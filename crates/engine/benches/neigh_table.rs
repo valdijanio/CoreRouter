@@ -122,11 +122,30 @@ fn neigh_100k(c: &mut Criterion) {
         ("list/mac_prefix", json!({"search": "02:00:01"})),
         ("list/state_incomplete", json!({"state": "incomplete"})),
         ("list/text_ether3", json!({"search": "ether3"})),
+        // G1.27d OUI: every row's vendor looked up (no vendor matches).
+        ("list/text_vendor", json!({"search": "cisco"})),
     ] {
         g.bench_function(name, |b| {
             b.iter(|| s.execute("ip.arp.list", black_box(&p)).unwrap());
         });
     }
+    // One vendor lookup in the built-in table (binary search in place).
+    let t = corerouter_model::oui::Table::new(corerouter_model::oui::BUILTIN).unwrap();
+    let mut i = 0u32;
+    g.bench_function("oui_lookup", |b| {
+        b.iter(|| {
+            i = i.wrapping_add(0x9e37);
+            let mac = [((i >> 16) as u8) & 0xfc, (i >> 8) as u8, i as u8, 0, 0, 0];
+            black_box(t.vendor(mac))
+        });
+    });
+    g.bench_function("oui_check_table", |b| {
+        b.iter(|| {
+            corerouter_model::oui::Table::new(black_box(corerouter_model::oui::BUILTIN))
+                .unwrap()
+                .len()
+        });
+    });
     g.finish();
 }
 

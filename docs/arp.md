@@ -117,9 +117,11 @@ zonas locais), como OPNsense e pfSense fazem.
 concessão termina ou o servidor deixa de pedir. Com `arp=reply-only` na interface só clientes
 DHCP alcançam o roteador (o Dynamic ARP Inspection do Cisco faz o mesmo com o DHCP snooping).
 
-**O que ficou para depois:** o fabricante pelo OUI, que aguarda a decisão do usuário sobre a
-licença da lista pública do IEEE (o site não traz termos; a permissão citada pelo Debian é de
-terceiros).
+**Fabricante pelo OUI (parte d):** a lista MA-L do IEEE vem embutida numa tabela compacta (709
+KB, busca binária em 75 ns, sem custo de inicialização) e o roteador pode baixar a atual
+(`ip.arp.vendors.update`, botão "Update vendors" na aba Settings), que vale mais que a embutida.
+Fonte, data, SHA-256 e termos em `docs/third-party.md`. O usuário decidiu embutir com base na
+declaração do IEEE citada pelo pacote Debian `ieee-data`.
 
 ## Desempenho e paralelismo
 

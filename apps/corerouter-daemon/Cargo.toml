@@ -20,6 +20,8 @@ corerouter-control.workspace = true
 corerouter-storage-fs.workspace = true
 corerouter-discovery.workspace = true
 corerouter-model.workspace = true
+# G1.27d: the SHA-256 of the IEEE listing a vendor table came from.
+sha2 = { version = "0.11.0", default-features = false }
 corerouter-proto-lldp.workspace = true
 corerouter-proto-mndp.workspace = true
 # Signs zones (G4.1c-2): ring stays out of the engine and the GUI.
