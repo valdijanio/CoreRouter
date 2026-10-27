@@ -74,8 +74,7 @@ fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
         let mut frr_line: Option<String> = None;
         let mut frr_at: Option<Instant> = None;
         let frr = frr_dir.as_deref().map(corerouter_hal_frr::Frr::new);
-        let result = (|| {
-            while health.sleep(TICK) {
+        while health.sleep(TICK) {
                 health.beat();
                 let wanted: Vec<RpkiCache> = lock(&session)
                     .store()
@@ -162,13 +161,11 @@ fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
                     frr: if wanted.is_empty() { None } else { frr_line.clone() },
                 };
                 lock(&session).set_rpki_status(status);
-            }
-            Ok(())
-        })();
+        }
         for w in workers.values() {
             w.stop.store(true, Ordering::Release);
         }
-        result
+        Ok(())
     }))
 }
 
@@ -197,10 +194,7 @@ fn work(cfg: &RpkiCache, state: &Mutex<Link>, stop: &AtomicBool, health: &super:
         let timers = client.timers();
         let refresh = Duration::from_secs(u64::from(cfg.refresh_interval.unwrap_or(timers.refresh)));
         let expire = Duration::from_secs(u64::from(cfg.expire_interval.unwrap_or(timers.expire)));
-        let error = match session(cfg, addr, &mut client, state, stop, health, refresh, expire, &mut last_sync) {
-            Ok(()) => None,
-            Err(e) => Some(e),
-        };
+        let error = session(cfg, addr, &mut client, state, stop, health, refresh, expire, &mut last_sync).err();
         client.disconnected();
         // RFC 8210 §6: data older than the expire interval is not used.
         if last_sync.is_some_and(|t| t.elapsed() >= expire) {

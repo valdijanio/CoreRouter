@@ -119,7 +119,7 @@ impl BgpHistory {
                 out.push((conn.clone(), addr.clone(), e.clone()));
             }
         }
-        out.sort_by(|a, b| b.2.at.cmp(&a.2.at));
+        out.sort_by_key(|e| std::cmp::Reverse(e.2.at));
         out
     }
 }

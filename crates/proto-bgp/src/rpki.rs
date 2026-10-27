@@ -38,11 +38,16 @@ pub struct Vrp {
 }
 
 fn mask(len: u8) -> u128 {
-    if len == 0 { 0 } else { u128::MAX << (128 - u32::from(len.min(128))) }
+    if len == 0 {
+        0
+    } else {
+        u128::MAX << (128 - u32::from(len.min(128)))
+    }
 }
 
-fn bit(key: u128, at: u8) -> usize {
-    usize::from((key >> (127 - u32::from(at.min(127)))) & 1 == 1)
+/// Bit `at` of a left-aligned key (`true`: the right child).
+fn bit(key: u128, at: u8) -> bool {
+    (key >> (127 - u32::from(at.min(127)))) & 1 == 1
 }
 
 /// Left-aligned bits of an address, and its family's width.
@@ -89,7 +94,14 @@ impl Vrp {
 
 impl fmt::Display for Vrp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}-{} AS{}", self.addr(), self.len, self.max_len, self.asn)
+        write!(
+            f,
+            "{}/{}-{} AS{}",
+            self.addr(),
+            self.len,
+            self.max_len,
+            self.asn
+        )
     }
 }
 
@@ -99,10 +111,25 @@ const NONE: u32 = u32::MAX;
 struct Node {
     key: u128,
     len: u8,
-    child: [u32; 2],
+    left: u32,
+    right: u32,
     /// The VRPs of this exact prefix: `entries[first..first + count]`.
     first: u32,
     count: u32,
+}
+
+impl Node {
+    fn child(&self, right: bool) -> u32 {
+        if right { self.right } else { self.left }
+    }
+
+    fn set_child(&mut self, right: bool, to: u32) {
+        if right {
+            self.right = to;
+        } else {
+            self.left = to;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -119,7 +146,8 @@ impl Trie {
         self.nodes.push(Node {
             key,
             len,
-            child: [NONE; 2],
+            left: NONE,
+            right: NONE,
             first: 0,
             count: 0,
         });
@@ -135,14 +163,12 @@ impl Trie {
     }
 
     /// Point whoever pointed at `old` (the root or a parent's child) at `new`.
-    fn relink(&mut self, parent: Option<(u32, usize)>, new: u32) {
+    fn relink(&mut self, parent: Option<(u32, bool)>, new: u32) {
         match parent {
             None => self.root = Some(new),
             Some((p, side)) => {
-                if let Some(n) = self.get_mut(p)
-                    && let Some(c) = n.child.get_mut(side)
-                {
-                    *c = new;
+                if let Some(n) = self.get_mut(p) {
+                    n.set_child(side, new);
                 }
             }
         }
@@ -155,7 +181,7 @@ impl Trie {
             self.root = Some(n);
             return n;
         };
-        let mut parent: Option<(u32, usize)> = None;
+        let mut parent: Option<(u32, bool)> = None;
         loop {
             let Some(&n) = self.get(idx) else { return NONE };
             let diff = (key ^ n.key).leading_zeros();
@@ -165,7 +191,7 @@ impl Trie {
                     // The new prefix sits above `n`.
                     let new = self.node(key, len);
                     if let Some(m) = self.get_mut(new) {
-                        m.child[bit(n.key, len)] = idx;
+                        m.set_child(bit(n.key, len), idx);
                     }
                     self.relink(parent, new);
                     return new;
@@ -174,8 +200,8 @@ impl Trie {
                 let branch = self.node(key & mask(common), common);
                 let leaf = self.node(key, len);
                 if let Some(b) = self.get_mut(branch) {
-                    b.child[bit(key, common)] = leaf;
-                    b.child[bit(n.key, common)] = idx;
+                    b.set_child(bit(key, common), leaf);
+                    b.set_child(bit(n.key, common), idx);
                 }
                 self.relink(parent, branch);
                 return leaf;
@@ -184,11 +210,11 @@ impl Trie {
                 return idx;
             }
             let side = bit(key, n.len);
-            let next = n.child[side];
+            let next = n.child(side);
             if next == NONE {
                 let leaf = self.node(key, len);
                 if let Some(m) = self.get_mut(idx) {
-                    m.child[side] = leaf;
+                    m.set_child(side, leaf);
                 }
                 return leaf;
             }
@@ -213,10 +239,10 @@ impl Trie {
                 // matches nothing (RFC 6483 §4, RFC 7607), and a route with
                 // no origin (AS_SET last, RFC 6811 §2) matches nothing.
                 if let Some(o) = origin
-                    && self
-                        .entries
-                        .get(from..to)
-                        .is_some_and(|es| es.iter().any(|&(max, asn)| len <= max && asn == o && asn != 0))
+                    && self.entries.get(from..to).is_some_and(|es| {
+                        es.iter()
+                            .any(|&(max, asn)| len <= max && asn == o && asn != 0)
+                    })
                 {
                     return RpkiState::Valid;
                 }
@@ -224,9 +250,13 @@ impl Trie {
             if n.len >= 128 {
                 break;
             }
-            idx = n.child[bit(key, n.len)];
+            idx = n.child(bit(key, n.len));
         }
-        if covered { RpkiState::Invalid } else { RpkiState::Unknown }
+        if covered {
+            RpkiState::Invalid
+        } else {
+            RpkiState::Unknown
+        }
     }
 
     fn covering(&self, key: u128, len: u8, out: &mut Vec<(u128, u8, u8, u32)>) {
@@ -243,7 +273,7 @@ impl Trie {
             if n.len >= 128 {
                 break;
             }
-            idx = n.child[bit(key, n.len)];
+            idx = n.child(bit(key, n.len));
         }
     }
 }
@@ -357,7 +387,12 @@ pub fn origin_as(path: &str, local_as: Option<u32>) -> Option<u32> {
     let last = path.rsplit([' ', ')']).next()?;
     // `asdot` (1.10) is 1 × 65536 + 10 (RFC 5396).
     match last.split_once('.') {
-        Some((hi, lo)) => Some(hi.parse::<u32>().ok()?.checked_mul(65_536)?.checked_add(lo.parse::<u32>().ok()?)?),
+        Some((hi, lo)) => Some(
+            hi.parse::<u32>()
+                .ok()?
+                .checked_mul(65_536)?
+                .checked_add(lo.parse::<u32>().ok()?)?,
+        ),
         None => last.parse().ok(),
     }
 }
@@ -426,7 +461,11 @@ pub fn render_frr(routing: &Routing) -> String {
     for c in &caches {
         // rtrlib prefers the lower preference; RouterOS the higher.
         let pref = 255 - u16::from(c.preference.unwrap_or(0).min(254));
-        let _ = writeln!(s, " rpki cache tcp {} {} preference {pref}", c.address, c.port);
+        let _ = writeln!(
+            s,
+            " rpki cache tcp {} {} preference {pref}",
+            c.address, c.port
+        );
     }
     let _ = writeln!(s, "exit");
     s.push_str(&route_map_prelude(ROUTE_MAP_IN));
@@ -451,7 +490,10 @@ pub fn validate(routing: &Routing) -> Vec<Issue> {
             out.push(Issue::new(&path, "validator name does not match its key"));
         }
         if c.group.is_empty() || c.group.len() > 63 {
-            out.push(Issue::new(format!("{path}.group"), "group must be 1..63 characters"));
+            out.push(Issue::new(
+                format!("{path}.group"),
+                "group must be 1..63 characters",
+            ));
         }
         if c.address.is_unspecified() || c.address.is_multicast() {
             out.push(Issue::new(
@@ -462,7 +504,10 @@ pub fn validate(routing: &Routing) -> Vec<Issue> {
         if c.port == 0 {
             out.push(Issue::new(format!("{path}.port"), "port must be 1..65535"));
         }
-        if let Some((_, _, other)) = seen.iter().find(|(a, p, _)| *a == c.address && *p == c.port) {
+        if let Some((_, _, other)) = seen
+            .iter()
+            .find(|(a, p, _)| *a == c.address && *p == c.port)
+        {
             out.push(Issue::new(
                 format!("{path}.address"),
                 format!("{}:{} is already validator {other:?}", c.address, c.port),
@@ -496,7 +541,10 @@ pub fn validate(routing: &Routing) -> Vec<Issue> {
             ));
         }
         if c.preference == Some(255) {
-            out.push(Issue::new(format!("{path}.preference"), "preference must be 0..254"));
+            out.push(Issue::new(
+                format!("{path}.preference"),
+                "preference must be 0..254",
+            ));
         }
     }
     out
@@ -560,7 +608,10 @@ mod tests {
         assert_eq!(check(&t, "192.0.2.0/24", Some(0)), RpkiState::Invalid);
         assert_eq!(check(&t, "192.0.2.0/24", Some(64496)), RpkiState::Invalid);
         assert_eq!(check(&t, "2001:db8:1::/48", Some(64500)), RpkiState::Valid);
-        assert_eq!(check(&t, "2001:db8:1::/49", Some(64500)), RpkiState::Invalid);
+        assert_eq!(
+            check(&t, "2001:db8:1::/49", Some(64500)),
+            RpkiState::Invalid
+        );
         assert_eq!(check(&t, "2001:db9::/32", Some(64500)), RpkiState::Unknown);
         assert_eq!((t.len_v4(), t.len_v6()), (3, 1));
         assert_eq!(t.covering("10.0.1.0".parse().unwrap(), 24).len(), 2);
@@ -578,26 +629,47 @@ mod tests {
         for _ in 0..3_000 {
             let r = next();
             let len = 8 + u8::try_from(r % 17).unwrap();
-            let addr = Ipv4Addr::from(u32::try_from((r >> 16) & 0x0fff_ffff).unwrap() | 0x1000_0000);
-            vrps.push(Vrp::new(addr.into(), len, len + u8::try_from((r >> 8) % 4).unwrap(), u32::try_from(r % 7).unwrap()).unwrap());
+            let addr =
+                Ipv4Addr::from(u32::try_from((r >> 16) & 0x0fff_ffff).unwrap() | 0x1000_0000);
+            vrps.push(
+                Vrp::new(
+                    addr.into(),
+                    len,
+                    len + u8::try_from((r >> 8) % 4).unwrap(),
+                    u32::try_from(r % 7).unwrap(),
+                )
+                .unwrap(),
+            );
         }
         let t = VrpTable::build(&vrps);
         for _ in 0..20_000 {
             let r = next();
             let len = 8 + u8::try_from(r % 25).unwrap();
-            let addr = IpAddr::V4(Ipv4Addr::from(u32::try_from((r >> 16) & 0x0fff_ffff).unwrap() | 0x1000_0000));
+            let addr = IpAddr::V4(Ipv4Addr::from(
+                u32::try_from((r >> 16) & 0x0fff_ffff).unwrap() | 0x1000_0000,
+            ));
             let origin = Some(u32::try_from((r >> 40) % 7).unwrap());
             let (key, _) = key_of(addr);
             let key = key & mask(len);
-            let covering: Vec<&Vrp> = vrps.iter().filter(|v| !v.v6 && v.len <= len && key & mask(v.len) == v.key).collect();
+            let covering: Vec<&Vrp> = vrps
+                .iter()
+                .filter(|v| !v.v6 && v.len <= len && key & mask(v.len) == v.key)
+                .collect();
             let want = if covering.is_empty() {
                 RpkiState::Unknown
-            } else if covering.iter().any(|v| len <= v.max_len && Some(v.asn) == origin && v.asn != 0) {
+            } else if covering
+                .iter()
+                .any(|v| len <= v.max_len && Some(v.asn) == origin && v.asn != 0)
+            {
                 RpkiState::Valid
             } else {
                 RpkiState::Invalid
             };
-            assert_eq!(t.validate(addr, len, origin), want, "{addr}/{len} {origin:?}");
+            assert_eq!(
+                t.validate(addr, len, origin),
+                want,
+                "{addr}/{len} {origin:?}"
+            );
         }
     }
 

@@ -132,6 +132,8 @@ pub(crate) struct RoutesPanel {
     history_table: TableState,
     pub(crate) explain: Option<Explain>,
     help: Option<HelpView>,
+    /// `routing.backend.get`: whether a routing daemon is attached.
+    pub(crate) attached: Option<bool>,
 }
 
 fn s(r: &Value, k: &str) -> String {
@@ -442,6 +444,13 @@ impl RoutesPanel {
             ui.weak(tr_in(SCOPE, l, "Choose a BGP connection to see its routes."));
             return;
         }
+        if self.attached == Some(false) {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                tr_in(SCOPE, l, "No routing daemon is attached (the virtual lab, or the daemon runs without --frr): BGP routes are read from FRR."),
+            );
+            return;
+        }
         let answer = self.answer.clone().unwrap_or(Value::Null);
         match answer.get("state").and_then(Value::as_str) {
             Some("ready") => {}
@@ -696,6 +705,13 @@ impl PanelState for RoutesPanel {
         if !app.open.contains(&Win::Panel(WIN)) {
             return out;
         }
+        if app.has_command("routing.backend.get") {
+            out.push(Query {
+                key: "backend",
+                command: "routing.backend.get",
+                params: json!({}),
+            });
+        }
         if app.has_command("routing.bgp.connection.list") {
             out.push(Query {
                 key: "connections",
@@ -748,6 +764,7 @@ impl PanelState for RoutesPanel {
                 }
             }
             "history" => self.history = value.as_array().cloned().unwrap_or_default(),
+            "backend" => self.attached = value.get("attached").and_then(Value::as_bool),
             "explain" => {
                 if let Some(e) = self.explain.as_mut() {
                     e.answer = Some(value);

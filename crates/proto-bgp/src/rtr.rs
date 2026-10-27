@@ -96,18 +96,40 @@ impl ErrorCode {
 /// One PDU (RFC 8210 §5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pdu {
-    SerialNotify { session: u16, serial: u32 },
-    SerialQuery { session: u16, serial: u32 },
+    SerialNotify {
+        session: u16,
+        serial: u32,
+    },
+    SerialQuery {
+        session: u16,
+        serial: u32,
+    },
     ResetQuery,
-    CacheResponse { session: u16 },
+    CacheResponse {
+        session: u16,
+    },
     /// IPv4 and IPv6 Prefix; `announce` is flag bit 0 (§5.6).
-    Prefix { announce: bool, vrp: Vrp },
+    Prefix {
+        announce: bool,
+        vrp: Vrp,
+    },
     /// Version 1 carries the timers; version 0 only the serial.
-    EndOfData { session: u16, serial: u32, timers: Option<Timers> },
+    EndOfData {
+        session: u16,
+        serial: u32,
+        timers: Option<Timers>,
+    },
     CacheReset,
     /// BGPsec router key (§5.10): counted, not used.
-    RouterKey { announce: bool, asn: u32 },
-    ErrorReport { code: ErrorCode, pdu: Vec<u8>, text: String },
+    RouterKey {
+        announce: bool,
+        asn: u32,
+    },
+    ErrorReport {
+        code: ErrorCode,
+        pdu: Vec<u8>,
+        text: String,
+    },
 }
 
 /// The intervals of End of Data, seconds (RFC 8210 §6).
@@ -186,7 +208,10 @@ pub fn decode(b: &[u8]) -> Result<(u8, Pdu), DecodeError> {
         return Err(bad(ErrorCode::CorruptData, "short PDU"));
     };
     if version > VERSION {
-        return Err(bad(ErrorCode::UnsupportedVersion, format!("version {version}")));
+        return Err(bad(
+            ErrorCode::UnsupportedVersion,
+            format!("version {version}"),
+        ));
     }
     let need = |n: usize| {
         if b.len() == n {
@@ -204,9 +229,15 @@ pub fn decode(b: &[u8]) -> Result<(u8, Pdu), DecodeError> {
             need(12)?;
             let serial = be32(b, 8).ok_or_else(short)?;
             if kind == SERIAL_NOTIFY {
-                Pdu::SerialNotify { session: field, serial }
+                Pdu::SerialNotify {
+                    session: field,
+                    serial,
+                }
             } else {
-                Pdu::SerialQuery { session: field, serial }
+                Pdu::SerialQuery {
+                    session: field,
+                    serial,
+                }
             }
         }
         RESET_QUERY => {
@@ -224,11 +255,23 @@ pub fn decode(b: &[u8]) -> Result<(u8, Pdu), DecodeError> {
                 return Err(short());
             };
             let (addr, asn) = if v6 {
-                let raw: [u8; 16] = b.get(12..28).and_then(|s| s.try_into().ok()).ok_or_else(short)?;
-                (IpAddr::V6(Ipv6Addr::from(raw)), be32(b, 28).ok_or_else(short)?)
+                let raw: [u8; 16] = b
+                    .get(12..28)
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or_else(short)?;
+                (
+                    IpAddr::V6(Ipv6Addr::from(raw)),
+                    be32(b, 28).ok_or_else(short)?,
+                )
             } else {
-                let raw: [u8; 4] = b.get(12..16).and_then(|s| s.try_into().ok()).ok_or_else(short)?;
-                (IpAddr::V4(Ipv4Addr::from(raw)), be32(b, 16).ok_or_else(short)?)
+                let raw: [u8; 4] = b
+                    .get(12..16)
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or_else(short)?;
+                (
+                    IpAddr::V4(Ipv4Addr::from(raw)),
+                    be32(b, 16).ok_or_else(short)?,
+                )
             };
             // §5.6/§5.7: prefix length ≤ max length ≤ the family's bits.
             let vrp = Vrp::new(addr, len, max, asn).ok_or_else(|| {
@@ -281,14 +324,23 @@ pub fn decode(b: &[u8]) -> Result<(u8, Pdu), DecodeError> {
         }
         ERROR_REPORT => {
             let plen = usize::try_from(be32(b, 8).ok_or_else(short)?).unwrap_or(usize::MAX);
-            let pdu_end = 12usize.checked_add(plen).filter(|e| *e + 4 <= b.len()).ok_or_else(short)?;
+            let pdu_end = 12usize
+                .checked_add(plen)
+                .filter(|e| *e + 4 <= b.len())
+                .ok_or_else(short)?;
             let pdu = b.get(12..pdu_end).ok_or_else(short)?.to_vec();
             let tlen = usize::try_from(be32(b, pdu_end).ok_or_else(short)?).unwrap_or(usize::MAX);
             let text_at = pdu_end + 4;
             if text_at.checked_add(tlen) != Some(b.len()) {
-                return Err(bad(ErrorCode::CorruptData, "error report lengths do not add up"));
+                return Err(bad(
+                    ErrorCode::CorruptData,
+                    "error report lengths do not add up",
+                ));
             }
-            let text = b.get(text_at..).map(String::from_utf8_lossy).unwrap_or_default();
+            let text = b
+                .get(text_at..)
+                .map(String::from_utf8_lossy)
+                .unwrap_or_default();
             Pdu::ErrorReport {
                 code: ErrorCode::from_code(field),
                 pdu,
@@ -365,7 +417,13 @@ pub fn encode(version: u8, pdu: &Pdu, out: &mut Vec<u8>) {
             let pdu = pdu.get(..pdu.len().min(MAX_PDU / 2)).unwrap_or_default();
             let text = text.get(..text.len().min(1024)).unwrap_or_default();
             let len = 16 + pdu.len() + text.len();
-            header(out, version, ERROR_REPORT, code.code(), u32::try_from(len).unwrap_or(u32::MAX));
+            header(
+                out,
+                version,
+                ERROR_REPORT,
+                code.code(),
+                u32::try_from(len).unwrap_or(u32::MAX),
+            );
             out.extend_from_slice(&u32::try_from(pdu.len()).unwrap_or(0).to_be_bytes());
             out.extend_from_slice(pdu);
             out.extend_from_slice(&u32::try_from(text.len()).unwrap_or(0).to_be_bytes());
@@ -404,7 +462,11 @@ pub enum Event {
     /// Write these bytes to the cache.
     Send(Vec<u8>),
     /// New data is in force (End of Data); the counts of the change.
-    Synced { serial: u32, announced: usize, withdrawn: usize },
+    Synced {
+        serial: u32,
+        announced: usize,
+        withdrawn: usize,
+    },
     /// The cache has news (Serial Notify): poll now.
     Notified,
     /// The cache has no data yet (Error Report "No Data Available", §8):
@@ -604,7 +666,10 @@ impl Client {
             }
             Pdu::CacheResponse { session } => {
                 let reset = self.session != Some(session) || self.serial.is_none();
-                if self.session.is_some() && self.session != Some(session) && self.state == State::Connecting {
+                if self.session.is_some()
+                    && self.session != Some(session)
+                    && self.state == State::Connecting
+                {
                     // §5.1: a new Session ID means the cache restarted; what
                     // we hold is from another session. Ask for all of it.
                     self.session = None;
@@ -621,7 +686,12 @@ impl Client {
             }
             Pdu::Prefix { announce, vrp } => {
                 let Some(p) = self.pending.as_mut() else {
-                    return self.fatal(ErrorCode::InvalidRequest, raw, "prefix outside a response", events);
+                    return self.fatal(
+                        ErrorCode::InvalidRequest,
+                        raw,
+                        "prefix outside a response",
+                        events,
+                    );
                 };
                 if announce {
                     p.announce.push(vrp);
@@ -640,10 +710,20 @@ impl Client {
                 timers,
             } => {
                 let Some(p) = self.pending.take() else {
-                    return self.fatal(ErrorCode::InvalidRequest, raw, "End of Data outside a response", events);
+                    return self.fatal(
+                        ErrorCode::InvalidRequest,
+                        raw,
+                        "End of Data outside a response",
+                        events,
+                    );
                 };
                 if Some(session) != self.session {
-                    return self.fatal(ErrorCode::CorruptData, raw, "End of Data of another session", events);
+                    return self.fatal(
+                        ErrorCode::CorruptData,
+                        raw,
+                        "End of Data of another session",
+                        events,
+                    );
                 }
                 match self.apply(p) {
                     Ok((announced, withdrawn)) => {
@@ -674,13 +754,19 @@ impl Client {
                     self.state = State::Idle;
                     events.push(Event::NoData);
                 } else {
-                    events.push(Event::Close(format!("the cache reported {}: {text}", code.text())));
+                    events.push(Event::Close(format!(
+                        "the cache reported {}: {text}",
+                        code.text()
+                    )));
                     self.disconnected();
                 }
             }
-            Pdu::SerialQuery { .. } | Pdu::ResetQuery => {
-                self.fatal(ErrorCode::InvalidRequest, raw, "a query sent to the router", events)
-            }
+            Pdu::SerialQuery { .. } | Pdu::ResetQuery => self.fatal(
+                ErrorCode::InvalidRequest,
+                raw,
+                "a query sent to the router",
+                events,
+            ),
         }
     }
 
@@ -692,7 +778,10 @@ impl Client {
             let mut next = HashSet::with_capacity(p.announce.len());
             for v in &p.announce {
                 if !next.insert(*v) {
-                    return Err((ErrorCode::DuplicateAnnouncement, format!("{v} announced twice")));
+                    return Err((
+                        ErrorCode::DuplicateAnnouncement,
+                        format!("{v} announced twice"),
+                    ));
                 }
             }
             let n = next.len();
@@ -702,12 +791,18 @@ impl Client {
         }
         for v in &p.withdraw {
             if !self.vrps.contains(v) {
-                return Err((ErrorCode::WithdrawalOfUnknown, format!("{v} withdrawn but not held")));
+                return Err((
+                    ErrorCode::WithdrawalOfUnknown,
+                    format!("{v} withdrawn but not held"),
+                ));
             }
         }
         for v in &p.announce {
             if self.vrps.contains(v) && !p.withdraw.contains(v) {
-                return Err((ErrorCode::DuplicateAnnouncement, format!("{v} announced but already held")));
+                return Err((
+                    ErrorCode::DuplicateAnnouncement,
+                    format!("{v} announced but already held"),
+                ));
             }
         }
         for v in &p.withdraw {
@@ -716,7 +811,8 @@ impl Client {
         for v in &p.announce {
             self.vrps.insert(*v);
         }
-        self.keys = u64::try_from((i64::try_from(self.keys).unwrap_or(0) + p.keys).max(0)).unwrap_or(0);
+        self.keys =
+            u64::try_from((i64::try_from(self.keys).unwrap_or(0) + p.keys).max(0)).unwrap_or(0);
         Ok((p.announce.len(), p.withdraw.len()))
     }
 }
@@ -735,7 +831,10 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(session: u16, vrps: Vec<Vrp>) -> Self {
+    /// Duplicates are dropped: announcing one twice is an error (§5.6).
+    pub fn new(session: u16, mut vrps: Vec<Vrp>) -> Self {
+        vrps.sort_unstable();
+        vrps.dedup();
         Server {
             session,
             serial: 1,
@@ -751,7 +850,9 @@ impl Server {
 
     /// Replace the data: the serial goes up and the Serial Notify to send
     /// to every connected router is returned (§8.4).
-    pub fn replace(&mut self, vrps: Vec<Vrp>, version: u8) -> Vec<u8> {
+    pub fn replace(&mut self, mut vrps: Vec<Vrp>, version: u8) -> Vec<u8> {
+        vrps.sort_unstable();
+        vrps.dedup();
         let old = std::mem::replace(&mut self.vrps, vrps);
         self.previous = Some((self.serial, old));
         self.serial = self.serial.wrapping_add(1);
@@ -792,21 +893,47 @@ impl Server {
         };
         match pdu {
             Pdu::ResetQuery => {
-                encode(version, &Pdu::CacheResponse { session: self.session }, &mut out);
+                encode(
+                    version,
+                    &Pdu::CacheResponse {
+                        session: self.session,
+                    },
+                    &mut out,
+                );
                 send(&self.vrps, true, &mut out);
             }
-            Pdu::SerialQuery { session, serial } if session == self.session && serial == self.serial => {
-                encode(version, &Pdu::CacheResponse { session: self.session }, &mut out);
+            Pdu::SerialQuery { session, serial }
+                if session == self.session && serial == self.serial =>
+            {
+                encode(
+                    version,
+                    &Pdu::CacheResponse {
+                        session: self.session,
+                    },
+                    &mut out,
+                );
             }
             Pdu::SerialQuery { session, serial }
-                if session == self.session && self.previous.as_ref().is_some_and(|(s, _)| *s == serial) =>
+                if session == self.session
+                    && self.previous.as_ref().is_some_and(|(s, _)| *s == serial) =>
             {
-                encode(version, &Pdu::CacheResponse { session: self.session }, &mut out);
+                encode(
+                    version,
+                    &Pdu::CacheResponse {
+                        session: self.session,
+                    },
+                    &mut out,
+                );
                 if let Some((_, old)) = &self.previous {
                     let now: HashSet<&Vrp> = self.vrps.iter().collect();
                     let before: HashSet<&Vrp> = old.iter().collect();
                     let gone: Vec<Vrp> = old.iter().filter(|v| !now.contains(v)).copied().collect();
-                    let new: Vec<Vrp> = self.vrps.iter().filter(|v| !before.contains(v)).copied().collect();
+                    let new: Vec<Vrp> = self
+                        .vrps
+                        .iter()
+                        .filter(|v| !before.contains(v))
+                        .copied()
+                        .collect();
                     send(&gone, false, &mut out);
                     send(&new, true, &mut out);
                 }
@@ -842,15 +969,39 @@ mod tests {
     #[test]
     fn pdus_round_trip() {
         let all = [
-            Pdu::SerialNotify { session: 7, serial: 9 },
-            Pdu::SerialQuery { session: 7, serial: 9 },
+            Pdu::SerialNotify {
+                session: 7,
+                serial: 9,
+            },
+            Pdu::SerialQuery {
+                session: 7,
+                serial: 9,
+            },
             Pdu::ResetQuery,
             Pdu::CacheResponse { session: 7 },
-            Pdu::Prefix { announce: true, vrp: vrp("192.0.2.0/24", 24, 64500) },
-            Pdu::Prefix { announce: false, vrp: vrp("2001:db8::/32", 48, 64501) },
-            Pdu::EndOfData { session: 7, serial: 9, timers: Some(Timers { refresh: 60, retry: 30, expire: 600 }) },
+            Pdu::Prefix {
+                announce: true,
+                vrp: vrp("192.0.2.0/24", 24, 64500),
+            },
+            Pdu::Prefix {
+                announce: false,
+                vrp: vrp("2001:db8::/32", 48, 64501),
+            },
+            Pdu::EndOfData {
+                session: 7,
+                serial: 9,
+                timers: Some(Timers {
+                    refresh: 60,
+                    retry: 30,
+                    expire: 600,
+                }),
+            },
             Pdu::CacheReset,
-            Pdu::ErrorReport { code: ErrorCode::NoDataAvailable, pdu: vec![1, 2], text: "warming up".into() },
+            Pdu::ErrorReport {
+                code: ErrorCode::NoDataAvailable,
+                pdu: vec![1, 2],
+                text: "warming up".into(),
+            },
         ];
         for p in &all {
             let mut b = Vec::new();
@@ -860,19 +1011,42 @@ mod tests {
         }
         // Version 0 End of Data: 12 bytes, no timers (RFC 6810 §5.8).
         let mut b = Vec::new();
-        encode(0, &Pdu::EndOfData { session: 1, serial: 2, timers: Some(Timers::default()) }, &mut b);
+        encode(
+            0,
+            &Pdu::EndOfData {
+                session: 1,
+                serial: 2,
+                timers: Some(Timers::default()),
+            },
+            &mut b,
+        );
         assert_eq!(b.len(), 12);
-        assert_eq!(decode(&b).unwrap(), (0, Pdu::EndOfData { session: 1, serial: 2, timers: None }));
+        assert_eq!(
+            decode(&b).unwrap(),
+            (
+                0,
+                Pdu::EndOfData {
+                    session: 1,
+                    serial: 2,
+                    timers: None
+                }
+            )
+        );
     }
 
     #[test]
     fn rfc8210_wire_examples() {
         // §5.6 IPv4 Prefix: version 1, type 4, zero, length 20, flags 1,
         // 24, 24, zero, 192.0.2.0, AS 64496.
-        let b = [1, 4, 0, 0, 0, 0, 0, 20, 1, 24, 24, 0, 192, 0, 2, 0, 0, 0, 0xfb, 0xf0];
+        let b = [
+            1, 4, 0, 0, 0, 0, 0, 20, 1, 24, 24, 0, 192, 0, 2, 0, 0, 0, 0xfb, 0xf0,
+        ];
         assert_eq!(
             decode(&b).unwrap().1,
-            Pdu::Prefix { announce: true, vrp: vrp("192.0.2.0/24", 24, 64496) }
+            Pdu::Prefix {
+                announce: true,
+                vrp: vrp("192.0.2.0/24", 24, 64496)
+            }
         );
         // §5.4 Reset Query is the 8-byte header alone.
         let mut q = Vec::new();
@@ -883,17 +1057,27 @@ mod tests {
     #[test]
     fn hostile_pdus_are_errors() {
         // Max length below the prefix length (§5.6).
-        let b = [1, 4, 0, 0, 0, 0, 0, 20, 1, 24, 16, 0, 192, 0, 2, 0, 0, 0, 0, 1];
+        let b = [
+            1, 4, 0, 0, 0, 0, 0, 20, 1, 24, 16, 0, 192, 0, 2, 0, 0, 0, 0, 1,
+        ];
         assert_eq!(decode(&b).unwrap_err().code, ErrorCode::CorruptData);
         // /33 in IPv4.
-        let b = [1, 4, 0, 0, 0, 0, 0, 20, 1, 33, 33, 0, 192, 0, 2, 0, 0, 0, 0, 1];
+        let b = [
+            1, 4, 0, 0, 0, 0, 0, 20, 1, 33, 33, 0, 192, 0, 2, 0, 0, 0, 0, 1,
+        ];
         assert!(decode(&b).is_err());
         // Wrong length for the type, absurd length, unknown type, version 2.
         assert!(decode(&[1, 2, 0, 0, 0, 0, 0, 9, 0]).is_err());
         assert!(pdu_len(&[1, 2, 0, 0, 0xff, 0, 0, 0]).is_err());
         assert!(pdu_len(&[1, 2, 0, 0, 0, 0, 0, 3]).is_err());
-        assert_eq!(decode(&[1, 99, 0, 0, 0, 0, 0, 8]).unwrap_err().code, ErrorCode::UnsupportedPduType);
-        assert_eq!(decode(&[2, 2, 0, 0, 0, 0, 0, 8]).unwrap_err().code, ErrorCode::UnsupportedVersion);
+        assert_eq!(
+            decode(&[1, 99, 0, 0, 0, 0, 0, 8]).unwrap_err().code,
+            ErrorCode::UnsupportedPduType
+        );
+        assert_eq!(
+            decode(&[2, 2, 0, 0, 0, 0, 0, 8]).unwrap_err().code,
+            ErrorCode::UnsupportedVersion
+        );
         // Error report whose inner lengths lie.
         let b = [1, 10, 0, 0, 0, 0, 0, 16, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
         assert!(decode(&b).is_err());
@@ -901,7 +1085,13 @@ mod tests {
 
     #[test]
     fn client_and_server_sync_reset_then_serial() {
-        let mut server = Server::new(42, vec![vrp("192.0.2.0/24", 24, 64500), vrp("2001:db8::/32", 48, 64501)]);
+        let mut server = Server::new(
+            42,
+            vec![
+                vrp("192.0.2.0/24", 24, 64500),
+                vrp("2001:db8::/32", 48, 64501),
+            ],
+        );
         let mut c = Client::new();
         let q = c.query();
         assert_eq!(decode(&q).unwrap().1, Pdu::ResetQuery);
@@ -911,15 +1101,44 @@ mod tests {
         for byte in a {
             ev.extend(c.feed(&[byte]));
         }
-        assert_eq!(ev, [Event::Synced { serial: 1, announced: 2, withdrawn: 0 }]);
-        assert_eq!((c.state(), c.session(), c.serial(), c.vrps().len()), (State::Sync, Some(42), Some(1), 2));
+        assert_eq!(
+            ev,
+            [Event::Synced {
+                serial: 1,
+                announced: 2,
+                withdrawn: 0
+            }]
+        );
+        assert_eq!(
+            (c.state(), c.session(), c.serial(), c.vrps().len()),
+            (State::Sync, Some(42), Some(1), 2)
+        );
         // The cache changes: Serial Notify, Serial Query, the difference.
-        let notify = server.replace(vec![vrp("192.0.2.0/24", 24, 64500), vrp("198.51.100.0/22", 24, 64502)], 1);
+        let notify = server.replace(
+            vec![
+                vrp("192.0.2.0/24", 24, 64500),
+                vrp("198.51.100.0/22", 24, 64502),
+            ],
+            1,
+        );
         assert_eq!(c.feed(&notify), [Event::Notified]);
         let q = c.query();
-        assert_eq!(decode(&q).unwrap().1, Pdu::SerialQuery { session: 42, serial: 1 });
+        assert_eq!(
+            decode(&q).unwrap().1,
+            Pdu::SerialQuery {
+                session: 42,
+                serial: 1
+            }
+        );
         let ev = c.feed(&server.answer(&q).unwrap());
-        assert_eq!(ev, [Event::Synced { serial: 2, announced: 1, withdrawn: 1 }]);
+        assert_eq!(
+            ev,
+            [Event::Synced {
+                serial: 2,
+                announced: 1,
+                withdrawn: 1
+            }]
+        );
         assert!(c.vrps().contains(&vrp("198.51.100.0/22", 24, 64502)));
         assert!(!c.vrps().contains(&vrp("2001:db8::/32", 48, 64501)));
         // A serial the cache no longer has: Cache Reset, then Reset Query.
@@ -927,10 +1146,19 @@ mod tests {
         server.replace(vec![vrp("203.0.113.0/24", 24, 64503)], 1);
         let q = c.query();
         let ev = c.feed(&server.answer(&q).unwrap());
-        let Some(Event::Send(again)) = ev.first() else { panic!("{ev:?}") };
+        let Some(Event::Send(again)) = ev.first() else {
+            panic!("{ev:?}")
+        };
         assert_eq!(decode(again).unwrap().1, Pdu::ResetQuery);
         let ev = c.feed(&server.answer(again).unwrap());
-        assert_eq!(ev, [Event::Synced { serial: 4, announced: 1, withdrawn: 0 }]);
+        assert_eq!(
+            ev,
+            [Event::Synced {
+                serial: 4,
+                announced: 1,
+                withdrawn: 0
+            }]
+        );
         assert_eq!(c.vrps().len(), 1);
     }
 
@@ -940,25 +1168,93 @@ mod tests {
         let _ = c.query();
         let mut a = Vec::new();
         encode(1, &Pdu::CacheResponse { session: 1 }, &mut a);
-        encode(1, &Pdu::Prefix { announce: true, vrp: vrp("192.0.2.0/24", 24, 1) }, &mut a);
+        encode(
+            1,
+            &Pdu::Prefix {
+                announce: true,
+                vrp: vrp("192.0.2.0/24", 24, 1),
+            },
+            &mut a,
+        );
         assert!(c.feed(&a).is_empty());
         assert!(c.vrps().is_empty(), "applied before End of Data");
         let mut e = Vec::new();
-        encode(1, &Pdu::EndOfData { session: 1, serial: 5, timers: Some(Timers { refresh: 0, retry: 99_999, expire: 10 }) }, &mut e);
-        assert_eq!(c.feed(&e), [Event::Synced { serial: 5, announced: 1, withdrawn: 0 }]);
+        encode(
+            1,
+            &Pdu::EndOfData {
+                session: 1,
+                serial: 5,
+                timers: Some(Timers {
+                    refresh: 0,
+                    retry: 99_999,
+                    expire: 10,
+                }),
+            },
+            &mut e,
+        );
+        assert_eq!(
+            c.feed(&e),
+            [Event::Synced {
+                serial: 5,
+                announced: 1,
+                withdrawn: 0
+            }]
+        );
         // §6 ranges enforced on the cache's timers.
-        assert_eq!(c.timers(), Timers { refresh: 1, retry: 7_200, expire: 600 });
+        assert_eq!(
+            c.timers(),
+            Timers {
+                refresh: 1,
+                retry: 7_200,
+                expire: 600
+            }
+        );
         // Withdrawing what is not held: Error Report and close; data kept.
         let q = c.query();
-        assert_eq!(decode(&q).unwrap().1, Pdu::SerialQuery { session: 1, serial: 5 });
+        assert_eq!(
+            decode(&q).unwrap().1,
+            Pdu::SerialQuery {
+                session: 1,
+                serial: 5
+            }
+        );
         let mut a = Vec::new();
         encode(1, &Pdu::CacheResponse { session: 1 }, &mut a);
-        encode(1, &Pdu::Prefix { announce: false, vrp: vrp("198.51.100.0/24", 24, 1) }, &mut a);
-        encode(1, &Pdu::EndOfData { session: 1, serial: 6, timers: None }, &mut a);
+        encode(
+            1,
+            &Pdu::Prefix {
+                announce: false,
+                vrp: vrp("198.51.100.0/24", 24, 1),
+            },
+            &mut a,
+        );
+        encode(
+            1,
+            &Pdu::EndOfData {
+                session: 1,
+                serial: 6,
+                timers: None,
+            },
+            &mut a,
+        );
         let ev = c.feed(&a);
-        let Some(Event::Send(report)) = ev.first() else { panic!("{ev:?}") };
+        let Some(Event::Send(report)) = ev.first() else {
+            panic!("{ev:?}")
+        };
         let got = decode(report);
-        assert!(matches!(got, Ok((_, Pdu::ErrorReport { code: ErrorCode::WithdrawalOfUnknown, .. }))), "{got:?}");
+        assert!(
+            matches!(
+                got,
+                Ok((
+                    _,
+                    Pdu::ErrorReport {
+                        code: ErrorCode::WithdrawalOfUnknown,
+                        ..
+                    }
+                ))
+            ),
+            "{got:?}"
+        );
         assert!(matches!(ev.last(), Some(Event::Close(_))));
         assert_eq!((c.vrps().len(), c.serial()), (1, Some(5)));
     }
@@ -968,7 +1264,15 @@ mod tests {
         let mut c = Client::new();
         let _ = c.query();
         let mut a = Vec::new();
-        encode(0, &Pdu::ErrorReport { code: ErrorCode::UnsupportedVersion, pdu: vec![], text: String::new() }, &mut a);
+        encode(
+            0,
+            &Pdu::ErrorReport {
+                code: ErrorCode::UnsupportedVersion,
+                pdu: vec![],
+                text: String::new(),
+            },
+            &mut a,
+        );
         let ev = c.feed(&a);
         assert!(matches!(ev.as_slice(), [Event::Close(m)] if m.contains("version 0")));
         assert_eq!(c.version(), 0);
@@ -986,7 +1290,15 @@ mod tests {
         let mut c = Client::new();
         let _ = c.query();
         let mut a = Vec::new();
-        encode(1, &Pdu::ErrorReport { code: ErrorCode::NoDataAvailable, pdu: vec![], text: String::new() }, &mut a);
+        encode(
+            1,
+            &Pdu::ErrorReport {
+                code: ErrorCode::NoDataAvailable,
+                pdu: vec![],
+                text: String::new(),
+            },
+            &mut a,
+        );
         assert_eq!(c.feed(&a), [Event::NoData]);
     }
 }

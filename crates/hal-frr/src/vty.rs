@@ -148,7 +148,10 @@ impl Vty {
     /// next command; a stream dropped early leaves the connection unusable.
     pub fn run_stream(&mut self, command: &str, max: u64) -> io::Result<Stream<'_>> {
         if command.len() > MAX_COMMAND || command.bytes().any(|b| b == 0 || b == b'\n') {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "command refused"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "command refused",
+            ));
         }
         let mut msg = Vec::with_capacity(command.len() + 1);
         msg.extend_from_slice(command.as_bytes());
@@ -260,7 +263,10 @@ impl Read for Stream<'_> {
             self.vty.buf.drain(..self.start);
             self.start = 0;
             if self.total > self.max {
-                return Err(io::Error::other(format!("answer longer than {} bytes", self.max)));
+                return Err(io::Error::other(format!(
+                    "answer longer than {} bytes",
+                    self.max
+                )));
             }
             let n = self.vty.stream.read(&mut self.vty.chunk)?;
             if n == 0 {

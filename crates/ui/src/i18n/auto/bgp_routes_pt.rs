@@ -13,6 +13,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"History"##, r##"Histórico"##),
     (r##"Lost At"##, r##"Perdeu em"##),
     (r##"No route matches."##, r##"Nenhuma rota corresponde."##),
+    (r##"No routing daemon is attached (the virtual lab, or the daemon runs without --frr): BGP routes are read from FRR."##, r##"Nenhum daemon de roteamento ligado (o laboratório virtual, ou o daemon roda sem --frr): as rotas BGP são lidas do FRR."##),
     (r##"No session went down since the daemon started."##, r##"Nenhuma sessão caiu desde que o daemon subiu."##),
     (r##"Order:"##, r##"Ordem:"##),
     (r##"RPKI"##, r##"RPKI"##),

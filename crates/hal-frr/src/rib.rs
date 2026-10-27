@@ -125,7 +125,11 @@ impl Builder {
             .and_then(|h| h.parse().ok());
         let attrs = BgpAttrs {
             as_path: cut(c.path.as_deref().unwrap_or_default()),
-            origin: c.origin.as_deref().and_then(Origin::parse).unwrap_or_default(),
+            origin: c
+                .origin
+                .as_deref()
+                .and_then(Origin::parse)
+                .unwrap_or_default(),
             next_hop,
             med: c.metric,
             local_pref: c.loc_prf,
@@ -133,7 +137,10 @@ impl Builder {
             communities: Vec::new(),
             large_communities: Vec::new(),
         };
-        let best = c.best.unwrap_or(false) || c.bestpath.as_ref().is_some_and(|b| b.as_bool() == Some(true));
+        let best = c.best.unwrap_or(false)
+            || c.bestpath
+                .as_ref()
+                .is_some_and(|b| b.as_bool() == Some(true));
         let attrs = self.intern(attrs);
         self.rib.routes.push(BgpRoute {
             prefix: prefix.trunc(),
@@ -144,9 +151,10 @@ impl Builder {
 
     pub fn finish(mut self) -> BgpRib {
         if self.dropped > 0 {
-            self.rib
-                .warnings
-                .push(format!("{} route(s) past {MAX_ROUTES} were not kept", self.dropped));
+            self.rib.warnings.push(format!(
+                "{} route(s) past {MAX_ROUTES} were not kept",
+                self.dropped
+            ));
         }
         self.rib
     }
@@ -166,7 +174,10 @@ impl Builder {
     /// Add the routes of another table (its attribute sets interned here).
     pub fn extend(&mut self, other: BgpRib) {
         for r in other.routes {
-            let Some(a) = other.attrs.get(usize::try_from(r.attrs).unwrap_or(usize::MAX)) else {
+            let Some(a) = other
+                .attrs
+                .get(usize::try_from(r.attrs).unwrap_or(usize::MAX))
+            else {
                 continue;
             };
             let attrs = self.intern(a.clone());
@@ -438,8 +449,16 @@ pub fn parse_prefix(text: &str) -> Result<BgpPrefix, String> {
                         asns: s.list.into_iter().take(1_024).collect(),
                     })
                     .collect(),
-                as_path: cut(if aspath.string == "Local" { "" } else { &aspath.string }),
-                origin: j.origin.as_deref().and_then(Origin::parse).unwrap_or_default(),
+                as_path: cut(if aspath.string == "Local" {
+                    ""
+                } else {
+                    &aspath.string
+                }),
+                origin: j
+                    .origin
+                    .as_deref()
+                    .and_then(Origin::parse)
+                    .unwrap_or_default(),
                 med: j.metric,
                 local_pref: j.loc_prf,
                 weight: j.weight.unwrap_or(0),
@@ -501,7 +520,10 @@ mod tests {
         // Both share one attribute set but local-pref: two sets.
         assert_eq!(rib.attrs.len(), 2);
         let a = rib.attrs_of(&rib.routes[0]).unwrap();
-        assert_eq!((a.as_path.as_str(), a.local_pref, a.next_hop), ("64502 64502", Some(200), "198.51.100.18".parse().ok()));
+        assert_eq!(
+            (a.as_path.as_str(), a.local_pref, a.next_hop),
+            ("64502 64502", Some(200), "198.51.100.18".parse().ok())
+        );
         assert!(rib.routes[0].best());
     }
 
@@ -520,13 +542,30 @@ mod tests {
     #[test]
     fn no_soft_reconfiguration_and_garbage() {
         let mut b = Builder::new(true, None);
-        let p = parse_table(r#"{"warning": "Inbound soft reconfiguration not enabled"}"#.as_bytes(), &mut b).unwrap();
-        assert_eq!(p.warning.as_deref(), Some("Inbound soft reconfiguration not enabled"));
+        let p = parse_table(
+            r#"{"warning": "Inbound soft reconfiguration not enabled"}"#.as_bytes(),
+            &mut b,
+        )
+        .unwrap();
+        assert_eq!(
+            p.warning.as_deref(),
+            Some("Inbound soft reconfiguration not enabled")
+        );
         assert!(parse_table("% Unknown command".as_bytes(), &mut Builder::default()).is_err());
-        assert!(parse_table(r#"{"routes": {"x": 3}}"#.as_bytes(), &mut Builder::default()).is_err());
+        assert!(
+            parse_table(
+                r#"{"routes": {"x": 3}}"#.as_bytes(),
+                &mut Builder::default()
+            )
+            .is_err()
+        );
         // A route without a usable prefix is skipped, not an error.
         let mut b = Builder::default();
-        parse_table(r#"{"routes": {"nope": [{"path": "1"}]}}"#.as_bytes(), &mut b).unwrap();
+        parse_table(
+            r#"{"routes": {"nope": [{"path": "1"}]}}"#.as_bytes(),
+            &mut b,
+        )
+        .unwrap();
         assert_eq!(b.routes(), 0);
     }
 
@@ -544,6 +583,9 @@ mod tests {
         assert_eq!(best.igp_metric, Some(0));
         assert_eq!(p.paths[1].local_pref, Some(100));
         assert_eq!(parse_prefix("{}").unwrap().paths.len(), 0);
-        assert_eq!(parse_prefix("% Network not in table").unwrap().paths.len(), 0);
+        assert_eq!(
+            parse_prefix("% Network not in table").unwrap().paths.len(),
+            0
+        );
     }
 }

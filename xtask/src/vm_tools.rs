@@ -240,7 +240,16 @@ mod tests {
             .iter()
             .map(|(t, _)| t.package)
             .collect();
-        assert_eq!(names, ["pppoe", "iperf3", "frr-pythontools", "librtr0t64", "frr-rpki-rtrlib"]);
+        assert_eq!(
+            names,
+            [
+                "pppoe",
+                "iperf3",
+                "frr-pythontools",
+                "librtr0t64",
+                "frr-rpki-rtrlib"
+            ]
+        );
         let old = missing(TOOLS, "bngblaster installed 0.9.30\n");
         let (t, have) = old.first().unwrap();
         assert_eq!((t.package, have.as_deref()), ("bngblaster", Some("0.9.30")));

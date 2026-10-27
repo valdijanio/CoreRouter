@@ -428,7 +428,9 @@ impl Frr {
         {
             Ok(format!("view {instance} "))
         } else {
-            Err(HalError::Rejected(format!("bad instance name {instance:?}")))
+            Err(HalError::Rejected(format!(
+                "bad instance name {instance:?}"
+            )))
         }
     }
 
@@ -437,7 +439,12 @@ impl Frr {
     /// neighbor keeps its Adj-RIB-In (`soft-reconfiguration inbound`, which
     /// CoreRouter turns on with RPKI), with the refused ones flagged; the
     /// accepted ones otherwise.
-    pub fn bgp_routes(&self, instance: &str, neighbor: &str, direction: Direction) -> Result<BgpRib, HalError> {
+    pub fn bgp_routes(
+        &self,
+        instance: &str,
+        neighbor: &str,
+        direction: Direction,
+    ) -> Result<BgpRib, HalError> {
         let addr: std::net::IpAddr = neighbor
             .parse()
             .map_err(|_| HalError::Rejected(format!("{neighbor:?} is not a neighbor address")))?;
@@ -446,7 +453,10 @@ impl Frr {
         let io = |e: std::io::Error| io_err(Daemon::Bgpd, e);
         // One table, streamed into `b`; `Ok(None)`: the family is not
         // active with this neighbor (FRR says so in text).
-        let table = |vty: &mut Vty, cmd: String, b: &mut rib::Builder| -> Result<Option<rib::Parsed>, HalError> {
+        let table = |vty: &mut Vty,
+                     cmd: String,
+                     b: &mut rib::Builder|
+         -> Result<Option<rib::Parsed>, HalError> {
             let mut stream = vty.run_stream(&cmd, MAX_TABLE).map_err(io)?;
             let mut first = [0u8; 1];
             let n = std::io::Read::read(&mut stream, &mut first).map_err(io)?;
@@ -507,7 +517,9 @@ impl Frr {
             Ok(n) => n.addr().is_ipv6(),
             Err(_) => prefix
                 .parse::<std::net::IpAddr>()
-                .map_err(|_| HalError::Rejected(format!("{prefix:?} is not a prefix or an address")))?
+                .map_err(|_| {
+                    HalError::Rejected(format!("{prefix:?} is not a prefix or an address"))
+                })?
                 .is_ipv6(),
         };
         let view = Self::view(instance)?;
@@ -523,7 +535,9 @@ impl Frr {
             .ok()
             .map(|r| String::from_utf8_lossy(&r.output).into_owned())
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
-        let fam = head.as_ref().and_then(|h| h.get(format!("{afi}Unicast")).or(Some(h)));
+        let fam = head
+            .as_ref()
+            .and_then(|h| h.get(format!("{afi}Unicast")).or(Some(h)));
         p.local_as = fam
             .and_then(|f| f.get("as"))
             .and_then(serde_json::Value::as_u64)
@@ -673,7 +687,12 @@ impl RoutingReader for FrrReader {
         self.0.incarnation()
     }
 
-    fn bgp_routes(&mut self, instance: &str, neighbor: &str, direction: Direction) -> Result<BgpRib, HalError> {
+    fn bgp_routes(
+        &mut self,
+        instance: &str,
+        neighbor: &str,
+        direction: Direction,
+    ) -> Result<BgpRib, HalError> {
         self.0.bgp_routes(instance, neighbor, direction)
     }
 

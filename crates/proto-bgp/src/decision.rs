@@ -112,7 +112,9 @@ impl Step {
     }
 
     pub fn from_frr_reason(s: &str) -> Option<Step> {
-        Step::ALL.into_iter().find(|st| !st.frr_reason().is_empty() && st.frr_reason() == s)
+        Step::ALL
+            .into_iter()
+            .find(|st| !st.frr_reason().is_empty() && st.frr_reason() == s)
     }
 
     /// The rule, in English (the window explains it in Portuguese).
@@ -122,14 +124,24 @@ impl Step {
             Step::Weight => "higher weight wins (local to this router, not sent to peers)",
             Step::LocalPref => "higher LOCAL_PREF wins (RFC 4271 §9.1.1)",
             Step::LocalRoute => "a route originated here wins over a received one",
-            Step::AsPathLength => "shorter AS_PATH wins; an AS_SET counts as one (RFC 4271 §9.1.2.2 a)",
-            Step::Origin => "lower ORIGIN wins: IGP, then EGP, then incomplete (RFC 4271 §9.1.2.2 b)",
-            Step::Med => "lower MED wins between routes from the same neighboring AS (RFC 4271 §9.1.2.2 c)",
+            Step::AsPathLength => {
+                "shorter AS_PATH wins; an AS_SET counts as one (RFC 4271 §9.1.2.2 a)"
+            }
+            Step::Origin => {
+                "lower ORIGIN wins: IGP, then EGP, then incomplete (RFC 4271 §9.1.2.2 b)"
+            }
+            Step::Med => {
+                "lower MED wins between routes from the same neighboring AS (RFC 4271 §9.1.2.2 c)"
+            }
             Step::PeerType => "a route from an eBGP peer wins over iBGP (RFC 4271 §9.1.2.2 d)",
             Step::IgpMetric => "lower interior cost to the next hop wins (RFC 4271 §9.1.2.2 e)",
-            Step::ConfedPeerType => "a confederation-external route wins over a confederation-internal one",
+            Step::ConfedPeerType => {
+                "a confederation-external route wins over a confederation-internal one"
+            }
             Step::OlderPath => "between eBGP routes the one already chosen stays (fewer flaps)",
-            Step::RouterId => "lower BGP Identifier (ORIGINATOR_ID when reflected) wins (RFC 4271 §9.1.2.2 f, RFC 4456 §9)",
+            Step::RouterId => {
+                "lower BGP Identifier (ORIGINATOR_ID when reflected) wins (RFC 4271 §9.1.2.2 f, RFC 4456 §9)"
+            }
             Step::ClusterLength => "shorter CLUSTER_LIST wins (RFC 4456 §9)",
             Step::Stale => "a stale route (graceful restart) loses",
             Step::NeighborAddress => "lower peer address wins (RFC 4271 §9.1.2.2 g)",
@@ -194,12 +206,16 @@ fn left_as(p: &BgpPath) -> Option<u32> {
         .segments
         .iter()
         .find(|s| !matches!(s.kind, SegmentKind::ConfedSequence | SegmentKind::ConfedSet))?;
-    (s.kind == SegmentKind::Sequence).then(|| s.asns.first().copied()).flatten()
+    (s.kind == SegmentKind::Sequence)
+        .then(|| s.asns.first().copied())
+        .flatten()
 }
 
 fn left_confed(p: &BgpPath) -> Option<u32> {
     let s = p.segments.first()?;
-    (s.kind == SegmentKind::ConfedSequence).then(|| s.asns.first().copied()).flatten()
+    (s.kind == SegmentKind::ConfedSequence)
+        .then(|| s.asns.first().copied())
+        .flatten()
 }
 
 fn is_ebgp(p: &BgpPath) -> bool {
@@ -218,13 +234,26 @@ pub struct Verdict {
     pub loser_value: String,
 }
 
-fn verdict<T: Ord + ToString>(step: Step, a: T, b: T, a_better_when_greater: bool) -> Option<Verdict> {
+fn verdict<T: Ord + ToString>(
+    step: Step,
+    a: T,
+    b: T,
+    a_better_when_greater: bool,
+) -> Option<Verdict> {
     let o = a.cmp(&b);
     if o == Ordering::Equal {
         return None;
     }
-    let order = if a_better_when_greater { o } else { o.reverse() };
-    let (w, l) = if order == Ordering::Greater { (a, b) } else { (b, a) };
+    let order = if a_better_when_greater {
+        o
+    } else {
+        o.reverse()
+    };
+    let (w, l) = if order == Ordering::Greater {
+        (a, b)
+    } else {
+        (b, a)
+    };
     Some(Verdict {
         order,
         step,
@@ -253,7 +282,13 @@ fn kind_name(k: PeerKind) -> &'static str {
 
 /// Compare `a` with `b`. `a_selected`/`b_selected`: the path the daemon
 /// holds as best now (the "older path" step keeps it).
-pub fn compare(a: &BgpPath, b: &BgpPath, a_selected: bool, b_selected: bool, o: &Options) -> Verdict {
+pub fn compare(
+    a: &BgpPath,
+    b: &BgpPath,
+    a_selected: bool,
+    b_selected: bool,
+    o: &Options,
+) -> Verdict {
     // §9.1.2: only usable paths compete.
     if let Some(v) = flag(Step::NotUsable, a.valid, b.valid, "usable", "not usable") {
         return v;
@@ -266,7 +301,13 @@ pub fn compare(a: &BgpPath, b: &BgpPath, a_selected: bool, b_selected: bool, o: 
         return v;
     }
     let local = |p: &BgpPath| p.peer_kind == PeerKind::Local;
-    if let Some(v) = flag(Step::LocalRoute, local(a), local(b), "originated here", "received") {
+    if let Some(v) = flag(
+        Step::LocalRoute,
+        local(a),
+        local(b),
+        "originated here",
+        "received",
+    ) {
         return v;
     }
     if !o.as_path_ignore {
@@ -285,7 +326,11 @@ pub fn compare(a: &BgpPath, b: &BgpPath, a_selected: bool, b_selected: bool, o: 
         let a_wins = a.origin < b.origin;
         let (w, l) = if a_wins { (a, b) } else { (b, a) };
         return Verdict {
-            order: if a_wins { Ordering::Greater } else { Ordering::Less },
+            order: if a_wins {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            },
             step: Step::Origin,
             winner_value: w.origin.name().into(),
             loser_value: l.origin.name().into(),
@@ -303,10 +348,15 @@ pub fn compare(a: &BgpPath, b: &BgpPath, a_selected: bool, b_selected: bool, o: 
     }
     // eBGP over iBGP and confederation peers.
     let ext = |p: &BgpPath| is_ebgp(p);
-    let ibgpish = |p: &BgpPath| matches!(p.peer_kind, PeerKind::Internal | PeerKind::ConfedExternal);
+    let ibgpish =
+        |p: &BgpPath| matches!(p.peer_kind, PeerKind::Internal | PeerKind::ConfedExternal);
     if ext(a) && ibgpish(b) || ext(b) && ibgpish(a) {
         return Verdict {
-            order: if ext(a) { Ordering::Greater } else { Ordering::Less },
+            order: if ext(a) {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            },
             step: Step::PeerType,
             winner_value: "ebgp".into(),
             loser_value: kind_name(if ext(a) { b.peer_kind } else { a.peer_kind }).into(),
@@ -320,7 +370,11 @@ pub fn compare(a: &BgpPath, b: &BgpPath, a_selected: bool, b_selected: bool, o: 
     let cint = |p: &BgpPath| p.peer_kind == PeerKind::Internal;
     if cext(a) && cint(b) || cext(b) && cint(a) {
         return Verdict {
-            order: if cext(a) { Ordering::Greater } else { Ordering::Less },
+            order: if cext(a) {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            },
             step: Step::ConfedPeerType,
             winner_value: "confed-ebgp".into(),
             loser_value: "ibgp".into(),
@@ -329,39 +383,79 @@ pub fn compare(a: &BgpPath, b: &BgpPath, a_selected: bool, b_selected: bool, o: 
     if !o.compare_router_id
         && ext(a)
         && ext(b)
-        && let Some(v) = flag(Step::OlderPath, a_selected, b_selected, "chosen first", "newer")
+        && let Some(v) = flag(
+            Step::OlderPath,
+            a_selected,
+            b_selected,
+            "chosen first",
+            "newer",
+        )
     {
         return v;
     }
-    let rid = |p: &BgpPath| u32::from(p.originator_id.or(p.peer_router_id).unwrap_or([0, 0, 0, 0].into()));
+    let rid = |p: &BgpPath| {
+        u32::from(
+            p.originator_id
+                .or(p.peer_router_id)
+                .unwrap_or([0, 0, 0, 0].into()),
+        )
+    };
     if let Some(mut v) = verdict(Step::RouterId, rid(a), rid(b), false) {
-        v.winner_value = std::net::Ipv4Addr::from(v.winner_value.parse::<u32>().unwrap_or(0)).to_string();
-        v.loser_value = std::net::Ipv4Addr::from(v.loser_value.parse::<u32>().unwrap_or(0)).to_string();
+        v.winner_value =
+            std::net::Ipv4Addr::from(v.winner_value.parse::<u32>().unwrap_or(0)).to_string();
+        v.loser_value =
+            std::net::Ipv4Addr::from(v.loser_value.parse::<u32>().unwrap_or(0)).to_string();
         return v;
     }
-    if let Some(v) = verdict(Step::ClusterLength, a.cluster_list_len, b.cluster_list_len, false) {
+    if let Some(v) = verdict(
+        Step::ClusterLength,
+        a.cluster_list_len,
+        b.cluster_list_len,
+        false,
+    ) {
         return v;
     }
     if let Some(v) = flag(Step::Stale, !a.stale, !b.stale, "fresh", "stale") {
         return v;
     }
-    let addr = |p: &BgpPath| p.peer.parse::<IpAddr>().ok().filter(|a| !a.is_unspecified());
+    let addr = |p: &BgpPath| {
+        p.peer
+            .parse::<IpAddr>()
+            .ok()
+            .filter(|a| !a.is_unspecified())
+    };
     match (addr(a), addr(b)) {
         // Our own routes have no peer address: they lose here (FRR
         // "Locally configured route"; step 3 nearly always decided first).
         (None, Some(_)) | (Some(_), None) => {
             let a_wins = addr(a).is_some();
             return Verdict {
-                order: if a_wins { Ordering::Greater } else { Ordering::Less },
+                order: if a_wins {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                },
                 step: Step::NeighborAddress,
-                winner_value: if a_wins { a.peer.clone() } else { b.peer.clone() },
-                loser_value: if a_wins { b.peer.clone() } else { a.peer.clone() },
+                winner_value: if a_wins {
+                    a.peer.clone()
+                } else {
+                    b.peer.clone()
+                },
+                loser_value: if a_wins {
+                    b.peer.clone()
+                } else {
+                    a.peer.clone()
+                },
             };
         }
         (Some(x), Some(y)) if x != y => {
             let a_wins = x < y;
             return Verdict {
-                order: if a_wins { Ordering::Greater } else { Ordering::Less },
+                order: if a_wins {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                },
                 step: Step::NeighborAddress,
                 winner_value: if a_wins { x } else { y }.to_string(),
                 loser_value: if a_wins { y } else { x }.to_string(),
@@ -416,7 +510,11 @@ pub fn explain(p: &BgpPrefix, o: &Options) -> Explanation {
             None => Some(i),
             Some((w, wp)) => {
                 let v = compare(x, wp, x.best, wp.best, o);
-                if v.order == Ordering::Greater { Some(i) } else { Some(w) }
+                if v.order == Ordering::Greater {
+                    Some(i)
+                } else {
+                    Some(w)
+                }
             }
         };
     }
@@ -567,23 +665,57 @@ mod tests {
     fn explains_ten_paths() {
         let mut paths: Vec<BgpPath> = (1..=10)
             .map(|i| {
-                let mut p = path(&format!("198.51.100.{i}"), PeerKind::Internal, &[64500, 64500 + i]);
+                let mut p = path(
+                    &format!("198.51.100.{i}"),
+                    PeerKind::Internal,
+                    &[64500, 64500 + i],
+                );
                 p.local_pref = Some(100 + i % 3);
                 p
             })
             .collect();
         // FRR chose the first one with local-pref 102 and lowest router id.
-        let best = paths.iter().position(|p| p.local_pref == Some(102)).unwrap();
+        let best = paths
+            .iter()
+            .position(|p| p.local_pref == Some(102))
+            .unwrap();
         paths[best].best = true;
         paths[best].selection_reason = Some("Local Pref".into());
-        let e = explain(&BgpPrefix { prefix: "10.0.0.0/8".into(), paths, ..BgpPrefix::default() }, &Options::default());
+        let e = explain(
+            &BgpPrefix {
+                prefix: "10.0.0.0/8".into(),
+                paths,
+                ..BgpPrefix::default()
+            },
+            &Options::default(),
+        );
         assert_eq!(e.best, Some(best));
         assert!(e.agrees);
-        let steps: Vec<Option<Step>> = e.rows.iter().map(|r| r.lost_at.as_ref().map(|v| v.step)).collect();
-        assert_eq!(steps.iter().filter(|s| **s == Some(Step::LocalPref)).count(), 7);
-        assert_eq!(steps.iter().filter(|s| **s == Some(Step::RouterId)).count(), 2);
+        let steps: Vec<Option<Step>> = e
+            .rows
+            .iter()
+            .map(|r| r.lost_at.as_ref().map(|v| v.step))
+            .collect();
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|s| **s == Some(Step::LocalPref))
+                .count(),
+            7
+        );
+        assert_eq!(
+            steps.iter().filter(|s| **s == Some(Step::RouterId)).count(),
+            2
+        );
         assert!(e.rows.iter().all(|r| !r.unexplained));
-        let w = e.rows.iter().find(|r| r.best).unwrap().won_at.as_ref().unwrap();
+        let w = e
+            .rows
+            .iter()
+            .find(|r| r.best)
+            .unwrap()
+            .won_at
+            .as_ref()
+            .unwrap();
         assert_eq!(w.step, Step::RouterId);
         assert_eq!(Step::from_frr_reason("Local Pref"), Some(Step::LocalPref));
     }
@@ -595,7 +727,14 @@ mod tests {
         a.local_pref = Some(100);
         b.local_pref = Some(200);
         a.best = true;
-        let e = explain(&BgpPrefix { prefix: "10.0.0.0/8".into(), paths: vec![a, b], ..BgpPrefix::default() }, &Options::default());
+        let e = explain(
+            &BgpPrefix {
+                prefix: "10.0.0.0/8".into(),
+                paths: vec![a, b],
+                ..BgpPrefix::default()
+            },
+            &Options::default(),
+        );
         assert!(!e.agrees);
         assert!(e.rows[1].unexplained);
     }

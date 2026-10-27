@@ -55,10 +55,12 @@ impl AsPathPattern {
         let body = t.trim_start_matches('^').trim_end_matches('$');
         let mut asns = Vec::new();
         for w in body.split([' ', '_', ',']).filter(|w| !w.is_empty()) {
-            asns.push(
-                w.parse::<u32>()
-                    .map_err(|_| format!("{:?} is not an AS number (use ^, $ and AS numbers)", w.chars().take(20).collect::<String>()))?,
-            );
+            asns.push(w.parse::<u32>().map_err(|_| {
+                format!(
+                    "{:?} is not an AS number (use ^, $ and AS numbers)",
+                    w.chars().take(20).collect::<String>()
+                )
+            })?);
             if asns.len() > 64 {
                 return Err("at most 64 AS numbers in a search".into());
             }
@@ -144,7 +146,11 @@ impl Indexed {
         rib.routes.sort_unstable_by_key(|r| key(&r.prefix));
         let keys: Vec<(bool, u128, u8)> = rib.routes.iter().map(|r| key(&r.prefix)).collect();
         // Origin AS once per attribute set, not per route.
-        let origins: Vec<Option<u32>> = rib.attrs.iter().map(|a| origin_as(&a.as_path, local_as)).collect();
+        let origins: Vec<Option<u32>> = rib
+            .attrs
+            .iter()
+            .map(|a| origin_as(&a.as_path, local_as))
+            .collect();
         let mut summary = Summary::default();
         let states: Vec<RpkiState> = rib
             .routes
@@ -153,7 +159,11 @@ impl Indexed {
                 let s = match vrps {
                     None => RpkiState::Unverified,
                     Some(t) => {
-                        let origin = usize::try_from(r.attrs).ok().and_then(|i| origins.get(i)).copied().flatten();
+                        let origin = usize::try_from(r.attrs)
+                            .ok()
+                            .and_then(|i| origins.get(i))
+                            .copied()
+                            .flatten();
                         t.validate(r.prefix.network(), r.prefix.prefix_len(), origin)
                     }
                 };
@@ -181,7 +191,11 @@ impl Indexed {
 
     pub fn route(&self, i: usize) -> Option<(&BgpRoute, Option<&BgpAttrs>, RpkiState)> {
         let r = self.rib.routes.get(i)?;
-        Some((r, self.rib.attrs_of(r), self.states.get(i).copied().unwrap_or(RpkiState::Unverified)))
+        Some((
+            r,
+            self.rib.attrs_of(r),
+            self.states.get(i).copied().unwrap_or(RpkiState::Unverified),
+        ))
     }
 
     /// The candidate positions for a prefix search, in order.
@@ -190,12 +204,22 @@ impl Indexed {
             return Box::new(0..self.keys.len());
         };
         let (v6, pk, plen) = key(&p.trunc());
-        let host = |len: u8| if len == 0 { u128::MAX } else { !(u128::MAX << (128 - u32::from(len))) };
+        let host = |len: u8| {
+            if len == 0 {
+                u128::MAX
+            } else {
+                !(u128::MAX << (128 - u32::from(len)))
+            }
+        };
         match m {
             Match::Covering => {
                 let mut hits = Vec::new();
                 for len in 0..=plen {
-                    let mask = if len == 0 { 0 } else { u128::MAX << (128 - u32::from(len)) };
+                    let mask = if len == 0 {
+                        0
+                    } else {
+                        u128::MAX << (128 - u32::from(len))
+                    };
                     let k = (v6, pk & mask, len);
                     if let Ok(i) = self.keys.binary_search(&k) {
                         hits.push(i);
@@ -210,7 +234,9 @@ impl Indexed {
                 let hi = self.keys.partition_point(|k| *k <= (v6, top, 128));
                 let longer = m == Match::Longer;
                 Box::new((lo..hi.max(lo)).filter(move |&i| {
-                    self.keys.get(i).is_some_and(|&(f, _, l)| f == v6 && l >= plen && (!longer || l > plen))
+                    self.keys
+                        .get(i)
+                        .is_some_and(|&(f, _, l)| f == v6 && l >= plen && (!longer || l > plen))
                 }))
             }
         }
@@ -219,24 +245,34 @@ impl Indexed {
     /// The routes that match `q`: how many in all, and those of the page.
     pub fn search(&self, q: &Query, offset: usize, limit: usize) -> (usize, Vec<usize>) {
         // Attribute sets that pass the attribute searches, computed once.
-        let attr_ok: Option<Vec<bool>> = (q.as_path.is_some() || q.community.is_some()).then(|| {
-            self.rib
-                .attrs
-                .iter()
-                .map(|a| {
-                    q.as_path.as_ref().is_none_or(|p| p.matches(&a.as_path))
-                        && q.community.as_ref().is_none_or(|c| {
-                            a.communities.iter().chain(&a.large_communities).any(|x| x.eq_ignore_ascii_case(c))
-                        })
-                })
-                .collect()
-        });
+        let attr_ok: Option<Vec<bool>> =
+            (q.as_path.is_some() || q.community.is_some()).then(|| {
+                self.rib
+                    .attrs
+                    .iter()
+                    .map(|a| {
+                        q.as_path.as_ref().is_none_or(|p| p.matches(&a.as_path))
+                            && q.community.as_ref().is_none_or(|c| {
+                                a.communities
+                                    .iter()
+                                    .chain(&a.large_communities)
+                                    .any(|x| x.eq_ignore_ascii_case(c))
+                            })
+                    })
+                    .collect()
+            });
         let mut total = 0usize;
         let mut page = Vec::with_capacity(limit.min(5_000));
         for i in self.candidates(q) {
-            let Some(r) = self.rib.routes.get(i) else { continue };
+            let Some(r) = self.rib.routes.get(i) else {
+                continue;
+            };
             if let Some(ok) = &attr_ok
-                && !usize::try_from(r.attrs).ok().and_then(|a| ok.get(a)).copied().unwrap_or(false)
+                && !usize::try_from(r.attrs)
+                    .ok()
+                    .and_then(|a| ok.get(a))
+                    .copied()
+                    .unwrap_or(false)
             {
                 continue;
             }
@@ -271,11 +307,26 @@ mod tests {
 
     fn rib() -> BgpRib {
         let attrs = vec![
-            BgpAttrs { as_path: "64500 13335".into(), communities: vec!["65000:100".into()], ..BgpAttrs::default() },
-            BgpAttrs { as_path: "64500 64666".into(), large_communities: vec!["65000:1:2".into()], ..BgpAttrs::default() },
-            BgpAttrs { as_path: "64500 {64510,64511}".into(), ..BgpAttrs::default() },
+            BgpAttrs {
+                as_path: "64500 13335".into(),
+                communities: vec!["65000:100".into()],
+                ..BgpAttrs::default()
+            },
+            BgpAttrs {
+                as_path: "64500 64666".into(),
+                large_communities: vec!["65000:1:2".into()],
+                ..BgpAttrs::default()
+            },
+            BgpAttrs {
+                as_path: "64500 {64510,64511}".into(),
+                ..BgpAttrs::default()
+            },
         ];
-        let mk = |p: &str, a: u32, flags: u8| BgpRoute { prefix: p.parse().unwrap(), attrs: a, flags };
+        let mk = |p: &str, a: u32, flags: u8| BgpRoute {
+            prefix: p.parse().unwrap(),
+            attrs: a,
+            flags,
+        };
         BgpRib {
             routes: vec![
                 mk("10.1.0.0/16", 0, BgpRoute::BEST),
@@ -294,21 +345,44 @@ mod tests {
     fn prefixes(ix: &Indexed, q: &Query) -> Vec<String> {
         let (n, page) = ix.search(q, 0, 100);
         assert_eq!(n, page.len());
-        page.iter().map(|&i| ix.rib.routes[i].prefix.to_string()).collect()
+        page.iter()
+            .map(|&i| ix.rib.routes[i].prefix.to_string())
+            .collect()
     }
 
     #[test]
     fn prefix_searches() {
         let ix = Indexed::new(rib(), None, Some(65000));
-        let q = |p: &str, m| Query { prefix: Some((p.parse().unwrap(), m)), ..Query::default() };
-        assert_eq!(prefixes(&ix, &q("10.0.0.0/8", Match::OrLonger)), ["10.0.0.0/8", "10.1.0.0/16", "10.1.0.0/24", "10.1.2.0/24"]);
-        assert_eq!(prefixes(&ix, &q("10.0.0.0/8", Match::Longer)), ["10.1.0.0/16", "10.1.0.0/24", "10.1.2.0/24"]);
-        assert_eq!(prefixes(&ix, &q("10.1.0.0/16", Match::Exact)), ["10.1.0.0/16"]);
-        assert_eq!(prefixes(&ix, &q("10.1.2.3/32", Match::Covering)), ["10.0.0.0/8", "10.1.0.0/16", "10.1.2.0/24"]);
-        assert_eq!(prefixes(&ix, &q("2001:db8:1::/48", Match::Covering)), ["2001:db8::/32"]);
+        let q = |p: &str, m| Query {
+            prefix: Some((p.parse().unwrap(), m)),
+            ..Query::default()
+        };
+        assert_eq!(
+            prefixes(&ix, &q("10.0.0.0/8", Match::OrLonger)),
+            ["10.0.0.0/8", "10.1.0.0/16", "10.1.0.0/24", "10.1.2.0/24"]
+        );
+        assert_eq!(
+            prefixes(&ix, &q("10.0.0.0/8", Match::Longer)),
+            ["10.1.0.0/16", "10.1.0.0/24", "10.1.2.0/24"]
+        );
+        assert_eq!(
+            prefixes(&ix, &q("10.1.0.0/16", Match::Exact)),
+            ["10.1.0.0/16"]
+        );
+        assert_eq!(
+            prefixes(&ix, &q("10.1.2.3/32", Match::Covering)),
+            ["10.0.0.0/8", "10.1.0.0/16", "10.1.2.0/24"]
+        );
+        assert_eq!(
+            prefixes(&ix, &q("2001:db8:1::/48", Match::Covering)),
+            ["2001:db8::/32"]
+        );
         assert_eq!(prefixes(&ix, &q("0.0.0.0/0", Match::OrLonger)).len(), 5);
         assert_eq!(ix.summary.total, 6);
-        assert_eq!((ix.summary.ipv4, ix.summary.ipv6, ix.summary.filtered), (5, 1, 1));
+        assert_eq!(
+            (ix.summary.ipv4, ix.summary.ipv6, ix.summary.filtered),
+            (5, 1, 1)
+        );
         // Pages.
         let (n, page) = ix.search(&Query::default(), 2, 2);
         assert_eq!((n, page.len()), (6, 2));
@@ -316,23 +390,38 @@ mod tests {
 
     #[test]
     fn attribute_and_rpki_searches() {
-        let vrps = VrpTable::build(&[
-            Vrp::new("10.0.0.0".parse().unwrap(), 8, 24, 13335).unwrap(),
-        ]);
+        let vrps = VrpTable::build(&[Vrp::new("10.0.0.0".parse().unwrap(), 8, 24, 13335).unwrap()]);
         let ix = Indexed::new(rib(), Some(&vrps), Some(65000));
         // 10/8 and 10.1/16 valid; 10.1.2/24 (AS 64666) invalid; 10.1.0/24
         // ends in an AS_SET: invalid; 11/8 and the IPv6 one unknown.
         assert_eq!(ix.summary.rpki, [2, 2, 2, 0]);
-        let q = Query { rpki: Some(RpkiState::Invalid), ..Query::default() };
+        let q = Query {
+            rpki: Some(RpkiState::Invalid),
+            ..Query::default()
+        };
         assert_eq!(prefixes(&ix, &q), ["10.1.0.0/24", "10.1.2.0/24"]);
-        let q = Query { as_path: Some(AsPathPattern::parse("13335$").unwrap()), ..Query::default() };
+        let q = Query {
+            as_path: Some(AsPathPattern::parse("13335$").unwrap()),
+            ..Query::default()
+        };
         assert_eq!(prefixes(&ix, &q).len(), 3);
-        let q = Query { as_path: Some(AsPathPattern::parse("^64666").unwrap()), ..Query::default() };
+        let q = Query {
+            as_path: Some(AsPathPattern::parse("^64666").unwrap()),
+            ..Query::default()
+        };
         assert!(prefixes(&ix, &q).is_empty());
-        let q = Query { community: Some("65000:1:2".into()), filtered: Some(true), ..Query::default() };
+        let q = Query {
+            community: Some("65000:1:2".into()),
+            filtered: Some(true),
+            ..Query::default()
+        };
         assert_eq!(prefixes(&ix, &q), ["10.1.2.0/24"]);
         assert!(AsPathPattern::parse("abc").is_err());
         assert!(AsPathPattern::parse("^$").unwrap().matches(""));
-        assert!(AsPathPattern::parse("64500 64510").unwrap().matches("64500 {64510,64511}"));
+        assert!(
+            AsPathPattern::parse("64500 64510")
+                .unwrap()
+                .matches("64500 {64510,64511}")
+        );
     }
 }
