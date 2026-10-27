@@ -4,7 +4,9 @@
 //!   that chain, ports without a protocol that has ports, jump loops…), used
 //!   by the engine before every commit and, per rule, by the commands.
 //! - [`eval`]: which rule decides a packet (the engine's lockout check).
+//! - [`path`]: the way of one packet through every table (`ip.firewall.test`).
 //! - [`shadow`]: rules an earlier rule makes unreachable.
+//! - [`diff`]: line diff of two rulesets (the Diff tab).
 //! - [`describe`]: a rule in plain Portuguese, for the GUI.
 //! - [`nft`]: the nftables ruleset for a config, in table `inet corerouter`
 //!   only (rules of other owners are never touched). `hal-linux` applies it
@@ -20,11 +22,13 @@
 
 pub mod cgnat;
 pub mod describe;
+pub mod diff;
 pub mod eval;
 pub mod fastpath;
 pub mod graph;
 pub mod nft;
 pub mod notice;
+pub mod path;
 pub mod program;
 pub mod sample;
 pub mod shadow;

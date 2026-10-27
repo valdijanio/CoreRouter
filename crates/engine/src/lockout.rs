@@ -105,6 +105,14 @@ fn way_back(cfg: &Config, peer: IpAddr, local: IpAddr) -> Option<String> {
         .as_deref()
         .and_then(|h| h.parse::<IfName>().ok())
         .map_or(RoutingTable::Main, |h| route::table_of(cfg, &h));
+    route_out(cfg, peer, &table)
+}
+
+/// The interface routing sends `peer` out of in `table`: the longest
+/// enabled connected network or active route (the packet tester uses it
+/// too, G2.1c).
+pub(crate) fn route_out(cfg: &Config, peer: IpAddr, table: &RoutingTable) -> Option<String> {
+    let table = table.clone();
     // Longest prefix wins; a connected network beats a route of the same
     // length (distance 0), then the lower distance.
     let mut best: Option<(u8, u8, IfName)> = None;

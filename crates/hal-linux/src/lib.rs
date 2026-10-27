@@ -70,6 +70,12 @@ pub mod nfnl;
 /// Conntrack over ctnetlink (G2.2): codec pure, socket Linux.
 pub mod ctnl;
 
+/// Firewall rule counters in one nfnetlink dump (G2.1c).
+pub mod nft_counters;
+
+/// The packet trace (`meta nftrace`, G2.1c): trace table and event codec.
+pub mod nft_trace;
+
 /// The CGNAT table in the kernel (G2.3).
 #[cfg(target_os = "linux")]
 mod cgnat;

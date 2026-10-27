@@ -97,6 +97,11 @@ const NFTA_PAYLOAD_OFFSET: u16 = 3;
 const NFTA_PAYLOAD_LEN: u16 = 4;
 const NFTA_META_DREG: u16 = 1;
 const NFTA_META_KEY: u16 = 2;
+const NFTA_META_SREG: u16 = 3;
+const NFTA_LIMIT_RATE: u16 = 1;
+const NFTA_LIMIT_UNIT: u16 = 2;
+const NFTA_LIMIT_BURST: u16 = 3;
+const NFTA_LIMIT_TYPE: u16 = 4;
 const NFTA_CMP_SREG: u16 = 1;
 const NFTA_CMP_OP: u16 = 2;
 const NFTA_CMP_DATA: u16 = 3;
@@ -402,6 +407,9 @@ impl Batch {
             Expr::Drop => "immediate",
             Expr::Queue { .. } => "queue",
             Expr::FlowAdd { .. } => "flow_offload",
+            Expr::Immediate { .. } => "immediate",
+            Expr::MetaSet { .. } => "meta",
+            Expr::Limit { .. } => "limit",
         };
         self.str(NFTA_EXPR_NAME, name);
         self.begin(NFTA_EXPR_DATA);
@@ -499,6 +507,24 @@ impl Batch {
             }
             Expr::Counter => {}
             Expr::FlowAdd { table } => self.str(NFTA_FLOW_TABLE_NAME, table),
+            Expr::Immediate { dreg, data } => {
+                self.be32(NFTA_IMMEDIATE_DREG, *dreg);
+                self.value(NFTA_IMMEDIATE_DATA, data);
+            }
+            Expr::MetaSet { key, sreg } => {
+                self.be32(NFTA_META_KEY, key.number());
+                self.be32(NFTA_META_SREG, *sreg);
+            }
+            Expr::Limit {
+                rate,
+                unit_secs,
+                burst,
+            } => {
+                self.be64(NFTA_LIMIT_RATE, *rate);
+                self.be64(NFTA_LIMIT_UNIT, *unit_secs);
+                self.be32(NFTA_LIMIT_BURST, *burst);
+                self.be32(NFTA_LIMIT_TYPE, 0); // NFT_LIMIT_PKTS
+            }
             Expr::Drop => {
                 self.be32(NFTA_IMMEDIATE_DREG, 0);
                 self.begin(NFTA_IMMEDIATE_DATA);

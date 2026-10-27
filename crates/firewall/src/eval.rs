@@ -1,7 +1,7 @@
 //! Where one packet ends in a chain: the rule that decides it, walking
 //! jumps and returns like the kernel does. The engine's lockout check uses
 //! it for the management connection (G2.1b); the packet tester of G2.1c
-//! will show the same walk.
+//! ([`crate::path`]) shows the same walk, chain after chain.
 //!
 //! What a config alone cannot know is assumed, always the same way:
 //!
@@ -163,6 +163,27 @@ pub fn walk(
     chain: &str,
     p: &Packet,
 ) -> Outcome {
+    walk_traced(cfg, dynamic, table, chain, p, None)
+}
+
+/// A rule the packet matched on its way through a chain (G2.1c): jumps,
+/// returns, logs and marks that let it go on, and the one that decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hit {
+    pub rule: ItemId,
+    pub chain: Name,
+    pub action: &'static str,
+}
+
+/// [`walk`], also listing in `hits` every rule that matched, in order.
+pub fn walk_traced(
+    cfg: &Config,
+    dynamic: &[DynamicAddress],
+    table: Table,
+    chain: &str,
+    p: &Packet,
+    mut hits: Option<&mut Vec<Hit>>,
+) -> Outcome {
     let rules: Vec<&FirewallRule> = cfg
         .ip
         .firewall
@@ -188,6 +209,13 @@ pub fn walk(
             }
             if r.chain.as_str() != current || !matches(cfg, dynamic, r, p) {
                 continue;
+            }
+            if let Some(h) = hits.as_deref_mut() {
+                h.push(Hit {
+                    rule: r.id,
+                    chain: r.chain.clone(),
+                    action: r.action.name(),
+                });
             }
             let decided = |verdict| Outcome {
                 verdict,
