@@ -1838,3 +1838,67 @@ cgnat_capacity`; 65 536 assinantes × 20 conexões.
 | entregar ao engine (lock segurado) | 5,6 ms |
 | `ip.firewall.cgnat.capacity.get` | 4,1 ms |
 | memória dos picos de 7 dias | 2,8 MiB |
+
+### G1.6b — atualização A/B (**medido**, 2026-10-27, AMD Ryzen AI Max+ 395, build release do bench / KVM no QEMU)
+
+| Medida | Resultado |
+|---|---|
+| `verity_tree` 16 MiB, 1 / 4 / 8 threads | 7,7 / 7,7 / 7,8 ms (abaixo de 64 MiB não divide) |
+| `verity_tree` 256 MiB, 1 / 4 / 8 threads | 126 / 33 / 18 ms (7,1× com 8) |
+| `package_copy` 64 MiB para arquivo, sequencial × pipeline | 51,8 ms (1,21 GiB/s) × 48,0 ms (1,30 GiB/s), +8% |
+| QEMU: gravar slot B (34,1 MiB) / reler + árvore | 36–53 ms / 12–17 ms |
+| QEMU: kernel → daemon pronto, sem × com dm-verity | 0,72 s × 0,70–0,73 s (sem diferença medível) |
+
+### G2.8 — firewall por nfnetlink × `nft` (**medido**)
+
+AMD Ryzen AI MAX+ 395 (32 threads), kernel 7.0, nft 1.0.9, build release, netns sem root,
+2026-10-27, `cargo bench -p corerouter-hal-linux --bench netns_firewall`. "Antes" = `nft -j list`
++ `nft -f` do ruleset inteiro, com o texto antigo (sets anônimos por regra).
+
+| Operação | nfnetlink | antes (`nft`) |
+|---|---|---|
+| carregar 100 regras | 17,4 ms | 22,8 ms |
+| carregar 1 000 regras | 24,6 ms | 49,3 ms |
+| carregar 10 000 regras | 112 ms | 4,09 s |
+| mudar 1 regra em 100 | 15,8 ms | 26,7 ms |
+| mudar 1 regra em 1 000 | 22,3 ms | 99,4 ms |
+| mudar 1 regra em 10 000 | 109 ms | 6,91 s |
+| 1 000 entradas dinâmicas | 0,92 ms | 2,37 s (um `nft` por entrada); 8,9 ms (script) |
+| 100 000 entradas dinâmicas | 116 ms | script por linha: "Message too long"; `add element` único: 383 ms |
+| ler 1 000 entradas dinâmicas | 0,24 ms | 3,3 ms (`nft -j`) |
+| ler 100 000 entradas dinâmicas | 246 ms | 636 ms (`nft -j`) |
+
+- 10 000 regras com um set anônimo cada: 22 s (`th dport { … }`) e 3,2 s (`ct state { … }`), no
+  `nft` e em nós; com sets compartilhados e máscara, 77 ms e 63 ms.
+- Remover qualquer coisa num lote custa 12–28 ms de kernel (RCU), também no `nft delete rule`;
+  acrescentar ~0,5 ms.
+- Commit de 10 000 regras, por partes: programa antigo 15 ms, novo 15 ms, dump do kernel 38 ms
+  (25–28 ms só de kernel, 6,3 MB) — os três em paralelo —, comparação 9 ms, kernel ~23 ms.
+- 100 000 entradas: kernel ~97 ms, merge 2,5 ms (era 10 ms com `Vec<u8>`), codificação 5 ms;
+  4 threads/4 sockets ≈ 1 lote (o nfnetlink serializa o lote no mutex do nf_tables).
+
+### G3.2a — BGP: engine, render e FRR real (**medido**, 2026-10-27)
+
+Host: AMD Ryzen AI Max+ 395 (32 threads), build release, criterion. VM do laboratório: 8 vCPUs,
+FRR 10.7.1 (pacote oficial), o nosso lado em debug (`CARGO_PROFILE_DEV_DEBUG=0`).
+
+| Medida | Antes | Depois |
+|---|---|---|
+| `engine.batch` com 1 template + 1 000 conexões (uma transação) | 10,6 ms | 7,8 ms |
+| `routing.bgp.connection.set` de uma entre 1 000 (commit inteiro) | 8,1 ms | 1,5 ms |
+| `routing.bgp.connection.list` com 1 000 | — | 2,5 ms |
+| `routing.bgp.session.list` com 1 000 (sob o lock) | — | 1,25–1,48 ms |
+| `proto_bgp::validate` com 1 000 | — | 145 µs |
+| render de 1 000 conexões (`render_all`) | — | 357–462 µs |
+| parse do `running-config` de 1 000 conexões | — | 156 µs |
+| diff com uma conexão mudada entre 1 000 | — | 590 µs |
+| FRR real: aplicar 1 000 conexões | — | 329 ms (5 006 comandos) |
+| FRR real: mudar uma entre 1 000 | — | 28 ms (3 comandos) |
+| FRR real: remover 1 000 | — | 197 ms |
+| FRR real: ler 1 000 sessões (fora do lock) | — | 135 ms |
+
+O "antes" do commit: a seção `routing` não era `CowArc` e entrava inteira no delta do
+histórico duas vezes por commit (~2 ms cada com 1 000 conexões). Montar a resposta de
+`session.list` (1 000 linhas) custa 1,2 ms; clonar um `Value` pronto custaria 0,84 ms, então a
+resposta continua sendo montada na hora. O clone da amostra no serviço `frr` (126 µs) saiu de
+dentro do lock.
