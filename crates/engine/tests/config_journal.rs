@@ -412,10 +412,10 @@ fn the_shutdown_checkpoint_loses_no_journal_line() {
             "{commits}: {:?}",
             t.storage_status().boot_errors
         );
-        same_store(&s, &t);
+        same_store(&mut s, &mut t);
         // The restarted session journals again, and nothing was lost.
         add(&mut t, 5000);
-        same_store(&t, &boot(&storage));
+        same_store(&mut t, &mut boot(&storage));
 
         // The journal still pairs with the previous slot.
         let lost = MemoryStorage::default();
