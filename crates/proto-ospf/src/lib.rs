@@ -12,9 +12,14 @@
 
 pub mod bind;
 pub mod chain;
+pub mod diagnose;
 pub mod frr;
 pub mod impact;
+pub mod layout;
+pub mod packet;
 pub mod pools;
+pub mod sample;
+pub mod topology;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 

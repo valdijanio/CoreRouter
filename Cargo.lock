@@ -1315,6 +1315,7 @@ dependencies = [
  "criterion",
  "ipnet",
  "log",
+ "proptest",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -1523,7 +1524,9 @@ dependencies = [
  "corerouter-proto-bgp",
  "criterion",
  "ipnet",
+ "proptest",
  "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
