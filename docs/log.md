@@ -6364,3 +6364,23 @@ continuação indentadas).
     0 em 48 na segunda rodada), `netns_ha_bfd` 2 em 48. As falhas que sobram a 3× de sobrecarga de CPU são o
     caso em que um hello chega depois da perda do BFD (a máquina de papéis trata como "o par está
     vivo": comportamento desejado contra alarme falso) e não são corrigíveis no teste.
+
+- 2026-10-28 — G1.6k: A imagem instalável passa a levar o **FRR 10.7.1** com a **libyang 3.13.6**, as versões da VM
+  do laboratório onde OSPF, LDP, Segment Routing, TI-LFA e o BFD distribuído foram validados (o
+  Buildroot 2025.02.19 trazia o 10.3 e a libyang 2.1.148). `os/buildroot-patches/` porta para o
+  2025.02.19 as receitas do `master` do Buildroot (FRR 10.7.0 → 10.7.1, libyang 3.13.6), com o
+  hash de cada tarball conferido pelo Buildroot; o `cargo xtask os build` aplica os patches à
+  árvore extraída e a extrai de novo quando eles mudam, e o `os check` recusa patch fora de
+  `package/`. Mesmos daemons e opções (sem `vtysh`, scripts nem bash). Novo `cargo xtask os
+  frr-test`: dois roteadores da imagem no QEMU (sem root, enlace por socket UDP do QEMU),
+  configurados só por comandos, com vizinho OSPF `Full`, prefix SID do outro com rótulo, LDP
+  operacional, BFD `up` pelo data plane do `bfdd`, rótulos MPLS no kernel, ping entre as
+  loopbacks e a versão do FRR igual à do patch (25 s, **medido**).
+
+  Como testar: `cargo xtask os build`, `cargo xtask os frr-test`, `cargo xtask os boot-test --efi`,
+  `cargo xtask os install-test`.
+
+  Números (**medidos**, 2026-10-28, KVM, builds limpos): rootfs 21,4 → 21,7 MiB; RSS dos 8
+  daemons do FRR com OSPF+SR+LDP no ar 85,7 → 88,5 MiB; boot e convergência iguais (kernel → FRR
+  0,75 s, OSPF `Full` 1,5 s, LDP 11,5 s); dois builds limpos com `-j` diferente deram imagens
+  idênticas, menos o OVA (o `CID` aleatório que o `qemu-img` grava no VMDK, que já existia: G1.6l).
