@@ -212,3 +212,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-28 — G3.5 feito (dois `ldpd` reais sobre OSPF na VM, ping pelo LSP, lote × um a um medido)
 - 2026-10-28 — G3.6i feito (BFD contra o `bfdd` real na VM); criadas G3.6j (lote de syscalls) e G3.6k (Down logo depois do Up)
 - 2026-10-28 — G3.7c feito (fidelidade do simulador com o FRR real; multipath BGP como o FRR)
+- 2026-10-28 — G3.6h feito (BFD no par do BNG: tomada em ~150 ms em vez de 1,2 s)
