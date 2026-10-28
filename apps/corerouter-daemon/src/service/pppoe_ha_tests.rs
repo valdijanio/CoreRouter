@@ -13,7 +13,7 @@ use corerouter_engine::ppp::PppBackend;
 use corerouter_proto_ha::record::SessionRecord;
 
 use super::pppoe_bng::ha::{HaChange, TAKEOVER, TAKEOVER_GEN};
-use super::pppoe_bng::{Bng, HA_ACTIVE, PortInfo, Snapshot};
+use super::pppoe_bng::{Backend, Bng, HA_ACTIVE, PortInfo, Snapshot};
 use super::pppoe_bng_tests::{BNG_MAC, IFINDEX, Lab, server, snap};
 
 fn hot(n: usize) -> Snapshot {
@@ -73,7 +73,7 @@ fn the_other_node_adopts_every_session_and_the_subscribers_stay_up() {
     *TAKEOVER.lock().unwrap() = Some(Arc::new(published.clone()));
     TAKEOVER_GEN.fetch_add(1, Ordering::AcqRel);
     assert!(other.ha_pending());
-    let done = other.ha_adopt_pending(now);
+    let done = other.ha_adopt_pending(now).expect("one chunk adopts 200");
     assert_eq!((done.sessions, done.skipped), (n, 0));
     assert!(!other.ha_pending(), "adopted once");
     assert!(other.frames.is_empty(), "nothing sent to the subscribers");
@@ -198,4 +198,219 @@ fn the_class_of_a_radius_session_survives_a_takeover() {
 #[test]
 fn the_class_limit_is_the_records() {
     assert_eq!(corerouter_engine::radius::MAX_CLASS, corerouter_proto_ha::record::MAX_CLASS);
+}
+
+/// G4.3hh profiling: `n` records over two servers, adopted by `lanes`
+/// workers in parallel like the daemon's.
+fn synth(n: usize, lanes: u16) -> (Snapshot, Vec<SessionRecord>) {
+    let mut s = hot(n);
+    s.pools = super::pppoe_bng_tests::pools_of(200_000);
+    let mut second = s.ppp.pppoe_servers[0].clone();
+    second.name = "pppoe-ether3".into();
+    second.id = corerouter_model::ItemId(2);
+    second.interface = "ether3".parse().unwrap();
+    s.ppp.pppoe_servers.push(second);
+    let mut lab = Lab::new(1, hot(1), |i| (format!("u{i}"), format!("p{i}")));
+    no_takeover_pending(&mut lab.bng, 0);
+    lab.start(0..1);
+    lab.run(400, 50);
+    let t = records(&lab.bng.ha_take(lab.now)).remove(0);
+    let mut next_sid: HashMap<(usize, u16), u16> = HashMap::new();
+    let base = u32::from(std::net::Ipv4Addr::new(100, 64, 0, 1));
+    let recs = (0..n)
+        .map(|i| {
+            let mut r = t.clone();
+            r.client_mac = [0x02, 0x10, (i >> 16) as u8, (i >> 8) as u8, i as u8, 0x01];
+            let lane = super::pppoe_bng::ha::mac_lane(r.client_mac, lanes);
+            let srv = i % 2;
+            let sid = next_sid.entry((srv, lane)).or_insert(lane);
+            *sid += lanes;
+            r.sid = *sid;
+            r.server = if srv == 0 { "pppoe-ether2".into() } else { "pppoe-ether3".into() };
+            r.ipv4 = Some(std::net::Ipv4Addr::from(base + i as u32));
+            r.username = format!("u{i}").into_bytes().into();
+            r.acct_session_id = format!("{i:08x}").into();
+            r
+        })
+        .collect();
+    (s, recs)
+}
+
+#[test]
+#[ignore = "profiling: cargo test --release -p corerouter-daemon adopt_profile -- --ignored --nocapture"]
+fn adopt_profile() {
+    let _g = pair_lock();
+    let n: usize = std::env::var("ADOPT_N").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
+    let lanes: u16 = std::env::var("ADOPT_LANES").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let (s, recs) = synth(n, lanes);
+    let ports = HashMap::from([
+        ("pppoe-ether2".to_owned(), PortInfo { ifindex: IFINDEX, mac: BNG_MAC }),
+        ("pppoe-ether3".to_owned(), PortInfo { ifindex: IFINDEX + 1, mac: BNG_MAC }),
+    ]);
+    let mut bngs = vec![Bng::first_of([9; 32], lanes)];
+    for lane in 1..lanes {
+        let b = bngs[0].sibling([9; 32], lane, lanes);
+        bngs.push(b);
+    }
+    for b in &mut bngs {
+        b.configure(0, s.clone(), &ports);
+        no_takeover_pending(b, 0);
+    }
+    let shared = bngs[0].shared.clone();
+    *TAKEOVER.lock().unwrap() = Some(Arc::new(recs));
+    TAKEOVER_GEN.fetch_add(1, Ordering::AcqRel);
+    let t0 = std::time::Instant::now();
+    let handles: Vec<_> = bngs
+        .into_iter()
+        .map(|mut b| {
+            std::thread::spawn(move || {
+                let t = std::time::Instant::now();
+                let mut d = b.ha_adopt_pending(1000);
+                let answering = t.elapsed();
+                while d.is_none() {
+                    d = b.ha_adopt_step(1000);
+                }
+                let d = d.unwrap();
+                let serving = t.elapsed();
+                while b.ha_later() {
+                    b.ha_adopt_rest(1000);
+                }
+                (d, answering, serving, t.elapsed(), b)
+            })
+        })
+        .collect();
+    let mut total = 0;
+    for h in handles {
+        let (d, answering, serving, all, b) = h.join().unwrap();
+        eprintln!("worker: {} adopted, {} skipped: answering after {answering:?}, all adopted after {serving:?}, bookkeeping done after {all:?} ({} effects)", d.sessions, d.skipped, b.effects.len());
+        total += d.sessions;
+        b.check().unwrap();
+    }
+    eprintln!("{total} of {n} adopted by {lanes} workers in {:?}", t0.elapsed());
+    assert_eq!(total, n);
+    assert_eq!(Backend(shared).active().len(), n, "every session in the active table");
+}
+
+/// G4.3hh: the worker answers after the first phase of a takeover; the
+/// bookkeeping (active table, history, Interim) follows a chunk per round.
+/// A session that ends in between still gets its row first: its Stop
+/// carries the counters it came with, and no Interim goes for it.
+#[test]
+fn a_session_that_ends_before_its_bookkeeping_keeps_its_counters() {
+    use super::pppoe_bng_tests::FakeAaa;
+    use corerouter_model::radius::AcctStatus;
+    let radius_snap = |aaa: &Arc<FakeAaa>| {
+        let mut s = snap(0, server(serde_json::json!({"authentication": ["pap"]})), 10);
+        s.ppp.redundancy.enabled = true;
+        s.ppp.redundancy.mode = corerouter_model::ppp_redundancy::HaMode::HotStandby;
+        s.ppp.redundancy.secret = "segredo-do-par-123".into();
+        s.ppp.aaa.use_radius = true;
+        s.aaa = Some(aaa.clone());
+        s
+    };
+    let _g = pair_lock();
+    let a_aaa = Arc::new(FakeAaa::default());
+    let n = 3;
+    let mut lab = Lab::new(n, radius_snap(&a_aaa), |i| (format!("r{i}"), "x".into()));
+    no_takeover_pending(&mut lab.bng, 0);
+    for i in 0..n {
+        let mut cfg = lab.clients[i].config().clone();
+        cfg.auth = corerouter_proto_pppoe::layers::AuthSet::new(&[corerouter_proto_pppoe::lcp::AuthProto::Pap]);
+        lab.clients[i] = corerouter_proto_pppoe::client::Client::new(cfg, [5 + i as u8; 32]);
+    }
+    lab.start(0..n);
+    lab.run(400, 50);
+    assert_eq!(lab.ups(), n);
+    let mut published = records(&lab.bng.ha_take(lab.now));
+    for r in &mut published {
+        r.counters.rx_bytes = 123_456;
+        r.counters.tx_bytes = 654_321;
+    }
+    let c_aaa = Arc::new(FakeAaa::default());
+    let mut other = Bng::new([9; 32]);
+    let ports = HashMap::from([("pppoe-ether2".to_owned(), PortInfo { ifindex: IFINDEX, mac: BNG_MAC })]);
+    other.configure(lab.now, radius_snap(&c_aaa), &ports);
+    no_takeover_pending(&mut other, lab.now);
+    let refs: Vec<&SessionRecord> = published.iter().collect();
+    assert_eq!(other.adopt(lab.now, &refs).sessions, n);
+    // First phase only: serving, nothing in the table yet, no Interim.
+    assert!(other.ha_later());
+    assert!(Backend(other.shared.clone()).active().is_empty());
+    assert!(c_aaa.accts.lock().unwrap().is_empty());
+    // Subscriber 0 hangs up now (PADT to the new node).
+    let mut out = corerouter_proto_pppoe::client::ClientOutput::new();
+    lab.clients[0].abort(&mut out);
+    for (_, f) in out.frames() {
+        other.frame(lab.now, IFINDEX, f);
+    }
+    lab.bng = other;
+    lab.run(100, 50);
+    assert!(!lab.bng.ha_later(), "the bookkeeping is done");
+    let accts = c_aaa.accts.lock().unwrap().clone();
+    let stops: Vec<_> = accts.iter().filter(|r| r.status == AcctStatus::Stop).collect();
+    assert_eq!(stops.len(), 1, "{accts:?}");
+    let c = stops[0].counters.as_ref().unwrap();
+    assert_eq!((c.input_octets, c.output_octets), (123_456, 654_321), "the counters it came with");
+    let interims = accts.iter().filter(|r| r.status == AcctStatus::InterimUpdate).count();
+    assert_eq!(interims, n - 1, "an Interim for each session still up, none for the one gone");
+    let active = lab.backend().active();
+    assert_eq!(active.len(), n - 1);
+    assert!(active.iter().all(|a| a.rx_bytes == 123_456));
+    lab.bng.check().unwrap();
+}
+
+/// G4.3hh: a takeover bigger than one chunk. The worker answers after the
+/// first; an upstream packet of a session still waiting adopts it on the
+/// spot and goes up (no PADT); the next rounds adopt the rest.
+#[test]
+fn a_frame_of_a_session_not_adopted_yet_adopts_it_on_the_spot() {
+    let _g = pair_lock();
+    let n = 1300;
+    let mut lab = Lab::new(n, hot(n), |i| (format!("u{i}"), format!("p{i}")));
+    no_takeover_pending(&mut lab.bng, 0);
+    lab.start(0..n);
+    lab.run(400, 50);
+    assert_eq!(lab.ups(), n);
+    let now = lab.now;
+    let published = records(&lab.bng.ha_take(now));
+    let mut other = Bng::new([9; 32]);
+    let ports = HashMap::from([("pppoe-ether2".to_owned(), PortInfo { ifindex: IFINDEX, mac: BNG_MAC })]);
+    other.configure(now, hot(n), &ports);
+    *TAKEOVER.lock().unwrap() = Some(Arc::new(published.clone()));
+    TAKEOVER_GEN.fetch_add(1, Ordering::AcqRel);
+    assert!(other.ha_adopt_pending(now).is_none(), "one chunk, more to go");
+    assert!(other.serving(), "it answers already");
+    assert!(other.ha_adopting());
+    // The chunks take the records from the end: the first is still waiting.
+    let r = &published[0];
+    let ip = r.ipv4.unwrap();
+    let mut pkt = vec![0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0];
+    pkt.extend_from_slice(&ip.octets());
+    pkt.extend_from_slice(&[8, 8, 8, 8]);
+    let mut f = Vec::new();
+    f.extend_from_slice(&BNG_MAC);
+    f.extend_from_slice(&r.client_mac);
+    f.extend_from_slice(&[0x88, 0x64, 0x11, 0x00]);
+    f.extend_from_slice(&r.sid.to_be_bytes());
+    f.extend_from_slice(&(pkt.len() as u16 + 2).to_be_bytes());
+    f.extend_from_slice(&[0x00, 0x21]);
+    f.extend_from_slice(&pkt);
+    other.frame(now, IFINDEX, &f);
+    assert_eq!(other.upstream, vec![pkt], "adopted and forwarded");
+    assert!(other.frames.is_empty(), "no PADT, nothing to the subscriber");
+    let mut done = None;
+    for _ in 0..10 {
+        if done.is_none() {
+            done = other.ha_adopt_step(now);
+        }
+    }
+    let done = done.expect("the rest in the next chunk");
+    assert_eq!((done.sessions, done.skipped), (n, 0), "the one on demand counted once");
+    assert!(!other.ha_adopting());
+    lab.bng = other;
+    lab.run(2400, 50);
+    assert_eq!(lab.ups(), n, "no subscriber noticed");
+    assert_eq!(lab.backend().stats().padt_tx, 0);
+    assert_eq!(lab.backend().active().len(), n);
+    lab.bng.check().unwrap();
 }

@@ -76,6 +76,11 @@ const PER_PORT: usize = 50_000;
 /// one thread, and 200 000 pps through it would drown the LCP echoes, which
 /// is not what this lab measures (`bng_lab.rs` samples the same way).
 const SAMPLE_ALL: usize = 2000;
+/// G4.3hh: sessions whose upstream flow is read after the cut ("traffic
+/// back": the first and the last of them), spread over the workers.
+const PROBES: usize = 32;
+/// Their packets per second above `SAMPLE_ALL` (1 pps below).
+const PROBE_PPS: u64 = 20;
 const SECRET: &str = "lab-segredo";
 const PAIR_SECRET: &str = "segredo-do-par-do-laboratorio";
 
@@ -237,7 +242,9 @@ impl Blaster {
                 "ip6cp": {"enable": false},
             },
             "dhcpv6": {"enable": false},
-            "session-traffic": {"autostart": n <= SAMPLE_ALL, "ipv4-pps": 1},
+            // G4.3hh: above SAMPLE_ALL only the sample and the probes send,
+            // at PROBE_PPS: the time traffic is back resolves to 1/PROBE_PPS.
+            "session-traffic": {"autostart": n <= SAMPLE_ALL, "ipv4-pps": if n <= SAMPLE_ALL { 1 } else { PROBE_PPS }},
         });
         if ipoe() {
             // The gateway's MAC asked again every second: after the
@@ -502,6 +509,86 @@ fn rx_sample(ns: Option<u32>) -> u64 {
         .unwrap_or(0)
 }
 
+/// G4.3hh: `PROBES` session ids spread over 1..=n.
+fn probe_ids(n: usize) -> Vec<usize> {
+    (0..PROBES.min(n))
+        .map(|k| 1 + k * n / PROBES.min(n).max(1))
+        .collect()
+}
+
+/// The probes' IPv4 addresses on A (the active one before the cut).
+fn probe_addrs(n: usize) -> Vec<std::net::Ipv4Addr> {
+    probe_ids(n)
+        .into_iter()
+        .filter_map(|id| {
+            let name = format!("rad{id}");
+            let v = call(None, "ppp.active.list", json!({"find": name, "limit": 100})).ok()?;
+            v["rows"]
+                .as_array()?
+                .iter()
+                .find(|r| r["name"] == name.as_str())?["address"]
+                .as_str()?
+                .parse()
+                .ok()
+        })
+        .collect()
+}
+
+/// Seconds from `cut` to the first IPv4 packet from each of `ips` on the
+/// bridge port toward BNG Blaster's network side (`blnet-p`: what reached
+/// the network), until `limit`. Bound to that port: the access bridges'
+/// 100 000 sessions copied into this thread would load the VM it measures.
+fn first_seen(ips: &[std::net::Ipv4Addr], cut: Instant, limit: Duration) -> Vec<f64> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    // Every protocol: a tap of one protocol does not see what a bridge
+    // forwards (the bridge takes the frame first); ETH_P_ALL taps do.
+    const ETH_P_ALL: u16 = 0x0003;
+    let sock = match Socket::new(
+        Domain::PACKET,
+        Type::RAW,
+        Some(Protocol::from(i32::from(ETH_P_ALL.to_be()))),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("probes: no packet socket: {e}");
+            return Vec::new();
+        }
+    };
+    let port = nix::ifaddrs::getifaddrs().ok().and_then(|mut it| {
+        it.find(|i| {
+            i.interface_name == "blnet-p"
+                && i.address.as_ref().and_then(|a| a.as_link_addr()).is_some()
+        })
+        .and_then(|i| i.address.and_then(|a| a.as_link_addr().copied()))
+    });
+    let bound = port.is_some_and(|l| {
+        nix::sys::socket::bind(std::os::fd::AsRawFd::as_raw_fd(&sock), &l).is_ok()
+    });
+    if !bound {
+        eprintln!("probes: could not bind to blnet-p");
+        return Vec::new();
+    }
+    let _ = sock.set_recv_buffer_size(16 << 20);
+    let _ = sock.set_read_timeout(Some(Duration::from_millis(20)));
+    let mut first: HashMap<std::net::Ipv4Addr, f64> = HashMap::new();
+    let mut buf = [0u8; 2048];
+    while cut.elapsed() < limit && first.len() < ips.len() {
+        let Ok(len) = std::io::Read::read(&mut &sock, &mut buf) else {
+            continue;
+        };
+        let at = cut.elapsed().as_secs_f64();
+        // Ethernet II carrying IPv4, then the IPv4 source at 14 + 12.
+        if len < 34 || buf[12..14] != [0x08, 0x00] {
+            continue;
+        }
+        let ip = std::net::Ipv4Addr::new(buf[26], buf[27], buf[28], buf[29]);
+        if ips.contains(&ip) {
+            first.entry(ip).or_insert(at);
+        }
+    }
+    first.into_values().collect()
+}
+
 fn monitor(ns: Option<u32>) -> Value {
     call(ns, "ppp.redundancy.monitor", json!({})).unwrap_or(Value::Null)
 }
@@ -544,7 +631,7 @@ fn bng_lab_ha() {
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
         .unwrap_or_else(|| vec![10_000]);
     let mut md = String::from(
-        "# BNG em par (G4.3h): o ativo perde a energia\n\n| Sessões | Plano de dados | Tomada | Linha do tempo em C (detectado/testemunha/ativo/adotadas, do último sinal de vida) | Todas no nó novo | Tráfego de volta | Sessões perdidas | Na tabela do novo | Starts (ids únicos) | Stops na tomada | Sessões com Interim do novo | Sessões sem Interim do novo | Registros sem o Class do usuário | CoA ao nó antigo (ACK, mediana, p99, total) |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+        "# BNG em par (G4.3h): o ativo perde a energia\n\n| Sessões | Plano de dados | Tomada | Linha do tempo em C (detectado/testemunha/ativo/adotadas, rotas no kernel; do último sinal de vida) | Todas no nó novo | Tráfego de volta (tabela de C) | Subida das sondas de volta (1ª / todas) | Sessões perdidas | Na tabela do novo | Starts (ids únicos) | Stops na tomada | Sessões com Interim do novo | Sessões sem Interim do novo | Registros sem o Class do usuário | CoA ao nó antigo (ACK, mediana, p99, total) |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for n in scales {
         let row = run(n, &blaster, &out);
@@ -731,10 +818,17 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
             .flatten()
             .filter_map(|r| r["name"].as_str()?.strip_prefix("rad")?.parse().ok())
             .collect();
-        for id in &ids {
+        for id in ids
+            .iter()
+            .copied()
+            .chain(probe_ids(n).into_iter().map(|p| p as u64))
+        {
             b.cmd(json!({"command": "session-traffic-start", "arguments": {"session-id": id}}));
         }
-        eprintln!("ha {n}: traffic on {} sampled sessions", ids.len());
+        eprintln!(
+            "ha {n}: traffic on {} sampled sessions and {PROBES} probes",
+            ids.len()
+        );
     }
     std::thread::sleep(Duration::from_secs(10));
     let (_, flapped0) = b.counters();
@@ -746,6 +840,11 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
         .map(|r| r.1.clone())
         .collect();
 
+    // G4.3hh: the probes' addresses, from A while it is the active one (a
+    // lookup scans its table: after the cut it would delay the watch).
+    let probe_ips = probe_addrs(n);
+    eprintln!("ha {n}: {} probe addresses", probe_ips.len());
+
     // A loses power: every port down at once (the RADIUS link is the
     // server's, elsewhere in the network, and stays).
     let cut = Instant::now();
@@ -755,13 +854,40 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
     ip(None, &["link", "set", "wan0", "down"]);
     ip(None, &["link", "set", "sync0", "down"]);
     ip(None, &["addr", "del", "10.99.0.1/24", "dev", "gw0"]);
-    let takeover = wait_every(30, Duration::from_millis(10), || {
-        monitor(Some(cp))["role"] == "active"
-    })
-    .unwrap_or(f64::NAN);
-    // G4.3hd: every session in C's table (adopted), from the cut.
-    let adopted = wait_secs(60, || active(Some(cp)) >= n as u64)
-        .map_or(f64::NAN, |_| cut.elapsed().as_secs_f64());
+    // G4.3hh: the probes' upstream packets, seen on the uplink's bridge
+    // ports (a packet socket in this namespace; what C put on the way to
+    // the network), next to the table waits below.
+    let traffic = std::thread::scope(|scope| {
+        let watch = (!ipoe() && !probe_ips.is_empty()).then(|| {
+            let ips = &probe_ips;
+            scope.spawn(move || first_seen(ips, cut, Duration::from_secs(30)))
+        });
+        let takeover = wait_every(30, Duration::from_millis(10), || {
+            monitor(Some(cp))["role"] == "active"
+        })
+        .unwrap_or(f64::NAN);
+        // G4.3hd: every session in C's table (adopted), from the cut.
+        let adopted = wait_secs(60, || active(Some(cp)) >= n as u64)
+            .map_or(f64::NAN, |_| cut.elapsed().as_secs_f64());
+        let mut seen: Vec<f64> = watch.and_then(|h| h.join().ok()).unwrap_or_default();
+        seen.sort_by(f64::total_cmp);
+        let first = seen.first().copied().unwrap_or(f64::NAN);
+        let all = if seen.len() == probe_ips.len() && seen.iter().all(|t| t.is_finite()) {
+            seen.last().copied().unwrap_or(f64::NAN)
+        } else {
+            f64::NAN
+        };
+        if !seen.is_empty() {
+            let mid = seen.get(seen.len() / 2).copied().unwrap_or(f64::NAN);
+            eprintln!(
+                "ha {n}: probes' upstream back (s, {} of {}): first {first:.3}, median {mid:.3}, last {all:.3}",
+                seen.len(),
+                probe_ips.len()
+            );
+        }
+        (takeover, adopted, (first, all))
+    });
+    let (takeover, adopted, (probe_first, probe_all)) = traffic;
     let back = wait_secs(60, || rx_sample(Some(cp)) > rx0)
         .map_or(f64::NAN, |_| cut.elapsed().as_secs_f64());
     let timeline = {
@@ -769,12 +895,17 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
         let k = monitor(Some(cp))["takeovers"][0].clone();
         let ms = |key: &str| k[key].as_u64().map_or("–".to_owned(), |v| v.to_string());
         format!(
-            "{}: {}/{}/{}/{} ms",
+            "{}: {}/{}/{}/{} ms (entregues {} ms, respondendo {} ms), rotas {} ms ({} no kernel, {} recusadas)",
             k["detected_by"].as_str().unwrap_or("?"),
             ms("detected_ms"),
             ms("witness_ms"),
             ms("active_ms"),
-            ms("adopted_ms")
+            ms("adopted_ms"),
+            ms("handed_ms"),
+            ms("answering_ms"),
+            ms("routes_ms"),
+            k["routes"].as_u64().unwrap_or(0),
+            k["routes_refused"].as_u64().unwrap_or(0)
         )
     };
     // Keepalive (5 s × 3 on BNG Blaster) and interims settle; IPoE: past
@@ -851,7 +982,7 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
     eprintln!("ha {n}: accounting before the cut: {}", tally(&before_refs));
     eprintln!("ha {n}: accounting after the cut: {}", tally(&new));
     eprintln!(
-        "ha {n}: timeline on C {timeline}; takeover {takeover:.2} s, all on C {adopted:.2} s, traffic back {back:.2} s, lost {lost}, C holds {held}, established {est}, starts {starts}, stops {stops}, C interims {}, without {without}, wrong Class {wrong_class} (C's records with it {class_c})",
+        "ha {n}: timeline on C {timeline}; takeover {takeover:.2} s, all on C {adopted:.2} s, traffic back {back:.2} s, probes' upstream back first {probe_first:.3} s all {probe_all:.3} s, lost {lost}, C holds {held}, established {est}, starts {starts}, stops {stops}, C interims {}, without {without}, wrong Class {wrong_class} (C's records with it {class_c})",
         interims_c.len()
     );
     let coa = if single() {
@@ -889,7 +1020,7 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
         let _ = in_ns(None, "ip").args(["link", "del", l]).output();
     }
     format!(
-        "| {n}{}{} | {plane} | {takeover:.2} s | {timeline} | {adopted:.2} s | {back:.2} s | {lost} | {held} | {starts} ({}) | {stops} | {} | {without} | {} | {coa} |",
+        "| {n}{}{} | {plane} | {takeover:.2} s | {timeline} | {adopted:.2} s | {back:.2} s | {probe_first:.3} / {probe_all:.3} s | {lost} | {held} | {starts} ({}) | {stops} | {} | {without} | {} | {coa} |",
         if ipoe() { " IPoE" } else { "" },
         bfd_profile().map_or(String::new(), |p| format!(" BFD {p}")),
         unique.len(),

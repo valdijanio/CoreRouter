@@ -39,6 +39,39 @@ pub(crate) static TAKEOVER: Mutex<Option<Arc<Vec<SessionRecord>>>> = Mutex::new(
 /// that worker's), so it is a config section compared for drift.
 pub(crate) static LANES: AtomicU16 = AtomicU16::new(0);
 
+/// G4.3hh: sessions a worker adopts per hold of the shared locks (the
+/// active table, the pools, the slow path's address table). One hold per
+/// session had the 8 workers of a 100 000-session takeover queue on the
+/// active table's lock: 300 of the 430 ms each worker spent (**medido**,
+/// `pppoe_ha_tests::adopt_profile`). A hold of this many is ≈ 1 ms, so a
+/// reader (`ppp.active`, the RADIUS thread) waits at most that.
+const ADOPT_CHUNK: usize = 1024;
+
+/// What a chunk of adopted sessions writes to the shared state, applied
+/// in one hold of each lock ([`Bng::adopt_commit`]).
+#[derive(Default)]
+struct AdoptBatch {
+    rows: Vec<AdoptRow>,
+    hold4: Vec<Ipv4Addr>,
+    hold6: Vec<ipnet::Ipv6Net>,
+    /// The slow path's address → worker table.
+    lanes: Vec<Ipv4Addr>,
+    /// Interims, posted once the rows are in the table (their counters
+    /// are read from it).
+    acct: Vec<(String, AcctRequest, Arc<dyn AcctSource>)>,
+    /// `Ppp::effective` without a secret, by (profile, fallback): a
+    /// handful, a walk finds it without allocating a key.
+    effective: Vec<(Box<str>, Box<str>, corerouter_model::ppp::Effective)>,
+}
+
+struct AdoptRow {
+    id: String,
+    active: ActiveSession,
+    acct_id: String,
+    ip: Option<Ipv4Addr>,
+    history: HistoryEntry,
+}
+
 /// What a takeover did in one worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct Adopted {
@@ -62,6 +95,30 @@ pub(crate) struct HaState {
     keys: HashMap<(usize, u16), Key>,
     /// Ending sessions because the peer took them (no Acct-Stop).
     pub(crate) handed_over: bool,
+    /// G4.3hh: the next flush carries a takeover's routes (its timeline
+    /// marks when they are in the kernel).
+    routes_mark: bool,
+    /// G4.3hh: adopted sessions whose bookkeeping waits for
+    /// [`Bng::ha_adopt_rest`], and the order to take them.
+    later: HashMap<(usize, u16), Later>,
+    later_order: Vec<(usize, u16)>,
+    /// G4.3hh: the takeover being adopted: its records, the ones of this
+    /// worker still waiting by (CPE MAC, SESSION_ID), the order the chunks
+    /// take them, and the totals so far.
+    records: Option<Arc<Vec<SessionRecord>>>,
+    waiting: HashMap<([u8; 6], u16), usize>,
+    order: Vec<usize>,
+    total: Adopted,
+}
+
+/// What the second phase of an adoption needs of the session's record.
+pub(crate) struct Later {
+    acct_id: Box<str>,
+    counters: HaCounters,
+    age_ms: u64,
+    /// The `proto-pppoe` session may be gone when the row is made (a
+    /// session that ends first): what the row needs of it.
+    auth: Option<AuthProto>,
 }
 
 impl HaState {
@@ -115,7 +172,19 @@ fn counters_of(a: &ActiveSession) -> HaCounters {
 }
 
 /// The worker a CPE's frames reach (`Bng::lane_of` on its MAC).
-fn mac_lane(mac: [u8; 6], lanes: u16) -> u16 {
+/// The (source MAC, SESSION_ID) of a PPPoE frame of a session (session
+/// stage, or a PADT), without parsing the rest.
+fn session_key(frame: &[u8]) -> Option<([u8; 6], u16)> {
+    use corerouter_proto_pppoe::eth::{ETHERTYPE_DISCOVERY, ETHERTYPE_SESSION, parse};
+    let e = parse(frame).ok()?;
+    if e.ethertype != ETHERTYPE_SESSION && e.ethertype != ETHERTYPE_DISCOVERY {
+        return None;
+    }
+    let h = corerouter_proto_pppoe::discovery::parse_header(e.payload).ok()?;
+    (h.session_id != 0).then_some((e.src.0, h.session_id))
+}
+
+pub(crate) fn mac_lane(mac: [u8; 6], lanes: u16) -> u16 {
     let [_, _, a, b, c, d] = mac;
     let k = u32::from_be_bytes([a, b, c, d]);
     ((k.wrapping_mul(0x9E37_79B1) >> 16) % u32::from(lanes.max(1))) as u16
@@ -288,28 +357,84 @@ impl Bng {
         true
     }
 
+    /// G4.3hh: whether this round's routes are a takeover's (once).
+    pub(crate) fn ha_take_routes_mark(&mut self) -> bool {
+        std::mem::take(&mut self.ha.routes_mark)
+    }
+
     /// A takeover waits for this worker (adopt it before answering).
     pub(crate) fn ha_pending(&self) -> bool {
         TAKEOVER_GEN.load(Ordering::Acquire) > self.ha.gen_done
     }
 
-    /// Adopts the sessions of the latest takeover that land on this
-    /// worker (by the CPE's MAC, like its frames).
-    pub(crate) fn ha_adopt_pending(&mut self, now: Millis) -> Adopted {
+    /// Starts adopting the sessions of the latest takeover that land on
+    /// this worker (by the CPE's MAC, like its frames), and adopts the
+    /// first [`ADOPT_CHUNK`] of them. From here the worker answers: a frame
+    /// of a session still waiting adopts it on the spot
+    /// ([`Self::ha_adopt_for`]), so it never gets a PADT, and
+    /// [`Self::ha_adopt_step`] takes the next chunk each round (G4.3hh).
+    /// `Some` with the totals once this worker's share is all adopted.
+    pub(crate) fn ha_adopt_pending(&mut self, now: Millis) -> Option<Adopted> {
         let gen_ = TAKEOVER_GEN.load(Ordering::Acquire);
         if gen_ <= self.ha.gen_done {
-            return Adopted::default();
+            return None;
         }
         let records = guard(&TAKEOVER).clone();
         self.ha.gen_done = gen_;
+        self.ha.waiting.clear();
+        self.ha.order.clear();
+        self.ha.total = Adopted::default();
+        self.ha.records = None;
         let Some(records) = records else {
-            return Adopted::default();
+            return Some(Adopted::default());
         };
-        let mine: Vec<&SessionRecord> = records
-            .iter()
-            .filter(|r| r.kind == Kind::Pppoe && mac_lane(r.client_mac, self.lanes) == self.lane)
-            .collect();
-        let done = self.adopt(now, &mine);
+        for (k, r) in records.iter().enumerate() {
+            if r.kind == Kind::Pppoe && mac_lane(r.client_mac, self.lanes) == self.lane {
+                self.ha.waiting.insert((r.client_mac, r.sid), k);
+                self.ha.order.push(k);
+            }
+        }
+        // Room for the whole share at once: growing these tables step by
+        // step maps and unmaps memory under every worker's feet.
+        let n = self.ha.order.len();
+        self.subs.reserve(n);
+        self.index.reserve(n);
+        self.effects.reserve(2 * n);
+        self.ha.later.reserve(n);
+        self.ha.later_order.reserve(n);
+        self.ha.records = Some(records);
+        self.ha_adopt_step(now)
+    }
+
+    /// Sessions of a takeover this worker has not adopted yet.
+    pub(crate) fn ha_adopting(&self) -> bool {
+        !self.ha.waiting.is_empty()
+    }
+
+    /// The next [`ADOPT_CHUNK`] sessions of the takeover; `Some` with the
+    /// totals when it was the last.
+    pub(crate) fn ha_adopt_step(&mut self, now: Millis) -> Option<Adopted> {
+        let records = self.ha.records.clone()?;
+        let mut chunk: Vec<&SessionRecord> = Vec::with_capacity(ADOPT_CHUNK);
+        while chunk.len() < ADOPT_CHUNK {
+            let Some(k) = self.ha.order.pop() else {
+                break;
+            };
+            let Some(r) = records.get(k) else {
+                continue;
+            };
+            // Adopted already, on demand.
+            if self.ha.waiting.remove(&(r.client_mac, r.sid)).is_some() {
+                chunk.push(r);
+            }
+        }
+        self.adopt_counted(now, &chunk);
+        if !self.ha.order.is_empty() {
+            return None;
+        }
+        self.ha.waiting.clear();
+        self.ha.records = None;
+        let done = std::mem::take(&mut self.ha.total);
         if done.sessions + done.skipped > 0 {
             self.log(
                 done.skipped > 0,
@@ -327,7 +452,35 @@ impl Bng {
                 ),
             );
         }
-        done
+        Some(done)
+    }
+
+    /// A frame of a session of the takeover still waiting: adopted now,
+    /// before the frame reaches `proto-pppoe` (which would answer an
+    /// unknown session with a PADT).
+    pub(super) fn ha_adopt_for(&mut self, now: Millis, frame: &[u8]) {
+        let Some(key) = session_key(frame) else {
+            return;
+        };
+        let Some(k) = self.ha.waiting.remove(&key) else {
+            return;
+        };
+        let Some(records) = self.ha.records.clone() else {
+            return;
+        };
+        if let Some(r) = records.get(k) {
+            self.adopt_counted(now, &[r]);
+        }
+    }
+
+    fn adopt_counted(&mut self, now: Millis, records: &[&SessionRecord]) {
+        if records.is_empty() {
+            return;
+        }
+        let d = self.adopt(now, records);
+        self.ha.routes_mark |= d.sessions > 0;
+        self.ha.total.sessions += d.sessions;
+        self.ha.total.skipped += d.skipped;
     }
 
     /// Takes `records` over: Opened in `proto-pppoe`, then the BNG's side
@@ -335,7 +488,7 @@ impl Bng {
     pub(crate) fn adopt(&mut self, now: Millis, records: &[&SessionRecord]) -> Adopted {
         let mut done = Adopted::default();
         let unix_now = self.cfg.unix_base + now / 1000;
-        let mut adopt: Vec<(usize, SessionRef, SessionRecord)> = Vec::new();
+        let mut adopt: Vec<(usize, SessionRef, &SessionRecord)> = Vec::new();
         for (i, slot) in self.slots.iter_mut().enumerate() {
             let here: Vec<&SessionRecord> = records
                 .iter()
@@ -388,7 +541,7 @@ impl Bng {
             for (r, res) in here.iter().zip(results) {
                 match res {
                     Ok(sref) => {
-                        adopt.push((i, sref, (*r).clone()));
+                        adopt.push((i, sref, *r));
                         done.sessions += 1;
                     }
                     Err(_) => done.skipped += 1,
@@ -396,13 +549,72 @@ impl Bng {
             }
         }
         done.skipped += records.len().saturating_sub(done.sessions + done.skipped);
-        for (i, sref, r) in adopt {
-            self.adopt_one(now, i, sref, &r);
+        let mut batch = AdoptBatch::default();
+        for chunk in adopt.chunks(ADOPT_CHUNK) {
+            for &(i, sref, r) in chunk {
+                self.adopt_one(now, i, sref, r, &mut batch);
+            }
+            self.adopt_commit(&mut batch);
         }
         done
     }
 
-    fn adopt_one(&mut self, now: Millis, i: usize, sref: SessionRef, r: &SessionRecord) {
+    /// One hold of each shared lock for a chunk of adopted sessions, then
+    /// their Interims.
+    fn adopt_commit(&mut self, b: &mut AdoptBatch) {
+        if !b.hold4.is_empty() {
+            let mut p = guard(&self.pools);
+            for ip in b.hold4.drain(..) {
+                p.hold(ip);
+            }
+        }
+        if !b.hold6.is_empty() {
+            let mut p = guard(&self.pools6);
+            for n in b.hold6.drain(..) {
+                p.hold(n);
+            }
+        }
+        if !b.lanes.is_empty()
+            && let Ok(mut t) = self.routes.write()
+        {
+            for ip in b.lanes.drain(..) {
+                t.insert(ip, self.lane);
+            }
+        }
+        b.lanes.clear();
+        if !b.rows.is_empty() {
+            let mut sh = guard(&self.shared);
+            for row in b.rows.drain(..) {
+                sh.by_acct.insert(row.acct_id, row.id.clone());
+                if let Some(ip) = row.ip {
+                    sh.by_ip.insert(ip, row.id.clone());
+                }
+                sh.active.insert(row.id, row.active);
+                sh.record(row.history);
+            }
+        }
+        let Some(aaa) = self.cfg.aaa.clone() else {
+            b.acct.clear();
+            return;
+        };
+        for (user, req, src) in std::mem::take(&mut b.acct) {
+            if let Err(e) = aaa.account(req, Some(src)) {
+                self.log(
+                    true,
+                    format!("PPP: Accounting-Interim de {user} (tomada) não enviado: {e}"),
+                );
+            }
+        }
+    }
+
+    fn adopt_one(
+        &mut self,
+        now: Millis,
+        i: usize,
+        sref: SessionRef,
+        r: &SessionRecord,
+        batch: &mut AdoptBatch,
+    ) {
         let Some(slot) = self.slots.get(i) else {
             return;
         };
@@ -410,26 +622,44 @@ impl Bng {
             return;
         };
         let port = slot.port;
-        let server = slot.cfg.name.clone();
         let interface = slot.cfg.interface.to_string();
         let user = String::from_utf8_lossy(&r.username).into_owned();
-        let secret = self.cfg.ppp.secret(&user).cloned();
-        let effective = self.cfg.ppp.effective(
-            if r.radius { None } else { secret.as_ref() },
-            &r.profile,
-            &r.fallback_profile,
-        );
+        // The profiles' part once per pair of names (it clones three
+        // profiles), the secret's addresses on top of each.
+        let found = batch
+            .effective
+            .iter()
+            .find(|(p, f, _)| *p == r.profile && *f == r.fallback_profile)
+            .map(|(_, _, e)| e.clone());
+        let base = match found {
+            Some(e) => e,
+            None => {
+                let e = self
+                    .cfg
+                    .ppp
+                    .effective(None, &r.profile, &r.fallback_profile);
+                batch
+                    .effective
+                    .push((r.profile.clone(), r.fallback_profile.clone(), e.clone()));
+                e
+            }
+        };
+        let effective = base.with_secret(if r.radius {
+            None
+        } else {
+            self.cfg.ppp.secret(&user)
+        });
         let unix_now = self.cfg.unix_base + now / 1000;
         let age_ms = unix_now.saturating_sub(r.started_at) * 1000;
         if let (Some(ip), Some(_)) = (r.ipv4, &r.pool) {
-            guard(&self.pools).hold(ip);
+            batch.hold4.push(ip);
         }
         let xdp = if self.xdp { self.slot_index() } else { None };
-        let hold6 =
+        let mut hold6 =
             |p: Option<Prefix6>, pool: &Option<Box<str>>| -> Option<(ipnet::Ipv6Net, v6::Source)> {
                 let p = p?;
                 let n = ipnet::Ipv6Net::new(p.addr, p.len).ok()?;
-                guard(&self.pools6).hold(n);
+                batch.hold6.push(n);
                 Some((
                     n,
                     pool.as_deref()
@@ -528,9 +758,8 @@ impl Bng {
         let ip = r.ipv4;
         if xdp.is_none()
             && let Some(ip) = ip
-            && let Ok(mut t) = self.routes.write()
         {
-            t.insert(ip, self.lane);
+            batch.lanes.push(ip);
         }
         let Some(sub) = self.subs.get_mut(&(i, sref.sid)) else {
             return;
@@ -570,6 +799,109 @@ impl Bng {
         for (rt, _) in &adm.routes {
             self.effects.push(route_effect(xdp, rt, true));
         }
+        // The rest (active table, history, Interim, address list, the
+        // publish) waits for `ha_adopt_rest`: the worker answers first.
+        self.ha.later.insert(
+            (i, sref.sid),
+            Later {
+                acct_id: r.acct_session_id.clone(),
+                counters: r.counters,
+                age_ms,
+                auth: d.auth,
+            },
+        );
+        self.ha.later_order.push((i, sref.sid));
+    }
+
+    /// G4.3hh: whether adopted sessions still wait for their bookkeeping.
+    pub(crate) fn ha_later(&self) -> bool {
+        !self.ha.later.is_empty()
+    }
+
+    /// G4.3hh, second phase of a takeover: the bookkeeping of up to
+    /// [`ADOPT_CHUNK`] adopted sessions (the active table and the history
+    /// in one hold of the shared lock, then their Interims). The worker
+    /// calls it once per round, between its frames.
+    pub(crate) fn ha_adopt_rest(&mut self, now: Millis) {
+        let mut batch = AdoptBatch::default();
+        let mut taken = 0;
+        while taken < ADOPT_CHUNK {
+            let Some(key) = self.ha.later_order.pop() else {
+                break;
+            };
+            let Some(l) = self.ha.later.remove(&key) else {
+                continue;
+            };
+            taken += 1;
+            self.later_row(now, key, &l, &mut batch, true);
+        }
+        if self.ha.later.is_empty() {
+            self.ha.later_order = Vec::new();
+        }
+        self.adopt_commit(&mut batch);
+    }
+
+    /// A session that ends before its bookkeeping: its row first, so the
+    /// end finds it (the Stop's counters, the history), without an Interim.
+    pub(super) fn ha_adopt_now(&mut self, now: Millis, sub: &Sub) {
+        let key = (sub.slot, sub.sref.sid);
+        let Some(l) = self.ha.later.remove(&key) else {
+            return;
+        };
+        let mut batch = AdoptBatch::default();
+        if l.acct_id.as_ref() == sub.acct_id.as_str() {
+            self.row_of(now, key, sub, &l, &mut batch, false);
+        }
+        self.adopt_commit(&mut batch);
+    }
+
+    fn later_row(
+        &mut self,
+        now: Millis,
+        key: (usize, u16),
+        l: &Later,
+        batch: &mut AdoptBatch,
+        acct: bool,
+    ) {
+        // Gone in the meantime (or its SESSION_ID already another's).
+        let Some(sub) = self.subs.get(&key) else {
+            return;
+        };
+        if l.acct_id.as_ref() != sub.acct_id.as_str() {
+            return;
+        }
+        // `row_of` reads `self`; the sub is taken out for the call.
+        let Some(sub) = self.subs.remove(&key) else {
+            return;
+        };
+        self.row_of(now, key, &sub, l, batch, acct);
+        self.subs.insert(key, sub);
+        // The standby publishes from here on (the new active's stream).
+        self.ha_dirty(key);
+    }
+
+    fn row_of(
+        &mut self,
+        now: Millis,
+        key: (usize, u16),
+        sub: &Sub,
+        l: &Later,
+        batch: &mut AdoptBatch,
+        acct: bool,
+    ) {
+        let (i, sid) = key;
+        let Some(slot) = self.slots.get(i) else {
+            return;
+        };
+        let server = slot.cfg.name.clone();
+        let interface = slot.cfg.interface.to_string();
+        let id = session_id(i, &self.slots, sid);
+        let user = sub.user.clone();
+        let ip = sub.ip;
+        let unix_now = self.cfg.unix_base + now / 1000;
+        let age_ms = l.age_ms;
+        let r = l;
+        let routes = framed::rows(&sub.routes);
         let mac = mac_text(sub.mac);
         let mut a = ActiveSession {
             id: id.clone(),
@@ -578,7 +910,7 @@ impl Bng {
             service_name: Some(sub.service_name.clone()),
             caller_id: mac.clone(),
             address: ip,
-            session_id: sref.sid,
+            session_id: sid,
             server: server.clone(),
             interface: interface.clone(),
             vlan: (sub.vlans.outer != 0).then_some(sub.vlans.outer),
@@ -587,7 +919,7 @@ impl Bng {
             remote_id: sub.remote_id.clone(),
             rate_limit: sub.rate.clone(),
             profile: sub.effective.profile.clone(),
-            encoding: match d.auth {
+            encoding: match l.auth {
                 Some(AuthProto::Pap) => "pap",
                 Some(AuthProto::ChapMd5) => "chap",
                 Some(AuthProto::MsChapV1) => "mschap1",
@@ -596,10 +928,10 @@ impl Bng {
             }
             .into(),
             radius: sub.radius,
-            mtu: d.mtu,
+            mtu: sub.mtu,
             limit_bytes_in: (sub.limit_in > 0).then_some(sub.limit_in),
             limit_bytes_out: (sub.limit_out > 0).then_some(sub.limit_out),
-            routes: adm.rows(),
+            routes,
             rx_bytes: r.counters.rx_bytes,
             tx_bytes: r.counters.tx_bytes,
             rx_packets: r.counters.rx_packets,
@@ -619,14 +951,12 @@ impl Bng {
         let interim = sub.interim;
         let acct_id = sub.acct_id.clone();
         let radius_acct = sub.radius || self.cfg.ppp.aaa.use_radius;
-        {
-            let mut sh = guard(&self.shared);
-            sh.active.insert(id.clone(), a.clone());
-            sh.by_acct.insert(acct_id.clone(), id.clone());
-            if let Some(ip) = ip {
-                sh.by_ip.insert(ip, id.clone());
-            }
-            sh.record(HistoryEntry {
+        let row = AdoptRow {
+            id: id.clone(),
+            active: ActiveSession::default(),
+            acct_id: acct_id.clone(),
+            ip,
+            history: HistoryEntry {
                 at: unix_now,
                 name: user.clone(),
                 caller_id: mac.clone(),
@@ -637,16 +967,13 @@ impl Bng {
                 hint: "Assumida do outro BNG do par, sem novo login (redundância).".into(),
                 address: ip,
                 ..HistoryEntry::default()
-            });
-        }
+            },
+        };
         // RFC 2866: the same Acct-Session-Id goes on, and an Interim says
         // where it is now (its Start went from the other node; a second
         // one would be a duplicate). The RADIUS service schedules the next
         // interims from it.
-        if radius_acct
-            && self.cfg.ppp.aaa.accounting
-            && let Some(aaa) = &self.cfg.aaa
-        {
+        if acct && radius_acct && self.cfg.ppp.aaa.accounting && self.cfg.aaa.is_some() {
             let src: Arc<dyn AcctSource> = Arc::new(Counters {
                 shared: self.shared.clone(),
                 id: id.clone(),
@@ -662,18 +989,14 @@ impl Bng {
                 attributes: {
                     let mut at = acct_attributes(ip, &mac, sub);
                     at.extend(v6_attrs);
-                    at.extend(route_attributes(&adm.routes));
+                    at.extend(route_attributes(&sub.routes));
                     at
                 },
                 class: sub.class.clone(),
             };
-            if let Err(e) = aaa.account(req, Some(src)) {
-                self.log(
-                    true,
-                    format!("PPP: Accounting-Interim de {user} (tomada) não enviado: {e}"),
-                );
-            }
+            batch.acct.push((user.clone(), req, src));
         }
+        batch.rows.push(AdoptRow { active: a, ..row });
         if let (Some(l), Some(ip)) = (list, ip) {
             self.effects.push(Effect::AddressList {
                 list: l,
@@ -682,7 +1005,5 @@ impl Bng {
                 comment: format!("ppp {user}"),
             });
         }
-        // The standby publishes from here on (the new active's stream).
-        self.ha_dirty((i, sref.sid));
     }
 }

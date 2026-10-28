@@ -23,7 +23,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("ppp_ha.role", "active, standby, init, fenced (cannot prove it is not isolated) or yielding (switchover)."),
     ("ppp_ha.secret", "The same on both nodes, at least 16 characters. Write-only."),
     ("ppp_ha.sync", "N/N sessions held by the active and copied by the standby; lag (unacknowledged changes) and delay (ms)."),
-    ("ppp_ha.timeline", "Each takeover in ms from the peer's last sign of life: detected, witness, active, announced, adopted, first frame; sessions kept and lost. The peer's last takeover shows after a Test Takeover from this node."),
+    ("ppp_ha.timeline", "Each takeover in ms from the peer's last sign of life: detected, witness, active, announced, adopted, routes in the kernel (slow path), first frame; sessions kept and lost. The peer's last takeover shows after a Test Takeover from this node."),
     ("ppp_ha.timers", "Hello interval and dead interval in ms (dead ≥ 3 × hello)."),
     ("ppp_ha.track", "Ports whose loss of carrier fences this node."),
     ("ppp_ha.virtual_mac", "The AC MAC the subscribers see, the same on both nodes; empty = 02:43:52:48:41:<group>."),

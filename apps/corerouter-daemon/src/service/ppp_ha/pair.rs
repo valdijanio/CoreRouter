@@ -227,6 +227,8 @@ pub(crate) fn begin(t: &Transition, handed: u64, peer_sessions: u64, test: bool)
         detected_ms: t.detection.and_then(|d| ms(d.detected)),
         witness_ms: t.detection.and_then(|d| d.witness_at).and_then(ms),
         active_ms: ms(t.at),
+        // `hand_takeover` decoded the replica just before.
+        handed_ms: ms(runtime().now()),
         stateful: t.stateful,
         handed,
         lost: peer_sessions.saturating_sub(handed),
@@ -250,6 +252,27 @@ pub(crate) fn adopted(sessions: usize, skipped: usize) {
         k.skipped += skipped as u64;
         k.adopted_ms = Some(now.saturating_sub(t.base));
         k.lost = t.peer_sessions.max(k.handed).saturating_sub(k.adopted);
+    }
+}
+
+/// G4.3hh: a worker answers (its share of the takeover indexed, the first
+/// chunk adopted).
+pub(crate) fn answering() {
+    let now = runtime().now();
+    if let Some(t) = locked(&TRACK).as_mut() {
+        t.takeover.answering_ms = Some(now.saturating_sub(t.base));
+    }
+}
+
+/// G4.3hh: a worker's routes of the takeover are in the kernel (slow
+/// path): `done` taken, `refused` still refused after the second try.
+pub(crate) fn routes_installed(done: usize, refused: usize) {
+    let now = runtime().now();
+    if let Some(t) = locked(&TRACK).as_mut() {
+        let k = &mut t.takeover;
+        k.routes += done as u64;
+        k.routes_refused += refused as u64;
+        k.routes_ms = Some(now.saturating_sub(t.base));
     }
 }
 

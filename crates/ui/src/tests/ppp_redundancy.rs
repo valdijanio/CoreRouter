@@ -78,9 +78,11 @@ impl HaBackend for Fake {
                 active_ms: Some(160),
                 announced_ms: Some(160),
                 adopted_ms: Some(173),
+                routes_ms: Some(190),
                 stateful: true,
                 handed: 48_213,
                 adopted: 48_213,
+                routes: 48_213,
                 ..Takeover::default()
             }],
             ..RedundancyStatus::default()
@@ -243,6 +245,7 @@ fn bfd_state_alerts_and_the_takeover_timeline_show() {
     assert!(h.has_text_containing("answered 420 ms"));
     assert!(h.has_text("bfd (sync, access)"));
     assert!(h.has_text("detected 150 ms") && h.has_text("witness 152 ms") && h.has_text("active 160 ms"));
+    assert!(h.has_text("routes 190 ms"), "G4.3hh: the slow path's routes in the kernel");
     assert!(h.has_text("48213 kept · 0 lost"));
 }
 

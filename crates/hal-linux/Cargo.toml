@@ -90,6 +90,10 @@ name = "netns_neigh"
 harness = false
 
 [[bench]]
+name = "netns_routes_batch"
+harness = false
+
+[[bench]]
 name = "resource"
 harness = false
 
