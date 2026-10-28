@@ -167,7 +167,7 @@ fn a_flapping_gateway_is_held_down() {
     let id = add(&mut s, json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.0.1", "check_gateway": "ping"}));
     let t = s.route_check_targets(Some(0));
     let mut now = 0;
-    let mut cycle = |s: &mut Session, now: &mut u64| {
+    let cycle = |s: &mut Session, now: &mut u64| {
         report(s, &t, false, *now);
         report(s, &t, false, *now + 10_000);
         *now += 20_000;

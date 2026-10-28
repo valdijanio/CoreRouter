@@ -19,7 +19,7 @@
 //!   `bfd` has no probe: the state is the one of the BFD session the
 //!   `bfd` service runs to the gateway (`routing.bfd.session.list`).
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -48,6 +48,12 @@ pub const HOLD_BASE_MS: u64 = CHECK_INTERVAL_MS;
 pub const HOLD_MAX_MS: u64 = 5 * 60_000;
 /// Downs remembered per target (only the window's count).
 const MAX_DOWNS: usize = 16;
+/// The targets are taken again at least this often even when the config
+/// did not change (a DHCP lease moved the ARP source address).
+pub const RESYNC_MS: u64 = 10_000;
+/// Check transitions logged one by one per report; the rest in one line
+/// (the uplink switch dies: 10 000 gateways down at once).
+const MAX_LOG_LINES: usize = 16;
 /// A BFD session that has not come up this long after its route asked for
 /// it counts as down (RFC 5880 §6.8.3: before Up, packets go at most once
 /// a second; three of them and an answer fit, **estimado**).
@@ -246,10 +252,16 @@ pub struct StaticChecks {
     /// The checks run (a daemon with the `route-check` service): without
     /// one, `ip.route.list` says "not checked".
     pub running: bool,
+    /// Gateways of the targets down now: [`StaticChecks::withholds`]
+    /// rejects every other route with one hash lookup, no allocation.
+    down_gateways: HashSet<IpAddr>,
+    /// The config generation and clock (ms) of the last sync.
+    synced: Option<(u64, u64)>,
 }
 
 impl StaticChecks {
     fn recount(&mut self) {
+        self.down_gateways = self.health.iter().filter(|(_, h)| h.down).map(|(t, _)| t.gateway).collect();
         self.down = self.health.values().filter(|h| h.down).count();
         self.generation = self.generation.wrapping_add(1);
     }
@@ -257,6 +269,8 @@ impl StaticChecks {
     /// Whether route `r` waits for its gateway.
     pub fn withholds(&self, r: &RouteEntry) -> bool {
         self.down > 0
+            && r.check_gateway != CheckGateway::None
+            && r.gateway.address().is_some_and(|g| self.down_gateways.contains(&g))
             && target_of(r)
                 .and_then(|t| self.health.get(&t))
                 .is_some_and(|h| h.down)
@@ -531,6 +545,7 @@ impl Session {
     /// "checking". BFD targets are followed here, from `BfdState`.
     pub fn route_check_targets(&mut self, now_ms: Option<u64>) -> Vec<ProbeTarget> {
         let now = now_ms.or(self.dhcp.now_ms).unwrap_or(0);
+        let generation = self.store().generation();
         let running = self.store().running().clone();
         let cfg = self.effective(&running).into_owned();
         let mut wanted: BTreeMap<Target, ProbeHow> = BTreeMap::new();
@@ -577,6 +592,7 @@ impl Session {
         }
         if let Some(c) = self.checks_mut() {
             c.running = true;
+            c.synced = Some((generation, now));
         }
         self.route_check_bfd(now_ms);
         wanted
@@ -584,6 +600,23 @@ impl Session {
             .filter(|(t, _)| t.method != CheckGateway::Bfd)
             .map(|(target, how)| ProbeTarget { target, how })
             .collect()
+    }
+
+    /// The `route-check` thread's sync, once a second: the targets again
+    /// only when the config changed (or every [`RESYNC_MS`]), `None` when
+    /// the thread's are still right; BFD targets are followed either way.
+    /// Unchanged, it costs no pass over the routes under the lock.
+    pub fn route_check_sync(&mut self, now_ms: Option<u64>) -> Option<Vec<ProbeTarget>> {
+        let now = now_ms.or(self.dhcp.now_ms).unwrap_or(0);
+        let generation = self.store().generation();
+        let fresh = self.ext::<StaticChecks>().and_then(|c| c.synced).is_some_and(|(g, at)| {
+            g == generation && now.saturating_sub(at) < RESYNC_MS
+        });
+        if fresh {
+            self.route_check_bfd(now_ms);
+            return None;
+        }
+        Some(self.route_check_targets(now_ms))
     }
 
     /// BFD targets: up while their session is up (and not dampened), down
@@ -701,8 +734,30 @@ impl Session {
         self.checks_change(apply);
         let running = self.store().running().clone();
         let time = self.now();
-        for (t, down, misses) in moved {
-            let routes = running.ip.routes.iter().filter(|r| target_of(r).as_ref() == Some(&t)).count();
+        // Routes per moved target, in one pass over the routes.
+        let mut counts: HashMap<Target, usize> = moved.iter().map(|(t, _, _)| (t.clone(), 0)).collect();
+        let gateways: HashSet<IpAddr> = moved.iter().map(|(t, _, _)| t.gateway).collect();
+        for r in running.ip.routes.iter() {
+            if r.gateway.address().is_some_and(|g| gateways.contains(&g))
+                && let Some(n) = target_of(r).and_then(|t| counts.get_mut(&t))
+            {
+                *n += 1;
+            }
+        }
+        let total = moved.len();
+        let downs = moved.iter().filter(|(_, d, _)| *d).count();
+        if total > MAX_LOG_LINES {
+            let message = format!(
+                "check-gateway: {downs} gateway(s) down and {} up at once; the first {MAX_LOG_LINES} follow, \
+                 the rest in ip.route.check.history",
+                total - downs
+            );
+            log::warn!("{message}");
+            self.log_event(&["route", "warning"], crate::logging::DAEMON, message, Value::Null);
+        }
+        for (i, (t, down, misses)) in moved.into_iter().enumerate() {
+            let routes = counts.get(&t).copied().unwrap_or(0);
+            let logged = i < MAX_LOG_LINES;
             let how = t.method.as_str();
             let gw = t.text();
             let message = if down {
@@ -718,16 +773,18 @@ impl Session {
                 format!("gateway {gw} answers {how} again: {routes} route(s) back")
             };
             let level = if down { "warning" } else { "info" };
-            log::log!(
-                if down { log::Level::Warn } else { log::Level::Info },
-                "check-gateway: {message}"
-            );
-            self.log_event(
-                &["route", level],
-                crate::logging::DAEMON,
-                message.clone(),
-                json!({"gateway": gw, "method": how, "state": if down { "down" } else { "up" }}),
-            );
+            if logged {
+                log::log!(
+                    if down { log::Level::Warn } else { log::Level::Info },
+                    "check-gateway: {message}"
+                );
+                self.log_event(
+                    &["route", level],
+                    crate::logging::DAEMON,
+                    message.clone(),
+                    json!({"gateway": gw, "method": how, "state": if down { "down" } else { "up" }}),
+                );
+            }
             if let Some(c) = self.checks_mut() {
                 c.history.push_back(CheckEvent {
                     time,

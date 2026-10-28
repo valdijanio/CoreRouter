@@ -179,3 +179,91 @@ fn linux_check_gateway_ping_arp_and_bfd() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&bdir);
 }
+
+/// CPU ticks (utime + stime) of the daemon's thread named `comm`.
+fn thread_ticks(pid: u32, comm: &str) -> u64 {
+    let mut total = 0;
+    for t in std::fs::read_dir(format!("/proc/{pid}/task")).unwrap().flatten() {
+        let p = t.path();
+        if std::fs::read_to_string(p.join("comm")).is_ok_and(|c| c.trim() == comm) {
+            let stat = std::fs::read_to_string(p.join("stat")).unwrap();
+            let rest = stat.rsplit_once(')').unwrap().1;
+            let f: Vec<&str> = rest.split_whitespace().collect();
+            // Fields 14 and 15 of stat (utime, stime), after `pid (comm)`.
+            total += f[11].parse::<u64>().unwrap() + f[12].parse::<u64>().unwrap();
+        }
+    }
+    total
+}
+
+/// G1.27f `## perf`: 1 000 gateways in B, one static route through each,
+/// checked with `ping`, then with `arp`, at RouterOS' 10 s: the
+/// `route-check` thread's CPU over 30 s and how late its probes left.
+/// Not in the CI (a minute and a half):
+///
+/// ```sh
+/// COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- \
+///     cargo test --release -p corerouter-daemon --test netns_route_check -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn load_1000_gateways() {
+    if !in_netns() {
+        return;
+    }
+    const N: u32 = 1000;
+    const SECS: u64 = 30;
+    ip(None, &["link", "set", "lo", "up"]);
+    let b = namespace_b();
+    let bpid = Some(b.0.id());
+    ip(None, &["link", "add", "wan0", "type", "veth", "peer", "name", "gw0"]);
+    ip(None, &["link", "set", "gw0", "netns", &b.0.id().to_string()]);
+    let batch = std::env::temp_dir().join(format!("g127f-load-{}.ip", std::process::id()));
+    let gws: Vec<String> = (0..N).map(|i| format!("10.100.{}.{}", 1 + i / 250, 1 + i % 250)).collect();
+    let lines: String = gws.iter().map(|g| format!("addr add {g}/16 dev gw0\n")).collect();
+    std::fs::write(&batch, lines).unwrap();
+    ip(bpid, &["-batch", batch.to_str().unwrap()]);
+    ip(bpid, &["link", "set", "gw0", "up"]);
+    // The gateways' ARP entries would age; their table must hold them.
+    ip(None, &["link", "set", "wan0", "up"]);
+    let dir = std::env::temp_dir().join(format!("g127f-load-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let a = daemon(None, &dir, "g127f-load.log", &["--backend", "linux", "--manage", "wan0"]);
+    run("ip.address.add", json!({"address": "10.100.0.1/16", "interface": "wan0"}));
+    for (i, g) in gws.iter().enumerate() {
+        let dst = format!("172.{}.{}.0/24", 16 + i / 256, i % 256);
+        run("ip.route.add", json!({"dst_address": dst, "gateway": g, "check_gateway": "ping"}));
+    }
+    let pid = a.0.id();
+    for method in ["ping", "arp"] {
+        if method == "arp" {
+            for r in run("ip.route.list", json!({"origin": "static"})).as_array().unwrap() {
+                run("ip.route.set", json!({"id": r["id"], "check_gateway": "arp"}));
+            }
+        }
+        wait_for(&format!("{method}: every gateway reachable"), || {
+            run("ip.route.check.list", json!({}))
+                .as_array()
+                .is_some_and(|l| l.len() == N as usize && l.iter().all(|r| r["status"] == "reachable"))
+        });
+        let before = thread_ticks(pid, "svc-route-check");
+        let t = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_secs(SECS));
+        let ticks = thread_ticks(pid, "svc-route-check") - before;
+        let secs = t.elapsed().as_secs_f64();
+        let hz = 100.0;
+        let svc = run("system.service.print", json!({}));
+        let row = svc.as_array().unwrap().iter().find(|r| r["name"] == "route-check").cloned().unwrap();
+        let checks = run("ip.route.check.list", json!({}));
+        let down = checks.as_array().unwrap().iter().filter(|r| r["status"] != "reachable").count();
+        println!(
+            "G1.27f load {method}: {N} gateways, {:.2} % of a core over {secs:.0} s; {down} not reachable; service: {}",
+            ticks as f64 / hz / secs * 100.0,
+            row
+        );
+        assert_eq!(down, 0);
+    }
+    drop(a);
+    let _ = std::fs::remove_file(&batch);
+    let _ = std::fs::remove_dir_all(&dir);
+}

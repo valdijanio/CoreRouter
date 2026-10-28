@@ -115,7 +115,12 @@ fn run(session: &Shared, interval: u64, health: &super::Health) {
 fn sync(session: &Shared, sched: &mut Schedule, socks: &mut Sockets, now: u64, health: &super::Health) {
     let (targets, prober, pingers) = {
         let mut s = lock(session);
-        let targets = s.route_check_targets(None);
+        // Unchanged config: nothing to take (no pass over the routes).
+        let Some(targets) = s.route_check_sync(None) else {
+            drop(s);
+            report_health(sched, health);
+            return;
+        };
         let prober = if socks.prober.is_none()
             && targets.iter().any(|t| matches!(t.how, ProbeHow::Ping { .. }))
         {
@@ -153,17 +158,21 @@ fn sync(session: &Shared, sched: &mut Schedule, socks: &mut Sockets, now: u64, h
             .iter()
             .any(|t| matches!(&t.how, ProbeHow::Ping { device } if device == d))
     });
-    let n = targets.len();
     sched.sync(targets, now);
+    report_health(sched, health);
+}
+
+/// The service's row: how many gateways, how late the probes leave.
+fn report_health(sched: &Schedule, health: &super::Health) {
+    let n = sched.len();
     if n == 0 {
         health.disabled(Some("no static route has check_gateway=ping or arp"));
     } else {
         health.disabled(None);
         let avg = sched.late_ms_sum.checked_div(sched.sent).unwrap_or(0);
         health.event(format!(
-            "{n} gateways every {} s; probes late {avg} ms on average, {} ms at most",
-            sched.interval_ms / 1000,
-            sched.late_ms_max
+            "{n} gateways every {} ms; probes late {avg} ms on average, {} ms at most",
+            sched.interval_ms, sched.late_ms_max
         ));
     }
 }
