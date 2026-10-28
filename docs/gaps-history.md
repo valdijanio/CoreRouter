@@ -214,3 +214,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-28 — G3.7c feito (fidelidade do simulador com o FRR real; multipath BGP como o FRR)
 - 2026-10-28 — G3.6h feito (BFD no par do BNG: tomada em ~150 ms em vez de 1,2 s)
 - 2026-10-28 — G3.4f feito (Segment Routing MPLS no OSPF); G3.4i e G3.4j criadas
+- 2026-10-28 — G3.4d feito (TI-LFA e aba Fast Reroute); G3.4k e G3.4l criadas

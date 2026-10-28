@@ -2188,3 +2188,17 @@ threads 8,2 % por thread. Data plane: `bfdd` → `bgpd` em 0,20–0,26 ms (5 cor
 |---|---|
 | leitura do banco SR para o modelo | 8,5 ms |
 | conflitos de SID sobre ele (1 995 achados) | 2,6 ms |
+
+### G3.4d: TI-LFA, 10 000 prefixos (medido)
+
+2026-10-28, 32 núcleos, build de bench (release).
+
+| Medida | Antes | Depois |
+|---|---|---|
+| cobertura de 10 000 prefixos num área de 500 roteadores (`cargo bench -p corerouter-netsim --bench tilfa`) | 62,4 ms | 15,1 ms |
+| reparos para todos os 500 roteadores | — | 9,6 ms |
+| leitura de 10 000 rotas com reserva do zebra (6,5 MiB de JSON, `--bench frr_sr`) | — | 21,8 ms |
+
+O antes recalculava 5 SPFs por (destino, vizinho); agora a árvore da raiz, a árvore sem cada
+vizinho e a árvore reversa de cada destino são calculadas uma vez e compartilhadas (`Rc`), e só a
+árvore reversa sem o recurso é por par.
