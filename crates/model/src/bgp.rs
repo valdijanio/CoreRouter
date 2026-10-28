@@ -233,6 +233,10 @@ pub struct BgpParams {
     /// validator is configured; `crate::rpki`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpki_invalid: Option<crate::rpki::RpkiInvalid>,
+    /// G3.6b: the BFD profile watching the session (`crate::bfd`; RouterOS
+    /// `use-bfd`): the session goes down with BFD (FRR `neighbor … bfd`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bfd: Option<String>,
 }
 
 impl BgpParams {
@@ -260,6 +264,7 @@ impl BgpParams {
         take(&mut self.output_filter, &parent.output_filter);
         take(&mut self.keep_received, &parent.keep_received);
         take(&mut self.rpki_invalid, &parent.rpki_invalid);
+        take(&mut self.bfd, &parent.bfd);
     }
 
     /// The families in force: unset is IPv4 only, as in RouterOS.

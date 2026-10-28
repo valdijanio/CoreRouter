@@ -44,6 +44,9 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "routing.bfd.session.list", "BFD Sessions", ["Routing", "BFD"], None,
         "{} → {running, steering, error?, threads: [{index, sessions, cpu_percent, packets_in, packets_out, forwarded}], sessions: [{peer, local?, multihop, users, profile, state: up | down | init | admin-down | inactive, remote_state, diag, dampened, penalty, local_discr, remote_discr, tx_interval_us, remote_min_rx_us, remote_desired_tx_us, multiplier, remote_multiplier, detect_time_us, packets_tx, packets_rx, dropped, state_changes, flaps_24h, last_change?, tx_jitter_p99_us?, rx_gap_p99_us?, thread}]}",
         always, session_list),
+    cmd!("routing.bfd.attach", "Use BFD Everywhere", ["Routing", "BFD"], None,
+        "{protocols?: [bgp | ospf] | string (default both), profile?: string (default \"default\")} → {profile, bgp: [connection], ospf: [template id]} (only those without a profile of their own or from a template)",
+        always, attach),
     cmd!(query "routing.bfd.history.list", "BFD History", ["Routing", "BFD"], None,
         "{peer?: ip, limit?: u32 (default 200)} → [{at_ms, peer, multihop, from, to, diag, users, detect_time_us, dampened}] (newest first)",
         always, history_list),
@@ -157,7 +160,7 @@ fn profile_answer(prof: &BfdProfile) -> Value {
 
 fn profile_add(s: &mut Session, p: &Value) -> Result<Value> {
     let name = req_str(p, "name")?;
-    check_name("name", name)?;
+    corerouter_model::bfd::check_profile_name(name).map_err(|e| EngineError::bad("name", e))?;
     let bfd = &mut s.store_mut().candidate_mut().routing.bfd;
     if bfd.profile(name).is_some() {
         return Err(EngineError::bad("name", format!("profile {:?} already exists (routing.bfd.profile.set)", cut(name))));
@@ -307,6 +310,12 @@ fn apply_peer(bfd: &mut BfdConfig, p: &Value, id: Option<&str>) -> Result<String
     if let Some(m) = opt_bool(p, "multihop")? {
         peer.multihop = m;
     }
+    if peer.multihop && peer.local_address.is_none() {
+        return Err(EngineError::bad(
+            "local_address",
+            "a multihop session needs local_address (RFC 5883 §3: the session is the address pair)",
+        ));
+    }
     if peer.multihop && peer.interface.is_some() {
         return Err(EngineError::bad("interface", "a multihop session is not tied to an interface (RFC 5883)"));
     }
@@ -436,6 +445,44 @@ fn session_list(s: &mut Session, _: &Value) -> Result<Value> {
     Ok(out)
 }
 
+/// BFD with one click: the profile on every BGP connection and OSPF
+/// interface template that has none (its own or a template's).
+fn attach(s: &mut Session, p: &Value) -> Result<Value> {
+    let protocols: Vec<String> = match p.get("protocols") {
+        None | Some(Value::Null) => vec!["bgp".into(), "ospf".into()],
+        Some(Value::String(t)) => t.split(',').map(|x| x.trim().to_owned()).filter(|x| !x.is_empty()).collect(),
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
+        Some(_) => return Err(EngineError::bad("protocols", "a list of bgp, ospf")),
+    };
+    if let Some(bad) = protocols.iter().find(|x| *x != "bgp" && *x != "ospf") {
+        return Err(EngineError::bad("protocols", format!("{:?}: bgp or ospf", cut(bad))));
+    }
+    let profile = opt_str(p, "profile")?.unwrap_or(PROFILE_DEFAULT).to_owned();
+    let routing = &mut s.store_mut().candidate_mut().routing;
+    if routing.bfd.profile(&profile).is_none() {
+        return Err(EngineError::bad("profile", format!("no BFD profile {:?}", cut(&profile))));
+    }
+    let mut bgp = Vec::new();
+    if protocols.iter().any(|x| x == "bgp") {
+        let resolved = corerouter_model::bgp::resolve_templates(&routing.bgp_templates);
+        for c in routing.bgp_connections.values_mut() {
+            let inherited = c.effective(&resolved).ok().and_then(|e| e.bfd);
+            if inherited.is_none() {
+                c.params.bfd = Some(profile.clone());
+                bgp.push(c.name.clone());
+            }
+        }
+    }
+    let mut ospf = Vec::new();
+    if protocols.iter().any(|x| x == "ospf") {
+        for t in routing.ospf.templates.iter_mut().filter(|t| t.bfd.is_none()) {
+            t.bfd = Some(profile.clone());
+            ospf.push(t.id.to_string());
+        }
+    }
+    Ok(json!({"profile": profile, "bgp": bgp, "ospf": ospf}))
+}
+
 fn history_list(s: &mut Session, p: &Value) -> Result<Value> {
     let peer = ip(p, "peer")?;
     let limit = opt_u32(p, "limit")?.unwrap_or(200) as usize;
@@ -509,7 +556,9 @@ mod tests {
     fn peers_and_inactive_sessions() {
         let mut s = session();
         s.execute("routing.bfd.peer.add", &json!({"address": "192.0.2.2", "profile": "fast"})).unwrap();
-        s.execute("routing.bfd.peer.add", &json!({"name": "mh", "address": "198.51.100.9", "multihop": true})).unwrap();
+        let e = s.execute("routing.bfd.peer.add", &json!({"name": "mh", "address": "198.51.100.9", "multihop": true})).unwrap_err();
+        assert!(e.to_string().contains("RFC 5883"), "{e}");
+        s.execute("routing.bfd.peer.add", &json!({"name": "mh", "address": "198.51.100.9", "multihop": true, "local_address": "192.0.2.1"})).unwrap();
         // One session, one profile.
         let e = s
             .execute("routing.bfd.peer.add", &json!({"name": "dup", "address": "192.0.2.2", "profile": "default"}))
@@ -518,7 +567,7 @@ mod tests {
         let e = s.execute("routing.bfd.peer.add", &json!({"address": "192.0.2.3", "profile": "nope"})).unwrap_err();
         assert!(e.to_string().contains("no BFD profile"));
         let e = s
-            .execute("routing.bfd.peer.add", &json!({"address": "192.0.2.4", "multihop": true, "interface": "ether1"}))
+            .execute("routing.bfd.peer.add", &json!({"address": "192.0.2.4", "multihop": true, "local_address": "192.0.2.1", "interface": "ether1"}))
             .unwrap_err();
         assert!(e.to_string().contains("multihop"));
         // A profile in use cannot go.
@@ -572,6 +621,46 @@ mod tests {
         let h = s.execute("routing.bfd.history.list", &json!({"limit": 2})).unwrap();
         assert_eq!(h.as_array().unwrap().len(), 2);
         assert_eq!(h[0]["at_ms"], 2);
+    }
+
+    #[test]
+    fn bgp_and_ospf_name_profiles_that_must_exist() {
+        let mut s = session();
+        s.execute("routing.bgp.instance.set", &json!({"asn": 65000, "router_id": "10.0.0.1"})).unwrap();
+        s.execute(
+            "routing.bgp.connection.add",
+            &json!({"name": "up1", "remote_address": "192.0.2.6", "remote_as": 64500, "bfd": "fast"}),
+        )
+        .unwrap();
+        let conf = corerouter_proto_bgp::render_all(&s.store().running().routing, &|_| None).unwrap();
+        assert!(conf.contains(" neighbor 192.0.2.6 bfd profile fast\n"), "{conf}");
+        let bfd = corerouter_proto_bfd::frr::render(s.store().running());
+        assert!(bfd.starts_with("bfd\n profile default\n"), "{bfd}");
+        // A profile nobody defined is refused at commit.
+        let e = s.execute("routing.bgp.connection.set", &json!({"id": "up1", "bfd": "nope"})).unwrap_err();
+        assert!(e.to_string().contains("no BFD profile"), "{e}");
+        let e = s.execute("routing.bgp.connection.set", &json!({"id": "up1", "bfd": "bad name"})).unwrap_err();
+        assert!(matches!(e, EngineError::BadParam { .. }), "{e}");
+        // Unset: no BFD, no bfd block.
+        s.execute("routing.bgp.connection.set", &json!({"id": "up1", "bfd": null})).unwrap();
+        assert_eq!(corerouter_proto_bfd::frr::render(s.store().running()), "");
+    }
+
+    #[test]
+    fn attach_puts_the_profile_where_none_is() {
+        let mut s = session();
+        s.execute("routing.bgp.instance.set", &json!({"asn": 65000, "router_id": "10.0.0.1"})).unwrap();
+        s.execute("routing.bgp.connection.add", &json!({"name": "a", "remote_address": "192.0.2.6", "remote_as": 64500})).unwrap();
+        s.execute("routing.bgp.connection.add", &json!({"name": "b", "remote_address": "192.0.2.7", "remote_as": 64500, "bfd": "fast"})).unwrap();
+        let r = s.execute("routing.bfd.attach", &json!({"protocols": ["bgp"]})).unwrap();
+        assert_eq!(r["bgp"], json!(["a"]));
+        let c = &s.store().candidate().routing.bgp_connections;
+        assert_eq!(c["a"].params.bfd.as_deref(), Some("default"));
+        assert_eq!(c["b"].params.bfd.as_deref(), Some("fast"));
+        assert!(s.execute("routing.bfd.attach", &json!({"profile": "nope"})).is_err());
+        assert!(s.execute("routing.bfd.attach", &json!({"protocols": "isis"})).is_err());
+        let r = s.execute("routing.bfd.attach", &json!({})).unwrap();
+        assert_eq!(r["bgp"], json!([]));
     }
 
     #[test]

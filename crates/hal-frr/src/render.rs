@@ -82,6 +82,8 @@ pub const OWNED: Owned = &[
     // `match rpki` exists only in bgpd (its rpki module).
     ("rpki", &[Daemon::Bgpd]),
     ("route-map CR-RPKI-", &[Daemon::Bgpd]),
+    // G3.6b: profiles and peers for bfdd (CoreRouter's engine is its data plane).
+    ("bfd", &[Daemon::Bfdd]),
 ];
 
 /// A table of owned contexts: header prefix → daemons that take it.
@@ -154,6 +156,7 @@ pub fn render(cfg: &Config, open: corerouter_proto_bgp::Opener<'_>) -> Result<Co
         corerouter_proto_bgp::render_all(&cfg.routing, open).map_err(RenderError::Proto)?;
     // G3.4: the same key opener (both seal with the engine's key).
     text.push_str(&corerouter_proto_ospf::frr::render(cfg, open).map_err(RenderError::Proto)?);
+    text.push_str(&corerouter_proto_bfd::frr::render(cfg));
     Ok(Conf::parse(&text)?)
 }
 

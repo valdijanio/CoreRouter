@@ -43,6 +43,12 @@ pub(crate) struct Spec {
 #[derive(Debug, Clone)]
 pub(crate) struct Event {
     pub key: BfdKey,
+    pub discr: u32,
+    /// What the peer said last (for `bfdd`'s `BFD_STATE_CHANGE`).
+    pub remote_discr: u32,
+    pub remote_desired_tx: u32,
+    pub remote_min_rx: u32,
+    pub remote_mult: u8,
     pub from: State,
     pub to: State,
     pub diag: Diag,
@@ -313,6 +319,21 @@ impl Engine {
             .insert(spec.key.clone(), discr);
         self.post((discr % n) as usize, Cmd::Add(discr, Box::new(spec)));
         discr
+    }
+
+    /// A session whose discriminator someone else chose (`bfdd`, data
+    /// plane mode): it lives on thread `discr mod N`. False when 0 or taken.
+    pub(crate) fn add_with(&mut self, discr: u32, spec: Spec) -> bool {
+        if discr == 0 || !self.used.insert(discr) {
+            return false;
+        }
+        self.shared
+            .demux
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(spec.key.clone(), discr);
+        self.post((discr % self.n as u32) as usize, Cmd::Add(discr, Box::new(spec)));
+        true
     }
 
     pub(crate) fn update(&self, discr: u32, spec: Spec) {
@@ -723,6 +744,11 @@ impl Worker {
         sl.client_up = sl.s.state() == State::Up && !sl.suppressed;
         let ev = Event {
             key: sl.spec.key.clone(),
+            discr: sl.discr,
+            remote_discr: sl.s.remote_discr(),
+            remote_desired_tx: sl.s.remote_desired_tx(),
+            remote_min_rx: sl.s.remote_min_rx(),
+            remote_mult: sl.s.remote_mult(),
             from: c.from,
             to: c.to,
             diag: c.diag,
@@ -790,6 +816,11 @@ impl Worker {
             sl.client_up = sl.s.state() == State::Up;
             let _ = self.events.try_send(Event {
                 key: sl.spec.key.clone(),
+                discr: sl.discr,
+                remote_discr: sl.s.remote_discr(),
+                remote_desired_tx: sl.s.remote_desired_tx(),
+                remote_min_rx: sl.s.remote_min_rx(),
+                remote_mult: sl.s.remote_mult(),
                 from: sl.s.state(),
                 to: sl.s.state(),
                 diag: Diag::None,
