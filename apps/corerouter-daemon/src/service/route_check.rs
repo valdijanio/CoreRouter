@@ -84,6 +84,7 @@ fn run(session: &Shared, interval: u64, health: &super::Health) {
     let start = Instant::now();
     let ms = || u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let mut sched = Schedule::new(interval, CHECK_WAIT_MS.min(interval / 2));
+    lock(session).route_check_interval(interval);
     let mut socks = Sockets::default();
     let mut results: Vec<(Target, bool)> = Vec::new();
     let mut arp_buf = Vec::new();

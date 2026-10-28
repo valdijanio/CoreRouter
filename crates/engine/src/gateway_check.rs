@@ -257,6 +257,9 @@ pub struct StaticChecks {
     down_gateways: HashSet<IpAddr>,
     /// The config generation and clock (ms) of the last sync.
     synced: Option<(u64, u64)>,
+    /// The probes' interval when the daemon runs another than RouterOS'
+    /// 10 s (`--route-check-interval`, tests).
+    pub interval_ms: Option<u64>,
 }
 
 impl StaticChecks {
@@ -506,6 +509,15 @@ impl Schedule {
 }
 
 impl Session {
+    /// The interval the `route-check` thread probes at (shown in
+    /// `ip.route.list`; [`CHECK_INTERVAL_MS`] unless the daemon was told
+    /// otherwise).
+    pub fn route_check_interval(&mut self, ms: u64) {
+        if let Some(c) = self.checks_mut() {
+            c.interval_ms = Some(ms);
+        }
+    }
+
     /// An ICMP prober for the `route-check` thread (used without the lock).
     pub fn route_check_prober(&self) -> Result<corerouter_hal::probe::SharedProber, String> {
         self.hal().prober()
@@ -825,11 +837,15 @@ impl Session {
         let mut withheld = Vec::new();
         let c = self.ext::<StaticChecks>();
         let running = c.is_some_and(|c| c.running);
+        let interval = c.and_then(|c| c.interval_ms).unwrap_or(CHECK_INTERVAL_MS);
         let now = self.dhcp.now_ms.unwrap_or(0);
         for r in cfg.ip.routes.iter() {
             let Some(t) = target_of(r) else { continue };
             let h = c.and_then(|c| c.health.get(&t));
-            let check = route_check(&t, h, running, now);
+            let mut check = route_check(&t, h, running, now);
+            if t.method != CheckGateway::Bfd {
+                check.interval_secs = interval.div_ceil(1000);
+            }
             if h.is_some_and(|h| h.down) {
                 let why = match t.method {
                     CheckGateway::Bfd => format!("BFD session to gateway {} is down", t.text()),

@@ -106,14 +106,14 @@ fn cells_carry_chips_and_the_reason_is_translated() {
         vec![(chip::Kind::Neutral, "ether2"), (chip::Kind::Green, "reachable")]
     );
     assert_eq!(
-        standby.cells[6],
+        standby.cells[7],
         "perde para a distância 1 (rota *1 via 10.0.0.1%ether1)"
     );
-    let (_, table) = chip::split(&standby.cells[4]);
+    let (_, table) = chip::split(&standby.cells[5]);
     assert_eq!(table, vec![(chip::Kind::Hashed(chip::name_hue("main")), "main")]);
     let english = rows_of(&routes, &View::default(), langs(Lang::En));
     let down = english.iter().find(|r| r.key == "*4").unwrap();
-    assert_eq!(down.cells[6], "interface 'ether3' has no link");
+    assert_eq!(down.cells[7], "interface 'ether3' has no link");
     let (_, chips) = chip::split(&down.cells[2]);
     assert!(chips.contains(&(chip::Kind::Red, "unreachable")));
 }
