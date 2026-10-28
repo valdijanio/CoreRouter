@@ -24,12 +24,16 @@ fn base() -> Config {
     }
     let mpls = &mut c.routing.mpls;
     mpls.ldp = Some(LdpInstance::new(Ipv4Addr::new(10, 255, 0, 1)));
-    mpls.ldp_interfaces.insert(name("ether1"), LdpInterface::default());
+    mpls.ldp_interfaces
+        .insert(name("ether1"), LdpInterface::default());
     c
 }
 
 fn paths(c: &Config) -> Vec<String> {
-    validate(c).into_iter().map(|i| format!("{}: {}", i.path, i.message)).collect()
+    validate(c)
+        .into_iter()
+        .map(|i| format!("{}: {}", i.path, i.message))
+        .collect()
 }
 
 #[test]
@@ -42,7 +46,10 @@ fn a_plain_ldp_config_is_valid_and_renders_for_ldpd() {
         "mpls ldp\n router-id 10.255.0.1\n address-family ipv4\n  discovery transport-address 10.255.0.1\n  interface ether1\n exit-address-family\n"
     );
     // RFC 5443 on by default: the IGP gets the sync lines.
-    assert_eq!(igp_sync_lines(&c.routing.mpls), vec!["mpls ldp-sync".to_owned()]);
+    assert_eq!(
+        igp_sync_lines(&c.routing.mpls),
+        vec!["mpls ldp-sync".to_owned()]
+    );
 }
 
 #[test]
@@ -100,7 +107,10 @@ fn bad_values_are_refused_with_the_rule() {
             ..LdpInterface::default()
         },
     );
-    c.routing.mpls.ldp_interfaces.insert(name("nope"), LdpInterface::default());
+    c.routing
+        .mpls
+        .ldp_interfaces
+        .insert(name("nope"), LdpInterface::default());
     c.routing.mpls.statics.insert(
         5000,
         StaticLsp {
@@ -115,13 +125,23 @@ fn bad_values_are_refused_with_the_rule() {
     assert!(p.iter().any(|x| x.contains("RFC 5036 §3.5.2.1")), "{p:?}");
     assert!(p.iter().any(|x| x.contains("no interface 'nope'")), "{p:?}");
     // In the dynamic range, and 3 out: both said.
-    assert!(p.iter().any(|x| x.contains("inside the dynamic range")), "{p:?}");
+    assert!(
+        p.iter().any(|x| x.contains("inside the dynamic range")),
+        "{p:?}"
+    );
     assert!(p.iter().any(|x| x.contains("outgoing label 3")), "{p:?}");
     c.routing.mpls.settings.dynamic_label_range = (16, 4999);
     let p = paths(&c);
-    assert!(!p.iter().any(|x| x.contains("inside the dynamic range")), "{p:?}");
+    assert!(
+        !p.iter().any(|x| x.contains("inside the dynamic range")),
+        "{p:?}"
+    );
     // The range then reaches zebra, so LDP never takes a static label.
-    assert!(render_frr(&c.routing.mpls, &|_| None).unwrap().starts_with("mpls label dynamic-block 16 4999\n"));
+    assert!(
+        render_frr(&c.routing.mpls, &|_| None)
+            .unwrap()
+            .starts_with("mpls label dynamic-block 16 4999\n")
+    );
     c.routing.mpls.settings.dynamic_label_range = (3, 10);
     assert!(paths(&c).iter().any(|x| x.contains("reserved")));
 }
@@ -200,11 +220,31 @@ fn every_fec_without_a_label_says_why() {
     // MTU 1500 < 1504 for a 1500-byte packet with one label (the mockup).
     assert_eq!(
         row("10.255.0.3/32").mtu.as_deref(),
-        Some("MTU 1500 < 1504: a 1500-byte IP packet with 1 label does not fit; raise the link MTU to 1504")
+        Some(
+            "MTU 1500 < 1504: a 1500-byte IP packet with 1 label does not fit; raise the link MTU to 1504"
+        )
     );
-    assert!(row("10.255.0.1/32").reason.as_deref().unwrap().starts_with("egress"));
-    assert!(row("10.9.0.0/24").reason.as_deref().unwrap().contains("no neighbor advertised"));
-    assert!(row("10.8.0.0/24").reason.as_deref().unwrap().contains("none is the IGP next hop"));
+    assert!(
+        row("10.255.0.1/32")
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with("egress")
+    );
+    assert!(
+        row("10.9.0.0/24")
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("no neighbor advertised")
+    );
+    assert!(
+        row("10.8.0.0/24")
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("none is the IGP next hop")
+    );
     // The kernel entry no FEC explains is listed too.
     let other: Vec<_> = rows.iter().filter(|r| r.fec.is_none()).collect();
     assert_eq!(other.len(), 1);
@@ -215,12 +255,24 @@ fn every_fec_without_a_label_says_why() {
         ..st.clone()
     };
     let rows = forwarding_rows(&c.routing.mpls, Some(&down), &[], &|_| Some(9000));
-    assert!(rows.iter().find(|r| r.fec.as_deref() == Some("10.9.0.0/24")).unwrap().reason.as_deref().unwrap().contains("no LDP neighbor is operational"));
+    assert!(
+        rows.iter()
+            .find(|r| r.fec.as_deref() == Some("10.9.0.0/24"))
+            .unwrap()
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("no LDP neighbor is operational")
+    );
 }
 
 #[test]
 fn mtu_warning_counts_four_bytes_per_label() {
     assert_eq!(mtu_warning(1500, 0, 1504), None);
     assert_eq!(mtu_warning(1500, 2, 1508), None);
-    assert!(mtu_warning(1500, 2, 1507).unwrap().starts_with("MTU 1507 < 1508"));
+    assert!(
+        mtu_warning(1500, 2, 1507)
+            .unwrap()
+            .starts_with("MTU 1507 < 1508")
+    );
 }

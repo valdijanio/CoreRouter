@@ -172,7 +172,11 @@ fn ldp_sync(conf: &mut Conf, cfg: &Config) {
     if lines.is_empty() {
         return;
     }
-    for n in conf.nodes.iter_mut().filter(|n| n.line == "router ospf" || n.line.starts_with("router ospf ")) {
+    for n in conf
+        .nodes
+        .iter_mut()
+        .filter(|n| n.line == "router ospf" || n.line.starts_with("router ospf "))
+    {
         for l in &lines {
             if !n.children.iter().any(|c| &c.line == l) {
                 n.children.push(crate::conf::Node {
@@ -243,7 +247,10 @@ mod tests {
         let mut cfg = Config::default();
         let e1: corerouter_model::IfName = "ether1".parse().unwrap();
         cfg.routing.mpls.ldp = Some(LdpInstance::new([10, 0, 0, 1].into()));
-        cfg.routing.mpls.ldp_interfaces.insert(e1, LdpInterface::default());
+        cfg.routing
+            .mpls
+            .ldp_interfaces
+            .insert(e1, LdpInterface::default());
         let conf = render(&cfg, &|_| None).unwrap();
         let parts = by_daemon(OWNED, &conf);
         assert_eq!(parts.len(), 1);
@@ -252,9 +259,21 @@ mod tests {
         // With an OSPF context (G3.4 renders it), sync lands inside it.
         let mut c2 = Conf::parse("router ospf\n ospf router-id 10.0.0.1\n").unwrap();
         ldp_sync(&mut c2, &cfg);
-        assert!(c2.nodes[0].children.iter().any(|c| c.line == "mpls ldp-sync"));
+        assert!(
+            c2.nodes[0]
+                .children
+                .iter()
+                .any(|c| c.line == "mpls ldp-sync")
+        );
         ldp_sync(&mut c2, &cfg);
-        assert_eq!(c2.nodes[0].children.iter().filter(|c| c.line == "mpls ldp-sync").count(), 1);
+        assert_eq!(
+            c2.nodes[0]
+                .children
+                .iter()
+                .filter(|c| c.line == "mpls ldp-sync")
+                .count(),
+            1
+        );
     }
 
     #[test]

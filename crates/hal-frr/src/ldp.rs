@@ -54,7 +54,11 @@ fn truthy(v: Option<&Value>) -> bool {
 /// `{"neighbors": [...]}`.
 pub fn neighbors(json: &str) -> Result<Vec<LdpNeighborState>, String> {
     let v = parse(json, "neighbors")?;
-    let list = v.get("neighbors").and_then(Value::as_array).cloned().unwrap_or_default();
+    let list = v
+        .get("neighbors")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let mut out: Vec<LdpNeighborState> = list
         .iter()
         .filter_map(Value::as_object)
@@ -76,7 +80,11 @@ pub fn neighbors(json: &str) -> Result<Vec<LdpNeighborState>, String> {
 /// one line per (FEC, neighbor), grouped by FEC.
 pub fn bindings(json: &str) -> Result<Vec<LdpBinding>, String> {
     let v = parse(json, "bindings")?;
-    let list = v.get("bindings").and_then(Value::as_array).cloned().unwrap_or_default();
+    let list = v
+        .get("bindings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let mut by: BTreeMap<ipnet::IpNet, LdpBinding> = BTreeMap::new();
     for b in list.iter().filter_map(Value::as_object) {
         let Some(prefix) = text(b, "prefix").and_then(|p| p.parse::<ipnet::IpNet>().ok()) else {
@@ -117,7 +125,10 @@ pub fn interfaces(json: &str) -> Result<Vec<LdpInterfaceState>, String> {
             .iter()
             .filter_map(|(k, v)| Some((k.as_str(), v.as_object()?)))
             .collect(),
-        Value::Array(a) => a.iter().filter_map(|v| Some(("", v.as_object()?))).collect(),
+        Value::Array(a) => a
+            .iter()
+            .filter_map(|v| Some(("", v.as_object()?)))
+            .collect(),
         _ => Vec::new(),
     };
     let mut out: Vec<LdpInterfaceState> = items
@@ -189,11 +200,23 @@ mod tests {
             {"addressFamily":"ipv4","prefix":"10.9.0.0/24","neighborId":"-","localLabel":"18","remoteLabel":"-","inUse":0}
         ]}"#).unwrap();
         assert_eq!(b.len(), 3);
-        let own = b.iter().find(|x| x.prefix.to_string() == "10.255.0.1/32").unwrap();
+        let own = b
+            .iter()
+            .find(|x| x.prefix.to_string() == "10.255.0.1/32")
+            .unwrap();
         assert_eq!(own.local_label, Some(IMPLICIT_NULL));
-        let php = b.iter().find(|x| x.prefix.to_string() == "10.255.0.2/32").unwrap();
+        let php = b
+            .iter()
+            .find(|x| x.prefix.to_string() == "10.255.0.2/32")
+            .unwrap();
         assert_eq!(php.in_use().map(|r| r.label), Some(IMPLICIT_NULL));
-        assert!(b.iter().find(|x| x.prefix.to_string() == "10.9.0.0/24").unwrap().remote.is_empty());
+        assert!(
+            b.iter()
+                .find(|x| x.prefix.to_string() == "10.9.0.0/24")
+                .unwrap()
+                .remote
+                .is_empty()
+        );
         let i = interfaces(r#"{"ether1: ipv4":{"name":"ether1","addressFamily":"ipv4","state":"ACTIVE","adjacencyCount":1}}"#).unwrap();
         assert_eq!(i[0].name, "ether1");
         assert_eq!(i[0].adjacencies, 1);

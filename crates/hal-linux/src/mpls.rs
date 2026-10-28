@@ -185,7 +185,11 @@ pub fn parse(body: &[u8]) -> Option<RawRoute> {
         }
     }
     nexthop_attrs(body.get(RTMSG..)?, &mut single);
-    let nexthops = if multi.is_empty() { vec![single] } else { multi };
+    let nexthops = if multi.is_empty() {
+        vec![single]
+    } else {
+        multi
+    };
     Some(RawRoute {
         label: label?,
         protocol,
@@ -221,7 +225,9 @@ fn attr(buf: &mut Vec<u8>, kind: u16, data: &[u8]) {
 
 /// Write the message length into the header that starts at `at`.
 fn close(buf: &mut [u8], at: usize) {
-    let len = u32::try_from(buf.len() - at).unwrap_or(u32::MAX).to_ne_bytes();
+    let len = u32::try_from(buf.len() - at)
+        .unwrap_or(u32::MAX)
+        .to_ne_bytes();
     if let Some(head) = buf.get_mut(at..at + 4) {
         head.copy_from_slice(&len);
     }
@@ -399,9 +405,7 @@ mod linux {
                 out.clear();
                 self.seq = self.seq.wrapping_add(1);
                 let seq = self.seq;
-                self.sock
-                    .send(&super::dump_request(seq), 0)
-                    .map_err(io)?;
+                self.sock.send(&super::dump_request(seq), 0).map_err(io)?;
                 let start = Instant::now();
                 let mut torn = false;
                 'read: loop {
@@ -524,15 +528,17 @@ mod linux {
                     }
                     acked += 1;
                     let code = errno(msg);
-                    let gone = code == ENOENT
-                        && matches!(ops.get(s.op), Some(StaticOp::Remove(_)));
+                    let gone = code == ENOENT && matches!(ops.get(s.op), Some(StaticOp::Remove(_)));
                     if code != 0 && !gone && refused.as_ref().is_none_or(|(o, _)| s.op < *o) {
                         let what = match ops.get(s.op) {
                             Some(StaticOp::Remove(l)) => format!("removing label {l}"),
                             Some(StaticOp::Set(r)) => format!("label {}", r.label),
                             None => String::new(),
                         };
-                        refused = Some((s.op, HalError::Rejected(format!("MPLS {what}: {}", os_error(code)))));
+                        refused = Some((
+                            s.op,
+                            HalError::Rejected(format!("MPLS {what}: {}", os_error(code))),
+                        ));
                     }
                 }
             }
@@ -644,7 +650,11 @@ mod linux {
         }
         write(
             &sys.join("ip_ttl_propagate"),
-            if mpls.settings.propagate_ttl { "1" } else { "0" },
+            if mpls.settings.propagate_ttl {
+                "1"
+            } else {
+                "0"
+            },
         )?;
         for name in cfg.interfaces.keys().filter(|n| managed(n)) {
             let p = sys.join("conf").join(name.as_str()).join("input");
@@ -656,7 +666,11 @@ mod linux {
     }
 
     /// `/mpls` from `from` to `to`: the knobs, then the static entries.
-    pub fn sync(from: &Config, to: &Config, managed: &dyn Fn(&IfName) -> bool) -> Result<(), HalError> {
+    pub fn sync(
+        from: &Config,
+        to: &Config,
+        managed: &dyn Fn(&IfName) -> bool,
+    ) -> Result<(), HalError> {
         let (a, b) = (&from.routing.mpls, &to.routing.mpls);
         if a == b && from.interfaces == to.interfaces {
             return Ok(());
@@ -713,7 +727,10 @@ mod tests {
         let mut buf = Vec::new();
         push_set(&mut buf, &r, 9);
         assert_eq!(buf.len() % 4, 0);
-        assert_eq!(usize::try_from(u32_at(&buf, 0).unwrap()).unwrap(), buf.len());
+        assert_eq!(
+            usize::try_from(u32_at(&buf, 0).unwrap()).unwrap(),
+            buf.len()
+        );
         assert_eq!(parse(body_of(&buf)), Some(r));
         let v6 = RawRoute {
             label: 17,

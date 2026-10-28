@@ -253,7 +253,10 @@ pub(crate) fn features() -> Features {
     }
     let mpls = crate::mpls::available();
     if !mpls {
-        log::info!("{}: the MPLS commands are disabled", corerouter_hal::mpls::NO_MPLS);
+        log::info!(
+            "{}: the MPLS commands are disabled",
+            corerouter_hal::mpls::NO_MPLS
+        );
     }
     Features { vrf, mpls }
 }

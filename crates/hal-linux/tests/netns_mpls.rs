@@ -125,20 +125,46 @@ fn static_labels_go_in_and_read_back() {
     ];
     apply_static(&ops, &[]).unwrap();
     let text = ip(&["-f", "mpls", "route", "show"]);
-    assert!(text.contains("100 as to 200 via inet 10.30.0.2 dev mpa0"), "{text}");
-    assert!(text.contains("102 as to 300/301/302 via inet 10.30.0.2 dev mpa0"), "{text}");
+    assert!(
+        text.contains("100 as to 200 via inet 10.30.0.2 dev mpa0"),
+        "{text}"
+    );
+    assert!(
+        text.contains("102 as to 300/301/302 via inet 10.30.0.2 dev mpa0"),
+        "{text}"
+    );
     assert!(text.contains("101 via inet 10.30.0.2 dev mpa0"), "{text}");
     let mut r = Reader::open().unwrap();
     let back = mine(&mut r);
-    assert_eq!(back, vec![
-        route(100, [10, 30, 0, 2], "mpa0", &[200]),
-        route(101, [10, 30, 0, 2], "mpa0", &[]),
-        route(102, [10, 30, 0, 2], "mpa0", &[300, 301, 302]),
-    ]);
+    assert_eq!(
+        back,
+        vec![
+            route(100, [10, 30, 0, 2], "mpa0", &[200]),
+            route(101, [10, 30, 0, 2], "mpa0", &[]),
+            route(102, [10, 30, 0, 2], "mpa0", &[300, 301, 302]),
+        ]
+    );
     // An entry `ip` added is read too (another program's), with its origin.
-    ip(&["-f", "mpls", "route", "add", "500", "via", "inet", "10.30.0.3", "dev", "mpa0", "proto", "193"]);
+    ip(&[
+        "-f",
+        "mpls",
+        "route",
+        "add",
+        "500",
+        "via",
+        "inet",
+        "10.30.0.3",
+        "dev",
+        "mpa0",
+        "proto",
+        "193",
+    ]);
     let all = r.routes().unwrap();
-    assert!(all.iter().any(|x| x.label == 500 && x.origin == Origin::Ldp), "{all:?}");
+    assert!(
+        all.iter()
+            .any(|x| x.label == 500 && x.origin == Origin::Ldp),
+        "{all:?}"
+    );
     // A refusal in the middle undoes what went before (all or nothing):
     // label 99999 is in range, 200000 is not (platform_labels 100000).
     let before = back.clone();
@@ -149,7 +175,16 @@ fn static_labels_go_in_and_read_back() {
     ];
     assert!(apply_static(&bad, &before).is_err());
     assert_eq!(mine(&mut r), before, "the batch was undone");
-    apply_static(&[StaticOp::Remove(100), StaticOp::Remove(101), StaticOp::Remove(102), StaticOp::Remove(100)], &before).unwrap();
+    apply_static(
+        &[
+            StaticOp::Remove(100),
+            StaticOp::Remove(101),
+            StaticOp::Remove(102),
+            StaticOp::Remove(100),
+        ],
+        &before,
+    )
+    .unwrap();
     assert!(mine(&mut r).is_empty());
     ip(&["link", "del", "mpa0"]);
 }
@@ -163,8 +198,10 @@ fn apply_sets_the_knobs_and_the_static_entries() {
     port("mpb0", "mpb1", 31);
     let name: IfName = "mpb0".parse().unwrap();
     let mut from = Config::default();
-    from.interfaces
-        .insert(name.clone(), Interface::new(name.clone(), InterfaceKind::Ethernet));
+    from.interfaces.insert(
+        name.clone(),
+        Interface::new(name.clone(), InterfaceKind::Ethernet),
+    );
     let mut to = from.clone();
     to.routing.mpls.settings.dynamic_label_range = (16, 49_999);
     to.routing.mpls.settings.propagate_ttl = false;
@@ -197,7 +234,11 @@ fn apply_sets_the_knobs_and_the_static_entries() {
     assert_eq!(read("ip_ttl_propagate").trim(), "0");
     assert_eq!(read("conf/mpb0/input").trim(), "1");
     let got = hal.mpls_routes().unwrap();
-    assert!(got.iter().any(|r| r.label == 60_000 && r.nexthops[0].out_labels == [70]), "{got:?}");
+    assert!(
+        got.iter()
+            .any(|r| r.label == 60_000 && r.nexthops[0].out_labels == [70]),
+        "{got:?}"
+    );
     hal.apply(&to, &from).unwrap();
     assert_eq!(read("conf/mpb0/input").trim(), "0");
     assert!(!hal.mpls_routes().unwrap().iter().any(|r| r.label == 60_000));

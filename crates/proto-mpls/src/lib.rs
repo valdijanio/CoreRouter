@@ -43,7 +43,9 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
     }
     for name in m.interfaces.keys() {
         if name != corerouter_model::mpls::ALL
-            && !name.parse::<IfName>().is_ok_and(|n| cfg.interfaces.contains_key(&n))
+            && !name
+                .parse::<IfName>()
+                .is_ok_and(|n| cfg.interfaces.contains_key(&n))
         {
             out.push(Issue::new(
                 format!("routing.mpls.interfaces.{name}"),
@@ -56,14 +58,22 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
         if l.lsr_id.is_unspecified() || l.lsr_id.is_broadcast() || l.lsr_id.is_multicast() {
             out.push(Issue::new(
                 format!("{p}.lsr_id"),
-                format!("{} is not a usable LSR id (use the loopback address)", l.lsr_id),
+                format!(
+                    "{} is not a usable LSR id (use the loopback address)",
+                    l.lsr_id
+                ),
             ));
         }
         if l.afi.is_empty() {
             out.push(Issue::new(format!("{p}.afi"), "at least one of ip, ipv6"));
         }
         for v4 in [true, false] {
-            if l.transport_addresses.iter().filter(|a| a.is_ipv4() == v4).count() > 1 {
+            if l.transport_addresses
+                .iter()
+                .filter(|a| a.is_ipv4() == v4)
+                .count()
+                > 1
+            {
                 out.push(Issue::new(
                     format!("{p}.transport_addresses"),
                     "one transport address per family (RFC 5036 §2.5.2)",
@@ -93,7 +103,10 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
     for (name, i) in &m.ldp_interfaces {
         let p = format!("routing.mpls.ldp_interfaces.{name}");
         if !cfg.interfaces.contains_key(name) {
-            out.push(Issue::new(&p, format!("no interface '{name}' (see interface.list)")));
+            out.push(Issue::new(
+                &p,
+                format!("no interface '{name}' (see interface.list)"),
+            ));
         }
         if i.hello_interval == 0 || i.hold_time == 0 || i.hello_interval >= i.hold_time {
             out.push(Issue::new(
@@ -130,7 +143,10 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
             ));
         }
         if s.out_labels.len() > MAX_PUSH {
-            out.push(Issue::new(&p, format!("at most {MAX_PUSH} outgoing labels")));
+            out.push(Issue::new(
+                &p,
+                format!("at most {MAX_PUSH} outgoing labels"),
+            ));
         }
         if let Some(bad) = s.out_labels.iter().find(|l| !out_label_ok(**l)) {
             out.push(Issue::new(
@@ -141,7 +157,10 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
         if let Some(i) = &s.interface
             && !cfg.interfaces.contains_key(i)
         {
-            out.push(Issue::new(&p, format!("no interface '{i}' (see interface.list)")));
+            out.push(Issue::new(
+                &p,
+                format!("no interface '{i}' (see interface.list)"),
+            ));
         }
     }
     out
@@ -149,7 +168,9 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
 
 /// A label a packet may carry out (RFC 3032 §2.1; Linux refuses the rest).
 pub fn out_label_ok(l: u32) -> bool {
-    l == IPV4_EXPLICIT_NULL || l == IPV6_EXPLICIT_NULL || (FIRST_UNRESERVED..=MAX_LABEL).contains(&l)
+    l == IPV4_EXPLICIT_NULL
+        || l == IPV6_EXPLICIT_NULL
+        || (FIRST_UNRESERVED..=MAX_LABEL).contains(&l)
 }
 
 fn afi_name(a: Afi) -> &'static str {
@@ -164,7 +185,9 @@ fn afi_name(a: Afi) -> &'static str {
 pub fn render_frr(mpls: &Mpls, open: Opener<'_>) -> Result<String, String> {
     let mut s = String::new();
     let (lo, hi) = mpls.settings.dynamic_label_range;
-    if mpls.settings.dynamic_label_range != corerouter_model::mpls::MplsSettings::default().dynamic_label_range {
+    if mpls.settings.dynamic_label_range
+        != corerouter_model::mpls::MplsSettings::default().dynamic_label_range
+    {
         // zebra's label manager hands LDP labels from this block only
         // (FRR 9.1+), so they never collide with `/mpls static`.
         let _ = writeln!(s, "mpls label dynamic-block {lo} {hi}");
@@ -181,10 +204,14 @@ pub fn render_frr(mpls: &Mpls, open: Opener<'_>) -> Result<String, String> {
     for (id, n) in mpls.ldp_neighbors.iter().filter(|(_, n)| !n.disabled) {
         if let Some(key) = n.password.as_ref().filter(|k| !k.is_empty()) {
             let clear = open(key).ok_or_else(|| {
-                format!("LDP neighbor {id}: its password cannot be opened (sealed on another router?)")
+                format!(
+                    "LDP neighbor {id}: its password cannot be opened (sealed on another router?)"
+                )
             })?;
             if clear.chars().any(|c| c.is_whitespace() || c.is_control()) || clear.len() > 80 {
-                return Err(format!("LDP neighbor {id}: the password must be 1..80 characters without spaces"));
+                return Err(format!(
+                    "LDP neighbor {id}: the password must be 1..80 characters without spaces"
+                ));
             }
             let _ = writeln!(s, " neighbor {id} password {clear}");
         }
@@ -242,7 +269,10 @@ pub fn igp_sync_lines(mpls: &Mpls) -> Vec<String> {
         return Vec::new();
     };
     match l.igp_sync_holddown {
-        Some(h) => vec!["mpls ldp-sync".into(), format!("mpls ldp-sync holddown {h}")],
+        Some(h) => vec![
+            "mpls ldp-sync".into(),
+            format!("mpls ldp-sync holddown {h}"),
+        ],
         None => vec!["mpls ldp-sync".into()],
     }
 }
@@ -277,7 +307,10 @@ pub fn why_no_label(b: &LdpBinding, state: &LdpState) -> Option<String> {
     if b.in_use().is_some() {
         return None;
     }
-    if matches!(b.local_label, Some(IMPLICIT_NULL | IPV4_EXPLICIT_NULL | IPV6_EXPLICIT_NULL)) {
+    if matches!(
+        b.local_label,
+        Some(IMPLICIT_NULL | IPV4_EXPLICIT_NULL | IPV6_EXPLICIT_NULL)
+    ) {
         return Some("egress: the FEC is this router's own (connected or loopback); it advertises NULL and the LSP ends here".into());
     }
     if b.local_label.is_none() {
@@ -287,7 +320,9 @@ pub fn why_no_label(b: &LdpBinding, state: &LdpState) -> Option<String> {
         return Some("no LDP neighbor is operational (see the Neighbors tab)".into());
     }
     if b.remote.is_empty() {
-        return Some("no neighbor advertised a label for it (not in its IGP, or filtered there)".into());
+        return Some(
+            "no neighbor advertised a label for it (not in its IGP, or filtered there)".into(),
+        );
     }
     let from: Vec<String> = b.remote.iter().map(|r| r.neighbor.to_string()).collect();
     Some(format!(
@@ -326,7 +361,9 @@ pub fn forwarding_rows(
 ) -> Vec<FecRow> {
     // The readers hand the table sorted by label: a binary search per FEC,
     // no map (a 100 k-entry map was a third of the time, **medido**).
-    let sorted = kernel.windows(2).all(|w| w.first().map(|a| a.label) < w.get(1).map(|b| b.label));
+    let sorted = kernel
+        .windows(2)
+        .all(|w| w.first().map(|a| a.label) < w.get(1).map(|b| b.label));
     let owned: Vec<&MplsRoute>;
     let by_label: Vec<&MplsRoute> = if sorted {
         kernel.iter().collect()
@@ -336,13 +373,22 @@ pub fn forwarding_rows(
         owned = v;
         owned
     };
-    let find = |l: u32| by_label.binary_search_by_key(&l, |r| r.label).ok().and_then(|i| by_label.get(i).copied());
+    let find = |l: u32| {
+        by_label
+            .binary_search_by_key(&l, |r| r.label)
+            .ok()
+            .and_then(|i| by_label.get(i).copied())
+    };
     let payload = mpls.settings.payload_mtu;
     let sync_of = |ifname: &Option<String>| -> Option<String> {
         let st = state?;
         let name = ifname.as_deref()?;
         st.igp_sync.iter().find(|s| s.interface == name).map(|s| {
-            if s.achieved { "achieved".to_owned() } else { "waiting".to_owned() }
+            if s.achieved {
+                "achieved".to_owned()
+            } else {
+                "waiting".to_owned()
+            }
         })
     };
     let mtu_note = |ifname: &Option<String>, labels: usize| -> Option<String> {
@@ -367,8 +413,9 @@ pub fn forwarding_rows(
             let has_out = remote.is_some();
             let interface = nh.and_then(|n| n.interface.as_ref()).map(|i| i.to_string());
             let reason = why_no_label(b, st).or_else(|| {
-                (has_out && local.is_some() && k.is_none())
-                    .then(|| "not in the kernel's label table yet (zebra has not installed it)".to_owned())
+                (has_out && local.is_some() && k.is_none()).then(|| {
+                    "not in the kernel's label table yet (zebra has not installed it)".to_owned()
+                })
             });
             rows.push(FecRow {
                 fec: Some(b.prefix.to_string()),
@@ -381,7 +428,11 @@ pub fn forwarding_rows(
                 out_labels: out_labels.clone(),
                 nexthop: nh.and_then(|n| n.via),
                 igp_sync: sync_of(&interface),
-                mtu: if has_out { mtu_note(&interface, out_labels.len()) } else { None },
+                mtu: if has_out {
+                    mtu_note(&interface, out_labels.len())
+                } else {
+                    None
+                },
                 interface,
                 peer: remote.map(|r| r.neighbor.to_string()),
                 origin: "ldp",
@@ -467,7 +518,10 @@ pub fn lines(
         c.statics += usize::from(r.origin == "static");
         c.mtu_warnings += usize::from(r.mtu.is_some());
         let mut h = String::with_capacity(48);
-        for part in [r.fec.as_deref(), r.interface.as_deref()].into_iter().flatten() {
+        for part in [r.fec.as_deref(), r.interface.as_deref()]
+            .into_iter()
+            .flatten()
+        {
             h.push_str(part);
             h.push(' ');
         }
@@ -481,7 +535,11 @@ pub fn lines(
         h.push(' ');
         hay.push(h.to_ascii_lowercase());
     }
-    Lines { rows, hay, counts: c }
+    Lines {
+        rows,
+        hay,
+        counts: c,
+    }
 }
 
 #[cfg(test)]
