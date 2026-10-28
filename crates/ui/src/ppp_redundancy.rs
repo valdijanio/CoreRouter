@@ -5,8 +5,11 @@
 //! (`ppp.redundancy.monitor`): this node's role, the peer and the two
 //! paths it is heard on, the witness, the sync (sessions N/N, lag, delay),
 //! config drift and the last role changes; **Switchover** and **Simular
-//! falha** each ask first. The engine and the daemon's `ppp-ha` service
-//! decide; the tab only shows and sends.
+//! falha** each ask first. G3.6h adds the detection (BFD per path, with
+//! its profile), the BFD state, the alerts, the timeline of each takeover
+//! and **Test Takeover** (the checks, then a run that asks the operator to
+//! type `takeover`). The engine and the daemon's `ppp-ha` service decide;
+//! the tab only shows and sends.
 
 use egui::{Grid, Id, TextEdit, Ui};
 use serde_json::{Map, Value, json};
@@ -46,6 +49,9 @@ pub(crate) struct Form {
     pub dead_interval: String,
     pub init_hold: String,
     pub recover_hold: String,
+    pub bfd: String,
+    pub access_bfd: String,
+    pub access_peer: String,
 }
 
 fn list(v: &Value, key: &str) -> String {
@@ -84,6 +90,9 @@ impl Form {
             dead_interval: num(v, "dead_interval"),
             init_hold: num(v, "init_hold"),
             recover_hold: num(v, "recover_hold"),
+            bfd: text(v, "bfd"),
+            access_bfd: text(v, "access_bfd"),
+            access_peer: text(v, "access_peer"),
         }
     }
 
@@ -104,6 +113,9 @@ impl Form {
             ("interfaces", &self.interfaces, &base.interfaces),
             ("witness", &self.witness, &base.witness),
             ("track", &self.track, &base.track),
+            ("bfd", &self.bfd, &base.bfd),
+            ("access_bfd", &self.access_bfd, &base.access_bfd),
+            ("access_peer", &self.access_peer, &base.access_peer),
         ];
         for (k, a, b) in texts {
             if a != b {
@@ -139,18 +151,29 @@ impl Form {
 enum Ask {
     Switchover,
     SimulateFailure,
+    TestTakeover,
 }
 
-struct Confirm {
+pub(crate) struct Confirm {
     id: u64,
     ask: Ask,
     force: bool,
     seconds: String,
     status: Status,
+    /// Test Takeover: `failure` or `switchover`, and what the operator
+    /// typed (it runs only on `takeover`).
+    method: String,
+    pub(crate) typed: String,
 }
+
+/// The word the operator types to run a takeover test.
+const CONFIRM_WORD: &str = "takeover";
 
 /// A reply this tab asked for.
 pub(crate) struct Sent(Option<Form>);
+
+/// The checks of a takeover test (its dry run, when the dialog opens).
+pub(crate) struct Checks;
 
 #[derive(Default)]
 pub(crate) struct RedundancyTab {
@@ -162,7 +185,11 @@ pub(crate) struct RedundancyTab {
     pub(crate) error: Option<String>,
     pub(crate) note: Option<String>,
     help: Option<HelpView>,
-    confirm: Option<Confirm>,
+    pub(crate) confirm: Option<Confirm>,
+    /// BFD profile names (`routing.bfd.profile.list`).
+    pub(crate) profiles: Vec<String>,
+    /// The last dry run of Test Takeover.
+    pub(crate) checks: Value,
 }
 
 /// A label with its ⓘ; the explanation key is `ppp_ha.<key>`.
@@ -198,6 +225,7 @@ impl RedundancyTab {
     pub(crate) fn queries(&self, q: &mut Vec<Query>) {
         q.push(Query { key: "redundancy", command: "ppp.redundancy.get", params: json!({}) });
         q.push(Query { key: "redundancy-monitor", command: "ppp.redundancy.monitor", params: json!({}) });
+        q.push(Query { key: "redundancy-bfd-profiles", command: "routing.bfd.profile.list", params: json!({}) });
     }
 
     /// A query reply; whether it was this tab's.
@@ -214,6 +242,16 @@ impl RedundancyTab {
             }
             "redundancy-monitor" if v.is_object() => {
                 self.monitor = v;
+                true
+            }
+            "redundancy-bfd-profiles" => {
+                let rows = v.get("rows").unwrap_or(&v);
+                self.profiles = rows
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|r| r.get("name").and_then(Value::as_str).map(str::to_owned))
+                    .collect();
                 true
             }
             _ => false,
@@ -300,6 +338,27 @@ impl RedundancyTab {
                 ui.add(TextEdit::singleline(&mut self.form.recover_hold).desired_width(50.0));
             });
             ui.end_row();
+            label(ui, &mut help, l, "bfd", "BFD (sync)");
+            profile_combo(ui, "ppp-ha-bfd", &mut self.form.bfd, &self.profiles, l);
+            ui.end_row();
+            label(ui, &mut help, l, "access_bfd", "BFD (access)");
+            ui.horizontal(|ui| {
+                profile_combo(ui, "ppp-ha-access-bfd", &mut self.form.access_bfd, &self.profiles, l);
+                ui.label(tr_in(SCOPE, l, "to"));
+                ui.add(TextEdit::singleline(&mut self.form.access_peer).hint_text(tr_in(SCOPE, l, "peer's access address")).desired_width(110.0));
+            });
+            ui.end_row();
+            label(ui, &mut help, l, "detection", "Detection");
+            ui.horizontal(|ui| {
+                let ms = n(&self.cfg, "detection_ms");
+                let v = ui.visuals().clone();
+                if ms > 0 {
+                    let by = if ms < n(&self.cfg, "dead_interval") { "BFD" } else { tr_in(SCOPE, l, "hellos") };
+                    chip::chip(ui, &format!("{ms} ms"), if ms <= 500 { GREEN.tone(&v) } else { AMBER.tone(&v) });
+                    ui.weak(by);
+                }
+            });
+            ui.end_row();
         });
         self.help = help;
         let dirty = self.form.set_params(&self.base).is_some();
@@ -377,7 +436,44 @@ impl RedundancyTab {
             });
             ui.end_row();
             label(ui, &mut help, l, "witness_state", "Witness");
-            yes_no(ui, l, flag(&m, "witness"), "reachable", "unreachable");
+            ui.horizontal(|ui| {
+                yes_no(ui, l, flag(&m, "witness"), "reachable", "unreachable");
+                if let Some(age) = m.get("witness_age_ms").and_then(Value::as_u64) {
+                    ui.weak(format!("{} {}", tr_in(SCOPE, l, "answered"), ago(age)));
+                }
+                if flag(&m, "confirming") {
+                    chip::chip(ui, tr_in(SCOPE, l, "confirming"), AMBER.tone(&v));
+                }
+            });
+            ui.end_row();
+            label(ui, &mut help, l, "bfd_state", "BFD");
+            ui.vertical(|ui| {
+                let paths: Vec<Value> = m.get("bfd").and_then(Value::as_array).cloned().unwrap_or_default();
+                if paths.is_empty() {
+                    ui.weak(tr_in(SCOPE, l, "off (hellos only)"));
+                }
+                for p in &paths {
+                    ui.horizontal(|ui| {
+                        let st = text(p, "state");
+                        let tone = match st.as_str() {
+                            "up" => GREEN.tone(&v),
+                            "down" => RED.tone(&v),
+                            "init" => AMBER.tone(&v),
+                            _ => chip::neutral_tone(&v),
+                        };
+                        let path = tr_in(SCOPE, l, if text(p, "path") == "access" { "access" } else { "sync link" });
+                        chip::chip(ui, &format!("{path}: {st}"), tone);
+                        let mut info = format!("{} · {} ms", text(p, "profile"), n(p, "detect_ms"));
+                        if let Some(g) = p.get("rx_gap_p99_us").and_then(Value::as_u64) {
+                            info.push_str(&format!(" · p99 {:.0} ms", g as f64 / 1000.0));
+                        }
+                        ui.weak(info);
+                        if flag(p, "suppressed") {
+                            chip::chip(ui, tr_in(SCOPE, l, "damped"), AMBER.tone(&v));
+                        }
+                    });
+                }
+            });
             ui.end_row();
             let sync = m.get("sync").cloned().unwrap_or(Value::Null);
             label(ui, &mut help, l, "sync", "Sync");
@@ -414,16 +510,29 @@ impl RedundancyTab {
         if let Some(e) = m.get("last_error").and_then(Value::as_str) {
             ui.colored_label(ui.visuals().warn_fg_color, e);
         }
+        for a in m.get("alerts").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+            ui.horizontal_wrapped(|ui| {
+                chip::chip(ui, tr_in(SCOPE, l, "alert"), AMBER.tone(&v));
+                ui.colored_label(ui.visuals().warn_fg_color, a);
+            });
+        }
         ui.horizontal(|ui| {
             let can_switch = if role == "active" { app.can().check("ppp.redundancy.switchover") } else { Err(tr_in(SCOPE, l, "only the active node hands over").to_owned()) };
             if table::action(ui, tr_in(SCOPE, l, "Switchover"), can_switch) {
                 app.next_dialog = app.next_dialog.wrapping_add(1);
-                self.confirm = Some(Confirm { id: app.next_dialog, ask: Ask::Switchover, force: false, seconds: String::new(), status: Status::default() });
+                self.confirm = Some(Confirm { id: app.next_dialog, ask: Ask::Switchover, force: false, seconds: String::new(), status: Status::default(), method: String::new(), typed: String::new() });
             }
             let can_sim = if flag(&m, "running") { app.can().check("ppp.redundancy.simulate-failure") } else { Err(tr_in(SCOPE, l, "redundancy is not running").to_owned()) };
             if table::action(ui, tr_in(SCOPE, l, "Simulate Failure"), can_sim) {
                 app.next_dialog = app.next_dialog.wrapping_add(1);
-                self.confirm = Some(Confirm { id: app.next_dialog, ask: Ask::SimulateFailure, force: false, seconds: "30".into(), status: Status::default() });
+                self.confirm = Some(Confirm { id: app.next_dialog, ask: Ask::SimulateFailure, force: false, seconds: "30".into(), status: Status::default(), method: String::new(), typed: String::new() });
+            }
+            let can_test = if role == "active" { app.can().check("ppp.redundancy.test-takeover") } else { Err(tr_in(SCOPE, l, "run it on the active node").to_owned()) };
+            if table::action(ui, tr_in(SCOPE, l, "Test Takeover"), can_test) {
+                app.next_dialog = app.next_dialog.wrapping_add(1);
+                self.confirm = Some(Confirm { id: app.next_dialog, ask: Ask::TestTakeover, force: false, seconds: "15".into(), status: Status::default(), method: "failure".into(), typed: String::new() });
+                self.checks = Value::Null;
+                app.run_then("ppp.redundancy.test-takeover", json!({}), crate::panel::then(crate::ppp::NAME, Checks));
             }
             if help::info_button(ui, Id::unique("ppp-ha-actions"), tr_in(SCOPE, l, "Switchover")).clicked() {
                 help = Some(HelpView::new("ppp_ha.actions", tr_in(SCOPE, l, "Switchover")));
@@ -431,6 +540,45 @@ impl RedundancyTab {
         });
         if let Some(n) = &self.note {
             ui.weak(n.as_str());
+        }
+        if let Some(t) = m.get("test").filter(|t| t.is_object()) {
+            ui.horizontal_wrapped(|ui| {
+                let st = text(t, "state");
+                let tone = match st.as_str() {
+                    "passed" => GREEN.tone(&v),
+                    "failed" | "refused" => RED.tone(&v),
+                    _ => AMBER.tone(&v),
+                };
+                ui.label(tr_in(SCOPE, l, "Takeover Test"));
+                chip::chip(ui, &st, tone);
+                ui.weak(text(t, "note"));
+            });
+        }
+        ui.add_space(6.0);
+        label(ui, &mut help, l, "timeline", "Takeovers");
+        let takeovers: Vec<Value> = m.get("takeovers").and_then(Value::as_array).cloned().unwrap_or_default();
+        match takeovers.first() {
+            Some(k) => timeline(ui, l, k, &v),
+            None => {
+                ui.weak(tr_in(SCOPE, l, "none yet"));
+            }
+        }
+        if let Some(k) = m.get("peer_takeover").filter(|k| k.is_object()) {
+            ui.horizontal(|ui| {
+                ui.weak(tr_in(SCOPE, l, "Peer's last:"));
+            });
+            timeline(ui, l, k, &v);
+        }
+        if takeovers.len() > 1 {
+            Grid::new("ppp-ha-takeovers").striped(true).spacing([10.0, 3.0]).show(ui, |ui| {
+                for k in takeovers.iter().skip(1).take(6) {
+                    ui.weak(crate::system_log::short_time(n(k, "at"), 0));
+                    ui.label(text(k, "detected_by"));
+                    ui.label(format!("{} {}", tr_in(SCOPE, l, "active at"), ms_of(k, "active_ms")));
+                    ui.label(format!("{} {} · {} {}", n(k, "adopted"), tr_in(SCOPE, l, "kept"), n(k, "lost"), tr_in(SCOPE, l, "lost")));
+                    ui.end_row();
+                }
+            });
         }
         ui.add_space(6.0);
         label(ui, &mut help, l, "history", "Role Changes");
@@ -465,10 +613,14 @@ impl RedundancyTab {
             let title = match c.ask {
                 Ask::Switchover => tr_in(SCOPE, l, "Switchover"),
                 Ask::SimulateFailure => tr_in(SCOPE, l, "Simulate Failure"),
+                Ask::TestTakeover => tr_in(SCOPE, l, "Test Takeover"),
             };
             let head = Head { id: wid, title, dirty: false, pos: cascade(area, c.id), parent: Some(crate::win_id(Win::Panel(crate::ppp::WIN))) };
             let ask = c.ask;
             let (mut force, mut seconds) = (c.force, c.seconds.clone());
+            let (mut method, mut typed) = (c.method.clone(), c.typed.clone());
+            let checks = self.checks.clone();
+            let checks_ok = checks.get("checks").and_then(Value::as_array).is_some_and(|a| a.iter().all(|x| flag(x, "ok")));
             let pressed = dialog::show(&mut app.floats, ctx, area, head, &mut c.status, |ui, _| {
                 match ask {
                     Ask::Switchover => {
@@ -482,16 +634,35 @@ impl RedundancyTab {
                             ui.add(TextEdit::singleline(&mut seconds).desired_width(50.0));
                         });
                     }
+                    Ask::TestTakeover => {
+                        test_dialog(ui, l, &checks, &mut method, &mut seconds, &mut force, &mut typed);
+                    }
                 }
-                Footer { buttons: Buttons::Edit { apply: false }, ok: Ok(()), extra: Vec::new(), pressed: None::<()> }
+                let ok = match ask {
+                    Ask::TestTakeover if typed.trim() != CONFIRM_WORD => Err(tr_in(SCOPE, l, "type takeover to run it").to_owned()),
+                    Ask::TestTakeover if !checks_ok && !force => Err(tr_in(SCOPE, l, "a check failed").to_owned()),
+                    _ => Ok(()),
+                };
+                Footer { buttons: Buttons::Edit { apply: false }, ok, extra: Vec::new(), pressed: None::<()> }
             });
             c.force = force;
             c.seconds = seconds;
+            c.method = method;
+            c.typed = typed;
             match pressed {
                 Some(Press::Ok) => {
                     let (cmd, p) = match c.ask {
                         Ask::Switchover => ("ppp.redundancy.switchover", json!({"force": c.force})),
                         Ask::SimulateFailure => ("ppp.redundancy.simulate-failure", json!({"seconds": c.seconds.trim().parse::<u64>().map_or_else(|_| json!(c.seconds.trim()), |s| json!(s))})),
+                        Ask::TestTakeover => (
+                            "ppp.redundancy.test-takeover",
+                            json!({
+                                "method": c.method,
+                                "seconds": c.seconds.trim().parse::<u64>().map_or_else(|_| json!(c.seconds.trim()), |s| json!(s)),
+                                "confirm": c.typed.trim(),
+                                "force": c.force,
+                            }),
+                        ),
                     };
                     app.run_then(cmd, p, crate::panel::then(crate::ppp::NAME, Sent(None)));
                     app.floats.forget(wid);
@@ -505,6 +676,16 @@ impl RedundancyTab {
 
     /// A command reply; `Err(then)` when it was not this tab's.
     pub(crate) fn reply(&mut self, app: &mut CoreRouterUi, then: PanelThen, result: &Result<Value, String>) -> Result<(), PanelThen> {
+        let then = match then.downcast::<Checks>() {
+            Ok(_) => {
+                self.checks = match result {
+                    Ok(v) => v.clone(),
+                    Err(e) => json!({"note": e}),
+                };
+                return Ok(());
+            }
+            Err(t) => t,
+        };
         let s = then.downcast::<Sent>()?;
         match s.0 {
             Some(form) => {
@@ -529,4 +710,123 @@ impl RedundancyTab {
         app.cache.refreshed_at = None;
         Ok(())
     }
+}
+
+/// A BFD profile, or none (hellos only).
+fn profile_combo(ui: &mut Ui, id: &str, value: &mut String, profiles: &[String], l: Lang) {
+    let off = tr_in(SCOPE, l, "off (hellos only)");
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(if value.is_empty() { off.to_owned() } else { value.clone() })
+        .show_ui(ui, |ui| {
+            ui.selectable_value(value, String::new(), off);
+            for p in profiles {
+                ui.selectable_value(value, p.clone(), p.as_str());
+            }
+        });
+}
+
+fn ms_of(v: &Value, key: &str) -> String {
+    v.get(key).and_then(Value::as_u64).map_or_else(|| "–".to_owned(), |x| format!("{x} ms"))
+}
+
+fn ago(ms: u64) -> String {
+    if ms < 10_000 { format!("{ms} ms") } else { format!("{} s", ms / 1000) }
+}
+
+/// One takeover as a chain of milestones, ms after the peer's last sign
+/// of life: detected » witness » active » announced » adopted » first
+/// frame, then the sessions kept and lost.
+fn timeline(ui: &mut Ui, l: Lang, k: &Value, v: &egui::Visuals) {
+    ui.horizontal_wrapped(|ui| {
+        ui.weak(crate::system_log::short_time(n(k, "at"), 0));
+        chip::chip(ui, &text(k, "detected_by"), if text(k, "detected_by").starts_with("bfd") { GREEN.tone(v) } else { BLUE.tone(v) });
+        if flag(k, "test") {
+            chip::chip(ui, tr_in(SCOPE, l, "test"), AMBER.tone(v));
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        // A takeover found by detection starts at the failure; a planned
+        // one (switchover, election) at its start.
+        let start = if k.get("detected_ms").and_then(Value::as_u64).is_some() { "failure" } else { "start" };
+        let steps = [
+            (start, Some(0)),
+            ("detected", k.get("detected_ms").and_then(Value::as_u64)),
+            ("witness", k.get("witness_ms").and_then(Value::as_u64)),
+            ("active", k.get("active_ms").and_then(Value::as_u64)),
+            ("announced", k.get("announced_ms").and_then(Value::as_u64)),
+            ("adopted", k.get("adopted_ms").and_then(Value::as_u64)),
+            ("1st frame", k.get("first_frame_ms").and_then(Value::as_u64)),
+        ];
+        let mut first = true;
+        for (name, at) in steps {
+            let Some(at) = at else { continue };
+            if !first {
+                ui.label("»");
+            }
+            first = false;
+            chip::chip(ui, &format!("{} {at} ms", tr_in(SCOPE, l, name)), chip::neutral_tone(v));
+        }
+        let lost = n(k, "lost") + n(k, "skipped");
+        chip::chip(
+            ui,
+            &format!("{} {} · {lost} {}", n(k, "adopted"), tr_in(SCOPE, l, "kept"), tr_in(SCOPE, l, "lost")),
+            if lost == 0 { GREEN.tone(v) } else { RED.tone(v) },
+        );
+    });
+}
+
+/// Test Takeover: the warning, the checks of the dry run, the method and
+/// the word to type.
+fn test_dialog(ui: &mut Ui, l: Lang, checks: &Value, method: &mut String, seconds: &mut String, force: &mut bool, typed: &mut String) {
+    let v = ui.visuals().clone();
+    ui.colored_label(
+        v.warn_fg_color,
+        tr_in(SCOPE, l, "This is a real takeover: this node stops serving and the peer must take every subscriber. Run it in a maintenance window."),
+    );
+    ui.horizontal(|ui| {
+        ui.label(tr_in(SCOPE, l, "Method"));
+        egui::ComboBox::from_id_salt("ppp-ha-test-method").selected_text(method.clone()).show_ui(ui, |ui| {
+            ui.selectable_value(method, "failure".to_owned(), "failure");
+            ui.selectable_value(method, "switchover".to_owned(), "switchover");
+        });
+        if method == "failure" {
+            ui.label(tr_in(SCOPE, l, "Seconds"));
+            ui.add(TextEdit::singleline(seconds).desired_width(50.0));
+        }
+    });
+    ui.weak(tr_in(
+        SCOPE,
+        l,
+        if method == "failure" {
+            "failure: this node goes silent (no answers, no hellos, no BFD); the peer must detect it as a crash, confirm with the witness and take over"
+        } else {
+            "switchover: a planned handover (no detection: it tests the sessions moving, not the failure)"
+        },
+    ));
+    ui.add_space(4.0);
+    ui.strong(tr_in(SCOPE, l, "Checks"));
+    match checks.get("checks").and_then(Value::as_array) {
+        None => {
+            ui.weak(checks.get("note").and_then(Value::as_str).unwrap_or(tr_in(SCOPE, l, "checking…")));
+        }
+        Some(rows) => {
+            Grid::new("ppp-ha-test-checks").spacing([8.0, 3.0]).show(ui, |ui| {
+                for r in rows {
+                    if flag(r, "ok") {
+                        chip::chip(ui, &text(r, "name"), GREEN.tone(&v));
+                    } else {
+                        chip::chip(ui, &text(r, "name"), RED.tone(&v));
+                    }
+                    ui.label(text(r, "detail"));
+                    ui.end_row();
+                }
+            });
+        }
+    }
+    ui.checkbox(force, tr_in(SCOPE, l, "run even with a check failed"));
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(tr_in(SCOPE, l, "Type takeover to confirm"));
+        ui.add(TextEdit::singleline(typed).hint_text(CONFIRM_WORD).desired_width(110.0));
+    });
 }

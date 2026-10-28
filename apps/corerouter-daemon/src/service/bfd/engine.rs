@@ -83,7 +83,14 @@ pub(crate) struct Options {
     pub port_multi: u16,
     /// Where peers listen (the same ports but in tests: two engines on one host).
     pub peer_ports: Option<(u16, u16)>,
+    /// Called on the engine thread for every state change, before the
+    /// event queue (G3.6h: the BNG pair hears a lost peer without waiting
+    /// for the service loop or the session lock). It only queues.
+    pub tap: Option<Tap>,
 }
+
+/// A state change of session `key`: from, to, the local diagnostic.
+pub(crate) type Tap = fn(&BfdKey, State, State, Diag);
 
 impl Default for Options {
     fn default() -> Self {
@@ -94,6 +101,7 @@ impl Default for Options {
             port_single: PORT_SINGLE_HOP,
             port_multi: PORT_MULTI_HOP,
             peer_ports: None,
+            tap: None,
         }
     }
 }
@@ -253,6 +261,7 @@ impl Engine {
                 peers: cmds.clone(),
                 wakers: wakers.clone(),
                 events: ev_tx.clone(),
+                tap: opts.tap,
                 shared: Arc::clone(&shared),
                 epoch,
                 stats: BfdThreadStatus {
@@ -441,6 +450,7 @@ struct Worker {
     seed: u64,
     /// Where peers listen: (single hop, multihop); the standard ports but in tests.
     ports: (u16, u16),
+    tap: Option<Tap>,
 }
 
 impl Worker {
@@ -742,6 +752,9 @@ impl Worker {
             }
         }
         sl.client_up = sl.s.state() == State::Up && !sl.suppressed;
+        if let Some(tap) = self.tap {
+            tap(&sl.spec.key, c.from, c.to, c.diag);
+        }
         let ev = Event {
             key: sl.spec.key.clone(),
             discr: sl.discr,

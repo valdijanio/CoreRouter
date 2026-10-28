@@ -2141,3 +2141,40 @@ Release, criterion, esta máquina (32 núcleos), 2026-10-28, **medido**
 VM do laboratório, build debug, 2026-10-28, **medido** (`scripts/lsp-ping-live.sh`, dois saltos
 com LDP do FRR): LSP ping mín. 69 µs, mediana 90 µs, p95 590 µs; ICMP do kernel no mesmo caminho
 mín. 11 µs, média 17 µs.
+
+### G3.5: rótulos MPLS no kernel, lote × um a um (VM do laboratório, 2026-10-27)
+
+**Medido**, VM `corerouter-lab` (8 vCPUs EPYC-Genoa `host-model`, kernel 7.0, `mpls_router`),
+build release, `tests/netns_mpls.rs` (`ten_thousand_labels_in_batches_and_one_by_one`,
+`MPLS_LABELS=10000` e `100000`):
+
+| Rótulos | Em lote (64 KiB por `sendmsg`) | Um a um | Dump |
+|---|---|---|---|
+| 10 mil | 10,1 ms | 15,9 ms | 2,8 ms |
+| 100 mil | 98,4 ms | 159,4 ms | 33,7 ms |
+
+O lote ganha 1,6×; o custo por rótulo é do kernel (~1 µs), não das idas e voltas.
+
+### G3.6i: o nosso BFD contra o `bfdd` do FRR (VM do laboratório, 2026-10-27)
+
+**Medido**, VM `corerouter-lab` (8 vCPUs EPYC-Genoa `host-model`, kernel 7.0, virtio), FRR
+10.7.1, build release, 50 ms × 3, 15 s em regime (`scripts/frr-bfd-live.sh load`, com
+`BFD_THREADS=1,2,4`). CPU nossa por thread; a do `bfdd`, do processo.
+
+| sessions | our threads | our CPU %/thread | bfdd CPU % | our tx jitter p99 median (µs) | worst | bfdd tx gap p99 median (µs) | worst | our false downs | bfdd false downs |
+|---|---|---|---|---|---|---|---|---|---|
+| 100 | 1 | 7.5 | 5.6 | 97 | 108 | 50940 | 53587 | 0 | 0 |
+| 500 | 1 | 24.8 | 20.3 | 87 | 265 | 56052 | 56052 | 0 | 0 |
+| 1000 | 1 | 36.5 | 32.7 | 69 | 331 | 56052 | 56052 | 0 | 0 |
+| 1000 | 4 | 15.4 | 44.7 | 87 | 212 | 56052 | 56052 | 0 | 0 |
+
+Nós contra nós na mesma VM (`bfd::tests::load`, 10 s): 1000 sessões numa thread 32,4 %, com 8
+threads 8,2 % por thread. Data plane: `bfdd` → `bgpd` em 0,20–0,26 ms (5 cortes).
+
+- 2026-10-28, G3.6h, VM `corerouter-lab` (8 vCPUs, kernel 7.0, release, BNG Blaster 1.0.1, sem
+  root): tomada do par com o ativo sem energia, **medido**. Sem BFD: 0,96–1,18 s. Com BFD `fast`
+  nos dois caminhos: 0,13–0,20 s, e o nó novo ativo 150–154 ms depois do último pacote do par. O
+  tráfego volta em 0,19 s (1 mil sessões), 0,25 s (10 mil) e 1,04 s (100 mil); 0 perdidas.
+- 2026-10-28, G3.6h, dois daemons debug em namespace (Ryzen AI Max+ 395), **medido**: com o laço
+  do `ppp-ha` acordado pelo evento, a decisão sai 0–4 ms depois da detecção do BFD (antes, com o
+  tique de 10 ms, saía ~10 ms depois).

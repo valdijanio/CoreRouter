@@ -510,6 +510,33 @@ impl Node {
         self.after(now);
     }
 
+    /// The peer's BFD session on `path` changed (G3.6h): see [`Ha::bfd`].
+    pub fn bfd(&mut self, now: Millis, path: Path, up: bool, expired: bool, detect_ms: u64) {
+        self.ha.bfd(now, path, up, expired, detect_ms);
+        self.after(now);
+    }
+
+    pub fn set_bfd_damp(&mut self, d: Option<crate::role::BfdDamp>) {
+        self.ha.set_bfd_damp(d);
+    }
+
+    pub fn bfd_off(&mut self, now: Millis, path: Path) {
+        self.ha.bfd_off(now, path);
+        self.after(now);
+    }
+
+    /// The witness answered a probe at `at`.
+    pub fn witness_answer(&mut self, now: Millis, at: Millis) {
+        self.ha.witness_answer(now, at);
+        self.after(now);
+    }
+
+    /// BFD found the peer silent: probe the witness now (the takeover
+    /// waits for its answer).
+    pub fn wants_witness_probe(&self) -> bool {
+        self.ha.wants_witness_probe()
+    }
+
     /// Runs the timers; hellos due go to the outputs.
     pub fn tick(&mut self, now: Millis) {
         let in_sync = self.publisher.is_none()

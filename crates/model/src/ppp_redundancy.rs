@@ -199,6 +199,18 @@ pub struct Redundancy {
     /// Seconds a fenced node waits, stable, before it may take over.
     #[serde(default = "default_recover_hold")]
     pub recover_hold: u32,
+    /// BFD profile on the sync path (G3.6h), to the `peer`'s address;
+    /// empty = hellos only. BFD brings the detection forward (`fast`:
+    /// 50 ms × 3 = 150 ms instead of `dead_interval`); the takeover rule
+    /// does not change.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub bfd: String,
+    /// BFD profile on the access path, to `access_peer`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub access_bfd: String,
+    /// The peer's address on the access network (BFD of the access path).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_peer: Option<IpAddr>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub comment: String,
 }
@@ -224,6 +236,9 @@ impl Default for Redundancy {
             dead_interval: DEFAULT_DEAD_MS,
             init_hold: default_init_hold(),
             recover_hold: default_recover_hold(),
+            bfd: String::new(),
+            access_bfd: String::new(),
+            access_peer: None,
             comment: String::new(),
         }
     }
@@ -281,6 +296,15 @@ impl Redundancy {
         {
             p.push(("peer", "host:port (a name or an address, then the port)".into()));
         }
+        if !self.bfd.is_empty() && self.peer.is_some() && self.sync_bfd_peer().is_none() {
+            p.push((
+                "bfd",
+                "BFD on the sync path needs peer as an address (ip:port or [ipv6]:port), not a name".into(),
+            ));
+        }
+        if !self.access_bfd.is_empty() && self.access_peer.is_none() {
+            p.push(("access_peer", "access_bfd needs the peer's address on the access network".into()));
+        }
         if self.enabled {
             if self.peer.is_none() {
                 p.push(("peer", "required to enable: the other node's host:port".into()));
@@ -302,6 +326,35 @@ impl Redundancy {
             }
         }
         p
+    }
+}
+
+impl Redundancy {
+    /// The sync path's BFD target: the address in `peer`.
+    pub fn sync_bfd_peer(&self) -> Option<IpAddr> {
+        let (host, _) = self.peer.as_deref()?.trim().rsplit_once(':')?;
+        host.trim_start_matches('[').trim_end_matches(']').parse().ok()
+    }
+
+    /// The BFD sessions the pair asks the `bfd` service for (G3.6h):
+    /// `(peer address, profile, path)`, path `"sync"` or `"access"`.
+    pub fn bfd_sessions(&self) -> Vec<(IpAddr, &str, &'static str)> {
+        let mut v = Vec::new();
+        if !self.enabled {
+            return v;
+        }
+        if !self.bfd.is_empty()
+            && let Some(a) = self.sync_bfd_peer()
+        {
+            v.push((a, self.bfd.as_str(), "sync"));
+        }
+        if !self.access_bfd.is_empty()
+            && let Some(a) = self.access_peer
+            && v.iter().all(|(b, _, _)| *b != a)
+        {
+            v.push((a, self.access_bfd.as_str(), "access"));
+        }
+        v
     }
 }
 
@@ -348,6 +401,107 @@ pub struct RedundancyStatus {
     pub history: Vec<RoleChange>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// BFD on the sync and on the access path (G3.6h).
+    pub bfd: Vec<PathBfdStatus>,
+    /// BFD found the peer silent: the takeover waits for a fresh witness
+    /// answer.
+    pub confirming: bool,
+    /// The witness answered this long ago (ms).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub witness_age_ms: Option<u64>,
+    /// Takeovers by this node, newest first, with their timeline.
+    pub takeovers: Vec<Takeover>,
+    /// The peer's last takeover, as it reported over the sync link (after
+    /// a test from this node, where the result is).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_takeover: Option<Takeover>,
+    /// Warnings that call for a look before the pair fails: BFD jitter,
+    /// a damped path.
+    pub alerts: Vec<String>,
+    /// A takeover test under way or done (`ppp.redundancy.test-takeover`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test: Option<TakeoverTest>,
+}
+
+/// BFD on one path of the pair.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PathBfdStatus {
+    /// `sync` or `access`.
+    pub path: String,
+    pub peer: Option<IpAddr>,
+    pub profile: String,
+    /// `up`, `down`, `init`, `admin-down` (the BFD session), `none` (not
+    /// started yet).
+    pub state: String,
+    pub detect_ms: u64,
+    /// p99 of the gap between packets received from the peer, and of how
+    /// late ours left (µs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rx_gap_p99_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_jitter_p99_us: Option<u64>,
+    /// Damped: its losses are ignored (hellos only).
+    pub suppressed: bool,
+    pub penalty: u32,
+    pub losses: u64,
+    pub false_alarms: u64,
+}
+
+/// One takeover's timeline (ms after the failure's best estimate: the
+/// last time the peer was heard).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Takeover {
+    /// Unix seconds.
+    pub at: u64,
+    /// English key of the role change (`peer-dead`, `switchover`…).
+    pub reason: String,
+    pub epoch: u64,
+    /// `bfd` (and on which paths), `dead-interval`, `handover`.
+    pub detected_by: String,
+    /// Milestones from the last sign of life of the peer, ms: detected,
+    /// witness confirmed, active, announced (virtual MAC hello), sessions
+    /// adopted, first subscriber frame.
+    pub detected_ms: Option<u64>,
+    pub witness_ms: Option<u64>,
+    pub active_ms: Option<u64>,
+    pub announced_ms: Option<u64>,
+    pub adopted_ms: Option<u64>,
+    pub first_frame_ms: Option<u64>,
+    /// Sessions kept and lost: the replica handed over, the ones the
+    /// workers adopted, the ones that did not fit, and the peer's last
+    /// count minus the adopted ones (changes not synced in time).
+    pub stateful: bool,
+    pub handed: u64,
+    pub adopted: u64,
+    pub skipped: u64,
+    pub lost: u64,
+    /// A test (`ppp.redundancy.test-takeover`), not a failure.
+    pub test: bool,
+}
+
+/// `ppp.redundancy.test-takeover`: what was checked and what happened.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TakeoverTest {
+    /// Unix seconds.
+    pub started: u64,
+    /// `failure` (this node goes silent, the peer detects it as a crash)
+    /// or `switchover` (planned handover).
+    pub method: String,
+    /// `running`, `passed`, `failed`, `refused`.
+    pub state: String,
+    pub checks: Vec<TestCheck>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TestCheck {
+    pub name: String,
+    pub ok: bool,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -438,5 +592,36 @@ mod tests {
         assert_eq!(keys, ["dead_interval", "virtual_mac", "peer"]);
         assert!(valid_peer("[2001:db8::2]:8730") && valid_peer("bng2.isp:1"));
         assert!(!valid_peer("bng2:0") && !valid_peer(":8730"));
+    }
+
+    #[test]
+    fn bfd_sessions_need_addresses() {
+        let mut r = Redundancy {
+            enabled: true,
+            peer: Some("bng2.isp:8730".into()),
+            secret: "0123456789abcdef".into(),
+            witness: vec!["10.0.0.254".parse().unwrap()],
+            bfd: "fast".into(),
+            ..Redundancy::default()
+        };
+        assert_eq!(r.problems().first().map(|p| p.0), Some("bfd"), "a name has no BFD address");
+        r.peer = Some("[2001:db8::2]:8730".into());
+        assert!(r.problems().is_empty());
+        r.access_bfd = "fast".into();
+        assert_eq!(r.problems().first().map(|p| p.0), Some("access_peer"));
+        r.access_peer = Some("100.64.0.2".parse().unwrap());
+        assert!(r.problems().is_empty());
+        let s = r.bfd_sessions();
+        assert_eq!(
+            s,
+            [
+                ("2001:db8::2".parse().unwrap(), "fast", "sync"),
+                ("100.64.0.2".parse().unwrap(), "fast", "access"),
+            ]
+        );
+        r.enabled = false;
+        assert!(r.bfd_sessions().is_empty(), "a disabled pair runs no BFD");
+        let back: Redundancy = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back, r);
     }
 }
