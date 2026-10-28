@@ -280,6 +280,19 @@ fn a_label_ttl_that_expires_is_answered_by_the_transit_lsr() {
         Some(1500),
         false,
     ));
+    // One namespace is both ends: the FEC's route here pushes 100, while
+    // label 100 swaps to 200, so the FEC check (RFC 8029 §4.4.1) rightly
+    // says the label belongs to another mapping.
+    let (r, _, _) = ask(&mut s, &p, &e, 1);
+    assert_eq!(
+        (r.return_code, r.return_subcode),
+        (code::WRONG_LABEL, 1),
+        "{r:?}"
+    );
+    // The all-routers DDMAP skips the checks: "label switched", with the
+    // downstream mapping of label 100.
+    e.seq = 3;
+    e.ddmaps[0].address = corerouter_hal::lsp::wire::DsAddress::all_routers(false);
     let (r, _, _) = ask(&mut s, &p, &e, 1);
     assert_eq!(
         (r.return_code, r.return_subcode),
