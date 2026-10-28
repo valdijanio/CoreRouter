@@ -132,7 +132,8 @@ impl Driver {
         let gen_ = TAKEOVER_GEN.load(Ordering::Acquire);
         if gen_ > core.ha_gen() {
             let records = TAKEOVER.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-            core.adopt(gen_, records.as_deref().map_or(&[], Vec::as_slice));
+            let done = core.adopt(gen_, records.as_deref().map_or(&[], Vec::as_slice));
+            super::ppp_ha::adopted(done.sessions, done.skipped);
         }
         if self.was_active && !active && core.ha_enabled() {
             core.abandon();

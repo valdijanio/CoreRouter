@@ -28,6 +28,17 @@
 //!   actives, at most one handover round-trip with none.
 //! - **Hold timers**: a fenced node leaves only after its witness has been
 //!   stable for `recover_hold`; preemption waits `preempt_delay` in sync.
+//! - **BFD** (G3.6h), a third sign of life on each path: a BFD session to
+//!   the peer that *expires* (RFC 5880 §6.8.4, diagnostic 1: its packets
+//!   stopped) makes the hellos heard on that path before it stale at once,
+//!   instead of after `dead`. BFD only brings the detection forward: the
+//!   peer must still be silent on every path, and a takeover found by BFD
+//!   needs a witness answer *newer* than the detection (a fresh probe;
+//!   the hellos' dead interval falls back to the debounced witness, as
+//!   before). A peer that says Down itself (diagnostic 3, AdminDown) is
+//!   alive and talking: it never counts. Each path damps its BFD: flaps
+//!   add a penalty that decays (RFC 5882 §3.2), and above `suppress` that
+//!   path's BFD is ignored (hellos only) until it falls below `reuse`.
 
 use std::collections::VecDeque;
 
@@ -57,6 +68,32 @@ pub struct RoleConfig {
     pub access_path: bool,
     /// Hot standby: a takeover keeps the sessions (else they redial).
     pub hot_standby: bool,
+    /// Dampening of the BFD signal of each path (G3.6h); `None` = off.
+    pub bfd_damp: Option<BfdDamp>,
+}
+
+/// How a path's BFD is damped (the BFD profile's `dampening`, in ms).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BfdDamp {
+    pub half_life_ms: u64,
+    /// Added per BFD loss (1000, as BGP's RFC 2439 and Cisco's BFD).
+    pub penalty: u32,
+    pub suppress: u32,
+    pub reuse: u32,
+    pub max_suppress_ms: u64,
+}
+
+impl Default for BfdDamp {
+    /// The BFD profile's defaults: three losses within ~15 s suppress.
+    fn default() -> Self {
+        BfdDamp {
+            half_life_ms: 15_000,
+            penalty: 1000,
+            suppress: 2500,
+            reuse: 800,
+            max_suppress_ms: 120_000,
+        }
+    }
 }
 
 impl Default for RoleConfig {
@@ -75,6 +112,7 @@ impl Default for RoleConfig {
             witness: true,
             access_path: true,
             hot_standby: true,
+            bfd_damp: Some(BfdDamp::default()),
         }
     }
 }
@@ -166,6 +204,98 @@ pub struct Transition {
     pub reason: Reason,
     /// Becoming active with a complete replica: keep the sessions.
     pub stateful: bool,
+    /// How the peer's silence was found (a takeover from a dead peer).
+    pub detection: Option<Detection>,
+}
+
+/// The first steps of a takeover's timeline (G3.6h): the caller adds the
+/// announcement, the sessions adopted and the first subscriber frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Detection {
+    /// The last time the peer was heard on any path: the failure came
+    /// after it.
+    pub last_heard: Millis,
+    /// When this node found the peer silent on every path.
+    pub detected: Millis,
+    /// BFD found it on these paths `[sync, access]`; else the hellos'
+    /// dead interval did.
+    pub bfd: [bool; 2],
+    /// The witness answer the takeover relied on: newer than `detected`
+    /// when BFD found the silence; `None` without a witness.
+    pub witness_at: Option<Millis>,
+}
+
+impl Detection {
+    pub fn by_bfd(&self) -> bool {
+        self.bfd.iter().any(|b| *b)
+    }
+}
+
+/// A path's BFD as the monitor shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BfdPathStatus {
+    /// A BFD session runs on this path (the caller said so at least once).
+    pub configured: bool,
+    pub up: bool,
+    /// Damped: its losses are ignored (hellos only) until `reuse`.
+    pub suppressed: bool,
+    pub penalty: u32,
+    /// Losses (expiries) seen.
+    pub losses: u64,
+    /// Losses followed by a hello on the same path: the peer was alive.
+    pub false_alarms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct PathBfd {
+    configured: bool,
+    up: bool,
+    /// The session expired at this time: hellos heard on the path at or
+    /// before it no longer count.
+    lost_at: Option<Millis>,
+    /// The peer's last BFD packet on this path: the expiry minus the
+    /// detection time (the timeline's last sign of life).
+    last_rx: Millis,
+    penalty: f64,
+    penalty_at: Millis,
+    suppressed_since: Option<Millis>,
+    losses: u64,
+    false_alarms: u64,
+}
+
+impl PathBfd {
+    fn decay(&mut self, d: &BfdDamp, now: Millis) {
+        if now > self.penalty_at && d.half_life_ms > 0 {
+            let halves = (now - self.penalty_at) as f64 / d.half_life_ms as f64;
+            self.penalty *= 0.5f64.powf(halves);
+        }
+        self.penalty_at = self.penalty_at.max(now);
+        // RFC 2439 §4.2: never more than what decays to `reuse` in
+        // `max_suppress`.
+        let ceil =
+            f64::from(d.reuse) * 2f64.powf(d.max_suppress_ms as f64 / d.half_life_ms.max(1) as f64);
+        self.penalty = self.penalty.min(ceil);
+        if self.suppressed_since.is_some_and(|t| {
+            self.penalty < f64::from(d.reuse) || now.saturating_sub(t) >= d.max_suppress_ms
+        }) {
+            self.suppressed_since = None;
+        }
+    }
+
+    /// A loss; true when it counts (not suppressed).
+    fn lost(&mut self, damp: Option<&BfdDamp>, now: Millis) -> bool {
+        self.losses += 1;
+        let Some(d) = damp else {
+            return true;
+        };
+        self.decay(d, now);
+        let was = self.suppressed_since.is_some();
+        self.penalty += f64::from(d.penalty);
+        if !was && self.penalty >= f64::from(d.suppress) {
+            self.suppressed_since = Some(now);
+        }
+        !was && self.suppressed_since.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +347,10 @@ pub struct RoleStatus {
     /// A hello carried our own node id (misconfigured pair).
     pub duplicate_node_id: bool,
     pub history: Vec<Transition>,
+    /// BFD on [sync, access] (G3.6h).
+    pub bfd: [BfdPathStatus; 2],
+    /// BFD found the peer silent: waiting for a fresh witness answer.
+    pub confirming: bool,
 }
 
 const HISTORY: usize = 32;
@@ -246,6 +380,11 @@ pub struct Ha {
     material: (Role, bool),
     actions: Vec<Action>,
     history: VecDeque<Transition>,
+    bfd: [PathBfd; 2],
+    /// The latest witness answer (a fresh probe confirms a BFD detection).
+    witness_answer: Option<Millis>,
+    /// The peer silent on every path since (and how it was found).
+    silent_since: Option<Detection>,
 }
 
 impl Ha {
@@ -273,6 +412,9 @@ impl Ha {
             material: (Role::Init, true),
             actions: Vec::new(),
             history: VecDeque::new(),
+            bfd: [PathBfd::default(); 2],
+            witness_answer: None,
+            silent_since: None,
         }
     }
 
@@ -325,20 +467,115 @@ impl Ha {
     }
 
     fn peer(&self, now: Millis) -> Option<PeerView> {
-        self.heard
-            .iter()
-            .flatten()
-            .filter(|(at, _)| now.saturating_sub(*at) < self.cfg.dead_ms)
+        [Path::Sync, Path::Access]
+            .into_iter()
+            .filter(|p| self.path_alive(now, *p))
+            .filter_map(|p| self.heard.get(p.idx()).copied().flatten())
             .max_by_key(|(at, _)| *at)
-            .map(|(_, v)| *v)
+            .map(|(_, v)| v)
     }
 
-    fn path_alive(&self, now: Millis, p: Path) -> bool {
+    /// A hello on `p` within the dead interval.
+    fn hello_alive(&self, now: Millis, p: Path) -> bool {
         self.heard
             .get(p.idx())
             .copied()
             .flatten()
             .is_some_and(|(at, _)| now.saturating_sub(at) < self.cfg.dead_ms)
+    }
+
+    /// BFD expired on `p` after its last hello.
+    fn bfd_killed(&self, p: Path) -> bool {
+        let lost = self.bfd.get(p.idx()).and_then(|b| b.lost_at);
+        let heard = self.heard.get(p.idx()).copied().flatten().map(|(at, _)| at);
+        matches!((lost, heard), (Some(l), Some(h)) if h <= l)
+    }
+
+    fn path_alive(&self, now: Millis, p: Path) -> bool {
+        self.hello_alive(now, p) && !self.bfd_killed(p)
+    }
+
+    /// The silence on every path came from BFD, ahead of the dead
+    /// interval: some path still has a live hello that BFD killed.
+    fn fast_silence(&self, now: Millis) -> [bool; 2] {
+        [Path::Sync, Path::Access].map(|p| self.hello_alive(now, p) && self.bfd_killed(p))
+    }
+
+    /// The peer's BFD session on `path` (G3.6h): `up`, or down with
+    /// `expired` when its packets stopped (RFC 5880 §6.8.4, diagnostic 1
+    /// — the only Down that says the peer may be dead) after `detect_ms`
+    /// of silence.
+    pub fn bfd(&mut self, now: Millis, path: Path, up: bool, expired: bool, detect_ms: u64) {
+        let damp = self.cfg.bfd_damp;
+        let Some(b) = self.bfd.get_mut(path.idx()) else {
+            return;
+        };
+        b.configured = true;
+        let was_up = b.up;
+        b.up = up;
+        if let Some(d) = &damp {
+            b.decay(d, now);
+        }
+        if up {
+            b.lost_at = None;
+        } else if was_up && expired {
+            b.last_rx = now.saturating_sub(detect_ms);
+            if b.lost(damp.as_ref(), now) && self.sim_until.is_none() {
+                b.lost_at = Some(now);
+            }
+        }
+        self.evaluate(now);
+    }
+
+    /// A path's BFD as the role machine sees it.
+    pub fn bfd_state(&self, path: Path) -> BfdPathStatus {
+        let b = self.bfd.get(path.idx()).copied().unwrap_or_default();
+        BfdPathStatus {
+            configured: b.configured,
+            up: b.up,
+            suppressed: b.suppressed_since.is_some(),
+            penalty: b.penalty.round() as u32,
+            losses: b.losses,
+            false_alarms: b.false_alarms,
+        }
+    }
+
+    /// The BFD profile's dampening changed (no rebuild of the machine).
+    pub fn set_bfd_damp(&mut self, d: Option<BfdDamp>) {
+        self.cfg.bfd_damp = d;
+    }
+
+    /// BFD no longer runs on `path` (the profile was removed).
+    pub fn bfd_off(&mut self, now: Millis, path: Path) {
+        if let Some(b) = self.bfd.get_mut(path.idx()) {
+            *b = PathBfd::default();
+        }
+        self.evaluate(now);
+    }
+
+    /// The witness answered at `at` (a probe of the caller; the debounced
+    /// state still goes to [`Ha::witness`]).
+    pub fn witness_answer(&mut self, now: Millis, at: Millis) {
+        if self.witness_answer.is_none_or(|w| at > w) {
+            self.witness_answer = Some(at);
+            self.evaluate(now);
+        }
+    }
+
+    /// BFD found the peer silent and the takeover waits for a witness
+    /// answer newer than that: probe it now.
+    pub fn wants_witness_probe(&self) -> bool {
+        self.confirming()
+    }
+
+    fn confirming(&self) -> bool {
+        self.cfg.witness
+            && self.sim_until.is_none()
+            && self.track_up
+            && matches!(self.role, Role::Standby | Role::Fenced)
+            && self
+                .silent_since
+                .is_some_and(|d| d.by_bfd() && self.witness_answer.is_none_or(|w| w < d.detected))
     }
 
     pub fn peer_heard(&mut self, now: Millis, path: Path, v: PeerView) {
@@ -356,6 +593,29 @@ impl Ha {
         self.max_epoch_seen = self.max_epoch_seen.max(v.epoch);
         if let Some(slot) = self.heard.get_mut(path.idx()) {
             *slot = Some((now, v));
+        }
+        // A hello within the dead interval after a BFD loss: the peer was
+        // alive on this path, a false alarm. It costs another penalty: a
+        // link that loses BFD but not the hellos is damped from its next
+        // loss on. Later, the peer came back (it was silent): no alarm.
+        let damp = self.cfg.bfd_damp;
+        let dead = self.cfg.dead_ms;
+        if let Some(b) = self.bfd.get_mut(path.idx())
+            && let Some(t) = b.lost_at.filter(|t| now > *t)
+        {
+            b.lost_at = None;
+            if now - t >= dead {
+                self.evaluate(now);
+                return;
+            }
+            b.false_alarms += 1;
+            if let Some(d) = &damp {
+                b.decay(d, now);
+                b.penalty += f64::from(d.penalty);
+                if b.suppressed_since.is_none() && b.penalty >= f64::from(d.suppress) {
+                    b.suppressed_since = Some(now);
+                }
+            }
         }
         self.evaluate(now);
     }
@@ -445,6 +705,10 @@ impl Ha {
         }
         self.sim_until = Some(now + ms);
         self.heard = [None, None];
+        for b in &mut self.bfd {
+            b.lost_at = None;
+        }
+        self.silent_since = None;
         self.set(now, Role::Fenced, Reason::SimulatedFailure);
         Ok(())
     }
@@ -506,6 +770,14 @@ impl Ha {
             epoch: self.epoch,
             reason,
             stateful: to == Role::Active && self.cfg.hot_standby && self.synced,
+            detection: if to == Role::Active && reason == Reason::PeerDead {
+                self.silent_since.map(|mut d| {
+                    d.witness_at = self.cfg.witness.then_some(self.witness_answer).flatten();
+                    d
+                })
+            } else {
+                None
+            },
         };
         self.role = to;
         self.since = now;
@@ -548,6 +820,38 @@ impl Ha {
         let peer = self.peer(now);
         self.hears = peer.map_or(0, |p| p.incarnation);
         self.peer_view_seq = peer.map_or(0, |p| p.view_seq);
+        let fast = self.fast_silence(now);
+        match (peer, &mut self.silent_since) {
+            (Some(_), s) => *s = None,
+            (None, s @ None) => {
+                let hello = self
+                    .heard
+                    .iter()
+                    .flatten()
+                    .map(|(at, _)| *at)
+                    .max()
+                    .unwrap_or(0);
+                // BFD's last packet is closer to the failure than the
+                // last hello (one every `hello_ms`).
+                let bfd_rx = [Path::Sync, Path::Access]
+                    .into_iter()
+                    .zip(fast)
+                    .filter(|(_, f)| *f)
+                    .filter_map(|(p, _)| self.bfd.get(p.idx()).map(|b| b.last_rx))
+                    .max()
+                    .unwrap_or(0);
+                let last_heard = hello.max(bfd_rx);
+                *s = Some(Detection {
+                    last_heard,
+                    detected: now,
+                    bfd: fast,
+                    witness_at: None,
+                });
+            }
+            // BFD found it, then the dead interval ran out too: still the
+            // same silence, found by BFD.
+            (None, Some(_)) => {}
+        }
         if self.role == Role::Yielding {
             match peer {
                 Some(p) if p.role == Role::Active && p.epoch > self.epoch => {
@@ -582,14 +886,23 @@ impl Ha {
                     }
                 }
                 Role::Standby => {
-                    if may_take {
+                    if fast.iter().any(|f| *f) && self.cfg.witness {
+                        // BFD found it ahead of the dead interval: take
+                        // over on a fresh witness answer, else wait (the
+                        // dead interval brings the usual rule back).
+                        if self.fresh_witness() {
+                            self.set(now, Role::Active, Reason::PeerDead);
+                        }
+                    } else if may_take {
                         self.set(now, Role::Active, Reason::PeerDead);
                     } else {
                         self.set(now, Role::Fenced, Reason::Isolated);
                     }
                 }
                 Role::Fenced => {
-                    if may_take && self.stable(now) {
+                    let confirmed =
+                        !(fast.iter().any(|f| *f) && self.cfg.witness) || self.fresh_witness();
+                    if may_take && confirmed && self.stable(now) {
                         self.set(now, Role::Active, Reason::PeerDead);
                     }
                 }
@@ -644,6 +957,14 @@ impl Ha {
         }
     }
 
+    /// A witness answer after BFD found the silence.
+    fn fresh_witness(&self) -> bool {
+        match (self.silent_since, self.witness_answer) {
+            (Some(d), Some(w)) => w >= d.detected,
+            _ => false,
+        }
+    }
+
     fn maybe_preempt(&mut self, now: Millis, p: &PeerView) {
         if !self.cfg.preempt || self.cfg.priority <= p.priority {
             return;
@@ -678,6 +999,21 @@ impl Ha {
             simulating_until: self.sim_until,
             duplicate_node_id: self.duplicate_node_id,
             history: self.history.iter().copied().collect(),
+            bfd: self.bfd.map(|b| {
+                let mut b = b;
+                if let Some(d) = &self.cfg.bfd_damp {
+                    b.decay(d, now);
+                }
+                BfdPathStatus {
+                    configured: b.configured,
+                    up: b.up,
+                    suppressed: b.suppressed_since.is_some(),
+                    penalty: b.penalty.round() as u32,
+                    losses: b.losses,
+                    false_alarms: b.false_alarms,
+                }
+            }),
+            confirming: self.confirming(),
         }
     }
 }
@@ -956,5 +1292,80 @@ mod tests {
         );
         p.handover_request(5001, 1);
         assert_eq!(p.role(), Role::Yielding);
+    }
+
+    #[test]
+    fn bfd_expiry_on_every_path_takes_over_on_a_fresh_witness_answer() {
+        let mut a = Ha::new(cfg(1), 0);
+        a.witness(0, true);
+        a.witness_answer(0, 0);
+        a.synced(0, true);
+        for p in [Path::Sync, Path::Access] {
+            a.bfd(5, p, true, false, 150);
+            a.peer_heard(10, p, view(2, Role::Active, 7));
+        }
+        // The peer said Down itself (AdminDown, diagnostic 3): alive.
+        a.bfd(100, Path::Sync, false, false, 150);
+        a.bfd(100, Path::Access, false, false, 150);
+        a.tick(110);
+        assert_eq!(a.role(), Role::Standby);
+        for p in [Path::Sync, Path::Access] {
+            a.bfd(120, p, true, false, 150);
+        }
+        // Its packets stopped on one path: the other still hears it.
+        a.bfd(160, Path::Sync, false, true, 150);
+        a.tick(170);
+        assert_eq!(a.role(), Role::Standby);
+        a.bfd(165, Path::Access, false, true, 150);
+        a.tick(175);
+        assert_eq!(
+            a.role(),
+            Role::Standby,
+            "the witness answer is older than the detection"
+        );
+        assert!(a.wants_witness_probe() && a.status(175).confirming);
+        a.witness_answer(178, 178);
+        assert_eq!(a.role(), Role::Active);
+        let mut acts = Vec::new();
+        a.take_actions(&mut acts);
+        let d = acts
+            .iter()
+            .find_map(|x| match x {
+                Action::Role(t) if t.to == Role::Active => t.detection,
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            (d.last_heard, d.detected, d.bfd, d.witness_at),
+            (15, 165, [true, true], Some(178))
+        );
+    }
+
+    #[test]
+    fn a_hello_after_a_bfd_loss_revives_the_path_and_costs_a_penalty() {
+        let mut a = Ha::new(cfg(1), 0);
+        a.witness(0, true);
+        a.peer_heard(10, Path::Sync, view(2, Role::Active, 7));
+        a.bfd(10, Path::Sync, true, false, 150);
+        a.bfd(50, Path::Sync, false, true, 150);
+        assert!(a.status(50).peer.is_none(), "BFD killed the only path");
+        a.peer_heard(300, Path::Sync, view(2, Role::Active, 7));
+        let s = a.status(300);
+        assert!(s.peer.is_some() && s.paths[0]);
+        assert_eq!(
+            (s.bfd[0].losses, s.bfd[0].false_alarms, s.bfd[0].penalty),
+            (1, 1, 1989)
+        );
+    }
+
+    #[test]
+    fn a_peer_back_after_the_dead_interval_is_no_false_alarm() {
+        let mut a = Ha::new(cfg(1), 0);
+        a.peer_heard(10, Path::Sync, view(2, Role::Standby, 0));
+        a.bfd(10, Path::Sync, true, false, 150);
+        a.bfd(50, Path::Sync, false, true, 150);
+        a.peer_heard(5000, Path::Sync, view(2, Role::Standby, 0));
+        let b = a.bfd_state(Path::Sync);
+        assert_eq!((b.losses, b.false_alarms), (1, 0));
     }
 }

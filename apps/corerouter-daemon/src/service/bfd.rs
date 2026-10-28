@@ -162,6 +162,7 @@ fn run(session: &Shared, threads: Option<usize>, dp_path: Option<PathBuf>, healt
     }
     let mut cfg_at: Option<Instant> = None;
     let mut pub_at = Instant::now();
+    let mut pair_silent = false;
     loop {
         if health.stopping() {
             ctl.stop(session);
@@ -202,12 +203,21 @@ fn run(session: &Shared, threads: Option<usize>, dp_path: Option<PathBuf>, healt
                 ctl.on_bfdd(m, &cfg, health);
             }
         }
+        // A simulated failure of the BNG pair silences its sessions now,
+        // not at the next config pass.
+        if super::ppp_ha::bfd_silent() != pair_silent {
+            pair_silent = !pair_silent;
+            cfg_at = None;
+        }
         if cfg_at.is_none_or(|t| t.elapsed() >= CONFIG_EVERY) {
             cfg_at = Some(Instant::now());
             let cfg = lock(session).store().running().clone();
             // A failed start (port taken) is retried every second.
-            // The routes' sessions (G3.6g) are part of what is wanted.
-            let wanted = (cfg.routing.bfd.clone(), route_sessions(&cfg));
+            // The routes' sessions (G3.6g) and the BNG pair's (G3.6h)
+            // are part of what is wanted.
+            let mut extra = route_sessions(&cfg);
+            extra.extend(pair_sessions(&cfg));
+            let wanted = (cfg.routing.bfd.clone(), extra);
             if ctl.cfg.as_ref() != Some(&wanted) && ctl.reconcile(&cfg, health) {
                 ctl.cfg = Some(wanted);
             }
@@ -340,6 +350,22 @@ struct Controller {
     dp: Option<std::os::unix::net::UnixStream>,
 }
 
+/// The BNG pair's BFD sessions (G3.6h): to the peer on the sync and the
+/// access path; none while a simulated failure keeps this node silent.
+#[cfg(target_os = "linux")]
+fn pair_sessions(cfg: &corerouter_model::Config) -> corerouter_model::bfd::Wanted {
+    let mut out = corerouter_model::bfd::Wanted::new();
+    if super::ppp_ha::bfd_silent() {
+        return out;
+    }
+    for (peer, prof, path) in cfg.ppp.redundancy.bfd_sessions() {
+        let Some(p) = cfg.routing.bfd.profile(prof) else { continue };
+        let key = BfdKey { peer, multihop: false, local: None };
+        out.insert(key, (p, vec![format!("ppp redundancy {path}")]));
+    }
+    out
+}
+
 #[cfg(target_os = "linux")]
 fn spec_of(key: BfdKey, prof: &BfdProfile, users: Vec<String>) -> engine::Spec {
     engine::Spec {
@@ -365,6 +391,8 @@ impl Controller {
         let auto = if self.dplane { auto_threads(AUTO_PER_THREAD + 1) } else { auto_threads(sessions) };
         let opts = engine::Options {
             threads: self.threads.unwrap_or(auto),
+            // G3.6h: the BNG pair hears its peer's BFD on the engine thread.
+            tap: Some(super::ppp_ha::bfd_tap),
             ..self.opts.clone()
         };
         let spawn = |name: String, f: Box<dyn FnOnce() + Send>| health.spawn(&name, f);
@@ -403,7 +431,11 @@ impl Controller {
         // With bfdd the config's peers are its own; static routes with
         // check_gateway=bfd (G3.6g) run here either way, except a gateway
         // bfdd already has a session to.
-        let wanted_cfg = if self.dplane { route_sessions(cfg) } else { wanted_all(cfg) };
+        let mut wanted_cfg = if self.dplane { route_sessions(cfg) } else { wanted_all(cfg) };
+        // G3.6h: the BNG pair's sessions run here either way.
+        for (key, v) in pair_sessions(cfg) {
+            wanted_cfg.entry(key).or_insert(v);
+        }
         let wanted: BTreeMap<BfdKey, engine::Spec> = wanted_cfg
             .into_iter()
             .filter(|(key, _)| !self.dp_sessions.values().any(|(s, _)| s.key == *key))
@@ -573,6 +605,8 @@ impl Controller {
             }
             None => (Vec::new(), Vec::new(), ""),
         };
+        // Before the session lock: the BNG pair's monitor and alerts.
+        super::ppp_ha::publish_bfd(&sessions);
         let mut s = lock(session);
         if let Some(st) = s.ext_mut::<BfdState>() {
             st.running = self.engine.is_some();

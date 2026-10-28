@@ -32,6 +32,7 @@ fn engine(bind: Ipv4Addr, port: u16, peer_port: u16, threads: usize) -> Engine {
         port_single: port,
         port_multi: port + 1,
         peer_ports: Some((peer_port, peer_port + 1)),
+        tap: None,
     };
     Engine::start(&opts, &spawn).unwrap()
 }
@@ -110,6 +111,54 @@ fn two_engines_come_up_and_detect_the_loss() {
     let fwd: u64 = threads.iter().map(|t| t.forwarded).sum();
     let rx: u64 = s.iter().map(|x| x.packets_rx).sum();
     assert!(fwd <= 3, "forwarded {fwd} of {rx}");
+    drop(a);
+}
+
+/// What the tap of [`the_tap_hears_the_loss_on_the_engine_thread`] saw.
+static TAPPED: std::sync::Mutex<Vec<(State, corerouter_proto_bfd::packet::Diag, Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn record_tap(_k: &BfdKey, _from: State, to: State, diag: corerouter_proto_bfd::packet::Diag) {
+    TAPPED.lock().unwrap().push((to, diag, Instant::now()));
+}
+
+/// G3.6h: the BNG pair's tap runs on the engine thread, before the event
+/// queue and the service loop (and so before any session lock).
+#[test]
+fn the_tap_hears_the_loss_on_the_engine_thread() {
+    let (pa, pb) = ports();
+    let (pa, pb) = (pa + 2000, pb + 2000);
+    let fast = BfdProfile::new("fast", 50, 3);
+    let opts = Options {
+        threads: 1,
+        bind4: Some("127.0.0.1".parse().unwrap()),
+        bind6: None,
+        port_single: pa,
+        port_multi: pa + 1,
+        peer_ports: Some((pb, pb + 1)),
+        tap: Some(record_tap),
+    };
+    let mut a = Engine::start(&opts, &spawn).unwrap();
+    let mut b = engine("127.0.0.2".parse().unwrap(), pb, pa, 1);
+    a.add(spec("127.0.0.2".parse().unwrap(), None, &fast), None);
+    b.add(spec("127.0.0.1".parse().unwrap(), None, &fast), None);
+    assert!(wait_for(&a, Duration::from_secs(5), |s| s.iter().all(|x| x.state == "up")));
+    assert!(TAPPED.lock().unwrap().iter().any(|(s, _, _)| *s == State::Up));
+    let t = Instant::now();
+    drop(b);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let down = loop {
+        let hit = TAPPED.lock().unwrap().iter().find(|(s, _, at)| *s == State::Down && *at > t).copied();
+        if let Some(h) = hit {
+            break h;
+        }
+        assert!(Instant::now() < deadline, "no Down in the tap");
+        thread::sleep(Duration::from_millis(1));
+    };
+    let took = down.2 - t;
+    assert_eq!(down.1, corerouter_proto_bfd::packet::Diag::ControlDetectionTimeExpired);
+    assert!(took <= Duration::from_millis(170) && took >= Duration::from_millis(90), "{took:?}");
+    eprintln!("tap: loss heard {took:?} after the peer stopped (detection 150 ms)");
     drop(a);
 }
 
@@ -249,6 +298,7 @@ fn data_plane_for_a_fake_bfdd() {
             port_single: pa,
             port_multi: pa + 1,
             peer_ports: Some((pb, pb + 1)),
+            tap: None,
         },
         ..Controller::default()
     };

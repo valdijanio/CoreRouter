@@ -119,6 +119,20 @@ sincronização da configuração com confirmação.
 | Porta rastreada caída | cerca |
 | Cercado volta | só depois de `recover_hold` (3 s) estável |
 
+**Com BFD (G3.6h, §2.13).** O BFD é um terceiro sinal de vida em cada caminho; ele só antecipa a
+detecção, e a regra de maioria com a testemunha não muda:
+
+| Situação | Decisão |
+|---|---|
+| BFD expira (diagnóstico 1: os pacotes do par pararam) em **todos** os caminhos em uso, antes do `dead` | o espera sonda a testemunha na hora; assume só com uma resposta **posterior** à detecção. Sem resposta, espera: quando o `dead` dos hellos vence, vale a tabela de cima |
+| BFD expira num caminho só | nada: o outro caminho ainda ouve o par |
+| BFD num caminho só configurado (com `fencing` usando o acesso) | nada antecipa: o hello do outro caminho ainda precisa do `dead` |
+| O par anuncia Down (AdminDown, diagnóstico 3) ou a sessão nunca subiu | não conta: o par está vivo e falando; só os hellos decidem |
+| Hello chega até `dead` depois de uma perda de BFD | alarme falso: o caminho revive e leva uma segunda penalidade |
+| Penalidade do caminho ≥ `suppress` (3 perdas em ~15 s, ou uma perda falsa e mais uma) | o BFD desse caminho é ignorado (amortecido) até a penalidade cair abaixo de `reuse`; só os hellos decidem |
+| Ativo com o par mudo pelo BFD e sem testemunha | como antes: cerca pelo estado da testemunha com debounce (3 faltas); o BFD não cerca mais cedo |
+| Falha simulada / Testar tomada (método falha) | este nó para também as sessões BFD do par (somem sem AdminDown): o par vê uma queda de verdade |
+
 Toda tomada aumenta a **época**; ela desempata um split-brain visto depois de uma partição (fica a
 tomada mais recente, que tem as sessões novas).
 
@@ -430,6 +444,125 @@ As sessões IPoE (G4.3f) entram no hot standby como as PPPoE:
   repete cada DHCP a cada 5 s, ≈ 19 mensagens por cliente, enquanto o servidor responde até 3100
   ACKs/s. Por isso a adoção de 10 mil e 100 mil vem do benchmark (gap G4.3fb).
 
+## 2.13 BFD no par (G3.6h)
+
+Aprovado pelo usuário em 2026-10-28 (mockup da janela PPP › Redundancy). O BFD (RFC 5880/5881,
+o nosso motor em Rust da G3.6, o mesmo do `/routing bfd`) entra como **terceiro sinal de vida**
+nos dois caminhos do par. A detecção cai de 1,2 s (4 hellos) para o tempo de detecção do perfil
+(`fast`: 50 ms × 3 = 150 ms); a decisão de assumir continua a mesma (tabela em §2.1).
+
+### Pesquisa
+
+- **Cisco ASR 9000 (BNG Geo Redundancy, SRG):** o par se acompanha por uma sessão TCP/sync e pela
+  rota de controle de estado; o BFD protege essa rota e o peering. Um caso no fórum da Cisco: com
+  a energia cortada, a troca levou 2–3 min porque a sessão BFD foi a *AdminDown* em vez de expirar,
+  e o BGP só caiu no timeout do TCP
+  ([community.cisco.com](https://community.cisco.com/t5/xr-os-and-platforms/bng-geo-redundancy-no-sub-second-failover-after-power-failure/m-p/3696820)).
+  Lição adotada: só a **expiração** (diagnóstico 1) conta como morte; AdminDown não, e o hello
+  continua como rede de segurança.
+- **Juniper MX (M:N subscriber redundancy):** o primário passa as ligações ao backup por TCP, e a
+  troca vai pela redundância de pseudowire; o BFD aparece como verificação de sessão, sem
+  descrição de como acelera a troca
+  ([juniper.net](https://juniper.net/documentation/us/en/software/junos/subscriber-mgmt-sessions/topics/topic-map/m-to-n-subscriber-redundancy.html)).
+- **Nokia 7750 (MC-LAG + SRRP, MCS):** o par fala por UDP 1025 entre os system addresses; o SRRP
+  segue o MC-LAG. O BFD é documentado para VRRP e para LAG, não para o peering MC
+  ([MC-LAG and SRRP](https://infocenter.nokia.com/public/7750SR222R1A/topic/com.nokia.Interface_Configuration_Guide/mc-lag_and_subs-d10e14929.html)).
+- **VRRP com BFD** (draft-ietf-rtgwg-vrrp-bfd-p2p, atualiza a RFC 9568, trabalho em andamento):
+  BFD ponto a ponto só entre o ativo e o backup crítico, detecção na faixa de 150 ms, e *o BFD
+  sempre volta à falha normal do VRRP*
+  ([datatracker](https://datatracker.ietf.org/doc/draft-ietf-rtgwg-vrrp-bfd-p2p/)). É o mesmo
+  desenho daqui: o BFD antecipa, o hello continua sendo o piso.
+- **RFC 5880 §6.8.4 e errata:** a errata 6926 (verificada) manda manter o diagnóstico em
+  *Control Detection Time Expired* quando os pacotes param, mesmo que o par tenha anunciado
+  AdminDown antes; a 5205 está retida para revisão
+  ([errata](https://www.rfc-editor.org/errata/rfc5880)). A RFC 5881 (salto único, TTL 255) já é
+  seguida pelo motor. RFC 5882 §3.2 pede amortecer os clientes de uma sessão que oscila.
+- **MikroTik RouterOS v7:** não tem redundância de PPPoE server; o BFD existe para BGP/OSPF.
+
+**O que adotamos:** sessões BFD do nosso motor (sem processo externo) ao endereço de sync do par e
+ao endereço do par no acesso; só a expiração conta; confirmação **fresca** da testemunha antes de
+assumir; amortecimento por caminho com o perfil do BFD; linha do tempo de cada tomada; o
+"Testar tomada" e o alerta preventivo de jitter.
+
+**Melhorias além dos outros:** a resposta da testemunha *depois* da detecção (nenhum dos BNGs
+pesquisados documenta isso; fecha a janela em que um espera isolado assume com o estado velho da
+testemunha); o alarme falso (BFD perdido com o hello passando) custa penalidade dobrada; o teste
+de tomada lê o resultado do par pelo link de sync; a linha do tempo medida em cada nó.
+
+**Fora, e por quê:** BFD echo (o motor não tem; o assíncrono a 50 ms já dá 150 ms); BFD sobre
+IPv6 link-local no acesso (a chave da sessão não tem interface: use um endereço global ou um /30
+numa VLAN de gerência); acelerar a cerca do ativo isolado pelo BFD (uma resposta perdida da
+testemunha derrubaria o acesso de todos: fica o debounce de 3 s, como antes).
+
+### Como funciona
+
+- **Config:** `ppp.redundancy.set bfd=fast access_bfd=fast access_peer=<ip>`. O `peer` precisa
+  ser um endereço para o BFD do sync. `get` mostra `detection_ms`: o BFD quando todos os caminhos
+  em uso têm BFD, senão o `dead`. Mudar o BFD não recria a máquina de papéis (um nó recriado
+  volta a `init` e para de responder).
+- **Sessões:** o serviço `bfd` acrescenta as do par ao que já roda (peers, rotas com
+  `check_gateway=bfd`), também no modo data plane do `bfdd`.
+- **Sem lock do `Session` no caminho da decisão:** a thread do motor BFD chama um *tap* (um
+  ponteiro de função nas `Options` do motor) na mudança de estado; ele só põe numa fila de 256 e
+  acorda o laço do `ppp-ha`. O laço entrega à máquina de papéis, que pede uma sonda à thread da
+  testemunha (acordada na hora, espera de 200 ms); a resposta acorda o laço de novo. Nada disso
+  passa pelo lock do engine nem pelo laço do serviço `bfd`.
+- **Linha do tempo** (`ppp.redundancy.monitor` → `takeovers`), em ms desde o último sinal de vida
+  do par (o último pacote BFD, ou o último hello): detectado, testemunha, ativo, anunciado (o
+  primeiro hello do MAC virtual), adotadas (o último worker que adotou a sua parte), 1º quadro de
+  assinante; sessões entregues, adotadas, que não couberam, e perdidas (as que o par tinha e a
+  réplica não, mais as que não couberam).
+- **Testar tomada** (`ppp.redundancy.test-takeover`): sem `confirm` só roda as verificações (este
+  nó ativo, o par de espera, em sync e alcançando a testemunha, os dois caminhos ouvidos, o BFD de
+  pé e não amortecido, a config igual). Com `confirm=takeover`, o método `failure` deixa este nó
+  mudo por N segundos (sem respostas, sem hellos, sem BFD); o par detecta como uma queda. A cada
+  2 s este nó pergunta ao par a última tomada dele (`Msg::Forward` com `{"ha":"last-takeover"}`:
+  um par sem a G3.6h responde 404, porque o pedido não é um CoA válido) e dá o veredito: `passed`
+  com 0 perdidas.
+- **Alerta preventivo:** p99 do intervalo entre os pacotes do par ≥ 2/3 do tempo de detecção (dois
+  dos três pacotes da janela faltando: mais uma perda seguida derruba a sessão), este nó mandando
+  BFD atrasado (p99 ≥ 1/3 da detecção: CPU) e caminho amortecido. Cada alerta vai uma vez ao log.
+- **Janela PPP › Redundancy:** BFD (sync), BFD (acesso) com o endereço do par, Detecção; à
+  direita, o BFD por caminho (estado, perfil, detecção, p99, amortecido), a idade da resposta da
+  testemunha, os alertas, o resultado do teste, a linha do tempo em selos encadeados e a última
+  tomada do par; **Testar tomada** mostra as verificações e só roda depois de digitar `takeover`.
+  Conferida com dois daemons reais num namespace, temas claro e escuro.
+
+### Medido
+
+- **Laboratório em memória** (`tests/sim_bfd.rs`, release): morto o ativo com 20 mil sessões, o
+  espera assume em **155 ms** simulados (BFD 150 ms + a sonda da testemunha), 0 perdidas; 300
+  sementes de falhas aleatórias com BFD e perdas de BFD com o hello passando: **nunca** dois ativos
+  que se ouvem.
+- **Dois daemons reais** (`tests/netns_ha_bfd.rs`, debug, namespace, sem assinantes): detectado
+  em 150 ms, testemunha em 150–154 ms, ativo em **150–154 ms** depois do último sinal de vida
+  (antes do laço acordar pelo evento: 160 ms); o teste de tomada passa e o nó de origem lê o
+  resultado do par.
+- **Motor BFD:** o tap ouve a perda 117 ms depois de o par parar (detecção de 150 ms contada do
+  último pacote recebido), na thread do motor.
+- **VM com BNG Blaster** (`corerouter-lab`, 8 vCPUs, kernel 7.0, release, BNG Blaster 1.0.1,
+  sem root: caminho lento; 2026-10-28; `cargo xtask vm-lab run -- env BNG_LAB_HA_BFD=fast cargo
+  xtask bng-lab --only ha --scales …`). O ativo perde a energia (todas as portas caem juntas).
+  "Tomada", "Todas no nó novo" e "Tráfego de volta" são contados do corte; a linha do tempo de C,
+  do último sinal de vida de A:
+
+  | Sessões | Detecção | Tomada | Linha do tempo em C (detectado / testemunha / ativo / adotadas) | Todas no nó novo | Tráfego de subida de volta | Sessões perdidas |
+  |---:|---|---:|---|---:|---:|---:|
+  | 1 000 | hellos (1,2 s) | 0,96 s | 1208 / 840 / 1208 / 1216 ms | 0,97 s | 0,98 s | 0 |
+  | 10 000 | hellos | 1,18 s | 1203 / – / 1203 / – ms | 1,30 s | 1,32 s | 0 |
+  | 100 000 | hellos | 1,15 s | 1209 / 907 / 1209 / 1927 ms | 1,85 s | 1,88 s | 0 |
+  | 1 000 | BFD `fast` (150 ms) | 0,16 s | 150 / 151 / 160 / 163 ms | 0,17 s | **0,19 s** | 0 |
+  | 10 000 | BFD `fast` | 0,13 s | 150 / 150 / 150 / 247 ms | 0,24 s | **0,25 s** | 0 |
+  | 100 000 | BFD `fast` | 0,20 s | 150 / 154 / 154 / 911 ms | 1,00 s | **1,04 s** | 0 |
+
+  Em todas: os mesmos Acct-Session-Id, nenhum Stop, um Interim de C por sessão, o Class de cada
+  usuário preservado. A 1 000 sessões de 1 000, a primeira rodada (antes do laço acordar pelo
+  evento) dava ativo a 160 ms; com o evento, 150–154 ms.
+
+  **A meta de < 200 ms vale até ~10 mil sessões.** Acima, quem domina é a adoção no caminho lento
+  (a rota de cada sessão no kernel): 100 mil levam ~0,72–0,76 s com e sem BFD. A detecção já não
+  pesa. Fica na gap G4.3hh (adoção em lote).
+
 ## 3. Testes
 
 - Unidade (27): cada regra da máquina de papéis, codec, registro, hello, sync.
@@ -447,6 +580,10 @@ As sessões IPoE (G4.3f) entram no hot standby como as PPPoE:
 | switchover ida e volta (50 mil) | troca em ≤ 20 ms, 0 perdidas, nunca dois ativos |
 | simular falha | o par assume; o nó volta como espera |
 | preempção | a prioridade maior retoma depois do atraso, em sync |
+| BFD 50 ms × 3 nos dois caminhos, o ativo morre (G3.6h, `tests/sim_bfd.rs`) | troca em 155 ms simulados, 0 de 20 000 perdidas, a detecção marcada como BFD e a testemunha respondendo depois dela |
+| BFD só no sync, ou espera isolado sem testemunha | espera o `dead` dos hellos / não assume |
+| BFD perdido com o hello passando, 6 vezes | no máximo uma troca; os dois caminhos amortecidos; 60 s depois o BFD volta a valer |
+| falhas aleatórias com BFD e perdas de BFD (300 sementes) | **nunca** dois ativos que se ouvem |
 | falhas aleatórias (2000 sementes × 120 eventos: morte, reinício, cortes, testemunha, porta, switchover, simular falha, 2 % de perda no acesso) | **nunca** dois ativos que se ouvem; tudo converge para um ativo com a espera em sync |
 
   O vigia do laboratório foi conferido por mutação: com o ativo nunca cedendo num split-brain, dois
@@ -484,6 +621,22 @@ As sessões IPoE (G4.3f) entram no hot standby como as PPPoE:
 - **A tomada** importa em paralelo: cada worker adota as sessões da sua lane.
 - **A máquina de papéis** é uma só por nó: decisão global, custo desprezível.
 
+### BFD no par (G3.6h)
+
+- **Trabalho por item:** nenhum por sessão de assinante. O custo é por mudança de estado do BFD
+  (um mutex de uma lista de até 2 endereços, uma fila de 256) e por tomada (O(1) para a linha do
+  tempo; a adoção continua dividida entre os workers). O worker do `pppoe` faz uma leitura atômica
+  relaxada por quadro (o "1º quadro" da linha do tempo): ≈ 1 ns (**estimado**; a linha de cache é
+  só lida fora de uma tomada).
+- **Threads:** a detecção roda na thread do motor BFD (a roda de temporizadores dele, G3.6), a
+  decisão no laço do `ppp-ha` (acordado pelo evento), a sonda na thread da testemunha. Nenhuma
+  espera o lock do `Session` nem o laço do serviço `bfd` (que pega o lock para o histórico). O
+  par tem 2 sessões BFD: mais threads não ajudam; o motor já é multithread para os milhares de
+  sessões de BGP/OSPF.
+- **Filas:** eventos do BFD (256), respostas ao par (1024), logs (256): todas limitadas.
+- **Medido:** detecção → ativo em 0–4 ms (laço acordado pelo evento), contra 10 ms com o tique de
+  10 ms (`tests/netns_ha_bfd.rs`, debug).
+
 ### No serviço `pppoe` (fase 2)
 
 **Medido** com `cargo bench -p corerouter-daemon --bench pppoe_bng` (release, Ryzen AI Max+ 395,
@@ -514,6 +667,13 @@ As sessões IPoE (G4.3f) entram no hot standby como as PPPoE:
   entre 8 workers, dá ≈ 3 ms por worker a cada segundo.
 
 ## 5. Riscos e como evitamos
+
+- **BFD perdido nos dois caminhos com o par vivo (G3.6h):** com o hello ainda passando, o espera
+  pode assumir antes do próximo hello. O par ativo ouve a tomada no hello seguinte e cede
+  (época maior), em ≤ 1 hello; numa réplica completa, as sessões seguem no novo ativo. O
+  amortecimento torna isso raro (a perda falsa vale duas penalidades: a próxima já é ignorada) e
+  o alerta de jitter avisa antes. Por isso o BFD tem de ir nos **dois** caminhos, que passam por
+  redes diferentes.
 
 - **Uma porta de acesso por L2:** o ativo põe o mesmo MAC virtual em todas as portas de acesso.
   Duas portas no mesmo L2 fazem o switch mover o MAC de uma para a outra, e os quadros chegam pela

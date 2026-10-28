@@ -380,7 +380,9 @@ mod linux {
             let now = ms();
             // G4.3h: a takeover first (its sessions before any frame).
             if bng.ha_pending() {
-                let _ = bng.ha_adopt_pending(now);
+                let done = bng.ha_adopt_pending(now);
+                // G3.6h: the takeover's timeline.
+                super::super::ppp_ha::adopted(done.sessions, done.skipped);
             }
             let mut wait = WAIT;
             if let Some(d) = bng.next_deadline() {
@@ -407,6 +409,7 @@ mod linux {
                             // its subscribers.
                             Msg::Frame(ifindex, f) => {
                                 if bng.serving() {
+                                    super::super::ppp_ha::frame_seen();
                                     bng.frame(now, ifindex, &f);
                                 }
                             }

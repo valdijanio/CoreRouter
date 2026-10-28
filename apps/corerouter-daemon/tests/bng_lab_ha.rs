@@ -39,6 +39,11 @@
 //! access port, a lease of 2 minutes so every client renews on C after
 //! the takeover; RADIUS accounting only, the MAC as User-Name).
 //!
+//! `BNG_LAB_HA_BFD=<profile>` (G3.6h): BFD on both paths of the pair
+//! (`fast`: 50 ms × 3), the access one over 10.7.0.1/.2 on `acc0`; the
+//! summary adds C's timeline of the takeover (from the peer's last sign
+//! of life) next to the times measured from the cut.
+//!
 //! Results: `$BNG_LAB_OUT/ha-summary.md`. Helpers may unwrap/panic.
 #![cfg(target_os = "linux")]
 #![allow(
@@ -372,6 +377,13 @@ fn single() -> bool {
     std::env::var_os("BNG_LAB_HA_SINGLE").is_some()
 }
 
+/// `BNG_LAB_HA_BFD`: the pair's BFD profile (G3.6h).
+fn bfd_profile() -> Option<String> {
+    std::env::var("BNG_LAB_HA_BFD")
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
 fn configure(ns: Option<u32>, uplink: &str, peer: &str, priority: u32, ports: usize, r: &Radius) {
     ok(
         ns,
@@ -448,14 +460,27 @@ fn configure(ns: Option<u32>, uplink: &str, peer: &str, priority: u32, ports: us
         return;
     }
     let ifs: Vec<String> = (0..ports).map(|i| format!("acc{i}")).collect();
-    ok(
-        ns,
-        "ppp.redundancy.set",
-        json!({
-            "enabled": true, "mode": "hot-standby", "peer": format!("{peer}:8730"), "secret": PAIR_SECRET,
-            "witness": ["10.99.0.1"], "interfaces": ifs, "priority": priority, "init_hold": 2
-        }),
-    );
+    let mut p = json!({
+        "enabled": true, "mode": "hot-standby", "peer": format!("{peer}:8730"), "secret": PAIR_SECRET,
+        "witness": ["10.99.0.1"], "interfaces": ifs, "priority": priority, "init_hold": 2
+    });
+    if let Some(prof) = bfd_profile() {
+        // The access path's BFD over acc0 (A .1, C .2).
+        let (me, other) = if priority == 200 {
+            ("10.7.0.1", "10.7.0.2")
+        } else {
+            ("10.7.0.2", "10.7.0.1")
+        };
+        ok(
+            ns,
+            "ip.address.add",
+            json!({"address": format!("{me}/24"), "interface": "acc0"}),
+        );
+        p["bfd"] = json!(prof);
+        p["access_bfd"] = json!(prof);
+        p["access_peer"] = json!(other);
+    }
+    ok(ns, "ppp.redundancy.set", p);
 }
 
 fn active(ns: Option<u32>) -> u64 {
@@ -481,13 +506,20 @@ fn monitor(ns: Option<u32>) -> Value {
     call(ns, "ppp.redundancy.monitor", json!({})).unwrap_or(Value::Null)
 }
 
-fn wait_secs(secs: u64, mut f: impl FnMut() -> bool) -> Option<f64> {
+fn wait_secs(secs: u64, f: impl FnMut() -> bool) -> Option<f64> {
+    wait_every(secs, Duration::from_millis(100), f)
+}
+
+/// `wait_secs` polling every `step`: 10 ms for the role (cheap; the
+/// takeover with BFD is ~0.2 s), 100 ms for the table queries, which take
+/// the sessions' lock and would slow the adoption they measure.
+fn wait_every(secs: u64, step: Duration, mut f: impl FnMut() -> bool) -> Option<f64> {
     let t = Instant::now();
     while t.elapsed() < Duration::from_secs(secs) {
         if f() {
             return Some(t.elapsed().as_secs_f64());
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(step);
     }
     None
 }
@@ -512,7 +544,7 @@ fn bng_lab_ha() {
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
         .unwrap_or_else(|| vec![10_000]);
     let mut md = String::from(
-        "# BNG em par (G4.3h): o ativo perde a energia\n\n| Sessões | Plano de dados | Tomada | Todas no nó novo | Tráfego de volta | Sessões perdidas | Na tabela do novo | Starts (ids únicos) | Stops na tomada | Sessões com Interim do novo | Sessões sem Interim do novo | Registros sem o Class do usuário | CoA ao nó antigo (ACK, mediana, p99, total) |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+        "# BNG em par (G4.3h): o ativo perde a energia\n\n| Sessões | Plano de dados | Tomada | Linha do tempo em C (detectado/testemunha/ativo/adotadas, do último sinal de vida) | Todas no nó novo | Tráfego de volta | Sessões perdidas | Na tabela do novo | Starts (ids únicos) | Stops na tomada | Sessões com Interim do novo | Sessões sem Interim do novo | Registros sem o Class do usuário | CoA ao nó antigo (ACK, mediana, p99, total) |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for n in scales {
         let row = run(n, &blaster, &out);
@@ -723,12 +755,28 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
     ip(None, &["link", "set", "wan0", "down"]);
     ip(None, &["link", "set", "sync0", "down"]);
     ip(None, &["addr", "del", "10.99.0.1/24", "dev", "gw0"]);
-    let takeover = wait_secs(30, || monitor(Some(cp))["role"] == "active").unwrap_or(f64::NAN);
+    let takeover = wait_every(30, Duration::from_millis(10), || {
+        monitor(Some(cp))["role"] == "active"
+    })
+    .unwrap_or(f64::NAN);
     // G4.3hd: every session in C's table (adopted), from the cut.
     let adopted = wait_secs(60, || active(Some(cp)) >= n as u64)
         .map_or(f64::NAN, |_| cut.elapsed().as_secs_f64());
     let back = wait_secs(60, || rx_sample(Some(cp)) > rx0)
         .map_or(f64::NAN, |_| cut.elapsed().as_secs_f64());
+    let timeline = {
+        // G3.6h: C's own timeline, ms from A's last sign of life.
+        let k = monitor(Some(cp))["takeovers"][0].clone();
+        let ms = |key: &str| k[key].as_u64().map_or("–".to_owned(), |v| v.to_string());
+        format!(
+            "{}: {}/{}/{}/{} ms",
+            k["detected_by"].as_str().unwrap_or("?"),
+            ms("detected_ms"),
+            ms("witness_ms"),
+            ms("active_ms"),
+            ms("adopted_ms")
+        )
+    };
     // Keepalive (5 s × 3 on BNG Blaster) and interims settle; IPoE: past
     // T1, every client renewed on C.
     std::thread::sleep(Duration::from_secs(if ipoe() { 75 } else { 30 }));
@@ -803,7 +851,7 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
     eprintln!("ha {n}: accounting before the cut: {}", tally(&before_refs));
     eprintln!("ha {n}: accounting after the cut: {}", tally(&new));
     eprintln!(
-        "ha {n}: takeover {takeover:.2} s, all on C {adopted:.2} s, traffic back {back:.2} s, lost {lost}, C holds {held}, established {est}, starts {starts}, stops {stops}, C interims {}, without {without}, wrong Class {wrong_class} (C's records with it {class_c})",
+        "ha {n}: timeline on C {timeline}; takeover {takeover:.2} s, all on C {adopted:.2} s, traffic back {back:.2} s, lost {lost}, C holds {held}, established {est}, starts {starts}, stops {stops}, C interims {}, without {without}, wrong Class {wrong_class} (C's records with it {class_c})",
         interims_c.len()
     );
     let coa = if single() {
@@ -841,8 +889,9 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
         let _ = in_ns(None, "ip").args(["link", "del", l]).output();
     }
     format!(
-        "| {n}{} | {plane} | {takeover:.2} s | {adopted:.2} s | {back:.2} s | {lost} | {held} | {starts} ({}) | {stops} | {} | {without} | {} | {coa} |",
+        "| {n}{}{} | {plane} | {takeover:.2} s | {timeline} | {adopted:.2} s | {back:.2} s | {lost} | {held} | {starts} ({}) | {stops} | {} | {without} | {} | {coa} |",
         if ipoe() { " IPoE" } else { "" },
+        bfd_profile().map_or(String::new(), |p| format!(" BFD {p}")),
         unique.len(),
         interims_c.len(),
         // IPoE accounting only: no Access-Accept, no Class.

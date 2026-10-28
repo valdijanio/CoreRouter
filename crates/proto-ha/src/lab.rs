@@ -15,7 +15,7 @@ use crate::hello;
 use crate::msg::{Counters, Key, Role};
 use crate::node::{Event, Node, NodeConfig};
 use crate::record::{Kind, SessionRecord};
-use crate::role::{Refused, RoleConfig, Transition};
+use crate::role::{Path, Refused, RoleConfig, Transition};
 use crate::sync::SyncConfig;
 
 /// A small deterministic generator (xorshift64*).
@@ -87,6 +87,12 @@ pub struct LabNode {
     pub witness: bool,
     pub track: bool,
     pub transitions: Vec<Transition>,
+    /// BFD to the peer on [sync, access]: up, and when its last packet
+    /// arrived (G3.6h).
+    pub bfd: [(bool, Millis); 2],
+    /// Witness probes asked for (answered after `latency_ms`).
+    pub probes: u64,
+    probe_due: Option<Millis>,
 }
 
 impl LabNode {
@@ -108,6 +114,9 @@ impl LabNode {
             witness: true,
             track: true,
             transitions: Vec::new(),
+            bfd: [(false, now); 2],
+            probes: 0,
+            probe_due: None,
         }
     }
 }
@@ -126,6 +135,10 @@ pub struct LabConfig {
     pub seed: u64,
     /// Keep a line per event and role change in [`Lab::log`].
     pub trace: bool,
+    /// BFD detection time on [sync, access] (`None`: no BFD on that
+    /// path). A session comes up when the path passes and expires this
+    /// long after its last packet.
+    pub bfd_ms: [Option<u64>; 2],
 }
 
 impl Default for LabConfig {
@@ -149,6 +162,7 @@ impl Default for LabConfig {
             access_loss: 0,
             seed: 1,
             trace: false,
+            bfd_ms: [None, None],
         }
     }
 }
@@ -174,6 +188,9 @@ pub struct Lab {
     pub nodes: [LabNode; 2],
     pub sync_up: bool,
     pub access_up: bool,
+    /// BFD packets lost on [sync, access] until this time while the
+    /// hellos still pass (a degraded link that flaps BFD only).
+    pub bfd_blocked_until: [Millis; 2],
     connected: bool,
     /// (deliver at, to, bytes).
     sync_q: VecDeque<(Millis, usize, Vec<u8>)>,
@@ -196,6 +213,7 @@ impl Lab {
             nodes: [a, b],
             sync_up: true,
             access_up: true,
+            bfd_blocked_until: [0, 0],
             connected: false,
             sync_q: VecDeque::new(),
             access_q: VecDeque::new(),
@@ -491,11 +509,23 @@ impl Lab {
             }
             self.drain(to);
         }
+        self.bfd_step(now);
         let budget = self.cfg.bytes_per_ms * self.cfg.step_ms as usize;
         for i in 0..2 {
             if let Some(n) = self.nodes.get_mut(i)
                 && n.alive
             {
+                // A probe asked for: answered one link latency later.
+                if n.probe_due.is_some_and(|t| now >= t) {
+                    n.probe_due = None;
+                    if n.witness {
+                        n.node.witness_answer(now, now);
+                    }
+                }
+                if n.probe_due.is_none() && n.node.wants_witness_probe() {
+                    n.probes += 1;
+                    n.probe_due = Some(now + 2 * self.cfg.latency_ms);
+                }
                 n.node.witness(now, n.witness);
                 n.node.track(now, n.track);
                 n.node.tick(now);
@@ -524,6 +554,52 @@ impl Lab {
             }
         } else if any_alive && !ans.iter().any(|a| *a) {
             self.watch.nobody_ms += self.cfg.step_ms;
+        }
+    }
+
+    /// The BFD sessions of both nodes: a packet arrives on a path while
+    /// the peer is alive, not silent (a simulated failure), and the path
+    /// passes; a session expires `bfd_ms` after its last packet.
+    fn bfd_step(&mut self, now: Millis) {
+        let talking: Vec<bool> = self
+            .nodes
+            .iter()
+            .map(|n| n.alive && !n.node.ha().silent())
+            .collect();
+        for i in 0..2 {
+            for (p, path) in [Path::Sync, Path::Access].into_iter().enumerate() {
+                let Some(detect) = self.cfg.bfd_ms.get(p).copied().flatten() else {
+                    continue;
+                };
+                let link = if p == 0 { self.sync_up } else { self.access_up };
+                let blocked = self.bfd_blocked_until.get(p).is_some_and(|t| now < *t);
+                let passes = link && !blocked && talking.get(1 - i).copied().unwrap_or(false);
+                let Some(n) = self.nodes.get_mut(i) else {
+                    continue;
+                };
+                if !n.alive {
+                    continue;
+                }
+                let Some(st) = n.bfd.get_mut(p) else { continue };
+                let mut change = None;
+                if passes {
+                    st.1 = now;
+                    if !st.0 {
+                        st.0 = true;
+                        change = Some(true);
+                    }
+                } else if st.0 && now.saturating_sub(st.1) >= detect {
+                    st.0 = false;
+                    change = Some(false);
+                }
+                if let Some(up) = change {
+                    n.node.bfd(now, path, up, !up, detect);
+                    self.note(|| {
+                        format!("node{i} bfd {path:?} {}", if up { "up" } else { "down" })
+                    });
+                    self.drain(i);
+                }
+            }
         }
     }
 
