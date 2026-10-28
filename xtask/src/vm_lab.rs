@@ -37,8 +37,16 @@ const LAB_ROOT: &str = "/srv/lab";
 /// Extra kernel command line in the guest (see `guest_settings`).
 const GRUB_CFG: &str = "/etc/default/grub.d/90-corerouter-lab.cfg";
 const GUEST_CMDLINE: &str = "spec_rstack_overflow=off";
-/// Held (flock) by each exclusive `run` inside the VM.
+/// Held (flock) by each exclusive `run` inside the VM; `<LOCK>.owner` says
+/// whose round it is (`key=value` lines, see `Owner`).
 const LOCK: &str = "/run/corerouter-lab.lock";
+/// Every process of a round carries it in its environment (`<host pid>.<start
+/// time>` of the `vm-lab run` on the host): how leftovers are found and told
+/// apart from a live round.
+const ROUND_VAR: &str = "COREROUTER_LAB_ROUND";
+/// How long `run` waits for the lock (`--lock-timeout`, or this variable).
+const LOCK_TIMEOUT_VAR: &str = "COREROUTER_VM_LOCK_TIMEOUT";
+const LOCK_TIMEOUT_DEFAULT: u64 = 30 * 60;
 /// Held on the host by a round the user runs by hand
 /// (`flock vm/root.lock cargo xtask vm-lab run …`): no snapshot or reset then.
 const HOST_LOCK: &str = "root.lock";
@@ -72,15 +80,20 @@ const HELP: &str = "usage: cargo xtask vm-lab <subcommand>
                     it (packages, rustup) and take the `clean` snapshot
                     (defaults: 8 vCPUs, 16384 MiB, 20 GiB thin, 1 wire = 2 test NICs)
   up | down         start (and wait for SSH) | shut down
-  status            state, address, snapshots, disk use
   ssh [cmd...]      shell (or one command) as user `lab`; `sudo` works inside
   sync              rsync this worktree to /srv/lab/<worktree>/src (no target*, .git)
   put <file...>     copy host files into /srv/lab/inbox/ (a .deb, a capture)
-  run [--no-sync] [--shared] -- <cmd...>
+  status            state, address, who holds the VM lock and for how long
+  run [--no-sync] [--shared] [--lock-timeout 30m] -- <cmd...>
                     health check (reset to `clean` if the VM is broken), sync, then run
                     <cmd> as root in /srv/lab/<worktree>/src with
                     CARGO_TARGET_DIR=/srv/lab/<worktree>/target (kept: incremental);
-                    one run at a time unless --shared (builds only, no namespaces)
+                    one run at a time unless --shared (builds only, no namespaces).
+                    Waits for the lock up to --lock-timeout (or $COREROUTER_VM_LOCK_TIMEOUT;
+                    default 30m; s/m/h), then fails showing who holds it. Warns about
+                    processes the command left running
+  unlock [--force]  show who holds the VM lock (owner, age, processes); with --force,
+                    end what is left of rounds whose `vm-lab run` is gone, freeing the lock
   tools [--check]   install the third-party tools declared in xtask/src/vm_tools.rs
                     (official URL + SHA-256), then snapshot `tools`; --check only
                     says what is missing. Installing is the user's, once per tool
@@ -111,6 +124,7 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
         "sync" => lab.up().and_then(|()| lab.sync()),
         "put" => lab.put(rest),
         "run" => lab.run(rest),
+        "unlock" => lab.unlock(rest),
         "tools" => lab.tools(rest),
         "snapshot" | "reset" => {
             let force = rest.iter().any(|a| a == "--force");
@@ -644,18 +658,17 @@ impl Lab {
                 host.display()
             ));
         }
-        if self.state()?.as_deref() == Some("running") && self.address()?.is_some() {
-            let out = self.ssh_output(&format!(
-                "sudo -n flock -n -E 75 {LOCK} true && echo free || cat {LOCK}.owner"
+        if self.state()?.as_deref() == Some("running")
+            && self.address()?.is_some()
+            && let Ok(report) = self.lock_report()
+            && report.busy
+        {
+            let alive = owner_alive(&report.owner);
+            return Err(format!(
+                "a `vm-lab run` holds the VM; try again when it ends, `cargo xtask vm-lab unlock` \
+                 if it is gone, or --force\n{}",
+                report.describe(alive, &round_alive).trim_end()
             ));
-            if let Ok(out) = out
-                && !out.contains("free")
-            {
-                return Err(format!(
-                    "a `vm-lab run` holds the VM ({}); try again when it ends, or --force",
-                    out.trim()
-                ));
-            }
         }
         Ok(())
     }
@@ -696,6 +709,17 @@ impl Lab {
         match self.idle() {
             Ok(()) => println!("rounds: none (snapshot/reset allowed)"),
             Err(why) => println!("rounds: busy: {why}"),
+        }
+        // Free lock, but a round left something running (an FRR daemon).
+        if state == "running"
+            && let Ok(report) = self.lock_report()
+            && !report.busy
+            && !report.procs.is_empty()
+        {
+            print!(
+                "left by rounds (`cargo xtask vm-lab unlock`):\n{}",
+                report.describe(owner_alive(&report.owner), &round_alive)
+            );
         }
         if state == "running" {
             match self.address() {
@@ -1046,11 +1070,27 @@ impl Lab {
     fn run(&self, args: &[String]) -> Result<(), String> {
         let mut sync = true;
         let mut exclusive = true;
+        let mut timeout = match std::env::var(LOCK_TIMEOUT_VAR) {
+            Ok(v) => parse_duration(&v).map_err(|e| format!("${LOCK_TIMEOUT_VAR}: {e}"))?,
+            Err(_) => LOCK_TIMEOUT_DEFAULT,
+        };
         let mut rest = args;
         while let Some((first, tail)) = rest.split_first() {
             match first.as_str() {
                 "--no-sync" => sync = false,
                 "--shared" => exclusive = false,
+                "--lock-timeout" => {
+                    let (v, t) = tail
+                        .split_first()
+                        .ok_or_else(|| "--lock-timeout needs a value (30m, 900, 1h)".to_owned())?;
+                    timeout = parse_duration(v).map_err(|e| format!("--lock-timeout: {e}"))?;
+                    rest = t;
+                    continue;
+                }
+                f if f.starts_with("--lock-timeout=") => {
+                    let v = f.strip_prefix("--lock-timeout=").unwrap_or_default();
+                    timeout = parse_duration(v).map_err(|e| format!("--lock-timeout: {e}"))?;
+                }
                 "--" => {
                     rest = tail;
                     break;
@@ -1075,31 +1115,28 @@ impl Lab {
             self.sync()?;
         }
         let dir = self.remote_dir()?;
+        let round = own_round();
         let script = format!(
             "if [ ! -r {RUST_ENV} ]; then echo 'vm-lab: no Rust toolchain in the VM; run `cargo xtask vm-lab create`' >&2; exit 1; fi\n\
              . {RUST_ENV}\n\
              export CARGO_TARGET_DIR={dir}/target CARGO_TERM_COLOR=${{CARGO_TERM_COLOR:-always}}\n\
-             {lock}\
-             cd {dir}/src && {cmd}\n",
-            cmd = remote_command(rest),
-            // One root round at a time: the tests share fixed namespace
-            // names (`crxdp`, `crxsub`) and one tears down the other's
-            // (**measured**, 2026-10-25), and their pps numbers share CPUs.
-            lock = if exclusive {
-                format!(
-                    "exec 9>>{LOCK}\n\
-                     if ! flock -n 9; then echo \"vm-lab: waiting for $(cat {LOCK}.owner 2>/dev/null)\" >&2; flock 9; fi\n\
-                     echo \"{dir} since $(date -u +%H:%M:%SZ)\" > {LOCK}.owner\n"
-                )
-            } else {
-                String::new()
-            }
+             {body}",
+            body = round_script(&Round {
+                lock: LOCK,
+                dir: &dir,
+                cmd: &remote_command(rest),
+                exclusive,
+                timeout_s: timeout,
+                id: &round,
+                host_pid: std::process::id(),
+            }),
         );
         // `bash -c` (not a heredoc on stdin), so the command keeps a
-        // terminal-less stdin of its own and `-t` is not needed.
+        // terminal-less stdin of its own and `-t` is not needed. `env` puts
+        // the round mark in the environment every process of it inherits.
         let status = self
             .ssh()?
-            .args(["sudo", "bash", "-c"])
+            .args(["sudo", "env", &format!("{ROUND_VAR}={round}"), "bash", "-c"])
             .arg(shell_quote(&script))
             .stdin(Stdio::null())
             .status()
@@ -1109,6 +1146,471 @@ impl Lab {
             started.elapsed().as_secs_f64()
         );
         exit_like(status)
+    }
+
+    // ---- lock: status / unlock ----------------------------------------
+
+    /// The lock as the VM sees it: busy or not, the owner file and every
+    /// process that belongs to a round or has the lock file open.
+    fn lock_report(&self) -> Result<LockReport, String> {
+        let script = format!(
+            "lock={LOCK}\n\
+             if flock -n \"$lock\" true 2>/dev/null; then echo lock=free; else echo lock=busy; fi\n\
+             echo \"now=$(date +%s)\"\n\
+             echo --owner--\n\
+             cat \"$lock.owner\" 2>/dev/null\n\
+             echo --procs--\n\
+             bash -c {scan} scan \"$lock\" '' 0\n",
+            scan = shell_quote(SCAN_SH),
+        );
+        let out = self.ssh_output(&format!("sudo -n bash -c {}", shell_quote(&script)))?;
+        Ok(LockReport::parse(&out))
+    }
+
+    fn unlock(&self, args: &[String]) -> Result<(), String> {
+        let mut force = false;
+        for a in args {
+            match a.as_str() {
+                "--force" => force = true,
+                other => return Err(format!("unlock: unknown option {other}\n{HELP}")),
+            }
+        }
+        if self.require()? != "running" {
+            println!("{NAME} is not running: no round, no lock (it lives in /run)");
+            return Ok(());
+        }
+        let report = self.lock_report()?;
+        let alive = owner_alive(&report.owner);
+        print!("{}", report.describe(alive, &round_alive));
+        let to_end = orphans(&report.procs, alive, &round_alive);
+        if to_end.is_empty() {
+            if report.busy && alive == Some(true) {
+                println!(
+                    "the round holding the lock is alive on this host: wait for it, or stop that \
+                     `cargo xtask vm-lab run` (Ctrl-C) and run unlock again"
+                );
+            } else if report.busy {
+                println!(
+                    "nothing here is safe to end automatically; end the holders above by hand \
+                     (`cargo xtask vm-lab ssh sudo kill <pid>`)"
+                );
+            } else {
+                println!("nothing to clean up");
+            }
+            return Ok(());
+        }
+        if !force {
+            println!(
+                "would end {} process(es) of rounds whose `vm-lab run` is gone: {}",
+                to_end.len(),
+                pid_list(&to_end)
+            );
+            println!("run `cargo xtask vm-lab unlock --force` to end them and free the lock");
+            return Ok(());
+        }
+        let pids = pid_list(&to_end);
+        // TERM first, KILL what is still there after ~5 s.
+        let kill = format!(
+            "kill -TERM {pids} 2>/dev/null\n\
+             for i in $(seq 10); do\n\
+               alive=; for p in {pids}; do kill -0 $p 2>/dev/null && alive=\"$alive $p\"; done\n\
+               [ -z \"$alive\" ] && break; sleep 0.5\n\
+             done\n\
+             [ -n \"$alive\" ] && kill -KILL $alive\n\
+             flock -n {LOCK} sh -c ': > {LOCK}.owner' 2>/dev/null\n\
+             true\n"
+        );
+        self.ssh_output(&format!("sudo -n bash -c {}", shell_quote(&kill)))?;
+        println!("ended: {pids}");
+        let after = self.lock_report()?;
+        if after.busy {
+            let alive = owner_alive(&after.owner);
+            print!("{}", after.describe(alive, &round_alive));
+            Err("the lock is still held".into())
+        } else {
+            println!("the VM lock is free");
+            Ok(())
+        }
+    }
+}
+
+/// What a `run` script needs to know about its round.
+struct Round<'a> {
+    lock: &'a str,
+    /// `/srv/lab/<worktree>`; the command runs in `<dir>/src`.
+    dir: &'a str,
+    /// Already a shell line (`remote_command`).
+    cmd: &'a str,
+    exclusive: bool,
+    timeout_s: u64,
+    id: &'a str,
+    host_pid: u32,
+}
+
+/// Lists the processes of a round (`$2`, or every round when empty) and
+/// the ones holding the lock file `$1` open, skipping pid `$3`: one line
+/// `pid<TAB>round<TAB>hold|wait|-<TAB>age s<TAB>command` each. Runs without
+/// the round mark in its own environment, so it never lists itself.
+const SCAN_SH: &str = r#"lock=$1 want=$2 skip=$3
+ino=$(stat -Lc %i "$lock" 2>/dev/null)
+waiters=" $(awk -v s=":$ino" '$2 == "->" && substr($7, length($7) - length(s) + 1) == s { print $6 }' /proc/locks 2>/dev/null | tr '\n' ' ') "
+pids=$( { grep -lazs '^COREROUTER_LAB_ROUND=' /proc/[0-9]*/environ; find /proc/[0-9]*/fd -maxdepth 1 -lname "$lock" 2>/dev/null; } | cut -d/ -f3 | sort -un)
+for pid in $pids; do
+  [ "$pid" = "$skip" ] && continue
+  round=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^COREROUTER_LAB_ROUND=//p' | head -n 1)
+  if [ -n "$want" ] && [ "$round" != "$want" ]; then continue; fi
+  fd=-
+  if find "/proc/$pid/fd" -maxdepth 1 -lname "$lock" 2>/dev/null | grep -q .; then
+    case "$waiters" in *" $pid "*) fd=wait ;; *) fd=hold ;; esac
+  fi
+  age=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
+  [ -n "$age" ] || continue
+  cmd=$(tr '\0\n\t' '   ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c 1-200)
+  printf '%s\t%s\t%s\t%s\t%s\n' "$pid" "${round:--}" "$fd" "$age" "$cmd"
+done
+"#;
+
+/// Helpers every round script starts with: `lab_owner` describes the owner
+/// file, `lab_list` turns `SCAN_SH` lines into sentences, `lab_scan <round>`
+/// runs it (into a file, never a pipe or `$( )`: a subshell of this one
+/// would carry the round mark and the lock and list itself).
+const ROUND_HELPERS_SH: &str = r#"lab_owner() {
+  o=@LOCK@.owner
+  if grep -q '^worktree=' "$o" 2>/dev/null; then
+    s=$(sed -n 's/^started=//p' "$o")
+    echo "$(sed -n 's/^worktree=//p' "$o") (host pid $(sed -n 's/^host_pid=//p' "$o"), for $(( $(date +%s) - ${s:-0} )) s)"
+  elif [ -s "$o" ]; then cat "$o"
+  else echo 'owner unknown'
+  fi
+}
+lab_list() {
+  awk -F'\t' '{ f = $3 == "hold" ? "holds the lock" : $3 == "wait" ? "waits for the lock" : "no lock"; printf "  pid %s (%s, round %s, up %s s): %s\n", $1, f, $2, $4, $5 }' "$1"
+}
+lab_scan_out=$(mktemp)
+lab_scan() {
+  env -u COREROUTER_LAB_ROUND bash -c @SCAN@ scan @LOCK@ "$1" $$ 9>&- > "$lab_scan_out"
+}
+"#;
+
+/// The exclusive part: wait for the lock (with a deadline), then sign it.
+/// Only the wait has a deadline, never the round.
+const ROUND_LOCK_SH: &str = r#"exec 9>>@LOCK@
+if ! flock -n 9; then
+  echo "vm-lab: the VM is busy: $(lab_owner); waiting up to @TIMEOUT@ s for it (--lock-timeout)" >&2
+  if ! flock -w @TIMEOUT@ 9; then
+    echo "vm-lab: gave up after @TIMEOUT@ s waiting for @LOCK@; held by $(lab_owner)" >&2
+    lab_scan ''
+    lab_list "$lab_scan_out" >&2
+    rm -f "$lab_scan_out"
+    echo 'vm-lab: `cargo xtask vm-lab unlock` shows the holders and frees the lock of a round that is gone' >&2
+    exit 75
+  fi
+fi
+printf 'worktree=%s\nround=%s\nhost_pid=%s\nstarted=%s\n' @DIR@ @ID@ @PID@ "$(date +%s)" > @LOCK@.owner
+"#;
+
+/// The command, with the lock's fd closed (`9>&-`): a daemon it starts
+/// (zebra, 2026-10-28) must not keep the lock after the round. Then the
+/// leftovers check. `cd` on a line of its own: `cd x && a & b` would put
+/// `cd x && a` in the background and run `b` outside `x`.
+const ROUND_CMD_SH: &str = r#"( cd @DIR@/src || exit 1
+@CMD@
+) 9>&-
+rc=$?
+lab_scan @ID@
+if [ -s "$lab_scan_out" ]; then
+  echo "vm-lab: warning: the command left processes running in the VM:" >&2
+  lab_list "$lab_scan_out" >&2
+  echo 'vm-lab: stop them in the test itself (trap ... EXIT); they do not hold the lock, and `cargo xtask vm-lab unlock --force` ends them' >&2
+fi
+rm -f "$lab_scan_out"
+"#;
+
+/// The part of a `run` script after the toolchain setup.
+fn round_script(r: &Round) -> String {
+    let mut s = String::from(ROUND_HELPERS_SH);
+    if r.exclusive {
+        s.push_str(ROUND_LOCK_SH);
+    }
+    s.push_str(ROUND_CMD_SH);
+    if r.exclusive {
+        // Still ours here: a clean end leaves no stale owner behind.
+        s.push_str(": > @LOCK@.owner\n");
+    }
+    s.push_str("exit $rc\n");
+    // `@CMD@` last: the command's own text is never scanned for markers.
+    s.replace("@SCAN@", &shell_quote(SCAN_SH))
+        .replace("@LOCK@", &shell_quote(r.lock))
+        .replace("@TIMEOUT@", &r.timeout_s.to_string())
+        .replace("@DIR@", &shell_quote(r.dir))
+        .replace("@ID@", &shell_quote(r.id))
+        .replace("@PID@", &r.host_pid.to_string())
+        .replace("@CMD@", r.cmd)
+}
+
+/// How a process uses the lock file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FdUse {
+    None,
+    Holds,
+    Waits,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LabProc {
+    pid: u32,
+    round: Option<String>,
+    fd: FdUse,
+    age_s: u64,
+    cmd: String,
+}
+
+/// `<LOCK>.owner`: `key=value` lines since G0.26b; one free line
+/// (`/srv/lab/<worktree> since 01:02:03Z`) from older `vm_lab.rs`.
+#[derive(Debug, PartialEq, Eq)]
+enum Owner {
+    None,
+    Round {
+        worktree: String,
+        round: String,
+        host_pid: u32,
+        started: u64,
+    },
+    Legacy(String),
+}
+
+impl Owner {
+    fn parse(text: &str) -> Self {
+        let get = |k: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(k).and_then(|r| r.strip_prefix('=')))
+                .map(str::trim)
+        };
+        match (get("worktree"), get("round")) {
+            (Some(w), Some(r)) => Owner::Round {
+                worktree: w.to_owned(),
+                round: r.to_owned(),
+                host_pid: get("host_pid").and_then(|p| p.parse().ok()).unwrap_or(0),
+                started: get("started").and_then(|p| p.parse().ok()).unwrap_or(0),
+            },
+            _ if text.trim().is_empty() => Owner::None,
+            _ => Owner::Legacy(text.trim().to_owned()),
+        }
+    }
+}
+
+struct LockReport {
+    busy: bool,
+    now: u64,
+    owner: Owner,
+    procs: Vec<LabProc>,
+}
+
+impl LockReport {
+    fn parse(text: &str) -> Self {
+        let (head, rest) = text.split_once("--owner--\n").unwrap_or((text, ""));
+        let (owner, procs) = rest.split_once("--procs--\n").unwrap_or((rest, ""));
+        let busy = head.lines().any(|l| l.trim() == "lock=busy");
+        let now = head
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("now="))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        Self {
+            busy,
+            now,
+            owner: Owner::parse(owner),
+            procs: procs.lines().filter_map(parse_proc).collect(),
+        }
+    }
+
+    /// Who holds the lock and what is running, for `status` and `unlock`.
+    fn describe(&self, owner_alive: Option<bool>, round_alive: &dyn Fn(&str) -> bool) -> String {
+        let mut s = String::new();
+        let alive = match owner_alive {
+            Some(true) => "its `vm-lab run` is alive on this host",
+            Some(false) => "its `vm-lab run` is gone",
+            None => "unknown whether its round is alive",
+        };
+        if !self.busy {
+            s.push_str("lock: free\n");
+        } else {
+            match &self.owner {
+                Owner::Round {
+                    worktree,
+                    round,
+                    host_pid,
+                    started,
+                } => s.push_str(&format!(
+                    "lock: held by {worktree} (host pid {host_pid}, round {round}) for {}; {alive}\n",
+                    human_secs(self.now.saturating_sub(*started))
+                )),
+                Owner::Legacy(text) => s.push_str(&format!(
+                    "lock: held by {text} (owner from an older vm_lab.rs); {alive}\n"
+                )),
+                Owner::None => s.push_str("lock: held, owner unknown\n"),
+            }
+        }
+        for p in &self.procs {
+            let fd = match p.fd {
+                FdUse::Holds => "holds the lock",
+                FdUse::Waits => "waits for the lock",
+                FdUse::None => "no lock",
+            };
+            let round = match &p.round {
+                Some(r) if round_alive(r) => format!("round {r}, alive"),
+                Some(r) => format!("round {r}, gone"),
+                None => "no round mark".into(),
+            };
+            s.push_str(&format!(
+                "  pid {} ({fd}; {round}; up {}): {}\n",
+                p.pid,
+                human_secs(p.age_s),
+                p.cmd
+            ));
+        }
+        s
+    }
+}
+
+fn parse_proc(line: &str) -> Option<LabProc> {
+    let mut f = line.splitn(5, '\t');
+    let pid = f.next()?.trim().parse().ok()?;
+    let round = match f.next()?.trim() {
+        "-" | "" => None,
+        r => Some(r.to_owned()),
+    };
+    let fd = match f.next()?.trim() {
+        "hold" => FdUse::Holds,
+        "wait" => FdUse::Waits,
+        _ => FdUse::None,
+    };
+    let age_s = f.next()?.trim().parse().unwrap_or(0);
+    let cmd = f.next().unwrap_or("").trim().to_owned();
+    Some(LabProc {
+        pid,
+        round,
+        fd,
+        age_s,
+        cmd,
+    })
+}
+
+/// What `unlock --force` may end: a process of a round whose `vm-lab run`
+/// is gone, or a holder of the lock without a round mark (an older
+/// `vm_lab.rs`) when the owner's round is known to be gone. Never a live
+/// round, never a waiter.
+fn orphans<'a>(
+    procs: &'a [LabProc],
+    owner_alive: Option<bool>,
+    round_alive: &dyn Fn(&str) -> bool,
+) -> Vec<&'a LabProc> {
+    procs
+        .iter()
+        .filter(|p| match &p.round {
+            Some(r) => !round_alive(r),
+            None => p.fd == FdUse::Holds && owner_alive == Some(false),
+        })
+        .collect()
+}
+
+fn pid_list(procs: &[&LabProc]) -> String {
+    procs
+        .iter()
+        .map(|p| p.pid.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// This `vm-lab run`'s round mark: `<pid>.<start time in ticks>`, so a
+/// reused pid is not taken for the same round.
+fn own_round() -> String {
+    let pid = std::process::id();
+    format!("{pid}.{}", start_ticks(pid).unwrap_or(0))
+}
+
+/// Field 22 of `/proc/<pid>/stat`.
+fn start_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `pid (comm) state …`: comm may hold spaces, so count after `)`.
+    let (_, rest) = stat.rsplit_once(')')?;
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Is the `vm-lab run` behind a round mark still running on this host?
+fn round_alive(round: &str) -> bool {
+    let Some((pid, start)) = round.split_once('.') else {
+        return false;
+    };
+    let (Ok(pid), Ok(start)) = (pid.parse::<u32>(), start.parse::<u64>()) else {
+        return false;
+    };
+    match start_ticks(pid) {
+        Some(t) => start == 0 || t == start,
+        None => false,
+    }
+}
+
+/// `None` when nobody signed the lock. An owner from an older `vm_lab.rs`
+/// is alive while some `vm-lab run` works in that worktree on this host.
+fn owner_alive(owner: &Owner) -> Option<bool> {
+    match owner {
+        Owner::None => None,
+        Owner::Round { round, .. } => Some(round_alive(round)),
+        Owner::Legacy(text) => {
+            let dir = text.split_whitespace().next().unwrap_or("");
+            let name = dir.rsplit('/').next().unwrap_or("");
+            if name.is_empty() {
+                return None;
+            }
+            Some(host_run_in(name))
+        }
+    }
+}
+
+/// Some process on this host runs `vm-lab run` from a worktree called `name`.
+fn host_run_in(name: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let path = e.path();
+        let cmdline = std::fs::read(path.join("cmdline")).unwrap_or_default();
+        let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
+        let is_run = args.iter().any(|a| *a == b"vm-lab") && args.iter().any(|a| *a == b"run");
+        is_run
+            && std::fs::read_link(path.join("cwd"))
+                .is_ok_and(|cwd| cwd.components().any(|c| c.as_os_str() == name))
+    })
+}
+
+/// `900`, `90s`, `30m`, `1h` → seconds (at most a day).
+fn parse_duration(text: &str) -> Result<u64, String> {
+    let t = text.trim();
+    let (num, mult) = if let Some(n) = t.strip_suffix('s') {
+        (n, 1)
+    } else if let Some(n) = t.strip_suffix('m') {
+        (n, 60)
+    } else if let Some(n) = t.strip_suffix('h') {
+        (n, 3600)
+    } else {
+        (t, 1)
+    };
+    let n: u64 = num
+        .parse()
+        .map_err(|_| format!("{text:?}: a number of seconds, or with s/m/h (30m)"))?;
+    let secs = n.saturating_mul(mult);
+    if secs > 24 * 3600 {
+        return Err(format!("{text:?}: at most 24h"));
+    }
+    Ok(secs)
+}
+
+fn human_secs(s: u64) -> String {
+    match s {
+        0..60 => format!("{s} s"),
+        60..3600 => format!("{}m{:02}s", s / 60, s % 60),
+        _ => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
     }
 }
 
@@ -1404,5 +1906,252 @@ mod tests {
         assert!(check_snapshot_name("clean").is_ok());
         assert!(check_snapshot_name("a b").is_err());
         assert!(check_snapshot_name("../x").is_err());
+    }
+
+    fn round<'a>(lock: &'a str, dir: &'a str, cmd: &'a str, timeout_s: u64) -> Round<'a> {
+        Round {
+            lock,
+            dir,
+            cmd,
+            exclusive: true,
+            timeout_s,
+            id: "4242.77",
+            host_pid: 4242,
+        }
+    }
+
+    #[test]
+    fn round_script_closes_the_lock_for_the_command_and_waits_with_a_deadline() {
+        let s = round_script(&round(LOCK, "/srv/lab/w", "cargo test && echo ok", 1800));
+        // The command runs with fd 9 closed (2026-10-28: zebra kept it).
+        assert!(s.contains("( cd /srv/lab/w/src || exit 1\ncargo test && echo ok\n) 9>&-"));
+        assert!(s.contains("flock -w 1800 9"));
+        // No wait without a deadline.
+        assert!(!s.contains("flock 9"));
+        assert!(s.contains("round=%s\\nhost_pid=%s"));
+        assert!(s.contains("/srv/lab/w 4242.77 4242"));
+        assert!(s.contains("exit 75"));
+        // Shared rounds take no lock but still look for leftovers.
+        let shared = round_script(&Round {
+            exclusive: false,
+            ..round(LOCK, "/srv/lab/w", "cargo build", 1800)
+        });
+        assert!(!shared.contains("flock"));
+        assert!(shared.contains("lab_scan 4242.77"));
+    }
+
+    #[test]
+    fn owner_and_report_parse() {
+        let text = "lock=busy\nnow=1000\n--owner--\nworktree=/srv/lab/w\nround=12.34\n\
+                    host_pid=12\nstarted=700\n--procs--\n\
+                    501\t12.34\thold\t300\tbash -c script\n\
+                    502\t-\thold\t290\t/usr/lib/frr/zebra -d\n\
+                    503\t-\twait\t10\tbash -c old\n\
+                    junk\n";
+        let r = LockReport::parse(text);
+        assert!(r.busy);
+        assert_eq!(r.now, 1000);
+        assert_eq!(
+            r.owner,
+            Owner::Round {
+                worktree: "/srv/lab/w".into(),
+                round: "12.34".into(),
+                host_pid: 12,
+                started: 700,
+            }
+        );
+        assert_eq!(r.procs.len(), 3);
+        assert_eq!(r.procs[1].cmd, "/usr/lib/frr/zebra -d");
+        assert_eq!(r.procs[2].fd, FdUse::Waits);
+        let d = r.describe(Some(false), &|_| false);
+        assert!(d.contains("held by /srv/lab/w (host pid 12, round 12.34) for 5m00s"));
+        assert!(d.contains("pid 502 (holds the lock; no round mark"));
+        assert_eq!(
+            Owner::parse("/srv/lab/old since 01:02:03Z\n"),
+            Owner::Legacy("/srv/lab/old since 01:02:03Z".into())
+        );
+        assert_eq!(Owner::parse("\n"), Owner::None);
+        assert!(!LockReport::parse("lock=free\nnow=1\n--owner--\n--procs--\n").busy);
+    }
+
+    #[test]
+    fn unlock_ends_only_what_a_dead_round_left() {
+        let p = |pid, round: Option<&str>, fd| LabProc {
+            pid,
+            round: round.map(str::to_owned),
+            fd,
+            age_s: 1,
+            cmd: String::new(),
+        };
+        let procs = [
+            p(1, Some("live.1"), FdUse::Holds),
+            p(2, Some("dead.1"), FdUse::None),
+            p(3, None, FdUse::Holds),
+            p(4, None, FdUse::Waits),
+        ];
+        let alive = |r: &str| r.starts_with("live");
+        let pids = |v: Vec<&LabProc>| v.iter().map(|p| p.pid).collect::<Vec<_>>();
+        // Owner gone (the 2026-10-28 case): its unmarked holder goes too.
+        assert_eq!(pids(orphans(&procs, Some(false), &alive)), [2, 3]);
+        // Owner alive or unknown: only marked leftovers of dead rounds.
+        assert_eq!(pids(orphans(&procs, Some(true), &alive)), [2]);
+        assert_eq!(pids(orphans(&procs, None, &alive)), [2]);
+    }
+
+    #[test]
+    fn rounds_are_alive_while_their_host_process_is() {
+        assert!(round_alive(&own_round()));
+        let pid = std::process::id();
+        assert!(!round_alive(&format!("{pid}.1")));
+        assert!(!round_alive("garbage"));
+        assert!(!round_alive("4000000000.5"));
+    }
+
+    #[test]
+    fn durations_parse() {
+        assert_eq!(parse_duration("900").unwrap(), 900);
+        assert_eq!(parse_duration("90s").unwrap(), 90);
+        assert_eq!(parse_duration("30m").unwrap(), 1800);
+        assert_eq!(parse_duration("1h").unwrap(), 3600);
+        assert!(parse_duration("25h").is_err());
+        assert!(parse_duration("m").is_err());
+        assert!(parse_duration("-1").is_err());
+        assert_eq!(human_secs(42), "42 s");
+        assert_eq!(human_secs(312), "5m12s");
+        assert_eq!(human_secs(3720), "1h02m");
+    }
+
+    /// The real script, run by bash on this machine with a lock file in a
+    /// temporary folder (what the VM does as root, minus the root).
+    #[cfg(target_os = "linux")]
+    mod shell {
+        use super::*;
+
+        fn scratch(tag: &str) -> PathBuf {
+            let d = std::env::temp_dir().join(format!(
+                "vm-lab-{tag}-{}-{}",
+                std::process::id(),
+                unix_now()
+            ));
+            std::fs::create_dir_all(d.join("src")).unwrap();
+            d
+        }
+
+        fn have_tools() -> bool {
+            ["bash", "flock"].iter().all(|t| {
+                Command::new(t)
+                    .arg("--version")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok()
+            })
+        }
+
+        fn lock_free(lock: &Path) -> bool {
+            Command::new("flock")
+                .arg("-n")
+                .arg(lock)
+                .arg("true")
+                .status()
+                .unwrap()
+                .success()
+        }
+
+        fn run_round(r: &Round) -> std::process::Output {
+            Command::new("env")
+                .arg(format!("{ROUND_VAR}={}", r.id))
+                .args(["bash", "-c"])
+                .arg(round_script(r))
+                .stdin(Stdio::null())
+                .output()
+                .unwrap()
+        }
+
+        /// Pids named in the `lab_list` lines of `text`.
+        fn listed_pids(text: &str) -> Vec<u32> {
+            text.lines()
+                .filter_map(|l| l.trim().strip_prefix("pid "))
+                .filter_map(|l| l.split_whitespace().next()?.parse().ok())
+                .collect()
+        }
+
+        #[test]
+        fn a_background_process_does_not_keep_the_lock() {
+            if !have_tools() {
+                eprintln!("skip: no bash/flock");
+                return;
+            }
+            let d = scratch("leak");
+            let lock = d.join("lock");
+            let (l, dir) = (lock.to_string_lossy(), d.to_string_lossy());
+            let id = format!("t{}.1", std::process::id());
+            let r = Round {
+                id: &id,
+                ..round(&l, &dir, "sleep 600 >/dev/null 2>&1 & echo started", 5)
+            };
+            let out = run_round(&r);
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{err}");
+            assert!(String::from_utf8_lossy(&out.stdout).contains("started"));
+            // The round ended; its `sleep` lives on but holds no lock.
+            let free = lock_free(&lock);
+            assert!(err.contains("left processes running"), "{err}");
+            assert!(err.contains("sleep 600"), "{err}");
+            let left = listed_pids(&err);
+            for pid in &left {
+                let _ = Command::new("kill").arg(pid.to_string()).status();
+            }
+            assert!(!left.is_empty());
+            assert!(free, "a process of the round kept the lock");
+            // A clean end leaves no owner behind.
+            assert_eq!(std::fs::read_to_string(d.join("lock.owner")).unwrap(), "");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn the_wait_gives_up_and_says_who_holds_it() {
+            if !have_tools() {
+                eprintln!("skip: no bash/flock");
+                return;
+            }
+            let d = scratch("wait");
+            let lock = d.join("lock");
+            std::fs::write(
+                d.join("lock.owner"),
+                "worktree=/srv/lab/other\nround=1.1\nhost_pid=1\nstarted=0\n",
+            )
+            .unwrap();
+            let mut holder = Command::new("flock")
+                .arg(&lock)
+                .args(["bash", "-c", "sleep 30\ntrue"])
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while lock_free(&lock) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let (l, dir) = (lock.to_string_lossy(), d.to_string_lossy());
+            let started = Instant::now();
+            let out = run_round(&round(&l, &dir, "echo never", 1));
+            let _ = holder.kill();
+            let _ = holder.wait();
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(75), "{err}");
+            assert!(started.elapsed() < Duration::from_secs(10));
+            assert!(!String::from_utf8_lossy(&out.stdout).contains("never"));
+            assert!(err.contains("gave up after 1 s"), "{err}");
+            assert!(err.contains("held by /srv/lab/other (host pid 1"), "{err}");
+            assert!(err.contains("holds the lock"), "{err}");
+            // Multi-line command lines (a round's own `bash -c`) stay on one line.
+            assert!(
+                err.lines()
+                    .filter(|l| l.starts_with("  pid "))
+                    .all(|l| l.contains("): ")),
+                "{err}"
+            );
+            assert!(err.contains("vm-lab unlock"), "{err}");
+            let _ = std::fs::remove_dir_all(&d);
+        }
     }
 }

@@ -300,7 +300,9 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
   `cargo xtask vm-lab run -- <comando>` copia a worktree para a VM `corerouter-lab` e roda o
   comando como root lá dentro (ex.: `cargo xtask vm-lab run -- env COREROUTER_REQUIRE_XDP=1
   cargo xtask xdp-root`). O root fica dentro da VM: o agente continua sem `sudo` no host. A
-  rodada pelo usuário (abaixo) e o runner do CI ficam como alternativas.
+  rodada pelo usuário (abaixo) e o runner do CI ficam como alternativas. Sessões usam só
+  `vm-lab run`, sem embrulhar em `flock vm/root.lock`. VM travada (espera > 15 min):
+  `cargo xtask vm-lab unlock`; regras em `docs/vm-lab.md`.
 - **Sem a VM: rodada local pelo usuário.** É o caminho
   rápido (segundos, contra ~15 min de um `workflow_dispatch` no runner do CI, **medido** em
   2026-10-24). A sessão entrega ao usuário, pela sessão principal, o comando completo na pasta
