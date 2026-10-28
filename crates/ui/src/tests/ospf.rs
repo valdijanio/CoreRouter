@@ -166,9 +166,13 @@ fn five_hundred_routers_paint_within_a_frame() {
     }
     times.sort();
     let median = times[times.len() / 2];
-    eprintln!("ospf topology, 500 routers: frame (paint + tessellate) {median:?}, median of 20 (debug build)");
-    // 16.7 ms is a 60 fps frame; the painting is a small part of it.
-    assert!(median < std::time::Duration::from_millis(16), "{median:?}");
+    eprintln!("ospf topology, 500 routers: frame (paint + tessellate) {median:?}, median of 20");
+    // 16.7 ms is a 60 fps frame: the bar for an optimized build. A debug
+    // build on a shared CI machine varies several times over, so it only
+    // catches a large regression (AGENTS.md: the CI does not fail on a
+    // benchmark, only on a large regression).
+    let limit = if cfg!(debug_assertions) { 100 } else { 16 };
+    assert!(median < std::time::Duration::from_millis(limit), "{median:?} (limit {limit} ms)");
 }
 
 #[test]
