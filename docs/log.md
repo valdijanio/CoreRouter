@@ -6230,3 +6230,21 @@ continuação indentadas).
   ping pelo rótulo 16003, SRGB movido em 1,9 ms, SR desligado em 1,4 ms. Achados da VM: o `ospfd`
   recusa `ip ospf network` na `lo` do kernel (o render deixou de escrever) e recusa prefix SID numa
   interface dummy (vira a G3.4i).
+
+- 2026-10-28 — G3.4d: TI-LFA (RFC 9855) sobre o SR da G3.4f: `ti_lfa` (`off`, `link`, `node`) em
+  `routing.ospf.segment-routing.set`, render `fast-reroute ti-lfa [node-protection]`,
+  `routing.ospf.fast-reroute.list` (cobertura, rotas com principal e reserva e pilha de rótulos, rotas sem
+  proteção com o motivo) e `routing.ospf.fast-reroute.simulate` (o corte de um vizinho, sem tocar a
+  rede). Os reservas vêm do zebra (`show ip route ospf json`, lido do socket em linhas tipadas); os
+  motivos e a simulação, de `netsim::tilfa`, uma reprodução simplificada do `ospf_ti_lfa.c`. Aba
+  Routing › OSPF › Fast Reroute. Detalhes em `docs/ospf.md`, "Fast Reroute: TI-LFA (G3.4d)".
+
+  Como testar: `corerouter-cli run routing.ospf.segment-routing.set '{"ti_lfa":"link"}'`,
+  `routing.ospf.fast-reroute.list`, `routing.ospf.fast-reroute.simulate '{"neighbor":"ether1"}'`; na VM,
+  `cargo xtask vm-lab run -- scripts/frr-sr-live.sh frr`.
+
+  FRR 10.7.1 na VM, **medido** em 2026-10-28 (UDP do iperf3, 2 000 datagramas/s, corte de R1–R2):
+  perda de portadora 12,5 ms com TI-LFA e 13,5 ms sem; corte silencioso com BFD 3 × 10 ms 59,5 ms com
+  TI-LFA e 51,0 ms só com BFD; segunda rodada 13,5 × 13,5 ms e 50,5 × 50,5 ms. A meta de < 50 ms não foi atingida no corte silencioso, e o TI-LFA não
+  muda a perda no Linux. Fidelidade: onde os dois têm reserva, `netsim` e `ospfd` saem pelo mesmo
+  vizinho; o `ospfd` não instalou o reserva que pede nó P ≠ nó Q (10.255.0.2/32 no quadrado).
