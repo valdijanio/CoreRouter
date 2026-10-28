@@ -264,5 +264,25 @@ lista de origens aceitas (§5 "RECOMMENDED"), teste ponta a ponta com dois daemo
   não casa). Sockets por protocolo não são chamados nos pacotes enviados (o `ETH_P_ALL` seria, com
   um clone cada).
 - **Latência adicional contra o ICMP comum:** veth no namespace de teste, 9,2 µs de ida e volta
-  com o respondedor em espaço de usuário (build debug, **medido**, `tests/netns_lsp.rs`). Na VM,
-  três roteadores com LDP: ver abaixo.
+  com o respondedor em espaço de usuário (build debug, **medido**, `tests/netns_lsp.rs`). Na VM do
+  laboratório (2026-10-28, build debug, **medido**, `scripts/lsp-ping-live.sh`), lsp1 → lsp3 por
+  dois saltos com os rótulos do ldpd do FRR:
+
+  | Caminho | mín. | mediana / média | p95 | máx. |
+  |---|---|---|---|---|
+  | ICMP do kernel (`ping`, 200 pacotes) | 11 µs | 17 µs (média) | — | 39 µs |
+  | LSP ping (200 pedidos, respondedor do CoreRouter em lsp3) | 69 µs | 90 µs (mediana) | 590 µs | 4,0 ms |
+
+  O custo a mais (~70 µs) é o do respondedor em espaço de usuário (cópia do tap, `poll`, resposta
+  por socket UDP), contra o echo do kernel, e o build debug. Para um teste de LSP não pesa; a
+  cauda de 4 ms é o escalonamento da VM.
+
+### Teste real (VM)
+
+`flock vm/root.lock cargo xtask vm-lab run -- scripts/lsp-ping-live.sh`: três namespaces, cada um com
+zebra + ospfd + ldpd do FRR 10.7.1 e MPLS do kernel. O ldpd distribuiu os rótulos (lsp1 empilha 17
+para 10.255.0.3, lsp2 retira: PHP). Resultado (`tests/lsp_live.rs`, **medido**): 200 de 200 pings
+com código 3 do egress; traceroute com o salto 1 (lsp2) "label switched" e `implicit-null`
+abaixo, salto 2 (lsp3) egress; rótulo desconhecido com TTL 1 → código 11 em lsp2. O `netns_lsp`
+com `mpls_router` também passou na VM (TTL que expira no LSR de trânsito, código 10 quando o rótulo
+é de outro mapeamento).
