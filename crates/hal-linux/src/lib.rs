@@ -279,9 +279,10 @@ mod linux {
             let mut claims = self.claims.clone();
             claims.extend(claims_of(to));
             let managed: std::collections::BTreeSet<IfName> = match self.view(&claims) {
+                // Not the OS loopback (G3.4i): RA never reaches `lo`.
                 Ok(v) => v
                     .into_iter()
-                    .filter(|(_, o)| *o == Owner::Managed)
+                    .filter(|(l, o)| *o == Owner::Managed && l.arphrd != owner::ARPHRD_LOOPBACK)
                     .filter_map(|(l, _)| l.name.parse().ok())
                     .collect(),
                 Err(e) => {
@@ -644,7 +645,7 @@ mod linux {
             Ok(self
                 .view(&self.claims)?
                 .into_iter()
-                .filter(|(_, o)| *o == Owner::Managed)
+                .filter(|(l, o)| *o == Owner::Managed && l.arphrd != owner::ARPHRD_LOOPBACK)
                 .filter_map(|(l, _)| {
                     Some(LinkInfo {
                         name: l.name.parse().ok()?,
@@ -994,15 +995,27 @@ mod linux {
                     .master
                     .and_then(|i| by_index.get(&i))
                     .and_then(|m| m.parse().ok());
-                let snap = LinkSnap {
+                let mut snap = LinkSnap {
                     up: l.up,
                     mtu: l.mtu,
                     master,
                 };
+                // The OS loopback's state and MTU are the OS's (G3.4i): what
+                // the config says, so they are never drift to repair.
+                if l.arphrd == owner::ARPHRD_LOOPBACK
+                    && let Some(want) = corerouter_hal::drift::expected_links(cfg).remove(&name)
+                {
+                    snap = want;
+                }
                 links.insert(name.clone(), snap);
                 managed.insert(l.index, name);
             }
-            let (addresses, routes) = crate::netlink::held(&managed)?;
+            let (mut addresses, routes) = crate::netlink::held(&managed)?;
+            // 127.0.0.1/8 and ::1 on `lo` are the OS's, never CoreRouter's.
+            addresses.retain(|(link, a)| {
+                !(corerouter_model::os_loopback::is_os_loopback(cfg, link)
+                    && corerouter_model::os_loopback::is_os_address(a))
+            });
             Ok(Snapshot {
                 links,
                 addresses,

@@ -162,8 +162,13 @@ do banco SR. O RouterOS não tem SR: os nomes são os do IOS-XR e do FRR.
   (`mpls_router`), como o resto do `/mpls`.
 - **Loopback na `lo` (G3.4i):** o `ospfd` só aceita prefix SID numa interface IFF_LOOPBACK (a
   `lo` do Linux); a loopback do CoreRouter é um `dummy` no Linux e o FRR a recusa (medido na VM:
-  `interface crsr-lo is not a Loopback`). Até a G3.4i, a prévia avisa quando há FRR de verdade. O
-  render não escreve tipo de rede na `lo` (o `ospfd` recusa: "This is a loopback interface").
+  `interface crsr-lo is not a Loopback`). Por isso a loopback chamada `lo` é a `lo` do sistema
+  (G3.4i, como a `lo` do RouterOS v7 e a `interfaces loopback lo` do VyOS): o hal-linux só põe e
+  tira os endereços do CoreRouter nela, nunca a cria, apaga, desliga ou muda o MTU, e nunca toca no
+  127.0.0.1/8 nem no ::1 (o engine recusa esses endereços na `lo`). Desativar a `lo` tira os nossos
+  endereços sem derrubar a `lo` do kernel. A prévia avisa quando o prefix SID está numa loopback
+  com outro nome e há FRR de verdade. O render não escreve tipo de rede na `lo` (o `ospfd` recusa:
+  "This is a loopback interface").
 
 ### Janela Routing › OSPF › Segment Routing
 

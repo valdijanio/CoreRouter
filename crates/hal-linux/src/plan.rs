@@ -41,6 +41,7 @@ use std::fmt;
 use corerouter_hal::HalError;
 use corerouter_hal::drift::{self, Snapshot, active_addresses, master};
 pub use corerouter_hal::drift::{KernelRoute, kernel_routes};
+use corerouter_model::os_loopback::{is_os_address, is_os_loopback};
 use corerouter_model::{BondMode, Config, HashPolicy, IfName, InterfaceKind, LacpRate};
 use ipnet::IpNet;
 
@@ -570,7 +571,29 @@ pub fn plan(from: &Config, to: &Config) -> Result<Vec<Op>, HalError> {
         }
     }
 
+    ops.retain(|op| !os_owned(op, from, to));
     Ok(ops)
+}
+
+/// What on the OS loopback stays the OS's (G3.4i, `os_loopback`): `lo` is
+/// never created, deleted, enslaved, resized nor taken down, and its
+/// 127.0.0.0/8 and ::1 are never touched. Only CoreRouter's addresses and
+/// routes on it go through.
+fn os_owned(op: &Op, from: &Config, to: &Config) -> bool {
+    let link = op.link();
+    if !is_os_loopback(from, link) && !is_os_loopback(to, link) {
+        return false;
+    }
+    match op {
+        Op::AddAddress { addr, .. } | Op::DelAddress { addr, .. } => is_os_address(addr),
+        Op::AddRoute(_) | Op::DelRoute(_) => false,
+        Op::SetMaster { .. }
+        | Op::DeleteLink { .. }
+        | Op::CreateLink { .. }
+        | Op::SetBond { .. }
+        | Op::SetMtu { .. }
+        | Op::SetUp { .. } => true,
+    }
 }
 
 /// The operations that put back what `cfg` (the applied config) holds in
@@ -684,6 +707,7 @@ pub fn repair(cfg: &Config, have: &Snapshot) -> Vec<Op> {
             ops.push(Op::AddRoute(r.clone()));
         }
     }
+    ops.retain(|op| !os_owned(op, cfg, cfg));
     ops
 }
 
@@ -1603,5 +1627,91 @@ mod tests {
         have.addresses.retain(|(l, _)| *l != n("ether1"));
         have.routes.clear();
         assert_eq!(repair(&c, &have), Vec::new());
+    }
+
+    /// G3.4i: the model's `lo` is the OS loopback. Its /32 and /128 go on
+    /// the kernel's `lo`; the link itself and 127.0.0.1 / ::1 are the OS's.
+    #[test]
+    fn os_loopback_only_gets_addresses() {
+        let from = base();
+        let mut to = base();
+        add(&mut to, "lo", InterfaceKind::Loopback);
+        addr(&mut to, "lo", "10.255.0.1/32");
+        addr(&mut to, "lo", "2001:db8::1/128");
+        addr(&mut to, "lo", "127.0.0.1/8");
+        addr(&mut to, "lo", "::1/128");
+        let ops = plan(&from, &to).unwrap();
+        assert_eq!(
+            ops,
+            vec![
+                Op::AddAddress {
+                    link: n("lo"),
+                    addr: "10.255.0.1/32".parse().unwrap()
+                },
+                Op::AddAddress {
+                    link: n("lo"),
+                    addr: "2001:db8::1/128".parse().unwrap()
+                },
+            ],
+            "no create, MTU or up on lo, and never 127.0.0.1/::1"
+        );
+
+        // Disabling it removes CoreRouter's addresses, never takes lo down.
+        let mut off = to.clone();
+        off.interfaces.get_mut(&n("lo")).unwrap().disabled = true;
+        let ops = plan(&to, &off).unwrap();
+        assert!(
+            ops.iter().all(|o| matches!(o, Op::DelAddress { .. })),
+            "{ops:#?}"
+        );
+        assert_eq!(ops.len(), 2);
+
+        // Removing it from the config: addresses only, never a delete.
+        let ops = plan(&to, &from).unwrap();
+        assert!(
+            ops.iter().all(|o| matches!(o, Op::DelAddress { .. })),
+            "{ops:#?}"
+        );
+        assert_eq!(ops.len(), 2);
+
+        // A loopback with another name is still a dummy.
+        let mut dummy = base();
+        add(&mut dummy, "lo0", InterfaceKind::Loopback);
+        let ops = plan(&from, &dummy).unwrap();
+        assert!(ops.contains(&Op::CreateLink {
+            link: n("lo0"),
+            spec: LinkSpec::Dummy
+        }));
+    }
+
+    #[test]
+    fn repair_never_strips_the_os_addresses_of_lo() {
+        let mut c = base();
+        add(&mut c, "lo", InterfaceKind::Loopback);
+        addr(&mut c, "lo", "10.255.0.1/32");
+        let mut have = drift::expected(&c);
+        // The kernel holds lo up with MTU 65536, 127.0.0.1/8 and ::1 too.
+        if let Some(l) = have.links.get_mut(&n("lo")) {
+            l.mtu = 65536;
+        }
+        have.addresses
+            .insert((n("lo"), "127.0.0.1/8".parse().unwrap()));
+        have.addresses.insert((n("lo"), "::1/128".parse().unwrap()));
+        have.addresses
+            .remove(&(n("lo"), "10.255.0.1/32".parse().unwrap()));
+        assert_eq!(
+            repair(&c, &have),
+            vec![Op::AddAddress {
+                link: n("lo"),
+                addr: "10.255.0.1/32".parse().unwrap()
+            }]
+        );
+        // Gone from the kernel (cannot happen to lo): never recreated.
+        have.links.remove(&n("lo"));
+        assert!(
+            repair(&c, &have)
+                .iter()
+                .all(|o| !matches!(o, Op::CreateLink { .. }))
+        );
     }
 }

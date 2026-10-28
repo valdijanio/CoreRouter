@@ -15,6 +15,7 @@ use std::net::Ipv6Addr;
 
 use ipnet::IpNet;
 
+use corerouter_model::os_loopback;
 use corerouter_model::route::{self, FIRST_VRF_TABLE, LAST_VRF_TABLE, Reach};
 use corerouter_model::sections::Sections;
 use corerouter_model::{
@@ -212,6 +213,7 @@ fn interface_checks(cfg: &Config) -> Vec<Issue> {
                 ));
             }
         }
+        os_loopback_checks(name, iface, &mut out);
         if !(68..=9216).contains(&iface.mtu) {
             out.push(Issue::new(
                 format!("interfaces.{name}.mtu"),
@@ -220,6 +222,29 @@ fn interface_checks(cfg: &Config) -> Vec<Issue> {
         }
     }
     out
+}
+
+/// `lo` is the OS loopback (G3.4i, `os_loopback`): only a loopback takes
+/// the name, and the kernel's `lo` joins no VRF, bridge or bond.
+fn os_loopback_checks(name: &IfName, iface: &Interface, out: &mut Vec<Issue>) {
+    if name.as_str() != os_loopback::NAME {
+        return;
+    }
+    if iface.kind != InterfaceKind::Loopback {
+        out.push(Issue::new(
+            format!("interfaces.{name}"),
+            format!(
+                "'{name}' is the OS loopback: only a loopback interface takes the name (this one is {})",
+                iface.kind.label()
+            ),
+        ));
+    }
+    if iface.vrf.is_some() || iface.bridge.is_some() || iface.bond.is_some() {
+        out.push(Issue::new(
+            format!("interfaces.{name}"),
+            format!("'{name}' is the OS loopback and joins no VRF, bridge or bond; use another loopback"),
+        ));
+    }
 }
 
 fn address_checks(cfg: &Config) -> Vec<Issue> {
@@ -237,6 +262,15 @@ fn address_checks(cfg: &Config) -> Vec<Issue> {
             out.push(Issue::new(
                 format!("ip.addresses[{}].interface", a.id),
                 format!("interface '{}' does not exist", a.interface),
+            ));
+        }
+        if os_loopback::is_os_loopback(cfg, &a.interface) && os_loopback::is_os_address(&a.address) {
+            out.push(Issue::new(
+                format!("ip.addresses[{}].address", a.id),
+                format!(
+                    "{} is the OS's own on '{}' (127.0.0.0/8 and ::1 are always there and are never CoreRouter's)",
+                    a.address, a.interface
+                ),
             ));
         }
         if let IpNet::V6(net) = a.address

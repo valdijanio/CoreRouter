@@ -131,8 +131,12 @@ pub const PLATFORM_CRATES: &[&str] = &[
 
 /// Platform crates a platform crate below the apps may use: the loader and
 /// the programs it loads (G2.5).
-pub const PLATFORM_ALLOWED: &[(&str, &str)] =
-    &[("corerouter-hal-linux", "corerouter-dataplane-ebpf-common")];
+pub const PLATFORM_ALLOWED: &[(&str, &str)] = &[
+    ("corerouter-hal-linux", "corerouter-dataplane-ebpf-common"),
+    // G3.4i, a dev-dependency of the lab VM test only: R1's loopback goes
+    // to the kernel's lo through LinuxHal before FRR takes its prefix SID.
+    ("corerouter-hal-frr", "corerouter-hal-linux"),
+];
 pub const APP_LAYER: u8 = 6;
 pub const TOOLING_LAYER: u8 = 7;
 
