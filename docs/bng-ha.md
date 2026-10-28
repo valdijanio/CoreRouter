@@ -540,7 +540,28 @@ testemunha derrubaria o acesso de todos: fica o debounce de 3 s, como antes).
   resultado do par.
 - **Motor BFD:** o tap ouve a perda 117 ms depois de o par parar (detecção de 150 ms contada do
   último pacote recebido), na thread do motor.
-- **VM com BNG Blaster:** tabela abaixo.
+- **VM com BNG Blaster** (`corerouter-lab`, 8 vCPUs, kernel 7.0, release, BNG Blaster 1.0.1,
+  sem root: caminho lento; 2026-10-28; `cargo xtask vm-lab run -- env BNG_LAB_HA_BFD=fast cargo
+  xtask bng-lab --only ha --scales …`). O ativo perde a energia (todas as portas caem juntas).
+  "Tomada", "Todas no nó novo" e "Tráfego de volta" são contados do corte; a linha do tempo de C,
+  do último sinal de vida de A:
+
+  | Sessões | Detecção | Tomada | Linha do tempo em C (detectado / testemunha / ativo / adotadas) | Todas no nó novo | Tráfego de subida de volta | Sessões perdidas |
+  |---:|---|---:|---|---:|---:|---:|
+  | 1 000 | hellos (1,2 s) | 0,96 s | 1208 / 840 / 1208 / 1216 ms | 0,97 s | 0,98 s | 0 |
+  | 10 000 | hellos | 1,18 s | 1203 / – / 1203 / – ms | 1,30 s | 1,32 s | 0 |
+  | 100 000 | hellos | 1,15 s | 1209 / 907 / 1209 / 1927 ms | 1,85 s | 1,88 s | 0 |
+  | 1 000 | BFD `fast` (150 ms) | 0,16 s | 150 / 151 / 160 / 163 ms | 0,17 s | **0,19 s** | 0 |
+  | 10 000 | BFD `fast` | 0,13 s | 150 / 150 / 150 / 247 ms | 0,24 s | **0,25 s** | 0 |
+  | 100 000 | BFD `fast` | 0,20 s | 150 / 154 / 154 / 911 ms | 1,00 s | **1,04 s** | 0 |
+
+  Em todas: os mesmos Acct-Session-Id, nenhum Stop, um Interim de C por sessão, o Class de cada
+  usuário preservado. A 1 000 sessões de 1 000, a primeira rodada (antes do laço acordar pelo
+  evento) dava ativo a 160 ms; com o evento, 150–154 ms.
+
+  **A meta de < 200 ms vale até ~10 mil sessões.** Acima, quem domina é a adoção no caminho lento
+  (a rota de cada sessão no kernel): 100 mil levam ~0,72–0,76 s com e sem BFD. A detecção já não
+  pesa. Fica na gap G4.3hh (adoção em lote).
 
 ## 3. Testes
 
