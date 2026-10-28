@@ -51,8 +51,10 @@ fn spec(peer: IpAddr, local: Option<IpAddr>, prof: &BfdProfile) -> Spec {
     }
 }
 
+/// Below the ephemeral range (32768–60999): an ephemeral port of another
+/// test (iperf's UDP streams use SO_REUSEPORT too) never lands on these.
 fn ports() -> (u16, u16) {
-    let base = 20_000 + (std::process::id() % 20_000) as u16 / 4 * 4;
+    let base = 21_000 + (std::process::id() % 1_000) as u16 * 4;
     (base, base + 2)
 }
 
@@ -205,4 +207,163 @@ fn load() {
             println!("{}", load_run(sessions, threads, secs));
         }
     }
+}
+
+/// G3.6b: the engine as bfdd's data plane. A fake bfdd (a Unix socket)
+/// hands it a session; a second engine is the peer. bfdd must hear Up,
+/// then Down with Diag 1 when the peer goes, and get its counters.
+#[test]
+fn data_plane_for_a_fake_bfdd() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+
+    use corerouter_proto_bfd::dplane as dp;
+
+    use super::{Controller, dplane};
+
+    let (pa, pb) = ports();
+    let (pa, pb) = (pa + 2000, pb + 2000);
+    let dir = std::env::temp_dir().join(format!("g36b-dplane-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bfdd_dplane.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+
+    let health = crate::service::Health::new(corerouter_control::Shutdown::default());
+    let (tx, rx) = std::sync::mpsc::sync_channel(dplane::QUEUE);
+    let h = health.clone();
+    let p = path.clone();
+    thread::spawn(move || dplane::run(p, tx, h));
+    let (mut bfdd, _) = listener.accept().unwrap();
+    bfdd.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+
+    let mut ctl = Controller {
+        threads: Some(2),
+        dplane: true,
+        opts: Options {
+            threads: 2,
+            bind4: Some("127.0.0.1".parse().unwrap()),
+            bind6: None,
+            port_single: pa,
+            port_multi: pa + 1,
+            peer_ports: Some((pb, pb + 1)),
+        },
+        ..Controller::default()
+    };
+    let cfg = corerouter_model::Config::default();
+    let mut msg = Vec::new();
+    dp::encode_session(
+        dp::DP_ADD_SESSION,
+        &dp::DpSession {
+            flags: 0,
+            src: "127.0.0.1".parse().unwrap(),
+            dst: "127.0.0.2".parse().unwrap(),
+            lid: 0x0001_1001,
+            min_tx: 50_000,
+            min_rx: 50_000,
+            min_echo_tx: 0,
+            min_echo_rx: 0,
+            hold_time: 0,
+            ttl: 255,
+            detect_mult: 3,
+            ifindex: 0,
+            ifname: String::new(),
+        },
+        &mut msg,
+    );
+    bfdd.write_all(&msg).unwrap();
+    // The peer.
+    let mut b = engine("127.0.0.2".parse().unwrap(), pb, pa, 1);
+    let mut sb = spec("127.0.0.1".parse().unwrap(), None, &BfdProfile::new("fast", 50, 3));
+    sb.damp = None;
+    b.add(sb, None);
+
+    // Pumps the controller like its loop; returns bfdd's state changes.
+    let mut inbuf: Vec<u8> = Vec::new();
+    let mut pump = |ctl: &mut Controller, bfdd: &mut std::os::unix::net::UnixStream| -> Vec<dp::StateChange> {
+        while let Ok(m) = rx.try_recv() {
+            ctl.on_bfdd(m, &cfg, &health);
+        }
+        let mut evs = Vec::new();
+        if let Some(e) = &ctl.engine {
+            while let Ok(ev) = e.events.try_recv() {
+                evs.push(ev);
+            }
+        }
+        ctl.tell_bfdd(&evs);
+        let mut chunk = [0u8; 1024];
+        if let Ok(n) = bfdd.read(&mut chunk) {
+            inbuf.extend_from_slice(&chunk[..n]);
+        }
+        let mut out = Vec::new();
+        while let Ok(Some(h)) = dp::header(&inbuf) {
+            let len = usize::from(h.length);
+            if inbuf.len() < len {
+                break;
+            }
+            if h.kind == dp::BFD_STATE_CHANGE {
+                let p = &inbuf[8..len];
+                let be = |i: usize| u32::from_be_bytes(p[i..i + 4].try_into().unwrap());
+                out.push(dp::StateChange {
+                    lid: be(0),
+                    rid: be(4),
+                    remote_flags: be(8),
+                    desired_tx: be(12),
+                    required_rx: be(16),
+                    required_echo_rx: be(20),
+                    state: p[24],
+                    diagnostics: p[25],
+                    detect_mult: p[26],
+                });
+            } else if h.kind == dp::BFD_SESSION_COUNTERS {
+                assert_eq!(h.id, 77);
+                out.push(dp::StateChange {
+                    lid: 0,
+                    rid: 0,
+                    remote_flags: 0,
+                    desired_tx: 0,
+                    required_rx: 0,
+                    required_echo_rx: 0,
+                    state: 99,
+                    diagnostics: 0,
+                    detect_mult: 0,
+                });
+            }
+            inbuf.drain(..len);
+        }
+        out
+    };
+    let t = Instant::now();
+    let mut up = None;
+    while t.elapsed() < Duration::from_secs(5) && up.is_none() {
+        up = pump(&mut ctl, &mut bfdd).into_iter().find(|s| s.state == 3);
+    }
+    let up = up.expect("bfdd heard Up");
+    assert_eq!(up.lid, 0x0001_1001);
+    assert_ne!(up.rid, 0);
+    assert_eq!(up.detect_mult, 3);
+    assert_eq!(ctl.engine.as_ref().unwrap().steering, "reuseport-cbpf");
+    // Counters on request, with the request's id.
+    let mut req = vec![1, 0, 0, 5, 0, 77, 0, 12];
+    req.extend_from_slice(&0x0001_1001u32.to_be_bytes());
+    bfdd.write_all(&req).unwrap();
+    let t = Instant::now();
+    let mut counted = false;
+    while t.elapsed() < Duration::from_secs(2) && !counted {
+        counted = pump(&mut ctl, &mut bfdd).iter().any(|s| s.state == 99);
+    }
+    assert!(counted, "no counters");
+    // The peer goes: Down, Diag 1, within the detection time.
+    let t = Instant::now();
+    drop(b);
+    let mut down = None;
+    while t.elapsed() < Duration::from_secs(2) && down.is_none() {
+        down = pump(&mut ctl, &mut bfdd).into_iter().find(|s| s.state == 1);
+    }
+    let took = t.elapsed();
+    let down = down.expect("bfdd heard Down");
+    assert_eq!(down.diagnostics, 1);
+    assert!(took <= Duration::from_millis(250), "{took:?}");
+    health.stop();
+    let _ = std::fs::remove_dir_all(&dir);
 }

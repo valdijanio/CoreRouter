@@ -15,6 +15,8 @@ corerouter-firewall.workspace = true
 corerouter-proto-bgp.workspace = true
 corerouter-proto-ospf.workspace = true
 corerouter-proto-mpls.workspace = true
+# G3.6b: the BFD commit checks (profiles named by BGP, OSPF and peers).
+corerouter-proto-bfd.workspace = true
 corerouter-proto-cgnat.workspace = true
 corerouter-proto-dns.workspace = true
 corerouter-proto-dhcp.workspace = true

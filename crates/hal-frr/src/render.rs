@@ -85,6 +85,8 @@ pub const OWNED: Owned = &[
     // G3.5: LDP, and zebra's label block when `/mpls settings` narrows it.
     ("mpls ldp", &[Daemon::Ldpd]),
     ("mpls label dynamic-block", &[Daemon::Zebra]),
+    // G3.6b: profiles and peers for bfdd (CoreRouter's engine is its data plane).
+    ("bfd", &[Daemon::Bfdd]),
 ];
 
 /// A table of owned contexts: header prefix → daemons that take it.
@@ -157,6 +159,7 @@ pub fn render(cfg: &Config, open: corerouter_proto_bgp::Opener<'_>) -> Result<Co
         corerouter_proto_bgp::render_all(&cfg.routing, open).map_err(RenderError::Proto)?;
     // G3.4: the same key opener (both seal with the engine's key).
     text.push_str(&corerouter_proto_ospf::frr::render(cfg, open).map_err(RenderError::Proto)?);
+    text.push_str(&corerouter_proto_bfd::frr::render(cfg));
     text.push_str(
         &corerouter_proto_mpls::render_frr(&cfg.routing.mpls, open).map_err(RenderError::Proto)?,
     );
