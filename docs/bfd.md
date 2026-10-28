@@ -8,7 +8,7 @@ BFD e esses protocolos é a parte (b) do G3.6.
 |---|---|---|
 | G3.6a | Codec, máquina de estados, autenticação SHA1, dampening, motor multithread, perfis, peers, sessões, histórico | este documento |
 | G3.6b | Ligação com o FRR (BGP/OSPF caem com o BFD) como data plane do `bfdd`, BFD nas conexões e templates BGP, `routing.bfd.attach` | ver "Ligação com o FRR" |
-| G3.6c | Janela Routing › BFD (Sessions, Profiles, History) | aberto |
+| G3.6c | Janela Routing › BFD (Sessions, Profiles, History), perfil BFD no modal BGP | ver "Janela" |
 
 ## Como usar
 
@@ -91,6 +91,21 @@ corerouter-cli run routing.bfd.profile.list
   é 1024), e os receptores separam por discriminador e endereço, não pela porta.
 - **Espera em µs (`ppoll`)**: com o `poll` em milissegundos cada pacote saía até 1 ms atrasado.
 - O motor só abre as portas com a primeira sessão e fecha com a última.
+
+## Janela Routing › BFD (G3.6c)
+
+- **Sessions:** uma linha por sessão: Peer (selo `multihop`), Used by (selos coloridos por nome:
+  `BGP upstream-a`, `OSPF ether1`, `peer core1`), State (`up`, `down`, `init`, `dampened`,
+  `inactive`), Tx/Rx, Detect Time, Jitter p99, Flaps 24h. Barra: + e − de peers (uma sessão do
+  BGP ou do OSPF não se remove aqui: diz onde desligar), **Use BFD Everywhere**
+  (`routing.bfd.attach`). Rodapé: contagens e o motor (threads, CPU de cada uma, `reuseport-cbpf`).
+- **Profiles:** a lista com selo `built-in`, Options (`dampening`, `passive`, `sha1`) e quem usa;
+  o modal tem a prévia do engine (`routing.bfd.profile.preview`: tempo de detecção, pacotes por
+  segundo, aviso de CPU abaixo de 100 ms, multiplicador baixo, dampening, autenticação).
+- **History:** as mudanças, a mais nova primeiro, com o diagnóstico e o tempo de detecção;
+  `down » dampened` quando a sessão volta mas fica segura, `dampened » up` quando é liberada.
+- O modal de conexão e de template BGP ganhou o campo **BFD Profile**.
+- ⓘ em toda coluna, aba, campo e no título, em português (padrão) e inglês.
 
 ## Ligação com o FRR (G3.6b)
 

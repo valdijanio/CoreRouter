@@ -283,7 +283,7 @@ fn record(session: &Shared, events: &[engine::Event]) {
                 e.users.join(", ")
             )
         } else {
-            format!("BFD {}: {} → {}", e.key.peer, e.from.name(), e.to.name())
+            format!("BFD {}: {} » {}", e.key.peer, e.from.name(), e.to.name())
         };
         let level = if e.to == State::Down && e.from == State::Up { "warning" } else { "info" };
         // Up but held down for the clients (dampened): say so.

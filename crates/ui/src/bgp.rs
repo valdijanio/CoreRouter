@@ -84,7 +84,7 @@ const fn field(param: &'static str, label: &'static str, help: &'static str, inp
 }
 
 /// The shared parameters, in the modal's pages.
-const SESSION_PAGE: &[&str] = &["hold_time", "keepalive_time", "multihop", "update_source", "tcp_md5_key", "nexthop_choice"];
+const SESSION_PAGE: &[&str] = &["hold_time", "keepalive_time", "multihop", "bfd", "update_source", "tcp_md5_key", "nexthop_choice"];
 const LIMITS_PAGE: &[&str] = &["afi", "max_prefix_ipv4", "max_prefix_ipv6", "max_prefix_action", "max_prefix_restart"];
 /// G3.2b: the `/routing filter` chains (RFC 8212: eBGP needs both).
 const FILTERS_PAGE: &[&str] = &["input_filter", "output_filter", "keep_received"];
@@ -101,6 +101,8 @@ const CONN_FIELDS: &[Field] = &[
     field("hold_time", "Hold Time", "bgp.param.hold_time", Input::Text("180 s (0 = infinity)")),
     field("keepalive_time", "Keepalive Time", "bgp.param.keepalive_time", Input::Text("a third of the hold time")),
     field("multihop", "Multihop", "bgp.param.multihop", Input::Choice),
+    // G3.6b: the BFD profile the session follows (Routing › BFD).
+    field("bfd", "BFD Profile", "bgp.param.bfd", Input::Text("none (default, fast…)")),
     field("update_source", "Local Address", "bgp.param.update_source", Input::Text("address or interface")),
     field("tcp_md5_key", "TCP MD5 Key", "bgp.param.tcp_md5_key", Input::Secret("empty keeps it")),
     field("nexthop_choice", "Nexthop Choice", "bgp.param.nexthop_choice", Input::Choice),
@@ -123,6 +125,8 @@ const TPL_FIELDS: &[Field] = &[
     field("hold_time", "Hold Time", "bgp.param.hold_time", Input::Text("180 s (0 = infinity)")),
     field("keepalive_time", "Keepalive Time", "bgp.param.keepalive_time", Input::Text("a third of the hold time")),
     field("multihop", "Multihop", "bgp.param.multihop", Input::Choice),
+    // G3.6b: the BFD profile the session follows (Routing › BFD).
+    field("bfd", "BFD Profile", "bgp.param.bfd", Input::Text("none (default, fast…)")),
     field("update_source", "Local Address", "bgp.param.update_source", Input::Text("address or interface")),
     field("tcp_md5_key", "TCP MD5 Key", "bgp.param.tcp_md5_key", Input::Secret("empty keeps it")),
     field("nexthop_choice", "Nexthop Choice", "bgp.param.nexthop_choice", Input::Choice),

@@ -47,6 +47,12 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("routing.bfd.attach", "Use BFD Everywhere", ["Routing", "BFD"], None,
         "{protocols?: [bgp | ospf] | string (default both), profile?: string (default \"default\")} → {profile, bgp: [connection], ospf: [template id]} (only those without a profile of their own or from a template)",
         always, attach),
+    cmd!(query "routing.bfd.profile.preview", "Check BFD Profile", [], None,
+        "{id?: string (the profile being edited), name?: string, min_tx?: u32 | string, min_rx?: u32 | string, multiplier?: u8 | string, passive?: bool | yes | no, dampening?: bool | yes | no, half_life?: u32 | string, suppress?: u32 | string, reuse?: u32 | string, max_suppress?: u32 | string, auth?: string, auth_key_id?: u8 | string, auth_secret?: string, min_ttl?: u8 | string, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]} (form texts accepted; never an error: bad input is a check)",
+        always, profile_preview),
+    cmd!(query "routing.bfd.peer.preview", "Check BFD Peer", [], None,
+        "{id?: string (the peer being edited), name?: string, address?: string, local_address?: string, interface?: string, multihop?: bool | yes | no, profile?: string, disabled?: bool | yes | no, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]} (form texts accepted; never an error: bad input is a check)",
+        always, peer_preview),
     cmd!(query "routing.bfd.history.list", "BFD History", ["Routing", "BFD"], None,
         "{peer?: ip, limit?: u32 (default 200)} → [{at_ms, peer, multihop, from, to, diag, users, detect_time_us, dampened}] (newest first)",
         always, history_list),
@@ -158,33 +164,159 @@ fn profile_answer(prof: &BfdProfile) -> Value {
     json!({"name": prof.name, "detect_ms": prof.detect_ms(), "warning": warning})
 }
 
-fn profile_add(s: &mut Session, p: &Value) -> Result<Value> {
-    let name = req_str(p, "name")?;
-    corerouter_model::bfd::check_profile_name(name).map_err(|e| EngineError::bad("name", e))?;
-    let bfd = &mut s.store_mut().candidate_mut().routing.bfd;
-    if bfd.profile(name).is_some() {
-        return Err(EngineError::bad("name", format!("profile {:?} already exists (routing.bfd.profile.set)", cut(name))));
-    }
-    if bfd.profiles.len() >= MAX_PROFILES {
-        return Err(EngineError::bad("name", format!("at most {MAX_PROFILES} profiles")));
-    }
-    let mut prof = BfdProfile::new(name, 300, 3);
+/// Add (`id` None) or change a profile in `bfd`.
+fn profile_apply(bfd: &mut BfdConfig, p: &Value, id: Option<&str>) -> Result<BfdProfile> {
+    let mut prof = match id {
+        Some(id) => bfd
+            .profile(id)
+            .ok_or_else(|| EngineError::bad("id", format!("no BFD profile {:?}", cut(id))))?,
+        None => {
+            let name = req_str(p, "name")?;
+            corerouter_model::bfd::check_profile_name(name).map_err(|e| EngineError::bad("name", e))?;
+            if bfd.profile(name).is_some() {
+                return Err(EngineError::bad(
+                    "name",
+                    format!("profile {:?} already exists (routing.bfd.profile.set)", cut(name)),
+                ));
+            }
+            if bfd.profiles.len() >= MAX_PROFILES {
+                return Err(EngineError::bad("name", format!("at most {MAX_PROFILES} profiles")));
+            }
+            BfdProfile::new(name, 300, 3)
+        }
+    };
     apply_profile(&mut prof, p)?;
-    let out = profile_answer(&prof);
-    bfd.profiles.insert(name.to_owned(), prof);
-    Ok(out)
+    bfd.profiles.insert(prof.name.clone(), prof.clone());
+    Ok(prof)
+}
+
+fn profile_add(s: &mut Session, p: &Value) -> Result<Value> {
+    let prof = profile_apply(&mut s.store_mut().candidate_mut().routing.bfd, p, None)?;
+    Ok(profile_answer(&prof))
 }
 
 fn profile_set(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = req_str(p, "id")?;
-    let bfd = &mut s.store_mut().candidate_mut().routing.bfd;
-    let mut prof = bfd
-        .profile(id)
-        .ok_or_else(|| EngineError::bad("id", format!("no BFD profile {:?}", cut(id))))?;
-    apply_profile(&mut prof, p)?;
-    let out = profile_answer(&prof);
-    bfd.profiles.insert(id.to_owned(), prof);
-    Ok(out)
+    let id = req_str(p, "id")?.to_owned();
+    let prof = profile_apply(&mut s.store_mut().candidate_mut().routing.bfd, p, Some(&id))?;
+    Ok(profile_answer(&prof))
+}
+
+/// Form texts as `add`/`set` take them: numbers as numbers, yes/no as
+/// bools, an empty field left out (a profile has no unset values; a peer's
+/// optional addresses are unset by `null` on edit).
+fn normalize(p: &Value, editing: bool, numbers: &[&str], bools: &[&str], nullable: &[&str]) -> Value {
+    let Some(o) = p.as_object() else {
+        return p.clone();
+    };
+    let mut out = serde_json::Map::new();
+    for (k, v) in o {
+        let text = v.as_str().map(str::trim);
+        let v = match text {
+            Some("") if editing && nullable.contains(&k.as_str()) => Value::Null,
+            Some("") => continue,
+            Some(t) if numbers.contains(&k.as_str()) => t.parse::<u64>().map_or_else(|_| v.clone(), Value::from),
+            Some("yes" | "true") if bools.contains(&k.as_str()) => Value::Bool(true),
+            Some("no" | "false") if bools.contains(&k.as_str()) => Value::Bool(false),
+            _ => v.clone(),
+        };
+        out.insert(k.clone(), v);
+    }
+    if !editing {
+        out.remove("id");
+    }
+    Value::Object(out)
+}
+
+fn check(level: &str, check: &str, message: String, param: &str) -> Value {
+    json!({"level": level, "check": check, "message": message, "param": param})
+}
+
+fn param_error(e: EngineError) -> Value {
+    match e {
+        EngineError::BadParam { param, reason } => check("error", "param", reason, &param),
+        e => check("error", "param", e.to_string(), ""),
+    }
+}
+
+const PROFILE_NUMBERS: &[&str] = &[
+    "min_tx", "min_rx", "multiplier", "half_life", "suppress", "reuse", "max_suppress", "auth_key_id", "min_ttl",
+];
+
+/// The profile modal: detection time, packets per second, the CPU and
+/// dampening notes, and what OK sends.
+fn profile_preview(s: &mut Session, raw: &Value) -> Result<Value> {
+    let id = raw.get("id").and_then(Value::as_str).map(str::to_owned);
+    let editing = id.is_some();
+    let p = normalize(raw, editing, PROFILE_NUMBERS, &["passive", "dampening"], &[]);
+    let mut bfd = s.store().candidate().routing.bfd.clone();
+    let (mut computed, mut checks, mut commands) = (Vec::new(), Vec::new(), Vec::new());
+    match profile_apply(&mut bfd, &p, id.as_deref()) {
+        Err(e) => checks.push(param_error(e)),
+        Ok(prof) => {
+            let fastest = prof.min_tx.min(prof.min_rx).max(1);
+            computed.push(json!({"label": "Detection time", "value": format!("{} ms ({} × {} ms)", prof.detect_ms(), prof.multiplier, prof.min_tx.max(prof.min_rx))}));
+            computed.push(json!({"label": "Packets per second", "value": format!("{} each way per session", 1000 / prof.min_tx.max(1))}));
+            computed.push(json!({"label": "Until up", "value": "1 s timers (RFC 5880 §6.8.3), then these through a Poll"}));
+            if fastest < FAST_WARN_MS {
+                checks.push(check("warning", "cpu", profile_answer(&prof).get("warning").and_then(Value::as_str).unwrap_or_default().to_owned(), "min_tx"));
+            }
+            if prof.multiplier < 3 {
+                checks.push(check("warning", "multiplier", format!("multiplier {}: one or two lost packets bring the session down (3 is the usual)", prof.multiplier), "multiplier"));
+            }
+            if prof.dampening.enabled {
+                checks.push(check("info", "dampening", format!("dampening on: about 3 flaps within {} s keep the session down for its clients until it is quiet", prof.dampening.half_life), "dampening"));
+            } else {
+                checks.push(check("info", "dampening", "dampening off: a flapping link takes BGP and OSPF down and up with it".into(), "dampening"));
+            }
+            if prof.auth == BfdAuth::None {
+                checks.push(check("info", "auth", "no authentication: fine on a link; across hops (multihop) prefer meticulous-keyed-sha1 (RFC 5883 §6)".into(), "auth"));
+            }
+            let users = users_of(&bfd, &prof.name);
+            if editing && !users.is_empty() {
+                checks.push(check("info", "users", format!("used by {}: new timers go through a Poll Sequence, the sessions stay up", users.join(", ")), ""));
+            }
+            let command = if editing { "routing.bfd.profile.set" } else { "routing.bfd.profile.add" };
+            commands.push(json!({"command": command, "params": p}));
+        }
+    }
+    Ok(json!({"computed": computed, "checks": checks, "commands": commands}))
+}
+
+/// The peer modal: the session it makes, what already uses that address.
+fn peer_preview(s: &mut Session, raw: &Value) -> Result<Value> {
+    let id = raw.get("id").and_then(Value::as_str).map(str::to_owned);
+    let editing = id.is_some();
+    let p = normalize(raw, editing, &[], &["multihop", "disabled"], &["local_address", "interface"]);
+    let mut bfd = s.store().candidate().routing.bfd.clone();
+    let (mut computed, mut checks, mut commands) = (Vec::new(), Vec::new(), Vec::new());
+    match apply_peer(&mut bfd, &p, id.as_deref()) {
+        Err(e) => checks.push(param_error(e)),
+        Ok(name) => {
+            if let Some(peer) = bfd.peers.get(&name) {
+                let port = if peer.multihop { "4784 (multihop, RFC 5883)" } else { "3784 (single hop, RFC 5881: TTL 255)" };
+                computed.push(json!({"label": "Session", "value": format!("{}, UDP {port}", peer.address)}));
+                if let Some(prof) = bfd.profile(&peer.profile) {
+                    computed.push(json!({"label": "Detection time", "value": format!("{} ms", prof.detect_ms())}));
+                }
+                let routing = &s.store().candidate().routing;
+                let bgp: Vec<&str> = routing
+                    .bgp_connections
+                    .values()
+                    .filter(|c| c.remote_address == peer.address)
+                    .map(|c| c.name.as_str())
+                    .collect();
+                if !bgp.is_empty() {
+                    checks.push(check("info", "bgp", format!("BGP {} talks to this address: its own bfd profile (routing.bgp.connection.set bfd=…) makes BGP follow the session", bgp.join(", ")), ""));
+                }
+                if peer.multihop && bfd.profile(&peer.profile).is_some_and(|p| p.auth == BfdAuth::None) {
+                    checks.push(check("warning", "auth", "multihop without authentication: anyone on the path can bring it down (RFC 5883 §6)".into(), "profile"));
+                }
+            }
+            let command = if editing { "routing.bfd.peer.set" } else { "routing.bfd.peer.add" };
+            commands.push(json!({"command": command, "params": p}));
+        }
+    }
+    Ok(json!({"computed": computed, "checks": checks, "commands": commands}))
 }
 
 fn users_of(bfd: &BfdConfig, profile: &str) -> Vec<String> {
@@ -661,6 +793,34 @@ mod tests {
         assert!(s.execute("routing.bfd.attach", &json!({"protocols": "isis"})).is_err());
         let r = s.execute("routing.bfd.attach", &json!({})).unwrap();
         assert_eq!(r["bgp"], json!([]));
+    }
+
+    #[test]
+    fn previews_check_without_changing_anything() {
+        let mut s = session();
+        let r = s
+            .execute("routing.bfd.profile.preview", &json!({"name": "edge", "min_tx": "20", "min_rx": "20", "multiplier": "2", "dampening": "no"}))
+            .unwrap();
+        assert_eq!(r["computed"][0]["value"], "40 ms (2 × 20 ms)");
+        let levels: Vec<&str> = r["checks"].as_array().unwrap().iter().map(|c| c["check"].as_str().unwrap()).collect();
+        assert!(levels.contains(&"cpu") && levels.contains(&"multiplier"), "{levels:?}");
+        assert_eq!(r["commands"][0]["command"], "routing.bfd.profile.add");
+        assert_eq!(r["commands"][0]["params"]["min_tx"], 20);
+        assert_eq!(r["commands"][0]["params"]["dampening"], false);
+        let r = s.execute("routing.bfd.profile.preview", &json!({"name": "x", "min_tx": "5"})).unwrap();
+        assert_eq!(r["checks"][0]["level"], "error");
+        assert_eq!(r["checks"][0]["param"], "min_tx");
+        assert!(r["commands"].as_array().unwrap().is_empty());
+        let r = s.execute("routing.bfd.peer.preview", &json!({"address": "198.51.100.9", "multihop": "yes", "local_address": "192.0.2.1"})).unwrap();
+        assert!(r["computed"][0]["value"].as_str().unwrap().contains("4784"));
+        assert!(r["checks"].as_array().unwrap().iter().any(|c| c["check"] == "auth"));
+        // Nothing changed.
+        assert!(s.store().candidate().routing.bfd.is_empty());
+        // The commands it gives run as they are.
+        let r = s.execute("routing.bfd.peer.preview", &json!({"address": "192.0.2.2", "profile": "fast"})).unwrap();
+        let c = &r["commands"][0];
+        s.execute(c["command"].as_str().unwrap(), &c["params"]).unwrap();
+        assert_eq!(s.store().candidate().routing.bfd.peers.len(), 1);
     }
 
     #[test]
