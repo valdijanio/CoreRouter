@@ -13,6 +13,8 @@
 //!   `auth_key` becomes chain `CR-T<id>`, a `/routing ospf keychain K` is
 //!   `CR-K-K`. The windows are FRR's `send-lifetime`/`accept-lifetime`,
 //!   printed in the box's local time: CoreRouter runs in UTC.
+//! - BFD: not typed into FRR. CoreRouter runs its own BFD (G3.6, not
+//!   FRR's `bfdd`); the link between its sessions and `ospfd` is G3.6b.
 //! - Redistribution: one route-map per instance and kind
 //!   (`CR-O<version>-<inst>-<kind>`): the subscriber pools first (G4.3ce), then
 //!   the `out_filter_chain` compiled by the `/routing filter` compiler
@@ -301,10 +303,6 @@ fn iface_v2(s: &mut String, b: &Binding<'_>, open: Opener<'_>) -> Result<(), Str
         let _ = writeln!(s, " ip ospf transmit-delay {d}");
     }
     let _ = writeln!(s, " ip ospf area {}", b.area.area_id);
-    if let Some(p) = &t.bfd {
-        let _ = writeln!(s, " ip ospf bfd");
-        let _ = writeln!(s, " ip ospf bfd profile {p}");
-    }
     if t.mtu_ignore {
         let _ = writeln!(s, " ip ospf mtu-ignore");
     }
@@ -353,10 +351,6 @@ fn iface_v3(s: &mut String, b: &Binding<'_>) {
             let _ = writeln!(s, " ipv6 ospf6 network point-to-multipoint");
         }
         _ => {}
-    }
-    if let Some(p) = &t.bfd {
-        let _ = writeln!(s, " ipv6 ospf6 bfd");
-        let _ = writeln!(s, " ipv6 ospf6 bfd profile {p}");
     }
     if t.auth.is_some_and(AuthType::is_crypto)
         && let Some(chain) = auth_chain(t)

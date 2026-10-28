@@ -148,6 +148,7 @@ fn received_routes_show_rpki_and_why_this_route() {
                 last_error: (!up).then(|| "Hold Timer Expired".into()),
                 ..BgpSession::default()
             }],
+            ..RoutingStatus::default()
         };
         s.set_routing_status(one(true));
         s.set_routing_status(one(false));
@@ -195,6 +196,7 @@ fn session_detail_shows_the_rpki_share_and_links() {
             established: true,
             ..BgpSession::default()
         }],
+        ..RoutingStatus::default()
     });
     let mut h = Harness::with_session(s);
     h.app.open.clear();

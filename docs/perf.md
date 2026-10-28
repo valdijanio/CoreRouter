@@ -2014,3 +2014,82 @@ FRR 10.7.1 real (VM do laboratório, debug): mudar uma regra digita 14 linhas em
 | render FRR | 148,1 ms | 12,7 ms |
 | impacto do commit | 284,8 ms | 32,8 ms |
 | validação | 0,30 ms | 0,31 ms |
+
+### G3.4b — LSDB e layout da topologia (**medido**, 2026-10-27, 32 núcleos, build de bench)
+
+| Medida | Resultado |
+|---|---|
+| LSDB de 10 000 LSAs (4,0 MiB de JSON) lida em fluxo | 9,1 ms, 612 KiB |
+| a mesma como `serde_json::Value` | 17,0 ms, +34 MiB de RSS |
+| layout de 500 roteadores, 1 / 4 / 16 threads | 66,8 / 27,1 / 29,1 ms |
+
+`cargo bench -p corerouter-hal-frr --bench frr_ospf`, `cargo bench -p corerouter-proto-ospf
+--bench ospf_topology`.
+
+### BFD: motor próprio (G3.6a, 2026-10-27)
+
+AMD Ryzen AI MAX+ 395, build release, dois motores no loopback de um namespace, 50 ms × 3, 15 s por caso (`service/bfd/tests.rs`, `load`), **medido**:
+
+| sessions | threads | CPU %/thread avg | CPU %/thread max | tx jitter p99 worst (µs) | tx jitter p99 median (µs) | rx gap p99 worst (µs) | false downs | handed over |
+|---|---|---|---|---|---|---|---|---|
+| 100 | 1 | 1.6 | 8.0 | 87 | 69 | 50708 | 0 | 0 |
+| 100 | 2 | 0.9 | 4.0 | 3081 | 1578 | 56052 | 0 | 26 |
+| 100 | 4 | 0.4 | 4.0 | 87 | 69 | 51384 | 0 | 48 |
+| 100 | 8 | 0.5 | 4.0 | 136 | 69 | 50073 | 0 | 76 |
+| 500 | 1 | 5.9 | 8.0 | 265 | 69 | 50712 | 0 | 0 |
+| 500 | 2 | 4.5 | 12.0 | 1578 | 108 | 54477 | 0 | 199 |
+| 500 | 4 | 3.5 | 8.0 | 4815 | 1972 | 56052 | 0 | 318 |
+| 500 | 8 | 1.7 | 8.0 | 108 | 69 | 51647 | 0 | 351 |
+| 1000 | 1 | 10.1 | 16.0 | 517 | 69 | 53205 | 0 | 0 |
+| 1000 | 2 | 6.9 | 12.0 | 1262 | 108 | 54480 | 0 | 506 |
+| 1000 | 4 | 4.4 | 8.0 | 136 | 69 | 52314 | 0 | 619 |
+| 1000 | 8 | 2.9 | 8.0 | 6019 | 1972 | 56052 | 0 | 729 |
+
+Com `poll` em ms (antes do `ppoll`): jitter p99 mediano 1 050 µs em todos os casos, CPU de 1000 sessões numa thread 5,6 %. `proto-bfd` (criterion): decode 6,7 ns, SHA1 assinar 43 ns, conferir 39 ns, receber 5,5 ns; 1 s de 1000 sessões no timer wheel 0,30 ms.
+
+### G3.4c — quadro da topologia (**medido**, 2026-10-27, build de debug)
+
+500 roteadores e 500 enlaces, com um caminho destacado: pintura + tesselação do quadro 3,2 ms
+(mediana de 20, `tests::ospf::five_hundred_routers_paint_within_a_frame`), contra 16,7 ms de um
+quadro a 60 fps. A resposta do engine vira vetores planos uma vez, ao chegar; o quadro não lê JSON
+nem aloca por nó.
+
+### G3.7 simulador de rede (**medido**, 2026-10-27, 32 CPUs, build release, máquina compartilhada com outras sessões: load 15–30)
+
+`cargo run --release -p corerouter-netsim --example measure -- 10 100 500`: grade com OSPF em
+todo enlace e eBGP entre vizinhos (cada roteador no seu AS, um /24 cada), 60 s virtuais desde o
+boot.
+
+| Roteadores (enlaces) | 1 thread | 4 | 8 | 16 | janelas (paralelas) | eventos | estado do simulador por roteador |
+|---|---|---|---|---|---|---|---|
+| 10 (13) | 0,6 ms | 0,5 ms | 0,5 ms | 0,5 ms | 676 (0) | 1 124 | 9 KB |
+| 100 (180) | 102 ms | 106 ms | 122 ms | 127 ms | 9 109 (642) | 51 723 | 88 KB |
+| 500 (955) | 5,65 s | 3,93 s | 3,12 s | 3,96 s | 25 937 (6 588) | 957 457 | 447 KB |
+
+- Tempo por passo (janela): 0,8 µs (10), 11 µs (100) e 218 µs (500) com 1 thread; 120 µs com 8
+  threads em 500. A barreira (entrega serial) custa 145–280 ms dos 3–6 s em 500 roteadores.
+- Convergência de 100 roteadores: a última mudança de protocolo acontece em 10,7 s virtuais
+  (hellos com fase aleatória de até 10 s + MinLSInterval de 5 s). Simular isso custa 102 ms de
+  parede. 10 minutos virtuais de regime custam 39 ms.
+- Corte de um enlace no meio + 30 s: 9 ms (100 roteadores), 225 ms (500, 1 thread), 109–284 ms
+  (500, com threads).
+- 16 threads não ganham de 8: as janelas com trabalho em paralelo são curtas (lookahead = 1 ms
+  de latência) e a máquina estava ocupada.
+
+Antes e depois das otimizações deste PR (500 roteadores, 1 thread, 60 s virtuais):
+- primeira versão: 21 s;
+- SPF com o throttle do FRR (backoff) e Dijkstra por índices: 100 roteadores só OSPF de 0,73 s
+  para 0,22 s;
+- entrega sem clonar o enlace e LS Update agrupado por instante: 500 só OSPF 4,9 → 3,8 s;
+- FIB incremental para BGP e próximo salto em cache: com eBGP 14,5 → 7,2 s;
+- SPF com conjuntos de next-hop em arena: 760 → 180 µs por SPF;
+- final: 5,65 s.
+
+Pool persistente × `thread::scope` por janela (500, 8 threads): 3,1 s × 11,3 s. Limiar de
+roteadores ativos por janela para usar o pool: 16 (100 roteadores 18 % mais lentos em 8 threads),
+48 (empata em 100, 500 mantém 3,2 s), 96 (500 cai para 3,6 s): fica 48.
+
+Engine (`cargo test --release`, RSS do processo): um `Session` por roteador virtual custa
+~98–140 KiB (100 e 500 roteadores); com o estado do simulador, ~1,2 MiB por roteador em 500. Montar o
+laboratório de 500 roteadores por comandos (uma transação cada) leva 150 ms; 60 s virtuais pelo
+`tool.netsim.advance`, 4,7 s.

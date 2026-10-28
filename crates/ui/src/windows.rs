@@ -16,7 +16,6 @@ pub enum Win {
     Vrf,
     Firewall,
     Bgp,
-    Ospf,
     Mpls,
     Identity,
     History,
@@ -47,7 +46,8 @@ pub(crate) const MENU: &[(&str, &[Win])] = &[
         ],
     ),
     ("IPv6", &[]),
-    ("Routing", &[Win::Bgp, Win::Ospf]),
+    // OSPF is a panel (`ospf.rs`, G3.4).
+    ("Routing", &[Win::Bgp]),
     ("MPLS", &[Win::Mpls]),
     // The CGNAT window is a panel (`cgnat.rs`, G2.3d).
     ("CGNAT", &[]),
@@ -95,7 +95,6 @@ impl Win {
         Win::Vrf,
         Win::Firewall,
         Win::Bgp,
-        Win::Ospf,
         Win::Mpls,
         Win::Identity,
         Win::History,
@@ -126,7 +125,6 @@ impl Win {
             Win::Vrf => "VRF",
             Win::Firewall => "Firewall",
             Win::Bgp => "BGP",
-            Win::Ospf => "OSPF",
             Win::Mpls => "MPLS",
             Win::Identity => "Identity",
             Win::History => "History",
@@ -138,7 +136,6 @@ impl Win {
     /// `Some(gap id)` while the area has no engine commands yet.
     pub fn gap(self) -> Option<&'static str> {
         match self {
-            Win::Ospf => Some("G3.4"),
             Win::Mpls => Some("G3.5"),
             _ => None,
         }
