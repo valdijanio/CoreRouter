@@ -2170,3 +2170,11 @@ O lote ganha 1,6×; o custo por rótulo é do kernel (~1 µs), não das idas e v
 
 Nós contra nós na mesma VM (`bfd::tests::load`, 10 s): 1000 sessões numa thread 32,4 %, com 8
 threads 8,2 % por thread. Data plane: `bfdd` → `bgpd` em 0,20–0,26 ms (5 cortes).
+
+- 2026-10-28, G3.6h, VM `corerouter-lab` (8 vCPUs, kernel 7.0, release, BNG Blaster 1.0.1, sem
+  root): tomada do par com o ativo sem energia, **medido**. Sem BFD: 0,96–1,18 s. Com BFD `fast`
+  nos dois caminhos: 0,13–0,20 s, e o nó novo ativo 150–154 ms depois do último pacote do par. O
+  tráfego volta em 0,19 s (1 mil sessões), 0,25 s (10 mil) e 1,04 s (100 mil); 0 perdidas.
+- 2026-10-28, G3.6h, dois daemons debug em namespace (Ryzen AI Max+ 395), **medido**: com o laço
+  do `ppp-ha` acordado pelo evento, a decisão sai 0–4 ms depois da detecção do BFD (antes, com o
+  tique de 10 ms, saía ~10 ms depois).

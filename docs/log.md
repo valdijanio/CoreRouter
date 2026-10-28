@@ -6173,3 +6173,43 @@ continuação indentadas).
   release): +0,8 a +4,6 % (convergir 100 roteadores 88,8 → 90,4 ms, dentro do ruído; corte 92,3 →
   97,2 ms), o preço de reinstalar todo prefixo olhado (um membro do multipath pode entrar ou sair
   com o melhor no lugar).
+
+- 2026-10-28 — G3.6h: BFD no par do BNG. O nosso motor BFD (G3.6) vira o terceiro sinal de vida nos dois caminhos do par
+  (`ppp.redundancy.set bfd=fast access_bfd=fast access_peer=<ip>`). Só a expiração conta (RFC 5880
+  §6.8.4, diagnóstico 1; errata 6926); AdminDown, não. A regra de maioria com a testemunha não
+  muda: o espera só assume com o par mudo em todos os caminhos e com uma resposta da testemunha
+  **posterior** à detecção. Sem ela, vale o intervalo morto dos hellos. Tabela de decisões em
+  `docs/bng-ha.md` §2.1 e desenho em §2.13.
+
+  O que entrou:
+
+  - **Sem o lock do `Session` no caminho da decisão:** a thread do motor BFD avisa o `ppp-ha` por um
+    tap nas `Options` do motor; o tap só enfileira e acorda o laço.
+  - **Dampening por caminho:** usa o do perfil. Um alarme falso (BFD perdido com o hello passando)
+    vale duas penalidades.
+  - **Linha do tempo de cada tomada:** detectado, testemunha, ativo, anunciado, adotadas e 1º
+    quadro, mais as sessões perdidas (`ppp.redundancy.monitor` → `takeovers`).
+  - **`ppp.redundancy.test-takeover`:** roda as verificações e, com `confirm=takeover`, faz a tomada
+    planejada (`failure` silencia também o BFD do par). O resultado é lido do par pelo link de sync.
+  - **Alertas:** p99 do intervalo do BFD ≥ 2/3 da detecção, BFD saindo atrasado, caminho amortecido.
+  - **Janela PPP › Redundancy:** campos de detecção, estado do BFD por caminho, idade da resposta da
+    testemunha, alertas, linha do tempo e o botão **Testar tomada**, que pede para digitar
+    `takeover`. ⓘ em português; capturas claro e escuro em `docs/changes/G3.6h-screenshots/`.
+
+  Como testar:
+
+  - `cargo test -p corerouter-proto-ha --release --test sim_bfd`;
+  - `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-daemon --test netns_ha_bfd -- --test-threads 1 --nocapture`;
+  - na VM: `cargo xtask vm-lab run -- env BNG_LAB_HA_BFD=fast cargo xtask bng-lab --only ha`.
+
+  Números:
+
+  - **Laboratório em memória:** a tomada leva 155 ms simulados, 0 de 20 000 sessões perdidas; em 300
+    sementes de falhas aleatórias com BFD nunca houve dois ativos (**medido**).
+  - **Dois daemons reais** (debug, namespace): ativo 150–154 ms depois do último sinal de vida do
+    par, contra 1,16 s com só hellos (**medido**).
+  - **Acordar o laço pelo evento** cortou 10 ms → 0–4 ms entre a detecção e a decisão (**medido**).
+  - **VM com BNG Blaster** (o ativo perde a energia; caminho lento): a tomada leva 0,13–0,20 s com BFD,
+    contra 0,96–1,18 s só com hellos. O tráfego de subida volta em 0,19 s com 1 mil sessões, 0,25 s com
+    10 mil e 1,04 s com 100 mil. 0 sessões perdidas em todas as escalas (**medido**). Acima de ~10 mil, a adoção
+    no caminho lento domina (100 mil levam ~0,75 s, com e sem BFD): gap abaixo.
