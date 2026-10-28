@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use corerouter_model::os_loopback;
 use corerouter_model::{Config, IfName, Interface, InterfaceKind, RoutingTable, VlanId};
 use serde_json::{Value, json};
 
@@ -242,6 +243,11 @@ pub(super) fn refuse_unmanaged(s: &mut Session, p: &Value, keys: &[&str]) -> Res
         let Ok(n) = name.parse::<IfName>() else {
             continue;
         };
+        // The OS loopback is CoreRouter's for its addresses once the
+        // candidate has it, even before the commit that claims it (G3.4i).
+        if os_loopback::is_os_loopback(s.store().candidate(), &n) {
+            continue;
+        }
         if let Some(why) = external.get(&n) {
             return Err(EngineError::bad(
                 key,
@@ -344,7 +350,11 @@ fn bridge_add(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn loopback_add(s: &mut Session, p: &Value) -> Result<Value> {
-    refuse_unmanaged(s, p, &["name"])?;
+    // `lo` is the OS loopback (G3.4i): it exists already, outside the
+    // config, and becomes CoreRouter's for its addresses only.
+    if p.get("name").and_then(Value::as_str) != Some(os_loopback::NAME) {
+        refuse_unmanaged(s, p, &["name"])?;
+    }
     let name = new_name(s.store().candidate(), p)?;
     insert(s, Interface::new(name, InterfaceKind::Loopback), p)
 }

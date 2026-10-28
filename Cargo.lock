@@ -1312,6 +1312,7 @@ name = "corerouter-hal-frr"
 version = "0.1.0"
 dependencies = [
  "corerouter-hal",
+ "corerouter-hal-linux",
  "corerouter-model",
  "corerouter-netsim",
  "corerouter-proto-bfd",

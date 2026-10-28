@@ -8,7 +8,10 @@
 //!
 //! The rule, first match wins:
 //! 1. a name the model cannot hold (`IfName`) — external;
-//! 2. the kernel loopback (`ARPHRD_LOOPBACK`, `lo`) — external, the OS's;
+//! 2. the kernel loopback (`ARPHRD_LOOPBACK`, `lo`) — the OS's: managed
+//!    only when the config has it as a loopback named `lo` (G3.4i,
+//!    `os_loopback`), and then only for its addresses (`plan` never
+//!    creates, deletes, resizes nor takes it down); external otherwise;
 //! 3. a name in `--unmanaged` — external;
 //! 4. a link enslaved to an external master (a veth in `docker0`) — external;
 //! 5. a name the config claims: managed when the kernel kind fits the claim
@@ -30,6 +33,7 @@
 
 use std::collections::BTreeMap;
 
+use corerouter_model::os_loopback;
 use corerouter_model::{IfName, InterfaceKind};
 
 pub const ARPHRD_ETHER: u16 = 1;
@@ -180,7 +184,13 @@ fn base(link: &KernelLink, claim: Option<&InterfaceKind>, policy: &Policy) -> Ow
         return ext("its name is not a valid CoreRouter interface name".into());
     }
     if link.arphrd == ARPHRD_LOOPBACK {
-        return ext("the kernel loopback, kept by the OS".into());
+        if link.name == os_loopback::NAME && claim == Some(&InterfaceKind::Loopback) {
+            return Owner::Managed;
+        }
+        return ext(format!(
+            "the kernel loopback, kept by the OS (add a loopback named '{}' to put addresses on it)",
+            os_loopback::NAME
+        ));
     }
     if Policy::hit(&policy.unmanaged, &link.name) {
         return ext("listed in --unmanaged".into());
@@ -482,5 +492,27 @@ mod tests {
         }
         let many = vec!["e"; MAX_PATTERNS + 1].join(",");
         assert!(Policy::patterns(&many).is_err());
+    }
+
+    /// G3.4i: the kernel's `lo` is managed when the config has a loopback
+    /// named `lo` (its addresses only), and never under another claim.
+    #[test]
+    fn the_kernel_lo_is_managed_as_a_loopback_named_lo() {
+        let mut lo = link(1, "lo", None);
+        lo.arphrd = ARPHRD_LOOPBACK;
+        lo.mtu = 65536;
+        let links = [lo];
+        let v = verdicts(
+            &links,
+            &[("lo", InterfaceKind::Loopback)],
+            &Policy::default(),
+        );
+        assert!(managed(&v, "lo"));
+        for kind in [InterfaceKind::Ethernet, InterfaceKind::Bridge] {
+            let v = verdicts(&links, &[("lo", kind)], &Policy::default());
+            assert!(reason(&v, "lo").contains("kernel loopback"));
+        }
+        let v = verdicts(&links, &[], &Policy::default());
+        assert!(reason(&v, "lo").contains("add a loopback named 'lo'"));
     }
 }

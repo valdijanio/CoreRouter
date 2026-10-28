@@ -7,8 +7,11 @@
 //!   nothing), with the default blocks and with a moved SRGB;
 //! - the SR database is read: R2..R4 with their SIDs;
 //! - zebra puts the SID's label on the kernel route and a ping crosses it;
-//! - a prefix SID on a dummy interface is refused by ospfd (only an
-//!   IFF_LOOPBACK interface takes one): the gap the docs name;
+//! - R1's loopback addresses reach the kernel through `LinuxHal` (G3.4i):
+//!   the loopback named `lo` is the kernel's `lo`, so ospfd takes its
+//!   prefix SID and R2 and R3 switch R1's label;
+//! - a prefix SID on a dummy interface (a loopback with another name) is
+//!   still refused by ospfd (only an IFF_LOOPBACK interface takes one);
 //! - switching SR off types the removals in an order FRR takes.
 
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
@@ -127,6 +130,55 @@ pub fn config() -> Config {
     cfg
 }
 
+/// R1's kernel side of [`config`] put by `LinuxHal` (G3.4i): the loopback
+/// `lo` (the kernel's own) and the dummy `crsr-lo`, with their addresses;
+/// the ports are the script's veths. Taken back on drop, even on a panic.
+pub struct KernelLo {
+    hal: corerouter_hal_linux::LinuxHal,
+    cfg: Config,
+}
+
+impl KernelLo {
+    pub fn apply(full: &Config) -> Self {
+        use corerouter_hal::Hal;
+        let mut cfg = Config::default();
+        for n in ["lo", "crsr-lo"] {
+            let n: corerouter_model::IfName = n.parse().unwrap();
+            cfg.interfaces
+                .insert(n.clone(), full.interfaces[&n].clone());
+        }
+        cfg.ip.addresses = full
+            .ip
+            .addresses
+            .iter()
+            .filter(|a| cfg.interfaces.contains_key(&a.interface))
+            .cloned()
+            .collect();
+        let mut hal = corerouter_hal_linux::LinuxHal::new();
+        let t = Instant::now();
+        hal.apply(&Config::default(), &cfg).unwrap();
+        eprintln!(
+            "LinuxHal: lo + crsr-lo applied in {:.2} ms",
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+        let (_, lo) = sh("ip", &["-o", "addr", "show", "dev", "lo"]);
+        assert!(
+            lo.contains("10.255.0.1/32") && lo.contains("127.0.0.1/8"),
+            "{lo}"
+        );
+        Self { hal, cfg }
+    }
+}
+
+impl Drop for KernelLo {
+    fn drop(&mut self) {
+        use corerouter_hal::Hal;
+        if let Err(e) = self.hal.apply(&self.cfg, &Config::default()) {
+            eprintln!("taking R1's loopback back: {e}");
+        }
+    }
+}
+
 pub fn sh(cmd: &str, args: &[&str]) -> (bool, String) {
     let out = Command::new(cmd).args(args).output().unwrap();
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -194,6 +246,7 @@ fn live_sr() {
     };
     let cfg = config();
     assert_eq!(corerouter_proto_ospf::validate(&cfg), Vec::new());
+    let _lo = KernelLo::apply(&cfg);
     let started = Instant::now();
     frr.apply(&Config::default(), &cfg).unwrap();
     eprintln!(
@@ -244,6 +297,37 @@ fn live_sr() {
             .any(|l| l.starts_with("16003") && l.contains("10.0.23.2")),
         "R2 does not switch 16003 towards R3"
     );
+    // G3.4i: ospfd took R1's prefix SID on the kernel's lo: R2 (its
+    // neighbour, PHP: pops) and R3 switch R1's label 16001.
+    for ns in ["crsr2", "crsr3"] {
+        let t = wait(&format!("{ns} switches R1's SID label 16001"), 60, || {
+            let (_, t) = sh("ip", &["-n", ns, "-f", "mpls", "route", "show"]);
+            t.lines().any(|l| l.starts_with("16001")).then_some(t)
+        });
+        eprintln!(
+            "{ns}: {}",
+            t.lines()
+                .find(|l| l.starts_with("16001"))
+                .unwrap_or_default()
+        );
+    }
+    let (_, back) = sh(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            "crsr3",
+            "ping",
+            "-c",
+            "1",
+            "-W",
+            "1",
+            "-I",
+            "10.255.0.3",
+            "10.255.0.1",
+        ],
+    );
+    eprintln!("R3 → R1's lo: {}", back.lines().last().unwrap_or_default());
     let (_, mine) = sh("ip", &["-f", "mpls", "route", "show"]);
     eprintln!("R1's label table:\n{mine}");
 
@@ -491,6 +575,7 @@ fn live_ti_lfa() {
     if let Some(sr) = cfg.routing.ospf.segment_routing.as_mut() {
         sr.ti_lfa = corerouter_model::ospf_sr::TiLfa::Link;
     }
+    let _lo = KernelLo::apply(&cfg);
     frr.apply(&Config::default(), &cfg).unwrap();
     canonical(&frr, &cfg, "SR with TI-LFA");
     // The backup of R3's loopback, as zebra holds it.

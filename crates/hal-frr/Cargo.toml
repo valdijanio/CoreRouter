@@ -30,6 +30,9 @@ corerouter-proto-bgp.workspace = true
 # cut, and the simplified TI-LFA is checked against ospfd's.
 corerouter-proto-iperf.workspace = true
 corerouter-netsim.workspace = true
+# G3.4i, the lab VM test: R1's loopback reaches the kernel's lo through
+# LinuxHal, as in the daemon.
+corerouter-hal-linux.workspace = true
 
 [[bench]]
 name = "frr_conf"

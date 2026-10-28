@@ -41,12 +41,9 @@ finish() {
 }
 trap finish EXIT
 sysctl -qw net.mpls.platform_labels=1048575
-# R1's loopback on the kernel's lo (FRR takes a prefix SID only on an
-# IFF_LOOPBACK interface) and a dummy, to show that a dummy is refused.
-ip addr add 10.255.0.1/32 dev lo
-ip link add crsr-lo type dummy
-ip addr add 10.255.0.11/32 dev crsr-lo
-ip link set crsr-lo up
+# R1's loopback (10.255.0.1 on the kernel's lo, G3.4i) and the dummy
+# crsr-lo (to show that ospfd refuses a SID there) are put by the test,
+# through LinuxHal; cleanup() only takes back what a crash left.
 for ns in crsr2 crsr3 crsr4; do
   ip netns add $ns
   ip -n $ns link set lo up
