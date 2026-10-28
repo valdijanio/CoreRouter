@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::IpAddr;
 
+use corerouter_model::os_loopback::{is_os_address, is_os_loopback};
 use corerouter_model::route::{self, Reach};
 use corerouter_model::{Config, IfName, InterfaceKind, RouteEntry};
 use ipnet::IpNet;
@@ -70,7 +71,8 @@ pub struct Snapshot {
 /// A disabled interface keeps none in the kernel: Linux drops the IPv6
 /// addresses of a link that goes down (`keep_addr_on_down` is 0 by default),
 /// so they are removed explicitly before it goes down — which an undo can
-/// reverse — and added again before it comes back up.
+/// reverse — and added again before it comes back up. The OS's 127.0.0.0/8
+/// and ::1 on its `lo` are never CoreRouter's (G3.4i, `os_loopback`).
 pub fn active_addresses(cfg: &Config) -> BTreeSet<(IfName, IpNet)> {
     cfg.ip
         .addresses
@@ -81,6 +83,7 @@ pub fn active_addresses(cfg: &Config) -> BTreeSet<(IfName, IpNet)> {
                     .interfaces
                     .get(&a.interface)
                     .is_some_and(|i| !i.disabled)
+                && !(is_os_loopback(cfg, &a.interface) && is_os_address(&a.address))
         })
         .map(|a| (a.interface.clone(), a.address))
         .collect()

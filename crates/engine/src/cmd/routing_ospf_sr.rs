@@ -196,8 +196,9 @@ fn sr_unset(s: &mut Session, _: &Value) -> Result<Value> {
 }
 
 /// FRR takes a prefix SID only on an IFF_LOOPBACK interface (Linux's
-/// `lo`); a CoreRouter loopback interface is a dummy there, which ospfd
-/// refuses (lab VM, FRR 10.7.1). Said where a real FRR runs (G3.4i).
+/// `lo`); a CoreRouter loopback with another name is a dummy there, which
+/// ospfd refuses (lab VM, FRR 10.7.1). The loopback named `lo` is the OS's
+/// (G3.4i, `os_loopback`). Said where a real FRR runs.
 fn lo_warning(s: &Session, cfg: &Config, sids: &[PrefixSid]) -> Option<String> {
     if !s.has_routing() {
         return None;
@@ -210,7 +211,7 @@ fn lo_warning(s: &Session, cfg: &Config, sids: &[PrefixSid]) -> Option<String> {
         .collect();
     (!off.is_empty()).then(|| {
         format!(
-            "{}: FRR's ospfd takes a prefix SID only on the kernel's lo, and a loopback interface is a dummy on Linux, so the commit would be refused (G3.4i); put the /32 on lo",
+            "{}: FRR's ospfd takes a prefix SID only on the kernel's lo, and a loopback with another name is a dummy on Linux, so the commit would be refused; put the /32 on the loopback named lo (interface.loopback.add name=lo)",
             off.join(", ")
         )
     })
