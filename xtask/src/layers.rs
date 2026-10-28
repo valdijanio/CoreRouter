@@ -94,6 +94,11 @@ pub const SIDEWAYS_ALLOWED: &[(&str, &str)] = &[
     ("corerouter-hal-frr", "corerouter-proto-mpls"),
     // G3.6b: the `bfd` block for bfdd (profiles, peers).
     ("corerouter-hal-frr", "corerouter-proto-bfd"),
+    // G3.4d, dev-dependencies of the lab VM test only: the iperf3 UDP
+    // datagrams count the loss of a cut, and netsim's TI-LFA is checked
+    // against ospfd's.
+    ("corerouter-hal-frr", "corerouter-proto-iperf"),
+    ("corerouter-hal-frr", "corerouter-netsim"),
     // OSPF redistribution runs through the `/routing filter` chains, whose
     // compiler lives with the BGP policy (G3.4).
     ("corerouter-proto-ospf", "corerouter-proto-bgp"),

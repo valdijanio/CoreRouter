@@ -19,7 +19,7 @@ use corerouter_model::mpls::{FIRST_UNRESERVED, LABEL_BYTES, MAX_LABEL, MplsSetti
 use corerouter_model::ospf::{MAIN_VRF, OspfInstance, Version};
 use corerouter_model::ospf_sr::{
     LabelBlock, MAX_INDEX, MAX_MSD, MAX_PREFIX_SIDS, MIN_BLOCK, PrefixSid, SidBehavior, SrDb,
-    active,
+    TiLfa, active,
 };
 use corerouter_model::ospf_state::OspfRoute;
 use corerouter_model::{Config, IfName, Issue};
@@ -276,6 +276,12 @@ pub fn router_lines(cfg: &Config, inst: &OspfInstance) -> Vec<String> {
     l.push("segment-routing on".to_owned());
     if let Some(m) = sr.node_msd {
         l.push(format!("segment-routing node-msd {m}"));
+    }
+    // G3.4d: TI-LFA (RFC 9855), as ospf_config_write_one prints it.
+    match sr.ti_lfa {
+        TiLfa::Off => {}
+        TiLfa::Link => l.push("fast-reroute ti-lfa".to_owned()),
+        TiLfa::Node => l.push("fast-reroute ti-lfa node-protection".to_owned()),
     }
     for s in ospf.prefix_sids.iter().filter(|s| !s.disabled) {
         let mut p = format!("segment-routing prefix {} index {}", s.prefix, s.index);

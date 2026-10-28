@@ -39,6 +39,7 @@ pub(crate) const SR_FIELDS: &[Field] = &[
     field("srgb", "SRGB", "ospf.sr.srgb", Input::Text("16000-23999"), true),
     field("srlb", "SRLB", "ospf.sr.srlb", Input::Text("15000-15999"), true),
     field("node_msd", "Node MSD", "ospf.sr.node_msd", Input::Text("8"), true),
+    field("ti_lfa", "TI-LFA", "ospf.sr.ti_lfa", Input::Choice, true),
     field("auto_sid", "Loopback SIDs", "ospf.sr.auto_sid", Input::Check, true),
     field("disabled", "Disabled", "ospf.disabled", Input::Check, true),
     field("comment", "Comment", "", Input::Text(""), true),
@@ -215,7 +216,7 @@ fn node_row(r: &Value) -> Row {
 }
 
 /// The modal of the SR settings: new, or the current ones.
-fn open_settings(p: &mut OspfPanel, app: &mut CoreRouterUi, off: bool) {
+pub(crate) fn open_settings(p: &mut OspfPanel, app: &mut CoreRouterUi, off: bool) {
     if let Some((_, m)) = &mut p.modal {
         m.status.bring_to_front();
         return;
@@ -226,6 +227,7 @@ fn open_settings(p: &mut OspfPanel, app: &mut CoreRouterUi, off: bool) {
     for f in SR_FIELDS {
         let v = match f.param {
             "auto_sid" => if configured { "no" } else { "yes" }.to_owned(),
+            "ti_lfa" => Some(s(sr, "ti_lfa")).filter(|t| !t.is_empty()).unwrap_or_else(|| "off".to_owned()),
             "disabled" => if off || flag(sr, "disabled") { "yes" } else { "no" }.to_owned(),
             k => s(sr, k),
         };

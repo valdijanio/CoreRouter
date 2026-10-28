@@ -1313,8 +1313,10 @@ version = "0.1.0"
 dependencies = [
  "corerouter-hal",
  "corerouter-model",
+ "corerouter-netsim",
  "corerouter-proto-bfd",
  "corerouter-proto-bgp",
+ "corerouter-proto-iperf",
  "corerouter-proto-mpls",
  "corerouter-proto-ospf",
  "criterion",

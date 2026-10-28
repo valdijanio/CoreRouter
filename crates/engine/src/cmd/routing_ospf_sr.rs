@@ -13,7 +13,7 @@ use std::net::Ipv4Addr;
 
 use corerouter_model::ospf::{MAIN_VRF, Version};
 use corerouter_model::ospf_sr::{
-    LabelBlock, MAX_INDEX, MAX_MSD, MAX_PREFIX_SIDS, PrefixSid, SegmentRouting, SidBehavior, SrDb,
+    LabelBlock, MAX_INDEX, MAX_MSD, MAX_PREFIX_SIDS, PrefixSid, SegmentRouting, SidBehavior, SrDb, TiLfa,
 };
 use corerouter_model::types::ItemId;
 use corerouter_model::{Config, Routing};
@@ -29,16 +29,16 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("routing.ospf.segment-routing.set", "Set OSPF Segment Routing", ["Routing", "OSPF"], None,
-        "{instance?: string (the OSPFv2 instance in VRF main; default: the only one), srgb?: string (labels for prefix SIDs, default 16000-23999, outside LDP's range), srlb?: string (local labels, default 15000-15999), node_msd?: u8 | null (deepest label stack pushed, 1..=16), auto_sid?: bool (default yes: a SID for every loopback /32 of the instance without one), force?: bool (the forwarding change was confirmed: the modal sends it), disabled?: bool, comment?: string} → {instance, added: [{prefix, index, label}]}",
+        "{instance?: string (the OSPFv2 instance in VRF main; default: the only one), srgb?: string (labels for prefix SIDs, default 16000-23999, outside LDP's range), srlb?: string (local labels, default 15000-15999), node_msd?: u8 | null (deepest label stack pushed, 1..=16), ti_lfa?: string (off, link, node: TI-LFA, RFC 9855), auto_sid?: bool (default yes: a SID for every loopback /32 of the instance without one), force?: bool (the forwarding change was confirmed: the modal sends it), disabled?: bool, comment?: string} → {instance, added: [{prefix, index, label}]}",
         mpls_supported, sr_set),
     cmd!("routing.ospf.segment-routing.unset", "Remove OSPF Segment Routing", [], None,
         "{} → {removed_sids}",
         has_sr, sr_unset),
     cmd!(query "routing.ospf.segment-routing.check", "Check OSPF Segment Routing", [], None,
-        "{id?: string (the instance, when editing), instance?: string, srgb?: string, srlb?: string, node_msd?: u8 | string | null, auto_sid?: bool | yes | no, disabled?: bool | yes | no, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk, preview: {by_label, maybe, own, mtu, no_mpls_input, conflicts, ldp_block, switches}, available, why?}",
+        "{id?: string (the instance, when editing), instance?: string, srgb?: string, srlb?: string, node_msd?: u8 | string | null, ti_lfa?: string, auto_sid?: bool | yes | no, disabled?: bool | yes | no, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk, preview: {by_label, maybe, own, mtu, no_mpls_input, conflicts, ldp_block, switches}, available, why?}",
         always, sr_check),
     cmd!(query "routing.ospf.segment-routing.database", "OSPF Segment Routing", ["Routing", "OSPF"], None,
-        "{} → {configured, active, instance?, srgb?, srlb?, node_msd?, disabled, comment?, ldp_block?, source, stale, error?, router_id?, nodes: [{router_id, srgb, srlb, msd, adjacencies, prefixes, same_srgb, me}], sids: [{prefix, router, index, label, in_label, out_label?, interface?, nexthop?, own}], conflicts: [{index, prefix, router, other_prefix, kind, detail}], issues: [string], available, why?}",
+        "{} → {configured, active, instance?, srgb?, srlb?, node_msd?, ti_lfa?, disabled, comment?, ldp_block?, source, stale, error?, router_id?, nodes: [{router_id, srgb, srlb, msd, adjacencies, prefixes, same_srgb, me}], sids: [{prefix, router, index, label, in_label, out_label?, interface?, nexthop?, own}], conflicts: [{index, prefix, router, other_prefix, kind, detail}], issues: [string], available, why?}",
         always, sr_database),
     cmd!("routing.ospf.prefix-sid.add", "Add OSPF Prefix SID", ["Routing", "OSPF"], None,
         "{prefix?: prefix (a /32 of a loopback), interface?: string (a loopback: its /32), index?: u32 (0..=65535, below the SRGB size; default: the last octet when free, else the lowest free), behavior?: string (php, no-php, explicit-null; default php), force?: bool (take an index another router uses: anycast), disabled?: bool, comment?: string} → {id, prefix, index, label}",
@@ -125,6 +125,9 @@ fn apply(cfg: &mut Config, p: &Value, db: Option<&SrDb>) -> Result<Vec<(Ipv4Net,
         Given::Absent => {}
     }
     super::routing_ospf::opt_number(p, "node_msd", 1, u64::from(MAX_MSD), &mut sr.node_msd)?;
+    if let Given::Value(v) = given(p, "ti_lfa") {
+        sr.ti_lfa = TiLfa::parse(text("ti_lfa", v)?).ok_or_else(|| EngineError::bad("ti_lfa", "off, link or node"))?;
+    }
     if let Some(c) = opt_text(p, "comment", 256)? {
         sr.comment = c;
     }
@@ -287,11 +290,25 @@ fn sr_check(s: &mut Session, raw: &Value) -> Result<Value> {
             checks.push(check("error", "validate", issue.message, ""));
         }
     }
-    let pv = sr::preview(&cfg, s.store().running(), db.as_ref().filter(|d| !d.is_empty()), &routes, sr::SR_LABELS);
+    // TI-LFA pushes up to two repair labels over the prefix SID (RFC 9855
+    // §6: P node and adjacency P→Q).
+    let ti_lfa = cfg.routing.ospf.segment_routing.as_ref().is_some_and(|x| x.ti_lfa != TiLfa::Off);
+    let labels = if ti_lfa { sr::SR_LABELS + 2 } else { sr::SR_LABELS };
+    let pv = sr::preview(&cfg, s.store().running(), db.as_ref().filter(|d| !d.is_empty()), &routes, labels);
+    if ti_lfa && cfg.routing.ospf.segment_routing.as_ref().is_some_and(|x| x.ti_lfa == TiLfa::Node) {
+        checks.push(check("info", "ti-lfa", "node protection: a route to the next hop itself has no backup (the router is what fails); link protection covers it".into(), "ti_lfa"));
+    }
+    if ti_lfa {
+        checks.push(check("warning", "ti-lfa", "FRR 10.7.1's ospfd aborted in 2 of 9 lab rounds with TI-LFA on (assert in get_reverse_distance while LSAs arrive): watchfrr restarts it and every adjacency drops. On Linux the measured loss of a cut did not improve with it (G3.4k, G3.4l): keep it off in production".into(), "ti_lfa"));
+    }
+    if ti_lfa && cfg.routing.ospf.templates.iter().all(|t| t.bfd.is_none()) {
+        checks.push(check("warning", "bfd", "TI-LFA repairs from the moment the failure is seen: without BFD on the OSPF links a silent cut waits for the dead interval (set a BFD profile in the interface templates)".into(), "ti_lfa"));
+    }
     if let Some(sr) = &cfg.routing.ospf.segment_routing {
         computed.push(json!({"label": "Instance", "value": sr.instance}));
         computed.push(json!({"label": "SRGB", "value": format!("{} ({} labels)", sr.srgb, sr.srgb.size())}));
         computed.push(json!({"label": "SRLB", "value": sr.srlb.to_string()}));
+        computed.push(json!({"label": "TI-LFA", "value": sr.ti_lfa.name()}));
     }
     if let Some(b) = &pv.ldp_block {
         computed.push(json!({"label": "LDP labels", "value": b}));
@@ -417,6 +434,7 @@ fn sr_database(s: &mut Session, _: &Value) -> Result<Value> {
         "srgb": sr_cfg.srgb.to_string(),
         "srlb": sr_cfg.srlb.to_string(),
         "node_msd": sr_cfg.node_msd,
+        "ti_lfa": sr_cfg.ti_lfa.name(),
         "disabled": sr_cfg.disabled,
         "comment": sr_cfg.comment,
         "ldp_block": sr::dynamic_block(&cfg).map(|b| b.to_string()),

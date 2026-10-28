@@ -89,3 +89,31 @@ fn the_tab_shows_this_router_the_network_and_the_routers() {
         assert!(h.has_text(t), "{t}");
     }
 }
+
+#[test]
+fn fast_reroute_shows_coverage_backups_and_a_simulated_cut() {
+    use crate::ospf_frr::FrrView;
+    let mut s = lab();
+    for (a, i) in [("10.0.2.1/30", "ether2"), ("10.0.3.1/30", "ether3")] {
+        s.execute("ip.address.add", &json!({"address": a, "interface": i})).unwrap();
+    }
+    s.execute("routing.ospf.interface-template.add", &json!({"area": "backbone", "interfaces": "ether2,ether3", "type": "ptp"})).unwrap();
+    s.execute("routing.ospf.segment-routing.set", &json!({"ti_lfa": "link"})).unwrap();
+    let mut h = open(s);
+    panel(&mut h).tab = Tab::FastReroute;
+    settle(&mut h);
+    for t in ["TI-LFA · link", "TI-LFA…", "virtual lab sample", "Routes", "Unprotected"] {
+        assert!(h.has_text(t), "{t}: {}", panel(&mut h).frr);
+    }
+    assert!(h.has_text_containing("% protected"), "{}", panel(&mut h).frr);
+    panel(&mut h).frr_view = FrrView::Unprotected;
+    settle(&mut h);
+    assert!(h.has_text_containing("directly connected"), "{}", panel(&mut h).frr);
+    let nb = panel(&mut h).frr["neighbors"][0]["router_id"].as_str().unwrap().to_owned();
+    panel(&mut h).frr_view = FrrView::Simulate;
+    panel(&mut h).frr_pick = nb.clone();
+    panel(&mut h).frr_cut = Some((nb, false));
+    settle(&mut h);
+    assert!(h.has_text("simulation: nothing changes"));
+    assert!(h.has_text_containing("nothing changed"), "{}", panel(&mut h).frr_sim);
+}

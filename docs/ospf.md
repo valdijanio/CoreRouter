@@ -182,6 +182,74 @@ com `encap mpls 16003` e ping por ela; R2 faz PHP do 16003 para R3; SRGB/SRLB mo
 `explicit-null` em 1,9 ms, de novo canônicos; SID numa interface dummy recusado pelo `ospfd`; SR
 desligado em 1,4 ms sem sobra no `running-config`.
 
+## Fast Reroute: TI-LFA (G3.4d)
+
+TI-LFA (RFC 9855, antes `draft-ietf-rtgwg-segment-routing-ti-lfa`): para cada rota, o `ospfd` do
+FRR calcula um caminho de reserva sem laço com uma pilha de rótulos SR e o zebra o deixa
+instalado junto da rota. Liga-se no SR: `routing.ospf.segment-routing.set '{"ti_lfa":"link"}'`
+(`link`, `node` ou `off`), render `fast-reroute ti-lfa [node-protection]`.
+
+| Comando | O que é |
+|---|---|
+| `routing.ospf.fast-reroute.list` | Cobertura (% de rotas com reserva, tipo de proteção), cada rota com o próximo salto principal e o de reserva com a pilha de rótulos, e as rotas sem proteção com o motivo |
+| `routing.ospf.fast-reroute.simulate` | "Simular corte de link": para um vizinho (router id, endereço ou interface; `node` para o roteador inteiro), o reserva de cada rota afetada, os segmentos, os rótulos e o caminho depois da convergência, sem tocar a rede |
+
+- **Por instância:** o `ospfd` liga TI-LFA no processo inteiro (`ospf_vty.c`); "por área ou
+  template" não existe no FRR 10.7.1 (o IS-IS do FRR tem por nível e interface).
+- **De onde vêm os reservas:** o `ospfd` não os mostra; o zebra sim (`show ip route ospf json`,
+  `backupNexthops`/`backupIndex`). O `hal-frr` lê esse JSON do socket em linhas tipadas
+  (`fast_reroute::read`, sem árvore JSON) junto com a LSDB, fora do lock.
+- **Por que uma rota está sem proteção:** calculado como o `ospfd` faz (P-space, Q-space,
+  caminho pós-convergência, nó PQ ou nós P e Q; `netsim::tilfa`, uma reprodução simplificada de
+  `ospf_ti_lfa.c`): "único caminho" (o enlace é ponte), conectada, fora da área, "o destino é o
+  próximo salto" (proteção de nó), ou "existe reparo mas nada foi instalado" (roteador sem SID, ou
+  o FRR deixou de fora).
+- **Laboratório virtual:** sem FRR, os reservas são os calculados (selo `lab`); a amostra ganhou
+  um roteador central que une os anéis quando há dois vizinhos ou mais.
+- **Seguro por padrão:** a prévia do SR soma 2 rótulos de reparo no MTU com TI-LFA, avisa da
+  proteção de nó (a rota até o próprio vizinho fica sem reserva) e de templates sem BFD (um corte
+  silencioso esperaria o dead interval).
+
+### Janela Routing › OSPF › Fast Reroute
+
+Selo "TI-LFA · link/node" e a cobertura em selo (verde ≥ 95%, âmbar ≥ 70%, vermelho abaixo, como o
+`show isis fast-reroute summary` da Cisco), **TI-LFA…** (o modal do SR), e três vistas: **Rotas**
+(principal, reserva e pilha de rótulos em selos, como o next-hop de reserva do Junos), **Sem
+proteção** (prefixo e motivo) e **Simular corte de link** (vizinho, "o roteador cai", resultado
+com reserva instalado ou calculado, segmentos, rótulos e o caminho depois da convergência, e as
+rotas perdidas com o motivo).
+
+### Teste com FRR real e perda medida
+
+`cargo xtask vm-lab run -- scripts/frr-sr-live.sh frr` (o mesmo quadrado da G3.4f; R2 com BFD
+3 × 10 ms para R1). FRR 10.7.1, **medido** em 2026-10-28:
+
+- o reserva de 10.255.0.3 aparece 5,8 s depois do commit: via R4, rótulos `15003/16003` (a
+  adjacência R1→R4 e o SID de R3); leitura de LSDB + SR + rotas do zebra em 11 ms;
+- **fidelidade** do `netsim::tilfa` contra o `ospfd`: as rotas em que os dois têm reserva saem
+  pelo mesmo vizinho; o `ospfd` deixou sem reserva 10.255.0.2/32, cujo reparo pede nó P ≠ nó Q
+  (duas adjacências) — a aba mostra a rota como sem proteção, com esse motivo;
+- **perda real** (datagramas UDP do iperf3 do `proto-iperf`, 2 000/s, de R1 para a loopback de R3,
+  cortando R1–R2):
+
+  | Corte | Com TI-LFA | Sem TI-LFA |
+  |---|---|---|
+  | perda de portadora (o vizinho derruba a interface) | 12,5 ms | 13,5 ms |
+  | silencioso (netem 100%), detectado pelo BFD 3 × 10 ms | 59,5 ms | 51,0 ms |
+
+  Segunda rodada: 13,5 × 13,5 ms (portadora) e 50,5 × 50,5 ms (silencioso).
+
+  **O TI-LFA do FRR não encurta a perda no Linux:** o kernel não tem nexthop de reserva
+  pré-programado; o zebra guarda o reserva, mas a troca espera o `ospfd` (aviso do BFD, SPF,
+  instalação). O corte silencioso fica em ~50–60 ms, acima da meta de 50 ms; o tempo é o do BFD
+  (30 ms) mais o SPF e a instalação. Trocar no plano de dados é a G3.4k.
+- **O `ospfd` 10.7.1 aborta com TI-LFA** em 2 de 9 rodadas do laboratório:
+  `ospf_spf.c:1269: get_reverse_distance(): assertion (w_lsa && w_lsa->data) failed`, no SPF
+  reverso do Q-space, quando o LSA de um vizinho ainda não chegou (a função trata esse caso logo
+  depois, mas o `assert` vem antes). O watchfrr reinicia o daemon e todas as adjacências caem. Por
+  isso a prévia avisa e a recomendação é deixar o TI-LFA desligado em produção até a G3.4l
+  (correção no FRR ou versão que a traga).
+
 ## Seguro por padrão
 
 - `routing.ospf.interface-template.check` (o modal) mostra antes de aplicar: **quais interfaces
@@ -284,5 +352,5 @@ Medido em 2026-10-27, 32 núcleos (carga ~10 de outras sessões), build de bench
   seladas, `sha256` por padrão quando só a chave é dada, prévia das interfaces que entram, tipo e
   `passive` sugeridos, aviso de autenticação ausente/fraca, prévia "estes vizinhos vão cair" com
   Safe Mode, pools de assinantes sumarizados, recusa de chain BGP-only no OSPF.
-- **Ficou para depois:** LFA/TI-LFA (RFC 5286, G3.4d), graceful restart com a atualização A/B
+- **Ficou para depois:** graceful restart com a atualização A/B
   (RFC 3623, G3.4e), pools IPv6 no OSPFv3 (G3.4g). Segment Routing entrou na G3.4f (acima).

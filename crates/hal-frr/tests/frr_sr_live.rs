@@ -297,3 +297,324 @@ fn live_sr() {
     let (_, run) = sh("vtysh", &["-c", "show running-config ospfd"]);
     assert!(!run.contains("segment-routing"), "{run}");
 }
+
+// ---- G3.4d: TI-LFA ----
+
+const SINK: &str = "COREROUTER_UDP_SINK";
+/// One datagram every this many microseconds (2 000 a second).
+const GAP_US: u64 = 500;
+
+/// The receiver, run inside R3's namespace by `ip netns exec` (this same
+/// test binary, `udp_sink`): counts the iperf3 datagrams (proto-iperf's
+/// header and loss accounting) and the longest silence between two.
+#[test]
+fn udp_sink() {
+    let Ok(spec) = std::env::var(SINK) else {
+        return;
+    };
+    let mut it = spec.split(',');
+    let (addr, out, secs) = (
+        it.next().unwrap(),
+        it.next().unwrap(),
+        it.next().unwrap().parse::<u64>().unwrap(),
+    );
+    let sock = std::net::UdpSocket::bind(addr).unwrap();
+    sock.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let mut rx = corerouter_proto_iperf::UdpRx::default();
+    let start = Instant::now();
+    let mut last: Option<Instant> = None;
+    let mut worst = Duration::ZERO;
+    let mut buf = [0u8; 2048];
+    while start.elapsed() < Duration::from_secs(secs) {
+        let Ok(n) = sock.recv(&mut buf) else { continue };
+        let Some(h) = corerouter_proto_iperf::UdpHeader::read(buf.get(..n).unwrap_or(&[]), false)
+        else {
+            continue;
+        };
+        let now = Instant::now();
+        if let Some(l) = last {
+            worst = worst.max(now - l);
+        }
+        last = Some(now);
+        rx.on_datagram(&h, start.elapsed().as_secs_f64());
+    }
+    std::fs::write(
+        out,
+        format!("{} {} {}", rx.packet_count, rx.errors, worst.as_micros()),
+    )
+    .unwrap();
+}
+
+/// Send to R3's loopback from R1's for `secs`, run `cut` after one second;
+/// (sent, lost, the longest silence at the receiver).
+fn measure(secs: u64, cut: impl FnOnce()) -> (u64, u64, Duration) {
+    let out = format!("/tmp/crsr-sink-{}", std::process::id());
+    let _ = std::fs::remove_file(&out);
+    let exe = std::env::current_exe().unwrap();
+    let mut sink = Command::new("ip")
+        .args(["netns", "exec", "crsr3"])
+        .arg(&exe)
+        .args(["--exact", "udp_sink", "--nocapture"])
+        .env(SINK, format!("10.255.0.3:5201,{out},{}", secs + 2))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    let sock = std::net::UdpSocket::bind("10.255.0.1:0").unwrap();
+    sock.connect("10.255.0.3:5201").unwrap();
+    let start = Instant::now();
+    let mut cut = Some(cut);
+    let mut seq = 0u64;
+    let mut buf = [0u8; 128];
+    while start.elapsed() < Duration::from_secs(secs) {
+        seq += 1;
+        let t = start.elapsed();
+        corerouter_proto_iperf::UdpHeader {
+            sec: u32::try_from(t.as_secs()).unwrap(),
+            usec: t.subsec_micros(),
+            seq,
+        }
+        .write(&mut buf, false);
+        let _ = sock.send(&buf);
+        if t >= Duration::from_secs(1)
+            && let Some(c) = cut.take()
+        {
+            c();
+        }
+        let next = Duration::from_micros(seq * GAP_US);
+        while start.elapsed() < next {
+            std::hint::spin_loop();
+        }
+    }
+    let _ = sink.wait();
+    let text = std::fs::read_to_string(&out).unwrap_or_default();
+    let v: Vec<u64> = text
+        .split_whitespace()
+        .filter_map(|x| x.parse().ok())
+        .collect();
+    (
+        seq,
+        v.get(1).copied().unwrap_or(seq),
+        Duration::from_micros(v.get(2).copied().unwrap_or(0)),
+    )
+}
+
+/// The topology netsim's TI-LFA takes, from the LSDB ospfd has.
+fn topology(db: &corerouter_model::ospf_state::Lsdb) -> corerouter_netsim::tilfa::Topology {
+    let mut arcs = Vec::new();
+    for l in db.lsas.iter().filter(|l| l.kind == 1) {
+        let s = l.link_start as usize;
+        for k in &db.links[s..s + usize::from(l.link_count)] {
+            if k.kind == 1 {
+                arcs.push((
+                    Ipv4Addr::from(l.adv),
+                    Ipv4Addr::from(k.id),
+                    u32::from(k.metric),
+                ));
+            }
+        }
+    }
+    corerouter_netsim::tilfa::Topology::new(&arcs)
+}
+
+fn vtysh(ns: Option<&str>, lines: &[&str]) {
+    let mut a: Vec<String> = Vec::new();
+    if let Some(n) = ns {
+        a.extend(["-N".into(), n.into()]);
+    }
+    a.push("-c".into());
+    a.push("configure terminal".into());
+    for l in lines {
+        a.push("-c".into());
+        a.push((*l).into());
+    }
+    let refs: Vec<&str> = a.iter().map(String::as_str).collect();
+    let (ok, t) = sh("vtysh", &refs);
+    assert!(ok, "vtysh {lines:?}: {t}");
+}
+
+/// Cut R1–R2 the way named, run the traffic, bring it back.
+fn scenario(frr: &Frr, cfg: &Config, name: &str, silent: bool) -> Duration {
+    // Converged: the route to R3 by R2 again.
+    wait("R1 → R3 by R2", 60, || {
+        kernel_route("10.255.0.3").contains("crsr-a").then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(3));
+    let (sent, lost, worst) = measure(4, || {
+        if silent {
+            // A cut that leaves the carrier up: only BFD sees it.
+            sh(
+                "tc",
+                &[
+                    "qdisc", "add", "dev", "crsr-a", "root", "netem", "loss", "100%",
+                ],
+            );
+            sh(
+                "ip",
+                &[
+                    "netns", "exec", "crsr2", "tc", "qdisc", "add", "dev", "crsr-b", "root",
+                    "netem", "loss", "100%",
+                ],
+            );
+        } else {
+            sh("ip", &["-n", "crsr2", "link", "set", "crsr-b", "down"]);
+        }
+    });
+    let outage = Duration::from_micros(lost * GAP_US);
+    eprintln!(
+        "MEASURED {name}: sent {sent}, lost {lost} ({:.1} ms at {} µs a datagram), longest silence {:.1} ms",
+        outage.as_secs_f64() * 1000.0,
+        GAP_US,
+        worst.as_secs_f64() * 1000.0
+    );
+    let _ = sh("tc", &["qdisc", "del", "dev", "crsr-a", "root"]);
+    let _ = sh(
+        "ip",
+        &[
+            "netns", "exec", "crsr2", "tc", "qdisc", "del", "dev", "crsr-b", "root",
+        ],
+    );
+    let _ = sh("ip", &["-n", "crsr2", "link", "set", "crsr-b", "up"]);
+    let _ = (frr, cfg);
+    outage
+}
+
+#[test]
+fn live_ti_lfa() {
+    let Some(mut frr) = live() else {
+        eprintln!("skipped: COREROUTER_FRR_LIVE=1 only in the lab VM (scripts/frr-sr-live.sh)");
+        return;
+    };
+    let mut cfg = config();
+    if let Some(sr) = cfg.routing.ospf.segment_routing.as_mut() {
+        sr.ti_lfa = corerouter_model::ospf_sr::TiLfa::Link;
+    }
+    frr.apply(&Config::default(), &cfg).unwrap();
+    canonical(&frr, &cfg, "SR with TI-LFA");
+    // The backup of R3's loopback, as zebra holds it.
+    let (db, route) = wait("a TI-LFA backup for 10.255.0.3/32", 90, || {
+        let (db, routes) = frr.ospf_lsdb(&cfg, "v2").ok()?;
+        let r = routes.into_iter().find(|r| r.prefix == "10.255.0.3/32")?;
+        r.fast_reroute
+            .as_ref()
+            .is_some_and(|f| !f.backup.is_empty())
+            .then_some((db, r))
+    });
+    let f = route.fast_reroute.clone().unwrap();
+    eprintln!(
+        "10.255.0.3/32 primary {:?}, backup {:?}",
+        f.primary, f.backup
+    );
+    let t = std::time::Instant::now();
+    let read = frr.ospf_lsdb(&cfg, "v2").unwrap();
+    eprintln!(
+        "LSDB + SR + zebra routes read in {:.1} ms ({} routes)",
+        t.elapsed().as_secs_f64() * 1000.0,
+        read.1.len()
+    );
+    // Fidelity: netsim's simplified TI-LFA against ospfd's, for every
+    // route announced by a router.
+    let topo = topology(&db);
+    let r1: Ipv4Addr = "10.255.0.1".parse().unwrap();
+    let mut agree = 0;
+    let mut differ = Vec::new();
+    let mut only_netsim: Vec<String> = Vec::new();
+    for r in read
+        .1
+        .iter()
+        .filter(|r| r.prefix.ends_with("/32") && r.prefix != "10.255.0.1/32")
+    {
+        let Some(fr) = r.fast_reroute.as_ref() else {
+            continue;
+        };
+        let dest: Ipv4Addr = r.prefix.trim_end_matches("/32").parse().unwrap();
+        let Some(via) = fr.primary.first().and_then(|h| h.via.clone()) else {
+            continue;
+        };
+        let nbr = if via == "10.0.12.2" {
+            "10.255.0.2"
+        } else {
+            "10.255.0.4"
+        };
+        let rep = corerouter_netsim::tilfa::repair(
+            &topo,
+            r1,
+            dest,
+            nbr.parse().unwrap(),
+            corerouter_netsim::tilfa::Protection::Link,
+        );
+        let ours = rep.as_ref().and_then(|x| x.nexthop).map(|n| {
+            if n == Ipv4Addr::new(10, 255, 0, 2) {
+                "10.0.12.2"
+            } else {
+                "10.0.14.2"
+            }
+        });
+        let theirs = fr.backup.first().and_then(|h| h.via.as_deref());
+        let segs = rep.as_ref().map_or(0, |x| x.segments.len());
+        let labels = fr.backup.first().map_or(0, |h| h.labels.len());
+        match (theirs, ours) {
+            (Some(t), Some(o)) if t == o && labels <= segs + 1 => agree += 1,
+            (Some(_), Some(_)) => differ.push(format!(
+                "{}: ospfd {:?}, netsim {ours:?} {:?}",
+                r.prefix,
+                fr.backup,
+                rep.map(|x| x.segments)
+            )),
+            // ospfd 10.7.1 leaves out a repair netsim finds (seen: P and Q
+            // apart, two adjacencies): the coverage says so for that route.
+            (None, Some(_)) => {
+                only_netsim.push(format!("{} {:?}", r.prefix, rep.map(|x| x.segments)))
+            }
+            (Some(_), None) => {
+                differ.push(format!("{}: ospfd {:?}, netsim none", r.prefix, fr.backup))
+            }
+            (None, None) => agree += 1,
+        }
+    }
+    eprintln!(
+        "fidelity: {agree} routes agree, {} differ {differ:?}; repairs ospfd did not install: {only_netsim:?}",
+        differ.len()
+    );
+    assert!(differ.is_empty(), "{differ:?}");
+
+    // BFD on R1's link to R2 (R2 has it in its own config): typed by hand,
+    // the CoreRouter's BFD engine is not in this VM test.
+    vtysh(
+        None,
+        &[
+            "bfd",
+            "profile crfast",
+            "detect-multiplier 3",
+            "receive-interval 10",
+            "transmit-interval 10",
+            "exit",
+            "exit",
+            "interface crsr-a",
+            "ip ospf bfd",
+            "ip ospf bfd profile crfast",
+        ],
+    );
+    wait("BFD up with R2", 30, || {
+        let (_, t) = sh("vtysh", &["-c", "show bfd peers brief"]);
+        t.contains("10.0.12.2")
+            .then_some(())
+            .filter(|_| t.contains("up"))
+    });
+    let lfa_carrier = scenario(&frr, &cfg, "TI-LFA, carrier lost", false);
+    let lfa_silent = scenario(&frr, &cfg, "TI-LFA + BFD, silent cut", true);
+    // The same without TI-LFA.
+    vtysh(None, &["router ospf", "no fast-reroute ti-lfa"]);
+    let bfd_carrier = scenario(&frr, &cfg, "no TI-LFA, carrier lost", false);
+    let bfd_silent = scenario(&frr, &cfg, "only BFD, silent cut", true);
+    eprintln!(
+        "SUMMARY outage ms: TI-LFA carrier {:.1}, TI-LFA+BFD silent {:.1}, no TI-LFA carrier {:.1}, only BFD silent {:.1}",
+        lfa_carrier.as_secs_f64() * 1000.0,
+        lfa_silent.as_secs_f64() * 1000.0,
+        bfd_carrier.as_secs_f64() * 1000.0,
+        bfd_silent.as_secs_f64() * 1000.0
+    );
+    frr.apply(&cfg, &Config::default()).unwrap();
+}
