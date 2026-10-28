@@ -13,6 +13,7 @@ corerouter-model.workspace = true
 # The `/routing filter` compiler (G3.2b) for `out_filter_chain`.
 corerouter-proto-bgp.workspace = true
 ipnet.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

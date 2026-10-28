@@ -19,6 +19,7 @@ pub mod layout;
 pub mod packet;
 pub mod pools;
 pub mod sample;
+pub mod sr;
 pub mod topology;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -71,6 +72,7 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
     }
     keychains(ospf, &mut out);
     neighbors(ospf, &mut out);
+    sr::validate(cfg, &mut out);
     out
 }
 

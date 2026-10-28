@@ -24,6 +24,7 @@ pub mod ospf;
 pub mod render;
 pub mod rib;
 pub mod routes;
+pub mod sr;
 pub mod state;
 pub mod vty;
 
@@ -571,6 +572,18 @@ impl Frr {
         } else {
             Vec::new()
         };
+        // G3.4f: the SR database, when this instance runs SR.
+        if corerouter_model::ospf_sr::active(&cfg.routing.ospf)
+            .is_some_and(|s| s.instance == instance)
+        {
+            let r = vty
+                .run("show ip ospf database segment-routing json")
+                .map_err(io)?;
+            let text = String::from_utf8_lossy(&r.output);
+            if r.ok() && text.trim_start().starts_with('{') {
+                db.sr = sr::sr_db(&text).map_err(HalError::Rejected)?;
+            }
+        }
         Ok((db, routes))
     }
 }

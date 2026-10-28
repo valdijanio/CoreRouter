@@ -93,6 +93,50 @@ intra-area, inter-area, ext-1, ext-2."##),
 The next hop and interface."##),
     (r##"ospf.route.prefix"##, r##"## What it is
 The destination."##),
+    (r##"ospf.sid"##, r##"## What it is
+A prefix SID of this router: the index of a loopback /32 in the SRGB (RFC 8665 §5). An index another router uses for another prefix is refused before the commit (Force takes it, for anycast)."##),
+    (r##"ospf.sid.announced"##, r##"## What it is
+Whether OSPF announces this loopback (an interface template of the instance takes it)."##),
+    (r##"ospf.sid.behavior"##, r##"## What it is
+What the hop before the last does with the label (RFC 8665 §5): php (pop, the default), no-php, explicit-null."##),
+    (r##"ospf.sid.force"##, r##"## What it is
+Take an index another router already announces for another prefix (anycast)."##),
+    (r##"ospf.sid.index"##, r##"## What it is
+The index in the SRGB, unique in the network (RFC 8402 §3.2). Empty or auto: picked."##),
+    (r##"ospf.sid.interface"##, r##"## What it is
+The loopback of the prefix, or where the label goes out."##),
+    (r##"ospf.sid.label"##, r##"## What it is
+The SID's label on a router with the same SRGB: start + index."##),
+    (r##"ospf.sid.prefix"##, r##"## What it is
+The /32 the SID names; FRR takes only a loopback's address."##),
+    (r##"ospf.sr"##, r##"## What it is
+Segment Routing of the OSPFv2 instance in VRF main (FRR runs SR there only, one per process, in every area of the instance). The preview lists what moves to labels, the short MTU, the interfaces without MPLS input and the clashing SIDs; use Safe Mode."##),
+    (r##"ospf.sr.adjacencies"##, r##"## What it is
+Adjacency SIDs the router announced (one per neighbor, in its SRLB)."##),
+    (r##"ospf.sr.auto_sid"##, r##"## What it is
+A prefix SID for every loopback /32 of the instance without one: the last octet when free, else the lowest free index."##),
+    (r##"ospf.sr.conflicts"##, r##"## What it is
+Clashing SIDs: one index for two prefixes, or one prefix with two indexes (RFC 8660 §2.5 leaves the fix to the operator)."##),
+    (r##"ospf.sr.in_label"##, r##"## What it is
+The label this router takes in for the SID."##),
+    (r##"ospf.sr.instance"##, r##"## What it is
+The OSPFv2 instance (VRF main) that runs SR."##),
+    (r##"ospf.sr.ldp_block"##, r##"## What it is
+The labels LDP uses while SR runs: outside the SR blocks (from 24000 with the defaults, as on IOS-XR)."##),
+    (r##"ospf.sr.nexthop"##, r##"## What it is
+The neighbor the labeled packet goes to."##),
+    (r##"ospf.sr.node_msd"##, r##"## What it is
+Maximum SID Depth (RFC 8476): how many labels this router pushes."##),
+    (r##"ospf.sr.out_label"##, r##"## What it is
+The label the packet leaves with; implicit-null (pop) when the next hop owns the SID."##),
+    (r##"ospf.sr.router"##, r##"## What it is
+The OSPF router id that announces it."##),
+    (r##"ospf.sr.srgb"##, r##"## What it is
+Segment Routing Global Block (RFC 8402 §2): the labels of the prefix SIDs (label = start + index). Default 16000-23999. It stays out of LDP's labels."##),
+    (r##"ospf.sr.srlb"##, r##"## What it is
+Segment Routing Local Block: the router's local labels (adjacency SIDs). Default 15000-15999."##),
+    (r##"ospf.sr.views"##, r##"## What it is
+This Router: the configured prefix SIDs. Network SIDs: what ospfd learned, with the in and out labels. SR Routers: each router's SRGB and SRLB (amber when the SRGB differs from ours)."##),
     (r##"ospf.tab.areas"##, r##"## What it is
 The areas of each instance. 0.0.0.0 is the backbone; the others connect to it through an ABR."##),
     (r##"ospf.tab.instances"##, r##"## What it is
@@ -105,6 +149,8 @@ The link-state database (RouterOS `/routing ospf lsa`): every LSA the router hol
 The adjacencies OSPF formed (RouterOS `/routing ospf neighbor`), live. Select one and press Diagnose to see why it is not Full."##),
     (r##"ospf.tab.routes"##, r##"## What it is
 The routes OSPF computed. Select one (or type an address) to see why its path is the one: the cost added hop by hop."##),
+    (r##"ospf.tab.sr"##, r##"## What it is
+Segment Routing MPLS over OSPFv2 (RFC 8665): each router announces an index for its loopback and every router forwards to it with the label SRGB start + index, without LDP. FRR's ospfd computes; here are the switch with its preview, this router's SIDs, the network's and the clashes."##),
     (r##"ospf.tab.templates"##, r##"## What it is
 Which interfaces run OSPF and how: matched by name, interface list or network. The first template that matches an interface wins."##),
     (r##"ospf.tab.topology"##, r##"## What it is

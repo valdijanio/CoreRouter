@@ -5,8 +5,10 @@
 pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"ASBR Summary"##, r##"ASBR summary"##),
     (r##"Address"##, r##"Endereço"##),
+    (r##"Adjacency SIDs"##, r##"Adjacency SIDs"##),
     (r##"Age"##, r##"Idade"##),
     (r##"All"##, r##"Todos"##),
+    (r##"Announced"##, r##"Anunciado"##),
     (r##"Area"##, r##"Área"##),
     (r##"Area ID"##, r##"ID da área"##),
     (r##"Areas"##, r##"Áreas"##),
@@ -17,6 +19,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"BFD"##, r##"BFD"##),
     (r##"BFD Profile"##, r##"Perfil BFD"##),
     (r##"Back to the whole map"##, r##"Volta ao mapa inteiro"##),
+    (r##"Behavior"##, r##"Comportamento"##),
     (r##"Body"##, r##"Conteúdo"##),
     (r##"Comment"##, r##"Comentário"##),
     (r##"Cost"##, r##"Custo"##),
@@ -27,8 +30,11 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Disabled"##, r##"Desativado"##),
     (r##"External"##, r##"Externo"##),
     (r##"Fit"##, r##"Ajustar"##),
+    (r##"Force"##, r##"Forçar"##),
     (r##"Hello Interval"##, r##"Hello interval"##),
     (r##"ID"##, r##"ID"##),
+    (r##"In"##, r##"Entra"##),
+    (r##"Index"##, r##"Índice"##),
     (r##"Instance"##, r##"Instância"##),
     (r##"Instances"##, r##"Instâncias"##),
     (r##"Interface"##, r##"Interface"##),
@@ -40,7 +46,11 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Key Chains"##, r##"Key chains"##),
     (r##"Keys"##, r##"Chaves"##),
     (r##"Kind"##, r##"Tipo"##),
+    (r##"LDP"##, r##"LDP"##),
     (r##"LSDB"##, r##"LSDB"##),
+    (r##"Label"##, r##"Rótulo"##),
+    (r##"Loopback SIDs"##, r##"SIDs das loopbacks"##),
+    (r##"MSD"##, r##"MSD"##),
     (r##"MTU Ignore"##, r##"Ignorar MTU"##),
     (r##"Match"##, r##"Casa com"##),
     (r##"NSSA"##, r##"NSSA"##),
@@ -48,24 +58,30 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Name"##, r##"Nome"##),
     (r##"Neighbors"##, r##"Vizinhos"##),
     (r##"Network"##, r##"Network"##),
+    (r##"Network SIDs"##, r##"SIDs da rede"##),
     (r##"Network Type"##, r##"Tipo de rede"##),
     (r##"Networks"##, r##"Redes"##),
     (r##"New Interface Template"##, r##"Novo interface template"##),
     (r##"New Key Chain"##, r##"Nova key chain"##),
     (r##"New OSPF Area"##, r##"Nova área OSPF"##),
     (r##"New OSPF Instance"##, r##"Nova instância OSPF"##),
+    (r##"New Prefix SID"##, r##"Novo prefix SID"##),
     (r##"New…"##, r##"Novo…"##),
     (r##"Next Hop"##, r##"Próximo salto"##),
     (r##"No LSDB to draw yet"##, r##"Ainda não há LSDB para desenhar"##),
     (r##"No Summaries"##, r##"Sem sumários"##),
     (r##"No neighbor: add an instance, an area and an interface template."##, r##"Nenhum vizinho: crie uma instância, uma área e um interface template."##),
+    (r##"Node MSD"##, r##"MSD do nó"##),
     (r##"OSPF Area"##, r##"Área OSPF"##),
     (r##"OSPF Instance"##, r##"Instância OSPF"##),
     (r##"Originate Default"##, r##"Originar padrão"##),
     (r##"Originator"##, r##"Originador"##),
+    (r##"Out"##, r##"Sai"##),
     (r##"Out Filter Chain"##, r##"Chain de saída"##),
     (r##"Passive"##, r##"Passiva"##),
     (r##"Prefix"##, r##"Prefixo"##),
+    (r##"Prefix SID"##, r##"Prefix SID"##),
+    (r##"Prefix SIDs"##, r##"Prefix SIDs"##),
     (r##"Priority"##, r##"Prioridade"##),
     (r##"Ranges"##, r##"Ranges"##),
     (r##"Reading the database from the routing daemon…"##, r##"Lendo a base do daemon de roteamento…"##),
@@ -74,13 +90,25 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Router"##, r##"Router"##),
     (r##"Router ID"##, r##"Router ID"##),
     (r##"Routes"##, r##"Rotas"##),
+    (r##"SR Routers"##, r##"Roteadores SR"##),
+    (r##"SR disabled"##, r##"SR desativado"##),
+    (r##"SR off"##, r##"SR desligado"##),
+    (r##"SR on"##, r##"SR ligado"##),
+    (r##"SRGB"##, r##"SRGB"##),
+    (r##"SRLB"##, r##"SRLB"##),
+    (r##"Segment Routing"##, r##"Segment Routing"##),
+    (r##"Segment Routing is off. Turn it on for the OSPFv2 instance: the preview shows what moves to labels before anything changes."##, r##"O Segment Routing está desligado. Ligue-o na instância OSPFv2: a prévia mostra o que passa a ir por rótulo antes de qualquer mudança."##),
     (r##"Sending Now"##, r##"Enviando agora"##),
     (r##"Sequence"##, r##"Sequência"##),
+    (r##"Settings…"##, r##"Configurar…"##),
     (r##"Show"##, r##"Mostrar"##),
     (r##"State"##, r##"Estado"##),
     (r##"Subscriber Pools"##, r##"Pools de assinantes"##),
     (r##"Summary"##, r##"Summary"##),
+    (r##"This Router"##, r##"Este roteador"##),
     (r##"Topology"##, r##"Topologia"##),
+    (r##"Turn Off…"##, r##"Desligar…"##),
+    (r##"Turn On…"##, r##"Ligar…"##),
     (r##"Type"##, r##"Tipo"##),
     (r##"Uptime"##, r##"Tempo de pé"##),
     (r##"Used By"##, r##"Usada por"##),
@@ -90,13 +118,16 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Why this neighbor is not Full, with the RFC section that says so"##, r##"Por que este vizinho não chega a Full, com a seção da RFC que diz isso"##),
     (r##"Why this path?"##, r##"Por que esse caminho?"##),
     (r##"agrees"##, r##"confere"##),
+    (r##"conflict"##, r##"conflito"##),
     (r##"cost"##, r##"custo"##),
     (r##"daemon's route"##, r##"rota do daemon"##),
     (r##"dead in"##, r##"dead em"##),
     (r##"differs"##, r##"difere"##),
+    (r##"error"##, r##"erro"##),
     (r##"layout"##, r##"layout"##),
     (r##"priority"##, r##"prioridade"##),
     (r##"retransmit"##, r##"retransmissão"##),
+    (r##"unavailable"##, r##"indisponível"##),
     (r##"virtual lab sample"##, r##"amostra do laboratório virtual"##),
 ];
 
@@ -206,6 +237,62 @@ O custo total (E2: a métrica externa, e entre parênteses o custo até o ASBR).
 O próximo salto e a interface."##),
     (r##"ospf.route.prefix"##, r##"## O que é
 O destino."##),
+    (r##"ospf.sid"##, r##"## O que é
+Um prefix SID deste roteador: o índice de um /32 de loopback no SRGB (RFC 8665 §5).
+
+## Antes do commit
+A prévia confere o índice com os SIDs que a rede já anuncia: um índice que outro roteador usa para outro prefixo é recusado (o tráfego de um iria para o outro). **Forçar** aceita, para anycast."##),
+    (r##"ospf.sid.announced"##, r##"## O que é
+Se o OSPF anuncia esta loopback (ela está num interface template da instância). Sem isso o SID não vai para a rede."##),
+    (r##"ospf.sid.behavior"##, r##"## O que é
+O que o penúltimo salto faz com o rótulo (RFC 8665 §5, flags NP e E):
+- `php`: tira o rótulo um salto antes (padrão, como o LDP);
+- `no-php`: o rótulo chega até aqui;
+- `explicit-null`: troca por explicit null (o campo de classe de tráfego chega até aqui)."##),
+    (r##"ospf.sid.force"##, r##"## O que é
+Aceita um índice que outro roteador já anuncia para outro prefixo. Só para anycast consciente."##),
+    (r##"ospf.sid.index"##, r##"## O que é
+O índice no SRGB: único na rede (RFC 8402 §3.2). Vazio ou `auto`: escolhido sozinho."##),
+    (r##"ospf.sid.interface"##, r##"## O que é
+A interface (loopback) do prefixo, ou por onde o rótulo sai."##),
+    (r##"ospf.sid.label"##, r##"## O que é
+O rótulo do SID num roteador com o mesmo SRGB: início do SRGB + índice."##),
+    (r##"ospf.sid.prefix"##, r##"## O que é
+O /32 que o SID identifica. O FRR só aceita endereço de interface loopback."##),
+    (r##"ospf.sr"##, r##"## O que é
+O Segment Routing da instância OSPFv2 em VRF main (o FRR só roda SR lá, um por processo, em todas as áreas da instância).
+
+## Prévia
+Mostra os prefixos que passam a ir por rótulo, o SID automático das loopbacks, o MTU que falta, as interfaces sem MPLS e os SIDs em conflito com a rede. Use o Safe Mode: se a mudança cortar o acesso, ela volta sozinha."##),
+    (r##"ospf.sr.adjacencies"##, r##"## O que é
+Quantos adjacency SIDs o roteador anunciou (um por vizinho, no SRLB dele)."##),
+    (r##"ospf.sr.auto_sid"##, r##"## O que é
+Dá um prefix SID a cada /32 de loopback da instância que ainda não tem: o índice é o último octeto do endereço quando está livre aqui e na rede, senão o menor livre."##),
+    (r##"ospf.sr.conflicts"##, r##"## O que é
+SIDs em conflito na rede: um índice para dois prefixos (o tráfego de um vai para o outro) ou um prefixo com dois índices. A RFC 8660 §2.5 deixa a solução ao operador: corrija o índice num dos roteadores."##),
+    (r##"ospf.sr.in_label"##, r##"## O que é
+O rótulo que este roteador recebe para o SID (instalado no kernel)."##),
+    (r##"ospf.sr.instance"##, r##"## O que é
+A instância OSPFv2 (VRF main) que roda o SR."##),
+    (r##"ospf.sr.ldp_block"##, r##"## O que é
+Os rótulos que o LDP usa enquanto o SR roda. O zebra do FRR recusa um SRGB dentro do bloco dinâmico, e com o bloco inteiro o LDP poderia pegar um rótulo do SRGB antes; por isso o LDP vai para fora dos blocos do SR (como no IOS-XR, a partir de 24000)."##),
+    (r##"ospf.sr.nexthop"##, r##"## O que é
+O vizinho para onde o pacote rotulado vai."##),
+    (r##"ospf.sr.node_msd"##, r##"## O que é
+Maximum SID Depth (RFC 8476): quantos rótulos este roteador consegue empilhar, anunciado aos outros. Vazio: não anuncia."##),
+    (r##"ospf.sr.out_label"##, r##"## O que é
+O rótulo com que o pacote sai. `implicit-null (pop)`: o próximo salto é o dono do SID (PHP)."##),
+    (r##"ospf.sr.router"##, r##"## O que é
+O router ID OSPF de quem anuncia."##),
+    (r##"ospf.sr.srgb"##, r##"## O que é
+Segment Routing Global Block (RFC 8402 §2): os rótulos reservados para os prefix SIDs. O rótulo de um SID é o início do bloco + o índice. Padrão 16000–23999 (o do FRR e da Cisco).
+
+## Cuidado
+O bloco fica **fora da faixa do LDP**: com a faixa padrão do `/mpls settings`, o LDP passa a usar os rótulos acima do SR (24000–1048575); com uma faixa sua, o commit recusa sobreposição. Use o mesmo SRGB em toda a rede: o rótulo fica igual em todo salto."##),
+    (r##"ospf.sr.srlb"##, r##"## O que é
+Segment Routing Local Block: rótulos locais do roteador, usados pelos adjacency SIDs. Padrão 15000–15999. Não pode sobrepor o SRGB."##),
+    (r##"ospf.sr.views"##, r##"## O que é
+**Este roteador**: os prefix SIDs da config, com + − para editar. **SIDs da rede**: tudo o que o `ospfd` aprendeu, com o rótulo de entrada e de saída. **Roteadores SR**: o SRGB e o SRLB de cada um (em âmbar quando o SRGB difere do nosso)."##),
     (r##"ospf.tab.areas"##, r##"## O que é
 As áreas de cada instância. A 0.0.0.0 é o backbone; as outras se ligam a ele por um ABR (roteador de borda de área)."##),
     (r##"ospf.tab.instances"##, r##"## O que é
@@ -223,6 +310,11 @@ O banco de estado de enlace (`/routing ospf lsa` do RouterOS): todo LSA que o ro
 As adjacências que o OSPF formou (`/routing ospf neighbor` do RouterOS), ao vivo. Selecione uma e use **Diagnose** para ver por que ela não chega a Full."##),
     (r##"ospf.tab.routes"##, r##"## O que é
 As rotas que o OSPF calculou. Selecione uma (ou digite um endereço) para ver **por que esse caminho**: o custo somado salto a salto."##),
+    (r##"ospf.tab.sr"##, r##"## O que é
+Segment Routing MPLS sobre OSPFv2 (RFC 8665): cada roteador anuncia um **índice** para a sua loopback e todos encaminham até ela com o rótulo **início do SRGB + índice**, sem LDP. O `ospfd` do FRR calcula; aqui ficam o liga/desliga com prévia, os SIDs deste roteador, os da rede e os conflitos.
+
+## Seguro por padrão
+Ligar o SR muda o encaminhamento interno de IP para rótulo: a prévia lista os prefixos que mudam, o MTU curto (+4 bytes por rótulo) e as interfaces sem entrada MPLS, e sugere o Safe Mode."##),
     (r##"ospf.tab.templates"##, r##"## O que é
 Quais interfaces rodam OSPF e como: casadas por nome, interface list ou rede. **O primeiro template que casa ganha**, então a ordem importa."##),
     (r##"ospf.tab.topology"##, r##"## O que é

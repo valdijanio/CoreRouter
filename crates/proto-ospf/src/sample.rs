@@ -260,8 +260,109 @@ pub fn lab(
             },
         );
     }
-    let routes = routes(&db, instance, me, &nbrs);
+    let mut routes = routes(&db, instance, me, &nbrs);
+    if let Some(sr) =
+        corerouter_model::ospf_sr::active(&cfg.routing.ospf).filter(|s| s.instance == instance)
+    {
+        db.sr = sr_lab(cfg, sr.srgb, me, &db, &nbrs, instance, &mut routes);
+    }
     (nbrs, ifs, db, routes)
+}
+
+/// G3.4f: the lab's SR database: this router's SIDs from the config, and
+/// every other router of the sample announcing its router id as a /32 with
+/// index 100 + n (the routes to those /32s are added too).
+fn sr_lab(
+    cfg: &Config,
+    srgb: corerouter_model::ospf_sr::LabelBlock,
+    me: u32,
+    db: &Lsdb,
+    nbrs: &[OspfNeighbor],
+    instance: &str,
+    routes: &mut Vec<OspfRoute>,
+) -> corerouter_model::ospf_sr::SrDb {
+    use corerouter_model::ospf_sr::{SrDb, SrHop, SrNode, SrPrefix};
+    let node = |rid: u32, prefixes: Vec<SrPrefix>| SrNode {
+        router_id: rid,
+        srgb_start: srgb.start,
+        srgb_size: srgb.size(),
+        srlb_start: corerouter_model::ospf_sr::DEFAULT_SRLB.start,
+        srlb_size: corerouter_model::ospf_sr::DEFAULT_SRLB.size(),
+        msd: None,
+        prefixes,
+        adjacencies: 0,
+    };
+    let own = cfg
+        .routing
+        .ospf
+        .prefix_sids
+        .iter()
+        .filter(|s| !s.disabled)
+        .map(|s| SrPrefix {
+            prefix: u32::from(s.prefix.addr()),
+            plen: s.prefix.prefix_len(),
+            sid: s.index,
+            in_label: 0,
+            out: Vec::new(),
+        })
+        .collect();
+    let mut out = SrDb {
+        router_id: Some(me),
+        nodes: vec![node(me, own)],
+    };
+    let mut others: Vec<u32> = db
+        .lsas
+        .iter()
+        .filter(|l| l.kind == 1 && l.adv != me)
+        .map(|l| l.adv)
+        .collect();
+    others.sort_unstable();
+    others.dedup();
+    let g = graphs(db);
+    for (n, rid) in others.into_iter().enumerate() {
+        let sid = 100 + u32::try_from(n).unwrap_or(0);
+        let hops = g.values().find_map(|g| path(g, me, Ipv4Addr::from(rid)));
+        let first = hops
+            .as_ref()
+            .and_then(|h| h.get(1))
+            .and_then(|h| match h.node {
+                Node::Router(r) => nbrs
+                    .iter()
+                    .find(|x| x.router_id == Ipv4Addr::from(r).to_string()),
+                Node::Network(_) => None,
+            });
+        let adjacent = hops.as_ref().is_some_and(|h| h.len() == 2);
+        let out_hop = first.map(|f| SrHop {
+            // RFC 8660 §2: PHP when the next hop is the router itself.
+            label: if adjacent { 3 } else { srgb.start + sid },
+            interface: f.interface.clone(),
+            nexthop: f.address.parse::<Ipv4Addr>().map(u32::from).unwrap_or(0),
+        });
+        if let (Some(h), Some(f)) = (&hops, first) {
+            routes.push(OspfRoute {
+                instance: instance.to_owned(),
+                prefix: format!("{}/32", Ipv4Addr::from(rid)),
+                kind: "intra-area".into(),
+                cost: h.last().map_or(0, |x| x.total),
+                type2_cost: None,
+                area: Some(Ipv4Addr::from(g.keys().next().copied().unwrap_or(0)).to_string()),
+                nexthops: vec![(Some(f.address.clone()), f.interface.clone())],
+            });
+        }
+        out.nodes.push(node(
+            rid,
+            vec![SrPrefix {
+                prefix: rid,
+                plen: 32,
+                sid,
+                in_label: srgb.start + sid,
+                out: out_hop.into_iter().collect(),
+            }],
+        ));
+    }
+    routes.sort_by(|a, b| a.prefix.cmp(&b.prefix));
+    routes.dedup_by(|a, b| a.prefix == b.prefix);
+    out
 }
 
 /// The routes the lab's network gives (the SPF over the sample).
@@ -318,5 +419,19 @@ mod tests {
         assert!(g[&0].nodes.len() >= 5, "{:?}", g[&0].nodes);
         assert!(r.iter().any(|r| r.prefix.starts_with("172.16.0.")), "{r:?}");
         assert_eq!(lab(&cfg, "v2").2, db, "deterministic");
+        assert!(db.sr.is_empty(), "no SR, no SR database");
+    }
+
+    #[test]
+    fn the_lab_has_sids_when_sr_is_on() {
+        let mut cfg = crate::sr::tests::sr_sample();
+        cfg.routing.ospf.templates[1].passive = false;
+        let (_, _, db, r) = lab(&cfg, "v2");
+        assert_eq!(db.sr.nodes[0].prefixes[0].sid, 1, "ours, from the config");
+        assert!(db.sr.nodes.len() > 3, "{:?}", db.sr.nodes);
+        let far = &db.sr.nodes[2].prefixes[0];
+        assert!(far.sid >= 100);
+        let p = format!("{}/32", Ipv4Addr::from(far.prefix));
+        assert!(r.iter().any(|x| x.prefix == p), "{r:?}");
     }
 }

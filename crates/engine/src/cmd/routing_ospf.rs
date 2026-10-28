@@ -293,6 +293,9 @@ pub(super) fn apply_instance(routing: &mut Routing, p: &Value, id: Option<&str>)
         for n in ospf.static_neighbors.iter_mut().filter(|n| n.instance == old) {
             n.instance = name.clone();
         }
+        if let Some(sr) = ospf.segment_routing.as_mut().filter(|s| s.instance == old) {
+            sr.instance = name.clone();
+        }
     }
     ospf.instances.insert(name.clone(), inst);
     Ok(name)
@@ -320,6 +323,12 @@ fn instance_remove(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::bad(
             "id",
             format!("instance {id:?} has areas ({}): remove them first", areas.join(", ")),
+        ));
+    }
+    if ospf.segment_routing.as_ref().is_some_and(|s| s.instance == id) {
+        return Err(EngineError::bad(
+            "id",
+            format!("Segment Routing runs on instance {id:?}: routing.ospf.segment-routing.unset first"),
         ));
     }
     ospf.static_neighbors.retain(|n| n.instance != id);

@@ -583,6 +583,11 @@ pub struct Ospf {
     pub static_neighbors: Vec<OspfStaticNeighbor>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub keychains: BTreeMap<String, OspfKeychain>,
+    /// G3.4f: Segment Routing on one OSPFv2 instance (`crate::ospf_sr`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_routing: Option<crate::ospf_sr::SegmentRouting>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prefix_sids: Vec<crate::ospf_sr::PrefixSid>,
     pub next_id: u32,
 }
 
