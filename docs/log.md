@@ -6248,3 +6248,52 @@ continuação indentadas).
   TI-LFA e 51,0 ms só com BFD; segunda rodada 13,5 × 13,5 ms e 50,5 × 50,5 ms. A meta de < 50 ms não foi atingida no corte silencioso, e o TI-LFA não
   muda a perda no Linux. Fidelidade: onde os dois têm reserva, `netsim` e `ospfd` saem pelo mesmo
   vizinho; o `ospfd` não instalou o reserva que pede nó P ≠ nó Q (10.255.0.2/32 no quadrado).
+
+- 2026-10-28 — G1.27d: Teste `netns_neigh::arp_ping_gets_an_answer_from_a_real_host` instável corrigido (só o teste; o
+  `hal-linux` não mudou). Nos 7 runs da fila (Actions 40576264652, 40578661613, 40591681774,
+  40616352446, 40628233128, 40634323743, 40640354947) a falha era sempre a mesma: o `expect("the far
+  host answers")` (linha 424) dos 20 pings ARP, passando ao repetir sozinho. Não era limite de
+  tempo apertado de latência: o pedido ARP é um quadro único, sem retransmissão, e o teste o enviava
+  logo depois do `ip link set up`. O carrier do veth e o qdisc real vêm de trabalho adiado do
+  linkwatch do kernel, que no runner carregado atrasa e o quadro se perde. Agora o teste espera o
+  `/sys/class/net/nbd0/carrier` e repete cada ping até 30 s (o rtt guardado é o da tentativa que
+  respondeu); o prazo de "never resolved" subiu de 3 s para 30 s. A conferência (a máquina remota
+  responde, o silêncio dá `None`, vira vizinho `reachable` com MAC) é a mesma.
+
+  Reproduzido sob carga (64 laços de CPU em 32 núcleos, 8 instâncias do teste em paralelo, cada
+  uma num `unshare --user --map-root-user --net`; **medido**, 2026-10-28): antes da mudança 1 falha
+  em 255 execuções, no mesmo `expect` (a taxa baixa é a do runner: 7 em poucas dezenas de lotes);
+  depois, 0 falhas em 200. A espera pelo carrier usa `ip -o link show` e não `/sys/class/net`,
+  porque o `unshare --net` sem mount namespace mostra o `/sys` do host.
+
+- 2026-10-28 — G3.4i: SR na `lo` do kernel: o `ospfd` do FRR só aceita prefix SID numa interface IFF_LOOPBACK, e as
+  loopbacks do CoreRouter são `dummy` no Linux. Agora a loopback **chamada `lo`** (módulo
+  `corerouter_model::os_loopback`) é a `lo` do sistema: `interface.loopback.add name=lo` funciona
+  mesmo com a `lo` do kernel fora do CoreRouter (também numa transação, antes do commit), o
+  `owner` a classifica como gerida só com essa declaração, o `plan`/`repair` do hal-linux só deixam
+  passar endereços e rotas nela, o snapshot de drift ignora estado/MTU dela e os endereços do SO, e
+  o RA e a descoberta de portas a deixam de fora. Desativar a `lo` tira os nossos endereços sem
+  derrubar a `lo` do kernel; tirá-la da config não a apaga. A validação recusa 127.0.0.0/8 e ::1 na
+  `lo`, outro tipo de interface com o nome `lo` e a `lo` em VRF, bridge ou bond. Outra loopback
+  continua `dummy`, e a prévia do SR segue avisando quando o prefix SID está nela (texto com o
+  comando para criar a `lo`).
+
+  Como testar: `corerouter-cli run interface.loopback.add '{"name":"lo"}'`,
+  `ip.address.add '{"address":"10.255.0.1/32","interface":"lo"}'`, depois `ip -o addr show dev lo`
+  (127.0.0.1/8 e ::1 continuam). Testes: `cargo test -p corerouter-engine --test os_loopback`,
+  `cargo xtask netns` (`netns_os_loopback`: aplicar, drift + reconcile, desativar, tirar da config,
+  apply com falha e rollback, sempre com a `lo` up, MTU 65536, 127.0.0.1/8 e ::1), e na VM
+  `cargo xtask vm-lab run -- scripts/frr-sr-live.sh sr` (o `live_sr` põe a `lo` pelo `LinuxHal`).
+
+  Números **medidos** em 2026-10-28, build debug:
+  - no namespace (host), o apply de `lo` + um dummy com 3 endereços leva ~2 ms;
+  - na VM (FRR 10.7.1), o `LinuxHal` põe `lo` + `crsr-lo` em 5,4–7,2 ms (duas rodadas) e o commit
+    do FRR leva 16,2 ms;
+  - o `ospfd` aceita o prefix SID 10.255.0.1 (índice 1) na `lo`: R2 comuta o 16001 (PHP, pop para
+    o R1) e R3 o troca para o R2;
+  - ping R1 → R3 pelo 16003 e R3 → R1 pelo 16001, e o caminho SR fica utilizável 6,1 s depois do
+    commit;
+  - o SID num dummy (`crsr-lo`) continua recusado (`interface crsr-lo is not a Loopback`).
+
+  Na primeira rodada, o `ospfd` dos vizinhos R2/R4 do roteiro abortou com o assert da G3.4l
+  (TI-LFA ligado neles), sem relação com esta mudança; a segunda passou.
