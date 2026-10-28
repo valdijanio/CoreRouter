@@ -223,7 +223,9 @@ fn apply_sets_the_knobs_and_the_static_entries() {
             comment: String::new(),
         },
     );
-    let mut hal = LinuxHal::new();
+    let mut hal = LinuxHal::with_policy(corerouter_hal_linux::owner::Policy::default());
+    // The config names the port first: only then is it managed (owner rule 5).
+    hal.apply(&Config::default(), &from).unwrap();
     // The label is above the table (platform_labels = 50 000): refused,
     // and nothing stays.
     assert!(hal.apply(&from, &to).is_err());
