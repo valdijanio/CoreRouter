@@ -5777,3 +5777,25 @@ continuação indentadas).
   community e tamanho; prepend e community chegam ao par; forma canônica; uma regra mudada = 14
   linhas em 2,7 ms; prévia nas rotas lidas do bgpd = o que o bgpd fez — **medido**, 2026-10-27).
   Na GUI: Routing › Filters.
+
+- 2026-10-27 — G3.4: OSPF, parte 1 (configuração, `docs/ospf.md`): `routing.ospf.instance`, `area`, `area.range`,
+  `interface-template` (com `move` e o `check` do modal), `static-neighbor`, `keychain` e
+  `keychain.key`, e `routing.ospf.impact`, no modelo do RouterOS v7. `proto-ospf` valida (RFC 2328
+  §3.6, §C.3, §D.3, §15; RFC 3101; RFC 7166) e renderiza para o `ospfd`/`ospf6d` do FRR na forma
+  canônica do FRR 10.7.1; o `hal-frr` passou a ser dono de `router ospf`, `router ospf6`, das
+  linhas OSPF dos contextos `interface` (por daemon), de `key chain CR-` e dos filtros `CR-O2-`/
+  `CR-O3-`. Chaves seladas (`auth_key`, `key_string` em `auth::SECRET_KEYS`, mascaradas no
+  `hal-frr`), `sha256` por padrão quando só a chave é dada. O `check` mostra as interfaces que
+  entram, o tipo sugerido (/30, /31, PPP → `ptp`), `passive` sugerido em interface de cliente,
+  autenticação ausente ou fraca e as adjacências que caem (risco com Safe Mode).
+
+  Como testar: `cargo test -p corerouter-proto-ospf -p corerouter-hal-frr`, `cargo test -p
+  corerouter-engine routing_ospf`; na CLI, os exemplos de `docs/ospf.md`. O teste com FRR real na
+  VM do laboratório (Full entre dois FRRs, sha256, rotação sem queda, MTU no Diagnose) vem com a
+  G3.4b, quando a VM voltar.
+
+- 2026-10-27 — G4.3ce: BNG, anúncio dos blocos de assinantes, parte OSPF: `routing.ospf.instance.set
+  subscriber_pools=true` cobre cada faixa dos `/ip pool` dos perfis PPPoE e dos servidores DHCP
+  IPoE pelo menor prefixo, agrega, e redistribui as rotas dos assinantes (conectada /32 do PPP,
+  kernel do IPoE) por um prefix-list com `summary-address` no `ospfd`: um LSA tipo 5 por pool, que
+  some quando o último assinante cai (`docs/ospf.md`).
