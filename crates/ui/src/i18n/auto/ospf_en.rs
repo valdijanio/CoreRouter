@@ -1,0 +1,159 @@
+//! English explanations of the Routing › OSPF window (G3.4), sorted by key
+//! (registered by `build.rs`).
+
+/// Explanations: (key, Markdown).
+pub(super) const HELP: &[(&str, &str)] = &[
+    (r##"ospf.area"##, r##"## What it is
+An OSPF area (RouterOS `/routing ospf area`)."##),
+    (r##"ospf.area.area_id"##, r##"## What it is
+The 32-bit area id, dotted. 0.0.0.0 is the backbone."##),
+    (r##"ospf.area.default_cost"##, r##"## What it is
+Stub/NSSA: the cost of the default the ABR announces."##),
+    (r##"ospf.area.instance"##, r##"## What it is
+The instance the area belongs to."##),
+    (r##"ospf.area.name"##, r##"## What it is
+The area's name (templates refer to it)."##),
+    (r##"ospf.area.no_summaries"##, r##"## What it is
+Stub/NSSA: not even inter-area routes, just a default (totally stubby)."##),
+    (r##"ospf.area.nssa_translate"##, r##"## What it is
+NSSA: whether this ABR translates type-7 to type-5 (candidate: elected, RFC 3101 §3.1)."##),
+    (r##"ospf.area.ranges"##, r##"## What it is
+Area ranges: the area's networks summarized by the ABR (RFC 2328 §12.4.3)."##),
+    (r##"ospf.area.type"##, r##"## What it is
+default, stub (no externals) or nssa (externals of its own as type-7, RFC 3101). The backbone is always default."##),
+    (r##"ospf.diagnose"##, r##"## What it is
+Why a neighbor is not Full, from the config, the daemon's state and the packets seen, with the RFC section."##),
+    (r##"ospf.disabled"##, r##"## What it is
+Kept in the config, not running."##),
+    (r##"ospf.instance"##, r##"## What it is
+An OSPF instance (RouterOS `/routing ospf instance`). The preview shows the interfaces it runs on and what the change does."##),
+    (r##"ospf.instance.name"##, r##"## What it is
+The instance's name."##),
+    (r##"ospf.instance.originate_default"##, r##"## What it is
+Announce a default route: never, if-installed (only while this router has one) or always."##),
+    (r##"ospf.instance.out_filter_chain"##, r##"## What it is
+The `/routing filter` chain the redistributed routes go through (prefix tests and `set bgp-med` as the external metric)."##),
+    (r##"ospf.instance.redistribute"##, r##"## What it is
+Routes announced into OSPF as externals: connected, static, bgp, kernel."##),
+    (r##"ospf.instance.router_id"##, r##"## What it is
+The router's 32-bit id in OSPF, unique in the AS.
+
+## Recommended
+A fixed one (a loopback address): changing it restarts every adjacency."##),
+    (r##"ospf.instance.subscriber_pools"##, r##"## What it is
+Announce the PPPoE and IPoE address pools, each summarized into one external, withdrawn when its last subscriber goes (G4.3ce)."##),
+    (r##"ospf.instance.version"##, r##"## What it is
+2: OSPFv2 for IPv4 (RFC 2328). 3: OSPFv3 for IPv6 (RFC 5340)."##),
+    (r##"ospf.instance.vrf"##, r##"## What it is
+The VRF the instance routes in (`main` by default)."##),
+    (r##"ospf.keychain"##, r##"## What it is
+A key chain (several keys with windows)."##),
+    (r##"ospf.keychain.keys"##, r##"## What it is
+The keys: id and algorithm."##),
+    (r##"ospf.keychain.name"##, r##"## What it is
+The chain's name."##),
+    (r##"ospf.keychain.rotation"##, r##"## What it is
+Whether a rotation would drop a neighbor: a moment no key is sent, or the old key no longer accepted when the new one starts."##),
+    (r##"ospf.keychain.sending"##, r##"## What it is
+The key sent now (the router's clock, UTC)."##),
+    (r##"ospf.keychain.used_by"##, r##"## What it is
+The templates using the chain."##),
+    (r##"ospf.lsa.age"##, r##"## What it is
+Seconds since it was originated (refreshed every 30 min, gone at 60)."##),
+    (r##"ospf.lsa.body"##, r##"## What it is
+What the LSA says."##),
+    (r##"ospf.lsa.id"##, r##"## What it is
+The Link State ID."##),
+    (r##"ospf.lsa.originator"##, r##"## What it is
+The advertising router."##),
+    (r##"ospf.lsa.sequence"##, r##"## What it is
+The sequence number: higher is newer."##),
+    (r##"ospf.lsa.type"##, r##"## What it is
+router (1), network (2), summary (3), asbr-summary (4), external (5), nssa-external (7)."##),
+    (r##"ospf.neighbor.address"##, r##"## What it is
+The neighbor's address on the link (v3: link-local)."##),
+    (r##"ospf.neighbor.interface"##, r##"## What it is
+The interface the neighbor is on."##),
+    (r##"ospf.neighbor.router_id"##, r##"## What it is
+The neighbor's router id."##),
+    (r##"ospf.neighbor.state"##, r##"## What it is
+The adjacency state (RFC 2328 §10.1): Down, Init, 2-Way, ExStart, Exchange, Loading, Full; and the neighbor's role on the link (DR, BDR, DROther, ptp).
+
+## Normal
+Full with the DR and BDR; 2-Way with the others on a LAN."##),
+    (r##"ospf.neighbor.uptime"##, r##"## What it is
+Time in the current state (Full: the adjacency's uptime)."##),
+    (r##"ospf.path"##, r##"## What it is
+The shortest path to an address or router id over the LSDB, the cost added hop by hop, checked against the daemon's route."##),
+    (r##"ospf.route.cost"##, r##"## What it is
+The total cost (E2: the external metric, then the cost to the ASBR)."##),
+    (r##"ospf.route.kind"##, r##"## What it is
+intra-area, inter-area, ext-1, ext-2."##),
+    (r##"ospf.route.nexthop"##, r##"## What it is
+The next hop and interface."##),
+    (r##"ospf.route.prefix"##, r##"## What it is
+The destination."##),
+    (r##"ospf.tab.areas"##, r##"## What it is
+The areas of each instance. 0.0.0.0 is the backbone; the others connect to it through an ABR."##),
+    (r##"ospf.tab.instances"##, r##"## What it is
+One OSPF process per version (2: IPv4, 3: IPv6) and VRF: router id, redistribution and the default route."##),
+    (r##"ospf.tab.keychains"##, r##"## What it is
+Key chains: several keys, each with a window to be sent and to be accepted, so a key is replaced without dropping a neighbor (RFC 8177)."##),
+    (r##"ospf.tab.lsdb"##, r##"## What it is
+The link-state database (RouterOS `/routing ospf lsa`): every LSA the router holds, by type and area."##),
+    (r##"ospf.tab.neighbors"##, r##"## What it is
+The adjacencies OSPF formed (RouterOS `/routing ospf neighbor`), live. Select one and press Diagnose to see why it is not Full."##),
+    (r##"ospf.tab.routes"##, r##"## What it is
+The routes OSPF computed. Select one (or type an address) to see why its path is the one: the cost added hop by hop."##),
+    (r##"ospf.tab.templates"##, r##"## What it is
+Which interfaces run OSPF and how: matched by name, interface list or network. The first template that matches an interface wins."##),
+    (r##"ospf.tab.topology"##, r##"## What it is
+The network as the LSDB describes it: routers, transit networks and the cost of each link. Click a router to see the path to it."##),
+    (r##"ospf.template"##, r##"## What it is
+An interface template (RouterOS `/routing ospf interface-template`). The preview lists the interfaces it takes now, the network type each suggests, missing authentication and the adjacencies that drop."##),
+    (r##"ospf.template.area"##, r##"## What it is
+The area the matched interfaces join."##),
+    (r##"ospf.template.auth"##, r##"## What it is
+simple, md5, sha1, sha256, sha384, sha512. sha256 is the default when only a key is given.
+
+## Careful
+simple and md5 are weak."##),
+    (r##"ospf.template.auth_id"##, r##"## What it is
+The key id on the wire (0..255 in v2). Must match the neighbors'."##),
+    (r##"ospf.template.auth_key"##, r##"## What it is
+One key, sealed at once; never shown back. Empty keeps the current one."##),
+    (r##"ospf.template.bfd"##, r##"## What it is
+The BFD profile that watches the adjacencies (sub-second failure detection, RFC 5882)."##),
+    (r##"ospf.template.cost"##, r##"## What it is
+The interface's cost (1..65535); empty: from the bandwidth."##),
+    (r##"ospf.template.dead_interval"##, r##"## What it is
+Seconds without a Hello before the neighbor is down (default 40). Must match."##),
+    (r##"ospf.template.hello_interval"##, r##"## What it is
+Seconds between Hellos (default 10). Must match the neighbors'."##),
+    (r##"ospf.template.interfaces"##, r##"## What it is
+Interface names or interface lists this template takes."##),
+    (r##"ospf.template.keychain"##, r##"## What it is
+A key chain instead of one key: rotation without a drop."##),
+    (r##"ospf.template.matched"##, r##"## What it is
+The interfaces this template takes now (a later template does not get them)."##),
+    (r##"ospf.template.mtu_ignore"##, r##"## What it is
+Accept a different MTU in the DD exchange (RFC 2328 §10.6)."##),
+    (r##"ospf.template.networks"##, r##"## What it is
+An interface with an address inside one of these networks matches."##),
+    (r##"ospf.template.passive"##, r##"## What it is
+Announce the networks but send no Hello.
+
+## Recommended
+On customer and loopback interfaces."##),
+    (r##"ospf.template.priority"##, r##"## What it is
+DR election priority (0: never DR)."##),
+    (r##"ospf.template.type"##, r##"## What it is
+broadcast (LAN, DR elected), ptp (two routers: /30, /31, PPP), nbma, ptmp, virtual-link.
+
+## Recommended
+ptp on a link with two routers: no DR election, adjacency sooner."##),
+    (r##"ospf.template.warnings"##, r##"## What it is
+What to look at: missing or weak authentication, a better network type, passive on a customer interface, a template hidden by an earlier one."##),
+    (r##"ospf.topology.legend"##, r##"## What it is
+Circles are routers (ours highlighted, neighbors green, ABR/ASBR with a ring), squares transit networks; numbers are link costs (a/b when the ends differ). Drag to pan, scroll to zoom, click a router for the path."##),
+];

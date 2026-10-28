@@ -1,0 +1,454 @@
+{
+  "expect": [
+    {
+      "bgp_established": 2,
+      "bgp_routes": [
+        "100.64.0.0/16",
+        "198.51.100.0/24",
+        "203.0.113.0/24"
+      ],
+      "node": "R1"
+    },
+    {
+      "bgp_established": 2,
+      "bgp_routes": [
+        "198.51.100.0/24",
+        "203.0.113.0/24"
+      ],
+      "node": "R2"
+    },
+    {
+      "bgp_established": 3,
+      "bgp_routes": [
+        "100.64.0.0/16",
+        "198.51.100.0/24",
+        "203.0.113.0/24"
+      ],
+      "node": "R3"
+    },
+    {
+      "bgp_established": 1,
+      "bgp_routes": [
+        "100.64.0.0/16"
+      ],
+      "node": "R4"
+    }
+  ],
+  "faults": [
+    {
+      "at_ms": 60000,
+      "kind": "link-cut",
+      "link": 3
+    }
+  ],
+  "format": "corerouter-netsim/1",
+  "links": [
+    {
+      "a": "R1",
+      "a_iface": "ether1",
+      "b": "R2",
+      "b_iface": "ether1",
+      "bfd": true,
+      "cost_a": 10,
+      "cost_b": 10,
+      "latency_us": 1000,
+      "ospf": true
+    },
+    {
+      "a": "R2",
+      "a_iface": "ether2",
+      "b": "R3",
+      "b_iface": "ether1",
+      "bfd": true,
+      "cost_a": 10,
+      "cost_b": 10,
+      "latency_us": 1000,
+      "ospf": true
+    },
+    {
+      "a": "R1",
+      "a_iface": "ether2",
+      "b": "R3",
+      "b_iface": "ether2",
+      "bfd": true,
+      "cost_a": 10,
+      "cost_b": 10,
+      "latency_us": 1000,
+      "ospf": true
+    },
+    {
+      "a": "R4",
+      "a_iface": "ether1",
+      "b": "R1",
+      "b_iface": "ether3",
+      "bfd": true,
+      "cost_a": 10,
+      "cost_b": 10,
+      "latency_us": 5000,
+      "ospf": false
+    },
+    {
+      "a": "R4",
+      "a_iface": "ether2",
+      "b": "R3",
+      "b_iface": "ether3",
+      "bfd": true,
+      "cost_a": 10,
+      "cost_b": 10,
+      "latency_us": 5000,
+      "ospf": false
+    }
+  ],
+  "name": "square",
+  "nodes": [
+    {
+      "commands": [
+        {
+          "command": "system.identity.set",
+          "params": {
+            "name": "R1"
+          }
+        },
+        {
+          "command": "interface.loopback.add",
+          "params": {
+            "name": "lo"
+          }
+        },
+        {
+          "command": "ip.address.add",
+          "params": {
+            "address": "10.255.0.1/32",
+            "interface": "lo"
+          }
+        },
+        {
+          "command": "ip.address.add",
+          "params": {
+            "address": "10.0.0.1/30",
+            "interface": "ether1"
+          }
+        },
+        {
+          "command": "ip.address.add",
+          "params": {
+            "address": "10.0.0.9/30",
+            "interface": "ether2"
+          }
+        },
+        {
+          "command": "ip.address.add",
+          "params": {
+            "address": "10.0.0.14/30",
+            "interface": "ether3"
+          }
+        },
+        {
+          "command": "routing.filter.rule.add",
+          "params": {
+            "chain": "sim-accept",
+            "comment": "simulator: eBGP needs a policy (RFC 8212)",
+            "rule": "accept"
+          }
+        },
+        {
+          "command": "routing.bgp.instance.set",
+          "params": {
+            "asn": 65000,
+            "router_id": "10.255.0.1"
+          }
+        },
+        {
+          "command": "routing.bgp.connection.add",
+          "params": {
+            "name": "r2",
+            "nexthop_choice": "force-self",
+            "remote_address": "10.255.0.2",
+            "remote_as": 65000,
+            "update_source": "10.255.0.1"
+          }
+        },
+        {
+          "command": "routing.bgp.connection.add",
+          "params": {
+            "name": "r3",
+            "nexthop_choice": "force-self",
+            "remote_address": "10.255.0.3",
+            "remote_as": 65000,
+            "update_source": "10.255.0.1"
+          }
+        },
+        {
+          "command": "routing.bgp.connection.add",
+          "params": {
+            "input_filter": "sim-accept",
+            "name": "r4",
+            "output_filter": "sim-accept",
+            "remote_address": "10.0.0.13",
+            "remote_as": 65100
+          }
+        }
+      ],
+      "name": "R1",
+      "networks": [],
+      "ports": 8,
+      "pos": [
+        0.20000000298023224,
+        0.25
+      ]
+    },
+    {
+      "commands": [
+        {
+          "command": "system.identity.set",
+          "params": {
+            "name": "R2"
+          }
+        },
+        {
+          "command": "interface.loopback.add",
+          "params": {
+            "name": "lo"
+          }
+        },
+        {
+          "command": "ip.address.add",
+          "params": {
+            "address": "10.255.0.2/32",
+            "interface": "lo"
+          }
+        },
+        {
+          "command": "ip.address.add",
+          "params": {
+            "address": "10.0.0.2/30",
+            "interface": "ether1"
+          }
+        },
+        {
+          "command": "ip.address.add",
+          "params": {
+            "address": "10.0.0.5/30",
+            "interface": "ether2"
+          }
+        },
+        {
+          "command": "routing.bgp.instance.set",
+          "params": {
+            "asn": 65000,
+            "router_id": "10.255.0.2"
+          }
+        },
+        {
+          "command": "routing.bgp.connection.add",
+          "params": {
+            "name": "r1",
+            "nexthop_choice": "force-self",
+            "remote_address": "10.255.0.1",
+            "remote_as": 65000,
+            "update_source": "10.255.0.2"
+          }
+        },
+        {
+          "command": "routing.bgp.connection.add",
+          "params": {
+            "name": "r3",
+            "nexthop_choice": "force-self",
+            "remote_address": "10.255.0.3",
+            "remote_as": 65000,
+            "update_source": "10.255.0.2"
+          }
+        }
+      ],
+      "name": "R2",
+      "networks": [
+        "100.64.0.0/16"
+      ],
+      "ports": 8,
+      "pos": [
+        0.800000011920929,
+        0.25
+      ]
+    },
+    {
+      "commands": [
+        {
+          "command": "system.identity.set",
+          "params": {
+            "name": "R3"
+          }
+        },
+        {
+          "command": "interface.loopback.add",
+          "params": {
+            "name": "lo"
+          }
+        },
+        {
+          "command": "ip.address.add",
+          "params": {
+            "address": "10.255.0.3/32",
+            "interface": "lo"
+          }
+        },
+        {
+          "command": "ip.address.add",
+          "params": {
+            "address": "10.0.0.6/30",
+            "interface": "ether1"
+          }
+        },
+        {
+          "command": "ip.address.add",
+          "params": {
+            "address": "10.0.0.10/30",
+            "interface": "ether2"
+          }
+        },
+        {
+          "command": "ip.address.add",
+          "params": {
+            "address": "10.0.0.18/30",
+            "interface": "ether3"
+          }
+        },
+        {
+          "command": "routing.filter.rule.add",
+          "params": {
+            "chain": "sim-accept",
+            "comment": "simulator: eBGP needs a policy (RFC 8212)",
+            "rule": "accept"
+          }
+        },
+        {
+          "command": "routing.bgp.instance.set",
+          "params": {
+            "asn": 65000,
+            "router_id": "10.255.0.3"
+          }
+        },
+        {
+          "command": "routing.bgp.connection.add",
+          "params": {
+            "name": "r2",
+            "nexthop_choice": "force-self",
+            "remote_address": "10.255.0.2",
+            "remote_as": 65000,
+            "update_source": "10.255.0.3"
+          }
+        },
+        {
+          "command": "routing.bgp.connection.add",
+          "params": {
+            "name": "r1",
+            "nexthop_choice": "force-self",
+            "remote_address": "10.255.0.1",
+            "remote_as": 65000,
+            "update_source": "10.255.0.3"
+          }
+        },
+        {
+          "command": "routing.bgp.connection.add",
+          "params": {
+            "input_filter": "sim-accept",
+            "name": "r4",
+            "output_filter": "sim-accept",
+            "remote_address": "10.0.0.17",
+            "remote_as": 65100
+          }
+        }
+      ],
+      "name": "R3",
+      "networks": [],
+      "ports": 8,
+      "pos": [
+        0.800000011920929,
+        0.75
+      ]
+    },
+    {
+      "commands": [
+        {
+          "command": "system.identity.set",
+          "params": {
+            "name": "R4"
+          }
+        },
+        {
+          "command": "interface.loopback.add",
+          "params": {
+            "name": "lo"
+          }
+        },
+        {
+          "command": "ip.address.add",
+          "params": {
+            "address": "10.255.0.4/32",
+            "interface": "lo"
+          }
+        },
+        {
+          "command": "ip.address.add",
+          "params": {
+            "address": "10.0.0.13/30",
+            "interface": "ether1"
+          }
+        },
+        {
+          "command": "ip.address.add",
+          "params": {
+            "address": "10.0.0.17/30",
+            "interface": "ether2"
+          }
+        },
+        {
+          "command": "routing.filter.rule.add",
+          "params": {
+            "chain": "sim-accept",
+            "comment": "simulator: eBGP needs a policy (RFC 8212)",
+            "rule": "accept"
+          }
+        },
+        {
+          "command": "routing.bgp.instance.set",
+          "params": {
+            "asn": 65100,
+            "router_id": "10.255.0.4"
+          }
+        },
+        {
+          "command": "routing.bgp.connection.add",
+          "params": {
+            "input_filter": "sim-accept",
+            "name": "r1",
+            "output_filter": "sim-accept",
+            "remote_address": "10.0.0.14",
+            "remote_as": 65000
+          }
+        },
+        {
+          "command": "routing.bgp.connection.add",
+          "params": {
+            "input_filter": "sim-accept",
+            "name": "r3",
+            "output_filter": "sim-accept",
+            "remote_address": "10.0.0.18",
+            "remote_as": 65000
+          }
+        }
+      ],
+      "name": "R4",
+      "networks": [
+        "198.51.100.0/24",
+        "203.0.113.0/24"
+      ],
+      "ports": 8,
+      "pos": [
+        0.20000000298023224,
+        0.75
+      ]
+    }
+  ],
+  "run_ms": 90000,
+  "seed": 7
+}

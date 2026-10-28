@@ -20,7 +20,7 @@ use crate::topology::{Node, graphs, path};
 const RING: u8 = 3;
 
 fn rid(a: u8, b: u8) -> u32 {
-    u32::from(Ipv4Addr::new(10, 255, a, b))
+    u32::from(Ipv4Addr::new(10, 250, a, b))
 }
 
 /// What the lab shows for instance `instance` of `cfg`.
@@ -43,13 +43,13 @@ pub fn lab(
     };
     let mut nbrs = Vec::new();
     let mut ifs = Vec::new();
-    let mut my_links: Vec<Link> = Vec::new();
+    // Our router LSA of each area: the links of that area's interfaces.
+    let mut my_links: std::collections::BTreeMap<u32, Vec<Link>> =
+        std::collections::BTreeMap::new();
     let addrs = crate::bind::addresses(cfg, inst.version == Version::V3);
-    let mut area0 = 0;
     for (i, b) in binds.iter().enumerate() {
         let i = u8::try_from(i.min(200)).unwrap_or(200);
         let area = b.area.area_id.0;
-        area0 = area;
         let cost = b.template.cost.unwrap_or(10);
         let state = if b.template.passive {
             "DR"
@@ -82,7 +82,7 @@ pub fn lab(
         });
         for a in addrs.get(&b.interface).map_or(&[][..], Vec::as_slice) {
             if let ipnet::IpNet::V4(n) = a {
-                my_links.push(Link {
+                my_links.entry(area).or_default().push(Link {
                     kind: 3,
                     id: u32::from(n.network()),
                     data: u32::from(n.netmask()),
@@ -120,7 +120,7 @@ pub fn lab(
         if !full {
             continue;
         }
-        my_links.push(Link {
+        my_links.entry(area).or_default().push(Link {
             kind: 1,
             id: nb,
             data: 0,
@@ -241,23 +241,25 @@ pub fn lab(
             });
         }
     }
-    let start = u32::try_from(db.links.len()).unwrap_or(u32::MAX);
-    let count = u16::try_from(my_links.len()).unwrap_or(0);
-    db.links.extend(my_links);
-    db.lsas.insert(
-        0,
-        Lsa {
-            kind: 1,
-            area: area0,
-            id: me,
-            adv: me,
-            age: 30,
-            seq: 0x8000_0005,
-            link_start: start,
-            link_count: count,
-            ..Lsa::default()
-        },
-    );
+    for (i, (area, links)) in my_links.into_iter().enumerate() {
+        let start = u32::try_from(db.links.len()).unwrap_or(u32::MAX);
+        let count = u16::try_from(links.len()).unwrap_or(0);
+        db.links.extend(links);
+        db.lsas.insert(
+            i,
+            Lsa {
+                kind: 1,
+                area,
+                id: me,
+                adv: me,
+                age: 30,
+                seq: 0x8000_0005,
+                link_start: start,
+                link_count: count,
+                ..Lsa::default()
+            },
+        );
+    }
     let routes = routes(&db, instance, me, &nbrs);
     (nbrs, ifs, db, routes)
 }
