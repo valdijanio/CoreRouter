@@ -478,6 +478,83 @@ fn select_group(group: &mut [Line]) {
     }
 }
 
+/// The lines of one (table, prefix): `lines` is sorted by [`order`], so a
+/// binary search finds the run (O(log n), a full table of 1 M routes too).
+fn group_of<'a>(lines: &'a [Line], table: &RoutingTable, dst: IpNet) -> &'a [Line] {
+    let want = (!table.is_main(), table, dst);
+    let start = lines.partition_point(|l| (!l.table.is_main(), &l.table, l.dst) < want);
+    let rest = lines.get(start..).unwrap_or(&[]);
+    let len = rest
+        .iter()
+        .take_while(|l| l.table == *table && l.dst == dst)
+        .count();
+    rest.get(..len).unwrap_or(&[])
+}
+
+/// What a route a client installed (DHCP, DHCPv6) does in the table
+/// (G1.27h): the client's list says it, so an operator sees why traffic
+/// leaves elsewhere without reading the whole table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fate {
+    /// `0.0.0.0/0 via 10.15.0.1%eth0`.
+    pub route: String,
+    pub state: State,
+    /// Paths of its ECMP group when active (1: alone).
+    pub ecmp: usize,
+    /// Why it is not the route in use, or with whom it shares the traffic.
+    pub note: Option<String>,
+}
+
+/// The [`Fate`] of the route `id` of `table`/`dst` (gateway text `gw`).
+pub(crate) fn fate(
+    lines: &[Line],
+    id: ItemId,
+    table: &RoutingTable,
+    dst: IpNet,
+    gw: &str,
+) -> Fate {
+    let route = format!("{dst} via {gw}");
+    let group = group_of(lines, table, dst);
+    let Some(me) = group.iter().find(|l| l.id == Some(id)) else {
+        return Fate {
+            note: Some(format!("route {route} is not in the routing table")),
+            route,
+            state: State::Inactive,
+            ecmp: 1,
+        };
+    };
+    let note = match me.state {
+        State::Active if me.ecmp > 1 => {
+            let others: Vec<String> = group
+                .iter()
+                .filter(|l| l.state == State::Active && l.id != Some(id))
+                .map(|l| {
+                    let name = l.id.map_or_else(|| "connected".to_owned(), |i| i.to_string());
+                    format!("{name} via {}", l.immediate_gw().unwrap_or_default())
+                })
+                .collect();
+            Some(format!(
+                "route {route} shares the traffic (ECMP) with {} at distance {}; \
+                 raise the distance to keep it as a backup",
+                others.join(", "),
+                me.distance
+            ))
+        }
+        State::Active => None,
+        State::Standby | State::Inactive => Some(format!(
+            "route {route} is {}: {}",
+            me.state.as_str(),
+            me.why.as_ref().map_or("", |w| w.text.as_str())
+        )),
+    };
+    Fate {
+        route,
+        state: me.state,
+        ecmp: me.ecmp,
+        note,
+    }
+}
+
 impl Session {
     /// What [`build`] needs besides the config.
     pub(crate) fn route_live(&mut self, cfg: &Config) -> Live {
@@ -866,5 +943,88 @@ impl Session {
             self.log_route_changes(&seen);
         }
         (lines, now)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(id: u32, dst: &str, distance: u8, origin: Origin, gw: &str, up: bool) -> Line {
+        let gateway: IpAddr = gw.parse().unwrap();
+        Line {
+            key: ItemId(id).to_string(),
+            id: Some(ItemId(id)),
+            dst: dst.parse().unwrap(),
+            table: RoutingTable::Main,
+            distance,
+            origin,
+            gateway: gw.to_owned(),
+            gateway_address: Some(gateway),
+            gateway_interface: None,
+            via: up.then(|| Via {
+                link: "ether1".parse().unwrap(),
+                gateway: Some(gateway),
+            }),
+            disabled: false,
+            why: (!up).then(|| Why::new("unreachable", "unreachable".into())),
+            check: None,
+            comment: String::new(),
+            state: State::Inactive,
+            ecmp: 1,
+        }
+    }
+
+    fn table(mut lines: Vec<Line>) -> Vec<Line> {
+        lines.sort_by(order);
+        select(&mut lines);
+        lines
+    }
+
+    #[test]
+    fn group_of_finds_one_prefix_among_many() {
+        let mut v: Vec<Line> = (0..1000u32)
+            .map(|n| {
+                let dst = format!("10.{}.{}.0/24", n / 256, n % 256);
+                line(n + 1, &dst, 1, Origin::Static, "10.0.0.1", true)
+            })
+            .collect();
+        v.push(line(5000, "10.0.7.0/24", 1, Origin::Dhcp, "10.0.0.2", true));
+        let v = table(v);
+        let g = group_of(&v, &RoutingTable::Main, "10.0.7.0/24".parse().unwrap());
+        assert_eq!(g.len(), 2);
+        assert!(group_of(&v, &RoutingTable::Main, "192.0.2.0/24".parse().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn fate_says_ecmp_standby_and_inactive() {
+        let dst: IpNet = "0.0.0.0/0".parse().unwrap();
+        let main = RoutingTable::Main;
+        // Same distance: ECMP, named with the other path.
+        let v = table(vec![
+            line(1, "0.0.0.0/0", 1, Origin::Static, "192.168.122.1", true),
+            line(0xDC00_0101, "0.0.0.0/0", 1, Origin::Dhcp, "10.15.0.1", true),
+        ]);
+        let f = fate(&v, ItemId(0xDC00_0101), &main, dst, "10.15.0.1%eth0");
+        assert_eq!((f.state, f.ecmp), (State::Active, 2));
+        let note = f.note.unwrap();
+        assert!(note.contains("ECMP") && note.contains("*1 via 192.168.122.1"), "{note}");
+        // Higher distance: standby, with the winner.
+        let v = table(vec![
+            line(1, "0.0.0.0/0", 1, Origin::Static, "192.168.122.1", true),
+            line(0xDC00_0101, "0.0.0.0/0", 2, Origin::Dhcp, "10.15.0.1", true),
+        ]);
+        let f = fate(&v, ItemId(0xDC00_0101), &main, dst, "10.15.0.1");
+        assert_eq!(f.state, State::Standby);
+        assert!(f.note.unwrap().contains("loses to distance 1 (route *1"));
+        // Unreachable gateway: inactive, with the reason.
+        let v = table(vec![line(0xDC00_0101, "0.0.0.0/0", 1, Origin::Dhcp, "10.15.0.1", false)]);
+        let f = fate(&v, ItemId(0xDC00_0101), &main, dst, "10.15.0.1");
+        assert_eq!(f.state, State::Inactive);
+        assert!(f.note.unwrap().contains("is inactive: unreachable"));
+        // Alone and active: nothing to say. Missing: said.
+        let v = table(vec![line(0xDC00_0101, "0.0.0.0/0", 1, Origin::Dhcp, "10.15.0.1", true)]);
+        assert_eq!(fate(&v, ItemId(0xDC00_0101), &main, dst, "x").note, None);
+        assert!(fate(&[], ItemId(7), &main, dst, "x").note.unwrap().contains("not in the routing table"));
     }
 }

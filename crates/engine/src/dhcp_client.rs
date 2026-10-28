@@ -375,8 +375,8 @@ fn lease_text(secs: u32) -> String {
 impl Session {
     /// `cfg` plus the addresses and routes the DHCP clients installed: what
     /// the data plane runs. Entries of clients that `cfg` no longer has (or
-    /// has disabled) are left out, and so is a route a static route already
-    /// holds (same table, destination and distance: the kernel takes one).
+    /// has disabled) are left out; a static route to the same prefix does
+    /// not hide a lease's route (`route_table::build` picks the winner).
     /// Static routes whose gateway fails check-gateway (G1.27f) are out too.
     pub(crate) fn effective<'a>(&self, cfg: &'a Config) -> Cow<'a, Config> {
         let v4_quiet = self
@@ -403,17 +403,13 @@ impl Session {
             }
             out.ip.addresses.extend(r.addresses.iter().cloned());
             out.ip.addresses.extend(r.fallback.iter().cloned());
-            for route in r.routes.iter().filter(|rt| !r.withholds(rt)) {
-                let taken = out.ip.routes.iter().any(|o| {
-                    !o.disabled
-                        && o.routing_table == route.routing_table
-                        && o.dst_address == route.dst_address
-                        && o.distance == route.distance
-                });
-                if !taken {
-                    out.ip.routes.push(route.clone());
-                }
-            }
+            // G1.27h: a static route to the same prefix at the same
+            // distance does not hide the lease's route: both are listed and
+            // share the traffic (ECMP, RouterOS v7), one multipath route in
+            // the kernel; a lower distance leaves the other on standby.
+            out.ip
+                .routes
+                .extend(r.routes.iter().filter(|rt| !r.withholds(rt)).cloned());
         }
         // DHCPv6 (G4.7b): leases, and the addresses taken from pools.
         self.dhcp6_extend(cfg, &mut out);

@@ -45,6 +45,12 @@ reescreve a rota com os irmãos (`hal-linux`, `netlink.rs`). Uma rota `proto sta
 programa com o mesmo prefixo e métrica nunca é misturada com as nossas: o apply recusa, como antes.
 Rotas aprendidas por RA de vários roteadores também formam grupo (o kernel já as junta).
 
+Uma rota de lease (DHCP, DHCPv6) ao lado de uma estática com o mesmo destino e distância nunca
+some: até o G1.27h o motor a tirava da lista e do kernel sem dizer nada (achado numa VM: a rota
+padrão do DHCP não aparecia, nem inativa, enquanto a estática `*1` existia). Agora as duas formam o
+grupo ECMP e `ip.dhcp-client.list` diz com quem a rota divide o tráfego (`route_states`, `notes`);
+para usá-la só como reserva, suba o `default_route_distance`.
+
 Na GUI o grupo aparece numa linha "+ 2 next-hops" com o selo `ECMP`; um clique abre os caminhos.
 
 ## Check-gateway (G1.27f, G3.6g)

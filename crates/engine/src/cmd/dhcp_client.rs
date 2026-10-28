@@ -6,7 +6,8 @@ use corerouter_model::dhcp_client::{
     CheckGateway, MAX_ALLOWED, MAX_EXTRA, MAX_FALLBACK_TIMEOUT, MIN_FALLBACK_TIMEOUT,
 };
 use corerouter_model::{
-    AddDefaultRoute, AllowedServer, Config, DhcpClient, ExtraOption, IfName, ItemId, RoutingTable,
+    AddDefaultRoute, AllowedServer, Config, DhcpClient, ExtraOption, IfName, ItemId, RouteEntry,
+    RoutingTable,
 };
 use corerouter_proto_dhcp::v4;
 use ipnet::Ipv4Net;
@@ -15,6 +16,7 @@ use serde_json::{Value, json};
 use super::args::{opt_bool, opt_parse, opt_str, opt_text, opt_u32, req_parse};
 use super::{CommandSpec, always};
 use crate::dhcp_client::{duration_text, table_for};
+use crate::route_table::{self, Line};
 use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
@@ -64,7 +66,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         release
     ),
     cmd!(query "ip.dhcp-client.list", "DHCP Client", ["IP", "DHCP Client"], None,
-        "{interface?: string} → [{id, flags (X disabled, I invalid), interface, use_peer_dns, add_default_route, status (stopped | searching | requesting | bound | renewing | rebinding | error), address, gateway, dhcp_server, expires_after, primary_dns, secondary_dns, primary_ntp, secondary_ntp, domain, lease_time, expires_after_secs, routes, notes, error, invalid, disabled, comment, default_route_distance, default_route_table, routes_table, use_peer_ntp, host_name, client_id, vendor_class, extra_options, allowed_servers, check_gateway, gateway_status (unchecked | up | down), fallback_address, fallback_timeout, fallback_active, remembered (the lease kept for INIT-REBOOT, if any)}]",
+        "{interface?: string} → [{id, flags (X disabled, I invalid), interface, use_peer_dns, add_default_route, status (stopped | searching | requesting | bound | renewing | rebinding | error), address, gateway, dhcp_server, expires_after, primary_dns, secondary_dns, primary_ntp, secondary_ntp, domain, lease_time, expires_after_secs, routes, route_states (each route of the lease in the routing table: [{route, state (active | standby | inactive), ecmp, reason}]), notes, error, invalid, disabled, comment, default_route_distance, default_route_table, routes_table, use_peer_ntp, host_name, client_id, vendor_class, extra_options, allowed_servers, check_gateway, gateway_status (unchecked | up | down), fallback_address, fallback_timeout, fallback_active, remembered (the lease kept for INIT-REBOOT, if any)}]",
         always, list),
     cmd!(query "ip.dhcp-client.options", "Received Options", [], None,
         "{id: *hex} → {id, interface, dhcp_server, options: [{code, name, value, hex}]}",
@@ -413,8 +415,31 @@ fn ips(v: &[std::net::Ipv4Addr], i: usize) -> Value {
     v.get(i).map_or(Value::Null, |ip| json!(ip.to_string()))
 }
 
+/// What each route of a lease does in the routing table (G1.27h): one
+/// `route_states` entry per route, and a note for each one that is not
+/// alone in forwarding (standby, inactive, ECMP with another route).
+pub(super) fn route_states(lines: &[Line], routes: &[RouteEntry]) -> (Vec<Value>, Vec<String>) {
+    let mut notes = Vec::new();
+    let states = routes
+        .iter()
+        .map(|rt| {
+            let f = route_table::fate(
+                lines,
+                rt.id,
+                &rt.routing_table,
+                rt.dst_address,
+                &rt.gateway.to_string(),
+            );
+            notes.extend(f.note.clone());
+            json!({"route": f.route, "state": f.state.as_str(), "ecmp": f.ecmp, "reason": f.note})
+        })
+        .collect();
+    (states, notes)
+}
+
 fn list(s: &mut Session, p: &Value) -> Result<Value> {
     let filter: Option<IfName> = opt_parse(p, "interface")?;
+    let lines = s.route_lines();
     let cfg = s.store().candidate();
     let now = s.dhcp.now_ms;
     let mut rows = Vec::new();
@@ -454,6 +479,9 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                     .collect()
             })
             .unwrap_or_default();
+        let (states, route_notes) = route_states(&lines, runner.map_or(&[], |r| r.routes.as_slice()));
+        let mut notes = runner.map(|r| r.notes.clone()).unwrap_or_default();
+        notes.extend(route_notes);
         let empty = Vec::new();
         let (dns, ntp) = lease.map_or((&empty, &empty), |l| (&l.dns, &l.ntp));
         rows.push(json!({
@@ -479,7 +507,8 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
             }),
             "expires_after_secs": expires,
             "routes": routes,
-            "notes": runner.map(|r| r.notes.clone()).unwrap_or_default(),
+            "route_states": states,
+            "notes": notes,
             "error": error.or(invalid.clone()),
             "invalid": invalid.is_some(),
             "disabled": c.disabled,

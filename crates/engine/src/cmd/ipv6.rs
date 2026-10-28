@@ -10,7 +10,7 @@ use ipnet::{IpNet, Ipv6Net};
 use serde_json::{Value, json};
 
 use super::args::{opt_bool, opt_parse, opt_str, opt_text, opt_u32, req_parse};
-use super::dhcp_client::opt_list;
+use super::dhcp_client::{opt_list, route_states};
 use super::{CommandSpec, always};
 use crate::dhcp_client::duration_text;
 use crate::{EngineError, Result, Session};
@@ -62,7 +62,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         release
     ),
     cmd!(query "ipv6.dhcp-client.list", "DHCPv6 Client", ["IPv6", "DHCP Client"], None,
-        "{interface?: string} → [{id, flags (X disabled, I invalid), interface, request, pool_name, status (stopped | searching | requesting | bound | renewing | rebinding | error), address, prefix, expires_after, address_expires_after, prefix_expires_after, dhcp_server, server_duid, duid, primary_dns, secondary_dns, domains, missing, routes, t1_after, t2_after, error, invalid, disabled, comment, prefix_hint, accept_prefix_without_address, add_default_route, default_route_distance, use_peer_dns, rapid_commit, custom_duid, allowed_servers}]",
+        "{interface?: string} → [{id, flags (X disabled, I invalid), interface, request, pool_name, status (stopped | searching | requesting | bound | renewing | rebinding | error), address, prefix, expires_after, address_expires_after, prefix_expires_after, dhcp_server, server_duid, duid, primary_dns, secondary_dns, domains, missing, routes, route_states (each route of the lease in the routing table: [{route, state (active | standby | inactive), ecmp, reason}]), notes (why a route of the lease is not the one in use), t1_after, t2_after, error, invalid, disabled, comment, prefix_hint, accept_prefix_without_address, add_default_route, default_route_distance, use_peer_dns, rapid_commit, custom_duid, allowed_servers}]",
         always, list),
     cmd!(query "ipv6.dhcp-client.options", "Received Options", [], None,
         "{id: *hex} → {id, interface, dhcp_server, options: [{code, name, value, hex}]}",
@@ -327,6 +327,7 @@ fn left(now: Option<u64>, at: Option<u64>) -> Option<u64> {
 
 fn list(s: &mut Session, p: &Value) -> Result<Value> {
     let filter: Option<IfName> = opt_parse(p, "interface")?;
+    let lines = s.route_lines();
     let cfg = s.store().candidate();
     let now = s.dhcp.now_ms;
     let mut rows = Vec::new();
@@ -363,6 +364,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                 .and_then(|t| left(now, Some(t)))
                 .map(duration_text)
         };
+        let (states, notes) = route_states(&lines, runner.map_or(&[], |r| r.routes.as_slice()));
         let dns = lease.map(|l| l.dns.clone()).unwrap_or_default();
         let ip = |i: usize| dns.get(i).map(ToString::to_string);
         rows.push(json!({
@@ -385,6 +387,8 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
             "domains": lease.map(|l| l.domains.clone()).unwrap_or_default(),
             "missing": lease.map(|l| l.missing.clone()).unwrap_or_default(),
             "routes": runner.map(|r| r.routes.iter().map(|rt| format!("{} via {}", rt.dst_address, rt.gateway)).collect::<Vec<_>>()).unwrap_or_default(),
+            "route_states": states,
+            "notes": notes,
             "t1_after": t(lease.map(|l| l.t1_ms)),
             "t2_after": t(lease.map(|l| l.t2_ms)),
             "error": error.or(invalid.clone()),
