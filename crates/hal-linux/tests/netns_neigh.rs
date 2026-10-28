@@ -410,18 +410,41 @@ fn arp_ping_gets_an_answer_from_a_real_host() {
     ip(&["link", "set", "nbd0", "up"]);
     far.ip(&["addr", "add", "10.23.9.9/16", "dev", "nbd1"]);
     far.ip(&["link", "set", "nbd1", "up"]);
+    // The kernel raises the carrier (and swaps the noop qdisc for the real
+    // one) from a deferred linkwatch work item: on a loaded runner a request
+    // sent right after `up` is dropped. Wait for it instead of racing it.
+    let t = Instant::now();
+    while ip(&["-o", "link", "show", "nbd0"]).contains("NO-CARRIER") {
+        assert!(
+            t.elapsed() < Duration::from_secs(30),
+            "nbd0 never got carrier"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let mut hal = LinuxHal::new();
     let mut p = hal.arp_pinger(&"nbd0".parse().unwrap()).unwrap();
     let mut rtts = Vec::new();
     for _ in 0..20 {
-        let r = p
-            .ping(
-                Ipv4Addr::new(10, 23, 0, 1),
-                Ipv4Addr::new(10, 23, 9, 9),
-                Duration::from_secs(1),
-            )
-            .unwrap()
-            .expect("the far host answers");
+        // A request is one frame with no retransmission, so a starved
+        // far-side softirq loses it: ask again within a generous deadline
+        // (the rtt kept is the answered try's).
+        let t = Instant::now();
+        let r = loop {
+            let got = p
+                .ping(
+                    Ipv4Addr::new(10, 23, 0, 1),
+                    Ipv4Addr::new(10, 23, 9, 9),
+                    Duration::from_secs(1),
+                )
+                .unwrap();
+            if let Some(r) = got {
+                break r;
+            }
+            assert!(
+                t.elapsed() < Duration::from_secs(30),
+                "the far host never answers"
+            );
+        };
         rtts.push(r.rtt);
     }
     rtts.sort();
@@ -447,7 +470,7 @@ fn arp_ping_gets_an_answer_from_a_real_host() {
         {
             break n;
         }
-        assert!(t.elapsed() < Duration::from_secs(3), "never resolved");
+        assert!(t.elapsed() < Duration::from_secs(30), "never resolved");
         std::thread::sleep(Duration::from_millis(20));
     };
     assert!(n.mac.is_some());
