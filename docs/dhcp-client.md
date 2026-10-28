@@ -18,7 +18,7 @@ todas as opções recebidas visíveis e um histórico de eventos.
 | `ip.dhcp-client.remove {id}` | remove (a concessão sai do data plane no mesmo commit) |
 | `ip.dhcp-client.renew {id}` | renova agora (preso a um servidor: unicast; sem concessão: recomeça) → `{id, status}` |
 | `ip.dhcp-client.release {id}` | manda DHCPRELEASE ao servidor, devolve endereço e rotas e recomeça a procurar → `{id, status}` |
-| `ip.dhcp-client.list {interface?}` | configuração + estado: `status`, `address`, `gateway`, `dhcp_server`, `expires_after`, DNS/NTP primário e secundário, domínio, rotas instaladas, notas, erro; flags `X` (desabilitado) e `I` (inválido) |
+| `ip.dhcp-client.list {interface?}` | configuração + estado: `status`, `address`, `gateway`, `dhcp_server`, `expires_after`, DNS/NTP primário e secundário, domínio, rotas instaladas, `route_states` (o que cada rota do lease faz na tabela: `active`/`standby`/`inactive`, ECMP e o motivo, G1.27h), notas (inclusive "a rota divide o tráfego com a estática *1" ou "está em standby: perde para…"), erro; flags `X` (desabilitado) e `I` (inválido) |
 | `ip.dhcp-client.options {id}` | todas as opções da última ACK: `{code, name, value, hex}`, decodificadas quando conhecidas, hex quando não |
 | `ip.dhcp-client.history {id?, after_seq?}` | eventos (anel de 512): `searching`, `offered`, `bound`, `renewed`, `lost`, `nak`, `refused`, `declined`, `ignored`, `error`, `stopped` |
 
@@ -206,7 +206,7 @@ rota padrão vem, como manda a RFC 7084 (W-3), do Router Advertisement do proved
 | `ipv6.dhcp-client.add {interface, request, …}` | cria o cliente (habilitado) → `{id}` |
 | `ipv6.dhcp-client.set` / `remove` | muda / remove (`remove` recusa enquanto um endereço usa o pool) |
 | `ipv6.dhcp-client.renew` / `release` | Renew agora / Release ao servidor e recomeça |
-| `ipv6.dhcp-client.list` | configuração + estado: `status`, `address` (/128), `prefix`, validades, T1/T2, servidor (link-local + DUID), nosso DUID, DNS, domínios, o que faltou (`missing`) |
+| `ipv6.dhcp-client.list` | configuração + estado: `status`, `address` (/128), `prefix`, validades, T1/T2, servidor (link-local + DUID), nosso DUID, DNS, domínios, o que faltou (`missing`), `route_states` e `notes` como no DHCPv4 (G1.27h) |
 | `ipv6.dhcp-client.options {id}` | todas as opções do último Reply (IA_NA/IA_PD decodificados) |
 | `ipv6.dhcp-client.history` | eventos: `searching`, `advertised`, `bound`, `renewed`, `lost`, `status`, `refused`, `ignored`, `error`, `stopped` |
 | `ipv6.pool.list` | os pools: prefixo, validade, endereços numerados a partir dele |

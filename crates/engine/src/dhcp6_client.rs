@@ -243,17 +243,8 @@ impl Session {
                 continue;
             }
             out.ip.addresses.extend(r.addresses.iter().cloned());
-            for route in &r.routes {
-                let taken = out.ip.routes.iter().any(|o| {
-                    !o.disabled
-                        && o.routing_table == route.routing_table
-                        && o.dst_address == route.dst_address
-                        && o.distance == route.distance
-                });
-                if !taken {
-                    out.ip.routes.push(route.clone());
-                }
-            }
+            // Listed even beside a static route to the same prefix (G1.27h).
+            out.ip.routes.extend(r.routes.iter().cloned());
         }
         let pools = self.pools(cfg);
         out.ip.addresses.retain_mut(|a| {
