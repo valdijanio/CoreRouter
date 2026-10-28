@@ -79,7 +79,8 @@ runs:
       if: inputs.kernel == 'true'
       with:
         path: ~/vrf-ko
-        key: vrf-ko-${{ steps.kernel.outputs.release }}
+        # v2: também o mpls_router.ko (G3.5), do mesmo pacote.
+        key: vrf-ko-v2-${{ steps.kernel.outputs.release }}
 
     - name: Carregar o módulo vrf
       if: inputs.kernel == 'true'
@@ -97,8 +98,9 @@ runs:
           mkdir -p ~/vrf-ko && cd "$RUNNER_TEMP"
           sudo apt-get update -qq   # o cache de pacotes acima pula o update
           if timeout 120 apt-get download "$pkg"; then
-            dpkg-deb --fsys-tarfile "$pkg"_*.deb | tar -x --wildcards '*/vrf.ko*'
-            find . -name 'vrf.ko*' -exec cp {} ~/vrf-ko/ \;
+            # G3.5: o mpls_router vem no mesmo pacote nas imagens do Azure.
+            dpkg-deb --fsys-tarfile "$pkg"_*.deb | tar -x --wildcards '*/vrf.ko*' '*/mpls_router.ko*' || true
+            find . \( -name 'vrf.ko*' -o -name 'mpls_router.ko*' \) -exec cp {} ~/vrf-ko/ \;
             ko=$(find ~/vrf-ko -name 'vrf.ko*' -print -quit)
           fi
         fi
@@ -119,7 +121,22 @@ runs:
         for f in ci/kernel-modules/*; do
           mod=$(basename "$f")
           [ "$mod" = README.md ] && continue
+          var=$(head -n1 "$f")
+          # Linha `optional` (G3.5): sem o módulo no kernel do runner, tenta o .ko guardado
+          # do linux-modules-extra (passo do vrf); se não houver, o teste pula com aviso.
+          if grep -qx optional "$f"; then
+            ko=$(find ~/vrf-ko -name "$mod.ko*" -print -quit 2>/dev/null || true)
+            if sudo modprobe "$mod" 2>/dev/null \
+              || { [ -n "$ko" ] && for d in $(modinfo -F depends "$ko" | tr ',' ' '); do sudo modprobe "$d"; done && sudo insmod "$ko"; }; then
+              lsmod | grep -w "^$mod"
+              echo "$var=1" >> "$GITHUB_ENV"
+            else
+              echo "::warning::módulo $mod indisponível neste runner; os testes que dependem dele ficam de fora deste run"
+              echo "$var=0" >> "$GITHUB_ENV"
+            fi
+            continue
+          fi
           sudo modprobe "$mod"
           lsmod | grep -w "^$mod"
-          echo "$(head -n1 "$f")=1" >> "$GITHUB_ENV"
+          echo "$var=1" >> "$GITHUB_ENV"
         done
