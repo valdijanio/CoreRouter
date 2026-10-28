@@ -197,7 +197,7 @@ fn comment_and_disabled(p: &Value, comment: &mut String, disabled: &mut bool) ->
 
 // ---- instances ----
 
-fn apply_instance(routing: &mut Routing, p: &Value, id: Option<&str>) -> Result<String> {
+pub(super) fn apply_instance(routing: &mut Routing, p: &Value, id: Option<&str>) -> Result<String> {
     let ospf = &mut routing.ospf;
     let mut inst = match id {
         Some(id) => ospf
@@ -362,7 +362,7 @@ fn instance_list(s: &mut Session, _: &Value) -> Result<Value> {
 
 // ---- areas ----
 
-fn apply_area(routing: &mut Routing, p: &Value, id: Option<&str>) -> Result<String> {
+pub(super) fn apply_area(routing: &mut Routing, p: &Value, id: Option<&str>) -> Result<String> {
     let ospf = &mut routing.ospf;
     let mut a = match id {
         Some(id) => ospf
@@ -513,7 +513,7 @@ fn area_list(s: &mut Session, _: &Value) -> Result<Value> {
 
 // ---- ranges ----
 
-fn apply_range(routing: &mut Routing, p: &Value, id: Option<ItemId>) -> Result<ItemId> {
+pub(super) fn apply_range(routing: &mut Routing, p: &Value, id: Option<ItemId>) -> Result<ItemId> {
     let ospf = &mut routing.ospf;
     let mut r = match id {
         Some(id) => ospf

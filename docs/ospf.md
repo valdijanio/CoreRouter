@@ -95,6 +95,17 @@ corerouter-cli run routing.ospf.interface-template.check '{"area":"backbone","ne
   Full e explicado pelo Diagnose, LSDB e topologia lidas).
 - **Limites**: VRF diferente de `main` e a LSDB do OSPFv3 ainda não são lidas (G3.4h).
 
+## Janela Routing › OSPF (G3.4c)
+
+Abas **Neighbors** (estado em selo "Full · DR", área em selo colorido pelo id, uptime, BFD; a linha
+selecionada mostra o detalhe e o botão **Diagnose**), **Instances**, **Areas**, **Interface
+Templates** e **Key Chains** (o padrão de lista G0.24: barra + − ✓ ✗ 💬, modal com a prévia do
+engine: interfaces que entram, tipo e `passive` sugeridos, autenticação ausente, adjacências que
+caem com Safe Mode), **LSDB** (paginada por tipo), **Routes** (selecionar uma rota mostra "Por que
+esse caminho?") e **Topology** (o mapa desenhado da LSDB; clique num roteador para o caminho; arraste
+e role para mover e aproximar). A resposta da topologia vira vetores planos ao chegar: 500
+roteadores pintam e tesselam em 3,2 ms por quadro em debug (**medido**).
+
 ## Seguro por padrão
 
 - `routing.ospf.interface-template.check` (o modal) mostra antes de aplicar: **quais interfaces
