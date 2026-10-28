@@ -6297,3 +6297,34 @@ continuação indentadas).
 
   Na primeira rodada, o `ospfd` dos vizinhos R2/R4 do roteiro abortou com o assert da G3.4l
   (TI-LFA ligado neles), sem relação com esta mudança; a segunda passou.
+
+- 2026-10-28 — G4.3hh: Adoção em lote na tomada do par BNG. O perfil mostrou que o tempo não ia nas rotas, como se
+  supunha: os 8 workers faziam fila no lock da tabela ativa, um por sessão (300 de 310 ms), e
+  `Ppp::effective` clonava três perfis por sessão. Agora:
+
+  - **Duas fases.** O worker indexa a sua parte da réplica, adota o primeiro bloco de 1024
+    (`Server::import`, o `Sub`, pool, tabela do caminho lento, XDP ou rota) e responde. Um quadro de
+    sessão ainda não adotada a adota na hora (nunca leva PADT); o resto vai um bloco por rodada,
+    com os quadros entre eles. Depois, a tabela ativa, o histórico, o Interim, a address-list e a
+    publicação, também em blocos, um lock da tabela por bloco. Uma sessão que acaba antes ganha a
+    linha primeiro (o Stop leva os contadores herdados).
+  - **Rotas em lote numa thread** (`pppoe-routes`): até 64 KiB de pedidos por `sendmsg`, ACK só no
+    último, repetição só do recusado, a contagem conferida e publicada na linha do tempo
+    (`routes`, `routes_refused`). Oito threads em lote eram mais lentas que uma (o kernel serializa
+    pelo RTNL do namespace). `COREROUTER_SLOW_ROUTES=each` volta ao `rtnetlink` uma a uma.
+  - **A réplica decodificada em até 8 threads**; o índice de secrets montado no `configure`; o
+    `effective` em cache por par de perfis.
+  - **Linha do tempo:** `handed_ms`, `answering_ms` e `routes_ms` no `ppp.redundancy.monitor`; o
+    selo "rotas" na janela PPP › Redundancy.
+  - **Laboratório:** "subida de volta" medida de verdade, pelo primeiro pacote de 32 sessões-sonda
+    na porta da rede (antes era a tabela de C).
+
+  Como testar: `cargo test -p corerouter-daemon --bin corerouter-daemon pppoe_ha_tests` (inclui a
+  sessão adotada na hora e a que cai antes da contabilidade);
+  `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-hal-linux --test netns_routes_batch`;
+  `cargo xtask vm-lab run -- env BNG_LAB_HA_BFD=fast cargo xtask bng-lab --only ha --scales 10000,100000`.
+
+  Medido na VM `corerouter-lab` (8 vCPUs, release, BNG Blaster, sem root, BFD `fast`), 100 mil
+  sessões: subida de todas as sondas de volta em **0,244 s** (antes 1,20 s), todas adotadas em
+  273 ms do último sinal de vida (antes 1102 ms), rotas no kernel em 308 ms, 0 perdidas. 10 mil:
+  0,203 s, igual à `main` (a adoção já cabia na detecção). Detalhes em `docs/bng-ha.md` §2.14.

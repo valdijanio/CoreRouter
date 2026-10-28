@@ -216,3 +216,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-28 — G3.4f feito (Segment Routing MPLS no OSPF); G3.4i e G3.4j criadas
 - 2026-10-28 — G3.4d feito (TI-LFA e aba Fast Reroute); G3.4k e G3.4l criadas
 - 2026-10-28 — G3.4i feita (loopback `lo` = `lo` do kernel, para o prefix SID)
+- 2026-10-28 — G4.3hh feito (adoção em lote na tomada do par); G4.3hi e G4.3hj abertos
