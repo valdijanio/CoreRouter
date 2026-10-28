@@ -506,14 +506,20 @@ fn monitor(ns: Option<u32>) -> Value {
     call(ns, "ppp.redundancy.monitor", json!({})).unwrap_or(Value::Null)
 }
 
-fn wait_secs(secs: u64, mut f: impl FnMut() -> bool) -> Option<f64> {
+fn wait_secs(secs: u64, f: impl FnMut() -> bool) -> Option<f64> {
+    wait_every(secs, Duration::from_millis(100), f)
+}
+
+/// `wait_secs` polling every `step`: 10 ms for the role (cheap; the
+/// takeover with BFD is ~0.2 s), 100 ms for the table queries, which take
+/// the sessions' lock and would slow the adoption they measure.
+fn wait_every(secs: u64, step: Duration, mut f: impl FnMut() -> bool) -> Option<f64> {
     let t = Instant::now();
     while t.elapsed() < Duration::from_secs(secs) {
         if f() {
             return Some(t.elapsed().as_secs_f64());
         }
-        // 10 ms: the takeover with BFD is ~0.2 s.
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(step);
     }
     None
 }
@@ -749,7 +755,15 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
     ip(None, &["link", "set", "wan0", "down"]);
     ip(None, &["link", "set", "sync0", "down"]);
     ip(None, &["addr", "del", "10.99.0.1/24", "dev", "gw0"]);
-    let takeover = wait_secs(30, || monitor(Some(cp))["role"] == "active").unwrap_or(f64::NAN);
+    let takeover = wait_every(30, Duration::from_millis(10), || {
+        monitor(Some(cp))["role"] == "active"
+    })
+    .unwrap_or(f64::NAN);
+    // G4.3hd: every session in C's table (adopted), from the cut.
+    let adopted = wait_secs(60, || active(Some(cp)) >= n as u64)
+        .map_or(f64::NAN, |_| cut.elapsed().as_secs_f64());
+    let back = wait_secs(60, || rx_sample(Some(cp)) > rx0)
+        .map_or(f64::NAN, |_| cut.elapsed().as_secs_f64());
     let timeline = {
         // G3.6h: C's own timeline, ms from A's last sign of life.
         let k = monitor(Some(cp))["takeovers"][0].clone();
@@ -763,11 +777,6 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
             ms("adopted_ms")
         )
     };
-    // G4.3hd: every session in C's table (adopted), from the cut.
-    let adopted = wait_secs(60, || active(Some(cp)) >= n as u64)
-        .map_or(f64::NAN, |_| cut.elapsed().as_secs_f64());
-    let back = wait_secs(60, || rx_sample(Some(cp)) > rx0)
-        .map_or(f64::NAN, |_| cut.elapsed().as_secs_f64());
     // Keepalive (5 s × 3 on BNG Blaster) and interims settle; IPoE: past
     // T1, every client renewed on C.
     std::thread::sleep(Duration::from_secs(if ipoe() { 75 } else { 30 }));
