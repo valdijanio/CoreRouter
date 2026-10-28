@@ -67,8 +67,8 @@ pub fn encode_label(label: u32, bottom: bool) -> [u8; 4] {
 /// bit; `None` if malformed (a stack without its bottom).
 pub fn decode_stack(b: &[u8]) -> Option<Vec<u32>> {
     let mut out = Vec::new();
-    for chunk in b.chunks_exact(4) {
-        let v = u32::from_be_bytes(chunk.try_into().ok()?);
+    for chunk in b.as_chunks::<4>().0 {
+        let v = u32::from_be_bytes(*chunk);
         out.push(v >> 12);
         if v & 0x100 != 0 {
             return Some(out);

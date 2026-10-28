@@ -95,16 +95,14 @@ pub fn set_ldp(s: &mut Session, read: Result<Option<LdpState>, String>) {
 pub fn labels(s: &mut Session) -> (Arc<Vec<MplsRoute>>, Option<String>) {
     let now = s.hal_now().unwrap_or(0);
     let service = s.ext::<KernelLabels>().is_some_and(|k| k.service);
-    if service {
-        if let Some(k) = s.ext_mut::<KernelLabels>() {
-            k.wanted_until = now.saturating_add(WANTED_SECS);
-            let note = match (&k.error, k.updated) {
-                (Some(e), _) => Some(e.clone()),
-                (None, None) => Some("reading the label table…".to_owned()),
-                (None, Some(_)) => None,
-            };
-            return (k.routes.clone(), note);
-        }
+    if service && let Some(k) = s.ext_mut::<KernelLabels>() {
+        k.wanted_until = now.saturating_add(WANTED_SECS);
+        let note = match (&k.error, k.updated) {
+            (Some(e), _) => Some(e.clone()),
+            (None, None) => Some("reading the label table…".to_owned()),
+            (None, Some(_)) => None,
+        };
+        return (k.routes.clone(), note);
     }
     match s.hal_mut().mpls_routes() {
         Ok(r) => (Arc::new(r), None),

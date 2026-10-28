@@ -1209,6 +1209,34 @@ total oferecida em pacotes de 128 B, `shaper_root::perf_edt_vs_htb`):
   do assinante, o caminho é a qdisc em BPF (`struct_ops`, kernel 6.16+), não o HTB.
 - **Revisar** com placa real (G4.3cb) e quando a qdisc BPF estiver nos kernels das distribuições.
 
+### MPLS: kernel por netlink próprio, LDP no FRR (G3.5)
+
+**Comparado:**
+
+- Encaminhamento: o kernel (`mpls_router`) contra o XDP (G2.5). O kernel ficou. O fast path MPLS
+  em XDP é a G3.5f, só se o kernel se mostrar o gargalo num laboratório com tráfego.
+- Programação e leitura dos rótulos: três caminhos possíveis.
+  - `ip -f mpls`: um processo por lote e texto para interpretar;
+  - o crate `rtnetlink`: assíncrono, e o resto do `hal-linux` já é síncrono por socket
+    (`neigh.rs`);
+  - netlink próprio: codec puro de ~200 linhas, com proptest e muitas requisições por `sendmsg`.
+    **Ficou este.**
+- LDP: implementar em Rust contra o `ldpd` do FRR. Ficou o FRR, pela regra do projeto: protocolo
+  maduro, interoperabilidade antes de desempenho, e o gargalo não está no plano de controle.
+
+**Números:**
+
+- Montar a Forwarding Table de 100 mil rótulos e 10 mil FECs: 22,5 ms, **medido**.
+- Isso vai para a thread do serviço `mpls`. A página sob o lock fica em 1,1 ms e a busca em
+  0,48 ms, **medidos** (`docs/mpls.md`).
+- Lote × um a um no kernel: medido no CI completo / na VM (`tests/netns_mpls.rs`), pendente
+  aqui.
+
+**Revisar se:**
+
+- vier um LDP em Rust (holo, G3.8);
+- o kernel não aguentar a vazão MPLS.
+
 ## Histórico de revisão
 
 - 2026-10-21 — versão inicial (esqueleto v0.1.0).
