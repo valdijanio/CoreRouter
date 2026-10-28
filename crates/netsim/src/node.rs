@@ -245,12 +245,21 @@ impl Node {
                 }
                 Some(list) => {
                     let o = list.iter().find(|o| o.iface == p.iface);
+                    // A single-hop BGP neighbor with BFD on this link
+                    // turns BFD on for the port (G3.6b).
+                    let bgp_bfd = p.net.is_some_and(|net| {
+                        self.cfg
+                            .bgp
+                            .iter()
+                            .flat_map(|b| &b.neighbors)
+                            .any(|n| n.bfd && !n.disabled && net.contains(&n.remote))
+                    });
                     p.ospf = p.link_ospf && o.is_some();
                     p.cost = o
                         .and_then(|o| o.cost)
                         .unwrap_or(p.link_cost)
                         .clamp(1, 65535);
-                    p.bfd = p.link_bfd || o.is_some_and(|o| o.bfd);
+                    p.bfd = p.link_bfd || bgp_bfd || o.is_some_and(|o| o.bfd);
                     p.passive = o.is_some_and(|o| o.passive);
                     p.hello = o.and_then(|o| o.hello);
                     p.dead = o.and_then(|o| o.dead);

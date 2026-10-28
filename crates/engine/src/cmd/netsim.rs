@@ -601,4 +601,29 @@ mod tests {
         let r = route(&mut s, "R1", "10.255.0.5/32").unwrap();
         assert_eq!(r["proto"], "ospf", "{r}");
     }
+
+    #[test]
+    fn bgp_bfd_comes_from_the_connection() {
+        // G3.6b: the presets put the `default` BFD profile on eBGP; without
+        // it a silent cut waits for the hold timer.
+        let peers = |s: &mut Session| {
+            s.execute("tool.netsim.node.get", &json!({"node": "R1"})).unwrap()["bgp_peers"].clone()
+        };
+        for with_bfd in [true, false] {
+            let mut s = lab_session();
+            if !with_bfd {
+                for (node, conn) in [("R1", "r4"), ("R4", "r1")] {
+                    s.execute("tool.netsim.node.run", &json!({"node": node, "id": "routing.bgp.connection.set",
+                        "params": {"id": conn, "bfd": null}})).unwrap();
+                }
+            }
+            run_for(&mut s, 60_000);
+            let v = s.execute("tool.netsim.get", &json!({})).unwrap();
+            let up = v["links"].as_array().unwrap().iter().find(|l| l["ospf"] == false && (l["a"] == 0 || l["b"] == 0)).unwrap()["id"].clone();
+            s.execute("tool.netsim.fault", &json!({"kind": "link-cut", "link": up})).unwrap();
+            run_for(&mut s, 5_000);
+            let r4 = peers(&mut s).as_array().unwrap().iter().find(|p| p["name"] == "r4").cloned().unwrap();
+            assert_eq!(r4["state"] != "established", with_bfd, "bfd {with_bfd}: {r4}");
+        }
+    }
 }

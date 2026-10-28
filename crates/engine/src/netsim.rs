@@ -154,9 +154,9 @@ pub fn node_config(name: &str, cfg: &Config, networks: &[Ipv4Net], timers: Timer
                     keepalive,
                     input: p.input_filter.clone(),
                     output: p.output_filter.clone(),
-                    // Single-hop sessions follow the link's BFD (G3.2d
-                    // brings `use_bfd` to the model).
-                    bfd: true,
+                    // G3.6b: a BFD profile on the connection (RouterOS
+                    // `use-bfd`) drops the session with BFD.
+                    bfd: p.bfd.is_some(),
                     next_hop_self: p.nexthop_choice == Some(NexthopChoice::ForceSelf),
                     disabled: c.disabled,
                 })
@@ -343,6 +343,9 @@ impl Lab {
                     }
                     if let Some(c) = &n.output {
                         put(&mut params, "output_filter", json!(c));
+                    }
+                    if n.bfd {
+                        put(&mut params, "bfd", json!(corerouter_model::bfd::PROFILE_DEFAULT));
                     }
                     if n.next_hop_self {
                         put(&mut params, "nexthop_choice", json!("force-self"));
@@ -558,7 +561,8 @@ impl Lab {
                         &name,
                         "routing.bgp.connection.add",
                         json!({"name": peer, "remote_address": remote.to_string(), "remote_as": other_as,
-                               "input_filter": ACCEPT_CHAIN, "output_filter": ACCEPT_CHAIN}),
+                               "input_filter": ACCEPT_CHAIN, "output_filter": ACCEPT_CHAIN,
+                               "bfd": corerouter_model::bfd::PROFILE_DEFAULT}),
                     )?;
                 }
             }
@@ -605,6 +609,15 @@ impl Lab {
         }
         for r in &f.rules {
             try_exec(&mut node, &mut refused, "routing.filter.rule.add", json!({"chain": r.chain, "rule": r.rule, "disabled": r.disabled}));
+        }
+        // G3.6 BFD profiles the connections and templates name (the built-in
+        // ones exist already; keys stay sealed on the real router).
+        for b in real.routing.bfd.profiles.values() {
+            let p = json!({"name": b.name, "min_tx": b.min_tx, "min_rx": b.min_rx, "multiplier": b.multiplier, "passive": b.passive});
+            let builtin = corerouter_model::bfd::builtin_profiles().iter().any(|x| x.name == b.name);
+            let id = if builtin { "routing.bfd.profile.set" } else { "routing.bfd.profile.add" };
+            let p = if builtin { json!({"id": b.name, "min_tx": b.min_tx, "min_rx": b.min_rx, "multiplier": b.multiplier}) } else { p };
+            try_exec(&mut node, &mut refused, id, p);
         }
         if let Some(i) = real.routing.bgp.get("default") {
             try_exec(&mut node, &mut refused, "routing.bgp.instance.set", json!({"asn": i.asn.0, "router_id": i.router_id.to_string()}));

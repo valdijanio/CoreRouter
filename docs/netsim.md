@@ -50,6 +50,9 @@ corerouter-netsim::Simulation (L2, puro, wasm)
   `default`, a área `backbone`, um template ponto a ponto com as portas dos enlaces OSPF e a
   loopback passiva; um enlace novo acrescenta o template da porta. Custo sem valor no template
   fica com o custo do enlace no editor.
+- **BFD do BGP vem da conexão** (G3.6b): com perfil BFD (`bfd`), a sessão de um salto cai com o
+  BFD; sem perfil, um corte silencioso espera o hold timer. Os presets põem o perfil embutido
+  `default` no eBGP.
 
 ## Eventos discretos, relógio virtual e determinismo
 
@@ -250,4 +253,4 @@ Ferramentas: `cargo run --release -p corerouter-netsim --example measure -- 10 1
 
 **Fica para depois (gaps):**
 - G3.7c: o teste de fidelidade com o FRR real na VM (bloqueado pelo disco da VM);
-- G3.7e: o `use_bfd` das conexões BGP (quando a G3.2d entrar), IPv6 (OSPFv3, BGP IPv6) e refletor de rotas.
+- G3.7e: IPv6 (OSPFv3, BGP IPv6) e refletor de rotas.

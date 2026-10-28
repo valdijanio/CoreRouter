@@ -181,6 +181,7 @@
         {
           "command": "routing.bgp.connection.add",
           "params": {
+            "bfd": "default",
             "input_filter": "sim-accept",
             "name": "r4",
             "output_filter": "sim-accept",
@@ -424,6 +425,7 @@
         {
           "command": "routing.bgp.connection.add",
           "params": {
+            "bfd": "default",
             "input_filter": "sim-accept",
             "name": "r4",
             "output_filter": "sim-accept",
@@ -530,6 +532,7 @@
         {
           "command": "routing.bgp.connection.add",
           "params": {
+            "bfd": "default",
             "input_filter": "sim-accept",
             "name": "r1",
             "output_filter": "sim-accept",
@@ -540,6 +543,7 @@
         {
           "command": "routing.bgp.connection.add",
           "params": {
+            "bfd": "default",
             "input_filter": "sim-accept",
             "name": "r3",
             "output_filter": "sim-accept",
