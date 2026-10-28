@@ -71,7 +71,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.mtr", "## O que faz\nTraceroute contínuo (MTR) ou de uma passada (Traceroute), por ICMP, UDP ou TCP, com o modo Paris para seguir um só caminho ECMP: cada salto do caminho com perda e latência ao longo do tempo, AS e operadora de cada salto. Mostra em que ponto do caminho o problema começa."),
     ("menu.neighbors", "## O que faz\nEquipamentos vistos nos links por LLDP e pela descoberta do próprio roteador: nome, endereço, plataforma e a porta onde estão."),
     ("menu.ntp-client", "## O que faz\nMantém o relógio do roteador certo a partir de servidores NTP. Logs, certificados e concessões DHCP dependem da hora certa."),
-    ("menu.ospf", "## O que faz\nOSPF, o protocolo de roteamento interno: áreas, interfaces e vizinhos. Ainda não implementado."),
+    ("menu.ospf", "## O que faz\nOSPF (v2 e v3), o protocolo de roteamento interno: instâncias, áreas, interface templates e key chains; vizinhos com o Diagnose de quem não chega a Full, LSDB, rotas com \"Por que esse caminho?\" e o mapa da rede desenhado da LSDB."),
     ("menu.ping", "## O que faz\nEnvia ICMP echo para um endereço e mostra latência e perda em gráfico; também descobre o MTU do caminho."),
     ("menu.resources", "## O que faz\nA saúde do roteador: CPU (por núcleo, com os softirqs de recepção), memória e pressão (PSI), discos, interfaces, sensores com os limites, processos e verificações de saúde com o motivo e o que fazer. Como /system resource, /system health e /tool profile do RouterOS juntos."),
     ("menu.routes", "## O que faz\nA tabela de rotas: rotas estáticas (inclusive a rota padrão 0.0.0.0/0), conectadas e aprendidas, qual está ativa e em qual VRF."),

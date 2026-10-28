@@ -326,12 +326,13 @@ fn template(cfg: &Config, t: &OspfTemplate, path: &str, _pos: usize, out: &mut V
         ));
     }
     auth(ospf, t, v, path, out);
+    // G3.6: the profile is one of `/routing bfd profile` (or a built-in).
     if let Some(p) = &t.bfd
-        && !name_ok(p)
+        && cfg.routing.bfd.profile(p).is_none()
     {
         out.push(Issue::new(
             format!("{path}.bfd"),
-            "a BFD profile name: 1..=48 of [A-Za-z0-9_.-]",
+            format!("no BFD profile {p} (routing.bfd.profile.add; built-in: default, fast)"),
         ));
     }
 }
@@ -678,6 +679,19 @@ pub(crate) mod tests {
             validate(&cfg)
                 .iter()
                 .any(|i| i.message.contains("no OSPF key chain nope"))
+        );
+    }
+
+    #[test]
+    fn the_bfd_profile_must_exist() {
+        let mut cfg = sample();
+        cfg.routing.ospf.templates[0].bfd = Some("fast".into());
+        assert_eq!(validate(&cfg), Vec::new());
+        cfg.routing.ospf.templates[0].bfd = Some("nope".into());
+        assert!(
+            validate(&cfg)
+                .iter()
+                .any(|i| i.message.contains("no BFD profile nope"))
         );
     }
 

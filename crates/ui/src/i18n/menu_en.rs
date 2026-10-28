@@ -42,7 +42,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.mtr", "## What it does\nTraceroute that keeps going (MTR) or one pass (Traceroute), over ICMP, UDP or TCP, with Paris to follow one ECMP path: each hop of the path with loss and latency over time, AS and operator of each hop. Shows where along the path a problem starts."),
     ("menu.neighbors", "## What it does\nDevices seen on the links by LLDP and the router's own discovery: name, address, platform and the port they are on."),
     ("menu.ntp-client", "## What it does\nKeeps the router's clock right from NTP servers. Logs, certificates and DHCP leases depend on the time being correct."),
-    ("menu.ospf", "## What it does\nOSPF, the interior routing protocol: areas, interfaces and neighbors. Not implemented yet."),
+    ("menu.ospf", "## What it does\nOSPF (v2 and v3), the interior routing protocol: instances, areas, interface templates and key chains; neighbors with the Diagnose of those not Full, the LSDB, routes with \"Why this path?\" and the network map drawn from the LSDB."),
     ("menu.ping", "## What it does\nSends ICMP echo to an address and charts the latency and loss; also finds the path MTU."),
     ("menu.resources", "## What it does\nThe router's health: CPU (per core, with the receive softirqs), memory and pressure (PSI), disks, links, sensors with their limits, processes, and health checks with the reason and what to do. Like RouterOS /system resource, /system health and /tool profile together."),
     ("menu.routes", "## What it does\nThe routing table: static routes (the default route 0.0.0.0/0 included), connected and learned ones, which one is active and in which VRF."),

@@ -22,6 +22,7 @@ corerouter-proto-discovery.workspace = true
 corerouter-proto-iperf.workspace = true
 corerouter-proto-flow.workspace = true
 corerouter-proto-radius.workspace = true
+corerouter-netsim.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
