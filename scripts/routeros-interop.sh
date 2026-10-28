@@ -487,7 +487,7 @@ case_redistribute() {
   cli ip.address.add '{"address":"100.64.39.1/24","interface":"ether3"}' >/dev/null || result redistribute FAIL "address on ether3"
   cli ip.address.add '{"address":"198.18.39.1/24","interface":"ether4"}' >/dev/null || result redistribute FAIL "address on ether4"
   cli routing.ospf.interface-template.add '{"area":"backbone","interfaces":"ether3","passive":true,"comment":"clientes de teste"}' >/dev/null
-  sleep 4
+  wait_for 30 via_cr 100.64.39.0/24 >/dev/null || true
   local a b
   a=$(ros_route 100.64.39.0/24); b=$(ros_route 198.18.39.0/24)
   [[ $a == 10.39.1.2* ]] && result redistribute OK "clients' subnet 100.64.39.0/24 reaches CHR via the CoreRouter" \
@@ -642,12 +642,14 @@ bfd_up() {
   rosx '/routing ospf interface-template set [find interfaces=ether3] use-bfd=yes' >/dev/null
 }
 bfd_downs() { cli routing.bfd.history.list '{"peer":"10.39.1.1","limit":2000}' | jq '[.[] | select(.to == "down")] | length'; }
-set_bfd_ms() {
-  cli routing.bfd.profile.set "{\"id\":\"g39\",\"min_tx\":$1,\"min_rx\":$1}" >/dev/null
-  rosx "/routing bfd configuration set [find] min-rx=$1ms min-tx=$1ms" >/dev/null
+set_bfd_ms() { # set_bfd_ms <ms> [multiplier]
+  local m=${2:-3}
+  cli routing.bfd.profile.set "{\"id\":\"g39\",\"min_tx\":$1,\"min_rx\":$1,\"multiplier\":$m}" >/dev/null
+  rosx "/routing bfd configuration set [find] min-rx=$1ms min-tx=$1ms multiplier=$m" >/dev/null
   local ns
   for ns in crr3 crr4; do
-    vtysh -N $ns -c 'configure terminal' -c 'bfd' -c 'profile g39' -c "receive-interval $1" -c "transmit-interval $1" >/dev/null
+    vtysh -N $ns -c 'configure terminal' -c 'bfd' -c 'profile g39' -c "receive-interval $1" \
+      -c "transmit-interval $1" -c "detect-multiplier $m" >/dev/null
   done
 }
 bfd_ok() { [ "$(cr_bfd "$1")" = up ]; }
@@ -683,9 +685,20 @@ case_bfd() {
   sleep 5; f0=$(bfd_downs); sleep 30; f1=$(bfd_downs)
   r1=$(ros_bfd_downs 10.255.39.4)
   result bfd INFO "100 ms × 3, new session: CoreRouter—CHR $((f1 - f0)) downs in 30 s; CHR—R4 (FRR bfdd) $((r1 - r0)) 'bfd down' in CHR's log"
-  set_bfd_ms 300
-  rset 'use-bfd=no'; sleep 6; rset 'use-bfd=yes'
-  wait_for 60 bfd_ok 10.39.1.1 >/dev/null || result bfd FAIL "back to 300 ms: BFD not up"
+  # Which profile survives a new session: RouterOS sends at ~1 s right
+  # after Up, so the detect time has to cover that.
+  local m
+  for m in 3 4; do
+    set_bfd_ms 300 "$m"
+    r0=$(ros_bfd_downs 10.255.39.4)
+    rosx '/routing ospf interface-template set [find use-bfd=yes] use-bfd=no' >/dev/null; sleep 6
+    rosx '/routing ospf interface-template set [find comment=cr] use-bfd=yes
+/routing ospf interface-template set [find interfaces=ether3] use-bfd=yes' >/dev/null
+    sleep 5; f0=$(bfd_downs); sleep 30; f1=$(bfd_downs)
+    r1=$(ros_bfd_downs 10.255.39.4)
+    result bfd INFO "300 ms × $m, new session: CoreRouter—CHR $((f1 - f0)) downs in 30 s; CHR—R4 (FRR bfdd) $((r1 - r0))"
+  done
+  wait_for 60 bfd_ok 10.39.1.1 >/dev/null || result bfd FAIL "300 ms × 4: BFD not up"
   wait_for 30 bfd_ok 10.39.4.2 >/dev/null \
     && result bfd OK "BFD CoreRouter—R4 (FRR bfdd) up" || result bfd FAIL "BFD with R4: $(cr_bfd 10.39.4.2)"
 }
@@ -818,6 +831,14 @@ case_prod() {
   kill "$(cat "$W/daemon.pid")"; sleep 2
   rm -rf "$W/cfg"
   start_daemon
+  # CHR is the existing core: LDP already running (towards R3 and R4).
+  if [ "$(ros mpls/ldp | jq length)" = 0 ]; then
+    rosx '/mpls ldp add afi=ip lsr-id=10.255.39.1 transport-addresses=10.255.39.1
+/mpls ldp interface add interface=ether2
+/mpls ldp interface add interface=ether3' >/dev/null
+  fi
+  [ "$(ros routing/bfd/configuration | jq length)" != 0 ] \
+    || rosx '/routing bfd configuration add interfaces=ether3 min-rx=300ms min-tx=300ms multiplier=3' >/dev/null
   # CHR: forget what the other cases set on ether1, keep BFD to R4.
   rosx '/routing ospf interface-template remove [find comment=cr]
 /routing bfd configuration set [find] interfaces=ether3
@@ -831,7 +852,7 @@ case_prod() {
   local ms
   ms=$(wait_for 90 full_both) && result prod OK "Full ${ms} ms after both blocks (sha256, hello 10 s)" \
     || { result prod FAIL "no Full: CR $(cr_nbr), CHR $(ros_nbr)"; return; }
-  ms=$(wait_for 60 bfd_ok 10.39.1.1) && result prod OK "BFD up (300 ms × 3, dampening on)" || result prod FAIL "BFD: $(cr_bfd)"
+  ms=$(wait_for 60 bfd_ok 10.39.1.1) && result prod OK "BFD up ($(cli routing.bfd.session.list | jq -r '[.sessions[] | select(.peer == "10.39.1.1")][0] | "\(.tx_interval_us / 1000) ms × \(.multiplier)"'), dampening on)" || result prod FAIL "BFD: $(cr_bfd)"
   ms=$(wait_for 60 ldp_ok) && result prod OK "LDP operational" || result prod FAIL "LDP: $(cr_ldp)"
   ms=$(wait_for 60 via_cr 100.64.39.0/24) && result prod OK "clients' subnet on CHR via the CoreRouter" \
     || result prod FAIL "100.64.39.0/24 on CHR: $(ros_route 100.64.39.0/24)"

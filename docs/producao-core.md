@@ -16,7 +16,7 @@ Resumo do que interopera e do que não:
 | Áreas normal, stub, NSSA | ok; tipo diferente nos dois lados não forma adjacência (certo) |
 | Redistribuição | só o que o template anuncia (passive) ou a chain deixa passar |
 | LDP | sessão por loopback (transport address = LSR id), rótulos nos dois sentidos, tráfego rotulado CHR ⇄ CoreRouter |
-| BFD | ok a **300 ms × 3**; a 100 ms × 3 toda sessão nova flapa (do lado do RouterOS, que também flapa com o `bfdd` do FRR) |
+| BFD | ok a **300 ms × 4** (recomendado) e 300 ms × 3; a 100 ms × 3 toda sessão nova flapa (15 quedas em 30 s), e com o `bfdd` do FRR também (12): logo depois do Up o RouterOS segue mandando a ~1 s |
 | LSP ping (RFC 8029) | o RouterOS não responde: use ping/traceroute IP e a tabela de rótulos |
 | OSPFv3 | ok (ptp, loopback /128 trocada) |
 
@@ -55,7 +55,7 @@ O que ela faz: router-id único na loopback; **custo 65535** em todo enlace do C
 calcula caminho de trânsito por ele, mas o que ele anuncia continua alcançável; medido no caso
 `entry`); prioridade 0 se o enlace for broadcast (nunca DR/BDR); anuncia **só** a loopback e a
 sub-rede dos clientes de teste (templates passivos, sem `redistribute`); autenticação sha256; BFD
-300 ms × 3 com dampening; LDP com transport address na loopback; TI-LFA desligado (é o padrão: só
+300 ms × 4 (detecção em 1,2 s; ver "Como ampliar"); LDP com transport address na loopback; TI-LFA desligado (é o padrão: só
 liga com `routing.ospf.segment-routing.set`).
 
 Troque os endereços, a chave e os nomes das portas pelos seus. No terminal do CoreRouter
@@ -70,7 +70,7 @@ file=core-start.rsc` faz o mesmo a partir de um arquivo.
 /ip address add address=10.255.39.2/32 interface=lo
 /ip address add address=10.39.1.2/30 interface=ether1 comment="core MikroTik"
 /ip address add address=100.64.39.1/24 interface=ether3 comment="clientes de teste"
-/routing bfd profile add name=mikrotik min-tx=300 min-rx=300 multiplier=3
+/routing bfd profile add name=mikrotik min-tx=300 min-rx=300 multiplier=4
 /routing ospf instance add name=v2 router-id=10.255.39.2
 /routing ospf area add name=backbone instance=v2 area-id=0.0.0.0
 /routing ospf interface-template add area=backbone interfaces=ether1 type=ptp cost=65535 priority=0 auth=sha256 auth-id=1 auth-key=TROQUE-ESTA-CHAVE bfd=mikrotik comment="core MikroTik"
@@ -86,7 +86,7 @@ destinado a ele):
 
 <!-- lab:mikrotik-side (aplicado no CHR pelo laboratório) -->
 ```text
-/routing bfd configuration add interfaces=ether1 min-rx=300ms min-tx=300ms multiplier=3 comment=corerouter
+/routing bfd configuration add interfaces=ether1 min-rx=300ms min-tx=300ms multiplier=4 comment=corerouter
 /routing ospf interface-template add area=backbone interfaces=ether1 type=ptp cost=10 auth=sha256 auth-id=1 auth-key=TROQUE-ESTA-CHAVE use-bfd=yes comment=corerouter
 /mpls ldp interface add interface=ether1 comment=corerouter
 ```
@@ -99,7 +99,7 @@ Equivalências, item por item:
 | template `cost=65535` | `cost=` no interface-template | O custo vale na saída de cada lado |
 | `priority=0` | `priority=0` | Só conta em `broadcast`; em `ptp` não há eleição |
 | `auth=sha256 auth-id=1 auth-key=…` | `auth=sha256 auth-id=1 auth-key=…` | Mesmo key id dos dois lados (o RouterOS loga "wrong SA ID") |
-| `bfd=mikrotik` (perfil 300/300/3) | `use-bfd=yes` + `/routing bfd configuration` | O RouterOS só faz BFD nas portas listadas em `configuration`; sem autenticação nem echo |
+| `bfd=mikrotik` (perfil 300/300/4) | `use-bfd=yes` + `/routing bfd configuration` | O RouterOS só faz BFD nas portas listadas em `configuration`; sem autenticação nem echo |
 | `/mpls ldp add lsr-id=` | `/mpls ldp add lsr-id= transport-addresses=` | O nosso usa o LSR id como transport address por padrão |
 | `/mpls ldp interface add` | `/mpls ldp interface add` | — |
 | templates `passive=yes` | `passive` | Anuncia a rede sem formar vizinho |
@@ -129,7 +129,7 @@ Equivalências, item por item:
 
 Tempos medidos no laboratório com hello 1 s: Full 1,8–7,6 s depois do commit do CoreRouter; rotas
 pelo CoreRouter no CHR 6,6–14,4 s (o CHR fica até ~4 s em Loading); com os blocos acima (hello
-10 s) o caso `prod` chegou a Full em 11,8 s. Com o padrão 10/40 s conte até ~40 s
+10 s) o caso `prod` chegou a Full em 11,7–11,9 s. Com o padrão 10/40 s conte até ~40 s
 para a adjacência e alguns segundos a mais para as rotas.
 
 ## Como monitorar
@@ -146,17 +146,17 @@ para a adjacência e alguns segundos a mais para as rotas.
 
 O que esperar: vizinho `Full` (ptp) ou `Full · DR` visto do nosso lado; no LDP o MikroTik
 `operational` com transport 10.255.39.1; na tabela de rótulos as FECs das loopbacks do core com
-rótulo de saída; BFD `up` com 300 ms e detect time 900 ms; no MikroTik, `/ip route print` com a
+rótulo de saída; BFD `up` com 300 ms e detect time 1200 ms; no MikroTik, `/ip route print` com a
 sub-rede de teste via o CoreRouter e **nenhuma** outra rota mudada.
 
 ## Como sair em segundos
 
 | Como | Comando | Medido no laboratório |
 |---|---|---|
-| OSPF passivo no enlace com o MikroTik | `/routing ospf interface-template print`, depois `set 0 passive=yes` (o número do print, como no RouterOS) | rota trocada no MikroTik em 26 ms, **sem perda**: o BFD avisa AdminDown e o MikroTik derruba o vizinho na hora |
+| OSPF passivo no enlace com o MikroTik | `/routing ospf interface-template print`, depois `set 0 passive=yes` (o número do print, como no RouterOS) | tráfego de trânsito desviado em < 0,6 s e a sub-rede de teste fora do MikroTik em 1,3–1,9 s, **sem perda** em nenhuma rodada: o BFD avisa AdminDown e o MikroTik derruba o vizinho na hora |
 | Desligar a instância | `/routing ospf instance set v2 disabled=yes` | buraco de 0,44–1,4 s |
-| Desligar a VM ou cair o enlace | `qm stop <vmid>` no Proxmox | perda de portadora: buraco de 0,70 s |
-| O CoreRouter travar (corte silencioso) | — | com BFD 300 ms × 3: o MikroTik derruba a adjacência em 0,8 s, buraco de 1,29 s; **sem BFD**, o dead interval inteiro (40 s no padrão) |
+| Desligar a VM ou cair o enlace | `qm stop <vmid>` no Proxmox | perda de portadora: buraco de 0,6–0,7 s |
+| O CoreRouter travar (corte silencioso) | — | com BFD 300 ms × 4: o MikroTik derruba a adjacência em 1,1 s, buraco de 1,55 s (× 3: 0,7–0,8 s e 1,2–1,3 s); **sem BFD**, o dead interval inteiro (40 s no padrão; 3,4 s com dead 4 s no laboratório) |
 | Pelo lado MikroTik | `/routing ospf interface-template disable [find comment=corerouter]` | igual ao passivo |
 
 O passivo é a saída recomendada: revise com `/routing ospf impact` (diz que a adjacência de ether1
@@ -170,8 +170,12 @@ sub-rede de teste do ar. A volta (tirar o passivo, religar a VM) não abriu bura
    no MikroTik para ver o que passou a ir pelo CoreRouter.
 2. Mais clientes: mais templates passivos ou um `redistribute` com `out_filter_chain` que aceite só
    as redes certas (caso `redistribute` do laboratório).
-3. BFD mais rápido só depois de medir: a 100 ms × 3 a sessão nova com RouterOS 7.25 flapa (o
-   dampening do perfil segura o pior); trocar 300 → 100 com a sessão já em Up foi estável.
+3. BFD mais rápido só depois de medir. Com o RouterOS 7.25, a 100 ms × 3 toda sessão nova flapa;
+   a 300 ms × 3 a sessão nova ficou estável em duas rodadas, mas na volta de um corte houve 2 a 5
+   quedas a mais numa delas; a 300 ms × 4, nenhuma. Trocar 300 → 100 com a sessão já em Up foi
+   estável (0 quedas em 30 s), mas a próxima sessão nova (depois de qualquer queda) volta a
+   flapar. O dampening do perfil (ligado por padrão) segura a sessão caída enquanto pune os
+   flaps, e com ela a adjacência OSPF: mais um motivo para não descer de 300 ms × 4 (G3.9b).
 4. Graceful restart (G3.4e) e TI-LFA (G3.4d) depois que o CoreRouter for trânsito de verdade.
 
 ## Laboratório
