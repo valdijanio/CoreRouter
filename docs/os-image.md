@@ -775,7 +775,7 @@ de MikroTik usam `ether1`, `ether2`…. O init renomeia antes do daemon subir
 - **Ordem do barramento, não do probe:** caminho PCI do dispositivo, depois `dev_port` (placa
   com várias portas numa função), depois o MAC. O probe em paralelo muda a ordem entre boots
   (relatos do RouterOS em VM e o T9127 do VyOS com a `ice`). O init espera a lista de links
-  ficar parada por 300 ms (no máximo 2 s) antes de numerar.
+  ficar parada por 100 ms (no máximo 2 s) antes de numerar.
 - **O nome segue a placa** (`/config/.port-names`: nome, MAC, caminho), como o `hw-id` do VyOS:
   placa nova ganha o próximo número livre e não desloca as outras.
 - **Placa trocada no mesmo slot** (MAC sumiu, MAC novo no mesmo caminho PCI) fica com o nome da
@@ -864,7 +864,19 @@ disk novo). Porta que não existe: o endereço não é aplicado e o assistente p
 
 Tudo roda uma vez no boot, fora de caminho quente. O renomeio é uma mensagem netlink por porta
 (três com a porta ativa), O(n) no número de portas; a decisão (`assign`) é O(n·m) com n, m ≤
-1024, irrelevante. A única espera é a de a lista de links parar de mudar (300 ms de silêncio,
+1024, irrelevante. A única espera é a de a lista de links parar de mudar (100 ms de silêncio,
 2 s no máximo): é o que evita numerar antes de um driver lento terminar. Não há o que dividir
 entre núcleos. O assistente e o aviso rodam em processo e thread próprios, sem lock com o
 laço do PID 1.
+
+### Números (G1.6m)
+
+**Medido** em 2026-10-28, KVM no host de desenvolvimento, build release da imagem:
+
+- kernel → daemon responde `ping`: 0,90–0,91 s em três `boot-test` (0,92 s na imagem da
+  `main` antes); com a espera de 300 ms de silêncio dos links eram 1,10 s, por isso 100 ms;
+- `early boot done`: 110–112 ms (14 ms antes; a diferença é a espera dos links);
+- `install-test` completo: 40,8 s; `/sys/class/net` com 3 placas: `ether1 ether2 ether3 lo`
+  (antes: mais `bond0`, `dummy0` e sete túneis de fallback);
+- build da imagem do zero numa worktree (toolchain externa e downloads em cache): 1064 s; um
+  build incremental só do init: 56 s.

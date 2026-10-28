@@ -394,7 +394,8 @@ fn check_installed(t: &mut T, vm: &mut Vm, port: u16, first: bool) -> Result<(),
     // G1.6m: RouterOS names in bus order, kept in /config; no device the
     // kernel made on its own (bond0, dummy0, gre0, sit0…); the marker of
     // the installer's address written.
-    let links = sh(vm, &mut log, "ls /sys/class/net")?;
+    // (`bonding_masters` is a file of the bonding driver, not a link.)
+    let links = sh(vm, &mut log, "cd /sys/class/net && ls -d */ | tr -d /")?;
     check(
         links.trim() == "ether1 ether2 ether3 lo",
         format!("links: {links}"),
@@ -403,7 +404,7 @@ fn check_installed(t: &mut T, vm: &mut Vm, port: u16, first: bool) -> Result<(),
     let marker = sh(
         vm,
         &mut log,
-        "cat /config/.installer-mgmt-applied; echo; grep -c '^ether' /config/.port-names",
+        "{ cat /config/.installer-mgmt-applied; echo; grep -c '^ether' /config/.port-names; }",
     )?;
     check(
         marker.starts_with("ether1,10.0.2.15/24,10.0.2.2") && marker.ends_with('3'),
@@ -442,9 +443,11 @@ fn check_installed(t: &mut T, vm: &mut Vm, port: u16, first: bool) -> Result<(),
         r#"{"name":"frr"}"#,
         |v| {
             v["result"][0]["state"] == "running"
+                // "attached to FRR in …", then (a boot with routing
+                // config) "frr 10.7.1: running config installed".
                 && v["result"][0]["last_event"]
                     .as_str()
-                    .is_some_and(|e| e.contains("FRR"))
+                    .is_some_and(|e| e.to_ascii_lowercase().contains("frr"))
         },
     )?;
     t.n.put(

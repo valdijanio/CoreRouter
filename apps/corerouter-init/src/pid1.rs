@@ -195,7 +195,7 @@ fn spawn_frr(s: &Svc) -> Option<Pid> {
 /// before the daemon sees them; `map`: where the names are kept (`None`:
 /// the installer, nothing kept). Every port's name by kernel name.
 fn name_ports(map: Option<&Path>) -> Vec<(String, String)> {
-    crate::links::settle(Duration::from_millis(300), Duration::from_secs(2));
+    crate::links::settle(Duration::from_millis(100), Duration::from_secs(2));
     let found = crate::links::kernel_named_ports();
     let text = map.and_then(|p| File::open(p).ok()).map(|f| {
         let mut s = String::new();
