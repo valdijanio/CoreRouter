@@ -71,4 +71,9 @@ pub struct RoutingStatus {
     /// Why the last read or sync failed.
     pub error: Option<String>,
     pub bgp_sessions: Vec<BgpSession>,
+    /// G3.4b: the OSPF adjacencies and interfaces of every instance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ospf_neighbors: Vec<crate::ospf_state::OspfNeighbor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ospf_interfaces: Vec<crate::ospf_state::OspfIfState>,
 }

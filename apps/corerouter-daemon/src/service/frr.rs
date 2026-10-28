@@ -115,6 +115,23 @@ fn run(session: &Shared, mut reader: Box<dyn RoutingReader>, synced: bool, healt
                         health.error(e.to_string());
                     }
                 }
+                // G3.4b: OSPF neighbors and interfaces, every poll (two
+                // small JSON answers per instance).
+                if !cfg.routing.ospf.instances.is_empty() {
+                    match reader.ospf_state(&cfg) {
+                        Ok((n, i)) => {
+                            status.ospf_neighbors = n;
+                            status.ospf_interfaces = i;
+                        }
+                        Err(e) => {
+                            status.error = Some(e.to_string());
+                            health.error(e.to_string());
+                        }
+                    }
+                } else {
+                    status.ospf_neighbors.clear();
+                    status.ospf_interfaces.clear();
+                }
             }
             Err(e) => {
                 if in_sync {
@@ -123,6 +140,8 @@ fn run(session: &Shared, mut reader: Box<dyn RoutingReader>, synced: bool, healt
                 in_sync = false;
                 status.error = Some(e.to_string());
                 status.bgp_sessions.clear();
+                status.ospf_neighbors.clear();
+                status.ospf_interfaces.clear();
                 health.error(e.to_string());
             }
         }
@@ -135,11 +154,20 @@ fn run(session: &Shared, mut reader: Box<dyn RoutingReader>, synced: bool, healt
         // Copied before the lock is taken (126 µs for 1 000 sessions,
         // **medido**): under it only the move.
         let sample = status.clone();
-        let wanted = {
+        let (wanted, ospf_wanted) = {
             let mut s = lock(session);
             s.set_routing_status(sample);
-            s.bgp_routes_wanted()
+            (s.bgp_routes_wanted(), s.ospf_db_wanted())
         };
+        // G3.4b: the OSPF databases a window asked for, streamed here
+        // (10 000 LSAs: see docs/ospf.md) and handed back under the lock.
+        if !ospf_wanted.is_empty() {
+            let cfg = routing_only(session);
+            for inst in ospf_wanted {
+                let got = reader.ospf_lsdb(&cfg, &inst).map_err(|e| e.to_string());
+                lock(session).set_ospf_db(inst, got);
+            }
+        }
         // G3.2b: the tables the filter preview asked for, read here (a
         // full table takes seconds) and handed back under the lock.
         for key in wanted {

@@ -20,6 +20,7 @@
 
 pub mod conf;
 pub mod ldp;
+pub mod ospf;
 pub mod render;
 pub mod rib;
 pub mod routes;
@@ -457,6 +458,124 @@ impl Frr {
         Ok(Some(st))
     }
 
+    /// G3.4b: the OSPF neighbors and interfaces of `cfg`'s instances (the
+    /// main VRF; a VRF instance is read when its daemon prints it the same
+    /// way: G3.4h).
+    pub fn ospf_state(
+        &self,
+        cfg: &Config,
+    ) -> Result<
+        (
+            Vec<corerouter_model::ospf_state::OspfNeighbor>,
+            Vec<corerouter_model::ospf_state::OspfIfState>,
+        ),
+        HalError,
+    > {
+        use corerouter_model::ospf::Version;
+        let mut nbrs = Vec::new();
+        let mut ifs = Vec::new();
+        for inst in cfg.routing.ospf.instances.values() {
+            if inst.disabled || inst.vrf != corerouter_model::ospf::MAIN_VRF {
+                continue;
+            }
+            let d = match inst.version {
+                Version::V2 => Daemon::Ospfd,
+                Version::V3 => Daemon::Ospf6d,
+            };
+            let mut vty = self.connect(d)?;
+            let mut read = |cmd: &str| -> Result<Option<String>, HalError> {
+                let r = vty.run(cmd).map_err(|e| io_err(d, e))?;
+                let text = String::from_utf8_lossy(&r.output).into_owned();
+                // Not running yet: a warning, not JSON.
+                Ok((r.ok() && text.trim_start().starts_with('{')).then_some(text))
+            };
+            match inst.version {
+                Version::V2 => {
+                    if let Some(t) = read("show ip ospf neighbor json")? {
+                        nbrs.extend(
+                            ospf::neighbors_v2(&t, &inst.name).map_err(HalError::Rejected)?,
+                        );
+                    }
+                    if let Some(t) = read("show ip ospf interface json")? {
+                        ifs.extend(
+                            ospf::interfaces_v2(&t, &inst.name).map_err(HalError::Rejected)?,
+                        );
+                    }
+                }
+                Version::V3 => {
+                    if let Some(t) = read("show ipv6 ospf6 neighbor json")? {
+                        nbrs.extend(
+                            ospf::neighbors_v3(&t, &inst.name).map_err(HalError::Rejected)?,
+                        );
+                    }
+                }
+            }
+        }
+        Ok((nbrs, ifs))
+    }
+
+    /// G3.4b: the LSDB of OSPFv2 instance `instance`, streamed LSA type by
+    /// LSA type into the compact table, and its routes.
+    pub fn ospf_lsdb(
+        &self,
+        cfg: &Config,
+        instance: &str,
+    ) -> Result<
+        (
+            corerouter_model::ospf_state::Lsdb,
+            Vec<corerouter_model::ospf_state::OspfRoute>,
+        ),
+        HalError,
+    > {
+        use corerouter_model::ospf::Version;
+        let inst = cfg
+            .routing
+            .ospf
+            .instances
+            .get(instance)
+            .ok_or_else(|| HalError::Rejected(format!("no OSPF instance {instance:?}")))?;
+        if inst.version == Version::V3 {
+            return Err(HalError::Unsupported("the OSPFv3 database (G3.4h)".into()));
+        }
+        let d = Daemon::Ospfd;
+        let mut vty = self.connect(d)?;
+        let io = |e: std::io::Error| io_err(d, e);
+        let mut db = corerouter_model::ospf_state::Lsdb {
+            version: 2,
+            ..Default::default()
+        };
+        for kind in [
+            "router",
+            "network",
+            "summary",
+            "asbr-summary",
+            "external",
+            "nssa-external",
+        ] {
+            let cmd = format!("show ip ospf database {kind} json");
+            let mut stream = vty.run_stream(&cmd, MAX_TABLE).map_err(io)?;
+            let mut first = [0u8; 1];
+            let n = std::io::Read::read(&mut stream, &mut first).map_err(io)?;
+            if n == 0 || first[0] != b'{' {
+                let _ = stream.finish().map_err(io)?;
+                continue;
+            }
+            let chained = std::io::Read::chain(&first[..], &mut stream);
+            ospf::read_lsdb(chained, &mut db).map_err(HalError::Rejected)?;
+            let _ = stream.finish().map_err(io)?;
+        }
+        let r = vty.run("show ip ospf route json").map_err(io)?;
+        let text = String::from_utf8_lossy(&r.output);
+        let routes = if r.ok() && text.trim_start().starts_with('{') {
+            ospf::routes_v2(&text, instance).map_err(HalError::Rejected)?
+        } else {
+            Vec::new()
+        };
+        Ok((db, routes))
+    }
+}
+
+impl Frr {
     /// The routes of `neighbor` (instance `instance`) for the policy
     /// preview: `received`, what it sent before the input chain (needs
     /// `keep_received`); otherwise our best routes, before the output chain.
@@ -822,6 +941,33 @@ impl RoutingReader for FrrReader {
 
     fn bgp_prefix(&mut self, instance: &str, prefix: &str) -> Result<BgpPrefix, HalError> {
         self.0.bgp_prefix(instance, prefix)
+    }
+
+    fn ospf_state(
+        &mut self,
+        cfg: &Config,
+    ) -> Result<
+        (
+            Vec<corerouter_model::ospf_state::OspfNeighbor>,
+            Vec<corerouter_model::ospf_state::OspfIfState>,
+        ),
+        HalError,
+    > {
+        self.0.ospf_state(cfg)
+    }
+
+    fn ospf_lsdb(
+        &mut self,
+        cfg: &Config,
+        instance: &str,
+    ) -> Result<
+        (
+            corerouter_model::ospf_state::Lsdb,
+            Vec<corerouter_model::ospf_state::OspfRoute>,
+        ),
+        HalError,
+    > {
+        self.0.ospf_lsdb(cfg, instance)
     }
 
     fn rpki_state(&mut self) -> Option<String> {

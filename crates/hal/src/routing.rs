@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use corerouter_model::Config;
 use corerouter_model::bgp_rib::{BgpPrefix, BgpRib, Direction};
+use corerouter_model::ospf_state::{Lsdb, OspfIfState, OspfNeighbor, OspfRoute};
 use corerouter_model::routing_state::BgpSession;
 use corerouter_model::sealed::Sealed;
 
@@ -126,5 +127,26 @@ pub trait RoutingReader: Send {
     ) -> Result<Option<corerouter_model::mpls_state::LdpState>, HalError> {
         let _ = cfg;
         Ok(None)
+    }
+
+    /// G3.4b: the OSPF neighbors and interfaces of `cfg`'s instances
+    /// (cheap: read every poll).
+    fn ospf_state(
+        &mut self,
+        cfg: &Config,
+    ) -> Result<(Vec<OspfNeighbor>, Vec<OspfIfState>), HalError> {
+        let _ = cfg;
+        Ok((Vec::new(), Vec::new()))
+    }
+
+    /// G3.4b: the link-state database and the routes of OSPF instance
+    /// `instance` (tens of thousands of LSAs: read streaming, on demand).
+    fn ospf_lsdb(
+        &mut self,
+        cfg: &Config,
+        instance: &str,
+    ) -> Result<(Lsdb, Vec<OspfRoute>), HalError> {
+        let _ = (cfg, instance);
+        Err(HalError::Unsupported("OSPF database".into()))
     }
 }

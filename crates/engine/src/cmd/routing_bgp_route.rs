@@ -560,6 +560,7 @@ mod tests {
                 last_error: (!up).then(|| "Cease/Administrative Reset".into()),
                 ..BgpSession::default()
             }],
+            ..RoutingStatus::default()
         };
         s.set_routing_status(one(true));
         s.set_routing_status(one(false));

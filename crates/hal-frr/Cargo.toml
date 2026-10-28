@@ -21,6 +21,7 @@ thiserror.workspace = true
 log.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 criterion.workspace = true
 corerouter-proto-bgp.workspace = true
 
@@ -34,6 +35,10 @@ harness = false
 
 [[bench]]
 name = "frr_rib"
+harness = false
+
+[[bench]]
+name = "frr_ospf"
 harness = false
 
 [lints]
