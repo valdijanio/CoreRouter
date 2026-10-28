@@ -304,6 +304,15 @@ backend.**
   mesmo trait (G3.8) — sem mudar UI, comandos ou MCP.
 - FSMs próprias só para o **simulador** (sessões BGP/OSPF entre roteadores virtuais no lab, G3.7)
   e onde não houver implementação madura.
+- **Simulador de rede (G3.7, `docs/netsim.md`).** `crates/netsim` (L2, puro, wasm) roda OSPF,
+  BGP e BFD simplificados por eventos discretos num relógio virtual; cada roteador virtual é um
+  `Session` sobre o `VirtualHal`, configurado por comandos, e o simulador lê a running dele.
+  Comparado: (a) emular o FRR real em contêineres (containerlab, CML, GNS3), fiel mas sem wasm,
+  sem relógio virtual e com GBs por nó; (b) só análise estática da config (Batfish), rápida mas
+  sem o tempo de convergência; (c) FSMs simplificadas próprias. Ficamos com (c) para a janela e o
+  CI, conferindo o processo de decisão contra `proto_bgp::decision` (proptest) e, na G3.7c, as
+  melhores rotas contra o FRR real. Paralelismo por janelas conservadoras (lookahead = menor
+  latência) com um pool de threads persistente; números em `docs/perf.md` (G3.7).
 
 ### 1.4 Serviços de borda
 
@@ -362,6 +371,7 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 | L1 | `crates/firewall` | Firewall puro (G2.1): validação, grafo de jumps e render nftables da tabela `inet corerouter`; a tabela `ip corerouter_cgnat` do CGNAT (`cgnat`, G2.3); o flowtable `inet corerouter_fastpath` (`fastpath`, G2.4); sem I/O, compila para wasm. L1 (e não `proto-*`) porque o `hal-linux` também renderiza. Veja `docs/firewall.md` | L0 |
 | L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via rtnetlink (`RTM_GETLINK`, G1.18) com política de posse (`owner`); I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); ICMP das ferramentas (`icmp`: ping socket ou raw, G6.2); firewall por `nft -f -` (módulo `nft`, G2.1); CGNAT e fast path por nfnetlink (`nfnl`, `cgnat`, G2.3b; `fastpath`, flowtable e eSwitch por devlink, G2.4) e conntrack por ctnetlink (`ctnl`, G2.2; eventos `NEW`/`DESTROY` para o Traffic Flow, `ctnl::Events`, G4.4b); estado/hardware/contadores das portas por ethtool e devlink netlink (`genl`, `ethtool`, `nic`, `pci_ids`; G1.19, sem ioctl — veja `docs/interfaces.md`); cliente DHCP (`dhcp`: `AF_PACKET` com filtro BPF, UDP 68, sonda ARP; G4.7); cliente DHCPv6 (`dhcp6`: UDP 546 → `ff02::1:2`) e RA (`ra`: `accept_ra` por interface a cada apply, limpeza do aprendido; G4.7b); configuração Ethernet, EEPROM do módulo e teste de cabo por ethtool netlink (`ether`, G1.20). **Plataforma** | L0, `hal`, `firewall` (laterais permitidos) |
 | L2 | `crates/proto-{bgp,ospf,mpls,cgnat,dns,dhcp}` | `validate(&Config) -> Vec<Issue>` + render para o backend (FRR, nftables…); `proto-dhcp` também tem o codec DHCPv4 (`dhcproto` atrás de um saneador), a máquina de estados pura do cliente e o servidor simulado do lab (G4.7, `docs/dhcp-client.md`); o mesmo para DHCPv6 com codec próprio (`v6`, `client6`, `lab6`; G4.7b) | L0, L1 |
+| L2 | `crates/netsim` | Simulador de rede do lab (G3.7): roteadores virtuais com OSPF, BGP e BFD simplificados, eventos discretos num relógio virtual, janelas paralelas (pool de threads só no nativo), falhas, linha do tempo e convergência; topologias prontas (`preset`). Puro, compila em wasm. Veja `docs/netsim.md` | L0, `proto-bgp` (lateral permitido: filtros e processo de decisão) |
 | L2 | `crates/hal-frr` | Driver do FRR (G3.1): `conf` (árvore do `frr.conf`, diff por contexto), `render` (render dos `proto-*` por daemon, contextos do CoreRouter), `vty` (socket vty dos daemons, sem `vtysh`), `state` (sessões BGP do JSON do bgpd); implementa `hal::routing::RoutingDaemon`. **Plataforma** | L0, `hal`, `proto-bgp` (lateral permitido) |
 | L2 | `crates/proto-discovery` | CRDP, protocolo de descoberta próprio: codec puro (`Announcement::encode`/`decode`) + `validate` das configurações de descoberta. Veja `docs/discovery.md` | L0 |
 | L2 | `crates/proto-flow` | Exportação de fluxos (G4.4b): IPFIX (RFC 7011) e NetFlow v9 (RFC 3954), codificador e decodificador; eventos de NAT (RFC 8158); o medidor que transforma eventos do conntrack em registros (timeouts, amostragem, cache limitado). Puro, compila em wasm. Veja `docs/traffic-flow.md` | L0, L1 |

@@ -1239,6 +1239,7 @@ dependencies = [
  "corerouter-firewall",
  "corerouter-hal",
  "corerouter-model",
+ "corerouter-netsim",
  "corerouter-proto-bgp",
  "corerouter-proto-cgnat",
  "corerouter-proto-dhcp",
@@ -1385,6 +1386,18 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "corerouter-netsim"
+version = "0.1.0"
+dependencies = [
+ "corerouter-model",
+ "corerouter-proto-bgp",
+ "criterion",
+ "ipnet",
+ "proptest",
+ "serde",
 ]
 
 [[package]]

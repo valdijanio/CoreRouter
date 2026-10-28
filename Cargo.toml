@@ -37,6 +37,7 @@ corerouter-proto-flow = { path = "crates/proto-flow" }
 corerouter-proto-pppoe = { path = "crates/proto-pppoe" }
 corerouter-proto-radius = { path = "crates/proto-radius" }
 corerouter-proto-ha = { path = "crates/proto-ha" }
+corerouter-netsim = { path = "crates/netsim" }
 corerouter-engine = { path = "crates/engine" }
 corerouter-control = { path = "crates/control" }
 corerouter-mcp = { path = "crates/mcp" }
