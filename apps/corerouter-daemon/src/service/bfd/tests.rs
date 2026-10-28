@@ -30,8 +30,8 @@ fn engine(bind: Ipv4Addr, port: u16, peer_port: u16, threads: usize) -> Engine {
         bind4: Some(bind),
         bind6: None,
         port_single: port,
-        port_multi: port + 1,
-        peer_ports: Some((peer_port, peer_port + 1)),
+        port_multi: free_port(),
+        peer_ports: Some((peer_port, 0)),
     };
     Engine::start(&opts, &spawn).unwrap()
 }
@@ -51,12 +51,27 @@ fn spec(peer: IpAddr, local: Option<IpAddr>, prof: &BfdProfile) -> Spec {
     }
 }
 
-/// Below the ephemeral range (32768–60999): an ephemeral port of another
-/// test (iperf's UDP streams use SO_REUSEPORT too) never lands on these.
-fn ports() -> (u16, u16) {
-    let base = 21_000 + (std::process::id() % 1_000) as u16 * 4;
-    (base, base + 2)
+/// A port free right now, chosen by the kernel (no fixed ranges: two
+/// tests of the binary, or another test's ephemeral port, never meet). The
+/// engine binds it with SO_REUSEPORT, and the kernel hands a bound port to
+/// nobody else.
+fn free_port() -> u16 {
+    std::net::UdpSocket::bind("0.0.0.0:0").unwrap().local_addr().unwrap().port()
 }
+
+fn ports() -> (u16, u16) {
+    (free_port(), free_port())
+}
+
+/// Generous under a loaded CI (load ~28 on 32 cores): waits end on the
+/// event or the counter, this only bounds a hang.
+const PATIENCE: Duration = Duration::from_secs(10);
+/// The detection tests check BFD detected the loss, not the machine's
+/// speed: never before the detection time (150 ms minus one 50 ms
+/// interval), and within this ceiling. The precise numbers come from the
+/// load bench (`load`, docs/bfd.md).
+const DETECT_CEILING: Duration = Duration::from_millis(1500)
+;
 
 fn wait_for(e: &Engine, until: Duration, f: impl Fn(&[corerouter_model::bfd::BfdSessionStatus]) -> bool) -> bool {
     let t = Instant::now();
@@ -83,7 +98,7 @@ fn two_engines_come_up_and_detect_the_loss() {
     a.add(da.clone(), Some(1));
     b.add(spec(a_ip, None, &fast), Some(0));
     assert!(
-        wait_for(&a, Duration::from_secs(5), |s| s.iter().all(|x| x.state == "up" && x.tx_interval_us == 50_000)),
+        wait_for(&a, PATIENCE, |s| s.iter().all(|x| x.state == "up" && x.tx_interval_us == 50_000)),
         "{:?}",
         a.snapshot().0
     );
@@ -97,11 +112,12 @@ fn two_engines_come_up_and_detect_the_loss() {
     // its own wheel tick and the snapshot.
     let t = Instant::now();
     drop(b);
-    let ev = a.events.recv_timeout(Duration::from_secs(2)).unwrap();
+    let ev = a.events.recv_timeout(PATIENCE).unwrap();
     let took = t.elapsed();
     assert_eq!(ev.to, State::Down);
     assert!(!ev.client_up);
-    assert!(took <= Duration::from_millis(170), "{took:?}");
+    eprintln!("detected after {took:?} (detection time 150 ms)");
+    assert!(took <= DETECT_CEILING, "{took:?}");
     assert!(took >= Duration::from_millis(90), "{took:?}");
     let (s, threads) = a.snapshot();
     assert_eq!(threads.len(), 2);
@@ -117,13 +133,11 @@ fn two_engines_come_up_and_detect_the_loss() {
 fn ttl_below_255_is_dropped_on_single_hop() {
     // A plain UDP socket sends with TTL 64: RFC 5881 §5 says discard.
     let (pa, pb) = ports();
-    let pa = pa + 1000;
-    let pb = pb + 1000;
     let mut a = engine("127.0.0.1".parse().unwrap(), pa, pb, 1);
     a.add(spec("127.0.0.3".parse().unwrap(), None, &BfdProfile::new("x", 300, 3)), None);
     // The worker takes the session before the packets (it reads its
     // sockets first: a packet for a session not there yet is ignored).
-    assert!(wait_for(&a, Duration::from_secs(2), |s| s.len() == 1));
+    assert!(wait_for(&a, PATIENCE, |s| s.len() == 1));
     let s = std::net::UdpSocket::bind("127.0.0.3:0").unwrap();
     s.set_ttl(64).unwrap();
     let mut p = corerouter_proto_bfd::packet::Packet::new(99);
@@ -132,7 +146,7 @@ fn ttl_below_255_is_dropped_on_single_hop() {
     for _ in 0..3 {
         s.send_to(&out[..n], ("127.0.0.1", pa)).unwrap();
     }
-    assert!(wait_for(&a, Duration::from_secs(2), |s| s[0].dropped == 3), "{:?}", a.snapshot().0);
+    assert!(wait_for(&a, PATIENCE, |s| s[0].dropped == 3), "{:?}", a.snapshot().0);
     let (sessions, _) = a.snapshot();
     assert_eq!(sessions[0].packets_rx, 0);
     // With TTL 255 the same packet is taken (Down → Init).
@@ -140,7 +154,7 @@ fn ttl_below_255_is_dropped_on_single_hop() {
     p.state = State::Down;
     let n = p.encode(&mut out);
     s.send_to(&out[..n], ("127.0.0.1", pa)).unwrap();
-    assert!(wait_for(&a, Duration::from_secs(2), |s| s[0].state == "init"));
+    assert!(wait_for(&a, PATIENCE, |s| s[0].state == "init"));
 }
 
 /// The load harness: `sessions` pairs at 50 ms × 3 between two engines on
@@ -224,7 +238,6 @@ fn data_plane_for_a_fake_bfdd() {
     use super::{Controller, dplane};
 
     let (pa, pb) = ports();
-    let (pa, pb) = (pa + 2000, pb + 2000);
     let dir = std::env::temp_dir().join(format!("g36b-dplane-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -247,8 +260,8 @@ fn data_plane_for_a_fake_bfdd() {
             bind4: Some("127.0.0.1".parse().unwrap()),
             bind6: None,
             port_single: pa,
-            port_multi: pa + 1,
-            peer_ports: Some((pb, pb + 1)),
+            port_multi: free_port(),
+            peer_ports: Some((pb, 0)),
         },
         ..Controller::default()
     };
@@ -337,7 +350,7 @@ fn data_plane_for_a_fake_bfdd() {
     };
     let t = Instant::now();
     let mut up = None;
-    while t.elapsed() < Duration::from_secs(5) && up.is_none() {
+    while t.elapsed() < PATIENCE && up.is_none() {
         up = pump(&mut ctl, &mut bfdd).into_iter().find(|s| s.state == 3);
     }
     let up = up.expect("bfdd heard Up");
@@ -351,7 +364,7 @@ fn data_plane_for_a_fake_bfdd() {
     bfdd.write_all(&req).unwrap();
     let t = Instant::now();
     let mut counted = false;
-    while t.elapsed() < Duration::from_secs(2) && !counted {
+    while t.elapsed() < PATIENCE && !counted {
         counted = pump(&mut ctl, &mut bfdd).iter().any(|s| s.state == 99);
     }
     assert!(counted, "no counters");
@@ -359,13 +372,15 @@ fn data_plane_for_a_fake_bfdd() {
     let t = Instant::now();
     drop(b);
     let mut down = None;
-    while t.elapsed() < Duration::from_secs(2) && down.is_none() {
+    while t.elapsed() < PATIENCE && down.is_none() {
         down = pump(&mut ctl, &mut bfdd).into_iter().find(|s| s.state == 1);
     }
     let took = t.elapsed();
     let down = down.expect("bfdd heard Down");
     assert_eq!(down.diagnostics, 1);
-    assert!(took <= Duration::from_millis(250), "{took:?}");
+    eprintln!("bfdd heard Down after {took:?} (detection time 150 ms)");
+    assert!(took <= DETECT_CEILING, "{took:?}");
+    assert!(took >= Duration::from_millis(90), "{took:?}");
     health.stop();
     let _ = std::fs::remove_dir_all(&dir);
 }

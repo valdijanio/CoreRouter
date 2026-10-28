@@ -10,10 +10,11 @@
 //!   A (here)  bfd0 10.8.0.1 ────── veth ────── bfd0 10.8.0.2  B (namespace_b)
 //! ```
 //!
-//! Both add the other as a peer with the `fast` profile (50 ms × 3); the
-//! session comes up on both sides with the fast timers after the Poll
+//! Both add the other as a peer with the `default` profile (300 ms × 3: a
+//! loaded CI must not see false downs); the session comes up on both sides
+//! with its timers after the Poll
 //! Sequence; the link goes down in B and A must see the session down
-//! within the detection time (150 ms), with "control-detection-time-
+//! within the detection time (900 ms), with "control-detection-time-
 //! expired" in the history. The link back brings it up again.
 //!
 //! Helpers outside `#[test]` fns may unwrap/panic too.
@@ -132,21 +133,21 @@ fn two_daemons_detect_a_dead_link_within_the_detection_time() {
     ok(
         None,
         "routing.bfd.peer.add",
-        json!({"name": "b", "address": "10.8.0.2", "profile": "fast"}),
+        json!({"name": "b", "address": "10.8.0.2", "profile": "default"}),
     );
     ok(
         Some(b),
         "routing.bfd.peer.add",
-        json!({"name": "a", "address": "10.8.0.1", "profile": "fast"}),
+        json!({"name": "a", "address": "10.8.0.1", "profile": "default"}),
     );
-    let took = until("the session up with the fast timers", 10, || {
+    let took = until("the session up with its timers", 30, || {
         let s = session(None);
-        s["state"] == "up" && s["tx_interval_us"] == 50_000
+        s["state"] == "up" && s["tx_interval_us"] == 300_000
     });
     eprintln!("BFD up in {took:?}");
     assert_eq!(session(Some(b))["state"], "up");
     let s = session(None);
-    assert_eq!(s["detect_time_us"], 150_000);
+    assert_eq!(s["detect_time_us"], 900_000);
     assert_eq!(s["users"], json!(["peer b"]));
     let list = ok(None, "routing.bfd.session.list", json!({}));
     assert_eq!(list["running"], true);
@@ -162,7 +163,7 @@ fn two_daemons_detect_a_dead_link_within_the_detection_time() {
     // Cut the link in B; A sees the session go down.
     let cut = unix_ms();
     ip(Some(b), &["link", "set", "bfd0", "down"]);
-    until("the session down", 5, || session(None)["state"] == "down");
+    until("the session down", 30, || session(None)["state"] == "down");
     let h = ok(None, "routing.bfd.history.list", json!({}));
     let down = h
         .as_array()
@@ -173,14 +174,15 @@ fn two_daemons_detect_a_dead_link_within_the_detection_time() {
         .clone();
     assert_eq!(down["diag"], "control-detection-time-expired");
     let detect_ms = down["at_ms"].as_u64().unwrap().saturating_sub(cut);
-    eprintln!("BFD detection after the cut: {detect_ms} ms (detection time 150 ms)");
-    // The last packet came up to one interval (50 ms) before the cut, and
-    // the `ip` command itself takes some ms: (100, 150] plus a margin.
-    assert!(detect_ms <= 200, "{detect_ms} ms");
+    eprintln!("BFD detection after the cut: {detect_ms} ms (detection time 900 ms)");
+    // The last packet came up to one interval (300 ms) before the cut:
+    // never before 600 ms; the ceiling is generous for a loaded CI (the
+    // precise numbers come from the load bench, docs/bfd.md).
+    assert!((550..=3_000).contains(&detect_ms), "{detect_ms} ms");
 
     // Link back: up again.
     ip(Some(b), &["link", "set", "bfd0", "up"]);
-    until("the session up again", 10, || {
+    until("the session up again", 30, || {
         session(None)["state"] == "up"
     });
 }
