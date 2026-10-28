@@ -6071,3 +6071,105 @@ continuação indentadas).
   chega ao engine no mesmo lock que grava o histórico do BFD (`route_check_bfd_event`), então a rota
   sai no tempo de detecção do perfil (`fast`: 150 ms). Perfil usado por rota não pode ser removido.
   Teste em netns contra um segundo daemon como par BFD (`netns_route_check`).
+
+- 2026-10-28 — G0.26b: Travas da VM do laboratório, depois do impasse de 2026-10-28 (~40 min parados). O incidente teve três partes. Um `zebra` do FRR, subido por um teste, herdou o fd 9 da trava `/run/corerouter-lab.lock` e a segurou depois da rodada. Duas sessões embrulhavam o `run` em `flock vm/root.lock` e esperavam uma pela outra. E o `flock 9` esperava sem prazo. Correções em `xtask/src/vm_lab.rs`:
+  - o comando roda num subshell com `9>&-`, então um daemon que ele sobe não leva a trava;
+  - o `cd` para `src` fica numa linha própria: antes, `run -- 'a & b'` punha `cd && a` em segundo plano e rodava `b` fora de `src`;
+  - cada processo da rodada leva `COREROUTER_LAB_ROUND=<pid>.<início>` do `vm-lab run` no host, e no fim o `run` avisa, com PID e comando, do que ficou vivo na VM (não mata sozinho);
+  - a espera usa `flock -w` (`--lock-timeout`, `$COREROUTER_VM_LOCK_TIMEOUT`, padrão 30 min); ao estourar, sai com código 75 dizendo o dono, a idade e os processos que seguram ou esperam;
+  - o `.lock.owner` passa a ter `worktree`, `round`, `host_pid` e `started`, e fica vazio quando a rodada termina normalmente;
+  - `cargo xtask vm-lab unlock [--force]` mostra o dono, a idade e os processos; com `--force`, encerra (TERM e depois KILL) o que sobrou de rodadas cujo `run` não existe mais no host. Nunca mexe numa rodada viva nem em quem espera. Um dono no formato antigo conta como vivo enquanto houver um `vm-lab run` daquela worktree no host;
+  - `status` mostra o dono e a idade, e também o que sobrou com a trava livre;
+  - `snapshot` e `reset` recusam com a mesma descrição.
+
+  Docs: `docs/vm-lab.md` ganhou a seção "Travas: regras e como destravar": para que serve cada trava, sessões sem `flock vm/root.lock`, `trap` para desligar daemons, diagnóstico e solução. O `AGENTS.md` ganhou uma linha.
+
+  Como testar:
+  - `cargo test -p xtask vm_lab` (12 testes): dois deles rodam o script gerado no bash local com uma trava em pasta temporária. Um confere que um `sleep 600 &` não segura a trava depois da rodada (o teste falha sem o `9>&-`, conferido). O outro confere que a espera desiste em 1 s e diz quem segura.
+  - Na VM (**medido**, 2026-10-28):
+    - `cargo xtask vm-lab run -- 'sleep 600 >/dev/null 2>&1 & …'`: avisou do `sleep` que sobrou; trava livre (`fuser` vazio); `unlock --force` o encerrou;
+    - com uma rodada segurando a trava, um segundo `run --lock-timeout 10s` desistiu em 10,1 s com o dono e os processos; `unlock --force` recusou porque a rodada estava viva; `reset` e `snapshot` recusaram;
+    - incidente simulado (processo sem marca segurando a trava, owner no formato antigo): `unlock` mostrou e `unlock --force` liberou.
+
+- 2026-10-28 — G3.2c: RPKI e "Por que essa rota?" contra o FRR real na VM do laboratório
+  (`cargo xtask vm-lab run -- scripts/frr-rpki-live.sh`, FRR 10.7.1 com `bgpd_rpki`, validador RTR
+  local com VRPs fixos), **medido** em 2026-10-27: render canônico; o `bgpd` descarta a origem
+  inválida 10.66.0.0/24 (ROA /16 com tamanho máximo 16); a lista recebida mostra 10.66.0.0/24
+  `invalid` e filtrada, 10.30.2.0/24 `valid`, 10.20.1.0/24 `unknown` (resumo lido em 1 ms); o
+  explain diz que o caminho do rr3 perdeu em local-pref (200 > 100), como o próprio `bgpd`;
+  `rpki_invalid=accept` numa conexão deixa a inválida entrar e voltar a `reject` a tira. Nenhum
+  defeito achado.
+
+- 2026-10-28 — G3.4: OSPF contra o FRR real na VM do laboratório (`cargo xtask vm-lab run -- scripts/frr-ospf-live.sh`,
+  FRR 10.7.1), **medido** em 2026-10-27: commit em 17,5 ms; Full com HMAC-SHA-256 (RFC 5709) em
+  0,3 s; a rotação para a chave 2 mantém a adjacência Full por 20 s (2,5 intervalos de dead); o
+  vizinho com MTU 1400 para em Exchange e o Diagnose aponta o RFC 2328 §10.6; LSDB lida com 2 LSAs
+  e 5 ligações. Dois defeitos achados e corrigidos com teste: o Diagnose dizia "for 0 min" abaixo de
+  um minuto (agora "for 12 s") e um template ponto a ponto **passivo** (a loopback, como o operador
+  escreve) não tinha o /32 anunciado, porque o `ospfd` toma um /32 em interface point-to-point como
+  enlace não numerado; o render agora escreve `broadcast` para template passivo ponto a ponto (sem
+  vizinho, o tipo só decide o que se anuncia). O segundo apareceu no teste do LDP (a sessão LDP, com
+  transporte no loopback, não subia).
+
+- 2026-10-28 — G3.5: LDP contra o FRR real na VM do laboratório: `cargo xtask vm-lab run -- scripts/frr-ldp-live.sh`
+  (teste `crates/hal-frr/tests/frr_ldp_live.rs`). Três LSRs em linha: R1 é o FRR da VM, configurado
+  pelo `hal-frr` (OSPF + LDP); R2 e R3 são instâncias do FRR (`zebra`, `ospfd`, `ldpd`) em
+  namespaces. **Medido** em 2026-10-27 (FRR 10.7.1): render canônico; sessão LDP operacional em
+  6,0 s depois do commit; 10.255.0.3/32 sai do R1 com o rótulo do R2 (`encap mpls 17`), o R2 tira o
+  rótulo (PHP, RFC 3032 §2.1) e o ping passa pelo LSP 6,1 s depois do commit (o tcpdump no R2 mostra
+  o rótulo 17); sync RFC 5443 "achieved" em 10,1 s (o `ldpd` espera 10 s fixos depois da sessão).
+  Corrigido: "Sync not required: non-p2p link" (loopback, broadcast) aparecia como "esperando" para
+  sempre; o formato do `show ip ospf mpls ldp-sync json` foi confirmado e entrou como teste.
+
+  O `tests/netns_mpls.rs` rodou pela primeira vez com o `mpls_router` (VM, kernel 7.0) e passou;
+  `MPLS_LABELS` escolhe o tamanho da medição.
+
+- 2026-10-28 — G3.6: O texto da linha G3.6 deixa de dizer "pendentes da VM": a G3.6i fechou a interoperabilidade e a
+  comparação com o `bfdd` 10.7.1 (`docs/bfd.md`, "Contra o `bfdd` real").
+
+- 2026-10-28 — G3.6b: A linha G3.6b ficou "aberto" depois do merge do #331: o fold registrou o status só na G3.6.
+  Corrigido aqui, com o número do data plane medido na G3.6i.
+
+- 2026-10-28 — G3.6c: A linha G3.6c ficou "aberto" depois do merge do #335: o fold registrou o status só na G3.6.
+
+- 2026-10-28 — G3.6i: BFD contra o FRR real na VM do laboratório (FRR 10.7.1, build release, **medido** em
+  2026-10-27). Roteiros novos: `scripts/frr-bfd-live.sh [interop|load|self|all]` (testes
+  `#[ignore]` em `apps/corerouter-daemon/src/service/bfd/live_bfdd.rs`: o motor num namespace,
+  `zebra` + `bfdd` noutro) e `scripts/frr-bfd-dplane-live.sh` (o daemon como data plane do `bfdd`
+  da VM, com `bgpd` e um par eBGP com BFD num namespace).
+
+  - **Interop:** Up em ~1 s; o Poll do `bfdd` (300 → 50 ms) aplicado em 242 ms e o nosso (200 ms)
+    visto pelo `bfdd` em 8 ms, sem mudança de estado; SHA1 só do nosso lado cai e não volta (o
+    `bfdd` 10.7.1 não implementa autenticação e descarta o bit A, RFC 5880 §6.8.6); o `bfdd`
+    detecta o nosso silêncio com `control detection time expired` em 114–155 ms e nós detectamos o
+    `bfdd` morto em 146 ms (50 ms × 3).
+  - **Data plane com `bgpd`:** cinco cortes só dos pacotes BFD do vizinho (o TCP do BGP segue): o
+    `bfdd` recebe o nosso `BFD_STATE_CHANGE` 110–140 ms depois do corte e o `bgpd` sai de
+    Established 0,20–0,26 ms depois (logs do FRR com µs). O 0,2 ms substitui o "< 1 ms estimado" do
+    `docs/bfd.md`.
+  - **Carga** (50 ms × 3, 15 s): 1000 sessões, uma thread nossa 36,5 % × `bfdd` 32,7 % de um
+    núcleo; com 4 threads, 15,4 % por thread; o nosso atraso de envio p99 mediano 69–108 µs; zero
+    quedas falsas dos dois lados em 135 s. Nós contra nós na mesma VM: 32,4 % (no host, 10,1 %): o
+    custo é a syscall, ~3× mais cara na VM. Números e leitura em `docs/bfd.md`; decisão revista em
+    `docs/architecture.md` (mantida).
+  - **Achado do `bfdd`:** a sessão de salto único é identificada pelo vizinho, não pelo endereço
+    local (vários `peer X local-address …` viram uma); a bancada põe os endereços do nosso lado.
+  - Um corte 0,5 s depois de o BFD subir não derrubou o BGP numa rodada (o BFD caiu, o `bgpd` ficou
+    em Established); com 3 s de folga, cinco de cinco derrubaram. Não reproduzido de propósito: G3.6k.
+
+- 2026-10-28 — G3.7c: Fidelidade do simulador com o FRR real na VM do laboratório
+  (`cargo xtask vm-lab run -- scripts/frr-netsim-fidelity.sh`, teste
+  `crates/netsim/tests/frr_fidelity.rs`). Cada cenário roda no simulador e como uma instância do FRR
+  10.7.1 (`zebra`, `ospfd`, `bgpd`) por roteador, cada uma num namespace, um veth por enlace; cada
+  roteador tem de ter as mesmas melhores rotas e sessões por 5 s seguidos. **Medido** em 2026-10-27:
+  o quadrado (18 melhores rotas, 5 sessões), o anel de 5 com eBGP (55 rotas, 5 sessões) e o anel de
+  4 com OSPF (20 rotas com ECMP) batem; o FRR convergiu em 9–13 s com timers curtos.
+
+  Defeito achado e corrigido: o simulador escolhia um caminho BGP só, e o `bgpd` instala todos os
+  iguais ao melhor até o custo IGP (`maximum-paths` 64 por padrão, que o nosso render não muda): no
+  quadrado o R2 vai ao upstream por R1 e R3 e o R4 ao /16 do cliente pelos dois. O simulador agora
+  soma os enlaces desses caminhos (mesmo tipo, local-pref, AS path inteiro, origin, MED e custo
+  IGP, até 16); teste `bgp_multipath_like_frr`. Custo na bancada do simulador (criterion, host,
+  release): +0,8 a +4,6 % (convergir 100 roteadores 88,8 → 90,4 ms, dentro do ruído; corte 92,3 →
+  97,2 ms), o preço de reinstalar todo prefixo olhado (um membro do multipath pode entrar ou sair
+  com o melhor no lugar).
