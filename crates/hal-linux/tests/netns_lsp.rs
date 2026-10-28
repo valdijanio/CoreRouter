@@ -33,6 +33,9 @@ use corerouter_hal_linux::mpls::available;
 
 const ENV: &str = "COREROUTER_NETNS_TESTS";
 const REQUIRE: &str = "COREROUTER_REQUIRE_MPLS";
+/// Routes with `encap mpls` need `mpls_iptunnel` too (some kernels have
+/// `mpls_router` without it).
+const REQUIRE_ENCAP: &str = "COREROUTER_REQUIRE_MPLS_IPTUNNEL";
 static ONE: Mutex<()> = Mutex::new(());
 
 fn in_netns() -> bool {
@@ -232,6 +235,36 @@ fn a_label_ttl_that_expires_is_answered_by_the_transit_lsr() {
         return;
     }
     setup();
+    // A throwaway route tells whether the kernel can push labels on IP
+    // routes (`mpls_iptunnel`); without it the test skips, like the others.
+    let probe = Command::new("ip")
+        .args([
+            "route",
+            "replace",
+            "10.255.9.99/32",
+            "encap",
+            "mpls",
+            "999",
+            "via",
+            "10.77.0.9",
+            "dev",
+            "lpa",
+            "onlink",
+        ])
+        .output()
+        .unwrap();
+    if !probe.status.success() {
+        assert!(
+            std::env::var_os(REQUIRE_ENCAP).is_none_or(|v| v != "1"),
+            "{REQUIRE_ENCAP}=1 but routes cannot carry MPLS: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        eprintln!(
+            "skipped: no MPLS encap on IP routes (load it on the host: modprobe mpls_iptunnel)"
+        );
+        return;
+    }
+    ip(&["route", "del", "10.255.9.99/32"]);
     std::fs::write("/proc/sys/net/mpls/platform_labels", "1000").unwrap();
     std::fs::write("/proc/sys/net/mpls/conf/lpb/input", "1").unwrap();
     ip(&[
