@@ -43,6 +43,9 @@ pub const SECRET_KEYS: &[&str] = &[
     "passphrase",
     // BGP TCP MD5 key (G3.2a).
     "tcp_md5_key",
+    // OSPF keys (G3.4): a template's own key and a key chain's keys.
+    "auth_key",
+    "key_string",
 ];
 
 /// A `config.diff` path that ends in a secret field (`ip.dns_tsig.keys[*1].secret`).

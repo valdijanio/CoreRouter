@@ -86,6 +86,10 @@ pub const SIDEWAYS_ALLOWED: &[(&str, &str)] = &[
     ("corerouter-proto-pppoe", "corerouter-proto-radius"),
     // The FRR driver renders the routing protocols' config (G3.1).
     ("corerouter-hal-frr", "corerouter-proto-bgp"),
+    ("corerouter-hal-frr", "corerouter-proto-ospf"),
+    // OSPF redistribution runs through the `/routing filter` chains, whose
+    // compiler lives with the BGP policy (G3.4).
+    ("corerouter-proto-ospf", "corerouter-proto-bgp"),
 ];
 
 pub const UI_CRATES: &[&str] = &[
