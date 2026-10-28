@@ -5882,3 +5882,45 @@ continuação indentadas).
   Corte silencioso R1–R2 no quadrado, com BFD: percebido em +0,79 s, OSPF reconvergiu em +0,80 s,
   nenhum prefixo BGP perdido (**medido**, `a_cut_link_reconverges_with_bfd`). Sem BFD, o dead
   interval decide em 30–40 s.
+
+- 2026-10-27 — G3.6: BFD, parte 2 (G3.6b): CoreRouter's engine as the distributed data plane of FRR's `bfdd` (FRR 10.7.1
+  `bfddp`, `--dplaneaddr unix:/var/run/frr/bfdd_dplane.sock`, set by the init): bfdd hands every
+  session it creates (BGP `neighbor … bfd profile`, OSPF `ip ospf bfd profile`, the `routing.bfd`
+  peers) to the engine and tells bgpd/ospfd what the engine reports, so BGP and OSPF go down with
+  our BFD. Codec `proto_bfd::dplane` (proptest), the client `service/bfd/dplane.rs` (reconnect,
+  bounded queue), counters and echo answered; auth, dampening and minimum TTL from our profile
+  (bfddp has no auth). FRR render of the `bfd` block (profiles, peers); `bfd` profile on BGP
+  connections and templates; commit checks (named profiles exist, multihop peers need a local
+  address); `routing.bfd.attach` puts a profile on every BGP connection and OSPF template without
+  one. Option (b), dropping neighbours over vty, was rejected: it cannot hold a neighbour down and
+  does not cover OSPF (docs/bfd.md, "Ligação com o FRR").
+
+  Test: `cargo test -p corerouter-daemon --bin corerouter-daemon bfd::` (`data_plane_for_a_fake_bfdd`:
+  a fake bfdd hears Up, gets counters, and hears Down with Diag 1 ≤ 250 ms after the peer is gone,
+  **medido**); `cargo test -p corerouter-proto-bfd`; `cargo test -p corerouter-engine --lib routing_bfd`.
+  Interop and latency against the real bfdd: on the lab VM when it has disk again.
+
+- 2026-10-27 — G3.7b: Janela Tools › Network Simulator (painel `crates/ui/src/netsim.rs`), sobre os comandos
+  `tool.netsim.*` da G3.7. Tem:
+  - barra com o selo âmbar "simulation — not the real network" (sempre visível), topologia pronta e
+    New, relógio ⏮ (recomeça em t = 0) ⏯ ⏭ (próximo instante com evento) ×1/×10/×60/×600/×3600
+    e o tempo virtual;
+  - topologia desenhada: roteadores em selo com a cor pelo hash do AS (vermelho quando fora), enlaces
+    verdes (OSPF Full), âmbar (OSPF subindo), azuis (só eBGP), vermelho tracejado (cortado), cinza
+    tracejado (sem portadora), custo OSPF ao lado; clique seleciona roteador ou enlace;
+  - roteador selecionado: AS, router id, vizinhos OSPF, sessões BGP e rotas, com Derrubar/Ligar;
+  - enlace selecionado: estado, custo, latência, perda, Cortar/Sem portadora/Restaurar, custo e BFD;
+  - editor: acrescentar roteador (AS) e enlace (a, b, custo), e "E se? Adicionar este roteador";
+  - linha do tempo com selos por camada (fault, bfd, ospf, bgp) e, em cima, o resumo da última falha
+    ("link-cut: detected +0.64 s, OSPF +0.64 s, BGP +0.65 s, 0 prefixes lost");
+  - ⓘ em português em cada parte (`i18n/auto/netsim_{en,pt}.rs`), item no menu Tools com sinônimos
+    (simulador, e se, convergência, gns3, batfish…).
+
+  Rodando, a janela manda `tool.netsim.tick` a cada 0,5 s com o tempo de parede passado, como
+  consulta (não enche o log de ações). Ícones novos do Phosphor: play, pause, skip-back,
+  skip-forward (subconjunto refeito por `scripts/icons-subset.sh` a partir do `egui-phosphor`
+  0.14.0 do crates.io, sha256 conferido).
+
+  Como testar: `cargo run -p corerouter-gui -- --control 7979`, Virtual lab, Tools › Network
+  Simulator, New, ⏯ e ×60; clique no enlace R1–R2, Cortar; a linha do tempo mostra o BFD em
+  ~0,6–0,9 s e o OSPF indo por R3. `cargo test -p corerouter-ui netsim`.

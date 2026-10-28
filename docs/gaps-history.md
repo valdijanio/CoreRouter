@@ -199,3 +199,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-27 — G3.6 redefinido: BFD próprio em Rust puro (não o bfdd), em três partes (G3.6a motor, G3.6b FRR e clientes, G3.6c janela)
 - 2026-10-27 — G3.4 feito (janela OSPF; teste no FRR real pendente da VM)
 - 2026-10-27 — G3.7 em partes (motor do simulador e comandos `tool.netsim.*`); criadas G3.7b, G3.7c, G3.7d
+- 2026-10-27 — G3.7b feito (janela do simulador de rede)
