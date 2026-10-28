@@ -593,14 +593,20 @@ impl Ha {
         if let Some(slot) = self.heard.get_mut(path.idx()) {
             *slot = Some((now, v));
         }
-        // A hello after a BFD loss: the peer was alive on this path, a
-        // false alarm. It costs another penalty: a link that loses BFD
-        // but not the hellos is damped from its next loss on.
+        // A hello within the dead interval after a BFD loss: the peer was
+        // alive on this path, a false alarm. It costs another penalty: a
+        // link that loses BFD but not the hellos is damped from its next
+        // loss on. Later, the peer came back (it was silent): no alarm.
         let damp = self.cfg.bfd_damp;
+        let dead = self.cfg.dead_ms;
         if let Some(b) = self.bfd.get_mut(path.idx())
-            && b.lost_at.is_some_and(|t| now > t)
+            && let Some(t) = b.lost_at.filter(|t| now > *t)
         {
             b.lost_at = None;
+            if now - t >= dead {
+                self.evaluate(now);
+                return;
+            }
             b.false_alarms += 1;
             if let Some(d) = &damp {
                 b.decay(d, now);
@@ -1332,5 +1338,16 @@ mod tests {
         let s = a.status(300);
         assert!(s.peer.is_some() && s.paths[0]);
         assert_eq!((s.bfd[0].losses, s.bfd[0].false_alarms, s.bfd[0].penalty), (1, 1, 1989));
+    }
+
+    #[test]
+    fn a_peer_back_after_the_dead_interval_is_no_false_alarm() {
+        let mut a = Ha::new(cfg(1), 0);
+        a.peer_heard(10, Path::Sync, view(2, Role::Standby, 0));
+        a.bfd(10, Path::Sync, true, false, 150);
+        a.bfd(50, Path::Sync, false, true, 150);
+        a.peer_heard(5000, Path::Sync, view(2, Role::Standby, 0));
+        let b = a.bfd_state(Path::Sync);
+        assert_eq!((b.losses, b.false_alarms), (1, 0));
     }
 }

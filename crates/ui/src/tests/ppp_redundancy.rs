@@ -5,7 +5,9 @@
 use std::sync::{Arc, Mutex};
 
 use corerouter_engine::ppp_redundancy::HaBackend;
-use corerouter_model::ppp_redundancy::{PeerStatus, RedundancyStatus, RoleChange, SyncStatus};
+use corerouter_model::ppp_redundancy::{
+    PathBfdStatus, PeerStatus, RedundancyStatus, RoleChange, SyncStatus, Takeover, TakeoverTest, TestCheck,
+};
 use serde_json::json;
 
 use super::*;
@@ -43,8 +45,55 @@ impl HaBackend for Fake {
                 reason: "peer-dead".into(),
                 stateful: true,
             }],
+            bfd: vec![
+                PathBfdStatus {
+                    path: "sync".into(),
+                    peer: Some("10.0.0.2".parse().unwrap()),
+                    profile: "fast".into(),
+                    state: "up".into(),
+                    detect_ms: 150,
+                    rx_gap_p99_us: Some(104_000),
+                    ..PathBfdStatus::default()
+                },
+                PathBfdStatus {
+                    path: "access".into(),
+                    peer: Some("100.64.0.2".parse().unwrap()),
+                    profile: "fast".into(),
+                    state: "down".into(),
+                    detect_ms: 150,
+                    suppressed: true,
+                    losses: 3,
+                    ..PathBfdStatus::default()
+                },
+            ],
+            witness_age_ms: Some(420),
+            alerts: vec!["BFD on the sync path: p99 gap between the peer's packets 104 ms of a 150 ms detection time".into()],
+            takeovers: vec![Takeover {
+                at: 1_792_000_000,
+                reason: "peer-dead".into(),
+                epoch: 3,
+                detected_by: "bfd (sync, access)".into(),
+                detected_ms: Some(150),
+                witness_ms: Some(152),
+                active_ms: Some(160),
+                announced_ms: Some(160),
+                adopted_ms: Some(173),
+                stateful: true,
+                handed: 48_213,
+                adopted: 48_213,
+                ..Takeover::default()
+            }],
             ..RedundancyStatus::default()
         }
+    }
+    fn test_takeover(&self, method: &str, secs: u32, run: bool, force: bool) -> Result<TakeoverTest, String> {
+        self.calls.lock().unwrap().push(format!("test {method} {secs} {run} {force}"));
+        Ok(TakeoverTest {
+            method: method.into(),
+            state: if run { "running" } else { "checked" }.into(),
+            checks: vec![TestCheck { name: "bfd-sync".into(), ok: true, detail: "BFD fast to 10.0.0.2: up".into() }],
+            ..TakeoverTest::default()
+        })
     }
     fn switchover(&self, force: bool) -> Result<(), String> {
         self.calls.lock().unwrap().push(format!("switchover {force}"));
@@ -168,6 +217,11 @@ fn every_explanation_exists_in_both_languages() {
         "ppp_ha.virtual_mac",
         "ppp_ha.witness",
         "ppp_ha.witness_state",
+        "ppp_ha.bfd",
+        "ppp_ha.access_bfd",
+        "ppp_ha.detection",
+        "ppp_ha.bfd_state",
+        "ppp_ha.timeline",
     ];
     for k in keys {
         for l in [Lang::Pt, Lang::En] {
@@ -175,4 +229,47 @@ fn every_explanation_exists_in_both_languages() {
             assert_eq!(found.map(|(got, _)| got), Some(l), "{k} in {l:?}");
         }
     }
+}
+
+#[test]
+fn bfd_state_alerts_and_the_takeover_timeline_show() {
+    let (h, _) = open();
+    assert!(h.has_text("BFD (sync)") && h.has_text("BFD (access)"));
+    assert!(h.has_text("1200 ms"), "the detection without BFD");
+    assert!(h.has_text("sync link: up") && h.has_text("access: down"));
+    assert!(h.has_text("damped"));
+    assert!(h.has_text_containing("p99 104 ms"));
+    assert!(h.has_text("alert") && h.has_text_containing("BFD on the sync path: p99 gap"), "the early warning");
+    assert!(h.has_text_containing("answered 420 ms"));
+    assert!(h.has_text("bfd (sync, access)"));
+    assert!(h.has_text("detected 150 ms") && h.has_text("witness 152 ms") && h.has_text("active 160 ms"));
+    assert!(h.has_text("48213 kept · 0 lost"));
+}
+
+#[test]
+fn test_takeover_checks_and_runs_only_once_takeover_is_typed() {
+    let (mut h, fake) = open();
+    h.click(h.text("Test Takeover"));
+    for _ in 0..8 {
+        h.idle();
+    }
+    assert!(h.has_text_containing("This is a real takeover"));
+    assert!(h.has_text("BFD fast to 10.0.0.2: up"), "the checks of the dry run");
+    assert_eq!(*fake.calls.lock().unwrap(), ["test failure 15 false false"], "opening only checks");
+    h.click(h.text("OK"));
+    for _ in 0..5 {
+        h.idle();
+    }
+    assert_eq!(fake.calls.lock().unwrap().len(), 1, "OK does nothing before takeover is typed");
+    if let Some(c) = h.app.panel_mut::<PppPanel>().unwrap().redundancy.confirm.as_mut() {
+        c.typed = "takeover".into();
+    }
+    for _ in 0..3 {
+        h.idle();
+    }
+    h.click(h.text("OK"));
+    for _ in 0..10 {
+        h.idle();
+    }
+    assert_eq!(fake.calls.lock().unwrap().last().unwrap(), "test failure 15 true false");
 }

@@ -2,7 +2,11 @@
 
 pub(super) const HELP: &[(&str, &str)] = &[
     ("ppp.redundancy", "## BNG redundancy (active/standby pair)\n\nTwo CoreRouters serve the same subscribers: the **active** one answers, the **standby** keeps a copy of every session and takes over with the same virtual MAC, SESSION_IDs and LCP Magic-Numbers. The subscriber does not notice."),
-    ("ppp_ha.actions", "**Switchover** hands the role to the standby peer (sessions kept). **Simulate Failure** makes this node behave as dead for N seconds so the peer takes over for real."),
+    ("ppp_ha.access_bfd", "A BFD session to the peer's address on the access network. With access fencing, the takeover needs the peer silent on both paths: without BFD here the access hellos still need the dead interval."),
+    ("ppp_ha.actions", "**Switchover** hands the role to the standby peer (sessions kept). **Simulate Failure** makes this node behave as dead for N seconds so the peer takes over for real. **Test Takeover** shows the checks, then (type takeover) makes this node silent so the peer takes over as in a crash; its timeline comes back here."),
+    ("ppp_ha.bfd", "A BFD session to the peer's sync address: a third sign of life. When its packets stop, the path is silent at once (150 ms with fast). Taking over still needs every path silent and a fresh witness answer. A path that loses BFD but not the hellos is damped."),
+    ("ppp_ha.bfd_state", "Each path's BFD session: state, profile, detection time and p99 gap between the peer's packets; damped = its losses are ignored until stable. An alert when the p99 gap reaches 2/3 of the detection time."),
+    ("ppp_ha.detection", "How long the peer's failure takes to find: the BFD detection time when every path in use runs BFD, else the hellos' dead interval."),
     ("ppp_ha.drift", "Config sections that differ from the peer's."),
     ("ppp_ha.enabled", "Join the pair. The node starts in init and listens for Init Hold seconds before claiming the role."),
     ("ppp_ha.fencing", "How a node proves it is not isolated before it takes over: witness-and-access (recommended), witness, or access."),
@@ -19,6 +23,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("ppp_ha.role", "active, standby, init, fenced (cannot prove it is not isolated) or yielding (switchover)."),
     ("ppp_ha.secret", "The same on both nodes, at least 16 characters. Write-only."),
     ("ppp_ha.sync", "N/N sessions held by the active and copied by the standby; lag (unacknowledged changes) and delay (ms)."),
+    ("ppp_ha.timeline", "Each takeover in ms from the peer's last sign of life: detected, witness, active, announced, adopted, first frame; sessions kept and lost. The peer's last takeover shows after a Test Takeover from this node."),
     ("ppp_ha.timers", "Hello interval and dead interval in ms (dead ≥ 3 × hello)."),
     ("ppp_ha.track", "Ports whose loss of carrier fences this node."),
     ("ppp_ha.virtual_mac", "The AC MAC the subscribers see, the same on both nodes; empty = 02:43:52:48:41:<group>."),
