@@ -139,8 +139,33 @@ Fontes:
   **fast path MPLS em XDP**: G3.5c a G3.5f.
 - Filtros `accept-filter`/`advertise-filter` do RouterOS e a política "só loopbacks" do Junos:
   hoje o `ldpd` rotula todas as rotas do IGP. O Junos faz melhor aqui; fica na G3.5g.
-- O teste com dois `ldpd` reais sobre OSPF na VM (rótulos trocados e ping pelo LSP): a VM está com
-  o disco cheio. Fica pendente na G3.5 até ela voltar.
+
+## Teste com FRR real (VM do laboratório)
+
+`cargo xtask vm-lab run -- scripts/frr-ldp-live.sh`: três LSRs em linha, R1 é o FRR da VM, que o
+teste (`crates/hal-frr/tests/frr_ldp_live.rs`) configura pelo `hal-frr` (OSPF + LDP, a loopback
+num template ponto a ponto passivo); R2 e R3 são instâncias do FRR (`zebra`, `ospfd`, `ldpd`) em
+namespaces. Rodado em 2026-10-27 com o FRR 10.7.1, **medido**:
+
+- o render é a forma canônica do FRR (um segundo sync não digita nada);
+- sessão LDP com R2 operacional 6,0 s depois do commit;
+- 10.255.0.3/32 (R3) sai do R1 com o rótulo do R2 (`encap mpls 17`); o R2 tira o rótulo (R3 pediu
+  implicit null, RFC 3032 §2.1) e o ping passa pelo LSP 6,1 s depois do commit; o tcpdump no R2
+  mostra `MPLS (label 17, …) IP 10.255.0.1 > 10.255.0.3`;
+- sync LDP–IGP (RFC 5443) "achieved" no enlace 10,1 s depois do commit: o `ldpd` espera 10 s
+  fixos depois da sessão para declarar a troca inicial completa, e até lá o `ospfd` anuncia o
+  enlace com custo 65535. Com um caminho só, o tráfego passa assim mesmo.
+
+Defeitos que a rodada achou e o mesmo PR corrigiu:
+
+- **Loopback num template ponto a ponto passivo não era anunciada.** O `ospfd` toma um /32 numa
+  interface point-to-point como enlace não numerado e não põe o stub no router-LSA; o R2 nunca
+  aprendia o loopback do R1 e a sessão LDP (transporte no loopback) não subia. O render agora
+  escreve `broadcast` para template passivo ponto a ponto (sem vizinho, o tipo só decide o que se
+  anuncia).
+- **"Sync not required: non-p2p link"** (loopback, enlace broadcast) virava "esperando" na
+  Forwarding Table para sempre; agora a linha não aparece (o RFC 5443 não se aplica ali). O JSON do
+  `show ip ospf mpls ldp-sync json`, que não tinha sido confirmado, é o que o parser lê.
 
 ## Desempenho e paralelismo
 
@@ -166,7 +191,15 @@ Paralelismo:
 - **Montagem:** daria para dividir as linhas entre threads, mas 47 ms a cada 2 s não pagam um pool
   (o engine também roda em wasm, sem threads).
 - **Programação de rótulos:** em lotes de 64 KiB por `sendmsg`, com os ACKs lidos depois. A
-  alternativa é uma ida e volta por rótulo. Os números (lote × um a um, 10 mil rótulos; dump de 100
-  mil) saem do `tests/netns_mpls.rs` (`ten_thousand_labels_in_batches_and_one_by_one` imprime os tempos), que precisa do `mpls_router`.
-  O host de desenvolvimento não tem o módulo carregado e a VM está fora, então eles rodam no CI
-  completo (`ci/kernel-modules/mpls_router`) e ficam **pendentes** de medição aqui.
+  alternativa é uma ida e volta por rótulo. Na VM do laboratório (kernel 7.0 com `mpls_router`,
+  build release, 2026-10-27, `tests/netns_mpls.rs` com `MPLS_LABELS`), **medido**:
+
+  | Rótulos | Em lote | Um a um | Dump (leitura) |
+  |---|---|---|---|
+  | 10 mil | 10,1 ms | 15,9 ms | 2,8 ms |
+  | 100 mil | 98,4 ms | 159,4 ms | 33,7 ms |
+
+  O lote é 1,6× mais rápido e o custo por rótulo é constante (~1 µs em lote, ~1,6 µs um a um): o
+  trabalho é do kernel, não das idas e voltas. O dump de 100 mil cabe com folga no ciclo de 2 s da
+  Forwarding Table. Paralelizar a escrita não ajuda: a tabela de rótulos do kernel é uma só, sob o
+  RTNL.

@@ -96,9 +96,11 @@ pub fn diagnose(local: &Local, seen: &[Seen], heard: &[Packet]) -> Vec<Finding> 
     }
     for n in seen {
         let st = n.state.split('/').next().unwrap_or("");
-        let mins = n
-            .state_secs
-            .map_or(String::new(), |s| format!(" for {} min", s / 60));
+        let mins = n.state_secs.map_or(String::new(), |s| match s {
+            // Seen in the lab VM: "stuck in Exchange for 0 min".
+            0..60 => format!(" for {s} s"),
+            _ => format!(" for {} min", s / 60),
+        });
         match st {
             "Full" => out.push(find("ok", "full", format!("{} is Full{mins}", n.router_id), "RFC 2328 §10.1")),
             "2-Way" | "TwoWay" if local.network_type == "broadcast" || local.network_type == "nbma" => out.push(find(
@@ -355,6 +357,13 @@ mod tests {
         assert_eq!(f[0].check, "stuck-exstart");
         assert_eq!(f[0].rfc, "RFC 2328 §10.6");
         assert!(f[0].message.contains("for 5 min"));
+        // Under a minute: seconds, not "0 min".
+        let seen = [Seen {
+            state_secs: Some(12),
+            ..seen[0].clone()
+        }];
+        let f = diagnose(&local(), &seen, &[]);
+        assert!(f[0].message.contains("for 12 s"), "{}", f[0].message);
     }
 
     #[test]

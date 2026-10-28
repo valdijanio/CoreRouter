@@ -168,7 +168,10 @@ pub fn ospf_sync(json: &str) -> Result<Vec<IgpSyncState>, String> {
             .find_map(|k| text(i, k))
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if state.is_empty() {
+        // "Sync not required: non-p2p link" (a loopback, a broadcast
+        // link): RFC 5443 does not apply there, so no row (it would read
+        // as waiting forever). Seen on FRR 10.7.1 in the lab VM.
+        if state.is_empty() || state.contains("not required") {
             continue;
         }
         out.push(IgpSyncState {
@@ -222,6 +225,13 @@ mod tests {
         assert_eq!(i[0].adjacencies, 1);
         let s = ospf_sync(r#"{"ether1":{"ldpIgpSyncEnabled":true,"ldpIgpSyncState":"Sync achieved"},"ether2":{"ldpIgpSyncState":"Sync not achieved"}}"#).unwrap();
         assert!(s[0].achieved && !s[1].achieved);
+        // FRR 10.7.1's own output (lab VM, scripts/frr-ldp-live.sh).
+        let s = ospf_sync(r#"{
+  "crldp-a":{"ldpIgpSyncEnabled":true,"holdDownTimeInSec":0,"ldpIgpSyncState":"Sync not achieved"},
+  "crldp-lo":{"ldpIgpSyncEnabled":true,"holdDownTimeInSec":0,"ldpIgpSyncState":"Sync not required: non-p2p link"}
+}"#).unwrap();
+        assert_eq!(s.len(), 1);
+        assert_eq!((s[0].interface.as_str(), s[0].achieved), ("crldp-a", false));
     }
 
     #[test]

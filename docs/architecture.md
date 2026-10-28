@@ -1234,8 +1234,15 @@ papel do data plane, ou, se ele não servir, derrubando o vizinho pelo vty.
   `SO_REUSEPORT` com cBPF que lê o Your Discriminator; timer wheel por thread; nada de lock no
   caminho do pacote. Uma thread leva 1000 sessões a 50 ms × 3 com ~10 % de um núcleo e jitter
   p99 de 69 µs (**medido**, `docs/bfd.md`); o padrão é uma thread por 500 sessões, até 4.
-- **Revisar** com a comparação medida contra o `bfdd` na VM (G3.6b) e se aparecer pedido de
-  dezenas de milhares de sessões ou 3,3 ms (BFD em XDP, G3.6f).
+- **Comparação com o `bfdd` (G3.6i, VM do laboratório, release, **medido** em 2026-10-27):**
+  1000 sessões a 50 ms × 3, uma thread nossa contra o `bfdd`: 36,5 % × 32,7 % de um núcleo, zero
+  quedas falsas dos dois lados, nosso atraso de envio p99 mediano 69 µs; com 4 threads, 15,4 %
+  por thread. O custo dos dois é syscall por pacote (nós contra nós na mesma VM: 32,4 %; no host,
+  10,1 %). Interoperam: Up, Poll nos dois sentidos sem flap, detecção nos dois sentidos; o `bfdd`
+  10.7.1 não tem autenticação. A decisão se mantém: empate em CPU numa thread, e o nosso divide
+  em threads, tem dampening, histórico e comandos (`docs/bfd.md`).
+- **Revisar** se o lote de syscalls (G3.6j) não pagar e se aparecer pedido de dezenas de milhares
+  de sessões ou 3,3 ms (BFD em XDP, G3.6f).
 
 ### MPLS: kernel por netlink próprio, LDP no FRR (G3.5)
 
@@ -1257,8 +1264,9 @@ papel do data plane, ou, se ele não servir, derrubando o vizinho pelo vty.
 - Montar a Forwarding Table de 100 mil rótulos e 10 mil FECs: 22,5 ms, **medido**.
 - Isso vai para a thread do serviço `mpls`. A página sob o lock fica em 1,1 ms e a busca em
   0,48 ms, **medidos** (`docs/mpls.md`).
-- Lote × um a um no kernel: medido no CI completo / na VM (`tests/netns_mpls.rs`), pendente
-  aqui.
+- Lote × um a um no kernel (VM do laboratório, kernel 7.0, release, **medido** em 2026-10-27):
+  100 mil rótulos em 98 ms em lote contra 159 ms um a um (1,6×); dump de 100 mil em 34 ms. O custo
+  é do kernel (~1 µs por rótulo), não das idas e voltas (`docs/mpls.md`).
 
 **Revisar se:**
 

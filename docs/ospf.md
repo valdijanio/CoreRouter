@@ -95,7 +95,14 @@ corerouter-cli run routing.ospf.interface-template.check '{"area":"backbone","ne
   sample"`.
 - **Teste com FRR real**: `cargo xtask vm-lab run -- scripts/frr-ospf-live.sh` (dois FRRs em
   namespaces: Full com HMAC-SHA-256, rotação da chave sem queda, MTU diferente parado antes de
-  Full e explicado pelo Diagnose, LSDB e topologia lidas).
+  Full e explicado pelo Diagnose, LSDB e topologia lidas). Rodado em 2026-10-27 com o FRR 10.7.1,
+  **medido**: commit em 17,5 ms, Full com HMAC-SHA-256 em 0,3 s, a chave 2 entra sem queda (a
+  adjacência segue Full por 20 s, 2,5 intervalos de dead), o vizinho com MTU 1400 para em
+  Exchange e o Diagnose aponta o RFC 2328 §10.6; LSDB com 2 LSAs e 5 ligações. A rodada achou dois
+  defeitos, corrigidos: o Diagnose escrevia "for 0 min" abaixo de um minuto (agora segundos) e um
+  template ponto a ponto **passivo** (a loopback) não tinha o /32 anunciado pelo `ospfd`, que o
+  toma como enlace não numerado — o render agora escreve `broadcast` nesse caso (achado no teste
+  do LDP, `docs/mpls.md`).
 - **Limites**: VRF diferente de `main` e a LSDB do OSPFv3 ainda não são lidas (G3.4h).
 
 ## Janela Routing › OSPF (G3.4c)

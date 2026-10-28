@@ -263,7 +263,16 @@ fn civil(days: u64) -> (u64, u8, u8) {
 
 fn iface_v2(s: &mut String, b: &Binding<'_>, open: Opener<'_>) -> Result<(), String> {
     let t = b.template;
-    if let Some(n) = network_v2(t.kind) {
+    // A passive interface has no neighbor, so its type only decides what
+    // is advertised: ospfd takes a /32 on a point-to-point interface (a
+    // loopback in a ptp template) as unnumbered and never advertises it
+    // (lab VM, FRR 10.7.1: the LDP session to that loopback never came
+    // up). Broadcast advertises the stub network either way.
+    let kind = match t.kind {
+        NetworkType::Ptp if t.passive => NetworkType::Broadcast,
+        k => k,
+    };
+    if let Some(n) = network_v2(kind) {
         let _ = writeln!(s, " ip ospf network {n}");
     }
     match t.auth {
@@ -671,6 +680,17 @@ mod tests {
         );
         assert!(text.contains("key chain CR-T1\n key 1\n  key-string s3cret\n  cryptographic-algorithm hmac-sha-256\n exit\nexit\n"), "{text}");
         assert!(text.contains(" ip ospf area 0.0.0.0\n"), "{text}");
+        // ether2 is a passive point-to-point (a loopback in a ptp
+        // template): broadcast, or ospfd never advertises a /32 there.
+        assert!(
+            text.contains("interface ether2\n ip ospf network broadcast\n"),
+            "{text}"
+        );
+        let mut cfg = sample();
+        for t in &mut cfg.routing.ospf.templates {
+            t.passive = false;
+        }
+        let text = render(&cfg, &|s| Some(s.stored().to_owned())).unwrap();
         assert!(
             text.contains("interface ether2\n ip ospf network point-to-point\n"),
             "{text}"

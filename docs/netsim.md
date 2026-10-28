@@ -121,8 +121,13 @@ Fora: DR/BDR, troca DD/LSR/LSAck (o banco inteiro é inundado no Full), MinLSArr
   tentativa só reenvia o KEEPALIVE. Sem isso a primeira resposta perdida (a rota de volta ainda não
   existia) travava o par em OpenSent/OpenConfirm — o teste `every_seed_converges` roda 20 sementes.
 
+- **multipath como o FRR** (G3.7c): o `bgpd` instala todo caminho igual ao melhor até o custo IGP
+  (`maximum-paths` 64 por padrão, que o nosso render não muda): mesmo tipo (eBGP ou iBGP),
+  local-pref, AS path inteiro, origin, MED e custo IGP. O simulador soma os enlaces desses caminhos
+  na FIB (até 16, como o OSPF). Sem isso o quadrado divergia do FRR real em três rotas.
+
 Fora: TCP de verdade (o OPEN que chega é a conexão), colisão do §6.8, MRAI (o do FRR é 0), route
-refresh, graceful restart, multipath, IPv6, refletor de rotas.
+refresh, graceful restart, `multipath-relax`, IPv6, refletor de rotas.
 
 **BFD** (RFC 5880, analítico): numa falha silenciosa, cada ponta com BFD percebe
 `intervalo × multiplicador` (300 ms × 3, padrão do `bfdd`) depois do último pacote recebido, que
@@ -254,3 +259,17 @@ Ferramentas: `cargo run --release -p corerouter-netsim --example measure -- 10 1
 **Fica para depois (gaps):**
 - G3.7c: o teste de fidelidade com o FRR real na VM (bloqueado pelo disco da VM);
 - G3.7e: IPv6 (OSPFv3, BGP IPv6) e refletor de rotas.
+
+## Fidelidade com o FRR real (G3.7c)
+
+`cargo xtask vm-lab run -- scripts/frr-netsim-fidelity.sh` (teste
+`crates/netsim/tests/frr_fidelity.rs`): o mesmo cenário roda no simulador e como uma instância do
+FRR (`zebra`, `ospfd`, `bgpd`) por roteador, cada uma num namespace, um veth por enlace, com os
+endereços, custos e sessões do `Scenario::plan`. Depois que os dois convergem, cada roteador tem
+de ter as mesmas melhores rotas (prefixo, protocolo, métrica OSPF e interfaces de saída, ECMP
+incluído) e as mesmas sessões BGP no ar, por 5 s seguidos. Cenários: o quadrado (OSPF no
+triângulo, iBGP com next-hop-self, upstream com eBGP em dois roteadores de borda), anel de 5 com
+eBGP em todo enlace (AS path mais curto, sem empate) e anel de 4 só com OSPF (ECMP no oposto).
+Os timers do FRR são os curtos (hello 1 s, BGP 3/9 s): a comparação é do estado final, não dos
+tempos.
+

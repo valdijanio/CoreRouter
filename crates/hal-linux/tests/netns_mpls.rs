@@ -255,11 +255,15 @@ fn ten_thousand_labels_in_batches_and_one_by_one() {
     let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
     port("mpc0", "mpc1", 32);
     sysctl("platform_labels", "1048575");
-    const N: u32 = 10_000;
-    let set: Vec<StaticOp> = (0..N)
+    // MPLS_LABELS=100000 for the lab VM measurement (docs/mpls.md).
+    let n_env = std::env::var("MPLS_LABELS")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let total: u32 = n_env.unwrap_or(10_000).clamp(1, 500_000);
+    let set: Vec<StaticOp> = (0..total)
         .map(|i| StaticOp::Set(route(100_000 + i, [10, 32, 0, 2], "mpc0", &[200_000 + i])))
         .collect();
-    let remove: Vec<StaticOp> = (0..N).map(|i| StaticOp::Remove(100_000 + i)).collect();
+    let remove: Vec<StaticOp> = (0..total).map(|i| StaticOp::Remove(100_000 + i)).collect();
     let t = Instant::now();
     apply_static(&set, &[]).unwrap();
     let batched = t.elapsed();
@@ -267,13 +271,13 @@ fn ten_thousand_labels_in_batches_and_one_by_one() {
     let t = Instant::now();
     let n = mine(&mut r).len();
     let dump = t.elapsed();
-    assert_eq!(n, N as usize);
+    assert_eq!(n, total as usize);
     apply_static(&remove, &[]).unwrap();
     let t = Instant::now();
     apply_one_by_one(&set).unwrap();
     let single = t.elapsed();
     apply_static(&remove, &[]).unwrap();
-    eprintln!("{N} labels: batched {batched:?}, one by one {single:?}, dump {dump:?}");
+    eprintln!("{total} labels: batched {batched:?}, one by one {single:?}, dump {dump:?}");
     assert!(mine(&mut r).is_empty());
     ip(&["link", "del", "mpc0"]);
 }

@@ -38,6 +38,30 @@ fn converged(scn: &preset::Scenario, secs: u64) -> Simulation {
 }
 
 #[test]
+fn bgp_multipath_like_frr() {
+    // FRR installs every path equal to the best down to the IGP cost
+    // (maximum-paths 64 by default; our render leaves it): the lab VM's
+    // FRR showed both of these (tests/frr_fidelity.rs).
+    let sim = converged(&preset::square(), 60);
+    // R2: the upstream's /24 through R1 and R3 (iBGP, next-hop-self, both
+    // loopbacks 10 away).
+    let r = has(&sim, 1, "198.51.100.0/24").unwrap();
+    let mut want = vec![link_between(&sim, 0, 1), link_between(&sim, 1, 2)];
+    want.sort_unstable();
+    assert_eq!(r.links, want, "{r:?}");
+    // R4: the customer /16 from R1 and R3 (eBGP, the same AS path).
+    let r = has(&sim, 3, "100.64.0.0/16").unwrap();
+    let mut want = vec![link_between(&sim, 3, 0), link_between(&sim, 3, 2)];
+    want.sort_unstable();
+    assert_eq!(r.links, want, "{r:?}");
+    // A longer AS path is no member: on a 5-ring with eBGP, R1 reaches R3's
+    // /24 through R2 only (2 ASes against 3 the other way).
+    let ring = converged(&preset::ring(5, preset::BgpMode::Ebgp), 60);
+    let r = has(&ring, 0, &preset::customer(2).to_string()).unwrap();
+    assert_eq!(r.links, vec![link_between(&ring, 0, 1)], "{r:?}");
+}
+
+#[test]
 fn every_seed_converges() {
     // The handshake must survive a lost first answer (a route back not
     // there yet), whatever the timing a seed gives.
