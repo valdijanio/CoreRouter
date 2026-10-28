@@ -64,6 +64,7 @@ fn lab() -> Session {
                 ..BgpSession::default()
             },
         ],
+        ..RoutingStatus::default()
     });
     s
 }

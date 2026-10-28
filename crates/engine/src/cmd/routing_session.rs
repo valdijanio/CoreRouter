@@ -74,6 +74,7 @@ mod tests {
             updated: Some(1),
             error: None,
             bgp_sessions: vec![one("default", "192.0.2.2"), one("lab", "192.0.2.6")],
+            ..RoutingStatus::default()
         });
         let all = s.execute("routing.bgp.session.list", &json!({})).unwrap();
         assert_eq!(all.as_array().map(Vec::len), Some(2));

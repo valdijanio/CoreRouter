@@ -61,6 +61,40 @@ corerouter-cli run routing.ospf.interface-template.check '{"area":"backbone","ne
   pontuada, `%e` com espaço nas datas, valores do `ospf6d` iguais ao padrão omitidos (ele não os
   imprime). Linha que o FRR imprime diferente aparece no log como "leftover".
 
+## Estado (G3.4b)
+
+| Comando | O que é |
+|---|---|
+| `routing.ospf.neighbor.list` | `/routing ospf neighbor`: estado (RFC 2328 §10.1), papel, selo "Full · DR", tempo no estado, BFD |
+| `routing.ospf.interface.list` | As interfaces como o daemon as roda (tipo, estado, MTU, hello/dead, DR/BDR), com o template |
+| `routing.ospf.lsa.list` | `/routing ospf lsa`, paginado, por tipo, área e originador |
+| `routing.ospf.route.list` | As rotas que o `ospfd` calculou (intra, inter-área, E1/E2) |
+| `routing.ospf.topology` | Roteadores e redes de trânsito da LSDB com posição (layout por forças) e custo de cada ponta |
+| `routing.ospf.path` | "Por que esse caminho?": o caminho mais curto até um endereço ou router id, custo somado salto a salto, conferido com a rota do daemon (`agrees`) |
+| `routing.ospf.neighbor.diagnose` | Por que um vizinho não chega a Full, com a seção da RFC |
+
+- **Vizinhos e interfaces** vêm em toda leitura do serviço `frr` (a cada 2 s, fora do lock).
+- **A LSDB e as rotas** são lidas sob demanda, fora do lock: o comando pede (`crate::ospf_state`),
+  a thread do FRR lê em fluxo direto do socket (`show ip ospf database <tipo> json`) para a tabela
+  compacta `Lsdb` (uma linha fixa por LSA, links num vetor só) e devolve; a primeira resposta pode
+  vir `pending`. O resultado vale 10 s e é compartilhado (`Arc`) por páginas, topologia e caminho;
+  o layout fica guardado enquanto a mesma cópia da LSDB estiver em uso.
+- **Diagnose** (`proto_ospf::diagnose`): com o estado do daemon, explica ExStart/Exchange parado
+  (MTU, §10.6), Init (os Hellos chegam mas não nos listam: autenticação, área, timers, máscara,
+  §10.5), 2-Way normal em link multiacesso (§10.4), interface passiva ou caída. Com pacotes
+  capturados (`proto_ospf::packet`, parser do cabeçalho, Hello e DD de v2 e v3, RFC 2328 §A.3 e
+  RFC 5340 §A.3, com proptest) compara campo a campo: área, hello/dead, máscara, bits E/N do tipo
+  de área (RFC 3101 §2.3), tipo e key id de autenticação (§D.3), MTU do DD, router id duplicado
+  (§C.1) e tipo de rede diferente.
+- **Laboratório virtual**: sem FRR, vizinhos, LSDB e rotas são uma amostra feita a partir da
+  config (`proto_ospf::sample`: um vizinho por interface ativa, um anel de roteadores e uma LAN de
+  trânsito atrás de cada um, a segunda interface parada em ExStart), com `source: "virtual lab
+  sample"`.
+- **Teste com FRR real**: `cargo xtask vm-lab run -- scripts/frr-ospf-live.sh` (dois FRRs em
+  namespaces: Full com HMAC-SHA-256, rotação da chave sem queda, MTU diferente parado antes de
+  Full e explicado pelo Diagnose, LSDB e topologia lidas).
+- **Limites**: VRF diferente de `main` e a LSDB do OSPFv3 ainda não são lidas (G3.4h).
+
 ## Seguro por padrão
 
 - `routing.ospf.interface-template.check` (o modal) mostra antes de aplicar: **quais interfaces
@@ -103,6 +137,27 @@ corerouter-proto-ospf --bench ospf_config`: 4 000 interfaces, 4 000 endereços, 
   interfaces; o tempo do commit é do FRR digitando os contextos (G3.1: um thread por daemon, o
   `ospfd` e o `ospf6d` em paralelo, já feito). Dividir o casamento por faixa de interfaces
   ganharia ≤ 10 ms e não roda no WASM.
+
+### Estado: LSDB e layout (G3.4b)
+
+Medido em 2026-10-27, 32 núcleos (carga ~10 de outras sessões), build de bench.
+
+| Medida | Resultado |
+|---|---|
+| LSDB de 10 000 LSAs (2 000 router com 4 links, 500 network, 7 500 externas; 4,0 MiB de JSON): leitura em fluxo para a tabela compacta | 9,1 ms, 612 KiB |
+| a mesma como árvore `serde_json::Value` | 17,0 ms, +34 MiB de RSS |
+| layout de 500 roteadores (570 links, 300 rodadas): 1 thread | 66,8 ms |
+| idem, 4 threads | 27,1 ms |
+| idem, 16 threads | 29,1 ms (a barreira entre rodadas custa o que a divisão ganha) |
+
+- **Por item:** a LSDB vai direto do socket para linhas fixas (um LSA = 40 bytes, um link = 12),
+  sem árvore JSON; uma página de LSAs é um filtro sobre o vetor.
+- **Threads no layout:** a repulsão é O(n²) por rodada e cada nó só depende das posições da
+  rodada anterior, então os nós se dividem em pedaços, um thread por pedaço, criados uma vez, com
+  uma barreira entre as rodadas (criar threads a cada rodada custava mais do que ganhava: 16
+  threads em 69 ms contra 72 ms em um, **medido**). O mesmo resultado em 1 ou N threads (teste).
+  Limite de 8 threads; no WASM, um. O layout roda uma vez por LSDB nova e fica guardado, não a
+  cada quadro.
 
 ## Pesquisa
 

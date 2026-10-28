@@ -71,6 +71,7 @@ fn loaded() -> Session {
                 ..BgpSession::default()
             })
             .collect(),
+        ..RoutingStatus::default()
     });
     s
 }
