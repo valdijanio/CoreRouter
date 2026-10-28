@@ -138,6 +138,9 @@ pub struct Inputs {
     pub oom_recent: Option<u64>,
     /// NTP client enabled and its state.
     pub ntp: Option<(bool, NtpState)>,
+    /// Something configured depends on the clock (RADIUS servers in use):
+    /// a disabled NTP client is then a warning, not the factory default.
+    pub ntp_needed: bool,
     /// Supervised services by state (`None`: no supervisor — lab).
     pub services: Option<Vec<(String, ServiceState)>>,
     /// (busiest CPU, its share of NET_RX %, CPUs, NET_RX/s).
@@ -334,9 +337,14 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
 
     // NTP.
     match i.ntp {
-        Some((false, _)) => push("ntp", "NTP", Severity::Warning, Some("disabled".into()),
-            "cliente NTP desligado: logs, RADIUS e certificados dependem do horário certo".into(),
+        // G4.6i: off is the RouterOS factory default, so a new router must not
+        // be born with a warning; it matters once RADIUS depends on the clock.
+        Some((false, _)) if i.ntp_needed => push("ntp", "NTP", Severity::Warning, Some("disabled".into()),
+            "cliente NTP desligado, mas há servidores RADIUS configurados: o horário errado quebra Event-Timestamp e a contabilidade".into(),
             Some("Ligue o cliente NTP: system.ntp.client.set enabled=yes servers=…")),
+        Some((false, _)) => push("ntp", "NTP", Severity::Ok, Some("disabled".into()),
+            "cliente NTP desligado (padrão de fábrica); ligue em System › NTP Client se logs e certificados precisarem do horário certo".into(),
+            None),
         Some((true, NtpState::Synchronized)) => push("ntp", "NTP", Severity::Ok, Some("synchronized".into()), "relógio sincronizado".into(), None),
         Some((true, NtpState::Waiting)) => push("ntp", "NTP", Severity::Warning, Some("waiting".into()),
             "cliente NTP sem resposta dos servidores".into(),
@@ -494,6 +502,7 @@ impl Session {
         }
         let ntp = &self.store().running().system.ntp_client;
         let enabled = ntp.enabled;
+        i.ntp_needed = self.store().running().radius.servers.iter().any(|r| !r.service.is_empty());
         i.ntp = Some((enabled, self.ext::<NtpStatus>().map(|s| s.status).unwrap_or_default()));
         i.sockbuf = self
             .ext::<SocketBuffers>()
@@ -574,6 +583,7 @@ mod tests {
             cgnat: None,
             oom_recent: Some(0),
             ntp: Some((true, NtpState::Synchronized)),
+            ntp_needed: false,
             services: Some(vec![("dns-resolver".into(), ServiceState::Running)]),
             rss: Some((0, 20.0, 8, 50_000.0)),
             sockbuf: Some(vec![("radius".into(), 4 << 20, 4 << 20)]),
@@ -622,7 +632,8 @@ mod tests {
             ("cgnat above", |i| i.cgnat = Some((3, 0)), "cgnat.ports", Severity::Warning),
             ("cgnat failures", |i| i.cgnat = Some((0, 12)), "cgnat.ports", Severity::Error),
             ("oom", |i| i.oom_recent = Some(1), "oom", Severity::Error),
-            ("ntp off", |i| i.ntp = Some((false, NtpState::Stopped)), "ntp", Severity::Warning),
+            ("ntp off, nothing needs it", |i| i.ntp = Some((false, NtpState::Stopped)), "ntp", Severity::Ok),
+            ("ntp off, radius needs it", |i| { i.ntp = Some((false, NtpState::Stopped)); i.ntp_needed = true }, "ntp", Severity::Warning),
             ("ntp waiting", |i| i.ntp = Some((true, NtpState::Waiting)), "ntp", Severity::Warning),
             ("ntp no daemon", |i| i.ntp = Some((true, NtpState::Stopped)), "ntp", Severity::Unknown),
             ("service restarting", |i| i.services = Some(vec![("dns".into(), ServiceState::Restarting)]), "services", Severity::Warning),
@@ -646,6 +657,14 @@ mod tests {
                 assert!(matches!(other.severity, Severity::Ok), "{what} moved {}", other.key);
             }
         }
+    }
+
+    #[test]
+    fn new_router_has_no_ntp_warning() {
+        let mut s = Session::virtual_lab();
+        s.health_alerts();
+        let log = s.execute("log.print", &serde_json::json!({})).unwrap().to_string();
+        assert!(!log.contains("Saúde: NTP"), "{log}");
     }
 
     #[test]
