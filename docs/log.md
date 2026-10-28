@@ -6384,3 +6384,45 @@ continuação indentadas).
   daemons do FRR com OSPF+SR+LDP no ar 85,7 → 88,5 MiB; boot e convergência iguais (kernel → FRR
   0,75 s, OSPF `Full` 1,5 s, LDP 11,5 s); dois builds limpos com `-j` diferente deram imagens
   idênticas, menos o OVA (o `CID` aleatório que o `qemu-img` grava no VMDK, que já existia: G1.6l).
+
+- 2026-10-28 — G3.6l: O perfil `bfd` do interface-template OSPF chega ao `ospfd` (`ip ospf bfd` + `ip ospf bfd profile
+  P`), e o vizinho OSPF cai pelo BFD do CoreRouter (data plane do `bfdd`). Achado em paralelo pela
+  G1.6k e pela G3.9 (contra o RouterOS); corrigido na G3.9. Números em `docs/changes/G3.9.md`.
+
+- 2026-10-28 — G3.6m: O bloco `bfd` do render é a forma que o `bfdd` 10.7.1 imprime: sem os valores padrão e com
+  transmit antes de receive. O hal-frr não o redigita mais a cada sync. Corrigido na G3.9.
+
+- 2026-10-28 — G3.9: Interoperabilidade com RouterOS v7: um RouterOS 7.25 CHR (imagem oficial, SHA-256 publicado
+  conferido) roda em QEMU/KVM aninhado dentro da VM do laboratório, ligado ao CoreRouter
+  (`--backend linux`, FRR 10.7.1 `-N crcore` num namespace, `bfdd` com o nosso motor como data plane)
+  e a dois FRR (R3, R4) para tráfego de ponta a ponta. `scripts/routeros-interop.sh` é o roteiro
+  repetível (`cargo xtask vm-lab run -- scripts/routeros-interop.sh [casos]`, ~15 min); o caso `prod`
+  aplica os blocos de `docs/producao-core.md` como estão, num CoreRouter reiniciado do zero, e
+  confere Full, BFD, LDP e que o MikroTik só manda ao CoreRouter a loopback e a sub-rede de teste.
+
+  Interopera (**medido**, VM do laboratório, 2026-10-28): OSPFv2 ptp (Full 1,8–7,6 s com hello 1 s;
+  o CHR fica até ~4 s em Loading) e broadcast com prioridade 0 (CHR DR, CoreRouter DROther); md5 e
+  sha256; áreas normal, stub e NSSA (tipo diferente não forma); MTU diferente fica em
+  ExStart/Exchange e o `neighbor.diagnose` aponta o MTU, `mtu_ignore` só do nosso lado resolve;
+  redistribuição só do pedido; custo 65535 tira o CoreRouter do trânsito sem tirar a sub-rede dos
+  clientes; LDP (sessão em 1–2,5 s, rótulos nos dois sentidos, ping R3 → R4 rotulado através do CHR
+  e do CoreRouter); BFD 300 ms × 3 e × 4 (× 4 recomendado com RouterOS: nenhuma queda extra na volta
+  de um corte); OSPFv3 ptp.
+
+  Corrigido nesta entrega (fecha também a G3.6l e a G3.6m, abertas pela G1.6k):
+  - o `bfd` do interface-template OSPF nunca chegava ao FRR (faltava `ip ospf bfd profile P`): num
+    corte silencioso o OSPF esperava o dead interval; agora o CHR derruba a adjacência em 0,7–1,1 s
+    e o buraco no tráfego é de 1,2–1,6 s (300 ms × 3 a × 4);
+  - o `hal-frr` dava como aplicado um batch que o northbound do FRR recusava (`XFRR_end_configuration`
+    responde sucesso com "% Configuration failed"): sha1/384/512 deixavam o `ospfd` sem key chain,
+    mandando MD5 com key id 0; agora o commit falha com a mensagem do FRR;
+  - tirar o OSPF de uma interface mandava `no interface X`, que o FRR recusa enquanto o link existe:
+    o commit inteiro falhava; agora a interface é esvaziada linha a linha;
+  - o bloco `bfd` era redigitado a cada sync (o `bfdd` omite os valores padrão e imprime transmit
+    antes de receive): o render agora é a forma canônica.
+
+  Números de queda (R3 pinga R4 a cada 10 ms; o caminho volta pelo enlace direto CHR—R4):
+  corte silencioso com BFD 300 ms × 3: CHR derruba a adjacência em 0,7–0,8 s, buraco de 1,16–1,29 s;
+  com × 4: 1,08 s e 1,55 s; perda de portadora: buraco de 0,6–0,7 s; sem BFD (dead 4 s): adjacência
+  cai em 3,2–3,5 s; a volta do CoreRouter não abre buraco (< 0,1 s). Sair: template passivo tira o
+  tráfego sem perda em nenhuma rodada, desligar a instância abre 0,44–1,4 s.
