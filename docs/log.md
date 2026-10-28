@@ -5924,3 +5924,83 @@ continuação indentadas).
   Como testar: `cargo run -p corerouter-gui -- --control 7979`, Virtual lab, Tools › Network
   Simulator, New, ⏯ e ×60; clique no enlace R1–R2, Cortar; a linha do tempo mostra o BFD em
   ~0,6–0,9 s e o OSPF indo por R3. `cargo test -p corerouter-ui netsim`.
+
+- 2026-10-27 — G3.5: MPLS e LDP, parte 1 (`docs/mpls.md`):
+
+  - **Comandos** com os nomes do RouterOS v7: `mpls.settings.*`, `mpls.interface.*`,
+    `mpls.static.*` (LSP estático, Cisco/Junos), `mpls.ldp.*`, `mpls.ldp.interface.*`,
+    `mpls.ldp.neighbor.*` (TCP MD5 selada, Hellos dirigidos) e `mpls.forwarding-table.page`.
+    As listas modais têm prévias (`*.preview`) que mostram o que o `ldpd` recebe.
+  - **Kernel:** `hal-linux/src/mpls.rs` fala netlink `AF_MPLS` próprio:
+    - dump, `RTM_NEWROUTE`/`DELROUTE` em lotes de 64 KiB com tudo ou nada, e os sysctls;
+    - os comandos que adicionam ficam desabilitados com o motivo sem o `mpls_router`;
+    - `ci/kernel-modules/mpls_router` liga o teste em netns no CI completo. O módulo é `optional`: o kernel do Azure não o traz no pacote base. O setup tenta o `.ko` do `linux-modules-extra` (o cache do `vrf`); sem ele, o teste pula com aviso;
+    - o kernel da imagem já tem `CONFIG_MPLS_ROUTING=y`.
+  - **FRR:**
+    - o `hal-frr` passa a ser dono de `mpls ldp` (no `ldpd`) e de `mpls label dynamic-block` (no
+      zebra, quando a faixa não é a padrão);
+    - põe `mpls ldp-sync` em `router ospf`, empilhado na G3.4;
+    - lê vizinhos, ligações, interfaces e o sync a cada 2 s.
+  - **Validação com a RFC no erro:**
+    - RFC 3032 §2.1 (rótulos reservados; 3 nunca no fio);
+    - RFC 5036 §3.5.2.1 (hello < hold);
+    - RFC 7552 §6.1 (transporte IPv6 global);
+    - um LSP estático dentro da faixa dinâmica é recusado.
+  - **Janelas** MPLS › LDP (Neighbors, Interfaces, Settings) e MPLS › Forwarding Table, no mockup
+    aprovado, com ⓘ em português, claro e escuro:
+    - selo `MTU 1500 < 1504`;
+    - Sync IGP em selo;
+    - o motivo de cada FEC sem rótulo;
+    - `implicit-null (pop)`.
+  - **IP › Routes:** selo `MPLS <rótulo>` no gateway.
+
+  **Como testar:**
+
+  - `cargo test -p corerouter-proto-mpls -p corerouter-hal-frr -p corerouter-engine --test mpls`;
+  - `cargo test -p corerouter-ui mpls`;
+  - `cargo xtask netns` com o `mpls_router` carregado (`tests/netns_mpls.rs`);
+  - na CLI: `mpls.ldp.add {"lsr_id":"10.255.0.1"}` e `mpls.ldp.interface.add {"interface":"ether1"}`,
+    e a janela mostra o aviso de MTU do lab (1500).
+
+- 2026-10-27 — G3.6: BFD, parte 3 (G3.6c): the Routing › BFD window, tabs Sessions (Peer with a multihop chip, Used
+  by as name-coloured chips, State up/down/init/dampened/inactive, Tx/Rx, Detect Time, Jitter p99,
+  Flaps 24h; + and − for peers, "Use BFD Everywhere"; footer with the engine's threads, CPU and
+  steering), Profiles (list window pattern with the engine's preview `routing.bfd.profile.preview`:
+  detection time, packets per second, CPU and multiplier warnings) and History (newest first,
+  `down » dampened`, `dampened » up`). The peer modal uses `routing.bfd.peer.preview`. The BGP
+  connection and template modal gained "BFD Profile". ⓘ on every column, tab and field, Portuguese
+  and English. Screenshots light and dark checked (two daemons over a veth in a namespace, three
+  link flaps dampened the session).
+
+  Test: `cargo test -p corerouter-ui bfd` (sessions, attach, profile and peer modals through the
+  preview, history, every ⓘ in both languages); `cargo test -p corerouter-engine --lib routing_bfd`.
+
+- 2026-10-27 — G3.7d: Simulador de rede, parte 3: cada roteador virtual roda o OSPF da sua própria configuração
+  (modelo da G3.4), não mais "OSPF em todo enlace":
+  - **o que é lido**: a primeira instância OSPFv2 habilitada e as interfaces que os templates casam,
+    pela mesma regra do render para o FRR (`proto_ospf::bind::bindings`: nome, interface list ou
+    rede; o primeiro template vence), com o custo, o hello e o dead do template, `passive`
+    (anuncia a rede, sem adjacência) e o perfil de BFD (liga o BFD da adjacência). Sem instância,
+    sem OSPF; loopback só entra se um template a casar;
+  - **o que muda nos roteadores**: os presets digitam em cada roteador a instância `default`, a área
+    `backbone` (0.0.0.0), um template ponto a ponto com as portas dos enlaces OSPF e a loopback
+    passiva; um enlace novo acrescenta o template da porta, um roteador novo já nasce com a
+    instância; template sem custo usa o custo do enlace no editor;
+  - **BFD do BGP** (G3.6b): uma conexão com perfil BFD (`bfd`, RouterOS `use-bfd`) cai com o BFD;
+    sem perfil, um corte silencioso espera o hold timer. Os presets e o `link.add` põem o perfil
+    embutido `default` no eBGP; a porta liga o BFD quando um vizinho de um salto o pede;
+  - **"E se?"**: copia também instâncias, áreas e templates OSPF e os perfis BFD (as chaves de
+    autenticação continuam seladas no roteador real);
+  - **formato do cenário exportado**: passa a ser `corerouter-netsim/2` (os roteadores trazem os
+    comandos OSPF). O formato 1 é recusado com o motivo ("export it again"), e o exemplo de
+    `crates/engine/tests/netsim/` foi exportado de novo, com o mesmo `expect`.
+
+  Como testar: `cargo test -p corerouter-netsim the_routers_own_ospf_config_decides`,
+  `cargo test -p corerouter-engine netsim` (inclui `bgp_bfd_comes_from_the_connection`). Na janela: selecione R1,
+  `tool.netsim.node.run {"node":"R1","id":"routing.ospf.interface-template.add","params":{"area":"backbone","interfaces":["ether1"],"type":"ptp","cost":100,"place_before":"*3"}}`
+  e veja a rota de R1 para 10.255.0.2/32 passar por R3 com custo 20.
+
+  Desempenho (**medido**, release, 32 CPUs com load ~15, 2026-10-27): montar o laboratório de 500
+  roteadores, agora com 4 comandos OSPF a mais por roteador, levou 143 ms (150 ms antes); 60 s
+  virtuais pelo `tool.netsim.advance`, 3,3 s. Ler o OSPF de um roteador é O(interfaces × templates
+  que as citam), feito só quando a config dele muda.
