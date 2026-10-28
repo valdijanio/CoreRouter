@@ -7,6 +7,13 @@
 //! "expect", save it here. `NETSIM_WRITE=1 cargo test -p corerouter-engine
 //! --test netsim_scenarios -- --ignored` rewrites the bundled example.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
 use std::path::Path;
 
 use corerouter_engine::Session;
