@@ -6027,3 +6027,47 @@ continuação indentadas).
   as threads. `sendmmsg` em lotes de 64 e 3 ou 4 threads não ofereceram mais (1,52 contra 1,54 Mpps;
   4 threads 1,49 Mpps), porque o custo é o caminho do roteador, executado no softirq de quem envia.
   Por isso ficaram de fora.
+
+- 2026-10-28 — G1.27f: Check-gateway em rotas estáticas, como o `check-gateway` do RouterOS v7. `ip.route.add/set`
+  ganham `check_gateway` (`none | ping | arp | bfd`) e `bfd_profile`; a cada 10 s, 2 falhas e a rota
+  sai do kernel (fica `inactive`, motivo `check-gateway-down`) e a de distância maior assume; na
+  primeira resposta ela volta. Hold-down contra oscilação: a 2ª queda em 15 min espera 10 s
+  respondendo, depois 20 s, 40 s… até 5 min. Rotas com o mesmo método, gateway e tabela dividem uma
+  sonda. Comandos novos `ip.route.check.list` (alvos, rotas por alvo, estado, falhas, hold-down,
+  flaps) e `ip.route.check.history`; `ip.route.list`/`ip.route.detail` trazem `status`,
+  `hold_down_secs`, `bfd_profile` e o histórico do gateway. Engine: `gateway_check.rs` (estado
+  `Health`, alvos, agenda `Schedule`), a mesma máquina de estado do cliente DHCP (G4.7c, refeito em
+  cima dela); daemon: serviço `route-check` (`--route-check-interval`); hal: `ArpPinger::request`/
+  `replies` (ARP em lote, um socket por interface). Janela IP › Routes: coluna **Check** (método +
+  selo `reachable`/`unreachable`/`checking`/`not-checked`), campo **Check Gateway** com selos e
+  **BFD Profile** no modal, detalhe com falhas, hold-down e trocas; ⓘ em português.
+
+  Testar: `cargo test -p corerouter-engine --test route_check`; netns com daemon real (ping, arp e
+  BFD contra um segundo daemon): `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net --
+  cargo test -p corerouter-daemon --test netns_route_check` (8 s, **medido**). Screenshots em
+  `side-session-notes/…/G1.27f-screenshots/`.
+
+- 2026-10-28 — G3.5b: LSP ping e traceroute (RFC 8029 com a RFC 9570 e a errata 8788): `tool.mpls.ping.start` e
+  `tool.mpls.traceroute.start` (terminal `/tool lsp-ping`, `/tool lsp-traceroute`), janela Tools ›
+  LSP Ping (modos Ping e Traceroute, letras de retorno do Cisco como selos, rótulos por salto) e
+  "LSP Ping…" no clique direito de uma FEC em MPLS › Forwarding Table. Codec e respondedor sans-IO
+  em `hal/src/lsp/` (proptest de entrada hostil, exemplo de FEC Stack da RFC §3); envio por
+  `AF_PACKET` com a pilha da rota da FEC (`RTA_ENCAP`), destino 127.0.0.1, TTL IP 1, sem Router
+  Alert; respondedor no serviço `lsp-ping` do daemon (sockets por protocolo com BPF nas interfaces
+  MPLS, códigos 1/2/3/4/5/6/8/10/11, DDMAP por próximo salto, limite de taxa `/mpls settings
+  lsp-ping-rate`, padrão 100/s, ligado por padrão). O laboratório responde com o mesmo código
+  (LSPs simulados, um quebrado em 10.255.9.9). Como testar: no laboratório, Tools › LSP Ping,
+  FEC `10.255.0.4`, Ping e Traceroute; `cargo test -p corerouter-hal lsp`; na VM,
+  `flock vm/root.lock cargo xtask vm-lab run -- scripts/lsp-ping-live.sh` (três roteadores com o
+  ldpd do FRR). Custo por pedido: 117 ns para codificar, 363 ns para responder em trânsito com 100
+  mil rótulos (**medido**, release). Na VM, com os rótulos do ldpd do FRR em três roteadores: 200/200
+  pings com código 3, traceroute lsp2 (label switched, implicit-null) → lsp3 (egress); RTT do LSP
+  ping 90 µs de mediana contra 17 µs do ICMP do kernel no mesmo caminho (build debug, **medido**).
+
+- 2026-10-28 — G3.6g: Rotas estáticas com `check_gateway=bfd`: o `bfd` (G3.6) roda as sessões pedidas pelas rotas
+  (`bfd::route_sessions`/`wanted_all`; um gateway com milhares de rotas é uma sessão, os usuários
+  listam até 4 rotas e "and N more routes"); no modo data plane do `bfdd` as sessões das rotas
+  continuam no nosso motor, exceto se o `bfdd` já tem sessão ao mesmo endereço. A mudança de estado
+  chega ao engine no mesmo lock que grava o histórico do BFD (`route_check_bfd_event`), então a rota
+  sai no tempo de detecção do perfil (`fast`: 150 ms). Perfil usado por rota não pode ser removido.
+  Teste em netns contra um segundo daemon como par BFD (`netns_route_check`).
