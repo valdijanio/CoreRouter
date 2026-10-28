@@ -176,6 +176,21 @@ Endereços: /30 por enlace em 10.0.0.0/9, loopback 10.255.x.y/32, um /24 por rot
 (`tool.netsim.link.add`, que digita os /30 nos dois roteadores e cria o eBGP quando os AS diferem)
 e muda custo, BFD, latência e perda (`tool.netsim.link.set`).
 
+## A janela (G3.7b)
+
+Tools › Network Simulator (`crates/ui/src/netsim.rs`):
+- topologia: roteadores em selos coloridos pelo AS e enlaces coloridos pelo estado (o cortado
+  tracejado), com o custo ao lado;
+- relógio ⏮ ⏯ ⏭ ×N;
+- linha do tempo com o resumo de convergência;
+- painel do roteador (rotas, vizinhos OSPF, sessões BGP) e do enlace (cortar, portadora,
+  restaurar, custo, BFD);
+- editor e "E se?";
+- o selo "simulation — not the real network" sempre na barra.
+
+Rodando, ela manda `tool.netsim.tick` como consulta a cada 0,5 s. Screenshots claro e escuro na
+pasta de notas da rodada (`G3.7b-screenshots/`).
+
 ## Desempenho e paralelismo
 
 Ver a seção `## perf` de `docs/changes/G3.7-netsim-core.md`, consolidada em `docs/perf.md`.
@@ -196,7 +211,7 @@ Ferramentas: `cargo run --release -p corerouter-netsim --example measure -- 10 1
   reais (o RouterOS CHR inclusive), topologia desenhada, captura de pacotes. Mesmo custo e a mesma
   falta de reprodutibilidade dos anteriores.
   - *Adotamos*: o desenho da topologia com o estado do enlace (cores, tracejado no corte), na
-    janela da parte seguinte (G3.7b).
+    janela (G3.7b).
 - **Batfish**, https://www.batfish.org/ (https://github.com/batfish/batfish). **Não emula**: lê
   as configurações e calcula as tabelas de controle, com perguntas como "este tráfego passa?",
   "o que acontece se este enlace cair?" (análise de falhas) e comparação entre duas versões da
@@ -222,6 +237,5 @@ Ferramentas: `cargo run --release -p corerouter-netsim --example measure -- 10 1
   - RFC 8212: política padrão do eBGP.
 
 **Fica para depois (gaps):**
-- G3.7b: a janela Tools › Network Simulator;
 - G3.7c: o teste de fidelidade com o FRR real na VM (bloqueado pelo disco da VM);
 - G3.7d: ler a config OSPF da G3.4 e o `use_bfd` da G3.2d/G3.6 nos nós; IPv6 e refletor de rotas.
