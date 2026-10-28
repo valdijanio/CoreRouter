@@ -15,9 +15,10 @@ use std::sync::Arc;
 use corerouter_hal::VirtualHal;
 use corerouter_model::Config;
 use corerouter_model::bgp::{NexthopChoice, resolve_templates};
+use corerouter_model::ospf::Version;
 use corerouter_netsim::preset::{self, ACCEPT_CHAIN, Plan, Scenario};
 use corerouter_netsim::{
-    BgpConfig, Endpoint, Fault, IfAddr, Link, LinkId, MS, Neighbor, NodeConfig, NodeId, SEC,
+    BgpConfig, Endpoint, Fault, IfAddr, Link, LinkId, MS, Neighbor, NodeConfig, NodeId, OspfIface, SEC,
     Simulation, Time, Timers,
 };
 use corerouter_proto_bgp::filter::eval::Policy;
@@ -153,9 +154,9 @@ pub fn node_config(name: &str, cfg: &Config, networks: &[Ipv4Net], timers: Timer
                     keepalive,
                     input: p.input_filter.clone(),
                     output: p.output_filter.clone(),
-                    // Single-hop sessions follow the link's BFD (G3.2d
-                    // brings `use_bfd` to the model).
-                    bfd: true,
+                    // G3.6b: a BFD profile on the connection (RouterOS
+                    // `use-bfd`) drops the session with BFD.
+                    bfd: p.bfd.is_some(),
                     next_hop_self: p.nexthop_choice == Some(NexthopChoice::ForceSelf),
                     disabled: c.disabled,
                 })
@@ -168,14 +169,76 @@ pub fn node_config(name: &str, cfg: &Config, networks: &[Ipv4Net], timers: Timer
             policy: Arc::new(Policy::build(&routing.filter).0),
         }
     });
+    let (ospf, ospf_ifaces) = ospf_of(cfg);
     NodeConfig {
         name: name.to_owned(),
         router_id,
         addresses,
-        ospf: true,
+        ospf,
+        ospf_ifaces: Some(ospf_ifaces),
         bgp,
         timers,
     }
+}
+
+/// G3.7d: the router's OSPFv2 as the simulator runs it — the first enabled
+/// v2 instance, on the interfaces its templates match (the same matching
+/// `proto_ospf::bind` does for the FRR render), with each template's cost,
+/// hello and dead intervals, passive flag and BFD profile. No instance: no
+/// OSPF.
+fn ospf_of(cfg: &Config) -> (bool, Vec<OspfIface>) {
+    let Some(inst) = cfg
+        .routing
+        .ospf
+        .instances
+        .values()
+        .find(|i| !i.disabled && i.version == Version::V2)
+    else {
+        return (false, Vec::new());
+    };
+    let secs = |s: Option<u16>| s.map(|s| Time::from(s.max(1)) * SEC);
+    let ifaces = corerouter_proto_ospf::bind::bindings(cfg)
+        .into_iter()
+        .filter(|b| b.instance.name == inst.name)
+        .map(|b| OspfIface {
+            iface: b.interface.to_string(),
+            cost: b.template.cost.map(u32::from),
+            hello: secs(b.template.hello_interval),
+            dead: secs(b.template.dead_interval),
+            passive: b.template.passive,
+            bfd: b.template.bfd.is_some(),
+        })
+        .collect();
+    (true, ifaces)
+}
+
+/// Type the OSPF of a virtual router: instance `default`, the backbone,
+/// a point-to-point template for `ifaces` and the loopback as passive.
+fn ospf_commands(node: &mut LabNode, name: &str, rid: Ipv4Addr, ifaces: &[String]) -> Result<(), String> {
+    let running = node.session.store().running();
+    let has = !running.routing.ospf.instances.is_empty()
+        || node.commands.iter().any(|(id, _)| id == "routing.ospf.instance.add");
+    if !has {
+        node.exec(name, "routing.ospf.instance.add", json!({"name": "default", "router_id": rid.to_string()}))?;
+        node.exec(
+            name,
+            "routing.ospf.area.add",
+            json!({"name": "backbone", "instance": "default", "area_id": "0.0.0.0"}),
+        )?;
+        node.exec(
+            name,
+            "routing.ospf.interface-template.add",
+            json!({"area": "backbone", "interfaces": ["lo"], "passive": true, "comment": "loopback"}),
+        )?;
+    }
+    if !ifaces.is_empty() {
+        node.exec(
+            name,
+            "routing.ospf.interface-template.add",
+            json!({"area": "backbone", "interfaces": ifaces, "type": "ptp"}),
+        )?;
+    }
+    Ok(())
 }
 
 impl LabNode {
@@ -281,11 +344,28 @@ impl Lab {
                     if let Some(c) = &n.output {
                         put(&mut params, "output_filter", json!(c));
                     }
+                    if n.bfd {
+                        put(&mut params, "bfd", json!(corerouter_model::bfd::PROFILE_DEFAULT));
+                    }
                     if n.next_hop_self {
                         put(&mut params, "nexthop_choice", json!("force-self"));
                     }
                     node.exec(name, "routing.bgp.connection.add", params)?;
                 }
+            }
+            // OSPF on the router's ends of the links that run it.
+            let i = self.nodes.len();
+            let ospf_ifaces: Vec<String> = plan
+                .links
+                .iter()
+                .filter(|l| l.ospf)
+                .filter_map(|l| {
+                    let ix = u32::try_from(i).ok()?;
+                    [&l.a, &l.b].into_iter().find(|e| e.node.0 == ix).map(|e| e.iface.clone())
+                })
+                .collect();
+            if !ospf_ifaces.is_empty() {
+                ospf_commands(&mut node, name, p.router_id, &ospf_ifaces)?;
             }
             run(&mut node.session, name, "config.commit", json!({}))?;
             run(&mut node.session, name, "config.mode.set", json!({"mode": "immediate"}))?;
@@ -368,6 +448,7 @@ impl Lab {
             json!({"chain": ACCEPT_CHAIN, "rule": "accept", "comment": "simulator: eBGP needs a policy (RFC 8212)"}),
         )?;
         node.exec(&name, "routing.bgp.instance.set", json!({"asn": asn, "router_id": lo.to_string()}))?;
+        ospf_commands(&mut node, &name, lo, &[])?;
         let cfg = node_config(&name, node.session.store().running(), &node.networks, self.timers);
         self.sim.add_node(cfg)?;
         self.nodes.push(node);
@@ -455,6 +536,15 @@ impl Lab {
         link.bfd = bfd;
         link.ospf = ospf;
         let id = self.sim.add_link(link)?;
+        if ospf {
+            for (i, port) in [(a, ia.clone()), (b, ib.clone())] {
+                let name = self.node_name(i);
+                let rid = self.sim.config(NodeId(u32::try_from(i).map_err(|_| "index")?)).map(|c| c.router_id);
+                if let (Some(node), Some(rid)) = (self.nodes.get_mut(i), rid) {
+                    ospf_commands(node, &name, rid, &[port])?;
+                }
+            }
+        }
         let asn = |i: usize| {
             self.nodes
                 .get(i)
@@ -471,7 +561,8 @@ impl Lab {
                         &name,
                         "routing.bgp.connection.add",
                         json!({"name": peer, "remote_address": remote.to_string(), "remote_as": other_as,
-                               "input_filter": ACCEPT_CHAIN, "output_filter": ACCEPT_CHAIN}),
+                               "input_filter": ACCEPT_CHAIN, "output_filter": ACCEPT_CHAIN,
+                               "bfd": corerouter_model::bfd::PROFILE_DEFAULT}),
                     )?;
                 }
             }
@@ -519,6 +610,15 @@ impl Lab {
         for r in &f.rules {
             try_exec(&mut node, &mut refused, "routing.filter.rule.add", json!({"chain": r.chain, "rule": r.rule, "disabled": r.disabled}));
         }
+        // G3.6 BFD profiles the connections and templates name (the built-in
+        // ones exist already; keys stay sealed on the real router).
+        for b in real.routing.bfd.profiles.values() {
+            let p = json!({"name": b.name, "min_tx": b.min_tx, "min_rx": b.min_rx, "multiplier": b.multiplier, "passive": b.passive});
+            let builtin = corerouter_model::bfd::builtin_profiles().iter().any(|x| x.name == b.name);
+            let id = if builtin { "routing.bfd.profile.set" } else { "routing.bfd.profile.add" };
+            let p = if builtin { json!({"id": b.name, "min_tx": b.min_tx, "min_rx": b.min_rx, "multiplier": b.multiplier}) } else { p };
+            try_exec(&mut node, &mut refused, id, p);
+        }
         if let Some(i) = real.routing.bgp.get("default") {
             try_exec(&mut node, &mut refused, "routing.bgp.instance.set", json!({"asn": i.asn.0, "router_id": i.router_id.to_string()}));
         }
@@ -557,6 +657,39 @@ impl Lab {
             put(&mut p, "templates", json!(c.templates));
             put(&mut p, "disabled", json!(c.disabled));
             try_exec(&mut node, &mut refused, "routing.bgp.connection.add", p);
+        }
+        // G3.7d: the OSPF too (authentication keys stay sealed on the real
+        // router: a keyed template is copied without its key).
+        let ospf = &real.routing.ospf;
+        for i in ospf.instances.values() {
+            let mut p = json!({"name": i.name, "version": if i.version == Version::V3 { 3 } else { 2 }, "disabled": i.disabled});
+            if let Some(r) = i.router_id {
+                put(&mut p, "router_id", json!(r.to_string()));
+            }
+            try_exec(&mut node, &mut refused, "routing.ospf.instance.add", p);
+        }
+        for a in ospf.areas.values() {
+            try_exec(
+                &mut node,
+                &mut refused,
+                "routing.ospf.area.add",
+                json!({"name": a.name, "instance": a.instance, "area_id": a.area_id.to_string(),
+                       "type": a.kind.name(), "no_summaries": a.no_summaries, "disabled": a.disabled}),
+            );
+        }
+        for t in &ospf.templates {
+            let mut p = json!({"area": t.area, "interfaces": t.interfaces,
+                "networks": t.networks.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "type": t.kind.name(), "passive": t.passive, "disabled": t.disabled});
+            for (k, v) in [("cost", t.cost), ("hello_interval", t.hello_interval), ("dead_interval", t.dead_interval)] {
+                if let Some(v) = v {
+                    put(&mut p, k, json!(v));
+                }
+            }
+            if let Some(b) = &t.bfd {
+                put(&mut p, "bfd", json!(b));
+            }
+            try_exec(&mut node, &mut refused, "routing.ospf.interface-template.add", p);
         }
         let cfg = node_config(name, node.session.store().running(), &node.networks, self.timers);
         self.sim.add_node(cfg)?;
@@ -662,7 +795,7 @@ impl Lab {
             })
             .collect();
         let mut out = json!({
-            "format": "corerouter-netsim/1",
+            "format": "corerouter-netsim/2",
             "name": self.name,
             "seed": self.seed,
             "nodes": nodes,
@@ -700,7 +833,10 @@ impl Lab {
     /// and fault (the clock stays at 0: advance to `run_ms`).
     pub fn load(file: &Value) -> Result<Lab, String> {
         let f: ScenarioFile = serde_json::from_value(file.clone()).map_err(|e| format!("scenario: {e}"))?;
-        if f.format != "corerouter-netsim/1" {
+        if f.format == "corerouter-netsim/1" {
+            return Err("scenario: format 1 is from before the routers typed their own OSPF (G3.7d); export it again".into());
+        }
+        if f.format != "corerouter-netsim/2" {
             return Err(format!("scenario: unknown format {:?}", f.format.chars().take(40).collect::<String>()));
         }
         if f.nodes.len() > MAX_LAB_NODES || f.links.len() > corerouter_netsim::MAX_LINKS {

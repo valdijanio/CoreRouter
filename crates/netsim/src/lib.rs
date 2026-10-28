@@ -267,6 +267,21 @@ impl PartialEq for BgpConfig {
     }
 }
 
+/// OSPF on one interface, from the router's interface templates (G3.4):
+/// what the first matching template sets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OspfIface {
+    pub iface: String,
+    /// `None`: the link's cost (the simulator's editor sets it).
+    pub cost: Option<u32>,
+    pub hello: Option<Time>,
+    pub dead: Option<Time>,
+    /// Advertised as a stub, no hellos, no adjacency.
+    pub passive: bool,
+    /// A BFD profile is set: BFD watches the adjacency.
+    pub bfd: bool,
+}
+
 /// What the simulator reads from a router's configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeConfig {
@@ -276,6 +291,11 @@ pub struct NodeConfig {
     /// link uses.
     pub addresses: Vec<IfAddr>,
     pub ospf: bool,
+    /// `Some`: OSPF runs only on these interfaces, with these values (the
+    /// router's own OSPF config); `None`: on every link and loopback, with
+    /// the links' costs (the presets of the pure simulator).
+    #[serde(default)]
+    pub ospf_ifaces: Option<Vec<OspfIface>>,
     pub bgp: Option<BgpConfig>,
     pub timers: Timers,
 }
@@ -287,6 +307,7 @@ impl NodeConfig {
             router_id,
             addresses: Vec::new(),
             ospf: true,
+            ospf_ifaces: None,
             bgp: None,
             timers: Timers::default(),
         }

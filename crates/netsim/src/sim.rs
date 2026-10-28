@@ -264,8 +264,9 @@ impl Simulation {
             if let Some(n) = self.nodes.get_mut(node.ix())
                 && let Some(p) = n.port_mut(id)
             {
-                p.cost = cost;
-                p.bfd = bfd;
+                p.link_cost = cost;
+                p.link_bfd = bfd;
+                n.bind_addresses();
                 if n.up {
                     n.ospf_originate(now, false);
                     n.ospf_flush_floods(now);
@@ -865,9 +866,30 @@ impl Node {
     pub(crate) fn reconfigure(&mut self, now: Time, old: &NodeConfig) {
         if self.cfg.addresses != old.addresses
             || self.cfg.ospf != old.ospf
+            || self.cfg.ospf_ifaces != old.ospf_ifaces
             || self.cfg.router_id != old.router_id
         {
             self.bind_addresses();
+            // Interfaces that left OSPF (or turned passive) drop their
+            // adjacency; those that joined start their hellos.
+            let ports: Vec<(LinkId, bool, bool)> = self
+                .ports
+                .iter()
+                .map(|p| {
+                    (
+                        p.link,
+                        p.ospf && !p.passive,
+                        p.adj == crate::node::AdjState::Down,
+                    )
+                })
+                .collect();
+            for (link, runs, down) in ports {
+                if !runs && !down {
+                    self.ospf_adj_down(now, link, "OSPF reconfigured");
+                } else if runs && down && self.cfg.ospf {
+                    self.ospf_port_up(now, link);
+                }
+            }
             if !self.cfg.ospf || self.cfg.router_id != old.router_id {
                 let links: Vec<LinkId> = self.ports.iter().map(|p| p.link).collect();
                 for l in links {

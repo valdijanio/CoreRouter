@@ -36,9 +36,23 @@ corerouter-netsim::Simulation (L2, puro, wasm)
   `xtask/src/layers.rs`), do `proto-bgp`, para rodar os filtros reais e para conferir o processo de
   decisão contra `proto_bgp::decision`. O engine (L3) guarda o laboratório e os comandos; a UI (L5)
   só chama os comandos.
-- **Não usa `proto-ospf` nem `proto-bfd`.** As máquinas simplificadas ficam no `netsim` (as do
-  FRR continuam sendo as de produção). O modelo de configuração OSPF da G3.4 entrou na `main`
-  depois deste desenho; ler área, custo e interfaces passivas dele nos nós é a G3.7d.
+- **As máquinas são do `netsim`; a configuração é a do roteador.** As FSMs simplificadas ficam
+  no `netsim` (as do FRR continuam sendo as de produção). Desde a G3.7d, o OSPF de cada roteador
+  virtual vem da config OSPF dele (modelo da G3.4):
+  - a primeira instância v2 habilitada;
+  - as interfaces que os templates casam, pela mesma regra do render para o FRR
+    (`proto_ospf::bind::bindings`: nome, interface list ou rede; o primeiro template vence);
+  - o custo, o hello e o dead do template;
+  - `passive` (anuncia a rede, sem adjacência);
+  - o perfil de BFD (liga o BFD da adjacência).
+
+  Sem instância, o roteador não roda OSPF. Os presets digitam em cada roteador a instância
+  `default`, a área `backbone`, um template ponto a ponto com as portas dos enlaces OSPF e a
+  loopback passiva; um enlace novo acrescenta o template da porta. Custo sem valor no template
+  fica com o custo do enlace no editor.
+- **BFD do BGP vem da conexão** (G3.6b): com perfil BFD (`bfd`), a sessão de um salto cai com o
+  BFD; sem perfil, um corte silencioso espera o hold timer. Os presets põem o perfil embutido
+  `default` no eBGP.
 
 ## Eventos discretos, relógio virtual e determinismo
 
@@ -146,9 +160,10 @@ quanto tempo nada muda. Exemplo do quadrado (corte silencioso R1–R2 com BFD): 
 como comandos:
 - endereços IPv4, criando interfaces tipo loopback para nomes que o roteador virtual não tem;
 - prefix-lists, community-lists e regras de `/routing filter`;
-- a instância BGP, os templates (pais primeiro) e as conexões.
+- a instância BGP, os templates (pais primeiro) e as conexões;
+- o OSPF: instâncias, áreas e templates de interface (G3.7d).
 
-A chave MD5 continua selada no roteador real e não é copiada; o RPKI fica de fora (não há
+As chaves (TCP MD5 do BGP, autenticação do OSPF) continuam seladas no roteador real e não são copiadas; o RPKI fica de fora (não há
 validador no laboratório). Comando recusado pelo roteador virtual volta na lista `refused`, sem
 abortar. Depois ligam-se roteadores virtuais às interfaces dele (`tool.netsim.link.add`) e
 simula-se corte ou custo **antes** de mexer em produção.
@@ -238,4 +253,4 @@ Ferramentas: `cargo run --release -p corerouter-netsim --example measure -- 10 1
 
 **Fica para depois (gaps):**
 - G3.7c: o teste de fidelidade com o FRR real na VM (bloqueado pelo disco da VM);
-- G3.7d: ler a config OSPF da G3.4 e o `use_bfd` da G3.2d/G3.6 nos nós; IPv6 e refletor de rotas.
+- G3.7e: IPv6 (OSPFv3, BGP IPv6) e refletor de rotas.

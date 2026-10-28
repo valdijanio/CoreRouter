@@ -448,3 +448,46 @@ proptest! {
         prop_assert_eq!(ours, theirs.order, "step {:?}", theirs.step);
     }
 }
+
+#[test]
+fn the_routers_own_ospf_config_decides() {
+    use crate::OspfIface;
+    let mut sim = converged(&preset::ring(4, BgpMode::None), 60);
+    let iface = |name: &str, cost: Option<u32>, passive: bool| OspfIface {
+        iface: name.into(),
+        cost,
+        hello: None,
+        dead: None,
+        passive,
+        bfd: false,
+    };
+    // R1: ether1 (to R2) costs 100, ether2 (to R4) is passive, the
+    // loopback is in no template.
+    let mut cfg = sim.config(NodeId(0)).unwrap().clone();
+    cfg.ospf_ifaces = Some(vec![
+        iface("ether1", Some(100), false),
+        iface("ether2", None, true),
+    ]);
+    sim.set_config(NodeId(0), cfg).unwrap();
+    let t = sim.now();
+    sim.advance(t + 60 * SEC, u64::MAX);
+    let n = sim.ospf_neighbors(NodeId(0));
+    assert_eq!(
+        n.iter().find(|x| x.iface == "ether1").unwrap().state,
+        "full"
+    );
+    assert_ne!(
+        n.iter().find(|x| x.iface == "ether2").unwrap().state,
+        "full",
+        "{n:?}"
+    );
+    assert!(
+        has(&sim, 1, "10.255.0.1/32").is_none(),
+        "R1's loopback is not in OSPF"
+    );
+    // R1 → R3 only through R2 now: 100 + 10.
+    assert_eq!(has(&sim, 0, "10.255.0.3/32").unwrap().metric, 110);
+    // The passive interface's subnet is still advertised (a stub).
+    let r3 = has(&sim, 2, "10.0.0.12/30").unwrap();
+    assert_eq!(r3.proto, Proto::Ospf);
+}

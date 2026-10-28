@@ -103,6 +103,14 @@ pub(crate) struct Port {
     pub(crate) nbr: Option<Ipv4Addr>,
     pub(crate) last_hello: Time,
     pub(crate) hello_gen: u32,
+    /// What the link says (the editor's cost, OSPF and BFD on it); `cost`,
+    /// `ospf` and `bfd` are these with the router's OSPF config applied.
+    pub(crate) link_cost: u32,
+    pub(crate) link_ospf: bool,
+    pub(crate) link_bfd: bool,
+    pub(crate) passive: bool,
+    pub(crate) hello: Option<Time>,
+    pub(crate) dead: Option<Time>,
 }
 
 impl Port {
@@ -120,6 +128,12 @@ impl Port {
             nbr: None,
             last_hello: 0,
             hello_gen: 0,
+            link_cost: cost,
+            link_ospf: ospf,
+            link_bfd: bfd,
+            passive: false,
+            hello: None,
+            dead: None,
         }
     }
 }
@@ -210,6 +224,8 @@ impl Node {
     }
 
     /// Assign each port its address from the config (by interface name).
+    /// Bind each port to its address and to the OSPF config of its
+    /// interface (cost, timers, passive, BFD; RouterOS interface templates).
     pub(crate) fn bind_addresses(&mut self) {
         for p in &mut self.ports {
             p.net = self
@@ -218,7 +234,53 @@ impl Node {
                 .iter()
                 .find(|a| a.iface == p.iface)
                 .map(|a| a.net);
+            match &self.cfg.ospf_ifaces {
+                None => {
+                    p.cost = p.link_cost;
+                    p.ospf = p.link_ospf;
+                    p.bfd = p.link_bfd;
+                    p.passive = false;
+                    p.hello = None;
+                    p.dead = None;
+                }
+                Some(list) => {
+                    let o = list.iter().find(|o| o.iface == p.iface);
+                    // A single-hop BGP neighbor with BFD on this link
+                    // turns BFD on for the port (G3.6b).
+                    let bgp_bfd = p.net.is_some_and(|net| {
+                        self.cfg
+                            .bgp
+                            .iter()
+                            .flat_map(|b| &b.neighbors)
+                            .any(|n| n.bfd && !n.disabled && net.contains(&n.remote))
+                    });
+                    p.ospf = p.link_ospf && o.is_some();
+                    p.cost = o
+                        .and_then(|o| o.cost)
+                        .unwrap_or(p.link_cost)
+                        .clamp(1, 65535);
+                    p.bfd = p.link_bfd || bgp_bfd || o.is_some_and(|o| o.bfd);
+                    p.passive = o.is_some_and(|o| o.passive);
+                    p.hello = o.and_then(|o| o.hello);
+                    p.dead = o.and_then(|o| o.dead);
+                }
+            }
         }
+    }
+
+    /// The loopbacks OSPF advertises: all (no OSPF config) or those an
+    /// interface template matches.
+    pub(crate) fn ospf_loopbacks(&self) -> Vec<Ipv4Net> {
+        self.cfg
+            .addresses
+            .iter()
+            .filter(|a| !self.ports.iter().any(|p| p.iface == a.iface))
+            .filter(|a| match &self.cfg.ospf_ifaces {
+                None => true,
+                Some(list) => list.iter().any(|o| o.iface == a.iface),
+            })
+            .map(|a| a.net)
+            .collect()
     }
 
     /// Addresses on interfaces no link uses: loopbacks.

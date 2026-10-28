@@ -69,7 +69,21 @@ impl Node {
         self.cfg.ospf
             && self
                 .port(link)
-                .is_some_and(|p| p.ospf && p.carrier && p.bfd_up)
+                .is_some_and(|p| p.ospf && !p.passive && p.carrier && p.bfd_up)
+    }
+
+    fn hello_of(&self, link: LinkId) -> Time {
+        self.port(link)
+            .and_then(|p| p.hello)
+            .unwrap_or(self.cfg.timers.ospf_hello)
+            .max(1)
+    }
+
+    fn dead_of(&self, link: LinkId) -> Time {
+        self.port(link)
+            .and_then(|p| p.dead)
+            .unwrap_or(self.cfg.timers.ospf_dead)
+            .max(1)
     }
 
     pub(crate) fn ospf_start(&mut self, now: Time) {
@@ -88,7 +102,7 @@ impl Node {
         if !self.ospf_runs_on(link) {
             return;
         }
-        let phase = self.pick(u64::from(link.0), self.cfg.timers.ospf_hello);
+        let phase = self.pick(u64::from(link.0), self.hello_of(link));
         let Some(p) = self.port_mut(link) else { return };
         p.hello_gen = p.hello_gen.wrapping_add(1);
         let generation = p.hello_gen;
@@ -107,10 +121,8 @@ impl Node {
             return;
         }
         self.ospf_send_hello(now, link);
-        self.q.push(
-            now + self.cfg.timers.ospf_hello,
-            Ev::HelloTimer(link, generation),
-        );
+        self.q
+            .push(now + self.hello_of(link), Ev::HelloTimer(link, generation));
     }
 
     fn ospf_send_hello(&mut self, now: Time, link: LinkId) {
@@ -128,7 +140,7 @@ impl Node {
         if !self.ospf_runs_on(link) {
             return;
         }
-        let dead = self.cfg.timers.ospf_dead;
+        let dead = self.dead_of(link);
         let Some(p) = self.port_mut(link) else { return };
         if p.nbr.is_some_and(|n| n != rid) {
             // Another router answers on this link now.
@@ -193,7 +205,7 @@ impl Node {
     }
 
     pub(crate) fn ospf_dead_check(&mut self, now: Time, link: LinkId) {
-        let dead = self.cfg.timers.ospf_dead;
+        let dead = self.dead_of(link);
         let Some(p) = self.port(link) else { return };
         if p.adj != AdjState::Down && now >= p.last_hello.saturating_add(dead) {
             self.ospf_adj_down(now, link, "dead timer");
@@ -239,7 +251,7 @@ impl Node {
                 stubs.push((net.trunc(), p.cost));
             }
         }
-        for net in self.loopbacks() {
+        for net in self.ospf_loopbacks() {
             stubs.push((net.trunc(), 0));
         }
         links.sort_unstable();
