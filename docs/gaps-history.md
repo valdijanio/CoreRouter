@@ -203,3 +203,6 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-27 — G3.5 parcial (MPLS no kernel, LDP pelo FRR, janelas)
 - 2026-10-27 — G3.6 feito em três PRs (G3.6a motor, G3.6b FRR e clientes, G3.6c janela)
 - 2026-10-27 — G3.7d redefinida (OSPF e BFD do modelo) e feita; criada G3.7e (IPv6, refletor de rotas)
+- 2026-10-28 — G1.27f feito (check-gateway em rotas estáticas, com BFD da G3.6g)
+- 2026-10-28 — G3.5b feito (LSP ping e traceroute MPLS)
+- 2026-10-28 — G3.6g feito (rotas estáticas com check_gateway=bfd)
