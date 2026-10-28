@@ -121,6 +121,9 @@ fn ttl_below_255_is_dropped_on_single_hop() {
     let pb = pb + 1000;
     let mut a = engine("127.0.0.1".parse().unwrap(), pa, pb, 1);
     a.add(spec("127.0.0.3".parse().unwrap(), None, &BfdProfile::new("x", 300, 3)), None);
+    // The worker takes the session before the packets (it reads its
+    // sockets first: a packet for a session not there yet is ignored).
+    assert!(wait_for(&a, Duration::from_secs(2), |s| s.len() == 1));
     let s = std::net::UdpSocket::bind("127.0.0.3:0").unwrap();
     s.set_ttl(64).unwrap();
     let mut p = corerouter_proto_bfd::packet::Packet::new(99);
@@ -129,10 +132,9 @@ fn ttl_below_255_is_dropped_on_single_hop() {
     for _ in 0..3 {
         s.send_to(&out[..n], ("127.0.0.1", pa)).unwrap();
     }
-    thread::sleep(Duration::from_millis(400));
+    assert!(wait_for(&a, Duration::from_secs(2), |s| s[0].dropped == 3), "{:?}", a.snapshot().0);
     let (sessions, _) = a.snapshot();
     assert_eq!(sessions[0].packets_rx, 0);
-    assert_eq!(sessions[0].dropped, 3);
     // With TTL 255 the same packet is taken (Down → Init).
     s.set_ttl(255).unwrap();
     p.state = State::Down;

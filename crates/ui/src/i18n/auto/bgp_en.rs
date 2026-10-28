@@ -21,6 +21,11 @@ The instance's name; `default` runs in the main table, another name is a separat
 Our BGP identifier, an IPv4 address unique in the AS (RFC 6286); usually the loopback."##),
     (r##"bgp.param.afi"##, r##"## What it is
 RouterOS `afi`: the address families the session carries (multiprotocol BGP, RFC 4760): `ip` (IPv4 unicast), `ipv6`, or both. Default `ip`."##),
+    (r##"bgp.param.bfd"##, r##"## What it is
+The BFD profile (Routing › BFD) watching this session: when BFD sees the neighbor or the path die, BGP goes down at once instead of after the hold time (FRR `neighbor … bfd profile`). Empty: inherit from the templates; none: no BFD.
+
+## Recommended
+`default` (300 ms × 3) on eBGP to an upstream; the other side needs BFD too."##),
     (r##"bgp.param.hold_time"##, r##"## What it is
 Seconds without a message from the neighbor before the session is closed (RFC 4271 §4.2). The smaller of the two sides' values is used.
 

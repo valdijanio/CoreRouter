@@ -89,6 +89,11 @@ O `afi` do RouterOS: as famílias de endereço que a sessão carrega (BGP multip
 
 ## Cuidado
 Uma conexão sem família nenhuma é recusada: não carregaria nada."##),
+    (r##"bgp.param.bfd"##, r##"## O que é
+O perfil BFD (Routing › BFD) que vigia esta sessão: quando o BFD vê o vizinho ou o caminho morrer, o BGP cai na hora em vez de esperar o hold time (`neighbor … bfd profile` do FRR). Vazio: herda dos templates; sem perfil, sem BFD.
+
+## Recomendado
+`default` (300 ms × 3) no eBGP com a operadora; o outro lado também precisa de BFD."##),
     (r##"bgp.param.hold_time"##, r##"## O que é
 Segundos sem mensagem do vizinho até a sessão ser fechada (RFC 4271 §4.2). Vale o menor dos dois lados.
 
