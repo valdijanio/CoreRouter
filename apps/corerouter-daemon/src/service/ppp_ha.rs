@@ -63,7 +63,7 @@ const TAKEOVERS: usize = 16;
 
 #[path = "ppp_ha/pair.rs"]
 mod pair;
-pub(crate) use pair::{adopted, frame_seen, publish_bfd, silent as bfd_silent, tap as bfd_tap};
+pub(crate) use pair::{adopted, answering, frame_seen, publish_bfd, routes_installed, silent as bfd_silent, tap as bfd_tap};
 
 /// The witness's last answer (`Runtime::now` ms; 0 = none yet) and a
 /// probe asked for now (BFD found the peer silent).
@@ -749,16 +749,7 @@ fn hand_takeover(p: &Pair, t: &Transition) -> u64 {
     let records = t.stateful.then(|| {
         p.node
             .publisher()
-            .map(|pb| {
-                pb.iter()
-                    .filter_map(|(_, v, c)| {
-                        corerouter_proto_ha::record::SessionRecord::decode(v).ok().map(|mut r| {
-                            r.counters = c;
-                            r
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            })
+            .map(|pb| decode_all(pb.iter().map(|(_, v, c)| (v, c)).collect()))
             .unwrap_or_default()
     });
     let handed = records.as_ref().map_or(0, |r| r.len() as u64);
@@ -766,6 +757,52 @@ fn hand_takeover(p: &Pair, t: &Transition) -> u64 {
     TAKEOVER_GEN.fetch_add(1, Ordering::AcqRel);
     handed
 }
+
+/// G4.3hh: the replica's records decoded on several threads: 100 000 in one
+/// were ≈ 10 ms here and more in the lab's VM, before any worker could
+/// start adopting. Records below [`DECODE_SPLIT`] stay on this thread.
+fn decode_all(
+    raw: Vec<(&[u8], corerouter_proto_ha::msg::Counters)>,
+) -> Vec<corerouter_proto_ha::record::SessionRecord> {
+    use corerouter_proto_ha::record::SessionRecord;
+    let one = |part: &[(&[u8], corerouter_proto_ha::msg::Counters)]| -> Vec<SessionRecord> {
+        part.iter()
+            .filter_map(|(v, c)| {
+                SessionRecord::decode(v).ok().map(|mut r| {
+                    r.counters = *c;
+                    r
+                })
+            })
+            .collect()
+    };
+    let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get).min(8);
+    if raw.len() < DECODE_SPLIT || threads < 2 {
+        return one(&raw);
+    }
+    let size = raw.len().div_ceil(threads);
+    std::thread::scope(|s| {
+        let parts: Vec<_> = raw
+            .chunks(size)
+            .map(|part| {
+                std::thread::Builder::new()
+                    .name("ppp-ha-decode".into())
+                    .spawn_scoped(s, move || one(part))
+            })
+            .collect();
+        let mut out = Vec::with_capacity(raw.len());
+        for (part, h) in raw.chunks(size).zip(parts) {
+            // A thread that could not start: this one decodes its part.
+            match h.map(|h| h.join()) {
+                Ok(Ok(v)) => out.extend(v),
+                _ => out.extend(one(part)),
+            }
+        }
+        out
+    })
+}
+
+/// Below this many records the decode stays on one thread.
+const DECODE_SPLIT: usize = 8192;
 
 /// A takeover begins: its timeline (the one before it goes to the list).
 fn begin_takeover(p: &mut Pair, t: &Transition, handed: u64, now: u64) {

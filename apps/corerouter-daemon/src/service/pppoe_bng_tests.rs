@@ -36,6 +36,10 @@ pub(super) fn server(json: serde_json::Value) -> PppoeServer {
     serde_json::from_value(base).unwrap()
 }
 
+pub(super) fn pools_of(size: u32) -> IpPools {
+    pools(size)
+}
+
 fn pools(size: u32) -> IpPools {
     let start = u32::from(Ipv4Addr::new(100, 64, 0, 1));
     IpPools {
@@ -151,6 +155,13 @@ impl Lab {
     pub(super) fn run(&mut self, rounds: usize, step: u64) {
         let mut out = ClientOutput::new();
         for _ in 0..rounds {
+            // G4.3hh: like the worker, a takeover a chunk per round, then
+            // its bookkeeping.
+            if self.bng.ha_adopting() {
+                self.bng.ha_adopt_step(self.now);
+            } else if self.bng.ha_later() {
+                self.bng.ha_adopt_rest(self.now);
+            }
             for _ in 0..50 {
                 self.bng.radius(self.now);
                 let frames: Vec<(u32, Vec<u8>)> = std::mem::take(&mut self.bng.frames);

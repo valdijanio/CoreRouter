@@ -469,6 +469,17 @@ pub struct Takeover {
     pub announced_ms: Option<u64>,
     pub adopted_ms: Option<u64>,
     pub first_frame_ms: Option<u64>,
+    /// G4.3hh: the replica's records decoded and handed to the workers,
+    /// and the last worker answering (its share indexed, its first chunk
+    /// adopted; a frame of a session still waiting adopts it on the spot).
+    pub handed_ms: Option<u64>,
+    pub answering_ms: Option<u64>,
+    /// G4.3hh, slow path: the adopted sessions' routes in the kernel (the
+    /// last worker's batch), how many the kernel took and how many it
+    /// still refused after the second try.
+    pub routes_ms: Option<u64>,
+    pub routes: u64,
+    pub routes_refused: u64,
     /// Sessions kept and lost: the replica handed over, the ones the
     /// workers adopted, the ones that did not fit, and the peer's last
     /// count minus the adopted ones (changes not synced in time).

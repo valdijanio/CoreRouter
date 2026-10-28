@@ -37,6 +37,10 @@
 //! the subscriber. The production path is XDP plus G4.3ca (a tc program
 //! on `bng0`); this one is correct, not fast.
 
+mod routes;
+
+pub use routes::{Applied, RouteBatch, RouteOp};
+
 use std::io::{self, IoSliceMut};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
@@ -528,6 +532,7 @@ impl SlowPath {
             ifindex: self.ifindex,
             rt,
             handle,
+            batch: RouteBatch::open(self.ifindex).ok(),
         })
     }
 }
@@ -540,9 +545,38 @@ pub struct SlowTx {
     ifindex: u32,
     rt: tokio::runtime::Runtime,
     handle: rtnetlink::Handle,
+    /// G4.3hh: this worker's socket for routes in batches (`None`: it
+    /// could not open; the routes go one request each, [`Self::prefixes`]).
+    batch: Option<RouteBatch>,
 }
 
 impl SlowTx {
+    /// G4.3hh: add or remove these routes to `bng0` in batches (many per
+    /// `sendmsg`, refusals tried once more). Without the batch socket, or
+    /// with `one_by_one`, one request each on the `rtnetlink` connection
+    /// (the path before G4.3hh), counted the same way.
+    pub fn apply_routes(&mut self, ops: &[RouteOp], one_by_one: bool) -> io::Result<Applied> {
+        if ops.is_empty() {
+            return Ok(Applied::default());
+        }
+        if !one_by_one && let Some(b) = self.batch.as_mut() {
+            return b.apply(ops);
+        }
+        let mut v4 = Vec::new();
+        let mut v6 = Vec::new();
+        for o in ops {
+            match o.dst {
+                std::net::IpAddr::V4(a) => v4.push((a, o.len, o.add)),
+                std::net::IpAddr::V6(a) => v6.push((a, o.len, o.add)),
+            }
+        }
+        let r = self.prefixes(&v4).and(self.routes6(&v6));
+        r.map(|()| Applied {
+            done: ops.len(),
+            ..Applied::default()
+        })
+    }
+
     pub fn inject(&self, packet: &[u8]) -> io::Result<()> {
         inject(&self.raw, &self.raw6, packet)
     }

@@ -563,6 +563,122 @@ testemunha derrubaria o acesso de todos: fica o debounce de 3 s, como antes).
   (a rota de cada sessão no kernel): 100 mil levam ~0,72–0,76 s com e sem BFD. A detecção já não
   pesa. Fica na gap G4.3hh (adoção em lote).
 
+## 2.14 Adoção em lote na tomada (G4.3hh)
+
+Com o BFD, a detecção caiu para 150 ms, mas com 100 mil sessões o par levava mais 0,76 s para
+adotá-las (§2.13). O brief supunha que o tempo ia nas rotas do kernel, uma a uma. O perfil
+(`pppoe_ha_tests::adopt_profile`, 100 mil registros, 8 workers, release) mostrou outra coisa:
+
+| Onde ia o tempo de cada worker (12 500 sessões) | Antes | Depois |
+|---|---:|---:|
+| espera do lock da tabela ativa (um lock por sessão, os 8 workers na fila) | ≈ 300 ms | — (um lock por bloco de 1024, e só na segunda fase) |
+| `Ppp::effective` (três perfis clonados por sessão) | ≈ 1 µs/sessão | uma vez por par de perfis |
+| índice de secrets montado na primeira busca (cada worker, na tomada) | ≈ 30 ms | no `configure` |
+| até o worker responder | 310 ms | **7 ms** (o primeiro bloco) |
+| todas adotadas | 310 ms | 62–66 ms |
+
+As rotas eram a segunda parte: o worker as aplicava no fim da rodada da adoção e só depois
+voltava a ler os quadros dos assinantes.
+
+### Pesquisa
+
+- **accel-ppp:** não sincroniza sessões entre servidores; no IPoE ele mesmo insere as rotas por
+  netlink (`ifcfg=0`), com buffers configuráveis (`SO_SNDBUF` 32 KiB, recepção 1 MiB), sem lote
+  documentado ([accel-ppp.conf](https://www.mankier.com/5/accel-ppp.conf),
+  [IPoE](https://accel-ppp.readthedocs.io/configuration/ipoe.html)). O VyOS discute um cliente de
+  sync com o VPP, não uma troca de nó ([T7650](https://vyos.dev/T7650)).
+- **Cisco ASR 9000 (BNG Geo Redundancy):** no *hot standby* (padrão) as sessões já ficam montadas
+  no espera, com o plano de dados programado; a troca tem "ação mínima" e fica abaixo de 1 s. O
+  *warm standby* guarda só uma cópia na memória do plano de controle
+  ([Cisco Community](https://community.cisco.com/t5/service-providers-knowledge-base/asr9000-xr-using-and-understanding-bng-geo-redundancy/ta-p/3158636)).
+- **Juniper MX (M:N subscriber redundancy):** o backup em hot standby assume as sessões; a volta
+  do tráfego vem do BGP que anuncia as rotas dos assinantes; sem número de tempo de adoção
+  publicado ([juniper.net](https://www.juniper.net/documentation/us/en/software/junos/subscriber-mgmt-sessions/topics/topic-map/m-to-n-subscriber-redundancy.html)).
+- **Nokia 7750 (MCS):** sincroniza o estado por UDP entre os system addresses (§2.13).
+- **MikroTik RouterOS v7:** não tem redundância de PPPoE server.
+- **Kernel:** desde o 6.14 o `RTM_NEWROUTE` do IPv4 pega o RTNL **por namespace**
+  (`rtnl_net_lock`), não o global; continua um por vez dentro do namespace. Mandar vários pedidos
+  num `sendmsg` é o que o `mpls.rs` já faz (G3.5); o `netlink_rcv_skb` responde a um pedido
+  recusado mesmo sem `NLM_F_ACK`, e trata os pedidos de um socket em ordem.
+
+**O que adotamos:** a tomada em duas fases, com prioridade para quem manda tráfego (abaixo), e as
+rotas em lote numa thread só. **Melhoria sobre os outros:** a sessão que manda um quadro antes de
+ser adotada é adotada na hora, e não leva PADT; a linha do tempo mostra cada fase. **Fora, e
+por quê:** montar as sessões no espera antes da falha, como o hot standby da Cisco (o espera teria
+de manter o keepalive e o estado do `proto-pppoe` vivos sem falar com o CPE; gap G4.3hi), e trocar
+as rotas /32 do caminho lento por uma rota do pool inteiro para `bng0` (gap G4.3hj).
+
+### Como funciona
+
+- **Primeira fase, o que um quadro precisa.** O worker indexa a sua parte da réplica por (MAC do
+  CPE, SESSION_ID) e adota o primeiro bloco de 1024: `Server::import`, o `Sub`, o endereço no
+  pool, a tabela de endereços do caminho lento, o XDP ou a rota. A partir daí ele **responde**. A
+  cada rodada adota o bloco seguinte, com os quadros entre um bloco e outro. Um quadro (de sessão
+  ou PADT) de uma sessão que ainda espera a adota na hora, antes de chegar ao `proto-pppoe`, que
+  responderia a uma sessão desconhecida com PADT.
+- **Segunda fase, a contabilidade.** A tabela ativa, o histórico, o Interim (o mesmo
+  Acct-Session-Id e os contadores herdados), a address-list e a publicação para o novo espera vão
+  em blocos de 1024, um lock da tabela por bloco. Uma sessão que termina antes ganha a linha
+  primeiro: o Stop leva os contadores herdados e não sai Interim dela.
+- **Rotas numa thread só.** A thread `pppoe-routes` recebe as rotas de cada rodada de cada worker
+  (fila de 1024 rodadas) e as manda em lotes de até 64 KiB por `sendmsg` (≈ 1400 rotas IPv4),
+  `NLM_F_ACK` só no último pedido de cada envio. Um pedido recusado é tentado de novo, sozinho;
+  um envio cujas respostas se perderam (`ENOBUFS`) vai de novo inteiro (o add é um replace, e
+  remover uma rota que já não existe não é erro). O que o kernel aceitou e o que ainda recusou
+  saem na linha do tempo (`routes`, `routes_refused`). Fila cheia: o worker guarda as rotas e as
+  oferece na rodada seguinte, na ordem. `COREROUTER_SLOW_ROUTES=each` volta ao caminho anterior
+  (uma requisição `rtnetlink` por rota), para comparar.
+- **A réplica decodificada em paralelo** (`ppp-ha-decode`, até 8 threads) antes de ir aos workers.
+- **Linha do tempo** (`ppp.redundancy.monitor` → `takeovers`): `handed_ms` (registros entregues aos
+  workers), `answering_ms` (o último worker respondendo), `adopted_ms` (o último terminou a
+  primeira fase), `routes_ms` (as rotas no kernel). A janela PPP › Redundancy ganha o selo "rotas".
+
+### Medido
+
+**VM com BNG Blaster** (`corerouter-lab`, 8 vCPUs, kernel 7.0, release, BNG Blaster 1.0.1, sem
+root: caminho lento, 6 workers; 2026-10-28; `cargo xtask vm-lab run -- env BNG_LAB_HA_BFD=fast
+cargo xtask bng-lab --only ha --scales 10000,100000`; a `main` de antes rodada na mesma VM, no
+mesmo dia, com o mesmo laboratório). O ativo perde a energia. **Subida de volta**: do corte até o
+primeiro pacote de cada uma de 32 sessões-sonda (20 pps cada) na porta da bridge do lado da rede
+(um socket de pacotes no laboratório, ligado só a essa porta). A linha do tempo de C conta do
+último sinal de vida de A:
+
+| Sessões | | Ativo | Entregues | Respondendo | Todas adotadas | Rotas no kernel | Subida de volta (1ª / mediana / todas) | Perdidas |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| 10 000 | antes (`main`) | 151 ms | – | – | 244 ms | – | 0,175 / 0,193 / 0,203 s | 0 |
+| 10 000 | **G4.3hh** | 154 ms | 157 ms | 165 ms | 228 ms | 180 ms | 0,157 / 0,182 / **0,203 s** | 0 |
+| 100 000 | antes (`main`) | 153 ms | – | – | 1102 ms | – | 0,899 / 1,090 / 1,202 s | 0 |
+| 100 000 | **G4.3hh** | 154 ms | 190 ms | 201 ms | 273 ms | 308 ms | 0,195 / 0,216 / **0,244 s** | 0 |
+
+- **Meta (< 300 ms com 100 mil): cumprida**, com 0 sessões perdidas, os mesmos Acct-Session-Id,
+  nenhum Stop, um Interim de C por sessão e o Class preservado.
+- Com 10 mil não muda nada que se perceba (0,203 s nos dois): a adoção já cabia na detecção. O
+  ganho é com a escala.
+- As sondas mandam tráfego e por isso são adotadas na hora; as que não mandam nada estão todas
+  adotadas aos 273 ms (a coluna "Todas adotadas").
+- A tabela ativa de C (a segunda fase) fica completa em ≈ 0,63 s; antes, 1,14 s.
+- Na `main` a rota de cada sessão ia no fim da adoção, com o worker parado; aqui as rotas entram
+  em 154 ms depois do ativo, pela thread de rotas, e o worker não espera.
+
+**Como o laboratório mede, e o que deu errado no caminho:** a primeira versão lia os contadores
+das sondas pelo socket de controle do BNG Blaster; carregado, ele respondia em 30–330 ms, e o
+número dizia mais da leitura que do tráfego. Um socket de pacotes sem porta copiava cada quadro de
+cada bridge (100 mil sessões de LCP) e carregava a VM que media. E os endereços das sondas eram
+procurados em A depois do corte (32 buscas em 100 mil linhas, ≈ 1,5 s). As três coisas foram
+corrigidas antes das rodadas da tabela.
+
+**No host** (`pppoe_ha_tests::adopt_profile`, 100 mil registros sintéticos em dois servidores,
+Ryzen AI Max+ 395, release, **medido**):
+
+| Workers | Respondendo | Todas adotadas | Contabilidade pronta |
+|---:|---:|---:|---:|
+| 1 (antes: 660 ms, tudo de uma vez) | 10 ms | 372 ms | 588 ms |
+| 8 (antes: 310 ms cada) | 7 ms | 62–66 ms | 180–183 ms |
+
+**Rotas** (`hal-linux/benches/netns_routes_batch.rs`, namespace, criterion): 10 mil /32 em
+**13,1 ms** em lote contra 31,7 ms uma a uma (2,4×). 100 mil, ver `docs/architecture.md`
+("Rotas do caminho lento").
+
 ## 3. Testes
 
 - Unidade (27): cada regra da máquina de papéis, codec, registro, hello, sync.
@@ -636,6 +752,21 @@ testemunha derrubaria o acesso de todos: fica o debounce de 3 s, como antes).
 - **Filas:** eventos do BFD (256), respostas ao par (1024), logs (256): todas limitadas.
 - **Medido:** detecção → ativo em 0–4 ms (laço acordado pelo evento), contra 10 ms com o tique de
   10 ms (`tests/netns_ha_bfd.rs`, debug).
+
+### Adoção em lote (G4.3hh)
+
+- **Trabalho por item:** O(1) por sessão adotada (o índice da réplica por worker é um
+  `HashMap`, os blocos andam na ordem); nenhum custo cresce com o total, exceto o próprio índice
+  (O(n/workers), uma vez por tomada). `Ppp::effective` uma vez por par de perfis, não por sessão.
+- **Locks:** a tabela ativa, os pools e a tabela de endereços do caminho lento, uma vez por bloco
+  de 1024 sessões (≈ 1 ms de lock), não por sessão. O lock do `Session` não entra.
+- **Threads:** a decodificação da réplica em até 8 threads (`ppp-ha-decode`, escopo da tomada);
+  a adoção nos workers, cada um a sua parte; as rotas numa thread só (`pppoe-routes`), porque o
+  kernel as serializa (`docs/architecture.md`). Filas limitadas: a das rotas (1024 rodadas; cheia,
+  o worker guarda e oferece de novo).
+- **O que ainda custa:** ≈ 8 µs por sessão na VM (≈ 3,4 µs no host num núcleo), quase tudo
+  alocação do `Sub`; e ≈ 1,6 µs por rota no kernel. As gaps G4.3hi (sessões montadas no espera) e
+  G4.3hj (rota do pool) tiram os dois da tomada.
 
 ### No serviço `pppoe` (fase 2)
 

@@ -755,6 +755,7 @@ fn timeline(ui: &mut Ui, l: Lang, k: &Value, v: &egui::Visuals) {
             ("active", k.get("active_ms").and_then(Value::as_u64)),
             ("announced", k.get("announced_ms").and_then(Value::as_u64)),
             ("adopted", k.get("adopted_ms").and_then(Value::as_u64)),
+            ("routes", k.get("routes_ms").and_then(Value::as_u64)),
             ("1st frame", k.get("first_frame_ms").and_then(Value::as_u64)),
         ];
         let mut first = true;

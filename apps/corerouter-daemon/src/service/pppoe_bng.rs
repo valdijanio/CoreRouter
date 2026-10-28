@@ -1062,6 +1062,12 @@ struct SubIndex {
 }
 
 impl SubIndex {
+    /// Room for `n` more sessions up (a takeover's share, G4.3hh).
+    fn reserve(&mut self, n: usize) {
+        self.by_ip.reserve(n);
+        self.users_up.reserve(n);
+    }
+
     fn add(&mut self, key: (usize, u16), sub: &Sub) {
         if sub.up_at.is_some() {
             *self.users_up.entry(sub.user.clone()).or_default() += 1;
@@ -1532,6 +1538,10 @@ impl Bng {
             sh.forbidden = snap.forbidden.clone();
         }
         self.cfg = snap;
+        // G4.3hh: the secrets' name index is built on the first lookup; on
+        // a standby that is the takeover itself, in every worker at once
+        // (≈ 30 ms per worker with 100 000 secrets, **medido**). Built here.
+        let _ = self.cfg.ppp.secret("");
         // Servers gone or restarted: end their sessions.
         let mut keep: Vec<bool> = Vec::with_capacity(self.slots.len());
         for s in &self.slots {
@@ -1718,6 +1728,10 @@ impl Bng {
         let Some(i) = self.slots.iter().position(|s| s.port.ifindex == ifindex) else {
             return;
         };
+        // G4.3hh: a session of a takeover not adopted yet is, now.
+        if self.ha_adopting() {
+            self.ha_adopt_for(now, frame);
+        }
         if let Some((code, src)) = peek(frame) {
             let key = mac_text(src);
             let sessions = self.subs.len();
@@ -3079,6 +3093,8 @@ impl Bng {
             .map(|s| s.cfg.interface.to_string())
             .unwrap_or_default();
         let unix = self.cfg.unix_base + now / 1000;
+        // G4.3hh: adopted, its bookkeeping not done yet.
+        self.ha_adopt_now(now, &sub);
         let gone = {
             let mut sh = guard(&self.shared);
             let gone = sh.active.remove(&id);

@@ -91,7 +91,8 @@ mod linux {
 
     use corerouter_engine::{Shared, lock};
     use corerouter_hal::pppoe::PppoeOp;
-    use corerouter_hal_linux::pppoe_io::{Listen, PortSender, PppoePort, SlowPath, SlowTx};
+    use corerouter_hal_linux::pppoe_io::{Listen, PortSender, PppoePort, RouteOp, SlowPath, SlowTx};
+    use super::super::pppoe_route_writer::Job as RouteJob;
     use corerouter_model::ppp::{PppoeServer, pppoe_workers_auto};
     use corerouter_model::pppoe_vlans::VlanMode;
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
@@ -118,6 +119,13 @@ mod linux {
 
     fn ms() -> u64 {
         u64::try_from(origin().elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// G4.3hh: `COREROUTER_SLOW_ROUTES=each` keeps the slow path's routes
+    /// one request each (the path before the batches), for an A/B.
+    fn one_by_one() -> bool {
+        static EACH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *EACH.get_or_init(|| std::env::var("COREROUTER_SLOW_ROUTES").is_ok_and(|v| v == "each"))
     }
 
     fn seed() -> [u8; 32] {
@@ -183,8 +191,10 @@ mod linux {
         Config(Box<Snapshot>, HashMap<String, PortInfo>, bool),
         /// The ports changed: the worker's own senders for them.
         Ports(HashMap<u32, PortSender>),
-        /// The slow path opened: the worker's own sender.
-        Slow(Box<SlowTx>),
+        /// The slow path opened: the worker's own sender, and the queue of
+        /// the routes' thread (G4.3hh; `None`: it could not start, the
+        /// worker applies its routes itself).
+        Slow(Box<SlowTx>, Option<SyncSender<RouteJob>>),
     }
 
     /// The reader: ports, plane, config and the workers' queues.
@@ -372,6 +382,8 @@ mod linux {
     fn worker(mut bng: Bng, rx: &Receiver<Msg>, session: &Shared, health: &super::super::Health) {
         let mut ports: HashMap<u32, PortSender> = HashMap::new();
         let mut slow: Option<SlowTx> = None;
+        let mut writer: Option<SyncSender<RouteJob>> = None;
+        let mut backlog = Backlog::default();
         let mut configured = false;
         let mut last_tick = Instant::now();
         let mut errors: Vec<String> = Vec::new();
@@ -379,9 +391,23 @@ mod linux {
         loop {
             let now = ms();
             // G4.3h: a takeover first (its sessions before any frame).
-            if bng.ha_pending() {
+            // G4.3hh: in chunks, the worker answering between them (a frame
+            // of a session still waiting adopts it on the spot); then the
+            // adopted sessions' bookkeeping, a chunk per round.
+            let adopted = if bng.ha_pending() {
                 let done = bng.ha_adopt_pending(now);
-                // G3.6h: the takeover's timeline.
+                super::super::ppp_ha::answering();
+                done
+            } else if bng.ha_adopting() {
+                bng.ha_adopt_step(now)
+            } else {
+                if bng.ha_later() {
+                    bng.ha_adopt_rest(now);
+                }
+                None
+            };
+            // G3.6h: the takeover's timeline.
+            if let Some(done) = adopted {
                 super::super::ppp_ha::adopted(done.sessions, done.skipped);
             }
             let mut wait = WAIT;
@@ -390,6 +416,10 @@ mod linux {
             }
             if bng.waiting_radius() {
                 wait = wait.min(Duration::from_millis(2));
+            }
+            // G4.3hh: a takeover's chunks one after another, frames between.
+            if bng.ha_adopting() || bng.ha_later() {
+                wait = Duration::ZERO;
             }
             let mut open = true;
             let mut first = Some(rx.recv_timeout(wait));
@@ -420,7 +450,10 @@ mod linux {
                                 configured = true;
                             }
                             Msg::Ports(p) => ports = p,
-                            Msg::Slow(s) => slow = Some(*s),
+                            Msg::Slow(s, w) => {
+                                slow = Some(*s);
+                                writer = w;
+                            }
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => break,
@@ -456,20 +489,85 @@ mod linux {
                     }
                 }
             }
-            flush(&mut bng, &ports, slow.as_ref(), session, &mut errors);
+            flush(&mut bng, &ports, slow.as_mut(), writer.as_ref(), &mut backlog, session, &mut errors);
             if !open || health.stopping() {
                 break;
             }
         }
         bng.shutdown(ms());
-        flush(&mut bng, &ports, slow.as_ref(), session, &mut errors);
+        flush(&mut bng, &ports, slow.as_mut(), writer.as_ref(), &mut backlog, session, &mut errors);
+    }
+
+    /// G4.3hh: a worker's routes the routes' thread has not taken yet.
+    #[derive(Default)]
+    struct Backlog {
+        ops: Vec<RouteOp>,
+        takeover: bool,
+        /// Rounds the queue was full (logged once per burst).
+        busy: u32,
+    }
+
+    impl Backlog {
+        /// Routes waiting at most before the worker waits for the queue.
+        const MAX: usize = 1 << 20;
+
+        fn offer(&mut self, writer: Option<&SyncSender<RouteJob>>, slow: &mut SlowTx, errors: &mut Vec<String>) {
+            if self.ops.is_empty() && !self.takeover {
+                return;
+            }
+            let job = RouteJob { ops: std::mem::take(&mut self.ops), takeover: std::mem::take(&mut self.takeover) };
+            let Some(w) = writer else {
+                return Self::inline(job, slow, errors);
+            };
+            match w.try_send(job) {
+                Ok(()) => self.busy = 0,
+                Err(TrySendError::Full(job)) if job.ops.len() < Self::MAX => {
+                    if self.busy == 0 && errors.len() < 100 {
+                        errors.push(format!("slow path: the routes' queue is full; {} routes wait for the next round", job.ops.len()));
+                    }
+                    self.busy += 1;
+                    self.ops = job.ops;
+                    self.takeover = job.takeover;
+                }
+                // A million routes waiting: wait for the thread (memory).
+                Err(TrySendError::Full(job)) => {
+                    if let Err(std::sync::mpsc::SendError(job)) = w.send(job) {
+                        Self::inline(job, slow, errors);
+                    }
+                }
+                Err(TrySendError::Disconnected(job)) => Self::inline(job, slow, errors),
+            }
+        }
+
+        /// Without the thread: on the worker's own socket (the path before
+        /// G4.3hh), the same count.
+        fn inline(job: RouteJob, slow: &mut SlowTx, errors: &mut Vec<String>) {
+            let n = job.ops.len();
+            match slow.apply_routes(&job.ops, one_by_one()) {
+                Ok(a) => {
+                    if !a.refused.is_empty() && errors.len() < 100 {
+                        errors.push(format!("{} of {n} routes to bng0 refused", a.refused.len()));
+                    }
+                    if job.takeover {
+                        super::super::ppp_ha::routes_installed(a.done, a.refused.len());
+                    }
+                }
+                Err(e) => {
+                    if errors.len() < 100 {
+                        errors.push(e.to_string());
+                    }
+                }
+            }
+        }
     }
 
     /// Send what the BNG made and do what it asked.
     fn flush(
         bng: &mut Bng,
         ports: &HashMap<u32, PortSender>,
-        slow: Option<&SlowTx>,
+        mut slow: Option<&mut SlowTx>,
+        writer: Option<&SyncSender<RouteJob>>,
+        backlog: &mut Backlog,
         session: &Shared,
         errors: &mut Vec<String>,
     ) {
@@ -493,7 +591,7 @@ mod linux {
                 log::debug!("pppoe: send on ifindex {ifindex}: {e}");
             }
         }
-        if let Some(s) = slow {
+        if let Some(s) = slow.as_deref() {
             for p in bng.upstream.drain(..) {
                 let _ = s.inject(&p);
             }
@@ -502,31 +600,33 @@ mod linux {
         }
         let effects: Vec<Effect> = std::mem::take(&mut bng.effects);
         if effects.is_empty() {
+            // Routes the routes' thread could not take last round.
+            if let Some(s) = slow.as_deref_mut() {
+                backlog.offer(writer, s, errors);
+            }
             return;
         }
         let mut ops: Vec<PppoeOp> = Vec::new();
-        let mut routes: Vec<(std::net::Ipv4Addr, u8, bool)> = Vec::new();
-        let mut routes6: Vec<(std::net::Ipv6Addr, u8, bool)> = Vec::new();
+        let mut routes: Vec<RouteOp> = Vec::new();
         let mut locked: Vec<Effect> = Vec::new();
         for e in effects {
             match e {
                 Effect::Xdp(op) => ops.push(op),
-                Effect::Route { ip, add } => routes.push((ip, 32, add)),
-                Effect::Block { dst, add } => routes.push((dst.network(), dst.prefix_len(), add)),
-                Effect::Route6 { net, add } => routes6.push((net.network(), net.prefix_len(), add)),
+                Effect::Route { ip, add } => routes.push(RouteOp { dst: ip.into(), len: 32, add }),
+                Effect::Block { dst, add } => routes.push(RouteOp { dst: dst.network().into(), len: dst.prefix_len(), add }),
+                Effect::Route6 { net, add } => routes.push(RouteOp { dst: net.network().into(), len: net.prefix_len(), add }),
                 other => locked.push(other),
             }
         }
-        // The round's routes (/32, routed blocks and IPv6 prefixes) in one
-        // go on the worker's own connection.
+        // The round's routes (/32, routed blocks and IPv6 prefixes) to the
+        // routes' thread (G4.3hh), which merges every worker's into big
+        // batches; this worker goes on with its frames. Its queue full, they
+        // wait here and go next round, in order.
+        let takeover = bng.ha_take_routes_mark();
         if let Some(s) = slow {
-            for r in [s.prefixes(&routes), s.routes6(&routes6)] {
-                if let Err(e) = r
-                    && errors.len() < 100
-                {
-                    errors.push(e.to_string());
-                }
-            }
+            backlog.ops.append(&mut routes);
+            backlog.takeover |= takeover;
+            backlog.offer(writer, s, errors);
         }
         if ops.is_empty() && locked.is_empty() {
             return;
@@ -630,10 +730,18 @@ mod linux {
                     }
                     match SlowPath::open() {
                         Ok(s) => {
+                            // G4.3hh: one thread puts every worker's routes in the kernel.
+                            let writer = match s.sender().and_then(|tx| super::super::pppoe_route_writer::spawn(tx, session.clone(), one_by_one())) {
+                                Ok(w) => Some(w),
+                                Err(e) => {
+                                    self.errors.push(format!("slow path routes thread: {e}"));
+                                    None
+                                }
+                            };
                             for w in &self.workers {
                                 match s.sender() {
                                     Ok(tx) => {
-                                        let _ = w.send(Msg::Slow(Box::new(tx)));
+                                        let _ = w.send(Msg::Slow(Box::new(tx), writer.clone()));
                                     }
                                     Err(e) => self.errors.push(format!("slow path: {e}")),
                                 }

@@ -803,6 +803,24 @@ pub struct Effective {
     pub download_mode: crate::queue::DownloadMode,
 }
 
+impl Effective {
+    /// The secret's own addresses on top (the last step of
+    /// [`Ppp::effective`]): a caller that keeps `effective(None, …)` of a
+    /// profile pair applies each secret with this (G4.3hh, a takeover's
+    /// 100 000 sessions share a handful of profiles).
+    pub fn with_secret(mut self, secret: Option<&PppSecret>) -> Self {
+        if let Some(s) = secret {
+            if let Some(ip) = s.local_address {
+                self.local_address = Some(AddrOrPool::Address(ip));
+            }
+            if let Some(ip) = s.remote_address {
+                self.remote_address = Some(AddrOrPool::Address(ip));
+            }
+        }
+        self
+    }
+}
+
 impl Ppp {
     pub fn next_id(&mut self) -> ItemId {
         self.next_id = self.next_id.saturating_add(1);
@@ -851,7 +869,7 @@ impl Ppp {
         let tri = |f: fn(&PppProfile) -> Tri| {
             chain.iter().map(f).find(|t| *t != Tri::Default).unwrap_or(Tri::No) == Tri::Yes
         };
-        let mut e = Effective {
+        let e = Effective {
             profile: chain.first().map(|p| p.name.clone()).unwrap_or_else(|| DEFAULT_PROFILE.into()),
             local_address: pick(&chain, |p| p.local_address.clone()),
             remote_address: pick(&chain, |p| p.remote_address.clone()),
@@ -885,15 +903,7 @@ impl Ppp {
                 .unwrap_or_else(|| crate::queue::DEFAULT_DYNAMIC_TYPE.into()),
             download_mode: pick(&chain, |p| p.download_mode).unwrap_or_default(),
         };
-        if let Some(s) = secret {
-            if let Some(ip) = s.local_address {
-                e.local_address = Some(AddrOrPool::Address(ip));
-            }
-            if let Some(ip) = s.remote_address {
-                e.remote_address = Some(AddrOrPool::Address(ip));
-            }
-        }
-        e
+        e.with_secret(secret)
     }
 
     /// Who names profile `name` (refuses its removal or rename).

@@ -93,6 +93,7 @@ impl Server {
         let lane = self.cfg.sid_lane.0 % lanes;
         let mut taken = Vec::with_capacity(states.len());
         let mut results = Vec::with_capacity(states.len());
+        self.by_host.reserve(states.len());
         for st in states {
             let ours = st.sid != 0 && st.sid <= self.cfg.max_sessions && st.sid % lanes == lane;
             if !ours {
@@ -119,8 +120,14 @@ impl Server {
             results.push(Ok(r));
         }
         if !taken.is_empty() {
-            let used: std::collections::HashSet<u16> = taken.iter().copied().collect();
-            self.free.retain(|sid| !used.contains(sid));
+            // A few (a session adopted on demand, G4.3hh): a walk of
+            // `taken` beats building a set for every free SESSION_ID.
+            if taken.len() <= 16 {
+                self.free.retain(|sid| !taken.contains(sid));
+            } else {
+                let used: std::collections::HashSet<u16> = taken.iter().copied().collect();
+                self.free.retain(|sid| !used.contains(sid));
+            }
             for sid in taken {
                 // Schedules the keepalive (and the Session-Timeout).
                 self.with_session(now, sid, None, out, |_, _| {});

@@ -1199,6 +1199,29 @@ de PADIs de uma volta de energia.
   - as perdas do kernel por socket (`SO_RXQ_OVFL`) e as do canal saem no
     `interface.pppoe-server.monitor` (`rx_dropped`).
 
+### Rotas do caminho lento: em lote, numa thread só (G4.3hh)
+
+O caminho lento põe uma rota por assinante para `bng0` (e os blocos e prefixos IPv6). Na tomada do
+par são 100 mil de uma vez. Comparado num namespace (`hal-linux/tests/netns_routes_batch.rs`,
+Ryzen AI Max+ 395, kernel 7.0, release, 2026-10-28, **medido**):
+
+| 100 000 rotas /32 | 1 thread | 8 threads ao mesmo tempo |
+|---|---:|---:|
+| uma requisição `rtnetlink` por rota (antes) | 348 ms (3,5 µs/rota) | 188 ms |
+| em lote (`RouteBatch`: até 64 KiB por `sendmsg`, ACK só no último) | **132 ms (1,3 µs/rota)** | 221 ms |
+
+- **Decisão:** lote, e **uma thread** (`pppoe-routes`) para o serviço inteiro, com os workers
+  pondo as rotas de cada rodada numa fila (1024 rodadas; cheia, o worker guarda e oferece de
+  novo, na ordem). O kernel insere a rota IPv4 sob o RTNL do namespace, uma por vez: oito
+  threads em lote disputam esse lock e ficam mais lentas que uma (221 contra 132 ms). E o worker
+  já não para de ler os quadros dos assinantes enquanto o kernel trabalha.
+- **Sobra o kernel:** ≈ 1,3 µs por rota aqui (≈ 1,6 µs na VM do laboratório). Tirar isso da tomada
+  pede outra forma (uma rota do pool inteiro para `bng0`, a tabela de endereços do serviço já sabe
+  o worker de cada um), gap G4.3hj.
+- **Sem crate novo:** o mesmo formato de mensagem do `mpls.rs` (G3.5), escrito à mão sobre o
+  `netlink-sys`; o `rtnetlink` fica como alternativa (`COREROUTER_SLOW_ROUTES=each`) e para o
+  resto do `hal-linux`.
+
 ### Filas: EDT × HTB (G4.9b)
 
 Decisão (2026-10-26, **medida**): a descida das filas é moldada com **EDT** — um programa tc na
