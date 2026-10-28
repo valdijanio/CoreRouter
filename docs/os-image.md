@@ -1,4 +1,4 @@
-# Imagem do sistema (G1.6a, G1.6b, G1.6c)
+# Imagem do sistema (G1.6a, G1.6b, G1.6c, G1.6k)
 
 A imagem que vai no disco do roteador: kernel LTS, rootfs squashfs só de leitura, `/config`
 gravável, `corerouter-init` como PID 1 e `corerouter-daemon` como único serviço. Construída
@@ -13,6 +13,7 @@ cargo xtask os boot-test --efi       # o mesmo, pelo firmware UEFI (OVMF) e o di
 cargo xtask os boot-test --append corerouter.shell=ttyS0 --timeout 600   # com shell de manutenção na serial
 cargo xtask os ab-test               # G1.6b: os 4 cenários A/B no QEMU (UEFI, sem root)
 cargo xtask os install-test          # G1.6c: instalador (CD, USB, interativo), qcow2 e OVA no QEMU
+cargo xtask os frr-test              # G1.6k: dois roteadores da imagem com OSPF, SR, LDP e BFD entre eles
 cargo xtask os package --out b.crpkg --version 0.1.1 --build 1800000000  # outro pacote deste build
 ```
 
@@ -29,7 +30,7 @@ FRR: seção "Instalador, imagens de VM e FRR (G1.6c)" no fim.
 | Init | `corerouter-init` (Rust, este workspace) | `apps/corerouter-init` |
 | Roteador | `corerouter-daemon --backend linux --config-dir /config --control 7979 --listen 0.0.0.0:8729` | `os/package/corerouter` |
 | Espaço de usuário | `nft` sem JSON e sem CLI interativa (só diagnóstico no shell de manutenção: o hal-linux fala nfnetlink, G2.8), glibc, busybox (só para o shell de manutenção) | defconfig |
-| Roteamento | FRR 10.3 (pacote do Buildroot): `mgmtd`, `zebra`, `staticd`, `bgpd`, `ospfd`, `ospf6d`, `ldpd`, `bfdd`, iniciados pelo `corerouter-init`; sem `vtysh`, scripts nem bash (G1.6c) | defconfig, `post-build.sh` |
+| Roteamento | FRR **10.7.1** com libyang 3.13.6 (a versão validada na VM do laboratório; receita do Buildroot `master` portada, G1.6k): `mgmtd`, `zebra`, `staticd`, `bgpd`, `ospfd`, `ospf6d`, `ldpd`, `bfdd`, iniciados pelo `corerouter-init`; sem `vtysh`, scripts nem bash (G1.6c) | defconfig, `post-build.sh`, `os/buildroot-patches/` |
 
 Tudo que o roteador precisa no kernel é `=y` (sem módulos): eBPF/XDP com BTF e JIT sempre
 ligado, AF_XDP, nftables completo (NAT, conntrack, flowtable, fib, socket, synproxy), **VRF**
@@ -175,6 +176,12 @@ precisar de streaming delta, o RAUC volta a ser a opção (o formato de bundle v
 - O Buildroot é fixado por versão **e** SHA-256 (`os/buildroot.lock`), baixado uma vez para
   `os/dl/` e extraído em `os/out/` (as duas pastas no `.gitignore`). Todo pacote é conferido
   pelo hash (`BR2_DOWNLOAD_FORCE_CHECK_HASHES`); o kernel, pelo `linux.hash` nosso.
+- G1.6k: `os/buildroot-patches/*.patch` (em ordem de nome) é aplicado à árvore extraída. Só
+  receitas de `package/` (o `os check` recusa outro caminho), cada versão nova com o hash
+  dela no `.hash` do pacote. Um carimbo com o SHA-256 dos patches fica na árvore; patch
+  mudou, a árvore é extraída de novo do tarball (nunca um patch por cima de outro). Ao trocar a
+  versão de um pacote, faça um build limpo (`rm -rf os/out/build`): o `target/` do Buildroot não
+  apaga os arquivos da versão anterior (a `libyang.so.2` ficou no build incremental).
 - `BR2_REPRODUCIBLE`: `SOURCE_DATE_EPOCH` fixo, datas e ordem dos arquivos do squashfs fixas.
   GUIDs, volume id do vfat e UUID/hash seed do ext4 fixos no `genimage.cfg`.
 - O Rust: `cargo build --release --locked --offline` com o cargo do `rust-toolchain.toml`,
@@ -546,13 +553,37 @@ Saídas em `os/out/build/images/`:
 
 ### FRR na imagem
 
-- **Pacote `frr` do Buildroot 2025.02.19 (FRR 10.3).** O G3.1 foi feito contra o 10.7.1; o
-  `install-test` confere que o hal-frr conversa com o 10.3: o serviço `frr` anexa, uma instância
-  BGP e um vizinho são aplicados e o estado da sessão vem do `bgpd` (`active`/`idle`), e depois
-  da reinstalação com a configuração mantida o daemon a reinstala no FRR novo ("running config
-  installed"). Ficar no pacote do Buildroot quer dizer correções de segurança junto com as
-  versões LTS do Buildroot, sem manter receita própria; um FRR mais novo é um
-  `FRR_OVERRIDE_SRCDIR` quando precisarmos (G3.x que exija ≥ 10.4).
+- **FRR 10.7.1 e libyang 3.13.6 (G1.6k).** O Buildroot 2025.02.19 traz o FRR 10.3 e a libyang
+  2.1.148; OSPF, LDP, Segment Routing, TI-LFA e o BFD distribuído (`bfddp`) foram validados no
+  FRR 10.7.1 da VM do laboratório (com a libyang 3.13.6 do deb.frrouting.org), e um core
+  OSPF/MPLS em produção roda a versão testada. O `master` do Buildroot já tem FRR 10.7.0 e
+  libyang 3.13.6 (commits `34dfa10d` e `c49e140b`, e os anteriores: protobuf opcional, opção de
+  ECMP, cabeçalhos em staging): `os/buildroot-patches/0001-package-frr-10.7.1-libyang-3.13.6.patch`
+  porta essas receitas para o 2025.02.19 e sobe o FRR para 10.7.1. As opções ficam as mesmas
+  (`--enable-multipath=256`, protobuf ligado, `BR2_PACKAGE_FRR_BFD`, sem `vtysh` na imagem).
+  - **Hashes:** o tarball é o arquivo da tag `frr-10.7.1` no GitHub (`6aaf9d89…`, o commit
+    `f8c0b08d` no cabeçalho pax é o da tag assinada); baixados do mesmo jeito, o 10.7.0 e a
+    libyang 3.13.6 dão os hashes do `master` do Buildroot. O Buildroot confere os dois no build
+    (`frr-10.7.1.tar.gz: OK`).
+  - **Alternativas:** `FRR_OVERRIDE_SRCDIR` (o que a G1.6c previa) tira o pacote da conferência
+    de hash do Buildroot e mostra a versão como `custom`; um pacote externo com outro nome
+    duplica a receita inteira e o `select` do nftables. O patch é pequeno (145 linhas, só
+    `package/frr` e `package/libyang`) e falha alto se a receita mudar num Buildroot novo.
+  - **Saída:** quando um LTS do Buildroot trouxer FRR ≥ 10.7.1, apagar o patch.
+- **O que o `frr-test` prova** (`cargo xtask os frr-test`, `xtask/src/os/frr.rs`): dois
+  roteadores da imagem no QEMU, sem root, com os `eth0` ligados por um par de sockets UDP do
+  QEMU no loopback do host. Cada um é configurado só por comandos (13, os mesmos de CLI/MCP):
+  endereço e `/32` na `lo`, OSPFv2 ponto a ponto, SR com prefix SID automático (sem TI-LFA,
+  desligado em produção pela G3.4l), MPLS e LDP no `eth0`, um peer BFD. E tem de ler de volta
+  do FRR: vizinho OSPF `Full` (`ospfd`), o prefix SID do outro com rótulo (`16002`, saída
+  implicit-null), LDP `operational` (`ldpd`), sessão BFD `up` (a do `bfdd`, rodada pelo motor
+  do daemon como data plane), rótulos na tabela MPLS do kernel (`zebra`), ping entre as
+  loopbacks pela rota OSPF e a versão que o `zebra --version` diz igual à do patch.
+  - **Achados:** o perfil `bfd` do interface-template OSPF não chega ao `ospfd`
+    (`crates/proto-ospf/src/frr.rs`: "BFD: not typed into FRR"): o OSPF não cai pelo BFD,
+    só o BGP (gap G3.6l). E o `bfdd` não imprime os valores padrão do perfil (`detect-multiplier 3`,
+    `receive-interval 300`, …) que o render manda: o hal-frr os digita de novo a cada sync, nos
+    dois FRR (gap G3.6m).
 - **O `corerouter-init` inicia os daemons** (`mgmtd`, `zebra`, `staticd`, `bgpd`, `ospfd`,
   `ospf6d`, `ldpd`, `bfdd`), em primeiro plano, com o mesmo backoff de reinício do daemon,
   `-P 0` (sem vty TCP: só os sockets em `/var/run/frr`), log em `/var/log/frr-<daemon>.log` (com o
@@ -632,7 +663,8 @@ UEFI no x86. Servidores atuais têm UEFI (e há fornecedores que já desligam o 
 ESP e o A/B por variável dele.
 
 **OVA:** `qemu-img` (VMDK streamOptimized, o único que uma OVA pode levar) + OVF e tar escritos
-em Rust (`corerouter-image ova`), datas fixas: o OVA é reprodutível.
+em Rust (`corerouter-image ova`), datas fixas. O OVA ainda não é reprodutível: o `qemu-img`
+põe um `CID` aleatório no descritor do VMDK (achado na G1.6k, gap G1.6l).
 
 ### Desempenho e paralelismo
 
@@ -677,6 +709,30 @@ outras sessões usando a máquina.
 | qcow2 e OVA: QEMU ligado → daemon pronto | 2,0–2,1 s |
 | `cargo xtask os install-test` (6 boots, 3 instalações) | 33,2 s |
 | Rebuild incremental da imagem (com o kernel do instalador) | 32–49 s |
+
+### FRR 10.3 → 10.7.1 (G1.6k)
+
+**Medidos** em 2026-10-28, AMD Ryzen AI Max+ 395, KVM, 2 vCPUs, 1 GiB; builds limpos do mesmo
+commit, um com o patch e outro sem, com outras sessões usando a máquina.
+
+| O quê | FRR 10.3 / libyang 2.1.148 | FRR 10.7.1 / libyang 3.13.6 |
+|---|---|---|
+| `rootfs.squashfs` | 21,4 MiB | **21,7 MiB** (+0,3) |
+| FRR + libyang no rootfs, descomprimido | 13,6 MiB | 14,2 MiB |
+| `corerouter.crpkg` / ISO / qcow2 / OVA | 40,7 / 98,4 / 41,1 / 40,9 MiB | 41,0 / 98,7 / 41,4 / 41,2 MiB |
+| RSS dos 8 daemons com OSPF+SR+LDP no ar (`frr-test`) | 85,7 MiB | **88,5 MiB** (+2,8; bgpd +0,9, zebra +0,5, mgmtd +0,5) |
+| `MemAvailable` nesse ponto (de 949 MiB) | 836,6 MiB | 834,7 MiB |
+| Kernel → os 8 sockets vty / → daemon pronto | 0,76 / 0,81 s | 0,75 / 0,80 s |
+| Vizinho OSPF `Full` / LDP `operational` depois da config | 1,9 / 11,9 s | 1,5 / 11,5 s (o `ldpd` espera 10 s fixos, RFC 5443) |
+| BFD `up` (peer explícito, 300 ms × 3) | não medido | já `up` na primeira leitura, depois do LDP |
+| `frr-test` inteiro | — | 25 s |
+| Build limpo da imagem, ccache e cargo quentes | — | 164 s (`--top-jobs 17`), 427 s sem `-j` de topo |
+
+**Reprodutível:** dois builds limpos com o patch (um com `--top-jobs 17`, outro sem `-j` de
+topo) deram o mesmo `bzImage`, `rootfs.squashfs`, `disk.img`, pacote e imagens de VM, e o mesmo
+`target/` arquivo por arquivo. Só o **OVA** saiu diferente, e não pelo FRR: o `qemu-img`
+(8.2) grava um `CID` aleatório no descritor do VMDK a cada conversão (dois `convert` do mesmo
+`disk.img` diferem no byte 549). Gap G1.6l.
 
 ### O que ficou de fora e por quê
 
