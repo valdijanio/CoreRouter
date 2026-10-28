@@ -243,11 +243,19 @@ pub fn build(cfg: &Config, live: &Live) -> Vec<Line> {
             ecmp: 1,
         });
     }
-    // Lease routes whose gateway fails check-gateway (G4.7c).
+    // Lease routes whose gateway fails check-gateway (G4.7c), and static
+    // ones (G1.27f).
     for (r, text) in &live.withheld {
         let check = live.checks.get(&r.id).cloned();
+        let origin = if is_dynamic(r.id) {
+            Origin::Dhcp
+        } else {
+            Origin::Static
+        };
+        // A static route's line is cached: its time is in `changed_secs`.
         let ago = check
             .as_ref()
+            .filter(|_| origin == Origin::Dhcp)
             .and_then(|c| Some(live.now_ms?.saturating_sub(c.down_since_ms?) / 1000));
         let method = check.as_ref().map_or("arp", |c| c.method);
         let gw = r.gateway.to_string();
@@ -269,12 +277,12 @@ pub fn build(cfg: &Config, live: &Live) -> Vec<Line> {
             dst: r.dst_address,
             table: r.routing_table.clone(),
             distance: r.distance,
-            origin: Origin::Dhcp,
+            origin,
             gateway: gw,
             gateway_address: r.gateway.address(),
             gateway_interface: r.gateway.iface().cloned(),
             via: None,
-            disabled: false,
+            disabled: r.disabled,
             why: Some(why),
             check,
             comment: r.comment.clone(),
@@ -503,6 +511,7 @@ impl Session {
         let key = CacheKey {
             generation: self.store().generation(),
             dynamic: self.dynamic_fingerprint(),
+            checked: self.static_checks_generation(),
             learned: live.learned.clone(),
             down: live.down.clone(),
             checks,
@@ -517,6 +526,8 @@ impl Session {
             return (Arc::clone(&c.lines), Arc::clone(&c.summary), c.generation);
         }
         let cfg = self.effective(&base).into_owned();
+        let mut live = live;
+        self.static_live(&base, &mut live);
         let lines = Arc::new(build(&cfg, &live));
         let summary = Arc::new(Summary::of(&lines));
         let Some(c) = self.ext_mut::<RouteCache>() else {
@@ -537,7 +548,7 @@ impl Session {
         for (id, r) in &self.dhcp.runners {
             id.hash(&mut h);
             format!("{:?}{:?}{:?}", r.addresses, r.routes, r.fallback).hash(&mut h);
-            (r.gw.down, r.gw.target).hash(&mut h);
+            (r.gw.health.down, r.gw.target).hash(&mut h);
         }
         for (id, r) in &self.dhcp6.runners {
             id.hash(&mut h);
@@ -550,9 +561,19 @@ impl Session {
     /// The effective `base` (with the DHCP routes) and its routes.
     pub(crate) fn route_lines_of(&mut self, base: &Config) -> (Config, Vec<Line>) {
         let cfg = self.effective(base).into_owned();
-        let live = self.route_live(&cfg);
+        let mut live = self.route_live(&cfg);
+        self.static_live(base, &mut live);
         let lines = build(&cfg, &live);
         (cfg, lines)
+    }
+
+    /// The static routes' checks (G1.27f): taken from `base` (the routes
+    /// a down gateway withholds are not in the effective config), only
+    /// when the lines are built — the cache key is their generation.
+    fn static_live(&self, base: &Config, live: &mut Live) {
+        let (checks, withheld) = self.static_route_checks(base);
+        live.checks.extend(checks);
+        live.withheld.extend(withheld);
     }
 }
 
@@ -709,6 +730,8 @@ impl RouteWatch {
 struct CacheKey {
     generation: u64,
     dynamic: u64,
+    /// The static routes' checks (G1.27f, [`crate::gateway_check`]).
+    checked: u64,
     learned: Vec<Learned>,
     down: Vec<IfName>,
     checks: Vec<(ItemId, RouteCheck)>,

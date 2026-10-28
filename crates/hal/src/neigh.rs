@@ -185,6 +185,21 @@ pub trait ArpPinger: Send {
         target: Ipv4Addr,
         timeout: Duration,
     ) -> Result<Option<ArpReply>, HalError>;
+
+    /// Batch use (check-gateway, G1.27f: one socket per interface checks
+    /// every gateway on it): send one request for `target` and return at
+    /// once. `Ok(false)`: this pinger cannot, use [`ArpPinger::ping`].
+    fn request(&mut self, src: Ipv4Addr, target: Ipv4Addr) -> Result<bool, HalError> {
+        let _ = (src, target);
+        Ok(false)
+    }
+
+    /// Batch use: the hosts (address, MAC) that answered since the last
+    /// call, without waiting.
+    fn replies(&mut self, out: &mut Vec<(Ipv4Addr, [u8; 6])>) -> Result<(), HalError> {
+        let _ = out;
+        Ok(())
+    }
 }
 
 /// The MAC as RouterOS prints it.

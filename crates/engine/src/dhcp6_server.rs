@@ -585,6 +585,8 @@ impl Session {
                 routing_table: RoutingTable::Main,
                 disabled: false,
                 comment: route_comment(&l.server),
+                check_gateway: Default::default(),
+                bfd_profile: String::new(),
             },
         );
         true

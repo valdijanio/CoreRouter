@@ -1,6 +1,7 @@
 //! /ip route — static routes, plus the connected routes derived from IP
 //! addresses in `ip.route.list` (flagged dynamic/connected, as in RouterOS).
 
+use corerouter_model::dhcp_client::CheckGateway;
 use corerouter_model::{
     Config, DEFAULT_DISTANCE, Gateway, ItemId, RouteEntry, RoutingTable, parse_destination,
 };
@@ -24,7 +25,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add Route",
         ["IP", "Routes"],
         None,
-        "{dst_address: cidr | ip (0.0.0.0/0, ::/0, 10.1.0.0/16, 192.0.2.7), gateway: ip | interface | ip%interface, distance?: u32 (1..=255, default 1), routing_table?: string (main | VRF name, default main), disabled?: bool, comment?: string} → {id}",
+        "{dst_address: cidr | ip (0.0.0.0/0, ::/0, 10.1.0.0/16, 192.0.2.7), gateway: ip | interface | ip%interface, distance?: u32 (1..=255, default 1), routing_table?: string (main | VRF name, default main), check_gateway?: none | ping | arp | bfd (default none; ping/arp every 10 s, down after 2 misses: the route leaves the kernel and the next distance wins), bfd_profile?: string (check_gateway=bfd; default 'default'), disabled?: bool, comment?: string} → {id}",
         always,
         add
     ),
@@ -33,7 +34,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set Route",
         [],
         None,
-        "{id: *hex, dst_address?: cidr | ip, gateway?: ip | interface | ip%interface, distance?: u32 (1..=255), routing_table?: string, disabled?: bool, comment?: string} → {id}",
+        "{id: *hex, dst_address?: cidr | ip, gateway?: ip | interface | ip%interface, distance?: u32 (1..=255), routing_table?: string, check_gateway?: none | ping | arp | bfd, bfd_profile?: string (check_gateway=bfd; empty: default), disabled?: bool, comment?: string} → {id}",
         has_routes,
         set
     ),
@@ -46,8 +47,14 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         has_routes,
         remove
     ),
+    cmd!(query "ip.route.check.list", "Gateway Checks", [], None,
+        "{} → [{gateway, method (arp | ping | bfd), routing_table, bfd_profile (bfd; null), routes (static routes sharing this check), status (checking | reachable | unreachable), misses, down_secs (null: up), hold_down_secs (null: no hold-down), flaps_15m}]",
+        always, check_list),
+    cmd!(query "ip.route.check.history", "Gateway Check History", [], None,
+        "{gateway?: ip} → [{time (Unix s; null: no clock), gateway, method, to (up | down), routes, message}]",
+        always, check_history),
     cmd!(query "ip.route.list", "Routes", ["IP", "Routes"], None,
-        "{routing_table?: string, family?: string (ipv4 | ipv6), state?: string (active | standby | inactive), origin?: string (connected | static | dhcp | ra)} → [{key (stable row key), id (null if connected), dst_address, family, gateway (as configured), gateway_address, gateway_interface, gateway_status (reachable | unreachable | incomplete: the gateway does not answer ARP/ND; null if connected), check_gateway (null | {method, interval_secs, misses, state (up | down)}), distance, routing_table, flags (X disabled, A active, D dynamic, C connected, S static, + ECMP), state (active | standby: a lower distance wins | inactive), active, static, connected, dynamic (from a DHCP lease, a Router Advertisement or connected), origin (connected | static | dhcp | ra), disabled, immediate_gw, interface, ecmp (paths of its ECMP group), reason (why standby or inactive), reason_id, reason_args, changed_at (Unix s it took its state; null: before watching), changed_secs, comment}]",
+        "{routing_table?: string, family?: string (ipv4 | ipv6), state?: string (active | standby | inactive), origin?: string (connected | static | dhcp | ra)} → [{key (stable row key), id (null if connected), dst_address, family, gateway (as configured), gateway_address, gateway_interface, gateway_status (reachable | unreachable | incomplete: the gateway does not answer ARP/ND; null if connected), check_gateway (null | {method (arp | ping | bfd), interval_secs (0: bfd), misses, state (up | down), status (checking | reachable | unreachable | not-checked), hold_down_secs (answers again, held for flapping; null), bfd_profile (bfd; null)}), distance, routing_table, flags (X disabled, A active, D dynamic, C connected, S static, + ECMP), state (active | standby: a lower distance wins | inactive), active, static, connected, dynamic (from a DHCP lease, a Router Advertisement or connected), origin (connected | static | dhcp | ra), disabled, immediate_gw, interface, ecmp (paths of its ECMP group), reason (why standby or inactive), reason_id, reason_args, changed_at (Unix s it took its state; null: before watching), changed_secs, comment}]",
         always, list),
 ];
 
@@ -95,6 +102,8 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
     let routing_table: RoutingTable = opt_parse(p, "routing_table")?.unwrap_or_default();
     let disabled = opt_bool(p, "disabled")?.unwrap_or(false);
     let comment = opt_text(p, "comment", 256)?.unwrap_or_default();
+    let check_gateway: CheckGateway = opt_parse(p, "check_gateway")?.unwrap_or_default();
+    let bfd_profile = opt_text(p, "bfd_profile", 48)?.unwrap_or_default();
 
     let cfg = s.store_mut().candidate_mut();
     if cfg.ip.routes.len() >= MAX_ROUTES {
@@ -112,6 +121,8 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
         routing_table,
         disabled,
         comment,
+        check_gateway,
+        bfd_profile,
     };
     check(cfg, &route)?;
     cfg.ip.routes.push(route);
@@ -155,6 +166,8 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     let table: Option<RoutingTable> = opt_parse(p, "routing_table")?;
     let disabled = opt_bool(p, "disabled")?;
     let comment = opt_text(p, "comment", 256)?;
+    let check_gateway: Option<CheckGateway> = opt_parse(p, "check_gateway")?;
+    let bfd_profile = opt_text(p, "bfd_profile", 48)?;
 
     let cfg = s.store_mut().candidate_mut();
     let (pos, id) = existing(cfg, p)?;
@@ -181,6 +194,16 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     }
     if let Some(c) = comment {
         route.comment = c;
+    }
+    if let Some(m) = check_gateway {
+        route.check_gateway = m;
+        // Leaving bfd drops its profile, unless one is given anyway.
+        if m != CheckGateway::Bfd && bfd_profile.is_none() {
+            route.bfd_profile.clear();
+        }
+    }
+    if let Some(b) = bfd_profile {
+        route.bfd_profile = b;
     }
     check(cfg, &route)?;
     if let Some(slot) = cfg.ip.routes.get_mut(pos) {
@@ -258,6 +281,9 @@ pub(crate) fn row(l: &Line, watch: Option<&RouteWatch>, now: Option<u64>) -> Val
             "interval_secs": c.interval_secs,
             "misses": c.misses,
             "state": if c.down { "down" } else { "up" },
+            "status": c.status,
+            "hold_down_secs": c.hold_secs,
+            "bfd_profile": c.profile,
         })
     });
     json!({
@@ -290,6 +316,15 @@ pub(crate) fn row(l: &Line, watch: Option<&RouteWatch>, now: Option<u64>) -> Val
         "changed_secs": changed_at.zip(now).map(|(at, now)| now.saturating_sub(at)),
         "comment": l.comment,
     })
+}
+
+fn check_list(s: &mut Session, _p: &Value) -> Result<Value> {
+    Ok(Value::Array(s.route_check_rows()))
+}
+
+fn check_history(s: &mut Session, p: &Value) -> Result<Value> {
+    let gateway: Option<std::net::IpAddr> = opt_parse(p, "gateway")?;
+    Ok(Value::Array(s.route_check_history(gateway)))
 }
 
 fn list(s: &mut Session, p: &Value) -> Result<Value> {

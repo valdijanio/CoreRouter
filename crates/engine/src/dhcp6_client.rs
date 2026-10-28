@@ -179,6 +179,8 @@ pub fn lease_entries(
             routing_table: ipv6::table_of(cfg, c),
             disabled: false,
             comment: String::new(),
+            check_gateway: Default::default(),
+            bfd_profile: String::new(),
         });
     }
     (addresses, routes)

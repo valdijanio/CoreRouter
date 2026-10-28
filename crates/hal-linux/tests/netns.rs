@@ -137,6 +137,8 @@ fn route<'a>(cfg: &'a mut Config, dst: &str, gw: &str) -> &'a mut RouteEntry {
         routing_table: RoutingTable::Main,
         disabled: false,
         comment: String::new(),
+        check_gateway: Default::default(),
+        bfd_profile: String::new(),
     });
     cfg.ip.routes.last_mut().unwrap()
 }

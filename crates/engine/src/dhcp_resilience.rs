@@ -9,7 +9,10 @@
 //! - **check-gateway**: `arp` / `ping` the lease's gateway every 10 s; after
 //!   2 unanswered checks its routes leave the data plane (shown inactive
 //!   in `ip.route.list`, so a route with a higher distance takes over) and
-//!   come back at the first answer — RouterOS' `check-gateway` rule.
+//!   come back at the first answer — RouterOS' `check-gateway` rule. The
+//!   state machine (and its hold-down for a flapping gateway) is the one
+//!   of static routes, [`crate::gateway_check::Health`]; the probe goes
+//!   out of the client's own socket.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
@@ -24,16 +27,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::Session;
 use crate::dhcp_client::{Runner, dyn_id};
+use crate::gateway_check::Health;
 
 /// Name of the remembered leases in [`crate::ConfigStorage::save_state`].
 pub const LEASES_STATE: &str = "dhcp-leases";
-/// RouterOS' `check-gateway`: one check every 10 s, the gateway is down
-/// after 2 unanswered ones and up again at the first answer.
-pub const CHECK_INTERVAL_MS: u64 = 10_000;
-pub const CHECK_MISSES: u32 = 2;
-/// How long one check waits for its answer (RouterOS' ping timeout is 1 s;
-/// a busy CPE answers ARP late, **estimado**).
-pub const CHECK_WAIT_MS: u64 = 2_000;
+pub use crate::gateway_check::{CHECK_INTERVAL_MS, CHECK_MISSES, CHECK_WAIT_MS};
 /// Index of the fallback address among the client's dynamic ids.
 const FALLBACK_N: usize = 0xFF;
 
@@ -81,14 +79,22 @@ fn from_hex(s: &str) -> Option<Vec<u8>> {
 /// The check-gateway of one route, as `ip.route.list` shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteCheck {
-    /// `arp` | `ping`.
+    /// `arp` | `ping` | `bfd`.
     pub method: &'static str,
+    /// 0 for `bfd` (its profile sets the timing).
     pub interval_secs: u64,
     /// Checks unanswered in a row.
     pub misses: u32,
     pub down: bool,
     /// Session clock (ms) when it went down.
     pub down_since_ms: Option<u64>,
+    /// `checking` | `reachable` | `unreachable` | `not-checked` (no
+    /// daemon runs the checks).
+    pub status: &'static str,
+    /// Hold-down left: the gateway answers again, the routes wait.
+    pub hold_secs: Option<u64>,
+    /// BFD profile of a `bfd` check.
+    pub profile: Option<String>,
 }
 
 /// The gateway check of one client.
@@ -98,11 +104,8 @@ pub(crate) struct GatewayCheck {
     pub target: Option<Ipv4Addr>,
     next_at: u64,
     sent_at: Option<u64>,
-    misses: u32,
-    /// Its routes are withheld.
-    pub down: bool,
-    /// Session clock (ms) when it went down (G1.27: "failed N s ago").
-    pub down_since: Option<u64>,
+    /// Misses, down and since when (G1.27: "failed N s ago").
+    pub health: Health,
     seq: u16,
     ping: Option<Box<dyn ProbeSocket>>,
 }
@@ -118,7 +121,7 @@ impl GatewayCheck {
 impl Runner {
     /// `ip.dhcp-client.list`'s `gateway_status`.
     pub fn gateway_status(&self) -> &'static str {
-        match (&self.gw.target, self.gw.down) {
+        match (&self.gw.target, self.gw.health.down) {
             (None, _) => "unchecked",
             (Some(_), false) => "up",
             (Some(_), true) => "down",
@@ -127,7 +130,7 @@ impl Runner {
 
     /// Whether `route` is one of this client's and waits for its gateway.
     pub fn withholds(&self, route: &RouteEntry) -> bool {
-        self.gw.down
+        self.gw.health.down
             && self.gw.target.is_some_and(|gw| {
                 route.gateway.address() == Some(IpAddr::V4(gw))
                     && self.routes.iter().any(|r| r.id == route.id)
@@ -351,7 +354,7 @@ impl Session {
             .then(|| gateway_of(&r.routes))
             .flatten();
         if target != r.gw.target {
-            let was_down = r.gw.down;
+            let was_down = r.gw.health.down;
             // The ARP slot is the DHCP probe's now if the client is probing.
             if r.gw.sent_at.is_some()
                 && r.cfg.check_gateway == CheckGateway::Arp
@@ -386,7 +389,7 @@ impl Session {
                     .and_then(|p| p.conflict().ok().flatten())
                     .is_some(),
                 CheckGateway::Ping => ping_answered(&mut r.gw, gw),
-                CheckGateway::None => true,
+                CheckGateway::None | CheckGateway::Bfd => true,
             };
             let timed_out = now.saturating_sub(sent) >= CHECK_WAIT_MS;
             if !answered && !timed_out {
@@ -399,26 +402,22 @@ impl Session {
             }
             r.gw.sent_at = None;
             if answered {
-                r.gw.misses = 0;
-                if r.gw.down {
-                    self.dhcp_change(id, |r| {
-                        r.gw.down = false;
-                        r.gw.down_since = None;
-                    });
+                let mut h = r.gw.health.clone();
+                if h.answered(now) {
+                    self.dhcp_change(id, |r| r.gw.health = h);
                     self.dhcp_note_id(
                         id,
                         "gateway",
                         format!("gateway {gw} answers again: its routes are back"),
                     );
+                } else {
+                    r.gw.health = h;
                 }
             } else {
-                r.gw.misses = r.gw.misses.saturating_add(1);
-                if r.gw.misses >= CHECK_MISSES && !r.gw.down {
+                let mut h = r.gw.health.clone();
+                if h.missed(now) {
                     let how = mode.as_str();
-                    self.dhcp_change(id, |r| {
-                        r.gw.down = true;
-                        r.gw.down_since = Some(now);
-                    });
+                    self.dhcp_change(id, |r| r.gw.health = h);
                     self.dhcp_note_id(
                         id,
                         "gateway",
@@ -426,6 +425,8 @@ impl Session {
                             "gateway {gw} did not answer {CHECK_MISSES} {how} checks: its routes are inactive"
                         ),
                     );
+                } else {
+                    r.gw.health = h;
                 }
             }
             return;
@@ -446,7 +447,7 @@ impl Session {
                 let device = r.cfg.interface.to_string();
                 ping_send(&mut r.gw, gw, src, device, prober)
             }
-            CheckGateway::None => Ok(()),
+            CheckGateway::None | CheckGateway::Bfd => Ok(()),
         };
         match sent {
             Ok(()) => {
@@ -467,6 +468,7 @@ impl Session {
     /// The check-gateway of every lease route that has one, by route id
     /// (G1.27: the Routes window shows it next to the gateway).
     pub(crate) fn dhcp_route_checks(&self) -> Vec<(ItemId, RouteCheck)> {
+        let now = self.dhcp.now_ms.unwrap_or(0);
         let mut out = Vec::new();
         for r in self.dhcp.runners.values() {
             let Some(gw) = r.gw.target else { continue };
@@ -480,9 +482,12 @@ impl Session {
                     RouteCheck {
                         method: r.cfg.check_gateway.as_str(),
                         interval_secs: CHECK_INTERVAL_MS / 1000,
-                        misses: r.gw.misses,
-                        down: r.gw.down,
-                        down_since_ms: r.gw.down_since,
+                        misses: r.gw.health.misses,
+                        down: r.gw.health.down,
+                        down_since_ms: r.gw.health.down_since,
+                        status: r.gw.health.status(),
+                        hold_secs: r.gw.health.hold_left_ms(now).map(|ms| ms.div_ceil(1000)),
+                        profile: None,
                     },
                 ));
             }
@@ -500,7 +505,7 @@ impl Session {
                 .dhcp_clients
                 .iter()
                 .any(|c| c.id == *id && !c.disabled && c.interface == r.cfg.interface);
-            if !live || !r.gw.down {
+            if !live || !r.gw.health.down {
                 continue;
             }
             for route in r.routes.iter().filter(|rt| r.withholds(rt)) {

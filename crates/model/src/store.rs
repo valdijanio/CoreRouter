@@ -319,6 +319,8 @@ mod tests {
             routing_table: crate::RoutingTable::Main,
             disabled: false,
             comment: String::new(),
+            check_gateway: Default::default(),
+            bfd_profile: String::new(),
         });
         st.commit("routes", None).unwrap();
         // Running, candidate and the new revision are one copy.
