@@ -77,7 +77,7 @@ fn ping_shows_each_reply_with_its_code_and_the_path() {
     assert_eq!(p.events.len(), 3, "{:?}", p.events);
     assert_eq!(p.summary["stats"]["received"], 3);
     assert!(p.events.iter().all(|e| e["detail"].as_str().unwrap().contains("egress for the FEC")));
-    for t in ["MPLS 1401", "→ 10.1.1.2 on ether1", "! ×3", "Return Code"] {
+    for t in ["MPLS 1401", "via 10.1.1.2 on ether1", "! 3", "Return Code"] {
         assert!(h.has_text(t), "{t}");
     }
 }

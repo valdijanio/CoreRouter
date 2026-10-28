@@ -39,6 +39,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"received"##, r##"recebidos"##),
     (r##"sent"##, r##"enviados"##),
     (r##"stopped"##, r##"parou"##),
+    (r##"via"##, r##"via"##),
 ];
 
 /// Explanations: (key, text).

@@ -185,7 +185,7 @@ pub(crate) fn trace_row(e: &Value) -> Row {
             s(e, "mtu"),
             labels_cell(&s(e, "out_label")),
             if local {
-                format!("→ {} ({})", s(e, "downstream"), s(e, "interface"))
+                format!("via {} ({})", s(e, "downstream"), s(e, "interface"))
             } else {
                 detail
             },
@@ -316,9 +316,9 @@ impl LspPingPanel {
                     self.field(ui, l, "count", "Count", "lsp_ping.count", 50.0);
                     self.field(ui, l, "interval", "Interval (ms)", "lsp_ping.interval", 50.0);
                     self.field(ui, l, "size", "Size", "lsp_ping.size", 45.0);
-                    self.field(ui, l, "ttl", "TTL", "lsp_ping.ttl", 35.0);
+                    self.field(ui, l, "ttl", "TTL", "lsp_ping.ttl", 45.0);
                 }
-                self.field(ui, l, "exp", "EXP", "lsp_ping.exp", 25.0);
+                self.field(ui, l, "exp", "EXP", "lsp_ping.exp", 30.0);
                 self.field(ui, l, "timeout", "Timeout (ms)", "lsp_ping.timeout", 50.0);
             });
             ui.separator();
@@ -366,7 +366,7 @@ impl LspPingPanel {
                     chip::chip(ui, &format!("MPLS {label}"), chip::BLUE.tone(&v));
                 }
             }
-            ui.label(format!("→ {} {} {}", s(&path, "nexthop"), tr_in(SCOPE, l, "on"), s(&path, "interface")));
+            ui.label(format!("{} {} {} {}", tr_in(SCOPE, l, "via"), s(&path, "nexthop"), tr_in(SCOPE, l, "on"), s(&path, "interface")));
             let src = s(&path, "src");
             if !src.is_empty() {
                 ui.weak(format!("{} {src}", tr_in(SCOPE, l, "from")));
@@ -419,7 +419,7 @@ impl LspPingPanel {
                 }
                 for c in self.summary.get("codes").and_then(Value::as_array).into_iter().flatten() {
                     let letter = s(c, "letter");
-                    chip::chip(ui, &format!("{letter} ×{}", s(c, "count")), letter_kind(&letter).tone(&v))
+                    chip::chip(ui, &format!("{letter} {}", s(c, "count")), letter_kind(&letter).tone(&v))
                         .on_hover_text(s(c, "meaning"));
                 }
             });
