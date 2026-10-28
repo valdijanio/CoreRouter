@@ -6213,3 +6213,20 @@ continuação indentadas).
     contra 0,96–1,18 s só com hellos. O tráfego de subida volta em 0,19 s com 1 mil sessões, 0,25 s com
     10 mil e 1,04 s com 100 mil. 0 sessões perdidas em todas as escalas (**medido**). Acima de ~10 mil, a adoção
     no caminho lento domina (100 mil levam ~0,75 s, com e sem BFD): gap abaixo.
+
+- 2026-10-28 — G3.4f: Segment Routing MPLS sobre OSPFv2 (RFC 8665, 8660, 8402): `routing.ospf.segment-routing.{set,unset,check,database}`
+  e `routing.ospf.prefix-sid.{add,set,remove,list,check}`, render para o `ospfd` na forma que ele
+  imprime, remoção na ordem que o FRR aceita (prefixos, `segment-routing on`, `router-info`,
+  `capability opaque`), bloco dinâmico do LDP movido para fora do SRGB/SRLB (24000–1048575 com os
+  padrões), leitura do banco SR (`show ip ospf database segment-routing json`) junto com a LSDB, fora
+  do lock, e a aba Routing › OSPF › Segment Routing (Este roteador, SIDs da rede, Roteadores SR,
+  conflitos). Detalhes em `docs/ospf.md`, seção "Segment Routing (G3.4f)".
+
+  Como testar: `corerouter-cli run routing.ospf.segment-routing.check '{}'` (prévia),
+  `routing.ospf.segment-routing.set '{}'` (liga e dá SID às loopbacks),
+  `routing.ospf.segment-routing.database`; na VM, `cargo xtask vm-lab run -- scripts/frr-sr-live.sh sr`.
+
+  FRR 10.7.1 na VM, **medido** em 2026-10-28: commit em 15,4 ms, banco SR completo 5,8 s depois,
+  ping pelo rótulo 16003, SRGB movido em 1,9 ms, SR desligado em 1,4 ms. Achados da VM: o `ospfd`
+  recusa `ip ospf network` na `lo` do kernel (o render deixou de escrever) e recusa prefix SID numa
+  interface dummy (vira a G3.4i).
