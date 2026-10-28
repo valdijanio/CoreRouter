@@ -1,0 +1,585 @@
+//! /routing bfd (G3.6): profiles, peers, the live sessions and the history
+//! of state changes. The daemon's `bfd` service runs the sessions
+//! (CoreRouter's own BFD, `corerouter_proto_bfd`) and publishes them in
+//! `ext::<BfdState>`; without the daemon (a GUI on the virtual lab) the
+//! sessions the config asks for are listed as `inactive`.
+
+use std::net::IpAddr;
+
+use corerouter_model::bfd::{
+    BfdAuth, BfdConfig, BfdKeyText, BfdPeer, BfdProfile, BfdState, FAST_WARN_MS, INTERVAL_MS, MAX_KEY, MAX_PEERS,
+    MAX_PROFILES, PROFILE_DEFAULT, PROFILE_FAST, builtin_profiles, wanted_sessions,
+};
+use serde_json::{Value, json};
+
+use super::args::{opt_bool, opt_str, opt_text, opt_u32, req_str};
+use super::{CommandSpec, always};
+use crate::{EngineError, Result, Session};
+
+pub(super) const COMMANDS: &[CommandSpec] = &[
+    cmd!("routing.bfd.profile.add", "Add BFD Profile", ["Routing", "BFD"], None,
+        "{name: string, min_tx?: u32 (ms, 10..=60000, default 300), min_rx?: u32 (ms, 10..=60000, default 300), multiplier?: u8 (1..=255, default 3), passive?: bool, dampening?: bool (default yes), half_life?: u32 (s, 1..=3600), suppress?: u32 (1..=20000), reuse?: u32 (1..suppress), max_suppress?: u32 (s, 1..=3600), auth?: none | keyed-sha1 | meticulous-keyed-sha1, auth_key_id?: u8, auth_secret?: string (1..=20 bytes), min_ttl?: u8 (multihop, 1..=255), comment?: string} → {name, detect_ms, warning?}",
+        always, profile_add),
+    cmd!("routing.bfd.profile.set", "Set BFD Profile", [], None,
+        "{id: string (the name; default and fast are built in), min_tx?: u32 (ms, 10..=60000), min_rx?: u32 (ms, 10..=60000), multiplier?: u8 (1..=255), passive?: bool, dampening?: bool, half_life?: u32 (s, 1..=3600), suppress?: u32 (1..=20000), reuse?: u32 (1..suppress), max_suppress?: u32 (s, 1..=3600), auth?: none | keyed-sha1 | meticulous-keyed-sha1, auth_key_id?: u8, auth_secret?: string (1..=20 bytes), min_ttl?: u8 (multihop, 1..=255), comment?: string} → {name, detect_ms, warning?}",
+        always, profile_set),
+    cmd!("routing.bfd.profile.remove", "Remove BFD Profile", [], None,
+        "{id: string (the name; a built-in goes back to its defaults)} → {name, reset}",
+        always, profile_remove),
+    cmd!(query "routing.bfd.profile.list", "BFD Profiles", ["Routing", "BFD"], None,
+        "{} → [{id, name, builtin, default, min_tx, min_rx, multiplier, detect_ms, passive, dampening, half_life, suppress, reuse, max_suppress, auth, auth_key_id, auth_secret (*** when set), min_ttl, comment, used_by: [string]}]",
+        always, profile_list),
+    cmd!("routing.bfd.peer.add", "Add BFD Peer", ["Routing", "BFD"], None,
+        "{address: ip, name?: string (default: the address), local_address?: ip, interface?: string, multihop?: bool, profile?: string (default \"default\"), disabled?: bool, comment?: string} → {name}",
+        always, peer_add),
+    cmd!("routing.bfd.peer.set", "Set BFD Peer", [], None,
+        "{id: string (the name), address?: ip, local_address?: ip | null, interface?: string | null, multihop?: bool, profile?: string, disabled?: bool, comment?: string} → {name}",
+        has_peers, peer_set),
+    cmd!("routing.bfd.peer.remove", "Remove BFD Peer", [], None,
+        "{id: string (the name)} → {name}",
+        has_peers, peer_remove),
+    cmd!(query "routing.bfd.peer.list", "BFD Peers", ["Routing", "BFD"], None,
+        "{} → [{id, name, address, local_address?, interface?, multihop, profile, disabled, comment, state}]",
+        always, peer_list),
+    cmd!(query "routing.bfd.session.list", "BFD Sessions", ["Routing", "BFD"], None,
+        "{} → {running, steering, error?, threads: [{index, sessions, cpu_percent, packets_in, packets_out, forwarded}], sessions: [{peer, local?, multihop, users, profile, state: up | down | init | admin-down | inactive, remote_state, diag, dampened, penalty, local_discr, remote_discr, tx_interval_us, remote_min_rx_us, remote_desired_tx_us, multiplier, remote_multiplier, detect_time_us, packets_tx, packets_rx, dropped, state_changes, flaps_24h, last_change?, tx_jitter_p99_us?, rx_gap_p99_us?, thread}]}",
+        always, session_list),
+    cmd!(query "routing.bfd.history.list", "BFD History", ["Routing", "BFD"], None,
+        "{peer?: ip, limit?: u32 (default 200)} → [{at_ms, peer, multihop, from, to, diag, users, detect_time_us, dampened}] (newest first)",
+        always, history_list),
+];
+
+fn has_peers(s: &Session) -> std::result::Result<(), String> {
+    if s.store().candidate().routing.bfd.peers.is_empty() {
+        Err("there are no BFD peers (routing.bfd.peer.add)".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn cut(s: &str) -> String {
+    crate::logging::cut(s, 64).to_string()
+}
+
+fn check_name(key: &str, name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(EngineError::bad(key, "1..=64 characters of [A-Za-z0-9_.:-]"));
+    }
+    Ok(())
+}
+
+fn ranged(p: &Value, key: &str, lo: u32, hi: u32, what: &str) -> Result<Option<u32>> {
+    match opt_u32(p, key)? {
+        Some(v) if !(lo..=hi).contains(&v) => Err(EngineError::bad(key, format!("must be {lo}..={hi} {what}"))),
+        v => Ok(v),
+    }
+}
+
+fn apply_profile(prof: &mut BfdProfile, p: &Value) -> Result<()> {
+    let (lo, hi) = INTERVAL_MS;
+    let why = "ms (RFC 7419 common intervals: 10, 20, 50, 100, 1000)";
+    if let Some(v) = ranged(p, "min_tx", lo, hi, why)? {
+        prof.min_tx = v;
+    }
+    if let Some(v) = ranged(p, "min_rx", lo, hi, why)? {
+        prof.min_rx = v;
+    }
+    if let Some(v) = ranged(p, "multiplier", 1, 255, "(RFC 5880 §4.1: Detect Mult is never 0)")? {
+        prof.multiplier = v as u8;
+    }
+    if let Some(v) = opt_bool(p, "passive")? {
+        prof.passive = v;
+    }
+    let d = &mut prof.dampening;
+    if let Some(v) = opt_bool(p, "dampening")? {
+        d.enabled = v;
+    }
+    if let Some(v) = ranged(p, "half_life", 1, 3600, "seconds")? {
+        d.half_life = v;
+    }
+    if let Some(v) = ranged(p, "suppress", 1, 20_000, "(1000 per flap)")? {
+        d.suppress = v;
+    }
+    if let Some(v) = ranged(p, "reuse", 1, 20_000, "(1000 per flap)")? {
+        d.reuse = v;
+    }
+    if let Some(v) = ranged(p, "max_suppress", 1, 3600, "seconds")? {
+        d.max_suppress = v;
+    }
+    if d.reuse >= d.suppress {
+        return Err(EngineError::bad(
+            "reuse",
+            format!("must be below suppress ({}), or the session would never be released", d.suppress),
+        ));
+    }
+    if let Some(a) = opt_str(p, "auth")? {
+        prof.auth = BfdAuth::parse(a).ok_or_else(|| {
+            EngineError::bad("auth", format!("{:?}: use none, keyed-sha1 or meticulous-keyed-sha1", cut(a)))
+        })?;
+    }
+    if let Some(v) = ranged(p, "auth_key_id", 0, 255, "")? {
+        prof.auth_key_id = v as u8;
+    }
+    if let Some(k) = opt_str(p, "auth_secret")? {
+        if k.len() > MAX_KEY {
+            return Err(EngineError::bad("auth_secret", format!("at most {MAX_KEY} bytes (RFC 5880 §4.4)")));
+        }
+        prof.auth_secret = BfdKeyText(k.to_owned());
+    }
+    if prof.auth != BfdAuth::None && prof.auth_secret.is_empty() {
+        return Err(EngineError::bad("auth_secret", "is required with auth (1..=20 bytes, the same on both sides)"));
+    }
+    if let Some(v) = ranged(p, "min_ttl", 1, 255, "")? {
+        prof.min_ttl = v as u8;
+    }
+    if let Some(c) = opt_text(p, "comment", 256)? {
+        prof.comment = c;
+    }
+    Ok(())
+}
+
+fn profile_answer(prof: &BfdProfile) -> Value {
+    let fastest = prof.min_tx.min(prof.min_rx);
+    let warning = (fastest < FAST_WARN_MS).then(|| {
+        format!(
+            "{fastest} ms: each session sends {} packets/s each way; fine for tens of sessions per core, \
+             measure before using it on hundreds (routing.bfd.session.list shows CPU per thread)",
+            1000 / fastest.max(1)
+        )
+    });
+    json!({"name": prof.name, "detect_ms": prof.detect_ms(), "warning": warning})
+}
+
+fn profile_add(s: &mut Session, p: &Value) -> Result<Value> {
+    let name = req_str(p, "name")?;
+    check_name("name", name)?;
+    let bfd = &mut s.store_mut().candidate_mut().routing.bfd;
+    if bfd.profile(name).is_some() {
+        return Err(EngineError::bad("name", format!("profile {:?} already exists (routing.bfd.profile.set)", cut(name))));
+    }
+    if bfd.profiles.len() >= MAX_PROFILES {
+        return Err(EngineError::bad("name", format!("at most {MAX_PROFILES} profiles")));
+    }
+    let mut prof = BfdProfile::new(name, 300, 3);
+    apply_profile(&mut prof, p)?;
+    let out = profile_answer(&prof);
+    bfd.profiles.insert(name.to_owned(), prof);
+    Ok(out)
+}
+
+fn profile_set(s: &mut Session, p: &Value) -> Result<Value> {
+    let id = req_str(p, "id")?;
+    let bfd = &mut s.store_mut().candidate_mut().routing.bfd;
+    let mut prof = bfd
+        .profile(id)
+        .ok_or_else(|| EngineError::bad("id", format!("no BFD profile {:?}", cut(id))))?;
+    apply_profile(&mut prof, p)?;
+    let out = profile_answer(&prof);
+    bfd.profiles.insert(id.to_owned(), prof);
+    Ok(out)
+}
+
+fn users_of(bfd: &BfdConfig, profile: &str) -> Vec<String> {
+    bfd.peers
+        .values()
+        .filter(|x| x.profile == profile)
+        .map(|x| format!("peer {}", x.name))
+        .collect()
+}
+
+fn profile_remove(s: &mut Session, p: &Value) -> Result<Value> {
+    let id = req_str(p, "id")?;
+    let bfd = &mut s.store_mut().candidate_mut().routing.bfd;
+    let builtin = id == PROFILE_DEFAULT || id == PROFILE_FAST;
+    if !builtin {
+        let users = users_of(bfd, id);
+        if !users.is_empty() {
+            return Err(EngineError::bad(
+                "id",
+                format!("profile {:?} is used by {}; move them to another profile first", cut(id), users.join(", ")),
+            ));
+        }
+    }
+    if bfd.profiles.remove(id).is_none() && !builtin {
+        return Err(EngineError::bad("id", format!("no BFD profile {:?}", cut(id))));
+    }
+    Ok(json!({"name": id, "reset": builtin}))
+}
+
+fn profile_list(s: &mut Session, _: &Value) -> Result<Value> {
+    let bfd = &s.store().candidate().routing.bfd;
+    let builtins = builtin_profiles();
+    let rows = bfd
+        .all_profiles()
+        .into_iter()
+        .map(|prof| {
+            let builtin = builtins.iter().any(|b| b.name == prof.name);
+            let d = prof.dampening;
+            json!({
+                "id": prof.name,
+                "name": prof.name,
+                "builtin": builtin,
+                // `/export`: present in every config, exported as `set`.
+                "default": builtin,
+                "min_tx": prof.min_tx,
+                "min_rx": prof.min_rx,
+                "multiplier": prof.multiplier,
+                "detect_ms": prof.detect_ms(),
+                "passive": prof.passive,
+                "dampening": d.enabled,
+                "half_life": d.half_life,
+                "suppress": d.suppress,
+                "reuse": d.reuse,
+                "max_suppress": d.max_suppress,
+                "auth": prof.auth.name(),
+                "auth_key_id": prof.auth_key_id,
+                "auth_secret": if prof.auth_secret.is_empty() { "" } else { "***" },
+                "min_ttl": prof.min_ttl,
+                "comment": prof.comment,
+                "used_by": users_of(bfd, &prof.name),
+            })
+        })
+        .collect();
+    Ok(Value::Array(rows))
+}
+
+fn ip(p: &Value, key: &str) -> Result<Option<IpAddr>> {
+    match opt_str(p, key)? {
+        Some(a) => a
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|_| EngineError::bad(key, format!("{:?} is not an IP address", cut(a)))),
+        None => Ok(None),
+    }
+}
+
+fn apply_peer(bfd: &mut BfdConfig, p: &Value, id: Option<&str>) -> Result<String> {
+    let mut peer = match id {
+        Some(id) => bfd
+            .peers
+            .get(id)
+            .cloned()
+            .ok_or_else(|| EngineError::bad("id", format!("no BFD peer {:?}", cut(id))))?,
+        None => {
+            let address = ip(p, "address")?.ok_or_else(|| EngineError::bad("address", "is required"))?;
+            BfdPeer {
+                name: address.to_string(),
+                address,
+                local_address: None,
+                interface: None,
+                multihop: false,
+                profile: PROFILE_DEFAULT.to_owned(),
+                disabled: false,
+                comment: String::new(),
+            }
+        }
+    };
+    if let Some(a) = ip(p, "address")? {
+        peer.address = a;
+    }
+    if id.is_none() && p.get("name").is_none() {
+        peer.name = peer.address.to_string();
+    }
+    if let Some(n) = opt_str(p, "name")? {
+        check_name("name", n)?;
+        peer.name = n.to_owned();
+    }
+    if p.get("local_address").is_some() {
+        peer.local_address = ip(p, "local_address")?;
+    }
+    if let Some(l) = peer.local_address
+        && l.is_ipv4() != peer.address.is_ipv4()
+    {
+        return Err(EngineError::bad("local_address", "must be the same family as address"));
+    }
+    if p.get("interface").is_some() {
+        peer.interface = opt_str(p, "interface")?.map(str::to_owned);
+        if let Some(i) = &peer.interface {
+            check_name("interface", i)?;
+        }
+    }
+    if let Some(m) = opt_bool(p, "multihop")? {
+        peer.multihop = m;
+    }
+    if peer.multihop && peer.interface.is_some() {
+        return Err(EngineError::bad("interface", "a multihop session is not tied to an interface (RFC 5883)"));
+    }
+    if let Some(pr) = opt_str(p, "profile")? {
+        if bfd.profile(pr).is_none() {
+            return Err(EngineError::bad("profile", format!("no BFD profile {:?} (routing.bfd.profile.add)", cut(pr))));
+        }
+        peer.profile = pr.to_owned();
+    }
+    if let Some(d) = opt_bool(p, "disabled")? {
+        peer.disabled = d;
+    }
+    if let Some(c) = opt_text(p, "comment", 256)? {
+        peer.comment = c;
+    }
+    let name = peer.name.clone();
+    if id != Some(name.as_str()) && bfd.peers.contains_key(&name) {
+        return Err(EngineError::bad("name", format!("peer {:?} already exists", cut(&name))));
+    }
+    if let Some(other) = bfd.peers.values().find(|o| {
+        Some(o.name.as_str()) != id
+            && o.name != name
+            && o.address == peer.address
+            && o.multihop == peer.multihop
+            && o.local_address == peer.local_address
+            && o.profile != peer.profile
+    }) {
+        return Err(EngineError::bad(
+            "profile",
+            format!(
+                "peer {:?} is the same session ({}) with profile {:?}; one session has one profile",
+                cut(&other.name),
+                peer.address,
+                other.profile
+            ),
+        ));
+    }
+    if id.is_none() && bfd.peers.len() >= MAX_PEERS {
+        return Err(EngineError::bad("address", format!("at most {MAX_PEERS} BFD peers")));
+    }
+    if let Some(old) = id.filter(|old| *old != name) {
+        bfd.peers.remove(old);
+    }
+    bfd.peers.insert(name.clone(), peer);
+    Ok(name)
+}
+
+fn peer_add(s: &mut Session, p: &Value) -> Result<Value> {
+    let name = apply_peer(&mut s.store_mut().candidate_mut().routing.bfd, p, None)?;
+    Ok(json!({"name": name}))
+}
+
+fn peer_set(s: &mut Session, p: &Value) -> Result<Value> {
+    let id = req_str(p, "id")?.to_owned();
+    let name = apply_peer(&mut s.store_mut().candidate_mut().routing.bfd, p, Some(&id))?;
+    Ok(json!({"name": name}))
+}
+
+fn peer_remove(s: &mut Session, p: &Value) -> Result<Value> {
+    let id = req_str(p, "id")?;
+    if s.store_mut().candidate_mut().routing.bfd.peers.remove(id).is_none() {
+        return Err(EngineError::bad("id", format!("no BFD peer {:?}", cut(id))));
+    }
+    Ok(json!({"name": id}))
+}
+
+fn live_state(st: Option<&BfdState>, peer: IpAddr, multihop: bool) -> String {
+    st.and_then(|st| {
+        st.sessions
+            .iter()
+            .find(|x| x.peer == Some(peer) && x.multihop == multihop)
+            .map(|x| if x.dampened { "dampened".to_owned() } else { x.state.clone() })
+    })
+    .unwrap_or_else(|| "inactive".to_owned())
+}
+
+fn peer_list(s: &mut Session, _: &Value) -> Result<Value> {
+    let st = s.ext::<BfdState>();
+    let rows = s
+        .store()
+        .candidate()
+        .routing
+        .bfd
+        .peers
+        .values()
+        .map(|x| {
+            let mut v = serde_json::to_value(x).unwrap_or_else(|_| json!({}));
+            if let Some(o) = v.as_object_mut() {
+                o.insert("id".into(), json!(x.name));
+                let state = if x.disabled { "disabled".to_owned() } else { live_state(st, x.address, x.multihop) };
+                o.insert("state".into(), json!(state));
+            }
+            v
+        })
+        .collect();
+    Ok(Value::Array(rows))
+}
+
+fn session_list(s: &mut Session, _: &Value) -> Result<Value> {
+    let st = s.ext::<BfdState>().cloned().unwrap_or_default();
+    let mut sessions: Vec<Value> = st
+        .sessions
+        .iter()
+        .map(|x| serde_json::to_value(x).unwrap_or_else(|_| json!({})))
+        .collect();
+    // What the running config asks for and the service does not run (yet).
+    for (k, (prof, users)) in wanted_sessions(&s.store().running().routing.bfd) {
+        if st.sessions.iter().any(|x| x.peer == Some(k.peer) && x.multihop == k.multihop && x.local == k.local) {
+            continue;
+        }
+        sessions.push(json!({
+            "peer": k.peer, "local": k.local, "multihop": k.multihop, "users": users,
+            "profile": prof.name, "state": "inactive", "remote_state": "down", "diag": "none",
+            "dampened": false, "multiplier": prof.multiplier,
+            "detect_time_us": prof.detect_ms() * 1000,
+        }));
+    }
+    let mut out = json!({
+        "running": st.running,
+        "steering": st.steering,
+        "threads": st.threads,
+        "sessions": sessions,
+    });
+    if let (Some(e), Some(o)) = (st.error, out.as_object_mut()) {
+        o.insert("error".into(), json!(e));
+    }
+    Ok(out)
+}
+
+fn history_list(s: &mut Session, p: &Value) -> Result<Value> {
+    let peer = ip(p, "peer")?;
+    let limit = opt_u32(p, "limit")?.unwrap_or(200) as usize;
+    let Some(st) = s.ext::<BfdState>() else {
+        return Ok(json!([]));
+    };
+    let rows: Vec<Value> = st
+        .history
+        .iter()
+        .rev()
+        .filter(|e| peer.is_none_or(|a| e.peer == a))
+        .take(limit)
+        .map(|e| serde_json::to_value(e).unwrap_or_else(|_| json!({})))
+        .collect();
+    Ok(Value::Array(rows))
+}
+
+#[cfg(test)]
+mod tests {
+    use corerouter_model::bfd::{BfdEvent, BfdSessionStatus};
+
+    use super::*;
+
+    fn session() -> Session {
+        Session::virtual_lab()
+    }
+
+    #[test]
+    fn builtin_profiles_are_listed_and_reset() {
+        let mut s = session();
+        let l = s.execute("routing.bfd.profile.list", &json!({})).unwrap();
+        assert_eq!(l[0]["name"], "default");
+        assert_eq!(l[0]["detect_ms"], 900);
+        assert_eq!(l[1]["name"], "fast");
+        assert_eq!(l[1]["builtin"], true);
+        let r = s.execute("routing.bfd.profile.set", &json!({"id": "fast", "min_tx": 20, "min_rx": 20})).unwrap();
+        assert!(r["warning"].as_str().unwrap().contains("50 packets/s"));
+        assert_eq!(s.store().candidate().routing.bfd.profile("fast").unwrap().min_tx, 20);
+        let r = s.execute("routing.bfd.profile.remove", &json!({"id": "fast"})).unwrap();
+        assert_eq!(r["reset"], true);
+        assert_eq!(s.store().candidate().routing.bfd.profile("fast").unwrap().min_tx, 50);
+    }
+
+    #[test]
+    fn profile_validation() {
+        let mut s = session();
+        for bad in [
+            json!({"name": "x", "min_tx": 5}),
+            json!({"name": "x", "multiplier": 0}),
+            json!({"name": "x", "auth": "md5"}),
+            json!({"name": "x", "auth": "keyed-sha1"}),
+            json!({"name": "x", "auth": "keyed-sha1", "auth_secret": "012345678901234567890"}),
+            json!({"name": "x", "reuse": 3000}),
+            json!({"name": "bad name"}),
+            json!({"name": "default"}),
+        ] {
+            let e = s.execute("routing.bfd.profile.add", &bad).unwrap_err();
+            assert!(matches!(e, EngineError::BadParam { .. }), "{bad}: {e}");
+        }
+        assert!(s.store().candidate().routing.bfd.profiles.is_empty());
+        let r = s
+            .execute("routing.bfd.profile.add", &json!({"name": "wan", "min_tx": 500, "multiplier": 5, "auth": "meticulous-keyed-sha1", "auth_secret": "k3y"}))
+            .unwrap();
+        assert_eq!(r["detect_ms"], 2500);
+        assert!(r["warning"].is_null());
+        let l = s.execute("routing.bfd.profile.list", &json!({})).unwrap();
+        assert_eq!(l[2]["auth_secret"], "***");
+    }
+
+    #[test]
+    fn peers_and_inactive_sessions() {
+        let mut s = session();
+        s.execute("routing.bfd.peer.add", &json!({"address": "192.0.2.2", "profile": "fast"})).unwrap();
+        s.execute("routing.bfd.peer.add", &json!({"name": "mh", "address": "198.51.100.9", "multihop": true})).unwrap();
+        // One session, one profile.
+        let e = s
+            .execute("routing.bfd.peer.add", &json!({"name": "dup", "address": "192.0.2.2", "profile": "default"}))
+            .unwrap_err();
+        assert!(e.to_string().contains("one session has one profile"), "{e}");
+        let e = s.execute("routing.bfd.peer.add", &json!({"address": "192.0.2.3", "profile": "nope"})).unwrap_err();
+        assert!(e.to_string().contains("no BFD profile"));
+        let e = s
+            .execute("routing.bfd.peer.add", &json!({"address": "192.0.2.4", "multihop": true, "interface": "ether1"}))
+            .unwrap_err();
+        assert!(e.to_string().contains("multihop"));
+        // A profile in use cannot go.
+        s.execute("routing.bfd.profile.add", &json!({"name": "wan"})).unwrap();
+        s.execute("routing.bfd.peer.set", &json!({"id": "mh", "profile": "wan"})).unwrap();
+        let e = s.execute("routing.bfd.profile.remove", &json!({"id": "wan"})).unwrap_err();
+        assert!(e.to_string().contains("peer mh"));
+        let l = s.execute("routing.bfd.peer.list", &json!({})).unwrap();
+        assert_eq!(l[0]["name"], "192.0.2.2");
+        assert_eq!(l[0]["state"], "inactive");
+        // Immediate mode: running = candidate.
+        let sl = s.execute("routing.bfd.session.list", &json!({})).unwrap();
+        assert_eq!(sl["running"], false);
+        assert_eq!(sl["sessions"].as_array().unwrap().len(), 2);
+        assert_eq!(sl["sessions"][0]["state"], "inactive");
+        s.execute("routing.bfd.peer.remove", &json!({"id": "mh"})).unwrap();
+        s.execute("routing.bfd.profile.remove", &json!({"id": "wan"})).unwrap();
+    }
+
+    #[test]
+    fn live_state_and_history_from_the_service() {
+        let mut s = session();
+        s.execute("routing.bfd.peer.add", &json!({"address": "192.0.2.2"})).unwrap();
+        let peer: IpAddr = "192.0.2.2".parse().unwrap();
+        if let Some(st) = s.ext_mut::<BfdState>() {
+            st.running = true;
+            st.sessions.push(BfdSessionStatus {
+                peer: Some(peer),
+                state: "up".into(),
+                dampened: true,
+                ..BfdSessionStatus::default()
+            });
+            for i in 0..3 {
+                st.history.push_back(BfdEvent {
+                    at_ms: i,
+                    peer,
+                    multihop: false,
+                    from: "up".into(),
+                    to: "down".into(),
+                    diag: "control-detection-time-expired".into(),
+                    users: vec![],
+                    detect_time_us: 900_000,
+                    dampened: false,
+                });
+            }
+        }
+        let l = s.execute("routing.bfd.peer.list", &json!({})).unwrap();
+        assert_eq!(l[0]["state"], "dampened");
+        let sl = s.execute("routing.bfd.session.list", &json!({})).unwrap();
+        assert_eq!(sl["sessions"].as_array().unwrap().len(), 1);
+        let h = s.execute("routing.bfd.history.list", &json!({"limit": 2})).unwrap();
+        assert_eq!(h.as_array().unwrap().len(), 2);
+        assert_eq!(h[0]["at_ms"], 2);
+    }
+
+    #[test]
+    fn rollback_drops_the_peer() {
+        let mut s = session();
+        s.execute("config.mode.set", &json!({"mode": "transactional"})).unwrap();
+        s.execute("routing.bfd.peer.add", &json!({"address": "192.0.2.2"})).unwrap();
+        s.execute("config.discard", &json!({})).unwrap();
+        assert!(s.store().candidate().routing.bfd.peers.is_empty());
+    }
+}

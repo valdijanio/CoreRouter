@@ -2002,3 +2002,47 @@ só para leitura, sem lock; o padrão usa até 8 (abaixo de 20 000 rotas, uma).
 | Diff com uma regra mudada (hal-frr) | | 14,6 ms (serial: custo pequeno) |
 
 FRR 10.7.1 real (VM do laboratório, debug): mudar uma regra digita 14 linhas em 2,7 ms.
+
+### G3.4a — configuração OSPF (**medido**, 2026-10-27, 32 núcleos, build de bench)
+
+`cargo bench -p corerouter-proto-ospf --bench ospf_config`, 4 000 interfaces, 4 000 endereços,
+1 000 templates (900 por nome, 100 por rede):
+
+| Medida | Antes (cada interface × cada template) | Depois (índice por nome) |
+|---|---|---|
+| `bindings` | 145,7 ms | 10,9 ms |
+| render FRR | 148,1 ms | 12,7 ms |
+| impacto do commit | 284,8 ms | 32,8 ms |
+| validação | 0,30 ms | 0,31 ms |
+
+### G3.4b — LSDB e layout da topologia (**medido**, 2026-10-27, 32 núcleos, build de bench)
+
+| Medida | Resultado |
+|---|---|
+| LSDB de 10 000 LSAs (4,0 MiB de JSON) lida em fluxo | 9,1 ms, 612 KiB |
+| a mesma como `serde_json::Value` | 17,0 ms, +34 MiB de RSS |
+| layout de 500 roteadores, 1 / 4 / 16 threads | 66,8 / 27,1 / 29,1 ms |
+
+`cargo bench -p corerouter-hal-frr --bench frr_ospf`, `cargo bench -p corerouter-proto-ospf
+--bench ospf_topology`.
+
+### BFD: motor próprio (G3.6a, 2026-10-27)
+
+AMD Ryzen AI MAX+ 395, build release, dois motores no loopback de um namespace, 50 ms × 3, 15 s por caso (`service/bfd/tests.rs`, `load`), **medido**:
+
+| sessions | threads | CPU %/thread avg | CPU %/thread max | tx jitter p99 worst (µs) | tx jitter p99 median (µs) | rx gap p99 worst (µs) | false downs | handed over |
+|---|---|---|---|---|---|---|---|---|
+| 100 | 1 | 1.6 | 8.0 | 87 | 69 | 50708 | 0 | 0 |
+| 100 | 2 | 0.9 | 4.0 | 3081 | 1578 | 56052 | 0 | 26 |
+| 100 | 4 | 0.4 | 4.0 | 87 | 69 | 51384 | 0 | 48 |
+| 100 | 8 | 0.5 | 4.0 | 136 | 69 | 50073 | 0 | 76 |
+| 500 | 1 | 5.9 | 8.0 | 265 | 69 | 50712 | 0 | 0 |
+| 500 | 2 | 4.5 | 12.0 | 1578 | 108 | 54477 | 0 | 199 |
+| 500 | 4 | 3.5 | 8.0 | 4815 | 1972 | 56052 | 0 | 318 |
+| 500 | 8 | 1.7 | 8.0 | 108 | 69 | 51647 | 0 | 351 |
+| 1000 | 1 | 10.1 | 16.0 | 517 | 69 | 53205 | 0 | 0 |
+| 1000 | 2 | 6.9 | 12.0 | 1262 | 108 | 54480 | 0 | 506 |
+| 1000 | 4 | 4.4 | 8.0 | 136 | 69 | 52314 | 0 | 619 |
+| 1000 | 8 | 2.9 | 8.0 | 6019 | 1972 | 56052 | 0 | 729 |
+
+Com `poll` em ms (antes do `ppoll`): jitter p99 mediano 1 050 µs em todos os casos, CPU de 1000 sessões numa thread 5,6 %. `proto-bfd` (criterion): decode 6,7 ns, SHA1 assinar 43 ns, conferir 39 ns, receber 5,5 ns; 1 s de 1000 sessões no timer wheel 0,30 ms.

@@ -1209,6 +1209,24 @@ total oferecida em pacotes de 128 B, `shaper_root::perf_edt_vs_htb`):
   do assinante, o caminho é a qdisc em BPF (`struct_ops`, kernel 6.16+), não o HTB.
 - **Revisar** com placa real (G4.3cb) e quando a qdisc BPF estiver nos kernels das distribuições.
 
+### BFD próprio em Rust puro (G3.6)
+
+**Decisão (do usuário, 2026-10-27): o BFD é nosso (`crates/proto-bfd` + serviço `bfd` do
+daemon), não o `bfdd` do FRR.** O FRR continua com BGP, OSPF e LDP; a ligação (G3.6b) será
+pelo *distributed data plane* do `bfdd` (`--dplaneaddr`, protocolo `bfddp`), com o nosso motor no
+papel do data plane, ou, se ele não servir, derrubando o vizinho pelo vty.
+
+- **Por que Rust puro aqui** (a regra geral de "Desempenho e escolha de implementação"): BFD é
+  um protocolo pequeno e fechado (RFC 5880/5881/5883), a parte cara é o relógio e o caminho do
+  pacote, e o nosso motor ganha o que o `bfdd` não tem (multithread, jitter e folga por sessão,
+  dampening, histórico, comandos e Safe Mode).
+- **Divisão em N threads:** sessão por `discriminador mod N`; socket por thread no grupo
+  `SO_REUSEPORT` com cBPF que lê o Your Discriminator; timer wheel por thread; nada de lock no
+  caminho do pacote. Uma thread leva 1000 sessões a 50 ms × 3 com ~10 % de um núcleo e jitter
+  p99 de 69 µs (**medido**, `docs/bfd.md`); o padrão é uma thread por 500 sessões, até 4.
+- **Revisar** com a comparação medida contra o `bfdd` na VM (G3.6b) e se aparecer pedido de
+  dezenas de milhares de sessões ou 3,3 ms (BFD em XDP, G3.6f).
+
 ## Histórico de revisão
 
 - 2026-10-21 — versão inicial (esqueleto v0.1.0).

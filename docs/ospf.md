@@ -43,6 +43,9 @@ corerouter-cli run routing.ospf.interface-template.check '{"area":"backbone","ne
   mostram a caixa ou `key_set: true`; só o render abre. O `hal-frr` mascara `key-string`,
   `authentication-key`, `md5 …` e `key …` em erro e log; as duas chaves estão em
   `auth::SECRET_KEYS`.
+- **BFD**: o campo `bfd` do template é o nome de um perfil da G3.6 (`/routing bfd profile`, ou os de
+  fábrica `default` e `fast`), conferido no commit. Nada vai para o FRR: o CoreRouter tem BFD
+  próprio em Rust (não o `bfdd`), e ligar a queda da sessão BFD à adjacência é a G3.6b.
 - **Redistribuição**: um route-map por instância e tipo (`CR-O2-<inst>-connected`): primeiro os
   pools de assinantes, depois a `out_filter_chain` compilada pelo compilador da G3.2b com as
   listas renomeadas `CR-O2-…`/`CR-O3-…` (o BGP continua com as dele no `bgpd`). Uma chain que testa

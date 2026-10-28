@@ -5777,3 +5777,57 @@ continuação indentadas).
   community e tamanho; prepend e community chegam ao par; forma canônica; uma regra mudada = 14
   linhas em 2,7 ms; prévia nas rotas lidas do bgpd = o que o bgpd fez — **medido**, 2026-10-27).
   Na GUI: Routing › Filters.
+
+- 2026-10-27 — G3.4: OSPF, parte 1 (configuração, `docs/ospf.md`): `routing.ospf.instance`, `area`, `area.range`,
+  `interface-template` (com `move` e o `check` do modal), `static-neighbor`, `keychain` e
+  `keychain.key`, e `routing.ospf.impact`, no modelo do RouterOS v7. `proto-ospf` valida (RFC 2328
+  §3.6, §C.3, §D.3, §15; RFC 3101; RFC 7166) e renderiza para o `ospfd`/`ospf6d` do FRR na forma
+  canônica do FRR 10.7.1; o `hal-frr` passou a ser dono de `router ospf`, `router ospf6`, das
+  linhas OSPF dos contextos `interface` (por daemon), de `key chain CR-` e dos filtros `CR-O2-`/
+  `CR-O3-`. Chaves seladas (`auth_key`, `key_string` em `auth::SECRET_KEYS`, mascaradas no
+  `hal-frr`), `sha256` por padrão quando só a chave é dada. O `check` mostra as interfaces que
+  entram, o tipo sugerido (/30, /31, PPP → `ptp`), `passive` sugerido em interface de cliente,
+  autenticação ausente ou fraca e as adjacências que caem (risco com Safe Mode).
+
+  Como testar: `cargo test -p corerouter-proto-ospf -p corerouter-hal-frr`, `cargo test -p
+  corerouter-engine routing_ospf`; na CLI, os exemplos de `docs/ospf.md`. O teste com FRR real na
+  VM do laboratório (Full entre dois FRRs, sha256, rotação sem queda, MTU no Diagnose) vem com a
+  G3.4b, quando a VM voltar.
+
+- 2026-10-27 — G4.3ce: BNG, anúncio dos blocos de assinantes, parte OSPF: `routing.ospf.instance.set
+  subscriber_pools=true` cobre cada faixa dos `/ip pool` dos perfis PPPoE e dos servidores DHCP
+  IPoE pelo menor prefixo, agrega, e redistribui as rotas dos assinantes (conectada /32 do PPP,
+  kernel do IPoE) por um prefix-list com `summary-address` no `ospfd`: um LSA tipo 5 por pool, que
+  some quando o último assinante cai (`docs/ospf.md`).
+
+- 2026-10-27 — G3.4: OSPF, parte 2 (estado, `docs/ospf.md` "Estado"): `routing.ospf.neighbor.list`,
+  `interface.list`, `lsa.list`, `route.list`, `topology`, `path` e `neighbor.diagnose`. O serviço
+  `frr` lê vizinhos e interfaces a cada poll e a LSDB sob demanda, em fluxo e fora do lock, para a
+  tabela compacta `ospf_state::Lsdb`. `proto-ospf` ganhou o parser de pacotes OSPF v2/v3 (Hello e
+  DD, com proptest), o Diagnose (RFC 2328 §10.4–§10.6, §C.1, §D.3; RFC 3101 §2.3), o grafo da
+  LSDB com Dijkstra (§16.1, com a checagem de mão dupla), o layout por forças em threads e a
+  amostra do laboratório virtual.
+
+  Como testar: `cargo test -p corerouter-proto-ospf -p corerouter-hal-frr`, `cargo test -p
+  corerouter-engine ospf`; no laboratório virtual, `routing.ospf.topology {"instance":"v2"}` depois
+  dos exemplos de `docs/ospf.md`. Com FRR real: `cargo xtask vm-lab run --
+  scripts/frr-ospf-live.sh` (escrito; a VM está com o disco cheio).
+
+- 2026-10-27 — G3.6: BFD, parte 1 (G3.6a): CoreRouter's own BFD in pure Rust. Crate `proto-bfd` (L2, sans-IO, WASM):
+  Control packet codec with the RFC 5880 §6.8.6 checks, the session machine (§6.8, Poll/Final,
+  slow 1 s timers while not Up, jitter of §6.8.7, a peer's Demand mode honoured), Keyed SHA1 and
+  Meticulous Keyed SHA1 (§6.7.4, erratum 7083), dampening (RFC 5882 §3.2), a timer wheel and
+  per-session p99 histograms; proptest on hostile packets. Daemon service `bfd`: N named threads
+  (`--bfd-threads`, auto: one per 500 sessions up to 4), each with its own sockets on 3784/4784 in
+  a `SO_REUSEPORT` group steered by a classic BPF program (`Your Discriminator mod N`), its own
+  timer wheel and no lock on the packet path; TTL 255 out, single hop accepts only 255 (RFC 5881
+  §5), multihop a minimum TTL. Commands `routing.bfd.profile.*` (built-in `default` 300 ms × 3 and
+  `fast` 50 ms × 3, dampening on), `routing.bfd.peer.*`, `routing.bfd.session.list` (jitter p99,
+  rx gap p99, detect time, flaps in 24 h, CPU per thread) and `routing.bfd.history.list`. Docs:
+  `docs/bfd.md`.
+
+  Test: `cargo test -p corerouter-proto-bfd`; `cargo test -p corerouter-daemon --bin corerouter-daemon bfd::`
+  (two engines over the loopback: up, then the peer gone and detected in 90–170 ms);
+  `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-daemon --test netns_bfd`
+  (two daemons over a veth: up in 1.4 s, the link cut detected in 118 ms with the 150 ms
+  detection time, **medido**). Load bench: `docs/bfd.md` ("Desempenho e paralelismo").
