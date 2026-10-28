@@ -115,11 +115,16 @@ fn query_helper() {
     common::query_helper();
 }
 
-/// The BFD of both paths up, as the monitor of `netns` shows it.
+/// The BFD of both paths up with the fast timers, as the monitor of
+/// `netns` shows it. `up` alone is not enough: a session comes up with the
+/// slow timers (3 s detection) and only gets the fast ones after the Poll
+/// Sequence, so a peer killed in between is caught by the dead interval.
 fn bfd_up(netns: Option<u32>) -> bool {
     let m = monitor(netns);
     let p = m["bfd"].as_array().cloned().unwrap_or_default();
-    p.len() == 2 && p.iter().all(|x| x["state"] == "up")
+    p.len() == 2
+        && p.iter()
+            .all(|x| x["state"] == "up" && x["detect_ms"] == 150)
 }
 
 #[test]

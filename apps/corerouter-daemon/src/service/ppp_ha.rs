@@ -255,6 +255,11 @@ struct Pair {
     takeovers: VecDeque<Takeover>,
     /// The BFD of [sync, access]: peer and profile.
     bfd: [Option<(std::net::IpAddr, String)>; 2],
+    /// When the last BFD event was handled, and when `bfd_sync` runs next:
+    /// the snapshot it reads is up to 500 ms old, so it only fills in what
+    /// no event has said for longer than that.
+    bfd_event_at: u64,
+    bfd_sync_at: u64,
     test: Option<RunningTest>,
     /// Alerts already logged (each once until it clears).
     alerted: Vec<String>,
@@ -443,11 +448,15 @@ fn test_checks(p: &Pair, now: u64) -> Vec<TestCheck> {
         if let Some(Some((addr, prof))) = p.bfd.get(i) {
             let st = snap.iter().find(|x| x.peer == Some(*addr)).map_or("none", |x| x.state.as_str());
             let damped = r.bfd.get(i).is_some_and(|b| b.suppressed);
+            // The service says up, but the role machine only counts the
+            // loss of a path it saw come up.
+            let known = r.bfd.get(i).is_some_and(|b| b.up);
             v.push(c(
                 &format!("bfd-{path}"),
-                st == "up" && !damped,
+                st == "up" && known && !damped,
                 format!(
-                    "BFD {prof} to {addr}: {st}{}",
+                    "BFD {prof} to {addr}: {st}{}{}",
+                    if st == "up" && !known { ", not yet taken in by the role machine" } else { "" },
                     if damped { ", damped (the dead interval would decide)" } else { "" }
                 ),
             ));
@@ -822,6 +831,7 @@ fn bfd_turn(p: &mut Pair, now: u64) {
     if events.is_empty() {
         return;
     }
+    p.bfd_event_at = now;
     let snap = pair::bfd_snapshot();
     for e in events {
         let detect = snap
@@ -836,8 +846,23 @@ fn bfd_turn(p: &mut Pair, now: u64) {
     }
 }
 
-/// Once a second: BFD paths that came or went, and a session already up
-/// (the role machine was rebuilt, or the service started first).
+/// Every 200 ms: BFD paths that came or went, and a session already up
+/// (the role machine was rebuilt, or the service started first). The up
+/// event of a session that came up before the pair's config was applied is
+/// not queued (the tap only queues the pair's peers), so without this the
+/// role machine would never know that path is up, and the loss of BFD
+/// would be left to the dead interval.
+fn bfd_sync_often(p: &mut Pair, now: u64) {
+    if now < p.bfd_sync_at {
+        return;
+    }
+    p.bfd_sync_at = now + 200;
+    if now.saturating_sub(p.bfd_event_at) >= 1000 {
+        bfd_sync(p, now);
+    }
+}
+
+/// The sync itself, against the service's last snapshot.
 fn bfd_sync(p: &mut Pair, now: u64) {
     let snap = pair::bfd_snapshot();
     for (i, path) in [Path::Sync, Path::Access].into_iter().enumerate() {
@@ -1013,6 +1038,8 @@ mod linux {
                         peer_fingerprint: fp,
                         takeovers: VecDeque::new(),
                         bfd: bfd_want.clone(),
+                        bfd_event_at: 0,
+                        bfd_sync_at: 0,
                         test: None,
                         alerted: Vec::new(),
                     });
@@ -1133,6 +1160,7 @@ mod linux {
                         p.node.access_input(now, b);
                     }
                     bfd_turn(p, now);
+                    bfd_sync_often(p, now);
                     match WITNESS_AT.load(Ordering::Acquire) {
                         0 => {}
                         at => p.node.witness_answer(now, at),
