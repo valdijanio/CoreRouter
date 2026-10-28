@@ -533,9 +533,19 @@ fn template_check(s: &mut Session, raw: &Value) -> Result<Value> {
         checks.push(check("warning", what, msg, param));
     }
     if let Some(b) = &t.bfd {
-        // G3.6 owns the profiles; until its model is in, the name is only
-        // checked for shape.
-        checks.push(check("info", "bfd", format!("BFD profile {b} watches these adjacencies (FRR bfdd)"), "bfd"));
+        // G3.6 owns the profiles and the sessions; tying a session's fall
+        // to the adjacency is G3.6b.
+        if let Some(p) = cfg.routing.bfd.profile(b) {
+            checks.push(check(
+                "info",
+                "bfd",
+                format!(
+                    "BFD profile {b}: detection in {} ms (the adjacency follows the BFD session once G3.6b ties them)",
+                    p.detect_ms()
+                ),
+                "bfd",
+            ));
+        }
     }
     // What the commit does to the adjacencies (against the running config:
     // other pending changes count too).

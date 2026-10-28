@@ -43,6 +43,9 @@ corerouter-cli run routing.ospf.interface-template.check '{"area":"backbone","ne
   mostram a caixa ou `key_set: true`; só o render abre. O `hal-frr` mascara `key-string`,
   `authentication-key`, `md5 …` e `key …` em erro e log; as duas chaves estão em
   `auth::SECRET_KEYS`.
+- **BFD**: o campo `bfd` do template é o nome de um perfil da G3.6 (`/routing bfd profile`, ou os de
+  fábrica `default` e `fast`), conferido no commit. Nada vai para o FRR: o CoreRouter tem BFD
+  próprio em Rust (não o `bfdd`), e ligar a queda da sessão BFD à adjacência é a G3.6b.
 - **Redistribuição**: um route-map por instância e tipo (`CR-O2-<inst>-connected`): primeiro os
   pools de assinantes, depois a `out_filter_chain` compilada pelo compilador da G3.2b com as
   listas renomeadas `CR-O2-…`/`CR-O3-…` (o BGP continua com as dele no `bgpd`). Uma chain que testa
@@ -94,6 +97,17 @@ corerouter-cli run routing.ospf.interface-template.check '{"area":"backbone","ne
   namespaces: Full com HMAC-SHA-256, rotação da chave sem queda, MTU diferente parado antes de
   Full e explicado pelo Diagnose, LSDB e topologia lidas).
 - **Limites**: VRF diferente de `main` e a LSDB do OSPFv3 ainda não são lidas (G3.4h).
+
+## Janela Routing › OSPF (G3.4c)
+
+Abas **Neighbors** (estado em selo "Full · DR", área em selo colorido pelo id, uptime, BFD; a linha
+selecionada mostra o detalhe e o botão **Diagnose**), **Instances**, **Areas**, **Interface
+Templates** e **Key Chains** (o padrão de lista G0.24: barra + − ✓ ✗ 💬, modal com a prévia do
+engine: interfaces que entram, tipo e `passive` sugeridos, autenticação ausente, adjacências que
+caem com Safe Mode), **LSDB** (paginada por tipo), **Routes** (selecionar uma rota mostra "Por que
+esse caminho?") e **Topology** (o mapa desenhado da LSDB; clique num roteador para o caminho; arraste
+e role para mover e aproximar). A resposta da topologia vira vetores planos ao chegar: 500
+roteadores pintam e tesselam em 3,2 ms por quadro em debug (**medido**).
 
 ## Seguro por padrão
 
