@@ -17,6 +17,7 @@ pub mod icmp_ext;
 pub mod lab_conntrack;
 pub mod lab_flow;
 pub mod lab_neigh;
+pub mod lsp;
 pub mod mpls;
 pub mod neigh;
 pub mod nic;
@@ -739,6 +740,20 @@ pub trait Hal: Send {
     fn mpls_reader(&self) -> Result<Box<dyn mpls::MplsReader>, HalError> {
         Err(HalError::Unsupported(format!(
             "{} has no MPLS label table",
+            self.describe()
+        )))
+    }
+
+    /// LSP ping / traceroute sockets (G3.5b, [`lsp`]), or why there are
+    /// none. Cheap: built once, handed out as clones.
+    fn lsp_prober(&self) -> Result<lsp::SharedLspProber, String> {
+        Err(format!("{} cannot send MPLS echo requests", self.describe()))
+    }
+
+    /// The MPLS echo responder's I/O (G3.5b), for a thread of the daemon.
+    fn lsp_responder(&self) -> Result<Box<dyn lsp::LspResponderIo>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} cannot answer MPLS echo requests",
             self.describe()
         )))
     }
