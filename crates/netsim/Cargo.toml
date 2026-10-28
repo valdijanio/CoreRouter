@@ -1,0 +1,26 @@
+[package]
+name = "corerouter-netsim"
+description = "L2: discrete-event network simulator (simplified OSPF, BGP and BFD) for the lab"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+corerouter-model.workspace = true
+corerouter-proto-bgp.workspace = true
+ipnet.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "netsim"
+harness = false
+
+[lints]
+workspace = true

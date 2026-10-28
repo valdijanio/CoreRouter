@@ -48,6 +48,9 @@ pub const LAYERS: &[(&str, u8)] = &[
     ("corerouter-proto-ha", 2),
     // G3.6: BFD (RFC 5880/5881/5883) codec, session machine, timer wheel (sans-IO).
     ("corerouter-proto-bfd", 2),
+    // G3.7: the lab's network simulator (simplified OSPF/BGP/BFD, discrete
+    // events, virtual clock); pure and wasm-safe, read by the engine.
+    ("corerouter-netsim", 2),
     // G3.1: the FRR driver renders with the proto-* crates (L2), so it sits
     // beside them; as a platform crate only the apps use it.
     ("corerouter-hal-frr", 2),
@@ -90,6 +93,9 @@ pub const SIDEWAYS_ALLOWED: &[(&str, &str)] = &[
     // OSPF redistribution runs through the `/routing filter` chains, whose
     // compiler lives with the BGP policy (G3.4).
     ("corerouter-proto-ospf", "corerouter-proto-bgp"),
+    // The simulator runs the real `/routing filter` evaluator and checks its
+    // decision process against `proto_bgp::decision` (G3.7).
+    ("corerouter-netsim", "corerouter-proto-bgp"),
 ];
 
 pub const UI_CRATES: &[&str] = &[
