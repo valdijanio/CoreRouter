@@ -19,6 +19,7 @@
 //! mgmtd, with the numbers.
 
 pub mod conf;
+pub mod ldp;
 pub mod ospf;
 pub mod render;
 pub mod rib;
@@ -423,6 +424,40 @@ impl Frr {
 }
 
 impl Frr {
+    /// G3.5: LDP's state from `ldpd` (and the sync from `ospfd`), when
+    /// `cfg` runs LDP. A missing ospfd only leaves the sync empty.
+    pub fn ldp_state(
+        &self,
+        cfg: &Config,
+    ) -> Result<Option<corerouter_model::mpls_state::LdpState>, HalError> {
+        let Some(ldp) = cfg.routing.mpls.ldp_running() else {
+            return Ok(None);
+        };
+        let mut vty = self.connect(Daemon::Ldpd)?;
+        let show = |vty: &mut Vty, d: Daemon, cmd: &str| -> Result<Option<String>, HalError> {
+            let r = vty.run(cmd).map_err(|e| io_err(d, e))?;
+            let text = String::from_utf8_lossy(&r.output).into_owned();
+            Ok((r.ok() && !text.trim().is_empty()).then_some(text))
+        };
+        let mut st = corerouter_model::mpls_state::LdpState::default();
+        if let Some(t) = show(&mut vty, Daemon::Ldpd, "show mpls ldp neighbor json")? {
+            st.neighbors = ldp::neighbors(&t).map_err(HalError::Rejected)?;
+        }
+        if let Some(t) = show(&mut vty, Daemon::Ldpd, "show mpls ldp binding json")? {
+            st.bindings = ldp::bindings(&t).map_err(HalError::Rejected)?;
+        }
+        if let Some(t) = show(&mut vty, Daemon::Ldpd, "show mpls ldp interface json")? {
+            st.interfaces = ldp::interfaces(&t).map_err(HalError::Rejected)?;
+        }
+        if ldp.igp_sync
+            && let Ok(mut o) = self.connect(Daemon::Ospfd)
+            && let Ok(Some(t)) = show(&mut o, Daemon::Ospfd, "show ip ospf mpls ldp-sync json")
+        {
+            st.igp_sync = ldp::ospf_sync(&t).unwrap_or_default();
+        }
+        Ok(Some(st))
+    }
+
     /// G3.4b: the OSPF neighbors and interfaces of `cfg`'s instances (the
     /// main VRF; a VRF instance is read when its daemon prints it the same
     /// way: G3.4h).
@@ -937,6 +972,13 @@ impl RoutingReader for FrrReader {
 
     fn rpki_state(&mut self) -> Option<String> {
         self.0.rpki_state()
+    }
+
+    fn ldp_state(
+        &mut self,
+        cfg: &Config,
+    ) -> Result<Option<corerouter_model::mpls_state::LdpState>, HalError> {
+        self.0.ldp_state(cfg)
     }
 }
 

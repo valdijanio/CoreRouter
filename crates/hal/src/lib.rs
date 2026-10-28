@@ -17,6 +17,7 @@ pub mod icmp_ext;
 pub mod lab_conntrack;
 pub mod lab_flow;
 pub mod lab_neigh;
+pub mod mpls;
 pub mod neigh;
 pub mod nic;
 pub mod oslog;
@@ -118,12 +119,17 @@ pub const NO_VRF: &str = "this kernel has no VRF support (CONFIG_NET_VRF / modul
 pub struct Features {
     /// VRF devices (Linux: `CONFIG_NET_VRF`, module `vrf`).
     pub vrf: bool,
+    /// MPLS forwarding (G3.5, Linux: module `mpls_router`).
+    pub mpls: bool,
 }
 
 impl Default for Features {
     /// Everything: a backend that does not probe lets `apply` say no.
     fn default() -> Self {
-        Self { vrf: true }
+        Self {
+            vrf: true,
+            mpls: true,
+        }
     }
 }
 
@@ -715,6 +721,24 @@ pub trait Hal: Send {
     fn arp_pinger(&mut self, name: &IfName) -> Result<Box<dyn neigh::ArpPinger>, HalError> {
         Err(HalError::Unsupported(format!(
             "{} cannot send ARP on {name}",
+            self.describe()
+        )))
+    }
+
+    /// The kernel's label table (G3.5, [`mpls`]), read now. A full LSR
+    /// has 10⁵ labels: the daemon reads through [`Hal::mpls_reader`] on a
+    /// thread instead.
+    fn mpls_routes(&mut self) -> Result<Vec<mpls::MplsRoute>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no MPLS label table",
+            self.describe()
+        )))
+    }
+
+    /// A reader of the label table for a thread outside the session lock.
+    fn mpls_reader(&self) -> Result<Box<dyn mpls::MplsReader>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no MPLS label table",
             self.describe()
         )))
     }

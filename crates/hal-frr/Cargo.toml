@@ -13,6 +13,7 @@ corerouter-model.workspace = true
 corerouter-hal.workspace = true
 corerouter-proto-bgp.workspace = true
 corerouter-proto-ospf.workspace = true
+corerouter-proto-mpls.workspace = true
 # G3.6b: the bfd block (profiles, peers).
 corerouter-proto-bfd.workspace = true
 serde_json.workspace = true

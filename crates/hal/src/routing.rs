@@ -119,6 +119,16 @@ pub trait RoutingReader: Send {
         None
     }
 
+    /// G3.5: LDP's neighbors, interfaces, bindings and IGP sync. `None`:
+    /// `cfg` runs no LDP (nothing to read).
+    fn ldp_state(
+        &mut self,
+        cfg: &Config,
+    ) -> Result<Option<corerouter_model::mpls_state::LdpState>, HalError> {
+        let _ = cfg;
+        Ok(None)
+    }
+
     /// G3.4b: the OSPF neighbors and interfaces of `cfg`'s instances
     /// (cheap: read every poll).
     fn ospf_state(

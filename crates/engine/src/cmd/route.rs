@@ -312,6 +312,9 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
             layer2(&mut r, l, &neigh);
             r
         })
-        .collect();
+        .collect::<Vec<_>>();
+    drop(neigh);
+    let mut rows = rows;
+    crate::mpls::annotate_routes(s, &mut rows);
     Ok(Value::Array(rows))
 }

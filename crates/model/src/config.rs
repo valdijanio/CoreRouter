@@ -401,6 +401,9 @@ pub struct Routing {
     /// templates and key chains.
     #[serde(skip_serializing_if = "crate::ospf::Ospf::is_empty")]
     pub ospf: crate::ospf::Ospf,
+    /// `/mpls` (G3.5, `crate::mpls`): kernel label switching and LDP.
+    #[serde(skip_serializing_if = "crate::mpls::Mpls::is_default")]
+    pub mpls: crate::mpls::Mpls,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -90,6 +90,8 @@ pub const SIDEWAYS_ALLOWED: &[(&str, &str)] = &[
     // The FRR driver renders the routing protocols' config (G3.1).
     ("corerouter-hal-frr", "corerouter-proto-bgp"),
     ("corerouter-hal-frr", "corerouter-proto-ospf"),
+    // G3.5: the ldpd render, as the other renders.
+    ("corerouter-hal-frr", "corerouter-proto-mpls"),
     // G3.6b: the `bfd` block for bfdd (profiles, peers).
     ("corerouter-hal-frr", "corerouter-proto-bfd"),
     // OSPF redistribution runs through the `/routing filter` chains, whose

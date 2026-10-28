@@ -158,12 +158,16 @@ fn a_menu_item_opens_its_window_and_its_info_explains_it() {
 }
 
 #[test]
-fn not_implemented_areas_show_a_lock_and_soon() {
+fn no_area_is_left_as_a_stub() {
+    // G3.5: MPLS was the last area drawn as "soon" with a lock; a new stub
+    // returns its gap from `Win::gap` and this test then names it.
+    assert!(Win::all().iter().all(|w| w.gap().is_none()));
     let mut h = Harness::new();
     h.click_menu("Routing");
+    h.click_menu("MPLS");
     assert!(h.menu_row(&win_row("ospf")).is_some());
-    assert!(h.has_text("soon"));
-    assert!(h.has_text(icons::LOCK_SIMPLE));
+    assert!(h.menu_row(&win_row("mpls-ldp")).is_some());
+    assert!(!h.has_text(icons::LOCK_SIMPLE));
 }
 
 fn first_win(query: &str) -> Option<Win> {
