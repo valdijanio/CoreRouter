@@ -12,6 +12,7 @@ repository.workspace = true
 corerouter-model.workspace = true
 corerouter-hal.workspace = true
 corerouter-proto-bgp.workspace = true
+corerouter-proto-ospf.workspace = true
 corerouter-proto-mpls.workspace = true
 serde_json.workspace = true
 serde.workspace = true

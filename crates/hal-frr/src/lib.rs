@@ -155,7 +155,16 @@ impl Frr {
         }
         let text = String::from_utf8_lossy(&r.output);
         Conf::parse(&text)
-            .map(|c| c.owned(|line| render::daemons_of(self.owned, line).contains(&d)))
+            .map(|c| {
+                let c = c.owned(|line| render::daemons_of(self.owned, line).contains(&d));
+                Conf {
+                    nodes: c
+                        .nodes
+                        .iter()
+                        .filter_map(|n| render::part_of(d, n))
+                        .collect(),
+                }
+            })
             .map_err(|e| HalError::Rejected(format!("FRR {} running config: {e}", d.name())))
     }
 

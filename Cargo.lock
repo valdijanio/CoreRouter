@@ -1312,6 +1312,7 @@ dependencies = [
  "corerouter-model",
  "corerouter-proto-bgp",
  "corerouter-proto-mpls",
+ "corerouter-proto-ospf",
  "criterion",
  "ipnet",
  "log",
@@ -1525,6 +1526,10 @@ name = "corerouter-proto-ospf"
 version = "0.1.0"
 dependencies = [
  "corerouter-model",
+ "corerouter-proto-bgp",
+ "criterion",
+ "ipnet",
+ "serde_json",
 ]
 
 [[package]]
