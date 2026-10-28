@@ -263,14 +263,14 @@ fn interactive(t: &mut T) -> Result<(), String> {
 }
 
 /// `sh` in the guest: the output of `cmd`, marked.
-fn sh(vm: &mut Vm, log: &mut std::fs::File, cmd: &str) -> Result<String, String> {
+pub(super) fn sh(vm: &mut Vm, log: &mut std::fs::File, cmd: &str) -> Result<String, String> {
     let line = format!("{cmd} 2>&1 | tr '\\n' ' ' | sed \"s/^/@@$((2+2))S /\"; echo\n");
     vm.stdin_write(line.as_bytes())?;
     let got = vm.expect(log, &["@@4S "], 60)?;
     Ok(got.split("@@4S ").nth(1).unwrap_or("").trim().to_owned())
 }
 
-fn until(
+pub(super) fn until(
     vm: &mut Vm,
     log: &mut std::fs::File,
     secs: u64,

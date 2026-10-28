@@ -38,6 +38,13 @@ recomendação é um atualizador próprio em Rust em vez do RAUC (a atualizaçã
 comando com journal e Safe Mode; boot por EFI stub). Comparação, fontes e números em
 `docs/os-image.md`.
 
+**FRR na imagem (G1.6k): a versão testada, não a do LTS.** A imagem leva o FRR **10.7.1** (e a
+libyang 3.13.6), a mesma da VM do laboratório onde OSPF, LDP, SR, TI-LFA e o `bfddp` foram
+validados, e não o 10.3 do Buildroot 2025.02. Um patch em `os/buildroot-patches/` porta a
+receita do `master` do Buildroot (download pelo Buildroot, hash conferido); sai quando um LTS
+trouxer a versão. Custo **medido**: +0,3 MiB de rootfs, +2,8 MiB de RSS nos 8 daemons
+(`docs/os-image.md`, "FRR 10.3 → 10.7.1").
+
 #### 1.1.2 A/B e atualização (G1.6b)
 
 **Decisão: o gerenciador de boot da UEFI é o bootloader, e o `BootNext` é o contador de boot de
