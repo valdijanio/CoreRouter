@@ -43,6 +43,7 @@ pub fn header(kind: &str) -> Option<String> {
         )),
         "cable-test" => Some(format!("{:<4} {:<20} DISTANCE", "PAIR", "STATUS")),
         "torch" => Some(super::torch::text_header()),
+        "lsp-ping" | "lsp-traceroute" => super::lsp::text::header(kind),
         "bandwidth-test" => Some(format!(
             "{:>5} {:>12} {:>12} {:>8} {:>10} {:>6}",
             "TIME", "TX-RATE", "RX-RATE", "LOST", "JITTER", "CPU"
@@ -133,6 +134,7 @@ pub fn line(kind: &str, ev: &Value) -> String {
         "torch" => super::torch::text_line(ev),
         // The table at the end is the output (`traceroute` prints per hop).
         "traceroute" => String::new(),
+        "lsp-ping" | "lsp-traceroute" => super::lsp::text::line(kind, ev),
         "bandwidth-test" => {
             let f = |k: &str| ev.get(k).and_then(Value::as_f64);
             format!(
@@ -311,6 +313,7 @@ pub fn summary(kind: &str, summary: &Value) -> Vec<String> {
         "dns-lookup" => crate::dns_lookup::summary_lines(summary),
         "torch" => Vec::new(),
         "traceroute" => traceroute_table(summary),
+        "lsp-ping" | "lsp-traceroute" => super::lsp::text::summary(kind, summary),
         "bandwidth-test" => {
             let f = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64);
             let mut out = Vec::new();

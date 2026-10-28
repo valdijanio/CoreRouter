@@ -5,6 +5,7 @@
 pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"+ Static LSP"##, r##"+ LSP estático"##),
     (r##"10.255.0.1 (the loopback)"##, r##"10.255.0.1 (o loopback)"##),
+    (r##"100 replies/s"##, r##"100 respostas/s"##),
     (r##"AFI"##, r##"AFI"##),
     (r##"Adjacencies"##, r##"Adjacências"##),
     (r##"Apply"##, r##"Aplicar"##),
@@ -36,6 +37,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"LDP runs in FRR's ldpd: start the daemon with --frr to see sessions."##, r##"O LDP roda no ldpd do FRR: inicie o daemon com --frr para ver as sessões."##),
     (r##"LDP runs on no interface yet: + adds the links towards the other LSRs."##, r##"O LDP ainda não roda em nenhuma interface: + adiciona os enlaces para os outros LSRs."##),
     (r##"LDP: no daemon"##, r##"LDP: sem daemon"##),
+    (r##"LSP Ping Rate"##, r##"Taxa do LSP ping"##),
+    (r##"LSP Ping Responder"##, r##"Responder LSP ping"##),
+    (r##"LSP Ping…"##, r##"LSP ping…"##),
+    (r##"LSP Traceroute…"##, r##"LSP traceroute…"##),
     (r##"LSR ID"##, r##"LSR ID"##),
     (r##"Labels"##, r##"Rótulos"##),
     (r##"MTU"##, r##"MTU"##),
@@ -147,6 +152,19 @@ Segundos que o Hello de um vizinho vale antes de a adjacência cair (padrão 15,
 O enlace para outro LSR. O MTU dele precisa caber um pacote IP inteiro mais 4 bytes por rótulo."##),
     (r##"mpls.if.state"##, r##"## O que é
 `active`: o LDP manda Hellos ali. `down`: o enlace caiu ou não tem endereço. `no daemon`: sem daemon de roteamento."##),
+    (r##"mpls.lsp_ping_rate"##, r##"## O que é
+Quantas respostas a MPLS echo request este roteador manda por segundo, no máximo (padrão 100). O excedente é descartado e contado.
+
+## Por quê
+A RFC 8029 §5 pede um limitador de taxa na porta UDP 3503: sem ele, uma enxurrada de pedidos ocupa o plano de controle. A resposta nunca é maior que o pedido mais os mapeamentos e vai só para quem pediu, então não serve de amplificador."##),
+    (r##"mpls.lsp_ping_responder"##, r##"## O que é
+Responde LSP ping e LSP traceroute (MPLS echo request, RFC 8029) que chegam a este roteador, como egress do LSP ou como LSR de trânsito onde o TTL do rótulo expirou.
+
+## Padrão
+Ligado, como no Cisco e no Junos: desligado, um ping que chega aqui parece um LSP quebrado. Só funciona nas interfaces que aceitam MPLS (MPLS › Interface ou LDP).
+
+## Diagnóstico
+`mpls.settings.get` mostra os contadores (`lsp_ping_counters`): pedidos ouvidos, respondidos, descartados pela taxa e por código de retorno."##),
     (r##"mpls.lsr_id"##, r##"## O que é
 O LSR ID deste roteador (RFC 5036 §2.2.2), normalmente o endereço do loopback. Obrigatório para ligar o LDP."##),
     (r##"mpls.mtu"##, r##"## O que é

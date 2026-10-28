@@ -288,15 +288,28 @@ impl PanelState for ForwardingPanel {
         ui.separator();
         let footer_h = ui.spacing().interact_size.y * 2.0 + 12.0;
         let mut open = None;
+        let mut ping: Option<(String, bool)> = None;
+        let can = app.can();
         let out = table::show(ui, TABLE, footer_h, &mut self.table, &COLUMNS, &rows, |ui, menu| {
-            if let Menu::Rows(sel) = menu
-                && let Some(k) = sel.as_slice().first()
-                && k.starts_with("label:")
-                && table::action(ui, tr_in(SCOPE, l, "Edit Static LSP…"), Ok(()))
-            {
-                open = Some(k.clone());
+            let Menu::Rows(sel) = menu else { return };
+            let Some(k) = sel.as_slice().first() else { return };
+            if k.starts_with("label:") {
+                if table::action(ui, tr_in(SCOPE, l, "Edit Static LSP…"), Ok(())) {
+                    open = Some(k.clone());
+                }
+            } else {
+                // G3.5b: test this FEC's LSP (Tools › LSP Ping).
+                if table::action(ui, tr_in(SCOPE, l, "LSP Ping…"), can.check("tool.mpls.ping.start")) {
+                    ping = Some((k.clone(), false));
+                }
+                if table::action(ui, tr_in(SCOPE, l, "LSP Traceroute…"), can.check("tool.mpls.traceroute.start")) {
+                    ping = Some((k.clone(), true));
+                }
             }
         });
+        if let Some((fec, trace)) = ping {
+            crate::lsp_ping::open_with(app, &fec, trace);
+        }
         if let Some(key) = out.help {
             let title = COLUMNS.iter().find(|c| c.help == key).map_or("", |c| c.title);
             self.help = Some(HelpView::new(key, tr_in(SCOPE, l, title)));
