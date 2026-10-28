@@ -18,13 +18,20 @@
 //!   peer over the sync link ([`PeerForward`]); its owners apply it and
 //!   this node answers the RADIUS server with what they said.
 //!
+//! - **BFD** (G3.6h, [`pair`]): the `bfd` service runs a session to the
+//!   peer on the sync path and on the access path; its threads queue each
+//!   change for the role machine (no session lock on the way), and a loss
+//!   asks the witness thread for a probe at once. Each takeover keeps its
+//!   timeline (failure, detection, witness, active, announced, adopted,
+//!   first frame, sessions lost), and `test-takeover` runs one on purpose.
+//!
 //! The node sits behind a mutex that every thread takes briefly and never
 //! across I/O: the main loop (hellos, timers, every 10 ms), the connection
 //! thread (bytes in and out) and the commands (`HaBackend`). What the
 //! `pppoe` service reads to answer or keep quiet is [`shared`] (atomics).
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -32,12 +39,12 @@ use corerouter_engine::ppp_redundancy::HaBackend;
 use corerouter_engine::{Shared, lock};
 use corerouter_model::radius::{CoaOutcome, CoaRequest};
 use corerouter_model::ppp_redundancy::{
-    PeerStatus, Redundancy, RedundancyStatus, RoleChange, SyncStatus,
+    PeerStatus, Redundancy, RedundancyStatus, RoleChange, SyncStatus, Takeover, TakeoverTest, TestCheck,
 };
 use corerouter_proto_ha::hello;
 use corerouter_proto_ha::msg::Role;
 use corerouter_proto_ha::node::{Event, Node, NodeConfig, section};
-use corerouter_proto_ha::role::{RoleConfig, Transition};
+use corerouter_proto_ha::role::{BfdDamp, Path, RoleConfig, Transition};
 use corerouter_proto_ha::sync::SyncConfig;
 use serde_json::json;
 
@@ -52,6 +59,24 @@ pub(crate) const SERVICE: super::Service = super::Service {
 
 const TICK: Duration = Duration::from_millis(10);
 const HISTORY: usize = 32;
+const TAKEOVERS: usize = 16;
+
+#[path = "ppp_ha/pair.rs"]
+mod pair;
+pub(crate) use pair::{adopted, frame_seen, publish_bfd, silent as bfd_silent, tap as bfd_tap};
+
+/// The witness's last answer (`Runtime::now` ms; 0 = none yet) and a
+/// probe asked for now (BFD found the peer silent).
+static WITNESS_AT: AtomicU64 = AtomicU64::new(0);
+static WITNESS_URGENT: AtomicBool = AtomicBool::new(false);
+/// The id of our "last takeover?" question to the peer, and its answer.
+static QUERY_ID: AtomicU64 = AtomicU64::new(0);
+static PEER_TAKEOVER: Mutex<Option<Takeover>> = Mutex::new(None);
+/// Raw answers to the peer's questions (not CoA), for the main loop.
+static RAW_REPLIES: Mutex<Vec<(u64, Vec<u8>)>> = Mutex::new(Vec::new());
+/// The body of the "last takeover?" question (a CoA request needs
+/// `kind`, `from` and `selector`: a peer without G3.6h answers 404).
+const QUERY_TAKEOVER: &[u8] = br#"{"ha":"last-takeover"}"#;
 
 /// What the `pppoe` service reads (G4.3h phase 1): whether this node
 /// answers subscribers and the AC MAC and AC-Cookie key of the pair.
@@ -142,6 +167,13 @@ impl super::radius_aaa::CoaForward for PeerForward {
 
 /// The peer asks: its request to our owners, the answer back later.
 fn peer_asks(id: u64, body: &[u8]) {
+    if body == QUERY_TAKEOVER {
+        let last = pair::current();
+        if let Ok(b) = serde_json::to_vec(&last) {
+            locked(&RAW_REPLIES).push((id, b));
+        }
+        return;
+    }
     let reply = move |o: CoaOutcome| locked(&PEER_REPLIES).push((id, o));
     match serde_json::from_slice::<CoaRequest>(body) {
         Ok(req) => match locked(&AAA).clone() {
@@ -155,6 +187,12 @@ fn peer_asks(id: u64, body: &[u8]) {
 
 /// The peer answered our request `id`.
 fn peer_answers(id: u64, body: &[u8]) {
+    if id != 0 && QUERY_ID.load(Ordering::Acquire) == id {
+        if let Ok(Some(t)) = serde_json::from_slice::<Option<Takeover>>(body) {
+            *locked(&PEER_TAKEOVER) = Some(t);
+        }
+        return;
+    }
     let done = locked(&FORWARDS).waiting.remove(&id);
     if let Some((_, done)) = done {
         done(serde_json::from_slice::<CoaOutcome>(body).ok());
@@ -164,6 +202,14 @@ fn peer_answers(id: u64, body: &[u8]) {
 /// Answers for the peer onto the link, and forwards never answered out
 /// of the table.
 fn forward_turn(rt: &Runtime) {
+    let raw = std::mem::take(&mut *locked(&RAW_REPLIES));
+    if !raw.is_empty()
+        && let Some(p) = rt.pair().as_mut()
+    {
+        for (id, b) in raw {
+            p.node.forward_reply(id, b);
+        }
+    }
     let replies = std::mem::take(&mut *locked(&PEER_REPLIES));
     if !replies.is_empty()
         && let Some(p) = rt.pair().as_mut()
@@ -201,6 +247,22 @@ struct Pair {
     /// one was replaced and stops.
     conn: u64,
     peer_fingerprint: String,
+    /// Finished takeovers by this node, oldest first (the one under way
+    /// is `pair::TRACK`).
+    takeovers: VecDeque<Takeover>,
+    /// The BFD of [sync, access]: peer and profile.
+    bfd: [Option<(std::net::IpAddr, String)>; 2],
+    test: Option<RunningTest>,
+    /// Alerts already logged (each once until it clears).
+    alerted: Vec<String>,
+}
+
+/// A takeover test from this node and how to tell its result.
+struct RunningTest {
+    report: TakeoverTest,
+    /// Our epoch when it began: the peer's takeover has a higher one.
+    epoch: u64,
+    deadline: u64,
 }
 
 struct Runtime {
@@ -266,6 +328,170 @@ impl HaBackend for Backend {
             .simulate_failure(now, u64::from(secs) * 1000)
             .map_err(|r| r.as_str().to_owned())
     }
+
+    fn test_takeover(&self, method: &str, secs: u32, run: bool, force: bool) -> Result<TakeoverTest, String> {
+        let now = self.0.now();
+        let mut g = self.0.pair();
+        let p = g.as_mut().ok_or("redundancy is not enabled")?;
+        let checks = test_checks(p, now);
+        let ok = checks.iter().all(|c| c.ok);
+        let mut report = TakeoverTest {
+            started: unix_now(),
+            method: method.into(),
+            state: "checked".into(),
+            checks,
+            note: String::new(),
+        };
+        if !run {
+            report.note = if ok {
+                "every check passed: run it with confirm=takeover in a maintenance window".into()
+            } else {
+                "a check failed: fix it first (force=yes runs anyway)".into()
+            };
+            return Ok(report);
+        }
+        if !ok && !force {
+            report.state = "refused".into();
+            report.note = "a check failed: nothing was changed (force=yes runs anyway)".into();
+            return Ok(report);
+        }
+        let epoch = p.node.ha().epoch();
+        match method {
+            "switchover" => p.node.switchover(now, force).map_err(|r| r.as_str().to_owned())?,
+            _ => p
+                .node
+                .simulate_failure(now, u64::from(secs) * 1000)
+                .map_err(|r| r.as_str().to_owned())?,
+        }
+        *locked(&PEER_TAKEOVER) = None;
+        report.state = "running".into();
+        report.note = if method == "switchover" {
+            "this node handed the role over; the peer's timeline appears here once it is active".into()
+        } else {
+            format!(
+                "this node went silent for {secs} s (no answers, no hellos, no BFD): the peer must detect it as a crash and take over; the result appears here"
+            )
+        };
+        p.test = Some(RunningTest {
+            report: report.clone(),
+            epoch,
+            deadline: now + u64::from(secs) * 1000 + 30_000,
+        });
+        Ok(report)
+    }
+}
+
+/// What must hold before a takeover test (`ppp.redundancy.test-takeover`).
+fn test_checks(p: &Pair, now: u64) -> Vec<TestCheck> {
+    let s = p.node.status(now);
+    let r = &s.role;
+    let c = |name: &str, ok: bool, detail: String| TestCheck {
+        name: name.into(),
+        ok,
+        detail,
+    };
+    let peer = r.peer;
+    let mut v = vec![
+        c("role", r.role == Role::Active, format!("this node is {}", r.role.as_str())),
+        c(
+            "peer",
+            peer.is_some_and(|v| v.role == Role::Standby),
+            match peer {
+                Some(v) => format!("the peer is {}", v.role.as_str()),
+                None => "the peer is not heard".into(),
+            },
+        ),
+        c(
+            "paths",
+            r.paths[0] && (r.paths[1] || !p.cfg.fencing.uses_access()),
+            format!(
+                "sync link {}, access hello {}",
+                if r.paths[0] { "heard" } else { "silent" },
+                if r.paths[1] { "heard" } else if p.cfg.fencing.uses_access() { "silent" } else { "not used" }
+            ),
+        ),
+    ];
+    if p.cfg.mode == corerouter_model::ppp_redundancy::HaMode::HotStandby {
+        let synced = peer.is_some_and(|v| v.in_sync);
+        v.push(c(
+            "in-sync",
+            synced,
+            if synced {
+                format!("the peer holds all {} sessions", s.publisher.as_ref().map_or(0, |x| x.sessions))
+            } else {
+                "the peer's replica is not complete: sessions not synced would redial".into()
+            },
+        ));
+    }
+    if p.cfg.fencing.uses_witness() {
+        let pw = peer.is_some_and(|v| v.witness);
+        v.push(c(
+            "witness",
+            pw,
+            if pw {
+                "the peer reaches the witness (it needs it to take over)".into()
+            } else {
+                "the peer does not reach the witness: it would not take over".into()
+            },
+        ));
+    }
+    let snap = pair::bfd_snapshot();
+    for (i, path) in ["sync", "access"].into_iter().enumerate() {
+        if let Some(Some((addr, prof))) = p.bfd.get(i) {
+            let st = snap.iter().find(|x| x.peer == Some(*addr)).map_or("none", |x| x.state.as_str());
+            let damped = r.bfd.get(i).is_some_and(|b| b.suppressed);
+            v.push(c(
+                &format!("bfd-{path}"),
+                st == "up" && !damped,
+                format!(
+                    "BFD {prof} to {addr}: {st}{}",
+                    if damped { ", damped (the dead interval would decide)" } else { "" }
+                ),
+            ));
+        }
+    }
+    if p.bfd.iter().all(Option::is_none) {
+        v.push(c(
+            "bfd",
+            true,
+            format!("no BFD: the peer detects the failure by the dead interval ({} ms)", p.cfg.dead_interval),
+        ));
+    }
+    v.push(c(
+        "drift",
+        s.drift.is_empty(),
+        if s.drift.is_empty() { "the pair's config matches".into() } else { format!("differs: {}", s.drift.join(", ")) },
+    ));
+    v
+}
+
+/// A test under way: the peer's takeover with a higher epoch is its
+/// result; none by the deadline is a failure.
+fn test_turn(p: &mut Pair, now: u64) {
+    let Some(t) = p.test.as_mut() else {
+        return;
+    };
+    if t.report.state != "running" {
+        return;
+    }
+    let peer = locked(&PEER_TAKEOVER).clone();
+    if let Some(k) = peer.filter(|k| k.epoch > t.epoch) {
+        let ms = |v: Option<u64>| v.map_or("-".to_owned(), |x| format!("{x} ms"));
+        let pass = k.lost == 0 && k.skipped == 0;
+        t.report.state = if pass { "passed" } else { "failed" }.into();
+        t.report.note = format!(
+            "the peer took over: detected by {} at {}, active at {}, sessions adopted at {}; {} kept, {} lost",
+            k.detected_by,
+            ms(k.detected_ms),
+            ms(k.active_ms),
+            ms(k.adopted_ms),
+            k.adopted,
+            k.lost
+        );
+    } else if now > t.deadline {
+        t.report.state = "failed".into();
+        t.report.note = "the peer did not report a takeover in time: check its monitor and log".into();
+    }
 }
 
 fn status_of(p: &Pair, now: u64) -> RedundancyStatus {
@@ -326,7 +552,33 @@ fn status_of(p: &Pair, now: u64) -> RedundancyStatus {
         duplicate_node_id: r.duplicate_node_id,
         history: p.history.iter().rev().cloned().collect(),
         last_error: p.last_error.clone(),
+        bfd: bfd_paths(p, &r.bfd),
+        confirming: r.confirming,
+        witness_age_ms: match WITNESS_AT.load(Ordering::Acquire) {
+            0 => None,
+            at => Some(now.saturating_sub(at)),
+        },
+        takeovers: pair::current()
+            .into_iter()
+            .chain(p.takeovers.iter().rev().cloned())
+            .collect(),
+        peer_takeover: locked(&PEER_TAKEOVER).clone(),
+        alerts: pair::alerts(&bfd_paths(p, &r.bfd)),
+        test: p.test.as_ref().map(|t| t.report.clone()),
     }
+}
+
+fn bfd_paths(p: &Pair, ha: &[corerouter_proto_ha::role::BfdPathStatus; 2]) -> Vec<corerouter_model::ppp_redundancy::PathBfdStatus> {
+    let snap = pair::bfd_snapshot();
+    ["sync", "access"]
+        .into_iter()
+        .zip(p.bfd.iter())
+        .zip(ha.iter())
+        .filter_map(|((name, b), h)| {
+            b.as_ref()
+                .map(|(addr, prof)| pair::path_status(name, Some(*addr), prof, h, &snap))
+        })
+        .collect()
 }
 
 fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
@@ -418,7 +670,12 @@ fn sections(cfg: &corerouter_model::Config) -> Vec<corerouter_proto_ha::msg::Sec
     ]
 }
 
-fn node_config(r: &Redundancy, id: u64, sections: Vec<corerouter_proto_ha::msg::Section>) -> NodeConfig {
+fn node_config(
+    r: &Redundancy,
+    id: u64,
+    sections: Vec<corerouter_proto_ha::msg::Section>,
+    bfd_damp: Option<BfdDamp>,
+) -> NodeConfig {
     let mut inc = [0u8; 8];
     let _ = getrandom::fill(&mut inc);
     NodeConfig {
@@ -436,6 +693,7 @@ fn node_config(r: &Redundancy, id: u64, sections: Vec<corerouter_proto_ha::msg::
             witness: r.fencing.uses_witness(),
             access_path: r.fencing.uses_access(),
             hot_standby: r.mode == corerouter_model::ppp_redundancy::HaMode::HotStandby,
+            bfd_damp,
         },
         sync: SyncConfig::default(),
         hello_key: hello::derive("hello", r.secret.as_bytes()),
@@ -483,7 +741,7 @@ pub(crate) fn publish(
 /// This node takes the role: the replica's sessions for the `pppoe`
 /// workers to adopt (stateful), or none (they redial). Before the workers
 /// may answer: a frame of a session not adopted yet would get a PADT.
-fn hand_takeover(p: &Pair, t: &Transition) {
+fn hand_takeover(p: &Pair, t: &Transition) -> u64 {
     use super::pppoe_bng::ha::{TAKEOVER, TAKEOVER_GEN};
     let records = t.stateful.then(|| {
         p.node
@@ -500,8 +758,61 @@ fn hand_takeover(p: &Pair, t: &Transition) {
             })
             .unwrap_or_default()
     });
+    let handed = records.as_ref().map_or(0, |r| r.len() as u64);
     *TAKEOVER.lock().unwrap_or_else(PoisonError::into_inner) = records.map(Arc::new);
     TAKEOVER_GEN.fetch_add(1, Ordering::AcqRel);
+    handed
+}
+
+/// A takeover begins: its timeline (the one before it goes to the list).
+fn begin_takeover(p: &mut Pair, t: &Transition, handed: u64, now: u64) {
+    let peer_sessions = u64::from(p.node.status(now).peer_sessions);
+    if let Some(old) = pair::begin(t, handed, if t.stateful { peer_sessions } else { 0 }, false) {
+        if p.takeovers.len() >= TAKEOVERS {
+            p.takeovers.pop_front();
+        }
+        p.takeovers.push_back(old.takeover);
+    }
+}
+
+/// The `bfd` service's state for the pair, and its changes, into the role
+/// machine (no session lock).
+fn bfd_turn(p: &mut Pair, now: u64) {
+    let events = pair::take_bfd_events();
+    if events.is_empty() {
+        return;
+    }
+    let snap = pair::bfd_snapshot();
+    for e in events {
+        let detect = snap
+            .iter()
+            .find(|s| s.peer == Some(e.peer))
+            .map_or(0, |s| s.detect_time_us / 1000);
+        for (i, path) in [Path::Sync, Path::Access].into_iter().enumerate() {
+            if p.bfd.get(i).and_then(Option::as_ref).is_some_and(|(a, _)| *a == e.peer) {
+                p.node.bfd(now, path, e.up, e.expired, detect);
+            }
+        }
+    }
+}
+
+/// Once a second: BFD paths that came or went, and a session already up
+/// (the role machine was rebuilt, or the service started first).
+fn bfd_sync(p: &mut Pair, now: u64) {
+    let snap = pair::bfd_snapshot();
+    for (i, path) in [Path::Sync, Path::Access].into_iter().enumerate() {
+        let st = p.node.ha().bfd_state(path);
+        match p.bfd.get(i).and_then(Option::as_ref) {
+            None if st.configured => p.node.bfd_off(now, path),
+            None => {}
+            Some((addr, _)) => {
+                let up = snap.iter().any(|s| s.peer == Some(*addr) && s.state == "up");
+                if up && !st.up {
+                    p.node.bfd(now, path, true, false, 0);
+                }
+            }
+        }
+    }
 }
 
 fn record(p: &mut Pair, t: &Transition) {
@@ -582,6 +893,7 @@ mod linux {
         let mut access_in = Vec::new();
         let mut access_out = Vec::new();
         let mut events = Vec::new();
+        let mut next_query = 0u64;
         loop {
             health.beat();
             flush_logs(session);
@@ -590,8 +902,20 @@ mod linux {
             let guard_now = if Instant::now() >= next_cfg { try_session(session) } else { None };
             if let Some(s) = guard_now {
                 next_cfg = Instant::now() + Duration::from_secs(1);
-                let (r, secs, pppoe_ifs) = {
+                let (r, secs, pppoe_ifs, damp) = {
                     let cfg = s.store().running();
+                    let r0 = &cfg.ppp.redundancy;
+                    let prof = if r0.bfd.is_empty() { &r0.access_bfd } else { &r0.bfd };
+                    let damp = cfg.routing.bfd.profile(prof).and_then(|p| {
+                        let d = p.dampening;
+                        d.enabled.then(|| BfdDamp {
+                            half_life_ms: u64::from(d.half_life.max(1)) * 1000,
+                            penalty: 1000,
+                            suppress: d.suppress,
+                            reuse: d.reuse,
+                            max_suppress_ms: u64::from(d.max_suppress) * 1000,
+                        })
+                    });
                     let ifs: Vec<IfName> = cfg
                         .ppp
                         .pppoe_servers
@@ -599,8 +923,10 @@ mod linux {
                         .filter(|x| !x.disabled)
                         .map(|x| x.interface.clone())
                         .collect();
-                    (cfg.ppp.redundancy.clone(), sections(cfg), ifs)
+                    (cfg.ppp.redundancy.clone(), sections(cfg), ifs, damp)
                 };
+                let bfd_want = pair::wanted(&r);
+                pair::set_peers(bfd_want.iter().flatten().map(|(a, _)| *a).collect());
                 drop(s);
                 let sh = shared();
                 if !r.enabled {
@@ -620,20 +946,35 @@ mod linux {
                     continue;
                 }
                 health.disabled(None);
-                let rebuild = rt.pair().as_ref().is_none_or(|p| p.cfg != r || p.sections != secs);
+                // BFD's knobs change in place: a rebuilt role machine
+                // starts over in init and would stop answering.
+                let no_bfd = |x: &Redundancy| Redundancy {
+                    bfd: String::new(),
+                    access_bfd: String::new(),
+                    access_peer: None,
+                    ..x.clone()
+                };
+                let rebuild = rt
+                    .pair()
+                    .as_ref()
+                    .is_none_or(|p| no_bfd(&p.cfg) != no_bfd(&r) || p.sections != secs);
                 if rebuild {
                     let fp = dir
                         .and_then(|d| std::fs::read_to_string(d.join(PIN_FILE)).ok())
                         .map(|s| s.trim().to_owned())
                         .unwrap_or_default();
                     *rt.pair() = Some(Pair {
-                        node: Node::new(node_config(&r, our_id, secs.clone()), rt.now()),
+                        node: Node::new(node_config(&r, our_id, secs.clone(), damp), rt.now()),
                         cfg: r.clone(),
                         sections: secs,
                         history: VecDeque::new(),
                         last_error: None,
                         conn: CONNS.fetch_add(1, Ordering::AcqRel) + 1,
                         peer_fingerprint: fp,
+                        takeovers: VecDeque::new(),
+                        bfd: bfd_want.clone(),
+                        test: None,
+                        alerted: Vec::new(),
                     });
                     *sh.mac.lock().unwrap_or_else(PoisonError::into_inner) = r.mac().0;
                     *sh.cookie_key.lock().unwrap_or_else(PoisonError::into_inner) =
@@ -658,6 +999,24 @@ mod linux {
                         format!("ppp redundancy on: node {our_id:016x}, group {}, priority {}", r.group, r.priority),
                         json!({"node_id": format!("{our_id:016x}"), "access_ports": names.len()}),
                     );
+                }
+                {
+                    let now = rt.now();
+                    let mut g = rt.pair();
+                    if let Some(p) = g.as_mut() {
+                        p.cfg = r.clone();
+                        p.bfd = bfd_want;
+                        p.node.set_bfd_damp(damp);
+                        bfd_sync(p, now);
+                        let st = status_of(p, now);
+                        let fresh: Vec<String> =
+                            st.alerts.iter().filter(|a| !p.alerted.contains(a)).cloned().collect();
+                        p.alerted = st.alerts;
+                        drop(g);
+                        for a in fresh {
+                            log(session, "warning", format!("ppp redundancy: {a}"), json!({}));
+                        }
+                    }
                 }
                 let witnesses: Vec<IpAddr> = r.witness.clone();
                 track = r.track.clone();
@@ -733,22 +1092,48 @@ mod linux {
                     for b in &access_in {
                         p.node.access_input(now, b);
                     }
+                    bfd_turn(p, now);
+                    match WITNESS_AT.load(Ordering::Acquire) {
+                        0 => {}
+                        at => p.node.witness_answer(now, at),
+                    }
                     p.node.witness(now, witness_ok);
                     p.node.track(now, track_ok);
                     p.node.tick(now);
+                    if p.node.wants_witness_probe() {
+                        WITNESS_URGENT.store(true, Ordering::Release);
+                    }
+                    pair::set_silent(p.node.ha().silent());
+                    test_turn(p, now);
+                    if now >= next_query {
+                        next_query = now + 2000;
+                        if p.node.can_forward() {
+                            let id = {
+                                let mut f = locked(&FORWARDS);
+                                f.next += 1;
+                                f.next
+                            };
+                            QUERY_ID.store(id, Ordering::Release);
+                            p.node.forward(id, QUERY_TAKEOVER.to_vec());
+                        }
+                    }
                     p.node.take_access(&mut access_out);
                     p.node.take_events(&mut events);
                     for e in &events {
                         if let Event::Role(t) = e {
                             record(p, t);
                             if t.to == Role::Active {
-                                hand_takeover(p, t);
+                                let handed = hand_takeover(p, t);
+                                begin_takeover(p, t, handed, now);
                             }
                         }
                     }
                     shared().answering.store(p.node.answering(), Ordering::Release);
                     super::super::pppoe_bng::HA_ACTIVE.store(p.node.answering(), Ordering::Release);
                 }
+            }
+            if access_out.iter().any(|(_, v)| *v) && !ports.is_empty() {
+                pair::announced(rt.now());
             }
             for (body, from_vmac) in access_out.drain(..) {
                 for port in &ports {
@@ -825,6 +1210,10 @@ mod linux {
         let mut seq: u16 = 0;
         loop {
             let started = Instant::now();
+            // A probe asked for (BFD found the peer silent): answers in
+            // an RTT, so the wait is short.
+            let urgent = WITNESS_URGENT.swap(false, Ordering::AcqRel);
+            let wait = Duration::from_millis(if urgent { 200 } else { 500 });
             let targets = list.lock().unwrap_or_else(PoisonError::into_inner).clone();
             let mut ok = false;
             if let Ok(mut sock) = prober.open(&SocketOptions::default()) {
@@ -839,11 +1228,12 @@ mod linux {
                     if sock.send(&probe).is_err() {
                         continue;
                     }
-                    let until = Instant::now() + Duration::from_millis(500);
+                    let until = Instant::now() + wait;
                     while let Some(left) = until.checked_duration_since(Instant::now()) {
                         match sock.recv(left) {
                             Ok(Some(r)) if r.seq == seq && r.kind == ReplyKind::Echo => {
                                 ok = true;
+                                WITNESS_AT.store(runtime().now().max(1), Ordering::Release);
                                 break;
                             }
                             Ok(Some(_)) => {}
@@ -855,10 +1245,16 @@ mod linux {
                     }
                 }
             }
-            misses = if ok { 0 } else { misses.saturating_add(1) };
+            // An urgent probe that failed is not a miss of the debounce
+            // (the regular one decides that).
+            if !urgent || ok {
+                misses = if ok { 0 } else { misses.saturating_add(1) };
+            }
             WITNESS.store(misses < 3, Ordering::Release);
-            if let Some(rest) = Duration::from_secs(1).checked_sub(started.elapsed()) {
-                std::thread::sleep(rest);
+            // Sleep the rest of the second, in steps that see an urgent
+            // probe within 5 ms.
+            while started.elapsed() < Duration::from_secs(1) && !WITNESS_URGENT.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(5));
             }
         }
     }

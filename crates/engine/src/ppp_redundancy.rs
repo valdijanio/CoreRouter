@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use corerouter_model::ppp_redundancy::RedundancyStatus;
+use corerouter_model::ppp_redundancy::{RedundancyStatus, TakeoverTest};
 
 use crate::Session;
 
@@ -19,6 +19,14 @@ pub trait HaBackend: Send + Sync {
     fn switchover(&self, force: bool) -> Result<(), String>;
     /// "Simular falha": behave as a dead node for `secs`.
     fn simulate_failure(&self, secs: u32) -> Result<(), String>;
+    /// "Testar tomada" (G3.6h): the checks, and with `run` the takeover
+    /// itself (`method` `failure`: silent for `secs`, the peer detects it
+    /// as a crash; `switchover`: planned handover). `force` runs it with a
+    /// check failed.
+    fn test_takeover(&self, method: &str, secs: u32, run: bool, force: bool) -> Result<TakeoverTest, String> {
+        let _ = (method, secs, run, force);
+        Err("this redundancy service cannot test a takeover".into())
+    }
 }
 
 #[derive(Default)]

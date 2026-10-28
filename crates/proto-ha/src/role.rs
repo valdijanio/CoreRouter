@@ -253,6 +253,9 @@ struct PathBfd {
     /// The session expired at this time: hellos heard on the path at or
     /// before it no longer count.
     lost_at: Option<Millis>,
+    /// The peer's last BFD packet on this path: the expiry minus the
+    /// detection time (the timeline's last sign of life).
+    last_rx: Millis,
     penalty: f64,
     penalty_at: Millis,
     suppressed_since: Option<Millis>,
@@ -499,8 +502,9 @@ impl Ha {
 
     /// The peer's BFD session on `path` (G3.6h): `up`, or down with
     /// `expired` when its packets stopped (RFC 5880 §6.8.4, diagnostic 1
-    /// — the only Down that says the peer may be dead).
-    pub fn bfd(&mut self, now: Millis, path: Path, up: bool, expired: bool) {
+    /// — the only Down that says the peer may be dead) after `detect_ms`
+    /// of silence.
+    pub fn bfd(&mut self, now: Millis, path: Path, up: bool, expired: bool, detect_ms: u64) {
         let damp = self.cfg.bfd_damp;
         let Some(b) = self.bfd.get_mut(path.idx()) else {
             return;
@@ -513,10 +517,31 @@ impl Ha {
         }
         if up {
             b.lost_at = None;
-        } else if was_up && expired && b.lost(damp.as_ref(), now) && self.sim_until.is_none() {
-            b.lost_at = Some(now);
+        } else if was_up && expired {
+            b.last_rx = now.saturating_sub(detect_ms);
+            if b.lost(damp.as_ref(), now) && self.sim_until.is_none() {
+                b.lost_at = Some(now);
+            }
         }
         self.evaluate(now);
+    }
+
+    /// A path's BFD as the role machine sees it.
+    pub fn bfd_state(&self, path: Path) -> BfdPathStatus {
+        let b = self.bfd.get(path.idx()).copied().unwrap_or_default();
+        BfdPathStatus {
+            configured: b.configured,
+            up: b.up,
+            suppressed: b.suppressed_since.is_some(),
+            penalty: b.penalty.round() as u32,
+            losses: b.losses,
+            false_alarms: b.false_alarms,
+        }
+    }
+
+    /// The BFD profile's dampening changed (no rebuild of the machine).
+    pub fn set_bfd_damp(&mut self, d: Option<BfdDamp>) {
+        self.cfg.bfd_damp = d;
     }
 
     /// BFD no longer runs on `path` (the profile was removed).
@@ -792,7 +817,17 @@ impl Ha {
         match (peer, &mut self.silent_since) {
             (Some(_), s) => *s = None,
             (None, s @ None) => {
-                let last_heard = self.heard.iter().flatten().map(|(at, _)| *at).max().unwrap_or(0);
+                let hello = self.heard.iter().flatten().map(|(at, _)| *at).max().unwrap_or(0);
+                // BFD's last packet is closer to the failure than the
+                // last hello (one every `hello_ms`).
+                let bfd_rx = [Path::Sync, Path::Access]
+                    .into_iter()
+                    .zip(fast)
+                    .filter(|(_, f)| *f)
+                    .filter_map(|(p, _)| self.bfd.get(p.idx()).map(|b| b.last_rx))
+                    .max()
+                    .unwrap_or(0);
+                let last_heard = hello.max(bfd_rx);
                 *s = Some(Detection {
                     last_heard,
                     detected: now,
@@ -1252,22 +1287,22 @@ mod tests {
         a.witness_answer(0, 0);
         a.synced(0, true);
         for p in [Path::Sync, Path::Access] {
-            a.bfd(5, p, true, false);
+            a.bfd(5, p, true, false, 150);
             a.peer_heard(10, p, view(2, Role::Active, 7));
         }
         // The peer said Down itself (AdminDown, diagnostic 3): alive.
-        a.bfd(100, Path::Sync, false, false);
-        a.bfd(100, Path::Access, false, false);
+        a.bfd(100, Path::Sync, false, false, 150);
+        a.bfd(100, Path::Access, false, false, 150);
         a.tick(110);
         assert_eq!(a.role(), Role::Standby);
         for p in [Path::Sync, Path::Access] {
-            a.bfd(120, p, true, false);
+            a.bfd(120, p, true, false, 150);
         }
         // Its packets stopped on one path: the other still hears it.
-        a.bfd(160, Path::Sync, false, true);
+        a.bfd(160, Path::Sync, false, true, 150);
         a.tick(170);
         assert_eq!(a.role(), Role::Standby);
-        a.bfd(165, Path::Access, false, true);
+        a.bfd(165, Path::Access, false, true, 150);
         a.tick(175);
         assert_eq!(a.role(), Role::Standby, "the witness answer is older than the detection");
         assert!(a.wants_witness_probe() && a.status(175).confirming);
@@ -1282,7 +1317,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        assert_eq!((d.last_heard, d.detected, d.bfd, d.witness_at), (10, 165, [true, true], Some(178)));
+        assert_eq!((d.last_heard, d.detected, d.bfd, d.witness_at), (15, 165, [true, true], Some(178)));
     }
 
     #[test]
@@ -1290,8 +1325,8 @@ mod tests {
         let mut a = Ha::new(cfg(1), 0);
         a.witness(0, true);
         a.peer_heard(10, Path::Sync, view(2, Role::Active, 7));
-        a.bfd(10, Path::Sync, true, false);
-        a.bfd(50, Path::Sync, false, true);
+        a.bfd(10, Path::Sync, true, false, 150);
+        a.bfd(50, Path::Sync, false, true, 150);
         assert!(a.status(50).peer.is_none(), "BFD killed the only path");
         a.peer_heard(300, Path::Sync, view(2, Role::Active, 7));
         let s = a.status(300);

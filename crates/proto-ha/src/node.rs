@@ -511,9 +511,13 @@ impl Node {
     }
 
     /// The peer's BFD session on `path` changed (G3.6h): see [`Ha::bfd`].
-    pub fn bfd(&mut self, now: Millis, path: Path, up: bool, expired: bool) {
-        self.ha.bfd(now, path, up, expired);
+    pub fn bfd(&mut self, now: Millis, path: Path, up: bool, expired: bool, detect_ms: u64) {
+        self.ha.bfd(now, path, up, expired, detect_ms);
         self.after(now);
+    }
+
+    pub fn set_bfd_damp(&mut self, d: Option<crate::role::BfdDamp>) {
+        self.ha.set_bfd_damp(d);
     }
 
     pub fn bfd_off(&mut self, now: Millis, path: Path) {

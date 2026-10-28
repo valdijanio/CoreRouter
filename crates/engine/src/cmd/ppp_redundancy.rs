@@ -19,13 +19,13 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("ppp.redundancy.set", "PPP Redundancy", [], None,
-        "{enabled?: bool, mode?: stateless|hot-standby (default hot-standby: sessions survive a takeover), group?: int 1..255 (the same on both nodes; default 1), peer?: host:port | \"\" (the other node's sync address, TLS), listen_port?: int 1..65535 (default 8730), secret?: string 16..256 (the same on both nodes; write-only), priority?: int 1..254 (default 100; higher wins an election), preempt?: bool (default no), preempt_delay?: int 0..3600 (s, default 60), virtual_mac?: mac | \"\" (default 02:43:52:48:41:<group>), interfaces?: [string] (access ports; empty: every pppoe-server interface), fencing?: witness|access|witness-and-access (default witness-and-access), witness?: [ip] | string (at most 4; the gateway is a good one), track?: [string] (a port of these down fences the node), hello_interval?: int 50..10000 (ms, default 300), dead_interval?: int (ms, at least 3 × hello, at most 60000; default 1200), init_hold?: int 0..600 (s, default 5), recover_hold?: int 0..600 (s, default 3), comment?: string} → {enabled, mode, group, peer?, listen_port, secret (*** when set), priority, preempt, preempt_delay, virtual_mac? (set), virtual_mac_in_use, interfaces, fencing, witness, track, hello_interval, dead_interval, init_hold, recover_hold, comment?, warnings}",
+        "{enabled?: bool, mode?: stateless|hot-standby (default hot-standby: sessions survive a takeover), group?: int 1..255 (the same on both nodes; default 1), peer?: host:port | \"\" (the other node's sync address, TLS), listen_port?: int 1..65535 (default 8730), secret?: string 16..256 (the same on both nodes; write-only), priority?: int 1..254 (default 100; higher wins an election), preempt?: bool (default no), preempt_delay?: int 0..3600 (s, default 60), virtual_mac?: mac | \"\" (default 02:43:52:48:41:<group>), interfaces?: [string] (access ports; empty: every pppoe-server interface), fencing?: witness|access|witness-and-access (default witness-and-access), witness?: [ip] | string (at most 4; the gateway is a good one), track?: [string] (a port of these down fences the node), hello_interval?: int 50..10000 (ms, default 300), dead_interval?: int (ms, at least 3 × hello, at most 60000; default 1200), init_hold?: int 0..600 (s, default 5), recover_hold?: int 0..600 (s, default 3), bfd?: string (BFD profile on the sync path, to peer's address; fast = 50 ms × 3 detects in 150 ms; \"\" = hellos only), access_bfd?: string (BFD profile on the access path, to access_peer), access_peer?: ip | \"\" (the peer's address on the access network), comment?: string} → {enabled, mode, group, peer?, listen_port, secret (*** when set), priority, preempt, preempt_delay, virtual_mac? (set), virtual_mac_in_use, interfaces, fencing, witness, track, hello_interval, dead_interval, init_hold, recover_hold, bfd, access_bfd, access_peer?, detection_ms, comment?, warnings}",
         always, set),
     cmd!(query "ppp.redundancy.get", "PPP Redundancy", ["PPP"], None,
-        "{} → {enabled, mode, group, peer?, listen_port, secret (*** when set), priority, preempt, preempt_delay, virtual_mac? (set), virtual_mac_in_use, interfaces, fencing, witness, track, hello_interval, dead_interval, init_hold, recover_hold, comment?, warnings}",
+        "{} → {enabled, mode, group, peer?, listen_port, secret (*** when set), priority, preempt, preempt_delay, virtual_mac? (set), virtual_mac_in_use, interfaces, fencing, witness, track, hello_interval, dead_interval, init_hold, recover_hold, bfd, access_bfd, access_peer?, detection_ms, comment?, warnings}",
         always, get),
     cmd!(query "ppp.redundancy.monitor", "PPP Redundancy Monitor", [], None,
-        "{} → {running (the pppoe service runs the pair), enabled, role (disabled|init|standby|active|fenced|yielding), epoch, role_since_secs, answering, peer: {connected, role?, priority, sync_path, access_path, witness, fingerprint?}, witness, track, in_sync, sync: {sessions, synced, lag, delay_ms, snapshots, snapshot?, gaps, bytes_sent, bytes_received}, drift: [string], simulating_secs?, duplicate_node_id, history: [{at, from, to, epoch, reason, stateful}], last_error?}",
+        "{} → {running (the pppoe service runs the pair), enabled, role (disabled|init|standby|active|fenced|yielding), epoch, role_since_secs, answering, peer: {connected, role?, priority, sync_path, access_path, witness, fingerprint?}, witness, track, in_sync, sync: {sessions, synced, lag, delay_ms, snapshots, snapshot?, gaps, bytes_sent, bytes_received}, drift: [string], simulating_secs?, duplicate_node_id, history: [{at, from, to, epoch, reason, stateful}], last_error?, bfd: [{path, peer, profile, state, detect_ms, rx_gap_p99_us?, tx_jitter_p99_us?, suppressed, penalty, losses, false_alarms}], confirming, witness_age_ms?, takeovers: [{at, reason, epoch, detected_by, detected_ms, witness_ms, active_ms, announced_ms, adopted_ms, first_frame_ms, stateful, handed, adopted, skipped, lost, test}], peer_takeover?, alerts: [string], test?: {started, method, state, checks, note}}",
         always, monitor),
     cmd!("ppp.redundancy.switchover", "PPP Redundancy Switchover", [], None,
         "{force?: bool (switch even if the standby's replica is incomplete: those sessions redial)} → {role, note}",
@@ -33,6 +33,9 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("ppp.redundancy.simulate-failure", "PPP Redundancy Simulate Failure", [], None,
         "{seconds?: int 1..600 (default 30)} → {role, until_secs, note}",
         has_backend, simulate_failure),
+    cmd!("ppp.redundancy.test-takeover", "PPP Redundancy Test Takeover", [], None,
+        "{method?: failure|switchover (failure, the default: this node goes silent and the peer must detect it as a crash; switchover: planned handover), seconds?: int 5..600 (failure: how long silent, default 15), confirm?: string (\"takeover\" runs it: this node stops serving; without it only the checks run), force?: bool (run with a check failed)} → {started, method, state (checked|refused|running), checks: [{name, ok, detail}], note}",
+        has_backend, test_takeover),
 ];
 
 fn has_backend(s: &Session) -> std::result::Result<(), String> {
@@ -65,6 +68,9 @@ fn view(s: &Session) -> Value {
         "dead_interval": r.dead_interval,
         "init_hold": r.init_hold,
         "recover_hold": r.recover_hold,
+        "bfd": r.bfd,
+        "access_bfd": r.access_bfd,
+        "detection_ms": detection_ms(s, r),
         "warnings": warnings(s, r),
     });
     if let Some(o) = v.as_object_mut() {
@@ -74,8 +80,24 @@ fn view(s: &Session) -> Value {
         if !r.comment.is_empty() {
             o.insert("comment".into(), json!(r.comment));
         }
+        if let Some(a) = r.access_peer {
+            o.insert("access_peer".into(), json!(a.to_string()));
+        }
     }
     v
+}
+
+/// How long the peer's failure takes to find (G3.6h): the BFD detection
+/// time when every path it listens on runs BFD, else the dead interval.
+fn detection_ms(s: &Session, r: &Redundancy) -> u64 {
+    let cfg = s.store().candidate();
+    let detect = |name: &str| (!name.is_empty()).then(|| cfg.routing.bfd.profile(name).map(|p| p.detect_ms())).flatten();
+    let sync = detect(&r.bfd);
+    let access = if r.fencing.uses_access() { detect(&r.access_bfd).map(Some) } else { Some(None) };
+    match (sync, access) {
+        (Some(a), Some(b)) => a.max(b.unwrap_or(0)),
+        _ => u64::from(r.dead_interval),
+    }
 }
 
 /// What works but deserves a look, in plain words.
@@ -103,6 +125,28 @@ fn warnings(s: &Session, r: &Redundancy) -> Vec<String> {
     }
     if r.mode == HaMode::Stateless {
         w.push("mode=stateless: after a takeover every subscriber redials (seconds of outage); hot-standby keeps the sessions".into());
+    }
+    if r.bfd.is_empty() && r.access_bfd.is_empty() {
+        w.push(format!(
+            "no BFD: a failure is found by the dead interval ({} ms); bfd=fast (and access_bfd=fast) finds it in 150 ms",
+            r.dead_interval
+        ));
+    } else if r.fencing.uses_access() && (r.bfd.is_empty() || r.access_bfd.is_empty()) {
+        w.push(format!(
+            "BFD on one path only: the takeover still waits for the other path's hellos ({} ms); set {} too",
+            r.dead_interval,
+            if r.bfd.is_empty() { "bfd" } else { "access_bfd" }
+        ));
+    }
+    for (key, name) in [("bfd", &r.bfd), ("access_bfd", &r.access_bfd)] {
+        if let Some(p) = cfg.routing.bfd.profile(name)
+            && p.detect_ms() < 100
+        {
+            w.push(format!(
+                "{key}={name}: {} ms detection; a busy link or node may lose 3 packets in a row and cause a takeover nobody needed (the pair damps a flapping path)",
+                p.detect_ms()
+            ));
+        }
     }
     if r.dead_interval < 600 {
         w.push(format!(
@@ -203,6 +247,32 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(v) = bounded(p, "recover_hold", 0, 600)? {
         r.recover_hold = v;
     }
+    for key in ["bfd", "access_bfd"] {
+        if let Some(name) = opt_str(p, key)? {
+            let name = name.trim();
+            if !name.is_empty() && cfg.routing.bfd.profile(name).is_none() {
+                let all: Vec<String> = cfg.routing.bfd.all_profiles().into_iter().map(|p| p.name).collect();
+                return Err(EngineError::bad(
+                    key,
+                    format!("no BFD profile '{}' (routing.bfd.profile: {})", name.chars().take(64).collect::<String>(), all.join(", ")),
+                ));
+            }
+            if key == "bfd" {
+                r.bfd = name.to_owned();
+            } else {
+                r.access_bfd = name.to_owned();
+            }
+        }
+    }
+    match opt_str(p, "access_peer")? {
+        Some(t) if t.trim().is_empty() => r.access_peer = None,
+        Some(t) => {
+            r.access_peer = Some(t.trim().parse::<IpAddr>().map_err(|_| {
+                EngineError::bad("access_peer", format!("'{}' is not an IP address", t.chars().take(64).collect::<String>()))
+            })?);
+        }
+        None => {}
+    }
     if let Some(t) = opt_text(p, "comment", 256)? {
         r.comment = t;
     }
@@ -249,6 +319,33 @@ fn simulate_failure(s: &mut Session, p: &Value) -> Result<Value> {
         "until_secs": secs,
         "note": "this node behaves as dead (no answers, no hellos): the peer takes over; it comes back as standby",
     }))
+}
+
+fn test_takeover(s: &mut Session, p: &Value) -> Result<Value> {
+    let method = opt_str(p, "method")?.unwrap_or("failure").to_owned();
+    if !matches!(method.as_str(), "failure" | "switchover") {
+        return Err(EngineError::bad("method", "failure or switchover"));
+    }
+    let secs = bounded(p, "seconds", 5, 600)?.unwrap_or(15);
+    let run = match opt_str(p, "confirm")? {
+        None => false,
+        Some(c) if c == "takeover" => true,
+        Some(_) => return Err(EngineError::bad("confirm", "type takeover to run it (this node stops serving)")),
+    };
+    let force = opt_bool(p, "force")?.unwrap_or(false);
+    let b = s.ha_backend().ok_or_else(|| EngineError::bad("method", "redundancy is not running"))?;
+    let t = b
+        .test_takeover(&method, secs, run, force)
+        .map_err(|e| EngineError::bad("method", e))?;
+    if run && t.state == "running" {
+        s.log_event(
+            &["ppp", "warning"],
+            crate::logging::DAEMON,
+            format!("ppp redundancy: takeover test started ({method}, {secs} s)"),
+            json!({"method": method, "seconds": secs}),
+        );
+    }
+    Ok(serde_json::to_value(t).unwrap_or_else(|_| json!({})))
 }
 
 #[cfg(test)]
@@ -330,6 +427,20 @@ mod tests {
             self.0.lock().unwrap().push(format!("simulate {secs}"));
             Ok(())
         }
+        fn test_takeover(
+            &self,
+            method: &str,
+            secs: u32,
+            run: bool,
+            force: bool,
+        ) -> std::result::Result<corerouter_model::ppp_redundancy::TakeoverTest, String> {
+            self.0.lock().unwrap().push(format!("test {method} {secs} {run} {force}"));
+            Ok(corerouter_model::ppp_redundancy::TakeoverTest {
+                method: method.into(),
+                state: if run { "running" } else { "checked" }.into(),
+                ..Default::default()
+            })
+        }
     }
 
     #[test]
@@ -349,5 +460,68 @@ mod tests {
         s.execute("ppp.redundancy.simulate-failure", &json!({"seconds": 10})).unwrap();
         assert!(s.execute("ppp.redundancy.simulate-failure", &json!({"seconds": 0})).is_err());
         assert_eq!(*fake.0.lock().unwrap(), ["switchover false", "switchover true", "simulate 10"]);
+    }
+
+    #[test]
+    fn bfd_profiles_and_the_detection_time() {
+        let mut s = Session::virtual_lab();
+        ready(&mut s);
+        let g = s.execute("ppp.redundancy.get", &json!({})).unwrap();
+        assert_eq!(g["detection_ms"], 1200, "hellos only");
+        assert!(g["warnings"].as_array().unwrap().is_empty(), "disabled: no warnings");
+        s.execute("ppp.redundancy.set", &json!({"enabled": true})).unwrap();
+        let g = s.execute("ppp.redundancy.get", &json!({})).unwrap();
+        assert!(g["warnings"].to_string().contains("no BFD"), "{g}");
+        let e = s.execute("ppp.redundancy.set", &json!({"bfd": "nope"})).unwrap_err();
+        assert!(e.to_string().contains("bfd") && e.to_string().contains("fast"), "{e}");
+        let r = s.execute("ppp.redundancy.set", &json!({"bfd": "fast"})).unwrap();
+        assert_eq!(r["bfd"], "fast");
+        assert_eq!(r["detection_ms"], 1200, "the access hellos still decide");
+        assert!(r["warnings"].to_string().contains("one path only"), "{r}");
+        let e = s.execute("ppp.redundancy.set", &json!({"access_bfd": "fast"})).unwrap_err();
+        assert!(e.to_string().contains("access_peer"), "{e}");
+        let e = s.execute("ppp.redundancy.set", &json!({"access_bfd": "fast", "access_peer": "x"})).unwrap_err();
+        assert!(e.to_string().contains("access_peer"), "{e}");
+        let r = s
+            .execute("ppp.redundancy.set", &json!({"access_bfd": "fast", "access_peer": "100.64.0.2"}))
+            .unwrap();
+        assert_eq!((r["access_peer"].clone(), r["detection_ms"].clone()), (json!("100.64.0.2"), json!(150)));
+        assert!(!r["warnings"].to_string().contains("BFD"), "{r}");
+        // A name as the peer has no address for BFD.
+        let e = s.execute("ppp.redundancy.set", &json!({"peer": "bng2.isp:8730"})).unwrap_err();
+        assert!(e.to_string().contains("bfd"), "{e}");
+        // Back to hellos only.
+        let r = s.execute("ppp.redundancy.set", &json!({"bfd": "", "access_bfd": "", "access_peer": ""})).unwrap();
+        assert_eq!(r["detection_ms"], 1200);
+        assert!(r.get("access_peer").is_none());
+    }
+
+    #[test]
+    fn test_takeover_checks_first_and_runs_only_on_confirmation() {
+        let mut s = Session::virtual_lab();
+        let e = s.execute("ppp.redundancy.test-takeover", &json!({})).unwrap_err();
+        assert!(e.to_string().contains("not running"), "{e}");
+        let fake = Arc::new(Fake(Mutex::new(Vec::new())));
+        s.set_ha_backend(fake.clone());
+        let t = s.execute("ppp.redundancy.test-takeover", &json!({})).unwrap();
+        assert_eq!(t["state"], "checked", "no confirm: only the checks");
+        for (p, key) in [
+            (json!({"confirm": "yes"}), "confirm"),
+            (json!({"method": "reboot"}), "method"),
+            (json!({"seconds": 1}), "seconds"),
+        ] {
+            let e = s.execute("ppp.redundancy.test-takeover", &p).unwrap_err();
+            assert!(e.to_string().contains(key), "{p}: {e}");
+        }
+        let t = s
+            .execute("ppp.redundancy.test-takeover", &json!({"confirm": "takeover", "seconds": 20}))
+            .unwrap();
+        assert_eq!(t["state"], "running");
+        s.execute("ppp.redundancy.test-takeover", &json!({"method": "switchover", "confirm": "takeover", "force": true}))
+            .unwrap();
+        assert_eq!(
+            *fake.0.lock().unwrap(),
+            ["test failure 15 false false", "test failure 20 true false", "test switchover 15 true true"]
+        );
     }
 }

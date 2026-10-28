@@ -587,7 +587,7 @@ impl Lab {
                     change = Some(false);
                 }
                 if let Some(up) = change {
-                    n.node.bfd(now, path, up, !up);
+                    n.node.bfd(now, path, up, !up, detect);
                     self.note(|| format!("node{i} bfd {path:?} {}", if up { "up" } else { "down" }));
                     self.drain(i);
                 }
