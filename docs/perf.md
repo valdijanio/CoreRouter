@@ -2178,3 +2178,13 @@ threads 8,2 % por thread. Data plane: `bfdd` → `bgpd` em 0,20–0,26 ms (5 cor
 - 2026-10-28, G3.6h, dois daemons debug em namespace (Ryzen AI Max+ 395), **medido**: com o laço
   do `ppp-ha` acordado pelo evento, a decisão sai 0–4 ms depois da detecção do BFD (antes, com o
   tique de 10 ms, saía ~10 ms depois).
+
+### G3.4f: banco SR de 10 000 SIDs (medido)
+
+2026-10-28, 32 núcleos (carga ~1,3), build de bench (release), `cargo bench -p corerouter-hal-frr --bench frr_sr`:
+1 000 roteadores SR, 10 000 prefix SIDs, 1,5 MiB de JSON.
+
+| Medida | Resultado |
+|---|---|
+| leitura do banco SR para o modelo | 8,5 ms |
+| conflitos de SID sobre ele (1 995 achados) | 2,6 ms |
