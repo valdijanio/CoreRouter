@@ -41,7 +41,7 @@
       "link": 3
     }
   ],
-  "format": "corerouter-netsim/1",
+  "format": "corerouter-netsim/2",
   "links": [
     {
       "a": "R1",
@@ -187,6 +187,43 @@
             "remote_address": "10.0.0.13",
             "remote_as": 65100
           }
+        },
+        {
+          "command": "routing.ospf.instance.add",
+          "params": {
+            "name": "default",
+            "router_id": "10.255.0.1"
+          }
+        },
+        {
+          "command": "routing.ospf.area.add",
+          "params": {
+            "area_id": "0.0.0.0",
+            "instance": "default",
+            "name": "backbone"
+          }
+        },
+        {
+          "command": "routing.ospf.interface-template.add",
+          "params": {
+            "area": "backbone",
+            "comment": "loopback",
+            "interfaces": [
+              "lo"
+            ],
+            "passive": true
+          }
+        },
+        {
+          "command": "routing.ospf.interface-template.add",
+          "params": {
+            "area": "backbone",
+            "interfaces": [
+              "ether1",
+              "ether2"
+            ],
+            "type": "ptp"
+          }
         }
       ],
       "name": "R1",
@@ -257,6 +294,43 @@
             "remote_address": "10.255.0.3",
             "remote_as": 65000,
             "update_source": "10.255.0.2"
+          }
+        },
+        {
+          "command": "routing.ospf.instance.add",
+          "params": {
+            "name": "default",
+            "router_id": "10.255.0.2"
+          }
+        },
+        {
+          "command": "routing.ospf.area.add",
+          "params": {
+            "area_id": "0.0.0.0",
+            "instance": "default",
+            "name": "backbone"
+          }
+        },
+        {
+          "command": "routing.ospf.interface-template.add",
+          "params": {
+            "area": "backbone",
+            "comment": "loopback",
+            "interfaces": [
+              "lo"
+            ],
+            "passive": true
+          }
+        },
+        {
+          "command": "routing.ospf.interface-template.add",
+          "params": {
+            "area": "backbone",
+            "interfaces": [
+              "ether1",
+              "ether2"
+            ],
+            "type": "ptp"
           }
         }
       ],
@@ -355,6 +429,43 @@
             "output_filter": "sim-accept",
             "remote_address": "10.0.0.17",
             "remote_as": 65100
+          }
+        },
+        {
+          "command": "routing.ospf.instance.add",
+          "params": {
+            "name": "default",
+            "router_id": "10.255.0.3"
+          }
+        },
+        {
+          "command": "routing.ospf.area.add",
+          "params": {
+            "area_id": "0.0.0.0",
+            "instance": "default",
+            "name": "backbone"
+          }
+        },
+        {
+          "command": "routing.ospf.interface-template.add",
+          "params": {
+            "area": "backbone",
+            "comment": "loopback",
+            "interfaces": [
+              "lo"
+            ],
+            "passive": true
+          }
+        },
+        {
+          "command": "routing.ospf.interface-template.add",
+          "params": {
+            "area": "backbone",
+            "interfaces": [
+              "ether1",
+              "ether2"
+            ],
+            "type": "ptp"
           }
         }
       ],

@@ -534,11 +534,16 @@ mod tests {
         s.execute("routing.filter.rule.add", &json!({"chain": "up-in", "rule": "accept"})).unwrap();
         s.execute("routing.bgp.template.add", &json!({"name": "up", "hold_time": 90, "input_filter": "up-in", "output_filter": "up-in"})).unwrap();
         s.execute("routing.bgp.connection.add", &json!({"name": "upstream", "remote_address": "192.0.2.2", "remote_as": 64999, "templates": "up"})).unwrap();
+        s.execute("routing.ospf.instance.add", &json!({"name": "core", "router_id": "10.255.9.9"})).unwrap();
+        s.execute("routing.ospf.area.add", &json!({"name": "bb", "instance": "core", "area_id": "0.0.0.0"})).unwrap();
+        s.execute("routing.ospf.interface-template.add", &json!({"area": "bb", "interfaces": ["ether1"], "type": "ptp", "cost": 30})).unwrap();
         let r = s.execute("tool.netsim.import", &json!({})).unwrap();
         assert_eq!(r["node"], "this-router");
         assert_eq!(r["refused"], json!([]), "{r}");
         let n = s.execute("tool.netsim.node.get", &json!({"node": "this-router"})).unwrap();
         assert_eq!(n["bgp_peers"][0]["name"], "upstream", "{n}");
+        let t = s.execute("tool.netsim.node.run", &json!({"node": "this-router", "id": "routing.ospf.interface-template.list"})).unwrap();
+        assert_eq!(t["result"][0]["cost"], 30, "{t}");
         // The real router is untouched.
         assert!(s.store().running().routing.bgp_connections.contains_key("upstream"));
         assert_eq!(s.store().running().ip.addresses.len(), 2);
@@ -553,5 +558,47 @@ mod tests {
         assert!(s.execute("tool.netsim.new", &json!({"preset": "rnig"})).unwrap_err().to_string().contains("ring"));
         assert!(s.execute("tool.netsim.new", &json!({"preset": "ring", "nodes": 40, "bgp": "ibgp"})).is_err());
         assert_eq!(s.execute("tool.netsim.clear", &json!({})).unwrap()["cleared"], false);
+    }
+
+    fn route(s: &mut Session, node: &str, prefix: &str) -> Option<Value> {
+        let n = s.execute("tool.netsim.node.get", &json!({"node": node})).unwrap();
+        n["routes"].as_array().unwrap().iter().find(|r| r["prefix"] == prefix).cloned()
+    }
+
+    #[test]
+    fn each_virtual_router_runs_its_own_ospf_config() {
+        // G3.7d: the presets type OSPF in each router (instance, backbone,
+        // point-to-point template, passive loopback); the simulator reads it.
+        let mut s = lab_session();
+        let t = s.execute("tool.netsim.node.run", &json!({"node": "R1", "id": "routing.ospf.interface-template.list"})).unwrap();
+        let rows = t["result"].as_array().unwrap().clone();
+        assert!(rows.iter().any(|r| r["passive"] == true && r["interfaces"] == json!(["lo"])), "{t}");
+        let ptp = rows.iter().find(|r| r["type"] == "ptp").unwrap()["id"].clone();
+        run_for(&mut s, 60_000);
+        assert_eq!(route(&mut s, "R1", "10.255.0.2/32").unwrap()["metric"], 10);
+        // A template before it makes ether1 (to R2) cost 100: R1 goes round by R3.
+        s.execute("tool.netsim.node.run", &json!({"node": "R1", "id": "routing.ospf.interface-template.add",
+            "params": {"area": "backbone", "interfaces": ["ether1"], "type": "ptp", "cost": 100, "place_before": ptp}})).unwrap();
+        run_for(&mut s, 30_000);
+        assert_eq!(route(&mut s, "R1", "10.255.0.2/32").unwrap()["metric"], 20);
+        // R2 turns its OSPF off: its loopback leaves the other routers.
+        s.execute("tool.netsim.node.run", &json!({"node": "R2", "id": "routing.ospf.instance.set",
+            "params": {"id": "default", "disabled": true}})).unwrap();
+        run_for(&mut s, 60_000);
+        assert!(route(&mut s, "R1", "10.255.0.2/32").is_none());
+        // The upstream (R4) has no OSPF at all.
+        let r4 = s.execute("tool.netsim.node.run", &json!({"node": "R4", "id": "routing.ospf.instance.list"})).unwrap();
+        assert_eq!(r4["result"], json!([]));
+    }
+
+    #[test]
+    fn a_new_link_joins_ospf_by_command() {
+        let mut s = lab_session();
+        s.execute("tool.netsim.node.add", &json!({"name": "R5", "asn": 65000})).unwrap();
+        s.execute("tool.netsim.link.add", &json!({"a": "R5", "b": "R2"})).unwrap();
+        run_for(&mut s, 60_000);
+        // R5's loopback reaches R1 through OSPF (R5 typed its template).
+        let r = route(&mut s, "R1", "10.255.0.5/32").unwrap();
+        assert_eq!(r["proto"], "ospf", "{r}");
     }
 }
