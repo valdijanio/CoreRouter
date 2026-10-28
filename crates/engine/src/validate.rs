@@ -345,6 +345,7 @@ pub(crate) fn route_issues<'a>(
     if let Reach::Invalid { field, why } = route::reach(cfg, r) {
         out.push((field, why.text));
     }
+    check_gateway_issues(cfg, r, &mut out);
     // Equal distance is ECMP (RouterOS v7, G1.27): only the very same
     // next hop twice is refused.
     for o in others.filter(|o| o.id != r.id && o.routing_table == r.routing_table) {
@@ -359,6 +360,47 @@ pub(crate) fn route_issues<'a>(
         }
     }
     out
+}
+
+/// G1.27f / G3.6g: what `check_gateway` can check.
+fn check_gateway_issues(cfg: &Config, r: &RouteEntry, out: &mut Vec<(&'static str, String)>) {
+    use corerouter_model::dhcp_client::CheckGateway;
+    let gw = r.gateway.address();
+    match (r.check_gateway, gw) {
+        (CheckGateway::None, _) => {}
+        (m, None) => out.push((
+            "check_gateway",
+            format!(
+                "check-gateway={m} needs a gateway address: an interface gateway ({}) has no \
+                 host to check",
+                r.gateway
+            ),
+        )),
+        (CheckGateway::Arp, Some(std::net::IpAddr::V6(_))) => out.push((
+            "check_gateway",
+            "arp checks IPv4 gateways; use ping or bfd for an IPv6 gateway".into(),
+        )),
+        (CheckGateway::Bfd, Some(_)) => {
+            let name = if r.bfd_profile.is_empty() {
+                corerouter_model::bfd::PROFILE_DEFAULT
+            } else {
+                r.bfd_profile.as_str()
+            };
+            if cfg.routing.bfd.profile(name).is_none() {
+                out.push((
+                    "bfd_profile",
+                    format!(
+                        "no BFD profile '{}' (see routing.bfd.profile.list)",
+                        name.chars().take(48).collect::<String>()
+                    ),
+                ));
+            }
+        }
+        _ => {}
+    }
+    if !r.bfd_profile.is_empty() && r.check_gateway != CheckGateway::Bfd {
+        out.push(("bfd_profile", "only with check_gateway=bfd".into()));
+    }
 }
 
 fn vrf_member_checks(

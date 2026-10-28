@@ -269,6 +269,8 @@ pub fn lease_entries(
             routing_table: table.clone(),
             disabled: false,
             comment: String::new(),
+            check_gateway: Default::default(),
+            bfd_profile: String::new(),
         });
     }
     (address, routes, notes)
@@ -375,16 +377,21 @@ impl Session {
     /// the data plane runs. Entries of clients that `cfg` no longer has (or
     /// has disabled) are left out, and so is a route a static route already
     /// holds (same table, destination and distance: the kernel takes one).
+    /// Static routes whose gateway fails check-gateway (G1.27f) are out too.
     pub(crate) fn effective<'a>(&self, cfg: &'a Config) -> Cow<'a, Config> {
         let v4_quiet = self
             .dhcp
             .runners
             .values()
             .all(|r| r.addresses.is_empty() && r.routes.is_empty() && r.fallback.is_none());
-        if v4_quiet && self.dhcp6_quiet(cfg) && self.dhcp6_server_quiet() {
+        let static_quiet = self.static_checks_quiet();
+        if v4_quiet && static_quiet && self.dhcp6_quiet(cfg) && self.dhcp6_server_quiet() {
             return Cow::Borrowed(cfg);
         }
         let mut out = cfg.clone();
+        if !static_quiet {
+            out.ip.routes.retain(|r| !self.static_withholds(r));
+        }
         for (id, r) in &self.dhcp.runners {
             let live = cfg
                 .ip
@@ -519,7 +526,7 @@ impl Session {
             std::mem::take(&mut r.notes),
         );
         let old_fallback = r.fallback.clone();
-        let old_gw_down = r.gw.down;
+        let old_gw_health = r.gw.health.clone();
         // A lease replaces the fallback address in the same apply; a stop
         // takes it away too.
         r.fallback = None;
@@ -547,7 +554,7 @@ impl Session {
             if let Some(r) = self.dhcp.runners.get_mut(&id) {
                 (r.addresses, r.routes, r.notes) = old;
                 r.fallback = old_fallback;
-                r.gw.down = old_gw_down;
+                r.gw.health = old_gw_health;
                 r.error = Some(msg.clone());
             }
             self.dhcp_log(id, &Event::Error(msg));

@@ -8,7 +8,7 @@ use std::net::IpAddr;
 
 use corerouter_model::bfd::{
     BfdAuth, BfdConfig, BfdKeyText, BfdPeer, BfdProfile, BfdState, FAST_WARN_MS, INTERVAL_MS, MAX_KEY, MAX_PEERS,
-    MAX_PROFILES, PROFILE_DEFAULT, PROFILE_FAST, builtin_profiles, wanted_sessions,
+    MAX_PROFILES, PROFILE_DEFAULT, PROFILE_FAST, builtin_profiles, wanted_all,
 };
 use serde_json::{Value, json};
 
@@ -329,10 +329,20 @@ fn users_of(bfd: &BfdConfig, profile: &str) -> Vec<String> {
 
 fn profile_remove(s: &mut Session, p: &Value) -> Result<Value> {
     let id = req_str(p, "id")?;
-    let bfd = &mut s.store_mut().candidate_mut().routing.bfd;
+    let cand = s.store_mut().candidate_mut();
+    // G3.6g: static routes with check_gateway=bfd use profiles too.
+    let routes: Vec<String> = cand
+        .ip
+        .routes
+        .iter()
+        .filter(|r| r.check_gateway == corerouter_model::dhcp_client::CheckGateway::Bfd && r.bfd_profile == id)
+        .map(|r| format!("route {}", r.id))
+        .collect();
+    let bfd = &mut cand.routing.bfd;
     let builtin = id == PROFILE_DEFAULT || id == PROFILE_FAST;
     if !builtin {
-        let users = users_of(bfd, id);
+        let mut users = users_of(bfd, id);
+        users.extend(routes);
         if !users.is_empty() {
             return Err(EngineError::bad(
                 "id",
@@ -554,7 +564,7 @@ fn session_list(s: &mut Session, _: &Value) -> Result<Value> {
         .map(|x| serde_json::to_value(x).unwrap_or_else(|_| json!({})))
         .collect();
     // What the running config asks for and the service does not run (yet).
-    for (k, (prof, users)) in wanted_sessions(&s.store().running().routing.bfd) {
+    for (k, (prof, users)) in wanted_all(s.store().running()) {
         if st.sessions.iter().any(|x| x.peer == Some(k.peer) && x.multihop == k.multihop && x.local == k.local) {
             continue;
         }

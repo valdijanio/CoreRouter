@@ -61,6 +61,8 @@ fn routes(n: usize) -> Config {
             routing_table: RoutingTable::Main,
             disabled: false,
             comment: String::new(),
+            check_gateway: Default::default(),
+            bfd_profile: String::new(),
         });
     }
     cfg

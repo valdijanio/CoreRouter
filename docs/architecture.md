@@ -819,6 +819,14 @@ um link cujo tipo no kernel difere do config. Testes de integração (`tests/net
 num network namespace descartável sem root: `cargo xtask netns` (passo do `cargo xtask ci`,
 que vira `skip` onde `unshare` sem root não é permitido).
 
+**Check-gateway (G1.27f, G3.6g):** a rota estática com `check_gateway` sai do config efetivo
+(`Session::effective`) enquanto o gateway está caído, então hal-linux, FRR e drift a veem sumir sem
+código próprio. Estado (`gateway_check::Health`, compartilhado com o cliente DHCP da G4.7c) no
+engine; sondas no serviço `route-check` do daemon, numa thread, fora do lock, agrupadas por
+(método, gateway, tabela). Rust puro em vez de `dpinger` (um processo por gateway) ou do
+`staticd`+`bfdd` do FRR: uma thread leva 1 000 gateways com 0,5 % de um núcleo (**medido**) e o
+BFD já é o nosso (G3.6). Uma thread basta: dividir só acrescentaria lock à agenda.
+
 ### Tarefas das ferramentas (G6.1–G6.3)
 
 Ping, MTU e (G6.3) MTR levam segundos ou não terminam: o comando valida, inicia um **job** e
@@ -1272,6 +1280,30 @@ papel do data plane, ou, se ele não servir, derrubando o vizinho pelo vty.
 
 - vier um LDP em Rust (holo, G3.8);
 - o kernel não aguentar a vazão MPLS.
+
+### LSP ping e traceroute em Rust puro (G3.5b)
+
+**Comparado:** não há ferramenta externa a orquestrar. O FRR não tem LSP ping (o `ldpd` não
+responde MPLS echo), o iproute2 também não, e o kernel não manda nem entrega pacotes para 127/8
+por uma interface. Ficaram três peças em Rust puro:
+
+- codec (RFC 8029 §3) e lógica do respondedor (§4.4), sem E/S, no `corerouter-hal`
+  (`hal/src/lsp/`), ao lado do `icmp_ext.rs`: o `hal-linux` é L1 e não pode usar um `proto-*`,
+  e o laboratório responde com o mesmo código (`lsp/sim.rs`);
+- envio por `AF_PACKET` (o quadro inteiro, com a pilha de rótulos da rota da FEC, lida por
+  `RTM_GETROUTE` + `RTA_ENCAP`), contra uma rota de host temporária com `encap mpls` (mexeria na
+  tabela do roteador a cada ping) — ficou o `AF_PACKET`;
+- recepção do respondedor por sockets `AF_PACKET` presos a um protocolo (MPLS, IPv4, IPv6) e às
+  interfaces MPLS, com filtro BPF clássico, contra `ETH_P_ALL` (o kernel chamaria o socket em
+  todo pacote enviado também, com um clone por pacote) e contra `route_localnet=1` (entregaria
+  127/8 vindo da rede a qualquer serviço local: brecha). Ficaram os sockets por protocolo.
+
+**Números:** pedido codificado em 117 ns, lido em 104 ns, resposta de trânsito completa (100 mil
+rótulos) em 363 ns, **medidos** (`hal/benches/lsp_echo.rs`, release). Com o limite padrão de 100
+respostas/s, ~0,004 % de um núcleo.
+
+**Revisar se:** o filtro BPF por pacote IP nas interfaces MPLS aparecer num perfil do caminho de
+dados (passar o respondedor para o XDP da G3.5f).
 
 ## Histórico de revisão
 

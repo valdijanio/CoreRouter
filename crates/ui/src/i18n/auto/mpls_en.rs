@@ -48,6 +48,19 @@ Seconds a neighbor's Hello is held before the adjacency drops (default 15, RFC 5
 The link towards another LSR. Its MTU must fit a full IP packet plus 4 bytes per label."##),
     (r##"mpls.if.state"##, r##"## What it is
 `active`: LDP sends Hellos there. `down`: the link is down or has no address. `no daemon`: no routing daemon."##),
+    (r##"mpls.lsp_ping_rate"##, r##"## What it is
+How many MPLS echo replies this router sends per second at most (default 100). The rest are dropped and counted.
+
+## Why
+RFC 8029 §5 asks for a rate limiter on UDP port 3503: without one a flood of requests fills the control plane. A reply is never larger than the request plus the mappings and goes only to the sender, so it cannot amplify."##),
+    (r##"mpls.lsp_ping_responder"##, r##"## What it is
+Answers LSP ping and LSP traceroute (MPLS echo request, RFC 8029) that reach this router, as the LSP's egress or as the transit LSR where the label TTL expired.
+
+## Default
+On, as on Cisco and Junos: off, a ping that reaches here looks like a broken LSP. It works on the interfaces that take MPLS (MPLS › Interface or LDP).
+
+## Diagnosis
+`mpls.settings.get` shows its counters (`lsp_ping_counters`): requests heard, answered, dropped by the rate and by return code."##),
     (r##"mpls.lsr_id"##, r##"## What it is
 This router's LSR ID (RFC 5036 §2.2.2), usually the loopback address. Required to start LDP."##),
     (r##"mpls.mtu"##, r##"## What it is

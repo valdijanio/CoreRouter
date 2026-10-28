@@ -267,6 +267,8 @@ fn a_failed_apply_puts_the_slaves_back() {
         routing_table: corerouter_model::RoutingTable::Main,
         disabled: false,
         comment: String::new(),
+        check_gateway: Default::default(),
+        bfd_profile: String::new(),
     });
     let err = hal.apply(&base, &to).unwrap_err().to_string();
     assert!(
@@ -361,6 +363,8 @@ fn live_settings_change_without_recreating_the_bond() {
         routing_table: corerouter_model::RoutingTable::Main,
         disabled: false,
         comment: String::new(),
+        check_gateway: Default::default(),
+        bfd_profile: String::new(),
     });
     let err = hal.apply(&to, &bad).unwrap_err().to_string();
     assert!(

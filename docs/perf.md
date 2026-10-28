@@ -2100,3 +2100,44 @@ laboratório de 500 roteadores por comandos (uma transação cada) leva 150 ms; 
   - `mpls_page/find_cached`: 25 ms → 0,48 ms;
   - `mpls_page/service_build`: 47 ms, fora do lock;
   - o netlink no kernel (lote × um a um, dump de 100 mil) fica pendente: precisa do `mpls_router`.
+
+### G1.27f — check-gateway de rotas estáticas (**medido**, 2026-10-28, 32 threads, build release)
+
+Daemon real em netns (`netns_route_check::load_1000_gateways`, `--ignored`), 1 000 gateways num
+segundo namespace, uma rota por gateway, intervalo de 10 s (100 sondas/s), 30 s medidos na thread
+`svc-route-check` (`/proc/<pid>/task/*/stat`):
+
+| Método | CPU da thread | Sondas atrasadas (média / máx.) | Inalcançáveis |
+|---|---|---|---|
+| ping | 0,50 % de um núcleo | 9 ms / 24 ms | 0 |
+| arp | 0,37 % de um núcleo | 9 ms / 119 ms (o máximo inclui os 1 000 `ip.route.set` da troca) | 0 |
+
+O atraso médio é metade do tick de 20 ms; sobre 10 s, 0,1 %. Uma thread basta (0,5 % de um
+núcleo): dividir por interface só acrescentaria um lock à agenda.
+
+Engine (`cargo bench -p corerouter-engine --bench gateway_check`, 4 rotas por gateway), antes →
+depois das otimizações deste PR (lista de gateways caídos no `effective`, contagem de rotas numa
+passada, log agregado, sync em cache pela geração do config):
+
+| Caso | 1 000 gateways | 10 000 gateways |
+|---|---|---|
+| sync por segundo, config igual (sob o lock) | 0,88 ms → 0,002 ms | 9,4 ms → 0,024 ms |
+| tomar os alvos (config mudou) | 0,98 ms | 9,7 ms |
+| relato de um tick, todos respondendo | 0,28 ms | 3,0 ms |
+| todos caem e voltam (2 applies) | 43,7 ms → 7,2 ms | 3 643 ms → 78 ms |
+| agenda: um intervalo inteiro a ticks de 20 ms (sem lock) | 0,82 ms | 12,9 ms |
+
+### LSP ping (G3.5b)
+
+Release, criterion, esta máquina (32 núcleos), 2026-10-28, **medido**
+(`cargo bench -p corerouter-hal --bench lsp_echo`):
+
+| Caminho | Tempo |
+|---|---|
+| Codificar um MPLS echo request com DDMAP | 117 ns |
+| Ler o mesmo pedido | 104 ns |
+| Resposta de trânsito completa (ILM e FECs com 100 mil entradas) | 363 ns |
+
+VM do laboratório, build debug, 2026-10-28, **medido** (`scripts/lsp-ping-live.sh`, dois saltos
+com LDP do FRR): LSP ping mín. 69 µs, mediana 90 µs, p95 590 µs; ICMP do kernel no mesmo caminho
+mín. 11 µs, média 17 µs.

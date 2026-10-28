@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::bonding::{BondMode, HashPolicy, LacpRate, default_mii_interval};
 use crate::cow::CowArc;
 use crate::cow_list::CowList;
-use crate::dhcp_client::DhcpClient;
+use crate::dhcp_client::{CheckGateway, DhcpClient};
 use crate::dns::Dns;
 use crate::firewall::Firewall;
 use crate::interface_list::InterfaceLists;
@@ -370,6 +370,13 @@ pub struct RouteEntry {
     pub disabled: bool,
     #[serde(default)]
     pub comment: String,
+    /// RouterOS `check-gateway` (G1.27f): while the gateway does not
+    /// answer, the route leaves the data plane and the next distance wins.
+    #[serde(default, skip_serializing_if = "CheckGateway::is_none")]
+    pub check_gateway: CheckGateway,
+    /// BFD profile of `check_gateway = bfd` (empty: `default`, G3.6g).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bfd_profile: String,
 }
 
 pub const DEFAULT_DISTANCE: u8 = 1;

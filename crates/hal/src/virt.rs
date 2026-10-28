@@ -952,6 +952,11 @@ impl Hal for VirtualHal {
         Ok(Arc::clone(&self.prober))
     }
 
+    /// The lab's simulated LSPs (`lsp::sim`).
+    fn lsp_prober(&self) -> Result<crate::lsp::SharedLspProber, String> {
+        Ok(Arc::new(crate::lsp::sim::SimLspProber))
+    }
+
     /// Simulated traffic on any lab port (`capture::SimCapture`).
     fn packet_capture(&self) -> Result<crate::capture::SharedCapture, String> {
         Ok(Arc::new(crate::capture::SimCapture))

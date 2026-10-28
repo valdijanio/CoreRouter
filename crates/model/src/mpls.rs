@@ -129,7 +129,19 @@ pub struct MplsSettings {
     pub propagate_ttl: bool,
     /// The IP packet size the MTU check assumes (not a RouterOS setting).
     pub payload_mtu: u32,
+    /// Answer MPLS echo requests (LSP ping / traceroute, RFC 8029; G3.5b).
+    /// On by default, as on Cisco and Junos: a ping that reaches this
+    /// router would otherwise look like a broken LSP.
+    pub lsp_ping_responder: bool,
+    /// Echo replies per second at most (RFC 8029 §5: "A rate limiter
+    /// SHOULD be applied"); the rest are dropped and counted.
+    pub lsp_ping_rate: u32,
 }
+
+/// Default of [`MplsSettings::lsp_ping_rate`] (replies per second).
+pub const DEFAULT_LSP_PING_RATE: u32 = 100;
+/// Highest [`MplsSettings::lsp_ping_rate`].
+pub const MAX_LSP_PING_RATE: u32 = 10_000;
 
 impl Default for MplsSettings {
     fn default() -> Self {
@@ -137,6 +149,8 @@ impl Default for MplsSettings {
             dynamic_label_range: (FIRST_UNRESERVED, MAX_LABEL),
             propagate_ttl: true,
             payload_mtu: DEFAULT_PAYLOAD_MTU,
+            lsp_ping_responder: true,
+            lsp_ping_rate: DEFAULT_LSP_PING_RATE,
         }
     }
 }

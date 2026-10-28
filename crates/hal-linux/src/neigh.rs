@@ -878,6 +878,60 @@ mod linux {
             }
             Ok(None)
         }
+
+        fn request(&mut self, src: Ipv4Addr, target: Ipv4Addr) -> Result<bool, HalError> {
+            use nix::sys::socket::{MsgFlags, send};
+            use std::os::fd::AsRawFd;
+            send(
+                self.sock.as_raw_fd(),
+                &crate::dhcp_server::arp_request(self.mac, src, target),
+                MsgFlags::empty(),
+            )
+            .map_err(|e| HalError::Io(format!("{}: ARP request: {e}", self.name)))?;
+            Ok(true)
+        }
+
+        fn replies(&mut self, out: &mut Vec<(Ipv4Addr, [u8; 6])>) -> Result<(), HalError> {
+            use nix::sys::socket::{LinkAddr, recvfrom};
+            use std::os::fd::AsRawFd;
+            const PACKET_OUTGOING: u8 = 4;
+            /// Frames read per call: a busy segment's ARP chatter waits for
+            /// the next call instead of holding the thread.
+            const BUDGET: usize = 4096;
+            let mut buf = [0u8; 128];
+            for _ in 0..BUDGET {
+                let Ok((n, from)) = recvfrom::<LinkAddr>(self.sock.as_raw_fd(), &mut buf) else {
+                    break;
+                };
+                if from.is_some_and(|a| a.pkttype() == PACKET_OUTGOING) {
+                    continue;
+                }
+                if let Some(r) = arp_sender(buf.get(..n).unwrap_or(&[]), self.mac) {
+                    out.push(r);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// The sender (address, MAC) of an ARP frame that is not ours: a reply
+    /// to our request, or the host announcing itself — either way it is
+    /// alive on the link. Probes (sender 0.0.0.0) say nothing.
+    pub(crate) fn arp_sender(frame: &[u8], me: [u8; 6]) -> Option<(Ipv4Addr, [u8; 6])> {
+        if frame.get(12..14)? != [0x08, 0x06] {
+            return None;
+        }
+        let arp = frame.get(14..42)?;
+        // Ethernet / IPv4 only (RFC 826 htype 1, ptype 0x0800).
+        if arp.get(0..6)? != [0, 1, 8, 0, 6, 4] {
+            return None;
+        }
+        let sha: [u8; 6] = arp.get(8..14)?.try_into().ok()?;
+        let spa: [u8; 4] = arp.get(14..18)?.try_into().ok()?;
+        if sha == me || spa == [0; 4] {
+            return None;
+        }
+        Some((Ipv4Addr::from(spa), sha))
     }
 }
 

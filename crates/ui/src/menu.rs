@@ -102,6 +102,7 @@ pub(crate) const CATALOG: &[Entry] = &[
     e("ipv6-settings", None, Some("Settings"), icons::GEAR_SIX, "/ipv6 settings", &["ipv6.settings"], &["forward", "ra", "accept router advertisements", "slaac"]),
     e("log", None, None, icons::SCROLL, "/log", &["log"], &["eventos", "messages", "mensagens"]),
     e("logging", None, None, icons::NOTEBOOK, "/system logging", &["system.logging"], &["syslog", "remote log", "topics", "rules", "regras"]),
+    e("lsp-ping", None, None, icons::PATH, "", &["tool.mpls"], &["lsp ping", "lsp traceroute", "ping mpls", "traceroute mpls", "mpls ping", "mpls oam", "rfc 8029", "echo request", "ldp", "fec", "rótulo", "label", "lsp"]),
     e("mpls-forwarding", None, Some("Forwarding Table"), icons::TAG, "/mpls forwarding-table", &["mpls.forwarding-table", "mpls.static", "mpls.settings", "mpls.interface"], &["mpls", "label", "rótulo", "lfib", "lsp", "fec", "static lsp", "show mpls forwarding-table", "implicit-null", "php", "mtu"]),
     e("mpls-ldp", None, Some("LDP"), icons::TAG, "/mpls ldp", &["mpls.ldp"], &["mpls", "ldp", "label distribution", "distribuição de rótulos", "ldp neighbor", "vizinho ldp", "transport address", "igp sync", "ldp-sync", "gtsm", "rfc 5036"]),
     e("mtr", None, None, icons::PATH, "/tool traceroute", &["tool.mtr", "tool.traceroute"], &["traceroute", "tracert", "path", "caminho", "perda", "loss", "paris", "ecmp", "tcp traceroute", "tcptraceroute"]),

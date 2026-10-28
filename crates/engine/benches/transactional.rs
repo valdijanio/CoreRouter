@@ -63,6 +63,8 @@ fn big_session(lists: u32, routes: u32) -> Session {
             routing_table: RoutingTable::Main,
             disabled: false,
             comment: String::new(),
+            check_gateway: Default::default(),
+            bfd_profile: String::new(),
         });
     }
     cfg.ip.next_route_id = routes;

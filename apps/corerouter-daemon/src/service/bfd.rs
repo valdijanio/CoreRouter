@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use corerouter_engine::{Shared, lock};
 use corerouter_model::bfd::{
-    BfdAuth, BfdConfig, BfdEvent, BfdKey, BfdProfile, BfdState, MAX_HISTORY, wanted_sessions,
+    BfdAuth, BfdConfig, BfdEvent, BfdKey, BfdProfile, BfdState, MAX_HISTORY, route_sessions, wanted_all,
 };
 use corerouter_model::service::Listen;
 use corerouter_proto_bfd::auth::AuthConfig;
@@ -206,8 +206,10 @@ fn run(session: &Shared, threads: Option<usize>, dp_path: Option<PathBuf>, healt
             cfg_at = Some(Instant::now());
             let cfg = lock(session).store().running().clone();
             // A failed start (port taken) is retried every second.
-            if ctl.cfg.as_ref() != Some(&cfg.routing.bfd) && ctl.reconcile(&cfg, health) {
-                ctl.cfg = Some(cfg.routing.bfd.clone());
+            // The routes' sessions (G3.6g) are part of what is wanted.
+            let wanted = (cfg.routing.bfd.clone(), route_sessions(&cfg));
+            if ctl.cfg.as_ref() != Some(&wanted) && ctl.reconcile(&cfg, health) {
+                ctl.cfg = Some(wanted);
             }
             match &ctl.engine {
                 Some(e) => {
@@ -314,6 +316,10 @@ fn record(session: &Shared, events: &[engine::Event]) {
                 st.history.pop_front();
             }
         }
+        // G3.6g: static routes with check_gateway=bfd follow at once.
+        if e.from != e.to || released {
+            s.route_check_bfd_event(e.key.peer, e.key.multihop, e.key.local, e.client_up);
+        }
     }
 }
 
@@ -326,7 +332,7 @@ struct Controller {
     /// bfdd hands the sessions over (FRR present): the config's peers go
     /// to bfdd too (`proto_bfd::frr::render`), none is started here.
     dplane: bool,
-    cfg: Option<BfdConfig>,
+    cfg: Option<(BfdConfig, corerouter_model::bfd::Wanted)>,
     engine: Option<engine::Engine>,
     sessions: BTreeMap<BfdKey, (u32, engine::Spec)>,
     /// bfdd's sessions by its discriminator, and what it last said of each.
@@ -393,15 +399,25 @@ impl Controller {
                     *old = spec;
                 }
             }
-            return true;
         }
-        let wanted: BTreeMap<BfdKey, engine::Spec> = wanted_sessions(&cfg.routing.bfd)
+        // With bfdd the config's peers are its own; static routes with
+        // check_gateway=bfd (G3.6g) run here either way, except a gateway
+        // bfdd already has a session to.
+        let wanted_cfg = if self.dplane { route_sessions(cfg) } else { wanted_all(cfg) };
+        let wanted: BTreeMap<BfdKey, engine::Spec> = wanted_cfg
             .into_iter()
+            .filter(|(key, _)| !self.dp_sessions.values().any(|(s, _)| s.key == *key))
             .map(|(key, (prof, users))| (key.clone(), spec_of(key, &prof, users)))
             .collect();
         if wanted.is_empty() {
-            self.sessions.clear();
-            self.engine = None;
+            if let Some(eng) = self.engine.as_mut() {
+                for (key, (discr, _)) in std::mem::take(&mut self.sessions) {
+                    eng.remove(discr, &key);
+                }
+            }
+            if self.dp_sessions.is_empty() {
+                self.engine = None;
+            }
             return true;
         }
         if !self.ensure_engine(wanted.len(), health) {

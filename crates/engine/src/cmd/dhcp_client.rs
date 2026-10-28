@@ -255,6 +255,12 @@ fn edit(c: &mut DhcpClient, p: &Value) -> Result<()> {
         c.allowed_servers = v;
     }
     if let Some(v) = opt_parse::<CheckGateway>(p, "check_gateway")? {
+        if !CheckGateway::DHCP.contains(&v) {
+            return Err(crate::EngineError::bad(
+                "check_gateway",
+                "a DHCP client checks its gateway with arp or ping (bfd is for static routes)",
+            ));
+        }
         c.check_gateway = v;
     }
     if let Some(t) = opt_str(p, "fallback_address")? {

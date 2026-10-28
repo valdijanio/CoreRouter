@@ -171,6 +171,10 @@ pub mod neigh;
 /// entries in batches, the `net.mpls` knobs.
 pub mod mpls;
 
+/// LSP ping / traceroute (G3.5b): requests over `AF_PACKET`, the responder.
+#[cfg(target_os = "linux")]
+pub mod lsp;
+
 /// IP › Firewall › XDP (G2.5a): the XDP filter's loader, maps and counters.
 #[cfg(target_os = "linux")]
 pub mod xdp;
@@ -711,6 +715,14 @@ mod linux {
 
         fn mpls_reader(&self) -> Result<Box<dyn corerouter_hal::mpls::MplsReader>, HalError> {
             Ok(Box::new(crate::mpls::Reader::open()?))
+        }
+
+        fn lsp_prober(&self) -> Result<corerouter_hal::lsp::SharedLspProber, String> {
+            Ok(std::sync::Arc::new(crate::lsp::HostLspProber))
+        }
+
+        fn lsp_responder(&self) -> Result<Box<dyn corerouter_hal::lsp::LspResponderIo>, HalError> {
+            Ok(Box::new(crate::lsp::HostResponder::open()?))
         }
 
         fn neighbors(&mut self) -> Result<Vec<corerouter_hal::neigh::Neighbor>, HalError> {
