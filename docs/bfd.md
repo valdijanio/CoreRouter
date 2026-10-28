@@ -145,7 +145,9 @@ derrubar vizinhos pelo vty (opção (b)).
   toda conexão BGP e interface-template OSPF sem perfil (próprio ou herdado).
 
 Ficou para depois (gaps): `check_gateway=bfd` nas rotas estáticas (G3.6g, depende da G1.27f, que
-cria a retirada de rota estática do kernel) e BFD no link de sync do par BNG (G3.6h).
+cria a retirada de rota estática do kernel) e BFD no link de sync do par BNG (G3.6h, feita:
+`ppp.redundancy.set bfd=… access_bfd=…`; o motor avisa o par pelo `tap` das `Options`, na
+própria thread, sem o lock do `Session`; veja `docs/bng-ha.md` §2.13).
 
 ## Desempenho e paralelismo
 
