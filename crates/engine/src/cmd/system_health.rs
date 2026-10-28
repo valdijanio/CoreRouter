@@ -101,7 +101,7 @@ mod tests {
         let by = |k: &str| checks.iter().find(|c| c["key"] == k).unwrap().clone();
         assert_eq!(by("nic.errors")["severity"], "warning", "ether4's bad cable");
         assert!(by("nic.errors")["reason"].as_str().unwrap().contains("ether4"));
-        assert_eq!(by("ntp")["severity"], "warning", "NTP off by default");
+        assert_eq!(by("ntp")["severity"], "ok", "NTP off is the factory default (G4.6i)");
         assert_eq!(by("services")["severity"], "unknown", "no supervisor in the lab");
         assert_eq!(by("temperature")["severity"], "ok");
         assert_eq!(v["status"], "warning");

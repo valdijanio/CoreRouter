@@ -34,7 +34,7 @@ fn overview_has_cards_links_and_checks() {
     assert!(h.has_text("10 G"), "link chip with the speed");
     assert!(h.has_text("NIC errors"));
     assert!(h.has_text_containing("ether4 com erros subindo"), "the reason, in Portuguese");
-    assert!(h.has_text_containing("2 warnings"), "header chip: NTP off and the bad cable");
+    assert!(h.has_text_containing("1 warning"), "header chip: only the bad cable (NTP off is the default)");
     assert!(h.has_text_containing("16 cores"));
     assert!(h.has_text_containing("crit 100 °C"));
     let p = h.app.panel_mut::<ResourcesPanel>().unwrap();
