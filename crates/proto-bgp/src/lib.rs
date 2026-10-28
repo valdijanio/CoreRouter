@@ -462,6 +462,11 @@ fn neighbor(
     if let Some(src) = &p.update_source {
         let _ = writeln!(s, " neighbor {a} update-source {src}");
     }
+    // G3.6b: the session follows BFD (`bfdd`, with CoreRouter's engine as
+    // its data plane).
+    if let Some(b) = &p.bfd {
+        let _ = writeln!(s, " neighbor {a} bfd profile {b}");
+    }
     if p.hold_time.is_some() || p.keepalive_time.is_some() {
         let (k, h) = timers(p);
         let _ = writeln!(s, " neighbor {a} timers {k} {h}");

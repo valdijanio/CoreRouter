@@ -1240,6 +1240,7 @@ dependencies = [
  "corerouter-firewall",
  "corerouter-hal",
  "corerouter-model",
+ "corerouter-proto-bfd",
  "corerouter-proto-bgp",
  "corerouter-proto-cgnat",
  "corerouter-proto-dhcp",
@@ -1311,6 +1312,7 @@ version = "0.1.0"
 dependencies = [
  "corerouter-hal",
  "corerouter-model",
+ "corerouter-proto-bfd",
  "corerouter-proto-bgp",
  "corerouter-proto-ospf",
  "criterion",
@@ -1394,8 +1396,10 @@ dependencies = [
 name = "corerouter-proto-bfd"
 version = "0.1.0"
 dependencies = [
+ "corerouter-model",
  "criterion",
  "proptest",
+ "serde_json",
  "sha1 0.11.0",
  "thiserror 2.0.21",
 ]

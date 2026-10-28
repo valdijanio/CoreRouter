@@ -35,10 +35,10 @@ pub const MAX_TEMPLATES: usize = 1_000;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("routing.bgp.template.add", "Add BGP Template", ["Routing", "BGP"], None,
-        "{name: string, templates?: [string] | string (parents, first wins), comment?: string, remote_as?: u32 | asdot string | null, local_role?: string | null, multihop?: bool | null, hold_time?: u16 | null, keepalive_time?: u16 | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | null, max_prefix_ipv6?: u32 | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes)} → {name}",
+        "{name: string, templates?: [string] | string (parents, first wins), comment?: string, remote_as?: u32 | asdot string | null, local_role?: string | null, multihop?: bool | null, hold_time?: u16 | null, keepalive_time?: u16 | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | null, max_prefix_ipv6?: u32 | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes), bfd?: string | null (a BFD profile, routing.bfd.profile: the session goes down with BFD)} → {name}",
         always, template_add),
     cmd!("routing.bgp.template.set", "Set BGP Template", [], None,
-        "{id: string (the name), name?: string, templates?: [string] | string, comment?: string, remote_as?: u32 | asdot string | null, local_role?: string | null, multihop?: bool | null, hold_time?: u16 | null, keepalive_time?: u16 | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | null, max_prefix_ipv6?: u32 | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes)} → {name}",
+        "{id: string (the name), name?: string, templates?: [string] | string, comment?: string, remote_as?: u32 | asdot string | null, local_role?: string | null, multihop?: bool | null, hold_time?: u16 | null, keepalive_time?: u16 | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | null, max_prefix_ipv6?: u32 | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes), bfd?: string | null (a BFD profile, routing.bfd.profile: the session goes down with BFD)} → {name}",
         has_templates, template_set),
     cmd!("routing.bgp.template.remove", "Remove BGP Template", [], None,
         "{id: string (the name)} → {name}",
@@ -47,13 +47,13 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{} → [{name, templates, params (own values; tcp_md5_key as \"***\"), effective (with the parents' values), used_by (connections and templates listing it), error?, comment}]",
         always, template_list),
     cmd!(query "routing.bgp.template.check", "Check BGP Template", [], None,
-        "{id?: string (the template being edited), name?: string, templates?: [string] | string, comment?: string, remote_as?: u32 | string | null, local_role?: string | null, multihop?: bool | yes | no | null, hold_time?: u16 | string | null, keepalive_time?: u16 | string | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | string | null, max_prefix_ipv6?: u32 | string | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | string | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes)} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk} (form texts accepted: \"90\", yes/no, empty = unset)",
+        "{id?: string (the template being edited), name?: string, templates?: [string] | string, comment?: string, remote_as?: u32 | string | null, local_role?: string | null, multihop?: bool | yes | no | null, hold_time?: u16 | string | null, keepalive_time?: u16 | string | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | string | null, max_prefix_ipv6?: u32 | string | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | string | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes), bfd?: string | null (a BFD profile, routing.bfd.profile: the session goes down with BFD)} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk} (form texts accepted: \"90\", yes/no, empty = unset)",
         always, template_check),
     cmd!("routing.bgp.connection.add", "Add BGP Connection", ["Routing", "BGP"], None,
-        "{name: string, remote_address: ip, instance?: string (default \"default\"), templates?: [string] | string, disabled?: bool, comment?: string, remote_as?: u32 | asdot string | null, local_role?: string | null, multihop?: bool | null, hold_time?: u16 | null, keepalive_time?: u16 | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | null, max_prefix_ipv6?: u32 | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes)} → {name}",
+        "{name: string, remote_address: ip, instance?: string (default \"default\"), templates?: [string] | string, disabled?: bool, comment?: string, remote_as?: u32 | asdot string | null, local_role?: string | null, multihop?: bool | null, hold_time?: u16 | null, keepalive_time?: u16 | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | null, max_prefix_ipv6?: u32 | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes), bfd?: string | null (a BFD profile, routing.bfd.profile: the session goes down with BFD)} → {name}",
         always, connection_add),
     cmd!("routing.bgp.connection.set", "Set BGP Connection", [], None,
-        "{id: string (the name), name?: string, remote_address?: ip, instance?: string, templates?: [string] | string, disabled?: bool (true: shutdown, the session closes and stays in the config), comment?: string, remote_as?: u32 | asdot string | null, local_role?: string | null, multihop?: bool | null, hold_time?: u16 | null, keepalive_time?: u16 | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | null, max_prefix_ipv6?: u32 | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes)} → {name}",
+        "{id: string (the name), name?: string, remote_address?: ip, instance?: string, templates?: [string] | string, disabled?: bool (true: shutdown, the session closes and stays in the config), comment?: string, remote_as?: u32 | asdot string | null, local_role?: string | null, multihop?: bool | null, hold_time?: u16 | null, keepalive_time?: u16 | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | null, max_prefix_ipv6?: u32 | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes), bfd?: string | null (a BFD profile, routing.bfd.profile: the session goes down with BFD)} → {name}",
         has_connections, connection_set),
     cmd!("routing.bgp.connection.remove", "Remove BGP Connection", [], None,
         "{id: string (the name)} → {name}",
@@ -62,7 +62,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{find?: string (in name, address, AS or comment)} → [{name, instance, remote_address, templates, disabled, comment, kind (ibgp | ebgp), local_as, params (own; tcp_md5_key \"***\"), effective (in force), inherited: [param] (from a template), key_set: bool (a TCP MD5 key is in force), state (the session's, or disabled | unknown), established, uptime_secs?, prefix_count?, prefix_sent?, error?}]",
         always, connection_list),
     cmd!(query "routing.bgp.connection.check", "Check BGP Connection", [], None,
-        "{id?: string (the connection being edited), name?: string, remote_address?: string, instance?: string, templates?: [string] | string, disabled?: bool, comment?: string, remote_as?: u32 | string | null, local_role?: string | null, multihop?: bool | yes | no | null, hold_time?: u16 | string | null, keepalive_time?: u16 | string | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | string | null, max_prefix_ipv6?: u32 | string | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | string | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes)} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk} (form texts accepted: \"90\", yes/no, empty = unset)",
+        "{id?: string (the connection being edited), name?: string, remote_address?: string, instance?: string, templates?: [string] | string, disabled?: bool, comment?: string, remote_as?: u32 | string | null, local_role?: string | null, multihop?: bool | yes | no | null, hold_time?: u16 | string | null, keepalive_time?: u16 | string | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | string | null, max_prefix_ipv6?: u32 | string | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | string | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes), bfd?: string | null (a BFD profile, routing.bfd.profile: the session goes down with BFD)} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk} (form texts accepted: \"90\", yes/no, empty = unset)",
         always, connection_check),
     cmd!("routing.bgp.session.clear", "Clear BGP Session", [], None,
         "{connection: string} → {connection, remote_address, action: \"clear\"} (closes the session and opens it again: NOTIFICATION Cease, administrative reset)",
@@ -249,6 +249,12 @@ fn parse_params(p: &Value, out: &mut BgpParams, seal: Sealer<'_>) -> Result<()> 
     }
     field(p, "keep_received", &mut out.keep_received, |v| {
         v.as_bool().ok_or_else(|| EngineError::bad("keep_received", "must be true or false"))
+    })?;
+    // G3.6b: checked against the profiles at commit (routing.bfd).
+    field(p, "bfd", &mut out.bfd, |v| {
+        let b = str_of("bfd", v)?.trim();
+        corerouter_model::bfd::check_profile_name(b).map_err(|e| EngineError::bad("bfd", e))?;
+        Ok(b.to_owned())
     })?;
     Ok(())
 }
@@ -549,6 +555,7 @@ const PARAM_NAMES: &[&str] = &[
     "input_filter",
     "output_filter",
     "keep_received",
+    "bfd",
 ];
 
 fn kind_of(local_as: Option<Asn>, p: &BgpParams) -> &'static str {
@@ -664,6 +671,7 @@ const UNSET_WHEN_EMPTY: &[&str] = &[
     "input_filter",
     "output_filter",
     "keep_received",
+    "bfd",
 ];
 
 /// The parameters of a form (texts) as `add`/`set` take them: numbers as
