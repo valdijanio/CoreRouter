@@ -575,6 +575,36 @@ fn a_default_route_via_the_server_when_asked() {
     );
 }
 
+/// G1.27h: a static `::/0` at the lease route's distance no longer hides
+/// it; both share the traffic and the client says with whom.
+#[test]
+fn a_static_default_at_the_same_distance_does_not_hide_the_lease_route() {
+    let mut l = Lab::new(Knobs::default());
+    let id = l.wan();
+    let st = l.ok(
+        "ip.route.add",
+        json!({"dst_address": "::/0", "gateway": "fe80::99%ether2", "distance": 5}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    l.ok(
+        "ipv6.dhcp-client.set",
+        json!({"id": id, "add_default_route": true, "default_route_distance": 5}),
+    );
+    l.run(500);
+    let routes = l.routes();
+    let lease = routes
+        .iter()
+        .find(|r| r["dst_address"] == "::/0" && r["origin"] == "dhcp")
+        .unwrap_or_else(|| panic!("lease route hidden: {routes:?}"));
+    assert_eq!(lease["flags"], "ADS+", "{lease}");
+    let c = l.client(&id);
+    assert_eq!(c["route_states"][0]["state"], "active", "{c}");
+    let note = c["notes"][0].as_str().unwrap();
+    assert!(note.contains("ECMP") && note.contains(&st), "{note}");
+}
+
 #[test]
 fn renew_release_and_a_server_that_forgot_us() {
     let mut l = Lab::new(Knobs::default());

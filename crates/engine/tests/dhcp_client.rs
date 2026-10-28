@@ -317,8 +317,12 @@ fn add_default_route_modes() {
     assert!(c["notes"][0].as_str().unwrap().contains("option 121 wins"));
 }
 
+/// G1.27h (reproduced on a VM, 2026-10-28): a static default route and a
+/// lease's default route at the same distance. The lease's route used to
+/// vanish from `ip.route.list` (and the kernel) with no word anywhere; as
+/// in RouterOS v7 both are listed and share the traffic (ECMP `+`).
 #[test]
-fn a_static_route_holds_its_place() {
+fn a_static_route_at_the_same_distance_shares_and_is_listed() {
     let mut l = Lab::new(Knobs {
         classless: false,
         ..Knobs::default()
@@ -327,22 +331,43 @@ fn a_static_route_holds_its_place() {
         "ip.address.add",
         json!({"address": "10.0.0.2/24", "interface": "ether2"}),
     );
-    l.ok(
+    let st = l.ok(
         "ip.route.add",
         json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.0.1"}),
-    );
-    let id = l.add(json!({"interface": "ether1"}));
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let id = l.add(json!({"interface": "ether1", "default_route_distance": 1}));
     l.run(1_000);
-    // Same distance as the static one: the kernel takes one, the static.
     let defaults: Vec<Value> = l
         .routes()
         .into_iter()
         .filter(|r| r["dst_address"] == "0.0.0.0/0")
         .collect();
-    assert_eq!(defaults.len(), 1, "{defaults:?}");
-    assert_eq!(defaults[0]["static"], true);
-    assert_eq!(defaults[0]["dynamic"], false);
-    // A backup: distance 2 is listed, not active.
+    assert_eq!(defaults.len(), 2, "{defaults:?}");
+    let dynamic = defaults.iter().find(|r| r["dynamic"] == true).unwrap();
+    let fixed = defaults.iter().find(|r| r["static"] == true).unwrap();
+    assert_eq!(dynamic["flags"], "ADS+", "{dynamic}");
+    assert_eq!(fixed["flags"], "AS+", "{fixed}");
+    // The kernel holds both paths (one multipath route).
+    let (_, kernel) = l.data_plane();
+    assert_eq!(
+        kernel.iter().filter(|r| r.starts_with("0.0.0.0/0")).count(),
+        2,
+        "{kernel:?}"
+    );
+    // The client says it, and with whom.
+    let c = l.client(&id);
+    assert_eq!(c["route_states"][0]["state"], "active", "{c}");
+    assert_eq!(c["route_states"][0]["ecmp"], 2, "{c}");
+    let note = c["notes"][0].as_str().unwrap();
+    assert!(
+        note.contains("ECMP") && note.contains(&st) && note.contains("10.0.0.1"),
+        "{note}"
+    );
+
+    // A backup: distance 2 is listed on standby, and the client says why.
     l.ok(
         "ip.dhcp-client.set",
         json!({"id": id, "default_route_distance": 2}),
@@ -354,6 +379,7 @@ fn a_static_route_holds_its_place() {
         .filter(|r| r["dst_address"] == "0.0.0.0/0")
         .collect();
     assert_eq!(defaults.len(), 2);
+    assert_eq!(defaults[0]["flags"], "AS");
     assert_eq!(defaults[1]["flags"], "DS");
     assert!(
         defaults[1]["reason"]
@@ -361,6 +387,65 @@ fn a_static_route_holds_its_place() {
             .unwrap()
             .contains("loses to distance")
     );
+    // Both still go to the kernel, at metrics 1 and 2: the kernel uses
+    // the lower one and falls back at once.
+    let metrics: Vec<u8> = l
+        .applied
+        .lock()
+        .unwrap()
+        .ip
+        .routes
+        .iter()
+        .map(|r| r.distance)
+        .collect();
+    assert_eq!(metrics.len(), 2, "{metrics:?}");
+    assert!(metrics.contains(&1) && metrics.contains(&2), "{metrics:?}");
+    let c = l.client(&id);
+    assert_eq!(c["route_states"][0]["state"], "standby", "{c}");
+    assert!(
+        c["notes"][0]
+            .as_str()
+            .unwrap()
+            .contains("is standby: loses to distance 1"),
+        "{c}"
+    );
+
+    // Disabling the static one: the lease's route takes over, alone.
+    l.ok("ip.route.set", json!({"id": st, "disabled": true}));
+    l.run(250);
+    let c = l.client(&id);
+    assert_eq!(c["route_states"][0]["state"], "active", "{c}");
+    assert_eq!(c["route_states"][0]["ecmp"], 1, "{c}");
+    assert!(c["notes"].as_array().unwrap().is_empty(), "{c}");
+}
+
+/// A lower-distance lease route wins over the static one, which says so.
+#[test]
+fn a_lease_route_with_a_lower_distance_wins() {
+    let mut l = Lab::new(Knobs {
+        classless: false,
+        ..Knobs::default()
+    });
+    l.ok(
+        "ip.address.add",
+        json!({"address": "10.0.0.2/24", "interface": "ether2"}),
+    );
+    l.ok(
+        "ip.route.add",
+        json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.0.1", "distance": 5}),
+    );
+    let id = l.add(json!({"interface": "ether1", "default_route_distance": 1}));
+    l.run(1_000);
+    let defaults: Vec<Value> = l
+        .routes()
+        .into_iter()
+        .filter(|r| r["dst_address"] == "0.0.0.0/0")
+        .collect();
+    assert_eq!(defaults[0]["flags"], "ADS", "{defaults:?}");
+    assert_eq!(defaults[1]["flags"], "S", "{defaults:?}");
+    let c = l.client(&id);
+    assert_eq!(c["route_states"][0]["state"], "active", "{c}");
+    assert!(c["notes"].as_array().unwrap().is_empty(), "{c}");
 }
 
 #[test]

@@ -6426,3 +6426,34 @@ continuação indentadas).
   com × 4: 1,08 s e 1,55 s; perda de portadora: buraco de 0,6–0,7 s; sem BFD (dead 4 s): adjacência
   cai em 3,2–3,5 s; a volta do CoreRouter não abre buraco (< 0,1 s). Sair: template passivo tira o
   tráfego sem perda em nenhuma rodada, desligar a instância abre 0,44–1,4 s.
+
+- 2026-10-28 — G1.27h: Rota do DHCP escondida (achado do usuário numa VM com `--backend linux`, 2026-10-28): com uma
+  estática `0.0.0.0/0` distância 1 e um cliente DHCP com `default_route_distance=1`, a rota do lease
+  sumia de `ip.route.list` (nem inativa), do kernel e do log; só aparecia ao desativar a estática.
+  Causa: `Session::effective` (G4.7a, anterior ao ECMP do G1.27a) descartava a rota do lease quando
+  uma estática tinha a mesma tabela, destino e distância ("o kernel fica com uma"); o mesmo no cliente
+  DHCPv6. Agora a rota do lease sempre entra: com a mesma distância as duas formam ECMP (`+`, uma rota
+  multipath no kernel, como `docs/routes.md` já prometia e como o RouterOS v7 faz); com distância
+  maior ela fica em standby com o motivo ("loses to distance 1 (route *1 via …)"). `ip.dhcp-client.list`
+  e `ipv6.dhcp-client.list` ganham `route_states` (`route`, `state`, `ecmp`, `reason`) e uma nota por
+  rota que não está sozinha no encaminhamento. Testar: `cargo test -p corerouter-engine --test
+  dhcp_client a_static_route_at_the_same_distance` (e `--test dhcp6_client`, `--lib route_table`).
+  Desempenho: a busca do estado de cada rota do lease é por busca binária no grupo (O(log n) numa
+  tabela de 1 M rotas); o filtro antigo era O(rotas × rotas do lease) a cada `effective`.
+
+- 2026-10-28 — G4.6i: NTP desligado deixa de ser aviso num roteador novo (achado numa VM recém-instalada: "1 warning"
+  logo na primeira tela, com um cliente DHCP `use_peer_ntp=yes` que é o padrão).
+
+  - **Padrão de fábrica mantido: cliente NTP desligado**, como o RouterOS v7 (`/system ntp client`
+    `enabled=no`; ele só acrescenta os servidores do DHCP quando o cliente é ligado). Ligar de fábrica
+    com `pool.ntp.org` mudaria o `NtpClient::default()` e, pelo `serde(default)`, também as configs
+    já salvas sem o campo, e faria o roteador falar com a internet sem o operador pedir. VyOS
+    (`time.cloudflare.com` etc. de fábrica) e OPNsense (pool) ligam; Junos não liga. Fica como opção
+    futura, só para config nova, se o operador preferir.
+  - **Aviso só quando importa:** a verificação de saúde `ntp` vira Warning com o cliente desligado
+    somente se há servidor RADIUS em uso (Event-Timestamp e contabilidade dependem do relógio). Sem
+    isso, fica Ok com o texto "desligado (padrão de fábrica)" apontando System › NTP Client.
+    Cliente ligado sem resposta continua Warning.
+  - Testes: `every_rule_by_table` (desligado sem dependência = Ok; com RADIUS = Warning),
+    `new_router_has_no_ntp_warning` (laboratório novo não loga aviso de NTP).
+  - Sem mudança em config existente. Caminho não quente (verificação a cada leitura de saúde, O(servidores RADIUS)).
