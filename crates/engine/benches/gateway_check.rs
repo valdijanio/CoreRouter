@@ -55,7 +55,11 @@ fn lab(n: u32) -> Session {
                 routing_table: RoutingTable::Main,
                 disabled: false,
                 comment: String::new(),
-                check_gateway: if i % 2 == 0 { CheckGateway::Ping } else { CheckGateway::Arp },
+                check_gateway: if i % 2 == 0 {
+                    CheckGateway::Ping
+                } else {
+                    CheckGateway::Arp
+                },
                 bfd_profile: String::new(),
             });
         }

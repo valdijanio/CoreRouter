@@ -54,7 +54,10 @@ fn route_row(id: &Value) -> Value {
 }
 
 fn status(id: &Value) -> String {
-    route_row(id)["check_gateway"]["status"].as_str().unwrap_or("").to_owned()
+    route_row(id)["check_gateway"]["status"]
+        .as_str()
+        .unwrap_or("")
+        .to_owned()
 }
 
 fn daemon(netns: Option<u32>, dir: &std::path::Path, log: &str, extra: &[&str]) -> Kill {
@@ -69,7 +72,9 @@ fn daemon(netns: Option<u32>, dir: &std::path::Path, log: &str, extra: &[&str]) 
         .stdout(Stdio::null())
         .stderr(log);
     let k = Kill(c.spawn().unwrap());
-    wait_for("the daemon", || call(netns, "interface.list", json!({})).is_ok());
+    wait_for("the daemon", || {
+        call(netns, "interface.list", json!({})).is_ok()
+    });
     k
 }
 
@@ -92,7 +97,10 @@ fn linux_check_gateway_ping_arp_and_bfd() {
         ("wan0", "gw0", "10.0.0.2/24", "10.0.0.1/24"),
         ("wan1", "gw1", "10.9.0.2/24", "10.9.0.1/24"),
     ] {
-        ip(None, &["link", "add", here, "type", "veth", "peer", "name", there]);
+        ip(
+            None,
+            &["link", "add", here, "type", "veth", "peer", "name", there],
+        );
         ip(None, &["link", "set", there, "netns", &pid]);
         ip(bpid, &["addr", "add", gw, "dev", there]);
         ip(bpid, &["link", "set", there, "up"]);
@@ -107,11 +115,27 @@ fn linux_check_gateway_ping_arp_and_bfd() {
         None,
         &dir,
         "g127f-netns-a.log",
-        &["--backend", "linux", "--manage", "wan0,wan1", "--route-check-interval", INTERVAL_MS],
+        &[
+            "--backend",
+            "linux",
+            "--manage",
+            "wan0,wan1",
+            "--route-check-interval",
+            INTERVAL_MS,
+        ],
     );
-    run("ip.address.add", json!({"address": "10.0.0.2/24", "interface": "wan0"}));
-    run("ip.address.add", json!({"address": "10.9.0.2/24", "interface": "wan1"}));
-    run("ip.route.add", json!({"dst_address": "0.0.0.0/0", "gateway": "10.9.0.1", "distance": 10}));
+    run(
+        "ip.address.add",
+        json!({"address": "10.0.0.2/24", "interface": "wan0"}),
+    );
+    run(
+        "ip.address.add",
+        json!({"address": "10.9.0.2/24", "interface": "wan1"}),
+    );
+    run(
+        "ip.route.add",
+        json!({"dst_address": "0.0.0.0/0", "gateway": "10.9.0.1", "distance": 10}),
+    );
     let main = run(
         "ip.route.add",
         json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.0.1", "check_gateway": "ping"}),
@@ -124,11 +148,15 @@ fn linux_check_gateway_ping_arp_and_bfd() {
 
     for method in ["ping", "arp"] {
         run("ip.route.set", json!({"id": main, "check_gateway": method}));
-        wait_for(&format!("{method}: the gateway answers"), || status(&main) == "reachable");
+        wait_for(&format!("{method}: the gateway answers"), || {
+            status(&main) == "reachable"
+        });
         // The gateway goes quiet (its address leaves gw0): two misses and
         // the route leaves the kernel; the backup is the default now.
         ip(bpid, &["addr", "del", "10.0.0.1/24", "dev", "gw0"]);
-        wait_for(&format!("{method}: the gateway down"), || status(&main) == "unreachable");
+        wait_for(&format!("{method}: the gateway down"), || {
+            status(&main) == "unreachable"
+        });
         let d = defaults();
         assert!(!d.contains("via 10.0.0.1"), "{method}: {d}");
         assert!(d.contains("via 10.9.0.1"), "{method}: {d}");
@@ -142,7 +170,12 @@ fn linux_check_gateway_ping_arp_and_bfd() {
         });
     }
     let h = run("ip.route.check.history", json!({}));
-    let to: Vec<&str> = h.as_array().unwrap().iter().map(|e| e["to"].as_str().unwrap()).collect();
+    let to: Vec<&str> = h
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["to"].as_str().unwrap())
+        .collect();
     assert_eq!(to, ["down", "up", "down", "up"], "{h}");
 
     // BFD: our own engine on both ends. B's daemon runs a peer to us.
@@ -155,7 +188,10 @@ fn linux_check_gateway_ping_arp_and_bfd() {
         json!({"name": "a", "address": "10.0.0.2", "profile": "fast"}),
     )
     .unwrap();
-    run("ip.route.set", json!({"id": main, "check_gateway": "bfd", "bfd_profile": "fast"}));
+    run(
+        "ip.route.set",
+        json!({"id": main, "check_gateway": "bfd", "bfd_profile": "fast"}),
+    );
     wait_for("bfd: the session up", || status(&main) == "reachable");
     assert!(defaults().contains("via 10.0.0.1"));
     let s = run("routing.bfd.session.list", json!({}));
@@ -165,7 +201,10 @@ fn linux_check_gateway_ping_arp_and_bfd() {
     drop(peer);
     wait_for("bfd: the session down", || status(&main) == "unreachable");
     let d = defaults();
-    assert!(!d.contains("via 10.0.0.1") && d.contains("via 10.9.0.1"), "bfd: {d}");
+    assert!(
+        !d.contains("via 10.0.0.1") && d.contains("via 10.9.0.1"),
+        "bfd: {d}"
+    );
     // B is back: so is the route.
     let _peer = daemon(bpid, &bdir, "g127f-netns-b2.log", &[]);
     wait_for("bfd: the route back", || {
@@ -183,7 +222,10 @@ fn linux_check_gateway_ping_arp_and_bfd() {
 /// CPU ticks (utime + stime) of the daemon's thread named `comm`.
 fn thread_ticks(pid: u32, comm: &str) -> u64 {
     let mut total = 0;
-    for t in std::fs::read_dir(format!("/proc/{pid}/task")).unwrap().flatten() {
+    for t in std::fs::read_dir(format!("/proc/{pid}/task"))
+        .unwrap()
+        .flatten()
+    {
         let p = t.path();
         if std::fs::read_to_string(p.join("comm")).is_ok_and(|c| c.trim() == comm) {
             let stat = std::fs::read_to_string(p.join("stat")).unwrap();
@@ -216,11 +258,22 @@ fn load_1000_gateways() {
     ip(None, &["link", "set", "lo", "up"]);
     let b = namespace_b();
     let bpid = Some(b.0.id());
-    ip(None, &["link", "add", "wan0", "type", "veth", "peer", "name", "gw0"]);
-    ip(None, &["link", "set", "gw0", "netns", &b.0.id().to_string()]);
+    ip(
+        None,
+        &["link", "add", "wan0", "type", "veth", "peer", "name", "gw0"],
+    );
+    ip(
+        None,
+        &["link", "set", "gw0", "netns", &b.0.id().to_string()],
+    );
     let batch = std::env::temp_dir().join(format!("g127f-load-{}.ip", std::process::id()));
-    let gws: Vec<String> = (0..N).map(|i| format!("10.100.{}.{}", 1 + i / 250, 1 + i % 250)).collect();
-    let lines: String = gws.iter().map(|g| format!("addr add {g}/16 dev gw0\n")).collect();
+    let gws: Vec<String> = (0..N)
+        .map(|i| format!("10.100.{}.{}", 1 + i / 250, 1 + i % 250))
+        .collect();
+    let lines: String = gws
+        .iter()
+        .map(|g| format!("addr add {g}/16 dev gw0\n"))
+        .collect();
     std::fs::write(&batch, lines).unwrap();
     ip(bpid, &["-batch", batch.to_str().unwrap()]);
     ip(bpid, &["link", "set", "gw0", "up"]);
@@ -228,23 +281,42 @@ fn load_1000_gateways() {
     ip(None, &["link", "set", "wan0", "up"]);
     let dir = std::env::temp_dir().join(format!("g127f-load-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let a = daemon(None, &dir, "g127f-load.log", &["--backend", "linux", "--manage", "wan0"]);
-    run("ip.address.add", json!({"address": "10.100.0.1/16", "interface": "wan0"}));
+    let a = daemon(
+        None,
+        &dir,
+        "g127f-load.log",
+        &["--backend", "linux", "--manage", "wan0"],
+    );
+    run(
+        "ip.address.add",
+        json!({"address": "10.100.0.1/16", "interface": "wan0"}),
+    );
     for (i, g) in gws.iter().enumerate() {
         let dst = format!("172.{}.{}.0/24", 16 + i / 256, i % 256);
-        run("ip.route.add", json!({"dst_address": dst, "gateway": g, "check_gateway": "ping"}));
+        run(
+            "ip.route.add",
+            json!({"dst_address": dst, "gateway": g, "check_gateway": "ping"}),
+        );
     }
     let pid = a.0.id();
     for method in ["ping", "arp"] {
         if method == "arp" {
-            for r in run("ip.route.list", json!({"origin": "static"})).as_array().unwrap() {
-                run("ip.route.set", json!({"id": r["id"], "check_gateway": "arp"}));
+            for r in run("ip.route.list", json!({"origin": "static"}))
+                .as_array()
+                .unwrap()
+            {
+                run(
+                    "ip.route.set",
+                    json!({"id": r["id"], "check_gateway": "arp"}),
+                );
             }
         }
         wait_for(&format!("{method}: every gateway reachable"), || {
             run("ip.route.check.list", json!({}))
                 .as_array()
-                .is_some_and(|l| l.len() == N as usize && l.iter().all(|r| r["status"] == "reachable"))
+                .is_some_and(|l| {
+                    l.len() == N as usize && l.iter().all(|r| r["status"] == "reachable")
+                })
         });
         let before = thread_ticks(pid, "svc-route-check");
         let t = std::time::Instant::now();
@@ -253,9 +325,20 @@ fn load_1000_gateways() {
         let secs = t.elapsed().as_secs_f64();
         let hz = 100.0;
         let svc = run("system.service.print", json!({}));
-        let row = svc.as_array().unwrap().iter().find(|r| r["name"] == "route-check").cloned().unwrap();
+        let row = svc
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "route-check")
+            .cloned()
+            .unwrap();
         let checks = run("ip.route.check.list", json!({}));
-        let down = checks.as_array().unwrap().iter().filter(|r| r["status"] != "reachable").count();
+        let down = checks
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["status"] != "reachable")
+            .count();
         println!(
             "G1.27f load {method}: {N} gateways, {:.2} % of a core over {secs:.0} s; {down} not reachable; service: {}",
             ticks as f64 / hz / secs * 100.0,

@@ -13,7 +13,8 @@ use corerouter_model::bfd::{BfdSessionStatus, BfdState};
 use serde_json::{Value, json};
 
 fn ok(s: &mut Session, id: &str, p: Value) -> Value {
-    s.execute(id, &p).unwrap_or_else(|e| panic!("{id} {p}: {e}"))
+    s.execute(id, &p)
+        .unwrap_or_else(|e| panic!("{id} {p}: {e}"))
 }
 
 fn fails(s: &mut Session, id: &str, p: Value, needle: &str) {
@@ -27,8 +28,16 @@ fn fails(s: &mut Session, id: &str, p: Value, needle: &str) {
 /// 10.9.0.2/24 (backup uplink).
 fn lab() -> Session {
     let mut s = Session::virtual_lab();
-    for (a, i) in [("10.0.0.2/24", "ether1"), ("2001:db8::2/64", "ether1"), ("10.9.0.2/24", "ether2")] {
-        ok(&mut s, "ip.address.add", json!({"address": a, "interface": i}));
+    for (a, i) in [
+        ("10.0.0.2/24", "ether1"),
+        ("2001:db8::2/64", "ether1"),
+        ("10.9.0.2/24", "ether2"),
+    ] {
+        ok(
+            &mut s,
+            "ip.address.add",
+            json!({"address": a, "interface": i}),
+        );
     }
     s
 }
@@ -49,7 +58,10 @@ fn row(s: &mut Session, id: &str) -> Value {
 
 /// Report every probe target as answered (or not) at `now`.
 fn report(s: &mut Session, targets: &[ProbeTarget], answered: bool, now: u64) {
-    let r: Vec<(Target, bool)> = targets.iter().map(|t| (t.target.clone(), answered)).collect();
+    let r: Vec<(Target, bool)> = targets
+        .iter()
+        .map(|t| (t.target.clone(), answered))
+        .collect();
     s.route_check_report(&r, Some(now));
 }
 
@@ -69,7 +81,10 @@ fn ping_check_withdraws_the_route_and_the_backup_takes_over() {
         &mut s,
         json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.0.1", "check_gateway": "ping"}),
     );
-    let backup = add(&mut s, json!({"dst_address": "0.0.0.0/0", "gateway": "10.9.0.1", "distance": 10}));
+    let backup = add(
+        &mut s,
+        json!({"dst_address": "0.0.0.0/0", "gateway": "10.9.0.1", "distance": 10}),
+    );
     // No daemon runs the checks yet: said so, the route stays.
     let r = row(&mut s, &main);
     assert_eq!(r["check_gateway"]["status"], "not-checked", "{r}");
@@ -86,13 +101,19 @@ fn ping_check_withdraws_the_route_and_the_backup_takes_over() {
     // RouterOS: one miss is not enough, two are.
     report(&mut s, &targets, false, 10_000);
     let r = row(&mut s, &main);
-    assert_eq!((r["active"].clone(), r["check_gateway"]["misses"].clone()), (json!(true), json!(1)));
+    assert_eq!(
+        (r["active"].clone(), r["check_gateway"]["misses"].clone()),
+        (json!(true), json!(1))
+    );
     report(&mut s, &targets, false, 20_000);
     let r = row(&mut s, &main);
     assert_eq!(r["state"], "inactive", "{r}");
     assert_eq!(r["check_gateway"]["status"], "unreachable");
     assert_eq!(r["reason_id"], "check-gateway-down", "{r}");
-    assert!(r["reason"].as_str().unwrap().contains("check-gateway=ping"), "{r}");
+    assert!(
+        r["reason"].as_str().unwrap().contains("check-gateway=ping"),
+        "{r}"
+    );
     assert_eq!(r["origin"], "static");
     let b = row(&mut s, &backup);
     assert_eq!(b["active"], true, "{b}");
@@ -101,7 +122,13 @@ fn ping_check_withdraws_the_route_and_the_backup_takes_over() {
     assert_eq!(k.len(), 1, "{k:?}");
     assert!(k[0].contains("10.9.0.1"), "{k:?}");
     let d = ok(&mut s, "ip.route.detail", json!({"key": main}));
-    assert!(d["kernel"]["note"].as_str().unwrap().contains("check-gateway"), "{d}");
+    assert!(
+        d["kernel"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("check-gateway"),
+        "{d}"
+    );
     assert_eq!(d["check_gateway"]["history"][0]["to"], "down", "{d}");
 
     // Back at the first answer (first down of the window).
@@ -109,28 +136,59 @@ fn ping_check_withdraws_the_route_and_the_backup_takes_over() {
     assert_eq!(row(&mut s, &main)["active"], true);
     assert_eq!(kernel_defaults(&mut s, &backup).len(), 2);
     let h = ok(&mut s, "ip.route.check.history", json!({}));
-    let to: Vec<&str> = h.as_array().unwrap().iter().map(|e| e["to"].as_str().unwrap()).collect();
+    let to: Vec<&str> = h
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["to"].as_str().unwrap())
+        .collect();
     assert_eq!(to, ["down", "up"]);
-    assert!(h[0]["message"].as_str().unwrap().contains("did not answer 2 ping checks"), "{h}");
+    assert!(
+        h[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("did not answer 2 ping checks"),
+        "{h}"
+    );
 }
 
 #[test]
 fn routes_through_one_gateway_share_one_probe() {
     let mut s = lab();
     for dst in ["10.10.0.0/16", "10.11.0.0/16", "10.12.0.0/16"] {
-        add(&mut s, json!({"dst_address": dst, "gateway": "10.0.0.1", "check_gateway": "arp"}));
+        add(
+            &mut s,
+            json!({"dst_address": dst, "gateway": "10.0.0.1", "check_gateway": "arp"}),
+        );
     }
-    add(&mut s, json!({"dst_address": "10.20.0.0/16", "gateway": "10.0.0.1", "check_gateway": "ping"}));
-    add(&mut s, json!({"dst_address": "10.30.0.0/16", "gateway": "10.0.0.1"}));
+    add(
+        &mut s,
+        json!({"dst_address": "10.20.0.0/16", "gateway": "10.0.0.1", "check_gateway": "ping"}),
+    );
+    add(
+        &mut s,
+        json!({"dst_address": "10.30.0.0/16", "gateway": "10.0.0.1"}),
+    );
     let targets = s.route_check_targets(Some(0));
     assert_eq!(targets.len(), 2, "{targets:?}");
-    let arp = targets.iter().find(|t| matches!(t.how, ProbeHow::Arp { .. })).unwrap();
+    let arp = targets
+        .iter()
+        .find(|t| matches!(t.how, ProbeHow::Arp { .. }))
+        .unwrap();
     assert_eq!(
         arp.how,
-        ProbeHow::Arp { link: "ether1".parse().unwrap(), src: "10.0.0.2".parse().unwrap() }
+        ProbeHow::Arp {
+            link: "ether1".parse().unwrap(),
+            src: "10.0.0.2".parse().unwrap()
+        }
     );
     let list = ok(&mut s, "ip.route.check.list", json!({}));
-    let arp_row = list.as_array().unwrap().iter().find(|r| r["method"] == "arp").unwrap();
+    let arp_row = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["method"] == "arp")
+        .unwrap();
     assert_eq!(arp_row["routes"], 3);
     // One down: the three routes leave together, the ping one stays.
     report(&mut s, std::slice::from_ref(arp), false, 10_000);
@@ -146,7 +204,11 @@ fn routes_through_one_gateway_share_one_probe() {
     assert_eq!(inactive, ["10.10.0.0/16", "10.11.0.0/16", "10.12.0.0/16"]);
     // A route that no longer checks comes back at the next sync.
     let id = rows[0]["id"].as_str().unwrap().to_owned();
-    ok(&mut s, "ip.route.set", json!({"id": id, "check_gateway": "none"}));
+    ok(
+        &mut s,
+        "ip.route.set",
+        json!({"id": id, "check_gateway": "none"}),
+    );
     s.route_check_targets(Some(21_000));
     assert_eq!(row(&mut s, &id)["state"], "active");
     // Removing the last routes of a down target brings nothing back by
@@ -164,7 +226,10 @@ fn routes_through_one_gateway_share_one_probe() {
 #[test]
 fn a_flapping_gateway_is_held_down() {
     let mut s = lab();
-    let id = add(&mut s, json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.0.1", "check_gateway": "ping"}));
+    let id = add(
+        &mut s,
+        json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.0.1", "check_gateway": "ping"}),
+    );
     let t = s.route_check_targets(Some(0));
     let mut now = 0;
     let cycle = |s: &mut Session, now: &mut u64| {
@@ -201,7 +266,13 @@ fn bfd_check_follows_the_session() {
     // No probe for the route-check thread.
     assert!(s.route_check_targets(Some(0)).is_empty());
     let r = row(&mut s, &id);
-    assert_eq!((r["check_gateway"]["method"].clone(), r["check_gateway"]["status"].clone()), (json!("bfd"), json!("checking")));
+    assert_eq!(
+        (
+            r["check_gateway"]["method"].clone(),
+            r["check_gateway"]["status"].clone()
+        ),
+        (json!("bfd"), json!("checking"))
+    );
     assert_eq!(r["check_gateway"]["bfd_profile"], "fast");
     // A session still coming up does not pull the route.
     let peer = "10.0.0.1".parse().unwrap();
@@ -232,7 +303,10 @@ fn bfd_check_follows_the_session() {
 #[test]
 fn bfd_that_never_comes_up_counts_as_down_after_the_grace() {
     let mut s = lab();
-    let id = add(&mut s, json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.0.1", "check_gateway": "bfd"}));
+    let id = add(
+        &mut s,
+        json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.0.1", "check_gateway": "bfd"}),
+    );
     s.route_check_targets(Some(0));
     s.route_check_targets(Some(4_000));
     assert_eq!(row(&mut s, &id)["active"], true);
@@ -274,27 +348,62 @@ fn check_gateway_is_validated() {
         "expected none, arp, ping or bfd",
     );
     // IPv6 gateways are pinged.
-    add(&mut s, json!({"dst_address": "2001:db8:1::/48", "gateway": "2001:db8::1", "check_gateway": "ping"}));
+    add(
+        &mut s,
+        json!({"dst_address": "2001:db8:1::/48", "gateway": "2001:db8::1", "check_gateway": "ping"}),
+    );
     // Leaving bfd drops the profile.
     let id = add(
         &mut s,
         json!({"dst_address": "10.1.0.0/16", "gateway": "10.0.0.1", "check_gateway": "bfd", "bfd_profile": "fast"}),
     );
-    ok(&mut s, "ip.route.set", json!({"id": id, "check_gateway": "ping"}));
-    let r = s.store().candidate().ip.routes.iter().find(|r| r.id.to_string() == id).cloned().unwrap();
+    ok(
+        &mut s,
+        "ip.route.set",
+        json!({"id": id, "check_gateway": "ping"}),
+    );
+    let r = s
+        .store()
+        .candidate()
+        .ip
+        .routes
+        .iter()
+        .find(|r| r.id.to_string() == id)
+        .cloned()
+        .unwrap();
     assert!(r.bfd_profile.is_empty());
     // A profile a route uses cannot be removed.
-    ok(&mut s, "routing.bfd.profile.add", json!({"name": "wan", "min_tx": 100, "multiplier": 3}));
-    ok(&mut s, "ip.route.set", json!({"id": id, "check_gateway": "bfd", "bfd_profile": "wan"}));
-    fails(&mut s, "routing.bfd.profile.remove", json!({"id": "wan"}), "used by route");
+    ok(
+        &mut s,
+        "routing.bfd.profile.add",
+        json!({"name": "wan", "min_tx": 100, "multiplier": 3}),
+    );
+    ok(
+        &mut s,
+        "ip.route.set",
+        json!({"id": id, "check_gateway": "bfd", "bfd_profile": "wan"}),
+    );
+    fails(
+        &mut s,
+        "routing.bfd.profile.remove",
+        json!({"id": "wan"}),
+        "used by route",
+    );
 }
 
 #[test]
 fn a_transaction_rolls_the_check_back() {
     let mut s = lab();
-    let id = add(&mut s, json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.0.1"}));
+    let id = add(
+        &mut s,
+        json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.0.1"}),
+    );
     ok(&mut s, "config.mode.set", json!({"mode": "transactional"}));
-    ok(&mut s, "ip.route.set", json!({"id": id, "check_gateway": "arp"}));
+    ok(
+        &mut s,
+        "ip.route.set",
+        json!({"id": id, "check_gateway": "arp"}),
+    );
     ok(&mut s, "config.discard", json!({}));
     let r = row(&mut s, &id);
     assert_eq!(r["check_gateway"], Value::Null, "{r}");
