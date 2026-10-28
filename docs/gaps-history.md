@@ -200,3 +200,6 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-27 — G3.4 feito (janela OSPF; teste no FRR real pendente da VM)
 - 2026-10-27 — G3.7 em partes (motor do simulador e comandos `tool.netsim.*`); criadas G3.7b, G3.7c, G3.7d
 - 2026-10-27 — G3.7b feito (janela do simulador de rede)
+- 2026-10-27 — G3.5 parcial (MPLS no kernel, LDP pelo FRR, janelas)
+- 2026-10-27 — G3.6 feito em três PRs (G3.6a motor, G3.6b FRR e clientes, G3.6c janela)
+- 2026-10-27 — G3.7d redefinida (OSPF e BFD do modelo) e feita; criada G3.7e (IPv6, refletor de rotas)

@@ -2093,3 +2093,10 @@ Engine (`cargo test --release`, RSS do processo): um `Session` por roteador virt
 ~98–140 KiB (100 e 500 roteadores); com o estado do simulador, ~1,2 MiB por roteador em 500. Montar o
 laboratório de 500 roteadores por comandos (uma transação cada) leva 150 ms; 60 s virtuais pelo
 `tool.netsim.advance`, 4,7 s.
+
+- 2026-10-27, G3.5 (**medido**, esta máquina, release, criterion):
+  - `forwarding/rows_100k` (100 mil rótulos, 10 mil FECs): 38,9 → 22,5 ms;
+  - `mpls_page/cached`, a página sob o lock: 39 ms → 1,1 ms;
+  - `mpls_page/find_cached`: 25 ms → 0,48 ms;
+  - `mpls_page/service_build`: 47 ms, fora do lock;
+  - o netlink no kernel (lote × um a um, dump de 100 mil) fica pendente: precisa do `mpls_router`.
