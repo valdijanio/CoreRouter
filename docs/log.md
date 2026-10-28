@@ -6328,3 +6328,39 @@ continuação indentadas).
   sessões: subida de todas as sondas de volta em **0,244 s** (antes 1,20 s), todas adotadas em
   273 ms do último sinal de vida (antes 1102 ms), rotas no kernel em 308 ms, 0 perdidas. 10 mil:
   0,203 s, igual à `main` (a adoção já cabia na detecção). Detalhes em `docs/bng-ha.md` §2.14.
+
+- 2026-10-28 — G3.6h: Três testes instáveis do BFD corrigidos (`netns_bfd`, `netns_ha_bfd`, `bfd::tests::data_plane_for_a_fake_bfdd`),
+  um deles com **bug real no serviço** (`ppp_ha`). Status da G3.6h não muda.
+
+  - **`netns_ha_bfd` (bug de código).** O evento "BFD subiu" de um caminho do par que sobe antes da
+    configuração do `ppp.redundancy` ser aplicada não entra na fila (o `tap` só enfileira os pares
+    já configurados), e o `bfd_sync` (que a documentação diz rodar "uma vez por segundo") só rodava
+    na aplicação da configuração, com o instantâneo de até 500 ms. Resultado: a máquina de papéis nunca
+    soube que o caminho estava `up`, a perda por BFD (`was_up && expired`) era ignorada e a tomada
+    saía por `dead-interval` (1,2 s) em vez de `bfd` (~150 ms), com o `test-takeover` já dizendo
+    "bfd-sync: up" (a lista de verificação lia o instantâneo do serviço). Agora `bfd_sync` roda a cada
+    200 ms (só preenche o que nenhum evento disse nos últimos 1000 ms, para o instantâneo velho não
+    apagar uma perda recente) e a lista de verificação só dá `ok` ao `bfd-*` quando a máquina de papéis
+    também sabe que está `up`. O teste passou a esperar o BFD `up` com `detect_ms == 150` (timers
+    rápidos, depois do Poll Sequence).
+  - **`netns_bfd` (teste).** (1) `session(B)` vinha `inactive` logo depois de A subir: a linha de B é
+    do instantâneo do serviço, copiado a cada 500 ms; agora espera por condição. (2) Os 2 s "sem down
+    falso" com detecção de 150 ms caem de verdade quando a máquina deixa um daemon parado por 150 ms
+    (B declara down e avisa A: `neighbor-signaled-session-down`): a janela de 2 s pode ser repetida
+    até 5 vezes, voltando antes para `up` com timers rápidos; um bug que oscila nunca acha janela
+    limpa. (3) O limite de detecção passou de 200 ms para 1000 ms (o `ip link set down` roda no meio
+    e a máquina carregada o atrasa); ainda separa os timers rápidos (150 ms) dos lentos (3 s).
+  - **`data_plane_for_a_fake_bfdd` (teste).** O cronômetro dos ≤ 250 ms agora começa depois do
+    `drop(b)` (o drop junta as threads do par) e o limite passou a 1500 ms (ainda abaixo dos 3 s dos
+    timers lentos; o laço espera até 2 s). Não reproduzi a falha (0 em 165 execuções sob carga): a
+    folga de 100 ms sobre os 150 ms + leituras de 20 ms é a causa provável.
+
+  Reprodução (**medido**, 2026-10-28, 32 núcleos, cada instância num `unshare --user --map-root-user
+  --net`, TMPDIR próprio; as três instâncias do teste de cada rodada em paralelo, rodadas de 15):
+  - carga moderada (16 laços de CPU + 3 instâncias de cada teste ao mesmo tempo): antes `netns_bfd`
+    16 falhas em 45, `netns_ha_bfd` 8 em 45, unitário 0 em 45; depois 0, 0 e 0 em 45 cada;
+  - carga extrema (64 laços de CPU + 8 instâncias de cada): antes `netns_bfd` 9 em 40 (8 no
+    `session(B)==up`, 1 no "sem down falso"), `netns_ha_bfd` 5 em 40; depois `netns_bfd` 0 em 48 (e
+    0 em 48 na segunda rodada), `netns_ha_bfd` 2 em 48. As falhas que sobram a 3× de sobrecarga de CPU são o
+    caso em que um hello chega depois da perda do BFD (a máquina de papéis trata como "o par está
+    vivo": comportamento desejado contra alarme falso) e não são corrigíveis no teste.
