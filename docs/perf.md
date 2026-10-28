@@ -2202,3 +2202,18 @@ threads 8,2 % por thread. Data plane: `bfdd` → `bgpd` em 0,20–0,26 ms (5 cor
 O antes recalculava 5 SPFs por (destino, vizinho); agora a árvore da raiz, a árvore sem cada
 vizinho e a árvore reversa de cada destino são calculadas uma vez e compartilhadas (`Rc`), e só a
 árvore reversa sem o recurso é por par.
+
+- 2026-10-28, G4.3hh, adoção de 100 mil sessões no par BNG (**medido**).
+  - VM `corerouter-lab`, 8 vCPUs, kernel 7.0, release, BNG Blaster 1.0.1, caminho lento, 6
+    workers, BFD `fast`, `cargo xtask bng-lab --only ha`. Subida de volta (1ª / mediana / todas
+    as 32 sondas):
+    - 100 mil: antes 0,899 / 1,090 / 1,202 s; depois 0,195 / 0,216 / 0,244 s.
+    - Todas adotadas: 1102 → 273 ms do último sinal de vida.
+    - 10 mil: antes 0,175 / 0,193 / 0,203 s; depois 0,157 / 0,182 / 0,203 s.
+  - Host (Ryzen AI Max+ 395, release), `pppoe_ha_tests::adopt_profile`, 100 mil sessões, 8
+    workers: o worker responde em 7 ms (antes 310 ms, tudo de uma vez); todas adotadas em
+    62–66 ms; a contabilidade em 180 ms.
+  - Rotas para `bng0` (namespace, `tests/netns_routes_batch.rs`), 100 mil /32:
+    - `rtnetlink` uma a uma: 348 ms com 1 thread, 188 ms com 8;
+    - lote: 132 ms com 1 thread, 221 ms com 8.
+  - `benches/netns_routes_batch.rs`, 10 mil /32: 13,1 ms em lote contra 31,7 ms uma a uma.
