@@ -7,6 +7,9 @@
 # the two peers and a few connections for that long, for screenshots of
 # Routing › BGP (a GUI on the host reaches it through `ssh -L`).
 set -euo pipefail
+# vm-lab run holds its lock on fd 9: a daemon started from here would
+# inherit it and keep the VM locked after the round.
+exec 9>&-
 [ "$(id -u)" = 0 ] || { echo "run inside the lab VM (cargo xtask vm-lab run)"; exit 1; }
 sed -i "s/^bgpd=no/bgpd=yes/" /etc/frr/daemons
 # Start from the package's frr.conf (frr-compare.sh's frr-reload.py rounds

@@ -9,6 +9,9 @@
 # R1, 10.255.0.3 goes out with R2's label; R2 pops it (R3 asked for
 # implicit null, RFC 3032 §2.1), so the ping crosses one label switch.
 set -euo pipefail
+# vm-lab run holds its lock on fd 9: a daemon started from here would
+# inherit it and keep the VM locked after the round.
+exec 9>&-
 [ "$(id -u)" = 0 ] || { echo "run inside the lab VM (cargo xtask vm-lab run)"; exit 1; }
 modprobe mpls_router
 modprobe mpls_iptunnel
@@ -23,6 +26,12 @@ cleanup() {
   ip link del crldp-lo 2>/dev/null || true
 }
 cleanup
+finish() {
+  cleanup
+  cp -p /etc/frr/frr.conf.crorig /etc/frr/frr.conf
+  systemctl restart frr || true
+}
+trap finish EXIT
 sysctl -qw net.mpls.platform_labels=1048575
 ip link add crldp-lo type dummy
 ip addr add 10.255.0.1/32 dev crldp-lo
@@ -95,7 +104,4 @@ if [ $status != 0 ]; then
     -c "show mpls ldp neighbor" -c "show mpls ldp discovery" -c "show ip route" \
     -c "show running-config" || true
 fi
-cleanup
-cp -p /etc/frr/frr.conf.crorig /etc/frr/frr.conf
-systemctl restart frr || true
 exit $status

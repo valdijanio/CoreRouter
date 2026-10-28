@@ -378,7 +378,10 @@ fn simulator_matches_frr() {
     // (shortest AS path, no ties). A 4-ring with OSPF only (ECMP across).
     let mut failures = Vec::new();
     for s in [square(), ring(5, BgpMode::Ebgp), ring(4, BgpMode::None)] {
-        if let Err(e) = std::panic::catch_unwind(|| compare(&s)) {
+        let result = std::panic::catch_unwind(|| compare(&s));
+        // Whatever failed on the way, no FRR instance stays behind.
+        teardown(&s, &s.plan().unwrap());
+        if let Err(e) = result {
             failures.push(
                 e.downcast_ref::<String>()
                     .cloned()

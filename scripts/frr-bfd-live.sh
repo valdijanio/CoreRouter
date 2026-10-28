@@ -8,6 +8,9 @@
 # (one address of ours per load session: bfdd keys a single-hop session by
 # the peer address, not by its local one). BFD_LOAD_SECS sets the steady-state window (default 15).
 set -euo pipefail
+# vm-lab run holds its lock on fd 9: a daemon started from here would
+# inherit it and keep the VM locked after the round.
+exec 9>&-
 [ "$(id -u)" = 0 ] || { echo "run inside the lab VM (cargo xtask vm-lab run)"; exit 1; }
 what=${1:-all}
 cleanup() {
