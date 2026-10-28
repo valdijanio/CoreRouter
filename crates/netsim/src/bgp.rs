@@ -32,6 +32,9 @@ use crate::{BgpConfig, LinkId, Neighbor, Time};
 
 /// FRR `bgp default local-preference`.
 const DEFAULT_LOCAL_PREF: u32 = 100;
+/// Most paths BGP installs for one prefix: FRR's `maximum-paths` default
+/// is 64; 16 is what the OSPF side keeps too and bounds the memory.
+const MAX_MULTIPATH: usize = 16;
 
 /// Path attributes, shared by every RIB that holds the same route.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -257,22 +260,52 @@ impl Bgp {
             .filter_map(move |prefix| self.installed_one(prefix, igp))
     }
 
-    /// The route BGP installs for `prefix`, if any.
+    /// The route BGP installs for `prefix`, if any: the best path and, as
+    /// FRR does by default (`maximum-paths` 64, which our render leaves
+    /// alone), every path equal to it down to the IGP cost (multipath).
     pub(crate) fn installed_one(&self, prefix: &Ipv4Net, igp: &Fib) -> Option<FibRoute> {
         let e = self.rib.get(prefix)?;
-        let p = e.paths.get(e.best?)?;
-        let peer = self.peers.get(p.peer?)?;
-        let via = igp.lookup(p.attrs.next_hop)?;
-        if via.links.is_empty() {
+        let best = e.paths.get(e.best?)?;
+        let peer = self.peers.get(best.peer?)?;
+        let mut links: Vec<LinkId> = Vec::new();
+        for p in e
+            .paths
+            .iter()
+            .filter(|p| std::ptr::eq(*p, best) || self.multipath_eq(best, p))
+        {
+            if let Some(via) = igp.lookup(p.attrs.next_hop) {
+                links.extend(via.links.iter().copied());
+            }
+        }
+        links.sort_unstable();
+        links.dedup();
+        links.truncate(MAX_MULTIPATH);
+        if links.is_empty() {
             return None;
         }
         Some(FibRoute {
             prefix: *prefix,
             proto: if peer.ebgp { Proto::Ebgp } else { Proto::Ibgp },
-            metric: p.igp,
-            links: via.links.clone(),
-            via: Some(p.attrs.next_hop),
+            metric: best.igp,
+            links,
+            via: Some(best.attrs.next_hop),
         })
+    }
+
+    /// FRR's multipath test (`bgp_path_info_cmp` setting `paths_eq`,
+    /// without `bestpath as-path multipath-relax`): a learned, valid path of
+    /// the same kind (eBGP or iBGP) that ties with `best` on local-pref,
+    /// the whole AS path, origin, MED and IGP cost.
+    fn multipath_eq(&self, best: &Path, p: &Path) -> bool {
+        p.valid
+            && p.peer.is_some()
+            && self.is_ebgp_path(p) == self.is_ebgp_path(best)
+            && p.attrs.local_pref.unwrap_or(DEFAULT_LOCAL_PREF)
+                == best.attrs.local_pref.unwrap_or(DEFAULT_LOCAL_PREF)
+            && p.attrs.as_path == best.attrs.as_path
+            && p.attrs.origin == best.attrs.origin
+            && p.attrs.med.unwrap_or(0) == best.attrs.med.unwrap_or(0)
+            && p.igp == best.igp
     }
 
     /// After an IGP change: the prefixes whose paths use a next hop that
@@ -1093,11 +1126,10 @@ impl Node {
                 },
             );
         }
-        touched.extend(moved);
-        if !touched.is_empty() {
-            touched.sort_unstable();
-            touched.dedup();
-            self.refresh_bgp(&touched);
+        // Every prefix looked at, not only those whose best changed: a
+        // multipath member may have come or gone with the best in place.
+        if !nets.is_empty() {
+            self.refresh_bgp(&nets);
         }
     }
 }

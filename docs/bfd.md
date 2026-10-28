@@ -212,10 +212,74 @@ até a detecção de 150 ms). Nenhuma queda falsa em 180 s de 100 a 1000 sessõe
   mas dividem a CPU e isolam: uma thread ocupada atrasa só as sessões dela.
 - **Padrão (`--bfd-threads auto`)**: uma thread por 500 sessões, até 4 e até o número de núcleos.
   Com poucas sessões, uma thread; a divisão entra quando um núcleo começaria a pesar.
-- **Comparação com o `bfdd` do FRR**: pendente da VM do laboratório (disco cheio em 2026-10-27);
-  entra no PR da G3.6b com a mesma bancada.
+- **Comparação com o `bfdd` do FRR**: medida na VM do laboratório (G3.6i, seção abaixo). Numa
+  thread, o nosso motor gasta o mesmo que o `bfdd` (36,5 % × 32,7 % de um núcleo a 1000 sessões),
+  sem queda falsa em nenhum dos dois; a diferença é que o nosso divide o trabalho em threads.
 - **XDP**: não precisa. A 1000 sessões o custo é de cerca de 10 % de uma thread; BFD em XDP só faria
   sentido para dezenas de milhares de sessões ou intervalos de 3,3 ms (gap G3.6f).
+
+## Contra o `bfdd` real (G3.6i, VM do laboratório)
+
+Medido em 2026-10-27 na VM `corerouter-lab` (8 vCPUs EPYC-Genoa `host-model`, kernel 7.0,
+virtio), FRR 10.7.1, build release. Roteiros: `scripts/frr-bfd-live.sh` (testes `#[ignore]` de
+`service/bfd/live_bfdd.rs`: o motor num namespace, `zebra` + `bfdd` noutro, um veth) e
+`scripts/frr-bfd-dplane-live.sh` (o nosso daemon como data plane do `bfdd` da VM, com `bgpd`).
+
+**Interoperabilidade** (`bfdd_interop`), **medido**:
+
+- Up nos dois lados em ~1 s; enquanto o `bfdd` pede 300 ms, mandamos a 300 ms (RFC 5880 §6.8.7);
+- Poll iniciado pelo `bfdd` (timers para 50 ms): passamos a mandar a 50 ms em 242 ms; Poll
+  iniciado por nós (200 ms): o `bfdd` mostra `remote-transmit-interval 200` em 8 ms; nenhuma
+  mudança de estado nos dois Polls;
+- SHA1 só do nosso lado: a sessão cai e não volta (o `bfdd` 10.7.1 não tem autenticação e descarta
+  pacotes com o bit A, como manda o RFC 5880 §6.8.6); sem SHA1 volta em < 1 s. Autenticação BFD
+  com o FRR, portanto, não existe: só entre CoreRouters (ou com quem implementa);
+- o `bfdd` detecta o nosso silêncio com `control detection time expired` (114–155 ms com 50 ms ×
+  3); nós detectamos o `bfdd` morto (`kill -9`) em 146 ms, Diag 1.
+
+**Modo data plane com `bgpd`** (`frr-bfd-dplane-live.sh`): o `bfdd` da VM sobe com
+`--dplaneaddr`, o daemon conecta, o eBGP com `bfd profile` sobe e a sessão BFD aparece no nosso
+motor com usuário "BGP peer". Cortando só os pacotes BFD do vizinho (o TCP do BGP segue), o `bfdd`
+recebe o nosso `BFD_STATE_CHANGE` 108–147 ms depois do corte (detecção de 150 ms) e o `bgpd`
+derruba a sessão.
+
+**Carga** (`bfdd_load`, 50 ms × 3, 15 s em regime), **medido**. "bfdd tx gap" é o intervalo
+entre os pacotes do `bfdd` medido aqui (p99 por sessão; o histograma tem faixas de 25 %, então
+56 052 µs é o teto da faixa de 50–56 ms). A CPU do `bfdd` é a do processo (`/proc/<pid>/stat`).
+
+| sessions | our threads | our CPU %/thread | bfdd CPU % | our tx jitter p99 median (µs) | worst | bfdd tx gap p99 median (µs) | worst | our false downs | bfdd false downs |
+|---|---|---|---|---|---|---|---|---|---|
+| 100 | 1 | 7.5 | 5.6 | 97 | 108 | 50940 | 53587 | 0 | 0 |
+| 100 | 2 | 3.7 | 5.9 | 108 | 136 | 50945 | 53498 | 0 | 0 |
+| 100 | 4 | 1.9 | 6.1 | 108 | 136 | 50942 | 54603 | 0 | 0 |
+| 500 | 1 | 24.8 | 20.3 | 87 | 265 | 56052 | 56052 | 0 | 0 |
+| 500 | 2 | 14.7 | 23.4 | 87 | 169 | 56052 | 56052 | 0 | 0 |
+| 500 | 4 | 8.1 | 24.5 | 87 | 136 | 56052 | 56052 | 0 | 0 |
+| 1000 | 1 | 36.5 | 32.7 | 69 | 331 | 56052 | 56052 | 0 | 0 |
+| 1000 | 2 | 25.2 | 39.7 | 87 | 212 | 56052 | 56052 | 0 | 0 |
+| 1000 | 4 | 15.4 | 44.7 | 87 | 212 | 56052 | 56052 | 0 | 0 |
+
+Nós contra nós na mesma VM (o `bfd::tests::load`, 10 s), para separar a VM do motor: 1000 sessões
+numa thread custam 32,4 % (no host, 10,1 %); a syscall na VM sai ~3× mais cara, e é ela o custo
+(o trabalho do protocolo é de nanossegundos, `proto-bfd` criterion).
+
+**Leitura:**
+
+- **CPU:** numa thread empatamos com o `bfdd` (±15 %; os dois são `recvmsg`/`sendmsg` por pacote).
+  O `bfdd` é uma thread só e fica nisso; o nosso divide: com 4 threads, 15 % por thread a 1000
+  sessões. A soma das threads cresce um pouco (61 % com 4 contra 36,5 % com 1: cada thread acorda
+  por conta própria e junta menos pacotes por acordar). A CPU do `bfdd` também sobe quando
+  dividimos (32,7 → 44,7 %): os nossos pacotes chegam mais espalhados no tempo e ele junta menos
+  por acordar.
+- **Regularidade:** o nosso p99 de atraso de envio fica em 69–108 µs (mediana); o do `bfdd`, visto
+  daqui, cabe na faixa de 50–56 ms do histograma. Nenhuma queda falsa em 135 s de 100 a 1000
+  sessões, nos dois lados.
+- **O ganho que sobra é de syscalls:** `sendmmsg`/`recvmmsg` em lote nos disparos do mesmo tick
+  cortariam o custo por pacote, que na VM é o que pesa. Fica na G3.6j, com esta bancada como
+  medida de antes.
+- **Achado do `bfdd`:** uma sessão de salto único é identificada pelo endereço do vizinho (e a
+  interface), não pelo endereço local: dez blocos `peer 10.76.0.1 local-address …` viram uma
+  sessão só. O nosso motor separa por (vizinho, local).
 
 ## Pesquisa
 

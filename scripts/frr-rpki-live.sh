@@ -11,6 +11,9 @@
 # FRR_DEMO=<seconds>: no checks; the daemon (control 7982) stays up that
 # long for screenshots (ssh -L from the host).
 set -euo pipefail
+# vm-lab run holds its lock on fd 9: a daemon started from here would
+# inherit it and keep the VM locked after the round.
+exec 9>&-
 [ "$(id -u)" = 0 ] || { echo "run inside the lab VM (cargo xtask vm-lab run)"; exit 1; }
 [ -f /usr/lib/x86_64-linux-gnu/frr/modules/bgpd_rpki.so ] \
   || { echo "FAIL: no bgpd_rpki (install frr-rpki-rtrlib: cargo xtask vm-lab tools)"; exit 1; }

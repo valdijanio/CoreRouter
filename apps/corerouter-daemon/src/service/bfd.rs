@@ -40,6 +40,9 @@ mod dplane;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "bfd/tests.rs"]
 mod tests;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "bfd/live_bfdd.rs"]
+mod live_bfdd;
 
 pub(crate) const SERVICE: super::Service = super::Service {
     name: "bfd",

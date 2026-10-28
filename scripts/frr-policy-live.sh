@@ -10,6 +10,9 @@
 # FRR_EXPLORE=1: only set the peers up, configure our side by hand and
 # print what bgpd answers (the JSON the route reader parses).
 set -euo pipefail
+# vm-lab run holds its lock on fd 9: a daemon started from here would
+# inherit it and keep the VM locked after the round.
+exec 9>&-
 [ "$(id -u)" = 0 ] || { echo "run inside the lab VM (cargo xtask vm-lab run)"; exit 1; }
 sed -i "s/^bgpd=no/bgpd=yes/" /etc/frr/daemons
 [ -f /etc/frr/frr.conf.crorig ] || cp -p /etc/frr/frr.conf /etc/frr/frr.conf.crorig

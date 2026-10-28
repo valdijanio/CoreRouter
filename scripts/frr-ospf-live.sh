@@ -9,6 +9,9 @@
 #               so the pair sticks in ExStart (RFC 2328 §10.6) and the
 #               Diagnose must say so.
 set -euo pipefail
+# vm-lab run holds its lock on fd 9: a daemon started from here would
+# inherit it and keep the VM locked after the round.
+exec 9>&-
 [ "$(id -u)" = 0 ] || { echo "run inside the lab VM (cargo xtask vm-lab run)"; exit 1; }
 sed -i "s/^ospfd=no/ospfd=yes/; s/^ospf6d=no/ospf6d=yes/" /etc/frr/daemons
 [ -f /etc/frr/frr.conf.crorig ] || cp -p /etc/frr/frr.conf /etc/frr/frr.conf.crorig
@@ -23,6 +26,7 @@ cleanup() {
   ip link del crospf-c 2>/dev/null || true
 }
 cleanup
+trap cleanup EXIT
 peer() { # <ns> <instance> <our if> <peer if> <our addr> <peer addr> <mtu> <conf>
   ip netns add "$1"
   ip link add "$3" type veth peer name "$4" netns "$1"
@@ -72,5 +76,4 @@ exit"
 for _ in $(seq 50); do [ -S /var/run/frr/ospfd.vty ] && break; sleep 0.2; done
 status=0
 COREROUTER_FRR_LIVE=1 cargo test -p corerouter-hal-frr --test frr_ospf_live -- --nocapture || status=$?
-cleanup
 exit $status

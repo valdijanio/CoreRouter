@@ -909,6 +909,10 @@ impl Lab {
                 .args(["--exclude=/target", "--exclude=/target-*", "--exclude=/vm/"])
                 .args([
                     "--exclude=/.git",
+                    // The app copies `.claude/` into each worktree, parked
+                    // Buildroot trees included (4.2 GB, measured): never
+                    // send it to the VM's 20 GiB disk.
+                    "--exclude=/.claude/",
                     "--exclude=/plan/",
                     "--exclude=/fuzz/target/",
                 ])
