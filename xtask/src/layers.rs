@@ -46,6 +46,8 @@ pub const LAYERS: &[(&str, u8)] = &[
     ("corerouter-proto-radius", 2),
     // G4.3h: BNG high availability: sync protocol, role machine, fencing (sans-IO).
     ("corerouter-proto-ha", 2),
+    // G3.6: BFD (RFC 5880/5881/5883) codec, session machine, timer wheel (sans-IO).
+    ("corerouter-proto-bfd", 2),
     // G3.7: the lab's network simulator (simplified OSPF/BGP/BFD, discrete
     // events, virtual clock); pure and wasm-safe, read by the engine.
     ("corerouter-netsim", 2),
@@ -87,6 +89,10 @@ pub const SIDEWAYS_ALLOWED: &[(&str, &str)] = &[
     ("corerouter-proto-pppoe", "corerouter-proto-radius"),
     // The FRR driver renders the routing protocols' config (G3.1).
     ("corerouter-hal-frr", "corerouter-proto-bgp"),
+    ("corerouter-hal-frr", "corerouter-proto-ospf"),
+    // OSPF redistribution runs through the `/routing filter` chains, whose
+    // compiler lives with the BGP policy (G3.4).
+    ("corerouter-proto-ospf", "corerouter-proto-bgp"),
     // The simulator runs the real `/routing filter` evaluator and checks its
     // decision process against `proto_bgp::decision` (G3.7).
     ("corerouter-netsim", "corerouter-proto-bgp"),

@@ -1173,6 +1173,7 @@ dependencies = [
  "corerouter-hal-frr",
  "corerouter-hal-linux",
  "corerouter-model",
+ "corerouter-proto-bfd",
  "corerouter-proto-bgp",
  "corerouter-proto-dhcp",
  "corerouter-proto-dns",
@@ -1312,6 +1313,7 @@ dependencies = [
  "corerouter-hal",
  "corerouter-model",
  "corerouter-proto-bgp",
+ "corerouter-proto-ospf",
  "criterion",
  "ipnet",
  "log",
@@ -1398,6 +1400,16 @@ dependencies = [
  "ipnet",
  "proptest",
  "serde",
+]
+
+[[package]]
+name = "corerouter-proto-bfd"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "proptest",
+ "sha1 0.11.0",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1532,6 +1544,10 @@ name = "corerouter-proto-ospf"
 version = "0.1.0"
 dependencies = [
  "corerouter-model",
+ "corerouter-proto-bgp",
+ "criterion",
+ "ipnet",
+ "serde_json",
 ]
 
 [[package]]

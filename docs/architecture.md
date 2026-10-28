@@ -300,6 +300,18 @@ backend.**
     revisão anterior), até nos commits de firewall. Medido com 1 000 conexões, release:
     mudar uma passou de 8,1 ms para 1,5 ms por commit (criterion, `engine/benches/bgp.rs`), e
     um commit que não toca `routing` não copia nem serializa a seção.
+- **OSPF no modelo RouterOS v7 (G3.4, `docs/ospf.md`).** `routing.ospf` (`corerouter_model::ospf`):
+  instâncias, áreas, ranges, interface templates, vizinhos estáticos e key chains. O FRR roda o
+  protocolo e o SPF; o `proto-ospf` resolve os templates em interfaces (o primeiro que casa por
+  nome, lista ou rede) e renderiza um contexto `interface X` por interface (`ip ospf area`, não
+  `network … area`, que o FRR não mistura e que não carrega valores por template). O `hal-frr`
+  ganhou a posse parcial de um contexto (`render::CHILDREN`): no `ospfd` as linhas `ip ospf …`, no
+  `ospf6d` as `ipv6 ospf6 …`, e a `description` do zebra que eles imprimem fica de fora. Chave
+  cripto sempre por key chain `CR-…` (o `ospfd` só faz HMAC-SHA por key chain), selada como a
+  chave TCP MD5 do BGP. A `out_filter_chain` reaproveita o compilador da G3.2b
+  (`proto-ospf` → `proto-bgp`, lateral permitido) com listas renomeadas `CR-O2-`/`CR-O3-`, porque
+  o `ospfd` recusa as linhas BGP dos route-maps do `bgpd`. Índice de templates por nome: 4 000
+  interfaces × 1 000 templates em 10,9 ms (era 145,7 ms, **medido**).
 - **holo** (suíte de roteamento em Rust, modelo YANG) é o candidato a backend Rust-nativo do
   mesmo trait (G3.8) — sem mudar UI, comandos ou MCP.
 - FSMs próprias só para o **simulador** (sessões BGP/OSPF entre roteadores virtuais no lab, G3.7)
@@ -372,7 +384,7 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 | L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via rtnetlink (`RTM_GETLINK`, G1.18) com política de posse (`owner`); I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); ICMP das ferramentas (`icmp`: ping socket ou raw, G6.2); firewall por `nft -f -` (módulo `nft`, G2.1); CGNAT e fast path por nfnetlink (`nfnl`, `cgnat`, G2.3b; `fastpath`, flowtable e eSwitch por devlink, G2.4) e conntrack por ctnetlink (`ctnl`, G2.2; eventos `NEW`/`DESTROY` para o Traffic Flow, `ctnl::Events`, G4.4b); estado/hardware/contadores das portas por ethtool e devlink netlink (`genl`, `ethtool`, `nic`, `pci_ids`; G1.19, sem ioctl — veja `docs/interfaces.md`); cliente DHCP (`dhcp`: `AF_PACKET` com filtro BPF, UDP 68, sonda ARP; G4.7); cliente DHCPv6 (`dhcp6`: UDP 546 → `ff02::1:2`) e RA (`ra`: `accept_ra` por interface a cada apply, limpeza do aprendido; G4.7b); configuração Ethernet, EEPROM do módulo e teste de cabo por ethtool netlink (`ether`, G1.20). **Plataforma** | L0, `hal`, `firewall` (laterais permitidos) |
 | L2 | `crates/proto-{bgp,ospf,mpls,cgnat,dns,dhcp}` | `validate(&Config) -> Vec<Issue>` + render para o backend (FRR, nftables…); `proto-dhcp` também tem o codec DHCPv4 (`dhcproto` atrás de um saneador), a máquina de estados pura do cliente e o servidor simulado do lab (G4.7, `docs/dhcp-client.md`); o mesmo para DHCPv6 com codec próprio (`v6`, `client6`, `lab6`; G4.7b) | L0, L1 |
 | L2 | `crates/netsim` | Simulador de rede do lab (G3.7): roteadores virtuais com OSPF, BGP e BFD simplificados, eventos discretos num relógio virtual, janelas paralelas (pool de threads só no nativo), falhas, linha do tempo e convergência; topologias prontas (`preset`). Puro, compila em wasm. Veja `docs/netsim.md` | L0, `proto-bgp` (lateral permitido: filtros e processo de decisão) |
-| L2 | `crates/hal-frr` | Driver do FRR (G3.1): `conf` (árvore do `frr.conf`, diff por contexto), `render` (render dos `proto-*` por daemon, contextos do CoreRouter), `vty` (socket vty dos daemons, sem `vtysh`), `state` (sessões BGP do JSON do bgpd); implementa `hal::routing::RoutingDaemon`. **Plataforma** | L0, `hal`, `proto-bgp` (lateral permitido) |
+| L2 | `crates/hal-frr` | Driver do FRR (G3.1): `conf` (árvore do `frr.conf`, diff por contexto), `render` (render dos `proto-*` por daemon, contextos do CoreRouter, posse parcial de `interface` por daemon: G3.4), `vty` (socket vty dos daemons, sem `vtysh`), `state` (sessões BGP do JSON do bgpd); implementa `hal::routing::RoutingDaemon`. **Plataforma** | L0, `hal`, `proto-bgp`, `proto-ospf` (lateral permitido) |
 | L2 | `crates/proto-discovery` | CRDP, protocolo de descoberta próprio: codec puro (`Announcement::encode`/`decode`) + `validate` das configurações de descoberta. Veja `docs/discovery.md` | L0 |
 | L2 | `crates/proto-flow` | Exportação de fluxos (G4.4b): IPFIX (RFC 7011) e NetFlow v9 (RFC 3954), codificador e decodificador; eventos de NAT (RFC 8158); o medidor que transforma eventos do conntrack em registros (timeouts, amostragem, cache limitado). Puro, compila em wasm. Veja `docs/traffic-flow.md` | L0, L1 |
 | L2 | `crates/proto-{lldp,mndp}` | Codecs puros de descoberta: LLDPDU (`decode`/`encode`) e anúncio MNDP (só `decode`; nunca anunciamos MNDP). Veja `docs/lldp-mndp.md` | nada do workspace |
@@ -1206,6 +1218,24 @@ total oferecida em pacotes de 128 B, `shaper_root::perf_edt_vs_htb`):
   contra 1663 do policer, ping +15 ms sem GSO). Se um operador precisar de justiça por fluxo dentro
   do assinante, o caminho é a qdisc em BPF (`struct_ops`, kernel 6.16+), não o HTB.
 - **Revisar** com placa real (G4.3cb) e quando a qdisc BPF estiver nos kernels das distribuições.
+
+### BFD próprio em Rust puro (G3.6)
+
+**Decisão (do usuário, 2026-10-27): o BFD é nosso (`crates/proto-bfd` + serviço `bfd` do
+daemon), não o `bfdd` do FRR.** O FRR continua com BGP, OSPF e LDP; a ligação (G3.6b) será
+pelo *distributed data plane* do `bfdd` (`--dplaneaddr`, protocolo `bfddp`), com o nosso motor no
+papel do data plane, ou, se ele não servir, derrubando o vizinho pelo vty.
+
+- **Por que Rust puro aqui** (a regra geral de "Desempenho e escolha de implementação"): BFD é
+  um protocolo pequeno e fechado (RFC 5880/5881/5883), a parte cara é o relógio e o caminho do
+  pacote, e o nosso motor ganha o que o `bfdd` não tem (multithread, jitter e folga por sessão,
+  dampening, histórico, comandos e Safe Mode).
+- **Divisão em N threads:** sessão por `discriminador mod N`; socket por thread no grupo
+  `SO_REUSEPORT` com cBPF que lê o Your Discriminator; timer wheel por thread; nada de lock no
+  caminho do pacote. Uma thread leva 1000 sessões a 50 ms × 3 com ~10 % de um núcleo e jitter
+  p99 de 69 µs (**medido**, `docs/bfd.md`); o padrão é uma thread por 500 sessões, até 4.
+- **Revisar** com a comparação medida contra o `bfdd` na VM (G3.6b) e se aparecer pedido de
+  dezenas de milhares de sessões ou 3,3 ms (BFD em XDP, G3.6f).
 
 ## Histórico de revisão
 

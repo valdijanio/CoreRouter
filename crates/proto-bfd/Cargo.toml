@@ -1,0 +1,25 @@
+[package]
+name = "corerouter-proto-bfd"
+description = "L2: BFD (RFC 5880/5881/5883): control packet codec, Keyed SHA1 authentication, the session state machine, dampening and a timer wheel, pure (no I/O)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+# Keyed SHA1 / Meticulous Keyed SHA1 (RFC 5880 §6.7.4), as proto-radius.
+sha1.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "bfd"
+harness = false
+
+[lints]
+workspace = true

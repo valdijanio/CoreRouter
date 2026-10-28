@@ -2002,3 +2002,15 @@ só para leitura, sem lock; o padrão usa até 8 (abaixo de 20 000 rotas, uma).
 | Diff com uma regra mudada (hal-frr) | | 14,6 ms (serial: custo pequeno) |
 
 FRR 10.7.1 real (VM do laboratório, debug): mudar uma regra digita 14 linhas em 2,7 ms.
+
+### G3.4a — configuração OSPF (**medido**, 2026-10-27, 32 núcleos, build de bench)
+
+`cargo bench -p corerouter-proto-ospf --bench ospf_config`, 4 000 interfaces, 4 000 endereços,
+1 000 templates (900 por nome, 100 por rede):
+
+| Medida | Antes (cada interface × cada template) | Depois (índice por nome) |
+|---|---|---|
+| `bindings` | 145,7 ms | 10,9 ms |
+| render FRR | 148,1 ms | 12,7 ms |
+| impacto do commit | 284,8 ms | 32,8 ms |
+| validação | 0,30 ms | 0,31 ms |

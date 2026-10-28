@@ -167,6 +167,30 @@ pub fn overwrite_key(line: &str) -> Option<String> {
         "description",
         "router-id",
         "ospf router-id",
+        // G3.4: OSPF interface values and keys, one each.
+        "ospf6 router-id",
+        "ip ospf network",
+        "ip ospf cost",
+        "ip ospf hello-interval",
+        "ip ospf dead-interval",
+        "ip ospf priority",
+        "ip ospf retransmit-interval",
+        "ip ospf transmit-delay",
+        "ip ospf authentication-key",
+        "ip ospf bfd profile",
+        "ipv6 ospf6 network",
+        "ipv6 ospf6 cost",
+        "ipv6 ospf6 hello-interval",
+        "ipv6 ospf6 dead-interval",
+        "ipv6 ospf6 priority",
+        "ipv6 ospf6 retransmit-interval",
+        "ipv6 ospf6 transmit-delay",
+        "ipv6 ospf6 instance-id",
+        "ipv6 ospf6 bfd profile",
+        "key-string",
+        "cryptographic-algorithm",
+        "send-lifetime",
+        "accept-lifetime",
         // Route-map entries (G3.2b): one value each.
         "on-match",
         "set local-preference",
@@ -337,8 +361,24 @@ fn diff_scope(
 /// `line` with any secret it carries masked, for logs and errors
 /// (`neighbor X password KEY`).
 pub fn redact(line: &str) -> String {
-    match line.find(" password ") {
-        Some(i) => format!("{} password ***", line.get(..i).unwrap_or_default()),
+    // The secret is the rest of the line after one of these (G3.4: OSPF
+    // keys, `ip ospf message-digest-key N md5 K`, `… hash-algo A key K`).
+    const SECRET: &[&str] = &[
+        " password ",
+        "key-string ",
+        "authentication-key ",
+        " md5 ",
+        " key ",
+    ];
+    let mut cut = None;
+    for m in SECRET {
+        if let Some(i) = line.find(m) {
+            let end = i + m.len();
+            cut = Some(cut.map_or(end, |c: usize| c.min(end)));
+        }
+    }
+    match cut {
+        Some(end) => format!("{}***", line.get(..end).unwrap_or_default()),
         None => line.to_owned(),
     }
 }
@@ -591,6 +631,28 @@ end
                 "exit",
             ]
         );
+    }
+
+    #[test]
+    fn ospf_keys_are_masked_for_logs() {
+        assert_eq!(redact("key-string s3cret"), "key-string ***");
+        assert_eq!(
+            redact("ip ospf authentication-key abc"),
+            "ip ospf authentication-key ***"
+        );
+        assert_eq!(
+            redact("ip ospf message-digest-key 1 md5 abc"),
+            "ip ospf message-digest-key 1 md5 ***"
+        );
+        assert_eq!(
+            redact("ipv6 ospf6 authentication key-id 1 hash-algo hmac-sha-256 key abc"),
+            "ipv6 ospf6 authentication key-id 1 hash-algo hmac-sha-256 key ***"
+        );
+        assert_eq!(
+            redact("ip ospf authentication key-chain CR-T1"),
+            "ip ospf authentication key-chain CR-T1"
+        );
+        assert_eq!(redact("key 1"), "key 1");
     }
 
     #[test]
