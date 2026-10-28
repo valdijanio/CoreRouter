@@ -74,12 +74,13 @@ struct Links {
 }
 
 impl Links {
-    fn refresh(&mut self) {
+    /// Read again when older than [`FRESH`]; `true` if it did.
+    fn refresh(&mut self) -> bool {
         if self.at.is_some_and(|t| t.elapsed() < FRESH) {
-            return;
+            return false;
         }
         self.at = Some(Instant::now());
-        let Ok(all) = getifaddrs() else { return };
+        let Ok(all) = getifaddrs() else { return true };
         let mut by_name: HashMap<IfName, Link> = HashMap::new();
         for a in all {
             let Ok(name) = a.interface_name.parse::<IfName>() else {
@@ -108,6 +109,7 @@ impl Links {
             .map(|(n, l)| (l.index, n.clone()))
             .collect();
         self.by_name = by_name;
+        true
     }
 
     /// A source address of `name` for `v6` (a global one first).
@@ -349,7 +351,7 @@ impl HostLspSocket {
 impl LspSocket for HostLspSocket {
     fn paths(&mut self, fec: IpNet) -> Result<Vec<LspPath>, ProbeError> {
         self.links.at = None;
-        self.links.refresh();
+        let _ = self.links.refresh();
         let Some(r) = self
             .routes
             .get(fec.addr())
@@ -382,7 +384,7 @@ impl LspSocket for HostLspSocket {
     }
 
     fn send(&mut self, req: &LspRequest<'_>) -> Result<(), ProbeError> {
-        self.links.refresh();
+        let _ = self.links.refresh();
         let path = req.path;
         let v6 = req.dst.is_ipv6();
         let src = path
@@ -524,17 +526,26 @@ impl HostView {
                 self.labels.clear();
             }
         }
-        let before = self.links.at;
-        self.links.refresh();
-        if self.links.at != before {
-            self.locals = self
-                .links
-                .by_name
-                .values()
-                .flat_map(|l| l.addrs.iter().copied())
-                .collect();
-            self.fecs.borrow_mut().clear();
+        if self.links.refresh() {
+            self.links_changed();
         }
+    }
+
+    /// Read the links now (the interfaces to listen on changed).
+    fn reread_links(&mut self) {
+        self.links.at = None;
+        self.links.refresh();
+        self.links_changed();
+    }
+
+    fn links_changed(&mut self) {
+        self.locals = self
+            .links
+            .by_name
+            .values()
+            .flat_map(|l| l.addrs.iter().copied())
+            .collect();
+        self.fecs.borrow_mut().clear();
     }
 }
 
@@ -666,8 +677,7 @@ impl HostResponder {
 impl LspResponderIo for HostResponder {
     fn set_interfaces(&mut self, names: &[IfName]) -> Vec<(IfName, String)> {
         self.taps.retain(|n, _| names.contains(n));
-        self.view.links.at = None;
-        self.view.links.refresh();
+        self.view.reread_links();
         let mut failed = Vec::new();
         for name in names {
             if self.taps.contains_key(name) {
