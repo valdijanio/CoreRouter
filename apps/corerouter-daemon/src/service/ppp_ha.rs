@@ -169,8 +169,11 @@ impl super::radius_aaa::CoaForward for PeerForward {
 fn peer_asks(id: u64, body: &[u8]) {
     if body == QUERY_TAKEOVER {
         let last = pair::current();
-        if let Ok(b) = serde_json::to_vec(&last) {
-            locked(&RAW_REPLIES).push((id, b));
+        let mut q = locked(&RAW_REPLIES);
+        if q.len() < MAX_FORWARDS
+            && let Ok(b) = serde_json::to_vec(&last)
+        {
+            q.push((id, b));
         }
         return;
     }
@@ -1169,7 +1172,8 @@ mod linux {
                 }
             }
             super::forward_turn(rt);
-            if !health.sleep(TICK) {
+            pair::wait(TICK);
+            if health.stopping() {
                 *rt.pair() = None;
                 shared().enabled.store(false, Ordering::Release);
                 shared().answering.store(false, Ordering::Release);
@@ -1234,6 +1238,9 @@ mod linux {
                             Ok(Some(r)) if r.seq == seq && r.kind == ReplyKind::Echo => {
                                 ok = true;
                                 WITNESS_AT.store(runtime().now().max(1), Ordering::Release);
+                                if urgent {
+                                    pair::wake();
+                                }
                                 break;
                             }
                             Ok(Some(_)) => {}

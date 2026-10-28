@@ -19,8 +19,9 @@
 
 use std::collections::VecDeque;
 use std::net::IpAddr;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex, PoisonError};
+use std::time::Duration;
 
 use corerouter_model::bfd::{BfdKey, BfdSessionStatus};
 use corerouter_model::ppp_redundancy::{PathBfdStatus, Redundancy, Takeover};
@@ -39,6 +40,24 @@ pub(crate) struct BfdIn {
 }
 
 const BFD_QUEUE: usize = 256;
+/// Wakes the `ppp-ha` loop before its 10 ms tick: a BFD change or a
+/// witness answer decides a takeover (8 ms of a 160 ms one, **medido**).
+static WAKE: Mutex<bool> = Mutex::new(false);
+static WAKE_CV: Condvar = Condvar::new();
+
+pub(crate) fn wake() {
+    *locked(&WAKE) = true;
+    WAKE_CV.notify_one();
+}
+
+/// The loop's sleep: `d`, or less when [`wake`] is called.
+pub(crate) fn wait(d: Duration) {
+    let g = locked(&WAKE);
+    let (mut g, _) = WAKE_CV
+        .wait_timeout_while(g, d, |woken| !*woken)
+        .unwrap_or_else(PoisonError::into_inner);
+    *g = false;
+}
 static BFD_EVENTS: Mutex<VecDeque<BfdIn>> = Mutex::new(VecDeque::new());
 /// The addresses the pair runs BFD to (`Redundancy::bfd_sessions`).
 static PEERS: Mutex<Vec<IpAddr>> = Mutex::new(Vec::new());
@@ -60,6 +79,8 @@ pub(crate) fn tap(key: &BfdKey, _from: State, to: State, diag: Diag) {
             expired: to == State::Down && diag == Diag::ControlDetectionTimeExpired,
         });
     }
+    drop(q);
+    wake();
 }
 
 pub(crate) fn take_bfd_events() -> Vec<BfdIn> {
