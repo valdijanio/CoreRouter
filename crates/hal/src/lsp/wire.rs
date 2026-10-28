@@ -609,7 +609,11 @@ fn fec_value(fecs: &[Fec]) -> Vec<u8> {
         let kind = match f {
             Fec::Ldp(p) => {
                 put_prefix(&mut v, p);
-                if p.addr().is_ipv4() { FEC_LDP_V4 } else { FEC_LDP_V6 }
+                if p.addr().is_ipv4() {
+                    FEC_LDP_V4
+                } else {
+                    FEC_LDP_V6
+                }
             }
             Fec::Generic(p) => {
                 put_prefix(&mut v, p);
@@ -699,7 +703,12 @@ pub fn encode(e: &Echo) -> Vec<u8> {
     out.extend_from_slice(&e.flags.to_be_bytes());
     out.extend_from_slice(&[e.msg_type, e.reply_mode, e.return_code, e.return_subcode]);
     for w in [
-        e.handle, e.seq, e.sent.0, e.sent.1, e.received.0, e.received.1,
+        e.handle,
+        e.seq,
+        e.sent.0,
+        e.sent.1,
+        e.received.0,
+        e.received.1,
     ] {
         out.extend_from_slice(&w.to_be_bytes());
     }

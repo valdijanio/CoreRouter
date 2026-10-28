@@ -32,7 +32,11 @@ fn enter(ns: &str) {
     setns(f, CloneFlags::CLONE_NEWNET).unwrap();
 }
 
-fn responder(ns: &'static str, ifs: &'static [&'static str], stop: Arc<AtomicBool>) -> thread::JoinHandle<u64> {
+fn responder(
+    ns: &'static str,
+    ifs: &'static [&'static str],
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<u64> {
     thread::Builder::new()
         .name(format!("lsp-{ns}"))
         .spawn(move || {
@@ -42,9 +46,18 @@ fn responder(ns: &'static str, ifs: &'static [&'static str], stop: Arc<AtomicBoo
             assert!(r.set_interfaces(&names).is_empty());
             let mut n = 0;
             while !stop.load(Ordering::Relaxed) {
-                let Some(h) = r.recv(Duration::from_millis(50)).unwrap() else { continue };
+                let Some(h) = r.recv(Duration::from_millis(50)).unwrap() else {
+                    continue;
+                };
                 let ntp = r.now_ntp();
-                if let Verdict::Reply { to, from, tos, payload, .. } = respond(&h, r.view(), ntp) {
+                if let Verdict::Reply {
+                    to,
+                    from,
+                    tos,
+                    payload,
+                    ..
+                } = respond(&h, r.view(), ntp)
+                {
                     r.send(to, from, tos, &payload).unwrap();
                     n += 1;
                 }
@@ -54,9 +67,21 @@ fn responder(ns: &'static str, ifs: &'static [&'static str], stop: Arc<AtomicBoo
         .unwrap()
 }
 
-fn ask(s: &mut HostLspSocket, path: &LspPath, e: &Echo, ttl: u8) -> Option<(Echo, IpAddr, Duration)> {
+fn ask(
+    s: &mut HostLspSocket,
+    path: &LspPath,
+    e: &Echo,
+    ttl: u8,
+) -> Option<(Echo, IpAddr, Duration)> {
     let payload = wire::encode(e);
-    s.send(&LspRequest { path, ttl, dst: destination(false, 1), tos: 0, payload: &payload }).unwrap();
+    s.send(&LspRequest {
+        path,
+        ttl,
+        dst: destination(false, 1),
+        tos: 0,
+        payload: &payload,
+    })
+    .unwrap();
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(2) {
         if let Some(a) = s.recv(Duration::from_millis(100)).unwrap() {
@@ -95,7 +120,11 @@ fn ping_and_trace_over_ldp() {
                 let mut e = Echo::request(7, seq, vec![Fec::Ldp(fec)]);
                 e.flags = wire::FLAG_VALIDATE;
                 let (r, from, rtt) = ask(&mut s, &p, &e, 255).expect("egress reply");
-                assert_eq!((r.return_code, r.return_subcode), (code::EGRESS, 1), "{r:?}");
+                assert_eq!(
+                    (r.return_code, r.return_subcode),
+                    (code::EGRESS, 1),
+                    "{r:?}"
+                );
                 assert!(from.to_string().starts_with("10."), "{from}");
                 rtts.push(rtt);
             }
@@ -107,19 +136,34 @@ fn ping_and_trace_over_ldp() {
             // Traceroute.
             let mut e = Echo::request(8, 1000, vec![Fec::Ldp(fec)]);
             e.ddmaps.push(ddmap_of(
-                &MplsNexthop { via: p.nexthop, interface: Some(p.interface.clone()), out_labels: p.labels.clone() },
+                &MplsNexthop {
+                    via: p.nexthop,
+                    interface: Some(p.interface.clone()),
+                    out_labels: p.labels.clone(),
+                },
                 p.origin,
                 p.mtu,
                 false,
             ));
             let (h1, from1, _) = ask(&mut s, &p, &e, 1).expect("hop 1");
-            eprintln!("hop 1 {from1}: {} {:?}", wire::describe(h1.return_code, h1.return_subcode), h1.ddmaps);
+            eprintln!(
+                "hop 1 {from1}: {} {:?}",
+                wire::describe(h1.return_code, h1.return_subcode),
+                h1.ddmaps
+            );
             assert_eq!(h1.return_code, code::LABEL_SWITCHED);
-            assert_eq!(h1.ddmaps[0].labels[0].label, wire::LABEL_IMPLICIT_NULL, "lsp2 pops (PHP)");
+            assert_eq!(
+                h1.ddmaps[0].labels[0].label,
+                wire::LABEL_IMPLICIT_NULL,
+                "lsp2 pops (PHP)"
+            );
             e.seq = 1001;
             e.ddmaps = vec![h1.ddmaps[0].clone()];
             let (h2, from2, _) = ask(&mut s, &p, &e, 2).expect("hop 2");
-            eprintln!("hop 2 {from2}: {}", wire::describe(h2.return_code, h2.return_subcode));
+            eprintln!(
+                "hop 2 {from2}: {}",
+                wire::describe(h2.return_code, h2.return_subcode)
+            );
             assert_eq!(h2.return_code, code::EGRESS);
             // A label lsp2 never bound.
             let mut bad = p.clone();

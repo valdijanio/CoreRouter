@@ -747,7 +747,10 @@ pub trait Hal: Send {
     /// LSP ping / traceroute sockets (G3.5b, [`lsp`]), or why there are
     /// none. Cheap: built once, handed out as clones.
     fn lsp_prober(&self) -> Result<lsp::SharedLspProber, String> {
-        Err(format!("{} cannot send MPLS echo requests", self.describe()))
+        Err(format!(
+            "{} cannot send MPLS echo requests",
+            self.describe()
+        ))
     }
 
     /// The MPLS echo responder's I/O (G3.5b), for a thread of the daemon.

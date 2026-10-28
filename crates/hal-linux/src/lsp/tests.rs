@@ -12,11 +12,36 @@ fn run(prog: &[Insn], pkt: &[u8]) -> u32 {
         let jump = |c: bool| if c { usize::from(jt) } else { usize::from(jf) };
         pc += 1;
         match code {
-            LD_B_ABS => a = match byte(k_at) { Some(v) => v, None => return 0 },
-            LD_H_ABS => a = match half(k_at) { Some(v) => v, None => return 0 },
-            LD_W_ABS => a = match word(k_at) { Some(v) => v, None => return 0 },
-            LD_H_IND => a = match half(x as usize + k_at) { Some(v) => v, None => return 0 },
-            LDX_B_MSH => x = match byte(k_at) { Some(v) => (v & 0xf) * 4, None => return 0 },
+            LD_B_ABS => {
+                a = match byte(k_at) {
+                    Some(v) => v,
+                    None => return 0,
+                }
+            }
+            LD_H_ABS => {
+                a = match half(k_at) {
+                    Some(v) => v,
+                    None => return 0,
+                }
+            }
+            LD_W_ABS => {
+                a = match word(k_at) {
+                    Some(v) => v,
+                    None => return 0,
+                }
+            }
+            LD_H_IND => {
+                a = match half(x as usize + k_at) {
+                    Some(v) => v,
+                    None => return 0,
+                }
+            }
+            LDX_B_MSH => {
+                x = match byte(k_at) {
+                    Some(v) => (v & 0xf) * 4,
+                    None => return 0,
+                }
+            }
             AND_K => a &= k,
             JEQ_K => pc += jump(a == k),
             JGT_K => pc += jump(a > k),
@@ -59,10 +84,24 @@ fn a_labeled_request_parses_back() {
     assert_eq!(&f[12..14], &[0x88, 0x47]);
     let h = parse_frame(&f, &name()).unwrap();
     assert_eq!(h.stack.len(), 2);
-    assert_eq!((h.stack[0].label, h.stack[0].ttl, h.stack[0].tc, h.stack[0].bottom), (100, 1, 5, false));
+    assert_eq!(
+        (
+            h.stack[0].label,
+            h.stack[0].ttl,
+            h.stack[0].tc,
+            h.stack[0].bottom
+        ),
+        (100, 1, 5, false)
+    );
     assert!(h.stack[1].bottom);
-    assert_eq!((h.src, h.dst), ("10.0.0.1".parse().unwrap(), "127.0.0.1".parse().unwrap()));
-    assert_eq!((h.src_port, h.dst_port, h.payload.len()), (50_000, 3503, 40));
+    assert_eq!(
+        (h.src, h.dst),
+        ("10.0.0.1".parse().unwrap(), "127.0.0.1".parse().unwrap())
+    );
+    assert_eq!(
+        (h.src_port, h.dst_port, h.payload.len()),
+        (50_000, 3503, 40)
+    );
 }
 
 #[test]
@@ -95,28 +134,97 @@ fn ipv6_frames_round_trip() {
 #[test]
 fn the_filters_keep_only_candidates() {
     // MPLS: TTL 1 or 0, or explicit null.
-    assert_ne!(run(MPLS_FILTER, &frame(&[100], 1, "10.0.0.1", "127.0.0.1", 3503)), 0);
-    assert_ne!(run(MPLS_FILTER, &frame(&[100], 0, "10.0.0.1", "127.0.0.1", 3503)), 0);
-    assert_eq!(run(MPLS_FILTER, &frame(&[100], 64, "10.0.0.1", "127.0.0.1", 3503)), 0);
-    assert_ne!(run(MPLS_FILTER, &frame(&[0], 64, "10.0.0.1", "127.0.0.1", 3503)), 0);
-    assert_ne!(run(MPLS_FILTER, &frame(&[2], 64, "2001:db8::1", "::1", 3503)), 0);
-    assert_eq!(run(MPLS_FILTER, &frame(&[3], 64, "10.0.0.1", "127.0.0.1", 3503)), 0);
-    assert_eq!(run(MPLS_FILTER, &frame(&[6], 64, "10.0.0.1", "127.0.0.1", 3503)), 0);
+    assert_ne!(
+        run(
+            MPLS_FILTER,
+            &frame(&[100], 1, "10.0.0.1", "127.0.0.1", 3503)
+        ),
+        0
+    );
+    assert_ne!(
+        run(
+            MPLS_FILTER,
+            &frame(&[100], 0, "10.0.0.1", "127.0.0.1", 3503)
+        ),
+        0
+    );
+    assert_eq!(
+        run(
+            MPLS_FILTER,
+            &frame(&[100], 64, "10.0.0.1", "127.0.0.1", 3503)
+        ),
+        0
+    );
+    assert_ne!(
+        run(MPLS_FILTER, &frame(&[0], 64, "10.0.0.1", "127.0.0.1", 3503)),
+        0
+    );
+    assert_ne!(
+        run(MPLS_FILTER, &frame(&[2], 64, "2001:db8::1", "::1", 3503)),
+        0
+    );
+    assert_eq!(
+        run(MPLS_FILTER, &frame(&[3], 64, "10.0.0.1", "127.0.0.1", 3503)),
+        0
+    );
+    assert_eq!(
+        run(MPLS_FILTER, &frame(&[6], 64, "10.0.0.1", "127.0.0.1", 3503)),
+        0
+    );
     // IPv4: 127/8 and port 3503 only.
-    assert_ne!(run(IP4_FILTER, &frame(&[], 1, "10.0.0.1", "127.0.0.1", 3503)), 0);
-    assert_ne!(run(IP4_FILTER, &frame(&[], 1, "10.0.0.1", "127.9.8.7", 3503)), 0);
-    assert_eq!(run(IP4_FILTER, &frame(&[], 1, "10.0.0.1", "10.0.0.2", 3503)), 0);
-    assert_eq!(run(IP4_FILTER, &frame(&[], 1, "10.0.0.1", "127.0.0.1", 53)), 0);
+    assert_ne!(
+        run(IP4_FILTER, &frame(&[], 1, "10.0.0.1", "127.0.0.1", 3503)),
+        0
+    );
+    assert_ne!(
+        run(IP4_FILTER, &frame(&[], 1, "10.0.0.1", "127.9.8.7", 3503)),
+        0
+    );
+    assert_eq!(
+        run(IP4_FILTER, &frame(&[], 1, "10.0.0.1", "10.0.0.2", 3503)),
+        0
+    );
+    assert_eq!(
+        run(IP4_FILTER, &frame(&[], 1, "10.0.0.1", "127.0.0.1", 53)),
+        0
+    );
     let mut frag = frame(&[], 1, "10.0.0.1", "127.0.0.1", 3503);
     frag[20] = 0x20; // more fragments
     assert_eq!(run(IP4_FILTER, &frag), 0);
     // IPv6: ::1 and ::ffff:127/104 only.
-    assert_ne!(run(IP6_FILTER, &frame(&[], 1, "2001:db8::1", "::1", 3503)), 0);
-    assert_ne!(run(IP6_FILTER, &frame(&[], 1, "2001:db8::1", "::ffff:127.0.0.9", 3503)), 0);
-    assert_eq!(run(IP6_FILTER, &frame(&[], 1, "2001:db8::1", "::ffff:10.0.0.1", 3503)), 0);
-    assert_eq!(run(IP6_FILTER, &frame(&[], 1, "2001:db8::1", "::2", 3503)), 0);
-    assert_eq!(run(IP6_FILTER, &frame(&[], 1, "2001:db8::1", "2001:db8::2", 3503)), 0);
-    assert_eq!(run(IP6_FILTER, &frame(&[], 1, "2001:db8::1", "::1", 3504)), 0);
+    assert_ne!(
+        run(IP6_FILTER, &frame(&[], 1, "2001:db8::1", "::1", 3503)),
+        0
+    );
+    assert_ne!(
+        run(
+            IP6_FILTER,
+            &frame(&[], 1, "2001:db8::1", "::ffff:127.0.0.9", 3503)
+        ),
+        0
+    );
+    assert_eq!(
+        run(
+            IP6_FILTER,
+            &frame(&[], 1, "2001:db8::1", "::ffff:10.0.0.1", 3503)
+        ),
+        0
+    );
+    assert_eq!(
+        run(IP6_FILTER, &frame(&[], 1, "2001:db8::1", "::2", 3503)),
+        0
+    );
+    assert_eq!(
+        run(
+            IP6_FILTER,
+            &frame(&[], 1, "2001:db8::1", "2001:db8::2", 3503)
+        ),
+        0
+    );
+    assert_eq!(
+        run(IP6_FILTER, &frame(&[], 1, "2001:db8::1", "::1", 3504)),
+        0
+    );
 }
 
 #[test]
@@ -134,18 +242,28 @@ fn route_answers_with_mpls_encap_parse() {
     attr(&mut b, RTA_GATEWAY, &[10, 0, 0, 2]);
     attr(&mut b, RTA_ENCAP_TYPE, &LWTUNNEL_ENCAP_MPLS.to_ne_bytes());
     let mut encap = Vec::new();
-    attr(&mut encap, MPLS_IPTUNNEL_DST, &crate::mpls::encode_label(100, true));
+    attr(
+        &mut encap,
+        MPLS_IPTUNNEL_DST,
+        &crate::mpls::encode_label(100, true),
+    );
     attr(&mut b, RTA_ENCAP, &encap);
     let r = parse_route(&b).unwrap();
     assert!(r.unicast && !r.static_route);
-    assert_eq!(r.nexthops, vec![RawFtn {
-        ifindex: Some(3),
-        gateway: Some("10.0.0.2".parse().unwrap()),
-        labels: vec![100],
-    }]);
+    assert_eq!(
+        r.nexthops,
+        vec![RawFtn {
+            ifindex: Some(3),
+            gateway: Some("10.0.0.2".parse().unwrap()),
+            labels: vec![100],
+        }]
+    );
     // The request asks for the FIB entry of a /32.
     let q = route_request("10.255.0.3".parse().unwrap(), 9);
-    assert_eq!(u32::from_ne_bytes(q[0..4].try_into().unwrap()) as usize, q.len());
+    assert_eq!(
+        u32::from_ne_bytes(q[0..4].try_into().unwrap()) as usize,
+        q.len()
+    );
     assert_eq!(&q[16..18], &[2, 32]);
 }
 

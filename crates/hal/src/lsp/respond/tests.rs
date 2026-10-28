@@ -131,7 +131,10 @@ fn the_egress_answers_code_3_and_copies_the_ids() {
     let r = answer(&heard(&[], &request()), &egress());
     assert_eq!(r.msg_type, wire::MSG_REPLY);
     assert_eq!((r.return_code, r.return_subcode), (code::EGRESS, 1));
-    assert_eq!((r.handle, r.seq, r.sent, r.received), (0x1234, 9, (100, 200), (5, 6)));
+    assert_eq!(
+        (r.handle, r.seq, r.sent, r.received),
+        (0x1234, 9, (100, 200), (5, 6))
+    );
     // §3.4: the egress sends no DDMAP.
     assert!(r.ddmaps.is_empty());
     // Explicit null arrives at the egress when it asked for it (§4.4 step 4).
@@ -156,7 +159,10 @@ fn a_transit_lsr_reports_the_switch_and_its_downstream() {
     assert_eq!(d.address, DsAddress::numbered(ip("10.0.23.3")));
     assert_eq!(d.mtu, 1500);
     assert_eq!(d.labels.len(), 1);
-    assert_eq!((d.labels[0].label, d.labels[0].protocol, d.labels[0].bottom), (200, wire::PROTO_LDP, true));
+    assert_eq!(
+        (d.labels[0].label, d.labels[0].protocol, d.labels[0].bottom),
+        (200, wire::PROTO_LDP, true)
+    );
     // Without a DDMAP in the request (a ping that expired): no DDMAP back.
     let r = answer(&heard(&[(100, 1)], &request()), &transit());
     assert_eq!(r.return_code, code::LABEL_SWITCHED);
@@ -187,7 +193,10 @@ fn interface_and_label_mismatches_are_code_5_with_what_came_in() {
     let mut d = ddmap_to_r2(100);
     d.address = DsAddress::numbered(ip("10.9.9.9"));
     e.ddmaps.push(d);
-    assert_eq!(answer(&heard(&[(100, 1)], &e), &transit()).return_code, code::DS_MISMATCH);
+    assert_eq!(
+        answer(&heard(&[(100, 1)], &e), &transit()).return_code,
+        code::DS_MISMATCH
+    );
     // 127.0.0.1: the upstream does not know the interface (code 6).
     let mut e = request();
     let mut d = ddmap_to_r2(100);
@@ -202,7 +211,10 @@ fn interface_and_label_mismatches_are_code_5_with_what_came_in() {
     let mut d = ddmap_to_r2(555);
     d.address = DsAddress::all_routers(false);
     e.ddmaps.push(d);
-    assert_eq!(answer(&heard(&[(100, 1)], &e), &transit()).return_code, code::LABEL_SWITCHED);
+    assert_eq!(
+        answer(&heard(&[(100, 1)], &e), &transit()).return_code,
+        code::LABEL_SWITCHED
+    );
 }
 
 #[test]
@@ -223,7 +235,10 @@ fn a_label_of_another_fec_is_code_10() {
     assert_eq!((r.return_code, r.return_subcode), (code::WRONG_LABEL, 1));
     // No route at all for the FEC: no mapping.
     v.fecs.clear();
-    assert_eq!(answer(&heard(&[(100, 1)], &e), &v).return_code, code::NO_MAPPING);
+    assert_eq!(
+        answer(&heard(&[(100, 1)], &e), &v).return_code,
+        code::NO_MAPPING
+    );
 }
 
 #[test]
@@ -231,11 +246,17 @@ fn malformed_and_unknown_tlvs() {
     let mut h = heard(&[], &request());
     h.payload.truncate(wire::HEADER_LEN + 6);
     let r = answer(&h, &egress());
-    assert_eq!((r.return_code, r.handle, r.seq, r.sent), (code::MALFORMED, 0x1234, 9, (100, 200)));
+    assert_eq!(
+        (r.return_code, r.handle, r.seq, r.sent),
+        (code::MALFORMED, 0x1234, 9, (100, 200))
+    );
     // No FEC stack at all.
     let mut e = request();
     e.fec_stack = None;
-    assert_eq!(answer(&heard(&[], &e), &egress()).return_code, code::MALFORMED);
+    assert_eq!(
+        answer(&heard(&[], &e), &egress()).return_code,
+        code::MALFORMED
+    );
     // A mandatory TLV this LSR does not know: code 2, sent back.
     let mut h = heard(&[], &request());
     h.payload.extend_from_slice(&[0, 0x63, 0, 1, 7, 0, 0, 0]);

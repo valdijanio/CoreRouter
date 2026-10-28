@@ -88,7 +88,11 @@ fn chain(fec: IpNet) -> Option<(Vec<Hop>, LspPath)> {
     let label = |k: usize| 1000 + 100 * u32::from(d) + u32::try_from(k).unwrap_or(0);
     let addr = |k: usize| Ipv4Addr::new(10, net, u8::try_from(k).unwrap_or(0), 2);
     let out = |k: usize| -> Vec<u32> {
-        if k + 1 >= hops { Vec::new() } else { vec![label(k + 1)] }
+        if k + 1 >= hops {
+            Vec::new()
+        } else {
+            vec![label(k + 1)]
+        }
     };
     let chain: Vec<Hop> = (1..=hops)
         .map(|k| {
@@ -305,7 +309,10 @@ mod tests {
         assert_eq!((r.return_code, r.return_subcode), (code::EGRESS, 1));
         assert_eq!((r.handle, r.seq), (7, 1));
         // Two hops: PHP, the request reaches the egress unlabeled.
-        assert_eq!(ask("10.255.0.2/32", 255, false).unwrap().return_code, code::EGRESS);
+        assert_eq!(
+            ask("10.255.0.2/32", 255, false).unwrap().return_code,
+            code::EGRESS
+        );
         assert!(ask("192.0.2.1/32", 255, false).is_none());
     }
 
@@ -319,7 +326,10 @@ mod tests {
         assert_eq!(r.return_code, code::LABEL_SWITCHED);
         // The penultimate hop pops: implicit null downstream.
         assert_eq!(r.ddmaps[0].labels[0].label, wire::LABEL_IMPLICIT_NULL);
-        assert_eq!(ask("10.255.0.4/32", 3, true).unwrap().return_code, code::EGRESS);
+        assert_eq!(
+            ask("10.255.0.4/32", 3, true).unwrap().return_code,
+            code::EGRESS
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ use corerouter_model::IfName;
 use ipnet::IpNet;
 
 use super::wire::{
-    self, DsAddress, DsLabel, Ddmap, Echo, Fec, IfLabelStack, LABEL_EXPLICIT_NULL_V4,
+    self, Ddmap, DsAddress, DsLabel, Echo, Fec, IfLabelStack, LABEL_EXPLICIT_NULL_V4,
     LABEL_EXPLICIT_NULL_V6, LABEL_IMPLICIT_NULL, LABEL_ROUTER_ALERT, code,
 };
 use crate::mpls::{MplsNexthop, MplsRoute, Origin};
@@ -105,7 +105,9 @@ fn protocol(origin: Origin) -> u8 {
 /// The DDMAP of one way out of a label entry (§3.4): the next router, the
 /// labels it will see (implicit null when popped).
 pub fn ddmap_of(nh: &MplsNexthop, origin: Origin, mtu: Option<u16>, v6: bool) -> Ddmap {
-    let address = nh.via.map_or_else(|| DsAddress::unknown(v6), DsAddress::numbered);
+    let address = nh
+        .via
+        .map_or_else(|| DsAddress::unknown(v6), DsAddress::numbered);
     let proto = protocol(origin);
     let mut labels: Vec<DsLabel> = nh
         .out_labels
@@ -257,8 +259,14 @@ pub fn respond(heard: &Heard, view: &dyn LsrView, now: (u32, u32)) -> Verdict {
                 ..Echo::default()
             };
             if let (Some(a), Some(b)) = (
-                heard.payload.get(16..20).and_then(|s| <[u8; 4]>::try_from(s).ok()),
-                heard.payload.get(20..24).and_then(|s| <[u8; 4]>::try_from(s).ok()),
+                heard
+                    .payload
+                    .get(16..20)
+                    .and_then(|s| <[u8; 4]>::try_from(s).ok()),
+                heard
+                    .payload
+                    .get(20..24)
+                    .and_then(|s| <[u8; 4]>::try_from(s).ok()),
             ) {
                 e.sent = (u32::from_be_bytes(a), u32::from_be_bytes(b));
             }
@@ -338,11 +346,7 @@ fn classify(
     // Step 3: from the top (depth = number of labels) down.
     let mut depth = heard.stack.len();
     while depth > 0 {
-        let Some(label) = heard
-            .stack
-            .get(heard.stack.len() - depth)
-            .map(|l| l.label)
-        else {
+        let Some(label) = heard.stack.get(heard.stack.len() - depth).map(|l| l.label) else {
             break;
         };
         if pops_and_continues(label) {

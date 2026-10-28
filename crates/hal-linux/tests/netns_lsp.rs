@@ -42,7 +42,10 @@ fn in_netns() -> bool {
         );
         return false;
     }
-    let out = Command::new("ip").args(["-o", "link", "show"]).output().unwrap();
+    let out = Command::new("ip")
+        .args(["-o", "link", "show"])
+        .output()
+        .unwrap();
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let names: Vec<&str> = text
         .lines()
@@ -85,8 +88,27 @@ fn setup() {
     ip(&["link", "set", "lpb", "up"]);
     ip(&["link", "set", "lo", "up"]);
     let m = mac("lpb");
-    ip(&["neigh", "replace", "10.77.0.9", "lladdr", &m, "dev", "lpa", "nud", "permanent"]);
-    ip(&["route", "replace", "10.255.7.7/32", "via", "10.77.0.9", "dev", "lpa", "onlink"]);
+    ip(&[
+        "neigh",
+        "replace",
+        "10.77.0.9",
+        "lladdr",
+        &m,
+        "dev",
+        "lpa",
+        "nud",
+        "permanent",
+    ]);
+    ip(&[
+        "route",
+        "replace",
+        "10.255.7.7/32",
+        "via",
+        "10.77.0.9",
+        "dev",
+        "lpa",
+        "onlink",
+    ]);
 }
 
 /// The responder on `lpb`, answering until `stop`.
@@ -103,7 +125,14 @@ fn responder(stop: Arc<AtomicBool>) -> thread::JoinHandle<u64> {
                     continue;
                 };
                 let ntp = r.now_ntp();
-                if let Verdict::Reply { to, from, tos, payload, .. } = respond(&h, r.view(), ntp) {
+                if let Verdict::Reply {
+                    to,
+                    from,
+                    tos,
+                    payload,
+                    ..
+                } = respond(&h, r.view(), ntp)
+                {
                     r.send(to, from, tos, &payload).unwrap();
                     replied += 1;
                 }
@@ -154,7 +183,12 @@ fn unlabeled_requests_reach_the_egress() {
     assert_eq!(p.interface.as_str(), "lpa");
     assert_eq!(p.src, Some("10.77.0.1".parse().unwrap()));
     // 10.255.7.7 is nobody's: the LSR where it ends says "no mapping".
-    let (r, _, _) = ask(&mut s, p, &Echo::request(1, 1, vec![Fec::Ldp("10.255.7.7/32".parse().unwrap())]), 255);
+    let (r, _, _) = ask(
+        &mut s,
+        p,
+        &Echo::request(1, 1, vec![Fec::Ldp("10.255.7.7/32".parse().unwrap())]),
+        255,
+    );
     assert_eq!(r.return_code, code::NO_MAPPING);
     // 10.77.0.2 is the responder's: egress.
     let mut rtts = Vec::new();
@@ -169,9 +203,16 @@ fn unlabeled_requests_reach_the_egress() {
         rtts.push(rtt);
     }
     rtts.sort();
-    eprintln!("LSP ping round trip over veth (median of 10): {:?}", rtts[5]);
+    eprintln!(
+        "LSP ping round trip over veth (median of 10): {:?}",
+        rtts[5]
+    );
     // Paths of a FEC without route: none.
-    assert!(s.paths("192.0.2.77/32".parse().unwrap()).unwrap().is_empty());
+    assert!(
+        s.paths("192.0.2.77/32".parse().unwrap())
+            .unwrap()
+            .is_empty()
+    );
     stop.store(true, Ordering::Relaxed);
     assert!(worker.join().unwrap() >= 11);
 }
@@ -193,8 +234,33 @@ fn a_label_ttl_that_expires_is_answered_by_the_transit_lsr() {
     setup();
     std::fs::write("/proc/sys/net/mpls/platform_labels", "1000").unwrap();
     std::fs::write("/proc/sys/net/mpls/conf/lpb/input", "1").unwrap();
-    ip(&["route", "replace", "10.255.8.8/32", "encap", "mpls", "100", "via", "10.77.0.9", "dev", "lpa", "onlink"]);
-    ip(&["-f", "mpls", "route", "replace", "100", "as", "200", "via", "inet", "10.77.0.9", "dev", "lpa"]);
+    ip(&[
+        "route",
+        "replace",
+        "10.255.8.8/32",
+        "encap",
+        "mpls",
+        "100",
+        "via",
+        "10.77.0.9",
+        "dev",
+        "lpa",
+        "onlink",
+    ]);
+    ip(&[
+        "-f",
+        "mpls",
+        "route",
+        "replace",
+        "100",
+        "as",
+        "200",
+        "via",
+        "inet",
+        "10.77.0.9",
+        "dev",
+        "lpa",
+    ]);
     let stop = Arc::new(AtomicBool::new(false));
     let worker = responder(stop.clone());
     let mut s = HostLspSocket::open().unwrap();
@@ -215,7 +281,11 @@ fn a_label_ttl_that_expires_is_answered_by_the_transit_lsr() {
         false,
     ));
     let (r, _, _) = ask(&mut s, &p, &e, 1);
-    assert_eq!((r.return_code, r.return_subcode), (code::LABEL_SWITCHED, 1), "{r:?}");
+    assert_eq!(
+        (r.return_code, r.return_subcode),
+        (code::LABEL_SWITCHED, 1),
+        "{r:?}"
+    );
     assert_eq!(r.ddmaps[0].labels[0].label, 200);
     // TTL 255 does not expire: the kernel switches it, nobody answers here.
     // A label without entry, with TTL 1: code 11.

@@ -111,7 +111,9 @@ pub fn build_frame(f: &FrameSpec<'_>) -> Option<Vec<u8>> {
             // UDP checksum over the pseudo-header (RFC 768).
             let mut acc = sum16(&s.octets(), 0);
             acc = sum16(&d.octets(), acc);
-            acc = acc.wrapping_add(u32::from(IPPROTO_UDP)).wrapping_add(udp_len as u32);
+            acc = acc
+                .wrapping_add(u32::from(IPPROTO_UDP))
+                .wrapping_add(udp_len as u32);
             let c = match fold(sum16(&udp, acc)) {
                 0 => 0xffff,
                 c => c,
@@ -128,7 +130,9 @@ pub fn build_frame(f: &FrameSpec<'_>) -> Option<Vec<u8>> {
             // IPv6 needs the UDP checksum (RFC 8200 §8.1).
             let mut acc = sum16(&s.octets(), 0);
             acc = sum16(&d.octets(), acc);
-            acc = acc.wrapping_add(udp_len as u32).wrapping_add(u32::from(IPPROTO_UDP));
+            acc = acc
+                .wrapping_add(udp_len as u32)
+                .wrapping_add(u32::from(IPPROTO_UDP));
             let c = match fold(sum16(&udp, acc)) {
                 0 => 0xffff,
                 c => c,
@@ -198,7 +202,11 @@ pub fn parse_frame(frame: &[u8], interface: &IfName) -> Option<Heard> {
             }
             let s: [u8; 4] = frame.get(at + 12..at + 16)?.try_into().ok()?;
             let d: [u8; 4] = frame.get(at + 16..at + 20)?.try_into().ok()?;
-            (IpAddr::V4(Ipv4Addr::from(s)), IpAddr::V4(Ipv4Addr::from(d)), at + ihl)
+            (
+                IpAddr::V4(Ipv4Addr::from(s)),
+                IpAddr::V4(Ipv4Addr::from(d)),
+                at + ihl,
+            )
         }
         ETH_P_IPV6 => {
             if frame.get(at)? >> 4 != 6 || *frame.get(at + 6)? != IPPROTO_UDP {
@@ -259,7 +267,7 @@ pub fn sock_filter(prog: &[Insn]) -> Vec<SockFilter> {
 /// label is explicit null (IPv4 0, IPv6 2: it ends here).
 pub const MPLS_FILTER: &[Insn] = &[
     /* 0 */ (LD_B_ABS, 0, 0, 17), // top label TTL
-    /* 1 */ (JGT_K, 0, 4, 1),     // ≤ 1 → keep
+    /* 1 */ (JGT_K, 0, 4, 1), // ≤ 1 → keep
     /* 2 */ (LD_W_ABS, 0, 0, 14),
     /* 3 */ (AND_K, 0, 0, 0xffff_d000), // the label, bit 1 cleared: 0 and 2 → 0
     /* 4 */ (JEQ_K, 1, 0, 0),
@@ -276,7 +284,7 @@ pub const IP4_FILTER: &[Insn] = &[
     /* 4 */ (LD_H_ABS, 0, 0, 20), // flags + fragment offset
     /* 5 */ (JSET_K, 3, 0, 0x3fff),
     /* 6 */ (LDX_B_MSH, 0, 0, 14), // X = IP header length
-    /* 7 */ (LD_H_IND, 0, 0, 16),  // UDP destination port
+    /* 7 */ (LD_H_IND, 0, 0, 16), // UDP destination port
     /* 8 */ (JEQ_K, 1, 0, corerouter_hal::lsp::wire::PORT as u32),
     /* 9 */ (RET_K, 0, 0, 0),
     /* 10 */ (RET_K, 0, 0, KEEP),
@@ -294,7 +302,7 @@ pub const IP6_FILTER: &[Insn] = &[
     /* 6 */ (LD_W_ABS, 0, 0, 42),
     /* 7 */ (JEQ_K, 0, 7, 0),
     /* 8 */ (LD_W_ABS, 0, 0, 46),
-    /* 9 */ (JEQ_K, 3, 0, 0),       // ::x → is x 1?
+    /* 9 */ (JEQ_K, 3, 0, 0), // ::x → is x 1?
     /* 10 */ (JEQ_K, 0, 4, 0xffff), // ::ffff:x → is x in 127/8?
     /* 11 */ (LD_B_ABS, 0, 0, 50),
     /* 12 */ (JEQ_K, 3, 2, 127),
@@ -408,7 +416,10 @@ fn nexthop_attrs(attrs: &[u8], nh: &mut RawFtn) {
             RTA_GATEWAY => nh.gateway = ip_of(data),
             RTA_VIA => nh.gateway = via_of(data),
             RTA_ENCAP_TYPE => {
-                mpls = data.get(..2).and_then(|d| d.try_into().ok()).map(u16::from_ne_bytes)
+                mpls = data
+                    .get(..2)
+                    .and_then(|d| d.try_into().ok())
+                    .map(u16::from_ne_bytes)
                     == Some(LWTUNNEL_ENCAP_MPLS);
             }
             RTA_ENCAP => encap = data,
@@ -440,7 +451,10 @@ pub fn parse_route(body: &[u8]) -> Option<RawFecRoute> {
                 // i32 } followed by its attributes.
                 let mut rest = data;
                 while r.nexthops.len() < MAX_NEXTHOPS {
-                    let Some(len) = rest.get(..2).and_then(|b| b.try_into().ok()).map(u16::from_ne_bytes)
+                    let Some(len) = rest
+                        .get(..2)
+                        .and_then(|b| b.try_into().ok())
+                        .map(u16::from_ne_bytes)
                     else {
                         break;
                     };
@@ -450,7 +464,10 @@ pub fn parse_route(body: &[u8]) -> Option<RawFecRoute> {
                     }
                     let Some(one) = rest.get(..len) else { break };
                     let mut nh = RawFtn {
-                        ifindex: one.get(4..8).and_then(|b| b.try_into().ok()).map(u32::from_ne_bytes),
+                        ifindex: one
+                            .get(4..8)
+                            .and_then(|b| b.try_into().ok())
+                            .map(u32::from_ne_bytes),
                         ..RawFtn::default()
                     };
                     nexthop_attrs(one.get(8..).unwrap_or(&[]), &mut nh);

@@ -9,7 +9,12 @@
 //! ```
 
 // A benchmark is test code: fixtures may unwrap (clippy.toml only covers #[test]).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::collections::BTreeMap;
 use std::hint::black_box;
@@ -100,8 +105,12 @@ fn bench(c: &mut Criterion) {
         payload: payload.clone(),
     };
     let mut g = c.benchmark_group("lsp_echo");
-    g.bench_function("encode_request_with_ddmap", |b| b.iter(|| wire::encode(black_box(&e))));
-    g.bench_function("parse_request_with_ddmap", |b| b.iter(|| wire::parse(black_box(&payload))));
+    g.bench_function("encode_request_with_ddmap", |b| {
+        b.iter(|| wire::encode(black_box(&e)))
+    });
+    g.bench_function("parse_request_with_ddmap", |b| {
+        b.iter(|| wire::parse(black_box(&payload)))
+    });
     g.bench_function("respond_transit_100k_labels", |b| {
         b.iter(|| respond(black_box(&heard), &v, (0, 0)))
     });

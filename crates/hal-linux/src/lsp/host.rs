@@ -104,10 +104,7 @@ impl Links {
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .map(|m| u16::try_from(m).unwrap_or(u16::MAX));
         }
-        self.by_index = by_name
-            .iter()
-            .map(|(n, l)| (l.index, n.clone()))
-            .collect();
+        self.by_index = by_name.iter().map(|(n, l)| (l.index, n.clone())).collect();
         self.by_name = by_name;
         true
     }
@@ -238,7 +235,11 @@ impl Neighbors {
         if let Some(m) = self.map.get(&(dev.clone(), ip)) {
             return Some(*m);
         }
-        let domain = if ip.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+        let domain = if ip.is_ipv6() {
+            Domain::IPV6
+        } else {
+            Domain::IPV4
+        };
         if let Ok(s) = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)) {
             let _ = s.bind_device(Some(dev.as_str().as_bytes()));
             let _ = s.send_to(&[0], &SocketAddr::new(ip, 9).into());
@@ -300,10 +301,7 @@ fn udp(v6: bool) -> io::Result<(Socket, u16)> {
     }
     s.set_nonblocking(true)?;
     s.bind(&any.into())?;
-    let port = s
-        .local_addr()?
-        .as_socket()
-        .map_or(0, |a| a.port());
+    let port = s.local_addr()?.as_socket().map_or(0, |a| a.port());
     Ok((s, port))
 }
 
@@ -363,7 +361,11 @@ impl LspSocket for HostLspSocket {
             return Ok(Vec::new());
         }
         let v6 = fec.addr().is_ipv6();
-        let origin = if r.static_route { Origin::Static } else { Origin::Ldp };
+        let origin = if r.static_route {
+            Origin::Static
+        } else {
+            Origin::Ldp
+        };
         Ok(nexthops(&r, &self.links)
             .into_iter()
             .filter_map(|nh| {
@@ -399,11 +401,20 @@ impl LspSocket for HostLspSocket {
                 ProbeError::Unreachable(format!("{} is not an Ethernet link", path.interface))
             })?;
         let nexthop = path.nexthop.ok_or_else(|| {
-            ProbeError::Unreachable(format!("the route leaves {} without a next hop", path.interface))
+            ProbeError::Unreachable(format!(
+                "the route leaves {} without a next hop",
+                path.interface
+            ))
         })?;
-        let dst_mac = self.neighbors.mac(&path.interface, nexthop).ok_or_else(|| {
-            ProbeError::Unreachable(format!("no ARP/ND entry for {nexthop} on {}", path.interface))
-        })?;
+        let dst_mac = self
+            .neighbors
+            .mac(&path.interface, nexthop)
+            .ok_or_else(|| {
+                ProbeError::Unreachable(format!(
+                    "no ARP/ND entry for {nexthop} on {}",
+                    path.interface
+                ))
+            })?;
         let mut payload = req.payload.to_vec();
         let (secs, frac) = ntp_now();
         if let Some(ts) = payload.get_mut(16..24) {
@@ -448,14 +459,12 @@ impl LspSocket for HostLspSocket {
             return Ok(None);
         }
         for s in std::iter::once(&self.udp4).chain(self.udp6.iter()) {
-            let (n, from) = match recvfrom::<nix::sys::socket::SockaddrStorage>(
-                s.as_raw_fd(),
-                &mut self.buf,
-            ) {
-                Ok(r) => r,
-                Err(nix::Error::EAGAIN) => continue,
-                Err(e) => return Err(ProbeError::Io(e.to_string())),
-            };
+            let (n, from) =
+                match recvfrom::<nix::sys::socket::SockaddrStorage>(s.as_raw_fd(), &mut self.buf) {
+                    Ok(r) => r,
+                    Err(nix::Error::EAGAIN) => continue,
+                    Err(e) => return Err(ProbeError::Io(e.to_string())),
+                };
             let from = from.and_then(|a| {
                 a.as_sockaddr_in()
                     .map(|v| SocketAddr::new(IpAddr::V4(v.ip()), v.port()))
@@ -628,9 +637,15 @@ pub struct HostResponder {
 
 fn reply_socket(v6: bool) -> io::Result<Socket> {
     let (domain, addr) = if v6 {
-        (Domain::IPV6, SocketAddr::from((Ipv6Addr::UNSPECIFIED, wire::PORT)))
+        (
+            Domain::IPV6,
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, wire::PORT)),
+        )
     } else {
-        (Domain::IPV4, SocketAddr::from((Ipv4Addr::UNSPECIFIED, wire::PORT)))
+        (
+            Domain::IPV4,
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, wire::PORT)),
+        )
     };
     let s = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
     if v6 {
