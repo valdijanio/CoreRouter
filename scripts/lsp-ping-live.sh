@@ -23,6 +23,9 @@ for n in 1 2 3; do
   ip -n "lsp$n" link set lo up
   ip -n "lsp$n" addr add "10.255.0.$n/32" dev lo
   ip netns exec "lsp$n" sysctl -qw net.mpls.platform_labels=100000
+  # A new namespace does not forward IP: lsp2 must (the replies come back
+  # unlabeled where the next router asked for implicit null).
+  ip netns exec "lsp$n" sysctl -qw net.ipv4.ip_forward=1
 done
 link() { # <ns a> <if a> <addr a> <ns b> <if b> <addr b>
   ip -n "$1" link add "$2" type veth peer name "$5" netns "$4"
@@ -66,7 +69,7 @@ done
 ip -n lsp1 route show 10.255.0.3
 ip -n lsp2 -f mpls route show
 echo "ICMP ping over the same path (kernel echo):"
-ip netns exec lsp1 ping -c 50 -i 0.02 -q 10.255.0.3 | tail -1
+ip netns exec lsp1 ping -c 200 -i 0.01 -q 10.255.0.3 | tail -2 || true
 status=0
 COREROUTER_LSP_LIVE=1 cargo test -p corerouter-hal-linux --test lsp_live -- --nocapture || status=$?
 exit $status
