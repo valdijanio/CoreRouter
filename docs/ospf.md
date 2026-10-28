@@ -37,15 +37,20 @@ corerouter-cli run routing.ospf.interface-template.check '{"area":"backbone","ne
   HMAC-SHA por key chain, RFC 5709; o `ospf6d` faz o trailer da RFC 7166 do mesmo jeito). A chave
   própria de um template é a chain `CR-T<id>`; a `/routing ospf keychain K` é `CR-K-K`. As
   janelas viram `send-lifetime`/`accept-lifetime` no horário local da caixa: o CoreRouter roda em
-  UTC. `simple` usa `ip ospf authentication-key` (8 bytes, RFC 2328 §D.3).
+  UTC. `simple` usa `ip ospf authentication-key` (8 bytes, RFC 2328 §D.3). O FRR 10.7.1 de
+  deb.frrouting.org só aceita `md5` e `hmac-sha-256` na key chain (sem OpenSSL); sha1, sha384 e
+  sha512 são recusados no commit com a mensagem do FRR (G3.9: antes o commit passava e o `ospfd`
+  ficava sem a chain).
 - **Selagem**: `auth_key` e `key_string` chegam em claro e são selados na hora (AES-256-GCM, a
   mesma das senhas PPPoE e da chave TCP MD5 do BGP). Config, histórico, journal, MCP e respostas
   mostram a caixa ou `key_set: true`; só o render abre. O `hal-frr` mascara `key-string`,
   `authentication-key`, `md5 …` e `key …` em erro e log; as duas chaves estão em
   `auth::SECRET_KEYS`.
 - **BFD**: o campo `bfd` do template é o nome de um perfil da G3.6 (`/routing bfd profile`, ou os de
-  fábrica `default` e `fast`), conferido no commit. Nada vai para o FRR: o CoreRouter tem BFD
-  próprio em Rust (não o `bfdd`), e ligar a queda da sessão BFD à adjacência é a G3.6b.
+  fábrica `default` e `fast`), conferido no commit, e vira `ip ospf bfd` + `ip ospf bfd profile P`
+  (`ipv6 ospf6 …` no v3): o `ospfd` pede a sessão ao `bfdd`, que a entrega ao nosso motor (data
+  plane, G3.6b), e a adjacência cai com ela. Até a G3.9 essas linhas não eram geradas e o OSPF
+  esperava o dead interval num corte silencioso (achado contra o RouterOS, `docs/producao-core.md`).
 - **Redistribuição**: um route-map por instância e tipo (`CR-O2-<inst>-connected`): primeiro os
   pools de assinantes, depois a `out_filter_chain` compilada pelo compilador da G3.2b com as
   listas renomeadas `CR-O2-…`/`CR-O3-…` (o BGP continua com as dele no `bgpd`). Uma chain que testa

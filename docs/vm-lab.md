@@ -126,7 +126,10 @@ humana. Por isso a instalação é do usuário, **uma vez por ferramenta nova**,
 Acrescentar uma ferramenta: uma entrada em `TOOLS` num PR (com o link do hash publicado no corpo),
 e depois do merge o usuário roda `cargo xtask vm-lab tools`. Hoje: BNG Blaster 1.0.1 (`.deb` do
 release da rtbrick), `ppp`, `pppoe`, `tcpdump`, `iperf3`, `ethtool` e o FRR 10.7.1 com
-`frr-pythontools` e `libyang3` (`.deb` de deb.frrouting.org, G3.1).
+`frr-pythontools` e `libyang3` (`.deb` de deb.frrouting.org, G3.1), `qemu-system-x86`, `unzip` e
+`traceroute` (G3.9: o RouterOS CHR roda em QEMU/KVM aninhado dentro da VM; a imagem do CHR o
+próprio `scripts/routeros-interop.sh` baixa e confere com o SHA-256 da MikroTik, e o roteiro
+instala os três pacotes do Ubuntu se faltarem). Veja `docs/producao-core.md`, "Laboratório".
 
 ## Como é montada
 

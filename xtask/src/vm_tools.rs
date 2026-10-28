@@ -67,6 +67,27 @@ pub const TOOLS: &[Tool] = &[
         source: Source::Apt,
         why: "NIC offloads and channels",
     },
+    // G3.9: the RouterOS CHR runs in QEMU/KVM inside the VM
+    // (scripts/routeros-interop.sh; the CHR image itself is downloaded by
+    // the script and checked against MikroTik's published SHA-256).
+    Tool {
+        package: "qemu-system-x86",
+        version: "",
+        source: Source::Apt,
+        why: "QEMU/KVM for the RouterOS CHR (G3.9)",
+    },
+    Tool {
+        package: "unzip",
+        version: "",
+        source: Source::Apt,
+        why: "the CHR image comes zipped",
+    },
+    Tool {
+        package: "traceroute",
+        version: "",
+        source: Source::Apt,
+        why: "traceroute through the LSP (G3.9)",
+    },
     // G3.1: FRR from the project's own repository (Ubuntu's 8.4 predates
     // mgmtd). Hashes from deb.frrouting.org's `Packages` for noble, whose
     // `InRelease` checks against the FRR signing key A90FC36D…AB194DBF.
@@ -245,6 +266,9 @@ mod tests {
             [
                 "pppoe",
                 "iperf3",
+                "qemu-system-x86",
+                "unzip",
+                "traceroute",
                 "frr-pythontools",
                 "librtr0t64",
                 "frr-rpki-rtrlib"
