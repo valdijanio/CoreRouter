@@ -268,6 +268,56 @@ pub fn wanted_sessions(cfg: &BfdConfig) -> BTreeMap<BfdKey, (BfdProfile, Vec<Str
     out
 }
 
+/// Sessions by key, with their profile and users.
+pub type Wanted = BTreeMap<BfdKey, (BfdProfile, Vec<String>)>;
+
+/// Users named per route session; the rest are counted ("and 997 more
+/// routes": a gateway with thousands of routes is one session).
+const MAX_ROUTE_USERS: usize = 4;
+
+/// The sessions static routes ask for with `check_gateway = bfd` (G3.6g):
+/// one single-hop session per gateway, with the profile of its first
+/// route (by id), users `route <dst>`.
+pub fn route_sessions(cfg: &crate::config::Config) -> Wanted {
+    let mut out: BTreeMap<BfdKey, (BfdProfile, Vec<String>, usize)> = BTreeMap::new();
+    for r in cfg.ip.routes.iter() {
+        if r.disabled || r.check_gateway != crate::dhcp_client::CheckGateway::Bfd {
+            continue;
+        }
+        let Some(peer) = r.gateway.address() else { continue };
+        let name = if r.bfd_profile.is_empty() { PROFILE_DEFAULT } else { r.bfd_profile.as_str() };
+        let key = BfdKey { peer, multihop: false, local: None };
+        if !out.contains_key(&key) {
+            let Some(prof) = cfg.routing.bfd.profile(name) else { continue };
+            out.insert(key.clone(), (prof, Vec::new(), 0));
+        }
+        if let Some((_, users, n)) = out.get_mut(&key) {
+            *n += 1;
+            if users.len() < MAX_ROUTE_USERS {
+                users.push(format!("route {}", r.dst_address));
+            }
+        }
+    }
+    out.into_iter()
+        .map(|(k, (p, mut users, n))| {
+            if n > users.len() {
+                users.push(format!("and {} more routes", n - users.len()));
+            }
+            (k, (p, users))
+        })
+        .collect()
+}
+
+/// Every session the engine runs on its own: the peers and the routes'
+/// (a peer to the same address keeps its profile; the routes join its users).
+pub fn wanted_all(cfg: &crate::config::Config) -> Wanted {
+    let mut out = wanted_sessions(&cfg.routing.bfd);
+    for (key, (prof, users)) in route_sessions(cfg) {
+        out.entry(key).or_insert_with(|| (prof, Vec::new())).1.extend(users);
+    }
+    out
+}
+
 /// What `routing.bfd.session.list` shows of one session (published by the
 /// service; µs timings as the protocol carries them).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]

@@ -124,6 +124,8 @@ fn rollback_points_survive_writes_to_the_shared_sections() {
         routing_table: RoutingTable::Main,
         disabled: false,
         comment: String::new(),
+        check_gateway: Default::default(),
+        bfd_profile: String::new(),
     };
     st.candidate_mut().ip.routes.push(route(1));
     let point = st.candidate().clone();

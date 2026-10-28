@@ -190,12 +190,22 @@ impl Session {
         // An unused route's choice is its reason: `route.<id>` in the GUI.
         let chosen_kind = if me.state == State::Active { "choice" } else { "route" };
         let source = self.route_source(&me, now);
+        // G1.27f: the transitions of the gateway's check (shared by every
+        // route through it).
+        let check_history = match (me.origin, me.gateway_address) {
+            (Origin::Static, Some(gw)) if me.check.is_some() => self.route_check_history(Some(gw)),
+            _ => Vec::new(),
+        };
         let check = me.check.as_ref().map(|c| {
             json!({
                 "method": c.method,
                 "interval_secs": c.interval_secs,
                 "misses": c.misses,
                 "state": if c.down { "down" } else { "up" },
+                "status": c.status,
+                "hold_down_secs": c.hold_secs,
+                "bfd_profile": c.profile,
+                "history": check_history,
                 "down_secs": c.down_since_ms.zip(self.dhcp.now_ms)
                     .map(|(at, n)| n.saturating_sub(at) / 1000),
             })
@@ -312,6 +322,9 @@ impl Session {
         let running = self.store().running().clone();
         let cfg = self.effective(&running).into_owned();
         let Some(entry) = cfg.ip.routes.iter().find(|r| r.id == entry).cloned() else {
+            if running.ip.routes.iter().any(|r| r.id == entry && self.static_withholds(r)) {
+                return kernel_note("out of the kernel while its gateway fails check-gateway");
+            }
             return kernel_note("not applied yet (pending in the transaction)");
         };
         match self.hal_mut().snapshot(&cfg) {

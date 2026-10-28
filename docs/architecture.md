@@ -819,6 +819,14 @@ um link cujo tipo no kernel difere do config. Testes de integração (`tests/net
 num network namespace descartável sem root: `cargo xtask netns` (passo do `cargo xtask ci`,
 que vira `skip` onde `unshare` sem root não é permitido).
 
+**Check-gateway (G1.27f, G3.6g):** a rota estática com `check_gateway` sai do config efetivo
+(`Session::effective`) enquanto o gateway está caído, então hal-linux, FRR e drift a veem sumir sem
+código próprio. Estado (`gateway_check::Health`, compartilhado com o cliente DHCP da G4.7c) no
+engine; sondas no serviço `route-check` do daemon, numa thread, fora do lock, agrupadas por
+(método, gateway, tabela). Rust puro em vez de `dpinger` (um processo por gateway) ou do
+`staticd`+`bfdd` do FRR: uma thread leva 1 000 gateways com 0,5 % de um núcleo (**medido**) e o
+BFD já é o nosso (G3.6). Uma thread basta: dividir só acrescentaria lock à agenda.
+
 ### Tarefas das ferramentas (G6.1–G6.3)
 
 Ping, MTU e (G6.3) MTR levam segundos ou não terminam: o comando valida, inicia um **job** e

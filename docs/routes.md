@@ -12,7 +12,7 @@ por que esta outra não está, e para onde vai o tráfego para tal IP**. O motor
 | `origin` | `connected`, `static`, `dhcp`, `ra` (BGP e OSPF entram quando o RIB deles existir) |
 | `gateway_address`, `gateway_interface`, `interface` | o gateway separado: endereço, interface configurada e a interface de saída resolvida |
 | `gateway_status` | `reachable` / `unreachable` (nulo nas conectadas) |
-| `check_gateway` | método, intervalo, falhas seguidas e `up`/`down` (hoje só nas rotas de lease DHCP, G4.7c) |
+| `check_gateway` | método (`ping`, `arp`, `bfd`), intervalo, falhas seguidas, `up`/`down`, `status` (`checking`, `reachable`, `unreachable`, `not-checked`), hold-down e perfil BFD: rotas estáticas (G1.27f/G3.6g) e de lease DHCP (G4.7c) |
 | `ecmp` | quantos caminhos tem o grupo ECMP da rota (1 = sem ECMP) |
 | `reason`, `reason_id`, `reason_args` | por que está `standby`/`inactive`; o id e os argumentos deixam a GUI traduzir |
 | `changed_at`, `changed_secs` | quando a rota entrou no estado atual (nulo: já estava assim quando o daemon começou a olhar) |
@@ -29,7 +29,8 @@ Filtros do comando: `routing_table`, `family` (`ipv4`/`ipv6`), `state`, `origin`
 | `connected-wins` | a rede é conectada: a rota conectada (distância 0) ganha |
 | `interface-down` | a interface de saída está sem link (o daemon segue o carrier a cada segundo) |
 | `interface-disabled`, `address-disabled`, `network-disabled`, `connected-disabled` | algo no caminho foi desativado |
-| `check-gateway` | o check-gateway falhou: "check-gateway=arp falhou há 40 s" |
+| `check-gateway` | o check-gateway de uma rota de lease falhou: "check-gateway=arp falhou há 40 s" |
+| `check-gateway-down` | o gateway de uma rota estática não responde ao check-gateway (ou a sessão BFD caiu); há quanto tempo está em `changed_secs` |
 | `unreachable`, `not-on-interface`, `own-address`, `needs-interface`, `other-table`, `bridge-port`, `bond-slave`, `no-interface`, `no-table`, `family-mismatch` | a rota está errada para a config atual (o validador recusa criar assim; aparece se a config mudou embaixo dela) |
 
 A lista completa, com as palavras em inglês e os argumentos, é `route_table::REASONS`; a tradução
@@ -45,6 +46,68 @@ programa com o mesmo prefixo e métrica nunca é misturada com as nossas: o appl
 Rotas aprendidas por RA de vários roteadores também formam grupo (o kernel já as junta).
 
 Na GUI o grupo aparece numa linha "+ 2 next-hops" com o selo `ECMP`; um clique abre os caminhos.
+
+## Check-gateway (G1.27f, G3.6g)
+
+`ip.route.add/set` aceitam `check_gateway` = `none | ping | arp | bfd` e `bfd_profile` (só com
+`bfd`; vazio = `default`), como o `check-gateway` do RouterOS v7:
+
+- `ping`/`arp`: uma sonda a cada 10 s; 2 sem resposta seguidas e o gateway caiu; a primeira resposta
+  o traz de volta. `arp` só para gateway IPv4 (ND é a G1.27g); `ping` serve IPv4 e IPv6.
+- `bfd`: uma sessão do **nosso** motor BFD (serviço `bfd`, G3.6) ao gateway, salto único, com o
+  perfil da rota; cai no tempo de detecção do perfil. Sessão que não sobe em 5 s conta como caída.
+- **Gateway caído:** a rota sai do kernel (`Session::effective` a deixa de fora; `ip.route.list` a
+  mostra `inactive` com o motivo `check-gateway-down`) e a concorrente de distância maior assume.
+- **Hold-down contra oscilação:** a 1ª queda em 15 min volta na primeira resposta (RouterOS); a 2ª
+  espera 10 s respondendo, depois 20 s, 40 s… até 5 min (`hold_down_secs`). Uma falha no meio
+  recomeça a contagem.
+- **Agrupado por gateway:** rotas com o mesmo método, gateway e tabela dividem uma sonda
+  (`ip.route.check.list` mostra os alvos e quantas rotas cada um carrega;
+  `ip.route.check.history` as trocas, também no detalhe da rota).
+- **Onde roda:** o serviço `route-check` do daemon (uma thread, fora do lock do `Session`): um
+  socket ICMP por device e um `AF_PACKET` por interface; o engine (`gateway_check.rs`) guarda a
+  máquina de estado, a mesma do cliente DHCP (G4.7c), e retira/devolve as rotas num apply só.
+  `--route-check-interval <ms>` muda os 10 s (testes). Uma GUI sem daemon mostra `not-checked`.
+
+Na janela: coluna **Check** (método + selo do estado), campo **Check Gateway** com selos no modal
+e **BFD Profile** quando é `bfd`, e o detalhe com falhas, há quanto tempo caiu, hold-down e as
+últimas trocas do gateway.
+
+### Pesquisa (G1.27f)
+
+- **MikroTik RouterOS v7** — [`/ip route`](https://manual.mikrotik.com/docs/cli-reference/ip/route)
+  e [IP Routing](https://help.mikrotik.com/docs/spaces/ROS/pages/59965493/IP+Routing): `check-gateway`
+  = `none|arp|ping|bfd`, a cada 10 s, inalcançável depois de 2 falhas, de volta na primeira resposta;
+  o estado fica em `/routing nexthop`. O suporte a `bfd` em rota estática foi por muito tempo "ainda
+  não" ([fórum](https://forum.mikrotik.com/t/default-route-check-with-bfd/175874),
+  [pedido](https://forum.mikrotik.com/t/feature-request-bfd-for-static-routes/119494)); sem
+  hold-down: um gateway oscilando move o tráfego a cada 20 s.
+- **Cisco IP SLA + track** — [exemplo](https://networklessons.com/tag/ip-sla/reliable-static-routing-with-ip-sla),
+  [delay up/down](https://community.cisco.com/t5/routing/ip-sla-questions/td-p/4283763): `ip sla`
+  (icmp-echo) → `track … reachability` com `delay down/up` → `ip route … track N`. Ideia adotada:
+  a espera para voltar (aqui crescente com as quedas, em vez de fixa).
+- **Juniper Junos** — [BFD em rota estática](https://www.juniper.net/documentation/us/en/software/junos/static-routing/topics/topic-map/bfd-static-routes.html),
+  [qualified-next-hop](https://juniper.net/documentation/en_US/junos12.3/topics/example/policy-bfd-qualiified-next-hop.html):
+  `bfd-liveness-detection` por next-hop (salto único por padrão, multihop opcional), tempo de
+  detecção = intervalo × multiplicador; com o BFD caído o next-hop sai da tabela.
+- **VyOS** — [failover](https://docs.vyos.io/en/latest/configuration/protocols/failover.html):
+  rota que só fica enquanto um alvo responde (icmp/arp/tcp), alvo pode ser outro host que não o
+  next-hop. Ficou de fora (alvo diferente do gateway): vira opção futura.
+- **OPNsense/pfSense (dpinger)** — [Gateway Settings](https://doc.pfsense.org/index.php/Gateway_Settings):
+  monitoramento contínuo com limites de perda e latência (200/500 ms), alarme e estado amarelo
+  "delay". Ficou de fora (latência/perda como gatilho); o dpinger é um processo por gateway, aqui
+  uma thread leva 1 000.
+- **RFC 5880** §6.8.3 (antes de Up, no máximo 1 pacote/s: daí a carência de 5 s), §6.8.4 (tempo de
+  detecção); **RFC 5881** (salto único, TTL 255); **RFC 5882** §3.2 e §4.3 (uso genérico: o cliente
+  — aqui a rota estática — age na mudança para Down e não deve reagir a AdminDown como falha do
+  caminho; o nosso motor já reporta isso ao cliente) e §3.3 (dampening de oscilação: o do perfil BFD
+  mais o hold-down da rota).
+
+**Adotado:** nomes e tempos do RouterOS; BFD como no Junos (perfil por rota, salto único);
+espera para voltar como o `delay up` do Cisco, crescente. **Melhorias:** N rotas, 1 sonda;
+histórico por gateway; tudo é comando (MCP vê `ip.route.check.list`); retirada de 10 000
+gateways num apply. **Ficou para depois:** ND para gateway IPv6 e confirmação passiva pela tabela
+de vizinhos (G1.27g); alvo diferente do gateway (VyOS); limites de latência/perda (dpinger).
 
 ## Route lookup (`ip.route.lookup`)
 

@@ -68,6 +68,10 @@ name = "neigh_table"
 harness = false
 
 [[bench]]
+name = "gateway_check"
+harness = false
+
+[[bench]]
 name = "scale"
 harness = false
 

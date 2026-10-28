@@ -74,8 +74,9 @@ impl FromStr for AddDefaultRoute {
     }
 }
 
-/// How the client checks the lease's gateway (RouterOS `check-gateway`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// How a gateway is checked (RouterOS `check-gateway`): the DHCP client's
+/// lease gateway (G4.7c) and static routes (G1.27f, `RouteEntry`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CheckGateway {
     /// No check: the routes stay while the lease does.
@@ -85,16 +86,27 @@ pub enum CheckGateway {
     Arp,
     /// An ICMP echo every 10 s from the lease's address.
     Ping,
+    /// A BFD session to the gateway (RFC 5880/5881), static routes only:
+    /// the profile's detect time instead of 10 s × 2 (G3.6g).
+    Bfd,
 }
 
 impl CheckGateway {
-    pub const ALL: [Self; 3] = [Self::None, Self::Arp, Self::Ping];
+    /// No check (serde: left out of a route that has none).
+    pub fn is_none(&self) -> bool {
+        *self == Self::None
+    }
+
+    pub const ALL: [Self; 4] = [Self::None, Self::Arp, Self::Ping, Self::Bfd];
+    /// What a DHCP client can use (no BFD to a lease's gateway).
+    pub const DHCP: [Self; 3] = [Self::None, Self::Arp, Self::Ping];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::Arp => "arp",
             Self::Ping => "ping",
+            Self::Bfd => "bfd",
         }
     }
 }
@@ -111,7 +123,7 @@ impl FromStr for CheckGateway {
         Self::ALL
             .into_iter()
             .find(|v| v.as_str() == s.trim())
-            .ok_or_else(|| ParseError::new("check-gateway", s, "expected none, arp or ping"))
+            .ok_or_else(|| ParseError::new("check-gateway", s, "expected none, arp, ping or bfd"))
     }
 }
 
