@@ -163,6 +163,12 @@ pub fn render(cfg: &Config, open: corerouter_proto_bgp::Opener<'_>) -> Result<Co
     text.push_str(
         &corerouter_proto_mpls::render_frr(&cfg.routing.mpls, open).map_err(RenderError::Proto)?,
     );
+    // G3.4f: while SR runs, LDP's labels keep out of the SR blocks (zebra
+    // refuses an SRGB inside a narrowed dynamic block, and with the default
+    // one LDP could take an SRGB label first).
+    if let Some(b) = corerouter_proto_ospf::sr::dynamic_block(cfg) {
+        text.push_str(&format!("mpls label dynamic-block {} {}\n", b.start, b.end));
+    }
     let mut conf = Conf::parse(&text)?;
     ldp_sync(&mut conf, cfg);
     Ok(conf)

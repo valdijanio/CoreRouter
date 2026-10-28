@@ -121,6 +121,9 @@ pub struct Lsdb {
     pub attached: Vec<u32>,
     /// LSAs the reader dropped (over the cap, malformed).
     pub dropped: u64,
+    /// G3.4f: the Segment Routing database, when SR is on.
+    #[serde(default, skip_serializing_if = "crate::ospf_sr::SrDb::is_empty")]
+    pub sr: crate::ospf_sr::SrDb,
 }
 
 /// One OSPF route as the daemon computed it (`show ip ospf route json`).

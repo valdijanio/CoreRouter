@@ -116,6 +116,72 @@ esse caminho?") e **Topology** (o mapa desenhado da LSDB; clique num roteador pa
 e role para mover e aproximar). A resposta da topologia vira vetores planos ao chegar: 500
 roteadores pintam e tesselam em 3,2 ms por quadro em debug (**medido**).
 
+## Segment Routing (G3.4f)
+
+SR-MPLS sobre OSPFv2 (RFC 8665): cada roteador anuncia um **índice** para a sua loopback e todos
+encaminham até ela com o rótulo **início do SRGB + índice**, sem LDP. O `ospfd` do FRR calcula e
+instala os rótulos; o CoreRouter é dono do modelo, da validação, do render, da prévia e da leitura
+do banco SR. O RouterOS não tem SR: os nomes são os do IOS-XR e do FRR.
+
+| Comando | O que é |
+|---|---|
+| `routing.ospf.segment-routing.set` / `unset` | Liga o SR na instância OSPFv2 em VRF main: `srgb` (padrão 16000–23999), `srlb` (15000–15999), `node_msd`, `auto_sid` (SID automático para cada /32 de loopback anunciada; o índice é o último octeto quando está livre aqui e na rede) |
+| `routing.ospf.segment-routing.check` | A prévia do modal: prefixos que passam a ir por rótulo, MTU curto (+4 bytes por rótulo), interfaces sem entrada MPLS, SIDs em conflito, o bloco do LDP, e o risco com Safe Mode |
+| `routing.ospf.segment-routing.database` | O banco SR do `ospfd` (`show ip ospf database segment-routing json`): roteadores com SRGB/SRLB/MSD, SIDs com rótulo de entrada e de saída, conflitos |
+| `routing.ospf.prefix-sid.{add,set,remove,list,check}` | Os prefix SIDs deste roteador (`behavior`: `php`, `no-php`, `explicit-null`, RFC 8665 §5) |
+
+- **Por instância, não por área:** o FRR roda um banco SR por processo `ospfd`, só na VRF
+  default, para todas as áreas da instância (`ospfd/ospf_sr.c`). O IOS-XR e o Junos também ligam
+  SR no processo IGP.
+- **Render** (`proto_ospf::sr::router_lines`), na forma que o `ospfd` imprime: `capability opaque`,
+  `router-info area`, `segment-routing global-block A B [local-block C D]` (só fora do padrão, com
+  a regra de impressão do FRR), `segment-routing on`, `node-msd`, `segment-routing prefix P index
+  N [no-php-flag|explicit-null]`. Os blocos são digitados antes do `on` (com o SR desligado o FRR
+  só guarda os valores) e os prefixos depois. Ao desligar, o diff do `hal-frr` remove os prefixos
+  antes do `segment-routing on`, e este antes de `router-info` e `capability opaque`
+  (`conf::delete_late`): na ordem inversa o FRR recusa (`OSPF SR is not turned on`). Índice novo de
+  um prefixo é digitado por cima (o FRR atualiza no lugar).
+- **Rótulos fora do LDP:** o zebra recusa um SRGB dentro de um `dynamic-block` estreitado
+  (`zebra/label_manager.c`), e com o bloco inteiro o LDP poderia pegar um rótulo do SRGB antes.
+  Com a faixa padrão do `/mpls settings`, o render manda `mpls label dynamic-block 24000 1048575`
+  (o maior trecho livre fora dos blocos do SR, como o IOS-XR); com uma faixa do operador, o commit
+  recusa sobreposição e bloco acima do fim da tabela de rótulos do kernel. LSP estático dentro do
+  SRGB/SRLB também é recusado.
+- **Validação:** instância v2 em VRF main, blocos em 16–1048575 com ≥ 16 rótulos sem sobreposição
+  (`sr_range_is_valid` do FRR), MSD 1–16, SID num /32 de interface loopback anunciada por um
+  template da instância, índice abaixo do tamanho do SRGB e único, um SID por prefixo.
+- **SID duplicado antes do commit:** `prefix-sid.add`/`set` e a prévia comparam o índice com o
+  banco SR lido: um índice que outro roteador usa para outro prefixo é recusado (RFC 8402 §3.2;
+  `force: true` aceita, para anycast). A aba mostra os conflitos da rede (um índice, dois
+  prefixos; um prefixo, dois índices; RFC 8660 §2.5 deixa ao operador).
+- **Convivência com o LDP (RFC 8661):** os dois rodam juntos; os rótulos de entrada não colidem
+  (blocos separados). Para o push na entrada (FTN), o zebra do FRR 10.7.1 fica com o rótulo que
+  chegou primeiro (`ftn_update_nexthop`): a preferência SR/LDP configurável não é garantida pelo
+  FRR e ficou para a G3.4j.
+- **Sem módulos MPLS no kernel:** os comandos que ligam ficam indisponíveis com o motivo
+  (`mpls_router`), como o resto do `/mpls`.
+- **Loopback na `lo` (G3.4i):** o `ospfd` só aceita prefix SID numa interface IFF_LOOPBACK (a
+  `lo` do Linux); a loopback do CoreRouter é um `dummy` no Linux e o FRR a recusa (medido na VM:
+  `interface crsr-lo is not a Loopback`). Até a G3.4i, a prévia avisa quando há FRR de verdade. O
+  render não escreve tipo de rede na `lo` (o `ospfd` recusa: "This is a loopback interface").
+
+### Janela Routing › OSPF › Segment Routing
+
+Selo de estado (SR ligado, desativado, desligado, indisponível), instância, SRGB, SRLB e o bloco do
+LDP; **Ligar…/Configurar…/Desligar…** abrem o modal com a prévia (o OK espera o "entendi" ou o Safe
+Mode); três vistas: **Este roteador** (lista G0.24 dos prefix SIDs: + − ✓ ✗, rótulo, anunciado),
+**SIDs da rede** (prefixo, roteador, índice, rótulo, entrada, saída `implicit-null (pop)`,
+interface, próximo salto) e **Roteadores SR** (SRGB em âmbar quando difere do nosso).
+
+### Teste com FRR real
+
+`cargo xtask vm-lab run -- scripts/frr-sr-live.sh sr`: um quadrado de quatro roteadores (R1 é o
+FRR da VM com o nosso render, R2..R4 em namespaces), FRR 10.7.1, **medido** em 2026-10-28: commit
+em 15,4 ms; o banco SR com os quatro roteadores lido 5,8 s depois; rota do kernel para 10.255.0.3
+com `encap mpls 16003` e ping por ela; R2 faz PHP do 16003 para R3; SRGB/SRLB movidos e
+`explicit-null` em 1,9 ms, de novo canônicos; SID numa interface dummy recusado pelo `ospfd`; SR
+desligado em 1,4 ms sem sobra no `running-config`.
+
 ## Seguro por padrão
 
 - `routing.ospf.interface-template.check` (o modal) mostra antes de aplicar: **quais interfaces
@@ -219,4 +285,4 @@ Medido em 2026-10-27, 32 núcleos (carga ~10 de outras sessões), build de bench
   `passive` sugeridos, aviso de autenticação ausente/fraca, prévia "estes vizinhos vão cair" com
   Safe Mode, pools de assinantes sumarizados, recusa de chain BGP-only no OSPF.
 - **Ficou para depois:** LFA/TI-LFA (RFC 5286, G3.4d), graceful restart com a atualização A/B
-  (RFC 3623, G3.4e), Segment Routing (RFC 8665, G3.4f), pools IPv6 no OSPFv3 (G3.4g).
+  (RFC 3623, G3.4e), pools IPv6 no OSPFv3 (G3.4g). Segment Routing entrou na G3.4f (acima).

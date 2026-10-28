@@ -2,7 +2,8 @@
 //! (live, with the Diagnose of the selected one), Instances, Areas,
 //! Interface Templates and Key Chains (list windows, G0.24, with the
 //! engine's preview in the modal), LSDB, Routes (with "Why this path?") and
-//! Topology (the network drawn from the LSDB, `crate::ospf_topology`).
+//! Topology (the network drawn from the LSDB, `crate::ospf_topology`) and
+//! Segment Routing (G3.4f, `crate::ospf_sr`).
 //! `routing.ospf.*` decides; this only shows and sends.
 
 use std::collections::BTreeMap;
@@ -42,9 +43,10 @@ pub(crate) enum Tab {
     Lsdb,
     Routes,
     Topology,
+    SegmentRouting,
 }
 
-pub(crate) const TABS: [(Tab, &str, &str); 8] = [
+pub(crate) const TABS: [(Tab, &str, &str); 9] = [
     (Tab::Neighbors, "Neighbors", "ospf.tab.neighbors"),
     (Tab::Instances, "Instances", "ospf.tab.instances"),
     (Tab::Areas, "Areas", "ospf.tab.areas"),
@@ -53,6 +55,7 @@ pub(crate) const TABS: [(Tab, &str, &str); 8] = [
     (Tab::Lsdb, "LSDB", "ospf.tab.lsdb"),
     (Tab::Routes, "Routes", "ospf.tab.routes"),
     (Tab::Topology, "Topology", "ospf.tab.topology"),
+    (Tab::SegmentRouting, "Segment Routing", "ospf.tab.sr"),
 ];
 
 const NBR: &str = "ospf-neighbors";
@@ -261,6 +264,13 @@ pub(crate) struct OspfPanel {
     /// The interface whose neighbor is diagnosed.
     pub(crate) diagnose_of: Option<String>,
     pub(crate) topo: crate::ospf_topology::View,
+    /// G3.4f: `routing.ospf.segment-routing.database` and the SID list.
+    pub(crate) sr: Value,
+    pub(crate) prefix_sids: Vec<Value>,
+    pub(crate) sr_view: crate::ospf_sr::SrView,
+    pub(crate) sid_table: TableState,
+    pub(crate) sr_sid_table: TableState,
+    pub(crate) sr_node_table: TableState,
     nbr_table: TableState,
     inst_table: TableState,
     area_table: TableState,
@@ -278,6 +288,9 @@ pub(crate) enum What {
     Area,
     Template,
     Keychain,
+    /// G3.4f: the SR settings (one item) and this router's prefix SIDs.
+    Sr,
+    PrefixSid,
 }
 
 fn s(r: &Value, k: &str) -> String {
@@ -567,12 +580,14 @@ fn values_of(r: &Value, what: What) -> BTreeMap<&'static str, String> {
         What::Area => AREA_FIELDS,
         What::Template => TPL_FIELDS,
         What::Keychain => KC_FIELDS,
+        What::Sr => crate::ospf_sr::SR_FIELDS,
+        What::PrefixSid => crate::ospf_sr::SID_FIELDS,
     };
     let mut out = BTreeMap::new();
     for f in fields {
         let v = match f.param {
             "auth_key" => String::new(),
-            "disabled" | "passive" | "mtu_ignore" | "no_summaries" | "subscriber_pools" => {
+            "disabled" | "passive" | "mtu_ignore" | "no_summaries" | "subscriber_pools" | "force" => {
                 if flag(r, f.param) { "yes" } else { "no" }.to_owned()
             }
             "interfaces" | "networks" | "redistribute" => list_of(r, f.param).join(","),
@@ -591,6 +606,7 @@ fn options(param: &str, areas: &[String], instances: &[String], chains: &[String
         "type" if !areas.is_empty() && instances.is_empty() => &["broadcast", "ptp", "nbma", "ptmp", "virtual-link"],
         "type" => &["default", "stub", "nssa"],
         "nssa_translate" => &["candidate", "yes", "no"],
+        "behavior" => &["php", "no-php", "explicit-null"],
         "auth" => &["", "sha256", "sha384", "sha512", "sha1", "md5", "simple"],
         "area" => return areas.to_vec(),
         "instance" => return instances.to_vec(),
@@ -750,7 +766,7 @@ impl OspfPanel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn list_tab(
+    pub(crate) fn list_tab(
         &mut self,
         app: &mut CoreRouterUi,
         ui: &mut Ui,
@@ -766,6 +782,7 @@ impl OspfPanel {
             What::Area => (self.areas.clone(), AREA_CMDS, area_row),
             What::Template => (self.templates.clone(), TPL_CMDS, tpl_row),
             What::Keychain => (self.keychains.clone(), KC_CMDS, kc_row),
+            What::Sr | What::PrefixSid => (self.prefix_sids.clone(), crate::ospf_sr::SID_CMDS, crate::ospf_sr::sid_row),
         };
         let rows: Vec<Row> = data.iter().map(rowf).collect();
         let table = match what {
@@ -773,6 +790,7 @@ impl OspfPanel {
             What::Area => &mut self.area_table,
             What::Template => &mut self.tpl_table,
             What::Keychain => &mut self.kc_table,
+            What::Sr | What::PrefixSid => &mut self.sid_table,
         };
         let selection = table.selection(&rows);
         let picked: Vec<Item> = data.iter().filter(|r| selection.contains(&s(r, key_field))).map(|r| Item::of(r, key_field, "")).collect();
@@ -846,10 +864,12 @@ impl OspfPanel {
             What::Area => AREA_CMDS,
             What::Template => TPL_CMDS,
             What::Keychain => KC_CMDS,
+            What::Sr | What::PrefixSid => crate::ospf_sr::SID_CMDS,
         };
         let row_of = |k: &str| data.iter().find(|r| s(r, key_field) == k).cloned();
         let title_of = |r: &Value| match what {
             What::Template => format!("{} {}", s(r, "id"), s(r, "area")),
+            What::PrefixSid => s(r, "prefix"),
             _ => s(r, key_field),
         };
         match act {
@@ -876,7 +896,11 @@ impl OspfPanel {
                                 values.insert("area", s(a, "name"));
                             }
                         }
-                        What::Keychain => {}
+                        What::Keychain | What::Sr => {}
+                        What::PrefixSid => {
+                            values.insert("behavior", "php".to_owned());
+                            values.insert("index", "auto".to_owned());
+                        }
                     }
                     self.modal = Some((what, Modal::open(app, None, values)));
                 }
@@ -910,7 +934,7 @@ impl OspfPanel {
         }
     }
 
-    fn edit(&mut self, app: &mut CoreRouterUi, what: What, row: Option<Value>, key: &str, title: impl Fn(&Value) -> String) {
+    pub(crate) fn edit(&mut self, app: &mut CoreRouterUi, what: What, row: Option<Value>, key: &str, title: impl Fn(&Value) -> String) {
         if let Some((_, m)) = &mut self.modal {
             m.status.bring_to_front();
         } else if let Some(r) = row {
@@ -1068,6 +1092,8 @@ fn recreate(r: &Value, what: What) -> Value {
         What::Area => &["name", "instance", "area_id", "type", "no_summaries", "default_cost", "nssa_translate", "disabled", "comment"],
         What::Template => &["area", "interfaces", "networks", "type", "cost", "priority", "hello_interval", "dead_interval", "passive", "mtu_ignore", "auth", "auth_id", "keychain", "bfd", "disabled", "comment"],
         What::Keychain => &["name", "comment"],
+        What::Sr => &["instance", "srgb", "srlb", "node_msd", "disabled", "comment"],
+        What::PrefixSid => &["prefix", "index", "behavior", "disabled", "comment"],
     };
     let mut o = serde_json::Map::new();
     for k in keys {
@@ -1104,6 +1130,10 @@ impl PanelState for OspfPanel {
                 q("keychains", "routing.ospf.keychain.list", json!({}));
             }
             Tab::Keychains => q("keychains", "routing.ospf.keychain.list", json!({})),
+            Tab::SegmentRouting => {
+                q("sr", "routing.ospf.segment-routing.database", json!({}));
+                q("prefix_sids", "routing.ospf.prefix-sid.list", json!({}));
+            }
             Tab::Lsdb if !self.instance.is_empty() => {
                 let mut p = json!({"instance": self.instance, "offset": self.lsa_page * 200, "limit": 200});
                 if !self.lsa_type.is_empty()
@@ -1161,6 +1191,8 @@ impl PanelState for OspfPanel {
                 self.topology = value;
             }
             "path" => self.path = value,
+            "sr" => self.sr = value,
+            "prefix_sids" => self.prefix_sids = arr(value),
             _ => {}
         }
     }
@@ -1177,6 +1209,7 @@ impl PanelState for OspfPanel {
             Tab::Lsdb => self.lsdb_tab(app, ui),
             Tab::Routes => self.routes_tab(app, ui),
             Tab::Topology => crate::ospf_topology::tab(self, app, ui),
+            Tab::SegmentRouting => crate::ospf_sr::tab(self, app, ui),
         }
     }
 
@@ -1190,6 +1223,8 @@ impl PanelState for OspfPanel {
                 What::Area => &AREA_SPEC,
                 What::Template => &TPL_SPEC,
                 What::Keychain => &KC_SPEC,
+                What::Sr => &crate::ospf_sr::SR_SPEC,
+                What::PrefixSid => &crate::ospf_sr::SID_SPEC,
             };
             let w = *what;
             let open = m.show(app, ctx, area, spec, &|p| match (w, p) {
@@ -1224,6 +1259,7 @@ impl PanelState for OspfPanel {
             Tab::Lsdb => self.lsa_table.escape(),
             Tab::Routes => self.route_table.escape(),
             Tab::Topology => false,
+            Tab::SegmentRouting => self.sid_table.escape() || self.sr_sid_table.escape() || self.sr_node_table.escape(),
         }
     }
 
@@ -1236,6 +1272,9 @@ impl PanelState for OspfPanel {
             (KC, &self.kc_table),
             (LSDB, &self.lsa_table),
             (ROUTES, &self.route_table),
+            (crate::ospf_sr::SIDS, &self.sid_table),
+            (crate::ospf_sr::NET_SIDS, &self.sr_sid_table),
+            (crate::ospf_sr::NODES, &self.sr_node_table),
         ]
     }
 
@@ -1248,6 +1287,9 @@ impl PanelState for OspfPanel {
             (KC, &mut self.kc_table),
             (LSDB, &mut self.lsa_table),
             (ROUTES, &mut self.route_table),
+            (crate::ospf_sr::SIDS, &mut self.sid_table),
+            (crate::ospf_sr::NET_SIDS, &mut self.sr_sid_table),
+            (crate::ospf_sr::NODES, &mut self.sr_node_table),
         ]
     }
 }
@@ -1270,6 +1312,7 @@ impl OspfPanel {
             out.push(f.help);
         }
         out.extend([INST_SPEC.help, AREA_SPEC.help, TPL_SPEC.help, KC_SPEC.help, "ospf.diagnose", "ospf.path", "ospf.topology.legend"]);
+        out.extend(crate::ospf_sr::help_keys());
         out.retain(|k| !k.is_empty());
         out.sort_unstable();
         out.dedup();

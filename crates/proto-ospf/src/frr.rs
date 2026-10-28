@@ -272,7 +272,10 @@ fn iface_v2(s: &mut String, b: &Binding<'_>, open: Opener<'_>) -> Result<(), Str
         NetworkType::Ptp if t.passive => NetworkType::Broadcast,
         k => k,
     };
-    if let Some(n) = network_v2(kind) {
+    // The kernel's own loopback takes no network type ("This is a loopback
+    // interface. Can't set network type.", ospfd, lab VM, FRR 10.7.1: met
+    // with a prefix SID, G3.4f).
+    if let Some(n) = network_v2(kind).filter(|_| !kernel_loopback(b)) {
         let _ = writeln!(s, " ip ospf network {n}");
     }
     match t.auth {
@@ -353,6 +356,7 @@ fn iface_v3(s: &mut String, b: &Binding<'_>) {
         let _ = writeln!(s, " ipv6 ospf6 mtu-ignore");
     }
     match t.kind {
+        _ if kernel_loopback(b) => {}
         NetworkType::Ptp => {
             let _ = writeln!(s, " ipv6 ospf6 network point-to-point");
         }
@@ -366,6 +370,11 @@ fn iface_v3(s: &mut String, b: &Binding<'_>) {
     {
         let _ = writeln!(s, " ipv6 ospf6 authentication keychain {chain}");
     }
+}
+
+/// Linux's `lo` (IFF_LOOPBACK): FRR refuses a network type on it.
+fn kernel_loopback(b: &Binding<'_>) -> bool {
+    b.interface.as_str() == "lo"
 }
 
 /// The key chain a crypto template authenticates with.
@@ -548,6 +557,10 @@ fn router(
         OriginateDefault::Always => {
             let _ = writeln!(s, " default-information originate always");
         }
+    }
+    // G3.4f: Segment Routing (only the instance that runs it).
+    for l in crate::sr::router_lines(cfg, inst) {
+        let _ = writeln!(s, " {l}");
     }
     if inst.disabled && v2 {
         let _ = writeln!(s, " shutdown");

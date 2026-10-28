@@ -200,11 +200,20 @@ pub fn overwrite_key(line: &str) -> Option<String> {
         "set as-path prepend",
         "set comm-list",
         "set large-comm-list",
+        // G3.4f: Segment Routing, one value each.
+        "segment-routing global-block",
+        "segment-routing node-msd",
     ];
     for p in SINGLE {
         if line.starts_with(p) && line.as_bytes().get(p.len()) == Some(&b' ') {
             return Some((*p).to_owned());
         }
+    }
+    // G3.4f: `segment-routing prefix P index N [flag]`: one SID per
+    // prefix; FRR updates the index and flags of a prefix in place.
+    if let Some(rest) = line.strip_prefix("segment-routing prefix ") {
+        let p = rest.split(' ').next()?;
+        return Some(format!("segment-routing prefix {p}"));
     }
     // neighbor <peer> <attr> <value…>
     const PEER: &[&str] = &[
@@ -242,6 +251,23 @@ pub fn overwrite_key(line: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Lines other lines of the same context depend on, deleted after them
+/// (0: no order): `no segment-routing prefix …` fails once `no
+/// segment-routing on` ran ("OSPF SR is not turned on"), and SR's opaque
+/// LSAs go before `router-info` and `capability opaque` (`ospfd`, FRR
+/// 10.7.1).
+fn delete_late(line: &str) -> u8 {
+    if line == "segment-routing on" {
+        1
+    } else if line.starts_with("router-info ") {
+        2
+    } else if line == "capability opaque" {
+        3
+    } else {
+        0
+    }
 }
 
 /// The commands that turn `old` into `new`, in order, as they are typed in
@@ -308,9 +334,12 @@ fn diff_scope(
     );
     let of_removed = |line: &str| peer_of(line).is_some_and(|p| removed.contains(p));
     let body = out;
-    // 1. Deletions (a removed neighbor's own lines go with it, in 5).
+    // 1. Deletions (a removed neighbor's own lines go with it, in 5). The
+    // switches other lines need go last ([`delete_late`]).
     let mut peer_removals = Vec::new();
-    for n in old {
+    let mut old_sorted: Vec<&Node> = old.iter().collect();
+    old_sorted.sort_by_key(|n| delete_late(&n.line));
+    for n in old_sorted {
         if new_by.contains_key(n.line.as_str()) {
             continue;
         }
@@ -629,6 +658,51 @@ end
                 "  neighbor 192.0.2.2 maximum-prefix 200 warning-only",
                 " exit-address-family",
                 "exit",
+            ]
+        );
+    }
+
+    #[test]
+    fn segment_routing_goes_off_in_reverse_and_sids_change_in_place() {
+        let off = conf("router ospf\n ospf router-id 10.0.0.1\nexit\n");
+        let on = conf(
+            "router ospf\n ospf router-id 10.0.0.1\n capability opaque\n router-info area\n segment-routing on\n\n segment-routing prefix 10.255.0.1/32 index 1\nexit\n",
+        );
+        // On: in the render's order.
+        assert_eq!(
+            diff(&off, &on),
+            [
+                "router ospf",
+                " capability opaque",
+                " router-info area",
+                " segment-routing on",
+                " segment-routing prefix 10.255.0.1/32 index 1",
+                "exit"
+            ]
+        );
+        // Off: the prefixes before SR, SR before its opaque LSAs.
+        assert_eq!(
+            diff(&on, &off),
+            [
+                "router ospf",
+                " no segment-routing prefix 10.255.0.1/32 index 1",
+                " no segment-routing on",
+                " no router-info area",
+                " no capability opaque",
+                "exit"
+            ]
+        );
+        // A new index is typed over the old one (FRR updates it in place).
+        let moved = conf(
+            "router ospf\n ospf router-id 10.0.0.1\n capability opaque\n router-info area\n segment-routing on\n segment-routing prefix 10.255.0.1/32 index 7 explicit-null\n segment-routing global-block 20000 27999\nexit\n",
+        );
+        assert_eq!(
+            diff(&on, &moved),
+            [
+                "router ospf",
+                " segment-routing prefix 10.255.0.1/32 index 7 explicit-null",
+                " segment-routing global-block 20000 27999",
+                "exit"
             ]
         );
     }
