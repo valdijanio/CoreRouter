@@ -131,7 +131,7 @@ Fontes:
 
 ### O que ficou de fora (vira gap)
 
-- **LSP ping/traceroute** (G3.5b): RFC 8029, com a correção da RFC 9570, que proíbe o Router
+- **LSP ping/traceroute** (G3.5b, feito: seção abaixo): RFC 8029, com a correção da RFC 9570, que proíbe o Router
   Alert. Precisa de um socket UDP 3503 com destino em 127/8, TTL 1 e a pilha de rótulos da FEC. A
   pilha sai por `RTA_ENCAP`/`MPLS_IPTUNNEL_DST` numa rota de host temporária ou por `AF_PACKET`.
   Também precisa do lado que responde. Fica para um PR próprio (~8 h, **estimado**).
@@ -170,3 +170,99 @@ Paralelismo:
   mil) saem do `tests/netns_mpls.rs` (`ten_thousand_labels_in_batches_and_one_by_one` imprime os tempos), que precisa do `mpls_router`.
   O host de desenvolvimento não tem o módulo carregado e a VM está fora, então eles rodam no CI
   completo (`ci/kernel-modules/mpls_router`) e ficam **pendentes** de medição aqui.
+
+## LSP ping e traceroute (G3.5b)
+
+`tool.mpls.ping.start` e `tool.mpls.traceroute.start` (no terminal, `/tool lsp-ping 10.255.0.3` e
+`/tool lsp-traceroute`), a janela **Tools › LSP Ping** (modos Ping e Traceroute; atalho "LSP Ping…"
+no clique direito de uma FEC em MPLS › Forwarding Table) e o respondedor, serviço `lsp-ping` do
+daemon. Como as outras ferramentas, cada comando abre uma tarefa (`tool.task.poll`).
+
+### Como funciona
+
+- **Envio** (`hal-linux/src/lsp/host.rs`): a rota da FEC (`RTM_GETROUTE` com `RTM_F_FIB_MATCH`)
+  dá o próximo salto, a interface e os rótulos (`RTA_ENCAP`/`MPLS_IPTUNNEL_DST`). O quadro
+  Ethernet inteiro sai por `AF_PACKET` para o MAC do próximo salto (tabela de vizinhos; sem
+  entrada, um datagrama ao próximo salto faz o kernel resolver, até 300 ms):
+  - pilha de rótulos com o TTL do topo em 255 (ping) ou 1, 2, 3… (traceroute), TC = EXP;
+  - IP para 127.0.0.1 (IPv6: `::1`, RFC 9570 §4), TTL IP 1, **sem Router Alert** (RFC 9570 §4
+    troca o "MUST" da RFC 8029 §4.3 por "MUST NOT");
+  - UDP para 3503, da porta de um socket UDP do processo, por onde a resposta volta como IP
+    comum. O socket carimba o TimeStamp Sent (NTP) e mede o RTT pelo número de sequência.
+- **Traceroute** (`engine/src/tools/lsp.rs`): o pedido de TTL 1 leva o DDMAP do próprio ingress
+  (próximo salto e rótulo); cada resposta "label switched" traz o DDMAP do salto seguinte, que vai
+  no próximo pedido (§4.6). Assim cada LSR confere a interface e o rótulo que o anterior anunciou
+  (código 5 numa divergência, com o Interface and Label Stack de quem recebeu). Termina no egress
+  (3), no primeiro código de erro ou em `max_hops`. Sem resposta num salto, segue (como o Cisco).
+- **Respondedor** (`hal/src/lsp/respond.rs`, sans-IO; E/S em `HostResponder`): em cada interface
+  que aceita MPLS, três sockets `AF_PACKET` presos a um protocolo com filtro BPF clássico:
+  - MPLS com TTL do topo ≤ 1 (o kernel descarta sem ICMP) ou explicit null;
+  - IPv4 UDP 3503 para 127/8, sem fragmento (o kernel descarta como marciano; o tap vê antes);
+  - IPv6 UDP 3503 para `::1` ou `::ffff:127/104`.
+
+  A resposta (§4.5) sai de um socket UDP na porta 3503 com TTL 255, para a origem e a porta do
+  pedido. A decisão segue §4.4 passo a passo: rótulo sem entrada no ILM → 11; entrada →
+  8 com um DDMAP por próximo salto (MTU, endereço, rótulos de saída, `implicit-null` no PHP);
+  DDMAP do pedido que não bate com a interface ou o rótulo recebidos → 5; FEC verificada (§4.4.1)
+  → 4 sem rota, 10 quando o rótulo comuta para outro próximo salto que o da rota da FEC; sem
+  rótulos → egress, 3 se a FEC é um endereço deste roteador, 4 se não. TLV obrigatório
+  desconhecido → 2 com o Errored TLVs; malformado → 1. Não responde: reply mode 1, flag T com TTL
+  > 1, pedido que não é request (evita laço entre respondedores), origem não unicast.
+- **O que o LSR sabe** (`HostView`): a tabela de rótulos (um dump, guardado 1 s), endereços e MTUs
+  (1 s) e a rota de cada FEC perguntada (1 s, 1024 no máximo). O kernel não guarda a ligação
+  FEC→rótulo do LDP; a checagem do código 10 compara a entrada do rótulo com a rota da FEC, que o
+  zebra instala a partir da mesma ligação.
+- **Segurança** (RFC 8029 §5): limite de taxa por token bucket (`/mpls settings
+  lsp-ping-rate`, padrão 100 respostas/s, rajada de 1 s) **antes** de qualquer trabalho; resposta
+  nunca maior que 1500 bytes e só para a origem do pedido (não amplifica). O Pad TLV com "copy"
+  só é copiado se o pedido coube nesse limite. `lsp-ping-responder=no` desliga. Contadores em
+  `mpls.settings.get` (`lsp_ping_counters`).
+- **Laboratório:** `hal/src/lsp/sim.rs` tem LSPs fixos (`10.255.0.2`–`10.255.0.6`, um LSP
+  quebrado em `10.255.9.9` com código 11 no salto 2, um rótulo de outra FEC em `10.255.8.8` com
+  código 10), cada salto respondido pelo mesmo `respond()`.
+
+### Pesquisa
+
+- **RFC 8029** (obsoleta a 4379), §2–§5 inteiras, com as que a atualizam:
+  - **RFC 9570**: Router Alert proibido no pedido (§4), reply mode 3 depreciado (§2.2: aqui é
+    respondido como o 2), destino IPv6 `::1` (§4);
+  - **RFC 8611** (LAG/multipath em L2): fica de fora (gap abaixo);
+  - **RFC 9041**: só os registros da IANA, sem efeito no código.
+  - **Errata:** 7639 (verificada, técnica: o texto do reply mode 3 vale para IPv4 e IPv6) e
+    **8788** (retida para atualização, técnica: no DDMAP IPv6 não numerado a interface é um
+    índice de 4 octetos, não 16; implementado assim e testado).
+- **MikroTik RouterOS v7:** não tem LSP ping. O `/tool traceroute` só mostra os rótulos que os
+  roteadores põem nos erros ICMP (RFC 4950), o que o nosso MTR já faz (G6.3b).
+- **Cisco IOS-XE:** `ping mpls ipv4 <fec>/32 [repeat] [size] [exp] [ttl] [reply mode]` e
+  `traceroute mpls ipv4`; as letras de retorno (`!` `L` `.` `N` `F` `f` `D` `M` `m`…) são o padrão
+  que os operadores conhecem: adotadas como selos na janela e no texto do terminal.
+- **Junos:** `ping mpls ldp <fec>` / `traceroute mpls ldp`, contagem padrão 5 (adotada).
+- **Nokia SR OS:** `oam lsp-ping` / `lsp-trace`, com o "downstream mapping" detalhado por salto.
+
+**Adotado agora:** os nomes `tool.mpls.*` (o RouterOS não tem), FEC LDP e genérica (LSP
+estático), V ligado por padrão (acha rótulo vazando para o LSP errado), DDMAP em todo traceroute
+com o pedido do Interface and Label Stack (mostra com que rótulo o pedido chegou numa
+divergência), letra + texto do código, caminho de saída na janela (selos `MPLS n`, ECMP avisado),
+respondedor ligado por padrão com limite de taxa.
+
+**Ficou de fora** (gaps abaixo): multipath/ECMP (§3.4.1.1 e RFC 8611), FECs de VPN/RSVP/PW,
+lista de origens aceitas (§5 "RECOMMENDED"), teste ponta a ponta com dois daemons.
+
+### Desempenho e paralelismo
+
+- **Por pedido** (release, criterion, esta máquina, 2026-10-28, **medido**): codificar com DDMAP
+  117 ns, ler 104 ns, resposta de trânsito completa com 100 mil rótulos e FECs 363 ns
+  (`cargo bench -p corerouter-hal --bench lsp_echo`). Busca no ILM e nas FECs é O(log n) num
+  `BTreeMap`; o custo que cresce com o total é o dump da tabela de rótulos, no máximo uma vez por
+  segundo e só quando chega pedido.
+- **Thread:** o respondedor roda na thread nomeada do supervisor (serviço `lsp-ping`); o lock da
+  sessão só para ler o plano (a cada 2 s) e publicar os contadores (1 s). Uma thread basta: a
+  100 respostas/s são ~36 µs de CPU por segundo; dividir por núcleo só dividiria o limite de taxa.
+  O envio roda na thread da tarefa, fora do lock, uma por tarefa.
+- **Custo no caminho de dados:** o filtro BPF roda no kernel para cada quadro MPLS e IP recebido
+  nas interfaces MPLS (uns 10 instruções, **estimado** < 20 ns por pacote, sem cópia para quem
+  não casa). Sockets por protocolo não são chamados nos pacotes enviados (o `ETH_P_ALL` seria, com
+  um clone cada).
+- **Latência adicional contra o ICMP comum:** veth no namespace de teste, 9,2 µs de ida e volta
+  com o respondedor em espaço de usuário (build debug, **medido**, `tests/netns_lsp.rs`). Na VM,
+  três roteadores com LDP: ver abaixo.
