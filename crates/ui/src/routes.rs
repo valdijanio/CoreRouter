@@ -88,6 +88,9 @@ pub(crate) struct Route {
     pub reason_args: Vec<(String, String)>,
     pub changed_secs: Option<u64>,
     pub comment: String,
+    /// G3.5: the outgoing LDP label of the route's prefix (`20`,
+    /// `implicit-null (pop)`).
+    pub mpls: Option<String>,
 }
 
 impl Route {
@@ -128,6 +131,7 @@ impl Route {
             gateway_address: opt("gateway_address"),
             gateway_interface: opt("gateway_interface"),
             gateway_status: opt("gateway_status"),
+            mpls: opt("mpls_out"),
             check,
             distance: text("distance"),
             table: text("routing_table"),
@@ -211,6 +215,11 @@ impl Route {
             // G1.27d: routed, but the gateway does not answer ARP/ND.
             Some("incomplete") if !self.disabled => chips.push(("incomplete", Kind::Amber)),
             _ => {}
+        }
+        // G3.5 (docs/ui-style.md: "MPLS 85260" in blue): the LDP label out.
+        let mpls = self.mpls.as_ref().map(|l| format!("MPLS {}", l.trim_end_matches(" (pop)")));
+        if let Some(m) = &mpls {
+            chips.push((m, Kind::Blue));
         }
         let check;
         if let Some((method, state, _)) = &self.check {

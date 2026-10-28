@@ -16,7 +16,6 @@ pub enum Win {
     Vrf,
     Firewall,
     Bgp,
-    Mpls,
     Identity,
     History,
     Ping,
@@ -48,7 +47,9 @@ pub(crate) const MENU: &[(&str, &[Win])] = &[
     ("IPv6", &[]),
     // OSPF is a panel (`ospf.rs`, G3.4).
     ("Routing", &[Win::Bgp]),
-    ("MPLS", &[Win::Mpls]),
+    // MPLS › LDP and Forwarding Table are panels (`mpls_ldp.rs`,
+    // `mpls_forwarding.rs`, G3.5).
+    ("MPLS", &[]),
     // The CGNAT window is a panel (`cgnat.rs`, G2.3d).
     ("CGNAT", &[]),
     // The RADIUS window is a panel (`radius.rs`, G4.3j); RouterOS has it
@@ -95,7 +96,6 @@ impl Win {
         Win::Vrf,
         Win::Firewall,
         Win::Bgp,
-        Win::Mpls,
         Win::Identity,
         Win::History,
         Win::Ping,
@@ -125,7 +125,6 @@ impl Win {
             Win::Vrf => "VRF",
             Win::Firewall => "Firewall",
             Win::Bgp => "BGP",
-            Win::Mpls => "MPLS",
             Win::Identity => "Identity",
             Win::History => "History",
             Win::Ping => "Ping",
@@ -133,12 +132,12 @@ impl Win {
         }
     }
 
-    /// `Some(gap id)` while the area has no engine commands yet.
+    /// `Some(gap id)` while the area has no engine commands yet. None now:
+    /// the last stubs (OSPF, MPLS) became panels; a new stub returns its
+    /// gap here.
     pub fn gap(self) -> Option<&'static str> {
-        match self {
-            Win::Mpls => Some("G3.5"),
-            _ => None,
-        }
+        let _ = self;
+        None
     }
 
     /// List windows close on Esc (after clearing find text and selection).
@@ -203,7 +202,6 @@ impl CoreRouterUi {
             Win::History => self.history(ui),
             Win::Ping => self.ping_window(ui),
             Win::Mtr => self.mtr_window(ui),
-            _ => {}
         }
     }
 

@@ -2226,7 +2226,10 @@ mod tests {
             None
         }
         fn features(&self) -> corerouter_hal::Features {
-            corerouter_hal::Features { vrf: false }
+            corerouter_hal::Features {
+                vrf: false,
+                ..corerouter_hal::Features::default()
+            }
         }
     }
 

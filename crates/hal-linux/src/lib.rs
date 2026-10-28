@@ -167,6 +167,10 @@ pub mod oslog;
 /// Neighbor tables over rtnetlink (G1.27d): dump, events, static entries.
 pub mod neigh;
 
+/// MPLS label switching over rtnetlink (G3.5): the label table, static
+/// entries in batches, the `net.mpls` knobs.
+pub mod mpls;
+
 /// IP › Firewall › XDP (G2.5a): the XDP filter's loader, maps and counters.
 #[cfg(target_os = "linux")]
 pub mod xdp;
@@ -678,7 +682,35 @@ mod linux {
                     return Err(e);
                 }
             }
+            // MPLS (G3.5): the knobs and `/mpls static`, last (its own undo).
+            if from.routing.mpls != to.routing.mpls || from.interfaces != to.interfaces {
+                let managed: std::collections::BTreeSet<IfName> = self
+                    .managed_indexes()
+                    .map(|m| m.into_values().collect())
+                    .unwrap_or_default();
+                if let Err(e) = crate::mpls::sync(from, to, &|n| managed.contains(n)) {
+                    if let Err(back) = self.neigh.sync(from, &|n| managed.contains(n)) {
+                        log::error!("restoring the ARP entries after MPLS refused: {back}");
+                    }
+                    if let Err(back) = self.xdp.sync(from) {
+                        log::error!("restoring the previous XDP filter: {back}");
+                    }
+                    if let Err(back) = self.apply_links(to, from) {
+                        log::error!("restoring the rest after MPLS refused: {back}");
+                    }
+                    return Err(e);
+                }
+            }
             Ok(())
+        }
+
+        fn mpls_routes(&mut self) -> Result<Vec<corerouter_hal::mpls::MplsRoute>, HalError> {
+            use corerouter_hal::mpls::MplsReader;
+            crate::mpls::Reader::open()?.routes()
+        }
+
+        fn mpls_reader(&self) -> Result<Box<dyn corerouter_hal::mpls::MplsReader>, HalError> {
+            Ok(Box::new(crate::mpls::Reader::open()?))
         }
 
         fn neighbors(&mut self) -> Result<Vec<corerouter_hal::neigh::Neighbor>, HalError> {
@@ -1018,7 +1050,12 @@ mod linux {
         }
 
         fn features(&self) -> Features {
-            *self.features.get_or_init(crate::netlink::features)
+            // MPLS again each time (one stat): `modprobe mpls_router`
+            // takes effect without a restart.
+            Features {
+                mpls: crate::mpls::available(),
+                ..*self.features.get_or_init(crate::netlink::features)
+            }
         }
 
         fn address_list_dynamic(&mut self, change: DynamicChange<'_>) -> Result<(), HalError> {
