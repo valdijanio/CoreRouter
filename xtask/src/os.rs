@@ -16,6 +16,10 @@
 //!   `qemu-img`) and checks that every ELF of the image finds its
 //!   libraries; `install-test` runs the installer and the VM images in
 //!   QEMU (`os/install.rs`).
+//! - G1.6k: `build` applies `os/buildroot-patches/*.patch` to the extracted
+//!   Buildroot tree (package versions newer than the LTS branch ships, FRR
+//!   10.7.1) and extracts it again when those patches change; `frr-test`
+//!   runs OSPF/SR/LDP/BFD between two guests of the image (`os/frr.rs`).
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -23,10 +27,13 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
+
 use crate::Outcome;
 use crate::vm_lab::{download, sha256_file};
 
 mod ab;
+mod frr;
 mod install;
 
 const DEFCONFIG: &str = "corerouter_x86_64_defconfig";
@@ -103,7 +110,7 @@ const GUEST_IP_ARG: &str = "ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off";
 /// The daemon's TLS control port inside the image (corerouter-init's plan).
 const GUEST_TLS_PORT: u16 = 8729;
 
-const USAGE: &str = "usage: cargo xtask os <build [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|boot-test [--efi] [--tcg] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--scenario update|no-confirm|bad-signature|bad-param]|install-test [--tcg]|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
+const USAGE: &str = "usage: cargo xtask os <build [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|boot-test [--efi] [--tcg] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--scenario update|no-confirm|bad-signature|bad-param]|install-test [--tcg]|frr-test [--tcg]|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
 
 pub fn main(root: &Path, args: &[String]) -> Outcome {
     let (sub, rest) = match args.split_first() {
@@ -115,6 +122,7 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
         "boot-test" => boot_test(root, rest),
         "ab-test" => images_dir(root).and_then(|i| ab::ab_test(root, &i, rest)),
         "install-test" => images_dir(root).and_then(|i| install::install_test(root, &i, rest)),
+        "frr-test" => images_dir(root).and_then(|i| frr::frr_test(root, &i, rest)),
         "package" => images_dir(root).and_then(|i| package_cmd(root, &i, rest)),
         "check" => check(&root.join("os")).map(|n| eprintln!("ok: os/ configuration ({n} checks)")),
         "-h" | "--help" => {
@@ -395,7 +403,57 @@ pub fn check(os: &Path) -> Result<usize, String> {
         n += 1;
     }
     n += check_installer(os, &genimage, &version)?;
+    let (patches, _) = buildroot_patches(os)?;
+    for p in &patches {
+        let text = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        let files: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("+++ "))
+            .collect();
+        if files.is_empty() {
+            return Err(format!("{}: patches no file", p.display()));
+        }
+        // Package recipes only: the build system itself stays the pinned one.
+        if let Some(f) = files.iter().find(|f| !f.starts_with("b/package/")) {
+            return Err(format!(
+                "{}: patches {f}, outside Buildroot's package/",
+                p.display()
+            ));
+        }
+        n += 1;
+    }
     Ok(n)
+}
+
+/// G1.6k: the patches `build` applies to the extracted Buildroot tree
+/// (`os/buildroot-patches/*.patch`, in name order) and one hash over their
+/// names and contents, which tells a tree patched with other files apart.
+fn buildroot_patches(os: &Path) -> Result<(Vec<PathBuf>, String), String> {
+    let dir = os.join("buildroot-patches");
+    let mut patches: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "patch"))
+            .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(format!("{}: {e}", dir.display())),
+    };
+    patches.sort();
+    let mut hasher = Sha256::new();
+    for p in &patches {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        hasher.update(std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?);
+        hasher.update([0]);
+    }
+    let hash = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Ok((patches, hash))
 }
 
 /// G1.6c: the installer's kernel, boot image and payload stay consistent.
@@ -863,8 +921,17 @@ fn vm_images(root: &Path, images: &Path) -> Result<(), String> {
 }
 
 fn fetch_buildroot(d: &Dirs, lock: &Lock) -> Result<(), String> {
+    let (patches, patches_hash) = buildroot_patches(&d.os)?;
+    let stamp = d.buildroot.join(".corerouter-patches.sha256");
     if d.buildroot.join("Makefile").exists() {
-        return Ok(());
+        if std::fs::read_to_string(&stamp).ok().as_deref() == Some(patches_hash.as_str()) {
+            return Ok(());
+        }
+        // A tree patched with other files (or before G1.6k): start over from
+        // the tarball rather than patch on top of an old patch.
+        eprintln!("   os/buildroot-patches changed: extracting Buildroot again");
+        std::fs::remove_dir_all(&d.buildroot)
+            .map_err(|e| format!("{}: {e}", d.buildroot.display()))?;
     }
     let name = lock.url.rsplit('/').next().unwrap_or("buildroot.tar.xz");
     let tarball = d.os.join("dl").join(name);
@@ -890,6 +957,23 @@ fn fetch_buildroot(d: &Dirs, lock: &Lock) -> Result<(), String> {
     if !st.success() {
         return Err(format!("tar -xf {name}: {st}"));
     }
+    for p in &patches {
+        let st = Command::new("patch")
+            .args(["-p1", "--batch", "--forward", "--silent", "-d"])
+            .arg(&d.buildroot)
+            .arg("-i")
+            .arg(p)
+            .status()
+            .map_err(|e| format!("patch: {e}"))?;
+        if !st.success() {
+            return Err(format!("patch {}: {st}", p.display()));
+        }
+        eprintln!(
+            "   applied {}",
+            p.file_name().and_then(|n| n.to_str()).unwrap_or_default()
+        );
+    }
+    std::fs::write(&stamp, &patches_hash).map_err(|e| format!("{}: {e}", stamp.display()))?;
     Ok(())
 }
 
