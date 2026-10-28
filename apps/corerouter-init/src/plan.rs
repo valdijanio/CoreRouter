@@ -148,6 +148,33 @@ impl Mgmt {
     }
 }
 
+/// What the console says when `corerouter.mgmt=` is applied (G1.6m): the
+/// address, where it came from, and what to do when it was not expected (a
+/// new VM that inherited an old one's NVRAM and its boot entry). `ports`:
+/// the ports of this boot (empty: unknown).
+pub fn mgmt_notice(m: &Mgmt, ports: &[String]) -> String {
+    let gw = m
+        .gateway
+        .as_ref()
+        .map(|g| format!(", gateway {g}"))
+        .unwrap_or_default();
+    let mut s = format!(
+        "\nCoreRouter: management address {} on {}{gw}, from the kernel command line \
+         (corerouter.mgmt=, put in the UEFI boot entry by the installer). Applied once on this /config.\n\
+         Not expected? The VM may have kept an earlier VM's NVRAM: start it with fresh NVRAM \
+         (virsh start --reset-nvram; Proxmox: a new EFI disk).",
+        m.address, m.interface
+    );
+    if !ports.is_empty() && !ports.contains(&m.interface) {
+        s.push_str(&format!(
+            "\nNOT APPLIED: there is no port {} here (ports: {}). The console setup asks for one.",
+            m.interface,
+            ports.join(", ")
+        ));
+    }
+    s
+}
+
 /// A filesystem mounted before anything else runs.
 pub struct Mount {
     pub source: &'static str,
@@ -485,6 +512,26 @@ mod tests {
         let o = BootOptions::parse("corerouter.mode=rescue corerouter.mgmt=nope");
         assert_eq!(o.mode, Mode::Router);
         assert_eq!(o.warnings.len(), 2);
+    }
+
+    #[test]
+    fn management_notice_says_where_it_came_from() {
+        let m = Mgmt::parse("ether1,192.0.2.10/24,192.0.2.1").unwrap();
+        let ports = vec!["ether1".to_owned(), "ether2".to_owned()];
+        let t = mgmt_notice(&m, &ports);
+        assert!(
+            t.contains("192.0.2.10/24 on ether1, gateway 192.0.2.1"),
+            "{t}"
+        );
+        assert!(t.contains("corerouter.mgmt=") && t.contains("--reset-nvram"));
+        assert!(!t.contains("NOT APPLIED"));
+        let m = Mgmt::parse("eth7,192.0.2.10/24").unwrap();
+        let t = mgmt_notice(&m, &ports);
+        assert!(
+            t.contains("NOT APPLIED: there is no port eth7 here (ports: ether1, ether2)"),
+            "{t}"
+        );
+        assert!(!mgmt_notice(&m, &[]).contains("NOT APPLIED"));
     }
 
     #[test]

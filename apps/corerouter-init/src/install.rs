@@ -455,15 +455,27 @@ fn flow(
                             None,
                         )
                         .is_some_and(|l| l.eq_ignore_ascii_case("y"));
+                // G1.6m: the names the router gives them on its first
+                // boot (bus order), with link and MAC to find the cable.
+                let ports: Vec<(String, String, bool)> = crate::links::ports_with_link()
+                    .into_iter()
+                    .map(|(f, up)| (f.kernel, f.mac, up))
+                    .collect();
                 let mgmt = loop {
                     con.say("Management address for the first boot: <port> <address/prefix> [<gateway>]");
-                    let Some(l) = con.ask("(e.g. eth0 192.0.2.10/24 192.0.2.1; empty: none, set it on the console later): ", None) else {
+                    for p in &ports {
+                        con.say(&format!("  {}", crate::setup::describe(p)));
+                    }
+                    let Some(l) = con.ask("(e.g. ether1 192.0.2.10/24 192.0.2.1; empty: none, set it on the console later): ", None) else {
                         return Err("console closed".into());
                     };
                     if l.is_empty() {
                         break None;
                     }
                     match Mgmt::parse(&l.split_whitespace().collect::<Vec<_>>().join(",")) {
+                        Ok(m) if !ports.is_empty() && !ports.iter().any(|p| p.0 == m.interface) => {
+                            con.say(&format!("There is no port {} here.", m.interface));
+                        }
                         Ok(m) => break Some(m),
                         Err(e) => con.say(&e),
                     }

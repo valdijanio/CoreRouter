@@ -106,7 +106,7 @@ impl SlotId {
 /// `os/board/x86_64/linux.fragment`, checked equal by `cargo xtask os
 /// check`). What a boot entry adds comes after it, and for the parameters
 /// given twice the last one counts.
-pub const BUILTIN_CMDLINE: &str = "console=tty0 console=ttyS0,115200 root=PARTUUID=3e1088b8-5b4b-4fbb-b756-a271f641d018 rootfstype=squashfs rootwait ro init=/usr/sbin/corerouter-init panic=10 quiet";
+pub const BUILTIN_CMDLINE: &str = "console=tty0 console=ttyS0,115200 root=PARTUUID=3e1088b8-5b4b-4fbb-b756-a271f641d018 rootfstype=squashfs rootwait ro bonding.max_bonds=0 dummy.numdummies=0 init=/usr/sbin/corerouter-init panic=10 quiet";
 
 /// Platform parameters carried from the running command line to the slot
 /// written next, when not already built in: a serial console on another

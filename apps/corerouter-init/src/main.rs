@@ -21,8 +21,12 @@ mod ctl;
 #[cfg(target_os = "linux")]
 mod install;
 #[cfg(target_os = "linux")]
+mod links;
+#[cfg(target_os = "linux")]
 mod pid1;
 mod plan;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod ports;
 #[cfg(target_os = "linux")]
 mod setup;
 

@@ -25,6 +25,8 @@ use serde_json::Value;
 
 use super::ab::{Numbers, Vm, check, fresh_vars, qemu_base, ready_s, slot, start};
 
+/// The kernel's name, as an installer from before G1.6m wrote it (or a
+/// VM's old NVRAM keeps it): the first boot applies it to `ether1`.
 const MGMT: &str = "eth0,10.0.2.15/24,10.0.2.2";
 
 fn autoinstall(keep: bool) -> String {
@@ -118,6 +120,13 @@ impl T {
             super::GUEST_TLS_PORT
         ));
         cmd.args(["-device", "virtio-net-pci,netdev=n0"]);
+        // G1.6m: two more ports; the one with the address is ether1 (the
+        // first in bus order).
+        for i in 1..=2 {
+            cmd.arg("-netdev").arg(format!("user,id=n{i}"));
+            cmd.arg("-device")
+                .arg(format!("virtio-net-pci,netdev=n{i}"));
+        }
         start(&mut self.log, name, cmd)
     }
 
@@ -161,14 +170,31 @@ impl T {
         if !setup {
             return Ok(());
         }
-        answer(&mut vm, &mut log, "no management address is set", "")?;
-        answer(&mut vm, &mut log, "Ports:", "")?;
-        answer(&mut vm, &mut log, "Port [", "10.0.2.15/24")?;
+        // G1.6m: no default answers; the port by number, confirmed; a
+        // summary and an explicit yes.
+        vm.expect(&mut log, &["no command shell"], 30)?;
+        answer(&mut vm, &mut log, "or the CLI (corerouter-cli", "")?;
+        let row = answer(&mut vm, &mut log, "1) ", "1")?;
+        check(
+            row.contains("1) ether1 (") && row.contains("52:54:"),
+            format!("port list: {row}"),
+        )?;
+        answer(&mut vm, &mut log, "Management port (number", "y")?;
+        answer(&mut vm, &mut log, "Use ether1", "10.0.2.15/24")?;
         answer(&mut vm, &mut log, "Address/prefix", "10.0.2.2")?;
         answer(&mut vm, &mut log, "has no password", "corerouter-test-1")?;
         answer(&mut vm, &mut log, "New admin password", "corerouter-test-1")?;
+        answer(&mut vm, &mut log, "admin     new password", "y")?;
         vm.expect(&mut log, &["admin password: set"], 30)?;
         vm.expect(&mut log, &["Done. Manage it"], 30)?;
+        // Enter on the quiet console: the status, not a shell.
+        answer(
+            &mut vm,
+            &mut log,
+            "CLI: corerouter-cli --connect tls://10.0.2.15",
+            "",
+        )?;
+        vm.expect(&mut log, &["10.0.2.15/24 on ether1"], 30)?;
         let mut ping = Err(String::new());
         for _ in 0..10 {
             ping = super::tls_ping(port);
@@ -213,6 +239,12 @@ fn interactive(t: &mut T) -> Result<(), String> {
         "-device",
         "usb-storage,drive=stick,removable=on,bootindex=0",
     ]);
+    cmd.args([
+        "-netdev",
+        "user,id=n0",
+        "-device",
+        "virtio-net-pci,netdev=n0",
+    ]);
     let mut log = t.log.try_clone().map_err(|e| e.to_string())?;
     let mut vm = start(&mut log, "install/interactive", cmd)?;
     let row = vm.expect(&mut log, &["not offered: the installer medium"], 120)?;
@@ -226,13 +258,21 @@ fn interactive(t: &mut T) -> Result<(), String> {
     )?;
     answer(&mut vm, &mut log, "CoreRouter", "vda")?;
     answer(&mut vm, &mut log, "ALL DATA ON vda WILL BE ERASED", "y")?;
+    // G1.6m: the ports by the router's names; one that is not there is
+    // refused, then none.
     answer(
         &mut vm,
         &mut log,
         "Management address for the first boot",
-        "",
+        "eth9 192.0.2.10/24",
     )?;
-    vm.expect(&mut log, &["(e.g. eth0"], 30)?;
+    let row = vm.expect(&mut log, &["ether1 (", "(e.g."], 30)?;
+    check(
+        row.contains("ether1 ("),
+        format!("installer port list: {row}"),
+    )?;
+    answer(&mut vm, &mut log, "There is no port eth9 here.", "")?;
+    vm.expect(&mut log, &["(e.g. ether1"], 30)?;
     std::thread::sleep(Duration::from_millis(800));
     vm.stdin_write(b"vdb\n")?;
     vm.expect(&mut log, &["Nothing was written."], 30)?;
@@ -244,7 +284,7 @@ fn interactive(t: &mut T) -> Result<(), String> {
         "Management address for the first boot",
         "",
     )?;
-    vm.expect(&mut log, &["(e.g. eth0"], 30)?;
+    vm.expect(&mut log, &["(e.g. ether1"], 30)?;
     std::thread::sleep(Duration::from_millis(800));
     vm.stdin_write(b"vda\n")?;
     let line = vm.expect(&mut log, &["INSTALLED", "install failed"], 120)?;
@@ -294,7 +334,13 @@ pub(super) fn until(
 /// What every boot of the installed disk must show.
 fn check_installed(t: &mut T, vm: &mut Vm, port: u16, first: bool) -> Result<(), String> {
     let mut log = t.log.try_clone().map_err(|e| e.to_string())?;
-    let r = vm.expect_all(&mut log, &["ready:", "maintenance shell", "FRR up:"], 120)?;
+    let mut pats = vec!["ready:", "maintenance shell", "FRR up:", "eth0→ether1 ("];
+    if first {
+        // G1.6m: the entry's `eth0` lands on ether1, and the console says
+        // where the address came from.
+        pats.push("management address 10.0.2.15/24 on ether1, gateway 10.0.2.2, from the kernel command line");
+    }
+    let r = vm.expect_all(&mut log, &pats, 120)?;
     let what = if first {
         "first boot"
     } else {
@@ -344,6 +390,42 @@ fn check_installed(t: &mut T, vm: &mut Vm, port: u16, first: bool) -> Result<(),
     t.n.put(
         &format!("{what}: TLS ping on the management address"),
         ping?,
+    );
+    // G1.6m: RouterOS names in bus order, kept in /config; no device the
+    // kernel made on its own (bond0, dummy0, gre0, sit0…); the marker of
+    // the installer's address written.
+    let links = sh(vm, &mut log, "ls /sys/class/net")?;
+    check(
+        links.trim() == "ether1 ether2 ether3 lo",
+        format!("links: {links}"),
+    )?;
+    t.n.put(&format!("{what}: links"), links.trim().to_owned());
+    let marker = sh(
+        vm,
+        &mut log,
+        "cat /config/.installer-mgmt-applied; echo; grep -c '^ether' /config/.port-names",
+    )?;
+    check(
+        marker.starts_with("ether1,10.0.2.15/24,10.0.2.2") && marker.ends_with('3'),
+        format!("marker and port map: {marker}"),
+    )?;
+    // G1.6m: the maintenance shell comes back after an `exit` (it stayed a
+    // zombie: PID 1 reaped only its own process group).
+    vm.stdin_write(b"exit\n")?;
+    vm.expect(&mut log, &["maintenance shell on /dev/ttyS0"], 30)?;
+    std::thread::sleep(Duration::from_millis(800));
+    let z = sh(
+        vm,
+        &mut log,
+        "grep -l '^State:.*Z' /proc/[0-9]*/status 2>/dev/null | wc -l",
+    )?;
+    check(
+        z.trim() == "0",
+        format!("zombies after the shell exit: {z}"),
+    )?;
+    t.n.put(
+        &format!("{what}: shell after exit"),
+        "started again, no zombies".to_owned(),
     );
     // FRR: the daemons, the frr service attached.
     let vty = sh(vm, &mut log, "ls /var/run/frr/ | grep -c 'vty$'")?;

@@ -33,15 +33,39 @@ Resumo do que interopera e do que não:
   gerência, se a gerência não for pelo próprio core. Ponha todas **antes** do primeiro boot: uma
   placa acrescentada com a VM ligada ainda não entra sozinha na configuração (G1.3b); reinicie a
   VM depois de acrescentar.
-- **Primeiro IP pelo console.** Não há cloud-init (G1.6h): abra o console (noVNC ou serial
-  `qm terminal <vmid>`), entre como `admin` sem senha (só no console local), defina a senha e um
-  endereço de gerência:
+- **NVRAM nova.** A entrada de boot do instalador carrega o endereço de gerência
+  (`corerouter.mgmt=`) e os PARTUUIDs da imagem são fixos: uma VM nova que herde a NVRAM de
+  outra (mesmo nome no libvirt, `virsh undefine` sem `--nvram`) boota o disco novo com o
+  endereço da antiga, e o assistente não aparece. Crie a VM com NVRAM nova (Proxmox: um *EFI
+  Disk* novo; libvirt: `virsh start --reset-nvram <vm>` ou `virsh undefine --nvram` antes de
+  recriar). Quando o roteador aplica um `corerouter.mgmt=`, o console diz o endereço, a porta e
+  que veio da entrada de boot.
+- **Nomes das portas.** A imagem chama as placas de `ether1`, `ether2`… na ordem do barramento
+  PCI (a ordem das `net0`, `net1`… do Proxmox), e o nome fica preso ao MAC
+  (`/config/.port-names`): placa acrescentada depois ganha o próximo número. Confira no
+  assistente, que mostra link e MAC de cada uma, e compare com os MACs do hipervisor.
+- **Primeiro IP pelo console.** Não há cloud-init (G1.6h) nem terminal de comandos no console:
+  abra o console (noVNC ou serial `qm terminal <vmid>`; libvirt: `virsh console <vm>`) e
+  aperte Enter. O assistente de primeiro boot lista as portas, pede a de gerência pelo número
+  (e confirma: `Use ether4 (link up, bc:24:11:…)? [y/N]`), o endereço, o gateway e a senha do
+  `admin`, mostra o resumo e só aplica com `y`:
 
   ```text
-  /user set admin password=...
-  /ip address add address=192.0.2.10/24 interface=ether4
-  /ip route add dst-address=0.0.0.0/0 gateway=192.0.2.1
+  Ethernet ports (empty answer: cancel):
+    1) ether1 (link up, bc:24:11:00:00:01)
+    2) ether2 (no link, bc:24:11:00:00:02)
+    3) ether3 (no link, bc:24:11:00:00:03)
+    4) ether4 (link up, bc:24:11:00:00:04)
+  Management port (number or name): 4
+  Use ether4 (link up, bc:24:11:00:00:04)? [y/N] y
+  Address/prefix (e.g. 192.0.2.10/24; empty: cancel): 192.0.2.10/24
+  Gateway (empty: none): 192.0.2.1
   ```
+
+  O resto (a configuração abaixo) vai pela rede: `corerouter-cli --connect
+  tls://192.0.2.10:8729 --user admin` ou a GUI. Com endereço já posto, Enter no console mostra
+  os endereços e os comandos para conectar. O shell de manutenção (`corerouter.shell=ttyS0` na
+  entrada de boot) é só para laboratório.
 
 - **MTU de MPLS.** Com LDP, o pacote de 1500 bytes do cliente vira 1504 no enlace. No laboratório
   (enlaces de 1500), o ping de 1500 com DF através do LSP **se perdeu**: aumente o MTU do enlace
@@ -119,7 +143,7 @@ Equivalências, item por item:
 
 ## Como entrar
 
-1. **Safe Mode** no terminal do CoreRouter: Ctrl+X (o prompt mostra `<SAFE>`). Se a sessão cair,
+1. **Safe Mode** no terminal do CoreRouter (o da GUI ou o `corerouter-cli --connect tls://…`, não o console da VM): Ctrl+X (o prompt mostra `<SAFE>`). Se a sessão cair,
    tudo o que foi feito nela é desfeito, como no RouterOS.
 2. Cole o bloco de partida (um batch atômico, uma revisão). Para revisar antes, use o modo
    transacional: `/config mode set mode=transactional`, cole, `/config diff` mostra o que muda,

@@ -3,12 +3,12 @@
 //!
 //! - two guests of `disk.img` (throw-away qcow2 overlays, their own NVRAM),
 //!   booted the factory way with the maintenance shell on the serial
-//!   console; their `eth0`s are one link, a QEMU UDP socket pair on the
+//!   console; their `ether1`s are one link, a QEMU UDP socket pair on the
 //!   host's loopback;
 //! - each is configured only through commands (`corerouter-init run`, the
-//!   same `Session::execute` as the CLI and MCP): an address on `eth0` and a
+//!   same `Session::execute` as the CLI and MCP): an address on `ether1` and a
 //!   loopback /32, OSPFv2 point-to-point, Segment Routing with a
-//!   prefix SID for the loopback, MPLS input and LDP on `eth0` (no TI-LFA:
+//!   prefix SID for the loopback, MPLS input and LDP on `ether1` (no TI-LFA:
 //!   off in production while G3.4l is open), a BFD peer on the link;
 //! - what must follow is read back from FRR through hal-frr's queries: the
 //!   OSPF adjacency Full (ospfd), the other router's prefix SID with its
@@ -91,13 +91,13 @@ fn configure(vm: &mut Vm, log: &mut std::fs::File, n: u8) -> Result<(), String> 
         // management address does it, `corerouter-init` plan.rs).
         (
             "interface.set",
-            r#"{"name":"eth0","disabled":false}"#.into(),
+            r#"{"name":"ether1","disabled":false}"#.into(),
         ),
         // The kernel's `lo` (G3.4i: ospfd takes a prefix SID only there).
         ("interface.loopback.add", r#"{"name":"lo"}"#.into()),
         (
             "ip.address.add",
-            format!(r#"{{"address":"10.0.12.{n}/24","interface":"eth0"}}"#),
+            format!(r#"{{"address":"10.0.12.{n}/24","interface":"ether1"}}"#),
         ),
         (
             "ip.address.add",
@@ -113,13 +113,13 @@ fn configure(vm: &mut Vm, log: &mut std::fs::File, n: u8) -> Result<(), String> 
         ),
         (
             "routing.ospf.interface-template.add",
-            r#"{"area":"backbone","interfaces":"eth0","type":"ptp","hello_interval":1,"dead_interval":4}"#.into(),
+            r#"{"area":"backbone","interfaces":"ether1","type":"ptp","hello_interval":1,"dead_interval":4}"#.into(),
         ),
         (
             "routing.ospf.interface-template.add",
             r#"{"area":"backbone","interfaces":"lo","passive":true}"#.into(),
         ),
-        ("mpls.interface.add", r#"{"interface":"eth0"}"#.into()),
+        ("mpls.interface.add", r#"{"interface":"ether1"}"#.into()),
         (
             "routing.ospf.segment-routing.set",
             r#"{"instance":"core","force":true}"#.into(),
@@ -128,13 +128,13 @@ fn configure(vm: &mut Vm, log: &mut std::fs::File, n: u8) -> Result<(), String> 
             "mpls.ldp.add",
             format!(r#"{{"lsr_id":"10.255.0.{n}"}}"#),
         ),
-        ("mpls.ldp.interface.add", r#"{"interface":"eth0"}"#.into()),
+        ("mpls.ldp.interface.add", r#"{"interface":"ether1"}"#.into()),
         // bfdd's own peer (its session goes to the daemon's engine, the
         // data plane). Not OSPF's `bfd`: proto-ospf does not type it into
         // ospfd yet (G3.6l).
         (
             "routing.bfd.peer.add",
-            format!(r#"{{"address":"10.0.12.{other}","interface":"eth0"}}"#),
+            format!(r#"{{"address":"10.0.12.{other}","interface":"ether1"}}"#),
         ),
     ];
     for (cmd, params) in &steps {
@@ -177,7 +177,7 @@ fn verify(
             break;
         }
         if Instant::now() >= deadline {
-            let a = sh(vm, log, "{ ip addr show eth0; ip route; }")?;
+            let a = sh(vm, log, "{ ip addr show ether1; ip route; }")?;
             let i = vm.run(log, "interface.list", "{}")?;
             let ad = vm.run(log, "ip.address.list", "{}")?;
             eprintln!("   [{r}] interfaces: {i}\n   [{r}] addresses: {ad}");
