@@ -2217,3 +2217,25 @@ vizinho e a árvore reversa de cada destino são calculadas uma vez e compartilh
     - `rtnetlink` uma a uma: 348 ms com 1 thread, 188 ms com 8;
     - lote: 132 ms com 1 thread, 221 ms com 8.
   - `benches/netns_routes_batch.rs`, 10 mil /32: 13,1 ms em lote contra 31,7 ms uma a uma.
+
+### G3.9: RouterOS 7.25 CHR × CoreRouter (medido, 2026-10-28)
+
+VM do laboratório (8 vCPUs, KVM aninhado: CHR com 2 vCPUs e 512 MiB), build release, FRR 10.7.1.
+`cargo xtask vm-lab run -- scripts/routeros-interop.sh`.
+
+| Medida | Valor |
+|---|---|
+| Full OSPF ptp depois do commit (hello 1 s) | 1,8–7,6 s |
+| Rotas pelo CoreRouter no CHR depois do commit | 6,6–14,4 s |
+| Sessão LDP operacional | 0,95–2,5 s |
+| BFD up depois do Full | 1,8–2,4 s |
+| Corte silencioso, BFD 300 ms × 3: CHR derruba a adjacência / buraco no ping | 0,67–0,80 s / 1,16–1,29 s |
+| Corte silencioso, BFD 300 ms × 4: idem | 1,08 s / 1,55 s |
+| Perda de portadora: buraco no ping | 0,60–0,70 s |
+| Corte silencioso sem BFD (dead 4 s): CHR derruba a adjacência | 3,2–3,5 s |
+| Volta do CoreRouter: buraco | < 0,1 s |
+| Template passivo: trânsito desviado / sub-rede fora do CHR / buraco | 26–573 ms / 1,3–1,9 s / nenhum |
+| Instância desligada: buraco | 0,44–1,4 s |
+| BFD 100 ms × 3, sessão nova: quedas em 30 s (CoreRouter / FRR) | 15 / 12–13 |
+| BFD 300 ms × 3 e × 4, sessão nova: quedas em 30 s | 0 e 0 |
+| BFD 100 ms × 3 trocado com a sessão em Up: quedas em 30 s | 0 |

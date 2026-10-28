@@ -218,3 +218,6 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-28 — G3.4i feita (loopback `lo` = `lo` do kernel, para o prefix SID)
 - 2026-10-28 — G4.3hh feito (adoção em lote na tomada do par); G4.3hi e G4.3hj abertos
 - 2026-10-28 — G1.6k criado e feito (FRR 10.7.1 na imagem); G1.6l, G3.6l e G3.6m abertos
+- 2026-10-28 — G3.6l feito (na G3.9)
+- 2026-10-28 — G3.6m feito (na G3.9)
+- 2026-10-28 — G3.9 criada e feita (interoperabilidade com RouterOS v7 e roteiro de produção do core)
