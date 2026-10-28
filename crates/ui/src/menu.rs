@@ -104,6 +104,7 @@ pub(crate) const CATALOG: &[Entry] = &[
     e("mpls", None, None, icons::TAG, "/mpls", &[], &["ldp", "label", "vpls", "rótulo"]),
     e("mtr", None, None, icons::PATH, "/tool traceroute", &["tool.mtr", "tool.traceroute"], &["traceroute", "tracert", "path", "caminho", "perda", "loss", "paris", "ecmp", "tcp traceroute", "tcptraceroute"]),
     e("neighbors", None, None, icons::USERS_THREE, "/ip neighbor", &["ip.neighbor"], &["vizinhos", "lldp", "mndp", "cdp", "discovery"]),
+    e("netsim", None, None, icons::GRAPH, "", &["tool.netsim"], &["simulator", "simulador", "simulação", "simulation", "lab", "laboratório", "what if", "e se", "convergence", "convergência", "failover", "falha", "gns3", "eve-ng", "cml", "batfish", "ospf", "bgp", "bfd"]),
     e("ntp-client", None, None, icons::CLOCK, "/system ntp client", &["system.ntp.client"], &["time", "hora", "relógio", "sntp", "clock"]),
     e("os-log", None, None, icons::TERMINAL_WINDOW, "", &["log.os"], &["dmesg", "kernel", "kmsg", "journal", "journalctl", "syslog", "sistema", "log do sistema", "drivers", "erros do kernel", "oom", "show log messages"]),
     e("ospf", None, None, icons::GRAPH, "/routing ospf", &[], &["area", "lsa", "igp"]),

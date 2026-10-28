@@ -45,6 +45,8 @@ pub(crate) const MAGNIFYING_GLASS: &str = "\u{E30C}";
 pub(crate) const MAP_PIN: &str = "\u{E316}";
 pub(crate) const NOTEBOOK: &str = "\u{E34E}";
 pub(crate) const PATH: &str = "\u{E39C}";
+pub(crate) const PAUSE: &str = "\u{E39E}";
+pub(crate) const PLAY: &str = "\u{E3D0}";
 pub(crate) const PLUGS: &str = "\u{EB56}";
 pub(crate) const PLUGS_CONNECTED: &str = "\u{EB5A}";
 pub(crate) const PROHIBIT: &str = "\u{E3DE}";
@@ -54,6 +56,8 @@ pub(crate) const SCROLL: &str = "\u{EB7A}";
 pub(crate) const SHARE_NETWORK: &str = "\u{E408}";
 pub(crate) const SHIELD_CHECK: &str = "\u{E40C}";
 pub(crate) const SIGNPOST: &str = "\u{E89C}";
+pub(crate) const SKIP_BACK: &str = "\u{E5A4}";
+pub(crate) const SKIP_FORWARD: &str = "\u{E5A6}";
 pub(crate) const SLIDERS_HORIZONTAL: &str = "\u{E434}";
 pub(crate) const SQUARES_FOUR: &str = "\u{E464}";
 pub(crate) const STACK: &str = "\u{E466}";
@@ -141,6 +145,8 @@ pub(crate) const ALL: &[&str] = &[
     MAP_PIN,
     NOTEBOOK,
     PATH,
+    PAUSE,
+    PLAY,
     PLUGS,
     PLUGS_CONNECTED,
     PROHIBIT,
@@ -150,6 +156,8 @@ pub(crate) const ALL: &[&str] = &[
     SHARE_NETWORK,
     SHIELD_CHECK,
     SIGNPOST,
+    SKIP_BACK,
+    SKIP_FORWARD,
     SLIDERS_HORIZONTAL,
     SQUARES_FOUR,
     STACK,
