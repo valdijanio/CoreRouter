@@ -142,6 +142,24 @@ pub struct OspfRoute {
     /// `via` addresses with their interface (`directly attached`: no
     /// address).
     pub nexthops: Vec<(Option<String>, String)>,
+    /// G3.4d: what zebra installed for it, with the TI-LFA backups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_reroute: Option<RouteFrr>,
+}
+
+/// One next hop as zebra installed it: address, interface, labels.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FrrHop {
+    pub via: Option<String>,
+    pub interface: String,
+    pub labels: Vec<u32>,
+}
+
+/// A route's primary next hops and its backups (TI-LFA, RFC 9855).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RouteFrr {
+    pub primary: Vec<FrrHop>,
+    pub backup: Vec<FrrHop>,
 }
 
 pub fn ip(v: u32) -> Ipv4Addr {

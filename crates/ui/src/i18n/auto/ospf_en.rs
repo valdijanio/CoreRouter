@@ -25,6 +25,24 @@ default, stub (no externals) or nssa (externals of its own as type-7, RFC 3101).
 Why a neighbor is not Full, from the config, the daemon's state and the packets seen, with the RFC section."##),
     (r##"ospf.disabled"##, r##"## What it is
 Kept in the config, not running."##),
+    (r##"ospf.frr.after"##, r##"## What it is
+The path and cost after OSPF converges without the cut link."##),
+    (r##"ospf.frr.backup"##, r##"## What it is
+The backup next hop zebra installed (TI-LFA); in the virtual lab the computed one."##),
+    (r##"ospf.frr.coverage"##, r##"## What it is
+The share of OSPF routes with a backup installed (IOS-XR's fast-reroute prefix-summary)."##),
+    (r##"ospf.frr.labels"##, r##"## What it is
+The backup's label stack, top first: the repair segments, then the destination's SID."##),
+    (r##"ospf.frr.primary"##, r##"## What it is
+The primary next hop: address · interface."##),
+    (r##"ospf.frr.protected"##, r##"## What it is
+Whether the route has a backup ready."##),
+    (r##"ospf.frr.reason"##, r##"## What it is
+Why the route has no backup."##),
+    (r##"ospf.frr.segments"##, r##"## What it is
+The repair segments, computed as ospfd does."##),
+    (r##"ospf.frr.views"##, r##"## What it is
+Routes: primary and backup next hop with the label stack. Unprotected: the routes without a backup and why. Simulate Link Cut: the backup each affected route takes and the path after convergence, nothing changed."##),
     (r##"ospf.instance"##, r##"## What it is
 An OSPF instance (RouterOS `/routing ospf instance`). The preview shows the interfaces it runs on and what the change does."##),
     (r##"ospf.instance.name"##, r##"## What it is
@@ -135,10 +153,14 @@ The OSPF router id that announces it."##),
 Segment Routing Global Block (RFC 8402 §2): the labels of the prefix SIDs (label = start + index). Default 16000-23999. It stays out of LDP's labels."##),
     (r##"ospf.sr.srlb"##, r##"## What it is
 Segment Routing Local Block: the router's local labels (adjacency SIDs). Default 15000-15999."##),
+    (r##"ospf.sr.ti_lfa"##, r##"## What it is
+TI-LFA (RFC 9855) for the whole instance: link (the link to the next hop), node (the next-hop router; the route to it gets none) or off."##),
     (r##"ospf.sr.views"##, r##"## What it is
 This Router: the configured prefix SIDs. Network SIDs: what ospfd learned, with the in and out labels. SR Routers: each router's SRGB and SRLB (amber when the SRGB differs from ours)."##),
     (r##"ospf.tab.areas"##, r##"## What it is
 The areas of each instance. 0.0.0.0 is the backbone; the others connect to it through an ABR."##),
+    (r##"ospf.tab.frr"##, r##"## What it is
+Fast Reroute by TI-LFA (RFC 9855): FRR's ospfd computes a loop-free backup with an SR label stack for each route and zebra keeps it ready, used until OSPF converges. Needs Segment Routing and a SID on every router of the path; BFD makes the failure seen fast."##),
     (r##"ospf.tab.instances"##, r##"## What it is
 One OSPF process per version (2: IPv4, 3: IPv6) and VRF: router id, redistribution and the default route."##),
     (r##"ospf.tab.keychains"##, r##"## What it is

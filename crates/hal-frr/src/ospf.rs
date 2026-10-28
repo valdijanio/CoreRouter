@@ -245,6 +245,7 @@ pub fn routes_v2(json: &str, instance: &str) -> Result<Vec<OspfRoute>, String> {
             type2_cost: n(m, "type2cost").and_then(|c| u32::try_from(c).ok()),
             area: s(m, "area"),
             nexthops,
+            fast_reroute: None,
         });
     }
     Ok(out)

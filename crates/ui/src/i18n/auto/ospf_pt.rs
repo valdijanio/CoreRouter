@@ -6,6 +6,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"ASBR Summary"##, r##"ASBR summary"##),
     (r##"Address"##, r##"Endereço"##),
     (r##"Adjacency SIDs"##, r##"Adjacency SIDs"##),
+    (r##"After Convergence"##, r##"Depois da convergência"##),
     (r##"Age"##, r##"Idade"##),
     (r##"All"##, r##"Todos"##),
     (r##"Announced"##, r##"Anunciado"##),
@@ -19,16 +20,21 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"BFD"##, r##"BFD"##),
     (r##"BFD Profile"##, r##"Perfil BFD"##),
     (r##"Back to the whole map"##, r##"Volta ao mapa inteiro"##),
+    (r##"Backup"##, r##"Reserva"##),
+    (r##"Before"##, r##"Antes"##),
     (r##"Behavior"##, r##"Comportamento"##),
     (r##"Body"##, r##"Conteúdo"##),
     (r##"Comment"##, r##"Comentário"##),
     (r##"Cost"##, r##"Custo"##),
+    (r##"Coverage"##, r##"Cobertura"##),
+    (r##"Cut the link to"##, r##"Cortar o link para"##),
     (r##"Dead Interval"##, r##"Dead interval"##),
     (r##"Default Cost"##, r##"Custo padrão"##),
     (r##"Diagnose"##, r##"Diagnosticar"##),
     (r##"Diagnosing…"##, r##"Diagnosticando…"##),
     (r##"Disabled"##, r##"Desativado"##),
     (r##"External"##, r##"Externo"##),
+    (r##"Fast Reroute"##, r##"Fast Reroute"##),
     (r##"Fit"##, r##"Ajustar"##),
     (r##"Force"##, r##"Forçar"##),
     (r##"Hello Interval"##, r##"Hello interval"##),
@@ -49,6 +55,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"LDP"##, r##"LDP"##),
     (r##"LSDB"##, r##"LSDB"##),
     (r##"Label"##, r##"Rótulo"##),
+    (r##"Label Stack"##, r##"Pilha de rótulos"##),
     (r##"Loopback SIDs"##, r##"SIDs das loopbacks"##),
     (r##"MSD"##, r##"MSD"##),
     (r##"MTU Ignore"##, r##"Ignorar MTU"##),
@@ -79,12 +86,16 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Out"##, r##"Sai"##),
     (r##"Out Filter Chain"##, r##"Chain de saída"##),
     (r##"Passive"##, r##"Passiva"##),
+    (r##"Pick a neighbor: the routes that leave by it are shown with the backup they take and the path after OSPF converges."##, r##"Escolha um vizinho: as rotas que saem por ele aparecem com o reserva que usam e o caminho depois que o OSPF converge."##),
     (r##"Prefix"##, r##"Prefixo"##),
     (r##"Prefix SID"##, r##"Prefix SID"##),
     (r##"Prefix SIDs"##, r##"Prefix SIDs"##),
+    (r##"Primary"##, r##"Principal"##),
     (r##"Priority"##, r##"Prioridade"##),
+    (r##"Protected"##, r##"Protegido"##),
     (r##"Ranges"##, r##"Ranges"##),
     (r##"Reading the database from the routing daemon…"##, r##"Lendo a base do daemon de roteamento…"##),
+    (r##"Reason"##, r##"Motivo"##),
     (r##"Redistribute"##, r##"Redistribuir"##),
     (r##"Rotation"##, r##"Rotação"##),
     (r##"Router"##, r##"Router"##),
@@ -98,18 +109,28 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"SRLB"##, r##"SRLB"##),
     (r##"Segment Routing"##, r##"Segment Routing"##),
     (r##"Segment Routing is off. Turn it on for the OSPFv2 instance: the preview shows what moves to labels before anything changes."##, r##"O Segment Routing está desligado. Ligue-o na instância OSPFv2: a prévia mostra o que passa a ir por rótulo antes de qualquer mudança."##),
+    (r##"Segments"##, r##"Segmentos"##),
     (r##"Sending Now"##, r##"Enviando agora"##),
     (r##"Sequence"##, r##"Sequência"##),
     (r##"Settings…"##, r##"Configurar…"##),
     (r##"Show"##, r##"Mostrar"##),
+    (r##"Simulate"##, r##"Simular"##),
+    (r##"Simulate Link Cut"##, r##"Simular corte de link"##),
     (r##"State"##, r##"Estado"##),
     (r##"Subscriber Pools"##, r##"Pools de assinantes"##),
     (r##"Summary"##, r##"Summary"##),
+    (r##"TI-LFA"##, r##"TI-LFA"##),
+    (r##"TI-LFA off"##, r##"TI-LFA desligado"##),
+    (r##"TI-LFA · link"##, r##"TI-LFA · enlace"##),
+    (r##"TI-LFA · node"##, r##"TI-LFA · nó"##),
+    (r##"TI-LFA…"##, r##"TI-LFA…"##),
+    (r##"The router fails"##, r##"O roteador cai"##),
     (r##"This Router"##, r##"Este roteador"##),
     (r##"Topology"##, r##"Topologia"##),
     (r##"Turn Off…"##, r##"Desligar…"##),
     (r##"Turn On…"##, r##"Ligar…"##),
     (r##"Type"##, r##"Tipo"##),
+    (r##"Unprotected"##, r##"Sem proteção"##),
     (r##"Uptime"##, r##"Tempo de pé"##),
     (r##"Used By"##, r##"Usada por"##),
     (r##"VRF"##, r##"VRF"##),
@@ -126,7 +147,9 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"error"##, r##"erro"##),
     (r##"layout"##, r##"layout"##),
     (r##"priority"##, r##"prioridade"##),
+    (r##"protected"##, r##"protegidos"##),
     (r##"retransmit"##, r##"retransmissão"##),
+    (r##"simulation: nothing changes"##, r##"simulação: nada muda"##),
     (r##"unavailable"##, r##"indisponível"##),
     (r##"virtual lab sample"##, r##"amostra do laboratório virtual"##),
 ];
@@ -163,6 +186,24 @@ Por que um vizinho não chega a Full, a partir da config, do estado do daemon e 
 - tipo de rede diferente (um elege DR, o outro é ptp)."##),
     (r##"ospf.disabled"##, r##"## O que é
 Fica na config e não roda."##),
+    (r##"ospf.frr.after"##, r##"## O que é
+O caminho e o custo depois que o OSPF reconverge sem o enlace cortado."##),
+    (r##"ospf.frr.backup"##, r##"## O que é
+O próximo salto de reserva que o zebra deixou instalado (TI-LFA). No laboratório virtual é o calculado (selo `lab`)."##),
+    (r##"ospf.frr.coverage"##, r##"## O que é
+A porcentagem das rotas OSPF que têm reserva instalada, como o `show ... fast-reroute prefix-summary` da Cisco. Verde ≥ 95%, âmbar ≥ 70%, vermelho abaixo. A aba **Sem proteção** diz o motivo de cada uma."##),
+    (r##"ospf.frr.labels"##, r##"## O que é
+A pilha de rótulos do reserva, de cima para baixo: os segmentos do reparo (nó P, adjacência P→Q) e o SID do destino."##),
+    (r##"ospf.frr.primary"##, r##"## O que é
+O próximo salto principal: endereço · interface."##),
+    (r##"ospf.frr.protected"##, r##"## O que é
+Se a rota tem reserva pronto."##),
+    (r##"ospf.frr.reason"##, r##"## O que é
+Por que a rota está sem reserva: único caminho (o enlace é ponte), conectada, anunciada fora da área, nó protegido igual ao destino, ou um roteador do caminho sem SID."##),
+    (r##"ospf.frr.segments"##, r##"## O que é
+Os segmentos do reparo calculados como o `ospfd` faz (nó PQ, ou nó P e adjacência P→Q)."##),
+    (r##"ospf.frr.views"##, r##"## O que é
+**Rotas**: cada rota com o próximo salto principal e o de reserva e a pilha de rótulos (como o next-hop de reserva do Junos). **Sem proteção**: as rotas sem reserva e por quê (único caminho, conectada, externa, roteador sem SID). **Simular corte de link**: escolha um vizinho e veja o reserva de cada rota afetada e o caminho depois da convergência, sem tocar a rede."##),
     (r##"ospf.instance"##, r##"## O que é
 Uma instância OSPF (`/routing ospf instance`). A prévia mostra em quais interfaces ela roda e o que a mudança faz (inclusive adjacências que caem)."##),
     (r##"ospf.instance.name"##, r##"## O que é
@@ -291,10 +332,20 @@ Segment Routing Global Block (RFC 8402 §2): os rótulos reservados para os pref
 O bloco fica **fora da faixa do LDP**: com a faixa padrão do `/mpls settings`, o LDP passa a usar os rótulos acima do SR (24000–1048575); com uma faixa sua, o commit recusa sobreposição. Use o mesmo SRGB em toda a rede: o rótulo fica igual em todo salto."##),
     (r##"ospf.sr.srlb"##, r##"## O que é
 Segment Routing Local Block: rótulos locais do roteador, usados pelos adjacency SIDs. Padrão 15000–15999. Não pode sobrepor o SRGB."##),
+    (r##"ospf.sr.ti_lfa"##, r##"## O que é
+TI-LFA (RFC 9855) na instância inteira (o FRR liga por processo):
+- `link`: protege o enlace até o próximo salto;
+- `node`: protege o roteador do próximo salto (a rota até ele mesmo fica sem reserva);
+- `off`: sem reserva pré-calculada."##),
     (r##"ospf.sr.views"##, r##"## O que é
 **Este roteador**: os prefix SIDs da config, com + − para editar. **SIDs da rede**: tudo o que o `ospfd` aprendeu, com o rótulo de entrada e de saída. **Roteadores SR**: o SRGB e o SRLB de cada um (em âmbar quando o SRGB difere do nosso)."##),
     (r##"ospf.tab.areas"##, r##"## O que é
 As áreas de cada instância. A 0.0.0.0 é o backbone; as outras se ligam a ele por um ABR (roteador de borda de área)."##),
+    (r##"ospf.tab.frr"##, r##"## O que é
+Fast Reroute por **TI-LFA** (RFC 9855): para cada rota, o `ospfd` do FRR calcula um caminho de reserva sem laço, com uma pilha de rótulos SR, e o zebra o deixa pronto. Quando o vizinho principal cai, o tráfego vai pelo reserva **antes** de o OSPF reconvergir.
+
+## Requisitos
+Precisa do Segment Routing ligado (aba Segment Routing) e de SID em todos os roteadores do caminho. Para ver a queda rápido, use BFD nos interface templates."##),
     (r##"ospf.tab.instances"##, r##"## O que é
 Um processo OSPF por versão (2: IPv4, RFC 2328; 3: IPv6, RFC 5340) e por VRF: router id, redistribuição e rota padrão."##),
     (r##"ospf.tab.keychains"##, r##"## O que é

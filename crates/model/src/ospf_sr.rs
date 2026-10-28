@@ -135,10 +135,45 @@ pub struct SegmentRouting {
     /// `None`: not announced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_msd: Option<u8>,
+    /// G3.4d: Topology Independent LFA (RFC 9855), FRR's `fast-reroute
+    /// ti-lfa [node-protection]` for the whole instance.
+    #[serde(default, skip_serializing_if = "TiLfa::is_off")]
+    pub ti_lfa: TiLfa,
     #[serde(default)]
     pub disabled: bool,
     #[serde(default)]
     pub comment: String,
+}
+
+/// TI-LFA protection (RFC 9855 §2): of the link to the next hop, or of the
+/// next-hop router itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TiLfa {
+    #[default]
+    Off,
+    Link,
+    Node,
+}
+
+impl TiLfa {
+    pub const ALL: [TiLfa; 3] = [TiLfa::Off, TiLfa::Link, TiLfa::Node];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            TiLfa::Off => "off",
+            TiLfa::Link => "link",
+            TiLfa::Node => "node",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| t.name() == s)
+    }
+
+    pub fn is_off(&self) -> bool {
+        *self == TiLfa::Off
+    }
 }
 
 impl SegmentRouting {
@@ -148,6 +183,7 @@ impl SegmentRouting {
             srgb: DEFAULT_SRGB,
             srlb: DEFAULT_SRLB,
             node_msd: None,
+            ti_lfa: TiLfa::Off,
             disabled: false,
             comment: String::new(),
         }

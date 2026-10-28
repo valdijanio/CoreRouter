@@ -21,7 +21,7 @@ exec 9>&-
 what=${1:-all}
 modprobe mpls_router
 modprobe mpls_iptunnel
-sed -i "s/^ospfd=no/ospfd=yes/" /etc/frr/daemons
+sed -i "s/^ospfd=no/ospfd=yes/; s/^bfdd=no/bfdd=yes/" /etc/frr/daemons
 [ -f /etc/frr/frr.conf.crorig ] || cp -p /etc/frr/frr.conf /etc/frr/frr.conf.crorig
 cp -p /etc/frr/frr.conf.crorig /etc/frr/frr.conf
 cleanup() {
@@ -83,7 +83,10 @@ router() {
     for ic in "$@"; do
       local i=${ic%%:*} c=${ic##*:}
       printf 'interface %s\n ip ospf network point-to-point\n ip ospf hello-interval 1\n' "$i"
-      printf ' ip ospf dead-interval 4\n ip ospf cost %s\n ip ospf area 0.0.0.0\nexit\n' "$c"
+      printf ' ip ospf dead-interval 4\n ip ospf cost %s\n ip ospf area 0.0.0.0\n' "$c"
+      # BFD towards R1 (the silent-cut measurement of live_ti_lfa).
+      [ "$i" = crsr-b ] && printf ' ip ospf bfd\n ip ospf bfd profile crfast\n'
+      printf 'exit\n'
     done
     printf 'interface lo\n ip ospf area 0.0.0.0\n ip ospf passive\nexit\n'
     printf 'router ospf\n ospf router-id 10.255.0.%s\n capability opaque\n router-info area\n' "$n"
@@ -94,6 +97,9 @@ router() {
   ip netns exec "$ns" /usr/lib/frr/zebra -N "$ns" -d -f "$d/zebra.conf" --log "file:$d/zebra.log" </dev/null >/dev/null 2>&1
   for _ in $(seq 50); do [ -S "/var/run/frr/$ns/zserv.api" ] && break; sleep 0.1; done
   ip netns exec "$ns" /usr/lib/frr/ospfd -N "$ns" -d -f "$d/ospfd.conf" --log "file:$d/ospfd.log" </dev/null >/dev/null 2>&1
+  printf 'bfd\n profile crfast\n  detect-multiplier 3\n  receive-interval 10\n  transmit-interval 10\n exit\nexit\n' > "$d/bfdd.conf"
+  chown frr:frr "$d/bfdd.conf"
+  ip netns exec "$ns" /usr/lib/frr/bfdd -N "$ns" -d -f "$d/bfdd.conf" --log "file:$d/bfdd.log" </dev/null >/dev/null 2>&1
 }
 # The VM's FRR first: its restart must not meet the instances below.
 systemctl reset-failed frr 2>/dev/null || true
@@ -107,6 +113,7 @@ status=0
 case $what in
   sr) tests=(live_sr) ;;
   frr) tests=(live_ti_lfa) ;;
+  sink) tests=() ;;
   *) tests=(live_sr live_ti_lfa) ;;
 esac
 for t in "${tests[@]}"; do
@@ -117,13 +124,15 @@ if [ $status != 0 ]; then
   for ns in crsr2 crsr3 crsr4; do
     echo "--- $ns ---"
     ls /var/run/frr/$ns || true
-    tail -n 20 /etc/frr/$ns/zebra.log /etc/frr/$ns/ospfd.log 2>/dev/null || true
+    grep -v "BE-client\|NB_OP_CHANGE" /etc/frr/$ns/ospfd.log 2>/dev/null | grep -i -B2 -A3 "assert\|signal" | head -n 30 || true
     vtysh -N $ns -c "show ip ospf neighbor" -c "show ip ospf database segment-routing" -c "show ip route" 2>/dev/null || true
     ip -n $ns -f mpls route show || true
   done
   echo "--- R1 (the VM's FRR) ---"
   ip -f mpls route show || true
   echo "kernel: $(ip route show 10.255.0.3)"; ip nexthop show || true; ip route get 10.255.0.3 || true
+  vtysh -c "show ip route ospf json" 2>/dev/null | head -c 4000 || true
+  journalctl -u frr --since "-10min" --no-pager 2>/dev/null | grep -i "ospfd\|assert" | tail -n 30 || true
   vtysh -c "show ip ospf neighbor" -c "show ip ospf database segment-routing" -c "show ip route" \
     -c "show running-config" || true
 fi

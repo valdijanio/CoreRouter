@@ -19,6 +19,7 @@
 //! mgmtd, with the numbers.
 
 pub mod conf;
+pub mod fast_reroute;
 pub mod ldp;
 pub mod ospf;
 pub mod render;
@@ -567,7 +568,7 @@ impl Frr {
         }
         let r = vty.run("show ip ospf route json").map_err(io)?;
         let text = String::from_utf8_lossy(&r.output);
-        let routes = if r.ok() && text.trim_start().starts_with('{') {
+        let mut routes = if r.ok() && text.trim_start().starts_with('{') {
             ospf::routes_v2(&text, instance).map_err(HalError::Rejected)?
         } else {
             Vec::new()
@@ -582,6 +583,21 @@ impl Frr {
             let text = String::from_utf8_lossy(&r.output);
             if r.ok() && text.trim_start().starts_with('{') {
                 db.sr = sr::sr_db(&text).map_err(HalError::Rejected)?;
+            }
+            // G3.4d: the labels and TI-LFA backups zebra installed (ospfd
+            // prints none), streamed from zebra's socket.
+            let z = Daemon::Zebra;
+            let mut zvty = self.connect(z)?;
+            let zio = |e: std::io::Error| io_err(z, e);
+            let mut stream = zvty
+                .run_stream("show ip route ospf json", MAX_TABLE)
+                .map_err(zio)?;
+            let got = fast_reroute::read(&mut stream);
+            let _ = stream.finish().map_err(zio)?;
+            if let Ok(mut by) = got {
+                for r in &mut routes {
+                    r.fast_reroute = by.remove(&r.prefix);
+                }
             }
         }
         Ok((db, routes))

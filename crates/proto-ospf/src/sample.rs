@@ -47,6 +47,15 @@ pub fn lab(
     let mut my_links: std::collections::BTreeMap<u32, Vec<Link>> =
         std::collections::BTreeMap::new();
     let addrs = crate::bind::addresses(cfg, inst.version == Version::V3);
+    // With two neighbors or more, a core router joins the rings' tails, so
+    // the network has a way around (G3.4d: TI-LFA has something to show).
+    let fulls = binds
+        .iter()
+        .enumerate()
+        .filter(|(i, b)| !b.template.passive && *i != 1)
+        .count();
+    let core = rid(250, 1);
+    let mut core_links: Vec<(u32, Link)> = Vec::new();
     for (i, b) in binds.iter().enumerate() {
         let i = u8::try_from(i.min(200)).unwrap_or(200);
         let area = b.area.area_id.0;
@@ -209,6 +218,23 @@ pub fn lab(
                     metric: 5,
                 });
             }
+            if fulls >= 2 && k + 1 == ring.len() {
+                links.push(Link {
+                    kind: 1,
+                    id: core,
+                    data: 0,
+                    metric: 50,
+                });
+                core_links.push((
+                    area,
+                    Link {
+                        kind: 1,
+                        id: *r,
+                        data: 0,
+                        metric: 50,
+                    },
+                ));
+            }
             push(&mut db, *r, links, if k + 1 == ring.len() { 2 } else { 0 });
         }
         // The transit LAN of the last two ring routers.
@@ -240,6 +266,24 @@ pub fn lab(
                 ..Lsa::default()
             });
         }
+    }
+    if let Some((area, _)) = core_links.first() {
+        let area = *area;
+        let links: Vec<Link> = core_links.iter().map(|(_, l)| *l).collect();
+        let start = u32::try_from(db.links.len()).unwrap_or(u32::MAX);
+        let count = u16::try_from(links.len()).unwrap_or(0);
+        db.links.extend(links);
+        db.lsas.push(Lsa {
+            kind: 1,
+            area,
+            id: core,
+            adv: core,
+            age: 200,
+            seq: 0x8000_0001,
+            link_start: start,
+            link_count: count,
+            ..Lsa::default()
+        });
     }
     for (i, (area, links)) in my_links.into_iter().enumerate() {
         let start = u32::try_from(db.links.len()).unwrap_or(u32::MAX);
@@ -347,6 +391,7 @@ fn sr_lab(
                 type2_cost: None,
                 area: Some(Ipv4Addr::from(g.keys().next().copied().unwrap_or(0)).to_string()),
                 nexthops: vec![(Some(f.address.clone()), f.interface.clone())],
+                fast_reroute: None,
             });
         }
         out.nodes.push(node(
@@ -394,6 +439,7 @@ fn routes(db: &Lsdb, instance: &str, me: u32, nbrs: &[OspfNeighbor]) -> Vec<Ospf
                         hops.first().map(|_| "local".to_owned()).unwrap_or_default(),
                     ),
                 }],
+                fast_reroute: None,
             });
         }
     }

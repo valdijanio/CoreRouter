@@ -388,3 +388,22 @@ fn the_kernel_loopback_gets_no_network_type() {
         "{text}"
     );
 }
+
+#[test]
+fn ti_lfa_renders_link_or_node_protection() {
+    let mut cfg = sr_sample();
+    let inst = cfg.routing.ospf.instances["v2"].clone();
+    assert!(
+        !router_lines(&cfg, &inst)
+            .iter()
+            .any(|l| l.starts_with("fast-reroute"))
+    );
+    if let Some(sr) = cfg.routing.ospf.segment_routing.as_mut() {
+        sr.ti_lfa = TiLfa::Link;
+    }
+    assert!(router_lines(&cfg, &inst).contains(&"fast-reroute ti-lfa".to_owned()));
+    if let Some(sr) = cfg.routing.ospf.segment_routing.as_mut() {
+        sr.ti_lfa = TiLfa::Node;
+    }
+    assert!(router_lines(&cfg, &inst).contains(&"fast-reroute ti-lfa node-protection".to_owned()));
+}

@@ -26,6 +26,10 @@ log.workspace = true
 proptest.workspace = true
 criterion.workspace = true
 corerouter-proto-bgp.workspace = true
+# G3.4d, the lab VM test: the iperf3 UDP datagrams count the loss of a
+# cut, and the simplified TI-LFA is checked against ospfd's.
+corerouter-proto-iperf.workspace = true
+corerouter-netsim.workspace = true
 
 [[bench]]
 name = "frr_conf"

@@ -34,6 +34,7 @@ mod queue;
 mod sim;
 #[cfg(test)]
 mod tests;
+pub mod tilfa;
 mod timeline;
 
 use std::net::Ipv4Addr;

@@ -44,9 +44,10 @@ pub(crate) enum Tab {
     Routes,
     Topology,
     SegmentRouting,
+    FastReroute,
 }
 
-pub(crate) const TABS: [(Tab, &str, &str); 9] = [
+pub(crate) const TABS: [(Tab, &str, &str); 10] = [
     (Tab::Neighbors, "Neighbors", "ospf.tab.neighbors"),
     (Tab::Instances, "Instances", "ospf.tab.instances"),
     (Tab::Areas, "Areas", "ospf.tab.areas"),
@@ -56,6 +57,7 @@ pub(crate) const TABS: [(Tab, &str, &str); 9] = [
     (Tab::Routes, "Routes", "ospf.tab.routes"),
     (Tab::Topology, "Topology", "ospf.tab.topology"),
     (Tab::SegmentRouting, "Segment Routing", "ospf.tab.sr"),
+    (Tab::FastReroute, "Fast Reroute", "ospf.tab.frr"),
 ];
 
 const NBR: &str = "ospf-neighbors";
@@ -271,6 +273,16 @@ pub(crate) struct OspfPanel {
     pub(crate) sid_table: TableState,
     pub(crate) sr_sid_table: TableState,
     pub(crate) sr_node_table: TableState,
+    /// G3.4d: `routing.ospf.fast-reroute` and the simulated cut.
+    pub(crate) frr: Value,
+    pub(crate) frr_sim: Value,
+    pub(crate) frr_view: crate::ospf_frr::FrrView,
+    pub(crate) frr_pick: String,
+    pub(crate) frr_node: bool,
+    pub(crate) frr_cut: Option<(String, bool)>,
+    pub(crate) frr_table: TableState,
+    pub(crate) frr_unprot_table: TableState,
+    pub(crate) frr_sim_table: TableState,
     nbr_table: TableState,
     inst_table: TableState,
     area_table: TableState,
@@ -607,6 +619,7 @@ fn options(param: &str, areas: &[String], instances: &[String], chains: &[String
         "type" => &["default", "stub", "nssa"],
         "nssa_translate" => &["candidate", "yes", "no"],
         "behavior" => &["php", "no-php", "explicit-null"],
+        "ti_lfa" => &["off", "link", "node"],
         "auth" => &["", "sha256", "sha384", "sha512", "sha1", "md5", "simple"],
         "area" => return areas.to_vec(),
         "instance" => return instances.to_vec(),
@@ -1134,6 +1147,13 @@ impl PanelState for OspfPanel {
                 q("sr", "routing.ospf.segment-routing.database", json!({}));
                 q("prefix_sids", "routing.ospf.prefix-sid.list", json!({}));
             }
+            Tab::FastReroute => {
+                q("frr", "routing.ospf.fast-reroute", json!({}));
+                q("sr", "routing.ospf.segment-routing.database", json!({}));
+                if let Some((n, node)) = &self.frr_cut {
+                    q("frr_sim", "routing.ospf.fast-reroute.simulate", json!({"neighbor": n, "node": node}));
+                }
+            }
             Tab::Lsdb if !self.instance.is_empty() => {
                 let mut p = json!({"instance": self.instance, "offset": self.lsa_page * 200, "limit": 200});
                 if !self.lsa_type.is_empty()
@@ -1193,6 +1213,8 @@ impl PanelState for OspfPanel {
             "path" => self.path = value,
             "sr" => self.sr = value,
             "prefix_sids" => self.prefix_sids = arr(value),
+            "frr" => self.frr = value,
+            "frr_sim" => self.frr_sim = value,
             _ => {}
         }
     }
@@ -1210,6 +1232,7 @@ impl PanelState for OspfPanel {
             Tab::Routes => self.routes_tab(app, ui),
             Tab::Topology => crate::ospf_topology::tab(self, app, ui),
             Tab::SegmentRouting => crate::ospf_sr::tab(self, app, ui),
+            Tab::FastReroute => crate::ospf_frr::tab(self, app, ui),
         }
     }
 
@@ -1260,6 +1283,7 @@ impl PanelState for OspfPanel {
             Tab::Routes => self.route_table.escape(),
             Tab::Topology => false,
             Tab::SegmentRouting => self.sid_table.escape() || self.sr_sid_table.escape() || self.sr_node_table.escape(),
+            Tab::FastReroute => self.frr_table.escape() || self.frr_unprot_table.escape() || self.frr_sim_table.escape(),
         }
     }
 
@@ -1275,6 +1299,9 @@ impl PanelState for OspfPanel {
             (crate::ospf_sr::SIDS, &self.sid_table),
             (crate::ospf_sr::NET_SIDS, &self.sr_sid_table),
             (crate::ospf_sr::NODES, &self.sr_node_table),
+            (crate::ospf_frr::ROUTES, &self.frr_table),
+            (crate::ospf_frr::UNPROTECTED, &self.frr_unprot_table),
+            (crate::ospf_frr::SIM, &self.frr_sim_table),
         ]
     }
 
@@ -1290,6 +1317,9 @@ impl PanelState for OspfPanel {
             (crate::ospf_sr::SIDS, &mut self.sid_table),
             (crate::ospf_sr::NET_SIDS, &mut self.sr_sid_table),
             (crate::ospf_sr::NODES, &mut self.sr_node_table),
+            (crate::ospf_frr::ROUTES, &mut self.frr_table),
+            (crate::ospf_frr::UNPROTECTED, &mut self.frr_unprot_table),
+            (crate::ospf_frr::SIM, &mut self.frr_sim_table),
         ]
     }
 }
@@ -1313,6 +1343,7 @@ impl OspfPanel {
         }
         out.extend([INST_SPEC.help, AREA_SPEC.help, TPL_SPEC.help, KC_SPEC.help, "ospf.diagnose", "ospf.path", "ospf.topology.legend"]);
         out.extend(crate::ospf_sr::help_keys());
+        out.extend(crate::ospf_frr::help_keys());
         out.retain(|k| !k.is_empty());
         out.sort_unstable();
         out.dedup();

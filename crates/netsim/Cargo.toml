@@ -23,5 +23,9 @@ proptest.workspace = true
 name = "netsim"
 harness = false
 
+[[bench]]
+name = "tilfa"
+harness = false
+
 [lints]
 workspace = true
