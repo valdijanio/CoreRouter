@@ -1148,7 +1148,7 @@ impl PanelState for OspfPanel {
                 q("prefix_sids", "routing.ospf.prefix-sid.list", json!({}));
             }
             Tab::FastReroute => {
-                q("frr", "routing.ospf.fast-reroute", json!({}));
+                q("frr", "routing.ospf.fast-reroute.list", json!({}));
                 q("sr", "routing.ospf.segment-routing.database", json!({}));
                 if let Some((n, node)) = &self.frr_cut {
                     q("frr_sim", "routing.ospf.fast-reroute.simulate", json!({"neighbor": n, "node": node}));

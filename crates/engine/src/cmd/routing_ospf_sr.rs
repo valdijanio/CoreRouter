@@ -298,6 +298,9 @@ fn sr_check(s: &mut Session, raw: &Value) -> Result<Value> {
     if ti_lfa && cfg.routing.ospf.segment_routing.as_ref().is_some_and(|x| x.ti_lfa == TiLfa::Node) {
         checks.push(check("info", "ti-lfa", "node protection: a route to the next hop itself has no backup (the router is what fails); link protection covers it".into(), "ti_lfa"));
     }
+    if ti_lfa {
+        checks.push(check("warning", "ti-lfa", "FRR 10.7.1's ospfd aborted in 2 of 9 lab rounds with TI-LFA on (assert in get_reverse_distance while LSAs arrive): watchfrr restarts it and every adjacency drops. On Linux the measured loss of a cut did not improve with it (G3.4k, G3.4l): keep it off in production".into(), "ti_lfa"));
+    }
     if ti_lfa && cfg.routing.ospf.templates.iter().all(|t| t.bfd.is_none()) {
         checks.push(check("warning", "bfd", "TI-LFA repairs from the moment the failure is seen: without BFD on the OSPF links a silent cut waits for the dead interval (set a BFD profile in the interface templates)".into(), "ti_lfa"));
     }

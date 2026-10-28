@@ -191,7 +191,7 @@ instalado junto da rota. Liga-se no SR: `routing.ospf.segment-routing.set '{"ti_
 
 | Comando | O que é |
 |---|---|
-| `routing.ospf.fast-reroute` | Cobertura (% de rotas com reserva, tipo de proteção), cada rota com o próximo salto principal e o de reserva com a pilha de rótulos, e as rotas sem proteção com o motivo |
+| `routing.ospf.fast-reroute.list` | Cobertura (% de rotas com reserva, tipo de proteção), cada rota com o próximo salto principal e o de reserva com a pilha de rótulos, e as rotas sem proteção com o motivo |
 | `routing.ospf.fast-reroute.simulate` | "Simular corte de link": para um vizinho (router id, endereço ou interface; `node` para o roteador inteiro), o reserva de cada rota afetada, os segmentos, os rótulos e o caminho depois da convergência, sem tocar a rede |
 
 - **Por instância:** o `ospfd` liga TI-LFA no processo inteiro (`ospf_vty.c`); "por área ou
@@ -237,10 +237,18 @@ rotas perdidas com o motivo).
   | perda de portadora (o vizinho derruba a interface) | 12,5 ms | 13,5 ms |
   | silencioso (netem 100%), detectado pelo BFD 3 × 10 ms | 59,5 ms | 51,0 ms |
 
+  Segunda rodada: 13,5 × 13,5 ms (portadora) e 50,5 × 50,5 ms (silencioso).
+
   **O TI-LFA do FRR não encurta a perda no Linux:** o kernel não tem nexthop de reserva
   pré-programado; o zebra guarda o reserva, mas a troca espera o `ospfd` (aviso do BFD, SPF,
   instalação). O corte silencioso fica em ~50–60 ms, acima da meta de 50 ms; o tempo é o do BFD
   (30 ms) mais o SPF e a instalação. Trocar no plano de dados é a G3.4k.
+- **O `ospfd` 10.7.1 aborta com TI-LFA** em 2 de 9 rodadas do laboratório:
+  `ospf_spf.c:1269: get_reverse_distance(): assertion (w_lsa && w_lsa->data) failed`, no SPF
+  reverso do Q-space, quando o LSA de um vizinho ainda não chegou (a função trata esse caso logo
+  depois, mas o `assert` vem antes). O watchfrr reinicia o daemon e todas as adjacências caem. Por
+  isso a prévia avisa e a recomendação é deixar o TI-LFA desligado em produção até a G3.4l
+  (correção no FRR ou versão que a traga).
 
 ## Seguro por padrão
 

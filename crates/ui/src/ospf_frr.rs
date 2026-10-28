@@ -129,7 +129,7 @@ fn sim_row(r: &Value) -> Row {
             }),
             if segs.is_empty() { "–".into() } else { segs.join(", ") },
             labels(b.and_then(|b| b.get("labels"))),
-            if path.is_empty() { "–".into() } else { format!("{} · {}", path.join(" → "), s(&after, "cost")) },
+            if path.is_empty() { "–".into() } else { format!("{} · {}", path.join(" › "), s(&after, "cost")) },
         ],
         dimmed: false,
         section: false,

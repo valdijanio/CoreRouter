@@ -498,16 +498,24 @@ pub fn coverage(
         }
         let reason: &'static str = match (r.dest, r.neighbor) {
             (_, None) => "directly connected: no next hop to protect",
-            (None, _) => "not announced by a router of the area (external or summary): no repair is computed for it",
-            (Some(d), Some(n)) => *memo.entry((d, n)).or_insert_with(|| {
-                let ix = (t.index.get(&d), t.index.get(&n));
-                match (spfs.as_mut(), ix) {
-                    (Some(c), (Some(d), Some(n))) => repair_one(c, *d, *n)
-                        .reason
-                        .unwrap_or("a repair exists but none was installed: a router on it has no SID, SR is off there, or the daemon found none (FRR 10.7.1 leaves out some with P and Q apart)"),
-                    _ => "a router of the path is not in the database",
+            (None, _) => {
+                "not announced by a router of the area (external or summary): no repair is computed for it"
+            }
+            (Some(d), Some(n)) => {
+                if let Some(known) = memo.get(&(d, n)) {
+                    known
+                } else {
+                    let ix = (t.index.get(&d), t.index.get(&n));
+                    let why = match (spfs.as_mut(), ix) {
+                        (Some(c), (Some(d), Some(n))) => repair_one(c, *d, *n)
+                            .reason
+                            .unwrap_or("a repair exists but none was installed: a router on it has no SID, SR is off there, or the daemon found none (FRR 10.7.1 leaves out some with P and Q apart)"),
+                        _ => "a router of the path is not in the database",
+                    };
+                    memo.insert((d, n), why);
+                    why
                 }
-            }),
+            }
         };
         c.unprotected.push(Unprotected {
             prefix: r.prefix.to_owned(),

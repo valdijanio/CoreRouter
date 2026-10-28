@@ -24,7 +24,7 @@ use crate::{EngineError, Result, Session};
 pub const MAX_ROWS: usize = 5_000;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
-    cmd!(query "routing.ospf.fast-reroute", "OSPF Fast Reroute", ["Routing", "OSPF"], None,
+    cmd!(query "routing.ospf.fast-reroute.list", "OSPF Fast Reroute", ["Routing", "OSPF"], None,
         "{instance?: string (default: the SR instance), find?: string (prefix contains), limit?: u32 (1..=5000, default 2000)} → {instance, ti_lfa (off, link, node), source, pending, error?, coverage: {total, protected, percent}, unprotected: [{prefix, reason}], rows: [{prefix, kind, cost, primary: {via, interface, labels}, backup?: {via, interface, labels, segments}, computed (the virtual lab's, not a daemon's), protected}], neighbors: [{router_id, address, interface}]}",
         always, frr_list),
     cmd!(query "routing.ospf.fast-reroute.simulate", "Simulate Link Cut", [], None,
@@ -54,7 +54,7 @@ fn hop(h: &FrrHop) -> Value {
 
 fn seg_text(s: &Segment) -> String {
     match s {
-        Segment::Adjacency { from, to } => format!("adj {from}→{to}"),
+        Segment::Adjacency { from, to } => format!("adj {from} › {to}"),
         Segment::Node { router } => format!("node {router}"),
     }
 }
@@ -132,6 +132,11 @@ fn routes_with_backups(c: &Ctx, g: &Graph) -> (Vec<OspfRoute>, bool) {
 }
 
 fn frr_list(s: &mut Session, p: &Value) -> Result<Value> {
+    // A list answers even without OSPF (the terminal refreshes every list
+    // in one batch).
+    if opt_str(p, "instance")?.is_none_or(|i| i.trim().is_empty()) && instance(s, p).is_err() {
+        return Ok(json!({"ti_lfa": "off", "source": "config", "pending": false, "rows": [], "unprotected": [], "coverage": {"total": 0, "protected": 0, "percent": 0.0}, "neighbors": []}));
+    }
     let c = ctx(s, p)?;
     let find = opt_str(p, "find")?.map(|f| f.trim().to_owned()).filter(|f| !f.is_empty());
     let limit = match p.get("limit") {
@@ -206,7 +211,7 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
         return Ok(json!({"neighbor": nb.router_id, "pending": true, "affected": [], "lost": [], "kept": 0}));
     };
     let g = Graph::of(&db.0);
-    let (routes, _) = routes_with_backups(&c, &g);
+    let (routes, sample) = routes_with_backups(&c, &g);
     let rid: Ipv4Addr = nb.router_id.parse().map_err(|_| EngineError::bad("neighbor", "the neighbor has no router id"))?;
     let prot = if node { Protection::Node } else { Protection::Link };
     let mut affected = Vec::new();
@@ -218,7 +223,8 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
             continue;
         }
         let rep = repair_of(&g, r, rid, prot);
-        let installed = r.fast_reroute.as_ref().and_then(|f| f.backup.first());
+        // The virtual lab's backups are computed, not installed.
+        let installed = r.fast_reroute.as_ref().and_then(|f| f.backup.first()).filter(|_| !sample);
         let after = rep.as_ref().filter(|x| x.reason.is_none());
         match (after, installed) {
             (None, None) => lost.push(json!({
@@ -278,7 +284,7 @@ mod tests {
     #[test]
     fn the_lab_has_coverage_backups_and_reasons() {
         let mut s = lab();
-        let v = s.execute("routing.ospf.fast-reroute", &json!({})).unwrap();
+        let v = s.execute("routing.ospf.fast-reroute.list", &json!({})).unwrap();
         assert_eq!(v["ti_lfa"], "link", "{v}");
         let total = v["coverage"]["total"].as_u64().unwrap();
         let protected = v["coverage"]["protected"].as_u64().unwrap();
@@ -294,5 +300,8 @@ mod tests {
         assert!(sim["note"].as_str().unwrap().contains("nothing changed"), "{sim}");
         assert!(!sim["affected"].as_array().unwrap().is_empty() || !sim["lost"].as_array().unwrap().is_empty(), "{sim}");
         assert!(s.execute("routing.ospf.fast-reroute.simulate", &json!({"neighbor": "nobody"})).is_err());
+        // Without OSPF the list is empty, not an error.
+        let mut bare = Session::new(Box::new(VirtualHal::default()));
+        assert_eq!(bare.execute("routing.ospf.fast-reroute.list", &json!({})).unwrap()["rows"], json!([]));
     }
 }
