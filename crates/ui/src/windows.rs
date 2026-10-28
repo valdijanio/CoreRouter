@@ -132,11 +132,12 @@ impl Win {
         }
     }
 
-    /// `Some(gap id)` while the area has no engine commands yet.
+    /// `Some(gap id)` while the area has no engine commands yet. None now:
+    /// the last stubs (OSPF, MPLS) became panels; a new stub returns its
+    /// gap here.
     pub fn gap(self) -> Option<&'static str> {
-        match self {
-            _ => None,
-        }
+        let _ = self;
+        None
     }
 
     /// List windows close on Esc (after clearing find text and selection).
@@ -201,7 +202,6 @@ impl CoreRouterUi {
             Win::History => self.history(ui),
             Win::Ping => self.ping_window(ui),
             Win::Mtr => self.mtr_window(ui),
-            _ => {}
         }
     }
 
