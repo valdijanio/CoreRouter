@@ -13,8 +13,10 @@
 //!   `auth_key` becomes chain `CR-T<id>`, a `/routing ospf keychain K` is
 //!   `CR-K-K`. The windows are FRR's `send-lifetime`/`accept-lifetime`,
 //!   printed in the box's local time: CoreRouter runs in UTC.
-//! - BFD: not typed into FRR. CoreRouter runs its own BFD (G3.6, not
-//!   FRR's `bfdd`); the link between its sessions and `ospfd` is G3.6b.
+//! - BFD: `ip ospf bfd` + `ip ospf bfd profile P` (v3: `ipv6 ospf6 …`).
+//!   `bfdd` hands the session to CoreRouter's engine, its data plane
+//!   (G3.6b), and tells `ospfd` when it falls (G3.9: without these lines
+//!   the template's `bfd` never reached FRR).
 //! - Redistribution: one route-map per instance and kind
 //!   (`CR-O<version>-<inst>-<kind>`): the subscriber pools first (G4.3ce), then
 //!   the `out_filter_chain` compiled by the `/routing filter` compiler
@@ -321,6 +323,10 @@ fn iface_v2(s: &mut String, b: &Binding<'_>, open: Opener<'_>) -> Result<(), Str
     if t.passive {
         let _ = writeln!(s, " ip ospf passive");
     }
+    if let Some(p) = &t.bfd {
+        let _ = writeln!(s, " ip ospf bfd");
+        let _ = writeln!(s, " ip ospf bfd profile {p}");
+    }
     Ok(())
 }
 
@@ -369,6 +375,10 @@ fn iface_v3(s: &mut String, b: &Binding<'_>) {
         && let Some(chain) = auth_chain(t)
     {
         let _ = writeln!(s, " ipv6 ospf6 authentication keychain {chain}");
+    }
+    if let Some(p) = &t.bfd {
+        let _ = writeln!(s, " ipv6 ospf6 bfd");
+        let _ = writeln!(s, " ipv6 ospf6 bfd profile {p}");
     }
 }
 
@@ -768,6 +778,21 @@ mod tests {
         cfg.routing.filter.rules[0].rule = "if (bgp-as-path \"^65000_\") { accept }".into();
         let v = crate::validate(&cfg);
         assert!(v.iter().any(|i| i.message.contains("AS path")), "{v:?}");
+    }
+
+    #[test]
+    fn a_template_with_bfd_asks_ospfd_for_it() {
+        // G3.9: without these lines the BFD of a template never reached
+        // FRR and a silent cut waited for the dead interval.
+        let mut cfg = sample();
+        cfg.routing.ospf.templates[0].bfd = Some("fast".into());
+        let text = render(&cfg, &|s| Some(s.stored().to_owned())).unwrap();
+        assert!(
+            text.contains(" ip ospf bfd\n ip ospf bfd profile fast\n"),
+            "{text}"
+        );
+        let without = render(&sample(), &|s| Some(s.stored().to_owned())).unwrap();
+        assert!(!without.contains("bfd"), "{without}");
     }
 
     #[test]

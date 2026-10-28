@@ -145,6 +145,12 @@ pub fn close(header: &str) -> &'static str {
     }
 }
 
+/// Top-level contexts CoreRouter owns only lines of and never deletes:
+/// `interface X` (the interface itself belongs to zebra and the kernel).
+fn kept_context(line: &str) -> bool {
+    line.starts_with("interface ")
+}
+
 /// The command that undoes `line`: `no X` for `X`, `X` for `no X`.
 pub fn negate(line: &str) -> String {
     match line.strip_prefix("no ") {
@@ -265,6 +271,9 @@ fn delete_late(line: &str) -> u8 {
         2
     } else if line == "capability opaque" {
         3
+    } else if line == "ip ospf bfd" || line == "ipv6 ospf6 bfd" {
+        // After its `… bfd profile P`, which it would take with it.
+        1
     } else {
         0
     }
@@ -352,10 +361,13 @@ fn diff_scope(
             }
             continue;
         }
-        if n.children.is_empty() || top {
+        if n.children.is_empty() || (top && !kept_context(&n.line)) {
             body.push(negate(&n.line));
         } else {
-            // A nested context (address-family) has no `no` form: empty it.
+            // A nested context (address-family) has no `no` form, and an
+            // `interface X` of a link the kernel still has is zebra's: the
+            // daemon refuses `no interface X` (FRR 10.7.1, G3.9: the
+            // whole commit failed when OSPF left an interface). Empty it.
             let mut sub = Vec::new();
             diff_scope(&n.children, &[], false, &removed, &mut sub);
             wrap(&n.line, sub, body);
@@ -573,6 +585,23 @@ end
                 " address-family ipv4 unicast",
                 "  no neighbor 192.0.2.2 activate",
                 " exit-address-family",
+                "exit",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_interface_left_by_ospf_is_emptied_not_deleted() {
+        // FRR 10.7.1 refuses `no interface ether2` while the link exists
+        // ("configuration failed", lab VM against RouterOS, G3.9).
+        let a = conf("interface ether2\n ip ospf area 0.0.0.0\n ip ospf cost 10\nexit\n");
+        let b = conf("");
+        assert_eq!(
+            diff(&a, &b),
+            [
+                "interface ether2",
+                " no ip ospf area 0.0.0.0",
+                " no ip ospf cost 10",
                 "exit",
             ]
         );

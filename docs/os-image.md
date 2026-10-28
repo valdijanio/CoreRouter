@@ -583,7 +583,7 @@ Saídas em `os/out/build/images/`:
     (`crates/proto-ospf/src/frr.rs`: "BFD: not typed into FRR"): o OSPF não cai pelo BFD,
     só o BGP (gap G3.6l). E o `bfdd` não imprime os valores padrão do perfil (`detect-multiplier 3`,
     `receive-interval 300`, …) que o render manda: o hal-frr os digita de novo a cada sync, nos
-    dois FRR (gap G3.6m).
+    dois FRR (gap G3.6m). Os dois foram corrigidos na G3.9 (`docs/producao-core.md`).
 - **O `corerouter-init` inicia os daemons** (`mgmtd`, `zebra`, `staticd`, `bgpd`, `ospfd`,
   `ospf6d`, `ldpd`, `bfdd`), em primeiro plano, com o mesmo backoff de reinício do daemon,
   `-P 0` (sem vty TCP: só os sockets em `/var/run/frr`), log em `/var/log/frr-<daemon>.log` (com o

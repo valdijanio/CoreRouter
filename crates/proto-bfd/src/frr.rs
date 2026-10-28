@@ -167,11 +167,26 @@ pub fn used_profiles(cfg: &Config) -> BTreeSet<String> {
     out
 }
 
+/// `bfdd`'s own defaults (`frr-bfdd.yang`), which it leaves out of `show
+/// running-config`.
+const FRR_MULTIPLIER: u8 = 3;
+const FRR_INTERVAL_MS: u32 = 300;
+
+/// A profile as `bfdd` prints it back (FRR 10.7.1, lab VM, G3.9): the
+/// YANG order (multiplier, transmit, receive) and no value equal to its
+/// default. Otherwise the diff never empties and every commit types the
+/// whole `bfd` block again.
 fn profile(s: &mut String, p: &BfdProfile) {
     let _ = writeln!(s, " profile {}", p.name);
-    let _ = writeln!(s, "  detect-multiplier {}", p.multiplier);
-    let _ = writeln!(s, "  receive-interval {}", p.min_rx);
-    let _ = writeln!(s, "  transmit-interval {}", p.min_tx);
+    if p.multiplier != FRR_MULTIPLIER {
+        let _ = writeln!(s, "  detect-multiplier {}", p.multiplier);
+    }
+    if p.min_tx != FRR_INTERVAL_MS {
+        let _ = writeln!(s, "  transmit-interval {}", p.min_tx);
+    }
+    if p.min_rx != FRR_INTERVAL_MS {
+        let _ = writeln!(s, "  receive-interval {}", p.min_rx);
+    }
     if p.passive {
         let _ = writeln!(s, "  passive-mode");
     }
@@ -313,9 +328,12 @@ mod tests {
             },
         );
         let out = render(&cfg);
-        assert!(out.starts_with("bfd\n profile default\n  detect-multiplier 3\n  receive-interval 300\n  transmit-interval 300\n exit\n"), "{out}");
-        assert!(out.contains(" profile fast\n  detect-multiplier 3\n  receive-interval 50\n  transmit-interval 50\n exit\n"));
-        assert!(out.contains(" profile wan\n  detect-multiplier 5\n  receive-interval 500\n  transmit-interval 500\n  passive-mode\n  minimum-ttl 250\n exit\n"));
+        // As bfdd prints it: defaults left out, transmit before receive.
+        assert!(out.starts_with("bfd\n profile default\n exit\n"), "{out}");
+        assert!(
+            out.contains(" profile fast\n  transmit-interval 50\n  receive-interval 50\n exit\n")
+        );
+        assert!(out.contains(" profile wan\n  detect-multiplier 5\n  transmit-interval 500\n  receive-interval 500\n  passive-mode\n  minimum-ttl 250\n exit\n"));
         assert!(
             out.ends_with(
                 " peer 198.51.100.9 multihop local-address 10.0.0.1\n  profile wan\n exit\nexit\n"

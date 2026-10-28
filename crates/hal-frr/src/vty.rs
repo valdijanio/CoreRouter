@@ -23,6 +23,9 @@ pub const CMD_WARNING: u8 = 1;
 pub const CMD_SUCCESS_DAEMON: u8 = 10;
 pub const CMD_WARNING_CONFIG_FAILED: u8 = 13;
 
+/// What FRR's northbound writes when it rejects a pending commit.
+const COMMIT_FAILED: &[u8] = b"% Configuration failed";
+
 /// A command's answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reply {
@@ -34,6 +37,17 @@ pub struct Reply {
 impl Reply {
     pub fn ok(&self) -> bool {
         matches!(self.code, CMD_SUCCESS | CMD_SUCCESS_DAEMON)
+    }
+
+    /// Whether the northbound refused the batch: at
+    /// `XFRR_end_configuration` FRR 10.7.1 answers `CMD_SUCCESS` and
+    /// writes "% Configuration failed." (`nb_cli_pending_commit_check`),
+    /// e.g. `cryptographic-algorithm hmac-sha-384` in an FRR built
+    /// without OpenSSL (lab VM, G3.9): the code alone says nothing.
+    pub fn commit_failed(&self) -> bool {
+        self.output
+            .windows(COMMIT_FAILED.len())
+            .any(|w| w == COMMIT_FAILED)
     }
 
     /// The output as text, cut to `max` bytes for error messages (the
@@ -356,6 +370,22 @@ mod tests {
         assert_eq!((r.ok(), r.code), (false, 2));
         assert_eq!(code_name(r.code), "unknown command");
         assert!(v.run("").unwrap().output.is_empty());
+    }
+
+    #[test]
+    fn a_refused_batch_is_seen_despite_the_success_code() {
+        // FRR 10.7.1, lab VM: the end marker of a batch with a key chain
+        // the build cannot do.
+        let r = Reply {
+            code: CMD_SUCCESS,
+            output: b"% Configuration failed.\n\nError type: validation\n".to_vec(),
+        };
+        assert!(r.ok() && r.commit_failed());
+        let fine = Reply {
+            code: CMD_SUCCESS,
+            output: Vec::new(),
+        };
+        assert!(!fine.commit_failed());
     }
 
     #[test]

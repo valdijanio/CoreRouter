@@ -230,7 +230,7 @@ impl Frr {
         let end = vty
             .run("XFRR_end_configuration")
             .map_err(|e| io_err(d, e))?;
-        if failed.is_none() && !end.ok() {
+        if failed.is_none() && (!end.ok() || end.commit_failed()) {
             failed = Some(format!(
                 "FRR {} refused the change at commit: {} ({})",
                 d.name(),
