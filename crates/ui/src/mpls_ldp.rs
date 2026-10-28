@@ -149,6 +149,8 @@ const MPLS_SETTINGS: &[(&str, &str, &str, Option<&str>)] = &[
     ("dynamic_label_range", "Dynamic Label Range", "mpls.range", Some("16-1048575")),
     ("propagate_ttl", "Propagate TTL", "mpls.propagate_ttl", None),
     ("payload_mtu", "Payload MTU", "mpls.payload_mtu", Some("1500")),
+    ("lsp_ping_responder", "LSP Ping Responder", "mpls.lsp_ping_responder", None),
+    ("lsp_ping_rate", "LSP Ping Rate", "mpls.lsp_ping_rate", Some("100 replies/s")),
 ];
 
 #[derive(Default)]
@@ -640,7 +642,7 @@ pub(crate) fn settings_steps(f: &BTreeMap<&'static str, String>, has: bool) -> V
                 set.insert((*p).into(), json!(v == "yes"));
             }
             (_, _) if v.is_empty() => {}
-            ("payload_mtu", _) => {
+            ("payload_mtu" | "lsp_ping_rate", _) => {
                 set.insert((*p).into(), v.parse::<u64>().map_or_else(|_| json!(v), |n| json!(n)));
             }
             _ => {
