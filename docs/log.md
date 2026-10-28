@@ -5831,3 +5831,54 @@ continuação indentadas).
   `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-daemon --test netns_bfd`
   (two daemons over a veth: up in 1.4 s, the link cut detected in 118 ms with the 150 ms
   detection time, **medido**). Load bench: `docs/bfd.md` ("Desempenho e paralelismo").
+
+- 2026-10-27 — G3.4: OSPF, parte 3 (janela, `docs/ospf.md`): Routing › OSPF deixou de ser um stub (`Win::Ospf` saiu de
+  `windows.rs`; a janela é o painel `crates/ui/src/ospf.rs`). Abas Neighbors (estado em selo "Full ·
+  DR", área em selo por hash, uptime, BFD, Diagnose com a seção da RFC), Instances, Areas, Interface
+  Templates e Key Chains (lista G0.24 com o modal alimentado pela prévia do engine:
+  `routing.ospf.instance.check`, `area.check`, `area.range.check`, `keychain.check`), LSDB
+  (paginada, por tipo), Routes ("Por que esse caminho?" ao selecionar uma rota) e Topology (o mapa
+  desenhado da LSDB, `ospf_topology.rs`: clique num roteador para ver o caminho, custo somado salto a
+  salto, selo `agrees` quando confere com a rota do daemon). ⓘ em português em toda aba, coluna e
+  campo; screenshots claro e escuro conferidos. A amostra do laboratório virtual ganhou um LSA do
+  nosso roteador por área. O campo `bfd` dos templates agora é conferido contra os perfis da G3.6
+  (`routing.bfd`) e deixou de ir ao FRR como `ip ospf bfd`: o BFD é nosso, não o `bfdd`; a ligação
+  sessão → adjacência é a G3.6b.
+
+  Como testar: `cargo test -p corerouter-ui ospf`; na GUI, Routing › OSPF depois dos exemplos de
+  `docs/ospf.md` (o laboratório virtual mostra a amostra, com a segunda interface em ExStart).
+
+- 2026-10-27 — G3.7: Simulador de rede, parte 1 (motor e comandos). O crate novo `crates/netsim` (L2, puro, compila
+  para wasm) roda OSPFv2 (RFC 2328: hellos/dead, router-LSA, inundação, MinLSInterval, SPF com o
+  throttle do FRR), BGP-4 (RFC 4271: OPEN/KEEPALIVE/UPDATE, hold, laço de AS, decisão na ordem do
+  FRR conferida contra `proto_bgp::decision`, chains de `/routing filter` pelo avaliador do
+  `proto-bgp`, RFC 8212) e BFD (RFC 5880, analítico) por eventos discretos num relógio virtual em
+  µs, determinístico (mesma semente, mesma execução, com qualquer número de threads). Os roteadores
+  avançam em paralelo dentro de janelas conservadoras (lookahead = menor latência de enlace), num
+  pool de threads persistente; no navegador, uma thread.
+
+  No engine, cada roteador virtual é um `Session` sobre o `VirtualHal`, configurado por comandos
+  (`engine::netsim`). Os comandos são `tool.netsim.*`:
+  - topologia: `new` (presets square/ring/mesh/star/grid até 500 roteadores), `node.add`,
+    `link.add`, `link.set`;
+  - execução: `node.run` (qualquer comando dentro de um roteador virtual), `clock` (play, pause,
+    step, ×1..×3600), `tick`, `advance` (com orçamento de eventos);
+  - falhas: `fault` (corte silencioso, perda de portadora, reparo, roteador fora/de volta,
+    latência, perda);
+  - leitura: `get` (com o selo "simulation — not the real network" e o resumo de convergência),
+    `timeline`, `node.get` (rotas, vizinhos OSPF, sessões e tabela BGP, LSDB);
+  - extras: `import` ("e se?" com a config deste roteador), `export`/`load` (o cenário com o
+    `expect` vira teste: `crates/engine/tests/netsim_scenarios.rs` roda `tests/netsim/*.json`).
+
+  Como testar:
+  - `cargo test -p corerouter-netsim`: convergência em anel, malha, estrela e grade; corte com e sem
+    BFD; perda de portadora; saída do upstream; roteador fora e de volta; RFC 8212; AS errado;
+    determinismo com 1/4/8 threads; orçamento; proptest da decisão;
+  - `cargo test -p corerouter-engine netsim`;
+  - pelo CLI: `corerouter-cli run tool.netsim.new '{}'`, `… run tool.netsim.advance '{"ms":60000}'`,
+    `… run tool.netsim.fault '{"kind":"link-cut","link":0}'`, `… run tool.netsim.advance '{"ms":5000}'`,
+    `… run tool.netsim.get` (campo `convergence`).
+
+  Corte silencioso R1–R2 no quadrado, com BFD: percebido em +0,79 s, OSPF reconvergiu em +0,80 s,
+  nenhum prefixo BGP perdido (**medido**, `a_cut_link_reconverges_with_bfd`). Sem BFD, o dead
+  interval decide em 30–40 s.
