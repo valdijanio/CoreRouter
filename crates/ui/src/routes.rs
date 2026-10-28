@@ -21,12 +21,15 @@ use serde_json::{Map, Value, json};
 use crate::avail::Avail;
 use crate::chip::{self, Kind, cell};
 use crate::dialog::{self, Buttons, Footer, Form, Head, Press, Status};
-use crate::i18n::{self, Lang, tr};
+use crate::help::{self, HelpView};
+use crate::i18n::{self, Lang, tr, tr_in};
 use crate::interfaces::{cascade, dialog_id, opt_text};
 use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment, num, weak};
 use crate::{CoreRouterUi, Then, Win, form_number, value_text};
 
 pub(crate) const TABLE: &str = "routes";
+/// Scope of this window's own catalogs (`i18n/auto/routes_*.rs`).
+const SCOPE: &str = "routes";
 /// Property windows opened at once from one selection.
 const MAX_OPEN: usize = 8;
 const MAIN: &str = "main";
@@ -37,7 +40,7 @@ const DETAIL_CHANGES: usize = 4;
 /// Key prefix of an ECMP group's own line.
 const GROUP: &str = "ecmp ";
 
-const COLUMNS: [table::Column; 8] = [
+const COLUMNS: [table::Column; 9] = [
     col("State"),
     col("Dst. Address"),
     col("Gateway"),
@@ -45,8 +48,66 @@ const COLUMNS: [table::Column; 8] = [
     col("Routing Table"),
     num("Changed"),
     weak("Reason"),
+    col("Check").help("routes.check_gateway"),
     comment(),
 ];
+
+/// What `check_gateway` takes (RouterOS `check-gateway`).
+const CHECK_METHODS: [&str; 4] = ["none", "ping", "arp", "bfd"];
+
+/// The check-gateway of a route, as `ip.route.list` shows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Check {
+    /// `ping` | `arp` | `bfd`.
+    pub method: String,
+    /// `checking` | `reachable` | `unreachable` | `not-checked`.
+    pub status: String,
+    pub misses: u64,
+    /// Hold-down left (flapping gateway), in seconds.
+    pub hold_secs: Option<u64>,
+    /// BFD profile of a `bfd` check.
+    pub profile: Option<String>,
+}
+
+impl Check {
+    fn of(c: &Value) -> Self {
+        let text = |k: &str| c.get(k).filter(|v| !v.is_null()).map(value_text);
+        // An older daemon sends only `state` (up | down).
+        let status = text("status").unwrap_or_else(|| {
+            match text("state").as_deref() {
+                Some("down") => "unreachable",
+                _ => "reachable",
+            }
+            .to_owned()
+        });
+        Self {
+            method: text("method").unwrap_or_default(),
+            status,
+            misses: c.get("misses").and_then(Value::as_u64).unwrap_or(0),
+            hold_secs: c.get("hold_down_secs").and_then(Value::as_u64),
+            profile: text("bfd_profile"),
+        }
+    }
+
+    /// The status chip: green reachable, red unreachable, amber checking.
+    pub(crate) fn chip(&self) -> (&'static str, Kind) {
+        match self.status.as_str() {
+            "reachable" => ("reachable", Kind::Green),
+            "unreachable" => ("unreachable", Kind::Red),
+            "checking" => ("checking", Kind::Amber),
+            _ => ("not-checked", Kind::Neutral),
+        }
+    }
+
+    /// The table cell: the method, then the status.
+    pub(crate) fn cell(&self) -> String {
+        let method = match &self.profile {
+            Some(p) if self.method == "bfd" => format!("bfd {p}"),
+            _ => self.method.clone(),
+        };
+        cell("", &[(&method, Kind::Neutral), self.chip()])
+    }
+}
 
 /// One row of `ip.route.list`, as the window needs it.
 #[derive(Clone, Default)]
@@ -62,8 +123,8 @@ pub(crate) struct Route {
     pub gateway_interface: Option<String>,
     /// `reachable` | `unreachable`; `None` for a connected route.
     pub gateway_status: Option<String>,
-    /// check-gateway: (method, `up` | `down`, misses).
-    pub check: Option<(String, String, u64)>,
+    /// check-gateway (G1.27f): method and status.
+    pub check: Option<Check>,
     pub distance: String,
     pub table: String,
     pub flags: String,
@@ -109,13 +170,7 @@ impl Route {
             )
         });
         let active = flag("active");
-        let check = row.get("check_gateway").filter(|v| v.is_object()).map(|c| {
-            (
-                c.get("method").map(value_text).unwrap_or_default(),
-                c.get("state").map(value_text).unwrap_or_default(),
-                c.get("misses").and_then(Value::as_u64).unwrap_or(0),
-            )
-        });
+        let check = row.get("check_gateway").filter(|v| v.is_object()).map(Check::of);
         let reason_args = row
             .get("reason_args")
             .and_then(Value::as_object)
@@ -220,14 +275,6 @@ impl Route {
         let mpls = self.mpls.as_ref().map(|l| format!("MPLS {}", l.trim_end_matches(" (pop)")));
         if let Some(m) = &mpls {
             chips.push((m, Kind::Blue));
-        }
-        let check;
-        if let Some((method, state, _)) = &self.check {
-            check = format!("check {method}");
-            chips.push((
-                &check,
-                if state == "down" { Kind::Red } else { Kind::Blue },
-            ));
         }
         cell(&text, &chips)
     }
@@ -445,6 +492,7 @@ fn group_row(key: &str, first: &Route, paths: usize, open: bool, lang: i18n::Lan
             age(first.changed_secs),
             String::new(),
             String::new(),
+            String::new(),
         ],
         dimmed: false,
         section: false,
@@ -468,6 +516,7 @@ fn bucket_row(r: &Route, routes: u64, lang: i18n::Langs) -> Row {
             format!("+ {}", tr(lang.labels, "open")),
             String::new(),
             cell("", &[(&r.table, Kind::Hashed(chip::name_hue(&r.table)))]),
+            String::new(),
             String::new(),
             String::new(),
             String::new(),
@@ -509,6 +558,7 @@ fn route_row(r: &Route, lang: i18n::Langs, path: bool) -> Row {
             cell("", &[(&r.table, Kind::Hashed(chip::name_hue(&r.table)))]),
             age(r.changed_secs),
             r.why(lang.help),
+            r.check.as_ref().map(Check::cell).unwrap_or_default(),
             r.comment.clone(),
         ],
         dimmed: r.disabled,
@@ -740,24 +790,7 @@ fn detail(ui: &mut Ui, d: Option<&Value>, langs: i18n::Langs) {
 
                     ui.label(tr(l, "Check gateway"));
                     match d.get("check_gateway").filter(|c| c.is_object()) {
-                        Some(c) => {
-                            ui.horizontal(|ui| {
-                                let s = |k: &str| c.get(k).map(value_text).unwrap_or_default();
-                                ui.label(format!(
-                                    "{}, every {} s, {} {}",
-                                    s("method"),
-                                    s("interval_secs"),
-                                    s("misses"),
-                                    tr(l, "misses")
-                                ));
-                                let up = s("state") == "up";
-                                let tone = if up { chip::GREEN.tone(&v) } else { chip::RED.tone(&v) };
-                                chip::chip(ui, &s("state"), tone);
-                                if let Some(secs) = c.get("down_secs").and_then(Value::as_u64).filter(|_| !up) {
-                                    ui.weak(format!("{} {}", tr(l, "down for"), age(Some(secs))));
-                                }
-                            });
-                        }
+                        Some(c) => check_detail(ui, c, l),
                         None => {
                             ui.weak(tr(l, "none"));
                         }
@@ -823,6 +856,42 @@ fn detail(ui: &mut Ui, d: Option<&Value>, langs: i18n::Langs) {
 }
 
 /// A filter chip: blue when on. Returns whether it was clicked.
+/// The check-gateway of the selected route (G1.27f): method and timing,
+/// the status chip, how long it is down or held, and the last transitions
+/// of its gateway.
+fn check_detail(ui: &mut Ui, c: &Value, l: Lang) {
+    let s = |k: &str| c.get(k).filter(|v| !v.is_null()).map(value_text).unwrap_or_default();
+    let check = Check::of(c);
+    let v = ui.visuals().clone();
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            let timing = if check.method == "bfd" {
+                format!("bfd, {} {}", tr_in(SCOPE, l, "profile"), check.profile.as_deref().unwrap_or("default"))
+            } else {
+                format!("{}, every {} s, {} {}", s("method"), s("interval_secs"), s("misses"), tr(l, "misses"))
+            };
+            ui.label(timing);
+            let (text, kind) = check.chip();
+            chip::chip(ui, tr_in(SCOPE, l, text), kind.tone(&v));
+            if let Some(secs) = c.get("down_secs").and_then(Value::as_u64).filter(|_| check.status == "unreachable") {
+                ui.weak(format!("{} {}", tr(l, "down for"), age(Some(secs))));
+            }
+            if let Some(h) = check.hold_secs {
+                ui.weak(format!("{} {}", tr_in(SCOPE, l, "held down for flapping, back in"), age(Some(h))));
+            }
+        });
+        let history = c.get("history").and_then(Value::as_array).cloned().unwrap_or_default();
+        for e in history.iter().rev().take(DETAIL_CHANGES) {
+            ui.horizontal(|ui| {
+                let down = e.get("to").and_then(Value::as_str) == Some("down");
+                let (text, kind) = if down { ("down", Kind::Red) } else { ("up", Kind::Green) };
+                chip::chip(ui, tr_in(SCOPE, l, text), kind.tone(&v));
+                ui.weak(e.get("message").map(value_text).unwrap_or_default());
+            });
+        }
+    });
+}
+
 fn filter_chip(ui: &mut Ui, text: &str, on: bool) -> bool {
     let tone = if on {
         chip::BLUE.tone(ui.visuals())
@@ -857,18 +926,23 @@ pub(crate) struct RouteForm {
     pub table: String,
     pub comment: String,
     pub disabled: bool,
+    /// `none` | `ping` | `arp` | `bfd` (G1.27f).
+    pub check_gateway: String,
+    /// BFD profile of `check_gateway = bfd`; empty: `default`.
+    pub bfd_profile: String,
 }
 
 impl RouteForm {
     /// A blank "New Route" form.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             table: MAIN.into(),
+            check_gateway: "none".into(),
             ..Self::default()
         }
     }
 
-    fn of(r: &Route) -> Self {
+    pub(crate) fn of(r: &Route) -> Self {
         Self {
             dst: r.dst.clone(),
             gateway: r.gateway.clone(),
@@ -876,22 +950,27 @@ impl RouteForm {
             table: r.table.clone(),
             comment: r.comment.clone(),
             disabled: r.disabled,
+            check_gateway: r.check.as_ref().map_or_else(|| "none".into(), |c| c.method.clone()),
+            bfd_profile: r.check.as_ref().and_then(|c| c.profile.clone()).filter(|p| p != "default").unwrap_or_default(),
         }
     }
 
     /// `ip.route.add` params; blank optional fields are left to the engine.
-    fn add_params(&self) -> Value {
+    pub(crate) fn add_params(&self) -> Value {
+        let bfd = self.check_gateway == "bfd";
         json!({
             "dst_address": self.dst.trim(),
             "gateway": self.gateway.trim(),
             "distance": form_number(&self.distance),
             "routing_table": opt_text(self.table.trim()),
+            "check_gateway": if self.check_gateway == "none" { Value::Null } else { opt_text(&self.check_gateway) },
+            "bfd_profile": if bfd { opt_text(self.bfd_profile.trim()) } else { Value::Null },
             "comment": opt_text(&self.comment),
         })
     }
 
     /// `ip.route.set` params for what differs from `base`; `None` if nothing.
-    fn set_params(&self, id: &str, base: &RouteForm) -> Option<Value> {
+    pub(crate) fn set_params(&self, id: &str, base: &RouteForm) -> Option<Value> {
         let mut p = Map::new();
         if self.dst.trim() != base.dst {
             p.insert("dst_address".into(), json!(self.dst.trim()));
@@ -910,6 +989,13 @@ impl RouteForm {
         }
         if self.disabled != base.disabled {
             p.insert("disabled".into(), json!(self.disabled));
+        }
+        if self.check_gateway != base.check_gateway {
+            p.insert("check_gateway".into(), json!(self.check_gateway));
+        }
+        // The engine drops the profile when the method leaves bfd.
+        if self.check_gateway == "bfd" && self.bfd_profile.trim() != base.bfd_profile {
+            p.insert("bfd_profile".into(), json!(self.bfd_profile.trim()));
         }
         if p.is_empty() {
             return None;
@@ -953,6 +1039,8 @@ pub(crate) struct RouteDialogWin {
     pub id: u64,
     pub dialog: RouteDialog,
     pub status: Status,
+    /// The explanation an ⓘ of the dialog opened.
+    pub help: Option<HelpView>,
 }
 
 /// What a dialog's command changes in the dialog when it succeeds.
@@ -1196,6 +1284,18 @@ impl CoreRouterUi {
                 }
             },
         );
+        // The ⓘ of a column (Check): its explanation, kept in egui's memory
+        // (the window's state lives in the app).
+        let help_id = egui::Id::unique("routes-column-help");
+        if let Some(key) = out.help {
+            let title = COLUMNS.iter().find(|c| c.help == key).map_or("", |c| c.title);
+            ui.ctx().data_mut(|d| d.insert_temp(help_id, Some(HelpView::new(key, title))));
+        }
+        let mut help: Option<HelpView> = ui.ctx().data(|d| d.get_temp(help_id)).flatten();
+        if help.is_some() {
+            help::modal(ui.ctx(), langs, &mut help);
+            ui.ctx().data_mut(|d| d.insert_temp(help_id, help));
+        }
         self.route_pager(ui);
         let c = self
             .route_view
@@ -1500,6 +1600,7 @@ impl CoreRouterUi {
             id: self.next_dialog,
             dialog,
             status: Status::default(),
+            help: None,
         });
     }
 
@@ -1558,10 +1659,12 @@ impl CoreRouterUi {
                 pos: cascade(area, d.id),
                 parent: Some(crate::win_id(Win::Routes)),
             };
+            let help = &mut d.help;
             let pressed =
                 dialog::show(&mut self.floats, ctx, area, head, &mut d.status, |ui, f| {
-                    dialog_body(ui, f, &mut d.dialog, &routes, &tables, &can)
+                    dialog_body(ui, f, &mut d.dialog, &routes, &tables, &can, help)
                 });
+            help::modal(ctx, self.lang, &mut d.help);
             let keep = pressed.is_none_or(|b| self.route_button(d, b, &routes));
             if !keep {
                 self.floats.forget(id);
@@ -1795,7 +1898,51 @@ fn dialog_title(d: &RouteDialog, routes: &[Route]) -> String {
     }
 }
 
-fn form_fields(ui: &mut Ui, f: &Form, r: &mut RouteForm, tables: &[String], with_disabled: bool) {
+/// An ⓘ that opens explanation `key` in the dialog.
+fn info(ui: &mut Ui, f: &Form, help: &mut Option<HelpView>, key: &'static str, title: &str) {
+    if help::info_button(ui, f.window().with(("help", key)), title).clicked() {
+        *help = Some(HelpView::new(key, title));
+    }
+}
+
+/// G1.27f: check-gateway as chips, and the BFD profile when it is bfd.
+fn check_fields(ui: &mut Ui, f: &Form, r: &mut RouteForm, help: &mut Option<HelpView>) {
+    ui.horizontal(|ui| {
+        ui.label("Check Gateway");
+        info(ui, f, help, "routes.check_gateway", "Check Gateway");
+    });
+    ui.horizontal(|ui| {
+        for m in CHECK_METHODS {
+            if filter_chip(ui, m, r.check_gateway == m) {
+                r.check_gateway = m.to_owned();
+            }
+        }
+    });
+    ui.end_row();
+    if r.check_gateway == "bfd" {
+        ui.horizontal(|ui| {
+            ui.label("BFD Profile");
+            info(ui, f, help, "routes.bfd_profile", "BFD Profile");
+        });
+        let resp = ui.add(
+            TextEdit::singleline(&mut r.bfd_profile)
+                .id(dialog::field_id(f.window(), "bfd_profile"))
+                .hint_text("default")
+                .desired_width(180.0),
+        );
+        resp.on_hover_text("default, fast or a profile of Routing › BFD");
+        ui.end_row();
+    }
+}
+
+fn form_fields(
+    ui: &mut Ui,
+    f: &Form,
+    r: &mut RouteForm,
+    tables: &[String],
+    with_disabled: bool,
+    help: &mut Option<HelpView>,
+) {
     f.text(ui, "Dst. Address", "dst_address", &mut r.dst, "0.0.0.0/0");
     f.text(
         ui,
@@ -1808,6 +1955,7 @@ fn form_fields(ui: &mut Ui, f: &Form, r: &mut RouteForm, tables: &[String], with
     ui.label("Routing Table");
     crate::windows::combo(ui, "route-table", MAIN, &mut r.table, tables);
     ui.end_row();
+    check_fields(ui, f, r, help);
     f.text(ui, "Comment", "comment", &mut r.comment, "");
     if with_disabled {
         ui.label("Disabled");
@@ -1833,6 +1981,7 @@ fn dialog_body(
     routes: &[Route],
     tables: &[String],
     can: &Avail,
+    help: &mut Option<HelpView>,
 ) -> Footer<Button> {
     let mut toggle_label = None;
     let mut view_only = false;
@@ -1841,9 +1990,9 @@ fn dialog_body(
         .num_columns(2)
         .spacing([12.0, 6.0])
         .show(ui, |ui| match &mut *d {
-            RouteDialog::New(form) => form_fields(ui, f, form, tables, false),
+            RouteDialog::New(form) => form_fields(ui, f, form, tables, false, help),
             RouteDialog::Props { id, form, .. } => {
-                form_fields(ui, f, form, tables, true);
+                form_fields(ui, f, form, tables, true, help);
                 if let Some(r) = routes.iter().find(|r| r.id.as_deref() == Some(id.as_str())) {
                     read_only(
                         ui,
