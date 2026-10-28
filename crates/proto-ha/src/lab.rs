@@ -561,7 +561,11 @@ impl Lab {
     /// the peer is alive, not silent (a simulated failure), and the path
     /// passes; a session expires `bfd_ms` after its last packet.
     fn bfd_step(&mut self, now: Millis) {
-        let talking: Vec<bool> = self.nodes.iter().map(|n| n.alive && !n.node.ha().silent()).collect();
+        let talking: Vec<bool> = self
+            .nodes
+            .iter()
+            .map(|n| n.alive && !n.node.ha().silent())
+            .collect();
         for i in 0..2 {
             for (p, path) in [Path::Sync, Path::Access].into_iter().enumerate() {
                 let Some(detect) = self.cfg.bfd_ms.get(p).copied().flatten() else {
@@ -570,7 +574,9 @@ impl Lab {
                 let link = if p == 0 { self.sync_up } else { self.access_up };
                 let blocked = self.bfd_blocked_until.get(p).is_some_and(|t| now < *t);
                 let passes = link && !blocked && talking.get(1 - i).copied().unwrap_or(false);
-                let Some(n) = self.nodes.get_mut(i) else { continue };
+                let Some(n) = self.nodes.get_mut(i) else {
+                    continue;
+                };
                 if !n.alive {
                     continue;
                 }
@@ -588,7 +594,9 @@ impl Lab {
                 }
                 if let Some(up) = change {
                     n.node.bfd(now, path, up, !up, detect);
-                    self.note(|| format!("node{i} bfd {path:?} {}", if up { "up" } else { "down" }));
+                    self.note(|| {
+                        format!("node{i} bfd {path:?} {}", if up { "up" } else { "down" })
+                    });
                     self.drain(i);
                 }
             }

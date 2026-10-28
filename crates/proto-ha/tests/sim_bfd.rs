@@ -31,16 +31,28 @@ fn bfd_on_both_paths_takes_over_in_about_the_detection_time() {
     l.kill(0);
     let t = l.run_until(5_000, |l| l.active() == Some(1)).unwrap();
     // Detection, one witness round trip (2 × latency), steps of 5 ms.
-    assert!(t <= DETECT + 4 * l.cfg.latency_ms + 3 * l.cfg.step_ms, "takeover in {t} ms");
+    assert!(
+        t <= DETECT + 4 * l.cfg.latency_ms + 3 * l.cfg.step_ms,
+        "takeover in {t} ms"
+    );
     assert_eq!(l.lost(&before, 1), 0, "every session kept");
     let tr = *l.nodes[1].transitions.last().unwrap();
-    assert_eq!((tr.to, tr.reason, tr.stateful), (Role::Active, Reason::PeerDead, true));
+    assert_eq!(
+        (tr.to, tr.reason, tr.stateful),
+        (Role::Active, Reason::PeerDead, true)
+    );
     let d = tr.detection.unwrap();
     assert_eq!(d.bfd, [true, true], "found by BFD on both paths");
-    assert!(d.witness_at.unwrap() >= d.detected, "a fresh witness answer: {d:?}");
+    assert!(
+        d.witness_at.unwrap() >= d.detected,
+        "a fresh witness answer: {d:?}"
+    );
     assert!(d.last_heard <= d.detected && tr.at >= d.detected);
     assert_eq!(l.nodes[1].probes, 1, "one probe");
-    eprintln!("BFD {DETECT} ms: takeover {t} ms after the kill, 0 of {} lost, {d:?}", before.len());
+    eprintln!(
+        "BFD {DETECT} ms: takeover {t} ms after the kill, 0 of {} lost, {d:?}",
+        before.len()
+    );
     assert_eq!(l.watch.split_brain_ms, 0);
 }
 
@@ -85,7 +97,10 @@ fn bfd_lost_on_one_path_while_the_peer_lives_changes_nothing() {
     let b = l.node(1).unwrap().ha().status(l.now).bfd[0];
     // A false alarm costs two penalties: the next loss damps the path's
     // BFD (hellos only).
-    assert!(b.losses >= 5 && b.false_alarms == 1 && b.suppressed, "{b:?}");
+    assert!(
+        b.losses >= 5 && b.false_alarms == 1 && b.suppressed,
+        "{b:?}"
+    );
 }
 
 #[test]
@@ -104,7 +119,10 @@ fn a_flapping_link_is_damped_after_its_first_false_alarm() {
         }
         assert!(l.active().is_some());
     }
-    assert!(takeovers <= 1, "{takeovers} takeovers: damped after the first false alarm");
+    assert!(
+        takeovers <= 1,
+        "{takeovers} takeovers: damped after the first false alarm"
+    );
     let s = l.node(1).unwrap().ha().status(l.now);
     assert!(s.bfd.iter().all(|b| b.suppressed), "{:?}", s.bfd);
     // Quiet: the penalty decays below reuse and BFD counts again.
@@ -197,7 +215,12 @@ fn random_faults_with_bfd_never_put_two_actives_on_the_same_subscribers() {
                 l.step();
             }
             let tail = l.log.len().saturating_sub(30);
-            assert_eq!(l.watch.split_brain_ms, 0, "seed {seed}:\n{}", l.log[tail..].join("\n"));
+            assert_eq!(
+                l.watch.split_brain_ms,
+                0,
+                "seed {seed}:\n{}",
+                l.log[tail..].join("\n")
+            );
         }
         for i in 0..2 {
             if !l.nodes[i].alive {
@@ -209,7 +232,11 @@ fn random_faults_with_bfd_never_put_two_actives_on_the_same_subscribers() {
         l.bfd_blocked_until = [0, 0];
         l.heal_sync();
         l.heal_access();
-        assert!(l.run_until(60_000, Lab::in_sync).is_some(), "seed {seed}: roles {:?}", l.roles());
+        assert!(
+            l.run_until(60_000, Lab::in_sync).is_some(),
+            "seed {seed}: roles {:?}",
+            l.roles()
+        );
         assert_eq!(l.watch.split_brain_ms, 0, "seed {seed}");
         eprintln!("seed {seed}: {:?}", l.watch);
     }

@@ -133,7 +133,12 @@ fn bfd_takes_over_in_a_fraction_of_the_dead_interval() {
     let pid = b.to_string();
     ip(Some(b), &["link", "set", "lo", "up"]);
     for name in ["sync0", "acc0"] {
-        ip(None, &["link", "add", name, "type", "veth", "peer", "name", name, "netns", &pid]);
+        ip(
+            None,
+            &[
+                "link", "add", name, "type", "veth", "peer", "name", name, "netns", &pid,
+            ],
+        );
         ip(None, &["link", "set", name, "up"]);
         ip(Some(b), &["link", "set", name, "up"]);
     }
@@ -152,9 +157,13 @@ fn bfd_takes_over_in_a_fraction_of_the_dead_interval() {
     let mut b_daemon = Some(daemon(Some(b), &dir_b, "g36h-ha-b.log"));
     pair(None, "10.9.0.2", "10.8.0.2", 200);
     pair(Some(b), "10.9.0.1", "10.8.0.1", 100);
-    let t = until("A active, B standby", 30, || role(None) == "active" && role(Some(b)) == "standby");
+    let t = until("A active, B standby", 30, || {
+        role(None) == "active" && role(Some(b)) == "standby"
+    });
     eprintln!("pair formed in {t:?}");
-    let t = until("BFD up on both paths of both nodes", 20, || bfd_up(None) && bfd_up(Some(b)));
+    let t = until("BFD up on both paths of both nodes", 20, || {
+        bfd_up(None) && bfd_up(Some(b))
+    });
     eprintln!("BFD up in {t:?}");
     let g = ok(None, "ppp.redundancy.get", json!({}));
     assert_eq!(g["detection_ms"], 150, "{g}");
@@ -164,9 +173,17 @@ fn bfd_takes_over_in_a_fraction_of_the_dead_interval() {
     assert_eq!(c["state"], "checked", "{c}");
     until("every check passes", 20, || {
         let c = ok(None, "ppp.redundancy.test-takeover", json!({}));
-        c["checks"].as_array().unwrap().iter().all(|x| x["ok"] == true)
+        c["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|x| x["ok"] == true)
     });
-    let r = ok(None, "ppp.redundancy.test-takeover", json!({"confirm": "takeover", "seconds": 5}));
+    let r = ok(
+        None,
+        "ppp.redundancy.test-takeover",
+        json!({"confirm": "takeover", "seconds": 5}),
+    );
     assert_eq!(r["state"], "running", "{r}");
     until("B active after the test", 10, || role(Some(b)) == "active");
     let k = monitor(Some(b))["takeovers"][0].clone();
@@ -175,7 +192,9 @@ fn bfd_takes_over_in_a_fraction_of_the_dead_interval() {
     assert_eq!(k["lost"], 0, "{k}");
     until("A standby again", 30, || role(None) == "standby");
     let t = until("A reads the result from B", 20, || {
-        monitor(None)["test"]["state"].as_str().is_some_and(|s| s != "running")
+        monitor(None)["test"]["state"]
+            .as_str()
+            .is_some_and(|s| s != "running")
     });
     let m = monitor(None);
     eprintln!("test result on A after {t:?}: {}", m["test"]);
@@ -191,8 +210,14 @@ fn bfd_takes_over_in_a_fraction_of_the_dead_interval() {
     eprintln!("kill of the active: A active within {wall:?} (polled every 50 ms); timeline {k}");
     assert!(k["detected_by"].as_str().unwrap().starts_with("bfd"), "{k}");
     let active_ms = k["active_ms"].as_u64().unwrap();
-    assert!(active_ms < 400, "takeover {active_ms} ms after the last sign of life: {k}");
-    assert!(wall < Duration::from_millis(1100), "faster than the dead interval: {wall:?}");
+    assert!(
+        active_ms < 400,
+        "takeover {active_ms} ms after the last sign of life: {k}"
+    );
+    assert!(
+        wall < Duration::from_millis(1100),
+        "faster than the dead interval: {wall:?}"
+    );
     let h = monitor(None)["history"][0].clone();
     assert_eq!(h["reason"], "peer-dead", "{h}");
 }

@@ -272,7 +272,8 @@ impl PathBfd {
         self.penalty_at = self.penalty_at.max(now);
         // RFC 2439 §4.2: never more than what decays to `reuse` in
         // `max_suppress`.
-        let ceil = f64::from(d.reuse) * 2f64.powf(d.max_suppress_ms as f64 / d.half_life_ms.max(1) as f64);
+        let ceil =
+            f64::from(d.reuse) * 2f64.powf(d.max_suppress_ms as f64 / d.half_life_ms.max(1) as f64);
         self.penalty = self.penalty.min(ceil);
         if self.suppressed_since.is_some_and(|t| {
             self.penalty < f64::from(d.reuse) || now.saturating_sub(t) >= d.max_suppress_ms
@@ -823,7 +824,13 @@ impl Ha {
         match (peer, &mut self.silent_since) {
             (Some(_), s) => *s = None,
             (None, s @ None) => {
-                let hello = self.heard.iter().flatten().map(|(at, _)| *at).max().unwrap_or(0);
+                let hello = self
+                    .heard
+                    .iter()
+                    .flatten()
+                    .map(|(at, _)| *at)
+                    .max()
+                    .unwrap_or(0);
                 // BFD's last packet is closer to the failure than the
                 // last hello (one every `hello_ms`).
                 let bfd_rx = [Path::Sync, Path::Access]
@@ -893,7 +900,8 @@ impl Ha {
                     }
                 }
                 Role::Fenced => {
-                    let confirmed = !(fast.iter().any(|f| *f) && self.cfg.witness) || self.fresh_witness();
+                    let confirmed =
+                        !(fast.iter().any(|f| *f) && self.cfg.witness) || self.fresh_witness();
                     if may_take && confirmed && self.stable(now) {
                         self.set(now, Role::Active, Reason::PeerDead);
                     }
@@ -1310,7 +1318,11 @@ mod tests {
         assert_eq!(a.role(), Role::Standby);
         a.bfd(165, Path::Access, false, true, 150);
         a.tick(175);
-        assert_eq!(a.role(), Role::Standby, "the witness answer is older than the detection");
+        assert_eq!(
+            a.role(),
+            Role::Standby,
+            "the witness answer is older than the detection"
+        );
         assert!(a.wants_witness_probe() && a.status(175).confirming);
         a.witness_answer(178, 178);
         assert_eq!(a.role(), Role::Active);
@@ -1323,7 +1335,10 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        assert_eq!((d.last_heard, d.detected, d.bfd, d.witness_at), (15, 165, [true, true], Some(178)));
+        assert_eq!(
+            (d.last_heard, d.detected, d.bfd, d.witness_at),
+            (15, 165, [true, true], Some(178))
+        );
     }
 
     #[test]
@@ -1337,7 +1352,10 @@ mod tests {
         a.peer_heard(300, Path::Sync, view(2, Role::Active, 7));
         let s = a.status(300);
         assert!(s.peer.is_some() && s.paths[0]);
-        assert_eq!((s.bfd[0].losses, s.bfd[0].false_alarms, s.bfd[0].penalty), (1, 1, 1989));
+        assert_eq!(
+            (s.bfd[0].losses, s.bfd[0].false_alarms, s.bfd[0].penalty),
+            (1, 1, 1989)
+        );
     }
 
     #[test]

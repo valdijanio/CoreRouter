@@ -329,7 +329,7 @@ fn test_takeover(s: &mut Session, p: &Value) -> Result<Value> {
     let secs = bounded(p, "seconds", 5, 600)?.unwrap_or(15);
     let run = match opt_str(p, "confirm")? {
         None => false,
-        Some(c) if c == "takeover" => true,
+        Some("takeover") => true,
         Some(_) => return Err(EngineError::bad("confirm", "type takeover to run it (this node stops serving)")),
     };
     let force = opt_bool(p, "force")?.unwrap_or(false);

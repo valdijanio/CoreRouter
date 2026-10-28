@@ -379,7 +379,9 @@ fn single() -> bool {
 
 /// `BNG_LAB_HA_BFD`: the pair's BFD profile (G3.6h).
 fn bfd_profile() -> Option<String> {
-    std::env::var("BNG_LAB_HA_BFD").ok().filter(|v| !v.is_empty())
+    std::env::var("BNG_LAB_HA_BFD")
+        .ok()
+        .filter(|v| !v.is_empty())
 }
 
 fn configure(ns: Option<u32>, uplink: &str, peer: &str, priority: u32, ports: usize, r: &Radius) {
@@ -464,8 +466,16 @@ fn configure(ns: Option<u32>, uplink: &str, peer: &str, priority: u32, ports: us
     });
     if let Some(prof) = bfd_profile() {
         // The access path's BFD over acc0 (A .1, C .2).
-        let (me, other) = if priority == 200 { ("10.7.0.1", "10.7.0.2") } else { ("10.7.0.2", "10.7.0.1") };
-        ok(ns, "ip.address.add", json!({"address": format!("{me}/24"), "interface": "acc0"}));
+        let (me, other) = if priority == 200 {
+            ("10.7.0.1", "10.7.0.2")
+        } else {
+            ("10.7.0.2", "10.7.0.1")
+        };
+        ok(
+            ns,
+            "ip.address.add",
+            json!({"address": format!("{me}/24"), "interface": "acc0"}),
+        );
         p["bfd"] = json!(prof);
         p["access_bfd"] = json!(prof);
         p["access_peer"] = json!(other);
