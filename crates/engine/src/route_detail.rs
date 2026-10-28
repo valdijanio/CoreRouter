@@ -322,6 +322,9 @@ impl Session {
         let running = self.store().running().clone();
         let cfg = self.effective(&running).into_owned();
         let Some(entry) = cfg.ip.routes.iter().find(|r| r.id == entry).cloned() else {
+            if running.ip.routes.iter().any(|r| r.id == entry && self.static_withholds(r)) {
+                return kernel_note("out of the kernel while its gateway fails check-gateway");
+            }
             return kernel_note("not applied yet (pending in the transaction)");
         };
         match self.hal_mut().snapshot(&cfg) {

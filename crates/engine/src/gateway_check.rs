@@ -766,14 +766,13 @@ impl Session {
     ) -> (Vec<(ItemId, RouteCheck)>, Withheld) {
         let mut checks = Vec::new();
         let mut withheld = Vec::new();
-        let Some(c) = self.ext::<StaticChecks>() else {
-            return (checks, withheld);
-        };
+        let c = self.ext::<StaticChecks>();
+        let running = c.is_some_and(|c| c.running);
         let now = self.dhcp.now_ms.unwrap_or(0);
         for r in cfg.ip.routes.iter() {
             let Some(t) = target_of(r) else { continue };
-            let h = c.health.get(&t);
-            let check = route_check(&t, h, c.running, now);
+            let h = c.and_then(|c| c.health.get(&t));
+            let check = route_check(&t, h, running, now);
             if h.is_some_and(|h| h.down) {
                 let why = match t.method {
                     CheckGateway::Bfd => format!("BFD session to gateway {} is down", t.text()),
@@ -944,7 +943,7 @@ mod tests {
                 per_slice[(now / 100) as usize] += 1;
                 assert_eq!(s.echo(d.target.gateway, d.seq), Some(d.target));
             }
-            now += 100;
+            now += 1;
         }
         assert_eq!(per_slice.iter().sum::<u32>(), 1000);
         assert!(per_slice.iter().all(|n| *n < 40), "{per_slice:?}");
@@ -952,10 +951,10 @@ mod tests {
         let mut again = 0;
         while now < 20_000 {
             again += s.due(now).len();
-            now += 100;
+            now += 1;
         }
         assert_eq!(again, 1000);
-        assert!(s.late_ms_max < 100);
+        assert_eq!(s.late_ms_max, 0);
     }
 
     #[test]

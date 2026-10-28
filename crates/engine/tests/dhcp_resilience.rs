@@ -412,7 +412,12 @@ fn resilience_settings_are_validated() {
     l.fails(
         "ip.dhcp-client.add",
         json!({"interface": "ether1", "check_gateway": "bfd"}),
-        "expected none, arp or ping",
+        "arp or ping (bfd is for static routes)",
+    );
+    l.fails(
+        "ip.dhcp-client.add",
+        json!({"interface": "ether1", "check_gateway": "icmp"}),
+        "expected none, arp, ping or bfd",
     );
     for bad in [
         "10.0.0.0/24",
