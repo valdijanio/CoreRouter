@@ -43,6 +43,14 @@ pub fn frr_args(daemon: &str) -> Vec<String> {
     if daemon == "zebra" {
         a.extend(["-s".to_owned(), "90000000".to_owned()]);
     }
+    // G3.6b: CoreRouter's BFD engine is bfdd's data plane (the daemon
+    // connects to this socket; bfdd then opens no BFD socket of its own).
+    if daemon == "bfdd" {
+        a.extend([
+            "--dplaneaddr".to_owned(),
+            format!("unix:{FRR_DIR}/bfdd_dplane.sock"),
+        ]);
+    }
     a
 }
 
@@ -434,6 +442,11 @@ mod tests {
             "-P 0 --log stdout --log-level notifications -s 90000000"
         );
         assert!(!frr_args("bgpd").contains(&"-s".to_owned()));
+        assert!(
+            frr_args("bfdd")
+                .join(" ")
+                .ends_with("--dplaneaddr unix:/var/run/frr/bfdd_dplane.sock")
+        );
         assert_eq!(FRR_DAEMONS.first(), Some(&"mgmtd"));
     }
 

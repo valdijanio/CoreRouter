@@ -151,6 +151,17 @@ impl BfdProfile {
     }
 }
 
+/// A profile name as FRR's `bfd profile` and OSPF's template take it.
+pub fn check_profile_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty()
+        || name.len() > 48
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Err("a BFD profile name: 1..=48 of [A-Za-z0-9_.-]");
+    }
+    Ok(())
+}
+
 /// The built-in profiles: conservative (300 ms × 3, 900 ms) and fast
 /// (50 ms × 3, 150 ms; RFC 7419 common interval).
 pub fn builtin_profiles() -> [BfdProfile; 2] {

@@ -96,6 +96,11 @@ pub const UNITS: &[Unit] = &[
         run: corerouter_proto_ospf::validate,
     },
     Unit {
+        name: "bfd",
+        reads: small_and(Sections::NONE),
+        run: corerouter_proto_bfd::frr::validate,
+    },
+    Unit {
         name: "mpls",
         reads: small_and(Sections::NONE),
         run: corerouter_proto_mpls::validate,

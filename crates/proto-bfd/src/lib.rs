@@ -8,6 +8,8 @@
 //! - [`auth`]: Keyed SHA1 and Meticulous Keyed SHA1 (§6.7.4, erratum 7083).
 //! - [`session`]: the state machine, timers, Poll/Final, jitter (§6.8).
 //! - [`dampen`]: flap dampening for the clients (RFC 5882 §3.2).
+//! - [`dplane`]: FRR's distributed data plane protocol (`bfdd --dplaneaddr`);
+//!   [`frr`]: the `bfd` block of FRR's config (profiles and peers).
 //! - [`wheel`]: the timer wheel of one engine thread; [`hist`]: per-session
 //!   timing percentiles.
 //!
@@ -18,6 +20,8 @@
 
 pub mod auth;
 pub mod dampen;
+pub mod dplane;
+pub mod frr;
 pub mod hist;
 pub mod packet;
 pub mod session;

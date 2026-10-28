@@ -9,11 +9,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# The profiles and peers (`frr`): L0.
+corerouter-model.workspace = true
 thiserror.workspace = true
 # Keyed SHA1 / Meticulous Keyed SHA1 (RFC 5880 §6.7.4), as proto-radius.
 sha1.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 criterion.workspace = true
 proptest.workspace = true
 

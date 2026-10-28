@@ -7,7 +7,7 @@ BFD e esses protocolos é a parte (b) do G3.6.
 | Parte | O quê | Estado |
 |---|---|---|
 | G3.6a | Codec, máquina de estados, autenticação SHA1, dampening, motor multithread, perfis, peers, sessões, histórico | este documento |
-| G3.6b | Ligação com o FRR (BGP/OSPF caem com o BFD), BFD em conexões BGP, interface-templates OSPF, `check-gateway=bfd`, par BNG, BFD automático | aberto |
+| G3.6b | Ligação com o FRR (BGP/OSPF caem com o BFD) como data plane do `bfdd`, BFD nas conexões e templates BGP, `routing.bfd.attach` | ver "Ligação com o FRR" |
 | G3.6c | Janela Routing › BFD (Sessions, Profiles, History) | aberto |
 
 ## Como usar
@@ -91,6 +91,46 @@ corerouter-cli run routing.bfd.profile.list
   é 1024), e os receptores separam por discriminador e endereço, não pela porta.
 - **Espera em µs (`ppoll`)**: com o `poll` em milissegundos cada pacote saía até 1 ms atrasado.
 - O motor só abre as portas com a primeira sessão e fecha com a última.
+
+## Ligação com o FRR (G3.6b)
+
+**Decisão: o nosso motor é o *distributed data plane* do `bfdd`** (opção (a) do plano), não
+derrubar vizinhos pelo vty (opção (b)).
+
+- **Como funciona.** O init sobe o `bfdd` com `--dplaneaddr unix:/var/run/frr/bfdd_dplane.sock`;
+  o serviço `bfd` do daemon (com `--frr`) conecta como cliente (de novo a cada segundo enquanto não
+  consegue). O `bfdd` então não abre socket BFD nenhum (`bfd_vrf_start_sockets` sai cedo no FRR
+  10.7.1) e entrega cada sessão que cria — `neighbor … bfd profile` do BGP, `ip ospf bfd profile`
+  do OSPF, os `peer` do bloco `bfd` — por `DP_ADD_SESSION`, com o discriminador escolhido por ele
+  (o motor a põe na thread `discriminador mod N`, a mesma regra). O motor manda e recebe os pacotes
+  e devolve `BFD_STATE_CHANGE`; o `bfdd` avisa `bgpd`/`ospfd`, que derrubam a sessão. Também
+  respondemos `DP_REQUEST_SESSION_COUNTERS` (pacotes; bytes estimados em 24 ou 52 por pacote) e
+  `ECHO_REQUEST`.
+- **O que o render manda ao FRR** (`proto_bfd::frr::render`, contexto `bfd` do `bfdd`, só quando
+  alguém usa BFD): todos os perfis em vigor (`detect-multiplier`, `receive-interval`,
+  `transmit-interval`, `passive-mode`, `minimum-ttl`) e os peers de `routing.bfd.peer`. O BGP ganha
+  `bfd` (perfil) nos parâmetros de conexão e de template (`neighbor X bfd profile P`); o OSPF já
+  tinha o `bfd` do interface-template (G3.4). Um perfil citado que não existe é recusado no commit.
+- **O que o `bfddp` não leva e o motor põe:** autenticação (no FRR 10.7.1 ela é um TODO no
+  protocolo), dampening e TTL mínimo vêm do nosso perfil, achado pela sessão: o peer, a conexão BGP
+  com aquele endereço, o template OSPF daquela interface; sem ninguém (sessão digitada à mão no
+  FRR), o perfil de mesmos timers.
+- **Dampening para os clientes:** enquanto a sessão está "dampened" o `bfdd` ouve Down, mesmo com
+  o BFD em Up.
+- **Por que não (b):** `clear bgp neighbor` não segura o vizinho caído (o TCP volta se o caminho
+  só perdeu um sentido); segurar exigiria `neighbor shutdown` na config pelo vty a cada queda e o
+  inverso a cada subida, uma escrita de config por evento, sem cobrir OSPF. A latência de (a) é uma
+  mensagem num socket Unix mais o aviso do `bfdd` ao `bgpd` por zapi, abaixo de 1 ms (**estimado**;
+  o teste com o `bfdd` real na VM mede). O teste `data_plane_for_a_fake_bfdd` (um `bfdd` falso num
+  socket Unix e um segundo motor como vizinho) mede o nosso lado: Up entregue, contadores, e Down
+  com Diag 1 em ≤ 250 ms do fim do vizinho, com detecção de 150 ms (**medido**).
+- **Sem FRR** (laboratório virtual, `--bfd-dplane off`): o motor roda sozinho os peers de
+  `routing.bfd.peer`, como na G3.6a.
+- **BFD com um clique:** `routing.bfd.attach {protocols?: [bgp, ospf], profile?}` põe o perfil em
+  toda conexão BGP e interface-template OSPF sem perfil (próprio ou herdado).
+
+Ficou para depois (gaps): `check_gateway=bfd` nas rotas estáticas (G3.6g, depende da G1.27f, que
+cria a retirada de rota estática do kernel) e BFD no link de sync do par BNG (G3.6h).
 
 ## Desempenho e paralelismo
 
