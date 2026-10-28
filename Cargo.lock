@@ -1506,6 +1506,8 @@ version = "0.1.0"
 dependencies = [
  "corerouter-hal",
  "corerouter-model",
+ "criterion",
+ "ipnet",
  "serde",
  "serde_json",
 ]

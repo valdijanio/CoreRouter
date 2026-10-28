@@ -31,6 +31,8 @@ pub struct KernelLabels {
     pub service: bool,
     /// Session clock until which the service should keep reading.
     pub wanted_until: u64,
+    /// The service's lines of `routes` (built on its thread).
+    pub lines: Option<Arc<corerouter_proto_mpls::Lines>>,
 }
 
 /// LDP as the routing service last read it.
@@ -147,4 +149,83 @@ pub fn annotate_routes(s: &Session, rows: &mut [serde_json::Value]) {
             o.insert("mpls_out".into(), serde_json::json!(out));
         }
     }
+}
+
+/// The forwarding table's lines (`corerouter_proto_mpls::Lines`):
+/// building them for 100 000 labels takes ~22 ms (**medido**,
+/// `benches/forwarding.rs`), so they are built once per input.
+/// - With the `mpls` service, it builds them on its thread after each read
+///   ([`build_lines`], off the lock) and the page uses them as they are
+///   (at most one tick old: the view is a 2 s sample anyway).
+/// - Without it (the lab), here, kept while the inputs stay the same; the
+///   cache holds the inputs it was built from, so a new table is never
+///   taken for the old one.
+#[derive(Default)]
+struct LinesCache {
+    kernel: Option<Arc<Vec<MplsRoute>>>,
+    ldp: Option<Arc<LdpState>>,
+    revision: u32,
+    lines: Arc<corerouter_proto_mpls::Lines>,
+}
+
+/// What [`build_lines`] needs, copied under the lock (pointers and the
+/// copy-on-write config).
+pub struct LineInputs {
+    cfg: corerouter_model::Config,
+    ldp: Option<Arc<LdpState>>,
+}
+
+pub fn line_inputs(s: &Session) -> LineInputs {
+    LineInputs {
+        cfg: s.store().running().clone(),
+        ldp: s.ext::<LdpStatus>().and_then(|l| l.state.clone()),
+    }
+}
+
+/// The lines for `kernel` (no lock needed).
+pub fn build_lines(i: &LineInputs, kernel: &[MplsRoute]) -> corerouter_proto_mpls::Lines {
+    let mtu_of = |name: &str| -> Option<u32> {
+        let n: corerouter_model::IfName = name.parse().ok()?;
+        i.cfg.interfaces.get(&n).map(|x| u32::from(x.mtu))
+    };
+    corerouter_proto_mpls::lines(&i.cfg.routing.mpls, i.ldp.as_deref(), kernel, &mtu_of)
+}
+
+/// The service's read with its lines.
+pub fn set_kernel_lines(s: &mut Session, routes: Vec<MplsRoute>, lines: corerouter_proto_mpls::Lines) {
+    let now = s.hal_now();
+    if let Some(k) = s.ext_mut::<KernelLabels>() {
+        k.routes = Arc::new(routes);
+        k.lines = Some(Arc::new(lines));
+        k.error = None;
+        k.updated = now;
+    }
+}
+
+/// The lines for a page (see [`LinesCache`]).
+pub fn lines(s: &mut Session, kernel: &Arc<Vec<MplsRoute>>) -> Arc<corerouter_proto_mpls::Lines> {
+    if let Some(l) = s.ext::<KernelLabels>().filter(|k| k.service).and_then(|k| k.lines.clone()) {
+        return l;
+    }
+    let ldp = s.ext::<LdpStatus>().and_then(|l| l.state.clone());
+    let revision = s.store().current_revision();
+    if let Some(c) = s.ext::<LinesCache>()
+        && c.kernel.as_ref().is_some_and(|k| Arc::ptr_eq(k, kernel))
+        && match (&c.ldp, &ldp) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        }
+        && c.revision == revision
+    {
+        return c.lines.clone();
+    }
+    let lines = Arc::new(build_lines(&line_inputs(s), kernel));
+    if let Some(c) = s.ext_mut::<LinesCache>() {
+        c.kernel = Some(kernel.clone());
+        c.ldp = ldp;
+        c.revision = revision;
+        c.lines = lines.clone();
+    }
+    lines
 }

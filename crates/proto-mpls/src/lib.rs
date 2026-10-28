@@ -5,7 +5,6 @@
 //! Contract shared by every `proto-*` crate: `validate` inspects the
 //! candidate and returns issues; the engine refuses to commit while any exist.
 
-use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::net::IpAddr;
 
@@ -261,7 +260,7 @@ pub struct FecRow {
     pub interface: Option<String>,
     pub peer: Option<String>,
     /// `ldp`, `static`, `bgp`, `other`.
-    pub origin: String,
+    pub origin: &'static str,
     /// Installed in the kernel's label table.
     pub installed: bool,
     /// RFC 5443 on the way out: `achieved`, `waiting`, or `None` (no IGP
@@ -325,7 +324,19 @@ pub fn forwarding_rows(
     kernel: &[MplsRoute],
     mtu_of: &dyn Fn(&str) -> Option<u32>,
 ) -> Vec<FecRow> {
-    let by_label: BTreeMap<u32, &MplsRoute> = kernel.iter().map(|r| (r.label, r)).collect();
+    // The readers hand the table sorted by label: a binary search per FEC,
+    // no map (a 100 k-entry map was a third of the time, **medido**).
+    let sorted = kernel.windows(2).all(|w| w.first().map(|a| a.label) < w.get(1).map(|b| b.label));
+    let owned: Vec<&MplsRoute>;
+    let by_label: Vec<&MplsRoute> = if sorted {
+        kernel.iter().collect()
+    } else {
+        let mut v: Vec<&MplsRoute> = kernel.iter().collect();
+        v.sort_by_key(|r| r.label);
+        owned = v;
+        owned
+    };
+    let find = |l: u32| by_label.binary_search_by_key(&l, |r| r.label).ok().and_then(|i| by_label.get(i).copied());
     let payload = mpls.settings.payload_mtu;
     let sync_of = |ifname: &Option<String>| -> Option<String> {
         let st = state?;
@@ -337,12 +348,12 @@ pub fn forwarding_rows(
     let mtu_note = |ifname: &Option<String>, labels: usize| -> Option<String> {
         mtu_warning(payload, labels, mtu_of(ifname.as_deref()?)?)
     };
-    let mut rows = Vec::new();
-    let mut used = std::collections::BTreeSet::new();
+    let mut rows = Vec::with_capacity(kernel.len() + state.map_or(0, |s| s.bindings.len()));
+    let mut used = std::collections::HashSet::with_capacity(state.map_or(0, |s| s.bindings.len()));
     if let Some(st) = state {
         for b in &st.bindings {
             let local = b.local_label.filter(|l| *l >= FIRST_UNRESERVED);
-            let k = local.and_then(|l| by_label.get(&l).copied());
+            let k = local.and_then(find);
             if let Some(l) = local {
                 used.insert(l);
             }
@@ -373,7 +384,7 @@ pub fn forwarding_rows(
                 mtu: if has_out { mtu_note(&interface, out_labels.len()) } else { None },
                 interface,
                 peer: remote.map(|r| r.neighbor.to_string()),
-                origin: "ldp".into(),
+                origin: "ldp",
                 installed: k.is_some(),
                 reason,
             });
@@ -392,13 +403,85 @@ pub fn forwarding_rows(
                 mtu: mtu_note(&interface, nh.out_labels.len()),
                 interface,
                 peer: None,
-                origin: r.origin.name().into(),
+                origin: r.origin.name(),
                 installed: true,
                 reason: None,
             });
         }
     }
     rows
+}
+
+/// The forwarding table ready to page: the lines, their counts and each
+/// line's search text (lowercase FEC, labels, next hop, interface), built
+/// once per read of the table so a page and a search allocate nothing per
+/// line (a search that formatted each line took 25 ms for 100 k,
+/// **medido**).
+#[derive(Debug, Default)]
+pub struct Lines {
+    pub rows: Vec<FecRow>,
+    pub hay: Vec<String>,
+    pub counts: Counts,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Counts {
+    pub rows: usize,
+    pub fecs: usize,
+    pub labeled: usize,
+    pub unlabeled: usize,
+    pub egress: usize,
+    #[serde(rename = "static")]
+    pub statics: usize,
+    pub mtu_warnings: usize,
+    /// Entries of the kernel's label table.
+    pub labels: usize,
+}
+
+impl FecRow {
+    /// A FEC LDP gives no outgoing label (the "without label" filter).
+    pub fn unlabeled(&self) -> bool {
+        self.fec.is_some() && self.out_label == "-"
+    }
+}
+
+/// [`forwarding_rows`] with the counts and the search texts.
+pub fn lines(
+    mpls: &Mpls,
+    state: Option<&LdpState>,
+    kernel: &[MplsRoute],
+    mtu_of: &dyn Fn(&str) -> Option<u32>,
+) -> Lines {
+    let rows = forwarding_rows(mpls, state, kernel, mtu_of);
+    let mut c = Counts {
+        rows: rows.len(),
+        labels: kernel.len(),
+        ..Counts::default()
+    };
+    let mut hay = Vec::with_capacity(rows.len());
+    for r in &rows {
+        c.fecs += usize::from(r.fec.is_some());
+        c.labeled += usize::from(r.fec.is_some() && r.out_label != "-");
+        c.unlabeled += usize::from(r.unlabeled());
+        c.egress += usize::from(r.reason.as_deref().is_some_and(|x| x.starts_with("egress")));
+        c.statics += usize::from(r.origin == "static");
+        c.mtu_warnings += usize::from(r.mtu.is_some());
+        let mut h = String::with_capacity(48);
+        for part in [r.fec.as_deref(), r.interface.as_deref()].into_iter().flatten() {
+            h.push_str(part);
+            h.push(' ');
+        }
+        if let Some(l) = r.in_label {
+            let _ = write!(h, " {l} ");
+        }
+        h.push_str(&r.out_label);
+        if let Some(n) = r.nexthop {
+            let _ = write!(h, " {n}");
+        }
+        h.push(' ');
+        hay.push(h.to_ascii_lowercase());
+    }
+    Lines { rows, hay, counts: c }
 }
 
 #[cfg(test)]

@@ -15,6 +15,12 @@ serde.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+criterion.workspace = true
+ipnet.workspace = true
+
+[[bench]]
+name = "forwarding"
+harness = false
 
 [lints]
 workspace = true

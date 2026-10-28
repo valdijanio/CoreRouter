@@ -45,6 +45,10 @@ name = "cgnat_pba_storm"
 harness = false
 
 [[bench]]
+name = "mpls_page"
+harness = false
+
+[[bench]]
 name = "execute"
 harness = false
 

@@ -499,43 +499,29 @@ fn forwarding_page(s: &mut Session, p: &Value) -> Result<Value> {
     let why = mpls_supported(s).err();
     let (kernel, note) = crate::mpls::labels(s);
     let ldp = crate::mpls::ldp(s);
-    let cfg = s.store().running();
-    let mpls = &cfg.routing.mpls;
-    let mtu_of = |name: &str| -> Option<u32> {
-        let n: IfName = name.parse().ok()?;
-        cfg.interfaces.get(&n).map(|i| u32::from(i.mtu))
-    };
-    let rows = corerouter_proto_mpls::forwarding_rows(mpls, ldp.state.as_deref(), &kernel, &mtu_of);
-    let summary = json!({
-        "rows": rows.len(),
-        "fecs": rows.iter().filter(|r| r.fec.is_some()).count(),
-        "labeled": rows.iter().filter(|r| r.fec.is_some() && r.out_label != "-").count(),
-        "unlabeled": rows.iter().filter(|r| r.fec.is_some() && r.out_label == "-").count(),
-        "egress": rows.iter().filter(|r| r.reason.as_deref().is_some_and(|x| x.starts_with("egress"))).count(),
-        "static": rows.iter().filter(|r| r.origin == "static").count(),
-        "mtu_warnings": rows.iter().filter(|r| r.mtu.is_some()).count(),
-        "labels": kernel.len(),
-    });
-    let keep = |r: &corerouter_proto_mpls::FecRow| {
+    let lines = crate::mpls::lines(s, &kernel);
+    let mpls = &s.store().running().routing.mpls;
+    let keep = |(r, hay): &(&corerouter_proto_mpls::FecRow, &String)| {
         origin.is_none_or(|o| r.origin == o)
-            && (!unlabeled || (r.fec.is_some() && r.out_label == "-"))
-            && find.as_deref().is_none_or(|f| {
-                r.fec.as_deref().is_some_and(|x| x.contains(f))
-                    || r.in_label.is_some_and(|l| l.to_string() == f)
-                    || r.out_label.contains(f)
-                    || r.nexthop.is_some_and(|n| n.to_string().contains(f))
-                    || r.interface.as_deref().is_some_and(|i| i.to_ascii_lowercase().contains(f))
-            })
+            && (!unlabeled || r.unlabeled())
+            && find.as_deref().is_none_or(|f| hay.contains(f))
     };
-    let matching: Vec<&corerouter_proto_mpls::FecRow> = rows.iter().filter(|r| keep(r)).collect();
-    let page: Vec<Value> = matching
-        .iter()
-        .skip(usize::try_from(offset).unwrap_or(usize::MAX))
-        .take(usize::try_from(limit).unwrap_or(0))
-        .map(|r| serde_json::to_value(r).unwrap_or(Value::Null))
-        .collect();
+    let skip = usize::try_from(offset).unwrap_or(usize::MAX);
+    let take = usize::try_from(limit).unwrap_or(0);
+    let mut total = 0usize;
+    let mut page = Vec::with_capacity(take.min(lines.rows.len()));
+    for pair in lines.rows.iter().zip(&lines.hay) {
+        if !keep(&pair) {
+            continue;
+        }
+        if total >= skip && page.len() < take {
+            page.push(serde_json::to_value(pair.0).unwrap_or(Value::Null));
+        }
+        total += 1;
+    }
+    let summary = serde_json::to_value(lines.counts).unwrap_or(Value::Null);
     Ok(json!({
-        "total": matching.len(),
+        "total": total,
         "offset": offset,
         "rows": page,
         "summary": summary,
