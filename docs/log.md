@@ -6457,3 +6457,40 @@ continuação indentadas).
   - Testes: `every_rule_by_table` (desligado sem dependência = Ok; com RADIUS = Warning),
     `new_router_has_no_ntp_warning` (laboratório novo não loga aviso de NTP).
   - Sem mudança em config existente. Caminho não quente (verificação a cada leitura de saúde, O(servidores RADIUS)).
+
+- 2026-10-28 — G1.6m: Primeiro boot da imagem numa VM libvirt (UEFI, 3 placas virtio), seis achados do usuário
+  (`docs/os-image.md`, seção G1.6m):
+
+  - **Nomes de porta:** o init renomeia `eth0…` para `ether1…` antes do daemon, na ordem do
+    barramento PCI (não do probe), com o nome preso ao MAC em `/config/.port-names` (placa nova
+    ganha o próximo número; placa trocada no mesmo slot herda o nome; configuração de antes sem
+    mapa mantém os nomes do kernel). `corerouter.mgmt=eth0,…` antigo vale para a mesma placa
+    renomeada. O instalador lista as portas com esses nomes, link e MAC, e recusa porta que não
+    existe.
+  - **Assistente de console:** diz que não há terminal de comandos e o que usar (GUI/CLI pela
+    rede); convite de novo a cada 5 min e pergunta pendente de novo a cada 30 s (console serial
+    conectado depois); porta pelo número com confirmação (`Use ether1 (link up, 52:54:…)? [y/N]`),
+    sem padrão que um Enter perdido aceite; resumo e `Apply? [y/N]`. Com endereço, Enter mostra o
+    status e como conectar.
+  - **Interfaces do kernel** (`bond0`, `dummy0`, `gre0`, `gretap0`, `erspan0`, `ip6gre0`,
+    `ip6tnl0`, `sit0`, `tunl0`): `bonding.max_bonds=0 dummy.numdummies=0` na linha de comando
+    embutida e um patch de uma linha no kernel (padrão do `fb_tunnels_only_for_init_net` = 2: o
+    sysctl pela linha de comando chega depois dos initcalls). O `os build` reaplica patches do
+    kernel quando mudam.
+  - **Shell de manutenção que parava:** a causa era sair do shell, não reconectar o console. O
+    PID 1 colhia filhos com `waitpid(None)` do rustix 1.x, que é `wait4(0)` (só o próprio grupo
+    de processos): o shell (`setsid`) virava zumbi e nunca voltava; órfãos com grupo próprio
+    também. Agora `wait4(-1)`.
+  - **NVRAM herdada:** o `corerouter.mgmt=` aplicado é anunciado nos consoles (endereço, porta,
+    origem, `--reset-nvram`); o marcador `/config/.installer-mgmt-applied` é gravado com fsync
+    (o daemon sincroniza a configuração, o marcador não: uma VM desligada à força logo depois
+    ficava com o endereço e sem o marcador).
+  - **Roteiro** `docs/producao-core.md`: primeiro boot com o assistente real, nomes `etherN` e
+    NVRAM nova no Proxmox/libvirt (o caso `prod` do `routeros-interop.sh` usa só os blocos
+    `lab:`, sem mudança).
+
+  Como testar: `cargo xtask os build`, `cargo xtask os install-test` (instalação com o
+  `corerouter.mgmt=eth0,…` antigo aplicado em `ether1` e anunciado; disco com 3 placas:
+  `ether1 ether2 ether3 lo` e nada mais em `/sys/class/net`; marcador e mapa gravados; `exit` no
+  shell e ele volta sem zumbi; instalador recusa `eth9`; assistente do qcow2 pelo número, com
+  confirmação e resumo), `cargo xtask os boot-test`, `ab-test`, `frr-test` (agora em `ether1`).

@@ -223,3 +223,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-28 — G3.9 criada e feita (interoperabilidade com RouterOS v7 e roteiro de produção do core)
 - 2026-10-28 — G1.27h criado e feito (rota do DHCP escondida pela estática de mesma distância)
 - 2026-10-28 — G4.6i feito (roteador novo nasce sem aviso de NTP)
+- 2026-10-28 — G1.6m criado e feito (primeiro boot de verdade numa VM: assistente, nomes de porta, interfaces do kernel, shell, NVRAM herdada); relacionado à G1.6d, que segue aberta
