@@ -39,8 +39,10 @@ use corerouter_model::routing_filter::{PrefixEntry, RoutingFilter};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
 use super::eval::{MAX_JUMP_DEPTH, Problem, parsed_chains};
-use super::parse::{Atom, CommArg, CommHow, CommOp, Expr, Family, SetOp, Stmt};
-use super::{CommunityValue, Large, Protocol, community_text, fnv};
+use super::parse::{
+    Atom, CommArg, CommHow, CommOp, Expr, ExtArg, ExtHow, ExtOp, Family, SetOp, Stmt,
+};
+use super::{CommunityValue, Ext, ExtKind, Large, Protocol, community_text, fnv};
 
 /// The sequence of the final `deny` of every map.
 pub const END_SEQ: u32 = 65_535;
@@ -59,10 +61,24 @@ pub fn route_map(chain: &str) -> String {
 /// A `match` of a route-map entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Match {
-    Plist { v6: bool, name: String },
+    Plist {
+        v6: bool,
+        name: String,
+    },
     AsPath(String),
-    Comm { name: String, exact: bool },
-    Large { name: String, exact: bool },
+    Comm {
+        name: String,
+        exact: bool,
+    },
+    Large {
+        name: String,
+        exact: bool,
+    },
+    /// G3.9fc: `match extcommunity` (a standard or an expanded list).
+    Ext {
+        name: String,
+        exact: bool,
+    },
     Proto(Protocol),
 }
 
@@ -75,6 +91,12 @@ pub enum Set {
     Prepend(u32, u8),
     /// The next hop (G3.9fh); the entry before it tests the family.
     Gw(std::net::IpAddr),
+    /// G3.9fc: `set extcommunity none`.
+    ExtNone,
+    /// `set extcommunity rt …` / `soo …`: FRR always adds.
+    ExtAdd(Vec<Ext>),
+    /// `set extended-comm-list NAME delete`.
+    ExtDel(String),
     Comm(CommHow, Vec<u32>, String),
     Large(CommHow, Vec<Large>, String),
 }
@@ -88,6 +110,9 @@ impl Set {
             Set::Comm(..) => 3,
             Set::Large(..) => 4,
             Set::Gw(_) => 5,
+            Set::ExtNone => 6,
+            Set::ExtAdd(_) => 7,
+            Set::ExtDel(_) => 8,
         }
     }
 }
@@ -153,6 +178,10 @@ pub struct Lists {
     /// Entries; one entry matches when the route has all its communities.
     pub comm: BTreeMap<String, Vec<Vec<u32>>>,
     pub large: BTreeMap<String, Vec<Vec<Large>>>,
+    /// G3.9fc: standard extended-community lists, entries as `comm`.
+    pub ext: BTreeMap<String, Vec<Vec<Ext>>>,
+    /// Expanded ones: (permit, POSIX regex on FRR's text of the values).
+    pub ext_re: BTreeMap<String, Vec<(bool, String)>>,
 }
 
 /// The entry for prefix `p` and lengths `lo..=hi` (FRR wants len < ge <=
@@ -223,7 +252,27 @@ fn atom_text(a: &Atom) -> String {
             };
             format!("{what} {op}{list} {}", vals(arg))
         }
+        Atom::Ext { op, arg } => {
+            let list = if matches!(arg, CommArg::List(_)) {
+                "-list"
+            } else {
+                ""
+            };
+            let op = match op {
+                ExtOp::Includes => "includes",
+                ExtOp::Any => "any",
+                ExtOp::Equal => "equal",
+                ExtOp::Subset => "subset",
+            };
+            format!("bgp-ext-communities {op}{list} {}", vals(arg))
+        }
     }
+}
+
+/// A POSIX regex for FRR's text of `e` (`RT:65000:1`): `.` of an IPv4
+/// address in a bracket, nothing else special.
+fn ext_re(e: Ext) -> String {
+    e.frr_display().unwrap_or_default().replace('.', "[.]")
 }
 
 /// FRR keeps a description as typed; printable ASCII, bounded.
@@ -326,6 +375,90 @@ impl<'a> Comp<'a> {
         v.sort_unstable();
         v.dedup();
         v
+    }
+
+    fn exts(&mut self, arg: &CommArg) -> Vec<Ext> {
+        let mut v: Vec<Ext> = self
+            .comm_values(arg)
+            .into_iter()
+            .filter_map(|c| match c {
+                CommunityValue::Ext(e) => Some(e),
+                _ => None,
+            })
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    fn ext_list(&mut self, entries: Vec<Vec<Ext>>) -> String {
+        let key: Vec<String> = entries
+            .iter()
+            .map(|e| {
+                e.iter()
+                    .map(|x| format!("{:016x}", x.0))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        let name = format!("CR-E-{:016x}", fnv(&key.join("|")));
+        self.lists.ext.entry(name.clone()).or_insert(entries);
+        name
+    }
+
+    fn ext_re_list(&mut self, entries: Vec<(bool, String)>) -> String {
+        let key: Vec<String> = entries.iter().map(|(p, r)| format!("{p} {r}")).collect();
+        let name = format!("CR-ER-{:016x}", fnv(&key.join("|")));
+        self.lists.ext_re.entry(name.clone()).or_insert(entries);
+        name
+    }
+
+    /// G3.9fc: the `set extended-comm-list … delete` list of an action:
+    /// FRR tries each value against the entries in order, the first that
+    /// matches decides (permit deletes).
+    fn ext_delete(&mut self, how: ExtHow, arg: &ExtArg) -> Option<Set> {
+        let values = |c: &mut Self| match arg {
+            ExtArg::Values(v) => {
+                let mut v = v.clone();
+                v.sort_unstable();
+                v.dedup();
+                v
+            }
+            ExtArg::List(n) => c.exts(&CommArg::List(n.clone())),
+            ExtArg::Kind(_) => Vec::new(),
+        };
+        let entries: Vec<(bool, String)> = match (how, arg) {
+            (ExtHow::Delete, ExtArg::Kind(ExtKind::Rt)) => vec![(true, "^RT:".into())],
+            (ExtHow::Delete, ExtArg::Kind(ExtKind::Soo)) => vec![(true, "^SoO:".into())],
+            (ExtHow::Delete, ExtArg::Kind(ExtKind::Other)) => vec![
+                (false, "^RT:".into()),
+                (false, "^SoO:".into()),
+                (true, ".*".into()),
+            ],
+            (ExtHow::Delete, _) => {
+                let v = values(self);
+                if v.is_empty() {
+                    return None;
+                }
+                v.into_iter()
+                    .map(|e| (true, format!("^{}$", ext_re(e))))
+                    .collect()
+            }
+            (ExtHow::Filter, _) => {
+                let v = values(self);
+                if v.is_empty() {
+                    return Some(Set::ExtNone);
+                }
+                let mut out: Vec<(bool, String)> = v
+                    .into_iter()
+                    .map(|e| (false, format!("^{}$", ext_re(e))))
+                    .collect();
+                out.push((true, ".*".into()));
+                out
+            }
+            _ => return None,
+        };
+        Some(Set::ExtDel(self.ext_re_list(entries)))
     }
 
     fn plist(&mut self, net: IpNet, lo: u8, hi: u8) -> Match {
@@ -467,6 +600,43 @@ impl<'a> Comp<'a> {
                 let name = self.large_list(entries);
                 Alt::Any(vec![Match::Large { name, exact }])
             }
+            // G3.9fc: includes, any and equal are standard lists, as for
+            // the other communities; subset is an expanded one over the
+            // whole text (`RT:1:1 SoO:2:2`; none: the empty text).
+            Atom::Ext { op, arg } => {
+                let v = self.exts(arg);
+                match op {
+                    ExtOp::Includes | ExtOp::Any if v.is_empty() => {
+                        if *op == ExtOp::Includes {
+                            Alt::Always
+                        } else {
+                            Alt::Never
+                        }
+                    }
+                    ExtOp::Includes => {
+                        let name = self.ext_list(vec![v]);
+                        Alt::Any(vec![Match::Ext { name, exact: false }])
+                    }
+                    ExtOp::Any => {
+                        let name = self.ext_list(v.into_iter().map(|e| vec![e]).collect());
+                        Alt::Any(vec![Match::Ext { name, exact: false }])
+                    }
+                    ExtOp::Equal if !v.is_empty() => {
+                        let name = self.ext_list(vec![v]);
+                        Alt::Any(vec![Match::Ext { name, exact: true }])
+                    }
+                    ExtOp::Equal | ExtOp::Subset => {
+                        let re = if v.is_empty() {
+                            "^$".to_owned()
+                        } else {
+                            let alts: Vec<String> = v.into_iter().map(ext_re).collect();
+                            format!("^(({})( |$))*$", alts.join("|"))
+                        };
+                        let name = self.ext_re_list(vec![(true, re)]);
+                        Alt::Any(vec![Match::Ext { name, exact: false }])
+                    }
+                }
+            }
         }
     }
 
@@ -511,6 +681,8 @@ impl<'a> Comp<'a> {
             SetOp::LocalPref(v) => Set::LocalPref(*v),
             SetOp::Med(v) => Set::Med(*v),
             SetOp::Gw(a) => Set::Gw(*a),
+            // Handled in `stmts`: `set` is two entries.
+            SetOp::Ext { .. } => return None,
             // G3.9fg: N copies in all, the session's own included; none
             // left (N = 1 on eBGP), nothing to do.
             SetOp::Prepend(n) if *n <= self.counted => return None,
@@ -613,6 +785,43 @@ impl<'a> Comp<'a> {
                         description: None,
                     });
                     self.place(end);
+                }
+                // G3.9fc: FRR's `set extcommunity` always adds, so
+                // RouterOS's `set` is `none` and then the values, in two
+                // entries (the order inside one entry is FRR's own).
+                Stmt::Set(SetOp::Ext { how, arg }) => {
+                    let sets: Vec<Set> = match (how, arg) {
+                        (ExtHow::Set | ExtHow::Append, a) => {
+                            let v = match a {
+                                ExtArg::Values(v) => {
+                                    let mut v = v.clone();
+                                    v.sort_unstable();
+                                    v.dedup();
+                                    v
+                                }
+                                ExtArg::List(n) => self.exts(&CommArg::List(n.clone())),
+                                ExtArg::Kind(_) => Vec::new(),
+                            };
+                            let mut out = Vec::new();
+                            if *how == ExtHow::Set {
+                                out.push(Set::ExtNone);
+                            }
+                            if !v.is_empty() {
+                                out.push(Set::ExtAdd(v));
+                            }
+                            out
+                        }
+                        (h, a) => self.ext_delete(*h, a).into_iter().collect(),
+                    };
+                    for set in sets {
+                        self.emit(Entry {
+                            permit: true,
+                            matches: Vec::new(),
+                            sets: vec![set],
+                            exit: Exit::Next,
+                            description: None,
+                        });
+                    }
                 }
                 Stmt::Set(op) => {
                     if let Some(set) = self.set(op) {
@@ -889,6 +1098,25 @@ fn set_line(s: &Set) -> Option<String> {
             }
             l
         }
+        Set::ExtNone => "set extcommunity none".into(),
+        Set::ExtAdd(v) => {
+            let of = |k: ExtKind| {
+                v.iter()
+                    .filter(|e| e.kind() == k)
+                    .filter_map(|e| e.frr_display())
+                    .map(|t| t.split_once(':').map_or(t.clone(), |(_, a)| a.to_owned()))
+                    .collect::<Vec<_>>()
+            };
+            let mut lines = Vec::new();
+            for (k, kw) in [(ExtKind::Rt, "rt"), (ExtKind::Soo, "soo")] {
+                let a = of(k);
+                if !a.is_empty() {
+                    lines.push(format!("set extcommunity {kw} {}", a.join(" ")));
+                }
+            }
+            lines.join("\n ")
+        }
+        Set::ExtDel(name) => format!("set extended-comm-list {name} delete"),
         Set::Gw(std::net::IpAddr::V4(a)) => format!("set ip next-hop {a}"),
         Set::Gw(std::net::IpAddr::V6(a)) => format!("set ipv6 next-hop global {a}"),
         Set::Comm(CommHow::Set, v, _) if v.is_empty() => "set community none".into(),
@@ -913,6 +1141,10 @@ fn match_line(m: &Match) -> String {
         ),
         Match::Large { name, exact } => format!(
             "match large-community {name}{}",
+            if *exact { " exact-match" } else { "" }
+        ),
+        Match::Ext { name, exact } => format!(
+            "match extcommunity {name}{}",
             if *exact { " exact-match" } else { "" }
         ),
         Match::Proto(p) => format!("match source-protocol {}", p.name()),
@@ -995,6 +1227,35 @@ pub fn lists_text(l: &Lists, out: &mut String) {
                 "bgp large-community-list standard {name} seq {} permit {}",
                 (i + 1) * 5,
                 words.join(" ")
+            );
+        }
+    }
+    // G3.9fc: FRR prints each value with its keyword (`rt 1:1 soo 2:2`).
+    for (name, entries) in &l.ext {
+        for (i, e) in entries.iter().enumerate() {
+            let words: Vec<String> = e
+                .iter()
+                .filter_map(|x| {
+                    let t = x.frr_display()?;
+                    let (k, a) = t.split_once(':')?;
+                    Some(format!("{} {a}", k.to_ascii_lowercase()))
+                })
+                .collect();
+            let _ = writeln!(
+                out,
+                "bgp extcommunity-list standard {name} seq {} permit {}",
+                (i + 1) * 5,
+                words.join(" ")
+            );
+        }
+    }
+    for (name, entries) in &l.ext_re {
+        for (i, (permit, re)) in entries.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "bgp extcommunity-list expanded {name} seq {} {} {re}",
+                (i + 1) * 5,
+                if *permit { "permit" } else { "deny" }
             );
         }
     }
@@ -1179,6 +1440,8 @@ pub fn render_counted(
         lists.aspath.extend(l.aspath);
         lists.comm.extend(l.comm);
         lists.large.extend(l.large);
+        lists.ext.extend(l.ext);
+        lists.ext_re.extend(l.ext_re);
         maps.push_str(&m);
         problems.extend(p);
         variants.extend(v);
@@ -1229,7 +1492,13 @@ pub(crate) mod tests {
             "cl".into(),
             CommunityList {
                 name: "cl".into(),
-                communities: vec!["65000:1".into(), "65000:2".into(), "1:2:3".into()],
+                communities: vec![
+                    "65000:1".into(),
+                    "65000:2".into(),
+                    "1:2:3".into(),
+                    "rt:65000:7".into(),
+                    "soo:192.0.2.1:1".into(),
+                ],
                 comment: String::new(),
             },
         );
@@ -1268,7 +1537,7 @@ pub(crate) mod tests {
                     return None;
                 }
                 for s in &e.sets {
-                    frr_set(s, &mut r);
+                    frr_set_with(s, lists, &mut r);
                 }
                 match e.exit {
                     Exit::Done => return Some(r),
@@ -1317,8 +1586,37 @@ pub(crate) mod tests {
                     }
                 })
             }),
+            // G3.9fc, as `bgp_clist.c` does: a standard entry matches when
+            // the route has all its values (exact: the same set); an
+            // expanded one runs its regex on FRR's text of all of them.
+            Match::Ext { name, exact } => {
+                if let Some(es) = l.ext.get(name) {
+                    es.iter().any(|e| {
+                        if *exact {
+                            *e == r.ext
+                        } else {
+                            e.iter().all(|c| r.ext.contains(c))
+                        }
+                    })
+                } else if let Some(es) = l.ext_re.get(name) {
+                    let text = ext_text(&r.ext);
+                    es.iter()
+                        .find(|(_, re)| regex::Regex::new(re).unwrap().is_match(&text))
+                        .is_some_and(|(permit, _)| *permit)
+                } else {
+                    false
+                }
+            }
             Match::Proto(p) => r.protocol == *p,
         }
+    }
+
+    /// FRR's text of a route's extended communities (`RT:1:1 SoO:2:2`).
+    fn ext_text(v: &[Ext]) -> String {
+        v.iter()
+            .filter_map(|e| e.frr_display())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn frr_set(s: &Set, r: &mut Route) {
@@ -1344,6 +1642,26 @@ pub(crate) mod tests {
             Set::Gw(a) => r.next_hop = Some(*a),
             Set::Comm(how, v, _) => change(*how, v, &mut r.communities),
             Set::Large(how, v, _) => change(*how, v, &mut r.large),
+            Set::ExtNone => r.ext.clear(),
+            Set::ExtAdd(v) => change(CommHow::Append, v, &mut r.ext),
+            // `ecommunity_list_match_delete`: each value alone, the first
+            // entry that matches decides, permit deletes.
+            Set::ExtDel(_) => {}
+        }
+    }
+
+    /// [`frr_set`] for the deletes, which need the lists.
+    fn frr_set_with(s: &Set, l: &Lists, r: &mut Route) {
+        if let Set::ExtDel(name) = s {
+            let es = l.ext_re.get(name).unwrap();
+            r.ext.retain(|e| {
+                let t = ext_text(&[*e]);
+                !es.iter()
+                    .find(|(_, re)| regex::Regex::new(re).unwrap().is_match(&t))
+                    .is_some_and(|(permit, _)| *permit)
+            });
+        } else {
+            frr_set(s, r);
         }
     }
 
@@ -1407,6 +1725,111 @@ pub(crate) mod tests {
         // The text reads back as an FRR tree.
         let conf = corerouter_model_free_parse(&text);
         assert!(conf > 5);
+    }
+
+    #[test]
+    fn extended_communities_render_like_frr() {
+        // G3.9fc: standard lists for includes/any/equal, expanded ones
+        // (POSIX, on FRR's text) for subset and the deletes; `set` is
+        // `none` then the values, FRR's `set extcommunity` only adds.
+        let f = filter(&[(
+            "in",
+            "if (bgp-ext-communities includes rt:65000:7,soo:192.0.2.1:1) { set bgp-local-pref 300 } \
+             if (bgp-ext-communities equal rt:1:1) { set bgp-med 1 } \
+             if (bgp-ext-communities subset rt:65000:7,rt:4200000000:7) { set bgp-med 2 } \
+             set bgp-ext-communities rt:65000:9; append bgp-ext-communities soo:1:1,rt:1:2; \
+             delete bgp-ext-communities rt:1:2; delete bgp-ext-communities other; \
+             filter bgp-ext-communities rt:65000:9; accept",
+        )]);
+        let (text, problems) = render(&f, &BTreeSet::new(), &|_| Some(65000));
+        assert_eq!(problems, []);
+        for want in [
+            " seq 5 permit rt 65000:7 soo 192.0.2.1:1\n",
+            " match extcommunity CR-E-",
+            " exact-match\n",
+            " seq 5 permit ^((RT:65000:7|RT:4200000000:7)( |$))*$\n",
+            " set extcommunity none\n",
+            " set extcommunity rt 65000:9\n",
+            " set extcommunity rt 1:2\n set extcommunity soo 1:1\n",
+            " seq 5 permit ^RT:1:2$\n",
+            " seq 5 deny ^RT:\n",
+            " seq 10 deny ^SoO:\n",
+            " seq 15 permit .*\n",
+            " seq 5 deny ^RT:65000:9$\n",
+            " delete\n",
+        ] {
+            assert!(text.contains(want), "{want:?} in\n{text}");
+        }
+        assert!(
+            text.contains("bgp extcommunity-list standard CR-E-")
+                && text.contains("bgp extcommunity-list expanded CR-ER-"),
+            "{text}"
+        );
+        // `.` of an IPv4 address is literal in the regex.
+        let f = filter(&[(
+            "in",
+            "if (bgp-ext-communities subset soo:192.0.2.1:1) { accept }",
+        )]);
+        let (text, _) = render(&f, &BTreeSet::new(), &|_| Some(65000));
+        assert!(text.contains("^((SoO:192[.]0[.]2[.]1:1)( |$))*$"), "{text}");
+    }
+
+    #[test]
+    fn extended_communities_are_checked_where_written() {
+        for (rule, want) in [
+            (
+                "if (bgp-communities includes rt:1:1) { accept }",
+                "use bgp-ext-communities",
+            ),
+            (
+                "if (bgp-ext-communities includes 65000:1) { accept }",
+                "use bgp-communities",
+            ),
+            (
+                "if (bgp-ext-communities within rt:1:1) { accept }",
+                "subset",
+            ),
+            (
+                "filter bgp-communities 65000:1",
+                "filter takes bgp-ext-communities",
+            ),
+            ("set bgp-ext-communities rt:70000:70000", "RFC 5668"),
+            (
+                "delete bgp-ext-communities color:1",
+                "not an extended community",
+            ),
+        ] {
+            let e = parse::parse(rule).unwrap_err().to_string();
+            assert!(e.contains(want), "{rule}: {e}");
+        }
+        for ok in [
+            "delete bgp-ext-communities rt",
+            "delete bgp-ext-communities soo; delete bgp-ext-communities other",
+            "set bgp-ext-communities none",
+            "if (bgp-ext-communities any-list cl) { reject }",
+        ] {
+            assert!(parse::parse(ok).is_ok(), "{ok}");
+        }
+        // A list without extended ones is a problem for the matcher.
+        let mut f = filter(&[(
+            "in",
+            "if (bgp-ext-communities includes-list only) { accept }",
+        )]);
+        f.community_lists.insert(
+            "only".into(),
+            CommunityList {
+                name: "only".into(),
+                communities: vec!["65000:1".into()],
+                comment: String::new(),
+            },
+        );
+        let (_, problems) = Policy::build(&f);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.message.contains("has no extended communities")),
+            "{problems:?}"
+        );
     }
 
     #[test]
@@ -1636,6 +2059,12 @@ pub(crate) mod tests {
             Just("bgp-communities equal-list cl".to_owned()),
             Just("bgp-large-communities includes 1:2:3".to_owned()),
             Just("bgp-large-communities any-list cl".to_owned()),
+            Just("bgp-ext-communities includes rt:65000:7".to_owned()),
+            Just("bgp-ext-communities any rt:65000:7,rt:1:1".to_owned()),
+            Just("bgp-ext-communities equal rt:65000:7".to_owned()),
+            Just("bgp-ext-communities subset rt:65000:7,soo:192.0.2.1:1".to_owned()),
+            Just("bgp-ext-communities subset-list cl".to_owned()),
+            Just("bgp-ext-communities equal-list cl".to_owned()),
         ]
     }
 
@@ -1667,6 +2096,15 @@ pub(crate) mod tests {
             Just("delete bgp-communities cl".to_owned()),
             Just("append bgp-large-communities 1:2:3".to_owned()),
             Just("set bgp-large-communities none".to_owned()),
+            Just("set bgp-ext-communities rt:65000:7".to_owned()),
+            Just("set bgp-ext-communities none".to_owned()),
+            Just("append bgp-ext-communities rt:1:1,soo:192.0.2.1:1".to_owned()),
+            Just("delete bgp-ext-communities rt:65000:7".to_owned()),
+            Just("delete bgp-ext-communities rt".to_owned()),
+            Just("delete bgp-ext-communities soo".to_owned()),
+            Just("delete bgp-ext-communities other".to_owned()),
+            Just("delete bgp-ext-communities cl".to_owned()),
+            Just("filter bgp-ext-communities rt:65000:7,soo:192.0.2.1:1".to_owned()),
         ]
     }
 
@@ -1720,16 +2158,25 @@ pub(crate) mod tests {
             prop::collection::vec(asn, 1..4),
             prop::sample::subsequence(vec![65000 << 16 | 1, 65000 << 16 | 2, 0xFFFF_FF01], 0..3),
             prop::sample::subsequence(vec![Large(1, 2, 3), Large(1, 2, 4)], 0..2),
+            prop::sample::subsequence(
+                ["rt:1:1", "rt:65000:7", "soo:192.0.2.1:1", "rt:4200000000:7"]
+                    .iter()
+                    .map(|t| crate::filter::parse_ext(t).unwrap())
+                    .collect::<Vec<_>>(),
+                0..3,
+            ),
             prop_oneof![
                 Just(Protocol::Bgp),
                 Just(Protocol::Static),
                 Just(Protocol::Connected)
             ],
         )
-            .prop_map(|(p, path, comms, large, protocol)| {
+            .prop_map(|(p, path, comms, large, mut ext, protocol)| {
                 let mut r = Route::bgp(p.parse().unwrap(), path);
                 r.communities = comms;
                 r.large = large;
+                ext.sort();
+                r.ext = ext;
                 r.protocol = protocol;
                 r
             })

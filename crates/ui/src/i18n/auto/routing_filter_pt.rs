@@ -19,6 +19,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Direction"##, r##"Direção"##),
     (r##"Down"##, r##"Descer"##),
     (r##"Entries"##, r##"Entradas"##),
+    (r##"Extended"##, r##"Estendidas"##),
     (r##"Filter Rule"##, r##"Regra de filtro"##),
     (r##"Filters"##, r##"Filtros"##),
     (r##"IPv4"##, r##"IPv4"##),
@@ -85,7 +86,7 @@ Mais uma cópia de cada rota recebida na memória. Vazio: sim."##),
     (r##"filter.community_list"##, r##"## O que é
 Uma lista de communities com nome, normais e large."##),
     (r##"filter.community_list.communities"##, r##"## O que é
-Communities normais (RFC 1997: `65000:100`, ou `no-export`, `no-advertise`, `blackhole`, `graceful-shutdown`…) e large (RFC 8092: `65000:1:2`)."##),
+Communities normais (RFC 1997: `65000:100`, ou `no-export`, `no-advertise`, `blackhole`, `graceful-shutdown`…) e large (RFC 8092: `65000:1:2`) e estendidas (RFC 4360, G3.9fc): Route Target `rt:65000:1`, `rt:192.0.2.1:7`, `rt:4200000000:1` (AS de 4 octetos, RFC 5668) e Site of Origin `soo:…`, ou os 16 dígitos hex de um deles (`0x0002fde800000001`). É também a `community-ext-list` do RouterOS: cada matcher usa as do seu tipo."##),
     (r##"filter.impact"##, r##"## O que é
 O que o commit das mudanças pendentes faz com as rotas de cada conexão, medido nas mesmas rotas da Prévia: prefixos que deixam de ser anunciados a (ou aceitos de) um vizinho, novos, e atributos alterados."##),
     (r##"filter.list.name"##, r##"## O que é
@@ -124,7 +125,7 @@ Escreva as chains (Regras) e escolha o Filtro de entrada e o Filtro de saída da
 Uma regra na linguagem do RouterOS v7: `if (dst in bogons || dst-len > 24) { reject }`, `if (bgp-as-path "^64500_") { set bgp-local-pref 200; accept }`. A prévia abaixo conta quantas rotas a chain deixa passar com esta mudança.
 
 ## Linguagem
-Condições: `dst in|==|!=`, `dst-len`, `afi`, `protocol`, `bgp-as-path` (regex do FRR/Cisco, `_` é separador), `bgp-communities` e `bgp-large-communities` com `includes`, `any`, `equal` (e `-list`). Combinadas com `&&`, `||`, `not` e parênteses. Ações: `accept`, `reject`, `return`, `jump CHAIN`, `set bgp-local-pref|bgp-med|bgp-path-prepend|bgp-communities|bgp-large-communities`, `set gw ENDEREÇO` (next hop das rotas da família do endereço), `append …`, `delete …`."##),
+Condições: `dst in|==|!=`, `dst-len`, `afi`, `protocol`, `bgp-as-path` (regex do FRR/Cisco, `_` é separador), `bgp-communities` e `bgp-large-communities` com `includes`, `any`, `equal` (e `-list`), `bgp-ext-communities` com esses e `subset`. Combinadas com `&&`, `||`, `not` e parênteses. Ações: `accept`, `reject`, `return`, `jump CHAIN`, `set bgp-local-pref|bgp-med|bgp-path-prepend|bgp-communities|bgp-large-communities`, `set gw ENDEREÇO` (next hop das rotas da família do endereço), `append …`, `delete …`; nas estendidas também `set|append|delete|filter bgp-ext-communities` (`set` troca todas, `delete rt|soo|other` tira um tipo, `filter` deixa só as dadas)."##),
     (r##"filter.rule.actions"##, r##"## O que é
 O que a regra faz: verde aceita, vermelho rejeita, azul muda um atributo."##),
     (r##"filter.rule.chain"##, r##"## O que é

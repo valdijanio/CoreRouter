@@ -40,6 +40,8 @@ impl fmt::Display for Large {
 pub enum CommunityValue {
     Normal(u32),
     Large(Large),
+    /// G3.9fc: an extended community (RFC 4360).
+    Ext(Ext),
 }
 
 impl fmt::Display for CommunityValue {
@@ -47,8 +49,168 @@ impl fmt::Display for CommunityValue {
         match self {
             CommunityValue::Normal(c) => f.write_str(&community_text(*c)),
             CommunityValue::Large(l) => l.fmt(f),
+            CommunityValue::Ext(e) => e.fmt(f),
         }
     }
+}
+
+/// An extended community (RFC 4360 §2), its 8 octets as one number: the
+/// type (high octet; bit 0x40 set = non-transitive), the sub-type, then
+/// 6 octets of value. Ordered as FRR keeps them (by the octets), so a
+/// sorted list compares like `match extcommunity … exact-match`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Ext(pub u64);
+
+/// The extended communities the filter writes and names (G3.9fc): Route
+/// Target (sub-type 0x02) and Site of Origin (0x03) of the 2-octet AS
+/// (type 0x00), IPv4 address (0x01, RFC 4360 §3.1–3.2) and 4-octet AS
+/// (0x02, RFC 5668) kinds, all transitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ExtKind {
+    Rt,
+    Soo,
+    Other,
+}
+
+impl Ext {
+    pub fn kind(self) -> ExtKind {
+        let ty = (self.0 >> 56) as u8;
+        let sub = (self.0 >> 48) as u8;
+        match (ty, sub) {
+            (0x00..=0x02, 0x02) => ExtKind::Rt,
+            (0x00..=0x02, 0x03) => ExtKind::Soo,
+            _ => ExtKind::Other,
+        }
+    }
+
+    /// The global and local administrator parts of an RT or SoO, as
+    /// written after `rt:`: `65000:1`, `192.0.2.1:7`, `4200000000:1`.
+    fn admin(self) -> String {
+        let ty = (self.0 >> 56) as u8;
+        let v = self.0 & 0xFFFF_FFFF_FFFF;
+        match ty {
+            0x00 => format!("{}:{}", v >> 32, v & 0xFFFF_FFFF),
+            0x01 => format!(
+                "{}:{}",
+                std::net::Ipv4Addr::from((v >> 16) as u32),
+                v & 0xFFFF
+            ),
+            _ => format!("{}:{}", v >> 16, v & 0xFFFF),
+        }
+    }
+
+    /// As FRR prints it in `show` and matches it in an expanded list
+    /// (`RT:65000:1`, `SoO:…`); `None` for a kind the filter does not
+    /// write.
+    pub fn frr_display(self) -> Option<String> {
+        match self.kind() {
+            ExtKind::Rt => Some(format!("RT:{}", self.admin())),
+            ExtKind::Soo => Some(format!("SoO:{}", self.admin())),
+            ExtKind::Other => None,
+        }
+    }
+
+    fn make(ty: u8, sub: u8, value: u64) -> Ext {
+        Ext((u64::from(ty) << 56) | (u64::from(sub) << 48) | (value & 0xFFFF_FFFF_FFFF))
+    }
+
+    /// FRR's text (`RT:65000:1`, `SoO:…`, as `show bgp … json` gives it)
+    /// back to a value; `None` for anything else.
+    pub fn from_frr(s: &str) -> Option<Ext> {
+        let (sub, rest) = if let Some(r) = s.strip_prefix("RT:") {
+            (0x02, r)
+        } else {
+            (0x03, s.strip_prefix("SoO:")?)
+        };
+        admin(sub, rest).ok()
+    }
+}
+
+/// `rt:`/`soo:` after the prefix: `A:N`.
+fn admin(sub: u8, rest: &str) -> Result<Ext, String> {
+    let (a, n) = rest
+        .rsplit_once(':')
+        .ok_or_else(|| format!("{:?}: write AS:N or IPv4:N", parse::cut(rest)))?;
+    if let Ok(ip) = a.parse::<std::net::Ipv4Addr>() {
+        let n: u16 = n.parse().map_err(|_| {
+            format!(
+                "{}: after an IPv4 address the number is 0..=65535",
+                parse::cut(rest)
+            )
+        })?;
+        return Ok(Ext::make(
+            0x01,
+            sub,
+            (u64::from(u32::from(ip)) << 16) | u64::from(n),
+        ));
+    }
+    let asn: u32 = a.parse().map_err(|_| {
+        format!(
+            "{:?}: the first part is an AS number or an IPv4 address",
+            parse::cut(a)
+        )
+    })?;
+    match u16::try_from(asn) {
+        // RFC 4360 §3.1: 2-octet AS, 4-octet number.
+        Ok(a2) => {
+            let n: u32 = n
+                .parse()
+                .map_err(|_| format!("{}: the number is 0..=4294967295", parse::cut(rest)))?;
+            Ok(Ext::make(0x00, sub, (u64::from(a2) << 32) | u64::from(n)))
+        }
+        // RFC 5668 §3: 4-octet AS, 2-octet number.
+        Err(_) => {
+            let n: u16 = n.parse().map_err(|_| {
+                format!(
+                    "{}: after a 4-octet AS the number is 0..=65535 (RFC 5668)",
+                    parse::cut(rest)
+                )
+            })?;
+            Ok(Ext::make(0x02, sub, (u64::from(asn) << 16) | u64::from(n)))
+        }
+    }
+}
+
+impl fmt::Display for Ext {
+    /// RouterOS's form: `rt:65000:1`, `soo:192.0.2.1:7`, `0x…` otherwise.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind() {
+            ExtKind::Rt => write!(f, "rt:{}", self.admin()),
+            ExtKind::Soo => write!(f, "soo:{}", self.admin()),
+            ExtKind::Other => write!(f, "0x{:016x}", self.0),
+        }
+    }
+}
+
+/// `rt:AS:N`, `rt:IPv4:N`, `soo:…` or 16 hex digits (`0x0002fde800000001`)
+/// of an RT or SoO (G3.9fc).
+pub fn parse_ext(s: &str) -> Result<Ext, String> {
+    let t = s.trim();
+    let lower = t.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("rt:") {
+        return admin(0x02, rest);
+    }
+    if let Some(rest) = lower.strip_prefix("soo:") {
+        return admin(0x03, rest);
+    }
+    if let Some(hex) = lower.strip_prefix("0x") {
+        let v = (!hex.is_empty() && hex.len() <= 16)
+            .then(|| u64::from_str_radix(hex, 16).ok())
+            .flatten()
+            .ok_or_else(|| format!("{}: 0x and 1..=16 hex digits", parse::cut(t)))?;
+        let e = Ext(v);
+        return match e.kind() {
+            ExtKind::Other => Err(format!(
+                "{}: only Route Target and Site of Origin extended communities (rt:, soo:) for now",
+                parse::cut(t)
+            )),
+            _ => Ok(e),
+        };
+    }
+    Err(format!(
+        "{:?} is not an extended community (rt:65000:1, soo:192.0.2.1:7)",
+        parse::cut(t)
+    ))
 }
 
 /// The well-known communities by the names FRR prints (RFC 1997 §6,
@@ -79,6 +241,10 @@ pub fn community_text(c: u32) -> String {
 /// `local-as`) or `65000:1:2` (large).
 pub fn parse_community(s: &str) -> Result<CommunityValue, String> {
     let t = s.trim();
+    let lower = t.to_ascii_lowercase();
+    if ["rt:", "soo:", "0x"].iter().any(|p| lower.starts_with(p)) {
+        return parse_ext(t).map(CommunityValue::Ext);
+    }
     if let Some((_, v)) = WELL_KNOWN.iter().find(|(n, _)| n.eq_ignore_ascii_case(t)) {
         return Ok(CommunityValue::Normal(*v));
     }
@@ -157,6 +323,8 @@ pub struct Route {
     /// Sorted, no repeats.
     pub communities: Vec<u32>,
     pub large: Vec<Large>,
+    /// Extended communities (G3.9fc): sorted, no repeats.
+    pub ext: Vec<Ext>,
     pub med: Option<u32>,
     pub local_pref: Option<u32>,
     /// The next hop a chain set (`set gw`, G3.9fh); `None`: the one the
@@ -172,6 +340,7 @@ impl Route {
             as_path,
             communities: Vec::new(),
             large: Vec::new(),
+            ext: Vec::new(),
             med: None,
             local_pref: None,
             next_hop: None,
@@ -312,5 +481,51 @@ mod tests {
                 .contains("did you mean \"no-export\"")
         );
         assert!(parse_community("1:2:3:4").is_err());
+    }
+
+    #[test]
+    fn extended_communities_parse_print_and_order_like_frr() {
+        // RFC 4360 §3.1 (2-octet AS), §3.2 (IPv4), RFC 5668 (4-octet AS);
+        // sub-type 0x02 Route Target, 0x03 Site of Origin.
+        for (text, octets, frr) in [
+            ("rt:65000:1", 0x0002_fde8_0000_0001u64, "RT:65000:1"),
+            ("rt:1:4294967295", 0x0002_0001_ffff_ffff, "RT:1:4294967295"),
+            ("soo:192.0.2.1:7", 0x0103_c000_0201_0007, "SoO:192.0.2.1:7"),
+            ("rt:4200000000:1", 0x0202_fa56_ea00_0001, "RT:4200000000:1"),
+        ] {
+            let e = parse_ext(text).unwrap();
+            assert_eq!(e.0, octets, "{text}");
+            assert_eq!(e.to_string(), text);
+            assert_eq!(e.frr_display().as_deref(), Some(frr));
+            assert_eq!(Ext::from_frr(frr), Some(e));
+            assert_eq!(parse_ext(&format!("0x{octets:016x}")), Ok(e));
+        }
+        assert_eq!(
+            parse_community("RT:65000:1"),
+            Ok(CommunityValue::Ext(parse_ext("rt:65000:1").unwrap()))
+        );
+        for (bad, why) in [
+            ("rt:65000", "AS:N"),
+            ("rt:70000:70000", "RFC 5668"),
+            ("soo:192.0.2.1:70000", "0..=65535"),
+            ("rt:x:1", "AS number or an IPv4"),
+            ("0x0300000000000000", "only Route Target"),
+            ("0x", "hex digits"),
+            ("color:1", "not an extended community"),
+        ] {
+            let e = parse_ext(bad).unwrap_err();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+        // Ordered by the octets: FRR's order.
+        let mut v = [
+            parse_ext("soo:1:1").unwrap(),
+            parse_ext("rt:2:1").unwrap(),
+            parse_ext("rt:1:1").unwrap(),
+        ];
+        v.sort();
+        assert_eq!(
+            v.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["rt:1:1", "rt:2:1", "soo:1:1"]
+        );
     }
 }

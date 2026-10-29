@@ -16,8 +16,10 @@ use corerouter_model::routing_filter::{PrefixEntry, RoutingFilter};
 use ipnet::IpNet;
 use regex::Regex;
 
-use super::parse::{self, Atom, CommArg, CommHow, CommOp, Expr, Family, SetOp, Stmt};
-use super::{CommunityValue, Large, Protocol, Route};
+use super::parse::{
+    self, Atom, CommArg, CommHow, CommOp, Expr, ExtArg, ExtHow, ExtOp, Family, SetOp, Stmt,
+};
+use super::{CommunityValue, Ext, ExtKind, Large, Protocol, Route};
 
 /// Deepest chain of jumps followed at run time (loops are refused by
 /// [`Policy::build`]; this is the guard behind it).
@@ -183,6 +185,7 @@ enum Test {
     AsPath(usize),
     Comm(CommOp, Vec<u32>),
     Large(CommOp, Vec<Large>),
+    Ext(ExtOp, Vec<Ext>),
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +204,14 @@ enum SetC {
     Gw(std::net::IpAddr),
     Comm(CommHow, Vec<u32>),
     Large(CommHow, Vec<Large>),
+    Ext(ExtHow, ExtSel),
+}
+
+/// What an extended-community action works on (G3.9fc).
+#[derive(Debug, Clone)]
+enum ExtSel {
+    Values(Vec<Ext>),
+    Kind(ExtKind),
 }
 
 #[derive(Debug, Clone)]
@@ -437,8 +448,15 @@ impl Builder<'_> {
         }
     }
 
-    fn comm_values(&mut self, arg: &CommArg, large: bool) -> (Vec<u32>, Vec<Large>) {
-        let values: Vec<CommunityValue> = match arg {
+    /// The values `arg` names; a list without any of the kind `wanted`
+    /// (`normal`, `large`, `extended`) is a problem.
+    fn values(&mut self, arg: &CommArg, wanted: &str) -> Vec<CommunityValue> {
+        let kind = |v: &CommunityValue| match v {
+            CommunityValue::Normal(_) => "normal",
+            CommunityValue::Large(_) => "large",
+            CommunityValue::Ext(_) => "extended",
+        };
+        match arg {
             CommArg::Values(v) => v.clone(),
             CommArg::List(name) => match self.filter.community_lists.get(name) {
                 Some(l) => {
@@ -447,13 +465,9 @@ impl Builder<'_> {
                         .iter()
                         .filter_map(|c| super::parse_community(c).ok())
                         .collect();
-                    if !vals
-                        .iter()
-                        .any(|v| matches!(v, CommunityValue::Large(_)) == large)
-                    {
+                    if !vals.iter().any(|v| kind(v) == wanted) {
                         self.problem(format!(
-                            "community list {name:?} has no {} communities",
-                            if large { "large" } else { "normal" }
+                            "community list {name:?} has no {wanted} communities"
                         ));
                     }
                     vals
@@ -470,7 +484,26 @@ impl Builder<'_> {
                     Vec::new()
                 }
             },
-        };
+        }
+    }
+
+    /// The extended communities `arg` names, sorted (G3.9fc).
+    fn ext_values(&mut self, arg: &CommArg) -> Vec<Ext> {
+        let mut v: Vec<Ext> = self
+            .values(arg, "extended")
+            .into_iter()
+            .filter_map(|c| match c {
+                CommunityValue::Ext(e) => Some(e),
+                _ => None,
+            })
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    fn comm_values(&mut self, arg: &CommArg, large: bool) -> (Vec<u32>, Vec<Large>) {
+        let values = self.values(arg, if large { "large" } else { "normal" });
         let mut n: Vec<u32> = values
             .iter()
             .filter_map(|v| {
@@ -548,6 +581,10 @@ impl Builder<'_> {
                         Test::Comm(*op, n)
                     }
                 }
+                Atom::Ext { op, arg } => {
+                    let v = self.ext_values(arg);
+                    Test::Ext(*op, v)
+                }
             }),
         }
     }
@@ -584,6 +621,21 @@ impl Builder<'_> {
                             SetC::Comm(*how, n)
                         }
                     }
+                    SetOp::Ext { how, arg } => SetC::Ext(
+                        *how,
+                        match arg {
+                            ExtArg::Kind(k) => ExtSel::Kind(*k),
+                            ExtArg::Values(v) => {
+                                let mut v = v.clone();
+                                v.sort_unstable();
+                                v.dedup();
+                                ExtSel::Values(v)
+                            }
+                            ExtArg::List(n) => {
+                                ExtSel::Values(self.ext_values(&CommArg::List(n.clone())))
+                            }
+                        },
+                    ),
                 }),
             })
             .collect()
@@ -746,6 +798,7 @@ impl Policy {
                     Test::Proto(p) => r.protocol == *p,
                     Test::Comm(op, want) => comm_match(*op, want, &r.communities),
                     Test::Large(op, want) => comm_match(*op, want, &r.large),
+                    Test::Ext(op, want) => ext_match(*op, want, &r.ext),
                     Test::AsPath(i) => {
                         if ctx.path.is_none() {
                             ctx.path = Some(r.path_text());
@@ -775,6 +828,34 @@ fn comm_match<T: Ord>(op: CommOp, want: &[T], have: &[T]) -> bool {
         CommOp::Includes => want.iter().all(|w| have.binary_search(w).is_ok()),
         CommOp::Any => want.iter().any(|w| have.binary_search(w).is_ok()),
         CommOp::Equal => want == have,
+    }
+}
+
+/// G3.9fc: RouterOS's extended-community matchers.
+fn ext_match(op: ExtOp, want: &[Ext], have: &[Ext]) -> bool {
+    match op {
+        ExtOp::Includes => comm_match(CommOp::Includes, want, have),
+        ExtOp::Any => comm_match(CommOp::Any, want, have),
+        ExtOp::Equal => comm_match(CommOp::Equal, want, have),
+        ExtOp::Subset => have.iter().all(|h| want.binary_search(h).is_ok()),
+    }
+}
+
+/// G3.9fc: `set` replaces, `append` adds, `delete` removes the values or
+/// a kind, `filter` keeps only the values.
+fn change_ext(how: ExtHow, sel: &ExtSel, have: &mut Vec<Ext>) {
+    match (how, sel) {
+        (ExtHow::Set, ExtSel::Values(v)) => *have = v.clone(),
+        (ExtHow::Append, ExtSel::Values(v)) => {
+            have.extend_from_slice(v);
+            have.sort_unstable();
+            have.dedup();
+        }
+        (ExtHow::Delete, ExtSel::Values(v)) => have.retain(|e| v.binary_search(e).is_err()),
+        (ExtHow::Delete, ExtSel::Kind(k)) => have.retain(|e| e.kind() != *k),
+        (ExtHow::Filter, ExtSel::Values(v)) => have.retain(|e| v.binary_search(e).is_ok()),
+        // The parser gives a kind to delete only.
+        (_, ExtSel::Kind(_)) => {}
     }
 }
 
@@ -821,6 +902,7 @@ fn apply(s: &SetC, ctx: &mut Ctx<'_>, asn: u32) {
         SetC::Gw(a) => r.next_hop = Some(*a),
         SetC::Comm(how, vals) => change(*how, vals, &mut r.communities),
         SetC::Large(how, vals) => change(*how, vals, &mut r.large),
+        SetC::Ext(how, sel) => change_ext(*how, sel, &mut r.ext),
     }
 }
 

@@ -315,6 +315,7 @@ mod tests {
             BgpAttrs {
                 as_path: "64500 64666".into(),
                 large_communities: vec!["65000:1:2".into()],
+                ext_communities: Vec::new(),
                 ..BgpAttrs::default()
             },
             BgpAttrs {
