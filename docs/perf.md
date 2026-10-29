@@ -2239,3 +2239,8 @@ VM do laboratório (8 vCPUs, KVM aninhado: CHR com 2 vCPUs e 512 MiB), build rel
 | BFD 100 ms × 3, sessão nova: quedas em 30 s (CoreRouter / FRR) | 15 / 12–13 |
 | BFD 300 ms × 3 e × 4, sessão nova: quedas em 30 s | 0 e 0 |
 | BFD 100 ms × 3 trocado com a sessão em Up: quedas em 30 s | 0 |
+
+- 2026-10-28, G1.6m, **medido** (KVM, imagem release, QEMU 2 vCPUs/1 GiB): kernel → daemon
+  pronto 0,90–0,91 s com o renomeio das portas (0,92 s antes); a espera de a lista de links
+  parar (100 ms) custa ~0,1 s no `early boot` (110 ms contra 14 ms); com 300 ms o pronto ia a
+  1,10 s.
