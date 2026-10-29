@@ -1189,6 +1189,43 @@ mod tests {
         (session, srv, port, shutdown)
     }
 
+    /// G3.9h: several readers share one UDP socket. Clients in parallel
+    /// each get their own answer (the id they asked with), and turning the
+    /// forwarder off stops every reader, not just one.
+    #[test]
+    fn parallel_clients_share_the_udp_readers() {
+        let (session, srv, port, shutdown) = lab();
+        assert!((1..=4).contains(&udp_threads()));
+        thread::scope(|s| {
+            for c in 0..8u16 {
+                s.spawn(move || {
+                    let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+                    sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                    for i in 0..50u16 {
+                        let id = c * 1000 + i;
+                        let mut m = Message::query();
+                        m.metadata.id = id;
+                        m.metadata.recursion_desired = true;
+                        m.add_query(Query::query(Name::from_ascii("nas.lan.").unwrap(), RecordType::A));
+                        sock.send_to(&m.to_vec().unwrap(), ("127.0.0.1", port)).unwrap();
+                        let mut buf = [0u8; 512];
+                        let n = sock.recv(&mut buf).unwrap();
+                        let r = Message::from_vec(&buf[..n]).unwrap();
+                        assert_eq!(r.metadata.id, id);
+                        assert_eq!(r.answers[0].data.to_string(), "192.168.88.2");
+                    }
+                });
+            }
+        });
+        lock(&session)
+            .execute("ip.dns.set", &json!({"allow_remote_requests": false}))
+            .unwrap();
+        // Every reader is gone: no answer at all for a few polls in a row.
+        wait("all readers to stop", || (0..4).all(|_| udp(port, &query("nas.lan.", RecordType::A)).is_none()));
+        shutdown.close();
+        drop(srv);
+    }
+
     #[cfg(target_os = "linux")]
     /// Connects from source address `src` (any 127/8 address works on
     /// Linux loopback) and sends the first byte of a length.
