@@ -13,7 +13,7 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use corerouter_engine::Session;
-use corerouter_engine::validate::{UNITS, validate_all, validate_changed};
+use corerouter_engine::validate::{UNITS, validate_all, validate_changed, validate_commit};
 use corerouter_model::Config;
 use corerouter_model::sections::{Sections, changed, restrict};
 use proptest::prelude::*;
@@ -365,6 +365,9 @@ enum Change {
     DropAddress(usize),
     AddressOn(usize),
     DropRoute(usize),
+    /// G0.31e: a copy of a route (a duplicate), or one with another
+    /// gateway, destination with host bits or distance 0.
+    CopyRoute(usize, u8),
     DropRule(usize),
     DropListEntry(usize),
     DropPool(usize),
@@ -392,6 +395,7 @@ fn change() -> impl Strategy<Value = Change> {
         any::<usize>().prop_map(Change::DropAddress),
         any::<usize>().prop_map(Change::AddressOn),
         any::<usize>().prop_map(Change::DropRoute),
+        (any::<usize>(), 0u8..5).prop_map(|(i, how)| Change::CopyRoute(i, how)),
         any::<usize>().prop_map(Change::DropRule),
         any::<usize>().prop_map(Change::DropListEntry),
         any::<usize>().prop_map(Change::DropPool),
@@ -471,6 +475,22 @@ fn apply(c: &mut Config, ch: &Change) {
                 c.ip.routes.remove(k);
             }
         }
+        Change::CopyRoute(i, how) => {
+            if let Some(mut r) = pick(c.ip.routes.len(), i)
+                .and_then(|k| c.ip.routes.get(k))
+                .cloned()
+            {
+                r.id = c.ip.next_route_id();
+                match how {
+                    0 => {}
+                    1 => r.gateway = "10.10.0.9".parse().unwrap(),
+                    2 => r.gateway = "203.0.113.1".parse().unwrap(),
+                    3 => r.dst_address = "172.16.0.1/16".parse().unwrap(),
+                    _ => r.distance = 0,
+                }
+                c.ip.routes.push(r);
+            }
+        }
         Change::DropRule(i) => {
             if let Some(k) = pick(c.ip.firewall.filter.len(), i) {
                 c.ip.firewall.filter.remove(k);
@@ -532,5 +552,8 @@ proptest! {
         }
         let diff = changed(&base, &c);
         prop_assert_eq!(sorted(validate_changed(&c, diff)), sorted(validate_all(&c)), "changed {:?}", diff);
+        // G0.31e: the commit's own validation, routes from the index: the
+        // same issues in the same order.
+        prop_assert_eq!(validate_commit(&base, &c, diff), validate_all(&c), "changed {:?}", diff);
     }
 }

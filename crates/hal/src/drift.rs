@@ -19,6 +19,7 @@ use std::net::IpAddr;
 
 use corerouter_model::os_loopback::{is_os_address, is_os_loopback};
 use corerouter_model::route::{self, Reach};
+use corerouter_model::routes::Dst;
 use corerouter_model::{Config, IfName, InterfaceKind, RouteEntry};
 use ipnet::IpNet;
 use serde::Serialize;
@@ -121,6 +122,42 @@ pub fn kernel_routes_of<'a>(
             })
         })
         .collect()
+}
+
+/// [`kernel_routes`] of the routes of `cfg` to the destinations `dsts`,
+/// found through the index of `ip.routes` (G0.31e).
+pub fn kernel_routes_to<'a>(
+    cfg: &Config,
+    dsts: impl IntoIterator<Item = &'a Dst>,
+) -> BTreeSet<KernelRoute> {
+    kernel_routes_of(
+        cfg,
+        dsts.into_iter().flat_map(|d| cfg.ip.routes.routes_to(d)),
+    )
+}
+
+/// The kernel routes a commit from `from` to `to` removes and adds, as
+/// (gone, new), resolving only the destinations it touched (G0.31e: one
+/// route among 60 000 resolved ~128, not 120 000). A route resolves
+/// through the interfaces and addresses only (`route::reach`): with those
+/// the same, a route in a block both configs share resolves the same on
+/// both sides. `None` when they changed: compare [`kernel_routes`] whole.
+pub fn route_changes(
+    from: &Config,
+    to: &Config,
+) -> Option<(BTreeSet<KernelRoute>, BTreeSet<KernelRoute>)> {
+    let addresses_same =
+        corerouter_model::cow_list::CowList::ptr_eq(&from.ip.addresses, &to.ip.addresses)
+            || from.ip.addresses == to.ip.addresses;
+    if corerouter_model::sections::interfaces_changed(from, to) || !addresses_same {
+        return None;
+    }
+    let dsts = to.ip.routes.changed_dsts(&from.ip.routes);
+    let (old, new) = (kernel_routes_to(from, &dsts), kernel_routes_to(to, &dsts));
+    Some((
+        old.difference(&new).cloned().collect(),
+        new.difference(&old).cloned().collect(),
+    ))
 }
 
 /// What applying `cfg` leaves in the data plane.

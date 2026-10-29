@@ -71,6 +71,22 @@ punha N), e N já em 16. Em
 modo transacional, `routing.filter.impact` mostra o efeito antes do commit. Filtros novos já
 nascem com a contagem do RouterOS.
 
+## `set gw` (G3.9fh)
+
+Como o `gw` do RouterOS v7: troca o next hop das rotas da família do endereço (IPv4 → `set ip
+next-hop`, IPv6 → `set ipv6 next-hop global` no FRR); as da outra família passam sem mudar. O
+caso que motivou: o RouterOS 7.25 manda IPv6 numa sessão IPv4 com o next hop IPv4-mapeado
+`::ffff:a.b.c.d`, que nenhum kernel instala (RFC 2545 §3 pede um IPv6 global). Na chain de
+entrada dessa conexão:
+
+```sh
+corerouter-cli run routing.filter.rule.add '{"chain":"chr-in","rule":"if (afi ipv6) { set gw fd39:1::1 } accept"}'
+```
+
+Recusa na hora o que não serve de next hop: mapeado (`::ffff:…`), link-local (precisaria da
+interface), multicast, loopback e não especificado. `routing.bgp.connection.check` avisa
+(`mpbgp-nexthop`) numa conexão IPv4 com `afi=ipv6` cuja chain de entrada não reescreve o next hop.
+
 ## A linguagem
 
 ```text
@@ -78,6 +94,7 @@ rule    := stmt*
 stmt    := if (expr) { stmt* } [else { stmt* } | else if …] | action [;]
 action  := accept | reject | return | jump CHAIN
          | set bgp-local-pref N | set bgp-med N | set bgp-path-prepend 1..16
+         | set gw ENDEREÇO   (G3.9fh: next hop; só nas rotas da família do endereço)
          | set|append|delete bgp-communities VALORES|LISTA   (set … none apaga todas)
          | set|append|delete bgp-large-communities VALORES|LISTA
 expr    := expr || expr | expr && expr | not expr | ! expr | (expr) | matcher

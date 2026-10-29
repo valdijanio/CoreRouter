@@ -15,6 +15,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("resources.check.nic.errors", "## NIC errors\n\nErrors or drops rising on a link."),
     ("resources.check.ntp", "## NTP\n\nClock synchronized?"),
     ("resources.check.oom", "## OOM kills\n\nProcesses killed for lack of memory in the last hour."),
+    ("resources.check.root.verity", "## Root verity\n\nWhether the running slot's root file system is the dm-verity device of its signed root hash. The first boot of a qcow2/OVA image takes the fallback path without verity: reboot once."),
     ("resources.check.rss", "## RSS balance\n\nOne CPU taking most of the receive softirqs."),
     ("resources.check.services", "## Services\n\nSupervised services failed or down."),
     ("resources.check.sockbuf", "## Socket buffers\n\nThe RADIUS and PPPoE sockets got a smaller receive buffer than they asked for (net.core.rmem_max)."),

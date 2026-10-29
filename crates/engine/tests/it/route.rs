@@ -203,6 +203,57 @@ fn backup_route_waits_behind_a_lower_distance() {
     );
 }
 
+/// G0.31d: the duplicate check reads the index of next hops, which every
+/// add, set and remove keeps.
+#[test]
+fn the_same_hop_twice_is_refused_after_set_and_remove() {
+    let mut s = lab();
+    let a = add(
+        &mut s,
+        json!({"dst_address": "10.9.0.0/16", "gateway": "10.0.0.1"}),
+    );
+    let b = add(
+        &mut s,
+        json!({"dst_address": "10.8.0.0/16", "gateway": "10.0.0.1"}),
+    );
+    // Moving b onto a's hop is refused; on its own hop, a set goes through.
+    fails(
+        &mut s,
+        "ip.route.set",
+        json!({"id": b, "dst_address": "10.9.0.0/16"}),
+        &format!("route {a} already goes to 10.9.0.0/16"),
+    );
+    ok(&mut s, "ip.route.set", json!({"id": b, "distance": 5}));
+    // A set that leaves a hop frees it; a remove too.
+    ok(
+        &mut s,
+        "ip.route.set",
+        json!({"id": a, "dst_address": "10.7.0.0/16"}),
+    );
+    ok(
+        &mut s,
+        "ip.route.set",
+        json!({"id": b, "dst_address": "10.9.0.0/16"}),
+    );
+    ok(&mut s, "ip.route.remove", json!({"id": b}));
+    let c = add(
+        &mut s,
+        json!({"dst_address": "10.9.0.0/16", "gateway": "10.0.0.1"}),
+    );
+    // Another gateway to the same place is ECMP, not a duplicate.
+    add(
+        &mut s,
+        json!({"dst_address": "10.9.0.0/16", "gateway": "10.0.0.3"}),
+    );
+    // The hop taken again is refused again.
+    fails(
+        &mut s,
+        "ip.route.add",
+        json!({"dst_address": "10.9.0.0/16", "gateway": "10.0.0.1"}),
+        &format!("route {c} already goes to"),
+    );
+}
+
 #[test]
 fn add_rejects_bad_routes_and_changes_nothing() {
     let mut s = lab();

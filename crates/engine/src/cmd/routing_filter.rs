@@ -434,6 +434,7 @@ fn summary(stmts: &[Stmt]) -> (Vec<String>, Vec<String>, &'static str) {
                         SetOp::LocalPref(v) => format!("local-pref {v}"),
                         SetOp::Med(v) => format!("med {v}"),
                         SetOp::Prepend(n) => format!("prepend {n}"),
+                        SetOp::Gw(g) => format!("gw {g}"),
                         SetOp::Comm { large, how, .. } => format!(
                             "{} {}",
                             match how {
@@ -923,6 +924,11 @@ fn describe_change(a: &Route, b: &Route) -> String {
         && let Some(v) = b.med
     {
         out.push(format!("med {v}"));
+    }
+    if a.next_hop != b.next_hop
+        && let Some(g) = b.next_hop
+    {
+        out.push(format!("gw {g}"));
     }
     if b.as_path.len() > a.as_path.len() {
         let added: Vec<String> = b.as_path.iter().take(b.as_path.len() - a.as_path.len()).map(ToString::to_string).collect();

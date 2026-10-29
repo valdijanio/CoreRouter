@@ -158,7 +158,7 @@ fn list_changed<T: PartialEq>(a: &CowList<T>, b: &CowList<T>) -> bool {
 fn ip_rest(ip: &Ip) -> Ip {
     let mut l = ip.clone();
     l.addresses = CowList::default();
-    l.routes = CowList::default();
+    l.routes = Default::default();
     l.firewall = CowArc::default();
     l.dns_static = CowArc::default();
     l.dns_zones = CowArc::default();
@@ -279,7 +279,7 @@ pub fn restrict(cfg: &Config, keep: Sections) -> Config {
             ip.addresses = CowList::default();
         }
         if !has(Sections::ROUTES) {
-            ip.routes = CowList::default();
+            ip.routes = Default::default();
         }
         if !has(Sections::DNS_STATIC) {
             ip.dns_static = CowArc::default();
