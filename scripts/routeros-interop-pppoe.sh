@@ -581,10 +581,20 @@ case_multi() {
 "
   done
   rosx "$script" >/dev/null || { result multi FAIL "CHR refused the macvlans/clients (macvlan in this RouterOS?)"; return; }
+  # /rest/execute returns before a long script ends: wait for all the
+  # clients to exist (enabling earlier caught only m1 and m2).
+  wait_for 60 multi_made "$n" >/dev/null || { result multi FAIL "CHR made $(multi_made_count) of $n clients"; return; }
   local base t0 ms; base=$(cr_count)
   t0=$(now_ms)
-  # No `$` in the regex: inside a RouterOS string it starts a variable.
-  rosx "/interface pppoe-client enable [find name~\"^m[0-9]\"]" >/dev/null
+  # One `set [find name=…]` per client, the form pc_up uses.
+  local on="" off=""
+  for i in $(seq 1 "$n"); do
+    on+="/interface pppoe-client set [find name=m$i] disabled=no
+"
+    off+="/interface pppoe-client set [find name=m$i] disabled=yes
+"
+  done
+  rosx "$on" >/dev/null
   ms=$(wait_for 120 multi_all "$((base + n))") && result multi OK "$n CHR clients (one MAC each): all up on the BNG in ${ms} ms" \
     || { result multi FAIL "$n clients: $(( $(cr_count) - base )) up on the BNG after 120 s; CHR running $(ros interface/pppoe-client | jq '[.[] | select(.running == "true")] | length')"
          result multi INFO "m2: $(pc_mon m2 | cut -c1-200); CHR log: $(ros log | jq -r '[.[] | select(.message | test("m2"))][-3:][] | .message' | tr '\n' ' ' | cut -c1-300)"
@@ -610,13 +620,20 @@ case_multi() {
   [ $lost = 0 ] && [ "$addrs" = "$n" ] && result multi OK "every subscriber answers a ping from crgup" || result multi INFO "$lost of $n subscribers do not answer a ping from crgup"
   # All down at once from the CPE side: every PADT seen.
   t0=$(now_ms)
-  rosx "/interface pppoe-client disable [find name~\"^m[0-9]\"]" >/dev/null
+  rosx "$off" >/dev/null
   ms=$(wait_for 60 multi_all "$base") && result multi OK "$n clients disabled on the CHR: the BNG back to $base sessions in ${ms} ms" \
     || result multi FAIL "after disabling: $(cr_count) sessions (base $base)"
-  rosx "/interface pppoe-client remove [find name~\"^m[0-9]\"]
-/interface macvlan remove [find name~\"^mv[0-9]\"]" >/dev/null || true
+  local rm=""
+  for i in $(seq 1 "$n"); do
+    rm+="/interface pppoe-client remove [find name=m$i]
+/interface macvlan remove [find name=mv$i]
+"
+  done
+  rosx "$rm" >/dev/null || true
 }
 multi_all() { [ "$(cr_count)" = "$1" ]; }
+multi_made_count() { ros interface/pppoe-client | jq '[.[] | select(.name | test("^m[0-9]+$"))] | length'; }
+multi_made() { [ "$(multi_made_count)" = "$1" ]; }
 
 # FreeRADIUS and the BNG's RADIUS client, once per run. The RADIUS clients
 # all dial from the CHR's ether1 MAC: with one_session_per_host=yes each new
