@@ -40,7 +40,9 @@ pub use conn::Timeouts;
 pub use dial::{Login, Target, Trust, dial};
 pub use dispatch::{Host, NO_UI, SharedHost, dispatch, dispatch_as, hang_up, new_caller};
 pub use known_hosts::KnownHosts;
-pub use server::{Endpoint, Shutdown, bind_loopback, serve, serve_until, spawn, spawn_until};
+pub use server::{
+    Allow, Endpoint, Shutdown, bind_loopback, serve, serve_until, spawn, spawn_until,
+};
 pub use tasks::{ThreadRunner, thread_runner};
 pub use ws::{WsPolicy, serve_ws, serve_ws_until, spawn_ws, spawn_ws_until};
 

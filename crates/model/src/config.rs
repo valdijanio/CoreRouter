@@ -72,6 +72,9 @@ pub struct System {
     /// `/tool graphing` (G4.5): what the traffic history keeps.
     #[serde(skip_serializing_if = "crate::graphing::Graphing::is_default")]
     pub graphing: crate::graphing::Graphing,
+    /// `/ip service www-ssl` and `www` (G1.6o): the GUI in a browser.
+    #[serde(skip_serializing_if = "crate::web::WebService::is_default")]
+    pub web: crate::web::WebService,
 }
 
 impl Default for System {
@@ -85,6 +88,7 @@ impl Default for System {
             analytics: crate::analytics::Analytics::default(),
             bandwidth_server: crate::bandwidth::BandwidthServer::default(),
             graphing: crate::graphing::Graphing::default(),
+            web: crate::web::WebService::default(),
         }
     }
 }

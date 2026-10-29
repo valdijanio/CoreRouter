@@ -235,7 +235,18 @@ sem carregar o arquivo inteiro na memória; texto que não é JSON ou mensagem b
 **Arquivos estáticos** (`--web-root`): só `GET`/`HEAD`; `/` → `index.html`; segmentos com
 `..`, nome oculto (`.x`), `\`, `%`, `:` ou NUL são `404`; o caminho canônico precisa ficar dentro
 da raiz (symlinks não escapam); arquivo até 64 MiB; MIME correto para `.wasm`/`.js`/`.html`;
-`X-Content-Type-Options: nosniff`. Sem `--web-root`, HTTP comum recebe `404`.
+`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` (a GUI do roteador nunca dentro de
+outra página) e `Referrer-Policy: no-referrer`. Um `<arquivo>.gz` ao lado do arquivo (feito no
+build, como o `gzip_static` do nginx) vai com `Content-Encoding: gzip` para quem manda
+`Accept-Encoding: gzip` (RFC 9110 §12.5.3; `q=0` recusa); se só o `.gz` existe (a imagem guarda
+assim o `.wasm` e o JS), quem não aceita gzip recebe `406`. Sem `--web-root`, HTTP comum recebe `404`.
+
+**Pela config: `ip.service.www-ssl.*` / `ip.service.www.*` (G1.6o).** O mesmo endpoint TLS, mas
+ligado, movido e desligado por comando, sem reiniciar (o `/ip service` do RouterOS; detalhes em
+`docs/os-image.md`, "Acesso web"). O daemon segue a config em execução: `--web-files <dist>` diz
+onde está a GUI, `--web-factory-on` liga o `www-ssl` numa config nova. `available_from` derruba,
+antes do TLS e sem resposta, quem não está na lista (`Endpoint::with_allow`); `www` é HTTP só
+para `301` → `https://<host>/` (senha nunca em texto claro).
 
 Na GUI web: `?connect=ws://127.0.0.1:7980` abre a tela de conexão com esse daemon (pede login);
 `?lab` roda o laboratório virtual dentro da página; sem parâmetro, a tela de conexão aponta para

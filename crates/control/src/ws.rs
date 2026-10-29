@@ -130,6 +130,8 @@ struct Head {
     upgrade: bool,
     origin: Option<String>,
     host: Option<String>,
+    /// `Accept-Encoding` takes gzip (G1.6o: the precompressed `.gz`).
+    gzip: bool,
 }
 
 fn parse_head(raw: &[u8]) -> Option<Head> {
@@ -152,9 +154,23 @@ fn parse_head(raw: &[u8]) -> Option<Head> {
             head.origin = Some(value.to_owned());
         } else if name.eq_ignore_ascii_case("host") {
             head.host = Some(value.to_owned());
+        } else if name.eq_ignore_ascii_case("accept-encoding") {
+            head.gzip = takes_gzip(value);
         }
     }
     Some(head)
+}
+
+/// `Accept-Encoding` lists `gzip` (or `*`) without `q=0` (RFC 9110 §12.5.3).
+fn takes_gzip(value: &str) -> bool {
+    value.split(',').any(|item| {
+        let mut parts = item.split(';').map(str::trim);
+        let coding = parts.next().unwrap_or_default();
+        let q = parts
+            .find_map(|p| p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")))
+            .map_or(Some(1.0), |q| q.trim().parse::<f32>().ok());
+        (coding.eq_ignore_ascii_case("gzip") || coding == "*") && q.is_some_and(|q| q > 0.0)
+    })
 }
 
 /// Read up to the blank line that ends the head. Returns the head and
@@ -320,21 +336,48 @@ fn static_file(stream: &mut dyn Conn, head: &Head, root: Option<&Path>) -> io::R
     if !matches!(head.method.as_str(), "GET" | "HEAD") {
         return respond(stream, "405 Method Not Allowed", "GET only");
     }
-    let Some(path) = resolve(root, &head.target) else {
-        return respond(stream, "404 Not Found", "not found");
+    // G1.6o: a `<file>.gz` (made at build time, as nginx's `gzip_static`)
+    // goes to browsers that take gzip: the GUI's 32 MiB wasm crosses the
+    // network as ~11 MiB. The router image keeps only the `.gz` of the big
+    // files; a client that refuses gzip gets `406` for those.
+    let (path, gz) = match resolve(root, &head.target) {
+        Some(p) => {
+            let gz = head.gzip.then(|| gzipped(root, &p)).flatten();
+            (p, gz)
+        }
+        None => {
+            let Some(g) = resolve_gz(root, &head.target) else {
+                return respond(stream, "404 Not Found", "not found");
+            };
+            if !head.gzip {
+                return respond(
+                    stream,
+                    "406 Not Acceptable",
+                    "this file is kept gzip-compressed: send Accept-Encoding: gzip",
+                );
+            }
+            (g.with_extension(""), Some(g))
+        }
+    };
+    let (body, encoding) = match &gz {
+        Some(g) => (g.as_path(), "Content-Encoding: gzip\r\n"),
+        None => (path.as_path(), ""),
     };
     // Streamed, not read into memory: 16 slow readers of the 10 MiB wasm
     // would otherwise hold 160 MiB (the write timeout drops a stalled one).
-    let Ok(file) = fs::File::open(&path) else {
+    let Ok(file) = fs::File::open(body) else {
         return respond(stream, "404 Not Found", "not found");
     };
     let size = file.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
     if size > MAX_FILE {
         return respond(stream, "404 Not Found", "not found");
     }
+    // The router's GUI is never framed by another page (clickjacking) and
+    // never tells another site where it came from.
     let head_bytes = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {size}\r\n\
-         X-Content-Type-Options: nosniff\r\nCache-Control: no-cache\r\n\
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {size}\r\n{encoding}\
+         Vary: Accept-Encoding\r\nX-Content-Type-Options: nosniff\r\n\
+         X-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nCache-Control: no-cache\r\n\
          Connection: close\r\n\r\n",
         mime(&path),
     );
@@ -343,6 +386,23 @@ fn static_file(stream: &mut dyn Conn, head: &Head, root: Option<&Path>) -> io::R
         io::copy(&mut file.take(size), stream)?;
     }
     stream.flush()
+}
+
+/// The `.gz` of a request target whose plain file is not there.
+fn resolve_gz(root: &Path, target: &str) -> Option<PathBuf> {
+    let path = target.split(['?', '#']).next()?;
+    if path.ends_with('/') || path.ends_with(".gz") {
+        return None;
+    }
+    resolve(root, &format!("{path}.gz"))
+}
+
+/// `<path>.gz`, if it is a regular file still under `root`.
+fn gzipped(root: &Path, path: &Path) -> Option<PathBuf> {
+    let mut name = path.file_name()?.to_os_string();
+    name.push(".gz");
+    let gz = path.with_file_name(name).canonicalize().ok()?;
+    (gz.starts_with(root.canonicalize().ok()?) && gz.is_file()).then_some(gz)
 }
 
 /// Map a request target to a regular file inside `root`, or `None`.
@@ -470,6 +530,28 @@ mod tests {
         assert_eq!(r["result"]["identity"], "ws");
         let r = call(&mut ws, json!({"id": 9, "method": "nope"}));
         assert_eq!(r["ok"], false);
+    }
+
+    /// G1.6o: a peer the endpoint's filter refuses (`/ip service address`)
+    /// is disconnected without an answer; the others are served.
+    #[test]
+    fn a_refused_peer_gets_no_answer() {
+        for (allowed, served) in [(false, false), (true, true)] {
+            let listener = bind_loopback(0).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let endpoint =
+                Endpoint::loopback(listener).with_allow(std::sync::Arc::new(move |ip: IpAddr| {
+                    allowed && ip.is_loopback()
+                }));
+            spawn_ws(
+                endpoint,
+                SharedHost(shared(Session::virtual_lab())),
+                WsPolicy::default(),
+                gate(),
+            )
+            .unwrap();
+            assert_eq!(connect(port, None).is_ok(), served, "allowed={allowed}");
+        }
     }
 
     /// G1.4: the browser tab that holds Safe Mode closes → changes undone.
@@ -636,6 +718,58 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// G1.6o: the precompressed `.gz` goes to a browser that takes gzip.
+    #[test]
+    fn serves_the_gzip_copy_to_who_takes_it() {
+        let dir = std::env::temp_dir().join(format!("cr-ws-gz-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("index.html"), "<canvas>").unwrap();
+        fs::write(dir.join("app_bg.wasm"), b"\0asm-plain").unwrap();
+        fs::write(dir.join("app_bg.wasm.gz"), b"gz-bytes").unwrap();
+        let port = start(WsPolicy {
+            web_root: Some(dir.clone()),
+            ..WsPolicy::default()
+        });
+        let get = |enc: &str| {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            write!(
+                s,
+                "GET /app_bg.wasm HTTP/1.1\r\nHost: x\r\nAccept-Encoding: {enc}\r\n\r\n"
+            )
+            .unwrap();
+            let mut out = String::new();
+            s.read_to_string(&mut out).unwrap();
+            out
+        };
+        let gz = get("gzip, deflate, br");
+        assert!(
+            gz.contains("Content-Encoding: gzip\r\n") && gz.ends_with("gz-bytes"),
+            "{gz}"
+        );
+        assert!(gz.contains("application/wasm") && gz.contains("X-Frame-Options: DENY"));
+        for plain in ["br", "gzip;q=0", "identity"] {
+            let out = get(plain);
+            assert!(
+                !out.contains("Content-Encoding") && out.ends_with("asm-plain"),
+                "{plain}: {out}"
+            );
+        }
+        assert!(takes_gzip("*") && takes_gzip("GZIP;q=0.5") && !takes_gzip("gzip; q=0.0"));
+        // Only the .gz kept (the router image): gzip clients get it, others 406.
+        fs::write(dir.join("only.js.gz"), b"gz-js").unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(s, "GET /only.js HTTP/1.1\r\nAccept-Encoding: gzip\r\n\r\n").unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        assert!(
+            out.contains("text/javascript") && out.ends_with("gz-js"),
+            "{out}"
+        );
+        assert!(http_get(port, "/only.js").starts_with("HTTP/1.1 406"));
+        assert!(http_get(port, "/only.js.gz.gz").starts_with("HTTP/1.1 404"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn without_web_root_http_is_refused() {
         let port = start(WsPolicy::default());
@@ -661,6 +795,7 @@ mod tests {
                 upgrade: true,
                 origin: Some("http://a:1".into()),
                 host: Some("a".into()),
+                gzip: false,
             }
         );
         assert!(parse_head(b"\xff\xfe").is_none());

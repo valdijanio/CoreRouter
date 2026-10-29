@@ -119,7 +119,13 @@ pub struct Endpoint {
     pub listener: TcpListener,
     pub tls: Option<Arc<rustls::ServerConfig>>,
     pub timeouts: Timeouts,
+    /// Which peers may connect (RouterOS `/ip service address`); the others
+    /// are disconnected before any handshake, without an answer.
+    pub allow: Option<Allow>,
 }
+
+/// A peer filter of an [`Endpoint`].
+pub type Allow = Arc<dyn Fn(IpAddr) -> bool + Send + Sync>;
 
 impl Endpoint {
     pub fn loopback(listener: TcpListener) -> Self {
@@ -127,6 +133,7 @@ impl Endpoint {
             listener,
             tls: None,
             timeouts: Timeouts::default(),
+            allow: None,
         }
     }
 
@@ -135,7 +142,14 @@ impl Endpoint {
             listener,
             tls: Some(config),
             timeouts: Timeouts::default(),
+            allow: None,
         }
+    }
+
+    /// Accept only the peers `allow` says yes to.
+    pub fn with_allow(mut self, allow: Allow) -> Self {
+        self.allow = Some(allow);
+        self
     }
 
     /// Other socket timeouts than [`Timeouts::default`] (tests, tuning).
@@ -229,6 +243,12 @@ where
         }
         if endpoint.tls.is_none() && !peer.is_some_and(|a| a.ip().is_loopback()) {
             log::warn!("{what}: rejected non-loopback peer");
+            continue;
+        }
+        if let (Some(allow), Some(p)) = (&endpoint.allow, peer)
+            && !allow(p.ip())
+        {
+            log::debug!("{what}: {p} is not allowed to connect; disconnected");
             continue;
         }
         let slot = match slots.take(peer.map(|p| p.ip()), MAX_CONNECTIONS) {
