@@ -18,6 +18,8 @@ cargo xtask os frr-test              # G1.6k: dois roteadores da imagem com OSPF
 cargo xtask os package --out b.crpkg --version 0.1.1 --build 1800000000  # outro pacote deste build
 cargo xtask os build --only crpkg    # G1.6e: só o pacote de atualização (sem disk.img, ISO, qcow2, OVA)
 cargo xtask os push --to 127.0.0.1:7990   # G1.6e: --only crpkg, envia pela rede, espera o slot novo confirmar
+cargo xtask os release-key init           # processo: a chave de release (uma vez, cifrada com senha; docs/release.md)
+cargo xtask os release --tag v0.1.0       # processo: imagem da tag assinada pela chave de release, no rascunho da Release
 ```
 
 `<out>` é a pasta do build deste checkout, fora do repositório (seção "Onde fica o build").
@@ -221,6 +223,14 @@ dele traz. Pasta nova sem a chave = chave nova = o roteador **recusa** o pacote 
 desconhecida); por isso a regra 2 existe, e com `$COREROUTER_OS_OUT` apontando para uma pasta
 sem chave enquanto o `os/out` tem uma o build para e diz o que copiar. Para usar a mesma chave
 em mais de um checkout, copie `keys/` ou passe `--key <pkcs8>` (`$COREROUTER_IMAGE_KEY`).
+
+Essa é a chave de **desenvolvimento**. A de **release**, que assina as versões publicadas, é
+outra: cifrada com senha, fora do repositório e do `/srv/build`
+(`~/.config/corerouter/release-key/`), com a pública em `os/keys/release/` (no git). A imagem
+de desenvolvimento confia nas duas (a VM de teste segue aceitando `os push` e também aceita uma
+release); a imagem de release (`cargo xtask os release`, num `<out>-release` próprio) confia só
+na de release. As chaves que o build põe na imagem são montadas em `<out>/trust/`. Detalhes,
+backup e troca de chave em [release.md](release.md).
 
 ### Migrar o `os/out` de um checkout para o disco de builds
 
@@ -460,7 +470,9 @@ Scrub) e **System › Tuning › Boot** (o que cada slot carrega, "Apply on slot
   recalculada. A imagem só leva a **chave pública** (`/etc/corerouter/image-keys/<id>.pub`); a
   privada fica fora do repositório (`cargo xtask os build --key <pkcs8>` ou
   `$COREROUTER_IMAGE_KEY`; sem elas, uma chave de desenvolvimento gerada uma vez em
-  `<out>/keys/`, fora do repositório; seção "Onde fica o build"). Atualizar para um build mais antigo é recusado
+  `<out>/keys/`, fora do repositório; seção "Onde fica o build"). Imagem de desenvolvimento:
+  essa chave e as de release de `os/keys/release/`; imagem de release: só as de release
+  ([release.md](release.md)). Atualizar para um build mais antigo é recusado
   ("use system.package.downgrade").
 - **Parâmetros carregados:** `console=`, `ip=` e `corerouter.shell=` da linha em uso que não
   estão na embutida passam para o slot gravado (como o `linux_append` de OEM do Flatcar): uma

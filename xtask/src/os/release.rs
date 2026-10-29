@@ -6,6 +6,8 @@
 //!   disk (default `~/.config/corerouter/release-key`, 0700). Its public key
 //!   goes into `os/keys/release/` by a PR: development images then trust it
 //!   too, release images trust only it.
+//! - `os release-key check [--dir D]`: the passphrase opens the key (the
+//!   backup check), and whether its public key is in `os/keys/release/`.
 //! - `os release --tag vX.Y.Z`: checks that the checkout is exactly that
 //!   tag, builds the image apart from the development build, signs it with
 //!   the release key (decrypted into `$XDG_RUNTIME_DIR` for the build and
@@ -28,7 +30,7 @@ pub const RELEASE_KEYS: &str = "os/keys/release";
 /// The file `corerouter-image release-key` writes.
 const KEY_FILE: &str = "release-image-key.enc";
 const BUILD_DISK: &str = "/srv/build";
-const USAGE_KEY: &str = "usage: cargo xtask os release-key init [--dir DIR]";
+const USAGE_KEY: &str = "usage: cargo xtask os release-key <init|check> [--dir DIR]";
 const USAGE: &str = "usage: cargo xtask os release --tag vX.Y.Z [--key-dir DIR] [--dry-run] [--no-build] [--repo OWNER/NAME] [--jobs N] [--top-jobs N]";
 
 /// `~/.config/corerouter/release-key` (`$XDG_CONFIG_HOME` first).
@@ -91,7 +93,7 @@ fn key_dir_refusal(dir: &Path, root: &Path) -> Option<String> {
 }
 
 pub fn release_key(root: &Path, args: &[String]) -> Result<(), String> {
-    let (Some("init"), rest) = (
+    let (Some(sub @ ("init" | "check")), rest) = (
         args.first().map(String::as_str),
         args.get(1..).unwrap_or(&[]),
     ) else {
@@ -115,22 +117,36 @@ pub fn release_key(root: &Path, args: &[String]) -> Result<(), String> {
     let tool = ab::tool(root)?;
     let d = dir.to_string_lossy().into_owned();
     let v: Value = serde_json::from_str(
-        tool_output(&tool, &["release-key", "init", "--dir", d.as_str()])?.trim(),
+        tool_output(&tool, &["release-key", sub, "--dir", d.as_str()])?.trim(),
     )
     .map_err(|e| e.to_string())?;
+    if sub == "check" {
+        let id = v.get("id").and_then(Value::as_str).unwrap_or("?");
+        let known = release_keys(&root.join(RELEASE_KEYS))?
+            .iter()
+            .any(|(k, _)| k == id);
+        eprintln!(
+            "release key {id} in {d}: the passphrase opens it; it is {}in {RELEASE_KEYS}/ of this checkout",
+            if known { "" } else { "NOT " }
+        );
+        return Ok(());
+    }
     let id = v.get("id").and_then(Value::as_str).unwrap_or("?");
     let pub_file = v.get("pub").and_then(Value::as_str).unwrap_or("?");
-    eprintln!(
-        "\nrelease key {id} made in {d}\n\
-         \n\
-         Next:\n\
-         1. Back up the whole directory offline now (two USB drives kept apart, or paper for\n\
-            the passphrase): without the key and its passphrase no router installed from a\n\
-            release accepts another update. docs/release.md, \"Backup\".\n\
-         2. Put the public key in the repository by a PR (it is public; the private part never):\n\
-              cp {pub_file} {RELEASE_KEYS}/\n\
-            From then on development images trust it as well, and `os release` signs with it."
-    );
+    for line in [
+        format!("\nrelease key {id} made in {d}\n\nNext:"),
+        "1. Back up the whole directory offline now (two USB drives kept apart; the".into(),
+        "   passphrase on paper, apart from them): without the key and its passphrase no".into(),
+        "   router installed from a release accepts another update (docs/release.md, \"Backup\")."
+            .into(),
+        "2. Put the public key in the repository by a PR (it is public; the private part never):"
+            .into(),
+        format!("     cp {pub_file} {RELEASE_KEYS}/"),
+        "   From then on development images trust it as well, and `os release` signs with it."
+            .into(),
+    ] {
+        eprintln!("{line}");
+    }
     Ok(())
 }
 

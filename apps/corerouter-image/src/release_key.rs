@@ -6,6 +6,8 @@
 //!   (the PKCS#8 under Argon2id + ChaCha20-Poly1305) and `D/<id>.pub`, the
 //!   public key the release images trust. Refuses a directory that already
 //!   has a key.
+//! - `release-key check --dir D`: decrypts in memory and prints the key id
+//!   (the backup check; nothing is written).
 //! - `release-key decrypt --dir D --out F`: the PKCS#8 in `F` (0600, a new
 //!   file), for the time of one release build; checked against `D/<id>.pub`.
 //!
@@ -44,7 +46,7 @@ pub const PASSPHRASE_ENV: &str = "COREROUTER_RELEASE_KEY_PASSPHRASE";
 pub fn main(args: &[String]) -> Result<(), String> {
     let (sub, rest) = args
         .split_first()
-        .ok_or("usage: corerouter-image release-key <init --dir D | decrypt --dir D --out F>")?;
+        .ok_or("usage: corerouter-image release-key <init --dir D | check --dir D | decrypt --dir D --out F>")?;
     let mut dir = None;
     let mut out = None;
     let mut it = rest.iter();
@@ -79,6 +81,15 @@ pub fn main(args: &[String]) -> Result<(), String> {
             let pass = passphrase(false)?;
             let pk8 = decrypt_dir(&dir, pass.as_bytes())?;
             crate::write_private(&out, &pk8)?;
+            let id = package::Key::from_hex(&package::public_hex(&pk8)?)
+                .ok_or("public key")?
+                .id_hex();
+            let _ = writeln!(std::io::stdout(), "{}", serde_json::json!({"id": id}));
+            Ok(())
+        }
+        "check" => {
+            let pass = passphrase(false)?;
+            let pk8 = decrypt_dir(&dir, pass.as_bytes())?;
             let id = package::Key::from_hex(&package::public_hex(&pk8)?)
                 .ok_or("public key")?
                 .id_hex();

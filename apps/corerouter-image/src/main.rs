@@ -30,7 +30,7 @@ use std::time::Instant;
 use corerouter_sysupdate::package::{self, Blob, Manifest, Rootfs};
 use corerouter_sysupdate::verity;
 
-const USAGE: &str = "usage: corerouter-image <seal IMAGES | key --keys DIR [--key PKCS8] | package --images DIR (--keys DIR | --key PKCS8) --out FILE [--version V] [--build N] [--channel C] [--squashfs FILE] | info PACKAGE | verify PACKAGE --keys DIR | genkey FILE | release-key (init --dir D | decrypt --dir D --out F) | installer IMAGES | ova --vmdk FILE --capacity BYTES --out FILE [--name N]>";
+const USAGE: &str = "usage: corerouter-image <seal IMAGES | key --keys DIR [--key PKCS8] | package --images DIR (--keys DIR | --key PKCS8) --out FILE [--version V] [--build N] [--channel C] [--squashfs FILE] | info PACKAGE | verify PACKAGE --keys DIR | genkey FILE | release-key (init --dir D | check --dir D | decrypt --dir D --out F) | installer IMAGES | ova --vmdk FILE --capacity BYTES --out FILE [--name N]>";
 
 mod installer;
 mod ova;
