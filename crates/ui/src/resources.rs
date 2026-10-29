@@ -835,6 +835,7 @@ fn static_name(name: &str) -> &'static str {
         "Socket buffers",
         "Admin password",
         "Root verity",
+        "BGP End-of-RIB",
     ]
     .into_iter()
     .find(|n| *n == name)
