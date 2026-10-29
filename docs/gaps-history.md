@@ -252,3 +252,8 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-29 — G1.6qf feito (Safe Mode recusado na chamada avulsa da CLI)
 - 2026-10-29 — G3.9hb feito (`interface=` do RouterOS em `/interface vlan add`); G3.9he criado (o que ainda diverge em `/interface vlan`)
 - 2026-10-29 — G3.9hc feito (S-tag 802.1ad na janela de VLAN)
+- 2026-10-29 — G0.31c feito (conntrack lido e filtrado fora do lock do `Session`)
+- 2026-10-29 — G0.31d feito (índice das rotas estáticas para a checagem de duplicata)
+- 2026-10-29 — G1.6qa feito (reboot e desligamento limpos pela rede)
+- 2026-10-29 — G3.9fg feito (contagem do bgp-path-prepend do RouterOS, com migração explícita)
+- 2026-10-29 — G3.9fh feito (next hop IPv4-mapeado do RouterOS reescrito por `set gw`)
