@@ -111,7 +111,7 @@ endereço muda ou sai, o prefixo velho vai 3 vezes com lifetime 0.
 - Os prefixos dinâmicos vêm de cada endereço global /64 da interface.
   - Um prefixo estático igual substitui o dinâmico; desativado, o esconde. Isso faz o papel do
     `advertise=no`.
-  - O campo `advertise` no `ip.address` virou a gap G3.9hi: são 44 construções do
+  - O campo `advertise` no `ip.address` virou a gap G3.9hj: são 44 construções do
     `AddressEntry`, num ponto quente.
 - O prefixo do DHCPv6-PD (um endereço `from_pool` na LAN) entra com os lifetimes que restam da
   delegação, com teto de 5400/2700 s (RFC 9096 §3.4). A contagem regressiva não reinicia a
@@ -146,11 +146,11 @@ endereço muda ou sai, o prefixo velho vai 3 vezes com lifetime 0.
 
 | Gap | O quê | Por quê |
 |---|---|---|
-| G3.9hf | Route Information (RFC 4191 §2.3) e PREF64 (RFC 8781) | — |
-| G3.9hg | RA só no mestre VRRP | Depende do VRRP |
-| G3.9hh | Prefixos anunciados persistidos para depreciar depois de um reboot | — |
-| G3.9hi | `advertise`/`eui-64`/`no-dad` no `ip.address` | — |
-| G3.9hj | RA guard nas portas de LAN (RFC 6105) | — |
+| G3.9hg | Route Information (RFC 4191 §2.3) e PREF64 (RFC 8781) | — |
+| G3.9hh | RA só no mestre VRRP | Depende do VRRP |
+| G3.9hi | Prefixos anunciados persistidos para depreciar depois de um reboot | — |
+| G3.9hj | `advertise`/`eui-64`/`no-dad` no `ip.address` | — |
+| G3.9hk | RA guard nas portas de LAN (RFC 6105) | — |
 
 ## Decisão: Rust puro × radvd
 
