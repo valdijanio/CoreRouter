@@ -158,6 +158,10 @@ pub struct Inputs {
     /// Enabled accounts of group full without a password (G0.3d): the
     /// router takes an empty password from the network for them.
     pub no_password: Vec<String>,
+    /// The running slot of the A/B image and whether its root is the
+    /// dm-verity device of its signed root hash (G1.6qb). `None`: not on
+    /// the image (lab, browser, the package service has not reported).
+    pub root_verity: Option<(String, bool)>,
     /// Whether any reading exists at all.
     pub readings: bool,
 }
@@ -375,6 +379,21 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
             Some("Defina a senha: botão \"Set password\" na barra da GUI, `/user set admin password=…` no terminal ou user.set."));
     }
 
+    // The root file system checked block by block against the signed root
+    // hash (G1.6qb). The first boot of a qcow2/OVA or of a disk written with
+    // dd goes through the built-in fallback `root=PARTUUID=`, without
+    // verity, and writes the slot's boot entry: the next boot is verified.
+    // A VM of the 2026-10-29 test ran a whole day like that unnoticed.
+    match &i.root_verity {
+        None => push("root.verity", "Root verity", Severity::Unknown, None,
+            "fora da imagem A/B (laboratório, ou o serviço de pacotes não respondeu)".into(), None),
+        Some((slot, true)) => push("root.verity", "Root verity", Severity::Ok, Some(format!("slot {slot}")),
+            format!("o slot {slot} roda pela raiz dm-verity, conferida contra o hash assinado"), None),
+        Some((slot, false)) => push("root.verity", "Root verity", Severity::Warning, Some(format!("slot {slot}")),
+            format!("o slot {slot} rodando não está em dm-verity: a raiz não é conferida contra o hash assinado (primeiro boot de qcow2/OVA ou de disco gravado com dd pelo caminho reserva, ou NVRAM apagada)"),
+            Some("Reinicie uma vez (`/system reboot confirm=yes` no terminal, ou system.reboot): este boot já gravou a entrada de boot do slot e o próximo sobe pela raiz verificada. Se o aviso voltar, confira em System › Packages a entrada de boot e a linha de comando do slot.")),
+    }
+
     // Supervised services.
     match &i.services {
         None => push("services", "Services", Severity::Unknown, None, "sem supervisor de serviços (laboratório)".into(), None),
@@ -453,6 +472,18 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
         }
     }
     out
+}
+
+/// (running slot, on dm-verity) from the package service's status, or
+/// `None` off the image (and in its lab, which has no real root).
+fn root_verity(st: &serde_json::Value) -> Option<(String, bool)> {
+    use serde_json::Value;
+    let on = |v: &Value, k: &str| v.get(k).and_then(Value::as_bool) == Some(true);
+    if !on(st, "supported") || on(st, "lab") {
+        return None;
+    }
+    let slot = st.get("slots")?.as_array()?.iter().find(|s| on(s, "running"))?;
+    Some((slot.get("slot")?.as_str()?.to_owned(), on(slot, "verity")))
 }
 
 /// The worst severity of `checks` (unknown counts as ok).
@@ -562,6 +593,10 @@ impl Session {
             .filter(|t| t.supervised)
             .map(|t| t.rows.iter().map(|r| (r.name.clone(), r.state)).collect());
         i.no_password = self.admins_without_password();
+        i.root_verity = self
+            .ext::<crate::package::Packages>()
+            .and_then(|p| p.status.as_ref())
+            .and_then(root_verity);
         i
     }
 
@@ -639,13 +674,14 @@ mod tests {
             sockbuf: Some(vec![("radius".into(), 4 << 20, 4 << 20)]),
             ecmp: Some((0, 0, None)),
             no_password: Vec::new(),
+            root_verity: Some(("a".into(), true)),
         }
     }
 
     #[test]
     fn healthy_is_all_ok() {
         let checks = evaluate(&healthy());
-        assert_eq!(checks.len(), 15);
+        assert_eq!(checks.len(), 16);
         for c in &checks {
             assert_eq!(c.severity, Severity::Ok, "{c:?}");
             assert!(c.action.is_none());
@@ -697,6 +733,8 @@ mod tests {
             ("ecmp static + dhcp", |i| i.ecmp = Some((1, 0, Some(("x".into(), Some("ip.dhcp-client.set".into()))))), "routes.ecmp", Severity::Warning),
             ("routes not read", |i| i.ecmp = None, "routes.ecmp", Severity::Unknown),
             ("admin without a password", |i| i.no_password = vec!["admin".into()], "auth.no_password", Severity::Warning),
+            ("root without dm-verity", |i| i.root_verity = Some(("b".into(), false)), "root.verity", Severity::Warning),
+            ("not the A/B image", |i| i.root_verity = None, "root.verity", Severity::Unknown),
         ];
         for (what, change, key, want) in cases {
             let mut i = healthy();
