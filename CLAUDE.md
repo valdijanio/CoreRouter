@@ -229,7 +229,9 @@ MCP: `claude mcp add corerouter -- corerouter-cli mcp` (detalhes em `docs/mcp.md
   o completo roda no lote da fila de entrada e na `main`. No GitHub os passos
   rodam em jobs paralelos (`lint`, `test`, `bench-check`, `netns`, `xdp-root`, cada um com
   `cargo xtask ci --only <passos>`), e o check exigido `xtask ci (linux)` confere todos. Para
-  repetir só um passo localmente: `cargo xtask ci --only netns` (ou `cargo xtask netns`).
+  repetir só um passo localmente: `cargo xtask ci --only netns` (ou `cargo xtask netns`). No lote
+  da fila, `test`, `bench-check` e `netns` rodam no runner próprio quando ele está online (VM
+  `corerouter-ci`, só código confiável; `docs/ci-runner.md`).
 - **Orçamento de testes (G0.30): o tempo do portão não cresce com o número de testes.**
   - **Camadas:** a **rápida** (`--affected`, `--fast` e o job `test` do PR) roda tudo menos os
     testes cujo nome (da função ou de um módulo) começa com `slow_`, com `PROPTEST_CASES=32`;

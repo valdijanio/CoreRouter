@@ -5,6 +5,7 @@ mod affected;
 mod bench;
 mod bng_lab;
 mod changes;
+mod ci_runner;
 mod ebpf;
 mod layers;
 mod os;
@@ -21,7 +22,7 @@ use std::process::{Command, ExitCode};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-const USAGE: &str = "usage: cargo xtask <ci [--affected [--base <ref>]] [--fast] [--only <step>,...] [--no-wait]|fmt|clippy|test|bench-check|netns|xdp-root|docs|ebpf-check|layers|agents-sync|wasm|bench|bng-lab|ebpf|docs fold|vm-lab|os|package gui [--help]>";
+const USAGE: &str = "usage: cargo xtask <ci [--affected [--base <ref>]] [--fast] [--only <step>,...] [--no-wait]|fmt|clippy|test|bench-check|netns|xdp-root|docs|ebpf-check|layers|agents-sync|wasm|bench|bng-lab|ebpf|docs fold|vm-lab|ci-runner|os|package gui [--help]>";
 
 /// Crates that must keep compiling for the browser.
 const WASM_PACKAGES: &[&str] = &[
@@ -284,6 +285,17 @@ fn main() -> ExitCode {
                 }
                 Outcome::Fail(why) => {
                     eprintln!("FAIL bng-lab: {why}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        // The self-hosted CI runner's VM (docs/ci-runner.md).
+        "ci-runner" => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            return match ci_runner::main(&root, &rest) {
+                Outcome::Ok | Outcome::Skip(_) => ExitCode::SUCCESS,
+                Outcome::Fail(why) => {
+                    eprintln!("FAIL ci-runner: {why}");
                     ExitCode::FAILURE
                 }
             };

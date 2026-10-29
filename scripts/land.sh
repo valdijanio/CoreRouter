@@ -26,8 +26,14 @@
 # Sem --batch, um por um: merge da `main` na branch do PR, fold, push, CI completo disparado no
 # commit que vai entrar, squash; para no primeiro problema.
 #
+# Runner do lote: os jobs pesados (test, bench-check, netns) vão para o runner próprio
+# (`corerouter`, docs/ci-runner.md) quando o GitHub o mostra online, senão para os do GitHub; lote
+# com PR de fork vai sempre para os do GitHub. Ociosa, a fila contínua volta a VM do runner ao
+# snapshot a cada CI_RUNNER_RESET_JOBS jobs (`cargo xtask ci-runner reset --if-due`).
+#
 # Ambiente: BASE (padrão main); LAND_DIR (padrão <repo>/target-land: worktrees e o target do
-# xtask, fora do git); FOLD_MIN (padrão 10).
+# xtask, fora do git); FOLD_MIN (padrão 10); LAND_CI_RUNNER (auto, github ou corerouter);
+# CI_RUNNER_RESET_JOBS (padrão 40).
 set -euo pipefail
 
 batch=0 fold=0 watch=0
@@ -265,6 +271,34 @@ squash() {
   gh pr merge -R "$repo" "$n" --squash --subject "$title (#$n)" --match-head-commit "$sha"
 }
 
+# Runner dos jobs pesados do lote (docs/ci-runner.md): `corerouter` quando o GitHub mostra algum
+# runner com esse rótulo online; senão `github`, para a fila nunca esperar um runner fora do ar
+# (um job em `self-hosted` sem runner fica na fila do Actions por até 24 h). LAND_CI_RUNNER força.
+ci_runner() {
+  local online
+  case "${LAND_CI_RUNNER:-auto}" in
+    github | corerouter) printf '%s\n' "$LAND_CI_RUNNER"; return ;;
+  esac
+  online=$(gh api "repos/$repo/actions/runners" --jq \
+    '[.runners[] | select(.status == "online" and any(.labels[]; .name == "corerouter"))] | length' \
+    2>/dev/null || echo 0)
+  if [ "${online:-0}" -gt 0 ] 2>/dev/null; then echo corerouter; else echo github; fi
+}
+
+# Ociosa: a VM do runner volta ao snapshot `registered` depois de CI_RUNNER_RESET_JOBS jobs
+# (no máximo uma consulta a cada 10 min; não mexe se um job estiver rodando nem se a VM não
+# existir). Falha aqui só avisa: a fila segue, no máximo nos runners do GitHub.
+RUNNER_CHECKED=0
+ci_runner_maintenance() {
+  local now
+  now=$(date +%s)
+  [ $((now - RUNNER_CHECKED)) -ge 600 ] || return 0
+  RUNNER_CHECKED=$now
+  virsh -c qemu:///system domstate corerouter-ci >/dev/null 2>&1 || return 0
+  (cd "$root" && cargo xtask ci-runner reset --if-due "${CI_RUNNER_RESET_JOBS:-40}" 2>&1 |
+    sed 's/^/  /') || say "  aviso: ci-runner reset --if-due falhou (docs/ci-runner.md)"
+}
+
 pr_info() {
   gh pr view "$1" --json state,isCrossRepository,headRefName,headRefOid \
     --jq '"\(.state) \(.isCrossRepository) \(.headRefName) \(.headRefOid)"'
@@ -283,7 +317,7 @@ members=()
 declare -A SKIP=()
 combo_sha="" combo_branch=""
 build_combo() {
-  local from=$1 name=$2 n state cross branch head wt
+  local from=$1 name=$2 n state cross branch head wt runner fork=0
   shift 2
   members=()
   git -C "$root" fetch --quiet origin "$base"
@@ -311,6 +345,7 @@ build_combo() {
     if merge_fold_aware "origin/$branch" "lote: #$n"; then
       members+=("$n")
       HEADS[$n]=$head
+      if [ "$cross" = true ]; then fork=1; fi
     else
       # Sem SKIP: o conflito é com outro PR do lote (ou do lote especulativo), não com a main;
       # quando aquele entra, este pode mesclar limpo. Marcar fazia a fila ignorá-lo até a branch
@@ -332,8 +367,11 @@ build_combo() {
   combo_sha=$(git rev-parse HEAD)
   combo_branch="queue/batch-$(date +%s%N | cut -c1-13)"
   git push --quiet origin "HEAD:refs/heads/$combo_branch"
-  gh workflow run ci.yml --ref "$combo_branch" >/dev/null
-  say "== lote ${members[*]}: CI da combinação ($(git rev-parse --short HEAD), sobre ${from#origin/})"
+  # Código de fork nunca vai para o runner próprio (o repositório é público): docs/ci-runner.md.
+  runner=$(ci_runner)
+  if [ "$fork" = 1 ]; then runner=github; fi
+  gh workflow run ci.yml --ref "$combo_branch" -f runner="$runner" >/dev/null
+  say "== lote ${members[*]}: CI da combinação ($(git rev-parse --short HEAD), sobre ${from#origin/}, runner $runner)"
   cd "$root"
   return 0
 }
@@ -540,6 +578,7 @@ watch() {
         MERGED_ANY=0
         maybe_fold
       fi
+      ci_runner_maintenance
       idle=$((idle + tick))
       if [ "$idle" -ge "$max_idle" ]; then
         say "fila contínua: ${max_idle}s sem PR pronto, encerrando"
