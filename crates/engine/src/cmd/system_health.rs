@@ -97,8 +97,9 @@ mod tests {
         let mut s = Session::virtual_lab();
         let v = s.execute("system.health.check", &json!({})).unwrap();
         let checks = v["checks"].as_array().unwrap();
-        assert_eq!(checks.len(), 15);
+        assert_eq!(checks.len(), 16);
         let by = |k: &str| checks.iter().find(|c| c["key"] == k).unwrap().clone();
+        assert_eq!(by("root.verity")["severity"], "unknown", "no A/B image in the lab");
         assert_eq!(by("routes.ecmp")["severity"], "ok", "the lab has no ECMP (G1.27j)");
         assert_eq!(by("auth.no_password")["severity"], "ok", "the lab has no admin yet");
         assert_eq!(by("nic.errors")["severity"], "warning", "ether4's bad cable");
@@ -111,6 +112,36 @@ mod tests {
         assert!(by("nic.errors")["action"].is_string());
         assert!(by("temperature")["action"].is_null(), "no action when ok");
         assert!(s.execute("system.health.check", &json!({"all": true})).is_err());
+    }
+
+    /// G1.6qb: the running slot booted without dm-verity (first boot of a
+    /// qcow2/OVA by the fallback path) is a warning that says to reboot once.
+    #[test]
+    fn root_without_verity_says_reboot_once() {
+        let mut s = Session::virtual_lab();
+        let status = |verity: bool| {
+            json!({"supported": true, "lab": false, "running": "a", "slots": [
+                {"slot": "a", "running": true, "verity": verity},
+                {"slot": "b", "running": false, "verity": false}]})
+        };
+        let check = |s: &mut Session| {
+            let v = s.execute("system.health.check", &json!({})).unwrap();
+            v["checks"].as_array().unwrap().iter().find(|c| c["key"] == "root.verity").unwrap().clone()
+        };
+        crate::package::feed_status(&mut s, status(false));
+        let c = check(&mut s);
+        assert_eq!(c["severity"], "warning");
+        assert_eq!(c["value"], "slot a");
+        assert!(c["reason"].as_str().unwrap().contains("dm-verity"), "{c}");
+        assert!(c["action"].as_str().unwrap().contains("Reinicie uma vez"), "{c}");
+        assert!(c["action"].as_str().unwrap().contains("system.reboot"), "{c}");
+        crate::package::feed_status(&mut s, status(true));
+        assert_eq!(check(&mut s)["severity"], "ok");
+        // The package service's lab has no real root: not judged.
+        let mut lab = status(false);
+        lab["lab"] = json!(true);
+        crate::package::feed_status(&mut s, lab);
+        assert_eq!(check(&mut s)["severity"], "unknown");
     }
 
     #[test]
