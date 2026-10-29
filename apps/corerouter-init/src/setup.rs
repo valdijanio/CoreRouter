@@ -3,7 +3,8 @@
 //! this, a person at the console of a fresh router could do nothing. Like
 //! the first login of a CHR or a VyOS box, while no port has an address it
 //! asks for the management port, address and gateway and the `admin`
-//! password (network logins are refused until it has one), shows what it is
+//! password (optional: as on a CHR, the network takes the empty one until
+//! it has one, with a warning everywhere — G0.3d), shows what it is
 //! about to do, and applies it as commands on the control channel only on a
 //! yes. With an address set, Enter shows the router's status and how to
 //! reach it.
@@ -239,7 +240,8 @@ fn ask_and_apply(con: &Console) -> Result<Option<String>, String> {
     let mut password = None;
     if admin_without_password() {
         con.say(
-            "The admin user has no password: logins from the network are refused until it has one.",
+            "The admin user has no password. You can set one now or later: until then anyone \
+             who reaches the router logs in as admin with an empty password.",
         );
         loop {
             let Some(a) = con.ask_secret("New admin password (empty: keep none for now): ") else {
@@ -268,9 +270,16 @@ fn ask_and_apply(con: &Console) -> Result<Option<String>, String> {
         ctl::call("user.set", &json!({"name": "admin", "password": p}))
             .map_err(|e| format!("admin password: {e}"))?;
         con.say("  admin password: set");
+    } else {
+        con.say(NO_PASSWORD_YET);
     }
     Ok(Some(m.address))
 }
+
+/// The last words of a setup that kept admin without a password (G0.3d).
+pub const NO_PASSWORD_YET: &str = "  admin has no password: log in from the network as admin with an \
+     empty password (GUI or CLI, over TLS) and set one there. Until then anyone who reaches \
+     the router can do the same; the GUI, the CLI and the health checks keep warning.";
 
 pub fn summary(m: &Mgmt, password: bool) -> String {
     format!(
@@ -281,7 +290,7 @@ pub fn summary(m: &Mgmt, password: bool) -> String {
         if password {
             "new password"
         } else {
-            "no password (network logins refused)"
+            "no password (empty password works from the network; set one later)"
         }
     )
 }
@@ -326,5 +335,10 @@ mod tests {
         let m = Mgmt::parse("ether2,192.0.2.10/24,192.0.2.1").unwrap();
         let t = summary(&m, true);
         assert!(t.contains("port      ether2") && t.contains("gateway   192.0.2.1"));
+        // G0.3d: no password is a choice, and the text says what it means.
+        let t = summary(&m, false);
+        assert!(t.contains("empty password works from the network"), "{t}");
+        assert!(!t.contains("refused"), "{t}");
+        assert!(NO_PASSWORD_YET.contains("empty password") && NO_PASSWORD_YET.contains("set one"));
     }
 }

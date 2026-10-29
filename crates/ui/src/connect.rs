@@ -76,10 +76,11 @@ pub const OLD_ROUTER: &str =
     "This router runs an old version (without login). Update and restart corerouter-daemon.";
 /// The login was refused (the router never says which part was wrong).
 pub const BAD_LOGIN: &str = "Invalid user or password";
-/// A network login while an account of group full has no password (G0.3b).
-pub const SET_PASSWORD_FIRST: &str = "Set the admin password first: log in on the router's own \
-     machine (127.0.0.1, empty password) and set it; until then logins from the network are \
-     refused.";
+/// What a router between G0.3b and G0.3d answers to a network login while
+/// an account of group full has no password (newer ones accept it).
+pub const SET_PASSWORD_FIRST: &str = "Set the admin password first: this router version refuses \
+     network logins until admin has one. Log in on its own machine (127.0.0.1, empty password) \
+     and set it, or update the router.";
 const TOO_MANY: &str = "Too many failed logins: wait a moment and try again";
 
 /// Why a connection failed, for the operator.
@@ -461,7 +462,7 @@ impl ConnectScreen {
                           OS user runs the router; otherwise it logs in with Login and \
                           Password. Any other address is TLS with a user and password. A \
                           new router's admin has no password: leave Password empty here \
-                          and set one; until then logins from the network are refused.";
+                          (from any network) and set one when asked.";
         let mut enter = false;
         egui::Grid::new("connect-grid")
             .num_columns(2)
