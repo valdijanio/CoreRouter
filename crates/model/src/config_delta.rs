@@ -141,20 +141,14 @@ fn apply_firewall(base: &Firewall, delta: &Value) -> Result<Firewall, PersistErr
     level(
         base,
         delta,
-        &["filter", "nat", "mangle", "address_lists"],
-        |f| {
-            let mut light = f.clone();
-            light.filter = CowList::default();
-            light.nat = CowList::default();
-            light.mangle = CowList::default();
-            light.address_lists = AddressLists::default();
-            light
-        },
+        &["filter", "nat", "mangle", "raw", "address_lists"],
+        light_firewall,
         |out, base, key, op| {
             match key {
                 "filter" => out.filter = list(&base.filter, op)?,
                 "nat" => out.nat = list(&base.nat, op)?,
                 "mangle" => out.mangle = list(&base.mangle, op)?,
+                "raw" => out.raw = list(&base.raw, op)?,
                 "address_lists" => out.address_lists = AddressLists::from_list(list(base.address_lists.list(), op)?),
                 _ => {}
             }
@@ -402,21 +396,38 @@ fn diff_ip(a: &Ip, b: &Ip) -> Result<Option<Value>, PersistError> {
     Ok(p.finish())
 }
 
+/// The firewall without its big lists (every rule table and the address
+/// lists), the part both sides of a delta handle field by field.
+/// Destructured whole: a new table is a compile error here, not a list
+/// serialized twice at every firewall commit (the raw table was, until
+/// 2026-10-29).
+fn light_firewall(f: &Firewall) -> Firewall {
+    let Firewall {
+        filter: _,
+        nat: _,
+        mangle: _,
+        raw: _,
+        address_lists: _,
+        next_rule_id,
+        next_address_list_id,
+        zones,
+    } = f;
+    Firewall {
+        next_rule_id: *next_rule_id,
+        next_address_list_id: *next_address_list_id,
+        zones: zones.clone(),
+        ..Firewall::default()
+    }
+}
+
 fn diff_firewall(a: &Firewall, b: &Firewall) -> Result<Option<Value>, PersistError> {
-    let light = |f: &Firewall| {
-        let mut l = f.clone();
-        l.filter = CowList::default();
-        l.nat = CowList::default();
-        l.mangle = CowList::default();
-        l.address_lists = AddressLists::default();
-        l
-    };
-    let Some(mut p) = Parts::small(a, b, light)? else {
+    let Some(mut p) = Parts::small(a, b, light_firewall)? else {
         return whole(a, b);
     };
     p.list("filter", &a.filter, &b.filter)?;
     p.list("nat", &a.nat, &b.nat)?;
     p.list("mangle", &a.mangle, &b.mangle)?;
+    p.list("raw", &a.raw, &b.raw)?;
     p.list("address_lists", a.address_lists.list(), b.address_lists.list())?;
     Ok(p.finish())
 }
@@ -1106,6 +1117,75 @@ mod tests {
         assert!(diff(&new, &gone).unwrap().to_string().len() < 200);
         check(&gone, &new);
         check(&new, &gone);
+    }
+
+    fn fw_rule(i: u32, chain: &str) -> crate::firewall::FirewallRule {
+        serde_json::from_value(serde_json::json!({
+            "id": format!("*{:X}", i + 1),
+            "chain": chain,
+            "matchers": {"protocol": "tcp", "dst_port": format!("{}", 10000 + i)},
+            "action": {"type": "drop"},
+        }))
+        .unwrap()
+    }
+
+    /// The raw table (G2.1c) is a big list like filter, nat and mangle: a
+    /// commit that touches one rule of any table stores that rule, and the
+    /// raw table is never serialized for it (it was, whole and twice, at
+    /// every firewall commit: ~50 ms of 110 with 4 000 raw rules).
+    #[test]
+    fn one_raw_rule_of_many_is_one_small_delta() {
+        let mut new = big();
+        for i in 0..3000 {
+            new.ip.firewall.raw.push(fw_rule(i, "prerouting"));
+            new.ip.firewall.filter.push(fw_rule(3000 + i, "input"));
+        }
+        let mut old = new.clone();
+        if let Some(r) = old.ip.firewall.raw.get_mut(1500) {
+            r.comment = "x".into();
+        }
+        let d = diff(&new, &old).unwrap();
+        assert!(d.to_string().len() < 600, "{d}");
+        let got = check(&old, &new);
+        assert!(CowList::ptr_eq(&got.ip.firewall.filter, &new.ip.firewall.filter));
+        // A filter rule changed: the raw table is shared, not rebuilt.
+        let mut old = new.clone();
+        if let Some(r) = old.ip.firewall.filter.get_mut(10) {
+            r.disabled = true;
+        }
+        assert!(diff(&new, &old).unwrap().to_string().len() < 600);
+        let got = check(&old, &new);
+        assert!(CowList::ptr_eq(&got.ip.firewall.raw, &new.ip.firewall.raw));
+        // Emptied and filled (raw is left out of the JSON when empty).
+        let mut empty = new.clone();
+        empty.ip.firewall.raw = CowList::default();
+        check(&empty, &new);
+        check(&new, &empty);
+    }
+
+    /// What a firewall delta serializes whole is only the small fields:
+    /// every rule table and the address lists are left out.
+    #[test]
+    fn the_light_firewall_has_no_rule_table() {
+        let mut fw = (*big().ip.firewall).clone();
+        for (i, t) in crate::firewall::Table::ALL.iter().enumerate() {
+            let chain = if *t == crate::firewall::Table::Filter { "input" } else { "prerouting" };
+            let rule = fw_rule(u32::try_from(i).unwrap(), chain);
+            match t {
+                crate::firewall::Table::Filter => fw.filter.push(rule),
+                crate::firewall::Table::Nat => fw.nat.push(rule),
+                crate::firewall::Table::Mangle => fw.mangle.push(rule),
+                crate::firewall::Table::Raw => fw.raw.push(rule),
+            }
+        }
+        fw.next_rule_id = 9;
+        let light = light_firewall(&fw);
+        for t in crate::firewall::Table::ALL {
+            assert!(!fw.rules(t).is_empty(), "{t:?}");
+            assert!(light.rules(t).is_empty(), "{t:?}");
+        }
+        assert!(light.address_lists.list().is_empty());
+        assert_eq!(light.next_rule_id, 9);
     }
 
     #[test]
