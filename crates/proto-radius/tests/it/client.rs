@@ -4,7 +4,7 @@
 
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
-mod common;
+use crate::common;
 
 use std::net::SocketAddr;
 

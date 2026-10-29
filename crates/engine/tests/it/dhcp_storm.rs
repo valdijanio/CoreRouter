@@ -6,7 +6,7 @@
 //! round, and a relay that only takes replies from its servers.
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
-mod support;
+use crate::support;
 
 use std::cell::Cell;
 use std::net::{IpAddr, Ipv4Addr};

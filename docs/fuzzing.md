@@ -38,7 +38,7 @@ que preservam o tipo, para o arquivo ainda decodificar e o config hostil chegar 
 Sem nightly (aleatória, mesma geração estruturada da CI; a falha imprime a entrada mínima):
 
 ```sh
-COREROUTER_FUZZ_CASES=20000 cargo test -p corerouter-engine -p corerouter-control -p corerouter-mcp --test fuzz
+COREROUTER_FUZZ_CASES=20000 cargo test -p corerouter-engine -p corerouter-control -p corerouter-mcp --test it fuzz::
 ```
 
 Com libFuzzer (precisa de `rustup toolchain install nightly` e `cargo install cargo-fuzz`; `-s

@@ -3,7 +3,7 @@
 //! a fixed queue over them is warned.
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
-mod support;
+use crate::support;
 
 use std::sync::{Arc, Mutex};
 

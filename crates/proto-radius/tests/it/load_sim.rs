@@ -13,7 +13,7 @@
 
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

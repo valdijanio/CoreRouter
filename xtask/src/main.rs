@@ -489,6 +489,13 @@ fn fmt(root: &Path) -> Outcome {
     let Some(pkgs) = package_args(|_| true) else {
         return Outcome::Skip("no package in scope".into());
     };
+    let missing = it_mods_missing(root);
+    if !missing.is_empty() {
+        return Outcome::Fail(format!(
+            "not declared in tests/it/main.rs, so never compiled: {}",
+            missing.join(", ")
+        ));
+    }
     let mut c = cargo();
     c.arg("fmt");
     if SCOPE.get().is_none() {
@@ -498,6 +505,65 @@ fn fmt(root: &Path) -> Outcome {
     }
     c.args(["--", "--check"]);
     run(c, root)
+}
+
+/// G0.29: each crate's integration tests are one binary, `tests/it/main.rs`
+/// with a `mod` per file. A file left out of that list would never compile
+/// or run, silently: every `tests/it/<name>.rs` (and `<name>/mod.rs`) needs
+/// its `mod <name>;`.
+fn it_mods_missing(root: &Path) -> Vec<String> {
+    let mut missing = Vec::new();
+    for top in ["crates", "apps"] {
+        let Ok(dirs) = std::fs::read_dir(root.join(top)) else {
+            continue;
+        };
+        let mut dirs: Vec<PathBuf> = dirs.flatten().map(|d| d.path()).collect();
+        dirs.sort();
+        for dir in dirs {
+            let it = dir.join("tests/it");
+            let Ok(main) = std::fs::read_to_string(it.join("main.rs")) else {
+                continue;
+            };
+            let declared = it_mod_names(&main);
+            let Ok(entries) = std::fs::read_dir(&it) else {
+                continue;
+            };
+            let mut names: Vec<String> = entries
+                .flatten()
+                .filter_map(|e| {
+                    let p = e.path();
+                    let file = e.file_name().into_string().ok()?;
+                    if p.is_dir() {
+                        p.join("mod.rs").is_file().then_some(file)
+                    } else {
+                        file.strip_suffix(".rs").map(str::to_owned)
+                    }
+                })
+                .filter(|n| n != "main")
+                .collect();
+            names.sort();
+            let shown = it.strip_prefix(root).unwrap_or(&it).display().to_string();
+            missing.extend(
+                names
+                    .into_iter()
+                    .filter(|n| !declared.contains(n))
+                    .map(|n| format!("{shown}/{n}")),
+            );
+        }
+    }
+    missing
+}
+
+/// The `mod <name>;` declarations of a `tests/it/main.rs`.
+fn it_mod_names(main: &str) -> Vec<String> {
+    main.lines()
+        .filter_map(|l| {
+            let l = l.trim().strip_prefix("pub ").unwrap_or(l.trim());
+            l.strip_prefix("mod ")?
+                .strip_suffix(';')
+                .map(|n| n.trim().to_owned())
+        })
+        .collect()
 }
 
 fn clippy(root: &Path) -> Outcome {
@@ -1003,6 +1069,33 @@ mod tests {
         assert!(names(&["--only"]).is_err());
         assert!(names(&["--only", ","]).is_err());
         assert!(names(&["--quick"]).is_err());
+    }
+
+    #[test]
+    fn it_mods_are_all_declared() {
+        assert_eq!(
+            it_mod_names(
+                "//! x\n#[path = \"../s/mod.rs\"]\nmod support;\n\nmod a;\npub mod b;\n// mod c;\n"
+            ),
+            vec!["support", "a", "b"]
+        );
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        assert_eq!(it_mods_missing(&root), Vec::<String>::new());
+        let tmp = std::env::temp_dir().join(format!("cr-itmods-{}", std::process::id()));
+        let it = tmp.join("crates/x/tests/it");
+        std::fs::create_dir_all(it.join("helper")).unwrap();
+        std::fs::write(it.join("helper/mod.rs"), "").unwrap();
+        std::fs::write(it.join("main.rs"), "mod a;\n").unwrap();
+        std::fs::write(it.join("a.rs"), "").unwrap();
+        std::fs::write(it.join("b.rs"), "").unwrap();
+        assert_eq!(
+            it_mods_missing(&tmp),
+            vec![
+                "crates/x/tests/it/b".to_owned(),
+                "crates/x/tests/it/helper".to_owned()
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
