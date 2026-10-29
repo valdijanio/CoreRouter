@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
-use corerouter_control::dial::{Expect, RefuseNew};
+use corerouter_control::dial::{AcceptNew, Changed, Decision, Expect, RefuseNew};
 use corerouter_control::{
     Client, Endpoint, Gate, KnownHosts, Limits, Login, SharedHost, Target, Trust, UNAUTHORIZED,
     bind_loopback, dial, spawn,
@@ -309,12 +309,59 @@ fn tls_endpoint_with_pinning_and_login() {
         .is_ok()
     );
 
-    // The router's certificate changes: refused before logging in.
-    known.remember(&target.addr(), "SHA256:00:11").unwrap();
+    // The router's certificate changes: refused before logging in (the
+    // default answer is Cancel).
+    known
+        .remember_at(&target.addr(), "SHA256:00:11", Some(1_700_000_000))
+        .unwrap();
     let e = dial(&target, t, &login, &mut known, &mut shown)
         .err()
         .unwrap();
-    assert!(e.contains("CHANGED"), "{e}");
+    assert!(
+        e.contains("CHANGED") && e.contains("Nothing was sent"),
+        "{e}"
+    );
+
+    // G0.3d, PuTTY style: the operator sees both and decides.
+    struct Answer(Decision, Option<Changed>);
+    impl Trust for Answer {
+        fn first_use(&mut self, _: &Target, _: &str) -> bool {
+            false
+        }
+        fn changed(&mut self, _: &Target, change: &Changed) -> Decision {
+            self.1 = Some(change.clone());
+            self.0
+        }
+    }
+    let mut cancel = Answer(Decision::Cancel, None);
+    assert!(dial(&target, t, &login, &mut known, &mut cancel).is_err());
+    let seen = cancel.1.unwrap();
+    assert_eq!(
+        (seen.old.as_str(), seen.since, seen.new.as_str()),
+        ("SHA256:00:11", Some(1_700_000_000), id.fingerprint.as_str())
+    );
+    // Once: connects, the file keeps the old line.
+    let mut once = Answer(Decision::Once, None);
+    let mut c = dial(&target, t, &login, &mut known, &mut once).unwrap();
+    assert_eq!(c.call("auth.whoami", Value::Null).unwrap()["user"], "admin");
+    assert_eq!(
+        KnownHosts::load(&path).get(&target.addr()),
+        Some("SHA256:00:11")
+    );
+    // Update: connects and replaces the line, dated now.
+    let mut update = Answer(Decision::Update, None);
+    assert!(dial(&target, t, &login, &mut known, &mut update).is_ok());
+    let saved = KnownHosts::load(&path);
+    assert_eq!(saved.get(&target.addr()), Some(id.fingerprint.as_str()));
+    assert!(saved.since(&target.addr()).unwrap() > 1_700_000_000);
+    // --accept-new-cert does the same without asking.
+    let mut known = KnownHosts::load(&path);
+    known.remember(&target.addr(), "SHA256:00:11").unwrap();
+    assert!(dial(&target, t, &login, &mut known, &mut AcceptNew).is_ok());
+    assert_eq!(
+        KnownHosts::load(&path).get(&target.addr()),
+        Some(id.fingerprint.as_str())
+    );
 
     // Plain text to a TLS port goes nowhere.
     let mut raw = TcpStream::connect(("127.0.0.1", port)).unwrap();

@@ -1,7 +1,10 @@
-//! First login without a password (G0.3b), as in RouterOS 7: right after
-//! the GUI connects, an account of group full that has no password (the
-//! first `admin`) is asked to set one, with "Not now" to skip; and the top
-//! bar keeps a small warning, clickable, until it has one.
+//! First login without a password (G0.3b, G0.3d), as in RouterOS 7: right
+//! after the GUI connects, an account of group full that has no password
+//! (the first `admin`) is asked to set one, with "Not now" to skip; and the
+//! top bar keeps an amber chip with "Set password" and the ⓘ until it has
+//! one. As on a CHR the router takes the empty password from the network
+//! meanwhile (G0.3d): keeping it so is the operator's choice, so the GUI
+//! warns on every connection and never forces it.
 //!
 //! What the router says is all the UI knows: `auth.whoami` lists the
 //! accounts of group full without a password (`no_password`, only for a
@@ -12,7 +15,14 @@
 use egui::{Key, RichText, TextEdit};
 use serde_json::{Value, json};
 
-use crate::{CoreRouterUi, Then};
+use crate::help::{self, HelpView};
+use crate::i18n::tr_in;
+use crate::{CoreRouterUi, Then, chip};
+
+/// Translation scope (`i18n/auto/first_login_*.rs`).
+const SCOPE: &str = "first_login";
+/// The explanation the ⓘ opens.
+pub(crate) const HELP_KEY: &str = "first_login.no_password";
 
 /// The dialog's state (UI-local; the password lives only while typed).
 #[derive(Default)]
@@ -28,6 +38,8 @@ pub(crate) struct PasswordAsk {
     sending: bool,
     /// Put the cursor in the first field (when the dialog opens).
     focus: bool,
+    /// The ⓘ's explanation, while open.
+    help: Option<HelpView>,
 }
 
 impl CoreRouterUi {
@@ -148,27 +160,38 @@ impl CoreRouterUi {
     }
 
     /// The top bar's warning while an account of group full has no
-    /// password: small, persistent, opens the dialog.
+    /// password: an amber chip, "Set password" and the ⓘ, on every
+    /// connection until it has one (G0.3d).
     pub(crate) fn no_password_warning(&mut self, ui: &mut egui::Ui) {
         let Some(user) = self.no_password_user() else {
             return;
         };
-        let text = RichText::new(format!("{user} has no password — set one"))
-            .color(ui.visuals().warn_fg_color);
-        let r = ui.add(egui::Button::new(text).frame(false)).on_hover_text(
-            "Anyone on this machine can manage the router, and logins from the network \
-                 are refused until this account has a password. Click to set it.",
-        );
-        if r.clicked() {
+        let l = self.lang.labels;
+        let tone = chip::Kind::Amber.tone(ui.visuals());
+        let text = format!("{} {user}: {}", crate::icons::LOCK_SIMPLE, tr_in(SCOPE, l, "no password"));
+        chip::chip(ui, &text, tone).on_hover_text(tr_in(
+            SCOPE,
+            l,
+            "Anyone who reaches the router, from this machine or the network, logs in as \
+             this user with an empty password.",
+        ));
+        if ui.small_button(tr_in(SCOPE, l, "Set password")).clicked() {
             self.open_password_dialog();
+        }
+        if help::info_button(ui, egui::Id::unique("first-login-no-password-info"), tr_in(SCOPE, l, "Why this matters"))
+            .clicked()
+        {
+            self.password_ask.help = Some(HelpView::new(HELP_KEY, tr_in(SCOPE, l, "Account without a password")));
         }
         ui.separator();
     }
 
     pub(crate) fn password_window(&mut self, ctx: &egui::Context) {
+        help::modal(ctx, self.lang, &mut self.password_ask.help);
         if !self.password_ask.open {
             return;
         }
+        let l = self.lang.labels;
         let mut set = false;
         let mut later = false;
         let a = &mut self.password_ask;
@@ -180,10 +203,13 @@ impl CoreRouterUi {
             .show(ctx, |ui| {
                 ui.label(RichText::new(format!("Set a password for {}", a.user)).strong());
                 ui.add_space(4.0);
-                ui.weak(
-                    "This account has no password. Until it has one, only this machine can \
-                     manage the router: logins from the network are refused.",
-                );
+                ui.weak(tr_in(
+                    SCOPE,
+                    l,
+                    "This account has no password: anyone who reaches the router, from this \
+                     machine or the network, logs in with an empty password. You can keep it \
+                     so (Not now); the warning stays in the top bar until it has one.",
+                ));
                 ui.add_space(8.0);
                 let mut enter = false;
                 egui::Grid::new("first-password-grid")
@@ -295,25 +321,27 @@ mod tests {
         }
         assert!(app.password_dialog_open(), "asked right after the login");
         assert!(has(&texts, "Set a password for admin"), "{texts:?}");
-        assert!(has(&texts, "admin has no password — set one"));
+        assert!(has(&texts, "admin: no password"));
 
         // "Not now" (a real click): closed, the warning stays.
         painted(&mut app, &ctx, click(&texts, "Not now"));
         let texts = painted(&mut app, &ctx, Vec::new());
         assert!(!app.password_dialog_open());
         assert!(!has(&texts, "Set a password for admin"));
-        assert!(has(&texts, "admin has no password — set one"));
+        assert!(has(&texts, "admin: no password"), "the warning stays (G0.3d)");
+        assert!(has(&texts, "Set password"));
+        // The ⓘ has its explanation in both languages.
+        for langs in [crate::i18n::Langs::default(), crate::i18n::Langs { help: crate::i18n::Lang::En, ..Default::default() }] {
+            let (_, text) = crate::i18n::explain(langs, HELP_KEY).unwrap();
+            assert!(text.contains("CHR"), "{text}");
+        }
         // It does not come back by itself on the next refresh.
         app.cache.refreshed_at = None;
         let texts = painted(&mut app, &ctx, Vec::new());
         assert!(!app.password_dialog_open());
 
-        // The warning opens it again.
-        painted(
-            &mut app,
-            &ctx,
-            click(&texts, "admin has no password — set one"),
-        );
+        // "Set password" in the top bar opens it again.
+        painted(&mut app, &ctx, click(&texts, "Set password"));
         assert!(app.password_dialog_open());
         // Mismatch and too short: told, nothing changes.
         app.password_submit("first-password", "other");
@@ -342,7 +370,7 @@ mod tests {
         assert!(lock(&session).password_hash("admin").is_some());
         app.cache.refreshed_at = None;
         let texts = painted(&mut app, &ctx, Vec::new());
-        assert!(!has(&texts, "has no password"), "{texts:?}");
+        assert!(!has(&texts, "no password"), "{texts:?}");
         assert!(app.password_ask.password.is_empty(), "nothing kept");
     }
 

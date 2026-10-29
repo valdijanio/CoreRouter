@@ -356,19 +356,32 @@ mod tests {
 
     /// audit-services #1: the receive path with a full table was ~120 µs per
     /// datagram (a scan cloning every key, then an O(n) eviction scan).
+    ///
+    /// The fastest of several rounds is judged, not one: a busy machine (the
+    /// whole workspace testing in parallel) slows some rounds, never all of
+    /// them, while the old O(n) path is slow in every round (~240 ms for
+    /// 2000 records even in release). Was flaky as a single 10 000-record
+    /// timing under `cargo xtask ci` (2026-10-28).
     #[test]
     fn recording_into_a_full_table_is_cheap() {
+        const ROUNDS: u64 = 7;
+        const PER_ROUND: u64 = 2000;
         let mut t = NeighborTable::default();
         for i in 0..MAX_NEIGHBORS as u64 {
             t.record(entry(&port(i), &format!("n{i}"), 1, 120));
         }
-        let start = std::time::Instant::now();
-        for i in 0..10_000u64 {
-            let e = entry(&port(i), &format!("new{i}"), 2, 120);
-            assert!(t.record(e));
+        let mut fastest = std::time::Duration::MAX;
+        for round in 0..ROUNDS {
+            let start = std::time::Instant::now();
+            for i in 0..PER_ROUND {
+                let n = round * PER_ROUND + i;
+                let e = entry(&port(n), &format!("new{n}"), 2 + round, 120);
+                assert!(t.record(e));
+            }
+            fastest = fastest.min(start.elapsed());
         }
-        let took = start.elapsed();
-        // Debug build, shared CI machine: generous (release: ~1 ms).
-        assert!(took < std::time::Duration::from_millis(500), "{took:?}");
+        eprintln!("fastest round of {PER_ROUND} records into a full table: {fastest:?}");
+        // Debug build: ~10 ms measured; the O(n) path took > 200 ms.
+        assert!(fastest < std::time::Duration::from_millis(100), "{fastest:?}");
     }
 }

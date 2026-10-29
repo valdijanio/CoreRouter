@@ -19,7 +19,9 @@ com `--control`) gravou num arquivo legível só pelo usuário do sistema que o 
 senha a configurar. Outro usuário, ou um roteador remoto (sempre TLS), usa `--user` com a senha
 em `$COREROUTER_PASSWORD` (o stdin é o protocolo, não há prompt). O certificado de um roteador
 novo precisa estar em `known_hosts` (conecte uma vez com `corerouter-cli --connect … --user …`
-num terminal, que pergunta) ou ser dado com `--fingerprint`. O que o agente pode fazer é o que o
+num terminal, que pergunta) ou ser dado com `--fingerprint`. Certificado que mudou (roteador
+reinstalado) é recusado com a mensagem e as duas impressões; confira e rode com
+`--accept-new-cert` (ou `--fingerprint <a nova>`), que troca a linha no `known_hosts` (G0.3d). O que o agente pode fazer é o que o
 grupo do usuário permite: `list_commands` mostra `enabled: false` com o motivo.
 
 **Segredos (G4.3n).** O agente nunca lê um segredo: toda resposta de tool e de resource passa

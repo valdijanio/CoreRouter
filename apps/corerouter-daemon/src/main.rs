@@ -442,14 +442,15 @@ fn tls_identity(
 fn bootstrap_admin(session: &corerouter_engine::Shared, reset: bool) {
     if let Some(what) = lock(session).bootstrap_admin(reset) {
         log::warn!(
-            "{what}: log in as admin with an empty password from this machine \
-             (GUI or `corerouter-cli shell`) and set one"
+            "{what}: log in as admin with an empty password (GUI, `corerouter-cli shell`, \
+             or from the network over TLS) and set one"
         );
     }
 }
 
 /// Listening on the network while an account of group full has no
-/// password: the listener runs, but refuses every login until one is set.
+/// password: as on a RouterOS CHR, anyone who reaches it logs in with an
+/// empty password (G0.3d). The operator's choice; warned, not refused.
 fn warn_open_admin(session: &corerouter_engine::Shared, args: &Args) {
     let missing = lock(session).admins_without_password();
     let remote: Vec<String> = [args.listen, args.ws_listen]
@@ -460,9 +461,9 @@ fn warn_open_admin(session: &corerouter_engine::Shared, args: &Args) {
         .collect();
     if !missing.is_empty() && !remote.is_empty() {
         log::warn!(
-            "{} listen(s) on the network, but user(s) {} of group full have no password: \
-             every network login is refused until a password is set (user.set from this \
-             machine)",
+            "{} listen(s) on the network and user(s) {} of group full have no password: \
+             anyone who reaches the router logs in with an empty password; set one \
+             (user.set)",
             remote.join(", "),
             missing.join(", ")
         );

@@ -54,6 +54,23 @@ pub struct Remote {
     login: Login,
     /// TLS: the certificate of the first connection.
     pinned: Option<String>,
+    /// Accounts of group full without a password, as `auth.whoami` said at
+    /// the last login (G0.3d).
+    no_password: Vec<String>,
+}
+
+/// The warning every client shows while an account of group full has no
+/// password (G0.3d): the router takes the empty one from the network.
+pub fn no_password_warning(users: &[String]) -> Option<String> {
+    if users.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = users.iter().map(|u| u.chars().take(64).collect()).collect();
+    Some(format!(
+        "WARNING: user(s) {} of group full have no password: anyone who reaches the router \
+         logs in with an empty password. Set one: user.set {{name, password}}.",
+        names.join(", ")
+    ))
 }
 
 /// How long a (re)connection may take.
@@ -79,14 +96,20 @@ impl Remote {
         known: &mut KnownHosts,
         trust: &mut dyn Trust,
     ) -> Result<Self, String> {
-        let (client, has_ui) = Self::open(target, login, known, trust)?;
+        let (client, has_ui, no_password) = Self::open(target, login, known, trust)?;
         Ok(Self {
             pinned: client.fingerprint().map(str::to_owned),
             client: Some(client),
             has_ui,
             target: target.clone(),
             login: login.clone(),
+            no_password,
         })
+    }
+
+    /// Accounts of group full without a password at the last login.
+    pub fn no_password(&self) -> &[String] {
+        &self.no_password
     }
 
     fn open(
@@ -94,22 +117,35 @@ impl Remote {
         login: &Login,
         known: &mut KnownHosts,
         trust: &mut dyn Trust,
-    ) -> Result<(Client, bool), String> {
+    ) -> Result<(Client, bool, Vec<String>), String> {
         let mut client = dial(target, DIAL_TIMEOUT, login, known, trust)?;
         let info = client.call("server.info", Value::Null)?;
         let has_ui = info.get("has_ui").and_then(Value::as_bool).unwrap_or(false);
-        if !matches!(login, Login::Nothing)
-            && let Err(e) = client.call("auth.whoami", Value::Null)
-        {
-            return Err(if e.starts_with(UNAUTHORIZED) && !target.tls {
-                format!("{target}: {}", local_token_hint(target.port))
-            } else if e.starts_with(UNAUTHORIZED) {
-                format!("{target}: log in with a user and password ({e})")
-            } else {
-                format!("{target}: {e}")
-            });
+        let mut no_password = Vec::new();
+        if !matches!(login, Login::Nothing) {
+            let me = client.call("auth.whoami", Value::Null).map_err(|e| {
+                if e.starts_with(UNAUTHORIZED) && !target.tls {
+                    format!("{target}: {}", local_token_hint(target.port))
+                } else if e.starts_with(UNAUTHORIZED) {
+                    format!("{target}: log in with a user and password ({e})")
+                } else {
+                    format!("{target}: {e}")
+                }
+            })?;
+            no_password = me
+                .get("no_password")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .take(16)
+                .map(str::to_owned)
+                .collect();
+            if let Some(w) = no_password_warning(&no_password) {
+                log::warn!("{target}: {w}");
+            }
         }
-        Ok((client, has_ui))
+        Ok((client, has_ui, no_password))
     }
 
     /// A live connection: the one we have, or a new one when the router
@@ -121,7 +157,7 @@ impl Remote {
         }
         if self.client.is_none() {
             let mut trust = Expect(self.pinned.clone().unwrap_or_default());
-            let (client, has_ui) = Self::open(
+            let (client, has_ui, no_password) = Self::open(
                 &self.target,
                 &self.login,
                 &mut KnownHosts::load_default(),
@@ -136,6 +172,7 @@ impl Remote {
                 ));
             }
             self.has_ui = has_ui;
+            self.no_password = no_password;
             self.client = Some(client);
         }
         self.client
@@ -189,11 +226,16 @@ impl Backend for Remote {
         self.has_ui
     }
     fn describe(&self) -> String {
-        format!(
+        let mut d = format!(
             "remote {}{}{}",
             if self.target.tls { "tls://" } else { "" },
             self.target.addr(),
             if self.has_ui { " (with UI)" } else { "" }
-        )
+        );
+        if let Some(w) = no_password_warning(&self.no_password) {
+            d.push_str(". ");
+            d.push_str(w.trim_end_matches('.'));
+        }
+        d
     }
 }

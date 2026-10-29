@@ -81,23 +81,31 @@ encerra as sessões daquela conta.
 estado explícito (`password_hash: null` no arquivo, `no_password: true` no `user.list`), nunca o
 hash de uma string vazia. Regras enquanto uma conta `full` ativa estiver sem senha:
 
-- O login dela com senha **vazia** só vale de **loopback** (`127.0.0.1`/`::1`, inclusive o TLS
-  e o `--ws` em loopback); de qualquer outro endereço é recusado.
-- **Todo** login vindo da rede (endereço não-loopback, de qualquer conta) é recusado com
-  `login from the network is refused while an account of group full has no password: set the
-  admin password first …`, antes de conferir senha (não conta como falha). `--listen` /
-  `--ws-listen` fora do loopback sobem assim mesmo, com um aviso no log.
+- **G0.3d (como o RouterOS CHR):** o login dela com senha **vazia** vale de **qualquer
+  endereço**, loopback ou rede (fora do loopback é sempre TLS). Manter sem senha é escolha do
+  operador: nada força a troca nem limita comandos. Em troca, o aviso é constante:
+  - cada login sem senha vira uma linha de aviso no log do roteador (`log.print`, tópicos
+    `system,account,warning`, origem `auth`) com o usuário, o endereço de origem e o canal;
+  - a verificação de saúde `auth.no_password` ("Admin password") fica em `warning` (o selo
+    "1 warning" da barra) até haver senha;
+  - `auth.login` responde `no_password: true` e o `auth.whoami` lista as contas; GUI, CLI,
+    terminal e MCP avisam a cada login;
+  - `--listen` / `--ws-listen` fora do loopback sobem com um aviso no log do daemon.
+  Roteadores entre o G0.3b e o G0.3d recusavam todo login da rede com `login from the network
+  is refused while an account of group full has no password…`; os clientes ainda reconhecem
+  essa resposta (a GUI explica "Set the admin password first…").
 - O token local (CLI/MCP na mesma máquina) segue igual.
 - Logo após entrar, a GUI (nativa e web) abre **"Set a password for admin"** com **"Not now"**,
-  e a barra superior mostra `admin has no password — set one` (clicável) até haver senha; o
+  e a barra superior mostra o selo âmbar `admin: no password`, o botão **Set password** e o ⓘ
+  (o risco, em português) até haver senha; o
   terminal (`corerouter-cli shell`, janela New Terminal) pergunta `New password for admin:` sem
   eco e fora do histórico (linha vazia = agora não). Definir é o `user.set {name, password}`
   normal, pelo engine; quem define continua logado (as outras sessões da conta acabam).
 
 Nenhum comando tira a senha de uma conta. Perdeu a senha? Reinicie com
 `corerouter-daemon --reset-admin-password …`: `admin` volta ativo, `full` e **sem senha** (as
-sessões dele acabam, as outras contas não mudam), a rede fica fechada de novo até definir uma, e
-o daemon segue rodando.
+sessões dele acabam, as outras contas não mudam), a senha vazia volta a valer de qualquer rede
+(com os avisos acima) até definir uma, e o daemon segue rodando.
 
 **Login e tokens.** `auth.login` devolve um token de sessão (256 bits aleatórios; o servidor
 guarda só o SHA-256, compara em tempo constante). Ele acaba com `auth.logout`, após 30 min sem
@@ -131,7 +139,7 @@ loopback: lá esse daemon já aceita qualquer processo da máquina, então conec
 novo; a barra superior mostra `old router: no login` e o que ele não tem fica cinza, como no
 G1.16). Num roteador atual, tenta o token local; se o arquivo não for legível (daemon de outro
 usuário do sistema, p. ex. root com `sudo`) ou o roteador o recusar, faz `auth.login` com Login
-e Password (senha vazia vale em loopback enquanto o `admin` não tiver uma, G0.3b). Só se isso
+e Password (senha vazia vale enquanto o `admin` não tiver uma, G0.3b/G0.3d). Só se isso
 também falhar aparece um erro, curto ("Invalid user or password", "Set the admin password
 first…", "Too many failed logins…", "Nothing answers at that address…"), com o texto técnico (o
 caminho do token, a resposta do roteador) em **Details** e no tooltip. Fora do loopback é TLS +
@@ -148,9 +156,23 @@ no log). Handshake até 10 s. Qualquer endereço que não seja loopback é **sem
 certificado como o SSH: na primeira conexão mostram a impressão digital e pedem confirmação
 (compare com a do log do daemon); a resposta fica em `known_hosts`
 (`$COREROUTER_KNOWN_HOSTS`, senão `~/.config/corerouter/known_hosts`, `%APPDATA%` no
-Windows; uma linha `host:porta SHA256:…`). Se o certificado mudar, a conexão é **recusada
-antes de enviar qualquer coisa**, com as duas impressões na mensagem; apague a linha se a
-mudança for legítima. As assinaturas do handshake continuam verificadas. Endereço no cliente:
+Windows; uma linha `host:porta SHA256:… <aceito em, segundos unix>`; a data, do G0.3d, é
+opcional e linhas antigas sem ela continuam valendo). Se o certificado mudar, **nada é enviado**
+antes da decisão do operador (G0.3d, como o PuTTY; o `StrictHostKeyChecking` do OpenSSH
+recusa, salvo com `no`):
+
+- **GUI nativa:** modal com a impressão guardada e quando foi aceita, a nova, o texto
+  "reinstalação × interceptação" e três botões: **Cancel** (padrão: Enter e Esc cancelam),
+  **Connect once** (conecta fixando a nova só nesta sessão; o `known_hosts` fica como estava) e
+  **Trust and update** (troca a linha, com a data de hoje). O primeiro uso abre o mesmo modal
+  (Cancel, Connect once, Trust and connect).
+- **CLI:** num terminal pergunta `[c]ancel, connect [o]nce, trust and [u]pdate?` (linha vazia
+  cancela); sem terminal recusa com a mensagem e o caminho: `--accept-new-cert` (aceita e
+  grava), ou `--fingerprint <a nova>`.
+- **MCP** (`corerouter-cli mcp`, sem terminal): como a CLI sem terminal; depois de conectado, um
+  certificado que muda numa reconexão é sempre recusado.
+
+As assinaturas do handshake continuam verificadas. Endereço no cliente:
 `HOST:PORTA` (loopback: TCP puro) ou `tls://HOST:PORTA`; um host que não é loopback implica
 `tls://`.
 
@@ -239,5 +261,9 @@ Na GUI web: `?connect=ws://127.0.0.1:7980` abre a tela de conexão com esse daem
   confiança no primeiro uso, portas TLS no CRDP.
 - 2026-10-22 — G0.3b: primeiro `admin` sem senha, login vazio só em loopback, rede recusada até
   definir a senha, `no_password` em `auth.login`/`auth.whoami`/`user.list`.
+- 2026-10-28 — G0.3d: certificado trocado com escolha estilo PuTTY (GUI), `--accept-new-cert`
+  (CLI/MCP), data no `known_hosts`.
+- 2026-10-28 — G0.3d: senha vazia aceita de qualquer rede (como o CHR), com aviso no log, na
+  saúde e em todo cliente.
 - 2026-10-22 — G0.3c: tela de conexão (token local → Login/Password em loopback, `admin` por
   padrão, roteador anterior ao G0.3 pelo `server.info` sem `auth`).

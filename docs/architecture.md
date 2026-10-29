@@ -625,6 +625,19 @@ pode servir os arquivos da GUI web na mesma porta (`--web-root`, modelo WebFig);
 `Origin` impede que uma página qualquer comande o roteador local. Detalhes em
 `docs/control-protocol.md`.
 
+### Pacotes da GUI (G0.28)
+
+`cargo xtask package gui` gera o `.deb` `corerouter-gui` (GUI + CLI, `.desktop`, ícone,
+handler `corerouter://`; uso em `docs/install-gui.md`). O arquivo é escrito pelo próprio xtask
+(`xtask/src/package.rs`: `ar` + `ustar` + gzip do `flate2`), não pelo `cargo-deb` nem pelo
+`dpkg-deb --build`: sem ferramenta a instalar, arquivos de root sem `fakeroot` e os mesmos
+bytes para o mesmo commit (mtime = hora do commit). O `dpkg-deb` só confere, quando existe. Os
+binários saem do perfil `dist` (release + `strip = "symbols"`). As bibliotecas ligadas vêm do
+`ldd` e cada uma precisa de pacote conhecido na tabela `NEEDED`; as que o winit/wgpu abrem por
+`dlopen` (xkbcommon, Wayland/X11, Vulkan/EGL) estão declaradas à mão. O ícone é desenhado por
+código (SVG + PNGs rasterizados no xtask), sem arte de terceiros. Windows, macOS e AppImage
+ficam para o G0.28b–d.
+
 ### Autenticação e TLS (G0.3)
 
 Quem decide **o que** cada um pode é o engine; quem decide **quem é** cada um é o canal de
