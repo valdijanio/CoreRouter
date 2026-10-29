@@ -7110,3 +7110,110 @@ continuação indentadas).
   ```
 
   O primeiro pede `jq` e `iperf3` no PATH.
+
+- 2026-10-29 — G0.31: Auditoria de desempenho, parte 6: buffer de recepção dos sockets que recebem rajadas (DHCP e
+  DNS). O servidor DHCPv4 lê os pedidos por um socket `AF_PACKET`
+  (com filtro BPF) que ficava com o buffer de recepção padrão (`rmem_default`, 208 KiB, ~100
+  quadros pequenos). Numa tempestade de DISCOVER/REQUEST, depois de uma queda de energia, o buffer
+  enchia entre duas rodadas, e os clientes descartados só voltavam na retransmissão (4 s ou mais,
+  RFC 2131 §4.1). A thread do DHCP ficava ociosa (1–14 % de CPU) enquanto o kernel descartava.
+  Agora os sockets dos servidores DHCPv4 e DHCPv6 e os uplinks dos relays pedem 4 MiB por
+  `l2::rcvbuf` (`SO_RCVBUFFORCE`, ou `SO_RCVBUF` até `rmem_max`), como o PPPoE já fazia. Com 20 000
+  clientes e 1024 transações em voo: 2,5 mil → 35 mil concessões/s, 1808 → 0 retransmissões, 99 %
+  servidos em 6,06 → 0,56 s (**medido**). O mesmo vale para os sockets UDP do encaminhador DNS da
+  LAN (`apps/corerouter-daemon/src/service/dns_server.rs`): com 4096 consultas em voo, o kernel
+  descartava 27 392 consultas em 6 s, e agora não descarta nenhuma (**medido**). A G3.9h também
+  testa DHCP e DNS nesta rodada; esta mudança só mexe na abertura dos sockets.
+
+- 2026-10-29 — G0.31: Auditoria de desempenho e paralelismo do daemon, fechamento. Tabela por área (tudo **medido**,
+  release, AMD Ryzen AI MAX+ 395, namespaces sem root; números completos em `docs/perf.md` e o
+  painel em `docs/desempenho.md`):
+
+  | Área | Gargalo | Número | Resultado |
+  |---|---|---|---|
+  | Canal de controle | lock do `Session` serializa as consultas; `config.diff`/`state.inspect` serializavam a config inteira | 1,4 s sob o lock por chamada; com uma GUI aberta os outros clientes ficavam com p50 de 672 ms | corrigido (#395): 2–24 µs, vizinhos com p50 de 72 µs |
+  | Canal de controle | 1/8/16/64 conexões | 21,9 / 79,6 / 72,9 mil pedidos/s, p99 86 / 214 / 622 µs; 48 de 64 recusadas ("too many connections") | sem mudança: a vazão para no lock (~13 µs por consulta); consultas grandes fora do lock são a G0.31b |
+  | Firewall | `ip.firewall.*.list` O(n²) (grafo por regra, sombra contra todas as chains) | 372 ms com 10 000 regras | corrigido (#399): 38 ms |
+  | Firewall | mudar 1 regra entre 10 000 relê o kernel e remonta tudo | 109 ms (G2.8) | gap G0.31f |
+  | DNS | uma thread `dns-udp` por socket a 100 % | 336 mil respostas/s | corrigido (#400): 964 mil/s com 4 leitores |
+  | DNS | buffer de recepção padrão | 28 160 consultas perdidas em 6 s com 4096 em voo | corrigido (#412): 0 |
+  | DHCP | buffer de recepção padrão descarta a tempestade; a thread fica ociosa | 2,5 mil concessões/s e 99 % servidos em 6,06 s (1024 em voo) | corrigido (#412): 35 mil/s, 0,56 s, 0 retransmissões |
+  | Rotas | commit de uma rota fazia dump da tabela do kernel | 140 ms com 60 000 rotas | corrigido (#408): 60–70 ms; o resto do commit O(n) na G0.31e e a checagem de duplicata O(n) na G0.31d |
+  | Rotas | `ip.route.list` inteiro sob o lock | 771 ms, lock até ~190 ms | gap G0.31b (`ip.route.page` já existe: 2,4 ms) |
+  | Conntrack | dump e filtro sob o lock | ~150 ms a cada 2 s com 250 000 entradas; 3 ms por chamada em cache | gap G0.31c |
+  | `config.diff` com uma rota pendente | serializa a lista de rotas inteira | 523 ms | gap G0.31a |
+  | Log/syslog, traffic-flow | filas | limitadas, descarte contado (`traffic_flow_link`, `remote_log`) | sem achado |
+  | Métricas | `system.metrics` sob o lock | 1,5–1,9 ms com 1000 VLANs | sem achado |
+  | Ferramentas `tool.*` | tarefas | fora do lock, no máximo 8, anel de eventos limitado | sem achado |
+  | Supervisor | `frr`/`mpls`/`neighbors` ociosos marcados como "stuck" | heartbeat de 60 s com limite de 30 s | corrigido (#401) |
+
+  Fora daqui: XDP precisa da VM (a fila das frentes de interop estava ocupada); o DHCP fica numa
+  thread só, que ainda tem folga a 35 mil concessões/s, até haver um gerador mais rápido (BNG Blaster
+  na VM).
+
+- 2026-10-29 — G3.9fd: Janela Routing › BGP: a página Filters do modal de conexão e de template ganhou Output Network
+  (o nome da address-list, `output_network`) e Redistribute (`connected,static,ospf`,
+  `output_redistribute`), os parâmetros da G3.9f, cada um com o ⓘ (português e inglês) que diz o
+  que o RouterOS chama assim e que o FRR anuncia por instância. Editar mostra de volta o que foi
+  digitado. Teste: `cargo test -p corerouter-ui tests::bgp` (o novo
+  `the_filters_page_sets_what_the_connection_announces` cria pela página e confere os parâmetros).
+  Falta o screenshot (claro e escuro) da página Filters: a GUI não foi dirigida nesta sessão.
+
+- 2026-10-29 — G3.9g: Interoperabilidade do BNG PPPoE com o RouterOS 7.25 CHR (parte 1): roteiro novo
+  `scripts/routeros-interop-pppoe.sh` (CHR em QEMU/KVM na VM do laboratório, CoreRouter com o backend
+  linux e XDP genérico num namespace, FreeRADIUS num segundo namespace) e duas divergências
+  corrigidas.
+
+  - **Keepalive pelo último pacote.** O servidor contava as faltas nas batidas do eco (`T/2`, duas
+    faltas), então um assinante mudo caía entre `T` e `1,5 T` depois do último pacote: com
+    `keepalive_timeout=30` o CHR mudo caiu em 42,0 s (**medido**); o RouterOS derruba em `T`. Agora
+    a sessão guarda quando ouviu o assinante pela última vez e cai em `T` depois disso. Os ecos saem
+    a cada `T/3` (com as duas faltas padrão), para caberem dois ecos e as respostas antes do prazo:
+    um eco perdido não derruba a sessão (RFC 1661 §5.8); com o período antigo de `T/2` o segundo eco
+    caía no próprio prazo e a simulação com perda (`slow_many_service_names_over_qinq_vlans`)
+    perdia 5 sessões. Teste `keepalive_drops_a_silent_subscriber_after_the_timeout_not_later`
+    (`proto-pppoe`, corte em 15 pontos entre as batidas; o código antigo reprova).
+  - **AC-Name = `/system identity`.** O PADO levava sempre "CoreRouter"; o RouterOS manda a
+    identity, e é ela que o `ac-name=` do cliente RouterOS compara. Teste
+    `pado_ac_name_is_the_system_identity` (daemon).
+
+  O que passou contra o CHR (rodadas r2, 2026-10-29, **medido**): PAP, CHAP, MS-CHAPv1 e
+  MS-CHAPv2 (cada um sozinho e os quatro oferecidos: os dois lados ficam em mschap2, como o RouterOS),
+  senha errada e método sem interseção recusados com o motivo no `ppp.why`; MTU 1480 e 1492 com
+  ping DF do tamanho exato passando e ICMP "frag needed" um byte acima, 1500 só com
+  `max_payload=1500` e quadros de 1508 (RFC 4638) e 1492 sem ele; DNS no IPCP (RFC 1877) e o
+  `local_address` do perfil como endereço do BNG; PADT nos dois sentidos (o CHR vê a remoção em
+  121 ms, o BNG vê o CHR desligar em 13 ms); Service-Name certo, vazio e errado (sem PADO); `ac-name`
+  certo e errado. Keepalive com corte silencioso: servidor 10 s cai em 12,1 s; o cliente RouterOS
+  cai em 2 × o dele (22 s com 10 s, 122 s com 60 s). Cada sessão do CHR leva ~3,1 s da habilitação
+  ao Up, a investigar com o caso `timeline` (captura com tempos).
+
+  Escala sem a VM (namespace sem root no host, `netns_pppoe` com 20 mil CPEs simulados do
+  `proto-pppoe`, debug, Ryzen AI Max+ 395 com 32 CPUs, 2026-10-29, **medido**): 20 000 sessões
+  Opened em 9,64 s = 2075 sessões/s; reconexão em massa em 34,8 s com `new_session_rate=1000`;
+  ≈ 6,3 KB de RSS por sessão. CPU por thread (amostras de `/proc/<pid>/task` a cada segundo): os 8
+  workers do daemon (`auto` = CPUs − 2, no máximo 8) dividem a subida, 10–20% cada; o leitor
+  `svc-pppoe` fica em 9–22%; a thread saturada é a do próprio simulador de CPEs (≈ 75%, uma só).
+  O plano de controle preso num núcleo a 98% (2026-10-25) não se repete; o que ainda serializa é o
+  leitor único, que já é a G4.3ga. O teste contava os `replaced` do `ppp.history` (no máximo 10 000
+  linhas) contra `n`, e reprovava acima de 10 mil sessões; agora compara com `min(n, 10 000)`.
+
+  Como testar: `cargo xtask vm-lab run -- scripts/routeros-interop-pppoe.sh [casos]` (casos `auth
+  mtu ipcp-dns ipv6 keepalive padt service-name mac-limit multi radius coa import client timeline`).
+  Os casos IPv6, várias sessões, RADIUS/CoA, import e o resto ficam para a parte 2 (a VM ficou presa
+  nesta noite).
+
+- 2026-10-29 — fix-nightly-netsim: CI noturno verde de novo (issue "CI noturno quebrado", #393): o proptest
+  `corerouter-netsim tests::decision_matches_proto_bgp` descartava com `prop_assume!` os pares em
+  que os dois lados são rotas locais (~1 caso em 4). Com os 4096 casos do noturno isso passa do
+  limite de 1024 descartes globais do proptest e o teste aborta sem achar divergência nenhuma. O
+  filtro foi para a estratégia (`prop_filter`, que conta como descarte local, limite 65 536). Testar:
+  `PROPTEST_CASES=4096 cargo test -p corerouter-netsim --lib decision_matches_proto_bgp` (passa,
+  **medido**, 0,17 s).
+
+- 2026-10-29 — fix-test-ceiling-journal: Dois testes da camada rápida passavam do teto de 10 s no runner do GitHub e reprovavam PRs que
+  nem tocavam no motor (o #406): `config_journal::the_shutdown_checkpoint_loses_no_journal_line`
+  (10,12 s) e o proptest `the_journal_saves_what_the_slot_would` (10,03 s). O caso de 1100 commits
+  do primeiro virou `slow_the_shutdown_checkpoint_loses_no_journal_line_after_1100_commits` (a
+  camada rápida fica com 3 e 40); o proptest passa a respeitar o `PROPTEST_CASES` (32 na camada
+  rápida), com no máximo os 48 de antes no lote e no noturno.

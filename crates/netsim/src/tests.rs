@@ -461,8 +461,13 @@ fn side() -> impl Strategy<Value = crate::bgp::check::Side> {
 proptest! {
     /// The simulator decides as `proto_bgp::decision` (FRR's order) does.
     #[test]
-    fn decision_matches_proto_bgp(mut a in side(), mut b in side(), best in 0u8..3) {
-        prop_assume!(!(a.local && b.local));
+    fn decision_matches_proto_bgp(
+        // At most one locally originated side, filtered in the strategy:
+        // a `prop_assume!` here rejects ~1 case in 4, and at the nightly's
+        // 4096 cases that passes proptest's 1024 global rejects.
+        (mut a, mut b) in (side(), side()).prop_filter("one local side at most", |(a, b)| !(a.local && b.local)),
+        best in 0u8..3,
+    ) {
         a.best = best == 1;
         b.best = best == 2;
         let ours = crate::bgp::check::compare(&a, &b);

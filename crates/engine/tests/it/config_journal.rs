@@ -413,53 +413,63 @@ fn without_journal(storage: &MemoryStorage) -> MemoryStorage {
 /// give the newest), and a second checkpoint has nothing to write.
 #[test]
 fn the_shutdown_checkpoint_loses_no_journal_line() {
-    for commits in [3u32, 40, 1100] {
-        let storage = MemoryStorage::default();
-        let mut s = boot(&storage);
-        rename(&mut s, "a");
-        for i in 0..commits {
-            add(&mut s, i);
-        }
-        assert!(lines(&storage) > 0, "{commits}");
-        // Before it, an old build would boot an older revision.
-        let stale = boot(&without_journal(&storage));
-        assert_ne!(stale.store().running(), s.store().running(), "{commits}");
-
-        assert_eq!(s.checkpoint(), Ok(true), "{commits}");
-        assert_eq!(s.checkpoint(), Ok(false), "{commits}");
-        let newest = *numbers(&s).last().unwrap();
-        let slot = storage.get(Slot::Current).unwrap();
-        assert!(
-            slot.contains(&format!("\"revision\":{newest}")),
-            "{commits}: the slot holds revision {newest}"
-        );
-
-        let old = boot(&without_journal(&storage));
-        assert!(old.storage_status().boot_errors.is_empty(), "{commits}");
-        assert_eq!(old.store().running(), s.store().running(), "{commits}");
-        assert_eq!(old.store().current_revision(), newest, "{commits}");
-
-        let mut t = boot(&storage);
-        assert!(
-            t.storage_status().boot_errors.is_empty(),
-            "{commits}: {:?}",
-            t.storage_status().boot_errors
-        );
-        same_store(&mut s, &mut t);
-        // The restarted session journals again, and nothing was lost.
-        add(&mut t, 5000);
-        same_store(&mut t, &mut boot(&storage));
-
-        // The journal still pairs with the previous slot.
-        let lost = MemoryStorage::default();
-        lost.put(Slot::Previous, storage.get(Slot::Previous));
-        lost.put_journal(CONFIG_JOURNAL, storage.journal(CONFIG_JOURNAL));
-        for n in storage.clone().list_revisions().unwrap() {
-            lost.put_revision(n, storage.revision(n));
-        }
-        let u = boot(&lost);
-        assert_eq!(u.store().running(), t.store().running(), "{commits}");
+    for commits in [3u32, 40] {
+        shutdown_checkpoint_case(commits);
     }
+}
+
+/// Slow layer (G0.30): 1100 journaled commits, ~10 s on the GitHub runner.
+#[test]
+fn slow_the_shutdown_checkpoint_loses_no_journal_line_after_1100_commits() {
+    shutdown_checkpoint_case(1100);
+}
+
+fn shutdown_checkpoint_case(commits: u32) {
+    let storage = MemoryStorage::default();
+    let mut s = boot(&storage);
+    rename(&mut s, "a");
+    for i in 0..commits {
+        add(&mut s, i);
+    }
+    assert!(lines(&storage) > 0, "{commits}");
+    // Before it, an old build would boot an older revision.
+    let stale = boot(&without_journal(&storage));
+    assert_ne!(stale.store().running(), s.store().running(), "{commits}");
+
+    assert_eq!(s.checkpoint(), Ok(true), "{commits}");
+    assert_eq!(s.checkpoint(), Ok(false), "{commits}");
+    let newest = *numbers(&s).last().unwrap();
+    let slot = storage.get(Slot::Current).unwrap();
+    assert!(
+        slot.contains(&format!("\"revision\":{newest}")),
+        "{commits}: the slot holds revision {newest}"
+    );
+
+    let old = boot(&without_journal(&storage));
+    assert!(old.storage_status().boot_errors.is_empty(), "{commits}");
+    assert_eq!(old.store().running(), s.store().running(), "{commits}");
+    assert_eq!(old.store().current_revision(), newest, "{commits}");
+
+    let mut t = boot(&storage);
+    assert!(
+        t.storage_status().boot_errors.is_empty(),
+        "{commits}: {:?}",
+        t.storage_status().boot_errors
+    );
+    same_store(&mut s, &mut t);
+    // The restarted session journals again, and nothing was lost.
+    add(&mut t, 5000);
+    same_store(&mut t, &mut boot(&storage));
+
+    // The journal still pairs with the previous slot.
+    let lost = MemoryStorage::default();
+    lost.put(Slot::Previous, storage.get(Slot::Previous));
+    lost.put_journal(CONFIG_JOURNAL, storage.journal(CONFIG_JOURNAL));
+    for n in storage.clone().list_revisions().unwrap() {
+        lost.put_revision(n, storage.revision(n));
+    }
+    let u = boot(&lost);
+    assert_eq!(u.store().running(), t.store().running(), "{commits}");
 }
 
 /// G0.27 in Safe Mode: the checkpoint writes the store of the entry, never
@@ -553,7 +563,11 @@ fn run(s: &mut Session, st: &Step) {
 }
 
 proptest::proptest! {
-    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+    // 48 cases at most (~10 s on the GitHub runner); the quick layer's
+    // `PROPTEST_CASES=32` lowers it (G0.30 ceiling).
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(
+        std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).map_or(48, |c: u32| c.min(48))
+    ))]
     /// The same commands through the journal and through slot-only saving
     /// (every save writes the slot) give the same store, after every
     /// reboot on the way.
