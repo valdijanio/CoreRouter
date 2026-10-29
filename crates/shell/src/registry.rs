@@ -16,6 +16,7 @@ use crate::doc::{self, Param, Shape};
 const MAX_COMMANDS: usize = 4096;
 const MAX_ID: usize = 128;
 const MAX_DEPTH: usize = 8;
+const MAX_KEY_ALIASES: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct Command {
@@ -36,6 +37,9 @@ pub struct Command {
     pub alias: Vec<String>,
     /// The parameter a bare value goes to.
     pub positional: Option<String>,
+    /// Other names of parameters, `(typed, key)` in engine form
+    /// (`interface` → `parent`, as RouterOS writes `/interface vlan add`).
+    pub key_alias: Vec<(String, String)>,
     /// Starts a background task (`tool.task.poll` follows it).
     pub task: bool,
 }
@@ -115,6 +119,8 @@ impl Registry {
             };
             let text = |k: &str| e.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
             let doc_text = text("params");
+            let params = doc::params(&doc_text);
+            let key_alias = key_alias(e.get("key_alias"), &params);
             let word = |k: &str| {
                 e.get(k)
                     .and_then(Value::as_str)
@@ -136,7 +142,7 @@ impl Registry {
                     id: id.to_owned(),
                     verb: (*verb).to_owned(),
                     label: text("label"),
-                    params: doc::params(&doc_text),
+                    params,
                     shape: doc::shape(&doc_text),
                     doc: doc_text,
                     query: e.get("kind").and_then(Value::as_str) == Some("query"),
@@ -155,6 +161,7 @@ impl Registry {
                         })
                         .unwrap_or_default(),
                     positional: word("positional"),
+                    key_alias,
                     task: e.get("task").and_then(Value::as_bool) == Some(true),
                 },
             ));
@@ -213,6 +220,22 @@ impl Registry {
     }
 }
 
+/// The `key_alias` object of an entry: only well-formed names that point
+/// at a parameter of the doc and are not parameters themselves.
+fn key_alias(v: Option<&Value>, params: &[Param]) -> Vec<(String, String)> {
+    let is_param = |k: &str| params.iter().any(|p| p.key == k);
+    let word = |w: &str| {
+        !w.is_empty() && w.len() <= 32 && w.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+    };
+    v.and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(typed, key)| Some((typed.clone(), key.as_str()?.to_owned())))
+        .filter(|(typed, key)| word(typed) && is_param(key) && !is_param(typed))
+        .take(MAX_KEY_ALIASES)
+        .collect()
+}
+
 /// `/ip address` for a path.
 pub fn path_text(path: &[String]) -> String {
     if path.is_empty() {
@@ -249,5 +272,20 @@ mod tests {
         let (_, commit) = r.by_id("config.commit").unwrap();
         assert_eq!(commit.enabled, Err("no pending changes".into()));
         assert_eq!(r.commands().count(), 4);
+    }
+
+    #[test]
+    fn key_aliases_must_point_at_a_parameter() {
+        let list = json!([{
+            "id": "interface.vlan.add",
+            "params": "{name: string, parent: string, vlan_id: u32} → {name}",
+            "key_alias": {"interface": "parent", "ghost": "nowhere", "name": "parent", "BAD": "parent", "n": 3},
+        }]);
+        let r = Registry::from_list(&list);
+        let (_, c) = r.by_id("interface.vlan.add").unwrap();
+        assert_eq!(
+            c.key_alias,
+            vec![("interface".to_owned(), "parent".to_owned())]
+        );
     }
 }

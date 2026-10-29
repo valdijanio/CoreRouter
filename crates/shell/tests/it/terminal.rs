@@ -1160,3 +1160,68 @@ fn dns_zone_export_import_round_trip() {
     assert_eq!(get(&b)["records"], get(&a)["records"]);
     assert_eq!(get(&b)["zones"][0]["serial"], get(&a)["zones"][0]["serial"]);
 }
+
+/// G3.9hb: a RouterOS 7.25 CHR's `/interface vlan export` (taken from the
+/// CHR in `scripts/routeros-interop-l2.sh rsc`) imports as it comes:
+/// `interface=` is the terminal's other name for `parent`.
+#[test]
+fn a_routeros_vlan_export_imports_as_written() {
+    let mut t = Term::new();
+    t.router
+        .files
+        .insert("ros.rsc".into(), ROUTEROS_VLAN_EXPORT.into());
+    t.ok("/import file=ros.rsc");
+    let vlans = t
+        .router
+        .session
+        .execute("interface.list", &json!({"type": "vlan"}))
+        .unwrap();
+    let got: Vec<Value> = vlans
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| {
+            json!([
+                v["name"],
+                v["parent"],
+                v["vlan_id"],
+                v["use_service_tag"],
+                v["mtu"],
+                v["disabled"],
+                v["comment"]
+            ])
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            json!(["c43", "s42", 43, false, 1500, false, ""]),
+            json!(["r40", "ether1", 40, false, 1500, false, "cliente 40"]),
+            json!(["r41", "ether1", 41, false, 1400, true, ""]),
+            json!(["s42", "ether1", 42, true, 1500, false, ""]),
+        ]
+    );
+    assert!(
+        t.complete("/interface vlan add in")
+            .contains(&"interface=".to_owned())
+    );
+    assert!(
+        !t.complete("/interface vlan add interface=ether1 p")
+            .contains(&"parent=".to_owned())
+    );
+    // Typed by hand too, and `parent=` as before.
+    t.ok("/interface vlan add interface=ether2 vlan-id=10 name=v10");
+    t.ok("/interface vlan add parent=ether2 vlan-id=11 name=v11");
+    assert!(t.export().contains("parent=ether2"));
+}
+
+const ROUTEROS_VLAN_EXPORT: &str = "\
+# 2026-10-29 15:00:00 by RouterOS 7.25
+# software id =
+#
+/interface vlan
+add comment=\"cliente 40\" interface=ether1 name=r40 vlan-id=40
+add disabled=yes interface=ether1 mtu=1400 name=r41 vlan-id=41
+add interface=ether1 name=s42 use-service-tag=yes vlan-id=42
+add interface=s42 name=c43 vlan-id=43
+";

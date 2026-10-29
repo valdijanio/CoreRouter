@@ -342,18 +342,36 @@ pub fn clip(s: &str) -> String {
 /// A parameter key as typed (`vlan-id`, `vl`) → engine key (`vlan_id`).
 /// Unknown keys pass through in engine form: the engine rejects them with
 /// its own "did you mean".
+/// A parameter's other name (`interface=` in `/interface vlan add`, as
+/// RouterOS writes it) becomes the key it stands for.
 pub fn resolve_key(cmd: &Command, typed: &str) -> Result<String, String> {
-    let shown: Vec<String> = cmd.params.iter().map(|p| kebab(&p.key)).collect();
+    let shown: Vec<String> = cmd
+        .params
+        .iter()
+        .map(|p| kebab(&p.key))
+        .chain(cmd.key_alias.iter().map(|(a, _)| kebab(a)))
+        .collect();
     let refs: Vec<&str> = shown.iter().map(String::as_str).collect();
     let typed_kebab = kebab(typed);
+    let target = |k: &str| {
+        let k = snake(k);
+        match cmd.key_alias.iter().find(|(a, _)| *a == k) {
+            Some((_, key)) => key.clone(),
+            None => k,
+        }
+    };
     match pick(&typed_kebab, &refs) {
-        Pick::One(k) => Ok(snake(k)),
+        Pick::One(k) => Ok(target(k)),
         Pick::None => Ok(snake(typed)),
-        Pick::Many(hits) => Err(format!(
-            "ambiguous argument name '{}': {}",
-            clip(typed),
-            hits.join(", ")
-        )),
+        Pick::Many(hits) => match hits.first().map(|h| target(h)) {
+            // A prefix of both a name and its alias is one parameter.
+            Some(k) if hits.iter().all(|h| target(h) == k) => Ok(k),
+            _ => Err(format!(
+                "ambiguous argument name '{}': {}",
+                clip(typed),
+                hits.join(", ")
+            )),
+        },
     }
 }
 
@@ -680,7 +698,7 @@ mod tests {
             {"id": "ip.address.remove", "params": "{id: *hex} → {id}", "kind": "action", "enabled": true},
             {"id": "ip.address.list", "params": "{interface?: string} → [{id, address, network, interface, disabled, comment}]", "kind": "query", "enabled": true},
             {"id": "ip.arp.list", "params": "{} → [{address}]", "kind": "query", "enabled": true},
-            {"id": "interface.vlan.add", "params": "{name: string, parent: string, vlan_id: u32} → {name}", "kind": "action", "enabled": true},
+            {"id": "interface.vlan.add", "params": "{name: string, parent: string, vlan_id: u32} → {name}", "kind": "action", "enabled": true, "key_alias": {"interface": "parent"}},
         ]))
     }
 
@@ -757,6 +775,32 @@ mod tests {
         let e = p(&["ip"], "a").unwrap_err();
         assert!(e.message.contains("ambiguous"), "{}", e.message);
         assert!(p(&[], "/ip address add comment=\"x").is_err());
+    }
+
+    #[test]
+    fn a_key_alias_becomes_its_parameter() {
+        let keys = |line: &str| match p(&["interface", "vlan"], line).unwrap() {
+            Parsed::Command { args, .. } => args
+                .into_iter()
+                .filter_map(|a| match a {
+                    Arg::Pair { key, .. } => Some(key),
+                    Arg::Positional(_) => None,
+                })
+                .collect::<Vec<_>>(),
+            other => panic!("{other:?}"),
+        };
+        // RouterOS writes `interface=`; `parent=` and prefixes of either still work.
+        assert_eq!(
+            keys("add interface=ether1 vlan-id=10 name=v10"),
+            ["parent", "vlan_id", "name"]
+        );
+        assert_eq!(keys("add parent=ether1"), ["parent"]);
+        assert_eq!(keys("add inter=ether1 par=ether1"), ["parent", "parent"]);
+        // Elsewhere `interface` is no alias.
+        assert!(matches!(
+            p(&["ip", "address"], "add interface=ether1").unwrap(),
+            Parsed::Command { args, .. } if args == [Arg::Pair { key: "interface".into(), value: "ether1".into() }]
+        ));
     }
 
     #[test]

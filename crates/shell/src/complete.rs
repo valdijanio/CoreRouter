@@ -311,6 +311,17 @@ impl Shell {
                 out.push(cand(format!("{k}="), note, Style::Key));
             }
         }
+        // RouterOS's name of a parameter (`interface=` for `parent`).
+        for (a, key) in &cmd.key_alias {
+            let k = kebab(a);
+            if !has(key) && k.starts_with(typed) {
+                out.push(cand(
+                    format!("{k}="),
+                    format!("same as {}", kebab(key)),
+                    Style::Key,
+                ));
+            }
+        }
         Completion {
             start,
             candidates: out,
