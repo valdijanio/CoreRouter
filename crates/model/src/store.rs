@@ -10,7 +10,9 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::config::Config;
+use crate::config::{Config, Ip};
+use crate::cow::CowArc;
+use crate::firewall::Firewall;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StoreError {
@@ -211,8 +213,12 @@ impl ConfigStore {
 }
 
 pub fn diff_configs(from: &Config, to: &Config) -> Vec<DiffLine> {
-    let a = flatten(from);
-    let b = flatten(to);
+    if from == to {
+        return Vec::new();
+    }
+    let (from, to) = differing(from, to);
+    let a = flatten(&from);
+    let b = flatten(&to);
     let mut out = Vec::new();
     for (path, va) in &a {
         match b.get(path) {
@@ -237,6 +243,118 @@ pub fn diff_configs(from: &Config, to: &Config) -> Vec<DiffLine> {
         }
     }
     out
+}
+
+/// For each field `f` (bound by name from the left side): if it differs
+/// from `$to.f`, copy both sides into `$x` and `$y`.
+macro_rules! keep {
+    ($x:ident, $y:ident, $to:ident: $($f:ident),* $(,)?) => {
+        $(if *$f != $to.$f {
+            $x.$f = $f.clone();
+            $y.$f = $to.$f.clone();
+        })*
+    };
+}
+
+/// Copies `from` and `to` set equal sections back to their default on
+/// both sides. An equal section adds no line, but serializing it was the
+/// cost: 1.5 s for a clean config with 100 000 routes, 100 000
+/// address-list entries and 10 000 rules, under the session lock, on
+/// every refresh of the GUI (G0.31). Sections shared by the two compare
+/// by pointer. The patterns are exhaustive: a new field must be sorted
+/// here, or this does not compile.
+fn differing(from: &Config, to: &Config) -> (Config, Config) {
+    let Config {
+        system,
+        interfaces,
+        interface_lists,
+        ip,
+        ipv6,
+        routing,
+        radius,
+        ppp,
+        queue,
+    } = from;
+    let (mut a, mut b) = (Config::default(), Config::default());
+    keep!(a, b, to: system, interfaces, interface_lists, ipv6, routing, radius, ppp, queue);
+    if *ip != to.ip {
+        let (x, y) = differing_ip(ip, &to.ip);
+        a.ip = CowArc::new(x);
+        b.ip = CowArc::new(y);
+    }
+    (a, b)
+}
+
+/// [`differing`] one level down: `ip` holds the big tables.
+fn differing_ip(from: &Ip, to: &Ip) -> (Ip, Ip) {
+    let Ip {
+        addresses,
+        next_id,
+        routes,
+        next_route_id,
+        neighbor_discovery,
+        firewall,
+        xdp,
+        dns_adlist,
+        dns_forwarders,
+        dhcp_clients,
+        next_dhcp_client_id,
+        dns,
+        dns_static,
+        dns_zones,
+        dns_tsig,
+        pools,
+        dhcp_server,
+        dhcp_relays,
+        cgnat,
+        fastpath,
+        traffic_flow,
+        subscriber_notice,
+        arp,
+    } = from;
+    let (mut a, mut b) = (Ip::default(), Ip::default());
+    keep!(a, b, to:
+        addresses,
+        next_id,
+        routes,
+        next_route_id,
+        neighbor_discovery,
+        xdp,
+        dns_adlist,
+        dns_forwarders,
+        dhcp_clients,
+        next_dhcp_client_id,
+        dns,
+        dns_static,
+        dns_zones,
+        dns_tsig,
+        pools,
+        dhcp_server,
+        dhcp_relays,
+        cgnat,
+        fastpath,
+        traffic_flow,
+        subscriber_notice,
+        arp
+    );
+    if *firewall != to.firewall {
+        let Firewall {
+            filter,
+            nat,
+            mangle,
+            raw,
+            address_lists,
+            next_rule_id,
+            next_address_list_id,
+            zones,
+        } = &**firewall;
+        let to = &*to.firewall;
+        let (mut x, mut y) = (Firewall::default(), Firewall::default());
+        keep!(x, y, to: filter, nat, mangle, raw, address_lists, next_rule_id, next_address_list_id, zones);
+        a.firewall = CowArc::new(x);
+        b.firewall = CowArc::new(y);
+    }
+    (a, b)
 }
 
 fn flatten(cfg: &Config) -> BTreeMap<String, Value> {
@@ -339,6 +457,70 @@ mod tests {
         assert!(!CowArc::ptr_eq(&st.candidate().ip, &st.running().ip));
         assert!(CowArc::ptr_eq(&st.candidate().interfaces, &st.running().interfaces));
         assert_eq!(st.running().ip.routes.len(), 1, "running kept its routes");
+    }
+
+    /// The diff before G0.31: both configs serialized whole.
+    fn naive(from: &Config, to: &Config) -> Vec<DiffLine> {
+        let (a, b) = (flatten(from), flatten(to));
+        let mut out = Vec::new();
+        for (path, va) in &a {
+            match b.get(path) {
+                None => out.push(DiffLine::Remove { path: path.clone(), value: va.clone() }),
+                Some(vb) if vb != va => out.push(DiffLine::Change {
+                    path: path.clone(),
+                    from: va.clone(),
+                    to: vb.clone(),
+                }),
+                Some(_) => {}
+            }
+        }
+        for (path, vb) in &b {
+            if !a.contains_key(path) {
+                out.push(DiffLine::Add { path: path.clone(), value: vb.clone() });
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn skipping_equal_sections_gives_the_same_diff() {
+        let route = |id: u32, dst: &str| crate::RouteEntry {
+            id: crate::ItemId(id),
+            dst_address: dst.parse().unwrap(),
+            gateway: crate::Gateway::ip("192.0.2.254".parse().unwrap()),
+            distance: 1,
+            routing_table: crate::RoutingTable::Main,
+            disabled: false,
+            comment: String::new(),
+            check_gateway: Default::default(),
+            bfd_profile: String::new(),
+        };
+        let mut base = Config::default();
+        base.system.identity = "edge".into();
+        base.ip.routes.push(route(1, "10.1.0.0/16"));
+        base.ip.routes.push(route(2, "10.2.0.0/16"));
+        base.ip.firewall.next_rule_id = 7;
+        base.ipv6.next_dhcp_client_id = 4;
+        let edits: [fn(&mut Config); 6] = [
+            |c| c.system.identity = "core".into(),
+            |c| c.ip.routes.retain(|r| r.id.0 != 1),
+            |c| c.ip.next_route_id = 9,
+            |c| c.ip.firewall.next_rule_id = 8,
+            |c| c.ipv6 = Default::default(),
+            |c| {
+                c.system.identity.clear();
+                c.ip.firewall.next_address_list_id = 3;
+                c.ip.routes.clear();
+            },
+        ];
+        assert_eq!(diff_configs(&base, &base.clone()), []);
+        for (i, edit) in edits.iter().enumerate() {
+            let mut to = base.clone();
+            edit(&mut to);
+            assert!(!naive(&base, &to).is_empty(), "edit {i} changes something");
+            assert_eq!(diff_configs(&base, &to), naive(&base, &to), "edit {i}");
+            assert_eq!(diff_configs(&to, &base), naive(&to, &base), "edit {i} reversed");
+        }
     }
 
     #[test]

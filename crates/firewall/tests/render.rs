@@ -6,7 +6,7 @@
 // Shared helpers are not `#[test]` fns, so clippy's in-tests allowances skip them.
 #![allow(clippy::unwrap_used, clippy::panic)]
 
-use corerouter_firewall::{render, rule_issues, script, validate};
+use corerouter_firewall::{render, rule_issues, script, table_issues, validate};
 use corerouter_model::Config;
 use corerouter_model::firewall::{Action, DynamicAddress, FirewallRule, Table};
 
@@ -260,6 +260,56 @@ fn validator_refuses_what_the_kernel_or_routeros_would() {
         rule_issues(&cfg2, Table::Nat, &bad)
             .iter()
             .any(|(f, _)| *f == "action")
+    );
+}
+
+#[test]
+fn table_issues_are_the_issues_of_each_rule() {
+    let mut cfg = sample();
+    let extra = [
+        rule(901, "INPUT", m(&[]), Action::Accept),
+        rule(
+            902,
+            "c1",
+            m(&[]),
+            act(r#"{"type":"jump","jump_target":"c1"}"#),
+        ),
+        rule(
+            903,
+            "input",
+            m(&[]),
+            act(r#"{"type":"jump","jump_target":"c1"}"#),
+        ),
+        rule(
+            904,
+            "c1",
+            m(&[]),
+            act(r#"{"type":"reject","reject_with":"tcp-reset"}"#),
+        ),
+        rule(
+            905,
+            "forward",
+            m(&[]),
+            act(r#"{"type":"jump","jump_target":"c1"}"#),
+        ),
+    ];
+    for r in extra {
+        cfg.ip.firewall.filter.push(r);
+    }
+    for table in Table::ALL {
+        let each: Vec<_> = cfg
+            .ip
+            .firewall
+            .rules(table)
+            .iter()
+            .map(|r| rule_issues(&cfg, table, r))
+            .collect();
+        assert_eq!(table_issues(&cfg, table), each, "{table:?}");
+    }
+    assert!(
+        table_issues(&cfg, Table::Filter)
+            .iter()
+            .any(|i| !i.is_empty())
     );
 }
 

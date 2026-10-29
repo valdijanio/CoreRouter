@@ -10,10 +10,9 @@
 //! - "dns-server": every second, copies the running config into the
 //!   forwarder when it changed, and opens or closes the sockets as
 //!   `allow_remote_requests` says.
-//! - `udp_threads()` UDP threads per family, all reading the same socket
-//!   (G3.9h: one thread answered ~400k queries/s at 100% of a core, and
-//!   more clients got nothing more): each reads a query and runs the chain
-//!   up to the cache; a cache hit is answered at once. A miss gets a thread of its
+//! - up to four UDP threads per family on one socket ([`udp_threads`]):
+//!   each reads a query and runs the chain up to the cache; a cache hit is
+//!   answered at once. A miss gets a thread of its
 //!   own, at most `max_concurrent_queries` of them (more: SERVFAIL), so
 //!   one slow upstream never holds the cache hits back.
 //! - one TCP thread per family; a thread per connection, at most
@@ -63,16 +62,6 @@ const TICK: Duration = if cfg!(test) {
 };
 /// How often the socket threads look at the stop signal.
 const POLL: Duration = Duration::from_millis(250);
-
-/// Readers per UDP socket: one per core, at most `MAX_UDP_THREADS`.
-/// Measured (G3.9h, 32-core host, cached and static names, one source):
-/// 1 reader 376k answers/s at 100% CPU, 4 readers 1.12M at 400%, 8
-/// readers 1.33M at 760% (they wait on each other past 4).
-const MAX_UDP_THREADS: usize = 4;
-
-fn udp_threads() -> usize {
-    thread::available_parallelism().map_or(1, |n| n.get().min(MAX_UDP_THREADS))
-}
 /// RFC 7766 §6.2.3: idle TCP connections are closed (a few seconds).
 const TCP_IDLE: Duration = Duration::from_secs(10);
 /// A message, from its first byte to its last (a peer sending one byte
@@ -499,6 +488,16 @@ fn is_lab(session: &Shared) -> bool {
     lock(session).backend().starts_with("virtual lab")
 }
 
+/// Readers of each UDP socket: half the cores, 1 to 4. One thread answered
+/// at most ~340 000 cache hits a second at 100 % of a core with the other
+/// cores free; the chain's locks (statistics, per-client limit, cache) let
+/// several scale: 2 threads 577 000/s, 4 threads 964 000/s (G0.31,
+/// **medido**). The kernel hands each datagram to one waiting reader.
+fn udp_threads() -> usize {
+    let cores = thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    (cores / 2).clamp(1, 4)
+}
+
 /// The sockets of one epoch, their threads counted in `health`; where
 /// they listen.
 fn open(
@@ -524,10 +523,10 @@ fn open(
         opened.push((udp, tcp, addr));
     }
     let at = opened.iter().map(|(_, _, a)| *a).collect();
-    let readers = udp_threads();
     for (udp, tcp, _) in opened {
-        for _ in 0..readers {
-            let (s, udp) = (srv.clone(), udp.clone());
+        for _ in 0..udp_threads() {
+            let s = srv.clone();
+            let udp = udp.clone();
             health
                 .spawn("dns-udp", move || udp_loop(s, udp, epoch))
                 .map_err(|e| e.to_string())?;
@@ -1187,7 +1186,7 @@ mod tests {
     #[test]
     fn parallel_clients_share_the_udp_readers() {
         let (session, srv, port, shutdown) = lab();
-        assert!((1..=MAX_UDP_THREADS).contains(&udp_threads()));
+        assert!((1..=4).contains(&udp_threads()));
         thread::scope(|s| {
             for c in 0..8u16 {
                 s.spawn(move || {

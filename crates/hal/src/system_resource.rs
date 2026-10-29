@@ -224,6 +224,9 @@ pub struct Process {
     /// User + system clock ticks since it started.
     pub cpu_ticks: u64,
     pub rss_bytes: u64,
+    /// Open file descriptors (`/proc/<pid>/fd`); `None` when unreadable
+    /// (G1.6q: a leak of sockets or files shows here first).
+    pub fds: Option<u32>,
 }
 
 /// One reading of the machine. Fields the platform does not have are
@@ -434,6 +437,7 @@ impl ResourceSampler for LabSampler {
                     threads: *threads,
                     cpu_ticks: *ticks,
                     rss_bytes: rss << 20,
+                    fds: Some(*threads * 3 + 4),
                 })
                 .collect()
         });

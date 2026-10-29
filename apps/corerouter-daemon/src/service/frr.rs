@@ -48,9 +48,7 @@ fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
     Ok(Box::new(move |health: &super::Health| {
         let Some(dir) = &dir else {
             health.disabled(Some("no --frr <dir>"));
-            while health.sleep(Duration::from_secs(60)) {
-                health.beat();
-            }
+            health.idle_until_shutdown();
             return Ok(());
         };
         let frr = Frr::new(dir);

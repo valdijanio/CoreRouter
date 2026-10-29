@@ -41,9 +41,15 @@ CONFIG_SERIAL_8250=y
 CONFIG_SERIAL_8250_CONSOLE=y
 CONFIG_HW_RANDOM=y
 CONFIG_HW_RANDOM_VIRTIO=y
-# ACPI power button and power-off (VMs, servers).
+# ACPI power button and power-off (VMs, servers). The tiny driver signals
+# PID 1 itself (SIGUSR2: corerouter-init powers off cleanly), with no input
+# daemon. G1.6q: with ACPI_BUTTON the 6.18 kernel made no input device for
+# the fixed button of QEMU's q35 and nothing listened: `virsh shutdown`,
+# Proxmox's Shutdown and a server's front button did nothing.
 CONFIG_ACPI=y
-CONFIG_ACPI_BUTTON=y
+# CONFIG_ACPI_BUTTON is not set
+CONFIG_ACPI_TINY_POWER_BUTTON=y
+CONFIG_ACPI_TINY_POWER_BUTTON_SIGNAL=12
 
 # --- Storage: NVMe, SATA/AHCI, virtio (VMs), SCSI disks.
 CONFIG_BLK_DEV_NVME=y

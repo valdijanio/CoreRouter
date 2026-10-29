@@ -29,6 +29,9 @@ pub const MAX_TEMPLATES_LISTED: usize = 8;
 #[serde(rename_all = "kebab-case")]
 pub enum LocalRole {
     Ibgp,
+    /// RouterOS `ibgp-rr`: iBGP where this router reflects routes to the
+    /// neighbor, its client (RFC 4456; FRR `route-reflector-client`).
+    IbgpRr,
     Ebgp,
     EbgpProvider,
     EbgpCustomer,
@@ -38,8 +41,9 @@ pub enum LocalRole {
 }
 
 impl LocalRole {
-    pub const ALL: [LocalRole; 7] = [
+    pub const ALL: [LocalRole; 8] = [
         LocalRole::Ibgp,
+        LocalRole::IbgpRr,
         LocalRole::Ebgp,
         LocalRole::EbgpProvider,
         LocalRole::EbgpCustomer,
@@ -51,6 +55,7 @@ impl LocalRole {
     pub fn name(self) -> &'static str {
         match self {
             LocalRole::Ibgp => "ibgp",
+            LocalRole::IbgpRr => "ibgp-rr",
             LocalRole::Ebgp => "ebgp",
             LocalRole::EbgpProvider => "ebgp-provider",
             LocalRole::EbgpCustomer => "ebgp-customer",
@@ -65,13 +70,13 @@ impl LocalRole {
     }
 
     pub fn is_ibgp(self) -> bool {
-        self == LocalRole::Ibgp
+        matches!(self, LocalRole::Ibgp | LocalRole::IbgpRr)
     }
 
     /// The RFC 9234 role FRR takes (`neighbor X local-role <role>`).
     pub fn rfc9234(self) -> Option<&'static str> {
         match self {
-            LocalRole::Ibgp | LocalRole::Ebgp => None,
+            LocalRole::Ibgp | LocalRole::IbgpRr | LocalRole::Ebgp => None,
             LocalRole::EbgpProvider => Some("provider"),
             LocalRole::EbgpCustomer => Some("customer"),
             LocalRole::EbgpPeer => Some("peer"),
@@ -142,6 +147,36 @@ impl MaxPrefixAction {
 }
 
 /// RouterOS `nexthop-choice`.
+/// G3.9fa: what a connection announces besides what it reflects
+/// (RouterOS `output.redistribute`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BgpRedistribute {
+    Connected,
+    Static,
+    Ospf,
+}
+
+impl BgpRedistribute {
+    pub const ALL: [BgpRedistribute; 3] = [
+        BgpRedistribute::Connected,
+        BgpRedistribute::Static,
+        BgpRedistribute::Ospf,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            BgpRedistribute::Connected => "connected",
+            BgpRedistribute::Static => "static",
+            BgpRedistribute::Ospf => "ospf",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.name() == s)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum NexthopChoice {
@@ -237,6 +272,14 @@ pub struct BgpParams {
     /// `use-bfd`): the session goes down with BFD (FRR `neighbor … bfd`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bfd: Option<String>,
+    /// G3.9fa: RouterOS `output.redistribute` (connected, static, ospf).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_redistribute: Option<Vec<BgpRedistribute>>,
+    /// G3.9fa: RouterOS `output.network`: the `/ip firewall address-list`
+    /// whose networks are announced, each only while a route to it exists
+    /// (FRR `network` with `bgp network import-check`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_network: Option<String>,
 }
 
 impl BgpParams {
@@ -265,6 +308,8 @@ impl BgpParams {
         take(&mut self.keep_received, &parent.keep_received);
         take(&mut self.rpki_invalid, &parent.rpki_invalid);
         take(&mut self.bfd, &parent.bfd);
+        take(&mut self.output_redistribute, &parent.output_redistribute);
+        take(&mut self.output_network, &parent.output_network);
     }
 
     /// The families in force: unset is IPv4 only, as in RouterOS.

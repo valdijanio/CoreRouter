@@ -36,6 +36,30 @@ Parâmetros de conexão e template (os mesmos nos dois): `remote_as`, `local_rol
 (`default`, `force-self`, `propagate`). Um parâmetro ausente herda do primeiro template que o
 define; `null` num `set` volta a herdar.
 
+### Anunciar redes e refletir rotas (G3.9f)
+
+```sh
+corerouter-cli run ip.firewall.address-list.add '{"list":"bgp-out","address":"100.64.0.0/22"}'
+corerouter-cli run routing.bgp.connection.set '{"id":"upstream1","output_network":"bgp-out"}'
+corerouter-cli run routing.bgp.connection.set '{"id":"core2","output_redistribute":"connected,static"}'
+corerouter-cli run routing.bgp.connection.add '{"name":"client1","remote_address":"10.0.0.7","remote_as":65000,"local_role":"ibgp-rr"}'
+```
+
+- `output_network` (RouterOS `output.network`): a address-list do firewall cujas redes são
+  anunciadas, cada uma só enquanto houver rota para ela (o `network` do FRR com
+  `bgp network import-check`, o "só com rota IGP correspondente" do RouterOS). Mudar a lista
+  chega ao FRR no mesmo commit (~0,1 s até o vizinho, **medido**). Faixas `a-b` ficam de fora.
+- `output_redistribute` (RouterOS `output.redistribute`): `connected`, `static`, `ospf`. As
+  estáticas do CoreRouter são instaladas pelo backend linux (`proto static`), e o `zebra` as vê
+  como rotas *kernel*: `static` vira `redistribute kernel` com um route-map que só deixa passar
+  os prefixos das estáticas configuradas (`CR-BGP-STATIC4/6`).
+- O FRR origina por instância, não por vizinho: o que uma conexão pede vale para as outras da
+  mesma família; quem não deve receber filtra no `output_filter` (o eBGP sem chain já não
+  recebe nada, RFC 8212). A forma exata por conexão é a G3.9fb.
+- `local_role=ibgp-rr` (RouterOS `ibgp-rr`): iBGP em que este roteador reflete rotas para o
+  vizinho, seu cliente (RFC 4456, `route-reflector-client` no FRR). O cluster-id é o router-id,
+  como no RouterOS.
+
 ## Pesquisa
 
 ### MikroTik RouterOS v7
@@ -106,6 +130,23 @@ define; `null` num `set` volta a herdar.
   que mudanças reiniciam a sessão; a prévia de um template recusa a mudança que deixaria uma
   conexão inválida.
 - Transação: mudar um vizinho não derruba os outros (teste com FRR real).
+
+### G3.9f: interoperabilidade (RouterOS v7.25, FRR 10.7.1, CoreRouter × CoreRouter)
+
+- [`/routing/bgp/connection` 7.25](https://manual.mikrotik.com/docs/7.25/cli-reference/routing/bgp/connection/):
+  `output.network` (address-list, enviada só com rota IGP correspondente), `output.redistribute`,
+  `local.role` com `ibgp-rr`, `use-bfd`, `input.limit-process-routes-ipv4/6` (para de processar,
+  não fecha a sessão); sem parâmetro de graceful restart (a sessão anuncia a capacidade `gr`).
+- Outros: Junos (`export` de política com `from protocol static`), IOS-XE (`network` +
+  `redistribute static route-map`), FRR (`network` com `import-check`; `redistribute` por
+  address-family, não por vizinho), VyOS (o mesmo do FRR).
+- RFCs: 4271 §5.1.3 (next hop mantido no iBGP; o `nexthop-choice=force-self` é o `next-hop-self`),
+  4456 §8 (ORIGINATOR_ID e CLUSTER_LIST, conferidos no laboratório), 4760 e 2545 §3 (IPv6 numa
+  sessão IPv4: next hop global, mais o link-local num enlace compartilhado), 1997 (no-export
+  respeitado), 8092, 4486 (Cease subcódigo 1 no max-prefix, visto do outro lado como `0601`),
+  5880/5882 (o BGP cai com o BFD), 2385 (MD5).
+- Como testar: `scripts/bgp-crcr-userns.sh` (no host, sem root nem VM: CoreRouter × CoreRouter e
+  FRR) e `scripts/routeros-interop-bgp.sh` (na VM, contra o CHR).
 
 ### Ficou para depois
 

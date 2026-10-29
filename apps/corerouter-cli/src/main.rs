@@ -70,6 +70,21 @@ fn main() -> ExitCode {
     }
 }
 
+/// Print a line on stdout. A closed stdout (`corerouter-cli … | head`)
+/// ends the program as a pipe does (status 141, as SIGPIPE would),
+/// instead of the panic `println!` gives.
+fn say(line: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    let mut o = io::stdout().lock();
+    if let Err(e) = writeln!(o, "{line}").and_then(|()| o.flush()) {
+        std::process::exit(if e.kind() == io::ErrorKind::BrokenPipe {
+            141
+        } else {
+            1
+        });
+    }
+}
+
 fn real_main() -> Result<(), String> {
     let mut connect: Option<String> = None;
     let mut user: Option<String> = None;
@@ -140,7 +155,7 @@ fn real_main() -> Result<(), String> {
                     .and_then(Value::as_str)
                     .map(|r| format!("  [disabled: {r}]"))
                     .unwrap_or_default();
-                println!("{id:<28} {params}{off}");
+                say(format_args!("{id:<28} {params}{off}"));
             }
             return Ok(());
         }
@@ -187,10 +202,10 @@ fn real_main() -> Result<(), String> {
         }
         other => return Err(format!("unknown command '{other}'\n\n{USAGE}")),
     };
-    println!(
+    say(format_args!(
         "{}",
         serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string())
-    );
+    ));
     Ok(())
 }
 
@@ -225,11 +240,11 @@ fn watch(backend: &mut dyn Backend, id: &str, params: Value) -> Result<(), Strin
         if !header {
             header = true;
             if let Some(h) = text::header(kind) {
-                println!("{h}");
+                say(format_args!("{h}"));
             }
         }
         if let Some(n) = p.get("lost").and_then(Value::as_u64).filter(|n| *n > 0) {
-            println!("({n} events not shown: too far behind)");
+            say(format_args!("({n} events not shown: too far behind)"));
         }
         for ev in p
             .get("events")
@@ -237,12 +252,12 @@ fn watch(backend: &mut dyn Backend, id: &str, params: Value) -> Result<(), Strin
             .into_iter()
             .flatten()
         {
-            println!("{}", text::line(kind, ev));
+            say(format_args!("{}", text::line(kind, ev)));
         }
         after = p.get("next_seq").and_then(Value::as_u64).unwrap_or(after);
         if p.get("done").and_then(Value::as_bool) == Some(true) {
             for l in text::summary(kind, p.get("summary").unwrap_or(&Value::Null)) {
-                println!("{l}");
+                say(format_args!("{l}"));
             }
             let state = p.get("state").and_then(Value::as_str).unwrap_or("");
             return match (state, p.get("reason").and_then(Value::as_str)) {

@@ -43,6 +43,9 @@ pub(crate) struct IpoeHa {
     /// This node answers DHCP on the session servers (the service sets
     /// it: active, and the takeover adopted).
     pub answering: bool,
+    /// The `ppp-ha` loop runs a pair (G4.3hk; the service sets it): with
+    /// `enabled` still off, the config here is behind, so keep quiet.
+    pub paired: bool,
     /// The takeover this core adopted last.
     pub gen_done: u64,
     /// Bindings for the DHCP server's next round (taken once).
@@ -242,6 +245,10 @@ impl Core {
     /// The DHCP server may answer on the session servers.
     pub(crate) fn set_answering(&self, on: bool) {
         guard(&self.st).ha.answering = on;
+    }
+
+    pub(crate) fn set_paired(&self, on: bool) {
+        guard(&self.st).ha.paired = on;
     }
 
     /// The pair's role went to the peer: every session ends here without
