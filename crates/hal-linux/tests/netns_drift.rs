@@ -91,6 +91,7 @@ fn drift_is_seen_and_reconciled() {
         InterfaceKind::Vlan {
             parent: n("d2"),
             vlan_id: VlanId::new(10).unwrap(),
+            service_tag: false,
         },
     );
     iface(&mut cfg, "dbr", InterfaceKind::Bridge);

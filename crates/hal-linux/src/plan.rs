@@ -48,10 +48,12 @@ use ipnet::IpNet;
 /// A link CoreRouter creates and deletes itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkSpec {
-    /// 802.1Q VLAN on top of `parent`.
+    /// 802.1Q VLAN on top of `parent`; with `service_tag` an 802.1ad
+    /// S-VLAN (TPID 0x88a8), the outer tag of a QinQ stack.
     Vlan {
         parent: IfName,
         vlan_id: u16,
+        service_tag: bool,
     },
     Bridge,
     /// Linux `dummy`: what a RouterOS-style loopback is in the kernel.
@@ -78,9 +80,14 @@ impl LinkSpec {
     pub fn of(kind: &InterfaceKind) -> Option<Self> {
         match kind {
             InterfaceKind::Ethernet => None,
-            InterfaceKind::Vlan { parent, vlan_id } => Some(Self::Vlan {
+            InterfaceKind::Vlan {
+                parent,
+                vlan_id,
+                service_tag,
+            } => Some(Self::Vlan {
                 parent: parent.clone(),
                 vlan_id: vlan_id.get(),
+                service_tag: *service_tag,
             }),
             InterfaceKind::Bridge => Some(Self::Bridge),
             InterfaceKind::Loopback => Some(Self::Dummy),
@@ -118,7 +125,16 @@ impl LinkSpec {
 impl fmt::Display for LinkSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Vlan { parent, vlan_id } => write!(f, "vlan {vlan_id} on '{parent}'"),
+            Self::Vlan {
+                parent,
+                vlan_id,
+                service_tag: false,
+            } => write!(f, "vlan {vlan_id} on '{parent}'"),
+            Self::Vlan {
+                parent,
+                vlan_id,
+                service_tag: true,
+            } => write!(f, "vlan {vlan_id} (802.1ad) on '{parent}'"),
             Self::Bridge => f.write_str("bridge"),
             Self::Dummy => f.write_str("loopback (dummy)"),
             Self::Vrf { table } => write!(f, "vrf (table {table})"),
@@ -767,6 +783,7 @@ mod tests {
         InterfaceKind::Vlan {
             parent: n(parent),
             vlan_id: VlanId::new(id).unwrap(),
+            service_tag: false,
         }
     }
 
@@ -854,6 +871,7 @@ mod tests {
                 spec: LinkSpec::Vlan {
                     parent: n("br0"),
                     vlan_id: 10,
+                    service_tag: false,
                 },
             },
         );
@@ -917,14 +935,16 @@ mod tests {
                     link: n("vlan11"),
                     spec: LinkSpec::Vlan {
                         parent: n("vlan10"),
-                        vlan_id: 11
+                        vlan_id: 11,
+                        service_tag: false,
                     }
                 },
                 Op::DeleteLink {
                     link: n("vlan10"),
                     spec: LinkSpec::Vlan {
                         parent: n("br0"),
-                        vlan_id: 10
+                        vlan_id: 10,
+                        service_tag: false,
                     }
                 },
                 Op::DeleteLink {
@@ -960,6 +980,7 @@ mod tests {
                 spec: LinkSpec::Vlan {
                     parent: n("vlan10"),
                     vlan_id: 100,
+                    service_tag: false,
                 },
             },
         );
@@ -970,6 +991,7 @@ mod tests {
                 spec: LinkSpec::Vlan {
                     parent: n("ether1"),
                     vlan_id: 10,
+                    service_tag: false,
                 },
             },
         );
@@ -980,6 +1002,7 @@ mod tests {
                 spec: LinkSpec::Vlan {
                     parent: n("ether1"),
                     vlan_id: 20,
+                    service_tag: false,
                 },
             },
         );
@@ -990,6 +1013,7 @@ mod tests {
                 spec: LinkSpec::Vlan {
                     parent: n("vlan10"),
                     vlan_id: 100,
+                    service_tag: false,
                 },
             },
         );
@@ -1586,6 +1610,7 @@ mod tests {
             spec: LinkSpec::Vlan {
                 parent: n("ether2"),
                 vlan_id: 10,
+                service_tag: false,
             },
         };
         let v10_addr = Op::AddAddress {

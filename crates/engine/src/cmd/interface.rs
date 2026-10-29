@@ -17,7 +17,7 @@ pub const MAX_INTERFACES: usize = 4096;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "interface.list", "Interfaces", ["Interfaces"], None,
-        "{type?: string (ether | vlan | bridge | bonding | loopback | vrf | veth | …)} → [{name, type, kind, managed, unmanaged_reason, mtu, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, comment, parent, vlan_id, bridge, bond, vrf, table}]",
+        "{type?: string (ether | vlan | bridge | bonding | loopback | vrf | veth | …)} → [{name, type, kind, managed, unmanaged_reason, mtu, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, comment, parent, vlan_id, use_service_tag, bridge, bond, vrf, table}]",
         always, list),
     cmd!(
         "interface.set",
@@ -33,7 +33,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add VLAN",
         ["Interfaces"],
         None,
-        "{name: string, parent: string, vlan_id: u32 (1..=4094), mtu?: u32 (68..=9216, default: parent MTU), comment?: string} → {name}",
+        "{name: string, parent: string, vlan_id: u32 (1..=4094), use_service_tag?: bool (802.1ad S-tag, TPID 0x88a8: the outer tag of QinQ; default no, 802.1Q 0x8100), mtu?: u32 (68..=9216, default: parent MTU), comment?: string} → {name}",
         always,
         vlan_add
     ),
@@ -100,9 +100,13 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
         .filter(|i| filter.is_none_or(|t| i.kind.label() == t))
         .map(|i| {
             let st = live.iter().find(|l| l.name == i.name);
-            let (parent, vlan_id) = match &i.kind {
-                InterfaceKind::Vlan { parent, vlan_id } => (Some(parent), Some(vlan_id.get())),
-                _ => (None, None),
+            let (parent, vlan_id, service_tag) = match &i.kind {
+                InterfaceKind::Vlan {
+                    parent,
+                    vlan_id,
+                    service_tag,
+                } => (Some(parent), Some(vlan_id.get()), Some(*service_tag)),
+                _ => (None, None, None),
             };
             let table = match i.kind {
                 InterfaceKind::Vrf { table } => Some(table),
@@ -125,6 +129,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                 "comment": i.comment,
                 "parent": parent,
                 "vlan_id": vlan_id,
+                "use_service_tag": service_tag,
                 "bridge": i.bridge,
                 "bond": i.bond,
                 "vrf": i.vrf,
@@ -316,13 +321,16 @@ fn vlan_add(s: &mut Session, p: &Value) -> Result<Value> {
         .ok()
         .and_then(|id| VlanId::new(id).ok())
         .ok_or_else(|| EngineError::bad("vlan_id", "must be 1..=4094"))?;
+    let service_tag = opt_bool(p, "use_service_tag")?.unwrap_or(false);
     if let Some(other) = cfg.interfaces.values().find(|i| {
-        matches!(&i.kind, InterfaceKind::Vlan { parent: p, vlan_id: v } if *p == parent && *v == vlan_id)
+        matches!(&i.kind, InterfaceKind::Vlan { parent: p, vlan_id: v, service_tag: t }
+            if *p == parent && *v == vlan_id && *t == service_tag)
     }) {
         return Err(EngineError::bad(
             "vlan_id",
             format!(
-                "VLAN {} on {parent} already exists ({})",
+                "{} {} on {parent} already exists ({})",
+                if service_tag { "S-VLAN" } else { "VLAN" },
                 vlan_id.get(),
                 other.name
             ),
@@ -338,7 +346,14 @@ fn vlan_add(s: &mut Session, p: &Value) -> Result<Value> {
             format!("{mtu} exceeds the MTU {} of '{parent}'", parent_iface.mtu),
         ));
     }
-    let mut iface = Interface::new(name, InterfaceKind::Vlan { parent, vlan_id });
+    let mut iface = Interface::new(
+        name,
+        InterfaceKind::Vlan {
+            parent,
+            vlan_id,
+            service_tag,
+        },
+    );
     iface.mtu = mtu;
     insert(s, iface, p)
 }
