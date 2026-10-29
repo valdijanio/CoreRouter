@@ -6527,3 +6527,42 @@ continuação indentadas).
   Na mão: `corerouter-daemon --control 7311 --config-dir /tmp/cr`, a GUI com `--connect
   127.0.0.1:7311` mostra o selo e "1 warning"; `corerouter-cli --connect 127.0.0.1:7311 run
   system.identity.get` imprime o aviso.
+
+- 2026-10-28 — G0.28: Gerenciador instalável como o WinBox: `cargo xtask package gui` gera o `.deb` `corerouter-gui`
+  com a GUI e a CLI em `/usr/bin` (perfil `dist`: release sem símbolos, commit embutido), a
+  entrada do menu (Network › RemoteAccess), o ícone desenhado por código em todos os tamanhos do
+  hicolor + SVG, e o handler de links `corerouter://[usuário@]host[:porta]`, que abre a GUI já
+  conectando pelo mesmo caminho do botão Connect (certificado confirmado na primeira vez; senha só
+  do chaveiro, nunca do link nem do ambiente; texto tratado como hostil). O `.deb` é escrito em
+  Rust no xtask (`ar` + `ustar` + gzip), reproduzível, e as dependências vêm do `ldd` mais as
+  bibliotecas que o winit/wgpu abrem por `dlopen`. Como testar: `cargo xtask package gui`,
+  `dpkg-deb --info/--contents` no arquivo e `sudo apt install ./target/package/corerouter-gui_*.deb`;
+  o teste do xtask instala e remove um pacote num diretório descartável sem root. Detalhes em
+  `docs/install-gui.md`.
+
+- 2026-10-28 — G0.3d: Certificado trocado sem editar arquivo à mão (G0.3d, parte b). Depois de reinstalar o roteador,
+  a GUI recusava o certificado novo e mandava apagar a linha do `known_hosts`.
+
+  - **control:** o `known_hosts` grava quando cada certificado foi aceito (terceira coluna,
+    segundos unix; linhas antigas sem ela seguem valendo) e `format_since` mostra a data. O
+    `dial` pergunta ao `Trust` o que fazer com um certificado trocado (`Decision::{Cancel, Once,
+    Update}`, padrão Cancel): uma vez conecta fixando o novo sem gravar, atualizar troca a linha.
+    Nada é enviado ao roteador antes da decisão (a segunda conexão é fixada no certificado que
+    o operador viu). `AcceptNew` aceita e grava; `Expect(fp)` aceita a troca só se o novo for
+    exatamente o dado.
+  - **GUI nativa:** modal (`egui::Modal`) com o fingerprint guardado e quando foi aceito, o novo
+    (em duas linhas de 16 bytes, fáceis de comparar), o texto "reinstalação × interceptação", ⓘ
+    com a explicação (EN/PT) e três botões: **Cancel** (com foco; Enter e Esc cancelam),
+    **Connect once** e **Trust and update**. O primeiro uso abre o mesmo modal (Cancel, Connect
+    once, Trust and connect). Rótulos em português no catálogo `i18n/auto/connect_pt.rs`.
+  - **CLI:** num terminal pergunta `[c]ancel, connect [o]nce, trust and [u]pdate?` (linha vazia
+    cancela); sem terminal recusa com a mensagem e cita `--accept-new-cert` (novo) e
+    `--fingerprint`. **MCP** (`corerouter-cli mcp`): igual à CLI sem terminal.
+  - Docs: `CLAUDE.md`/`AGENTS.md`, `docs/control-protocol.md`, `docs/mcp.md`.
+
+  Como testar: `cargo nextest run -p corerouter-control -E 'test(known) | test(tls_endpoint) | test(dates)'`
+  (trocar, uma vez, cancelar, `--accept-new-cert`), `-p corerouter-cli` (sem terminal: recusa e
+  `--accept-new-cert` grava; `run` e `mcp`), `-p corerouter-ui a_changed_certificate_asks_with_cancel_as_the_default`.
+  Na mão: daemon com `--listen 127.0.0.1:8739 --config-dir /tmp/cr2`, um `known_hosts` temporário
+  (`COREROUTER_KNOWN_HOSTS=/tmp/kh`) com outra impressão para `127.0.0.1:8739`, e
+  `corerouter-gui --connect tls://127.0.0.1:8739 --user admin`: abre o modal (screenshot conferido).
