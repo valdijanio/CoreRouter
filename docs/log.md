@@ -7055,3 +7055,58 @@ continuação indentadas).
   Também medido nesta auditoria e registrado aqui (os PRs #395 e #399 já tinham entrado):
   `config.diff` e `state.inspect` de ponta a ponta no daemon, o canal de controle com 1, 8, 16 e 64
   conexões, e o conntrack com 250 mil entradas. As gaps G0.31b–e saem desses números.
+
+- 2026-10-29 — G3.9h: Interoperabilidade de L2 e serviços, parte 2: o roteiro `scripts/routeros-interop-l2.sh` (casos
+  wire, vlan, qinq, mtu, lldp, arp, tools, dhcp, dhcp-client, dhcp-relay, dhcp6, dhcp6-client,
+  ra, ntp, dns, nat, cgnat, bond, cr-dhcp, cr-bond, storm e dns-qps). Roda na VM do laboratório
+  contra o RouterOS 7.25 CHR (`cargo xtask vm-lab run -- scripts/routeros-interop-l2.sh
+  [casos]`) ou, com `NO_CHR=1`, só os casos CoreRouter × CoreRouter num namespace descartável sem
+  root, no host. Detalhes da montagem:
+
+  - as portas do CHR ficam no namespace raiz, ligadas por veth + `tc mirred` ao namespace do
+    CoreRouter, porque o daemon não adota um tap criado fora dele e uma bridge não passa LACP;
+  - o roteiro tem um vigia de 30 min e só usa `wait <pid>`; o `wait` sem argumento esperava os
+    daemons e prendeu a VM numa rodada de 2026-10-29;
+  - sem BNG Blaster, a tempestade usa um gerador DHCP em Python num socket AF_PACKET.
+
+  Resultados CoreRouter × CoreRouter (**medido**, 2026-10-29, host de 32 núcleos, release, veth
+  num namespace sem root):
+
+  - **DHCP sobre VLAN 50:** B pega o lease de A com gateway, DNS e domínio certos.
+    - O release chega a A, que libera o lease, e B volta a pedir. É o mesmo do RouterOS: o
+      `/ip dhcp-client release` de lá diz "release current binding and restart DHCP client". O
+      roteiro esperava o lease livre e foi corrigido.
+  - **802.3ad entre os dois kernels:**
+    - um agregador só, com os dois membros, em ~415 ms;
+    - vazão clientes → A (roteando) → bond → B: 88 Gbit/s com 1 fluxo e 354–380 Gbit/s com 4
+      fluxos (veth: limitado por CPU, não é número de placa);
+    - um membro cortado com queda de portadora não perde nada;
+    - corte silencioso do membro que leva o tráfego (portadora em pé, quadros descartados com
+      tc): 1,83 s perdidos até o timeout do LACP tirar o membro do agregador. Bate com a
+      IEEE 802.1AX: com `lacp_rate` fast, 3 × 1 s contados desde o último LACPDU.
+  - **Tempestade DHCPv4:** o servidor acompanha o gerador até 10 mil DISCOVER/s.
+    - 20 000 clientes: 99 % ligados em 1,99 s (9 969 leases/s), latência de 1,6–3,2 ms no
+      histograma do servidor e a thread `svc-dhcp-server` a 14 % de um núcleo;
+    - a 40 mil/s quem cai é o gerador em Python: ele perde OFFERs e reenvia tudo a cada segundo, o
+      que um cliente real não faz (RFC 2131 §4.1: 4, 8, 16… s). O teto do servidor fica para o BNG
+      Blaster na VM.
+  - **DNS QPS:** nomes estáticos e em cache, de 1, 4 e 8 clientes com 32 consultas em voo. Com 1
+    leitor UDP: 376 mil respostas/s com a `dns-udp` a 100 % de um núcleo, e mais clientes não davam
+    mais. Isso confirma a G0.31 (#400), que entrou na `main` em paralelo com os mesmos 4 leitores
+    por socket. Com 4 leitores: 1,12 milhão/s a 400 %; com 8, 1,33 milhão/s a 760 % (rendimento
+    por núcleo cai de 281 para 175 mil/s). Este PR acrescenta o teste
+    `parallel_clients_share_the_udp_readers`: clientes em paralelo recebem cada um a sua resposta,
+    e desligar o encaminhador para todos os leitores.
+
+  Os casos contra o CHR (VLAN/QinQ/MTU, LLDP/MNDP, ARP, ferramentas, DHCPv4/v6, RA, NTP, DNS,
+  NAT/CGNAT e bonding com o RouterOS) esperam a VM, presa desde 2026-10-29 por uma rodada antiga
+  deste roteiro.
+
+  Teste:
+
+  ```sh
+  unshare --user --map-root-user --net --mount -- sh -c 'mount -t tmpfs none /run && mkdir /run/netns && W=/tmp/crw NO_CHR=1 BIN=$PWD/target/release scripts/routeros-interop-l2.sh'
+  cargo test -p corerouter-daemon --bin corerouter-daemon -- dns_server::
+  ```
+
+  O primeiro pede `jq` e `iperf3` no PATH.

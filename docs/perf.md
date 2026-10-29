@@ -2486,3 +2486,21 @@ count=5` em 0,14 s, contando o processo. Quatro conexões leves ao lado de uma q
 |---|---|---|---|---|---|
 | `ip.firewall.connection.list` | 3,0 ms | 6,7 mil | 139 µs | 2,4 ms | 151 ms (dump) |
 | `ip.firewall.connection.top` | 2,8 ms | 1,4 mil | 2,7 ms | 5,6 ms | 154 ms (dump) |
+
+### G3.9h — CoreRouter × CoreRouter: tempestade DHCP e DNS QPS (**medido**, 2026-10-29, 32 CPUs, release, namespace sem root, máquina compartilhada)
+
+`scripts/routeros-interop-l2.sh` com `NO_CHR=1`. Gerador DHCP em Python num socket AF_PACKET
+(um MAC por cliente, flag broadcast, REQUEST a cada OFFER, reenvio a cada 1 s). CPU por thread
+do daemon A lida de `/proc/<pid>/task`.
+
+| Tempestade DHCPv4 | 99 % ligados | Leases/s | Pico de ACKs/s | `svc-dhcp-server` |
+|---|---|---|---|---|
+| 4 000 clientes a 2 000/s | 1,99 s | 1 992 | 2 003 | 5 % |
+| 20 000 clientes a 10 000/s | 1,99 s | 9 969 | 9 999 | 14 % |
+| 40 000 clientes a 40 000/s | 46 s | 860 | 16 176 | 3 % (o gerador é o limite) |
+
+| DNS (consultas UDP, 32 em voo por cliente) | 1 cliente | 4 clientes | 8 clientes | CPU das `dns-udp` |
+|---|---|---|---|---|
+| 1 leitor (antes da G0.31) | 410 mil/s | 376 mil/s | — | 100 % |
+| 4 leitores (padrão) | 483 mil/s | 1,12 milhão/s | — | 400 % |
+| 8 leitores (comparação) | 413 mil/s | 1,33 milhão/s | 1,19 milhão/s | 760 % |
