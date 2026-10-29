@@ -835,7 +835,9 @@ mod tests {
         }
         let text = render(&cfg, &|s| Some(s.stored().to_owned())).unwrap();
         assert!(
-            text.contains("router ospf6\n ospf6 router-id 10.255.0.1\n stub-router administrative\n"),
+            text.contains(
+                "router ospf6\n ospf6 router-id 10.255.0.1\n stub-router administrative\n"
+            ),
             "{text}"
         );
         assert!(!text.contains("max-metric"), "{text}");

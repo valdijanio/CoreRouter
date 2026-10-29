@@ -224,7 +224,8 @@ pub fn stub_v2(json: &str, instance: &str) -> Result<OspfStubState, String> {
         out.admin |= flag("indefiniteActiveAdmin");
         if let Some(ms) = n(m, "activeStartupRemainderMsecs") {
             let secs = ms.div_ceil(1000);
-            out.startup_remaining_secs = Some(out.startup_remaining_secs.map_or(secs, |o| o.max(secs)));
+            out.startup_remaining_secs =
+                Some(out.startup_remaining_secs.map_or(secs, |o| o.max(secs)));
         }
     }
     out.areas.sort();
@@ -704,8 +705,16 @@ mod tests {
         assert_eq!(st.areas, ["0.0.0.0", "0.0.0.1"]);
         assert!(st.admin && st.active());
         assert_eq!(st.startup_remaining_secs, Some(42));
-        assert!(stub_v3(r#"{"routerId":"1.1.1.1","routerIsStubRouter":true}"#, "v3").unwrap().admin);
-        assert!(!stub_v3(r#"{"routerId":"1.1.1.1","routerIsStubRouter":false}"#, "v3").unwrap().active());
+        assert!(
+            stub_v3(r#"{"routerId":"1.1.1.1","routerIsStubRouter":true}"#, "v3")
+                .unwrap()
+                .admin
+        );
+        assert!(
+            !stub_v3(r#"{"routerId":"1.1.1.1","routerIsStubRouter":false}"#, "v3")
+                .unwrap()
+                .active()
+        );
         assert!(stub_v2("garbage", "v2").is_err());
     }
 
