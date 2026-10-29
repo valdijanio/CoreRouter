@@ -214,10 +214,13 @@ for _ in $(seq 100); do curl -sf -m 2 -u "admin:$PW" "http://$ROS/rest/system/re
 # (the same text an operator types; the doc shows them as they are here).
 ros() { curl -sf -m 10 -u "admin:$PW" "http://$ROS/rest/$1"; }
 rosx() {
+  # `as-string`: run it and wait. Without it /rest/execute starts a background
+  # job and returns, so two calls in a row race (a client enabled before the
+  # set that came first; the same race the L2 script hit with its VLANs).
   local out
-  out=$(jq -n --arg s "$1" '{script: $s}' |
-    curl -s -m 30 -u "admin:$PW" -H 'content-type: application/json' -d @- "http://$ROS/rest/execute")
-  if echo "$out" | jq -e 'type == "object" and has("error")' >/dev/null 2>&1; then
+  out=$(jq -n --arg s "$1" '{script: $s, "as-string": true}' |
+    curl -s -m 60 -u "admin:$PW" -H 'content-type: application/json' -d @- "http://$ROS/rest/execute")
+  if echo "$out" | jq -e 'type == "object" and (has("error") or ((.ret // "") | test("failure:|syntax error|bad command|no such item|expected end of command")))' >/dev/null 2>&1; then
     echo "RouterOS refused: $out" >&2
     return 1
   fi

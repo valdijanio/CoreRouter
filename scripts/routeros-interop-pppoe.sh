@@ -188,10 +188,13 @@ ros() { curl -sf -m 10 -u "admin:$PW" "http://$ROS/rest/$1"; }
 # rospost <path> <json>: POST /rest/<path> (monitor, print with options).
 rospost() { curl -s -m 20 -u "admin:$PW" -H 'content-type: application/json' -d "$2" "http://$ROS/rest/$1"; }
 rosx() {
+  # `as-string`: run it and wait. Without it /rest/execute starts a background
+  # job and returns, so two calls in a row race (a client enabled before the
+  # set that came first; the same race the L2 script hit with its VLANs).
   local out
-  out=$(jq -n --arg s "$1" '{script: $s}' |
-    curl -s -m 30 -u "admin:$PW" -H 'content-type: application/json' -d @- "http://$ROS/rest/execute")
-  if echo "$out" | jq -e 'type == "object" and has("error")' >/dev/null 2>&1; then
+  out=$(jq -n --arg s "$1" '{script: $s, "as-string": true}' |
+    curl -s -m 60 -u "admin:$PW" -H 'content-type: application/json' -d @- "http://$ROS/rest/execute")
+  if echo "$out" | jq -e 'type == "object" and (has("error") or ((.ret // "") | test("failure:|syntax error|bad command|no such item|expected end of command")))' >/dev/null 2>&1; then
     echo "RouterOS refused: $out" >&2
     return 1
   fi
@@ -582,7 +585,7 @@ case_multi() {
 "
   done
   rosx "$script" >/dev/null || { result multi FAIL "CHR refused the macvlans/clients (macvlan in this RouterOS?)"; return; }
-  # /rest/execute returns before a long script ends: wait for all the
+  # Belt and braces (rosx used to return before a long script ended): wait for all the
   # clients to exist (enabling earlier caught only m1 and m2).
   wait_for 60 multi_made "$n" >/dev/null || { result multi FAIL "CHR made $(multi_made_count) of $n clients"; return; }
   local base t0 ms; base=$(cr_count)
