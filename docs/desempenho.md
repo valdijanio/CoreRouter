@@ -115,6 +115,29 @@ Tetos de memória que a auditoria pôs (entradas hostis não crescem sem limite)
 vinculações do DHCPv6 em 131 072 registros, ofertas somem após 120 s; histórico de concessões com
 teto; cache DNS pelo orçamento em bytes configurado; tabela de vizinhos da descoberta em 4096.
 
+## Auditoria de desempenho e paralelismo (G0.31, 2026-10-29)
+
+Mesma máquina, release. Config grande do `lock_hold`: 1000 VLANs, 10 000 regras, 100 000
+entradas de address-list e 60 000 rotas. Tudo **medido**; o detalhe está em `docs/perf.md`.
+
+| Medida | Antes | Depois | PR |
+|---|---|---|---|
+| `state.inspect` com a config grande (lock do `Session`) | 1,51 s | 4,4 µs | #395 |
+| `config.diff` com a config grande | 1,42 s | 2,1 µs | #395 |
+| 4 clientes leves ao lado de um pedindo `config.diff` sem parar (p50) | 672 ms | 72 µs | #395 |
+| `ip.firewall.filter.list` com 10 000 regras | 372 ms | 38 ms | #399 |
+| DNS da LAN, respostas/s (cache ou estática) | 336 mil (1 thread a 100 %) | 964 mil (4 leitores) | #400 |
+| DNS com 4096 consultas em voo, perdidas em 6 s | 28 160 | 0 | #412 |
+| `ip.route.add` com 60 000 rotas no kernel (backend linux) | 140 ms | 60–70 ms | #408 |
+| DHCPv4, 20 000 clientes com 1024 em voo: concessões/s | 2,5 mil | 35 mil | #412 |
+| DHCPv4, idem: 99 % servidos | 6,06 s | 0,56 s | #412 |
+
+Canal de controle (`interface.list`): 21,9 mil/s com 1 conexão, 79,6 mil/s com 8 e 72,9 mil/s com
+16 (p99 de 86, 214 e 622 µs); a 17ª conexão é recusada. A vazão para no lock do `Session` (~13 µs
+por consulta), não na CPU. Ainda prendem o lock: `ip.route.list` com 60 000 rotas até ~190 ms
+(G0.31b), o dump do conntrack com 250 000 entradas ~150 ms a cada 2 s (G0.31c), o commit de uma rota
+com 60 000 60–70 ms (G0.31e) e o de uma regra entre 10 000 109 ms (G0.31f).
+
 ## Como medir de novo
 
 - Benchmarks: `cargo xtask bench` (todos) ou `cargo bench -p <crate> --bench <nome>`; para
