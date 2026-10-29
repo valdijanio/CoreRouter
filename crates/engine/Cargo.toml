@@ -135,5 +135,9 @@ harness = false
 name = "framed_routes"
 harness = false
 
+[[bench]]
+name = "ipv6_nd"
+harness = false
+
 [lints]
 workspace = true

@@ -697,14 +697,26 @@ case_ra() {
   ms=$(wait_for 20 slaac v14) && result ra OK "SLAAC on A from the CHR's RA in ${ms} ms (RFC 4862 §5.5.3): $(ip -n crcore -6 -o addr show dev v14 scope global | awk '{print $4}' | head -1), default $(ip -n crcore -6 route show default | head -1)" \
     || result ra FAIL "no SLAAC address on v14 ($(ip -n crcore -6 addr show dev v14 | grep inet6 | tr -s ' ' | paste -sd';'); sysctl accept_ra=$(ip netns exec crcore sysctl -n net.ipv6.conf.v14.accept_ra), autoconf=$(ip netns exec crcore sysctl -n net.ipv6.conf.v14.autoconf))"
   result ra INFO "A ip.address.list on v14: $(cli ip.address.list | jq -c '[.[]? // .rows[]? | select(.interface == "v14") | {address, dynamic: (.dynamic // null)}]' 2>/dev/null)"
-  # CoreRouter → CHR: an address on A's VLAN 15 and the CHR waiting for an RA.
+  # CoreRouter → CHR (G3.9ha): A advertises 2001:db8:15::/64 on VLAN 15
+  # (`ipv6.nd.add`, RFC 4861 §6.2); the CHR autoconfigures from it.
   cr_vlan 15 2001:db8:15::1/64; ros_vlan 15
   rosx '/ipv6 settings set accept-router-advertisements=yes' >/dev/null || true
-  sleep 12
-  local got; got=$(ros ipv6/address | jq -c '[.[] | select(.interface == "v15" and ((.address // "") | startswith("2001:db8:15")))]')
-  [ "$got" != "[]" ] && result ra OK "CHR autoconfigured from A's RA: $got" \
-    || result ra INFO "the CoreRouter sends no Router Advertisement (gap G3.9ha: no /ipv6 nd, RFC 4861 §6.2 router side): CHR v15 has no 2001:db8:15:: address"
+  local nd; nd=$(cli ipv6.nd.add '{"interface":"v15","ra_interval":"3s-4s","hop_limit":64,"other_configuration":true}') \
+    || result ra FAIL "ipv6.nd.add: $nd"
+  ms=$(wait_for 30 ros_slaac v15) && result ra OK "CHR autoconfigured from A's RA in ${ms} ms (RFC 4862 §5.5.3): $(ros ipv6/address | jq -c '[.[] | select(.interface == "v15" and ((.address // "") | startswith("2001:db8:15"))) | .address]')" \
+    || result ra FAIL "CHR has no 2001:db8:15:: address from A's RA (A: $(cli ipv6.nd.list | jq -c '.interfaces'))"
+  ms=$(wait_for 20 ros_ra_default v15) && result ra OK "CHR default route via A's link-local: $(ros ipv6/route | jq -c '[.[] | select(."dst-address" == "::/0") | {gateway, dynamic: (.dynamic // null)}]')" \
+    || result ra FAIL "CHR has no default route from A's RA: $(ros ipv6/route | jq -c '[.[] | select(."dst-address" == "::/0")]')"
+  result ra INFO "A ipv6.nd.list: $(cli ipv6.nd.list | jq -c '[.interfaces[] | select(.interface == "v15") | {state, prefixes, ra_sent, rs_received, conflict}]')"
+  # Disabled: the final RA (Router Lifetime 0, RFC 4861 §6.2.5) takes the
+  # CHR's default route away at once.
+  cli ipv6.nd.disable '{"id":"v15"}' >/dev/null
+  ms=$(wait_for 15 ros_no_ra_default v15) && result ra OK "final RA: the CHR dropped the default route in ${ms} ms" \
+    || result ra FAIL "the CHR kept the default route after ipv6.nd.disable: $(ros ipv6/route | jq -c '[.[] | select(."dst-address" == "::/0")]')"
 }
+ros_slaac() { [ "$(ros ipv6/address | jq -c --arg i "$1" '[.[] | select(.interface == $i and ((.address // "") | startswith("2001:db8:15")))]')" != "[]" ]; }
+ros_ra_default() { ros ipv6/route | jq -e --arg i "$1" '[.[] | select(."dst-address" == "::/0" and ((.gateway // "") | contains($i)))] | length > 0' >/dev/null; }
+ros_no_ra_default() { ! ros_ra_default "$1"; }
 slaac() { ip -n crcore -6 -o addr show dev "$1" scope global | grep -q 2001:db8:14:; }
 
 # --- NTP / DNS --------------------------------------------------------------------

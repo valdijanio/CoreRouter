@@ -17,7 +17,14 @@
 //!   options RDNSS and DNSSL (RFC 8106 §5.1, §5.2). [`RaTimer`] spaces them
 //!   (RFC 4861 §6.2.4, §6.2.6).
 //!
-//! Everything returns whole IPv6 packets (the PPP payload of protocol
+//! [`router_advert_icmp`] is the same RA as a bare ICMPv6 message, for
+//! the Ethernet sender of `/ipv6 nd` (G3.9ha), whose raw socket gets the
+//! IPv6 header and the checksum from the kernel (RFC 3542 §3.1); there the
+//! RA also carries the Source Link-Layer Address and the Default Router
+//! Preference (RFC 4191 §2.2). [`parse_rs_icmp`] and [`parse_ra_icmp`] read
+//! what that socket receives.
+//!
+//! Everything else returns whole IPv6 packets (the PPP payload of protocol
 //! 0x0057) with the ICMPv6/UDP checksum over the pseudo-header (RFC 8200
 //! §8.1). Readers never panic and never read past the payload length.
 
@@ -45,6 +52,8 @@ pub mod icmp {
 
 /// Neighbor Discovery option types.
 pub mod ndopt {
+    /// RFC 4861 §4.6.1.
+    pub const SOURCE_LL: u8 = 1;
     /// RFC 4861 §4.6.2.
     pub const PREFIX_INFO: u8 = 3;
     /// RFC 4861 §4.6.4.
@@ -432,6 +441,11 @@ pub struct RaConfig {
     /// RDNSS/DNSSL lifetime, seconds (RFC 8106 §5.1: by default at least
     /// 3 × MaxRtrAdvInterval).
     pub dns_lifetime: u32,
+    /// Source Link-Layer Address option (RFC 4861 §4.6.1; none on PPP).
+    pub sllao: Option<[u8; 6]>,
+    /// Default Router Preference, the two Prf bits (RFC 4191 §2.2: 01
+    /// high, 00 medium, 11 low; 10 is reserved and sent as medium).
+    pub preference: u8,
 }
 
 impl Default for RaConfig {
@@ -448,6 +462,8 @@ impl Default for RaConfig {
             rdnss: Vec::new(),
             dnssl: Vec::new(),
             dns_lifetime: 1800,
+            sllao: None,
+            preference: 0,
         }
     }
 }
@@ -476,12 +492,39 @@ fn dns_name(name: &str, out: &mut Vec<u8>) -> bool {
 /// [`MAX_DOMAINS`] and names that are not valid DNS names are left out;
 /// the packet never exceeds [`MAX_BUILT`].
 pub fn router_advert(out: &mut Vec<u8>, src: Ipv6Addr, dst: Ipv6Addr, cfg: &RaConfig) {
+    let b = ra_body(cfg);
+    icmp6(out, src, dst, icmp::ROUTER_ADVERT, &b);
+}
+
+/// The RA of `cfg` as an ICMPv6 message with a zero checksum, for a raw
+/// ICMPv6 socket (the kernel fills the checksum, RFC 3542 §3.1). Within
+/// [`MAX_BUILT`] with the IPv6 header, like [`router_advert`].
+pub fn router_advert_icmp(cfg: &RaConfig) -> Vec<u8> {
+    let b = ra_body(cfg);
+    let mut m = Vec::with_capacity(4 + b.len());
+    m.extend_from_slice(&[icmp::ROUTER_ADVERT, 0, 0, 0]);
+    m.extend_from_slice(&b);
+    m
+}
+
+/// The RA after type, code and checksum (RFC 4861 §4.2).
+fn ra_body(cfg: &RaConfig) -> Vec<u8> {
     let mut b = Vec::with_capacity(256);
-    let flags = (u8::from(cfg.managed) << 7) | (u8::from(cfg.other) << 6);
+    // RFC 4191 §2.2: Prf in bits 3-4 of the flags; 10 (reserved) MUST
+    // NOT be sent, it goes out as medium.
+    let prf = match cfg.preference & 0b11 {
+        0b10 => 0,
+        p => p,
+    };
+    let flags = (u8::from(cfg.managed) << 7) | (u8::from(cfg.other) << 6) | (prf << 3);
     b.extend_from_slice(&[cfg.hop_limit, flags]);
     b.extend_from_slice(&cfg.router_lifetime.to_be_bytes());
     b.extend_from_slice(&cfg.reachable_ms.to_be_bytes());
     b.extend_from_slice(&cfg.retrans_ms.to_be_bytes());
+    if let Some(mac) = cfg.sllao {
+        b.extend_from_slice(&[ndopt::SOURCE_LL, 1]);
+        b.extend_from_slice(&mac);
+    }
     if let Some(m) = cfg.mtu {
         b.extend_from_slice(&[ndopt::MTU, 1, 0, 0]);
         b.extend_from_slice(&m.to_be_bytes());
@@ -526,7 +569,7 @@ pub fn router_advert(out: &mut Vec<u8>, src: Ipv6Addr, dst: Ipv6Addr, cfg: &RaCo
             b.resize(b.len() + total - body, 0);
         }
     }
-    icmp6(out, src, dst, icmp::ROUTER_ADVERT, &b);
+    b
 }
 
 /// Appends a Neighbor Advertisement for `target` (RFC 4861 §4.4; R set,
@@ -583,6 +626,48 @@ pub fn router_solicit(out: &mut Vec<u8>, src: Ipv6Addr) {
     icmp6(out, src, ALL_ROUTERS, icmp::ROUTER_SOLICIT, &[0; 4]);
 }
 
+/// A Router Solicitation as a raw ICMPv6 socket hands it over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedRs {
+    pub src: Ipv6Addr,
+    /// The host's link-layer address, if it sent one.
+    pub sllao: Option<[u8; 6]>,
+}
+
+/// Reads a Router Solicitation (RFC 4861 §6.1.1): code 0, at least 8
+/// octets, every option of non-zero length, and no Source Link-Layer
+/// Address option from the unspecified address. `hop_limit` is the IPv6
+/// header's (from `IPV6_RECVHOPLIMIT`): it MUST be 255.
+pub fn parse_rs_icmp(src: Ipv6Addr, hop_limit: u8, b: &[u8]) -> Result<ParsedRs, WireError> {
+    if b.first() != Some(&icmp::ROUTER_SOLICIT) {
+        return Err(WireError::Malformed("not a Router Solicitation"));
+    }
+    if hop_limit != 255 || b.get(1) != Some(&0) || b.len() < 8 {
+        return Err(WireError::Malformed("RS fails RFC 4861 §6.1.1"));
+    }
+    let mut rs = ParsedRs { src, sllao: None };
+    let opts = b.get(8..).unwrap_or(&[]);
+    let mut at = 0usize;
+    while at < opts.len() {
+        let (Some(t), Some(l)) = (opts.get(at).copied(), opts.get(at + 1).copied()) else {
+            return Err(WireError::Malformed("RS option truncated"));
+        };
+        let size = usize::from(l) * 8;
+        let o = opts
+            .get(at..at + size)
+            .filter(|_| l != 0)
+            .ok_or(WireError::BadOption { kind: t, len: size })?;
+        if t == ndopt::SOURCE_LL && l == 1 {
+            if src.is_unspecified() {
+                return Err(WireError::Malformed("RS from :: with a link-layer address"));
+            }
+            rs.sllao = o.get(2..8).and_then(|m| <[u8; 6]>::try_from(m).ok());
+        }
+        at += size;
+    }
+    Ok(rs)
+}
+
 /// An RA as a subscriber reads it (lab, tests and the fuzz round trip).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedRa {
@@ -596,6 +681,11 @@ pub struct ParsedRa {
     pub rdnss: Vec<Ipv6Addr>,
     pub dnssl_raw: Vec<u8>,
     pub dns_lifetime: Option<u32>,
+    pub reachable_ms: u32,
+    pub retrans_ms: u32,
+    /// The Prf bits (RFC 4191 §2.2).
+    pub preference: u8,
+    pub sllao: Option<[u8; 6]>,
 }
 
 impl Default for ParsedRa {
@@ -611,6 +701,10 @@ impl Default for ParsedRa {
             rdnss: Vec::new(),
             dnssl_raw: Vec::new(),
             dns_lifetime: None,
+            reachable_ms: 0,
+            retrans_ms: 0,
+            preference: 0,
+            sllao: None,
         }
     }
 }
@@ -646,13 +740,30 @@ pub fn parse_ra(p: &[u8]) -> Result<ParsedRa, WireError> {
     if checksum(h.src, h.dst, next::ICMPV6, b) != 0 {
         return Err(WireError::Malformed("bad ICMPv6 checksum"));
     }
+    parse_ra_icmp(h.src, b)
+}
+
+/// Reads an RA as a raw ICMPv6 socket hands it over: the message from
+/// type on, sent from `src`. The caller has checked what the IPv6 header
+/// says (RFC 4861 §6.1.2: hop limit 255, link-local source); the kernel
+/// checked the checksum.
+pub fn parse_ra_icmp(src: Ipv6Addr, b: &[u8]) -> Result<ParsedRa, WireError> {
+    if b.first() != Some(&icmp::ROUTER_ADVERT) {
+        return Err(WireError::Malformed("not a Router Advertisement"));
+    }
+    if b.get(1) != Some(&0) || b.len() < 16 {
+        return Err(WireError::Malformed("RA fails RFC 4861 §6.1.2"));
+    }
     let flags = b.get(5).copied().unwrap_or(0);
     let mut ra = ParsedRa {
-        src: h.src,
+        src,
         hop_limit: b.get(4).copied().unwrap_or(0),
         managed: flags & 0x80 != 0,
         other: flags & 0x40 != 0,
+        preference: (flags >> 3) & 0b11,
         router_lifetime: u16_at(b, 6).unwrap_or(0),
+        reachable_ms: u32_at(b, 8).unwrap_or(0),
+        retrans_ms: u32_at(b, 12).unwrap_or(0),
         ..ParsedRa::default()
     };
     let opts = b.get(16..).unwrap_or(&[]);
@@ -667,6 +778,9 @@ pub fn parse_ra(p: &[u8]) -> Result<ParsedRa, WireError> {
             .filter(|_| l != 0)
             .ok_or(WireError::BadOption { kind: t, len: size })?;
         match t {
+            ndopt::SOURCE_LL if l == 1 => {
+                ra.sllao = o.get(2..8).and_then(|m| <[u8; 6]>::try_from(m).ok());
+            }
             ndopt::MTU => ra.mtu = u32_at(o, 4),
             ndopt::PREFIX_INFO if l == 4 => {
                 let f = o.get(3).copied().unwrap_or(0);
@@ -740,7 +854,7 @@ impl RaTimer {
                 gap = gap.min(MAX_INITIAL_RTR_ADVERT_INTERVAL_MS);
             }
         }
-        self.next_at = now + gap;
+        self.next_at = now.saturating_add(gap);
     }
 
     /// When a solicited RA may go out: now, or once the minimum gap since

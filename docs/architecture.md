@@ -1295,6 +1295,37 @@ papel do data plane, ou, se ele não servir, derrubando o vizinho pelo vty.
 - **Revisar** se o lote de syscalls (G3.6j) não pagar e se aparecer pedido de dezenas de milhares
   de sessões ou 3,3 ms (BFD em XDP, G3.6f).
 
+### Router Advertisement em Rust puro, um socket só (G3.9ha)
+
+**Comparado (**medido** em 2026-10-29, Ryzen AI MAX+ 395, namespace de user e de rede,
+interfaces dummy):**
+
+| | 100 interfaces | 1000 interfaces |
+|---|---|---|
+| Emissor Rust, um socket raw ICMPv6 | 1,26 µs/RA, 1 fd | 12,2 µs/RA, 1 fd |
+| Emissor Rust, um socket por interface | 2,57 µs/RA | 39,5 µs/RA, 1000 fds |
+| radvd 2.19, até sair a 1ª rodada | 57 ms, 2,5 MB | 2,4 s, 5,4 s de CPU |
+| radvd, recarga por SIGHUP | 72 ms | morreu com o sinal |
+
+**Fica o emissor próprio** (serviço `router-advertisement` do daemon), com uma thread e um socket.
+
+**Motivos:**
+- o codec do RA já existia, com fuzz (`proto-pppoe/src/nd.rs`, do BNG);
+- não há processo externo, arquivo de config nem sinal;
+- o estado é estruturado e chega a `ipv6.nd.list`: contadores, prefixos depreciados e
+  conflitos (RFC 4861 §6.2.7).
+
+**Desempenho e paralelismo:**
+- **Lock:** o plano (`engine::ipv6_nd::plan`) custa 257 µs com 1000 VLANs, sob o lock da
+  sessão (`benches/ipv6_nd.rs`). Ele só é refeito quando a revisão rodando muda.
+- **Envio:** a rodada de 1000 interfaces custa ~12 ms a cada 200–600 s. Mais threads não
+  ajudam.
+- **Custo por RA:** cresce com o número de interfaces, nas duas formas de socket. A causa
+  provável é a busca da rota `ff00::/8` por interface no kernel, sem confirmação.
+
+**Revisar** se aparecer pedido de dezenas de milhares de interfaces anunciando, ou de RA a menos
+de 3 s.
+
 ### MPLS: kernel por netlink próprio, LDP no FRR (G3.5)
 
 **Comparado:**
