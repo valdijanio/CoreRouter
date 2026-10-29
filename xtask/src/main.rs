@@ -11,6 +11,7 @@ mod os;
 mod oui;
 mod package;
 mod slots;
+mod slowest;
 mod vm_lab;
 mod vm_tools;
 
@@ -81,6 +82,10 @@ const HEAVY: &[&str] = &[
 /// G0.29: the packages `cargo xtask ci --affected` limits the cargo steps
 /// to; unset, the whole workspace.
 static SCOPE: OnceLock<Vec<affected::Package>> = OnceLock::new();
+
+/// G0.30: the slowest tests of this run's `test` step, printed after the
+/// summary (and so at the end of every CI log).
+static SLOWEST: OnceLock<String> = OnceLock::new();
 
 /// `--workspace`, or `-p` for each package of the `--affected` scope that
 /// `keep` accepts. `None` when the scope has none of them (skip the step).
@@ -300,6 +305,9 @@ fn main() -> ExitCode {
             Outcome::Fail(why) => eprintln!("  FAIL  {name}: {why}"),
             Outcome::Skip(why) => eprintln!("  skip  {name}: {why}"),
         }
+    }
+    if let Some(report) = SLOWEST.get() {
+        eprintln!("\n{report}");
     }
     drop(held_slot);
     if failed {
@@ -618,7 +626,14 @@ fn test(root: &Path) -> Outcome {
     if let Some((i, n)) = part {
         c.args(["--partition", &format!("hash:{i}/{n}")]);
     }
-    match run(c, root) {
+    // G0.30: the JUnit report of this run only (none left from an earlier one).
+    let junit = slowest::junit_path(root, "default");
+    let _ = std::fs::remove_file(&junit);
+    let outcome = run(c, root);
+    if let Ok(xml) = std::fs::read_to_string(&junit) {
+        let _ = SLOWEST.set(slowest::report(&slowest::parse_junit(&xml), 20));
+    }
+    match outcome {
         // `cargo test --doc` costs ~17 s even with no doctest (one rustdoc
         // per crate), so it runs only when some doc comment has Rust code.
         Outcome::Ok if first && has_doctests(root) => {
