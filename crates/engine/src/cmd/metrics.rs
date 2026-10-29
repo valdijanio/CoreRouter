@@ -102,14 +102,14 @@ fn machine(s: &mut Session) -> Machine {
     let m = &l.memory;
     let hz = f64::from(l.hz.max(1));
     Machine {
-        memory: (m.total > 0)
-            .then(|| {
-                json!({
-                    "total": m.total, "available": m.available, "free": m.free,
-                    "swap_total": m.swap_total, "swap_free": m.swap_free,
-                })
+        memory: if m.total > 0 {
+            json!({
+                "total": m.total, "available": m.available, "free": m.free,
+                "swap_total": m.swap_total, "swap_free": m.swap_free,
             })
-            .unwrap_or(Value::Null),
+        } else {
+            Value::Null
+        },
         filesystems: l
             .disks
             .iter()
