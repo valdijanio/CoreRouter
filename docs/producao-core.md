@@ -62,6 +62,11 @@ Resumo do que interopera e do que não:
   Gateway (empty: none): 192.0.2.1
   ```
 
+  A senha do `admin` é opcional aqui: sem ela, como no CHR, o roteador aceita a senha vazia
+  pela rede (sempre TLS) e todos os clientes, o log e a saúde avisam até ela ser definida
+  (G0.3d). Defina-a no primeiro acesso: entre com a senha vazia e use **Set password** na GUI
+  (ou `/user set admin password=…`). Até lá qualquer um que alcance a porta de gerência entra.
+
   O resto (a configuração abaixo) vai pela rede: `corerouter-cli --connect
   tls://192.0.2.10:8729 --user admin` ou a GUI. Com endereço já posto, Enter no console mostra
   os endereços e os comandos para conectar. O shell de manutenção (`corerouter.shell=ttyS0` na

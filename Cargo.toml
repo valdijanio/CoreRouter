@@ -135,6 +135,12 @@ panic = "unwind"
 lto = "thin"
 codegen-units = 1
 
+# G0.28: the binaries of the installable packages (`cargo xtask package`):
+# release without symbols (the GUI goes from ~2x to 1x its code size).
+[profile.dist]
+inherits = "release"
+strip = "symbols"
+
 # processo: the `bench-check` step of `cargo xtask ci` (every benchmark run
 # once in criterion's test mode). Optimized, but with the debug assertions
 # and overflow checks of a test build: in debug, the setups of 1M routes or

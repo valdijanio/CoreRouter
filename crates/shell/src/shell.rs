@@ -418,8 +418,8 @@ impl Shell {
         out.lines.push(Line::styled(
             Style::Error,
             format!(
-                "User {user} has no password: anyone on this machine can manage the router, \
-                 and logins from the network are refused until it has one."
+                "User {user} has no password: anyone who reaches the router, from this \
+                 machine or the network, logs in with an empty password until it has one."
             ),
         ));
         out.lines.push(Line::styled(

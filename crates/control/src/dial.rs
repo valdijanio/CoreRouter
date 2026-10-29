@@ -9,6 +9,7 @@ use std::time::Duration;
 use crate::client::Client;
 use crate::known_hosts::KnownHosts;
 use crate::local_token;
+use crate::tls::TlsError;
 
 /// Where a router is: `HOST:PORT` or `tls://HOST:PORT`. TLS is forced for
 /// any host that is not loopback (no plain text over a network).
@@ -95,10 +96,48 @@ impl fmt::Debug for Login {
     }
 }
 
-/// Decides about a certificate seen for the first time.
+/// What to do with a certificate that differs from the remembered one
+/// (G0.3d, PuTTY style).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// Do not connect (the default: nothing was sent).
+    Cancel,
+    /// Connect to the new certificate this time; the file keeps the old.
+    Once,
+    /// Replace the line in known_hosts (dated now) and connect.
+    Update,
+}
+
+/// A remembered certificate that the router no longer shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Changed {
+    pub old: String,
+    /// When the old one was accepted (unix seconds), if known.
+    pub since: Option<u64>,
+    pub new: String,
+}
+
+/// Decides about a certificate seen for the first time, or changed.
 pub trait Trust {
     /// `true` to remember `fingerprint` for `target` and go on.
     fn first_use(&mut self, target: &Target, fingerprint: &str) -> bool;
+    /// The router shows another certificate than the remembered one.
+    fn changed(&mut self, _target: &Target, _change: &Changed) -> Decision {
+        Decision::Cancel
+    }
+}
+
+/// Accepts a new certificate and a changed one, remembering it
+/// (`--accept-new-cert`: the operator said so explicitly).
+pub struct AcceptNew;
+
+impl Trust for AcceptNew {
+    fn first_use(&mut self, _: &Target, _: &str) -> bool {
+        true
+    }
+    fn changed(&mut self, _: &Target, _: &Changed) -> Decision {
+        Decision::Update
+    }
 }
 
 /// Never trusts a new certificate (non-interactive clients: the host must
@@ -117,6 +156,15 @@ pub struct Expect(pub String);
 impl Trust for Expect {
     fn first_use(&mut self, _: &Target, fingerprint: &str) -> bool {
         self.0.eq_ignore_ascii_case(fingerprint)
+    }
+    /// The new certificate is exactly the one given: the operator already
+    /// checked it.
+    fn changed(&mut self, _: &Target, change: &Changed) -> Decision {
+        if self.0.eq_ignore_ascii_case(&change.new) {
+            Decision::Update
+        } else {
+            Decision::Cancel
+        }
     }
 }
 
@@ -145,8 +193,37 @@ pub fn dial(
     let addr = target.addr();
     let mut client = if target.tls {
         let expected = known.get(&addr).map(str::to_owned);
-        let c = Client::connect_tls(&addr, timeout, expected.as_deref())
-            .map_err(|e| format!("{target}: {e}"))?;
+        let c = match Client::connect_tls(&addr, timeout, expected.as_deref()) {
+            Ok(c) => c,
+            Err(TlsError::Changed {
+                expected: old,
+                seen,
+            }) => {
+                let change = Changed {
+                    since: known.since(&addr),
+                    old: old.clone(),
+                    new: seen.clone(),
+                };
+                let refused = TlsError::Changed {
+                    expected: old,
+                    seen: seen.clone(),
+                };
+                match trust.changed(target, &change) {
+                    Decision::Cancel => return Err(format!("{target}: {refused}")),
+                    Decision::Once => {
+                        log::warn!("{target}: certificate {seen} accepted this time only");
+                    }
+                    Decision::Update => match known.remember(&addr, &seen) {
+                        Ok(()) => log::warn!("{target}: certificate changed to {seen}; saved"),
+                        Err(e) => log::warn!("{target}: certificate accepted but not saved: {e}"),
+                    },
+                }
+                // Pinned to what the operator just accepted.
+                Client::connect_tls(&addr, timeout, Some(&seen))
+                    .map_err(|e| format!("{target}: {e}"))?
+            }
+            Err(e) => return Err(format!("{target}: {e}")),
+        };
         if expected.is_none() {
             let fp = c.fingerprint().unwrap_or_default().to_owned();
             if !trust.first_use(target, &fp) {

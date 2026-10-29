@@ -13,12 +13,14 @@
 //!   acts as [`Principal::Local`] (group full). It is how the CLI and the
 //!   MCP server on the same machine work without a password.
 //!
-//! **No password yet (G0.3b, RouterOS 7 style).** The first `admin` has no
-//! password. It logs in with an empty one, but only from loopback; and
-//! while any enabled account of group `full` has no password, every login
-//! from a non-loopback address is refused with [`NO_PASSWORD_REMOTE`], so a
-//! fresh router cannot be taken over from the network. The local token is
-//! not affected.
+//! **No password yet (G0.3b, G0.3d; as on a RouterOS CHR).** The first
+//! `admin` has no password. An account without one logs in with the empty
+//! password from anywhere (the network listeners are TLS only): keeping it
+//! so is the operator's choice, never forced nor limited. Each such login
+//! is a warning in the router's log with the source address, the answer
+//! says `no_password` so every client warns, and the health checks keep a
+//! warning until a password is set. Routers before G0.3d refused network
+//! logins with [`NO_PASSWORD_REMOTE`]; clients still recognise it.
 //!
 //! Tokens are compared in constant time. Failed logins are counted per
 //! source (an IPv4 address or an IPv6 /64, [`crate::conn::source_of`]) and
@@ -52,8 +54,9 @@ use crate::dispatch::Host;
 pub const UNAUTHORIZED: &str = "unauthorized";
 /// The one answer to a failed login, whatever the cause.
 pub const INVALID_LOGIN: &str = "invalid user or password";
-/// The answer to a network login while an account of group `full` has no
-/// password (G0.3b). Clients stop retrying on it.
+/// What routers between G0.3b and G0.3d answered to a network login while
+/// an account of group `full` had no password. Kept so clients talking to
+/// such a router still stop retrying on it.
 pub const NO_PASSWORD_REMOTE: &str = "login from the network is refused while an account of \
      group full has no password: set the admin password first (on the router itself, \
      e.g. `corerouter-cli shell` or the GUI at 127.0.0.1, or user.set)";
@@ -253,23 +256,6 @@ impl Gate {
         params: &Value,
     ) -> Result<Value, String> {
         let (user, password) = login_params(params)?;
-        let loopback = peer.is_some_and(|p| p.is_loopback());
-        if !loopback {
-            let missing = host
-                .with_session(&mut |s| Ok(Value::from(s.admins_without_password())))
-                .ok()
-                .and_then(|v| v.as_array().map(Vec::len))
-                .unwrap_or(0);
-            if missing > 0 {
-                log::warn!(
-                    "control: network login for {:?} from {} refused: an account of group \
-                     full has no password",
-                    user.chars().take(64).collect::<String>(),
-                    peer.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
-                );
-                return Err(NO_PASSWORD_REMOTE.into());
-            }
-        }
         let keys = [
             format!(
                 "ip {}",
@@ -300,8 +286,9 @@ impl Gate {
                 let _slot = self.verify_slot()?;
                 verify_password(h, password)
             }
-            // An account without a password: the empty one, from loopback.
-            Value::Bool(true) if loopback => password.is_empty(),
+            // An account without a password: the empty one, from anywhere
+            // (G0.3d, as on a RouterOS CHR).
+            Value::Bool(true) => password.is_empty(),
             _ => {
                 let _slot = self.verify_slot()?;
                 burn_verification(password);
@@ -365,13 +352,36 @@ impl Gate {
             dropped
         };
         end_logins(host, &dropped);
-        log::info!("control: '{name}' logged in ({})", caller.name);
+        let no_password = stored == Value::Bool(true);
+        if no_password {
+            let from = peer.map(|p| p.to_string()).unwrap_or_else(|| "?".into());
+            log::warn!(
+                "control: '{name}' logged in WITHOUT A PASSWORD from {from} ({}); set one \
+                 with user.set",
+                caller.name
+            );
+            let (who, via) = (name.clone(), caller.name.clone());
+            let _ = host.with_session(&mut |s| {
+                s.log_event(
+                    &["system", "account", "warning"],
+                    "auth",
+                    format!(
+                        "Login sem senha: usuário {who} de {from} ({via}); defina uma senha \
+                         (user.set)"
+                    ),
+                    json!({"user": who, "address": from, "via": via, "no_password": true}),
+                );
+                Ok(Value::Null)
+            });
+        } else {
+            log::info!("control: '{name}' logged in ({})", caller.name);
+        }
         Ok(json!({
             "token": token,
             "user": name,
             "group": group,
             "idle_timeout_secs": self.0.limits.idle.as_secs(),
-            "no_password": stored == Value::Bool(true),
+            "no_password": no_password,
         }))
     }
 
@@ -759,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn no_password_admin_logs_in_from_loopback_only() {
+    fn no_password_admin_logs_in_from_anywhere_and_is_logged() {
         let gate = Gate::new(quick());
         let mut s = Session::virtual_lab();
         assert!(s.bootstrap_admin(false).is_some());
@@ -771,60 +781,68 @@ mod tests {
         let at = |gate: &Gate, s: &mut Session, ip: &str, user: &str, pw: &str| {
             gate.login(
                 s,
-                &Caller::new(1, format!("tcp {ip}:1")),
+                &Caller::new(1, format!("tls {ip}:1")),
                 Some(ip.parse().unwrap()),
                 &json!({"user": user, "password": pw}),
             )
         };
-        let ok = at(&gate, &mut s, "127.0.0.1", "admin", "").unwrap();
-        assert_eq!(ok["no_password"], true);
-        assert_eq!(ok["group"], "full");
-        let ok = at(&gate, &mut s, "::1", "admin", "").unwrap();
-        assert_eq!(ok["no_password"], true);
-        assert_eq!(
-            at(&gate, &mut s, "127.0.0.1", "admin", "anything").unwrap_err(),
-            INVALID_LOGIN
-        );
-        // From the network: refused for everyone while admin has none,
-        // before any password check (no failure counted).
-        for (u, p) in [("admin", ""), ("noc", "right-password"), ("ghost", "x")] {
-            assert_eq!(
-                at(&gate, &mut s, "10.0.0.9", u, p).unwrap_err(),
-                NO_PASSWORD_REMOTE
-            );
+        // G0.3d: the empty password works from loopback and the network
+        // alike, as on a RouterOS CHR.
+        for ip in ["127.0.0.1", "::1", "10.0.0.9", "2001:db8::9"] {
+            let ok = at(&gate, &mut s, ip, "admin", "").unwrap();
+            assert_eq!(ok["no_password"], true, "{ip}");
+            assert_eq!(ok["group"], "full");
         }
-        // A read account with a password still logs in locally.
-        let noc = at(&gate, &mut s, "127.0.0.1", "noc", "right-password").unwrap();
-        assert_eq!(noc["no_password"], false);
-        // Once admin has a password, the network is open, and the empty
-        // password no longer works anywhere.
-        s.execute(
-            "user.set",
-            &json!({"name": "admin", "password": "a-real-password"}),
-        )
-        .unwrap();
-        assert!(at(&gate, &mut s, "10.0.0.9", "admin", "a-real-password").is_ok());
-        assert!(at(&gate, &mut s, "10.0.0.9", "noc", "right-password").is_ok());
+        // Each one is a warning in the router's log with the source.
+        let log = s.execute("log.print", &json!({})).unwrap().to_string();
+        assert!(
+            log.contains("Login sem senha: usuário admin de 10.0.0.9"),
+            "{log}"
+        );
+        assert!(log.contains("2001:db8::9"), "{log}");
+        // Still only the empty password, and the others are unaffected.
         assert_eq!(
-            at(&gate, &mut s, "127.0.0.1", "admin", "").unwrap_err(),
+            at(&gate, &mut s, "10.0.0.9", "admin", "anything").unwrap_err(),
             INVALID_LOGIN
         );
-        // --reset-admin-password closes the network again.
-        s.bootstrap_admin(true);
-        assert_eq!(
-            at(&gate, &mut s, "10.0.0.9", "admin", "a-real-password").unwrap_err(),
-            NO_PASSWORD_REMOTE
-        );
-        // Unknown peer (no address): treated as the network.
-        let e = gate
+        let noc = at(&gate, &mut s, "10.0.0.9", "noc", "right-password").unwrap();
+        assert_eq!(noc["no_password"], false);
+        // Unknown peer (no address): the same.
+        let ok = gate
             .login(
                 &mut s,
                 &Caller::new(1, "x"),
                 None,
                 &json!({"user": "admin", "password": ""}),
             )
-            .unwrap_err();
-        assert_eq!(e, NO_PASSWORD_REMOTE);
+            .unwrap();
+        assert_eq!(ok["no_password"], true);
+        // Once admin has a password, the empty one no longer works anywhere
+        // and the warning goes away.
+        s.execute(
+            "user.set",
+            &json!({"name": "admin", "password": "a-real-password"}),
+        )
+        .unwrap();
+        let ok = at(&gate, &mut s, "10.0.0.9", "admin", "a-real-password").unwrap();
+        assert_eq!(ok["no_password"], false);
+        for ip in ["127.0.0.1", "10.0.0.9"] {
+            assert_eq!(
+                at(&gate, &mut s, ip, "admin", "").unwrap_err(),
+                INVALID_LOGIN
+            );
+        }
+        assert!(s.admins_without_password().is_empty());
+        // --reset-admin-password: the empty one again, from anywhere.
+        s.bootstrap_admin(true);
+        assert_eq!(
+            at(&gate, &mut s, "10.0.0.9", "admin", "").unwrap()["no_password"],
+            true
+        );
+        assert_eq!(
+            at(&gate, &mut s, "10.0.0.9", "admin", "a-real-password").unwrap_err(),
+            INVALID_LOGIN
+        );
     }
 
     #[test]

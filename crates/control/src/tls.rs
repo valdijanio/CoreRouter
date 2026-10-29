@@ -246,9 +246,9 @@ impl std::fmt::Display for TlsError {
             Self::Changed { expected, seen } => write!(
                 f,
                 "REFUSED: the router's TLS certificate CHANGED. Remembered {expected}, \
-                 now {seen}. Someone may be intercepting the connection, or the router \
-                 was reinstalled. If you know why it changed, remove its line from the \
-                 known hosts file and connect again."
+                 now {seen}. Nothing was sent. The router may have been reinstalled (a new \
+                 certificate), or someone may be intercepting the connection: check the \
+                 fingerprint the router prints at start-up before trusting the new one."
             ),
             Self::Other(e) => f.write_str(e),
         }
