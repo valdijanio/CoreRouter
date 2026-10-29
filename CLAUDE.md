@@ -189,7 +189,10 @@ CLI/MCP, log do roteador, saúde); `--reset-admin-password` volta a deixar o `ad
 o **token local** que o daemon grava em `control-<porta>.token` (só o mesmo usuário do sistema
 lê; `$COREROUTER_RUNTIME_DIR` muda a pasta, `--token-file` o arquivo). Fora do loopback é sempre
 TLS + `--user` (senha por prompt ou `$COREROUTER_PASSWORD`); o certificado é confirmado no
-primeiro uso e fica em `~/.config/corerouter/known_hosts`. Detalhes em `docs/control-protocol.md`.
+primeiro uso e fica em `~/.config/corerouter/known_hosts`; se mudar (roteador reinstalado), a GUI
+pergunta como o PuTTY (Cancel, Connect once, Trust and update) e a CLI/MCP sem terminal pede
+`--accept-new-cert` (G0.3d). Testes usam `$COREROUTER_KNOWN_HOSTS` numa pasta temporária.
+Detalhes em `docs/control-protocol.md`.
 
 Mudou UI? Rode a GUI com `--control`, tire `screenshot` e **olhe o PNG** antes de dizer que está
 pronto.

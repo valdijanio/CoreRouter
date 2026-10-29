@@ -156,9 +156,23 @@ no log). Handshake até 10 s. Qualquer endereço que não seja loopback é **sem
 certificado como o SSH: na primeira conexão mostram a impressão digital e pedem confirmação
 (compare com a do log do daemon); a resposta fica em `known_hosts`
 (`$COREROUTER_KNOWN_HOSTS`, senão `~/.config/corerouter/known_hosts`, `%APPDATA%` no
-Windows; uma linha `host:porta SHA256:…`). Se o certificado mudar, a conexão é **recusada
-antes de enviar qualquer coisa**, com as duas impressões na mensagem; apague a linha se a
-mudança for legítima. As assinaturas do handshake continuam verificadas. Endereço no cliente:
+Windows; uma linha `host:porta SHA256:… <aceito em, segundos unix>`; a data, do G0.3d, é
+opcional e linhas antigas sem ela continuam valendo). Se o certificado mudar, **nada é enviado**
+antes da decisão do operador (G0.3d, como o PuTTY; o `StrictHostKeyChecking` do OpenSSH
+recusa, salvo com `no`):
+
+- **GUI nativa:** modal com a impressão guardada e quando foi aceita, a nova, o texto
+  "reinstalação × interceptação" e três botões: **Cancel** (padrão: Enter e Esc cancelam),
+  **Connect once** (conecta fixando a nova só nesta sessão; o `known_hosts` fica como estava) e
+  **Trust and update** (troca a linha, com a data de hoje). O primeiro uso abre o mesmo modal
+  (Cancel, Connect once, Trust and connect).
+- **CLI:** num terminal pergunta `[c]ancel, connect [o]nce, trust and [u]pdate?` (linha vazia
+  cancela); sem terminal recusa com a mensagem e o caminho: `--accept-new-cert` (aceita e
+  grava), ou `--fingerprint <a nova>`.
+- **MCP** (`corerouter-cli mcp`, sem terminal): como a CLI sem terminal; depois de conectado, um
+  certificado que muda numa reconexão é sempre recusado.
+
+As assinaturas do handshake continuam verificadas. Endereço no cliente:
 `HOST:PORTA` (loopback: TCP puro) ou `tls://HOST:PORTA`; um host que não é loopback implica
 `tls://`.
 
@@ -236,6 +250,8 @@ Na GUI web: `?connect=ws://127.0.0.1:7980` abre a tela de conexão com esse daem
   confiança no primeiro uso, portas TLS no CRDP.
 - 2026-10-22 — G0.3b: primeiro `admin` sem senha, login vazio só em loopback, rede recusada até
   definir a senha, `no_password` em `auth.login`/`auth.whoami`/`user.list`.
+- 2026-10-28 — G0.3d: certificado trocado com escolha estilo PuTTY (GUI), `--accept-new-cert`
+  (CLI/MCP), data no `known_hosts`.
 - 2026-10-28 — G0.3d: senha vazia aceita de qualquer rede (como o CHR), com aviso no log, na
   saúde e em todo cliente.
 - 2026-10-22 — G0.3c: tela de conexão (token local → Login/Password em loopback, `admin` por

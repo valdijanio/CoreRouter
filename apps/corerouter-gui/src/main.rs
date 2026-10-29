@@ -55,6 +55,26 @@ enum Connected {
     /// browser checks certificates itself, so only natively).
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     Trust(Credentials, String),
+    /// The router shows another certificate than the remembered one
+    /// (G0.3d): ask, PuTTY style.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    Changed(Box<CertChange>),
+}
+
+/// A certificate that differs from the remembered one.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+struct CertChange {
+    creds: Credentials,
+    old: String,
+    /// When `old` was accepted, already a date.
+    since: String,
+    new: String,
+}
+
+impl CertChange {
+    fn ask(self, screen: &mut ConnectScreen) {
+        screen.ask_changed(self.creds, self.old, self.since, self.new);
+    }
 }
 
 enum Screen {
@@ -128,7 +148,7 @@ impl eframe::App for GuiApp {
                 let creds = match action {
                     None => None,
                     Some(ConnectAction::VirtualLab) => None,
-                    Some(ConnectAction::Connect(c)) => Some(c),
+                    Some(ConnectAction::Connect(c) | ConnectAction::Once(c)) => Some(c),
                     Some(ConnectAction::Trust { creds, fingerprint }) => {
                         match platform.trust(&creds.address, &fingerprint) {
                             Ok(()) => Some(creds),
@@ -150,6 +170,10 @@ impl eframe::App for GuiApp {
                         }
                         Some(Ok(Connected::Trust(c, fp))) => {
                             screen.ask_trust(c, fp);
+                            None
+                        }
+                        Some(Ok(Connected::Changed(change))) => {
+                            change.ask(screen);
                             None
                         }
                         Some(Err(e)) => {
