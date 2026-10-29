@@ -616,6 +616,18 @@ fn render_instance(
     if let Some(t) = inst.graceful_restart_time.filter(|t| *t != GR_RESTART_TIME) {
         let _ = writeln!(s, " bgp graceful-restart restart-time {t}");
     }
+    // G3.9fj, RFC 8538: the N bit (§2) and the Hard Reset of an
+    // administrative reset (§3), both on by default since FRR 8.3
+    // (`bgp_vty.c`, `FRR_CFG_DEFAULT_BOOL`), which prints them only when
+    // off. Typing the `on` form at every commit would make the diff retype
+    // it, and `graceful-restart notification` sends a capability to every
+    // neighbor each time it is typed.
+    if inst.graceful_notification == Some(false) {
+        let _ = writeln!(s, " no bgp graceful-restart notification");
+    }
+    if inst.hard_admin_reset == Some(false) {
+        let _ = writeln!(s, " no bgp hard-administrative-reset");
+    }
     if neighbors
         .iter()
         .any(|(_, p)| p.graceful_restart == Some(true))
@@ -1089,6 +1101,8 @@ mod tests {
             graceful_restart_time: None,
             graceful_stale_time: None,
             graceful_defer_time: None,
+            graceful_notification: None,
+            hard_admin_reset: None,
         }
     }
 
@@ -1340,6 +1354,23 @@ mod tests {
         assert!(
             !text.contains("stalepath-time"),
             "the default is not printed: {text}"
+        );
+        // RFC 8538: only the off forms are printed (FRR's defaults are on).
+        assert!(
+            !text.contains("notification") && !text.contains("hard-administrative-reset"),
+            "{text}"
+        );
+        let inst = cfg.routing.bgp.get_mut("default").unwrap();
+        inst.graceful_notification = Some(false);
+        inst.hard_admin_reset = Some(false);
+        let text = render_config(&cfg, &|_| None).unwrap();
+        assert!(
+            text.contains(" no bgp graceful-restart notification\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(" no bgp hard-administrative-reset\n"),
+            "{text}"
         );
         // Nobody restarting: no F bit.
         cfg.routing.bgp_connections.remove("up");

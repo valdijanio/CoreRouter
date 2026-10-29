@@ -2,6 +2,8 @@
 //!
 //! - [`wire`]: the MPLS echo request / reply codec;
 //! - [`respond`]: what an LSR answers (egress and transit), without I/O;
+//! - [`expired`]: the ICMP "time exceeded" for a labeled packet whose TTL
+//!   expires here (G3.9d; the Linux forwarder sends none), without I/O;
 //! - [`sim`]: the lab's LSPs, answered by that same responder;
 //! - the traits here: the sending side ([`LspProber`] → [`LspSocket`],
 //!   used by the engine's tasks without the session lock) and the
@@ -14,6 +16,7 @@
 //! hands it to its control plane. Since RFC 9570 §4 it carries no Router
 //! Alert option.
 
+pub mod expired;
 pub mod respond;
 pub mod sim;
 pub mod wire;
@@ -31,6 +34,15 @@ use crate::mpls::Origin;
 use crate::probe::ProbeError;
 
 pub use respond::{Heard, LsrView, Verdict};
+
+/// What the responder's sockets heard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Frame {
+    /// An MPLS echo request candidate (UDP 3503 to 127/8 or ::1).
+    Echo(Heard),
+    /// Any other labeled packet whose top TTL expired here.
+    Expired(expired::Expired),
+}
 
 /// One way the FEC leaves this router (the FTN entry: the route of the
 /// prefix with its labels).
@@ -101,8 +113,8 @@ pub type SharedLspProber = Arc<dyn LspProber>;
 pub trait LspResponderIo: Send {
     /// Interfaces to listen on (the MPLS ones); replaces the set.
     fn set_interfaces(&mut self, names: &[IfName]) -> Vec<(IfName, String)>;
-    /// The next request, waiting at most `wait`.
-    fn recv(&mut self, wait: Duration) -> Result<Option<Heard>, HalError>;
+    /// The next request or expired packet, waiting at most `wait`.
+    fn recv(&mut self, wait: Duration) -> Result<Option<Frame>, HalError>;
     /// Send one reply.
     fn send(
         &mut self,
@@ -111,6 +123,8 @@ pub trait LspResponderIo: Send {
         tos: Option<u8>,
         payload: &[u8],
     ) -> Result<(), HalError>;
+    /// Send an ICMP error ([`expired::answer`]) the way it says.
+    fn send_icmp(&mut self, icmp: &expired::Icmp) -> Result<(), HalError>;
     /// What the LSR knows now.
     fn view(&mut self) -> &dyn LsrView;
     /// NTP time now (for TimeStamp Received).
