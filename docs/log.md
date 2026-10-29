@@ -6797,3 +6797,160 @@ continuação indentadas).
 
   Como testar: `cargo xtask ci --affected` (fim da saída: relatório e avisos);
   `COREROUTER_TEST_CEILING_SECS=0.5 GITHUB_ACTIONS=1 cargo xtask ci --only test` reprova.
+
+- 2026-10-29 — G0.31: Auditoria de desempenho, parte 1: `config.diff` e `state.inspect` (o `pending_changes` do resumo
+  usa o mesmo diff) serializavam a config inteira dos dois lados, mesmo sem nada pendente. Com uma
+  config de ISP (1000 VLANs, 10 000 regras de filtro, 100 000 entradas de address-list, 60 000
+  rotas), cada um segurava o lock do `Session` por ~1,4 s; a GUI pede os dois a cada segundo
+  (`REFRESH_SECS`), então uma GUI aberta deixava o lock ocupado quase o tempo todo e DHCP, PPPoE,
+  métricas e os outros clientes esperavam. Agora `diff_configs` retorna na hora quando as configs
+  são iguais (as seções compartilhadas comparam por ponteiro) e só serializa as seções que mudaram
+  (`Config`, `Ip` e `Firewall`, desestruturados por inteiro: campo novo sem tratamento não compila).
+  Teste: `store::tests::skipping_equal_sections_gives_the_same_diff` compara com o diff antigo.
+  Benchmark novo `crates/engine/benches/lock_hold.rs`: varre todas as consultas que aceitam `{}`
+  na config grande e imprime as mais lentas, e mede `state.inspect`/`config.diff` com e sem
+  mudança pendente. Números na seção perf (**medido**).
+
+- 2026-10-29 — G0.31: Auditoria de desempenho, parte 3: o encaminhador DNS da LAN lia cada socket UDP numa thread só.
+  Sob carga, essa thread `dns-udp` ficava a 100 % de um núcleo com os outros 31 livres e o
+  encaminhador parava em ~340 mil respostas/s. Agora cada socket tem até quatro leitores (metade dos
+  núcleos, de 1 a 4), todos no mesmo socket: o kernel entrega cada datagrama a um leitor que está
+  esperando, então não há porta nova nem opção de socket nova. Os locks da cadeia (estatística,
+  limite por cliente, cache) deixam escalar: 4 threads dão 964 mil respostas/s, com p99 de 229 µs
+  (eram 626 µs). O limite `max_queries_per_client` continua valendo para o conjunto, porque a tabela
+  de baldes é a mesma. A G3.9h também testa o DNS nesta rodada; esta mudança só mexe em
+  `open()`/`udp_threads()` de `apps/corerouter-daemon/src/service/dns_server.rs`. Números na seção
+  perf (**medido**).
+
+- 2026-10-29 — G0.31: Auditoria de desempenho, parte 2: `ip.firewall.<tabela>.list` era O(n²). Para cada regra o
+  `rule_issues` montava de novo o grafo de jumps da tabela inteira, e o `shadowed` percorria todas
+  as regras anteriores de todas as chains e recalculava a família dos dois lados a cada par. Agora
+  `corerouter_firewall::table_issues` monta o grafo uma vez por tabela (como o `validate` já fazia
+  desde o audit-net) e o `shadowed` guarda, por chain, as regras anteriores que decidem, com a
+  família calculada uma vez: as mesmas comparações na mesma ordem (o teto `MAX_COMPARISONS` corta
+  no mesmo ponto). Com 10 000 regras em 50 chains, 372 → 38 ms sob o lock do `Session` (a janela
+  Firewall pede a lista a cada segundo). Teste: `table_issues_are_the_issues_of_each_rule`
+  (`crates/firewall/tests/render.rs`) e os testes do `shadow`. Números na seção perf (**medido**).
+
+- 2026-10-29 — G0.31: Auditoria de desempenho, achado de passagem: os serviços `frr`, `mpls` e `neighbors` ociosos
+  (daemon sem `--frr`, laboratório virtual) davam heartbeat a cada 60 s, mas o supervisor acusa
+  "no heartbeat for 30 s (stuck?)" depois de 30 s. Todo daemon sem FRR logava esse aviso falso e
+  mostrava o motivo "no heartbeat" em `system.service.print`. Agora os três chamam
+  `Health::idle_until_shutdown`, que bate a cada `IDLE_BEAT` (10 s); o teste
+  `an_idle_service_beats_before_it_counts_as_stuck` mantém o intervalo abaixo da metade do limite.
+
+- 2026-10-29 — G1.6q: Teste de produção da imagem instalada, parte 1 (o soak de 8 h vem num PR seguinte,
+  `G1.6q-soak`). Na VM `corerouter-teste` (libvirt, imagem de 28/10, `3d79961`) só por leitura e
+  pelo canal 7990 da GUI do usuário; os testes que mudam config, reiniciam ou derrubam a VM
+  rodaram em duas cópias locais da **mesma imagem** (`corerouter.qcow2` de 28/10) num QEMU de
+  usuário, só com a rede NAT do slirp (nada na rede física).
+
+  Quatro defeitos achados e corrigidos:
+
+  - **`virsh shutdown`, o "Shutdown" do Proxmox e o botão de energia não faziam nada**: o kernel
+    6.18 com `ACPI_BUTTON` não criou dispositivo de entrada para o botão fixo do q35, e ninguém o
+    ouvia. Agora o `CONFIG_ACPI_TINY_POWER_BUTTON` manda SIGUSR2 ao PID 1, que já desliga limpo.
+    Botão → QEMU fora: **0,41 s** (antes: nada em 64 s; **medido**).
+  - **`system.resource.process.print` voltava `[]`** numa chamada avulsa (CLI/MCP, ninguém olhando
+    a janela) e, depois, a lista de até 15 s antes. Agora lê na hora quando a do serviço não é da
+    última leitura (teste `a_one_shot_call_gets_the_processes_of_now`).
+  - **Descritores abertos por processo** não apareciam em lugar nenhum: `fds` na lista de
+    processos (`/proc/<pid>/fd`, até 65 536 contados; teste `open_descriptors_are_counted`).
+  - **Cada GUI aberta puxava ~300 KB/s da gerência**, parada (4,2 GB em 3h48 numa delas, na VM
+    real): o catálogo de comandos (`engine.list`, 309 KB) ia junto em toda atualização de 1 s.
+    Agora a GUI pede `engine.list {if_none_match: <etag>}` e o roteador responde `{etag,
+    unchanged: true}` quando nada mudou (FNV-1a do JSON do catálogo, razões de desabilitado
+    incluídas, então um botão que acende vem na atualização seguinte). Sem o parâmetro (CLI, MCP,
+    GUI antiga) a resposta continua o array; roteador antigo ignora o parâmetro e a GUI aceita o
+    array. **294 → 8 KiB/s** por GUI ociosa (**medido**, mesmo daemon, 60 s; testes
+    `the_catalogue_is_not_sent_again_unchanged` e `the_catalogue_comes_again_only_when_it_changed`).
+
+  Funcional na imagem (cópias locais, KVM, 2 vCPUs, 2 GiB, **medido** em 2026-10-29):
+
+  - 298 comandos de consulta com `{}`: nenhum pânico, nenhum erro fora de "parâmetro obrigatório"
+    ou "nada configurado" com o comando que resolve; os mais lentos: `log.os.print` 7,8 ms.
+  - Transacional: loopback, bridge sobre `ether2`, VLAN 100, endereços e identity num
+    `config.commit` (revisão 5), `config.drift.list` em sincronia, `config.rollback` para a 4.
+  - Safe Mode: a sessão caiu, as mudanças foram desfeitas ("undone (the owner's connection
+    closed)"); `config.safe-mode.exit` confirmou.
+  - Reset forçado (`system_reset`, queda de energia): config inteira de volta; **3,7 s** do reset ao
+    TLS respondendo, kernel → daemon pronto 1,25 s; boot a frio da imagem nova 2,78 s (com o
+    firmware).
+  - A/B: 3d79961 → imagem nova em **18 s** (envio 0,3 s a 172 MiB/s, volta em 10,5 s, confirmada
+    em 17,5 s), config, certificado e `admin` sem senha mantidos; `system.tuning.boot.apply
+    drill=true` (slot de teste que não boota): kernel panic e volta sozinha ao slot anterior,
+    `rolled-back`, em menos de 20 s.
+  - Web: `https://…/` 200, `.wasm` de 11,5 MB em gzip em 0,17 s; métricas (`ip.service.metrics`)
+    171 linhas em 15 ms; NTP sincronizado em menos de 5 s (stratum 2, −3,8 ms); DNS pelo
+    servidor configurado.
+  - Gerência sob carga (cópia local, 2 vCPUs): 1 conexão 2 405 consultas/s (p50 0,38 ms, p99
+    0,96 ms), 4 conexões 4 712/s (p99 2,08 ms), o daemon em ~1,2 das 2 vCPUs.
+
+  Na VM real: atualizada pelo canal 7990 (`corerouter-cli upload --wait`, o que o `cargo xtask os
+  push` faz) para esta branch (`f694e065`): 17,6 s, volta em 7,5 s; config (13 revisões), endereço
+  DHCP da `ether1`, certificado (SHA-256 igual) e `admin` sem senha mantidos, as duas GUIs
+  reconectaram. Ela rodava desde 28/10 **sem dm-verity** (primeiro boot de imagem de VM pelo
+  fallback da UEFI, documentado em `docs/os-image.md`); agora o slot `b` está com `"verity":
+  true`. O roteiro (`docs/producao-core.md`) ganhou o passo "reiniciar uma vez".
+
+  FRR ocioso: **103,3 MiB** somando os 8 daemons (10 processos; o `ldpd` tem 3), contra os ~88 MiB
+  da G1.6i; `mgmtd`+`zebra`+`staticd` são 33,4 MiB: a G1.6i economizaria ~70 MiB (**medido**, VM
+  real, 4 h de uptime).
+
+- 2026-10-29 — G3.9h: QinQ 802.1ad como o RouterOS monta: `interface.vlan.add` ganhou `use_service_tag` (o
+  `use-service-tag` do RouterOS), que cria a VLAN com TPID 0x88a8 (S-tag do IEEE 802.1ad) em vez
+  de 0x8100. Antes o CoreRouter só empilhava 802.1Q sobre 802.1Q, e uma C-VLAN sobre uma S-VLAN
+  do RouterOS ou de uma OLT não conversava. Uma S-VLAN e uma C-VLAN podem ter o mesmo id na
+  mesma porta (TPIDs diferentes, como no Linux e no RouterOS); duas S-VLANs com o mesmo id, não.
+  O `interface.list` mostra `use_service_tag`, o `/export` escreve `use-service-tag=yes` só onde
+  está ligado, e a config de uma VLAN comum não muda (o campo só é gravado quando verdadeiro). No
+  kernel: `IFLA_VLAN_PROTOCOL` na criação e na leitura (uma VLAN existente com outro TPID não é
+  adotada). Teste: `cargo test -p corerouter-engine --test it -- vlan_add_service_tag_for_qinq` e o
+  teste de namespace `vlan_bridge_loopback_and_addresses` (`cargo xtask netns`), que cria
+  `802.1ad id 10` + `802.1Q id 7` em cima e confere no `ip -d link`.
+
+- 2026-10-29 — G4.3hk: O `netns_ha_pppoe` caía uma vez a cada tantos lotes da fila, cada vez num ponto. A causa
+  eram **dois defeitos do produto**. O teste estava certo.
+
+  - **Um nó do par atendia assinantes sem a config do par.** O laço `ppp-ha` e os serviços
+    PPPoE/IPoE releem a config cada um no seu segundo. Logo depois de `ppp.redundancy.set`, o
+    HA já dizia `standby` (ou `active`) e os workers ainda rodavam sem redundância
+    (`serving()` = `!cfg.redundancy.enabled || …` = sim). O nó respondia PADI pela MAC
+    própria em vez da virtual, e um standby atendia CPEs que depois abandonava em silêncio.
+    Comprovado no laboratório: as CPEs subiram em 25 ms com MAC de AC errada, e o B registrou
+    `down admin` de sessões que um standby não devia ter. Correção:
+    `pppoe_bng::ha_may_answer`. Sem par nem no HA (`HA_PAIRED`, que o `ppp-ha` grava) nem na config, o nó
+    atende como antes. Com par em qualquer um dos dois, só atende quando é o ativo **e** a
+    config dele já tem o par (a VMAC). O IPoE usa a mesma trava, no DHCP e no ARP calado.
+  - **CoA-ACK antes de a mudança aparecer** (RFC 5176 §3: o ACK diz que a mudança foi feita).
+    O PPPoE punha a taxa na fila dos workers e respondia ACK; o `ppp.active.list` só mostrava
+    a taxa na volta seguinte do worker (até 20 ms ocioso, mais sob carga). Comprovado: logo
+    após os 20 ACKs uma sessão estava sem a taxa, e 2 s depois tinha. Agora a taxa entra na
+    sessão sob o mesmo lock, antes do ACK, como no IPoE. O plano de dados é programado na
+    volta seguinte do worker, como já era.
+
+  O teste ganhou diagnóstico permanente: quedas das CPEs por motivo, o maior intervalo sem
+  atendimento e, na falha, o monitor e o histórico dos dois nós, o log do roteador (papéis
+  e partidas do PPPoE) e o fim dos logs dos daemons, que agora ficam na pasta de config.
+  Duas hipóteses foram descartadas com medida. **(a)** As CPEs sem atendimento entre as
+  consultas ao B ficaram até 1,4 s (**medido**), longe do `keepalive_timeout` de 10 s.
+  **(b)** Um split brain por hello perdido também não: congelar o B ou o A por 3 s
+  (SIGSTOP) com 200 sessões não derrubou nenhuma.
+
+
+  Como testar: `cargo test -p corerouter-daemon --bin corerouter-daemon -- a_node_answers_only coa_rate_is_on`
+  (determinísticos: o primeiro fixa a tabela da trava, o segundo reprovava sem o ACK novo) e
+  `cargo xtask netns` (o teste inteiro).
+
+  Números (**medidos**, 2026-10-29, AMD Ryzen AI Max+ 395, 32 threads, build debug), várias
+  cópias do teste em paralelo, cada uma no seu namespace:
+
+  | Carga | Antes | Depois |
+  |---|---|---|
+  | 8 cópias × 6 rodadas | 6 falhas em 48 (5× MAC de AC errada, 1× taxa do CoA) | 0 em 48 |
+  | 12 cópias × 4 rodadas | 7 falhas em 48 (todas MAC de AC errada) | 0 em 48 |
+  | 12 cópias × 3 rodadas (código final) | — | 0 em 36 |
+
+  Só CPU não reproduz: 0 falhas em 7 rodadas do `cargo xtask netns` inteiro preso em 4 e em
+  2 núcleos com laços de carga, e 0 em 5 do teste sozinho sob carga. A janela aparece quando
+  vários daemons sobem e são configurados ao mesmo tempo, como no passo `netns` do CI.
