@@ -6713,3 +6713,23 @@ continuação indentadas).
   Como testar: `cargo test -p xtask` (seleção do afetado com metadata falsa; o semáforo com dois
   processos-filho segurando as vagas, a morte de um libera, a trava não passa para filhos);
   `cargo xtask ci --affected` numa branch com uma mudança pequena.
+
+- 2026-10-29 — G0.29: Parte C: os testes de integração de cada crate viram um executável só, `tests/it/main.rs` com um
+  `mod` por arquivo (106 arquivos de 9 crates: engine, daemon, dataplane-ebpf-common, shell,
+  proto-pppoe, proto-radius, control, mcp, proto-ha). Os nomes das funções não mudam; o nome
+  completo ganha o módulo do arquivo (`cgnat::...`), e o `.config/nextest.toml` casa com ou sem
+  ele. Ficam em `tests/<nome>.rs`, binário próprio, os que precisam do processo deles: `netns*`
+  (o `cargo xtask netns` dá um namespace novo por binário, descoberta sem mudança), `*_root`
+  (`cargo xtask xdp-root`), `*_live` (scripts do FRR), `bng_lab*` (`cargo xtask bng-lab`), os que
+  se reexecutam pelo nome (`current_exe() --exact`) e o `discovery/tests/warnings.rs`, que
+  instala o logger do processo. O `cargo xtask fmt` reprova um `tests/it/<nome>.rs` sem o `mod`
+  no `main.rs` (ficaria sem compilar, em silêncio). `CLAUDE.md`/`AGENTS.md`: a regra do arquivo
+  novo de teste.
+
+  Benches (77): não juntados. A medição dos testes mostrou que juntar não muda o tempo (o link
+  já roda em paralelo nas 32 threads) e só reduz disco; nos benches seriam ~2,4 GB, ao custo de
+  renomear os alvos que `cargo bench --bench <nome>`, o `SLOW_FIRST` do bench-check e os
+  comandos do `docs/perf.md` usam.
+
+  Como testar: `cargo nextest run --workspace` (3487 testes); `cargo test -p corerouter-engine
+  --test it cgnat::` (um arquivo); `cargo xtask netns`; `cargo test -p xtask it_mods`.
