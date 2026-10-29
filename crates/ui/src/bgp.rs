@@ -87,7 +87,7 @@ const fn field(param: &'static str, label: &'static str, help: &'static str, inp
 const SESSION_PAGE: &[&str] = &["hold_time", "keepalive_time", "multihop", "bfd", "update_source", "tcp_md5_key", "nexthop_choice"];
 const LIMITS_PAGE: &[&str] = &["afi", "max_prefix_ipv4", "max_prefix_ipv6", "max_prefix_action", "max_prefix_restart"];
 /// G3.2b: the `/routing filter` chains (RFC 8212: eBGP needs both).
-const FILTERS_PAGE: &[&str] = &["input_filter", "output_filter", "keep_received"];
+const FILTERS_PAGE: &[&str] = &["input_filter", "output_filter", "keep_received", "output_network", "output_redistribute"];
 
 const CONN_FIELDS: &[Field] = &[
     field("name", "Name", "bgp.connection.name", Input::Text("upstream1")),
@@ -114,6 +114,9 @@ const CONN_FIELDS: &[Field] = &[
     field("input_filter", "Input Filter", "bgp.param.input_filter", Input::Text("chain of received routes")),
     field("output_filter", "Output Filter", "bgp.param.output_filter", Input::Text("chain of sent routes")),
     field("keep_received", "Keep Received", "bgp.param.keep_received", Input::Choice),
+    // G3.9f: what the router announces itself.
+    field("output_network", "Output Network", "bgp.param.output_network", Input::Text("address-list name")),
+    field("output_redistribute", "Redistribute", "bgp.param.output_redistribute", Input::Text("connected,static,ospf")),
 ];
 
 const TPL_FIELDS: &[Field] = &[
@@ -138,6 +141,9 @@ const TPL_FIELDS: &[Field] = &[
     field("input_filter", "Input Filter", "bgp.param.input_filter", Input::Text("chain of received routes")),
     field("output_filter", "Output Filter", "bgp.param.output_filter", Input::Text("chain of sent routes")),
     field("keep_received", "Keep Received", "bgp.param.keep_received", Input::Choice),
+    // G3.9f: what the router announces itself.
+    field("output_network", "Output Network", "bgp.param.output_network", Input::Text("address-list name")),
+    field("output_redistribute", "Redistribute", "bgp.param.output_redistribute", Input::Text("connected,static,ospf")),
 ];
 
 pub(crate) const CONN_SPEC: Spec = Spec {
@@ -207,7 +213,7 @@ pub(crate) struct BgpPanel {
     filters: Filters,
     pub(crate) modal: Option<(What, Modal)>,
     /// The modal's page.
-    page: usize,
+    pub(crate) page: usize,
     pub(crate) help: Option<HelpView>,
 }
 
@@ -487,8 +493,8 @@ fn values_of(r: &Value, what: What) -> BTreeMap<&'static str, String> {
                 Some(false) => "no".into(),
                 None => String::new(),
             },
-            "afi" => own
-                .get("afi")
+            "afi" | "output_redistribute" => own
+                .get(f.param)
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(","))
                 .unwrap_or_default(),
