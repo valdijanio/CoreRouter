@@ -582,6 +582,13 @@ impl SessionOwner for Owner {
                             sh.route_changes.push((h.clone(), c.clone()));
                         }
                         if let Some(r) = &rate {
+                            // G4.3hk: RFC 5176 §3: the ACK says the change
+                            // was made, so the session shows it before the
+                            // ACK leaves (as the IPoE one does); the worker
+                            // programs the data plane on its next turn.
+                            if let Some(a) = sh.active.get_mut(&h) {
+                                a.rate_limit = Some(r.clone());
+                            }
                             sh.rates.push((h.clone(), r.clone()));
                         }
                         if let Some(l) = &list {
@@ -1147,6 +1154,31 @@ pub(crate) struct Snapshot {
 /// daemon's `ppp-ha` service; false until it says so: a node that boots
 /// keeps quiet until the pair decides).
 pub(crate) static HA_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// G4.3hk: may this node answer subscribers? `configured`: the service's
+/// copy of the config has redundancy on; `active`: the pair says this node
+/// answers. The `ppp-ha` loop and the PPPoE/IPoE services read the config
+/// each on its own second, so right after `ppp.redundancy.set` one of them
+/// has the pair and the other not yet. A standby whose PPPoE still ran
+/// without it answered PADIs from its own MAC while the active answered
+/// from the virtual one (the netns test: 5 of 48 runs, **medido**). Both
+/// must agree: no pair on either side answers as before; a pair on either
+/// side answers only when active and configured (from the virtual MAC).
+pub(crate) fn ha_may_answer(configured: bool, active: bool) -> bool {
+    may_answer(
+        configured,
+        HA_PAIRED.load(std::sync::atomic::Ordering::Acquire),
+        active,
+    )
+}
+
+pub(crate) fn may_answer(configured: bool, paired: bool, active: bool) -> bool {
+    if configured { active } else { !paired }
+}
+
+/// G4.3hk: the `ppp-ha` loop runs a pair (set by it, with [`HA_ACTIVE`]).
+pub(crate) static HA_PAIRED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) struct Bng {
@@ -3580,8 +3612,10 @@ impl Bng {
     /// G4.3h: answer subscribers now — redundancy is off, or this node is
     /// the active one of its pair ([`HA_ACTIVE`]).
     pub(crate) fn serving(&self) -> bool {
-        !self.cfg.ppp.redundancy.enabled
-            || (HA_ACTIVE.load(std::sync::atomic::Ordering::Acquire) && !self.ha_pending())
+        ha_may_answer(
+            self.cfg.ppp.redundancy.enabled,
+            HA_ACTIVE.load(std::sync::atomic::Ordering::Acquire) && !self.ha_pending(),
+        )
     }
 
     /// G4.3h: the pair's role went to the peer. Every session ends here
