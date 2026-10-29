@@ -158,7 +158,7 @@ fn lock_hold(c: &mut Criterion) {
     g.bench_function("state.inspect", |b| {
         b.iter(|| black_box(s.inspect(None).ok()))
     });
-    for id in ["config.diff", "interface.list"] {
+    for id in ["config.diff", "interface.list", "ip.firewall.filter.list"] {
         g.bench_function(id, |b| {
             b.iter(|| black_box(s.execute(id, &Value::Null).ok()))
         });
