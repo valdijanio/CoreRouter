@@ -103,3 +103,71 @@ fn cli_and_mcp_use_the_local_token() {
     assert_ne!(reply["result"]["isError"], true, "{reply}");
     let _ = std::fs::remove_dir_all(base);
 }
+
+/// G0.3d: without a terminal a CHANGED certificate is refused with the way
+/// out (`--accept-new-cert`), in `run` and in `mcp`; with the flag the CLI
+/// connects and the known hosts line is replaced.
+#[test]
+fn a_changed_certificate_needs_accept_new_cert_without_a_terminal() {
+    let base = std::env::temp_dir().join(format!("cr-cli-cert-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let mut s = Session::virtual_lab();
+    s.execute(
+        "user.add",
+        &json!({"name": "admin", "group": "full", "password": "cert-test-pw"}),
+    )
+    .unwrap();
+    let (cert, key) = corerouter_control::tls::generate().unwrap();
+    let id = corerouter_control::tls::identity_from_pem(cert.as_bytes(), key.as_bytes()).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    spawn(
+        Endpoint::tls(listener, id.config.clone()),
+        SharedHost(shared(s)),
+        Gate::default(),
+    )
+    .unwrap();
+    let known = base.join("known_hosts");
+    std::fs::write(&known, format!("{addr} SHA256:00:11 1700000000\n")).unwrap();
+    let target = format!("tls://{addr}");
+    let run = |extra: &[&str]| {
+        let out = Command::new(CLI)
+            .args(["--connect", &target, "--user", "admin"])
+            .args(extra)
+            .env("COREROUTER_KNOWN_HOSTS", &known)
+            .env("COREROUTER_PASSWORD", "cert-test-pw")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    for args in [&["inspect"][..], &["mcp"][..]] {
+        let (ok, err) = run(args);
+        assert!(!ok, "{args:?}");
+        assert!(
+            err.contains("CHANGED") && err.contains("--accept-new-cert"),
+            "{args:?}: {err}"
+        );
+    }
+    assert!(
+        std::fs::read_to_string(&known)
+            .unwrap()
+            .contains("SHA256:00:11")
+    );
+    let (ok, err) = run(&["--accept-new-cert", "run", "system.identity.get"]);
+    assert!(ok, "{err}");
+    let text = std::fs::read_to_string(&known).unwrap();
+    assert!(
+        text.contains(&format!("{addr} {}", id.fingerprint)),
+        "{text}"
+    );
+    assert!(!text.contains("SHA256:00:11"), "{text}");
+    // Now known: no flag needed.
+    let (ok, err) = run(&["run", "system.identity.get"]);
+    assert!(ok, "{err}");
+    let _ = std::fs::remove_dir_all(&base);
+}

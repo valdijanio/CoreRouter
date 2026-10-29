@@ -97,9 +97,10 @@ mod tests {
         let mut s = Session::virtual_lab();
         let v = s.execute("system.health.check", &json!({})).unwrap();
         let checks = v["checks"].as_array().unwrap();
-        assert_eq!(checks.len(), 14);
+        assert_eq!(checks.len(), 15);
         let by = |k: &str| checks.iter().find(|c| c["key"] == k).unwrap().clone();
         assert_eq!(by("routes.ecmp")["severity"], "ok", "the lab has no ECMP (G1.27j)");
+        assert_eq!(by("auth.no_password")["severity"], "ok", "the lab has no admin yet");
         assert_eq!(by("nic.errors")["severity"], "warning", "ether4's bad cable");
         assert!(by("nic.errors")["reason"].as_str().unwrap().contains("ether4"));
         assert_eq!(by("ntp")["severity"], "ok", "NTP off is the factory default (G4.6i)");

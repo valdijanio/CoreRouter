@@ -6494,3 +6494,75 @@ continuação indentadas).
   `ether1 ether2 ether3 lo` e nada mais em `/sys/class/net`; marcador e mapa gravados; `exit` no
   shell e ele volta sem zumbi; instalador recusa `eth9`; assistente do qcow2 pelo número, com
   confirmação e resumo), `cargo xtask os boot-test`, `ab-test`, `frr-test` (agora em `ether1`).
+
+- 2026-10-28 — G0.3d: Acesso sem senha como no RouterOS CHR (G0.3d, parte a). No teste da imagem numa VM o usuário
+  pulou a senha no assistente e ficou trancado: o `admin` sem senha só entrava de `127.0.0.1` e
+  todo login pela rede era recusado (G0.3b), sem shell no console para definir a senha. Decisão
+  do usuário: aceitar a senha vazia de qualquer rede, como o CHR, sem forçar troca nem limitar
+  comandos, mas avisando sempre.
+
+  - **Control (`auth.login`):** a conta sem senha entra com a senha vazia de qualquer endereço
+    (fora do loopback é sempre TLS); a recusa `NO_PASSWORD_REMOTE` saiu (a constante fica para
+    os clientes reconhecerem roteadores entre G0.3b e G0.3d). Cada login sem senha é um aviso no
+    log do roteador (`log.print`, tópicos `system,account,warning`, origem `auth`) com usuário,
+    endereço de origem e canal, e uma linha `WARN` no log do daemon.
+  - **Saúde:** verificação nova `auth.no_password` ("Admin password"), `warning` enquanto uma
+    conta `full` ativa não tiver senha; entra no selo "1 warning" e no System › Resources (ⓘ em
+    inglês e português).
+  - **GUI:** selo âmbar `admin: no password` na barra de cima com o botão **Set password** e o ⓘ
+    (modal explicando o risco, catálogo `i18n/auto/first_login_*.rs`), em todo login e toda
+    janela; o diálogo de primeiro acesso diz que a senha vazia vale pela rede ("Not now" segue).
+  - **CLI e MCP:** uma linha `WARNING: user(s) admin of group full have no password…` no login
+    (stderr); no MCP o aviso vai também na descrição do backend nas instruções do servidor. O
+    terminal (`corerouter-cli shell`, New Terminal) diz o mesmo antes de perguntar a senha.
+  - **Daemon e assistente de primeiro boot:** saiu "every network login is refused until a
+    password is set"; o assistente (`apps/corerouter-init/src/setup.rs`) mantém a senha opcional
+    e termina dizendo que dá para entrar pela rede com a senha vazia e defini-la depois.
+  - Docs: `CLAUDE.md`/`AGENTS.md`, `docs/control-protocol.md`, `docs/producao-core.md` e o
+    critério da G0.3b em `docs/gaps.md`.
+
+  Como testar: `cargo nextest run -p corerouter-control auth::tests::no_password_admin_logs_in_from_anywhere_and_is_logged`,
+  `-p corerouter-daemon network_listener_takes_the_empty_password_with_a_warning`,
+  `-p corerouter-engine admin_without_password_warns_until_set`, `-p corerouter-ui first_login`.
+  Na mão: `corerouter-daemon --control 7311 --config-dir /tmp/cr`, a GUI com `--connect
+  127.0.0.1:7311` mostra o selo e "1 warning"; `corerouter-cli --connect 127.0.0.1:7311 run
+  system.identity.get` imprime o aviso.
+
+- 2026-10-28 — G0.28: Gerenciador instalável como o WinBox: `cargo xtask package gui` gera o `.deb` `corerouter-gui`
+  com a GUI e a CLI em `/usr/bin` (perfil `dist`: release sem símbolos, commit embutido), a
+  entrada do menu (Network › RemoteAccess), o ícone desenhado por código em todos os tamanhos do
+  hicolor + SVG, e o handler de links `corerouter://[usuário@]host[:porta]`, que abre a GUI já
+  conectando pelo mesmo caminho do botão Connect (certificado confirmado na primeira vez; senha só
+  do chaveiro, nunca do link nem do ambiente; texto tratado como hostil). O `.deb` é escrito em
+  Rust no xtask (`ar` + `ustar` + gzip), reproduzível, e as dependências vêm do `ldd` mais as
+  bibliotecas que o winit/wgpu abrem por `dlopen`. Como testar: `cargo xtask package gui`,
+  `dpkg-deb --info/--contents` no arquivo e `sudo apt install ./target/package/corerouter-gui_*.deb`;
+  o teste do xtask instala e remove um pacote num diretório descartável sem root. Detalhes em
+  `docs/install-gui.md`.
+
+- 2026-10-28 — G0.3d: Certificado trocado sem editar arquivo à mão (G0.3d, parte b). Depois de reinstalar o roteador,
+  a GUI recusava o certificado novo e mandava apagar a linha do `known_hosts`.
+
+  - **control:** o `known_hosts` grava quando cada certificado foi aceito (terceira coluna,
+    segundos unix; linhas antigas sem ela seguem valendo) e `format_since` mostra a data. O
+    `dial` pergunta ao `Trust` o que fazer com um certificado trocado (`Decision::{Cancel, Once,
+    Update}`, padrão Cancel): uma vez conecta fixando o novo sem gravar, atualizar troca a linha.
+    Nada é enviado ao roteador antes da decisão (a segunda conexão é fixada no certificado que
+    o operador viu). `AcceptNew` aceita e grava; `Expect(fp)` aceita a troca só se o novo for
+    exatamente o dado.
+  - **GUI nativa:** modal (`egui::Modal`) com o fingerprint guardado e quando foi aceito, o novo
+    (em duas linhas de 16 bytes, fáceis de comparar), o texto "reinstalação × interceptação", ⓘ
+    com a explicação (EN/PT) e três botões: **Cancel** (com foco; Enter e Esc cancelam),
+    **Connect once** e **Trust and update**. O primeiro uso abre o mesmo modal (Cancel, Connect
+    once, Trust and connect). Rótulos em português no catálogo `i18n/auto/connect_pt.rs`.
+  - **CLI:** num terminal pergunta `[c]ancel, connect [o]nce, trust and [u]pdate?` (linha vazia
+    cancela); sem terminal recusa com a mensagem e cita `--accept-new-cert` (novo) e
+    `--fingerprint`. **MCP** (`corerouter-cli mcp`): igual à CLI sem terminal.
+  - Docs: `CLAUDE.md`/`AGENTS.md`, `docs/control-protocol.md`, `docs/mcp.md`.
+
+  Como testar: `cargo nextest run -p corerouter-control -E 'test(known) | test(tls_endpoint) | test(dates)'`
+  (trocar, uma vez, cancelar, `--accept-new-cert`), `-p corerouter-cli` (sem terminal: recusa e
+  `--accept-new-cert` grava; `run` e `mcp`), `-p corerouter-ui a_changed_certificate_asks_with_cancel_as_the_default`.
+  Na mão: daemon com `--listen 127.0.0.1:8739 --config-dir /tmp/cr2`, um `known_hosts` temporário
+  (`COREROUTER_KNOWN_HOSTS=/tmp/kh`) com outra impressão para `127.0.0.1:8739`, e
+  `corerouter-gui --connect tls://127.0.0.1:8739 --user admin`: abre o modal (screenshot conferido).

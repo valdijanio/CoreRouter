@@ -197,7 +197,7 @@ fn blaster() -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 
-fn target_dir(root: &Path) -> PathBuf {
+pub(crate) fn target_dir(root: &Path) -> PathBuf {
     std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .map(|p| if p.is_absolute() { p } else { root.join(p) })
