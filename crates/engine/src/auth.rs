@@ -79,7 +79,9 @@ impl Principal {
 }
 
 /// Commands that change state although they are not journaled.
-const WRITE_QUERIES: &[&str] = &["config.mode.set"];
+/// `system.package.upload.chunk` (G1.6e) is one: its data must not land in
+/// the journal, a megabyte per line.
+const WRITE_QUERIES: &[&str] = &["config.mode.set", "system.package.upload.chunk"];
 
 /// The group a command needs.
 pub fn required_group(id: &str, journal: bool) -> Group {

@@ -2,6 +2,7 @@
 
 /// Labels: (English, Portuguese).
 pub(super) const LABELS: &[(&str, &str)] = &[
+    ("Abort", "Interromper"),
     ("Boot", "Boot"),
     ("Boot the other slot", "Bootar o outro slot"),
     ("Booted by the fallback path (built-in command line): the root is not checked.", "Bootado pelo caminho de fallback (linha de comando embutida): a raiz não é conferida."),
@@ -11,11 +12,14 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("Configuration snapshots:", "Cópias da configuração:"),
     ("Confirm", "Confirmar"),
     ("Downgrade", "Voltar versão"),
+    ("From this computer", "Deste computador"),
     ("Install and reboot", "Instalar e reiniciar"),
     ("Kernel", "Kernel"),
     ("Last job", "Último trabalho"),
     ("Package file", "Arquivo do pacote"),
     ("Scrub", "Verificar slot"),
+    ("Send this package and write it to slot", "Enviar este pacote e gravá-lo no slot"),
+    ("Sending", "Enviando"),
     ("Size", "Tamanho"),
     ("Slot", "Slot"),
     ("State", "Estado"),
@@ -24,6 +28,9 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("The router reboots into it on trial. It must be confirmed within", "O roteador reinicia nele em teste. Ele precisa ser confirmado em"),
     ("Timeout", "Prazo"),
     ("Trial boot of slot", "Boot de teste do slot"),
+    ("Upload and check", "Enviar e conferir"),
+    ("Upload and install", "Enviar e instalar"),
+    ("Upload and install…", "Enviar e instalar…"),
     ("Verified", "Verificado"),
     ("Version", "Versão"),
     ("Virtual lab: slots are files, reboots are simulated.", "Laboratório virtual: os slots são arquivos e os reboots são simulados."),
@@ -65,6 +72,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("packages.state", "## Estado\n\n**running**: este boot. **standby**: uma imagem boa, a volta. **trial**: armado ou bootado em teste, sem confirmação. **failed**: o último teste dele não confirmou (passe o mouse: por quê). **invalid**: o cabeçalho não confere. **empty**: sem imagem."),
     ("packages.timeout", "## Prazo\n\nSegundos que o boot de teste tem para confirmar (30 a 3600; padrão 300). Contados do início do boot de teste; passado o prazo, o init reinicia e o firmware boota o slot anterior."),
     ("packages.trial", "## Boot de teste\n\nO slot novo boota uma vez (`BootNext` da UEFI, que o firmware apaga ao bootá-lo). Qualquer falha — pânico do kernel, um parâmetro que impede o boot, um daemon que nunca responde, falta de energia — termina no slot anterior, porque ele continua primeiro no `BootOrder`. **Cancel** desfaz um teste armado antes do reboot."),
+    ("packages.upload", "## Deste computador\n\nUm `.crpkg` **neste computador** (digite o caminho ou solte o arquivo na janela). **Enviar e conferir** manda o pacote pelo canal de controle e o roteador confere assinatura e hashes sem gravar. **Enviar e instalar…** grava no outro slot **enquanto chega**, em blocos de 1 MiB (nunca o pacote inteiro na memória): a assinatura é conferida antes do primeiro byte gravado, e os hashes e a árvore do dm-verity antes de o slot ser ativado. Depois reinicia em teste, como Install and reboot. Interromper (ou a conexão cair) não muda nada: o slot em uso continua o padrão.\n\nNo navegador ainda não dá para ler arquivos deste computador: copie o pacote para o roteador ou use `corerouter-cli upload`."),
     ("packages.verified", "## Verificado\n\n**assinado**: o cabeçalho do slot é assinado por uma chave em que a imagem confia (id da chave no tooltip). **dm-verity**: a raiz em uso é conferida bloco a bloco contra o hash raiz assinado à medida que é lida (um bloco alterado falha a leitura). **sem verity**: bootado pelo caminho de fallback (a linha de comando embutida no kernel), como o primeiro boot de uma imagem gravada."),
     ("packages.version", "## Versão\n\nA versão da imagem; o tooltip mostra o commit e o número de build que ordena as versões (uma atualização não pode ir para baixo da que está em uso: use Downgrade)."),
 ];

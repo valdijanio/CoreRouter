@@ -11,6 +11,8 @@
 //! - [`iso`], [`install`]: the installer's hybrid ISO and what it writes on
 //!   an empty disk (G1.6c).
 //! - [`state`]: the trial across the reboot, configuration snapshots.
+//! - [`upload`]: a package arriving over the network, read as a stream
+//!   (G1.6e).
 //! - [`ab`]: the operations (status, install, confirm, the boot-time
 //!   decision corerouter-init takes).
 //!
@@ -25,6 +27,7 @@ pub mod install;
 pub mod iso;
 pub mod package;
 pub mod state;
+pub mod upload;
 pub mod verity;
 
 use serde::{Deserialize, Serialize};

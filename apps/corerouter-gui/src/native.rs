@@ -342,6 +342,7 @@ pub fn main() -> ExitCode {
             let _ = ctx_slot.set(cc.egui_ctx.clone());
             corerouter_ui::export::install(&cc.egui_ctx, Arc::new(save_export));
             corerouter_ui::export::install_open(&cc.egui_ctx, Arc::new(open_file));
+            corerouter_ui::export::install_read_at(&cc.egui_ctx, Arc::new(read_at));
             Ok(Box::new(app.with_storage(cc)))
         }),
     );
@@ -744,6 +745,28 @@ fn open_file(path: &str) -> Result<Vec<u8>, String> {
         return Err(format!("{}: larger than 32 MiB", path.display()));
     }
     Ok(bytes)
+}
+
+/// G1.6e: a piece of a file (System › Packages sends a package in chunks).
+fn read_at(path: &str, offset: u64, len: usize) -> Result<(Vec<u8>, u64), String> {
+    use std::io::{Read as _, Seek as _};
+    let path = path.trim();
+    let path = match (path.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) => std::path::Path::new(&home).join(rest),
+        _ => std::path::PathBuf::from(path),
+    };
+    let mut f = std::fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let size = f
+        .metadata()
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .len();
+    f.seek(std::io::SeekFrom::Start(offset))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut bytes = Vec::with_capacity(len.min(4 << 20));
+    f.take(len.min(4 << 20) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok((bytes, size))
 }
 
 fn save_export(name: &str, export: corerouter_ui::export::Export) -> Result<String, String> {

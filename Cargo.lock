@@ -1165,6 +1165,7 @@ dependencies = [
 name = "corerouter-daemon"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "corerouter-control",
  "corerouter-discovery",
  "corerouter-engine",

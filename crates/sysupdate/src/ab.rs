@@ -605,23 +605,40 @@ impl Platform {
         o: &Opts,
         progress: &mut dyn FnMut(u64, u64),
     ) -> Result<Report, String> {
+        self.check_no_trial()?;
+        let mut f = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let meta = f.metadata().map_err(|e| e.to_string())?;
+        // A file holds exactly the package; a block device (a USB stick, a
+        // test disk) may hold more after it.
+        let exact = meta.is_file().then_some(meta.len());
+        self.install_from(&mut f, exact, downgrade, o, progress)
+    }
+
+    /// [`Platform::install`] from a stream (G1.6e: a package arriving over
+    /// the control channel goes straight to the slot, never whole in RAM).
+    /// `exact`: the package's size when the source knows it (a file, an
+    /// upload's declared size); the manifest must say the same. The header
+    /// and its signature are checked before a byte is written.
+    pub fn install_from<R: Read + Send>(
+        &self,
+        f: &mut R,
+        exact: Option<u64>,
+        downgrade: bool,
+        o: &Opts,
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<Report, String> {
         let t0 = Instant::now();
         self.check_no_trial()?;
         let running = self.running().ok_or("cannot tell which slot is running")?;
         let target = running.other();
-        let mut f = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let meta = f.metadata().map_err(|e| e.to_string())?;
-        let h = Header::read(&mut f)?;
+        let h = Header::read(f)?;
         h.verify(&self.keys)?;
         let m = &h.manifest;
         let total = h.len() + m.kernel.size + m.rootfs.size;
-        // A file holds exactly the package; a block device (a USB stick, a
-        // test disk) may hold more after it.
-        if meta.is_file() && meta.len() != total {
-            return Err(format!(
-                "package is {} bytes, its manifest says {total}",
-                meta.len()
-            ));
+        if let Some(len) = exact
+            && len != total
+        {
+            return Err(format!("package is {len} bytes, its manifest says {total}"));
         }
         self.version_policy(running, m, downgrade)?;
         let swap = if downgrade {
@@ -665,7 +682,7 @@ impl Platform {
             let tw = Instant::now();
             let mut parts: [(u64, &mut dyn Write); 2] =
                 [(m.kernel.size, &mut k), (m.rootfs.size, &mut d)];
-            let c = package::copy(&mut f, &mut parts, o.pipelined, &mut |n| progress(n, all))?;
+            let c = package::copy(f, &mut parts, o.pipelined, &mut |n| progress(n, all))?;
             if c.sha256.first() != Some(&m.kernel.sha256)
                 || c.sha256.get(1) != Some(&m.rootfs.sha256)
             {
