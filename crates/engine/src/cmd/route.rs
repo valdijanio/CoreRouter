@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use super::args::{opt_bool, opt_parse, opt_str, opt_text, opt_u32, req_parse, req_str};
 use super::{CommandSpec, always};
 use crate::dhcp_client::is_dynamic;
-use crate::route_table::{Line, Origin, RouteWatch, State};
+use crate::route_table::{Changed, Line, Origin, RouteWatch, State};
 use crate::validate::route_issues;
 use crate::{EngineError, Result, Session};
 
@@ -255,7 +255,7 @@ pub(crate) fn layer2(row: &mut Value, l: &Line, t: &crate::neigh_table::NeighTab
 }
 
 /// `ip.route.list`'s view of one route.
-pub(crate) fn row(l: &Line, watch: Option<&RouteWatch>, now: Option<u64>) -> Value {
+pub(crate) fn row(l: &Line, watch: Option<&Changed>, now: Option<u64>) -> Value {
     let (reason, reason_id, reason_args) = match &l.why {
         Some(w) => (
             Some(w.text.clone()),
@@ -336,27 +336,37 @@ fn check_history(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn list(s: &mut Session, p: &Value) -> Result<Value> {
     let table: Option<RoutingTable> = opt_parse(p, "routing_table")?;
-    let family = opt_choice(p, "family", &["ipv4", "ipv6"])?;
-    let state = opt_choice(p, "state", &["active", "standby", "inactive"])?;
-    let origin = opt_choice(p, "origin", &["connected", "static", "dhcp", "ra"])?;
+    let family = opt_choice(p, "family", &["ipv4", "ipv6"])?.map(str::to_owned);
+    let state = opt_choice(p, "state", &["active", "standby", "inactive"])?.map(str::to_owned);
+    let origin = opt_choice(p, "origin", &["connected", "static", "dhcp", "ra"])?.map(str::to_owned);
+    // Under the lock: pointers to the cached lines, the watch's states,
+    // the neighbour table and the LDP bindings (G0.31b). The rows of
+    // 60 000 routes are built after it is released.
     let (lines, now) = s.watched_route_lines();
     let neigh = s.neigh_fresh();
-    let neigh = neigh.lock();
-    let watch = s.ext::<RouteWatch>();
-    let rows = lines
-        .iter()
-        .filter(|l| table.as_ref().is_none_or(|t| *t == l.table))
-        .filter(|l| family.is_none_or(|f| (f == "ipv4") == l.dst.addr().is_ipv4()))
-        .filter(|l| state.is_none_or(|st| st == l.state.as_str()))
-        .filter(|l| origin.is_none_or(|o| o == l.origin.as_str()))
-        .map(|l| {
-            let mut r = row(l, watch, now);
-            layer2(&mut r, l, &neigh);
-            r
-        })
-        .collect::<Vec<_>>();
-    drop(neigh);
-    let mut rows = rows;
-    crate::mpls::annotate_routes(s, &mut rows);
-    Ok(Value::Array(rows))
+    let changed = s.ext::<RouteWatch>().map(RouteWatch::changed);
+    let ldp = crate::mpls::ldp_state(s);
+    s.defer(move || {
+        let neigh = neigh.lock();
+        let rows = lines
+            .iter()
+            .filter(|l| table.as_ref().is_none_or(|t| *t == l.table))
+            .filter(|l| {
+                family
+                    .as_deref()
+                    .is_none_or(|f| (f == "ipv4") == l.dst.addr().is_ipv4())
+            })
+            .filter(|l| state.as_deref().is_none_or(|st| st == l.state.as_str()))
+            .filter(|l| origin.as_deref().is_none_or(|o| o == l.origin.as_str()))
+            .map(|l| {
+                let mut r = row(l, changed.as_ref(), now);
+                layer2(&mut r, l, &neigh);
+                r
+            })
+            .collect::<Vec<_>>();
+        drop(neigh);
+        let mut rows = rows;
+        crate::mpls::annotate_rows(ldp.as_deref(), &mut rows);
+        Ok(Value::Array(rows))
+    })
 }

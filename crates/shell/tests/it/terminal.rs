@@ -1160,3 +1160,108 @@ fn dns_zone_export_import_round_trip() {
     assert_eq!(get(&b)["records"], get(&a)["records"]);
     assert_eq!(get(&b)["zones"][0]["serial"], get(&a)["zones"][0]["serial"]);
 }
+
+/// G3.9hb: a RouterOS 7.25 CHR's `/interface vlan export` (taken from the
+/// CHR in `scripts/routeros-interop-l2.sh rsc`) imports as it comes:
+/// `interface=` is the terminal's other name for `parent`, and the VLAN
+/// exported before its parent runs after it.
+#[test]
+fn a_routeros_vlan_export_imports_as_written() {
+    let mut t = Term::new();
+    t.router
+        .files
+        .insert("ros.rsc".into(), ROUTEROS_VLAN_EXPORT.into());
+    t.ok("/import file=ros.rsc");
+    let vlans = t
+        .router
+        .session
+        .execute("interface.list", &json!({"type": "vlan"}))
+        .unwrap();
+    let got: Vec<Value> = vlans
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| {
+            json!([
+                v["name"],
+                v["parent"],
+                v["vlan_id"],
+                v["use_service_tag"],
+                v["mtu"],
+                v["disabled"],
+                v["comment"]
+            ])
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            json!(["c43", "s42", 43, false, 1500, false, ""]),
+            json!(["r40", "ether1", 40, false, 1500, false, "cliente 40"]),
+            json!(["r41", "ether1", 41, false, 1400, true, ""]),
+            json!(["s42", "ether1", 42, true, 1500, false, ""]),
+        ]
+    );
+    assert!(
+        t.complete("/interface vlan add in")
+            .contains(&"interface=".to_owned())
+    );
+    assert!(
+        !t.complete("/interface vlan add interface=ether1 p")
+            .contains(&"parent=".to_owned())
+    );
+    // Typed by hand too, and `parent=` as before.
+    t.ok("/interface vlan add interface=ether2 vlan-id=10 name=v10");
+    t.ok("/interface vlan add parent=ether2 vlan-id=11 name=v11");
+    assert!(t.export().contains("parent=ether2"));
+}
+
+/// The body as the CHR wrote it (2026-10-29, RouterOS 7.25): name order,
+/// so `c43` comes before `s42`, the VLAN it rides on.
+const ROUTEROS_VLAN_EXPORT: &str = "\
+# 2026-10-29 15:59:59 by RouterOS 7.25
+# software id =
+#
+/interface vlan
+add interface=s42 name=c43 vlan-id=43
+add comment=\"cliente 40\" interface=ether1 name=r40 vlan-id=40
+add disabled=yes interface=ether1 mtu=1400 name=r41 vlan-id=41
+add interface=ether1 name=s42 use-service-tag=yes vlan-id=42
+";
+
+/// G3.9hb: a step that fails goes to the end of the import once; a line
+/// that is bad wherever it runs still fails, naming its place in the script.
+#[test]
+fn import_defers_a_forward_reference_and_still_fails_a_bad_line() {
+    let mut t = Term::new();
+    let before = t.export();
+    t.router.files.insert(
+        "bad.rsc".into(),
+        "/interface vlan\nadd interface=nope name=x1 vlan-id=1\nadd interface=ether1 name=x2 vlan-id=2\n".into(),
+    );
+    let e = t.fails("/import file=bad.rsc");
+    assert!(
+        e.contains("batch step 1 failed")
+            && e.contains("no interface 'nope'")
+            && e.contains("nothing was applied"),
+        "{e}"
+    );
+    assert_eq!(t.export(), before);
+    t.router.files.insert(
+        "fwd.rsc".into(),
+        "/interface vlan\nadd interface=b name=a vlan-id=1\nadd interface=c name=b vlan-id=2\nadd interface=ether1 name=c vlan-id=3\n".into(),
+    );
+    // Two bad lines cannot trade places forever.
+    t.router.files.insert(
+        "two.rsc".into(),
+        "/interface vlan\nadd interface=nope name=x1 vlan-id=1\nadd interface=nada name=x2 vlan-id=2\nadd interface=ether1 name=x3 vlan-id=3\n".into(),
+    );
+    let e = t.fails("/import file=two.rsc");
+    assert!(e.contains("nothing was applied"), "{e}");
+    assert_eq!(t.export(), before);
+    let out = t.ok("/import file=fwd.rsc");
+    assert!(
+        out.contains("imported 3 command(s)") && out.contains("2 run after"),
+        "{out}"
+    );
+}

@@ -33,10 +33,11 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add VLAN",
         ["Interfaces"],
         None,
-        "{name: string, parent: string, vlan_id: u32 (1..=4094), use_service_tag?: bool (802.1ad S-tag, TPID 0x88a8: the outer tag of QinQ; default no, 802.1Q 0x8100), mtu?: u32 (68..=9216, default: parent MTU), comment?: string} → {name}",
+        "{name: string, parent: string (terminal: also interface=, as RouterOS writes it), vlan_id: u32 (1..=4094), use_service_tag?: bool (802.1ad S-tag, TPID 0x88a8: the outer tag of QinQ; default no, 802.1Q 0x8100), mtu?: u32 (68..=9216, default: parent MTU), disabled?: bool, comment?: string} → {name}",
         always,
         vlan_add
-    ),
+    )
+    .key_alias(&[("interface", "parent")]),
     cmd!(
         "interface.bridge.add",
         "Add Bridge",
@@ -355,6 +356,7 @@ fn vlan_add(s: &mut Session, p: &Value) -> Result<Value> {
         },
     );
     iface.mtu = mtu;
+    iface.disabled = opt_bool(p, "disabled")?.unwrap_or(false);
     insert(s, iface, p)
 }
 

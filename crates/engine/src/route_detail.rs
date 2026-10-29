@@ -231,7 +231,8 @@ impl Session {
         };
         let watching = self.ext::<RouteWatch>().and_then(|w| w.since);
         let kernel = self.route_kernel(&me);
-        let mut route = crate::cmd::route::row(&me, self.ext::<RouteWatch>(), now);
+        let changed = self.ext::<RouteWatch>().map(RouteWatch::changed);
+        let mut route = crate::cmd::route::row(&me, changed.as_ref(), now);
         crate::cmd::route::layer2(&mut route, &me, &self.neigh_fresh().lock());
         Some(json!({
             "key": me.key,

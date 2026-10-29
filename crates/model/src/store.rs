@@ -11,8 +11,12 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::config::{Config, Ip};
+use crate::address_lists::AddressLists;
 use crate::cow::CowArc;
+use crate::cow_list::CowList;
 use crate::firewall::Firewall;
+use crate::ppp_secrets::Secrets;
+use crate::simple_queues::SimpleQueues;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StoreError {
@@ -277,6 +281,18 @@ fn differing(from: &Config, to: &Config) -> (Config, Config) {
     } = from;
     let (mut a, mut b) = (Config::default(), Config::default());
     keep!(a, b, to: system, interfaces, interface_lists, ipv6, routing, radius, ppp, queue);
+    // `keep!` copied a changed section whole: its big list keeps only
+    // what differs.
+    if *ppp != to.ppp {
+        let (x, y) = trim(ppp.secrets.list(), to.ppp.secrets.list());
+        a.ppp.secrets = Secrets::from_list(x);
+        b.ppp.secrets = Secrets::from_list(y);
+    }
+    if *queue != to.queue {
+        let (x, y) = trim(queue.simple.list(), to.queue.simple.list());
+        a.queue.simple = SimpleQueues::from_list(x);
+        b.queue.simple = SimpleQueues::from_list(y);
+    }
     if *ip != to.ip {
         let (x, y) = differing_ip(ip, &to.ip);
         a.ip = CowArc::new(x);
@@ -314,9 +330,7 @@ fn differing_ip(from: &Ip, to: &Ip) -> (Ip, Ip) {
     } = from;
     let (mut a, mut b) = (Ip::default(), Ip::default());
     keep!(a, b, to:
-        addresses,
         next_id,
-        routes,
         next_route_id,
         neighbor_discovery,
         xdp,
@@ -337,6 +351,18 @@ fn differing_ip(from: &Ip, to: &Ip) -> (Ip, Ip) {
         subscriber_notice,
         arp
     );
+    trim_into(&mut a.addresses, &mut b.addresses, addresses, &to.addresses);
+    trim_into(&mut a.routes, &mut b.routes, routes, &to.routes);
+    if *dhcp_server != to.dhcp_server {
+        let (x, y) = trim(&dhcp_server.leases, &to.dhcp_server.leases);
+        a.dhcp_server.leases = x;
+        b.dhcp_server.leases = y;
+    }
+    if *dns_static != to.dns_static {
+        let (x, y) = trim(&dns_static.entries, &to.dns_static.entries);
+        a.dns_static.entries = x;
+        b.dns_static.entries = y;
+    }
     if *firewall != to.firewall {
         let Firewall {
             filter,
@@ -350,11 +376,50 @@ fn differing_ip(from: &Ip, to: &Ip) -> (Ip, Ip) {
         } = &**firewall;
         let to = &*to.firewall;
         let (mut x, mut y) = (Firewall::default(), Firewall::default());
-        keep!(x, y, to: filter, nat, mangle, raw, address_lists, next_rule_id, next_address_list_id, zones);
+        keep!(x, y, to: next_rule_id, next_address_list_id, zones);
+        trim_into(&mut x.filter, &mut y.filter, filter, &to.filter);
+        trim_into(&mut x.nat, &mut y.nat, nat, &to.nat);
+        trim_into(&mut x.mangle, &mut y.mangle, mangle, &to.mangle);
+        trim_into(&mut x.raw, &mut y.raw, raw, &to.raw);
+        if *address_lists != to.address_lists {
+            let (l, r) = trim(address_lists.list(), to.address_lists.list());
+            x.address_lists = AddressLists::from_list(l);
+            y.address_lists = AddressLists::from_list(r);
+        }
         a.firewall = CowArc::new(x);
         b.firewall = CowArc::new(y);
     }
     (a, b)
+}
+
+/// [`differing`] inside a big list (G0.31a): the items in the blocks the
+/// two sides share are equal on both and add no line, so both keep only
+/// the rest. Every list here is keyed by `id` (the diff pairs items by id,
+/// not by position), so dropping items moves no path. A side left empty
+/// keeps one shared item, on both: an empty list is a line of its own
+/// (`ip.routes: []`) that the full lists would not give.
+fn trim<T: Clone>(from: &CowList<T>, to: &CowList<T>) -> (CowList<T>, CowList<T>) {
+    let (mut x, mut y) = (from.unshared(to), to.unshared(from));
+    if ((x.is_empty() && !from.is_empty()) || (y.is_empty() && !to.is_empty()))
+        && let Some(same) = from.any_shared(to)
+    {
+        x.push(same.clone());
+        y.push(same.clone());
+    }
+    (x, y)
+}
+
+/// [`trim`] into `x` and `y` when the lists differ (equal, they stay
+/// empty, as [`keep!`] leaves an equal field).
+fn trim_into<T: Clone + PartialEq>(
+    x: &mut CowList<T>,
+    y: &mut CowList<T>,
+    from: &CowList<T>,
+    to: &CowList<T>,
+) {
+    if from != to {
+        (*x, *y) = trim(from, to);
+    }
 }
 
 fn flatten(cfg: &Config) -> BTreeMap<String, Value> {
@@ -521,6 +586,77 @@ mod tests {
             assert_eq!(diff_configs(&base, &to), naive(&base, &to), "edit {i}");
             assert_eq!(diff_configs(&to, &base), naive(&to, &base), "edit {i} reversed");
         }
+    }
+
+    /// G0.31a: big lists keep only the blocks the two sides do not share,
+    /// and the diff stays the one of the whole lists.
+    #[test]
+    fn skipping_shared_blocks_gives_the_same_diff() {
+        use crate::firewall::AddressListEntry;
+        fn route(id: u32) -> crate::RouteEntry {
+          crate::RouteEntry {
+            id: crate::ItemId(id),
+            dst_address: format!("10.{}.{}.0/24", id / 256, id % 256).parse().unwrap(),
+            gateway: crate::Gateway::ip("192.0.2.254".parse().unwrap()),
+            distance: 1,
+            routing_table: crate::RoutingTable::Main,
+            disabled: false,
+            comment: String::new(),
+            check_gateway: Default::default(),
+            bfd_profile: String::new(),
+          }
+        }
+        fn entry(id: u32) -> AddressListEntry {
+          AddressListEntry {
+            id: crate::ItemId(id),
+            list: "l".parse().unwrap(),
+            address: format!("10.9.{}.{}", id / 256, id % 256).parse().unwrap(),
+            disabled: false,
+            comment: String::new(),
+          }
+        }
+        fn secret(id: u32) -> crate::ppp::PppSecret {
+            crate::ppp::PppSecret {
+                id: crate::ItemId(id),
+                name: format!("u{id}"),
+                ..Default::default()
+            }
+        }
+        let mut base = Config::default();
+        for id in 1..=1000 {
+            base.ip.routes.push(route(id));
+            base.ip.firewall.address_lists.push(entry(id));
+            base.ppp.secrets.push(secret(id));
+        }
+        let edits: [fn(&mut Config); 11] = [
+            |c| c.ip.routes.push(route(5000)),
+            |c| c.ip.routes.get_mut(500).unwrap().distance = 9,
+            |c| drop(c.ip.routes.remove(0)),
+            |c| assert!(c.ip.routes.insert(300, route(4000))),
+            |c| c.ip.routes.retain(|r| r.id.0 % 7 != 0),
+            |c| c.ip.routes.retain(|r| r.id.0 <= 128),
+            |c| c.ip.routes.clear(),
+            |c| c.ip.firewall.address_lists.push(entry(7000)),
+            |c| drop(c.ip.firewall.address_lists.remove(999)),
+            |c| c.ppp.secrets.push(secret(9000)),
+            |c| {
+                c.ppp.next_id = 4;
+                c.ip.routes.push(route(6000));
+            },
+        ];
+        for (i, edit) in edits.iter().enumerate() {
+            let mut to = base.clone();
+            edit(&mut to);
+            let want = naive(&base, &to);
+            assert!(!want.is_empty(), "edit {i} changes something");
+            assert_eq!(diff_configs(&base, &to), want, "edit {i}");
+            assert_eq!(diff_configs(&to, &base), naive(&to, &base), "edit {i} reversed");
+        }
+        // Equal lists that share nothing (a config loaded twice) still diff
+        // to nothing.
+        let mut copy: Config = serde_json::from_value(serde_json::to_value(&base).unwrap()).unwrap();
+        copy.system.identity = "x".into();
+        assert_eq!(diff_configs(&base, &copy), naive(&base, &copy));
     }
 
     #[test]

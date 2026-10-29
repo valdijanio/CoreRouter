@@ -171,3 +171,53 @@ fn a_changed_certificate_needs_accept_new_cert_without_a_terminal() {
     assert!(ok, "{err}");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// G1.6qf, the case seen on the image: `run config.safe-mode.enter` used to
+/// enter and leave Safe Mode at once (its connection closed with the
+/// command), and the next `run` changed the config unprotected. Now it is
+/// refused before connecting, with the clients that keep the connection;
+/// the router never entered Safe Mode, and other commands still run.
+#[test]
+fn run_refuses_safe_mode_which_would_end_with_its_connection() {
+    let base = std::env::temp_dir().join(format!("cr-cli-safe-{}", std::process::id()));
+    let runtime = base.join("run");
+    let port = router(&runtime);
+    let addr = format!("127.0.0.1:{port}");
+
+    let (ok, out, err) = cli(
+        &runtime,
+        &["--connect", &addr, "run", "config.safe-mode.enter"],
+    );
+    assert!(!ok, "{out}");
+    assert!(err.contains("corerouter-cli shell"), "{err}");
+    assert!(err.contains("mcp"), "{err}");
+    // Refused without a router too (the throwaway lab): same rule.
+    let (ok, _, err) = cli(
+        &runtime,
+        &["run", "config.safe-mode.enter", r#"{"timeout_secs":60}"#],
+    );
+    assert!(!ok && err.contains("shell"), "{err}");
+
+    // Safe Mode never started (before: last = "… the owner's connection closed").
+    let (ok, out, err) = cli(&runtime, &["--connect", &addr, "inspect"]);
+    assert!(ok, "{err}");
+    let state: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        state["safe_mode"],
+        json!({"active": false, "last": null}),
+        "{out}"
+    );
+
+    let (ok, _, err) = cli(
+        &runtime,
+        &[
+            "--connect",
+            &addr,
+            "run",
+            "system.identity.set",
+            r#"{"name":"after"}"#,
+        ],
+    );
+    assert!(ok, "{err}");
+    let _ = std::fs::remove_dir_all(base);
+}

@@ -34,6 +34,11 @@ pub struct CommandSpec {
     pub alias: Option<&'static str>,
     /// Terminal: the parameter a bare value goes to (`ping 8.8.8.8`).
     pub positional: Option<&'static str>,
+    /// Terminal: other names a parameter takes, `(typed, key)`, so a
+    /// RouterOS script pastes as written (`interface=` for `parent` in
+    /// `/interface vlan add`). The terminal translates; `params` (the
+    /// contract) does not change and the engine still takes only `key`.
+    pub key_alias: &'static [(&'static str, &'static str)],
     /// Starts a background task: the result carries its `id`, read with
     /// `tool.task.poll` and ended with `tool.task.stop`.
     pub task: bool,
@@ -52,6 +57,12 @@ impl CommandSpec {
         self
     }
 
+    /// Other names of parameters in the terminal: `&[("interface", "parent")]`.
+    pub const fn key_alias(mut self, aliases: &'static [(&'static str, &'static str)]) -> Self {
+        self.key_alias = aliases;
+        self
+    }
+
     /// The command starts a background task.
     pub const fn task(mut self) -> Self {
         self.task = true;
@@ -66,12 +77,12 @@ macro_rules! cmd {
     (query $id:literal, $label:literal, [$($menu:literal),* $(,)?], $shortcut:expr, $params:literal, $enabled:path, $run:path) => {
         $crate::cmd::CommandSpec { id: $id, label: $label, menu: &[$($menu),*], shortcut: $shortcut,
             params: $params, enabled: $enabled, run: $run, journal: false,
-            alias: None, positional: None, task: false }
+            alias: None, positional: None, key_alias: &[], task: false }
     };
     ($id:literal, $label:literal, [$($menu:literal),* $(,)?], $shortcut:expr, $params:literal, $enabled:path, $run:path) => {
         $crate::cmd::CommandSpec { id: $id, label: $label, menu: &[$($menu),*], shortcut: $shortcut,
             params: $params, enabled: $enabled, run: $run, journal: true,
-            alias: None, positional: None, task: false }
+            alias: None, positional: None, key_alias: &[], task: false }
     };
 }
 
@@ -207,6 +218,11 @@ pub fn describe(session: &Session) -> Value {
                     "disabledReason": enabled.err(),
                     "alias": c.alias,
                     "positional": c.positional,
+                    "key_alias": c
+                        .key_alias
+                        .iter()
+                        .map(|(typed, key)| ((*typed).to_owned(), json!(key)))
+                        .collect::<serde_json::Map<String, Value>>(),
                     "task": c.task,
                 })
             })
@@ -274,6 +290,20 @@ mod tests {
                     "bad alias {a}"
                 );
             }
+            for (typed, key) in c.key_alias {
+                let keys = doc_keys(c.params);
+                assert!(
+                    keys.iter().any(|(k, _)| k == key),
+                    "{}: key alias '{typed}' names '{key}', not a parameter",
+                    c.id
+                );
+                assert!(
+                    !keys.iter().any(|(k, _)| k == typed)
+                        && typed.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+                    "{}: bad key alias '{typed}'",
+                    c.id
+                );
+            }
             if let Some(p) = c.positional {
                 assert!(
                     doc_keys(c.params).iter().any(|(k, _)| *k == p),
@@ -290,10 +320,11 @@ mod tests {
             cmd!(query "x.y.start", "X", [], None, "{address: ip} → {id}", always, describe_stub)
                 .alias("xy")
                 .positional("address")
+                .key_alias(&[("addr", "address")])
                 .task();
         assert_eq!(
-            (c.alias, c.positional, c.task),
-            (Some("xy"), Some("address"), true)
+            (c.alias, c.positional, c.key_alias, c.task),
+            (Some("xy"), Some("address"), &[("addr", "address")][..], true)
         );
     }
 

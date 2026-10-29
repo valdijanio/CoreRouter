@@ -120,7 +120,18 @@ pub fn ldp(s: &Session) -> LdpStatus {
 /// router gave it) and `mpls_out` (the next hop's, RouterOS text). One
 /// pass over the bindings per call, then a lookup per row.
 pub fn annotate_routes(s: &Session, rows: &mut [serde_json::Value]) {
-    let Some(st) = s.ext::<LdpStatus>().and_then(|l| l.state.as_ref()) else {
+    annotate_rows(ldp_state(s).as_deref(), rows);
+}
+
+/// The LDP state the routing service stored: a pointer, read under the
+/// lock; [`annotate_rows`] runs outside it (G0.31b).
+pub fn ldp_state(s: &Session) -> Option<Arc<LdpState>> {
+    s.ext::<LdpStatus>().and_then(|l| l.state.clone())
+}
+
+/// [`annotate_routes`] with the state already taken.
+pub fn annotate_rows(st: Option<&LdpState>, rows: &mut [serde_json::Value]) {
+    let Some(st) = st else {
         return;
     };
     if st.bindings.is_empty() {

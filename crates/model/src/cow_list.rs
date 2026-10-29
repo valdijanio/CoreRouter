@@ -217,6 +217,42 @@ impl<T> CowList<T> {
             .collect()
     }
 
+    /// The items of `self` outside the blocks it shares with `other`, in
+    /// order; the blocks kept are shared, not copied. With one item
+    /// changed between two copies of 60 000 routes it holds one block, so
+    /// a diff serializes 128 items, not 120 000 (G0.31a).
+    pub fn unshared(&self, other: &Self) -> Self {
+        if Self::ptr_eq(self, other) {
+            return Self::new();
+        }
+        let theirs: std::collections::HashSet<*const Vec<T>> =
+            other.spine.blocks.iter().map(Arc::as_ptr).collect();
+        let mut spine = Spine::default();
+        let mut n = 0;
+        for b in &self.spine.blocks {
+            if b.is_empty() || theirs.contains(&Arc::as_ptr(b)) {
+                continue;
+            }
+            n += b.len();
+            spine.blocks.push(Arc::clone(b));
+            spine.ends.push(n);
+        }
+        Self {
+            spine: Arc::new(spine),
+        }
+    }
+
+    /// An item in a block both lists hold, if there is one.
+    pub fn any_shared(&self, other: &Self) -> Option<&T> {
+        let theirs: std::collections::HashSet<*const Vec<T>> =
+            other.spine.blocks.iter().map(Arc::as_ptr).collect();
+        self.spine
+            .blocks
+            .iter()
+            .find(|b| theirs.contains(&Arc::as_ptr(b)))
+            .and_then(|b| b.first())
+    }
+
     /// Position of the item whose `key` is `target`. A binary search when
     /// the list is in ascending `key` order (config lists are, by id: new
     /// items get the next id); otherwise, or when it misses, a walk.
@@ -707,6 +743,21 @@ mod tests {
             1 => Just(Op::Snapshot),
             1 => Just(Op::Pop),
         ]
+    }
+
+    #[test]
+    fn unshared_keeps_the_blocks_one_side_wrote() {
+        let a: CowList<u32> = (0..1000).collect::<Vec<_>>().into();
+        assert!(a.unshared(&a.clone()).is_empty());
+        let mut b = a.clone();
+        *b.get_mut(500).unwrap() = 7;
+        b.push(1000);
+        let (x, y) = (a.unshared(&b), b.unshared(&a));
+        assert!(x.len() <= 2 * BLOCK && y.len() <= 2 * BLOCK, "{} {}", x.len(), y.len());
+        assert!(x.iter().any(|&v| v == 500) && !x.iter().any(|&v| v == 7));
+        assert!(y.iter().any(|&v| v == 7) && y.iter().any(|&v| v == 1000));
+        assert_eq!(a.any_shared(&b), Some(&0));
+        assert_eq!(a.any_shared(&CowList::new()), None);
     }
 
     proptest! {
