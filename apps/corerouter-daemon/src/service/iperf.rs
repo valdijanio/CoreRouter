@@ -697,8 +697,17 @@ fn udp_listener(local: SocketAddr) -> Result<UdpSocket, String> {
     Ok(s.into())
 }
 
-fn accept_udp(local: SocketAddr, deadline: Instant) -> Result<UdpSocket, String> {
-    let u = udp_listener(local)?;
+/// One UDP stream on `u`, an already bound listener. With `more`, the
+/// listener for the next stream is bound before the reply goes out, as
+/// iperf3 does (`iperf_udp_accept`): the client sends the next stream's
+/// datagram as soon as it reads the reply, and a port with no socket yet
+/// answers it with ICMP port unreachable ("Connection refused").
+fn accept_udp(
+    u: UdpSocket,
+    local: SocketAddr,
+    deadline: Instant,
+    more: bool,
+) -> Result<(UdpSocket, Option<UdpSocket>), String> {
     let mut buf = [0u8; 64];
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -711,8 +720,9 @@ fn accept_udp(local: SocketAddr, deadline: Instant) -> Result<UdpSocket, String>
             // iperf3 does not look at the bytes; neither do we.
             Ok((_, peer)) => {
                 u.connect(peer).map_err(|e| io("UDP stream", &e))?;
+                let next = if more { Some(udp_listener(local)?) } else { None };
                 u.send(&UDP_CONNECT_REPLY).map_err(|e| io("UDP stream", &e))?;
-                return Ok(u);
+                return Ok((u, next));
             }
             Err(e) if timed_out(&e) => {}
             Err(e) => return Err(io("UDP stream", &e)),
@@ -767,13 +777,25 @@ pub fn serve(
     // The server's roles mirror the client's.
     let roles: Vec<bool> = client_roles(p.direction, p.parallel).iter().map(|s| !s).collect();
     let ids = iperf::stream_ids(u32::try_from(roles.len()).unwrap_or(0));
+    // UDP: the port must be listening before the client is told to send
+    // (iperf3 binds `prot_listener` before CREATE_STREAMS too).
+    let udp_local = SocketAddr::new(local.ip(), local.port());
+    let mut udp_next = match p.proto {
+        Proto::Udp => Some(udp_listener(udp_local)?),
+        Proto::Tcp => None,
+    };
     write_state(&mut ctrl, State::CreateStreams)?;
     let deadline = Instant::now() + STREAMS_TIMEOUT;
     let mut streams = Vec::with_capacity(roles.len());
-    for (sender, id) in roles.iter().zip(&ids) {
+    for (i, (sender, id)) in roles.iter().zip(&ids).enumerate() {
         let sock = match p.proto {
             Proto::Tcp => Sock::Tcp(accept_tcp(listener, &cookie, deadline)?),
-            Proto::Udp => Sock::Udp(accept_udp(SocketAddr::new(local.ip(), local.port()), deadline)?),
+            Proto::Udp => {
+                let l = udp_next.take().ok_or("no UDP listener for the next stream")?;
+                let (u, next) = accept_udp(l, udp_local, deadline, i + 1 < roles.len())?;
+                udp_next = next;
+                Sock::Udp(u)
+            }
         };
         set_tos(&sock, p.tos, peer.is_ipv6());
         streams.push(Stream { id: *id, sender: *sender, sock, counter: Arc::default() });
@@ -945,6 +967,24 @@ mod tests {
         assert!(up.packets.unwrap() > 2500, "{up:?}");
         assert!(up.received > 0 && up.received <= up.sent);
         assert!(srv.join().unwrap()[0].is_ok());
+    }
+
+    /// Several UDP streams: each one's datagram comes right after the
+    /// previous reply. The server binds the next listener before replying
+    /// (and the first before CREATE_STREAMS); before that fix the client
+    /// could hit a port with no socket and get "Connection refused" (flaky
+    /// under `cargo xtask ci`, 2026-10-28).
+    #[test]
+    fn udp_with_several_streams_never_hits_a_closed_port() {
+        for _ in 0..5 {
+            let (port, srv) = server(Limits::default(), 1);
+            let mut r = req(port, Proto::Udp, Direction::Send, 1_000_000, 4);
+            r.params.time = 1;
+            let (out, _) = run(&r);
+            let up = out.unwrap().upload.unwrap();
+            assert!(up.received > 0, "{up:?}");
+            assert!(srv.join().unwrap()[0].is_ok());
+        }
     }
 
     #[test]
