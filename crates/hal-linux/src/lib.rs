@@ -80,6 +80,10 @@ pub mod nft_read;
 #[cfg(target_os = "linux")]
 pub mod firewall;
 
+/// The firewall commit from what the previous one loaded (G0.31f).
+#[cfg(target_os = "linux")]
+mod fw_delta;
+
 /// The packet trace (`meta nftrace`, G2.1c): trace table and event codec.
 pub mod nft_trace;
 
