@@ -8027,3 +8027,31 @@ continuação indentadas).
   `cargo xtask ci` (sessões esperando até 30 min, **medido** em 29/10). A máquina tem 32 núcleos;
   3 compilações juntas cabem sem que cada uma fique bem mais lenta (**estimado**; 4 ficaria
   limitado pela RAM com a GPU reservando 64 GB). `COREROUTER_CI_SLOTS` continua mudando o número.
+
+- 2026-10-29 — G3.9ff: BGP: graceful restart (RFC 4724) com o CoreRouter como quem reinicia. Antes o FRR era só helper e,
+  com o `bgpd` morto, o vizinho retirava as rotas em 106 ms.
+
+  - `graceful_restart` por conexão e template (`true`: `neighbor X graceful-restart`; `false`:
+    `graceful-restart-disable`; sem valor: só helper, o padrão). Na instância:
+    `graceful_restart_time` (1..=4095 s, padrão 120), `graceful_stale_time` (padrão 360) e
+    `graceful_defer_time` (0..=3600 s, padrão 10; o `select-defer-time` do FRR, 360).
+  - Com uma conexão em restart: `bgp graceful-restart preserve-fw-state` (bit F) e o
+    `select-defer-time`. O `zebra` mantém as rotas do `bgpd` no kernel enquanto ele está fora (visto
+    no log: "Stale timer update to 500", "0 bgp routes removed").
+  - `routing.bgp.session.list`: `gr_local`, `gr_remote`, `end_of_rib_received`; coluna GR na janela
+    (`restart`/`helper`, `EoR`, `no EoR` em âmbar) e os tempos na aba de instâncias; prévia avisa
+    Restart Time ≥ hold time (RFC 4724 §3).
+  - Novo caso `gr` em `scripts/bgp-crcr-userns.sh` (host, FRR 10.7.1) e em
+    `scripts/routeros-interop-bgp.sh` (CHR e CoreRouter × CoreRouter na VM).
+
+  **Medido** (2026-10-29), `kill -9` do `bgpd` do CR1 e ping a cada 20 ms pelas rotas BGP, `bgpd` de
+  volta em 3 s: CoreRouter × CoreRouter no host, sem GR 469 de 656 perdidos (~9,4 s; o vizinho
+  retira em 105 ms) e com GR 2 de 656 (~40 ms), as duas rotas guardadas; na VM as duas rotas
+  ficam. RouterOS 7.25 CHR: anuncia `gr` e vê o nosso bit F, mas retira as nossas rotas em 8–9 ms
+  (com `kill -9` e com `TERM`) e nunca manda End-of-RIB (RFC 4724 §4.2); o kernel do CR1 guarda as
+  dele. Com o `select-defer-time` do FRR a rota do CHR ficava 120 s fora do kernel depois de ligar o
+  GR ou de um início do `bgpd`; com 10 s entra em 8,9 s, daí o padrão do CoreRouter.
+
+  Como testar: `cargo test -p corerouter-proto-bgp graceful`, `cargo test -p corerouter-engine
+  --lib graceful`; `scripts/bgp-crcr-userns.sh gr`; `cargo xtask vm-lab run --
+  scripts/routeros-interop-bgp.sh gr`.
