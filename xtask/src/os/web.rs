@@ -46,7 +46,7 @@ const WASM_BINDGEN: Tool = Tool {
 const TRUNK_MINOR: &str = "trunk 0.22.";
 
 /// Download (once), check and unpack `tool`; the directory holding its binary.
-fn fetch(os: &Path, tool: &Tool) -> Result<PathBuf, String> {
+fn fetch(os: &Path, top: &Path, tool: &Tool) -> Result<PathBuf, String> {
     let name = tool.url.rsplit('/').next().unwrap_or("tool.tar.gz");
     let dl = os.join("dl/web-tools");
     std::fs::create_dir_all(&dl).map_err(|e| format!("{}: {e}", dl.display()))?;
@@ -63,7 +63,7 @@ fn fetch(os: &Path, tool: &Tool) -> Result<PathBuf, String> {
             tool.sha256
         ));
     }
-    let unpack = os.join("out/web-tools");
+    let unpack = top.join("web-tools");
     let bin = unpack.join(tool.top).join(tool.bin);
     if !bin.is_file() {
         std::fs::create_dir_all(&unpack).map_err(|e| format!("{}: {e}", unpack.display()))?;
@@ -100,9 +100,9 @@ fn locked_bindgen(root: &Path) -> Result<String, String> {
     Err("Cargo.lock has no wasm-bindgen".into())
 }
 
-/// Build the GUI into `os/out/web` (index.html, the JS glue, the .wasm);
+/// Build the GUI into `<out>/web` (index.html, the JS glue, the .wasm);
 /// the directory, for `COREROUTER_WEB_DIR` of `corerouter.mk`.
-pub(super) fn build(root: &Path, cargo_target: &Path) -> Result<PathBuf, String> {
+pub(super) fn build(root: &Path, top: &Path, cargo_target: &Path) -> Result<PathBuf, String> {
     let os = root.join("os");
     let locked = locked_bindgen(root)?;
     if locked != WASM_BINDGEN_VERSION {
@@ -122,11 +122,11 @@ pub(super) fn build(root: &Path, cargo_target: &Path) -> Result<PathBuf, String>
              (cargo install --locked trunk --version 0.22.0)"
         ));
     }
-    let tools = [fetch(&os, &WASM_OPT)?, fetch(&os, &WASM_BINDGEN)?];
+    let tools = [fetch(&os, top, &WASM_OPT)?, fetch(&os, top, &WASM_BINDGEN)?];
     let path = std::env::var_os("PATH").unwrap_or_default();
     let path = std::env::join_paths(tools.iter().cloned().chain(std::env::split_paths(&path)))
         .map_err(|e| format!("PATH: {e}"))?;
-    let dist = os.join("out/web");
+    let dist = top.join("web");
     let started = Instant::now();
     let mut cmd = Command::new("trunk");
     cmd.current_dir(root.join("apps/corerouter-gui"))

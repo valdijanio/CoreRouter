@@ -683,7 +683,7 @@ bfd_on=0
 bfd_up() {
   [ $bfd_on = 1 ] && return
   bfd_on=1
-  # 300 ms × 3: at 100 ms a new session with RouterOS flaps (case bfd).
+  # 300 ms × 3 first; the case then goes to 100 ms (stable since G3.9b).
   cli routing.bfd.profile.add '{"name":"g39","min_tx":300,"min_rx":300,"multiplier":3,"dampening":false}' >/dev/null
   tset '{"bfd":"g39"}'
   cli routing.ospf.interface-template.set "{\"id\":\"$T2\",\"bfd\":\"g39\"}" >/dev/null
@@ -725,7 +725,8 @@ case_bfd() {
   result bfd INFO "300 ms × 3: $((f1 - f0)) BFD downs in 30 s with the session up"
   set_bfd_ms 100
   sleep 10; f0=$(bfd_downs); sleep 30; f1=$(bfd_downs)
-  result bfd INFO "100 ms × 3, changed with the session up (Poll): $((f1 - f0)) downs in 30 s"
+  [ $((f1 - f0)) = 0 ] && result bfd OK "100 ms × 3, changed with the session up (Poll): no downs in 30 s" \
+    || result bfd FAIL "100 ms × 3, changed with the session up (Poll): $((f1 - f0)) downs in 30 s"
   # New sessions on both of CHR's BFD links: to us and to R4 (FRR bfdd).
   local r0 r1
   r0=$(ros_bfd_downs 10.255.39.4)
@@ -734,7 +735,11 @@ case_bfd() {
 /routing ospf interface-template set [find interfaces=ether3] use-bfd=yes' >/dev/null
   sleep 5; f0=$(bfd_downs); sleep 30; f1=$(bfd_downs)
   r1=$(ros_bfd_downs 10.255.39.4)
-  result bfd INFO "100 ms × 3, new session: CoreRouter—CHR $((f1 - f0)) downs in 30 s; CHR—R4 (FRR bfdd) $((r1 - r0)) 'bfd down' in CHR's log"
+  # G3.9b: RouterOS keeps sending at ~1 s right after Up; our detect
+  # time holds the slow rate until a packet proves the new one.
+  [ $((f1 - f0)) = 0 ] && result bfd OK "100 ms × 3, new session: CoreRouter—CHR no downs in 30 s" \
+    || result bfd FAIL "100 ms × 3, new session: CoreRouter—CHR $((f1 - f0)) downs in 30 s"
+  result bfd INFO "100 ms × 3, new session: CHR—R4 (FRR bfdd) $((r1 - r0)) 'bfd down' in CHR's log; CR session $(cli routing.bfd.session.list | jq -c '[.sessions[] | select(.peer == "10.39.1.1") | {state, detect_time_us, rx_gap_p99_us, flaps_24h}][0]')"
   # Which profile survives a new session: RouterOS sends at ~1 s right
   # after Up, so the detect time has to cover that.
   local m

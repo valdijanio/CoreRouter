@@ -142,7 +142,11 @@ fn the_tap_hears_the_loss_on_the_engine_thread() {
     let mut b = engine("127.0.0.2".parse().unwrap(), pb, pa, 1);
     a.add(spec("127.0.0.2".parse().unwrap(), None, &fast), None);
     b.add(spec("127.0.0.1".parse().unwrap(), None, &fast), None);
-    assert!(wait_for(&a, Duration::from_secs(5), |s| s.iter().all(|x| x.state == "up")));
+    // G3.9b: Up, and the fast detection proved (the slow one holds until
+    // the peer's packets show the new rate).
+    assert!(wait_for(&a, Duration::from_secs(5), |s| s
+        .iter()
+        .all(|x| x.state == "up" && x.detect_time_us == 150_000)));
     assert!(TAPPED.lock().unwrap().iter().any(|(s, _, _)| *s == State::Up));
     let t = Instant::now();
     drop(b);
@@ -273,7 +277,9 @@ fn data_plane_for_a_fake_bfdd() {
     use super::{Controller, dplane};
 
     let (pa, pb) = ports();
-    let (pa, pb) = (pa + 2000, pb + 2000);
+    // Not +2000: the tap test uses those, and `cargo test` runs both in
+    // one process (same pid, same ports).
+    let (pa, pb) = (pa + 6000, pb + 6000);
     let dir = std::env::temp_dir().join(format!("g36b-dplane-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -405,6 +411,17 @@ fn data_plane_for_a_fake_bfdd() {
         counted = pump(&mut ctl, &mut bfdd).iter().any(|s| s.state == 99);
     }
     assert!(counted, "no counters");
+    // G3.9b: right after Up the detection keeps the slow 1 s × 3 until the
+    // peer's packets prove the fast rate (two periodic packets, ~100 ms).
+    let t = Instant::now();
+    let fast = |ctl: &Controller| {
+        let (s, _) = ctl.engine.as_ref().unwrap().snapshot();
+        s.iter().all(|x| x.detect_time_us == 150_000)
+    };
+    while t.elapsed() < Duration::from_secs(2) && !fast(&ctl) {
+        pump(&mut ctl, &mut bfdd);
+    }
+    assert!(fast(&ctl), "fast detection never proved");
     // The peer goes: Down, Diag 1, within the detection time.
     drop(b);
     let t = Instant::now();

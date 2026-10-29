@@ -84,7 +84,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{show_sensitive?: bool (the passwords in clear; group full)} → [{name, interface, user, password, service_name, ac_name, host_uniq, add_default_route, default_route_distance, use_peer_dns, profile, max_mtu, max_mru, keepalive_timeout, allow, disabled, comment, status (disabled | dialing | connecting | authenticating | connected | disconnected | disconnecting | error | stopped), local_address, remote_address, uptime_secs, mtu, retry_in_secs, attempts, last_down ({reason (no-offer | service-error | ac-error | padt | lcp | auth-failed | ncp | keepalive | local), message, time, uptime_secs} or null), error}]",
         always, list),
     cmd!(query "interface.pppoe-client.monitor", "PPPoE Client Monitor", [], None,
-        "{name: string} → {name, status, uptime_secs, service_name, ac_name, ac_mac, session_id, mtu, mru, encoding (mschap2 | mschap1 | chap | pap | none), local_address, remote_address, dns, attempts, retry_in_secs, last_error, rx_packets, rx_bytes, tx_packets, tx_bytes, dropped, mss_clamped, last_down}",
+        "{name: string} → {name, status, uptime_secs, service_name, ac_name, ac_mac, session_id, encoding (mschap2 | mschap1 | chap | pap | none) (these four: of the session up, else of the one negotiating, else of the last attempt that reached a BNG: a refused login keeps them), mtu, mru, local_address, remote_address, dns, attempts, retry_in_secs, last_error, rx_packets, rx_bytes, tx_packets, tx_bytes, dropped, mss_clamped, last_down}",
         has_clients, monitor),
     cmd!(query "interface.pppoe-client.history", "PPPoE Client History", [], None,
         "{name?: string, limit?: int (newest first, default 100)} → [{seq, time, name, event (dialing | connected | down | error | padt-stale), message}]",
@@ -811,6 +811,40 @@ mod tests {
         assert!(!addrs.contains("100.64.0."), "the session's address must go: {addrs}");
         let h = run(&mut s, "interface.pppoe-client.history", json!({})).unwrap().to_string();
         assert!(h.contains("connected") && h.contains("down"), "{h}");
+    }
+
+    /// A login the BNG refuses (the user's case on the real VM, 2026-10-29):
+    /// the client spoke to a concentrator, so the monitor keeps its AC
+    /// Name, AC MAC, session id and the authentication tried, also while
+    /// the next attempt is still looking for an offer.
+    #[test]
+    fn a_refused_login_keeps_the_bng_it_spoke_to() {
+        let mut s = session();
+        run(
+            &mut s,
+            "interface.pppoe-client.add",
+            json!({"name": "pppoe-out1", "interface": "ether1", "user": "u", "password": "wrong", "allow": "pap"}),
+        )
+        .unwrap();
+        for t in 0..10 {
+            s.dhcp_service(1000 + t * 250);
+        }
+        let m = run(&mut s, "interface.pppoe-client.monitor", json!({"name": "pppoe-out1"})).unwrap();
+        assert_eq!(m["status"], "disconnected", "{m}");
+        assert_eq!(m["last_down"]["reason"], "auth-failed", "{m}");
+        assert!(m["uptime_secs"].is_null() && m["local_address"].is_null(), "{m}");
+        assert_eq!(m["ac_name"], crate::pppoe_client::LAB_AC_NAME, "{m}");
+        let mac = m["ac_mac"].as_str().unwrap().to_owned();
+        assert_ne!(mac, "FF:FF:FF:FF:FF:FF", "{m}");
+        let sid = m["session_id"].as_u64().unwrap();
+        assert!(sid > 0, "{m}");
+        assert_eq!(m["encoding"], "pap", "{m}");
+        // The redial starts over from discovery: the last attempt's BNG stays.
+        let wait = m["retry_in_secs"].as_u64().unwrap();
+        s.dhcp_service(3500 + wait * 1000);
+        let m = run(&mut s, "interface.pppoe-client.monitor", json!({"name": "pppoe-out1"})).unwrap();
+        assert_eq!(m["ac_mac"], mac.as_str(), "{m}");
+        assert!(m["session_id"].as_u64().is_some(), "{m}");
     }
 
     #[test]

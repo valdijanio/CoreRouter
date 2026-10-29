@@ -16,7 +16,7 @@ Resumo do que interopera e do que não:
 | Áreas normal, stub, NSSA | ok; tipo diferente nos dois lados não forma adjacência (certo) |
 | Redistribuição | só o que o template anuncia (passive) ou a chain deixa passar |
 | LDP | sessão por loopback (transport address = LSR id), rótulos nos dois sentidos, tráfego rotulado CHR ⇄ CoreRouter |
-| BFD | ok a **300 ms × 4** (recomendado) e 300 ms × 3; a 100 ms × 3 toda sessão nova flapa (15 quedas em 30 s), e com o `bfdd` do FRR também (12): logo depois do Up o RouterOS segue mandando a ~1 s |
+| BFD | ok a 300 ms × 4, 300 ms × 3 e 100 ms × 3 (G3.9b: 0 quedas em 30 s numa sessão nova e numa troca com a sessão no ar; antes 15 e 5). Logo depois do Up o RouterOS segue mandando a ~1 s por ~1 s; o CoreRouter segura a detecção lenta até ver a taxa nova. Um `bfdd` do FRR do outro lado do mesmo CHR ainda flapa a 100 ms (13) |
 | LSP ping (RFC 8029) | o RouterOS não responde: use ping/traceroute IP e a tabela de rótulos |
 | OSPFv3 | ok (ptp, loopback /128 trocada) |
 
@@ -220,7 +220,7 @@ slot anterior, com a configuração que tinha. O slot em uso nunca é escrito.
 
    `signature: ok` e `intact: true`; nenhum `trial` pendente; o outro slot em `standby` ou
    `empty`. O pacote precisa ser assinado pela chave da imagem (a de produção, não a de
-   desenvolvimento de `os/out/keys`).
+   desenvolvimento de `<out>/keys`, `cargo xtask os out-dir`).
 2. **Saia do trânsito** se o roteador já for caminho de alguém (seção acima, "Como sair em
    segundos"): o reboot leva ~1 s de kernel e alguns segundos de firmware.
 3. **Envie e instale** com confirmação **manual** e prazo curto, numa janela de manutenção:
@@ -253,12 +253,12 @@ Sem acesso de rede ao roteador, o mesmo pacote vai num pendrive: `system.package
    no MikroTik para ver o que passou a ir pelo CoreRouter.
 2. Mais clientes: mais templates passivos ou um `redistribute` com `out_filter_chain` que aceite só
    as redes certas (caso `redistribute` do laboratório).
-3. BFD mais rápido só depois de medir. Com o RouterOS 7.25, a 100 ms × 3 toda sessão nova flapa;
-   a 300 ms × 3 a sessão nova ficou estável em duas rodadas, mas na volta de um corte houve 2 a 5
-   quedas a mais numa delas; a 300 ms × 4, nenhuma. Trocar 300 → 100 com a sessão já em Up foi
-   estável (0 quedas em 30 s), mas a próxima sessão nova (depois de qualquer queda) volta a
-   flapar. O dampening do perfil (ligado por padrão) segura a sessão caída enquanto pune os
-   flaps, e com ela a adjacência OSPF: mais um motivo para não descer de 300 ms × 4 (G3.9b).
+3. BFD mais rápido só depois de medir. Com o RouterOS 7.25 e o G3.9b, 100 ms × 3 ficou estável
+   no laboratório (0 quedas em 30 s numa sessão nova e numa troca 300 → 100 com a sessão no ar;
+   antes 15 e 5). O custo: logo depois de cada subida, até o RouterOS acelerar (~1 s, **medido**),
+   a detecção dessa sessão é a lenta (3 × 1 s; o `detect_time_us` da sessão mostra). Desça de
+   300 ms × 4 enlace por enlace, olhando `flaps_24h`; o dampening (ligado por padrão) segura uma
+   sessão instável caída, e com ela a adjacência OSPF.
 4. Graceful restart (G3.4e) e TI-LFA (G3.4d) depois que o CoreRouter for trânsito de verdade.
 
 ## Laboratório
