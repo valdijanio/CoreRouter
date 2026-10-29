@@ -7,7 +7,12 @@
 //! `cargo xtask bench` runs it; alone: `cargo bench -p corerouter-engine --bench package_upload`.
 
 // A benchmark is test code: fixtures may unwrap (clippy.toml only covers #[test]).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::time::Duration;
 
