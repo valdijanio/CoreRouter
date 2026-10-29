@@ -101,6 +101,9 @@ fn connections(n: u32, short: u32) -> corerouter_model::Config {
             router_id: [10, 0, 0, 1].into(),
             disabled: false,
             comment: String::new(),
+            graceful_restart_time: None,
+            graceful_stale_time: None,
+            graceful_defer_time: None,
         },
     );
     cfg.routing.bgp_templates.insert(

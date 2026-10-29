@@ -5,7 +5,7 @@
 #   cargo xtask vm-lab run --lock-timeout 2h -- scripts/routeros-interop-bgp.sh [case…]
 # Cases (default: all, in this order):
 #   ebgp4 ebgp6 mpbgp multihop md5 communities filters prepend ibgp nexthop-self
-#   rr rr-chr maxprefix restart bfd convergence scale crcr
+#   rr rr-chr maxprefix restart gr bfd convergence scale crcr
 # A round of everything takes ~25 min (the CHR boot ~1 min, scale ~5 min);
 # pass a few cases to keep a round short. HOLD=<s> keeps the lab up that
 # long at the end. Results: a table at the end and /tmp/crg39f/results.txt
@@ -34,7 +34,7 @@ exec 9>&-
 
 ROS_VERSION=${ROS_VERSION:-7.25}
 CASES=("$@")
-[ ${#CASES[@]} -gt 0 ] || CASES=(ebgp4 ebgp6 mpbgp multihop md5 communities filters prepend ibgp nexthop-self rr rr-chr maxprefix restart bfd convergence scale crcr)
+[ ${#CASES[@]} -gt 0 ] || CASES=(ebgp4 ebgp6 mpbgp multihop md5 communities filters prepend ibgp nexthop-self rr rr-chr maxprefix restart gr bfd convergence scale crcr)
 W=/tmp/crg39f
 CHR_DIR=/srv/lab/chr
 PW=g39f-lab-only
@@ -830,6 +830,92 @@ case_maxprefix() {
 
 # Restarting the CoreRouter daemon must not touch the sessions FRR holds;
 # restarting bgpd itself is a real BGP restart (graceful restart, RFC 4724).
+# G3.9ff: graceful restart (RFC 4724) with RouterOS as the helper. kill -9
+# of CR1's bgpd (no NOTIFICATION) while CR1's clients' gateway pings CHR's
+# ether1 every 20 ms: the reply comes back over the route CHR learnt from
+# CR1. Once without, once with graceful_restart; bgpd again after 3 s.
+gr_chr_round() { # gr_chr_round <label> <extra CR json> [signal]
+  local label=$1 x=${2:-} sig=${3:-KILL} ms t0
+  [ -n "$x" ] || x='{}'
+  ebgp4_up "$x"
+  wait_for 60 cr_up 1 chr4 >/dev/null || { result gr FAIL "$label: no session"; ebgp4_down; return; }
+  wait_for 30 ros_via 100.64.39.0/24 10.39.1.2 >/dev/null || true
+  # With graceful restart the best path waits for End-of-RIB (RouterOS
+  # sends none): the instance's defer time, 10 s.
+  ms=$(wait_for 30 k_has cf1 203.0.113.0/24) || true
+  result gr INFO "$label: CHR's 203.0.113.0/24 in CR1's kernel ${ms} ms after Established"
+  sleep 2
+  result gr INFO "$label: CHR session $(ros_sess cr4 | jq -c 'with_entries(select(.key | test("cap|gr|graceful|restart|stale")))'); CR1 $(cr_sess 1 chr4 | jq -c '{gr_local, gr_remote, end_of_rib_received}')"
+  result gr INFO "$label: CR1 bgpd GR $(vt cf1 'show bgp neighbors 10.39.1.1 json' | jq -c '."10.39.1.1" | {gr: .neighborCapabilities.gracefulRestart, rcvd: .neighborCapabilities.gracefulRestartCapability, info: .gracefulRestartInfo}' 2>/dev/null | cut -c1-600)"
+  result gr INFO "$label before the kill: CHR's route on CR1 '$(ip -n cf1 route show 203.0.113.0/24 | head -1)'; bgpd $(vtysh -N cf1 -c 'show bgp ipv4 unicast 203.0.113.0/24 json' | jq -c '[.paths[]? | {valid, bestpath: .bestpath.overall}]' 2>/dev/null); deferral $(vtysh -N cf1 -c 'show bgp neighbors 10.39.1.1 json' | jq -c '."10.39.1.1".gracefulRestartInfo.ipv4Unicast.timers' 2>/dev/null)"
+  ip netns exec cf1 ping -i 0.02 -w 14 -I 100.64.39.1 10.39.1.1 > "$W/gr-ping-$label.txt" 2>&1 &
+  local pp=$!
+  sleep 1
+  t0=$(now_ms)
+  pkill "-$sig" -f -- "bgpd -N cf1( |$)"
+  local gone=""
+  gone=$(wait_for 3 bash -c "[ \"\$(curl -sf -m 5 -u admin:$PW 'http://$ROS/rest/ip/route?dst-address=100.64.39.0/24' | jq '[.[] | select(.active == \"true\")] | length')\" = 0 ]") || gone=""
+  # CR1's own side: does its kernel keep CHR's route while bgpd is down?
+  local kept1=yes
+  [ -z "$gone" ] || sleep "$(awk -v g="$gone" 'BEGIN { printf "%.3f", (1000 - g) / 1000 }')"
+  k_has cf1 203.0.113.0/24 || kept1=no
+  sleep 1.5
+  k_has cf1 203.0.113.0/24 || kept1=no
+  sleep 0.5
+  ip netns exec cf1 /usr/lib/frr/bgpd -N cf1 -d -f /etc/frr/cf1/bgpd.conf
+  ms=$(wait_for 120 cr_up 1 chr4) || true
+  wait "$pp" || true
+  local got sent; got=$(grep -o '[0-9]* received' "$W/gr-ping-$label.txt" | grep -o '[0-9]*'); sent=$(grep -o '[0-9]* packets transmitted' "$W/gr-ping-$label.txt" | grep -o '^[0-9]*')
+  local miss=$(( ${sent:-0} - ${got:-0} ))
+  result gr INFO "$label: CHR $( [ -n "$gone" ] && echo "dropped CR1's route ${gone} ms after the kill" || echo "kept CR1's route through the outage"); CR1's kernel kept CHR's route at +1 s and +2.5 s: $kept1; session back $(( $(now_ms) - t0 )) ms after the kill; ping 20 ms apart (replies come over CHR's route): $miss of $sent lost"
+  echo "$label $miss $sent ${gone:-kept} $kept1" >> "$W/gr-summary.txt"
+  ebgp4_down
+  sleep 2
+}
+# The same between the two CoreRouters in the VM (CR2 is the helper).
+gr_crcr_round() {
+  cr2 routing.bgp.instance.set '{"asn":65002,"router_id":"10.255.39.5"}' >/dev/null
+  crc 1 '{"name":"cr2e","remote_address":"10.39.5.2","remote_as":65002,"input_filter":"all","output_filter":"all","output_network":"bgp-out","graceful_restart":true}'
+  crc 2 '{"name":"cr1e","remote_address":"10.39.5.1","remote_as":65000,"input_filter":"all","output_filter":"all","output_network":"bgp-out"}'
+  wait_for 60 cr_up 1 cr2e >/dev/null || { result gr FAIL "crcr: no session"; crd 1 cr2e; crd 2 cr1e; return; }
+  wait_for 30 k_has cf1 100.64.40.0/24 >/dev/null || true
+  wait_for 30 k_has cf2 100.64.39.0/24 >/dev/null || true
+  sleep 2
+  result gr INFO "crcr: CR1 $(cr_sess 1 cr2e | jq -c '{gr_local, gr_remote}')"
+  pkill -9 -f -- "bgpd -N cf1( |$)"
+  sleep 1
+  local k1=yes k2=yes
+  k_has cf1 100.64.40.0/24 || k1=no
+  k_has cf2 100.64.39.0/24 || k2=no
+  result gr INFO "crcr +1 s: CR1 kernel keeps CR2's route: $k1 ($(ip -n cf1 route show 100.64.40.0/24 | head -1)); CR2 keeps CR1's: $k2"
+  sleep 2
+  ip netns exec cf1 /usr/lib/frr/bgpd -N cf1 -d -f /etc/frr/cf1/bgpd.conf
+  wait_for 60 cr_up 1 cr2e >/dev/null || true
+  [ $k1 = yes ] && [ $k2 = yes ] && result gr OK "CoreRouter × CoreRouter in the VM: both routes kept while CR1's bgpd was down" || result gr INFO "crcr in the VM: CR1 kept $k1, CR2 kept $k2"
+  crd 1 cr2e; crd 2 cr1e
+  cr2 routing.bgp.instance.set '{"asn":65000,"router_id":"10.255.39.5"}' >/dev/null
+  sleep 2
+}
+case_gr() {
+  : > "$W/gr-summary.txt"
+  [ -n "${GR_SKIP_CRCR:-}" ] || gr_crcr_round
+  gr_chr_round without ''
+  gr_chr_round with '{"graceful_restart":true}'
+  # RFC 8538: a NOTIFICATION (Cease) with the N bit keeps graceful restart.
+  gr_chr_round with-term '{"graceful_restart":true}' TERM
+  local w gone kept wo_kept
+  read -r _ _ _ _ wo_kept < <(grep '^without ' "$W/gr-summary.txt")
+  read -r _ w _ gone kept < <(grep '^with ' "$W/gr-summary.txt")
+  # Ours: with graceful restart the kernel keeps the neighbor's routes.
+  [ "$kept" = yes ] && result gr OK "with graceful_restart CR1's kernel keeps CHR's routes while bgpd is down (without: $wo_kept)" \
+    || result gr FAIL "CR1's kernel lost CHR's route while bgpd was down: $(tr '\n' ';' < "$W/gr-summary.txt")"
+  # RouterOS 7.25 announces gr and sees our F bit (remote.gr-afi-fwp), yet
+  # drops our routes when the TCP session goes (RFC 4724 §4.2: a helper
+  # keeps them as stale): a divergence of RouterOS.
+  [ "$gone" = kept ] && result gr OK "CHR kept CR1's routes through the restart ($w lost pings)" \
+    || result gr INFO "RouterOS 7.25 is not a helper: it drops CR1's routes ${gone} ms after the TCP session goes, with graceful restart announced both ways (RFC 4724 §4.2 divergence); $w lost pings"
+}
+
 case_restart() {
   ebgp4_up
   local ms

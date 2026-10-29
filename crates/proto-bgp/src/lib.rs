@@ -38,6 +38,17 @@ use corerouter_model::{BgpInstance, Config, Issue, Routing};
 
 /// RFC 4271 §4.2: a hold time is 0 or at least 3 seconds.
 pub const MIN_HOLD_TIME: u16 = 3;
+/// G3.9ff: FRR's defaults (`bgpd.h`): Restart Time 120 s (RFC 4724 §3,
+/// at most 4095), stale paths kept 360 s.
+pub const GR_RESTART_TIME: u16 = 120;
+pub const GR_STALE_TIME: u16 = 360;
+/// The CoreRouter's best-path deferral after a `bgpd` start (FRR: 360 s).
+pub const GR_DEFER_TIME: u16 = 10;
+/// FRR's most for `select-defer-time`.
+pub const GR_MAX_DEFER: u16 = 3600;
+/// The largest Restart Time the capability carries (12 bits).
+pub const GR_MAX_TIME: u16 = 4095;
+
 /// Minutes before a neighbor over its prefix limit is tried again, when
 /// the action is `restart` and no time is set.
 pub const DEFAULT_RESTART_MINUTES: u16 = 5;
@@ -64,6 +75,28 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
             out.push(Issue::new(
                 format!("{path}.router_id"),
                 "router-id must not be 0.0.0.0 or 255.255.255.255",
+            ));
+        }
+        // G3.9ff, RFC 4724 §3: the Restart Time is 12 bits.
+        for (field, v) in [
+            ("graceful_restart_time", inst.graceful_restart_time),
+            ("graceful_stale_time", inst.graceful_stale_time),
+        ] {
+            if let Some(t) = v
+                && !(1..=GR_MAX_TIME).contains(&t)
+            {
+                out.push(Issue::new(
+                    format!("{path}.{field}"),
+                    format!("{t} s: 1..={GR_MAX_TIME} seconds (RFC 4724 §3: the Restart Time is 12 bits)"),
+                ));
+            }
+        }
+        if let Some(t) = inst.graceful_defer_time
+            && t > GR_MAX_DEFER
+        {
+            out.push(Issue::new(
+                format!("{path}.graceful_defer_time"),
+                format!("{t} s: 0..={GR_MAX_DEFER} seconds"),
             ));
         }
     }
@@ -572,6 +605,29 @@ fn render_instance(
     if inst.disabled {
         let _ = writeln!(s, " bgp shutdown");
     }
+    // G3.9ff, RFC 4724: the timers (FRR prints only what differs from its
+    // defaults) and the F bit (§3: forwarding state kept). With one
+    // neighbor in restarting mode `bgpd` registers with `zebra`, which then
+    // keeps `bgpd`'s routes in the kernel while it restarts (`zebra_gr.c`,
+    // `rib-stale-time`): the forwarding state is really kept.
+    if let Some(t) = inst.graceful_stale_time.filter(|t| *t != GR_STALE_TIME) {
+        let _ = writeln!(s, " bgp graceful-restart stalepath-time {t}");
+    }
+    if let Some(t) = inst.graceful_restart_time.filter(|t| *t != GR_RESTART_TIME) {
+        let _ = writeln!(s, " bgp graceful-restart restart-time {t}");
+    }
+    if neighbors
+        .iter()
+        .any(|(_, p)| p.graceful_restart == Some(true))
+    {
+        // §4.1: the restarting speaker defers its best path until every
+        // helper's End-of-RIB, bounded by this timer; RouterOS 7.25 sends
+        // none, so FRR's 360 s kept its routes out that long after a
+        // `bgpd` start (**medido**: no route from the CHR for 120 s).
+        let d = inst.graceful_defer_time.unwrap_or(GR_DEFER_TIME);
+        let _ = writeln!(s, " bgp graceful-restart select-defer-time {d}");
+        let _ = writeln!(s, " bgp graceful-restart preserve-fw-state");
+    }
     let (mut v4, all4) = origination(neighbors, cfg, Afi::Ip);
     let (mut v6, all6) = origination(neighbors, cfg, Afi::Ipv6);
     for (c, p) in neighbors {
@@ -902,6 +958,17 @@ fn neighbor(
     if c.disabled {
         let _ = writeln!(s, " neighbor {a} shutdown");
     }
+    // G3.9ff: restarting speaker (and helper), or neither; unset: helper
+    // only, FRR's default.
+    match p.graceful_restart {
+        Some(true) => {
+            let _ = writeln!(s, " neighbor {a} graceful-restart");
+        }
+        Some(false) => {
+            let _ = writeln!(s, " neighbor {a} graceful-restart-disable");
+        }
+        None => {}
+    }
     if p.multihop == Some(true) && !role.is_ibgp() {
         // TTL 255; FRR prints the maximum without the number.
         let _ = writeln!(s, " neighbor {a} ebgp-multihop");
@@ -1019,6 +1086,9 @@ mod tests {
             router_id: rid.into(),
             disabled: false,
             comment: String::new(),
+            graceful_restart_time: None,
+            graceful_stale_time: None,
+            graceful_defer_time: None,
         }
     }
 
@@ -1221,6 +1291,70 @@ mod tests {
             text.contains("  neighbor 192.0.2.1 route-map CR-out out\n"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn graceful_restart_renders_like_frr() {
+        // G3.9ff, RFC 4724: restarting mode per neighbor, the timers and
+        // the F bit per instance; FRR prints only non-default timers.
+        let p = |gr: Option<bool>| BgpParams {
+            remote_as: Some(Asn(64500)),
+            graceful_restart: gr,
+            ..Default::default()
+        };
+        let mut cfg = cfg_with(vec![
+            conn("up", "192.0.2.1", p(Some(true))),
+            conn("off", "192.0.2.5", p(Some(false))),
+            conn("plain", "192.0.2.9", p(None)),
+        ]);
+        let text = render_config(&cfg, &|_| None).unwrap();
+        assert!(
+            text.contains(" neighbor 192.0.2.1 graceful-restart\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(" neighbor 192.0.2.5 graceful-restart-disable\n"),
+            "{text}"
+        );
+        assert!(!text.contains("192.0.2.9 graceful"), "{text}");
+        assert!(
+            text.contains(" bgp graceful-restart preserve-fw-state\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(" bgp graceful-restart select-defer-time 10\n"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("restart-time") && !text.contains("stalepath-time"),
+            "{text}"
+        );
+        let inst = cfg.routing.bgp.get_mut("default").unwrap();
+        inst.graceful_restart_time = Some(60);
+        inst.graceful_stale_time = Some(GR_STALE_TIME);
+        let text = render_config(&cfg, &|_| None).unwrap();
+        assert!(
+            text.contains(" bgp graceful-restart restart-time 60\n"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("stalepath-time"),
+            "the default is not printed: {text}"
+        );
+        // Nobody restarting: no F bit.
+        cfg.routing.bgp_connections.remove("up");
+        assert!(
+            !render_config(&cfg, &|_| None)
+                .unwrap()
+                .contains("preserve-fw-state")
+        );
+        // §3: 12 bits.
+        cfg.routing
+            .bgp
+            .get_mut("default")
+            .unwrap()
+            .graceful_restart_time = Some(4096);
+        assert!(validate(&cfg).iter().any(|i| i.path.ends_with("graceful_restart_time") && i.message.contains("12 bits")));
     }
 
     #[test]

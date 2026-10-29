@@ -280,6 +280,13 @@ pub struct BgpParams {
     /// (FRR `network` with `bgp network import-check`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_network: Option<String>,
+    /// G3.9ff: graceful restart (RFC 4724) as the restarting speaker: the
+    /// neighbor keeps our routes while `bgpd` restarts, and our kernel
+    /// keeps its routes (FRR `neighbor … graceful-restart`). Unset: helper
+    /// only (we keep the neighbor's routes when it restarts); `false`: not
+    /// even that (`graceful-restart-disable`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graceful_restart: Option<bool>,
 }
 
 impl BgpParams {
@@ -310,6 +317,7 @@ impl BgpParams {
         take(&mut self.bfd, &parent.bfd);
         take(&mut self.output_redistribute, &parent.output_redistribute);
         take(&mut self.output_network, &parent.output_network);
+        take(&mut self.graceful_restart, &parent.graceful_restart);
     }
 
     /// The families in force: unset is IPv4 only, as in RouterOS.

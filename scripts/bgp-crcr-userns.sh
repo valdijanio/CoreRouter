@@ -7,7 +7,7 @@
 #   scripts/bgp-crcr-userns.sh [case…]
 # Cases (default: all, in this order):
 #   ebgp ebgp6 mpbgp md5 filters announce nexthop-self rr maxprefix restart
-#   bfd convergence scale
+#   gr bfd convergence scale
 # Not in the default list: ospf-static (G3.9fe, OSPF redistributing the
 # CoreRouter's static routes).
 # SCALE_N=<n> changes the 100 000 prefixes of `scale`. Results: a table at
@@ -71,7 +71,7 @@ export LD_LIBRARY_PATH=$FRR_DIR/root/usr/lib/x86_64-linux-gnu:$FRR_DIR/root/usr/
 FRR=$FRR_DIR/root/usr/lib/frr
 bin=$CARGO_TARGET_DIR/release
 CASES=("$@")
-[ ${#CASES[@]} -gt 0 ] || CASES=(ebgp ebgp6 mpbgp md5 filters announce nexthop-self rr maxprefix restart bfd convergence scale)
+[ ${#CASES[@]} -gt 0 ] || CASES=(ebgp ebgp6 mpbgp md5 filters announce nexthop-self rr maxprefix restart gr bfd convergence scale)
 FAILED=0
 : > "$W/results.txt"
 result() { # result <case> <OK|FAIL|INFO> <text>
@@ -495,6 +495,53 @@ case_maxprefix() {
   ms=$(wait_for 60 cr_up 1 r3) && result maxprefix OK "warning: up in ${ms} ms with $(cr_sess 1 r3 | jq -r .prefix_count) prefixes" || result maxprefix FAIL "warning: $(cr_state 1 r3)"
   crd 1 r3
   for i in 1 2 3 4 5 6; do ip -n r3 route del blackhole "198.18.$i.0/24"; done
+}
+
+# G3.9ff: graceful restart (RFC 4724). kill -9 of CR1's bgpd (no
+# NOTIFICATION: the TCP session just drops) while CR2's clients ping CR1's,
+# 20 ms apart, through the BGP routes; once without and once with
+# graceful_restart on CR1's connection. bgpd is started again 3 s later
+# (the daemon types its config back).
+gr_round() { # gr_round <label> <graceful_restart json or empty>
+  local label=$1 x=$2 ms t0 lost
+  crc 1 "$(jq -c '. + $x' --argjson x "${x:-{\}}" <<< '{"name":"cr2","remote_address":"10.39.5.2","remote_as":65002,"input_filter":"all","output_filter":"all","output_network":"bgp-out"}')"
+  crc 2 '{"name":"cr1","remote_address":"10.39.5.1","remote_as":65000,"input_filter":"all","output_filter":"all","output_network":"bgp-out"}'
+  wait_for 60 cr_up 1 cr2 >/dev/null || { result gr FAIL "$label: no session"; pair_down; return; }
+  wait_for 30 k_has c2 100.64.39.0/24 >/dev/null || true
+  wait_for 30 k_has c1 100.64.40.0/24 >/dev/null || true
+  sleep 2
+  result gr INFO "$label: CR1 sees $(cr_sess 1 cr2 | jq -c '{gr_local, gr_remote, end_of_rib_received}'), CR2 sees $(cr_sess 2 cr1 | jq -c '{gr_local, gr_remote}')"
+  ip netns exec c2 ping -i 0.02 -w 14 -I 100.64.40.1 100.64.39.1 > "$W/gr-ping-$label.txt" 2>&1 &
+  local pp=$!
+  sleep 1
+  t0=$(now_ms)
+  pkill -9 -f -- "frr/bgpd -N c1( |$)"
+  # During the outage: is CR1's route still on CR2, and CR2's on CR1?
+  local gone=""; gone=$(wait_for 3 k_none c2 100.64.39.0/24) || gone=""
+  local kept1; k_has c1 100.64.40.0/24 && kept1=yes || kept1=no
+  # bgpd down ~3 s in both rounds.
+  [ -z "$gone" ] || sleep "$(awk -v g="$gone" 'BEGIN { printf "%.3f", (3000 - g) / 1000 }')"
+  ip netns exec c1 "$FRR/bgpd" -N c1 -u root -g root -d --limit-fds 4096 -f /etc/frr/c1/bgpd.conf </dev/null >>"$W/frr-c1.log" 2>&1
+  ms=$(wait_for 60 cr_up 1 cr2) || true
+  wait "$pp" || true
+  lost=$(grep -o '[0-9]* received' "$W/gr-ping-$label.txt" | grep -o '[0-9]*'); local sent; sent=$(grep -o '[0-9]* packets transmitted' "$W/gr-ping-$label.txt" | grep -o '^[0-9]*')
+  local miss=$(( ${sent:-0} - ${lost:-0} ))
+  result gr INFO "$label: CR2 $( [ -n "$gone" ] && echo "withdrew CR1's route ${gone} ms after the kill" || echo "kept CR1's route (stale) through the outage"); CR1's kernel kept CR2's route: $kept1; session back $(( $(now_ms) - t0 )) ms after the kill"
+  result gr INFO "$label: ping 20 ms apart: $miss of $sent lost (~$(( miss * 20 )) ms without traffic)"
+  echo "$label $miss $sent ${gone:-kept} $kept1" >> "$W/gr-summary.txt"
+  crd 1 cr2; crd 2 cr1
+  sleep 2
+}
+case_gr() {
+  : > "$W/gr-summary.txt"
+  gr_round without ''
+  gr_round with '{"graceful_restart":true}'
+  local wo w
+  wo=$(awk '$1 == "without" {print $2}' "$W/gr-summary.txt"); w=$(awk '$1 == "with" {print $2}' "$W/gr-summary.txt")
+  read -r _ _ _ gone kept < <(grep '^with ' "$W/gr-summary.txt")
+  [ "$gone" = kept ] && [ "$kept" = yes ] && [ "${w:-999}" -le 5 ] \
+    && result gr OK "graceful restart: bgpd killed and back in ~3 s, both routes kept; $w lost pings with it, $wo without" \
+    || result gr FAIL "graceful restart: $(cat "$W/gr-summary.txt" | tr '\n' ';')"
 }
 
 case_restart() {

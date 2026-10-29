@@ -230,6 +230,9 @@ mod tests {
                 router_id: [10, 0, 0, 1].into(),
                 disabled: true,
                 comment: String::new(),
+                graceful_restart_time: None,
+                graceful_stale_time: None,
+                graceful_defer_time: None,
             },
         );
         let conf = render(&cfg, &|_| None).unwrap();

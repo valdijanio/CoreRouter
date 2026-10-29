@@ -95,6 +95,7 @@ fn session(
     let remote_id = str_of(n, "remoteRouterId").filter(|id| id != "0.0.0.0");
     let secs = |k: &str| u64_of(n, k).map(|ms| ms / 1000);
     let description = str_of(n, "nbrDesc");
+    let gr = n.get("gracefulRestartInfo").and_then(Value::as_object);
     BgpSession {
         instance,
         vrf: vrf.to_owned(),
@@ -145,7 +146,30 @@ fn session(
         afi,
         policy_in,
         policy_out,
+        gr_local: gr.and_then(|g| gr_mode(g, "localGrMode")),
+        gr_remote: gr.and_then(|g| gr_mode(g, "remoteGrMode")),
+        end_of_rib_received: gr
+            .and_then(|g| g.get("endOfRibRecv"))
+            .and_then(Value::as_object)
+            .map(|m| {
+                m.iter()
+                    .filter(|(_, v)| v.as_bool() == Some(true))
+                    .map(|(k, _)| family(k))
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
+}
+
+/// G3.9ff: FRR's `Restart`, `Helper*` (the `*`: inherited from the
+/// instance), `Disable`, lowercase; `NotApplicable` and the rest: none.
+fn gr_mode(g: &Map<String, Value>, key: &str) -> Option<String> {
+    let m = g
+        .get(key)?
+        .as_str()?
+        .trim_end_matches('*')
+        .to_ascii_lowercase();
+    matches!(m.as_str(), "restart" | "helper" | "disable").then_some(m)
 }
 
 /// `ipv4Unicast` → `ipv4`.
@@ -168,7 +192,9 @@ mod tests {
           "addressFamilyInfo": {
             "ipv4Unicast": {"acceptedPrefixCounter": 10, "sentPrefixCounter": 2},
             "ipv6Unicast": {"acceptedPrefixCounter": 5, "sentPrefixCounter": 1}
-          }
+          },
+          "gracefulRestartInfo": {"endOfRibSend": {"ipv4Unicast": true}, "endOfRibRecv": {"ipv4Unicast": true},
+            "localGrMode": "Restart", "remoteGrMode": "Helper", "rBit": false, "nBit": true}
         },
         "192.0.2.6": {
           "remoteAs": 65002, "localAs": 65000, "remoteRouterId": "0.0.0.0",
@@ -190,7 +216,17 @@ mod tests {
         assert_eq!(up.prefix_sent, Some(3));
         assert_eq!(up.messages_received, Some(9));
         assert_eq!(up.description.as_deref(), Some("upstream"));
+        // G3.9ff: the graceful-restart roles and the End-of-RIBs received.
+        assert_eq!(
+            (up.gr_local.as_deref(), up.gr_remote.as_deref()),
+            (Some("restart"), Some("helper"))
+        );
+        assert_eq!(up.end_of_rib_received, ["ipv4"]);
         let down = &s[1];
+        assert_eq!(
+            (down.gr_local.as_deref(), down.end_of_rib_received.len()),
+            (None, 0)
+        );
         assert_eq!(down.state, "active");
         assert_eq!(down.remote_id, None);
         assert_eq!(down.reason.as_deref(), Some("Waiting for peer OPEN"));

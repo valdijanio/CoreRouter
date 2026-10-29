@@ -84,7 +84,7 @@ const fn field(param: &'static str, label: &'static str, help: &'static str, inp
 }
 
 /// The shared parameters, in the modal's pages.
-const SESSION_PAGE: &[&str] = &["hold_time", "keepalive_time", "multihop", "bfd", "update_source", "tcp_md5_key", "nexthop_choice"];
+const SESSION_PAGE: &[&str] = &["hold_time", "keepalive_time", "multihop", "bfd", "graceful_restart", "update_source", "tcp_md5_key", "nexthop_choice"];
 const LIMITS_PAGE: &[&str] = &["afi", "max_prefix_ipv4", "max_prefix_ipv6", "max_prefix_action", "max_prefix_restart"];
 /// G3.2b: the `/routing filter` chains (RFC 8212: eBGP needs both).
 const FILTERS_PAGE: &[&str] = &["input_filter", "output_filter", "keep_received", "output_network", "output_redistribute"];
@@ -103,6 +103,8 @@ const CONN_FIELDS: &[Field] = &[
     field("multihop", "Multihop", "bgp.param.multihop", Input::Choice),
     // G3.6b: the BFD profile the session follows (Routing › BFD).
     field("bfd", "BFD Profile", "bgp.param.bfd", Input::Text("none (default, fast…)")),
+    // G3.9ff: RFC 4724, restarting speaker.
+    field("graceful_restart", "Graceful Restart", "bgp.param.graceful_restart", Input::Choice),
     field("update_source", "Local Address", "bgp.param.update_source", Input::Text("address or interface")),
     field("tcp_md5_key", "TCP MD5 Key", "bgp.param.tcp_md5_key", Input::Secret("empty keeps it")),
     field("nexthop_choice", "Nexthop Choice", "bgp.param.nexthop_choice", Input::Choice),
@@ -130,6 +132,8 @@ const TPL_FIELDS: &[Field] = &[
     field("multihop", "Multihop", "bgp.param.multihop", Input::Choice),
     // G3.6b: the BFD profile the session follows (Routing › BFD).
     field("bfd", "BFD Profile", "bgp.param.bfd", Input::Text("none (default, fast…)")),
+    // G3.9ff: RFC 4724, restarting speaker.
+    field("graceful_restart", "Graceful Restart", "bgp.param.graceful_restart", Input::Choice),
     field("update_source", "Local Address", "bgp.param.update_source", Input::Text("address or interface")),
     field("tcp_md5_key", "TCP MD5 Key", "bgp.param.tcp_md5_key", Input::Secret("empty keeps it")),
     field("nexthop_choice", "Nexthop Choice", "bgp.param.nexthop_choice", Input::Choice),
@@ -166,7 +170,7 @@ pub(crate) const TPL_SPEC: Spec = Spec {
     preview: "routing.bgp.template.check",
 };
 
-const SESSION_COLUMNS: [table::Column; 8] = [
+const SESSION_COLUMNS: [table::Column; 9] = [
     col("State").help("bgp.session.state"),
     col("Name").help("bgp.connection.name"),
     col("Remote Address").help("bgp.connection.remote_address"),
@@ -175,6 +179,7 @@ const SESSION_COLUMNS: [table::Column; 8] = [
     num("Prefixes In").help("bgp.session.prefixes_in"),
     num("Prefixes Out").help("bgp.session.prefixes_out"),
     col("BFD").help("bgp.session.bfd"),
+    col("GR").help("bgp.session.gr"),
 ];
 
 const CONN_COLUMNS: [table::Column; 10] = [
@@ -323,6 +328,27 @@ impl SessionRow {
             let c: Vec<(&str, Kind)> = v.iter().map(|(t, k)| (t.as_str(), *k)).collect();
             cell("", &c)
         };
+        // G3.9ff: our role (restart, helper) and the End-of-RIB (RFC 4724).
+        let gr = match self.text("gr_local").as_str() {
+            "" => "–".to_owned(),
+            g => {
+                let eor = self
+                    .session
+                    .as_ref()
+                    .and_then(|v| v.get("end_of_rib_received"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| !a.is_empty());
+                let mut chips = vec![(g, if g == "restart" { Kind::Green } else { Kind::Neutral })];
+                if eor {
+                    chips.push(("EoR", Kind::Blue));
+                } else if g == "restart" && self.state() == "established" {
+                    // RouterOS 7.25: announces graceful restart, never
+                    // sends End-of-RIB (the best path waits for it).
+                    chips.push(("no EoR", Kind::Amber));
+                }
+                cell("", &chips)
+            }
+        };
         let uptime = match (self.num("uptime_secs"), state.as_str()) {
             (Some(secs), "established") => crate::neighbors::uptime_text(secs),
             _ => "–".to_owned(),
@@ -338,6 +364,7 @@ impl SessionRow {
                 dash(self.num("prefix_count")),
                 dash(self.num("prefix_sent")),
                 bfd,
+                gr,
             ],
             dimmed: state == "disabled",
             section: false,
@@ -483,7 +510,7 @@ fn values_of(r: &Value, what: What) -> BTreeMap<&'static str, String> {
             "disabled" => if flag(r, "disabled") { "yes" } else { "no" }.to_owned(),
             // Write-only: never shown, empty keeps it.
             "tcp_md5_key" => String::new(),
-            "keep_received" => match own.get("keep_received").and_then(Value::as_bool) {
+            "keep_received" | "graceful_restart" => match own.get(f.param).and_then(Value::as_bool) {
                 Some(true) => "yes".into(),
                 Some(false) => "no".into(),
                 None => String::new(),
@@ -509,7 +536,7 @@ fn values_of(r: &Value, what: What) -> BTreeMap<&'static str, String> {
 fn options(param: &str, instances: &[String]) -> Vec<String> {
     let v: &[&str] = match param {
         "local_role" => &["", "ibgp", "ibgp-rr", "ebgp", "ebgp-provider", "ebgp-customer", "ebgp-peer", "ebgp-rs", "ebgp-rs-client"],
-        "multihop" | "keep_received" => &["", "yes", "no"],
+        "multihop" | "keep_received" | "graceful_restart" => &["", "yes", "no"],
         "nexthop_choice" => &["", "default", "force-self", "propagate"],
         "afi" => &["", "ip", "ipv6", "ip,ipv6"],
         "max_prefix_action" => &["", "shutdown", "warning", "restart"],
@@ -833,7 +860,7 @@ impl BgpPanel {
     fn instances_tab(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
         let l = app.lang.labels;
         Grid::new("bgp-instances").striped(true).show(ui, |ui| {
-            for h in ["Name", "AS", "Router ID", "Disabled"] {
+            for h in ["Name", "AS", "Router ID", "Disabled", "Restart Time", "Stale Time", "Defer Time"] {
                 ui.strong(tr_in(SCOPE, l, h));
             }
             ui.end_row();
@@ -850,6 +877,10 @@ impl BgpPanel {
                 }
                 ui.label(s(row, "router_id"));
                 ui.label(s(row, "disabled"));
+                // G3.9ff: graceful restart (routing.bgp.instance.set).
+                ui.label(format!("{} s", s(row, "graceful_restart_time")));
+                ui.label(format!("{} s", s(row, "graceful_stale_time")));
+                ui.label(format!("{} s", s(row, "graceful_defer_time")));
                 ui.end_row();
             }
         });

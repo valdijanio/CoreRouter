@@ -178,6 +178,49 @@ corerouter-cli run routing.bgp.connection.add '{"name":"client1","remote_address
   - `input.limit-process-routes-ipv4`: para de processar sem mandar Cease; o `max_prefix` do
     CoreRouter fecha com Cease 6/1 (RFC 4486), que o CHR registra.
 
+### G3.9ff: graceful restart (RFC 4724)
+
+Quando o `bgpd` do CoreRouter cai e volta, o vizinho guarda as nossas rotas (stale) e o nosso
+kernel guarda as dele: o tráfego segue enquanto o `bgpd` sobe de novo.
+
+```sh
+corerouter-cli run routing.bgp.connection.set '{"id":"core2","graceful_restart":true}'
+corerouter-cli run routing.bgp.instance.set '{"asn":65000,"router_id":"10.255.0.1","graceful_restart_time":120}'
+```
+
+- Por conexão ou template, `graceful_restart`: `true` → `neighbor X graceful-restart` (quem
+  reinicia, e helper); `false` → `graceful-restart-disable`; sem valor: só helper (o padrão do
+  FRR). O RouterOS 7.25 não tem parâmetro (só anuncia a capacidade `gr`).
+- Na instância: `graceful_restart_time` (o Restart Time anunciado, 1..=4095 s, padrão 120; RFC
+  4724 §3: 12 bits), `graceful_stale_time` (quanto as rotas stale de um vizinho que reinicia
+  ficam, padrão 360) e `graceful_defer_time` (quanto o melhor caminho espera os End-of-RIB depois
+  que o `bgpd` sobe, §4.1; padrão do CoreRouter 10 s, FRR 360). O `instance.set` sem eles mantém
+  o que havia.
+- Com uma conexão em modo restart, o render põe `bgp graceful-restart preserve-fw-state` (bit F):
+  o `bgpd` se registra no `zebra` com GR e o `zebra` mantém as rotas dele no kernel enquanto ele
+  está fora (`zebra_gr.c`, `rib-stale-time` 500 s; visto no log do `zebra`: "Stale timer update
+  to 500", "0 bgp routes removed").
+- `routing.bgp.session.list` traz `gr_local`, `gr_remote` e `end_of_rib_received`; a coluna GR da
+  janela mostra o papel e `EoR`, ou `no EoR` (âmbar) quando estamos como restart e o vizinho
+  nunca mandou o End-of-RIB. A prévia avisa quando o Restart Time não é menor que o hold time
+  (`gr-restart-time`).
+
+**Medido** (2026-10-29), `kill -9` do `bgpd` do CR1, ping a cada 20 ms atravessando as rotas BGP,
+`bgpd` de volta 3 s depois:
+
+| Vizinho | Sem GR | Com GR |
+|---|---|---|
+| CoreRouter (FRR 10.7.1, host, `bgp-crcr-userns.sh gr`) | 469 de 656 pings perdidos (~9,4 s); o vizinho retira a rota em 105 ms | **2 de 656** (~40 ms); as duas rotas ficam |
+| CoreRouter × CoreRouter na VM | — | as duas rotas ficam |
+| RouterOS 7.25 CHR (`routeros-interop-bgp.sh gr`) | o CHR retira em 8 ms | o CHR retira em 9 ms; o kernel do CR1 guarda as do CHR |
+
+Divergências do RouterOS 7.25: anuncia `gr` (vê o nosso bit F: `remote.gr-afi-fwp=ip`), mas
+retira as nossas rotas assim que o TCP cai, com `kill -9` e com `TERM` (RFC 4724 §4.2 pede que o
+helper as guarde como stale), e nunca manda End-of-RIB (§4.2: o helper MUST mandar depois do
+update inicial). Com o `select-defer-time` padrão do FRR (360 s; o temporizador por família ficou
+em 120 s), a rota do CHR ficava fora do kernel 120 s depois de ligar o GR ou de um início do
+`bgpd`; com os 10 s do CoreRouter entra em 8,9 s. Com MikroTik, o GR só protege o nosso lado.
+
 ### Ficou para depois
 
 - Políticas e o "quais rotas passam" (G3.2b); RPKI e "Por que essa rota?" (G3.2c).

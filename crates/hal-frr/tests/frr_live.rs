@@ -60,6 +60,9 @@ fn instance(asn: u32, rid: &str) -> BgpInstance {
         router_id: rid.parse().unwrap(),
         disabled: false,
         comment: String::new(),
+        graceful_restart_time: None,
+        graceful_stale_time: None,
+        graceful_defer_time: None,
     }
 }
 

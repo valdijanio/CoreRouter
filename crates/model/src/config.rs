@@ -435,6 +435,21 @@ pub struct BgpInstance {
     pub disabled: bool,
     #[serde(default)]
     pub comment: String,
+    /// G3.9ff, RFC 4724 §3: the Restart Time we announce, seconds
+    /// (1..=4095; unset: FRR's 120).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graceful_restart_time: Option<u16>,
+    /// How long a restarted neighbor's routes stay stale before they go
+    /// (FRR `stalepath-time`; unset: 360).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graceful_stale_time: Option<u16>,
+    /// How long, after `bgpd` starts, the best path waits for the
+    /// End-of-RIB of the neighbors that announce graceful restart (RFC
+    /// 4724 §4.1; FRR `select-defer-time`, 0..=3600). Unset: 10 s (FRR's
+    /// 360 s is too long: RouterOS 7.25 announces graceful restart and
+    /// never sends End-of-RIB, **medido**).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graceful_defer_time: Option<u16>,
 }
 
 #[cfg(test)]
