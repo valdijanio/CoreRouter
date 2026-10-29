@@ -2,6 +2,8 @@
 //! (`/proc`, `/sys`, `statvfs`; no root): the `health` service takes one
 //! every 5 s (every second while someone looks), the process list only on
 //! demand, the sensors every 10 s (`sensors`: what that read costs).
+//! G1.6qd: `router` is the router's own processes on every reading (pids
+//! known), `router_scan` the look at all of `/proc` every 30 s.
 //!
 //! ```sh
 //! cargo bench -p corerouter-hal-linux --bench resource
@@ -26,6 +28,17 @@ fn main() {
     });
     g.bench_function("sensors", |b| {
         b.iter(|| col.sensors());
+    });
+    g.bench_function("router", |b| {
+        col.router(0);
+        b.iter(|| col.router(1));
+    });
+    let mut t = 0u64;
+    g.bench_function("router_scan", |b| {
+        b.iter(|| {
+            t += 60_000;
+            col.router(t)
+        });
     });
     g.bench_function("sample_with_processes", |b| {
         b.iter(|| {

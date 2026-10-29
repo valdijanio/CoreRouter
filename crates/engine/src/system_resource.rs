@@ -33,6 +33,9 @@ pub const WANTED_SECS: u64 = 15;
 /// A process list older than this (ms of uptime before the last reading)
 /// is not served while the service catches up (G1.6q).
 const PROCS_STALE_MS: u64 = 2_000;
+/// A scrape of `system.metrics` takes the service's reading up to this old
+/// (s; it reads every 5 s) instead of reading under the lock (G1.6qd).
+pub const METRICS_STALE_SECS: u64 = 15;
 
 /// Where a reading came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,6 +301,22 @@ impl Session {
         self.ext::<ResourceMonitor>()
             .map(|m| m.wanted(now))
             .unwrap_or_default()
+    }
+
+    /// The readings for a scrape (G1.6qd): the service's while recent
+    /// enough ([`METRICS_STALE_SECS`]), else fresh ones without marking
+    /// them as watched. `None`: the platform has no readings.
+    pub(crate) fn resource_for_metrics(&mut self) -> Option<&ResourceMonitor> {
+        let now = self.clock_secs();
+        let recent = self.ext::<ResourceMonitor>().is_some_and(|m| {
+            m.last.is_some()
+                && m.source == Some(Source::Service)
+                && matches!((now, m.taken_at), (Some(n), Some(t)) if n.saturating_sub(t) <= METRICS_STALE_SECS)
+        });
+        if !recent {
+            self.resource_refresh(false, false).ok()?;
+        }
+        self.ext::<ResourceMonitor>().filter(|m| m.last.is_some())
     }
 
     fn clock_secs(&self) -> Option<u64> {
