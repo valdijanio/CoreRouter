@@ -353,7 +353,11 @@ fn check(s: &Session, v: &PppoeServer) -> Result<Vec<String>> {
     }
     if let Some(vid) = v.pppoe_over_vlan_range.iter().chain(&v.outer_vlan_range).find_map(|r| {
         cfg.interfaces.values().find_map(|i| match &i.kind {
-            corerouter_model::InterfaceKind::Vlan { vlan_id: id, parent }
+            corerouter_model::InterfaceKind::Vlan {
+                vlan_id: id,
+                parent,
+                ..
+            }
                 if *parent == v.interface && (r.first..=r.last).contains(&id.get()) =>
             {
                 Some(id.get())

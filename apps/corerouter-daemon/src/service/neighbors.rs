@@ -82,9 +82,7 @@ fn run(session: &Shared, health: &super::Health) -> Result<(), String> {
         Err(e) => {
             // No table on this platform: the lists read per query.
             health.disabled(Some(&e));
-            while health.sleep(Duration::from_secs(60)) {
-                health.beat();
-            }
+            health.idle_until_shutdown();
             return Ok(());
         }
     };

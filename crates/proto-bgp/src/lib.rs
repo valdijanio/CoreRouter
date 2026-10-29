@@ -26,9 +26,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::net::IpAddr;
 
+use corerouter_model::address_lists::AddressLists;
 use corerouter_model::bgp::{
-    Afi, BgpConnection, BgpParams, LocalRole, MaxPrefixAction, NexthopChoice, resolve_templates,
+    Afi, BgpConnection, BgpParams, BgpRedistribute, LocalRole, MaxPrefixAction, NexthopChoice,
+    resolve_templates,
 };
+use corerouter_model::firewall::AddrMatch;
 use corerouter_model::sealed::Sealed;
 use corerouter_model::{BgpInstance, Config, Issue, Routing};
 
@@ -327,12 +330,127 @@ pub fn frr_header(inst: &BgpInstance) -> String {
 /// Every instance of `routing`, rendered (connections grouped by instance
 /// in one pass: O(instances + connections)).
 pub fn render_all(routing: &Routing, open: Opener<'_>) -> Result<String, String> {
+    render_with_lists(routing, None, open)
+}
+
+/// [`render_all`] with the address lists the connections' `output_network`
+/// names (G3.9fa); `render_all` alone announces no network.
+pub fn render_config(cfg: &Config, open: Opener<'_>) -> Result<String, String> {
+    render_with_lists(&cfg.routing, Some(cfg), open)
+}
+
+/// G3.9fa: whether the BGP render of `to` differs from that of `from`
+/// outside `routing`: a changed address list while some connection or
+/// template announces one (`output_network`), or changed static routes
+/// while one redistributes them. Without it, adding an entry to the list
+/// reached FRR only at the next routing commit (seen in the lab). O(1)
+/// when both are shared, as in every commit that leaves them alone.
+pub fn networks_changed(from: &Config, to: &Config) -> bool {
+    let (a, b) = (
+        &from.ip.firewall.address_lists,
+        &to.ip.firewall.address_lists,
+    );
+    let lists = !(AddressLists::ptr_eq(a, b) || a == b);
+    let (x, y) = (&from.ip.routes, &to.ip.routes);
+    let statics = !(corerouter_model::cow_list::CowList::ptr_eq(x, y) || x == y);
+    if !lists && !statics {
+        return false;
+    }
+    let r = &to.routing;
+    let params = r
+        .bgp_connections
+        .values()
+        .map(|c| &c.params)
+        .chain(r.bgp_templates.values().map(|t| &t.params));
+    let mut uses = params.filter(|p| {
+        (lists && p.output_network.is_some())
+            || (statics
+                && p.output_redistribute
+                    .as_ref()
+                    .is_some_and(|v| v.contains(&BgpRedistribute::Static)))
+    });
+    uses.next().is_some()
+}
+
+/// G3.9fa: the route-map (and prefix-list, same name) that lets
+/// `redistribute kernel` take only CoreRouter's static routes. The linux
+/// backend installs them itself (`proto static`), so zebra sees them as
+/// kernel routes: `redistribute static` (staticd's) finds none.
+fn static_map(afi: Afi) -> &'static str {
+    match afi {
+        Afi::Ip => "CR-BGP-STATIC4",
+        Afi::Ipv6 => "CR-BGP-STATIC6",
+    }
+}
+
+/// The static routes of the main table, by family (what
+/// `output_redistribute=static` announces).
+fn static_prefixes(cfg: &Config, afi: Afi) -> std::collections::BTreeSet<ipnet::IpNet> {
+    cfg.ip
+        .routes
+        .iter()
+        .filter(|r| !r.disabled && r.routing_table.is_main())
+        .map(|r| r.dst_address.trunc())
+        .filter(|n| {
+            matches!(
+                (afi, n),
+                (Afi::Ip, ipnet::IpNet::V4(_)) | (Afi::Ipv6, ipnet::IpNet::V6(_))
+            )
+        })
+        .collect()
+}
+
+/// The prefix-lists and route-maps of [`static_map`], when a connection
+/// redistributes static routes.
+fn static_maps(cfg: &Config) -> String {
+    let wanted = cfg
+        .routing
+        .bgp_connections
+        .values()
+        .any(|c| c.params.output_redistribute.is_some())
+        || cfg
+            .routing
+            .bgp_templates
+            .values()
+            .any(|t| t.params.output_redistribute.is_some());
+    let mut s = String::new();
+    if !wanted {
+        return s;
+    }
+    for afi in [Afi::Ip, Afi::Ipv6] {
+        let nets = static_prefixes(cfg, afi);
+        if nets.is_empty() {
+            continue;
+        }
+        let (kw, m) = match afi {
+            Afi::Ip => ("ip", "ip"),
+            Afi::Ipv6 => ("ipv6", "ipv6"),
+        };
+        let name = static_map(afi);
+        for (i, n) in nets.iter().enumerate() {
+            let _ = writeln!(s, "{kw} prefix-list {name} seq {} permit {n}", (i + 1) * 5);
+        }
+        let _ = writeln!(s, "route-map {name} permit 10");
+        let _ = writeln!(s, " match {m} address prefix-list {name}");
+        let _ = writeln!(s, "exit");
+    }
+    s
+}
+
+fn render_with_lists(
+    routing: &Routing,
+    cfg: Option<&Config>,
+    open: Opener<'_>,
+) -> Result<String, String> {
     let resolved = resolve_templates(&routing.bgp_templates);
     let mut by_inst: BTreeMap<&str, Vec<&BgpConnection>> = BTreeMap::new();
     for c in routing.bgp_connections.values() {
         by_inst.entry(c.instance.as_str()).or_default().push(c);
     }
     let (mut s, _) = filter_render(routing);
+    if let Some(cfg) = cfg {
+        s.push_str(&static_maps(cfg));
+    }
     for inst in routing.bgp.values() {
         let conns = by_inst
             .get(inst.name.as_str())
@@ -344,7 +462,14 @@ pub fn render_all(routing: &Routing, open: Opener<'_>) -> Result<String, String>
                 .map_err(|e| format!("connection {}: {e}", c.name))?;
             eff.push((*c, p));
         }
-        render_instance(&mut s, inst, &eff, open, !rpki::enabled(routing).is_empty())?;
+        render_instance(
+            &mut s,
+            inst,
+            &eff,
+            cfg,
+            open,
+            !rpki::enabled(routing).is_empty(),
+        )?;
     }
     // G3.2c: the `rpki` node and its route-map, after the instances.
     s.push_str(&rpki::render_frr(routing));
@@ -356,7 +481,7 @@ pub fn render_all(routing: &Routing, open: Opener<'_>) -> Result<String, String>
 pub fn render_frr(inst: &BgpInstance) -> String {
     let mut s = String::new();
     // No neighbors: no key to open.
-    let _ = render_instance(&mut s, inst, &[], &|_| None, false);
+    let _ = render_instance(&mut s, inst, &[], None, &|_| None, false);
     s
 }
 
@@ -370,6 +495,7 @@ fn render_instance(
     s: &mut String,
     inst: &BgpInstance,
     neighbors: &[(&BgpConnection, BgpParams)],
+    cfg: Option<&Config>,
     open: Opener<'_>,
     rpki: bool,
 ) -> Result<(), String> {
@@ -380,8 +506,8 @@ fn render_instance(
     if inst.disabled {
         let _ = writeln!(s, " bgp shutdown");
     }
-    let mut v4 = String::new();
-    let mut v6 = String::new();
+    let mut v4 = origination(neighbors, cfg, Afi::Ip);
+    let mut v6 = origination(neighbors, cfg, Afi::Ipv6);
     for (c, p) in neighbors {
         neighbor(s, inst, c, p, open)?;
         for afi in p.families() {
@@ -416,6 +542,71 @@ fn render_instance(
     }
     let _ = writeln!(s, "exit");
     Ok(())
+}
+
+/// G3.9fa: the `network` and `redistribute` lines of one address family,
+/// in the order `bgpd` prints them. FRR originates per instance, not per
+/// neighbor: the union of what the instance's connections of that family
+/// ask for (RouterOS `output.network` / `output.redistribute`); a
+/// connection that should not send some of it says so in its output chain.
+/// O(connections + entries of the named lists).
+fn origination(
+    neighbors: &[(&BgpConnection, BgpParams)],
+    cfg: Option<&Config>,
+    afi: Afi,
+) -> String {
+    let lists = cfg.map(|c| &c.ip.firewall.address_lists);
+    let mut redist = std::collections::BTreeSet::new();
+    let mut names = std::collections::BTreeSet::new();
+    for (_, p) in neighbors
+        .iter()
+        .filter(|(_, p)| p.families().contains(&afi))
+    {
+        redist.extend(p.output_redistribute.iter().flatten().copied());
+        names.extend(p.output_network.as_deref());
+    }
+    let mut nets = std::collections::BTreeSet::new();
+    if let Some(lists) = lists
+        && !names.is_empty()
+    {
+        for e in lists
+            .iter()
+            .filter(|e| !e.disabled && names.contains(e.list.as_str()))
+        {
+            // A range is no prefix: left out (the connection check says so).
+            if let AddrMatch::Net(n) = e.address
+                && matches!(
+                    (afi, n),
+                    (Afi::Ip, ipnet::IpNet::V4(_)) | (Afi::Ipv6, ipnet::IpNet::V6(_))
+                )
+            {
+                nets.insert(n.trunc());
+            }
+        }
+    }
+    let mut s = String::new();
+    for n in nets {
+        let _ = writeln!(s, "  network {n}");
+    }
+    for r in redist {
+        let line = match (r, afi) {
+            (BgpRedistribute::Connected, _) => "redistribute connected".to_owned(),
+            // No static route of the family: nothing to announce (and no
+            // route-map to name).
+            (BgpRedistribute::Static, _)
+                if cfg.is_none_or(|c| static_prefixes(c, afi).is_empty()) =>
+            {
+                continue;
+            }
+            (BgpRedistribute::Static, _) => {
+                format!("redistribute kernel route-map {}", static_map(afi))
+            }
+            (BgpRedistribute::Ospf, Afi::Ip) => "redistribute ospf".to_owned(),
+            (BgpRedistribute::Ospf, Afi::Ipv6) => "redistribute ospf6".to_owned(),
+        };
+        let _ = writeln!(s, "  {line}");
+    }
+    s
 }
 
 fn role_of(inst: &BgpInstance, p: &BgpParams) -> LocalRole {
@@ -465,6 +656,10 @@ fn neighbor(
     // G3.6b: the session follows BFD (`bfdd`, with CoreRouter's engine as
     // its data plane).
     if let Some(b) = &p.bfd {
+        // G3.9f: `bgpd` 10.7.1 prints both lines; with the second alone
+        // every sync typed `no neighbor X bfd`, which turns BFD off (seen
+        // in the lab: a silent cut fell back to the hold timer).
+        let _ = writeln!(s, " neighbor {a} bfd");
         let _ = writeln!(s, " neighbor {a} bfd profile {b}");
     }
     if p.hold_time.is_some() || p.keepalive_time.is_some() {
@@ -502,6 +697,10 @@ pub fn timers(p: &BgpParams) -> (u16, u16) {
 fn neighbor_af(s: &mut String, c: &BgpConnection, p: &BgpParams, afi: Afi) {
     let a = c.remote_address;
     let _ = writeln!(s, "  neighbor {a} activate");
+    // G3.9fb: RouterOS `local.role=ibgp-rr`, RFC 4456 §6.
+    if p.local_role == Some(LocalRole::IbgpRr) {
+        let _ = writeln!(s, "  neighbor {a} route-reflector-client");
+    }
     match p.nexthop_choice.unwrap_or_default() {
         NexthopChoice::Default => {}
         NexthopChoice::ForceSelf => {
@@ -677,6 +876,151 @@ mod tests {
         // neighbor without its key.
         let e = render_all(&cfg.routing, &|_| None).unwrap_err();
         assert!(e.contains("up1") && !e.contains("box"), "{e}");
+    }
+
+    /// G3.9fa/G3.9fb: `output_network`, `output_redistribute` and the
+    /// `ibgp-rr` role, in the form `bgpd` 10.7.1 prints them (seen on the
+    /// lab VM against RouterOS 7.25).
+    #[test]
+    fn renders_origination_and_reflection() {
+        use corerouter_model::firewall::AddressListEntry;
+        use corerouter_model::types::ItemId;
+        let mut cfg = cfg_with(vec![
+            conn(
+                "chr",
+                "10.39.1.1",
+                BgpParams {
+                    remote_as: Some(Asn(65001)),
+                    afi: Some(vec![Afi::Ip, Afi::Ipv6]),
+                    output_network: Some("bgp-out".into()),
+                    output_redistribute: Some(vec![BgpRedistribute::Connected]),
+                    ..Default::default()
+                },
+            ),
+            conn(
+                "client",
+                "10.39.4.2",
+                BgpParams {
+                    local_role: Some(LocalRole::IbgpRr),
+                    output_redistribute: Some(vec![
+                        BgpRedistribute::Ospf,
+                        BgpRedistribute::Connected,
+                    ]),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        for (id, list, a, disabled) in [
+            (1, "bgp-out", "100.64.39.0/24", false),
+            (2, "bgp-out", "fd39:64::/48", false),
+            (3, "bgp-out", "198.18.39.7", false),
+            (4, "bgp-out", "198.18.40.0/24", true),
+            (5, "other", "203.0.113.0/24", false),
+            (6, "bgp-out", "10.1.1.1-10.1.1.9", false),
+        ] {
+            cfg.ip.firewall.address_lists.push(AddressListEntry {
+                id: ItemId(id),
+                list: list.parse().unwrap(),
+                address: a.parse().unwrap(),
+                disabled,
+                comment: String::new(),
+            });
+        }
+        assert_eq!(validate(&cfg), Vec::new());
+        let text = render_config(&cfg, &|_| None).unwrap();
+        let v4 = text.split(" address-family ipv4 unicast\n").nth(1).unwrap();
+        let v4 = v4.split(" exit-address-family").next().unwrap();
+        assert_eq!(
+            v4,
+            "  network 100.64.39.0/24\n  network 198.18.39.7/32\n  redistribute connected\n  \
+             redistribute ospf\n  neighbor 10.39.1.1 activate\n  \
+             neighbor 10.39.1.1 soft-reconfiguration inbound\n  neighbor 10.39.4.2 activate\n  \
+             neighbor 10.39.4.2 route-reflector-client\n  \
+             neighbor 10.39.4.2 soft-reconfiguration inbound\n"
+        );
+        // IPv6: only chr has the family, so only its origination.
+        let v6 = text.split(" address-family ipv6 unicast\n").nth(1).unwrap();
+        assert!(
+            v6.starts_with(
+                "  network fd39:64::/48\n  redistribute connected\n  neighbor 10.39.1.1 activate\n"
+            ),
+            "{v6}"
+        );
+        assert!(!v6.contains("ospf6"), "{v6}");
+        assert!(
+            text.contains(" neighbor 10.39.4.2 remote-as internal\n"),
+            "ibgp-rr is iBGP: {text}"
+        );
+        // Without the lists (render_all), no network line.
+        assert!(
+            !render_all(&cfg.routing, &|_| None)
+                .unwrap()
+                .contains("  network ")
+        );
+    }
+
+    /// G3.9fa: CoreRouter's static routes are kernel routes to zebra (the
+    /// linux backend installs them, `proto static`): `static` becomes
+    /// `redistribute kernel` limited to them (seen on FRR 10.7.1: zebra
+    /// lists them as "kernel", `redistribute static` announced nothing).
+    #[test]
+    fn static_redistribution_and_what_triggers_a_sync() {
+        let route = |id: u32, dst: &str, disabled: bool| corerouter_model::RouteEntry {
+            id: corerouter_model::ItemId(id),
+            dst_address: dst.parse().unwrap(),
+            gateway: corerouter_model::Gateway::ip("192.0.2.254".parse().unwrap()),
+            distance: 1,
+            routing_table: corerouter_model::RoutingTable::Main,
+            disabled,
+            comment: String::new(),
+            check_gateway: Default::default(),
+            bfd_profile: String::new(),
+        };
+        let mut cfg = cfg_with(vec![conn(
+            "up",
+            "192.0.2.1",
+            BgpParams {
+                remote_as: Some(Asn(64500)),
+                output_redistribute: Some(vec![BgpRedistribute::Static]),
+                ..Default::default()
+            },
+        )]);
+        let before = cfg.clone();
+        cfg.ip.routes.push(route(1, "198.18.98.0/24", false));
+        cfg.ip.routes.push(route(2, "198.18.97.7/24", false));
+        cfg.ip.routes.push(route(3, "198.18.96.0/24", true));
+        let text = render_config(&cfg, &|_| None).unwrap();
+        assert!(
+            text.starts_with(
+                "ip prefix-list CR-BGP-STATIC4 seq 5 permit 198.18.97.0/24\n\
+                 ip prefix-list CR-BGP-STATIC4 seq 10 permit 198.18.98.0/24\n\
+                 route-map CR-BGP-STATIC4 permit 10\n match ip address prefix-list CR-BGP-STATIC4\nexit\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("  redistribute kernel route-map CR-BGP-STATIC4\n"),
+            "{text}"
+        );
+        assert!(!text.contains("STATIC6"), "no IPv6 static route: {text}");
+        // No static route: no redistribute line, no map.
+        let empty = render_config(&before, &|_| None).unwrap();
+        assert!(
+            !empty.contains("redistribute") && !empty.contains("CR-BGP-STATIC"),
+            "{empty}"
+        );
+        // A static route change matters to BGP only while one redistributes them.
+        assert!(networks_changed(&before, &cfg));
+        assert!(!networks_changed(&cfg, &cfg.clone()));
+        let mut other = before.clone();
+        other
+            .routing
+            .bgp_connections
+            .values_mut()
+            .for_each(|c| c.params.output_redistribute = None);
+        let mut other2 = other.clone();
+        other2.ip.routes.push(route(1, "198.18.98.0/24", false));
+        assert!(!networks_changed(&other, &other2));
     }
 
     #[test]

@@ -214,6 +214,10 @@ pub enum InterfaceKind {
     Vlan {
         parent: IfName,
         vlan_id: VlanId,
+        /// Outer tag of a QinQ stack: TPID 0x88a8 (IEEE 802.1ad S-tag, the
+        /// RouterOS `use-service-tag=yes`) instead of 0x8100 (802.1Q).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        service_tag: bool,
     },
     Bridge,
     Loopback,

@@ -19,6 +19,9 @@ use socket2::{Domain, Protocol, Socket, Type};
 use crate::l2::{if_info, io_err};
 
 const RECV_BUDGET: usize = 256;
+/// Receive buffer of the server's sockets: a SOLICIT storm must not
+/// overflow the default between two rounds (as DHCPv4, G0.31).
+const RCVBUF: usize = 4 << 20;
 
 fn read(sock: &UdpSocket, name: &str) -> Result<Option<Heard6>, HalError> {
     let mut buf = [0u8; MAX_MESSAGE];
@@ -59,6 +62,7 @@ impl LinuxDhcp6ServerPort {
         sock.set_only_v6(true)?;
         sock.set_reuse_address(true)?;
         sock.set_nonblocking(true)?;
+        crate::l2::rcvbuf(&sock, RCVBUF);
         sock.bind_device(Some(name.as_str().as_bytes()))?;
         sock.set_multicast_loop_v6(false)?;
         sock.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, SERVER_PORT6)).into())?;
@@ -110,6 +114,7 @@ impl LinuxDhcp6Uplink {
         sock.set_only_v6(true)?;
         sock.set_reuse_address(true)?;
         sock.set_nonblocking(true)?;
+        crate::l2::rcvbuf(&sock, RCVBUF);
         sock.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, SERVER_PORT6)).into())?;
         Ok(Self { sock: sock.into() })
     }

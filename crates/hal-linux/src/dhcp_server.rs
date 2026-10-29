@@ -38,6 +38,11 @@ const BROADCAST_MAC: [u8; 6] = [0xff; 6];
 const PACKET_OUTGOING: u8 = 4;
 /// Frames read per call.
 const RECV_BUDGET: usize = 256;
+/// Receive buffer of the server's sockets. The default (`rmem_default`,
+/// 208 KiB) holds ~100 small frames, so a DISCOVER storm after an outage
+/// overflowed it between two rounds and the dropped clients waited for
+/// their retransmission (4 s and up, RFC 2131 §4.1): G0.31, **medido**.
+const RCVBUF: usize = 4 << 20;
 /// Addresses being probed at once.
 const MAX_PROBING: usize = 4096;
 
@@ -77,6 +82,7 @@ fn ip_socket(link: &LinkAddr) -> io::Result<Socket> {
     let proto = Protocol::from(i32::from(ETH_P_IP.to_be()));
     let sock = Socket::new(Domain::PACKET, Type::RAW, Some(proto))?;
     sock.set_nonblocking(true)?;
+    crate::l2::rcvbuf(&sock, RCVBUF);
     sock.attach_filter(&server_filter())?;
     bind(sock.as_raw_fd(), link).map_err(io_err)?;
     // Frames queued before the filter was attached: drop them.
@@ -379,6 +385,7 @@ impl LinuxDhcpUplink {
         let udp = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         udp.set_reuse_address(true)?;
         udp.set_nonblocking(true)?;
+        crate::l2::rcvbuf(&udp, RCVBUF);
         udp.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, SERVER_PORT)).into())?;
         Ok(Self { udp: udp.into() })
     }

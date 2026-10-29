@@ -34,7 +34,7 @@ Seconds without a message from the neighbor before the session is closed (RFC 42
     (r##"bgp.param.keepalive_time"##, r##"## What it is
 Seconds between KEEPALIVEs. Empty: a third of the hold time (RFC 4271 §10). Must be shorter than the hold time."##),
     (r##"bgp.param.local_role"##, r##"## What it is
-RouterOS `local.role`: `ibgp` (same AS) or `ebgp`; the `ebgp-provider`, `-customer`, `-peer`, `-rs`, `-rs-client` roles are announced in the OPEN (RFC 9234) and let both sides catch a route leak.
+RouterOS `local.role`: `ibgp` (same AS), `ibgp-rr` (iBGP where this router reflects routes to the neighbor, its client, RFC 4456) or `ebgp`; the `ebgp-provider`, `-customer`, `-peer`, `-rs`, `-rs-client` roles are announced in the OPEN (RFC 9234) and let both sides catch a route leak.
 
 ## Default
 Empty: from the remote AS (ours → ibgp, other → ebgp)."##),

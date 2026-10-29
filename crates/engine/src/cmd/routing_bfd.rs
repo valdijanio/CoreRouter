@@ -775,7 +775,7 @@ mod tests {
         )
         .unwrap();
         let conf = corerouter_proto_bgp::render_all(&s.store().running().routing, &|_| None).unwrap();
-        assert!(conf.contains(" neighbor 192.0.2.6 bfd profile fast\n"), "{conf}");
+        assert!(conf.contains(" neighbor 192.0.2.6 bfd\n neighbor 192.0.2.6 bfd profile fast\n"), "{conf}");
         let bfd = corerouter_proto_bfd::frr::render(s.store().running());
         assert!(bfd.starts_with("bfd\n profile default\n"), "{bfd}");
         // A profile nobody defined is refused at commit.

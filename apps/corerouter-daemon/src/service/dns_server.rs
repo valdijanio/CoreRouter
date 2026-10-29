@@ -10,8 +10,9 @@
 //! - "dns-server": every second, copies the running config into the
 //!   forwarder when it changed, and opens or closes the sockets as
 //!   `allow_remote_requests` says.
-//! - one UDP thread per family: reads a query and runs the chain up to the
-//!   cache; a cache hit is answered at once. A miss gets a thread of its
+//! - up to four UDP threads per family on one socket ([`udp_threads`]):
+//!   each reads a query and runs the chain up to the cache; a cache hit is
+//!   answered at once. A miss gets a thread of its
 //!   own, at most `max_concurrent_queries` of them (more: SERVFAIL), so
 //!   one slow upstream never holds the cache hits back.
 //! - one TCP thread per family; a thread per connection, at most
@@ -487,6 +488,16 @@ fn is_lab(session: &Shared) -> bool {
     lock(session).backend().starts_with("virtual lab")
 }
 
+/// Readers of each UDP socket: half the cores, 1 to 4. One thread answered
+/// at most ~340 000 cache hits a second at 100 % of a core with the other
+/// cores free; the chain's locks (statistics, per-client limit, cache) let
+/// several scale: 2 threads 577 000/s, 4 threads 964 000/s (G0.31,
+/// **medido**). The kernel hands each datagram to one waiting reader.
+fn udp_threads() -> usize {
+    let cores = thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    (cores / 2).clamp(1, 4)
+}
+
 /// The sockets of one epoch, their threads counted in `health`; where
 /// they listen.
 fn open(
@@ -513,10 +524,13 @@ fn open(
     }
     let at = opened.iter().map(|(_, _, a)| *a).collect();
     for (udp, tcp, _) in opened {
-        let s = srv.clone();
-        health
-            .spawn("dns-udp", move || udp_loop(s, udp, epoch))
-            .map_err(|e| e.to_string())?;
+        for _ in 0..udp_threads() {
+            let s = srv.clone();
+            let udp = udp.clone();
+            health
+                .spawn("dns-udp", move || udp_loop(s, udp, epoch))
+                .map_err(|e| e.to_string())?;
+        }
         let s = srv.clone();
         health
             .spawn("dns-tcp-accept", move || tcp_loop(s, tcp, epoch))
@@ -810,6 +824,12 @@ mod sock {
 
     use super::POLL;
 
+    /// Receive buffer of each UDP socket: with the default (`rmem_default`,
+    /// 208 KiB) a burst of 4096 queries in flight lost 27 392 of them in
+    /// 6 s, dropped by the kernel before a reader got them (G0.31,
+    /// **medido**). `SO_RCVBUFFORCE` as root, else up to `rmem_max`.
+    const RCVBUF: usize = 4 << 20;
+
     /// A UDP socket that knows each query's destination address.
     pub(super) struct Udp {
         sock: UdpSocket,
@@ -831,6 +851,9 @@ mod sock {
             let fd: OwnedFd = socket(family, SockType::Datagram, SockFlag::SOCK_CLOEXEC, None)
                 .map_err(nix_io)?;
             setsockopt(&fd, sockopt::ReuseAddr, &true).map_err(nix_io)?;
+            if setsockopt(&fd, sockopt::RcvBufForce, &RCVBUF).is_err() {
+                let _ = setsockopt(&fd, sockopt::RcvBuf, &RCVBUF);
+            }
             match addr {
                 SocketAddr::V4(a) => {
                     setsockopt(&fd, sockopt::Ipv4PacketInfo, &true).map_err(nix_io)?;
@@ -1164,6 +1187,43 @@ mod tests {
         let srv = spawn(session.clone(), Arc::new(RouterDns::new()), port, shutdown.clone()).unwrap();
         wait("the listener", || udp(port, &query("nas.lan.", RecordType::A)).is_some());
         (session, srv, port, shutdown)
+    }
+
+    /// G3.9h: several readers share one UDP socket. Clients in parallel
+    /// each get their own answer (the id they asked with), and turning the
+    /// forwarder off stops every reader, not just one.
+    #[test]
+    fn parallel_clients_share_the_udp_readers() {
+        let (session, srv, port, shutdown) = lab();
+        assert!((1..=4).contains(&udp_threads()));
+        thread::scope(|s| {
+            for c in 0..8u16 {
+                s.spawn(move || {
+                    let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+                    sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                    for i in 0..50u16 {
+                        let id = c * 1000 + i;
+                        let mut m = Message::query();
+                        m.metadata.id = id;
+                        m.metadata.recursion_desired = true;
+                        m.add_query(Query::query(Name::from_ascii("nas.lan.").unwrap(), RecordType::A));
+                        sock.send_to(&m.to_vec().unwrap(), ("127.0.0.1", port)).unwrap();
+                        let mut buf = [0u8; 512];
+                        let n = sock.recv(&mut buf).unwrap();
+                        let r = Message::from_vec(&buf[..n]).unwrap();
+                        assert_eq!(r.metadata.id, id);
+                        assert_eq!(r.answers[0].data.to_string(), "192.168.88.2");
+                    }
+                });
+            }
+        });
+        lock(&session)
+            .execute("ip.dns.set", &json!({"allow_remote_requests": false}))
+            .unwrap();
+        // Every reader is gone: no answer at all for a few polls in a row.
+        wait("all readers to stop", || (0..4).all(|_| udp(port, &query("nas.lan.", RecordType::A)).is_none()));
+        shutdown.close();
+        drop(srv);
     }
 
     #[cfg(target_os = "linux")]

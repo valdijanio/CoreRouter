@@ -31,6 +31,9 @@ use corerouter_hal::system_resource::{
     SensorKind, Want, cut_name,
 };
 
+/// Most descriptors counted per process (a reading of the processes lists
+/// each `/proc/<pid>/fd`; a runaway process with millions stops here).
+const MAX_FDS: usize = 1 << 16;
 /// Largest file read (`/proc/interrupts` of a 256-CPU box is ~1 MiB).
 const MAX_FILE: u64 = 4 << 20;
 /// Hottest and coldest temperature believed, °C: outside it is a broken
@@ -351,6 +354,13 @@ pub fn parse_mounts(text: &str) -> Vec<(String, String, String)> {
     out
 }
 
+/// Entries of `/proc/<pid>/fd` (a process's open descriptors), at most
+/// [`MAX_FDS`] counted; `None` when the directory cannot be read.
+fn count_fds(dir: &std::path::Path) -> Option<u32> {
+    let n = std::fs::read_dir(dir).ok()?.take(MAX_FDS).count();
+    u32::try_from(n).ok()
+}
+
 /// `/proc/<pid>/stat`. The name is between the first `(` and the last `)`
 /// (it may hold spaces and parentheses).
 pub fn parse_pid_stat(text: &str, page_size: u64) -> Option<Process> {
@@ -370,6 +380,7 @@ pub fn parse_pid_stat(text: &str, page_size: u64) -> Option<Process> {
         threads: n(17).and_then(|v| u32::try_from(v).ok()).unwrap_or(0),
         cpu_ticks: n(11)?.saturating_add(n(12)?),
         rss_bytes: n(21).unwrap_or(0).saturating_mul(page_size),
+        fds: None,
     })
 }
 
@@ -712,7 +723,11 @@ impl Collector {
                     .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
             })
             .take(MAX_PROCESSES)
-            .filter_map(|e| parse_pid_stat(&read(&e.path().join("stat"))?, self.page_size))
+            .filter_map(|e| {
+                let mut p = parse_pid_stat(&read(&e.path().join("stat"))?, self.page_size)?;
+                p.fds = count_fds(&e.path().join("fd"));
+                Some(p)
+            })
             .collect()
     }
 

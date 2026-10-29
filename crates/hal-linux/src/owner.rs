@@ -408,6 +408,7 @@ mod tests {
                 InterfaceKind::Vlan {
                     parent: n("ether1"),
                     vlan_id: VlanId::new(10).unwrap(),
+                    service_tag: false,
                 },
             ),
             ("lo1", InterfaceKind::Loopback),

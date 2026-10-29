@@ -88,6 +88,33 @@ pub fn hang_up(host: &mut dyn Host, caller: &Caller) {
     });
 }
 
+/// `engine.list` with `{if_none_match: etag}` (G1.6q): `{etag, commands}`,
+/// or `{etag, unchanged: true}` when the client already has this catalogue
+/// (~300 KB that a GUI asked for every second). Without the parameter, the
+/// bare list, as before (CLI, MCP, older GUIs).
+pub fn catalogue_reply(list: Value, params: &Value) -> Value {
+    let Some(seen) = params.get("if_none_match") else {
+        return list;
+    };
+    let etag = catalogue_etag(&list);
+    if seen.as_str() == Some(etag.as_str()) {
+        json!({ "etag": etag, "unchanged": true })
+    } else {
+        json!({ "etag": etag, "commands": list })
+    }
+}
+
+/// FNV-1a (64 bits) of the catalogue's JSON: the same list gives the same
+/// tag in any process and across restarts.
+fn catalogue_etag(list: &Value) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in list.to_string().bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
 /// [`dispatch_as`] for a caller inside this process.
 pub fn dispatch(host: &mut dyn Host, method: &str, params: &Value) -> Result<Value, String> {
     dispatch_as(host, &Caller::local(), method, params)
@@ -120,7 +147,10 @@ pub fn dispatch_as(
                 }))
             })
         }
-        "engine.list" => host.with_session(&mut |s| Ok(s.list_as(caller))),
+        "engine.list" => {
+            let list = host.with_session(&mut |s| Ok(s.list_as(caller)))?;
+            Ok(catalogue_reply(list, params))
+        }
         "engine.execute" => {
             let id = params
                 .get("command")
@@ -163,6 +193,7 @@ pub fn dispatch_as(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use corerouter_engine::shared;
 
     #[test]
     fn dispatches_on_a_bare_session() {
@@ -200,6 +231,38 @@ mod tests {
         fn forward(&mut self, method: &str, _params: &Value) -> Option<Result<Value, String>> {
             Some(Ok(json!({ "forwarded": method })))
         }
+    }
+
+    #[test]
+    fn the_catalogue_is_not_sent_again_unchanged() {
+        let mut h = SharedHost(shared(Session::virtual_lab()));
+        let bare = dispatch(&mut h, "engine.list", &Value::Null).unwrap();
+        assert!(
+            bare.as_array().is_some_and(|l| l.len() > 100),
+            "old clients: the list"
+        );
+        let first = dispatch(&mut h, "engine.list", &json!({"if_none_match": ""})).unwrap();
+        let etag = first["etag"].as_str().unwrap().to_owned();
+        assert_eq!(first["commands"], bare);
+        let again = dispatch(&mut h, "engine.list", &json!({"if_none_match": etag})).unwrap();
+        assert_eq!(again, json!({"etag": etag, "unchanged": true}));
+        assert!(again.to_string().len() < 100);
+        // What greys commands out changed (a pending change): sent again.
+        dispatch(
+            &mut h,
+            "engine.execute",
+            &json!({"command": "config.mode.set", "params": {"mode": "transactional"}}),
+        )
+        .unwrap();
+        dispatch(
+            &mut h,
+            "engine.execute",
+            &json!({"command": "system.identity.set", "params": {"name": "x"}}),
+        )
+        .unwrap();
+        let changed = dispatch(&mut h, "engine.list", &json!({"if_none_match": etag})).unwrap();
+        assert_ne!(changed["etag"], json!(etag));
+        assert!(changed["commands"].is_array());
     }
 
     #[test]

@@ -235,3 +235,9 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-29 — G0.29 feito (portão local só do afetado, 2 vagas de CI, testes de integração num executável por crate)
 - 2026-10-29 — G0.30 criado (orçamento de testes: o tempo do portão não cresce com o número de testes)
 - 2026-10-29 — G0.30 feito (orçamento de testes)
+- 2026-10-29 — G0.31 criado (auditoria de desempenho e paralelismo do daemon)
+- 2026-10-29 — G1.6q criado e feito (teste de produção da imagem instalada); G1.6qa–G1.6qe criados
+- 2026-10-29 — G3.9h criada (interoperabilidade de L2 e serviços com o RouterOS 7.25 e entre CoreRouters); G3.9ha–G3.9hc criadas
+- 2026-10-29 — G4.3hk criada e feita (instabilidade do `netns_ha_pppoe`: dois defeitos do par HA do BNG, não do teste)
+- 2026-10-29 — G3.9f criado (interoperabilidade BGP), parte 1 feita (CoreRouter × CoreRouter e FRR no host; o CHR na VM vem no PR seguinte); G3.9fb–G3.9ff criados
+- 2026-10-29 — G3.9fe feito (OSPF anuncia as estáticas do CoreRouter)

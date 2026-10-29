@@ -401,6 +401,33 @@ fn coa_changes_the_rate_live_and_disconnect_ends() {
     assert_eq!((h.event.as_str(), h.reason.as_str()), ("down", "admin"));
 }
 
+/// G4.3hk: the session shows the CoA's rate when the ACK leaves (RFC 5176
+/// §3: the ACK says the change was made), not only after the worker's next
+/// turn: under load that turn came after the RADIUS server (and the netns
+/// test) read the session back.
+#[test]
+fn coa_rate_is_on_the_session_when_the_ack_leaves() {
+    let mut lab = Lab::new(2, snap(2, server(serde_json::json!({})), 100), |i| (format!("u{i}"), format!("p{i}")));
+    lab.start(0..2);
+    lab.run(200, 50);
+    assert_eq!(lab.ups(), 2);
+    let owner = Owner(lab.bng.shared.clone());
+    let req = CoaRequest {
+        kind: CoaKind::Coa,
+        from: "127.0.0.1:3799".parse().unwrap(),
+        selector: CoaSelector { user_name: Some("u0".into()), ..CoaSelector::default() },
+        changes: vec![Attribute::new("Mikrotik-Rate-Limit", "9M/9M")],
+        authorize_only: false,
+        packet: Vec::new(),
+    };
+    assert_eq!(owner.handle(&req), CoaOutcome::Ack);
+    // No worker turn yet.
+    let rate = |lab: &Lab| lab.backend().active().into_iter().find(|a| a.name == "u0").and_then(|a| a.rate_limit);
+    assert_eq!(rate(&lab).as_deref(), Some("9M/9M"));
+    lab.bng.requests(lab.now);
+    assert_eq!(rate(&lab).as_deref(), Some("9M/9M"));
+}
+
 #[test]
 fn mass_reconnect_after_cpe_reboots_is_spread_by_the_rate() {
     let n = 2000;
