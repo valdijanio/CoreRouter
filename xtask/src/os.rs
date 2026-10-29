@@ -38,6 +38,7 @@ use crate::vm_lab::{download, sha256_file};
 mod ab;
 mod frr;
 mod install;
+mod push;
 mod web;
 
 const DEFCONFIG: &str = "corerouter_x86_64_defconfig";
@@ -116,7 +117,7 @@ const GUEST_TLS_PORT: u16 = 8729;
 /// G1.6o: `ip.service www-ssl`, on in a new config of the image.
 const GUEST_WEB_PORT: u16 = 443;
 
-const USAGE: &str = "usage: cargo xtask os <build [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|boot-test [--efi] [--tcg] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--scenario update|no-confirm|bad-signature|bad-param]|install-test [--tcg]|frr-test [--tcg]|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
+const USAGE: &str = "usage: cargo xtask os <build [--only crpkg] [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|push --to HOST:PORT [--user U] [--no-build] [--no-wait] [--confirm manual]|boot-test [--efi] [--tcg] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--scenario update|no-confirm|bad-signature|bad-param]|install-test [--tcg]|frr-test [--tcg]|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
 
 pub fn main(root: &Path, args: &[String]) -> Outcome {
     let (sub, rest) = match args.split_first() {
@@ -130,6 +131,7 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
         "install-test" => images_dir(root).and_then(|i| install::install_test(root, &i, rest)),
         "frr-test" => images_dir(root).and_then(|i| frr::frr_test(root, &i, rest)),
         "package" => images_dir(root).and_then(|i| package_cmd(root, &i, rest)),
+        "push" => images_dir(root).and_then(|i| push::push(root, &i, rest)),
         "check" => check(&root.join("os")).map(|n| eprintln!("ok: os/ configuration ({n} checks)")),
         "-h" | "--help" => {
             eprintln!("{USAGE}");
@@ -579,9 +581,19 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
     let mut top_jobs: Option<String> = None;
     let mut key: Option<PathBuf> = None;
     let mut channel = "development".to_owned();
+    let mut only_crpkg = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--only" => match it.next().map(String::as_str) {
+                Some("crpkg") => only_crpkg = true,
+                other => {
+                    return Err(format!(
+                        "--only {}: only 'crpkg' is known",
+                        other.unwrap_or("?")
+                    ));
+                }
+            },
             "--jobs" => jobs = Some(it.next().ok_or("--jobs needs a number")?.clone()),
             "--top-jobs" => top_jobs = Some(it.next().ok_or("--top-jobs needs a number")?.clone()),
             "--key" => key = Some(PathBuf::from(it.next().ok_or("--key needs a file")?)),
@@ -659,6 +671,9 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
             cmd.env_remove(var);
         }
         cmd.env("COREROUTER_COMMIT", &commit);
+        if only_crpkg {
+            cmd.env("CR_ONLY_CRPKG", "1");
+        }
         for (k, v) in &seal_env {
             cmd.env(k, v);
         }
@@ -707,8 +722,11 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
         "corerouter-installer-{}",
         kernel_version(&defconfig_text)?
     ));
-    for stamp in [".stamp_built", ".stamp_images_installed"] {
-        let _ = std::fs::remove_file(installer_dir.join(stamp));
+    // G1.6e: `--only crpkg` leaves it (and the ISO) as they are.
+    if !only_crpkg {
+        for stamp in [".stamp_built", ".stamp_images_installed"] {
+            let _ = std::fs::remove_file(installer_dir.join(stamp));
+        }
     }
     // G1.6m: Buildroot applies `os/patches/linux/*.patch` only when it
     // extracts the kernel: changed patches need `linux-dirclean` (then a
@@ -780,6 +798,28 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
             lost.join(" ")
         ));
     }
+    let libs = check_needed(&d.out.join("target"))?;
+    let images = d.out.join("images");
+    if only_crpkg {
+        eprintln!(
+            "\nupdate package only (--only crpkg: disk.img, the ISO and the VM images were not rebuilt):"
+        );
+        for f in ["corerouter.crpkg", "bzImage", "rootfs.img"] {
+            let p = images.join(f);
+            let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            eprintln!(
+                "  {f:<30} {:>8.1} MiB  sha256 {}",
+                len as f64 / 1048576.0,
+                sha256_file(&p).unwrap_or_default()
+            );
+        }
+        eprintln!(
+            "  built in {:.1} s → {}",
+            started.elapsed().as_secs_f64(),
+            images.join("corerouter.crpkg").display()
+        );
+        return Ok(());
+    }
     let ic = std::fs::read_to_string(installer_dir.join(".config"))
         .map_err(|e| format!("installer kernel .config: {e}"))?;
     // (BTF disappears from .config altogether once debug info is off.)
@@ -791,8 +831,6 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
     if ic.lines().any(|l| l == "CONFIG_DEBUG_INFO_BTF=y") {
         return Err("the installer kernel still has BTF".into());
     }
-    let libs = check_needed(&d.out.join("target"))?;
-    let images = d.out.join("images");
     let boot = std::fs::metadata(images.join("installer/EFI/BOOT/BOOTX64.EFI"))
         .map(|m| m.len())
         .unwrap_or(0);

@@ -6,10 +6,23 @@
 //! session lock released, feeding progress and the result back here. The
 //! engine never touches a disk or a boot variable itself (it also runs in
 //! the browser).
+//!
+//! A package sent over the control channel (G1.6e) is a job too: its
+//! chunks go into a bounded queue ([`UPLOAD_QUEUE`] chunks) that the service
+//! reads as a stream and writes to the inactive slot as they arrive. A full
+//! queue answers `busy` (the client resends); nothing waits under the lock.
+
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 
 use serde_json::{Value, json};
 
 use crate::Session;
+
+/// Chunks in flight between the control channel and the slot write: with
+/// [`UPLOAD_CHUNK`], at most 8 MiB of a package is in RAM at a time.
+pub const UPLOAD_QUEUE: usize = 8;
+/// Largest chunk (decoded); the client's default.
+pub const UPLOAD_CHUNK: usize = 1 << 20;
 
 /// What the service is asked to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +40,13 @@ pub enum JobKind {
     Check { path: String },
     /// Re-read slot `slot` and check it against its signed root hash.
     Scrub { slot: String },
+    /// A package of `size` bytes sent over the control channel: installed
+    /// (`downgrade`: an older one), or only checked (`check`).
+    Upload {
+        size: u64,
+        downgrade: bool,
+        check: bool,
+    },
 }
 
 impl JobKind {
@@ -39,6 +59,8 @@ impl JobKind {
             JobKind::Cancel => "cancel",
             JobKind::Check { .. } => "check",
             JobKind::Scrub { .. } => "scrub",
+            JobKind::Upload { check: true, .. } => "upload-check",
+            JobKind::Upload { .. } => "upload",
         }
     }
 
@@ -46,7 +68,10 @@ impl JobKind {
     pub fn arms_trial(&self) -> bool {
         matches!(
             self,
-            JobKind::Update { .. } | JobKind::Downgrade { .. } | JobKind::BootParams { .. }
+            JobKind::Update { .. }
+                | JobKind::Downgrade { .. }
+                | JobKind::BootParams { .. }
+                | JobKind::Upload { check: false, .. }
         )
     }
 }
@@ -80,6 +105,70 @@ pub struct Packages {
     /// The last job's outcome: `{id, kind, ok, result | error}`.
     pub result: Option<Value>,
     pub next_id: u64,
+    /// The upload in progress (G1.6e).
+    pub upload: Option<Upload>,
+}
+
+/// An upload's receiving end in the engine: the chunks go to `tx`, the
+/// service reads the other end (taken with [`take_upload`]).
+#[derive(Debug)]
+pub struct Upload {
+    /// The job it belongs to (the client names it in every chunk).
+    pub job: u64,
+    pub size: u64,
+    pub received: u64,
+    /// `None` once every byte was handed over (end of stream).
+    pub tx: Option<SyncSender<Vec<u8>>>,
+    /// Until the service takes it.
+    pub rx: Option<Receiver<Vec<u8>>>,
+}
+
+/// What [`push_chunk`] did with a chunk.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Pushed {
+    Queued,
+    /// The queue is full (the disk is behind): send the same chunk again.
+    Busy,
+}
+
+impl Upload {
+    pub fn new(job: u64, size: u64) -> Upload {
+        let (tx, rx) = sync_channel(UPLOAD_QUEUE);
+        Upload {
+            job,
+            size,
+            received: 0,
+            tx: Some(tx),
+            rx: Some(rx),
+        }
+    }
+}
+
+/// Hands one chunk to the service. `Err`: the upload is over (the service
+/// stopped reading: the job failed or was aborted).
+pub fn push_chunk(up: &mut Upload, data: Vec<u8>) -> Result<Pushed, String> {
+    let n = data.len() as u64;
+    let tx = up.tx.as_ref().ok_or("every byte was already received")?;
+    match tx.try_send(data) {
+        Ok(()) => {
+            up.received += n;
+            if up.received >= up.size {
+                up.tx = None; // end of stream
+            }
+            Ok(Pushed::Queued)
+        }
+        Err(TrySendError::Full(_)) => Ok(Pushed::Busy),
+        Err(TrySendError::Disconnected(_)) => {
+            up.tx = None;
+            Err("the package service stopped reading this upload".into())
+        }
+    }
+}
+
+/// The service takes the upload's stream with its job.
+pub fn take_upload(s: &mut Session, job: u64) -> Option<Receiver<Vec<u8>>> {
+    let p = s.ext_mut::<Packages>()?;
+    p.upload.as_mut().filter(|u| u.job == job)?.rx.take()
 }
 
 impl Packages {
@@ -120,6 +209,9 @@ pub fn feed_progress(s: &mut Session, phase: &str, done: u64, total: u64) {
 pub fn finish(s: &mut Session, id: u64, kind: &str, out: std::result::Result<Value, String>) {
     if let Some(p) = s.ext_mut::<Packages>() {
         p.running = None;
+        if p.upload.as_ref().is_some_and(|u| u.job == id) {
+            p.upload = None;
+        }
         p.result = Some(match out {
             Ok(v) => json!({"id": id, "kind": kind, "ok": true, "result": v}),
             Err(e) => json!({"id": id, "kind": kind, "ok": false, "error": e}),

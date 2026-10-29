@@ -1,4 +1,4 @@
-# Imagem do sistema (G1.6a, G1.6b, G1.6c, G1.6k, G1.6m)
+# Imagem do sistema (G1.6a, G1.6b, G1.6c, G1.6e, G1.6k, G1.6m)
 
 A imagem que vai no disco do roteador: kernel LTS, rootfs squashfs só de leitura, `/config`
 gravável, `corerouter-init` como PID 1 e `corerouter-daemon` como único serviço. Construída
@@ -15,6 +15,8 @@ cargo xtask os ab-test               # G1.6b: os 4 cenários A/B no QEMU (UEFI, 
 cargo xtask os install-test          # G1.6c: instalador (CD, USB, interativo), qcow2 e OVA no QEMU
 cargo xtask os frr-test              # G1.6k: dois roteadores da imagem com OSPF, SR, LDP e BFD entre eles
 cargo xtask os package --out b.crpkg --version 0.1.1 --build 1800000000  # outro pacote deste build
+cargo xtask os build --only crpkg    # G1.6e: só o pacote de atualização (sem disk.img, ISO, qcow2, OVA)
+cargo xtask os push --to 127.0.0.1:7990   # G1.6e: --only crpkg, envia pela rede, espera o slot novo confirmar
 ```
 
 A/B e atualização: seção "A/B e atualização segura (G1.6b)" abaixo. Instalador, imagens de VM e
@@ -477,8 +479,8 @@ desenvolvimento do mesmo commit; o host tinha outras sessões rodando.
 ### O que ficou de fora e por quê
 
 - **Envio do pacote pela GUI e download pelo canal** (o `install` do MikroTik baixa sozinho):
-  hoje o pacote tem de estar no roteador (arquivo ou dispositivo de bloco). Gap G1.6e, com o
-  streaming direto para o slot (sem cópia em RAM).
+  o envio pelo canal de controle entrou na G1.6e (seção "Pacote pela rede" abaixo); o download
+  por HTTPS de um canal, ainda não.
 - **Watchdog de hardware no boot de teste e Secure Boot (UKI assinado):** um kernel que trava
   antes do init (sem pânico) só volta com um reset; a raiz é conferida pelo hash raiz que está
   na NVRAM, e o kernel na ESP não é assinado. Gap G1.6f.
@@ -1000,3 +1002,142 @@ imagem da `main` (`7a6041d5`) feita no mesmo host:
   11 MiB (wasm-bindgen), guardado em `os/dl/web-tools/`.
 - Captura: a GUI servida pela imagem no QEMU abre a tela de conexão apontando para
   `wss://<host>/ws` com `admin`.
+
+## Pacote pela rede e ciclo rápido de teste (G1.6e)
+
+Até a G1.6b o `.crpkg` tinha de estar no disco do roteador (um arquivo em `/tmp`, um pendrive).
+Agora ele vai pelo **canal de controle** (TLS, ou o canal local de uma GUI com `--control`), em
+blocos, e é gravado no slot inativo **enquanto chega**.
+
+```sh
+# Do PC de desenvolvimento, numa VM que já roda a imagem (sem recriá-la):
+cargo xtask os push --to 127.0.0.1:7990                     # o canal local da GUI que gerencia a VM (token local)
+cargo xtask os push --to 192.0.2.10:8729 --user admin       # direto no roteador, TLS ($COREROUTER_PASSWORD ou prompt)
+cargo xtask os push --to … --no-build --confirm manual      # pacote já construído; confirmação manual
+
+# Qualquer pacote, de qualquer máquina:
+corerouter-cli --connect tls://192.0.2.10:8729 --user admin upload corerouter.crpkg --wait
+corerouter-cli --connect … upload corerouter.crpkg '{"check":true}'    # só confere, não grava
+```
+
+Na GUI: **System › Packages › From this computer** (digite o caminho ou solte o `.crpkg` na
+janela), **Upload and check** ou **Upload and install…**, barra de progresso e **Abort**.
+
+### O ciclo rápido
+
+`os push` faz, e cronometra, cada etapa:
+
+1. `cargo xtask os build --only crpkg`: o build de sempre até o `corerouter-image seal` (rootfs,
+   árvore do dm-verity, manifesto assinado, `corerouter.crpkg`) e para: sem o `disk.img` (o
+   genimage), sem a ISO do instalador e o kernel dele, sem o qcow2 e o OVA;
+2. `corerouter-cli upload --wait`: envia, espera gravar e reler, espera o roteador voltar do
+   reboot **no slot novo** e o boot de teste se confirmar (ou voltar ao anterior: aí falha e
+   diz por quê).
+
+A VM não é recriada: `/config` (com a senha do `admin` e o certificado TLS) fica, o
+`known_hosts` do PC continua valendo e a GUI reconecta sozinha. A versão (`build`) é a hora do
+commit: dois builds do mesmo commit (mudanças ainda não commitadas) têm o mesmo `build`, e
+atualizar para o mesmo `build` é permitido.
+
+### Como funciona
+
+- **Comandos** (`crates/engine/src/cmd/package.rs`): `system.package.upload.start {size, check?,
+  downgrade?, confirm?, timeout?, reboot?}` põe um trabalho na fila (as mesmas regras do
+  `update`: um por vez, nenhum boot de teste pendente, só na imagem A/B) e devolve o id do envio;
+  `system.package.upload.chunk {upload, offset, data}` leva cada bloco em base64 (até 4 MiB
+  decodificados; o cliente manda 1 MiB) **em ordem** (`offset` tem de ser o que já chegou);
+  `system.package.upload.abort` interrompe. O bloco não entra no journal (seria 1 MiB por
+  linha) mas pede o grupo `write`, como o `update`.
+- **Fila limitada, sem esperar sob o lock.** O engine entrega cada bloco a uma fila de 8 blocos
+  (`sync_channel`): no máximo ~8 MiB do pacote em RAM. Fila cheia (o disco atrasou) responde
+  `busy: true` e o cliente manda o mesmo bloco de novo; nada bloqueia com o lock do `Session`.
+- **O serviço `package` lê a fila como um fluxo** (`crates/sysupdate/src/upload.rs`,
+  `ChunkReader`) e chama a mesma instalação de um arquivo (`Platform::install_from`): lê o
+  cabeçalho, **confere a assinatura antes de gravar um byte** e o tamanho declarado contra o do
+  manifesto, grava kernel e rootfs no slot inativo com o SHA-256 no caminho (uma thread lê e
+  hasheia, outra grava), relê o slot sem o cache de páginas e recalcula a árvore do dm-verity, e
+  só então grava o cabeçalho, a entrada de boot e o `BootNext`. Daí em diante é o boot de teste da
+  G1.6b: confirmação automática ou manual, volta sozinho se não confirmar.
+- **Interrupção.** `abort`, a conexão que cai (60 s sem bloco: o envio é abandonado) ou um pacote
+  adulterado (hash do payload diferente) terminam o trabalho com erro; o slot inativo fica sem
+  cabeçalho (não é volta de ninguém) e o slot em uso continua o padrão. Testado no laboratório
+  virtual (`apps/corerouter-daemon/tests/package_upload.rs`), no `sysupdate`
+  (`streamed_install_and_its_failures`) e no QEMU (`ab-test --scenario push`).
+- **O resultado antes do reboot.** O serviço espera 2 s entre o resultado e o reboot, para quem
+  enviou (CLI, GUI) ler o resultado antes de a conexão cair; se cair antes, o `--wait` segue
+  pelo estado depois do reboot.
+
+### O teste em QEMU (`cargo xtask os ab-test --scenario push`)
+
+A imagem A recebe senha do `admin` e um nome (`system.identity.set`); o teste lê a impressão
+digital do certificado no log do daemon e roda `corerouter-cli --connect tls://… --user admin
+--fingerprint … upload b.crpkg --wait` pela rede de usuário do QEMU (encaminhamento de porta para
+o 8729). O roteador grava o slot B, reinicia (cada reboot é um QEMU novo com a mesma NVRAM), o
+boot de teste de B se confirma, e o CLI — que fez login de novo **com a mesma senha** e
+**exigindo o mesmo certificado** — vê B confirmado. O nome continua (o `/config` ficou). Depois um
+pacote cujo daemon nunca responde vai pelo mesmo caminho (`timeout` 30 s): o init reinicia no
+prazo, o firmware boota B, a configuração volta, e o CLI sai com erro dizendo que o slot não
+ficou.
+
+### Pesquisa
+
+Fontes: [MikroTik: Packages](https://help.mikrotik.com/docs/spaces/ROS/pages/40992872/Packages) e
+[Upgrading and installation](https://help.mikrotik.com/docs/spaces/ROS/pages/328142/Upgrading+and+installation),
+[VyOS: update](https://docs.vyos.io/en/latest/installation/update.html),
+[Junos `request system software add`](https://www.juniper.net/documentation/us/en/software/junos/cli-reference/topics/ref/command/request-system-software-add.html),
+[IOS-XE install mode](https://www.cisco.com/c/en/us/td/docs/routers/C8000V/Configuration/c8000v-installation-configuration-guide/m_installing-the-software-using-install-commands.html),
+[RAUC: HTTP streaming](https://rauc.readthedocs.io/en/latest/advanced.html#http-streaming),
+[SWUpdate: streaming](https://sbabic.github.io/swupdate/swupdate.html),
+[Mender: artifact streaming](https://docs.mender.io/overview/artifact).
+
+| Sistema | Como o pacote chega | Grava enquanto chega? |
+|---|---|---|
+| **MikroTik RouterOS v7** | Arrastar o `.npk` para Files (WinBox/WebFig, FTP, SFTP) e reiniciar; ou `/system package update` baixa do canal | Não: o `.npk` fica inteiro no armazenamento e é instalado no reboot |
+| **VyOS** | `add system image <url>` (HTTP/HTTPS/SCP/arquivo) | Não: baixa a ISO inteira, depois copia o squashfs |
+| **Junos** | `request system software add <url>` (FTP/SCP/HTTP) ou um arquivo em `/var/tmp` | Não: o pacote vai para `/var/tmp` primeiro |
+| **IOS-XE** | `copy` para a flash, depois `install add file` | Não: o pacote fica na flash |
+| **RAUC / SWUpdate / Mender** | bundle por HTTP, servidor de atualização ou API local | **Sim**: RAUC (bundle verity por HTTP range), SWUpdate e Mender gravam o stream direto na partição inativa |
+
+**Adotado:** o pacote vai pelo mesmo canal autenticado da GUI/CLI/MCP (sem abrir FTP/SFTP nem
+outra porta), em blocos que vão direto ao slot inativo como no RAUC/SWUpdate/Mender (o roteador não
+precisa de espaço para guardar o pacote — o `/config` tem 64 MiB e o pacote 34–41 MiB), com
+a assinatura conferida antes do primeiro byte. Os nomes seguem o MikroTik (Packages, check,
+install/reboot).
+
+**Melhor que os outros:** a atualização continua um **comando** (journal, permissão de grupo,
+MCP); um envio interrompido não deixa lixo no disco nem muda a caixa; e o `os push` fecha o
+ciclo de teste (build → envio → boot de teste → confirmação) num comando, medindo cada etapa.
+
+### Desempenho e paralelismo
+
+- **Por bloco**, com o lock do `Session`: conferir os parâmetros, decodificar o base64 e pôr na
+  fila. **Medido** (`cargo bench -p corerouter-engine --bench package_upload`): 587 µs por bloco
+  de 1 MiB (1,66 GiB/s, com o build da imagem rodando ao lado), uma vez por MiB enviado. O parse da linha JSON acontece antes, na thread da conexão.
+- **Gravação:** a mesma da G1.6b — uma thread lê do fluxo e hasheia, outra grava (4 buffers de
+  1 MiB); a releitura com a árvore do dm-verity usa até 8 threads. O envio pela rede e a
+  gravação andam em paralelo (a fila de 8 blocos é o colchão): o tempo total é o do mais lento.
+- **Um bloco em voo por vez** (pedido e resposta): na rede local isso não é o gargalo
+  (abaixo); numa WAN de alta latência valeria mandar vários antes da resposta. Fica como ideia,
+  sem gap, até alguém atualizar por uma WAN lenta.
+- **Não paraleliza mais:** a ordem dos bytes é obrigatória (hash em fluxo, slot gravado em
+  sequência) e um envio por vez é regra da atualização.
+
+### Números
+
+**Medidos** em 2026-10-28, AMD Ryzen AI Max+ 395 (32 threads), build release, com outras sessões
+usando a máquina.
+
+| O quê | Valor |
+|---|---|
+| Pacote de hoje | 41,0 MiB (kernel 19,1 + rootfs 21,9) |
+| Envio no laboratório virtual (canal local, TCP em loopback) | 41,0 MiB em 0,27 s (152 MiB/s); gravado e conferido 0,88 s depois do início |
+| Envio pela GUI (debug, sem GPU, Xvfb) para o laboratório | 41,0 MiB em ~4,7 s (um bloco por quadro da janela) |
+| Envio por TLS para o QEMU (KVM, rede de usuário, CLI release) | 41,0 MiB em 2,16 s (19 MiB/s; o gargalo é a rede de usuário do QEMU); gravado e relido 3,17 s depois do início |
+| `ab-test --scenario push`: envio → B confirmado (relógio do CLI) | 25,6 s (10 s são a carência da confirmação automática) |
+| `os build` incremental (só o daemon mudou), completo | 184 s (`make all` 150 s) |
+| `os build --only crpkg`, mesma mudança | 127 s (`make all` 110 s, dos quais 100 s são o cargo release do daemon com LTO); −57 s, −31% |
+| `os push` inteiro (build `--only crpkg` + envio + reboot + confirmação) | ~153 s (**estimado**: soma das duas linhas medidas acima) |
+| Build frio da imagem numa worktree nova (downloads em cache) | 1207 s |
+
+O que sobra do ciclo é o cargo release do daemon; um perfil de build sem LTO para o ciclo de
+teste encurtaria isso, mas o binário testado deixaria de ser o de produção: não entrou.

@@ -18,6 +18,10 @@
 //!   deadline.
 //! - Anywhere else (a development machine with `--backend linux`): off, and
 //!   it says why. It never writes a host's boot variables or disks.
+//!
+//! G1.6e: an upload job reads the chunks the control channel queues
+//! (`system.package.upload.chunk`) as a stream and installs (or checks) it
+//! like a file: header and signature first, then straight to the slot.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -26,8 +30,9 @@ use corerouter_engine::package::{self, Job, JobKind};
 use corerouter_engine::{Shared, lock};
 use corerouter_sysupdate::SlotId;
 use corerouter_sysupdate::ab::{Opts, Platform};
-use corerouter_sysupdate::package::{Header, load_keys};
+use corerouter_sysupdate::package::load_keys;
 use corerouter_sysupdate::state::{Confirm, Reason, State};
+use corerouter_sysupdate::upload::ChunkReader;
 use serde_json::{Value, json};
 
 const TICK: Duration = Duration::from_millis(250);
@@ -38,6 +43,10 @@ const STATUS_EVERY: Duration = Duration::from_secs(2);
 /// did not crash on its configuration). Flatcar waits ~2 min; ours is short
 /// because the deadline (default 300 s) bounds the risk anyway.
 const GRACE: Duration = Duration::from_secs(10);
+/// Between a slot-changing job's result and the reboot.
+const REBOOT_PAUSE: Duration = Duration::from_secs(2);
+/// An upload with no chunk for this long is dropped (the client is gone).
+const UPLOAD_STALL: Duration = Duration::from_secs(60);
 const KEYS_DIR: &str = "/etc/corerouter/image-keys";
 const ESP_MOUNT: &str = "/run/corerouter/esp";
 /// Lab slots (sparse files).
@@ -265,11 +274,12 @@ impl Svc {
             config_format: job.config_format,
             drill,
         };
+        let phase = if matches!(job.kind, JobKind::Upload { .. }) { "receiving and writing" } else { "writing" };
         let mut last = Instant::now();
         let mut progress = |done: u64, total: u64| {
             if last.elapsed() >= Duration::from_millis(100) || done == total {
                 last = Instant::now();
-                package::feed_progress(&mut lock(session), "writing", done, total);
+                package::feed_progress(&mut lock(session), phase, done, total);
             }
         };
         let rep = match &job.kind {
@@ -288,6 +298,27 @@ impl Svc {
                 return Ok(json!({}));
             }
             JobKind::Check { path } => return check(p, Path::new(path)),
+            JobKind::Upload { size, downgrade, check } => {
+                let rx = package::take_upload(&mut lock(session), job.id).ok_or("upload: its stream is gone (aborted)")?;
+                let mut src = ChunkReader::new(rx, *size, UPLOAD_STALL);
+                let t = Instant::now();
+                if *check {
+                    package::feed_progress(&mut lock(session), "receiving and checking", 0, *size);
+                    return corerouter_sysupdate::upload::check(&mut src, Some(*size), &p.keys);
+                }
+                let reason = if *downgrade { Reason::Downgrade } else { Reason::Update };
+                let rep = p.install_from(&mut src, Some(*size), *downgrade, &opts(reason, false), &mut progress)?;
+                log::info!(
+                    "package: upload of {size} bytes in {} ms, {} ms of it waiting for the network",
+                    t.elapsed().as_millis(),
+                    src.waited.as_millis()
+                );
+                let mut v = rep.json();
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("network_wait_ms".into(), json!(src.waited.as_millis() as u64));
+                }
+                return Ok(v);
+            }
             JobKind::Scrub { slot } => {
                 let s = SlotId::parse(slot).ok_or("slot must be a or b")?;
                 return p.scrub(s, threads);
@@ -317,6 +348,9 @@ impl Svc {
             self.feed(session);
             return;
         }
+        // A moment for whoever asked (an upload's client polls every
+        // 100 ms) to read the result before the connection goes.
+        std::thread::sleep(REBOOT_PAUSE);
         log::warn!("package: rebooting into the trial slot");
         reboot_image();
     }
@@ -325,22 +359,8 @@ impl Svc {
 /// A package's header, signature and payload hashes, without installing.
 fn check(p: &Platform, path: &Path) -> Result<Value, String> {
     let mut f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let h = Header::read(&mut f)?;
-    let signer = h.verify(&p.keys).map(|k| k.id_hex());
-    let m = &h.manifest;
-    let mut sink = std::io::sink();
-    let mut sink2 = std::io::sink();
-    let mut parts: [(u64, &mut dyn std::io::Write); 2] = [(m.kernel.size, &mut sink), (m.rootfs.size, &mut sink2)];
-    let t = Instant::now();
-    let c = corerouter_sysupdate::package::copy(&mut f, &mut parts, true, &mut |_| {})?;
-    let intact = c.sha256.first() == Some(&m.kernel.sha256) && c.sha256.get(1) == Some(&m.rootfs.sha256);
-    Ok(json!({
-        "version": m.version, "build": m.build, "commit": m.commit, "channel": m.channel,
-        "kernel": m.kernel_version, "config_format": m.config_format,
-        "size": h.len() + m.kernel.size + m.rootfs.size,
-        "signed_by": signer.as_ref().ok(), "signature": signer.as_ref().err().map_or("ok", |e| e.as_str()),
-        "intact": intact, "millis": t.elapsed().as_millis() as u64,
-    }))
+    let exact = f.metadata().ok().filter(|m| m.is_file()).map(|m| m.len());
+    corerouter_sysupdate::upload::check(&mut f, exact, &p.keys)
 }
 
 #[cfg(target_os = "linux")]

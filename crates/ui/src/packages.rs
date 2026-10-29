@@ -7,7 +7,14 @@
 //! The engine and the daemon's `package` service decide everything; the
 //! window shows `system.package.print` and sends commands (each slot
 //! change asks first: it reboots the router).
+//!
+//! G1.6e: a package on this computer (a typed path or a file dropped on
+//! the window) is sent in chunks (`system.package.upload.*`), read by the
+//! app a piece at a time (`crate::export::read_at`), one chunk in flight;
+//! the router writes it to the other slot as it arrives. The browser has
+//! no reader yet: there the package has to be on the router.
 
+use base64::Engine as _;
 use egui::{Grid, RichText, Ui};
 use serde_json::{Value, json};
 
@@ -41,11 +48,35 @@ pub(crate) const PANEL: Panel = Panel {
 enum Ask {
     Install,
     Downgrade,
+    /// Send the local file and install it.
+    Upload,
 }
+
+/// A package being sent from this computer.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Sending {
+    pub(crate) path: String,
+    pub(crate) size: u64,
+    pub(crate) check: bool,
+    /// The upload id, once `upload.start` answered.
+    pub(crate) job: Option<u64>,
+    pub(crate) chunk: usize,
+    pub(crate) sent: u64,
+    /// The chunk in flight or to send again (offset, bytes, base64).
+    pending: Option<(u64, usize, String)>,
+    inflight: bool,
+}
+
+/// Replies of the upload.
+struct UpStart;
+struct UpChunk;
 
 pub(crate) struct PackagesPanel {
     pub(crate) status: Value,
     path: String,
+    /// A package on this computer (G1.6e).
+    pub(crate) local: String,
+    pub(crate) sending: Option<Sending>,
     manual: bool,
     timeout: u32,
     ask: Option<Ask>,
@@ -92,6 +123,8 @@ impl PackagesPanel {
         Self {
             status: Value::Null,
             path: String::new(),
+            local: String::new(),
+            sending: None,
             manual: false,
             timeout: 300,
             ask: None,
@@ -351,6 +384,7 @@ impl PackagesPanel {
             Ok(())
         };
         let mut send: Option<(&'static str, Value)> = None;
+        let mut upload_check = false;
         Grid::new("packages-actions").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(t(lang, "Package file"));
@@ -359,6 +393,16 @@ impl PackagesPanel {
             ui.add(
                 egui::TextEdit::singleline(&mut self.path)
                     .hint_text("/tmp/corerouter.crpkg")
+                    .desired_width(360.0),
+            );
+            ui.end_row();
+            ui.horizontal(|ui| {
+                ui.label(t(lang, "From this computer"));
+                self.info(ui, "packages.upload", "From this computer");
+            });
+            ui.add(
+                egui::TextEdit::singleline(&mut self.local)
+                    .hint_text("~/CoreRouter/os/out/build/images/corerouter.crpkg")
                     .desired_width(360.0),
             );
             ui.end_row();
@@ -385,6 +429,26 @@ impl PackagesPanel {
             if action(ui, t(lang, "Install and reboot"), install) {
                 self.ask = Some(Ask::Install);
             }
+            ui.separator();
+            let local = |id: &str| -> Result<(), String> {
+                can.check(id)?;
+                if busy || self.sending.is_some() {
+                    return Err("a job is running".into());
+                }
+                if self.local.trim().is_empty() {
+                    return Err("type the package's path on this computer, or drop it on the window".into());
+                }
+                Ok(())
+            };
+            if action(ui, t(lang, "Upload and check"), local("system.package.upload.start")) {
+                upload_check = true;
+            }
+            let up = local("system.package.upload.start")
+                .and_then(|()| if trial { Err("a trial boot is pending".into()) } else { Ok(()) });
+            if action(ui, t(lang, "Upload and install…"), up) {
+                self.ask = Some(Ask::Upload);
+            }
+            ui.separator();
             let down = can
                 .check("system.package.downgrade")
                 .and_then(|()| if busy || trial { Err("a job or a trial is pending".into()) } else { Ok(()) });
@@ -417,6 +481,100 @@ impl PackagesPanel {
         });
         if let Some((id, p)) = send {
             self.send(app, id, p);
+        }
+        if upload_check {
+            self.start_upload(app, ui.ctx(), true);
+        }
+        self.upload_progress(app, ui, lang);
+    }
+
+    /// Asks the router for an upload of the local file (its size first).
+    fn start_upload(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, check: bool) {
+        self.error = None;
+        self.notice = None;
+        let path = self.local.trim().to_owned();
+        let size = match crate::export::read_at(ctx, &path, 0, 0) {
+            Ok((_, size)) => size,
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
+        };
+        let mut p = self.params();
+        if let Some(o) = p.as_object_mut() {
+            o.remove("path");
+            o.insert("size".into(), json!(size));
+            o.insert("check".into(), json!(check));
+        }
+        self.sending = Some(Sending {
+            path,
+            size,
+            check,
+            job: None,
+            chunk: crate::export::UPLOAD_CHUNK,
+            sent: 0,
+            pending: None,
+            inflight: true,
+        });
+        app.run_then("system.package.upload.start", p, crate::panel::then(NAME, UpStart));
+    }
+
+    /// Sends the next chunk when none is in flight (called every frame).
+    fn pump_upload(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context) {
+        let Some(up) = self.sending.as_mut() else { return };
+        // The next chunk goes as soon as the reply arrives.
+        ctx.request_repaint();
+        let Some(job) = up.job else { return };
+        if up.inflight || up.sent >= up.size {
+            return;
+        }
+        if up.pending.is_none() {
+            match crate::export::read_at(ctx, &up.path, up.sent, up.chunk) {
+                Ok((b, _)) if !b.is_empty() => {
+                    let text = base64::engine::general_purpose::STANDARD.encode(&b);
+                    up.pending = Some((up.sent, b.len(), text));
+                }
+                Ok(_) => {
+                    self.error = Some(format!("{}: shorter than when the upload started", up.path));
+                    self.abort_upload(app);
+                    return;
+                }
+                Err(e) => {
+                    self.error = Some(e);
+                    self.abort_upload(app);
+                    return;
+                }
+            }
+        }
+        if let Some((off, _, text)) = &up.pending {
+            up.inflight = true;
+            let p = json!({"upload": job, "offset": off, "data": text});
+            app.run_then("system.package.upload.chunk", p, crate::panel::then(NAME, UpChunk));
+        }
+    }
+
+    fn abort_upload(&mut self, app: &mut CoreRouterUi) {
+        if let Some(job) = self.sending.take().and_then(|u| u.job) {
+            app.run_then("system.package.upload.abort", json!({"upload": job}), crate::panel::then(NAME, Sent("system.package.upload.abort")));
+        }
+    }
+
+    fn upload_progress(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, lang: Lang) {
+        let Some(up) = &self.sending else { return };
+        let frac = if up.size > 0 { up.sent as f32 / up.size as f32 } else { 0.0 };
+        let mut abort = false;
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "{} {:.1} / {:.1} MiB",
+                t(lang, "Sending"),
+                up.sent as f64 / 1_048_576.0,
+                up.size as f64 / 1_048_576.0
+            ));
+            ui.add(egui::ProgressBar::new(frac).desired_width(280.0).show_percentage());
+            abort = ui.button(t(lang, "Abort")).clicked();
+        });
+        if abort {
+            self.abort_upload(app);
         }
     }
 
@@ -488,6 +646,16 @@ impl PanelState for PackagesPanel {
     }
 
     fn window(&mut self, app: &mut CoreRouterUi, _win: &'static str, ui: &mut Ui) {
+        // A package dropped on the window is the one to send.
+        let dropped = ui.ctx().input(|i| i.raw.dropped_files.clone());
+        if let Some(p) = dropped
+            .iter()
+            .map(|f| f.path().display().to_string())
+            .find(|p| p.ends_with(".crpkg"))
+        {
+            self.local = p;
+        }
+        self.pump_upload(app, ui.ctx());
         egui::ScrollArea::vertical().id_salt("packages").show(ui, |ui| self.draw(app, ui));
     }
 
@@ -510,6 +678,10 @@ impl PanelState for PackagesPanel {
                     t(lang, "Install and reboot"),
                     format!("{} {}", t(lang, "Write this package to slot"), s(&other, "slot").to_uppercase()),
                 ),
+                Ask::Upload => (
+                    t(lang, "Upload and install"),
+                    format!("{} {}", t(lang, "Send this package and write it to slot"), s(&other, "slot").to_uppercase()),
+                ),
                 Ask::Downgrade => (
                     t(lang, "Downgrade"),
                     if self.path.trim().is_empty() {
@@ -526,7 +698,8 @@ impl PanelState for PackagesPanel {
             };
             ui.heading(title);
             ui.label(what);
-            ui.label(RichText::new(self.path.trim()).monospace());
+            let file = if ask == Ask::Upload { self.local.trim() } else { self.path.trim() };
+            ui.label(RichText::new(file).monospace());
             ui.add_space(4.0);
             ui.label(format!(
                 "{} {} s ({}).",
@@ -554,6 +727,7 @@ impl PanelState for PackagesPanel {
                 let mut p = self.params();
                 match ask {
                     Ask::Install => self.send(app, "system.package.update", p),
+                    Ask::Upload => self.start_upload(app, ctx, false),
                     Ask::Downgrade => {
                         if self.path.trim().is_empty()
                             && let Some(o) = p.as_object_mut()
@@ -570,6 +744,53 @@ impl PanelState for PackagesPanel {
     }
 
     fn reply(&mut self, app: &mut CoreRouterUi, then: PanelThen, result: &Result<Value, String>) {
+        let then = match then.downcast::<UpStart>() {
+            Ok(_) => {
+                match (result, self.sending.as_mut()) {
+                    (Ok(v), Some(up)) => {
+                        up.job = v.get("upload").and_then(Value::as_u64);
+                        if let Some(c) = v.get("chunk").and_then(Value::as_u64) {
+                            up.chunk = (c as usize).clamp(64 << 10, 4 << 20);
+                        }
+                        up.inflight = false;
+                    }
+                    (Err(e), _) => {
+                        self.sending = None;
+                        self.error = Some(e.clone());
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            Err(other) => other,
+        };
+        let then = match then.downcast::<UpChunk>() {
+            Ok(_) => {
+                match (result, self.sending.as_mut()) {
+                    (Ok(v), Some(up)) => {
+                        up.inflight = false;
+                        if v.get("busy") != Some(&json!(true))
+                            && let Some((_, n, _)) = up.pending.take()
+                        {
+                            up.sent += n as u64;
+                        }
+                        if up.sent >= up.size {
+                            let what = if up.check { "checking" } else { "writing and reading back" };
+                            self.notice = Some(format!("sent {:.1} MiB; the router is {what}", up.size as f64 / 1_048_576.0));
+                            self.sending = None;
+                        }
+                    }
+                    (Err(e), _) => {
+                        // The job result (print) has the router's reason.
+                        self.sending = None;
+                        self.error = Some(e.clone());
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            Err(other) => other,
+        };
         let Ok(sent) = then.downcast::<Sent>() else { return };
         app.cache.refreshed_at = None;
         match result {

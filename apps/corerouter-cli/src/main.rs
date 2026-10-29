@@ -24,6 +24,7 @@ use corerouter_mcp::{Backend, Headless, Remote};
 use serde_json::{Value, json};
 
 mod shell;
+mod upload;
 
 const USAGE: &str = "\
 usage: corerouter-cli <command> [--connect HOST:PORT | tls://HOST:PORT]
@@ -35,6 +36,10 @@ usage: corerouter-cli <command> [--connect HOST:PORT | tls://HOST:PORT]
                               watch tool.ping.start '{\"address\":\"8.8.8.8\",\"count\":4}'
   inspect [path]              state summary, or one subtree (interfaces, routing.bgp, running.ip, journal)
   screenshot <out.png>        save the GUI window (needs --connect to corerouter-gui --control)
+  upload <file.crpkg> [json-params] [--wait]
+                              send an update package over the control channel (System › Packages);
+                              params of system.package.upload.start, e.g. '{\"check\":true}' or
+                              '{\"confirm\":\"manual\"}'; --wait: wait for the reboot and the confirmation
   mcp [--headless]            MCP server on stdio; default tries 127.0.0.1:7979, then headless
   shell                       RouterOS-style terminal (/ip address print; Tab, ?, Ctrl+X); see docs/terminal.md;
                               the prompt shows the logged-in user
@@ -71,12 +76,14 @@ fn real_main() -> Result<(), String> {
     let mut fingerprint: Option<String> = None;
     let mut accept_new_cert = false;
     let mut headless = false;
+    let mut wait = false;
     let mut pos: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--connect" => connect = Some(args.next().ok_or("--connect needs HOST:PORT")?),
             "--headless" => headless = true,
+            "--wait" => wait = true,
             "--accept-new-cert" => accept_new_cert = true,
             "--user" => user = Some(args.next().ok_or("--user needs a name")?),
             "--fingerprint" => {
@@ -89,13 +96,18 @@ fn real_main() -> Result<(), String> {
     let mut pos = pos.into_iter();
     let cmd = pos.next().ok_or(USAGE)?;
 
-    let auth = Auth {
+    let mut auth = Auth {
         user,
         fingerprint,
         accept_new_cert,
+        password: None,
     };
     if cmd == "mcp" {
         return mcp(connect, headless, &auth);
+    }
+    // Asked once: `upload --wait` logs in again after the reboot.
+    if let (Some(u), true) = (&auth.user, connect.is_some()) {
+        auth.password = Some(password(u, true)?);
     }
 
     let mut backend: Box<dyn Backend> = match &connect {
@@ -152,6 +164,14 @@ fn real_main() -> Result<(), String> {
             return watch(backend.as_mut(), &id, params);
         }
         "inspect" => backend.call("state.inspect", json!({"path": pos.next()}))?,
+        "upload" => {
+            let file = pos.next().ok_or("upload needs a .crpkg file")?;
+            let params: Value = match pos.next() {
+                Some(raw) => serde_json::from_str(&raw).map_err(|e| format!("params: {e}"))?,
+                None => json!({}),
+            };
+            upload::run(backend.as_mut(), &upload::Opts { file, params, wait })?
+        }
         "screenshot" => {
             let out = pos.next().ok_or("screenshot needs an output path")?;
             let img = backend.call("ui.screenshot", Value::Null)?;
@@ -279,6 +299,8 @@ struct Auth {
     /// `--accept-new-cert`: a new or changed certificate is trusted and
     /// remembered without asking (G0.3d).
     accept_new_cert: bool,
+    /// Read once (prompt or `$COREROUTER_PASSWORD`).
+    password: Option<String>,
 }
 
 /// Connect to `addr` as the flags say. `interactive`: may prompt on the
@@ -289,7 +311,10 @@ fn remote(addr: &str, auth: &Auth, interactive: bool) -> Result<Remote, String> 
         None => Login::Auto,
         Some(user) => Login::Password {
             user: user.clone(),
-            password: password(user, interactive)?,
+            password: match &auth.password {
+                Some(p) => p.clone(),
+                None => password(user, interactive)?,
+            },
         },
     };
     if target.tls && auth.user.is_none() {

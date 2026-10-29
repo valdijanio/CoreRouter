@@ -227,3 +227,5 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-28 — G0.3d criado (pedido do usuário depois do teste na VM: senha vazia pela rede como no CHR e certificado trocado com escolha estilo PuTTY); parte a feita, muda o comportamento da G0.3b
 - 2026-10-28 — G0.28 criado e feito (pacote .deb da GUI + CLI, link corerouter://); G0.28b–d criados (AppImage, Windows, macOS)
 - 2026-10-28 — G0.3d feito (parte b: certificado trocado estilo PuTTY na GUI, `--accept-new-cert` na CLI/MCP)
+- 2026-10-28 — G1.27j criado e feito (rota do DHCP com distância 254 e aviso de ECMP)
+- 2026-10-28 — G1.6e em andamento (envio do pacote pela rede e ciclo rápido de teste da imagem)

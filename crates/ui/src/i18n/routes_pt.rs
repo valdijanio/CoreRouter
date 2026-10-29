@@ -7,6 +7,9 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("Changes (24 h)", "Trocas (24 h)"),
     ("Check gateway", "Check gateway"),
     ("Chosen", "Escolha"),
+    ("Copy command", "Copiar comando"),
+    ("ECMP warning", "aviso de ECMP"),
+    ("ECMP warnings", "avisos de ECMP"),
     ("Every BGP path to this destination and the step of the decision that put each one behind", "Todos os caminhos BGP para este destino e o passo da decisão que deixou cada um para trás"),
     ("IPv4", "IPv4"),
     ("IPv6", "IPv6"),
@@ -29,6 +32,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("exact", "exato"),
     ("inactive", "inativas"),
     ("incomplete", "incompleto"),
+    ("info", "info"),
     ("kernel agrees", "kernel confere"),
     ("kernel differs", "kernel difere"),
     ("kernel not checked", "kernel não consultado"),
@@ -46,6 +50,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("routes", "rotas"),
     ("standby", "em espera"),
     ("unreachable", "inalcançável"),
+    ("warning", "aviso"),
 ];
 
 /// Why a route is standby or inactive (`route.<reason_id>`), with the
@@ -98,6 +103,18 @@ pub(super) const TEMPLATES: &[(&str, &str)] = &[
     (
         "route.disabled",
         "rota desativada",
+    ),
+    (
+        "route.ecmp-default",
+        "a rota padrão está dividida por conexão entre {paths} caminhos na distância {distance} ({vias}): cada um sai com um endereço diferente; deixe um de reserva: {fix}",
+    ),
+    (
+        "route.ecmp-mixed",
+        "rotas {origins} dividem o tráfego por conexão na distância {distance} ({vias}): cada uma sai com um endereço diferente; deixe uma de reserva: {fix}",
+    ),
+    (
+        "route.ecmp-same",
+        "{paths} caminhos {origin} dividem o tráfego na distância {distance} ({vias})",
     ),
     (
         "route.empty",

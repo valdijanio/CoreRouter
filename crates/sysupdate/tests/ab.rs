@@ -319,3 +319,80 @@ fn downgrade_back_to_the_previous_slot_takes_its_configuration() {
     assert!(l.p.switch_back(&o).unwrap_err().contains("not older"));
     let _ = std::fs::remove_dir_all(&l.dir);
 }
+
+/// G1.6e: the package arrives in chunks (the control channel) and goes to
+/// the slot as it comes, through the same install.
+fn stream(
+    l: &Lab,
+    bytes: Vec<u8>,
+    declared: u64,
+    stop_at: Option<usize>,
+) -> Result<corerouter_sysupdate::ab::Report, String> {
+    use corerouter_sysupdate::upload::ChunkReader;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
+    let feeder = std::thread::spawn(move || {
+        for (i, c) in bytes.chunks(64 << 10).enumerate() {
+            if stop_at == Some(i) {
+                return; // the client went away
+            }
+            if tx.send(c.to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+    let mut r = ChunkReader::new(rx, declared, std::time::Duration::from_secs(5));
+    let out = l.p.install_from(
+        &mut r,
+        Some(declared),
+        false,
+        &opts(Reason::Update),
+        &mut |_, _| {},
+    );
+    drop(r);
+    feeder.join().unwrap();
+    out
+}
+
+#[test]
+fn streamed_install_and_its_failures() {
+    let mut l = lab("stream");
+    let b = std::fs::read(package(&l.dir, &l.key, "1.1", 20, 2, 1)).unwrap();
+    let n = b.len() as u64;
+    let before = l.p.status(&st(&l.p));
+    // Declared size different from the manifest's: refused after the header.
+    let e = stream(&l, b.clone(), n + 1, None).unwrap_err();
+    assert!(e.contains("manifest says"), "{e}");
+    // Aborted in the middle: an error, slot B not activated, no trial.
+    let e = stream(&l, b.clone(), n, Some(3)).unwrap_err();
+    assert!(e.contains("aborted after"), "{e}");
+    assert!(st(&l.p).trial.is_none());
+    assert_eq!(l.p.status(&st(&l.p))["slots"][1]["next"], false);
+    assert_eq!(l.p.status(&st(&l.p))["slots"][0], before["slots"][0]);
+    // Tampered on the way.
+    let mut bad = b.clone();
+    let at = bad.len() - 7000;
+    bad[at] ^= 1;
+    let e = stream(&l, bad, n, None).unwrap_err();
+    assert!(e.contains("signed hashes"), "{e}");
+    assert!(st(&l.p).trial.is_none());
+    // Whole: same result as from a file, trial armed and boots.
+    let rep = stream(&l, b.clone(), n, None).unwrap();
+    assert_eq!(rep.slot, Some(SlotId::B));
+    assert_eq!(l.p.status(&st(&l.p))["slots"][1]["state"], "trial");
+    let (boot, _) = l.p.lab_reboot().unwrap();
+    assert!(matches!(
+        boot,
+        Boot::Trial {
+            slot: SlotId::B,
+            ..
+        }
+    ));
+    // check() on a stream says the same as on the file.
+    let mut src = b.as_slice();
+    let c = corerouter_sysupdate::upload::check(&mut src, Some(n), &l.p.keys).unwrap();
+    assert_eq!(
+        (c["version"].as_str(), c["intact"].as_bool()),
+        (Some("1.1"), Some(true))
+    );
+    let _ = std::fs::remove_dir_all(&l.dir);
+}
