@@ -2813,3 +2813,10 @@ reprovar): `service::bandwidth_server::tests::enabled_by_config_serves_and_refus
 O paralelismo médio entre pacotes no build completo foi 2,1× (1714 s de pacotes em 802 s). A
 corrente `host-protobuf` (309 s) → `protobuf-c` → FRR → kernel do instalador limita o `-j` de
 topo.
+
+- 2026-10-29, G3.9d (**medido**, VM do laboratório, release): `benches/netns_mpls_ttl.rs`,
+  troca de rótulo de quadros de 64 bytes num núcleo, mesma rodada: sem taps 1,90 Mpps; um tap
+  `AF_PACKET` preso à porta 1,47 (−23%, clone por pacote no `mpls_rcv`); os taps do respondedor
+  sem bind 1,53 (−19%). `cargo bench -p corerouter-hal --bench mpls_icmp` (host com outras
+  sessões compilando): ler o quadro 74 ns, ICMP pela tabela IP 0,59 µs, pelo LSP com 100 000
+  rótulos 0,82 µs.

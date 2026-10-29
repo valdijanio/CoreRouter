@@ -8355,3 +8355,75 @@ continuação indentadas).
   Desempenho e paralelismo: duas linhas no render (O(1) por instância), dois campos lidos do JSON
   que o serviço `frr` já lê, e a checagem O(sessões) a cada 5 s sobre a amostra em memória. Nada no
   caminho quente, nada a dividir entre threads.
+
+- 2026-10-29 — G3.9d: MPLS: o traceroute através de um LSP não mostra mais `*` no salto do CoreRouter. O MPLS do kernel
+  Linux descarta em silêncio o pacote rotulado com TTL do topo ≤ 1 (`mpls_forward`, sem sysctl em
+  nenhuma versão); o respondedor do LSP ping (G3.5b), que já copiava esses quadros com um filtro BPF
+  clássico, agora devolve o ICMP time exceeded / ICMPv6 time exceeded com 128 octetos do pacote e o
+  objeto da pilha de rótulos como chegou (RFC 4884, RFC 4950), de um endereço da interface de
+  entrada.
+
+  - A volta segue a regra padrão do Cisco: com um rótulo e rota IP até a origem, pela tabela IP;
+    com pilha de VPN (≥ 2 rótulos), ou sem rota de volta (núcleo sem BGP), pelo próprio LSP, a pilha
+    copiada com o topo trocado como a tabela de rótulos manda e TTL 255 (RFC 3032 §2.3.2). Não
+    manda erro sobre erro ICMP, fragmento não inicial, destino multicast/broadcast nem origem que
+    não é unicast (RFC 1812 §4.3.2.7, RFC 4443 §2.4).
+  - `mpls.settings.set {icmp_ttl_exceeded, icmp_rate}` (padrão ligado, 100 erros/s, até 10 000; o
+    token bucket vem antes de qualquer trabalho) e `icmp_counters` no `mpls.settings.get`; campos
+    na janela **MPLS › Settings** com ⓘ (screenshots em `docs/changes/G3.9d-screenshots/`).
+  - Sans-IO em `hal/src/lsp/expired.rs` (proptest com quadro hostil); E/S em `HostResponder`
+    (`IPPROTO_RAW` para a tabela IP, `AF_PACKET` ao MAC do próximo salto para o LSP); o trait
+    `LspResponderIo` passou a devolver `Frame::{Echo, Expired}` e ganhou `send_icmp`.
+  - Os taps do respondedor (os três sockets `AF_PACKET`) deixam de ser presos a cada interface
+    MPLS: presos, o kernel clonava cada pacote para o `mpls_rcv`/`ip_rcv`. Na mesma rodada da VM
+    (64 bytes, troca de rótulo, um núcleo, **medido**): sem taps 1,90 Mpps, tap preso 1,47 (−23%),
+    taps sem bind 1,53 (−19%); o resto é o `packet_rcv` com o filtro (G3.9db).
+  - Laboratório (VM, **medido**): `netns_mpls_ttl` (A → CR1 → CR2 → B, pela tabela IP e num
+    núcleo sem BGP pelo LSP) e `netns_lsp` com `mpls_router` passam. Contra o RouterOS 7.25 CHR
+    (`routeros-interop.sh ldp mpls-ttl`): com `icmp-ttl-exceeded=no` o salto do CoreRouter some
+    no traceroute do CHR (100% de perda); ligado, `10.39.1.2 <MPLS:L=20,E=0>`, e o traceroute do
+    R3 (FRR) mostra `10.39.1.2 <MPLS:L=20,E=0,S=1,T=1>`.
+  - Pesquisa, regras e números em `docs/mpls.md`, "ICMP de TTL vencido em pacote rotulado".
+
+  Como testar: `cargo test -p corerouter-hal --lib lsp::expired`, `cargo test -p
+  corerouter-hal-linux --lib lsp`, `cargo test -p corerouter-engine --test it mpls`; com
+  `mpls_router`: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
+  corerouter-hal-linux --test netns_mpls_ttl` (A → CR1 → CR2 → B: antes `*`, depois o salto do CR2
+  com o rótulo 100, pela tabela IP e num núcleo sem BGP pelo LSP); CHR: `cargo xtask vm-lab run --
+  scripts/routeros-interop.sh ldp mpls-ttl`.
+
+- 2026-10-29 — G3.9hl: Terminal: `/interface vlan print` (e `bridge`, `loopback`, `ethernet`) existe, com as colunas que o
+  RouterOS 7 mostra primeiro, porque o engine tem agora uma consulta por tipo:
+  `interface.vlan.list` (NAME, MTU, VLAN-ID, INTERFACE, MAC-ADDRESS, USE-SERVICE-TAG; o MAC é o do pai quando a VLAN não tem um, como no RouterOS), `interface.bridge.list`
+  (NAME, MTU, MAC-ADDRESS, PORTS), `interface.loopback.list` e `interface.ethernet.list` (NAME,
+  MTU, MAC-ADDRESS e o que o `interface.ethernet.set` mudou, no formato que ele aceita de volta).
+  `bonding` e `pppoe-client` já tinham o seu; `interface.bridge.port.list` mostra
+  INTERFACE antes de BRIDGE, como o RouterOS. `print detail`, `where`, `count-only`, `as-json` e
+  `proplist` valem como em qualquer `print`.
+
+  Os submenus de um tipo herdam os verbos do `/interface` que não têm (`/interface vlan set 0
+  mtu=1400`, `/interface bridge remove 0` são `interface.set`/`interface.remove`), e os números são
+  os do `print` daquele submenu: `/interface vlan remove 0` remove a primeira VLAN, não o `ether1`.
+  Um número solto vai para o item quando o `print` do menu lista o campo posicional
+  (`/interface ethernet set 3 …`; `set ether4` continua pelo nome).
+
+  `export` em cada submenu escreve só as linhas dele. A VLAN sai com `interface=ether1` (o nome do
+  RouterOS, pelo `key_alias`) em vez de `parent=`; as portas ethernet configuradas saem como
+  `/interface ethernet set name=ether4 auto-negotiation=no speed=100Mbps duplex=full` (antes não
+  saíam no export), e a porta sem configuração não gera linha. O `/interface export` inteiro
+  importa de volta igual (teste).
+
+  Conferido no CHR 7.25 (caso novo `prints` de `scripts/routeros-interop-l2.sh`, **medido** em
+  2026-10-29): as colunas de `/interface vlan` (NAME, MTU, ARP, VLAN-ID, INTERFACE, MAC-ADDRESS),
+  `ethernet` (NAME, MTU, MAC-ADDRESS, ARP) e `bridge port` (INTERFACE, BRIDGE, …) batem nessa ordem,
+  menos a ARP; `print where` renumera a partir de 0 nos dois. O que ficou diferente virou G3.9hm
+  (legenda, `Columns:`, `chave=valor` em bridge/bonding/pppoe-client) e G3.9hn (ARP, `mtu=` padrão
+  no export); o export do RouterOS ordena as chaves em ordem alfabética, aqui é a ordem do `add`.
+
+  Como testar: `corerouter-cli shell` e `/interface vlan add name=v30 vlan-id=30 interface=ether1`,
+  `/interface vlan print`, `/interface vlan print detail where vlan-id=30`, `/interface vlan export`,
+  `/interface vlan remove 0`. Testes: `crates/shell/tests/it/submenu_print.rs` (um por submenu,
+  export e ida e volta), `registry::tests::type_submenus_take_the_verbs_of_their_menu` e
+  `crates/engine/tests/it/interface.rs` (as quatro consultas, a linha ethernet que o `set` aceita
+  de volta). Laboratório: `cargo xtask vm-lab run -- scripts/routeros-interop-l2.sh prints` grava a
+  saída do CHR 7.25 e a do CoreRouter lado a lado (`/tmp/crg39h/prints.txt` na VM).

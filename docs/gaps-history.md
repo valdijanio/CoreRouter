@@ -274,3 +274,5 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-29 — G1.6i feito (daemons do FRR sob demanda)
 - 2026-10-29 — G1.6r criado (enviar só o que mudou no `os push`)
 - 2026-10-29 — G3.4l feito (abort do ospfd com TI-LFA: causa, patch na imagem, issue e PR no FRR)
+- 2026-10-29 — G3.9d feito (ICMP de TTL vencido em MPLS); G3.9da criada (ICMP "fragmentation needed" em LSP, taxa por origem); G3.9db criada (tap MPLS em eBPF)
+- 2026-10-29 — G3.9hl feito (print e export dos submenus de interface)
