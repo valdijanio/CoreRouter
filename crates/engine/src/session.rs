@@ -20,7 +20,7 @@ use crate::neighbors::NeighborTable;
 use crate::safe_mode::{Caller, SafeMode};
 use crate::storage::{ConfigStorage, MemoryStorage, Slot};
 use crate::tasks::Tasks;
-use crate::validate::{validate_all, validate_changed};
+use crate::validate::{validate_all, validate_commit};
 use crate::{EngineError, Result, guard};
 
 /// How config commands reach the running config.
@@ -508,7 +508,7 @@ impl Session {
             }
             _ => Sections::ALL,
         };
-        let issues = validate_changed(self.store.candidate(), scope);
+        let issues = validate_commit(self.store.running(), self.store.candidate(), scope);
         // Debug builds (every test) check the table of what each validator
         // reads against the full validation on each commit: a dependency
         // left out fails the command that found it.
