@@ -16,15 +16,15 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "BGP Instance",
         ["Routing", "BGP"],
         None,
-        "{asn: u32 | asdot string, router_id: ipv4, name?: string (default \"default\"), disabled?: bool, comment?: string, graceful_restart_time?: u16 | null (RFC 4724 Restart Time we announce, 1..=4095 s; default 120; absent: kept), graceful_stale_time?: u16 | null (how long a restarted neighbor's routes stay stale, 1..=4095 s; default 360; absent: kept), graceful_defer_time?: u16 | null (after bgpd starts, how long the best path waits for the End-of-RIB of graceful-restart neighbors, 0..=3600 s; default 10; absent: kept)} → {name, frr}",
+        "{asn: u32 | asdot string, router_id: ipv4, name?: string (default \"default\"), disabled?: bool, comment?: string, graceful_restart_time?: u16 | null (RFC 4724 Restart Time we announce, 1..=4095 s; default 120; absent: kept), graceful_stale_time?: u16 | null (how long a restarted neighbor's routes stay stale, 1..=4095 s; default 360; absent: kept), graceful_defer_time?: u16 | null (after bgpd starts, how long the best path waits for the End-of-RIB of graceful-restart neighbors, 0..=3600 s; default 10; absent: kept), graceful_notification?: bool | null (RFC 8538 N bit: a NOTIFICATION or a hold timer expiry keeps a graceful-restart neighbor's routes, only a Hard Reset drops them; default true; absent: kept), hard_admin_reset?: bool | null (RFC 8538 §3: an administrative reset, routing.bgp.session.clear, goes as a Hard Reset and drops the routes; false: it keeps them stale; default true; absent: kept)} → {name, frr}",
         always,
         instance_set
     ),
     cmd!(query "routing.bgp.instance.list", "BGP Instances", ["Routing", "BGP"], None,
-        "{} → [{name, asn, router_id, disabled, comment, graceful_restart_time? (unset: 120 s), graceful_stale_time? (unset: 360 s), graceful_defer_time? (unset: 10 s)}]",
+        "{} → [{name, asn, router_id, disabled, comment, graceful_restart_time? (unset: 120 s), graceful_stale_time? (unset: 360 s), graceful_defer_time? (unset: 10 s), graceful_notification, hard_admin_reset (in force; RFC 8538)}]",
         always, instance_list),
     cmd!(query "routing.bgp.instance.check", "Check BGP Instance", [], None,
-        "{id?: string (the instance being edited), name?: string, asn?: u32 | string, router_id?: string, disabled?: bool | yes | no, comment?: string, graceful_restart_time?: u16 | string | null, graceful_stale_time?: u16 | string | null, graceful_defer_time?: u16 | string | null} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk} (form texts accepted: \"120\", yes/no; an empty timer = its default)",
+        "{id?: string (the instance being edited), name?: string, asn?: u32 | string, router_id?: string, disabled?: bool | yes | no, comment?: string, graceful_restart_time?: u16 | string | null, graceful_stale_time?: u16 | string | null, graceful_defer_time?: u16 | string | null, graceful_notification?: bool | yes | no | null, hard_admin_reset?: bool | yes | no | null} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk} (form texts accepted: \"120\", yes/no; an empty timer = its default)",
         always, instance_check),
 ];
 
@@ -104,6 +104,20 @@ fn build_instance(p: &Value, name: String, prev: Option<&BgpInstance>) -> Result
                 .ok_or_else(|| EngineError::bad("graceful_defer_time", "0..=3600 seconds, or null for the default (10)"))?,
         ),
     };
+    // G3.9fj, RFC 8538: on is the default, so only off is stored.
+    let on_by_default = |key: &str, had: Option<bool>| -> Result<Option<bool>> {
+        match p.get(key) {
+            None => Ok(had),
+            Some(Value::Null) => Ok(None),
+            Some(Value::Bool(b)) => Ok((!b).then_some(false)),
+            // `/import` of an `/export` types them as words.
+            Some(Value::String(w)) if matches!(w.as_str(), "yes" | "true") => Ok(None),
+            Some(Value::String(w)) if matches!(w.as_str(), "no" | "false") => Ok(Some(false)),
+            Some(_) => Err(EngineError::bad(key, "true or false, or null for the default (true)")),
+        }
+    };
+    let graceful_notification = on_by_default("graceful_notification", prev.and_then(|i| i.graceful_notification))?;
+    let hard_admin_reset = on_by_default("hard_admin_reset", prev.and_then(|i| i.hard_admin_reset))?;
     Ok(BgpInstance {
         name,
         asn,
@@ -113,6 +127,8 @@ fn build_instance(p: &Value, name: String, prev: Option<&BgpInstance>) -> Result
         graceful_restart_time,
         graceful_stale_time,
         graceful_defer_time,
+        graceful_notification,
+        hard_admin_reset,
     })
 }
 
@@ -131,8 +147,9 @@ fn instance_form(raw: &Value) -> Value {
             (RESTART_KEY | STALE_KEY | DEFER_KEY, Some("")) => Value::Null,
             ("asn" | "router_id" | "name", Some("")) => continue,
             (RESTART_KEY | STALE_KEY | DEFER_KEY | "asn", Some(t)) => t.parse::<u64>().map_or_else(|_| v.clone(), Value::from),
-            ("disabled", Some("yes")) => Value::Bool(true),
-            ("disabled", Some("no")) => Value::Bool(false),
+            ("disabled" | NOTIFICATION_KEY | HARD_RESET_KEY, Some("yes")) => Value::Bool(true),
+            ("disabled" | NOTIFICATION_KEY | HARD_RESET_KEY, Some("no")) => Value::Bool(false),
+            (NOTIFICATION_KEY | HARD_RESET_KEY, Some("")) => Value::Null,
             (_, Some(t)) => Value::from(t),
             _ => v.clone(),
         };
@@ -147,6 +164,8 @@ fn instance_form(raw: &Value) -> Value {
 const RESTART_KEY: &str = "graceful_restart_time";
 const STALE_KEY: &str = "graceful_stale_time";
 const DEFER_KEY: &str = "graceful_defer_time";
+const NOTIFICATION_KEY: &str = "graceful_notification";
+const HARD_RESET_KEY: &str = "hard_admin_reset";
 
 /// The Instances modal's preview (G3.9fj): the instance as it would be,
 /// what it changes for the sessions, and the `instance.set` to run. Never
@@ -185,6 +204,8 @@ fn instance_check(s: &mut Session, raw: &Value) -> Result<Value> {
         ] {
             o.insert(k.into(), json!(v));
         }
+        o.insert(NOTIFICATION_KEY.into(), json!(inst.graceful_notification.unwrap_or(true)));
+        o.insert(HARD_RESET_KEY.into(), json!(inst.hard_admin_reset.unwrap_or(true)));
     }
     let routing = &s.store().candidate().routing;
     let resolved = resolve_templates(&routing.bgp_templates);
@@ -250,6 +271,12 @@ fn instance_check(s: &mut Session, raw: &Value) -> Result<Value> {
             checks.push(check("info", "no-eor", format!("{} never sent End-of-RIB (RouterOS 7.25 does not): after a bgpd start, their routes wait the whole Defer Time ({defer} s)", quiet.join(", ")), DEFER_KEY));
         }
     }
+    // RFC 8538: what turning each part off does.
+    if inst.graceful_notification == Some(false) {
+        checks.push(check("info", "n-bit", "without the N bit (RFC 8538 §2) a NOTIFICATION or a hold timer expiry drops a graceful-restart neighbor's routes at once, as before RFC 8538; a TCP reset (bgpd killed) still keeps them".into(), NOTIFICATION_KEY));
+    } else if inst.hard_admin_reset == Some(false) {
+        checks.push(check("warning", "hard-reset", "routing.bgp.session.clear will keep the routes of a neighbor with the N bit as stale (RFC 8538 §3: a graceful administrative reset): a clear no longer flushes what it learned; Shutdown still does".into(), HARD_RESET_KEY));
+    }
     let commands = if prev.as_ref() == Some(&inst) {
         Vec::new()
     } else {
@@ -275,6 +302,8 @@ fn instance_list(s: &mut Session, _: &Value) -> Result<Value> {
                     "graceful_restart_time": b.graceful_restart_time,
                     "graceful_stale_time": b.graceful_stale_time,
                     "graceful_defer_time": b.graceful_defer_time,
+                    "graceful_notification": b.graceful_notification.unwrap_or(true),
+                    "hard_admin_reset": b.hard_admin_reset.unwrap_or(true),
                 })
             })
             .collect(),
@@ -324,7 +353,7 @@ mod tests {
         assert_eq!(cmd["command"], "routing.bgp.instance.set");
         assert_eq!(
             cmd["params"],
-            json!({"name": "default", "asn": 65000, "router_id": "10.0.0.1", "disabled": false, "comment": "", "graceful_restart_time": 60, "graceful_stale_time": null, "graceful_defer_time": 0})
+            json!({"name": "default", "asn": 65000, "router_id": "10.0.0.1", "disabled": false, "comment": "", "graceful_restart_time": 60, "graceful_stale_time": null, "graceful_defer_time": 0, "graceful_notification": true, "hard_admin_reset": true})
         );
         // The command does what the preview said.
         s.execute("routing.bgp.instance.set", &cmd["params"]).unwrap();
@@ -371,6 +400,38 @@ mod tests {
             assert_eq!((v["checks"][0]["level"].as_str(), v["checks"][0]["param"].as_str()), (Some("error"), Some(param)), "{p}: {v}");
             assert_eq!(v["commands"], json!([]));
         }
+    }
+
+    /// G3.9fj, RFC 8538: the N bit and the Hard Reset of a clear, stored
+    /// only when off, and what the preview says of turning them off.
+    #[test]
+    fn rfc8538_switches_store_only_off() {
+        let mut s = session();
+        let inst = |s: &Session| s.store().candidate().routing.bgp["default"].clone();
+        s.execute("routing.bgp.instance.set", &json!({"asn": 65000, "router_id": "10.0.0.1", "graceful_notification": true})).unwrap();
+        assert_eq!(inst(&s).graceful_notification, None, "true is the default");
+        let v = s
+            .execute("routing.bgp.instance.check", &json!({"id": "default", "asn": "65000", "router_id": "10.0.0.1", "hard_admin_reset": "no"}))
+            .unwrap();
+        assert!(levels(&v).contains(&("warning".into(), "hard-reset".into())), "{v}");
+        assert_eq!(v["commands"][0]["params"]["hard_admin_reset"], false);
+        assert_eq!(v["commands"][0]["params"]["graceful_notification"], true);
+        let r = s.execute("routing.bgp.instance.set", &v["commands"][0]["params"]).unwrap();
+        assert!(r["frr"].as_str().unwrap().contains(" no bgp hard-administrative-reset\n"), "{r}");
+        assert_eq!(inst(&s).hard_admin_reset, Some(false));
+        // Absent keeps it; null puts the default back.
+        s.execute("routing.bgp.instance.set", &json!({"asn": 65000, "router_id": "10.0.0.1"})).unwrap();
+        assert_eq!(inst(&s).hard_admin_reset, Some(false));
+        let rows = s.execute("routing.bgp.instance.list", &json!({})).unwrap();
+        assert_eq!((rows[0]["hard_admin_reset"].as_bool(), rows[0]["graceful_notification"].as_bool()), (Some(false), Some(true)));
+        s.execute("routing.bgp.instance.set", &json!({"asn": 65000, "router_id": "10.0.0.1", "hard_admin_reset": null, "graceful_notification": false})).unwrap();
+        assert_eq!((inst(&s).hard_admin_reset, inst(&s).graceful_notification), (None, Some(false)));
+        let v = s.execute("routing.bgp.instance.check", &json!({"id": "default", "asn": 65000, "router_id": "10.0.0.1"})).unwrap();
+        assert!(levels(&v).contains(&("info".into(), "n-bit".into())), "{v}");
+        assert!(s.execute("routing.bgp.instance.set", &json!({"asn": 65000, "router_id": "10.0.0.1", "hard_admin_reset": "x"})).is_err());
+        // The words of an `/export`.
+        s.execute("routing.bgp.instance.set", &json!({"asn": 65000, "router_id": "10.0.0.1", "hard_admin_reset": "no", "graceful_notification": "yes"})).unwrap();
+        assert_eq!((inst(&s).hard_admin_reset, inst(&s).graceful_notification), (Some(false), None));
     }
 
     /// The RouterOS 7.25 neighbor without End-of-RIB is named next to the

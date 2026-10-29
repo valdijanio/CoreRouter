@@ -34,6 +34,7 @@ execução. Comando novo no engine aparece no terminal sozinho (há um teste que
 | id `ip.address.add` | menu `/ip address`, comando `add` |
 | `interface.bridge.port.list` | `/interface bridge port print` |
 | verbo `list` | `print` (`list` também é aceito) |
+| submenu de um tipo (`interface.vlan.add` sob um `interface.list {type?}`) | herda os verbos do menu que não tem (`/interface vlan set 0`, `remove 0` = `interface.set`/`interface.remove`); o `print` é o `list` próprio do submenu (`interface.vlan.list`, G3.9hl) |
 | verbo `get` num menu sem `list` | `print` (menus de um objeto só: `/ip neighbor discovery print`, `/system identity print`) |
 | demais verbos (`add`, `set`, `remove`, `enter`, `commit`, `rollback`, …) | o mesmo nome |
 | chave `vlan_id` | `vlan-id=` |
@@ -127,6 +128,13 @@ cond := termo (and|or termo)*      termo := [!]prop[(=|!=|~|<|>|<=|>=)valor]
   que `or`. Booleanos: `where disabled`, `where !disabled`, `disabled=yes`. Números comparam como
   números.
 - Menus de um objeto (`get`) imprimem `chave: valor` alinhado.
+- Submenus de `/interface` (G3.9hl): `vlan`, `bridge`, `bridge port`, `bonding`, `loopback`,
+  `ethernet` e `pppoe-client` têm `print` próprio, com as colunas que o RouterOS 7 mostra primeiro
+  (`/interface vlan print`: NAME, MTU, VLAN-ID, INTERFACE; sem ARP, que o CoreRouter não tem). Os
+  números valem para o `print` daquele submenu: `/interface vlan print` e depois
+  `/interface vlan remove 0` remove a primeira VLAN, não o `ether1`. Um número como valor solto
+  vai para o item, não para o parâmetro posicional, quando o `print` do menu lista esse campo
+  (`/interface ethernet set 3` é o item 3; `set ether4`, a porta pelo nome).
 
 ### Teclas
 
@@ -163,7 +171,10 @@ registro:
 - para cada menu com `print` sem parâmetro obrigatório: cada linha vira o `add` do menu — ou o
   `add` do submenu do seu `type` (`/interface` tipo `vlan` → `/interface vlan add`) — com as chaves
   que esse `add` declara; o que o `add` não aceita mas o `set` do menu aceita vem num `set` em
-  seguida (`/interface set name=vlan30 disabled=yes`). Sem `add` (portas físicas, instâncias BGP):
+  seguida (`/interface set name=vlan30 disabled=yes`). Um submenu com `print` próprio
+  (`/interface vlan`) escreve as suas linhas ele mesmo, com o nome RouterOS da chave quando a
+  linha usa o sinônimo (`interface=ether1`, não `parent=`); um `set` que só nomeia o item (porta
+  ethernet sem nada configurado) não sai. Sem `add` (portas físicas, instâncias BGP):
   `set`. Linhas dinâmicas (flag D) e links que o roteador não gerencia (`managed=no`, G1.18) ficam
   de fora. Menus de um objeto (`get`): um `set`;
 - **ordem segura**: cada linha vem depois das que criam os nomes que ela cita (bridge antes da VLAN

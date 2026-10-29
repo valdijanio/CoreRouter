@@ -104,6 +104,8 @@ fn connections(n: u32, short: u32) -> corerouter_model::Config {
             graceful_restart_time: None,
             graceful_stale_time: None,
             graceful_defer_time: None,
+            graceful_notification: None,
+            hard_admin_reset: None,
         },
     );
     cfg.routing.bgp_templates.insert(

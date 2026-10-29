@@ -706,11 +706,16 @@ Saídas em `<out>/build/images/`:
     duplica a receita inteira e o `select` do nftables. O patch é pequeno (145 linhas, só
     `package/frr` e `package/libyang`) e falha alto se a receita mudar num Buildroot novo.
   - **Saída:** quando um LTS do Buildroot trouxer FRR ≥ 10.7.1, apagar o patch.
+- **Patch no FRR (G3.4l):** `os/patches/frr/0001-ospfd-ti-lfa-missing-router-lsa.patch`, pelo
+  `BR2_GLOBAL_PATCH_DIR`, corrige o abort do `ospfd` com TI-LFA quando a router-LSA de um vizinho
+  sai do LSDB (`docs/frr-tilfa-abort.md`). O `cargo xtask os build` faz `frr-dirclean` quando os
+  patches de `os/patches/frr/` mudam (carimbo `.corerouter-frr-patches.sha256`, como o do
+  kernel). **Saída:** apagar o patch quando o FRR da imagem trouxer a correção.
 - **O que o `frr-test` prova** (`cargo xtask os frr-test`, `xtask/src/os/frr.rs`): dois
   roteadores da imagem no QEMU, sem root, com os `ether1` ligados por um par de sockets UDP do
   QEMU no loopback do host. Cada um é configurado só por comandos (13, os mesmos de CLI/MCP):
   endereço e `/32` na `lo`, OSPFv2 ponto a ponto, SR com prefix SID automático (sem TI-LFA,
-  desligado em produção pela G3.4l), MPLS e LDP no `ether1`, um peer BFD. E tem de ler de volta
+  desligado em produção pela G3.4k), MPLS e LDP no `ether1`, um peer BFD. E tem de ler de volta
   do FRR: vizinho OSPF `Full` (`ospfd`), o prefix SID do outro com rótulo (`16002`, saída
   implicit-null), LDP `operational` (`ldpd`), sessão BFD `up` (a do `bfdd`, rodada pelo motor
   do daemon como data plane), rótulos na tabela MPLS do kernel (`zebra`), ping entre as

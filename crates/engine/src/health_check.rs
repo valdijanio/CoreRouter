@@ -168,6 +168,10 @@ pub struct Inputs {
     /// established for [`EOR_GRACE_SECS`] that never sent End-of-RIB.
     /// `None`: no routing daemon reported.
     pub bgp_no_eor: Option<(usize, Vec<String>)>,
+    /// G3.9fj, RFC 8538: established sessions with the N bit on both sides
+    /// where one side restarts gracefully, and those of them without BFD.
+    /// `None`: no routing daemon reported.
+    pub bgp_gr_no_bfd: Option<(usize, Vec<String>)>,
     /// Whether any reading exists at all.
     pub readings: bool,
 }
@@ -184,6 +188,19 @@ fn bgp_gr_sessions(st: &RoutingStatus) -> impl Iterator<Item = &BgpSession> {
         b.established
             && b.gr_local.as_deref() == Some("restart")
             && matches!(b.gr_remote.as_deref(), Some("restart" | "helper"))
+    })
+}
+
+/// G3.9fj, RFC 8538 §4: sessions where a hold timer expiry is graceful
+/// (the N bit both ways, one side restarting with its forwarding state):
+/// a silent failure keeps the routes for the hold time plus the Restart
+/// Time. `n_off`: the instances that do not announce the N bit.
+fn bgp_n_bit_sessions<'a>(st: &'a RoutingStatus, n_off: &'a [String]) -> impl Iterator<Item = &'a BgpSession> {
+    st.bgp_sessions.iter().filter(move |b| {
+        b.established
+            && b.n_bit
+            && !n_off.contains(&b.instance)
+            && (b.gr_local.as_deref() == Some("restart") || b.gr_remote.as_deref() == Some("restart"))
     })
 }
 
@@ -542,6 +559,36 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
             });
         }
     }
+
+    // G3.9fj, RFC 8538: graceful restart with the N bit and no BFD.
+    let (key, name) = ("bgp.gr-bfd", "BGP GR without BFD");
+    match &i.bgp_gr_no_bfd {
+        None => out.push(Check { key, name, severity: Severity::Unknown, value: None, reason: "nenhum daemon de roteamento informou as sessões".into(), action: None }),
+        Some((n, bare)) if bare.is_empty() => out.push(Check {
+            key,
+            name,
+            severity: Severity::Ok,
+            value: None,
+            reason: match n {
+                0 => "nenhuma sessão BGP com graceful restart e o bit N".into(),
+                n => format!("{n} sessão(ões) com graceful restart e o bit N, todas com BFD"),
+            },
+            action: None,
+        }),
+        Some((n, bare)) => {
+            let shown: Vec<&str> = bare.iter().take(3).map(String::as_str).collect();
+            let more = bare.len().saturating_sub(shown.len());
+            let names = if more > 0 { format!("{} e mais {more}", shown.join(", ")) } else { shown.join(", ") };
+            out.push(Check {
+                key,
+                name,
+                severity: Severity::Warning,
+                value: Some(format!("{} de {n}", bare.len())),
+                reason: format!("sessão(ões) BGP com graceful restart e o bit N (RFC 8538) sem BFD: {names}; numa queda silenciosa (energia, link cortado) as rotas ficam o hold time e depois o Restart Time"),
+                action: Some("Ligue um perfil BFD na conexão (Routing › BGP › Connections, BFD Profile): uma queda do BFD é Hard Reset e tira as rotas na hora. Ou desligue o bit N na instância (graceful_notification=no).".into()),
+            });
+        }
+    }
     out
 }
 
@@ -685,6 +732,24 @@ impl Session {
                 .collect();
             (bgp_gr_sessions(st).count(), quiet)
         });
+        let n_off: Vec<String> = self
+            .store()
+            .running()
+            .routing
+            .bgp
+            .values()
+            .filter(|i| i.graceful_notification == Some(false))
+            .map(|i| i.name.clone())
+            .collect();
+        i.bgp_gr_no_bfd = self.routing_status().map(|st| {
+            let all: Vec<&BgpSession> = bgp_n_bit_sessions(st, &n_off).collect();
+            let bare = all
+                .iter()
+                .filter(|b| b.bfd.is_none())
+                .map(|b| b.connection.clone().unwrap_or_else(|| b.remote_address.clone()))
+                .collect();
+            (all.len(), bare)
+        });
         i.root_verity = self
             .ext::<crate::package::Packages>()
             .and_then(|p| p.status.as_ref())
@@ -768,6 +833,7 @@ mod tests {
             no_password: Vec::new(),
             root_verity: Some(("a".into(), true)),
             bgp_no_eor: Some((1, Vec::new())),
+            bgp_gr_no_bfd: Some((1, Vec::new())),
         }
     }
 
@@ -795,7 +861,7 @@ mod tests {
     #[test]
     fn healthy_is_all_ok() {
         let checks = evaluate(&healthy());
-        assert_eq!(checks.len(), 17);
+        assert_eq!(checks.len(), 18);
         for c in &checks {
             assert_eq!(c.severity, Severity::Ok, "{c:?}");
             assert!(c.action.is_none());
@@ -810,6 +876,8 @@ mod tests {
             ("bgp neighbor without End-of-RIB", |i| i.bgp_no_eor = Some((2, vec!["chr".into()])), "bgp.end-of-rib", Severity::Warning),
             ("bgp without graceful restart", |i| i.bgp_no_eor = Some((0, Vec::new())), "bgp.end-of-rib", Severity::Ok),
             ("no routing daemon", |i| i.bgp_no_eor = None, "bgp.end-of-rib", Severity::Unknown),
+            ("gr with the N bit, no BFD", |i| i.bgp_gr_no_bfd = Some((2, vec!["cr2".into()])), "bgp.gr-bfd", Severity::Warning),
+            ("gr without the N bit", |i| i.bgp_gr_no_bfd = Some((0, Vec::new())), "bgp.gr-bfd", Severity::Ok),
             ("rmem_max caps the RADIUS socket", |i| i.sockbuf = Some(vec![("radius".into(), 212_992, 4 << 20)]), "sockbuf", Severity::Warning),
             ("no burst socket open", |i| i.sockbuf = None, "sockbuf", Severity::Unknown),
             ("cpu 97", |i| i.cpu_avg = Some((97.0, 60)), "cpu", Severity::Error),
@@ -926,6 +994,34 @@ mod tests {
         assert_eq!((c.severity, c.value.as_deref()), (Severity::Warning, Some("1 de 2")), "{c:?}");
         assert!(c.reason.contains("chr") && !c.reason.contains("cr2"), "{}", c.reason);
         assert!(c.action.is_some_and(|a| a.contains("Defer Time")));
+    }
+
+    /// G3.9fj, RFC 8538: a restarting neighbor with the N bit and no BFD
+    /// keeps its routes hold + Restart Time on a silent failure.
+    #[test]
+    fn bgp_gr_with_the_n_bit_and_no_bfd_warns() {
+        let mut s = Session::virtual_lab();
+        let at = |s: &mut Session| evaluate(&s.health_inputs()).into_iter().find(|c| c.key == "bgp.gr-bfd").unwrap();
+        let one = |conn: &str, n_bit: bool, bfd: Option<&str>| BgpSession {
+            instance: "default".into(),
+            remote_address: "10.39.5.1".into(),
+            established: true,
+            connection: Some(conn.into()),
+            gr_local: Some("helper".into()),
+            gr_remote: Some("restart".into()),
+            n_bit,
+            bfd: bfd.map(Into::into),
+            ..BgpSession::default()
+        };
+        let set = |s: &mut Session, v| s.set_routing_status(RoutingStatus { backend: "frr 10.7.1".into(), bgp_sessions: v, ..RoutingStatus::default() });
+        set(&mut s, vec![one("cr1", true, Some("up")), one("old", false, None)]);
+        assert_eq!(at(&mut s).severity, Severity::Ok);
+        set(&mut s, vec![one("cr1", true, None)]);
+        let c = at(&mut s);
+        assert_eq!((c.severity, c.value.as_deref()), (Severity::Warning, Some("1 de 1")), "{c:?}");
+        // Without the N bit on our instance a hold expiry drops the routes.
+        s.execute("routing.bgp.instance.set", &serde_json::json!({"asn": 65002, "router_id": "10.0.0.2", "graceful_notification": false})).unwrap();
+        assert_eq!(at(&mut s).severity, Severity::Ok);
     }
 
     #[test]

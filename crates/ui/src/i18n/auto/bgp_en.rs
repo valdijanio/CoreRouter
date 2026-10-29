@@ -25,6 +25,11 @@ After our `bgpd` starts, how long the best-path selection waits for the End-of-R
 
 ## Careful
 A neighbor that never sends End-of-RIB (RouterOS 7.25; the health check `bgp.end-of-rib` names it) holds back its routes for the whole time after every `bgpd` start. 0 does not wait: routes may change while the neighbors resend their tables."##),
+    (r##"bgp.instance.graceful_notification"##, r##"## What it is
+The N bit of the graceful-restart capability (RFC 8538 §2). With it on both sides, a NOTIFICATION or a hold timer expiry is handled as a restart: the neighbor's routes stay (stale) for its Restart Time; only a Hard Reset (Cease 9, and in FRR also Maximum Prefixes, Shutdown, De-configured and BFD Down) drops them at once. On by default (FRR since 8.3).
+
+## Careful
+A silent failure (power, cut link) of a restarting neighbor then keeps its routes for the hold time plus the Restart Time. Use BFD on those connections (a BFD down is a Hard Reset); the preview and the health check `bgp.gr-bfd` warn. Off: a hold expiry or a NOTIFICATION drops the routes as before RFC 8538. RouterOS 7.25 does not document RFC 8538."##),
     (r##"bgp.instance.graceful_restart_time"##, r##"## What it is
 The Restart Time we announce in the graceful-restart capability (RFC 4724 §3): how long the neighbor keeps our routes (stale) after our `bgpd` dies, waiting for it to come back. Only the connections with Graceful Restart = yes announce it. 1..4095 s (12 bits); empty: 120 s.
 
@@ -38,6 +43,8 @@ As a helper: how long we keep the routes of a neighbor that restarted, marked st
 
 ## Careful
 A neighbor that never sends End-of-RIB (RouterOS 7.25) keeps its old routes for the whole time. FRR `bgp graceful-restart stalepath-time`, Junos `stale-routes-time` (300)."##),
+    (r##"bgp.instance.hard_admin_reset"##, r##"## What it is
+Whether an administrative reset (Cease 4: `routing.bgp.session.clear`) goes as a Hard Reset (RFC 8538 §3) and drops the neighbor's routes. On by default. Off: a clear of a neighbor with the N bit is graceful, its routes stay stale until it sends them again (useful to apply a policy without a traffic hole). Shutdown always drops them."##),
     (r##"bgp.instance.name"##, r##"## What it is
 The instance's name; `default` runs in the main table, another name is a separate FRR view."##),
     (r##"bgp.instance.router_id"##, r##"## What it is

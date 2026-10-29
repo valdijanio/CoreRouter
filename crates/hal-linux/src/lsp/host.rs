@@ -9,8 +9,9 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use corerouter_hal::HalError;
+use corerouter_hal::lsp::expired::{Delivery, Icmp};
 use corerouter_hal::lsp::{
-    Heard, LspAnswer, LspPath, LspProber, LspRequest, LspResponderIo, LspSocket, LsrView, wire,
+    Frame, LspAnswer, LspPath, LspProber, LspRequest, LspResponderIo, LspSocket, LsrView, wire,
 };
 use corerouter_hal::mpls::{MplsNexthop, MplsReader, MplsRoute, Origin};
 use corerouter_hal::probe::ProbeError;
@@ -24,7 +25,8 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 use super::{
     ETH_P_IP, ETH_P_IPV6, ETH_P_MPLS_UC, FrameSpec, IP4_FILTER, IP6_FILTER, MAX_FRAME, MPLS_FILTER,
-    RawFecRoute, build_frame, parse_frame, parse_route, route_request, sock_filter,
+    RawFecRoute, build_frame, classify, ether_only, icmp_frame, parse_route, route_request,
+    sock_filter,
 };
 use crate::neigh::nlmsg_header;
 
@@ -227,14 +229,9 @@ impl Neighbors {
         }
     }
 
-    /// The MAC of `ip` on `dev`: from the table, else after asking the
-    /// kernel to resolve it (a datagram to the discard port makes it ARP
-    /// or send a neighbor solicitation), waiting up to 300 ms.
-    fn mac(&mut self, dev: &IfName, ip: IpAddr) -> Option<[u8; 6]> {
-        self.refresh(false);
-        if let Some(m) = self.map.get(&(dev.clone(), ip)) {
-            return Some(*m);
-        }
+    /// Ask the kernel to resolve `ip` on `dev`: a datagram to the discard
+    /// port makes it ARP or send a neighbor solicitation.
+    fn resolve(dev: &IfName, ip: IpAddr) {
         let domain = if ip.is_ipv6() {
             Domain::IPV6
         } else {
@@ -244,6 +241,28 @@ impl Neighbors {
             let _ = s.bind_device(Some(dev.as_str().as_bytes()));
             let _ = s.send_to(&[0], &SocketAddr::new(ip, 9).into());
         }
+    }
+
+    /// The MAC of `ip` on `dev` from the table (read at most once per
+    /// [`FRESH`]), without waiting: a miss asks the kernel to resolve it
+    /// for the next time.
+    fn mac_now(&mut self, dev: &IfName, ip: IpAddr) -> Option<[u8; 6]> {
+        self.refresh(false);
+        let m = self.map.get(&(dev.clone(), ip)).copied();
+        if m.is_none() {
+            Self::resolve(dev, ip);
+        }
+        m
+    }
+
+    /// The MAC of `ip` on `dev`: from the table, else after asking the
+    /// kernel to resolve it, waiting up to 300 ms.
+    fn mac(&mut self, dev: &IfName, ip: IpAddr) -> Option<[u8; 6]> {
+        self.refresh(false);
+        if let Some(m) = self.map.get(&(dev.clone(), ip)) {
+            return Some(*m);
+        }
+        Self::resolve(dev, ip);
         for _ in 0..6 {
             std::thread::sleep(Duration::from_millis(50));
             self.refresh(true);
@@ -287,6 +306,14 @@ pub struct HostLspSocket {
 
 fn unavailable(what: &str, e: impl std::fmt::Display) -> ProbeError {
     ProbeError::Unavailable(format!("{what}: {e}"))
+}
+
+/// A packet socket of `link` that only sends (protocol 0: it hears
+/// nothing). Needs `CAP_NET_RAW`.
+fn send_only(link: &LinkAddr) -> io::Result<Socket> {
+    let s = Socket::new(Domain::PACKET, Type::RAW, Some(Protocol::from(0)))?;
+    bind(s.as_raw_fd(), link).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+    Ok(s)
 }
 
 fn udp(v6: bool) -> io::Result<(Socket, u16)> {
@@ -334,10 +361,7 @@ impl HostLspSocket {
                 .get(dev)
                 .and_then(|l| l.link)
                 .ok_or_else(|| ProbeError::Unreachable(format!("{dev} has no link address")))?;
-            // Protocol 0: this socket only sends, it hears nothing.
-            let s = Socket::new(Domain::PACKET, Type::RAW, Some(Protocol::from(0)))
-                .map_err(|e| unavailable("packet socket (needs CAP_NET_RAW)", e))?;
-            bind(s.as_raw_fd(), &link).map_err(|e| unavailable("bind", e))?;
+            let s = send_only(&link).map_err(|e| unavailable("packet socket", e))?;
             self.packet.insert(dev.clone(), s);
         }
         self.packet
@@ -601,20 +625,29 @@ impl LsrView for HostView {
     }
 }
 
-/// Three packet sockets of one interface.
+/// The three packet sockets (MPLS, IPv4, IPv6), for the whole host: the
+/// frame's `sll_ifindex` says which interface, checked against the MPLS
+/// ones after the copy.
+///
+/// G3.9d, **medido**: a socket bound to one interface sits on that
+/// device's `ptype_specific` list, which the kernel walks after
+/// `ptype_base`; `mpls_rcv` / `ip_rcv` then get the frame shared with the
+/// tap and clone it (`skb_share_check`) for every packet: MPLS switching
+/// fell from 1.20 to 0.90 Mpps with the taps on the port
+/// (`benches/netns_mpls_ttl.rs`). Unbound, the tap is on `ptype_base`
+/// ahead of them, its filter runs and lets the frame go first: no clone.
 struct Taps {
     socks: Vec<Socket>,
 }
 
-fn tap(link: &LinkAddr, ethertype: u16, prog: &[super::Insn]) -> io::Result<Socket> {
+fn tap(ethertype: u16, prog: &[super::Insn]) -> io::Result<Socket> {
     let s = Socket::new(
         Domain::PACKET,
         Type::RAW,
         Some(Protocol::from(i32::from(ethertype.to_be()))),
     )?;
     s.set_nonblocking(true)?;
-    s.attach_filter(&sock_filter(prog))?;
-    bind(s.as_raw_fd(), link).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+    s.attach_filter(&sock_filter(&ether_only(prog)))?;
     // What came before the filter: drop it.
     let mut buf = [0u8; 64];
     for _ in 0..RECV_BUDGET {
@@ -627,12 +660,30 @@ fn tap(link: &LinkAddr, ethertype: u16, prog: &[super::Insn]) -> io::Result<Sock
 
 /// The responder's sockets and view.
 pub struct HostResponder {
-    taps: BTreeMap<IfName, Taps>,
+    taps: Option<Taps>,
+    /// The interfaces answered on (frames from others are dropped).
+    listen: Vec<IfName>,
     udp4: Socket,
     udp6: Option<Socket>,
     view: HostView,
-    queue: VecDeque<Heard>,
+    queue: VecDeque<Frame>,
     buf: Vec<u8>,
+    /// ICMP errors by the IP table: `IPPROTO_RAW` (the header is ours),
+    /// opened when first used.
+    raw4: Option<Socket>,
+    raw6: Option<Socket>,
+    /// ICMP errors along an LSP: frames to the next hop's MAC.
+    packet: HashMap<IfName, Socket>,
+    neighbors: Neighbors,
+}
+
+/// An `IPPROTO_RAW` socket: the packet carries its own IP header
+/// (`IP_HDRINCL` / `IPV6_HDRINCL` implied). Needs `CAP_NET_RAW`.
+fn raw_ip(v6: bool) -> io::Result<Socket> {
+    let domain = if v6 { Domain::IPV6 } else { Domain::IPV4 };
+    let s = Socket::new(domain, Type::RAW, Some(Protocol::from(255)))?;
+    s.set_nonblocking(true)?;
+    Ok(s)
 }
 
 fn reply_socket(v6: bool) -> io::Result<Socket> {
@@ -666,13 +717,70 @@ impl HostResponder {
         let udp4 = reply_socket(false)
             .map_err(|e| HalError::Rejected(format!("UDP port {} (IPv4): {e}", wire::PORT)))?;
         Ok(Self {
-            taps: BTreeMap::new(),
+            taps: None,
+            listen: Vec::new(),
             udp4,
             udp6: reply_socket(true).ok(),
             view: HostView::new(),
             queue: VecDeque::new(),
             buf: vec![0u8; MAX_FRAME],
+            raw4: None,
+            raw6: None,
+            packet: HashMap::new(),
+            neighbors: Neighbors::default(),
         })
+    }
+
+    fn send_ip(&mut self, icmp: &Icmp) -> Result<(), HalError> {
+        let v6 = icmp.to.is_ipv6();
+        let slot = if v6 { &mut self.raw6 } else { &mut self.raw4 };
+        if slot.is_none() {
+            *slot = Some(raw_ip(v6).map_err(|e| io_hal("raw IP socket (needs CAP_NET_RAW)", e))?);
+        }
+        let s = slot
+            .as_ref()
+            .ok_or_else(|| HalError::Unsupported("raw IP socket".into()))?;
+        s.send_to(&icmp.packet, &SocketAddr::new(icmp.to, 0).into())
+            .map_err(|e| io_hal(&format!("ICMP to {}", icmp.to), e))?;
+        Ok(())
+    }
+
+    fn send_lsp(
+        &mut self,
+        interface: &IfName,
+        nexthop: Option<IpAddr>,
+        stack: &[corerouter_hal::probe::MplsLabel],
+        packet: &[u8],
+    ) -> Result<(), HalError> {
+        let link = self
+            .view
+            .links
+            .by_name
+            .get(interface)
+            .ok_or_else(|| HalError::Rejected(format!("{interface}: no such link")))?;
+        let (Some(src_mac), Some(addr)) = (link.mac, link.link) else {
+            return Err(HalError::Unsupported(format!(
+                "{interface} is not an Ethernet link"
+            )));
+        };
+        let via = nexthop.ok_or_else(|| {
+            HalError::Unsupported(format!("label leaves {interface} without a next hop"))
+        })?;
+        let dst_mac = self.neighbors.mac_now(interface, via).ok_or_else(|| {
+            HalError::Rejected(format!("no ARP/ND entry for {via} on {interface} yet"))
+        })?;
+        if !self.packet.contains_key(interface) {
+            let s = send_only(&addr).map_err(|e| io_hal("packet socket", e))?;
+            self.packet.insert(interface.clone(), s);
+        }
+        let s = self
+            .packet
+            .get(interface)
+            .ok_or_else(|| HalError::Unsupported("packet socket".into()))?;
+        let frame = icmp_frame(dst_mac, src_mac, stack, packet);
+        send(s.as_raw_fd(), &frame, MsgFlags::empty())
+            .map_err(|e| io_hal(&format!("ICMP along the LSP on {interface}"), e))?;
+        Ok(())
     }
 
     /// Requests that reach port 3503 as plain UDP (sent to an address of
@@ -691,43 +799,52 @@ impl HostResponder {
 
 impl LspResponderIo for HostResponder {
     fn set_interfaces(&mut self, names: &[IfName]) -> Vec<(IfName, String)> {
-        self.taps.retain(|n, _| names.contains(n));
         self.view.reread_links();
         let mut failed = Vec::new();
+        self.listen.clear();
         for name in names {
-            if self.taps.contains_key(name) {
-                continue;
-            }
-            let Some(link) = self.view.links.by_name.get(name).and_then(|l| l.link) else {
+            if self
+                .view
+                .links
+                .by_name
+                .get(name)
+                .and_then(|l| l.link)
+                .is_some()
+            {
+                self.listen.push(name.clone());
+            } else {
                 failed.push((name.clone(), "no such link".to_owned()));
-                continue;
-            };
+            }
+        }
+        if self.listen.is_empty() {
+            self.taps = None;
+        } else if self.taps.is_none() {
             let socks: io::Result<Vec<Socket>> = [
                 (ETH_P_MPLS_UC, MPLS_FILTER),
                 (ETH_P_IP, IP4_FILTER),
                 (ETH_P_IPV6, IP6_FILTER),
             ]
             .iter()
-            .map(|(t, p)| tap(&link, *t, p))
+            .map(|(t, p)| tap(*t, p))
             .collect();
             match socks {
-                Ok(socks) => {
-                    self.taps.insert(name.clone(), Taps { socks });
+                Ok(socks) => self.taps = Some(Taps { socks }),
+                Err(e) => {
+                    failed.extend(self.listen.drain(..).map(|n| (n, e.to_string())));
                 }
-                Err(e) => failed.push((name.clone(), e.to_string())),
             }
         }
         failed
     }
 
-    fn recv(&mut self, wait: Duration) -> Result<Option<Heard>, HalError> {
+    fn recv(&mut self, wait: Duration) -> Result<Option<Frame>, HalError> {
         if let Some(h) = self.queue.pop_front() {
             return Ok(Some(h));
         }
         let ms = u16::try_from(wait.as_millis().min(1000)).unwrap_or(1000);
         let mut fds: Vec<PollFd<'_>> = self
             .taps
-            .values()
+            .iter()
             .flat_map(|t| t.socks.iter())
             .map(|s| PollFd::new(s.as_fd(), PollFlags::POLLIN))
             .collect();
@@ -737,18 +854,24 @@ impl LspResponderIo for HostResponder {
         }
         drop(fds);
         self.drain_udp();
-        for (name, t) in &self.taps {
-            for s in &t.socks {
-                for _ in 0..RECV_BUDGET {
-                    let n = match recvfrom::<LinkAddr>(s.as_raw_fd(), &mut self.buf) {
-                        Ok((n, _)) => n,
-                        Err(_) => break,
-                    };
-                    if let Some(h) = self.buf.get(..n).and_then(|f| parse_frame(f, name))
-                        && self.queue.len() < RECV_BUDGET * 4
-                    {
-                        self.queue.push_back(h);
-                    }
+        self.view.refresh();
+        for s in self.taps.iter().flat_map(|t| t.socks.iter()) {
+            for _ in 0..RECV_BUDGET {
+                let (n, from) = match recvfrom::<LinkAddr>(s.as_raw_fd(), &mut self.buf) {
+                    Ok(got) => got,
+                    Err(_) => break,
+                };
+                let Some(name) = from
+                    .and_then(|l| u32::try_from(l.ifindex()).ok())
+                    .and_then(|i| self.view.links.by_index.get(&i))
+                    .filter(|n| self.listen.contains(n))
+                else {
+                    continue;
+                };
+                if let Some(h) = self.buf.get(..n).and_then(|f| classify(f, name))
+                    && self.queue.len() < RECV_BUDGET * 4
+                {
+                    self.queue.push_back(h);
                 }
             }
         }
@@ -778,6 +901,17 @@ impl LspResponderIo for HostResponder {
         s.send_to(payload, &to.into())
             .map_err(|e| io_hal("echo reply", e))?;
         Ok(())
+    }
+
+    fn send_icmp(&mut self, icmp: &Icmp) -> Result<(), HalError> {
+        match &icmp.delivery {
+            Delivery::Ip => self.send_ip(icmp),
+            Delivery::Lsp {
+                interface,
+                nexthop,
+                stack,
+            } => self.send_lsp(interface, *nexthop, stack, &icmp.packet),
+        }
     }
 
     fn view(&mut self) -> &dyn LsrView {
