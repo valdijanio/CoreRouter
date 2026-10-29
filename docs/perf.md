@@ -2435,3 +2435,54 @@ ressincronização: 4,7–5,0 s; retirada: 1,3 s. CPU no intervalo: `corerouter-
 71 → 79 MiB, `bgpd` 14 → 116 MiB, `zebra` 12 → 69 MiB. `routing.bgp.route.list` primeira página
 767 ms (lê o `bgpd`), depois 2 ms. Convergência num corte silencioso com duas sessões eBGP:
 8,8–9,0 s (hold 9 s), 314–420 ms (BFD 100 ms × 3), 1–2 ms (link down).
+
+### G0.31 — uma rota a mais com 60 000 rotas no kernel (**medido**, 2026-10-29, AMD Ryzen AI MAX+ 395, 32 CPUs, release, máquina compartilhada)
+
+Daemon release `--backend linux --manage dummy0` num namespace sem root, 60 000 rotas /24 por
+`engine.batch` (dois lotes de 30 000), depois `ip.route.add` de uma rota. Duas rodadas cada:
+
+| Medida | Antes | Depois |
+|---|---|---|
+| `ip.route.add` de uma rota com 60 000 instaladas | 140 / 142 ms | 60 / 70 ms |
+| lote de 30 000 rotas, o primeiro | 1,82 s | 1,74 s |
+| lote de 30 000 rotas, o segundo (G0.31d) | 3,77 s | 3,70 s |
+| `system.identity.set` com 60 000 rotas (referência) | 6–7 ms | 6–7 ms |
+
+Onde iam os 140 ms antes (instrumentado): dump das rotas do kernel 76 ms, `plan` 28 ms,
+`kernel_routes` 18 ms, `validate_changed` 16 ms, `save` 7 ms. O resto vira a G0.31e.
+
+### G0.31 — `config.diff` de ponta a ponta e o canal de controle (**medido**, mesma máquina)
+
+Daemon release `--backend virtual` num namespace sem root, 60 000 rotas e 30 000 entradas de
+address-list carregadas por `engine.batch` (4,9 s). Quatro conexões pedem `interface.list` sem
+parar, ao lado de uma quinta que pede outra consulta sem parar (TCP com o token local, 6 s):
+
+| Ao lado | Leves: pedidos/s | p50 | p99 | máx. |
+|---|---|---|---|---|
+| `config.diff`, antes do #395 (556 ms cada) | 6 | 672 ms | 2,0 s | 2,0 s |
+| `config.diff`, depois (178 mil chamadas em 6 s) | 52,5 mil | 72 µs | 145 µs | 12,8 ms |
+| `ip.route.list` (771 ms cada; G0.31b) | 48,6 mil | 63 µs | 141 µs | 192 ms |
+| `ip.firewall.address-list.list` (90 ms cada) | 43,5 mil | 64 µs | 152 µs | 24,8 ms |
+
+Sem consulta pesada (`interface.list`, lab de 8 portas):
+
+| Conexões | Pedidos/s | p50 | p99 |
+|---|---|---|---|
+| 1 | 21,9 mil | 42 µs | 86 µs |
+| 8 | 79,6 mil | 97 µs | 214 µs |
+| 16 (`MAX_CONNECTIONS`) | 72,9 mil | 214 µs | 622 µs |
+| 64 | 16 atendidas, 48 recusadas com "too many connections" | 223 µs | 660 µs |
+
+Com 15 conexões, as threads `control-conn` somam 292 % de CPU e a mais ocupada fica em 30 %. A
+vazão para em ~73 mil/s no lock do `Session`, não na CPU: cada consulta segura o lock ~13 µs.
+
+### G0.31 — conntrack com 250 000 entradas (**medido**, mesma máquina)
+
+Namespace sem root, `nf_conntrack_max` do host = 262 144. Foram 250 000 fluxos UDP criados em
+0,6 s e o daemon release rodando `--backend linux`. A CLI chama `ip.firewall.connection.list
+count=5` em 0,14 s, contando o processo. Quatro conexões leves ao lado de uma que pede sem parar:
+
+| Ao lado | Pesada por chamada | Leves: pedidos/s | p50 | p99 | máx. |
+|---|---|---|---|---|---|
+| `ip.firewall.connection.list` | 3,0 ms | 6,7 mil | 139 µs | 2,4 ms | 151 ms (dump) |
+| `ip.firewall.connection.top` | 2,8 ms | 1,4 mil | 2,7 ms | 5,6 ms | 154 ms (dump) |

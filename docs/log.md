@@ -7040,3 +7040,18 @@ continuação indentadas).
 
   Desempenho: a lista custa O(estáticas) no render, só com `static` pedido; o gatilho do commit
   compara as listas de rotas só quando elas não são a mesma cópia.
+
+- 2026-10-29 — G0.31: Auditoria de desempenho, parte 5: com o backend linux, todo commit que acrescentava uma rota lia a
+  tabela inteira do kernel (`load_hops`, um dump `RTM_GETROUTE`) antes do primeiro `add`, só para
+  saber se já havia rota igual (nossa depois de um reinício, irmã de ECMP ou de outro programa).
+  Com 60 000 rotas o dump custava 76 ms por commit, sob o lock do `Session`. Agora o `add` (que já
+  vai com `NLM_F_EXCL`) é tentado primeiro, e a tabela só é lida quando o kernel responde `EEXIST`;
+  nesse caso seguem as mesmas regras de antes (adota, junta ao ECMP ou recusa). Uma rota a mais com
+  60 000 instaladas: 140 → 60–70 ms (**medido**). Teste novo
+  `a_route_of_someone_else_is_refused_not_replaced` (`crates/hal-linux/tests/netns_routes.rs`): a
+  rota alheia fica intocada e a rota anterior do mesmo commit é desfeita. Os testes de ECMP e de
+  adoção continuam passando.
+
+  Também medido nesta auditoria e registrado aqui (os PRs #395 e #399 já tinham entrado):
+  `config.diff` e `state.inspect` de ponta a ponta no daemon, o canal de controle com 1, 8, 16 e 64
+  conexões, e o conntrack com 250 mil entradas. As gaps G0.31b–e saem desses números.
