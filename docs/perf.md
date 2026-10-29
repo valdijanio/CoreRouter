@@ -2772,3 +2772,20 @@ e depois (G0.31j).
   três boots cada): memória ociosa sem protocolo de roteamento 98,9 MiB (8 daemons do FRR) →
   70,9 MiB (mgmtd, zebra, staticd); FRR com os sockets vty prontos 0,82 s depois do kernel
   (antes 1,0–1,9 s).
+
+### Build rápido da imagem (processo, 2026-10-29)
+
+**Medido** em 2026-10-29, AMD Ryzen AI Max+ 395 (32 threads), 62 GiB, NVMe, build release, com
+5–6 outras sessões compilando (carga 20–90). Cada lado numa cópia própria do out em
+`/srv/build` (ccache do checkout principal, downloads em cache).
+
+| Situação | Antes | Depois |
+|---|---|---|
+| `os build` completo, out vazio só com ccache | 1063 s (`make all` 838 s, serial) | 1010 s (`make all` 800 s, `-j6 -l32`) |
+| Uma linha no daemon, `os build --only crpkg` | 889 s (GUI 331 + `make all` 497; 126 + 97 crates recompilados) | 213 s (GUI 60 s, 0 crates; `make all` 139 s) |
+| CLI do `push`, target novo | 223 s | 66 s |
+| CLI do `push`, uma linha no engine | 144 s | 3,2 s |
+
+O paralelismo médio entre pacotes no build completo foi 2,1× (1714 s de pacotes em 802 s). A
+corrente `host-protobuf` (309 s) → `protobuf-c` → FRR → kernel do instalador limita o `-j` de
+topo.
