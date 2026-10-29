@@ -30,7 +30,7 @@ pub const AGGREGATE_V4: u8 = 16;
 pub const AGGREGATE_V6: u8 = 32;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[cmd!(query "ip.route.page", "Routes (page)", [], None,
-    "{routing_table?: string, family?: string (ipv4 | ipv6), state?: string (active | standby | inactive), origin?: string (connected | static | dhcp | ra; several comma-separated), prefix?: cidr | ip, match?: string (exact | longer | orlonger | covering; default orlonger for a prefix, covering for an address), aggregate?: bool (routes longer than /16, IPv6 /32, as one line per /16 with their counts), offset?: u32, limit?: u32 (1..=5000, default 500)} → {total (lines that match), offset, rows: [ip.route.list rows | {key, bucket: true, dst_address, family, routing_table, routes, active, standby, inactive, state}], summary: {total, active, standby, inactive, ipv4, ipv6, origins: {origin: n}, tables: {table: n}}, generation}",
+    "{routing_table?: string, family?: string (ipv4 | ipv6), state?: string (active | standby | inactive), origin?: string (connected | static | dhcp | ra; several comma-separated), prefix?: cidr | ip, match?: string (exact | longer | orlonger | covering; default orlonger for a prefix, covering for an address), aggregate?: bool (routes longer than /16, IPv6 /32, as one line per /16 with their counts), offset?: u32, limit?: u32 (1..=5000, default 500)} → {total (lines that match), offset, rows: [ip.route.list rows | {key, bucket: true, dst_address, family, routing_table, routes, active, standby, inactive, state}], summary: {total, active, standby, inactive, ipv4, ipv6, origins: {origin: n}, tables: {table: n}, ecmp_warning (ECMP groups that need a look), ecmp_info}, generation}",
     always, page)];
 
 /// How a route's prefix must relate to the one searched.
@@ -184,6 +184,8 @@ fn summary_json(s: &Summary) -> Value {
         "ipv6": s.ipv6,
         "origins": s.origins,
         "tables": s.tables,
+        "ecmp_warning": s.ecmp_warning,
+        "ecmp_info": s.ecmp_info,
     })
 }
 

@@ -208,7 +208,7 @@ impl DhcpForm {
             use_peer_dns: true,
             use_peer_ntp: true,
             add_default_route: "yes".into(),
-            distance: "1".into(),
+            distance: "254".into(),
             table: String::new(),
             comment: String::new(),
             disabled: false,

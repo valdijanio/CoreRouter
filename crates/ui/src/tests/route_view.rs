@@ -332,3 +332,41 @@ fn a_gateway_that_does_not_resolve_shows_an_amber_incomplete_chip() {
     assert_eq!(text, "10.0.0.77");
     assert!(chips.contains(&(crate::chip::Kind::Amber, "incomplete")), "{chips:?}");
 }
+
+/// G1.27j: a static + DHCP default at the same distance is an amber ECMP
+/// group with the notice (translated) in the Reason column and a footer
+/// count; an ECMP of one origin stays blue and uncounted.
+#[test]
+fn a_mixed_ecmp_group_warns_in_amber_with_the_fix() {
+    let fix = r#"ip.dhcp-client.set {"id":"*7","default_route_distance":254}"#;
+    let notice = json!({"level": "warning", "id": "ecmp-mixed",
+        "text": format!("static + dhcp routes share the traffic per connection at distance 1 (*1 via 10.0.0.1%ether1, *DC000701 via 10.15.0.1%ether2): each leaves with a different address; make one a backup: {fix}"),
+        "args": {"origins": "static + dhcp", "distance": "1",
+                 "vias": "*1 via 10.0.0.1%ether1, *DC000701 via 10.15.0.1%ether2", "fix": fix},
+        "fix": fix});
+    let routes = vec![
+        route(json!({"key": "*1", "id": "*1", "dst_address": "0.0.0.0/0", "gateway": "10.0.0.1",
+            "interface": "ether1", "distance": 1, "routing_table": "main", "state": "active",
+            "active": true, "origin": "static", "ecmp": 2, "notice": notice})),
+        route(json!({"key": "*DC000701", "id": "*DC000701", "dst_address": "0.0.0.0/0",
+            "gateway": "10.15.0.1", "interface": "ether2", "distance": 1, "routing_table": "main",
+            "state": "active", "active": true, "origin": "dhcp", "dynamic": true, "ecmp": 2,
+            "notice": notice})),
+        route(json!({"key": "*2", "id": "*2", "dst_address": "10.9.0.0/16", "gateway": "10.0.0.5",
+            "interface": "ether1", "distance": 1, "routing_table": "main", "state": "active",
+            "active": true, "origin": "static", "ecmp": 2,
+            "notice": {"level": "info", "id": "ecmp-same", "text": "2 static paths share the traffic",
+                       "args": {"paths": "2", "origin": "static", "distance": "1", "vias": "x"}}})),
+        route(json!({"key": "*3", "id": "*3", "dst_address": "10.9.0.0/16", "gateway": "10.0.0.6",
+            "interface": "ether1", "distance": 1, "routing_table": "main", "state": "active",
+            "active": true, "origin": "static", "ecmp": 2})),
+    ];
+    let rows = rows_of(&routes, &View::default(), langs(Lang::Pt));
+    let group = rows.iter().find(|r| r.key == "ecmp main 0.0.0.0/0").unwrap();
+    assert!(group.cells[2].contains("warning"), "{:?}", group.cells);
+    assert!(group.cells[7].contains("deixe uma de reserva") && group.cells[7].contains(fix), "{:?}", group.cells);
+    let other = rows.iter().find(|r| r.key == "ecmp main 10.9.0.0/16").unwrap();
+    assert!(!other.cells[2].contains("warning"), "{:?}", other.cells);
+    assert!(other.cells[7].contains("caminhos static"), "{:?}", other.cells);
+    assert_eq!(counts(&routes).ecmp_warning, 1);
+}

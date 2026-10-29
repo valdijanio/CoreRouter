@@ -40,4 +40,17 @@ Rotas pelo mesmo gateway dividem uma verificação: mil rotas, uma sonda.
 
 **Estado**: `checking` (sem resposta ainda), `reachable`, `unreachable`, `not-checked` (nenhum daemon roda as verificações).",
     ),
+    (
+        "routes.reason",
+        "## Motivo
+
+Por que uma rota está **em espera** (uma rota de distância menor ganha; ela assume quando aquela cair) ou **inativa** (desativada, sem link, gateway inalcançável…).
+
+Na linha de um grupo **ECMP** (caminhos na mesma distância que dividem o tráfego por conexão) é o aviso do grupo:
+
+- `ECMP` azul (info): caminhos de uma origem só para uma rede que não é a rota padrão, como dois gateways estáticos. Em geral intencional.
+- `ECMP` `aviso` âmbar: origens diferentes (estática + DHCP, dois uplinks DHCP) ou a rota padrão. Cada conexão sai por um dos uplinks, com um endereço público diferente: um site vê o mesmo usuário vindo de dois endereços, e um uplink que cai leva junto a parte dele das conexões. O texto termina com o comando que deixa um deles de reserva (distância 254 no cliente DHCP, ou a rota estática um passo atrás).
+
+O aviso também conta em System › Health (`routes.ecmp`) e nas notas do cliente DHCP.",
+    ),
 ];

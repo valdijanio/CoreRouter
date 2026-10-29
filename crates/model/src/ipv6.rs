@@ -376,6 +376,8 @@ pub struct Dhcp6Client {
     /// default: on most links the default route comes from RA.
     #[serde(default)]
     pub add_default_route: bool,
+    /// A new client gets [`crate::dhcp_client::DEFAULT_ROUTE_DISTANCE`]
+    /// (G1.27j); a saved config without the field reads 1, as before.
     #[serde(default = "default_distance")]
     pub default_route_distance: u8,
     #[serde(default = "yes")]
@@ -399,7 +401,8 @@ fn default_distance() -> u8 {
 }
 
 impl Dhcp6Client {
-    /// A client with RouterOS' defaults.
+    /// A client with RouterOS' defaults, except the routes' distance (254,
+    /// G1.27j).
     pub fn new(id: ItemId, interface: IfName, request: Request6) -> Self {
         Self {
             id,
@@ -411,7 +414,7 @@ impl Dhcp6Client {
             prefix_hint: None,
             accept_prefix_without_address: true,
             add_default_route: false,
-            default_route_distance: DEFAULT_DISTANCE,
+            default_route_distance: crate::dhcp_client::DEFAULT_ROUTE_DISTANCE,
             use_peer_dns: true,
             rapid_commit: true,
             custom_duid: String::new(),
@@ -492,10 +495,12 @@ mod tests {
         let c: Dhcp6Client =
             serde_json::from_str(r#"{"id": "*1", "interface": "ether1", "request": "prefix"}"#)
                 .unwrap();
-        assert_eq!(
-            c,
-            Dhcp6Client::new(ItemId(1), "ether1".parse().unwrap(), Request6::Prefix)
-        );
+        // A config that never wrote the distance keeps 1 (G1.27j); a new
+        // client gets 254.
+        let mut want = Dhcp6Client::new(ItemId(1), "ether1".parse().unwrap(), Request6::Prefix);
+        assert_eq!(want.default_route_distance, 254);
+        want.default_route_distance = DEFAULT_DISTANCE;
+        assert_eq!(c, want);
         let back: Dhcp6Client = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(back, c);
         let s: Ipv6Settings = serde_json::from_str("{}").unwrap();
