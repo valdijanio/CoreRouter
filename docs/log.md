@@ -7388,3 +7388,47 @@ continuação indentadas).
   cargo xtask vm-lab run -- scripts/routeros-interop-l2.sh
   unshare --user --map-root-user --net --mount -- sh -c 'mount -t tmpfs none /run && mkdir /run/netns && W=/tmp/crw NO_CHR=1 BIN=$PWD/target/release scripts/routeros-interop-l2.sh dhcp-conflict'
   ```
+
+- 2026-10-29 — G1.6q: Teste de produção da imagem instalada, parte 2: o soak de 8 h e os testes funcionais na VM real
+  (`corerouter-teste`, já com a imagem da parte 1, `f694e065`, slot `b`, dm-verity ativo).
+  Gráfico: `docs/changes/G1.6q-soak-screenshots/soak.png`.
+
+  Soak, uma amostra a cada 10 min (`system.resource.print`, `system.resource.process.print`,
+  `system.health.check`, `log.print` dos avisos novos), **medido** em 2026-10-29:
+
+  - **VM real, imagem nova**, pelo canal 7990 da GUI do usuário (uma conexão fixa): 38 amostras de
+    04:20 a 10:30 (6,2 h). Às ~10:35 a GUI do 7990 fechou e as amostras seguintes falharam; uma
+    amostra final às 12:21 pelo login TLS autorizado fecha as **8 h** de uptime. Daemon 46,3 →
+    49,3 MiB: +2,7 MiB nos primeiros 30 min (caches, primeiro uso), depois **+0,03 MiB/h** (49,06 →
+    49,31 MiB de 04:50 a 12:21). Threads 57 e descritores 24 fixos (56/23 no fim, sem a conexão do
+    7990). FRR 102,8 → 103,2 MiB (+0,4 MiB uma vez na 1ª hora, depois plano), 25 threads.
+    `MemAvailable` 1 837,7 → 1 831,4 MiB (−0,8 MiB/h, cache de página). `/config` 4,86 → 4,89 MiB
+    (uma revisão de teste). Saúde sempre `warning` só pelo `admin` sem senha; nenhum erro novo no
+    log em 8 h, e os únicos avisos novos são os "Login sem senha" das próprias amostras por TLS.
+    Consulta completa de 17–40 ms.
+  - **Cópia local A, imagem de 28/10** (`3d79961`), por TLS com ~5 logins por amostra: 48 amostras
+    em 7,8 h. Threads 55, FRR 102,5 MiB e `/config` fixos. O daemon foi de 40,8 a 54,2 MiB, cada
+    vez mais rápido: **não é vazamento**. Cada amostra gravava 5 avisos "Login sem senha" no log
+    (teto de 1 000 entradas), e a resposta do `log.print {level: warning, limit: 2000}` crescia
+    junto até ~450 KB; o alocador guarda o pico. Reproduzido na cópia B (imagem nova): 600
+    `log.print` de 450 KB levam o daemon de 42,6 a **59,8 MiB e param aí** (59,32 → 59,81 → 59,82
+    em rodadas de 200), e 60 s depois ele está em 56,0 MiB. 300 logins TLS seguidos e 200 de cada
+    uma das outras consultas não mudam o RSS (±0,4 MiB), nas duas imagens.
+  - **Observação pelo host** (`virsh domstats`, HTTPS e TLS a cada 10 min, 48 amostras, 7,8 h): VM
+    `running` o tempo todo, HTTPS 200 em 2–3 ms, TLS em 15–17 ms, QEMU com 416–439 MiB. A gerência
+    mandou **~335 KiB/s** o tempo todo para as GUIs do usuário (12,7 GB na noite), que ainda são
+    binários anteriores ao etag do `engine.list` da parte 1. Com GUI nova a conta cai para ~8 KiB/s
+    por GUI.
+
+  Funcional na VM real pelo canal 7990 (imagem `f694e065`, **medido** em 2026-10-29, tudo desfeito
+  no fim; revisões 15–22 do histórico):
+
+  - `ping 1.1.1.1` pela `ether1` (cliente): 4/4, média 39,4 ms, jitter 0,03 ms.
+  - NTP (`pool.ntp.org`): sincronizado em 3 s, stratum 2, offset −58,6 ms (o relógio vinha do
+    RTC), RTT 56,9 ms; desligado de novo, como estava.
+  - Transacional: loopback com 192.0.2.99/32, bridge com a `ether2` (sem cabo), VLAN 999 com
+    198.51.100.99/24: diff de 32 linhas, commit na revisão 15, drift em sincronia; o rollback para a
+    14 fica pendente em modo transacional até o commit (revisão 16), como no Junos; volta ao modo
+    `immediate`, interfaces e endereços como antes.
+  - Safe Mode: a queda da sessão MCP desfez as mudanças (revisão 20), e o `config.safe-mode.cancel`
+    também (revisão 22).

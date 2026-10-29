@@ -2561,3 +2561,26 @@ VM `corerouter-lab` (2 vCPU do host AMD Ryzen AI Max+ 395), build release, 2026-
 |---|---|---|---|---|---|---|
 | 20 000 | 20 000 | 88,6 s | 20 000 / 20 000 / 20 000 (sem reenvio) | 1 800 | 92 % | o BNG Blaster na VM (~210 sessões/s) |
 | 20 000 (`start-rate` 10 000/s) | 19 381 em 90 s | — | 19 381 de cada | 3 021 | 93 % | o mesmo |
+
+### Soak de 8 h da imagem instalada (G1.6q)
+
+**Medido** em 2026-10-29, VM libvirt `corerouter-teste` (2 vCPUs, 2 GiB, AMD Ryzen AI Max+ 395,
+KVM) com a imagem release `f694e065`, e uma cópia local da imagem `3d79961` no QEMU de usuário.
+Uma amostra a cada 10 min. Gráfico em `docs/changes/G1.6q-soak-screenshots/soak.png`.
+
+| O quê (VM real, imagem nova) | Início | 8 h | Tendência |
+|---|---|---|---|
+| RSS do daemon | 46,3 MiB | 49,3 MiB | +2,7 MiB na 1ª meia hora, depois +0,03 MiB/h |
+| Threads / descritores do daemon | 57 / 24 | 56 / 23 | fixos (−1 sem a conexão do 7990) |
+| RSS do FRR (8 daemons, 10 processos) | 102,8 MiB | 103,2 MiB | +0,4 MiB uma vez, depois plano |
+| `MemAvailable` | 1 837,7 MiB | 1 831,4 MiB | −0,8 MiB/h (cache de página) |
+| `/config` usado | 4,86 MiB | 4,89 MiB | uma revisão de teste |
+| Erros novos no log | 0 | 0 | — |
+| Consulta completa (4 comandos) | 27 ms | 19 ms | 17–40 ms |
+
+| O quê (outras medições) | Número |
+|---|---|
+| Daemon depois de 600 `log.print` de ~450 KB (cópia B) | 42,6 → 59,8 MiB, para aí; 56,0 MiB 60 s depois |
+| 300 logins TLS seguidos | ±0,4 MiB nas duas imagens |
+| Gerência → GUIs antigas do usuário (sem etag) | ~335 KiB/s, 12,7 GB em 7,8 h |
+| HTTPS / TLS da gerência, pelo host | 2–3 ms / 15–17 ms |
