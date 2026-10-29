@@ -6954,3 +6954,159 @@ continuação indentadas).
   Só CPU não reproduz: 0 falhas em 7 rodadas do `cargo xtask netns` inteiro preso em 4 e em
   2 núcleos com laços de carga, e 0 em 5 do teste sozinho sob carga. A janela aparece quando
   vários daemons sobem e são configurados ao mesmo tempo, como no passo `netns` do CI.
+
+- 2026-10-29 — G3.9f: Interoperabilidade BGP, parte 1: CoreRouter × CoreRouter e FRR 10.7.1, sem root e sem a VM do
+  laboratório (presa a noite toda). `scripts/bgp-crcr-userns.sh` monta dois CoreRouters (backend
+  linux, cada um com o seu FRR) e dois FRR num namespace de usuário + rede + montagem
+  (`unshare --user --map-root-user`), com os pacotes oficiais do FRR 10.7.1 (deb.frrouting.org,
+  SHA-256 do índice conferido) extraídos no target, nunca instalados; 12 casos, 50 OK, 0 FAIL e nenhum
+  aviso "FRR prints … differently" na última rodada (**medido**, AMD Ryzen AI Max+ 395, 32 threads, release, 2026-10-29). O roteiro contra o RouterOS 7.25
+  CHR, `scripts/routeros-interop-bgp.sh` (17 casos: eBGP/iBGP v4/v6, MP-BGP, multihop, MD5,
+  communities normal/large/extended, filtros nos dois sentidos, next-hop-self, refletor nos dois
+  sentidos, max-prefix, reinício, BFD, convergência, 100 mil prefixos, CoreRouter × CoreRouter),
+  está pronto e roda na próxima janela da VM (`G3.9f-routeros`).
+
+  Defeitos achados e corrigidos (cada um com teste):
+
+  - **O BFD do BGP desligava a cada commit.** O `bgpd` 10.7.1 imprime `neighbor X bfd` e
+    `neighbor X bfd profile P`; o render só tinha a segunda, e todo sync digitava
+    `no neighbor X bfd` (o aviso "FRR prints … differently" em cada commit). Num corte silencioso
+    com duas sessões, a troca de caminho levava 7,8 s (o hold time) em vez de 0,3 s. Agora as duas
+    linhas, com a do perfil apagada antes (`hal-frr`), como o OSPF já fazia (G3.6l). Depois:
+    **314–420 ms** (BFD 100 ms × 3, duas rodadas, **medido**).
+  - **Um `bgpd` reiniciado ficava vazio.** `Frr::incarnation` virava `None` quando qualquer daemon
+    que o CoreRouter configura não tinha `.pid` (aqui `ospf6d` e `ldpd` não subiam; a G1.6i quer
+    justamente subir só os usados): o serviço `frr` nunca via o reinício. Agora o ausente conta
+    como `-`; o `bgpd` morto e subido de novo recebe a config em 5,9 s (**medido**).
+  - **O BGP não anunciava nada do próprio roteador.** Faltava o `output.network` e o
+    `output.redistribute` do RouterOS: entraram `output_network` (address-list) e
+    `output_redistribute` (`connected`, `static`, `ospf`) nos templates e conexões, e o papel
+    `ibgp-rr` (refletor, RFC 4456). As estáticas do CoreRouter são rotas *kernel* para o `zebra`
+    (o backend linux as instala com `proto static`): `static` vira `redistribute kernel` com um
+    route-map dos prefixos estáticos. Um commit que muda só a address-list ou só as estáticas
+    agora chega ao FRR (antes só um commit de `routing` chegava): ~0,12 s da entrada nova até o
+    vizinho (**medido**).
+  - **`corerouter-cli … | head` dava panic** (`println!` com stdout fechado): agora sai com 141,
+    como um pipe.
+
+  | Caso (host, FRR 10.7.1) | Resultado (**medido**) |
+  |---|---|
+  | eBGP IPv4 CR1 (65000) × CR2 (65002) | Established 5,4 s depois da config; rotas no kernel 1–3 ms depois; ping entre os gateways dos clientes |
+  | `output_network` | entrada nova da lista no vizinho em 118–131 ms, retirada em 133–205 ms; rede sem rota não sai e sai 210 ms depois de surgir a estática |
+  | `output_redistribute=static` | no vizinho em ~4 s |
+  | eBGP IPv6 (transporte e NLRI) | Established 4,5 s; next hop link-local no kernel |
+  | MP-BGP (IPv4 + IPv6 numa sessão IPv4) | IPv6 instalado; next hop global `fd39:5::1` + link-local (RFC 2545 §3) |
+  | TCP MD5 | Established; chave selada no disco; chave errada derruba e mantém caída; corrigida volta em ~1 s |
+  | Filtros e communities | MED 77, prepend 2, community 65000:10 + no-export, large 65000:0:10, community-list → local-pref 300; no-export respeitado; chain alterada aplica em ~5 s sem reset |
+  | next-hop-self (eBGP de um FRR → iBGP) | sem `force-self` o CR2 não instala (next hop inalcançável, RFC 4271 §5.1.3); com ele, instala 221 ms depois do commit |
+  | Refletor (CR1 RR, clientes CR2 e FRR) | ORIGINATOR_ID e CLUSTER_LIST corretos nos dois sentidos; sem o papel o cliente perde a rota em 139 ms |
+  | max-prefix | 6 > 3 com `shutdown`: sessão `idle`, "Reached received prefix count"; o FRR do outro lado recebe Cease/Maximum Number of Prefixes Reached (`0601`, RFC 4486); `warning` mantém os 6 |
+  | Reinício | `corerouter-daemon` reiniciado (responde em 210 ms) não toca a sessão; `bgpd` morto: o vizinho retira em 106 ms (sem graceful restart, G3.9ff) e a config volta em 5,9 s |
+  | BFD 100 ms × 3 | sobe com o BGP; perda total silenciosa retira a rota em 313–416 ms (hold 180 s) |
+  | Convergência (2 sessões, hold 9 s) | corte silencioso: 8,8–9,0 s pelo hold, **314–420 ms** com BFD (7,8 s antes da correção); link down: 1–2 ms |
+  | 100 mil prefixos | FRR → CR1 no kernel em 3,5–4,5 s; CR1 → CR2 em 3,6–3,9 s; `session.clear` ressincroniza em 4,7–5,0 s; retirada total em 1,3 s |
+
+  Desempenho e paralelismo (100 mil prefixos, **medido**): o `corerouter-daemon` fica em ~0 % de
+  CPU durante a carga e parado (nenhuma thread passa de 0,2 s em 300 s; RSS 71 → 79 MiB depois de
+  listar a tabela), então o caminho quente é do FRR: `bgpd` 0,4–0,5 s de CPU numa thread
+  (116 MiB), `zebra` 0,8–1,0 s na principal + 0,5–0,6 s na `zebra_apic` + 0,1–0,2 s na
+  `zebra_dplane` (69 MiB). Nada serializado do nosso lado a dividir; o `bgpd` de uma thread
+  principal é do FRR (decisão G3.1). Comandos com 100 mil rotas: `session.list` 3 ms,
+  `route.list` (primeira página, lendo o `bgpd`) 767 ms, um prefixo com a tabela em cache 2 ms,
+  `route.summary` 2 ms, `ip.route.page` 3 ms. O custo novo do render é O(conexões + entradas das
+  listas nomeadas + estáticas), só quando uma conexão anuncia; o gatilho do commit é O(1) quando
+  lista e estáticas não mudaram (cópias compartilhadas).
+
+  Como testar: `scripts/bgp-crcr-userns.sh` (ou só alguns casos: `… filters bfd`), sem root;
+  `cargo test -p corerouter-proto-bgp origination static_redis`,
+  `cargo test -p corerouter-hal-frr bfd incarnation`.
+
+- 2026-10-29 — G3.9fe: OSPF `redistribute=static` não anunciava nada: o backend linux instala as estáticas do
+  CoreRouter direto no kernel (`proto static`) e o `zebra` as lista como *kernel*, então o
+  `redistribute static` do `ospfd` (que é o do `staticd`) não achava nenhuma — o mesmo defeito
+  achado no BGP na G3.9f, reproduzido em `scripts/bgp-crcr-userns.sh ospf-static` (antes: FAIL,
+  "zebra on CR1 sees [kernel]"). Agora `static` sai como `redistribute kernel route-map
+  CR-O2-<inst>-kernel`, cujo `deny 2` casa a prefix-list `…-NOTSTATIC` (cada estática do main em
+  `deny`, o resto em `permit 0.0.0.0/0 le 32`; IPv6 no v3), depois dos pools de assinantes e antes
+  da chain do `out_filter_chain` — a forma que o `ospfd`/`ospf6d` 10.7.1 imprimem (nenhum aviso de
+  redigitação). Com `kernel` pedido também, vai o kernel inteiro, sem a lista. Um commit que só
+  muda `/ip route` agora chega ao FRR quando uma instância redistribui estáticas (gatilho O(1)
+  quando as rotas não mudaram).
+
+  Laboratório no host (**medido**, FRR 10.7.1, 2026-10-29): estática anunciada a CR2 por OSPF;
+  uma rota kernel de outro programa (`proto boot`) fica de fora com `static` e entra com
+  `kernel` em 106 ms; uma estática nova chega ao vizinho 118 ms depois do comando. Como testar:
+  `scripts/bgp-crcr-userns.sh ospf-static`, `cargo test -p corerouter-proto-ospf static_redistribution`.
+
+  Desempenho: a lista custa O(estáticas) no render, só com `static` pedido; o gatilho do commit
+  compara as listas de rotas só quando elas não são a mesma cópia.
+
+- 2026-10-29 — G0.31: Auditoria de desempenho, parte 5: com o backend linux, todo commit que acrescentava uma rota lia a
+  tabela inteira do kernel (`load_hops`, um dump `RTM_GETROUTE`) antes do primeiro `add`, só para
+  saber se já havia rota igual (nossa depois de um reinício, irmã de ECMP ou de outro programa).
+  Com 60 000 rotas o dump custava 76 ms por commit, sob o lock do `Session`. Agora o `add` (que já
+  vai com `NLM_F_EXCL`) é tentado primeiro, e a tabela só é lida quando o kernel responde `EEXIST`;
+  nesse caso seguem as mesmas regras de antes (adota, junta ao ECMP ou recusa). Uma rota a mais com
+  60 000 instaladas: 140 → 60–70 ms (**medido**). Teste novo
+  `a_route_of_someone_else_is_refused_not_replaced` (`crates/hal-linux/tests/netns_routes.rs`): a
+  rota alheia fica intocada e a rota anterior do mesmo commit é desfeita. Os testes de ECMP e de
+  adoção continuam passando.
+
+  Também medido nesta auditoria e registrado aqui (os PRs #395 e #399 já tinham entrado):
+  `config.diff` e `state.inspect` de ponta a ponta no daemon, o canal de controle com 1, 8, 16 e 64
+  conexões, e o conntrack com 250 mil entradas. As gaps G0.31b–e saem desses números.
+
+- 2026-10-29 — G3.9h: Interoperabilidade de L2 e serviços, parte 2: o roteiro `scripts/routeros-interop-l2.sh` (casos
+  wire, vlan, qinq, mtu, lldp, arp, tools, dhcp, dhcp-client, dhcp-relay, dhcp6, dhcp6-client,
+  ra, ntp, dns, nat, cgnat, bond, cr-dhcp, cr-bond, storm e dns-qps). Roda na VM do laboratório
+  contra o RouterOS 7.25 CHR (`cargo xtask vm-lab run -- scripts/routeros-interop-l2.sh
+  [casos]`) ou, com `NO_CHR=1`, só os casos CoreRouter × CoreRouter num namespace descartável sem
+  root, no host. Detalhes da montagem:
+
+  - as portas do CHR ficam no namespace raiz, ligadas por veth + `tc mirred` ao namespace do
+    CoreRouter, porque o daemon não adota um tap criado fora dele e uma bridge não passa LACP;
+  - o roteiro tem um vigia de 30 min e só usa `wait <pid>`; o `wait` sem argumento esperava os
+    daemons e prendeu a VM numa rodada de 2026-10-29;
+  - sem BNG Blaster, a tempestade usa um gerador DHCP em Python num socket AF_PACKET.
+
+  Resultados CoreRouter × CoreRouter (**medido**, 2026-10-29, host de 32 núcleos, release, veth
+  num namespace sem root):
+
+  - **DHCP sobre VLAN 50:** B pega o lease de A com gateway, DNS e domínio certos.
+    - O release chega a A, que libera o lease, e B volta a pedir. É o mesmo do RouterOS: o
+      `/ip dhcp-client release` de lá diz "release current binding and restart DHCP client". O
+      roteiro esperava o lease livre e foi corrigido.
+  - **802.3ad entre os dois kernels:**
+    - um agregador só, com os dois membros, em ~415 ms;
+    - vazão clientes → A (roteando) → bond → B: 88 Gbit/s com 1 fluxo e 354–380 Gbit/s com 4
+      fluxos (veth: limitado por CPU, não é número de placa);
+    - um membro cortado com queda de portadora não perde nada;
+    - corte silencioso do membro que leva o tráfego (portadora em pé, quadros descartados com
+      tc): 1,83 s perdidos até o timeout do LACP tirar o membro do agregador. Bate com a
+      IEEE 802.1AX: com `lacp_rate` fast, 3 × 1 s contados desde o último LACPDU.
+  - **Tempestade DHCPv4:** o servidor acompanha o gerador até 10 mil DISCOVER/s.
+    - 20 000 clientes: 99 % ligados em 1,99 s (9 969 leases/s), latência de 1,6–3,2 ms no
+      histograma do servidor e a thread `svc-dhcp-server` a 14 % de um núcleo;
+    - a 40 mil/s quem cai é o gerador em Python: ele perde OFFERs e reenvia tudo a cada segundo, o
+      que um cliente real não faz (RFC 2131 §4.1: 4, 8, 16… s). O teto do servidor fica para o BNG
+      Blaster na VM.
+  - **DNS QPS:** nomes estáticos e em cache, de 1, 4 e 8 clientes com 32 consultas em voo. Com 1
+    leitor UDP: 376 mil respostas/s com a `dns-udp` a 100 % de um núcleo, e mais clientes não davam
+    mais. Isso confirma a G0.31 (#400), que entrou na `main` em paralelo com os mesmos 4 leitores
+    por socket. Com 4 leitores: 1,12 milhão/s a 400 %; com 8, 1,33 milhão/s a 760 % (rendimento
+    por núcleo cai de 281 para 175 mil/s). Este PR acrescenta o teste
+    `parallel_clients_share_the_udp_readers`: clientes em paralelo recebem cada um a sua resposta,
+    e desligar o encaminhador para todos os leitores.
+
+  Os casos contra o CHR (VLAN/QinQ/MTU, LLDP/MNDP, ARP, ferramentas, DHCPv4/v6, RA, NTP, DNS,
+  NAT/CGNAT e bonding com o RouterOS) esperam a VM, presa desde 2026-10-29 por uma rodada antiga
+  deste roteiro.
+
+  Teste:
+
+  ```sh
+  unshare --user --map-root-user --net --mount -- sh -c 'mount -t tmpfs none /run && mkdir /run/netns && W=/tmp/crw NO_CHR=1 BIN=$PWD/target/release scripts/routeros-interop-l2.sh'
+  cargo test -p corerouter-daemon --bin corerouter-daemon -- dns_server::
+  ```
+
+  O primeiro pede `jq` e `iperf3` no PATH.

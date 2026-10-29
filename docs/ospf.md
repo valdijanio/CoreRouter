@@ -26,6 +26,13 @@ corerouter-cli run routing.ospf.interface-template.add '{"area":"backbone","netw
 corerouter-cli run routing.ospf.interface-template.check '{"area":"backbone","networks":"192.168.0.0/16"}'
 ```
 
+`redistribute=static` anuncia as rotas estáticas do CoreRouter (`/ip route`). Como o backend
+linux as instala direto no kernel (`proto static`), o `zebra` as vê como rotas *kernel*: o render
+usa `redistribute kernel` com um route-map que recusa toda rota kernel que não seja uma estática
+configurada (`CR-O2-<instância>-NOTSTATIC`), antes da chain do `out_filter_chain`. Com `kernel`
+pedido também, tudo do kernel vai (e as estáticas com ele). Uma estática nova chega ao vizinho no
+mesmo commit (~0,12 s, **medido**, G3.9fe).
+
 ## Como funciona
 
 - **Templates → interfaces** (`proto_ospf::bind`): para cada interface habilitada, o primeiro
