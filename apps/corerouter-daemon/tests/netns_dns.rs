@@ -29,7 +29,6 @@ use std::net::UdpSocket;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 
 use common::*;
 use hickory_proto::op::{Message, OpCode, ResponseCode};
@@ -151,8 +150,11 @@ fn ping_resolves_through_the_router_resolver() {
     assert_eq!(queries.load(Ordering::Relaxed), 0);
 
     run("ip.dns.set", json!({"servers": ["127.0.0.2"]})).unwrap();
-    // The resolver picks the config up within a second.
-    std::thread::sleep(Duration::from_millis(1500));
+    // G1.6qc: the very next command uses the new servers (no wait for the
+    // resolver's periodic copy of the config).
+    let t = run("ip.dns.resolve", json!({"name": "first.test", "type": "A"})).unwrap();
+    let r = until_done(&t["task_id"]);
+    assert!(r.to_string().contains("127.0.0.1"), "{r}");
     let t = run(
         "tool.ping.start",
         json!({"address": "router.test", "count": 1, "interval_ms": 100}),
