@@ -21,6 +21,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use corerouter_model::ItemId;
 use corerouter_model::firewall::{AddrMatch, Family, Protocol, Table};
@@ -163,7 +164,8 @@ pub struct FwDiag {
     pub read_at: Option<u64>,
     /// Why the last read failed (shown instead of numbers).
     pub read_error: Option<String>,
-    pub live: HashMap<(Table, ItemId), Live>,
+    /// Shared with a rule list built outside the session lock (G0.31b).
+    pub live: Arc<HashMap<(Table, ItemId), Live>>,
     pub trace: Trace,
 }
 
@@ -215,9 +217,10 @@ impl Session {
             e.1 = e.1.saturating_add(c.bytes);
         }
         // Rules gone from the kernel go from the view too.
-        d.live.retain(|k, _| sums.contains_key(k));
+        let live = Arc::make_mut(&mut d.live);
+        live.retain(|k, _| sums.contains_key(k));
         for (key, (packets, bytes)) in sums {
-            let l = d.live.entry(key).or_insert_with(|| Live {
+            let l = live.entry(key).or_insert_with(|| Live {
                 since: now,
                 raw_packets: packets,
                 raw_bytes: bytes,
@@ -256,7 +259,7 @@ impl Session {
             return 0;
         };
         let mut n = 0;
-        for ((t, i), l) in d.live.iter_mut() {
+        for ((t, i), l) in Arc::make_mut(&mut d.live).iter_mut() {
             if *t == table && id.is_none_or(|x| x == *i) {
                 l.base_packets = l.packets;
                 l.base_bytes = l.bytes;

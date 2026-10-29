@@ -32,6 +32,7 @@ use corerouter_model::bgp::{
     resolve_templates,
 };
 use corerouter_model::firewall::AddrMatch;
+use corerouter_model::routing_filter::PrependCount;
 use corerouter_model::sealed::Sealed;
 use corerouter_model::{BgpInstance, Config, Issue, Routing};
 
@@ -129,7 +130,7 @@ fn validate_filter(cfg: &Config, out: &mut Vec<Issue>) {
             }
         }
     }
-    let (_, render_problems) = filter_render(routing);
+    let (_, render_problems, _) = filter_render(routing);
     for p in render_problems {
         out.push(Issue::new(
             format!("routing.filter.rules.{}", p.item),
@@ -140,14 +141,23 @@ fn validate_filter(cfg: &Config, out: &mut Vec<Issue>) {
 
 /// The chains the connections use, with the AS of their instance (one
 /// per chain; `None` when connections of instances with different ASes
-/// share it, or nothing tells).
-fn filter_render(routing: &Routing) -> (String, Vec<filter::eval::Problem>) {
+/// share it, or nothing tells); the problems; the chains with a map of
+/// their own for eBGP outputs (G3.9fg, [`filter::frr::render_counted`]).
+fn filter_render(
+    routing: &Routing,
+) -> (
+    String,
+    Vec<filter::eval::Problem>,
+    std::collections::BTreeSet<String>,
+) {
     if routing.filter.rules.is_empty() {
-        return (String::new(), Vec::new());
+        return (String::new(), Vec::new(), std::collections::BTreeSet::new());
     }
     let resolved = resolve_templates(&routing.bgp_templates);
     let mut used: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut asn: HashMap<String, Option<u32>> = HashMap::new();
+    let mut uses: HashMap<String, filter::frr::Uses> = HashMap::new();
+    let legacy = routing.filter.prepend == PrependCount::Legacy;
     // G3.2c: the input chains whose connections drop RPKI-invalid routes
     // (with a validator, eBGP too: the chain is its policy) get the RPKI
     // entries first (sequences 1..=9).
@@ -157,13 +167,27 @@ fn filter_render(routing: &Routing) -> (String, Vec<filter::eval::Problem>) {
         let Ok(eff) = c.effective(&resolved) else {
             continue;
         };
-        let inst = routing.bgp.get(&c.instance).map(|i| i.asn.0);
+        let inst = routing.bgp.get(&c.instance);
         if let Some(chain) = &eff.input_filter {
             let drops = validators
                 && eff.rpki_invalid.unwrap_or_default()
                     == corerouter_model::rpki::RpkiInvalid::Reject;
             *rpki_in.entry(chain.clone()).or_insert(drops) |= drops;
+            let u = uses.entry(chain.clone()).or_default();
+            u.other = true;
+            u.legacy = legacy;
         }
+        if let Some(chain) = &eff.output_filter {
+            let ebgp = inst.is_some_and(|i| !role_of(i, &eff).is_ibgp());
+            let u = uses.entry(chain.clone()).or_default();
+            u.legacy = legacy;
+            if ebgp {
+                u.ebgp_out = true;
+            } else {
+                u.other = true;
+            }
+        }
+        let inst = inst.map(|i| i.asn.0);
         for chain in [&eff.input_filter, &eff.output_filter]
             .into_iter()
             .flatten()
@@ -178,7 +202,7 @@ fn filter_render(routing: &Routing) -> (String, Vec<filter::eval::Problem>) {
     let only = (routing.bgp.len() == 1)
         .then(|| routing.bgp.values().next().map(|i| i.asn.0))
         .flatten();
-    filter::frr::render_with(
+    filter::frr::render_counted(
         &routing.filter,
         &used,
         &|chain| match asn.get(chain) {
@@ -191,6 +215,15 @@ fn filter_render(routing: &Routing) -> (String, Vec<filter::eval::Problem>) {
             } else {
                 String::new()
             }
+        },
+        // A chain no connection names (jumped to only, or unused) runs
+        // nowhere: counted like an input.
+        &|chain| {
+            uses.get(chain).copied().unwrap_or(filter::frr::Uses {
+                ebgp_out: false,
+                other: true,
+                legacy,
+            })
         },
     )
 }
@@ -447,7 +480,7 @@ fn render_with_lists(
     for c in routing.bgp_connections.values() {
         by_inst.entry(c.instance.as_str()).or_default().push(c);
     }
-    let (mut s, _) = filter_render(routing);
+    let (mut s, _, ebgp_out_maps) = filter_render(routing);
     if let Some(cfg) = cfg {
         s.push_str(&static_maps(cfg));
     }
@@ -469,6 +502,7 @@ fn render_with_lists(
             cfg,
             open,
             !rpki::enabled(routing).is_empty(),
+            &ebgp_out_maps,
         )?;
     }
     // G3.2c: the `rpki` node and its route-map, after the instances.
@@ -481,7 +515,15 @@ fn render_with_lists(
 pub fn render_frr(inst: &BgpInstance) -> String {
     let mut s = String::new();
     // No neighbors: no key to open.
-    let _ = render_instance(&mut s, inst, &[], None, &|_| None, false);
+    let _ = render_instance(
+        &mut s,
+        inst,
+        &[],
+        None,
+        &|_| None,
+        false,
+        &std::collections::BTreeSet::new(),
+    );
     s
 }
 
@@ -498,6 +540,7 @@ fn render_instance(
     cfg: Option<&Config>,
     open: Opener<'_>,
     rpki: bool,
+    ebgp_out_maps: &std::collections::BTreeSet<String>,
 ) -> Result<(), String> {
     // Writing to a String cannot fail; ignore the fmt::Result.
     let _ = writeln!(s, "{}", frr_header(inst));
@@ -515,7 +558,7 @@ fn render_instance(
                 Afi::Ip => &mut v4,
                 Afi::Ipv6 => &mut v6,
             };
-            neighbor_af(af, c, p, afi);
+            neighbor_af(af, c, p, afi, !role_of(inst, p).is_ibgp(), ebgp_out_maps);
             // G3.2c: drop RPKI-invalid routes; the Adj-RIB-In is kept so
             // FRR revalidates when the VRPs change (its rpki module needs
             // it) and the received list shows what was dropped.
@@ -694,7 +737,14 @@ pub fn timers(p: &BgpParams) -> (u16, u16) {
 }
 
 /// The lines of one neighbor inside `address-family <afi> unicast`.
-fn neighbor_af(s: &mut String, c: &BgpConnection, p: &BgpParams, afi: Afi) {
+fn neighbor_af(
+    s: &mut String,
+    c: &BgpConnection,
+    p: &BgpParams,
+    afi: Afi,
+    ebgp: bool,
+    ebgp_out_maps: &std::collections::BTreeSet<String>,
+) {
     let a = c.remote_address;
     let _ = writeln!(s, "  neighbor {a} activate");
     // G3.9fb: RouterOS `local.role=ibgp-rr`, RFC 4456 §6.
@@ -744,11 +794,14 @@ fn neighbor_af(s: &mut String, c: &BgpConnection, p: &BgpParams, afi: Afi) {
         );
     }
     if let Some(chain) = &p.output_filter {
-        let _ = writeln!(
-            s,
-            "  neighbor {a} route-map {} out",
+        // G3.9fg: the chain's map counting eBGP's copy of our AS, when the
+        // chain also runs where nothing is added.
+        let map = if ebgp && ebgp_out_maps.contains(chain) {
+            filter::frr::route_map_ebgp_out(chain)
+        } else {
             filter::frr::route_map(chain)
-        );
+        };
+        let _ = writeln!(s, "  neighbor {a} route-map {map} out");
     }
 }
 
@@ -789,6 +842,63 @@ mod tests {
             cfg.routing.bgp_connections.insert(c.name.clone(), c);
         }
         cfg
+    }
+
+    #[test]
+    fn ebgp_outputs_get_routeros_prepend_count() {
+        // G3.9fg: one chain on an eBGP output and an iBGP output.
+        use corerouter_model::routing_filter::FilterRule;
+        let p = |asn: u32| BgpParams {
+            remote_as: Some(Asn(asn)),
+            output_filter: Some("out".into()),
+            ..BgpParams::default()
+        };
+        let mut cfg = cfg_with(vec![
+            conn("up", "192.0.2.1", p(64500)),
+            conn("rr", "10.0.0.2", p(65000)),
+        ]);
+        let id = cfg.routing.filter.next_id();
+        cfg.routing.filter.rules.push(FilterRule {
+            id,
+            chain: "out".into(),
+            rule: "set bgp-path-prepend 2; accept".into(),
+            disabled: false,
+            comment: String::new(),
+        });
+        let text = render_config(&cfg, &|_| None).unwrap();
+        assert!(
+            text.contains("  neighbor 192.0.2.1 route-map CR-out+ebgp-out out\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  neighbor 10.0.0.2 route-map CR-out out\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("route-map CR-out+ebgp-out permit 10\n set as-path prepend 65000\n"),
+            "{text}"
+        );
+        // RouterOS adds nothing on iBGP (measured): the chain's own map
+        // has no prepend.
+        assert!(
+            !text.contains("route-map CR-out permit 10\n set as-path"),
+            "{text}"
+        );
+        // Only eBGP: one map, counting eBGP's copy.
+        cfg.routing.bgp_connections.remove("rr");
+        let text = render_config(&cfg, &|_| None).unwrap();
+        assert!(!text.contains("+ebgp-out"), "{text}");
+        assert!(
+            text.contains("route-map CR-out permit 10\n set as-path prepend 65000\n"),
+            "{text}"
+        );
+        // A filter of an older build keeps its paths: N on top of eBGP's.
+        cfg.routing.filter.prepend = PrependCount::Legacy;
+        let text = render_config(&cfg, &|_| None).unwrap();
+        assert!(
+            text.contains("route-map CR-out permit 10\n set as-path prepend 65000 65000\n"),
+            "{text}"
+        );
     }
 
     #[test]

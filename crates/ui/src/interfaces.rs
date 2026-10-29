@@ -55,6 +55,8 @@ pub(crate) struct Iface {
     pub comment: String,
     pub parent: Option<String>,
     pub vlan_id: Option<String>,
+    /// An 802.1ad S-VLAN (TPID 0x88a8), the outer tag of QinQ.
+    pub service_tag: bool,
     pub bridge: Option<String>,
     pub vrf: Option<String>,
     pub table: Option<String>,
@@ -78,6 +80,7 @@ impl Iface {
             comment: text("comment"),
             parent: opt("parent"),
             vlan_id: opt("vlan_id"),
+            service_tag: flag("use_service_tag"),
             bridge: opt("bridge"),
             vrf: opt("vrf"),
             table: opt("table"),
@@ -115,6 +118,7 @@ pub(crate) enum Dialog {
         name: String,
         parent: String,
         vlan_id: String,
+        service_tag: bool,
         mtu: String,
         comment: String,
     },
@@ -142,10 +146,11 @@ impl Dialog {
             Dialog::NewVlan {
                 name,
                 vlan_id,
+                service_tag,
                 mtu,
                 comment,
                 ..
-            } => [name, vlan_id, mtu, comment].iter().any(|f| !f.is_empty()),
+            } => *service_tag || [name, vlan_id, mtu, comment].iter().any(|f| !f.is_empty()),
             Dialog::NewBridge { name, comment } | Dialog::NewLoopback { name, comment } => {
                 !name.is_empty() || !comment.is_empty()
             }
@@ -507,6 +512,7 @@ impl CoreRouterUi {
                 name: String::new(),
                 parent: parent.unwrap_or_default(),
                 vlan_id: String::new(),
+                service_tag: false,
                 mtu: String::new(),
                 comment: String::new(),
             }),
@@ -576,6 +582,7 @@ impl CoreRouterUi {
         let can = self.can();
         let mut nic = std::mem::take(&mut self.nic);
         let mut dialogs = std::mem::take(&mut self.dialogs);
+        let mut help: Option<(&'static str, &'static str)> = None;
         dialogs.retain_mut(|d| {
             // A properties window whose interface is gone closes itself.
             let id = dialog_id(d.id);
@@ -599,7 +606,7 @@ impl CoreRouterUi {
             };
             let pressed =
                 dialog::show(&mut self.floats, ctx, area, head, &mut d.status, |ui, f| {
-                    dialog_body(ui, f, &mut d.dialog, &ifaces, &can, &mut nic)
+                    dialog_body(ui, f, &mut d.dialog, &ifaces, &can, &mut nic, &mut help)
                 });
             let keep = pressed.is_none_or(|b| self.dialog_button(d, b, &ifaces, eth));
             if !keep {
@@ -611,6 +618,12 @@ impl CoreRouterUi {
         dialogs.append(&mut self.dialogs);
         self.dialogs = dialogs;
         self.nic = nic;
+        if let Some((key, title)) = help {
+            let title = crate::i18n::tr_in("interfaces", self.lang.labels, title);
+            if let Some(panel) = self.panel_mut::<crate::interface_list_help::InterfaceListHelp>() {
+                panel.help = Some(crate::help::HelpView::new(key, title));
+            }
+        }
     }
 
     /// Send what a dialog button means. Returns whether the dialog stays
@@ -637,6 +650,7 @@ impl CoreRouterUi {
                 name,
                 parent,
                 vlan_id,
+                service_tag,
                 mtu,
                 comment,
             } => vec![(
@@ -645,6 +659,8 @@ impl CoreRouterUi {
                     "name": name.trim(),
                     "parent": parent,
                     "vlan_id": form_number(vlan_id),
+                    // Only when set: a daemon from before 802.1ad still takes a plain VLAN.
+                    "use_service_tag": service_tag.then_some(true),
                     "mtu": form_number(mtu),
                     "comment": opt_text(comment),
                 }),
@@ -875,7 +891,12 @@ fn type_icon(kind: &str) -> &'static str {
 
 fn info_cell(i: &Iface) -> String {
     if let Some(id) = &i.vlan_id {
-        let label = format!("VLAN {id}");
+        // An S-VLAN keeps the hue of its id: VLAN 100 and S-VLAN 100 match.
+        let label = if i.service_tag {
+            format!("S-VLAN {id}")
+        } else {
+            format!("VLAN {id}")
+        };
         let hue = id.parse::<u64>().map(crate::chip::hashed).unwrap_or_else(|_| crate::chip::name_hue(id));
         crate::chip::cell(&info(i), &[(&label, crate::chip::Kind::Hashed(hue))])
     } else {
@@ -887,7 +908,11 @@ fn info_cell(i: &Iface) -> String {
 fn info(i: &Iface) -> String {
     let mut parts = Vec::new();
     if let (Some(id), Some(parent)) = (&i.vlan_id, &i.parent) {
-        parts.push(format!("vlan {id} on {parent}"));
+        if i.service_tag {
+            parts.push(format!("s-vlan {id} on {parent} (802.1ad)"));
+        } else {
+            parts.push(format!("vlan {id} on {parent}"));
+        }
     }
     if let Some(b) = &i.bridge {
         parts.push(format!("port of {b}"));
@@ -1071,6 +1096,7 @@ fn dialog_body(
     ifaces: &[Iface],
     can: &Avail,
     nic: &mut BTreeMap<String, NicView>,
+    help: &mut Option<(&'static str, &'static str)>,
 ) -> Footer<Button> {
     let names: Vec<String> = ifaces.iter().map(|i| i.name.clone()).collect();
     let mut port_op: Option<(bool, String, String)> = None;
@@ -1090,7 +1116,7 @@ fn dialog_body(
                 .min_col_width(96.0)
                 .spacing([12.0, 6.0])
                 .show(ui, |ui| {
-                    props_general(ui, f, p, i, ifaces, can, &mut port_op, view)
+                    props_general(ui, f, p, i, ifaces, can, &mut port_op, view, help)
                 });
         });
     } else {
@@ -1102,15 +1128,23 @@ fn dialog_body(
                     name,
                     parent,
                     vlan_id,
+                    service_tag,
                     mtu,
                     comment,
                 } => {
-                    f.text(ui, "Name", "name", name, "vlan100");
-                    ui.label("Interface");
+                    let id = f.window();
+                    help_label(ui, id, "Name", "interfaces.vlan.name", help);
+                    f.field(ui, "name", name, "vlan100");
+                    help_label(ui, id, "Interface", "interfaces.vlan.interface", help);
                     crate::windows::combo(ui, "vlan-parent", "parent", parent, &names);
                     ui.end_row();
-                    f.text(ui, "VLAN ID", "vlan_id", vlan_id, "1..4094");
-                    f.text(ui, "MTU", "mtu", mtu, "parent MTU");
+                    help_label(ui, id, "VLAN ID", "interfaces.vlan.vlan_id", help);
+                    f.field(ui, "vlan_id", vlan_id, "1..4094");
+                    help_label(ui, id, "Use Service Tag", "interfaces.vlan.use_service_tag", help);
+                    ui.checkbox(service_tag, "802.1ad S-tag (0x88a8)");
+                    ui.end_row();
+                    help_label(ui, id, "MTU", "interfaces.vlan.mtu", help);
+                    f.field(ui, "mtu", mtu, "parent MTU");
                     f.text(ui, "Comment", "comment", comment, "");
                 }
                 Dialog::NewBridge { name, comment } => {
@@ -1157,6 +1191,7 @@ fn props_general(
     can: &Avail,
     port_op: &mut Option<(bool, String, String)>,
     view: Option<&NicView>,
+    help: &mut Option<(&'static str, &'static str)>,
 ) {
     let (mac, perm_mac, l2mtu) = view.map(NicView::general).unwrap_or_default();
     ui.label("Name");
@@ -1193,6 +1228,9 @@ fn props_general(
         ui.end_row();
         ui.label("VLAN ID");
         ui.label(id);
+        ui.end_row();
+        help_label(ui, f.window(), "Use Service Tag", "interfaces.vlan.use_service_tag", help);
+        ui.label(if i.service_tag { "yes (802.1ad, 0x88a8)" } else { "no (802.1Q, 0x8100)" });
         ui.end_row();
     }
     if let Some(b) = &i.bridge {
@@ -1259,6 +1297,22 @@ fn bridge_ports(
         });
     });
     ui.end_row();
+}
+
+/// A field label with the ⓘ that opens its explanation (`key`).
+fn help_label(
+    ui: &mut Ui,
+    window: egui::Id,
+    label: &'static str,
+    key: &'static str,
+    help: &mut Option<(&'static str, &'static str)>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        if crate::help::info_button(ui, window.with(key), label).clicked() {
+            *help = Some((key, label));
+        }
+    });
 }
 
 /// A small button inside a dialog's fields, greyed out with the reason when

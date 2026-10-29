@@ -247,3 +247,8 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-29 — G3.9g feito (interoperabilidade do BNG PPPoE com o RouterOS 7.25 CHR, parte 2)
 - 2026-10-29 — G3.9f feito (interoperabilidade BGP com RouterOS 7.25 e entre CoreRouters)
 - 2026-10-29 — G1.6qf criado (Safe Mode numa chamada avulsa da CLI acaba sem aviso)
+- 2026-10-29 — G0.31a feito (`config.diff` item a item nas listas grandes)
+- 2026-10-29 — G0.31b feito (consultas grandes fora do lock do `Session`); G0.31g criado (linhas de rota reconstruídas fora do lock)
+- 2026-10-29 — G1.6qf feito (Safe Mode recusado na chamada avulsa da CLI)
+- 2026-10-29 — G3.9hb feito (`interface=` do RouterOS em `/interface vlan add`); G3.9he criado (o que ainda diverge em `/interface vlan`)
+- 2026-10-29 — G3.9hc feito (S-tag 802.1ad na janela de VLAN)
