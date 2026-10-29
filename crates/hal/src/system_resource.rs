@@ -261,8 +261,8 @@ pub struct Process {
     /// Open file descriptors (`/proc/<pid>/fd`); `None` when unreadable
     /// (G1.6q: a leak of sockets or files shows here first).
     pub fds: Option<u32>,
-    /// Its threads (G1.6qe), only for the router's own processes
-    /// ([`Sample::router`]); empty elsewhere.
+    /// Its threads (G1.6qe), sorted by tid, only for the router's own
+    /// processes ([`Sample::router`]); empty elsewhere.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tasks: Vec<Task>,
 }

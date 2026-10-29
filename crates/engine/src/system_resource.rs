@@ -258,7 +258,11 @@ impl ResourceMonitor {
                 procs.insert(p.pid, ((used as f64 * 100.0 / all) as f32).min(100.0));
             }
             for t in &p.tasks {
-                let Some(t0) = before.tasks.iter().find(|x| x.tid == t.tid) else {
+                // Sorted by tid (`Process::tasks`): O(log n) per thread.
+                let Ok(i) = before.tasks.binary_search_by_key(&t.tid, |x| x.tid) else {
+                    continue;
+                };
+                let Some(t0) = before.tasks.get(i) else {
                     continue;
                 };
                 if let Some(used) = t.cpu_ticks.checked_sub(t0.cpu_ticks) {
