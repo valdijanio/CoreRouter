@@ -230,3 +230,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-28 — G1.27j criado e feito (rota do DHCP com distância 254 e aviso de ECMP)
 - 2026-10-28 — G1.6e em andamento (envio do pacote pela rede e ciclo rápido de teste da imagem)
 - 2026-10-28 — G1.6o criado e feito (acesso web de fábrica, estilo WebFig); G1.6p criado (janela IP › Services)
+- 2026-10-29 — G0.3e criado e feito (senha salva visível na tela de conexão; defeito achado ao reinstalar a VM)
