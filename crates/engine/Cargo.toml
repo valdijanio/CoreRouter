@@ -56,6 +56,10 @@ name = "execute"
 harness = false
 
 [[bench]]
+name = "lock_hold"
+harness = false
+
+[[bench]]
 name = "package_upload"
 harness = false
 
