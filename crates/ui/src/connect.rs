@@ -17,14 +17,56 @@
 //! saw under "Details". A router older than the login (G0.3) is told apart
 //! ([`old_router_info`], [`old_router_error`]) and, on this machine, can
 //! still be managed after "Connect anyway".
+//!
+//! G0.3d: a certificate seen for the first time, or different from the one
+//! remembered (a reinstalled router, or an interception), opens the same
+//! modal, PuTTY style: the remembered fingerprint with when it was accepted,
+//! the new one, why it may have changed, and Cancel (the default: Enter and
+//! Esc cancel), "Connect once" (not remembered) and "Trust and connect" /
+//! "Trust and update" (written to known_hosts).
 
 use egui::{Key, RichText, TextEdit, Ui};
 use serde_json::{Value, json};
 
+use crate::help::{self, HelpView};
+use crate::i18n::{Langs, tr_in};
 use crate::neighbors::uptime_text;
 use crate::table::{self, Menu, Row, Shortcut, TableState, col, num};
 
 const NEIGHBORS: &str = "connect-neighbors";
+/// Translation scope of the certificate modal (`i18n/auto/connect_*.rs`).
+const SCOPE: &str = "connect";
+/// The explanation the certificate modal's ⓘ opens.
+pub const HELP_CERT: &str = "connect.certificate";
+
+/// A certificate waiting for the operator (G0.3d).
+#[derive(Debug, Clone)]
+struct TrustAsk {
+    creds: Credentials,
+    fingerprint: String,
+    /// Changed: the remembered fingerprint and when it was accepted.
+    previous: Option<(String, String)>,
+}
+
+/// A SHA-256 fingerprint on two lines of 16 bytes, so the two can be
+/// compared at a glance and the modal stays narrow.
+fn fingerprint_lines(fp: &str) -> String {
+    let parts: Vec<&str> = fp.split(':').collect();
+    match (parts.get(..17), parts.get(17..)) {
+        (Some(head), Some(tail)) if !tail.is_empty() => {
+            format!("{}:\n{}", head.join(":"), tail.join(":"))
+        }
+        _ => fp.to_owned(),
+    }
+}
+
+/// The answer in the certificate modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    Cancel,
+    Once,
+    Trust,
+}
 const SAVED: &str = "connect-saved";
 /// Saved entries kept at most, and the longest text of each field.
 pub const MAX_SAVED: usize = 1000;
@@ -171,6 +213,9 @@ pub struct Credentials {
     pub remember: bool,
     /// The operator chose "Connect anyway" for an old router without login.
     pub legacy: bool,
+    /// TLS: the certificate accepted for this connection only ("Connect
+    /// once", G0.3d); `None` uses known_hosts.
+    pub pin: Option<String>,
 }
 
 impl std::fmt::Debug for Credentials {
@@ -181,6 +226,7 @@ impl std::fmt::Debug for Credentials {
             .field("user", &self.user)
             .field("remember", &self.remember)
             .field("legacy", &self.legacy)
+            .field("pin", &self.pin)
             .finish_non_exhaustive()
     }
 }
@@ -230,11 +276,14 @@ pub enum ConnectAction {
     /// Manage the router at this address (as typed in "Connect to").
     Connect(Credentials),
     /// The operator checked and accepted this certificate (first TLS
-    /// connection): remember it and connect.
+    /// connection, or a changed one): remember it and connect.
     Trust {
         creds: Credentials,
         fingerprint: String,
     },
+    /// Connect to this certificate this time, without remembering it
+    /// (`creds.pin` holds it).
+    Once(Credentials),
     /// Run the in-process virtual lab instead.
     VirtualLab,
 }
@@ -269,8 +318,12 @@ pub struct ConnectScreen {
     remember: bool,
     /// `None`: no secure store here (the checkbox is off, with the reason).
     keyring: Option<String>,
-    /// First TLS connection: the fingerprint waiting for a yes.
-    trust: Option<(Credentials, String)>,
+    /// A certificate waiting for the operator's answer.
+    trust: Option<TrustAsk>,
+    /// The ⓘ's explanation in the certificate modal, while open.
+    help: Option<HelpView>,
+    /// Put the focus on Cancel when the modal opens.
+    trust_focus: bool,
     group: String,
     comment: String,
     tab: Tab,
@@ -295,6 +348,8 @@ impl ConnectScreen {
             remember: false,
             keyring: None,
             trust: None,
+            help: None,
+            trust_focus: false,
             group: String::new(),
             comment: String::new(),
             tab: Tab::Neighbors,
@@ -337,10 +392,40 @@ impl ConnectScreen {
     }
 
     /// First TLS connection to `creds.address`: show `fingerprint` and
-    /// wait for the operator (the answer comes as [`ConnectAction::Trust`]).
+    /// wait for the operator (the answer comes as [`ConnectAction::Trust`]
+    /// or [`ConnectAction::Once`]).
     pub fn ask_trust(&mut self, creds: Credentials, fingerprint: String) {
         self.message = None;
-        self.trust = Some((creds, fingerprint));
+        self.trust_focus = true;
+        self.trust = Some(TrustAsk {
+            creds,
+            fingerprint,
+            previous: None,
+        });
+    }
+
+    /// The router at `creds.address` shows `fingerprint`, not the `old` one
+    /// remembered `since` (already a date, "unknown date" when the file has
+    /// none): ask, PuTTY style (G0.3d).
+    pub fn ask_changed(
+        &mut self,
+        creds: Credentials,
+        old: String,
+        since: String,
+        fingerprint: String,
+    ) {
+        self.message = None;
+        self.trust_focus = true;
+        self.trust = Some(TrustAsk {
+            creds,
+            fingerprint,
+            previous: Some((old, since)),
+        });
+    }
+
+    /// The certificate modal is open.
+    pub fn asking_trust(&self) -> bool {
+        self.trust.is_some()
     }
 
     /// Fill the Login field (e.g. from `--user`; default `admin`).
@@ -377,61 +462,132 @@ impl ConnectScreen {
             .show(ui, |ui| self.form(ui, &mut action));
         egui::CentralPanel::default().show(ui, |ui| self.lists(ui, neighbors, &mut action));
         self.trust_window(ui, &mut action);
-        if let Some(ConnectAction::Connect(c) | ConnectAction::Trust { creds: c, .. }) = &action {
+        if let Some(
+            ConnectAction::Connect(c)
+            | ConnectAction::Once(c)
+            | ConnectAction::Trust { creds: c, .. },
+        ) = &action
+        {
             self.message = Some(Message::ok(format!("connecting to {}…", c.address)));
         }
         action
     }
 
-    /// The SSH-style question of the first TLS connection.
+    /// The certificate modal, with its ⓘ explanation on top.
     fn trust_window(&mut self, ui: &mut Ui, action: &mut Option<ConnectAction>) {
-        let Some((creds, fp)) = self.trust.clone() else {
+        self.trust_modal(ui, action);
+        help::modal(ui.ctx(), Langs::default(), &mut self.help);
+    }
+
+    /// The certificate modal (G0.3d): first use or changed, three answers.
+    fn trust_modal(&mut self, ui: &mut Ui, action: &mut Option<ConnectAction>) {
+        let langs = Langs::default();
+        let Some(ask) = self.trust.clone() else {
             return;
         };
+        let l = langs.labels;
+        let t = |text: &'static str| tr_in(SCOPE, l, text);
+        let changed = ask.previous.is_some();
         let mut answer = None;
-        egui::Window::new("Unknown router certificate")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ui.ctx(), |ui| {
-                ui.label(format!(
-                    "First connection to {}. Its TLS certificate fingerprint is:",
-                    creds.address
-                ));
-                ui.add_space(4.0);
-                ui.monospace(fp.as_str());
-                ui.add_space(4.0);
-                ui.weak(
-                    "Compare it with the fingerprint the router printed at start-up \
-                     (corerouter-daemon log). If they match, trust it: it is remembered \
-                     and a different certificate later is refused.",
-                );
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .button(RichText::new("Trust and connect").strong())
-                        .clicked()
-                    {
-                        answer = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
-                        answer = Some(false);
-                    }
-                });
+        let mut open_help = false;
+        let focus = std::mem::take(&mut self.trust_focus);
+        egui::Modal::new(egui::Id::unique("corerouter-cert-modal")).show(ui.ctx(), |ui| {
+            ui.set_width(560.0);
+            ui.horizontal(|ui| {
+                let title = if changed {
+                    t("Router certificate CHANGED")
+                } else {
+                    t("Unknown router certificate")
+                };
+                let color = if changed { ui.visuals().warn_fg_color } else { ui.visuals().strong_text_color() };
+                ui.label(RichText::new(title).heading().color(color));
+                open_help = help::info_button(ui, egui::Id::unique("cert-modal-info"), t("What to check")).clicked();
             });
+            ui.separator();
+            ui.label(format!("{} {}", t("Router:"), ask.creds.address));
+            ui.add_space(4.0);
+            egui::Grid::new("cert-modal-grid").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
+                if let Some((old, since)) = &ask.previous {
+                    ui.label(t("Remembered"));
+                    ui.vertical(|ui| {
+                        ui.monospace(fingerprint_lines(old));
+                        ui.weak(format!("{} {since}", t("accepted")));
+                    });
+                    ui.end_row();
+                    ui.label(t("Now"));
+                } else {
+                    ui.label(t("Fingerprint"));
+                }
+                ui.monospace(RichText::new(fingerprint_lines(&ask.fingerprint)).strong());
+                ui.end_row();
+            });
+            ui.add_space(6.0);
+            if changed {
+                ui.label(t("The router shows another TLS certificate than the one remembered. Nothing was sent to it."));
+                ui.weak(t("Expected after a reinstall or a new certificate: compare the new fingerprint with the one the router prints at start-up (corerouter-daemon log, console). If you did not change anything, someone may be intercepting the connection: cancel."));
+            } else {
+                ui.weak(t("First connection to this router. Compare the fingerprint with the one the router prints at start-up (corerouter-daemon log, console) before trusting it."));
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let cancel = ui.button(RichText::new(t("Cancel")).strong());
+                if focus {
+                    cancel.request_focus();
+                }
+                if cancel.clicked() {
+                    answer = Some(Decision::Cancel);
+                }
+                if ui
+                    .button(t("Connect once"))
+                    .on_hover_text(t("Connect with this certificate now; known_hosts keeps what it had."))
+                    .clicked()
+                {
+                    answer = Some(Decision::Once);
+                }
+                let trust = if changed { t("Trust and update") } else { t("Trust and connect") };
+                if ui
+                    .button(trust)
+                    .on_hover_text(t("Remember this certificate (known_hosts, with today's date) and connect."))
+                    .clicked()
+                {
+                    answer = Some(Decision::Trust);
+                }
+            });
+            // Enter never accepts: a stray Enter cancels, like Esc.
+            if answer.is_none() && ui.input(|i| i.key_pressed(Key::Escape) || i.key_pressed(Key::Enter)) && self.help.is_none() {
+                answer = Some(Decision::Cancel);
+            }
+        });
+        if open_help {
+            self.help = Some(HelpView::new(
+                HELP_CERT,
+                tr_in(
+                    SCOPE,
+                    l,
+                    if changed {
+                        "Router certificate CHANGED"
+                    } else {
+                        "Unknown router certificate"
+                    },
+                ),
+            ));
+        }
+        let Some(answer) = answer else {
+            return;
+        };
+        self.trust = None;
+        let TrustAsk {
+            creds, fingerprint, ..
+        } = ask;
         match answer {
-            Some(true) => {
-                self.trust = None;
-                *action = Some(ConnectAction::Trust {
-                    creds,
-                    fingerprint: fp,
-                });
+            Decision::Trust => *action = Some(ConnectAction::Trust { creds, fingerprint }),
+            Decision::Once => {
+                *action = Some(ConnectAction::Once(Credentials {
+                    pin: Some(fingerprint),
+                    ..creds
+                }));
             }
-            Some(false) => {
-                self.trust = None;
-                self.set_error("Not connected: the certificate was not trusted");
-            }
-            None => {}
+            Decision::Cancel => self.set_error("Not connected: the certificate was not trusted"),
         }
     }
 
@@ -442,6 +598,7 @@ impl ConnectScreen {
             password: self.password.clone(),
             remember: self.remember && self.keyring.is_some(),
             legacy: false,
+            pin: None,
         }
     }
 
@@ -935,6 +1092,123 @@ mod tests {
             .find(|(t, _)| t == needle)
             .map(|(_, r)| r.center())
             .unwrap_or_else(|| panic!("no {needle:?} on screen"))
+    }
+
+    /// G0.3d: a changed certificate, PuTTY style. Both fingerprints and the
+    /// date on screen; Enter cancels; Connect once pins without trusting;
+    /// Trust and update remembers.
+    #[test]
+    fn a_changed_certificate_asks_with_cancel_as_the_default() {
+        let ctx = egui::Context::default();
+        let mut s = ConnectScreen::new(Vec::new());
+        let mut t = 0.0;
+        let creds = Credentials {
+            address: "tls://10.0.0.1:8729".into(),
+            user: "admin".into(),
+            ..Credentials::default()
+        };
+        let ask = |s: &mut ConnectScreen, t: &mut f64| {
+            s.ask_changed(
+                creds.clone(),
+                "SHA256:OL:DD".into(),
+                "2026-10-01 12:00 UTC".into(),
+                "SHA256:NE:WW".into(),
+            );
+            frame(&ctx, s, &[], Vec::new(), t);
+            frame(&ctx, s, &[], Vec::new(), t).1
+        };
+        let texts = ask(&mut s, &mut t);
+        for needle in [
+            "Router certificate CHANGED",
+            "SHA256:OL:DD",
+            "SHA256:NE:WW",
+            "accepted 2026-10-01 12:00 UTC",
+            "Cancel",
+            "Connect once",
+            "Trust and update",
+        ] {
+            assert!(
+                texts.iter().any(|(x, _)| x == needle),
+                "{needle}: {texts:?}"
+            );
+        }
+        // Enter never accepts.
+        let enter = vec![egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }];
+        let (a, _) = frame(&ctx, &mut s, &[], enter, &mut t);
+        assert_eq!(a, None);
+        assert!(!s.asking_trust(), "Enter cancelled");
+        assert!(s.message.as_ref().is_some_and(|m| !m.ok));
+        // Connect once: the new fingerprint only for this connection.
+        let texts = ask(&mut s, &mut t);
+        let mut a = frame(
+            &ctx,
+            &mut s,
+            &[],
+            click_events(at(&texts, "Connect once")),
+            &mut t,
+        )
+        .0;
+        a = a.or(frame(&ctx, &mut s, &[], Vec::new(), &mut t).0);
+        let Some(ConnectAction::Once(c)) = a else {
+            panic!("{a:?}")
+        };
+        assert_eq!(c.pin.as_deref(), Some("SHA256:NE:WW"));
+        assert_eq!(c.address, creds.address);
+        // Trust and update: remembered by the app.
+        let texts = ask(&mut s, &mut t);
+        let mut a = frame(
+            &ctx,
+            &mut s,
+            &[],
+            click_events(at(&texts, "Trust and update")),
+            &mut t,
+        )
+        .0;
+        a = a.or(frame(&ctx, &mut s, &[], Vec::new(), &mut t).0);
+        assert_eq!(
+            a,
+            Some(ConnectAction::Trust {
+                creds: creds.clone(),
+                fingerprint: "SHA256:NE:WW".into()
+            })
+        );
+        // The first use offers the same three answers.
+        s.ask_trust(creds.clone(), "SHA256:FI:RS".into());
+        frame(&ctx, &mut s, &[], Vec::new(), &mut t);
+        let texts = frame(&ctx, &mut s, &[], Vec::new(), &mut t).1;
+        for needle in [
+            "Unknown router certificate",
+            "Cancel",
+            "Connect once",
+            "Trust and connect",
+        ] {
+            assert!(texts.iter().any(|(x, _)| x == needle), "{needle}");
+        }
+        for langs in [
+            Langs::default(),
+            Langs {
+                help: crate::i18n::Lang::En,
+                ..Langs::default()
+            },
+        ] {
+            assert!(crate::i18n::explain(langs, HELP_CERT).is_some());
+        }
+    }
+
+    #[test]
+    fn fingerprints_break_in_two_halves() {
+        let fp = format!("SHA256:{}", vec!["AB"; 32].join(":"));
+        let two = fingerprint_lines(&fp);
+        let (a, b) = two.split_once('\n').unwrap();
+        assert_eq!((a.matches(':').count(), b.matches(':').count()), (17, 15));
+        assert_eq!(two.replace('\n', ""), fp);
+        assert_eq!(fingerprint_lines("SHA256:AA:BB"), "SHA256:AA:BB");
     }
 
     #[test]

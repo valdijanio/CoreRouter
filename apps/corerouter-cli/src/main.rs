@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
-use corerouter_control::dial::{Expect, RefuseNew, Trust};
+use corerouter_control::dial::{AcceptNew, Changed, Decision, Expect, RefuseNew, Trust};
+use corerouter_control::known_hosts::format_since;
 use corerouter_control::{DEFAULT_PORT, KnownHosts, Login, Target};
 use corerouter_engine::Session;
 use corerouter_mcp::{Backend, Headless, Remote};
@@ -26,7 +27,7 @@ mod shell;
 
 const USAGE: &str = "\
 usage: corerouter-cli <command> [--connect HOST:PORT | tls://HOST:PORT]
-                      [--user USER] [--fingerprint SHA256:...]
+                      [--user USER] [--fingerprint SHA256:...] [--accept-new-cert]
 
   list [prefix]               list commands (id, params, enabled)
   run <id> [json-params]      run one command, e.g. run ip.address.add '{\"address\":\"10.0.0.1/24\",\"interface\":\"ether1\"}'
@@ -44,7 +45,11 @@ Without --connect, list/run/inspect/shell use a fresh in-process virtual lab (no
                           any other address is TLS (tls:// is implied), with --user
   --user USER             log in as USER; password from $COREROUTER_PASSWORD or a prompt
   --fingerprint SHA256:.. trust this certificate on the first TLS connection without asking
-                          (needed by `mcp`, whose stdin is the protocol)";
+                          (needed by `mcp`, whose stdin is the protocol); a changed
+                          certificate equal to it replaces the remembered one
+  --accept-new-cert       trust the router's certificate even if it is new or CHANGED since
+                          the last connection, and remember it (after a reinstall; check the
+                          fingerprint the router prints first). In a terminal you are asked";
 
 fn main() -> ExitCode {
     // stderr only: in `mcp` mode stdout carries the protocol.
@@ -64,6 +69,7 @@ fn real_main() -> Result<(), String> {
     let mut connect: Option<String> = None;
     let mut user: Option<String> = None;
     let mut fingerprint: Option<String> = None;
+    let mut accept_new_cert = false;
     let mut headless = false;
     let mut pos: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
@@ -71,6 +77,7 @@ fn real_main() -> Result<(), String> {
         match a.as_str() {
             "--connect" => connect = Some(args.next().ok_or("--connect needs HOST:PORT")?),
             "--headless" => headless = true,
+            "--accept-new-cert" => accept_new_cert = true,
             "--user" => user = Some(args.next().ok_or("--user needs a name")?),
             "--fingerprint" => {
                 fingerprint = Some(args.next().ok_or("--fingerprint needs SHA256:...")?);
@@ -82,7 +89,11 @@ fn real_main() -> Result<(), String> {
     let mut pos = pos.into_iter();
     let cmd = pos.next().ok_or(USAGE)?;
 
-    let auth = Auth { user, fingerprint };
+    let auth = Auth {
+        user,
+        fingerprint,
+        accept_new_cert,
+    };
     if cmd == "mcp" {
         return mcp(connect, headless, &auth);
     }
@@ -265,6 +276,9 @@ fn mcp(connect: Option<String>, headless: bool, auth: &Auth) -> Result<(), Strin
 struct Auth {
     user: Option<String>,
     fingerprint: Option<String>,
+    /// `--accept-new-cert`: a new or changed certificate is trusted and
+    /// remembered without asking (G0.3d).
+    accept_new_cert: bool,
 }
 
 /// Connect to `addr` as the flags say. `interactive`: may prompt on the
@@ -285,14 +299,22 @@ fn remote(addr: &str, auth: &Auth, interactive: bool) -> Result<Remote, String> 
         ));
     }
     let mut known = KnownHosts::load_default();
-    let mut trust: Box<dyn Trust> = match (&auth.fingerprint, interactive) {
-        (Some(fp), _) => Box::new(Expect(fp.clone())),
-        (None, true) if io::stdin().is_terminal() => Box::new(Ask),
-        (None, _) => Box::new(RefuseNew),
+    let asks = interactive && io::stdin().is_terminal();
+    let mut trust: Box<dyn Trust> = match (&auth.fingerprint, auth.accept_new_cert, asks) {
+        (Some(fp), _, _) => Box::new(Expect(fp.clone())),
+        (None, true, _) => Box::new(AcceptNew),
+        (None, false, true) => Box::new(Ask),
+        (None, false, false) => Box::new(RefuseNew),
     };
     Remote::dial(&target, &login, &mut known, trust.as_mut()).map_err(|e| {
         if e.contains("not trusted") && !interactive {
             format!("{e}; pass --fingerprint SHA256:... (see `corerouter-cli --connect {target} --user ...` once in a terminal)")
+        } else if e.contains("CHANGED") && !asks && !auth.accept_new_cert {
+            format!(
+                "{e} If you know why (the router was reinstalled), connect again with \
+                 --accept-new-cert (or --fingerprint <the new one>), or once in a terminal \
+                 to be asked."
+            )
         } else {
             e
         }
@@ -328,5 +350,51 @@ impl Trust for Ask {
             return false;
         }
         answer.trim().eq_ignore_ascii_case("yes")
+    }
+
+    /// PuTTY style: both fingerprints, why it may have changed, and three
+    /// answers; anything but `once`/`update` (an empty line too) cancels.
+    fn changed(&mut self, target: &Target, change: &Changed) -> Decision {
+        eprintln!(
+            "WARNING: the TLS certificate of {target} CHANGED.\n  \
+             remembered: {}  (accepted {})\n  \
+             now:        {}\n\
+             If the router was reinstalled or got a new certificate, this is expected:\n\
+             compare the new fingerprint with the one the router prints at start-up.\n\
+             Otherwise someone may be intercepting the connection: cancel.",
+            change.old,
+            format_since(change.since),
+            change.new
+        );
+        eprint!("[c]ancel, connect [o]nce, trust and [u]pdate? (default: cancel) ");
+        let _ = io::stderr().flush();
+        let mut answer = String::new();
+        if io::stdin().lock().read_line(&mut answer).is_err() {
+            return Decision::Cancel;
+        }
+        cert_answer(&answer)
+    }
+}
+
+/// The answer typed to [`Ask::changed`].
+fn cert_answer(line: &str) -> Decision {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "o" | "once" => Decision::Once,
+        "u" | "update" => Decision::Update,
+        _ => Decision::Cancel,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_once_or_update_accepts_a_changed_certificate() {
+        assert_eq!(cert_answer("o\n"), Decision::Once);
+        assert_eq!(cert_answer(" Update "), Decision::Update);
+        for a in ["", "\n", "y", "yes", "c", "cancel", "uu"] {
+            assert_eq!(cert_answer(a), Decision::Cancel, "{a:?}");
+        }
     }
 }

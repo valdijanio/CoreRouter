@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use corerouter_control::dial::local_token_hint;
+use corerouter_control::known_hosts::format_since;
+use corerouter_control::tls::TlsError;
 use corerouter_control::{
     Client, Endpoint, Gate, Host, KnownHosts, Login, SharedHost, Target as RouterAddr,
     UNAUTHORIZED, bind_loopback, local_token, spawn, spawn_clock,
@@ -18,7 +20,7 @@ use eframe::egui;
 use serde_json::{Value, json};
 
 use crate::remote::{Dialer, Remote};
-use crate::{Connected, GuiApp, Platform};
+use crate::{CertChange, Connected, GuiApp, Platform};
 
 const USAGE: &str = "\
 usage: corerouter-gui [--connect HOST:PORT | tls://HOST:PORT] [--user USER]
@@ -286,11 +288,13 @@ pub fn main() -> ExitCode {
             password: std::env::var("COREROUTER_PASSWORD").unwrap_or_default(),
             remember: false,
             legacy: false,
+            pin: None,
         };
         screen.set_login(&creds.user);
         match platform.connect(&creds) {
             Ok(Connected::Ready(r)) => ready = Some(*r),
             Ok(Connected::Trust(c, fp)) => screen.ask_trust(c, fp),
+            Ok(Connected::Changed(change)) => change.ask(&mut screen),
             Err(e) => screen.fail(e),
         }
     }
@@ -449,9 +453,30 @@ impl Platform for NativePlatform {
                 .and_then(|e| e.get_password().ok())
                 .unwrap_or_default();
         }
-        let fingerprint = if target.tls {
-            match KnownHosts::load_default().get(&addr) {
-                Some(fp) => Some(fp.to_owned()),
+        let fingerprint = if !target.tls {
+            None
+        } else if let Some(pin) = &creds.pin {
+            // "Connect once": exactly the certificate the operator saw.
+            Some(pin.clone())
+        } else {
+            let known = KnownHosts::load_default();
+            match known.get(&addr) {
+                Some(fp) => {
+                    // Look first, send nothing: a changed certificate is a
+                    // question (G0.3d), not a dead end.
+                    match Client::connect_tls(&addr, PROXY_TIMEOUT, Some(fp)) {
+                        Ok(_) => Some(fp.to_owned()),
+                        Err(TlsError::Changed { expected, seen }) => {
+                            return Ok(Connected::Changed(Box::new(CertChange {
+                                creds: creds.clone(),
+                                since: format_since(known.since(&addr)),
+                                old: expected,
+                                new: seen,
+                            })));
+                        }
+                        Err(e) => return Err(explain(&format!("{target}: {e}"))),
+                    }
+                }
                 None => {
                     // First time: look at the certificate, send nothing, ask.
                     let c = Client::connect_tls(&addr, PROXY_TIMEOUT, None)
@@ -460,8 +485,6 @@ impl Platform for NativePlatform {
                     return Ok(Connected::Trust(creds.clone(), fp));
                 }
             }
-        } else {
-            None
         };
         let local = if target.tls {
             None
