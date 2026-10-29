@@ -67,6 +67,15 @@ pub struct BgpSession {
     pub gr_remote: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub end_of_rib_received: Vec<String>,
+    /// G3.9fj, RFC 8538 §2: the neighbor announced the N bit (with an
+    /// established graceful-restart session): its NOTIFICATIONs and a hold
+    /// timer expiry keep the routes, only a Hard Reset drops them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub n_bit: bool,
+    /// The last NOTIFICATION was a Hard Reset (RFC 8538 §3: Cease 9, the
+    /// routes went at once); false: it was graceful (they stayed stale).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_hard_reset: Option<bool>,
 }
 
 /// What the routing backend is doing, for the session list and the log.

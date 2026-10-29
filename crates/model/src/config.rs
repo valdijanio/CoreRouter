@@ -450,6 +450,16 @@ pub struct BgpInstance {
     /// never sends End-of-RIB, **medido**).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graceful_defer_time: Option<u16>,
+    /// G3.9fj, RFC 8538 §2: announce the N bit (graceful restart also for
+    /// a NOTIFICATION and a hold timer expiry; only a Hard Reset drops the
+    /// routes). Unset: on (FRR's default since 8.3); stored only when off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graceful_notification: Option<bool>,
+    /// G3.9fj, RFC 8538 §3: an administrative reset (Cease 4, `clear`) goes
+    /// as a Hard Reset and drops the routes. Off: a clear of a neighbor
+    /// with the N bit keeps them as stale. Unset: on; stored only when off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_admin_reset: Option<bool>,
 }
 
 #[cfg(test)]

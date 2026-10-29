@@ -158,6 +158,21 @@ fn session(
                     .collect()
             })
             .unwrap_or_default(),
+        // G3.9fj: FRR reports `nBit` only for an established session with
+        // the capability on both sides (`bgp_vty.c`,
+        // `bgp_show_neighnor_graceful_restart_flags`).
+        n_bit: gr
+            .and_then(|g| g.get("nBit"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        // Only while down: FRR clears `notify.hard_reset` when a
+        // graceful-restart session comes back (`bgp_fsm.c`,
+        // `bgp_peer_process_gr_cap_clear_stale`) and keeps the error code,
+        // so an established session always says false (**medido**).
+        last_hard_reset: n
+            .get("lastNotificationHardReset")
+            .and_then(Value::as_bool)
+            .filter(|_| !established && n.get("lastErrorCodeSubcode").is_some()),
     }
 }
 
@@ -199,6 +214,7 @@ mod tests {
         "192.0.2.6": {
           "remoteAs": 65002, "localAs": 65000, "remoteRouterId": "0.0.0.0",
           "bgpState": "Active", "lastResetDueTo": "Waiting for peer OPEN",
+          "lastErrorCodeSubcode": "0609", "lastNotificationReason": "Cease/Hard Reset", "lastNotificationHardReset": true,
           "messageStats": {"totalSent": 0, "totalRecv": 0}
         }
       }
@@ -222,11 +238,15 @@ mod tests {
             (Some("restart"), Some("helper"))
         );
         assert_eq!(up.end_of_rib_received, ["ipv4"]);
+        assert!(up.n_bit, "RFC 8538 §2");
         let down = &s[1];
         assert_eq!(
             (down.gr_local.as_deref(), down.end_of_rib_received.len()),
             (None, 0)
         );
+        assert!(!down.n_bit);
+        assert_eq!(down.last_hard_reset, Some(true), "RFC 8538 §3");
+        assert_eq!(up.last_hard_reset, None, "established: FRR has cleared it");
         assert_eq!(down.state, "active");
         assert_eq!(down.remote_id, None);
         assert_eq!(down.reason.as_deref(), Some("Waiting for peer OPEN"));
