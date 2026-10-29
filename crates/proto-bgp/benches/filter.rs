@@ -133,6 +133,7 @@ fn bench(c: &mut Criterion) {
         policy: &policy,
         chain: policy.chain("transit-in"),
         accept_without: false,
+        counted: 0,
         asn: 65000,
     };
     let mut g = c.benchmark_group("filter_preview_1m_routes");

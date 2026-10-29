@@ -4,7 +4,7 @@
 # Runs as root inside the lab VM only:
 #   cargo xtask vm-lab run --lock-timeout 2h -- scripts/routeros-interop-bgp.sh [case…]
 # Cases (default: all, in this order):
-#   ebgp4 ebgp6 mpbgp multihop md5 communities filters ibgp nexthop-self
+#   ebgp4 ebgp6 mpbgp multihop md5 communities filters prepend ibgp nexthop-self
 #   rr rr-chr maxprefix restart bfd convergence scale crcr
 # A round of everything takes ~25 min (the CHR boot ~1 min, scale ~5 min);
 # pass a few cases to keep a round short. HOLD=<s> keeps the lab up that
@@ -34,7 +34,7 @@ exec 9>&-
 
 ROS_VERSION=${ROS_VERSION:-7.25}
 CASES=("$@")
-[ ${#CASES[@]} -gt 0 ] || CASES=(ebgp4 ebgp6 mpbgp multihop md5 communities filters ibgp nexthop-self rr rr-chr maxprefix restart bfd convergence scale crcr)
+[ ${#CASES[@]} -gt 0 ] || CASES=(ebgp4 ebgp6 mpbgp multihop md5 communities filters prepend ibgp nexthop-self rr rr-chr maxprefix restart bfd convergence scale crcr)
 W=/tmp/crg39f
 CHR_DIR=/srv/lab/chr
 PW=g39f-lab-only
@@ -573,6 +573,70 @@ case_filters() {
   ebgp4_down
   rosx '/routing filter rule remove [find chain=f-out]
 /routing filter rule remove [find chain=f-in]' >/dev/null
+}
+
+# G3.9fg: how many times each side puts its AS for "set bgp-path-prepend N".
+# eBGP and iBGP (CHR with as=65000 on the connection), out and in, N = 1..3,
+# one session per kind with the rule changed in place. The CoreRouter's
+# contract is RouterOS's: N copies in all on what leaves over eBGP.
+prepend_count() { tr ', ' '\n\n' <<< "$1" | grep -c "^$2\$" || true; }
+# path_or_none <json with as_path or "bgp.as-path"> <key>: the path, "(no route)" or "(empty)"
+path_or_none() { jq -r --arg k "$2" 'if . == {} then "(no route)" elif (.[$k] // "") == "" then "(empty)" else .[$k] end' <<< "$1"; }
+case_prepend() {
+  local n kind r k id
+  cr1 routing.filter.rule.add '{"chain":"p-out","rule":"if (dst in 100.64.39.0/24) { set bgp-path-prepend 1; accept } accept"}' >/dev/null
+  id=$(cr1 routing.filter.rule.list '{"chain":"p-out"}' | jq -r '.[0].id')
+  rosx '/routing filter rule add chain=p-out comment=g39fg rule="set bgp-path-prepend 1; accept"
+/routing filter rule add chain=p-in comment=g39fg rule="if (dst == 100.64.39.0/24) { set bgp-path-prepend 1 } accept"' >/dev/null
+  for kind in ebgp ibgp; do
+    if [ $kind = ebgp ]; then
+      crc 1 '{"name":"chrp","remote_address":"10.39.1.1","remote_as":65001,"input_filter":"all","output_filter":"p-out","output_network":"bgp-out"}'
+      rosx '/routing bgp connection add name=crp instance=default remote.address=10.39.1.2 remote.as=65000 local.role=ebgp output.network=bgp-out output.filter-chain=p-out input.filter=p-in afi=ip' >/dev/null
+    else
+      # Between loopbacks, as case_ibgp (on the link address the CHR did
+      # not come up after the eBGP session to the same address went).
+      loop_routes
+      crc 1 '{"name":"chrp","remote_address":"10.255.39.1","remote_as":65000,"update_source":"10.255.39.2","output_filter":"p-out","output_network":"bgp-out"}'
+      rosx '/routing bgp connection add name=crp instance=default as=65000 remote.address=10.255.39.2 remote.as=65000 local.role=ibgp local.address=10.255.39.1 output.network=bgp-out output.filter-chain=p-out input.filter=p-in afi=ip' >/dev/null
+    fi
+    if ! wait_for 90 cr_up 1 chrp >/dev/null; then
+      result prepend FAIL "$kind: no session ($(cr_state 1 chrp), CHR $(ros_sess crp | jq -c '{established, "last-stopped"}'))"
+      dump; crd 1 chrp; rosd crp; [ $kind = ebgp ] || loop_routes_off; sleep 5; continue
+    fi
+    for n in 1 2 3; do
+      cr1 routing.filter.rule.set "{\"id\":\"$id\",\"rule\":\"if (dst in 100.64.39.0/24) { set bgp-path-prepend $n; accept } accept\"}" >/dev/null
+      rosx "/routing filter rule set [find chain=p-out comment=g39fg] rule=\"set bgp-path-prepend $n; accept\"
+/routing filter rule set [find chain=p-in comment=g39fg] rule=\"if (dst == 100.64.39.0/24) { set bgp-path-prepend $n } accept\"" >/dev/null
+      sleep 8
+      r=$(path_or_none "$(bgp_path cf1 203.0.113.0/24)" as_path)
+      result prepend INFO "$kind N=$n CHR out → CR1: as_path $r ($(prepend_count "$r" 65001) × 65001, $(prepend_count "$r" 65000) × 65000)"
+      r=$(path_or_none "$(ros_battr 100.64.39.0/24)" bgp.as-path)
+      k=$(prepend_count "$r" 65000)
+      result prepend INFO "$kind N=$n CR1 out + CHR in prepend $n → CHR: as-path $r ($(prepend_count "$r" 65001) × 65001, $k × 65000)"
+    done
+    crd 1 chrp; rosd crp
+    [ $kind = ebgp ] || loop_routes_off
+    sleep 3
+  done
+  # Our side alone (no prepend in CHR's in chain): eBGP N copies in all.
+  rosx '/routing filter rule set [find chain=p-in comment=g39fg] rule="accept"' >/dev/null
+  crc 1 '{"name":"chrp","remote_address":"10.39.1.1","remote_as":65001,"input_filter":"all","output_filter":"p-out","output_network":"bgp-out"}'
+  rosx '/routing bgp connection add name=crp instance=default remote.address=10.39.1.2 remote.as=65000 local.role=ebgp output.network=bgp-out output.filter-chain=p-out input.filter=p-in afi=ip' >/dev/null
+  if wait_for 90 cr_up 1 chrp >/dev/null; then
+    for n in 1 2 3; do
+      cr1 routing.filter.rule.set "{\"id\":\"$id\",\"rule\":\"if (dst in 100.64.39.0/24) { set bgp-path-prepend $n; accept } accept\"}" >/dev/null
+      sleep 8
+      r=$(path_or_none "$(ros_battr 100.64.39.0/24)" bgp.as-path)
+      k=$(prepend_count "$r" 65000)
+      [ "$k" = "$n" ] && result prepend OK "eBGP N=$n CR1 out → CHR as-path $r ($k × 65000, as RouterOS)" \
+        || result prepend FAIL "eBGP N=$n CR1 out → CHR as-path $r ($k × 65000, want $n)"
+    done
+  else
+    result prepend FAIL "ebgp (ours): no session ($(cr_state 1 chrp))"
+  fi
+  crd 1 chrp; rosd crp
+  cr1 routing.filter.rule.remove "{\"id\":\"$id\"}" >/dev/null
+  rosx '/routing filter rule remove [find comment=g39fg]' >/dev/null
 }
 
 # iBGP between loopbacks over static routes (the IGP stand-in).

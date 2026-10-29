@@ -31,10 +31,41 @@ corerouter-cli run routing.filter.impact
 | `routing.filter.preview` | — (o RouterOS não tem prévia) |
 | `routing.filter.impact` | — |
 | `routing.filter.status` | — (chains, quem usa, e as conexões eBGP sem chain) |
+| `routing.filter.prepend.set` | — (G3.9fg: a contagem do `bgp-path-prepend` de um filtro antigo) |
 
 Na GUI: **Routing › Filters** (abas Rules, Prefix Lists, Community Lists, Preview; aviso RFC 8212 e
 impacto do commit em cima) e, em Routing › BGP, a página **Filters** do modal da conexão e do
 template (Input Filter, Output Filter, Keep Received).
+
+## `set bgp-path-prepend N` (G3.9fg)
+
+Como no RouterOS v7: para um vizinho eBGP a rota sai com o nosso AS **N vezes no total**, a cópia
+que o eBGP sempre põe incluída. `set bgp-path-prepend 3` sai `65000 65000 65000`; N = 1 não muda
+nada (**medido** no RouterOS 7.25 CHR, `scripts/routeros-interop-bgp.sh prepend`). Na entrada e
+na saída iBGP, onde a sessão não põe o AS, a chain põe N cópias.
+
+No FRR, `set as-path prepend` põe as cópias antes da do eBGP. O render faz a conta: o mapa de
+saída de uma conexão eBGP põe N − 1. Uma chain usada também na entrada ou no iBGP ganha um
+segundo mapa só para as saídas eBGP, `CR-<chain>+ebgp-out` (o `+` não cabe num nome de chain).
+A prévia (`routing.filter.preview`, `impact`) mostra a mesma conta: o caminho que a chain entrega,
+antes da cópia do eBGP.
+
+**Configs antigas não mudam sozinhas.** Até a G3.9fg o CoreRouter punha N além da cópia do eBGP
+(N + 1). Um filtro gravado por uma versão anterior não tem o campo `prepend` e é lido como
+`legacy`, com a contagem antiga: depois da atualização o roteador manda os mesmos caminhos de
+antes. `routing.filter.status` traz `prepend` e `prepend_warning`, o `routing.filter.rule.check`
+avisa (`prepend-count`) e a janela Routing › Filters mostra o selo **Prepend count** com o botão
+**Use RouterOS count**, que roda:
+
+```sh
+corerouter-cli run routing.filter.prepend.set '{"count":"routeros"}'
+```
+
+Com `keep_paths` (padrão), ele reescreve N para N + 1 nas chains que só saem por eBGP, para o
+vizinho continuar recebendo o mesmo caminho, e lista em `left` o que não dá para manter: chain
+usada também na entrada ou no iBGP (separe as saídas eBGP numa chain própria) e N já em 16. Em
+modo transacional, `routing.filter.impact` mostra o efeito antes do commit. Filtros novos já
+nascem com a contagem do RouterOS.
 
 ## A linguagem
 
