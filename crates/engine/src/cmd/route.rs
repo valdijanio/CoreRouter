@@ -54,7 +54,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{gateway?: ip} → [{time (Unix s; null: no clock), gateway, method, to (up | down), routes, message}]",
         always, check_history),
     cmd!(query "ip.route.list", "Routes", ["IP", "Routes"], None,
-        "{routing_table?: string, family?: string (ipv4 | ipv6), state?: string (active | standby | inactive), origin?: string (connected | static | dhcp | ra)} → [{key (stable row key), id (null if connected), dst_address, family, gateway (as configured), gateway_address, gateway_interface, gateway_status (reachable | unreachable | incomplete: the gateway does not answer ARP/ND; null if connected), check_gateway (null | {method (arp | ping | bfd), interval_secs (0: bfd), misses, state (up | down), status (checking | reachable | unreachable | not-checked), hold_down_secs (answers again, held for flapping; null), bfd_profile (bfd; null)}), distance, routing_table, flags (X disabled, A active, D dynamic, C connected, S static, + ECMP), state (active | standby: a lower distance wins | inactive), active, static, connected, dynamic (from a DHCP lease, a Router Advertisement or connected), origin (connected | static | dhcp | ra), disabled, immediate_gw, interface, ecmp (paths of its ECMP group), reason (why standby or inactive), reason_id, reason_args, changed_at (Unix s it took its state; null: before watching), changed_secs, comment}]",
+        "{routing_table?: string, family?: string (ipv4 | ipv6), state?: string (active | standby | inactive), origin?: string (connected | static | dhcp | ra)} → [{key (stable row key), id (null if connected), dst_address, family, gateway (as configured), gateway_address, gateway_interface, gateway_status (reachable | unreachable | incomplete: the gateway does not answer ARP/ND; null if connected), check_gateway (null | {method (arp | ping | bfd), interval_secs (0: bfd), misses, state (up | down), status (checking | reachable | unreachable | not-checked), hold_down_secs (answers again, held for flapping; null), bfd_profile (bfd; null)}), distance, routing_table, flags (X disabled, A active, D dynamic, C connected, S static, + ECMP), state (active | standby: a lower distance wins | inactive), active, static, connected, dynamic (from a DHCP lease, a Router Advertisement or connected), origin (connected | static | dhcp | ra), disabled, immediate_gw, interface, ecmp (paths of its ECMP group), reason (why standby or inactive), reason_id, reason_args, notice (null | {level (info: paths of one origin | warning: origins mixed or the default route, split per connection between uplinks), text, id, args, fix (the command that makes one path a backup; null)}), changed_at (Unix s it took its state; null: before watching), changed_secs, comment}]",
         always, list),
 ];
 
@@ -312,6 +312,13 @@ pub(crate) fn row(l: &Line, watch: Option<&RouteWatch>, now: Option<u64>) -> Val
         "reason": reason,
         "reason_id": reason_id,
         "reason_args": reason_args,
+        "notice": l.notice.as_ref().map(|n| json!({
+            "level": n.level.as_str(),
+            "text": n.why.text,
+            "id": n.why.id,
+            "args": n.why.args.iter().map(|(k, v)| ((*k).to_owned(), Value::String(v.clone()))).collect::<serde_json::Map<_, _>>(),
+            "fix": n.fix,
+        })),
         "changed_at": changed_at,
         "changed_secs": changed_at.zip(now).map(|(at, now)| now.saturating_sub(at)),
         "comment": l.comment,

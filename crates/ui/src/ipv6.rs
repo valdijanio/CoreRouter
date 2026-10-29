@@ -236,7 +236,7 @@ impl Dhcp6Form {
             prefix_hint: String::new(),
             use_peer_dns: true,
             add_default_route: false,
-            distance: "1".into(),
+            distance: "254".into(),
             comment: String::new(),
             disabled: false,
             rapid_commit: true,

@@ -23,6 +23,14 @@ pub const MAX_EXTRA: usize = 16;
 pub const MAX_HOST_NAME: usize = 63;
 /// `client_id`, `vendor_class` and one `extra_options` value, as written.
 pub const MAX_VALUE_TEXT: usize = 255;
+/// Distance of a new client's routes (G1.27j): Cisco's AD 254 for a
+/// DHCP-learned default (`ip address dhcp`), so the lease's default route
+/// is the one in use when it is the only one and a backup behind any
+/// static, OSPF or BGP route, instead of an ECMP partner of a static
+/// route at distance 1 (RouterOS' default). A saved config keeps the
+/// value it wrote; one that never had the field reads
+/// [`DEFAULT_DISTANCE`], as before.
+pub const DEFAULT_ROUTE_DISTANCE: u8 = 254;
 
 /// What the lease's routes do (RouterOS `add-default-route`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,7 +210,8 @@ pub struct DhcpClient {
     pub comment: String,
     #[serde(default)]
     pub add_default_route: AddDefaultRoute,
-    /// Distance of every route the lease brings (1..=255).
+    /// Distance of every route the lease brings (1..=255; a new client
+    /// gets [`DEFAULT_ROUTE_DISTANCE`]).
     #[serde(default = "default_distance")]
     pub default_route_distance: u8,
     /// Table of the lease's routes; `None` follows the interface (main, or
@@ -252,7 +261,8 @@ fn yes() -> bool {
 }
 
 impl DhcpClient {
-    /// A client with RouterOS' defaults.
+    /// A client with RouterOS' defaults, except the routes' distance
+    /// ([`DEFAULT_ROUTE_DISTANCE`]).
     pub fn new(id: ItemId, interface: IfName) -> Self {
         Self {
             id,
@@ -260,7 +270,7 @@ impl DhcpClient {
             disabled: false,
             comment: String::new(),
             add_default_route: AddDefaultRoute::Yes,
-            default_route_distance: DEFAULT_DISTANCE,
+            default_route_distance: DEFAULT_ROUTE_DISTANCE,
             default_route_table: None,
             use_peer_dns: true,
             use_peer_ntp: true,
@@ -298,9 +308,28 @@ mod tests {
     #[test]
     fn minimal_json_gets_the_routeros_defaults() {
         let c: DhcpClient = serde_json::from_str(r#"{"id": "*1", "interface": "ether1"}"#).unwrap();
-        assert_eq!(c, DhcpClient::new(ItemId(1), "ether1".parse().unwrap()));
+        // A config that never wrote the distance keeps RouterOS' 1 (G1.27j).
+        let mut want = DhcpClient::new(ItemId(1), "ether1".parse().unwrap());
+        want.default_route_distance = DEFAULT_DISTANCE;
+        assert_eq!(c, want);
         let back: DhcpClient = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(back, c);
+    }
+
+    /// G1.27j: a new client's routes are a backup (254, Cisco's AD for a
+    /// DHCP default), and the value is written, so the saved config keeps
+    /// it when the default changes again; an old config's 1 stays 1.
+    #[test]
+    fn new_client_distance_is_254_and_saved_values_stay() {
+        let c = DhcpClient::new(ItemId(1), "ether1".parse().unwrap());
+        assert_eq!(c.default_route_distance, 254);
+        let text = serde_json::to_string(&c).unwrap();
+        assert!(text.contains(r#""default_route_distance":254"#), "{text}");
+        let old: DhcpClient = serde_json::from_str(
+            r#"{"id": "*1", "interface": "ether1", "default_route_distance": 1}"#,
+        )
+        .unwrap();
+        assert_eq!(old.default_route_distance, 1);
     }
 
     #[test]

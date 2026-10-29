@@ -366,6 +366,30 @@ fn a_static_route_at_the_same_distance_shares_and_is_listed() {
         note.contains("ECMP") && note.contains(&st) && note.contains("10.0.0.1"),
         "{note}"
     );
+    // G1.27j: never silent. Static + DHCP on the default route is a
+    // warning on both rows, with the command that makes the lease a
+    // backup, in the client's note and in the health checks.
+    assert_eq!(c["route_states"][0]["notice"], "warning", "{c}");
+    let fix = format!(r#"ip.dhcp-client.set {{"id":"{id}","default_route_distance":254}}"#);
+    assert!(
+        note.starts_with("warning:") && note.contains(&fix),
+        "{note}"
+    );
+    for r in &defaults {
+        assert_eq!(r["notice"]["level"], "warning", "{r}");
+        assert_eq!(r["notice"]["id"], "ecmp-mixed", "{r}");
+        assert_eq!(r["notice"]["fix"], fix.as_str(), "{r}");
+    }
+    let health = l.ok("system.health.check", json!({}));
+    let ecmp = health["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["key"] == "routes.ecmp")
+        .unwrap()
+        .clone();
+    assert_eq!(ecmp["severity"], "warning", "{ecmp}");
+    assert!(ecmp["action"].as_str().unwrap().contains(&fix), "{ecmp}");
 
     // A backup: distance 2 is listed on standby, and the client says why.
     l.ok(
@@ -381,6 +405,19 @@ fn a_static_route_at_the_same_distance_shares_and_is_listed() {
     assert_eq!(defaults.len(), 2);
     assert_eq!(defaults[0]["flags"], "AS");
     assert_eq!(defaults[1]["flags"], "DS");
+    assert!(
+        defaults.iter().all(|r| r["notice"].is_null()),
+        "{defaults:?}"
+    );
+    let health = l.ok("system.health.check", json!({}));
+    assert!(
+        health["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["key"] == "routes.ecmp" && c["severity"] == "ok"),
+        "{health}"
+    );
     assert!(
         defaults[1]["reason"]
             .as_str()
@@ -417,6 +454,43 @@ fn a_static_route_at_the_same_distance_shares_and_is_listed() {
     assert_eq!(c["route_states"][0]["state"], "active", "{c}");
     assert_eq!(c["route_states"][0]["ecmp"], 1, "{c}");
     assert!(c["notes"].as_array().unwrap().is_empty(), "{c}");
+}
+
+/// G1.27j: a client added without a distance gets 254 (Cisco's AD for a
+/// DHCP default): next to a static default it is the backup, not an ECMP
+/// partner, and nothing warns.
+#[test]
+fn a_new_client_is_a_backup_behind_a_static_default() {
+    let mut l = Lab::new(Knobs {
+        classless: false,
+        ..Knobs::default()
+    });
+    l.ok(
+        "ip.address.add",
+        json!({"address": "10.0.0.2/24", "interface": "ether2"}),
+    );
+    l.ok(
+        "ip.route.add",
+        json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.0.1"}),
+    );
+    let id = l.add(json!({"interface": "ether1"}));
+    l.run(1_000);
+    let c = l.client(&id);
+    assert_eq!(c["default_route_distance"], 254, "{c}");
+    assert_eq!(c["route_states"][0]["state"], "standby", "{c}");
+    assert!(c["route_states"][0]["notice"].is_null(), "{c}");
+    let defaults: Vec<Value> = l
+        .routes()
+        .into_iter()
+        .filter(|r| r["dst_address"] == "0.0.0.0/0")
+        .collect();
+    assert_eq!(defaults.len(), 2, "{defaults:?}");
+    assert_eq!(defaults[0]["flags"], "AS");
+    assert_eq!(defaults[1]["distance"], 254);
+    assert!(
+        defaults.iter().all(|r| r["notice"].is_null()),
+        "{defaults:?}"
+    );
 }
 
 /// A lower-distance lease route wins over the static one, which says so.

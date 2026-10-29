@@ -27,4 +27,17 @@ Routes through the same gateway share one check: a thousand routes, one probe.
 
 **Status**: `checking` (no answer yet), `reachable`, `unreachable`, `not-checked` (no daemon runs the checks).",
     ),
+    (
+        "routes.reason",
+        "## Reason
+
+Why a route is **standby** (a route with a lower distance wins; it takes over when that one goes) or **inactive** (disabled, no link, gateway unreachable…).
+
+On the line of an **ECMP** group (paths at the same distance that share the traffic per connection) it is the group's notice:
+
+- `ECMP` blue (info): paths of one origin to a network that is not the default route, such as two static gateways. Usually meant.
+- `ECMP` `warning` amber: different origins (static + DHCP, two DHCP uplinks) or the default route. Each connection leaves by one of the uplinks, with a different public address: a site sees one user coming from two addresses, and a dead uplink takes its share of the flows with it. The text ends with the command that makes one of them a backup (a DHCP client's distance 254, or a static route one step further).
+
+A warning also counts in System › Health (`routes.ecmp`) and in the DHCP client's notes.",
+    ),
 ];

@@ -51,6 +51,27 @@ padrão do DHCP não aparecia, nem inativa, enquanto a estática `*1` existia). 
 grupo ECMP e `ip.dhcp-client.list` diz com quem a rota divide o tráfego (`route_states`, `notes`);
 para usá-la só como reserva, suba o `default_route_distance`.
 
+### Aviso de ECMP (G1.27j)
+
+Um grupo ECMP nunca é silencioso. Cada rota ativa do grupo traz `notice` em `ip.route.list`
+(`level`, `text`, `id`, `args`, `fix`), em dois níveis:
+
+- **info** (`ecmp-same`): caminhos de uma origem só para uma rede que não é a padrão (duas
+  estáticas por gateways diferentes, RA de dois roteadores). Costuma ser intencional.
+- **warning** (`ecmp-mixed`, `ecmp-default`): origens misturadas (estática + DHCP, dois clientes
+  DHCP, que são dois uplinks mesmo com a mesma origem) ou a rota padrão. O kernel escolhe o caminho
+  por hash do fluxo (`net.ipv4.fib_multipath_hash_policy`: 0 = origem/destino, o padrão; 1 = as
+  portas também), então cada conexão sai por um uplink com outro IP público: sites que amarram a
+  sessão ao IP quebram e um uplink que cai leva a parte dele das conexões. O `fix` é o comando
+  pronto: o cliente DHCP do grupo com `default_route_distance` 254, ou a última estática um passo
+  atrás (`ip.route.set {"id":…,"distance":d+1}`).
+
+O aviso aparece na linha do grupo na janela Routes (selo `ECMP` âmbar + `warning`, texto no Motivo,
+contagem no rodapé, linha "ECMP" no detalhe com "Copy command"), em `system.health.check`
+(`routes.ecmp`, entra no "N warning" da barra), nas `notes` e em `route_states[].notice` de
+`ip.dhcp-client.list`/`ipv6.dhcp-client.list`, e em `ip.route.page` (`summary.ecmp_warning`,
+`ecmp_info`). A contagem vem do `Summary` guardado com as linhas: a saúde não varre a tabela.
+
 Na GUI o grupo aparece numa linha "+ 2 next-hops" com o selo `ECMP`; um clique abre os caminhos.
 
 ## Check-gateway (G1.27f, G3.6g)
