@@ -27,6 +27,10 @@
 //! - §6.2.7: another router's RA on the link with different values is
 //!   logged once and shown as a conflict.
 
+// The sender's state machine is plain Rust (tested everywhere); the raw
+// socket and the thread are Linux only (`nix`), like BFD's.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
+
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -448,6 +452,15 @@ fn is_lab(session: &Shared) -> bool {
     lock(session).backend().starts_with("virtual lab")
 }
 
+#[cfg(not(target_os = "linux"))]
+fn run(_session: &Shared, health: &super::Health) {
+    health.disabled(Some("Router Advertisements are sent on Linux only"));
+    while health.sleep(Duration::from_secs(5)) {
+        health.beat();
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn run(session: &Shared, health: &super::Health) {
     let origin = Instant::now();
     let clock = || u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -570,12 +583,14 @@ fn run(session: &Shared, health: &super::Health) {
 }
 
 /// What the socket read.
+#[cfg(target_os = "linux")]
 pub(crate) enum Inbound {
     Rs { ifindex: u32 },
     Ra { ifindex: u32, ra: ParsedRa },
 }
 
 /// The raw ICMPv6 socket, through `socket2` and `nix` (no `unsafe`).
+#[cfg(target_os = "linux")]
 mod sock {
     use std::io::IoSliceMut;
     use std::net::{Ipv6Addr, SocketAddrV6};

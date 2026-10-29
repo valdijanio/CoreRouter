@@ -344,6 +344,8 @@ fn linux_router_advertisement_gives_a_host_slaac_and_a_default_route() {
     drop(daemon);
     drop(b);
     drop(c_ns);
-    ip(None, &["link", "del", "lan0"]);
+    // Dropping B's namespace takes the veth pair with it, sooner or later:
+    // lan0 may be gone already.
+    let _ = Command::new("ip").args(["link", "del", "lan0"]).output();
     let _ = std::fs::remove_dir_all(&dir);
 }
