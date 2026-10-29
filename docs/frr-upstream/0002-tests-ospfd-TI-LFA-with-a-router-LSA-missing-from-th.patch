@@ -1,0 +1,257 @@
+From c9fe9ca0406d818d505b43a35790585fdec7d9af Mon Sep 17 00:00:00 2001
+From: Valdijanio Vieira <48389119+valdijanio@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 19:57:36 -0300
+Subject: [PATCH 2/2] tests: ospfd TI-LFA with a router-LSA missing from the
+ LSDB
+
+Add topo6 to test_ospf_spf: the triangle of topo1 plus RT4, which RT3
+advertises a point-to-point link to but whose router-LSA is not
+injected (the new no_router_lsa flag of a test node). Without the fix,
+"test ospf topology topo6 root rt1 ti-lfa" aborts in
+get_reverse_distance(); with it, the backup paths are those of topo1.
+
+Signed-off-by: Valdijanio Vieira <48389119+valdijanio@users.noreply.github.com>
+---
+ tests/ospfd/common.c             |   5 +-
+ tests/ospfd/common.h             |   6 ++
+ tests/ospfd/test_ospf_spf.in     |   2 +
+ tests/ospfd/test_ospf_spf.refout |  26 ++++++
+ tests/ospfd/topologies.c         | 132 +++++++++++++++++++++++++++++++
+ 5 files changed, 170 insertions(+), 1 deletion(-)
+
+diff --git a/tests/ospfd/common.c b/tests/ospfd/common.c
+index d56a48fa85..48350f8771 100644
+--- a/tests/ospfd/common.c
++++ b/tests/ospfd/common.c
+@@ -34,6 +34,8 @@ struct ospf_topology *test_find_topology(const char *name)
+ 		return &topo4;
+ 	else if (strmatch(name, "topo5"))
+ 		return &topo5;
++	else if (strmatch(name, "topo6"))
++		return &topo6;
+ 
+ 	return NULL;
+ }
+@@ -241,7 +243,8 @@ int topology_load(struct vty *vty, struct ospf_topology *topology,
+ 		tnode = &topology->nodes[i];
+ 
+ 		/* Inject a router LSA for each node, used for SPF */
+-		inject_router_lsa(vty, ospf, topology, root, tnode);
++		if (!tnode->no_router_lsa)
++			inject_router_lsa(vty, ospf, topology, root, tnode);
+ 
+ 		/*
+ 		 * SR information could also be inected via LSAs, but directly
+diff --git a/tests/ospfd/common.h b/tests/ospfd/common.h
+index 3a9cf3f5dc..b120e9137b 100644
+--- a/tests/ospfd/common.h
++++ b/tests/ospfd/common.h
+@@ -17,6 +17,11 @@ struct ospf_test_node {
+ 	const char *router_id;
+ 	mpls_label_t label;
+ 	struct ospf_test_adj adjacencies[MAX_ADJACENCIES + 1];
++	/*
++	 * Don't inject this node's router-LSA: other routers still advertise
++	 * a link to it, as when its LSA has not been received yet.
++	 */
++	bool no_router_lsa;
+ };
+ 
+ struct ospf_topology {
+@@ -37,6 +42,7 @@ extern struct ospf_topology topo2;
+ extern struct ospf_topology topo3;
+ extern struct ospf_topology topo4;
+ extern struct ospf_topology topo5;
++extern struct ospf_topology topo6;
+ extern struct zebra_privs_t ospfd_privs;
+ 
+ /* For stable order in unit tests */
+diff --git a/tests/ospfd/test_ospf_spf.in b/tests/ospfd/test_ospf_spf.in
+index f1e746745f..a8a0260b72 100644
+--- a/tests/ospfd/test_ospf_spf.in
++++ b/tests/ospfd/test_ospf_spf.in
+@@ -8,3 +8,5 @@ test ospf topology topo4 root rt1 ti-lfa
+ test ospf topology topo4 root rt1 ti-lfa node-protection
+ test ospf topology topo5 root rt1 ti-lfa
+ test ospf topology topo5 root rt1 ti-lfa node-protection
++test ospf topology topo6 root rt1 ti-lfa
++test ospf topology topo6 root rt1 ti-lfa node-protection
+diff --git a/tests/ospfd/test_ospf_spf.refout b/tests/ospfd/test_ospf_spf.refout
+index d1e3c7bc65..d89e896205 100644
+--- a/tests/ospfd/test_ospf_spf.refout
++++ b/tests/ospfd/test_ospf_spf.refout
+@@ -126,5 +126,31 @@ N 10.0.2.0/24        0.0.0.0         30
+ N 10.0.3.0/24        0.0.0.0         20
+   -> 10.0.4.2 with adv router 4.4.4.4
+ N 10.0.4.0/24        0.0.0.0         10
++test# test ospf topology topo6 root rt1 ti-lfa
++N 1.1.1.1/32         0.0.0.0         0
++N 2.2.2.2/32         0.0.0.0         10
++  -> 10.0.1.2 with adv router 2.2.2.2 and backup path 15002
++N 3.3.3.3/32         0.0.0.0         10
++  -> 10.0.3.2 with adv router 3.3.3.3 and backup path 15001
++N 10.0.1.0/24        0.0.0.0         10
++N 10.0.2.0/24        0.0.0.0         20
++  -> 10.0.1.2 with adv router 2.2.2.2 and backup path 15002
++  -> 10.0.3.2 with adv router 3.3.3.3 and backup path 15001
++N 10.0.3.0/24        0.0.0.0         10
++N 10.0.4.0/24        0.0.0.0         20
++  -> 10.0.3.2 with adv router 3.3.3.3 and backup path 15001
++test# test ospf topology topo6 root rt1 ti-lfa node-protection
++N 1.1.1.1/32         0.0.0.0         0
++N 2.2.2.2/32         0.0.0.0         10
++  -> 10.0.1.2 with adv router 2.2.2.2
++N 3.3.3.3/32         0.0.0.0         10
++  -> 10.0.3.2 with adv router 3.3.3.3
++N 10.0.1.0/24        0.0.0.0         10
++N 10.0.2.0/24        0.0.0.0         20
++  -> 10.0.1.2 with adv router 2.2.2.2
++  -> 10.0.3.2 with adv router 3.3.3.3
++N 10.0.3.0/24        0.0.0.0         10
++N 10.0.4.0/24        0.0.0.0         20
++  -> 10.0.3.2 with adv router 3.3.3.3
+ test# 
+ end.
+diff --git a/tests/ospfd/topologies.c b/tests/ospfd/topologies.c
+index c8a2f10183..bbc54df7a6 100644
+--- a/tests/ospfd/topologies.c
++++ b/tests/ospfd/topologies.c
+@@ -574,3 +574,135 @@ struct ospf_topology topo5 = {
+ 			},
+ 		},
+ };
++
++
++/*
++ * +---------+                     +---------+
++ * |         |                     |         |
++ * |   RT1   |eth-rt2       eth-rt1|   RT2   |
++ * | 1.1.1.1 +---------------------+ 2.2.2.2 |
++ * |         |     10.0.1.0/24     |         |
++ * +---------+                     +---------+
++ *      |eth-rt3                 eth-rt3|
++ *      |                               |
++ *      |10.0.3.0/24                    |
++ *      |                               |
++ *      |eth-rt1                        |
++ * +---------+                          |
++ * |         |eth-rt2        10.0.2.0/24|
++ * |   RT3   +--------------------------+
++ * | 3.3.3.3 |
++ * |         |
++ * +---------+
++ *      |eth-rt4
++ *      |
++ *      |10.0.4.0/24
++ *      |
++ *      |eth-rt3
++ * +---------+
++ * |         |
++ * |   RT4   |
++ * | 4.4.4.4 |
++ * |         |
++ * +---------+
++ *
++ * The triangle of topo1 plus RT4, whose router-LSA is not in the LSDB yet
++ * while RT3 already advertises its point-to-point link to it (e.g. RT3's
++ * new router-LSA was flooded before RT4's own one arrived). The SPF just
++ * skips RT4 (RFC 2328 16.1 (2b)), and so must the reverse SPF of the Q
++ * spaces: the backup paths are the ones of topo1.
++ */
++struct ospf_topology topo6 = {
++	.nodes =
++		{
++			{
++				.hostname = "rt1",
++				.router_id = "1.1.1.1",
++				.label = 10,
++				.adjacencies =
++					{
++						{
++							.hostname = "rt2",
++							.network =
++								"10.0.1.1/24",
++							.metric = 10,
++							.label = 1,
++						},
++						{
++							.hostname = "rt3",
++							.network =
++								"10.0.3.1/24",
++							.metric = 10,
++							.label = 2,
++						},
++					},
++			},
++			{
++				.hostname = "rt2",
++				.router_id = "2.2.2.2",
++				.label = 20,
++				.adjacencies =
++					{
++						{
++							.hostname = "rt1",
++							.network =
++								"10.0.1.2/24",
++							.metric = 10,
++							.label = 3,
++						},
++						{
++							.hostname = "rt3",
++							.network =
++								"10.0.2.1/24",
++							.metric = 10,
++							.label = 4,
++						},
++					},
++			},
++			{
++				.hostname = "rt3",
++				.router_id = "3.3.3.3",
++				.label = 30,
++				.adjacencies =
++					{
++						{
++							.hostname = "rt1",
++							.network =
++								"10.0.3.2/24",
++							.metric = 10,
++							.label = 5,
++						},
++						{
++							.hostname = "rt2",
++							.network =
++								"10.0.2.2/24",
++							.metric = 10,
++							.label = 6,
++						},
++						{
++							.hostname = "rt4",
++							.network =
++								"10.0.4.1/24",
++							.metric = 10,
++							.label = 7,
++						},
++					},
++			},
++			{
++				.hostname = "rt4",
++				.router_id = "4.4.4.4",
++				.label = 40,
++				.adjacencies =
++					{
++						{
++							.hostname = "rt3",
++							.network =
++								"10.0.4.2/24",
++							.metric = 10,
++							.label = 8,
++						},
++					},
++				.no_router_lsa = true,
++			},
++		},
++};
+-- 
+2.43.0
+

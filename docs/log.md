@@ -8246,3 +8246,72 @@ continuação indentadas).
   98,9 → 70,9 MiB (três boots: 101,9/95,2/99,6 → 72,0/69,0/71,8), FRR pronto 0,82 s depois do
   kernel (antes 1,0–1,9 s). Com OSPF+SR+LDP+BFD no ar o RSS por daemon não muda (ospfd 10,9 MiB,
   ldpd 8,6, bfdd 8,9).
+
+- 2026-10-29 — processo: Runner próprio do CI (`docs/ci-runner.md`): os jobs pesados do lote da fila (`test`,
+  `bench-check`, `netns`) rodam numa VM descartável desta máquina, `corerouter-ci` (16 vCPUs,
+  16 GiB, discos em `/srv/build/ci-runner/`), com 3 runners self-hosted, em vez dos runners de
+  4 vCPU do GitHub; o cache de build fica num disco próprio da VM e sobrevive aos resets.
+  `cargo xtask ci-runner create|register|status|check-network|run|reset|down|unregister|destroy`
+  (`xtask/src/ci_runner.rs`, que reaproveita a imagem verificada, o `virsh` e o SSH do `vm_lab`).
+  Segurança (o repositório é público): o workflow só manda para o runner o `workflow_dispatch` em
+  `queue/*` com `runner=corerouter` e, se a variável `CI_RUNNER` do repositório pedir, o push na
+  `main`; PR, inclusive de fork, fica no GitHub. Um hook do runner (root, posto pela unit) reprova
+  antes do primeiro passo qualquer outro job, mesmo que um workflow alterado peça `self-hosted`.
+  Os jobs rodam como `runner`, sem sudo; um nwfilter do libvirt no host deixa a VM falar só com a
+  internet (LAN, endereços do host, faixas privadas e IPv6 bloqueados; conferido por
+  `ci-runner check-network`). A fila (`scripts/land.sh`) escolhe o runner por lote: o próprio
+  quando o GitHub o mostra online, senão os do GitHub (a fila nunca espera um runner fora do ar);
+  lote com PR de fork vai sempre para o GitHub; ociosa, volta a VM ao snapshot a cada 40 jobs.
+  `xdp-root` e `lint` continuam no GitHub. O registro (token) e as opções do repositório são do
+  usuário: roteiro em `docs/ci-runner.md`, "Etapa do usuário".
+
+- 2026-10-29 — processo: Build rápido da imagem (`cargo xtask os build|push`):
+
+  - **Uma pasta de build por checkout fora do repositório.** Buildroot, `O=`, ccache, targets do
+    cargo, GUI web, pastas dos testes no QEMU e a chave de assinatura vão para
+    `/srv/build/os-out/<checkout>-<hash>` (`$COREROUTER_OS_OUT` muda; sem `/srv/build`, `os/out`).
+    `cargo xtask os out-dir` mostra a pasta.
+  - **Chave preservada.** Um checkout cujo `os/out/keys` já tem chave continua usando o `os/out`
+    até migrar, e o build avisa. Com `$COREROUTER_OS_OUT` numa pasta sem chave, o build para e diz
+    o que copiar. O roteiro de migração está em `docs/os-image.md`, "Onde fica o build".
+  - **Um build por pasta**, garantido por um `flock` em `<out>/.build.lock`.
+  - **`make all` com `-j` de topo automático:** núcleos/4, no máximo um por 4 GiB livres, no
+    mínimo 2, mais `-l<núcleos>`. `--top-jobs`/`--jobs` continuam valendo.
+  - **GUI web num target próprio** (`<out>/web-target`). No mesmo `cargo-target` que o daemon,
+    cada build invalidava os artefatos de host do outro.
+  - **CLI do `push` em `<out>/cli-target`**, com perfil rápido (sem LTO, 16 unidades,
+    incremental). O `ab-test --scenario push` usa a mesma CLI.
+  - `RUSTC` fixado ao lado do cargo da toolchain: sem `RUSTUP_TOOLCHAIN`, o `rust-toolchain` do
+    crate `dhcproto` (1.90) trocava o compilador no meio do build.
+  - O `check_needed` compara caminhos canônicos, então um out acessado por symlink funciona.
+
+  **Medido** (2026-10-29, Ryzen AI Max+ 395, 32 threads, outras sessões rodando):
+
+  - uma linha no daemon + `os build --only crpkg`: **889 → 213 s**;
+  - CLI do `push`: 223 → 66 s com target novo e 144 → 3,2 s depois de mudar o engine;
+  - build completo com ccache: 1063 → 1010 s; o caminho crítico é `host-protobuf` → FRR, serial.
+
+  `boot-test` (KVM) e `ab-test --scenario push` passaram com a imagem nova: envio a 83 MiB/s,
+  B confirmado em 18,3 s.
+
+- 2026-10-29 — G3.4l: O abort do `ospfd` com TI-LFA (`ospf_spf.c:1269: get_reverse_distance(): assertion (w_lsa &&
+  w_lsa->data) failed`) é um bug do FRR, no 10.7.1 e no `master`. No SPF reverso dos Q-spaces,
+  `ospf_spf_next` lê o custo de volta da router-LSA do vizinho W antes da checagem "LSA ausente →
+  pula" da RFC 2328 §16.1 (2b). O gatilho medido é uma router-LSA que **sai** do LSDB (troca de
+  router-id ou `no router ospf` no vizinho) enquanto outras ainda a citam. A hipótese da corrida
+  na subida não se confirmou. Análise completa em `docs/frr-tilfa-abort.md`.
+
+  - **Prova:** teste unitário do FRR (`test_ospf_spf`, `topo6` com uma LSA ausente) aborta sempre
+    no 10.7.1 e no `master` (gdb: `w_lsa=0x0`) e passa com a correção, com os mesmos backups da
+    `topo1`. Na VM, `scripts/frr-tilfa-repro.sh` (só OSPF + TI-LFA, sem LDP/BFD, namespaces)
+    com o FRR compilado com logs `G34L`: 10.7.1 aborta em 15 de 40 iterações com troca de
+    router-id no R1 (todas com "W router-LSA ABSENT" na linha anterior), 0 de 50 só com subida e
+    flap; com a correção, 0 de 40 e 27 passagens por LSA ausente puladas, sem rota faltando
+    (**medido**).
+  - **Correção:** `os/patches/frr/0001-ospfd-ti-lfa-missing-router-lsa.patch` (uma condição,
+    `&& w_lsa`), aplicada pelo Buildroot; o `cargo xtask os build` faz `frr-dirclean` quando os
+    patches do FRR mudam. O `.deb` da VM do laboratório não tem a correção.
+  - **Upstream:** issue FRRouting/frr#24091 e PR FRRouting/frr#24092 (correção + teste), abertos
+    pela conta do usuário a pedido dele; texto e patches em `docs/frr-upstream/`.
+  - **Produção:** o TI-LFA continua desligado por padrão (a perda de um corte no Linux não cai com
+    ele, G3.4k); o aviso da prévia passou a dizer isso e a citar a G3.4l só para FRR sem o patch.

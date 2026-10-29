@@ -260,12 +260,13 @@ rotas perdidas com o motivo).
   pré-programado; o zebra guarda o reserva, mas a troca espera o `ospfd` (aviso do BFD, SPF,
   instalação). O corte silencioso fica em ~50–60 ms, acima da meta de 50 ms; o tempo é o do BFD
   (30 ms) mais o SPF e a instalação. Trocar no plano de dados é a G3.4k.
-- **O `ospfd` 10.7.1 aborta com TI-LFA** em 2 de 9 rodadas do laboratório:
+- **O `ospfd` 10.7.1 abortava com TI-LFA** (G3.4l, `docs/frr-tilfa-abort.md`):
   `ospf_spf.c:1269: get_reverse_distance(): assertion (w_lsa && w_lsa->data) failed`, no SPF
-  reverso do Q-space, quando o LSA de um vizinho ainda não chegou (a função trata esse caso logo
-  depois, mas o `assert` vem antes). O watchfrr reinicia o daemon e todas as adjacências caem. Por
-  isso a prévia avisa e a recomendação é deixar o TI-LFA desligado em produção até a G3.4l
-  (correção no FRR ou versão que a traga).
+  reverso do Q-space, quando a router-LSA de um vizinho sai do LSDB (troca de router-id ou
+  remoção do `router ospf` nele) enquanto a LSA de outro roteador ainda o cita: o custo reverso
+  era lido antes da checagem "LSA ausente" da RFC 2328 §16.1 (2b). O FRR da imagem leva a
+  correção (`os/patches/frr/`); o `.deb` da VM do laboratório não. O TI-LFA segue desligado em
+  produção pela G3.4k.
 
 ## Seguro por padrão
 
