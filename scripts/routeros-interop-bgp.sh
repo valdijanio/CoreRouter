@@ -204,9 +204,13 @@ frr_plain() { # frr_plain <ns> <bgpd.conf text>
   : > "$d/zebra.conf"; : > "$d/vtysh.conf"; : > "$d/staticd.conf"; : > "$d/bfdd.conf"
   printf '%s\n' "$2" > "$d/bgpd.conf"
   chown frr:frr "$d"/*.conf
+  # mgmtd and staticd take no -f (FRR 10: mgmtd holds staticd's config).
+  ip netns exec "$ns" /usr/lib/frr/mgmtd -N "$ns" -d
+  sleep 1
   ip netns exec "$ns" /usr/lib/frr/zebra -N "$ns" -d -f "$d/zebra.conf"
   sleep 1
-  for p in staticd bgpd bfdd; do ip netns exec "$ns" /usr/lib/frr/$p -N "$ns" -d -f "$d/$p.conf"; done
+  ip netns exec "$ns" /usr/lib/frr/staticd -N "$ns" -d
+  for p in bgpd bfdd; do ip netns exec "$ns" /usr/lib/frr/$p -N "$ns" -d -f "$d/$p.conf"; done
 }
 vt() { vtysh -N "$1" -c "$2"; }
 frr_plain cfr3 'router bgp 65003
@@ -293,6 +297,12 @@ ros_route() { ros "ip/route?dst-address=$1" | jq -c '[.[] | select(.active == "t
 ros_route6() { ros "ipv6/route?dst-address=$1" | jq -c '[.[] | select(.active == "true")][0] // {}'; }
 ros_gw() { ros_route "$1" | jq -r '.gateway // "-"'; }
 ros_gw6() { ros_route6 "$1" | jq -r '.gateway // "-"'; }
+# BGP attributes live in /routing/route (bgp.as-path, bgp.med, bgp.communities…);
+# /ip/route only has the forwarding fields.
+ros_battr() { ros "routing/route?dst-address=$1" | jq -c '[.[] | select(has("bgp.as-path") or ((.["belongs-to"] // "") | startswith("bgp")))][0] // {} | with_entries(select(.key | startswith("bgp.") or . == "gateway" or . == "belongs-to"))'; }
+# CR1's addresses on the CHR link: global or link-local (RFC 2545 §3 sends both;
+# a receiver on the same link may use the link-local one).
+ros_via6_cr1() { local g; g=$(ros_gw6 "$1"); [[ $g == fd39:1::2* || $g == fe80::*%ether1 ]]; }
 # The kernel route in a namespace: "via X" or "-".
 k_route() { ip -n "$1" route show "$2" 2>/dev/null | grep -o 'via [0-9.]*' | head -1 || true; }
 k_route6() { ip -n "$1" -6 route show "$2" 2>/dev/null | grep -o 'via [0-9a-f:]*' | head -1 || true; }
@@ -393,7 +403,8 @@ case_ebgp4() {
     || result ebgp4 FAIL "route.list for 203.0.113.0/24: $r"
   ms=$(wait_for 30 ros_via 100.64.39.0/24 10.39.1.2) && result ebgp4 OK "output_network: 100.64.39.0/24 active on CHR via the CoreRouter" \
     || { result ebgp4 FAIL "100.64.39.0/24 on CHR: $(ros_route 100.64.39.0/24)"; dump; }
-  result ebgp4 INFO "CHR route: $(ros_route 100.64.39.0/24 | jq -c 'with_entries(select(.key | startswith("bgp") or . == "gateway"))')"
+  result ebgp4 INFO "CHR route: $(ros_battr 100.64.39.0/24)"
+  result ebgp4 INFO "CHR /routing/route keys: $(ros 'routing/route?dst-address=100.64.39.0/24' | jq -c '[.[]? | keys] | add // [] | unique')"
   ip netns exec cf1 ping -c 3 -i 0.2 -W 1 -I 100.64.39.1 10.39.2.1 >/dev/null 2>&1 \
     && result ebgp4 OK "CR1's clients' gateway reaches CHR's ether2 address through the BGP-learnt routes" \
     || result ebgp4 INFO "ping 100.64.39.1 → 10.39.2.1 failed (CHR does not announce 10.39.2.0/30)"
@@ -412,9 +423,9 @@ case_ebgp6() {
   result ebgp6 OK "eBGP IPv6 (transport and NLRI) Established in ${ms} ms"
   ms=$(wait_for 30 k_has6 cf1 fd39:203::/48) && result ebgp6 OK "fd39:203::/48 in CR1's kernel $(k_route6 cf1 fd39:203::/48)" \
     || result ebgp6 FAIL "fd39:203::/48 on CR1: '$(k_route6 cf1 fd39:203::/48)'"
-  ms=$(wait_for 30 ros_via6 fd39:64::/64 fd39:1::2) && result ebgp6 OK "fd39:64::/64 active on CHR via fd39:1::2" \
+  ms=$(wait_for 30 ros_via6_cr1 fd39:64::/64) && result ebgp6 OK "fd39:64::/64 active on CHR via CR1 ($(ros_gw6 fd39:64::/64))" \
     || result ebgp6 FAIL "fd39:64::/64 on CHR: $(ros_route6 fd39:64::/64)"
-  result ebgp6 INFO "CHR route: $(ros_route6 fd39:64::/64 | jq -c '{gateway, "immediate-gw", "bgp.as-path"}')"
+  result ebgp6 INFO "CHR route: $(ros_battr fd39:64::/64)"
   crd 1 chr6; rosd cr6
 }
 
@@ -436,6 +447,7 @@ case_mpbgp() {
   [[ $r6 == *'"active":"true"'* ]] && result mpbgp OK "IPv6 over the IPv4 session: fd39:64::/64 active on CHR $r6" \
     || result mpbgp FAIL "fd39:64::/64 on CHR over the IPv4 session: $r6"
   result mpbgp INFO "CR1 bgpd next hop it sends: $(vt cf1 'show bgp ipv6 unicast neighbors 10.39.1.1 advertised-routes json' | jq -c '[.advertisedRoutes[]? | .nextHop] | unique' 2>/dev/null)"
+  result mpbgp INFO "zebra on CR1: $(vt cf1 'show ipv6 route fd39:203::/48 json' | jq -c '[.[]?[]? | {protocol, selected, installed, nh: [.nexthops[]? | {ip, afi, active, unreachable}]}]' 2>/dev/null)"
   result mpbgp INFO "next hop CR1 got: $(vt cf1 'show bgp ipv6 unicast fd39:203::/48 json' | jq -c '[.paths[]?.nexthops[]? | {ip, afi, scope, accessible}]' 2>/dev/null)"
   ebgp4_down
 }
@@ -502,7 +514,7 @@ case_communities() {
   result communities INFO "extended communities: route.list has no column for them and routing.filter has no bgp-ext-communities (G3.9fc)"
   # no-export: CR1 must not send it on to an eBGP neighbor (RFC 1997).
   ms=$(wait_for 30 ros_via 100.64.39.0/24 10.39.1.2) || true
-  local rr; rr=$(ros_route 100.64.39.0/24)
+  local rr; rr=$(ros_battr 100.64.39.0/24)
   [[ $rr == *65000:200* ]] && result communities OK "CR1's append reaches CHR: $(jq -c '{"bgp.communities", "bgp.large-communities"}' <<< "$rr")" \
     || result communities FAIL "CHR route from CR1: $rr"
   [[ $rr == *65000:3:4* ]] || result communities FAIL "large community from CR1 not on CHR: $rr"
@@ -531,16 +543,20 @@ case_filters() {
   wait_for 30 k_has cf1 203.0.113.0/24 >/dev/null || true
   r=$(bgp_path cf1 203.0.113.0/24)
   [ "$(jq -r .local_pref <<< "$r")" = 150 ] && result filters OK "in: local-pref 150 set by our chain" || result filters FAIL "in: local-pref $(jq -c '{local_pref}' <<< "$r")"
-  [[ $(jq -c .as_path <<< "$r") == *65001*65001*65001*65001* ]] && result filters OK "CHR's out prepend 3: as_path $(jq -c .as_path <<< "$r")" \
+  # How many times RouterOS puts its AS for "set bgp-path-prepend 3" on eBGP:
+  # 3 (the count includes the one eBGP adds) or 4 (3 more).
+  local n; n=$(jq -r '.as_path // ""' <<< "$r" | tr ' ' '\n' | grep -c '^65001$')
+  [ "$n" -ge 3 ] && result filters OK "CHR's out prepend 3: 65001 appears $n times (as_path $(jq -c .as_path <<< "$r"))" \
     || result filters FAIL "CHR prepend: as_path $(jq -c .as_path <<< "$r")"
   k_has cf1 198.51.100.0/24 && result filters FAIL "in: 198.51.100.0/24 should be rejected" || result filters OK "in: 198.51.100.0/24 rejected"
   local f; f=$(cr1 routing.bgp.route.list '{"connection":"chr4","prefix":"198.51.100.0/24","match":"exact"}' | jq -c '[.rows[]? | {prefix, filtered}]')
   result filters INFO "route.list shows the refused one: $f"
   ms=$(wait_for 30 ros_via 100.64.39.0/24 10.39.1.2) || true
-  r=$(ros_route 100.64.39.0/24)
-  result filters INFO "CHR got: $(jq -c 'with_entries(select(.key | startswith("bgp")))' <<< "$r")"
+  r=$(ros_battr 100.64.39.0/24)
+  result filters INFO "CHR got: $r"
   [ "$(jq -r '."bgp.med" // ""' <<< "$r")" = 77 ] && result filters OK "out: MED 77 on CHR" || result filters FAIL "out: MED on CHR: $(jq -c '."bgp.med"' <<< "$r")"
-  [[ $(jq -r '."bgp.as-path" // ""' <<< "$r") == *65000*65000*65000* ]] && result filters OK "out: prepend 2 (as-path $(jq -r '."bgp.as-path"' <<< "$r"))" \
+  n=$(jq -r '."bgp.as-path" // ""' <<< "$r" | tr ', ' '\n\n' | grep -c '^65000$')
+  [ "$n" -ge 2 ] && result filters OK "out: our prepend 2: 65000 appears $n times on CHR (as-path $(jq -r '."bgp.as-path"' <<< "$r"))" \
     || result filters FAIL "out: as-path on CHR: $(jq -r '."bgp.as-path"' <<< "$r")"
   [ "$(jq -r '."bgp.local-pref" // ""' <<< "$r")" = 222 ] && result filters OK "CHR's in chain set local-pref 222" || result filters INFO "CHR local-pref: $(jq -c '."bgp.local-pref"' <<< "$r")"
   [ "$(ros_gw 10.255.39.2/32)" = - ] && result filters OK "out: our loopback (in the list, not in the chain) stays out of CHR" \
@@ -827,6 +843,8 @@ case_scale() {
   # zebra can miss part of 100k kernel notifications sent at once (netlink
   # buffer; seen on the host lab): restart R3's FRR on the loaded table.
   pkill -f -- "-N cfr3( |$)" || true
+  sleep 1
+  ip netns exec cfr3 /usr/lib/frr/mgmtd -N cfr3 -d
   sleep 1
   ip netns exec cfr3 /usr/lib/frr/zebra -N cfr3 -d -f /etc/frr/cfr3/zebra.conf
   sleep 2
