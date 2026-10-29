@@ -752,6 +752,7 @@ fn static_name(name: &str) -> &'static str {
         "RSS balance",
         "Socket buffers",
         "Admin password",
+        "Root verity",
     ]
     .into_iter()
     .find(|n| *n == name)
