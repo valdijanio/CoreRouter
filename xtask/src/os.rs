@@ -743,6 +743,23 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
         }
         std::fs::write(&kstamp, &kpatches).map_err(|e| format!("{}: {e}", kstamp.display()))?;
     }
+    // G3.4l: the same for `os/patches/frr/*.patch` (the ospfd TI-LFA fix):
+    // a changed patch needs `frr-dirclean`.
+    let (_, fpatches) = patches_in(&d.os.join("patches/frr"))?;
+    let fstamp = d.out.join(".corerouter-frr-patches.sha256");
+    if std::fs::read_to_string(&fstamp).ok().as_deref() != Some(fpatches.as_str()) {
+        let built = std::fs::read_dir(d.out.join("build")).is_ok_and(|rd| {
+            rd.flatten().any(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("frr-"))
+            })
+        });
+        if built {
+            make(&["frr-dirclean"], None)?;
+        }
+        std::fs::write(&fstamp, &fpatches).map_err(|e| format!("{}: {e}", fstamp.display()))?;
+    }
     // Buildroot reads the kernel fragment only when it configures the
     // kernel: a changed fragment needs `linux-reconfigure` (the kernel's
     // own make is incremental underneath).

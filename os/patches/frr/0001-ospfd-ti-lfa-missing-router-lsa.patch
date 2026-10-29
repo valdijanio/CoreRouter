@@ -1,0 +1,35 @@
+From: CoreRouter <noreply@corerouter>
+Subject: [PATCH] ospfd: don't assert on a missing router-LSA in the TI-LFA
+ reverse SPF
+
+G3.4l (docs/frr-tilfa-abort.md). With "fast-reroute ti-lfa", the Q spaces
+are reverse SPF trees. ospf_spf_next() reads the reverse distance of a
+point-to-point link from W's router-LSA before it checks that the LSA is
+in the LSDB (RFC 2328 16.1 (2b), a few lines below), so a router-LSA of V
+that names a neighbor W whose own router-LSA is not there (not received
+yet while adjacencies come up, or already flushed) hits
+assert(w_lsa && w_lsa->data) in get_reverse_distance() and ospfd aborts.
+The forward SPF just skips W in that case; the reverse one now does the
+same. Reproduced in FRR 10.7.1 and master (tests/ospfd topo6, and in the
+lab VM); the backup paths of the other prefixes do not change. To be
+dropped once upstream FRR carries the fix.
+
+---
+--- a/ospfd/ospf_spf.c
++++ b/ospfd/ospf_spf.c
+@@ -1405,9 +1405,14 @@ static void ospf_spf_next(struct vertex *v, struct ospf_area *area,
+ 			/*
+ 			 * For TI-LFA we might need the reverse SPF.
+ 			 * Currently only works with P2P!
++			 *
++			 * W's router-LSA may not be in the LSDB (not received
++			 * yet, or already flushed) while V still advertises
++			 * the link: then there is no reverse distance to read,
++			 * and the check below skips W, as the forward SPF does.
+ 			 */
+ 			if (type == LSA_LINK_TYPE_POINTOPOINT
+-			    && area->spf_reversed)
++			    && area->spf_reversed && w_lsa)
+ 				link_distance =
+ 					get_reverse_distance(v, l, w_lsa);
+ 			else
