@@ -89,7 +89,10 @@ netlink-sys, já no `Cargo.lock`):
    tempo desde o início do kernel) e, 10 s depois, a memória em uso (`idle:`);
 8. desliga limpo pelos sinais que o busybox `reboot`/`poweroff`/`halt` mandam ao PID 1
    (SIGTERM/SIGUSR2/SIGUSR1) e por Ctrl-Alt-Del (SIGINT): SIGTERM ao daemon, 10 s para salvar,
-   SIGKILL, `sync`, desmonta `/config` (ou remonta só de leitura), `reboot(2)`.
+   SIGKILL, `sync`, desmonta `/config` (ou remonta só de leitura), `reboot(2)`;
+   o botão de energia ACPI (o "Shutdown" do hipervisor, `virsh shutdown`, o botão do servidor)
+   chega como SIGUSR2 pelo `CONFIG_ACPI_TINY_POWER_BUTTON` do kernel e desliga do mesmo jeito
+   (G1.6q).
 
 **Sem shell por padrão.** `corerouter.shell=ttyS0` na linha de comando abre um `sh` do busybox
 naquela console (aberto de novo 1 s depois de sair: `exit`, Ctrl-D), para laboratório e

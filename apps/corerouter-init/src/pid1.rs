@@ -111,55 +111,8 @@ pub fn main() {
             log!("signal {sig}: {e}");
         }
     }
-    watch_power_button(&action);
     log!("early boot done in {} ms", started.elapsed().as_millis());
     supervise(&opts, &action, started, trial, frr, names);
-}
-
-/// The ACPI power button powers off cleanly, like SIGUSR2 (G1.6q): one
-/// thread per button device, blocked in `read`, that only sets the flag
-/// the main loop acts on.
-fn watch_power_button(action: &Arc<AtomicUsize>) {
-    let Ok(dir) = fs::read_dir("/sys/class/input") else {
-        return;
-    };
-    let mut found = 0;
-    for e in dir.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if !name.starts_with("event") {
-            continue;
-        }
-        let dev = fs::read_to_string(e.path().join("device/name")).unwrap_or_default();
-        if !plan::is_power_button(&dev) {
-            continue;
-        }
-        let mut file = match File::open(format!("/dev/input/{name}")) {
-            Ok(f) => f,
-            Err(e) => {
-                log!("power button /dev/input/{name}: {e}");
-                continue;
-            }
-        };
-        let action = Arc::clone(action);
-        let spawned = std::thread::Builder::new()
-            .name("power-button".into())
-            .spawn(move || {
-                let mut ev = [0u8; plan::INPUT_EVENT_LEN];
-                while file.read_exact(&mut ev).is_ok() {
-                    if plan::power_key_pressed(&ev) {
-                        log("power button pressed: powering off");
-                        action.store(POWEROFF, Ordering::SeqCst);
-                    }
-                }
-            });
-        match spawned {
-            Ok(_) => found += 1,
-            Err(e) => log!("power button: {e}"),
-        }
-    }
-    if found == 0 {
-        log("no ACPI power button: a hypervisor's Shutdown does nothing (use the router's commands)");
-    }
 }
 
 /// FRR's daemons, when the image has them (G1.6c): their state directory
