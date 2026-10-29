@@ -271,9 +271,9 @@ fn arrows_walk_the_tree_from_the_search_field() {
     let none = egui::Modifiers::NONE;
     h.key(egui::Key::ArrowDown, none);
     assert_eq!(h.app.menu.cursor, Some(Nav::Group("Interfaces")));
-    // PPP (one window: a leaf) sits between them, as in RouterOS.
+    // PPP (PPPoE Server and Client since G3.9ga: a group) sits between them.
     h.key(egui::Key::ArrowDown, none);
-    assert_eq!(h.app.menu.cursor, Some(Nav::Item(Win::Panel("ppp"))));
+    assert_eq!(h.app.menu.cursor, Some(Nav::Group("PPP")));
     h.key(egui::Key::ArrowDown, none);
     assert_eq!(h.app.menu.cursor, Some(Nav::Group("IP")));
     h.key(egui::Key::ArrowRight, none);
