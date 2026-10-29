@@ -1,6 +1,7 @@
 //! `cargo xtask <task>` — checks as code. Agents run `cargo xtask ci` before
 //! every commit; it stops at the first FAIL and prints an ok/FAIL/skip summary.
 
+mod affected;
 mod bench;
 mod bng_lab;
 mod changes;
@@ -9,13 +10,16 @@ mod layers;
 mod os;
 mod oui;
 mod package;
+mod slots;
 mod vm_lab;
 mod vm_tools;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::sync::OnceLock;
+use std::time::Duration;
 
-const USAGE: &str = "usage: cargo xtask <ci [--fast] [--only <step>,...]|fmt|clippy|test|bench-check|netns|xdp-root|docs|ebpf-check|layers|agents-sync|wasm|bench|bng-lab|ebpf|docs fold|vm-lab|os|package gui [--help]>";
+const USAGE: &str = "usage: cargo xtask <ci [--affected [--base <ref>]] [--fast] [--only <step>,...] [--no-wait]|fmt|clippy|test|bench-check|netns|xdp-root|docs|ebpf-check|layers|agents-sync|wasm|bench|bng-lab|ebpf|docs fold|vm-lab|os|package gui [--help]>";
 
 /// Crates that must keep compiling for the browser.
 const WASM_PACKAGES: &[&str] = &[
@@ -62,8 +66,53 @@ const CI: &[Step] = &[
 /// Left out of `cargo xtask ci --fast`.
 const SLOW: &[&str] = &["bench-check", "netns", "xdp-root"];
 
+/// G0.29: steps that compile; a run with one of them takes a machine slot
+/// (`slots`).
+const HEAVY: &[&str] = &[
+    "clippy",
+    "test",
+    "bench-check",
+    "netns",
+    "xdp-root",
+    "ebpf-check",
+    "wasm",
+];
+
+/// G0.29: the packages `cargo xtask ci --affected` limits the cargo steps
+/// to; unset, the whole workspace.
+static SCOPE: OnceLock<Vec<affected::Package>> = OnceLock::new();
+
+/// `--workspace`, or `-p` for each package of the `--affected` scope that
+/// `keep` accepts. `None` when the scope has none of them (skip the step).
+fn package_args(keep: impl Fn(&affected::Package) -> bool) -> Option<Vec<String>> {
+    let Some(scope) = SCOPE.get() else {
+        return Some(vec!["--workspace".into()]);
+    };
+    let args: Vec<String> = scope
+        .iter()
+        .filter(|p| keep(p))
+        .flat_map(|p| ["-p".to_owned(), p.name.clone()])
+        .collect();
+    (!args.is_empty()).then_some(args)
+}
+
+/// Did the diff change `package` itself (always true without a scope)?
+fn changed_in_scope(package: &str) -> bool {
+    SCOPE
+        .get()
+        .is_none_or(|s| s.iter().any(|p| p.name == package && p.changed))
+}
+
+/// Is `package` in the `--affected` scope (always, without one)?
+fn in_scope(package: &str) -> bool {
+    SCOPE
+        .get()
+        .is_none_or(|s| s.iter().any(|p| p.name == package))
+}
+
 fn main() -> ExitCode {
     let root = workspace_root();
+    let mut held_slot: Option<slots::Slot> = None;
     let task = std::env::args().nth(1).unwrap_or_default();
     let steps: Vec<&Step> = match task.as_str() {
         // `--fast`: the PR gate (deterministic, ~2 min in CI). The steps
@@ -73,13 +122,58 @@ fn main() -> ExitCode {
         // the full gate as parallel jobs, one group of steps each).
         "ci" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
-            match ci_steps(&rest) {
-                Ok(steps) => steps,
+            let args = match ci_args(&rest) {
+                Ok(a) => a,
                 Err(why) => {
-                    eprintln!("{why}\nusage: cargo xtask ci [--fast] [--only <step>[,<step>...]]");
+                    eprintln!(
+                        "{why}\nusage: cargo xtask ci [--affected [--base <ref>]] [--fast] \
+                         [--only <step>[,<step>...]] [--no-wait]"
+                    );
                     return ExitCode::from(2);
                 }
+            };
+            let steps = if args.affected {
+                match affected_steps(&root, &args.base, args.steps) {
+                    Ok(s) => s,
+                    Err(why) => {
+                        eprintln!("FAIL --affected: {why}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                args.steps
+            };
+            // G0.29: a machine slot for runs that compile (not in GitHub
+            // Actions: one job per runner). Held until `main` returns.
+            let heavy = steps.iter().any(|(n, _)| HEAVY.contains(n));
+            if heavy && std::env::var_os("GITHUB_ACTIONS").is_none() {
+                match slots::acquire(
+                    &slots::dir(),
+                    slots::count(),
+                    args.wait,
+                    Duration::from_secs(5),
+                ) {
+                    Ok(slot) => held_slot = slot,
+                    Err(e) => eprintln!("warning: no CI slot: {e}"),
+                }
+                let target = std::env::var_os("CARGO_TARGET_DIR")
+                    .map_or_else(|| root.clone(), PathBuf::from);
+                let probe = if target.exists() {
+                    target
+                } else {
+                    root.clone()
+                };
+                if let Err(e) = slots::wait_for_disk(
+                    &probe,
+                    slots::min_free_gb(),
+                    args.wait,
+                    Duration::from_secs(20 * 60),
+                ) {
+                    eprintln!("FAIL disk: {e}");
+                    return ExitCode::FAILURE;
+                }
             }
+            steps
         }
         "ebpf" => {
             return match ebpf::refresh(&root) {
@@ -207,10 +301,107 @@ fn main() -> ExitCode {
             Outcome::Skip(why) => eprintln!("  skip  {name}: {why}"),
         }
     }
+    drop(held_slot);
     if failed {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// What `cargo xtask ci <args>` was asked.
+struct CiArgs {
+    steps: Vec<&'static Step>,
+    affected: bool,
+    base: String,
+    /// `false` with `--no-wait`: no waiting for a slot or for disk.
+    wait: bool,
+}
+
+fn ci_args(args: &[String]) -> Result<CiArgs, String> {
+    let mut rest = Vec::new();
+    let mut out = CiArgs {
+        steps: Vec::new(),
+        affected: false,
+        base: "origin/main".into(),
+        wait: true,
+    };
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--affected" => out.affected = true,
+            "--no-wait" => out.wait = false,
+            "--base" => {
+                out.base = it.next().ok_or("--base needs a git ref")?.clone();
+                out.affected = true;
+            }
+            other => rest.push(other.to_owned()),
+        }
+    }
+    out.steps = ci_steps(&rest)?;
+    Ok(out)
+}
+
+/// `--affected`: of `steps`, those the diff since `base` needs, with the
+/// cargo steps limited to the affected packages (`SCOPE`).
+fn affected_steps(
+    root: &Path,
+    base: &str,
+    steps: Vec<&'static Step>,
+) -> Result<Vec<&'static Step>, String> {
+    let files = affected::changed_files(root, base)?;
+    let out = cargo()
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("cargo metadata: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+    }
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| format!("cargo metadata: {e}"))?;
+    let packages = affected::parse_metadata(&json, root);
+    match affected::plan(&files, &packages) {
+        affected::Plan::Full(why) => {
+            eprintln!("--affected: everything ({why})");
+            Ok(steps)
+        }
+        affected::Plan::Partial(sel) => {
+            let changed: Vec<&str> = sel.changed.iter().map(String::as_str).collect();
+            eprintln!(
+                "--affected: {} file(s) since {base}; changed: {}; with dependents: {} package(s)",
+                files.len(),
+                if changed.is_empty() {
+                    "no package".into()
+                } else {
+                    changed.join(", ")
+                },
+                sel.packages.len()
+            );
+            let scope = packages
+                .into_iter()
+                .filter(|p| sel.packages.contains(&p.name))
+                .map(|mut p| {
+                    p.changed = sel.changed.contains(&p.name);
+                    p
+                })
+                .collect();
+            let _ = SCOPE.set(scope);
+            let kept: Vec<&'static Step> = steps
+                .into_iter()
+                .filter(|(n, _)| sel.steps.contains(n))
+                .collect();
+            let names: Vec<&str> = kept.iter().map(|(n, _)| *n).collect();
+            eprintln!(
+                "--affected: steps {}",
+                if names.is_empty() {
+                    "none".into()
+                } else {
+                    names.join(", ")
+                }
+            );
+            Ok(kept)
+        }
     }
 }
 
@@ -295,21 +486,28 @@ fn run(mut cmd: Command, root: &Path) -> Outcome {
 }
 
 fn fmt(root: &Path) -> Outcome {
+    let Some(pkgs) = package_args(|_| true) else {
+        return Outcome::Skip("no package in scope".into());
+    };
     let mut c = cargo();
-    c.args(["fmt", "--all", "--", "--check"]);
+    c.arg("fmt");
+    if SCOPE.get().is_none() {
+        c.arg("--all");
+    } else {
+        c.args(pkgs);
+    }
+    c.args(["--", "--check"]);
     run(c, root)
 }
 
 fn clippy(root: &Path) -> Outcome {
+    let Some(pkgs) = package_args(|_| true) else {
+        return Outcome::Skip("no package in scope".into());
+    };
     let mut c = cargo();
-    c.args([
-        "clippy",
-        "--workspace",
-        "--all-targets",
-        "--",
-        "-D",
-        "warnings",
-    ]);
+    c.arg("clippy")
+        .args(pkgs)
+        .args(["--all-targets", "--", "-D", "warnings"]);
     run(c, root)
 }
 
@@ -328,19 +526,19 @@ fn test(root: &Path) -> Outcome {
         Err(e) => return Outcome::Fail(e),
     };
     let first = part.is_none_or(|(i, _)| i == 1);
+    let Some(pkgs) = package_args(|_| true) else {
+        return Outcome::Skip("no package in scope".into());
+    };
     if !nextest_available(root) {
         if !first {
             return Outcome::Skip("no cargo-nextest to split the tests: part 1 runs them".into());
         }
         let mut c = cargo();
-        c.args(["test", "--workspace", "--quiet"]);
+        c.arg("test").args(&pkgs).arg("--quiet");
         return run(c, root);
     }
     let mut c = cargo();
-    c.args([
-        "nextest",
-        "run",
-        "--workspace",
+    c.args(["nextest", "run"]).args(&pkgs).args([
         "--cargo-quiet",
         "--status-level",
         "fail",
@@ -359,7 +557,7 @@ fn test(root: &Path) -> Outcome {
         // per crate), so it runs only when some doc comment has Rust code.
         Outcome::Ok if first && has_doctests(root) => {
             let mut d = cargo();
-            d.args(["test", "--workspace", "--doc", "--quiet"]);
+            d.arg("test").args(&pkgs).args(["--doc", "--quiet"]);
             run(d, root)
         }
         other => other,
@@ -502,10 +700,16 @@ fn netns_run(root: &Path) -> Outcome {
     if let Err(why) = netns_probe() {
         return Outcome::Skip(why);
     }
-    let tests = match netns_tests(root) {
-        Ok(t) => t,
+    let tests: Vec<NetnsTest> = match netns_tests(root) {
+        Ok(t) => t
+            .into_iter()
+            .filter(|t| changed_in_scope(&t.package))
+            .collect(),
         Err(e) => return Outcome::Fail(e),
     };
+    if tests.is_empty() {
+        return Outcome::Skip("no netns test in scope".into());
+    }
     let bins = match netns_build(root, &tests) {
         Ok(b) => b,
         Err(e) => return Outcome::Fail(e),
@@ -753,9 +957,13 @@ fn wasm(root: &Path) -> Outcome {
             "target not installed: rustup target add {WASM_TARGET}"
         ));
     }
+    let pkgs: Vec<&&str> = WASM_PACKAGES.iter().filter(|p| in_scope(p)).collect();
+    if pkgs.is_empty() {
+        return Outcome::Skip("no wasm package in scope".into());
+    }
     let mut c = cargo();
     c.args(["check", "--target", WASM_TARGET]);
-    for p in WASM_PACKAGES {
+    for p in pkgs {
         c.args(["-p", p]);
     }
     run(c, root)

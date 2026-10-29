@@ -206,13 +206,26 @@ MCP: `claude mcp add corerouter -- corerouter-cli mcp` (detalhes em `docs/mcp.md
 
 ## Verificação
 
-- Antes de cada commit: `cargo xtask ci` (fmt, clippy -D warnings, test, bench-check, netns,
-  docs, layers, agents-sync, wasm). Ele para no primeiro FAIL; não faça commit com FAIL. O passo
+- Antes de cada commit: `cargo xtask ci --affected` (G0.29), o portão local só do afetado: os
+  arquivos mudados desde a `origin/main` (commit, índice, árvore e não rastreados) dão os crates
+  alterados e os que dependem deles; fmt, clippy e test rodam só nesses, `bench-check` e `netns`
+  só nos crates alterados que os têm, e `wasm`, `layers`, `docs`, `agents-sync` e `ebpf-check`
+  só quando o diff toca o que eles conferem. Arquivo de workspace (`Cargo.toml`/`Cargo.lock`
+  da raiz, `xtask/`, `.cargo/`, `.config/`, `build-support/`, `clippy.toml`, toolchain) roda
+  tudo. O `cargo xtask ci`
+  completo (fmt, clippy -D warnings, test, bench-check, netns, docs, layers, agents-sync, wasm)
+  é opcional localmente, para mudança de risco amplo; ele roda no lote da fila e na `main`.
+  Os dois param no primeiro FAIL; não faça commit com FAIL. O passo
   `test` usa o `cargo nextest` quando instalado (`cargo install --locked cargo-nextest`; metade do
   tempo, **medido**). Teste que falha e passa ao repetir sai como FLAKY/"flaky netns test" e não
   reprova: corrija-o depois (teste instável trava a fila; foram quatro em 2026-10-22).
+- **No máximo 2 CIs pesados na máquina** (G0.29): o `cargo xtask ci` que compila pega uma de 2
+  vagas (`flock` em `$XDG_RUNTIME_DIR/corerouter-ci/`, solta quando o processo morre) e espera
+  com "esperando vaga (N rodando: …)"; também espera enquanto o disco do target tiver menos de
+  30 GB livres (`COREROUTER_CI_MIN_FREE_GB`). `--no-wait` só avisa; `COREROUTER_CI_SLOTS` muda
+  o número de vagas.
 - **Portão em duas camadas:** `cargo xtask ci --fast` (sem `netns` e `bench-check`) é o do PR;
-  o completo roda localmente, no lote da fila de entrada e na `main`. No GitHub os passos
+  o completo roda no lote da fila de entrada e na `main`. No GitHub os passos
   rodam em jobs paralelos (`lint`, `test`, `bench-check`, `netns`, `xdp-root`, cada um com
   `cargo xtask ci --only <passos>`), e o check exigido `xtask ci (linux)` confere todos. Para
   repetir só um passo localmente: `cargo xtask ci --only netns` (ou `cargo xtask netns`).
@@ -236,15 +249,15 @@ de features; daí a fila integra sozinha (ele pode pedir para ser consultado ant
 Sessões de feature não fazem merge nem ligam auto-merge.
 
 1. Trabalhe numa branch `stream/<id>-<slug>`, nunca na `main`. Nunca faça commit nem push na `main`.
-2. Antes de cada commit: `cargo xtask ci`.
+2. Antes de cada commit: `cargo xtask ci --affected`.
 3. Ao terminar: `git fetch origin && git merge origin/main` (merge, nunca rebase/force-push numa
-   branch com PR), `cargo xtask ci` de novo, `git push -u origin <branch>` e
+   branch com PR), `cargo xtask ci --affected` de novo, `git push -u origin <branch>` e
    `gh pr create --base main --title "<id>: <resumo>"`. O corpo do PR diz o que mudou, como
    testar (comandos ou cliques), o id da gap e, em feature nova, a seção `## Pesquisa` (veja
    "Pesquisa antes de implementar").
 4. Abra o PR com o rótulo **`fila`** (`gh pr create … --label fila`): é ele que a fila contínua
-   (`scripts/land.sh --watch`) procura. Com o PR aberto, **pare** e diga no relato "pronto para a fila: #<n>" (o `cargo xtask ci`
-   local completo já passou; não espere o CI do GitHub). Não ligue `gh pr merge --auto` nem
+   (`scripts/land.sh --watch`) procura. Com o PR aberto, **pare** e diga no relato "pronto para a fila: #<n>" (o `cargo xtask ci --affected`
+   local já passou; não espere o CI do GitHub). Não ligue `gh pr merge --auto` nem
    faça merge. O CI do PR roda o portão rápido (`cargo xtask ci --fast`); se ele ou a fila
    acusarem erro, a sessão principal avisa e você corrige na mesma branch.
 
@@ -272,7 +285,7 @@ runs do Actions, não dos check-runs (o GitHub já deixou um check-run preso em 
 A fila para no primeiro problema e diz qual PR e por quê:
 
 - **conflito real com a `main`**: a sessão dona resolve na branch (`git merge origin/main`,
-  `cargo xtask ci`, push) e o PR volta para a próxima rodada;
+  `cargo xtask ci --affected`, push) e o PR volta para a próxima rodada;
 - **CI vermelho depois do merge da `main`**: idem; a quebra é de integração, quem conhece o código
   corrige;
 - **`docs/changes` inválido**: corrija o arquivo (`cargo xtask docs` diz o que está errado).
@@ -320,7 +333,9 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
 ## Agentes em paralelo
 
 - `CARGO_TARGET_DIR=target-<seu-id>` próprio (o diretório `target-*` está no `.gitignore`);
-  apague-o ao terminar (~7 GB depois de uma `cargo xtask ci`, **medido**).
+  apague-o ao terminar (até ~27 GB depois de uma `cargo xtask ci` completa, **medido** em
+  2026-10-29). O `sccache` não ajuda aqui: a chave dele muda com a pasta da worktree e com o
+  target, e nada de Rust se reaproveita entre sessões (G0.29b, **medido**).
 - Edite só os crates da sua tarefa (a coluna "crates" de `docs/gaps.md`). Precisa mexer em
   `crates/model` ou `crates/engine/src/session.rs`? São compartilhados: mudanças pequenas,
   aditivas, e avise no PR.
