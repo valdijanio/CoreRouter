@@ -151,8 +151,11 @@ corerouter-cli run routing.bgp.connection.add '{"name":"client1","remote_address
   - IPv6 numa sessão IPv4 (`afi=ip,ipv6`): o CHR manda o next hop `::ffff:10.39.1.1`
     (IPv4-mapeado). A RFC 2545 §3 pede um endereço IPv6 global; nenhum kernel instala o mapeado,
     e o próprio RouterOS o trata como inalcançável. Errado o RouterOS. O CoreRouter manda global +
-    link-local e o CHR instala. A prévia da conexão avisa (`mpbgp-nexthop`); use uma segunda
-    conexão ao endereço IPv6 com `afi=ipv6`.
+    link-local e o CHR instala. Desde a G3.9fh a chain de entrada reescreve o next hop com o
+    IPv6 do CHR no enlace, `if (afi ipv6) { set gw fd39:1::1 } accept` (FRR `set ipv6 next-hop
+    global`), e as rotas entram no kernel; a prévia da conexão avisa (`mpbgp-nexthop`) e diz o
+    que escrever. A outra saída continua valendo: uma segunda conexão ao endereço IPv6 com
+    `afi=ipv6`.
   - Refletor: o CHR põe o próprio Router ID no ORIGINATOR_ID; a RFC 4456 §8 pede o do originador
     do anúncio no AS. Errado o RouterOS; o CLUSTER_LIST e o next hop estão certos.
   - `set bgp-path-prepend N`: no eBGP o CHR sai com o próprio AS N vezes no total (N = 1, 2, 3 →
