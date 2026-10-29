@@ -299,7 +299,7 @@ mod tests {
     fn explain_and_as_client_go_to_the_router_chain() {
         let fake = Arc::new(Explained::default());
         let mut s = Session::virtual_lab();
-        s.set_runner(test_runner::threads());
+        s.set_runner(test_runner::sim());
         s.set_dns_backend(fake.clone());
         let r = s
             .execute("tool.dns.query", &json!({"name": "nas.lan", "explain": true, "as_client": "192.168.88.10"}))
@@ -344,7 +344,7 @@ mod tests {
 
     fn lab(fake: &Arc<Fake>) -> Session {
         let mut s = Session::virtual_lab();
-        s.set_runner(test_runner::threads());
+        s.set_runner(test_runner::sim());
         s.set_dns_backend(fake.clone());
         s
     }
@@ -352,7 +352,7 @@ mod tests {
     #[test]
     fn one_query_through_the_router() {
         let mut s = Session::virtual_lab();
-        s.set_runner(test_runner::threads());
+        s.set_runner(test_runner::sim());
         // No daemon resolver: disabled, with why.
         let err = s.execute("tool.dns.query", &json!({"name": "www.example"})).unwrap_err();
         assert!(matches!(err, EngineError::Disabled { .. }), "{err}");
@@ -518,7 +518,7 @@ mod tests {
     #[test]
     fn trace_walks_from_the_root_down() {
         let mut s = Session::virtual_lab();
-        s.set_runner(test_runner::threads());
+        s.set_runner(test_runner::sim());
         s.set_dns_backend(Arc::new(Tree));
         let r = s.execute("tool.dns.query", &json!({"name": "www.example.com", "trace": true})).unwrap();
         assert_eq!(r["mode"], "trace");

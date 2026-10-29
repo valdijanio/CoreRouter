@@ -174,7 +174,7 @@ mod tests {
         // No runner: disabled with the reason.
         let err = s.execute("ip.dns.resolve", &json!({"name": "www.example"})).unwrap_err();
         assert!(matches!(err, EngineError::Disabled { .. }), "{err}");
-        s.set_runner(test_runner::threads());
+        s.set_runner(test_runner::sim());
         let fake = Arc::new(Fake::default());
         s.set_dns_backend(fake.clone());
         let r = s.execute("ip.dns.resolve", &json!({"name": "www.example"})).unwrap();
@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn bad_requests_are_refused() {
         let mut s = Session::virtual_lab();
-        s.set_runner(test_runner::threads());
+        s.set_runner(test_runner::sim());
         for p in [
             json!({}),
             json!({"name": "bad name!"}),
@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn the_lab_resolves_its_own_names() {
         let mut s = Session::virtual_lab();
-        s.set_runner(test_runner::threads());
+        s.set_runner(test_runner::sim());
         let r = s.execute("ip.dns.resolve", &json!({"name": "localhost", "type": "A"})).unwrap();
         let done = until_done(&mut s, r["id"].as_u64().unwrap());
         assert_eq!(done["events"][0]["source"], "simulated", "{done}");

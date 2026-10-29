@@ -450,7 +450,7 @@ mod tests {
 
     fn lab() -> Session {
         let mut s = Session::virtual_lab();
-        s.set_runner(test_runner::threads());
+        s.set_runner(test_runner::sim());
         s
     }
 
@@ -626,7 +626,9 @@ mod tests {
 
     #[test]
     fn stop_a_continuous_ping() {
-        let mut s = lab();
+        // The wall clock: the job must still be running when the stop comes.
+        let mut s = Session::virtual_lab();
+        s.set_runner(test_runner::threads());
         let r = s
             .execute(
                 "tool.ping.start",

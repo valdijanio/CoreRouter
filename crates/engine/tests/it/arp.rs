@@ -11,7 +11,8 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use corerouter_engine::{Caller, Clock, Job, Link, Principal, Runner, Session};
+use corerouter_engine::tasks::SimClock;
+use corerouter_engine::{Caller, Job, Link, Principal, Runner, Session};
 use serde_json::{Value, json};
 
 fn run(s: &mut Session, id: &str, p: Value) -> Value {
@@ -361,20 +362,9 @@ fn risky_modes_ask_and_cutting_the_management_neighbor_is_refused() {
 }
 
 struct Threads;
-struct Wall(Instant);
-
-impl Clock for Wall {
-    fn elapsed(&self) -> Duration {
-        self.0.elapsed()
-    }
-    fn sleep(&self, d: Duration) {
-        thread::sleep(d);
-    }
-}
-
 impl Runner for Threads {
     fn spawn(&self, _name: &str, job: Job) -> Result<(), String> {
-        thread::spawn(move || job(&Wall(Instant::now())));
+        thread::spawn(move || job(&SimClock::default()));
         Ok(())
     }
 }

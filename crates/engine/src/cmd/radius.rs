@@ -977,6 +977,7 @@ mod tests {
         // No runner, no backend: disabled with the reason.
         let err = s.execute("radius.test", &json!({"user": "ana", "password": "segredo"})).unwrap_err();
         assert!(matches!(err, EngineError::Disabled { .. }), "{err}");
+        // The wall clock: the job waits for the backend's reply from another thread.
         s.set_runner(test_runner::threads());
         let err = s.execute("radius.test", &json!({"user": "ana", "password": "segredo"})).unwrap_err();
         assert!(err.to_string().contains("daemon"), "{err}");

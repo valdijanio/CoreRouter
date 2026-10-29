@@ -345,7 +345,7 @@ mod tests {
 
     fn lab() -> Session {
         let mut s = Session::virtual_lab();
-        s.set_runner(test_runner::threads());
+        s.set_runner(test_runner::sim());
         s
     }
 

@@ -5,29 +5,19 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use corerouter_engine::{Clock, Job, Runner};
+use corerouter_engine::tasks::SimClock;
+use corerouter_engine::{Job, Runner};
 
 use super::*;
 use crate::lsp_ping::LspPingPanel;
 
 struct Threads;
 
-struct Wall(Instant);
-
-impl Clock for Wall {
-    fn elapsed(&self) -> Duration {
-        self.0.elapsed()
-    }
-    fn sleep(&self, d: Duration) {
-        thread::sleep(d);
-    }
-}
-
 impl Runner for Threads {
     fn spawn(&self, name: &str, job: Job) -> Result<(), String> {
         thread::Builder::new()
             .name(name.into())
-            .spawn(move || job(&Wall(Instant::now())))
+            .spawn(move || job(&SimClock::default()))
             .map(|_| ())
             .map_err(|e| e.to_string())
     }

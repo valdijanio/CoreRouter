@@ -34,7 +34,12 @@ use corerouter_proto_dns::resolver::{
 };
 
 /// How often the thread looks at the config.
-const TICK: Duration = Duration::from_secs(1);
+/// G0.30: 50 ms in the unit tests, which follow the config through it.
+const TICK: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(1)
+};
 /// Largest reply read over UDP (RFC 6891 payloads go up to 65535).
 const MAX_REPLY: usize = 65_535;
 

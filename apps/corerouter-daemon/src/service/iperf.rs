@@ -976,15 +976,21 @@ mod tests {
     /// under `cargo xtask ci`, 2026-10-28).
     #[test]
     fn udp_with_several_streams_never_hits_a_closed_port() {
-        for _ in 0..5 {
-            let (port, srv) = server(Limits::default(), 1);
-            let mut r = req(port, Proto::Udp, Direction::Send, 1_000_000, 4);
-            r.params.time = 1;
-            let (out, _) = run(&r);
-            let up = out.unwrap().upload.unwrap();
-            assert!(up.received > 0, "{up:?}");
-            assert!(srv.join().unwrap()[0].is_ok());
-        }
+        // Five tests of 1 s at once, each with its own server (G0.30: one
+        // after the other they took 6 s).
+        thread::scope(|scope| {
+            for _ in 0..5 {
+                scope.spawn(|| {
+                    let (port, srv) = server(Limits::default(), 1);
+                    let mut r = req(port, Proto::Udp, Direction::Send, 1_000_000, 4);
+                    r.params.time = 1;
+                    let (out, _) = run(&r);
+                    let up = out.unwrap().upload.unwrap();
+                    assert!(up.received > 0, "{up:?}");
+                    assert!(srv.join().unwrap()[0].is_ok());
+                });
+            }
+        });
     }
 
     #[test]

@@ -19,6 +19,51 @@ impl TestTime {
     pub fn full_name(&self) -> String {
         format!("{} {}", self.binary, self.name)
     }
+
+    /// The package of the test binary (`corerouter-engine::it` →
+    /// `corerouter-engine`).
+    pub fn package(&self) -> &str {
+        self.binary.split("::").next().unwrap_or(&self.binary)
+    }
+
+    /// In the slow layer: a segment of its path starts with `slow_` (the
+    /// filter of `.config/nextest.toml`).
+    pub fn is_slow_layer(&self) -> bool {
+        self.name.split("::").any(|seg| seg.starts_with("slow_"))
+    }
+}
+
+/// A quick-layer test over this is reported: simulate its clock or name it
+/// `slow_` (CLAUDE.md, "Orçamento de testes").
+pub const WARN_SECS: f64 = 1.0;
+
+/// A quick-layer test over this fails the PR's test job (in GitHub
+/// Actions); locally it is a warning. `COREROUTER_TEST_CEILING_SECS`
+/// changes it.
+pub const CEILING_SECS: f64 = 5.0;
+
+/// The tests outside the slow layer over `secs` (and, when `packages` is
+/// given, of those packages), slowest first.
+pub fn over<'a>(
+    tests: &'a [TestTime],
+    secs: f64,
+    packages: Option<&[String]>,
+) -> Vec<&'a TestTime> {
+    let mut out: Vec<&TestTime> = tests
+        .iter()
+        .filter(|t| t.secs > secs && !t.is_slow_layer())
+        .filter(|t| packages.is_none_or(|p| p.iter().any(|n| n == t.package())))
+        .collect();
+    out.sort_by(|a, b| b.secs.total_cmp(&a.secs));
+    out
+}
+
+/// One line per test: `  1.23 s  <binary> <name>`.
+pub fn lines(tests: &[&TestTime]) -> String {
+    tests
+        .iter()
+        .map(|t| format!("  {:>7.2} s  {}\n", t.secs, t.full_name()))
+        .collect()
 }
 
 /// Where nextest writes the JUnit report of `profile`: its store is
@@ -99,9 +144,7 @@ pub fn report(tests: &[TestTime], top: usize) -> String {
             0.0
         },
     );
-    for t in sorted.iter().take(top) {
-        out.push_str(&format!("  {:>7.2} s  {}\n", t.secs, t.full_name()));
-    }
+    out.push_str(&lines(&sorted.into_iter().take(top).collect::<Vec<_>>()));
     out
 }
 
@@ -139,6 +182,41 @@ mod tests {
         assert_eq!(attr(tag, "name").as_deref(), Some("b"));
         assert_eq!(attr(tag, "classname").as_deref(), Some("a"));
         assert_eq!(attr(tag, "nam"), None);
+    }
+
+    #[test]
+    fn the_budget_spares_the_slow_layer_and_picks_packages() {
+        let t = |binary: &str, name: &str, secs| TestTime {
+            binary: binary.into(),
+            name: name.into(),
+            secs,
+        };
+        let tests = [
+            t("corerouter-engine::it", "a::slow_scale", 9.0),
+            t("corerouter-engine::it", "slow_mod::x", 9.0),
+            t("corerouter-engine::it", "a::a_slow_reader", 6.0),
+            t("corerouter-hal", "b::waits", 2.0),
+            t("corerouter-hal", "b::fast", 0.2),
+        ];
+        assert!(tests[0].is_slow_layer() && tests[1].is_slow_layer());
+        assert!(
+            !tests[2].is_slow_layer(),
+            "slow_ only at the start of a segment"
+        );
+        assert_eq!(tests[0].package(), "corerouter-engine");
+        assert_eq!(tests[3].package(), "corerouter-hal");
+        let names = |v: Vec<&TestTime>| v.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            names(over(&tests, CEILING_SECS, None)),
+            ["a::a_slow_reader"]
+        );
+        assert_eq!(
+            names(over(&tests, WARN_SECS, None)),
+            ["a::a_slow_reader", "b::waits"]
+        );
+        let hal = ["corerouter-hal".to_owned()];
+        assert_eq!(names(over(&tests, WARN_SECS, Some(&hal))), ["b::waits"]);
+        assert!(lines(&over(&tests, CEILING_SECS, None)).ends_with("a::a_slow_reader\n"));
     }
 
     #[test]
