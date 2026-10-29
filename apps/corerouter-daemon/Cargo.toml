@@ -101,5 +101,10 @@ harness = false
 name = "ipoe_bng"
 harness = false
 
+# G0.31c: the conntrack queries' time under the session lock.
+[[bench]]
+name = "netns_conntrack"
+harness = false
+
 [lints]
 workspace = true

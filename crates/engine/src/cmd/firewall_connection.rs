@@ -6,11 +6,20 @@
 //! The kernel's table is read whole (`Hal::connections`, ctnetlink) and
 //! filtered and paged here; a dump is reused for [`CACHE_SECS`] so a GUI
 //! scrolling a million connections reads them once, not per page.
+//!
+//! `list` and `top` read, filter and sum outside the session lock (G0.31c):
+//! under it they take only the cached dump's `Arc` (or, when it is old, a
+//! `Hal::conntrack_scanner`, its own netlink socket) and the CGNAT pools;
+//! the answer is built by [`Session::defer`]. A dump read there is
+//! published back for the next call, one read at a time ([`ConnCache`]).
+//! A backend without a scanner (the lab) is read under the lock, as before.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 
-use corerouter_hal::conntrack::{Conn, Stats, Via, status};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+use corerouter_hal::conntrack::{Conn, Scanner, Stats, Via, status};
 use ipnet::IpNet;
 use serde_json::{Value, json};
 
@@ -70,42 +79,130 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
 
 /// The last dump and when it was read (`Hal::monotonic_secs`).
 #[derive(Default)]
-pub struct ConnCache {
+pub(crate) struct Dump {
     at: Option<u64>,
-    conns: std::sync::Arc<Vec<Conn>>,
+    conns: Arc<Vec<Conn>>,
     stats: Stats,
+}
+
+impl Dump {
+    fn fresh(&self, now: Option<u64>) -> Option<(Arc<Vec<Conn>>, Stats)> {
+        let (Some(now), Some(at)) = (now, self.at) else { return None };
+        (now.saturating_sub(at) < CACHE_SECS).then(|| (self.conns.clone(), self.stats))
+    }
+}
+
+/// The last dump, shared with the answers built outside the lock.
+/// `dump` is held for a pointer copy only; `reading` is held through a
+/// read outside the lock, so two windows asking at once read the table
+/// once (the second finds the first's dump).
+#[derive(Default)]
+pub struct ConnCache {
+    dump: Arc<Mutex<Dump>>,
+    reading: Arc<Mutex<()>>,
+}
+
+fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl ConnCache {
     /// Read again next time (the fast path changed what Via says).
     pub(crate) fn forget(&mut self) {
-        self.at = None;
+        locked(&self.dump).at = None;
+    }
+}
+
+/// The connections as an answer outside the lock gets them.
+pub(crate) enum Source {
+    /// The cached dump, or one read under the lock (no scanner).
+    Ready(Arc<Vec<Conn>>, Stats),
+    /// Read outside the lock, then published to the cache.
+    Scan {
+        scanner: Box<dyn Scanner>,
+        now: Option<u64>,
+        dump: Arc<Mutex<Dump>>,
+        reading: Arc<Mutex<()>>,
+    },
+}
+
+impl Source {
+    /// The connections: no session needed, so it runs after the lock.
+    pub(crate) fn read(self) -> Result<(Arc<Vec<Conn>>, Stats)> {
+        let (mut scanner, now, dump, reading) = match self {
+            Source::Ready(conns, stats) => return Ok((conns, stats)),
+            Source::Scan {
+                scanner,
+                now,
+                dump,
+                reading,
+            } => (scanner, now, dump, reading),
+        };
+        let _one = locked(&reading);
+        if let Some(got) = locked(&dump).fresh(now) {
+            return Ok(got);
+        }
+        let mut conns = Vec::new();
+        let stats = scanner
+            .scan(&mut |c| conns.push(c.clone()))
+            .map_err(|e| EngineError::Hal(e.to_string()))?;
+        let conns = Arc::new(conns);
+        let mut d = locked(&dump);
+        d.at = now;
+        d.conns = conns.clone();
+        d.stats = stats;
+        Ok((conns, stats))
     }
 }
 
 impl Session {
     /// The kernel's connections, read at most every [`CACHE_SECS`].
     /// `fresh`: read now (after a kill).
-    pub(crate) fn connections(&mut self, fresh: bool) -> Result<(std::sync::Arc<Vec<Conn>>, Stats)> {
+    pub(crate) fn connections(&mut self, fresh: bool) -> Result<(Arc<Vec<Conn>>, Stats)> {
         let now = self.hal().monotonic_secs();
-        if !fresh
-            && let (Some(now), Some(c)) = (now, self.ext::<ConnCache>())
-            && c.at.is_some_and(|at| now.saturating_sub(at) < CACHE_SECS)
-        {
-            return Ok((c.conns.clone(), c.stats));
+        if !fresh && let Some(got) = self.ext::<ConnCache>().and_then(|c| locked(&c.dump).fresh(now)) {
+            return Ok(got);
         }
         let conns = self
             .hal_mut()
             .connections()
             .map_err(|e| EngineError::Hal(e.to_string()))?;
         let stats = self.hal_mut().connection_stats().unwrap_or_default();
-        let conns = std::sync::Arc::new(conns);
+        let conns = Arc::new(conns);
         if let Some(c) = self.ext_mut::<ConnCache>() {
-            c.at = now;
-            c.conns = conns.clone();
-            c.stats = stats;
+            let mut d = locked(&c.dump);
+            d.at = now;
+            d.conns = conns.clone();
+            d.stats = stats;
         }
         Ok((conns, stats))
+    }
+
+    /// What the connections can be read from after the lock: the cached
+    /// dump, a scanner of the kernel's table, or (a backend without one)
+    /// the table read now.
+    pub(crate) fn connection_source(&mut self) -> Result<Source> {
+        let now = self.hal().monotonic_secs();
+        let Some(c) = self.ext_mut::<ConnCache>() else {
+            let (conns, stats) = self.connections(false)?;
+            return Ok(Source::Ready(conns, stats));
+        };
+        if let Some((conns, stats)) = locked(&c.dump).fresh(now) {
+            return Ok(Source::Ready(conns, stats));
+        }
+        let (dump, reading) = (c.dump.clone(), c.reading.clone());
+        match self.hal().conntrack_scanner() {
+            Ok(scanner) => Ok(Source::Scan {
+                scanner,
+                now,
+                dump,
+                reading,
+            }),
+            Err(_) => {
+                let (conns, stats) = self.connections(false)?;
+                Ok(Source::Ready(conns, stats))
+            }
+        }
     }
 }
 
@@ -150,7 +247,7 @@ fn prefix(p: &Value, key: &str) -> Result<Option<IpNet>> {
 }
 
 /// A connection filter from the parameters (shared by list and kill).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Filter {
     protocol: Option<u8>,
     src: Option<IpNet>,
@@ -350,17 +447,20 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
     {
         return Err(EngineError::bad("sort", "timeout, bytes or packets"));
     }
-    let (conns, stats) = s.connections(false)?;
-    let mut hits: Vec<&Conn> = conns.iter().filter(|c| f.keeps(c)).collect();
-    match sort.as_deref() {
-        Some("timeout") => hits.sort_by_key(|c| std::cmp::Reverse(c.timeout)),
-        Some("bytes") => hits.sort_by_key(|c| std::cmp::Reverse(c.orig_bytes.saturating_add(c.reply_bytes))),
-        Some("packets") => hits.sort_by_key(|c| std::cmp::Reverse(c.orig_packets.saturating_add(c.reply_packets))),
-        _ => {}
-    }
+    let source = s.connection_source()?;
     let pools = pools(s);
-    let rows: Vec<Value> = hits.iter().skip(offset).take(count).map(|c| row(c, &pools)).collect();
-    Ok(json!({"total": hits.len(), "offset": offset, "rows": rows, "table": table_json(&stats)}))
+    s.defer(move || {
+        let (conns, stats) = source.read()?;
+        let mut hits: Vec<&Conn> = conns.iter().filter(|c| f.keeps(c)).collect();
+        match sort.as_deref() {
+            Some("timeout") => hits.sort_by_key(|c| std::cmp::Reverse(c.timeout)),
+            Some("bytes") => hits.sort_by_key(|c| std::cmp::Reverse(c.orig_bytes.saturating_add(c.reply_bytes))),
+            Some("packets") => hits.sort_by_key(|c| std::cmp::Reverse(c.orig_packets.saturating_add(c.reply_packets))),
+            _ => {}
+        }
+        let rows: Vec<Value> = hits.iter().skip(offset).take(count).map(|c| row(c, &pools)).collect();
+        Ok(json!({"total": hits.len(), "offset": offset, "rows": rows, "table": table_json(&stats)}))
+    })
 }
 
 fn top(s: &mut Session, p: &Value) -> Result<Value> {
@@ -375,7 +475,13 @@ fn top(s: &mut Session, p: &Value) -> Result<Value> {
         },
         ..Filter::default()
     };
-    let (conns, _) = s.connections(false)?;
+    let source = s.connection_source()?;
+    let cgnat = s.store().running().ip.cgnat.clone();
+    s.defer(move || top_rows(source, &f, count, &cgnat))
+}
+
+fn top_rows(source: Source, f: &Filter, count: usize, cgnat: &corerouter_model::cgnat::Cgnat) -> Result<Value> {
+    let (conns, _) = source.read()?;
     #[derive(Default)]
     struct Tally {
         n: u64,
@@ -401,7 +507,6 @@ fn top(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let mut ranked: Vec<(IpAddr, Tally)> = by.into_iter().collect();
     ranked.sort_by(|a, b| b.1.n.cmp(&a.1.n).then(a.0.cmp(&b.0)));
-    let cgnat = s.store().running().ip.cgnat.clone();
     let rows: Vec<Value> = ranked
         .into_iter()
         .take(count)
@@ -446,7 +551,7 @@ fn kill(s: &mut Session, p: &Value) -> Result<Value> {
         .map_err(|e| EngineError::Hal(e.to_string()))?;
     // The next list reads the table again.
     if let Some(c) = s.ext_mut::<ConnCache>() {
-        c.at = None;
+        c.forget();
     }
     Ok(json!({"matched": victims.len(), "killed": killed}))
 }
@@ -498,4 +603,87 @@ fn tracking_set(s: &mut Session, p: &Value) -> Result<Value> {
         changed.push(json!({"name": key, "value": value}));
     }
     Ok(json!({"changed": changed}))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::{Caller, off_lock::Reply};
+
+    /// A kernel table of `n` connections that counts its reads.
+    struct Fake(Arc<AtomicUsize>, u32);
+
+    impl Scanner for Fake {
+        fn scan(&mut self, each: &mut dyn FnMut(&Conn)) -> std::result::Result<Stats, corerouter_hal::HalError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let t = corerouter_hal::conntrack::Tuple {
+                src: IpAddr::from([10, 0, 0, 1]),
+                dst: IpAddr::from([192, 0, 2, 1]),
+                src_port: 1000,
+                dst_port: 53,
+            };
+            for id in 0..self.1 {
+                each(&Conn {
+                    id,
+                    protocol: 17,
+                    orig: t,
+                    reply: t,
+                    status: 0,
+                    timeout: 30,
+                    tcp_state: None,
+                    mark: 0,
+                    orig_packets: 1,
+                    orig_bytes: 64,
+                    reply_packets: 0,
+                    reply_bytes: 0,
+                });
+            }
+            Ok(Stats {
+                count: u64::from(self.1),
+                ..Stats::default()
+            })
+        }
+    }
+
+    fn scan(cache: &ConnCache, reads: &Arc<AtomicUsize>, now: u64) -> Source {
+        Source::Scan {
+            scanner: Box::new(Fake(reads.clone(), 3)),
+            now: Some(now),
+            dump: cache.dump.clone(),
+            reading: cache.reading.clone(),
+        }
+    }
+
+    #[test]
+    fn a_scan_outside_the_lock_is_read_once_and_published() {
+        let cache = ConnCache::default();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (a, b) = std::thread::scope(|t| {
+            let one = t.spawn(|| scan(&cache, &reads, 100).read().map(|(c, _)| c.len()));
+            let two = t.spawn(|| scan(&cache, &reads, 100).read().map(|(c, _)| c.len()));
+            (one.join().unwrap().unwrap(), two.join().unwrap().unwrap())
+        });
+        assert_eq!((a, b), (3, 3));
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "two answers at once read the table once");
+        // Published: the next call within CACHE_SECS takes the pointer.
+        let got = locked(&cache.dump).fresh(Some(100 + CACHE_SECS - 1)).unwrap();
+        assert_eq!((got.0.len(), got.1.count), (3, 3));
+        assert!(locked(&cache.dump).fresh(Some(100 + CACHE_SECS)).is_none());
+        // Old: read again.
+        scan(&cache, &reads, 100 + CACHE_SECS).read().unwrap();
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn list_and_top_answer_after_the_lock() {
+        let mut s = Session::virtual_lab();
+        for id in ["ip.firewall.connection.list", "ip.firewall.connection.top"] {
+            let now = s.execute(id, &json!({})).unwrap();
+            let reply = s.execute_reply_as(&Caller::local(), id, &json!({})).unwrap();
+            assert!(matches!(reply, Reply::Later(_)), "{id}: {reply:?}");
+            assert_eq!(reply.finish().unwrap(), now, "{id}");
+        }
+    }
 }
