@@ -377,8 +377,26 @@ do LSP mostrava `*` no salto do CoreRouter. Agora o próprio respondedor do LSP 
 
 ### Desempenho e paralelismo
 
-- **Por pacote no caminho de dados:** nada novo. O filtro BPF dos taps já rodava em todo quadro
-  MPLS das interfaces MPLS (G3.5b) e só copia o expirado. Medido abaixo, com e sem os taps.
+- **Por pacote no caminho de dados:** o ICMP não acrescenta nada; o custo é o dos taps que o
+  respondedor já tinha (G3.5b, ligados por padrão), e este trabalho o mediu e o reduziu.
+  `benches/netns_mpls_ttl.rs` (veth → LSR → dummy, quadros de 64 bytes com rótulo, troca de
+  rótulo, um núcleo; VM do laboratório, build release, 2026-10-29, **medido**; os valores
+  absolutos variam muito entre rodadas na VM, compare só na mesma rodada):
+
+  | Caso (mesma rodada) | Mpps | contra sem taps |
+  |---|---|---|
+  | sem taps | 1,90 | — |
+  | um tap MPLS **preso à porta** (como era no G3.5b) | 1,47 | −23% |
+  | os três taps do respondedor **sem bind** (agora) | 1,53 | −19% |
+
+  Preso à porta, o socket fica na `ptype_specific`, que o kernel percorre depois da
+  `ptype_base`: o `mpls_rcv`/`ip_rcv` recebe o skb compartilhado e o clona (`skb_share_check`).
+  Sem bind, o tap fica na `ptype_base` à frente deles e solta o quadro antes (o filtro passou a
+  conferir que o device é Ethernet, `SKF_AD_HATYPE`; a interface vem do `sll_ifindex`). Isso
+  devolveu ~4 pontos; o resto (~125 ns por pacote nesta VM) é o próprio `packet_rcv` com o
+  filtro, inerente a qualquer tap `AF_PACKET`. Num enlace real com várias filas o custo se
+  divide pelos núcleos que recebem. Quem não precisa de LSP ping nem do ICMP recupera tudo com
+  `lsp-ping-responder=no icmp-ttl-exceeded=no`; um tap em XDP/tc (eBPF) é a gap G3.9db.
 - **Por erro** (release, criterion, esta máquina com outras sessões compilando, 2026-10-29,
   **medido**, `cargo bench -p corerouter-hal --bench mpls_icmp`): ler o quadro 74 ns; o erro
   pela tabela IP 0,59 µs, pelo LSP com 100 000 rótulos 0,82 µs, pilha de VPN 0,77 µs. A busca do
