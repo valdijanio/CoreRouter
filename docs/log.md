@@ -7217,3 +7217,52 @@ continuação indentadas).
   do primeiro virou `slow_the_shutdown_checkpoint_loses_no_journal_line_after_1100_commits` (a
   camada rápida fica com 3 e 40); o proptest passa a respeitar o `PROPTEST_CASES` (32 na camada
   rápida), com no máximo os 48 de antes no lote e no noturno.
+
+- 2026-10-29 — G3.9g: Interoperabilidade do BNG PPPoE com o RouterOS 7.25 CHR, parte 2: o resto dos casos do roteiro
+  `scripts/routeros-interop-pppoe.sh` e duas correções que tiram ~3 s da subida de cada sessão.
+
+  - **LCP sem a espera de 3 s.** Nosso Configure-Request saía junto com o PADS, ~70 ms antes de o
+    cliente RouterOS abrir o LCP; ele o descartava e cada sessão esperava o timer de reinício de
+    3 s (RFC 1661 §4.6) pela retransmissão: 3,1–3,2 s da habilitação ao Up no CHR (**medido**, caso
+    `timeline`). Agora o primeiro Configure-Request do assinante faz o nosso sair de novo na hora.
+    Teste `a_configure_request_lost_before_the_client_listens_is_resent_at_once` (o código antigo
+    sobe em 3100 ms na simulação).
+  - **Primeiro Challenge repetido em 300 ms.** O cliente RouterOS às vezes descarta o Challenge do
+    CHAP que chega microssegundos depois do Configure-Ack dele; a repetição só vinha em 3 s. Agora a
+    primeira repetição sai em 300 ms (as outras seguem em 3 s, RFC 1994 §4.1 deixa o timer ao
+    autenticador) com o mesmo valor, e uma Response ao Identifier anterior também vale. Teste
+    `a_lost_first_challenge_is_repeated_early` (CHAP, MS-CHAPv1 e v2; o timer antigo dá 3100 ms).
+    Contra o CHR (r5, **medido**): MS-CHAPv2 243 ms, MS-CHAPv1 223 ms, CHAP 439 ms, PAP 112 ms da
+    habilitação ao Up; antes, ~3,1 s em todos (r2).
+
+  Rodadas r3–r8 (2026-10-29, **medido**): IPv6CP + RA (endereço global no CHR 4,2 s depois do Up,
+  o tempo do SLAAC do RouterOS) e DHCPv6-PD (/56 preso 6 ms depois), tráfego IPv6 pelo BNG; limite
+  por MAC (`one_session_per_host` sim: no máximo uma sessão do MAC; não: as duas); 32 clientes do
+  CHR, um MAC cada (macvlan), todos Up em 1,55 s, 32 endereços distintos, e o BNG volta a 0 sessões
+  217 ms depois de o CHR desligar todos; FreeRADIUS: Framed-IP-Address, Mikrotik-Rate-Limit,
+  Accounting-Start com o Class (RFC 2865 §5.25), Interim-Update aos 60 s do Acct-Interim-Interval,
+  Session-Timeout 30 encerrando em 29,98 s com Acct-Terminate-Cause Session-Timeout, Access-Reject
+  sem sessão; CoA (RFC 5176): 498 kbit/s medidos de um fluxo de 2 Mbit/s com 512k, CoA-ACK e 256
+  kbit/s depois do CoA de 256k, Disconnect-ACK e o CHR vendo a queda em 118 ms, Disconnect-NAK para
+  sessão desconhecida; import de `/ppp export show-sensitive` do CHR: 4 secrets e o perfil
+  `imp-10m` (10M/20M) criados, `cpe1` existente pulado, caller-id mantido e a senha com espaço, `;`
+  e `"` entrando por CHAP. Sem divergência nesses casos. Correções do roteiro: o `/rest/execute` do
+  RouterOS volta antes de um script longo acabar (o `multi` habilitava só os 2 primeiros clientes);
+  os casos RADIUS/CoA desligam o `one_session_per_host` (todos discam do mesmo MAC do CHR e se
+  substituíam em ciclo, comportamento igual ao do RouterOS).
+
+  Escala sem a VM (namespace sem root no host, `netns_pppoe` com 20 mil CPEs simulados do
+  `proto-pppoe`, debug, Ryzen AI Max+ 395 com 32 CPUs, 2026-10-29, **medido**): 20 000 sessões
+  Opened em 9,64 s = 2075 sessões/s; reconexão em massa em 34,8 s com `new_session_rate=1000`;
+  ≈ 6,3 KB de RSS por sessão. CPU por thread (amostras de `/proc/<pid>/task` a cada segundo): os 8
+  workers do daemon (`auto` = CPUs − 2, no máximo 8) dividem a subida, 10–20% cada; o leitor
+  `svc-pppoe` fica em 9–22%; a thread saturada é a do próprio simulador de CPEs (≈ 75%, uma só).
+  O plano de controle preso num núcleo a 98% (2026-10-25) não se repete; o que ainda serializa é o
+  leitor único, que já é a G4.3ga. O teste contava os `replaced` do `ppp.history` (no máximo 10 000
+  linhas) contra `n`, e reprovava acima de 10 mil sessões; agora compara com `min(n, 10 000)`.
+
+  Como testar: `cargo xtask vm-lab run -- scripts/routeros-interop-pppoe.sh [casos]` (casos `auth
+  mtu ipcp-dns ipv6 keepalive padt service-name mac-limit multi radius coa import client timeline`).
+
+  Como testar: `cargo xtask vm-lab run -- scripts/routeros-interop-pppoe.sh [casos]`; os testes novos
+  rodam no `cargo test -p corerouter-proto-pppoe`.
