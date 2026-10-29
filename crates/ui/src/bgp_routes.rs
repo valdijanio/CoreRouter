@@ -178,7 +178,8 @@ fn route_row(i: usize, r: &Value) -> Row {
         String::new()
     };
     let rpki = s(r, "rpki");
-    let communities: Vec<String> = ["communities", "large_communities"]
+    // G3.9fc: the extended ones (`rt:65000:1`) in the same column.
+    let communities: Vec<String> = ["communities", "large_communities", "ext_communities"]
         .iter()
         .filter_map(|k| r.get(*k).and_then(Value::as_array))
         .flatten()

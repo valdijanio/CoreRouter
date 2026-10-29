@@ -20,7 +20,8 @@ use corerouter_model::routing_filter::{
 use corerouter_model::types::ItemId;
 use corerouter_model::{Config, Routing};
 use corerouter_proto_bgp::filter::eval::{self, Policy, Preview, Row, Side};
-use corerouter_proto_bgp::filter::parse::{self, Atom, CommArg, CommHow, Expr, SetOp, Stmt};
+use corerouter_proto_bgp::filter::{CommunityValue, ExtKind, parse_community};
+use corerouter_proto_bgp::filter::parse::{self, Atom, CommArg, CommHow, Expr, ExtArg, ExtHow, SetOp, Stmt};
 use corerouter_proto_bgp::filter::{Route, community_text, sample};
 use serde_json::{Value, json};
 
@@ -67,16 +68,16 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{} → [{name, entries: [string], count, ipv4, ipv6, used_by: [chain], comment}]",
         always, plist_list),
     cmd!("routing.filter.community-list.add", "Add Community List", ["Routing", "Filters"], None,
-        "{name: string, communities: [string] | string (65000:100, no-export, 65000:1:2), comment?: string} → {name}",
+        "{name: string, communities: [string] | string (65000:100, no-export, 65000:1:2, rt:65000:1, soo:192.0.2.1:7), comment?: string} → {name}",
         always, clist_add),
     cmd!("routing.filter.community-list.set", "Set Community List", [], None,
-        "{id: string (the name), name?: string, communities?: [string] | string, comment?: string} → {name}",
+        "{id: string (the name), name?: string, communities?: [string] | string (normal, large and extended), comment?: string} → {name}",
         has_clists, clist_set),
     cmd!("routing.filter.community-list.remove", "Remove Community List", [], None,
         "{id: string (the name)} → {name}",
         has_clists, clist_remove),
     cmd!(query "routing.filter.community-list.list", "Community Lists", ["Routing", "Filters"], None,
-        "{} → [{name, communities: [string], normal, large, used_by: [chain], comment}]",
+        "{} → [{name, communities: [string], normal, large, ext (extended, rt:/soo:), used_by: [chain], comment}]",
         always, clist_list),
     cmd!(query "routing.filter.prefix-list.check", "Check Prefix List", [], None,
         "{id?: string (the list being edited), name?: string, entries?: [string] | string, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk}",
@@ -380,6 +381,20 @@ pub(crate) fn prepend_warning(f: &RoutingFilter) -> Option<String> {
     ))
 }
 
+/// The extended-community actions of a rule, in order (G3.9fc).
+fn ext_actions(stmts: &[Stmt], out: &mut Vec<(ExtHow, ExtArg)>) {
+    for s in stmts {
+        match s {
+            Stmt::If { then, els, .. } => {
+                ext_actions(then, out);
+                ext_actions(els, out);
+            }
+            Stmt::Set(SetOp::Ext { how, arg }) => out.push((*how, arg.clone())),
+            _ => {}
+        }
+    }
+}
+
 /// What a rule tests and does, for the chips of the list.
 fn summary(stmts: &[Stmt]) -> (Vec<String>, Vec<String>, &'static str) {
     fn atoms(e: &Expr, out: &mut Vec<String>) {
@@ -398,6 +413,7 @@ fn summary(stmts: &[Stmt]) -> (Vec<String>, Vec<String>, &'static str) {
                     Atom::AsPath(_) => "bgp-as-path",
                     Atom::Comm { large: false, .. } => "bgp-communities",
                     Atom::Comm { large: true, .. } => "bgp-large-communities",
+                    Atom::Ext { .. } => "bgp-ext-communities",
                 };
                 if !out.iter().any(|x| x == name) {
                     out.push(name.to_owned());
@@ -443,6 +459,15 @@ fn summary(stmts: &[Stmt]) -> (Vec<String>, Vec<String>, &'static str) {
                                 CommHow::Delete => "delete",
                             },
                             if *large { "large-communities" } else { "communities" }
+                        ),
+                        SetOp::Ext { how, .. } => format!(
+                            "{} ext-communities",
+                            match how {
+                                ExtHow::Set => "set",
+                                ExtHow::Append => "append",
+                                ExtHow::Delete => "delete",
+                                ExtHow::Filter => "filter",
+                            }
                         ),
                     },
                 ),
@@ -546,14 +571,14 @@ fn chains_using(f: &RoutingFilter, name: &str, prefix: bool) -> Vec<String> {
             Expr::Not(x) => in_expr(x, name, prefix),
             Expr::And(a, b) | Expr::Or(a, b) => in_expr(a, name, prefix) || in_expr(b, name, prefix),
             Expr::Atom(Atom::DstList(n)) => prefix && n == name,
-            Expr::Atom(Atom::Comm { arg: CommArg::List(n), .. }) => !prefix && n == name,
+            Expr::Atom(Atom::Comm { arg: CommArg::List(n), .. } | Atom::Ext { arg: CommArg::List(n), .. }) => !prefix && n == name,
             Expr::Atom(_) => false,
         }
     }
     fn in_stmts(st: &[Stmt], name: &str, prefix: bool) -> bool {
         st.iter().any(|s| match s {
             Stmt::If { cond, then, els } => in_expr(cond, name, prefix) || in_stmts(then, name, prefix) || in_stmts(els, name, prefix),
-            Stmt::Set(SetOp::Comm { arg: CommArg::List(n), .. }) => !prefix && n == name,
+            Stmt::Set(SetOp::Comm { arg: CommArg::List(n), .. } | SetOp::Ext { arg: ExtArg::List(n), .. }) => !prefix && n == name,
             _ => false,
         })
     }
@@ -738,12 +763,14 @@ fn clist_list(s: &mut Session, _: &Value) -> Result<Value> {
         .community_lists
         .values()
         .map(|l| {
-            let large = l.communities.iter().filter(|c| c.matches(':').count() == 2).count();
+            let kinds: Vec<Option<CommunityValue>> = l.communities.iter().map(|c| parse_community(c).ok()).collect();
+            let count = |f: fn(&CommunityValue) -> bool| kinds.iter().flatten().filter(|c| f(c)).count();
             json!({
                 "name": l.name,
                 "communities": l.communities,
-                "normal": l.communities.len() - large,
-                "large": large,
+                "normal": count(|c| matches!(c, CommunityValue::Normal(_))),
+                "large": count(|c| matches!(c, CommunityValue::Large(_))),
+                "ext": count(|c| matches!(c, CommunityValue::Ext(_))),
                 "used_by": chains_using(f, &l.name, false),
                 "comment": l.comment,
             })
@@ -951,6 +978,16 @@ fn describe_change(a: &Route, b: &Route) -> String {
     }
     for c in &a.large {
         if !b.large.contains(c) {
+            out.push(format!("-{c}"));
+        }
+    }
+    for c in &b.ext {
+        if !a.ext.contains(c) {
+            out.push(format!("+{c}"));
+        }
+    }
+    for c in &a.ext {
+        if !b.ext.contains(c) {
             out.push(format!("-{c}"));
         }
     }
@@ -1180,8 +1217,14 @@ fn list_check(s: &mut Session, raw: &Value, prefix: bool) -> Result<Value> {
                 }
             }
             if !prefix && let Some(l) = cfg.routing.filter.community_lists.get(&name) {
-                let large = l.communities.iter().filter(|c| c.matches(':').count() == 2).count();
-                computed.push(json!({"label": "Communities", "value": format!("{} normal, {large} large", l.communities.len() - large)}));
+                let kinds: Vec<CommunityValue> = l.communities.iter().filter_map(|c| parse_community(c).ok()).collect();
+                let n = |f: fn(&CommunityValue) -> bool| kinds.iter().filter(|c| f(c)).count();
+                computed.push(json!({"label": "Communities", "value": format!(
+                    "{} normal, {} large, {} extended",
+                    n(|c| matches!(c, CommunityValue::Normal(_))),
+                    n(|c| matches!(c, CommunityValue::Large(_))),
+                    n(|c| matches!(c, CommunityValue::Ext(_)))
+                )}));
             }
             let users = chains_using(&cfg.routing.filter, &name, prefix);
             if !users.is_empty() {
@@ -1267,6 +1310,37 @@ fn rule_check(s: &mut Session, raw: &Value) -> Result<Value> {
                 format!("rule {} before it always accepts or rejects: this rule never runs (move it up, or use place_before)", blocker.id),
                 "rule",
             ));
+        }
+        // G3.9fc: what an extended-community action takes away.
+        let mut ext_ops = Vec::new();
+        ext_actions(&st, &mut ext_ops);
+        for (how, arg) in ext_ops {
+            let rts_kept = match &arg {
+                ExtArg::Values(v) => v.iter().any(|e| e.kind() == ExtKind::Rt),
+                ExtArg::List(_) => true,
+                ExtArg::Kind(k) => *k != ExtKind::Rt,
+            };
+            match how {
+                ExtHow::Set => checks.push(check(
+                    "info",
+                    "ext-set",
+                    "set bgp-ext-communities replaces every extended community of the route, its Route Targets too (append adds)".into(),
+                    "rule",
+                )),
+                ExtHow::Delete if matches!(arg, ExtArg::Kind(ExtKind::Rt)) => checks.push(check(
+                    "warning",
+                    "ext-rt",
+                    "delete bgp-ext-communities rt removes every Route Target: a VPN route without one is imported nowhere".into(),
+                    "rule",
+                )),
+                ExtHow::Filter if !rts_kept => checks.push(check(
+                    "warning",
+                    "ext-rt",
+                    "filter bgp-ext-communities keeps no Route Target: a VPN route without one is imported nowhere".into(),
+                    "rule",
+                )),
+                _ => {}
+            }
         }
         // G3.9fg: RouterOS's count, or the legacy one of an older filter.
         if !prepend_counts(&r.rule).is_empty() {
@@ -1527,6 +1601,38 @@ mod tests {
         let row = pv["rows"].as_array().unwrap().iter().find(|r| r["change"].is_string()).unwrap().clone();
         // The chain adds 2: eBGP adds the third (G3.9fg).
         assert!(row["change"].as_str().unwrap().contains("prepend 65000 65000") && !row["change"].as_str().unwrap().contains("prepend 65000 65000 65000"), "{row}");
+    }
+
+    #[test]
+    fn extended_communities_in_lists_rules_and_checks() {
+        // G3.9fc: RFC 4360 values in a community list and in the rules.
+        let mut s = session();
+        s.execute("routing.filter.community-list.add", &json!({"name": "vpn", "communities": "rt:65000:7,soo:192.0.2.1:1,65000:1"})).unwrap();
+        let rows = s.execute("routing.filter.community-list.list", &json!({})).unwrap();
+        assert_eq!((rows[0]["normal"].as_u64(), rows[0]["large"].as_u64(), rows[0]["ext"].as_u64()), (Some(1), Some(0), Some(2)), "{rows}");
+        assert!(s.store().running().routing.filter.community_lists.contains_key("vpn"), "committed");
+        let e = s.execute("routing.filter.community-list.add", &json!({"name": "bad", "communities": "rt:70000:70000"})).unwrap_err();
+        assert!(e.to_string().contains("RFC 5668"), "{e}");
+        assert!(s.store().candidate().routing.filter.community_lists.contains_key("vpn"), "kept after the refused one");
+        let r = s.execute("routing.filter.rule.add", &json!({"chain": "in", "rule": "if (bgp-ext-communities any-list vpn) { set bgp-local-pref 300; accept } reject"})).unwrap();
+        s.execute("routing.filter.rule.add", &json!({"chain": "out", "rule": "append bgp-ext-communities rt:65000:9; accept"})).unwrap();
+        s.execute("routing.bgp.connection.set", &json!({"id": "up1", "input_filter": "in", "output_filter": "out"})).unwrap();
+        let text = corerouter_proto_bgp::render_all(&s.store().running().routing, &|_| None).unwrap();
+        assert!(text.contains(" permit rt 65000:7\n") && text.contains(" permit soo 192.0.2.1:1\n"), "{text}");
+        assert!(text.contains(" set extcommunity rt 65000:9\n"), "{text}");
+        let rows = s.execute("routing.filter.rule.list", &json!({"chain": "in"})).unwrap();
+        assert_eq!(rows[0]["matchers"], json!(["bgp-ext-communities"]));
+        assert_eq!(r["id"], rows[0]["id"]);
+        // What an action takes away is said before the commit.
+        let c = s.execute("routing.filter.rule.check", &json!({"chain": "out", "rule": "delete bgp-ext-communities rt; accept"})).unwrap();
+        assert!(c["checks"].to_string().contains("removes every Route Target"), "{c}");
+        let c = s.execute("routing.filter.rule.check", &json!({"chain": "out", "rule": "filter bgp-ext-communities soo:1:1; accept"})).unwrap();
+        assert!(c["checks"].to_string().contains("keeps no Route Target"), "{c}");
+        let c = s.execute("routing.filter.rule.check", &json!({"chain": "out", "rule": "set bgp-ext-communities rt:1:1; accept"})).unwrap();
+        assert!(c["checks"].to_string().contains("replaces every extended community"), "{c}");
+        // A list in use cannot go.
+        let e = s.execute("routing.filter.community-list.remove", &json!({"id": "vpn"})).unwrap_err();
+        assert!(e.to_string().contains("used by chain in"), "{e}");
     }
 
     #[test]

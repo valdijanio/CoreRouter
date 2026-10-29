@@ -151,11 +151,12 @@ const PLIST_COLUMNS: [table::Column; 6] = [
     comment(),
 ];
 
-const CLIST_COLUMNS: [table::Column; 6] = [
+const CLIST_COLUMNS: [table::Column; 7] = [
     col("Name").help("filter.list.name"),
     col("Communities").help("filter.community_list.communities"),
     num("Normal").help("filter.community_list.communities"),
     num("Large").help("filter.community_list.communities"),
+    num("Extended").help("filter.community_list.communities"),
     col("Used By").help("filter.list.used_by"),
     comment(),
 ];
@@ -318,7 +319,7 @@ fn clist_row(r: &Value) -> Row {
     }
     Row {
         key: s(r, "name"),
-        cells: vec![s(r, "name"), shown, s(r, "normal"), s(r, "large"), used_by(r), s(r, "comment")],
+        cells: vec![s(r, "name"), shown, s(r, "normal"), s(r, "large"), s(r, "ext"), used_by(r), s(r, "comment")],
         dimmed: false,
         section: false,
         tint: None,

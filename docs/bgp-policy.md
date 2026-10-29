@@ -27,7 +27,7 @@ corerouter-cli run routing.filter.impact
 |---|---|
 | `routing.filter.rule.{add,set,remove,move,list,check}` | `/routing filter rule` |
 | `routing.filter.prefix-list.{add,set,remove,list,check}` | (o RouterOS usa address-lists do firewall; aqui é uma lista própria, no formato do FRR/Cisco) |
-| `routing.filter.community-list.{add,set,remove,list,check}` | `/routing filter community-list` e `community-large-list` (juntas) |
+| `routing.filter.community-list.{add,set,remove,list,check}` | `/routing filter community-list`, `community-large-list` e `community-ext-list` (juntas; G3.9fc) |
 | `routing.filter.preview` | — (o RouterOS não tem prévia) |
 | `routing.filter.impact` | — |
 | `routing.filter.status` | — (chains, quem usa, e as conexões eBGP sem chain) |
@@ -71,6 +71,41 @@ punha N), e N já em 16. Em
 modo transacional, `routing.filter.impact` mostra o efeito antes do commit. Filtros novos já
 nascem com a contagem do RouterOS.
 
+## Extended communities (G3.9fc, RFC 4360)
+
+Como o `bgp-ext-communities` do RouterOS v7. Valores: Route Target `rt:65000:1` (AS de 2 octetos,
+número de 4; RFC 4360 §3.1), `rt:192.0.2.1:7` (IPv4, §3.2), `rt:4200000000:1` (AS de 4 octetos,
+número de 2; RFC 5668) e Site of Origin `soo:…` nas mesmas três formas, ou os 16 dígitos hex de
+um deles (`0x0002fde800000001`). A `community-list` guarda as três famílias (é também a
+`community-ext-list` do RouterOS); cada matcher usa as do seu tipo e avisa quando a lista não tem
+nenhuma.
+
+```sh
+corerouter-cli run routing.filter.community-list.add '{"name":"vpn-a","communities":"rt:65000:7,soo:192.0.2.1:1"}'
+corerouter-cli run routing.filter.rule.add '{"chain":"pe-in","rule":"if (bgp-ext-communities any-list vpn-a) { set bgp-local-pref 300 } delete bgp-ext-communities soo; accept"}'
+corerouter-cli run routing.filter.rule.add '{"chain":"pe-out","rule":"append bgp-ext-communities rt:65000:9; accept"}'
+```
+
+| RouterOS | O que faz | No FRR |
+|---|---|---|
+| `includes`, `any`, `equal` (+ `-list`) | todas, alguma, exatamente estas | `bgp extcommunity-list standard` + `match extcommunity` (`exact-match` no `equal`) |
+| `subset` (+ `-list`) | toda extended da rota é uma destas (nenhuma conta) | `expanded` com `^((RT:…\|SoO:…)( \|$))*$` |
+| `set` | troca todas | `set extcommunity none` e depois `set extcommunity rt …`/`soo …`, em duas entradas: o `set extcommunity` do FRR só acrescenta (`bgp_routemap.c`) |
+| `append` | acrescenta | `set extcommunity rt …`/`soo …` |
+| `delete VALORES\|LISTA` | tira estas | `expanded` `permit ^RT:…$` + `set extended-comm-list … delete` |
+| `delete rt\|soo\|other` | tira um tipo (`other`: nem RT nem SoO) | `expanded` `^RT:` / `^SoO:` / `deny ^RT:`, `deny ^SoO:`, `permit .*` |
+| `filter` | deixa só estas | `expanded` `deny ^V$` por valor, `permit .*` |
+
+O `rule.check` avisa: `set` troca todas, os Route Targets também (`ext-set`); `delete … rt` e um
+`filter` sem RT deixam a rota sem Route Target, e uma rota VPN sem RT não é importada em lugar
+nenhum (`ext-rt`). `routing.bgp.route.list` e `route.explain` trazem `ext_communities`
+(`rt:65000:1`), na mesma coluna Communities da janela de rotas BGP; o `route.list` lê as
+communities da tabela do FRR, que hoje não as traz (vale para todas: G3.2g), o `route.explain`
+(detalhe do prefixo) as mostra.
+
+Fica para depois (G3.9fi): link bandwidth, `any-regexp`/`subset-regexp`, outros tipos (color,
+EVPN, RFC 5701) e `bgp-ext-communities-empty`.
+
 ## `set gw` (G3.9fh)
 
 Como o `gw` do RouterOS v7: troca o next hop das rotas da família do endereço (IPv4 → `set ip
@@ -97,12 +132,15 @@ action  := accept | reject | return | jump CHAIN
          | set gw ENDEREÇO   (G3.9fh: next hop; só nas rotas da família do endereço)
          | set|append|delete bgp-communities VALORES|LISTA   (set … none apaga todas)
          | set|append|delete bgp-large-communities VALORES|LISTA
+         | set|append|filter bgp-ext-communities VALORES|LISTA   (set … none apaga todas; G3.9fc)
+         | delete bgp-ext-communities VALORES|LISTA|rt|soo|other
 expr    := expr || expr | expr && expr | not expr | ! expr | (expr) | matcher
 matcher := dst in PREFIXO|LISTA | dst == PREFIXO | dst != PREFIXO
          | dst-len (==|!=|<|<=|>|>=) N | dst-len in N-M
          | afi ipv4|ipv6 | protocol bgp,connected,static,ospf,rip
          | bgp-as-path "REGEX"
          | bgp-communities|bgp-large-communities includes|any|equal[-list] VALORES|LISTA
+         | bgp-ext-communities includes|any|equal|subset[-list] VALORES|LISTA
 ```
 
 - As regras de uma chain rodam na ordem da lista; `accept`/`reject` encerram; `jump` roda outra
