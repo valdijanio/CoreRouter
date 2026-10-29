@@ -1,33 +1,43 @@
-//! G1.6q: the command catalogue (`engine.list`, ~300 KB on a router) is not
-//! asked for on every one-second refresh: on the image an idle GUI pulled
-//! ~300 KB/s over the management link, ~250 KB/s of it this list.
+//! G1.6q: the command catalogue (`engine.list`, ~300 KB on a router) is
+//! asked for with its etag, and the router sends it only when it changed: on
+//! the image an idle GUI pulled ~300 KB/s over the management link, ~250 KB/s
+//! of it this list.
 
 use super::*;
 
-/// A router that counts the catalogue requests and whose revision the test
-/// moves.
+/// A router that answers `engine.list {if_none_match}` like the daemon and
+/// counts the full catalogues it sent.
 #[derive(Default)]
 struct Router {
     next: RequestId,
     replies: Vec<Reply>,
-    lists: usize,
-    revision: u64,
+    asked: usize,
+    sent: usize,
+    /// Bumped by the test: the catalogue changed (a command enabled).
+    version: u64,
 }
 
 struct Counting(std::rc::Rc<std::cell::RefCell<Router>>);
 
 impl Backend for Counting {
-    fn submit(&mut self, method: &str, _params: Value) -> RequestId {
+    fn submit(&mut self, method: &str, params: Value) -> RequestId {
         let mut r = self.0.borrow_mut();
         r.next += 1;
         let reply = match method {
             "engine.list" => {
-                r.lists += 1;
-                Ok(json!([{"id": "system.identity.set", "label": "Identity",
-                    "params": "{name: string} → {name}", "kind": "action", "enabled": true}]))
+                r.asked += 1;
+                let etag = format!("v{}", r.version);
+                if params["if_none_match"] == json!(etag) {
+                    Ok(json!({"etag": etag, "unchanged": true}))
+                } else {
+                    r.sent += 1;
+                    let enabled = r.version > 0;
+                    Ok(json!({"etag": etag, "commands": [{"id": "system.analytics.test",
+                        "label": "Test", "params": "{} → {requested}", "kind": "action",
+                        "enabled": enabled, "disabledReason": if enabled { Value::Null } else { json!("no exporter") }}]}))
+                }
             }
-            "state.inspect" => Ok(json!({"identity": "sim", "revision": r.revision,
-                "pending_changes": 0, "mode": "immediate", "safe_mode": {"active": false}})),
+            "state.inspect" => Ok(json!({"identity": "sim"})),
             "server.info" => Ok(json!({"version": "sim"})),
             "engine.execute" => Ok(json!([])),
             _ => Ok(json!({})),
@@ -49,7 +59,7 @@ impl Backend for Counting {
 }
 
 #[test]
-fn the_catalogue_is_asked_for_when_it_can_have_changed() {
+fn the_catalogue_comes_again_only_when_it_changed() {
     let router = std::rc::Rc::new(std::cell::RefCell::new(Router::default()));
     let mut app = CoreRouterUi::with_backend(Box::new(Counting(router.clone())));
     let ctx = egui::Context::default();
@@ -65,20 +75,14 @@ fn the_catalogue_is_asked_for_when_it_can_have_changed() {
             ctx.run_ui(raw, |ui| app.ui(ui)).drop_without_applying_deltas();
         }
     };
-    run(&mut app, 2.0);
-    assert!(router.borrow().lists >= 1, "asked for on connect");
-    assert!(app.can().check("system.identity.set").is_ok(), "and used");
-    let after_connect = router.borrow().lists;
-    // 5 s of refreshes with nothing changing: none.
-    run(&mut app, 5.0);
-    assert_eq!(router.borrow().lists, after_connect, "not every second");
-    // A commit elsewhere moves the revision: asked again within 2 s.
-    router.borrow_mut().revision = 7;
-    run(&mut app, 2.0);
-    assert_eq!(router.borrow().lists, after_connect + 1, "after the revision moved");
-    // Quiet again: nothing for 10 s, then one by the 15 s mark.
     run(&mut app, 10.0);
-    assert_eq!(router.borrow().lists, after_connect + 1, "quiet");
-    run(&mut app, 6.0);
-    assert_eq!(router.borrow().lists, after_connect + 2, "at least every 15 s");
+    let (asked, sent) = (router.borrow().asked, router.borrow().sent);
+    assert!(asked >= 8, "still asked every refresh: {asked}");
+    assert_eq!(sent, 1, "sent once in 10 s");
+    assert!(app.can().check("system.analytics.test").is_err(), "disabled, as the router said");
+    // The router's state enables the command: the next refresh brings it.
+    router.borrow_mut().version = 1;
+    run(&mut app, 2.0);
+    assert_eq!(router.borrow().sent, 2);
+    assert!(app.can().check("system.analytics.test").is_ok(), "enabled without waiting");
 }
