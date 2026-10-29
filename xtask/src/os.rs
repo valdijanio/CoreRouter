@@ -794,7 +794,7 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
             })
         });
         if built {
-            make(&["frr-dirclean"], None)?;
+            make(&["frr-dirclean"], &[])?;
         }
         std::fs::write(&fstamp, &fpatches).map_err(|e| format!("{}: {e}", fstamp.display()))?;
     }
