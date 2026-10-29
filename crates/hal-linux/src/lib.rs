@@ -599,8 +599,7 @@ mod linux {
                 let why = external.get(op.link().as_str()).map_or("", String::as_str);
                 log::warn!("not applied: {op} ('{}' is not managed: {why})", op.link());
             }
-            let mut owned = crate::plan::kernel_routes(from);
-            owned.extend(crate::plan::kernel_routes(to));
+            let owned = crate::plan::owned_routes(from, to, &run);
             match crate::netlink::apply(&run, &owned) {
                 Ok(()) => {
                     self.claims = claims_of(to);

@@ -68,7 +68,7 @@ pub const UNITS: &[Unit] = &[
         run: address_checks,
     },
     Unit {
-        name: "routes",
+        name: ROUTES_UNIT,
         reads: Sections::ROUTES.union(Sections::ADDRESSES).union(Sections::INTERFACES),
         run: route_checks,
     },
@@ -151,6 +151,30 @@ pub fn validate_changed(cfg: &Config, changed: Sections) -> Vec<Issue> {
         .flat_map(|u| (u.run)(cfg))
         .collect()
 }
+
+/// [`validate_changed`] for a commit from `running` (valid: the commit
+/// path keeps it so, `ValidRunning`) to `cfg`. With the interfaces and
+/// addresses the same, the route checks look only at the destinations the
+/// commit touched (G0.31e: 16 ms with 60 000 routes); the rest as
+/// [`validate_changed`]. Same issues, in the same order.
+pub fn validate_commit(running: &Config, cfg: &Config, changed: Sections) -> Vec<Issue> {
+    let routes_only = !changed.contains(Sections::OTHER)
+        && !changed.intersects(Sections::ADDRESSES.union(Sections::INTERFACES));
+    UNITS
+        .iter()
+        .filter(|u| changed.contains(Sections::OTHER) || u.reads.intersects(changed))
+        .flat_map(|u| {
+            if routes_only && u.name == ROUTES_UNIT {
+                route_checks_since(running, cfg)
+            } else {
+                (u.run)(cfg)
+            }
+        })
+        .collect()
+}
+
+/// Name of the unit that [`validate_commit`] runs incrementally.
+const ROUTES_UNIT: &str = "routes";
 
 fn interface_checks(cfg: &Config) -> Vec<Issue> {
     let mut out = Vec::new();
@@ -313,6 +337,44 @@ fn route_checks(cfg: &Config) -> Vec<Issue> {
             )
                 .into_iter()
                 .map(|(field, m)| Issue::new(format!("ip.routes[{}].{field}", r.id), m)),
+        );
+        group.push(r);
+    }
+    out
+}
+
+/// [`route_checks`] when only routes changed since `running` (valid, same
+/// interfaces and addresses): a route resolves through those alone, so an
+/// untouched route gives what it gave there (nothing), and a duplicate
+/// pairs two routes to one destination, one of them touched. So only the
+/// routes at the destinations the commit touched are looked at, through
+/// the index, in list order with the earlier routes of their group, as
+/// [`route_checks`] does.
+fn route_checks_since(running: &Config, cfg: &Config) -> Vec<Issue> {
+    let routes = &cfg.ip.routes;
+    let mut at: Vec<(usize, &RouteEntry)> = routes
+        .changed_dsts(&running.ip.routes)
+        .iter()
+        .flat_map(|d| routes.to_dst(&d.0, d.1))
+        .filter_map(|id| {
+            let pos = routes.position(*id)?;
+            Some((pos, routes.get(pos)?))
+        })
+        .collect();
+    at.sort_by_key(|(pos, _)| *pos);
+    at.dedup_by_key(|(pos, _)| *pos);
+    let mut out = Vec::new();
+    let mut groups: BTreeMap<(&RoutingTable, IpNet), Vec<&RouteEntry>> = BTreeMap::new();
+    for (_, r) in at {
+        let group = groups.entry((&r.routing_table, r.dst_address)).or_default();
+        out.extend(
+            route_issues(
+                cfg,
+                r,
+                group.iter().filter(|o| o.gateway == r.gateway).map(|o| o.id),
+            )
+            .into_iter()
+            .map(|(field, m)| Issue::new(format!("ip.routes[{}].{field}", r.id), m)),
         );
         group.push(r);
     }
