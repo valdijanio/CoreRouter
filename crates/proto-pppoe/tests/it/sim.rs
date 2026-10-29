@@ -49,8 +49,9 @@ fn only_keepalive_deaths(l: &Lab) {
     }
 }
 
+/// Slow layer (G0.30, `slow_`): 100 000 sessions, ~50 s in a dev build.
 #[test]
-fn hundred_thousand_dual_stack_sessions_reach_opened_on_a_lossy_network() {
+fn slow_hundred_thousand_dual_stack_sessions_reach_opened_on_a_lossy_network() {
     let t = Instant::now();
     let n: usize = std::env::var("SIM_N")
         .ok()
@@ -372,8 +373,9 @@ fn authentication_failures_at_scale_leave_nothing_behind() {
     l.check().unwrap();
 }
 
+/// Slow layer (G0.30, `slow_`): 20 000 sessions twice, ~13 s in a dev build.
 #[test]
-fn mass_reconnect_after_an_outage() {
+fn slow_mass_reconnect_after_an_outage() {
     let n = 20_000;
     let mut l = run(
         LabConfig {
@@ -434,9 +436,10 @@ fn cpe_reboot_storm_replaces_sessions_one_per_host() {
 /// G4.3k + G4.3l: 20 000 subscribers asking for 40 Service-Names (and the
 /// empty one, and names the table drops) over 100 × 50 QinQ VLANs, on a
 /// lossy network: those of terminating rows come up with their own name
-/// and tags, those of drop rows never get a session.
+/// and tags, those of drop rows never get a session. Slow layer (G0.30,
+/// `slow_`): ~12 s in a dev build.
 #[test]
-fn many_service_names_over_qinq_vlans() {
+fn slow_many_service_names_over_qinq_vlans() {
     use corerouter_proto_pppoe::eth::Vlans;
     use corerouter_proto_pppoe::server::{ServiceAction, ServiceRule, ServiceTable};
     let t = Instant::now();

@@ -208,8 +208,9 @@ MCP: `claude mcp add corerouter -- corerouter-cli mcp` (detalhes em `docs/mcp.md
 
 - Antes de cada commit: `cargo xtask ci --affected` (G0.29), o portão local só do afetado: os
   arquivos mudados desde a `origin/main` (commit, índice, árvore e não rastreados) dão os crates
-  alterados e os que dependem deles; fmt, clippy e test rodam só nesses, `bench-check` e `netns`
-  só nos crates alterados que os têm, e `wasm`, `layers`, `docs`, `agents-sync` e `ebpf-check`
+  alterados e os que dependem deles; fmt, clippy e test (camada rápida, abaixo) rodam só nesses,
+  `bench-check` só nos crates alterados que o têm, `netns` só com `--only netns` (camada lenta,
+  G0.30), e `wasm`, `layers`, `docs`, `agents-sync` e `ebpf-check`
   só quando o diff toca o que eles conferem. Arquivo de workspace (`Cargo.toml`/`Cargo.lock`
   da raiz, `xtask/`, `.cargo/`, `.config/`, `build-support/`, `clippy.toml`, toolchain) roda
   tudo. O `cargo xtask ci`
@@ -229,6 +230,22 @@ MCP: `claude mcp add corerouter -- corerouter-cli mcp` (detalhes em `docs/mcp.md
   rodam em jobs paralelos (`lint`, `test`, `bench-check`, `netns`, `xdp-root`, cada um com
   `cargo xtask ci --only <passos>`), e o check exigido `xtask ci (linux)` confere todos. Para
   repetir só um passo localmente: `cargo xtask ci --only netns` (ou `cargo xtask netns`).
+- **Orçamento de testes (G0.30): o tempo do portão não cresce com o número de testes.**
+  - **Camadas:** a **rápida** (`--affected`, `--fast` e o job `test` do PR) roda tudo menos os
+    testes cujo nome (da função ou de um módulo) começa com `slow_`, com `PROPTEST_CASES=32`;
+    a **completa** (lote da fila e `main`) roda todos com os casos de cada proptest; o **CI
+    noturno** (`.github/workflows/nightly.yml`) roda a completa com `PROPTEST_CASES=4096` e os
+    namespaces, e abre a issue "CI noturno quebrado" se falhar. `COREROUTER_TEST_LAYER=quick|full`
+    escolhe à mão.
+  - **Teste lento de propósito** (escala de milhares de sessões, fuzz longo, rede real com
+    espera que não dá para simular): nome `slow_…` e uma linha de doc com o motivo e o tempo
+    (ex.: `/// Slow layer (G0.30): 100 000 sessions, ~50 s in a dev build.`). Antes,
+    tente o relógio simulado (`Clock`/`Runner` do engine, relógio do laboratório): esperar de
+    verdade é o último recurso. Caso grande num laço: os casos pequenos ficam na camada rápida
+    e os grandes num `slow_` à parte (`config_journal.rs`).
+  - **Relatório:** todo `cargo xtask ci` termina com os 20 testes mais lentos (JUnit do nextest).
+  - **Regressões do proptest** (`proptest-regressions/`) rodam em toda camada; o passo `test`
+    reprova arquivo de regressão que nenhum teste lê mais (teste movido ou renomeado).
 - Comando novo: teste de sucesso, de erro de validação e de rollback; o `command_sweep` cobre
   params lixo automaticamente.
 - Um id de tarefa por commit: `G1.2: hal-linux aplica endereços via rtnetlink`.

@@ -101,6 +101,9 @@ jobs:
         part: [1, 2]
     env:
       COREROUTER_CI_PARTITION: ${{ matrix.part }}/${{ strategy.job-total }}
+      # G0.30: no PR, a camada rápida (sem os testes `slow_…`, proptest com 32 casos); no lote da
+      # fila (workflow_dispatch) e na main, todos os testes com os casos de cada um.
+      COREROUTER_TEST_LAYER: ${{ github.event_name == 'pull_request' && 'quick' || 'full' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup
