@@ -245,6 +245,36 @@ corerouter-cli run routing.bgp.instance.check '{"id":"default","asn":"65000","ro
 corerouter-cli run system.health.check | jq '.checks[] | select(.key == "bgp.end-of-rib")'
 ```
 
+### G3.9fj: Hard Reset e o bit N (RFC 8538)
+
+O FRR 10.7.1 já anuncia o bit N e manda Hard Reset no `clear` por padrão (desde a 8.3,
+`FRR_CFG_DEFAULT_BOOL` em `bgpd/bgp_vty.c`). Com o bit N dos dois lados, toda NOTIFICATION que não
+é Hard Reset e o **hold timer expirado** viram graceful restart (§4): as rotas ficam stale.
+Hard Reset (Cease 9) no FRR: Maximum Prefixes, Administrative Shutdown, Peer De-configured,
+BFD Down (Cease 10) e Administrative Reset conforme `hard_admin_reset` (`bgp_packet.c`,
+`bgp_notify_send_hard_reset`).
+
+```sh
+corerouter-cli run routing.bgp.instance.set '{"asn":65000,"router_id":"10.255.0.1","hard_admin_reset":false}'
+```
+
+- Na instância: `graceful_notification` (bit N, padrão `true`) e `hard_admin_reset` (padrão
+  `true`; `false`: um `routing.bgp.session.clear` de um vizinho com bit N mantém as rotas stale).
+  Só o desligado fica na config e vira `no bgp graceful-restart notification` / `no bgp
+  hard-administrative-reset`. O FRR imprime só o que difere do padrão, e digitar a forma ligada a
+  cada commit faria o diff redigitá-la. Pior: `graceful-restart notification` manda a capacidade
+  a todo vizinho cada vez que é digitado.
+- `routing.bgp.session.list`: `n_bit` (o vizinho anunciou, sessão estabelecida com GR) e
+  `last_hard_reset`. Na janela, o selo `N` na coluna GR e "(Hard Reset)" no último erro. Na aba Instances, a coluna Notification (`N bit`, `graceful clear`) e os
+  dois campos no modal.
+- **Risco já existente que o PR expõe:** com GR e bit N, uma queda silenciosa (energia, link
+  cortado) do lado que reinicia deixa as rotas dele no vizinho por hold time + Restart Time. A
+  prévia da conexão avisa (`gr-bfd`) quando há `graceful_restart=yes` sem BFD, e a saúde
+  (`bgp.gr-bfd`) aponta as sessões estabelecidas assim. O remédio é BFD (a queda do BFD é Hard
+  Reset) ou desligar o bit N.
+- RouterOS 7.25: nada documentado sobre a RFC 8538. Como ele não é helper, o bit N não muda nada
+  com ele.
+
 ### Ficou para depois
 
 - Políticas e o "quais rotas passam" (G3.2b); RPKI e "Por que essa rota?" (G3.2c).

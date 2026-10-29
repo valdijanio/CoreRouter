@@ -177,6 +177,9 @@ const INST_FIELDS: &[Field] = &[
     field("graceful_restart_time", "Restart Time", "bgp.instance.graceful_restart_time", Input::Text("120 s (default)")),
     field("graceful_stale_time", "Stale Time", "bgp.instance.graceful_stale_time", Input::Text("360 s (default)")),
     field("graceful_defer_time", "Defer Time", "bgp.instance.graceful_defer_time", Input::Text("10 s (default)")),
+    // RFC 8538 (on by default).
+    field("graceful_notification", "GR Notification", "bgp.instance.graceful_notification", Input::Check),
+    field("hard_admin_reset", "Hard Admin Reset", "bgp.instance.hard_admin_reset", Input::Check),
 ];
 
 pub(crate) const INST_SPEC: Spec = Spec {
@@ -209,7 +212,7 @@ pub(crate) const TPL_SPEC: Spec = Spec {
     preview: "routing.bgp.template.check",
 };
 
-const INST_COLUMNS: [table::Column; 8] = [
+const INST_COLUMNS: [table::Column; 9] = [
     col("State").help("bgp.instance.disabled"),
     col("Name").help("bgp.instance.name"),
     col("AS").help("bgp.instance.asn"),
@@ -217,6 +220,7 @@ const INST_COLUMNS: [table::Column; 8] = [
     num("Restart Time").help("bgp.instance.graceful_restart_time"),
     num("Stale Time").help("bgp.instance.graceful_stale_time"),
     num("Defer Time").help("bgp.instance.graceful_defer_time"),
+    col("Notification").help("bgp.instance.graceful_notification"),
     comment(),
 ];
 
@@ -391,6 +395,10 @@ impl SessionRow {
                     .and_then(Value::as_array)
                     .is_some_and(|a| !a.is_empty());
                 let mut chips = vec![(g, if g == "restart" { Kind::Green } else { Kind::Neutral })];
+                // G3.9fj, RFC 8538 §2: the neighbor's N bit.
+                if self.session.as_ref().is_some_and(|v| flag(v, "n_bit")) {
+                    chips.push(("N", Kind::Blue));
+                }
                 if eor {
                     chips.push(("EoR", Kind::Blue));
                 } else if g == "restart" && self.state() == "established" {
@@ -562,6 +570,18 @@ fn inst_row(r: &Value) -> Row {
             secs("graceful_restart_time", 120),
             secs("graceful_stale_time", 360),
             secs("graceful_defer_time", 10),
+            // RFC 8538: the N bit, and a clear that keeps the routes.
+            {
+                let mut chips = vec![if r.get("graceful_notification").and_then(Value::as_bool) == Some(false) {
+                    ("no N bit", Kind::Neutral)
+                } else {
+                    ("N bit", Kind::Blue)
+                }];
+                if r.get("hard_admin_reset").and_then(Value::as_bool) == Some(false) {
+                    chips.push(("graceful clear", Kind::Amber));
+                }
+                cell("", &chips)
+            },
             s(r, "comment"),
         ],
         dimmed: disabled,
@@ -581,8 +601,11 @@ fn values_of(r: &Value, what: What) -> BTreeMap<&'static str, String> {
                 .iter()
                 .map(|f| {
                     let v = match f.param {
-                        "disabled" => if flag(r, "disabled") { "yes" } else { "no" }.to_owned(),
-                        k => r.get(k).filter(|v| !v.is_null()).map(value_text).unwrap_or_default(),
+                        k => match r.get(k) {
+                            Some(Value::Bool(b)) => if *b { "yes" } else { "no" }.to_owned(),
+                            Some(v) if !v.is_null() => value_text(v),
+                            _ => String::new(),
+                        },
                     };
                     (f.param, v)
                 })
@@ -733,7 +756,13 @@ impl BgpPanel {
         };
         let last_error = {
             let e = r.text("last_error");
-            if e.is_empty() { r.text("reason") } else { e }
+            // G3.9fj, RFC 8538 §3: a Hard Reset dropped the routes at once
+            // (FRR says so only while the session is down).
+            match r.get("last_hard_reset").and_then(Value::as_bool) {
+                _ if e.is_empty() => r.text("reason"),
+                Some(true) => format!("{e} (Hard Reset)"),
+                _ => e,
+            }
         };
         let families = r
             .get("afi")
