@@ -122,6 +122,20 @@ fn diskstats_vmstat_net_and_mounts() {
 }
 
 #[test]
+fn open_descriptors_are_counted() {
+    let dir = std::env::temp_dir().join(format!("cr-fds-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in ["0", "1", "2"] {
+        std::fs::write(dir.join(f), "").unwrap();
+    }
+    assert_eq!(count_fds(&dir), Some(3));
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(count_fds(&dir), None, "unreadable: not zero");
+    let own = count_fds(Path::new("/proc/self/fd")).unwrap();
+    assert!(own >= 3, "{own}");
+}
+
+#[test]
 fn process_names_with_spaces_and_parentheses() {
     let p = parse_pid_stat(&fixture("proc/1/stat"), 4096).unwrap();
     assert_eq!(

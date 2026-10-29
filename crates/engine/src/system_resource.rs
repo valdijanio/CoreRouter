@@ -30,6 +30,9 @@ pub const HISTORY_STEP_MS: u64 = 5_000;
 const MIN_DT_MS: u64 = 200;
 /// Seconds a command's interest keeps the service at one reading a second.
 pub const WANTED_SECS: u64 = 15;
+/// A process list older than this (ms of uptime before the last reading)
+/// is not served while the service catches up (G1.6q).
+const PROCS_STALE_MS: u64 = 2_000;
 
 /// Where a reading came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,8 +351,16 @@ impl Session {
         if fresh && have_procs && m.last.is_some() {
             return Ok(());
         }
-        if m.source == Some(Source::Service) && age.is_some_and(|a| a <= 2) {
-            // The service will add the processes on its next reading.
+        // The service adds the processes on its next reading; until then a
+        // list of the last second or two is good enough. With none (a
+        // one-shot CLI/MCP call, G1.6q) or an old one, read now.
+        let procs_recent = !processes
+            || m.procs_last.as_ref().is_some_and(|(t, _)| {
+                m.last
+                    .as_ref()
+                    .is_some_and(|l| l.uptime_ms.saturating_sub(*t) <= PROCS_STALE_MS)
+            });
+        if m.source == Some(Source::Service) && age.is_some_and(|a| a <= 2) && procs_recent {
             return Ok(());
         }
         let Some(sampler) = m.sampler.as_mut() else {

@@ -87,6 +87,9 @@ struct Cache {
     history: Vec<Value>,
     diff: Vec<Value>,
     commands: Vec<Value>,
+    /// The catalogue's etag: the router answers `unchanged` instead of
+    /// sending it again (G1.6q: ~300 KB a second per open GUI).
+    commands_etag: Option<String>,
     info: Value,
     whoami: Value,
     neighbors: Vec<Value>,
@@ -547,10 +550,23 @@ impl CoreRouterUi {
             Field::Bgp => self.cache.bgp = arr(value),
             Field::History => self.cache.history = arr(value),
             Field::Diff => self.cache.diff = arr(value),
-            Field::Commands => {
-                self.cache.commands = arr(value);
-                self.update_can();
-            }
+            Field::Commands => match value {
+                // A router before G1.6q: the bare list, every time.
+                Value::Array(list) => {
+                    self.cache.commands = list;
+                    self.cache.commands_etag = None;
+                    self.update_can();
+                }
+                Value::Object(mut m) => {
+                    if let Some(Value::Array(list)) = m.remove("commands") {
+                        self.cache.commands = list;
+                        self.update_can();
+                    }
+                    self.cache.commands_etag =
+                        m.get("etag").and_then(Value::as_str).map(str::to_owned);
+                }
+                _ => {}
+            },
             Field::Info => {
                 self.cache.info = value;
                 self.update_can();
@@ -759,7 +775,13 @@ impl CoreRouterUi {
             exec("config.history"),
         );
         ask(self, Field::Diff, "engine.execute", exec("config.diff"));
-        ask(self, Field::Commands, "engine.list", Value::Null);
+        let etag = self.cache.commands_etag.clone().unwrap_or_default();
+        ask(
+            self,
+            Field::Commands,
+            "engine.list",
+            json!({ "if_none_match": etag }),
+        );
         // An old router has no auth.whoami: no question it cannot answer.
         if !self.old_router() {
             ask(self, Field::Whoami, "auth.whoami", Value::Null);
