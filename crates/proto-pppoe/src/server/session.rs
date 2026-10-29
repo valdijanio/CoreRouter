@@ -523,7 +523,7 @@ impl Session {
     /// LCP Opened (tlu): start the keepalive and the Authenticate phase.
     fn lcp_up(&mut self, env: &mut Env<'_>) {
         if env.cfg.keepalive_interval_ms > 0 {
-            self.echo_at = env.now + env.cfg.keepalive_interval_ms;
+            self.echo_at = env.now + echo_step(env.cfg);
             self.heard_at = env.now;
         }
         self.auth.proto = self.lcp_l.auth_agreed;
@@ -960,10 +960,8 @@ impl Session {
             // last packet heard. Counting misses at the echo ticks let a dead
             // subscriber live up to 1.5× that (42 s for 30 s against a
             // RouterOS CPE, G3.9g).
-            let window = env
-                .cfg
-                .keepalive_interval_ms
-                .saturating_mul(u64::from(env.cfg.keepalive_misses.max(1)));
+            let misses = u64::from(env.cfg.keepalive_misses.max(1));
+            let window = env.cfg.keepalive_interval_ms.saturating_mul(misses);
             let dead_at = self.heard_at.saturating_add(window);
             if now >= dead_at {
                 // The subscriber is gone: it would not answer Terminate.
@@ -974,9 +972,12 @@ impl Session {
             self.echo_id = self.echo_id.wrapping_add(1);
             let body = self.lcp_l.echo_magic().to_be_bytes();
             self.send(env, proto::LCP, lc::ECHO_REQUEST, self.echo_id, &body);
-            self.echo_at = now
-                .saturating_add(env.cfg.keepalive_interval_ms)
-                .min(dead_at);
+            // RFC 1661 §5.8: one lost echo is not a dead link. Probe every
+            // `window / (misses + 1)` so `misses` echoes (and their replies)
+            // fit before the deadline: with the period itself the second
+            // echo would land on the deadline and a single loss would kill
+            // the session (5 drops in the lossy QinQ simulation).
+            self.echo_at = now.saturating_add(echo_step(env.cfg)).min(dead_at);
         }
         if !self.up && self.setup_deadline <= now {
             self.setup_deadline = now + env.cfg.fsm.restart_ms * 2;
@@ -1094,9 +1095,17 @@ impl Session {
         }
         s.up = s.v4_up || s.v6_up;
         if cfg.keepalive_interval_ms > 0 {
-            s.echo_at = now + cfg.keepalive_interval_ms;
+            s.echo_at = now + echo_step(cfg);
             s.heard_at = now;
         }
         s
     }
+}
+
+/// Echo period: `interval × misses / (misses + 1)`, so `misses` echoes go out
+/// (and can be answered) inside the keepalive window that starts at the last
+/// packet heard.
+fn echo_step(cfg: &ServerConfig) -> u64 {
+    let misses = u64::from(cfg.keepalive_misses.max(1));
+    (cfg.keepalive_interval_ms.saturating_mul(misses) / (misses + 1)).max(1)
 }
