@@ -633,7 +633,7 @@ bfd_on=0
 bfd_up() {
   [ $bfd_on = 1 ] && return
   bfd_on=1
-  # 300 ms × 3: at 100 ms a new session with RouterOS flaps (case bfd).
+  # 300 ms × 3 first; the case then goes to 100 ms (stable since G3.9b).
   cli routing.bfd.profile.add '{"name":"g39","min_tx":300,"min_rx":300,"multiplier":3,"dampening":false}' >/dev/null
   tset '{"bfd":"g39"}'
   cli routing.ospf.interface-template.set "{\"id\":\"$T2\",\"bfd\":\"g39\"}" >/dev/null
