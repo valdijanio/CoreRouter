@@ -8055,3 +8055,194 @@ continuação indentadas).
   Como testar: `cargo test -p corerouter-proto-bgp graceful`, `cargo test -p corerouter-engine
   --lib graceful`; `scripts/bgp-crcr-userns.sh gr`; `cargo xtask vm-lab run --
   scripts/routeros-interop-bgp.sh gr`.
+
+- 2026-10-29 — processo-codigo-de-terceiros: Regra nova no CLAUDE.md/AGENTS.md (pedido do usuário, 2026-10-29): em dúvida, problema ou análise
+  de desempenho que passe por um pacote de terceiros (FRR, kernel, buildroot, nftables, crates), é
+  obrigatório ler o código do pacote e, quando preciso, compilar com logs e testar por dentro, com
+  a evidência registrada no PR e a correção no lugar do defeito (patch na imagem e texto para o
+  projeto de origem). Primeiro caso: o abort do TI-LFA no `ospfd` (G3.4l).
+
+- 2026-10-29 — valida-bgp-history-flap: `routing.bgp.session.history` perdia a sessão que sobe e cai entre duas amostras do serviço `frr`
+  (a cada 2 s). Achado na validação das rodadas 1 e 2 (`scripts/bgp-crcr-userns.sh maxprefix`,
+  CoreRouter × FRR 10.7.1 no host): o `max_prefix_ipv4=3` com `shutdown` fecha a sessão com o R3
+  logo depois do Established; as duas amostras dizem `idle` e só o contador `flaps` anda (0 → 1),
+  e o histórico ficava vazio, justo no evento que o operador procura. Agora `flaps` maior com a
+  sessão fora nas duas amostras entra como `down`, com o motivo (`Reached received prefix count`)
+  e sem uptime (não se sabe quanto ficou de pé). Teste
+  `bgp_history::tests::up_and_down_between_two_samples_is_a_down` (o código antigo reprova).
+
+  Como testar: `cargo test -p corerouter-engine --lib bgp_history`.
+
+  Desempenho e paralelismo: uma comparação a mais por sessão por amostra, O(1); nada muda no
+  custo da amostra (O(sessões), uma thread, a do serviço `frr`).
+
+- 2026-10-29 — G3.9b: BFD tolerante à subida lenta do RouterOS. Quando o par baixa o Desired Min TX (o passo de 1 s para
+  o intervalo rápido logo depois do Up, ou uma troca de perfil com a sessão no ar), o `proto-bfd`
+  mantém o valor antigo no tempo de detecção até dois pacotes periódicos do par chegarem a no máximo
+  um intervalo novo um do outro. Um Final ou uma mudança de estado, que saem na hora, não contam
+  como prova. É o princípio que a RFC 5880 §6.8.3 impõe a quem baixa o próprio Required Min RX,
+  aplicado do nosso lado. A captura mostrou o motivo: o CHR responde ao nosso Poll com `Up F tx=100`
+  e fica ~1 s sem mandar nada. Com 3 × 100 ms a sessão caía 300 ms depois, num ciclo de ~2 s.
+  Enquanto a prova não chega, o `detect_time_us` da sessão mostra a detecção lenta.
+
+  Laboratório (`scripts/routeros-interop.sh bfd`, VM `corerouter-lab`, RouterOS 7.25 CHR), **medido**
+  em 2026-10-29:
+
+  | 100 ms × 3, quedas em 30 s | antes (main 132c8645) | depois |
+  |---|---|---|
+  | troca 300 → 100 com a sessão no ar (Poll) | 5 | 0 |
+  | sessão nova (CoreRouter—CHR) | 15 | 0 |
+  | sessão nova CHR—R4 (`bfdd` do FRR, referência) | 12 | 13 |
+
+  - No caso `bfd`, as duas linhas a 100 ms viraram OK/FAIL (eram INFO).
+  - Na sessão nova, o CHR ficou lento por 0,95 s depois do Init (maior intervalo: 774 ms, **medido**
+    na captura).
+  - Testes com relógio simulado em `proto-bfd`:
+    - `routeros_slow_start_after_up_does_not_flap`: 5 s a ~1 s, depois 100 ms; queda em 300 ms
+      depois de provado;
+    - `hold_ignores_out_of_schedule_packets`;
+    - `a_prompt_peer_gets_the_fast_detection_in_two_packets`.
+  - Os testes do serviço BFD esperam a detecção rápida provada antes de cortar o par. O
+    `data_plane_for_a_fake_bfdd` deixou de dividir portas com o `the_tap_hears_the_loss…` no
+    `cargo test`, que roda os dois no mesmo processo.
+  - Como testar: `cargo test -p corerouter-proto-bfd`;
+    `cargo xtask vm-lab run -- scripts/routeros-interop.sh bfd`.
+
+- 2026-10-29 — G3.9fj: BGP: graceful restart, parte 1 de 5 (o que ficou fora da G3.9ff, #450). Os tempos de GR (Restart,
+  Stale, Defer), que só a CLI e o MCP mudavam, agora se editam na janela, e o vizinho que nunca
+  manda End-of-RIB aparece fora dela, na saúde.
+
+  - **Routing › BGP › Instances** no padrão de lista e modal (G0.24): estado, AS em selo, router-id,
+    os três tempos ("120 s (default)" quando não definidos) e comentário; duplo clique edita, ✓/✗
+    ativam e desativam, cópia como comando. O modal pergunta ao novo `routing.bgp.instance.check`
+    (prévia que nunca falha por entrada ruim: vira checagem no campo) e aplica o `instance.set` que
+    ele devolve, com os três tempos explícitos (campo vazio = padrão, `null`). Avisos: Restart Time
+    não menor que o hold time de cada conexão em restart (RFC 4724 §3, com o nome da conexão), AS
+    ou router-id novos reiniciam as sessões da instância, desativar para as sessões, nome que já
+    existe; informa Defer Time 0, tempos sem conexão em restart e os vizinhos sem End-of-RIB. O
+    texto que vai para o `bgpd` continua embaixo da lista depois do OK.
+  - **Saúde:** checagem `bgp.end-of-rib` em `system.health.check` (System › Resources e o log
+    quando muda, depois de duas leituras): aviso quando uma sessão com GR dos dois lados (nós
+    `restart`, o vizinho anuncia a capacidade) está estabelecida há 5 min sem End-of-RIB (RFC 4724
+    §4.2). Valor "N de M", motivo com até 3 conexões, ação com o caso do RouterOS 7.25 (Defer Time
+    curto ou `graceful_restart=no`). Sem daemon de roteamento: `unknown`.
+
+  **Medido** (2026-10-29, host, FRR 10.7.1, `scripts/bgp-crcr-userns.sh gr`): com os tempos
+  aplicados pelo comando que a prévia do modal devolve (Restart 60 s, Defer 5 s; o `bgpd` do CR1
+  passa a ter `bgp graceful-restart restart-time 60`), `kill -9` do `bgpd` do CR1 e ping a cada
+  20 ms: com GR 2 de 640 perdidos (~40 ms), as duas rotas guardadas; sem GR 445 de 639 (~8,9 s), o
+  CR2 retira a rota em 155 ms. Na GUI real: lista, modal com o aviso da RFC 4724 §3 e os comandos,
+  OK aplica e mostra o texto do `bgpd` (screenshots conferidos). O caso RouterOS 7.25 (sem
+  End-of-RIB) é o estado medido na G3.9ff (`gr_remote: helper`, sem EoR), coberto por teste.
+
+  Como testar: `cargo test -p corerouter-engine --lib -- routing::tests health_check`,
+  `cargo test -p corerouter-ui --lib -- tests::bgp`; `scripts/bgp-crcr-userns.sh gr` (aplica os
+  tempos pelo comando da prévia e mostra a checagem); na GUI, Routing › BGP › Instances, duplo
+  clique em `default`.
+
+  Desempenho e paralelismo: a checagem custa O(sessões BGP) sobre a última amostra do serviço
+  `frr` (já em memória, nada lido do FRR sob o lock do `Session`), a cada 5 s; a prévia, O(conexões
+  + templates) por tecla (depois da pausa de 0,4 s do modal). Nada a dividir entre threads.
+
+- 2026-10-29 — processo: O `.deb` do gerenciador (GUI + CLI, G0.28) no GitHub Releases. `.github/workflows/release.yml`:
+  uma tag `v*` gera, num runner Ubuntu 22.04 do GitHub (sem cache, não no self-hosted), o
+  `corerouter-gui_<versão>_amd64.deb`, o `SHA256SUMS` e as notas da versão, e cria a Release em
+  **rascunho** (o dono revisa e publica). `workflow_dispatch` com uma versão e PR que mexe no
+  workflow ou em `xtask/src/package*` só geram os arquivos, como artifact do run. Actions fixadas
+  por SHA; `permissions: {}` no topo, `contents: read` no build e `contents: write` só no job que
+  roda o `gh release create` (sem checkout nem código do repositório).
+
+  `cargo xtask package gui --version <v>`: a versão do `.deb` vem da tag (`v0.2.0` → `0.2.0`,
+  `v0.2.0-rc.1` → `0.2.0~rc.1`) e tem de ser a do workspace, para o pacote e o `server.info`
+  dizerem o mesmo. `cargo xtask package notes [--since <tag>]`: uma linha por entrada do
+  `docs/log.md` que a tag anterior não tinha (300 caracteres cada, 100 kB no total; o log inteiro
+  dá 98 kB, **medido**). A imagem do roteador fica fora (assinada com a chave do dono, que não vai
+  para o CI); `docs/install-gui.md` diz como baixar, conferir o SHA-256 e anexar a imagem assinada
+  localmente.
+
+  Testar: `cargo xtask package gui --version 0.1.0-test.1` e `cargo xtask package notes --since
+  HEAD~5`; no GitHub, o job `build (.deb)` roda no próprio PR. Primeira versão, depois do merge:
+  `git tag -a v0.1.0 -m "CoreRouter 0.1.0" origin/main && git push origin v0.1.0`.
+
+- 2026-10-29 — valida-fw-raw-delta: Delta de revisão do firewall sem serializar a tabela raw. Achado na validação das rodadas 1 e 2 na
+  VM `corerouter-teste` (imagem `cb5867de`): com 4 000 regras raw, todo commit que mexia no firewall
+  (uma regra de filter, até só o comentário) serializava a tabela raw inteira duas vezes e a
+  comparava por `json_delta` para gravar a revisão. O `config_delta::diff_firewall` e o
+  `apply_firewall` tiravam filter, nat, mangle e address lists da parte "pequena" do delta, mas
+  não a raw, que veio depois (G2.1c). Agora uma função só, `light_firewall`, serve os dois lados e
+  desestrutura o `Firewall` inteiro: tabela nova sem tratamento não compila. A raw virou lista
+  grande como as outras (`{"a": …}` por blocos do `CowList`); uma revisão gravada antes continua
+  abrindo (o delta antigo da raw é aplicado pela árvore JSON, como qualquer lista).
+
+  Como testar: `cargo test -p corerouter-model --lib config_delta` (os testes novos
+  `one_raw_rule_of_many_is_one_small_delta`, que compara com o diff da árvore e confere que a raw
+  fica compartilhada quando muda uma regra de filter, e `the_light_firewall_has_no_rule_table`, que
+  reprova se alguma tabela de `Table::ALL` sobrar na parte pequena). Benchmark novo:
+  `cargo bench -p corerouter-model --bench config_delta`.
+
+  Desempenho e paralelismo: o trabalho por commit de firewall era O(regras raw) no delta do journal,
+  sob o lock do `Session`; agora é O(blocos mudados), como filter/nat/mangle. Não há o que dividir em
+  threads: o delta é um por commit e pequeno. O commit de uma regra com 10 000 regras ainda leva
+  ~100 ms de ponta a ponta na VM (2 vCPUs) e 90–110 ms no host carregado: o resto está fora do delta
+  (validação do firewall inteiro, `fw_delta`, alocação), medido mas não atacado aqui (G0.31j).
+
+  Achados da mesma validação que viram gaps (números **medidos** na VM `corerouter-teste`, 2 vCPUs,
+  2 GiB, e reproduzidos no host num namespace sem root, release, 2026-10-29):
+
+- 2026-10-29 — valida-oom-health: Saúde: "OOM kills" dizia "ok" dez minutos depois de o kernel matar o próprio daemon. Achado na
+  validação das rodadas 1 e 2 na VM `corerouter-teste` (imagem `cb5867de`, 2 GiB): um
+  `ip.route.list` de 60 000 rotas levou o daemon a 1,85 GiB, o OOM killer o matou e o
+  `corerouter-init` o reiniciou; System › Resources mostrava "nenhum processo morto por falta de
+  memória na última hora". A checagem só contava o `oom_kill` do `/proc/vmstat` (contagem desde o
+  boot) quando ele subia entre duas leituras do mesmo processo, e o daemon novo começava com a
+  morte já contada. Agora a primeira leitura conta o que o kernel já contou quando a máquina subiu
+  há menos de uma hora (`OOM_WINDOW`): essas mortes são recentes por definição. Numa máquina ligada
+  há mais tempo elas não têm data e continuam fora (gap G1.6qj).
+
+  Como testar: `cargo test -p corerouter-engine --lib health_check` (teste novo
+  `kills_before_the_daemon_started_count_when_they_are_recent`: máquina com 700 s, morte de antes do
+  daemon contada, saída da janela, máquina ligada há dias, primeira leitura sem morte).
+
+  Desempenho e paralelismo: uma comparação a mais por leitura de saúde (a cada 5 s), fora de
+  qualquer caminho quente; nada a dividir.
+
+- 2026-10-29 — valida-pppoe-monitor: PPPoE Client: com a autenticação recusada, o painel de monitor deixava AC Name, AC MAC e Session
+  ID vazios, embora o cliente tivesse falado com o concentrador (achado do usuário na VM
+  `corerouter-teste`, cliente `vvs` na `ether1` com a conta do provedor: "login refused — bad
+  username or password" e os campos com "—"). O `interface.pppoe-client.monitor` tirava esses
+  campos só da sessão de pé. Agora o `Runner` guarda o concentrador da última tentativa que chegou
+  a um (`Peer`: AC Name, AC MAC, Session ID e a autenticação que o LCP combinou), e o monitor mostra,
+  nesta ordem, o da sessão de pé, o da que está negociando (depois do PADO/PADS) ou o da última
+  tentativa. Também vale para `encoding`: um login PAP recusado mostra `pap`. A redial que volta à
+  descoberta continua mostrando o concentrador anterior até a nova oferta. A assinatura do comando
+  diz de onde vêm os quatro campos.
+
+  Como testar: `cargo test -p corerouter-engine --lib pppoe_client` (teste novo
+  `a_refused_login_keeps_the_bng_it_spoke_to`: o BNG do laboratório recusa a senha `wrong`; o
+  monitor traz AC Name, AC MAC, Session ID e `pap`, e os mantém durante a redial). Na GUI:
+  PPP › PPPoE Client, um cliente com senha errada, painel de baixo.
+
+  Desempenho e paralelismo: uma cópia de um nome de até 64 caracteres por fim de sessão e por
+  leitura do monitor, fora do caminho de pacotes; nada a dividir.
+
+- 2026-10-29 — G1.6i: FRR sob demanda na imagem: o `corerouter-init` sobe sempre `mgmtd`, `zebra` e `staticd`, e
+  `bgpd`, `ospfd`, `ospf6d`, `ldpd` e `bfdd` só quando a configuração os usa. O daemon
+  (`--frr-daemons /run/corerouter/frr-daemons`, passado pelo init) grava a lista;
+  o init a lê quando ela muda (um `stat` por tick de 50 ms) e sobe ou para só a diferença, sem
+  reiniciar os outros. Ordem segura (`crates/hal-frr/src/on_demand.rs`): antes do sync a lista
+  recebe o que a config nova usa somado ao que já rodava, e o sync espera o socket vty do daemon
+  novo (até 10 s); depois do sync bem-sucedido ela fica só com o que a config usa, então um daemon
+  só sai depois que a config e as rotas dele foram removidas. O `bfdd` sobe também quando um
+  protocolo pede BFD (`neighbor X bfd`, `ip ospf bfd`, `ipv6 ospf6 bfd`). Uma instância BGP
+  desabilitada continua no bgpd (`bgp shutdown`) e o mantém.
+
+  Como testar: `cargo xtask os build && cargo xtask os boot-test` (linha "FRR up: mgmtd zebra
+  staticd …" e a memória ociosa) e `cargo xtask os frr-test`, que agora confere que nenhum daemon
+  de protocolo roda antes da configuração, que a instância BGP sobe o bgpd e que remover o LDP e o
+  peer BFD para o ldpd e o bfdd sem mudar o PID do zebra e do ospfd e com o ping da outra loopback
+  pela rota OSPF (verde em 29 s, KVM, **medido**).
+
+  Números (imagem, KVM, 1 GiB, 2026-10-29, **medido**): memória ociosa sem protocolo
+  98,9 → 70,9 MiB (três boots: 101,9/95,2/99,6 → 72,0/69,0/71,8), FRR pronto 0,82 s depois do
+  kernel (antes 1,0–1,9 s). Com OSPF+SR+LDP+BFD no ar o RSS por daemon não muda (ospfd 10,9 MiB,
+  ldpd 8,6, bfdd 8,9).

@@ -511,7 +511,7 @@ pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), S
             ),
         )?;
     }
-    let work = root.join("os/out/install-test");
+    let work = super::out_dir(root)?.join("install-test");
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
     let log_path = work.join("console.log");

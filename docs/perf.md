@@ -2753,3 +2753,22 @@ intercaladas.
 Com filtro (50 de 250 000), a resposta é a leitura da tabela, 147–224 ms, e o lock fica em
 50–80 µs. Com a máquina carregada, uma rodada isolada chegou a 4,5 ms de lock, que é preempção
 da thread, não trabalho.
+
+### Delta de revisão de um commit de firewall (valida-fw-raw-delta, **medido**)
+
+2026-10-29, AMD Ryzen AI Max+ 395 (32 threads), release, máquina compartilhada (load 40–60).
+`cargo bench -p corerouter-model --bench config_delta`, `--save-baseline antes` com as linhas da
+correção revertidas e `--baseline antes` com elas:
+
+| Caso | Antes | Depois |
+|---|---|---|
+| `config_delta/one_filter_rule_of_10000` (4 000 filter + 4 000 raw + 2 000 mangle, uma regra de filter mudada) | 31,2 ms | 68 µs (−99,7 %) |
+
+De ponta a ponta (daemon release `--backend linux` num namespace sem root, commit de uma regra de
+filter, 15 commits por rodada) o ganho ficou dentro do ruído da máquina carregada: 90–110 ms antes
+e depois (G0.31j).
+
+- 2026-10-29, G1.6i (**medido**, imagem no QEMU/KVM, 2 vCPUs, 1 GiB, `cargo xtask os boot-test`,
+  três boots cada): memória ociosa sem protocolo de roteamento 98,9 MiB (8 daemons do FRR) →
+  70,9 MiB (mgmtd, zebra, staticd); FRR com os sockets vty prontos 0,82 s depois do kernel
+  (antes 1,0–1,9 s).

@@ -44,6 +44,9 @@ const CONFIG_WAIT: Duration = Duration::from_secs(5);
 /// baud console.
 const DAEMON_LOG: &str = "/var/log/corerouter-daemon.log";
 const DAEMON_LOG_MAX: u64 = 8 << 20;
+/// An FRR daemon the config no longer uses gets this long after SIGTERM
+/// (G1.6i); FRR exits in well under a second.
+const FRR_STOP_GRACE: Duration = Duration::from_secs(5);
 /// Idle memory is read this long after the first ready.
 const IDLE_AFTER: Duration = Duration::from_secs(10);
 
@@ -141,6 +144,8 @@ fn prepare_frr() -> Vec<Svc> {
         .filter(|d| Path::new(&format!("{}/{d}", plan::FRR_SBIN)).exists())
         .map(|d| Svc {
             name: d,
+            wanted: plan::FRR_ALWAYS.contains(d),
+            stopping: None,
             pid: None,
             since: Instant::now(),
             restart_at: Instant::now(),
@@ -152,6 +157,11 @@ fn prepare_frr() -> Vec<Svc> {
 /// A supervised FRR daemon.
 struct Svc {
     name: &'static str,
+    /// Runs now: always for [`plan::FRR_ALWAYS`], the others while the
+    /// daemon names them in [`plan::FRR_WANTED`] (G1.6i).
+    wanted: bool,
+    /// SIGTERM sent because it is no longer wanted; SIGKILL past this.
+    stopping: Option<Instant>,
     pid: Option<Pid>,
     since: Instant,
     restart_at: Instant,
@@ -161,6 +171,45 @@ struct Svc {
 impl Svc {
     fn log_path(&self) -> String {
         format!("/var/log/frr-{}.log", self.name)
+    }
+}
+
+/// The daemon's [`plan::FRR_WANTED`] as `(mtime, len)`: read again only
+/// when it changes (one `stat` per tick).
+fn wanted_stamp() -> Option<(std::time::SystemTime, u64)> {
+    let m = fs::metadata(plan::FRR_WANTED).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
+/// Starts what the daemon's list adds and stops (SIGTERM) what it drops.
+/// The daemon drops a daemon only after removing its config, so its
+/// routes are already withdrawn; zebra, mgmtd and staticd never stop.
+fn apply_wanted(frr: &mut [Svc], now: Instant) {
+    let mut text = String::new();
+    if let Ok(f) = File::open(plan::FRR_WANTED) {
+        let _ = f.take(plan::FRR_WANTED_MAX).read_to_string(&mut text);
+    }
+    let list = plan::frr_wanted(&text);
+    for s in frr.iter_mut() {
+        let w = list.contains(&s.name);
+        if w && !s.wanted {
+            s.wanted = true;
+            log!("FRR {}: starting (the configuration uses it)", s.name);
+            if s.pid.is_none() {
+                s.restart_at = now;
+                s.backoff = Backoff::new();
+            }
+        } else if !w && s.wanted {
+            s.wanted = false;
+            if let Some(p) = s.pid {
+                log!(
+                    "FRR {}: stopping (the configuration no longer uses it)",
+                    s.name
+                );
+                let _ = rustix::process::kill_process(p, Signal::TERM);
+                s.stopping = Some(now + FRR_STOP_GRACE);
+            }
+        }
     }
 }
 
@@ -500,6 +549,7 @@ fn supervise(
     let mut idle_done = false;
     let mut next_rotate = Instant::now();
     let mut frr_ready = !with_frr;
+    let mut stamp = None;
     loop {
         let what = action.load(Ordering::Relaxed);
         if what != RUN {
@@ -532,6 +582,24 @@ fn supervise(
                     want_setup.store(false, Ordering::Relaxed);
                 }
             } else if let Some(s) = frr.iter_mut().find(|s| s.pid == Some(pid)) {
+                // Stopped on purpose (G1.6i): no backoff; wanted again
+                // meanwhile, it starts on this tick.
+                if s.stopping.take().is_some() || !s.wanted {
+                    s.pid = None;
+                    s.restart_at = Instant::now();
+                    s.backoff = Backoff::new();
+                    log!(
+                        "FRR {} stopped after {:.1} s{}",
+                        s.name,
+                        s.since.elapsed().as_secs_f64(),
+                        if s.wanted {
+                            "; wanted again, starting"
+                        } else {
+                            ""
+                        }
+                    );
+                    continue;
+                }
                 let ran = s.since.elapsed();
                 let delay = s.backoff.after_exit(ran);
                 log!(
@@ -546,10 +614,28 @@ fn supervise(
             }
         }
         let now = Instant::now();
+        if with_frr {
+            let st = wanted_stamp();
+            if st != stamp {
+                stamp = st;
+                apply_wanted(&mut frr, now);
+            }
+        }
         // FRR first (mgmtd, zebra, the protocols): the daemon attaches to
         // their vty sockets, and resyncs when they come back.
         for s in frr.iter_mut() {
-            if s.pid.is_none() && now >= s.restart_at {
+            if let (Some(p), Some(t)) = (s.pid, s.stopping)
+                && now >= t
+            {
+                log!(
+                    "FRR {} did not stop in {} s: killing it",
+                    s.name,
+                    FRR_STOP_GRACE.as_secs()
+                );
+                let _ = rustix::process::kill_process(p, Signal::KILL);
+                s.stopping = Some(now + FRR_STOP_GRACE);
+            }
+            if s.wanted && s.pid.is_none() && now >= s.restart_at {
                 s.pid = spawn_frr(s);
                 s.since = now;
                 if s.pid.is_none() {
@@ -564,23 +650,20 @@ fn supervise(
                 d.restart_at = now + d.backoff.after_exit(Duration::ZERO);
             }
         }
-        if !frr_ready && frr.iter().all(|s| s.pid.is_some()) {
-            let socks = fs::read_dir(plan::FRR_DIR)
-                .map(|d| {
-                    d.flatten()
-                        .filter(|e| e.file_name().to_string_lossy().ends_with(".vty"))
-                        .count()
-                })
-                .unwrap_or(0);
-            if socks >= frr.len() {
-                frr_ready = true;
-                let up = read_proc("/proc/uptime").and_then(|s| plan::uptime_secs(&s));
-                log!(
-                    "FRR up: {} daemons have their vty sockets, {:.3} s after kernel start",
-                    frr.len(),
-                    up.unwrap_or(-1.0)
-                );
-            }
+        if !frr_ready
+            && frr.iter().filter(|s| s.wanted).all(|s| {
+                s.pid.is_some() && Path::new(&format!("{}/{}.vty", plan::FRR_DIR, s.name)).exists()
+            })
+        {
+            frr_ready = true;
+            let up = read_proc("/proc/uptime").and_then(|s| plan::uptime_secs(&s));
+            let running: Vec<&str> = frr.iter().filter(|s| s.wanted).map(|s| s.name).collect();
+            log!(
+                "FRR up: {} have their vty sockets, {:.3} s after kernel start \
+                 (the others start when the configuration uses them)",
+                running.join(" "),
+                up.unwrap_or(-1.0)
+            );
         }
         if d.pid.is_some() && !d.ready && probe() {
             d.ready = true;
