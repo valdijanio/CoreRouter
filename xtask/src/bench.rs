@@ -271,10 +271,14 @@ pub fn check(root: &Path) -> Outcome {
         Ok(m) => m,
         Err(e) => return Outcome::Fail(e),
     };
+    // G0.29: under `ci --affected`, only the changed packages with benches.
+    let Some(pkgs) = crate::package_args(|p| p.has_benches && p.changed) else {
+        return Outcome::Skip("no package with benches in scope".into());
+    };
     let out = cargo()
+        .arg("test")
+        .args(pkgs)
         .args([
-            "test",
-            "--workspace",
             "--bench",
             "*",
             "--no-run",
