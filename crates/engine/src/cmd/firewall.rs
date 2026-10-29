@@ -7,7 +7,7 @@
 //! it touches the candidate; the whole config is validated again at commit.
 
 use corerouter_firewall::describe::describe;
-use corerouter_firewall::rule_issues;
+use corerouter_firewall::{rule_issues, table_issues};
 use corerouter_firewall::shadow::shadowed;
 use corerouter_firewall::validate::MAX_RULES;
 use corerouter_hal::DynamicChange;
@@ -793,15 +793,15 @@ pub fn summary(r: &FirewallRule) -> String {
 }
 
 /// One rule as `ip.firewall.<table>.list` shows it; `shadowed_by` comes
-/// from [`corerouter_firewall::shadow::shadowed`] over the whole table.
+/// from [`corerouter_firewall::shadow::shadowed`] and `issue` from
+/// [`table_issues`], both over the whole table.
 pub fn row(
-    cfg: &Config,
     table: Table,
     position: usize,
     r: &FirewallRule,
     shadowed_by: Option<ItemId>,
+    issue: Option<(&'static str, String)>,
 ) -> Value {
-    let issue = rule_issues(cfg, table, r).into_iter().next();
     let mut flags = String::new();
     if r.disabled {
         flags.push('X');
@@ -880,15 +880,18 @@ fn list(s: &mut Session, table: Table, p: &Value) -> Result<Value> {
     let live = s.ext::<crate::firewall_diag::FwDiag>().map(|d| &d.live);
     let cfg = s.store().candidate();
     let shadows = shadowed(cfg, table);
+    let issues = table_issues(cfg, table);
     Ok(Value::Array(
         cfg.ip
             .firewall
             .rules(table)
             .iter()
+            .zip(issues)
             .enumerate()
-            .filter(|(_, r)| chain.as_ref().is_none_or(|c| *c == r.chain && !r.section))
-            .map(|(i, r)| {
-                let mut v = row(cfg, table, i, r, shadows.get(&r.id).copied());
+            .filter(|(_, (r, _))| chain.as_ref().is_none_or(|c| *c == r.chain && !r.section))
+            .map(|(i, (r, issue))| {
+                let first = issue.into_iter().next();
+                let mut v = row(table, i, r, shadows.get(&r.id).copied(), first);
                 if let (Some(l), Some(o)) =
                     (live.and_then(|m| m.get(&(table, r.id))), v.as_object_mut())
                 {
