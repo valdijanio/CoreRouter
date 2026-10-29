@@ -470,6 +470,7 @@ fn capabilities(s: &mut Session, name: &IfName) -> Result<EthernetMonitor> {
 
 fn list(s: &mut Session, _: &Value) -> Result<Value> {
     let rows = super::interface::typed(s, |k| matches!(k, InterfaceKind::Ethernet))
+        .0
         .into_iter()
         .map(|(i, st)| {
             let e = &i.ethernet;

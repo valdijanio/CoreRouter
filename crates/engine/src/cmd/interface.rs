@@ -41,7 +41,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     // `/interface vlan print` and the like (G3.9hl): one type each, the
     // columns RouterOS prints first (`interface.list` keeps every type).
     cmd!(query "interface.vlan.list", "VLANs", [], None,
-        "{} → [{name, mtu, vlan_id, interface (the parent: interface= in RouterOS), use_service_tag, disabled, running, comment}]",
+        "{} → [{name, mtu, vlan_id, interface (the parent: interface= in RouterOS), mac_address, use_service_tag, disabled, running, comment}]",
         always, vlan_list),
     cmd!(query "interface.bridge.list", "Bridges", [], None,
         "{} → [{name, mtu, mac_address, ports (count), disabled, running, comment}]",
@@ -191,15 +191,19 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(Value::Array(rows))
 }
 
+type Typed = Vec<(Interface, Option<corerouter_hal::LinkState>)>;
+
 /// The config interfaces `keep` selects, each with its kernel link (if
-/// any), in config order: the rows of the per-type lists (G3.9hl).
+/// any), in config order: the rows of the per-type lists (G3.9hl). Also
+/// the links left over (a VLAN's parent, for its MAC).
 pub(super) fn typed(
     s: &mut Session,
     keep: impl Fn(&InterfaceKind) -> bool,
-) -> Vec<(Interface, Option<corerouter_hal::LinkState>)> {
+) -> (Typed, Vec<corerouter_hal::LinkState>) {
     let mut live = s.hal_mut().poll();
     s.watch_links(&live);
-    s.store()
+    let rows = s
+        .store()
         .candidate()
         .interfaces
         .values()
@@ -211,7 +215,8 @@ pub(super) fn typed(
                 .map(|at| live.swap_remove(at));
             (i.clone(), st)
         })
-        .collect()
+        .collect();
+    (rows, live)
 }
 
 fn running(st: Option<&corerouter_hal::LinkState>) -> bool {
@@ -219,8 +224,38 @@ fn running(st: Option<&corerouter_hal::LinkState>) -> bool {
 }
 
 fn vlan_list(s: &mut Session, _: &Value) -> Result<Value> {
-    let rows = typed(s, |k| matches!(k, InterfaceKind::Vlan { .. }))
-        .into_iter()
+    let (vlans, live) = typed(s, |k| matches!(k, InterfaceKind::Vlan { .. }));
+    // Without its own, a VLAN carries its parent's MAC (Linux and RouterOS),
+    // up a stack of VLANs (QinQ). Two maps, built once: O(1) per row.
+    let mut macs: BTreeMap<&IfName, &str> = live
+        .iter()
+        .filter_map(|l| Some((&l.name, l.mac.as_deref()?)))
+        .collect();
+    macs.extend(
+        vlans
+            .iter()
+            .filter_map(|(i, st)| Some((&i.name, st.as_ref()?.mac.as_deref()?))),
+    );
+    let parents: BTreeMap<&IfName, &IfName> = vlans
+        .iter()
+        .filter_map(|(i, _)| match &i.kind {
+            InterfaceKind::Vlan { parent, .. } => Some((&i.name, parent)),
+            _ => None,
+        })
+        .collect();
+    let mac_of = |name: &IfName| {
+        let mut at = name;
+        // A stack is short; the bound only stops a loop the config forbids.
+        for _ in 0..8 {
+            if let Some(m) = macs.get(at) {
+                return Some((*m).to_owned());
+            }
+            at = parents.get(at)?;
+        }
+        None
+    };
+    let rows = vlans
+        .iter()
         .filter_map(|(i, st)| {
             let InterfaceKind::Vlan {
                 parent,
@@ -235,6 +270,7 @@ fn vlan_list(s: &mut Session, _: &Value) -> Result<Value> {
                 "mtu": i.mtu,
                 "vlan_id": vlan_id.get(),
                 "interface": parent,
+                "mac_address": mac_of(&i.name),
                 "use_service_tag": service_tag,
                 "disabled": i.disabled,
                 "running": running(st.as_ref()),
@@ -257,6 +293,7 @@ fn bridge_list(s: &mut Session, _: &Value) -> Result<Value> {
         *ports.entry(b).or_default() += 1;
     }
     let rows = typed(s, |k| matches!(k, InterfaceKind::Bridge))
+        .0
         .into_iter()
         .map(|(i, st)| {
             json!({
@@ -275,6 +312,7 @@ fn bridge_list(s: &mut Session, _: &Value) -> Result<Value> {
 
 fn loopback_list(s: &mut Session, _: &Value) -> Result<Value> {
     let rows = typed(s, |k| matches!(k, InterfaceKind::Loopback))
+        .0
         .into_iter()
         .map(|(i, st)| {
             json!({

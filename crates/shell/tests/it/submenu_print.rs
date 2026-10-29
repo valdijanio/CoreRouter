@@ -41,6 +41,32 @@ fn names(out: &str) -> Vec<String> {
         .collect()
 }
 
+/// `Columns:` of the RouterOS 7.25 CHR for the same config (the `prints`
+/// case of `scripts/routeros-interop-l2.sh`, 2026-10-29).
+const ROS_VLAN: &str = "NAME, MTU, ARP, VLAN-ID, INTERFACE, MAC-ADDRESS";
+const ROS_ETHERNET: &str = "NAME, MTU, MAC-ADDRESS, ARP";
+const ROS_BRIDGE_PORT: &str = "INTERFACE, BRIDGE, HORIZON, TRUSTED, TRUSTED-RA, TRUSTED-DHCPV6, \
+     TRUSTED-ARP, FAST-LEAVE, BPDU-GUARD, EDGE, POINT-TO-POINT, PVID, FRAME-TYPES";
+
+/// RouterOS's columns that CoreRouter has a field for, in its order: the
+/// table here is a prefix of them (no ARP: it lives in /ip arp settings).
+fn routeros(columns: &str) -> Vec<String> {
+    const OURS: &[&str] = &[
+        "NAME",
+        "MTU",
+        "VLAN-ID",
+        "INTERFACE",
+        "MAC-ADDRESS",
+        "BRIDGE",
+    ];
+    columns
+        .split(',')
+        .map(str::trim)
+        .filter(|c| OURS.contains(c))
+        .map(str::to_owned)
+        .collect()
+}
+
 fn lab() -> Term {
     let mut t = Term::new();
     for line in [
@@ -67,11 +93,8 @@ fn vlan_print_lists_the_vlans_with_routeros_columns() {
     let mut t = lab();
     let out = t.ok("/interface vlan print");
     assert!(out.starts_with("Flags: X - disabled, R - running"), "{out}");
-    assert_eq!(
-        header(&out).get(..4),
-        Some(&["NAME", "MTU", "VLAN-ID", "INTERFACE"].map(String::from)[..]),
-        "{out}"
-    );
+    let cols = routeros(ROS_VLAN);
+    assert_eq!(header(&out).get(..cols.len()), Some(&cols[..]), "{out}");
     assert_eq!(names(&out), ["v30", "v31"], "{out}");
     assert!(out.contains(";;; prints"), "{out}");
     assert!(out.contains(" 1 X v31"), "{out}");
@@ -127,7 +150,7 @@ fn bridge_bonding_loopback_and_ethernet_print() {
     );
     assert_eq!(names(&br), ["br1"]);
     let port = t.ok("/interface bridge port print");
-    assert_eq!(header(&port), ["INTERFACE", "BRIDGE"], "{port}");
+    assert_eq!(header(&port), routeros(ROS_BRIDGE_PORT), "{port}");
     let bond = t.ok("/interface bonding print");
     assert_eq!(
         header(&bond).get(..3),
@@ -138,11 +161,9 @@ fn bridge_bonding_loopback_and_ethernet_print() {
     let lo = t.ok("/interface loopback print");
     assert_eq!(names(&lo), ["lo1"], "{lo}");
     let eth = t.ok("/interface ethernet print");
-    assert_eq!(
-        header(&eth).get(..3),
-        Some(&["NAME", "MTU", "MAC-ADDRESS"].map(String::from)[..]),
-        "{eth}"
-    );
+    // RouterOS's columns first, then what `interface.ethernet.set` changed.
+    let cols = routeros(ROS_ETHERNET);
+    assert_eq!(header(&eth).get(..cols.len()), Some(&cols[..]), "{eth}");
     assert!(names(&eth).iter().all(|n| n.starts_with("ether")), "{eth}");
     assert!(eth.contains("100Mbps"), "{eth}");
     // `set` by number on the ethernet print.

@@ -714,7 +714,14 @@ fn per_type_lists_hold_only_their_type_with_routeros_columns() {
     );
     ok(&mut s, "interface.loopback.add", json!({"name": "lo1"}));
 
-    let vlans = ok(&mut s, "interface.vlan.list", json!({}));
+    let mut vlans = ok(&mut s, "interface.vlan.list", json!({}));
+    // A VLAN shows its parent's MAC, as RouterOS does (v30 = ether1's).
+    let ether1 = ok(&mut s, "interface.ethernet.list", json!({}))[0]["mac_address"].clone();
+    assert!(ether1.is_string(), "{ether1}");
+    assert_eq!(vlans[1]["mac_address"], ether1);
+    for v in vlans.as_array_mut().unwrap() {
+        v.as_object_mut().unwrap().remove("mac_address");
+    }
     assert_eq!(
         vlans,
         json!([
