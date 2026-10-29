@@ -2306,3 +2306,23 @@ Mesma máquina (32 threads, NVMe), dev com `CARGO_INCREMENTAL=0`, `cargo test --
 
 O ganho é de disco (metade do target de cada sessão), não de tempo: com 32 threads os links
 já rodam em paralelo, e o executável único do engine (56 arquivos) compila num crate só.
+
+### G0.30 — tempo dos testes, linha de base (**medido**, 2026-10-29, AMD Ryzen AI Max+ 395, 32 threads, build dev, nextest 0.9.149)
+
+`cargo nextest run --workspace` com o projeto compilado: 3487 testes em **50,0 s** de parede, mas
+**810 s** de tempo de teste somado (média 0,23 s por teste). O caminho crítico é um teste só: o
+mais longo leva 50 s (`sim::hundred_thousand_dual_stack_sessions_reach_opened_on_a_lossy_network`),
+o segundo 34 s. 143 testes passam de 1 s e somam 585 s (72% do total); 20 passam de 5 s e somam
+297 s; os 3344 restantes somam 225 s.
+
+### G0.30 — camada rápida (**medido**, 2026-10-29, AMD Ryzen AI Max+ 395, 32 threads, build dev, nextest 0.9.149, projeto já compilado)
+
+| `cargo nextest run --workspace` | Testes | Parede | Tempo de teste somado | CPU (user) |
+|---|---|---|---|---|
+| Antes (todos, casos de cada proptest) | 3487 | 50,0 s | 810 s | — |
+| Só `PROPTEST_CASES=32` | 3490 | 46,6 s | 633 s | 448 s |
+| Camada rápida (sem `slow_`, 32 casos) | 3485 | **22,4 s** (22,4 / 22,6) | 482 s | 309 s |
+
+O caminho crítico deixou de ser um teste de 50 s: o mais longo da camada rápida leva 8,6 s. 64
+threads em vez de 32 (mais testes esperando ao mesmo tempo) quebrou um teste sensível a tempo
+e foi descartado.
