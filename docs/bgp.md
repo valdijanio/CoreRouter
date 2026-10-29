@@ -151,13 +151,17 @@ corerouter-cli run routing.bgp.connection.add '{"name":"client1","remote_address
   - IPv6 numa sessão IPv4 (`afi=ip,ipv6`): o CHR manda o next hop `::ffff:10.39.1.1`
     (IPv4-mapeado). A RFC 2545 §3 pede um endereço IPv6 global; nenhum kernel instala o mapeado,
     e o próprio RouterOS o trata como inalcançável. Errado o RouterOS. O CoreRouter manda global +
-    link-local e o CHR instala. A prévia da conexão avisa (`mpbgp-nexthop`); use uma segunda
-    conexão ao endereço IPv6 com `afi=ipv6`.
+    link-local e o CHR instala. Desde a G3.9fh a chain de entrada reescreve o next hop com o
+    IPv6 do CHR no enlace, `if (afi ipv6) { set gw fd39:1::1 } accept` (FRR `set ipv6 next-hop
+    global`), e as rotas entram no kernel; a prévia da conexão avisa (`mpbgp-nexthop`) e diz o
+    que escrever. A outra saída continua valendo: uma segunda conexão ao endereço IPv6 com
+    `afi=ipv6`.
   - Refletor: o CHR põe o próprio Router ID no ORIGINATOR_ID; a RFC 4456 §8 pede o do originador
     do anúncio no AS. Errado o RouterOS; o CLUSTER_LIST e o next hop estão certos.
-  - `set bgp-path-prepend N`: no eBGP o CHR sai com o próprio AS N vezes no total; o CoreRouter
-    (FRR `set as-path prepend`) põe N além do que o eBGP já põe (N + 1). A documentação não diz
-    qual é o contrato; fica como G3.9fg.
+  - `set bgp-path-prepend N`: no eBGP o CHR sai com o próprio AS N vezes no total (N = 1, 2, 3 →
+    1, 2, 3 cópias, **medido**); na saída iBGP e na entrada não põe nada. Desde a G3.9fg o
+    CoreRouter faz igual; filtros antigos mantêm a contagem anterior (N além do que a sessão põe)
+    até `routing.filter.prepend.set` (`docs/bgp-policy.md`).
   - iBGP de rede própria: o CHR anuncia com o endereço da interface (10.39.1.1) quando a sessão
     é entre loopbacks com `local.address`; a RFC 4271 §5.1.3 permite. Sem `local.address` ele
     abre a sessão a partir do loopback.

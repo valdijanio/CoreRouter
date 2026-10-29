@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::config::{Config, Ip};
 use crate::address_lists::AddressLists;
+use crate::routes::Routes;
 use crate::cow::CowArc;
 use crate::cow_list::CowList;
 use crate::firewall::Firewall;
@@ -352,7 +353,11 @@ fn differing_ip(from: &Ip, to: &Ip) -> (Ip, Ip) {
         arp
     );
     trim_into(&mut a.addresses, &mut b.addresses, addresses, &to.addresses);
-    trim_into(&mut a.routes, &mut b.routes, routes, &to.routes);
+    if *routes != to.routes {
+        let (l, r) = trim(routes.list(), to.routes.list());
+        a.routes = Routes::from_list(l);
+        b.routes = Routes::from_list(r);
+    }
     if *dhcp_server != to.dhcp_server {
         let (x, y) = trim(&dhcp_server.leases, &to.dhcp_server.leases);
         a.dhcp_server.leases = x;

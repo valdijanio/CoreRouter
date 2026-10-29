@@ -33,6 +33,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 
+#[cfg(doc)]
+use corerouter_model::routing_filter::PrependCount;
 use corerouter_model::routing_filter::{PrefixEntry, RoutingFilter};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
@@ -71,6 +73,8 @@ pub enum Set {
     Med(u32),
     /// Our AS this many times.
     Prepend(u32, u8),
+    /// The next hop (G3.9fh); the entry before it tests the family.
+    Gw(std::net::IpAddr),
     Comm(CommHow, Vec<u32>, String),
     Large(CommHow, Vec<Large>, String),
 }
@@ -83,6 +87,7 @@ impl Set {
             Set::Prepend(..) => 2,
             Set::Comm(..) => 3,
             Set::Large(..) => 4,
+            Set::Gw(_) => 5,
         }
     }
 }
@@ -242,6 +247,9 @@ struct Comp<'a> {
     chains: &'a HashMap<&'a str, &'a [Stmt]>,
     lists: &'a mut Lists,
     asn: Option<u32>,
+    /// Copies of our AS the session adds on its own and that a `set
+    /// bgp-path-prepend N` counts (G3.9fg: 1 on an eBGP output map).
+    counted: u8,
     items: Vec<Item>,
     labels: usize,
     entries: usize,
@@ -502,8 +510,12 @@ impl<'a> Comp<'a> {
         Some(match op {
             SetOp::LocalPref(v) => Set::LocalPref(*v),
             SetOp::Med(v) => Set::Med(*v),
+            SetOp::Gw(a) => Set::Gw(*a),
+            // G3.9fg: N copies in all, the session's own included; none
+            // left (N = 1 on eBGP), nothing to do.
+            SetOp::Prepend(n) if *n <= self.counted => return None,
             SetOp::Prepend(n) => match self.asn {
-                Some(a) => Set::Prepend(a, *n),
+                Some(a) => Set::Prepend(a, *n - self.counted),
                 None => {
                     self.problems.push("set bgp-path-prepend needs the chain's own AS: use it from connections of one BGP instance".into());
                     return None;
@@ -585,6 +597,22 @@ impl<'a> Comp<'a> {
                         // No such chain, a loop, too deep: reject (as eval).
                         _ => self.emit(Entry::reject()),
                     }
+                }
+                // G3.9fh: `set gw` changes routes of its family only: FRR
+                // would write an IPv6 next hop into an IPv4 route.
+                Stmt::Set(SetOp::Gw(a)) => {
+                    let fam = if a.is_ipv4() { Family::V4 } else { Family::V6 };
+                    let (lt, end) = (self.label(), self.label());
+                    self.cond(&Expr::Atom(Atom::Afi(fam)), lt, end);
+                    self.place(lt);
+                    self.emit(Entry {
+                        permit: true,
+                        matches: Vec::new(),
+                        sets: vec![Set::Gw(*a)],
+                        exit: Exit::Next,
+                        description: None,
+                    });
+                    self.place(end);
                 }
                 Stmt::Set(op) => {
                     if let Some(set) = self.set(op) {
@@ -783,12 +811,26 @@ pub fn compile(
     asn: Option<u32>,
     lists: &mut Lists,
 ) -> (Vec<Entry>, Vec<String>) {
+    compile_counted(filter, chains, chain, asn, 0, lists)
+}
+
+/// [`compile`] for a map whose session adds `counted` copies of our AS
+/// that `set bgp-path-prepend` counts ([`prepend_counted`]).
+pub fn compile_counted(
+    filter: &RoutingFilter,
+    chains: &HashMap<&str, &[Stmt]>,
+    chain: &str,
+    asn: Option<u32>,
+    counted: u8,
+    lists: &mut Lists,
+) -> (Vec<Entry>, Vec<String>) {
     let body = chains.get(chain).copied().unwrap_or(&[]);
     let mut c = Comp {
         filter,
         chains,
         lists,
         asn,
+        counted,
         items: Vec::new(),
         labels: 0,
         entries: 0,
@@ -847,6 +889,8 @@ fn set_line(s: &Set) -> Option<String> {
             }
             l
         }
+        Set::Gw(std::net::IpAddr::V4(a)) => format!("set ip next-hop {a}"),
+        Set::Gw(std::net::IpAddr::V6(a)) => format!("set ipv6 next-hop global {a}"),
         Set::Comm(CommHow::Set, v, _) if v.is_empty() => "set community none".into(),
         Set::Comm(CommHow::Set, v, _) => format!("set community {}", words(v)),
         Set::Comm(CommHow::Append, v, _) => format!("set community {} additive", words(v)),
@@ -877,7 +921,11 @@ fn match_line(m: &Match) -> String {
 
 /// FRR text of one compiled chain.
 pub fn map_text(chain: &str, entries: &[Entry], out: &mut String) {
-    let name = route_map(chain);
+    map_text_named(&route_map(chain), entries, out);
+}
+
+/// [`map_text`] under the route-map name `name`.
+pub fn map_text_named(name: &str, entries: &[Entry], out: &mut String) {
     let n = entries.len();
     for (i, e) in entries.iter().enumerate() {
         let _ = writeln!(
@@ -1013,6 +1061,64 @@ pub fn render_with(
     asn_of: &dyn Fn(&str) -> Option<u32>,
     prelude: &dyn Fn(&str) -> String,
 ) -> (String, Vec<Problem>) {
+    let legacy = Uses {
+        legacy: true,
+        ..Uses::default()
+    };
+    let (text, problems, _) = render_counted(filter, used, asn_of, prelude, &|_| legacy);
+    (text, problems)
+}
+
+/// How the connections use a chain, for the count of `set
+/// bgp-path-prepend` (G3.9fg).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Uses {
+    /// The output chain of an eBGP connection.
+    pub ebgp_out: bool,
+    /// Any other use: input or iBGP output.
+    pub other: bool,
+    /// A filter of an older build ([`PrependCount::Legacy`]): N copies on
+    /// top of whatever the session adds, everywhere.
+    pub legacy: bool,
+}
+
+/// `counted` for a map where `set bgp-path-prepend` does nothing: RouterOS
+/// 7.25 adds no copy on an iBGP output nor on input (**medido**, G3.9fg).
+pub const PREPEND_IGNORED: u8 = u8::MAX;
+
+impl Uses {
+    /// `counted` of the chain's own map and, when it needs one, of its map
+    /// for the eBGP outputs.
+    pub fn counted(self) -> (u8, Option<u8>) {
+        match (self.legacy, self.ebgp_out, self.other) {
+            (true, ..) => (0, None),
+            (false, true, false) => (1, None),
+            (false, false, _) => (PREPEND_IGNORED, None),
+            (false, true, true) => (PREPEND_IGNORED, Some(1)),
+        }
+    }
+}
+
+/// The route-map of `chain` on the output of an eBGP connection when the
+/// chain is used both ways ([`render_counted`]): `+` cannot be in a chain
+/// name, so it never meets another chain's map.
+pub fn route_map_ebgp_out(chain: &str) -> String {
+    format!("CR-{chain}+ebgp-out")
+}
+
+/// [`render_with`] with the count of `set bgp-path-prepend` of RouterOS
+/// (G3.9fg): on an eBGP output the copy eBGP adds counts (`set
+/// bgp-path-prepend 3` leaves with our AS 3 times); on input and iBGP
+/// outputs it does nothing. A chain used both ways gets a second map for
+/// the eBGP outputs, [`route_map_ebgp_out`], when that changes something.
+/// The third value: the chains that got one.
+pub fn render_counted(
+    filter: &RoutingFilter,
+    used: &BTreeSet<String>,
+    asn_of: &dyn Fn(&str) -> Option<u32>,
+    prelude: &dyn Fn(&str) -> String,
+    uses_of: &dyn Fn(&str) -> Uses,
+) -> (String, Vec<Problem>, BTreeSet<String>) {
     let (parsed, _) = parsed_chains(filter);
     let chains: HashMap<&str, &[Stmt]> = parsed
         .iter()
@@ -1033,27 +1139,41 @@ pub fn render_with(
     // parts merge): many chains go on threads.
     let asns: HashMap<&str, Option<u32>> = roots.iter().map(|n| (*n, asn_of(n))).collect();
     let preludes: HashMap<&str, String> = roots.iter().map(|n| (*n, prelude(n))).collect();
-    let part = |names: &[&str]| -> (Lists, String, Vec<Problem>) {
-        let (mut lists, mut maps, mut problems) = (Lists::default(), String::new(), Vec::new());
+    let uses: HashMap<&str, Uses> = roots.iter().map(|n| (*n, uses_of(n))).collect();
+    type Part = (Lists, String, Vec<Problem>, Vec<String>);
+    let part = |names: &[&str]| -> Part {
+        let (mut lists, mut maps, mut problems, mut variants) =
+            (Lists::default(), String::new(), Vec::new(), Vec::new());
         for name in names {
             let asn = asns.get(name).copied().flatten();
-            let (entries, probs) = compile(filter, &chains, name, asn, &mut lists);
+            let (counted, variant) = uses.get(name).copied().unwrap_or_default().counted();
+            let (entries, probs) = compile_counted(filter, &chains, name, asn, counted, &mut lists);
             problems.extend(probs.into_iter().map(|message| Problem {
                 item: format!("chain {name}"),
                 message,
             }));
-            if let Some(p) = preludes.get(name) {
-                maps.push_str(p);
+            let prelude = preludes.get(name).map_or("", String::as_str);
+            maps.push_str(prelude);
+            map_text_named(&route_map(name), &entries, &mut maps);
+            if let Some(c2) = variant {
+                // The same chain counting eBGP's copy; only when that
+                // changes something (a chain with a prepend).
+                let (e2, _) = compile_counted(filter, &chains, name, asn, c2, &mut lists);
+                if e2 != entries {
+                    maps.push_str(&prelude.replace(&route_map(name), &route_map_ebgp_out(name)));
+                    map_text_named(&route_map_ebgp_out(name), &e2, &mut maps);
+                    variants.push((*name).to_owned());
+                }
             }
-            map_text(name, &entries, &mut maps);
         }
-        (lists, maps, problems)
+        (lists, maps, problems, variants)
     };
-    let parts: Vec<(Lists, String, Vec<Problem>)> = render_parts(&roots, &part);
+    let parts: Vec<Part> = render_parts(&roots, &part);
     let mut lists = Lists::default();
     let mut maps = String::new();
     let mut problems = Vec::new();
-    for (l, m, p) in parts {
+    let mut variants = BTreeSet::new();
+    for (l, m, p, v) in parts {
         lists.prefix4.extend(l.prefix4);
         lists.prefix6.extend(l.prefix6);
         lists.aspath.extend(l.aspath);
@@ -1061,11 +1181,12 @@ pub fn render_with(
         lists.large.extend(l.large);
         maps.push_str(&m);
         problems.extend(p);
+        variants.extend(v);
     }
     let mut text = String::new();
     lists_text(&lists, &mut text);
     text.push_str(&maps);
-    (text, problems)
+    (text, problems, variants)
 }
 
 #[cfg(test)]
@@ -1220,6 +1341,7 @@ pub(crate) mod tests {
                 p.extend_from_slice(&r.as_path);
                 r.as_path = p;
             }
+            Set::Gw(a) => r.next_hop = Some(*a),
             Set::Comm(how, v, _) => change(*how, v, &mut r.communities),
             Set::Large(how, v, _) => change(*how, v, &mut r.large),
         }
@@ -1285,6 +1407,136 @@ pub(crate) mod tests {
         // The text reads back as an FRR tree.
         let conf = corerouter_model_free_parse(&text);
         assert!(conf > 5);
+    }
+
+    #[test]
+    fn set_gw_rewrites_the_next_hop_of_its_family_only() {
+        // G3.9fh: RouterOS 7.25 sends IPv6 over an IPv4 session with the
+        // next hop ::ffff:10.39.1.1, which the kernel does not install;
+        // the input chain writes the neighbor's IPv6 address over it.
+        let (v, _, text) = one(&[("in", "set gw fd39:1::1; accept")]);
+        assert!(text.contains(" match ipv6 address prefix-list "), "{text}");
+        assert!(
+            text.contains(" set ipv6 next-hop global fd39:1::1\n"),
+            "{text}"
+        );
+        assert!(!text.contains("set ip next-hop"), "{text}");
+        let lists = {
+            let mut l = Lists::default();
+            let f = filter(&[("in", "set gw fd39:1::1; accept")]);
+            let (parsed, _) = parsed_chains(&f);
+            let chains: HashMap<&str, &[Stmt]> = parsed
+                .iter()
+                .map(|(n, b)| (n.as_str(), b.as_slice()))
+                .collect();
+            let _ = compile(&f, &chains, "in", Some(65000), &mut l);
+            l
+        };
+        let r6 = Route::bgp("fd39:203::/48".parse().unwrap(), vec![65001]);
+        let got = frr_run(&v, &lists, &r6).unwrap();
+        assert_eq!(got.next_hop, Some("fd39:1::1".parse().unwrap()));
+        let r4 = Route::bgp("203.0.113.0/24".parse().unwrap(), vec![65001]);
+        assert_eq!(
+            frr_run(&v, &lists, &r4).unwrap().next_hop,
+            None,
+            "IPv4 routes keep theirs"
+        );
+        let (_, _, text) = one(&[("in", "set gw 10.39.1.1; accept")]);
+        assert!(text.contains(" set ip next-hop 10.39.1.1\n"), "{text}");
+        // The evaluator agrees.
+        let f = filter(&[("in", "set gw fd39:1::1; accept")]);
+        let (p, _) = Policy::build(&f);
+        assert_eq!(
+            p.eval(0, &r6, 65000).route.next_hop,
+            Some("fd39:1::1".parse().unwrap())
+        );
+        let o = p.eval(0, &r4, 65000);
+        assert!(o.accepted && !o.modified());
+        // What cannot be a next hop is refused where it is written.
+        for (rule, want) in [
+            ("set gw ::ffff:10.39.1.1", "IPv4-mapped"),
+            ("set gw fe80::1", "link-local"),
+            ("set gw ff02::1", "cannot be a next hop"),
+            ("set gw 0.0.0.0", "cannot be a next hop"),
+            ("set gw ether1", "expected an IPv4 or IPv6 address"),
+        ] {
+            let e = parse::parse(rule).unwrap_err().to_string();
+            assert!(e.contains(want) && e.contains("column 8"), "{rule}: {e}");
+        }
+        assert!(parse::parse("append gw 10.0.0.1").is_err());
+    }
+
+    #[test]
+    fn prepend_counts_the_copy_ebgp_adds_on_ebgp_outputs() {
+        // G3.9fg, RouterOS 7.25 CHR (measured): `set bgp-path-prepend N` on
+        // eBGP leaves with the AS N times in all; N = 1 adds nothing.
+        let f = filter(&[
+            (
+                "out",
+                "if (dst in 10.0.0.0/8) { set bgp-path-prepend 3; accept } set bgp-path-prepend 1; accept",
+            ),
+            ("plain", "set bgp-med 5; accept"),
+        ]);
+        let used: BTreeSet<String> = ["out".to_owned(), "plain".to_owned()].into();
+        let only_ebgp = |_: &str| Uses {
+            ebgp_out: true,
+            ..Uses::default()
+        };
+        let (text, problems, variants) =
+            render_counted(&f, &used, &|_| Some(65000), &|_| String::new(), &only_ebgp);
+        assert_eq!(problems, []);
+        assert!(variants.is_empty(), "{variants:?}");
+        assert!(
+            text.contains(" set as-path prepend 65000 65000\n"),
+            "{text}"
+        );
+        assert!(!text.contains("prepend 65000 65000 65000"), "{text}");
+        assert_eq!(
+            text.matches("set as-path prepend").count(),
+            1,
+            "N = 1: nothing\n{text}"
+        );
+        // On input and iBGP outputs RouterOS adds nothing (measured).
+        let other = |_: &str| Uses {
+            other: true,
+            ..Uses::default()
+        };
+        let (text, _, variants) =
+            render_counted(&f, &used, &|_| Some(65000), &|_| String::new(), &other);
+        assert!(variants.is_empty());
+        assert!(!text.contains("prepend"), "{text}");
+        // A legacy filter: N on top of what the session adds, everywhere.
+        let legacy = |_: &str| Uses {
+            ebgp_out: true,
+            other: true,
+            legacy: true,
+        };
+        let (text, _, variants) =
+            render_counted(&f, &used, &|_| Some(65000), &|_| String::new(), &legacy);
+        assert!(variants.is_empty());
+        assert!(
+            text.contains(" set as-path prepend 65000 65000 65000\n"),
+            "{text}"
+        );
+        assert!(text.contains(" set as-path prepend 65000\n"), "{text}");
+        // Both: a second map for the eBGP outputs, only for the chain
+        // whose prepend differs.
+        let both = |_: &str| Uses {
+            ebgp_out: true,
+            other: true,
+            legacy: false,
+        };
+        let (text, _, variants) =
+            render_counted(&f, &used, &|_| Some(65000), &|_| String::new(), &both);
+        assert_eq!(variants, BTreeSet::from(["out".to_owned()]));
+        assert!(text.contains("route-map CR-out permit"), "{text}");
+        assert!(
+            text.contains(&format!("route-map {} permit", route_map_ebgp_out("out"))),
+            "{text}"
+        );
+        assert!(!text.contains("CR-plain+"), "{text}");
+        // `+` is not in a chain name: no other chain can own that map.
+        assert!(parse::check_chain("out+ebgp-out").is_err());
     }
 
     /// Lines that open a context (no leading space), as a sanity check
@@ -1406,6 +1658,8 @@ pub(crate) mod tests {
             (0u32..300).prop_map(|n| format!("set bgp-local-pref {n}")),
             (0u32..300).prop_map(|n| format!("set bgp-med {n}")),
             (1u8..4).prop_map(|n| format!("set bgp-path-prepend {n}")),
+            prop_oneof![Just("set gw 192.0.2.9"), Just("set gw 2001:db8::9")]
+                .prop_map(str::to_owned),
             Just("set bgp-communities 65000:1".to_owned()),
             Just("set bgp-communities none".to_owned()),
             Just("append bgp-communities 65000:2,no-export".to_owned()),
@@ -1488,6 +1742,7 @@ pub(crate) mod tests {
             main in prop::collection::vec(stmt(), 1..4),
             sub in prop::collection::vec(stmt(), 0..3),
             routes in prop::collection::vec(route(), 1..12),
+            counted in prop_oneof![Just(0u8), Just(1u8), Just(PREPEND_IGNORED)],
         ) {
             let main_text = main.join("; ");
             let mut rules = vec![("in", main_text.as_str())];
@@ -1501,13 +1756,14 @@ pub(crate) mod tests {
             let (parsed, _) = parsed_chains(&f);
             let chains: HashMap<&str, &[Stmt]> = parsed.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect();
             let mut lists = Lists::default();
-            let (v, probs) = compile(&f, &chains, "in", Some(65000), &mut lists);
+            // G3.9fg: an eBGP output map (counted = 1) and any other.
+            let (v, probs) = compile_counted(&f, &chains, "in", Some(65000), counted, &mut lists);
             prop_assert!(probs.is_empty(), "{:?}", probs);
             prop_assert!(v.len() <= MAX_ENTRIES);
             prop_assert!(v.last().is_some_and(|e| !e.permit && e.always()));
             let c = policy.chain("in").unwrap();
             for r in &routes {
-                let want = policy.eval(c, r, 65000);
+                let want = policy.eval_counted(c, r, 65000, counted);
                 let got = frr_run(&v, &lists, r);
                 prop_assert_eq!(got.is_some(), want.accepted, "{}\n{:?}\n{:#?}", main_text, r, v);
                 if let Some(g) = got {

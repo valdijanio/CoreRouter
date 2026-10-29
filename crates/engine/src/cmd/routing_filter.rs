@@ -15,7 +15,7 @@ use std::time::Instant;
 use corerouter_model::bgp::{BgpConnection, LocalRole, resolve_templates};
 use corerouter_model::routing_filter::{
     CommunityList, FilterRule, MAX_COMMUNITIES, MAX_LISTS, MAX_PREFIX_ENTRIES, MAX_RULES, PrefixEntry,
-    PrefixList, RoutingFilter,
+    PrefixList, PrependCount, RoutingFilter,
 };
 use corerouter_model::types::ItemId;
 use corerouter_model::{Config, Routing};
@@ -84,6 +84,9 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "routing.filter.community-list.check", "Check Community List", [], None,
         "{id?: string (the list being edited), name?: string, communities?: [string] | string, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk}",
         always, clist_check),
+    cmd!("routing.filter.prepend.set", "Set Prepend Count", ["Routing", "Filters"], None,
+        "{count: routeros | legacy (routeros: set bgp-path-prepend N leaves over eBGP with our AS N times in all, as RouterOS v7; legacy: N + 1, the count of filters written before G3.9fg), keep_paths?: bool (default true: rewrite N where that keeps what eBGP neighbors get)} → {count, previous, rewritten: [{id, chain, from, to}], left: [{id, chain, message}]}",
+        always, prepend_set),
     cmd!(query "routing.filter.status", "Filter Status", ["Routing", "Filters"], None,
         "{} → {chains: [{chain, rules, enabled, used_in: [connection], used_out: [connection], errors}], rfc8212: [{connection, remote_address, remote_as?, missing: [in | out], message}]}",
         always, status),
@@ -228,6 +231,155 @@ fn rule_move(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "id": id, "position": to }))
 }
 
+/// The chains a connection runs, each with how it is used, the chains
+/// they jump to included (G3.9fg): (on an eBGP output, anywhere else).
+fn chain_uses(routing: &Routing) -> BTreeMap<String, (bool, bool)> {
+    let resolved = resolve_templates(&routing.bgp_templates);
+    let (parsed, _) = eval::parsed_chains(&routing.filter);
+    let bodies: BTreeMap<&str, &[Stmt]> = parsed.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect();
+    let mut out: BTreeMap<String, (bool, bool)> = BTreeMap::new();
+    let mut mark = |root: &str, ebgp_out: bool| {
+        // Breadth-first over the jumps; each chain once per root.
+        let mut seen: Vec<String> = vec![root.to_owned()];
+        let mut i = 0;
+        while let Some(name) = seen.get(i).cloned() {
+            i += 1;
+            let e = out.entry(name.clone()).or_default();
+            if ebgp_out {
+                e.0 = true;
+            } else {
+                e.1 = true;
+            }
+            let mut next = Vec::new();
+            if let Some(b) = bodies.get(name.as_str()) {
+                eval::jumps(b, &mut next);
+            }
+            for n in next {
+                if !seen.contains(&n) {
+                    seen.push(n);
+                }
+            }
+        }
+    };
+    for c in routing.bgp_connections.values() {
+        let Ok(eff) = c.effective(&resolved) else { continue };
+        let ebgp = is_ebgp(routing, c, eff.local_role, eff.remote_as);
+        if let Some(ch) = &eff.input_filter {
+            mark(ch, false);
+        }
+        if let Some(ch) = &eff.output_filter {
+            mark(ch, ebgp);
+        }
+    }
+    out
+}
+
+/// The counts of `set bgp-path-prepend` in a rule's text, with where
+/// each number sits.
+fn prepend_counts(rule: &str) -> Vec<(usize, usize, u8)> {
+    const KEY: &str = "bgp-path-prepend";
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = rule.get(from..).and_then(|t| t.find(KEY)) {
+        let after = from + i + KEY.len();
+        let rest = rule.get(after..).unwrap_or("");
+        let ws = rest.len() - rest.trim_start().len();
+        let digits: String = rest.trim_start().chars().take_while(char::is_ascii_digit).collect();
+        if let Ok(n) = digits.parse::<u8>() {
+            out.push((after + ws, after + ws + digits.len(), n));
+        }
+        from = after;
+    }
+    out
+}
+
+fn prepend_set(s: &mut Session, p: &Value) -> Result<Value> {
+    let count = match req_str(p, "count")? {
+        "routeros" => PrependCount::RouterOs,
+        "legacy" => PrependCount::Legacy,
+        o => return Err(EngineError::bad("count", format!("{:?}: routeros or legacy", cut(o)))),
+    };
+    let keep = opt_bool(p, "keep_paths")?.unwrap_or(true);
+    let routing = &s.store().candidate().routing;
+    let previous = routing.filter.prepend;
+    let uses = chain_uses(routing);
+    let mut rewritten = Vec::new();
+    let mut left = Vec::new();
+    let mut texts: Vec<(usize, String)> = Vec::new();
+    if keep && count != previous {
+        // Legacy → RouterOS: an eBGP output keeps its path with N + 1;
+        // RouterOS → legacy: with N − 1. Elsewhere both counts agree.
+        let up = count == PrependCount::RouterOs;
+        for (i, r) in routing.filter.rules.iter().enumerate() {
+            let counts = prepend_counts(&r.rule);
+            if counts.is_empty() {
+                continue;
+            }
+            let (ebgp_out, other) = uses.get(&r.chain).copied().unwrap_or_default();
+            if other {
+                // RouterOS adds nothing on input or iBGP output; legacy N.
+                let what = if up { "stops adding" } else { "starts adding" };
+                let also = if ebgp_out { " (it also runs on eBGP outputs: give them a chain of their own)" } else { "" };
+                left.push(json!({"id": r.id, "chain": r.chain, "message": format!(
+                    "chain {} runs on input or an iBGP output, where set bgp-path-prepend {what} copies of our AS after the switch (RouterOS v7 ignores it there){also}",
+                    r.chain)}));
+                continue;
+            }
+            if !ebgp_out {
+                continue;
+            }
+            let mut text = r.rule.clone();
+            let mut ok = true;
+            let mut changes = Vec::new();
+            for (a, b, n) in counts.iter().rev() {
+                let m = if up { n.checked_add(1).filter(|m| *m <= parse::MAX_PREPEND) } else { n.checked_sub(1).filter(|m| *m >= 1) };
+                let Some(m) = m else {
+                    ok = false;
+                    break;
+                };
+                text.replace_range(*a..*b, &m.to_string());
+                changes.push((*n, m));
+            }
+            if !ok {
+                left.push(json!({"id": r.id, "chain": r.chain, "message": if up {
+                    format!("bgp-path-prepend {} is the most (16): this rule's eBGP neighbors get our AS once less after the switch", parse::MAX_PREPEND)
+                } else {
+                    "bgp-path-prepend 1 adds nothing on eBGP with RouterOS's count and one copy with the legacy one: remove the action to keep the path".to_owned()
+                }}));
+                continue;
+            }
+            changes.reverse();
+            for (from, to) in changes {
+                rewritten.push(json!({"id": r.id, "chain": r.chain, "from": from, "to": to}));
+            }
+            texts.push((i, text));
+        }
+    }
+    let f = filter_mut(s);
+    for (i, text) in texts {
+        if let Some(r) = f.rules.get_mut(i) {
+            r.rule = text;
+        }
+    }
+    f.prepend = count;
+    Ok(json!({"count": prepend_name(count), "previous": prepend_name(previous), "rewritten": rewritten, "left": left}))
+}
+
+fn prepend_name(c: PrependCount) -> &'static str {
+    match c {
+        PrependCount::RouterOs => "routeros",
+        PrependCount::Legacy => "legacy",
+    }
+}
+
+/// G3.9fg: a filter from before the RouterOS count that prepends says so.
+pub(crate) fn prepend_warning(f: &RoutingFilter) -> Option<String> {
+    let n = f.rules.iter().filter(|r| !prepend_counts(&r.rule).is_empty()).count();
+    (f.prepend == PrependCount::Legacy && n > 0).then(|| format!(
+        "{n} rule(s) use set bgp-path-prepend with the legacy count (N + 1 copies of our AS over eBGP; RouterOS v7 sends N): routing.filter.prepend.set {{\"count\":\"routeros\"}} switches and rewrites N to keep the paths"
+    ))
+}
+
 /// What a rule tests and does, for the chips of the list.
 fn summary(stmts: &[Stmt]) -> (Vec<String>, Vec<String>, &'static str) {
     fn atoms(e: &Expr, out: &mut Vec<String>) {
@@ -282,6 +434,7 @@ fn summary(stmts: &[Stmt]) -> (Vec<String>, Vec<String>, &'static str) {
                         SetOp::LocalPref(v) => format!("local-pref {v}"),
                         SetOp::Med(v) => format!("med {v}"),
                         SetOp::Prepend(n) => format!("prepend {n}"),
+                        SetOp::Gw(g) => format!("gw {g}"),
                         SetOp::Comm { large, how, .. } => format!(
                             "{} {}",
                             match how {
@@ -679,7 +832,7 @@ fn status(s: &mut Session, _: &Value) -> Result<Value> {
             json!({"chain": name, "rules": rules, "enabled": enabled, "used_in": used_in, "used_out": used_out, "errors": errors})
         })
         .collect();
-    Ok(json!({ "chains": rows, "rfc8212": rfc8212(routing) }))
+    Ok(json!({ "chains": rows, "rfc8212": rfc8212(routing), "prepend": prepend_name(f.prepend), "prepend_warning": prepend_warning(f) }))
 }
 
 // ---- preview ----
@@ -772,6 +925,11 @@ fn describe_change(a: &Route, b: &Route) -> String {
     {
         out.push(format!("med {v}"));
     }
+    if a.next_hop != b.next_hop
+        && let Some(g) = b.next_hop
+    {
+        out.push(format!("gw {g}"));
+    }
     if b.as_path.len() > a.as_path.len() {
         let added: Vec<String> = b.as_path.iter().take(b.as_path.len() - a.as_path.len()).map(ToString::to_string).collect();
         out.push(format!("prepend {}", added.join(" ")));
@@ -815,6 +973,18 @@ fn chain_of(cfg: &Config, name: &str, dir: Dir) -> Option<(Option<String>, bool,
     let mut c = c.clone();
     c.params.remote_as = eff.remote_as;
     Some((chain, ebgp, c, asn))
+}
+
+/// Copies of our AS a `set bgp-path-prepend` counts on `dir` of an
+/// (e)BGP connection under `cfg` (G3.9fg): RouterOS's count includes the
+/// one eBGP adds on output and adds nothing on input or iBGP output; a
+/// legacy filter adds N on top of what the session adds, everywhere.
+fn counted(cfg: &Config, dir: Dir, ebgp: bool) -> u8 {
+    match (cfg.routing.filter.prepend, dir, ebgp) {
+        (PrependCount::Legacy, ..) => 0,
+        (PrependCount::RouterOs, Dir::Out, true) => 1,
+        (PrependCount::RouterOs, ..) => corerouter_proto_bgp::filter::frr::PREPEND_IGNORED,
+    }
 }
 
 fn opt_dir(p: &Value) -> Result<Dir> {
@@ -868,9 +1038,9 @@ fn preview(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let (nc, n_without) = side(&new_policy, &new_chain);
     let (oc, o_without) = side(&old_policy, &old_chain);
-    let new_side = Side { policy: &new_policy, chain: nc, accept_without: n_without, asn };
+    let new_side = Side { policy: &new_policy, chain: nc, accept_without: n_without, asn, counted: counted(&cand, dir, ebgp) };
     let compared = old_chain.as_ref().is_some_and(|c| old_policy.chain(c).is_some()) || conn_name.is_some();
-    let old_side = Side { policy: &old_policy, chain: oc, accept_without: o_without, asn };
+    let old_side = Side { policy: &old_policy, chain: oc, accept_without: o_without, asn, counted: counted(&running, dir, ebgp) };
     let src = routes_for(s, conn.as_ref(), dir);
     let threads = opt_u32(p, "threads")?.map_or_else(|| eval::threads_for(src.routes.len()), |t| t.clamp(1, 64) as usize);
     let t0 = Instant::now();
@@ -920,8 +1090,8 @@ pub(crate) fn impact_rows(s: &mut Session) -> Vec<Value> {
             if conn.disabled {
                 continue;
             }
-            let new_side = Side { policy: &new_policy, chain: nch.as_deref().and_then(|c| new_policy.chain(c)), accept_without: nch.is_none() && !ebgp, asn };
-            let old_side = Side { policy: &old_policy, chain: och.as_deref().and_then(|c| old_policy.chain(c)), accept_without: och.is_none() && !ebgp, asn };
+            let new_side = Side { policy: &new_policy, chain: nch.as_deref().and_then(|c| new_policy.chain(c)), accept_without: nch.is_none() && !ebgp, asn, counted: counted(&cand, dir, ebgp) };
+            let old_side = Side { policy: &old_policy, chain: och.as_deref().and_then(|c| old_policy.chain(c)), accept_without: och.is_none() && !ebgp, asn, counted: counted(&running, dir, ebgp) };
             let src = routes_for(s, Some(&conn), dir);
             let pv = eval::preview(&new_side, Some(&old_side), &src.routes, 0, eval::threads_for(src.routes.len()));
             if pv.newly_rejected == 0 && pv.newly_accepted == 0 && pv.attrs_changed == 0 && !src.pending {
@@ -1098,6 +1268,16 @@ fn rule_check(s: &mut Session, raw: &Value) -> Result<Value> {
                 "rule",
             ));
         }
+        // G3.9fg: RouterOS's count, or the legacy one of an older filter.
+        if !prepend_counts(&r.rule).is_empty() {
+            let (_, other) = chain_uses(&cfg.routing).get(&r.chain).copied().unwrap_or_default();
+            let (level, msg) = match cfg.routing.filter.prepend {
+                PrependCount::RouterOs if other => ("warning", "set bgp-path-prepend does nothing on input nor on an iBGP output, as on RouterOS v7: this chain runs there".to_owned()),
+                PrependCount::RouterOs => ("info", "set bgp-path-prepend N: over eBGP the route leaves with our AS N times in all, the copy eBGP adds included (RouterOS v7)".to_owned()),
+                PrependCount::Legacy => ("warning", "this filter uses the legacy count: over eBGP the route leaves with our AS N + 1 times (RouterOS v7 sends N); routing.filter.prepend.set {\"count\":\"routeros\"} switches and keeps the paths".to_owned()),
+            };
+            checks.push(check(level, "prepend-count", msg, "rule"));
+        }
         if v == "none" {
             checks.push(check(
                 "info",
@@ -1128,9 +1308,9 @@ fn rule_check(s: &mut Session, raw: &Value) -> Result<Value> {
             .find(|c| c.params.input_filter.as_deref() == Some(r.chain.as_str()))
             .cloned();
         let asn = cfg.routing.bgp.values().next().map_or(0, |i| i.asn.0);
-        let ns = Side { policy: &new_policy, chain: new_policy.chain(&r.chain), accept_without: false, asn };
+        let ns = Side { policy: &new_policy, chain: new_policy.chain(&r.chain), accept_without: false, asn, counted: 0 };
         let oc = old_policy.chain(&r.chain);
-        let os = Side { policy: &old_policy, chain: oc, accept_without: false, asn };
+        let os = Side { policy: &old_policy, chain: oc, accept_without: false, asn, counted: 0 };
         let src = routes_for(s, user.as_ref(), Dir::In);
         let pv = eval::preview(&ns, oc.is_some().then_some(&os), &src.routes, 0, eval::threads_for(src.routes.len()));
         computed.push(json!({"label": "Chain passes", "value": format!("{} of {} routes ({})", pv.accepted, pv.total, src.source)}));
@@ -1189,7 +1369,8 @@ mod tests {
             "  neighbor 192.0.2.1 route-map CR-up-in in\n",
             "  neighbor 192.0.2.1 route-map CR-up-out out\n",
             "ip prefix-list CR-L-bogons seq 5 permit 10.0.0.0/8 le 32\n",
-            " set as-path prepend 65000 65000\n",
+            // G3.9fg: prepend 2 to an eBGP neighbor is 2 in all.
+            " set as-path prepend 65000\n",
             "bgp community-list standard CR-C-",
         ] {
             assert!(text.contains(want), "{want:?}\n{text}");
@@ -1275,6 +1456,77 @@ mod tests {
         assert!(text.contains("route-map CR-up-in deny 1\n match rpki invalid\nexit\nroute-map CR-up-in permit 10\n"), "{text}");
         // The chain carries it: no CR-RPKI-IN on this neighbor.
         assert!(!text.contains("192.0.2.1 route-map CR-RPKI-IN"), "{text}");
+    }
+
+    #[test]
+    fn prepend_count_of_an_older_filter_is_kept_until_switched() {
+        // G3.9fg: a filter from an older build reads as legacy (N + 1 over
+        // eBGP); switching keeps the paths by rewriting N where it can.
+        let mut s = session();
+        s.execute("routing.bgp.connection.add", &json!({"name": "up2", "remote_address": "192.0.2.5", "remote_as": 64501})).unwrap();
+        s.execute("routing.bgp.connection.add", &json!({"name": "rr1", "remote_address": "10.0.0.2", "remote_as": 65000})).unwrap();
+        for (chain, rule) in [
+            ("up-out", "if (dst in 10.0.0.0/8) { set bgp-path-prepend 2; accept } accept"),
+            ("up-out", "set bgp-path-prepend 16; accept"),
+            ("both", "set bgp-path-prepend 1; accept"),
+            ("in", "set bgp-path-prepend 3; accept"),
+        ] {
+            s.execute("routing.filter.rule.add", &json!({"chain": chain, "rule": rule})).unwrap();
+        }
+        s.execute("routing.bgp.connection.set", &json!({"id": "up1", "input_filter": "in", "output_filter": "up-out"})).unwrap();
+        s.execute("routing.bgp.connection.set", &json!({"id": "up2", "input_filter": "in", "output_filter": "both"})).unwrap();
+        s.execute("routing.bgp.connection.set", &json!({"id": "rr1", "output_filter": "both"})).unwrap();
+        let st = s.execute("routing.filter.status", &json!({})).unwrap();
+        assert_eq!(st["prepend"], "routeros");
+        assert_eq!(st["prepend_warning"], Value::Null);
+        // As a file of an older build reads it.
+        s.execute("config.mode.set", &json!({"mode": "transactional"})).unwrap();
+        s.store_mut().candidate_mut().routing.filter.prepend = PrependCount::Legacy;
+        let st = s.execute("routing.filter.status", &json!({})).unwrap();
+        assert_eq!(st["prepend"], "legacy");
+        assert!(st["prepend_warning"].as_str().unwrap().contains("4 rule(s)"), "{st}");
+        let ids: Vec<String> = s.store().candidate().routing.filter.rules.iter().map(|r| r.id.to_string()).collect();
+        let c = s.execute("routing.filter.rule.check", &json!({"id": ids[0]})).unwrap();
+        assert!(c["checks"].as_array().unwrap().iter().any(|c| c["check"] == "prepend-count" && c["level"] == "warning"), "{c}");
+        // Legacy over eBGP: 2 on top of eBGP's copy.
+        let before = corerouter_proto_bgp::render_all(&s.store().candidate().routing, &|_| None).unwrap();
+        assert!(before.contains(" set as-path prepend 65000 65000\n"), "{before}");
+        let out = s.execute("routing.filter.prepend.set", &json!({"count": "routeros"})).unwrap();
+        assert_eq!(out["previous"], "legacy");
+        // 2 → 3 on the eBGP-only chain; 16 cannot grow; on input and iBGP
+        // outputs RouterOS adds nothing, so those are listed to look at.
+        assert_eq!(out["rewritten"], json!([{"id": ids[0], "chain": "up-out", "from": 2, "to": 3}]), "{out}");
+        let left: Vec<&str> = out["left"].as_array().unwrap().iter().map(|l| l["id"].as_str().unwrap()).collect();
+        assert_eq!(left, [ids[1].as_str(), ids[2].as_str(), ids[3].as_str()], "{out}");
+        assert!(out["left"][1]["message"].as_str().unwrap().contains("give them a chain of their own"), "{out}");
+        let c = s.execute("routing.filter.rule.check", &json!({"id": ids[3]})).unwrap();
+        assert!(c["checks"].as_array().unwrap().iter().any(|c| c["check"] == "prepend-count" && c["message"].as_str().unwrap().contains("does nothing on input")), "{c}");
+        let rules = &s.store().candidate().routing.filter.rules;
+        assert_eq!(rules[0].rule, "if (dst in 10.0.0.0/8) { set bgp-path-prepend 3; accept } accept");
+        assert_eq!(rules[3].rule, "set bgp-path-prepend 3; accept");
+        assert_eq!(s.store().candidate().routing.filter.prepend, PrependCount::RouterOs);
+        // What the eBGP neighbor of up-out gets is unchanged: 2 on top.
+        let after = corerouter_proto_bgp::render_all(&s.store().candidate().routing, &|_| None).unwrap();
+        assert!(after.contains(" set as-path prepend 65000 65000\n"), "{after}");
+        // The preview of the eBGP output counts eBGP's copy.
+        let st = s.execute("routing.filter.status", &json!({})).unwrap();
+        assert_eq!(st["prepend_warning"], Value::Null);
+        // Bad count: refused, nothing changes.
+        let e = s.execute("routing.filter.prepend.set", &json!({"count": "cisco"})).unwrap_err();
+        assert!(e.to_string().contains("routeros or legacy"), "{e}");
+        s.execute("config.discard", &json!({})).unwrap();
+        assert_eq!(s.store().candidate().routing.filter.rules[0].rule, "if (dst in 10.0.0.0/8) { set bgp-path-prepend 2; accept } accept");
+    }
+
+    #[test]
+    fn preview_of_an_ebgp_output_counts_ebgps_copy() {
+        let mut s = session();
+        s.execute("routing.filter.rule.add", &json!({"chain": "out", "rule": "set bgp-path-prepend 3; accept"})).unwrap();
+        s.execute("routing.bgp.connection.set", &json!({"id": "up1", "output_filter": "out"})).unwrap();
+        let pv = s.execute("routing.filter.preview", &json!({"connection": "up1", "direction": "out", "limit": 3})).unwrap();
+        let row = pv["rows"].as_array().unwrap().iter().find(|r| r["change"].is_string()).unwrap().clone();
+        // The chain adds 2: eBGP adds the third (G3.9fg).
+        assert!(row["change"].as_str().unwrap().contains("prepend 65000 65000") && !row["change"].as_str().unwrap().contains("prepend 65000 65000 65000"), "{row}");
     }
 
     #[test]

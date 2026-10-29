@@ -189,16 +189,22 @@ fn preview(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let moved: Vec<Ipv4Addr> = corerouter_firewall::cgnat::remapped(&from, &to);
     o.insert("remapped".into(), json!(moved.len()));
-    let killed = match s.connections(false) {
-        Ok((conns, _)) => conns
-            .iter()
-            .filter(|c| c.has(status::SRC_NAT))
-            .filter(|c| matches!(c.orig.src, IpAddr::V4(a) if moved.binary_search(&a).is_ok()))
-            .count(),
-        Err(_) => 0,
-    };
-    o.insert("connections".into(), json!(killed));
-    Ok(out)
+    // The table is read and counted after the lock (G0.31c).
+    let source = s.connection_source().ok();
+    s.defer(move || {
+        let killed = match source.map(|src| src.read()) {
+            Some(Ok((conns, _))) => conns
+                .iter()
+                .filter(|c| c.has(status::SRC_NAT))
+                .filter(|c| matches!(c.orig.src, IpAddr::V4(a) if moved.binary_search(&a).is_ok()))
+                .count(),
+            _ => 0,
+        };
+        if let Some(o) = out.as_object_mut() {
+            o.insert("connections".into(), json!(killed));
+        }
+        Ok(out)
+    })
 }
 
 #[cfg(test)]

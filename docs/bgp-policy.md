@@ -31,10 +31,61 @@ corerouter-cli run routing.filter.impact
 | `routing.filter.preview` | — (o RouterOS não tem prévia) |
 | `routing.filter.impact` | — |
 | `routing.filter.status` | — (chains, quem usa, e as conexões eBGP sem chain) |
+| `routing.filter.prepend.set` | — (G3.9fg: a contagem do `bgp-path-prepend` de um filtro antigo) |
 
 Na GUI: **Routing › Filters** (abas Rules, Prefix Lists, Community Lists, Preview; aviso RFC 8212 e
 impacto do commit em cima) e, em Routing › BGP, a página **Filters** do modal da conexão e do
 template (Input Filter, Output Filter, Keep Received).
+
+## `set bgp-path-prepend N` (G3.9fg)
+
+Como no RouterOS v7: para um vizinho eBGP a rota sai com o nosso AS **N vezes no total**, a cópia
+que o eBGP sempre põe incluída. `set bgp-path-prepend 3` sai `65000 65000 65000`; N = 1 não muda
+nada. Na entrada e na saída iBGP o RouterOS não põe cópia nenhuma, e o CoreRouter também não (o
+`rule.check` avisa `prepend-count`). Tudo **medido** no RouterOS 7.25 CHR,
+`scripts/routeros-interop-bgp.sh prepend`: N = 1, 2, 3 no eBGP → 1, 2, 3 cópias; no iBGP e na
+entrada → 0.
+
+No FRR, `set as-path prepend` põe as cópias antes da do eBGP. O render faz a conta: o mapa de
+saída de uma conexão eBGP põe N − 1, e o de entrada ou de saída iBGP não põe nada. Uma chain usada
+nos dois lugares ganha um segundo mapa só para as saídas eBGP, `CR-<chain>+ebgp-out` (o `+` não
+cabe num nome de chain).
+A prévia (`routing.filter.preview`, `impact`) mostra a mesma conta: o caminho que a chain entrega,
+antes da cópia do eBGP.
+
+**Configs antigas não mudam sozinhas.** Até a G3.9fg o CoreRouter punha N além da cópia do eBGP
+(N + 1). Um filtro gravado por uma versão anterior não tem o campo `prepend` e é lido como
+`legacy`, com a contagem antiga: depois da atualização o roteador manda os mesmos caminhos de
+antes. `routing.filter.status` traz `prepend` e `prepend_warning`, o `routing.filter.rule.check`
+avisa (`prepend-count`) e a janela Routing › Filters mostra o selo **Prepend count** com o botão
+**Use RouterOS count**, que roda:
+
+```sh
+corerouter-cli run routing.filter.prepend.set '{"count":"routeros"}'
+```
+
+Com `keep_paths` (padrão), ele reescreve N para N + 1 nas chains que só saem por eBGP, para o
+vizinho continuar recebendo o mesmo caminho, e lista em `left` o que não dá para manter: chain
+usada na entrada ou numa saída iBGP, onde o prepend deixa de fazer efeito (com a contagem antiga
+punha N), e N já em 16. Em
+modo transacional, `routing.filter.impact` mostra o efeito antes do commit. Filtros novos já
+nascem com a contagem do RouterOS.
+
+## `set gw` (G3.9fh)
+
+Como o `gw` do RouterOS v7: troca o next hop das rotas da família do endereço (IPv4 → `set ip
+next-hop`, IPv6 → `set ipv6 next-hop global` no FRR); as da outra família passam sem mudar. O
+caso que motivou: o RouterOS 7.25 manda IPv6 numa sessão IPv4 com o next hop IPv4-mapeado
+`::ffff:a.b.c.d`, que nenhum kernel instala (RFC 2545 §3 pede um IPv6 global). Na chain de
+entrada dessa conexão:
+
+```sh
+corerouter-cli run routing.filter.rule.add '{"chain":"chr-in","rule":"if (afi ipv6) { set gw fd39:1::1 } accept"}'
+```
+
+Recusa na hora o que não serve de next hop: mapeado (`::ffff:…`), link-local (precisaria da
+interface), multicast, loopback e não especificado. `routing.bgp.connection.check` avisa
+(`mpbgp-nexthop`) numa conexão IPv4 com `afi=ipv6` cuja chain de entrada não reescreve o next hop.
 
 ## A linguagem
 
@@ -43,6 +94,7 @@ rule    := stmt*
 stmt    := if (expr) { stmt* } [else { stmt* } | else if …] | action [;]
 action  := accept | reject | return | jump CHAIN
          | set bgp-local-pref N | set bgp-med N | set bgp-path-prepend 1..16
+         | set gw ENDEREÇO   (G3.9fh: next hop; só nas rotas da família do endereço)
          | set|append|delete bgp-communities VALORES|LISTA   (set … none apaga todas)
          | set|append|delete bgp-large-communities VALORES|LISTA
 expr    := expr || expr | expr && expr | not expr | ! expr | (expr) | matcher

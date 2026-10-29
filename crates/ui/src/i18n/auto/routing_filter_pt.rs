@@ -42,12 +42,14 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Prefix"##, r##"Prefixo"##),
     (r##"Prefix List"##, r##"Lista de prefixos"##),
     (r##"Prefix Lists"##, r##"Listas de prefixos"##),
+    (r##"Prepend count"##, r##"Contagem do prepend"##),
     (r##"Preview"##, r##"Prévia"##),
     (r##"Reading the routes from FRR…"##, r##"Lendo as rotas do FRR…"##),
     (r##"Rule"##, r##"Regra"##),
     (r##"Rules"##, r##"Regras"##),
     (r##"Run Preview"##, r##"Rodar prévia"##),
     (r##"Up"##, r##"Subir"##),
+    (r##"Use RouterOS count"##, r##"Usar a contagem do RouterOS"##),
     (r##"Used By"##, r##"Usada por"##),
     (r##"Verdict"##, r##"Resultado"##),
     (r##"Which routes the chain lets through"##, r##"Quais rotas a chain deixa passar"##),
@@ -94,6 +96,11 @@ As chains cujas regras usam esta lista. Uma lista em uso não pode ser removida 
 Uma lista de prefixos com nome. Separe as entradas com vírgula ou quebra de linha."##),
     (r##"filter.prefix_list.entries"##, r##"## O que é
 Prefixos com uma faixa de tamanho opcional (forma do FRR/Cisco): `10.0.0.0/8` casa só esse prefixo; `10.0.0.0/8 le 24`, ele e os mais específicos até /24; `0.0.0.0/0 ge 25`, qualquer prefixo IPv4 /25 ou maior."##),
+    (r##"filter.prepend"##, r##"## O que é
+`set bgp-path-prepend N` repete o nosso AS no caminho. No RouterOS v7 a rota sai para um vizinho eBGP com o AS N vezes no total (a cópia que o eBGP sempre põe conta): `set bgp-path-prepend 3` sai `65000 65000 65000`, e N = 1 não muda nada; na entrada e na saída iBGP não põe nada (**medido** no RouterOS 7.25 CHR). Filtros escritos antes da G3.9fg contavam N além dessa cópia (N + 1 no total) e continuam assim até você trocar.
+
+## O que fazer
+**Usar a contagem do RouterOS** troca e reescreve N para N + 1 nas chains que só saem por eBGP, para o vizinho continuar recebendo o mesmo caminho; o resultado lista o que não deu para manter (chain usada na entrada ou no iBGP, onde o prepend deixa de valer; N já em 16). Em modo transacional, veja o Impacto do commit antes de confirmar."##),
     (r##"filter.preview.as_path"##, r##"## O que é
 O caminho de AS da rota, o vizinho primeiro."##),
     (r##"filter.preview.before"##, r##"## O que é
@@ -117,7 +124,7 @@ Escreva as chains (Regras) e escolha o Filtro de entrada e o Filtro de saída da
 Uma regra na linguagem do RouterOS v7: `if (dst in bogons || dst-len > 24) { reject }`, `if (bgp-as-path "^64500_") { set bgp-local-pref 200; accept }`. A prévia abaixo conta quantas rotas a chain deixa passar com esta mudança.
 
 ## Linguagem
-Condições: `dst in|==|!=`, `dst-len`, `afi`, `protocol`, `bgp-as-path` (regex do FRR/Cisco, `_` é separador), `bgp-communities` e `bgp-large-communities` com `includes`, `any`, `equal` (e `-list`). Combinadas com `&&`, `||`, `not` e parênteses. Ações: `accept`, `reject`, `return`, `jump CHAIN`, `set bgp-local-pref|bgp-med|bgp-path-prepend|bgp-communities|bgp-large-communities`, `append …`, `delete …`."##),
+Condições: `dst in|==|!=`, `dst-len`, `afi`, `protocol`, `bgp-as-path` (regex do FRR/Cisco, `_` é separador), `bgp-communities` e `bgp-large-communities` com `includes`, `any`, `equal` (e `-list`). Combinadas com `&&`, `||`, `not` e parênteses. Ações: `accept`, `reject`, `return`, `jump CHAIN`, `set bgp-local-pref|bgp-med|bgp-path-prepend|bgp-communities|bgp-large-communities`, `set gw ENDEREÇO` (next hop das rotas da família do endereço), `append …`, `delete …`."##),
     (r##"filter.rule.actions"##, r##"## O que é
 O que a regra faz: verde aceita, vermelho rejeita, azul muda um atributo."##),
     (r##"filter.rule.chain"##, r##"## O que é

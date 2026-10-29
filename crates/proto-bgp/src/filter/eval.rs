@@ -198,6 +198,7 @@ enum SetC {
     LocalPref(u32),
     Med(u32),
     Prepend(u8),
+    Gw(std::net::IpAddr),
     Comm(CommHow, Vec<u32>),
     Large(CommHow, Vec<Large>),
 }
@@ -312,6 +313,41 @@ pub fn jumps(body: &[Stmt], out: &mut Vec<String>) {
             _ => {}
         }
     }
+}
+
+/// The next hops `set gw` writes in chain `chain` or a chain it jumps
+/// to (G3.9fh), in rule order.
+pub fn chain_gws(filter: &RoutingFilter, chain: &str) -> Vec<std::net::IpAddr> {
+    fn walk(body: &[Stmt], out: &mut Vec<std::net::IpAddr>, next: &mut Vec<String>) {
+        for s in body {
+            match s {
+                Stmt::Set(super::parse::SetOp::Gw(a)) => out.push(*a),
+                Stmt::Jump(c) => next.push(c.clone()),
+                Stmt::If { then, els, .. } => {
+                    walk(then, out, next);
+                    walk(els, out, next);
+                }
+                _ => {}
+            }
+        }
+    }
+    let (parsed, _) = parsed_chains(filter);
+    let mut out = Vec::new();
+    let mut seen = vec![chain.to_owned()];
+    let mut i = 0;
+    while let Some(name) = seen.get(i).cloned() {
+        i += 1;
+        let mut next = Vec::new();
+        if let Some((_, b)) = parsed.iter().find(|(n, _)| *n == name) {
+            walk(b, &mut out, &mut next);
+        }
+        for n in next {
+            if !seen.contains(&n) {
+                seen.push(n);
+            }
+        }
+    }
+    out
 }
 
 /// The chains in a jump loop (each reported once), as "a → b → a".
@@ -539,6 +575,7 @@ impl Builder<'_> {
                     SetOp::LocalPref(v) => SetC::LocalPref(*v),
                     SetOp::Med(v) => SetC::Med(*v),
                     SetOp::Prepend(n) => SetC::Prepend(*n),
+                    SetOp::Gw(a) => SetC::Gw(*a),
                     SetOp::Comm { large, how, arg } => {
                         let (n, l) = self.comm_values(arg, *large);
                         if *large {
@@ -621,9 +658,25 @@ impl Policy {
 
     /// Run chain `chain` on `route`; `asn` is ours (`bgp-path-prepend`).
     pub fn eval<'r>(&self, chain: usize, route: &'r Route, asn: u32) -> Outcome<'r> {
+        self.eval_counted(chain, route, asn, 0)
+    }
+
+    /// [`Policy::eval`] where the session adds `counted` copies of our AS
+    /// that `set bgp-path-prepend N` counts (G3.9fg: 1 on the output of
+    /// an eBGP connection, RouterOS's count): the chain prepends N −
+    /// `counted`. The route is the one the chain hands on, before the
+    /// session's own copy.
+    pub fn eval_counted<'r>(
+        &self,
+        chain: usize,
+        route: &'r Route,
+        asn: u32,
+        counted: u8,
+    ) -> Outcome<'r> {
         let mut ctx = Ctx {
             route: Cow::Borrowed(route),
             path: None,
+            counted,
         };
         let accepted = match self.run(chain, &mut ctx, asn, 0) {
             Flow::Accept => true,
@@ -741,16 +794,31 @@ fn change<T: Ord + Copy>(how: CommHow, vals: &[T], have: &mut Vec<T>) {
 }
 
 fn apply(s: &SetC, ctx: &mut Ctx<'_>, asn: u32) {
+    // G3.9fg: N copies in all, the session's own included; none left (N =
+    // 1 on eBGP) leaves the route as it is.
+    if let SetC::Prepend(n) = s
+        && *n <= ctx.counted
+    {
+        return;
+    }
+    // G3.9fh: a next hop of the other family leaves the route alone.
+    if let SetC::Gw(a) = s
+        && a.is_ipv4() != matches!(ctx.route.prefix, ipnet::IpNet::V4(_))
+    {
+        return;
+    }
+    let counted = ctx.counted;
     let r = ctx.route.to_mut();
     match s {
         SetC::LocalPref(v) => r.local_pref = Some(*v),
         SetC::Med(v) => r.med = Some(*v),
         SetC::Prepend(n) => {
-            let mut path = vec![asn; usize::from(*n)];
+            let mut path = vec![asn; usize::from(*n - counted)];
             path.extend_from_slice(&r.as_path);
             r.as_path = path;
             ctx.path = None;
         }
+        SetC::Gw(a) => r.next_hop = Some(*a),
         SetC::Comm(how, vals) => change(*how, vals, &mut r.communities),
         SetC::Large(how, vals) => change(*how, vals, &mut r.large),
     }
@@ -760,6 +828,8 @@ struct Ctx<'r> {
     route: Cow<'r, Route>,
     /// The AS path as text, built on the first regex test.
     path: Option<String>,
+    /// Copies of our AS a prepend counts ([`Policy::eval_counted`]).
+    counted: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -793,12 +863,14 @@ pub struct Side<'a> {
     /// What happens without a chain: iBGP accepts, eBGP rejects (RFC 8212).
     pub accept_without: bool,
     pub asn: u32,
+    /// Copies of our AS the session adds that a prepend counts (G3.9fg).
+    pub counted: u8,
 }
 
 impl Side<'_> {
     pub fn run<'r>(&self, r: &'r Route) -> Outcome<'r> {
         match self.chain {
-            Some(c) => self.policy.eval(c, r, self.asn),
+            Some(c) => self.policy.eval_counted(c, r, self.asn, self.counted),
             None => Outcome {
                 accepted: self.accept_without,
                 route: Cow::Borrowed(r),
@@ -1169,6 +1241,7 @@ mod tests {
             chain: Some(0),
             accept_without: false,
             asn: 65000,
+            counted: 0,
         };
         let one = preview(&side(&new), Some(&side(&old)), &routes, 10, 1);
         let many = preview(&side(&new), Some(&side(&old)), &routes, 10, 4);
@@ -1185,6 +1258,7 @@ mod tests {
             chain: None,
             accept_without: false,
             asn: 65000,
+            counted: 0,
         };
         assert_eq!(preview(&none, None, &routes, 0, 1).accepted, 0);
     }

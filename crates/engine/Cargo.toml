@@ -101,6 +101,10 @@ name = "batch_import"
 harness = false
 
 [[bench]]
+name = "route_scale"
+harness = false
+
+[[bench]]
 name = "transactional"
 harness = false
 

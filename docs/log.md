@@ -7510,3 +7510,108 @@ continuação indentadas).
   "Interface <nome>" de uma VLAN mostra "Use Service Tag" com ⓘ (yes/no e o TPID), só leitura.
   Opção A do mockup (sem coluna nova). Testar: `cargo test -p corerouter-ui vlan_service_tag`;
   screenshots claro e escuro em `docs/changes/G3.9hc-screenshots/`.
+
+- 2026-10-29 — G0.31c: Conntrack lido e filtrado fora do lock do `Session`, com o mecanismo da G0.31b
+  (`Session::defer`). Sob o lock, `ip.firewall.connection.list`, `ip.firewall.connection.top` e
+  `ip.firewall.cgnat.capacity.preview` pegam só o `Arc` do dump em cache e os pools do CGNAT. Se o
+  dump passou de `CACHE_SECS`, pegam também um leitor do kernel com socket próprio
+  (`Hal::conntrack_scanner`, o mesmo do `cgnat-scan` da G2.7b). Ler, filtrar, ordenar, somar e
+  montar o JSON roda depois do lock, na thread da conexão. O dump lido ali vai para o cache
+  (`ConnCache`: um mutex próprio, segurado só para copiar o `Arc`, e outro que serializa as
+  leituras). Duas janelas que pedem ao mesmo tempo leem a tabela uma vez só. O backend virtual
+  não tem leitor e continua lendo sob o lock (tabela pequena). `kill` continua sob o lock: ele
+  precisa do HAL para apagar, e a G3.9hd o revê.
+
+  Como testar: `cargo test -p corerouter-engine --lib firewall_connection` (duas leituras ao mesmo
+  tempo leem a tabela uma vez e publicam o dump; `list` e `top` adiam e dão a mesma resposta) e
+  `cargo test -p corerouter-engine --test it connections`. Bench em namespace sem root:
+  `COREROUTER_NETNS_BENCH=1 unshare --user --map-root-user --net -- cargo bench -p
+  corerouter-daemon --bench netns_conntrack` (`cargo xtask bench` o roda no namespace).
+
+- 2026-10-29 — G0.31d: As rotas estáticas (`ip.routes`) viraram `corerouter_model::routes::Routes`: o mesmo `CowList` em
+  blocos, com um índice (tabela, destino, gateway) → ids, no molde do `AddressLists` da G0.21. O
+  `ip.route.add`/`set` acha o mesmo próximo salto em O(1) em vez de comparar com todas as rotas; o
+  `ip.route.set`/`remove` acha a rota pelo id em O(log n) (a lista está em ordem de id). O índice é
+  montado na primeira consulta, compartilhado pelas cópias da config (`CowMap`, uma escrita copia
+  uma folha) e mantido por `push`, `update` e `remove`; qualquer outra escrita pelo `DerefMut` o
+  descarta e a próxima consulta o refaz. O arquivo salvo e o journal não mudam (serializa como a
+  lista). A validação do commit (`route_checks`) continua igual, agora recebendo os ids do mesmo
+  salto.
+
+  Mudança no `crates/model/src/config.rs`: uma linha, o tipo do campo `routes` (aditiva para quem
+  lê: `Routes` tem `Deref` para `CowList<RouteEntry>`).
+
+  Como testar: `cargo test -p corerouter-model --lib routes::` (o índice segue cada escrita e as
+  cópias mantêm o seu), `cargo test -p corerouter-engine --test it route::` (o teste
+  `the_same_hop_twice_is_refused_after_set_and_remove`). Bench novo: `cargo bench -p
+  corerouter-engine --bench route_scale`.
+
+- 2026-10-29 — G1.6qa: `system.reboot` e `system.shutdown`, como o `/system reboot|shutdown` do RouterOS: pedem
+  `confirm: true` (no terminal, `/system reboot confirm=yes`) e são recusados sem `force` em Safe
+  Mode (o boot subiria a config da entrada e desfaria as mudanças) ou com mudanças de transação
+  pendentes (seriam perdidas), e sempre dentro de um lote atômico (não dá para desfazer). Ficam no
+  journal e no log como qualquer comando. O engine só registra o pedido (`crate::power`); o
+  serviço `power` do daemon o pega fora do lock, espera 1 s para o cliente ler a resposta e manda
+  SIGTERM (reboot) ou SIGUSR2 (desligar) ao PID 1. O `corerouter-init` devolve SIGTERM ao daemon,
+  que grava o checkpoint da config (G0.27), para o FRR, faz `sync` e desmonta `/config`. Fora da
+  imagem (PID 1 que não é o `corerouter-init`, ou daemon que não é filho dele) os comandos ficam
+  desligados com o motivo ("PID 1 is systemd…"): um sinal a outro PID 1 pararia a máquina de
+  desenvolvimento.
+
+  Testes: `cmd::system_power` (sucesso, validação, Safe Mode, transação pendente, lote atômico),
+  `service::power` (detecção do init) e, na imagem, no QEMU como usuário (sem root):
+  `power-test.sh` (reboot pela rede, a config mudada antes sobrevive, depois shutdown e o QEMU
+  sai).
+
+  Na imagem (build desta branch, QEMU/KVM, 2 vCPUs, 1 GiB, 2026-10-29, **medido**): sem `confirm`
+  recusado; `system.identity.set` e `system.reboot {confirm: true}` pela TLS → o init escreve
+  "reboot: stopping services" e o daemon responde de novo em 3,0 s (de parede, do pedido ao
+  `ready:`), com a identidade mantida; `system.shutdown {confirm: true}` → "power off: stopping
+  services" e o QEMU sai em 2,0 s (1 s é a pausa para o cliente ler a resposta).
+
+- 2026-10-29 — G3.9fg: BGP: `set bgp-path-prepend N` com a contagem do RouterOS v7. Para um vizinho eBGP a rota sai com o
+  nosso AS N vezes no total (a cópia do eBGP conta; N = 1 não muda nada), **medido** no RouterOS
+  7.25 CHR com o caso novo `prepend` de `scripts/routeros-interop-bgp.sh` (CHR: N = 1, 2, 3 → 1, 2,
+  3 cópias; CoreRouter antes: 2, 3, 4; depois: 1, 2, 3). Na saída iBGP e na entrada o CHR não põe
+  cópia nenhuma (N = 1, 2, 3 → 0, **medido**; o FRR punha N): o CoreRouter também não, e o
+  `rule.check` avisa que ali o prepend não faz nada.
+
+  - Render: o mapa de saída eBGP põe N − 1 (`set as-path prepend`), o de entrada e de saída iBGP
+    nada; chain usada nos dois lugares ganha `CR-<chain>+ebgp-out`, só para as saídas eBGP e só
+    quando difere. A prévia e o impacto (`Side.counted`) fazem a mesma conta; o proptest que compara
+    o render com o avaliador roda as três contagens.
+  - Migração: um filtro gravado antes (sem o campo `prepend`) é lido como `legacy` e manda os mesmos
+    caminhos de antes. `routing.filter.status` (`prepend`, `prepend_warning`), o `rule.check`
+    (`prepend-count`) e a janela Routing › Filters (selo **Prepend count**, botão **Use RouterOS
+    count**, ⓘ) avisam. `routing.filter.prepend.set {count: routeros}` troca e, com `keep_paths`
+    (padrão), reescreve N → N + 1 nas chains que só saem por eBGP; o que não dá para manter (chain
+    na entrada ou no iBGP, onde o prepend deixa de valer; N = 16) volta em `left`. Escolhido em vez de converter na leitura: a
+    mesma regra pode estar numa chain de entrada, de iBGP e de eBGP, e só o operador decide como
+    separar.
+
+  Como testar: `cargo test -p corerouter-proto-bgp prepend`, `cargo test -p corerouter-engine
+  routing_filter`; contra o CHR, `cargo xtask vm-lab run -- scripts/routeros-interop-bgp.sh prepend`.
+
+- 2026-10-29 — G3.9fh: BGP: o RouterOS 7.25 manda IPv6 numa sessão IPv4 com o next hop IPv4-mapeado `::ffff:10.39.1.1`
+  (fora da RFC 2545 §3); o FRR aceita a rota, mas o kernel não a instala. Agora a chain de entrada
+  reescreve o next hop: `set gw ENDEREÇO`, a propriedade `gw` do RouterOS v7. Vira `set ipv6
+  next-hop global X` (ou `set ip next-hop X`) no FRR, numa entrada guardada por um teste de família,
+  para não pôr um next hop IPv6 numa rota IPv4. O avaliador e a prévia mostram `gw X` na mudança; o
+  proptest render × avaliador inclui `set gw` das duas famílias. O parser recusa mapeado,
+  link-local, multicast, loopback e não especificado, com a coluna.
+
+  `routing.bgp.connection.check` (`mpbgp-nexthop`): numa conexão IPv4 com `afi=ipv6`, vira
+  `warning` com a regra pronta quando a chain de entrada não reescreve o next hop IPv6, e `info`
+  com o endereço quando reescreve.
+
+  Escolhido em vez de uma opção nova na conexão: o RouterOS já tem `gw` no filtro, e o next hop de
+  cada vizinho é o endereço dele, que vai na chain dele. A rota IPv6 via gateway IPv4 (`via inet`,
+  como na RFC 8950) não serve: o Linux não aceita gateway IPv4 numa rota IPv6.
+
+  Contra o RouterOS 7.25 CHR (**medido**, VM `corerouter-lab`, 2026-10-29, caso `mpbgp`): sem `set
+  gw` o `fd39:203::/48` do CHR fica no bgpd com next hop `::ffff:10.39.1.1` e fora do kernel; com a
+  regra na entrada ele entra no kernel via `fd39:1::1` 169 ms depois do commit, sem reset da sessão,
+  e as rotas IPv4 continuam via `10.39.1.1`.
+
+  Como testar: `cargo test -p corerouter-proto-bgp set_gw`, `cargo test -p corerouter-engine --lib
+  routing_bgp`; contra o CHR, `cargo xtask vm-lab run -- scripts/routeros-interop-bgp.sh mpbgp`.

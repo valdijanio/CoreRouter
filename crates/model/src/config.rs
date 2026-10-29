@@ -270,7 +270,8 @@ pub struct Ip {
     pub next_id: u32,
     /// Static routes (`/ip route`), IPv4 and IPv6 together. Connected routes
     /// are not stored: they are derived from `addresses` (see `route`).
-    pub routes: CowList<RouteEntry>,
+    /// Indexed by next hop for the duplicate check (G0.31d).
+    pub routes: crate::routes::Routes,
     /// Next id handed out by `next_route_id`.
     pub next_route_id: u32,
     /// Where neighbor discovery listens and announces (`ip.neighbor.discovery.set`).

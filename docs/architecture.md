@@ -503,11 +503,16 @@ canal de controle ─► lock ─► Session::execute_reply_as ─► handler:
   - estado vivo em `Arc`, copiado só quando alguém escreve com o closure ainda vivo
     (`RouteWatch::changed`, `FwDiag::live`, `DynamicLists::shared`, o `LdpState`);
   - tabelas com lock próprio (`NeighShared`), travadas só dentro do closure.
-- **Para a próxima consulta (ex.: G0.31c, conntrack):** uma thread publica o dump num `Arc`, e o
-  handler clona o `Arc` e chama `s.defer` com o filtro e a soma.
+- **Leitura do kernel fora do lock (G0.31c, conntrack).** Quando o HAL oferece um leitor com
+  socket próprio (`Hal::conntrack_scanner`), o handler leva o leitor no snapshot e o dump roda
+  no closure. O resultado é publicado num cache com mutex próprio (`ConnCache`), segurado só
+  para copiar o `Arc`; um segundo mutex serializa as leituras, e quem chega durante uma delas
+  usa o dump que ela publicou. Sem leitor (o lab), a leitura fica sob o lock. Não há thread
+  lendo a tabela à toa: só quem olha paga o dump, uma vez a cada `CACHE_SECS`.
 
 Adiam hoje: `ip.route.list`, `ip.firewall.{filter,nat,mangle,raw}.list`,
-`ip.firewall.address-list.list`, `ip.firewall.preview` e `config.drift.list`. No drift, a
+`ip.firewall.address-list.list`, `ip.firewall.preview`, `config.drift.list`,
+`ip.firewall.connection.{list,top}` e `ip.firewall.cgnat.capacity.preview`. No drift, a
 leitura do kernel continua sob o lock, porque o HAL é do `Session`. Com a config do bench
 `lock_hold` (60 000 rotas, 10 000 regras, 100 000 entradas), nenhuma consulta segura o lock por
 mais de 2 ms. Antes eram 345 ms no `ip.route.list` e 112 ms no `address-list.list` (**medido**;
