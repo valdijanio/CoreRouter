@@ -245,9 +245,10 @@ MCP: `claude mcp add corerouter -- corerouter-cli mcp` (detalhes em `docs/mcp.md
     `if cfg!(test) { 50 ms } else { 1 s }`; repetições independentes em `thread::scope`; caso
     grande num laço com os pequenos na camada rápida e os grandes num `slow_` à parte
     (`config_journal.rs`).
-  - **Teto:** teste fora da camada lenta acima de 5 s reprova o job `test` do PR no GitHub
-    (`COREROUTER_TEST_CEILING_SECS` muda); no local é aviso, e o `--affected` lista os testes
-    acima de 1 s dos pacotes que o diff mudou.
+  - **Teto:** teste fora da camada lenta acima de 10 s reprova o job `test` do PR no GitHub
+    (runner de 4 vCPU, 1,5–2× mais lento); no local, acima de 5 s é aviso, e o `--affected`
+    lista os testes acima de 1 s dos pacotes que o diff mudou (`COREROUTER_TEST_CEILING_SECS`
+    muda o teto).
   - **Relatório:** todo `cargo xtask ci` termina com os 20 testes mais lentos (JUnit do nextest).
   - **Regressões do proptest** (`proptest-regressions/`) rodam em toda camada; o passo `test`
     reprova arquivo de regressão que nenhum teste lê mais (teste movido ou renomeado).

@@ -104,6 +104,10 @@ jobs:
       # G0.30: no PR, a camada rápida (sem os testes `slow_…`, proptest com 32 casos); no lote da
       # fila (workflow_dispatch) e na main, todos os testes com os casos de cada um.
       COREROUTER_TEST_LAYER: ${{ github.event_name == 'pull_request' && 'quick' || 'full' }}
+      # G0.30: teste da camada rápida acima disto reprova o PR. O dobro do teto local (5 s): no
+      # runner de 4 vCPU um teste que gasta CPU leva 1,5–2× o tempo da máquina das sessões
+      # (medido no #389: 18 testes acima de 5 s aqui contra 4 lá).
+      COREROUTER_TEST_CEILING_SECS: "10"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup
