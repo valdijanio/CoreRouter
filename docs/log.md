@@ -6733,3 +6733,9 @@ continuação indentadas).
 
   Como testar: `cargo nextest run --workspace` (3487 testes); `cargo test -p corerouter-engine
   --test it cgnat::` (um arquivo); `cargo xtask netns`; `cargo test -p xtask it_mods`.
+
+- 2026-10-29 — G0.30: Orçamento de testes, parte A: o relatório dos mais lentos. O passo `test` do `cargo xtask ci`
+  grava o JUnit do nextest (`.config/nextest.toml`, `target/nextest/default/junit.xml`) e o xtask
+  imprime, depois do resumo, o total de tempo de teste, quantos passam de 1 s e de 5 s e os 20
+  mais lentos (`xtask/src/slowest.rs`); aparece no fim de todo `cargo xtask ci` e no log de cada
+  parte do job `test` no GitHub. Como testar: `cargo xtask ci --only test` e ler o fim da saída.
