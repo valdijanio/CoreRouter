@@ -54,6 +54,10 @@ name = "netns_apply"
 harness = false
 
 [[bench]]
+name = "route_plan"
+harness = false
+
+[[bench]]
 name = "netns_forward"
 harness = false
 

@@ -1,18 +1,21 @@
-//! `/ip route` (static routes) as a block list with an index of each next
-//! hop (G0.31d).
+//! `/ip route` (static routes) as a block list with an index of each
+//! destination (G0.31d, G0.31e).
 //!
 //! An add refuses the very same next hop twice (same table, destination
 //! and gateway): with 60 000 routes the walk of the list cost ~60 µs per
-//! command and made an import of 60 000 routes quadratic. The index maps
-//! each (table, destination, gateway) to the ids of the routes on it — a
-//! list, so a config edited by hand with a hop twice stays exact. It is
-//! built on the first look, shared by the copies of the config, and kept by
-//! [`Routes::push`], [`Routes::update`] and [`Routes::remove`] (a write
-//! copies one leaf of it, [`CowMap`]). Any other write through `DerefMut`
-//! drops it. Same design as [`crate::address_lists`] (G0.21).
+//! command and made an import of 60 000 routes quadratic. A commit asks
+//! which routes go to the destinations it changed, to plan the kernel and
+//! validate only those (G0.31e). The index maps each (table, destination)
+//! to the ids of the routes to it — a list, so ECMP paths and a config
+//! edited by hand with a hop twice stay exact. It is built on the first
+//! look, shared by the copies of the config, and kept by [`Routes::push`],
+//! [`Routes::update`] and [`Routes::remove`] (a write copies one leaf of it,
+//! [`CowMap`]). Any other write through `DerefMut` drops it. Same design as
+//! [`crate::address_lists`] (G0.21).
 //!
 //! Serialized exactly like the list.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::sync::OnceLock;
@@ -23,33 +26,36 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::config::RouteEntry;
 use crate::cow_list::CowList;
 use crate::cow_map::CowMap;
-use crate::types::{Gateway, ItemId, RoutingTable};
+use crate::types::{ItemId, RoutingTable};
 
-type Key = (RoutingTable, IpNet, Gateway);
+/// A destination: the table and the prefix without host bits (the kernel's
+/// key, so `10.0.0.1/24` and `10.0.0.0/24` are one).
+pub type Dst = (RoutingTable, IpNet);
 
 #[derive(Default)]
 pub struct Routes {
     list: CowList<RouteEntry>,
-    hops: OnceLock<CowMap<Key, Vec<ItemId>>>,
+    dsts: OnceLock<CowMap<Dst, Vec<ItemId>>>,
 }
 
-fn key(r: &RouteEntry) -> Key {
-    (r.routing_table.clone(), r.dst_address, r.gateway.clone())
+/// The destination of `r`.
+pub fn dst(r: &RouteEntry) -> Dst {
+    (r.routing_table.clone(), r.dst_address.trunc())
 }
 
-fn hold(m: &mut CowMap<Key, Vec<ItemId>>, r: &RouteEntry) {
-    let mut ids = m.get(&key(r)).cloned().unwrap_or_default();
+fn hold(m: &mut CowMap<Dst, Vec<ItemId>>, r: &RouteEntry) {
+    let mut ids = m.get(&dst(r)).cloned().unwrap_or_default();
     ids.push(r.id);
-    m.insert(key(r), ids);
+    m.insert(dst(r), ids);
 }
 
-fn release(m: &mut CowMap<Key, Vec<ItemId>>, r: &RouteEntry) {
-    let k = key(r);
+fn release(m: &mut CowMap<Dst, Vec<ItemId>>, r: &RouteEntry) {
+    let k = dst(r);
     let Some(mut ids) = m.get(&k).cloned() else {
         return;
     };
     if let Some(i) = ids.iter().position(|id| *id == r.id) {
-        ids.swap_remove(i);
+        ids.remove(i);
     }
     if ids.is_empty() {
         m.remove(&k);
@@ -62,12 +68,12 @@ impl Routes {
     pub fn from_list(list: CowList<RouteEntry>) -> Self {
         Self {
             list,
-            hops: OnceLock::new(),
+            dsts: OnceLock::new(),
         }
     }
 
-    fn hops(&self) -> &CowMap<Key, Vec<ItemId>> {
-        self.hops.get_or_init(|| {
+    fn dsts(&self) -> &CowMap<Dst, Vec<ItemId>> {
+        self.dsts.get_or_init(|| {
             let mut m = CowMap::new();
             for r in &self.list {
                 hold(&mut m, r);
@@ -76,12 +82,50 @@ impl Routes {
         })
     }
 
-    /// The ids of the routes with the same table, destination and gateway
-    /// as `r` (`r` itself among them if it is in the list), in O(1).
-    pub fn same_hop(&self, r: &RouteEntry) -> &[ItemId] {
-        self.hops()
-            .get(&key(r))
+    /// The ids of the routes to `dst` (host bits ignored) in `table`, in
+    /// list order, in O(1).
+    pub fn to_dst(&self, table: &RoutingTable, dst: IpNet) -> &[ItemId] {
+        self.dsts()
+            .get(&(table.clone(), dst.trunc()))
             .map_or(&[], |ids| ids.as_slice())
+    }
+
+    /// The routes to the destination `d`.
+    pub fn routes_to<'a>(&'a self, d: &Dst) -> impl Iterator<Item = &'a RouteEntry> + 'a {
+        self.to_dst(&d.0, d.1).iter().filter_map(|id| self.by_id(*id))
+    }
+
+    /// The ids of the routes with the same table, destination and gateway
+    /// as `r` (`r` itself among them if it is in the list).
+    pub fn same_hop<'a>(&'a self, r: &'a RouteEntry) -> impl Iterator<Item = ItemId> + 'a {
+        self.to_dst(&r.routing_table, r.dst_address)
+            .iter()
+            .filter_map(|id| self.by_id(*id))
+            .filter(|o| o.dst_address == r.dst_address && o.gateway == r.gateway)
+            .map(|o| o.id)
+    }
+
+    /// The destinations of the routes that are not in a block `self` and
+    /// `other` share: every destination one of them added, changed or
+    /// removed (and the others of the blocks they touched), without walking
+    /// the shared blocks. One route changed among 60 000: one block, ~128.
+    pub fn changed_dsts(&self, other: &Self) -> BTreeSet<Dst> {
+        let mut out = BTreeSet::new();
+        if Self::ptr_eq(self, other) {
+            return out;
+        }
+        for r in self.list.unshared(&other.list).iter() {
+            out.insert(dst(r));
+        }
+        for r in other.list.unshared(&self.list).iter() {
+            out.insert(dst(r));
+        }
+        out
+    }
+
+    /// The route with id `id` (O(log n), see [`Routes::position`]).
+    pub fn by_id(&self, id: ItemId) -> Option<&RouteEntry> {
+        self.list.get(self.position(id)?)
     }
 
     /// Position of the route with id `id` (O(log n): new routes get the
@@ -92,7 +136,7 @@ impl Routes {
 
     /// Append, keeping the index.
     pub fn push(&mut self, r: RouteEntry) {
-        if let Some(m) = self.hops.get_mut() {
+        if let Some(m) = self.dsts.get_mut() {
             hold(m, &r);
         }
         self.list.push(r);
@@ -103,8 +147,8 @@ impl Routes {
         let before = self.list.get(i)?.clone();
         let x = self.list.get_mut(i)?;
         let out = f(x);
-        if (key(&before), before.id) != (key(x), x.id)
-            && let Some(m) = self.hops.get_mut()
+        if (dst(&before), before.id) != (dst(x), x.id)
+            && let Some(m) = self.dsts.get_mut()
         {
             release(m, &before);
             hold(m, x);
@@ -115,7 +159,7 @@ impl Routes {
     /// Remove the route at `i`, keeping the index.
     pub fn remove(&mut self, i: usize) -> Option<RouteEntry> {
         let r = self.list.remove(i)?;
-        if let Some(m) = self.hops.get_mut() {
+        if let Some(m) = self.dsts.get_mut() {
             release(m, &r);
         }
         Some(r)
@@ -134,13 +178,13 @@ impl Routes {
 
 impl Clone for Routes {
     fn clone(&self) -> Self {
-        let hops = OnceLock::new();
-        if let Some(m) = self.hops.get() {
-            let _ = hops.set(m.clone());
+        let dsts = OnceLock::new();
+        if let Some(m) = self.dsts.get() {
+            let _ = dsts.set(m.clone());
         }
         Self {
             list: self.list.clone(),
-            hops,
+            dsts,
         }
     }
 }
@@ -156,7 +200,7 @@ impl Deref for Routes {
 /// [`Routes::remove`]: the index is dropped.
 impl DerefMut for Routes {
     fn deref_mut(&mut self) -> &mut CowList<RouteEntry> {
-        self.hops = OnceLock::new();
+        self.dsts = OnceLock::new();
         &mut self.list
     }
 }
@@ -230,7 +274,7 @@ mod tests {
     }
 
     fn hop(l: &Routes, dst: &str, gw: &str) -> Vec<u32> {
-        let mut ids: Vec<u32> = l.same_hop(&r(0, dst, gw)).iter().map(|i| i.0).collect();
+        let mut ids: Vec<u32> = l.same_hop(&r(0, dst, gw)).map(|i| i.0).collect();
         ids.sort_unstable();
         ids
     }
@@ -262,5 +306,30 @@ mod tests {
         let j = serde_json::to_value(&copy).unwrap();
         assert!(j.is_array());
         assert_eq!(serde_json::from_value::<Routes>(j).unwrap(), copy);
+    }
+
+    #[test]
+    fn a_destination_holds_its_ecmp_paths_and_a_commit_sees_only_what_changed() {
+        let mut l: Routes = (1..=1000)
+            .map(|i| r(i, &format!("10.{}.{}.0/24", i / 256, i % 256), "192.0.2.1"))
+            .collect();
+        l.push(r(1001, "10.0.1.0/24", "192.0.2.9"));
+        let main = RoutingTable::default();
+        let ids: Vec<u32> = l
+            .routes_to(&(main.clone(), "10.0.1.7/24".parse().unwrap()))
+            .map(|x| x.id.0)
+            .collect();
+        assert_eq!(ids, [1, 1001], "host bits ignored, both paths, in list order");
+        assert_eq!(l.by_id(ItemId(500)).map(|x| x.id), Some(ItemId(500)));
+        let before = l.clone();
+        assert!(l.changed_dsts(&before).is_empty());
+        l.update(499, |x| x.dst_address = "172.16.0.0/12".parse().unwrap());
+        l.remove(0);
+        let changed = l.changed_dsts(&before);
+        for d in ["10.1.244.0/24", "172.16.0.0/12", "10.0.1.0/24"] {
+            assert!(changed.contains(&(main.clone(), d.parse().unwrap())), "{d} in {changed:?}");
+        }
+        assert!(changed.len() <= 2 * 128 + 2, "only the touched blocks: {}", changed.len());
+        assert!(!changed.contains(&(main, "10.3.200.0/24".parse().unwrap())));
     }
 }

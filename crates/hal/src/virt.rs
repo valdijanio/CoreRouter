@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use corerouter_model::firewall::DynamicAddress;
-use corerouter_model::{Config, FlowControl, IfName, InterfaceKind, ItemId, RouteEntry};
+use corerouter_model::{Config, FlowControl, IfName, InterfaceKind};
 
 use crate::dhcp::{
     Datagram, Datagram6, Dest, Dhcp6Port, DhcpPort, SharedResponder, SharedResponder6, eui64,
@@ -229,37 +229,18 @@ impl VirtualHal {
             k.addresses.extend(b.difference(&a).cloned());
         }
         // Routes resolve through interfaces and addresses: with those
-        // unchanged, an unchanged route entry resolves the same.
-        let (a, b) = if addrs {
-            (drift::kernel_routes(from), drift::kernel_routes(to))
-        } else {
-            fn by_id(c: &Config) -> BTreeMap<ItemId, &RouteEntry> {
-                c.ip.routes.iter().map(|r| (r.id, r)).collect()
-            }
-            let (old, new) = (by_id(from), by_id(to));
-            let gone = old.iter().filter(|(id, r)| new.get(id) != Some(r));
-            let came = new.iter().filter(|(id, r)| old.get(id) != Some(r));
+        // unchanged, only the destinations the commit touched (G0.31e).
+        let (gone, came) = drift::route_changes(from, to).unwrap_or_else(|| {
+            let (a, b) = (drift::kernel_routes(from), drift::kernel_routes(to));
             (
-                drift::kernel_routes_of(from, gone.map(|(_, r)| *r)),
-                drift::kernel_routes_of(to, came.map(|(_, r)| *r)),
+                a.difference(&b).cloned().collect(),
+                b.difference(&a).cloned().collect(),
             )
-        };
-        for r in a.difference(&b) {
-            // Another entry of `to` may still put the same route there.
-            let kept = !addrs
-                && drift::kernel_routes_of(
-                    to,
-                    to.ip
-                        .routes
-                        .iter()
-                        .filter(|e| e.dst_address.trunc() == r.dst),
-                )
-                .contains(r);
-            if !kept {
-                k.routes.remove(r);
-            }
+        });
+        for r in &gone {
+            k.routes.remove(r);
         }
-        k.routes.extend(b.difference(&a).cloned());
+        k.routes.extend(came);
     }
 
     /// Answer DHCP clients with `server` (a test's own scenario) instead of

@@ -53,9 +53,19 @@ corerouter-cli run routing.bgp.connection.add '{"name":"client1","remote_address
   estáticas do CoreRouter são instaladas pelo backend linux (`proto static`), e o `zebra` as vê
   como rotas *kernel*: `static` vira `redistribute kernel` com um route-map que só deixa passar
   os prefixos das estáticas configuradas (`CR-BGP-STATIC4/6`).
-- O FRR origina por instância, não por vizinho: o que uma conexão pede vale para as outras da
-  mesma família; quem não deve receber filtra no `output_filter` (o eBGP sem chain já não
-  recebe nada, RFC 8212). A forma exata por conexão é a G3.9fb.
+- Por conexão, como no RouterOS (G3.9fb): cada vizinho recebe só o que a conexão dele pede. O
+  FRR origina por instância (a união dos pedidos); a conexão que pede menos que a união ganha um
+  route-map de saída próprio, `CR-C+<conexão>`: passam as nossas rotas da lista dela
+  (`CR-C+<conexão>+4/+6`) e dos protocolos que ela redistribui (`match source-protocol`); são
+  recusadas as rotas `network` das outras conexões (o prefixo, `CR-C+<conexão>+not4/6`, com o
+  AS_PATH vazio de rota nossa, `CR-C+local`) e os protocolos que só as outras redistribuem; o
+  que passa segue para a chain dela (`call CR-<chain>`). Rotas recebidas de outros vizinhos não
+  mudam. O `match peer local` do FRR não serve: num route-map de saída o "peer" é o vizinho de
+  destino (`bgp_route.c`, `prep_for_rmap_apply`). Um prefixo conectado (ou estático) que outra
+  conexão põe no `output_network` vai também para a que redistribui connected (static): no
+  `bgpd` é uma rota só, a do `network`. Quando todas pedem o mesmo, nada muda no render. O eBGP
+  sem chain continua sem receber nada (RFC 8212). Limite: um prefixo do OSPF que outra conexão
+  lista no `output_network` não vai para a que só redistribui `ospf`.
 - `local_role=ibgp-rr` (RouterOS `ibgp-rr`): iBGP em que este roteador reflete rotas para o
   vizinho, seu cliente (RFC 4456, `route-reflector-client` no FRR). O cluster-id é o router-id,
   como no RouterOS.
