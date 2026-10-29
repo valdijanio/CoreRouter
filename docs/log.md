@@ -6954,3 +6954,69 @@ continuação indentadas).
   Só CPU não reproduz: 0 falhas em 7 rodadas do `cargo xtask netns` inteiro preso em 4 e em
   2 núcleos com laços de carga, e 0 em 5 do teste sozinho sob carga. A janela aparece quando
   vários daemons sobem e são configurados ao mesmo tempo, como no passo `netns` do CI.
+
+- 2026-10-29 — G3.9f: Interoperabilidade BGP, parte 1: CoreRouter × CoreRouter e FRR 10.7.1, sem root e sem a VM do
+  laboratório (presa a noite toda). `scripts/bgp-crcr-userns.sh` monta dois CoreRouters (backend
+  linux, cada um com o seu FRR) e dois FRR num namespace de usuário + rede + montagem
+  (`unshare --user --map-root-user`), com os pacotes oficiais do FRR 10.7.1 (deb.frrouting.org,
+  SHA-256 do índice conferido) extraídos no target, nunca instalados; 12 casos, 50 OK, 0 FAIL e nenhum
+  aviso "FRR prints … differently" na última rodada (**medido**, AMD Ryzen AI Max+ 395, 32 threads, release, 2026-10-29). O roteiro contra o RouterOS 7.25
+  CHR, `scripts/routeros-interop-bgp.sh` (17 casos: eBGP/iBGP v4/v6, MP-BGP, multihop, MD5,
+  communities normal/large/extended, filtros nos dois sentidos, next-hop-self, refletor nos dois
+  sentidos, max-prefix, reinício, BFD, convergência, 100 mil prefixos, CoreRouter × CoreRouter),
+  está pronto e roda na próxima janela da VM (`G3.9f-routeros`).
+
+  Defeitos achados e corrigidos (cada um com teste):
+
+  - **O BFD do BGP desligava a cada commit.** O `bgpd` 10.7.1 imprime `neighbor X bfd` e
+    `neighbor X bfd profile P`; o render só tinha a segunda, e todo sync digitava
+    `no neighbor X bfd` (o aviso "FRR prints … differently" em cada commit). Num corte silencioso
+    com duas sessões, a troca de caminho levava 7,8 s (o hold time) em vez de 0,3 s. Agora as duas
+    linhas, com a do perfil apagada antes (`hal-frr`), como o OSPF já fazia (G3.6l). Depois:
+    **314–420 ms** (BFD 100 ms × 3, duas rodadas, **medido**).
+  - **Um `bgpd` reiniciado ficava vazio.** `Frr::incarnation` virava `None` quando qualquer daemon
+    que o CoreRouter configura não tinha `.pid` (aqui `ospf6d` e `ldpd` não subiam; a G1.6i quer
+    justamente subir só os usados): o serviço `frr` nunca via o reinício. Agora o ausente conta
+    como `-`; o `bgpd` morto e subido de novo recebe a config em 5,9 s (**medido**).
+  - **O BGP não anunciava nada do próprio roteador.** Faltava o `output.network` e o
+    `output.redistribute` do RouterOS: entraram `output_network` (address-list) e
+    `output_redistribute` (`connected`, `static`, `ospf`) nos templates e conexões, e o papel
+    `ibgp-rr` (refletor, RFC 4456). As estáticas do CoreRouter são rotas *kernel* para o `zebra`
+    (o backend linux as instala com `proto static`): `static` vira `redistribute kernel` com um
+    route-map dos prefixos estáticos. Um commit que muda só a address-list ou só as estáticas
+    agora chega ao FRR (antes só um commit de `routing` chegava): ~0,12 s da entrada nova até o
+    vizinho (**medido**).
+  - **`corerouter-cli … | head` dava panic** (`println!` com stdout fechado): agora sai com 141,
+    como um pipe.
+
+  | Caso (host, FRR 10.7.1) | Resultado (**medido**) |
+  |---|---|
+  | eBGP IPv4 CR1 (65000) × CR2 (65002) | Established 5,4 s depois da config; rotas no kernel 1–3 ms depois; ping entre os gateways dos clientes |
+  | `output_network` | entrada nova da lista no vizinho em 118–131 ms, retirada em 133–205 ms; rede sem rota não sai e sai 210 ms depois de surgir a estática |
+  | `output_redistribute=static` | no vizinho em ~4 s |
+  | eBGP IPv6 (transporte e NLRI) | Established 4,5 s; next hop link-local no kernel |
+  | MP-BGP (IPv4 + IPv6 numa sessão IPv4) | IPv6 instalado; next hop global `fd39:5::1` + link-local (RFC 2545 §3) |
+  | TCP MD5 | Established; chave selada no disco; chave errada derruba e mantém caída; corrigida volta em ~1 s |
+  | Filtros e communities | MED 77, prepend 2, community 65000:10 + no-export, large 65000:0:10, community-list → local-pref 300; no-export respeitado; chain alterada aplica em ~5 s sem reset |
+  | next-hop-self (eBGP de um FRR → iBGP) | sem `force-self` o CR2 não instala (next hop inalcançável, RFC 4271 §5.1.3); com ele, instala 221 ms depois do commit |
+  | Refletor (CR1 RR, clientes CR2 e FRR) | ORIGINATOR_ID e CLUSTER_LIST corretos nos dois sentidos; sem o papel o cliente perde a rota em 139 ms |
+  | max-prefix | 6 > 3 com `shutdown`: sessão `idle`, "Reached received prefix count"; o FRR do outro lado recebe Cease/Maximum Number of Prefixes Reached (`0601`, RFC 4486); `warning` mantém os 6 |
+  | Reinício | `corerouter-daemon` reiniciado (responde em 210 ms) não toca a sessão; `bgpd` morto: o vizinho retira em 106 ms (sem graceful restart, G3.9ff) e a config volta em 5,9 s |
+  | BFD 100 ms × 3 | sobe com o BGP; perda total silenciosa retira a rota em 313–416 ms (hold 180 s) |
+  | Convergência (2 sessões, hold 9 s) | corte silencioso: 8,8–9,0 s pelo hold, **314–420 ms** com BFD (7,8 s antes da correção); link down: 1–2 ms |
+  | 100 mil prefixos | FRR → CR1 no kernel em 3,5–4,5 s; CR1 → CR2 em 3,6–3,9 s; `session.clear` ressincroniza em 4,7–5,0 s; retirada total em 1,3 s |
+
+  Desempenho e paralelismo (100 mil prefixos, **medido**): o `corerouter-daemon` fica em ~0 % de
+  CPU durante a carga e parado (nenhuma thread passa de 0,2 s em 300 s; RSS 71 → 79 MiB depois de
+  listar a tabela), então o caminho quente é do FRR: `bgpd` 0,4–0,5 s de CPU numa thread
+  (116 MiB), `zebra` 0,8–1,0 s na principal + 0,5–0,6 s na `zebra_apic` + 0,1–0,2 s na
+  `zebra_dplane` (69 MiB). Nada serializado do nosso lado a dividir; o `bgpd` de uma thread
+  principal é do FRR (decisão G3.1). Comandos com 100 mil rotas: `session.list` 3 ms,
+  `route.list` (primeira página, lendo o `bgpd`) 767 ms, um prefixo com a tabela em cache 2 ms,
+  `route.summary` 2 ms, `ip.route.page` 3 ms. O custo novo do render é O(conexões + entradas das
+  listas nomeadas + estáticas), só quando uma conexão anuncia; o gatilho do commit é O(1) quando
+  lista e estáticas não mudaram (cópias compartilhadas).
+
+  Como testar: `scripts/bgp-crcr-userns.sh` (ou só alguns casos: `… filters bfd`), sem root;
+  `cargo test -p corerouter-proto-bgp origination static_redis`,
+  `cargo test -p corerouter-hal-frr bfd incarnation`.
