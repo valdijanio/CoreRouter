@@ -457,24 +457,24 @@ impl ResourceSampler for LabSampler {
         let temp = 48.0 + wave(t, 1200, 140) as f64 / 10.0;
         let used = LAB_MEM / 2 - wave(t, 3600, 4 << 30);
         let all: Vec<Process> = LAB_PROCS
-                .iter()
-                .zip(&self.procs)
-                .enumerate()
-                .map(|(i, ((name, threads, rss, _), ticks))| Process {
-                    pid: if i == 0 { 812 } else { 2 + 37 * i as u32 },
-                    ppid: if i == 0 || name.starts_with('k') || name.starts_with('r') {
-                        1
-                    } else {
-                        812
-                    },
-                    name: (*name).into(),
-                    state: if i < 3 { 'R' } else { 'S' },
-                    threads: *threads,
-                    cpu_ticks: *ticks,
-                    rss_bytes: rss << 20,
-                    fds: Some(*threads * 3 + 4),
-                })
-                .collect();
+            .iter()
+            .zip(&self.procs)
+            .enumerate()
+            .map(|(i, ((name, threads, rss, _), ticks))| Process {
+                pid: if i == 0 { 812 } else { 2 + 37 * i as u32 },
+                ppid: if i == 0 || name.starts_with('k') || name.starts_with('r') {
+                    1
+                } else {
+                    812
+                },
+                name: (*name).into(),
+                state: if i < 3 { 'R' } else { 'S' },
+                threads: *threads,
+                cpu_ticks: *ticks,
+                rss_bytes: rss << 20,
+                fds: Some(*threads * 3 + 4),
+            })
+            .collect();
         let router = all
             .iter()
             .filter(|p| p.name == DAEMON_PROCESS || ROUTER_PROCESSES.contains(&p.name.as_str()))

@@ -796,7 +796,10 @@ impl Collector {
         });
         let read_known = |c: &Self, pids: &[u32]| -> Option<Vec<Process>> {
             pids.iter()
-                .map(|pid| c.process(*pid).filter(|p| ROUTER_PROCESSES.contains(&p.name.as_str())))
+                .map(|pid| {
+                    c.process(*pid)
+                        .filter(|p| ROUTER_PROCESSES.contains(&p.name.as_str()))
+                })
                 .collect()
         };
         let known = match &self.router_pids {
