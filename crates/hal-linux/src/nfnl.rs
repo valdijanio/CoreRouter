@@ -22,12 +22,19 @@ const NLA_HDR: usize = 4;
 const NLA_F_NESTED: u16 = 1 << 15;
 const NLM_F_REQUEST: u16 = 0x1;
 const NLM_F_ACK: u16 = 0x4;
+const NLM_F_ECHO: u16 = 0x8;
 const NLM_F_CREATE: u16 = 0x400;
 const NLM_F_APPEND: u16 = 0x800;
 
 pub const NFNL_SUBSYS_NFTABLES: u16 = 10;
 const NFNL_MSG_BATCH_BEGIN: u16 = 16;
 const NFNL_MSG_BATCH_END: u16 = 17;
+/// `NFNL_BATCH_GENID`: the batch applies only while the ruleset is still
+/// at this generation (0: any), else the kernel answers `ERESTART`.
+const NFNL_BATCH_GENID: u16 = 1;
+/// Where the generation id sits in the batch: after the begin message's
+/// netlink header (16), `nfgenmsg` (4) and the attribute header (4).
+const GENID_AT: usize = 24;
 
 // enum nf_tables_msg_types
 const NFT_MSG_NEWTABLE: u16 = 0;
@@ -40,6 +47,7 @@ const NFT_MSG_NEWSET: u16 = 9;
 const NFT_MSG_DELSET: u16 = 11;
 const NFT_MSG_NEWSETELEM: u16 = 12;
 const NFT_MSG_DELSETELEM: u16 = 14;
+const NFT_MSG_NEWGEN: u16 = 15;
 const NFT_MSG_NEWFLOWTABLE: u16 = 22;
 
 const NFTA_TABLE_NAME: u16 = 1;
@@ -209,6 +217,12 @@ pub struct Batch {
     /// Ids of the named firewall sets created in this batch (nft names
     /// them by id as well in the rules that follow).
     named_ids: std::collections::BTreeMap<String, u32>,
+    /// New rules ask the kernel to echo them back (with their handles).
+    echo: bool,
+    /// Sequence numbers of the new rules that asked for an echo.
+    echoed: Vec<u32>,
+    /// The tables the batch writes (see [`Self::str`]).
+    touched: std::collections::BTreeSet<String>,
 }
 
 impl Batch {
@@ -224,10 +238,33 @@ impl Batch {
             anon_ids: std::collections::VecDeque::new(),
             anon_next: None,
             named_ids: std::collections::BTreeMap::new(),
+            echo: false,
+            echoed: Vec::new(),
+            touched: std::collections::BTreeSet::new(),
         };
+        // The generation id (patched in by `apply`) makes the batch apply
+        // only on the ruleset we last saw (G0.31f).
         b.header(NFNL_MSG_BATCH_BEGIN, NLM_F_REQUEST, 0, NFNL_SUBSYS_NFTABLES);
+        b.be32(NFNL_BATCH_GENID, 0);
         b.close_msg();
         b
+    }
+
+    /// New rules from here on are echoed back with their kernel handles
+    /// (`NLM_F_ECHO`), in the order they were written.
+    pub fn echo_rules(&mut self, on: bool) {
+        self.echo = on;
+    }
+
+    /// How many rules asked for an echo.
+    pub fn echoed(&self) -> usize {
+        self.echoed.len()
+    }
+
+    /// The number the next anonymous set would take (see
+    /// [`Self::name_anon_sets_from`]).
+    pub fn next_anon_set(&self) -> Option<u32> {
+        self.anon_next
     }
 
     fn header(&mut self, kind: u16, flags: u16, family: u8, res_id: u16) {
@@ -258,9 +295,18 @@ impl Batch {
     /// the batch asks for an ACK ([`Self::finish`]): the kernel reports any
     /// error anyway, and one ACK per message of a batch of thousands
     /// overflowed the socket's receive buffer (`ENOBUFS`, G2.8).
+    ///
+    /// The first message asks for an echo: the kernel reads the flag of
+    /// the message after `BATCH_BEGIN` to decide whether to tell us the
+    /// generation the commit made (`NFT_MSG_NEWGEN`, G0.31f).
     fn begin_msg(&mut self, msg: u16, flags: u16) {
         let kind = (NFNL_SUBSYS_NFTABLES << 8) | msg;
-        self.header(kind, NLM_F_REQUEST | flags, self.family, 0);
+        let echo = if self.seq == self.first {
+            NLM_F_ECHO
+        } else {
+            0
+        };
+        self.header(kind, NLM_F_REQUEST | flags | echo, self.family, 0);
     }
 
     fn put(&mut self, kind: u16, data: &[u8]) {
@@ -280,6 +326,13 @@ impl Batch {
     }
 
     fn str(&mut self, kind: u16, s: &str) {
+        // Attribute 1 at the top of every nf_tables message we write is
+        // its table (`NFTA_TABLE_NAME`, `NFTA_CHAIN_TABLE`,
+        // `NFTA_RULE_TABLE`, `NFTA_SET_TABLE`, `NFTA_SET_ELEM_LIST_TABLE`,
+        // `NFTA_FLOWTABLE_TABLE`).
+        if kind == 1 && self.open.is_empty() && !self.touched.contains(s) {
+            self.touched.insert(s.to_owned());
+        }
         let mut d = s.as_bytes().to_vec();
         d.push(0);
         self.put(kind, &d);
@@ -455,10 +508,14 @@ impl Batch {
                 self.anon_ids.push_back(named);
             }
         }
-        let flags = match place {
+        let mut flags = match place {
             Place::End | Place::After(_) => NLM_F_CREATE | NLM_F_APPEND,
             Place::Start => NLM_F_CREATE,
         };
+        if self.echo {
+            flags |= NLM_F_ECHO;
+            self.echoed.push(self.seq);
+        }
         self.begin_msg(NFT_MSG_NEWRULE, flags);
         self.str(NFTA_RULE_TABLE, table);
         self.str(NFTA_RULE_CHAIN, &r.chain);
@@ -943,7 +1000,19 @@ impl Batch {
     }
 
     /// Close the batch: its bytes and the sequence numbers that answer.
-    pub fn finish(mut self) -> (Vec<u8>, std::ops::Range<u32>) {
+    pub fn finish(self) -> (Vec<u8>, std::ops::Range<u32>) {
+        let (bytes, seqs, _) = self.finish_echo();
+        (bytes, seqs)
+    }
+
+    /// The tables this batch writes.
+    pub fn tables(&self) -> &std::collections::BTreeSet<String> {
+        &self.touched
+    }
+
+    /// [`Self::finish`], and the sequence numbers of the rules that asked
+    /// for an echo.
+    pub fn finish_echo(mut self) -> (Vec<u8>, std::ops::Range<u32>, Vec<u32>) {
         let last = self.seq;
         if last != self.first
             && let Some(f) = self.buf.get_mut(self.msg + 6..self.msg + 8)
@@ -953,7 +1022,7 @@ impl Batch {
         }
         self.header(NFNL_MSG_BATCH_END, NLM_F_REQUEST, 0, NFNL_SUBSYS_NFTABLES);
         self.close_msg();
-        (self.buf, self.first..last)
+        (self.buf, self.first..last, self.echoed)
     }
 }
 
@@ -1321,22 +1390,74 @@ mod tests {
 }
 
 #[cfg(target_os = "linux")]
-pub use io::apply;
+pub use io::{Committed, apply, apply_checked, epoch, stamp};
 
 #[cfg(target_os = "linux")]
 mod io {
+    use std::collections::BTreeMap;
     use std::os::fd::AsFd;
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     use corerouter_hal::HalError;
     use netlink_sys::{Socket, protocols::NETLINK_NETFILTER};
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
-    use super::Batch;
+    use super::{Batch, GENID_AT, NFNL_SUBSYS_NFTABLES, NFT_MSG_NEWGEN, NFT_MSG_NEWRULE};
+    use crate::nft_read::{ReadRule, parse_rule};
 
     /// A batch slower than this is a stuck kernel: give up (the kernel
     /// commits the batch whole or not at all, so nothing is half-done).
     const DEADLINE: Duration = Duration::from_secs(30);
+
+    /// `ERESTART`: the ruleset is no longer at the batch's generation.
+    const ERESTART: i32 = 85;
+
+    /// What this process knows of the netns' nftables generation (G0.31f).
+    /// Every batch we send carries the generation our previous one made:
+    /// the kernel refuses it (`ERESTART`, nothing applied) if anyone else
+    /// committed in between, and then `epoch` moves on. So while `epoch`
+    /// stays the same, every commit since was ours, and what we believe
+    /// we loaded is what the kernel holds.
+    struct Generation {
+        last: Option<u32>,
+        epoch: u64,
+        /// Batches of ours applied, by table they wrote.
+        writes: BTreeMap<String, u64>,
+        /// The socket every batch goes through, kept open: closing a
+        /// netfilter socket (`NETLINK_URELEASE`) makes the kernel wait for
+        /// the release of what the last commit deleted (`flush_work` of
+        /// nf_tables' destroy work, an RCU grace period: 10–25 ms after
+        /// any rule went, **medido**), with its commit lock held.
+        sock: Option<Socket>,
+    }
+
+    static GENERATION: Mutex<Generation> = Mutex::new(Generation {
+        last: None,
+        epoch: 0,
+        writes: BTreeMap::new(),
+        sock: None,
+    });
+
+    /// Moves on whenever an nftables commit that is not ours may have
+    /// happened (or we could not tell).
+    pub fn epoch() -> u64 {
+        GENERATION.lock().unwrap_or_else(|e| e.into_inner()).epoch
+    }
+
+    /// [`epoch`] and how many of our batches wrote `table`: while both
+    /// stay the same, nobody changed that table.
+    pub fn stamp(table: &str) -> (u64, u64) {
+        let g = GENERATION.lock().unwrap_or_else(|e| e.into_inner());
+        (g.epoch, g.writes.get(table).copied().unwrap_or(0))
+    }
+
+    /// What a commit echoed back.
+    #[derive(Debug, Default)]
+    pub struct Committed {
+        /// The rules that asked for it ([`Batch::echo_rules`]), in order.
+        pub rules: Vec<ReadRule>,
+    }
 
     fn io(e: impl std::fmt::Display) -> HalError {
         HalError::Io(format!("nftables netlink: {e}"))
@@ -1344,24 +1465,135 @@ mod io {
 
     /// Send `batch` and wait for every answer; the first error refuses it.
     pub fn apply(batch: Batch, what: &str) -> Result<(), HalError> {
-        let (bytes, seqs) = batch.finish();
-        let mut sock = Socket::new(NETLINK_NETFILTER).map_err(io)?;
-        sock.bind_auto().map_err(io)?;
+        apply_checked(batch, what, None).map(|_| ())
+    }
+
+    /// [`apply`], and with `Some(epoch)` only if no one else committed
+    /// since `epoch` was read: `Ok(None)` when someone did (nothing was
+    /// sent, or the kernel refused it whole).
+    pub fn apply_checked(
+        batch: Batch,
+        what: &str,
+        unchanged_since: Option<u64>,
+    ) -> Result<Option<Committed>, HalError> {
+        let tables = batch.tables().clone();
+        let (mut bytes, seqs, echoed) = batch.finish_echo();
+        // Nothing in it: the kernel would commit nothing (and not answer).
+        if seqs.is_empty() {
+            return Ok(Some(Committed::default()));
+        }
+        let mut guard = GENERATION.lock().unwrap_or_else(|e| e.into_inner());
+        let Generation {
+            last,
+            epoch,
+            writes,
+            sock: slot,
+        } = &mut *guard;
+        let checked = match (unchanged_since, *last) {
+            (Some(e), Some(l)) if e == *epoch => Some(l),
+            (Some(_), _) => return Ok(None),
+            (None, l) => l,
+        };
+        let sock = match slot {
+            Some(s) => s,
+            None => {
+                let mut s = Socket::new(NETLINK_NETFILTER).map_err(io)?;
+                s.bind_auto().map_err(io)?;
+                slot.insert(s)
+            }
+        };
+        // What an earlier batch left unread (answers after an error).
+        drain(sock);
         // The whole batch is one message to the kernel: the send buffer
         // must hold it (as nft does, SO_SNDBUFFORCE; we are CAP_NET_ADMIN).
         // As root of the real router SO_SNDBUFFORCE lifts the limit; in a
         // user namespace (tests) it is refused and SO_SNDBUF goes up to
         // twice `net.core.wmem_max` (8 MiB by default: some 150 000
-        // subscribers in one batch), as `nft` does.
+        // subscribers in one batch), as `nft` does. Echoed rules come
+        // back in the receive buffer (the callers bound how many).
         let want = bytes.len().saturating_add(65_536);
         use nix::sys::socket::{setsockopt, sockopt};
         if setsockopt(&sock.as_fd(), sockopt::SndBufForce, &want).is_err() {
             let _ = setsockopt(&sock.as_fd(), sockopt::SndBuf, &want);
         }
-        if setsockopt(&sock.as_fd(), sockopt::RcvBufForce, &(1usize << 20)).is_err() {
-            let _ = setsockopt(&sock.as_fd(), sockopt::RcvBuf, &(1usize << 20));
+        if setsockopt(&sock.as_fd(), sockopt::RcvBufForce, &(4usize << 20)).is_err() {
+            let _ = setsockopt(&sock.as_fd(), sockopt::RcvBuf, &(4usize << 20));
         }
-        sock.send(&bytes, 0).map_err(|e| {
+        let mut genid = checked;
+        loop {
+            if let Some(at) = bytes.get_mut(GENID_AT..GENID_AT + 4) {
+                at.copy_from_slice(&genid.unwrap_or(0).to_be_bytes());
+            }
+            let outcome = match exchange(sock, &bytes, &seqs, &echoed, what) {
+                Ok(o) => o,
+                Err(e) => {
+                    // A socket that failed may hold half an answer: the
+                    // next batch opens another (a refused batch is fine).
+                    if matches!(e, HalError::Io(_)) {
+                        *slot = None;
+                    }
+                    return Err(e);
+                }
+            };
+            match outcome {
+                Outcome::Done(c, made) => {
+                    // Proven contiguous only when the kernel checked the
+                    // generation we knew.
+                    if genid.is_none() || made.is_none() {
+                        *epoch = epoch.wrapping_add(1);
+                    }
+                    *last = made;
+                    for t in tables {
+                        let n = writes.entry(t).or_insert(0);
+                        *n = n.wrapping_add(1);
+                    }
+                    return Ok(Some(c));
+                }
+                Outcome::Restart => {
+                    *epoch = epoch.wrapping_add(1);
+                    *last = None;
+                    if unchanged_since.is_some() || genid.is_none() {
+                        return Ok(None);
+                    }
+                    // Someone else committed: send it again unchecked.
+                    genid = None;
+                }
+            }
+        }
+    }
+
+    /// Read and drop whatever is queued on `sock`, without waiting.
+    fn drain(sock: &mut Socket) {
+        let mut buf = vec![0u8; 1 << 16];
+        loop {
+            let mut fds = [PollFd::new(sock.as_fd(), PollFlags::POLLIN)];
+            if !matches!(poll(&mut fds, PollTimeout::ZERO), Ok(n) if n > 0) {
+                return;
+            }
+            // ENOBUFS (an overrun) is reported once, then reading goes on.
+            if let Err(e) = sock.recv(&mut &mut buf[..], 0)
+                && e.raw_os_error() != Some(105)
+            {
+                return;
+            }
+        }
+    }
+
+    enum Outcome {
+        /// Applied: what was echoed and the generation it made.
+        Done(Committed, Option<u32>),
+        /// Refused whole: the ruleset moved past the batch's generation.
+        Restart,
+    }
+
+    fn exchange(
+        sock: &mut Socket,
+        bytes: &[u8],
+        seqs: &std::ops::Range<u32>,
+        echoed: &[u32],
+        what: &str,
+    ) -> Result<Outcome, HalError> {
+        sock.send(bytes, 0).map_err(|e| {
             if e.raw_os_error() == Some(90) {
                 HalError::Rejected(format!(
                     "{what}: the batch ({} KiB) does not fit the netlink send buffer; nothing changed",
@@ -1371,13 +1603,17 @@ mod io {
                 io(e)
             }
         })?;
-        // Only the last message answers on success (see `begin_msg`).
-        let mut pending: std::collections::BTreeSet<u32> =
-            seqs.clone().last().into_iter().collect();
+        // Only the last message answers on success (see `begin_msg`); a
+        // refused generation answers on the begin message.
+        let begin = seqs.start.wrapping_sub(1);
+        let last = seqs.clone().last();
+        let mut done = false;
         let start = Instant::now();
         let mut buf = vec![0u8; 1 << 16];
         let mut first_error: Option<(u32, i32)> = None;
-        while !pending.is_empty() {
+        let mut committed = Committed::default();
+        let mut made = None;
+        loop {
             let left = DEADLINE.saturating_sub(start.elapsed());
             if left.is_zero() {
                 return Err(HalError::Io(format!(
@@ -1385,27 +1621,51 @@ mod io {
                     DEADLINE.as_secs()
                 )));
             }
-            let ms = u16::try_from(left.as_millis().min(1000)).unwrap_or(1000);
+            // After the last ACK, only what is already queued is read.
+            let ms = if done {
+                0
+            } else {
+                u16::try_from(left.as_millis().min(1000)).unwrap_or(1000)
+            };
             let mut fds = [PollFd::new(sock.as_fd(), PollFlags::POLLIN)];
             if poll(&mut fds, PollTimeout::from(ms)).map_err(io)? == 0 {
+                if done {
+                    break;
+                }
                 continue;
             }
             let n = sock.recv(&mut &mut buf[..], 0).map_err(io)?;
-            for (seq, code) in acks(buf.get(..n).unwrap_or(&[])) {
-                pending.remove(&seq);
-                if code != 0 && first_error.is_none() {
-                    first_error = Some((seq, code));
+            for m in messages(buf.get(..n).unwrap_or(&[])) {
+                match m {
+                    Msg::Ack(seq, code) => {
+                        if code == ERESTART && seq == begin {
+                            return Ok(Outcome::Restart);
+                        }
+                        if code != 0 && first_error.is_none() {
+                            first_error = Some((seq, code));
+                        }
+                        if Some(seq) == last {
+                            done = true;
+                        }
+                    }
+                    Msg::Nft(kind, seq, body) => match kind {
+                        NFT_MSG_NEWGEN => made = gen_id(body),
+                        // `echoed` is in ascending order.
+                        NFT_MSG_NEWRULE if echoed.binary_search(&seq).is_ok() => {
+                            committed.rules.extend(parse_rule(body));
+                        }
+                        _ => {}
+                    },
                 }
             }
             // After an error the kernel aborts the batch: the remaining
             // messages may not all answer.
-            if first_error.is_some() && pending.iter().all(|s| *s > first_error.map_or(0, |e| e.0))
-            {
+            if first_error.is_some_and(|(s, _)| last.is_none_or(|l| l > s)) {
                 break;
             }
         }
         match first_error {
-            None => Ok(()),
+            None => Ok(Outcome::Done(committed, made)),
             Some((seq, errno)) => Err(HalError::Rejected(format!(
                 "{what}: the kernel refused message {} of the batch ({}); nothing changed",
                 seq.wrapping_sub(seqs.start),
@@ -1414,8 +1674,22 @@ mod io {
         }
     }
 
-    /// (seq, errno) of every NLMSG_ERROR in `buf` (0: an ACK).
-    pub(super) fn acks(buf: &[u8]) -> Vec<(u32, i32)> {
+    /// The generation a batch's commit made, from the `NFT_MSG_NEWGEN` the
+    /// kernel echoes (`NFTA_GEN_ID`).
+    fn gen_id(body: &[u8]) -> Option<u32> {
+        crate::genl::attrs(body)
+            .find(|a| a.kind == 1)
+            .and_then(|a| Some(u32::from_be_bytes(a.data.get(..4)?.try_into().ok()?)))
+    }
+
+    enum Msg<'a> {
+        /// `NLMSG_ERROR`: (seq, errno; 0 is an ACK).
+        Ack(u32, i32),
+        /// An nf_tables message: its type, seq and body (after `nfgenmsg`).
+        Nft(u16, u32, &'a [u8]),
+    }
+
+    fn messages(buf: &[u8]) -> Vec<Msg<'_>> {
         let mut out = Vec::new();
         let mut rest = buf;
         while let Some(hdr) = rest.get(..16) {
@@ -1430,17 +1704,20 @@ mod io {
             let kind = hdr
                 .get(4..6)
                 .and_then(|b| b.try_into().ok())
-                .map(u16::from_ne_bytes);
+                .map_or(0, u16::from_ne_bytes);
             let len = usize::try_from(len).unwrap_or(0);
             if len < 16 {
                 break;
             }
-            if kind == Some(2) {
-                let code = rest
+            let m = rest.get(..len).unwrap_or(rest);
+            if kind == 2 {
+                let code = m
                     .get(16..20)
                     .and_then(|b| b.try_into().ok())
                     .map_or(0, i32::from_ne_bytes);
-                out.push((seq, code.saturating_neg()));
+                out.push(Msg::Ack(seq, code.saturating_neg()));
+            } else if kind >> 8 == NFNL_SUBSYS_NFTABLES {
+                out.push(Msg::Nft(kind & 0xff, seq, m.get(20..).unwrap_or(&[])));
             }
             rest = rest.get(len.div_ceil(4) * 4..).unwrap_or(&[]);
         }

@@ -7,7 +7,7 @@
 use corerouter_hal::system_resource::{MAX_PROCESSES, Sample, SensorKind};
 use serde_json::{Value, json};
 
-use super::args::{opt_str, opt_u32};
+use super::args::{opt_bool, opt_str, opt_u32};
 use super::{CommandSpec, always};
 use crate::system_resource::{ResourceMonitor, hottest, load, memory_used, percent};
 use crate::{EngineError, Result, Session};
@@ -24,7 +24,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{} → [{cpu, load, user, system, irq, softirq, iowait, steal, frequency_mhz, irq_rate, softirq_rate, net_rx_rate, net_tx_rate}]",
         always, cpu_print),
     cmd!(query "system.resource.process.print", "Resources Processes", [], None,
-        "{sort?: cpu|memory|name|pid|threads, limit?: int} → [{pid, ppid, name, state, threads, cpu, memory, fds (open descriptors; null: unreadable)}]",
+        "{sort?: cpu|memory|name|pid|threads, limit?: int, threads?: bool (only the router's own processes — daemon, init, FRR — each with its threads)} → [{pid, ppid, name, state, threads, cpu, memory, fds (open descriptors; null: unreadable), tasks? (with threads: [{tid, name, state, cpu (% of one CPU)}], busiest first)}]",
         always, process_print),
     cmd!(query "system.resource.network.print", "Resources Network", [], None,
         "{} → [{name, running, speed_mbps, rx_bits_per_second, tx_bits_per_second, rx_packets_per_second, tx_packets_per_second, rx_errors, tx_errors, rx_drops, tx_drops, errors_per_second, drops_per_second}]",
@@ -174,12 +174,16 @@ fn cpu_print(s: &mut Session, _: &Value) -> Result<Value> {
 
 fn process_print(s: &mut Session, p: &Value) -> Result<Value> {
     let sort = opt_str(p, "sort")?.unwrap_or("cpu");
+    let threads = opt_bool(p, "threads")?.unwrap_or(false);
     if !matches!(sort, "cpu" | "memory" | "name" | "pid" | "threads") {
         return Err(EngineError::bad("sort", "must be cpu, memory, name, pid or threads"));
     }
     let limit = opt_u32(p, "limit")?.unwrap_or(DEFAULT_PROCESSES);
     if limit == 0 || limit as usize > MAX_PROCESSES {
         return Err(EngineError::bad("limit", format!("must be 1..={MAX_PROCESSES}")));
+    }
+    if threads {
+        return router_threads(s, sort, limit);
     }
     let m = monitor(s, true)?;
     let cpu = m.process_cpu();
@@ -206,6 +210,51 @@ fn process_print(s: &mut Session, p: &Value) -> Result<Value> {
                     "pid": x.pid, "ppid": x.ppid, "name": x.name,
                     "state": x.state.to_string(), "threads": x.threads,
                     "cpu": c.map(r1f), "memory": x.rss_bytes, "fds": x.fds,
+                })
+            })
+            .collect(),
+    ))
+}
+
+/// G1.6qe, `threads: true`: the router's own processes from every
+/// reading (no list of the whole machine needed), each with its threads
+/// and their CPU between the two last readings (a second apart while
+/// someone looks).
+fn router_threads(s: &mut Session, sort: &str, limit: u32) -> Result<Value> {
+    let m = monitor(s, false)?;
+    let l = last(m)?;
+    let (cpu, task_cpu) = m.router_cpu();
+    let mut rows: Vec<_> = l.router.iter().map(|x| (x, cpu.get(&x.pid).copied())).collect();
+    match sort {
+        "memory" => rows.sort_by_key(|a| std::cmp::Reverse(a.0.rss_bytes)),
+        "name" => rows.sort_by(|a, b| a.0.name.cmp(&b.0.name)),
+        "pid" => rows.sort_by_key(|x| x.0.pid),
+        "threads" => rows.sort_by_key(|a| std::cmp::Reverse(a.0.threads)),
+        _ => rows.sort_by(|a, b| b.1.unwrap_or(-1.0).total_cmp(&a.1.unwrap_or(-1.0))),
+    }
+    rows.truncate(limit as usize);
+    Ok(Value::Array(
+        rows.into_iter()
+            .map(|(x, c)| {
+                let mut tasks: Vec<_> = x
+                    .tasks
+                    .iter()
+                    .map(|t| (t, task_cpu.get(&(x.pid, t.tid)).copied()))
+                    .collect();
+                tasks.sort_by(|a, b| {
+                    b.1.unwrap_or(-1.0).total_cmp(&a.1.unwrap_or(-1.0)).then(a.0.tid.cmp(&b.0.tid))
+                });
+                let tasks: Vec<Value> = tasks
+                    .into_iter()
+                    .map(|(t, c)| {
+                        json!({"tid": t.tid, "name": t.name, "state": t.state.to_string(), "cpu": c.map(r1f)})
+                    })
+                    .collect();
+                json!({
+                    "pid": x.pid, "ppid": x.ppid, "name": x.name,
+                    "state": x.state.to_string(), "threads": x.threads,
+                    "cpu": c.map(r1f), "memory": x.rss_bytes, "fds": x.fds,
+                    "tasks": tasks,
                 })
             })
             .collect(),
@@ -263,6 +312,32 @@ mod tests {
         assert!(cores[0]["softirq"].as_f64().unwrap() > cores[1]["softirq"].as_f64().unwrap(),
             "core 0 takes the receive work in the lab");
         assert!(cores[0]["net_rx_rate"].as_f64().unwrap() > 0.0);
+    }
+
+    /// G1.6qe: `threads: true` gives the router's processes and each of
+    /// the daemon's threads, its CPU in % of one core, busiest first.
+    #[test]
+    fn threads_of_the_router_processes() {
+        let mut s = Session::virtual_lab();
+        let v = s.execute("system.resource.process.print", &json!({"threads": true})).unwrap();
+        let rows = v.as_array().unwrap();
+        let names: Vec<&str> = rows.iter().map(|r| r["name"].as_str().unwrap()).collect();
+        assert_eq!(names.len(), 4, "{names:?}");
+        assert_eq!(names[0], "corerouter-daemon", "the busiest of them");
+        let tasks = rows[0]["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 24);
+        assert_eq!(tasks[0]["name"], "pppoe-ctl", "{}", tasks[0]);
+        let cpu: Vec<f64> = tasks.iter().map(|t| t["cpu"].as_f64().unwrap()).collect();
+        assert!(cpu[0] >= 40.0 && cpu[0] <= 100.0, "% of one core: {cpu:?}");
+        assert!(cpu.windows(2).all(|w| w[0] >= w[1]), "busiest first: {cpu:?}");
+        assert_eq!(cpu.last(), Some(&0.0));
+        assert!(rows[1]["tasks"].as_array().unwrap().is_empty());
+        let v = s
+            .execute("system.resource.process.print", &json!({"threads": true, "sort": "memory", "limit": 1}))
+            .unwrap();
+        assert_eq!(v[0]["name"], "bgpd");
+        let e = s.execute("system.resource.process.print", &json!({"threads": "yes"})).unwrap_err();
+        assert!(e.to_string().contains("threads"), "{e}");
     }
 
     #[test]

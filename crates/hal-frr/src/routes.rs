@@ -33,6 +33,7 @@ fn communities(words: &str, e: &mut BgpRouteEntry) {
         match parse_community(w) {
             Ok(CommunityValue::Normal(c)) => e.communities.push(c),
             Ok(CommunityValue::Large(l)) => e.large.push((l.0, l.1, l.2)),
+            Ok(CommunityValue::Ext(x)) => e.ext.push(x.0),
             Err(_) => {}
         }
     }
@@ -166,6 +167,17 @@ pub fn best_json(json: &str) -> Result<Vec<BgpRouteEntry>, String> {
                     if let Some(n) = a.as_u64().and_then(|n| u32::try_from(n).ok()) {
                         e.as_path.push(n);
                     }
+                }
+            }
+        }
+        // G3.9fc: FRR writes them as text (`RT:65001:7 SoO:…`).
+        if let Some(t) = p
+            .pointer("/extendedCommunity/string")
+            .and_then(Value::as_str)
+        {
+            for w in t.split_whitespace().take(256) {
+                if let Some(x) = corerouter_proto_bgp::filter::Ext::from_frr(w) {
+                    e.ext.push(x.0);
                 }
             }
         }

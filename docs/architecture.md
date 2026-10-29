@@ -163,7 +163,11 @@ nft 1.0.9, build release, netns sem root, 2026-10-27,
   (`NEWRULE` com posição), os elementos e as chains/sets que mudaram. Regra igual mantém o handle
   e os contadores. Tabela alterada por terceiros ou set com outra definição: troca inteira.
 - **O kernel é o gargalo do commit:** qualquer lote que remove algo espera um período de graça
-  RCU, 12–28 ms (o próprio `nft delete rule` leva isso); só acrescentar custa ~0,5 ms.
+  RCU, 12–28 ms (o próprio `nft delete rule` leva isso); só acrescentar custa ~0,5 ms. *Revisto na
+  G0.31f:* a espera não é do commit, é de **fechar** o socket netfilter logo depois
+  (`NETLINK_URELEASE` → `nft_rcv_nl_event` → `flush_work` do destroy work, que faz
+  `synchronize_rcu`, com o `commit_mutex` preso). Com o socket dos lotes e o leitor do firewall
+  abertos o processo todo, remover uma regra custa 0,06–0,4 ms (**medido**).
 - **Sets anônimos custam O(sets) cada no kernel** (nome e busca por nome varrem a lista da
   tabela): 10 000 regras com `th dport { 22, 80, 443 }` levavam 22 s, com `ct state { … }` 3,2 s,
   no `nft` e em nós. Listas de portas viraram sets nomeados compartilhados por conteúdo
@@ -176,6 +180,22 @@ nft 1.0.9, build release, netns sem root, 2026-10-27,
 - **O dump fica:** 12 500 regras são 6,3 MB e 25–28 ms só de kernel; é o que detecta a tabela
   mexida por outro. Guardar handles e conferir o `genid` evitaria o dump, mas o genid muda a cada
   commit de qualquer tabela (o CGNAT muda por assinante), então o cache quase nunca valeria.
+  *Revisto na G0.31f:* todo lote nosso leva o `NFNL_BATCH_GENID` da geração que o lote anterior
+  nosso criou (o kernel a devolve em `NFT_MSG_NEWGEN` quando a primeira mensagem pede eco); se
+  outro processo fez commit no meio, o kernel recusa o lote inteiro (`ERESTART`) e a época do
+  `nfnl` avança. Os nossos commits (CGNAT, fast path, entradas dinâmicas) não invalidam nada; só
+  os de terceiros. O dump ficou para o primeiro commit e para depois de deriva.
+
+**G0.31f, commit do firewall sem ler o kernel (medido).** Mudar 1 regra entre 10 000: 101,6 →
+3,75 ms; entre 1 000: 28,7 → 0,37 ms. O commit guarda o que carregou (o `Firewall` da config,
+que divide os blocos do `CowList` com a próxima, os handles de cada regra e quantas regras
+precisam de cada chain e set), acha as regras que mudaram pelos blocos que as duas configs não
+dividem mais, monta e diferencia só essas e manda as remoções por handle e as inserções depois do
+handle da regra anterior, num lote com eco das regras novas (os handles delas). Comparado: dump +
+dois programas inteiros (o que havia, 38 + 15 + 15 ms com 10 000 regras, em paralelo) × estado
+guardado (~1,5 ms nosso). O que sobra é do kernel: uma regra com veredito, `reject` ou `nat`
+marca a tabela para revalidar inteira (`NFT_VALIDATE_NEED`), O(regras) a cada commit. Detalhes
+e deriva em `crates/hal-linux/src/fw_delta.rs`.
 - O `nft` não roda mais em produção; a imagem perde o jansson (`nft -j`).
 
 #### 1.2.2 CGNAT sem portas: nfqueue só dos quase cheios (G2.7, **medido**)
@@ -1368,6 +1388,37 @@ papel do data plane, ou, se ele não servir, derrubando o vizinho pelo vty.
   em threads, tem dampening, histórico e comandos (`docs/bfd.md`).
 - **Revisar** se o lote de syscalls (G3.6j) não pagar e se aparecer pedido de dezenas de milhares
   de sessões ou 3,3 ms (BFD em XDP, G3.6f).
+
+### Router Advertisement em Rust puro, um socket só (G3.9ha)
+
+**Comparado (**medido** em 2026-10-29, Ryzen AI MAX+ 395, namespace de user e de rede,
+interfaces dummy):**
+
+| | 100 interfaces | 1000 interfaces |
+|---|---|---|
+| Emissor Rust, um socket raw ICMPv6 | 1,26 µs/RA, 1 fd | 12,2 µs/RA, 1 fd |
+| Emissor Rust, um socket por interface | 2,57 µs/RA | 39,5 µs/RA, 1000 fds |
+| radvd 2.19, até sair a 1ª rodada | 57 ms, 2,5 MB | 2,4 s, 5,4 s de CPU |
+| radvd, recarga por SIGHUP | 72 ms | morreu com o sinal |
+
+**Fica o emissor próprio** (serviço `router-advertisement` do daemon), com uma thread e um socket.
+
+**Motivos:**
+- o codec do RA já existia, com fuzz (`proto-pppoe/src/nd.rs`, do BNG);
+- não há processo externo, arquivo de config nem sinal;
+- o estado é estruturado e chega a `ipv6.nd.list`: contadores, prefixos depreciados e
+  conflitos (RFC 4861 §6.2.7).
+
+**Desempenho e paralelismo:**
+- **Lock:** o plano (`engine::ipv6_nd::plan`) custa 257 µs com 1000 VLANs, sob o lock da
+  sessão (`benches/ipv6_nd.rs`). Ele só é refeito quando a revisão rodando muda.
+- **Envio:** a rodada de 1000 interfaces custa ~12 ms a cada 200–600 s. Mais threads não
+  ajudam.
+- **Custo por RA:** cresce com o número de interfaces, nas duas formas de socket. A causa
+  provável é a busca da rota `ff00::/8` por interface no kernel, sem confirmação.
+
+**Revisar** se aparecer pedido de dezenas de milhares de interfaces anunciando, ou de RA a menos
+de 3 s.
 
 ### MPLS: kernel por netlink próprio, LDP no FRR (G3.5)
 

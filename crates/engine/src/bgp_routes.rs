@@ -61,6 +61,10 @@ pub fn to_route(e: BgpRouteEntry) -> Option<Route> {
     l.sort_unstable();
     l.dedup();
     r.large = l;
+    let mut x: Vec<corerouter_proto_bgp::filter::Ext> = e.ext.into_iter().map(corerouter_proto_bgp::filter::Ext).collect();
+    x.sort_unstable();
+    x.dedup();
+    r.ext = x;
     r.med = e.med;
     r.local_pref = e.local_pref;
     Some(r)

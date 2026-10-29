@@ -91,3 +91,24 @@ fn the_readout_is_off_by_default_and_a_preference() {
     assert!(h.has_text_containing("CPU "));
     assert!(h.app.prefs().contains(r#""readout":true"#));
 }
+
+/// G1.6qe: the Threads tab lists each thread of the router's processes,
+/// the busiest first, and says when one fills a core.
+#[test]
+fn the_threads_tab_shows_the_daemon_threads() {
+    let mut h = open();
+    assert!(h.has_text("Threads"));
+    tab(&mut h, Tab::Threads);
+    for text in ["pppoe-ctl", "radius-aaa", "dns-lookup-0", "corerouter-daemon", "CPU (1 core)", "TID"] {
+        assert!(h.has_text(text), "{text}");
+    }
+    let p = h.app.panel_mut::<ResourcesPanel>().unwrap();
+    let rows = p.threads.as_ref().unwrap().as_array().unwrap();
+    assert_eq!(rows[0]["tasks"][0]["name"], "pppoe-ctl", "the engine sorts the threads");
+    let hot = rows[0]["tasks"][0]["cpu"].as_f64().unwrap();
+    if hot >= 90.0 {
+        assert!(h.has_text_containing("pppoe-ctl: "), "the chip names the hot thread");
+    } else {
+        assert!(h.has_text("No thread fills a core"));
+    }
+}

@@ -515,7 +515,7 @@ case_md5() {
 case_communities() {
   # CHR tags what it sends: a normal, a large and an extended community.
   rosx '/routing filter rule add chain=cr-out rule="if (dst == 203.0.113.0/24) { set bgp-communities 65001:100,no-export; set bgp-large-communities 65001:1:2; set bgp-ext-communities rt:65001:7; accept } accept"' >/dev/null
-  cr1 routing.filter.rule.add '{"chain":"chr-out","rule":"if (dst == 100.64.39.0/24) { append bgp-communities 65000:200; append bgp-large-communities 65000:3:4; accept } reject"}' >/dev/null
+  cr1 routing.filter.rule.add '{"chain":"chr-out","rule":"if (dst == 100.64.39.0/24) { append bgp-communities 65000:200; append bgp-large-communities 65000:3:4; append bgp-ext-communities rt:65000:9; accept } reject"}' >/dev/null
   ebgp4_up '{"output_filter":"chr-out"}' 'output.filter-chain=cr-out'
   local ms r
   ms=$(wait_for 60 cr_up 1 chr4) || { result communities FAIL "no session"; ebgp4_down; return; }
@@ -527,13 +527,20 @@ case_communities() {
     || result communities FAIL "large communities on CR1: $r"
   local ext; ext=$(jq -r .ext <<< "$r")
   [[ $ext == *65001:7* ]] && result communities OK "RFC 4360 extended from CHR reaches bgpd: $ext" || result communities FAIL "extended community in bgpd: $ext"
-  result communities INFO "extended communities: route.list has no column for them and routing.filter has no bgp-ext-communities (G3.9fc)"
+  # G3.9fc: our chain reads them: includes → local-pref, then delete the RTs.
+  cr1 routing.filter.rule.add '{"chain":"chr-x","rule":"if (bgp-ext-communities includes rt:65001:7) { set bgp-local-pref 222 } delete bgp-ext-communities rt; accept"}' >/dev/null
+  cr1 routing.bgp.connection.set '{"id":"chr4","input_filter":"chr-x"}' >/dev/null
+  lp222() { [ "$(bgp_path cf1 203.0.113.0/24 | jq -r .local_pref)" = 222 ]; }
+  ms=$(wait_for 30 lp222) && result communities OK "bgp-ext-communities includes rt:65001:7 (CHR's) → local-pref 222" || result communities FAIL "ext match on CR1: $(bgp_path cf1 203.0.113.0/24)"
+  [ "$(bgp_path cf1 203.0.113.0/24 | jq -r '.ext // ""')" = "" ] && result communities OK "delete bgp-ext-communities rt: no RT left on CR1" || result communities FAIL "after delete rt: $(bgp_path cf1 203.0.113.0/24 | jq -c .ext)"
   # no-export: CR1 must not send it on to an eBGP neighbor (RFC 1997).
   ms=$(wait_for 30 ros_via 100.64.39.0/24 10.39.1.2) || true
   local rr; rr=$(ros_battr 100.64.39.0/24)
   [[ $rr == *65000:200* ]] && result communities OK "CR1's append reaches CHR: $(jq -c '{"bgp.communities", "bgp.large-communities"}' <<< "$rr")" \
     || result communities FAIL "CHR route from CR1: $rr"
   [[ $rr == *65000:3:4* ]] || result communities FAIL "large community from CR1 not on CHR: $rr"
+  local xr; xr=$(jq -r '[to_entries[] | select(.key | test("ext")) | .value] | join(" ")' <<< "$rr")
+  [[ $xr == *65000:9* ]] && result communities OK "CR1's append bgp-ext-communities rt:65000:9 reaches CHR: $xr" || result communities FAIL "extended community from CR1 not on CHR: $rr"
   # A list match on our side: reject what carries 65001:100.
   cr1 routing.filter.community-list.add '{"name":"from-chr","communities":"65001:100"}' >/dev/null
   cr1 routing.filter.rule.add '{"chain":"chr-in","rule":"if (bgp-communities any-list from-chr) { reject } accept"}' >/dev/null

@@ -77,6 +77,9 @@ pub const OWNED: Owned = &[
     ("bgp as-path access-list CR-", &[Daemon::Bgpd]),
     ("bgp community-list standard CR-", &[Daemon::Bgpd]),
     ("bgp large-community-list standard CR-", &[Daemon::Bgpd]),
+    // G3.9fc: extended communities (RFC 4360).
+    ("bgp extcommunity-list standard CR-", &[Daemon::Bgpd]),
+    ("bgp extcommunity-list expanded CR-", &[Daemon::Bgpd]),
     ("route-map CR-", &[Daemon::Bgpd]),
     // G3.2c: RPKI validators and the route-map that drops invalid routes;
     // `match rpki` exists only in bgpd (its rpki module).

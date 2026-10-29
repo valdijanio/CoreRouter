@@ -32,6 +32,9 @@ pub struct Ipv6 {
     /// `/ipv6 pool`, `/ipv6 dhcp-server` and `/ipv6 dhcp-relay` (G4.2c).
     #[serde(skip_serializing_if = "crate::dhcp6_server::Dhcp6Servers::is_empty")]
     pub dhcp_server: crate::dhcp6_server::Dhcp6Servers,
+    /// `/ipv6 nd` and `/ipv6 nd prefix` (G3.9ha): Router Advertisements.
+    #[serde(skip_serializing_if = "crate::ipv6_nd::Nd::is_empty")]
+    pub nd: crate::ipv6_nd::Nd,
 }
 
 impl Ipv6 {

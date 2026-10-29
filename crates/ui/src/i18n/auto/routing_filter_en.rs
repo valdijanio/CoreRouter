@@ -15,7 +15,7 @@ RouterOS `output.filter-chain`: the chain the routes sent to this neighbor go th
     (r##"filter.community_list"##, r##"## What it is
 A named list of communities, normal and large."##),
     (r##"filter.community_list.communities"##, r##"## What it is
-Normal communities (RFC 1997: `65000:100`, or `no-export`, `no-advertise`, `blackhole`, `graceful-shutdown`…) and large ones (RFC 8092: `65000:1:2`)."##),
+Normal communities (RFC 1997: `65000:100`, or `no-export`, `no-advertise`, `blackhole`, `graceful-shutdown`…) and large ones (RFC 8092: `65000:1:2`) and extended ones (RFC 4360, G3.9fc): Route Target `rt:65000:1`, `rt:192.0.2.1:7`, `rt:4200000000:1` (4-octet AS, RFC 5668) and Site of Origin `soo:…`, or the 16 hex digits of one of them (`0x0002fde800000001`). It is also RouterOS's `community-ext-list`: each matcher takes the kind it needs."##),
     (r##"filter.impact"##, r##"## What it is
 What committing the pending changes does to the routes of each connection, measured on the same routes the Preview uses: prefixes withdrawn from (or no longer accepted from) a neighbor, new ones, and attributes changed."##),
     (r##"filter.list.name"##, r##"## What it is
@@ -54,7 +54,7 @@ Write the chains (Rules), then set the connection's Input Filter and Output Filt
 One rule in the RouterOS v7 language: `if (dst in bogons || dst-len > 24) { reject }`, `if (bgp-as-path "^64500_") { set bgp-local-pref 200; accept }`. The preview below counts how many routes the chain passes with this change.
 
 ## Language
-Matchers: `dst in|==|!=`, `dst-len`, `afi`, `protocol`, `bgp-as-path` (FRR/Cisco regex, `_` is a separator), `bgp-communities` and `bgp-large-communities` with `includes`, `any`, `equal` (and `-list`). Joined with `&&`, `||`, `not`, parentheses. Actions: `accept`, `reject`, `return`, `jump CHAIN`, `set bgp-local-pref|bgp-med|bgp-path-prepend|bgp-communities|bgp-large-communities`, `set gw ADDRESS` (the next hop of the routes of its family), `append …`, `delete …`."##),
+Matchers: `dst in|==|!=`, `dst-len`, `afi`, `protocol`, `bgp-as-path` (FRR/Cisco regex, `_` is a separator), `bgp-communities` and `bgp-large-communities` with `includes`, `any`, `equal` (and `-list`), `bgp-ext-communities` with those and `subset`. Joined with `&&`, `||`, `not`, parentheses. Actions: `accept`, `reject`, `return`, `jump CHAIN`, `set bgp-local-pref|bgp-med|bgp-path-prepend|bgp-communities|bgp-large-communities`, `set gw ADDRESS` (the next hop of the routes of its family), `append …`, `delete …`; for extended ones also `set|append|delete|filter bgp-ext-communities` (`set` replaces them all, `delete rt|soo|other` removes a kind, `filter` keeps only the given ones)."##),
     (r##"filter.rule.actions"##, r##"## What it is
 What the rule does: green accepts, red rejects, blue changes an attribute."##),
     (r##"filter.rule.chain"##, r##"## What it is

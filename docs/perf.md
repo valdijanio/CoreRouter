@@ -2653,3 +2653,103 @@ route_scale`, `--save-baseline antes` na base (`stream/G0.31b-offlock-queries`, 
 | import de 60 000 rotas, 2 `engine.batch` de 30 000 (cada um um commit) | 2,18 s + 6,35 s | 0,26 s + 0,46 s |
 | `route_scale/check/add_remove` (modo transacional, `ip.route.add` + `remove` com 60 000) | 297 µs | 30,6 µs (−91 %) |
 | `route_scale/commit/add_remove` (modo imediato, dois commits; G0.31e) | 146 ms | 137 ms (ruído, p = 0,13) |
+
+### Commit de uma rota com 60 000 rotas (G0.31e)
+
+**Medido** em 2026-10-29, AMD Ryzen AI Max+ 395 (32 threads), build release, máquina
+compartilhada (load 8–25). `--save-baseline` na branch da G0.31d (#432, com um `owned_routes`
+provisório que faz o que o código antigo fazia) e `--baseline` aqui. Rotas /24 por um gateway em
+`ether1`.
+
+| Caso | Antes | Depois |
+|---|---|---|
+| `route_plan/plan/one_more` (hal-linux, plano do kernel de uma rota a mais) | 20,1 ms | 54,8 µs (−99,7 %) |
+| `route_plan/owned/one_more` (rotas nossas para o executor) | 16,4 ms | 0,31 µs |
+| `route_scale/commit/add_remove` (engine, backend virtual, dois commits) | 122 ms | 6,04 ms (−94,8 %) |
+| `route_scale/check/add_remove` (transacional, sem commit) | 28,3 µs | 25,3 µs |
+| import de 60 000 rotas, 2 `engine.batch` de 30 000 | 0,27 s + 0,50 s | 0,28 s + 0,41 s |
+
+Onde iam os ~61 ms de um commit antes (`perf`, backend virtual): validação das rotas ~40 %
+(`route_checks` e as comparações do `BTreeMap`), `VirtualHal::carry` ~30 % (rotas do kernel das
+duas configs inteiras), `route::reach` e alocação o resto.
+
+### Commit de uma regra de firewall (G0.31f)
+
+**Medido** em 2026-10-29, AMD Ryzen AI MAX+ 395 (32 threads), kernel 7.0, build release, netns
+sem root, máquina compartilhada (load 17–21). `cargo bench -p corerouter-hal-linux --bench
+netns_firewall`, `--save-baseline antes` na `main` (a1a50c55) e `--baseline antes` na branch.
+Regras variadas (endereços, lista de portas, address list, estados), a do meio muda de ação.
+
+| Caso | Antes | Depois |
+|---|---|---|
+| `change_one/nfnetlink/100` | 16,8 ms | 39 µs (−99,8 %) |
+| `change_one/nfnetlink/1000` | 28,7 ms | 0,37 ms (−98,7 %) |
+| `change_one/nfnetlink/10000` | 101,6 ms | 3,75 ms (−96,3 %) |
+| `load/nfnetlink/100` | ~19,7 ms | 1,0 ms (−94,9 %) |
+| `load/nfnetlink/1000` | 60,3 ms | 10,1 ms (−83,2 %) |
+| `load/nfnetlink/10000` | 190,7 ms | 110 ms (−42 %) |
+
+- Por partes, com 10 000 regras, antes do socket persistente: nosso lado 1,2–1,9 ms (achar as
+  regras mudadas, montar e diferenciar só elas, o lote), kernel 16–32 ms; depois, kernel
+  ~2–8 ms (a revalidação da tabela, O(regras)).
+- Inserir e remover uma regra numa chain de 100 / 5 000 / 20 000 regras (só `counter`), lote
+  sozinho: inserir 0,1 / 0,5 / 1,8 ms; remover 10–25 ms com o socket fechado a cada lote, 0,06–0,4
+  ms com ele aberto (5 000).
+- A carga cai porque nenhum socket fecha no meio (o `remove()` que o benchmark faz antes deixava
+  a espera RCU para o socket seguinte).
+
+G1.6qd, **medido** em 2026-10-29 (Ryzen AI Max+ 395, bench do criterion em release, máquina
+carregada com os CIs de outras sessões, load 23–25):
+
+- `hal-linux` `resource/router`, os processos do roteador numa leitura com os PIDs conhecidos:
+  **6,5 µs**;
+- `resource/router_scan`, a varredura completa do `/proc` (1018 processos), feita a cada 30 s
+  fora do lock: **13,3 ms** (~13 µs por processo; uma imagem com ~100 processos fica perto de
+  1,3 ms, **estimado**);
+- `engine` `health/system_metrics`, o comando de um scrape sob o lock do `Session`, laboratório:
+  **14,7 µs → 31,1 µs**. O acréscimo é o julgamento das checagens e o JSON da máquina.
+
+O scrape inteiro pelo HTTP, com o daemon em debug e o backend virtual, ficou em ~1,1 ms
+(`corerouter_scrape_duration_seconds`, cinco scrapes).
+
+G1.6qe, **medido** em 2026-10-29 (Ryzen AI Max+ 395, criterion em release, load 50 com os CIs
+de outras sessões): `hal-linux` `resource/router` com o processo do bench em 32 threads (31
+paradas, perto do daemon) foi de **6,5 µs para 131 µs** por leitura, ~4 µs por thread. Roda fora
+do lock, uma vez a cada 1–5 s. A conta das taxas no engine é O(threads × log threads) por consulta
+(busca binária por TID na leitura anterior, já ordenada).
+
+- 2026-10-29, G3.9ga: o BNG simulado do laboratório (`LabBng`) nasce no primeiro quadro PPPoE, não em cada `Session::virtual_lab()`. O `command_sweep` do engine (uma sessão nova por caso) foi de 19 s para 0,74 s (Ryzen AI MAX+ 395, debug, 8 threads; no runner de 4 vCPU do CI tinha passado de 137 s, **medido**).
+
+- 2026-10-29, G3.9ga, relé do cliente PPPoE (`crates/hal-linux/tests/netns_pppoe_client.rs`):
+  Ryzen AI MAX+ 395, userns+netns, release, 3 rodadas.
+  - Kernel → fio: 1,13–1,18 Mpps com 64 B (o gerador era o limite) e 1,07–1,14 Mpps com
+    1400 B.
+  - Fio → kernel: 0,67–0,69 Mpps com 64 B e 0,70–0,72 Mpps com 1400 B (≈ 7,9 Gbit/s).
+  - Protótipo na VM `corerouter-lab` (8 vCPU): kernel `ppp` ≥ 0,80 Mpps na entrada com 64 B, TUN
+    0,42 Mpps e veth 0,26 Mpps (**medido**; `docs/pppoe-client.md` §4).
+
+- 2026-10-29, G3.9ha (**medido**, Ryzen AI MAX+ 395):
+  - **envio de RA:**
+    - Rust com 1 socket raw: 1,26 µs/RA com 100 interfaces e 12,2 µs/RA com 1000;
+    - 1 socket por interface: 2,57 µs/RA e 39,5 µs/RA;
+    - radvd 2.19: 57 ms e 2,4 s até a 1ª rodada (5,4 s de CPU com 1000).
+  - **plano** (`benches/ipv6_nd.rs`, release): 18,8 µs com 100 VLANs e 257 µs com 1000; refeito
+    só quando a revisão rodando muda.
+
+### `ip.firewall.connection.remove` (G3.9hd)
+
+**Medido** em 2026-10-29: AMD Ryzen AI MAX+ 395 (32 threads), build release, máquina
+compartilhada com carga de 9–20. `apps/corerouter-daemon/benches/netns_conntrack.rs`
+(namespace sem root, 250 000 fluxos UDP, backend linux, `remove all=true` no fim). Antes =
+`ctnl::delete` com um pedido por conexão; depois = lote de 256. Duas rodadas de cada,
+intercaladas.
+
+| `remove all=true` (249 900) | Lock | Resposta inteira (leitura ~150 ms + remoção) |
+|---|---|---|
+| um pedido por conexão | 30–57 µs | 701–772 ms |
+| lote de 256 | 44–45 µs | 427–473 ms |
+| `kill` antes da G3.9hd (sob o lock) | ~700 ms (**estimado**: a resposta inteira) | igual |
+
+Com filtro (50 de 250 000), a resposta é a leitura da tabela, 147–224 ms, e o lock fica em
+50–80 µs. Com a máquina carregada, uma rodada isolada chegou a 4,5 ms de lock, que é preempção
+da thread, não trabalho.

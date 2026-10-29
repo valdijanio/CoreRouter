@@ -420,6 +420,7 @@ fn path_of(s: &crate::bgp::check::Side) -> BgpPath {
         cluster_list_len: 0,
         communities: Vec::new(),
         large_communities: Vec::new(),
+        ext_communities: Vec::new(),
         last_update: None,
         rpki: None,
         stale: false,

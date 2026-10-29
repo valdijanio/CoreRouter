@@ -9,6 +9,11 @@
 //! made-up zero. They ride on the poll itself (`LinkState::errors`, Linux
 //! `IFLA_STATS64`): asking `counters` per link meant a netlink and an
 //! ethtool round trip per interface under the session lock, per scrape.
+//!
+//! G1.6qd: memory, filesystems, the router's own processes (daemon, init,
+//! FRR: memory, threads, descriptors, CPU) and the health checks, from the
+//! `health` service's last reading (taken outside the lock), so an alarm on
+//! a leak or a full `/config` needs nothing but Prometheus.
 
 use std::collections::BTreeMap;
 
@@ -18,10 +23,11 @@ use corerouter_model::service::ServiceTable;
 use serde_json::{Value, json};
 
 use super::{CommandSpec, always};
+use crate::health_check::{evaluate, overall};
 use crate::{Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[cmd!(query "system.metrics", "Metrics", [], None,
-    "{} → {revision, mode (immediate | transactional), safe_mode, engine: {changes_ok, changes_failed, queries_ok, queries_failed, unknown, commits_ok, commits_failed}, interfaces: [{name, type, managed, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, rx_errors, tx_errors, rx_dropped, tx_dropped, link_downs}], services: [{name, state, up, restarts}], dhcp_server (null until a DHCP server ran; else as ip.dhcp-server.statistics.print)}",
+    "{} → {revision, mode (immediate | transactional), safe_mode, engine: {changes_ok, changes_failed, queries_ok, queries_failed, unknown, commits_ok, commits_failed}, interfaces: [{name, type, managed, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, rx_errors, tx_errors, rx_dropped, tx_dropped, link_downs}], services: [{name, state, up, restarts}], dhcp_server (null until a DHCP server ran; else as ip.dhcp-server.statistics.print), memory: {total, available, free, swap_total, swap_free}|null, filesystems: [{mount, device, fs, total, free, available}], processes: [{name, pid, rss_bytes, threads, fds, cpu_seconds}] (the daemon, the init and FRR), health: {status, checks: [{key, severity}]}}",
     always, metrics)];
 
 fn metrics(s: &mut Session, _: &Value) -> Result<Value> {
@@ -40,6 +46,7 @@ fn metrics(s: &mut Session, _: &Value) -> Result<Value> {
             .filter(|l| !s.store().candidate().interfaces.contains_key(&l.name))
             .map(|l| (l.name.clone(), Some(l))),
     );
+    let machine = machine(s);
     let mut rows = Vec::with_capacity(names.len());
     for (name, st) in names {
         let errors = st.and_then(|l| l.errors);
@@ -73,7 +80,71 @@ fn metrics(s: &mut Session, _: &Value) -> Result<Value> {
         "interfaces": rows,
         "services": services(s),
         "dhcp_server": super::dhcp_server_stats::snapshot(s),
+        "memory": machine.memory,
+        "filesystems": machine.filesystems,
+        "processes": machine.processes,
+        "health": health(s),
     }))
+}
+
+/// What the last reading of the machine says (G1.6qd).
+#[derive(Default)]
+struct Machine {
+    memory: Value,
+    filesystems: Vec<Value>,
+    processes: Vec<Value>,
+}
+
+fn machine(s: &mut Session) -> Machine {
+    let Some(l) = s.resource_for_metrics().and_then(|m| m.last.as_ref()) else {
+        return Machine { memory: Value::Null, ..Machine::default() };
+    };
+    let m = &l.memory;
+    let hz = f64::from(l.hz.max(1));
+    Machine {
+        memory: if m.total > 0 {
+            json!({
+                "total": m.total, "available": m.available, "free": m.free,
+                "swap_total": m.swap_total, "swap_free": m.swap_free,
+            })
+        } else {
+            Value::Null
+        },
+        filesystems: l
+            .disks
+            .iter()
+            .map(|d| {
+                json!({
+                    "mount": d.mount, "device": d.device, "fs": d.fs,
+                    "total": d.total, "free": d.free, "available": d.available,
+                })
+            })
+            .collect(),
+        processes: l
+            .router
+            .iter()
+            .map(|p| {
+                json!({
+                    "name": p.name, "pid": p.pid, "rss_bytes": p.rss_bytes,
+                    "threads": p.threads, "fds": p.fds,
+                    "cpu_seconds": p.cpu_ticks as f64 / hz,
+                })
+            })
+            .collect(),
+    }
+}
+
+/// The health checks now, as `system.health.check` judges them (never
+/// logged here: the alerts are the `health` service's).
+fn health(s: &mut Session) -> Value {
+    let checks = evaluate(&s.health_inputs());
+    json!({
+        "status": overall(&checks).as_str(),
+        "checks": checks
+            .iter()
+            .map(|c| json!({"key": c.key, "severity": c.severity.as_str()}))
+            .collect::<Vec<_>>(),
+    })
 }
 
 /// The supervised services (G0.10); none without a daemon.

@@ -6,8 +6,8 @@
 # repository index) extracted into the target dir, never installed.
 #   scripts/bgp-crcr-userns.sh [case…]
 # Cases (default: all, in this order):
-#   ebgp ebgp6 mpbgp md5 filters announce nexthop-self rr maxprefix restart
-#   gr bfd convergence scale
+#   ebgp ebgp6 mpbgp md5 filters extcomm announce nexthop-self rr maxprefix
+#   restart gr bfd convergence scale
 # Not in the default list: ospf-static (G3.9fe, OSPF redistributing the
 # CoreRouter's static routes).
 # SCALE_N=<n> changes the 100 000 prefixes of `scale`. Results: a table at
@@ -71,7 +71,7 @@ export LD_LIBRARY_PATH=$FRR_DIR/root/usr/lib/x86_64-linux-gnu:$FRR_DIR/root/usr/
 FRR=$FRR_DIR/root/usr/lib/frr
 bin=$CARGO_TARGET_DIR/release
 CASES=("$@")
-[ ${#CASES[@]} -gt 0 ] || CASES=(ebgp ebgp6 mpbgp md5 filters announce nexthop-self rr maxprefix restart gr bfd convergence scale)
+[ ${#CASES[@]} -gt 0 ] || CASES=(ebgp ebgp6 mpbgp md5 filters extcomm announce nexthop-self rr maxprefix restart gr bfd convergence scale)
 FAILED=0
 : > "$W/results.txt"
 result() { # result <case> <OK|FAIL|INFO> <text>
@@ -232,7 +232,7 @@ cr_rx() { # cr_rx <n> <connection> <prefix>: the route as routing.bgp.route.list
 # communities (G3.2g).
 bgp_path() { # bgp_path <ns> <prefix>
   vt "$1" "show bgp $([[ $2 == *:* ]] && echo ipv6 || echo ipv4) unicast $2 json" |
-    jq -c '[.paths[]? | select(.bestpath.overall // false)][0] // {} | {as_path: .aspath.string, med: .metric, local_pref: .locPrf, communities: .community.string, large: .largeCommunity.string, originator: .originatorId}' 2>/dev/null || echo '{}'
+    jq -c '[.paths[]? | select(.bestpath.overall // false)][0] // {} | {as_path: .aspath.string, med: .metric, local_pref: .locPrf, communities: .community.string, large: .largeCommunity.string, ext: .extendedCommunity.string, originator: .originatorId}' 2>/dev/null || echo '{}'
 }
 dump() {
   local n
@@ -390,7 +390,43 @@ case_filters() {
   pair_down
 }
 
-# R3 (eBGP, AS 65003) → CR1 → CR2 over iBGP with no IGP between them.
+# G3.9fc: extended communities (RFC 4360) in the chains, both ways, on FRR.
+case_extcomm() {
+  cr1 routing.filter.rule.add '{"chain":"x-out","rule":"if (dst in 100.64.39.0/24) { append bgp-ext-communities rt:65000:7,soo:10.255.39.2:1 } accept"}' >/dev/null
+  cr2 routing.filter.community-list.add '{"name":"vpn7","communities":"rt:65000:7"}' >/dev/null
+  cr2 routing.filter.rule.add '{"chain":"x-in","rule":"if (bgp-ext-communities includes-list vpn7) { set bgp-local-pref 300 } if (bgp-ext-communities subset rt:65000:7,soo:10.255.39.2:1) { set bgp-med 9 } delete bgp-ext-communities soo; accept"}' >/dev/null
+  crc 1 '{"name":"cr2","remote_address":"10.39.5.2","remote_as":65002,"input_filter":"all","output_filter":"x-out","output_network":"bgp-out"}'
+  crc 2 '{"name":"cr1","remote_address":"10.39.5.1","remote_as":65000,"input_filter":"x-in","output_filter":"all","output_network":"bgp-out"}'
+  local ms r t0
+  ms=$(wait_for 60 cr_up 1 cr2) || { result extcomm FAIL "no session"; pair_down; return; }
+  wait_for 30 k_has c2 100.64.39.0/24 >/dev/null || true
+  sleep 1
+  r=$(bgp_path c2 100.64.39.0/24)
+  result extcomm INFO "CR2's bgpd has $r"
+  [ "$(jq -r .ext <<< "$r")" = "RT:65000:7" ] && result extcomm OK "append rt+soo on CR1, delete soo on CR2: RT:65000:7 left" || result extcomm FAIL "ext on CR2: $(jq -c .ext <<< "$r")"
+  [ "$(jq -r .local_pref <<< "$r")" = 300 ] && result extcomm OK "includes-list (rt:65000:7) → local-pref 300" || result extcomm FAIL "local_pref $(jq -c .local_pref <<< "$r")"
+  [ "$(jq -r .med <<< "$r")" = 9 ] && result extcomm OK "subset rt:65000:7,soo:10.255.39.2:1 → MED 9" || result extcomm FAIL "med $(jq -c .med <<< "$r")"
+  # route.explain answers "loading" first: ask until it is ready.
+  local i; for i in $(seq 30); do
+    r=$(cr2 routing.bgp.route.explain '{"prefix":"100.64.39.0/24"}' 2>/dev/null || echo '{}')
+    [ "$(jq -r '.state // ""' <<< "$r")" = loading ] || break
+    sleep 0.3
+  done
+  [[ $(jq -c '[.paths[]? | .ext_communities[]?]' <<< "$r") == *rt:65000:7* ]] && result extcomm OK "route.explain on CR2 shows ext_communities $(jq -c '[.paths[]? | .ext_communities]' <<< "$r")" \
+    || result extcomm FAIL "route.explain on CR2: $(jq -c '{state, paths: [.paths[]? | {ext_communities}]}' <<< "$r")"
+  # set replaces (FRR's set extcommunity adds: none first); subset fails then.
+  local id; id=$(cr1 routing.filter.rule.list '{"chain":"x-out"}' | jq -r '.[0].id')
+  t0=$(now_ms)
+  cr1 routing.filter.rule.set "{\"id\":\"$id\",\"rule\":\"if (dst in 100.64.39.0/24) { append bgp-ext-communities soo:10.255.39.2:1; set bgp-ext-communities rt:65000:8,rt:1:1 } accept\"}" >/dev/null
+  ext8() { [ "$(bgp_path c2 100.64.39.0/24 | jq -r .ext)" = "RT:1:1 RT:65000:8" ]; }
+  ms=$(wait_for 30 ext8) && result extcomm OK "set replaces: RT:1:1 RT:65000:8 on CR2 $(( $(now_ms) - t0 )) ms after the commit (the soo appended before it is gone)" \
+    || result extcomm FAIL "set: CR2 has $(bgp_path c2 100.64.39.0/24 | jq -c '{ext}')"
+  r=$(bgp_path c2 100.64.39.0/24)
+  [ "$(jq -r .local_pref <<< "$r")" != 300 ] && [ "$(jq -r .med <<< "$r")" != 9 ] && result extcomm OK "without rt:65000:7: no local-pref 300, and subset fails (rt:1:1 is not in it)" || result extcomm FAIL "after set: $r"
+  result extcomm INFO "CR2 bgpd lists: $(vt c2 'show running-config' | grep -E '^bgp extcommunity-list' | tr '\n' ';')"
+  pair_down
+}
+
 # G3.9fb: each connection sends only its own output_network and
 # output_redistribute, as on RouterOS (FRR originates per instance).
 case_announce() {
@@ -427,6 +463,7 @@ case_announce() {
   cr1 ip.firewall.address-list.list '{"list":"to-r3"}' | jq -r '.[]?.id' | while read -r id; do cr1 ip.firewall.address-list.remove "{\"id\":\"$id\"}" >/dev/null; done
 }
 
+# R3 (eBGP, AS 65003) → CR1 → CR2 over iBGP with no IGP between them.
 case_nexthop-self() {
   cr2 routing.bgp.instance.set '{"asn":65000,"router_id":"10.255.39.5"}' >/dev/null
   ip -n r3 route add blackhole 203.0.113.0/24

@@ -149,6 +149,7 @@ impl Builder {
             weight: c.weight.unwrap_or(0),
             communities: Vec::new(),
             large_communities: Vec::new(),
+            ext_communities: Vec::new(),
         };
         let best = c.best.unwrap_or(false) || c.bestpath.unwrap_or(false);
         let attrs = self.intern(attrs);
@@ -354,6 +355,8 @@ struct PathJson {
     bestpath: Option<BestJson>,
     community: Option<ListJson>,
     large_community: Option<ListJson>,
+    /// G3.9fc: FRR gives only the text, `RT:65001:7 SoO:…`.
+    extended_community: Option<TextJson>,
     last_update: Option<EpochJson>,
     nexthops: Vec<HopJson>,
     peer: Option<PeerJson>,
@@ -398,6 +401,24 @@ impl ListJson {
             .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned))
             .collect()
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct TextJson {
+    string: String,
+}
+
+/// FRR's text of the extended communities in RouterOS's words: `RT:65001:7`
+/// → `rt:65001:7`; a kind the filter does not know stays as FRR prints it.
+fn ext_words(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .take(256)
+        .map(|w| {
+            corerouter_proto_bgp::filter::Ext::from_frr(w)
+                .map_or_else(|| w.to_owned(), |e| e.to_string())
+        })
+        .collect()
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -496,6 +517,10 @@ pub fn parse_prefix(text: &str) -> Result<BgpPrefix, String> {
                     .map_or(0, |c| u32::try_from(c.list.len()).unwrap_or(u32::MAX)),
                 communities: j.community.map(|c| c.strings()).unwrap_or_default(),
                 large_communities: j.large_community.map(|c| c.strings()).unwrap_or_default(),
+                ext_communities: j
+                    .extended_community
+                    .map(|c| ext_words(&c.string))
+                    .unwrap_or_default(),
                 last_update: j.last_update.and_then(|l| l.epoch),
                 rpki: j.rpki_validation_state,
                 stale: j.stale,

@@ -25,10 +25,10 @@ const DEFAULT_LIMIT: u32 = 500;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "routing.bgp.route.list", "BGP Routes", ["Routing", "BGP"], None,
-        "{connection: string, direction?: string (received | advertised; default received), prefix?: cidr | ip, match?: string (exact | longer | orlonger | covering; default orlonger, covering for an address), as_path?: string (AS numbers in order, ^ and $ anchor: \"^64500\", \"13335$\"), community?: string (a:b, a:b:c or a well-known name), rpki?: string (valid | invalid | unknown | unverified), filtered?: bool (refused by the inbound policy), offset?: u32, limit?: u32 (1..=5000, default 500), refresh?: bool (read bgpd again)} → {state: loading | ready | failed, error?, connection, direction, pre_policy (received before the inbound policy, refused ones flagged), load_ms?, age_secs?, total (rows that match), offset, rows: [{prefix, best, filtered, rpki, origin_as?, as_path, origin, next_hop?, med?, local_pref?, weight, communities, large_communities}], summary: {total, ipv4, ipv6, best, filtered, rpki: {valid, invalid, unknown, unverified}}, warnings} (loading: ask again in a moment)",
+        "{connection: string, direction?: string (received | advertised; default received), prefix?: cidr | ip, match?: string (exact | longer | orlonger | covering; default orlonger, covering for an address), as_path?: string (AS numbers in order, ^ and $ anchor: \"^64500\", \"13335$\"), community?: string (a:b, a:b:c or a well-known name), rpki?: string (valid | invalid | unknown | unverified), filtered?: bool (refused by the inbound policy), offset?: u32, limit?: u32 (1..=5000, default 500), refresh?: bool (read bgpd again)} → {state: loading | ready | failed, error?, connection, direction, pre_policy (received before the inbound policy, refused ones flagged), load_ms?, age_secs?, total (rows that match), offset, rows: [{prefix, best, filtered, rpki, origin_as?, as_path, origin, next_hop?, med?, local_pref?, weight, communities, large_communities, ext_communities}], summary: {total, ipv4, ipv6, best, filtered, rpki: {valid, invalid, unknown, unverified}}, warnings} (loading: ask again in a moment)",
         always, list),
     cmd!(query "routing.bgp.route.explain", "Why This Route", ["Routing", "BGP"], None,
-        "{prefix: cidr | ip (an address: its longest match), instance?: string (default \"default\")} → {state: loading | ready | failed, error?, prefix, best? (index), agrees (our comparison picks the daemon's best), paths: [{index, peer, connection?, best, valid, multipath, stale, peer_kind (local | external | internal | confed-external), as_path, origin, med?, local_pref?, weight, next_hop?, igp_metric?, router_id?, originator_id?, cluster_list_len, communities, large_communities, rpki, origin_as?, selection_reason? (the daemon's), lost_at?: {step, rule, winner_value, loser_value}, won_at?, unexplained}], steps: [{step, rule}] (the order compared)} (loading: ask again; an answer is kept 30 s)",
+        "{prefix: cidr | ip (an address: its longest match), instance?: string (default \"default\")} → {state: loading | ready | failed, error?, prefix, best? (index), agrees (our comparison picks the daemon's best), paths: [{index, peer, connection?, best, valid, multipath, stale, peer_kind (local | external | internal | confed-external), as_path, origin, med?, local_pref?, weight, next_hop?, igp_metric?, router_id?, originator_id?, cluster_list_len, communities, large_communities, ext_communities, rpki, origin_as?, selection_reason? (the daemon's), lost_at?: {step, rule, winner_value, loser_value}, won_at?, unexplained}], steps: [{step, rule}] (the order compared)} (loading: ask again; an answer is kept 30 s)",
         always, explain),
     cmd!(query "routing.bgp.route.summary", "BGP Route Tables", [], None,
         "{} → [{connection, direction, state: loading | ready | failed, age_secs?, total?, filtered?, rpki?: {valid, invalid, unknown, unverified}}] (the tables read so far: the share of each RPKI state per session)",
@@ -143,6 +143,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                         "weight": a.weight,
                         "communities": a.communities,
                         "large_communities": a.large_communities,
+                        "ext_communities": a.ext_communities,
                     })
                 })
                 .collect();
@@ -208,6 +209,7 @@ fn path_json(i: usize, x: &BgpPath, s: &Session, local_as: Option<u32>, prefix: 
         "cluster_list_len": x.cluster_list_len,
         "communities": x.communities,
         "large_communities": x.large_communities,
+        "ext_communities": x.ext_communities,
         "rpki": rpki,
         "origin_as": origin,
         "selection_reason": x.selection_reason,

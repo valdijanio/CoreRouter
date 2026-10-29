@@ -61,6 +61,10 @@ pub struct BgpAttrs {
     pub communities: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub large_communities: Vec<String>,
+    /// RFC 4360 extended communities as RouterOS writes them
+    /// (`rt:65000:1`), G3.9fc.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ext_communities: Vec<String>,
 }
 
 /// One route of a table.
@@ -192,6 +196,8 @@ pub struct BgpPath {
     pub cluster_list_len: u32,
     pub communities: Vec<String>,
     pub large_communities: Vec<String>,
+    /// G3.9fc: `rt:65000:1`, `soo:…` (other kinds as FRR prints them).
+    pub ext_communities: Vec<String>,
     /// Unix time it was last updated.
     pub last_update: Option<u64>,
     /// The daemon's RPKI state of the path, when it validates.

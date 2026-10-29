@@ -15,6 +15,8 @@ pub struct BgpRouteEntry {
     pub communities: Vec<u32>,
     /// RFC 8092 large communities.
     pub large: Vec<(u32, u32, u32)>,
+    /// RFC 4360 extended communities, the 8 octets as one number (G3.9fc).
+    pub ext: Vec<u64>,
     pub med: Option<u32>,
     pub local_pref: Option<u32>,
     /// The communities are not known (FRR 10 shows them only for the

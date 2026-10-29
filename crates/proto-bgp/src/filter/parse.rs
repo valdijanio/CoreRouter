@@ -11,6 +11,7 @@
 //! matcher := dst (in|==|!=) PREFIX|LIST | dst-len OP N|N-M | afi ipv4|ipv6
 //!          | protocol NAME[,NAME…] | bgp-as-path REGEX
 //!          | bgp-communities|bgp-large-communities CMOP VALUES|LIST
+//!          | bgp-ext-communities EXTOP VALUES|LIST        (G3.9fc)
 //! ```
 //!
 //! The text is hostile: it is bounded (length, nesting, tokens), and an
@@ -21,7 +22,7 @@ use std::fmt;
 
 use ipnet::IpNet;
 
-use super::{CommunityValue, Protocol, parse_community};
+use super::{CommunityValue, Ext, ExtKind, Protocol, parse_community};
 
 /// Deepest nesting of blocks and parentheses.
 pub const MAX_DEPTH: usize = 32;
@@ -93,6 +94,43 @@ pub enum Atom {
         op: CommOp,
         arg: CommArg,
     },
+    /// `bgp-ext-communities` (G3.9fc, RFC 4360).
+    Ext {
+        op: ExtOp,
+        arg: CommArg,
+    },
+}
+
+/// How an extended-community matcher compares (RouterOS names).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExtOp {
+    Includes,
+    Any,
+    Equal,
+    /// Every extended community of the route is one of these (none
+    /// counts).
+    Subset,
+}
+
+/// What `delete bgp-ext-communities` takes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ExtArg {
+    Values(Vec<Ext>),
+    /// A `/routing filter community-list` (its extended entries).
+    List(String),
+    /// Every one of a kind: `rt`, `soo`, `other` (neither).
+    Kind(ExtKind),
+}
+
+/// How an action changes the extended communities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExtHow {
+    /// Replace them (no values: remove all, `set bgp-ext-communities none`).
+    Set,
+    Append,
+    Delete,
+    /// Keep only these (RouterOS `filter`).
+    Filter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -129,6 +167,11 @@ pub enum SetOp {
         how: CommHow,
         arg: CommArg,
     },
+    /// `set|append|delete|filter bgp-ext-communities` (G3.9fc).
+    Ext {
+        how: ExtHow,
+        arg: ExtArg,
+    },
 }
 
 impl SetOp {
@@ -142,6 +185,7 @@ impl SetOp {
             SetOp::Comm { large: false, .. } => 3,
             SetOp::Comm { large: true, .. } => 4,
             SetOp::Gw(_) => 5,
+            SetOp::Ext { .. } => 6,
         }
     }
 }
@@ -366,9 +410,10 @@ const MATCHERS: &[&str] = &[
     "bgp-as-path",
     "bgp-communities",
     "bgp-large-communities",
+    "bgp-ext-communities",
 ];
 const ACTIONS: &[&str] = &[
-    "accept", "reject", "return", "jump", "set", "append", "delete", "if",
+    "accept", "reject", "return", "jump", "set", "append", "delete", "filter", "if",
 ];
 const PROPS: &[&str] = &[
     "bgp-local-pref",
@@ -376,6 +421,7 @@ const PROPS: &[&str] = &[
     "bgp-path-prepend",
     "bgp-communities",
     "bgp-large-communities",
+    "bgp-ext-communities",
     "gw",
 ];
 const COMM_OPS: &[&str] = &[
@@ -385,6 +431,16 @@ const COMM_OPS: &[&str] = &[
     "includes-list",
     "any-list",
     "equal-list",
+];
+const EXT_OPS: &[&str] = &[
+    "includes",
+    "any",
+    "equal",
+    "subset",
+    "includes-list",
+    "any-list",
+    "equal-list",
+    "subset-list",
 ];
 /// Matchers of RouterOS that FRR cannot express (exactly) yet.
 const UNSUPPORTED: &[(&str, &str)] = &[
@@ -400,15 +456,19 @@ const UNSUPPORTED: &[(&str, &str)] = &[
         "bgp-path-len",
         "not supported yet: use bgp-as-path with a regular expression",
     ),
-    (
-        "bgp-ext-communities",
-        "extended communities are not supported yet",
-    ),
     ("rpki", "RPKI is G3.2c"),
     ("distance", "BGP routes have no distance in FRR's policy"),
 ];
 
 // ---- parser ----
+
+/// The kind of community a matcher or an action takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Want {
+    Normal,
+    Large,
+    Ext,
+}
 
 struct Parser<'a> {
     toks: &'a [(usize, Tok)],
@@ -553,7 +613,7 @@ impl Parser<'_> {
                 })?;
                 Stmt::Jump(c)
             }
-            "set" | "append" | "delete" => Stmt::Set(self.set(&w)?),
+            "set" | "append" | "delete" | "filter" => Stmt::Set(self.set(&w)?),
             "else" => {
                 self.at = start;
                 return self.err("else without if (or a \";\" between \"}\" and else)");
@@ -637,13 +697,57 @@ impl Parser<'_> {
                     }
                 }
             }
+            (_, "bgp-ext-communities") => {
+                let how = match verb {
+                    "set" => ExtHow::Set,
+                    "append" => ExtHow::Append,
+                    "delete" => ExtHow::Delete,
+                    _ => ExtHow::Filter,
+                };
+                let v = self.word("extended communities (rt:65000:1,soo:192.0.2.1:7), a community-list name, none, rt, soo or other")?;
+                let arg = match (how, v.as_str()) {
+                    (ExtHow::Set, "none") => ExtArg::Values(Vec::new()),
+                    (ExtHow::Delete, "rt") => ExtArg::Kind(ExtKind::Rt),
+                    (ExtHow::Delete, "soo") => ExtArg::Kind(ExtKind::Soo),
+                    (ExtHow::Delete, "other") => ExtArg::Kind(ExtKind::Other),
+                    _ => {
+                        self.at -= 1;
+                        match self.comm_values(Want::Ext, None)? {
+                            CommArg::List(n) => ExtArg::List(n),
+                            CommArg::Values(v) => ExtArg::Values(
+                                v.into_iter()
+                                    .filter_map(|c| match c {
+                                        CommunityValue::Ext(e) => Some(e),
+                                        _ => None,
+                                    })
+                                    .collect(),
+                            ),
+                        }
+                    }
+                };
+                Ok(SetOp::Ext { how, arg })
+            }
+            ("filter", _) => {
+                back(self);
+                self.err(format!(
+                    "filter takes bgp-ext-communities, not {:?}",
+                    cut(&prop)
+                ))
+            }
             (_, "bgp-communities") => comm(self, false),
             (_, "bgp-large-communities") => comm(self, true),
             ("append" | "delete", _) => {
                 back(self);
-                let hint = did_you_mean(&prop, &["bgp-communities", "bgp-large-communities"]);
+                let hint = did_you_mean(
+                    &prop,
+                    &[
+                        "bgp-communities",
+                        "bgp-large-communities",
+                        "bgp-ext-communities",
+                    ],
+                );
                 self.err(format!(
-                    "{verb} takes bgp-communities or bgp-large-communities, not {:?}{hint}",
+                    "{verb} takes bgp-communities, bgp-large-communities or bgp-ext-communities, not {:?}{hint}",
                     cut(&prop)
                 ))
             }
@@ -901,6 +1005,27 @@ impl Parser<'_> {
                 let arg = self.comm_arg(large, Some(list))?;
                 Ok(atom(Atom::Comm { large, op, arg }))
             }
+            "bgp-ext-communities" => {
+                let op_at = self.at;
+                let op = self.word("includes, any, equal, subset (or -list)")?;
+                let (op, list) = match op.as_str() {
+                    "includes" => (ExtOp::Includes, false),
+                    "any" => (ExtOp::Any, false),
+                    "equal" => (ExtOp::Equal, false),
+                    "subset" => (ExtOp::Subset, false),
+                    "includes-list" => (ExtOp::Includes, true),
+                    "any-list" => (ExtOp::Any, true),
+                    "equal-list" => (ExtOp::Equal, true),
+                    "subset-list" => (ExtOp::Subset, true),
+                    other => {
+                        self.at = op_at;
+                        let hint = did_you_mean(other, EXT_OPS);
+                        return self.err(format!("{:?} is not an extended-community operator (includes, any, equal, subset, …-list){hint}", cut(other)));
+                    }
+                };
+                let arg = self.comm_values(Want::Ext, Some(list))?;
+                Ok(atom(Atom::Ext { op, arg }))
+            }
             other => {
                 self.at = at;
                 if let Some((_, why)) = UNSUPPORTED.iter().find(|(m, _)| *m == other) {
@@ -920,11 +1045,16 @@ impl Parser<'_> {
     /// Community values (`65000:1,no-export`) or a list name. `list`:
     /// `Some(true)` only a name, `Some(false)` only values, `None` either.
     fn comm_arg(&mut self, large: bool, list: Option<bool>) -> Result<CommArg, ParseError> {
+        self.comm_values(if large { Want::Large } else { Want::Normal }, list)
+    }
+
+    /// [`Parser::comm_arg`] for one kind of community.
+    fn comm_values(&mut self, want: Want, list: Option<bool>) -> Result<CommArg, ParseError> {
         let v_at = self.at;
-        let v = self.word(if large {
-            "large communities (65000:1:2)"
-        } else {
-            "communities (65000:100, no-export)"
+        let v = self.word(match want {
+            Want::Large => "large communities (65000:1:2)",
+            Want::Normal => "communities (65000:100, no-export)",
+            Want::Ext => "extended communities (rt:65000:1, soo:192.0.2.1:7)",
         })?;
         let pos = self.toks.get(v_at).map_or(0, |t| t.0);
         let looks_like_values = v.contains(':') || parse_community(&v).is_ok();
@@ -934,17 +1064,28 @@ impl Parser<'_> {
         }
         let mut out = Vec::new();
         for raw in v.split(',') {
-            let c = parse_community(raw).map_err(|msg| ParseError { pos, msg })?;
-            if matches!(c, CommunityValue::Large(_)) != large {
-                let msg = if large {
-                    format!("{:?} is a normal community: use bgp-communities", cut(raw))
-                } else {
-                    format!(
-                        "{:?} is a large community: use bgp-large-communities",
-                        cut(raw)
-                    )
+            // Not a community of any kind where extended ones go: the
+            // extended-community error says what to write.
+            let c = match (want, parse_community(raw)) {
+                (Want::Ext, Err(_)) => super::parse_ext(raw).map(CommunityValue::Ext),
+                (_, r) => r,
+            }
+            .map_err(|msg| ParseError { pos, msg })?;
+            let is = match c {
+                CommunityValue::Normal(_) => Want::Normal,
+                CommunityValue::Large(_) => Want::Large,
+                CommunityValue::Ext(_) => Want::Ext,
+            };
+            if is != want {
+                let use_ = match is {
+                    Want::Normal => "a normal community: use bgp-communities",
+                    Want::Large => "a large community: use bgp-large-communities",
+                    Want::Ext => "an extended community: use bgp-ext-communities",
                 };
-                return Err(ParseError { pos, msg });
+                return Err(ParseError {
+                    pos,
+                    msg: format!("{:?} is {use_}", cut(raw)),
+                });
             }
             if !out.contains(&c) {
                 out.push(c);

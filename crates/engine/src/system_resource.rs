@@ -33,6 +33,9 @@ pub const WANTED_SECS: u64 = 15;
 /// A process list older than this (ms of uptime before the last reading)
 /// is not served while the service catches up (G1.6q).
 const PROCS_STALE_MS: u64 = 2_000;
+/// A scrape of `system.metrics` takes the service's reading up to this old
+/// (s; it reads every 5 s) instead of reading under the lock (G1.6qd).
+pub const METRICS_STALE_SECS: u64 = 15;
 
 /// Where a reading came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,6 +237,42 @@ impl ResourceMonitor {
             .collect()
     }
 
+    /// G1.6qe: CPU of the router's processes between the two readings: of
+    /// each process in % of the whole machine (as [`Self::process_cpu`]),
+    /// and of each of its threads in % of **one** CPU (a thread at 100 %
+    /// is a full core: work serialized on it). `None` for one that was not
+    /// in the previous reading.
+    pub fn router_cpu(&self) -> (BTreeMap<u32, f32>, BTreeMap<(u32, u32), f32>) {
+        let (mut procs, mut tasks) = (BTreeMap::new(), BTreeMap::new());
+        let Some((a, b, dt)) = self.pair() else {
+            return (procs, tasks);
+        };
+        let hz = f64::from(b.hz.max(1));
+        let one = dt * hz;
+        let all = one * b.cores.len().max(1) as f64;
+        for p in &b.router {
+            let Some(before) = a.router.iter().find(|x| x.pid == p.pid) else {
+                continue;
+            };
+            if let Some(used) = p.cpu_ticks.checked_sub(before.cpu_ticks) {
+                procs.insert(p.pid, ((used as f64 * 100.0 / all) as f32).min(100.0));
+            }
+            for t in &p.tasks {
+                // Sorted by tid (`Process::tasks`): O(log n) per thread.
+                let Ok(i) = before.tasks.binary_search_by_key(&t.tid, |x| x.tid) else {
+                    continue;
+                };
+                let Some(t0) = before.tasks.get(i) else {
+                    continue;
+                };
+                if let Some(used) = t.cpu_ticks.checked_sub(t0.cpu_ticks) {
+                    tasks.insert((p.pid, t.tid), ((used as f64 * 100.0 / one) as f32).min(100.0));
+                }
+            }
+        }
+        (procs, tasks)
+    }
+
     fn push(&mut self, sample: Sample, source: Source, now: Option<u64>) {
         if self.source != Some(source) {
             // Another sampler's counters: no rates across the switch.
@@ -298,6 +337,22 @@ impl Session {
         self.ext::<ResourceMonitor>()
             .map(|m| m.wanted(now))
             .unwrap_or_default()
+    }
+
+    /// The readings for a scrape (G1.6qd): the service's while recent
+    /// enough ([`METRICS_STALE_SECS`]), else fresh ones without marking
+    /// them as watched. `None`: the platform has no readings.
+    pub(crate) fn resource_for_metrics(&mut self) -> Option<&ResourceMonitor> {
+        let now = self.clock_secs();
+        let recent = self.ext::<ResourceMonitor>().is_some_and(|m| {
+            m.last.is_some()
+                && m.source == Some(Source::Service)
+                && matches!((now, m.taken_at), (Some(n), Some(t)) if n.saturating_sub(t) <= METRICS_STALE_SECS)
+        });
+        if !recent {
+            self.resource_refresh(false, false).ok()?;
+        }
+        self.ext::<ResourceMonitor>().filter(|m| m.last.is_some())
     }
 
     fn clock_secs(&self) -> Option<u64> {
