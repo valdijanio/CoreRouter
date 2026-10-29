@@ -8,13 +8,14 @@ mod ebpf;
 mod layers;
 mod os;
 mod oui;
+mod package;
 mod vm_lab;
 mod vm_tools;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-const USAGE: &str = "usage: cargo xtask <ci [--fast] [--only <step>,...]|fmt|clippy|test|bench-check|netns|xdp-root|docs|ebpf-check|layers|agents-sync|wasm|bench|bng-lab|ebpf|docs fold|vm-lab|os [--help]>";
+const USAGE: &str = "usage: cargo xtask <ci [--fast] [--only <step>,...]|fmt|clippy|test|bench-check|netns|xdp-root|docs|ebpf-check|layers|agents-sync|wasm|bench|bng-lab|ebpf|docs fold|vm-lab|os|package gui [--help]>";
 
 /// Crates that must keep compiling for the browser.
 const WASM_PACKAGES: &[&str] = &[
@@ -137,6 +138,17 @@ fn main() -> ExitCode {
                 Outcome::Ok | Outcome::Skip(_) => ExitCode::SUCCESS,
                 Outcome::Fail(why) => {
                     eprintln!("FAIL oui: {why}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        // G0.28: the GUI + CLI as a .deb (docs/install-gui.md).
+        "package" => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            return match package::main(&root, &rest) {
+                Outcome::Ok | Outcome::Skip(_) => ExitCode::SUCCESS,
+                Outcome::Fail(why) => {
+                    eprintln!("FAIL package: {why}");
                     ExitCode::FAILURE
                 }
             };

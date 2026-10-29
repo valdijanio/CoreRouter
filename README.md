@@ -15,6 +15,11 @@ cargo run -p corerouter-cli -- run ip.address.add '{"address":"10.0.0.1/24","int
 claude mcp add corerouter -- corerouter-cli mcp  # MCP
 ```
 
+Instalar o gerenciador (GUI + CLI) no Debian/Ubuntu e abrir pelo menu, como o WinBox:
+`cargo xtask package gui` gera `target/package/corerouter-gui_<versão>_amd64.deb`; instale com
+`sudo apt install ./target/package/corerouter-gui_*.deb`. Links `corerouter://10.0.0.1` abrem
+a GUI já conectando. Detalhes em [docs/install-gui.md](docs/install-gui.md).
+
 Web (requer `cargo install trunk --locked`): `cd apps/corerouter-gui && trunk build`, depois
 `cargo run -p corerouter-daemon -- --ws 7980 --web-root apps/corerouter-gui/dist` e abra
 http://127.0.0.1:7980 (a GUI servida pelo roteador, como o WebFig). Só a demo no navegador:

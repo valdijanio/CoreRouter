@@ -21,8 +21,16 @@ use crate::remote::{Dialer, Remote};
 use crate::{Connected, GuiApp, Platform};
 
 const USAGE: &str = "\
-usage: corerouter-gui [--connect HOST:PORT | tls://HOST:PORT] [--user USER]
-                      [--control <port>] [--discovery-port <port>] [--saved-list <file>]
+usage: corerouter-gui [--connect HOST:PORT | tls://HOST:PORT | corerouter://[USER@]HOST[:PORT]]
+                      [--user USER] [--control <port>] [--discovery-port <port>]
+                      [--saved-list <file>]
+
+  corerouter://[USER@]HOST[:PORT]
+                          a link (the desktop passes it when one is clicked): like
+                          --connect tls://HOST:PORT (default port 8729; a loopback HOST
+                          with a PORT is the local control channel), with the password
+                          remembered for that router, never $COREROUTER_PASSWORD; a router
+                          seen for the first time asks about its certificate first
 
   --connect HOST:PORT     manage a corerouter-daemon right away: 127.0.0.1:PORT with the
                           router's local token (same OS user), else (and at any other
@@ -215,6 +223,8 @@ struct Args {
     user: Option<String>,
     discovery_port: Option<u16>,
     saved_list: Option<PathBuf>,
+    /// `connect` came from a `corerouter://` link (G0.28).
+    from_link: bool,
 }
 
 /// `HOST:PORT` or `tls://HOST:PORT` as `--connect` and the connect screen take it.
@@ -227,6 +237,8 @@ fn check_addr(addr: &str) -> Result<RouterAddr, String> {
         )
     })
 }
+
+const TWO_TARGETS: &str = "give one router: --connect or a corerouter:// link";
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut out = Args::default();
@@ -241,6 +253,9 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
                 let addr = args.next().ok_or("--connect needs HOST:PORT")?;
                 check_addr(&addr)
                     .map_err(|_| format!("--connect needs HOST:PORT, got '{addr}'"))?;
+                if out.connect.is_some() {
+                    return Err(TWO_TARGETS.into());
+                }
                 out.connect = Some(addr);
             }
             "--user" => out.user = Some(args.next().ok_or("--user needs a name")?),
@@ -253,6 +268,15 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
                 out.saved_list = Some(PathBuf::from(file));
             }
             "-h" | "--help" => return Err(USAGE.into()),
+            other if crate::link::is_link(other) => {
+                let link = crate::link::parse(other)?;
+                if out.connect.is_some() {
+                    return Err(TWO_TARGETS.into());
+                }
+                out.connect = Some(link.address);
+                out.user = out.user.or(link.user);
+                out.from_link = true;
+            }
             other => return Err(format!("unknown argument '{other}'\n{USAGE}")),
         }
     }
@@ -283,7 +307,12 @@ pub fn main() -> ExitCode {
         let creds = Credentials {
             address: addr.clone(),
             user: args.user.clone().unwrap_or_else(|| DEFAULT_LOGIN.into()),
-            password: std::env::var("COREROUTER_PASSWORD").unwrap_or_default(),
+            // A clicked link never picks up a password from the environment.
+            password: if args.from_link {
+                String::new()
+            } else {
+                std::env::var("COREROUTER_PASSWORD").unwrap_or_default()
+            },
             remember: false,
             legacy: false,
         };
@@ -847,6 +876,21 @@ mod tests {
             assert!(parse(&["--connect", bad]).is_err(), "{bad}");
         }
         assert!(parse(&["--connect"]).is_err());
+    }
+
+    #[test]
+    fn parses_a_corerouter_link() {
+        let a = parse(&["corerouter://noc@10.0.0.1/"]).unwrap();
+        assert_eq!(a.connect.as_deref(), Some("tls://10.0.0.1:8729"));
+        assert_eq!(a.user.as_deref(), Some("noc"));
+        assert!(a.from_link);
+        // --user wins over the link's name, given before or after it.
+        let a = parse(&["--user", "ops", "corerouter://noc@h:9000"]).unwrap();
+        assert_eq!(a.user.as_deref(), Some("ops"));
+        assert!(parse(&["corerouter://h", "--connect", "127.0.0.1:1"]).is_err());
+        assert!(parse(&["--connect", "127.0.0.1:1", "corerouter://h"]).is_err());
+        assert!(parse(&["corerouter://a:b@h"]).is_err());
+        assert!(!parse(&["--connect", "127.0.0.1:1"]).unwrap().from_link);
     }
 
     #[test]
