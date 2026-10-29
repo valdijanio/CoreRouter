@@ -234,3 +234,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-29 — G0.29 criado: portão local só do afetado e 2 vagas de CI na máquina; sccache medido sem ganho entre worktrees (G0.29b)
 - 2026-10-29 — G0.29 feito (portão local só do afetado, 2 vagas de CI, testes de integração num executável por crate)
 - 2026-10-29 — G0.30 criado (orçamento de testes: o tempo do portão não cresce com o número de testes)
+- 2026-10-29 — G0.30 feito (orçamento de testes)

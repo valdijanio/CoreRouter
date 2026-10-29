@@ -6768,3 +6768,32 @@ continuação indentadas).
   Como testar: `cargo xtask ci --affected` (a linha "test layer: quick …" e o relatório no fim);
   `COREROUTER_TEST_LAYER=full cargo xtask ci --only test` roda os `slow_`;
   `cargo nextest list --profile quick | grep -c slow_` dá 0.
+
+- 2026-10-29 — G0.30: Orçamento de testes, parte C: relógio simulado nos piores e o teto.
+
+  - `corerouter_engine::tasks::SimClock`: um `Clock` cujo `sleep` só avança o tempo (sem
+    threads, compila para WASM). Os testes de ferramentas do engine (`test_runner::sim()`) e os da
+    GUI e do engine que usavam relógio de parede (traceroute, ping, torch, bandwidth, RADIUS, LSP
+    ping, cable test, ARP) passam a usá-lo: os timeouts do laboratório não custam nada. Ficam no
+    relógio de parede, com o motivo no teste, os dois que precisam dele: parar um ping contínuo
+    ainda rodando e esperar a resposta do backend RADIUS de outra thread.
+  - Serviços `metrics`, `dns_server` e `dns` do daemon: o `TICK` que relê a config é 50 ms nos
+    testes de unidade (`cfg!(test)`), 1 s em produção.
+  - `command_sweep` (todo comando com parâmetros lixo; cresce com cada comando novo) dividido
+    pelos núcleos com `thread::scope`; cada entrada continua num laboratório novo. O teste de
+    corrida do iperf roda as 5 rodadas de 1 s ao mesmo tempo, cada uma com o seu servidor.
+  - `[profile.dev.package.*]` com `opt-level = 3` para a pilha do egui e do texto (egui, epaint,
+    harfrust, skrifa, vello…) e para serde_json, regex, memchr e sha: os testes da GUI desenham
+    quadros de verdade e gastavam o tempo nesse código sem otimização. Nosso código continua sem
+    otimização (compila rápido e depura igual).
+  - Camada lenta: a tempestade DHCP de 70 mil clientes (`slow_`).
+  - Teto (`xtask/src/slowest.rs`, `budget` no `xtask/src/main.rs`): teste fora da camada lenta
+    acima do teto reprova o job `test` do PR no GitHub, onde o teto é 10 s (o runner de 4 vCPU
+    leva 1,5–2× o tempo daqui nos testes que gastam CPU, **medido** no #389); no local, acima de
+    5 s é aviso, e o `--affected` lista os testes acima de 1 s dos pacotes mudados
+    (`COREROUTER_TEST_CEILING_SECS` muda o teto). O teto vale
+    na camada rápida (a do PR): no lote, os proptests rodam com os casos escritos (até 3000) e a
+    camada lenta é lenta de propósito.
+
+  Como testar: `cargo xtask ci --affected` (fim da saída: relatório e avisos);
+  `COREROUTER_TEST_CEILING_SECS=0.5 GITHUB_ACTIONS=1 cargo xtask ci --only test` reprova.

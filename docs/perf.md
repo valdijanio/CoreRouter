@@ -2326,3 +2326,21 @@ o segundo 34 s. 143 testes passam de 1 s e somam 585 s (72% do total); 20 passam
 O caminho crítico deixou de ser um teste de 50 s: o mais longo da camada rápida leva 8,6 s. 64
 threads em vez de 32 (mais testes esperando ao mesmo tempo) quebrou um teste sensível a tempo
 e foi descartado.
+
+### G0.30 — relógio simulado e dependências otimizadas (**medido**, 2026-10-29, AMD Ryzen AI Max+ 395, 32 threads, build dev, nextest 0.9.149)
+
+| `cargo nextest run --workspace --profile quick` (`PROPTEST_CASES=32`) | Parede | Tempo somado | CPU (user) |
+|---|---|---|---|
+| Parte B (camada rápida) | 22,4 s | 482 s | 309 s |
+| Parte C | **11,9 s** (12,4 / 11,9 / 11,9) | 344 s | 217 s |
+| Antes da G0.30 (todos os testes, casos escritos) | 50,0 s | 810 s | — |
+
+Por parte: só os testes da GUI, `opt-level = 3` na pilha do egui: CPU 240 s → 65 s, parede
+7,1 s → 3,8 s. Engine + daemon + pppoe + shell, `opt-level = 3` em serde_json/regex/sha: CPU
+94,6 s → 85 s. Testes de unidade do engine com `SimClock`: o traceroute de 4,8 s e o torch e o
+bandwidth de 2 s cada caíram para centésimos; o da GUI, de 8,6 s, saiu da lista. `command_sweep`
+8,7 s → 0,75 s; iperf 6 s → ~1,2 s; serviço de métricas 5,2 s → fora da lista.
+
+Custo das dependências otimizadas numa pasta de build nova (`cargo nextest run --workspace
+--no-run`, `CARGO_INCREMENTAL=0`): 53,5 s → 56,5 s de parede, +167 s de CPU uma vez; cada
+rodada dos testes economiza ~185 s de CPU.
