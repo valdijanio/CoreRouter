@@ -504,6 +504,40 @@ fn rfc2516_5_5_padt_from_the_host_frees_at_once_and_silently() {
     s.check_invariants().unwrap();
 }
 
+/// RouterOS `keepalive-timeout` (echoes every T/2, two misses): a
+/// subscriber that goes silent is gone T after the last packet heard,
+/// wherever the silence falls between the echo ticks. Counting misses at
+/// the ticks let it live up to 1.5 T (42 s for 30 s against a RouterOS
+/// 7.25 CPE, `scripts/routeros-interop-pppoe.sh keepalive`, G3.9g).
+#[test]
+fn keepalive_drops_a_silent_subscriber_after_the_timeout_not_later() {
+    const T: u64 = 30_000;
+    for cut_offset in (0..15_000).step_by(1_000) {
+        let mut l = lab(1, |c| {
+            c.server.keepalive_interval_ms = T / 2;
+            c.server.keepalive_misses = 2;
+        });
+        l.run_until(10_000);
+        assert_eq!(l.server_sessions(), 1);
+        l.run_until(60_000 + cut_offset);
+        // The line goes dead both ways, silently.
+        l.cfg.loss_ppm = 1_000_000;
+        let cut = l.now;
+        let mut gone = None;
+        while l.now < cut + 2 * T {
+            l.run_until(l.now + 100);
+            if l.server_sessions() == 0 {
+                gone = Some(l.now - cut);
+                break;
+            }
+        }
+        let gone = gone.expect("the silent subscriber is dropped");
+        assert!(gone <= T + 200, "cut at +{cut_offset} ms: dropped {gone} ms after the cut (timeout {T})");
+        assert!(gone >= T / 2, "cut at +{cut_offset} ms: dropped too early, {gone} ms");
+        assert_eq!(l.servers[0].stats().keepalive_timeouts, 1);
+    }
+}
+
 #[test]
 fn silent_host_after_pads_is_cleaned_up_by_max_configure() {
     let (mut s, mut out) = server(|_| {});

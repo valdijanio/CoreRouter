@@ -91,7 +91,9 @@ pub(crate) struct Session {
     /// The peer sent something on LCP (it left Discovery).
     heard: bool,
     echo_at: Millis,
-    echo_misses: u8,
+    /// When the subscriber last sent anything (the keepalive measures from
+    /// here, not from the echo ticks).
+    heard_at: Millis,
     echo_id: u8,
     auth_deadline: Millis,
     setup_deadline: Millis,
@@ -201,7 +203,7 @@ impl Session {
             auth: AuthState::default(),
             heard: false,
             echo_at: 0,
-            echo_misses: 0,
+            heard_at: 0,
             echo_id: 0,
             auth_deadline: 0,
             setup_deadline: now + cfg.setup_timeout_ms,
@@ -425,7 +427,7 @@ impl Session {
     /// One Session-stage packet from the subscriber.
     pub fn receive(&mut self, env: &mut Env<'_>, protocol: u16, info: &[u8]) {
         // Any packet proves the peer alive (RouterOS keepalive semantics).
-        self.echo_misses = 0;
+        self.heard_at = env.now;
         match protocol {
             proto::LCP => {
                 self.heard = true;
@@ -522,6 +524,7 @@ impl Session {
     fn lcp_up(&mut self, env: &mut Env<'_>) {
         if env.cfg.keepalive_interval_ms > 0 {
             self.echo_at = env.now + env.cfg.keepalive_interval_ms;
+            self.heard_at = env.now;
         }
         self.auth.proto = self.lcp_l.auth_agreed;
         match self.auth.proto {
@@ -953,17 +956,25 @@ impl Session {
             self.echo_at = 0;
         }
         if self.echo_at != 0 && self.echo_at <= now && self.lcp.is_opened() {
-            if self.echo_misses >= env.cfg.keepalive_misses {
+            // RouterOS keepalive-timeout: gone `interval × misses` after the
+            // last packet heard. Counting misses at the echo ticks let a dead
+            // subscriber live up to 1.5× that (42 s for 30 s against a
+            // RouterOS CPE, G3.9g).
+            let window = env
+                .cfg
+                .keepalive_interval_ms
+                .saturating_mul(u64::from(env.cfg.keepalive_misses.max(1)));
+            let dead_at = self.heard_at.saturating_add(window);
+            if now >= dead_at {
                 // The subscriber is gone: it would not answer Terminate.
                 env.stats.keepalive_timeouts += 1;
                 self.padt(env, DownReason::Keepalive);
                 return;
             }
-            self.echo_misses += 1;
             self.echo_id = self.echo_id.wrapping_add(1);
             let body = self.lcp_l.echo_magic().to_be_bytes();
             self.send(env, proto::LCP, lc::ECHO_REQUEST, self.echo_id, &body);
-            self.echo_at = now + env.cfg.keepalive_interval_ms;
+            self.echo_at = now.saturating_add(env.cfg.keepalive_interval_ms).min(dead_at);
         }
         if !self.up && self.setup_deadline <= now {
             self.setup_deadline = now + env.cfg.fsm.restart_ms * 2;
@@ -1082,6 +1093,7 @@ impl Session {
         s.up = s.v4_up || s.v6_up;
         if cfg.keepalive_interval_ms > 0 {
             s.echo_at = now + cfg.keepalive_interval_ms;
+            s.heard_at = now;
         }
         s
     }

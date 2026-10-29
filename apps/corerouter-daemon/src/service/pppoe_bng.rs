@@ -1141,6 +1141,9 @@ pub(crate) struct Snapshot {
     /// IPoE and the commands) and the space no route may take.
     pub framed: FramedTable,
     pub forbidden: Arc<Forbidden>,
+    /// `/system identity`: the PADO's AC-Name, as RouterOS sends it (a
+    /// CPE's `ac-name=` matches it; G3.9g).
+    pub identity: String,
 }
 
 /// G4.3h: this node is the active one of its redundant pair (set by the
@@ -1575,6 +1578,9 @@ impl Bng {
                 _ => None,
             };
             let mut sc = server_config(&w, port.mac, local);
+            if !self.cfg.identity.is_empty() {
+                sc.ac_name = self.cfg.identity.as_bytes().to_vec();
+            }
             // G4.3g: this worker's share of the port's SESSION_IDs, of the
             // PADI limit and of the load the PADO delay looks at (a MAC
             // always comes to the same worker: its own limit stays).

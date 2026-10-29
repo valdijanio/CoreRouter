@@ -276,7 +276,7 @@ mod linux {
             let now = ms();
             if last_second.is_none_or(|t| t.elapsed() >= SECOND) {
                 last_second = Some(Instant::now());
-                let (ppp, pools, pools6, aaa, forbidden, queues) = {
+                let (ppp, pools, pools6, aaa, forbidden, queues, identity) = {
                     let s = lock(session);
                     let c = s.store().running();
                     (
@@ -286,6 +286,7 @@ mod linux {
                         s.aaa_backend(),
                         Arc::new(corerouter_engine::framed::Forbidden::of(c)),
                         c.queue.clone(),
+                        c.system.identity.clone(),
                     )
                 };
                 // CoA/Disconnect: one registration per RADIUS service.
@@ -339,6 +340,7 @@ mod linux {
                     forbidden,
                     queues,
                     seal: seal.clone(),
+                    identity,
                 };
                 let xdp = d.plane == Some(true);
                 for w in &d.workers {
