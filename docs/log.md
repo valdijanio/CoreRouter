@@ -8055,3 +8055,23 @@ continuação indentadas).
   Como testar: `cargo test -p corerouter-proto-bgp graceful`, `cargo test -p corerouter-engine
   --lib graceful`; `scripts/bgp-crcr-userns.sh gr`; `cargo xtask vm-lab run --
   scripts/routeros-interop-bgp.sh gr`.
+
+- 2026-10-29 — processo-codigo-de-terceiros: Regra nova no CLAUDE.md/AGENTS.md (pedido do usuário, 2026-10-29): em dúvida, problema ou análise
+  de desempenho que passe por um pacote de terceiros (FRR, kernel, buildroot, nftables, crates), é
+  obrigatório ler o código do pacote e, quando preciso, compilar com logs e testar por dentro, com
+  a evidência registrada no PR e a correção no lugar do defeito (patch na imagem e texto para o
+  projeto de origem). Primeiro caso: o abort do TI-LFA no `ospfd` (G3.4l).
+
+- 2026-10-29 — valida-bgp-history-flap: `routing.bgp.session.history` perdia a sessão que sobe e cai entre duas amostras do serviço `frr`
+  (a cada 2 s). Achado na validação das rodadas 1 e 2 (`scripts/bgp-crcr-userns.sh maxprefix`,
+  CoreRouter × FRR 10.7.1 no host): o `max_prefix_ipv4=3` com `shutdown` fecha a sessão com o R3
+  logo depois do Established; as duas amostras dizem `idle` e só o contador `flaps` anda (0 → 1),
+  e o histórico ficava vazio, justo no evento que o operador procura. Agora `flaps` maior com a
+  sessão fora nas duas amostras entra como `down`, com o motivo (`Reached received prefix count`)
+  e sem uptime (não se sabe quanto ficou de pé). Teste
+  `bgp_history::tests::up_and_down_between_two_samples_is_a_down` (o código antigo reprova).
+
+  Como testar: `cargo test -p corerouter-engine --lib bgp_history`.
+
+  Desempenho e paralelismo: uma comparação a mais por sessão por amostra, O(1); nada muda no
+  custo da amostra (O(sessões), uma thread, a do serviço `frr`).
