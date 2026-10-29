@@ -451,8 +451,11 @@ fn pppoe_server_end_to_end() {
         .iter()
         .filter(|h| h["reason"] == "replaced")
         .count();
+    // `ppp.history` returns at most 10 000 rows (the newest): above that
+    // (the lab's COREROUTER_PPPOE_E2E_SESSIONS=20000), every row it shows.
     assert_eq!(
-        replaced, n,
+        replaced,
+        n.min(10_000),
         "one-session-per-host replaced every old session"
     );
     drop(again);
