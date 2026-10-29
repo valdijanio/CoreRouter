@@ -27,10 +27,10 @@ A named prefix list. Entries are separated by commas or new lines."##),
     (r##"filter.prefix_list.entries"##, r##"## What it is
 Prefixes with an optional length range (FRR/Cisco form): `10.0.0.0/8` matches only that prefix; `10.0.0.0/8 le 24` it and its more specifics up to /24; `0.0.0.0/0 ge 25` any IPv4 prefix /25 or longer."##),
     (r##"filter.prepend"##, r##"## What it is
-`set bgp-path-prepend N` repeats our AS in the path. On RouterOS v7 a route leaves for an eBGP neighbor with the AS N times in all (the copy eBGP always adds counts): `set bgp-path-prepend 3` leaves as `65000 65000 65000`, and N = 1 changes nothing (measured on the RouterOS 7.25 CHR). Filters written before G3.9fg counted N on top of that copy (N + 1 in all) and keep doing so until you switch.
+`set bgp-path-prepend N` repeats our AS in the path. On RouterOS v7 a route leaves for an eBGP neighbor with the AS N times in all (the copy eBGP always adds counts): `set bgp-path-prepend 3` leaves as `65000 65000 65000`, and N = 1 changes nothing; on input and iBGP outputs it adds nothing (measured on the RouterOS 7.25 CHR). Filters written before G3.9fg counted N on top of that copy (N + 1 in all) and keep doing so until you switch.
 
 ## What to do
-**Use RouterOS count** switches and rewrites N to N + 1 in the chains that only leave over eBGP, so the neighbor keeps getting the same path; the result lists what could not be kept (a chain also used on input or iBGP, N already 16). In transactional mode, check the Commit impact before committing."##),
+**Use RouterOS count** switches and rewrites N to N + 1 in the chains that only leave over eBGP, so the neighbor keeps getting the same path; the result lists what could not be kept (a chain used on input or iBGP, where the prepend stops applying; N already 16). In transactional mode, check the Commit impact before committing."##),
     (r##"filter.preview.as_path"##, r##"## What it is
 The route's AS path, the neighbor first."##),
     (r##"filter.preview.before"##, r##"## What it is

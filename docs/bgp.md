@@ -156,8 +156,9 @@ corerouter-cli run routing.bgp.connection.add '{"name":"client1","remote_address
   - Refletor: o CHR põe o próprio Router ID no ORIGINATOR_ID; a RFC 4456 §8 pede o do originador
     do anúncio no AS. Errado o RouterOS; o CLUSTER_LIST e o next hop estão certos.
   - `set bgp-path-prepend N`: no eBGP o CHR sai com o próprio AS N vezes no total (N = 1, 2, 3 →
-    1, 2, 3 cópias, **medido**). Desde a G3.9fg o CoreRouter faz igual; filtros antigos mantêm a
-    contagem anterior (N + 1) até `routing.filter.prepend.set` (`docs/bgp-policy.md`).
+    1, 2, 3 cópias, **medido**); na saída iBGP e na entrada não põe nada. Desde a G3.9fg o
+    CoreRouter faz igual; filtros antigos mantêm a contagem anterior (N além do que a sessão põe)
+    até `routing.filter.prepend.set` (`docs/bgp-policy.md`).
   - iBGP de rede própria: o CHR anuncia com o endereço da interface (10.39.1.1) quando a sessão
     é entre loopbacks com `local.address`; a RFC 4271 §5.1.3 permite. Sem `local.address` ele
     abre a sessão a partir do loopback.
