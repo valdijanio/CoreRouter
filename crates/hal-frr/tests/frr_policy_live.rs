@@ -308,6 +308,7 @@ fn live_bgp_policy() {
         policy: &policy,
         chain: policy.chain("pol-in"),
         accept_without: false,
+        counted: 0,
         asn: 65000,
     };
     let pv = preview(&side, None, &got, 10, 1);

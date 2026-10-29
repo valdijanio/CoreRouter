@@ -431,6 +431,21 @@ impl FilterPanel {
         if unprotected.len() > 4 {
             ui.weak(format!("… +{}", unprotected.len() - 4));
         }
+        // G3.9fg: a filter of an older build keeps its prepend count.
+        let prepend = self.status.get("prepend_warning").and_then(Value::as_str).map(str::to_owned);
+        if let Some(msg) = &prepend {
+            ui.horizontal_wrapped(|ui| {
+                chip::chip(ui, tr_in(SCOPE, l, "Prepend count"), chip::AMBER.tone(&v));
+                ui.label(msg);
+                if ui.button(tr_in(SCOPE, l, "Use RouterOS count")).clicked() {
+                    app.run("routing.filter.prepend.set", json!({"count": "routeros"}));
+                    app.cache.refreshed_at = None;
+                }
+                if help::info_button(ui, egui::Id::unique("filter-prepend"), tr_in(SCOPE, l, "Prepend count")).clicked() {
+                    help = Some(HelpView::new("filter.prepend", tr_in(SCOPE, l, "Prepend count")));
+                }
+            });
+        }
         for r in self.impact.iter().take(4) {
             ui.horizontal_wrapped(|ui| {
                 let tone = if u(r, "withdrawn") > 0 { chip::RED.tone(&v) } else { chip::BLUE.tone(&v) };
@@ -444,7 +459,7 @@ impl FilterPanel {
         if help.is_some() {
             self.help = help;
         }
-        if !unprotected.is_empty() || !self.impact.is_empty() {
+        if !unprotected.is_empty() || !self.impact.is_empty() || prepend.is_some() {
             ui.separator();
         }
     }
@@ -771,6 +786,7 @@ impl FilterPanel {
             CLIST_SPEC.help,
             "filter.rfc8212",
             "filter.impact",
+            "filter.prepend",
             "filter.preview.connection",
             "filter.preview.direction",
             "bgp.param.input_filter",
