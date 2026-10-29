@@ -23,6 +23,10 @@ sha2 = { version = "0.11.0", default-features = false }
 criterion.workspace = true
 
 [[bench]]
+name = "config_delta"
+harness = false
+
+[[bench]]
 name = "cow_list"
 harness = false
 

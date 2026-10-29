@@ -8,6 +8,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Apply"##, r##"Aplicar"##),
     (r##"Ask the neighbor to send its routes again (RFC 2918): new inbound policy, no reset"##, r##"Pede ao vizinho que mande as rotas de novo (RFC 2918): aplica a nova política de entrada sem derrubar a sessão"##),
     (r##"BFD"##, r##"BFD"##),
+    (r##"BGP Instance"##, r##"Instância BGP"##),
     (r##"Clear"##, r##"Reiniciar"##),
     (r##"Close the session and open it again (its routes are withdrawn meanwhile)"##, r##"Fecha a sessão e abre de novo (as rotas dela saem enquanto isso)"##),
     (r##"Connections"##, r##"Conexões"##),
@@ -30,7 +31,9 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Local Role"##, r##"Papel local"##),
     (r##"Messages"##, r##"Mensagens"##),
     (r##"Name"##, r##"Nome"##),
+    (r##"New BGP Instance"##, r##"Nova instância BGP"##),
     (r##"New Connection…"##, r##"Nova conexão…"##),
+    (r##"New Instance…"##, r##"Nova instância…"##),
     (r##"New Template…"##, r##"Novo template…"##),
     (r##"No BGP connection yet: add one in the Connections tab."##, r##"Nenhuma conexão BGP ainda: adicione uma na aba Conexões."##),
     (r##"Not a CoreRouter connection (typed into FRR by hand)."##, r##"Não é uma conexão do CoreRouter (digitada no FRR à mão)."##),
@@ -87,6 +90,29 @@ O nome da conexão; vai para o FRR como a descrição do vizinho, e é assim que
 O endereço do vizinho (`remote.address` do RouterOS), IPv4 ou IPv6. Uma conexão por endereço em cada instância."##),
     (r##"bgp.instance.asn"##, r##"## O que é
 O nosso AS, em asplain ou asdot, de 4 bytes (RFC 6793). Valores reservados são recusados."##),
+    (r##"bgp.instance.disabled"##, r##"## O que é
+Uma instância desativada para: o `bgpd` fecha todas as sessões das conexões dela (Cease, administrative shutdown) e as rotas delas saem. A instância e as conexões continuam na config.
+
+## Cuidado
+A prévia diz quantas sessões param."##),
+    (r##"bgp.instance.graceful_defer_time"##, r##"## O que é
+Depois que o nosso `bgpd` sobe, quanto tempo a escolha do melhor caminho espera o End-of-RIB dos vizinhos que anunciam graceful restart antes de instalar e anunciar rotas (RFC 4724 §4.1; `select-defer-time` do FRR). 0..3600 s; vazio: 10 s (os 360 s do FRR deixaram as rotas de um vizinho RouterOS 120 s fora do kernel, **medido**).
+
+## Cuidado
+Um vizinho que nunca manda End-of-RIB (RouterOS 7.25; a checagem de saúde `bgp.end-of-rib` o aponta) segura as rotas dele pelo tempo inteiro depois de cada início do `bgpd`. 0 não espera: as rotas podem mudar enquanto os vizinhos reenviam as tabelas."##),
+    (r##"bgp.instance.graceful_restart_time"##, r##"## O que é
+O Restart Time que anunciamos na capacidade de graceful restart (RFC 4724 §3): quanto tempo o vizinho guarda as nossas rotas (stale) depois que o nosso `bgpd` morre, esperando ele voltar. Só as conexões com Graceful Restart = yes o anunciam. 1..4095 s (12 bits); vazio: 120 s.
+
+## Recomendado
+Abaixo do hold time dessas conexões (RFC 4724 §3; a prévia avisa). Mais longo esconde uma falha de verdade: o vizinho continua mandando tráfego para um roteador que não vai voltar.
+
+## Outros roteadores
+FRR `bgp graceful-restart restart-time` (120), Junos `restart-time` (120), Cisco `bgp graceful-restart restart-time` (120). O RouterOS 7.25 não tem o parâmetro."##),
+    (r##"bgp.instance.graceful_stale_time"##, r##"## O que é
+Como helper: quanto tempo guardamos as rotas de um vizinho que reiniciou, marcadas stale, depois que ele volta e antes do End-of-RIB dele (RFC 4724 §4.2). As rotas stale que ele não mandou de novo saem quando chega o End-of-RIB ou quando este tempo acaba. 1..4095 s; vazio: 360 s.
+
+## Cuidado
+Um vizinho que nunca manda End-of-RIB (RouterOS 7.25) deixa as rotas velhas pelo tempo inteiro. FRR `bgp graceful-restart stalepath-time`, Junos `stale-routes-time` (300)."##),
     (r##"bgp.instance.name"##, r##"## O que é
 O nome da instância; `default` roda na tabela principal, outro nome é uma view separada do FRR."##),
     (r##"bgp.instance.router_id"##, r##"## O que é
@@ -108,7 +134,7 @@ Graceful restart (RFC 4724) como quem reinicia: quando o `bgpd` deste roteador c
 `yes`: anuncia a capacidade de reinício com o bit F (encaminhamento preservado). Vazio: só ajuda (guarda as rotas do vizinho quando ele reinicia), o padrão do FRR. `no`: nem isso.
 
 ## Cuidado
-O vizinho precisa ser helper (o RouterOS anuncia `gr`). O Restart Time deve ser menor que o hold time (RFC 4724 §3; a prévia avisa). Os tempos ficam na instância: `routing.bgp.instance.set` com `graceful_restart_time` e `graceful_stale_time` (1..4095 s) e `graceful_defer_time` (0..3600 s, padrão 10: quanto o melhor caminho espera os End-of-RIB depois que o `bgpd` sobe; o FRR usaria 360 s).
+O vizinho precisa ser helper (o RouterOS anuncia `gr`). O Restart Time deve ser menor que o hold time (RFC 4724 §3; a prévia avisa). Os tempos ficam na instância (aba Instâncias, ou `routing.bgp.instance.set` com `graceful_restart_time` e `graceful_stale_time` (1..4095 s) e `graceful_defer_time` (0..3600 s, padrão 10: quanto o melhor caminho espera os End-of-RIB depois que o `bgpd` sobe; o FRR usaria 360 s)).
 
 ## Com MikroTik
 O RouterOS 7.25 anuncia graceful restart mas não guarda as nossas rotas quando o `bgpd` cai, nem manda End-of-RIB (**medido**): do lado dele não há ganho. Do nosso lado o kernel continua guardando as rotas dele."##),
@@ -209,7 +235,7 @@ Os vizinhos, como o `/routing bgp connection` do RouterOS: endereço, AS, papel 
 ## Dica
 Parâmetros comuns (timers, famílias, limite de prefixos, chave MD5) ficam melhor num template: muda-se num lugar só."##),
     (r##"bgp.tab.instances"##, r##"## O que é
-O nosso lado: o AS local (4 bytes, RFC 6793) e o router-id. As conexões pertencem a uma instância (`default`)."##),
+O nosso lado: o AS local (4 bytes, RFC 6793), o router-id e os tempos de graceful restart (RFC 4724). As conexões pertencem a uma instância (`default`). Duplo clique edita; a prévia diz o que a mudança faz com as sessões (AS ou router-id novos as reiniciam)."##),
     (r##"bgp.tab.sessions"##, r##"## O que mostra
 As sessões BGP que o FRR está rodando agora, uma por conexão, como o `/routing bgp session` do RouterOS (só leitura, ao vivo a cada 2 s): estado, tempo ativo, prefixos recebidos e enviados, BFD. Selecione uma para ver o último erro, os timers, as políticas, as quedas e as ações Pedir rotas, Reenviar, Reiniciar e Desligar.
 

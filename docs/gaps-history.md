@@ -270,3 +270,6 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-29 — G3.9ha feito (anúncio de roteador IPv6, `/ipv6 nd`); gaps novas G3.9hg–G3.9hk
 - 2026-10-29 — G3.9hd feito (`ip.firewall.connection.remove`); G3.9hf criado (GUI: Remove com contagem e aviso de gerência)
 - 2026-10-29 — G3.9ff feito (graceful restart como quem reinicia); G3.9fj criada (LLGR, BFD C-bit, Hard Reset, GR do OSPF, tempos na janela)
+- 2026-10-29 — G3.9b feito (BFD tolerante à subida lenta do RouterOS)
+- 2026-10-29 — G1.6i feito (daemons do FRR sob demanda)
+- 2026-10-29 — G1.6r criado (enviar só o que mudou no `os push`)

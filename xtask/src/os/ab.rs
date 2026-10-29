@@ -13,8 +13,9 @@
 //!   boot entries) and `corerouter-init run <command>`.
 //!
 //! The private key: `--key <pkcs8>` or `$COREROUTER_IMAGE_KEY`; without
-//! either, a development key generated once in `os/out/keys/` (ignored by
-//! git, never in the image). The image only carries the public key.
+//! either, a development key generated once in `<out>/keys/` (the build's
+//! directory, `os/out.rs`; never in git nor in the image). The image only
+//! carries the public key.
 
 // `serde_json::Value` indexing (`v["slots"]`) gives `Null` for a missing
 // key and never panics; the lint cannot tell it from slice indexing.
@@ -58,13 +59,14 @@ pub(super) fn run_tool(tool: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// The signing key and the public-key directory (`corerouter-image key`).
+/// The signing key and the public-key directory (`corerouter-image key`),
+/// under `top`, the build's directory.
 pub fn ensure_key(
-    root: &Path,
+    top: &Path,
     tool: &Path,
     given: Option<&Path>,
 ) -> Result<(PathBuf, PathBuf), String> {
-    let keys = root.join("os/out/keys");
+    let keys = top.join("keys");
     let keys = keys.to_string_lossy().into_owned();
     let mut args = vec!["key", "--keys", keys.as_str()];
     let given = given.map(|g| g.to_string_lossy().into_owned());
@@ -102,7 +104,10 @@ fn package(
     let version = format!("{}{suffix}", m["version"].as_str().unwrap_or("0"));
     let build = (m["build"].as_u64().unwrap_or(0) + 1).to_string();
     let images = ctx.images.to_string_lossy().into_owned();
-    let keys = ctx.root.join("os/out/keys").to_string_lossy().into_owned();
+    let keys = super::out_dir(&ctx.root)?
+        .join("keys")
+        .to_string_lossy()
+        .into_owned();
     let out_s = out.to_string_lossy().into_owned();
     let mut args = vec![
         "package",
@@ -836,18 +841,8 @@ const PUSH_PASSWORD: &str = "ab-test-push-Pw1";
 /// identity answer from B. Then a package whose daemon never answers is
 /// pushed the same way: its trial is not confirmed and B comes back.
 fn scenario_push(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
-    let st = Command::new(crate::cargo_bin())
-        .args(["build", "-q", "--release", "-p", "corerouter-cli"])
-        .current_dir(&ctx.root)
-        .status()
-        .map_err(|e| format!("cargo: {e}"))?;
-    check(st.success(), "cargo build -p corerouter-cli failed")?;
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let cli = exe
-        .parent()
-        .and_then(Path::parent)
-        .map(|t| t.join("release/corerouter-cli"))
-        .ok_or("no target directory")?;
+    // The CLI `os push` runs (same build, same target).
+    let cli = super::push::cli(&ctx.root)?;
     let pkg = ctx.work.join("push-b.crpkg");
     let version = package(ctx, &pkg, "-push", None, None)?;
     ctx.fwd = Some(super::free_port()?);
@@ -996,7 +991,7 @@ pub fn ab_test(root: &Path, images: &Path, args: &[String]) -> Result<(), String
         Path::new(OVMF_CODE).exists(),
         format!("{OVMF_CODE} missing (package ovmf)"),
     )?;
-    let work = root.join("os/out/ab-test");
+    let work = super::out_dir(root)?.join("ab-test");
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
     let log_path = work.join("console.log");
     let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;

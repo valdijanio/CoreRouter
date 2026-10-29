@@ -573,7 +573,15 @@ gr_round() { # gr_round <label> <graceful_restart json or empty>
 case_gr() {
   : > "$W/gr-summary.txt"
   gr_round without ''
+  # G3.9fj: the timers through the Instances modal's path, the preview's
+  # command (routing.bgp.instance.check → instance.set).
+  local inst set
+  inst=$(cr1 routing.bgp.instance.list | jq -c '.[0] | {id: .name, asn, router_id, graceful_restart_time: "60", graceful_defer_time: "5"}')
+  set=$(cr1 routing.bgp.instance.check "$inst" | jq -c '.commands[0].params')
+  cr1 routing.bgp.instance.set "$set" >/dev/null && result gr INFO "timers from the modal's preview: $set" || result gr FAIL "instance.check gave $set"
   gr_round with '{"graceful_restart":true}'
+  result gr INFO "CR1 bgpd: $(vt c1 'show running-config' | grep -E 'graceful-restart (restart-time|select-defer-time)' | tr '\n' ';')"
+  result gr INFO "health: $(cr1 system.health.check | jq -c '.checks[] | select(.key == "bgp.end-of-rib") | {severity, value, reason}')"
   local wo w
   wo=$(awk '$1 == "without" {print $2}' "$W/gr-summary.txt"); w=$(awk '$1 == "with" {print $2}' "$W/gr-summary.txt")
   read -r _ _ _ gone kept < <(grep '^with ' "$W/gr-summary.txt")

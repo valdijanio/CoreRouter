@@ -28,6 +28,26 @@ pub const FRR_DIR: &str = "/var/run/frr";
 pub const FRR_DAEMONS: &[&str] = &[
     "mgmtd", "zebra", "staticd", "bgpd", "ospfd", "ospf6d", "ldpd", "bfdd",
 ];
+/// G1.6i: the FRR daemons that always run (mgmtd and its back ends zebra
+/// and staticd); the others run only while the daemon names them in
+/// [`FRR_WANTED`] (`hal-frr`'s `on_demand`).
+pub const FRR_ALWAYS: &[&str] = &["mgmtd", "zebra", "staticd"];
+/// Where the daemon writes the protocol daemons its config uses (tmpfs: a
+/// reboot starts with [`FRR_ALWAYS`] and the daemon's first sync asks again).
+pub const FRR_WANTED: &str = "/run/corerouter/frr-daemons";
+/// Longest [`FRR_WANTED`] read (its five names fit in 100 bytes).
+pub const FRR_WANTED_MAX: u64 = 4096;
+
+/// The FRR daemons to run for the text of [`FRR_WANTED`] (hostile: only
+/// names of [`FRR_DAEMONS`] count), in start order; [`FRR_ALWAYS`] always.
+pub fn frr_wanted(text: &str) -> Vec<&'static str> {
+    let listed: Vec<&str> = text.lines().map(str::trim).collect();
+    FRR_DAEMONS
+        .iter()
+        .copied()
+        .filter(|d| FRR_ALWAYS.contains(d) || listed.contains(d))
+        .collect()
+}
 /// Where the FRR daemons are installed.
 pub const FRR_SBIN: &str = "/usr/sbin";
 /// Marks that the installer's management address (`corerouter.mgmt=`) was
@@ -346,7 +366,7 @@ pub fn daemon_args(opts: &BootOptions, frr: bool) -> Vec<String> {
     // G1.6o: web access (https://<router>/) on in a config made at first boot.
     a.extend(["--web-files", WEB_DIR, "--web-factory-on"].map(str::to_owned));
     if frr {
-        a.extend(["--frr".to_owned(), FRR_DIR.to_owned()]);
+        a.extend(["--frr", FRR_DIR, "--frr-daemons", FRR_WANTED].map(str::to_owned));
     }
     a
 }
@@ -460,6 +480,17 @@ mod tests {
     }
 
     #[test]
+    fn frr_runs_the_base_daemons_and_what_the_file_names() {
+        assert_eq!(frr_wanted(""), ["mgmtd", "zebra", "staticd"]);
+        // The daemon's file: a comment, names in any order, junk ignored.
+        let text = "# FRR daemons\nbfdd\nbgpd\n../../bin/sh\nzebra\n  ospfd  \n";
+        assert_eq!(
+            frr_wanted(text),
+            ["mgmtd", "zebra", "staticd", "bgpd", "ospfd", "bfdd"]
+        );
+    }
+
+    #[test]
     fn daemon_command_line() {
         let a = daemon_args(&BootOptions::parse(""), false);
         assert_eq!(
@@ -468,7 +499,10 @@ mod tests {
              --web-files /usr/share/corerouter/web --web-factory-on"
         );
         let a = daemon_args(&BootOptions::parse(""), true);
-        assert!(a.join(" ").ends_with("--frr /var/run/frr"));
+        assert!(
+            a.join(" ")
+                .ends_with("--frr /var/run/frr --frr-daemons /run/corerouter/frr-daemons")
+        );
         assert_eq!(
             frr_args("zebra").join(" "),
             "-P 0 --log stdout --log-level notifications -s 90000000"
