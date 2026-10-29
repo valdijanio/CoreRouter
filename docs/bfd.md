@@ -54,6 +54,13 @@ corerouter-cli run routing.bfd.profile.list
   - Jitter de transmissão: 0–25 % a menos, ou 10–25 % com multiplicador 1 (§6.8.7).
   - A detecção é o multiplicador recebido × max(nosso Required Min RX, o Desired Min TX recebido)
     (§6.8.4); vencida, a sessão cai com Diag 1 e o discriminador remoto volta a 0 (§6.8.1).
+  - **Subida tolerante (G3.9b).** Quando o par baixa o Desired Min TX (o passo de 1 s para o
+    intervalo rápido logo depois do Up), a detecção continua com o valor antigo até dois pacotes
+    periódicos dele chegarem no máximo um intervalo novo um do outro. É o princípio que a §6.8.3
+    impõe a quem baixa o próprio Required Min RX, aplicado do nosso lado: o RouterOS 7.25 anuncia
+    100 ms ao subir mas segue mandando a ~1 s por alguns segundos, e com 3 × 100 ms toda sessão
+    nova caía. Um Final ou uma mudança de estado (enviados na hora, fora do ritmo) não contam
+    como prova. Enquanto isso o `detect_time_us` da sessão mostra a detecção lenta.
   - Um par em Demand mode é respeitado (sem periódicos com os dois em Up); o nosso Demand mode
     local e a função Echo não são oferecidos (opcionais na RFC; viram gaps).
   - Um pacote de estado novo sai na hora (o handshake de três vias não espera o timer de 1 s).
