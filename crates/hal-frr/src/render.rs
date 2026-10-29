@@ -155,8 +155,7 @@ pub enum RenderError {
 /// What FRR should run for `cfg` (the owned part only); `open` opens the
 /// sealed TCP MD5 keys.
 pub fn render(cfg: &Config, open: corerouter_proto_bgp::Opener<'_>) -> Result<Conf, RenderError> {
-    let mut text =
-        corerouter_proto_bgp::render_all(&cfg.routing, open).map_err(RenderError::Proto)?;
+    let mut text = corerouter_proto_bgp::render_config(cfg, open).map_err(RenderError::Proto)?;
     // G3.4: the same key opener (both seal with the engine's key).
     text.push_str(&corerouter_proto_ospf::frr::render(cfg, open).map_err(RenderError::Proto)?);
     text.push_str(&corerouter_proto_bfd::frr::render(cfg));

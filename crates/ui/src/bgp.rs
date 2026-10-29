@@ -502,7 +502,7 @@ fn values_of(r: &Value, what: What) -> BTreeMap<&'static str, String> {
 /// The choices of a choice field (empty: unset, inherit).
 fn options(param: &str, instances: &[String]) -> Vec<String> {
     let v: &[&str] = match param {
-        "local_role" => &["", "ibgp", "ebgp", "ebgp-provider", "ebgp-customer", "ebgp-peer", "ebgp-rs", "ebgp-rs-client"],
+        "local_role" => &["", "ibgp", "ibgp-rr", "ebgp", "ebgp-provider", "ebgp-customer", "ebgp-peer", "ebgp-rs", "ebgp-rs-client"],
         "multihop" | "keep_received" => &["", "yes", "no"],
         "nexthop_choice" => &["", "default", "force-self", "propagate"],
         "afi" => &["", "ip", "ipv6", "ip,ipv6"],

@@ -105,7 +105,7 @@ Menos de 9 s derruba a sessão numa perda curta; para detectar falha rápido, us
     (r##"bgp.param.keepalive_time"##, r##"## O que é
 Segundos entre KEEPALIVEs. Vazio: um terço do hold time (RFC 4271 §10). Tem que ser menor que o hold time."##),
     (r##"bgp.param.local_role"##, r##"## O que é
-O `local.role` do RouterOS: `ibgp` (mesmo AS) ou `ebgp`; os papéis `ebgp-provider`, `-customer`, `-peer`, `-rs` e `-rs-client` são anunciados no OPEN (RFC 9234) e deixam os dois lados pegarem um vazamento de rotas (route leak).
+O `local.role` do RouterOS: `ibgp` (mesmo AS), `ibgp-rr` (iBGP em que este roteador é o refletor de rotas e o vizinho é cliente, RFC 4456) ou `ebgp`; os papéis `ebgp-provider`, `-customer`, `-peer`, `-rs` e `-rs-client` são anunciados no OPEN (RFC 9234) e deixam os dois lados pegarem um vazamento de rotas (route leak).
 
 ## Padrão
 Vazio: pelo AS remoto (o nosso → ibgp, outro → ebgp).
