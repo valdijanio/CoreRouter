@@ -6,11 +6,15 @@
 
 # --- Boot: EFI stub (the kernel is BOOTX64.EFI, no bootloader), built-in
 # command line. The PARTUUID is rootfs-a in genimage.cfg (checked by xtask).
+# G1.6m: `bonding.max_bonds=0 dummy.numdummies=0`, so the built-in drivers
+# create no `bond0`/`dummy0` of their own (CoreRouter creates its bonds and
+# loopbacks through netlink); the tunnels' catch-all devices (`gre0`,
+# `sit0`…) are off by a patch (os/patches/linux/0002-…).
 CONFIG_EFI=y
 CONFIG_EFI_STUB=y
 CONFIG_EFI_PARTITION=y
 CONFIG_CMDLINE_BOOL=y
-CONFIG_CMDLINE="console=tty0 console=ttyS0,115200 root=PARTUUID=3e1088b8-5b4b-4fbb-b756-a271f641d018 rootfstype=squashfs rootwait ro init=/usr/sbin/corerouter-init panic=10 quiet"
+CONFIG_CMDLINE="console=tty0 console=ttyS0,115200 root=PARTUUID=3e1088b8-5b4b-4fbb-b756-a271f641d018 rootfstype=squashfs rootwait ro bonding.max_bonds=0 dummy.numdummies=0 init=/usr/sbin/corerouter-init panic=10 quiet"
 CONFIG_DEVTMPFS=y
 CONFIG_DEVTMPFS_MOUNT=y
 # --- A/B image (G1.6b, docs/os-image.md): each slot boots from a UEFI boot

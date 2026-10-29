@@ -429,8 +429,13 @@ pub fn check(os: &Path) -> Result<usize, String> {
 /// (`os/buildroot-patches/*.patch`, in name order) and one hash over their
 /// names and contents, which tells a tree patched with other files apart.
 fn buildroot_patches(os: &Path) -> Result<(Vec<PathBuf>, String), String> {
-    let dir = os.join("buildroot-patches");
-    let mut patches: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+    patches_in(&os.join("buildroot-patches"))
+}
+
+/// The `*.patch` files of `dir` in name order and one hash over their names
+/// and contents.
+fn patches_in(dir: &Path) -> Result<(Vec<PathBuf>, String), String> {
+    let mut patches: Vec<PathBuf> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
             .flatten()
             .map(|e| e.path())
@@ -695,6 +700,21 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
     ));
     for stamp in [".stamp_built", ".stamp_images_installed"] {
         let _ = std::fs::remove_file(installer_dir.join(stamp));
+    }
+    // G1.6m: Buildroot applies `os/patches/linux/*.patch` only when it
+    // extracts the kernel: changed patches need `linux-dirclean` (then a
+    // full kernel build).
+    let (_, kpatches) = patches_in(&d.os.join("patches/linux"))?;
+    let kstamp = d.out.join(".corerouter-linux-patches.sha256");
+    if std::fs::read_to_string(&kstamp).ok().as_deref() != Some(kpatches.as_str()) {
+        if d.out
+            .join("build")
+            .join(format!("linux-{version}"))
+            .exists()
+        {
+            make(&["linux-dirclean"], None)?;
+        }
+        std::fs::write(&kstamp, &kpatches).map_err(|e| format!("{}: {e}", kstamp.display()))?;
     }
     // Buildroot reads the kernel fragment only when it configures the
     // kernel: a changed fragment needs `linux-reconfigure` (the kernel's
@@ -1248,7 +1268,7 @@ fn watch(
             report.ready_kernel_s = Some(s);
             wall_ready = Some(started.elapsed());
             ping = Some(if b.efi {
-                "skipped: with --efi the command line is the built-in one, no address on eth0 (G1.6d)".to_owned()
+                "skipped: with --efi the command line is the built-in one, no address on ether1 (G1.6d)".to_owned()
             } else {
                 tls_ping(port)?
             });

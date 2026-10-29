@@ -70,6 +70,9 @@ pub fn main() {
             mount_api(&plan::EFIVARS);
         }
         let _ = rustix::system::sethostname(b"corerouter-install");
+        // The installer shows the ports by the names the router will give
+        // them (no map yet: bus order).
+        let _ = name_ports(None);
         crate::install::run(&opts, cmdline.trim());
     }
     for w in &opts.warnings {
@@ -80,10 +83,11 @@ pub fn main() {
     if let Err(e) = rustix::system::sethostname(b"corerouter") {
         log!("hostname: {e}");
     }
-    if let Err(e) = loopback_up() {
+    if let Err(e) = crate::links::loopback_up() {
         log!("lo up: {e} (the control channel listens on 127.0.0.1)");
     }
     mount_config();
+    let names = name_ports(Some(Path::new(crate::ports::MAP_FILE)));
     let trial = trial_at_boot(&cmdline);
     for dir in [plan::RUNTIME_DIR, "/var/log", "/var/lib", "/var/tmp"] {
         if let Err(e) = fs::create_dir_all(dir) {
@@ -108,7 +112,7 @@ pub fn main() {
         }
     }
     log!("early boot done in {} ms", started.elapsed().as_millis());
-    supervise(&opts, &action, started, trial, frr);
+    supervise(&opts, &action, started, trial, frr, names);
 }
 
 /// FRR's daemons, when the image has them (G1.6c): their state directory
@@ -187,23 +191,115 @@ fn spawn_frr(s: &Svc) -> Option<Pid> {
     }
 }
 
+/// Renames the kernel's `eth<N>` to `ether<N+1>` (G1.6m, `ports.rs`),
+/// before the daemon sees them; `map`: where the names are kept (`None`:
+/// the installer, nothing kept). Every port's name by kernel name.
+fn name_ports(map: Option<&Path>) -> Vec<(String, String)> {
+    crate::links::settle(Duration::from_millis(100), Duration::from_secs(2));
+    let found = crate::links::kernel_named_ports();
+    let text = map.and_then(|p| File::open(p).ok()).map(|f| {
+        let mut s = String::new();
+        let _ = f.take(crate::ports::MAX_MAP).read_to_string(&mut s);
+        s
+    });
+    let (known, bad) = crate::ports::parse_map(text.as_deref().unwrap_or(""));
+    if bad > 0 {
+        log!(
+            "port names: {bad} unreadable lines in {}",
+            crate::ports::MAP_FILE
+        );
+    }
+    // A configuration from before the renaming and no map yet: the kernel's
+    // names stay (the configuration uses them).
+    let keep = map.is_some()
+        && text.is_none()
+        && Path::new(plan::CONFIG_DIR).join("running.json").exists();
+    if keep {
+        log("port names: configuration from before ether names; keeping the kernel's names");
+    }
+    let p = crate::ports::assign(&found, &known, keep);
+    for n in &p.notes {
+        log!("port names: {n}");
+    }
+    let mut names = p.names.clone();
+    for (from, to) in &p.renames {
+        if let Err(e) = crate::links::rename(from, to) {
+            log!("port names: {from} → {to}: {e}; it stays {from}");
+            if let Some(n) = names.iter_mut().find(|(k, _)| k == from) {
+                n.1.clone_from(from);
+            }
+        }
+    }
+    if !p.renames.is_empty() {
+        let list: Vec<String> = names
+            .iter()
+            .filter_map(|(k, n)| {
+                let f = found.iter().find(|f| &f.kernel == k)?;
+                Some(format!("{k}→{n} ({})", f.mac))
+            })
+            .collect();
+        log!("port names: {}", list.join(", "));
+    }
+    if let Some(m) = map
+        && p.map != known
+        && let Err(e) = write_durable(m, &crate::ports::render_map(&p.map))
+    {
+        log!("{}: {e}", m.display());
+    }
+    names
+}
+
+/// Written so it survives a power cut right after (a VM destroyed seconds
+/// later): temporary file, fsync, rename, fsync of the directory. Without
+/// it the installer's marker could be lost while the configuration (which
+/// the daemon syncs) was not, and the address was applied again (G1.6m).
+fn write_durable(path: &Path, text: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    let mut f = File::create(&tmp)?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()?;
+    fs::rename(&tmp, path)?;
+    if let Some(dir) = path.parent() {
+        File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
 /// After the first ready: the installer's management address (once), then
 /// whether the console setup is wanted (no address on any port).
-fn first_boot(opts: &BootOptions, want_setup: Arc<AtomicBool>) {
-    let mgmt = opts.mgmt.clone();
+fn first_boot(
+    opts: &BootOptions,
+    names: &[(String, String)],
+    ttys: &[String],
+    want_setup: Arc<AtomicBool>,
+) {
+    let mgmt = opts.mgmt.clone().map(|mut m| {
+        // An entry written before the ports were renamed (or by an older
+        // installer) names the kernel's port.
+        if let Some((_, n)) = names.iter().find(|(k, _)| *k == m.interface) {
+            m.interface.clone_from(n);
+        }
+        m
+    });
+    let ports: Vec<String> = names.iter().map(|(_, n)| n.clone()).collect();
+    let ttys = ttys.to_vec();
     let spawned = std::thread::Builder::new()
         .name("first-boot".into())
         .spawn(move || {
             if let Some(m) = mgmt
                 && !Path::new(plan::MGMT_DONE).exists()
             {
-                for (cmd, params) in m.commands() {
+                let text = plan::mgmt_notice(&m, &ports);
+                log!("{}", text.replace('\n', " "));
+                crate::console::announce(&ttys, &text);
+                let missing = !ports.is_empty() && !ports.contains(&m.interface);
+                for (cmd, params) in m.commands().into_iter().filter(|_| !missing) {
                     match crate::ctl::call(cmd, &params) {
                         Ok(_) => log!("installer's management address: {cmd} {params}"),
                         Err(e) => log!("installer's management address: {cmd}: {e}"),
                     }
                 }
-                if let Err(e) = fs::write(plan::MGMT_DONE, m.render()) {
+                if let Err(e) = write_durable(Path::new(plan::MGMT_DONE), &m.render()) {
                     log!("{}: {e}", plan::MGMT_DONE);
                 }
             }
@@ -212,8 +308,10 @@ fn first_boot(opts: &BootOptions, want_setup: Arc<AtomicBool>) {
                 .and_then(|v| v.as_array().map(Vec::len));
             if n == Some(0) {
                 log("no address on any port: first-boot setup on the console");
-                want_setup.store(true, Ordering::Relaxed);
             }
+            // The console service runs either way (G1.6m): the setup while
+            // no port has an address, the router's status on Enter after.
+            want_setup.store(true, Ordering::Relaxed);
         });
     if let Err(e) = spawned {
         log!("first-boot thread: {e}");
@@ -368,49 +466,6 @@ fn find_partition(label: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// `ip link set lo up` as one RTM_NEWLINK (ifindex 1 is always `lo` in the
-/// initial namespace), so the image needs no `ip` binary for it.
-fn loopback_up() -> std::io::Result<()> {
-    use netlink_sys::{Socket, SocketAddr as NlAddr, protocols::NETLINK_ROUTE};
-    const RTM_NEWLINK: u16 = 16;
-    const NLM_F_REQUEST: u16 = 1;
-    const NLM_F_ACK: u16 = 4;
-    const NLMSG_ERROR: u16 = 2;
-    const IFF_UP: u32 = 1;
-    let mut msg = Vec::with_capacity(32);
-    msg.extend_from_slice(&32u32.to_ne_bytes()); // nlmsg_len
-    msg.extend_from_slice(&RTM_NEWLINK.to_ne_bytes());
-    msg.extend_from_slice(&(NLM_F_REQUEST | NLM_F_ACK).to_ne_bytes());
-    msg.extend_from_slice(&1u32.to_ne_bytes()); // seq
-    msg.extend_from_slice(&0u32.to_ne_bytes()); // pid
-    msg.extend_from_slice(&[0, 0]); // ifi_family, pad
-    msg.extend_from_slice(&0u16.to_ne_bytes()); // ifi_type
-    msg.extend_from_slice(&1i32.to_ne_bytes()); // ifi_index
-    msg.extend_from_slice(&IFF_UP.to_ne_bytes()); // ifi_flags
-    msg.extend_from_slice(&IFF_UP.to_ne_bytes()); // ifi_change
-    let mut sock = Socket::new(NETLINK_ROUTE)?;
-    sock.bind_auto()?;
-    sock.send_to(&msg, &NlAddr::new(0, 0), 0)?;
-    let (reply, _) = sock.recv_from_full()?;
-    let u16_at = |i: usize| {
-        reply
-            .get(i..i + 2)
-            .and_then(|b| b.try_into().ok())
-            .map(u16::from_ne_bytes)
-    };
-    let i32_at = |i: usize| {
-        reply
-            .get(i..i + 4)
-            .and_then(|b| b.try_into().ok())
-            .map(i32::from_ne_bytes)
-    };
-    match (u16_at(4), i32_at(16)) {
-        (Some(NLMSG_ERROR), Some(0)) => Ok(()),
-        (Some(NLMSG_ERROR), Some(e)) => Err(std::io::Error::from_raw_os_error(-e)),
-        _ => Err(std::io::Error::other("unexpected netlink reply")),
-    }
-}
-
 struct Daemon {
     pid: Option<Pid>,
     since: Instant,
@@ -425,6 +480,7 @@ fn supervise(
     boot: Instant,
     mut trial: Option<TrialWatch>,
     mut frr: Vec<Svc>,
+    names: Vec<(String, String)>,
 ) -> ! {
     let with_frr = !frr.is_empty();
     let want_setup = Arc::new(AtomicBool::new(false));
@@ -450,7 +506,10 @@ fn supervise(
             shutdown(what, d.pid, shell, &frr, setup);
         }
         // Reap every child that exited: ours and orphans reparented to PID 1.
-        while let Ok(Some((pid, status))) = rustix::process::waitpid(None, WaitOptions::NOHANG) {
+        // `wait4(-1)`: `waitpid(None)` is `wait4(0)`, this process group
+        // only, which left the maintenance shell (its own session, `setsid`)
+        // a zombie that was never started again (G1.6m).
+        while let Ok(Some((pid, status))) = rustix::process::wait(WaitOptions::NOHANG) {
             if Some(pid) == d.pid {
                 let ran = d.since.elapsed();
                 let delay = d.backoff.after_exit(ran);
@@ -534,7 +593,7 @@ fn supervise(
             );
             if !idle_done {
                 idle_at.get_or_insert(now + IDLE_AFTER);
-                first_boot(opts, Arc::clone(&want_setup));
+                first_boot(opts, &names, &setup_ttys, Arc::clone(&want_setup));
             }
         }
         if want_setup.load(Ordering::Relaxed) && setup.is_none() && now >= setup_at {

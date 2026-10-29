@@ -1,4 +1,4 @@
-# Imagem do sistema (G1.6a, G1.6b, G1.6c, G1.6k)
+# Imagem do sistema (G1.6a, G1.6b, G1.6c, G1.6k, G1.6m)
 
 A imagem que vai no disco do roteador: kernel LTS, rootfs squashfs só de leitura, `/config`
 gravável, `corerouter-init` como PID 1 e `corerouter-daemon` como único serviço. Construída
@@ -73,12 +73,15 @@ netlink-sys, já no `Cargo.lock`):
 4. monta `/config` da partição de rótulo `config` (espera até 5 s pelo probe assíncrono). Sem
    partição ou com falha de montagem, monta tmpfs e avisa em letras grandes que a
    configuração não sobrevive ao reboot: o roteador sobe e pode ser consertado pela rede;
+   em seguida dá às portas os nomes do RouterOS (`eth0` → `ether1`…, G1.6m, abaixo);
 5. inicia o daemon com ambiente limpo, saída em `/var/log/corerouter-daemon.log` (copiado e
    truncado acima de 8 MiB: um daemon falante nem enche o `/var` nem trava na serial de
    115200 baud), e o reinicia se cair: 0,5 s dobrando até 30 s, zerando depois de 60 s de pé.
    Nunca desiste: roteador sem plano de controle é pior que um tentando de novo. Ao cair, as
    últimas 20 linhas do log vão para a console;
-6. colhe todo filho que termina (inclusive órfãos), como todo PID 1 tem de fazer;
+6. colhe todo filho que termina (inclusive órfãos), como todo PID 1 tem de fazer: `wait4(-1)`.
+   Até a G1.6m era `waitpid(None)` do rustix, que é `wait4(0)`, só o grupo de processos do
+   próprio init; o shell de manutenção (sessão própria) virava zumbi e nunca voltava;
 7. avisa quando o daemon responde `ping` em `127.0.0.1:7979` pela primeira vez (`ready:` com o
    tempo desde o início do kernel) e, 10 s depois, a memória em uso (`idle:`);
 8. desliga limpo pelos sinais que o busybox `reboot`/`poweroff`/`halt` mandam ao PID 1
@@ -86,7 +89,8 @@ netlink-sys, já no `Cargo.lock`):
    SIGKILL, `sync`, desmonta `/config` (ou remonta só de leitura), `reboot(2)`.
 
 **Sem shell por padrão.** `corerouter.shell=ttyS0` na linha de comando abre um `sh` do busybox
-naquela console (reaberto se sair), para laboratório e recuperação. Como a linha de comando está
+naquela console (aberto de novo 1 s depois de sair: `exit`, Ctrl-D), para laboratório e
+recuperação. Como a linha de comando está
 gravada no kernel, ligar o shell num roteador em campo exige outra imagem ou acesso ao
 firmware: é acesso físico, como o console serial de um Juniper.
 
@@ -230,7 +234,9 @@ precisar de streaming delta, o RAUC volta a ser a opção (o formato de bundle v
 
 A imagem sobe sem endereço em nenhuma porta: nada roda DHCP sem configuração. Com `-kernel`, o
 boot-test acrescenta à linha de comando o `ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off` do
-próprio kernel (`CONFIG_IP_PNP`), o endereço da rede de usuário do QEMU. Assim o
+próprio kernel (`CONFIG_IP_PNP`), o endereço da rede de usuário do QEMU. O `eth0` é o nome do
+kernel, que vale antes do init: o init renomeia a porta (`ether1`) baixando-a e subindo de novo
+(o kernel não renomeia uma porta ativa); o endereço fica, a rota padrão do `ip=` cai. Assim o
 encaminhamento de porta chega ao `0.0.0.0:8729` do daemon. Com `--efi` vale a linha de
 comando gravada no kernel: o teste confere a prontidão pelo loopback e pula o ping TLS. A
 configuração padrão de primeiro boot (cliente DHCP na primeira porta, como o CHR do RouterOS)
@@ -535,16 +541,22 @@ Saídas em `os/out/build/images/`:
   o instalador pergunta se mantém (como o *keep old configuration* do Netinstall).
 - **Consoles:** VGA (`tty1`) e serial (`ttyS0`, 115200) ao mesmo tempo; a resposta vale do
   console onde foi digitada.
-- **Endereço de gerência do primeiro boot:** o instalador pergunta (`eth0 192.0.2.10/24
-  192.0.2.1`, ou vazio) e grava `corerouter.mgmt=` na entrada do slot A. No primeiro boot o init
+- **Endereço de gerência do primeiro boot:** o instalador lista as portas com os nomes que o
+  roteador vai dar (`ether1 (link up, 52:54:…)`), pergunta (`ether1 192.0.2.10/24 192.0.2.1`,
+  ou vazio; porta que não existe é recusada) e grava `corerouter.mgmt=` na entrada do slot A.
+  No primeiro boot o init avisa nos consoles (VGA e serial) o endereço, a porta e de onde veio,
   habilita a porta, aplica `ip.address.add` e a rota padrão pelo canal de controle e grava
-  `/config/.installer-mgmt-applied`: não reaplica depois (nem se a configuração for mantida numa
-  reinstalação). A atualização não leva o parâmetro para o slot B.
-- **Assistente de console** (`corerouter-init setup`): quando o roteador sobe sem endereço em
-  nenhuma porta (VM nova, disco sem `corerouter.mgmt=`), o console pede porta, endereço,
-  gateway e a senha do `admin` (sem ela o login pela rede é recusado), e aplica tudo como
-  comandos. A imagem não tem shell: sem isso, quem está no console de um roteador novo não podia
-  fazer nada.
+  `/config/.installer-mgmt-applied` com fsync: não reaplica depois (nem se a configuração for
+  mantida numa reinstalação). Uma entrada com o nome do kernel (`eth0`, instalador antigo) vale
+  para a mesma placa renomeada. A atualização não leva o parâmetro para o slot B.
+- **Assistente de console** (`corerouter-init setup`, G1.6m): enquanto nenhuma porta tem
+  endereço, o console diz que não há terminal de comandos ali e convida a configurar (de novo a
+  cada 5 min); lista as portas numeradas com link e MAC, pede a porta pelo número ou nome
+  (sem padrão: Enter vazio cancela) e confirma (`Use ether1 (link up, 52:54:…)? [y/N]`), depois
+  endereço, gateway e a senha do `admin` (sem ela o login pela rede é recusado), mostra o
+  resumo e só aplica com `y`. A pergunta que espera resposta reaparece a cada 30 s (quem
+  conecta o console serial depois vê o que está pendente). Com endereço, Enter no console
+  mostra os endereços e como conectar pela GUI e pela CLI.
 - **Instalação sem interação** só pelo hipervisor: `-fw_cfg
   name=opt/org.corerouter/autoinstall,string=<json>` do QEMU, que nenhuma máquina física tem; o
   JSON nomeia o disco duas vezes (`disk`, `confirm`), e `append` só aceita `console=`, `ip=` e
@@ -571,10 +583,10 @@ Saídas em `os/out/build/images/`:
     `package/frr` e `package/libyang`) e falha alto se a receita mudar num Buildroot novo.
   - **Saída:** quando um LTS do Buildroot trouxer FRR ≥ 10.7.1, apagar o patch.
 - **O que o `frr-test` prova** (`cargo xtask os frr-test`, `xtask/src/os/frr.rs`): dois
-  roteadores da imagem no QEMU, sem root, com os `eth0` ligados por um par de sockets UDP do
+  roteadores da imagem no QEMU, sem root, com os `ether1` ligados por um par de sockets UDP do
   QEMU no loopback do host. Cada um é configurado só por comandos (13, os mesmos de CLI/MCP):
   endereço e `/32` na `lo`, OSPFv2 ponto a ponto, SR com prefix SID automático (sem TI-LFA,
-  desligado em produção pela G3.4l), MPLS e LDP no `eth0`, um peer BFD. E tem de ler de volta
+  desligado em produção pela G3.4l), MPLS e LDP no `ether1`, um peer BFD. E tem de ler de volta
   do FRR: vizinho OSPF `Full` (`ospfd`), o prefix SID do outro com rótulo (`16002`, saída
   implicit-null), LDP `operational` (`ldpd`), sessão BFD `up` (a do `bfdd`, rodada pelo motor
   do daemon como data plane), rótulos na tabela MPLS do kernel (`zebra`), ping entre as
@@ -748,3 +760,123 @@ topo) deram o mesmo `bzImage`, `rootfs.squashfs`, `disk.img`, pacote e imagens d
   Gap G1.6j.
 - **Senha do `admin` no instalador:** não vai na linha de comando (fica na NVRAM); o assistente
   de console do primeiro boot a pede.
+
+## Primeiro boot de verdade: nomes de porta, console e shell (G1.6m)
+
+Achados de uma instalação do `corerouter.qcow2` numa VM libvirt (UEFI, 3 placas virtio), em
+2026-10-28, e o que mudou.
+
+### Nomes de porta: `ether1…` desde o boot
+
+O kernel chama as portas `eth0`, `eth1`… na ordem de probe; a GUI, os documentos e o operador
+de MikroTik usam `ether1`, `ether2`…. O init renomeia antes do daemon subir
+(`apps/corerouter-init/src/ports.rs` decide, `links.rs` faz o `RTM_NEWLINK` com `IFLA_IFNAME`):
+
+- **Ordem do barramento, não do probe:** caminho PCI do dispositivo, depois `dev_port` (placa
+  com várias portas numa função), depois o MAC. O probe em paralelo muda a ordem entre boots
+  (relatos do RouterOS em VM e o T9127 do VyOS com a `ice`). O init espera a lista de links
+  ficar parada por 100 ms (no máximo 2 s) antes de numerar.
+- **O nome segue a placa** (`/config/.port-names`: nome, MAC, caminho), como o `hw-id` do VyOS:
+  placa nova ganha o próximo número livre e não desloca as outras.
+- **Placa trocada no mesmo slot** (MAC sumiu, MAC novo no mesmo caminho PCI) fica com o nome da
+  antiga, como o slot/porta do Junos: a configuração daquela porta continua valendo. O nome de
+  uma placa que sumiu fica reservado (a configuração aponta para ele); apagar o arquivo
+  renumera tudo a partir de `ether1` no boot seguinte.
+- **Configuração de antes (G1.6c) sem o mapa:** os nomes do kernel ficam (`eth0` na
+  configuração continua existindo) e o mapa os registra; placa nova depois disso vira `etherN`.
+  Renomear quebraria a gerência (lockout).
+- **`corerouter.mgmt=eth0,…`** (instalador antigo, NVRAM antiga) vale para a placa que o kernel
+  chamou de `eth0` neste boot, já renomeada: a tradução é pelo dispositivo, não pelo número.
+- **Porta ativa** (o `ip=` do kernel nos testes): o kernel não renomeia porta ativa; o init a
+  baixa, renomeia e sobe; o endereço IPv4 fica e as rotas por ela caem.
+- O daemon não muda: porta física é gerenciada pela regra 6 do `owner.rs` qualquer que seja o
+  nome; `--manage` não é usado na imagem.
+
+### Interfaces que o kernel criava sozinho
+
+Com os drivers `=y`, cada um criava a sua no namespace inicial durante os initcalls: `bond0`,
+`dummy0`, e as "fallback" dos túneis `gre0`, `gretap0`, `erspan0`, `ip6gre0`, `ip6tnl0`,
+`sit0`, `tunl0`. Apareciam em Interfaces como "not managed".
+
+- `bonding.max_bonds=0 dummy.numdummies=0` na linha de comando embutida (e no
+  `BUILTIN_CMDLINE` do `corerouter-sysupdate`, que o `os check` confere): bonds e loopbacks o
+  hal-linux cria por netlink.
+- Os túneis: o `sysctl.net.core.fb_tunnels_only_for_init_net=2` da linha de comando chega tarde
+  (o kernel aplica `sysctl.*` em `do_sysctl_args()`, depois dos initcalls; conferido no
+  `init/main.c` do 6.18). `os/patches/linux/0002-net-no-fallback-tunnel-devices.patch` muda o
+  padrão do sysctl para 2 (uma linha). Nada no CoreRouter usa as fallback (o hal-frr e o
+  hal-linux criam o que usam); sem elas, GRE/IPIP sem túnel configurado é descartado, o que é
+  o comportamento seguro.
+- O `cargo xtask os build` reaplica os patches do kernel quando mudam (`linux-dirclean`; antes
+  só o fragmento era acompanhado).
+
+### Shell de manutenção que parava
+
+Reproduzido sem root (QEMU com duas seriais em pty e uma VM libvirt de sessão com
+`virsh console --force`): reconectar o console não quebra nada; **sair do shell** (`exit`,
+Ctrl-D) sim. O init colhia filhos com `waitpid(None, NOHANG)` do rustix 1.x, que é `wait4(0)`:
+só o grupo de processos do PID 1. O shell (`setsid -c`, sessão e grupo próprios) virava zumbi,
+o init nunca via a saída e não abria outro; o eco que aparecia era o da disciplina de linha do
+`ttyS0` (aberto pelo `/dev/console`), sem ninguém lendo. O mesmo deixava zumbis de qualquer
+órfão com grupo próprio. Agora é `wait4(-1)` (`rustix::process::wait`); o `install-test` dá
+`exit` no shell, espera o novo e confere que não há zumbi.
+
+### `corerouter.mgmt=` herdado de outra VM
+
+Uma VM nova com o nome de uma antiga herdou a NVRAM (`/var/lib/libvirt/qemu/nvram/<nome>_VARS.fd`
+não é apagado com `virsh undefine` sem `--nvram`) e a entrada "CoreRouter A" com
+`corerouter.mgmt=`. Os PARTUUIDs da imagem são fixos, então a entrada antiga boota o disco
+novo e o endereço foi aplicado; por isso o assistente não apareceu. O marcador não aparecer é
+compatível com a VM desligada à força logo depois: o daemon faz fsync da configuração e o
+marcador era um `write` simples (o ext4 grava em até 5 s). Agora o marcador é gravado com
+fsync do arquivo e do diretório, e o init diz nos consoles qual endereço, em que porta, que
+veio da entrada de boot, e como sair disso (`virsh start --reset-nvram`; no Proxmox, um EFI
+disk novo). Porta que não existe: o endereço não é aplicado e o assistente pergunta.
+
+### Pesquisa
+
+- **MikroTik RouterOS v7:** portas `etherN` com `default-name` fixo por porta de hardware; no
+  x86/CHR a numeração segue a detecção, e há relatos de nomes trocados entre boots em VM e de
+  `default-name` duplicado no CHR ([fórum: CHR x86 random names](https://forum.mikrotik.com/t/chr-x86-ethernet-interfaces-random-names/115361),
+  [NIC order issues](https://forum.mikrotik.com/t/routeros-6-40-4-nic-order-issues/112975),
+  [duplicate default-name](https://forum.mikrotik.com/t/chr-duplicate-default-name-on-interfaces/130582));
+  numa máquina física, o nome só muda se a placa mudar de slot PCI
+  ([fórum](https://forum.mikrotik.com/t/how-are-hardware-ports-associated-with-names/125582)).
+  O console do CHR abre o login (sem senha na primeira vez) e um terminal completo.
+- **VyOS:** `ethN` com `hw-id` (o MAC permanente) gravado na configuração; o renomeio é por
+  udev (`vyos_net_name`), com corrida conhecida com placas lentas
+  ([docs](https://docs.vyos.io/en/1.5/troubleshooting/interfaces.html),
+  [T9127](https://vyos.dev/T9127), [T9141](https://vyos.dev/T9141)).
+- **OPNsense/pfSense:** nomes do driver (`vtnet0`, `igb1`); o menu do console atribui WAN/LAN
+  e pergunta antes de aplicar ([docs](https://docs.opnsense.org/manual/how-tos/vlan_and_lagg.html)).
+- **Junos:** nome pela posição física (`ge-0/0/1`): placa trocada no mesmo lugar herda a
+  configuração.
+- **Adotado:** nomes do RouterOS, ordem do barramento (melhor que a detecção), o nome preso ao
+  MAC (VyOS) e ao slot quando a placa é trocada (Junos); no console, a confirmação explícita
+  e o resumo antes de aplicar (OPNsense).
+- **Extras que entraram:** a pergunta pendente reaparece (console serial conectado depois); Enter
+  num console com endereço mostra o status; o aviso do `corerouter.mgmt=` com a origem; o
+  instalador recusa porta inexistente.
+- **Ficou de fora:** renomear placa que aparece depois do boot (hot-plug; hoje fica `ethN` até
+  o próximo boot); escolher o nome no console; o cliente DHCP de fábrica (G1.6d).
+
+### Desempenho e paralelismo
+
+Tudo roda uma vez no boot, fora de caminho quente. O renomeio é uma mensagem netlink por porta
+(três com a porta ativa), O(n) no número de portas; a decisão (`assign`) é O(n·m) com n, m ≤
+1024, irrelevante. A única espera é a de a lista de links parar de mudar (100 ms de silêncio,
+2 s no máximo): é o que evita numerar antes de um driver lento terminar. Não há o que dividir
+entre núcleos. O assistente e o aviso rodam em processo e thread próprios, sem lock com o
+laço do PID 1.
+
+### Números (G1.6m)
+
+**Medido** em 2026-10-28, KVM no host de desenvolvimento, build release da imagem:
+
+- kernel → daemon responde `ping`: 0,90–0,91 s em três `boot-test` (0,92 s na imagem da
+  `main` antes); com a espera de 300 ms de silêncio dos links eram 1,10 s, por isso 100 ms;
+- `early boot done`: 110–112 ms (14 ms antes; a diferença é a espera dos links);
+- `install-test` completo: 40,8 s; `/sys/class/net` com 3 placas: `ether1 ether2 ether3 lo`
+  (antes: mais `bond0`, `dummy0` e sete túneis de fallback);
+- build da imagem do zero numa worktree (toolchain externa e downloads em cache): 1064 s; um
+  build incremental só do init: 56 s.

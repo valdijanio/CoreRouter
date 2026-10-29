@@ -6,6 +6,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
@@ -38,6 +39,20 @@ pub fn active(skip: Option<&str>) -> Vec<String> {
     }
     out.dedup();
     out
+}
+
+/// `text` on each of `ttys`, once (PID 1's notices: its own stderr is
+/// `/dev/console`, which is only the last `console=`, the serial one).
+pub fn announce(ttys: &[String], text: &str) {
+    for t in ttys {
+        if let Ok(mut f) = OpenOptions::new()
+            .write(true)
+            .custom_flags(rustix::fs::OFlags::NOCTTY.bits() as i32)
+            .open(format!("/dev/{t}"))
+        {
+            let _ = f.write_all(format!("{text}\n").as_bytes());
+        }
+    }
 }
 
 impl Console {
@@ -105,6 +120,29 @@ impl Console {
         match timeout {
             None => self.rx.recv().ok(),
             Some(t) => self.rx.recv_timeout(t).ok(),
+        }
+    }
+
+    /// Like [`Console::ask`] without a deadline, the prompt shown again
+    /// every `every` while nobody answers: whoever attaches the serial
+    /// console later (`virsh console`) sees the question that is waiting
+    /// (G1.6m). After `give_up` with no answer: `None`, as if cancelled.
+    pub fn ask_shown(&self, prompt: &str, every: Duration, give_up: Duration) -> Option<String> {
+        self.drain();
+        self.put(prompt);
+        let start = std::time::Instant::now();
+        loop {
+            match self.rx.recv_timeout(every) {
+                Ok(l) => return Some(l),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if start.elapsed() >= give_up {
+                        self.put("\n(no answer: cancelled)\n");
+                        return None;
+                    }
+                    self.put(&format!("\n{prompt}"));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+            }
         }
     }
 
