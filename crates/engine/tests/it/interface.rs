@@ -199,6 +199,34 @@ fn vlan_add_service_tag_for_qinq() {
     assert!(!has(&s, "s100"));
 }
 
+/// G3.9hb: `disabled=yes` in RouterOS's export of a VLAN; `interface` is
+/// the terminal's name for `parent` only, never a key the engine takes.
+#[test]
+fn vlan_add_disabled_and_no_interface_key() {
+    let mut s = lab();
+    ok(
+        &mut s,
+        "interface.vlan.add",
+        json!({"name": "v41", "parent": "ether1", "vlan_id": 41, "disabled": true}),
+    );
+    assert_eq!(row(&mut s, "v41")["disabled"], true);
+    assert_eq!(row(&mut s, "v41")["running"], false);
+    fails(
+        &mut s,
+        "interface.vlan.add",
+        json!({"name": "v42", "parent": "ether1", "vlan_id": 42, "disabled": "maybe"}),
+        "disabled",
+    );
+    fails(
+        &mut s,
+        "interface.vlan.add",
+        json!({"name": "v43", "interface": "ether1", "vlan_id": 43}),
+        "interface",
+    );
+    ok(&mut s, "config.rollback", json!({"revision": 0}));
+    assert!(!has(&s, "v41"));
+}
+
 #[test]
 fn vlan_add_rolls_back() {
     let mut s = lab();

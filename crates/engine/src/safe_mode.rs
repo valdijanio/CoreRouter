@@ -107,6 +107,13 @@ impl Default for Caller {
     }
 }
 
+/// Commands whose effect lasts only while the connection that sent them
+/// stays open: Safe Mode belongs to its owner's connection and is undone
+/// when it closes ([`Session::hang_up`]). A one-shot client (`corerouter-cli
+/// run`) closes it as soon as the command returns, so it must refuse these
+/// and point to a persistent one (G1.6qf).
+pub const NEEDS_OPEN_CONNECTION: &[&str] = &["config.safe-mode.enter"];
+
 /// Bounds of `timeout_secs`: long enough to read the screen and confirm,
 /// short enough that a lost router comes back the same day.
 pub const MIN_TIMEOUT_SECS: u32 = 10;
