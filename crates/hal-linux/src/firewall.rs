@@ -8,11 +8,16 @@
 //!   kernel commits it whole or not at all. A rule that did not change
 //!   keeps its counters, and the dynamic sets (rule-filled address lists,
 //!   timed entries) are never touched.
-//! - Before the diff the kernel's rules are read (one dump) and checked
-//!   against what we believe we loaded; anything else (a table we did not
-//!   load, a set whose definition changed, a refused diff) falls back to
-//!   replacing the table whole, still one batch, after reading back the
-//!   dynamic entries so they survive it.
+//! - **From what was loaded** (G0.31f, [`crate::fw_delta`]): when nobody
+//!   else committed to nftables since the last commit, the next one starts
+//!   from what that one loaded (rules, handles), without reading the
+//!   kernel, and builds only the rules that changed.
+//! - Otherwise (the first commit, or after a drift) the kernel's rules are
+//!   read (one dump) and checked against what we believe we loaded;
+//!   anything else (a table we did not load, a set whose definition
+//!   changed, a refused diff) falls back to replacing the table whole,
+//!   still one batch, after reading back the dynamic entries so they
+//!   survive it.
 //! - **Dynamic entries** ([`apply_dynamic`]): address-list entries with a
 //!   timeout, any number of them in one batch of `NEWSETELEM`/`DELSETELEM`
 //!   (it was one `nft` process per entry).
@@ -21,6 +26,7 @@
 //! not read or touched.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Mutex;
 
 use corerouter_firewall::bytecode::interval_elements;
 use corerouter_firewall::program::{FwElement, FwSet, KernelElement, KeyKind, Rule, Table};
@@ -29,6 +35,7 @@ use corerouter_hal::HalError;
 use corerouter_model::Config;
 use corerouter_model::firewall::{AddrMatch, DynamicAddress, Family, Name};
 
+use crate::fw_delta::{self, ChainHandles, ECHO_MAX, Loaded, Outcome};
 use crate::nfnl::{self, Batch, Place};
 use crate::nft_read::{self, ReadRule, Reader};
 
@@ -37,7 +44,7 @@ pub const FAMILY: u8 = 1;
 
 /// The most edits one chain's diff looks for before it rewrites the
 /// chain's changed middle instead (the diff costs O(edits²) memory).
-const MAX_EDITS: usize = 1024;
+pub(crate) const MAX_EDITS: usize = 1024;
 
 /// What one apply did (for the log and the benchmarks).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -47,6 +54,9 @@ pub struct Applied {
     pub rules_added: usize,
     pub rules_removed: usize,
     pub elements_changed: usize,
+    /// Done from what the previous commit loaded, without reading the
+    /// kernel (G0.31f).
+    pub cached: bool,
 }
 
 /// What the kernel holds of our table, for the diff.
@@ -57,19 +67,49 @@ struct Held {
 }
 
 fn read_held() -> Result<Held, HalError> {
-    let mut rd = Reader::open()?;
-    Ok(Held {
-        chains: rd.chains(FAMILY, TABLE)?,
-        sets: rd.sets(FAMILY, TABLE)?,
-        rules: rd.rules(FAMILY, TABLE)?,
+    nft_read::with_reader(|rd| {
+        Ok(Held {
+            chains: rd.chains(FAMILY, TABLE)?,
+            sets: rd.sets(FAMILY, TABLE)?,
+            rules: rd.rules(FAMILY, TABLE)?,
+        })
     })
 }
 
-/// Take the firewall from `from` to `to`. The three inputs of the diff are
+/// What the last commit loaded (G0.31f): the next one starts from it
+/// instead of reading the kernel (see [`crate::fw_delta`]).
+static LOADED: Mutex<Option<Box<Loaded>>> = Mutex::new(None);
+
+fn loaded() -> std::sync::MutexGuard<'static, Option<Box<Loaded>>> {
+    LOADED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Take the firewall from `from` to `to`: from what the previous commit
+/// loaded when nothing else changed nftables since ([`crate::fw_delta`]),
+/// else by reading the kernel.
+pub fn apply(from: &Config, to: &Config) -> Result<Applied, HalError> {
+    let mut loaded = loaded();
+    if let Some(l) = loaded.take() {
+        match fw_delta::apply(l, from, to) {
+            Outcome::Done(applied, next) => {
+                *loaded = next;
+                return Ok(applied);
+            }
+            Outcome::Slow => {}
+        }
+    }
+    let (applied, next) = read_and_apply(from, to)?;
+    *loaded = next;
+    Ok(applied)
+}
+
+/// The commit that reads the kernel. The three inputs of the diff are
 /// independent and run side by side: the old program, the new one and the
 /// kernel's rules (10 000 rules: 15 + 15 + 38 ms one after the other,
 /// **medido**; together, the longest of them).
-pub fn apply(from: &Config, to: &Config) -> Result<Applied, HalError> {
+fn read_and_apply(from: &Config, to: &Config) -> Result<(Applied, Option<Box<Loaded>>), HalError> {
+    // Before the read: a commit by anyone else after it shows here.
+    let stamp = nfnl::stamp(TABLE);
     let (old, new, held) = std::thread::scope(|s| {
         let old = std::thread::Builder::new()
             .name("fw-diff-old".into())
@@ -92,41 +132,65 @@ pub fn apply(from: &Config, to: &Config) -> Result<Applied, HalError> {
         (old, new, held)
     });
     let Some(new) = new else {
-        remove()?;
-        return Ok(Applied {
-            replaced: true,
-            ..Applied::default()
-        });
+        remove_table()?;
+        return Ok((
+            Applied {
+                replaced: true,
+                ..Applied::default()
+            },
+            None,
+        ));
     };
     if let Some(old) = &old {
-        if *old == new {
-            return Ok(Applied::default());
-        }
         match held.and_then(|h| diff_apply(old, &new, h)) {
-            Ok(Some(a)) => return Ok(a),
+            Ok(Some(a)) => {
+                // Ours if the table's only write since the read was this
+                // commit's (or none).
+                let now = nfnl::stamp(TABLE);
+                let next = a
+                    .chains
+                    .filter(|_| now == (stamp.0, stamp.1.wrapping_add(u64::from(a.sent))));
+                let next = next.and_then(|(c, anon)| Loaded::from_kernel(to, &c, now, anon));
+                return Ok((a.applied, next));
+            }
             Ok(None) => {}
             Err(e) => log::info!("firewall: the diff was refused ({e}); replacing the table"),
         }
     }
-    replace(to)?;
-    Ok(Applied {
-        replaced: true,
-        rules_added: new.rules.len(),
-        ..Applied::default()
-    })
+    replace_table(to)?;
+    Ok((
+        Applied {
+            replaced: true,
+            rules_added: new.rules.len(),
+            ..Applied::default()
+        },
+        None,
+    ))
 }
 
 /// Replace the table whole with `cfg`'s, keeping the dynamic entries.
 pub fn replace(cfg: &Config) -> Result<(), HalError> {
+    let mut loaded = loaded();
+    *loaded = None;
+    replace_table(cfg)
+}
+
+fn replace_table(cfg: &Config) -> Result<(), HalError> {
     let dynamic = dynamic().unwrap_or_default();
     let Some(t) = fwnft::program(cfg, &dynamic) else {
-        return remove();
+        return remove_table();
     };
     nfnl::apply(nfnl::replace(&t, 1), "loading the firewall")
 }
 
 /// Delete our table (absent: nothing to do).
 pub fn remove() -> Result<(), HalError> {
+    let mut loaded = loaded();
+    *loaded = None;
+    remove_table()
+}
+
+fn remove_table() -> Result<(), HalError> {
     let mut b = Batch::new(1);
     b.family(corerouter_firewall::program::Family::Inet);
     b.new_table(TABLE);
@@ -136,7 +200,7 @@ pub fn remove() -> Result<(), HalError> {
 
 /// One step of a chain's diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Step {
+pub(crate) enum Step {
     Keep,
     Delete,
     Insert,
@@ -144,7 +208,7 @@ enum Step {
 
 /// The shortest edit script from `a` to `b` (Myers), or `None` past
 /// `max` edits.
-fn myers(a: &[usize], b: &[usize], max: usize) -> Option<Vec<Step>> {
+pub(crate) fn myers(a: &[usize], b: &[usize], max: usize) -> Option<Vec<Step>> {
     let (n, m) = (a.len(), b.len());
     let off = max + 1;
     let mut v = vec![0usize; 2 * off + 1];
@@ -257,10 +321,28 @@ fn by_chain(rules: &[Rule]) -> BTreeMap<&str, Vec<&Rule>> {
     out
 }
 
+/// What [`diff_apply`] did.
+struct Diffed {
+    applied: Applied,
+    /// A batch went to the kernel.
+    sent: bool,
+    /// What the kernel then holds of each chain, when the new rules'
+    /// handles came back, and the number of the next anonymous set.
+    chains: Option<(ChainHandles, u32)>,
+}
+
+/// A rule of a chain after the diff: kept (its handle) or new (its place
+/// among the rules sent).
+#[derive(Clone, Copy)]
+enum Slot {
+    Kept(u64),
+    New(usize),
+}
+
 /// The diff from `old` (what we loaded) to `new`, against the kernel's
 /// handles; `Ok(None)` when the kernel does not hold `old` (or a set
 /// changed definition): the caller replaces the table.
-fn diff_apply(old: &Table, new: &Table, held: Held) -> Result<Option<Applied>, HalError> {
+fn diff_apply(old: &Table, new: &Table, held: Held) -> Result<Option<Diffed>, HalError> {
     let Held {
         chains: kchains,
         sets: ksets,
@@ -342,8 +424,11 @@ fn diff_apply(old: &Table, new: &Table, held: Held) -> Result<Option<Applied>, H
     b.name_anon_sets_from(first);
     b.new_table(TABLE);
     let new_rules = by_chain(&new.rules);
+    // Every new rule, in the order it is first met.
+    let mut tickets: Vec<&Rule> = Vec::new();
+    let mut slots: BTreeMap<&str, Vec<Slot>> = BTreeMap::new();
     // 1. Rules that go (in kept chains; gone chains are flushed below).
-    let mut inserts: Vec<(Place, Vec<&Rule>)> = Vec::new();
+    let mut inserts: Vec<(Place, Vec<usize>)> = Vec::new();
     for (chain, ours) in &old_rules {
         let Some(hs) = handles.get(chain) else {
             continue;
@@ -357,7 +442,8 @@ fn diff_apply(old: &Table, new: &Table, held: Held) -> Result<Option<Applied>, H
         let script = steps(ours, theirs);
         let (mut i, mut j) = (0usize, 0usize);
         let mut anchor = Place::Start;
-        let mut pending: Vec<&Rule> = Vec::new();
+        let mut pending: Vec<usize> = Vec::new();
+        let slot = slots.entry(chain).or_default();
         for st in script {
             match st {
                 Step::Keep => {
@@ -366,6 +452,7 @@ fn diff_apply(old: &Table, new: &Table, held: Held) -> Result<Option<Applied>, H
                     }
                     if let Some(h) = hs.get(i) {
                         anchor = Place::After(*h);
+                        slot.push(Slot::Kept(*h));
                     }
                     i += 1;
                     j += 1;
@@ -379,7 +466,9 @@ fn diff_apply(old: &Table, new: &Table, held: Held) -> Result<Option<Applied>, H
                 }
                 Step::Insert => {
                     if let Some(r) = theirs.get(j) {
-                        pending.push(r);
+                        pending.push(tickets.len());
+                        slot.push(Slot::New(tickets.len()));
+                        tickets.push(r);
                     }
                     j += 1;
                 }
@@ -409,6 +498,19 @@ fn diff_apply(old: &Table, new: &Table, held: Held) -> Result<Option<Applied>, H
         b.del_rule(TABLE, c, None);
         done.rules_removed += old_rules.get(c).map_or(0, Vec::len);
     }
+    // Rules of new chains (and of kept chains that had none) go in whole.
+    let mut at_end: Vec<usize> = Vec::new();
+    for c in &new.chains {
+        if old_chains.contains_key(c.name.as_str()) && old_rules.contains_key(c.name.as_str()) {
+            continue;
+        }
+        let slot = slots.entry(c.name.as_str()).or_default();
+        for r in new_rules.get(c.name.as_str()).into_iter().flatten() {
+            at_end.push(tickets.len());
+            slot.push(Slot::New(tickets.len()));
+            tickets.push(r);
+        }
+    }
     // 2. New sets and chains, then elements.
     for s in &new.fw_sets {
         if !old_sets.contains_key(s.name.as_str()) {
@@ -436,19 +538,23 @@ fn diff_apply(old: &Table, new: &Table, held: Held) -> Result<Option<Applied>, H
         b.kernel_elements(TABLE, &s.name, None, &came, true);
     }
     // 3. New rules: at their place in kept chains (each group in reverse
-    // after the same anchor lands in order), in full in new chains.
+    // after the same anchor lands in order), in full in new chains; echoed
+    // back with their handles when not too many.
+    b.echo_rules(tickets.len() <= ECHO_MAX);
+    let mut sent: Vec<usize> = Vec::with_capacity(tickets.len());
     for (place, group) in &inserts {
-        for r in group.iter().rev() {
-            b.insert_rule(TABLE, r, *place);
-            done.rules_added += 1;
+        for t in group.iter().rev() {
+            if let Some(r) = tickets.get(*t) {
+                b.insert_rule(TABLE, r, *place);
+                sent.push(*t);
+                done.rules_added += 1;
+            }
         }
     }
-    for c in &new.chains {
-        if old_chains.contains_key(c.name.as_str()) && old_rules.contains_key(c.name.as_str()) {
-            continue;
-        }
-        for r in new_rules.get(c.name.as_str()).into_iter().flatten() {
+    for t in &at_end {
+        if let Some(r) = tickets.get(*t) {
             b.insert_rule(TABLE, r, Place::End);
+            sent.push(*t);
             done.rules_added += 1;
         }
     }
@@ -461,12 +567,57 @@ fn diff_apply(old: &Table, new: &Table, held: Held) -> Result<Option<Applied>, H
             b.del_set(TABLE, &s.name);
         }
     }
+    let anon_next = b.next_anon_set().unwrap_or(first);
+    let echoed = b.echoed() == tickets.len();
     // Only the table message: nothing changed.
-    if b.messages() <= 2 {
-        return Ok(Some(done));
+    let sends = b.messages() > 2;
+    let committed = if sends {
+        nfnl::apply_checked(b, "changing the firewall", None)?.unwrap_or_default()
+    } else {
+        nfnl::Committed::default()
+    };
+    let mut diffed = Diffed {
+        applied: done,
+        sent: sends,
+        chains: None,
+    };
+    // The handle of each new rule, from the echo (the rules sent, in order).
+    let mut new_handles: Vec<Option<u64>> = vec![None; tickets.len()];
+    if echoed && committed.rules.len() == sent.len() {
+        for (echo, t) in committed.rules.iter().zip(&sent) {
+            let Some(r) = tickets.get(*t) else { continue };
+            if echo.rule.chain == r.chain
+                && echo.rule.comment == r.comment
+                && let Some(slot) = new_handles.get_mut(*t)
+            {
+                *slot = Some(echo.handle);
+            }
+        }
     }
-    nfnl::apply(b, "changing the firewall")?;
-    Ok(Some(done))
+    let mut chains: ChainHandles = BTreeMap::new();
+    for c in &new.chains {
+        let rules = new_rules
+            .get(c.name.as_str())
+            .map_or(&[][..], Vec::as_slice);
+        let slot = slots.get(c.name.as_str()).map_or(&[][..], Vec::as_slice);
+        if slot.len() != rules.len() {
+            return Ok(Some(diffed));
+        }
+        let mut list = Vec::with_capacity(rules.len());
+        for (r, s) in rules.iter().zip(slot) {
+            let h = match s {
+                Slot::Kept(h) => Some(*h),
+                Slot::New(t) => new_handles.get(*t).copied().flatten(),
+            };
+            let Some(h) = h else {
+                return Ok(Some(diffed));
+            };
+            list.push((r.comment.clone(), h));
+        }
+        chains.insert(c.name.clone(), list);
+    }
+    diffed.chains = Some((chains, anon_next));
+    Ok(Some(diffed))
 }
 
 /// Elements of `old` that go and of `new` that come.
@@ -556,11 +707,15 @@ type SetChange<'a> = (FwSet, Vec<(&'a AddrMatch, u64)>, Vec<&'a AddrMatch>);
 /// Read each set, apply the changes in user space, flush and refill it
 /// (one batch for all).
 fn rewrite_sets(sets: Vec<SetChange<'_>>) -> Result<(), HalError> {
-    let mut rd = Reader::open()?;
+    let b = nft_read::with_reader(|rd| rewrite_batch(rd, &sets))?;
+    nfnl::apply(b, "changing dynamic address-list entries")
+}
+
+fn rewrite_batch(rd: &mut Reader, sets: &[SetChange<'_>]) -> Result<Batch, HalError> {
     let mut b = Batch::new(1);
     b.family(corerouter_firewall::program::Family::Inet);
     b.new_table(TABLE);
-    for (set, adds, dels) in &sets {
+    for (set, adds, dels) in sets {
         let now = nft_read::ranges(rd.elements(FAMILY, TABLE, &set.name)?, true);
         let mut statics: Vec<AddrMatch> = Vec::new();
         let mut timed: Vec<(AddrMatch, u64)> = Vec::new();
@@ -586,8 +741,7 @@ fn rewrite_sets(sets: Vec<SetChange<'_>>) -> Result<(), HalError> {
         let enc = corerouter_firewall::program::interval_encoding(&interval_elements(&st, &tm));
         b.kernel_elements(TABLE, &set.name, None, &enc, true);
     }
-    drop(rd);
-    nfnl::apply(b, "changing dynamic address-list entries")
+    Ok(b)
 }
 
 /// An address, prefix or range from interval bounds (bytes of an IPv4 or
@@ -627,7 +781,10 @@ fn to_u128(b: &[u8]) -> u128 {
 /// and every entry of the `ad*` sets (filled by `add-*-to-address-list`
 /// rules). What a table replace puts back.
 pub fn dynamic() -> Result<Vec<DynamicAddress>, HalError> {
-    let mut rd = Reader::open()?;
+    nft_read::with_reader(dynamic_in)
+}
+
+fn dynamic_in(rd: &mut Reader) -> Result<Vec<DynamicAddress>, HalError> {
     let sets = rd.sets(FAMILY, TABLE)?;
     let mut out = Vec::new();
     for info in sets {

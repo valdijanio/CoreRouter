@@ -163,7 +163,11 @@ nft 1.0.9, build release, netns sem root, 2026-10-27,
   (`NEWRULE` com posição), os elementos e as chains/sets que mudaram. Regra igual mantém o handle
   e os contadores. Tabela alterada por terceiros ou set com outra definição: troca inteira.
 - **O kernel é o gargalo do commit:** qualquer lote que remove algo espera um período de graça
-  RCU, 12–28 ms (o próprio `nft delete rule` leva isso); só acrescentar custa ~0,5 ms.
+  RCU, 12–28 ms (o próprio `nft delete rule` leva isso); só acrescentar custa ~0,5 ms. *Revisto na
+  G0.31f:* a espera não é do commit, é de **fechar** o socket netfilter logo depois
+  (`NETLINK_URELEASE` → `nft_rcv_nl_event` → `flush_work` do destroy work, que faz
+  `synchronize_rcu`, com o `commit_mutex` preso). Com o socket dos lotes e o leitor do firewall
+  abertos o processo todo, remover uma regra custa 0,06–0,4 ms (**medido**).
 - **Sets anônimos custam O(sets) cada no kernel** (nome e busca por nome varrem a lista da
   tabela): 10 000 regras com `th dport { 22, 80, 443 }` levavam 22 s, com `ct state { … }` 3,2 s,
   no `nft` e em nós. Listas de portas viraram sets nomeados compartilhados por conteúdo
@@ -176,6 +180,22 @@ nft 1.0.9, build release, netns sem root, 2026-10-27,
 - **O dump fica:** 12 500 regras são 6,3 MB e 25–28 ms só de kernel; é o que detecta a tabela
   mexida por outro. Guardar handles e conferir o `genid` evitaria o dump, mas o genid muda a cada
   commit de qualquer tabela (o CGNAT muda por assinante), então o cache quase nunca valeria.
+  *Revisto na G0.31f:* todo lote nosso leva o `NFNL_BATCH_GENID` da geração que o lote anterior
+  nosso criou (o kernel a devolve em `NFT_MSG_NEWGEN` quando a primeira mensagem pede eco); se
+  outro processo fez commit no meio, o kernel recusa o lote inteiro (`ERESTART`) e a época do
+  `nfnl` avança. Os nossos commits (CGNAT, fast path, entradas dinâmicas) não invalidam nada; só
+  os de terceiros. O dump ficou para o primeiro commit e para depois de deriva.
+
+**G0.31f, commit do firewall sem ler o kernel (medido).** Mudar 1 regra entre 10 000: 101,6 →
+3,75 ms; entre 1 000: 28,7 → 0,37 ms. O commit guarda o que carregou (o `Firewall` da config,
+que divide os blocos do `CowList` com a próxima, os handles de cada regra e quantas regras
+precisam de cada chain e set), acha as regras que mudaram pelos blocos que as duas configs não
+dividem mais, monta e diferencia só essas e manda as remoções por handle e as inserções depois do
+handle da regra anterior, num lote com eco das regras novas (os handles delas). Comparado: dump +
+dois programas inteiros (o que havia, 38 + 15 + 15 ms com 10 000 regras, em paralelo) × estado
+guardado (~1,5 ms nosso). O que sobra é do kernel: uma regra com veredito, `reject` ou `nat`
+marca a tabela para revalidar inteira (`NFT_VALIDATE_NEED`), O(regras) a cada commit. Detalhes
+e deriva em `crates/hal-linux/src/fw_delta.rs`.
 - O `nft` não roda mais em produção; a imagem perde o jansson (`nft -j`).
 
 #### 1.2.2 CGNAT sem portas: nfqueue só dos quase cheios (G2.7, **medido**)
