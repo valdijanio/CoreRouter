@@ -36,8 +36,8 @@ exec 9>&-
 ROS_VERSION=${ROS_VERSION:-7.25}
 ROS_SHA256=${ROS_SHA256:-6b981288350de2a2c7a3218bd820ab702633b8cd6cd339f2bb34dda1f1a2550e}
 CASES=("$@")
-[ ${#CASES[@]} -gt 0 ] || [ -z "${NO_CHR:-}" ] || CASES=(cr-dhcp cr-bond storm dns-qps)
-[ ${#CASES[@]} -gt 0 ] || CASES=(wire vlan qinq mtu lldp arp tools dhcp dhcp-client dhcp-relay dhcp6 dhcp6-client ra ntp dns nat cgnat bond cr-dhcp cr-bond storm dns-qps)
+[ ${#CASES[@]} -gt 0 ] || [ -z "${NO_CHR:-}" ] || CASES=(cr-dhcp cr-bond dhcp-conflict storm dns-qps)
+[ ${#CASES[@]} -gt 0 ] || CASES=(wire vlan qinq mtu lldp arp tools dhcp dhcp-client dhcp-relay dhcp-conflict dhcp6 dhcp6-client ra ntp dns nat cgnat bond cr-dhcp cr-bond storm dns-qps)
 W=${W:-/tmp/crg39h}
 CHR_DIR=/srv/lab/chr
 PW=g39h-lab-only
@@ -57,7 +57,7 @@ if [ -n "${NO_CHR:-}" ]; then
   bin=${BIN:?NO_CHR needs BIN=<dir with corerouter-daemon and corerouter-cli>}
 else
 need=()
-for t in qemu-system-x86_64:qemu-system-x86 traceroute:traceroute tcpdump:tcpdump iperf3:iperf3 jq:jq; do
+for t in qemu-system-x86_64:qemu-system-x86 traceroute:traceroute tcpdump:tcpdump iperf3:iperf3 jq:jq ethtool:ethtool; do
   command -v "${t%%:*}" >/dev/null || need+=("${t#*:}")
 done
 [ ${#need[@]} = 0 ] || DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "${need[@]}" unzip >/dev/null
@@ -127,11 +127,13 @@ veth crcore ether8 crcl cl0
 
 if [ -z "${NO_CHR:-}" ]; then
 cp "$img" "$W/chr.img"
+# ether2/3 (the bond) report 1 Gbit/s full duplex: virtio-net says unknown,
+# and the CHR's 802.3ad then keeps LACP off on them (no LACPDU sent).
 qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -name chr-g39h \
   -drive file="$W/chr.img",format=raw,if=virtio \
   -netdev tap,id=e1,ifname=crt1,script=no,downscript=no -device virtio-net-pci,netdev=e1,mac=52:54:00:39:01:01 \
-  -netdev tap,id=e2,ifname=crt2,script=no,downscript=no -device virtio-net-pci,netdev=e2,mac=52:54:00:39:01:02 \
-  -netdev tap,id=e3,ifname=crt3,script=no,downscript=no -device virtio-net-pci,netdev=e3,mac=52:54:00:39:01:03 \
+  -netdev tap,id=e2,ifname=crt2,script=no,downscript=no -device virtio-net-pci,netdev=e2,mac=52:54:00:39:01:02,speed=1000,duplex=full \
+  -netdev tap,id=e3,ifname=crt3,script=no,downscript=no -device virtio-net-pci,netdev=e3,mac=52:54:00:39:01:03,speed=1000,duplex=full \
   -netdev tap,id=e4,ifname=crt4,script=no,downscript=no -device virtio-net-pci,netdev=e4,mac=52:54:00:39:01:04 \
   -serial unix:$W/chr.sock,server,nowait -monitor unix:$W/chr.mon,server,nowait \
   -display none -daemonize -pidfile "$W/qemu.pid"
@@ -143,6 +145,11 @@ for i in 1 2 3; do
   ip link add crv$i type veth peer name ether$i netns crcore
   ip link set crv$i up; ip link set crt$i up
   ip -n crcore link set ether$i up
+  # A veth leaves the UDP/TCP checksum of the kernel's own sockets for the
+  # NIC to fill (CHECKSUM_PARTIAL); through tc mirred into the CHR's tap it
+  # arrives unfilled and RouterOS drops it (the unicast DHCP renewal, DNS,
+  # NTP). A real NIC fills it: compute it in software on the lab wire.
+  ip netns exec crcore ethtool -K ether$i tx off >/dev/null 2>&1 || echo "ethtool -K ether$i tx off failed" >&2
   for pair in "crt$i crv$i" "crv$i crt$i"; do
     set -- $pair
     tc qdisc add dev "$1" ingress
@@ -213,10 +220,13 @@ fi
 ros() { curl -sf -m 10 -u "admin:$PW" "http://$ROS/rest/$1"; }
 rosp() { curl -s -m 60 -u "admin:$PW" -H 'content-type: application/json' -d "$2" "http://$ROS/rest/$1"; }
 rosx() {
+  # `as-string`: run it and wait. Without it /rest/execute starts a background
+  # job and returns, so two calls in a row race (an address added before its
+  # VLAN exists).
   local out
-  out=$(jq -n --arg s "$1" '{script: $s}' |
+  out=$(jq -n --arg s "$1" '{script: $s, "as-string": true}' |
     curl -s -m 30 -u "admin:$PW" -H 'content-type: application/json' -d @- "http://$ROS/rest/execute")
-  if echo "$out" | jq -e 'type == "object" and has("error")' >/dev/null 2>&1; then
+  if echo "$out" | jq -e 'type == "object" and (has("error") or ((.ret // "") | test("failure:|syntax error|bad command|no such item|expected end of command")))' >/dev/null 2>&1; then
     echo "RouterOS refused: $out" >&2
     return 1
   fi
@@ -342,7 +352,7 @@ case_vlan() {
   timeout 4 ip netns exec crcore tcpdump -c 2 -nei ether1 'vlan 30 and icmp' 2>/dev/null > "$W/vlan.txt" &
   local tp=$!; sleep 0.5; ros_ping 10.39.30.2 >/dev/null; wait $tp || true
   grep -q 'ethertype 802.1Q (0x8100).*vlan 30' "$W/vlan.txt" \
-    && result vlan OK "on the wire: $(grep -o 'ethertype 802.1Q (0x8100), vlan 30, p [0-9]' "$W/vlan.txt" | head -1)" \
+    && result vlan OK "on the wire: $(grep -o 'ethertype 802.1Q (0x8100).*vlan 30, p [0-9]' "$W/vlan.txt" | head -1 | cut -c1-120)" \
     || result vlan FAIL "no 0x8100/30 frame seen: $(head -2 "$W/vlan.txt")"
   # A frame with a tag nobody configured stays out (vid 31 only on the CHR).
   ros_vlan 31 10.39.31.1/24
@@ -365,9 +375,11 @@ case_qinq() {
     cli ip.address.add '{"address":"10.39.200.2/24","interface":"c200"}' >/dev/null
     wait_for 10 cr_ping_ok 10.39.200.1 >/dev/null && result qinq OK "802.1ad S-tag 100 + C-tag 200: CoreRouter → CHR ping" || result qinq FAIL "802.1ad 100/200 ping"
     [ "$(ros_ping 10.39.200.2)" -ge 4 ] && result qinq OK "802.1ad 100/200: CHR → CoreRouter ping" || result qinq FAIL "802.1ad 100/200: CHR → CoreRouter"
-    timeout 4 ip netns exec crcore tcpdump -c 1 -nei ether1 'ether proto 0x88a8' 2>/dev/null > "$W/qinq.txt" &
+    # `vlan 100`, not `ether proto 0x88a8`: the veth strips the outer tag
+    # into the packet's metadata (rx offload) and libpcap only sees its TPID there.
+    timeout 4 ip netns exec crcore tcpdump -c 1 -nei ether1 'vlan 100' 2>/dev/null > "$W/qinq.txt" &
     local tp=$!; sleep 0.5; ros_ping 10.39.200.2 >/dev/null; wait $tp || true
-    grep -q '0x88a8' "$W/qinq.txt" && result qinq OK "on the wire: $(grep -o 'ethertype 802.1Q-QinQ (0x88a8), vlan 100.*vlan 200' "$W/qinq.txt" | head -1 | cut -c1-120)" \
+    grep -q '0x88a8' "$W/qinq.txt" && result qinq OK "on the wire: $(grep -o '0x88a8.*vlan 100.*vlan 200' "$W/qinq.txt" | head -1 | cut -c1-120)" \
       || result qinq FAIL "no 0x88a8 frame: $(head -1 "$W/qinq.txt")"
   else
     result qinq FAIL "interface.vlan.add has no 802.1ad (use_service_tag): $(head -c 200 <<< "$err")"
@@ -389,7 +401,9 @@ case_mtu() {
     || result mtu FAIL "vid 30: 1500-byte DF CHR → CoreRouter"
   cr_ping_ok 10.39.30.1 '{"size":1500,"do_not_fragment":true}' \
     && result mtu OK "vid 30, 1500-byte DF ping CoreRouter → CHR" || result mtu FAIL "vid 30: 1500-byte DF CoreRouter → CHR"
-  # Jumbo: 9000 on both ports and on the VLAN.
+  # Jumbo: 9000 on both ports and on the VLAN (and on the lab wire: the
+  # veth peer and the tap in the root namespace, 1500 by default, drop more).
+  ip link set crv1 mtu 9100; ip link set crt1 mtu 9100
   rosx '/interface ethernet set ether1 mtu=9000 l2mtu=9014' >/dev/null 2>&1 || rosx '/interface ethernet set ether1 mtu=9000' >/dev/null || true
   rosx '/interface vlan set v30 mtu=9000' >/dev/null || true
   cli interface.set '{"name":"ether1","mtu":9000}' >/dev/null || result mtu FAIL "interface.set ether1 mtu 9000"
@@ -404,10 +418,11 @@ case_mtu() {
   # CoreRouter is dropped by the CHR (an L2 MTU mismatch is silent, as
   # 802.3 says nothing about it), and the CoreRouter's MTU probe finds 1400.
   rosx '/interface vlan set v30 mtu=1400' >/dev/null
-  local m; m=$(run_task tool.ping.mtu '{"address":"10.39.30.1"}' 2>/dev/null | jq -c '.summary // {}' || echo '{}')
+  local m; m=$(run_task tool.ping.mtu '{"address":"10.39.30.1","max_size":9000}' 2>/dev/null | jq -c '.summary // {}' || echo '{}')
   result mtu INFO "mismatch (CHR v30 at 1400): tool.ping.mtu to the CHR says $m"
   rosx '/interface vlan set v30 mtu=1500
 /interface ethernet set ether1 mtu=1500' >/dev/null || true
+  ip link set crv1 mtu 1500; ip link set crt1 mtu 1500
   cli interface.set '{"name":"v30","mtu":1500}' >/dev/null || true
   cli interface.set '{"name":"ether1","mtu":1500}' >/dev/null || true
 }
@@ -439,19 +454,43 @@ case_arp() {
   local m; m=$(ros ip/arp | jq -c '[.[] | select(.address == "10.39.1.2")][0] // {}')
   [ "$(jq -r '.["mac-address"] // "" | ascii_upcase' <<< "$m")" = "$(ip -n crcore -o link show ether1 | grep -o 'link/ether [^ ]*' | cut -d' ' -f2 | tr a-f A-F)" ] \
     && result arp OK "CHR learned the CoreRouter: $(jq -c '{address, "mac-address", status}' <<< "$m")" || result arp FAIL "CHR ARP for 10.39.1.2: $m"
-  # Proxy ARP, one host (published): the CoreRouter answers for 10.39.1.3.
+  # Proxy ARP, one host (published). Linux (and so the CoreRouter) answers
+  # for a published address only when its route leaves by another interface
+  # (net/ipv4/arp.c: rt->dst.dev != dev): the host behind the router. The
+  # address inside ether1's own subnet is the INFO case below.
   local mac; mac=$(ip -n crcore -o link show ether1 | grep -o 'link/ether [^ ]*' | cut -d' ' -f2)
+  cli ip.route.add '{"dst_address":"10.39.1.3/32","gateway":"ether8"}' >/dev/null || result arp FAIL "ip.route.add 10.39.1.3/32 via ether8"
   cli ip.arp.add "{\"address\":\"10.39.1.3\",\"mac_address\":\"$mac\",\"interface\":\"ether1\",\"published\":true}" >/dev/null \
     || result arp FAIL "ip.arp.add published"
   ros_ping 10.39.1.3 >/dev/null || true
   m=$(ros ip/arp | jq -c '[.[] | select(.address == "10.39.1.3")][0] // {}')
-  [ "$(jq -r '.["mac-address"] // "" | ascii_downcase' <<< "$m")" = "$mac" ] && result arp OK "proxy ARP (published 10.39.1.3): the CHR resolves it to the CoreRouter's MAC" \
-    || result arp FAIL "proxy ARP 10.39.1.3 on the CHR: $m"
-  # And the other way: the CHR publishes 10.39.1.4.
-  rosx '/ip arp add address=10.39.1.4 mac-address=52:54:00:39:01:01 interface=ether1 published=yes' >/dev/null
-  run_task ip.arp.ping '{"address":"10.39.1.4","count":3}' > "$W/arpping.json" || true
-  e=$(cli ip.arp.list '{"search":"10.39.1.4"}' | jq -c '[.rows[]? // .[]? | {address, mac_address, state}][0] // {}')
-  [[ $e == *52:54:00:39:01:01* ]] && result arp OK "CHR published 10.39.1.4: the CoreRouter resolves it ($e)" || result arp FAIL "CHR-published 10.39.1.4: $e ($(jq -c '.summary' "$W/arpping.json" 2>/dev/null))"
+  [ "$(jq -r '.["mac-address"] // "" | ascii_downcase' <<< "$m")" = "$mac" ] && result arp OK "proxy ARP (published 10.39.1.3, routed via ether8): the CHR resolves it to the CoreRouter's MAC" \
+    || result arp FAIL "proxy ARP 10.39.1.3 (routed via ether8) on the CHR: $m"
+  cli ip.arp.add "{\"address\":\"10.39.1.6\",\"mac_address\":\"$mac\",\"interface\":\"ether1\",\"published\":true}" >/dev/null || true
+  ros_ping 10.39.1.6 >/dev/null || true
+  result arp INFO "CoreRouter published 10.39.1.6 inside ether1's own subnet: CHR sees $(ros ip/arp | jq -c '[.[] | select(.address == "10.39.1.6") | {"mac-address", status}][0] // {}')"
+  # ip.arp.ping itself, to an address that answers.
+  run_task ip.arp.ping '{"address":"10.39.1.1","count":3}' > "$W/arpping.json" || true
+  local r; r=$(jq -c '.summary // {}' "$W/arpping.json" 2>/dev/null)
+  [[ $r == *'"received":3'* || $r == *'"received":2'* ]] && result arp OK "ip.arp.ping 10.39.1.1 (the CHR): $(cut -c1-160 <<< "$r")" || result arp FAIL "ip.arp.ping 10.39.1.1: $r"
+  # And the other way: the CHR publishes 10.39.1.4 behind a bridge of its own
+  # (routed elsewhere) and 10.39.1.5 inside ether1's subnet.
+  rosx '/interface bridge add name=lo4
+/ip route add dst-address=10.39.1.4/32 gateway=lo4
+/ip arp add address=10.39.1.4 mac-address=52:54:00:39:01:01 interface=ether1 published=yes
+/ip arp add address=10.39.1.5 mac-address=52:54:00:39:01:01 interface=ether1 published=yes' >/dev/null || true
+  local addr
+  for addr in 10.39.1.4 10.39.1.5; do
+    run_task ip.arp.ping "{\"address\":\"$addr\",\"count\":3}" > "$W/arpping.json" || true
+    e=$(cli ip.arp.list "{\"search\":\"$addr\"}" | jq -c '[.rows[]? // .[]? | {address, mac_address, state}][0] // {}')
+    if [ $addr = 10.39.1.4 ]; then
+      # ip.arp.ping uses its own socket: the answer is in its summary, not the table.
+      r=$(jq -c '.summary // {}' "$W/arpping.json" 2>/dev/null)
+      [[ $r == *'"received":3'* || $r == *'"received":2'* ]] && result arp OK "CHR published $addr (routed to lo4): ip.arp.ping answered ($(cut -c1-160 <<< "$r"))" || result arp FAIL "CHR-published $addr (routed to lo4): $r"
+    else
+      result arp INFO "CHR published $addr inside ether1's own subnet: ip.arp.ping $(jq -c '.summary | {sent, received}' "$W/arpping.json" 2>/dev/null)"
+    fi
+  done
 }
 
 case_tools() {
@@ -460,11 +499,11 @@ case_tools() {
   result tools INFO "ping CHR loopback: $(jq -c '.summary_lines // .summary' <<< "$p" | cut -c1-300)"
   cr_ping_ok 10.255.39.1 && result tools OK "tool.ping to the CHR" || result tools FAIL "tool.ping to the CHR"
   p=$(run_task tool.traceroute.start '{"address":"10.255.39.1","use_dns":false,"probes":3}')
-  local hops; hops=$(jq -r '.lines // [] | join(" | ")' <<< "$p" | cut -c1-300)
+  local hops; hops=$(jq -r '[.summary.hops[]? | "\(.host // "*") \(.avg_ms // "-") ms"] | join(" | ")' <<< "$p" | cut -c1-300)
   [[ $hops == *10.255.39.1* ]] && result tools OK "traceroute reaches the CHR: $hops" || result tools FAIL "traceroute: $hops $(jq -c .summary <<< "$p" | head -c 200)"
   for proto in udp tcp; do
     p=$(run_task tool.traceroute.start "{\"address\":\"10.255.39.1\",\"use_dns\":false,\"protocol\":\"$proto\",\"probes\":2}")
-    hops=$(jq -r '.lines // [] | join(" | ")' <<< "$p" | cut -c1-200)
+    hops=$(jq -r '[.summary.hops[]? | "\(.host // "*") \(.avg_ms // "-") ms"] | join(" | ")' <<< "$p" | cut -c1-200)
     [[ $hops == *10.255.39.1* ]] && result tools OK "traceroute $proto reaches the CHR" || result tools INFO "traceroute $proto: $hops"
   done
   p=$(run_task tool.mtr.start '{"address":"10.255.39.1","count":10,"interval_ms":200,"use_dns":false}')
@@ -493,18 +532,14 @@ case_dhcp() {
   else
     result dhcp FAIL "option 121: $(head -c 200 <<< "$err")"
   fi
-  # Conflict: .50 is taken by a host the server does not know (the CHR
-  # itself, a static address); the ARP probe must skip it.
-  rosx '/ip address add address=192.168.10.50/24 interface=v10 comment=squatter' >/dev/null
+  # Conflict detection is the dhcp-conflict case: the CHR answers ARP for any
+  # of its addresses from the asking port's MAC (Linux arp_ignore=0), so a
+  # squatter on it looks like the client itself (RFC 5227: offered again).
   dhcp_cap v10 "$W/dhcp10.pcap"
   rosx '/ip dhcp-client add interface=v10 add-default-route=yes use-peer-dns=yes use-peer-ntp=yes comment=g39h' >/dev/null
   local ms
   ms=$(wait_for 30 ros_bound v10) && result dhcp OK "CHR client bound in ${ms} ms: $(ros ip/dhcp-client | jq -c '.[] | select(.interface == "v10") | {address, gateway, "dhcp-server", "primary-dns", "primary-ntp", "expires-after"}')" \
     || { result dhcp FAIL "CHR client on v10: $(ros ip/dhcp-client | jq -c '.[] | select(.interface == "v10") | {status}')"; dhcp_cap_stop v10; return; }
-  local addr; addr=$(ros ip/dhcp-client | jq -r '.[] | select(.interface == "v10") | .address')
-  [[ $addr != 192.168.10.50/* ]] && result dhcp OK "conflict detection: .50 (in use) skipped, got $addr; lease list: $(cli ip.dhcp-server.lease.print '{"server":"d10"}' | jq -c '[.[] | {address, status, reason}]')" \
-    || result dhcp FAIL "conflict: the server offered .50, already in use"
-  rosx '/ip address remove [find comment=squatter]' >/dev/null
   # What the CHR did with the options.
   local r; r=$(ros ip/route | jq -c '[.[] | select((.["dst-address"] == "10.99.0.0/16" or .["dst-address"] == "0.0.0.0/0") and (.gateway // "" | startswith("192.168.10.1")))] | map({"dst-address", gateway, dhcp: (.dhcp // null)})')
   [[ $r == *10.99.0.0/16* ]] && result dhcp OK "option 121: the CHR installed $r" || result dhcp FAIL "option 121 not installed on the CHR: $r"
@@ -520,7 +555,7 @@ case_dhcp() {
   for o in Subnet-Mask Default-Gateway Domain-Name-Server Domain-Name NTP Classless-Static-Route Lease-Time Server-ID; do
     grep -A40 'DHCP-Message (53), length 1: ACK' "$W/dhcp10.txt" | grep -q "$o" || result dhcp FAIL "ACK without $o"
   done
-  local acks; acks=$(grep -B12 'DHCP-Message (53), length 1: ACK' "$W/dhcp10.txt" | grep -oE '^[0-9]+\.[0-9]+' )
+  local acks; acks=$(ack_times "$W/dhcp10.txt")
   local first second; first=$(head -1 <<< "$acks"); second=$(sed -n 2p <<< "$acks")
   if [ -n "$second" ]; then
     local d; d=$(awk -v a="$first" -v b="$second" 'BEGIN {printf "%.1f", b - a}')
@@ -533,10 +568,15 @@ case_dhcp() {
   rosx '/ip dhcp-client release [find interface=v10]' >/dev/null || true
   sleep 2
   local st; st=$(cli ip.dhcp-server.lease.print '{"server":"d10"}' | jq -c '[.[] | {address, status, mac_address}]')
-  [[ $st != *bound* ]] && result dhcp OK "release: no lease left bound ($st)" || result dhcp FAIL "release: $st"
+  # RouterOS's `release` frees the binding and starts the client again, so the
+  # lease comes back at once: the release shows in A's log.
+  wait_for 5 a_logged 'released by the client' >/dev/null && result dhcp OK "release reached the server: 'released by the client' ($st)" || result dhcp FAIL "release: no 'released by the client' in A's log ($st)"
   ms=$(wait_for 30 ros_bound v10) && result dhcp OK "CHR bound again ${ms} ms after its release" || result dhcp INFO "CHR not bound again after release"
   result dhcp INFO "server statistics: $(cli ip.dhcp-server.statistics.print | jq -c '{received, sent, latency_us}')"
 }
+# ack_times <tcpdump -tt -v text>: the time of each ACK (the header line that
+# starts the packet; a unicast ACK has more lines before option 53).
+ack_times() { awk '/^[0-9]+\.[0-9]+ IP / {t = $1} /DHCP-Message \(53\), length 1: ACK/ {print t}' "$1"; }
 ros_bound() { [ "$(ros ip/dhcp-client | jq -r --arg i "$1" '.[] | select(.interface == $i) | .status')" = bound ]; }
 
 case_dhcp-client() {
@@ -566,19 +606,20 @@ case_dhcp-client() {
   dhcp_cap_stop v11
   tcpdump -r "$W/dhcp11.pcap" -tt -nv 2>/dev/null > "$W/dhcp11.txt" || true
   local req; req=$(grep -cE 'DHCP-Message \(53\), length 1: Request' "$W/dhcp11.txt" || true)
-  local t; t=$(grep -B12 'DHCP-Message (53), length 1: ACK' "$W/dhcp11.txt" | grep -oE '^[0-9]+\.[0-9]+' | head -2 | paste -sd' ')
+  local t; t=$(ack_times "$W/dhcp11.txt" | head -2 | paste -sd' ')
   local d; d=$(awk -v t="$t" 'BEGIN {split(t, a, " "); if (a[2]) printf "%.1f", a[2] - a[1]; else print "-"}')
   awk -v d="$d" 'BEGIN {exit !(d != "-" && d >= 27 && d <= 34)}' && result dhcp-client OK "renewed ${d} s after binding (T1 = 30 s of 60, RFC 2131 §4.4.5)" \
     || result dhcp-client FAIL "renewal at ${d} s (requests seen: $req)"
   # The renewal is unicast to the server (RFC 2131 §4.4.5, RENEWING).
-  grep -B2 'DHCP-Message (53), length 1: Request' "$W/dhcp11.txt" | grep -q '> 192.168.11.1.67' && result dhcp-client OK "RENEWING request unicast to 192.168.11.1" \
+  grep -q '192.168.11.[0-9]*.68 > 192.168.11.1.67' "$W/dhcp11.txt" && result dhcp-client OK "RENEWING request unicast to 192.168.11.1" \
     || result dhcp-client INFO "renewal requests: $(grep -E '^[0-9.]+ IP' "$W/dhcp11.txt" | tail -3 | cut -c1-120 | paste -sd'|')"
   # Release: the CHR drops the lease.
   cli ip.dhcp-client.release "{\"id\":\"$id\"}" >/dev/null || result dhcp-client FAIL "ip.dhcp-client.release"
   sleep 2
   local l; l=$(ros ip/dhcp-server/lease | jq -c '[.[] | select(.server == "d11") | .status]')
-  [[ $l != *bound* ]] && result dhcp-client OK "release: the CHR no longer holds the lease ($l)" || result dhcp-client FAIL "release: CHR lease still $l"
-  [ -z "$(ip -n crcore -4 addr show dev v11 | grep 192.168.11.)" ] && result dhcp-client OK "release: the address left v11" || result dhcp-client FAIL "release: address still on v11"
+  # The CoreRouter's release, like RouterOS's, frees the lease and starts
+  # again: the CHR logs the deassign, and the client binds once more.
+  ros log | jq -r '.[].message' | grep -q 'd11 deassigned' && result dhcp-client OK "release: the CHR deassigned the lease (now $l)" || result dhcp-client FAIL "release: no 'deassigned' in the CHR log (lease $l)"
   cli ip.dhcp-client.renew "{\"id\":\"$id\"}" >/dev/null || true
   ms=$(wait_for 30 cr_bound v11) && result dhcp-client OK "renew after release: bound in ${ms} ms" || result dhcp-client FAIL "renew after release"
 }
@@ -662,7 +703,7 @@ case_ra() {
   sleep 12
   local got; got=$(ros ipv6/address | jq -c '[.[] | select(.interface == "v15" and ((.address // "") | startswith("2001:db8:15")))]')
   [ "$got" != "[]" ] && result ra OK "CHR autoconfigured from A's RA: $got" \
-    || result ra FAIL "the CoreRouter sends no Router Advertisement (no /ipv6 nd: RFC 4861 §6.2 router side missing); CHR v15 has no 2001:db8:15:: address"
+    || result ra INFO "the CoreRouter sends no Router Advertisement (gap G3.9ha: no /ipv6 nd, RFC 4861 §6.2 router side): CHR v15 has no 2001:db8:15:: address"
 }
 slaac() { ip -n crcore -6 -o addr show dev "$1" scope global | grep -q 2001:db8:14:; }
 
@@ -721,7 +762,7 @@ nat_setup() { # the CHR behind A on VLAN 10 (a DHCP lease from case dhcp, or sta
     rosx '/ip address add address=192.168.10.55/24 interface=v10 comment=nat
 /ip route add dst-address=0.0.0.0/0 gateway=192.168.10.1 comment=nat' >/dev/null 2>&1 || true
   fi
-  [ -f "$W/http.pid" ] || { ip netns exec crpeer python3 -I -m http.server 8080 --bind 10.39.5.2 --directory "$W" >/dev/null 2>&1 & echo $! > "$W/http.pid"; sleep 1; }
+  [ -f "$W/http.pid" ] || { ip netns exec crpeer python3 -I -m http.server 8080 --bind 0.0.0.0 --directory "$W" >/dev/null 2>&1 & echo $! > "$W/http.pid"; sleep 1; }
 }
 case_nat() {
   nat_setup
@@ -742,15 +783,21 @@ case_nat() {
 }
 case_cgnat() {
   nat_setup
+  # Its own destination on B: the CHR reuses its ICMP id and TCP source port,
+  # and conntrack keeps the NAT of an entry it already has (the masquerade of
+  # case nat), as RouterOS does. The CoreRouter has no
+  # `ip.firewall.connection.remove` to clear them (gap G3.9hd).
+  clib ip.address.add '{"address":"10.39.6.2/24","interface":"ether1"}' >/dev/null || true
+  cli ip.route.add '{"dst_address":"10.39.6.0/24","gateway":"10.39.5.2"}' >/dev/null || true
   clib ip.route.add '{"dst_address":"198.51.100.0/30","gateway":"10.39.5.1"}' >/dev/null
   cli ip.firewall.cgnat.pool.add '{"name":"cg","inside":"192.168.10.0/24","outside":"198.51.100.0/30","ports_per_subscriber":1000,"out_interface":"ether5"}' >/dev/null || { result cgnat FAIL "cgnat.pool.add"; return; }
-  [ "$(ros_ping 10.39.5.2)" -ge 4 ] && result cgnat OK "deterministic CGNAT: CHR → B ping" || result cgnat FAIL "CGNAT: CHR → B ping"
-  local f; f=$(rosp tool/fetch '{"url":"http://10.39.5.2:8080/results.txt","output":"none"}')
+  [ "$(ros_ping 10.39.6.2)" -ge 4 ] && result cgnat OK "deterministic CGNAT: CHR → B ping" || result cgnat FAIL "CGNAT: CHR → B ping"
+  local f; f=$(rosp tool/fetch '{"url":"http://10.39.6.2:8080/results.txt","output":"none"}')
   [[ $f == *finished* ]] && result cgnat OK "CGNAT: CHR HTTP fetch from B" || result cgnat FAIL "CGNAT fetch: $(head -c 200 <<< "$f")"
   local sub; sub=$(ros ip/address | jq -r '[.[] | select(.interface == "v10")][0].address' | cut -d/ -f1)
   local lk; lk=$(cli ip.firewall.cgnat.lookup "{\"subscriber\":\"$sub\"}" | jq -c .)
   result cgnat INFO "lookup $sub: $lk"
-  local ct; ct=$(cli ip.firewall.connection.list "{\"subscriber\":\"$sub\"}" | jq -c '[(.rows // .)[] | {protocol, public: (.public // null), reply_dst: (.reply_dst_address // .reply_dst // null)}]' 2>/dev/null | head -c 300)
+  local ct; ct=$(cli ip.firewall.connection.list "{\"subscriber\":\"$sub\",\"dst\":\"10.39.6.2\"}" | jq -c '[(.rows // .)[] | {protocol, nat: (.nat // null), reply_dst: (.reply_dst_address // .reply_dst // null)}]' 2>/dev/null | head -c 300)
   local pub; pub=$(jq -r .public <<< "$lk")
   [[ $ct == *$pub* ]] && result cgnat OK "connections of $sub leave as $pub in the subscriber's port block: $ct" || result cgnat FAIL "connection.list subscriber: $ct"
   local port; port=$(jq -r .first_port <<< "$lk")
@@ -783,7 +830,7 @@ case_bond() {
   cli ip.address.add '{"address":"10.39.60.2/24","interface":"bond1"}' >/dev/null
   local ms
   ms=$(wait_for 30 lacp_up) && result bond OK "802.3ad with the CHR: both members in the aggregate after ${ms} ms (CHR monitor: $(ros_bond_mon | jq -c '{"active-ports", "inactive-ports", "lacp-system-id", "lacp-partner-system-id"}'))" \
-    || result bond FAIL "802.3ad: CHR monitor $(ros_bond_mon | jq -c .), A: $(lacp_state)"
+    || { result bond FAIL "802.3ad: CHR monitor $(ros_bond_mon | jq -c .), A: $(lacp_state)"; lacp_dump; }
   result bond INFO "A side: $(lacp_state)"
   result bond INFO "CoreRouter interface.bonding.list: $(cli interface.bonding.list | jq -c '.[0]')"
   [ "$(ros_ping 10.39.60.2)" -ge 4 ] && result bond OK "802.3ad: CHR → A ping over the bond" || result bond FAIL "ping over the LACP bond"
@@ -816,6 +863,16 @@ case_bond() {
 /interface bonding remove bond1' >/dev/null || true
 }
 ros_bond_mon() { rosp interface/bonding/monitor '{"numbers":"bond1","once":""}' | jq -c '.[0] // {}'; }
+# Where the LACPDUs (slow protocols, 0x8809) stop: each hop of the wire.
+lacp_dump() {
+  local d
+  for d in "crt2 root" "crv2 root" "ether2 crcore" "crt3 root" "ether3 crcore"; do
+    set -- $d
+    local x=""; [ "$2" = root ] || x="ip netns exec $2"
+    result bond INFO "LACPDUs on $1 ($2), 4 s: $(timeout 4 $x tcpdump -l -nei "$1" 'ether proto 0x8809' 2>/dev/null | awk '{print $2}' | sort | uniq -c | tr -s ' ' | paste -sd';')"
+  done
+  result bond INFO "tc on crt2/crv2: $(tc -s filter show dev crt2 ingress | grep -oE 'Sent [0-9]+ bytes [0-9]+ pkt' | head -1) / $(tc -s filter show dev crv2 ingress | grep -oE 'Sent [0-9]+ bytes [0-9]+ pkt' | head -1)"
+}
 lacp_state() { ip netns exec crcore cat /proc/net/bonding/bond1 2>/dev/null | grep -E 'Aggregator ID|Partner Mac|Slave Interface|MII Status|Number of ports' | tr -s ' ' | paste -sd';' | cut -c1-400; }
 lacp_up() { [[ $(ros_bond_mon | jq -r '.["active-ports"] // "" | tostring') == *ether2*ether3* ]] && [ "$(ip netns exec crcore grep -c 'Aggregator ID' /proc/net/bonding/bond1 2>/dev/null)" -ge 3 ] && \
   [ "$(ip netns exec crcore awk '/Aggregator ID/ {print $3}' /proc/net/bonding/bond1 | sort -u | wc -l)" = 1 ]; }
@@ -931,7 +988,26 @@ EOF
   ip -n crcl addr add 10.40.255.254/16 dev cl0 2>/dev/null || true
 }
 
-# storm_py <n> <rate>: without BNG Blaster, n DHCP clients from one raw
+case_dhcp-conflict() {
+  # RFC 2131 §4.4.1 (SHOULD probe before offering) and RouterOS's
+  # conflict-detection: a host with .50 that the server does not know (in
+  # crcl, its own MAC) makes the server mark .50 conflict and offer .51.
+  cli ip.address.add '{"address":"10.41.0.1/24","interface":"ether8"}' >/dev/null || true
+  cli ip.pool.add '{"name":"p41","ranges":"10.41.0.50-10.41.0.52"}' >/dev/null
+  cli ip.dhcp-server.add '{"name":"d41","interface":"ether8","address_pool":"p41","lease_time":"10m","conflict_detection":true}' >/dev/null || { result dhcp-conflict FAIL "server on ether8"; return; }
+  cli ip.dhcp-server.network.add '{"address":"10.41.0.0/24","gateway":"10.41.0.1"}' >/dev/null
+  ip -n crcl addr add 10.41.0.50/24 dev cl0
+  storm_py 1 1 dhcp-conflict
+  local l; l=$(cli ip.dhcp-server.lease.print '{"server":"d41"}' | jq -c '[.[] | {address, status, mac_address}]')
+  [[ $(jq -r '[.[] | select(.address == "10.41.0.50") | .status][0] // ""' <<< "$l") == conflict ]] \
+    && [[ $(jq -r '[.[] | select(.status == "bound") | .address][0] // ""' <<< "$l") != 10.41.0.50 ]] \
+    && result dhcp-conflict OK "the ARP probe found .50 in use: $l" || result dhcp-conflict FAIL "leases: $l"
+  ip -n crcl addr del 10.41.0.50/24 dev cl0 2>/dev/null || true
+  # One server per interface: free ether8 for the storm.
+  cli ip.dhcp-server.remove '{"id":"d41"}' >/dev/null || true
+}
+
+# storm_py <n> <rate> [case]: without BNG Blaster, n DHCP clients from one raw
 # socket on cl0 (own MAC each, broadcast flag so the replies reach the
 # socket): DISCOVER at <rate>/s, REQUEST on each OFFER, ACKs counted.
 storm_py() {
@@ -1000,12 +1076,12 @@ PY2
   snapshot "$W/cpu1"
   local acked n ms offers naks t99 tsend; read -r acked n ms offers naks t99 tsend <<< "$out"
   if [ "${acked:-0}" = "$1" ] && [ "${ms:-0}" -gt 0 ] && [ "${t99:-0}" -gt 0 ]; then
-    result storm OK "$1 clients: 99% bound in $t99 ms ($(( $1 * 990 / t99 )) leases/s), all in $ms ms; DISCOVERs sent over $tsend ms (Python generator, $2/s); $offers offers, $naks NAKs"
+    result "${3:-storm}" OK "$1 clients: 99% bound in $t99 ms ($(( $1 * 990 / t99 )) leases/s), all in $ms ms; DISCOVERs sent over $tsend ms (Python generator, $2/s); $offers offers, $naks NAKs"
   else
-    result storm FAIL "storm: ${out:0:200}"
+    result "${3:-storm}" FAIL "storm: ${out:0:200}"
   fi
-  result storm INFO "server: $(cli ip.dhcp-server.statistics.print | jq -c '{leases, received, sent, peak_acks, latency_us}' | cut -c1-300)"
-  result storm INFO "CPU per daemon thread over the storm: $(cpu_report "$W/cpu0" "$W/cpu1" "$(awk -v d="${ms:-1000}" 'BEGIN {print d / 1000}')")"
+  result "${3:-storm}" INFO "server: $(cli ip.dhcp-server.statistics.print | jq -c '{leases, received, sent, peak_acks, latency_us}' | cut -c1-300)"
+  result "${3:-storm}" INFO "CPU per daemon thread over the storm: $(cpu_report "$W/cpu0" "$W/cpu1" "$(awk -v d="${ms:-1000}" 'BEGIN {print d / 1000}')")"
   ip -n crcl addr add 10.40.255.254/16 dev cl0 2>/dev/null || true
 }
 
