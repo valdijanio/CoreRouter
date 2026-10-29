@@ -7266,3 +7266,125 @@ continuação indentadas).
 
   Como testar: `cargo xtask vm-lab run -- scripts/routeros-interop-pppoe.sh [casos]`; os testes novos
   rodam no `cargo test -p corerouter-proto-pppoe`.
+
+- 2026-10-29 — G3.9f: Interoperabilidade BGP, parte 2: `scripts/routeros-interop-bgp.sh` contra o RouterOS 7.25 CHR
+  (licença free) na VM do laboratório, com dois CoreRouters (backend linux + FRR 10) e dois FRR
+  puros (R3, R4) em namespaces. Rodar: `cargo xtask vm-lab run --lock-timeout 2h --
+  scripts/routeros-interop-bgp.sh [casos]` (cinco rodadas de 1,5 a 18 min, **medido**).
+
+  | Caso | Resultado (**medido**, VM `corerouter-lab`, 2026-10-29) |
+  |---|---|
+  | ebgp4 | OK: Established 5,2 s após as duas configs; rotas nos dois sentidos; remoção da conexão tira a rota do kernel em 109 ms |
+  | ebgp6 | OK: transporte e NLRI IPv6 em 2,1 s; o CHR usa o link-local do CR1 (RFC 2545 §3) |
+  | mpbgp | IPv4+IPv6 numa sessão IPv4: o CHR instala o IPv6 do CoreRouter; o IPv6 do CHR não entra no kernel do CR1 (next hop `::ffff:10.39.1.1` do CHR: divergência do RouterOS, RFC 2545 §3; a prévia da conexão agora avisa) |
+  | multihop | OK: loopbacks com `update_source`, 1,8 s |
+  | md5 | OK: Established em 2,9 s; chave errada derruba e mantém caída; chave corrigida volta em 0,96 s; a chave não fica em claro |
+  | communities | OK: RFC 1997, 8092 e 4360 do CHR; append do CoreRouter (normal e large) chega ao CHR; lista de communities na entrada derruba em 108 ms |
+  | filters | OK: local-pref, MED, prepend e reject nos dois sentidos; regra mudada vale em 5,1 s sem reset |
+  | ibgp | OK: entre loopbacks, LOCAL_PREF 100 |
+  | nexthop-self | OK: sem ele o CR2 não instala (next hop inalcançável); `force-self` instala em 211 ms |
+  | rr | OK: CoreRouter como refletor, CHR → R4 e R4 → CHR com ORIGINATOR_ID e CLUSTER_LIST; sem o papel, split horizon em 122 ms |
+  | rr-chr | OK: CHR como refletor nos dois sentidos, next hop mantido; o CHR põe o próprio ID no ORIGINATOR_ID (divergência, RFC 4456 §8) |
+  | maxprefix | OK: 6 > 3 com `shutdown` fecha com Cease 6/1 (o CHR registra `prefix limit reached`); `warning` mantém |
+  | restart | OK: reinício do daemon não mexe na sessão (volta em 211 ms); `bgpd` morto volta com a config em 5,8 s |
+  | bfd | OK: BFD com o CHR para a sessão BGP |
+  | convergence | OK: corte silencioso no lado do CHR: hold 9 s → 8,5 s; BFD 300 ms × 3 → 0,83 s; o CR1, que perde a portadora, troca em 2–3 ms |
+  | scale | OK: 100 000 prefixos do CHR no kernel do CR1 em 3,5 s; CR1 → CR2 (iBGP) em 3,5 s; clear em 4,5 s; retirada em 1,2 s |
+  | crcr | OK: eBGP com MD5 e IPv4+IPv6, communities, BFD 100 ms × 3 (perda em 418 ms), iBGP com refletor |
+
+  Corrigido no mesmo PR: a prévia de `routing.bgp.connection.check` avisa (`mpbgp-nexthop`) quando
+  a conexão leva IPv6 numa sessão IPv4. O roteiro lê os atributos BGP do CHR em `/routing/route`
+  (o `/ip/route` não os mostra), aceita o next hop link-local, sobe o `mgmtd` antes do `staticd`
+  (FRR 10) e mede a convergência de cada lado separado.
+
+- 2026-10-29 — G3.9h: Interoperabilidade de L2 e serviços, parte 3: os casos contra o RouterOS 7.25 CHR, na VM do
+  laboratório (`cargo xtask vm-lab run -- scripts/routeros-interop-l2.sh [casos]`), em rodadas de
+  até 25 min. Nenhum caso achou defeito do CoreRouter; os FAIL das primeiras rodadas eram da
+  montagem ou do roteiro, todos corrigidos:
+
+  - **Soma de verificação no fio do laboratório:** um veth deixa a soma UDP/TCP dos sockets do
+    próprio kernel para a placa preencher (`CHECKSUM_PARTIAL`); pelo `tc mirred` até o tap do CHR
+    ela chega vazia e o RouterOS descarta. Caía a renovação DHCP unicast (T1), e cairiam DNS e NTP.
+    O roteiro desliga o `tx` checksum nos veth do fio (`ethtool -K`); uma placa real preenche.
+  - **`/rest/execute` do RouterOS sem `as-string`** roda o script como tarefa em segundo plano e
+    volta na hora: dois comandos seguidos disputavam (o endereço da VLAN 30 antes de a VLAN
+    existir). Era a falha intermitente da VLAN 30.
+  - **Bonding 802.3ad:** o virtio-net do QEMU informa velocidade e duplex desconhecidos, e o
+    802.3ad do CHR não liga o LACP nessas portas (nenhum LACPDU sai). O roteiro dá
+    `speed=1000,duplex=full` às portas do bond.
+  - **Conflito DHCP:** um "invasor" no próprio CHR não serve. O Linux responde ARP de qualquer
+    endereço seu com o MAC da porta que perguntou, e um probe respondido pelo MAC do próprio
+    cliente é o cliente com o endereço dele (RFC 5227): o servidor o oferece de novo, de
+    propósito. O caso novo `dhcp-conflict` põe o invasor num namespace com MAC próprio: o servidor
+    marca .50 `conflict` com o MAC do invasor e entrega .51 (RFC 2131 §4.4.1, o
+    `conflict-detection` do RouterOS). Roda também com `NO_CHR=1`.
+  - **CGNAT:** o CHR reaproveita o id ICMP e a porta TCP de origem, e o conntrack mantém o NAT de
+    uma entrada que já existe (a masquerade do caso `nat`), como no RouterOS. O caso `cgnat` usa
+    um destino próprio em B.
+
+  Resultados contra o CHR (**medido**, 2026-10-29, VM `corerouter-lab`, release):
+
+  - **VLAN e MTU:**
+    - 802.1Q vid 30 nos dois sentidos, com a tag 0x8100 conferida no fio; a vid 31, só no CHR,
+      não vaza para a porta sem tag;
+    - 802.1ad S-tag 100 + C-tag 200 nos dois sentidos (0x88a8 por fora no fio); 802.1Q empilhado
+      101/201;
+    - 1500 bytes com DF sobre a VLAN; jumbo 9000 com DF nos dois sentidos; `tool.ping.mtu` acha
+      9000.
+  - **LLDP/MNDP:** o CoreRouter vê o CHR por LLDP em 415 ms (identidade, versão, porta remota,
+    endereço) e por MNDP (só recebe); o CHR vê o CoreRouter.
+  - **ARP:**
+    - aprendizado nos dois sentidos;
+    - proxy ARP (`published`) de um endereço roteado por outra interface, nos dois sentidos;
+    - `published` dentro da própria sub-rede da porta: nem o CoreRouter nem o RouterOS respondem
+      (o Linux só responde quando a rota sai por outra interface). Comportamento igual, sem
+      divergência; o `ip.arp.check` já avisa;
+    - a resposta publicada do CHR vem com 136–376 ms (o `proxy_delay` do Linux).
+  - **Ferramentas:** ping, traceroute ICMP/UDP/TCP e MTR até o CHR.
+  - **DHCPv4, CoreRouter servidor:**
+    - o CHR liga em 1,05 s;
+    - instala a opção 121 (10.99.0.0/16 e 0/0, RFC 3442) e o DNS da opção 6;
+    - renova 30,0 s depois do ACK (T1 = 0,5 × 60 s, RFC 2131 §4.4.5);
+    - o release chega ao servidor, e o CHR liga de novo em 9 ms.
+  - **DHCPv4, CoreRouter cliente do CHR:**
+    - liga em 2,1 s com as opções 15, 42 e 121 (rotas no kernel);
+    - renova por unicast 30,3 s depois de ligar;
+    - o release some do CHR ("deassigned"), e o cliente liga de novo em 211 ms.
+  - **DHCP relay:** o CHR liga pelo relay em 1,05 s, com a opção 82 (RFC 3046).
+  - **DHCPv6:**
+    - **CoreRouter servidor:** endereço e prefixo /56 em 1,7 s, rota para o prefixo delegado e
+      DNS (opção 23) no CHR;
+    - **CoreRouter cliente:** endereço e /56 do CHR em 4,4 s, com endereço do pool delegado na
+      ether8.
+  - **RA:** SLAAC no CoreRouter pelo RA do CHR em 4,5 s (RFC 4862 §5.5.3). O CoreRouter ainda
+    não envia RA (G3.9ha).
+  - **NTP:** o cliente sincroniza com o CHR em 1 s (round trip 1,1 ms). O CoreRouter ainda não é
+    servidor NTP (G4.6c).
+  - **DNS:** o CHR resolve pelo CoreRouter um nome estático, um CNAME e um nome encaminhado a B,
+    que fica no cache.
+  - **NAT/CGNAT:**
+    - masquerade com ping e HTTP; o conntrack mostra os fluxos do CHR; um filtro de forward
+      bloqueia o ping;
+    - CGNAT determinístico com ping e HTTP: as conexões saem como 198.51.100.0 dentro do bloco
+      de portas do assinante; `cgnat.lookup` e `who-was` respondem.
+  - **Bonding com o CHR:**
+    - 802.3ad com `lacp-rate=1sec`: os dois membros no agregado em 433 ms, com o mesmo parceiro
+      dos dois lados;
+    - corte do link de uma porta do CHR (sem portadora em A): 0 ms perdidos;
+    - ether2 de A desligada com a portadora do CHR em pé: 2,39 s perdidos, o tempo do CHR tirar a
+      porta pelo timeout do LACP (802.1AX: 3 × 1 s);
+    - active-backup e balance-xor: 230 e 320 ms perdidos no corte de um membro (mii 100 ms).
+  - **Tempestade com o BNG Blaster na VM:** 20 000 clientes ligados, um DISCOVER, um REQUEST e um
+    ACK por cliente, sem NAK nem reenvio; pico de 1 800 ACKs/s e quase todos abaixo de 6,4 ms.
+    Quem limita é o próprio BNG Blaster na VM (~210 sessões/s); o teto do servidor continua o
+    medido no host (9 969 leases/s a 14 % de um núcleo, G3.9h-crcr).
+
+  Gap nova:
+
+
+  Teste:
+
+  ```sh
+  cargo xtask vm-lab run -- scripts/routeros-interop-l2.sh
+  unshare --user --map-root-user --net --mount -- sh -c 'mount -t tmpfs none /run && mkdir /run/netns && W=/tmp/crw NO_CHR=1 BIN=$PWD/target/release scripts/routeros-interop-l2.sh dhcp-conflict'
+  ```
