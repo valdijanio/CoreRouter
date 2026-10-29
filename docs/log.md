@@ -6733,3 +6733,38 @@ continuação indentadas).
 
   Como testar: `cargo nextest run --workspace` (3487 testes); `cargo test -p corerouter-engine
   --test it cgnat::` (um arquivo); `cargo xtask netns`; `cargo test -p xtask it_mods`.
+
+- 2026-10-29 — G0.30: Orçamento de testes, parte A: o relatório dos mais lentos. O passo `test` do `cargo xtask ci`
+  grava o JUnit do nextest (`.config/nextest.toml`, `target/nextest/default/junit.xml`) e o xtask
+  imprime, depois do resumo, o total de tempo de teste, quantos passam de 1 s e de 5 s e os 20
+  mais lentos (`xtask/src/slowest.rs`); aparece no fim de todo `cargo xtask ci` e no log de cada
+  parte do job `test` no GitHub. Como testar: `cargo xtask ci --only test` e ler o fim da saída.
+
+- 2026-10-29 — G0.30: Orçamento de testes, parte B: camadas de teste e proptest por camada. A camada **rápida** (o
+  portão da sessão `cargo xtask ci --affected`, o `--fast` e o job `test` do PR no GitHub) roda
+  tudo menos os testes cujo nome começa com `slow_` (perfil `quick` do `.config/nextest.toml`) e
+  com `PROPTEST_CASES=32`; a **completa** (lote da fila e `main`) roda todos com os casos de cada
+  proptest; o **CI noturno** novo (`.github/workflows/nightly.yml`, 06:17 UTC) roda a completa com
+  `PROPTEST_CASES=4096` (o maior caso escrito hoje é 3000) em 4 partes, mais os namespaces, e abre
+  ou comenta a issue "CI noturno quebrado" (rótulo `noturno-quebrado`) ao falhar, fechando-a no
+  verde, como o `main-red`. O `--affected` deixa de rodar o `netns` (camada lenta) salvo com
+  `--only netns`. `COREROUTER_TEST_LAYER=quick|full` escolhe à mão.
+
+  Na camada lenta (`slow_`, cada um com uma linha de doc dizendo por quê): a simulação de 100 mil
+  sessões PPPoE, a reconexão em massa de 20 mil, os 20 mil Service-Names em QinQ, a reconexão de
+  6000 CPEs contra um RADIUS lento, as 100 mil requisições RADIUS e o aviso do discovery (agentes
+  em sockets reais, intervalo de 1 s). Os dois testes do journal da config que percorriam de 5 a
+  2100 commits num laço viraram dois cada: os casos pequenos ficam na camada rápida e os da borda
+  do checkpoint (1023–1025, 1030 e 2100 commits) na lenta, um teste por contagem para rodarem
+  lado a lado no lote. Nada do que os testes conferem mudou. O `priority` do nextest passa a
+  começar primeiro todos os `slow_`, sem lista de nomes.
+
+  As regressões gravadas do proptest (`proptest-regressions/`) rodam antes dos casos novos com
+  qualquer `PROPTEST_CASES` (proptest 1.12, `run_in_process_with_replay`); o risco era outro: o
+  arquivo é achado pelo caminho do teste, e um teste movido (como na ida para `tests/it`, G0.29)
+  deixa as sementes para trás sem aviso. O passo `test` agora reprova regressão órfã
+  (`xtask/src/regressions.rs`).
+
+  Como testar: `cargo xtask ci --affected` (a linha "test layer: quick …" e o relatório no fim);
+  `COREROUTER_TEST_LAYER=full cargo xtask ci --only test` roda os `slow_`;
+  `cargo nextest list --profile quick | grep -c slow_` dá 0.
