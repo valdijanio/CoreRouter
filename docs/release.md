@@ -131,7 +131,8 @@ VM de teste com o pacote de dev da `main` funcionando.
    (`.deb`, `.crpkg`, `-install.iso`, `.qcow2`, `.ova`, `SHA256SUMS` com todos), as notas, e
    teste o `.qcow2` numa VM limpa se quiser. **Publish release** é só no GitHub, por você.
 5. **Limpar:** `git worktree remove /srv/build/release-src-v0.1.0`. O build de release
-   (`<out>-release`) pode ficar: a próxima versão sai incremental dele.
+   (`<out>-release`) pode ficar: a próxima versão sai incremental dele. O primeiro é frio: 44 min
+   com os downloads, numa máquina com outras sessões compilando (**medido**, 2026-10-29).
 
 ### O que o `os release` confere e faz
 
