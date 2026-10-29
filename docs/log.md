@@ -6679,3 +6679,37 @@ continuação indentadas).
   `docs/changes/G0.3e-screenshots/` (GUI real num D-Bus isolado com gnome-keyring descartável).
   Busca no chaveiro: ≤ 5,5 ms por troca de endereço/Login (**medido**, 100 `secret-tool lookup`
   com o processo incluído, 2026-10-29), fora de qualquer caminho quente.
+
+- 2026-10-29 — G0.29: Portão local mais rápido para várias sessões em paralelo (pedido do usuário, 2026-10-29), partes
+  A e D; a B (sccache) foi medida e ficou de fora:
+
+  - **A. `cargo xtask ci --affected`** (`xtask/src/affected.rs`): os arquivos mudados desde a
+    base com a `origin/main` (commit, índice, árvore e não rastreados; `--base <ref>` muda a base)
+    dão os crates alterados, por diretório, e os que dependem deles (dependências normais, de dev
+    e de build, via `cargo metadata`). fmt, clippy e test rodam com `-p` só nesses;
+    `bench-check` e `netns` só nos crates alterados que têm benches/testes `netns*` (os dos
+    dependentes ficam para o completo da fila: rodá-los a cada mudança no `engine` custava
+    ~3 min), `wasm` só nos crates WASM do conjunto, `layers` quando muda um `Cargo.toml` de
+    crate, `docs` quando muda `docs/`, `agents-sync` quando muda `AGENTS.md`/`CLAUDE.md`,
+    `ebpf-check` quando muda `crates/dataplane-ebpf*`. Arquivo de workspace
+    (`Cargo.toml`/`Cargo.lock` da raiz, `xtask/`, `.cargo/`, `.config/`, `build-support/`,
+    `clippy.toml`, `rustfmt.toml`, toolchain) ou arquivo em `crates/`/`apps/` fora de qualquer
+    pacote roda tudo. Arquivos lidos de fora do pacote (`fuzz/`, `docs/analytics.md`, o objeto
+    XDP) selecionam quem os lê. Vira o portão local do `CLAUDE.md` e do `AGENTS.md`; o completo
+    segue no lote da fila e na `main` (`scripts/land.sh` sem mudança).
+  - **D. 2 vagas de CI na máquina** (`xtask/src/slots.rs`): o `ci` que compila pega uma vaga
+    (`flock` em `$XDG_RUNTIME_DIR/corerouter-ci/slot-<i>.lock`, solta quando o processo morre;
+    o fd é close-on-exec, nenhum filho a herda) e espera com "esperando vaga (N rodando: pid … em
+    …)"; depois confere o disco do target e espera (até 20 min) enquanto houver menos de 30 GB
+    livres. `--no-wait` só avisa; `COREROUTER_CI_SLOTS` e `COREROUTER_CI_MIN_FREE_GB` mudam os
+    limites. No GitHub Actions não há vaga (um job por runner).
+  - **B. sccache: medido, sem ganho, fora.** A chave de cache do sccache 0.18 para Rust inclui a
+    pasta da worktree (o `cwd` que o cargo dá ao rustc) e o caminho do target: a mesma crate do
+    registro deu chaves diferentes em outra worktree e em outro `CARGO_TARGET_DIR` da mesma
+    worktree, e `SCCACHE_BASEDIRS` não mudou a chave. Uma segunda worktree com o cache quente
+    teve 0 acertos de Rust (845 erros; só 31 acertos de C/assembly) e a compilação fria ficou
+    ~14% mais lenta com o sccache. Fica como G0.29b.
+
+  Como testar: `cargo test -p xtask` (seleção do afetado com metadata falsa; o semáforo com dois
+  processos-filho segurando as vagas, a morte de um libera, a trava não passa para filhos);
+  `cargo xtask ci --affected` numa branch com uma mudança pequena.

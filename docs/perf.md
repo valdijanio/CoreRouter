@@ -2262,3 +2262,31 @@ para o QEMU (19 MiB/s). `os build` incremental com só o daemon mudado: 184 s co
   explícito só −2%. Imagem guardando só o `.gz`: squashfs 21,7 → 32,7 MiB, qcow2 41,4 → 52,5
   MiB, ISO 98,7 → 109,8 MiB (cru: +9,9 MiB; cru + `.gz`: +20,8 MiB). `.wasm` pela rede do QEMU
   em 0,21–0,29 s.
+
+### G0.29: portão local só do afetado (**medido**, 2026-10-29)
+
+Máquina de desenvolvimento (32 threads, 62 GB, NVMe), build dev com `CARGO_INCREMENTAL=0`,
+`cargo-nextest` 0.9.149, rustc 1.99.1, sem sccache. Outras sessões compilavam ao mesmo tempo
+(carga 5–35): números de uma rodada cada, com ruído de ±10%.
+
+`cargo xtask ci` completo frio (target vazio, `origin/main` bda8bba6): 396 s, target de 27 GB.
+Por passo: clippy 28 s, test 105 s (51 s rodando 3469 testes), bench-check 127 s (67 s de
+build), netns 98 s (31 s de build com outras features, o resto rodando), wasm 26 s,
+ebpf-check 8 s, fmt/docs/layers/agents-sync < 2 s.
+
+Sessão típica (target já quente, uma linha mudada em um arquivo), portão de antes × depois:
+
+| arquivo mudado | crates no conjunto | `ci` completo (antes) | `ci --affected` (depois) |
+|---|---|---|---|
+| `crates/ui/src/lib.rs` | 2 (ui, gui) | 306 s | 165 s |
+| `crates/proto-bgp/src/lib.rs` | 14 | 288 s | 102 s |
+| `crates/engine/src/lib.rs` | 10 | 293 s | 130 s |
+
+O `--affected` com `-p` compila as dependências com as features só do conjunto (o cargo
+estável não tem `feature-unification = "workspace"`): a primeira rodada numa target que só
+viu o completo recompila ~140 crates (foi 336 s no caso do proto-bgp); a partir da segunda,
+fica quente.
+
+sccache (B), `cargo clippy --workspace --all-targets` + `cargo test --workspace --no-run`
+frios: sem cache 81 s; com o sccache e o cache vazio 92 s; segunda worktree com o cache
+quente 94 s (0 acertos de Rust).
