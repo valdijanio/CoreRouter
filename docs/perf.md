@@ -2290,3 +2290,19 @@ fica quente.
 sccache (B), `cargo clippy --workspace --all-targets` + `cargo test --workspace --no-run`
 frios: sem cache 81 s; com o sccache e o cache vazio 92 s; segunda worktree com o cache
 quente 94 s (0 acertos de Rust).
+
+### G0.29 parte C: um executável de teste de integração por crate (**medido**, 2026-10-29)
+
+Mesma máquina (32 threads, NVMe), dev com `CARGO_INCREMENTAL=0`, `cargo test --workspace
+--no-run` num target vazio, `origin/main` c5ca9ebb × esta branch:
+
+| | antes | depois |
+|---|---|---|
+| executáveis de teste | 210 | 124 |
+| `target/debug` depois dos testes | 19 GB | 9,8 GB |
+| build frio dos testes | 52 s | 51 s |
+| religar depois de mudar `engine/src/lib.rs` | 31 s | 30 s |
+| `cargo nextest run --workspace` (build pronto) | 82 s | 79 s |
+
+O ganho é de disco (metade do target de cada sessão), não de tempo: com 32 threads os links
+já rodam em paralelo, e o executável único do engine (56 arquivos) compila num crate só.
