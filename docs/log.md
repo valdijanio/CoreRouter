@@ -6655,3 +6655,27 @@ continuação indentadas).
   `corerouter-daemon --config-dir /tmp/cr --web-files <dist> --web-factory-on` e
   `corerouter-cli --connect 127.0.0.1:7979 run ip.service.www-ssl.set '{"port":18443}'`, depois
   `https://127.0.0.1:18443/`.
+
+- 2026-10-29 — G0.3e: Senha salva sem esconderijo na tela de conexão (defeito de 2026-10-29: numa VM reinstalada com
+  `admin` sem senha, a GUI nativa mandava em silêncio a senha guardada no chaveiro para a VM antiga
+  quando o campo Password ficava vazio, e o login falhava com "Invalid user or password"). Agora a
+  GUI manda exatamente o que o campo tem: ao mudar Connect to ou Login, ela procura a senha salva
+  (`usuário@endereço` normalizado, serviço `corerouter`) e, se existir, a põe no campo (mascarada)
+  com o selo azul `saved password`, o ⓘ (`connect.saved_password`, pt/en) e "Forget"; campo apagado =
+  senha vazia, e o selo vira `saved password unused`. Login recusado com a senha salva diz "The saved
+  password for this router did not work…" com o botão "Forget saved password". "Trust and update"
+  num certificado trocado (G0.3d) traz a caixa "Also forget the saved password of admin", marcada
+  por padrão (reinstalação = admin novo), e conecta sem ela. Duplo clique num vizinho conecta só
+  depois de a senha salva estar no campo. O exemplo de Connect to virou `e.g. 192.168.88.1:8729` em
+  itálico (não o último endereço usado: isso pediria estado novo e, com a senha agora preenchida,
+  um Enter ao abrir entraria no último roteador sem escolha; a aba Saved já cumpre esse papel).
+  `--connect` segue o mesmo caminho do botão. Código: `crates/ui/src/connect.rs`
+  (`wants_saved_password`/`set_saved_password`, `ConnectAction::ForgetPassword`,
+  `Trust.forget_password`, `Credentials.saved`), `apps/corerouter-gui/src/native.rs` (trait
+  `Secrets`: chaveiro do sistema ou um mapa nos testes). Testes: 4 da tela (senha mostrada e campo
+  vazio, recusa com Forget, Trust and update, vizinho com duplo clique e exemplo) e 2 nativos com
+  servidor de controle de teste e cofre falso (o defeito reproduzido: senha velha recusada,
+  esquecida, senha vazia entra; Remember/forget por conta). Screenshots em
+  `docs/changes/G0.3e-screenshots/` (GUI real num D-Bus isolado com gnome-keyring descartável).
+  Busca no chaveiro: ≤ 5,5 ms por troca de endereço/Login (**medido**, 100 `secret-tool lookup`
+  com o processo incluído, 2026-10-29), fora de qualquer caminho quente.

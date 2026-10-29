@@ -48,6 +48,23 @@ trait Platform {
     fn trust(&mut self, address: &str, fingerprint: &str) -> Result<(), String>;
     /// The in-process virtual lab.
     fn lab(&mut self) -> CoreRouterUi;
+    /// The password saved in the secure store for `address` and `user`
+    /// (G0.3e: shown in the Password field, never used behind it).
+    fn saved_password(&mut self, _address: &str, _user: &str) -> Option<String> {
+        None
+    }
+    /// Delete the password saved for `address` and `user`.
+    fn forget_password(&mut self, _address: &str, _user: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Answer the screen's question about a saved password, if it has one.
+fn look_up_saved(screen: &mut ConnectScreen, platform: &mut dyn Platform) {
+    if let Some((address, user)) = screen.wants_saved_password() {
+        let password = platform.saved_password(&address, &user);
+        screen.set_saved_password(&address, &user, password);
+    }
 }
 
 /// What [`Platform::connect`] got to.
@@ -143,6 +160,7 @@ impl eframe::App for GuiApp {
                 ui.ctx().request_repaint_after(CONNECT_REPAINT);
                 let rows = platform.neighbors();
                 let action = screen.ui(ui, &rows);
+                look_up_saved(screen, platform.as_mut());
                 if let Some(saved) = screen.take_saved_change() {
                     platform.store_saved(&saved);
                 }
@@ -151,7 +169,22 @@ impl eframe::App for GuiApp {
                     None => None,
                     Some(ConnectAction::VirtualLab) => None,
                     Some(ConnectAction::Connect(c) | ConnectAction::Once(c)) => Some(c),
-                    Some(ConnectAction::Trust { creds, fingerprint }) => {
+                    Some(ConnectAction::ForgetPassword { address, user }) => {
+                        if let Err(e) = platform.forget_password(&address, &user) {
+                            screen.set_error(e);
+                        }
+                        None
+                    }
+                    Some(ConnectAction::Trust {
+                        creds,
+                        fingerprint,
+                        forget_password,
+                    }) => {
+                        if forget_password
+                            && let Err(e) = platform.forget_password(&creds.address, &creds.user)
+                        {
+                            log::warn!("saved password not forgotten: {e}");
+                        }
                         match platform.trust(&creds.address, &fingerprint) {
                             Ok(()) => Some(creds),
                             Err(e) => {

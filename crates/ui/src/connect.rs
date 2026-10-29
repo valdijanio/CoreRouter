@@ -24,10 +24,19 @@
 //! the new one, why it may have changed, and Cancel (the default: Enter and
 //! Esc cancel), "Connect once" (not remembered) and "Trust and connect" /
 //! "Trust and update" (written to known_hosts).
+//!
+//! G0.3e: no hidden password. A password saved in the secure store for the
+//! address and Login shown is put in the Password field (masked), with a
+//! "saved password" pill, its ⓘ and "Forget saved password"; the app looks
+//! it up when the pair changes ([`ConnectScreen::wants_saved_password`],
+//! [`ConnectScreen::set_saved_password`]). Clearing the field sends an empty
+//! password. A login refused with the saved password says so and offers to
+//! forget it; "Trust and update" on a changed certificate offers the same.
 
 use egui::{Key, RichText, TextEdit, Ui};
 use serde_json::{Value, json};
 
+use crate::chip;
 use crate::help::{self, HelpView};
 use crate::i18n::{Langs, tr_in};
 use crate::neighbors::uptime_text;
@@ -38,6 +47,8 @@ const NEIGHBORS: &str = "connect-neighbors";
 const SCOPE: &str = "connect";
 /// The explanation the certificate modal's ⓘ opens.
 pub const HELP_CERT: &str = "connect.certificate";
+/// The explanation of the "saved password" pill (G0.3e).
+pub const HELP_SAVED: &str = "connect.saved_password";
 
 /// A certificate waiting for the operator (G0.3d).
 #[derive(Debug, Clone)]
@@ -46,6 +57,17 @@ struct TrustAsk {
     fingerprint: String,
     /// Changed: the remembered fingerprint and when it was accepted.
     previous: Option<(String, String)>,
+    /// A password is saved for this router and Login: "Trust and update"
+    /// also forgets it while this is ticked (G0.3e).
+    forget: Option<bool>,
+}
+
+/// The secure store's answer for one address and Login (G0.3e).
+#[derive(Clone, PartialEq, Eq)]
+struct Stored {
+    address: String,
+    user: String,
+    password: Option<String>,
 }
 
 /// A SHA-256 fingerprint on two lines of 16 bytes, so the two can be
@@ -123,6 +145,9 @@ pub const BAD_LOGIN: &str = "Invalid user or password";
 pub const SET_PASSWORD_FIRST: &str = "Set the admin password first: this router version refuses \
      network logins until admin has one. Log in on its own machine (127.0.0.1, empty password) \
      and set it, or update the router.";
+/// The login was refused with the password saved for this router (G0.3e).
+pub const SAVED_FAILED: &str = "The saved password for this router did not work: forget it, or \
+     type the password (empty if admin has none, e.g. after a reinstall).";
 const TOO_MANY: &str = "Too many failed logins: wait a moment and try again";
 
 /// Why a connection failed, for the operator.
@@ -187,6 +212,20 @@ pub fn explain(error: &str) -> Failure {
     Failure::new(text, error.chars().take(MAX_ERROR).collect::<String>())
 }
 
+/// The detail of a failure worded again: its sentence, then its detail.
+fn join_detail(f: &Failure) -> String {
+    if f.detail.is_empty() {
+        f.text.clone()
+    } else {
+        format!("{}: {}", f.text, f.detail)
+    }
+}
+
+/// The grey example in an empty Connect to: an address of another router
+/// (TLS), in italics so it never reads as a value.
+const CONNECT_TO_HINT: &str = "e.g. 192.168.88.1:8729";
+const FORGET: &str = "Forget saved password";
+
 /// Longest error text kept from the router or the network (hostile input).
 const MAX_ERROR: usize = 1000;
 
@@ -216,6 +255,8 @@ pub struct Credentials {
     /// TLS: the certificate accepted for this connection only ("Connect
     /// once", G0.3d); `None` uses known_hosts.
     pub pin: Option<String>,
+    /// `password` is the one saved in the secure store, untouched (G0.3e).
+    pub saved: bool,
 }
 
 impl std::fmt::Debug for Credentials {
@@ -227,6 +268,7 @@ impl std::fmt::Debug for Credentials {
             .field("remember", &self.remember)
             .field("legacy", &self.legacy)
             .field("pin", &self.pin)
+            .field("saved", &self.saved)
             .finish_non_exhaustive()
     }
 }
@@ -280,10 +322,15 @@ pub enum ConnectAction {
     Trust {
         creds: Credentials,
         fingerprint: String,
+        /// Also forget the password saved for `creds.address` and
+        /// `creds.user` (a reinstalled router, G0.3e).
+        forget_password: bool,
     },
     /// Connect to this certificate this time, without remembering it
     /// (`creds.pin` holds it).
     Once(Credentials),
+    /// Delete the password saved for this address and Login (G0.3e).
+    ForgetPassword { address: String, user: String },
     /// Run the in-process virtual lab instead.
     VirtualLab,
 }
@@ -293,6 +340,8 @@ pub enum ConnectAction {
 struct Message {
     ok: bool,
     failure: Failure,
+    /// The saved password was refused: offer to forget it.
+    forget: bool,
 }
 
 impl Message {
@@ -300,6 +349,7 @@ impl Message {
         Self {
             ok: true,
             failure: Failure::new(text, String::new()),
+            forget: false,
         }
     }
 }
@@ -318,6 +368,14 @@ pub struct ConnectScreen {
     remember: bool,
     /// `None`: no secure store here (the checkbox is off, with the reason).
     keyring: Option<String>,
+    /// The (address, Login) last handed to the app to look up.
+    asked: Option<(String, String)>,
+    /// What the secure store holds for `asked`.
+    stored: Option<Stored>,
+    /// The credentials of the last connection tried, to word its failure.
+    last_try: Option<Credentials>,
+    /// Connect once the saved password of the new address is looked up.
+    pending_connect: bool,
     /// A certificate waiting for the operator's answer.
     trust: Option<TrustAsk>,
     /// The ⓘ's explanation in the certificate modal, while open.
@@ -347,6 +405,10 @@ impl ConnectScreen {
             password: String::new(),
             remember: false,
             keyring: None,
+            asked: None,
+            stored: None,
+            last_try: None,
+            pending_connect: false,
             trust: None,
             help: None,
             trust_focus: false,
@@ -375,7 +437,21 @@ impl ConnectScreen {
 
     /// Show why connecting failed (the detail under "Details").
     pub fn fail(&mut self, failure: Failure) {
-        self.message = Some(Message { ok: false, failure });
+        let saved = self.last_try.as_ref().is_some_and(|c| c.saved);
+        let message = if saved && failure.text == BAD_LOGIN {
+            Message {
+                ok: false,
+                failure: Failure::new(SAVED_FAILED, join_detail(&failure)),
+                forget: true,
+            }
+        } else {
+            Message {
+                ok: false,
+                failure,
+                forget: false,
+            }
+        };
+        self.message = Some(message);
     }
 
     /// Where "Remember password" keeps it (e.g. "the system keyring"), or
@@ -391,6 +467,102 @@ impl ConnectScreen {
         }
     }
 
+    /// The (address, Login) now on screen, once each time it changes, for
+    /// the app to look up in the secure store and answer with
+    /// [`Self::set_saved_password`]. `None` without a store.
+    pub fn wants_saved_password(&mut self) -> Option<(String, String)> {
+        self.keyring.as_ref()?;
+        let key = self.key();
+        if self.asked.as_ref() == Some(&key) {
+            return None;
+        }
+        self.asked = Some(key.clone());
+        (!key.0.is_empty() && !key.1.is_empty()).then_some(key)
+    }
+
+    /// The secure store's answer for `address` and `user`: a saved password
+    /// goes into the field (masked, with the "saved password" pill); a
+    /// field that held the previous router's saved password is cleared. A
+    /// password the operator typed stays. Stale answers are ignored.
+    pub fn set_saved_password(&mut self, address: &str, user: &str, password: Option<String>) {
+        if self.key() != (address.to_owned(), user.to_owned()) {
+            return;
+        }
+        let filled = self
+            .stored
+            .as_ref()
+            .and_then(|s| s.password.as_deref())
+            .is_some_and(|p| p == self.password);
+        if filled || self.password.is_empty() {
+            self.password = password.clone().unwrap_or_default();
+            if password.is_some() {
+                self.remember = self.keyring.is_some();
+            }
+        }
+        self.stored = Some(Stored {
+            address: address.to_owned(),
+            user: user.to_owned(),
+            password,
+        });
+    }
+
+    /// The saved password of the address and Login on screen, if any.
+    fn saved_password(&self) -> Option<&str> {
+        let s = self.stored.as_ref()?;
+        let (address, user) = self.key();
+        (s.address == address && s.user == user)
+            .then_some(s.password.as_deref())
+            .flatten()
+    }
+
+    /// The Password field holds the saved password, untouched.
+    fn holds_saved(&self) -> bool {
+        self.saved_password().is_some_and(|p| p == self.password)
+    }
+
+    fn key(&self) -> (String, String) {
+        (
+            self.connect_to.trim().to_owned(),
+            self.login.trim().to_owned(),
+        )
+    }
+
+    /// Forget the saved password of `address` and `user` on screen (the
+    /// app deletes it from the store): the field is emptied if it held it.
+    fn forget_saved(&mut self, address: &str, user: &str, action: &mut Option<ConnectAction>) {
+        if let Some(s) = self
+            .stored
+            .as_mut()
+            .filter(|s| s.address == address && s.user == user)
+        {
+            if s.password.as_deref() == Some(self.password.as_str()) {
+                self.password.clear();
+            }
+            s.password = None;
+        }
+        if self.last_try.as_ref().is_some_and(|c| c.saved) {
+            self.message = None;
+        }
+        *action = Some(ConnectAction::ForgetPassword {
+            address: address.to_owned(),
+            user: user.to_owned(),
+        });
+    }
+
+    /// Put `password` in the field (e.g. `$COREROUTER_PASSWORD` for
+    /// `--connect`): typed, not saved.
+    pub fn set_password(&mut self, password: String) {
+        self.password = password;
+    }
+
+    /// The credentials on screen, to connect right away (`--connect`), as
+    /// the Connect button would.
+    pub fn connect_now(&mut self) -> Credentials {
+        let c = self.credentials();
+        self.last_try = Some(c.clone());
+        c
+    }
+
     /// First TLS connection to `creds.address`: show `fingerprint` and
     /// wait for the operator (the answer comes as [`ConnectAction::Trust`]
     /// or [`ConnectAction::Once`]).
@@ -401,6 +573,7 @@ impl ConnectScreen {
             creds,
             fingerprint,
             previous: None,
+            forget: None,
         });
     }
 
@@ -416,10 +589,15 @@ impl ConnectScreen {
     ) {
         self.message = None;
         self.trust_focus = true;
+        let saved = self.stored.as_ref().is_some_and(|s| {
+            s.password.is_some() && s.address == creds.address.trim() && s.user == creds.user.trim()
+        });
         self.trust = Some(TrustAsk {
             creds,
             fingerprint,
             previous: Some((old, since)),
+            // A reinstalled router has a new admin: forget by default.
+            forget: saved.then_some(true),
         });
     }
 
@@ -456,6 +634,9 @@ impl ConnectScreen {
     /// Draw the whole screen into the root `Ui`; returns what to do.
     pub fn ui(&mut self, ui: &mut Ui, neighbors: &[NeighborRow]) -> Option<ConnectAction> {
         let mut action = None;
+        if std::mem::take(&mut self.pending_connect) {
+            self.connect(&mut action);
+        }
         egui::Panel::left("connect-form")
             .resizable(false)
             .exact_size(330.0)
@@ -469,6 +650,7 @@ impl ConnectScreen {
         ) = &action
         {
             self.message = Some(Message::ok(format!("connecting to {}…", c.address)));
+            self.last_try = Some(c.clone());
         }
         action
     }
@@ -490,6 +672,7 @@ impl ConnectScreen {
         let changed = ask.previous.is_some();
         let mut answer = None;
         let mut open_help = false;
+        let mut forget = ask.forget;
         let focus = std::mem::take(&mut self.trust_focus);
         egui::Modal::new(egui::Id::unique("corerouter-cert-modal")).show(ui.ctx(), |ui| {
             ui.set_width(560.0);
@@ -527,6 +710,11 @@ impl ConnectScreen {
                 ui.weak(t("Expected after a reinstall or a new certificate: compare the new fingerprint with the one the router prints at start-up (corerouter-daemon log, console). If you did not change anything, someone may be intercepting the connection: cancel."));
             } else {
                 ui.weak(t("First connection to this router. Compare the fingerprint with the one the router prints at start-up (corerouter-daemon log, console) before trusting it."));
+            }
+            if let Some(f) = forget.as_mut() {
+                ui.add_space(6.0);
+                ui.checkbox(f, format!("{} {}", t("Also forget the saved password of"), ask.creds.user.trim()))
+                    .on_hover_text(t("A reinstalled router has a new admin (without a password until one is set): the password saved for the old one would be refused. Applies to Trust and update."));
             }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -573,14 +761,35 @@ impl ConnectScreen {
             ));
         }
         let Some(answer) = answer else {
+            if let Some(open) = self.trust.as_mut() {
+                open.forget = forget;
+            }
             return;
         };
         self.trust = None;
         let TrustAsk {
-            creds, fingerprint, ..
+            mut creds,
+            fingerprint,
+            ..
         } = ask;
         match answer {
-            Decision::Trust => *action = Some(ConnectAction::Trust { creds, fingerprint }),
+            Decision::Trust => {
+                let forget_password = forget == Some(true);
+                if forget_password {
+                    let mut ignored = None;
+                    self.forget_saved(creds.address.trim(), creds.user.trim(), &mut ignored);
+                    // A password typed now still goes (and is remembered).
+                    if creds.saved {
+                        creds.password.clear();
+                        creds.saved = false;
+                    }
+                }
+                *action = Some(ConnectAction::Trust {
+                    creds,
+                    fingerprint,
+                    forget_password,
+                });
+            }
             Decision::Once => {
                 *action = Some(ConnectAction::Once(Credentials {
                     pin: Some(fingerprint),
@@ -599,12 +808,17 @@ impl ConnectScreen {
             remember: self.remember && self.keyring.is_some(),
             legacy: false,
             pin: None,
+            saved: self.holds_saved(),
         }
     }
 
     fn connect(&mut self, action: &mut Option<ConnectAction>) {
         if self.connect_to.trim().is_empty() {
             self.set_error("Type an address in Connect to, or pick a neighbor or a saved router");
+        } else if self.keyring.is_some() && self.asked != Some(self.key()) {
+            // A neighbor or saved router just picked: its saved password
+            // is looked up first, so the field shows what is sent.
+            self.pending_connect = true;
         } else {
             *action = Some(ConnectAction::Connect(self.credentials()));
         }
@@ -627,9 +841,10 @@ impl ConnectScreen {
             .show(ui, |ui| {
                 let w = 200.0;
                 ui.label("Connect to:");
+                // An example, never mistaken for a value (G0.3e).
                 let r = ui.add(
                     TextEdit::singleline(&mut self.connect_to)
-                        .hint_text("127.0.0.1:7979")
+                        .hint_text(RichText::new(CONNECT_TO_HINT).italics())
                         .desired_width(w),
                 );
                 enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
@@ -652,6 +867,11 @@ impl ConnectScreen {
                 );
                 enter |= r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                 ui.end_row();
+                if self.saved_password().is_some() {
+                    ui.label("");
+                    self.saved_row(ui, action);
+                    ui.end_row();
+                }
                 ui.label("");
                 match &self.keyring {
                     Some(store) => {
@@ -704,11 +924,16 @@ impl ConnectScreen {
     /// The message under the buttons: the sentence, then "Details" and
     /// "Connect anyway" when they apply.
     fn message_ui(&mut self, ui: &mut Ui, action: &mut Option<ConnectAction>) {
-        let Some(Message { ok, failure }) = &self.message else {
+        let Some(Message {
+            ok,
+            failure,
+            forget,
+        }) = self.message.clone()
+        else {
             return;
         };
         ui.add_space(8.0);
-        let color = if *ok {
+        let color = if ok {
             ui.visuals().text_color()
         } else {
             ui.visuals().error_fg_color
@@ -721,6 +946,22 @@ impl ConnectScreen {
                 .show(ui, |ui| {
                     ui.weak(failure.detail.as_str());
                 });
+        }
+        if forget
+            && ui
+                .button(tr_in(SCOPE, Langs::default().labels, FORGET))
+                .clicked()
+        {
+            let (address, user) = self
+                .last_try
+                .as_ref()
+                .map(|c| (c.address.trim().to_owned(), c.user.trim().to_owned()))
+                .unwrap_or_else(|| self.key());
+            self.forget_saved(&address, &user, action);
+            self.message = Some(Message::ok(format!(
+                "saved password of {user} at {address} forgotten"
+            )));
+            return;
         }
         if failure.offer_anyway
             && ui
@@ -736,6 +977,42 @@ impl ConnectScreen {
                 ..self.credentials()
             }));
         }
+    }
+
+    /// Under Password while a password is saved for this address and
+    /// Login: the pill (whether the field holds it), its ⓘ and Forget.
+    fn saved_row(&mut self, ui: &mut Ui, action: &mut Option<ConnectAction>) {
+        let l = Langs::default().labels;
+        let t = |text: &'static str| tr_in(SCOPE, l, text);
+        let in_field = self.holds_saved();
+        ui.horizontal(|ui| {
+            let v = ui.visuals();
+            let (text, tone, tip) = if in_field {
+                (
+                    t("saved password"),
+                    chip::BLUE.tone(v),
+                    t("The Password field holds the password saved for this router and Login. Clear it to connect with an empty password."),
+                )
+            } else {
+                (
+                    t("saved password unused"),
+                    chip::neutral_tone(v),
+                    t("A password is saved for this router and Login, but Connect sends what the field holds now (empty: no password)."),
+                )
+            };
+            chip::chip(ui, text, tone).on_hover_text(tip);
+            if help::info_button(ui, egui::Id::unique("connect-saved-info"), t("Saved password")).clicked() {
+                self.help = Some(HelpView::new(HELP_SAVED, t("Saved password")));
+            }
+            if ui
+                .small_button(t("Forget"))
+                .on_hover_text(t("Forget saved password: delete it from the secure store of this computer; the router is not touched."))
+                .clicked()
+            {
+                let (address, user) = self.key();
+                self.forget_saved(&address, &user, action);
+            }
+        });
     }
 
     fn save_current(&mut self) {
@@ -1009,7 +1286,8 @@ mod tests {
             a,
             Some(ConnectAction::Trust {
                 creds: c,
-                fingerprint: "SHA256:AA:BB".into()
+                fingerprint: "SHA256:AA:BB".into(),
+                forget_password: false,
             })
         );
         s.connected();
@@ -1175,7 +1453,8 @@ mod tests {
             a,
             Some(ConnectAction::Trust {
                 creds: creds.clone(),
-                fingerprint: "SHA256:NE:WW".into()
+                fingerprint: "SHA256:NE:WW".into(),
+                forget_password: false,
             })
         );
         // The first use offers the same three answers.
@@ -1244,7 +1523,7 @@ mod tests {
         );
         assert_eq!(a, None);
         assert!(
-            matches!(&s.message, Some(Message { ok: false, failure }) if failure.text.contains("no CoreRouter management port"))
+            matches!(&s.message, Some(Message { ok: false, failure, .. }) if failure.text.contains("no CoreRouter management port"))
         );
     }
 
@@ -1273,7 +1552,7 @@ mod tests {
         assert_eq!(action, None);
         assert_eq!(s.connect_to, "10.0.0.3:7979");
         assert!(
-            matches!(&s.message, Some(Message { ok: false, failure }) if failure.text.contains("no TLS management port"))
+            matches!(&s.message, Some(Message { ok: false, failure, .. }) if failure.text.contains("no TLS management port"))
         );
         // The operator may still try it by hand.
         let (_, texts) = frame(&ctx, &mut s, &rows, Vec::new(), &mut t);
@@ -1472,5 +1751,294 @@ mod tests {
             &mut t,
         );
         assert_eq!(a, Some(ConnectAction::VirtualLab));
+    }
+
+    /// The app's side of G0.3e: answer the screen from a fake store.
+    fn answer(s: &mut ConnectScreen, store: &[(&str, &str, &str)]) {
+        if let Some((address, user)) = s.wants_saved_password() {
+            let pw = store
+                .iter()
+                .find(|(a, u, _)| *a == address && *u == user)
+                .map(|(_, _, p)| (*p).to_owned());
+            s.set_saved_password(&address, &user, pw);
+        }
+    }
+
+    fn has(texts: &[(String, egui::Rect)], needle: &str) -> bool {
+        texts.iter().any(|(x, _)| x == needle)
+    }
+
+    const STORE: &[(&str, &str, &str)] = &[("10.0.0.1:8729", "admin", "old-vm-pw")];
+
+    /// G0.3e: the saved password is shown (masked, with its pill), never
+    /// used behind the field; clearing the field sends an empty password.
+    #[test]
+    fn a_saved_password_is_shown_and_an_empty_field_sends_none() {
+        let ctx = egui::Context::default();
+        let mut s = ConnectScreen::new(Vec::new());
+        let mut t = 0.0;
+        // No store: nothing asked.
+        s.connect_to = "10.0.0.1:8729".into();
+        assert_eq!(s.wants_saved_password(), None);
+        s.set_keyring(Ok("the system keyring".into()));
+        answer(&mut s, STORE);
+        assert_eq!(s.password, "old-vm-pw");
+        assert!(s.remember, "a saved password is a remembered one");
+        // Asked once per pair.
+        assert_eq!(s.wants_saved_password(), None);
+        let c = s.credentials();
+        assert!(c.saved && c.password == "old-vm-pw");
+        assert!(!format!("{c:?}").contains("old-vm-pw"));
+        frame(&ctx, &mut s, &[], Vec::new(), &mut t);
+        let texts = frame(&ctx, &mut s, &[], Vec::new(), &mut t).1;
+        assert!(has(&texts, "saved password"), "{texts:?}");
+        assert!(has(&texts, "Forget"));
+        assert!(
+            !texts.iter().any(|(x, _)| x.contains("old-vm-pw")),
+            "masked"
+        );
+        // Cleared: an empty password, said so by the pill.
+        s.password.clear();
+        let c = s.credentials();
+        assert!(!c.saved && c.password.is_empty());
+        let texts = frame(&ctx, &mut s, &[], Vec::new(), &mut t).1;
+        assert!(has(&texts, "saved password unused"), "{texts:?}");
+        // Another router: no pill, an empty field stays empty.
+        s.connect_to = "10.0.0.2:8729".into();
+        answer(&mut s, STORE);
+        assert!(s.password.is_empty());
+        let texts = frame(&ctx, &mut s, &[], Vec::new(), &mut t).1;
+        assert!(!has(&texts, "saved password") && !has(&texts, "saved password unused"));
+        // Back: filled again; then to another router the filled one goes.
+        s.connect_to = "10.0.0.1:8729".into();
+        answer(&mut s, STORE);
+        assert_eq!(s.password, "old-vm-pw");
+        s.connect_to = "10.0.0.1:87".into();
+        answer(&mut s, STORE);
+        assert!(s.password.is_empty(), "never sent to another router");
+        // A typed password is never replaced.
+        s.password = "typed".into();
+        s.connect_to = "10.0.0.1:8729".into();
+        answer(&mut s, STORE);
+        assert_eq!(s.password, "typed");
+        assert!(!s.credentials().saved);
+        // A late answer for another pair is ignored.
+        s.set_saved_password("10.0.0.9:8729", "admin", Some("x".into()));
+        assert_eq!(s.password, "typed");
+        // Login is part of the pair.
+        s.password.clear();
+        s.login = "op".into();
+        answer(&mut s, STORE);
+        assert!(s.password.is_empty());
+    }
+
+    /// G0.3e: the saved password refused says so and offers Forget; the
+    /// pill's Forget empties the field.
+    #[test]
+    fn a_refused_saved_password_offers_to_forget_it() {
+        let ctx = egui::Context::default();
+        let mut s = ConnectScreen::new(Vec::new());
+        let mut t = 0.0;
+        s.set_keyring(Ok("the system keyring".into()));
+        s.connect_to = "10.0.0.1:8729".into();
+        answer(&mut s, STORE);
+        let texts = frame(&ctx, &mut s, &[], Vec::new(), &mut t).1;
+        let mut a = frame(
+            &ctx,
+            &mut s,
+            &[],
+            click_events(at(&texts, "Connect")),
+            &mut t,
+        )
+        .0;
+        a = a.or(frame(&ctx, &mut s, &[], Vec::new(), &mut t).0);
+        let Some(ConnectAction::Connect(c)) = a else {
+            panic!("{a:?}")
+        };
+        assert!(c.saved);
+        s.fail(Failure::new(BAD_LOGIN, "invalid user or password"));
+        assert_eq!(
+            s.message.as_ref().map(|m| m.failure.text.as_str()),
+            Some(SAVED_FAILED)
+        );
+        frame(&ctx, &mut s, &[], Vec::new(), &mut t);
+        let texts = frame(&ctx, &mut s, &[], Vec::new(), &mut t).1;
+        assert!(has(&texts, SAVED_FAILED), "{texts:?}");
+        // Two Forget buttons (the pill's and the message's): the message's.
+        let mut a = frame(
+            &ctx,
+            &mut s,
+            &[],
+            click_events(at(&texts, "Forget saved password")),
+            &mut t,
+        )
+        .0;
+        a = a.or(frame(&ctx, &mut s, &[], Vec::new(), &mut t).0);
+        assert_eq!(
+            a,
+            Some(ConnectAction::ForgetPassword {
+                address: "10.0.0.1:8729".into(),
+                user: "admin".into()
+            })
+        );
+        assert!(s.password.is_empty());
+        let texts = frame(&ctx, &mut s, &[], Vec::new(), &mut t).1;
+        assert!(!has(&texts, "saved password") && !has(&texts, "Forget"));
+        // A typed password refused is the usual sentence.
+        s.password = "typed".into();
+        let c = s.connect_now();
+        assert!(!c.saved);
+        s.fail(Failure::new(BAD_LOGIN, ""));
+        assert_eq!(
+            s.message.as_ref().map(|m| m.failure.text.as_str()),
+            Some(BAD_LOGIN)
+        );
+        // The pill's Forget.
+        s.password.clear();
+        s.asked = None;
+        answer(&mut s, STORE);
+        s.message = None;
+        let texts = frame(&ctx, &mut s, &[], Vec::new(), &mut t).1;
+        let a = frame(
+            &ctx,
+            &mut s,
+            &[],
+            click_events(at(&texts, "Forget")),
+            &mut t,
+        )
+        .0;
+        assert!(
+            matches!(a, Some(ConnectAction::ForgetPassword { .. })),
+            "{a:?}"
+        );
+        assert!(s.password.is_empty());
+        for langs in [
+            Langs::default(),
+            Langs {
+                help: crate::i18n::Lang::En,
+                ..Langs::default()
+            },
+        ] {
+            assert!(crate::i18n::explain(langs, HELP_SAVED).is_some());
+        }
+    }
+
+    /// G0.3e: Trust and update on a changed certificate also forgets the
+    /// saved password (ticked by default) and connects without it.
+    #[test]
+    fn trust_and_update_offers_to_forget_the_saved_password() {
+        let ctx = egui::Context::default();
+        let mut s = ConnectScreen::new(Vec::new());
+        let mut t = 0.0;
+        s.set_keyring(Ok("the system keyring".into()));
+        s.connect_to = "10.0.0.1:8729".into();
+        answer(&mut s, STORE);
+        let creds = s.connect_now();
+        let ask = |s: &mut ConnectScreen, t: &mut f64| {
+            s.ask_changed(
+                creds.clone(),
+                "SHA256:OL:DD".into(),
+                "2026-10-01".into(),
+                "SHA256:NE:WW".into(),
+            );
+            frame(&ctx, s, &[], Vec::new(), t);
+            frame(&ctx, s, &[], Vec::new(), t).1
+        };
+        let texts = ask(&mut s, &mut t);
+        assert!(
+            has(&texts, "Also forget the saved password of admin"),
+            "{texts:?}"
+        );
+        let mut a = frame(
+            &ctx,
+            &mut s,
+            &[],
+            click_events(at(&texts, "Trust and update")),
+            &mut t,
+        )
+        .0;
+        a = a.or(frame(&ctx, &mut s, &[], Vec::new(), &mut t).0);
+        let Some(ConnectAction::Trust {
+            creds: c,
+            forget_password,
+            ..
+        }) = a
+        else {
+            panic!("{a:?}")
+        };
+        assert!(forget_password);
+        assert!(c.password.is_empty() && !c.saved);
+        assert!(s.password.is_empty());
+        // Unticked: the saved password stays and goes with the login.
+        s.asked = None;
+        answer(&mut s, STORE);
+        let texts = ask(&mut s, &mut t);
+        frame(
+            &ctx,
+            &mut s,
+            &[],
+            click_events(at(&texts, "Also forget the saved password of admin")),
+            &mut t,
+        );
+        let mut a = frame(
+            &ctx,
+            &mut s,
+            &[],
+            click_events(at(&texts, "Trust and update")),
+            &mut t,
+        )
+        .0;
+        a = a.or(frame(&ctx, &mut s, &[], Vec::new(), &mut t).0);
+        let Some(ConnectAction::Trust {
+            creds: c,
+            forget_password,
+            ..
+        }) = a
+        else {
+            panic!("{a:?}")
+        };
+        assert!(!forget_password);
+        assert_eq!(c.password, "old-vm-pw");
+        // Nothing saved: no question.
+        s.ask_trust(
+            Credentials {
+                address: "10.0.0.5:8729".into(),
+                ..creds.clone()
+            },
+            "SHA256:X".into(),
+        );
+        frame(&ctx, &mut s, &[], Vec::new(), &mut t);
+        let texts = frame(&ctx, &mut s, &[], Vec::new(), &mut t).1;
+        assert!(!texts.iter().any(|(x, _)| x.starts_with("Also forget")));
+    }
+
+    /// G0.3e: a neighbor picked with a double click connects only after its
+    /// saved password is in the field; Connect to's example reads as one.
+    #[test]
+    fn a_picked_router_connects_after_its_saved_password_is_shown() {
+        let ctx = egui::Context::default();
+        let mut s = ConnectScreen::new(Vec::new());
+        let mut t = 0.0;
+        let texts = frame(&ctx, &mut s, &[], Vec::new(), &mut t).1;
+        assert!(has(&texts, CONNECT_TO_HINT), "{texts:?}");
+        s.set_keyring(Ok("the system keyring".into()));
+        let rows = [neighbor("a", Some("10.0.0.1:8729"))];
+        let texts = frame(&ctx, &mut s, &rows, Vec::new(), &mut t).1;
+        let row = at(&texts, "r-a");
+        let mut both = click_events(row);
+        both.extend(click_events(row));
+        let mut action = frame(&ctx, &mut s, &rows, both, &mut t).0;
+        assert_eq!(action, None, "not before the lookup");
+        answer(&mut s, STORE);
+        for _ in 0..2 {
+            action = action.or(frame(&ctx, &mut s, &rows, Vec::new(), &mut t).0);
+        }
+        let Some(ConnectAction::Connect(c)) = action else {
+            panic!("{action:?}")
+        };
+        assert_eq!(
+            (c.address.as_str(), c.password.as_str(), c.saved),
+            ("10.0.0.1:8729", "old-vm-pw", true)
+        );
     }
 }
