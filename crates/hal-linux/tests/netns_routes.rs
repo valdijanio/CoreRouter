@@ -218,3 +218,33 @@ fn route_get_answers_like_ip_route_get() {
         RouteKind::Unreachable
     );
 }
+
+#[test]
+fn a_route_of_someone_else_is_refused_not_replaced() {
+    if !in_netns() {
+        return;
+    }
+    let mut hal = LinuxHal::new();
+    let base = base("f1p", 82);
+    hal.apply(&Config::default(), &base).unwrap();
+    // Added by hand: same prefix, metric and table as ours.
+    ip(&[
+        "route",
+        "add",
+        "100.82.0.0/24",
+        "via",
+        "10.82.0.1",
+        "metric",
+        "1",
+    ]);
+    let before = ip(&["-4", "route", "show", "100.82.0.0/24"]);
+    let mut ours = base.clone();
+    route(&mut ours, "100.82.1.0/24", "10.82.0.1");
+    route(&mut ours, "100.82.0.0/24", "10.82.1.1");
+    let err = hal.apply(&base, &ours).unwrap_err().to_string();
+    assert!(err.contains("refusing to replace"), "{err}");
+    // Untouched, and the route added before it in the same commit is
+    // rolled back (G0.31: the add is tried before the table is read).
+    assert_eq!(ip(&["-4", "route", "show", "100.82.0.0/24"]), before);
+    assert_eq!(ip(&["-4", "route", "show", "100.82.1.0/24"]), "");
+}
