@@ -20,6 +20,7 @@
 use std::collections::BTreeMap;
 
 use corerouter_model::ntp::{NtpState, NtpStatus};
+use corerouter_model::routing_state::{BgpSession, RoutingStatus};
 use corerouter_model::service::{ServiceState, ServiceTable};
 use serde::Serialize;
 
@@ -162,8 +163,37 @@ pub struct Inputs {
     /// dm-verity device of its signed root hash (G1.6qb). `None`: not on
     /// the image (lab, browser, the package service has not reported).
     pub root_verity: Option<(String, bool)>,
+    /// G3.9fj: BGP sessions where we restart gracefully toward a neighbor
+    /// that announces graceful restart (RFC 4724), and those of them
+    /// established for [`EOR_GRACE_SECS`] that never sent End-of-RIB.
+    /// `None`: no routing daemon reported.
+    pub bgp_no_eor: Option<(usize, Vec<String>)>,
     /// Whether any reading exists at all.
     pub readings: bool,
+}
+
+/// How long an established session may go without End-of-RIB before the
+/// health check names it: a full table (1 M routes) takes minutes to send.
+pub const EOR_GRACE_SECS: u64 = 300;
+
+/// Sessions with graceful restart on both sides (we restart, the neighbor
+/// announces it), established: the ones whose End-of-RIB the best path
+/// waits for after a `bgpd` start (RFC 4724 §4.1, FRR `select-defer-time`).
+fn bgp_gr_sessions(st: &RoutingStatus) -> impl Iterator<Item = &BgpSession> {
+    st.bgp_sessions.iter().filter(|b| {
+        b.established
+            && b.gr_local.as_deref() == Some("restart")
+            && matches!(b.gr_remote.as_deref(), Some("restart" | "helper"))
+    })
+}
+
+/// G3.9fj: of [`bgp_gr_sessions`], the ones established for
+/// [`EOR_GRACE_SECS`] that never sent End-of-RIB (§2; the receiving
+/// speaker MUST send it after its initial update, §4.2). RouterOS 7.25 is
+/// one (**medido**, G3.9ff).
+pub(crate) fn bgp_without_eor(st: &RoutingStatus) -> impl Iterator<Item = &BgpSession> {
+    bgp_gr_sessions(st)
+        .filter(|b| b.end_of_rib_received.is_empty() && b.uptime_secs.is_some_and(|u| u >= EOR_GRACE_SECS))
 }
 
 fn level<T: PartialOrd>(v: T, warn: T, err: T, higher_is_worse: bool) -> Severity {
@@ -471,6 +501,47 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
             });
         }
     }
+
+    // BGP neighbors that never send End-of-RIB (G3.9fj): with graceful
+    // restart on, their routes wait the instance's Defer Time after every
+    // bgpd start, and the session window is the only other place it shows.
+    match &i.bgp_no_eor {
+        None => out.push(Check {
+            key: "bgp.end-of-rib",
+            name: "BGP End-of-RIB",
+            severity: Severity::Unknown,
+            value: None,
+            reason: "nenhum daemon de roteamento informou as sessões".into(),
+            action: None,
+        }),
+        Some((n, quiet)) if quiet.is_empty() => out.push(Check {
+            key: "bgp.end-of-rib",
+            name: "BGP End-of-RIB",
+            severity: Severity::Ok,
+            value: None,
+            reason: match n {
+                0 => "nenhuma sessão BGP com graceful restart dos dois lados".into(),
+                n => format!("{n} sessão(ões) com graceful restart; todos os vizinhos mandaram End-of-RIB"),
+            },
+            action: None,
+        }),
+        Some((n, quiet)) => {
+            let shown: Vec<&str> = quiet.iter().take(3).map(String::as_str).collect();
+            let more = quiet.len().saturating_sub(shown.len());
+            let names = if more > 0 { format!("{} e mais {more}", shown.join(", ")) } else { shown.join(", ") };
+            out.push(Check {
+                key: "bgp.end-of-rib",
+                name: "BGP End-of-RIB",
+                severity: Severity::Warning,
+                value: Some(format!("{} de {n}", quiet.len())),
+                reason: format!(
+                    "vizinho(s) BGP sem End-of-RIB depois de {} min estabelecido(s): {names}; depois de um reinício do bgpd as rotas dele(s) esperam o Defer Time inteiro (RFC 4724 §4.1)",
+                    EOR_GRACE_SECS / 60
+                ),
+                action: Some("O RouterOS 7.25 anuncia graceful restart e não manda End-of-RIB (nem guarda as nossas rotas). Mantenha o Defer Time curto (Routing › BGP › Instances, padrão 10 s) ou desligue o graceful restart dessa conexão (graceful_restart=no).".into()),
+            });
+        }
+    }
     out
 }
 
@@ -608,6 +679,12 @@ impl Session {
             .filter(|t| t.supervised)
             .map(|t| t.rows.iter().map(|r| (r.name.clone(), r.state)).collect());
         i.no_password = self.admins_without_password();
+        i.bgp_no_eor = self.routing_status().map(|st| {
+            let quiet = bgp_without_eor(st)
+                .map(|b| b.connection.clone().unwrap_or_else(|| b.remote_address.clone()))
+                .collect();
+            (bgp_gr_sessions(st).count(), quiet)
+        });
         i.root_verity = self
             .ext::<crate::package::Packages>()
             .and_then(|p| p.status.as_ref())
@@ -690,6 +767,7 @@ mod tests {
             ecmp: Some((0, 0, None)),
             no_password: Vec::new(),
             root_verity: Some(("a".into(), true)),
+            bgp_no_eor: Some((1, Vec::new())),
         }
     }
 
@@ -717,7 +795,7 @@ mod tests {
     #[test]
     fn healthy_is_all_ok() {
         let checks = evaluate(&healthy());
-        assert_eq!(checks.len(), 16);
+        assert_eq!(checks.len(), 17);
         for c in &checks {
             assert_eq!(c.severity, Severity::Ok, "{c:?}");
             assert!(c.action.is_none());
@@ -729,6 +807,9 @@ mod tests {
     fn every_rule_by_table() {
         let cases: &[Case] = &[
             ("cpu 85", |i| i.cpu_avg = Some((85.0, 60)), "cpu", Severity::Warning),
+            ("bgp neighbor without End-of-RIB", |i| i.bgp_no_eor = Some((2, vec!["chr".into()])), "bgp.end-of-rib", Severity::Warning),
+            ("bgp without graceful restart", |i| i.bgp_no_eor = Some((0, Vec::new())), "bgp.end-of-rib", Severity::Ok),
+            ("no routing daemon", |i| i.bgp_no_eor = None, "bgp.end-of-rib", Severity::Unknown),
             ("rmem_max caps the RADIUS socket", |i| i.sockbuf = Some(vec![("radius".into(), 212_992, 4 << 20)]), "sockbuf", Severity::Warning),
             ("no burst socket open", |i| i.sockbuf = None, "sockbuf", Severity::Unknown),
             ("cpu 97", |i| i.cpu_avg = Some((97.0, 60)), "cpu", Severity::Error),
@@ -808,6 +889,43 @@ mod tests {
         assert_eq!(warn(&mut s), Some(Severity::Warning));
         s.execute("user.set", &serde_json::json!({"name": "admin", "password": "a-real-password"})).unwrap();
         assert_eq!(warn(&mut s), Some(Severity::Ok));
+    }
+
+    /// G3.9fj: the RouterOS 7.25 case, a graceful-restart neighbor that
+    /// never sends End-of-RIB, named once established for the grace time.
+    #[test]
+    fn bgp_neighbor_without_end_of_rib_warns() {
+        let mut s = Session::virtual_lab();
+        let at = |s: &mut Session| evaluate(&s.health_inputs()).into_iter().find(|c| c.key == "bgp.end-of-rib").unwrap();
+        assert_eq!(at(&mut s).severity, Severity::Unknown);
+        let one = |conn: &str, uptime: u64, eor: &[&str], remote: Option<&str>| BgpSession {
+            instance: "default".into(),
+            remote_address: "192.0.2.2".into(),
+            state: "established".into(),
+            established: true,
+            uptime_secs: Some(uptime),
+            connection: Some(conn.into()),
+            gr_local: Some("restart".into()),
+            gr_remote: remote.map(Into::into),
+            end_of_rib_received: eor.iter().map(|f| (*f).to_owned()).collect(),
+            ..BgpSession::default()
+        };
+        let status = |sessions| RoutingStatus {
+            backend: "frr 10.7.1".into(),
+            bgp_sessions: sessions,
+            ..RoutingStatus::default()
+        };
+        // Just up: the initial update may still be running.
+        s.set_routing_status(status(vec![one("chr", 60, &[], Some("helper")), one("cr2", 900, &["ipv4"], Some("restart"))]));
+        assert_eq!(at(&mut s).severity, Severity::Ok);
+        // A neighbor without graceful restart is not waited for.
+        s.set_routing_status(status(vec![one("plain", 900, &[], None)]));
+        assert_eq!(at(&mut s).severity, Severity::Ok);
+        s.set_routing_status(status(vec![one("chr", 900, &[], Some("helper")), one("cr2", 900, &["ipv4"], Some("restart"))]));
+        let c = at(&mut s);
+        assert_eq!((c.severity, c.value.as_deref()), (Severity::Warning, Some("1 de 2")), "{c:?}");
+        assert!(c.reason.contains("chr") && !c.reason.contains("cr2"), "{}", c.reason);
+        assert!(c.action.is_some_and(|a| a.contains("Defer Time")));
     }
 
     #[test]

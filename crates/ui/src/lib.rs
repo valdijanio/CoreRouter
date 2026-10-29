@@ -102,9 +102,6 @@ struct Cache {
 /// Text fields of the forms (UI-local state only).
 #[derive(Default)]
 struct Forms {
-    bgp_name: String,
-    bgp_asn: String,
-    bgp_router_id: String,
     bgp_frr: String,
     identity: String,
     discovery: neighbors::DiscoveryForm,
@@ -200,7 +197,6 @@ pub struct Export {
 /// What to do when an action's reply arrives.
 pub(crate) enum Then {
     Nothing,
-    ShowFrr,
     Dialog {
         id: u64,
         effect: interfaces::Effect,
@@ -317,10 +313,7 @@ impl CoreRouterUi {
             open,
             log: Vec::new(),
             cache: Cache::default(),
-            forms: Forms {
-                bgp_name: "default".into(),
-                ..Forms::default()
-            },
+            forms: Forms::default(),
             tables: Tables::default(),
             dialogs: Vec::new(),
             nic: BTreeMap::new(),
@@ -591,11 +584,6 @@ impl CoreRouterUi {
     fn then(&mut self, then: Then, result: &Result<Value, String>) {
         match then {
             Then::Nothing => {}
-            Then::ShowFrr => {
-                if let Ok(r) = result {
-                    self.forms.bgp_frr = r.get("frr").map(value_text).unwrap_or_default();
-                }
-            }
             Then::Dialog { id, effect } => self.dialog_reply(id, effect, result),
             Then::Route { id, effect } => self.route_dialog_reply(id, effect, result),
             Then::Vrf { id, effect } => self.vrf_dialog_reply(id, effect, result),
