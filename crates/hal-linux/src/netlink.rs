@@ -22,7 +22,7 @@ use rtnetlink::packet_route::address::{
 };
 use rtnetlink::packet_route::link::{
     BondLacpRate, BondMode as KBondMode, BondXmitHashPolicy, InfoBond, InfoData, InfoKind,
-    InfoVlan, InfoVrf, LinkAttribute, LinkFlags, LinkInfo, LinkMessage, State,
+    InfoVlan, InfoVrf, LinkAttribute, LinkFlags, LinkInfo, LinkMessage, State, VlanProtocol,
 };
 use rtnetlink::packet_route::route::{
     RouteAddress, RouteAttribute, RouteMessage, RouteNextHop, RouteProtocol, RouteScope,
@@ -579,6 +579,8 @@ struct Link {
     lower: Option<u32>,
     kind: Option<InfoKind>,
     vlan_id: Option<u16>,
+    /// TPID 0x88a8 (802.1ad); absent or 0x8100 is plain 802.1Q.
+    vlan_service_tag: bool,
     vrf_table: Option<u32>,
     bond_mode: Option<KBondMode>,
 }
@@ -601,8 +603,12 @@ impl Link {
                             LinkInfo::Kind(k) => l.kind = Some(k.clone()),
                             LinkInfo::Data(InfoData::Vlan(v)) => {
                                 for x in v {
-                                    if let InfoVlan::Id(id) = x {
-                                        l.vlan_id = Some(*id);
+                                    match x {
+                                        InfoVlan::Id(id) => l.vlan_id = Some(*id),
+                                        InfoVlan::Protocol(p) => {
+                                            l.vlan_service_tag = *p == VlanProtocol::Ieee8021Ad;
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
@@ -645,7 +651,11 @@ impl Link {
     fn matches(&self, spec: &LinkSpec) -> bool {
         self.is_kind(spec)
             && match spec {
-                LinkSpec::Vlan { vlan_id, .. } => self.vlan_id == Some(*vlan_id),
+                LinkSpec::Vlan {
+                    vlan_id,
+                    service_tag,
+                    ..
+                } => self.vlan_id == Some(*vlan_id) && self.vlan_service_tag == *service_tag,
                 LinkSpec::Vrf { table } => self.vrf_table == Some(*table),
                 LinkSpec::Bond { mode, .. } => self.bond_mode == Some(kernel_bond_mode(*mode)),
                 LinkSpec::Bridge | LinkSpec::Dummy => true,
@@ -865,7 +875,21 @@ impl Kernel {
         }
         let name = link.as_str();
         let msg = match (spec, parent) {
-            (LinkSpec::Vlan { vlan_id, .. }, Some(p)) => LinkVlan::new(name, p, *vlan_id).build(),
+            (
+                LinkSpec::Vlan {
+                    vlan_id,
+                    service_tag,
+                    ..
+                },
+                Some(p),
+            ) => {
+                let b = LinkVlan::new(name, p, *vlan_id);
+                if *service_tag {
+                    b.protocol(VlanProtocol::Ieee8021Ad).build()
+                } else {
+                    b.build()
+                }
+            }
             (LinkSpec::Vlan { parent, .. }, None) => {
                 return Err(format!("parent '{parent}' of VLAN not found"));
             }
