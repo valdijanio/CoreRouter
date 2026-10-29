@@ -2,8 +2,9 @@
 //!
 //! The image's init (`corerouter-init`) always runs mgmtd, zebra and
 //! staticd; bgpd, ospfd, ospf6d, ldpd and bfdd it runs only when they are
-//! named in a file the daemon writes ([`OnDemand`], one name per line). Idle,
-//! the five cost ~55 MiB of RSS the router does not use (`docs/changes/G1.6i.md`).
+//! named in a file the daemon writes ([`OnDemand`], one name per line). A
+//! router without routing protocols idles 28 MiB lower on the image
+//! (98,9 → 70,9 MiB, **medido**, `docs/os-image.md`).
 //!
 //! The order keeps routes and the other daemons safe:
 //!
