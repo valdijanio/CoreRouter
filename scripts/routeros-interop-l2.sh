@@ -871,16 +871,22 @@ case_cr-bond() {
   # Silent cut: B's ether2 drops every frame but keeps its carrier, so only
   # the LACP timeout tells (802.1AX: 3 × the 1 s fast period).
   ms=$(wait_for 30 crlacp) || true
+  # Cut the member A sends the ping on (A ether6 = B ether2, ether7 = ether3).
   ip netns exec crcore ping -q -i 0.01 -W 1 -w 12 10.39.70.2 > "$W/crbond2.txt" 2>&1 &
-  p=$!; sleep 2
-  ip netns exec crpeer tc qdisc add dev ether2 clsact
-  ip netns exec crpeer tc filter add dev ether2 ingress matchall action drop
-  ip netns exec crpeer tc filter add dev ether2 egress matchall action drop
+  p=$!
+  local t6 t7 cut
+  t6=$(ip netns exec crcore cat /sys/class/net/ether6/statistics/tx_packets); t7=$(ip netns exec crcore cat /sys/class/net/ether7/statistics/tx_packets)
+  sleep 2
+  t6=$(( $(ip netns exec crcore cat /sys/class/net/ether6/statistics/tx_packets) - t6 )); t7=$(( $(ip netns exec crcore cat /sys/class/net/ether7/statistics/tx_packets) - t7 ))
+  if [ "$t6" -ge "$t7" ]; then cut=ether2; else cut=ether3; fi
+  ip netns exec crpeer tc qdisc add dev $cut clsact
+  ip netns exec crpeer tc filter add dev $cut ingress matchall action drop
+  ip netns exec crpeer tc filter add dev $cut egress matchall action drop
   wait $p || true
   tx=$(grep -oE '^[0-9]+ packets transmitted' "$W/crbond2.txt" | cut -d' ' -f1); rx=$(grep -oE '[0-9]+ received' "$W/crbond2.txt" | cut -d' ' -f1)
   local left; left=$(ip netns exec crcore awk '/Slave Interface/ {i=$3} /Aggregator ID/ && i {a[i]=$3} END {for (k in a) printf "%s=%s ", k, a[k]}' /proc/net/bonding/bond2)
-  result cr-bond INFO "silent member cut on B (carrier up, frames dropped): $(( (${tx:-0} - ${rx:-0}) * 10 )) ms lost to the LACP timeout; aggregators after: $left"
-  ip netns exec crpeer tc qdisc del dev ether2 clsact 2>/dev/null || true
+  result cr-bond INFO "silent cut of the busy member (B $cut; carrier up, frames dropped): $(( (${tx:-0} - ${rx:-0}) * 10 )) ms lost to the LACP timeout; aggregators after: $left"
+  ip netns exec crpeer tc qdisc del dev $cut clsact 2>/dev/null || true
 }
 crlacp() { [ "$(ip netns exec crcore awk '/Aggregator ID/ {print $3}' /proc/net/bonding/bond2 2>/dev/null | sort -u | wc -l)" = 1 ] &&
   ! ip netns exec crcore grep -q 'Partner Mac Address: 00:00:00:00:00:00' /proc/net/bonding/bond2; }
