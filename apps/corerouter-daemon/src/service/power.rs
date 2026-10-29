@@ -40,7 +40,7 @@ fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
     let session = ctx.session.clone();
     let support = support(
         std::fs::read_to_string("/proc/1/comm").ok().as_deref(),
-        std::os::unix::process::parent_id(),
+        parent_pid(),
     );
     if let Err(why) = &support {
         log::info!("power: system.reboot and system.shutdown disabled: {why}");
@@ -63,6 +63,17 @@ fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
         }
         Ok(())
     }))
+}
+
+#[cfg(unix)]
+fn parent_pid() -> u32 {
+    std::os::unix::process::parent_id()
+}
+
+/// No PID 1 to ask off Unix: 0 is never init, so [`support`] refuses.
+#[cfg(not(unix))]
+fn parent_pid() -> u32 {
+    0
 }
 
 /// Whether PID 1 is corerouter-init and our parent (it restarts us and
