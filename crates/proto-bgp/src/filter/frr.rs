@@ -73,6 +73,8 @@ pub enum Set {
     Med(u32),
     /// Our AS this many times.
     Prepend(u32, u8),
+    /// The next hop (G3.9fh); the entry before it tests the family.
+    Gw(std::net::IpAddr),
     Comm(CommHow, Vec<u32>, String),
     Large(CommHow, Vec<Large>, String),
 }
@@ -85,6 +87,7 @@ impl Set {
             Set::Prepend(..) => 2,
             Set::Comm(..) => 3,
             Set::Large(..) => 4,
+            Set::Gw(_) => 5,
         }
     }
 }
@@ -507,6 +510,7 @@ impl<'a> Comp<'a> {
         Some(match op {
             SetOp::LocalPref(v) => Set::LocalPref(*v),
             SetOp::Med(v) => Set::Med(*v),
+            SetOp::Gw(a) => Set::Gw(*a),
             // G3.9fg: N copies in all, the session's own included; none
             // left (N = 1 on eBGP), nothing to do.
             SetOp::Prepend(n) if *n <= self.counted => return None,
@@ -593,6 +597,22 @@ impl<'a> Comp<'a> {
                         // No such chain, a loop, too deep: reject (as eval).
                         _ => self.emit(Entry::reject()),
                     }
+                }
+                // G3.9fh: `set gw` changes routes of its family only: FRR
+                // would write an IPv6 next hop into an IPv4 route.
+                Stmt::Set(SetOp::Gw(a)) => {
+                    let fam = if a.is_ipv4() { Family::V4 } else { Family::V6 };
+                    let (lt, end) = (self.label(), self.label());
+                    self.cond(&Expr::Atom(Atom::Afi(fam)), lt, end);
+                    self.place(lt);
+                    self.emit(Entry {
+                        permit: true,
+                        matches: Vec::new(),
+                        sets: vec![Set::Gw(*a)],
+                        exit: Exit::Next,
+                        description: None,
+                    });
+                    self.place(end);
                 }
                 Stmt::Set(op) => {
                     if let Some(set) = self.set(op) {
@@ -869,6 +889,8 @@ fn set_line(s: &Set) -> Option<String> {
             }
             l
         }
+        Set::Gw(std::net::IpAddr::V4(a)) => format!("set ip next-hop {a}"),
+        Set::Gw(std::net::IpAddr::V6(a)) => format!("set ipv6 next-hop global {a}"),
         Set::Comm(CommHow::Set, v, _) if v.is_empty() => "set community none".into(),
         Set::Comm(CommHow::Set, v, _) => format!("set community {}", words(v)),
         Set::Comm(CommHow::Append, v, _) => format!("set community {} additive", words(v)),
@@ -1297,6 +1319,7 @@ pub(crate) mod tests {
                 p.extend_from_slice(&r.as_path);
                 r.as_path = p;
             }
+            Set::Gw(a) => r.next_hop = Some(*a),
             Set::Comm(how, v, _) => change(*how, v, &mut r.communities),
             Set::Large(how, v, _) => change(*how, v, &mut r.large),
         }
@@ -1545,6 +1568,7 @@ pub(crate) mod tests {
             (0u32..300).prop_map(|n| format!("set bgp-local-pref {n}")),
             (0u32..300).prop_map(|n| format!("set bgp-med {n}")),
             (1u8..4).prop_map(|n| format!("set bgp-path-prepend {n}")),
+            prop_oneof![Just("set gw 192.0.2.9"), Just("set gw 2001:db8::9")].prop_map(str::to_owned),
             Just("set bgp-communities 65000:1".to_owned()),
             Just("set bgp-communities none".to_owned()),
             Just("append bgp-communities 65000:2,no-export".to_owned()),

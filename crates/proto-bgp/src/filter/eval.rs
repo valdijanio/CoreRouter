@@ -198,6 +198,7 @@ enum SetC {
     LocalPref(u32),
     Med(u32),
     Prepend(u8),
+    Gw(std::net::IpAddr),
     Comm(CommHow, Vec<u32>),
     Large(CommHow, Vec<Large>),
 }
@@ -539,6 +540,7 @@ impl Builder<'_> {
                     SetOp::LocalPref(v) => SetC::LocalPref(*v),
                     SetOp::Med(v) => SetC::Med(*v),
                     SetOp::Prepend(n) => SetC::Prepend(*n),
+                    SetOp::Gw(a) => SetC::Gw(*a),
                     SetOp::Comm { large, how, arg } => {
                         let (n, l) = self.comm_values(arg, *large);
                         if *large {
@@ -764,6 +766,12 @@ fn apply(s: &SetC, ctx: &mut Ctx<'_>, asn: u32) {
     {
         return;
     }
+    // G3.9fh: a next hop of the other family leaves the route alone.
+    if let SetC::Gw(a) = s
+        && a.is_ipv4() != matches!(ctx.route.prefix, ipnet::IpNet::V4(_))
+    {
+        return;
+    }
     let counted = ctx.counted;
     let r = ctx.route.to_mut();
     match s {
@@ -775,6 +783,7 @@ fn apply(s: &SetC, ctx: &mut Ctx<'_>, asn: u32) {
             r.as_path = path;
             ctx.path = None;
         }
+        SetC::Gw(a) => r.next_hop = Some(*a),
         SetC::Comm(how, vals) => change(*how, vals, &mut r.communities),
         SetC::Large(how, vals) => change(*how, vals, &mut r.large),
     }
