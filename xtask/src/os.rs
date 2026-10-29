@@ -40,6 +40,7 @@ use crate::vm_lab::{download, sha256_file};
 
 mod ab;
 mod frr;
+mod hotplug;
 mod install;
 mod out;
 mod push;
@@ -1243,6 +1244,8 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     let port = free_port()?;
     let web_port = free_port()?;
     let log_path = top.join("boot-test.log");
+    let mon = top.join("boot-test.monitor");
+    let _ = std::fs::remove_file(&mon);
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.args([
         "-machine",
@@ -1260,15 +1263,10 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
         "-m",
         "1024",
     ]);
-    cmd.args([
-        "-display",
-        "none",
-        "-monitor",
-        "none",
-        "-serial",
-        "stdio",
-        "-no-reboot",
-    ]);
+    cmd.args(["-display", "none", "-serial", "stdio", "-no-reboot"]);
+    cmd.arg("-monitor")
+        .arg(format!("unix:{},server=on,wait=off", mon.display()));
+    cmd.args(hotplug::QEMU_ARGS);
     let snapshot = if b.keep_config { "" } else { ",snapshot=on" };
     cmd.arg("-drive").arg(format!(
         "file={},if=virtio,format=raw{snapshot}",
@@ -1321,11 +1319,12 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("qemu-system-x86_64: {e}"))?;
-    let res = watch(&mut child, &b, (port, web_port), started, &log_path);
+    let res = watch(&mut child, &b, (port, web_port), started, &log_path, &mon);
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_file(&vars);
-    let (report, wall_ready, ping, web) = res?;
+    let _ = std::fs::remove_file(&mon);
+    let (report, wall_ready, ping, web, hot) = res?;
     eprintln!("\nboot-test ok ({}):", if kvm { "KVM" } else { "TCG" });
     eprintln!(
         "  kernel start → daemon answers ping: {:.3} s (corerouter-init)",
@@ -1340,6 +1339,7 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     for l in web.lines() {
         eprintln!("    {l}");
     }
+    eprintln!("  card plugged in after boot (G1.6n): {hot}");
     if let Some(kib) = report.idle_kib {
         eprintln!(
             "  idle memory in use:                 {:.1} MiB",
@@ -1355,7 +1355,8 @@ fn watch(
     (port, web_port): (u16, u16),
     started: Instant,
     log_path: &Path,
-) -> Result<(Report, Duration, String, String), String> {
+    mon: &Path,
+) -> Result<(Report, Duration, String, String, String), String> {
     let stdout = child.stdout.take().ok_or("qemu: no stdout")?;
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::Builder::new()
@@ -1420,7 +1421,35 @@ fn watch(
             report.idle_kib = Some(k);
         }
         if let (Some(w), Some(p), Some(_), Some(web)) = (wall_ready, &ping, report.idle_kib, &web) {
-            return Ok((report, w, p.clone(), web.clone()));
+            let mut wait_line = |want: &dyn Fn(&str) -> bool, max: Duration| {
+                let until = Instant::now() + max;
+                loop {
+                    let left = until.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(format!(
+                            "no such console line (console in {})",
+                            log_path.display()
+                        ));
+                    }
+                    match rx.recv_timeout(left) {
+                        Ok(line) => {
+                            let _ = writeln!(log, "{line}");
+                            if line.contains("corerouter-init") {
+                                eprintln!("  | {line}");
+                            }
+                            if want(&line) {
+                                return Ok(());
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err("qemu exited".into());
+                        }
+                    }
+                }
+            };
+            let hot = hotplug::check(mon, &mut wait_line)?;
+            return Ok((report, w, p.clone(), web.clone(), hot));
         }
     }
 }

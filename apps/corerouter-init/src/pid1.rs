@@ -91,6 +91,7 @@ pub fn main() {
     }
     mount_config();
     let names = name_ports(Some(Path::new(crate::ports::MAP_FILE)));
+    spawn_hotplug_names(crate::ports::MAP_FILE);
     let trial = trial_at_boot(&cmdline);
     for dir in [plan::RUNTIME_DIR, "/var/log", "/var/lib", "/var/tmp"] {
         if let Err(e) = fs::create_dir_all(dir) {
@@ -267,6 +268,17 @@ fn name_ports(map: Option<&Path>) -> Vec<(String, String)> {
         log("port names: configuration from before ether names; keeping the kernel's names");
     }
     let p = crate::ports::assign(&found, &known, keep);
+    apply_names(&p, &found, &known, map)
+}
+
+/// Renames what `p` says, logs it and writes the map when it changed.
+/// Every port's name by kernel name (a failed rename keeps the kernel's).
+fn apply_names(
+    p: &crate::ports::Plan,
+    found: &[crate::ports::Found],
+    known: &[crate::ports::Known],
+    map: Option<&Path>,
+) -> Vec<(String, String)> {
     for n in &p.notes {
         log!("port names: {n}");
     }
@@ -296,6 +308,67 @@ fn name_ports(map: Option<&Path>) -> Vec<(String, String)> {
         log!("{}: {e}", m.display());
     }
     names
+}
+
+/// Reads the port-name map (G1.6m): its lines, or none.
+fn read_map(map: &Path) -> Vec<crate::ports::Known> {
+    let text = File::open(map).ok().map(|f| {
+        let mut s = String::new();
+        let _ = f.take(crate::ports::MAX_MAP).read_to_string(&mut s);
+        s
+    });
+    crate::ports::parse_map(text.as_deref().unwrap_or("")).0
+}
+
+/// G1.6n: a card that shows up with the router running (USB adapter,
+/// hot-plug PCIe, a virtio card added to a running VM) gets its `etherN`
+/// the same way as at boot, and keeps it when plugged in again. A thread
+/// that sleeps on the kernel's link messages; when a port carries a kernel
+/// name (`eth<N>`), it waits for the burst to settle and names it. Cost:
+/// one wake per link message (rare on a router: a carrier change, an
+/// address); no polling.
+fn spawn_hotplug_names(map: &'static str) {
+    let events = match crate::links::LinkEvents::open() {
+        Ok(e) => e,
+        Err(e) => {
+            log!(
+                "port names: no link messages ({e}); a card plugged in after boot keeps the kernel's name"
+            );
+            return;
+        }
+    };
+    let spawned = std::thread::Builder::new()
+        .name("port-names".into())
+        .spawn(move || {
+            loop {
+                if let Err(e) = events.wait() {
+                    // ENOBUFS: lost messages, look anyway; anything else:
+                    // do not spin on it.
+                    if e.raw_os_error() != Some(105) {
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                }
+                let pending = crate::links::all_ports()
+                    .iter()
+                    .any(|f| crate::ports::is_kernel_name(&f.kernel));
+                if !pending {
+                    continue;
+                }
+                // A card with several ports, or a driver that registers in
+                // steps: name them in one pass.
+                crate::links::settle(Duration::from_millis(100), Duration::from_secs(1));
+                let path = Path::new(map);
+                let known = read_map(path);
+                let found = crate::ports::hotplug_set(crate::links::all_ports(), &known);
+                let p = crate::ports::assign(&found, &known, false);
+                if !p.renames.is_empty() {
+                    apply_names(&p, &found, &known, Some(path));
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        log!("port names: hot-plug thread: {e}");
+    }
 }
 
 /// Written so it survives a power cut right after (a VM destroyed seconds

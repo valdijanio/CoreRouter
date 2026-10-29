@@ -51,6 +51,12 @@ CONFIG_ACPI=y
 CONFIG_ACPI_TINY_POWER_BUTTON=y
 CONFIG_ACPI_TINY_POWER_BUTTON_SIGNAL=12
 
+# --- G1.6n: a card plugged in with the router running (hot-plug PCIe slot,
+# a card added to a running VM: QEMU's pcie-root-port, the ACPI slots of
+# the i440fx machine). PID 1 names it etherN like the ones found at boot.
+CONFIG_HOTPLUG_PCI_PCIE=y
+CONFIG_HOTPLUG_PCI_ACPI=y
+
 # --- Storage: NVMe, SATA/AHCI, virtio (VMs), SCSI disks.
 CONFIG_BLK_DEV_NVME=y
 CONFIG_ATA=y
@@ -220,3 +226,4 @@ CONFIG_USB_XHCI_HCD=y
 CONFIG_USB_EHCI_HCD=y
 CONFIG_USB_STORAGE=y
 CONFIG_FW_CFG_SYSFS=y
+
