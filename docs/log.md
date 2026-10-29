@@ -8293,3 +8293,25 @@ continuação indentadas).
 
   `boot-test` (KVM) e `ab-test --scenario push` passaram com a imagem nova: envio a 83 MiB/s,
   B confirmado em 18,3 s.
+
+- 2026-10-29 — G3.4l: O abort do `ospfd` com TI-LFA (`ospf_spf.c:1269: get_reverse_distance(): assertion (w_lsa &&
+  w_lsa->data) failed`) é um bug do FRR, no 10.7.1 e no `master`. No SPF reverso dos Q-spaces,
+  `ospf_spf_next` lê o custo de volta da router-LSA do vizinho W antes da checagem "LSA ausente →
+  pula" da RFC 2328 §16.1 (2b). O gatilho medido é uma router-LSA que **sai** do LSDB (troca de
+  router-id ou `no router ospf` no vizinho) enquanto outras ainda a citam. A hipótese da corrida
+  na subida não se confirmou. Análise completa em `docs/frr-tilfa-abort.md`.
+
+  - **Prova:** teste unitário do FRR (`test_ospf_spf`, `topo6` com uma LSA ausente) aborta sempre
+    no 10.7.1 e no `master` (gdb: `w_lsa=0x0`) e passa com a correção, com os mesmos backups da
+    `topo1`. Na VM, `scripts/frr-tilfa-repro.sh` (só OSPF + TI-LFA, sem LDP/BFD, namespaces)
+    com o FRR compilado com logs `G34L`: 10.7.1 aborta em 15 de 40 iterações com troca de
+    router-id no R1 (todas com "W router-LSA ABSENT" na linha anterior), 0 de 50 só com subida e
+    flap; com a correção, 0 de 40 e 27 passagens por LSA ausente puladas, sem rota faltando
+    (**medido**).
+  - **Correção:** `os/patches/frr/0001-ospfd-ti-lfa-missing-router-lsa.patch` (uma condição,
+    `&& w_lsa`), aplicada pelo Buildroot; o `cargo xtask os build` faz `frr-dirclean` quando os
+    patches do FRR mudam. O `.deb` da VM do laboratório não tem a correção.
+  - **Upstream:** issue FRRouting/frr#24091 e PR FRRouting/frr#24092 (correção + teste), abertos
+    pela conta do usuário a pedido dele; texto e patches em `docs/frr-upstream/`.
+  - **Produção:** o TI-LFA continua desligado por padrão (a perda de um corte no Linux não cai com
+    ele, G3.4k); o aviso da prévia passou a dizer isso e a citar a G3.4l só para FRR sem o patch.
