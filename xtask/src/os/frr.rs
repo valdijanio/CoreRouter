@@ -388,7 +388,7 @@ pub fn frr_test(root: &Path, images: &Path, args: &[String]) -> Result<(), Strin
         )?;
     }
     let frr = pinned_frr(&root.join("os"))?;
-    let work = root.join("os/out/frr-test");
+    let work = super::out_dir(root)?.join("frr-test");
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
     let log_path = work.join("console.log");

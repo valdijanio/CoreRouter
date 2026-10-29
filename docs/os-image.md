@@ -6,7 +6,8 @@ pelo Buildroot a partir de `os/` (uma árvore `BR2_EXTERNAL`), testada no QEMU s
 
 ```sh
 cargo xtask os check                 # confere a configuração (sem rede; também roda no `cargo xtask ci`)
-cargo xtask os build                 # baixa e confere o Buildroot fixado, compila e grava os/out/build/images/disk.img
+cargo xtask os build                 # baixa e confere o Buildroot fixado, compila e grava <out>/build/images/disk.img
+cargo xtask os out-dir               # a pasta <out> deste checkout (seção "Onde fica o build")
 cargo xtask os boot-test             # boota no QEMU (KVM do usuário ou TCG) e faz ping no canal de controle TLS
 cargo xtask os boot-test --tcg       # sem KVM (emulação; ~3× mais lento)
 cargo xtask os boot-test --efi       # o mesmo, pelo firmware UEFI (OVMF) e o disco inteiro
@@ -19,6 +20,7 @@ cargo xtask os build --only crpkg    # G1.6e: só o pacote de atualização (sem
 cargo xtask os push --to 127.0.0.1:7990   # G1.6e: --only crpkg, envia pela rede, espera o slot novo confirmar
 ```
 
+`<out>` é a pasta do build deste checkout, fora do repositório (seção "Onde fica o build").
 A/B e atualização: seção "A/B e atualização segura (G1.6b)" abaixo. Instalador, imagens de VM e
 FRR: seção "Instalador, imagens de VM e FRR (G1.6c)" no fim.
 
@@ -187,16 +189,70 @@ precisar de streaming delta, o RAUC volta a ser a opção (o formato de bundle v
 - **musl/estático**: a toolchain glibc do Bootlin serve ao daemon e ao `nft`; o daemon liga
   contra a mesma glibc da imagem (sem baixar outro alvo do Rust).
 
+## Onde fica o build
+
+Tudo o que o `cargo xtask os` constrói fica numa pasta por checkout, `<out>`
+(`xtask/src/os/out.rs`): a árvore do Buildroot extraída, o `O=` dele (`build/`, com as
+imagens em `build/images/`), o `ccache`, os targets do cargo (`cargo-target` do daemon e do init,
+`web-target` da GUI web, `cli-target` da CLI do `push`), a GUI web, as pastas dos testes no QEMU e a **chave
+de assinatura** de desenvolvimento (`keys/`). Os downloads continuam em `os/dl/`.
+
+A pasta, na primeira regra que valer:
+
+1. `$COREROUTER_OS_OUT`, se definida (relativa ao checkout);
+2. `os/out` do checkout, se ele já tem uma chave em `os/out/keys/` (um checkout que construiu
+   antes desta mudança continua com a mesma chave até migrar; o build avisa a cada vez);
+3. `/srv/build/os-out/<pasta do checkout>-<8 hex do hash do caminho>` quando o disco de builds
+   `/srv/build` existe: fora do `/home` e do repositório, e uma pasta por checkout (duas
+   worktrees nunca dividem um build);
+4. `os/out`.
+
+`cargo xtask os out-dir` imprime a pasta. Dois `os build` (ou `push`) na mesma pasta não rodam
+juntos: o segundo para na hora com "another `cargo xtask os build` is using …" (um `flock` em
+`<out>/.build.lock`, solto quando o processo morre).
+
+**Por que fora do repositório.** Em 2026-10-29 o `/home` encheu e apagar o `os/out` para abrir
+espaço levou junto o ccache e os targets do cargo: o build seguinte foi completo e frio. No
+disco de builds (929 GB livres) nada disso precisa ser apagado por falta de espaço.
+
+**A chave.** Os pacotes `.crpkg` são assinados pela chave privada de `<out>/keys/`
+(`dev-image-key.pk8`), e o roteador só aceita pacotes da chave pública que a imagem instalada
+dele traz. Pasta nova sem a chave = chave nova = o roteador **recusa** o pacote (assinatura
+desconhecida); por isso a regra 2 existe, e com `$COREROUTER_OS_OUT` apontando para uma pasta
+sem chave enquanto o `os/out` tem uma o build para e diz o que copiar. Para usar a mesma chave
+em mais de um checkout, copie `keys/` ou passe `--key <pkcs8>` (`$COREROUTER_IMAGE_KEY`).
+
+### Migrar o `os/out` de um checkout para o disco de builds
+
+Com nenhum `os build`/`push` rodando nesse checkout:
+
+```sh
+cd /home/oem/code/CoreRouter        # o checkout a migrar
+mv os/out os/out.old                # nada se perde: só sai do caminho (mesmo disco, instantâneo)
+NEW=$(cargo xtask os out-dir)       # agora /srv/build/os-out/CoreRouter-<hash>
+mkdir -p "$NEW"
+cp -a os/out.old/keys "$NEW/"       # a MESMA chave: obrigatório
+cmp os/out.old/keys/dev-image-key.pk8 "$NEW/keys/dev-image-key.pk8" && echo chave ok
+cp -a os/out.old/ccache os/out.old/web-tools "$NEW/"   # opcional: o build seguinte sai com ccache quente
+cargo xtask os push --to 127.0.0.1:7990                # primeiro build no lugar novo (completo, ~10 min)
+rm -rf os/out.old                   # só depois de a VM aceitar e confirmar o pacote
+```
+
+O `build/` e o `cargo-target` antigos não valem a cópia: o Buildroot grava caminhos absolutos
+no `O=` (não é relocável) e o cargo refaz o que tem caminho da pasta antiga. O ccache sim: o
+wrapper da toolchain usa caminhos relativos (`BR2_CCACHE_USE_BASEDIR`), e os acertos valem na
+pasta nova. Para desfazer: `rm -rf "$NEW"` e `mv os/out.old os/out`.
+
 ## Build reprodutível
 
 - O Buildroot é fixado por versão **e** SHA-256 (`os/buildroot.lock`), baixado uma vez para
-  `os/dl/` e extraído em `os/out/` (as duas pastas no `.gitignore`). Todo pacote é conferido
+  `os/dl/` (no `.gitignore`) e extraído em `<out>/`. Todo pacote é conferido
   pelo hash (`BR2_DOWNLOAD_FORCE_CHECK_HASHES`); o kernel, pelo `linux.hash` nosso.
 - G1.6k: `os/buildroot-patches/*.patch` (em ordem de nome) é aplicado à árvore extraída. Só
   receitas de `package/` (o `os check` recusa outro caminho), cada versão nova com o hash
   dela no `.hash` do pacote. Um carimbo com o SHA-256 dos patches fica na árvore; patch
   mudou, a árvore é extraída de novo do tarball (nunca um patch por cima de outro). Ao trocar a
-  versão de um pacote, faça um build limpo (`rm -rf os/out/build`): o `target/` do Buildroot não
+  versão de um pacote, faça um build limpo (`rm -rf "$(cargo xtask os out-dir)/build"`): o `target/` do Buildroot não
   apaga os arquivos da versão anterior (a `libyang.so.2` ficou no build incremental).
 - `BR2_REPRODUCIBLE`: `SOURCE_DATE_EPOCH` fixo, datas e ordem dos arquivos do squashfs fixas.
   GUIDs, volume id do vfat e UUID/hash seed do ext4 fixos no `genimage.cfg`.
@@ -223,13 +279,25 @@ precisar de streaming delta, o RAUC volta a ser a opção (o formato de bundle v
 
 - **Por pacote** o Buildroot já usa `-j$(nproc+1)` (`BR2_JLEVEL=0`); o kernel é o pacote mais
   longo e paraleliza bem.
-- **Entre pacotes**: `BR2_PER_PACKAGE_DIRECTORIES=y` deixa usar `make -jN` no topo
-  (`cargo xtask os build --top-jobs N`), com pacotes independentes compilando ao mesmo tempo.
+- **Entre pacotes**: `BR2_PER_PACKAGE_DIRECTORIES=y` deixa usar `make -jN` no topo, com
+  pacotes independentes compilando (e, principalmente, rodando o `configure`, que é serial)
+  ao mesmo tempo. Desde o processo "build rápido" é o **padrão**: `make all -jN -l<núcleos>`
+  com N = núcleos/4, no máximo um por 4 GiB de `MemAvailable`, no mínimo 2 (32 núcleos e
+  37 GiB livres: `-j8 -l32`). O `-l` não deixa começar outro pacote com a carga da máquina já
+  acima do número de núcleos (os CIs de outras sessões). Cada pacote continua com o próprio
+  `-j` (`BR2_JLEVEL`); pacote que não aceita build paralelo usa `$(MAKE1)` na receita dele e o
+  Buildroot respeita isso também com `-j` no topo. `--top-jobs N` fixa o N (`--top-jobs 1`
+  volta ao serial) e `--jobs N` o `BR2_JLEVEL`.
 - **Cache de download**: `os/dl/` fica entre builds; nada é baixado de novo.
-- **Cache de compilação**: `BR2_CCACHE` em `os/out/ccache` (C/C++ do Buildroot e do kernel).
-  O Rust tem o próprio cache incremental em `os/out/cargo-target`, fora da pasta do pacote
+- **Cache de compilação**: `BR2_CCACHE` em `<out>/ccache` (C/C++ do Buildroot e do kernel; a
+  variável `BR2_CCACHE_DIR` que o xtask passa vence o caminho do defconfig).
+  O Rust tem o próprio cache incremental em `<out>/cargo-target`, fora da pasta do pacote
   e do `O=` do Buildroot: nem o `corerouter-dirclean` de cada build nem um build limpo jogam
   fora as dependências (frio, o Rust era 154 s de um build limpo de 447 s, **medido**).
+  A GUI web (trunk, `wasm32`) compila em outro target, `<out>/web-target`: no mesmo
+  `cargo-target`, os build scripts e macros do host de um (ligados pelo gcc do Buildroot) e do
+  outro (pelo `cc` do host) se invalidavam, e todo `os build` recompilava a GUI inteira e todas
+  as dependências do daemon (processo "build rápido", **medido** na seção de números).
 
 ### Boot
 
@@ -269,9 +337,41 @@ Todos **medidos** em 2026-10-27, AMD Ryzen AI Max+ 395 (32 threads), 62 GiB, NVM
 | Mudou o fragmento do kernel (`linux-reconfigure`) | 169 s | |
 | Sem mudança (quente) | 24–26 s | cargo sem trabalho, rootfs e disco regravados |
 
-Desde a medição do build limpo, o cache do Rust fica em `os/out/cargo-target`, fora do `O=`: um
+Desde a medição do build limpo, o cache do Rust fica em `<out>/cargo-target`, fora do `O=`: um
 build limpo do Buildroot não recompila mais o Rust (o build seguinte levou 165 s sem `-j` de
 topo, com o cargo frio numa pasta nova).
+
+### Build rápido: pasta própria, `-j` de topo, GUI e CLI em targets próprios (2026-10-29)
+
+**Medido** em 2026-10-29 na mesma máquina, build release, com 5–6 outras sessões compilando ao
+mesmo tempo (carga de 20 a 90; os tempos variam por isso). Cada lado numa cópia própria do out
+em `/srv/build`, com o ccache do checkout principal e os downloads em cache.
+
+| Situação | Antes | Depois |
+|---|---|---|
+| Build completo, out vazio só com o ccache (`os build`) | 1063 s (`make all` 838 s, serial) | 1010 s (`make all` 800 s, `-j6 -l32` automático) |
+| Incremental: uma linha no daemon, `os build --only crpkg` | **889 s** (GUI 331 s + `make all` 497 s; 126 crates da GUI e 97 do daemon recompilados) | **213 s** (GUI 60 s, 0 crates; `make all` 139 s, só o daemon) |
+| CLI do `push`, target novo | 223 s (release, LTO thin, 1 codegen unit) | 66 s (sem LTO, 16 unidades, incremental) |
+| CLI do `push`, depois de uma linha no engine | 144 s | 3,2 s |
+| CLI do `push`, só o daemon mudou | 0,2 s | 0,1 s |
+| Envio do `ab-test --scenario push` (CLI nova, TLS, QEMU) | — | 53,1 MiB em 0,64 s (83 MiB/s); B confirmado em 18,3 s |
+
+- **O ganho grande foi o target separado da GUI**, que não estava nos três itens do pedido. No
+  mesmo `cargo-target`, o trunk e o cargo da imagem se invalidavam um ao outro a cada build.
+  Num `os push` comum, isso eram 216–331 s de GUI mais a recompilação de todas as dependências
+  do daemon.
+- **O `-j` de topo quase não muda o build completo** (−4 %). O caminho crítico é uma corrente
+  serial: `host-protobuf` (309 s de C++) → `host-protobuf-c` → FRR → o kernel do instalador. O
+  paralelismo médio entre pacotes foi 2,1× (1714 s somados em 802 s; `build-time.log`). Os
+  pacotes de host não acertam o ccache quando o `O=` muda de caminho (só o wrapper da toolchain
+  do alvo usa caminho relativo). Por isso o primeiro build numa pasta nova é sempre o mais
+  lento; os seguintes, na mesma pasta, acertam. Com caches quentes, o `--top-jobs` dava 2,1×
+  (447 → 207 s, tabela acima).
+- **Memória:** com `-j6` a `MemAvailable` da máquina chegou a 3,5 GB no pior momento (as
+  outras sessões incluídas). Daí o teto de um job de topo por 4 GiB livres no início.
+- **O que sobra no incremental:** 57 s de `wasm-bindgen` + `wasm-opt` da GUI, que o trunk
+  refaz mesmo sem nada recompilado, e ~100 s do cargo release do daemon com LTO. Os dois estão
+  na gap G1.6r.
 
 **Reprodutível:** dois builds limpos do mesmo commit, um terceiro com outro nível de `-j` e um
 quarto com o cache do cargo em outra pasta deram o **mesmo** `bzImage` (`40e26533…`), o mesmo
@@ -360,7 +460,7 @@ Scrub) e **System › Tuning › Boot** (o que cada slot carrega, "Apply on slot
   recalculada. A imagem só leva a **chave pública** (`/etc/corerouter/image-keys/<id>.pub`); a
   privada fica fora do repositório (`cargo xtask os build --key <pkcs8>` ou
   `$COREROUTER_IMAGE_KEY`; sem elas, uma chave de desenvolvimento gerada uma vez em
-  `os/out/keys/`, ignorada pelo git). Atualizar para um build mais antigo é recusado
+  `<out>/keys/`, fora do repositório; seção "Onde fica o build"). Atualizar para um build mais antigo é recusado
   ("use system.package.downgrade").
 - **Parâmetros carregados:** `console=`, `ip=` e `corerouter.shell=` da linha em uso que não
   estão na embutida passam para o slot gravado (como o `linux_append` de OEM do Flatcar): uma
@@ -503,7 +603,7 @@ cargo xtask os build          # também grava corerouter-install.iso, corerouter
 cargo xtask os install-test   # instala de CD e de USB num disco virtual, boota, confere; qcow2 e OVA
 ```
 
-Saídas em `os/out/build/images/`:
+Saídas em `<out>/build/images/`:
 
 | Arquivo | Para quê |
 |---|---|
