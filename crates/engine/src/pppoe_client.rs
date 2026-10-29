@@ -1025,7 +1025,10 @@ pub(crate) fn monitor_json(r: &Runner, now: u64) -> Value {
 /// DNS 100.64.0.53. Enough for the demo and the engine's tests; the real
 /// interoperability tests run against the BNG and RouterOS.
 pub struct LabBng {
-    inner: Mutex<LabInner>,
+    /// Built on the first frame: every `Session` gets a lab BNG, and a
+    /// `proto_pppoe::Server` is not free to make (the 3 500 tests and the
+    /// command sweep build a session per case; G3.9ga, #439's CI).
+    inner: Mutex<Option<LabInner>>,
 }
 
 struct LabInner {
@@ -1038,6 +1041,14 @@ pub const LAB_AC_NAME: &str = "lab-bng";
 
 impl LabBng {
     pub fn new() -> Self {
+        LabBng {
+            inner: Mutex::new(None),
+        }
+    }
+}
+
+impl LabInner {
+    fn new() -> Self {
         use corerouter_proto_pppoe::server::{Server, ServerConfig, ServerOutput};
         let cfg = ServerConfig {
             ac_mac: Mac([0x02, 0xBB, 0, 0, 0, 1]),
@@ -1048,12 +1059,10 @@ impl LabBng {
             max_mtu: 1492,
             ..ServerConfig::default()
         };
-        LabBng {
-            inner: Mutex::new(LabInner {
-                server: Server::new(cfg, [7; 32], 0),
-                out: ServerOutput::new(),
-                next: 2,
-            }),
+        LabInner {
+            server: Server::new(cfg, [7; 32], 0),
+            out: ServerOutput::new(),
+            next: 2,
         }
     }
 }
@@ -1070,7 +1079,7 @@ impl PppoeLab for LabBng {
             AuthMethod, AuthVerdict, Authorization, Event, Ipv4Assignment,
         };
         let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        let LabInner { server, out, next } = &mut *g;
+        let LabInner { server, out, next } = g.get_or_insert_with(LabInner::new);
         out.clear();
         server.handle_frame(now_ms, 1, frame, out);
         server.handle_timers(now_ms, out);

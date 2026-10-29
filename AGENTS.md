@@ -332,6 +332,14 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
   namespace descartável, sem root:
   `unshare --user --map-root-user --net -- cargo test -p corerouter-hal-linux`. Dentro dele só
   existe uma interface `lo`; crie interfaces `dummy`/`veth` no próprio teste. Nada vaza para o host.
+- **Faltou ferramenta ou liberação? Peça antes de contornar** (pedido do usuário, 2026-10-29).
+  Quando uma ferramenta, permissão ou ajuste do sistema ajudaria o trabalho (um profiler
+  bloqueado, um pacote, um `sysctl`, um acesso), avise o usuário na hora: o que falta, por que
+  ajuda, o risco e o comando exato para ele rodar (e como desfazer). Paliativo (instrumentar à
+  mão, simular, contornar) só se ele autorizar. Exemplo: o `perf` estava bloqueado
+  (`kernel.perf_event_paranoid = 4`); liberado com `perf_event_paranoid = 1` em
+  `/etc/sysctl.d/60-perf.conf`, ele roda sem root nos benches (`perf record -g` com
+  `--profile-time`).
 - Precisa de root de verdade (FRR instalado no host, XDP numa NIC física, imagem Buildroot,
   `setcap`)? Pare e entregue ao usuário o comando exato e o motivo; ele roda no terminal dele.
   Nunca proponha `sudo` sem senha (NOPASSWD) amplo.
@@ -355,10 +363,17 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
 
 ## Agentes em paralelo
 
-- `CARGO_TARGET_DIR=target-<seu-id>` próprio (o diretório `target-*` está no `.gitignore`);
-  apague-o ao terminar (até ~27 GB depois de uma `cargo xtask ci` completa, **medido** em
-  2026-10-29). O `sccache` não ajuda aqui: a chave dele muda com a pasta da worktree e com o
-  target, e nada de Rust se reaproveita entre sessões (G0.29b, **medido**).
+- `CARGO_TARGET_DIR=/srv/build/target-<seu-id>` próprio, no disco de builds; apague-o ao
+  terminar (até ~27 GB depois de uma `cargo xtask ci` completa, **medido** em 2026-10-29). O
+  `sccache` não ajuda aqui: a chave dele muda com a pasta da worktree e com o target, e nada de
+  Rust se reaproveita entre sessões (G0.29b, **medido**).
+- **Disco de builds `/srv/build`** (desde 2026-10-29): partição própria (`nvme0n1p8`, ext4,
+  ~994 GiB, rótulo `build`, dono `oem`, montada pelo `/etc/fstab`), separada do `/home`
+  (293 GiB), onde ficam as worktrees e o disco da VM do laboratório. Com 5–6 sessões, os
+  `target-*` dentro das worktrees (10–21 GB cada) encheram o `/home` e todos os CIs pararam em
+  "esperando disco". O portão de disco do `cargo xtask ci` mede o disco do target, então passa a
+  olhar o `/srv/build`; não baixe `COREROUTER_CI_MIN_FREE_GB` como contorno. Um `target-*` na
+  worktree (o caminho antigo, ainda no `.gitignore`) só para quem não tem o `/srv/build`.
 - Edite só os crates da sua tarefa (a coluna "crates" de `docs/gaps.md`). Precisa mexer em
   `crates/model` ou `crates/engine/src/session.rs`? São compartilhados: mudanças pequenas,
   aditivas, e avise no PR.
