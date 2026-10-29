@@ -430,8 +430,9 @@ impl Session {
         self.heard_at = env.now;
         match protocol {
             proto::LCP => {
+                let first = !self.heard;
                 self.heard = true;
-                self.lcp_packet(env, info);
+                self.lcp_packet(env, info, first);
             }
             // RFC 1994 §4.1: after Success, repeated Responses are allowed
             // during the Network phase (our Success may have been lost).
@@ -461,7 +462,7 @@ impl Session {
         }
     }
 
-    fn lcp_packet(&mut self, env: &mut Env<'_>, info: &[u8]) {
+    fn lcp_packet(&mut self, env: &mut Env<'_>, info: &[u8], first: bool) {
         let Ok(pkt) = ppp::parse_control(info) else {
             env.stats.malformed += 1;
             return;
@@ -472,6 +473,13 @@ impl Session {
         let r = fsm!(self, env, lcp, lcp_l, |f, c, l| f.receive(&mut c, l, pkt));
         if let Some(s) = r {
             self.lcp_signals(env, s);
+            // Our Configure-Request leaves right after the PADS, and a client
+            // that opens LCP a little later (RouterOS: ~70 ms) drops it; the
+            // restart timer then held every session for 3 s (G3.9g, measured
+            // against the CHR). The peer's first request says it listens now.
+            if first && pkt.code == lc::CONFIGURE_REQUEST && self.dead.is_none() {
+                fsm!(self, env, lcp, lcp_l, |f, c, l| f.resend_request(&mut c, l));
+            }
             return;
         }
         let opened = self.lcp.is_opened();
@@ -563,8 +571,18 @@ impl Session {
         if v.put(&mut body).is_ok() {
             self.send(env, proto::CHAP, ac::CHAP_CHALLENGE, self.auth.id, &body);
         }
+        // The first Challenge goes out a few µs after the peer's
+        // Configure-Ack, and the RouterOS client drops it now and then
+        // (G3.9g, measured against the CHR: up in 3.1 s instead of 0.1 s).
+        // The first retry comes early; the rest keep the restart timer.
+        let first = self.auth.retries == env.cfg.fsm.max_configure;
         self.auth.retries = self.auth.retries.saturating_sub(1);
-        self.auth_deadline = env.now + env.cfg.fsm.restart_ms;
+        let wait = if first {
+            FIRST_CHALLENGE_RETRY_MS.min(env.cfg.fsm.restart_ms)
+        } else {
+            env.cfg.fsm.restart_ms
+        };
+        self.auth_deadline = env.now + wait;
     }
 
     fn auth_packet(&mut self, env: &mut Env<'_>, protocol: u16, info: &[u8]) {
@@ -593,6 +611,12 @@ impl Session {
                 self.send_success(env, b"");
             }
             return;
+        }
+        // The early retry above keeps the challenge value, so a Response to
+        // the previous Identifier (a CPE slower than 300 ms) is still good;
+        // the Success then carries that Identifier (RFC 1994 §4.2).
+        if !pap && !self.auth.pending && pkt.id == self.auth.id.wrapping_sub(1) {
+            self.auth.id = pkt.id;
         }
         if self.auth.pending || (!pap && pkt.id != self.auth.id) {
             return;
@@ -1101,6 +1125,10 @@ impl Session {
         s
     }
 }
+
+/// First CHAP Challenge retransmission (RFC 1994 §4.1 leaves the timer to
+/// us): well above a CPE's answer time, well below the 3 s restart timer.
+const FIRST_CHALLENGE_RETRY_MS: Millis = 300;
 
 /// Echo period: `interval × misses / (misses + 1)`, so `misses` echoes go out
 /// (and can be answered) inside the keepalive window that starts at the last
