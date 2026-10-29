@@ -36,6 +36,10 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("resources.col.proc_state", "## State\n\nProcess state letter."),
     ("resources.col.rx", "## Rx\n\nReceived bits per second."),
     ("resources.col.state", "## State\n\nThe sensor against its limits."),
+    ("resources.col.thread_cpu", "## CPU (1 core)\n\nShare of one core between two readings; 100 % is a full core."),
+    ("resources.col.thread_name", "## Thread\n\nThe name the program gave the thread."),
+    ("resources.col.thread_process", "## Process\n\nThe router process the thread belongs to."),
+    ("resources.col.tid", "## TID\n\nThe thread's id in the kernel."),
     ("resources.col.tx", "## Tx\n\nSent bits per second."),
     ("resources.col.used", "## Used\n\nShare in use."),
     ("resources.cpu.cores", "## Load per core\n\nEach core's load by kind."),
@@ -62,5 +66,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("resources.tab.overview", "## Overview\n\nCPU, memory, disk and temperature cards, the links and the health checks."),
     ("resources.tab.processes", "## Processes\n\nCPU and memory per process."),
     ("resources.tab.sensors", "## Sensors\n\nEvery hwmon sensor with its limits."),
+    ("resources.tab.threads", "## Threads\n\nEach thread of the daemon, the init and FRR, with its CPU in % of one core."),
+    ("resources.threads.hot", "## Busiest thread\n\nThe busiest thread; amber at 90 % of one core."),
     ("resources.uptime", "## Uptime\n\nTime since the router's operating system booted (`/proc/uptime`)."),
 ];

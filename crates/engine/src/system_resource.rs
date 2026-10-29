@@ -237,6 +237,38 @@ impl ResourceMonitor {
             .collect()
     }
 
+    /// G1.6qe: CPU of the router's processes between the two readings: of
+    /// each process in % of the whole machine (as [`Self::process_cpu`]),
+    /// and of each of its threads in % of **one** CPU (a thread at 100 %
+    /// is a full core: work serialized on it). `None` for one that was not
+    /// in the previous reading.
+    pub fn router_cpu(&self) -> (BTreeMap<u32, f32>, BTreeMap<(u32, u32), f32>) {
+        let (mut procs, mut tasks) = (BTreeMap::new(), BTreeMap::new());
+        let Some((a, b, dt)) = self.pair() else {
+            return (procs, tasks);
+        };
+        let hz = f64::from(b.hz.max(1));
+        let one = dt * hz;
+        let all = one * b.cores.len().max(1) as f64;
+        for p in &b.router {
+            let Some(before) = a.router.iter().find(|x| x.pid == p.pid) else {
+                continue;
+            };
+            if let Some(used) = p.cpu_ticks.checked_sub(before.cpu_ticks) {
+                procs.insert(p.pid, ((used as f64 * 100.0 / all) as f32).min(100.0));
+            }
+            for t in &p.tasks {
+                let Some(t0) = before.tasks.iter().find(|x| x.tid == t.tid) else {
+                    continue;
+                };
+                if let Some(used) = t.cpu_ticks.checked_sub(t0.cpu_ticks) {
+                    tasks.insert((p.pid, t.tid), ((used as f64 * 100.0 / one) as f32).min(100.0));
+                }
+            }
+        }
+        (procs, tasks)
+    }
+
     fn push(&mut self, sample: Sample, source: Source, now: Option<u64>) {
         if self.source != Some(source) {
             // Another sampler's counters: no rates across the switch.

@@ -23,15 +23,16 @@
 //! - on demand, `/proc/<pid>/stat` of every process;
 //! - on every reading, `/proc/<pid>/stat` and `fd` of the router's own
 //!   processes (G1.6qd: this one, the init, FRR), whose pids are kept and
-//!   looked for again every [`ROUTER_SCAN_MS`] or when one is gone.
+//!   looked for again every [`ROUTER_SCAN_MS`] or when one is gone, and
+//!   the `stat` of each of their threads (G1.6qe, `task/<tid>/stat`).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use corerouter_hal::system_resource::{
     CpuIrqs, CpuTimes, DAEMON_PROCESS, Disk, DiskIo, LoadAvg, MAX_CPUS, MAX_DISKS, MAX_NET,
-    MAX_PROCESSES, MAX_SENSORS, Memory, NetDev, Pressure, Process, Psi, ROUTER_PROCESSES,
-    ResourceSampler, Sample, Sensor, SensorKind, Want, cut_name,
+    MAX_PROCESSES, MAX_SENSORS, MAX_TASKS, Memory, NetDev, Pressure, Process, Psi, ROUTER_PROCESSES,
+    ResourceSampler, Sample, Sensor, SensorKind, Task, Want, cut_name,
 };
 
 /// Most descriptors counted per process (a reading of the processes lists
@@ -368,6 +369,30 @@ fn count_fds(dir: &std::path::Path) -> Option<u32> {
     u32::try_from(n).ok()
 }
 
+/// The threads of a process (`/proc/<pid>/task/<tid>/stat`, the same
+/// format as a process's), by tid, at most [`MAX_TASKS`].
+fn tasks(dir: &Path, page_size: u64) -> Vec<Task> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Task> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .take(MAX_TASKS)
+        .filter_map(|tid| {
+            let p = parse_pid_stat(&read(&dir.join(tid.to_string()).join("stat"))?, page_size)?;
+            Some(Task {
+                tid,
+                name: p.name,
+                state: p.state,
+                cpu_ticks: p.cpu_ticks,
+            })
+        })
+        .collect();
+    out.sort_unstable_by_key(|t| t.tid);
+    out
+}
+
 /// The name of a `/proc/<pid>/stat` (between the first `(` and the last
 /// `)`), without parsing the rest.
 fn stat_name(text: &str) -> Option<&str> {
@@ -394,6 +419,7 @@ pub fn parse_pid_stat(text: &str, page_size: u64) -> Option<Process> {
         cpu_ticks: n(11)?.saturating_add(n(12)?),
         rss_bytes: n(21).unwrap_or(0).saturating_mul(page_size),
         fds: None,
+        tasks: Vec::new(),
     })
 }
 
@@ -757,11 +783,13 @@ impl Collector {
             .collect()
     }
 
-    /// One process's stat and descriptors, `None` when it is gone.
+    /// One of the router's processes: its stat, descriptors and threads;
+    /// `None` when it is gone.
     fn process(&self, pid: u32) -> Option<Process> {
         let dir = self.proc.join(pid.to_string());
         let mut p = parse_pid_stat(&read(&dir.join("stat"))?, self.page_size)?;
         p.fds = count_fds(&dir.join("fd"));
+        p.tasks = tasks(&dir.join("task"), self.page_size);
         Some(p)
     }
 
