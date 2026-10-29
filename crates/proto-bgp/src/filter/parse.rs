@@ -574,8 +574,8 @@ impl Parser<'_> {
 
     fn set(&mut self, verb: &str) -> Result<SetOp, ParseError> {
         let prop_at = self.at;
-        let prop =
-            self.word("a property (bgp-local-pref, bgp-med, bgp-path-prepend, bgp-communities, gw…)")?;
+        let prop = self
+            .word("a property (bgp-local-pref, bgp-med, bgp-path-prepend, bgp-communities, gw…)")?;
         let back = |p: &mut Self| p.at = prop_at;
         let num = |p: &mut Self, max: u64| -> Result<u64, ParseError> {
             let v = p.word("a number")?;
@@ -980,7 +980,9 @@ pub fn check_name(s: &str) -> Result<(), String> {
 pub fn gw_problem(a: std::net::IpAddr) -> Option<String> {
     use std::net::IpAddr;
     let bad = match a {
-        IpAddr::V4(v) => v.is_unspecified() || v.is_multicast() || v.is_broadcast() || v.is_loopback(),
+        IpAddr::V4(v) => {
+            v.is_unspecified() || v.is_multicast() || v.is_broadcast() || v.is_loopback()
+        }
         IpAddr::V6(v) => v.is_unspecified() || v.is_multicast() || v.is_loopback(),
     };
     if bad {

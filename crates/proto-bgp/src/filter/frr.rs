@@ -1410,6 +1410,63 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn set_gw_rewrites_the_next_hop_of_its_family_only() {
+        // G3.9fh: RouterOS 7.25 sends IPv6 over an IPv4 session with the
+        // next hop ::ffff:10.39.1.1, which the kernel does not install;
+        // the input chain writes the neighbor's IPv6 address over it.
+        let (v, _, text) = one(&[("in", "set gw fd39:1::1; accept")]);
+        assert!(text.contains(" match ipv6 address prefix-list "), "{text}");
+        assert!(
+            text.contains(" set ipv6 next-hop global fd39:1::1\n"),
+            "{text}"
+        );
+        assert!(!text.contains("set ip next-hop"), "{text}");
+        let lists = {
+            let mut l = Lists::default();
+            let f = filter(&[("in", "set gw fd39:1::1; accept")]);
+            let (parsed, _) = parsed_chains(&f);
+            let chains: HashMap<&str, &[Stmt]> = parsed
+                .iter()
+                .map(|(n, b)| (n.as_str(), b.as_slice()))
+                .collect();
+            let _ = compile(&f, &chains, "in", Some(65000), &mut l);
+            l
+        };
+        let r6 = Route::bgp("fd39:203::/48".parse().unwrap(), vec![65001]);
+        let got = frr_run(&v, &lists, &r6).unwrap();
+        assert_eq!(got.next_hop, Some("fd39:1::1".parse().unwrap()));
+        let r4 = Route::bgp("203.0.113.0/24".parse().unwrap(), vec![65001]);
+        assert_eq!(
+            frr_run(&v, &lists, &r4).unwrap().next_hop,
+            None,
+            "IPv4 routes keep theirs"
+        );
+        let (_, _, text) = one(&[("in", "set gw 10.39.1.1; accept")]);
+        assert!(text.contains(" set ip next-hop 10.39.1.1\n"), "{text}");
+        // The evaluator agrees.
+        let f = filter(&[("in", "set gw fd39:1::1; accept")]);
+        let (p, _) = Policy::build(&f);
+        assert_eq!(
+            p.eval(0, &r6, 65000).route.next_hop,
+            Some("fd39:1::1".parse().unwrap())
+        );
+        let o = p.eval(0, &r4, 65000);
+        assert!(o.accepted && !o.modified());
+        // What cannot be a next hop is refused where it is written.
+        for (rule, want) in [
+            ("set gw ::ffff:10.39.1.1", "IPv4-mapped"),
+            ("set gw fe80::1", "link-local"),
+            ("set gw ff02::1", "cannot be a next hop"),
+            ("set gw 0.0.0.0", "cannot be a next hop"),
+            ("set gw ether1", "expected an IPv4 or IPv6 address"),
+        ] {
+            let e = parse::parse(rule).unwrap_err().to_string();
+            assert!(e.contains(want) && e.contains("column 8"), "{rule}: {e}");
+        }
+        assert!(parse::parse("append gw 10.0.0.1").is_err());
+    }
+
+    #[test]
     fn prepend_counts_the_copy_ebgp_adds_on_ebgp_outputs() {
         // G3.9fg, RouterOS 7.25 CHR (measured): `set bgp-path-prepend N` on
         // eBGP leaves with the AS N times in all; N = 1 adds nothing.
@@ -1601,7 +1658,8 @@ pub(crate) mod tests {
             (0u32..300).prop_map(|n| format!("set bgp-local-pref {n}")),
             (0u32..300).prop_map(|n| format!("set bgp-med {n}")),
             (1u8..4).prop_map(|n| format!("set bgp-path-prepend {n}")),
-            prop_oneof![Just("set gw 192.0.2.9"), Just("set gw 2001:db8::9")].prop_map(str::to_owned),
+            prop_oneof![Just("set gw 192.0.2.9"), Just("set gw 2001:db8::9")]
+                .prop_map(str::to_owned),
             Just("set bgp-communities 65000:1".to_owned()),
             Just("set bgp-communities none".to_owned()),
             Just("append bgp-communities 65000:2,no-export".to_owned()),
