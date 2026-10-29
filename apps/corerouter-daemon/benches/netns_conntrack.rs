@@ -13,6 +13,8 @@
 //! `Session::execute_reply_as`, what the control channel runs under the
 //! lock; "answer" adds `Reply::finish`, run after it. Cold: the dump is
 //! older than `CACHE_SECS`, so the table is read again; warm: it is not.
+//! Then `ip.firewall.connection.remove` (G3.9hd): a filter, and the
+//! whole table.
 
 #![allow(
     clippy::unwrap_used,
@@ -164,6 +166,24 @@ mod linux {
                 median(cold.iter().map(|c| c.1).collect()),
                 median(wl),
                 median(warm.iter().map(|w| w.1).collect()),
+            );
+        }
+        // G3.9hd: remove by filter (the 50 flows to port 1, then to port
+        // 2), then the rest of the table.
+        for p in [
+            json!({"protocol": "udp", "dst_port": 1}),
+            json!({"src": "127.0.0.1", "dst_port": 2}),
+            json!({"all": true}),
+        ] {
+            let id = "ip.firewall.connection.remove";
+            let t = Instant::now();
+            let reply = s.execute_reply_as(&Caller::local(), id, &p).unwrap();
+            let lock = t.elapsed();
+            let v = reply.finish().unwrap();
+            println!(
+                "remove {p}: lock {lock:.2?}, answer {:.2?}, removed {}",
+                t.elapsed(),
+                v["removed"]
             );
         }
     }

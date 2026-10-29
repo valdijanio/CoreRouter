@@ -38,6 +38,14 @@ pub trait DnsBackend: Send + Sync {
     }
     fn cache_used_bytes(&self) -> usize;
     fn flush(&self);
+
+    /// The settings in force now (G1.6qc): called each time the session
+    /// hands the backend out, so a command right after `ip.dns.set` uses
+    /// the new servers instead of waiting for the daemon's next copy.
+    /// Cheap when nothing changed (implementations compare first).
+    fn configure(&self, settings: Settings) {
+        let _ = settings;
+    }
     /// What the resolver measured of each upstream server.
     fn server_stats(&self) -> Vec<(IpAddr, ServerStats)> {
         Vec::new()
@@ -132,8 +140,13 @@ impl Session {
         }
     }
 
+    /// The registered resolver, brought up to the running config first
+    /// (G1.6qc): `ip.dns.set` and the lookup that follows it see the same
+    /// servers, without waiting for the daemon's periodic copy.
     pub fn dns_backend(&self) -> Option<Arc<dyn DnsBackend>> {
-        self.ext::<DnsRuntime>()?.backend.clone()
+        let backend = self.ext::<DnsRuntime>()?.backend.clone()?;
+        backend.configure(self.dns_settings());
+        Some(backend)
     }
 
     /// RouterOS `dynamic-servers`: learned by DHCP clients with
