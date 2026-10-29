@@ -97,6 +97,15 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         upload_abort
     ),
     cmd!(
+        "system.package.download",
+        "Download Package",
+        [],
+        None,
+        "{url: string (http:// or https:// of a .crpkg), check?: bool (only check it), downgrade?: bool, ssl_verify?: bool (default yes), confirm?: auto|manual, timeout?: u32 (30..3600 s), reboot?: bool} → {job, kind}",
+        always,
+        download
+    ),
+    cmd!(
         "system.package.scrub",
         "Scrub Slot",
         [],
@@ -351,6 +360,28 @@ fn upload_start(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(out)
 }
 
+/// Longest URL taken.
+const MAX_URL: usize = 2048;
+
+fn download(s: &mut Session, p: &Value) -> Result<Value> {
+    let url = req_str(p, "url")?;
+    let clip: String = url.chars().take(64).collect();
+    let scheme_ok = url.starts_with("https://") || url.starts_with("http://");
+    if !scheme_ok || url.len() > MAX_URL || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(EngineError::bad(
+            "url",
+            format!("'{clip}': an http:// or https:// address without spaces, up to {MAX_URL} characters"),
+        ));
+    }
+    let kind = JobKind::Download {
+        url: url.to_owned(),
+        verify: opt_bool(p, "ssl_verify")?.unwrap_or(true),
+        downgrade: opt_bool(p, "downgrade")?.unwrap_or(false),
+        check: opt_bool(p, "check")?.unwrap_or(false),
+    };
+    queue(s, kind, p)
+}
+
 fn upload_chunk(s: &mut Session, p: &Value) -> Result<Value> {
     let id = req_u64(p, "upload")?;
     let offset = req_u64(p, "offset")?;
@@ -541,6 +572,27 @@ mod tests {
         assert!(rx.recv().is_err(), "sender dropped: end of stream");
         finish(&mut s, job.id, "upload", Ok(json!({"slot": "b"})));
         assert!(chunk(&mut s, 14, b"h").unwrap_err().to_string().contains("no upload"));
+    }
+
+    #[test]
+    fn download_queues_a_job() {
+        let mut s = Session::virtual_lab();
+        ab(&mut s);
+        let mut err = |p: Value| s.execute("system.package.download", &p).unwrap_err().to_string();
+        assert!(err(json!({"url": "ftp://x/y.crpkg"})).contains("http"));
+        assert!(err(json!({"url": "https://x/a b"})).contains("without spaces"));
+        assert!(err(json!({"url": format!("https://x/{}", "a".repeat(3000))})).contains("2048"));
+        assert!(err(json!({})).contains("required"));
+        let out = s
+            .execute("system.package.download", &json!({"url": "https://up.example/b.crpkg", "ssl_verify": false}))
+            .unwrap();
+        assert_eq!(out["kind"], "download");
+        let job = take_job(&mut s).unwrap();
+        assert_eq!(
+            job.kind,
+            JobKind::Download { url: "https://up.example/b.crpkg".into(), verify: false, downgrade: false, check: false }
+        );
+        assert!(job.kind.arms_trial());
     }
 
     #[test]

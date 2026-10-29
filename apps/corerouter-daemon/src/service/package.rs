@@ -45,6 +45,10 @@ const STATUS_EVERY: Duration = Duration::from_secs(2);
 const GRACE: Duration = Duration::from_secs(10);
 /// Between a slot-changing job's result and the reboot.
 const REBOOT_PAUSE: Duration = Duration::from_secs(2);
+/// The largest body a download takes (the package format's limit).
+const MAX_DOWNLOAD: usize = 4_430_233_600;
+/// The whole download (a slow link: 41 MiB at 1 Mbit/s is ~6 min).
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(1800);
 /// An upload with no chunk for this long is dropped (the client is gone).
 const UPLOAD_STALL: Duration = Duration::from_secs(60);
 const KEYS_DIR: &str = "/etc/corerouter/image-keys";
@@ -274,7 +278,11 @@ impl Svc {
             config_format: job.config_format,
             drill,
         };
-        let phase = if matches!(job.kind, JobKind::Upload { .. }) { "receiving and writing" } else { "writing" };
+        let phase = match job.kind {
+            JobKind::Upload { .. } => "receiving and writing",
+            JobKind::Download { .. } => "downloading and writing",
+            _ => "writing",
+        };
         let mut last = Instant::now();
         let mut progress = |done: u64, total: u64| {
             if last.elapsed() >= Duration::from_millis(100) || done == total {
@@ -298,6 +306,11 @@ impl Svc {
                 return Ok(json!({}));
             }
             JobKind::Check { path } => return check(p, Path::new(path)),
+            JobKind::Download { url, verify, downgrade, check } => {
+                let reason = if *downgrade { Reason::Downgrade } else { Reason::Update };
+                let o = opts(reason, false);
+                return download(session, p, url, *verify, *check, *downgrade, &o, &mut progress);
+            }
             JobKind::Upload { size, downgrade, check } => {
                 let rx = package::take_upload(&mut lock(session), job.id).ok_or("upload: its stream is gone (aborted)")?;
                 let mut src = ChunkReader::new(rx, *size, UPLOAD_STALL);
@@ -354,6 +367,57 @@ impl Svc {
         log::warn!("package: rebooting into the trial slot");
         reboot_image();
     }
+}
+
+/// G1.6e: fetches `url` on a thread of its own, the body going through a
+/// bounded queue (as an upload's chunks) to the install or the check on
+/// this one: never whole in memory.
+#[allow(clippy::too_many_arguments)]
+fn download(
+    session: &Shared,
+    p: &Platform,
+    url: &str,
+    verify: bool,
+    check: bool,
+    downgrade: bool,
+    o: &Opts,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<Value, String> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(package::UPLOAD_QUEUE);
+    let t = Instant::now();
+    let fetch = {
+        let session = session.clone();
+        let url = url.to_owned();
+        std::thread::Builder::new()
+            .name("pkg-download".into())
+            .spawn(move || -> Result<(), String> {
+                let mut send = |b: &[u8]| tx.send(b.to_vec()).map_err(|_| "the install stopped reading".to_owned());
+                let resolve = |h: &str| super::dns::resolve(&session, h);
+                super::https::get_to(&url, verify, MAX_DOWNLOAD, DOWNLOAD_TIMEOUT, &resolve, Some(&mut send)).map(|_| ())
+            })
+            .map_err(|e| format!("thread: {e}"))?
+    };
+    let mut src = ChunkReader::new(rx, MAX_DOWNLOAD as u64, UPLOAD_STALL).named("download");
+    let out = if check {
+        corerouter_sysupdate::upload::check(&mut src, None, &p.keys)
+    } else {
+        p.install_from(&mut src, None, downgrade, o, progress).map(|rep| rep.json())
+    };
+    let got = src.received();
+    drop(src); // a fetch still sending (a longer body) stops here
+    let fetched = fetch.join().map_err(|_| "download thread panicked".to_owned())?;
+    let mut v = match (out, fetched) {
+        // The server's error explains a stream that ended early.
+        (Err(e), Err(f)) if e.contains("aborted") || e.contains("stalled") => return Err(format!("{url}: {f}")),
+        (Err(e), _) => return Err(e),
+        (Ok(v), _) => v,
+    };
+    log::info!("package: downloaded {got} bytes from {url} in {} ms", t.elapsed().as_millis());
+    if let Some(m) = v.as_object_mut() {
+        m.insert("url".into(), json!(url));
+        m.insert("download_ms".into(), json!(t.elapsed().as_millis() as u64));
+    }
+    Ok(v)
 }
 
 /// A package's header, signature and payload hashes, without installing.

@@ -230,9 +230,10 @@ slot anterior, com a configuração que tinha. O slot em uso nunca é escrito.
 5. **Voltar depois de confirmado:** `run system.package.downgrade` boota o outro slot (a versão
    anterior) em teste, com a cópia da configuração que ele rodou por último.
 
+O roteador também baixa sozinho de um servidor HTTP(S) que ele alcance (um servidor interno, por
+exemplo): `run system.package.download '{"url":"https://…/corerouter.crpkg","confirm":"manual","timeout":600}'`.
 Sem acesso de rede ao roteador, o mesmo pacote vai num pendrive: `system.package.update
-{"path":"/dev/sdb"}` (G1.6b). O download direto de um canal por HTTPS, como o `/system package
-update` do RouterOS, ainda não existe (G1.6e, parte seguinte).
+{"path":"/dev/sdb"}` (G1.6b).
 
 ## Como ampliar depois
 

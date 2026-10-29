@@ -86,3 +86,26 @@ fn a_missing_file_says_why_and_sends_nothing() {
     let s = h.session.lock().unwrap();
     assert!(s.ext::<corerouter_engine::package::Packages>().unwrap().upload.is_none());
 }
+
+#[test]
+fn an_address_in_package_file_is_downloaded_by_the_router() {
+    let mut h = open();
+    h.app.panel_mut::<PackagesPanel>().unwrap().path = "https://up.example/b.crpkg".into();
+    h.idle();
+    h.click(h.text("Check"));
+    until(&mut h, "the job", |h| {
+        let s = h.session.lock().unwrap();
+        s.ext::<corerouter_engine::package::Packages>().unwrap().queued.is_some()
+    });
+    let mut s = h.session.lock().unwrap();
+    let job = corerouter_engine::package::take_job(&mut s).unwrap();
+    assert_eq!(
+        job.kind,
+        corerouter_engine::package::JobKind::Download {
+            url: "https://up.example/b.crpkg".into(),
+            verify: true,
+            downgrade: false,
+            check: true
+        }
+    );
+}

@@ -478,8 +478,8 @@ desenvolvimento do mesmo commit; o host tinha outras sessões rodando.
 ### O que ficou de fora e por quê
 
 - **Envio do pacote pela GUI e download pelo canal** (o `install` do MikroTik baixa sozinho):
-  o envio pelo canal de controle entrou na G1.6e (seção "Pacote pela rede" abaixo); o download
-  por HTTPS de um canal, ainda não.
+  o envio pelo canal de controle e o download de um endereço HTTP(S) entraram na G1.6e (seção
+  "Pacote pela rede" abaixo); o canal com índice de versões (`check-for-updates`), ainda não.
 - **Watchdog de hardware no boot de teste e Secure Boot (UKI assinado):** um kernel que trava
   antes do init (sem pânico) só volta com um reset; a raiz é conferida pelo hash raiz que está
   na NVRAM, e o kernel na ESP não é assinado. Gap G1.6f.
@@ -946,6 +946,27 @@ atualizar para o mesmo `build` é permitido.
 - **O resultado antes do reboot.** O serviço espera 2 s entre o resultado e o reboot, para quem
   enviou (CLI, GUI) ler o resultado antes de a conexão cair; se cair antes, o `--wait` segue
   pelo estado depois do reboot.
+
+### Download pelo próprio roteador
+
+```sh
+corerouter-cli … run system.package.download '{"url":"https://updates.example/corerouter.crpkg"}'
+corerouter-cli … run system.package.download '{"url":"http://192.0.2.5:8000/corerouter.crpkg","check":true}'
+```
+
+Como o `/system package update install` do RouterOS, mas de um endereço que o operador dá: o
+serviço `package` baixa numa thread própria (`pkg-download`) com o cliente HTTP do daemon
+(`service/https.rs`: resolvedor do roteador, certificado conferido pelas raízes da Mozilla
+embutidas, `ssl_verify=false` como o `ssl-verify=no`, redirecionamento para dentro da LAN
+recusado), e o corpo vai em pedaços de 256 KiB pela **mesma** fila limitada do envio até a
+mesma instalação em fluxo. `http://` é aceito: o pacote é assinado, o TLS só esconde o que se
+baixa. Na GUI, um endereço no campo **Package file** faz o Check e o Install and reboot baixarem.
+Erros do servidor (404, conexão cortada) aparecem no resultado do trabalho; nada é gravado no
+slot antes de a assinatura conferir.
+
+Fica para depois: o **canal** (um índice por canal — stable, testing… — com a última versão,
+como o `check-for-updates` do RouterOS) e o **delta por blocos** (o índice do RAUC): hoje cada
+atualização baixa o pacote inteiro (41 MiB).
 
 ### O teste em QEMU (`cargo xtask os ab-test --scenario push`)
 
