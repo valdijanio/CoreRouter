@@ -7615,3 +7615,415 @@ continuação indentadas).
 
   Como testar: `cargo test -p corerouter-proto-bgp set_gw`, `cargo test -p corerouter-engine --lib
   routing_bgp`; contra o CHR, `cargo xtask vm-lab run -- scripts/routeros-interop-bgp.sh mpbgp`.
+
+- 2026-10-29 — G0.31e: Um commit que só muda rotas não percorre mais as 60 000. O índice das rotas (G0.31d) passou a ser
+  por (tabela, destino sem bits de host) → ids, e `Routes::changed_dsts` dá os destinos das rotas
+  fora dos blocos do `CowList` que as duas configs compartilham (uma rota mudada: um bloco, ~128).
+  Com as interfaces e os endereços iguais (é só disso que `route::reach` depende), uma rota num
+  bloco compartilhado resolve igual dos dois lados, então só os destinos tocados são resolvidos:
+
+  - `hal::drift::route_changes`: as rotas do kernel que saem e entram, comparando só esses
+    destinos (com todas as rotas deles, das duas configs: duas entradas que viram a mesma rota do
+    kernel continuam certas);
+  - `hal-linux` `plan::plan`: com só rotas mudando, o plano sai daí (o mesmo do plano inteiro,
+    na mesma ordem; o inteiro ficou em `plan_whole`);
+  - `hal-linux` `plan::owned_routes`: as rotas nossas que o executor compara com um irmão de ECMP
+    são só as dos destinos das operações, não as das duas configs inteiras;
+  - `VirtualHal::carry`: o mesmo `route_changes`;
+  - engine `validate::validate_commit`: com só rotas mudando, a checagem de rotas olha só os
+    destinos tocados (uma duplicata junta duas rotas do mesmo destino, uma delas tocada); as
+    outras unidades como antes. Mesmos problemas, na mesma ordem: a build de debug confere com a
+    validação completa a cada commit, e o proptest `incremental_equals_full` ganhou mudanças de
+    rota (cópia duplicada, gateway inalcançável, bits de host, distância 0).
+
+  Mudança no `crates/engine/src/session.rs`: uma linha (`validate_commit` no lugar de
+  `validate_changed`, com a config em execução).
+
+  Como testar: `cargo test -p corerouter-hal-linux --lib plan::` (o teste
+  `a_routes_only_plan_is_the_whole_plan` compara o atalho com o plano inteiro em sete edições, nos
+  dois sentidos, e confere as rotas nossas), `cargo test -p corerouter-model --lib routes::`,
+  `cargo test -p corerouter-engine --test it incremental_validate`. Benches: `cargo bench -p
+  corerouter-hal-linux --bench route_plan`, `cargo bench -p corerouter-engine --bench route_scale`.
+
+  O que sobra no commit do backend virtual (~3 ms, `perf`): ~60 % é o `LabNeigh::sync` do
+  laboratório (vizinhos simulados dos gateways), que o backend Linux não tem.
+
+- 2026-10-29 — G0.31f: O commit do firewall não lê mais o kernel nem monta os dois programas inteiros quando ninguém mais
+  mexeu no nftables desde o commit anterior (`crates/hal-linux/src/fw_delta.rs`):
+
+  - **Estado guardado:** depois de um commit fica o `Firewall` da config (as tabelas de regras
+    dividem os blocos do `CowList` com a próxima config, então guardar custa ponteiros), o handle
+    do kernel de cada regra, por posição, e quantas regras precisam de cada chain, set de portas e
+    set de address list.
+  - **Só o que mudou:** as regras fora dos blocos que as duas configs ainda dividem (uma regra
+    mudada: um bloco, ~128), sem as iguais do começo e do fim; só essas viram regras do kernel
+    (`corerouter_firewall::nft::program_rules`) e entram no Myers. Regra cuja forma no kernel não
+    mudou (o comentário, por exemplo) fica com o handle e os contadores.
+  - **Um lote:** remoções por handle; sets de portas, sets de lista e chains novos; inserções logo
+    depois do handle da regra anterior da mesma chain (em ordem reversa por âncora); chains e sets
+    que ninguém usa mais. As regras novas voltam em eco (`NLM_F_ECHO`) com os handles, até 2 048
+    por commit.
+  - **Deriva:** todo lote nosso leva o `NFNL_BATCH_GENID` da geração que o lote anterior nosso criou
+    (o kernel a devolve em `NFT_MSG_NEWGEN` quando a primeira mensagem do lote pede eco); se outro
+    processo fez commit no meio, o kernel recusa o lote inteiro (`ERESTART`), nada muda, e o commit
+    segue pelo caminho antigo (lê o kernel, confere, diferencia ou troca a tabela), que já deixa o
+    estado guardado para o próximo. Um lote do próprio processo que escreve a tabela fora do commit
+    (teste, `firewall::replace`) aparece na contagem de escritas da tabela (`nfnl::stamp`) e faz o
+    mesmo. CGNAT, fast path e entradas dinâmicas são nossos e não invalidam nada.
+  - **Fora do caminho rápido** (vão pelo antigo, como antes): mudança de address list estática, de
+    interface list ou de aviso a assinante; regra que passa a preencher uma lista (ou deixa de);
+    tabela que some.
+
+  Achado no caminho: os 12–28 ms "de kernel" de qualquer lote que remove algo (G2.8) eram de
+  **fechar** o socket netfilter logo depois: no `NETLINK_URELEASE` o kernel espera a liberação do
+  que o commit apagou (`nft_rcv_nl_event` → `flush_work` → `synchronize_rcu`, com o
+  `commit_mutex` preso). O socket dos lotes (`nfnl`) e o leitor do firewall (`nft_read::with_reader`)
+  ficam abertos o processo todo: remover uma regra caiu para 0,06–0,4 ms (**medido**), e isso vale
+  para CGNAT, fast path e entradas dinâmicas também.
+
+  Mudança no `nfnl` (compartilhado): o `BATCH_BEGIN` tem 8 bytes a mais (o genid, 0 quando
+  desconhecido) e a primeira mensagem de cada lote pede eco; `apply` continua com a mesma assinatura.
+
+  Como testar:
+
+  ```sh
+  COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- \
+      cargo test -p corerouter-hal-linux --test netns_fw_delta
+  COREROUTER_NETNS_BENCH=1 unshare --user --map-root-user --net -- \
+      cargo bench -p corerouter-hal-linux --bench netns_firewall -- 'nfnetlink'
+  ```
+
+  O `netns_fw_delta` aplica edições aleatórias (inserir, remover, mover, desligar, trocar a forma,
+  chain nova com jump, mangle, lista reconstruída sem blocos compartilhados) pelo caminho rápido e
+  confere que o kernel fica igual a carregar a última config do zero; com cinco derivas (regra
+  acrescentada à mão, chain esvaziada, tabela apagada, tabela de outro programa, escrita do próprio
+  processo) o commit seguinte lê o kernel e chega ao mesmo resultado. Testes de mutação: âncora
+  errada e deriva ignorada reprovam os testes. `corerouter-firewall` ganhou
+  `needs_add_up_to_the_build` (as peças por regra somam o que o `build` faz da config inteira).
+
+  Desempenho e paralelismo: o trabalho por commit agora é O(blocos) para achar o que mudou e
+  O(regras mudadas) para montar e diferenciar (~1,5 ms nosso com 10 000 regras, **medido**:
+  `shared_blocks`, a cópia dos handles e a busca da âncora são lineares mas baratos). O resto é do
+  kernel: uma regra com veredito, `reject` ou `nat` marca a tabela para revalidar inteira
+  (`NFT_VALIDATE_NEED`, `nf_tables_api.c`), O(regras) a cada commit, ~0,3 µs por regra aqui. Não há
+  o que dividir em threads: o commit roda sob o lock do `Session`, o lote é um só e o nf_tables o
+  serializa no `commit_mutex`; as três threads do caminho antigo (programa antigo, novo e dump)
+  ficam só para o primeiro commit e depois de deriva. O socket compartilhado serializa os lotes do
+  processo num mutex, o que o kernel já fazia.
+
+- 2026-10-29 — G1.6qb: Saúde avisa raiz sem dm-verity: checagem nova `root.verity` ("Root verity") no
+  `system.health.check`, lida do estado que o serviço de pacotes já informa (`slots[].verity` do
+  `system.package.print`). Aviso quando o slot `running` não sobe pelo dispositivo dm-verity do
+  hash assinado (primeiro boot de qcow2/OVA ou de disco gravado com `dd` pelo caminho reserva
+  `root=PARTUUID=`, NVRAM apagada), com a ação "Reinicie uma vez (`/system reboot confirm=yes` ou
+  system.reboot)"; ok com verity; desconhecido fora da imagem A/B e no laboratório do serviço de
+  pacotes. Como toda checagem, a mudança para aviso vai ao log do roteador (tópicos `system`,
+  `warning`, origem `health`) depois de duas leituras: a VM do teste de 29/10 rodou um dia assim
+  sem ninguém saber. GUI: System › Resources mostra a linha com o ⓘ (en/pt).
+
+  Testes: tabela do `health_check` (aviso, desconhecido) e
+  `system_health::root_without_verity_says_reboot_once` (sem verity → aviso com a ação; com
+  verity → ok; laboratório → desconhecido).
+
+- 2026-10-29 — G1.6qc: `ip.dns.resolve` logo depois de `ip.dns.set`: o `Session::dns_backend()` (por onde passam
+  `ip.dns.resolve`, `tool.dns.query`, ping/MTU/MTR por nome, o NTP do daemon e as consultas de
+  cache/estatística) agora entrega o resolver depois de chamar `DnsBackend::configure` com as
+  configurações da config em vigor (`dns_settings`: running + servidores aprendidos por DHCP). O
+  resolver compara e só troca se mudou. A thread `dns` continua copiando a config a cada segundo
+  para o encaminhador da LAN e para os servidores de DHCP que chegam sem comando. O reproduzido na
+  imagem de 29/10 ("no DNS server configured" logo depois do `ip.dns.set servers=…`) vira o teste
+  `service::dns::tests::resolve_right_after_set_uses_the_new_server` (sem a thread que segue a
+  config: falha sem a correção com a mesma mensagem, **medido**), e o `netns_dns` perdeu a espera de
+  1,5 s e resolve na hora depois do `ip.dns.set`.
+
+  Como testar: `cargo test -p corerouter-daemon --bin corerouter-daemon service::dns::`;
+  `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-daemon --test netns_dns`.
+
+  Custo: uma montagem do `Settings` (lista de servidores, DoH, servidores do DHCP) e uma comparação
+  sob o mutex do resolver por comando que pede o resolver, não por pacote nem por consulta da LAN
+  (poucos µs, **estimado**).
+
+- 2026-10-29 — G1.6qd: Métricas de processo e de saúde no `/metrics`. O `system.metrics` (e, com ele, o `/metrics` do
+  Prometheus e a tabela de métricas do ClickHouse) ganha:
+
+  - `memory` → `corerouter_memory_{MemTotal,MemAvailable,MemFree,SwapTotal,SwapFree}_bytes`, como
+    o coletor `meminfo` do node_exporter;
+  - `filesystems` → `corerouter_filesystem_{size,free,avail}_bytes{mountpoint,device,fstype}`, o
+    `/config` da imagem entre eles, como o coletor `filesystem` do node_exporter;
+  - `processes`, com os processos do próprio roteador: o daemon, o `corerouter-init` e os daemons
+    do FRR. Vira `corerouter_process_{count,resident_memory_bytes,threads,open_fds}` e
+    `corerouter_process_cpu_seconds_total{process}`, como o `process_*` das bibliotecas cliente,
+    somados por nome. Não há rótulo `pid`, que mudaria a cada restart do FRR;
+  - `health` → `corerouter_health_status` (0 ok, 1 aviso, 2 erro) e
+    `corerouter_health_check_status{check}` (sem amostra enquanto `unknown`), julgados como no
+    `system.health.check`, sem registrar no log.
+
+  Os números vêm da última leitura do serviço `health`, tirada fora do lock a cada 5 s (aceita até
+  15 s; mais velha, o comando lê na hora). A leitura passou a trazer `Sample::router`: o `stat` e o
+  `fd` desses processos em toda leitura. Os PIDs ficam guardados, e o `/proc` inteiro só é
+  varrido de novo a cada 30 s ou quando um PID some ou muda de nome (FRR reiniciado pelo
+  `watchfrr`).
+
+  Como testar:
+
+  - `cargo test -p corerouter-daemon --bin corerouter-daemon service::metrics`: formato,
+    soma por nome, sem `pid`, nada para descritor ilegível nem checagem `unknown`, e o
+    `system.metrics` do laboratório renderizado;
+  - `cargo test -p corerouter-hal-linux --lib resource`: o `bgpd` da árvore de fixture
+    encontrado, a varredura antecipada com PID sumido ou reaproveitado;
+  - `corerouter-daemon --metrics 127.0.0.1:9733` e `curl 127.0.0.1:9733/metrics`.
+
+  Ficou de fora: `process_max_fds` (`/proc/<pid>/limits`), para alarmar descritores perto do
+  limite, e regras de alerta prontas para o Prometheus.
+
+- 2026-10-29 — G1.6qe: CPU por thread do daemon. Cada leitura do serviço `health` (a cada 5 s, ou a cada segundo com
+  a janela aberta, sempre fora do lock) passou a ler também o `/proc/<pid>/task/<tid>/stat` dos
+  processos do roteador (o daemon, o `corerouter-init` e o FRR, os mesmos do G1.6qd). O nome de
+  cada thread é o que o `thread::Builder` deu.
+
+  `system.resource.process.print {threads: true}` devolve só esses processos, cada um com
+  `tasks: [{tid, name, state, cpu}]`, a mais ocupada primeiro. O `cpu` é a fatia de **um** núcleo
+  entre as duas últimas leituras, não um acumulado: uma thread a 100 % é um núcleo cheio, o caso do
+  plano de controle PPPoE preso num núcleo do laboratório do BNG de 2026-10-25.
+
+  A GUI ganhou a aba **System › Resources › Threads**, opção A do mockup enviado à sessão
+  principal:
+
+  - uma linha por thread (processo, TID, nome, estado, CPU de um núcleo), em ordem decrescente;
+  - as paradas aparecem esmaecidas;
+  - um selo âmbar a partir de 90 % de um núcleo, ou verde ("nenhuma thread enche um núcleo");
+  - ⓘ em português na aba, nas colunas e no selo.
+
+  O laboratório tem as 24 threads do daemon, com o `pppoe-ctl` puxando a CPU. Screenshots nos dois
+  temas em `docs/changes/G1.6qe-screenshots/`.
+
+  Como testar:
+
+  - `cargo test -p corerouter-engine --lib system_resource` (`threads_of_the_router_processes`);
+  - `cargo test -p corerouter-hal-linux --lib resource`: as threads do `bgpd` da fixture, e uma
+    thread com nome criada no teste aparecendo pelo nome;
+  - `cargo test -p corerouter-ui --lib resources`;
+  - `corerouter-cli run system.resource.process.print '{"threads": true}'`.
+
+- 2026-10-29 — G3.9fb: BGP: anúncio por conexão, exato como no RouterOS. O FRR origina por instância (`network` e
+  `redistribute` valem para todos os vizinhos da família); o RouterOS manda a cada conexão só o seu
+  `output.network` e `output.redistribute`. Agora a conexão que pede menos que a união da instância
+  ganha um route-map de saída próprio, `CR-C+<conexão>`:
+
+  - passam as nossas rotas da lista dela (`ip`/`ipv6 prefix-list CR-C+<conexão>+4/+6`) e dos
+    protocolos que ela redistribui (`match source-protocol connected|kernel|ospf|ospf6`, `on-match
+    goto 100`); param as rotas `network` das outras conexões (o prefixo, `CR-C+<conexão>+not4/6`, e
+    o AS_PATH vazio de rota nossa, `bgp as-path access-list CR-C+local ^$`) e os protocolos que só
+    as outras redistribuem. O `match peer local` do FRR não serve: num route-map de saída o "peer" é
+    o vizinho de destino (FRR 10.4, `prep_for_rmap_apply`), visto no laboratório;
+  - tudo o que passa vai para a chain dela (`call CR-<chain>`, ou o mapa eBGP da G3.9fg); iBGP sem
+    chain passa o resto; eBGP sem chain segue sem receber nada (RFC 8212);
+  - um prefixo conectado ou estático que outra conexão lista no `output_network` vai também para a
+    que redistribui connected/static: no `bgpd` é uma rota só (a do `network`, origem IGP), que o
+    `source-protocol` não veria;
+  - quando todas as conexões da família pedem o mesmo, o render não muda (nenhum mapa novo).
+
+  O caso `filters` do `scripts/bgp-crcr-userns.sh` passou a esperar a contagem de prepend da
+  G3.9fg (`65000 65000` para N = 2).
+
+  Laboratório do host com FRR 10.7.1 real (**medido**, 2026-10-29, `scripts/bgp-crcr-userns.sh
+  announce`, caso novo): CR1 com o CR2 (`output_network` bgp-out) e o R3 (outra lista +
+  `redistribute connected`). O R3 recebe a lista dele, as conectadas e o `100.64.39.0/24` (conectado,
+  originado pelo `network` do CR2); o CR2 recebe só o `100.64.39.0/24`, sem a lista do R3 nem as
+  conectadas; `output_redistribute=connected` na conexão do CR2 leva as conectadas a ele 219 ms
+  depois do commit, sem reset; 9 de 9 OK.
+
+  Como testar: `cargo test -p corerouter-proto-bgp each_connection`; com FRR real, sem root nem
+  VM: `scripts/bgp-crcr-userns.sh announce`.
+
+- 2026-10-29 — G3.9fc: BGP: extended communities (RFC 4360) no `routing.filter`, com os nomes do RouterOS v7.
+
+  - Valores: Route Target `rt:` e Site of Origin `soo:` nas três formas, AS de 2 octetos (RFC 4360
+    §3.1), IPv4 (§3.2) e AS de 4 octetos (RFC 5668), ou os 16 dígitos hex de um deles. Guardados na
+    `community-list` junto das normais e das large (é a `community-ext-list` do RouterOS).
+  - Matchers `bgp-ext-communities includes|any|equal|subset` (e `-list`); ações `set` (troca; `none`
+    apaga), `append`, `delete VALORES|LISTA|rt|soo|other` e `filter` (deixa só as dadas).
+  - FRR: includes/any/equal viram `bgp extcommunity-list standard` + `match extcommunity`
+    (`exact-match`); subset e os deletes viram listas `expanded` (regex POSIX no texto do FRR,
+    `RT:65000:1`; o `delete` testa valor a valor e a primeira entrada decide,
+    `ecommunity_list_match_delete`). O `set extcommunity` do FRR sempre soma, então o `set` do
+    RouterOS sai como `set extcommunity none` e depois os valores, em duas entradas. O `hal-frr`
+    passou a ser dono das `bgp extcommunity-list … CR-`.
+  - O proptest render × avaliador inclui as extended (matchers, ações, listas) num modelo do FRR que
+    segue o `bgp_clist.c`; 5 000 casos sem divergência (**medido**).
+  - `routing.bgp.route.list` e `route.explain` trazem `ext_communities` (`rt:65000:1`), na coluna
+    Communities da janela de rotas; a tabela do `route.list` segue sem communities até a G3.2g, o
+    `route.explain` mostra. A lista de communities ganhou a coluna Extended.
+  - `rule.check` avisa `ext-set` (o `set` troca os RT também) e `ext-rt` (`delete … rt` ou `filter`
+    sem RT: rota VPN sem RT não é importada).
+
+  Laboratório do host com FRR 10.7.1 real (**medido**, 2026-10-29, `scripts/bgp-crcr-userns.sh
+  extcomm`, caso novo): append `rt:65000:7` + `soo` no CR1, `delete … soo` no CR2 deixa
+  `RT:65000:7`; `includes-list` → local-pref 300; `subset` → MED 9; `route.explain` mostra
+  `rt:65000:7`; `set rt:65000:8,rt:1:1` troca tudo (o `soo` acrescentado antes some) 5,2 s depois do
+  commit, sem reset; 6 de 6 OK.
+
+  Contra o RouterOS 7.25 CHR (**medido**, VM `corerouter-lab`, 2026-10-29, caso `communities`, 8 de 8
+  OK): `bgp-ext-communities includes rt:65001:7` (o RT que o CHR põe) → local-pref 222 no CR1;
+  `delete bgp-ext-communities rt` deixa a rota sem RT; o `append bgp-ext-communities rt:65000:9` do
+  CR1 chega ao CHR (`bgp.ext-communities`).
+
+  Como testar: `cargo test -p corerouter-proto-bgp ext`, `cargo test -p corerouter-engine --lib
+  extended_communities`; `scripts/bgp-crcr-userns.sh extcomm`; contra o CHR, `cargo xtask vm-lab run
+  -- scripts/routeros-interop-bgp.sh communities`.
+
+- 2026-10-29 — G3.9ga: Cliente PPPoE, parte 1 (comandos e plano de dados). O CoreRouter disca para um servidor PPPoE
+  como WAN: `interface.pppoe-client.{add,set,remove,enable,disable,reconnect,list,monitor,history,check}`
+  com os nomes e padrões do RouterOS v7 (`add-default-route=no`, distância 1, `max-mtu` 1460,
+  `keepalive-timeout` 60, `allow` todos). A interface `pppoe-out1` é uma veth (`LinkSpec::PppoeOut`)
+  cujo outro lado é um relé `AF_PACKET`, uma thread por sentido. O endereço, a rota até o BNG, a
+  rota padrão e o DNS entram como entradas dinâmicas, como um lease DHCP.
+
+  Além do RouterOS:
+  - rediscagem com espera crescente: 1 s a 60 s com jitter, e no mínimo 30 s depois de falha de
+    autenticação;
+  - PADT da sessão que a execução anterior deixou (RFC 2516 §5.5), guardada no estado
+    `pppoe-client-sessions`;
+  - MSS clamp em IPv4 e IPv6 no relé (RFC 1624);
+  - motivo da queda em código, com as palavras do BNG (só o `M=` do MS-CHAP);
+  - avisos de rota padrão disputando com o DHCP client na mesma distância e de falta de rota
+    padrão;
+  - senha lacrada como a dos `/ppp secret` (`show_sensitive` só para o grupo full).
+
+  No `proto-pppoe`, o `Client` ganhou `ac_name`, `max-mtu` separado do `max-mru`, a mensagem de
+  recusa do BNG e `padt()`. O laboratório virtual tem um BNG simulado (`LabBng`) para a demonstração
+  e os testes. Pesquisa e decisões estão em `docs/pppoe-client.md`.
+
+  Como testar:
+  - `cargo test -p corerouter-engine --lib pppoe_client`: sessão com o BNG simulado, espera
+    crescente, rollback e validação;
+  - `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-daemon --test netns_pppoe_client -- --test-threads 1`:
+    o daemon cliente contra o daemon BNG em dois namespaces, com MS-CHAPv2, ping pelo relé, senha
+    errada, `kill -9` seguido de PADT e desativação;
+  - `cargo test -p corerouter-hal-linux --test netns_pppoe_client` (namespace): o relé nos dois
+    sentidos, o controle separado, outra sessão descartada e o MSS;
+  - `cargo xtask vm-lab run -- env XDP=0 scripts/routeros-interop-pppoe.sh client` contra o
+    RouterOS 7.25 CHR: sessão em 2,5 s, ping, DF de 1460 B, PADT do CHR visto em 238–325 ms, rediscagem em ~3 s, senha
+    errada com a mensagem do CHR e PADT ao desativar em 130–242 ms (**medido**).
+
+- 2026-10-29 — G3.9ga: Cliente PPPoE, parte 2 (GUI).
+
+  O menu PPP passou a ter dois itens, conforme a escolha B1 do usuário:
+  - **PPP › PPPoE Server (BNG)** abre a janela de hoje, com as 9 abas. O selo neutro mostra
+    quantas sessões estão ativas.
+  - **PPP › PPPoE Client** é a janela nova. O selo âmbar mostra quantas conexões caíram.
+  - A busca acha `/interface pppoe-client`, "pppoe-out", "discador" e "dialer".
+
+  A janela PPPoE Client segue o padrão de lista G0.24:
+  - **Barra:** + − ✓ ✗ 💬, Reconnect e os filtros de estado.
+  - **Linhas:** uma por conexão, com estado em selo; quando a conexão cai, outro selo diz o
+    motivo e a linha diz quando ela disca de novo. Interface com cor por chave, endereço e par,
+    uptime, MTU e rota padrão com a distância.
+  - **Monitor:** a conexão selecionada mostra embaixo o `monitor` (AC, sessão, autenticação,
+    MTU/MRU, DNS, contadores e a última queda com as palavras do BNG).
+  - **Modal:** alimentado por `interface.pppoe-client.preview`, com nome automático, MTU, MSS,
+    rota padrão, os avisos de ECMP e de falta de rota padrão, e a prévia RouterOS com a senha
+    mascarada.
+  - **ⓘ:** em português e em inglês em todos os campos e colunas.
+
+  Na janela Interfaces, a conexão aparece com o tipo `pppoe-out`, que fica `running` só com a
+  sessão de pé.
+
+  Como testar:
+  - `cargo test -p corerouter-ui --lib pppoe_client`;
+  - `corerouter-daemon --control 7979`, depois `corerouter-gui --connect 127.0.0.1:7979`, depois
+    `interface.pppoe-client.add` pela CLI. O BNG simulado do laboratório responde: senha `wrong`
+    recusa, qualquer outra conecta;
+  - screenshots em `docs/changes/G3.9ga-screenshots/` (lista clara e escura, modal).
+
+- 2026-10-29 — G3.9ha: IPv6 › ND: o CoreRouter passa a enviar Router Advertisements nas LANs (o kernel do Linux não
+  envia), e um host ou um RouterOS atrás dele faz SLAAC e pega o gateway IPv6.
+
+  **Comandos:**
+  - `ipv6.nd.add/set/remove/enable/disable/list`, `ipv6.nd.prefix.*` e as pré-visualizações
+    `ipv6.nd.check` e `ipv6.nd.prefix.check`;
+  - nomes e padrões do RouterOS v7: `ra-interval` 3m20s-10m, `ra-lifetime` 30m, prefixo 4w2d/1w.
+
+  **Prefixos:**
+  - os dinâmicos vêm dos endereços globais /64 da interface;
+  - um endereço tirado do prefixo delegado (`ip.address from_pool`) anuncia o /64 dele com os
+    lifetimes que restam da delegação, com teto de 5400/2700 s (RFC 9096 §3.4); quando o PD muda,
+    o prefixo velho sai depreciado;
+  - um estático com o mesmo prefixo substitui o dinâmico ou, desativado, o esconde.
+
+  **DNS no RA (RFC 8106):** `advertise_dns`, `dns` e `dnssl` (RDNSS e DNSSL), com lifetime de
+  3 × o intervalo máximo e 0 no RA final. Os servidores vêm, na ordem:
+  - da lista da própria entrada;
+  - deste roteador, quando ele responde consultas (`ip.dns allow_remote_requests`);
+  - do `/ip dns` e do DHCPv6.
+
+  **Segurança por padrão:**
+  - a config nova não tem entrada `all`;
+  - `all` pula a WAN (cliente DHCPv6, RA aceito, rota padrão), as portas de servidor PPPoE, as
+    portas de bridge e de bond e as interfaces sem prefixo, cada uma com o motivo;
+  - uma entrada explícita numa WAN é aceita, com aviso;
+  - uma entrada numa porta PPPoE é recusada.
+
+  **Emissor (serviço `router-advertisement`):** uma thread e um socket raw ICMPv6 com filtro BPF só para RS e
+  RA. Segue a RFC 4861:
+  - 3 RAs iniciais a ≤ 16 s e depois intervalo aleatório (§6.2.4);
+  - resposta ao RS em 0–0,5 s, respeitando `ra-delay` (§6.2.6);
+  - SLLAO, MTU, M/O, hop limit e preferência (RFC 4191 §2.2);
+  - RA final com lifetime 0 ao desativar ou parar (§6.2.5);
+  - prefixo que sai vai 3 vezes com lifetimes 0 (RFC 9096 §3.5);
+  - divergência de outro roteador vai para o log e para o selo `conflict` (§6.2.7).
+
+  **GUI:** IPv6 › ND (opção A do mockup), com as abas Interfaces (entradas e interfaces
+  alcançadas) e Prefixes, no padrão G0.24 e com ⓘ em português.
+
+  **Como testar:**
+  - `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-daemon --test netns_ipv6_nd`:
+    - o host faz SLAAC e pega a rota padrão em 1,8–4,8 s, contando o DAD (**medido**);
+    - o RA final tira a rota;
+    - com um servidor DHCPv6 num terceiro namespace, o host faz SLAAC no /64 delegado com o
+      lifetime da delegação e recebe RDNSS/DNSSL.
+  - `cargo xtask vm-lab run -- scripts/routeros-interop-l2.sh ra`, contra o RouterOS 7.25 CHR
+    (**medido** em 2026-10-29):
+    - o CHR autoconfigura a partir do RA do CoreRouter em 2,3 s;
+    - o CHR usa o link-local do CoreRouter como rota padrão;
+    - o RA final tira essa rota em 1,1 s;
+    - o sentido CHR → CoreRouter continua OK.
+
+  Pesquisa e decisões em `docs/ipv6-nd.md`.
+
+- 2026-10-29 — G3.9hd: `ip.firewall.connection.remove`, como o `/ip firewall connection remove [find …]` do RouterOS e o
+  `conntrack -D` do Linux, para limpar as conexões depois de mudar o NAT: uma entrada que já
+  existe mantém a tradução antiga até expirar.
+
+  - **Filtros:** os mesmos da lista (`id`, `protocol`, `src`, `dst`, `port`, `state`,
+    `subscriber`, `public`, `via`, `nat`), mais `src_port`/`dst_port` (os `--sport`/`--dport` do
+    `conntrack -D`). A lista ganhou `id`, para conferir uma conexão.
+  - **Contagem e confirmação:** `dry_run=true` conta sem apagar (`matched`). Sem filtro, só com
+    `all=true`, e a resposta avisa que todo fluxo do NAT recomeça no próximo pacote.
+  - **Gerência:** a conexão TCP de quem pede (o `Caller` do canal de controle, comparada pelo
+    lado de resposta, que também vale atrás de um dstnat) fica de fora por padrão
+    (`kept_management`, com aviso). `include_management=true` a apaga também, com o aviso de que
+    um firewall que só aceita `established` derruba a sessão.
+  - **Journal:** é ação, então entra no journal com os parâmetros, como todo comando que não é
+    consulta. Não é config: age na hora também em modo transacional, não cria revisão, e um
+    `config.rollback` não traz as conexões de volta.
+  - **Fora do lock:** com o backend linux, a leitura e a remoção rodam depois do lock (G0.31c), no
+    socket próprio do leitor (`Scanner::remove`, novo, com padrão "não suportado" no HAL). O lab
+    apaga sob o lock. O `kill` (nome antigo, usado pela GUI) virou o mesmo código e responde
+    `killed`; agora também preserva a conexão de gerência.
+  - **`ctnl::delete` em lote:** 256 pedidos por datagrama e as respostas lidas com um buffer só.
+    Antes eram um pedido, uma espera e um buffer de 128 KiB alocado por conexão.
+
+  Como testar: `cargo test -p corerouter-engine --test it connections` (filtro, id, `dry_run`,
+  `all`, parâmetros inválidos sem efeito, gerência preservada, journal e rollback) e `cargo test -p
+  corerouter-hal-linux --lib ctnl` (as respostas do lote, com proptest). Em namespace:
+  `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
+  corerouter-daemon --test netns_conntrack_remove`, contra o conntrack do kernel, com a resposta
+  fora do lock. No terminal: `corerouter-cli run ip.firewall.connection.remove
+  '{"protocol":"udp","dst_port":53,"dry_run":true}'`.
+
+- 2026-10-29 — processo-ci-3-vagas: Vagas de CI na máquina de 2 para 3 (pedido do usuário, 2026-10-29): com o disco de build próprio
+  (`/srv/build`) e 8–10 sessões em paralelo, o gargalo passou a ser a fila das 2 vagas do
+  `cargo xtask ci` (sessões esperando até 30 min, **medido** em 29/10). A máquina tem 32 núcleos;
+  3 compilações juntas cabem sem que cada uma fique bem mais lenta (**estimado**; 4 ficaria
+  limitado pela RAM com a GPU reservando 64 GB). `COREROUTER_CI_SLOTS` continua mudando o número.
