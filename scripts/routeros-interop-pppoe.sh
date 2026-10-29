@@ -5,6 +5,7 @@
 #   cargo xtask vm-lab run -- scripts/routeros-interop-pppoe.sh [case…]
 # Cases (default: all, in this order): auth mtu ipcp-dns ipv6 keepalive padt
 #   service-name mac-limit multi radius coa import client timeline
+# (client: the CoreRouter dialing the CHR's pppoe-server, G3.9ga)
 # HOLD=<s> keeps the lab up that long at the end; XDP=0 leaves the access
 # and uplink ports on the slow path (no XDP data plane, no policer).
 # MULTI=<n> sets how many CHR clients the `multi` case brings up (default 32).
@@ -814,13 +815,70 @@ case_timeline() {
 }
 
 case_client() {
-  # The reverse direction: the CoreRouter as a PPPoE client of a RouterOS
-  # pppoe-server. There is no interface.pppoe-client yet.
-  if ip netns exec crgcore "$bin/corerouter-cli" --connect 127.0.0.1:7991 list interface.pppoe-client 2>/dev/null | grep -q pppoe-client; then
-    result client INFO "interface.pppoe-client exists: write this case"
+  # G3.9ga, the reverse direction: the CoreRouter as a PPPoE client
+  # (interface.pppoe-client) of the CHR's pppoe-server, on the same ether1.
+  # Our own BNG never hears our PADI (its sockets drop what this host sends),
+  # but it is disabled meanwhile so only the CHR can answer.
+  cli interface.pppoe-server.server.disable "{\"id\":\"$SRV\"}" >/dev/null || true
+  rosx "/ip pool add name=g39ga ranges=10.39.0.10-10.39.0.50" >/dev/null
+  rosx "/ppp profile add name=g39ga local-address=10.39.0.1 remote-address=g39ga dns-server=10.39.0.53" >/dev/null
+  rosx "/ppp secret add name=crcli password=g39ga-pw service=pppoe profile=g39ga" >/dev/null
+  rosx "/interface pppoe-server server add interface=ether1 service-name=g39ga default-profile=g39ga authentication=mschap2,mschap1,chap,pap one-session-per-host=yes disabled=no" >/dev/null
+  local ms m chr enc
+  pcm() { cli interface.pppoe-client.monitor '{"name":"pppoe-out1"}'; }
+  pc_connected() { [ "$(pcm | jq -r .status)" = connected ]; }
+  chr_active() { ros "ppp/active?name=crcli" | jq -c '.[0] // empty'; }
+  chr_up() { [ -n "$(chr_active)" ]; }
+  chr_gone() { [ -z "$(chr_active)" ]; }
+  pc_was_down() { [ -n "$(pcm | jq -r '.last_down.reason // empty')" ]; }
+  pc_refused() { [ "$(pcm | jq -r '.last_down.reason // empty')" = auth-failed ]; }
+  cli interface.pppoe-client.add '{"name":"pppoe-out1","interface":"ether1","user":"crcli","password":"g39ga-pw","service_name":"g39ga","use_peer_dns":true}' >/dev/null
+  ms=$(wait_for 30 pc_connected) || { result client FAIL "no session with the CHR in 30 s: $(pcm | jq -c '{status, last_down, last_error}')"; dump; return 0; }
+  m=$(pcm); chr=$(chr_active)
+  # The CHR leaves /ppp active encoding empty without MPPE: ours says it.
+  enc=$(jq -r '.encoding // "?"' <<< "$m")
+  result client OK "up in ${ms} ms: $(jq -c '{local_address, remote_address, mtu, mru, ac_name, dns}' <<< "$m"); CHR: $(jq -c '{address, encoding, "caller-id"}' <<< "$chr")"
+  [ "$(jq -r .local_address <<< "$m")" = "$(jq -r .address <<< "$chr")" ] \
+    && result client OK "the address IPCP gave is the one the CHR lists" \
+    || result client FAIL "addresses differ: CR $(jq -r .local_address <<< "$m"), CHR $(jq -r .address <<< "$chr")"
+  [ "$enc" = mschap2 ] && result client OK "MS-CHAPv2 (RouterOS order)" || result client FAIL "encoding $enc, not mschap2"
+  [ "$(jq -r '.dns[0] // empty' <<< "$m")" = 10.39.0.53 ] && result client OK "use-peer-dns: 10.39.0.53" \
+    || result client FAIL "DNS from IPCP: $(jq -c .dns <<< "$m")"
+  # Traffic through the relay: the CHR's side of the link.
+  if ip netns exec crgcore ping -c 3 -i 0.2 -W 2 10.39.0.1 >/dev/null 2>&1; then
+    result client OK "ping 10.39.0.1 (the CHR) through pppoe-out1: $(pcm | jq -c '{tx_packets, rx_packets, dropped}')"
   else
-    result client INFO "no PPPoE client in the CoreRouter (interface.pppoe-client); gap G3.9ga"
+    result client FAIL "no ping through pppoe-out1: $(pcm | jq -c '{tx_packets, rx_packets, dropped}')"
   fi
+  local mtu; mtu=$(jq -r .mtu <<< "$m")
+  if ip netns exec crgcore ping -c 1 -W 2 -M do -s $((mtu - 28)) 10.39.0.1 >/dev/null 2>&1; then
+    result client OK "a $mtu-byte DF ping passes (link MTU $mtu)"
+  else
+    result client FAIL "a $mtu-byte DF ping is lost"
+  fi
+  # The CHR ends the session: we see it, and redial at once (back-off 1 s).
+  rosx "/ppp active remove [find name=crcli]" >/dev/null
+  ms=$(wait_for 15 pc_was_down) || ms=-1
+  m=$(pcm)
+  result client INFO "CHR removed the session: CR saw '$(jq -r '.last_down.reason // "?"' <<< "$m")' after ${ms} ms"
+  ms=$(wait_for 20 pc_connected) && result client OK "redialed: up again ${ms} ms later" \
+    || result client FAIL "no redial: $(pcm | jq -c '{status, retry_in_secs, last_down}')"
+  # Wrong password: the CHR's refusal text, a long back-off.
+  cli interface.pppoe-client.set '{"name":"pppoe-out1","password":"errada"}' >/dev/null
+  wait_for 20 pc_refused >/dev/null \
+    && result client OK "wrong password: auth-failed, CHR said '$(pcm | jq -r '.last_down.message // ""')', redial in $(pcm | jq -r .retry_in_secs) s" \
+    || result client FAIL "wrong password not seen: $(pcm | jq -c '{status, last_down}')"
+  # Disable: PADT, the CHR frees the session at once.
+  cli interface.pppoe-client.set '{"name":"pppoe-out1","password":"g39ga-pw"}' >/dev/null
+  cli interface.pppoe-client.reconnect '{"name":"pppoe-out1"}' >/dev/null || true
+  wait_for 20 pc_connected >/dev/null || true
+  wait_for 10 chr_up >/dev/null || true
+  cli interface.pppoe-client.disable '{"name":"pppoe-out1"}' >/dev/null
+  ms=$(wait_for 10 chr_gone) && result client OK "disable: the CHR dropped the session ${ms} ms later (PADT)" \
+    || result client FAIL "disable: the CHR still has the session"
+  cli interface.pppoe-client.remove '{"name":"pppoe-out1"}' >/dev/null || true
+  rosx "/interface pppoe-server server remove [find service-name=g39ga]" >/dev/null || true
+  cli interface.pppoe-server.server.enable "{\"id\":\"$SRV\"}" >/dev/null || true
 }
 
 for c in "${CASES[@]}"; do

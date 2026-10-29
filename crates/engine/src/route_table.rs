@@ -64,6 +64,8 @@ pub enum Origin {
     Static,
     Dhcp,
     Ra,
+    /// A PPPoE client's session (G3.9ga).
+    Ppp,
 }
 
 impl Origin {
@@ -73,6 +75,7 @@ impl Origin {
             Self::Static => "static",
             Self::Dhcp => "dhcp",
             Self::Ra => "ra",
+            Self::Ppp => "ppp",
         }
     }
 }
@@ -188,6 +191,7 @@ impl Line {
             Origin::Connected => "DC",
             Origin::Ra => "D",
             Origin::Dhcp => "DS",
+            Origin::Ppp => "D",
             Origin::Static => "S",
         });
         if self.ecmp > 1 && self.state == State::Active {
@@ -249,16 +253,23 @@ fn link_down(why_link: &IfName) -> Why {
     .arg("interface", why_link)
 }
 
+/// Where a route of the config's list comes from, by its id.
+fn origin_of(id: ItemId) -> Origin {
+    if crate::pppoe_client::is_dynamic(id) {
+        Origin::Ppp
+    } else if is_dynamic(id) {
+        Origin::Dhcp
+    } else {
+        Origin::Static
+    }
+}
+
 /// Every route of `cfg` with its state (sorted like `ip.route.list`).
 pub fn build(cfg: &Config, live: &Live) -> Vec<Line> {
     let down = |l: &IfName| live.down.contains(l);
     let mut lines: Vec<Line> = Vec::with_capacity(cfg.ip.routes.len() + cfg.ip.addresses.len());
     for r in cfg.ip.routes.iter() {
-        let origin = if is_dynamic(r.id) {
-            Origin::Dhcp
-        } else {
-            Origin::Static
-        };
+        let origin = origin_of(r.id);
         let (via, why) = match route::reach(cfg, r) {
             Reach::Active { link, .. } if down(&link) => (None, Some(link_down(&link))),
             Reach::Active { link, gateway } => (Some(Via { link, gateway }), None),
@@ -288,11 +299,7 @@ pub fn build(cfg: &Config, live: &Live) -> Vec<Line> {
     // ones (G1.27f).
     for (r, text) in &live.withheld {
         let check = live.checks.get(&r.id).cloned();
-        let origin = if is_dynamic(r.id) {
-            Origin::Dhcp
-        } else {
-            Origin::Static
-        };
+        let origin = origin_of(r.id);
         // A static route's line is cached: its time is in `changed_secs`.
         let ago = check
             .as_ref()
@@ -812,6 +819,13 @@ impl Session {
             format!("{:?}{:?}{:?}", r.addresses, r.routes, r.pool.as_ref().map(|p| p.value)).hash(&mut h);
         }
         self.dhcp6_server_routes_text().hash(&mut h);
+        // PPPoE client sessions (G3.9ga).
+        if let Some(rt) = self.pppoe_clients() {
+            for (name, r) in &rt.runners {
+                name.hash(&mut h);
+                format!("{:?}{:?}", r.addresses, r.routes).hash(&mut h);
+            }
+        }
         h.finish()
     }
 

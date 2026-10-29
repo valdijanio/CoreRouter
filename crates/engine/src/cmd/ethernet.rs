@@ -326,6 +326,7 @@ fn physical(cfg: &Config, name: &IfName, depth: u8, out: &mut BTreeSet<IfName>) 
             out.insert(name.clone());
         }
         InterfaceKind::Vlan { parent, .. } => physical(cfg, parent, depth + 1, out),
+        InterfaceKind::PppoeClient(c) => physical(cfg, &c.interface, depth + 1, out),
         InterfaceKind::Bridge => {
             for m in cfg
                 .interfaces

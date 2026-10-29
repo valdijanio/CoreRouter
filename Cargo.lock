@@ -1252,6 +1252,7 @@ dependencies = [
  "corerouter-proto-iperf",
  "corerouter-proto-mpls",
  "corerouter-proto-ospf",
+ "corerouter-proto-pppoe",
  "corerouter-proto-radius",
  "criterion",
  "getrandom 0.3.4",

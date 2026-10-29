@@ -107,8 +107,15 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                     vlan_id,
                     service_tag,
                 } => (Some(parent), Some(vlan_id.get()), Some(*service_tag)),
+                InterfaceKind::PppoeClient(c) => (Some(&c.interface), None, None),
                 _ => (None, None, None),
             };
+            // A PPPoE client runs when its session is up, not when its veth is.
+            let session_up = matches!(i.kind, InterfaceKind::PppoeClient(_)).then(|| {
+                s.pppoe_clients()
+                    .and_then(|rt| rt.runners.get(&i.name))
+                    .is_some_and(|r| r.up.is_some())
+            });
             let table = match i.kind {
                 InterfaceKind::Vrf { table } => Some(table),
                 _ => None,
@@ -122,7 +129,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                 "unmanaged_reason": unmanaged,
                 "mtu": i.mtu,
                 "disabled": i.disabled,
-                "running": st.is_some_and(|l| l.running),
+                "running": session_up.unwrap_or_else(|| st.is_some_and(|l| l.running)),
                 "rx_bytes": st.map_or(0, |l| l.rx_bytes),
                 "tx_bytes": st.map_or(0, |l| l.tx_bytes),
                 "rx_packets": st.map_or(0, |l| l.rx_packets),
@@ -485,7 +492,7 @@ fn port_list(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(Value::Array(rows))
 }
 
-fn remove(s: &mut Session, p: &Value) -> Result<Value> {
+pub(super) fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     // A port entry for a link CoreRouter does not manage (a stale seed that
     // took `docker0`) may go: apply never touches that link anyway.
     let external = unmanaged(s);
@@ -547,6 +554,18 @@ fn dependents(cfg: &Config, name: &IfName, iface: &Interface) -> Vec<String> {
         out.push(format!(
             "remove DHCP client {} first (ip.dhcp-client.remove)",
             clients.join(", ")
+        ));
+    }
+    let dialers: Vec<&str> = cfg
+        .interfaces
+        .values()
+        .filter(|i| matches!(&i.kind, InterfaceKind::PppoeClient(c) if c.interface == *name))
+        .map(|i| i.name.as_str())
+        .collect();
+    if !dialers.is_empty() {
+        out.push(format!(
+            "remove PPPoE client {} first (interface.pppoe-client.remove)",
+            dialers.join(", ")
         ));
     }
     let children: Vec<&str> = cfg

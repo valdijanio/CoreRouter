@@ -23,6 +23,7 @@ pub mod neigh;
 pub mod nic;
 pub mod oslog;
 pub mod pppoe;
+pub mod pppoe_client;
 pub mod probe;
 pub mod queue;
 pub mod resources;
@@ -289,6 +290,24 @@ pub trait Hal: Send {
             "{} has no DHCP client transport (asked for '{name}')",
             self.describe()
         )))
+    }
+
+    /// Open the port of PPPoE client `client` on Ethernet port `uplink`
+    /// (G3.9ga): its control frames, and the relay of its session.
+    fn pppoe_client_port(
+        &mut self,
+        client: &IfName,
+        uplink: &IfName,
+    ) -> Result<Box<dyn pppoe_client::PppoeClientPort>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no PPPoE client transport (asked for '{client}' on '{uplink}')",
+            self.describe()
+        )))
+    }
+
+    /// The lab's simulated BNG (see [`Hal::offer_dhcp_lab_server`]).
+    fn offer_pppoe_lab_server(&mut self, server: pppoe_client::SharedPppoeLab) {
+        let _ = server;
     }
 
     /// The simulated DHCP server of the lab, offered by the engine at

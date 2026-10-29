@@ -418,6 +418,14 @@ impl PortSender {
         self.ifindex
     }
 
+    /// Another sender on the same port (the PPPoE client's relay, G3.9ga).
+    pub fn try_clone(&self) -> io::Result<PortSender> {
+        Ok(PortSender {
+            ifindex: self.ifindex,
+            tx: self.tx.try_clone()?,
+        })
+    }
+
     pub fn send(&self, frame: &[u8]) -> io::Result<()> {
         send(self.tx.as_raw_fd(), frame, MsgFlags::empty())
             .map(|_| ())

@@ -168,6 +168,7 @@ impl Session {
         // The virtual lab's DHCP clients get leases from a simulated server.
         hal.offer_dhcp_lab_server(Arc::new(corerouter_proto_dhcp::lab::LabServer::default()));
         hal.offer_dhcp6_lab_server(Arc::new(corerouter_proto_dhcp::lab6::LabServer6::default()));
+        hal.offer_pppoe_lab_server(crate::pppoe_client::lab_bng());
         hal.offer_dhcp_lab_clients(Arc::new(corerouter_proto_dhcp::lab_hosts::LabHosts::default()));
         hal.offer_dhcp6_lab_clients(Arc::new(corerouter_proto_dhcp::lab_hosts6::LabHosts6::default()));
         let (restored, mut boot_errors) = restore(storage.as_mut());

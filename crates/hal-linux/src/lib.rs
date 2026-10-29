@@ -138,6 +138,10 @@ pub mod capture;
 #[cfg(target_os = "linux")]
 pub mod pppoe_io;
 
+/// The PPPoE client's port and relay (G3.9ga): `AF_PACKET` and a veth.
+#[cfg(target_os = "linux")]
+pub mod pppoe_client_io;
+
 /// BNG redundancy (G4.3h): the access-side hello (`AF_PACKET`, 0x88b5).
 #[cfg(target_os = "linux")]
 pub mod ha_io;
@@ -1117,6 +1121,17 @@ mod linux {
         ) -> Result<Box<dyn corerouter_hal::DhcpPort>, HalError> {
             crate::dhcp::LinuxDhcpPort::open(name)
                 .map(|p| Box::new(p) as Box<dyn corerouter_hal::DhcpPort>)
+                .map_err(|e| HalError::Io(e.to_string()))
+        }
+
+        fn pppoe_client_port(
+            &mut self,
+            client: &IfName,
+            uplink: &IfName,
+        ) -> Result<Box<dyn corerouter_hal::pppoe_client::PppoeClientPort>, HalError> {
+            let relay = corerouter_model::pppoe_client::relay_peer(client.as_str());
+            crate::pppoe_client_io::LinuxPppoeClientPort::open(client, &relay, uplink)
+                .map(|p| Box::new(p) as Box<dyn corerouter_hal::pppoe_client::PppoeClientPort>)
                 .map_err(|e| HalError::Io(e.to_string()))
         }
 

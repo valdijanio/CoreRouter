@@ -56,6 +56,8 @@ pub struct VirtualHal {
     dhcp: Option<SharedResponder>,
     /// Simulated DHCPv6 server (G4.7b).
     dhcp6: Option<SharedResponder6>,
+    /// Simulated BNG answering the lab's PPPoE clients (G3.9ga).
+    pppoe: Option<crate::pppoe_client::SharedPppoeLab>,
     /// Simulated hosts asking the router's DHCP server (G4.2a).
     dhcp_hosts: Option<crate::dhcp_server::SharedLabClients>,
     /// Simulated DHCPv6 clients (G4.2c).
@@ -168,6 +170,7 @@ impl VirtualHal {
             prober: Arc::new(SimProber::default()),
             dhcp: None,
             dhcp6: None,
+            pppoe: None,
             dhcp_hosts: None,
             dhcp6_hosts: None,
             reenabled: BTreeMap::new(),
@@ -1250,6 +1253,29 @@ impl Hal for VirtualHal {
             inbox: VecDeque::new(),
             probing: None,
         }))
+    }
+
+    fn pppoe_client_port(
+        &mut self,
+        client: &IfName,
+        uplink: &IfName,
+    ) -> Result<Box<dyn crate::pppoe_client::PppoeClientPort>, HalError> {
+        if !self.applied.interfaces.contains_key(uplink) && !self.ports.contains(uplink) {
+            return Err(HalError::Rejected(format!(
+                "no interface '{uplink}' in the lab (PPPoE client '{client}')"
+            )));
+        }
+        Ok(Box::new(crate::pppoe_client::SimPppoePort::new(
+            uplink.clone(),
+            self.mac_of(uplink),
+            self.pppoe.clone(),
+        )))
+    }
+
+    fn offer_pppoe_lab_server(&mut self, server: crate::pppoe_client::SharedPppoeLab) {
+        if self.pppoe.is_none() {
+            self.pppoe = Some(server);
+        }
     }
 
     fn offer_dhcp_lab_server(&mut self, server: SharedResponder) {
