@@ -6,7 +6,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use corerouter_engine::radius::{AaaBackend, AcctSource, AuthDone, SessionOwner};
-use corerouter_engine::{Clock, Job, Runner};
+use corerouter_engine::tasks::SimClock;
+use corerouter_engine::{Job, Runner};
 use corerouter_model::ItemId;
 use corerouter_model::radius::{
     AcctRequest, Attribute, AuthOutcome, AuthReply, AuthRequest, RadiusStatus, ServerMonitor,
@@ -18,20 +19,9 @@ use super::*;
 use crate::radius::{RadiusPanel, Tab, WIN};
 
 struct Threads;
-struct Wall(Instant);
-
-impl Clock for Wall {
-    fn elapsed(&self) -> Duration {
-        self.0.elapsed()
-    }
-    fn sleep(&self, d: Duration) {
-        thread::sleep(d);
-    }
-}
-
 impl Runner for Threads {
     fn spawn(&self, _name: &str, job: Job) -> Result<(), String> {
-        thread::spawn(move || job(&Wall(Instant::now())));
+        thread::spawn(move || job(&SimClock::default()));
         Ok(())
     }
 }

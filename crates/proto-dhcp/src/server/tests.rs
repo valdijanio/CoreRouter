@@ -1644,9 +1644,10 @@ fn a_revoke_ends_the_lease_and_the_grant() {
 
 /// A storm bigger than the rate limiter's table (a BNG with 70 000
 /// subscribers after a power cut): every client is served, the table
-/// stays bounded and is not swept once per new client (G4.3f).
+/// stays bounded and is not swept once per new client (G4.3f). Slow layer
+/// (G0.30, `slow_`): 70 000 clients, ~5 s in a dev build.
 #[test]
-fn a_storm_past_the_limiter_table_is_still_served() {
+fn slow_a_storm_past_the_limiter_table_is_still_served() {
     let mut c = cfg();
     c.ip.addresses.get_mut(0).unwrap().address = "10.0.0.1/14".parse().unwrap();
     c.ip.pools.pools[0].ranges = vec!["10.0.1.0-10.3.255.254".parse().unwrap()];

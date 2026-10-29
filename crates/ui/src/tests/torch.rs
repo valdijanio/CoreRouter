@@ -7,27 +7,17 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use corerouter_engine::{Clock, Job, Runner};
+use corerouter_engine::tasks::SimClock;
+use corerouter_engine::{Job, Runner};
 
 use super::*;
 use crate::sniffer::SnifferPanel;
 use crate::torch::{TorchPanel, absorb_identities};
 
 struct Threads;
-struct Wall(Instant);
-
-impl Clock for Wall {
-    fn elapsed(&self) -> Duration {
-        self.0.elapsed()
-    }
-    fn sleep(&self, d: Duration) {
-        thread::sleep(d);
-    }
-}
-
 impl Runner for Threads {
     fn spawn(&self, _name: &str, job: Job) -> Result<(), String> {
-        thread::spawn(move || job(&Wall(Instant::now())));
+        thread::spawn(move || job(&SimClock::default()));
         Ok(())
     }
 }

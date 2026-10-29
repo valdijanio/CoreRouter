@@ -277,7 +277,7 @@ mod tests {
     fn lab() -> (Session, Arc<Lab>) {
         let fake = Arc::new(Lab::default());
         let mut s = Session::virtual_lab();
-        s.set_runner(test_runner::threads());
+        s.set_runner(test_runner::sim());
         s.set_dns_backend(fake.clone());
         (s, fake)
     }

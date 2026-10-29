@@ -53,7 +53,12 @@ use sock::{Udp, bind_tcp};
 
 /// RFC 1035 §4.2.1.
 const DEFAULT_PORT: u16 = 53;
-const TICK: Duration = Duration::from_secs(1);
+/// G0.30: 50 ms in the unit tests, which follow the config through it.
+const TICK: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(1)
+};
 /// How often the socket threads look at the stop signal.
 const POLL: Duration = Duration::from_millis(250);
 /// RFC 7766 §6.2.3: idle TCP connections are closed (a few seconds).

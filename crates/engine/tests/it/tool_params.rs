@@ -5,27 +5,16 @@
 
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
 
-use corerouter_engine::{Clock, EngineError, Job, Runner, Session};
+use corerouter_engine::tasks::SimClock;
+use corerouter_engine::{EngineError, Job, Runner, Session};
 use proptest::prelude::*;
 use serde_json::{Value, json};
 
 struct Threads;
-struct Wall(Instant);
-
-impl Clock for Wall {
-    fn elapsed(&self) -> Duration {
-        self.0.elapsed()
-    }
-    fn sleep(&self, d: Duration) {
-        thread::sleep(d);
-    }
-}
-
 impl Runner for Threads {
     fn spawn(&self, _name: &str, job: Job) -> Result<(), String> {
-        thread::spawn(move || job(&Wall(Instant::now())));
+        thread::spawn(move || job(&SimClock::default()));
         Ok(())
     }
 }

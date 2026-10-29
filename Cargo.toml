@@ -129,6 +129,105 @@ opt-level = 3
 [profile.dev.package.md-5]
 opt-level = 3
 
+[profile.dev.package.egui]
+opt-level = 3
+
+[profile.dev.package.epaint]
+opt-level = 3
+
+[profile.dev.package.emath]
+opt-level = 3
+
+[profile.dev.package.ecolor]
+opt-level = 3
+
+[profile.dev.package.egui_plot]
+opt-level = 3
+
+[profile.dev.package.harfrust]
+opt-level = 3
+
+[profile.dev.package.skrifa]
+opt-level = 3
+
+[profile.dev.package.read-fonts]
+opt-level = 3
+
+[profile.dev.package.font-types]
+opt-level = 3
+
+[profile.dev.package.vello_cpu]
+opt-level = 3
+
+[profile.dev.package.vello_common]
+opt-level = 3
+
+[profile.dev.package.kurbo]
+opt-level = 3
+
+[profile.dev.package.peniko]
+opt-level = 3
+
+[profile.dev.package.guillotiere]
+opt-level = 3
+
+[profile.dev.package.fearless_simd]
+opt-level = 3
+
+[profile.dev.package.unicode-segmentation]
+opt-level = 3
+
+[profile.dev.package.ahash]
+opt-level = 3
+
+[profile.dev.package.hashbrown]
+opt-level = 3
+
+[profile.dev.package.foldhash]
+opt-level = 3
+
+[profile.dev.package.nohash-hasher]
+opt-level = 3
+
+[profile.dev.package.smallvec]
+opt-level = 3
+
+[profile.dev.package.serde_json]
+opt-level = 3
+
+[profile.dev.package.serde_core]
+opt-level = 3
+
+[profile.dev.package.regex]
+opt-level = 3
+
+[profile.dev.package.regex-automata]
+opt-level = 3
+
+[profile.dev.package.regex-syntax]
+opt-level = 3
+
+[profile.dev.package.aho-corasick]
+opt-level = 3
+
+[profile.dev.package.memchr]
+opt-level = 3
+
+[profile.dev.package.zmij]
+opt-level = 3
+
+[profile.dev.package.itoa]
+opt-level = 3
+
+[profile.dev.package.ipnet]
+opt-level = 3
+
+[profile.dev.package.sha1]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
 [profile.release]
 # Must stay "unwind": engine::guard relies on catch_unwind to roll back a command.
 panic = "unwind"

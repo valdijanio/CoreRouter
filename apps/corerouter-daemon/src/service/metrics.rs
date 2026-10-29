@@ -592,7 +592,12 @@ fn log_open(addr: SocketAddr, restricted: bool) {
 
 /// How often the configured service looks at the running config, and the
 /// longest a scrape waits to be accepted.
-const TICK: Duration = Duration::from_secs(1);
+/// G0.30: 50 ms in the unit tests, which follow the config through it.
+const TICK: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(1)
+};
 const ACCEPT_POLL: Duration = Duration::from_millis(20);
 
 /// The service of `ip.service.metrics.*` (G4.4c): one thread that

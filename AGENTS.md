@@ -239,10 +239,15 @@ MCP: `claude mcp add corerouter -- corerouter-cli mcp` (detalhes em `docs/mcp.md
     escolhe à mão.
   - **Teste lento de propósito** (escala de milhares de sessões, fuzz longo, rede real com
     espera que não dá para simular): nome `slow_…` e uma linha de doc com o motivo e o tempo
-    (ex.: `/// Slow layer (G0.30): 100 000 sessions, ~50 s in a dev build.`). Antes,
-    tente o relógio simulado (`Clock`/`Runner` do engine, relógio do laboratório): esperar de
-    verdade é o último recurso. Caso grande num laço: os casos pequenos ficam na camada rápida
-    e os grandes num `slow_` à parte (`config_journal.rs`).
+    (ex.: `/// Slow layer (G0.30): 100 000 sessions, ~50 s in a dev build.`). Antes, tente não
+    esperar de verdade: job de ferramenta com `corerouter_engine::tasks::SimClock` (o `sleep`
+    só avança o relógio); serviço do daemon que relê a config a cada `TICK` com
+    `if cfg!(test) { 50 ms } else { 1 s }`; repetições independentes em `thread::scope`; caso
+    grande num laço com os pequenos na camada rápida e os grandes num `slow_` à parte
+    (`config_journal.rs`).
+  - **Teto:** teste fora da camada lenta acima de 5 s reprova o job `test` do PR no GitHub
+    (`COREROUTER_TEST_CEILING_SECS` muda); no local é aviso, e o `--affected` lista os testes
+    acima de 1 s dos pacotes que o diff mudou.
   - **Relatório:** todo `cargo xtask ci` termina com os 20 testes mais lentos (JUnit do nextest).
   - **Regressões do proptest** (`proptest-regressions/`) rodam em toda camada; o passo `test`
     reprova arquivo de regressão que nenhum teste lê mais (teste movido ou renomeado).

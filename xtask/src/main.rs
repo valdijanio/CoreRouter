@@ -746,9 +746,15 @@ fn test(root: &Path) -> Outcome {
     // G0.30: the JUnit report of this run only (none left from an earlier one).
     let junit = slowest::junit_path(root, layer.profile());
     let _ = std::fs::remove_file(&junit);
-    let outcome = run(c, root);
+    let mut outcome = run(c, root);
     if let Ok(xml) = std::fs::read_to_string(&junit) {
-        let _ = SLOWEST.set(slowest::report(&slowest::parse_junit(&xml), 20));
+        let tests = slowest::parse_junit(&xml);
+        let _ = SLOWEST.set(slowest::report(&tests, 20));
+        if layer == TestLayer::Quick
+            && let Outcome::Ok = outcome
+        {
+            outcome = budget(&tests);
+        }
     }
     match outcome {
         // `cargo test --doc` costs ~17 s even with no doctest (one rustdoc
@@ -759,6 +765,50 @@ fn test(root: &Path) -> Outcome {
             run(d, root)
         }
         other => other,
+    }
+}
+
+/// G0.30: the quick layer's time budget. A test outside the slow layer over
+/// the ceiling (5 s) fails the PR's test job in GitHub Actions and is a
+/// warning locally (a busy machine slows everything); over 1 s, the tests
+/// of the packages this diff changed are listed as a warning.
+fn budget(tests: &[slowest::TestTime]) -> Outcome {
+    let ceiling = std::env::var("COREROUTER_TEST_CEILING_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(slowest::CEILING_SECS);
+    let changed: Option<Vec<String>> = SCOPE.get().map(|s| {
+        s.iter()
+            .filter(|p| p.changed)
+            .map(|p| p.name.clone())
+            .collect()
+    });
+    let warn = slowest::over(tests, slowest::WARN_SECS, changed.as_deref());
+    if changed.is_some() && !warn.is_empty() {
+        eprintln!(
+            "warning: {} test(s) of the changed packages over {} s: simulate the clock or \
+             name them slow_… (CLAUDE.md, \"Orçamento de testes\")\n{}",
+            warn.len(),
+            slowest::WARN_SECS,
+            slowest::lines(&warn)
+        );
+    }
+    let over = slowest::over(tests, ceiling, None);
+    if over.is_empty() {
+        return Outcome::Ok;
+    }
+    let what = format!(
+        "{} test(s) of the quick layer over the {ceiling} s ceiling: simulate the clock or name \
+         them slow_… (CLAUDE.md, \"Orçamento de testes\")\n{}",
+        over.len(),
+        slowest::lines(&over)
+    );
+    if std::env::var_os("GITHUB_ACTIONS").is_some() {
+        Outcome::Fail(what)
+    } else {
+        eprintln!("warning: {what}");
+        Outcome::Ok
     }
 }
 

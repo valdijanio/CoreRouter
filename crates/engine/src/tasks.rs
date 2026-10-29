@@ -22,7 +22,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -46,6 +46,30 @@ pub trait Clock {
     /// Time since the job started.
     fn elapsed(&self) -> Duration;
     fn sleep(&self, d: Duration);
+}
+
+/// A clock that never waits: `sleep` moves it forward at once (G0.30). For
+/// jobs whose waits are timeouts of a simulated network (the virtual lab):
+/// a test runs them as fast as the CPU allows, in the same order and with
+/// the same elapsed times as on the wall clock.
+#[derive(Debug, Default)]
+pub struct SimClock {
+    micros: AtomicU64,
+}
+
+impl Clock for SimClock {
+    fn elapsed(&self) -> Duration {
+        Duration::from_micros(self.micros.load(Ordering::Relaxed))
+    }
+
+    fn sleep(&self, d: Duration) {
+        let step = u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+        let _ = self
+            .micros
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |m| {
+                Some(m.saturating_add(step))
+            });
+    }
 }
 
 pub type Job = Box<dyn FnOnce(&dyn Clock) + Send>;
@@ -637,6 +661,24 @@ pub(crate) mod test_runner {
     pub fn threads() -> Arc<dyn Runner> {
         Arc::new(Threads)
     }
+
+    /// Jobs on threads with a [`super::SimClock`]: the lab's timeouts cost
+    /// nothing (G0.30).
+    pub struct Sim;
+
+    impl Runner for Sim {
+        fn spawn(&self, name: &str, job: Job) -> Result<(), String> {
+            thread::Builder::new()
+                .name(name.into())
+                .spawn(move || job(&super::SimClock::default()))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+    }
+
+    pub fn sim() -> Arc<dyn Runner> {
+        Arc::new(Sim)
+    }
 }
 
 #[cfg(test)]
@@ -646,7 +688,7 @@ mod tests {
 
     fn session() -> Session {
         let mut s = Session::virtual_lab();
-        s.set_runner(test_runner::threads());
+        s.set_runner(test_runner::sim());
         s
     }
 
