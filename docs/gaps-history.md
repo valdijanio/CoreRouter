@@ -246,3 +246,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-29 — G3.9g criado (interoperabilidade do BNG PPPoE com o RouterOS 7.25 CHR) e G3.9ga criado (cliente PPPoE no CoreRouter)
 - 2026-10-29 — G3.9g feito (interoperabilidade do BNG PPPoE com o RouterOS 7.25 CHR, parte 2)
 - 2026-10-29 — G3.9f feito (interoperabilidade BGP com RouterOS 7.25 e entre CoreRouters)
+- 2026-10-29 — G1.6qf criado (Safe Mode numa chamada avulsa da CLI acaba sem aviso)
