@@ -369,6 +369,7 @@ case_filters() {
   wait_for 30 k_has c2 100.64.39.0/24 >/dev/null || true
   r=$(bgp_path c2 100.64.39.0/24)
   result filters INFO "CR2's bgpd has $r"
+  [ "$(jq -r .med <<< "$r")" = 77 ] || result filters INFO "CR1 deferral: $(vt c1 'show bgp neighbors 10.39.5.2 json' | jq -c '."10.39.5.2".gracefulRestartInfo | {localGrMode, remoteGrMode, timers: .ipv4Unicast.timers, eor: .ipv4Unicast.endOfRibStatus}' 2>/dev/null); $(vt c1 'show bgp ipv4 unicast 100.64.39.0/24 json' | jq -c '[.paths[]? | {valid, best: .bestpath.overall}]' 2>/dev/null); CR1 running GR: $(vt c1 'show running-config' | grep -c graceful)"
   [ "$(jq -r .med <<< "$r")" = 77 ] && result filters OK "out: MED 77" || result filters FAIL "out: MED $(jq -c .med <<< "$r")"
   # G3.9fg: N copies in all over eBGP, as RouterOS.
   [ "$(jq -r .as_path <<< "$r")" = "65000 65000" ] && result filters OK "out: prepend 2 (65000 65000, RouterOS's count)" || result filters FAIL "out: as_path $(jq -c .as_path <<< "$r")"
