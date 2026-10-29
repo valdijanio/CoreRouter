@@ -1356,13 +1356,22 @@ mod tests {
             "the default is not printed: {text}"
         );
         // RFC 8538: only the off forms are printed (FRR's defaults are on).
-        assert!(!text.contains("notification") && !text.contains("hard-administrative-reset"), "{text}");
+        assert!(
+            !text.contains("notification") && !text.contains("hard-administrative-reset"),
+            "{text}"
+        );
         let inst = cfg.routing.bgp.get_mut("default").unwrap();
         inst.graceful_notification = Some(false);
         inst.hard_admin_reset = Some(false);
         let text = render_config(&cfg, &|_| None).unwrap();
-        assert!(text.contains(" no bgp graceful-restart notification\n"), "{text}");
-        assert!(text.contains(" no bgp hard-administrative-reset\n"), "{text}");
+        assert!(
+            text.contains(" no bgp graceful-restart notification\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(" no bgp hard-administrative-reset\n"),
+            "{text}"
+        );
         // Nobody restarting: no F bit.
         cfg.routing.bgp_connections.remove("up");
         assert!(

@@ -600,12 +600,10 @@ fn values_of(r: &Value, what: What) -> BTreeMap<&'static str, String> {
             return INST_FIELDS
                 .iter()
                 .map(|f| {
-                    let v = match f.param {
-                        k => match r.get(k) {
-                            Some(Value::Bool(b)) => if *b { "yes" } else { "no" }.to_owned(),
-                            Some(v) if !v.is_null() => value_text(v),
-                            _ => String::new(),
-                        },
+                    let v = match r.get(f.param) {
+                        Some(Value::Bool(b)) => if *b { "yes" } else { "no" }.to_owned(),
+                        Some(v) if !v.is_null() => value_text(v),
+                        _ => String::new(),
                     };
                     (f.param, v)
                 })

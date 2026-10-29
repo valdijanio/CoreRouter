@@ -110,6 +110,9 @@ fn build_instance(p: &Value, name: String, prev: Option<&BgpInstance>) -> Result
             None => Ok(had),
             Some(Value::Null) => Ok(None),
             Some(Value::Bool(b)) => Ok((!b).then_some(false)),
+            // `/import` of an `/export` types them as words.
+            Some(Value::String(w)) if matches!(w.as_str(), "yes" | "true") => Ok(None),
+            Some(Value::String(w)) if matches!(w.as_str(), "no" | "false") => Ok(Some(false)),
             Some(_) => Err(EngineError::bad(key, "true or false, or null for the default (true)")),
         }
     };
@@ -426,6 +429,9 @@ mod tests {
         let v = s.execute("routing.bgp.instance.check", &json!({"id": "default", "asn": 65000, "router_id": "10.0.0.1"})).unwrap();
         assert!(levels(&v).contains(&("info".into(), "n-bit".into())), "{v}");
         assert!(s.execute("routing.bgp.instance.set", &json!({"asn": 65000, "router_id": "10.0.0.1", "hard_admin_reset": "x"})).is_err());
+        // The words of an `/export`.
+        s.execute("routing.bgp.instance.set", &json!({"asn": 65000, "router_id": "10.0.0.1", "hard_admin_reset": "no", "graceful_notification": "yes"})).unwrap();
+        assert_eq!((inst(&s).hard_admin_reset, inst(&s).graceful_notification), (Some(false), None));
     }
 
     /// The RouterOS 7.25 neighbor without End-of-RIB is named next to the
