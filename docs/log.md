@@ -6583,3 +6583,48 @@ continuação indentadas).
     mais rápida de 7 (2000 inserções cada, < 100 ms): carga passageira atrasa algumas rodadas,
     nunca todas, e o caminho O(n) antigo (~120 µs por inserção) dá > 200 ms em todas. Medido em
     debug: 11 ms por rodada.
+
+- 2026-10-28 — G1.27j: Rota do DHCP em ECMP silencioso (achado do usuário na VM depois da G1.27h): com uma estática
+  `0.0.0.0/0` distância 1 e um cliente DHCP com `default_route_distance=1` (o padrão do RouterOS), as
+  duas viravam ECMP e o tráfego passava a sair por fluxo por duas saídas com IPs públicos diferentes,
+  sem aviso nenhum. Agora:
+
+  - **Distância 254 para cliente novo** (`ip.dhcp-client.add`/`ipv6.dhcp-client.add` sem
+    `default_route_distance`, e os formulários "New" da GUI), a AD do Cisco para a default aprendida
+    por DHCP: sozinha ela é a rota em uso; ao lado de uma estática, OSPF ou BGP fica de reserva.
+    Config gravada mantém o valor (o campo é sempre gravado; arquivo sem ele lê 1, como antes). A rota
+    de RA continua em 255, atrás da do DHCPv6.
+  - **Aviso sempre que houver ECMP**: `notice` em cada rota ativa do grupo no `ip.route.list` (info:
+    caminhos de uma origem só; warning: origens misturadas, dois clientes DHCP ou a rota padrão, com o
+    comando pronto no `fix`); selo `ECMP` âmbar + `warning`, texto no Motivo, contagem no rodapé e
+    linha "ECMP" com "Copy command" no detalhe da janela Routes (ⓘ do Motivo explica); check de saúde
+    `routes.ecmp` (conta no "N warning" da barra); `notes` e `route_states[].notice` em
+    `ip.dhcp-client.list`/`ipv6.dhcp-client.list`; `summary.ecmp_warning/ecmp_info` no
+    `ip.route.page`.
+
+  Testar: `cargo test -p corerouter-engine --lib route_table` (warning misto com o fix, info do mesmo
+  protocolo, rota padrão, desfazer o empate limpa o aviso, 100 000 rotas em ECMP numa passada),
+  `--test dhcp_client a_static_route_at_the_same_distance a_new_client_is_a_backup`, `-p
+  corerouter-model` (254 no cliente novo, 1 preservado), `-p corerouter-ui --lib route_view`. Na GUI
+  (lab virtual): estática `0.0.0.0/0` + cliente DHCP em ether1 com distância 1 → linha ECMP âmbar e
+  "1 ECMP warning"; o comando do aviso deixa a do DHCP em standby e o aviso some.
+
+  Desempenho: o aviso é decidido em `select_group`, na mesma passada que já decide os estados (os
+  grupos são runs da tabela ordenada): O(tamanho do grupo) por grupo, O(n) na tabela; a contagem vai
+  no `Summary` guardado com as linhas, e a saúde só a lê.
+
+- 2026-10-28 — G1.6e: Pacote pela rede, parte 1: o `.crpkg` vai pelo canal de controle (TLS, ou o canal local da GUI)
+  em blocos de 1 MiB e é gravado no slot inativo enquanto chega, sem cópia em RAM (fila de 8
+  blocos; cheia responde `busy`). Comandos `system.package.upload.start/chunk/abort`; o serviço
+  `package` lê a fila como um fluxo (`sysupdate::upload::ChunkReader`) e usa a mesma instalação de
+  um arquivo (`Platform::install_from`): assinatura antes do primeiro byte, hashes e dm-verity antes
+  de ativar, boot de teste com volta automática. Interrompido, adulterado ou abandonado (60 s sem
+  bloco) não muda nada. GUI: System › Packages › From this computer (caminho ou arquivo solto na
+  janela, progresso, Abort); o navegador ainda não lê arquivos locais. CLI: `corerouter-cli upload
+  <arquivo> [params] --wait` espera o reboot e a confirmação. Ciclo de teste da imagem sem
+  recriar a VM: `cargo xtask os build --only crpkg` (sem disk.img, ISO, qcow2, OVA) e `cargo xtask
+  os push --to 127.0.0.1:7990` (build, envio, reboot, confirmação, tempo de cada etapa).
+  `cargo xtask os ab-test --scenario push`: envio por TLS no QEMU mantém `/config`, senha e
+  certificado; um pacote ruim enviado do mesmo jeito volta sozinho. Como testar: `cargo test -p
+  corerouter-daemon --test package_upload`, `cargo test -p corerouter-sysupdate`, `cargo xtask os
+  ab-test --scenario push`. Números em `docs/os-image.md` ("Pacote pela rede").

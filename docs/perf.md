@@ -2244,3 +2244,15 @@ VM do laboratório (8 vCPUs, KVM aninhado: CHR com 2 vCPUs e 512 MiB), build rel
   pronto 0,90–0,91 s com o renomeio das portas (0,92 s antes); a espera de a lista de links
   parar (100 ms) custa ~0,1 s no `early boot` (110 ms contra 14 ms); com 300 ms o pronto ia a
   1,10 s.
+
+- 2026-10-28, G1.27j, `routes_full` `ip.route.page/cold` (1 M rotas, as linhas reconstruídas),
+  `cargo bench` release, 32 CPUs, host carregado (load 22–37, outras sessões compilando),
+  rodadas intercaladas `main` → branch → `main` → branch: `main` 1,56 s e 1,04 s, branch 1,28 s e
+  1,30 s (**medido**). Sem diferença acima do ruído. O `Notice` fica em `Box`: uma rota sem ECMP
+  paga 8 bytes, não a struct inteira, na ordenação de 1 M linhas.
+
+G1.6e (**medido** 2026-10-28, AMD Ryzen AI Max+ 395, build release, máquina compartilhada):
+`package_upload/chunk_1MiB` (um `system.package.upload.chunk` de 1 MiB: parâmetros, base64,
+fila) 587 µs, 1,66 GiB/s. Envio de 41 MiB: 0,27 s em loopback (152 MiB/s), 2,16 s por TLS
+para o QEMU (19 MiB/s). `os build` incremental com só o daemon mudado: 184 s completo, 127 s com
+`--only crpkg`.
