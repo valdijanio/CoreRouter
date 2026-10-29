@@ -221,6 +221,30 @@ update inicial). Com o `select-defer-time` padrão do FRR (360 s; o temporizador
 em 120 s), a rota do CHR ficava fora do kernel 120 s depois de ligar o GR ou de um início do
 `bgpd`; com os 10 s do CoreRouter entra em 8,9 s. Com MikroTik, o GR só protege o nosso lado.
 
+### G3.9fj: tempos de GR na janela e o vizinho sem End-of-RIB na saúde
+
+- **Routing › BGP › Instances** virou lista com modal (padrão G0.24): estado, AS, router-id, os
+  três tempos de GR (sem valor: o padrão, "120 s (default)") e comentário; duplo clique edita,
+  ✓/✗ ativam e desativam. O modal pergunta ao `routing.bgp.instance.check` (prévia, nunca erro:
+  campo ruim vira checagem) e aplica o `instance.set` que ele devolve; campo de tempo vazio volta
+  ao padrão. A prévia avisa: Restart Time não menor que o hold time de cada conexão em restart
+  (RFC 4724 §3, nomeando a conexão), AS ou router-id novos reiniciam as sessões da instância
+  (RFC 4486 Cease), instância desativada para as sessões, nome que já existe, e informa
+  Defer Time 0, tempos sem conexão em restart e os vizinhos sem End-of-RIB (o Defer Time
+  inteiro de espera a cada início do `bgpd`). Depois do OK, o texto que vai para o `bgpd` fica
+  embaixo da lista.
+- **Saúde** (`system.health.check`, System › Resources, log quando muda): `bgp.end-of-rib`
+  avisa quando um vizinho com GR dos dois lados (nós `restart`, ele anuncia a capacidade) está
+  estabelecido há 5 min e nunca mandou End-of-RIB (§4.2: o helper MUST mandar depois do update
+  inicial). O valor é "N de M" e o motivo nomeia até 3 conexões; a ação explica o RouterOS 7.25
+  e o que fazer (Defer Time curto ou `graceful_restart=no` na conexão). 5 min: uma tabela cheia
+  leva minutos para chegar.
+
+```sh
+corerouter-cli run routing.bgp.instance.check '{"id":"default","asn":"65000","router_id":"10.255.0.1","graceful_restart_time":"60"}'
+corerouter-cli run system.health.check | jq '.checks[] | select(.key == "bgp.end-of-rib")'
+```
+
 ### Ficou para depois
 
 - Políticas e o "quais rotas passam" (G3.2b); RPKI e "Por que essa rota?" (G3.2c).

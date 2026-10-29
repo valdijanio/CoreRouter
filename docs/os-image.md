@@ -715,6 +715,21 @@ Saídas em `<out>/build/images/`:
   Sem `watchfrr`/`frrinit.sh` (bash) nem `frr.conf`: a configuração mora no `/config` e chega
   pelo hal-frr; os daemons sobem vazios e o daemon passa `--frr /var/run/frr`. Eles caem para o
   usuário `frr` com as capacidades que precisam (`libcap`).
+- **Sob demanda (G1.6i).** Só `mgmtd`, `zebra` e `staticd` sobem sempre. `bgpd`, `ospfd`,
+  `ospf6d`, `ldpd` e `bfdd` sobem quando a configuração os usa: o daemon (`--frr-daemons
+  /run/corerouter/frr-daemons`) grava a lista no arquivo e o init (um `stat` por tick de 50 ms)
+  sobe ou para só a diferença, sem reiniciar os outros. Antes do sync o arquivo recebe o que a
+  config nova usa somado ao que já estava, e o sync espera o socket vty do daemon novo (até 10 s);
+  depois do sync bem-sucedido o arquivo fica só com o que a config usa, então um daemon só sai
+  depois que a config (e as rotas) dele foram removidas, como num `no router ospf`. O `bfdd` sobe
+  também quando um protocolo pede BFD (`neighbor X bfd`, `ip ospf bfd`). Código:
+  `crates/hal-frr/src/on_demand.rs` e `apps/corerouter-init/src/pid1.rs` (`apply_wanted`); o
+  `frr-test` confere (o bgpd sobe com a instância BGP; ldpd e bfdd saem ao remover o LDP e o
+  peer BFD, sem mexer no PID do zebra/ospfd nem na rota OSPF). Uma instância BGP desabilitada
+  continua no bgpd (`bgp shutdown`), então ele fica.
+  Memória ociosa sem protocolo de roteamento (`os boot-test`, KVM, 1 GiB, três boots cada,
+  2026-10-29, **medido**): **98,9 → 70,9 MiB** (101,9/95,2/99,6 → 72,0/69,0/71,8; −28 MiB), e o
+  FRR fica pronto 0,82 s depois do kernel (antes 1,0–1,9 s).
 - **Fora da imagem** (`post-build.sh`): `vtysh` (o único que liga readline), bash, readline,
   ncurses, o runtime C++ que a toolchain copia, scripts Python e os daemons que o CoreRouter não
   configura (rip, isis, pim, babel, eigrp, …). O `nft` deixa de ter CLI interativa (ela puxava

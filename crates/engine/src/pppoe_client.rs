@@ -159,6 +159,47 @@ pub struct UpInfo {
     pub since_unix: Option<u64>,
 }
 
+/// The concentrator a session talked to: from its offer (PADO/PADS) and
+/// LCP, known before authentication. Kept after the session ends, so a
+/// refused login still shows which BNG refused it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Peer {
+    pub ac_name: String,
+    pub ac_mac: [u8; 6],
+    /// 0 until the PADS came.
+    pub session_id: u16,
+    /// The authentication LCP agreed on, if it got that far.
+    pub auth: Option<&'static str>,
+}
+
+/// RouterOS `encoding` of an authentication protocol.
+fn auth_name(p: Option<AuthProto>) -> &'static str {
+    match p {
+        Some(AuthProto::MsChapV2) => "mschap2",
+        Some(AuthProto::MsChapV1) => "mschap1",
+        Some(AuthProto::ChapMd5) => "chap",
+        Some(AuthProto::Pap) => "pap",
+        None => "none",
+    }
+}
+
+/// The BNG `c` is talking to, once it took an offer.
+fn peer_of(c: &Client) -> Option<Peer> {
+    let mac = c.ac_mac().0;
+    if mac == [0xff; 6] || mac == [0; 6] {
+        return None;
+    }
+    Some(Peer {
+        ac_name: c
+            .ac_name()
+            .map(|n| String::from_utf8_lossy(n).chars().take(64).collect())
+            .unwrap_or_default(),
+        ac_mac: mac,
+        session_id: c.session_id(),
+        auth: c.auth_proto().map(|a| auth_name(Some(a))),
+    })
+}
+
 /// One client at run time.
 pub(crate) struct Runner {
     slot: u32,
@@ -175,6 +216,8 @@ pub(crate) struct Runner {
     pub(crate) failures: u32,
     pub(crate) up: Option<UpInfo>,
     pub(crate) last_down: Option<LastDown>,
+    /// The BNG of the last session that reached one (up or not).
+    pub(crate) last_peer: Option<Peer>,
     pub(crate) addresses: Vec<AddressEntry>,
     pub(crate) routes: Vec<RouteEntry>,
     /// Jitter source (xorshift).
@@ -401,18 +444,15 @@ impl Runner {
                             dns: dns.into_iter().flatten().collect(),
                             mtu,
                             mru,
-                            auth: match client.auth_proto() {
-                                Some(AuthProto::MsChapV2) => "mschap2",
-                                Some(AuthProto::MsChapV1) => "mschap1",
-                                Some(AuthProto::ChapMd5) => "chap",
-                                Some(AuthProto::Pap) => "pap",
-                                None => "none",
-                            },
+                            auth: auth_name(client.auth_proto()),
                             since_ms: now,
                             since_unix: None,
                         }));
                     }
                     ClientEvent::Down { reason } => {
+                        if let Some(p) = peer_of(client) {
+                            self.last_peer = Some(p);
+                        }
                         acts.push(Act::Down(reason, client.auth_message().map(str::to_owned)));
                     }
                 }
@@ -829,6 +869,7 @@ impl Session {
                     failures: 0,
                     up: None,
                     last_down: None,
+                    last_peer: None,
                     addresses: Vec::new(),
                     routes: Vec::new(),
                     rng: now ^ (u64::from(slot) << 32) ^ 0x9E37_79B9_7F4A_7C15,
@@ -983,16 +1024,28 @@ impl Session {
 /// `monitor` fields (RouterOS names) of runner `r` at `now`.
 pub(crate) fn monitor_json(r: &Runner, now: u64) -> Value {
     let c = r.counters();
+    // The BNG: of the session up, else of the one being negotiated (after
+    // its offer), else of the last attempt that reached one: a refused
+    // login still says who refused it (and its session id, for its logs).
+    let peer = match &r.up {
+        Some(u) => Some(Peer {
+            ac_name: u.ac_name.clone(),
+            ac_mac: u.ac_mac,
+            session_id: u.session_id,
+            auth: Some(u.auth),
+        }),
+        None => r.client.as_ref().and_then(peer_of).or_else(|| r.last_peer.clone()),
+    };
     let mut v = json!({
         "status": r.status(),
         "uptime_secs": r.up.as_ref().map(|u| now.saturating_sub(u.since_ms) / 1000),
         "service_name": r.cfg.service_name,
-        "ac_name": r.up.as_ref().map(|u| u.ac_name.clone()),
-        "ac_mac": r.up.as_ref().map(|u| Mac(u.ac_mac).to_string()),
-        "session_id": r.up.as_ref().map(|u| u.session_id),
+        "ac_name": peer.as_ref().map(|p| p.ac_name.clone()),
+        "ac_mac": peer.as_ref().map(|p| Mac(p.ac_mac).to_string()),
+        "session_id": peer.as_ref().map(|p| p.session_id).filter(|id| *id != 0),
         "mtu": r.up.as_ref().map(|u| u.mtu),
         "mru": r.up.as_ref().map(|u| u.mru),
-        "encoding": r.up.as_ref().map(|u| u.auth),
+        "encoding": peer.as_ref().and_then(|p| p.auth),
         "local_address": r.up.as_ref().map(|u| u.local.to_string()),
         "remote_address": r.up.as_ref().and_then(|u| u.remote).map(|a| a.to_string()),
         "dns": r.up.as_ref().map(|u| u.dns.iter().map(|d| d.to_string()).collect::<Vec<_>>()).unwrap_or_default(),

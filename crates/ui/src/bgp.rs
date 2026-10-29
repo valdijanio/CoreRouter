@@ -2,14 +2,15 @@
 //! (live, read-only, with the detail of the selected one and its actions),
 //! Connections (the neighbors) and Templates (shared parameters), in the
 //! list window pattern (G0.24, `docs/ui-style.md`), plus Instances (local
-//! AS and router id). `routing.bgp.*` decides; this only shows and sends.
+//! AS, router id and the graceful-restart timers, G3.9fj).
+//! `routing.bgp.*` decides; this only shows and sends.
 //!
 //! The window stays `Win::Bgp` (its place in the menu and the stored
 //! preferences); `windows.rs` hands this panel the drawing.
 
 use std::collections::BTreeMap;
 
-use egui::{Grid, RichText, TextEdit, Ui};
+use egui::{RichText, Ui};
 use serde_json::{Value, json};
 
 use crate::backend::RequestId;
@@ -30,6 +31,7 @@ const SCOPE: &str = "bgp";
 const SESSIONS: &str = "bgp-sessions";
 const CONNECTIONS: &str = "bgp-connections";
 const TEMPLATES: &str = "bgp-templates";
+const INSTANCES: &str = "bgp-instances";
 
 pub(crate) const PANEL: Panel = Panel {
     name: NAME,
@@ -71,6 +73,14 @@ const TPL_CMDS: Cmds = Cmds {
     remove: "routing.bgp.template.remove",
     set: Some("routing.bgp.template.set"),
     what: "templates",
+};
+
+/// `instance.set` creates and edits; nothing removes an instance yet.
+const INST_CMDS: Cmds = Cmds {
+    add: "routing.bgp.instance.set",
+    remove: "routing.bgp.instance.remove",
+    set: Some("routing.bgp.instance.set"),
+    what: "instances",
 };
 
 const fn field(param: &'static str, label: &'static str, help: &'static str, input: Input) -> Field {
@@ -150,6 +160,35 @@ const TPL_FIELDS: &[Field] = &[
     field("output_redistribute", "Redistribute", "bgp.param.output_redistribute", Input::Text("connected,static,ospf")),
 ];
 
+/// G3.9fj: the instance, with the graceful-restart timers (RFC 4724).
+const INST_FIELDS: &[Field] = &[
+    Field {
+        param: "name",
+        label: "Name",
+        help: "bgp.instance.name",
+        input: Input::Text("default"),
+        // The name is the key: a new name is a new instance.
+        edit: false,
+    },
+    field("asn", "AS", "bgp.instance.asn", Input::Text("65000 or 1.10")),
+    field("router_id", "Router ID", "bgp.instance.router_id", Input::Text("10.255.0.1")),
+    field("disabled", "Disabled", "bgp.instance.disabled", Input::Check),
+    field("comment", "Comment", "", Input::Text("")),
+    field("graceful_restart_time", "Restart Time", "bgp.instance.graceful_restart_time", Input::Text("120 s (default)")),
+    field("graceful_stale_time", "Stale Time", "bgp.instance.graceful_stale_time", Input::Text("360 s (default)")),
+    field("graceful_defer_time", "Defer Time", "bgp.instance.graceful_defer_time", Input::Text("10 s (default)")),
+];
+
+pub(crate) const INST_SPEC: Spec = Spec {
+    panel: NAME,
+    parent: Win::Bgp,
+    new_title: "New BGP Instance",
+    edit_title: "BGP Instance",
+    help: "bgp.tab.instances",
+    fields: INST_FIELDS,
+    preview: "routing.bgp.instance.check",
+};
+
 pub(crate) const CONN_SPEC: Spec = Spec {
     panel: NAME,
     parent: Win::Bgp,
@@ -169,6 +208,17 @@ pub(crate) const TPL_SPEC: Spec = Spec {
     fields: TPL_FIELDS,
     preview: "routing.bgp.template.check",
 };
+
+const INST_COLUMNS: [table::Column; 8] = [
+    col("State").help("bgp.instance.disabled"),
+    col("Name").help("bgp.instance.name"),
+    col("AS").help("bgp.instance.asn"),
+    col("Router ID").help("bgp.instance.router_id"),
+    num("Restart Time").help("bgp.instance.graceful_restart_time"),
+    num("Stale Time").help("bgp.instance.graceful_stale_time"),
+    num("Defer Time").help("bgp.instance.graceful_defer_time"),
+    comment(),
+];
 
 const SESSION_COLUMNS: [table::Column; 9] = [
     col("State").help("bgp.session.state"),
@@ -215,6 +265,7 @@ pub(crate) struct BgpPanel {
     session_table: TableState,
     conn_table: TableState,
     tpl_table: TableState,
+    inst_table: TableState,
     filters: Filters,
     pub(crate) modal: Option<(What, Modal)>,
     /// The modal's page.
@@ -227,6 +278,7 @@ pub(crate) struct BgpPanel {
 pub(crate) enum What {
     Connection,
     Template,
+    Instance,
 }
 
 fn s(r: &Value, k: &str) -> String {
@@ -492,11 +544,50 @@ fn tpl_row(r: &Value) -> Row {
 
 /// The modal's fields for an existing row: its own values (an empty field
 /// inherits).
+/// One instance; an unset timer shows its default, dimmed by the hint.
+fn inst_row(r: &Value) -> Row {
+    let disabled = flag(r, "disabled");
+    let asn = as_chip(u(r, "asn")).map_or_else(|| "–".to_owned(), |(t, k)| cell("", &[(t.as_str(), k)]));
+    let secs = |k: &str, d: u64| match u(r, k) {
+        Some(t) => format!("{t} s"),
+        None => format!("{d} s (default)"),
+    };
+    Row {
+        key: s(r, "name"),
+        cells: vec![
+            if disabled { cell("", &[("disabled", Kind::Neutral)]) } else { cell("", &[("enabled", Kind::Green)]) },
+            s(r, "name"),
+            asn,
+            s(r, "router_id"),
+            secs("graceful_restart_time", 120),
+            secs("graceful_stale_time", 360),
+            secs("graceful_defer_time", 10),
+            s(r, "comment"),
+        ],
+        dimmed: disabled,
+        section: false,
+        tint: None,
+    }
+}
+
 fn values_of(r: &Value, what: What) -> BTreeMap<&'static str, String> {
     let own = r.get("params").cloned().unwrap_or(Value::Null);
     let fields = match what {
         What::Connection => CONN_FIELDS,
         What::Template => TPL_FIELDS,
+        What::Instance => {
+            // Flat row; an unset timer stays empty (its default).
+            return INST_FIELDS
+                .iter()
+                .map(|f| {
+                    let v = match f.param {
+                        "disabled" => if flag(r, "disabled") { "yes" } else { "no" }.to_owned(),
+                        k => r.get(k).filter(|v| !v.is_null()).map(value_text).unwrap_or_default(),
+                    };
+                    (f.param, v)
+                })
+                .collect();
+        }
     };
     let mut out = BTreeMap::new();
     for f in fields {
@@ -856,85 +947,73 @@ impl BgpPanel {
         }
     }
 
-    /// Instances: the local AS and router id (`routing.bgp.instance.set`).
+    /// Instances (G3.9fj): the local AS, the router id and the
+    /// graceful-restart timers, edited in the modal
+    /// (`routing.bgp.instance.check` previews, `instance.set` applies).
     fn instances_tab(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
         let l = app.lang.labels;
-        Grid::new("bgp-instances").striped(true).show(ui, |ui| {
-            for h in ["Name", "AS", "Router ID", "Disabled", "Restart Time", "Stale Time", "Defer Time"] {
-                ui.strong(tr_in(SCOPE, l, h));
-            }
-            ui.end_row();
-            for row in &app.cache.bgp {
-                ui.label(s(row, "name"));
-                let asn = u(row, "asn");
-                match as_chip(asn) {
-                    Some((t, k)) => {
-                        chip::chip(ui, &t, k.tone(ui.visuals()));
-                    }
-                    None => {
-                        ui.label("–");
-                    }
-                }
-                ui.label(s(row, "router_id"));
-                ui.label(s(row, "disabled"));
-                // G3.9ff: graceful restart (routing.bgp.instance.set).
-                // Unset: the defaults (null in the list, so /export
-                // leaves them out).
-                for (k, d) in [
-                    ("graceful_restart_time", 120),
-                    ("graceful_stale_time", 360),
-                    ("graceful_defer_time", 10),
-                ] {
-                    ui.label(format!("{} s", u(row, k).unwrap_or(d)));
-                }
-                ui.end_row();
-            }
+        let all = app.cache.bgp.clone();
+        let rows: Vec<Row> = all.iter().map(inst_row).collect();
+        let selection = self.inst_table.selection(&rows);
+        let picked: Vec<Item> = all
+            .iter()
+            .filter(|r| selection.contains(&s(r, "name")))
+            .map(|r| Item::of(r, "name", ""))
+            .collect();
+        let mut tools = Tools::new(&app.can(), &INST_CMDS, &picked);
+        tools.remove = Err("an instance is not removed here: disable it (its connections stop)".to_owned());
+        let mut act = None;
+        ui.horizontal(|ui| {
+            act = list::toolbar(ui, INSTANCES, &tools, &selection, l);
+            table::find_field(ui, INSTANCES, &mut self.inst_table);
         });
         ui.separator();
-        let mut help = None;
-        Grid::new("bgp-instance-form").num_columns(2).show(ui, |ui| {
-            for (label, key, hint, which) in [
-                ("Name", "bgp.instance.name", "default", 0),
-                ("AS", "bgp.instance.asn", "65000 or 1.10", 1),
-                ("Router ID", "bgp.instance.router_id", "10.255.0.1", 2),
-            ] {
-                ui.horizontal(|ui| {
-                    ui.label(tr_in(SCOPE, l, label));
-                    if help::info_button(ui, egui::Id::unique(("bgp-inst-help", which)), tr_in(SCOPE, l, label)).clicked() {
-                        help = Some(HelpView::new(key, tr_in(SCOPE, l, label)));
-                    }
-                });
-                let v = match which {
-                    0 => &mut app.forms.bgp_name,
-                    1 => &mut app.forms.bgp_asn,
-                    _ => &mut app.forms.bgp_router_id,
-                };
-                ui.add(TextEdit::singleline(v).hint_text(hint));
-                ui.end_row();
+        let known = !app.cache.commands.is_empty();
+        let frr_h = if app.forms.bgp_frr.is_empty() { 0.0 } else { 140.0 };
+        let footer_h = ui.spacing().interact_size.y + 6.0 + frr_h;
+        let out = table::show(ui, INSTANCES, footer_h, &mut self.inst_table, &INST_COLUMNS, &rows, |ui, menu| match menu {
+            Menu::Rows(sel) => {
+                if let Some(a) = list::row_menu(ui, &tools, sel, known, l) {
+                    act = Some(a);
+                }
+            }
+            Menu::Empty => {
+                if table::action(ui, tr_in(SCOPE, l, "New Instance…"), tools.add.clone()) {
+                    act = Some(Act::Add);
+                }
             }
         });
-        if help.is_some() {
-            self.help = help;
-        }
-        if table::action(ui, tr_in(SCOPE, l, "Apply"), app.can.check("routing.bgp.instance.set")) {
-            let p = json!({
-                "name": app.forms.bgp_name.trim(),
-                "asn": app.forms.bgp_asn.trim(),
-                "router_id": app.forms.bgp_router_id.trim(),
-            });
-            app.run_then("routing.bgp.instance.set", p, Then::ShowFrr);
-        }
+        self.column_help(app, out.help, &INST_COLUMNS);
+        act = act
+            .or_else(|| list::from_shortcut(out.shortcut, &tools, &selection))
+            .or_else(|| out.opened.or(out.comment).map(Act::Edit));
         if !app.forms.bgp_frr.is_empty() {
             ui.separator();
             ui.weak(tr_in(SCOPE, l, "Rendered for FRR bgpd:"));
-            ui.monospace(&app.forms.bgp_frr);
+            egui::ScrollArea::vertical().id_salt("bgp-frr").max_height(120.0).show(ui, |ui| {
+                ui.monospace(&app.forms.bgp_frr);
+            });
+        }
+        let v = ui.visuals().clone();
+        list::footer(
+            ui,
+            &[(all.len(), "instances", chip::neutral_tone(&v)), (all.iter().filter(|r| flag(r, "disabled")).count(), "disabled", chip::neutral_tone(&v))],
+            l,
+        );
+        if let Some(a) = act {
+            self.act(app, a, ui, &rows, What::Instance);
         }
     }
 
     fn act(&mut self, app: &mut CoreRouterUi, act: Act, ui: &Ui, rows: &[Row], what: What) {
+        let instances;
         let (data, cmds) = match what {
             What::Connection => (&self.connections, CONN_CMDS),
             What::Template => (&self.templates, TPL_CMDS),
+            What::Instance => {
+                instances = app.cache.bgp.clone();
+                (&instances, INST_CMDS)
+            }
         };
         let row_of = |k: &str| data.iter().find(|r| s(r, "name") == k).cloned();
         match act {
@@ -966,6 +1045,17 @@ impl BgpPanel {
                 let steps: Vec<Value> = keys
                     .iter()
                     .map(|k| json!({"command": "routing.bgp.connection.set", "params": {"id": k, "disabled": to}}))
+                    .collect();
+                app.run_steps(steps, Then::Nothing);
+            }
+            // `instance.set` takes the whole instance (the timers left out
+            // stay).
+            Act::Enable(ref keys) | Act::Disable(ref keys) if what == What::Instance => {
+                let to = matches!(act, Act::Disable(_));
+                let steps: Vec<Value> = keys
+                    .iter()
+                    .filter_map(|k| row_of(k))
+                    .map(|r| json!({"command": "routing.bgp.instance.set", "params": {"name": s(&r, "name"), "asn": r.get("asn"), "router_id": s(&r, "router_id"), "disabled": to}}))
                     .collect();
                 app.run_steps(steps, Then::Nothing);
             }
@@ -1004,6 +1094,7 @@ impl BgpPanel {
         let rows: Vec<Row> = match what {
             What::Connection => self.connections.iter().map(conn_row).collect(),
             What::Template => self.templates.iter().map(tpl_row).collect(),
+            What::Instance => app.cache.bgp.iter().map(inst_row).collect(),
         };
         self.act(app, a, ui, &rows, what);
     }
@@ -1012,11 +1103,12 @@ impl BgpPanel {
     #[cfg(test)]
     pub(crate) fn help_keys() -> Vec<&'static str> {
         let mut out: Vec<&'static str> = TABS.iter().map(|(_, _, k)| *k).collect();
-        out.extend(SESSION_COLUMNS.iter().chain(&CONN_COLUMNS).chain(&TPL_COLUMNS).map(|c| c.help));
-        out.extend(CONN_FIELDS.iter().chain(TPL_FIELDS).map(|f| f.help));
+        out.extend(SESSION_COLUMNS.iter().chain(&CONN_COLUMNS).chain(&TPL_COLUMNS).chain(&INST_COLUMNS).map(|c| c.help));
+        out.extend(CONN_FIELDS.iter().chain(TPL_FIELDS).chain(INST_FIELDS).map(|f| f.help));
         out.extend([
             CONN_SPEC.help,
             TPL_SPEC.help,
+            INST_SPEC.help,
             "bgp.session.last_error",
             "bgp.session.timers",
             "bgp.session.policy",
@@ -1045,12 +1137,20 @@ fn button(ui: &mut Ui, text: &str, tip: &str, enabled: Result<(), String>) -> bo
 
 /// The `add` parameters that recreate a row (own values; no key).
 fn recreate(r: &Value, what: What) -> Value {
+    if what == What::Instance {
+        // The row is the instance; an unset timer stays out.
+        let mut p = r.clone();
+        if let Some(o) = p.as_object_mut() {
+            o.retain(|_, v| !v.is_null());
+        }
+        return p;
+    }
     let mut p = r.get("params").cloned().unwrap_or_else(|| json!({}));
     if let Some(o) = p.as_object_mut() {
         o.remove("tcp_md5_key");
         let keys: &[&str] = match what {
             What::Connection => &["name", "remote_address", "instance", "templates", "disabled", "comment"],
-            What::Template => &["name", "templates", "comment"],
+            What::Template | What::Instance => &["name", "templates", "comment"],
         };
         for k in keys {
             if let Some(v) = r.get(*k) {
@@ -1121,10 +1221,17 @@ impl PanelState for BgpPanel {
             let spec = match what {
                 What::Connection => &CONN_SPEC,
                 What::Template => &TPL_SPEC,
+                What::Instance => &INST_SPEC,
             };
             let l = app.lang.labels;
             let page = &mut self.page;
             let open = m.show_paged(app, ctx, area, spec, &|p| options(p, &instances), &mut |ui| {
+                let general: &'static [&'static str] = match what {
+                    What::Connection => &["name", "remote_address", "remote_as", "local_role", "templates", "instance", "disabled", "comment"],
+                    What::Template => &["name", "templates", "remote_as", "local_role", "comment"],
+                    // One page: every field.
+                    What::Instance => return Some(&[]),
+                };
                 ui.horizontal(|ui| {
                     for (i, label) in ["General", "Session", "Limits", "Filters"].iter().enumerate() {
                         if ui.selectable_label(*page == i, tr_in(SCOPE, l, label)).clicked() {
@@ -1133,10 +1240,6 @@ impl PanelState for BgpPanel {
                     }
                 });
                 ui.separator();
-                let general: &'static [&'static str] = match what {
-                    What::Connection => &["name", "remote_address", "remote_as", "local_role", "templates", "instance", "disabled", "comment"],
-                    What::Template => &["name", "templates", "remote_as", "local_role", "comment"],
-                };
                 Some(match *page {
                     1 => SESSION_PAGE,
                     2 => LIMITS_PAGE,
@@ -1152,6 +1255,13 @@ impl PanelState for BgpPanel {
     }
 
     fn reply(&mut self, app: &mut CoreRouterUi, then: PanelThen, result: &Result<Value, String>) {
+        // `instance.set` answers with what bgpd gets.
+        if let Ok(frr) = result.as_ref().map(|r| r.get("frr"))
+            && let Some(f) = frr.and_then(Value::as_str)
+            && self.modal.as_ref().is_some_and(|(w, _)| *w == What::Instance)
+        {
+            app.forms.bgp_frr = f.to_owned();
+        }
         if let Some(a) = then.downcast_ref::<Applied>()
             && let Some((_, m)) = self.modal.as_mut().filter(|(_, m)| m.id == a.0)
             && m.replied(app, result)
@@ -1166,12 +1276,18 @@ impl PanelState for BgpPanel {
             Tab::Sessions => self.session_table.escape(),
             Tab::Connections => self.conn_table.escape(),
             Tab::Templates => self.tpl_table.escape(),
-            Tab::Instances | Tab::Rpki | Tab::Routes => false,
+            Tab::Instances => self.inst_table.escape(),
+            Tab::Rpki | Tab::Routes => false,
         }
     }
 
     fn tables(&self) -> Vec<(&'static str, &TableState)> {
-        vec![(SESSIONS, &self.session_table), (CONNECTIONS, &self.conn_table), (TEMPLATES, &self.tpl_table)]
+        vec![
+            (SESSIONS, &self.session_table),
+            (CONNECTIONS, &self.conn_table),
+            (TEMPLATES, &self.tpl_table),
+            (INSTANCES, &self.inst_table),
+        ]
     }
 
     fn tables_mut(&mut self) -> Vec<(&'static str, &mut TableState)> {
@@ -1179,6 +1295,7 @@ impl PanelState for BgpPanel {
             (SESSIONS, &mut self.session_table),
             (CONNECTIONS, &mut self.conn_table),
             (TEMPLATES, &mut self.tpl_table),
+            (INSTANCES, &mut self.inst_table),
         ]
     }
 }
