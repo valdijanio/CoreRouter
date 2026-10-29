@@ -11,11 +11,14 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Clear"##, r##"Reiniciar"##),
     (r##"Close the session and open it again (its routes are withdrawn meanwhile)"##, r##"Fecha a sessão e abre de novo (as rotas dela saem enquanto isso)"##),
     (r##"Connections"##, r##"Conexões"##),
+    (r##"Defer Time"##, r##"Tempo de espera"##),
     (r##"Disabled"##, r##"Desativada"##),
     (r##"Enable"##, r##"Ativar"##),
     (r##"Families"##, r##"Famílias"##),
     (r##"Flaps"##, r##"Quedas"##),
+    (r##"GR"##, r##"GR"##),
     (r##"General"##, r##"Geral"##),
+    (r##"Graceful Restart"##, r##"Graceful restart"##),
     (r##"History"##, r##"Histórico"##),
     (r##"Hold"##, r##"Hold"##),
     (r##"Hold / Keepalive"##, r##"Hold / Keepalive"##),
@@ -44,6 +47,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Remote ID"##, r##"ID remoto"##),
     (r##"Rendered for FRR bgpd:"##, r##"Como vai para o bgpd do FRR:"##),
     (r##"Resend"##, r##"Reenviar rotas"##),
+    (r##"Restart Time"##, r##"Restart Time"##),
     (r##"Router ID"##, r##"Router ID"##),
     (r##"Routes"##, r##"Rotas"##),
     (r##"Send our routes again: new outbound policy, no reset"##, r##"Manda as nossas rotas de novo: aplica a nova política de saída sem derrubar a sessão"##),
@@ -51,6 +55,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Sessions"##, r##"Sessões"##),
     (r##"Shutdown"##, r##"Desligar"##),
     (r##"Shutdown closes the session (Cease, administrative shutdown) and keeps the connection"##, r##"Desligar fecha a sessão (Cease, administrative shutdown) e mantém a conexão na config"##),
+    (r##"Stale Time"##, r##"Tempo de stale"##),
     (r##"State"##, r##"Estado"##),
     (r##"Templates"##, r##"Templates"##),
     (r##"The routes this neighbor sent and we sent it, with the RPKI state of each (Routing › BGP Routes)"##, r##"As rotas que este vizinho mandou e que mandamos a ele, com o estado RPKI de cada uma (Routing › BGP Routes)"##),
@@ -96,6 +101,17 @@ O perfil BFD (Routing › BFD) que vigia esta sessão: quando o BFD vê o vizinh
 
 ## Recomendado
 `default` (300 ms × 3) no eBGP com a operadora; o outro lado também precisa de BFD."##),
+    (r##"bgp.param.graceful_restart"##, r##"## O que é
+Graceful restart (RFC 4724) como quem reinicia: quando o `bgpd` deste roteador cai e volta, o vizinho guarda as nossas rotas (marcadas stale) até o Restart Time da instância (120 s por padrão), e o nosso kernel guarda as dele (o `zebra` não as tira). O tráfego segue enquanto o `bgpd` volta. Sem isso o vizinho retira as rotas assim que a sessão TCP cai (106 ms, **medido** contra o RouterOS 7.25).
+
+## Valores
+`yes`: anuncia a capacidade de reinício com o bit F (encaminhamento preservado). Vazio: só ajuda (guarda as rotas do vizinho quando ele reinicia), o padrão do FRR. `no`: nem isso.
+
+## Cuidado
+O vizinho precisa ser helper (o RouterOS anuncia `gr`). O Restart Time deve ser menor que o hold time (RFC 4724 §3; a prévia avisa). Os tempos ficam na instância: `routing.bgp.instance.set` com `graceful_restart_time` e `graceful_stale_time` (1..4095 s) e `graceful_defer_time` (0..3600 s, padrão 10: quanto o melhor caminho espera os End-of-RIB depois que o `bgpd` sobe; o FRR usaria 360 s).
+
+## Com MikroTik
+O RouterOS 7.25 anuncia graceful restart mas não guarda as nossas rotas quando o `bgpd` cai, nem manda End-of-RIB (**medido**): do lado dele não há ganho. Do nosso lado o kernel continua guardando as rotas dele."##),
     (r##"bgp.param.hold_time"##, r##"## O que é
 Segundos sem mensagem do vizinho até a sessão ser fechada (RFC 4271 §4.2). Vale o menor dos dois lados.
 
@@ -164,6 +180,8 @@ O `local.address` do RouterOS: o endereço (ou interface) de onde sai a sessão 
 O estado do BFD para o vizinho (RFC 5880/5882), quando o BFD o vigia: detecta um enlace morto em fração de segundo, bem antes do hold time."##),
     (r##"bgp.session.flaps"##, r##"## O que é
 Quantas vezes a sessão caiu depois de estabelecida. Um número que cresce aponta para enlace ou vizinho instável."##),
+    (r##"bgp.session.gr"##, r##"## O que é
+O papel deste roteador no graceful restart com o vizinho (RFC 4724): `restart` (reinicia sem o vizinho retirar as rotas), `helper` (só guarda as rotas do vizinho quando ele reinicia), `disable`. `EoR`: o vizinho mandou o End-of-RIB (§2), a tabela dele está completa. `no EoR` (âmbar): estamos como `restart` e o vizinho nunca mandou End-of-RIB; o RouterOS 7.25 é assim (**medido**): anuncia a capacidade e não manda o marcador, e também não guarda as nossas rotas quando o nosso `bgpd` cai. Depois de um início do `bgpd`, as rotas dele esperam o Defer Time da instância (10 s)."##),
     (r##"bgp.session.last_error"##, r##"## O que é
 O último NOTIFICATION enviado ou recebido (RFC 4271 §4.5), ou o motivo da última queda ("Reached received prefix count": o limite de prefixos)."##),
     (r##"bgp.session.messages"##, r##"## O que é

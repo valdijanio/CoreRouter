@@ -11,7 +11,7 @@ use crate::{Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "routing.bgp.session.list", "BGP Sessions", ["Routing", "BGP"], None,
-        "{instance?: string, connection?: string} → [{instance, vrf, remote_address, remote_as, local_as, remote_id, state, established, uptime_secs, prefix_count, prefix_sent, messages_received, messages_sent, reason, description, connection? (the routing.bgp.connection), hold_time?, keepalive_time? (negotiated, s), last_error?, flaps?, bfd?, afi?: [string], policy_in?, policy_out?}]",
+        "{instance?: string, connection?: string} → [{instance, vrf, remote_address, remote_as, local_as, remote_id, state, established, uptime_secs, prefix_count, prefix_sent, messages_received, messages_sent, reason, description, connection? (the routing.bgp.connection), hold_time?, keepalive_time? (negotiated, s), last_error?, flaps?, bfd?, afi?: [string], policy_in?, policy_out?, gr_local? (restart | helper | disable, G3.9ff), gr_remote?, end_of_rib_received?: [string] (families whose End-of-RIB arrived, RFC 4724 §2)}]",
         always, session_list),
     cmd!(query "routing.backend.get", "Routing Backend", ["Routing"], None,
         "{} → {backend, attached, updated, error, bgp_sessions}",

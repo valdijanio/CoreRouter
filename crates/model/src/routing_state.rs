@@ -58,6 +58,15 @@ pub struct BgpSession {
     pub policy_in: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_out: Option<String>,
+    /// G3.9ff, RFC 4724: our graceful-restart role toward the neighbor and
+    /// its own (`restart`, `helper`, `disable`), and the families whose
+    /// End-of-RIB it sent us (§2: its routes are all there).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gr_local: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gr_remote: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub end_of_rib_received: Vec<String>,
 }
 
 /// What the routing backend is doing, for the session list and the log.

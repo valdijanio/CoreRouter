@@ -35,10 +35,10 @@ pub const MAX_TEMPLATES: usize = 1_000;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("routing.bgp.template.add", "Add BGP Template", ["Routing", "BGP"], None,
-        "{name: string, templates?: [string] | string (parents, first wins), comment?: string, remote_as?: u32 | asdot string | null, local_role?: string | null, multihop?: bool | null, hold_time?: u16 | null, keepalive_time?: u16 | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | null, max_prefix_ipv6?: u32 | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes), bfd?: string | null (a BFD profile, routing.bfd.profile: the session goes down with BFD), output_redistribute?: [string] | string | null (connected, static, ospf: announced to the neighbor), output_network?: string | null (an /ip firewall address-list: its networks are announced while a route to each exists)} → {name}",
+        "{name: string, templates?: [string] | string (parents, first wins), comment?: string, remote_as?: u32 | asdot string | null, local_role?: string | null, multihop?: bool | null, hold_time?: u16 | null, keepalive_time?: u16 | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | null, max_prefix_ipv6?: u32 | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes), graceful_restart?: bool | null (G3.9ff, RFC 4724: restart as the restarting speaker, the neighbor keeps our routes while bgpd restarts; unset: helper only; false: disable), bfd?: string | null (a BFD profile, routing.bfd.profile: the session goes down with BFD), output_redistribute?: [string] | string | null (connected, static, ospf: announced to the neighbor), output_network?: string | null (an /ip firewall address-list: its networks are announced while a route to each exists)} → {name}",
         always, template_add),
     cmd!("routing.bgp.template.set", "Set BGP Template", [], None,
-        "{id: string (the name), name?: string, templates?: [string] | string, comment?: string, remote_as?: u32 | asdot string | null, local_role?: string | null, multihop?: bool | null, hold_time?: u16 | null, keepalive_time?: u16 | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | null, max_prefix_ipv6?: u32 | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes), bfd?: string | null (a BFD profile, routing.bfd.profile: the session goes down with BFD), output_redistribute?: [string] | string | null (connected, static, ospf: announced to the neighbor), output_network?: string | null (an /ip firewall address-list: its networks are announced while a route to each exists)} → {name}",
+        "{id: string (the name), name?: string, templates?: [string] | string, comment?: string, remote_as?: u32 | asdot string | null, local_role?: string | null, multihop?: bool | null, hold_time?: u16 | null, keepalive_time?: u16 | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | null, max_prefix_ipv6?: u32 | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes), graceful_restart?: bool | null (G3.9ff, RFC 4724: restart as the restarting speaker, the neighbor keeps our routes while bgpd restarts; unset: helper only; false: disable), bfd?: string | null (a BFD profile, routing.bfd.profile: the session goes down with BFD), output_redistribute?: [string] | string | null (connected, static, ospf: announced to the neighbor), output_network?: string | null (an /ip firewall address-list: its networks are announced while a route to each exists)} → {name}",
         has_templates, template_set),
     cmd!("routing.bgp.template.remove", "Remove BGP Template", [], None,
         "{id: string (the name)} → {name}",
@@ -47,13 +47,13 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{} → [{name, templates, params (own values; tcp_md5_key as \"***\"), effective (with the parents' values), used_by (connections and templates listing it), error?, comment}]",
         always, template_list),
     cmd!(query "routing.bgp.template.check", "Check BGP Template", [], None,
-        "{id?: string (the template being edited), name?: string, templates?: [string] | string, comment?: string, remote_as?: u32 | string | null, local_role?: string | null, multihop?: bool | yes | no | null, hold_time?: u16 | string | null, keepalive_time?: u16 | string | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | string | null, max_prefix_ipv6?: u32 | string | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | string | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes), bfd?: string | null (a BFD profile, routing.bfd.profile: the session goes down with BFD), output_redistribute?: [string] | string | null (connected, static, ospf: announced to the neighbor), output_network?: string | null (an /ip firewall address-list: its networks are announced while a route to each exists)} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk} (form texts accepted: \"90\", yes/no, empty = unset)",
+        "{id?: string (the template being edited), name?: string, templates?: [string] | string, comment?: string, remote_as?: u32 | string | null, local_role?: string | null, multihop?: bool | yes | no | null, hold_time?: u16 | string | null, keepalive_time?: u16 | string | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | string | null, max_prefix_ipv6?: u32 | string | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | string | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes), graceful_restart?: bool | null (G3.9ff, RFC 4724: restart as the restarting speaker, the neighbor keeps our routes while bgpd restarts; unset: helper only; false: disable), bfd?: string | null (a BFD profile, routing.bfd.profile: the session goes down with BFD), output_redistribute?: [string] | string | null (connected, static, ospf: announced to the neighbor), output_network?: string | null (an /ip firewall address-list: its networks are announced while a route to each exists)} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk} (form texts accepted: \"90\", yes/no, empty = unset)",
         always, template_check),
     cmd!("routing.bgp.connection.add", "Add BGP Connection", ["Routing", "BGP"], None,
-        "{name: string, remote_address: ip, instance?: string (default \"default\"), templates?: [string] | string, disabled?: bool, comment?: string, remote_as?: u32 | asdot string | null, local_role?: string | null, multihop?: bool | null, hold_time?: u16 | null, keepalive_time?: u16 | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | null, max_prefix_ipv6?: u32 | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes), bfd?: string | null (a BFD profile, routing.bfd.profile: the session goes down with BFD), output_redistribute?: [string] | string | null (connected, static, ospf: announced to the neighbor), output_network?: string | null (an /ip firewall address-list: its networks are announced while a route to each exists)} → {name}",
+        "{name: string, remote_address: ip, instance?: string (default \"default\"), templates?: [string] | string, disabled?: bool, comment?: string, remote_as?: u32 | asdot string | null, local_role?: string | null, multihop?: bool | null, hold_time?: u16 | null, keepalive_time?: u16 | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | null, max_prefix_ipv6?: u32 | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes), graceful_restart?: bool | null (G3.9ff, RFC 4724: restart as the restarting speaker, the neighbor keeps our routes while bgpd restarts; unset: helper only; false: disable), bfd?: string | null (a BFD profile, routing.bfd.profile: the session goes down with BFD), output_redistribute?: [string] | string | null (connected, static, ospf: announced to the neighbor), output_network?: string | null (an /ip firewall address-list: its networks are announced while a route to each exists)} → {name}",
         always, connection_add),
     cmd!("routing.bgp.connection.set", "Set BGP Connection", [], None,
-        "{id: string (the name), name?: string, remote_address?: ip, instance?: string, templates?: [string] | string, disabled?: bool (true: shutdown, the session closes and stays in the config), comment?: string, remote_as?: u32 | asdot string | null, local_role?: string | null, multihop?: bool | null, hold_time?: u16 | null, keepalive_time?: u16 | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | null, max_prefix_ipv6?: u32 | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes), bfd?: string | null (a BFD profile, routing.bfd.profile: the session goes down with BFD), output_redistribute?: [string] | string | null (connected, static, ospf: announced to the neighbor), output_network?: string | null (an /ip firewall address-list: its networks are announced while a route to each exists)} → {name}",
+        "{id: string (the name), name?: string, remote_address?: ip, instance?: string, templates?: [string] | string, disabled?: bool (true: shutdown, the session closes and stays in the config), comment?: string, remote_as?: u32 | asdot string | null, local_role?: string | null, multihop?: bool | null, hold_time?: u16 | null, keepalive_time?: u16 | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | null, max_prefix_ipv6?: u32 | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes), graceful_restart?: bool | null (G3.9ff, RFC 4724: restart as the restarting speaker, the neighbor keeps our routes while bgpd restarts; unset: helper only; false: disable), bfd?: string | null (a BFD profile, routing.bfd.profile: the session goes down with BFD), output_redistribute?: [string] | string | null (connected, static, ospf: announced to the neighbor), output_network?: string | null (an /ip firewall address-list: its networks are announced while a route to each exists)} → {name}",
         has_connections, connection_set),
     cmd!("routing.bgp.connection.remove", "Remove BGP Connection", [], None,
         "{id: string (the name)} → {name}",
@@ -62,7 +62,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{find?: string (in name, address, AS or comment)} → [{name, instance, remote_address, templates, disabled, comment, kind (ibgp | ebgp), local_as, params (own; tcp_md5_key \"***\"), effective (in force), inherited: [param] (from a template), key_set: bool (a TCP MD5 key is in force), state (the session's, or disabled | unknown), established, uptime_secs?, prefix_count?, prefix_sent?, error?}]",
         always, connection_list),
     cmd!(query "routing.bgp.connection.check", "Check BGP Connection", [], None,
-        "{id?: string (the connection being edited), name?: string, remote_address?: string, instance?: string, templates?: [string] | string, disabled?: bool, comment?: string, remote_as?: u32 | string | null, local_role?: string | null, multihop?: bool | yes | no | null, hold_time?: u16 | string | null, keepalive_time?: u16 | string | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | string | null, max_prefix_ipv6?: u32 | string | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | string | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes), bfd?: string | null (a BFD profile, routing.bfd.profile: the session goes down with BFD), output_redistribute?: [string] | string | null (connected, static, ospf: announced to the neighbor), output_network?: string | null (an /ip firewall address-list: its networks are announced while a route to each exists)} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk} (form texts accepted: \"90\", yes/no, empty = unset)",
+        "{id?: string (the connection being edited), name?: string, remote_address?: string, instance?: string, templates?: [string] | string, disabled?: bool, comment?: string, remote_as?: u32 | string | null, local_role?: string | null, multihop?: bool | yes | no | null, hold_time?: u16 | string | null, keepalive_time?: u16 | string | null, tcp_md5_key?: string | null, afi?: [string] | string | null, max_prefix_ipv4?: u32 | string | null, max_prefix_ipv6?: u32 | string | null, max_prefix_action?: string | null, max_prefix_restart?: u16 | string | null, update_source?: string | null, nexthop_choice?: string | null, input_filter?: string | null (the /routing filter chain of received routes), output_filter?: string | null (of sent routes), keep_received?: bool | null (keep received routes before the input chain; default yes), graceful_restart?: bool | null (G3.9ff, RFC 4724: restart as the restarting speaker, the neighbor keeps our routes while bgpd restarts; unset: helper only; false: disable), bfd?: string | null (a BFD profile, routing.bfd.profile: the session goes down with BFD), output_redistribute?: [string] | string | null (connected, static, ospf: announced to the neighbor), output_network?: string | null (an /ip firewall address-list: its networks are announced while a route to each exists)} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk} (form texts accepted: \"90\", yes/no, empty = unset)",
         always, connection_check),
     cmd!("routing.bgp.session.clear", "Clear BGP Session", [], None,
         "{connection: string} → {connection, remote_address, action: \"clear\"} (closes the session and opens it again: NOTIFICATION Cease, administrative reset)",
@@ -249,6 +249,9 @@ fn parse_params(p: &Value, out: &mut BgpParams, seal: Sealer<'_>) -> Result<()> 
     }
     field(p, "keep_received", &mut out.keep_received, |v| {
         v.as_bool().ok_or_else(|| EngineError::bad("keep_received", "must be true or false"))
+    })?;
+    field(p, "graceful_restart", &mut out.graceful_restart, |v| {
+        v.as_bool().ok_or_else(|| EngineError::bad("graceful_restart", "must be true or false"))
     })?;
     // G3.6b: checked against the profiles at commit (routing.bfd).
     field(p, "bfd", &mut out.bfd, |v| {
@@ -581,6 +584,7 @@ const PARAM_NAMES: &[&str] = &[
     "input_filter",
     "output_filter",
     "keep_received",
+    "graceful_restart",
     "bfd",
     "output_redistribute",
     "output_network",
@@ -699,6 +703,7 @@ const UNSET_WHEN_EMPTY: &[&str] = &[
     "input_filter",
     "output_filter",
     "keep_received",
+    "graceful_restart",
     "bfd",
     "output_redistribute",
     "output_network",
@@ -726,8 +731,8 @@ fn normalize(p: &Value, editing: bool) -> Value {
             Some(t) if NUMBERS.contains(&k.as_str()) => {
                 t.parse::<u64>().map_or_else(|_| v.clone(), Value::from)
             }
-            Some("yes") if k == "multihop" || k == "keep_received" => Value::Bool(true),
-            Some("no") if k == "multihop" || k == "keep_received" => Value::Bool(false),
+            Some("yes") if matches!(k.as_str(), "multihop" | "keep_received" | "graceful_restart") => Value::Bool(true),
+            Some("no") if matches!(k.as_str(), "multihop" | "keep_received" | "graceful_restart") => Value::Bool(false),
             _ => v.clone(),
         };
         out.insert(k.clone(), v);
@@ -817,6 +822,27 @@ fn preview(s: &mut Session, raw: &Value, what: What) -> Result<Value> {
                 // G3.9f: RouterOS 7.25 sends IPv6 over an IPv4 session with an
                 // IPv4-mapped next hop (::ffff:a.b.c.d); RFC 2545 §3 asks for a
                 // global IPv6 address and no kernel installs the mapped one.
+                // G3.9ff, RFC 4724 §3: the Restart Time SHOULD be shorter
+                // than the hold time.
+                if eff.graceful_restart == Some(true) {
+                    let inst = routing.bgp.get(&c.instance);
+                    let rt = inst.and_then(|i| i.graceful_restart_time).unwrap_or(corerouter_proto_bgp::GR_RESTART_TIME);
+                    let (_, hold) = corerouter_proto_bgp::timers(&eff);
+                    if hold != 0 && rt >= hold {
+                        checks.push(check(
+                            "warning",
+                            "gr-restart-time",
+                            format!("the Restart Time ({rt} s, routing.bgp.instance.set graceful_restart_time) is not shorter than the hold time ({hold} s): RFC 4724 §3 recommends it below the hold time"),
+                            "graceful_restart",
+                        ));
+                    }
+                    checks.push(check(
+                        "info",
+                        "graceful-restart",
+                        format!("graceful restart: while bgpd restarts the neighbor keeps our routes for up to {rt} s and our kernel keeps its routes (RFC 4724); the neighbor must be a helper (RouterOS announces gr)"),
+                        "graceful_restart",
+                    ));
+                }
                 // G3.9fh: the input chain can write the neighbor's IPv6
                 // address over it (`set gw`).
                 if c.remote_address.is_ipv4() && eff.families().contains(&Afi::Ipv6) {
@@ -1153,6 +1179,32 @@ mod tests {
             .unwrap();
         assert_eq!(v["checks"][0]["param"], "remote_address");
         assert!(s.store().candidate().routing.bgp_connections.is_empty());
+    }
+
+    #[test]
+    fn graceful_restart_per_connection_and_its_timers() {
+        // G3.9ff: on a connection (and a template), timers on the instance;
+        // instance.set without them keeps them.
+        let mut s = session();
+        s.execute("routing.bgp.instance.set", &json!({"asn": 65000, "router_id": "10.0.0.1", "graceful_restart_time": 90})).unwrap();
+        s.execute("routing.bgp.instance.set", &json!({"asn": 65000, "router_id": "10.0.0.1", "comment": "edge"})).unwrap();
+        let rows = s.execute("routing.bgp.instance.list", &json!({})).unwrap();
+        assert_eq!((rows[0]["graceful_restart_time"].as_u64(), rows[0]["graceful_stale_time"].as_u64()), (Some(90), None), "{rows}");
+        let e = s.execute("routing.bgp.instance.set", &json!({"asn": 65000, "router_id": "10.0.0.1", "graceful_stale_time": 5000})).unwrap_err();
+        assert!(e.to_string().contains("12 bits"), "{e}");
+        s.execute("routing.bgp.template.add", &json!({"name": "gr", "graceful_restart": true})).unwrap();
+        s.execute("routing.bgp.connection.add", &json!({"name": "up1", "remote_address": "192.0.2.1", "remote_as": 64500, "templates": "gr"})).unwrap();
+        let text = corerouter_proto_bgp::render_all(&s.store().running().routing, &|_| None).unwrap();
+        assert!(text.contains(" neighbor 192.0.2.1 graceful-restart\n") && text.contains(" bgp graceful-restart restart-time 90\n"), "{text}");
+        // A form's "no" turns it off; the preview says what it does.
+        let v = s.execute("routing.bgp.connection.check", &json!({"id": "up1", "graceful_restart": "no"})).unwrap();
+        assert_eq!(v["commands"][0]["params"]["graceful_restart"], false, "{v}");
+        let v = s.execute("routing.bgp.connection.check", &json!({"id": "up1", "hold_time": 60})).unwrap();
+        assert!(v["checks"].to_string().contains("gr-restart-time"), "Restart Time 90 s ≥ hold 60 s: {v}");
+        let v = s.execute("routing.bgp.connection.check", &json!({"id": "up1"})).unwrap();
+        assert!(v["checks"].to_string().contains("\"graceful-restart\"") && !v["checks"].to_string().contains("gr-restart-time"), "{v}");
+        let e = s.execute("routing.bgp.connection.set", &json!({"id": "up1", "graceful_restart": "maybe"})).unwrap_err();
+        assert!(e.to_string().contains("true or false"), "{e}");
     }
 
     #[test]

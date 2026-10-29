@@ -59,6 +59,9 @@ fn base() -> Config {
             router_id: "198.51.100.33".parse().unwrap(),
             disabled: false,
             comment: String::new(),
+            graceful_restart_time: None,
+            graceful_stale_time: None,
+            graceful_defer_time: None,
         },
     );
     for c in [

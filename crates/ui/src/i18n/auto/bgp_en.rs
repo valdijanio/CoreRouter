@@ -26,6 +26,17 @@ The BFD profile (Routing › BFD) watching this session: when BFD sees the neigh
 
 ## Recommended
 `default` (300 ms × 3) on eBGP to an upstream; the other side needs BFD too."##),
+    (r##"bgp.param.graceful_restart"##, r##"## What it is
+Graceful restart (RFC 4724) as the restarting speaker: when this router's `bgpd` dies and comes back, the neighbor keeps our routes (stale) up to the instance's Restart Time (120 s by default), and our kernel keeps its routes (`zebra` leaves them). Traffic flows while `bgpd` comes back. Without it the neighbor withdraws the routes as soon as the TCP session drops (106 ms, measured against RouterOS 7.25).
+
+## Values
+`yes`: announces the restart capability with the F bit (forwarding kept). Empty: helper only (keeps the neighbor's routes when it restarts), FRR's default. `no`: not even that.
+
+## Mind
+The neighbor must be a helper (RouterOS announces `gr`). The Restart Time should be below the hold time (RFC 4724 §3; the preview warns). The timers are the instance's: `routing.bgp.instance.set` with `graceful_restart_time` and `graceful_stale_time` (1..4095 s) and `graceful_defer_time` (0..3600 s, default 10: how long the best path waits for End-of-RIBs after `bgpd` starts; FRR would use 360 s).
+
+## With MikroTik
+RouterOS 7.25 announces graceful restart but keeps none of our routes when our `bgpd` dies, and sends no End-of-RIB (measured): no gain on its side. On ours the kernel still keeps its routes."##),
     (r##"bgp.param.hold_time"##, r##"## What it is
 Seconds without a message from the neighbor before the session is closed (RFC 4271 §4.2). The smaller of the two sides' values is used.
 
@@ -76,6 +87,8 @@ RouterOS `local.address`: the address (or interface) the TCP session leaves from
 BFD's state for the neighbor (RFC 5880/5882), when BFD watches it: it detects a dead link in a fraction of a second, long before the hold time."##),
     (r##"bgp.session.flaps"##, r##"## What it is
 Times the session went down after being established. A count that grows points to a flapping link or neighbor."##),
+    (r##"bgp.session.gr"##, r##"## What it is
+This router's graceful-restart role with the neighbor (RFC 4724): `restart` (restarts without the neighbor withdrawing the routes), `helper` (only keeps the neighbor's routes when it restarts), `disable`. `EoR`: the neighbor sent its End-of-RIB (§2), its table is complete. `no EoR` (amber): we are `restart` and the neighbor never sent End-of-RIB; RouterOS 7.25 does so (measured): it announces the capability and sends no marker, and it does not keep our routes when our `bgpd` dies either. After a `bgpd` start its routes wait for the instance's Defer Time (10 s)."##),
     (r##"bgp.session.last_error"##, r##"## What it is
 The last NOTIFICATION sent or received (RFC 4271 §4.5), or why the session last went down ("Reached received prefix count": the prefix limit)."##),
     (r##"bgp.session.messages"##, r##"## What it is

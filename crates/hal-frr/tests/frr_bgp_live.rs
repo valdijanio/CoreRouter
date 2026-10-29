@@ -48,6 +48,9 @@ fn base_cfg() -> Config {
             router_id: "198.51.100.1".parse().unwrap(),
             disabled: false,
             comment: String::new(),
+            graceful_restart_time: None,
+            graceful_stale_time: None,
+            graceful_defer_time: None,
         },
     );
     cfg
