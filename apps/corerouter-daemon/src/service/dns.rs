@@ -30,7 +30,7 @@ use corerouter_engine::{Shared, lock};
 use corerouter_hal::probe::{AsInfo, Lookup};
 use corerouter_model::dns::CacheRow;
 use corerouter_proto_dns::resolver::{
-    ResolveError, Resolver, ServerStats, Transport, TransportError,
+    ResolveError, Resolver, ServerStats, Settings, Transport, TransportError,
 };
 
 /// How often the thread looks at the config.
@@ -147,6 +147,13 @@ impl RouterDns {
         }
     }
 
+    /// New settings, keeping the resolver's port (53 but in the tests,
+    /// which point it at a server of theirs).
+    pub(crate) fn sync(&self, mut settings: Settings) {
+        settings.port = self.resolver.settings().port;
+        self.resolver.configure(settings, self.now_ms());
+    }
+
     pub(crate) fn now_ms(&self) -> u64 {
         u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
@@ -178,6 +185,10 @@ impl DnsBackend for RouterDns {
 
     fn cache_used_bytes(&self) -> usize {
         self.resolver.cache_used_bytes()
+    }
+
+    fn configure(&self, settings: Settings) {
+        self.sync(settings);
     }
 
     fn flush(&self) {
@@ -474,7 +485,7 @@ pub(crate) fn spawn(session: Shared) -> std::io::Result<Arc<RouterDns>> {
 
 fn register(session: &Shared, dns: &Arc<RouterDns>) {
     let mut s = lock(session);
-    dns.resolver.configure(s.dns_settings(), dns.now_ms());
+    dns.sync(s.dns_settings());
     s.set_dns_backend(dns.clone());
 }
 
@@ -494,7 +505,7 @@ fn follow(session: &Shared, dns: &RouterDns, health: &super::Health) {
             health.event("DNS servers configured");
         }
         warned = !settings.has_servers();
-        dns.resolver.configure(settings, dns.now_ms());
+        dns.sync(settings);
     }
 }
 
@@ -705,6 +716,45 @@ pub(crate) mod tests {
         let t = Instant::now();
         assert_eq!(dns.lookup("x.example").unwrap(), vec![IpAddr::from([192, 0, 2, 12])]);
         assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    }
+
+    /// G1.6qc, the case of the image test of 29/10: `ip.dns.set` and,
+    /// right after, `ip.dns.resolve`. No following thread here, so only
+    /// the command path can bring the new server in.
+    #[test]
+    fn resolve_right_after_set_uses_the_new_server() {
+        let (port, count) = server(Ipv4Addr::new(192, 0, 2, 15), false);
+        let session = shared(Session::virtual_lab());
+        let dns = Arc::new(RouterDns::new());
+        dns.resolver.configure(settings(port, &[]), 0);
+        register(&session, &dns);
+        let id = {
+            let mut s = lock(&session);
+            s.set_runner(corerouter_control::thread_runner());
+            s.execute("ip.dns.set", &json!({"servers": ["127.0.0.1"]})).unwrap();
+            let r = s
+                .execute("ip.dns.resolve", &json!({"name": "www.example", "type": "A"}))
+                .unwrap();
+            r["task_id"].as_u64().unwrap()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let done = loop {
+            let p = lock(&session)
+                .execute("tool.task.poll", &json!({"id": id, "max": 16}))
+                .unwrap();
+            if p["done"] == true {
+                break p;
+            }
+            assert!(Instant::now() < deadline, "{p}");
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(done["state"], "done", "{done}");
+        assert_eq!(done["summary"]["addresses"], json!(["192.0.2.15"]), "{done}");
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        // And back: no server, the next lookup says so at once.
+        lock(&session).execute("ip.dns.set", &json!({"servers": []})).unwrap();
+        let backend = lock(&session).dns_backend().unwrap();
+        assert!(matches!(backend.lookup("uncached.example"), Err(ResolveError::NoServers)));
     }
 
     #[test]
