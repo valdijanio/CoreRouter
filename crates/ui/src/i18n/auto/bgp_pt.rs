@@ -31,11 +31,13 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"New Template…"##, r##"Novo template…"##),
     (r##"No BGP connection yet: add one in the Connections tab."##, r##"Nenhuma conexão BGP ainda: adicione uma na aba Conexões."##),
     (r##"Not a CoreRouter connection (typed into FRR by hand)."##, r##"Não é uma conexão do CoreRouter (digitada no FRR à mão)."##),
+    (r##"Output Network"##, r##"Redes anunciadas"##),
     (r##"Policy In"##, r##"Política de entrada"##),
     (r##"Policy Out"##, r##"Política de saída"##),
     (r##"Prefixes In"##, r##"Prefixos recebidos"##),
     (r##"Prefixes Out"##, r##"Prefixos enviados"##),
     (r##"RPKI In"##, r##"RPKI entrada"##),
+    (r##"Redistribute"##, r##"Redistribuir"##),
     (r##"Refresh"##, r##"Pedir rotas"##),
     (r##"Remote AS"##, r##"AS remoto"##),
     (r##"Remote Address"##, r##"Endereço remoto"##),
@@ -131,6 +133,16 @@ O `nexthop-choice` do RouterOS: `default` (a regra do protocolo), `force-self` (
 
 ## Quando usar
 `force-self` no iBGP de um roteador de borda, para os outros não precisarem da rota até o trânsito."##),
+    (r##"bgp.param.output_network"##, r##"## O que é
+`output.network` do RouterOS: o nome de uma address-list do firewall (`/ip firewall address-list`) cujas redes este roteador anuncia ao vizinho. Cada rede só sai enquanto houver rota para ela (conectada, estática ou do OSPF), como no RouterOS; faixas `a-b` ficam de fora.
+
+## Cuidado
+O FRR anuncia por instância: a lista vale para as outras conexões da mesma família. Quem não deve receber filtra no Output Filter (eBGP sem ele não recebe nada, RFC 8212)."##),
+    (r##"bgp.param.output_redistribute"##, r##"## O que é
+`output.redistribute` do RouterOS: as rotas do próprio roteador que vão ao vizinho, separadas por vírgula: `connected`, `static` (as de `/ip route`) e `ospf`.
+
+## Cuidado
+Como a Output Network, vale para a instância inteira; o Output Filter escolhe o que cada vizinho recebe."##),
     (r##"bgp.param.remote_as"##, r##"## O que é
 O AS do vizinho (`remote.as` do RouterOS), em asplain (`65100`) ou asdot (`1.10`), de 4 bytes (RFC 6793). Vazio: qualquer AS — `remote-as external` (eBGP) ou `internal` (iBGP) no FRR, conforme o papel.
 

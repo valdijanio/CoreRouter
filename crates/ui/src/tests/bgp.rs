@@ -180,6 +180,39 @@ fn the_modal_adds_a_connection_through_the_preview() {
     assert!(panel(&mut h).modal.is_none());
 }
 
+/// G3.9f: the Filters page has what the router announces itself.
+#[test]
+fn the_filters_page_sets_what_the_connection_announces() {
+    let mut h = open(lab());
+    panel(&mut h).tab = Tab::Connections;
+    refresh(&mut h);
+    act(&mut h, Act::Add, What::Connection);
+    panel(&mut h).page = 3;
+    settle(&mut h);
+    for t in ["Output Network", "Redistribute", "address-list name", "connected,static,ospf"] {
+        assert!(h.has_text(t), "{t}");
+    }
+    let (_, m) = panel(&mut h).modal.as_mut().unwrap();
+    m.values.insert("name", "ix2".into());
+    m.values.insert("remote_address", "203.0.113.10".into());
+    m.values.insert("remote_as", "64501".into());
+    m.values.insert("output_network", "bgp-out".into());
+    m.values.insert("output_redistribute", "connected,static".into());
+    settle(&mut h);
+    h.click(h.text("OK"));
+    settle(&mut h);
+    let rows = lock(&h.session).execute("routing.bgp.connection.list", &json!({})).unwrap();
+    let ix = rows.as_array().unwrap().iter().find(|r| r["name"] == "ix2").cloned();
+    let ix = ix.unwrap_or_else(|| panic!("{:?}", h.app.log()));
+    assert_eq!(ix["params"]["output_network"], "bgp-out");
+    assert_eq!(ix["params"]["output_redistribute"], json!(["connected", "static"]));
+    // Editing shows them back, the list as the operator typed it.
+    act(&mut h, Act::Edit("ix2".into()), What::Connection);
+    let (_, m) = panel(&mut h).modal.as_ref().unwrap();
+    assert_eq!(m.values.get("output_redistribute").map(String::as_str), Some("connected,static"));
+    assert_eq!(m.values.get("output_network").map(String::as_str), Some("bgp-out"));
+}
+
 #[test]
 fn every_label_explains_itself_in_both_languages() {
     for key in BgpPanel::help_keys() {

@@ -2504,3 +2504,37 @@ do daemon A lida de `/proc/<pid>/task`.
 | 1 leitor (antes da G0.31) | 410 mil/s | 376 mil/s | — | 100 % |
 | 4 leitores (padrão) | 483 mil/s | 1,12 milhão/s | — | 400 % |
 | 8 leitores (comparação) | 413 mil/s | 1,33 milhão/s | 1,19 milhão/s | 760 % |
+
+### G0.31 — tempestade DHCPv4 de ponta a ponta (**medido**, 2026-10-29, AMD Ryzen AI MAX+ 395, 32 CPUs, release, máquina compartilhada)
+
+Daemon release `--backend linux --manage 'ether*'` num namespace sem root, veth `ether1` ↔
+`crcli`; pool de 65 mil endereços, `lease_time=1h`, `conflict_detection=no`. O gerador em Python
+faz DORA completa com MACs aleatórios, N transações em voo, flag de broadcast e retransmissão
+depois de 2 s. `rmem_max` do host = 4 MiB.
+
+| Carga | Antes: concessões/s | 99 % servidos | retransmissões | Depois: concessões/s | 99 % servidos | retransmissões |
+|---|---|---|---|---|---|---|
+| 20 000 clientes, 256 em voo | 9,9 mil | 0,61 s | 34 | 35,5 mil | 0,56 s | 0 |
+| 20 000 clientes, 1024 em voo | 2,5 mil | 6,06 s | 1808 | 35,3 mil | 0,56 s | 0 |
+| 4 geradores × 10 000, 256 em voo cada | 4 × 1,2–1,7 mil | 4,0–6,1 s | ~2000 | 4 × 7,9 mil | 1,26 s | 0 |
+
+DORA p50 de 5–9 ms nos dois casos. Antes, o tempo total vinha dos clientes descartados, que
+esperavam a retransmissão; a CPU da thread `svc-dhcp-server` ficava em 1–14 %.
+
+Paralelismo: o servidor continua numa thread só, porque o estado das concessões fica no `Session`.
+Com 35 mil concessões/s (70 mil mensagens/s) num núcleo, ainda sobra CPU. A divisão por interface
+ou por hash de MAC só se paga quando o gerador deixar de ser o limite, com BNG Blaster na VM.
+
+### G0.31 — encaminhador DNS: buffer de recepção (**medido**, mesma máquina)
+
+Mesmo laboratório do PR #400 (daemon release `--backend virtual`, 100 entradas estáticas, 4
+leitores UDP), 16 processos geradores por 6 s:
+
+| Em voo | Antes: respostas/s | perdidas | descartes UDP/53 | Depois: respostas/s | perdidas | descartes |
+|---|---|---|---|---|---|---|
+| 16 × 32 = 512 | 964 mil | 288 | 1738 | 990 mil | 0 | 0 |
+| 16 × 256 = 4096 | 1,11 milhão | 28 160 | 33 635 | 1,01 milhão | 0 | 0 |
+
+Com o buffer maior, a consulta espera na fila em vez de ser descartada: p50 de 0,49 ms com 512
+em voo e de 3,9 ms com 4096 (fila / vazão). Antes, cada consulta perdida custava ao cliente o
+timeout de 1–5 s do resolvedor dele.
