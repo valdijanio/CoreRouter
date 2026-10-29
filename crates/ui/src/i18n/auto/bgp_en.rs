@@ -48,6 +48,16 @@ Minutes before a session closed by the prefix limit is opened again (action `res
 The eBGP neighbor is more than one hop away (a loopback): FRR `ebgp-multihop` (TTL 255). iBGP is always multihop."##),
     (r##"bgp.param.nexthop_choice"##, r##"## What it is
 RouterOS `nexthop-choice`: `default` (the protocol's rule), `force-self` (always our address, also to iBGP: FRR `next-hop-self`) or `propagate` (keep the received next hop, also to eBGP)."##),
+    (r##"bgp.param.output_network"##, r##"## What it is
+RouterOS `output.network`: the name of a firewall address-list (`/ip firewall address-list`) whose networks this router announces to the neighbor. Each network goes out only while a route to it exists (connected, static or OSPF), as in RouterOS; `a-b` ranges are left out.
+
+## Careful
+FRR announces per instance: the list counts for the other connections of the same family. Those that should not get it filter in the Output Filter (eBGP without one gets nothing, RFC 8212)."##),
+    (r##"bgp.param.output_redistribute"##, r##"## What it is
+RouterOS `output.redistribute`: the router's own routes sent to the neighbor, comma-separated: `connected`, `static` (those of `/ip route`) and `ospf`.
+
+## Careful
+Like the Output Network, it counts for the whole instance; the Output Filter picks what each neighbor gets."##),
     (r##"bgp.param.remote_as"##, r##"## What it is
 The neighbor's AS (RouterOS `remote.as`), asplain (`65100`) or asdot (`1.10`), 4-byte (RFC 6793). Empty: any AS — FRR `remote-as external` (eBGP) or `internal` (iBGP), by the role.
 
