@@ -76,6 +76,57 @@ pub fn pools_list(inst: &str) -> String {
     format!("CR-O2-{inst}-POOLS")
 }
 
+/// G3.9fe: the prefix-list of everything but the static routes, for the
+/// kernel route-map of an instance that redistributes `static`.
+pub fn not_static_list(inst: &OspfInstance) -> String {
+    format!("CR-O{}-{}-NOTSTATIC", inst.version.number(), inst.name)
+}
+
+/// Whether `inst` redistributes the static routes alone (without all of
+/// `kernel`). The linux backend installs them (`proto static`), so zebra
+/// lists them as kernel routes and `redistribute static` (staticd's) finds
+/// none (seen with FRR 10.7.1 in `scripts/bgp-crcr-userns.sh ospf-static`):
+/// they go through `redistribute kernel` and a route-map that refuses the
+/// other kernel routes.
+fn statics_only(inst: &OspfInstance) -> bool {
+    inst.redistribute.contains(&Redistribute::Static)
+        && !inst.redistribute.contains(&Redistribute::Kernel)
+}
+
+/// Whether `inst` redistributes `kind` because the operator asked
+/// (`static` counts as `kernel`, see [`statics_only`]).
+fn asked(inst: &OspfInstance, kind: Redistribute) -> bool {
+    inst.redistribute.contains(&kind) || (kind == Redistribute::Kernel && statics_only(inst))
+}
+
+/// The static routes of the main table of `inst`'s family.
+fn static_prefixes(cfg: &Config, inst: &OspfInstance) -> BTreeSet<ipnet::IpNet> {
+    let v6 = inst.version == Version::V3;
+    cfg.ip
+        .routes
+        .iter()
+        .filter(|r| !r.disabled && r.routing_table.is_main())
+        .map(|r| r.dst_address.trunc())
+        .filter(|n| matches!(n, ipnet::IpNet::V6(_)) == v6)
+        .collect()
+}
+
+/// G3.9fe: whether a commit from `from` to `to` changes the OSPF render
+/// outside `routing`: the static routes, while an instance redistributes
+/// them. O(1) when the routes are shared, as in every commit that leaves
+/// them alone.
+pub fn statics_changed(from: &Config, to: &Config) -> bool {
+    let (a, b) = (&from.ip.routes, &to.ip.routes);
+    if corerouter_model::cow_list::CowList::ptr_eq(a, b) || a == b {
+        return false;
+    }
+    to.routing
+        .ospf
+        .instances
+        .values()
+        .any(|i| !i.disabled && i.redistribute.contains(&Redistribute::Static))
+}
+
 /// FRR's router header of an instance.
 pub fn header(inst: &OspfInstance) -> String {
     let kw = match inst.version {
@@ -147,7 +198,7 @@ pub fn render(cfg: &Config, open: Opener<'_>) -> Result<String, String> {
     let compiled = chain::compile_used(cfg);
     let pools = pools::cidrs(cfg);
     for inst in ospf.instances.values().filter(|i| !i.disabled) {
-        redistribution_maps(&mut s, inst, &pools, &compiled);
+        redistribution_maps(&mut s, cfg, inst, &pools, &compiled);
     }
     // Interfaces, one context each (both versions share it).
     let mut by_iface: BTreeMap<&str, Vec<&Binding<'_>>> = BTreeMap::new();
@@ -412,6 +463,10 @@ fn network_v2(t: NetworkType) -> Option<&'static str> {
 /// kernel route).
 pub fn kinds(inst: &OspfInstance, pools: &[Ipv4Net]) -> BTreeSet<Redistribute> {
     let mut k: BTreeSet<Redistribute> = inst.redistribute.iter().copied().collect();
+    // G3.9fe: the static routes come through `kernel`.
+    if k.remove(&Redistribute::Static) {
+        k.insert(Redistribute::Kernel);
+    }
     if announces_pools(inst, pools) {
         k.insert(Redistribute::Connected);
         k.insert(Redistribute::Kernel);
@@ -428,11 +483,13 @@ fn announces_pools(inst: &OspfInstance, pools: &[Ipv4Net]) -> bool {
 fn needs_map(inst: &OspfInstance, pools: &[Ipv4Net], kind: Redistribute) -> bool {
     let p = announces_pools(inst, pools)
         && matches!(kind, Redistribute::Connected | Redistribute::Kernel);
-    p || (inst.out_filter_chain.is_some() && inst.redistribute.contains(&kind))
+    p || (inst.out_filter_chain.is_some() && asked(inst, kind))
+        || (kind == Redistribute::Kernel && statics_only(inst))
 }
 
 fn redistribution_maps(
     s: &mut String,
+    cfg: &Config,
     inst: &OspfInstance,
     pools: &[Ipv4Net],
     compiled: &HashMap<String, Compiled>,
@@ -476,7 +533,26 @@ fn redistribution_maps(
             );
             let _ = writeln!(s, "exit");
         }
-        if inst.redistribute.contains(&kind) {
+        // G3.9fe: only the static routes of the kernel ones (after the
+        // pools, which are kernel routes too).
+        if kind == Redistribute::Kernel && statics_only(inst) {
+            let list = not_static_list(inst);
+            let kw = if v6 { "ipv6" } else { "ip" };
+            let statics = static_prefixes(cfg, inst);
+            for (i, n) in statics.iter().enumerate() {
+                let _ = writeln!(s, "{kw} prefix-list {list} seq {} deny {n}", (i + 1) * 5);
+            }
+            let any = if v6 { "::/0 le 128" } else { "0.0.0.0/0 le 32" };
+            let _ = writeln!(
+                s,
+                "{kw} prefix-list {list} seq {} permit {any}",
+                (statics.len() + 1) * 5
+            );
+            let _ = writeln!(s, "route-map {name} deny 2");
+            let _ = writeln!(s, " match {kw} address prefix-list {list}");
+            let _ = writeln!(s, "exit");
+        }
+        if asked(inst, kind) {
             match chain {
                 Some(c) => c.map_text(&name, s),
                 None => {
@@ -721,6 +797,73 @@ mod tests {
         assert!(text.contains("router ospf\n ospf router-id 10.255.0.1\n redistribute connected\n area 0.0.0.1 stub no-summary\n"), "{text}");
         // The render parses as the FRR tree hal-frr diffs.
         assert!(!text.contains('\t'));
+    }
+
+    /// G3.9fe: `redistribute=static` goes through `kernel` (the linux
+    /// backend's static routes are kernel routes to zebra), denying every
+    /// other kernel route first; the form `ospfd` 10.7.1 prints.
+    #[test]
+    fn static_redistribution_goes_through_kernel() {
+        let route = |id: u32, dst: &str| corerouter_model::RouteEntry {
+            id: ItemId(id),
+            dst_address: dst.parse().unwrap(),
+            gateway: corerouter_model::Gateway::ip("192.0.2.254".parse().unwrap()),
+            distance: 1,
+            routing_table: corerouter_model::RoutingTable::Main,
+            disabled: false,
+            comment: String::new(),
+            check_gateway: Default::default(),
+            bfd_profile: String::new(),
+        };
+        let mut cfg = sample();
+        let before = cfg.clone();
+        cfg.ip.routes.push(route(1, "198.18.97.0/24"));
+        cfg.ip.routes.push(route(2, "2001:db8:97::/48"));
+        if let Some(i) = cfg.routing.ospf.instances.get_mut("v2") {
+            i.redistribute = vec![Redistribute::Static];
+        }
+        assert_eq!(crate::validate(&cfg), Vec::new());
+        let text = render(&cfg, &|s| Some(s.stored().to_owned())).unwrap();
+        assert!(
+            text.contains(
+                "ip prefix-list CR-O2-v2-NOTSTATIC seq 5 deny 198.18.97.0/24\n\
+                 ip prefix-list CR-O2-v2-NOTSTATIC seq 10 permit 0.0.0.0/0 le 32\n\
+                 route-map CR-O2-v2-kernel deny 2\n match ip address prefix-list CR-O2-v2-NOTSTATIC\nexit\n\
+                 route-map CR-O2-v2-kernel permit 65535\nexit\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(" redistribute kernel route-map CR-O2-v2-kernel\n"),
+            "{text}"
+        );
+        assert!(!text.contains("redistribute static"), "{text}");
+        assert!(
+            !text.contains("2001:db8:97"),
+            "the IPv6 route stays out of ospfd: {text}"
+        );
+        // kernel asked too: all of it, no NOTSTATIC map.
+        if let Some(i) = cfg.routing.ospf.instances.get_mut("v2") {
+            i.redistribute = vec![Redistribute::Static, Redistribute::Kernel];
+        }
+        let text = render(&cfg, &|s| Some(s.stored().to_owned())).unwrap();
+        assert!(
+            text.contains(" redistribute kernel\n") && !text.contains("NOTSTATIC"),
+            "{text}"
+        );
+        // A commit that only adds a static route reaches FRR while static
+        // is redistributed, and not otherwise.
+        let mut with = before.clone();
+        if let Some(i) = with.routing.ospf.instances.get_mut("v2") {
+            i.redistribute = vec![Redistribute::Static];
+        }
+        let mut more = with.clone();
+        more.ip.routes.push(route(1, "198.18.97.0/24"));
+        assert!(statics_changed(&with, &more));
+        assert!(!statics_changed(&with, &with.clone()));
+        let mut plain = before.clone();
+        plain.ip.routes.push(route(1, "198.18.97.0/24"));
+        assert!(!statics_changed(&before, &plain));
     }
 
     #[test]
