@@ -10,6 +10,8 @@ pub const DAEMON: &str = "/usr/bin/corerouter-daemon";
 pub const CONTROL_PORT: u16 = 7979;
 /// TLS control channel for the network (login required).
 pub const TLS_LISTEN: &str = "0.0.0.0:8729";
+/// The browser GUI in the image (G1.6o), served by `ip.service www-ssl`.
+pub const WEB_DIR: &str = "/usr/share/corerouter/web";
 /// Writable, persistent configuration (the `config` GPT partition).
 pub const CONFIG_DIR: &str = "/config";
 /// GPT partition name (PARTLABEL) of the configuration partition.
@@ -341,6 +343,8 @@ pub fn daemon_args(opts: &BootOptions, frr: bool) -> Vec<String> {
     .iter()
     .map(|s| (*s).to_owned())
     .collect();
+    // G1.6o: web access (https://<router>/) on in a config made at first boot.
+    a.extend(["--web-files", WEB_DIR, "--web-factory-on"].map(str::to_owned));
     if frr {
         a.extend(["--frr".to_owned(), FRR_DIR.to_owned()]);
     }
@@ -460,7 +464,8 @@ mod tests {
         let a = daemon_args(&BootOptions::parse(""), false);
         assert_eq!(
             a.join(" "),
-            "--backend linux --config-dir /config --control 7979 --listen 0.0.0.0:8729"
+            "--backend linux --config-dir /config --control 7979 --listen 0.0.0.0:8729 \
+             --web-files /usr/share/corerouter/web --web-factory-on"
         );
         let a = daemon_args(&BootOptions::parse(""), true);
         assert!(a.join(" ").ends_with("--frr /var/run/frr"));

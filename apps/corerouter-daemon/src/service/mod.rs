@@ -89,6 +89,11 @@ pub(crate) struct Ctx {
     /// `--config-dir` when the config is on disk (services keep their own
     /// files under it, like the graph history).
     pub config_dir: Option<std::path::PathBuf>,
+    /// The login gate of the TLS endpoints (shared, so login limits hold
+    /// across them).
+    pub remote_gate: corerouter_control::Gate,
+    /// The router's certificate, when the daemon made or loaded one.
+    pub tls: Option<corerouter_control::tls::ServerIdentity>,
 }
 
 impl Ctx {

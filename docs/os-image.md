@@ -28,7 +28,8 @@ FRR: seção "Instalador, imagens de VM e FRR (G1.6c)" no fim.
 | Toolchain | Bootlin x86-64 glibc stable 2024.05-1 (gcc 13.3, glibc 2.39), pronta e com hash no Buildroot | `os/configs/corerouter_x86_64_defconfig` |
 | Kernel | Linux **6.18.59** LTS (suporte projetado até dez/2028), `x86_64_defconfig` + fragmento; SHA-256 do `sha256sums.asc` assinado do kernel.org, conferido pelo Buildroot e de novo pelo xtask | `os/board/x86_64/linux.fragment`, `os/patches/linux/linux.hash` |
 | Init | `corerouter-init` (Rust, este workspace) | `apps/corerouter-init` |
-| Roteador | `corerouter-daemon --backend linux --config-dir /config --control 7979 --listen 0.0.0.0:8729` | `os/package/corerouter` |
+| Roteador | `corerouter-daemon --backend linux --config-dir /config --control 7979 --listen 0.0.0.0:8729 --web-files /usr/share/corerouter/web --web-factory-on` | `os/package/corerouter` |
+| GUI web | a GUI em WASM (trunk release + wasm-opt; `.wasm` e JS guardados como `.gz`), servida em `https://<roteador>/` pelo `ip.service www-ssl` (G1.6o, "Acesso web de fábrica" abaixo) | `/usr/share/corerouter/web` |
 | Espaço de usuário | `nft` sem JSON e sem CLI interativa (só diagnóstico no shell de manutenção: o hal-linux fala nfnetlink, G2.8), glibc, busybox (só para o shell de manutenção) | defconfig |
 | Roteamento | FRR **10.7.1** com libyang 3.13.6 (a versão validada na VM do laboratório; receita do Buildroot `master` portada, G1.6k): `mgmtd`, `zebra`, `staticd`, `bgpd`, `ospfd`, `ospf6d`, `ldpd`, `bfdd`, iniciados pelo `corerouter-init`; sem `vtysh`, scripts nem bash (G1.6c) | defconfig, `post-build.sh`, `os/buildroot-patches/` |
 
@@ -880,3 +881,122 @@ laço do PID 1.
   (antes: mais `bond0`, `dummy0` e sete túneis de fallback);
 - build da imagem do zero numa worktree (toolchain externa e downloads em cache): 1064 s; um
   build incremental só do init: 56 s.
+
+## Acesso web de fábrica (G1.6o)
+
+Como o WebFig do RouterOS: num roteador novo, `https://<endereço do roteador>/` no navegador abre
+a GUI (a mesma do aplicativo, compilada para WASM) e pede o login (`admin`). O mesmo endereço
+leva o canal de controle por WebSocket (`wss://<roteador>/ws`), com o certificado do próprio
+roteador, o mesmo da porta TLS 8729.
+
+### Como funciona
+
+- **Comandos** (`crates/engine/src/cmd/web_service.rs`), no estilo do `/ip service`:
+  - `ip.service.www-ssl.set {enabled?, address?, port?, available_from?}` e `.get` (com
+    `status`, `listening`, `last_error`, `refused`, `gui_files`): HTTPS + WSS;
+  - `ip.service.www.set` / `.get`: HTTP **só para redirecionar** (`301` →
+    `https://<host>/`, porta do `www-ssl`); nunca serve a GUI nem aceita login em texto claro.
+  - `address` é onde escuta (padrão `::`, todos os endereços IPv6 e IPv4); `available_from` é o
+    `address` do RouterOS: quem não está na lista cai antes do TLS, sem resposta, e conta em
+    `refused`. Os dois na mesma porta são recusados.
+- **Daemon** (`apps/corerouter-daemon/src/service/web.rs`, serviço `web` do supervisor): segue
+  a config em execução a cada 1 s; um commit abre, move ou fecha a porta **sem reiniciar**.
+  Conexões já abertas continuam (mudar o serviço não derruba quem o mudou, como no RouterOS).
+  Porta ocupada ou sem permissão vira `status: error` com o motivo, tentado de novo a cada
+  segundo e registrado no log uma vez.
+- **Padrão de fábrica só para config nova.** O modelo nasce desligado; o init passa
+  `--web-factory-on`, e o daemon liga o `www-ssl` (443) só quando não havia config salva. Um
+  roteador atualizado mantém o que tinha (nenhuma porta nova aberta numa atualização).
+- **Imagem:** o `cargo xtask os build` compila a GUI com o trunk em release (`xtask/src/os/web.rs`),
+  com `wasm-bindgen` e `wasm-opt` (binaryen) em versões fixas, baixados do GitHub oficial e
+  conferidos por SHA-256 (`os/dl/web-tools/`), trunk `--offline --locked`, e caminhos da
+  máquina removidos do `.wasm` (`--remap-path-prefix`). O `corerouter.mk` instala o resultado em
+  `/usr/share/corerouter/web` (`--web-files`). Nada de JS escrito à mão: o JS é o que o
+  `wasm-bindgen` gera; o `index.html` é o do trunk.
+- **Compressão:** o `.wasm` e o JS ficam na imagem só como `<arquivo>.gz` (`gzip -9 -n`,
+  reprodutível), e o daemon os entrega com `Content-Encoding: gzip` (como o `gzip_static` do
+  nginx); quem não aceita gzip recebe `406`, e todo navegador aceita. Na rede, 32 → 11 MiB; no
+  squashfs, só 1,6 MiB a mais que o `.wasm` cru (o zstd já o deixa em ~10 MiB); guardar os dois
+  custaria ~21 MiB (**medido**, ver "Números").
+- **Porta 443:** o daemon roda como root na imagem (PID 1 o inicia), então a porta privilegiada
+  abre sem `setcap`. Fora da imagem (laboratório como usuário comum) o `get` mostra
+  `cannot listen on [::]:443: Permission denied … CAP_NET_BIND_SERVICE`; use outra porta
+  (`ip.service.www-ssl.set port=8443`).
+
+O certificado é autoassinado: o navegador avisa na primeira vez ("Sua conexão não é
+particular"/"Aviso: risco potencial"). Compare a impressão digital SHA-256 que o navegador mostra
+com a do log do daemon (`TLS certificate fingerprint`) ou a do console, e aceite. Sem HSTS de
+propósito: com certificado próprio, o HSTS impediria o navegador de deixar aceitar a exceção.
+
+### Pesquisa
+
+- **MikroTik RouterOS v7** ([`/ip service`](https://help.mikrotik.com/docs/spaces/ROS/pages/103841820/Services)):
+  linhas `www` (80, ligada) e `www-ssl` (443, **desligada**, `certificate=none` até o operador
+  criar ou importar um); parâmetros `address` (prefixos permitidos; os outros não são
+  descartados na rede, só têm o acesso negado), `port`, `certificate`, `tls-version`, `vrf`,
+  `max-sessions` (padrão 20). Não dá para criar serviço novo.
+- **pfSense** ([Admin Access](https://docs.netgate.com/pfsense/en/latest/config/advanced-admin.html)):
+  HTTPS na 443 por padrão, certificado autoassinado gerado no primeiro boot, redirecionamento de
+  80 ligado por padrão, HSTS ligado (dá para desligar), 2 processos.
+- **OPNsense** ([Settings › Administration](https://docs.opnsense.org/manual/settingsmenu.html)):
+  HTTPS recomendado, certificado autoassinado por padrão, regra de redirecionamento 80/443 criada
+  sozinha (desligável), HSTS opcional, escuta em todas as interfaces por padrão.
+- **VyOS** (`service https`): desligado por padrão, só a API; sem GUI.
+- **RFC 9110 §12.5.3** (`Accept-Encoding`, `q=0`), **RFC 6455** (WebSocket, já no G0.4),
+  **RFC 6797** (HSTS, não adotado: ver acima).
+- **Adotado:** nomes e forma do RouterOS (`www-ssl`, `www`, `port`, lista de origem), o HTTPS de
+  fábrica com certificado próprio do pfSense/OPNsense (o RouterOS deixa o operador sem HTTPS até
+  ele criar um certificado, e com `www` em texto claro ligado).
+- **Melhor que o RouterOS:** HTTPS ligado e HTTP desligado de fábrica; `www` só redireciona
+  (senha nunca em texto claro); a porta muda sem reiniciar; `status`/`last_error` dizem por que
+  a porta não abriu; `X-Frame-Options: DENY` contra clickjacking; padrão novo só em config
+  nova.
+- **Ficou de fora** (gaps): janela IP › Services na GUI com ⓘ (G1.6p), `vrf` e `max-sessions`
+  por serviço, certificado escolhido pelo operador (`certificate=`, ACME), `tls-version`.
+
+### Desempenho e paralelismo
+
+- Cada conexão (arquivo estático ou WebSocket) tem a sua thread (`control::server::accept_loop`),
+  então downloads e sessões de GUI de vários operadores rodam em paralelo, em núcleos
+  diferentes. O que é compartilhado: a tabela de vagas do endpoint (um `Mutex` curto por
+  conexão aceita) e o lock do `Session` só durante cada comando, como no TCP.
+- **Limites** (os do canal de controle): 16 conexões por endpoint, 8 sem login, 4 sem login por
+  origem (IPv4 ou /64); acima disso a conexão cai. Uma página da GUI usa 3 conexões curtas
+  (`index.html`, JS, wasm; `Connection: close`) e depois uma WebSocket. O arquivo vai em fluxo
+  (`io::copy`), sem carregar 32 MiB na memória por cliente.
+- O redirecionamento HTTP usa uma thread de `accept` (sondando a cada 50 ms) e uma por
+  conexão, no máximo 16, cada uma com 5 s para ler 8 KiB de cabeçalho.
+- O laço do serviço olha a config uma vez por segundo (um clone pequeno sob o lock): custo
+  desprezível, sem crescer com nada.
+- Não há caminho quente aqui: servir a GUI é uma vez por sessão do operador. O que pesa é o
+  tamanho do `.wasm` na rede, por isso o gzip.
+
+### Números (G1.6o)
+
+**Medido** em 2026-10-28, host de desenvolvimento (KVM), build release da imagem; antes = a
+imagem da `main` (`7a6041d5`) feita no mesmo host:
+
+| | `.wasm` |
+|---|---|
+| saída do cargo (release, wasm32) | 42,2 MB |
+| depois do `wasm-bindgen` + `wasm-opt` padrão do trunk | 32,2 MB |
+| com `wasm-opt -Oz` explícito | 31,5 MB (−2%: não compensa o tempo, não adotado) |
+| `gzip -9` (o que vai na imagem e na rede) | 11,5 MB |
+| `xz` (só referência) | 7,0 MB |
+
+| Imagem | antes | só `.wasm` cru | `.wasm` + `.gz` | só `.gz` (adotado) |
+|---|---|---|---|---|
+| `rootfs.squashfs` | 21,7 MiB | 31,6 MiB | 42,5 MiB | **32,7 MiB** (+11,0) |
+| `corerouter.qcow2` | 41,4 MiB | 51,4 MiB | 62,4 MiB | **52,5 MiB** |
+| `corerouter-install.iso` | 98,7 MiB | 108,6 MiB | 119,7 MiB | **109,8 MiB** |
+| `corerouter.crpkg` | 41,0 MiB | 51,0 MiB | 62,0 MiB | **52,1 MiB** |
+
+- `boot-test`: `GET /` e o `.wasm` (10,9 MiB comprimido) em 0,21–0,29 s pela rede do QEMU; o
+  WebSocket responde ao `auth.login` (recusado, como deve, enquanto o `admin` não tem senha);
+  kernel → `ping` em 0,94–1,76 s (variação do host carregado por outros builds), memória ociosa
+  95,6–101,6 MiB.
+- Build da GUI dentro do `os build`: 2,5 min do zero (wasm32 release, `lto = "thin"`),
+  segundos com o cache do cargo; o download único das ferramentas é de 106 MiB (binaryen) +
+  11 MiB (wasm-bindgen), guardado em `os/dl/web-tools/`.
+- Captura: a GUI servida pela imagem no QEMU abre a tela de conexão apontando para
+  `wss://<host>/ws` com `admin`.

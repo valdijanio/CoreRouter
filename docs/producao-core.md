@@ -143,6 +143,14 @@ Equivalências, item por item:
 
 ## Como entrar
 
+**Pelo navegador (G1.6o):** a imagem já vem com `https://<endereço do roteador>/` ligado
+(`ip.service www-ssl`, porta 443, o mesmo certificado da porta 8729). O navegador avisa que o
+certificado é próprio: confira a impressão digital SHA-256 com a do log do daemon (`TLS
+certificate fingerprint`) antes de aceitar. Para limitar quem chega na página, como o `address`
+do `/ip service`: `/ip service www-ssl set available_from=192.0.2.0/24` (vale na hora, sem
+reiniciar; quem já está conectado continua). O HTTP (80) vem desligado e, ligado, só redireciona
+para o HTTPS.
+
 1. **Safe Mode** no terminal do CoreRouter (o da GUI ou o `corerouter-cli --connect tls://…`, não o console da VM): Ctrl+X (o prompt mostra `<SAFE>`). Se a sessão cair,
    tudo o que foi feito nela é desfeito, como no RouterOS.
 2. Cole o bloco de partida (um batch atômico, uma revisão). Para revisar antes, use o modo

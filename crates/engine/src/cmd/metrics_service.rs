@@ -37,7 +37,7 @@ fn settings_json(c: &MetricsService) -> Value {
 
 /// A JSON array of prefixes or, for the CLI, one comma-separated string.
 /// A bare address is a host (`/32`, `/128`); host bits are cleared.
-fn available_from(p: &Value) -> Result<Option<Vec<IpNet>>> {
+pub(super) fn available_from(p: &Value) -> Result<Option<Vec<IpNet>>> {
     const KEY: &str = "available_from";
     let raw: Vec<&str> = match p.get(KEY) {
         None | Some(Value::Null) => return Ok(None),

@@ -842,6 +842,8 @@ fn main() -> ExitCode {
         flags: args.service_flags.clone(),
         control: control_listens(&args),
         config_dir: config_dir.clone(),
+        remote_gate: remote_gate.clone(),
+        tls: tls.clone(),
     };
     if let Err(e) = service::start_all(&ctx) {
         eprintln!("{e}");

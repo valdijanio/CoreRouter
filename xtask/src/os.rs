@@ -16,6 +16,9 @@
 //!   `qemu-img`) and checks that every ELF of the image finds its
 //!   libraries; `install-test` runs the installer and the VM images in
 //!   QEMU (`os/install.rs`).
+//! - G1.6o: `build` first builds the browser GUI with trunk (release,
+//!   wasm-opt; pinned tools, `os/web.rs`) into `os/out/web`, which
+//!   `corerouter.mk` installs as `/usr/share/corerouter/web`.
 //! - G1.6k: `build` applies `os/buildroot-patches/*.patch` to the extracted
 //!   Buildroot tree (package versions newer than the LTS branch ships, FRR
 //!   10.7.1) and extracts it again when those patches change; `frr-test`
@@ -35,6 +38,7 @@ use crate::vm_lab::{download, sha256_file};
 mod ab;
 mod frr;
 mod install;
+mod web;
 
 const DEFCONFIG: &str = "corerouter_x86_64_defconfig";
 /// Free space the build wants before it starts (cold build: ~8 GB in
@@ -109,6 +113,8 @@ const INIT_PATH: &str = "/usr/sbin/corerouter-init";
 const GUEST_IP_ARG: &str = "ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off";
 /// The daemon's TLS control port inside the image (corerouter-init's plan).
 const GUEST_TLS_PORT: u16 = 8729;
+/// G1.6o: `ip.service www-ssl`, on in a new config of the image.
+const GUEST_WEB_PORT: u16 = 443;
 
 const USAGE: &str = "usage: cargo xtask os <build [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|boot-test [--efi] [--tcg] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--scenario update|no-confirm|bad-signature|bad-param]|install-test [--tcg]|frr-test [--tcg]|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
 
@@ -598,6 +604,8 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
         ));
     }
     fetch_buildroot(&d, &lock)?;
+    // G1.6o: the browser GUI that `ip.service www-ssl` serves.
+    let web_dir = web::build(root, &d.os.join("out/cargo-target"))?;
 
     let cargo = which_cargo()?;
     let commit = git_commit(root);
@@ -631,6 +639,7 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
             .arg(format!("O={}", d.out.display()));
         cmd.arg(format!("BR2_EXTERNAL={}", d.os.display()));
         cmd.arg(format!("COREROUTER_CARGO={}", cargo.display()));
+        cmd.arg(format!("COREROUTER_WEB_DIR={}", web_dir.display()));
         if let Some(j) = &jobs {
             cmd.arg(format!("BR2_JLEVEL={j}"));
         }
@@ -730,6 +739,19 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
             make(&["linux-reconfigure"], None)?;
         }
         std::fs::write(&stamp, &fragment_hash).map_err(|e| format!("{}: {e}", stamp.display()))?;
+    }
+    // G1.6o: with per-package directories the final target only gains
+    // files (rsync without delete), and the packages built after ours keep
+    // a copy of its files: GUI files of an older build (names carry a
+    // content hash) would pile up in the image. Every copy goes; ours is
+    // installed again from os/out/web.
+    let web = Path::new("usr/share/corerouter/web");
+    let mut stale = vec![d.out.join("target").join(web)];
+    if let Ok(pkgs) = std::fs::read_dir(d.out.join("per-package")) {
+        stale.extend(pkgs.flatten().map(|p| p.path().join("target").join(web)));
+    }
+    for dir in stale.iter().filter(|p| p.exists()) {
+        std::fs::remove_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     make(&["all"], top_jobs.as_ref())?;
 
@@ -1110,6 +1132,7 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     }
     let kvm = !b.tcg && kvm_usable();
     let port = free_port()?;
+    let web_port = free_port()?;
     let log_path = root.join("os/out/boot-test.log");
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.args([
@@ -1144,7 +1167,8 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     ));
     cmd.args(["-device", "virtio-rng-pci"]);
     cmd.arg("-netdev").arg(format!(
-        "user,id=n0,hostfwd=tcp:127.0.0.1:{port}-:{GUEST_TLS_PORT}"
+        "user,id=n0,hostfwd=tcp:127.0.0.1:{port}-:{GUEST_TLS_PORT},\
+         hostfwd=tcp:127.0.0.1:{web_port}-:{GUEST_WEB_PORT}"
     ));
     cmd.args(["-device", "virtio-net-pci,netdev=n0"]);
     let vars = root.join("os/out/OVMF_VARS.fd");
@@ -1188,11 +1212,11 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("qemu-system-x86_64: {e}"))?;
-    let res = watch(&mut child, &b, port, started, &log_path);
+    let res = watch(&mut child, &b, (port, web_port), started, &log_path);
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_file(&vars);
-    let (report, wall_ready, ping) = res?;
+    let (report, wall_ready, ping, web) = res?;
     eprintln!("\nboot-test ok ({}):", if kvm { "KVM" } else { "TCG" });
     eprintln!(
         "  kernel start → daemon answers ping: {:.3} s (corerouter-init)",
@@ -1203,6 +1227,10 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
         wall_ready.as_secs_f64()
     );
     eprintln!("  TLS ping from the host:             {ping}");
+    eprintln!("  web access (https://…/, the .wasm, WebSocket login):");
+    for l in web.lines() {
+        eprintln!("    {l}");
+    }
     if let Some(kib) = report.idle_kib {
         eprintln!(
             "  idle memory in use:                 {:.1} MiB",
@@ -1215,10 +1243,10 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
 fn watch(
     child: &mut Child,
     b: &BootArgs,
-    port: u16,
+    (port, web_port): (u16, u16),
     started: Instant,
     log_path: &Path,
-) -> Result<(Report, Duration, String), String> {
+) -> Result<(Report, Duration, String, String), String> {
     let stdout = child.stdout.take().ok_or("qemu: no stdout")?;
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::Builder::new()
@@ -1237,6 +1265,7 @@ fn watch(
     let mut report = Report::default();
     let mut wall_ready = None;
     let mut ping = None;
+    let mut web = None;
     let deadline = started + b.timeout;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -1272,12 +1301,17 @@ fn watch(
             } else {
                 tls_ping(port)?
             });
+            web = Some(if b.efi {
+                "skipped: no address with --efi".to_owned()
+            } else {
+                web_check(web_port)?
+            });
         }
         if let Some(k) = parse_idle(&line) {
             report.idle_kib = Some(k);
         }
-        if let (Some(w), Some(p), Some(_)) = (wall_ready, &ping, report.idle_kib) {
-            return Ok((report, w, p.clone()));
+        if let (Some(w), Some(p), Some(_), Some(web)) = (wall_ready, &ping, report.idle_kib, &web) {
+            return Ok((report, w, p.clone(), web.clone()));
         }
     }
 }
@@ -1319,6 +1353,183 @@ fn tls_ping(port: u16) -> Result<String, String> {
         Ok(l) => Err(format!("TLS ping: unexpected answer '{}'", l.trim())),
         Err(_) => Err("TLS ping: no answer in 10 s".into()),
     }
+}
+
+/// G1.6o: what a browser does at `https://<router>/`, through QEMU's port
+/// forward (certificate not checked, as `tls_ping`): the page, the `.wasm`
+/// it names, then a WebSocket on `/ws` and `auth.login` as `admin` with the
+/// empty password of a new router. A new router refuses that login from the
+/// network until a password is set (G0.3b): either answer proves the
+/// channel works end to end.
+fn web_check(port: u16) -> Result<String, String> {
+    let base = format!("https://127.0.0.1:{port}");
+    // The daemon may open 443 a tick after it answers the TLS ping.
+    let mut page = String::new();
+    for _ in 0..20 {
+        let out = Command::new("curl")
+            .args(["-skf", "--max-time", "10"])
+            .arg(format!("{base}/"))
+            .output()
+            .map_err(|e| format!("curl: {e}"))?;
+        if out.status.success() {
+            page = String::from_utf8_lossy(&out.stdout).into_owned();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    if !page.contains("<canvas") {
+        return Err(format!("web: GET {base}/ gave no GUI page"));
+    }
+    let wasm = wasm_name(&page).ok_or("web: the page names no .wasm")?;
+    let out = Command::new("curl")
+        // As a browser: the image keeps the wasm only gzip-compressed.
+        .args([
+            "-skf",
+            "--compressed",
+            "--max-time",
+            "60",
+            "-o",
+            "/dev/null",
+            "-w",
+        ])
+        .arg("%{http_code} %{content_type} %{size_download} %{time_total}")
+        .arg(format!("{base}/{wasm}"))
+        .output()
+        .map_err(|e| format!("curl: {e}"))?;
+    let got = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut f = got.split_whitespace();
+    let (code, mime, size, secs) = (f.next(), f.next(), f.next(), f.next());
+    if code != Some("200") || mime != Some("application/wasm") {
+        return Err(format!("web: GET /{wasm}: {got}"));
+    }
+    let size: u64 = size.and_then(|s| s.parse().ok()).unwrap_or(0);
+    let login = ws_login(port)?;
+    Ok(format!(
+        "GET / ok ({} bytes)\nGET /{wasm}: {:.1} MiB on the wire (gzip) in {} s\nwss /ws auth.login: {login}",
+        page.len(),
+        size as f64 / 1048576.0,
+        secs.unwrap_or("?")
+    ))
+}
+
+/// The `…_bg.wasm` file a trunk page preloads.
+fn wasm_name(page: &str) -> Option<String> {
+    let end = page.find(".wasm")?;
+    let start = page.get(..end)?.rfind(['"', '\'', '/'])? + 1;
+    page.get(start..end + 5).map(str::to_owned)
+}
+
+/// A WebSocket handshake and one `auth.login` frame over `openssl
+/// s_client` (no WebSocket or TLS crate in xtask); the answer's text.
+fn ws_login(port: u16) -> Result<String, String> {
+    let login = br#"{"id":1,"method":"auth.login","params":{"user":"admin","password":""}}"#;
+    let req = format!(
+        "GET /ws HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n\
+         Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\n\r\n"
+    );
+    let mask = [0x37u8, 0xfa, 0x21, 0x3d];
+    let len = u8::try_from(login.len()).map_err(|_| "login frame too long")?;
+    let mut frame = vec![0x81, 0x80 | len];
+    frame.extend(mask);
+    frame.extend(login.iter().zip(mask.iter().cycle()).map(|(b, m)| b ^ m));
+    let mut child = Command::new("openssl")
+        .args(["s_client", "-quiet", "-ign_eof", "-connect"])
+        .arg(format!("127.0.0.1:{port}"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("openssl: {e}"))?;
+    let mut stdin = child.stdin.take().ok_or("openssl: no stdin")?;
+    let _ = stdin.write_all(req.as_bytes());
+    let _ = stdin.flush();
+    let mut stdout = child.stdout.take().ok_or("openssl: no stdout")?;
+    // What came so far, after each read; the frame goes only after the
+    // `101` (a client must not send before the handshake answer, RFC 6455
+    // §4.1, and tungstenite refuses it).
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let _ = std::thread::Builder::new()
+        .name("ws-login".into())
+        .spawn(move || {
+            use std::io::Read;
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = stdout.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(buf.get(..n).unwrap_or_default());
+                if tx.send(got.clone()).is_err() {
+                    break;
+                }
+            }
+        });
+    let until = Instant::now() + Duration::from_secs(10);
+    let mut sent = false;
+    let mut got = Vec::new();
+    let done = loop {
+        let left = until.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(g) => got = g,
+            Err(_) => break false,
+        }
+        if !got.windows(4).any(|w| w == b"\r\n\r\n") {
+            continue;
+        }
+        if !got.starts_with(b"HTTP/1.1 101") || ws_text(&got).is_some() {
+            break true;
+        }
+        if !sent {
+            let _ = stdin.write_all(&frame);
+            let _ = stdin.flush();
+            sent = true;
+        }
+    };
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    let got = if done || !got.is_empty() {
+        Ok(got)
+    } else {
+        Err(())
+    };
+    let got = got.map_err(|_| "web: no WebSocket answer in 10 s")?;
+    if !got.starts_with(b"HTTP/1.1 101") {
+        let head: String = String::from_utf8_lossy(&got).chars().take(120).collect();
+        return Err(format!("web: WebSocket handshake refused: {head}"));
+    }
+    let text = ws_text(&got).ok_or("web: no text frame after the handshake")?;
+    if text.contains("\"token\"") {
+        Ok("logged in".into())
+    } else if text.contains("no password") {
+        Ok(format!(
+            "answered, refused as expected for a new router: {}",
+            text.chars().take(160).collect::<String>()
+        ))
+    } else {
+        Err(format!("web: unexpected login answer {text}"))
+    }
+}
+
+/// The first unmasked text frame after an HTTP head.
+fn ws_text(got: &[u8]) -> Option<String> {
+    let at = got.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    let frame = got.get(at..)?;
+    let (op, len) = (*frame.first()?, *frame.get(1)?);
+    if op != 0x81 {
+        return None;
+    }
+    let (len, from) = match len & 0x7f {
+        126 => (
+            usize::from(u16::from_be_bytes([*frame.get(2)?, *frame.get(3)?])),
+            4,
+        ),
+        127 => return None,
+        n => (usize::from(n), 2),
+    };
+    let body = frame.get(from..from + len)?;
+    Some(String::from_utf8_lossy(body).into_owned())
 }
 
 fn kvm_usable() -> bool {
@@ -1388,6 +1599,20 @@ mod tests {
             parse_idle("corerouter-init: idle: memory in use 51234 KiB (MemTotal − MemAvailable)"),
             Some(51234)
         );
+    }
+
+    #[test]
+    fn web_check_parsing() {
+        let page = r#"<link rel="preload" href="/corerouter-gui-1a2b_bg.wasm" as="fetch">"#;
+        assert_eq!(
+            wasm_name(page).as_deref(),
+            Some("corerouter-gui-1a2b_bg.wasm")
+        );
+        let mut got = b"HTTP/1.1 101 Switching Protocols\r\n\r\n".to_vec();
+        got.extend([0x81, 5]);
+        got.extend(b"hello");
+        assert_eq!(ws_text(&got).as_deref(), Some("hello"));
+        assert_eq!(ws_text(&got[..got.len() - 1]), None);
     }
 
     #[test]

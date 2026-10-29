@@ -39,9 +39,19 @@ define COREROUTER_BUILD_CMDS
 		-p corerouter-daemon -p corerouter-init
 endef
 
+# G1.6o: the browser GUI (`cargo xtask os build` makes it with trunk into
+# os/out/web and passes COREROUTER_WEB_DIR); ip.service www-ssl serves it.
+COREROUTER_WEB_DIR ?=
+
 define COREROUTER_INSTALL_TARGET_CMDS
 	$(INSTALL) -D -m 0755 $(COREROUTER_OUT)/corerouter-daemon $(TARGET_DIR)/usr/bin/corerouter-daemon
 	$(INSTALL) -D -m 0755 $(COREROUTER_OUT)/corerouter-init $(TARGET_DIR)/usr/sbin/corerouter-init
+	test -f "$(COREROUTER_WEB_DIR)/index.html" || \
+		{ echo "COREROUTER_WEB_DIR: no web GUI (build with cargo xtask os build)"; exit 1; }
+	rm -rf $(TARGET_DIR)/usr/share/corerouter/web
+	for f in $(COREROUTER_WEB_DIR)/*; do \
+		$(INSTALL) -D -m 0644 "$$f" $(TARGET_DIR)/usr/share/corerouter/web/$$(basename "$$f") || exit 1; \
+	done
 endef
 
 $(eval $(generic-package))
