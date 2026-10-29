@@ -10,8 +10,9 @@
 //! - "dns-server": every second, copies the running config into the
 //!   forwarder when it changed, and opens or closes the sockets as
 //!   `allow_remote_requests` says.
-//! - one UDP thread per family: reads a query and runs the chain up to the
-//!   cache; a cache hit is answered at once. A miss gets a thread of its
+//! - up to four UDP threads per family on one socket ([`udp_threads`]):
+//!   each reads a query and runs the chain up to the cache; a cache hit is
+//!   answered at once. A miss gets a thread of its
 //!   own, at most `max_concurrent_queries` of them (more: SERVFAIL), so
 //!   one slow upstream never holds the cache hits back.
 //! - one TCP thread per family; a thread per connection, at most
@@ -487,6 +488,16 @@ fn is_lab(session: &Shared) -> bool {
     lock(session).backend().starts_with("virtual lab")
 }
 
+/// Readers of each UDP socket: half the cores, 1 to 4. One thread answered
+/// at most ~340 000 cache hits a second at 100 % of a core with the other
+/// cores free; the chain's locks (statistics, per-client limit, cache) let
+/// several scale: 2 threads 577 000/s, 4 threads 964 000/s (G0.31,
+/// **medido**). The kernel hands each datagram to one waiting reader.
+fn udp_threads() -> usize {
+    let cores = thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    (cores / 2).clamp(1, 4)
+}
+
 /// The sockets of one epoch, their threads counted in `health`; where
 /// they listen.
 fn open(
@@ -513,10 +524,13 @@ fn open(
     }
     let at = opened.iter().map(|(_, _, a)| *a).collect();
     for (udp, tcp, _) in opened {
-        let s = srv.clone();
-        health
-            .spawn("dns-udp", move || udp_loop(s, udp, epoch))
-            .map_err(|e| e.to_string())?;
+        for _ in 0..udp_threads() {
+            let s = srv.clone();
+            let udp = udp.clone();
+            health
+                .spawn("dns-udp", move || udp_loop(s, udp, epoch))
+                .map_err(|e| e.to_string())?;
+        }
         let s = srv.clone();
         health
             .spawn("dns-tcp-accept", move || tcp_loop(s, tcp, epoch))
