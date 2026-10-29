@@ -593,6 +593,7 @@ impl Session {
             self.ext.get_mut::<crate::routing_daemon::RoutingBackend>()
             && (from.routing != to.routing
                 || corerouter_proto_bgp::networks_changed(from, to)
+                || corerouter_proto_ospf::frr::statics_changed(from, to)
                 || self.storage_status.boot_apply_error.is_some())
             && let Err(e) = daemon.apply(from, to)
         {

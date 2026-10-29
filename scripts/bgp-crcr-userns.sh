@@ -8,6 +8,8 @@
 # Cases (default: all, in this order):
 #   ebgp ebgp6 mpbgp md5 filters nexthop-self rr maxprefix restart bfd
 #   convergence scale
+# Not in the default list: ospf-static (G3.9fe, OSPF redistributing the
+# CoreRouter's static routes).
 # SCALE_N=<n> changes the 100 000 prefixes of `scale`. Results: a table at
 # the end and $W/results.txt; exit 1 if any case failed.
 #
@@ -627,6 +629,33 @@ case_scale() {
     || result scale FAIL "withdraw: CR1 $(bgp_count c1), CR2 $(bgp_count c2) left"
   pair_down
   sed 's/^route add/route del/' "$W/r3.batch" | ip -n r3 -batch - 2>/dev/null || true
+}
+
+# G3.9fe: OSPF between the two CoreRouters, CR1 redistributing a static route.
+case_ospf-static() {
+  for n in 1 2; do
+    cr "$n" routing.ospf.instance.add "{\"name\":\"v2\",\"router_id\":\"10.255.39.$([ "$n" = 1 ] && echo 2 || echo 5)\"}" >/dev/null
+    cr "$n" routing.ospf.area.add '{"name":"backbone","instance":"v2","area_id":"0.0.0.0"}' >/dev/null
+    cr "$n" routing.ospf.interface-template.add '{"area":"backbone","interfaces":"ether1","type":"ptp","hello_interval":1,"dead_interval":4}' >/dev/null
+  done
+  cr1 ip.route.add '{"dst_address":"198.18.97.0/24","gateway":"10.39.4.2"}' >/dev/null
+  cr1 routing.ospf.instance.set '{"id":"v2","redistribute":"static"}' >/dev/null
+  local ms
+  ms=$(wait_for 60 k_has c2 10.255.39.2/32) || true
+  ms=$(wait_for 30 k_has c2 198.18.97.0/24) && result ospf-static OK "redistribute=static: CR1's static 198.18.97.0/24 on CR2 via OSPF in ${ms} ms" \
+    || result ospf-static FAIL "redistribute=static: CR2 has no 198.18.97.0/24 ($(python3 -I "$W/vty.py" /var/run/frr/c1/ospfd.vty 'show running-config' | grep redistribute); zebra on CR1 sees $(vtz c1 'show ip route 198.18.97.0/24 json' | jq -c '[."198.18.97.0/24"[]?.protocol]'))"
+  # A kernel route that is not a CoreRouter static (another program's)
+  # must stay out with redistribute=static, and go with kernel.
+  ip -n c1 route add 198.18.95.0/24 via 10.39.4.2 proto boot
+  sleep 8
+  k_has c2 198.18.95.0/24 && result ospf-static FAIL "redistribute=static leaks a kernel route that is no static (198.18.95.0/24)" \
+    || result ospf-static OK "redistribute=static: a kernel route of another program stays out"
+  local t0; t0=$(now_ms)
+  cr1 ip.route.add '{"dst_address":"198.18.96.0/24","gateway":"10.39.4.2"}' >/dev/null
+  ms=$(wait_for 30 k_has c2 198.18.96.0/24) && result ospf-static OK "a static added later reaches CR2 $(( $(now_ms) - t0 )) ms after the command" \
+    || result ospf-static FAIL "a static added later is not announced"
+  cr1 routing.ospf.instance.set '{"id":"v2","redistribute":"kernel"}' >/dev/null
+  ms=$(wait_for 30 k_has c2 198.18.95.0/24) && result ospf-static OK "redistribute=kernel takes the other kernel route too (${ms} ms)" || result ospf-static FAIL "redistribute=kernel: 198.18.95.0/24 not on CR2"
 }
 
 for c in "${CASES[@]}"; do

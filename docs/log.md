@@ -7020,3 +7020,23 @@ continuação indentadas).
   Como testar: `scripts/bgp-crcr-userns.sh` (ou só alguns casos: `… filters bfd`), sem root;
   `cargo test -p corerouter-proto-bgp origination static_redis`,
   `cargo test -p corerouter-hal-frr bfd incarnation`.
+
+- 2026-10-29 — G3.9fe: OSPF `redistribute=static` não anunciava nada: o backend linux instala as estáticas do
+  CoreRouter direto no kernel (`proto static`) e o `zebra` as lista como *kernel*, então o
+  `redistribute static` do `ospfd` (que é o do `staticd`) não achava nenhuma — o mesmo defeito
+  achado no BGP na G3.9f, reproduzido em `scripts/bgp-crcr-userns.sh ospf-static` (antes: FAIL,
+  "zebra on CR1 sees [kernel]"). Agora `static` sai como `redistribute kernel route-map
+  CR-O2-<inst>-kernel`, cujo `deny 2` casa a prefix-list `…-NOTSTATIC` (cada estática do main em
+  `deny`, o resto em `permit 0.0.0.0/0 le 32`; IPv6 no v3), depois dos pools de assinantes e antes
+  da chain do `out_filter_chain` — a forma que o `ospfd`/`ospf6d` 10.7.1 imprimem (nenhum aviso de
+  redigitação). Com `kernel` pedido também, vai o kernel inteiro, sem a lista. Um commit que só
+  muda `/ip route` agora chega ao FRR quando uma instância redistribui estáticas (gatilho O(1)
+  quando as rotas não mudaram).
+
+  Laboratório no host (**medido**, FRR 10.7.1, 2026-10-29): estática anunciada a CR2 por OSPF;
+  uma rota kernel de outro programa (`proto boot`) fica de fora com `static` e entra com
+  `kernel` em 106 ms; uma estática nova chega ao vizinho 118 ms depois do comando. Como testar:
+  `scripts/bgp-crcr-userns.sh ospf-static`, `cargo test -p corerouter-proto-ospf static_redistribution`.
+
+  Desempenho: a lista custa O(estáticas) no render, só com `static` pedido; o gatilho do commit
+  compara as listas de rotas só quando elas não são a mesma cópia.
