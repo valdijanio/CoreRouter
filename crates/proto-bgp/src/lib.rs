@@ -506,8 +506,10 @@ fn render_with_lists(
             cfg,
             open,
             !rpki::enabled(routing).is_empty(),
-            &ebgp_out_maps,
-            &mut maps,
+            OutMaps {
+                ebgp: &ebgp_out_maps,
+                own: &mut maps,
+            },
         )?;
     }
     s.push_str(&maps);
@@ -515,6 +517,13 @@ fn render_with_lists(
     // G3.2c: the `rpki` node and its route-map, after the instances.
     s.push_str(&rpki::render_frr(routing));
     Ok(s)
+}
+
+/// The output maps beyond the chains': the chains with an eBGP one of
+/// their own (G3.9fg) and the text of the connections' own (G3.9fb).
+struct OutMaps<'a> {
+    ebgp: &'a std::collections::BTreeSet<String>,
+    own: &'a mut String,
 }
 
 /// One instance alone, without neighbors (the preview of
@@ -529,8 +538,10 @@ pub fn render_frr(inst: &BgpInstance) -> String {
         None,
         &|_| None,
         false,
-        &std::collections::BTreeSet::new(),
-        &mut String::new(),
+        OutMaps {
+            ebgp: &std::collections::BTreeSet::new(),
+            own: &mut String::new(),
+        },
     );
     s
 }
@@ -548,9 +559,12 @@ fn render_instance(
     cfg: Option<&Config>,
     open: Opener<'_>,
     rpki: bool,
-    ebgp_out_maps: &std::collections::BTreeSet<String>,
-    maps: &mut String,
+    out: OutMaps<'_>,
 ) -> Result<(), String> {
+    let OutMaps {
+        ebgp: ebgp_out_maps,
+        own: maps,
+    } = out;
     // Writing to a String cannot fail; ignore the fmt::Result.
     let _ = writeln!(s, "{}", frr_header(inst));
     let _ = writeln!(s, " bgp router-id {}", inst.router_id);
