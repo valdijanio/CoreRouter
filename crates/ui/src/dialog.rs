@@ -141,6 +141,12 @@ impl Form {
         hint: &str,
     ) {
         ui.label(label);
+        self.field(ui, param, value, hint);
+    }
+
+    /// The field of [`Form::text`] alone, after a label drawn by the
+    /// caller (one with an ⓘ).
+    pub(crate) fn field(&self, ui: &mut Ui, param: &str, value: &mut String, hint: &str) {
         let resp = ui.add(
             TextEdit::singleline(value)
                 .id(self.field_id(param))

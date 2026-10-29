@@ -2584,3 +2584,38 @@ Uma amostra a cada 10 min. Gráfico em `docs/changes/G1.6q-soak-screenshots/soak
 | 300 logins TLS seguidos | ±0,4 MiB nas duas imagens |
 | Gerência → GUIs antigas do usuário (sem etag) | ~335 KiB/s, 12,7 GB em 7,8 h |
 | HTTPS / TLS da gerência, pelo host | 2–3 ms / 15–17 ms |
+
+### `config.diff` com uma rota pendente (G0.31a)
+
+**Medido** em 2026-10-29, AMD Ryzen AI Max+ 395 (32 threads), build release (`cargo bench -p
+corerouter-engine --bench lock_hold`, `--save-baseline antes` na `main` `b6a438d6`,
+`--baseline antes` na branch). Config do `lock_hold`: 1000 VLANs, 10 000 regras, 100 000
+entradas de address-list, 60 000 rotas.
+
+| Caso | Antes | Depois |
+|---|---|---|
+| `config.diff/pending_route` (modo transacional, 1 rota nova) | 561,6 ms | 0,574 ms (−99,9 %) |
+| `config.diff/pending_identity` | 32,5 µs | 19,8 µs |
+| `config.diff` sem nada pendente | 1,77 µs | 2,18 µs (ruído, p = 0,15) |
+
+### Consultas fora do lock (G0.31b)
+
+**Medido** em 2026-10-29, AMD Ryzen AI Max+ 395 (32 threads), build release, `cargo bench -p
+corerouter-engine --bench lock_hold` (1000 VLANs, 10 000 regras, 100 000 entradas de
+address-list, 60 000 rotas). "Antes" é o tempo da consulta inteira na `main` `b6a438d6`, que
+rodava toda sob o lock (melhor de 3, a quente); "depois" é o tempo sob o lock
+(`execute_reply_as` sem o `finish`, melhor de 3), lido na varredura (`held`) e nos grupos
+`held/*` do criterion.
+
+| Consulta | Lock antes | Lock depois | Resposta inteira depois |
+|---|---|---|---|
+| `ip.route.list` | 325,6 ms | 42,7 µs (criterion: 1,17 µs) | 345 ms, fora do lock |
+| `ip.firewall.address-list.list` | 112,1 ms | 10,2 µs (criterion: 0,15 µs) | 112 ms |
+| `config.drift.list` (backend virtual) | 133,4 ms | 0,28 ms | 129 ms |
+| `ip.firewall.preview` | 85,3 ms | 39,7 µs | 82 ms |
+| `ip.firewall.filter.list` | 45,0 ms | 14,1 µs (criterion: 0,61 µs) | 41 ms |
+| consulta mais longa sob o lock | 325,6 ms (`ip.route.list`) | 1,98 ms (`ip.route.page`) | — |
+| `ip.route.list` logo depois de uma mudança | — | 26,4 ms (reconstrói as linhas: G0.31g) | — |
+
+O tempo total de cada resposta não muda: a montagem roda na thread da conexão, e cada cliente
+tem a sua, então N clientes montam em paralelo em N núcleos, em vez de um de cada vez sob o lock.

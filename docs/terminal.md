@@ -45,12 +45,13 @@ execução. Comando novo no engine aparece no terminal sozinho (há um teste que
 ### Metadados do registro para o terminal
 
 Três campos opcionais do `CommandSpec`, com construtores `const` (`cmd!(…).alias("ping")
-.positional("address").task()`), saem no `engine.list` como `alias`, `positional` e `task`:
+.positional("address").task()`), saem no `engine.list` como `alias`, `positional`, `key_alias` e `task`:
 
 | Metadado | Efeito no terminal |
 |---|---|
 | `alias("ping")` | atalho válido em qualquer menu e na raiz: `ping …` e `/ping …` = `/tool ping start …`; aparece no Tab e no `?` da raiz. Nunca esconde um menu da raiz (teste no engine). Vários nomes separados por vírgula (`alias("traceroute,mtr")`). **Menu com o nome de um alias:** se a palavra seguinte não é nome do menu (ou é `chave=valor`), o menu roda o comando dele que tem esse alias — `/tool ping 8.8.8.8 count=5 size=1400` e `/tool ping address=…` = `/tool ping start …`, como no RouterOS; `/tool ping mtu …` continua sendo o comando `mtu` |
 | `positional("address")` | a primeira palavra sem `=` vai para esse parâmetro: `ping 8.8.8.8 count=3` |
+| `key_alias(&[("interface", "parent")])` | outro nome de um parâmetro, o que o RouterOS escreve (G3.9hb): `/interface vlan add interface=ether1 vlan-id=10` = `parent=ether1`, para um script colado de um MikroTik ou o `/import` do export dele funcionar. O terminal traduz antes de enviar: o `params` (o contrato) não muda e o engine continua aceitando só `parent`. Aparece no Tab ("same as parent"); prefixo comum ao nome e ao sinônimo é o mesmo parâmetro. O engine testa que o sinônimo aponta para um parâmetro e não é um deles |
 | `task()` | o comando inicia uma tarefa: o terminal lê o `id` do resultado e acompanha com `tool.task.poll {id, after_seq}` (o `after_seq` é o `next_seq` da resposta anterior), imprimindo cada evento numa linha assim que chega (cabeçalho uma vez; colunas na ordem de um `columns` opcional no resultado ou na resposta, senão `seq` e as chaves do primeiro evento; `status` diferente de `ok`/vazio em amarelo), até `done`; então mostra `reason` e o `summary`. O poll vai com `text: true`: se a resposta trouxer `header`/`lines`/`summary_lines` (o engine as gera em `tools::text`, no formato do RouterOS: `SEQ HOST SIZE TTL TIME STATUS` e `sent=… received=… packet-loss=…% min-rtt=…`), o terminal imprime essas linhas como vieram, sem conhecer a ferramenta; senão usa as colunas acima. Entre polls sem novidade espera 250 ms (`Request::Sleep`). **Ctrl+C** chama `tool.task.stop {id}` uma vez e continua até o resumo |
 
 O `tool.ping.start` e o `tool.mtr.start` (G6.2/G6.3, `docs/tools.md`) usam esses metadados; os testes usam um roteador simulado com o mesmo contrato

@@ -183,6 +183,36 @@ pub struct RoutingFilter {
     pub prefix_lists: BTreeMap<String, PrefixList>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub community_lists: BTreeMap<String, CommunityList>,
+    /// What `set bgp-path-prepend N` means (G3.9fg). A filter written by
+    /// a build before G3.9fg has no such field and reads as
+    /// [`PrependCount::Legacy`], so an upgrade does not change the paths
+    /// a router sends; a new one is [`PrependCount::RouterOs`].
+    #[serde(default = "PrependCount::legacy", skip_serializing_if = "PrependCount::is_legacy")]
+    pub prepend: PrependCount,
+}
+
+/// The contract of `set bgp-path-prepend N` (G3.9fg).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrependCount {
+    /// RouterOS v7: on eBGP the route leaves with our AS N times in all
+    /// (the copy eBGP always adds counts).
+    #[default]
+    #[serde(rename = "routeros")]
+    RouterOs,
+    /// Before G3.9fg: N copies on top of the one eBGP adds (FRR's `set
+    /// as-path prepend`), N + 1 in all.
+    Legacy,
+}
+
+impl PrependCount {
+    pub fn legacy() -> Self {
+        PrependCount::Legacy
+    }
+
+    pub fn is_legacy(&self) -> bool {
+        *self == PrependCount::Legacy
+    }
 }
 
 impl RoutingFilter {
@@ -230,5 +260,24 @@ mod tests {
         let json = serde_json::to_string(&e).unwrap();
         assert_eq!(json, "\"10.0.0.0/8 le 24\"");
         assert_eq!(serde_json::from_str::<PrefixEntry>(&json).unwrap(), e);
+    }
+
+    #[test]
+    fn a_filter_from_before_g3_9fg_keeps_the_old_prepend_count() {
+        // A file of an older build: no `prepend`.
+        let old: RoutingFilter = serde_json::from_str(r#"{"rules":[{"id":"*1","chain":"out","rule":"set bgp-path-prepend 2; accept"}],"next_id":1}"#).unwrap();
+        assert_eq!(old.prepend, PrependCount::Legacy);
+        // Saved again it stays legacy (nothing written, nothing changes).
+        let again: RoutingFilter = serde_json::from_str(&serde_json::to_string(&old).unwrap()).unwrap();
+        assert_eq!(again.prepend, PrependCount::Legacy);
+        // A new filter is RouterOS's, and says so in the file.
+        let mut new = RoutingFilter::default();
+        assert_eq!(new.prepend, PrependCount::RouterOs);
+        new.rules.push(old.rules[0].clone());
+        let json = serde_json::to_string(&new).unwrap();
+        assert!(json.contains(r#""prepend":"routeros""#), "{json}");
+        assert_eq!(serde_json::from_str::<RoutingFilter>(&json).unwrap(), new);
+        // An empty filter is left out of the config: it reads back as new.
+        assert!(RoutingFilter::default().is_empty());
     }
 }

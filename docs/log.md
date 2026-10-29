@@ -7432,3 +7432,81 @@ continuação indentadas).
     `immediate`, interfaces e endereços como antes.
   - Safe Mode: a queda da sessão MCP desfez as mudanças (revisão 20), e o `config.safe-mode.cancel`
     também (revisão 22).
+
+- 2026-10-29 — G0.31a: `config.diff` só serializa, nas listas grandes, os blocos do `CowList` que o candidato e a config
+  em execução não compartilham. Vale para as dez listas em blocos: endereços, rotas, filter/nat/
+  mangle/raw, address-lists, PPP secrets, simple queues, leases estáticos do DHCP e DNS estático.
+  Todas são indexadas por `id` no diff (o caminho é `ip.routes[*1F].distance`, não a posição), então
+  tirar os itens iguais não muda nenhum caminho. Um lado que ficaria vazio guarda um item
+  compartilhado nos dois, porque a lista vazia é uma linha própria (`ip.routes: []`) que as listas
+  inteiras não dariam. `CowList::unshared` e `CowList::any_shared` são novos; a G0.31e pode
+  reaproveitá-los no plano do commit.
+
+  Como testar: `cargo test -p corerouter-model --lib store::` (o teste
+  `skipping_shared_blocks_gives_the_same_diff` compara com o diff ingênuo das listas inteiras em 11
+  edições: acrescentar, mudar, apagar, inserir no meio, `retain`, esvaziar, address-list, secret e
+  duas seções ao mesmo tempo, nos dois sentidos). Bench: `cargo bench -p corerouter-engine --bench
+  lock_hold`.
+
+- 2026-10-29 — G0.31b: Consultas grandes fora do lock do `Session`. Sob o lock, o handler pega um snapshot: a config
+  clonada (só contadores de referência) e `Arc`s do estado vivo. Em seguida chama `s.defer(closure)`.
+  O canal de controle (`Host::with_session_reply`, no daemon e na GUI local) solta o lock e só
+  então monta as linhas e o JSON (`Reply::finish`). Os outros chamadores (`Session::execute`: GUI no
+  processo, CLI sem daemon, lotes, testes) recebem a resposta pronta, como antes. Só o comando
+  pedido como resposta adia; um comando executado dentro dele responde no lugar.
+
+  Adiam: `ip.route.list`, `ip.firewall.{filter,nat,mangle,raw}.list`,
+  `ip.firewall.address-list.list`, `ip.firewall.preview` e `config.drift.list`. No drift, a leitura
+  do kernel continua sob o lock. O estado vivo que eles leem passou a `Arc`, copiado só quando
+  alguém escreve com um closure vivo:
+  - `RouteWatch` (estados, `RouteWatch::changed`). A olhada é pulada quando a tabela de linhas é o
+    mesmo `Arc` da última, porque nenhum estado pode ter mudado; antes, cada lista percorria as
+    60 000 rotas sob o lock;
+  - os contadores do firewall (`FwDiag::live`);
+  - as entradas dinâmicas das address-lists (`DynamicLists::shared`);
+  - o estado do LDP (`mpls::ldp_state`).
+
+  O mecanismo está em `docs/architecture.md` ("Consultas fora do lock do `Session`") e serve à
+  G0.31c: uma thread publica o dump do conntrack num `Arc`, e o handler chama `s.defer`.
+
+  Como testar: `cargo test -p corerouter-engine --lib off_lock` (adia e termina com a mesma
+  resposta; um comando dentro de outro responde no lugar; um erro não deixa nada pendente) e
+  `cargo test -p corerouter-engine --test it off_lock` (as 11 combinações de consulta e parâmetros
+  dão a mesma resposta com e sem adiar; um lote nunca adia). Bench: `cargo bench -p
+  corerouter-engine --bench lock_hold`, coluna `held` da varredura e grupo `held/*`.
+
+- 2026-10-29 — G1.6qf: Safe Mode na chamada avulsa da CLI: `corerouter-cli run config.safe-mode.enter` agora é recusado
+  antes de conectar, com o motivo (a conexão fecha quando o comando volta, o roteador desfaria o
+  Safe Mode na hora e o `run` seguinte mudaria a config sem proteção) e os clientes que mantêm a
+  conexão (`corerouter-cli shell` com Ctrl+X, `corerouter-cli mcp`, GUI). A lista dos comandos
+  presos à conexão fica no engine (`safe_mode::NEEDS_OPEN_CONNECTION`), perto do `hang_up` que a
+  justifica. Teste do caso reproduzido na VM: `apps/corerouter-cli/tests/local.rs`
+  (`run_refuses_safe_mode_which_would_end_with_its_connection`: recusa com e sem `--connect`, o
+  roteador nunca entrou em Safe Mode e os outros comandos seguem).
+
+- 2026-10-29 — G3.9hb: Terminal: `/interface vlan add interface=ether1 vlan-id=10 name=v10` funciona como no RouterOS, e o
+  `/import` do `/interface vlan export` de um MikroTik entra como veio. O `CommandSpec` ganhou
+  `key_alias(&[("interface", "parent")])`, que sai no `engine.list` como `key_alias`; o terminal
+  troca o sinônimo pela chave antes de enviar (o `params` não muda; o engine continua recusando
+  `interface`), oferece `interface=` no Tab ("same as parent") e completa o valor com os nomes de
+  interface. O `interface.vlan.add` aceita `disabled` (o RouterOS exporta `disabled=yes`).
+  `use-service-tag`, `mtu`, `vlan-id` e `comment` já batiam. Caso novo `rsc` em
+  `scripts/routeros-interop-l2.sh`: o CHR 7.25 cria VLANs (comentada, desabilitada com MTU 1400,
+  S-tag e C-tag sobre ela), exporta, e o terminal do CoreRouter importa o arquivo como veio.
+  O laboratório achou que o RouterOS exporta em ordem de nome, não de dependência (`add
+  interface=s42 name=c43` vem antes de `name=s42`): o `/import` agora põe no fim do lote o passo que
+  falhou e roda o lote atômico de novo. Um passo já adiado só volta a ser adiado se mais passos
+  rodaram antes da falha (uma cadeia se resolve, duas linhas ruins não trocam de lugar para sempre),
+  o último nunca, e no máximo 64 vezes; a linha ruim continua falhando com o número dela no script.
+  Testar: `cargo test -p corerouter-shell a_routeros_vlan_export_imports_as_written`,
+  `cargo xtask vm-lab run -- scripts/routeros-interop-l2.sh rsc`.
+
+- 2026-10-29 — G3.9hc: Interfaces › New VLAN Interface ganhou a caixa "Use Service Tag" (802.1ad S-tag, TPID 0x88a8),
+  enviada como `use_service_tag` só quando marcada (um daemon de antes do 802.1ad ainda cria a VLAN
+  comum), e ⓘ em Name, Interface, VLAN ID, Use Service Tag e MTU, com a explicação em português e
+  inglês (S-tag × C-tag, quando ligar, o cuidado do TPID igual nos dois lados, IEEE 802.1ad,
+  `use-service-tag` do RouterOS). Na lista, a coluna Info mostra o selo `S-VLAN 100` na mesma cor
+  por hash do id que a `VLAN 100` e o texto "s-vlan 100 on ether1 (802.1ad)"; a janela
+  "Interface <nome>" de uma VLAN mostra "Use Service Tag" com ⓘ (yes/no e o TPID), só leitura.
+  Opção A do mockup (sem coluna nova). Testar: `cargo test -p corerouter-ui vlan_service_tag`;
+  screenshots claro e escuro em `docs/changes/G3.9hc-screenshots/`.
