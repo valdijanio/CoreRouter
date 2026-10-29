@@ -31,8 +31,8 @@ use std::path::{Path, PathBuf};
 
 use corerouter_hal::system_resource::{
     CpuIrqs, CpuTimes, DAEMON_PROCESS, Disk, DiskIo, LoadAvg, MAX_CPUS, MAX_DISKS, MAX_NET,
-    MAX_PROCESSES, MAX_SENSORS, MAX_TASKS, Memory, NetDev, Pressure, Process, Psi, ROUTER_PROCESSES,
-    ResourceSampler, Sample, Sensor, SensorKind, Task, Want, cut_name,
+    MAX_PROCESSES, MAX_SENSORS, MAX_TASKS, Memory, NetDev, Pressure, Process, Psi,
+    ROUTER_PROCESSES, ResourceSampler, Sample, Sensor, SensorKind, Task, Want, cut_name,
 };
 
 /// Most descriptors counted per process (a reading of the processes lists
