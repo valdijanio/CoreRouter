@@ -244,3 +244,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-29 — G0.31 feito (auditoria de desempenho e paralelismo); G0.31a–f abertos com os números
 - 2026-10-29 — G3.9fd feito (campos de anúncio na janela BGP)
 - 2026-10-29 — G3.9g criado (interoperabilidade do BNG PPPoE com o RouterOS 7.25 CHR) e G3.9ga criado (cliente PPPoE no CoreRouter)
+- 2026-10-29 — G3.9g feito (interoperabilidade do BNG PPPoE com o RouterOS 7.25 CHR, parte 2)
