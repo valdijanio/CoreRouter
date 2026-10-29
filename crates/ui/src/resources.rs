@@ -7,7 +7,9 @@
 //!   health checks with their reason;
 //! - **CPU** (per core, softirq and the receive softirq of each CPU: RSS
 //!   balance), **Memory** (use, PSI, swap), **Disk**, **Network**,
-//!   **Sensors**, **Processes** (sortable) and **OS Log** (G4.8b).
+//!   **Sensors**, **Processes** (sortable), **Threads** (G1.6qe: each
+//!   thread of the daemon and FRR, its CPU in % of one core) and **OS
+//!   Log** (G4.8b).
 //!
 //! The top bar gets the health chip (always; a click opens this window)
 //! and, when Settings turns it on, the router's live CPU and memory next
@@ -45,6 +47,9 @@ pub(crate) const CHECK: &str = "system.health.check";
 /// Refreshes (1 s) between two health checks for the top bar's chip.
 const CHIP_EVERY: u32 = 5;
 const PROC_LIMIT: u32 = 200;
+/// A thread this busy (% of one core) is a core full: work serialized on
+/// it (the BNG of 2026-10-25).
+const HOT_THREAD: f64 = 90.0;
 
 pub(crate) const PANEL: Panel = Panel {
     name: NAME,
@@ -68,10 +73,11 @@ pub(crate) enum Tab {
     Network,
     Sensors,
     Processes,
+    Threads,
     OsLog,
 }
 
-const TABS: [(Tab, &str, &str); 8] = [
+const TABS: [(Tab, &str, &str); 9] = [
     (Tab::Overview, "Overview", "overview"),
     (Tab::Cpu, "CPU", "cpu"),
     (Tab::Memory, "Memory", "memory"),
@@ -79,6 +85,7 @@ const TABS: [(Tab, &str, &str); 8] = [
     (Tab::Network, "Network", "network"),
     (Tab::Sensors, "Sensors", "sensors"),
     (Tab::Processes, "Processes", "processes"),
+    (Tab::Threads, "Threads", "threads"),
     (Tab::OsLog, "OS Log", "os_log"),
 ];
 
@@ -96,6 +103,7 @@ const T_DISK: &str = "resources-disk";
 const T_NET: &str = "resources-net";
 const T_SENSORS: &str = "resources-sensors";
 const T_PROCS: &str = "resources-procs";
+const T_THREADS: &str = "resources-threads";
 
 #[derive(Default)]
 pub(crate) struct ResourcesPanel {
@@ -103,6 +111,8 @@ pub(crate) struct ResourcesPanel {
     pub(crate) print: Option<Value>,
     pub(crate) cpu: Option<Value>,
     pub(crate) procs: Option<Value>,
+    /// The router's processes with their threads (G1.6qe).
+    pub(crate) threads: Option<Value>,
     pub(crate) net: Option<Value>,
     pub(crate) sensors: Option<Value>,
     pub(crate) check: Option<Value>,
@@ -120,6 +130,7 @@ pub(crate) struct ResourcesPanel {
     links: TableState,
     sensor_table: TableState,
     proc_table: TableState,
+    thread_table: TableState,
 }
 
 fn f(v: &Value, k: &str) -> Option<f64> {
@@ -212,6 +223,7 @@ impl PanelState for ResourcesPanel {
                 PROCS,
                 json!({"sort": if self.sort.is_empty() { "cpu" } else { self.sort }, "limit": PROC_LIMIT}),
             )),
+            Tab::Threads => out.push(q("threads", PROCS, json!({"threads": true}))),
             Tab::Memory => out.push(q("procs", PROCS, json!({"sort": "memory", "limit": 8}))),
             Tab::Disk | Tab::OsLog => {}
         }
@@ -230,6 +242,7 @@ impl PanelState for ResourcesPanel {
             "print" => &mut self.print,
             "cpu" => &mut self.cpu,
             "procs" => &mut self.procs,
+            "threads" => &mut self.threads,
             "net" => &mut self.net,
             "sensors" => &mut self.sensors,
             "check" => &mut self.check,
@@ -270,6 +283,7 @@ impl PanelState for ResourcesPanel {
             Tab::Network => self.network_tab(ui, l),
             Tab::Sensors => self.sensors_tab(ui, l),
             Tab::Processes => self.processes_tab(app, ui, l),
+            Tab::Threads => self.threads_tab(ui, l),
             Tab::OsLog => os_log(app, ui, l),
         }
     }
@@ -721,6 +735,74 @@ impl ResourcesPanel {
             num("Memory").help("resources.col.proc_mem"),
         ];
         let out = table::show(ui, T_PROCS, 0.0, &mut self.proc_table, &cols, &rows, |_, _| {});
+        if let Some(k) = out.help {
+            self.help = Some(HelpView::new(k, col_title(&cols, k, l)));
+        }
+    }
+}
+
+impl ResourcesPanel {
+    /// G1.6qe: one row per thread of the router's processes, the busiest
+    /// first; a chip when one fills a core.
+    fn threads_tab(&mut self, ui: &mut Ui, l: Lang) {
+        // (process, tid, thread, state, cpu), owned: the table below needs `self`.
+        let mut all: Vec<(String, u64, String, String, Option<f64>)> = arr(self.threads.as_ref())
+            .iter()
+            .flat_map(|p| {
+                arr(p.get("tasks")).iter().map(move |t| {
+                    (
+                        s(p, "name").to_owned(),
+                        t.get("tid").and_then(Value::as_u64).unwrap_or(0),
+                        s(t, "name").to_owned(),
+                        s(t, "state").to_owned(),
+                        f(t, "cpu"),
+                    )
+                })
+            })
+            .collect();
+        all.sort_by(|a, b| b.4.unwrap_or(-1.0).total_cmp(&a.4.unwrap_or(-1.0)));
+        let hot = all.first().filter(|t| t.4.is_some_and(|c| c >= HOT_THREAD));
+        ui.horizontal(|ui| {
+            match hot {
+                Some((proc_name, _, thread, _, cpu)) => {
+                    let text = format!(
+                        "{proc_name} › {thread}: {:.0} % {}",
+                        cpu.unwrap_or(0.0),
+                        tr_in(SCOPE, l, "of one core")
+                    );
+                    chip(ui, &text, AMBER.tone(ui.visuals()));
+                }
+                None => {
+                    chip(ui, tr_in(SCOPE, l, "No thread fills a core"), GREEN.tone(ui.visuals()));
+                }
+            }
+            self.info(ui, l, "threads.hot", "Busiest thread");
+            table::find_field(ui, T_THREADS, &mut self.thread_table);
+        });
+        let rows: Vec<Row> = all
+            .iter()
+            .map(|(proc_name, tid, thread, state, c)| Row {
+                key: tid.to_string(),
+                cells: vec![
+                    proc_name.clone(),
+                    tid.to_string(),
+                    thread.clone(),
+                    state.clone(),
+                    c.map_or_else(|| "–".into(), |c| format!("{c:.1} %")),
+                ],
+                dimmed: c.is_none_or(|c| c == 0.0),
+                section: false,
+                tint: None,
+            })
+            .collect();
+        let cols = [
+            col("Process").help("resources.col.thread_process"),
+            num("TID").help("resources.col.tid"),
+            col("Thread").help("resources.col.thread_name"),
+            col("State").help("resources.col.proc_state"),
+            num("CPU (1 core)").help("resources.col.thread_cpu"),
+        ];
+        let out = table::show(ui, T_THREADS, 0.0, &mut self.thread_table, &cols, &rows, |_, _| {});
         if let Some(k) = out.help {
             self.help = Some(HelpView::new(k, col_title(&cols, k, l)));
         }

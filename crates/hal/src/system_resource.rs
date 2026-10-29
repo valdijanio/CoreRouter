@@ -19,6 +19,8 @@ pub const MAX_SENSORS: usize = 256;
 pub const MAX_NET: usize = 1024;
 pub const MAX_DISKS: usize = 64;
 pub const MAX_PROCESSES: usize = 8192;
+/// Threads kept per process (G1.6qe).
+pub const MAX_TASKS: usize = 4096;
 /// Longest name kept (process, sensor label, interface, mount).
 pub const MAX_NAME: usize = 64;
 
@@ -259,6 +261,21 @@ pub struct Process {
     /// Open file descriptors (`/proc/<pid>/fd`); `None` when unreadable
     /// (G1.6q: a leak of sockets or files shows here first).
     pub fds: Option<u32>,
+    /// Its threads (G1.6qe), sorted by tid, only for the router's own
+    /// processes ([`Sample::router`]); empty elsewhere.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tasks: Vec<Task>,
+}
+
+/// One thread (`/proc/<pid>/task/<tid>/stat`): the name its
+/// `thread::Builder` gave (cut by the kernel to 15 bytes).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Task {
+    pub tid: u32,
+    pub name: String,
+    pub state: char,
+    /// User + system clock ticks since the thread started.
+    pub cpu_ticks: u64,
 }
 
 /// One reading of the machine. Fields the platform does not have are
@@ -336,6 +353,35 @@ const LAB_CPUS: usize = 16;
 const LAB_MEM: u64 = 32 << 30;
 const LAB_DISK: u64 = 64_000_000_000;
 const LAB_PORTS: usize = 8;
+/// The lab daemon's threads: (name, share of the daemon's CPU in ‰).
+/// `pppoe-ctl` takes most, the serialized control plane of 2026-10-25.
+const LAB_TASKS: &[(&str, u64)] = &[
+    ("corerouter-daem", 70),
+    ("control", 50),
+    ("supervisor", 0),
+    ("health", 20),
+    ("metrics", 10),
+    ("dns", 40),
+    ("dns-lookup-0", 0),
+    ("dns-lookup-1", 0),
+    ("dns-lookup-2", 0),
+    ("dns-lookup-3", 0),
+    ("pppoe-ctl", 450),
+    ("pppoe-rx-0", 60),
+    ("pppoe-rx-1", 60),
+    ("pppoe-rx-2", 60),
+    ("pppoe-rx-3", 60),
+    ("radius-aaa", 120),
+    ("dhcp-server", 0),
+    ("ntp-client", 0),
+    ("os-log", 0),
+    ("graphing", 0),
+    ("frr", 0),
+    ("notice", 0),
+    ("analytics", 0),
+    ("web", 0),
+];
+
 /// (name, threads, rss MiB, share of the busy CPU in ‰).
 const LAB_PROCS: &[(&str, u32, u64, u64)] = &[
     ("corerouter-daemon", 24, 180, 420),
@@ -473,12 +519,28 @@ impl ResourceSampler for LabSampler {
                 cpu_ticks: *ticks,
                 rss_bytes: rss << 20,
                 fds: Some(*threads * 3 + 4),
+                tasks: Vec::new(),
             })
             .collect();
         let router = all
             .iter()
             .filter(|p| p.name == DAEMON_PROCESS || ROUTER_PROCESSES.contains(&p.name.as_str()))
             .cloned()
+            .map(|mut p| {
+                if p.name == DAEMON_PROCESS {
+                    p.tasks = LAB_TASKS
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (name, share))| Task {
+                            tid: p.pid + i as u32,
+                            name: (*name).into(),
+                            state: if *share >= 100 { 'R' } else { 'S' },
+                            cpu_ticks: p.cpu_ticks * share / 1000,
+                        })
+                        .collect();
+                }
+                p
+            })
             .collect();
         let processes = want.processes.then_some(all);
         Sample {
@@ -616,6 +678,9 @@ mod tests {
         // G1.6qd: the router's own on every reading, the daemon first.
         let names: Vec<&str> = a.router.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["corerouter-daemon", "bgpd", "zebra", "ospfd"]);
+        // G1.6qe: the daemon's threads, as many as it says it has.
+        assert_eq!(a.router[0].tasks.len(), 24);
+        assert!(a.router[1].tasks.is_empty());
         assert!(b.net[0].rx_bytes > a.net[0].rx_bytes);
         assert!(b.net[3].rx_errors > a.net[3].rx_errors);
         assert!(b.memory.available < b.memory.total);
