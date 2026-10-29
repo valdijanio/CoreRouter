@@ -136,10 +136,21 @@ pub struct MplsSettings {
     /// Echo replies per second at most (RFC 8029 §5: "A rate limiter
     /// SHOULD be applied"); the rest are dropped and counted.
     pub lsp_ping_rate: u32,
+    /// Send ICMP "time exceeded" (with the RFC 4950 label stack) for a
+    /// labeled packet whose TTL expires here (G3.9d): the Linux forwarder
+    /// drops it silently and traceroute shows `*`. On by default, as on
+    /// RouterOS, Cisco and Junos.
+    pub icmp_ttl_exceeded: bool,
+    /// Those errors per second at most; the rest are dropped and counted.
+    pub icmp_rate: u32,
 }
 
 /// Default of [`MplsSettings::lsp_ping_rate`] (replies per second).
 pub const DEFAULT_LSP_PING_RATE: u32 = 100;
+/// Default of [`MplsSettings::icmp_rate`] (errors per second).
+pub const DEFAULT_ICMP_RATE: u32 = 100;
+/// Highest [`MplsSettings::icmp_rate`].
+pub const MAX_ICMP_RATE: u32 = 10_000;
 /// Highest [`MplsSettings::lsp_ping_rate`].
 pub const MAX_LSP_PING_RATE: u32 = 10_000;
 
@@ -151,6 +162,8 @@ impl Default for MplsSettings {
             payload_mtu: DEFAULT_PAYLOAD_MTU,
             lsp_ping_responder: true,
             lsp_ping_rate: DEFAULT_LSP_PING_RATE,
+            icmp_ttl_exceeded: true,
+            icmp_rate: DEFAULT_ICMP_RATE,
         }
     }
 }

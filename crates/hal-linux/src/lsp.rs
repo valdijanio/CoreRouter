@@ -17,13 +17,18 @@
 //!   kernel drops it as martian; the tap sees it first). Protocol sockets
 //!   are not called for frames the host sends, unlike `ETH_P_ALL` ones.
 //!   Replies leave from a UDP socket on port 3503, IP TTL 255 (§4.5).
+//! - **ICMP for expired labeled packets** (G3.9d): an expired frame that
+//!   is not an echo request becomes an [`expired::Expired`] ([`classify`]);
+//!   its time exceeded leaves by the IP table from an `IPPROTO_RAW` socket,
+//!   or along the LSP as a whole frame on the packet socket of the label's
+//!   way out, to the next hop's MAC ([`icmp_frame`]).
 //! - **What the LSR knows** ([`LsrView`]): the label table (one dump,
 //!   kept a second), the addresses and MTUs of the links (kept a second),
 //!   the route of each FEC asked (kept a second, 1024 at most).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use corerouter_hal::lsp::Heard;
+use corerouter_hal::lsp::{Frame, Heard, expired};
 use corerouter_hal::probe::MplsLabel;
 use corerouter_model::IfName;
 use socket2::SockFilter;
@@ -237,6 +242,54 @@ pub fn parse_frame(frame: &[u8], interface: &IfName) -> Option<Heard> {
         dst_port,
         payload,
     })
+}
+
+/// Whether `h` is an MPLS echo request candidate: UDP 3503 to 127/8, ::1
+/// or ::ffff:127/104 (RFC 8029 §4.3, RFC 9570 §4).
+fn is_echo(h: &Heard) -> bool {
+    h.dst_port == corerouter_hal::lsp::wire::PORT
+        && match h.dst {
+            IpAddr::V4(a) => a.is_loopback(),
+            IpAddr::V6(a) => a.is_loopback() || a.to_ipv4_mapped().is_some_and(|v| v.is_loopback()),
+        }
+}
+
+/// What a frame heard on `interface` is for: an echo request candidate
+/// for the responder, or a labeled packet whose TTL expired here (G3.9d:
+/// the kernel drops it without the ICMP error). `None`: neither.
+pub fn classify(frame: &[u8], interface: &IfName) -> Option<Frame> {
+    let heard = parse_frame(frame, interface);
+    if u16_at(frame, 12)? == ETH_P_MPLS_UC
+        && !heard.as_ref().is_some_and(is_echo)
+        && let Some(e) = expired::parse(interface, frame.get(ETH_HEADER..)?)
+    {
+        return Some(Frame::Expired(e));
+    }
+    heard.map(Frame::Echo)
+}
+
+/// The Ethernet frame of an ICMP error sent along an LSP: `stack` (empty:
+/// unlabeled) over the IP `packet`.
+pub fn icmp_frame(
+    dst_mac: [u8; 6],
+    src_mac: [u8; 6],
+    stack: &[MplsLabel],
+    packet: &[u8],
+) -> Vec<u8> {
+    let ethertype = match (stack.is_empty(), packet.first().map(|b| b >> 4)) {
+        (false, _) => ETH_P_MPLS_UC,
+        (true, Some(6)) => ETH_P_IPV6,
+        (true, _) => ETH_P_IP,
+    };
+    let mut out = Vec::with_capacity(ETH_HEADER + 4 * stack.len() + packet.len());
+    out.extend_from_slice(&dst_mac);
+    out.extend_from_slice(&src_mac);
+    out.extend_from_slice(&ethertype.to_be_bytes());
+    for l in stack {
+        out.extend_from_slice(&corerouter_hal::lsp::wire::label_word(l).to_be_bytes());
+    }
+    out.extend_from_slice(packet);
+    out
 }
 
 // --- kernel filters (classic BPF, linux/filter.h) ---------------------------

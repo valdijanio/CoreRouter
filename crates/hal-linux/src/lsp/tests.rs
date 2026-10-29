@@ -227,6 +227,72 @@ fn the_filters_keep_only_candidates() {
     );
 }
 
+/// G3.9d: an expired labeled frame is an echo request for the responder
+/// only when it goes to 127/8 port 3503; anything else expired becomes an
+/// ICMP candidate, and unexpired frames stay with the responder.
+#[test]
+fn frames_split_into_echo_requests_and_expired_packets() {
+    let echo = frame(&[100], 1, "10.0.0.1", "127.0.0.1", 3503);
+    assert!(matches!(classify(&echo, &name()), Some(Frame::Echo(_))));
+    // A traceroute probe (UDP 33435 to a real host) whose label TTL expired.
+    let probe = frame(&[100, 16], 1, "10.0.0.1", "10.9.9.9", 33435);
+    let Some(Frame::Expired(e)) = classify(&probe, &name()) else {
+        panic!("{:?}", classify(&probe, &name()))
+    };
+    assert_eq!(
+        e.stack.iter().map(|l| l.label).collect::<Vec<_>>(),
+        [100, 16]
+    );
+    assert_eq!(e.packet.first().map(|b| b >> 4), Some(4));
+    // Port 3503 to a real host is not an echo request either.
+    let odd = frame(&[100], 1, "10.0.0.1", "10.9.9.9", 3503);
+    assert!(matches!(classify(&odd, &name()), Some(Frame::Expired(_))));
+    // Not expired: the responder's (explicit null) path, as before (the
+    // filter keeps only these; `respond` drops what is not a request).
+    let alive = frame(&[0], 9, "10.0.0.1", "127.0.0.1", 3503);
+    assert!(matches!(classify(&alive, &name()), Some(Frame::Echo(_))));
+    let transit = frame(&[100], 9, "10.0.0.1", "10.9.9.9", 33435);
+    assert!(matches!(classify(&transit, &name()), Some(Frame::Echo(_))));
+    assert_eq!(classify(&[0u8; 10], &name()), None);
+}
+
+#[test]
+fn icmp_frames_carry_the_stack_or_the_bare_packet() {
+    let stack = [
+        MplsLabel {
+            label: 200,
+            tc: 1,
+            bottom: false,
+            ttl: 255,
+        },
+        MplsLabel {
+            label: 16,
+            tc: 1,
+            bottom: true,
+            ttl: 255,
+        },
+    ];
+    let packet = [0x45u8, 0, 0, 20];
+    let f = icmp_frame([2; 6], [4; 6], &stack, &packet);
+    assert_eq!(&f[..12], &[2, 2, 2, 2, 2, 2, 4, 4, 4, 4, 4, 4]);
+    assert_eq!(&f[12..14], &[0x88, 0x47]);
+    assert_eq!(&f[14..18], &((200u32 << 12) | (1 << 9) | 255).to_be_bytes());
+    assert_eq!(
+        &f[18..22],
+        &((16u32 << 12) | (1 << 9) | 0x100 | 255).to_be_bytes()
+    );
+    assert_eq!(&f[22..], &packet);
+    // Popped to an unlabeled next hop: the IP ethertype of the packet.
+    assert_eq!(
+        &icmp_frame([2; 6], [4; 6], &[], &packet)[12..14],
+        &[0x08, 0x00]
+    );
+    assert_eq!(
+        &icmp_frame([2; 6], [4; 6], &[], &[0x60, 0, 0, 0])[12..14],
+        &[0x86, 0xdd]
+    );
+}
+
 #[test]
 fn route_answers_with_mpls_encap_parse() {
     // rtmsg (AF_INET, /32, table main, proto zebra, unicast) + RTA_OIF 3 +

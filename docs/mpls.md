@@ -319,3 +319,71 @@ com código 3 do egress; traceroute com o salto 1 (lsp2) "label switched" e `imp
 abaixo, salto 2 (lsp3) egress; rótulo desconhecido com TTL 1 → código 11 em lsp2. O `netns_lsp`
 com `mpls_router` também passou na VM (TTL que expira no LSR de trânsito, código 10 quando o rótulo
 é de outro mapeamento).
+
+## ICMP de TTL vencido em pacote rotulado (G3.9d)
+
+O MPLS do kernel Linux descarta em silêncio o pacote rotulado cujo TTL do topo chega a 0 ou 1
+(`net/mpls/af_mpls.c`, `mpls_forward`: `if (dec.ttl <= 1) goto err`, só conta `rx_errors`): não há
+`icmp_send` no arquivo nem sysctl que ligue o erro, até o `master` de 2026. Um traceroute através
+do LSP mostrava `*` no salto do CoreRouter. Agora o próprio respondedor do LSP ping manda o erro.
+
+### Como funciona
+
+- **Captura:** os taps do respondedor (G3.5b, acima) já copiam os quadros MPLS com TTL do topo
+  ≤ 1 (filtro BPF clássico no kernel). O que não é MPLS echo request (UDP 3503 para 127/8 ou
+  `::1`) vira um "expirado" (`hal/src/lsp/expired.rs`, sans-IO; `classify` em `hal-linux`).
+- **O erro** (RFC 3032 §2.3.1; RFC 792 / RFC 4443 §3.3): ICMP tipo 11 / ICMPv6 tipo 3, código
+  0, citando os primeiros 128 octetos do pacote IP sob a pilha (completados com zeros, RFC 4884
+  §4) e a estrutura de extensão com o objeto da pilha de rótulos **como chegou** (RFC 4950: o
+  traceroute do RouterOS mostra `MPLS:L=…`, o `traceroute -e` do Linux `<MPLS:L=…,E=…,S=…,T=…>`).
+  Sai de um endereço da interface de entrada (global antes de link-local), IP TTL 255, DSCP CS6
+  como os erros do próprio Linux.
+- **Não manda** (RFC 1812 §4.3.2.7, RFC 4443 §2.4(e)): erro sobre erro ICMP, fragmento que não é
+  o primeiro, destino multicast/broadcast, origem que não é unicast.
+- **Como volta** (RFC 3032 §2.3.2, o padrão do Cisco):
+  - **um rótulo** e rota IP até a origem: pela tabela IP (socket `IPPROTO_RAW`);
+  - **mais rótulos** (VPN), ou um rótulo sem rota de volta (núcleo sem BGP): **pelo próprio LSP**:
+    a pilha copiada, o rótulo do topo trocado como a tabela de rótulos manda, todos os TTL em
+    255, num quadro inteiro ao MAC do próximo salto. O egress roteia o erro até a origem. Assim
+    um endereço de cliente que coincide com um do núcleo nunca recebe o erro de outro.
+- **Configuração:** `/mpls settings icmp-ttl-exceeded` (padrão ligado, como RouterOS, Cisco e
+  Junos) e `icmp-rate` (padrão 100 erros/s, até 10 000); contadores em `mpls.settings.get`
+  (`icmp_counters`: expirados ouvidos, enviados, descartados pela taxa e por motivo). Janela
+  **MPLS › Settings**. O serviço `lsp-ping` escuta enquanto uma das duas funções está ligada.
+
+### Pesquisa
+
+- **Kernel:** `af_mpls.c` do `master` e do 7.0 desta máquina: descarte sem ICMP; sysctls só
+  `platform_labels`, `ip_ttl_propagate`, `default_ttl`, `conf.<if>.input`. Nenhuma versão gera o
+  erro.
+- **RFC 3032** §2.4.2: pacote com TTL vencido "MUST NOT be further forwarded" e MAY ir ao
+  tratamento de erro da camada de rede; §2.3.2: copiar a pilha para o ICMP e comutá-lo pelo LSP
+  quando o LSR não alcança a origem, com TTL longo. **RFC 4950** (objeto da pilha), **RFC 4884**
+  (extensões e o comprimento em palavras), **RFC 1812** §4.3.2.7 (quando não mandar), **RFC
+  4443** §2.4 (ICMPv6).
+- **MikroTik RouterOS v7:** `propagate-ttl` (padrão sim) decide se o núcleo aparece; os saltos
+  MikroTik mostram os rótulos. Sem opção de túnel de ICMP; relatos no fórum de saltos que somem
+  em VPN.
+- **Cisco IOS:** por padrão o erro segue pelo LSP com a pilha original;
+  `mpls ip ttl-expiration pop <n>` usa a tabela IP até `n` rótulos. **Junos:** tabela IP por
+  padrão, `icmp-tunneling` para seguir pelo LSP até o PE. **Nokia SR OS:** `icmp-tunneling`.
+- **Adotado:** a regra do Cisco com o limiar fixo em 1 rótulo (VPN sempre pelo LSP, núcleo
+  global pela tabela IP, que é o caminho mais curto) e o limite de taxa antes de qualquer trabalho.
+- **Descartado:** XDP no `dataplane-ebpf`. Exigiria `unsafe` e revisão humana, e o XDP não tem a
+  tabela de rótulos (`bpf_fib_lookup` não faz MPLS; seria preciso espelhar o ILM num mapa) para
+  um evento raro, limitado por taxa. O caminho lento custa menos de 1 µs de CPU por erro (abaixo).
+- **Fica de fora** (gap G3.9da): ICMP "fragmentation needed" para pacote rotulado maior que o MTU
+  do LSP (RFC 3032 §3.2: o kernel também descarta) e limite de taxa por origem.
+
+### Desempenho e paralelismo
+
+- **Por pacote no caminho de dados:** nada novo. O filtro BPF dos taps já rodava em todo quadro
+  MPLS das interfaces MPLS (G3.5b) e só copia o expirado. Medido abaixo, com e sem os taps.
+- **Por erro** (release, criterion, esta máquina com outras sessões compilando, 2026-10-29,
+  **medido**, `cargo bench -p corerouter-hal --bench mpls_icmp`): ler o quadro 74 ns; o erro
+  pela tabela IP 0,59 µs, pelo LSP com 100 000 rótulos 0,82 µs, pilha de VPN 0,77 µs. A busca do
+  rótulo é O(log n) no `BTreeMap` da visão (relida no máximo a cada segundo).
+- **Thread:** a do serviço `lsp-ping` (uma, nomeada), sem o lock da sessão no envio. A 100
+  erros/s são < 0,1 ms de CPU por segundo; dividir por núcleo só dividiria o limite de taxa. Uma
+  enxurrada de TTL 1 custa ao kernel a cópia para o socket (fila limitada pelo `SO_RCVBUF`; o
+  excedente o kernel descarta) e ao serviço um contador por pacote além da taxa.
