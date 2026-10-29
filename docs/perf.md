@@ -2538,3 +2538,26 @@ leitores UDP), 16 processos geradores por 6 s:
 Com o buffer maior, a consulta espera na fila em vez de ser descartada: p50 de 0,49 ms com 512
 em voo e de 3,9 ms com 4096 (fila / vazão). Antes, cada consulta perdida custava ao cliente o
 timeout de 1–5 s do resolvedor dele.
+
+### G3.9f: BGP com 100 000 prefixos contra o RouterOS 7.25 CHR (**medido**)
+
+VM `corerouter-lab` (2 vCPU do host AMD Ryzen AI Max+ 395), build release, 2026-10-29,
+`scripts/routeros-interop-bgp.sh scale`:
+
+- CHR → CR1: 100 000 prefixos no kernel em 3,5 s; CR1 → CR2 (iBGP): 3,5 s; `session.clear`:
+  4,5 s; retirada: 1,2 s.
+- Memória: daemon do CoreRouter 62 → 63 MiB (70 MiB depois de um `route.list` de 100 000),
+  `bgpd` 14 → 109 MiB, `zebra` 11 → 68 MiB.
+- CPU nos 3,5 s da carga: daemon 0 %, `bgpd` 17 %, `zebra` 28 % + `zebra_dplane` 6 % +
+  `zebra_apic` 12 %. Ocioso por 30 s com as 100 000 rotas: todas as threads do daemon a 0 %.
+- Consultas: `routing.bgp.session.list` 3 ms; primeira página de `routing.bgp.route.list` 1,0 s
+  (lê a tabela do `bgpd`); um prefixo com a tabela em cache 2 ms; `ip.route.page` 3 ms.
+
+### G3.9h — tempestade DHCPv4 com o BNG Blaster na VM do laboratório (**medido**, 2026-10-29, VM `corerouter-lab`, release)
+
+`scripts/routeros-interop-l2.sh storm`, IPoE N:1 na ether8 do CoreRouter A, `start-rate` 2000/s.
+
+| Clientes | Ligados | Tempo | DISCOVER/REQUEST/ACK no servidor | Pico de ACKs/s | respostas abaixo de 6,4 ms | Limite |
+|---|---|---|---|---|---|---|
+| 20 000 | 20 000 | 88,6 s | 20 000 / 20 000 / 20 000 (sem reenvio) | 1 800 | 92 % | o BNG Blaster na VM (~210 sessões/s) |
+| 20 000 (`start-rate` 10 000/s) | 19 381 em 90 s | — | 19 381 de cada | 3 021 | 93 % | o mesmo |
