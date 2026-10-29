@@ -29,7 +29,7 @@ Propriedades (nomes do RouterOS com `_`; o terminal mostra `-`):
 | `interface` | — | uma por cliente e um cliente por interface; não pode ser porta de bridge nem a própria VRF |
 | `disabled` | `false` | no RouterOS o padrão do `add` é desabilitado; aqui o `add` já liga (o operador quer o IP) |
 | `add_default_route` | `yes` | `yes`: rotas da opção 121 quando vier (a opção 3 é ignorada, RFC 3442), senão rota padrão pela opção 3; `special-classless`: as da 121 **e** a padrão pela 3 (se a 121 já tem `0.0.0.0/0`, ela vence e a nota diz); `no`: nenhuma rota |
-| `default_route_distance` | `1` | distância de todas as rotas da concessão |
+| `default_route_distance` | `254` | distância de todas as rotas da concessão. O RouterOS usa `1`; aqui um cliente **novo** nasce com 254, a AD do Cisco para a default aprendida por DHCP (G1.27j): sozinha ela é a rota em uso, ao lado de uma estática, OSPF ou BGP ela fica de reserva em vez de virar ECMP. Config já gravada mantém o valor que tinha (o campo é sempre gravado; um arquivo sem ele lê `1`, como antes) |
 | `default_route_table` | vazio | vazio = a tabela da interface (`main` ou a VRF dela, G1.5); preenchido, tem de ser essa mesma tabela (vazar rota entre tabelas não existe ainda) |
 | `use_peer_dns` / `use_peer_ntp` | `true` | os servidores recebidos ficam em `Session::dhcp_peer_dns()` / `dhcp_peer_ntp()` para o DNS (G4.1) e o NTP (G4.6) usarem |
 | `host_name` | vazio | opção 12; vazio manda a identidade do sistema (só letras, dígitos e `-`) |
@@ -219,6 +219,7 @@ rota padrão vem, como manda a RFC 7084 (W-3), do Router Advertisement do proved
 | `prefix_hint` | nenhum | `::/56` pede um /56; um prefixo inteiro pede aquele; `::/0` = sem dica |
 | `accept_prefix_without_address` | `true` | com os dois pedidos, aceita só o prefixo (RFC 7084 WPD-6); `false` espera um servidor que dê os dois |
 | `add_default_route` | `false` | `::/0` via o link-local do servidor (ou do relay) com `default_route_distance` |
+| `default_route_distance` | `254` | como no cliente DHCPv4 (G1.27j): reserva atrás de qualquer outra rota; a rota de RA continua em 255, atrás dela |
 | `use_peer_dns` | `true` | DNS recebidos em `Session::dhcp6_peer_dns()` para o G4.1 |
 | `rapid_commit` | `true` | Solicit com Rapid Commit (2 mensagens quando o servidor aceita) |
 | `custom_duid` | vazio | `0x…`; vazio = DUID-LL do MAC da interface |

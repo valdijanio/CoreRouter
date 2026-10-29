@@ -48,7 +48,7 @@ const COLUMNS: [table::Column; 9] = [
     num("Distance"),
     col("Routing Table"),
     num("Changed"),
-    weak("Reason"),
+    weak("Reason").help("routes.reason"),
     comment(),
 ];
 
@@ -147,11 +147,53 @@ pub(crate) struct Route {
     pub reason: Option<String>,
     pub reason_id: Option<String>,
     pub reason_args: Vec<(String, String)>,
+    /// G1.27j: the ECMP notice of its group (`info` | `warning`), its
+    /// template id, arguments and English text.
+    pub notice: Option<Notice>,
     pub changed_secs: Option<u64>,
     pub comment: String,
     /// G3.5: the outgoing LDP label of the route's prefix (`20`,
     /// `implicit-null (pop)`).
     pub mpls: Option<String>,
+}
+
+/// An ECMP group's notice, as `ip.route.list` gives it (G1.27j).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Notice {
+    /// `info` | `warning`.
+    pub level: String,
+    pub id: String,
+    pub args: Vec<(String, String)>,
+    pub text: String,
+    /// The command that makes one path a backup.
+    pub fix: Option<String>,
+}
+
+impl Notice {
+    fn of(v: &Value) -> Self {
+        let text = |k: &str| v.get(k).map(value_text).unwrap_or_default();
+        Self {
+            level: text("level"),
+            id: text("id"),
+            args: v
+                .get("args")
+                .and_then(Value::as_object)
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), value_text(v))).collect())
+                .unwrap_or_default(),
+            text: text("text"),
+            fix: v.get("fix").and_then(Value::as_str).map(str::to_owned),
+        }
+    }
+
+    pub(crate) fn warning(&self) -> bool {
+        self.level == "warning"
+    }
+
+    /// Its text in the explanations' language.
+    pub(crate) fn text(&self, lang: Lang) -> String {
+        let args: Vec<(&str, &str)> = self.args.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        i18n::template(lang, &format!("route.{}", self.id), &args, &self.text)
+    }
 }
 
 impl Route {
@@ -206,6 +248,7 @@ impl Route {
             reason: opt("reason"),
             reason_id: opt("reason_id"),
             reason_args,
+            notice: row.get("notice").filter(|v| v.is_object()).map(Notice::of),
             changed_secs: row.get("changed_secs").and_then(Value::as_u64),
             comment: text("comment"),
         }
@@ -404,6 +447,8 @@ pub(crate) struct Counts {
     pub inactive: usize,
     pub v4: usize,
     pub v6: usize,
+    /// ECMP groups whose notice is a warning (G1.27j).
+    pub ecmp_warning: usize,
 }
 
 /// The counts of `ip.route.page`'s summary (the whole table).
@@ -416,12 +461,19 @@ pub(crate) fn summary_counts(s: &Value) -> Counts {
         inactive: n("inactive"),
         v4: n("ipv4"),
         v6: n("ipv6"),
+        ecmp_warning: n("ecmp_warning"),
     }
 }
 
 pub(crate) fn counts(routes: &[Route]) -> Counts {
     let mut c = Counts::default();
+    let mut warned: BTreeSet<String> = BTreeSet::new();
     for r in routes {
+        if r.notice.as_ref().is_some_and(Notice::warning)
+            && let Some(g) = group_key(r)
+        {
+            warned.insert(g);
+        }
         c.total += 1;
         match r.state.as_str() {
             "active" => c.active += 1,
@@ -434,6 +486,7 @@ pub(crate) fn counts(routes: &[Route]) -> Counts {
             c.v4 += 1;
         }
     }
+    c.ecmp_warning = warned.len();
     c
 }
 
@@ -478,6 +531,14 @@ pub(crate) fn rows_of(routes: &[Route], view: &View, lang: i18n::Langs) -> Vec<R
 fn group_row(key: &str, first: &Route, paths: usize, open: bool, lang: i18n::Langs) -> Row {
     // The default fonts lack ▸/▾ (i18n MISSING_GLYPHS).
     let arrow = if open { "-" } else { "+" };
+    // G1.27j: mixed origins or the default route split between uplinks:
+    // amber, with the notice in the Reason column.
+    let warning = first.notice.as_ref().is_some_and(Notice::warning);
+    let ecmp: &[(&str, Kind)] = if warning {
+        &[("ECMP", Kind::Amber), ("warning", Kind::Amber)]
+    } else {
+        &[("ECMP", Kind::Blue)]
+    };
     Row {
         key: key.to_owned(),
         cells: vec![
@@ -485,13 +546,13 @@ fn group_row(key: &str, first: &Route, paths: usize, open: bool, lang: i18n::Lan
             cell(&first.dst, &[(origin_label(&first.origin), origin_kind(&first.origin))]),
             cell(
                 &format!("{arrow} {paths} {}", tr(lang.labels, "next-hops")),
-                &[("ECMP", Kind::Blue)],
+                ecmp,
             ),
             String::new(),
             first.distance.clone(),
             cell("", &[(&first.table, Kind::Hashed(chip::name_hue(&first.table)))]),
             age(first.changed_secs),
-            String::new(),
+            first.notice.as_ref().map(|n| n.text(lang.help)).unwrap_or_default(),
             String::new(),
         ],
         dimmed: false,
@@ -606,6 +667,10 @@ fn footer(ui: &mut Ui, c: &Counts, l: Lang) {
             (c.v6, "IPv6", chip::neutral_tone(&v)),
         ] {
             chip::chip(ui, &format!("{n} {}", tr(l, label)), tone);
+        }
+        if c.ecmp_warning > 0 {
+            let label = if c.ecmp_warning == 1 { "ECMP warning" } else { "ECMP warnings" };
+            chip::chip(ui, &format!("{} {}", c.ecmp_warning, tr(l, label)), chip::AMBER.tone(&v));
         }
     });
 }
@@ -722,7 +787,7 @@ fn revision_text(r: &Value) -> Option<String> {
 }
 
 /// The detail of the selected route (`ip.route.detail`).
-fn detail(ui: &mut Ui, d: Option<&Value>, langs: i18n::Langs) {
+fn detail(ui: &mut Ui, d: Option<&Value>, notice: Option<&Notice>, langs: i18n::Langs) {
     let l = langs.labels;
     let Some(d) = d else {
         ui.weak(tr(l, "Loading the route's detail…"));
@@ -787,6 +852,27 @@ fn detail(ui: &mut Ui, d: Option<&Value>, langs: i18n::Langs) {
                         }
                     });
                     ui.end_row();
+
+                    // G1.27j: what its ECMP group means, with the command
+                    // that makes one path a backup.
+                    if let Some(n) = notice {
+                        ui.label("ECMP");
+                        ui.horizontal_wrapped(|ui| {
+                            let (level, tone) = if n.warning() {
+                                ("warning", chip::AMBER.tone(&v))
+                            } else {
+                                ("info", chip::BLUE.tone(&v))
+                            };
+                            chip::chip(ui, tr(l, level), tone);
+                            ui.label(n.text(langs.help));
+                            if let Some(fix) = n.fix.as_deref()
+                                && ui.small_button(tr(l, "Copy command")).clicked()
+                            {
+                                ui.ctx().copy_text(fix.to_owned());
+                            }
+                        });
+                        ui.end_row();
+                    }
 
                     ui.label(tr(l, "Check gateway"));
                     match d.get("check_gateway").filter(|c| c.is_object()) {
@@ -1320,7 +1406,8 @@ impl CoreRouterUi {
             {
                 crate::bgp_routes::open_explain(self, &dst);
             }
-            detail(ui, shown.as_ref(), langs);
+            let notice = self.route(key).and_then(|r| r.notice);
+            detail(ui, shown.as_ref(), notice.as_ref(), langs);
         }
         // A click on an ECMP group's line opens or closes it.
         if let Some(key) = out.clicked.clone().filter(|k| k.starts_with(GROUP)) {

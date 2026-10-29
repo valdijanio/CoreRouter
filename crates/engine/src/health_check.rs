@@ -113,6 +113,9 @@ pub struct SocketBuffers {
     pub sockets: BTreeMap<String, (usize, usize)>,
 }
 
+/// The first ECMP warning: its prefix with the paths, and the fix.
+pub type EcmpFirst = (String, Option<String>);
+
 /// What the rules look at, gathered from the session.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Inputs {
@@ -148,6 +151,10 @@ pub struct Inputs {
     /// (socket, bytes given, bytes asked) of [`SocketBuffers`] (`None`:
     /// no service reported one).
     pub sockbuf: Option<Vec<(String, usize, usize)>>,
+    /// ECMP groups of the routing table (G1.27j): warnings (origins mixed
+    /// or the default route), infos, and the first warning's prefix with
+    /// its paths and the fix. `None`: not looked at.
+    pub ecmp: Option<(usize, usize, Option<EcmpFirst>)>,
     /// Whether any reading exists at all.
     pub readings: bool,
 }
@@ -405,6 +412,30 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
             }
         }
     }
+
+    // ECMP in the routing table (G1.27j): mixed uplinks split traffic per
+    // connection between public addresses without anyone asking for it.
+    match &i.ecmp {
+        None => push("routes.ecmp", "Route ECMP", Severity::Unknown, None, "tabela de rotas não consultada".into(), None),
+        Some((0, 0, _)) => push("routes.ecmp", "Route ECMP", Severity::Ok, None, "nenhuma rota dividindo o tráfego (ECMP)".into(), None),
+        Some((0, info, _)) => push("routes.ecmp", "Route ECMP", Severity::Ok, Some(format!("{info} grupo(s)")),
+            format!("{info} grupo(s) ECMP de uma origem só (ex.: dois gateways estáticos), em geral intencional"), None),
+        Some((warn, info, first)) => {
+            let (text, fix) = first.clone().unwrap_or_default();
+            let action = match fix {
+                Some(f) => format!("Torne uma das saídas reserva subindo a distância: {f} (IP › Routes mostra o grupo). Se a divisão por conexão é intencional (balanceamento), o aviso pode ficar."),
+                None => "Suba a distância de uma das rotas para ela virar reserva (IP › Routes mostra o grupo).".into(),
+            };
+            out.push(Check {
+                key: "routes.ecmp",
+                name: "Route ECMP",
+                severity: Severity::Warning,
+                value: Some(format!("{warn} aviso(s), {info} info")),
+                reason: format!("{warn} grupo(s) ECMP dividindo o tráfego por conexão entre saídas com IPs diferentes (origens misturadas ou rota padrão), como {text}"),
+                action: Some(action),
+            });
+        }
+    }
     out
 }
 
@@ -508,6 +539,8 @@ impl Session {
             .ext::<SocketBuffers>()
             .filter(|b| !b.sockets.is_empty())
             .map(|b| b.sockets.iter().map(|(n, (g, w))| (n.clone(), *g, *w)).collect());
+        let (_, routes, _) = self.cached_routes();
+        i.ecmp = Some((routes.ecmp_warning, routes.ecmp_info, routes.ecmp_first.clone()));
         i.services = self
             .ext::<ServiceTable>()
             .filter(|t| t.supervised)
@@ -587,13 +620,14 @@ mod tests {
             services: Some(vec![("dns-resolver".into(), ServiceState::Running)]),
             rss: Some((0, 20.0, 8, 50_000.0)),
             sockbuf: Some(vec![("radius".into(), 4 << 20, 4 << 20)]),
+            ecmp: Some((0, 0, None)),
         }
     }
 
     #[test]
     fn healthy_is_all_ok() {
         let checks = evaluate(&healthy());
-        assert_eq!(checks.len(), 13);
+        assert_eq!(checks.len(), 14);
         for c in &checks {
             assert_eq!(c.severity, Severity::Ok, "{c:?}");
             assert!(c.action.is_none());
@@ -641,6 +675,9 @@ mod tests {
             ("rss on one cpu", |i| i.rss = Some((0, 80.0, 8, 50_000.0)), "rss", Severity::Warning),
             ("rss idle link", |i| i.rss = Some((0, 100.0, 8, 10.0)), "rss", Severity::Ok),
             ("rss two cpus", |i| i.rss = Some((0, 100.0, 2, 50_000.0)), "rss", Severity::Ok),
+            ("ecmp of one origin", |i| i.ecmp = Some((0, 2, None)), "routes.ecmp", Severity::Ok),
+            ("ecmp static + dhcp", |i| i.ecmp = Some((1, 0, Some(("x".into(), Some("ip.dhcp-client.set".into()))))), "routes.ecmp", Severity::Warning),
+            ("routes not read", |i| i.ecmp = None, "routes.ecmp", Severity::Unknown),
         ];
         for (what, change, key, want) in cases {
             let mut i = healthy();

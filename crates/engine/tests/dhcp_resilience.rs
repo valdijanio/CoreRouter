@@ -314,7 +314,9 @@ fn check_gateway_arp_withholds_the_routes_while_the_gateway_is_silent() {
     );
     l.ok(
         "ip.dhcp-client.add",
-        json!({"interface": "ether1", "check_gateway": "arp"}),
+        // The lease's route is the primary here (a new client's 254 would
+        // make it the backup, G1.27j).
+        json!({"interface": "ether1", "check_gateway": "arp", "default_route_distance": 1}),
     );
     l.run(1_000);
     assert_eq!(l.client()["gateway_status"], "up");
