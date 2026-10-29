@@ -309,8 +309,10 @@ k_route6() { ip -n "$1" -6 route show "$2" 2>/dev/null | grep -o 'via [0-9a-f:]*
 k_has() { [ -n "$(k_route "$1" "$2")" ]; }
 k_has6() { [ -n "$(k_route6 "$1" "$2")" ]; }
 k_via() { [ "$(k_route "$1" "$2")" = "via $3" ]; }
+k_via_any() { local ns=$1 p=$2 g; shift 2; for g; do k_via "$ns" "$p" "$g" && return 0; done; return 1; }
 ros_via() { [[ $(ros_gw "$1") == "$2"* ]]; }
 ros_via6() { [[ $(ros_gw6 "$1") == "$2"* ]]; }
+ros_via_any() { local p=$1 g; shift; for g; do ros_via "$p" "$g" && return 0; done; return 1; }
 # A received route on the CoreRouter, through routing.bgp.route.list (the
 # command, not vtysh: what an operator sees).
 cr_rx() { # cr_rx <n> <connection> <prefix>
@@ -590,11 +592,22 @@ case_ibgp() {
   ms=$(wait_for 60 cr_up 1 chri) && result ibgp OK "iBGP between loopbacks (CHR with as=65000 on the connection): Established in ${ms} ms" \
     || { result ibgp FAIL "no Established: CR $(cr_state 1 chri), CHR $(ros_sess cri | jq -c .)"; dump; }
   result ibgp INFO "kind $(cr1 routing.bgp.connection.list '{"find":"chri"}' | jq -r '.[0].kind'); no chain needed on iBGP (RFC 8212 is eBGP only)"
-  ms=$(wait_for 30 k_via cf1 203.0.113.0/24 10.255.39.1) && result ibgp OK "203.0.113.0/24 via the CHR loopback (next hop kept on iBGP)" \
+  # RFC 4271 §5.1.3: a locally originated route to an internal peer carries the
+  # address of the interface the network is reached through; RouterOS uses
+  # its ether1 address (10.39.1.1), not the session's local.address.
+  ms=$(wait_for 30 k_via_any cf1 203.0.113.0/24 10.255.39.1 10.39.1.1) && result ibgp OK "203.0.113.0/24 on CR1 $(k_route cf1 203.0.113.0/24) (CHR's next hop for its own network: $(vt cf1 'show bgp ipv4 unicast 203.0.113.0/24 json' | jq -r '.paths[0].nexthops[0].ip // "?"' 2>/dev/null))" \
     || result ibgp FAIL "203.0.113.0/24 on CR1: '$(k_route cf1 203.0.113.0/24)'"
   local r; r=$(bgp_path cf1 203.0.113.0/24)
   [ "$(jq -r .local_pref <<< "$r")" = 100 ] && result ibgp OK "LOCAL_PREF 100 on iBGP (RFC 4271 §5.1.5)" || result ibgp INFO "local_pref $(jq -c .local_pref <<< "$r")"
   ms=$(wait_for 30 ros_via 100.64.39.0/24 10.255.39.2) && result ibgp OK "100.64.39.0/24 on CHR via our loopback" || result ibgp FAIL "100.64.39.0/24 on CHR: $(ros_route 100.64.39.0/24)"
+  # RouterOS's prepend count on iBGP (no AS of its own is added there): on
+  # eBGP "set bgp-path-prepend 3" gave the AS 3 times in all.
+  rosx '/routing filter rule add chain=ip-out rule="set bgp-path-prepend 2; accept"
+/routing bgp connection set [find name=cri] output.filter-chain=ip-out' >/dev/null
+  sleep 6
+  r=$(bgp_path cf1 203.0.113.0/24)
+  result ibgp INFO "CHR iBGP out prepend 2: as_path $(jq -c .as_path <<< "$r") ($(jq -r '.as_path // ""' <<< "$r" | tr ' ' '\n' | grep -c '^65000$') × 65000)"
+  rosx '/routing filter rule remove [find chain=ip-out]' >/dev/null || true
   crd 1 chri; rosd cri
   loop_routes_off
 }
@@ -627,7 +640,8 @@ case_rr() {
   loop_routes
   crc 1 '{"name":"chri","remote_address":"10.255.39.1","remote_as":65000,"update_source":"10.255.39.2","local_role":"ibgp-rr"}'
   crc 1 '{"name":"r4","remote_address":"10.39.4.2","remote_as":65000,"local_role":"ibgp-rr"}'
-  rosx '/routing bgp connection add name=cri instance=default as=65000 remote.address=10.255.39.2 remote.as=65000 local.role=ibgp local.address=10.255.39.1 output.network=bgp-out' >/dev/null
+  rosx '/routing bgp connection add name=cri instance=default as=65000 remote.address=10.255.39.2 remote.as=65000 local.role=ibgp local.address=10.255.39.1 output.network=bgp-out
+/ip route add dst-address=10.39.4.0/30 gateway=10.39.1.2' >/dev/null
   vt cfr4 'configure terminal
 router bgp 65000
  no neighbor 10.39.4.1 shutdown' >/dev/null
@@ -640,9 +654,11 @@ router bgp 65000
   [[ $j == *'"originatorId":"10.255.39.1"'* && $j == *10.255.39.2* ]] \
     && result rr OK "CHR → CR1 (RR) → R4: 203.0.113.0/24 with ORIGINATOR_ID and CLUSTER_LIST $j" \
     || result rr FAIL "R4 got $j"
+  # The reflector keeps R4's next hop (RFC 4456 §10); CHR reaches 10.39.4.2
+  # through the static route above.
   ms=$(wait_for 30 ros_via 192.0.2.0/24 10.39.4.2) || true
-  local r; r=$(ros_route 192.0.2.0/24)
-  [[ $r != "{}" ]] && result rr OK "R4 → CR1 (RR) → CHR: 192.0.2.0/24 $(jq -c 'with_entries(select(.key | test("originator|cluster|gateway")))' <<< "$r")" \
+  local r; r=$(ros_battr 192.0.2.0/24)
+  [[ $r == *'"bgp.originator-id":"10.255.39.4"'* || ( $r == *10.39.4.2* && $(ros_gw 192.0.2.0/24) == 10.39.4.2* ) ]] && result rr OK "R4 → CR1 (RR) → CHR: 192.0.2.0/24 active $r" \
     || result rr FAIL "192.0.2.0/24 on CHR: $(ros "ip/route?dst-address=192.0.2.0/24" | jq -c .)"
   result rr INFO "CHR session caps: $(ros_sess cri | jq -c '{"remote.cap", "local.cap"}')"
   # Without the role, a plain iBGP neighbor does not get the other's routes (RFC 4271 §9.2).
@@ -650,6 +666,7 @@ router bgp 65000
   ms=$(wait_for 30 bash -c "! vtysh -N cfr4 -c 'show bgp ipv4 unicast 203.0.113.0/24 json' | jq -e '.paths[0]' >/dev/null") \
     && result rr OK "local_role ibgp (no RR): R4 loses CHR's route in ${ms} ms (iBGP split horizon)" || result rr FAIL "R4 still has CHR's route without reflection"
   crd 1 chri; crd 1 r4; rosd cri
+  rosx '/ip route remove [find dst-address=10.39.4.0/30]' >/dev/null || true
   vt cfr4 'configure terminal
 router bgp 65000
  neighbor 10.39.4.1 shutdown' >/dev/null
@@ -659,8 +676,10 @@ router bgp 65000
 # CHR as route reflector: clients CR1 (direct) and R4 (multihop through CR1).
 case_rr-chr() {
   rosx '/ip route add dst-address=10.39.4.0/30 gateway=10.39.1.2
-/routing bgp connection add name=crc instance=default as=65000 remote.address=10.39.1.2 remote.as=65000 local.role=ibgp-rr
-/routing bgp connection add name=r4c instance=default as=65000 remote.address=10.39.4.2 remote.as=65000 local.role=ibgp-rr multihop=yes' >/dev/null
+/routing bgp connection add name=crc instance=default as=65000 remote.address=10.39.1.2 remote.as=65000 local.role=ibgp-rr local.address=10.39.1.1
+/routing bgp connection add name=r4c instance=default as=65000 remote.address=10.39.4.2 remote.as=65000 local.role=ibgp-rr multihop=yes local.address=10.39.1.1' >/dev/null
+  # Without local.address RouterOS 7.25 opened these from its loopback
+  # (10.255.39.1, seen in its log), which the CoreRouter has no route to here.
   crc 1 '{"name":"chrrr","remote_address":"10.39.1.1","remote_as":65000,"output_network":"bgp-out"}'
   vt cfr4 'configure terminal
 router bgp 65000
@@ -669,14 +688,21 @@ router bgp 65000
  address-family ipv4 unicast
   neighbor 10.39.1.1 activate' >/dev/null
   local ms j
-  ms=$(wait_for 60 cr_up 1 chrrr) && result rr-chr OK "CR1 as client of CHR (local.role=ibgp-rr there): Established in ${ms} ms" || result rr-chr FAIL "CR1 client: $(cr_state 1 chrrr)"
+  ms=$(wait_for 60 cr_up 1 chrrr) && result rr-chr OK "CR1 as client of CHR (local.role=ibgp-rr there): Established in ${ms} ms" || { result rr-chr FAIL "CR1 client: $(cr_state 1 chrrr) $(cr_sess 1 chrrr | jq -c '{reason, last_error}'); CHR: $(ros_sess crc | jq -c .) conns $(ros routing/bgp/connection | jq -c '[.[] | {name, "remote.address", "local.role", as, disabled}]')"
+    result rr-chr INFO "CR1 route get: $(ip -n cf1 route get 10.39.1.1 2>&1 | head -1); nht: $(vt cf1 'show ip nht' | tr '\n' ' ' | cut -c1-400)"
+    result rr-chr INFO "bgpd neighbor: $(vt cf1 'show bgp neighbors 10.39.1.1 json' | jq -c '.[] | {bgpState, lastResetDueTo, connectRetryTimer, hostLocal, nexthop, updateSource, ebgpMultihop: .externalBgpNbrMaxHopsAway}' 2>/dev/null)"
+    result rr-chr INFO "bgpd config: $(vt cf1 'show running-config' | grep -n '10.39.1.1' | tr '\n' ' ')"
+    dump; }
   ms=$(wait_for 60 bash -c "vtysh -N cfr4 -c 'show bgp ipv4 unicast 100.64.39.0/24 json' | jq -e '.paths[0]' >/dev/null") || true
   j=$(vt cfr4 'show bgp ipv4 unicast 100.64.39.0/24 json' | jq -c '.paths[0] | {originatorId, clusterList: .clusterList.list, nh: .nexthops[0].ip}' 2>/dev/null)
-  [[ $j == *'"originatorId":"10.255.39.2"'* && $j == *10.255.39.1* ]] \
-    && result rr-chr OK "CR1 → CHR (RR) → R4: 100.64.39.0/24 $j" || result rr-chr FAIL "R4 got $j"
+  # RFC 4456 §8: ORIGINATOR_ID is the BGP Identifier of the route's originator
+  # in the AS (CR1, 10.255.39.2); RouterOS 7.25 writes its own (10.255.39.1).
+  [[ $j == *'"clusterList":["10.255.39.1"]'* && $j == *'"nh":"10.39.1.2"'* ]] \
+    && result rr-chr OK "CR1 → CHR (RR) → R4: 100.64.39.0/24 reflected, next hop kept $j" || result rr-chr FAIL "R4 got $j"
+  [[ $j == *'"originatorId":"10.255.39.2"'* ]] || result rr-chr INFO "divergence: CHR's ORIGINATOR_ID is $(jq -r .originatorId <<< "$j"), not the originator CR1 (10.255.39.2); RFC 4456 §8 asks for the originator's BGP Identifier"
   ms=$(wait_for 30 bash -c "vtysh -N cf1 -c 'show bgp ipv4 unicast 192.0.2.0/24 json' | jq -e '.paths[0]' >/dev/null") || true
   j=$(vt cf1 'show bgp ipv4 unicast 192.0.2.0/24 json' | jq -c '.paths[0] | {originatorId, clusterList: .clusterList.list, nh: .nexthops[0].ip}' 2>/dev/null)
-  [[ $j == *'"originatorId":"10.255.39.4"'* ]] && result rr-chr OK "R4 → CHR (RR) → CR1: 192.0.2.0/24 $j" || result rr-chr FAIL "CR1 got $j"
+  [[ $j == *'"clusterList":["10.255.39.1"]'* && $j == *'"nh":"10.39.4.2"'* ]] && result rr-chr OK "R4 → CHR (RR) → CR1: 192.0.2.0/24 reflected $j" || result rr-chr FAIL "CR1 got $j"
   local why; why=$(cr1 routing.bgp.route.explain '{"prefix":"192.0.2.0/24"}' 2>/dev/null || true)
   sleep 1; why=$(cr1 routing.bgp.route.explain '{"prefix":"192.0.2.0/24"}' 2>/dev/null || true)
   result rr-chr INFO "route.explain: $(jq -c '{state, paths: [.paths[]? | {originator_id, cluster_list_len, best}]}' <<< "$why")"
@@ -785,30 +811,38 @@ case_convergence() {
     rosx "/routing bgp connection add name=l1 instance=default remote.address=10.39.1.2 remote.as=65000 local.role=ebgp output.network=bgp-out hold-time=9s $bfdr
 /routing bgp connection add name=l3 instance=default remote.address=10.39.3.2 remote.as=65000 local.role=ebgp output.network=bgp-out hold-time=9s $bfdr" >/dev/null
     wait_for 60 cr_up 1 l1 >/dev/null; wait_for 60 cr_up 1 l3 >/dev/null
-    local ms
-    ms=$(wait_for 30 ros_via 100.64.39.0/24 10.39.1.2) || true
-    wait_for 30 k_via cf1 203.0.113.0/24 10.39.1.1 >/dev/null || true
+    # Both links carry the routes; cut the one CHR uses (its tie-break picks
+    # either) and time each side on its own: the CHR's route to the other
+    # link and CR1's kernel route.
+    wait_for 30 ros_via_any 100.64.39.0/24 10.39.1.2 10.39.3.2 >/dev/null || true
+    wait_for 30 k_via_any cf1 203.0.113.0/24 10.39.1.1 10.39.3.1 >/dev/null || true
     [ $mode = bfd ] && sleep 3
-    if ! ros_via 100.64.39.0/24 10.39.1.2 || ! k_via cf1 203.0.113.0/24 10.39.1.1; then
-      result convergence FAIL "$mode: not on link 1 before the cut: CHR $(ros_gw 100.64.39.0/24), CR1 $(k_route cf1 203.0.113.0/24)"
-    else
-      local t0 a b
-      t0=$(now_ms)
-      case $mode in
-        linkdown) ip -n cf1 link set ether1 down ;;
-        *) ip link set cfv1 down ;;  # silent: both ports stay up
-      esac
-      a=$(wait_for 30 ros_via 100.64.39.0/24 10.39.3.2) || true
-      b=$(( $(now_ms) - t0 ))
-      wait_for 30 k_via cf1 203.0.113.0/24 10.39.3.1 >/dev/null || true
-      local c=$(( $(now_ms) - t0 ))
-      if [ "$a" != -1 ] && k_via cf1 203.0.113.0/24 10.39.3.1; then
-        result convergence OK "$mode cut of link 1: CHR on link 3 after ${b} ms, CR1's kernel after ≤ ${c} ms"
-      else
-        result convergence FAIL "$mode cut: CHR $(ros_gw 100.64.39.0/24), CR1 $(k_route cf1 203.0.113.0/24) after 30 s"
-      fi
-      case $mode in linkdown) ip -n cf1 link set ether1 up ;; *) ip link set cfv1 up ;; esac
+    local veth dev rgw kgw
+    if ros_via 100.64.39.0/24 10.39.1.2; then veth=cfv1 dev=ether1 rgw=10.39.3.2 kgw=10.39.3.1
+    else veth=cfv3 dev=ether5 rgw=10.39.1.2 kgw=10.39.1.1; fi
+    # CR1 must be on the same link for its cut to count.
+    if ! k_via cf1 203.0.113.0/24 "$([ $veth = cfv1 ] && echo 10.39.1.1 || echo 10.39.3.1)"; then
+      result convergence INFO "$mode: CHR uses $veth's link, CR1 $(k_route cf1 203.0.113.0/24): CR1's time is for a link it did not use"
     fi
+    local t0 a=-1 b=-1 now
+    t0=$(now_ms)
+    case $mode in
+      linkdown) ip -n cf1 link set $dev down ;;
+      *) ip link set $veth down ;;  # silent: both ports stay up
+    esac
+    while :; do
+      now=$(( $(now_ms) - t0 ))
+      [ $a = -1 ] && ros_via 100.64.39.0/24 $rgw && a=$now
+      [ $b = -1 ] && k_via cf1 203.0.113.0/24 $kgw && b=$now
+      { [ $a != -1 ] && [ $b != -1 ]; } || [ $now -gt 30000 ] && break
+      sleep 0.05
+    done
+    if [ $a != -1 ] && [ $b != -1 ]; then
+      result convergence OK "$mode cut of the link CHR used ($veth): CHR on the other link after ${a} ms, CR1's kernel after ${b} ms"
+    else
+      result convergence FAIL "$mode cut ($veth): CHR ${a} ms ($(ros_gw 100.64.39.0/24)), CR1 ${b} ms ($(k_route cf1 203.0.113.0/24)) in 30 s"
+    fi
+    case $mode in linkdown) ip -n cf1 link set $dev up ;; *) ip link set $veth up ;; esac
     crd 1 l1; crd 1 l3; rosd l1; rosd l3
     sleep 2
   done

@@ -147,6 +147,22 @@ corerouter-cli run routing.bgp.connection.add '{"name":"client1","remote_address
   5880/5882 (o BGP cai com o BFD), 2385 (MD5).
 - Como testar: `scripts/bgp-crcr-userns.sh` (no host, sem root nem VM: CoreRouter × CoreRouter e
   FRR) e `scripts/routeros-interop-bgp.sh` (na VM, contra o CHR).
+- Divergências do RouterOS 7.25 vistas no laboratório (quem está certo):
+  - IPv6 numa sessão IPv4 (`afi=ip,ipv6`): o CHR manda o next hop `::ffff:10.39.1.1`
+    (IPv4-mapeado). A RFC 2545 §3 pede um endereço IPv6 global; nenhum kernel instala o mapeado,
+    e o próprio RouterOS o trata como inalcançável. Errado o RouterOS. O CoreRouter manda global +
+    link-local e o CHR instala. A prévia da conexão avisa (`mpbgp-nexthop`); use uma segunda
+    conexão ao endereço IPv6 com `afi=ipv6`.
+  - Refletor: o CHR põe o próprio Router ID no ORIGINATOR_ID; a RFC 4456 §8 pede o do originador
+    do anúncio no AS. Errado o RouterOS; o CLUSTER_LIST e o next hop estão certos.
+  - `set bgp-path-prepend N`: no eBGP o CHR sai com o próprio AS N vezes no total; o CoreRouter
+    (FRR `set as-path prepend`) põe N além do que o eBGP já põe (N + 1). A documentação não diz
+    qual é o contrato; fica como G3.9fg.
+  - iBGP de rede própria: o CHR anuncia com o endereço da interface (10.39.1.1) quando a sessão
+    é entre loopbacks com `local.address`; a RFC 4271 §5.1.3 permite. Sem `local.address` ele
+    abre a sessão a partir do loopback.
+  - `input.limit-process-routes-ipv4`: para de processar sem mandar Cease; o `max_prefix` do
+    CoreRouter fecha com Cease 6/1 (RFC 4486), que o CHR registra.
 
 ### Ficou para depois
 

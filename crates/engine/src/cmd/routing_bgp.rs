@@ -814,6 +814,17 @@ fn preview(s: &mut Session, raw: &Value, what: What) -> Result<Value> {
             {
                 let local_as = routing.bgp.get(&c.instance).map(|i| i.asn);
                 describe(&eff, kind_of(local_as, &eff), &inherited(&c.params, &eff), &mut computed, &mut checks);
+                // G3.9f: RouterOS 7.25 sends IPv6 over an IPv4 session with an
+                // IPv4-mapped next hop (::ffff:a.b.c.d); RFC 2545 §3 asks for a
+                // global IPv6 address and no kernel installs the mapped one.
+                if c.remote_address.is_ipv4() && eff.families().contains(&Afi::Ipv6) {
+                    checks.push(check(
+                        "info",
+                        "mpbgp-nexthop",
+                        "IPv6 over an IPv4 session: the neighbor must send a global IPv6 next hop (RFC 2545 §3); RouterOS sends an IPv4-mapped one (::ffff:…) that is not installed, so use a second connection to its IPv6 address with afi=ipv6".to_owned(),
+                        "afi",
+                    ));
+                }
             }
         }
         What::Template => {
@@ -1126,6 +1137,21 @@ mod tests {
             .unwrap();
         assert_eq!(v["checks"][0]["param"], "remote_address");
         assert!(s.store().candidate().routing.bgp_connections.is_empty());
+    }
+
+    #[test]
+    fn the_preview_warns_of_ipv6_over_an_ipv4_session() {
+        let mut s = session();
+        let v = s
+            .execute("routing.bgp.connection.check", &json!({"name": "up1", "remote_address": "192.0.2.1", "remote_as": 64500, "afi": "ip,ipv6"}))
+            .unwrap();
+        assert!(v["checks"].to_string().contains("RFC 2545"), "{v}");
+        for (addr, afi) in [("192.0.2.1", "ip"), ("2001:db8::1", "ip,ipv6")] {
+            let v = s
+                .execute("routing.bgp.connection.check", &json!({"name": "up1", "remote_address": addr, "remote_as": 64500, "afi": afi}))
+                .unwrap();
+            assert!(!v["checks"].to_string().contains("RFC 2545"), "{addr} {afi}: {v}");
+        }
     }
 
     #[test]
