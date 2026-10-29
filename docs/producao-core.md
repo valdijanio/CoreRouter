@@ -193,6 +193,47 @@ cai e sugere Safe Mode). Como a configuração de partida já não atrai trânsi
 sub-rede de teste do ar. A volta (tirar o passivo, religar a VM) não abriu buraco no laboratório
 (< 0,1 s): o MikroTik só passa a usar o CoreRouter depois do Full.
 
+## Como atualizar a imagem (com volta automática)
+
+A imagem tem dois slots (A/B, G1.6b): a atualização é gravada no slot que **não** está em uso,
+conferida e bootada **uma vez em teste**. Se não se confirmar no prazo, o roteador volta sozinho ao
+slot anterior, com a configuração que tinha. O slot em uso nunca é escrito.
+
+1. **Antes:** confira o pacote sem gravar nada e veja o estado dos slots:
+
+   ```sh
+   corerouter-cli --connect tls://192.0.2.10:8729 --user admin upload corerouter.crpkg '{"check":true}'
+   corerouter-cli --connect tls://192.0.2.10:8729 --user admin run system.package.print
+   ```
+
+   `signature: ok` e `intact: true`; nenhum `trial` pendente; o outro slot em `standby` ou
+   `empty`. O pacote precisa ser assinado pela chave da imagem (a de produção, não a de
+   desenvolvimento de `os/out/keys`).
+2. **Saia do trânsito** se o roteador já for caminho de alguém (seção acima, "Como sair em
+   segundos"): o reboot leva ~1 s de kernel e alguns segundos de firmware.
+3. **Envie e instale** com confirmação **manual** e prazo curto, numa janela de manutenção:
+
+   ```sh
+   corerouter-cli --connect tls://192.0.2.10:8729 --user admin \
+     upload corerouter.crpkg '{"confirm":"manual","timeout":600}'
+   ```
+
+   O pacote vai pelo canal TLS, em blocos de 1 MiB, direto para o slot inativo (assinatura
+   conferida antes do primeiro byte; hashes e dm-verity antes de ativar). Na GUI: System ›
+   Packages › From this computer › **Upload and install…**. Um envio interrompido não muda
+   nada.
+4. **Depois do reboot**, ainda no prazo: confira OSPF (`/routing ospf neighbor print`), LDP, BFD
+   e os clientes de teste. Tudo certo: `run system.package.confirm` (ou **Confirm** na GUI).
+   Algo errado: não confirme — no fim do prazo o roteador reinicia no slot anterior; para voltar
+   já, reinicie a VM pelo hipervisor (`qm reboot <vmid>`): o teste já gastou o `BootNext` e o
+   firmware boota o slot anterior.
+5. **Voltar depois de confirmado:** `run system.package.downgrade` boota o outro slot (a versão
+   anterior) em teste, com a cópia da configuração que ele rodou por último.
+
+Sem acesso de rede ao roteador, o mesmo pacote vai num pendrive: `system.package.update
+{"path":"/dev/sdb"}` (G1.6b). O download direto de um canal por HTTPS, como o `/system package
+update` do RouterOS, ainda não existe (G1.6e, parte seguinte).
+
 ## Como ampliar depois
 
 1. Baixar o custo de um enlace por vez (65535 → o custo real), olhando `/routing ospf route print`

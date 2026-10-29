@@ -74,6 +74,8 @@ rustix = { version = "1.1.5", default-features = false, features = ["std", "proc
 
 [dev-dependencies]
 serde_json.workspace = true
+# package_upload.rs (G1.6e): chunks go base64 over the control channel.
+base64.workspace = true
 # service/https.rs: a local TLS server with a self-signed certificate.
 rcgen.workspace = true
 # benches/radius_aaa.rs (G4.3j).

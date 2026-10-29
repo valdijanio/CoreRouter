@@ -65,6 +65,40 @@ pub(crate) fn open(ctx: &Context, path: &str) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Bytes per upload chunk until the router says otherwise.
+pub(crate) const UPLOAD_CHUNK: usize = 1 << 20;
+
+/// A piece of a file the operator names (G1.6e: System › Packages sends a
+/// package of tens of MiB in chunks, never whole in memory): up to `len`
+/// bytes at `offset`, and the file's size.
+pub type ReadAt = Arc<dyn Fn(&str, u64, usize) -> Result<(Vec<u8>, u64), String> + Send + Sync>;
+
+fn read_at_key() -> Id {
+    Id::unique("corerouter-export-read-at")
+}
+
+/// The app's way of reading pieces of files (native: the local disk).
+pub fn install_read_at(ctx: &Context, read: ReadAt) {
+    ctx.data_mut(|d| d.insert_temp(read_at_key(), read));
+}
+
+/// Up to `len` bytes of `path` at `offset`, and its size; or why not (the
+/// browser has no reader).
+pub(crate) fn read_at(
+    ctx: &Context,
+    path: &str,
+    offset: u64,
+    len: usize,
+) -> Result<(Vec<u8>, u64), String> {
+    if path.trim().is_empty() {
+        return Err("type the file's path or drop the file on the window".into());
+    }
+    match ctx.data(|d| d.get_temp::<ReadAt>(read_at_key())) {
+        Some(f) => f(path, offset, len),
+        None => Err("files of this computer cannot be read here (browser): copy the package to the router, or use corerouter-cli upload".into()),
+    }
+}
+
 /// The saver of `ctx`, to call from a screenshot callback (another thread).
 pub(crate) fn saver(ctx: &Context) -> Option<SaveFile> {
     ctx.data(|d| d.get_temp::<SaveFile>(key()))

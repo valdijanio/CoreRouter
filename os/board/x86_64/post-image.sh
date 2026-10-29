@@ -13,5 +13,10 @@ export E2FSPROGS_FAKE_TIME="${SOURCE_DATE_EPOCH:?BR2_REPRODUCIBLE sets it}"
 export E2FSCK_TIME="$SOURCE_DATE_EPOCH"
 rm -rf "$BINARIES_DIR/efi-part"
 "${CR_SEAL_TOOL:?run through cargo xtask os build}" seal "$BINARIES_DIR"
+# G1.6e: `cargo xtask os build --only crpkg` wants only the update package
+# (the fast test cycle: build, `os push`, reboot): no disk.img nor ISO.
+if [ -n "${CR_ONLY_CRPKG:-}" ]; then
+	exit 0
+fi
 support/scripts/genimage.sh -c "$BR2_EXTERNAL_COREROUTER_PATH/board/x86_64/genimage.cfg"
 exec "$CR_SEAL_TOOL" installer "$BINARIES_DIR"
