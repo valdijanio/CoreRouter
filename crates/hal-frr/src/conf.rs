@@ -271,7 +271,10 @@ fn delete_late(line: &str) -> u8 {
         2
     } else if line == "capability opaque" {
         3
-    } else if line == "ip ospf bfd" || line == "ipv6 ospf6 bfd" {
+    } else if line == "ip ospf bfd"
+        || line == "ipv6 ospf6 bfd"
+        || (line.starts_with("neighbor ") && line.ends_with(" bfd"))
+    {
         // After its `… bfd profile P`, which it would take with it.
         1
     } else {
@@ -602,6 +605,26 @@ end
                 "interface ether2",
                 " no ip ospf area 0.0.0.0",
                 " no ip ospf cost 10",
+                "exit",
+            ]
+        );
+    }
+
+    /// G3.9f: `bgpd` 10.7.1 prints `neighbor X bfd` and `… bfd profile P`;
+    /// the same text on both sides is no change, and removing BFD takes the
+    /// profile line first (`no neighbor X bfd` takes the profile with it).
+    #[test]
+    fn bgp_bfd_is_two_lines_and_leaves_profile_first() {
+        let with = "router bgp 65000\n neighbor 192.0.2.1 remote-as 65001\n \
+                    neighbor 192.0.2.1 bfd\n neighbor 192.0.2.1 bfd profile fast\nexit\n";
+        let without = "router bgp 65000\n neighbor 192.0.2.1 remote-as 65001\nexit\n";
+        assert!(diff(&conf(with), &conf(with)).is_empty());
+        assert_eq!(
+            diff(&conf(with), &conf(without)),
+            [
+                "router bgp 65000",
+                " no neighbor 192.0.2.1 bfd profile fast",
+                " no neighbor 192.0.2.1 bfd",
                 "exit",
             ]
         );

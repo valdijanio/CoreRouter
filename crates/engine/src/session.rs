@@ -591,7 +591,9 @@ impl Session {
         // refuse, the data plane goes back too and the commit fails.
         if let Some(crate::routing_daemon::RoutingBackend(Some(daemon))) =
             self.ext.get_mut::<crate::routing_daemon::RoutingBackend>()
-            && (from.routing != to.routing || self.storage_status.boot_apply_error.is_some())
+            && (from.routing != to.routing
+                || corerouter_proto_bgp::networks_changed(from, to)
+                || self.storage_status.boot_apply_error.is_some())
             && let Err(e) = daemon.apply(from, to)
         {
             if let Err(back) = self.hal.apply(to, from) {
