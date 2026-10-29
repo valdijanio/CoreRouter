@@ -419,6 +419,27 @@ pub fn mem_used_kib(meminfo: &str) -> Option<u64> {
     field("MemTotal")?.checked_sub(field("MemAvailable")?)
 }
 
+/// `struct input_event` on a 64-bit kernel: a 16-byte `timeval`, then
+/// `type: u16`, `code: u16`, `value: i32`.
+pub const INPUT_EVENT_LEN: usize = 24;
+const EV_KEY: u16 = 0x01;
+const KEY_POWER: u16 = 116;
+
+/// The ACPI power button's input device (`/sys/class/input/eventN/device/
+/// name`: "Power Button", one for the fixed button and one for the PNP0C0C
+/// device). G1.6q: the hypervisor's "Shutdown" (`virsh shutdown`, Proxmox,
+/// a server's front button) presses it, and nothing listened.
+pub fn is_power_button(device_name: &str) -> bool {
+    device_name.trim() == "Power Button"
+}
+
+/// The power key pressed (not released, not autorepeat) in one event.
+pub fn power_key_pressed(ev: &[u8; INPUT_EVENT_LEN]) -> bool {
+    let u16_at = |i: usize| ev.get(i..i + 2).and_then(|b| b.try_into().ok()).map(u16::from_ne_bytes);
+    let value = ev.get(20..24).and_then(|b| b.try_into().ok()).map(i32::from_ne_bytes);
+    u16_at(16) == Some(EV_KEY) && u16_at(18) == Some(KEY_POWER) && value == Some(1)
+}
+
 /// What the daemon answers to a `ping` line on the control channel.
 pub fn is_pong(line: &str) -> bool {
     line.contains("\"pong\":true") || line.contains("\"pong\": true")
@@ -427,6 +448,26 @@ pub fn is_pong(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn input_event(kind: u16, code: u16, value: i32) -> [u8; INPUT_EVENT_LEN] {
+        let mut ev = [0u8; INPUT_EVENT_LEN];
+        ev[16..18].copy_from_slice(&kind.to_ne_bytes());
+        ev[18..20].copy_from_slice(&code.to_ne_bytes());
+        ev[20..24].copy_from_slice(&value.to_ne_bytes());
+        ev
+    }
+
+    #[test]
+    fn the_power_button_powers_off_on_press_only() {
+        assert!(is_power_button("Power Button\n"));
+        assert!(!is_power_button("Sleep Button"));
+        assert!(!is_power_button("AT Translated Set 2 keyboard"));
+        assert!(power_key_pressed(&input_event(EV_KEY, KEY_POWER, 1)));
+        assert!(!power_key_pressed(&input_event(EV_KEY, KEY_POWER, 0)), "release");
+        assert!(!power_key_pressed(&input_event(EV_KEY, KEY_POWER, 2)), "autorepeat");
+        assert!(!power_key_pressed(&input_event(0, 0, 0)), "EV_SYN");
+        assert!(!power_key_pressed(&input_event(EV_KEY, 30, 1)), "another key");
+    }
 
     #[test]
     fn cmdline_defaults_and_options() {

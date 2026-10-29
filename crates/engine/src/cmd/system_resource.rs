@@ -279,6 +279,28 @@ mod tests {
         assert_eq!(v[0]["name"], "accel-pppd");
     }
 
+    /// G1.6q: on the image a one-shot CLI/MCP call came back `[]` (the
+    /// service read without processes, nobody had asked yet), and later
+    /// calls got the list of the last time someone looked.
+    #[test]
+    fn a_one_shot_call_gets_the_processes_of_now() {
+        use corerouter_hal::system_resource::{LabSampler, ResourceSampler, Want};
+        let mut s = Session::virtual_lab();
+        let mut lab = LabSampler::new();
+        s.tick(1_800_000_000);
+        s.resource_ingest(lab.sample(Want { processes: false, now_ms: Some(0) }));
+        let v = s.execute("system.resource.process.print", &json!({})).unwrap();
+        assert!(!v.as_array().unwrap().is_empty(), "{v}");
+        // A list from an old reading is not served as the current one.
+        s.resource_ingest(lab.sample(Want { processes: true, now_ms: Some(1000) }));
+        s.tick(1_800_000_600);
+        s.resource_ingest(lab.sample(Want { processes: false, now_ms: Some(600_000) }));
+        s.execute("system.resource.process.print", &json!({})).unwrap();
+        let m = s.ext::<crate::system_resource::ResourceMonitor>().unwrap();
+        let (t, _) = m.procs_last.as_ref().unwrap();
+        assert_eq!(Some(*t), m.last.as_ref().map(|l| l.uptime_ms), "fresh list");
+    }
+
     #[test]
     fn bad_params_are_refused() {
         let mut s = Session::virtual_lab();
