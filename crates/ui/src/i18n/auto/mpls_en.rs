@@ -37,10 +37,29 @@ Show only the FECs without an outgoing label: where the LSP breaks."##),
     (r##"mpls.gtsm"##, r##"## What it is
 GTSM (RFC 6720): LDP packets of a directly connected neighbor must arrive with TTL 255, so a remote attacker cannot reach the session. Negotiated in the Hello; on by default. For IPv6 it is always on (RFC 7552 §9)."##),
     (r##"mpls.icmp_rate"##, r##"## What it is
-How many ICMP "time exceeded" errors for expired labeled packets this router sends per second at most (default 100). The rest are dropped and counted.
+How many ICMP errors about labeled packets (time exceeded and too big) this router sends per second at most, from all sources together (default 100). The rest are dropped and counted.
 
 ## Why
-A flood of packets with TTL 1 must not keep the control plane busy (RFC 1812 §4.3.2.8 asks routers to limit ICMP errors). Each error is at most about 200 bytes and goes only to the expired packet's source."##),
+A flood of packets with TTL 1 must not keep the control plane busy (RFC 1812 §4.3.2.8 asks routers to limit ICMP errors). Each error goes only to the source of the packet it is about. Each source also has its own, smaller limit (ICMP Rate Per Source)."##),
+    (r##"mpls.icmp_rate_per_source"##, r##"## What it is
+How many of those ICMP errors one source gets per second at most (default 10; a traceroute needs 3 per hop). Checked before the total limit.
+
+## Why
+Without it, one host flooding TTL 1 used up the whole ICMP Rate and everyone else's traceroute showed `*` at this hop. Linux does the same for its own errors (`icmp_ratelimit`, per destination).
+
+## Diagnosis
+`mpls.settings.get` shows `icmp_counters.rate_limited_source` (refused by this limit) apart from `rate_limited` (the total one)."##),
+    (r##"mpls.icmp_too_big"##, r##"## What it is
+When a labeled packet is larger than the MTU of the link its label leaves by, sends the ICMP "fragmentation needed" (IPv4 with DF) or ICMPv6 "packet too big" back to its source, with the MTU that fits: the link MTU minus the labels that would leave (RFC 3032 §3.4–3.5). IPv4 carries the label stack it arrived with (RFC 4950).
+
+## Why
+The Linux MPLS forwarder drops these packets without an error, so Path MTU Discovery through the LSP failed: the connection opens and stalls at the first full-size packet. Only routers in the middle of an LSP need this; where the packet is first labeled the IP layer already answers.
+
+## Not sent
+IPv4 without DF (RFC 3032 §3.4 lets the router drop it), small IPv6 fragments, errors about ICMP errors.
+
+## Diagnosis
+`mpls.settings.get` shows `icmp_counters.too_big` (heard) and `too_big_sent`; `reasons` says why the others got none ("fits the way out", "DF not set…")."##),
     (r##"mpls.icmp_ttl_exceeded"##, r##"## What it is
 When a labeled packet's TTL expires at this router, sends the ICMP "time exceeded" back to its source, with the label stack it arrived with (RFC 4950: traceroute shows `MPLS:L=…`).
 
@@ -51,7 +70,7 @@ The Linux MPLS forwarder drops these packets without an error, so a traceroute t
 With one label and an IP route to the source, by the IP table. With more labels (a VPN), along the LSP itself, as RFC 3032 §2.3.2 describes: the egress routes it back to the source.
 
 ## Diagnosis
-`mpls.settings.get` shows `icmp_counters`: expired packets heard, errors sent, dropped by the rate and by reason."##),
+`mpls.settings.get` shows `icmp_counters`: expired packets heard, errors sent, dropped by the rates and by reason."##),
     (r##"mpls.if"##, r##"## What it is
 LDP on one interface: link Hellos to 224.0.0.2 (IPv6 ff02::2) every hello interval, and the adjacencies they form (RFC 5036 §2.4.1)."##),
     (r##"mpls.if.adjacencies"##, r##"## What it is

@@ -24,9 +24,9 @@ use nix::sys::socket::{LinkAddr, MsgFlags, bind, recvfrom, send};
 use socket2::{Domain, Protocol, Socket, Type};
 
 use super::{
-    ETH_P_IP, ETH_P_IPV6, ETH_P_MPLS_UC, FrameSpec, IP4_FILTER, IP6_FILTER, MAX_FRAME, MPLS_FILTER,
-    RawFecRoute, build_frame, classify, ether_only, icmp_frame, parse_route, route_request,
-    sock_filter,
+    ETH_HEADER, ETH_P_IP, ETH_P_IPV6, ETH_P_MPLS_UC, FrameSpec, IP4_FILTER, IP6_FILTER, MAX_FRAME,
+    RawFecRoute, build_frame, classify, ether_only, icmp_frame, mpls_filter, parse_route,
+    route_request, sock_filter,
 };
 use crate::neigh::nlmsg_header;
 
@@ -530,6 +530,10 @@ pub struct HostView {
     locals: Vec<IpAddr>,
     fecs: RefCell<HashMap<IpNet, Cached>>,
     routes: RefCell<Option<Routes>>,
+    /// The longest MPLS frame payload every way out of the label table
+    /// takes (G3.9da): longer ones may be too big. `None`: no label
+    /// leaves by a link of known MTU.
+    way_out: Option<u32>,
 }
 
 impl HostView {
@@ -542,12 +546,14 @@ impl HostView {
             locals: Vec::new(),
             fecs: RefCell::new(HashMap::new()),
             routes: RefCell::new(Routes::open().ok()),
+            way_out: None,
         }
     }
 
     /// Read again what is older than a second.
     fn refresh(&mut self) {
-        if self.labels_at.is_none_or(|t| t.elapsed() >= FRESH) {
+        let labels_old = self.labels_at.is_none_or(|t| t.elapsed() >= FRESH);
+        if labels_old {
             self.labels_at = Some(Instant::now());
             if let Some(r) = self.reader.as_mut()
                 && crate::mpls::available()
@@ -559,9 +565,29 @@ impl HostView {
                 self.labels.clear();
             }
         }
-        if self.links.refresh() {
+        let links_changed = self.links.refresh();
+        if links_changed {
             self.links_changed();
         }
+        if labels_old || links_changed {
+            self.way_out = self.way_out();
+        }
+    }
+
+    /// The kernel's check (`mpls_forward`): the packet under the top
+    /// label must fit the link MTU minus the labels pushed, so the frame
+    /// payload (with the top label) may be the MTU − 4 × pushed + 4. The
+    /// smallest over the table: O(labels), once a second at most.
+    fn way_out(&self) -> Option<u32> {
+        self.labels
+            .values()
+            .flat_map(|r| r.nexthops.iter())
+            .filter_map(|nh| {
+                let mtu = u32::from(self.links.by_name.get(nh.interface.as_ref()?)?.mtu?);
+                let pushed = u32::try_from(nh.out_labels.len()).ok()?;
+                Some((mtu + 4).saturating_sub(4 * pushed))
+            })
+            .min()
     }
 
     /// Read the links now (the interfaces to listen on changed).
@@ -675,6 +701,10 @@ pub struct HostResponder {
     /// ICMP errors along an LSP: frames to the next hop's MAC.
     packet: HashMap<IfName, Socket>,
     neighbors: Neighbors,
+    /// Hear packets too big for their way out (G3.9da).
+    too_big: bool,
+    /// The frame length the MPLS tap's filter keeps above, as attached.
+    big: Option<u32>,
 }
 
 /// An `IPPROTO_RAW` socket: the packet carries its own IP header
@@ -728,7 +758,32 @@ impl HostResponder {
             raw6: None,
             packet: HashMap::new(),
             neighbors: Neighbors::default(),
+            too_big: false,
+            big: None,
         })
+    }
+
+    /// The MPLS tap's filter for what the view knows now (G3.9da): it
+    /// changes when a link MTU or the label table does, at most once a
+    /// second; replacing a filter is atomic for the socket.
+    fn sync_filter(&mut self) {
+        let want = if self.too_big {
+            self.view
+                .way_out
+                .map(|w| w.saturating_add(ETH_HEADER as u32))
+        } else {
+            None
+        };
+        let Some(mpls) = self.taps.as_ref().and_then(|t| t.socks.first()) else {
+            return;
+        };
+        if want != self.big
+            && mpls
+                .attach_filter(&sock_filter(&ether_only(&mpls_filter(want))))
+                .is_ok()
+        {
+            self.big = want;
+        }
     }
 
     fn send_ip(&mut self, icmp: &Icmp) -> Result<(), HalError> {
@@ -820,13 +875,15 @@ impl LspResponderIo for HostResponder {
             self.taps = None;
         } else if self.taps.is_none() {
             let socks: io::Result<Vec<Socket>> = [
-                (ETH_P_MPLS_UC, MPLS_FILTER),
+                // First: `sync_filter` replaces its program.
+                (ETH_P_MPLS_UC, super::MPLS_FILTER),
                 (ETH_P_IP, IP4_FILTER),
                 (ETH_P_IPV6, IP6_FILTER),
             ]
             .iter()
             .map(|(t, p)| tap(*t, p))
             .collect();
+            self.big = None;
             match socks {
                 Ok(socks) => self.taps = Some(Taps { socks }),
                 Err(e) => {
@@ -834,13 +891,24 @@ impl LspResponderIo for HostResponder {
                 }
             }
         }
+        self.sync_filter();
         failed
+    }
+
+    fn hear_too_big(&mut self, on: bool) {
+        self.too_big = on;
+        self.view.refresh();
+        self.sync_filter();
     }
 
     fn recv(&mut self, wait: Duration) -> Result<Option<Frame>, HalError> {
         if let Some(h) = self.queue.pop_front() {
             return Ok(Some(h));
         }
+        // Before the wait too: a frame the filter does not keep yet (a
+        // new label, an MTU changed) wakes nothing (G3.9da).
+        self.view.refresh();
+        self.sync_filter();
         let ms = u16::try_from(wait.as_millis().min(1000)).unwrap_or(1000);
         let mut fds: Vec<PollFd<'_>> = self
             .taps
@@ -855,6 +923,10 @@ impl LspResponderIo for HostResponder {
         drop(fds);
         self.drain_udp();
         self.view.refresh();
+        self.sync_filter();
+        let big = self
+            .big
+            .map(|b| b.saturating_sub(ETH_HEADER as u32) as usize);
         for s in self.taps.iter().flat_map(|t| t.socks.iter()) {
             for _ in 0..RECV_BUDGET {
                 let (n, from) = match recvfrom::<LinkAddr>(s.as_raw_fd(), &mut self.buf) {
@@ -868,7 +940,7 @@ impl LspResponderIo for HostResponder {
                 else {
                     continue;
                 };
-                if let Some(h) = self.buf.get(..n).and_then(|f| classify(f, name))
+                if let Some(h) = self.buf.get(..n).and_then(|f| classify(f, name, big))
                     && self.queue.len() < RECV_BUDGET * 4
                 {
                     self.queue.push_back(h);

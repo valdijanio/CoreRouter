@@ -1,11 +1,11 @@
-//! The MPLS echo responder (G3.5b) and the ICMP errors for expired labeled
-//! packets (G3.9d) as the daemon's service sees them: what to do (on or
+//! The MPLS echo responder (G3.5b) and the ICMP errors for expired (G3.9d)
+//! and too big (G3.9da) labeled packets as the daemon's service sees them: what to do (on or
 //! off, the rates, the interfaces) from the running config, and the
 //! counters, kept in the session for `mpls.settings.get`.
 //!
 //! The service itself (thread, token buckets, packet I/O) lives in the
 //! daemon; the answers come from `corerouter_hal::lsp::respond` and
-//! `corerouter_hal::lsp::expired`.
+//! `corerouter_hal::lsp::expired` and `corerouter_hal::lsp::too_big`.
 
 use std::collections::BTreeMap;
 
@@ -28,8 +28,12 @@ pub struct Plan {
     pub rate: u32,
     /// Send ICMP time exceeded for expired labeled packets.
     pub icmp: bool,
-    /// Those errors per second.
+    /// Send ICMP fragmentation needed / packet too big (G3.9da).
+    pub too_big: bool,
+    /// ICMP errors per second, all sources.
     pub icmp_rate: u32,
+    /// ICMP errors per second to one source.
+    pub icmp_rate_per_source: u32,
     /// Interfaces that take labeled packets (requests arrive there,
     /// labeled or popped by the penultimate hop).
     pub interfaces: Vec<IfName>,
@@ -46,13 +50,16 @@ pub fn plan(s: &Session) -> Plan {
         .filter(|n| m.input_on(n))
         .cloned()
         .collect();
-    let (echo, icmp) = (m.settings.lsp_ping_responder, m.settings.icmp_ttl_exceeded);
+    let st = &m.settings;
+    let (echo, icmp, too_big) = (st.lsp_ping_responder, st.icmp_ttl_exceeded, st.icmp_too_big);
     Plan {
-        enabled: (echo || icmp) && !interfaces.is_empty(),
+        enabled: (echo || icmp || too_big) && !interfaces.is_empty(),
         echo,
-        rate: m.settings.lsp_ping_rate.max(1),
+        rate: st.lsp_ping_rate.max(1),
         icmp,
-        icmp_rate: m.settings.icmp_rate.max(1),
+        too_big,
+        icmp_rate: st.icmp_rate.max(1),
+        icmp_rate_per_source: st.icmp_rate_per_source.max(1),
         interfaces,
     }
 }
@@ -78,7 +85,8 @@ pub struct Counters {
     pub error: Option<String>,
     /// Interfaces it could not listen on, and why.
     pub failed: Vec<(IfName, String)>,
-    /// ICMP time exceeded for expired labeled packets (G3.9d).
+    /// ICMP errors for expired (G3.9d) and too big (G3.9da) labeled
+    /// packets.
     pub icmp: IcmpCounters,
 }
 
@@ -87,9 +95,16 @@ pub struct Counters {
 pub struct IcmpCounters {
     /// Expired labeled packets heard (before the rate limit).
     pub expired: u64,
+    /// Labeled packets heard that may be too big (G3.9da).
+    pub too_big: u64,
+    /// Errors sent, both kinds.
     pub sent: u64,
+    /// Of those, fragmentation needed / packet too big.
+    pub too_big_sent: u64,
     /// Over `icmp_rate`: no error sent.
     pub rate_limited: u64,
+    /// Over `icmp_rate_per_source` (G3.9da): no error sent.
+    pub rate_limited_source: u64,
     /// No error by the rules (about an ICMP error, a fragment, no way
     /// back…) or a send that failed; why, with how many.
     pub dropped: u64,
@@ -157,8 +172,11 @@ pub fn icmp_json(s: &Session) -> Value {
         .collect();
     json!({
         "expired": i.expired,
+        "too_big": i.too_big,
         "sent": i.sent,
+        "too_big_sent": i.too_big_sent,
         "rate_limited": i.rate_limited,
+        "rate_limited_source": i.rate_limited_source,
         "dropped": i.dropped,
         "reasons": reasons,
         "error": i.error,

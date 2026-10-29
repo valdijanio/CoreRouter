@@ -152,7 +152,9 @@ const MPLS_SETTINGS: &[(&str, &str, &str, Option<&str>)] = &[
     ("lsp_ping_responder", "LSP Ping Responder", "mpls.lsp_ping_responder", None),
     ("lsp_ping_rate", "LSP Ping Rate", "mpls.lsp_ping_rate", Some("100 replies/s")),
     ("icmp_ttl_exceeded", "ICMP TTL Exceeded", "mpls.icmp_ttl_exceeded", None),
+    ("icmp_too_big", "ICMP Too Big", "mpls.icmp_too_big", None),
     ("icmp_rate", "ICMP Rate", "mpls.icmp_rate", Some("100 errors/s")),
+    ("icmp_rate_per_source", "ICMP Rate Per Source", "mpls.icmp_rate_per_source", Some("10 errors/s")),
 ];
 
 #[derive(Default)]
@@ -644,7 +646,7 @@ pub(crate) fn settings_steps(f: &BTreeMap<&'static str, String>, has: bool) -> V
                 set.insert((*p).into(), json!(v == "yes"));
             }
             (_, _) if v.is_empty() => {}
-            ("payload_mtu" | "lsp_ping_rate" | "icmp_rate", _) => {
+            ("payload_mtu" | "lsp_ping_rate" | "icmp_rate" | "icmp_rate_per_source", _) => {
                 set.insert((*p).into(), v.parse::<u64>().map_or_else(|_| json!(v), |n| json!(n)));
             }
             _ => {
