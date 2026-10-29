@@ -1,0 +1,100 @@
+# G0.30 — CI noturno: a camada lenta com mais casos. Todos os testes (inclusive os `slow_…`),
+# com `PROPTEST_CASES=4096` (o lote usa os casos de cada teste, de 32 a 3000; o portão local, 32),
+# e os testes em namespace. Falhou: abre (ou comenta) a issue "CI noturno quebrado", como o
+# `main-red`; verde de novo: fecha. A regressão gravada de cada proptest (`proptest-regressions/`)
+# roda antes dos casos novos em toda camada, com qualquer `PROPTEST_CASES`.
+# Actions fixadas por SHA; o comentário diz a versão.
+
+name: nightly
+
+on:
+  schedule:
+    # 06:17 UTC (03:17 em Brasília), fora do horário das sessões.
+    - cron: "17 6 * * *"
+  # Rodar à mão (Actions → nightly → Run workflow).
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  test:
+    name: test (${{ matrix.part }}/${{ strategy.job-total }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3, 4]
+    env:
+      COREROUTER_CI_PARTITION: ${{ matrix.part }}/${{ strategy.job-total }}
+      COREROUTER_TEST_LAYER: full
+      PROPTEST_CASES: "4096"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup
+        with:
+          nextest: "true"
+      - run: cargo xtask ci --only test
+
+  netns:
+    name: netns
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup
+        with:
+          kernel: "true"
+      - run: cargo xtask ci --only netns
+
+  alert:
+    name: issue
+    needs: [test, netns]
+    if: always() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RESULTS: ${{ toJSON(needs) }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      SHA: ${{ github.sha }}
+    steps:
+      - name: Abrir, comentar ou fechar a issue "CI noturno quebrado"
+        run: |
+          set -euo pipefail
+          label="noturno-quebrado"
+          gh label create "$label" --color D93F0B \
+            --description "O CI noturno (camada lenta) falhou" 2>/dev/null || true
+          open=$(gh issue list --label "$label" --state open --json number --jq '.[0].number // empty')
+          failed=$(echo "$RESULTS" | jq -r 'to_entries[] | select(.value.result != "success") | "\(.key): \(.value.result)"')
+          short=${SHA:0:7}
+          if [ -n "$failed" ]; then
+            body="O CI noturno falhou no commit \`${short}\` da \`main\`:
+
+          ${failed}
+
+          Log: ${RUN_URL}
+
+          A camada lenta (testes \`slow_…\`, proptest com 4096 casos, namespaces) não roda no portão local nem no PR. Reproduzir: \`PROPTEST_CASES=4096 COREROUTER_TEST_LAYER=full cargo xtask ci --only test\`. Uma falha de proptest grava a semente em \`proptest-regressions/\`: faça commit dela com a correção (ela passa a rodar em toda camada)."
+            if [ -n "$open" ]; then
+              gh issue comment "$open" --body "$body"
+            else
+              gh issue create --title "CI noturno quebrado" --label "$label" --body "$body"
+            fi
+          elif [ -n "$open" ]; then
+            gh issue close "$open" --comment "O CI noturno voltou a ficar verde no commit \`${short}\` (${RUN_URL})."
+          fi

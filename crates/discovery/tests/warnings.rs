@@ -85,8 +85,11 @@ fn run(transport: Transport, id: u8) {
     drop(agent);
 }
 
+/// Slow layer (G0.30, `slow_`): the agent announces on real sockets every
+/// second (the shortest interval) and the test listens for several
+/// intervals, twice: ~9 s of waiting.
 #[test]
-fn config_only_addresses_warn_never_in_the_lab_and_once_on_linux() {
+fn slow_config_only_addresses_warn_never_in_the_lab_and_once_on_linux() {
     log::set_logger(&LOGGER).unwrap();
     log::set_max_level(log::LevelFilter::Warn);
 

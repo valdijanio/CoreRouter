@@ -145,8 +145,9 @@ fn servers() -> Vec<(SocketAddr, TestServer)> {
     out
 }
 
+/// Slow layer (G0.30, `slow_`): 100 000 requests, ~10 s in a dev build.
 #[test]
-fn hundred_thousand_requests_with_loss_and_failover() {
+fn slow_hundred_thousand_requests_with_loss_and_failover() {
     let srv = servers();
     let addrs: Vec<SocketAddr> = srv.iter().map(|(a, _)| *a).collect();
     let mut net = Net::new(srv, 99);

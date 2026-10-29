@@ -1355,8 +1355,9 @@ fn wave_with<A: WaveAaa + 'static>(aaa: Arc<A>, n: usize, rate: serde_json::Valu
     (None, t, r)
 }
 
+/// Slow layer (G0.30, `slow_`): 6000 CPEs on the lab clock, ~13 s in a dev build.
 #[test]
-fn mass_reconnect_against_a_slow_radius() {
+fn slow_mass_reconnect_against_a_slow_radius() {
     // 6000 CPEs after a power cut, a 300/s RADIUS shared by
     // authentication and accounting; the logins go first (the accounting
     // waits behind them), ~20 s for all.

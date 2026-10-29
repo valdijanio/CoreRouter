@@ -10,6 +10,7 @@ mod layers;
 mod os;
 mod oui;
 mod package;
+mod regressions;
 mod slots;
 mod slowest;
 mod vm_lab;
@@ -67,6 +68,10 @@ const CI: &[Step] = &[
 /// Left out of `cargo xtask ci --fast`.
 const SLOW: &[&str] = &["bench-check", "netns", "xdp-root"];
 
+/// G0.30: left out of `cargo xtask ci --affected` (the slow layer; the
+/// merge queue's batch runs them), unless `--only` names them.
+const QUICK_LEAVES_OUT: &[&str] = &["netns", "xdp-root"];
+
 /// G0.29: steps that compile; a run with one of them takes a machine slot
 /// (`slots`).
 const HEAVY: &[&str] = &[
@@ -86,6 +91,62 @@ static SCOPE: OnceLock<Vec<affected::Package>> = OnceLock::new();
 /// G0.30: the slowest tests of this run's `test` step, printed after the
 /// summary (and so at the end of every CI log).
 static SLOWEST: OnceLock<String> = OnceLock::new();
+
+/// G0.30: which tests the `test` step runs (`TestLayer::from_env`).
+static LAYER: OnceLock<TestLayer> = OnceLock::new();
+
+/// G0.30: the test layers. `Quick` is the gate of a PR and of a session
+/// (`--fast`, `--affected`): without the tests named `slow_…` (scale,
+/// long fuzz, real waits; `.config/nextest.toml`) and with
+/// `PROPTEST_CASES=32`. `Full` runs everything with each property test's
+/// own case count: the merge queue's batch and the main. The nightly CI
+/// is `Full` with `PROPTEST_CASES` raised (`.github/workflows/nightly.yml`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestLayer {
+    Quick,
+    Full,
+}
+
+/// Property-test cases in the quick layer: proptest's 256 (or a test's
+/// own count) are for the batch; a session's gate checks the shape.
+const QUICK_PROPTEST_CASES: &str = "32";
+
+impl TestLayer {
+    /// `COREROUTER_TEST_LAYER=quick|full` when set (the GitHub PR job sets
+    /// `quick`), else `Quick` for the fast gates and `Full` for the rest.
+    fn from_env(fast_gate: bool) -> Result<Self, String> {
+        Self::parse(
+            std::env::var("COREROUTER_TEST_LAYER").ok().as_deref(),
+            fast_gate,
+        )
+    }
+
+    fn parse(var: Option<&str>, fast_gate: bool) -> Result<Self, String> {
+        match var.map(str::trim) {
+            None | Some("") => Ok(Self::default_for(fast_gate)),
+            Some("quick") => Ok(Self::Quick),
+            Some("full") => Ok(Self::Full),
+            Some(other) => {
+                let shown: String = other.chars().take(20).collect();
+                Err(format!(
+                    "COREROUTER_TEST_LAYER: expected quick or full, got '{shown}'"
+                ))
+            }
+        }
+    }
+
+    fn default_for(fast_gate: bool) -> Self {
+        if fast_gate { Self::Quick } else { Self::Full }
+    }
+
+    /// The nextest profile (`.config/nextest.toml`).
+    fn profile(self) -> &'static str {
+        match self {
+            Self::Quick => "quick",
+            Self::Full => "default",
+        }
+    }
+}
 
 /// `--workspace`, or `-p` for each package of the `--affected` scope that
 /// `keep` accepts. `None` when the scope has none of them (skip the step).
@@ -137,8 +198,16 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
+            let layer = match TestLayer::from_env(args.affected || args.fast) {
+                Ok(l) => l,
+                Err(why) => {
+                    eprintln!("FAIL {why}");
+                    return ExitCode::from(2);
+                }
+            };
+            let _ = LAYER.set(layer);
             let steps = if args.affected {
-                match affected_steps(&root, &args.base, args.steps) {
+                match affected_steps(&root, &args.base, args.steps, args.only) {
                     Ok(s) => s,
                     Err(why) => {
                         eprintln!("FAIL --affected: {why}");
@@ -324,6 +393,10 @@ struct CiArgs {
     base: String,
     /// `false` with `--no-wait`: no waiting for a slot or for disk.
     wait: bool,
+    /// `--fast` was asked.
+    fast: bool,
+    /// `--only` was asked (the steps are the ones named).
+    only: bool,
 }
 
 fn ci_args(args: &[String]) -> Result<CiArgs, String> {
@@ -333,6 +406,8 @@ fn ci_args(args: &[String]) -> Result<CiArgs, String> {
         affected: false,
         base: "origin/main".into(),
         wait: true,
+        fast: false,
+        only: false,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -343,7 +418,11 @@ fn ci_args(args: &[String]) -> Result<CiArgs, String> {
                 out.base = it.next().ok_or("--base needs a git ref")?.clone();
                 out.affected = true;
             }
-            other => rest.push(other.to_owned()),
+            other => {
+                out.fast |= other == "--fast";
+                out.only |= other == "--only" || other.starts_with("--only=");
+                rest.push(other.to_owned());
+            }
         }
     }
     out.steps = ci_steps(&rest)?;
@@ -351,12 +430,22 @@ fn ci_args(args: &[String]) -> Result<CiArgs, String> {
 }
 
 /// `--affected`: of `steps`, those the diff since `base` needs, with the
-/// cargo steps limited to the affected packages (`SCOPE`).
+/// cargo steps limited to the affected packages (`SCOPE`). G0.30: without
+/// `netns` (the slow layer: the batch runs it) unless `--only` names it.
 fn affected_steps(
     root: &Path,
     base: &str,
     steps: Vec<&'static Step>,
+    only: bool,
 ) -> Result<Vec<&'static Step>, String> {
+    let steps: Vec<&'static Step> = if only {
+        steps
+    } else {
+        steps
+            .into_iter()
+            .filter(|(n, _)| !QUICK_LEAVES_OUT.contains(n))
+            .collect()
+    };
     let files = affected::changed_files(root, base)?;
     let out = cargo()
         .args(["metadata", "--no-deps", "--format-version", "1"])
@@ -603,31 +692,59 @@ fn test(root: &Path) -> Outcome {
     let Some(pkgs) = package_args(|_| true) else {
         return Outcome::Skip("no package in scope".into());
     };
+    let orphans = regressions::orphans(root);
+    if !orphans.is_empty() {
+        return Outcome::Fail(format!(
+            "proptest regressions no test reads any more (moved or renamed test file? move \
+             them next to its new path): {}",
+            orphans.join(", ")
+        ));
+    }
+    let layer = LAYER.get().copied().unwrap_or(TestLayer::Full);
+    eprintln!(
+        "test layer: {}",
+        match layer {
+            TestLayer::Quick => format!(
+                "quick (no slow_ tests, PROPTEST_CASES={}; the batch runs them all)",
+                quick_proptest_cases()
+            ),
+            TestLayer::Full => "full".into(),
+        }
+    );
     if !nextest_available(root) {
         if !first {
             return Outcome::Skip("no cargo-nextest to split the tests: part 1 runs them".into());
         }
         let mut c = cargo();
         c.arg("test").args(&pkgs).arg("--quiet");
+        if layer == TestLayer::Quick {
+            c.env("PROPTEST_CASES", quick_proptest_cases());
+            c.args(["--", "--skip", "::slow_"]);
+        }
         return run(c, root);
     }
     let mut c = cargo();
-    c.args(["nextest", "run"]).args(&pkgs).args([
-        "--cargo-quiet",
-        "--status-level",
-        "fail",
-        "--final-status-level",
-        "slow",
-        // A test that fails and then passes is reported FLAKY and does not
-        // fail the run (it gets fixed without stopping the merge queue).
-        "--retries",
-        "1",
-    ]);
+    if layer == TestLayer::Quick {
+        c.env("PROPTEST_CASES", quick_proptest_cases());
+    }
+    c.args(["nextest", "run", "--profile", layer.profile()])
+        .args(&pkgs)
+        .args([
+            "--cargo-quiet",
+            "--status-level",
+            "fail",
+            "--final-status-level",
+            "slow",
+            // A test that fails and then passes is reported FLAKY and does not
+            // fail the run (it gets fixed without stopping the merge queue).
+            "--retries",
+            "1",
+        ]);
     if let Some((i, n)) = part {
         c.args(["--partition", &format!("hash:{i}/{n}")]);
     }
     // G0.30: the JUnit report of this run only (none left from an earlier one).
-    let junit = slowest::junit_path(root, "default");
+    let junit = slowest::junit_path(root, layer.profile());
     let _ = std::fs::remove_file(&junit);
     let outcome = run(c, root);
     if let Ok(xml) = std::fs::read_to_string(&junit) {
@@ -643,6 +760,15 @@ fn test(root: &Path) -> Outcome {
         }
         other => other,
     }
+}
+
+/// `PROPTEST_CASES` of the quick layer: the caller's when set (a session
+/// can ask for more), else `QUICK_PROPTEST_CASES`.
+fn quick_proptest_cases() -> String {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| QUICK_PROPTEST_CASES.to_owned())
 }
 
 /// `COREROUTER_CI_PARTITION=i/n` (1 ≤ i ≤ n ≤ 16): this CI job runs part i
@@ -1111,6 +1237,23 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn the_fast_gates_take_the_quick_layer() {
+        assert_eq!(TestLayer::parse(None, true), Ok(TestLayer::Quick));
+        assert_eq!(TestLayer::parse(None, false), Ok(TestLayer::Full));
+        assert_eq!(TestLayer::parse(Some(" "), true), Ok(TestLayer::Quick));
+        assert_eq!(TestLayer::parse(Some("full"), true), Ok(TestLayer::Full));
+        assert_eq!(TestLayer::parse(Some("quick"), false), Ok(TestLayer::Quick));
+        assert!(TestLayer::parse(Some("slow"), false).is_err());
+        assert_eq!(TestLayer::Quick.profile(), "quick");
+        assert_eq!(TestLayer::Full.profile(), "default");
+        let args: Vec<String> = ["--affected", "--fast"].map(String::from).into();
+        let a = ci_args(&args).unwrap();
+        assert!(a.affected && a.fast && !a.only);
+        let a = ci_args(&["--only=netns".to_owned()]).unwrap();
+        assert!(a.only && !a.fast);
     }
 
     #[test]

@@ -254,7 +254,29 @@ fn boot_flaky(storage: &Flaky) -> Session {
 /// flight, never anything else; and the commits after carry on.
 #[test]
 fn a_power_cut_at_any_step_loses_at_most_the_commit_in_flight() {
-    for commits in [5usize, 1023, 1024, 1025] {
+    power_cut_at_any_step(&[5]);
+}
+
+/// The same around the checkpoint (the 1024th journal line). Slow layer
+/// (G0.30, `slow_`): ~10 s each in a dev build, one test per count so they
+/// run side by side.
+#[test]
+fn slow_a_power_cut_one_commit_before_the_checkpoint() {
+    power_cut_at_any_step(&[1023]);
+}
+
+#[test]
+fn slow_a_power_cut_at_the_checkpoint() {
+    power_cut_at_any_step(&[1024]);
+}
+
+#[test]
+fn slow_a_power_cut_one_commit_after_the_checkpoint() {
+    power_cut_at_any_step(&[1025]);
+}
+
+fn power_cut_at_any_step(counts: &[usize]) {
+    for &commits in counts {
         for step in ["revision", "append", "slot", "rewrite", "remove"] {
             let storage = Flaky::default();
             let mut s = boot_flaky(&storage);
@@ -290,7 +312,18 @@ fn a_power_cut_at_any_step_loses_at_most_the_commit_in_flight() {
 /// and the journal give the newest revision.
 #[test]
 fn the_previous_slot_and_the_journal_give_the_newest() {
-    for commits in [1u32, 2, 3, 40, 1030, 2100] {
+    previous_slot_and_journal(&[1, 2, 3, 40]);
+}
+
+/// The same past one and two checkpoints. Slow layer (G0.30, `slow_`):
+/// ~12 s in a dev build.
+#[test]
+fn slow_the_previous_slot_and_the_journal_give_the_newest_past_checkpoints() {
+    previous_slot_and_journal(&[1030, 2100]);
+}
+
+fn previous_slot_and_journal(counts: &[u32]) {
+    for &commits in counts {
         let storage = MemoryStorage::default();
         let mut s = boot(&storage);
         for i in 0..commits {
