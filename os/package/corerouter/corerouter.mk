@@ -16,7 +16,8 @@ COREROUTER_LICENSE_FILES = LICENSE
 COREROUTER_CARGO ?= cargo
 # Outside $(@D) and outside O=: the `corerouter-dirclean` of every build and
 # a clean Buildroot build both keep the Rust cache (cold: 154 s of a 447 s
-# clean build, measured; warm: seconds).
+# clean build, measured; warm: seconds). `cargo xtask os build` passes
+# <out>/cargo-target (xtask/src/os/out.rs); this default is for a bare make.
 COREROUTER_CARGO_TARGET_DIR ?= $(BR2_EXTERNAL_COREROUTER_PATH)/out/cargo-target
 COREROUTER_TRIPLE = x86_64-unknown-linux-gnu
 COREROUTER_OUT = $(COREROUTER_CARGO_TARGET_DIR)/$(COREROUTER_TRIPLE)/release
@@ -40,7 +41,7 @@ define COREROUTER_BUILD_CMDS
 endef
 
 # G1.6o: the browser GUI (`cargo xtask os build` makes it with trunk into
-# os/out/web and passes COREROUTER_WEB_DIR); ip.service www-ssl serves it.
+# <out>/web and passes COREROUTER_WEB_DIR); ip.service www-ssl serves it.
 COREROUTER_WEB_DIR ?=
 
 define COREROUTER_INSTALL_TARGET_CMDS
