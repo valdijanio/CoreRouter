@@ -36,4 +36,4 @@ pub mod shadow;
 pub mod validate;
 
 pub use nft::{TABLE, render, script};
-pub use validate::{rule_issues, validate};
+pub use validate::{rule_issues, table_issues, validate};

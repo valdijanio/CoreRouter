@@ -99,9 +99,10 @@ fn field<T>(a: &Option<T>, b: &Option<T>, covers: impl Fn(&T, &T) -> bool) -> bo
     }
 }
 
-fn family_covers(a: &FirewallRule, b: &FirewallRule) -> bool {
-    match (family(a), family(b)) {
-        (Ok(fa), Ok(fb)) => fa == Family::Both || fa == fb,
+/// The family of each rule, `None` when its matchers contradict.
+fn family_covers(a: Option<Family>, b: Option<Family>) -> bool {
+    match (a, b) {
+        (Some(fa), Some(fb)) => fa == Family::Both || fa == fb,
         _ => false,
     }
 }
@@ -130,9 +131,18 @@ fn iface_covers(
 
 /// Whether every packet `b` matches, `a` matches too.
 pub fn covers(cfg: &Config, a: &FirewallRule, b: &FirewallRule) -> bool {
+    covers_as(cfg, (a, family(a).ok()), (b, family(b).ok()))
+}
+
+/// [`covers`] with the family of each rule already worked out.
+fn covers_as(
+    cfg: &Config,
+    (a, fa): (&FirewallRule, Option<Family>),
+    (b, fb): (&FirewallRule, Option<Family>),
+) -> bool {
     let (ma, mb) = (&a.matchers, &b.matchers);
     ma.limit.is_none()
-        && family_covers(a, b)
+        && family_covers(fa, fb)
         && field(&ma.src_address, &mb.src_address, addr_covers)
         && field(&ma.dst_address, &mb.dst_address, addr_covers)
         && field(&ma.src_address_list, &mb.src_address_list, eq_covers)
@@ -175,23 +185,28 @@ pub fn covers(cfg: &Config, a: &FirewallRule, b: &FirewallRule) -> bool {
 /// blamed.
 pub fn shadowed(cfg: &Config, table: Table) -> BTreeMap<ItemId, ItemId> {
     let rules = cfg.ip.firewall.rules(table);
-    let live: Vec<&FirewallRule> = rules.iter().filter(|r| !r.disabled && !r.section).collect();
     let mut out = BTreeMap::new();
     let mut budget = MAX_COMPARISONS;
-    for (i, b) in live.iter().enumerate() {
-        let earlier = live.iter().take(i);
-        for a in earlier {
-            if a.chain != b.chain || !decides(&a.action) {
-                continue;
-            }
+    // The earlier deciding rules of each chain, with their family: the
+    // same comparisons in the same order as against every earlier rule,
+    // without walking the other chains' rules nor working the family out
+    // again for each pair (G0.31: 10 000 rules in 50 chains, 115 ms).
+    let mut deciding: BTreeMap<&str, Vec<(&FirewallRule, Option<Family>)>> = BTreeMap::new();
+    for b in rules.iter().filter(|r| !r.disabled && !r.section) {
+        let fb = family(b).ok();
+        let earlier = deciding.entry(b.chain.as_str()).or_default();
+        for &(a, fa) in earlier.iter() {
             if budget == 0 {
                 return out;
             }
             budget -= 1;
-            if covers(cfg, a, b) {
+            if covers_as(cfg, (a, fa), (b, fb)) {
                 out.insert(b.id, a.id);
                 break;
             }
+        }
+        if decides(&b.action) {
+            earlier.push((b, fb));
         }
     }
     out

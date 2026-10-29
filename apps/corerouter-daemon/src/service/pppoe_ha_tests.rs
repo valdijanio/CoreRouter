@@ -414,3 +414,25 @@ fn a_frame_of_a_session_not_adopted_yet_adopts_it_on_the_spot() {
     assert_eq!(lab.backend().active().len(), n);
     lab.bng.check().unwrap();
 }
+
+/// G4.3hk: a node answers only when the `ppp-ha` loop and the service's
+/// own config agree; for the second after `ppp.redundancy.set` where they
+/// do not, it keeps quiet (a standby answered from its own MAC before).
+#[test]
+fn a_node_answers_only_when_the_pair_and_its_config_agree() {
+    use super::pppoe_bng::may_answer;
+    // (configured, paired, active) → answers
+    let table = [
+        ((false, false, false), true),  // no pair anywhere: as always
+        ((false, false, true), true),
+        ((false, true, false), false), // the pair is up, the config not yet: quiet
+        ((false, true, true), false),  // even active: its MAC is not the virtual one yet
+        ((true, false, false), false), // the config has it, the loop not yet
+        ((true, false, true), true),
+        ((true, true, false), false), // standby
+        ((true, true, true), true),   // active
+    ];
+    for ((configured, paired, active), answers) in table {
+        assert_eq!(may_answer(configured, paired, active), answers, "{configured} {paired} {active}");
+    }
+}

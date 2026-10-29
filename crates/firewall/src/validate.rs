@@ -150,6 +150,25 @@ pub fn rule_issues(cfg: &Config, table: Table, r: &FirewallRule) -> Vec<(&'stati
     issues_in(cfg, table, r, &roots)
 }
 
+/// [`rule_issues`] of every rule of `table` in `cfg`, in table order. The
+/// jumps and each chain's roots are worked out once for the table: per
+/// rule, a listing of 10 000 rules built the graph 10 000 times (G0.31).
+pub fn table_issues(cfg: &Config, table: Table) -> Vec<Vec<(&'static str, String)>> {
+    let rules = cfg.ip.firewall.rules(table);
+    let edges = graph::edges(rules);
+    let mut roots: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    rules
+        .iter()
+        .map(|r| {
+            let chain = r.chain.as_str();
+            let reach = roots
+                .entry(chain)
+                .or_insert_with(|| graph::roots_in(table, &edges, chain));
+            issues_in(cfg, table, r, reach)
+        })
+        .collect()
+}
+
 /// [`rule_issues`] with the built-in chains that reach `r`'s chain known.
 fn issues_in(
     cfg: &Config,

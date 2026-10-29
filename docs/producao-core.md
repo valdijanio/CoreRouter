@@ -144,6 +144,10 @@ Equivalências, item por item:
 - [ ] BFD listado na `/routing bfd configuration` do MikroTik para a porta.
 - [ ] Só a loopback e a sub-rede de teste nos templates do CoreRouter; nenhum `redistribute`.
 - [ ] Console da VM aberto (noVNC/serial) para sair mesmo sem rede.
+- [ ] Imagem de VM (qcow2/OVA) reiniciada uma vez depois do primeiro boot: o primeiro sobe pelo
+  caminho de fallback da UEFI, **sem dm-verity**, e cria as entradas "CoreRouter A/B"; do segundo
+  em diante a raiz é conferida. Confira em System › Packages (`system.package.print`: o slot
+  `running` com `"verity": true`). O "Shutdown" do hipervisor desliga limpo (G1.6q).
 - [ ] Um cliente de teste pronto para pingar através do CoreRouter.
 
 ## Como entrar

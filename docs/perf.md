@@ -2344,3 +2344,83 @@ bandwidth de 2 s cada caíram para centésimos; o da GUI, de 8,6 s, saiu da list
 Custo das dependências otimizadas numa pasta de build nova (`cargo nextest run --workspace
 --no-run`, `CARGO_INCREMENTAL=0`): 53,5 s → 56,5 s de parede, +167 s de CPU uma vez; cada
 rodada dos testes economiza ~185 s de CPU.
+
+### G0.31 — `config.diff` e `state.inspect` com config grande (**medido**, 2026-10-29, AMD Ryzen AI MAX+ 395, 32 CPUs, release, máquina compartilhada, load ~20)
+
+`cargo bench -p corerouter-engine --bench lock_hold`; antes = `store.rs` da `origin/main`
+(7ecd3365), mesma config: 1000 VLANs, 10 000 regras de filtro, 100 000 entradas de
+address-list, 60 000 rotas estáticas. Cada número é tempo com o lock do `Session`.
+
+| Benchmark | Antes | Depois |
+|---|---|---|
+| `lock_hold/state.inspect` (nada pendente) | 1,51 s | 4,43 µs |
+| `lock_hold/config.diff` (nada pendente) | 1,42 s | 2,06 µs |
+| `lock_hold/config.diff/pending_identity` (modo transacional, identidade mudada) | 1,45 s | 23,1 µs |
+| `lock_hold/state.inspect/pending_identity` | 1,56 s | 24,0 µs |
+| `lock_hold/config.diff/pending_route` (uma rota pendente; resto na G0.31a) | 1,35 s | 523 ms |
+
+Varredura de todas as 218 consultas que aceitam `{}`, mesma config (depois deste PR; frio =
+primeira chamada, quente = melhor de três):
+
+| Consulta | Frio | Quente | Resposta |
+|---|---|---|---|
+| `ip.route.list` | 226 ms | 367 ms | 40,7 MB |
+| `ip.firewall.filter.list` | 312 ms | 322 ms | 4,0 MB |
+| `ip.firewall.address-list.list` | 45 ms | 116 ms | 14,1 MB |
+| `ip.firewall.preview` | 93 ms | 82 ms | 7,1 MB |
+| `config.drift.list` | 12 ms | 13 ms | 111 kB |
+| `ip.route.page` | 4,0 ms | 2,4 ms | 337 kB |
+| `system.metrics` | 1,5 ms | 1,9 ms | 239 kB |
+| `interface.list` (1000 VLANs) | 1,1 ms | 1,3 ms | 283 kB |
+| as outras 210 | < 1 ms | | |
+
+### G0.31 — encaminhador DNS: threads de leitura UDP (**medido**, 2026-10-29, AMD Ryzen AI MAX+ 395, 32 CPUs, release, máquina compartilhada)
+
+Daemon release (`--backend virtual`) num namespace sem root (`unshare --user --map-root-user
+--net`). `ip.dns.set allow_remote_requests=yes allowed_from=127.0.0.0/8
+max_queries_per_client=0` e 100 entradas `ip.dns.static`, consultadas ao acaso. Carga: 16
+processos com 32 consultas UDP em voo cada, por 6 s. CPU por thread lida de `/proc/<pid>/task`.
+Antes = 1 leitor por socket.
+
+| Leitores por socket | Respostas/s | p50 | p99 | CPU das `dns-udp` |
+|---|---|---|---|---|
+| 1 (antes) | 336 mil | 480 µs | 626 µs | 103 % (um núcleo cheio) |
+| 2 | 577 mil | 273 µs | 415 µs | 206 % |
+| 4 (padrão com ≥ 8 núcleos) | 964 mil | 167 µs | 229 µs | 414 % |
+| 8 (fora do padrão, para comparar) | 1,29 milhão | 132 µs | 179 µs | 814 % |
+
+Com 8 leitores o gerador de carga (Python, 16 processos) já é o limite. O padrão para em 4 para
+deixar núcleos para o BNG, o DHCP e o plano de controle; os cache misses continuam ganhando uma
+thread cada, até `max_concurrent_queries`.
+
+### G0.31 — `ip.firewall.filter.list` com 10 000 regras (**medido**, 2026-10-29, AMD Ryzen AI MAX+ 395, 32 CPUs, release, máquina compartilhada)
+
+`cargo bench -p corerouter-engine --bench lock_hold -- filter.list`; mesma config grande do
+`lock_hold` (10 000 regras de filtro em 50 chains, 100 000 entradas de address-list, 60 000
+rotas, 1000 VLANs). Antes = `origin/main` 7ecd3365 + o PR do `config.diff`.
+
+| Medida | Antes | Depois |
+|---|---|---|
+| `lock_hold/ip.firewall.filter.list` | 372 ms | 38,1 ms |
+| parte: `rule_issues` de cada regra × `table_issues` | ~150 ms | 0,5 ms |
+| parte: `shadowed` | ~115 ms | 7,5 ms |
+
+O resto (~30 ms) é linear: montar o JSON de 4 MB (resumo, descrição em português, matchers).
+
+### Imagem instalada (G1.6q)
+
+**Medido** em 2026-10-29, AMD Ryzen AI Max+ 395, KVM, 2 vCPUs, 2 GiB, imagem release (cópia
+local da de 28/10 e a desta branch), com outras sessões compilando na máquina.
+
+| O quê | Número |
+|---|---|
+| GUI ociosa (janela Interfaces), bytes do daemon para a GUI | 294 KiB/s antes → **8 KiB/s** (60 s, mesmo daemon virtual) |
+| `engine.list` (catálogo inteiro) | 309 KB por pedido |
+| Botão de energia ACPI → QEMU fora | nada em 64 s antes → **0,41 s** |
+| Reset forçado → TLS respondendo / kernel → daemon pronto | 3,7 s / 1,25 s |
+| Boot a frio (QEMU → TLS) | 2,78 s |
+| Atualização A/B (52 MiB): envio / volta / confirmada | 0,3 s / 7,5–10,5 s / 17,0–17,5 s |
+| Rollback drill (slot que não boota) → de volta | < 20 s |
+| Consultas pela gerência, 1 conexão | 2 405/s, p50 0,38 ms, p99 0,96 ms |
+| Consultas pela gerência, 4 conexões | 4 712/s, p50 0,77 ms, p99 2,08 ms (daemon ~1,2 vCPU) |
+| Daemon ocioso / FRR ocioso (RSS, VM real) | 52,8 MiB, 61 threads / 103,3 MiB em 10 processos |
