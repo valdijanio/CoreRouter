@@ -6,6 +6,11 @@
 # Cases (default: all, in this order): wire vlan qinq mtu lldp arp tools dhcp
 #   dhcp-client dhcp-relay dhcp6 dhcp6-client ra ntp dns nat cgnat bond
 #   cr-dhcp cr-bond storm dns-qps
+# NO_CHR=1 BIN=<release dir>: no CHR, only the CoreRouter × CoreRouter
+# cases (cr-dhcp cr-bond storm dns-qps), e.g. on a host without root in a
+# disposable namespace: unshare --user --map-root-user --net --mount --
+# sh -c 'mount -t tmpfs none /run && mkdir /run/netns && W=<dir> NO_CHR=1
+# BIN=<dir> scripts/routeros-interop-l2.sh'.
 # HOLD=<s> keeps the lab up that long at the end. Results: a table at the
 # end and /tmp/crg39h/results.txt in the VM; exit 1 if any case failed.
 #
@@ -31,8 +36,9 @@ exec 9>&-
 ROS_VERSION=${ROS_VERSION:-7.25}
 ROS_SHA256=${ROS_SHA256:-6b981288350de2a2c7a3218bd820ab702633b8cd6cd339f2bb34dda1f1a2550e}
 CASES=("$@")
+[ ${#CASES[@]} -gt 0 ] || [ -z "${NO_CHR:-}" ] || CASES=(cr-dhcp cr-bond storm dns-qps)
 [ ${#CASES[@]} -gt 0 ] || CASES=(wire vlan qinq mtu lldp arp tools dhcp dhcp-client dhcp-relay dhcp6 dhcp6-client ra ntp dns nat cgnat bond cr-dhcp cr-bond storm dns-qps)
-W=/tmp/crg39h
+W=${W:-/tmp/crg39h}
 CHR_DIR=/srv/lab/chr
 PW=g39h-lab-only
 ROS=192.168.239.2
@@ -46,6 +52,10 @@ result() { # result <case> <OK|FAIL|INFO> <text>
 }
 
 # --- tools and image -------------------------------------------------------
+if [ -n "${NO_CHR:-}" ]; then
+  for t in tcpdump iperf3 jq; do command -v $t >/dev/null || { echo "NO_CHR: $t missing"; exit 1; }; done
+  bin=${BIN:?NO_CHR needs BIN=<dir with corerouter-daemon and corerouter-cli>}
+else
 need=()
 for t in qemu-system-x86_64:qemu-system-x86 traceroute:traceroute tcpdump:tcpdump iperf3:iperf3 jq:jq; do
   command -v "${t%%:*}" >/dev/null || need+=("${t#*:}")
@@ -64,6 +74,7 @@ fi
 
 cargo build -q --release -p corerouter-daemon -p corerouter-cli
 bin="$(realpath "${CARGO_TARGET_DIR:-target}")/release"
+fi
 
 # --- teardown ---------------------------------------------------------------
 NSS="crcore crpeer crcl"
@@ -114,6 +125,7 @@ veth crcore ether6 crpeer ether2
 veth crcore ether7 crpeer ether3
 veth crcore ether8 crcl cl0
 
+if [ -z "${NO_CHR:-}" ]; then
 cp "$img" "$W/chr.img"
 qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -name chr-g39h \
   -drive file="$W/chr.img",format=raw,if=virtio \
@@ -194,6 +206,7 @@ python3 -I "$W/console.py" "$W/chr.sock" "$PW" <<'ROS'
 /ip service set www disabled=no
 ROS
 for _ in $(seq 100); do curl -sf -m 2 -u "admin:$PW" "http://$ROS/rest/system/resource" >/dev/null && break; sleep 0.2; done
+fi
 
 # ros <path>: GET. rosp <path> <json>: POST (a command). rosx <script>:
 # RouterOS CLI lines. rosput <expr>: the value of a :put.
@@ -283,12 +296,14 @@ cpu_report() {
 }
 
 # --- base addressing --------------------------------------------------------
+if [ -z "${NO_CHR:-}" ]; then
 rosx '/interface bridge add name=lo0
 /ip address add address=10.255.39.1/32 interface=lo0
 /ip address add address=10.39.1.1/29 interface=ether1
 /ip neighbor discovery-settings set discover-interface-list=all protocol=lldp,mndp,cdp' >/dev/null
 cli ip.address.add '{"address":"10.39.1.2/29","interface":"ether1"}' >/dev/null
 cli ip.route.add '{"dst_address":"10.255.39.1/32","gateway":"10.39.1.1"}' >/dev/null
+fi
 cli ip.address.add '{"address":"10.39.5.1/30","interface":"ether5"}' >/dev/null
 clib ip.address.add '{"address":"10.39.5.2/30","interface":"ether1"}' >/dev/null
 cli ip.address.add '{"address":"10.40.0.1/16","interface":"ether8"}' >/dev/null
@@ -818,10 +833,15 @@ case_cr-dhcp() {
   local ms
   ms=$(wait_for 30 crb_bound v50) && result cr-dhcp OK "B bound from A over VLAN 50 in ${ms} ms: $(clib ip.dhcp-client.list '{"interface":"v50"}' | jq -c '.[0] | {address, gateway, primary_dns, domain}')" \
     || result cr-dhcp FAIL "B client: $(clib ip.dhcp-client.list '{"interface":"v50"}' | jq -c '.[0] | {status, error}')"
+  # RouterOS `/ip dhcp-client release`: "release current binding and
+  # restart DHCP client", so B binds again right after the RELEASE.
   clib ip.dhcp-client.release "{\"id\":\"$id\"}" >/dev/null || true
-  sleep 1
-  [[ $(cli ip.dhcp-server.lease.print '{"server":"d50"}' | jq -c '[.[] | .status]') != *bound* ]] && result cr-dhcp OK "B's release frees the lease on A" || result cr-dhcp FAIL "release between CoreRouters"
+  local rel; rel=$(wait_for 5 a_logged 'released by the client') || true
+  local again; again=$(wait_for 15 crb_bound v50) || true
+  [ "${rel:--1}" != -1 ] && [ "${again:--1}" != -1 ] && result cr-dhcp OK "B's release reaches A (lease freed) and B binds again, as RouterOS does" \
+    || result cr-dhcp FAIL "release between CoreRouters: A saw the release: $([ "${rel:--1}" != -1 ] && echo yes || echo no), B bound again: $([ "${again:--1}" != -1 ] && echo yes || echo no)"
 }
+a_logged() { cli log.print '{"limit":50}' | grep -q "$1"; }
 crb_bound() { [ "$(clib ip.dhcp-client.list "{\"interface\":\"$1\"}" | jq -r '.[0].status')" = bound ]; }
 
 case_cr-bond() {
@@ -848,6 +868,19 @@ case_cr-bond() {
   local p=$!; sleep 3; ip -n crpeer link set ether2 down; ip -n crpeer link set ether3 down; ip -n crpeer link set ether3 up; sleep 6; ip -n crpeer link set ether2 up; wait $p || true
   local tx rx; tx=$(grep -oE '^[0-9]+ packets transmitted' "$W/crbond.txt" | cut -d' ' -f1); rx=$(grep -oE '[0-9]+ received' "$W/crbond.txt" | cut -d' ' -f1)
   result cr-bond INFO "member cut on B (veth carrier goes down on A too): $(( (${tx:-0} - ${rx:-0}) * 10 )) ms lost"
+  # Silent cut: B's ether2 drops every frame but keeps its carrier, so only
+  # the LACP timeout tells (802.1AX: 3 × the 1 s fast period).
+  ms=$(wait_for 30 crlacp) || true
+  ip netns exec crcore ping -q -i 0.01 -W 1 -w 12 10.39.70.2 > "$W/crbond2.txt" 2>&1 &
+  p=$!; sleep 2
+  ip netns exec crpeer tc qdisc add dev ether2 clsact
+  ip netns exec crpeer tc filter add dev ether2 ingress matchall action drop
+  ip netns exec crpeer tc filter add dev ether2 egress matchall action drop
+  wait $p || true
+  tx=$(grep -oE '^[0-9]+ packets transmitted' "$W/crbond2.txt" | cut -d' ' -f1); rx=$(grep -oE '[0-9]+ received' "$W/crbond2.txt" | cut -d' ' -f1)
+  local left; left=$(ip netns exec crcore awk '/Slave Interface/ {i=$3} /Aggregator ID/ && i {a[i]=$3} END {for (k in a) printf "%s=%s ", k, a[k]}' /proc/net/bonding/bond2)
+  result cr-bond INFO "silent member cut on B (carrier up, frames dropped): $(( (${tx:-0} - ${rx:-0}) * 10 )) ms lost to the LACP timeout; aggregators after: $left"
+  ip netns exec crpeer tc qdisc del dev ether2 clsact 2>/dev/null || true
 }
 crlacp() { [ "$(ip netns exec crcore awk '/Aggregator ID/ {print $3}' /proc/net/bonding/bond2 2>/dev/null | sort -u | wc -l)" = 1 ] &&
   ! ip netns exec crcore grep -q 'Partner Mac Address: 00:00:00:00:00:00' /proc/net/bonding/bond2; }
@@ -856,8 +889,7 @@ crlacp() { [ "$(ip netns exec crcore awk '/Aggregator ID/ {print $3}' /proc/net/
 case_storm() {
   # N clients with their own MACs (BNG Blaster IPoE, DHCPv4 only) against
   # A's server on ether8: leases per second and CPU per daemon thread.
-  local n=${STORM_N:-4000} rate=${STORM_RATE:-2000}
-  command -v bngblaster >/dev/null || { result storm INFO "no bngblaster in the VM (cargo xtask vm-lab tools)"; return; }
+  local n=${STORM_N:-20000} rate=${STORM_RATE:-10000}
   cli ip.pool.add '{"name":"p40","ranges":"10.40.1.0-10.40.254.255"}' >/dev/null
   cli ip.dhcp-server.add '{"name":"d40","interface":"ether8","address_pool":"p40","lease_time":"30m","conflict_detection":false,"client_rate_limit":0}' >/dev/null || { result storm FAIL "server on ether8"; return; }
   cli ip.dhcp-server.network.add '{"address":"10.40.0.0/16","gateway":"10.40.0.1","dns_server":"10.40.0.1"}' >/dev/null
@@ -870,6 +902,7 @@ case_storm() {
  "dhcp": {"enable": true, "timeout": 5, "retry": 10},
  "dhcpv6": {"enable": false}}
 EOF
+  if ! command -v bngblaster >/dev/null; then storm_py "$n" "$rate"; return; fi
   snapshot "$W/cpu0"
   local t0; t0=$(now_ms)
   ip netns exec crcl timeout 120 bngblaster -C "$W/storm.json" -J "$W/storm-report.json" -S "$W/storm.sock" -l dhcp > "$W/storm.log" 2>&1 &
@@ -892,10 +925,90 @@ EOF
   ip -n crcl addr add 10.40.255.254/16 dev cl0 2>/dev/null || true
 }
 
+# storm_py <n> <rate>: without BNG Blaster, n DHCP clients from one raw
+# socket on cl0 (own MAC each, broadcast flag so the replies reach the
+# socket): DISCOVER at <rate>/s, REQUEST on each OFFER, ACKs counted.
+storm_py() {
+  cat > "$W/storm.py" <<'PY2'
+import os, random, socket, struct, sys, time
+n, rate = int(sys.argv[1]), int(sys.argv[2])
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800))
+s.bind(("cl0", 0)); s.setblocking(False)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 24)
+def csum(b):
+    if len(b) % 2: b += b"\0"
+    t = sum(struct.unpack("!%dH" % (len(b) // 2), b)); t = (t >> 16) + (t & 0xffff); t += t >> 16
+    return ~t & 0xffff
+def frame(mac, xid, opts):
+    bootp = struct.pack("!BBBBIHHIIII", 1, 1, 6, 0, xid, 0, 0x8000, 0, 0, 0, 0) + mac + b"\0" * 10 + b"\0" * 192
+    bootp += b"\x63\x82\x53\x63" + opts + b"\xff"
+    udp = struct.pack("!HHHH", 68, 67, 8 + len(bootp), 0) + bootp
+    ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(udp), 0, 0, 64, 17, 0, b"\0" * 4, b"\xff" * 4)
+    ip = ip[:10] + struct.pack("!H", csum(ip)) + ip[12:]
+    return b"\xff" * 6 + mac + b"\x08\x00" + ip + udp
+macs = [b"\x02\x39" + struct.pack("!I", i + 1) for i in range(n)]
+by_xid = {}
+acked = set(); offers = naks = 0
+t0 = time.time(); sent = 0; last_retry = t0; t99 = 0
+def recv():
+    global offers, naks
+    while True:
+        try: f = s.recv(2048)
+        except BlockingIOError: return
+        if len(f) < 282 or f[23] != 17 or f[36:38] != b"\x00\x44": continue
+        b = f[42:]
+        if b[0] != 2: continue
+        xid = struct.unpack("!I", b[4:8])[0]; i = by_xid.get(xid)
+        if i is None: continue
+        yi = b[16:20]; o = b[240:]; mt = sid = None; k = 0
+        while k < len(o) and o[k] != 255:
+            if o[k] == 0: k += 1; continue
+            c, l = o[k], o[k + 1]; v = o[k + 2:k + 2 + l]; k += 2 + l
+            if c == 53: mt = v[0]
+            elif c == 54: sid = v
+        if mt == 2 and sid:
+            offers += 1
+            s.send(frame(macs[i], xid, b"\x35\x01\x03\x32\x04" + yi + b"\x36\x04" + sid))
+        elif mt == 5: acked.add(i)
+        elif mt == 6: naks += 1
+while len(acked) < n and time.time() - t0 < 90:
+    due = min(n, int((time.time() - t0) * rate) + 1)
+    while sent < due:
+        xid = random.getrandbits(32); by_xid[xid] = sent
+        s.send(frame(macs[sent], xid, b"\x35\x01\x01")); sent += 1
+    recv()
+    if not t99 and len(acked) * 100 >= n * 99: t99 = time.time() - t0
+    if sent == n and time.time() - last_retry > 1:
+        last_retry = time.time()
+        for i in range(n):
+            if i not in acked:
+                xid = random.getrandbits(32); by_xid[xid] = i
+                s.send(frame(macs[i], xid, b"\x35\x01\x01"))
+    time.sleep(0.0005)
+dt = time.time() - t0
+print(len(acked), n, int(dt * 1000), offers, naks, int(t99 * 1000), int(n / rate * 1000))
+PY2
+  ip link set dev lo up 2>/dev/null || true
+  snapshot "$W/cpu0"
+  local out; out=$(ip netns exec crcl python3 -I "$W/storm.py" "$1" "$2" 2>&1 | tail -1)
+  snapshot "$W/cpu1"
+  local acked n ms offers naks t99 tsend; read -r acked n ms offers naks t99 tsend <<< "$out"
+  if [ "${acked:-0}" = "$1" ] && [ "${ms:-0}" -gt 0 ] && [ "${t99:-0}" -gt 0 ]; then
+    result storm OK "$1 clients: 99% bound in $t99 ms ($(( $1 * 990 / t99 )) leases/s), all in $ms ms; DISCOVERs sent over $tsend ms (Python generator, $2/s); $offers offers, $naks NAKs"
+  else
+    result storm FAIL "storm: ${out:0:200}"
+  fi
+  result storm INFO "server: $(cli ip.dhcp-server.statistics.print | jq -c '{leases, received, sent, peak_acks, latency_us}' | cut -c1-300)"
+  result storm INFO "CPU per daemon thread over the storm: $(cpu_report "$W/cpu0" "$W/cpu1" "$(awk -v d="${ms:-1000}" 'BEGIN {print d / 1000}')")"
+  ip -n crcl addr add 10.40.255.254/16 dev cl0 2>/dev/null || true
+}
+
 case_dns-qps() {
   # A loop of queries from the clients' namespace: answered per second by
   # A's resolver for a static name and for a cached forwarded one.
-  cli ip.dns.set '{"allow_remote_requests":true,"allowed_from":["10.39.0.0/16","192.168.0.0/16","10.40.0.0/16"],"max_queries_per_client":0,"servers":["10.39.5.2"]}' >/dev/null
+  local err
+  err=$(cli ip.dns.set '{"allow_remote_requests":true,"allowed_from":["10.39.0.0/16","192.168.0.0/16","10.40.0.0/16"],"max_queries_per_client":0,"servers":["10.39.5.2"]}' 2>&1) || { result dns-qps FAIL "ip.dns.set: ${err:0:200}"; return; }
+  wait_for 15 grep -q 'answering the LAN' "$W/daemon-a.log" >/dev/null || { result dns-qps FAIL "A's LAN forwarder did not open: $(grep -i 'dns' "$W/daemon-a.log" | tail -3 | paste -sd';' | cut -c1-300)"; return; }
   cli ip.dns.static.add '{"name":"qps.lab","address":"10.40.0.1"}' >/dev/null 2>&1 || true
   clib ip.dns.set '{"allow_remote_requests":true,"allowed_from":["10.39.0.0/16"]}' >/dev/null
   clib ip.dns.static.add '{"name":"fwd.lab","address":"10.39.5.2"}' >/dev/null 2>&1 || true
@@ -905,12 +1018,15 @@ server, name, secs, window = sys.argv[1], sys.argv[2], float(sys.argv[3]), int(s
 qn = b"".join(bytes([len(p)]) + p.encode() for p in name.split(".")) + b"\0"
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.setblocking(False)
 s.connect((server, 53))
-sent = got = 0; qid = 0; out = 0
+sent = got = 0; qid = 0; out = 0; err = 0
 end = time.time() + secs
 while time.time() < end:
     while out < window:
         qid = (qid + 1) & 0xffff
-        s.send(struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0) + qn + struct.pack(">HH", 1, 1)); sent += 1; out += 1
+        try:
+            s.send(struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0) + qn + struct.pack(">HH", 1, 1)); sent += 1; out += 1
+        except OSError as e:  # ICMP unreachable from an earlier query
+            err = e.errno; break
     r, _, _ = select.select([s], [], [], 0.05)
     if not r:
         out = 0  # lost: refill the window
@@ -920,20 +1036,26 @@ while time.time() < end:
             s.recv(512); got += 1; out -= 1
     except BlockingIOError:
         pass
-print(sent, got)
+    except OSError as e:
+        err = e.errno; out = 0
+print(sent, got, err)
 PY
   local name procs
   for name in qps.lab fwd.lab; do
     ip netns exec crcl python3 -I "$W/qps.py" 10.40.0.1 "$name" 1 8 >/dev/null 2>&1 || true
-    for procs in 1 4; do
+    for procs in 1 4 8; do
       snapshot "$W/q0"
       local i tot=0
       local qp=()
       for i in $(seq $procs); do ip netns exec crcl python3 -I "$W/qps.py" 10.40.0.1 "$name" 5 32 > "$W/qps.$i" 2>&1 & qp+=($!); done
       wait "${qp[@]}" || true
       snapshot "$W/q1"
-      for i in $(seq $procs); do tot=$(( tot + $(awk '{print $2}' "$W/qps.$i" 2>/dev/null || echo 0) )); done
-      result dns-qps INFO "$name, $procs client(s) × 32 in flight: $(( tot / 5 )) answers/s; CPU: $(cpu_report "$W/q0" "$W/q1" 5)"
+      local errs=""
+      for i in $(seq $procs); do
+        tot=$(( tot + $(awk 'NR == 1 {n = $2} END {print (n ~ /^[0-9]+$/ ? n : 0)}' "$W/qps.$i") ))
+        errs+=$(awk 'NR == 1 && $3 != 0 {printf " errno %s", $3}' "$W/qps.$i")
+      done
+      result dns-qps INFO "$name, $procs client(s) × 32 in flight: $(( tot / 5 )) answers/s${errs:+ (socket errors:$errs)}; CPU: $(cpu_report "$W/q0" "$W/q1" 5)"
     done
   done
   result dns-qps INFO "A statistics: $(cli ip.dns.statistics.print | jq -c . | cut -c1-300)"

@@ -10,8 +10,10 @@
 //! - "dns-server": every second, copies the running config into the
 //!   forwarder when it changed, and opens or closes the sockets as
 //!   `allow_remote_requests` says.
-//! - one UDP thread per family: reads a query and runs the chain up to the
-//!   cache; a cache hit is answered at once. A miss gets a thread of its
+//! - `udp_threads()` UDP threads per family, all reading the same socket
+//!   (G3.9h: one thread answered ~400k queries/s at 100% of a core, and
+//!   more clients got nothing more): each reads a query and runs the chain
+//!   up to the cache; a cache hit is answered at once. A miss gets a thread of its
 //!   own, at most `max_concurrent_queries` of them (more: SERVFAIL), so
 //!   one slow upstream never holds the cache hits back.
 //! - one TCP thread per family; a thread per connection, at most
@@ -61,6 +63,16 @@ const TICK: Duration = if cfg!(test) {
 };
 /// How often the socket threads look at the stop signal.
 const POLL: Duration = Duration::from_millis(250);
+
+/// Readers per UDP socket: one per core, at most `MAX_UDP_THREADS`.
+/// Measured (G3.9h, 32-core host, cached and static names, one source):
+/// 1 reader 376k answers/s at 100% CPU, 4 readers 1.12M at 400%, 8
+/// readers 1.33M at 760% (they wait on each other past 4).
+const MAX_UDP_THREADS: usize = 4;
+
+fn udp_threads() -> usize {
+    thread::available_parallelism().map_or(1, |n| n.get().min(MAX_UDP_THREADS))
+}
 /// RFC 7766 §6.2.3: idle TCP connections are closed (a few seconds).
 const TCP_IDLE: Duration = Duration::from_secs(10);
 /// A message, from its first byte to its last (a peer sending one byte
@@ -512,11 +524,14 @@ fn open(
         opened.push((udp, tcp, addr));
     }
     let at = opened.iter().map(|(_, _, a)| *a).collect();
+    let readers = udp_threads();
     for (udp, tcp, _) in opened {
-        let s = srv.clone();
-        health
-            .spawn("dns-udp", move || udp_loop(s, udp, epoch))
-            .map_err(|e| e.to_string())?;
+        for _ in 0..readers {
+            let (s, udp) = (srv.clone(), udp.clone());
+            health
+                .spawn("dns-udp", move || udp_loop(s, udp, epoch))
+                .map_err(|e| e.to_string())?;
+        }
         let s = srv.clone();
         health
             .spawn("dns-tcp-accept", move || tcp_loop(s, tcp, epoch))
@@ -1164,6 +1179,43 @@ mod tests {
         let srv = spawn(session.clone(), Arc::new(RouterDns::new()), port, shutdown.clone()).unwrap();
         wait("the listener", || udp(port, &query("nas.lan.", RecordType::A)).is_some());
         (session, srv, port, shutdown)
+    }
+
+    /// G3.9h: several readers share one UDP socket. Clients in parallel
+    /// each get their own answer (the id they asked with), and turning the
+    /// forwarder off stops every reader, not just one.
+    #[test]
+    fn parallel_clients_share_the_udp_readers() {
+        let (session, srv, port, shutdown) = lab();
+        assert!((1..=MAX_UDP_THREADS).contains(&udp_threads()));
+        thread::scope(|s| {
+            for c in 0..8u16 {
+                s.spawn(move || {
+                    let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+                    sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                    for i in 0..50u16 {
+                        let id = c * 1000 + i;
+                        let mut m = Message::query();
+                        m.metadata.id = id;
+                        m.metadata.recursion_desired = true;
+                        m.add_query(Query::query(Name::from_ascii("nas.lan.").unwrap(), RecordType::A));
+                        sock.send_to(&m.to_vec().unwrap(), ("127.0.0.1", port)).unwrap();
+                        let mut buf = [0u8; 512];
+                        let n = sock.recv(&mut buf).unwrap();
+                        let r = Message::from_vec(&buf[..n]).unwrap();
+                        assert_eq!(r.metadata.id, id);
+                        assert_eq!(r.answers[0].data.to_string(), "192.168.88.2");
+                    }
+                });
+            }
+        });
+        lock(&session)
+            .execute("ip.dns.set", &json!({"allow_remote_requests": false}))
+            .unwrap();
+        // Every reader is gone: no answer at all for a few polls in a row.
+        wait("all readers to stop", || (0..4).all(|_| udp(port, &query("nas.lan.", RecordType::A)).is_none()));
+        shutdown.close();
+        drop(srv);
     }
 
     #[cfg(target_os = "linux")]
