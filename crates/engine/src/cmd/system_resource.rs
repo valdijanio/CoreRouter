@@ -24,7 +24,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{} → [{cpu, load, user, system, irq, softirq, iowait, steal, frequency_mhz, irq_rate, softirq_rate, net_rx_rate, net_tx_rate}]",
         always, cpu_print),
     cmd!(query "system.resource.process.print", "Resources Processes", [], None,
-        "{sort?: cpu|memory|name|pid|threads, limit?: int} → [{pid, ppid, name, state, threads, cpu, memory}]",
+        "{sort?: cpu|memory|name|pid|threads, limit?: int} → [{pid, ppid, name, state, threads, cpu, memory, fds (open descriptors; null: unreadable)}]",
         always, process_print),
     cmd!(query "system.resource.network.print", "Resources Network", [], None,
         "{} → [{name, running, speed_mbps, rx_bits_per_second, tx_bits_per_second, rx_packets_per_second, tx_packets_per_second, rx_errors, tx_errors, rx_drops, tx_drops, errors_per_second, drops_per_second}]",
@@ -205,7 +205,7 @@ fn process_print(s: &mut Session, p: &Value) -> Result<Value> {
                 json!({
                     "pid": x.pid, "ppid": x.ppid, "name": x.name,
                     "state": x.state.to_string(), "threads": x.threads,
-                    "cpu": c.map(r1f), "memory": x.rss_bytes,
+                    "cpu": c.map(r1f), "memory": x.rss_bytes, "fds": x.fds,
                 })
             })
             .collect(),
