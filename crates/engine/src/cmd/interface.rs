@@ -38,6 +38,17 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         vlan_add
     )
     .key_alias(&[("interface", "parent")]),
+    // `/interface vlan print` and the like (G3.9hl): one type each, the
+    // columns RouterOS prints first (`interface.list` keeps every type).
+    cmd!(query "interface.vlan.list", "VLANs", [], None,
+        "{} → [{name, mtu, vlan_id, interface (the parent: interface= in RouterOS), use_service_tag, disabled, running, comment}]",
+        always, vlan_list),
+    cmd!(query "interface.bridge.list", "Bridges", [], None,
+        "{} → [{name, mtu, mac_address, ports (count), disabled, running, comment}]",
+        always, bridge_list),
+    cmd!(query "interface.loopback.list", "Loopbacks", [], None,
+        "{} → [{name, mtu, disabled, running, comment}]",
+        always, loopback_list),
     cmd!(
         "interface.bridge.add",
         "Add Bridge",
@@ -66,7 +77,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         port_remove
     ),
     cmd!(query "interface.bridge.port.list", "Bridge Ports", ["Interfaces"], None,
-        "{bridge?: string} → [{bridge, interface}]",
+        "{bridge?: string} → [{interface, bridge}]",
         always, port_list),
     cmd!(
         "interface.loopback.add",
@@ -177,6 +188,104 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                 })
             }),
     );
+    Ok(Value::Array(rows))
+}
+
+/// The config interfaces `keep` selects, each with its kernel link (if
+/// any), in config order: the rows of the per-type lists (G3.9hl).
+pub(super) fn typed(
+    s: &mut Session,
+    keep: impl Fn(&InterfaceKind) -> bool,
+) -> Vec<(Interface, Option<corerouter_hal::LinkState>)> {
+    let mut live = s.hal_mut().poll();
+    s.watch_links(&live);
+    s.store()
+        .candidate()
+        .interfaces
+        .values()
+        .filter(|i| keep(&i.kind))
+        .map(|i| {
+            let st = live
+                .iter()
+                .position(|l| l.name == i.name)
+                .map(|at| live.swap_remove(at));
+            (i.clone(), st)
+        })
+        .collect()
+}
+
+fn running(st: Option<&corerouter_hal::LinkState>) -> bool {
+    st.is_some_and(|l| l.running)
+}
+
+fn vlan_list(s: &mut Session, _: &Value) -> Result<Value> {
+    let rows = typed(s, |k| matches!(k, InterfaceKind::Vlan { .. }))
+        .into_iter()
+        .filter_map(|(i, st)| {
+            let InterfaceKind::Vlan {
+                parent,
+                vlan_id,
+                service_tag,
+            } = &i.kind
+            else {
+                return None;
+            };
+            Some(json!({
+                "name": i.name,
+                "mtu": i.mtu,
+                "vlan_id": vlan_id.get(),
+                "interface": parent,
+                "use_service_tag": service_tag,
+                "disabled": i.disabled,
+                "running": running(st.as_ref()),
+                "comment": i.comment,
+            }))
+        })
+        .collect();
+    Ok(Value::Array(rows))
+}
+
+fn bridge_list(s: &mut Session, _: &Value) -> Result<Value> {
+    let mut ports: BTreeMap<IfName, usize> = BTreeMap::new();
+    for b in s
+        .store()
+        .candidate()
+        .interfaces
+        .values()
+        .filter_map(|i| i.bridge.clone())
+    {
+        *ports.entry(b).or_default() += 1;
+    }
+    let rows = typed(s, |k| matches!(k, InterfaceKind::Bridge))
+        .into_iter()
+        .map(|(i, st)| {
+            json!({
+                "name": i.name,
+                "mtu": i.mtu,
+                "mac_address": st.as_ref().and_then(|l| l.mac.clone()),
+                "ports": ports.get(&i.name).copied().unwrap_or(0),
+                "disabled": i.disabled,
+                "running": running(st.as_ref()),
+                "comment": i.comment,
+            })
+        })
+        .collect();
+    Ok(Value::Array(rows))
+}
+
+fn loopback_list(s: &mut Session, _: &Value) -> Result<Value> {
+    let rows = typed(s, |k| matches!(k, InterfaceKind::Loopback))
+        .into_iter()
+        .map(|(i, st)| {
+            json!({
+                "name": i.name,
+                "mtu": i.mtu,
+                "disabled": i.disabled,
+                "running": running(st.as_ref()),
+                "comment": i.comment,
+            })
+        })
+        .collect();
     Ok(Value::Array(rows))
 }
 
@@ -487,7 +596,7 @@ fn port_list(s: &mut Session, p: &Value) -> Result<Value> {
         .values()
         .filter_map(|i| Some((i.bridge.as_ref()?, &i.name)))
         .filter(|(b, _)| filter.as_ref().is_none_or(|f| f == *b))
-        .map(|(b, i)| json!({ "bridge": b, "interface": i }))
+        .map(|(b, i)| json!({ "interface": i, "bridge": b }))
         .collect();
     Ok(Value::Array(rows))
 }

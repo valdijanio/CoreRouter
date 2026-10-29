@@ -125,10 +125,22 @@ fn args_of(
 ) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::new();
     for p in &cmd.params {
-        let v = row.get(&p.key).unwrap_or(&Value::Null);
+        // A row may name a parameter as RouterOS does (`interface` for the
+        // `parent` of `/interface vlan add`): read it and write it so.
+        let alias = cmd
+            .key_alias
+            .iter()
+            .find(|(typed, key)| {
+                *key == p.key && row.get(&p.key).is_none() && row.get(typed).is_some()
+            })
+            .map(|(typed, _)| typed.clone());
+        let v = row
+            .get(alias.as_deref().unwrap_or(&p.key))
+            .unwrap_or(&Value::Null);
+        let key = alias.unwrap_or_else(|| p.key.clone());
         if sensitive && secret(&p.key) && clear(v) {
             if p.required || !empty(v) {
-                out.push((p.key.clone(), arg_text(v)));
+                out.push((key.clone(), arg_text(v)));
             }
             continue;
         }
@@ -149,7 +161,7 @@ fn args_of(
         let meaningful_false = v == &Value::Bool(false) && p.ty_text.contains("default true");
         let keep = p.required || meaningful_false || if all { !v.is_null() } else { !empty(v) };
         if keep {
-            out.push((p.key.clone(), arg_text(v)));
+            out.push((key.clone(), arg_text(v)));
         }
     }
     Ok(out)
@@ -215,9 +227,17 @@ fn rows_of(
         // A sub-menu with its own `print` (`/interface bonding`) exports
         // its rows itself, with fields this menu's row lacks (`slaves`):
         // here only what its `add` cannot take, as a `set`.
-        let exported_below = typed_menu
-            .and_then(|(_, m)| m.print())
-            .is_some_and(|p| p.required().next().is_none());
+        let below =
+            typed_menu.filter(|(_, m)| m.print().is_some_and(|p| p.required().next().is_none()));
+        let exported_below = below.is_some();
+        // ... and its `add` and `set` write what they take (G3.9hl).
+        let taken_below = |key: &str| {
+            below.is_some_and(|(_, m)| {
+                ["add", "set"]
+                    .iter()
+                    .any(|v| m.commands.get(*v).is_some_and(|c| c.param(key).is_some()))
+            })
+        };
         // Present in every new config: set, never add.
         let preset = row.get("default").and_then(Value::as_bool) == Some(true);
         let (add_path, add) = match typed {
@@ -241,6 +261,7 @@ fn rows_of(
                         .params
                         .iter()
                         .filter(|p| add.param(&p.key).is_none() && !p.required)
+                        .filter(|p| !taken_below(&p.key))
                         .filter(|p| !secret(&p.key))
                         .filter_map(|p| row.get(&p.key).filter(|v| !empty(v)).map(|v| (p, v)))
                         .map(|(p, v)| (p.key.clone(), arg_text(v)))
@@ -262,6 +283,11 @@ fn rows_of(
                     }
                 }
             }
+            // A `set` naming only its item changes nothing (a port nobody
+            // configured): no line.
+            (None, Some(set))
+                if args_of(set, row, false, sensitive)
+                    .is_ok_and(|a| a.len() <= 1 && set.required().count() <= 1) => {}
             (None, Some(set)) => {
                 push(out, menu_path, set, row, false, false, sensitive);
             }

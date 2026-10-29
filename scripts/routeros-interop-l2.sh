@@ -4,6 +4,7 @@
 # inside the lab VM only:
 #   cargo xtask vm-lab run -- scripts/routeros-interop-l2.sh [case…]
 # Cases (default: all, in this order): wire vlan qinq rsc mtu lldp arp tools dhcp
+#   (prints, G3.9hl: only when named: print/export of /interface menus)
 #   dhcp-client dhcp-relay dhcp6 dhcp6-client ra ntp dns nat cgnat bond
 #   cr-dhcp cr-bond storm dns-qps
 # NO_CHR=1 BIN=<release dir>: no CHR, only the CoreRouter × CoreRouter
@@ -1176,6 +1177,37 @@ PY
     done
   done
   result dns-qps INFO "A statistics: $(cli ip.dns.statistics.print | jq -c . | cut -c1-300)"
+}
+
+# G3.9hl: the `print`/`export` of the /interface sub-menus as RouterOS 7
+# writes them (terminal text, the columns a test of crates/shell copies) and
+# as the CoreRouter's terminal writes them for the same config. Not a pass
+# or fail case: two text blocks to compare by eye and by test.
+prints_menus=("interface vlan" "interface bridge" "interface bridge port" "interface bonding" "interface pppoe-client" "interface ethernet")
+case_prints() {
+  rosx '/interface vlan add name=v30 vlan-id=30 interface=ether1 comment=prints
+/interface vlan add name=v31 vlan-id=31 interface=ether1 disabled=yes
+/interface bridge add name=br1
+/interface bridge port add bridge=br1 interface=v30
+/interface bonding add name=bond1 slaves=ether2,ether3 mode=802.3ad
+/interface pppoe-client add name=pc1 interface=ether1 user=u1 password=p1 disabled=yes' >/dev/null
+  cr_vlan 30 10.39.30.2/24
+  cli interface.vlan.add '{"name":"v31","parent":"ether1","vlan_id":31,"disabled":true}' >/dev/null
+  cli interface.set '{"name":"v30","comment":"prints"}' >/dev/null
+  cli interface.bridge.add '{"name":"br1"}' >/dev/null
+  cli interface.bridge.port.add '{"bridge":"br1","interface":"v30"}' >/dev/null
+  cli interface.bonding.add '{"name":"bond1","slaves":"ether2,ether3","mode":"802.3ad"}' >/dev/null
+  cli interface.pppoe-client.add '{"name":"pc1","interface":"ether1","user":"u1","password":"p1","disabled":true}' >/dev/null || true
+  local m v
+  for m in "${prints_menus[@]}"; do
+    for v in print "print detail" "print terse" "print as-value" "print where name~\"1\"" export; do
+      echo "--- RouterOS: /$m $v"
+      rosx "/$m $v" | jq -r '.ret // .'
+      echo "--- CoreRouter: /$m $v"
+      printf '/%s %s\n' "$m" "$v" | ip netns exec crcore "$bin/corerouter-cli" --connect 127.0.0.1:7990 shell 2>&1 | sed 's/\x1b\[[0-9;]*m//g'
+    done
+  done | tee "$W/prints.txt"
+  result prints INFO "$(grep -c '^--- ' "$W/prints.txt") outputs in $W/prints.txt"
 }
 
 for c in "${CASES[@]}"; do
