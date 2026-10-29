@@ -877,39 +877,44 @@ fn list(s: &mut Session, table: Table, p: &Value) -> Result<Value> {
     // Someone looks at the rules: keep the live counters coming (G2.1c).
     s.firewall_counters_want();
     let now = s.now().unwrap_or(0);
-    let live = s.ext::<crate::firewall_diag::FwDiag>().map(|d| &d.live);
-    let cfg = s.store().candidate();
-    let shadows = shadowed(cfg, table);
-    let issues = table_issues(cfg, table);
-    Ok(Value::Array(
-        cfg.ip
-            .firewall
-            .rules(table)
-            .iter()
-            .zip(issues)
-            .enumerate()
-            .filter(|(_, (r, _))| chain.as_ref().is_none_or(|c| *c == r.chain && !r.section))
-            .map(|(i, (r, issue))| {
-                let first = issue.into_iter().next();
-                let mut v = row(table, i, r, shadows.get(&r.id).copied(), first);
-                if let (Some(l), Some(o)) =
-                    (live.and_then(|m| m.get(&(table, r.id))), v.as_object_mut())
-                {
-                    let idle = l.idle_secs(now);
-                    o.insert("packets".into(), json!(l.shown_packets()));
-                    o.insert("bytes".into(), json!(l.shown_bytes()));
-                    o.insert("pps".into(), json!((l.pps * 10.0).round() / 10.0));
-                    o.insert("last_used".into(), json!(l.last_used));
-                    o.insert("idle_secs".into(), json!(idle));
-                    o.insert(
-                        "stale".into(),
-                        json!(idle >= crate::firewall_diag::STALE_DAYS * 86_400),
-                    );
-                }
-                v
-            })
-            .collect(),
-    ))
+    // Under the lock: the config and the counters, as pointers (G0.31b).
+    let live = s
+        .ext::<crate::firewall_diag::FwDiag>()
+        .map(|d| std::sync::Arc::clone(&d.live));
+    let cfg = s.store().candidate().clone();
+    s.defer(move || {
+        let shadows = shadowed(&cfg, table);
+        let issues = table_issues(&cfg, table);
+        Ok(Value::Array(
+            cfg.ip
+                .firewall
+                .rules(table)
+                .iter()
+                .zip(issues)
+                .enumerate()
+                .filter(|(_, (r, _))| chain.as_ref().is_none_or(|c| *c == r.chain && !r.section))
+                .map(|(i, (r, issue))| {
+                    let first = issue.into_iter().next();
+                    let mut v = row(table, i, r, shadows.get(&r.id).copied(), first);
+                    if let (Some(l), Some(o)) =
+                        (live.as_ref().and_then(|m| m.get(&(table, r.id))), v.as_object_mut())
+                    {
+                        let idle = l.idle_secs(now);
+                        o.insert("packets".into(), json!(l.shown_packets()));
+                        o.insert("bytes".into(), json!(l.shown_bytes()));
+                        o.insert("pps".into(), json!((l.pps * 10.0).round() / 10.0));
+                        o.insert("last_used".into(), json!(l.last_used));
+                        o.insert("idle_secs".into(), json!(idle));
+                        o.insert(
+                            "stale".into(),
+                            json!(idle >= crate::firewall_diag::STALE_DAYS * 86_400),
+                        );
+                    }
+                    v
+                })
+                .collect(),
+        ))
+    })
 }
 
 /// RouterOS durations: `90`, `30s`, `5m`, `1h30m`, `1d`, `1w` (at most 35
@@ -1088,31 +1093,12 @@ fn al_list(s: &mut Session, p: &Value) -> Result<Value> {
     let filter: Option<Name> = opt_parse(p, "list")?;
     s.expire_dynamic_addresses();
     let now = s.now();
-    let keep = |l: &Name| filter.as_ref().is_none_or(|f| f == l);
-    let cfg = s.store().candidate();
-    let mut rows: Vec<Value> = cfg
-        .ip
-        .firewall
-        .address_lists
-        .iter()
-        .filter(|e| keep(&e.list))
-        .map(|e| {
-            json!({
-                "id": e.id,
-                "list": e.list,
-                "address": e.address,
-                "family": e.address.family().name(),
-                "dynamic": false,
-                "timeout": Value::Null,
-                "flags": if e.disabled { "X" } else { "" },
-                "disabled": e.disabled,
-                "comment": e.comment,
-            })
-        })
-        .collect();
-    rows.extend(
-        s.dynamic_addresses
-            .entries()
+    // Under the lock: two pointers; 100 000 rows are built after (G0.31b).
+    let lists = s.store().candidate().ip.firewall.address_lists.list().clone();
+    let dynamic = s.dynamic_addresses.shared();
+    s.defer(move || {
+        let keep = |l: &Name| filter.as_ref().is_none_or(|f| f == l);
+        let mut rows: Vec<Value> = lists
             .iter()
             .filter(|e| keep(&e.list))
             .map(|e| {
@@ -1121,13 +1107,27 @@ fn al_list(s: &mut Session, p: &Value) -> Result<Value> {
                     "list": e.list,
                     "address": e.address,
                     "family": e.address.family().name(),
-                    "dynamic": true,
-                    "timeout": e.left(now),
-                    "flags": "D",
-                    "disabled": false,
+                    "dynamic": false,
+                    "timeout": Value::Null,
+                    "flags": if e.disabled { "X" } else { "" },
+                    "disabled": e.disabled,
                     "comment": e.comment,
                 })
-            }),
-    );
-    Ok(Value::Array(rows))
+            })
+            .collect();
+        rows.extend(dynamic.iter().filter(|e| keep(&e.list)).map(|e| {
+            json!({
+                "id": e.id,
+                "list": e.list,
+                "address": e.address,
+                "family": e.address.family().name(),
+                "dynamic": true,
+                "timeout": e.left(now),
+                "flags": "D",
+                "disabled": false,
+                "comment": e.comment,
+            })
+        }));
+        Ok(Value::Array(rows))
+    })
 }

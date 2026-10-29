@@ -3,7 +3,7 @@
 # MikroTik RouterOS v7 CHR and against a second CoreRouter. Runs as root
 # inside the lab VM only:
 #   cargo xtask vm-lab run -- scripts/routeros-interop-l2.sh [case…]
-# Cases (default: all, in this order): wire vlan qinq mtu lldp arp tools dhcp
+# Cases (default: all, in this order): wire vlan qinq rsc mtu lldp arp tools dhcp
 #   dhcp-client dhcp-relay dhcp6 dhcp6-client ra ntp dns nat cgnat bond
 #   cr-dhcp cr-bond storm dns-qps
 # NO_CHR=1 BIN=<release dir>: no CHR, only the CoreRouter × CoreRouter
@@ -37,7 +37,7 @@ ROS_VERSION=${ROS_VERSION:-7.25}
 ROS_SHA256=${ROS_SHA256:-6b981288350de2a2c7a3218bd820ab702633b8cd6cd339f2bb34dda1f1a2550e}
 CASES=("$@")
 [ ${#CASES[@]} -gt 0 ] || [ -z "${NO_CHR:-}" ] || CASES=(cr-dhcp cr-bond dhcp-conflict storm dns-qps)
-[ ${#CASES[@]} -gt 0 ] || CASES=(wire vlan qinq mtu lldp arp tools dhcp dhcp-client dhcp-relay dhcp-conflict dhcp6 dhcp6-client ra ntp dns nat cgnat bond cr-dhcp cr-bond storm dns-qps)
+[ ${#CASES[@]} -gt 0 ] || CASES=(wire vlan qinq rsc mtu lldp arp tools dhcp dhcp-client dhcp-relay dhcp-conflict dhcp6 dhcp6-client ra ntp dns nat cgnat bond cr-dhcp cr-bond storm dns-qps)
 W=${W:-/tmp/crg39h}
 CHR_DIR=/srv/lab/chr
 PW=g39h-lab-only
@@ -392,6 +392,29 @@ case_qinq() {
     && cli ip.address.add '{"address":"10.39.201.2/24","interface":"c201"}' >/dev/null \
     && wait_for 10 cr_ping_ok 10.39.201.1 >/dev/null && [ "$(ros_ping 10.39.201.2)" -ge 4 ] \
     && result qinq OK "stacked 802.1Q 101/201 (0x8100/0x8100): ping both ways" || result qinq FAIL "stacked 802.1Q 101/201"
+}
+
+case_rsc() {
+  # G3.9hb: the CHR's own `/interface vlan export` (interface=, vlan-id=,
+  # use-service-tag=, mtu=, disabled=, comment=, as RouterOS writes them)
+  # pasted into the CoreRouter's terminal as it comes.
+  rosx '/interface vlan add name=r40 vlan-id=40 interface=ether1 comment="cliente 40"
+/interface vlan add name=r41 vlan-id=41 interface=ether1 disabled=yes mtu=1400
+/interface vlan add name=s42 vlan-id=42 interface=ether1 use-service-tag=yes
+/interface vlan add name=c43 vlan-id=43 interface=s42
+/interface vlan export file=g39hb' >/dev/null
+  sleep 1
+  ros 'file?name=g39hb.rsc' | jq -r '.[0].contents // empty' > "$W/ros-vlan.rsc"
+  [ -s "$W/ros-vlan.rsc" ] || { result rsc FAIL "no export from the CHR"; return; }
+  result rsc INFO "CHR export: $(grep -v '^#' "$W/ros-vlan.rsc" | tr '\n' ' ' | cut -c1-400)"
+  local out
+  out=$(printf '/import file=%s\n' "$W/ros-vlan.rsc" |
+    ip netns exec crcore "$bin/corerouter-cli" --connect 127.0.0.1:7990 shell 2>&1) || true
+  local got; got=$(cli interface.list '{"type":"vlan"}' |
+    jq -c '[.[] | select(.name | test("^(r4[01]|s42|c43)$")) | {name, parent, vlan_id, use_service_tag, mtu, disabled, comment}] | sort_by(.name)')
+  local want='[{"name":"c43","parent":"s42","vlan_id":43,"use_service_tag":false,"mtu":1500,"disabled":false,"comment":""},{"name":"r40","parent":"ether1","vlan_id":40,"use_service_tag":false,"mtu":1500,"disabled":false,"comment":"cliente 40"},{"name":"r41","parent":"ether1","vlan_id":41,"use_service_tag":false,"mtu":1400,"disabled":true,"comment":""},{"name":"s42","parent":"ether1","vlan_id":42,"use_service_tag":true,"mtu":1500,"disabled":false,"comment":""}]'
+  [ "$got" = "$want" ] && result rsc OK "the CHR's VLAN export imports into the CoreRouter terminal: $got" \
+    || result rsc FAIL "import: $(head -c 300 <<< "$out"); got $got"
 }
 
 case_mtu() {

@@ -32,6 +32,7 @@ usage: corerouter-cli <command> [--connect HOST:PORT | tls://HOST:PORT]
 
   list [prefix]               list commands (id, params, enabled)
   run <id> [json-params]      run one command, e.g. run ip.address.add '{\"address\":\"10.0.0.1/24\",\"interface\":\"ether1\"}'
+                              (one connection per command: Safe Mode needs `shell`, `mcp` or the GUI)
   watch <id> [json-params]    start a tool task and print it until done (Ctrl+C stops it), e.g.
                               watch tool.ping.start '{\"address\":\"8.8.8.8\",\"count\":4}'
   inspect [path]              state summary, or one subtree (interfaces, routing.bgp, running.ip, journal)
@@ -161,6 +162,7 @@ fn real_main() -> Result<(), String> {
         }
         "run" => {
             let id = pos.next().ok_or("run needs a command id")?;
+            one_shot_allowed(&id)?;
             let params: Value = match pos.next() {
                 Some(raw) => serde_json::from_str(&raw).map_err(|e| format!("params: {e}"))?,
                 None => Value::Null,
@@ -207,6 +209,23 @@ fn real_main() -> Result<(), String> {
         serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string())
     ));
     Ok(())
+}
+
+/// `run` opens a connection for one command and closes it: a command tied
+/// to the connection (Safe Mode) would end the moment it started, and the
+/// next `run` would change the config unprotected (G1.6qf, seen on the
+/// image). Refused with the clients that keep the connection open.
+fn one_shot_allowed(id: &str) -> Result<(), String> {
+    if !corerouter_engine::safe_mode::NEEDS_OPEN_CONNECTION.contains(&id) {
+        return Ok(());
+    }
+    Err(format!(
+        "{id} lasts only while its connection stays open, and `run` closes it as soon as the \
+         command returns: the router would undo Safe Mode at once and the next `run` would \
+         change the config unprotected.\n\
+         Use a client that keeps the connection: `corerouter-cli shell` (Ctrl+X toggles Safe \
+         Mode), the MCP server (`corerouter-cli mcp`) or the GUI."
+    ))
 }
 
 /// Start a tool task and print its events (RouterOS style) until it ends.

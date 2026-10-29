@@ -189,9 +189,11 @@ Cada conexão TCP ou WebSocket é um cliente (`Caller`, ex. `tcp 127.0.0.1:50412
 `config.safe-mode.enter` pertence à conexão que o executou; quando ela fecha, o daemon desfaz
 tudo o que mudou desde a entrada. Isso vale também quando o caminho morre em silêncio (rota,
 endereço ou firewall cortam a gerência: nenhum FIN ou RST chega): o keepalive TCP derruba a
-conexão em ~30 s e o desfazer roda. Por isso `corerouter-cli --connect … run
-config.safe-mode.enter` não serve para nada (a conexão fecha logo depois): use a GUI, o MCP
-(conexão persistente) ou um cliente que fique conectado. `state.inspect` mostra
+conexão em ~30 s e o desfazer roda. Por isso `corerouter-cli run config.safe-mode.enter`
+é recusado (G1.6qf): a conexão fecharia logo depois, o Safe Mode acabaria na hora e o `run`
+seguinte mudaria a config sem proteção. Use o `corerouter-cli shell` (Ctrl+X), a GUI, o MCP
+(conexão persistente) ou um cliente que fique conectado; a lista dos comandos presos à
+conexão é `corerouter_engine::safe_mode::NEEDS_OPEN_CONNECTION`. `state.inspect` mostra
 `safe_mode: {active, owner, yours, since, entry_revision, pending_revisions, timeout_secs,
 expires_in, last}` — `yours` é relativo à conexão que pergunta. A GUI com `--control` repassa
 cada cliente por uma conexão própria ao daemon, então o dono é esse cliente, não a janela.

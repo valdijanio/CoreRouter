@@ -292,7 +292,10 @@ impl Session {
     /// The one door: UI, CLI, control channel and MCP all call this.
     pub fn execute(&mut self, id: &str, params: &Value) -> Result<Value> {
         let spec = cmd::find(id);
+        // G0.31b: only the outermost command of a reply defers.
+        self.off_lock_nest(true);
         let result = self.execute_counted(spec, id, params);
+        self.off_lock_nest(false);
         self.counters
             .note_command(spec.map(|spec| spec.journal), result.is_ok());
         result
