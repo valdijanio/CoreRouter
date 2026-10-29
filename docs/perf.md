@@ -2619,3 +2619,37 @@ rodava toda sob o lock (melhor de 3, a quente); "depois" é o tempo sob o lock
 
 O tempo total de cada resposta não muda: a montagem roda na thread da conexão, e cada cliente
 tem a sua, então N clientes montam em paralelo em N núcleos, em vez de um de cada vez sob o lock.
+
+### Conntrack fora do lock (G0.31c)
+
+**Medido** em 2026-10-29: AMD Ryzen AI MAX+ 395 (32 threads), build release, máquina
+compartilhada com carga de 35–46. `apps/corerouter-daemon/benches/netns_conntrack.rs` num
+namespace sem root, 250 000 fluxos UDP em `lo` e uma sessão `--backend linux`. "Lock" é
+`execute_reply_as`, o que o canal de controle roda sob o lock; "resposta" soma o `finish`.
+Fria: dump mais velho que `CACHE_SECS` (mediana de 3). Quente: dump em cache (mediana e máximo
+de 20). Antes = a branch da G0.31b; as duas versões rodaram intercaladas, duas vezes cada.
+
+| Consulta | Lock frio antes | Lock frio depois | Lock quente antes | Lock quente depois (máx.) | Resposta fria depois |
+|---|---|---|---|---|---|
+| `ip.firewall.connection.list count=5` | 276–349 ms | 19–24 µs | 1,9–2,5 ms | 12–16 µs (18 µs) | 168–428 ms |
+| `ip.firewall.connection.list count=50 sort=bytes` | 169–476 ms | 20–25 µs | 3,0–5,6 ms | 14–15 µs (22 µs) | 257–705 ms |
+| `ip.firewall.connection.top` | 180–184 ms | 16–18 µs | 3,5–5,9 ms | 0,7–6,6 µs (14 µs) | 184–371 ms |
+
+O tempo da resposta inteira não mudou: as faixas de antes e de depois se sobrepõem com essa
+carga na máquina. O que sai do lock é o dump (~170 ms com 250 000) e o filtro (2–6 ms). Sob o
+lock fica só o custo de clonar dois `Arc`s e os pools, que não cresce com a tabela; com 1
+milhão de entradas o lock fica igual (**estimado**: nada sob o lock percorre a tabela; o
+`nf_conntrack_max` do host, 262 144, não deixa medir 1 milhão no namespace).
+
+### Rotas estáticas: import e checagem de duplicata com 60 000 rotas (G0.31d)
+
+**Medido** em 2026-10-29, AMD Ryzen AI Max+ 395 (32 threads), build release, máquina
+compartilhada (load ~25), backend virtual. `cargo bench -p corerouter-engine --bench
+route_scale`, `--save-baseline antes` na base (`stream/G0.31b-offlock-queries`, #428) e
+`--baseline antes` na branch. Rotas /24 por um gateway em `ether1`.
+
+| Caso | Antes | Depois |
+|---|---|---|
+| import de 60 000 rotas, 2 `engine.batch` de 30 000 (cada um um commit) | 2,18 s + 6,35 s | 0,26 s + 0,46 s |
+| `route_scale/check/add_remove` (modo transacional, `ip.route.add` + `remove` com 60 000) | 297 µs | 30,6 µs (−91 %) |
+| `route_scale/commit/add_remove` (modo imediato, dois commits; G0.31e) | 146 ms | 137 ms (ruído, p = 0,13) |
