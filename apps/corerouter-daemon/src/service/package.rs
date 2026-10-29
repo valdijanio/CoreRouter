@@ -43,6 +43,8 @@ const STATUS_EVERY: Duration = Duration::from_secs(2);
 /// did not crash on its configuration). Flatcar waits ~2 min; ours is short
 /// because the deadline (default 300 s) bounds the risk anyway.
 const GRACE: Duration = Duration::from_secs(10);
+/// Between a slot-changing job's result and the reboot.
+const REBOOT_PAUSE: Duration = Duration::from_secs(2);
 /// An upload with no chunk for this long is dropped (the client is gone).
 const UPLOAD_STALL: Duration = Duration::from_secs(60);
 const KEYS_DIR: &str = "/etc/corerouter/image-keys";
@@ -346,6 +348,9 @@ impl Svc {
             self.feed(session);
             return;
         }
+        // A moment for whoever asked (an upload's client polls every
+        // 100 ms) to read the result before the connection goes.
+        std::thread::sleep(REBOOT_PAUSE);
         log::warn!("package: rebooting into the trial slot");
         reboot_image();
     }

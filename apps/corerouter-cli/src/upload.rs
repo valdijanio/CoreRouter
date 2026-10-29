@@ -111,10 +111,25 @@ pub fn run(b: &mut dyn Backend, o: &Opts) -> Result<Value, String> {
     }
     let t_sent = t0.elapsed();
     // The service finishes writing the last chunks and reads the slot back.
+    // An install reboots right after: the router going away then means
+    // "written, rebooting" (`--wait` finds out how it went).
+    let other = match before.get("running").and_then(Value::as_str) {
+        Some("a") => "b",
+        Some("b") => "a",
+        _ => "?",
+    };
     let result = loop {
-        let p = exec(b, "system.package.print", json!({}))?;
-        if let Some(r) = outcome(&p, job) {
-            break r;
+        match exec(b, "system.package.print", json!({})) {
+            Ok(p) => {
+                if let Some(r) = outcome(&p, job) {
+                    break r;
+                }
+            }
+            Err(e) if !check && reboot && o.wait => {
+                log::info!("the router went away after the upload ({e}): rebooting");
+                break json!({"ok": true, "result": {"slot": other}});
+            }
+            Err(e) => return Err(e),
         }
         std::thread::sleep(Duration::from_millis(100));
     };

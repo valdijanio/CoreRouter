@@ -5,7 +5,10 @@
 //! - `ab-test`: the scenarios in QEMU as the user (OVMF, KVM or TCG):
 //!   update A→B confirmed; a B that does not confirm falls back; a package
 //!   with a bad signature or a changed payload is refused; a boot parameter
-//!   that does not boot falls back. Driven through the serial console's
+//!   that does not boot falls back; G1.6e: a package pushed over the
+//!   network (TLS, `corerouter-cli upload --wait`) is installed, confirmed
+//!   and keeps `/config`, the password and the certificate, and a bad one
+//!   pushed the same way falls back. Driven through the serial console's
 //!   maintenance shell (`corerouter.shell=ttyS0`, carried into the slots'
 //!   boot entries) and `corerouter-init run <command>`.
 //!
@@ -137,6 +140,8 @@ struct Ctx {
     images: PathBuf,
     kvm: bool,
     log: std::fs::File,
+    /// G1.6e: a host port forwarded to the guest's TLS control port.
+    fwd: Option<u16>,
 }
 
 /// One QEMU run (it exits on the guest's reboot: `-no-reboot`).
@@ -226,12 +231,14 @@ impl Ctx {
                 p.display()
             ));
         }
-        cmd.args([
-            "-netdev",
-            "user,id=n0",
-            "-device",
-            "virtio-net-pci,netdev=n0",
-        ]);
+        let netdev = match self.fwd {
+            Some(port) => format!(
+                "user,id=n0,hostfwd=tcp:127.0.0.1:{port}-:{}",
+                super::GUEST_TLS_PORT
+            ),
+            None => "user,id=n0".to_owned(),
+        };
+        cmd.args(["-netdev", &netdev, "-device", "virtio-net-pci,netdev=n0"]);
         if first {
             // The factory boot: OVMF loads the kernel QEMU hands it, with the
             // test's platform arguments; the image provisions its boot
@@ -786,7 +793,190 @@ fn scenario_bad_param(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
     Ok(())
 }
 
-/// `cargo xtask os ab-test [--tcg] [--scenario update|no-confirm|bad-signature|bad-param]`.
+/// A shell command's output line on the guest's console.
+fn shell_line(vm: &mut Vm, log: &mut std::fs::File, cmd: &str) -> Result<String, String> {
+    vm.stdin_write(format!("{cmd} 2>&1 | sed \"s/^/@@$((2+1))S /\"\n").as_bytes())?;
+    let got = vm.expect(log, &["@@3S "], 30)?;
+    Ok(got.split("@@3S ").nth(1).unwrap_or("").trim().to_owned())
+}
+
+/// `corerouter-cli upload` of `pkg` to the guest over TLS, in the
+/// background (it waits for the reboots the test drives).
+fn push_cli(ctx: &Ctx, cli: &Path, fp: &str, pkg: &Path, params: &str) -> Result<Child, String> {
+    let port = ctx.fwd.ok_or("no forwarded port")?;
+    let home = ctx.work.join("push-home");
+    std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
+    Command::new(cli)
+        .args([
+            "--connect",
+            &format!("tls://127.0.0.1:{port}"),
+            "--user",
+            "admin",
+            "--fingerprint",
+            fp,
+        ])
+        .arg("upload")
+        .arg(pkg)
+        .args([params, "--wait"])
+        .env("HOME", &home)
+        .env("COREROUTER_PASSWORD", PUSH_PASSWORD)
+        .env("RUST_LOG", "warn")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{}: {e}", cli.display()))
+}
+
+const PUSH_PASSWORD: &str = "ab-test-push-Pw1";
+
+/// G1.6e: push over the network. Slot A gets a password, an identity and
+/// its certificate; the package goes over TLS in chunks straight to slot
+/// B; after the reboot the same certificate (pinned), password and
+/// identity answer from B. Then a package whose daemon never answers is
+/// pushed the same way: its trial is not confirmed and B comes back.
+fn scenario_push(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
+    let st = Command::new(crate::cargo_bin())
+        .args(["build", "-q", "--release", "-p", "corerouter-cli"])
+        .current_dir(&ctx.root)
+        .status()
+        .map_err(|e| format!("cargo: {e}"))?;
+    check(st.success(), "cargo build -p corerouter-cli failed")?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let cli = exe
+        .parent()
+        .and_then(Path::parent)
+        .map(|t| t.join("release/corerouter-cli"))
+        .ok_or("no target directory")?;
+    let pkg = ctx.work.join("push-b.crpkg");
+    let version = package(ctx, &pkg, "-push", None, None)?;
+    ctx.fwd = Some(super::free_port()?);
+    let mut log = ctx.log.try_clone().map_err(|e| e.to_string())?;
+    let r = (|| -> Result<(), String> {
+        let mut vm = fresh(ctx, n, "push", &[])?;
+        vm.ok(
+            &mut log,
+            "user.set",
+            &format!(r#"{{"name":"admin","password":"{PUSH_PASSWORD}"}}"#),
+        )?;
+        vm.ok(&mut log, "system.identity.set", r#"{"name":"push-kept"}"#)?;
+        let fp = shell_line(
+            &mut vm,
+            &mut log,
+            "grep -o 'SHA256:[0-9A-F:]*' /var/log/corerouter-daemon.log | tail -n 1",
+        )?;
+        check(
+            fp.starts_with("SHA256:") && fp.len() > 60,
+            format!("certificate fingerprint: '{fp}'"),
+        )?;
+        let t = Instant::now();
+        let child = push_cli(ctx, &cli, &fp, &pkg, r#"{"timeout":120}"#)?;
+        // The router reboots once the slot is written.
+        vm.wait_exit(&mut log, 180)?;
+        drop(vm);
+        let mut vm = ctx.boot("push/trial-b", false, &[])?;
+        vm.expect(&mut log, &["trial boot of slot b"], 120)?;
+        vm.expect_all(
+            &mut log,
+            &[
+                "ready:",
+                "maintenance shell",
+                "trial boot of slot b confirmed",
+            ],
+            120,
+        )?;
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let _ = writeln!(log, "{stderr}");
+        check(
+            out.status.success(),
+            format!("corerouter-cli upload: {stderr}"),
+        )?;
+        let v: Value =
+            serde_json::from_slice(&out.stdout).map_err(|e| format!("upload output: {e}"))?;
+        let tm = &v["times"];
+        n.put(
+            "push over TLS (QEMU user network): send",
+            format!(
+                "{} s for {:.1} MiB ({} MiB/s)",
+                tm["send_s"],
+                tm["bytes"].as_f64().unwrap_or(0.0) / 1048576.0,
+                tm["mib_per_s"]
+            ),
+        );
+        n.put(
+            "push: upload start → slot written and read back",
+            format!("{} s", tm["done_s"]),
+        );
+        n.put(
+            "push: whole cycle (send → B confirmed, CLI clock)",
+            format!("{:.1} s", t.elapsed().as_secs_f64()),
+        );
+        check(
+            v["last"]["result"] == "confirmed" && v["last"]["slot"] == "b",
+            format!("push result: {v}"),
+        )?;
+        let p = vm.print_until(&mut log, 30, |v| v["primary"] == "b")?;
+        check(
+            slot(&p, "b")["version"] == version.as_str(),
+            "slot B version after the push",
+        )?;
+        let id = vm.ok(&mut log, "system.identity.get", "{}")?;
+        check(
+            id.to_string().contains("push-kept"),
+            format!("/config not kept: identity {id}"),
+        )?;
+        let fp2 = shell_line(
+            &mut vm,
+            &mut log,
+            "grep -o 'SHA256:[0-9A-F:]*' /var/log/corerouter-daemon.log | tail -n 1",
+        )?;
+        check(fp2 == fp, format!("certificate changed: {fp} → {fp2}"))?;
+
+        // A bad package pushed the same way: back to B by itself.
+        let squashfs = broken_squashfs(ctx)?;
+        let bad = ctx.work.join("push-broken.crpkg");
+        package(ctx, &bad, "-push-broken", Some(&squashfs), None)?;
+        let child = push_cli(ctx, &cli, &fp, &bad, r#"{"timeout":30}"#)?;
+        vm.wait_exit(&mut log, 180)?;
+        drop(vm);
+        let mut vm = ctx.boot("push/trial-a-broken", false, &[])?;
+        vm.expect(&mut log, &["trial boot of slot a"], 120)?;
+        vm.expect(&mut log, &["not confirmed in 30 s"], 90)?;
+        vm.wait_exit(&mut log, 60)?;
+        drop(vm);
+        let mut vm = ctx.boot("push/back-on-b", false, &[])?;
+        vm.expect(
+            &mut log,
+            &["back on slot b after the trial of slot a failed"],
+            120,
+        )?;
+        vm.expect_all(&mut log, &["ready:", "maintenance shell"], 120)?;
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let _ = writeln!(log, "{stderr}");
+        check(
+            !out.status.success() && stderr.contains("not kept"),
+            format!("bad push should fail: {stderr}"),
+        )?;
+        let p = vm.print_until(&mut log, 30, |v| v["running"] == "b")?;
+        check(
+            p["last"]["result"] == "rolled-back" && p["primary"] == "b",
+            format!("after the bad push: {p}"),
+        )?;
+        let id = vm.ok(&mut log, "system.identity.get", "{}")?;
+        check(
+            id.to_string().contains("push-kept"),
+            "identity lost after the rollback",
+        )?;
+        vm.poweroff(&mut log)?;
+        Ok(())
+    })();
+    ctx.fwd = None;
+    r
+}
+
+/// `cargo xtask os ab-test [--tcg] [--scenario update|push|no-confirm|bad-signature|bad-param]`.
 pub fn ab_test(root: &Path, images: &Path, args: &[String]) -> Result<(), String> {
     let mut tcg = false;
     let mut only: Option<String> = None;
@@ -817,11 +1007,13 @@ pub fn ab_test(root: &Path, images: &Path, args: &[String]) -> Result<(), String
         images: images.to_owned(),
         kvm: !tcg && super::kvm_usable(),
         log,
+        fwd: None,
     };
     let mut n = Numbers(Vec::new());
     type Scenario = fn(&mut Ctx, &mut Numbers) -> Result<(), String>;
-    let all: [(&str, Scenario); 4] = [
+    let all: [(&str, Scenario); 5] = [
         ("update", scenario_update),
+        ("push", scenario_push),
         ("no-confirm", scenario_no_confirm),
         ("bad-signature", scenario_bad_signature),
         ("bad-param", scenario_bad_param),
