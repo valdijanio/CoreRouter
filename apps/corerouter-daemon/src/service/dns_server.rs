@@ -824,6 +824,12 @@ mod sock {
 
     use super::POLL;
 
+    /// Receive buffer of each UDP socket: with the default (`rmem_default`,
+    /// 208 KiB) a burst of 4096 queries in flight lost 27 392 of them in
+    /// 6 s, dropped by the kernel before a reader got them (G0.31,
+    /// **medido**). `SO_RCVBUFFORCE` as root, else up to `rmem_max`.
+    const RCVBUF: usize = 4 << 20;
+
     /// A UDP socket that knows each query's destination address.
     pub(super) struct Udp {
         sock: UdpSocket,
@@ -845,6 +851,9 @@ mod sock {
             let fd: OwnedFd = socket(family, SockType::Datagram, SockFlag::SOCK_CLOEXEC, None)
                 .map_err(nix_io)?;
             setsockopt(&fd, sockopt::ReuseAddr, &true).map_err(nix_io)?;
+            if setsockopt(&fd, sockopt::RcvBufForce, &RCVBUF).is_err() {
+                let _ = setsockopt(&fd, sockopt::RcvBuf, &RCVBUF);
+            }
             match addr {
                 SocketAddr::V4(a) => {
                     setsockopt(&fd, sockopt::Ipv4PacketInfo, &true).map_err(nix_io)?;
