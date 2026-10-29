@@ -6,6 +6,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("resources.card.disk", "## Disk\n\nFree space of the router's disk, its temperature and write rate."),
     ("resources.card.memory", "## Memory\n\nMemory in use (total minus available), pressure and swap."),
     ("resources.card.temperature", "## Temperature\n\nThe hottest sensor, its curve and its critical limit."),
+    ("resources.check.auth.no_password", "## Admin password\n\nAn account of group full without a password: anyone who reaches the router logs in with an empty password."),
     ("resources.check.cgnat.ports", "## CGNAT ports\n\nSubscribers above their pool's alert, connections without a free port."),
     ("resources.check.conntrack", "## Conntrack\n\nConnection table fill: 80/95 %."),
     ("resources.check.cpu", "## CPU\n\nAverage CPU load over 5 minutes: warning at 80 %, error at 95 %."),

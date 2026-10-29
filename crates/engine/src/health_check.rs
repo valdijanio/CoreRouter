@@ -148,6 +148,9 @@ pub struct Inputs {
     /// (socket, bytes given, bytes asked) of [`SocketBuffers`] (`None`:
     /// no service reported one).
     pub sockbuf: Option<Vec<(String, usize, usize)>>,
+    /// Enabled accounts of group full without a password (G0.3d): the
+    /// router takes an empty password from the network for them.
+    pub no_password: Vec<String>,
     /// Whether any reading exists at all.
     pub readings: bool,
 }
@@ -352,6 +355,19 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
         Some((true, NtpState::Stopped)) | None => push("ntp", "NTP", Severity::Unknown, None, "sem daemon rodando o cliente NTP".into(), None),
     }
 
+    // Accounts without a password (G0.3d): logins from any network with an
+    // empty password are accepted, as on a RouterOS CHR; the operator's
+    // choice, so a warning, never an error.
+    if i.no_password.is_empty() {
+        push("auth.no_password", "Admin password", Severity::Ok, None,
+            "todas as contas do grupo full têm senha".into(), None);
+    } else {
+        let names = i.no_password.iter().map(|n| n.chars().take(64).collect::<String>()).collect::<Vec<_>>().join(", ");
+        push("auth.no_password", "Admin password", Severity::Warning, Some(names.clone()),
+            format!("conta(s) {names} do grupo full sem senha: qualquer um que alcance o roteador pela rede entra com a senha vazia e o controla"),
+            Some("Defina a senha: botão \"Set password\" na barra da GUI, `/user set admin password=…` no terminal ou user.set."));
+    }
+
     // Supervised services.
     match &i.services {
         None => push("services", "Services", Severity::Unknown, None, "sem supervisor de serviços (laboratório)".into(), None),
@@ -512,6 +528,7 @@ impl Session {
             .ext::<ServiceTable>()
             .filter(|t| t.supervised)
             .map(|t| t.rows.iter().map(|r| (r.name.clone(), r.state)).collect());
+        i.no_password = self.admins_without_password();
         i
     }
 
@@ -587,13 +604,14 @@ mod tests {
             services: Some(vec![("dns-resolver".into(), ServiceState::Running)]),
             rss: Some((0, 20.0, 8, 50_000.0)),
             sockbuf: Some(vec![("radius".into(), 4 << 20, 4 << 20)]),
+            no_password: Vec::new(),
         }
     }
 
     #[test]
     fn healthy_is_all_ok() {
         let checks = evaluate(&healthy());
-        assert_eq!(checks.len(), 13);
+        assert_eq!(checks.len(), 14);
         for c in &checks {
             assert_eq!(c.severity, Severity::Ok, "{c:?}");
             assert!(c.action.is_none());
@@ -641,6 +659,7 @@ mod tests {
             ("rss on one cpu", |i| i.rss = Some((0, 80.0, 8, 50_000.0)), "rss", Severity::Warning),
             ("rss idle link", |i| i.rss = Some((0, 100.0, 8, 10.0)), "rss", Severity::Ok),
             ("rss two cpus", |i| i.rss = Some((0, 100.0, 2, 50_000.0)), "rss", Severity::Ok),
+            ("admin without a password", |i| i.no_password = vec!["admin".into()], "auth.no_password", Severity::Warning),
         ];
         for (what, change, key, want) in cases {
             let mut i = healthy();
@@ -665,6 +684,19 @@ mod tests {
         s.health_alerts();
         let log = s.execute("log.print", &serde_json::json!({})).unwrap().to_string();
         assert!(!log.contains("Saúde: NTP"), "{log}");
+    }
+
+    #[test]
+    fn admin_without_password_warns_until_set() {
+        let mut s = Session::virtual_lab();
+        assert!(s.bootstrap_admin(false).is_some());
+        let warn = |s: &mut Session| {
+            let checks = evaluate(&s.health_inputs());
+            checks.iter().find(|c| c.key == "auth.no_password").map(|c| c.severity)
+        };
+        assert_eq!(warn(&mut s), Some(Severity::Warning));
+        s.execute("user.set", &serde_json::json!({"name": "admin", "password": "a-real-password"})).unwrap();
+        assert_eq!(warn(&mut s), Some(Severity::Ok));
     }
 
     #[test]

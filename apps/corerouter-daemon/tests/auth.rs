@@ -283,13 +283,13 @@ fn admin_tls_login_local_token_and_reset() {
 }
 
 #[test]
-fn network_listener_warns_while_admin_has_no_password() {
+fn network_listener_takes_the_empty_password_with_a_warning() {
     let dir = std::env::temp_dir().join(format!("cr-auth-open-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let mut d = start_on(&dir, "0.0.0.0", &[]);
-    d.line("every network login is refused until a password is set");
-    // Reached through loopback it is still this machine: the empty login
-    // works (the refusal from other addresses is tested in control::auth).
+    d.line("anyone who reaches the router logs in with an empty password");
+    // G0.3d: the empty login works over TLS (other source addresses are
+    // tested in control::auth), and each one is a warning with its source.
     let fp = d.fingerprint();
     let port = d.tls.rsplit(':').next().unwrap().to_owned();
     let local = Target::parse(&format!("tls://127.0.0.1:{port}")).unwrap();
@@ -304,6 +304,7 @@ fn network_listener_warns_while_admin_has_no_password() {
         &mut Expect(fp),
     );
     assert!(c.is_ok(), "{:?}", c.err());
+    d.line("logged in WITHOUT A PASSWORD from 127.0.0.1");
     drop(d);
     let _ = std::fs::remove_dir_all(&dir);
 }
