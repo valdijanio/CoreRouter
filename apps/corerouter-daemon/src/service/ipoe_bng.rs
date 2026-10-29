@@ -1318,7 +1318,11 @@ impl IpoeBackend for Backend {
         let st = guard(&self.0.st);
         // G4.3hk: as `pppoe_bng::may_answer` (this file stands alone in
         // its bench): no pair here and none in `ppp-ha`, or the active.
-        if st.ha.enabled { st.ha.answering } else { !st.ha.paired }
+        if st.ha.enabled {
+            st.ha.answering
+        } else {
+            !st.ha.paired
+        }
     }
 
     fn takeover(&self) -> Option<(Vec<String>, Vec<Lease>)> {

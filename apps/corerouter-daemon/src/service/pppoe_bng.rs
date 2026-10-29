@@ -1166,7 +1166,11 @@ pub(crate) static HA_ACTIVE: std::sync::atomic::AtomicBool =
 /// must agree: no pair on either side answers as before; a pair on either
 /// side answers only when active and configured (from the virtual MAC).
 pub(crate) fn ha_may_answer(configured: bool, active: bool) -> bool {
-    may_answer(configured, HA_PAIRED.load(std::sync::atomic::Ordering::Acquire), active)
+    may_answer(
+        configured,
+        HA_PAIRED.load(std::sync::atomic::Ordering::Acquire),
+        active,
+    )
 }
 
 pub(crate) fn may_answer(configured: bool, paired: bool, active: bool) -> bool {
