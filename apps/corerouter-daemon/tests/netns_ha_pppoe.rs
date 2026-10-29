@@ -38,12 +38,13 @@ mod common;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::*;
 use corerouter_hal_linux::pppoe_io::PppoePort;
 use corerouter_model::IfName;
-use corerouter_proto_pppoe::client::{Client, ClientConfig, ClientEvent, ClientOutput};
+use corerouter_proto_pppoe::client::{Client, ClientConfig, ClientDown, ClientEvent, ClientOutput};
 use corerouter_proto_pppoe::layers::AuthSet;
 use corerouter_proto_pppoe::wire::Mac;
 use serde_json::{Value, json};
@@ -51,8 +52,13 @@ use serde_json::{Value, json};
 const SECRET: &str = "segredo-do-par-de-teste";
 const VMAC: [u8; 6] = [0x02, 0x43, 0x52, 0x48, 0x41, 0x01];
 
-fn daemon(netns: Option<u32>, dir: &Path, log: &str) -> Kill {
-    let log = std::fs::File::create(std::env::temp_dir().join(log)).unwrap();
+/// The daemon's log, kept in its config dir for [`Diag`].
+fn log_of(dir: &Path) -> PathBuf {
+    dir.join("daemon.log")
+}
+
+fn daemon(netns: Option<u32>, dir: &Path) -> Kill {
+    let log = std::fs::File::create(log_of(dir)).unwrap();
     let mut c = in_ns(netns, DAEMON);
     c.args([
         "--backend",
@@ -145,6 +151,32 @@ struct Cpes {
     origin: Instant,
     out: ClientOutput,
     downs: usize,
+    /// What the CPEs saw, for [`Diag`] (G4.3hk).
+    seen: Arc<Mutex<Seen>>,
+    /// When the last [`Cpes::run_until`] returned: nobody answers the
+    /// BNG's echoes between two of them.
+    left: Option<Instant>,
+}
+
+/// The CPEs' side of a failure (G4.3hk): why the sessions fell, when, and
+/// the longest stretch nobody served them.
+#[derive(Default)]
+struct Seen {
+    by_reason: HashMap<ClientDown, usize>,
+    /// The first downs: ms since the CPEs started, CPE, reason.
+    first: Vec<(u64, usize, ClientDown)>,
+    /// The longest time between two `run_until` calls, and where it ended.
+    max_unattended: (Duration, &'static str),
+}
+
+impl std::fmt::Display for Seen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "downs by reason {:?}; first downs (ms, cpe, reason) {:?}; longest unattended {:?} before {}",
+            self.by_reason, self.first, self.max_unattended.0, self.max_unattended.1
+        )
+    }
 }
 
 impl Cpes {
@@ -180,6 +212,8 @@ impl Cpes {
             origin: Instant::now(),
             out: ClientOutput::new(),
             downs: 0,
+            seen: Arc::default(),
+            left: None,
         }
     }
 
@@ -195,8 +229,30 @@ impl Cpes {
         }
     }
 
-    fn run_until(&mut self, secs: u64, mut done: impl FnMut(&Self) -> bool) -> Option<Duration> {
+    fn run_until(
+        &mut self,
+        what: &'static str,
+        secs: u64,
+        mut done: impl FnMut(&Self) -> bool,
+    ) -> Option<Duration> {
         let start = Instant::now();
+        if let Some(gap) = self.left.map(|t| t.elapsed()) {
+            let mut seen = self.seen.lock().unwrap();
+            if gap > seen.max_unattended.0 {
+                seen.max_unattended = (gap, what);
+            }
+        }
+        let r = self.serve(secs, &mut done, start);
+        self.left = Some(Instant::now());
+        r
+    }
+
+    fn serve(
+        &mut self,
+        secs: u64,
+        done: &mut impl FnMut(&Self) -> bool,
+        start: Instant,
+    ) -> Option<Duration> {
         while start.elapsed() < Duration::from_secs(secs) {
             let now = self.now();
             let mut frames: Vec<Vec<u8>> = Vec::new();
@@ -229,10 +285,16 @@ impl Cpes {
         for ev in self.out.events.drain(..) {
             match ev {
                 ClientEvent::Up { ac_mac, .. } => self.up[c] = Some(ac_mac.0),
-                ClientEvent::Down { .. } => {
+                ClientEvent::Down { reason } => {
                     self.up[c] = None;
                     self.downs += 1;
                     again = true;
+                    let at = self.origin.elapsed().as_millis() as u64;
+                    let mut seen = self.seen.lock().unwrap();
+                    *seen.by_reason.entry(reason).or_default() += 1;
+                    if seen.first.len() < 10 {
+                        seen.first.push((at, c, reason));
+                    }
                 }
             }
         }
@@ -261,8 +323,74 @@ fn query_helper() {
     common::query_helper();
 }
 
-/// The pair, the CPEs up on A; returns what the takeover test needs.
-fn pair(mode: &str) -> (Kill, Kill, Kill, Cpes, u32, usize) {
+/// On a failure (G4.3hk), dumps what the CPEs saw, both nodes' roles and
+/// transitions, their session history and the end of their logs, while
+/// the daemons still run (it is dropped before them).
+struct Diag {
+    b: u32,
+    logs: [PathBuf; 2],
+    seen: Option<Arc<Mutex<Seen>>>,
+}
+
+impl Drop for Diag {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            if let Some(seen) = &self.seen {
+                eprintln!("CPEs: {}", seen.lock().unwrap_or_else(|e| e.into_inner()));
+            }
+            return;
+        }
+        eprintln!("==== G4.3hk diagnostics ====");
+        if let Some(seen) = &self.seen {
+            eprintln!("CPEs: {}", seen.lock().unwrap_or_else(|e| e.into_inner()));
+        }
+        for (name, ns) in [("A", None), ("B", Some(self.b))] {
+            match call(ns, "ppp.redundancy.monitor", json!({})) {
+                Ok(m) => eprintln!(
+                    "{name} monitor: role {} epoch {} peer {} in_sync {} sync {} history {} takeovers {} alerts {} last_error {}",
+                    m["role"],
+                    m["epoch"],
+                    m["peer"],
+                    m["in_sync"],
+                    m["sync"],
+                    m["history"],
+                    m["takeovers"],
+                    m["alerts"],
+                    m["last_error"]
+                ),
+                Err(e) => eprintln!("{name} monitor: {e}"),
+            }
+            match call(ns, "ppp.history", json!({"limit": 15})) {
+                Ok(h) => eprintln!("{name} ppp.history: {h}"),
+                Err(e) => eprintln!("{name} ppp.history: {e}"),
+            }
+        }
+        for (name, log) in ["A", "B"].iter().zip(&self.logs) {
+            let text = std::fs::read_to_string(log).unwrap_or_default();
+            let lines: Vec<&str> = text.lines().collect();
+            eprintln!("---- {name} log ({}), last 80 lines ----", log.display());
+            for l in lines.iter().skip(lines.len().saturating_sub(80)) {
+                eprintln!("{l}");
+            }
+        }
+        eprintln!("==== end of diagnostics ====");
+    }
+}
+
+/// The pair with its CPEs up on A. Fields drop in order: [`Diag`] first,
+/// while the daemons still answer.
+struct Pair {
+    _diag: Diag,
+    cpes: Cpes,
+    a: Option<Kill>,
+    _b_daemon: Kill,
+    _holder: Kill,
+    b: u32,
+    n: usize,
+}
+
+/// The pair, the CPEs up on A.
+fn pair(mode: &str) -> Pair {
     let n: usize = std::env::var("COREROUTER_HA_CPES")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -316,8 +444,13 @@ fn pair(mode: &str) -> (Kill, Kill, Kill, Cpes, u32, usize) {
     }
 
     let (dir_a, dir_b) = (temp_dir("a"), temp_dir("b"));
-    let a = daemon(None, &dir_a, "g43h-pppoe-a.log");
-    let b_daemon = daemon(Some(b), &dir_b, "g43h-pppoe-b.log");
+    let a = daemon(None, &dir_a);
+    let b_daemon = daemon(Some(b), &dir_b);
+    let mut diag = Diag {
+        b,
+        logs: [log_of(&dir_a), log_of(&dir_b)],
+        seen: None,
+    };
     configure(None, "10.9.0.2", 200, mode);
     configure(Some(b), "10.9.0.1", 100, mode);
     wait_for("A active, B standby", || {
@@ -325,10 +458,11 @@ fn pair(mode: &str) -> (Kill, Kill, Kill, Cpes, u32, usize) {
     });
 
     let mut cpes = Cpes::new(n);
+    diag.seen = Some(cpes.seen.clone());
     cpes.start_all();
     let t = cpes
-        .run_until(120, |c| c.ups() == n)
-        .expect("every CPE up on A");
+        .run_until("the first dial", 120, |c| c.ups() == n)
+        .unwrap_or_else(|| panic!("every CPE up on A: {} of {n}", cpes.ups()));
     eprintln!("{n} CPEs up on A in {t:?}");
     assert!(
         cpes.up.iter().all(|u| *u == Some(VMAC)),
@@ -338,10 +472,18 @@ fn pair(mode: &str) -> (Kill, Kill, Kill, Cpes, u32, usize) {
     assert_eq!(active(Some(b)), 0, "the standby answered nobody");
     // Steady state: the standby sends nothing (a PADT of its own to these
     // sessions would end them), the CPEs' keepalive is answered by A.
-    cpes.run_until(5, |_| false);
+    cpes.run_until("the steady state", 5, |_| false);
     assert_eq!(cpes.downs, 0, "no CPE fell while A serves");
 
-    (holder, a, b_daemon, cpes, b, n)
+    Pair {
+        _diag: diag,
+        cpes,
+        a: Some(a),
+        _b_daemon: b_daemon,
+        _holder: holder,
+        b,
+        n,
+    }
 }
 
 /// Removes what [`pair`] made in this namespace (B's goes with its holder).
@@ -365,11 +507,13 @@ fn a_pair_serves_pppoe_stateless_and_hot_standby() {
 }
 
 fn stateless_the_cpes_redial_on_the_new_active() {
-    let (_holder, a, _b_daemon, mut cpes, b, n) = pair("stateless");
+    let mut p = pair("stateless");
+    let (b, n) = (p.b, p.n);
+    let cpes = &mut p.cpes;
     // A dies: B takes over; the CPEs redial on B.
-    drop(a);
+    drop(p.a.take());
     let t = cpes
-        .run_until(180, |c| c.ups() == n && c.downs >= n)
+        .run_until("the redial on B", 180, |c| c.ups() == n && c.downs >= n)
         .expect("every CPE back, on B");
     eprintln!(
         "{n} CPEs back on B {t:?} after A died ({} downs)",
@@ -384,18 +528,20 @@ fn stateless_the_cpes_redial_on_the_new_active() {
 }
 
 fn hot_standby_keeps_every_session_when_the_active_dies() {
-    let (_holder, a, _b_daemon, mut cpes, b, n) = pair("hot-standby");
+    let mut p = pair("hot-standby");
+    let (b, n) = (p.b, p.n);
+    let cpes = &mut p.cpes;
     // The standby's replica holds every session.
     wait_for("the replica", || {
         call(Some(b), "ppp.redundancy.monitor", json!({}))
             .is_ok_and(|m| m["sync"]["synced"].as_u64() == Some(n as u64) && m["in_sync"] == true)
     });
-    drop(a);
+    drop(p.a.take());
     let killed = Instant::now();
     wait_for("B active", || role(Some(b)) == "active");
     let took = killed.elapsed();
     // Ten seconds of keepalive (1 s × 3 on the CPEs) on B: nobody falls.
-    cpes.run_until(10, |_| false);
+    cpes.run_until("the takeover", 10, |_| false);
     eprintln!(
         "{n} sessions on B {took:?} after A died; {} CPEs went down",
         cpes.downs
@@ -465,7 +611,9 @@ fn addresses(netns: Option<u32>) -> Vec<(std::net::Ipv4Addr, Value)> {
 
 fn coa_to_the_old_active_reaches_the_new_one() {
     use corerouter_proto_radius::packet::Code;
-    let (_holder, _a, _b_daemon, mut cpes, b, n) = pair("hot-standby");
+    let mut p = pair("hot-standby");
+    let (b, n) = (p.b, p.n);
+    let cpes = &mut p.cpes;
     radius_incoming(None);
     radius_incoming(Some(b));
     wait_for("both listening for CoA", || {
@@ -491,7 +639,7 @@ fn coa_to_the_old_active_reaches_the_new_one() {
         role(Some(b)) == "active" && role(None) == "standby"
     });
     wait_for("B holds every session", || active(Some(b)) == n);
-    cpes.run_until(3, |_| false);
+    cpes.run_until("the switchover", 3, |_| false);
     // CoA to A: B applies it, A answers ACK.
     let on_b = addresses(Some(b));
     let mut times = Vec::new();
@@ -505,12 +653,23 @@ fn coa_to_the_old_active_reaches_the_new_one() {
         times.push(t);
     }
     times.sort();
-    let rate_on_b = addresses(Some(b))
-        .into_iter()
-        .filter(|(ip, _)| on_b.iter().take(20).any(|(x, _)| x == ip))
-        .filter(|(_, r)| r["rate_limit"] == "9M/9M")
-        .count();
-    assert_eq!(rate_on_b, 20.min(on_b.len()), "B applied the rate");
+    let without_rate = || {
+        addresses(Some(b))
+            .into_iter()
+            .filter(|(ip, _)| on_b.iter().take(20).any(|(x, _)| x == ip))
+            .filter(|(_, r)| r["rate_limit"] != "9M/9M")
+            .map(|(ip, r)| format!("{ip} {}", r["rate_limit"]))
+            .collect::<Vec<_>>()
+    };
+    let missing = without_rate();
+    if !missing.is_empty() {
+        // G4.3hk: late or never? Look again after a while.
+        std::thread::sleep(Duration::from_secs(2));
+        panic!(
+            "B applied the rate: without it right after the ACKs {missing:?}, 2 s later {:?}",
+            without_rate()
+        );
+    }
     // An address nobody holds: NAK 503, through the peer.
     let (code, cause, _) = coa_to_a(&sock, 40, "198.18.0.1".parse().unwrap(), None);
     assert_eq!((code, cause), (Code::DisconnectNak, Some(503)));
