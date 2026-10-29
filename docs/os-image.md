@@ -93,6 +93,12 @@ netlink-sys, já no `Cargo.lock`):
    o botão de energia ACPI (o "Shutdown" do hipervisor, `virsh shutdown`, o botão do servidor)
    chega como SIGUSR2 pelo `CONFIG_ACPI_TINY_POWER_BUTTON` do kernel e desliga do mesmo jeito
    (G1.6q).
+   Pela rede, `system.reboot {confirm: true}` e `system.shutdown {confirm: true}` (como o
+   `/system reboot|shutdown` do RouterOS; no terminal `/system reboot confirm=yes`) pedem o mesmo
+   ao PID 1: o serviço `power` do daemon manda SIGTERM ou SIGUSR2 ao init, e o SIGTERM que o init
+   devolve ao daemon grava o checkpoint da config (G0.27). Recusados sem `force` em Safe Mode
+   (o boot desfaria as mudanças) ou com mudanças de transação pendentes; fora da imagem (PID 1
+   que não é o `corerouter-init`) ficam desligados com o motivo (G1.6qa).
 
 **Sem shell por padrão.** `corerouter.shell=ttyS0` na linha de comando abre um `sh` do busybox
 naquela console (aberto de novo 1 s depois de sair: `exit`, Ctrl-D), para laboratório e
