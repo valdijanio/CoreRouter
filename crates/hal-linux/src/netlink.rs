@@ -29,7 +29,7 @@ use rtnetlink::packet_route::route::{
 };
 use rtnetlink::{
     AddressMessageBuilder, Handle, LinkBond, LinkBridge, LinkDummy, LinkMessageBuilder, LinkUnspec,
-    LinkVlan, LinkVrf, RouteMessageBuilder,
+    LinkVeth, LinkVlan, LinkVrf, RouteMessageBuilder,
 };
 
 use crate::owner::KernelLink;
@@ -643,6 +643,7 @@ impl Link {
             LinkSpec::Dummy => InfoKind::Dummy,
             LinkSpec::Vrf { .. } => InfoKind::Vrf,
             LinkSpec::Bond { .. } => InfoKind::Bond,
+            LinkSpec::PppoeOut { .. } => InfoKind::Veth,
         };
         self.kind.as_ref() == Some(&want)
     }
@@ -658,7 +659,7 @@ impl Link {
                 } => self.vlan_id == Some(*vlan_id) && self.vlan_service_tag == *service_tag,
                 LinkSpec::Vrf { table } => self.vrf_table == Some(*table),
                 LinkSpec::Bond { mode, .. } => self.bond_mode == Some(kernel_bond_mode(*mode)),
-                LinkSpec::Bridge | LinkSpec::Dummy => true,
+                LinkSpec::Bridge | LinkSpec::Dummy | LinkSpec::PppoeOut { .. } => true,
             }
     }
 
@@ -727,7 +728,17 @@ struct Kernel {
 
 impl Kernel {
     async fn find(&self, name: &IfName) -> Result<Option<Link>, String> {
-        let mut s = self.handle.link().get().match_name(name.as_str()).execute();
+        self.find_str(name.as_str()).await
+    }
+
+    /// [`Self::find`] for a kernel name the model does not hold (a relay end).
+    async fn find_str(&self, name: &str) -> Result<Option<Link>, String> {
+        let mut s = self
+            .handle
+            .link()
+            .get()
+            .match_name(name.to_owned())
+            .execute();
         match s.try_next().await {
             Ok(Some(m)) => Ok(Some(Link::parse(&m))),
             Ok(None) => Ok(None),
@@ -855,9 +866,11 @@ impl Kernel {
     async fn create(&self, link: &IfName, spec: &LinkSpec) -> Result<Vec<Op>, String> {
         let parent = match spec {
             LinkSpec::Vlan { parent, .. } => Some(self.require(parent).await?.index),
-            LinkSpec::Bridge | LinkSpec::Dummy | LinkSpec::Vrf { .. } | LinkSpec::Bond { .. } => {
-                None
-            }
+            LinkSpec::Bridge
+            | LinkSpec::Dummy
+            | LinkSpec::Vrf { .. }
+            | LinkSpec::Bond { .. }
+            | LinkSpec::PppoeOut { .. } => None,
         };
         if let Some(l) = self.find(link).await? {
             // Same link already there (daemon restart): adopt it, nothing to undo.
@@ -896,6 +909,8 @@ impl Kernel {
             (LinkSpec::Bridge, _) => LinkMessageBuilder::<LinkBridge>::new(name).build(),
             (LinkSpec::Dummy, _) => LinkMessageBuilder::<LinkDummy>::new(name).build(),
             (LinkSpec::Vrf { table }, _) => LinkVrf::new(name, *table).build(),
+            // No ARP on a point-to-point link: the relay owns the far end.
+            (LinkSpec::PppoeOut { peer }, _) => LinkVeth::new(name, peer).arp(false).build(),
             (
                 LinkSpec::Bond {
                     mode,
@@ -933,10 +948,29 @@ impl Kernel {
             .execute()
             .await
             .map_err(|e| create_error(spec, errno(&e), readable(&e)))?;
+        if let LinkSpec::PppoeOut { peer } = spec {
+            self.relay_end_up(peer).await?;
+        }
         Ok(vec![Op::DeleteLink {
             link: link.clone(),
             spec: spec.clone(),
         }])
+    }
+
+    /// The relay end of a PPPoE client's veth up, and quiet: no IPv6
+    /// link-local of its own (it never routes), `addrgenmode none` would
+    /// need IFLA_AF_SPEC, so the relay simply ignores what the kernel sends.
+    async fn relay_end_up(&self, peer: &str) -> Result<(), String> {
+        let l = self
+            .find_str(peer)
+            .await?
+            .ok_or_else(|| format!("relay end '{peer}' missing right after creating it"))?;
+        self.handle
+            .link()
+            .change(LinkUnspec::new_with_index(l.index).up().arp(false).build())
+            .execute()
+            .await
+            .map_err(|e| format!("relay end '{peer}' up: {}", readable(&e)))
     }
 
     /// Bond settings on the live bond, same ifindex, slaves untouched

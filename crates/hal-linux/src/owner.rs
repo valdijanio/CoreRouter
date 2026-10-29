@@ -174,6 +174,8 @@ fn claim_fits(claim: &InterfaceKind, link: &KernelLink) -> bool {
         InterfaceKind::Loopback => link.is("dummy"),
         InterfaceKind::Vrf { .. } => link.is("vrf"),
         InterfaceKind::Bonding { .. } => link.is("bond"),
+        // The session's netdev is one end of a veth pair (G3.9ga).
+        InterfaceKind::PppoeClient(_) => link.is("veth"),
     }
 }
 
@@ -243,9 +245,22 @@ pub fn classify(
             .ok()
             .and_then(|n| claims.get(&n).cloned())
     };
+    // The hidden ends of the PPPoE clients' veth pairs (G3.9ga) are
+    // CoreRouter's, but no interface of the config: never seeded as ports.
+    let relay_ends: BTreeMap<String, &IfName> = claims
+        .iter()
+        .filter(|(_, k)| matches!(k, InterfaceKind::PppoeClient(_)))
+        .map(|(n, _)| (corerouter_model::pppoe_client::relay_peer(n.as_str()), n))
+        .collect();
     let mut out: BTreeMap<u32, Owner> = links
         .iter()
-        .map(|l| (l.index, base(l, claim(l).as_ref(), policy)))
+        .map(|l| match relay_ends.get(&l.name) {
+            Some(client) if l.is("veth") => (
+                l.index,
+                Owner::External(format!("the relay end of PPPoE client '{client}'")),
+            ),
+            _ => (l.index, base(l, claim(l).as_ref(), policy)),
+        })
         .collect();
     let names: BTreeMap<u32, &str> = links.iter().map(|l| (l.index, l.name.as_str())).collect();
     // Rule 4, to a fixed point (a bridge in an external VRF…). Each pass
@@ -515,5 +530,27 @@ mod tests {
         }
         let v = verdicts(&links, &[], &Policy::default());
         assert!(reason(&v, "lo").contains("add a loopback named 'lo'"));
+    }
+
+    /// G3.9ga: the client's netdev is ours; the relay end of its veth is
+    /// CoreRouter's too, but never seeded as a port of its own.
+    #[test]
+    fn pppoe_client_veth_and_its_relay_end() {
+        let client = corerouter_model::pppoe_client::PppoeClient::new(n("ether1"), "u".into());
+        let links = [
+            link(2, "ether1", None),
+            link(3, "pppoe-out1", Some("veth")),
+            link(4, "pppoe-out1-r", Some("veth")),
+        ];
+        let claims = [
+            ("ether1", InterfaceKind::Ethernet),
+            ("pppoe-out1", InterfaceKind::PppoeClient(Box::new(client))),
+        ];
+        let v = verdicts(&links, &claims, &Policy::default());
+        assert!(managed(&v, "pppoe-out1"));
+        assert!(reason(&v, "pppoe-out1-r").contains("relay end of PPPoE client 'pppoe-out1'"));
+        // Without the claim (before the first apply) it is a plain veth.
+        let v = verdicts(&links, &[], &Policy::default());
+        assert!(managed(&v, "pppoe-out1-r"));
     }
 }

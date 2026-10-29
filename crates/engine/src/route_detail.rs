@@ -277,6 +277,14 @@ impl Session {
                     "client": owner.map(|r| r.cfg.id),
                 })
             }
+            (Origin::Ppp, _) => json!({
+                "kind": "ppp",
+                "text": format!(
+                    "PPPoE client {}",
+                    me.gateway_interface.as_ref().map(ToString::to_string).unwrap_or_default()
+                ),
+                "interface": me.gateway_interface,
+            }),
             (Origin::Ra, _) => json!({
                 "kind": "ra",
                 "text": format!(

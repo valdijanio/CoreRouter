@@ -885,6 +885,7 @@ fn type_icon(kind: &str) -> &'static str {
         "bridge" => crate::icons::SHARE_NETWORK,
         "bonding" => crate::icons::LINK,
         "vrf" => crate::icons::FOLDERS,
+        "pppoe-out" => crate::icons::LAPTOP,
         _ => crate::icons::SQUARES_FOUR,
     }
 }

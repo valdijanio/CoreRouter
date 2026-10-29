@@ -113,7 +113,8 @@ pub(crate) const CATALOG: &[Entry] = &[
     e("ospf", None, None, icons::GRAPH, "/routing ospf", &["routing.ospf"], &["area", "lsa", "igp", "ospfv2", "ospfv3", "vizinhos", "adjacência", "adjacency", "lsdb", "topologia", "topology", "spf", "dr", "bdr", "stub", "nssa", "área", "keychain", "exstart", "mtu"]),
     e("packages", None, None, icons::STACK_SIMPLE, "/system package", &["system.package"], &["update", "upgrade", "atualizar", "atualização", "firmware", "imagem", "image", "a/b", "rollback", "downgrade", "voltar versão", "npk", "add system image", "install", "instalar", "dm-verity"]),
     e("ping", None, None, icons::PULSE, "/tool ping", &["tool.ping"], &["icmp", "latência", "latency", "mtu"]),
-    e("ppp", None, None, icons::PLUGS, "/ppp", &["ppp", "interface.pppoe-server"], &["pppoe", "bng", "concentrador", "assinantes", "subscribers", "secrets", "profiles", "perfis", "active", "ativos", "online", "desconectar", "disconnect", "por que não sobe", "why", "accel-ppp", "pppoe-server", "rate limit", "plano"]),
+    e("ppp", None, Some("PPPoE Server (BNG)"), icons::HARD_DRIVES, "/ppp", &["ppp", "interface.pppoe-server"], &["pppoe", "pppoe server", "servidor pppoe", "bng", "concentrador", "assinantes", "subscribers", "secrets", "profiles", "perfis", "active", "ativos", "online", "desconectar", "disconnect", "por que não sobe", "why", "accel-ppp", "pppoe-server", "rate limit", "plano"]),
+    e("pppoe-client", None, Some("PPPoE Client"), icons::LAPTOP, "/interface pppoe-client", &["interface.pppoe-client"], &["pppoe", "pppoe client", "cliente pppoe", "pppoe-out", "discador", "dialer", "wan", "wan pppoe", "provedor", "isp", "uplink", "fibra", "pp0"]),
     e("queues", None, None, icons::GAUGE, "/queue", &["queue"], &["queue", "fila", "filas", "simple queue", "pcq", "per-ip", "limite de banda", "bandwidth limit", "rate limit", "controle de banda", "shaper", "policer", "fq-codel", "cake", "bufferbloat", "plano", "velocidade"]),
     e("radius", None, None, icons::KEY, "/radius", &["radius", "ppp.aaa"], &["aaa", "autenticação", "authentication", "accounting", "contabilização", "coa", "disconnect", "dm", "rfc 5176", "freeradius", "mk-auth", "ixc", "sgp", "hubsoft", "pppoe", "bng", "radtest", "nas"]),
     e("resources", None, None, icons::PULSE, "/system resource", &["system.resource", "system.health"], &["health", "saúde", "saude", "cpu", "memória", "memoria", "memory", "ram", "disk", "disco", "temperature", "temperatura", "sensores", "sensors", "fan", "ventoinha", "processos", "processes", "profile", "top", "htop", "uptime", "psi", "softirq", "irq", "rss"]),
@@ -546,6 +547,7 @@ fn badge_chip(ui: &mut Ui, b: &Badge) {
     let tone = match b.level {
         Level::Alert => crate::chip::RED.tone(v),
         Level::Notice => crate::chip::AMBER.tone(v),
+        Level::Info => crate::chip::neutral_tone(v),
     };
     crate::chip::chip(ui, &b.text, tone).on_hover_text(&b.tip);
 }

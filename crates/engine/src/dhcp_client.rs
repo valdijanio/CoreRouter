@@ -49,6 +49,7 @@ pub(crate) fn dyn_id(client: ItemId, n: usize) -> ItemId {
 /// v6) or the kernel learned from Router Advertisements.
 pub fn is_dynamic(id: ItemId) -> bool {
     id.0 & 0xFC00_0000 == DYN_BASE
+        || crate::pppoe_client::is_dynamic(id)
         || crate::dhcp6_client::is_dynamic6(id)
         || crate::dhcp6_client::is_learned(id)
 }
@@ -385,7 +386,12 @@ impl Session {
             .values()
             .all(|r| r.addresses.is_empty() && r.routes.is_empty() && r.fallback.is_none());
         let static_quiet = self.static_checks_quiet();
-        if v4_quiet && static_quiet && self.dhcp6_quiet(cfg) && self.dhcp6_server_quiet() {
+        if v4_quiet
+            && static_quiet
+            && self.dhcp6_quiet(cfg)
+            && self.dhcp6_server_quiet()
+            && self.pppoe_client_quiet()
+        {
             return Cow::Borrowed(cfg);
         }
         let mut out = cfg.clone();
@@ -415,6 +421,8 @@ impl Session {
         self.dhcp6_extend(cfg, &mut out);
         // Routes to the prefixes the DHCPv6 server delegated (G4.2c).
         self.dhcp6_server_extend(cfg, &mut out);
+        // PPPoE client sessions (G3.9ga).
+        self.pppoe_client_extend(cfg, &mut out);
         Cow::Owned(out)
     }
 
@@ -439,6 +447,8 @@ impl Session {
         // server (G4.2a) when no daemon service drives it.
         self.dhcp6_service(now_ms);
         self.dhcp_server_from_clock(now_ms);
+        // PPPoE clients (G3.9ga) run on the same clock.
+        self.pppoe_client_service(now_ms);
     }
 
     /// Apply what a state machine asked for (bind, unbind, log).
