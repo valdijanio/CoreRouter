@@ -311,7 +311,7 @@ fn messages(
                 c.max_frame_size = Some(MAX_REQUEST_LINE);
             });
         }
-        if let Err(e) = ws.send(Message::text(answer.reply.to_string())) {
+        if let Err(e) = ws.send(Message::text(answer.reply.into_text())) {
             return closed(e);
         }
     }
