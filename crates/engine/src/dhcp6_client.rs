@@ -187,7 +187,7 @@ pub fn lease_entries(
 }
 
 /// One pool as `ipv6.pool.list` shows it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Pool {
     pub name: String,
     pub client: ItemId,
