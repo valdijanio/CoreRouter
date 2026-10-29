@@ -367,6 +367,11 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
     `build.rs`, rótulos por `i18n::tr_in`); **não edite** as listas do `i18n/mod.rs`;
   - teste em namespace: `tests/netns<nome>.rs` em qualquer pacote — o `cargo xtask netns`
     descobre; não há lista para editar;
+  - teste de integração comum: `tests/it/<nome>.rs` + `mod <nome>;` em ordem alfabética no
+    `tests/it/main.rs` do crate (G0.29: um executável por crate em vez de um por arquivo; o
+    `cargo xtask fmt` reprova arquivo sem o `mod`). Fica em `tests/<nome>.rs`, binário
+    próprio, só o teste que precisa do processo dele: namespace (`netns*`), root (`*_root`,
+    `*_live`, `bng_lab*`), o que se reexecuta pelo nome ou muda estado global (logger);
   - módulo novo no engine, no model ou no mcp: só o arquivo `src/<nome>.rs` (ou
     `src/<nome>/mod.rs`) — o `build.rs` gera os `pub mod` (`build-support/root_modules.rs`);
     **não edite** a lista do `lib.rs`. Atributo do módulo vai dentro dele (`#![doc(hidden)]`).

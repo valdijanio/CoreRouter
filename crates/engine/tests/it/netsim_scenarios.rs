@@ -5,7 +5,7 @@
 //!
 //! A new one: build it in the window (or by commands), export with
 //! "expect", save it here. `NETSIM_WRITE=1 cargo test -p corerouter-engine
-//! --test netsim_scenarios -- --ignored` rewrites the bundled example.
+//! --test it netsim_scenarios:: -- --ignored` rewrites the bundled example.
 
 #![allow(
     clippy::unwrap_used,

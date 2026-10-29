@@ -152,7 +152,7 @@ por chave, e um roteador sela no máximo alguns milhões na vida.
 ## Desempenho
 
 **Medido** (build release, este laptop de desenvolvimento, 2026-10-26; `cargo test --release -p
-corerouter-engine --test ppp_import -- --ignored --nocapture`), 100 mil secrets com caller-id,
+corerouter-engine --test it ppp_import:: -- --ignored --nocapture`), 100 mil secrets com caller-id,
 comentário e endereço fixo, 17,0 MB de export:
 
 | etapa | tempo |
