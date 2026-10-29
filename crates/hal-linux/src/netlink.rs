@@ -1310,6 +1310,25 @@ impl Kernel {
 
     async fn add_route(&self, r: &KernelRoute) -> Result<Vec<Op>, String> {
         let l = self.require(&r.link).await?;
+        // Before the kernel's routes are read, try the add (it carries
+        // NLM_F_EXCL): a new prefix, the usual case, needs no dump of the
+        // whole table (76 ms with 60 000 routes, on every commit; G0.31).
+        // EEXIST means a route with this prefix, metric and table is
+        // there (ours after a restart, an ECMP sibling or someone else's):
+        // only then are they read, and the cases below decide.
+        if self.hops.borrow().is_none() {
+            match self
+                .handle
+                .route()
+                .add(route_msg(r, l.index)?)
+                .execute()
+                .await
+            {
+                Ok(()) => return Ok(vec![Op::DelRoute(r.clone())]),
+                Err(e) if errno(&e) == Some(EEXIST) => {}
+                Err(e) => return Err(readable(&e)),
+            }
+        }
         let siblings = self.siblings(r).await?;
         if siblings.contains(r) {
             // Exactly ours already (daemon restart): adopt it, nothing to undo.
