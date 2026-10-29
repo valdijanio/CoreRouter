@@ -532,8 +532,14 @@ fn keepalive_drops_a_silent_subscriber_after_the_timeout_not_later() {
             }
         }
         let gone = gone.expect("the silent subscriber is dropped");
-        assert!(gone <= T + 200, "cut at +{cut_offset} ms: dropped {gone} ms after the cut (timeout {T})");
-        assert!(gone >= T / 2, "cut at +{cut_offset} ms: dropped too early, {gone} ms");
+        assert!(
+            gone <= T + 200,
+            "cut at +{cut_offset} ms: dropped {gone} ms after the cut (timeout {T})"
+        );
+        assert!(
+            gone >= T / 2,
+            "cut at +{cut_offset} ms: dropped too early, {gone} ms"
+        );
         assert_eq!(l.servers[0].stats().keepalive_timeouts, 1);
     }
 }

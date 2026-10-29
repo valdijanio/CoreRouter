@@ -974,7 +974,9 @@ impl Session {
             self.echo_id = self.echo_id.wrapping_add(1);
             let body = self.lcp_l.echo_magic().to_be_bytes();
             self.send(env, proto::LCP, lc::ECHO_REQUEST, self.echo_id, &body);
-            self.echo_at = now.saturating_add(env.cfg.keepalive_interval_ms).min(dead_at);
+            self.echo_at = now
+                .saturating_add(env.cfg.keepalive_interval_ms)
+                .min(dead_at);
         }
         if !self.up && self.setup_deadline <= now {
             self.setup_deadline = now + env.cfg.fsm.restart_ms * 2;
