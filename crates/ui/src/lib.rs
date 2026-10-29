@@ -31,6 +31,11 @@ pub use windows::Win;
 
 /// Seconds between automatic refreshes of the live tables.
 const REFRESH_SECS: f64 = 1.0;
+/// The command catalogue (`engine.list`, ~300 KB on a router) is asked for
+/// again when what greys commands out changed (revision, pending changes,
+/// mode, Safe Mode), after an action, and at least this often (G1.6q: asked
+/// every second, it was ~250 KB/s per open GUI on the management link).
+const COMMANDS_SECS: f64 = 15.0;
 /// Repaint this often while replies are outstanding (a remote router).
 const PENDING_REPAINT: Duration = Duration::from_millis(50);
 const MAX_LOG: usize = 500;
@@ -92,6 +97,10 @@ struct Cache {
     neighbors: Vec<Value>,
     discovery: Value,
     refreshed_at: Option<f64>,
+    /// When the catalogue was last asked for by the timed refresh, and the
+    /// summary it was asked under (see [`COMMANDS_SECS`]).
+    commands_at: Option<f64>,
+    commands_sig: Value,
     /// Newest reply applied per field: an older one arriving late is dropped.
     applied: BTreeMap<Field, RequestId>,
 }
@@ -717,13 +726,30 @@ impl CoreRouterUi {
         {
             return;
         }
-        self.reload();
+        let sig = commands_signature(&self.cache.summary);
+        let commands = self.cache.commands.is_empty()
+            || sig != self.cache.commands_sig
+            || self
+                .cache
+                .commands_at
+                .is_none_or(|t| now - t >= COMMANDS_SECS);
+        self.reload_tables(commands);
+        if commands {
+            self.cache.commands_at = Some(now);
+            self.cache.commands_sig = sig;
+        }
         self.cache.refreshed_at = Some(now);
     }
 
-    /// Ask for every table again. Returns the id of the `interface.list`
-    /// (the other queries of the batch get larger ids).
+    /// Ask for every table again, the command catalogue included (after an
+    /// action: what it allows may have changed). Returns the id of the
+    /// `interface.list` (the other queries of the batch get larger ids).
     fn reload(&mut self) -> RequestId {
+        self.reload_tables(true)
+    }
+
+    /// [`Self::reload`], the catalogue only with `commands`.
+    fn reload_tables(&mut self, commands: bool) -> RequestId {
         let ask = |me: &mut Self, field: Field, method: &str, params: Value| {
             let id = me.backend.submit(method, params);
             me.pending.insert(id, Pending::Query(field));
@@ -759,7 +785,9 @@ impl CoreRouterUi {
             exec("config.history"),
         );
         ask(self, Field::Diff, "engine.execute", exec("config.diff"));
-        ask(self, Field::Commands, "engine.list", Value::Null);
+        if commands {
+            ask(self, Field::Commands, "engine.list", Value::Null);
+        }
         // An old router has no auth.whoami: no question it cannot answer.
         if !self.old_router() {
             ask(self, Field::Whoami, "auth.whoami", Value::Null);
@@ -1244,6 +1272,19 @@ fn form_number(s: &str) -> Value {
         Err(_) if s.is_empty() => Value::Null,
         Err(_) => json!(s),
     }
+}
+
+/// What in the summary (`state.inspect`) changes which commands are
+/// enabled: a change asks for the catalogue again (see [`COMMANDS_SECS`]).
+/// Not the Safe Mode countdown, which moves every second.
+fn commands_signature(summary: &Value) -> Value {
+    json!([
+        summary.get("revision"),
+        summary.get("pending_changes"),
+        summary.get("mode"),
+        summary.get("dirty"),
+        summary.pointer("/safe_mode/active"),
+    ])
 }
 
 fn value_text(v: &Value) -> String {
