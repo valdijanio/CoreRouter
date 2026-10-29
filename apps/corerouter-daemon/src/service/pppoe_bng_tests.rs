@@ -1497,6 +1497,29 @@ fn service_names_choose_the_profile_and_drop_rows_get_nothing() {
     }
 }
 
+/// G3.9g: the PADO's AC-Name is `/system identity`, as RouterOS sends it;
+/// a RouterOS CPE with `ac-name=<identity>` only takes that PADO. With no
+/// identity in the snapshot it stays "CoreRouter".
+#[test]
+fn pado_ac_name_is_the_system_identity() {
+    for (identity, want) in [("bng-sp1", "bng-sp1"), ("", "CoreRouter")] {
+        let mut s = snap(1, server(serde_json::json!({})), 10);
+        s.identity = identity.into();
+        let mut lab = Lab::new(1, s, |i| (format!("u{i}"), format!("p{i}")));
+        lab.start(0..1);
+        let names: Vec<Vec<u8>> = lab
+            .bng
+            .frames
+            .iter()
+            .filter_map(|(_, f)| corerouter_proto_pppoe::discovery::parse(f).ok())
+            .filter_map(|d| d.tags.ac_name.map(<[u8]>::to_vec))
+            .collect();
+        assert_eq!(names, vec![want.as_bytes().to_vec()], "identity {identity:?}");
+        lab.run(100, 50);
+        assert_eq!(lab.ups(), 1, "the client takes the PADO and comes up");
+    }
+}
+
 /// G4.3l: QinQ (802.1ad 100-101 outside, any C-tag inside), one session
 /// per line (TR-101 1:1): the second CPE on a line gets nothing; RADIUS
 /// gets the line in NAS-Port-Id (`ether2:<s>-<c>`) and the TR-101 ids;

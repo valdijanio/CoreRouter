@@ -91,7 +91,9 @@ pub(crate) struct Session {
     /// The peer sent something on LCP (it left Discovery).
     heard: bool,
     echo_at: Millis,
-    echo_misses: u8,
+    /// When the subscriber last sent anything (the keepalive measures from
+    /// here, not from the echo ticks).
+    heard_at: Millis,
     echo_id: u8,
     auth_deadline: Millis,
     setup_deadline: Millis,
@@ -201,7 +203,7 @@ impl Session {
             auth: AuthState::default(),
             heard: false,
             echo_at: 0,
-            echo_misses: 0,
+            heard_at: 0,
             echo_id: 0,
             auth_deadline: 0,
             setup_deadline: now + cfg.setup_timeout_ms,
@@ -425,7 +427,7 @@ impl Session {
     /// One Session-stage packet from the subscriber.
     pub fn receive(&mut self, env: &mut Env<'_>, protocol: u16, info: &[u8]) {
         // Any packet proves the peer alive (RouterOS keepalive semantics).
-        self.echo_misses = 0;
+        self.heard_at = env.now;
         match protocol {
             proto::LCP => {
                 self.heard = true;
@@ -521,7 +523,8 @@ impl Session {
     /// LCP Opened (tlu): start the keepalive and the Authenticate phase.
     fn lcp_up(&mut self, env: &mut Env<'_>) {
         if env.cfg.keepalive_interval_ms > 0 {
-            self.echo_at = env.now + env.cfg.keepalive_interval_ms;
+            self.echo_at = env.now + echo_step(env.cfg);
+            self.heard_at = env.now;
         }
         self.auth.proto = self.lcp_l.auth_agreed;
         match self.auth.proto {
@@ -953,17 +956,28 @@ impl Session {
             self.echo_at = 0;
         }
         if self.echo_at != 0 && self.echo_at <= now && self.lcp.is_opened() {
-            if self.echo_misses >= env.cfg.keepalive_misses {
+            // RouterOS keepalive-timeout: gone `interval × misses` after the
+            // last packet heard. Counting misses at the echo ticks let a dead
+            // subscriber live up to 1.5× that (42 s for 30 s against a
+            // RouterOS CPE, G3.9g).
+            let misses = u64::from(env.cfg.keepalive_misses.max(1));
+            let window = env.cfg.keepalive_interval_ms.saturating_mul(misses);
+            let dead_at = self.heard_at.saturating_add(window);
+            if now >= dead_at {
                 // The subscriber is gone: it would not answer Terminate.
                 env.stats.keepalive_timeouts += 1;
                 self.padt(env, DownReason::Keepalive);
                 return;
             }
-            self.echo_misses += 1;
             self.echo_id = self.echo_id.wrapping_add(1);
             let body = self.lcp_l.echo_magic().to_be_bytes();
             self.send(env, proto::LCP, lc::ECHO_REQUEST, self.echo_id, &body);
-            self.echo_at = now + env.cfg.keepalive_interval_ms;
+            // RFC 1661 §5.8: one lost echo is not a dead link. Probe every
+            // `window / (misses + 1)` so `misses` echoes (and their replies)
+            // fit before the deadline: with the period itself the second
+            // echo would land on the deadline and a single loss would kill
+            // the session (5 drops in the lossy QinQ simulation).
+            self.echo_at = now.saturating_add(echo_step(env.cfg)).min(dead_at);
         }
         if !self.up && self.setup_deadline <= now {
             self.setup_deadline = now + env.cfg.fsm.restart_ms * 2;
@@ -1081,8 +1095,17 @@ impl Session {
         }
         s.up = s.v4_up || s.v6_up;
         if cfg.keepalive_interval_ms > 0 {
-            s.echo_at = now + cfg.keepalive_interval_ms;
+            s.echo_at = now + echo_step(cfg);
+            s.heard_at = now;
         }
         s
     }
+}
+
+/// Echo period: `interval × misses / (misses + 1)`, so `misses` echoes go out
+/// (and can be answered) inside the keepalive window that starts at the last
+/// packet heard.
+fn echo_step(cfg: &ServerConfig) -> u64 {
+    let misses = u64::from(cfg.keepalive_misses.max(1));
+    (cfg.keepalive_interval_ms.saturating_mul(misses) / (misses + 1)).max(1)
 }

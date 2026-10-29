@@ -105,8 +105,9 @@ pub struct ServerConfig {
     pub max_mtu: u16,
     /// RFC 4638: largest PPP-Max-Payload we accept; `None` keeps 1492.
     pub max_payload: Option<u16>,
-    /// LCP echo period (RouterOS `keepalive-timeout` 10 s = two misses of
-    /// 5 s).
+    /// Keepalive unit (RouterOS `keepalive-timeout` 10 s = 5 s × two
+    /// misses): the session drops `interval × misses` after the last packet
+    /// heard, probing `misses` echoes inside that window.
     pub keepalive_interval_ms: u64,
     pub keepalive_misses: u8,
     /// RFC 1661 §4.6 timers and counters.
