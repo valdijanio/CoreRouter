@@ -6494,3 +6494,36 @@ continuação indentadas).
   `ether1 ether2 ether3 lo` e nada mais em `/sys/class/net`; marcador e mapa gravados; `exit` no
   shell e ele volta sem zumbi; instalador recusa `eth9`; assistente do qcow2 pelo número, com
   confirmação e resumo), `cargo xtask os boot-test`, `ab-test`, `frr-test` (agora em `ether1`).
+
+- 2026-10-28 — G0.3d: Acesso sem senha como no RouterOS CHR (G0.3d, parte a). No teste da imagem numa VM o usuário
+  pulou a senha no assistente e ficou trancado: o `admin` sem senha só entrava de `127.0.0.1` e
+  todo login pela rede era recusado (G0.3b), sem shell no console para definir a senha. Decisão
+  do usuário: aceitar a senha vazia de qualquer rede, como o CHR, sem forçar troca nem limitar
+  comandos, mas avisando sempre.
+
+  - **Control (`auth.login`):** a conta sem senha entra com a senha vazia de qualquer endereço
+    (fora do loopback é sempre TLS); a recusa `NO_PASSWORD_REMOTE` saiu (a constante fica para
+    os clientes reconhecerem roteadores entre G0.3b e G0.3d). Cada login sem senha é um aviso no
+    log do roteador (`log.print`, tópicos `system,account,warning`, origem `auth`) com usuário,
+    endereço de origem e canal, e uma linha `WARN` no log do daemon.
+  - **Saúde:** verificação nova `auth.no_password` ("Admin password"), `warning` enquanto uma
+    conta `full` ativa não tiver senha; entra no selo "1 warning" e no System › Resources (ⓘ em
+    inglês e português).
+  - **GUI:** selo âmbar `admin: no password` na barra de cima com o botão **Set password** e o ⓘ
+    (modal explicando o risco, catálogo `i18n/auto/first_login_*.rs`), em todo login e toda
+    janela; o diálogo de primeiro acesso diz que a senha vazia vale pela rede ("Not now" segue).
+  - **CLI e MCP:** uma linha `WARNING: user(s) admin of group full have no password…` no login
+    (stderr); no MCP o aviso vai também na descrição do backend nas instruções do servidor. O
+    terminal (`corerouter-cli shell`, New Terminal) diz o mesmo antes de perguntar a senha.
+  - **Daemon e assistente de primeiro boot:** saiu "every network login is refused until a
+    password is set"; o assistente (`apps/corerouter-init/src/setup.rs`) mantém a senha opcional
+    e termina dizendo que dá para entrar pela rede com a senha vazia e defini-la depois.
+  - Docs: `CLAUDE.md`/`AGENTS.md`, `docs/control-protocol.md`, `docs/producao-core.md` e o
+    critério da G0.3b em `docs/gaps.md`.
+
+  Como testar: `cargo nextest run -p corerouter-control auth::tests::no_password_admin_logs_in_from_anywhere_and_is_logged`,
+  `-p corerouter-daemon network_listener_takes_the_empty_password_with_a_warning`,
+  `-p corerouter-engine admin_without_password_warns_until_set`, `-p corerouter-ui first_login`.
+  Na mão: `corerouter-daemon --control 7311 --config-dir /tmp/cr`, a GUI com `--connect
+  127.0.0.1:7311` mostra o selo e "1 warning"; `corerouter-cli --connect 127.0.0.1:7311 run
+  system.identity.get` imprime o aviso.
