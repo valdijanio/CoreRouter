@@ -198,6 +198,7 @@ enum SetC {
     LocalPref(u32),
     Med(u32),
     Prepend(u8),
+    Gw(std::net::IpAddr),
     Comm(CommHow, Vec<u32>),
     Large(CommHow, Vec<Large>),
 }
@@ -312,6 +313,41 @@ pub fn jumps(body: &[Stmt], out: &mut Vec<String>) {
             _ => {}
         }
     }
+}
+
+/// The next hops `set gw` writes in chain `chain` or a chain it jumps
+/// to (G3.9fh), in rule order.
+pub fn chain_gws(filter: &RoutingFilter, chain: &str) -> Vec<std::net::IpAddr> {
+    fn walk(body: &[Stmt], out: &mut Vec<std::net::IpAddr>, next: &mut Vec<String>) {
+        for s in body {
+            match s {
+                Stmt::Set(super::parse::SetOp::Gw(a)) => out.push(*a),
+                Stmt::Jump(c) => next.push(c.clone()),
+                Stmt::If { then, els, .. } => {
+                    walk(then, out, next);
+                    walk(els, out, next);
+                }
+                _ => {}
+            }
+        }
+    }
+    let (parsed, _) = parsed_chains(filter);
+    let mut out = Vec::new();
+    let mut seen = vec![chain.to_owned()];
+    let mut i = 0;
+    while let Some(name) = seen.get(i).cloned() {
+        i += 1;
+        let mut next = Vec::new();
+        if let Some((_, b)) = parsed.iter().find(|(n, _)| *n == name) {
+            walk(b, &mut out, &mut next);
+        }
+        for n in next {
+            if !seen.contains(&n) {
+                seen.push(n);
+            }
+        }
+    }
+    out
 }
 
 /// The chains in a jump loop (each reported once), as "a → b → a".
@@ -539,6 +575,7 @@ impl Builder<'_> {
                     SetOp::LocalPref(v) => SetC::LocalPref(*v),
                     SetOp::Med(v) => SetC::Med(*v),
                     SetOp::Prepend(n) => SetC::Prepend(*n),
+                    SetOp::Gw(a) => SetC::Gw(*a),
                     SetOp::Comm { large, how, arg } => {
                         let (n, l) = self.comm_values(arg, *large);
                         if *large {
@@ -764,6 +801,12 @@ fn apply(s: &SetC, ctx: &mut Ctx<'_>, asn: u32) {
     {
         return;
     }
+    // G3.9fh: a next hop of the other family leaves the route alone.
+    if let SetC::Gw(a) = s
+        && a.is_ipv4() != matches!(ctx.route.prefix, ipnet::IpNet::V4(_))
+    {
+        return;
+    }
     let counted = ctx.counted;
     let r = ctx.route.to_mut();
     match s {
@@ -775,6 +818,7 @@ fn apply(s: &SetC, ctx: &mut Ctx<'_>, asn: u32) {
             r.as_path = path;
             ctx.path = None;
         }
+        SetC::Gw(a) => r.next_hop = Some(*a),
         SetC::Comm(how, vals) => change(*how, vals, &mut r.communities),
         SetC::Large(how, vals) => change(*how, vals, &mut r.large),
     }

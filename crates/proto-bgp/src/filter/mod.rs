@@ -159,6 +159,9 @@ pub struct Route {
     pub large: Vec<Large>,
     pub med: Option<u32>,
     pub local_pref: Option<u32>,
+    /// The next hop a chain set (`set gw`, G3.9fh); `None`: the one the
+    /// route came with.
+    pub next_hop: Option<std::net::IpAddr>,
 }
 
 impl Route {
@@ -171,6 +174,7 @@ impl Route {
             large: Vec::new(),
             med: None,
             local_pref: None,
+            next_hop: None,
         }
     }
 

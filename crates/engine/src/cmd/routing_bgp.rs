@@ -817,13 +817,29 @@ fn preview(s: &mut Session, raw: &Value, what: What) -> Result<Value> {
                 // G3.9f: RouterOS 7.25 sends IPv6 over an IPv4 session with an
                 // IPv4-mapped next hop (::ffff:a.b.c.d); RFC 2545 §3 asks for a
                 // global IPv6 address and no kernel installs the mapped one.
+                // G3.9fh: the input chain can write the neighbor's IPv6
+                // address over it (`set gw`).
                 if c.remote_address.is_ipv4() && eff.families().contains(&Afi::Ipv6) {
-                    checks.push(check(
-                        "info",
-                        "mpbgp-nexthop",
-                        "IPv6 over an IPv4 session: the neighbor must send a global IPv6 next hop (RFC 2545 §3); RouterOS sends an IPv4-mapped one (::ffff:…) that is not installed, so use a second connection to its IPv6 address with afi=ipv6".to_owned(),
-                        "afi",
-                    ));
+                    let gw6 = eff.input_filter.as_deref().and_then(|ch| {
+                        corerouter_proto_bgp::filter::eval::chain_gws(&routing.filter, ch).into_iter().find(std::net::IpAddr::is_ipv6)
+                    });
+                    match gw6 {
+                        Some(g) => checks.push(check(
+                            "info",
+                            "mpbgp-nexthop",
+                            format!("IPv6 over an IPv4 session: the input chain sets the IPv6 next hop to {g} (set gw), so the IPv4-mapped one RouterOS sends (::ffff:…) is replaced and the routes are installed"),
+                            "input_filter",
+                        )),
+                        None => checks.push(check(
+                            "warning",
+                            "mpbgp-nexthop",
+                            format!(
+                                "IPv6 over an IPv4 session: RouterOS sends an IPv4-mapped next hop (::ffff:{}) that the kernel does not install (RFC 2545 §3 asks for a global IPv6 one); in the input chain write the neighbor's IPv6 address on this link over it, `if (afi ipv6) {{ set gw <its IPv6> }}`, or use a second connection to its IPv6 address with afi=ipv6",
+                                c.remote_address
+                            ),
+                            "input_filter",
+                        )),
+                    }
                 }
             }
         }
@@ -1152,6 +1168,21 @@ mod tests {
                 .unwrap();
             assert!(!v["checks"].to_string().contains("RFC 2545"), "{addr} {afi}: {v}");
         }
+        // G3.9fh: the warning says what to write; an input chain that
+        // writes the neighbor's IPv6 address over the mapped one settles it.
+        assert!(v_warns(&mut s, None).contains("set gw"));
+        s.execute("routing.filter.rule.add", &json!({"chain": "chr-in", "rule": "if (afi ipv6) { set gw 2001:db8:1::1 } accept"})).unwrap();
+        let ok = v_warns(&mut s, Some("chr-in"));
+        assert!(ok.contains("sets the IPv6 next hop to 2001:db8:1::1") && ok.contains("\"info\""), "{ok}");
+    }
+
+    fn v_warns(s: &mut Session, input: Option<&str>) -> String {
+        let mut p = json!({"name": "up1", "remote_address": "192.0.2.1", "remote_as": 64500, "afi": "ip,ipv6"});
+        if let (Some(i), Some(o)) = (input, p.as_object_mut()) {
+            o.insert("input_filter".into(), json!(i));
+        }
+        let v = s.execute("routing.bgp.connection.check", &p).unwrap();
+        v["checks"].as_array().unwrap().iter().filter(|c| c["check"] == "mpbgp-nexthop").map(ToString::to_string).collect()
     }
 
     #[test]

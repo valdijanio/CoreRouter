@@ -120,6 +120,10 @@ pub enum SetOp {
     Med(u32),
     /// Our AS this many times (RouterOS `bgp-path-prepend`).
     Prepend(u8),
+    /// The next hop (RouterOS `set gw`, G3.9fh): a global address of the
+    /// family of the routes it changes; routes of the other family pass
+    /// unchanged.
+    Gw(std::net::IpAddr),
     Comm {
         large: bool,
         how: CommHow,
@@ -137,6 +141,7 @@ impl SetOp {
             SetOp::Prepend(_) => 2,
             SetOp::Comm { large: false, .. } => 3,
             SetOp::Comm { large: true, .. } => 4,
+            SetOp::Gw(_) => 5,
         }
     }
 }
@@ -371,6 +376,7 @@ const PROPS: &[&str] = &[
     "bgp-path-prepend",
     "bgp-communities",
     "bgp-large-communities",
+    "gw",
 ];
 const COMM_OPS: &[&str] = &[
     "includes",
@@ -568,8 +574,8 @@ impl Parser<'_> {
 
     fn set(&mut self, verb: &str) -> Result<SetOp, ParseError> {
         let prop_at = self.at;
-        let prop =
-            self.word("a property (bgp-local-pref, bgp-med, bgp-path-prepend, bgp-communities…)")?;
+        let prop = self
+            .word("a property (bgp-local-pref, bgp-med, bgp-path-prepend, bgp-communities, gw…)")?;
         let back = |p: &mut Self| p.at = prop_at;
         let num = |p: &mut Self, max: u64| -> Result<u64, ParseError> {
             let v = p.word("a number")?;
@@ -614,6 +620,22 @@ impl Parser<'_> {
                     return self.err("prepend at least once (1..=16)");
                 }
                 Ok(SetOp::Prepend(n))
+            }
+            ("set", "gw") => {
+                let v = self.word("an IPv4 or IPv6 address")?;
+                match v.parse::<std::net::IpAddr>() {
+                    Ok(a) => match gw_problem(a) {
+                        None => Ok(SetOp::Gw(a)),
+                        Some(why) => {
+                            self.at -= 1;
+                            self.err(why)
+                        }
+                    },
+                    Err(_) => {
+                        self.at -= 1;
+                        self.err(format!("{:?}: expected an IPv4 or IPv6 address", cut(&v)))
+                    }
+                }
             }
             (_, "bgp-communities") => comm(self, false),
             (_, "bgp-large-communities") => comm(self, true),
@@ -952,6 +974,33 @@ pub fn check_name(s: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Why `a` cannot be a next hop set by a chain (G3.9fh), if it cannot.
+pub fn gw_problem(a: std::net::IpAddr) -> Option<String> {
+    use std::net::IpAddr;
+    let bad = match a {
+        IpAddr::V4(v) => {
+            v.is_unspecified() || v.is_multicast() || v.is_broadcast() || v.is_loopback()
+        }
+        IpAddr::V6(v) => v.is_unspecified() || v.is_multicast() || v.is_loopback(),
+    };
+    if bad {
+        return Some(format!("{a} cannot be a next hop"));
+    }
+    if let IpAddr::V6(v) = a {
+        if v.to_ipv4_mapped().is_some() {
+            return Some(format!(
+                "{a} is IPv4-mapped, the next hop the kernel cannot install: give the neighbor's global IPv6 address"
+            ));
+        }
+        if v.is_unicast_link_local() {
+            return Some(format!(
+                "{a} is link-local: a link-local next hop needs its interface; give a global IPv6 address"
+            ));
+        }
+    }
+    None
 }
 
 pub fn check_chain(s: &str) -> Result<(), String> {
