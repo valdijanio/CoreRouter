@@ -1061,7 +1061,11 @@ pub fn render_with(
     asn_of: &dyn Fn(&str) -> Option<u32>,
     prelude: &dyn Fn(&str) -> String,
 ) -> (String, Vec<Problem>) {
-    let (text, problems, _) = render_counted(filter, used, asn_of, prelude, &|_| Uses::default());
+    let legacy = Uses {
+        legacy: true,
+        ..Uses::default()
+    };
+    let (text, problems, _) = render_counted(filter, used, asn_of, prelude, &|_| legacy);
     (text, problems)
 }
 
@@ -1069,11 +1073,30 @@ pub fn render_with(
 /// bgp-path-prepend` (G3.9fg).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Uses {
-    /// The output chain of an eBGP connection, where N counts the copy
-    /// eBGP adds ([`PrependCount::RouterOs`]).
+    /// The output chain of an eBGP connection.
     pub ebgp_out: bool,
-    /// Any other use: input, iBGP output, or a legacy filter.
+    /// Any other use: input or iBGP output.
     pub other: bool,
+    /// A filter of an older build ([`PrependCount::Legacy`]): N copies on
+    /// top of whatever the session adds, everywhere.
+    pub legacy: bool,
+}
+
+/// `counted` for a map where `set bgp-path-prepend` does nothing: RouterOS
+/// 7.25 adds no copy on an iBGP output nor on input (**medido**, G3.9fg).
+pub const PREPEND_IGNORED: u8 = u8::MAX;
+
+impl Uses {
+    /// `counted` of the chain's own map and, when it needs one, of its map
+    /// for the eBGP outputs.
+    pub fn counted(self) -> (u8, Option<u8>) {
+        match (self.legacy, self.ebgp_out, self.other) {
+            (true, ..) => (0, None),
+            (false, true, false) => (1, None),
+            (false, false, _) => (PREPEND_IGNORED, None),
+            (false, true, true) => (PREPEND_IGNORED, Some(1)),
+        }
+    }
 }
 
 /// The route-map of `chain` on the output of an eBGP connection when the
@@ -1084,11 +1107,11 @@ pub fn route_map_ebgp_out(chain: &str) -> String {
 }
 
 /// [`render_with`] with the count of `set bgp-path-prepend` of RouterOS
-/// (G3.9fg): a chain only eBGP connections send through counts the copy
-/// eBGP adds (`set bgp-path-prepend 3` leaves with our AS 3 times); a
-/// chain also used elsewhere, whose prepends would come out differently,
-/// gets a second map for the eBGP outputs, [`route_map_ebgp_out`]. The
-/// third value: the chains that got one.
+/// (G3.9fg): on an eBGP output the copy eBGP adds counts (`set
+/// bgp-path-prepend 3` leaves with our AS 3 times); on input and iBGP
+/// outputs it does nothing. A chain used both ways gets a second map for
+/// the eBGP outputs, [`route_map_ebgp_out`], when that changes something.
+/// The third value: the chains that got one.
 pub fn render_counted(
     filter: &RoutingFilter,
     used: &BTreeSet<String>,
@@ -1123,8 +1146,7 @@ pub fn render_counted(
             (Lists::default(), String::new(), Vec::new(), Vec::new());
         for name in names {
             let asn = asns.get(name).copied().flatten();
-            let u = uses.get(name).copied().unwrap_or_default();
-            let counted = u8::from(u.ebgp_out && !u.other);
+            let (counted, variant) = uses.get(name).copied().unwrap_or_default().counted();
             let (entries, probs) = compile_counted(filter, &chains, name, asn, counted, &mut lists);
             problems.extend(probs.into_iter().map(|message| Problem {
                 item: format!("chain {name}"),
@@ -1133,10 +1155,10 @@ pub fn render_counted(
             let prelude = preludes.get(name).map_or("", String::as_str);
             maps.push_str(prelude);
             map_text_named(&route_map(name), &entries, &mut maps);
-            if u.ebgp_out && u.other {
+            if let Some(c2) = variant {
                 // The same chain counting eBGP's copy; only when that
                 // changes something (a chain with a prepend).
-                let (e2, _) = compile_counted(filter, &chains, name, asn, 1, &mut lists);
+                let (e2, _) = compile_counted(filter, &chains, name, asn, c2, &mut lists);
                 if e2 != entries {
                     maps.push_str(&prelude.replace(&route_map(name), &route_map_ebgp_out(name)));
                     map_text_named(&route_map_ebgp_out(name), &e2, &mut maps);
@@ -1401,7 +1423,7 @@ pub(crate) mod tests {
         let used: BTreeSet<String> = ["out".to_owned(), "plain".to_owned()].into();
         let only_ebgp = |_: &str| Uses {
             ebgp_out: true,
-            other: false,
+            ..Uses::default()
         };
         let (text, problems, variants) =
             render_counted(&f, &used, &|_| Some(65000), &|_| String::new(), &only_ebgp);
@@ -1417,13 +1439,23 @@ pub(crate) mod tests {
             1,
             "N = 1: nothing\n{text}"
         );
-        // Elsewhere (input, iBGP, legacy filter) the chain prepends N.
+        // On input and iBGP outputs RouterOS adds nothing (measured).
         let other = |_: &str| Uses {
-            ebgp_out: false,
             other: true,
+            ..Uses::default()
         };
         let (text, _, variants) =
             render_counted(&f, &used, &|_| Some(65000), &|_| String::new(), &other);
+        assert!(variants.is_empty());
+        assert!(!text.contains("prepend"), "{text}");
+        // A legacy filter: N on top of what the session adds, everywhere.
+        let legacy = |_: &str| Uses {
+            ebgp_out: true,
+            other: true,
+            legacy: true,
+        };
+        let (text, _, variants) =
+            render_counted(&f, &used, &|_| Some(65000), &|_| String::new(), &legacy);
         assert!(variants.is_empty());
         assert!(
             text.contains(" set as-path prepend 65000 65000 65000\n"),
@@ -1435,6 +1467,7 @@ pub(crate) mod tests {
         let both = |_: &str| Uses {
             ebgp_out: true,
             other: true,
+            legacy: false,
         };
         let (text, _, variants) =
             render_counted(&f, &used, &|_| Some(65000), &|_| String::new(), &both);
@@ -1651,7 +1684,7 @@ pub(crate) mod tests {
             main in prop::collection::vec(stmt(), 1..4),
             sub in prop::collection::vec(stmt(), 0..3),
             routes in prop::collection::vec(route(), 1..12),
-            counted in 0u8..=1,
+            counted in prop_oneof![Just(0u8), Just(1u8), Just(PREPEND_IGNORED)],
         ) {
             let main_text = main.join("; ");
             let mut rules = vec![("in", main_text.as_str())];

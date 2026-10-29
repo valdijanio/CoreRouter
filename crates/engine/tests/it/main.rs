@@ -48,6 +48,7 @@ mod neighbor;
 mod net_audit;
 mod netsim_scenarios;
 mod ntp_logging;
+mod off_lock;
 mod os_loopback;
 mod persistence;
 mod ppp_import;

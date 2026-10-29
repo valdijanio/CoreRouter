@@ -612,7 +612,11 @@ case_prepend() {
       result prepend INFO "$kind N=$n CHR out → CR1: as_path $r ($(prepend_count "$r" 65001) × 65001, $(prepend_count "$r" 65000) × 65000)"
       r=$(path_or_none "$(ros_battr 100.64.39.0/24)" bgp.as-path)
       k=$(prepend_count "$r" 65000)
-      result prepend INFO "$kind N=$n CR1 out + CHR in prepend $n → CHR: as-path $r ($(prepend_count "$r" 65001) × 65001, $k × 65000)"
+      # RouterOS adds nothing for a prepend on input (CHR's in chain) nor
+      # on an iBGP output (measured): eBGP N, iBGP 0 in all.
+      local want=$n; [ $kind = ebgp ] || want=0
+      [ "$k" = "$want" ] && result prepend OK "$kind N=$n CR1 out + CHR in prepend $n → CHR: as-path $r ($k × 65000, as RouterOS)" \
+        || result prepend FAIL "$kind N=$n CR1 out + CHR in prepend $n → CHR: as-path $r ($k × 65000, want $want)"
     done
     crd 1 chrp; rosd crp
     [ $kind = ebgp ] || loop_routes_off

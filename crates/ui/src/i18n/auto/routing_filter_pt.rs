@@ -97,10 +97,10 @@ Uma lista de prefixos com nome. Separe as entradas com vírgula ou quebra de lin
     (r##"filter.prefix_list.entries"##, r##"## O que é
 Prefixos com uma faixa de tamanho opcional (forma do FRR/Cisco): `10.0.0.0/8` casa só esse prefixo; `10.0.0.0/8 le 24`, ele e os mais específicos até /24; `0.0.0.0/0 ge 25`, qualquer prefixo IPv4 /25 ou maior."##),
     (r##"filter.prepend"##, r##"## O que é
-`set bgp-path-prepend N` repete o nosso AS no caminho. No RouterOS v7 a rota sai para um vizinho eBGP com o AS N vezes no total (a cópia que o eBGP sempre põe conta): `set bgp-path-prepend 3` sai `65000 65000 65000`, e N = 1 não muda nada (**medido** no RouterOS 7.25 CHR). Filtros escritos antes da G3.9fg contavam N além dessa cópia (N + 1 no total) e continuam assim até você trocar.
+`set bgp-path-prepend N` repete o nosso AS no caminho. No RouterOS v7 a rota sai para um vizinho eBGP com o AS N vezes no total (a cópia que o eBGP sempre põe conta): `set bgp-path-prepend 3` sai `65000 65000 65000`, e N = 1 não muda nada; na entrada e na saída iBGP não põe nada (**medido** no RouterOS 7.25 CHR). Filtros escritos antes da G3.9fg contavam N além dessa cópia (N + 1 no total) e continuam assim até você trocar.
 
 ## O que fazer
-**Usar a contagem do RouterOS** troca e reescreve N para N + 1 nas chains que só saem por eBGP, para o vizinho continuar recebendo o mesmo caminho; o resultado lista o que não deu para manter (chain usada também na entrada ou no iBGP, N já em 16). Em modo transacional, veja o Impacto do commit antes de confirmar."##),
+**Usar a contagem do RouterOS** troca e reescreve N para N + 1 nas chains que só saem por eBGP, para o vizinho continuar recebendo o mesmo caminho; o resultado lista o que não deu para manter (chain usada na entrada ou no iBGP, onde o prepend deixa de valer; N já em 16). Em modo transacional, veja o Impacto do commit antes de confirmar."##),
     (r##"filter.preview.as_path"##, r##"## O que é
 O caminho de AS da rota, o vizinho primeiro."##),
     (r##"filter.preview.before"##, r##"## O que é

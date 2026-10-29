@@ -16,7 +16,8 @@ use std::hint::black_box;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
-use corerouter_engine::Session;
+use corerouter_engine::off_lock::Reply;
+use corerouter_engine::{Caller, Session};
 use corerouter_firewall::sample;
 use corerouter_model::firewall::{Action, AddressListEntry};
 use corerouter_model::{AddressEntry, Gateway, ItemId, RouteEntry, RoutingTable};
@@ -110,9 +111,11 @@ fn big() -> Session {
     corerouter_engine::perf::with_running(cfg)
 }
 
-/// Every query that takes `{}`, with the time of its first call and the
-/// best of three more; the slowest first.
-fn sweep(s: &mut Session) -> Vec<(String, Duration, Duration, usize)> {
+/// Every query that takes `{}`, with the time of its first call, the
+/// best of three more and the best of three under the lock (what the
+/// control channel holds it for: the answer of a query that defers is
+/// built after, G0.31b); the longest held first.
+fn sweep(s: &mut Session) -> Vec<(String, Duration, Duration, Duration, usize)> {
     let list = s.list();
     let mut out = Vec::new();
     for c in list.as_array().into_iter().flatten() {
@@ -131,10 +134,24 @@ fn sweep(s: &mut Session) -> Vec<(String, Duration, Duration, usize)> {
             black_box(s.execute(&id, &json!({})).ok());
             warm = warm.min(t.elapsed());
         }
-        out.push((id, cold, warm, size));
+        let held = held(s, &id);
+        out.push((id, cold, warm, held, size));
     }
-    out.sort_by_key(|a| std::cmp::Reverse(a.1.max(a.2)));
+    out.sort_by_key(|a| std::cmp::Reverse(a.3));
     out
+}
+
+/// Best of three: how long `id` holds the lock through the control
+/// channel (the deferred part of the answer is built after).
+fn held(s: &mut Session, id: &str) -> Duration {
+    let mut best = Duration::MAX;
+    for _ in 0..3 {
+        let t = Instant::now();
+        let reply = s.execute_reply_as(&Caller::local(), id, &json!({}));
+        best = best.min(t.elapsed());
+        black_box(reply.ok().map(Reply::finish));
+    }
+    best
 }
 
 fn lock_hold(c: &mut Criterion) {
@@ -145,11 +162,11 @@ fn lock_hold(c: &mut Criterion) {
         let rows = sweep(&mut s);
         eprintln!("lock_hold sweep: {} queries", rows.len());
         eprintln!(
-            "{:<48} {:>12} {:>12} {:>12}",
-            "query", "cold", "warm", "bytes"
+            "{:<48} {:>12} {:>12} {:>12} {:>12}",
+            "query", "cold", "warm", "held", "bytes"
         );
-        for (id, cold, warm, size) in rows.iter().take(40) {
-            eprintln!("{id:<48} {cold:>12.2?} {warm:>12.2?} {size:>12}");
+        for (id, cold, warm, held, size) in rows.iter().take(40) {
+            eprintln!("{id:<48} {cold:>12.2?} {warm:>12.2?} {held:>12.2?} {size:>12}");
         }
     }
     let mut g = c.benchmark_group("lock_hold");
@@ -161,6 +178,16 @@ fn lock_hold(c: &mut Criterion) {
     for id in ["config.diff", "interface.list", "ip.firewall.filter.list"] {
         g.bench_function(id, |b| {
             b.iter(|| black_box(s.execute(id, &Value::Null).ok()))
+        });
+    }
+    // G0.31b: the lock held by the big lists (the rows come after).
+    for id in [
+        "ip.route.list",
+        "ip.firewall.address-list.list",
+        "ip.firewall.filter.list",
+    ] {
+        g.bench_function(format!("held/{id}"), |b| {
+            b.iter(|| black_box(s.execute_reply_as(&Caller::local(), id, &Value::Null).ok()))
         });
     }
     // Transactional mode with one pending change (the identity): what the
@@ -175,8 +202,9 @@ fn lock_hold(c: &mut Criterion) {
     g.bench_function("state.inspect/pending_identity", |b| {
         b.iter(|| black_box(s.inspect(None).ok()))
     });
-    // One pending route: the 60 000 routes are serialized on both sides
-    // (item-by-item diff of a big list: G0.31a).
+    // One pending route: only the blocks of the routes the two sides do
+    // not share are serialized (G0.31a: 562 ms before, the whole list on
+    // both sides).
     s.execute(
         "ip.route.add",
         &json!({"dst_address": "198.51.100.0/24", "gateway": "192.168.88.254"}),
@@ -184,6 +212,24 @@ fn lock_hold(c: &mut Criterion) {
     .unwrap();
     g.bench_function("config.diff/pending_route", |b| {
         b.iter(|| black_box(s.execute("config.diff", &Value::Null).ok()))
+    });
+    // The first list after a change rebuilds the route lines (the cache
+    // of G1.27c) under the lock: what is left of G0.31b for G0.31e.
+    let mut n = 0u32;
+    g.bench_function("held/ip.route.list/after_change", |b| {
+        b.iter_custom(|iters| {
+            let mut held = Duration::ZERO;
+            for _ in 0..iters {
+                n += 1;
+                s.execute("system.identity.set", &json!({"name": format!("edge-{n}")}))
+                    .unwrap();
+                let t = Instant::now();
+                let reply = s.execute_reply_as(&Caller::local(), "ip.route.list", &Value::Null);
+                held += t.elapsed();
+                black_box(reply.ok());
+            }
+            held
+        })
     });
     g.finish();
 }

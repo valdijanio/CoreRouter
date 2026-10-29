@@ -5,6 +5,7 @@
 //! this table only mirrors it for `ip.firewall.address-list.list`.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use corerouter_hal::DynamicChange;
 use corerouter_model::ItemId;
@@ -52,7 +53,9 @@ impl DynamicEntry {
 
 #[derive(Debug, Default)]
 pub struct DynamicLists {
-    entries: Vec<DynamicEntry>,
+    /// Shared with a list being built outside the session lock (G0.31b);
+    /// a write copies it only while one is.
+    entries: Arc<Vec<DynamicEntry>>,
     /// (list, address) → position in `entries`: the duplicate check of
     /// every add was a scan of up to [`MAX_DYNAMIC`] entries.
     index: BTreeMap<(Name, AddrMatch), usize>,
@@ -62,6 +65,11 @@ pub struct DynamicLists {
 impl DynamicLists {
     pub fn entries(&self) -> &[DynamicEntry] {
         &self.entries
+    }
+
+    /// The entries, for a reader outside the lock: a pointer.
+    pub fn shared(&self) -> Arc<Vec<DynamicEntry>> {
+        Arc::clone(&self.entries)
     }
 
     pub fn find(&self, list: &Name, address: &AddrMatch) -> Option<&DynamicEntry> {
@@ -83,12 +91,12 @@ impl DynamicLists {
     pub fn push(&mut self, e: DynamicEntry) {
         self.index
             .insert((e.list.clone(), e.address), self.entries.len());
-        self.entries.push(e);
+        Arc::make_mut(&mut self.entries).push(e);
     }
 
     pub fn remove(&mut self, id: ItemId) -> Option<DynamicEntry> {
         let pos = self.entries.iter().position(|e| e.id == id)?;
-        let e = self.entries.remove(pos);
+        let e = Arc::make_mut(&mut self.entries).remove(pos);
         self.reindex();
         Some(e)
     }
@@ -99,10 +107,10 @@ impl DynamicLists {
         if ids.is_empty() {
             return Vec::new();
         }
-        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.entries)
+        let (gone, kept): (Vec<_>, Vec<_>) = Arc::unwrap_or_clone(std::mem::take(&mut self.entries))
             .into_iter()
             .partition(|e| ids.contains(&e.id));
-        self.entries = kept;
+        self.entries = Arc::new(kept);
         self.reindex();
         gone
     }
@@ -119,16 +127,18 @@ impl DynamicLists {
     /// Drop the entries whose time ran out at `now`; start the countdown of
     /// those added before a clock was known.
     pub fn expire(&mut self, now: u64) -> Vec<DynamicEntry> {
-        for e in &mut self.entries {
-            e.added.get_or_insert(now);
+        if self.entries.iter().any(|e| e.added.is_none()) {
+            for e in Arc::make_mut(&mut self.entries).iter_mut() {
+                e.added.get_or_insert(now);
+            }
         }
         if !self.entries.iter().any(|e| e.left(Some(now)) == 0) {
             return Vec::new();
         }
-        let (gone, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.entries)
+        let (gone, keep): (Vec<_>, Vec<_>) = Arc::unwrap_or_clone(std::mem::take(&mut self.entries))
             .into_iter()
             .partition(|e| e.left(Some(now)) == 0);
-        self.entries = keep;
+        self.entries = Arc::new(keep);
         self.reindex();
         gone
     }

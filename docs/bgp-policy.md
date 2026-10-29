@@ -41,12 +41,15 @@ template (Input Filter, Output Filter, Keep Received).
 
 Como no RouterOS v7: para um vizinho eBGP a rota sai com o nosso AS **N vezes no total**, a cópia
 que o eBGP sempre põe incluída. `set bgp-path-prepend 3` sai `65000 65000 65000`; N = 1 não muda
-nada (**medido** no RouterOS 7.25 CHR, `scripts/routeros-interop-bgp.sh prepend`). Na entrada e
-na saída iBGP, onde a sessão não põe o AS, a chain põe N cópias.
+nada. Na entrada e na saída iBGP o RouterOS não põe cópia nenhuma, e o CoreRouter também não (o
+`rule.check` avisa `prepend-count`). Tudo **medido** no RouterOS 7.25 CHR,
+`scripts/routeros-interop-bgp.sh prepend`: N = 1, 2, 3 no eBGP → 1, 2, 3 cópias; no iBGP e na
+entrada → 0.
 
 No FRR, `set as-path prepend` põe as cópias antes da do eBGP. O render faz a conta: o mapa de
-saída de uma conexão eBGP põe N − 1. Uma chain usada também na entrada ou no iBGP ganha um
-segundo mapa só para as saídas eBGP, `CR-<chain>+ebgp-out` (o `+` não cabe num nome de chain).
+saída de uma conexão eBGP põe N − 1, e o de entrada ou de saída iBGP não põe nada. Uma chain usada
+nos dois lugares ganha um segundo mapa só para as saídas eBGP, `CR-<chain>+ebgp-out` (o `+` não
+cabe num nome de chain).
 A prévia (`routing.filter.preview`, `impact`) mostra a mesma conta: o caminho que a chain entrega,
 antes da cópia do eBGP.
 
@@ -63,7 +66,8 @@ corerouter-cli run routing.filter.prepend.set '{"count":"routeros"}'
 
 Com `keep_paths` (padrão), ele reescreve N para N + 1 nas chains que só saem por eBGP, para o
 vizinho continuar recebendo o mesmo caminho, e lista em `left` o que não dá para manter: chain
-usada também na entrada ou no iBGP (separe as saídas eBGP numa chain própria) e N já em 16. Em
+usada na entrada ou numa saída iBGP, onde o prepend deixa de fazer efeito (com a contagem antiga
+punha N), e N já em 16. Em
 modo transacional, `routing.filter.impact` mostra o efeito antes do commit. Filtros novos já
 nascem com a contagem do RouterOS.
 

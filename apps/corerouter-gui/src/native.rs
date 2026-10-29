@@ -153,6 +153,17 @@ impl Host for GuiHost {
         }
     }
 
+    fn with_session_reply(
+        &mut self,
+        f: &mut dyn FnMut(&mut Session) -> Result<corerouter_engine::off_lock::Reply, String>,
+    ) -> Result<Value, String> {
+        match self.target() {
+            Target::Local(mut h) => h.with_session_reply(f),
+            Target::Remote { dialer } => Err(format!("this GUI manages {}", dialer.target)),
+            Target::Choosing => Err(CHOOSING.into()),
+        }
+    }
+
     fn forward(&mut self, method: &str, params: &Value) -> Option<Result<Value, String>> {
         match self.target() {
             Target::Local(_) => None,

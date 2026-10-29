@@ -157,7 +157,7 @@ fn filter_render(
     let mut used: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut asn: HashMap<String, Option<u32>> = HashMap::new();
     let mut uses: HashMap<String, filter::frr::Uses> = HashMap::new();
-    let routeros = routing.filter.prepend == PrependCount::RouterOs;
+    let legacy = routing.filter.prepend == PrependCount::Legacy;
     // G3.2c: the input chains whose connections drop RPKI-invalid routes
     // (with a validator, eBGP too: the chain is its policy) get the RPKI
     // entries first (sequences 1..=9).
@@ -173,12 +173,15 @@ fn filter_render(
                 && eff.rpki_invalid.unwrap_or_default()
                     == corerouter_model::rpki::RpkiInvalid::Reject;
             *rpki_in.entry(chain.clone()).or_insert(drops) |= drops;
-            uses.entry(chain.clone()).or_default().other = true;
+            let u = uses.entry(chain.clone()).or_default();
+            u.other = true;
+            u.legacy = legacy;
         }
         if let Some(chain) = &eff.output_filter {
             let ebgp = inst.is_some_and(|i| !role_of(i, &eff).is_ibgp());
             let u = uses.entry(chain.clone()).or_default();
-            if ebgp && routeros {
+            u.legacy = legacy;
+            if ebgp {
                 u.ebgp_out = true;
             } else {
                 u.other = true;
@@ -219,6 +222,7 @@ fn filter_render(
             uses.get(chain).copied().unwrap_or(filter::frr::Uses {
                 ebgp_out: false,
                 other: true,
+                legacy,
             })
         },
     )
@@ -874,8 +878,10 @@ mod tests {
             text.contains("route-map CR-out+ebgp-out permit 10\n set as-path prepend 65000\n"),
             "{text}"
         );
+        // RouterOS adds nothing on iBGP (measured): the chain's own map
+        // has no prepend.
         assert!(
-            text.contains("route-map CR-out permit 10\n set as-path prepend 65000 65000\n"),
+            !text.contains("route-map CR-out permit 10\n set as-path"),
             "{text}"
         );
         // Only eBGP: one map, counting eBGP's copy.
