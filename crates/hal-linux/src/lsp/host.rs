@@ -25,7 +25,8 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 use super::{
     ETH_P_IP, ETH_P_IPV6, ETH_P_MPLS_UC, FrameSpec, IP4_FILTER, IP6_FILTER, MAX_FRAME, MPLS_FILTER,
-    RawFecRoute, build_frame, classify, icmp_frame, parse_route, route_request, sock_filter,
+    RawFecRoute, build_frame, classify, ether_only, icmp_frame, parse_route, route_request,
+    sock_filter,
 };
 use crate::neigh::nlmsg_header;
 
@@ -624,20 +625,29 @@ impl LsrView for HostView {
     }
 }
 
-/// Three packet sockets of one interface.
+/// The three packet sockets (MPLS, IPv4, IPv6), for the whole host: the
+/// frame's `sll_ifindex` says which interface, checked against the MPLS
+/// ones after the copy.
+///
+/// G3.9d, **medido**: a socket bound to one interface sits on that
+/// device's `ptype_specific` list, which the kernel walks after
+/// `ptype_base`; `mpls_rcv` / `ip_rcv` then get the frame shared with the
+/// tap and clone it (`skb_share_check`) for every packet: MPLS switching
+/// fell from 1.20 to 0.90 Mpps with the taps on the port
+/// (`benches/netns_mpls_ttl.rs`). Unbound, the tap is on `ptype_base`
+/// ahead of them, its filter runs and lets the frame go first: no clone.
 struct Taps {
     socks: Vec<Socket>,
 }
 
-fn tap(link: &LinkAddr, ethertype: u16, prog: &[super::Insn]) -> io::Result<Socket> {
+fn tap(ethertype: u16, prog: &[super::Insn]) -> io::Result<Socket> {
     let s = Socket::new(
         Domain::PACKET,
         Type::RAW,
         Some(Protocol::from(i32::from(ethertype.to_be()))),
     )?;
     s.set_nonblocking(true)?;
-    s.attach_filter(&sock_filter(prog))?;
-    bind(s.as_raw_fd(), link).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+    s.attach_filter(&sock_filter(&ether_only(prog)))?;
     // What came before the filter: drop it.
     let mut buf = [0u8; 64];
     for _ in 0..RECV_BUDGET {
@@ -650,7 +660,9 @@ fn tap(link: &LinkAddr, ethertype: u16, prog: &[super::Insn]) -> io::Result<Sock
 
 /// The responder's sockets and view.
 pub struct HostResponder {
-    taps: BTreeMap<IfName, Taps>,
+    taps: Option<Taps>,
+    /// The interfaces answered on (frames from others are dropped).
+    listen: Vec<IfName>,
     udp4: Socket,
     udp6: Option<Socket>,
     view: HostView,
@@ -705,7 +717,8 @@ impl HostResponder {
         let udp4 = reply_socket(false)
             .map_err(|e| HalError::Rejected(format!("UDP port {} (IPv4): {e}", wire::PORT)))?;
         Ok(Self {
-            taps: BTreeMap::new(),
+            taps: None,
+            listen: Vec::new(),
             udp4,
             udp6: reply_socket(true).ok(),
             view: HostView::new(),
@@ -786,30 +799,39 @@ impl HostResponder {
 
 impl LspResponderIo for HostResponder {
     fn set_interfaces(&mut self, names: &[IfName]) -> Vec<(IfName, String)> {
-        self.taps.retain(|n, _| names.contains(n));
         self.view.reread_links();
         let mut failed = Vec::new();
+        self.listen.clear();
         for name in names {
-            if self.taps.contains_key(name) {
-                continue;
-            }
-            let Some(link) = self.view.links.by_name.get(name).and_then(|l| l.link) else {
+            if self
+                .view
+                .links
+                .by_name
+                .get(name)
+                .and_then(|l| l.link)
+                .is_some()
+            {
+                self.listen.push(name.clone());
+            } else {
                 failed.push((name.clone(), "no such link".to_owned()));
-                continue;
-            };
+            }
+        }
+        if self.listen.is_empty() {
+            self.taps = None;
+        } else if self.taps.is_none() {
             let socks: io::Result<Vec<Socket>> = [
                 (ETH_P_MPLS_UC, MPLS_FILTER),
                 (ETH_P_IP, IP4_FILTER),
                 (ETH_P_IPV6, IP6_FILTER),
             ]
             .iter()
-            .map(|(t, p)| tap(&link, *t, p))
+            .map(|(t, p)| tap(*t, p))
             .collect();
             match socks {
-                Ok(socks) => {
-                    self.taps.insert(name.clone(), Taps { socks });
+                Ok(socks) => self.taps = Some(Taps { socks }),
+                Err(e) => {
+                    failed.extend(self.listen.drain(..).map(|n| (n, e.to_string())));
                 }
-                Err(e) => failed.push((name.clone(), e.to_string())),
             }
         }
         failed
@@ -822,7 +844,7 @@ impl LspResponderIo for HostResponder {
         let ms = u16::try_from(wait.as_millis().min(1000)).unwrap_or(1000);
         let mut fds: Vec<PollFd<'_>> = self
             .taps
-            .values()
+            .iter()
             .flat_map(|t| t.socks.iter())
             .map(|s| PollFd::new(s.as_fd(), PollFlags::POLLIN))
             .collect();
@@ -832,18 +854,24 @@ impl LspResponderIo for HostResponder {
         }
         drop(fds);
         self.drain_udp();
-        for (name, t) in &self.taps {
-            for s in &t.socks {
-                for _ in 0..RECV_BUDGET {
-                    let n = match recvfrom::<LinkAddr>(s.as_raw_fd(), &mut self.buf) {
-                        Ok((n, _)) => n,
-                        Err(_) => break,
-                    };
-                    if let Some(h) = self.buf.get(..n).and_then(|f| classify(f, name))
-                        && self.queue.len() < RECV_BUDGET * 4
-                    {
-                        self.queue.push_back(h);
-                    }
+        self.view.refresh();
+        for s in self.taps.iter().flat_map(|t| t.socks.iter()) {
+            for _ in 0..RECV_BUDGET {
+                let (n, from) = match recvfrom::<LinkAddr>(s.as_raw_fd(), &mut self.buf) {
+                    Ok(got) => got,
+                    Err(_) => break,
+                };
+                let Some(name) = from
+                    .and_then(|l| u32::try_from(l.ifindex()).ok())
+                    .and_then(|i| self.view.links.by_index.get(&i))
+                    .filter(|n| self.listen.contains(n))
+                else {
+                    continue;
+                };
+                if let Some(h) = self.buf.get(..n).and_then(|f| classify(f, name))
+                    && self.queue.len() < RECV_BUDGET * 4
+                {
+                    self.queue.push_back(h);
                 }
             }
         }

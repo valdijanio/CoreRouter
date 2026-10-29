@@ -23,7 +23,7 @@
 //! - CR2 has an IP route to A: the error goes by the IP table;
 //! - CR2 has none (a BGP-free core): the error follows the LSP to B, the
 //!   egress, which routes it back to A over its own LSP (label 300 at CR2,
-//!   popped towards CR1).
+//!   popped towards CR1; B knows 10.60.0.0/14 that way).
 //!
 //! CR1, CR2 and B are nested namespaces (`unshare --net sleep`); the
 //! responder runs on a thread moved into CR2's (`setns`), as the daemon's
@@ -245,11 +245,14 @@ fn lab(route_back: bool) -> Lab {
         cr2.ip(&["route", "add", "10.61.0.0/24", "via", "10.62.0.1"]);
         b.ip(&["route", "add", "default", "via", "10.63.0.1"]);
     } else {
-        // A BGP-free core: only the egress knows A, over an LSP of its own.
+        // A BGP-free core: only the egress knows A (and the core's own
+        // addresses, as from the IGP: the error comes from 10.62.0.2, and
+        // a reverse path filter drops a source without a route), over an
+        // LSP of its own.
         b.ip(&[
             "route",
             "add",
-            "10.61.0.0/24",
+            "10.60.0.0/14",
             "encap",
             "mpls",
             "300",

@@ -256,6 +256,28 @@ fn frames_split_into_echo_requests_and_expired_packets() {
     assert_eq!(classify(&[0u8; 10], &name()), None);
 }
 
+/// The taps listen on every device: their filters first check that it is
+/// an Ethernet one (`SKF_AD_HATYPE`), then run as written.
+#[test]
+fn filters_on_unbound_taps_are_ethernet_only() {
+    for prog in [MPLS_FILTER, IP4_FILTER, IP6_FILTER] {
+        let p = ether_only(prog);
+        assert_eq!(
+            p[..3],
+            [
+                (LD_W_ABS, 0, 0, 0xffff_f01c),
+                (JEQ_K, 1, 0, 1),
+                (RET_K, 0, 0, 0)
+            ]
+        );
+        assert_eq!(&p[3..], prog);
+        // Jumps stay inside the program (BPF only jumps forward).
+        for (i, (_, jt, jf, _)) in p.iter().enumerate() {
+            assert!(i + 1 + usize::from(*jt.max(jf)) < p.len() || p[i].0 == RET_K);
+        }
+    }
+}
+
 #[test]
 fn icmp_frames_carry_the_stack_or_the_bare_packet() {
     let stack = [

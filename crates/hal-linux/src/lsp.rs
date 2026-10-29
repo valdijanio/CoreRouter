@@ -9,8 +9,10 @@
 //!   hop's MAC. The kernel cannot send it itself: a packet to 127/8 never
 //!   leaves the host. Replies come back as plain UDP to the source port of
 //!   a socket of this process.
-//! - **Answering:** on each MPLS interface, three `AF_PACKET` sockets bound
-//!   to one protocol each (MPLS, IPv4, IPv6) with a classic BPF filter, so
+//! - **Answering:** three `AF_PACKET` sockets for the host, one per
+//!   protocol (MPLS, IPv4, IPv6), not bound to an interface (bound, every
+//!   packet of the port was cloned: G3.9d, `Taps` in `host.rs`); the frame's
+//!   interface is checked against the MPLS ones. A classic BPF filter, so
 //!   the kernel copies only candidates: an MPLS frame whose top label TTL
 //!   expired (the kernel drops it without an ICMP) or that carries explicit
 //!   null, and IP to 127/8 (::1, ::ffff:127/104) UDP port 3503 (the
@@ -308,6 +310,24 @@ const KEEP: u32 = 0xffff;
 
 /// One instruction: code, jump if true, jump if false, constant.
 pub type Insn = (u16, u8, u8, u32);
+
+/// `SKF_AD_OFF + SKF_AD_HATYPE` (linux/filter.h): the device type.
+const AD_HATYPE: u32 = 0xffff_f000 + 28;
+const ARPHRD_ETHER: u32 = 1;
+
+/// `prog` behind a check that the frame came from an Ethernet device: the
+/// taps listen on every device (see `Taps` in `host.rs`), and the offsets
+/// of the filters assume an Ethernet header (a PPP or tun device hands the
+/// IP packet bare).
+pub fn ether_only(prog: &[Insn]) -> Vec<Insn> {
+    let mut p = vec![
+        (LD_W_ABS, 0, 0, AD_HATYPE),
+        (JEQ_K, 1, 0, ARPHRD_ETHER),
+        (RET_K, 0, 0, 0),
+    ];
+    p.extend_from_slice(prog);
+    p
+}
 
 /// The kernel's form of a program.
 pub fn sock_filter(prog: &[Insn]) -> Vec<SockFilter> {

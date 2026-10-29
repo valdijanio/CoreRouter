@@ -12,6 +12,9 @@
 //! 64-byte frames with label 100 (TTL 64) are written with `AF_PACKET`
 //! into veth `ta`; they come in on its peer `tb` (MPLS input on), are
 //! swapped to 200 and leave by dummy `to`, whose `tx_packets` count them.
+//! Three cases: no tap; one MPLS tap **bound** to `tb`, as the responder
+//! had them before G3.9d (the kernel then clones every frame for
+//! `mpls_rcv`); the responder's taps now (unbound, ahead of `mpls_rcv`).
 //! Needs `mpls_router` (the lab VM: `cargo xtask vm-lab run`); without it,
 //! skips.
 
@@ -213,11 +216,27 @@ mod linux {
         g.bench_function("mpls64/no taps", |b| {
             b.iter_custom(|iters| (0..iters).map(|_| lab.burst(BURST).0).sum())
         });
-        // The responder's three taps on the ingress port, as the daemon
-        // keeps them (nobody reads: these frames all pass the filter by).
+        // One tap bound to the port with a filter that keeps nothing.
+        {
+            let bound = Socket::new(
+                Domain::PACKET,
+                Type::RAW,
+                Some(Protocol::from(i32::from(0x8847u16.to_be()))),
+            )
+            .unwrap();
+            bound
+                .attach_filter(&[socket2::SockFilter::new(0x06, 0, 0, 0)])
+                .unwrap();
+            bind(bound.as_raw_fd(), &link("tb").0).unwrap();
+            g.bench_function("mpls64/one tap bound to the port (before G3.9d)", |b| {
+                b.iter_custom(|iters| (0..iters).map(|_| lab.burst(BURST).0).sum())
+            });
+        }
+        // The responder's three taps, as the daemon keeps them (nobody
+        // reads: these frames all pass the filter by).
         let mut r = HostResponder::open().unwrap();
         assert!(r.set_interfaces(&["tb".parse().unwrap()]).is_empty());
-        g.bench_function("mpls64/responder taps on the port", |b| {
+        g.bench_function("mpls64/responder taps (unbound)", |b| {
             b.iter_custom(|iters| (0..iters).map(|_| lab.burst(BURST).0).sum())
         });
         g.finish();
