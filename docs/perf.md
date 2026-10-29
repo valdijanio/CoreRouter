@@ -2424,3 +2424,14 @@ local da de 28/10 e a desta branch), com outras sessões compilando na máquina.
 | Consultas pela gerência, 1 conexão | 2 405/s, p50 0,38 ms, p99 0,96 ms |
 | Consultas pela gerência, 4 conexões | 4 712/s, p50 0,77 ms, p99 2,08 ms (daemon ~1,2 vCPU) |
 | Daemon ocioso / FRR ocioso (RSS, VM real) | 52,8 MiB, 61 threads / 103,3 MiB em 10 processos |
+
+### G3.9f — BGP com 100 mil prefixos, CoreRouter × CoreRouter (**medido**, 2026-10-29)
+
+Host AMD Ryzen AI Max+ 395 (32 threads), build release, FRR 10.7.1 oficial num namespace de usuário,
+`scripts/bgp-crcr-userns.sh scale`, duas rodadas. FRR (R3) → CR1: 100 000 rotas no kernel 3,5–4,5 s depois da
+config (a sessão leva ~1–5 s para subir); CR1 → CR2: 3,6–3,9 s; `routing.bgp.session.clear` e
+ressincronização: 4,7–5,0 s; retirada: 1,3 s. CPU no intervalo: `corerouter-daemon` ~0 %; `bgpd`
+0,4 s (uma thread); `zebra` 0,8 s + `zebra_apic` 0,5 s + `zebra_dplane` 0,1 s. RSS: daemon
+71 → 79 MiB, `bgpd` 14 → 116 MiB, `zebra` 12 → 69 MiB. `routing.bgp.route.list` primeira página
+767 ms (lê o `bgpd`), depois 2 ms. Convergência num corte silencioso com duas sessões eBGP:
+8,8–9,0 s (hold 9 s), 314–420 ms (BFD 100 ms × 3), 1–2 ms (link down).
