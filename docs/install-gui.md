@@ -3,7 +3,67 @@
 Como o WinBox: instala uma vez, abre pelo ícone do menu e gerencia qualquer CoreRouter, local
 ou remoto por TLS. O pacote `corerouter-gui` traz a GUI **e** a CLI (`corerouter-cli`).
 
-## Gerar e instalar (Debian, Ubuntu)
+## Baixar do GitHub Releases (Debian 12+, Ubuntu 22.04+, amd64)
+
+Cada versão (`v0.1.0`, `v0.2.0`…) tem o `.deb` e o `SHA256SUMS` em
+<https://github.com/valdijanio/CoreRouter/releases>. Baixe os dois para a mesma pasta, confira e
+instale:
+
+```sh
+v=0.1.0                                    # a versão da página da Release
+base=https://github.com/valdijanio/CoreRouter/releases/download/v$v
+curl -LO "$base/corerouter-gui_${v}_amd64.deb" -LO "$base/SHA256SUMS"
+sha256sum -c SHA256SUMS                    # tem de dizer "OK"; senão não instale
+sudo apt install "./corerouter-gui_${v}_amd64.deb"
+```
+
+O `sha256sum -c` confere se o arquivo baixado é o que o CI gerou (download corrompido ou
+trocado no caminho). O `SHA256SUMS` vem da mesma página, então ele não protege contra a própria
+página adulterada; para isso, compare o hash com o do log do run de release no Actions
+(passo `cargo xtask package gui`), que só o CI escreve. Atualizar = instalar o `.deb` novo do
+mesmo jeito (o `apt` trata como upgrade).
+
+### Como uma versão é publicada (dono do projeto)
+
+`.github/workflows/release.yml`, disparado por uma tag `v*`, num runner Ubuntu 22.04 do GitHub
+(não no self-hosted), sem cache:
+
+1. `cargo xtask package gui --version <tag sem o v> --out dist` — a versão do `.deb` é a da tag:
+   `v0.2.0` → `0.2.0`; `v0.2.0-rc.1` → `0.2.0~rc.1` (o `~` faz a pré-release vir antes da
+   `0.2.0` no `apt`). A tag tem de ser a versão do workspace (`[workspace.package] version` no
+   `Cargo.toml`), com pré-release opcional: assim o pacote, o `server.info` e a barra da GUI
+   dizem o mesmo. Tag com outra versão faz o build falhar ("bump … first");
+2. `SHA256SUMS` do `.deb`;
+3. notas da versão: `cargo xtask package notes --since <tag anterior>` lista uma linha por
+   entrada do `docs/log.md` que a tag anterior não tinha (até 300 caracteres cada, 100 kB no
+   total; o GitHub recusa corpo acima de 125 mil), depois de um cabeçalho com o comando de
+   instalação;
+4. uma Release em **rascunho** com o `.deb` e o `SHA256SUMS` (pré-release se a tag tem `-`). O
+   dono revisa em Releases e clica em Publish. Só esse job tem `contents: write`, e ele não roda
+   código do repositório, só o `gh`.
+
+Primeira versão (depois de o PR do workflow entrar na `main`):
+
+```sh
+git tag -a v0.1.0 -m "CoreRouter 0.1.0" origin/main && git push origin v0.1.0
+```
+
+Para testar sem publicar: Actions → release → Run workflow com uma versão como
+`0.1.0-test.1` (só gera os arquivos, como artifact do run, sem Release); um PR que mexe no
+workflow ou no `xtask/src/package*` faz o mesmo.
+
+A **imagem do roteador** (`.crpkg`, ISO, `disk.img`, `.ova`) não entra no workflow: ela é
+assinada com a chave do dono em `os/out/keys`, que não vai para o CI público, e o build do
+Buildroot passa do tempo e do disco de um runner. Quem quiser anexá-la a uma Release assina
+na própria máquina e sobe no rascunho, antes de publicar:
+
+```sh
+cargo xtask os build                        # assina com os/out/keys
+cd os/out/build/images && sha256sum corerouter.crpkg corerouter.ova > SHA256SUMS-image
+gh release upload v0.1.0 corerouter.crpkg corerouter.ova SHA256SUMS-image
+```
+
+## Gerar e instalar a partir do código (Debian, Ubuntu)
 
 ```sh
 cargo xtask package gui                     # build `dist` (release sem símbolos) + .deb
@@ -50,7 +110,10 @@ atualizados pelos gatilhos do dpkg (`desktop-file-utils`, `hicolor-icon-theme`);
 tem scripts de instalação.
 
 **Versão:** `<versão do workspace>+<commits>.g<commit>`, ex. `0.1.0+1520.g7a6041d`. O número de
-commits cresce na `main`, então um pacote novo sempre é "upgrade" do anterior.
+commits cresce na `main`, então um pacote novo sempre é "upgrade" do anterior. Numa versão
+publicada, `--version` põe a da tag (`0.2.0`); o pacote de desenvolvimento da mesma versão
+(`0.2.0+…`) conta como mais novo que ela no `apt`, e o da versão seguinte publicada (`0.2.1`)
+como mais novo que ambos.
 
 **Dependências** (conferidas com `ldd` a cada empacotamento: biblioteca nova sem pacote
 conhecido faz o `package` falhar):
@@ -100,5 +163,5 @@ um pacote gerado pelo mesmo código num diretório descartável, sem root (`dpkg
 ## Depois
 
 AppImage (G0.28b), instalador do Windows (G0.28c) e `.dmg` do macOS (G0.28d) estão em
-`docs/gaps.md`. Publicar binários (GitHub Releases, repositório apt) é decisão do dono do
-projeto.
+`docs/gaps.md`. O `.deb` sai no GitHub Releases (acima); um repositório apt (`apt
+upgrade` sem baixar à mão) fica para depois.
