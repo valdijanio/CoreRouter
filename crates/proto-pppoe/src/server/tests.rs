@@ -743,6 +743,38 @@ fn drop_first(proto: u16, code: u8) -> impl FnMut(bool, &[u8]) -> bool {
     }
 }
 
+/// G3.9g, against the RouterOS CHR: our LCP Configure-Request went out with
+/// the PADS, before the client listened, and every session waited the 3 s
+/// restart timer for the retransmission. The client's first request now
+/// brings ours again at once.
+#[test]
+fn a_configure_request_lost_before_the_client_listens_is_resent_at_once() {
+    let mut p = Pair::new(AuthProto::Pap);
+    p.c.start(0, &mut p.co);
+    let mut drop = drop_first(ppp::proto::LCP, crate::lcp::code::CONFIGURE_REQUEST);
+    while p.c.phase() != ClientPhase::Up && p.now < 10_000 {
+        p.run(100, &mut drop);
+    }
+    assert_eq!(p.c.phase(), ClientPhase::Up, "{:?}", p.log);
+    assert!(p.now < 1_000, "up after {} ms: {:?}", p.now, p.log);
+}
+
+/// G3.9g: the RouterOS client sometimes drops the first Challenge, sent
+/// right after its Configure-Ack; the first retry comes in 300 ms, not 3 s.
+#[test]
+fn a_lost_first_challenge_is_repeated_early() {
+    for a in [AuthProto::ChapMd5, AuthProto::MsChapV1, AuthProto::MsChapV2] {
+        let mut p = Pair::new(a);
+        p.c.start(0, &mut p.co);
+        let mut drop = drop_first(ppp::proto::CHAP, crate::auth::code::CHAP_CHALLENGE);
+        while p.c.phase() != ClientPhase::Up && p.now < 10_000 {
+            p.run(100, &mut drop);
+        }
+        assert_eq!(p.c.phase(), ClientPhase::Up, "{a:?}: {:?}", p.log);
+        assert!(p.now < 1_000, "{a:?}: up after {} ms", p.now);
+    }
+}
+
 #[test]
 fn rfc1994_4_1_lost_success_is_recovered_by_a_repeated_response() {
     for a in [AuthProto::ChapMd5, AuthProto::MsChapV1, AuthProto::MsChapV2] {
