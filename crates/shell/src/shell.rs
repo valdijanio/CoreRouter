@@ -135,6 +135,103 @@ struct Ask {
     first: Option<String>,
 }
 
+/// Moves `/import` may make of a failing step to the end (see `import_batch`).
+const MAX_DEFERRED: usize = 64;
+
+/// Send an import as one atomic batch. RouterOS exports in name order, not
+/// in dependency order (`/interface vlan add interface=s42 name=c43` comes
+/// before `name=s42`, seen on a 7.25 CHR, G3.9hb): the step that fails goes
+/// to the end and the batch runs again. A step already moved moves again
+/// only when more steps ran before the failure than last time (a chain
+/// `a` on `b` on `c` settles; two bad lines cannot swap forever), the last
+/// step never moves, and at most `MAX_DEFERRED` moves in all, so a bad
+/// line still fails, named by its place in the script. `order[i]` is the
+/// script position of `steps[i]`.
+fn import_batch(mut steps: Vec<Value>, mut order: Vec<usize>, retry: Retry) -> Next {
+    let request = Request::call(
+        "engine.batch",
+        json!({"steps": steps.clone(), "atomic": true}),
+    );
+    Next::Send(
+        vec![request],
+        Box::new(move |sh, replies| match reply(&replies, 0) {
+            Ok(_) => {
+                let mut text = format!("imported {} command(s) as one atomic batch", steps.len());
+                let moved = retry.moved.iter().filter(|m| **m).count();
+                if moved > 0 {
+                    text.push_str(&format!(" ({moved} run after the lines they depend on)"));
+                }
+                sh.with_refresh(Output::lines(vec![Line::styled(Style::Ok, text)]))
+            }
+            Err(e) => {
+                let failed = batch_step(&e).and_then(|k| k.checked_sub(1));
+                let next = failed.and_then(|i| retry.after(i, order.get(i).copied()?, steps.len()));
+                if let (Some(i), Some(next)) = (failed, next) {
+                    let step = steps.remove(i);
+                    steps.push(step);
+                    let at = order.remove(i);
+                    order.push(at);
+                    return import_batch(steps, order, next);
+                }
+                // The step number of the script, not of the reordered batch.
+                let e = match failed.and_then(|i| Some((i, order.get(i)?))) {
+                    Some((i, at)) => e.replacen(
+                        &format!("batch step {} failed", i + 1),
+                        &format!("batch step {} failed", at + 1),
+                        1,
+                    ),
+                    None => e,
+                };
+                Next::Done(Output::error(format!("{e}; nothing was applied")))
+            }
+        }),
+    )
+}
+
+/// What `import_batch` has moved so far.
+struct Retry {
+    /// By script position: moved to the end at least once.
+    moved: Vec<bool>,
+    /// Moves so far.
+    moves: usize,
+    /// Steps that ran before the last failure.
+    reached: usize,
+}
+
+impl Retry {
+    fn new(n: usize) -> Self {
+        Self {
+            moved: vec![false; n],
+            moves: 0,
+            reached: 0,
+        }
+    }
+
+    /// The state after moving the step at batch index `i` (script position
+    /// `at`) to the end, or `None` when it must not move.
+    fn after(&self, i: usize, at: usize, len: usize) -> Option<Self> {
+        let again = self.moved.get(at).copied().unwrap_or(true);
+        if i + 1 >= len || self.moves >= MAX_DEFERRED || (again && i <= self.reached) {
+            return None;
+        }
+        let mut moved = self.moved.clone();
+        if let Some(m) = moved.get_mut(at) {
+            *m = true;
+        }
+        Some(Self {
+            moved,
+            moves: self.moves + 1,
+            reached: i,
+        })
+    }
+}
+
+/// `N` of the engine's "batch step N failed: …".
+fn batch_step(error: &str) -> Option<usize> {
+    let rest = error.split_once("batch step ")?.1;
+    rest.split_once(" failed")?.0.parse().ok()
+}
+
 fn reply(replies: &[Reply], i: usize) -> Reply {
     replies
         .get(i)
@@ -1081,20 +1178,9 @@ impl Shell {
                 "nothing to import",
             )]));
         }
-        let n = steps.len();
-        Next::Send(
-            vec![Request::call(
-                "engine.batch",
-                json!({"steps": steps, "atomic": true}),
-            )],
-            Box::new(move |sh, replies| match reply(&replies, 0) {
-                Ok(_) => sh.with_refresh(Output::lines(vec![Line::styled(
-                    Style::Ok,
-                    format!("imported {n} command(s) as one atomic batch"),
-                )])),
-                Err(e) => Next::Done(Output::error(format!("{e}; nothing was applied"))),
-            }),
-        )
+        let order = (0..steps.len()).collect();
+        let retry = Retry::new(steps.len());
+        import_batch(steps, order, retry)
     }
 
     /// `?`: a menu's sub-menus and commands, or one command's parameters.

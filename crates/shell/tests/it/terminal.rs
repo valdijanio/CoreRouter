@@ -1163,7 +1163,8 @@ fn dns_zone_export_import_round_trip() {
 
 /// G3.9hb: a RouterOS 7.25 CHR's `/interface vlan export` (taken from the
 /// CHR in `scripts/routeros-interop-l2.sh rsc`) imports as it comes:
-/// `interface=` is the terminal's other name for `parent`.
+/// `interface=` is the terminal's other name for `parent`, and the VLAN
+/// exported before its parent runs after it.
 #[test]
 fn a_routeros_vlan_export_imports_as_written() {
     let mut t = Term::new();
@@ -1215,13 +1216,52 @@ fn a_routeros_vlan_export_imports_as_written() {
     assert!(t.export().contains("parent=ether2"));
 }
 
+/// The body as the CHR wrote it (2026-10-29, RouterOS 7.25): name order,
+/// so `c43` comes before `s42`, the VLAN it rides on.
 const ROUTEROS_VLAN_EXPORT: &str = "\
-# 2026-10-29 15:00:00 by RouterOS 7.25
+# 2026-10-29 15:59:59 by RouterOS 7.25
 # software id =
 #
 /interface vlan
+add interface=s42 name=c43 vlan-id=43
 add comment=\"cliente 40\" interface=ether1 name=r40 vlan-id=40
 add disabled=yes interface=ether1 mtu=1400 name=r41 vlan-id=41
 add interface=ether1 name=s42 use-service-tag=yes vlan-id=42
-add interface=s42 name=c43 vlan-id=43
 ";
+
+/// G3.9hb: a step that fails goes to the end of the import once; a line
+/// that is bad wherever it runs still fails, naming its place in the script.
+#[test]
+fn import_defers_a_forward_reference_and_still_fails_a_bad_line() {
+    let mut t = Term::new();
+    let before = t.export();
+    t.router.files.insert(
+        "bad.rsc".into(),
+        "/interface vlan\nadd interface=nope name=x1 vlan-id=1\nadd interface=ether1 name=x2 vlan-id=2\n".into(),
+    );
+    let e = t.fails("/import file=bad.rsc");
+    assert!(
+        e.contains("batch step 1 failed")
+            && e.contains("no interface 'nope'")
+            && e.contains("nothing was applied"),
+        "{e}"
+    );
+    assert_eq!(t.export(), before);
+    t.router.files.insert(
+        "fwd.rsc".into(),
+        "/interface vlan\nadd interface=b name=a vlan-id=1\nadd interface=c name=b vlan-id=2\nadd interface=ether1 name=c vlan-id=3\n".into(),
+    );
+    // Two bad lines cannot trade places forever.
+    t.router.files.insert(
+        "two.rsc".into(),
+        "/interface vlan\nadd interface=nope name=x1 vlan-id=1\nadd interface=nada name=x2 vlan-id=2\nadd interface=ether1 name=x3 vlan-id=3\n".into(),
+    );
+    let e = t.fails("/import file=two.rsc");
+    assert!(e.contains("nothing was applied"), "{e}");
+    assert_eq!(t.export(), before);
+    let out = t.ok("/import file=fwd.rsc");
+    assert!(
+        out.contains("imported 3 command(s)") && out.contains("2 run after"),
+        "{out}"
+    );
+}
