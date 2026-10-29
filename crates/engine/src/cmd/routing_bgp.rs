@@ -1189,7 +1189,7 @@ mod tests {
         s.execute("routing.bgp.instance.set", &json!({"asn": 65000, "router_id": "10.0.0.1", "graceful_restart_time": 90})).unwrap();
         s.execute("routing.bgp.instance.set", &json!({"asn": 65000, "router_id": "10.0.0.1", "comment": "edge"})).unwrap();
         let rows = s.execute("routing.bgp.instance.list", &json!({})).unwrap();
-        assert_eq!((rows[0]["graceful_restart_time"].as_u64(), rows[0]["graceful_stale_time"].as_u64()), (Some(90), Some(360)), "{rows}");
+        assert_eq!((rows[0]["graceful_restart_time"].as_u64(), rows[0]["graceful_stale_time"].as_u64()), (Some(90), None), "{rows}");
         let e = s.execute("routing.bgp.instance.set", &json!({"asn": 65000, "router_id": "10.0.0.1", "graceful_stale_time": 5000})).unwrap_err();
         assert!(e.to_string().contains("12 bits"), "{e}");
         s.execute("routing.bgp.template.add", &json!({"name": "gr", "graceful_restart": true})).unwrap();

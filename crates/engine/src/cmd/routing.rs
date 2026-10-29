@@ -20,7 +20,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         instance_set
     ),
     cmd!(query "routing.bgp.instance.list", "BGP Instances", ["Routing", "BGP"], None,
-        "{} → [{name, asn, router_id, disabled, comment}]",
+        "{} → [{name, asn, router_id, disabled, comment, graceful_restart_time? (unset: 120 s), graceful_stale_time? (unset: 360 s), graceful_defer_time? (unset: 10 s)}]",
         always, instance_list),
 ];
 
@@ -115,9 +115,9 @@ fn instance_list(s: &mut Session, _: &Value) -> Result<Value> {
                     "router_id": b.router_id.to_string(),
                     "disabled": b.disabled,
                     "comment": b.comment,
-                    "graceful_restart_time": b.graceful_restart_time.unwrap_or(corerouter_proto_bgp::GR_RESTART_TIME),
-                    "graceful_stale_time": b.graceful_stale_time.unwrap_or(corerouter_proto_bgp::GR_STALE_TIME),
-                    "graceful_defer_time": b.graceful_defer_time.unwrap_or(corerouter_proto_bgp::GR_DEFER_TIME),
+                    "graceful_restart_time": b.graceful_restart_time,
+                    "graceful_stale_time": b.graceful_stale_time,
+                    "graceful_defer_time": b.graceful_defer_time,
                 })
             })
             .collect(),

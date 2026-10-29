@@ -878,9 +878,15 @@ impl BgpPanel {
                 ui.label(s(row, "router_id"));
                 ui.label(s(row, "disabled"));
                 // G3.9ff: graceful restart (routing.bgp.instance.set).
-                ui.label(format!("{} s", s(row, "graceful_restart_time")));
-                ui.label(format!("{} s", s(row, "graceful_stale_time")));
-                ui.label(format!("{} s", s(row, "graceful_defer_time")));
+                // Unset: the defaults (null in the list, so /export
+                // leaves them out).
+                for (k, d) in [
+                    ("graceful_restart_time", 120),
+                    ("graceful_stale_time", 360),
+                    ("graceful_defer_time", 10),
+                ] {
+                    ui.label(format!("{} s", u(row, k).unwrap_or(d)));
+                }
                 ui.end_row();
             }
         });
