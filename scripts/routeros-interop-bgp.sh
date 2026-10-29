@@ -312,6 +312,12 @@ cr_rx() { # cr_rx <n> <connection> <prefix>
   done
   jq -c '[.rows[]? | select(.filtered | not)][0] // {}' <<< "$out"
 }
+# The best path in bgpd's table, after the inbound policy (route.list shows
+# received routes before it, and without communities: G3.2g).
+bgp_path() { # bgp_path <ns> <prefix>
+  vt "$1" "show bgp $([[ $2 == *:* ]] && echo ipv6 || echo ipv4) unicast $2 json" |
+    jq -c '[.paths[]? | select(.bestpath.overall // false)][0] // {} | {as_path: .aspath.string, med: .metric, local_pref: .locPrf, communities: .community.string, large: .largeCommunity.string, ext: .extendedCommunity.string, originator: .originatorId}' 2>/dev/null || echo '{}'
+}
 dump() {
   echo "--- CHR sessions"; ros routing/bgp/session | jq -c '.[] | {name, "remote.address", established, "last-stopped", "last-started", "prefix-count"}'
   echo "--- CR1 sessions"; cr1 routing.bgp.session.list | jq -c '.[] | {connection, remote_address, state, reason, last_error, prefix_count, prefix_sent}'
@@ -486,12 +492,12 @@ case_communities() {
   local ms r
   ms=$(wait_for 60 cr_up 1 chr4) || { result communities FAIL "no session"; ebgp4_down; return; }
   wait_for 30 k_has cf1 203.0.113.0/24 >/dev/null || true
-  r=$(cr_rx 1 chr4 203.0.113.0/24)
-  [[ $(jq -c .communities <<< "$r") == *65001:100* ]] && result communities OK "RFC 1997 from CHR: $(jq -c .communities <<< "$r")" \
-    || result communities FAIL "communities on CR1: $(jq -c '{communities, large_communities}' <<< "$r")"
-  [[ $(jq -c .large_communities <<< "$r") == *65001:1:2* ]] && result communities OK "RFC 8092 large from CHR: $(jq -c .large_communities <<< "$r")" \
-    || result communities FAIL "large communities on CR1: $(jq -c .large_communities <<< "$r")"
-  local ext; ext=$(vt cf1 'show bgp ipv4 unicast 203.0.113.0/24 json' | jq -c '[.paths[]?.extendedCommunity.string]' 2>/dev/null)
+  r=$(bgp_path cf1 203.0.113.0/24)
+  [[ $(jq -r .communities <<< "$r") == *65001:100* && $(jq -r .communities <<< "$r") == *no-export* ]] && result communities OK "RFC 1997 from CHR: $(jq -c .communities <<< "$r")" \
+    || result communities FAIL "communities on CR1: $r"
+  [[ $(jq -r .large <<< "$r") == *65001:1:2* ]] && result communities OK "RFC 8092 large from CHR: $(jq -c .large <<< "$r")" \
+    || result communities FAIL "large communities on CR1: $r"
+  local ext; ext=$(jq -r .ext <<< "$r")
   [[ $ext == *65001:7* ]] && result communities OK "RFC 4360 extended from CHR reaches bgpd: $ext" || result communities FAIL "extended community in bgpd: $ext"
   result communities INFO "extended communities: route.list has no column for them and routing.filter has no bgp-ext-communities (G3.9fc)"
   # no-export: CR1 must not send it on to an eBGP neighbor (RFC 1997).
@@ -523,7 +529,7 @@ case_filters() {
   local ms r
   ms=$(wait_for 60 cr_up 1 chr4) || { result filters FAIL "no session"; ebgp4_down; return; }
   wait_for 30 k_has cf1 203.0.113.0/24 >/dev/null || true
-  r=$(cr_rx 1 chr4 203.0.113.0/24)
+  r=$(bgp_path cf1 203.0.113.0/24)
   [ "$(jq -r .local_pref <<< "$r")" = 150 ] && result filters OK "in: local-pref 150 set by our chain" || result filters FAIL "in: local-pref $(jq -c '{local_pref}' <<< "$r")"
   [[ $(jq -c .as_path <<< "$r") == *65001*65001*65001*65001* ]] && result filters OK "CHR's out prepend 3: as_path $(jq -c .as_path <<< "$r")" \
     || result filters FAIL "CHR prepend: as_path $(jq -c .as_path <<< "$r")"
@@ -570,7 +576,7 @@ case_ibgp() {
   result ibgp INFO "kind $(cr1 routing.bgp.connection.list '{"find":"chri"}' | jq -r '.[0].kind'); no chain needed on iBGP (RFC 8212 is eBGP only)"
   ms=$(wait_for 30 k_via cf1 203.0.113.0/24 10.255.39.1) && result ibgp OK "203.0.113.0/24 via the CHR loopback (next hop kept on iBGP)" \
     || result ibgp FAIL "203.0.113.0/24 on CR1: '$(k_route cf1 203.0.113.0/24)'"
-  local r; r=$(cr_rx 1 chri 203.0.113.0/24)
+  local r; r=$(bgp_path cf1 203.0.113.0/24)
   [ "$(jq -r .local_pref <<< "$r")" = 100 ] && result ibgp OK "LOCAL_PREF 100 on iBGP (RFC 4271 §5.1.5)" || result ibgp INFO "local_pref $(jq -c .local_pref <<< "$r")"
   ms=$(wait_for 30 ros_via 100.64.39.0/24 10.255.39.2) && result ibgp OK "100.64.39.0/24 on CHR via our loopback" || result ibgp FAIL "100.64.39.0/24 on CHR: $(ros_route 100.64.39.0/24)"
   crd 1 chri; rosd cri
@@ -888,10 +894,10 @@ case_crcr() {
   ms=$(wait_for 60 cr_up 1 cr2e) && result crcr OK "eBGP CR1 (65000) — CR2 (65002), MD5, ip+ipv6: Established in ${ms} ms" \
     || { result crcr FAIL "no session: $(cr_sess 1 cr2e | jq -c '{state, reason, last_error}')"; dump; }
   ms=$(wait_for 30 k_via cf2 100.64.39.0/24 10.39.5.1) && result crcr OK "CR2 has 100.64.39.0/24 via 10.39.5.1" || result crcr FAIL "CR2: '$(k_route cf2 100.64.39.0/24)'"
-  local r; r=$(cr_rx 2 cr1e 100.64.39.0/24)
-  [ "$(jq -r .local_pref <<< "$r")" = 300 ] && [[ $(jq -c .large_communities <<< "$r") == *65000:0:10* ]] && [ "$(jq -r .med <<< "$r")" = 5 ] \
-    && result crcr OK "community match → local-pref 300, large community and MED 5 across: $(jq -c '{communities, large_communities, med, local_pref}' <<< "$r")" \
-    || result crcr FAIL "attributes on CR2: $(jq -c '{communities, large_communities, med, local_pref}' <<< "$r")"
+  local r; r=$(bgp_path cf2 100.64.39.0/24)
+  [ "$(jq -r .local_pref <<< "$r")" = 300 ] && [[ $(jq -r .large <<< "$r") == *65000:0:10* ]] && [ "$(jq -r .med <<< "$r")" = 5 ] \
+    && result crcr OK "community match → local-pref 300, large community and MED 5 across: $r" \
+    || result crcr FAIL "attributes on CR2: $r"
   ms=$(wait_for 30 k_has6 cf2 fd39:64::/64) && result crcr OK "IPv6 over the IPv4 session: CR2 has fd39:64::/64 $(k_route6 cf2 fd39:64::/64)" \
     || result crcr FAIL "CR2 IPv6: kernel '$(k_route6 cf2 fd39:64::/64)', bgpd $(vt cf2 'show bgp ipv6 unicast fd39:64::/64 json' | jq -c '[.paths[]? | {valid, nexthops}]' 2>/dev/null)"
   ms=$(wait_for 30 k_via cf1 100.64.40.0/24 10.39.5.2) && result crcr OK "CR1 has CR2's 100.64.40.0/24" || result crcr FAIL "CR1: '$(k_route cf1 100.64.40.0/24)'"

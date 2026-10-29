@@ -373,17 +373,23 @@ impl Frr {
     }
 
     /// The PIDs of the daemons CoreRouter configures, from the `.pid`
-    /// files FRR writes beside the sockets: a restart changes them.
+    /// files FRR writes beside the sockets: a restart changes them. A
+    /// daemon without one counts as `-`, so the others still tell a
+    /// restart (G3.9f: with ospf6d and ldpd not started, one missing file
+    /// made this `None` for good and a restarted bgpd stayed empty). `None`
+    /// only when no daemon runs at all.
     pub fn incarnation(&self) -> Option<String> {
         let mut out = String::new();
+        let mut any = false;
         for d in Daemon::ALL {
             if self.owned.iter().any(|(_, ds)| ds.contains(&d)) {
-                let pid =
-                    std::fs::read_to_string(self.dir.join(format!("{}.pid", d.name()))).ok()?;
-                out.push_str(&format!("{}={} ", d.name(), pid.trim()));
+                let pid = std::fs::read_to_string(self.dir.join(format!("{}.pid", d.name())));
+                any |= pid.is_ok();
+                let pid = pid.as_deref().map_or("-", str::trim);
+                out.push_str(&format!("{}={pid} ", d.name()));
             }
         }
-        Some(out)
+        any.then_some(out)
     }
 
     /// The BGP sessions of `cfg`'s instances, read from bgpd.
@@ -1014,6 +1020,32 @@ impl RoutingReader for FrrReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G3.9f: a restarted bgpd is seen while daemons CoreRouter owns
+    /// (ospf6d, ldpd) are not running at all.
+    #[test]
+    fn incarnation_sees_a_restart_with_daemons_missing() {
+        let dir = std::env::temp_dir().join(format!("cr-incarnation-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let frr = Frr::new(&dir);
+        assert_eq!(frr.incarnation(), None, "nothing runs");
+        std::fs::write(dir.join("zebra.pid"), "100\n").unwrap();
+        std::fs::write(dir.join("bgpd.pid"), "200\n").unwrap();
+        let a = frr.incarnation();
+        assert!(
+            a.as_deref()
+                .is_some_and(|s| s.contains("bgpd=200 ") && s.contains("ldpd=- ")),
+            "{a:?}"
+        );
+        std::fs::remove_file(dir.join("bgpd.pid")).unwrap();
+        let down = frr.incarnation();
+        assert_ne!(down, a);
+        std::fs::write(dir.join("bgpd.pid"), "201\n").unwrap();
+        let b = frr.incarnation();
+        assert!(b.is_some() && b != a && b != down, "{b:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn depth_follows_the_script() {
