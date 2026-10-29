@@ -19,7 +19,7 @@ use corerouter_model::os_loopback;
 use corerouter_model::route::{self, FIRST_VRF_TABLE, LAST_VRF_TABLE, Reach};
 use corerouter_model::sections::Sections;
 use corerouter_model::{
-    BondMode, Config, IfName, Interface, InterfaceKind, Issue, RouteEntry, RoutingTable, VlanId,
+    BondMode, Config, IfName, Interface, InterfaceKind, Issue, ItemId, RouteEntry, RoutingTable, VlanId,
 };
 
 /// One validator and the sections of the config it reads.
@@ -306,7 +306,11 @@ fn route_checks(cfg: &Config) -> Vec<Issue> {
             .entry((&r.routing_table, r.dst_address))
             .or_default();
         out.extend(
-            route_issues(cfg, r, group.iter().copied())
+            route_issues(
+                cfg,
+                r,
+                group.iter().filter(|o| o.gateway == r.gateway).map(|o| o.id),
+            )
                 .into_iter()
                 .map(|(field, m)| Issue::new(format!("ip.routes[{}].{field}", r.id), m)),
         );
@@ -360,13 +364,14 @@ pub(crate) fn v6_twice(addr: Ipv6Addr, iface: &IfName, other: IpNet) -> String {
     )
 }
 
-/// What is wrong with route `r` in `cfg`, as (field, message). `others` are
-/// the routes it must not duplicate. Shared with the `ip.route.*` commands,
-/// which report the first problem as a parameter error.
-pub(crate) fn route_issues<'a>(
+/// What is wrong with route `r` in `cfg`, as (field, message). `same_hop`
+/// are the ids of the routes with its table, destination and gateway (`r`
+/// itself may be among them). Shared with the `ip.route.*` commands, which
+/// report the first problem as a parameter error.
+pub(crate) fn route_issues(
     cfg: &Config,
     r: &RouteEntry,
-    others: impl Iterator<Item = &'a RouteEntry>,
+    same_hop: impl Iterator<Item = ItemId>,
 ) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     let dst = r.dst_address;
@@ -388,16 +393,14 @@ pub(crate) fn route_issues<'a>(
     check_gateway_issues(cfg, r, &mut out);
     // Equal distance is ECMP (RouterOS v7, G1.27): only the very same
     // next hop twice is refused.
-    for o in others.filter(|o| o.id != r.id && o.routing_table == r.routing_table) {
-        if o.dst_address == r.dst_address && o.gateway == r.gateway {
-            out.push((
-                "gateway",
-                format!(
-                    "route {} already goes to {dst} via {} in table {}",
-                    o.id, o.gateway, r.routing_table
-                ),
-            ));
-        }
+    for o in same_hop.filter(|o| *o != r.id) {
+        out.push((
+            "gateway",
+            format!(
+                "route {o} already goes to {dst} via {} in table {}",
+                r.gateway, r.routing_table
+            ),
+        ));
     }
     out
 }
