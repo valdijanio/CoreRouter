@@ -334,7 +334,8 @@ struct Diag {
 
 impl Drop for Diag {
     fn drop(&mut self) {
-        if !std::thread::panicking() {
+        // COREROUTER_HA_DIAG=1: the dump on success too.
+        if !std::thread::panicking() && std::env::var_os("COREROUTER_HA_DIAG").is_none() {
             if let Some(seen) = &self.seen {
                 eprintln!("CPEs: {}", seen.lock().unwrap_or_else(|e| e.into_inner()));
             }
@@ -363,6 +364,18 @@ impl Drop for Diag {
             match call(ns, "ppp.history", json!({"limit": 15})) {
                 Ok(h) => eprintln!("{name} ppp.history: {h}"),
                 Err(e) => eprintln!("{name} ppp.history: {e}"),
+            }
+            // The pair's roles and the PPPoE service's starts and stops
+            // (not the thousands of "conectado").
+            for find in ["redundancy", "PPPoE:"] {
+                match call(ns, "log.print", json!({"find": find, "limit": 30})) {
+                    Ok(Value::Array(rows)) => {
+                        for r in rows {
+                            eprintln!("{name} log #{} {}: {}", r["seq"], r["time"], r["message"]);
+                        }
+                    }
+                    other => eprintln!("{name} log.print: {other:?}"),
+                }
             }
         }
         for (name, log) in ["A", "B"].iter().zip(&self.logs) {
@@ -464,10 +477,29 @@ fn pair(mode: &str) -> Pair {
         .run_until("the first dial", 120, |c| c.ups() == n)
         .unwrap_or_else(|| panic!("every CPE up on A: {} of {n}", cpes.ups()));
     eprintln!("{n} CPEs up on A in {t:?}");
-    assert!(
-        cpes.up.iter().all(|u| *u == Some(VMAC)),
-        "every session on the virtual MAC"
-    );
+    if !cpes.up.iter().all(|u| *u == Some(VMAC)) {
+        let mut by_mac: HashMap<String, usize> = HashMap::new();
+        for m in cpes.up.iter().flatten() {
+            *by_mac.entry(Mac(*m).to_string()).or_default() += 1;
+        }
+        let macs = |ns| {
+            // `ip`, not /sys: `nsenter --net` keeps this namespace's sysfs.
+            let out = in_ns(ns, "ip")
+                .args(["-o", "link", "show", "acc0"])
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            text.split_once("link/ether ")
+                .and_then(|(_, r)| r.split_whitespace().next())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        panic!(
+            "every session on the virtual MAC: by AC MAC {by_mac:?} (A's acc0 {}, B's acc0 {})",
+            macs(None),
+            macs(Some(b))
+        );
+    }
     assert_eq!(active(None), n);
     assert_eq!(active(Some(b)), 0, "the standby answered nobody");
     // Steady state: the standby sends nothing (a PADT of its own to these

@@ -1316,7 +1316,7 @@ impl IpoeBackend for Backend {
 
     fn answering(&self) -> bool {
         let st = guard(&self.0.st);
-        !st.ha.enabled || st.ha.answering
+        super::pppoe_bng::ha_may_answer(st.ha.enabled, st.ha.answering)
     }
 
     fn takeover(&self) -> Option<(Vec<String>, Vec<Lease>)> {

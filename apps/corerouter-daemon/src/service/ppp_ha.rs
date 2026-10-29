@@ -88,6 +88,12 @@ pub(crate) struct HaShared {
     pub cookie_key: Mutex<Option<[u8; 32]>>,
 }
 
+/// The `ppp-ha` loop runs a pair (G4.3hk: the services keep quiet until
+/// their own config agrees, [`super::pppoe_bng::ha_may_answer`]).
+pub(crate) fn paired() -> bool {
+    shared().enabled.load(Ordering::Acquire)
+}
+
 pub(crate) fn shared() -> &'static HaShared {
     static S: OnceLock<HaShared> = OnceLock::new();
     S.get_or_init(|| HaShared {
