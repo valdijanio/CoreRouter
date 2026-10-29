@@ -484,6 +484,10 @@ fn render_with_lists(
     if let Some(cfg) = cfg {
         s.push_str(&static_maps(cfg));
     }
+    // G3.9fb: the connections' own output maps, with the other policy
+    // and before the instances that name them.
+    let mut maps = String::new();
+    let mut insts = String::new();
     for inst in routing.bgp.values() {
         let conns = by_inst
             .get(inst.name.as_str())
@@ -496,15 +500,18 @@ fn render_with_lists(
             eff.push((*c, p));
         }
         render_instance(
-            &mut s,
+            &mut insts,
             inst,
             &eff,
             cfg,
             open,
             !rpki::enabled(routing).is_empty(),
             &ebgp_out_maps,
+            &mut maps,
         )?;
     }
+    s.push_str(&maps);
+    s.push_str(&insts);
     // G3.2c: the `rpki` node and its route-map, after the instances.
     s.push_str(&rpki::render_frr(routing));
     Ok(s)
@@ -523,6 +530,7 @@ pub fn render_frr(inst: &BgpInstance) -> String {
         &|_| None,
         false,
         &std::collections::BTreeSet::new(),
+        &mut String::new(),
     );
     s
 }
@@ -541,6 +549,7 @@ fn render_instance(
     open: Opener<'_>,
     rpki: bool,
     ebgp_out_maps: &std::collections::BTreeSet<String>,
+    maps: &mut String,
 ) -> Result<(), String> {
     // Writing to a String cannot fail; ignore the fmt::Result.
     let _ = writeln!(s, "{}", frr_header(inst));
@@ -549,16 +558,52 @@ fn render_instance(
     if inst.disabled {
         let _ = writeln!(s, " bgp shutdown");
     }
-    let mut v4 = origination(neighbors, cfg, Afi::Ip);
-    let mut v6 = origination(neighbors, cfg, Afi::Ipv6);
+    let (mut v4, all4) = origination(neighbors, cfg, Afi::Ip);
+    let (mut v6, all6) = origination(neighbors, cfg, Afi::Ipv6);
     for (c, p) in neighbors {
         neighbor(s, inst, c, p, open)?;
+        let ebgp = !role_of(inst, p).is_ibgp();
+        let chain_map = p.output_filter.as_deref().map(|chain| {
+            if ebgp && ebgp_out_maps.contains(chain) {
+                filter::frr::route_map_ebgp_out(chain)
+            } else {
+                filter::frr::route_map(chain)
+            }
+        });
+        // G3.9fb: its own output map when it asks for less than the
+        // instance originates; eBGP without a chain sends nothing
+        // anyway (RFC 8212), so it gets none.
+        let own: Vec<(Afi, Origin)> = p
+            .families()
+            .into_iter()
+            .map(|afi| {
+                let all = if afi == Afi::Ip { &all4 } else { &all6 };
+                (afi, with_aliases(asks(p, cfg, afi), all, cfg, afi))
+            })
+            .collect();
+        let less = own
+            .iter()
+            .any(|(afi, o)| o != if *afi == Afi::Ip { &all4 } else { &all6 });
+        let out_map = if less && (chain_map.is_some() || !ebgp) {
+            if maps.is_empty() {
+                let _ = writeln!(maps, "bgp as-path access-list {LOCAL_PATH} seq 5 permit ^$");
+            }
+            let all: Vec<(Afi, &Origin)> = p
+                .families()
+                .into_iter()
+                .map(|afi| (afi, if afi == Afi::Ip { &all4 } else { &all6 }))
+                .collect();
+            connection_map_text(&c.name, &own, &all, chain_map.as_deref(), maps);
+            Some(connection_map(&c.name))
+        } else {
+            chain_map
+        };
         for afi in p.families() {
             let af = match afi {
                 Afi::Ip => &mut v4,
                 Afi::Ipv6 => &mut v6,
             };
-            neighbor_af(af, c, p, afi, !role_of(inst, p).is_ibgp(), ebgp_out_maps);
+            neighbor_af(af, c, p, afi, out_map.as_deref());
             // G3.2c: drop RPKI-invalid routes; the Adj-RIB-In is kept so
             // FRR revalidates when the VRPs change (its rpki module needs
             // it) and the received list shows what was dropped.
@@ -587,34 +632,33 @@ fn render_instance(
     Ok(())
 }
 
-/// G3.9fa: the `network` and `redistribute` lines of one address family,
-/// in the order `bgpd` prints them. FRR originates per instance, not per
-/// neighbor: the union of what the instance's connections of that family
-/// ask for (RouterOS `output.network` / `output.redistribute`); a
-/// connection that should not send some of it says so in its output chain.
-/// O(connections + entries of the named lists).
-fn origination(
-    neighbors: &[(&BgpConnection, BgpParams)],
-    cfg: Option<&Config>,
-    afi: Afi,
-) -> String {
-    let lists = cfg.map(|c| &c.ip.firewall.address_lists);
-    let mut redist = std::collections::BTreeSet::new();
-    let mut names = std::collections::BTreeSet::new();
-    for (_, p) in neighbors
-        .iter()
-        .filter(|(_, p)| p.families().contains(&afi))
-    {
-        redist.extend(p.output_redistribute.iter().flatten().copied());
-        names.extend(p.output_network.as_deref());
+/// What one connection asks to originate in one family (G3.9fb): its
+/// `output_network` lists' prefixes and its `output_redistribute` kinds,
+/// without a static redistribution when there is no static route of the
+/// family (nothing to announce).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Origin {
+    nets: std::collections::BTreeSet<ipnet::IpNet>,
+    redist: std::collections::BTreeSet<BgpRedistribute>,
+}
+
+fn asks(p: &BgpParams, cfg: Option<&Config>, afi: Afi) -> Origin {
+    let mut o = Origin::default();
+    if !p.families().contains(&afi) {
+        return o;
     }
-    let mut nets = std::collections::BTreeSet::new();
-    if let Some(lists) = lists
-        && !names.is_empty()
-    {
-        for e in lists
+    o.redist
+        .extend(p.output_redistribute.iter().flatten().copied().filter(|r| {
+            *r != BgpRedistribute::Static
+                || cfg.is_some_and(|c| !static_prefixes(c, afi).is_empty())
+        }));
+    if let (Some(cfg), Some(name)) = (cfg, p.output_network.as_deref()) {
+        for e in cfg
+            .ip
+            .firewall
+            .address_lists
             .iter()
-            .filter(|e| !e.disabled && names.contains(e.list.as_str()))
+            .filter(|e| !e.disabled && e.list.as_str() == name)
         {
             // A range is no prefix: left out (the connection check says so).
             if let AddrMatch::Net(n) = e.address
@@ -623,24 +667,65 @@ fn origination(
                     (Afi::Ip, ipnet::IpNet::V4(_)) | (Afi::Ipv6, ipnet::IpNet::V6(_))
                 )
             {
-                nets.insert(n.trunc());
+                o.nets.insert(n.trunc());
             }
         }
     }
+    o
+}
+
+/// `o` with the instance's `network` prefixes that its redistribution
+/// covers (G3.9fb): a connected or static prefix another connection lists
+/// is one route in `bgpd`, the `network` one (origin IGP wins), which
+/// `match source-protocol` would not see as connected or static; RouterOS
+/// sends it to the connection that redistributes it.
+fn with_aliases(mut o: Origin, all: &Origin, cfg: Option<&Config>, afi: Afi) -> Origin {
+    let Some(cfg) = cfg else { return o };
+    let mut covered = std::collections::BTreeSet::new();
+    if o.redist.contains(&BgpRedistribute::Connected) {
+        covered.extend(
+            cfg.ip
+                .addresses
+                .iter()
+                .filter(|a| {
+                    !a.disabled
+                        && a.from_pool.is_none()
+                        && matches!(a.address, ipnet::IpNet::V4(_)) == (afi == Afi::Ip)
+                })
+                .map(|a| a.address.trunc()),
+        );
+    }
+    if o.redist.contains(&BgpRedistribute::Static) {
+        covered.extend(static_prefixes(cfg, afi));
+    }
+    o.nets.extend(all.nets.intersection(&covered).copied());
+    o
+}
+
+/// G3.9fa: the `network` and `redistribute` lines of one address family,
+/// in the order `bgpd` prints them. FRR originates per instance, not per
+/// neighbor: the union of what the instance's connections of that family
+/// ask for (RouterOS `output.network` / `output.redistribute`); a
+/// connection that asks for less gets its own output map (G3.9fb,
+/// [`connection_map`]). O(connections × entries of the named lists).
+fn origination(
+    neighbors: &[(&BgpConnection, BgpParams)],
+    cfg: Option<&Config>,
+    afi: Afi,
+) -> (String, Origin) {
+    let mut all = Origin::default();
+    for (_, p) in neighbors {
+        let o = asks(p, cfg, afi);
+        all.nets.extend(o.nets);
+        all.redist.extend(o.redist);
+    }
     let mut s = String::new();
-    for n in nets {
+    for n in &all.nets {
         let _ = writeln!(s, "  network {n}");
     }
-    for r in redist {
+    for r in &all.redist {
         let line = match (r, afi) {
             (BgpRedistribute::Connected, _) => "redistribute connected".to_owned(),
-            // No static route of the family: nothing to announce (and no
-            // route-map to name).
-            (BgpRedistribute::Static, _)
-                if cfg.is_none_or(|c| static_prefixes(c, afi).is_empty()) =>
-            {
-                continue;
-            }
             (BgpRedistribute::Static, _) => {
                 format!("redistribute kernel route-map {}", static_map(afi))
             }
@@ -649,7 +734,121 @@ fn origination(
         };
         let _ = writeln!(s, "  {line}");
     }
-    s
+    (s, all)
+}
+
+/// The output route-map of connection `name` (G3.9fb).
+pub fn connection_map(name: &str) -> String {
+    format!("CR-C+{name}")
+}
+
+/// The AS-path list of the routes we originate (an empty path: in an
+/// output map the AS of eBGP is not on it yet).
+const LOCAL_PATH: &str = "CR-C+local";
+
+/// G3.9fb: the output map of a connection that asks to originate less
+/// than the instance does (RouterOS sends each connection only its own
+/// `output.network` and `output.redistribute`). Our routes it asked for
+/// pass; the instance's other `network` routes (their prefix and an empty
+/// AS path) and the protocols only other connections redistribute
+/// (`match source-protocol`) are refused; everything that passes goes on
+/// to its chain (`call`). FRR's `match peer local` does not work here: in
+/// an output map the peer is the neighbor the route goes to. `+` is in no
+/// connection or chain name: the names never meet another map or list.
+fn connection_map_text(
+    name: &str,
+    own: &[(Afi, Origin)],
+    all: &[(Afi, &Origin)],
+    chain: Option<&str>,
+    out: &mut String,
+) {
+    let map = connection_map(name);
+    const THEN: u32 = 100;
+    let kw = |afi: Afi| match afi {
+        Afi::Ip => ("ip", "4"),
+        Afi::Ipv6 => ("ipv6", "6"),
+    };
+    let proto = |r: BgpRedistribute, afi: Afi| match (r, afi) {
+        (BgpRedistribute::Connected, _) => "connected",
+        (BgpRedistribute::Static, _) => "kernel",
+        (BgpRedistribute::Ospf, Afi::Ip) => "ospf",
+        (BgpRedistribute::Ospf, Afi::Ipv6) => "ospf6",
+    };
+    let mut seq = 10;
+    let mut mine = std::collections::BTreeSet::new();
+    for (afi, o) in own {
+        let (kw, suffix) = kw(*afi);
+        if !o.nets.is_empty() {
+            let list = format!("{map}+{suffix}");
+            for (i, n) in o.nets.iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "{kw} prefix-list {list} seq {} permit {n}",
+                    (i + 1) * 5
+                );
+            }
+            let _ = writeln!(
+                out,
+                "route-map {map} permit {seq}\n match {kw} address prefix-list {list}\n on-match goto {THEN}\nexit"
+            );
+            seq += 1;
+        }
+        mine.extend(o.redist.iter().map(|r| proto(*r, *afi)));
+    }
+    for p in &mine {
+        let _ = writeln!(
+            out,
+            "route-map {map} permit {seq}\n match source-protocol {p}\n on-match goto {THEN}\nexit"
+        );
+        seq += 1;
+    }
+    let mut seq = 80;
+    let mut others = std::collections::BTreeSet::new();
+    for (afi, a) in all {
+        let (kw, suffix) = kw(*afi);
+        let empty = Origin::default();
+        let o = own
+            .iter()
+            .find(|(f, _)| f == afi)
+            .map_or(&empty, |(_, o)| o);
+        let not_mine: Vec<&ipnet::IpNet> = a.nets.difference(&o.nets).collect();
+        if !not_mine.is_empty() {
+            let list = format!("{map}+not{suffix}");
+            for (i, n) in not_mine.iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "{kw} prefix-list {list} seq {} permit {n}",
+                    (i + 1) * 5
+                );
+            }
+            let _ = writeln!(
+                out,
+                "route-map {map} deny {seq}\n match as-path {LOCAL_PATH}\n match {kw} address prefix-list {list}\nexit"
+            );
+            seq += 1;
+        }
+        others.extend(
+            a.redist
+                .iter()
+                .map(|r| proto(*r, *afi))
+                .filter(|p| !mine.contains(p)),
+        );
+    }
+    for p in others {
+        let _ = writeln!(
+            out,
+            "route-map {map} deny {seq}\n match source-protocol {p}\nexit"
+        );
+        seq += 1;
+    }
+    match chain {
+        Some(c) => {
+            let _ = writeln!(out, "route-map {map} permit {THEN}\n call {c}\nexit");
+        }
+        None => {
+            let _ = writeln!(out, "route-map {map} permit {THEN}\nexit");
+        }
+    }
 }
 
 fn role_of(inst: &BgpInstance, p: &BgpParams) -> LocalRole {
@@ -737,14 +936,9 @@ pub fn timers(p: &BgpParams) -> (u16, u16) {
 }
 
 /// The lines of one neighbor inside `address-family <afi> unicast`.
-fn neighbor_af(
-    s: &mut String,
-    c: &BgpConnection,
-    p: &BgpParams,
-    afi: Afi,
-    ebgp: bool,
-    ebgp_out_maps: &std::collections::BTreeSet<String>,
-) {
+/// `out_map`: the connection's output route-map, its chain's
+/// (`CR-<chain>`, or the eBGP one of G3.9fg) or its own (G3.9fb).
+fn neighbor_af(s: &mut String, c: &BgpConnection, p: &BgpParams, afi: Afi, out_map: Option<&str>) {
     let a = c.remote_address;
     let _ = writeln!(s, "  neighbor {a} activate");
     // G3.9fb: RouterOS `local.role=ibgp-rr`, RFC 4456 §6.
@@ -793,14 +987,7 @@ fn neighbor_af(
             filter::frr::route_map(chain)
         );
     }
-    if let Some(chain) = &p.output_filter {
-        // G3.9fg: the chain's map counting eBGP's copy of our AS, when the
-        // chain also runs where nothing is added.
-        let map = if ebgp && ebgp_out_maps.contains(chain) {
-            filter::frr::route_map_ebgp_out(chain)
-        } else {
-            filter::frr::route_map(chain)
-        };
+    if let Some(map) = out_map {
         let _ = writeln!(s, "  neighbor {a} route-map {map} out");
     }
 }
@@ -897,6 +1084,127 @@ mod tests {
         let text = render_config(&cfg, &|_| None).unwrap();
         assert!(
             text.contains("route-map CR-out permit 10\n set as-path prepend 65000 65000\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn each_connection_sends_only_what_it_asks_for() {
+        // G3.9fb: as on RouterOS, `output_network` and
+        // `output_redistribute` are per connection; FRR originates per
+        // instance, so a connection that asks for less gets its own map.
+        use corerouter_model::firewall::AddressListEntry;
+        use corerouter_model::routing_filter::FilterRule;
+        use corerouter_model::types::ItemId;
+        let p = |asn: u32, list: &str| BgpParams {
+            remote_as: Some(Asn(asn)),
+            afi: Some(vec![Afi::Ip, Afi::Ipv6]),
+            output_filter: Some("out".into()),
+            output_network: Some(list.into()),
+            ..Default::default()
+        };
+        let mut a = p(64500, "to-a");
+        a.output_redistribute = Some(vec![BgpRedistribute::Connected]);
+        let mut cfg = cfg_with(vec![
+            conn("a", "192.0.2.1", a),
+            conn("b", "192.0.2.5", p(64501, "to-b")),
+        ]);
+        for (id, list, addr) in [
+            (1, "to-a", "198.51.100.0/24"),
+            (2, "to-a", "2001:db8:a::/48"),
+            (3, "to-b", "203.0.113.0/24"),
+        ] {
+            cfg.ip.firewall.address_lists.push(AddressListEntry {
+                id: ItemId(id),
+                list: list.parse().unwrap(),
+                address: addr.parse().unwrap(),
+                disabled: false,
+                comment: String::new(),
+            });
+        }
+        let id = cfg.routing.filter.next_id();
+        cfg.routing.filter.rules.push(FilterRule {
+            id,
+            chain: "out".into(),
+            rule: "accept".into(),
+            disabled: false,
+            comment: String::new(),
+        });
+        assert_eq!(validate(&cfg), Vec::new());
+        let text = render_config(&cfg, &|_| None).unwrap();
+        // The instance originates the union.
+        for line in [
+            "  network 198.51.100.0/24\n",
+            "  network 203.0.113.0/24\n",
+            "  network 2001:db8:a::/48\n",
+            "  redistribute connected\n",
+        ] {
+            assert!(text.contains(line), "{line:?}\n{text}");
+        }
+        for want in [
+            "ip prefix-list CR-C+a+4 seq 5 permit 198.51.100.0/24\n",
+            "ipv6 prefix-list CR-C+a+6 seq 5 permit 2001:db8:a::/48\n",
+            "route-map CR-C+a permit 10\n match ip address prefix-list CR-C+a+4\n on-match goto 100\nexit\n",
+            "route-map CR-C+a permit 11\n match ipv6 address prefix-list CR-C+a+6\n on-match goto 100\nexit\n",
+            "route-map CR-C+a permit 12\n match source-protocol connected\n on-match goto 100\nexit\n",
+            // b's network, ours (empty path): not for a.
+            "ip prefix-list CR-C+a+not4 seq 5 permit 203.0.113.0/24\n",
+            "route-map CR-C+a deny 80\n match as-path CR-C+local\n match ip address prefix-list CR-C+a+not4\nexit\n",
+            "route-map CR-C+a permit 100\n call CR-out\nexit\n",
+            "ip prefix-list CR-C+b+4 seq 5 permit 203.0.113.0/24\n",
+            // a's networks and the connected routes it alone redistributes.
+            "ipv6 prefix-list CR-C+b+not6 seq 5 permit 2001:db8:a::/48\n",
+            "route-map CR-C+b deny 82\n match source-protocol connected\nexit\n",
+            "route-map CR-C+b permit 100\n call CR-out\nexit\n",
+            "  neighbor 192.0.2.1 route-map CR-C+a out\n",
+            "  neighbor 192.0.2.5 route-map CR-C+b out\n",
+        ] {
+            assert!(text.contains(want), "{want:?}\n{text}");
+        }
+        // b asks for no IPv6 network and no redistribution.
+        assert!(
+            !text.contains("CR-C+b+6 ") && !text.contains("route-map CR-C+b permit 11"),
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("bgp as-path access-list CR-C+local").count(),
+            1,
+            "{text}"
+        );
+        // The maps come before the instance that names them.
+        assert!(text.find("route-map CR-C+a").unwrap() < text.find("router bgp").unwrap());
+        // 203.0.113.0/24 connected: a redistributes connected, so b's
+        // network of that prefix is a's too (one route in bgpd, the
+        // `network` one); a then asks for all the instance sends.
+        let mut with_addr = cfg.clone();
+        with_addr
+            .ip
+            .addresses
+            .push(corerouter_model::config::AddressEntry {
+                id: ItemId(1),
+                address: "203.0.113.1/24".parse().unwrap(),
+                interface: "ether1".parse().unwrap(),
+                disabled: false,
+                comment: String::new(),
+                from_pool: None,
+            });
+        let text = render_config(&with_addr, &|_| None).unwrap();
+        assert!(
+            !text.contains("CR-C+a")
+                && text.contains("  neighbor 192.0.2.1 route-map CR-out out\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  neighbor 192.0.2.5 route-map CR-C+b out\n"),
+            "{text}"
+        );
+        // When every connection asks for the same, no map of its own: the
+        // render of one connection does not change.
+        cfg.routing.bgp_connections.remove("b");
+        let text = render_config(&cfg, &|_| None).unwrap();
+        assert!(!text.contains("CR-C+"), "{text}");
+        assert!(
+            text.contains("  neighbor 192.0.2.1 route-map CR-out out\n"),
             "{text}"
         );
     }
@@ -1046,8 +1354,27 @@ mod tests {
              redistribute ospf\n  neighbor 10.39.1.1 activate\n  \
              neighbor 10.39.1.1 soft-reconfiguration inbound\n  neighbor 10.39.4.2 activate\n  \
              neighbor 10.39.4.2 route-reflector-client\n  \
-             neighbor 10.39.4.2 soft-reconfiguration inbound\n"
+             neighbor 10.39.4.2 soft-reconfiguration inbound\n  \
+             neighbor 10.39.4.2 route-map CR-C+client out\n"
         );
+        // G3.9fb: the client asked for connected and OSPF only, not for
+        // chr's networks: its own map refuses those (our path, empty) and
+        // lets the rest through (no chain: iBGP passes it).
+        assert!(
+            text.contains(
+                "bgp as-path access-list CR-C+local seq 5 permit ^$\n\
+                 route-map CR-C+client permit 10\n match source-protocol connected\n on-match goto 100\nexit\n\
+                 route-map CR-C+client permit 11\n match source-protocol ospf\n on-match goto 100\nexit\n\
+                 ip prefix-list CR-C+client+not4 seq 5 permit 100.64.39.0/24\n\
+                 ip prefix-list CR-C+client+not4 seq 10 permit 198.18.39.7/32\n\
+                 route-map CR-C+client deny 80\n match as-path CR-C+local\n match ip address prefix-list CR-C+client+not4\nexit\n\
+                 route-map CR-C+client permit 100\nexit\n"
+            ),
+            "{text}"
+        );
+        // chr is eBGP without an output chain: it sends nothing (RFC 8212),
+        // no map of its own.
+        assert!(!text.contains("CR-C+chr"), "{text}");
         // IPv6: only chr has the family, so only its origination.
         let v6 = text.split(" address-family ipv6 unicast\n").nth(1).unwrap();
         assert!(
