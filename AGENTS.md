@@ -332,6 +332,14 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
   namespace descartável, sem root:
   `unshare --user --map-root-user --net -- cargo test -p corerouter-hal-linux`. Dentro dele só
   existe uma interface `lo`; crie interfaces `dummy`/`veth` no próprio teste. Nada vaza para o host.
+- **Faltou ferramenta ou liberação? Peça antes de contornar** (pedido do usuário, 2026-10-29).
+  Quando uma ferramenta, permissão ou ajuste do sistema ajudaria o trabalho (um profiler
+  bloqueado, um pacote, um `sysctl`, um acesso), avise o usuário na hora: o que falta, por que
+  ajuda, o risco e o comando exato para ele rodar (e como desfazer). Paliativo (instrumentar à
+  mão, simular, contornar) só se ele autorizar. Exemplo: o `perf` estava bloqueado
+  (`kernel.perf_event_paranoid = 4`); liberado com `perf_event_paranoid = 1` em
+  `/etc/sysctl.d/60-perf.conf`, ele roda sem root nos benches (`perf record -g` com
+  `--profile-time`).
 - Precisa de root de verdade (FRR instalado no host, XDP numa NIC física, imagem Buildroot,
   `setcap`)? Pare e entregue ao usuário o comando exato e o motivo; ele roda no terminal dele.
   Nunca proponha `sudo` sem senha (NOPASSWD) amplo.
