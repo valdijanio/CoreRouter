@@ -6628,3 +6628,30 @@ continuação indentadas).
   certificado; um pacote ruim enviado do mesmo jeito volta sozinho. Como testar: `cargo test -p
   corerouter-daemon --test package_upload`, `cargo test -p corerouter-sysupdate`, `cargo xtask os
   ab-test --scenario push`. Números em `docs/os-image.md` ("Pacote pela rede").
+
+- 2026-10-28 — G1.6e: Pacote pela rede, parte 2: `system.package.download {url, check?, downgrade?, ssl_verify?,
+  confirm?, timeout?, reboot?}` — o próprio roteador baixa o `.crpkg` de um endereço HTTP(S) (thread
+  `pkg-download`, cliente HTTP do daemon com o corpo entregue em pedaços de 256 KiB, `get_to`) pela
+  mesma fila limitada do envio até a instalação em fluxo: nunca inteiro na memória, assinatura antes
+  do primeiro byte gravado. Na GUI, um endereço no campo Package file faz Check e Install baixarem.
+  Como testar: `cargo test -p corerouter-daemon --test package_upload` (servidor HTTP local: 404,
+  pacote adulterado, check, instalação e boot de teste).
+
+- 2026-10-28 — G1.6o: Acesso web de fábrica, como o WebFig: na imagem, `https://<roteador>/` abre a GUI e pede o login.
+  Comandos `ip.service.www-ssl.set/get` (HTTPS + WSS com o certificado do roteador) e
+  `ip.service.www.set/get` (HTTP só para `301` → HTTPS), com `enabled`, `address`, `port` e
+  `available_from` (o `address` do `/ip service`: quem não está na lista cai antes do TLS, contado
+  em `refused`). O serviço `web` do daemon segue a config em execução: um commit abre, move ou
+  fecha a porta sem reiniciar, e as conexões abertas continuam. O padrão de fábrica (`www-ssl` na
+  443) vale só para config nova (`--web-factory-on`, passado pelo init), então um roteador
+  atualizado não ganha porta nova. O `cargo xtask os build` compila a GUI com trunk em release,
+  com `wasm-bindgen` e `wasm-opt` em versões fixas conferidas por SHA-256 e guarda o `.wasm` e o JS
+  só como `.gz`, que o daemon serve com `Content-Encoding: gzip` (32 → 11 MiB na rede). Respostas estáticas ganham `X-Frame-Options: DENY` e
+  `Referrer-Policy: no-referrer`. Detalhes, pesquisa e números em `docs/os-image.md` ("Acesso web
+  de fábrica").
+
+  Como testar: `cargo xtask os build && cargo xtask os boot-test` (a linha "web access" mostra a
+  página, o `.wasm` e o login por WSS); fora da imagem,
+  `corerouter-daemon --config-dir /tmp/cr --web-files <dist> --web-factory-on` e
+  `corerouter-cli --connect 127.0.0.1:7979 run ip.service.www-ssl.set '{"port":18443}'`, depois
+  `https://127.0.0.1:18443/`.

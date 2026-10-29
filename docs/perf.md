@@ -2256,3 +2256,9 @@ G1.6e (**medido** 2026-10-28, AMD Ryzen AI Max+ 395, build release, máquina com
 fila) 587 µs, 1,66 GiB/s. Envio de 41 MiB: 0,27 s em loopback (152 MiB/s), 2,16 s por TLS
 para o QEMU (19 MiB/s). `os build` incremental com só o daemon mudado: 184 s completo, 127 s com
 `--only crpkg`.
+
+- 2026-10-28, G1.6o, **medido** (host de desenvolvimento, KVM, build release da imagem): GUI
+  WASM 42,2 MB (cargo) → 32,2 MB (trunk: wasm-bindgen + wasm-opt) → 11,5 MB gzip -9; `-Oz`
+  explícito só −2%. Imagem guardando só o `.gz`: squashfs 21,7 → 32,7 MiB, qcow2 41,4 → 52,5
+  MiB, ISO 98,7 → 109,8 MiB (cru: +9,9 MiB; cru + `.gz`: +20,8 MiB). `.wasm` pela rede do QEMU
+  em 0,21–0,29 s.
