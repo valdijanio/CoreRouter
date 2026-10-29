@@ -1,8 +1,8 @@
 //! CoreRouter GUI.
 //!
-//! Native: `corerouter-gui [--connect HOST:PORT] [--control <port>]` manages a
-//! `corerouter-daemon` over its control channel (like WinBox). Without
-//! `--connect` it opens on the connect screen (WinBox login style): routers
+//! Native: `corerouter-gui [--connect HOST:PORT | corerouter://HOST]
+//! [--control <port>]` manages a `corerouter-daemon` over its control
+//! channel (like WinBox). Without either it opens on the connect screen (WinBox login style): routers
 //! heard with CRDP, the saved list, and a "Virtual lab" button for the
 //! in-process lab. `--control` serves the control channel (including
 //! `ui.screenshot`) so an agent can drive and *see* the app.
@@ -19,6 +19,8 @@ use corerouter_ui::{
 };
 
 mod export;
+#[cfg(not(target_arch = "wasm32"))]
+mod link;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 #[cfg(not(target_arch = "wasm32"))]
