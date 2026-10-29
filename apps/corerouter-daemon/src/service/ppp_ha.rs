@@ -88,12 +88,6 @@ pub(crate) struct HaShared {
     pub cookie_key: Mutex<Option<[u8; 32]>>,
 }
 
-/// The `ppp-ha` loop runs a pair (G4.3hk: the services keep quiet until
-/// their own config agrees, [`super::pppoe_bng::ha_may_answer`]).
-pub(crate) fn paired() -> bool {
-    shared().enabled.load(Ordering::Acquire)
-}
-
 pub(crate) fn shared() -> &'static HaShared {
     static S: OnceLock<HaShared> = OnceLock::new();
     S.get_or_init(|| HaShared {
@@ -1007,6 +1001,7 @@ mod linux {
                     ports.clear();
                     listener = None;
                     sh.enabled.store(false, Ordering::Release);
+                    super::super::pppoe_bng::HA_PAIRED.store(false, Ordering::Release);
                     sh.answering.store(false, Ordering::Release);
                     health.listen(Vec::new());
                 super::super::pppoe_bng::HA_ACTIVE.store(false, Ordering::Release);
@@ -1053,6 +1048,7 @@ mod linux {
                     *sh.cookie_key.lock().unwrap_or_else(PoisonError::into_inner) =
                         Some(hello::derive("ac-cookie", r.secret.as_bytes()));
                     sh.enabled.store(true, Ordering::Release);
+                    super::super::pppoe_bng::HA_PAIRED.store(true, Ordering::Release);
                     sh.answering.store(false, Ordering::Release);
                     let names: Vec<IfName> = if r.interfaces.is_empty() {
                         pppoe_ifs
@@ -1247,6 +1243,7 @@ mod linux {
             if health.stopping() {
                 *rt.pair() = None;
                 shared().enabled.store(false, Ordering::Release);
+                super::super::pppoe_bng::HA_PAIRED.store(false, Ordering::Release);
                 shared().answering.store(false, Ordering::Release);
                 super::super::pppoe_bng::HA_ACTIVE.store(false, Ordering::Release);
                 return Ok(());

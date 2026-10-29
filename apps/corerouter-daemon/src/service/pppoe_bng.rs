@@ -1166,15 +1166,16 @@ pub(crate) static HA_ACTIVE: std::sync::atomic::AtomicBool =
 /// must agree: no pair on either side answers as before; a pair on either
 /// side answers only when active and configured (from the virtual MAC).
 pub(crate) fn ha_may_answer(configured: bool, active: bool) -> bool {
-    may_answer(configured, super::ppp_ha::paired(), active)
+    may_answer(configured, HA_PAIRED.load(std::sync::atomic::Ordering::Acquire), active)
 }
 
 pub(crate) fn may_answer(configured: bool, paired: bool, active: bool) -> bool {
-    if !configured && !paired {
-        return true;
-    }
-    configured && active
+    if configured { active } else { !paired }
 }
+
+/// G4.3hk: the `ppp-ha` loop runs a pair (set by it, with [`HA_ACTIVE`]).
+pub(crate) static HA_PAIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) struct Bng {
     slots: Vec<Slot>,

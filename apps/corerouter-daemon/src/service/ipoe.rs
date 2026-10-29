@@ -143,10 +143,12 @@ impl Driver {
         core.set_answering(answering);
         // G4.3hk: quiet also while the pair and this service's config
         // disagree (one has the pair, the other not yet).
-        let quiet = !super::pppoe_bng::ha_may_answer(core.ha_enabled(), answering);
+        let paired = super::pppoe_bng::HA_PAIRED.load(Ordering::Acquire);
+        core.set_paired(paired);
+        let quiet = !super::pppoe_bng::may_answer(core.ha_enabled(), paired, answering);
         let ports = core.ports();
         // A router without a pair keeps whatever it had.
-        let untouched = !core.ha_enabled() && !super::ppp_ha::paired() && self.arp.is_none();
+        let untouched = !core.ha_enabled() && !paired && self.arp.is_none();
         if !untouched && self.arp.as_ref() != Some(&(quiet, ports.clone())) {
             for p in &ports {
                 if let Err(e) = arp_quiet(p, quiet) {
