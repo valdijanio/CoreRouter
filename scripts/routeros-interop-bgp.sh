@@ -442,8 +442,21 @@ case_mpbgp() {
   # output.network names one list; RouterOS takes the IPv4 and the IPv6
   # address-list of that name.
   rosx '/ipv6 firewall address-list add list=bgp-out address=fd39:203::/48' >/dev/null || true
-  ms=$(wait_for 30 k_has6 cf1 fd39:203::/48) && result mpbgp OK "IPv6 over the IPv4 session: fd39:203::/48 on CR1 $(k_route6 cf1 fd39:203::/48)" \
-    || result mpbgp FAIL "IPv6 over IPv4 on CR1: kernel '$(k_route6 cf1 fd39:203::/48)', bgpd: $(vt cf1 'show bgp ipv6 unicast fd39:203::/48 json' | jq -c '.paths[0] | {valid, nexthops}' 2>/dev/null)"
+  # Without a rewrite the CHR's IPv4-mapped next hop (::ffff:10.39.1.1)
+  # stays out of the kernel (RFC 2545 §3 divergence of RouterOS).
+  ms=$(wait_for 10 k_has6 cf1 fd39:203::/48) && result mpbgp INFO "IPv6 over the IPv4 session without set gw: fd39:203::/48 on CR1 $(k_route6 cf1 fd39:203::/48)" \
+    || result mpbgp INFO "IPv6 over IPv4 on CR1 without set gw: not installed, bgpd: $(vt cf1 'show bgp ipv6 unicast fd39:203::/48 json' | jq -c '.paths[0] | {valid, nexthops}' 2>/dev/null)"
+  # G3.9fh: the input chain writes the CHR's IPv6 address on the link.
+  cr1 routing.filter.rule.add '{"chain":"mp-in","rule":"if (afi ipv6) { set gw fd39:1::1 } accept"}' >/dev/null
+  local t0; t0=$(now_ms)
+  cr1 routing.bgp.connection.set '{"id":"chr4","input_filter":"mp-in"}' >/dev/null
+  ms=$(wait_for 30 k_has6 cf1 fd39:203::/48) && result mpbgp OK "set gw fd39:1::1 in the input chain: fd39:203::/48 on CR1 $(k_route6 cf1 fd39:203::/48) $(( $(now_ms) - t0 )) ms after the commit" \
+    || result mpbgp FAIL "set gw: fd39:203::/48 not on CR1: kernel '$(k_route6 cf1 fd39:203::/48)', bgpd: $(vt cf1 'show bgp ipv6 unicast fd39:203::/48 json' | jq -c '[.paths[]? | {valid, nexthops}]' 2>/dev/null)"
+  [[ $(k_route6 cf1 fd39:203::/48) == *fd39:1::1* ]] && result mpbgp OK "IPv6 next hop on CR1 is the CHR's fd39:1::1" || result mpbgp FAIL "IPv6 next hop: '$(k_route6 cf1 fd39:203::/48)'"
+  ip netns exec cf1 ping -6 -c 2 -i 0.2 -W 1 -I fd39:64::1 fd39:203::1 >/dev/null 2>&1 \
+    && result mpbgp INFO "ping fd39:64::1 → fd39:203::1 answered" || result mpbgp INFO "ping fd39:64::1 → fd39:203::1: no answer (CHR's blackhole route)"
+  # The IPv4 routes keep their next hop.
+  k_via cf1 203.0.113.0/24 10.39.1.1 && result mpbgp OK "IPv4 routes keep 10.39.1.1 (set gw of IPv6 only)" || result mpbgp FAIL "IPv4: '$(k_route cf1 203.0.113.0/24)'"
   ms=$(wait_for 30 ros_via6 fd39:64::/64 '') || true
   local r6; r6=$(ros "ipv6/route?dst-address=fd39:64::/64" | jq -c '[.[] | {gateway, active, "immediate-gw"}]')
   [[ $r6 == *'"active":"true"'* ]] && result mpbgp OK "IPv6 over the IPv4 session: fd39:64::/64 active on CHR $r6" \
@@ -452,6 +465,7 @@ case_mpbgp() {
   result mpbgp INFO "zebra on CR1: $(vt cf1 'show ipv6 route fd39:203::/48 json' | jq -c '[.[]?[]? | {protocol, selected, installed, nh: [.nexthops[]? | {ip, afi, active, unreachable}]}]' 2>/dev/null)"
   result mpbgp INFO "next hop CR1 got: $(vt cf1 'show bgp ipv6 unicast fd39:203::/48 json' | jq -c '[.paths[]?.nexthops[]? | {ip, afi, scope, accessible}]' 2>/dev/null)"
   ebgp4_down
+  cr1 routing.filter.rule.list '{"chain":"mp-in"}' | jq -r '.[].id' | while read -r id; do cr1 routing.filter.rule.remove "{\"id\":\"$id\"}" >/dev/null; done
 }
 
 case_multihop() {

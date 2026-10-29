@@ -124,7 +124,7 @@ Escreva as chains (Regras) e escolha o Filtro de entrada e o Filtro de saída da
 Uma regra na linguagem do RouterOS v7: `if (dst in bogons || dst-len > 24) { reject }`, `if (bgp-as-path "^64500_") { set bgp-local-pref 200; accept }`. A prévia abaixo conta quantas rotas a chain deixa passar com esta mudança.
 
 ## Linguagem
-Condições: `dst in|==|!=`, `dst-len`, `afi`, `protocol`, `bgp-as-path` (regex do FRR/Cisco, `_` é separador), `bgp-communities` e `bgp-large-communities` com `includes`, `any`, `equal` (e `-list`). Combinadas com `&&`, `||`, `not` e parênteses. Ações: `accept`, `reject`, `return`, `jump CHAIN`, `set bgp-local-pref|bgp-med|bgp-path-prepend|bgp-communities|bgp-large-communities`, `append …`, `delete …`."##),
+Condições: `dst in|==|!=`, `dst-len`, `afi`, `protocol`, `bgp-as-path` (regex do FRR/Cisco, `_` é separador), `bgp-communities` e `bgp-large-communities` com `includes`, `any`, `equal` (e `-list`). Combinadas com `&&`, `||`, `not` e parênteses. Ações: `accept`, `reject`, `return`, `jump CHAIN`, `set bgp-local-pref|bgp-med|bgp-path-prepend|bgp-communities|bgp-large-communities`, `set gw ENDEREÇO` (next hop das rotas da família do endereço), `append …`, `delete …`."##),
     (r##"filter.rule.actions"##, r##"## O que é
 O que a regra faz: verde aceita, vermelho rejeita, azul muda um atributo."##),
     (r##"filter.rule.chain"##, r##"## O que é

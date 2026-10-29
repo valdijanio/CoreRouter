@@ -25,6 +25,7 @@ use std::collections::BTreeMap;
 
 use crate::config::{Config, Ip, Routing};
 use crate::address_lists::AddressLists;
+use crate::routes::Routes;
 use crate::cow::CowArc;
 use crate::cow_list::CowList;
 use crate::dhcp_server::DhcpServers;
@@ -108,7 +109,7 @@ fn apply_ip(base: &Ip, delta: &Value) -> Result<Ip, PersistError> {
         |ip| {
             let mut light = ip.clone();
             light.addresses = CowList::default();
-            light.routes = CowList::default();
+            light.routes = Routes::default();
             light.firewall = CowArc::default();
             light.dns_static = CowArc::default();
             light.dns_zones = CowArc::default();
@@ -118,7 +119,7 @@ fn apply_ip(base: &Ip, delta: &Value) -> Result<Ip, PersistError> {
         |out, base, key, op| {
             match key {
                 "addresses" => out.addresses = list(&base.addresses, op)?,
-                "routes" => out.routes = list(&base.routes, op)?,
+                "routes" => out.routes = Routes::from_list(list(base.routes.list(), op)?),
                 "dns_static" => out.dns_static = nested(&base.dns_static, op, apply_dns_static)?,
                 "dns_zones" => out.dns_zones = section(&base.dns_zones, op)?,
                 "dhcp_server" => out.dhcp_server = nested(&base.dhcp_server, op, apply_dhcp)?,
@@ -358,7 +359,7 @@ fn diff_ip(a: &Ip, b: &Ip) -> Result<Option<Value>, PersistError> {
     let light = |ip: &Ip| {
         let mut l = ip.clone();
         l.addresses = CowList::default();
-        l.routes = CowList::default();
+        l.routes = Routes::default();
         l.firewall = CowArc::default();
         l.dns_static = CowArc::default();
         l.dns_zones = CowArc::default();
@@ -369,7 +370,7 @@ fn diff_ip(a: &Ip, b: &Ip) -> Result<Option<Value>, PersistError> {
         return whole(a, b);
     };
     p.list("addresses", &a.addresses, &b.addresses)?;
-    p.list("routes", &a.routes, &b.routes)?;
+    p.list("routes", a.routes.list(), b.routes.list())?;
     p.nested_section("dns_static", &a.dns_static, &b.dns_static, |s| !s.is_empty(), |a, b| {
         let light = |d: &DnsStatic| {
             let mut l = d.clone();
@@ -1069,7 +1070,7 @@ mod tests {
         assert!(CowList::ptr_eq(&got.ip.routes, &new.ip.routes));
         // Sections emptied and filled (keys that disappear from the JSON).
         let mut old = new.clone();
-        old.ip.routes = CowList::default();
+        old.ip.routes = Default::default();
         old.ip.dns_static.entries.clear();
         check(&old, &new);
         check(&new, &old);
