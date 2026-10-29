@@ -28,8 +28,9 @@ Depois de instalado:
 | `corerouter://127.0.0.1:7979` | canal local `127.0.0.1:7979` com o token local |
 
 O link só diz **onde** conectar; o caminho é o mesmo do botão Connect. Um roteador visto pela
-primeira vez pergunta pelo certificado antes de mandar qualquer coisa; a senha vem do chaveiro
-(se foi lembrada para aquele endereço), nunca do link nem de `$COREROUTER_PASSWORD`. O texto é
+primeira vez pergunta pelo certificado antes de mandar qualquer coisa; a senha lembrada no chaveiro
+para aquele endereço aparece no campo Password, com o selo `saved password` (G0.3e), nunca vem
+do link nem de `$COREROUTER_PASSWORD`. O texto é
 tratado como hostil: só `[usuário@]host[:porta]`, até 300 bytes, sem caminho, query,
 `%`-encoding nem senha (`usuário:senha@` é recusado). `corerouter-gui corerouter://…` no
 terminal faz o mesmo.

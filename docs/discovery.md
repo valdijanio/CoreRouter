@@ -204,6 +204,12 @@ No laboratório virtual (`--backend virtual`) só roda o CRDP: não há enlace d
   nativa inicia sem `--connect`. Esquerda: Connect to, Login, Password, Remember password, Group,
   Comment, Save to list, Connect e "Virtual lab". Direita: abas Neighbors e Saved com Find.
   Clique num vizinho preenche Connect to; duplo clique preenche e conecta.
+  - Senha salva (G0.3e): com "Remember password", a senha fica no chaveiro do sistema por
+    `usuário@endereço`. Ao mudar Connect to ou Login, a GUI a procura e, se existir, a põe no
+    campo Password (mascarada) com o selo `saved password`, ⓘ e "Forget"; nada é usado escondido
+    (campo vazio = senha vazia). Login recusado com a senha salva diz isso e oferece apagá-la;
+    "Trust and update" num certificado trocado também a esquece (caixa marcada por padrão). O
+    exemplo de Connect to é `e.g. 192.168.88.1:8729` em itálico.
   - Nativo: escuta CRDP direto nas interfaces da máquina (`corerouter_discovery::Listener`,
     nunca envia). Um vizinho que roda na própria máquina vira `127.0.0.1:<porta>`. "Na própria
     máquina" = o bind no endereço de origem funciona ou o endereço IPv6 é de uma interface local

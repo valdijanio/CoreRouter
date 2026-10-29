@@ -306,20 +306,20 @@ pub fn main() -> ExitCode {
     let mut ready = None;
     if let Some(addr) = &args.connect {
         screen.connect_to = addr.clone();
+        screen.set_login(&args.user.clone().unwrap_or_else(|| DEFAULT_LOGIN.into()));
+        // The saved password goes in the field, as for the Connect button.
+        crate::look_up_saved(&mut screen, &mut platform);
+        // A clicked link never picks up a password from the environment.
+        if !args.from_link
+            && let Ok(password) = std::env::var("COREROUTER_PASSWORD")
+            && !password.is_empty()
+        {
+            screen.set_password(password);
+        }
         let creds = Credentials {
-            address: addr.clone(),
-            user: args.user.clone().unwrap_or_else(|| DEFAULT_LOGIN.into()),
-            // A clicked link never picks up a password from the environment.
-            password: if args.from_link {
-                String::new()
-            } else {
-                std::env::var("COREROUTER_PASSWORD").unwrap_or_default()
-            },
             remember: false,
-            legacy: false,
-            pin: None,
+            ..screen.connect_now()
         };
-        screen.set_login(&creds.user);
         match platform.connect(&creds) {
             Ok(Connected::Ready(r)) => ready = Some(*r),
             Ok(Connected::Trust(c, fp)) => screen.ask_trust(c, fp),
@@ -399,11 +399,54 @@ struct NativePlatform {
     listener: Option<Listener>,
     saved_path: Option<PathBuf>,
     target: Arc<Mutex<Target>>,
-    keyring: bool,
+    /// `None`: no secure store on this machine.
+    secrets: Option<Box<dyn Secrets>>,
 }
 
 /// Keyring service name; the account is `user@address`.
 const KEYRING_SERVICE: &str = "corerouter";
+
+/// Where remembered passwords live, by account (`user@address`): the OS
+/// keyring, or a map in the tests (never the operator's keyring).
+trait Secrets {
+    fn get(&self, account: &str) -> Option<String>;
+    fn set(&self, account: &str, password: &str) -> Result<(), String>;
+    /// Deleting what is not there is fine.
+    fn delete(&self, account: &str) -> Result<(), String>;
+}
+
+struct Keyring;
+
+impl Secrets for Keyring {
+    fn get(&self, account: &str) -> Option<String> {
+        keyring::Entry::new(KEYRING_SERVICE, account)
+            .ok()?
+            .get_password()
+            .ok()
+    }
+
+    fn set(&self, account: &str, password: &str) -> Result<(), String> {
+        keyring::Entry::new(KEYRING_SERVICE, account)
+            .and_then(|e| e.set_password(password))
+            .map_err(|e| e.to_string())
+    }
+
+    fn delete(&self, account: &str) -> Result<(), String> {
+        match keyring::Entry::new(KEYRING_SERVICE, account).and_then(|e| e.delete_credential()) {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(format!("cannot forget the saved password: {e}")),
+        }
+    }
+}
+
+/// The keyring account of `user` at the router typed as `address`
+/// (normalized, so `tls://h:p` and `h:p` share it); `None` for an address
+/// the GUI could not connect to anyway.
+fn account(address: &str, user: &str) -> Option<String> {
+    let target = check_addr(address.trim()).ok()?;
+    let user = user.trim();
+    (!user.is_empty()).then(|| format!("{user}@{}", target.addr()))
+}
 
 /// Whether the OS keyring answers at all (a probe entry that does not exist).
 fn keyring_probe() -> Result<String, String> {
@@ -413,10 +456,6 @@ fn keyring_probe() -> Result<String, String> {
         Ok(_) | Err(keyring::Error::NoEntry) => Ok("the system keyring".into()),
         Err(e) => Err(format!("no secure password store: {e}")),
     }
-}
-
-fn keyring_entry(address: &str, user: &str) -> Option<keyring::Entry> {
-    keyring::Entry::new(KEYRING_SERVICE, &format!("{user}@{address}")).ok()
 }
 
 impl NativePlatform {
@@ -446,7 +485,7 @@ impl NativePlatform {
                 listener,
                 saved_path,
                 target,
-                keyring: has_keyring,
+                secrets: has_keyring.then(|| Box::new(Keyring) as Box<dyn Secrets>),
             },
         )
     }
@@ -477,12 +516,9 @@ impl Platform for NativePlatform {
                 "{target} is reached over TLS: type a Login and Password"
             )));
         }
-        let mut password = creds.password.clone();
-        if password.is_empty() && self.keyring && !creds.user.is_empty() {
-            password = keyring_entry(&addr, &creds.user)
-                .and_then(|e| e.get_password().ok())
-                .unwrap_or_default();
-        }
+        // G0.3e: exactly what the Password field held. A saved password is
+        // already there (shown); an empty field is an empty password.
+        let password = &creds.password;
         let fingerprint = if !target.tls {
             None
         } else if let Some(pin) = &creds.pin {
@@ -524,16 +560,18 @@ impl Platform for NativePlatform {
         let way = log_in(
             &target,
             &creds.user,
-            &password,
+            password,
             fingerprint,
             creds.legacy,
             local,
         )?;
         if way.how == How::Password
             && creds.remember
+            && !creds.saved
             && !creds.password.is_empty()
-            && let Some(entry) = keyring_entry(&addr, &creds.user)
-            && let Err(e) = entry.set_password(&creds.password)
+            && let Some(secrets) = &self.secrets
+            && let Some(account) = account(&addr, &creds.user)
+            && let Err(e) = secrets.set(&account, &creds.password)
         {
             log::warn!("password not remembered: {e}");
         }
@@ -563,6 +601,17 @@ impl Platform for NativePlatform {
         KnownHosts::load_default()
             .remember(&target.addr(), fingerprint)
             .map_err(|e| format!("cannot save the known hosts file: {e}"))
+    }
+
+    fn saved_password(&mut self, address: &str, user: &str) -> Option<String> {
+        self.secrets.as_ref()?.get(&account(address, user)?)
+    }
+
+    fn forget_password(&mut self, address: &str, user: &str) -> Result<(), String> {
+        match (&self.secrets, account(address, user)) {
+            (Some(secrets), Some(account)) => secrets.delete(&account),
+            _ => Ok(()),
+        }
     }
 
     fn lab(&mut self) -> CoreRouterUi {
@@ -1067,6 +1116,127 @@ mod tests {
                 .unwrap()["user"],
             "op"
         );
+    }
+
+    /// The tests' secure store: a map, never the operator's keyring.
+    #[derive(Default, Clone)]
+    struct MemSecrets(Arc<Mutex<std::collections::BTreeMap<String, String>>>);
+
+    impl MemSecrets {
+        fn map(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<String, String>> {
+            self.0.lock().unwrap()
+        }
+    }
+
+    impl Secrets for MemSecrets {
+        fn get(&self, account: &str) -> Option<String> {
+            self.map().get(account).cloned()
+        }
+        fn set(&self, account: &str, password: &str) -> Result<(), String> {
+            self.map().insert(account.into(), password.into());
+            Ok(())
+        }
+        fn delete(&self, account: &str) -> Result<(), String> {
+            self.map().remove(account);
+            Ok(())
+        }
+    }
+
+    fn platform(secrets: &MemSecrets) -> NativePlatform {
+        NativePlatform {
+            listener: None,
+            saved_path: None,
+            target: Arc::new(Mutex::new(Target::Choosing)),
+            secrets: Some(Box::new(secrets.clone())),
+        }
+    }
+
+    /// G0.3e, the defect of 2026-10-29: a reinstalled router whose admin has
+    /// no password, and the old one still saved. The saved one is shown in
+    /// the field; cleared, the login goes with an empty password.
+    #[test]
+    fn a_stale_saved_password_is_shown_and_an_empty_field_logs_in() {
+        let r = router();
+        let addr = r.addr();
+        let secrets = MemSecrets::default();
+        secrets
+            .map()
+            .insert(format!("admin@{addr}"), "old-vm-pw".into());
+        let mut p = platform(&secrets);
+        let mut screen = ConnectScreen::new(Vec::new());
+        screen.set_keyring(Ok("test store".into()));
+        screen.connect_to = addr.clone();
+        crate::look_up_saved(&mut screen, &mut p);
+        // Shown, and refused by the router as it would be: the screen says
+        // the saved password did not work.
+        let creds = screen.connect_now();
+        assert!(creds.saved && creds.password == "old-vm-pw");
+        let Err(f) = p.connect(&creds) else {
+            panic!("the old password was taken")
+        };
+        assert_eq!(f.text, connect::BAD_LOGIN);
+        screen.fail(f);
+        // Forget it: gone from the store; the empty password logs in.
+        assert!(p.forget_password(&addr, "admin").is_ok());
+        assert!(secrets.map().is_empty());
+        screen.set_password(String::new());
+        let creds = screen.connect_now();
+        assert!(!creds.saved && creds.password.is_empty());
+        assert!(matches!(p.connect(&creds), Ok(Connected::Ready(_))));
+        // Nothing was saved for an empty password.
+        assert!(secrets.map().is_empty());
+    }
+
+    /// Remember password keeps a typed password once, by normalized
+    /// address; the saved one is not written again; forget deletes it.
+    #[test]
+    fn remember_and_forget_go_to_the_store_by_account() {
+        let r = router();
+        let addr = r.addr();
+        let secrets = MemSecrets::default();
+        let mut p = platform(&secrets);
+        let creds = Credentials {
+            address: addr.clone(),
+            user: "op".into(),
+            password: "op-password".into(),
+            remember: true,
+            ..Credentials::default()
+        };
+        assert!(matches!(p.connect(&creds), Ok(Connected::Ready(_))));
+        assert_eq!(
+            secrets.map().get(&format!("op@{addr}")).map(String::as_str),
+            Some("op-password")
+        );
+        assert_eq!(
+            p.saved_password(&addr, "op").as_deref(),
+            Some("op-password")
+        );
+        assert_eq!(
+            p.saved_password(&format!(" {addr} "), " op").as_deref(),
+            Some("op-password")
+        );
+        assert_eq!(p.saved_password(&addr, "admin"), None);
+        assert_eq!(p.saved_password("not an address", "op"), None);
+        // The saved password logging in again is not rewritten.
+        secrets
+            .map()
+            .insert(format!("op@{addr}"), "op-password".into());
+        let before = secrets.map().clone();
+        let again = Credentials {
+            saved: true,
+            ..creds.clone()
+        };
+        assert!(matches!(p.connect(&again), Ok(Connected::Ready(_))));
+        assert_eq!(*secrets.map(), before);
+        assert!(p.forget_password(&addr, "op").is_ok());
+        assert_eq!(p.saved_password(&addr, "op"), None);
+        // Forgetting what is not there is fine.
+        assert!(p.forget_password(&addr, "op").is_ok());
+        assert_eq!(
+            account("tls://10.0.0.1:8729", "admin"),
+            account("10.0.0.1:8729", "admin")
+        );
+        assert_eq!(account("10.0.0.1:8729", " "), None);
     }
 
     #[test]
