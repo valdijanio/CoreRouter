@@ -72,12 +72,18 @@ fn rows(cfg: &Config, list: &[Drift]) -> Vec<Value> {
 
 fn list(s: &mut Session, _: &Value) -> Result<Value> {
     let cfg = applied(s);
-    let found = current(s, &cfg)?;
-    Ok(json!({
-        "backend": s.backend(),
-        "in_sync": found.is_empty(),
-        "drift": rows(&cfg, &found),
-    }))
+    // The data plane is read under the lock (the HAL is the session's);
+    // what it should hold and the comparison come after it (G0.31b).
+    let have = s.hal_mut().snapshot(&cfg).map_err(hal_err)?;
+    let backend = s.backend();
+    s.defer(move || {
+        let found = drift::diff(&drift::expected(&cfg), &have);
+        Ok(json!({
+            "backend": backend,
+            "in_sync": found.is_empty(),
+            "drift": rows(&cfg, &found),
+        }))
+    })
 }
 
 /// `::ffff:10.0.0.1` (a dual-stack socket) is 10.0.0.1.

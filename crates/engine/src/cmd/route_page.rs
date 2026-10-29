@@ -292,12 +292,12 @@ fn page(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let neigh = s.neigh_fresh();
     let neigh = neigh.lock();
-    let watch = s.ext::<RouteWatch>();
+    let watch = s.ext::<RouteWatch>().map(RouteWatch::changed);
     let rows: Vec<Value> = kept
         .iter()
         .filter_map(|e| match e {
             Entry::Line(i) => lines.get(*i).map(|l| {
-                let mut r = super::route::row(l, watch, now);
+                let mut r = super::route::row(l, watch.as_ref(), now);
                 super::route::layer2(&mut r, l, &neigh);
                 r
             }),

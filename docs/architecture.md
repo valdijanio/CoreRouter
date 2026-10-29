@@ -476,6 +476,53 @@ trocariam o tipo de toda lista da config (centenas de usos como slice) e trariam
 dependência nova; fica para quando uma lista sozinha for o gargalo (hoje, acrescentar a uma
 address list de 60 000 entradas ainda copia a lista: ~0,6 ms, **medido**).
 
+### Consultas fora do lock do `Session` (G0.31b)
+
+Todo comando do daemon roda dentro de `lock(&shared)`. Enquanto uma consulta monta 60 000 rotas
+em JSON, o DHCP, o PPPoE, a coleta de métricas e os outros clientes esperam. Uma consulta de
+resposta grande se divide em duas partes (`engine::off_lock`):
+
+```
+canal de controle ─► lock ─► Session::execute_reply_as ─► handler:
+                               pega o snapshot (Config clonada = contadores de referência,
+                               Arc do estado vivo) e chama s.defer(move || montar(snapshot))
+                     unlock ◄─ Reply::Later(closure)
+                     Reply::finish() — linhas, JSON, filtros: sem o lock
+```
+
+- **Quem chama.** `Host::with_session_reply` (o `SharedHost` do daemon e a GUI local) solta o
+  lock e só então roda `Reply::finish`. `Session::execute`, usado pela GUI no processo, pela CLI
+  sem daemon, pelos lotes e pelos testes, recebe a resposta pronta, como antes: o `defer` roda o
+  closure na hora.
+- **Aninhamento.** Só o comando pedido como resposta adia; um comando que ele executa por dentro
+  responde no lugar (senão quem o chamou receberia `null`). O controle usa a profundidade de
+  `execute`, guardada em `ext::<OffLock>`.
+- **O que entra no snapshot.** O closure é `Send + 'static`, então não alcança o `Session` (o
+  compilador impede). Tudo o que ele lê precisa custar um ponteiro sob o lock:
+  - seções da config (`CowArc`/`CowList`, G0.16/G0.21);
+  - estado vivo em `Arc`, copiado só quando alguém escreve com o closure ainda vivo
+    (`RouteWatch::changed`, `FwDiag::live`, `DynamicLists::shared`, o `LdpState`);
+  - tabelas com lock próprio (`NeighShared`), travadas só dentro do closure.
+- **Para a próxima consulta (ex.: G0.31c, conntrack):** uma thread publica o dump num `Arc`, e o
+  handler clona o `Arc` e chama `s.defer` com o filtro e a soma.
+
+Adiam hoje: `ip.route.list`, `ip.firewall.{filter,nat,mangle,raw}.list`,
+`ip.firewall.address-list.list`, `ip.firewall.preview` e `config.drift.list`. No drift, a
+leitura do kernel continua sob o lock, porque o HAL é do `Session`. Com a config do bench
+`lock_hold` (60 000 rotas, 10 000 regras, 100 000 entradas), nenhuma consulta segura o lock por
+mais de 2 ms. Antes eram 345 ms no `ip.route.list` e 112 ms no `address-list.list` (**medido**;
+tabela no `docs/perf.md`).
+
+Comparado com as alternativas:
+- **Paginar as listas:** já existe o `ip.route.page`, mas mudaria o contrato das listas inteiras
+  que a CLI, o MCP e os scripts usam.
+- **`RwLock` no `Session`:** quase toda consulta escreve algum estado (o `RouteWatch`, o pedido
+  de contadores, a expiração das entradas dinâmicas), então viraria escrita do mesmo jeito.
+
+Fica sob o lock a primeira lista depois de uma mudança de config, que reconstrói as linhas de
+rota (26 ms com 60 000 rotas, **medido**, `lock_hold/held/ip.route.list/after_change`): gap
+G0.31g.
+
 ### Safe Mode (G1.4)
 
 Como no RouterOS: `config.safe-mode.enter` guarda a config running da entrada (a própria
