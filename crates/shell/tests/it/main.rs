@@ -7,5 +7,6 @@
 mod cgnat_export;
 mod dns_lookup;
 mod ppp_export;
+mod submenu_print;
 mod tasks;
 mod terminal;
