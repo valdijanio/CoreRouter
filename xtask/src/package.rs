@@ -20,12 +20,25 @@ use md5::Digest as _;
 use crate::Outcome;
 
 const USAGE: &str = "\
-usage: cargo xtask package gui [--out <dir>] [--no-build]
+usage: cargo xtask package gui [--out <dir>] [--no-build] [--version <v>]
+       cargo xtask package notes [--since <git ref>]
 
-  Builds corerouter-gui and corerouter-cli (profile `dist`: release without
-  symbols) and writes corerouter-gui_<version>_<arch>.deb.
-  --out <dir>   where the .deb goes (default <target>/package)
-  --no-build    package the binaries already in <target>/dist";
+  gui: builds corerouter-gui and corerouter-cli (profile `dist`: release
+  without symbols) and writes corerouter-gui_<version>_<arch>.deb.
+  --out <dir>      where the .deb goes (default <target>/package)
+  --no-build       package the binaries already in <target>/dist
+  --version <v>    a release (the tag without the `v`: 0.2.0, 0.2.0-rc.1);
+                   must be the workspace version, plus an optional
+                   pre-release. Default: <workspace>+<commits>.g<commit>
+  notes: the release notes, from the docs/log.md entries the log at
+  <since> (the previous tag) does not have; all of them without --since.";
+
+/// GitHub refuses a release body above 125 000 characters; the notes stop
+/// before that and point at the full log.
+const NOTES_MAX: usize = 100_000;
+/// One entry of the notes: its first characters (the log entry has the
+/// details).
+const NOTE_ENTRY_MAX: usize = 300;
 
 const NAME: &str = "corerouter-gui";
 const BINARIES: &[&str] = &["corerouter-gui", "corerouter-cli"];
@@ -117,11 +130,14 @@ struct Deb {
 
 pub fn main(root: &Path, args: &[String]) -> Outcome {
     let mut args = args.iter();
-    if args.next().map(String::as_str) != Some("gui") {
-        return Outcome::Fail(USAGE.into());
+    match args.next().map(String::as_str) {
+        Some("gui") => {}
+        Some("notes") => return notes_main(root, args),
+        _ => return Outcome::Fail(USAGE.into()),
     }
     let mut out_dir = None;
     let mut build = true;
+    let mut release = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--out" => match args.next() {
@@ -129,10 +145,17 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
                 None => return Outcome::Fail(USAGE.into()),
             },
             "--no-build" => build = false,
+            "--version" => match args.next() {
+                Some(v) => match release_version(v, env!("CARGO_PKG_VERSION")) {
+                    Ok(v) => release = Some(v),
+                    Err(e) => return Outcome::Fail(e),
+                },
+                None => return Outcome::Fail(USAGE.into()),
+            },
             _ => return Outcome::Fail(format!("unknown argument '{a}'\n{USAGE}")),
         }
     }
-    match package_gui(root, out_dir, build) {
+    match package_gui(root, out_dir, build, release) {
         Ok(path) => {
             eprintln!(
                 "\nwrote {}\ninstall: sudo apt install {}",
@@ -145,7 +168,12 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
     }
 }
 
-fn package_gui(root: &Path, out_dir: Option<PathBuf>, build: bool) -> Result<PathBuf, String> {
+fn package_gui(
+    root: &Path,
+    out_dir: Option<PathBuf>,
+    build: bool,
+    release: Option<String>,
+) -> Result<PathBuf, String> {
     let target = crate::bng_lab::target_dir(root);
     if build {
         let mut cmd = crate::cargo();
@@ -178,7 +206,10 @@ fn package_gui(root: &Path, out_dir: Option<PathBuf>, build: bool) -> Result<Pat
     }
     depends.extend(RUNTIME_DEPENDS.iter().map(|s| (*s).to_owned()));
 
-    let version = version(root)?;
+    let version = match release {
+        Some(v) => v,
+        None => version(root)?,
+    };
     let mtime = commit_time(root);
     let mut files: Vec<Entry> = bins
         .into_iter()
@@ -266,6 +297,114 @@ fn version(root: &Path) -> Result<String, String> {
         return Err(format!("bad package version '{v}'"));
     }
     Ok(v)
+}
+
+/// The Debian version of a release: the tag without the `v` (`0.2.0`), a
+/// pre-release after `-` becoming `~` (`0.2.0-rc.1` → `0.2.0~rc.1`, which
+/// sorts before `0.2.0`). The base must be the workspace version, so the
+/// package and the binaries (`server.info`, the GUI's bar) say the same.
+fn release_version(tag: &str, workspace: &str) -> Result<String, String> {
+    let shown: String = tag.chars().take(40).collect();
+    let v = tag.strip_prefix('v').unwrap_or(tag);
+    let (base, pre) = match v.split_once('-') {
+        Some((b, p)) => (b, Some(p)),
+        None => (v, None),
+    };
+    if base != workspace {
+        return Err(format!(
+            "release version '{shown}' is not the workspace version {workspace}: \
+             bump [workspace.package] version in Cargo.toml first (or tag v{workspace})"
+        ));
+    }
+    match pre {
+        None => Ok(base.to_owned()),
+        Some(p)
+            if !p.is_empty()
+                && p.len() <= 30
+                && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') =>
+        {
+            Ok(format!("{base}~{p}"))
+        }
+        Some(_) => Err(format!(
+            "bad pre-release in '{shown}': letters, digits and dots after the '-' (0.2.0-rc.1)"
+        )),
+    }
+}
+
+fn notes_main(root: &Path, mut args: std::slice::Iter<'_, String>) -> Outcome {
+    let mut since = None;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--since" => match args.next() {
+                Some(r) if !r.is_empty() => since = Some(r.clone()),
+                Some(_) => {}
+                None => return Outcome::Fail(USAGE.into()),
+            },
+            _ => return Outcome::Fail(format!("unknown argument '{a}'\n{USAGE}")),
+        }
+    }
+    let new = match std::fs::read_to_string(root.join("docs/log.md")) {
+        Ok(t) => t,
+        Err(e) => return Outcome::Fail(format!("docs/log.md: {e}")),
+    };
+    let old = match &since {
+        Some(r) => match git(root, &["show", &format!("{r}:docs/log.md")]) {
+            Ok(t) => t,
+            Err(e) => return Outcome::Fail(e),
+        },
+        None => String::new(),
+    };
+    print!("{}", release_notes(&old, &new));
+    Outcome::Ok
+}
+
+/// The entries of `docs/log.md` (`- AAAA-MM-DD — id: …` plus its indented
+/// continuation lines), each joined into one line without the `- `.
+fn log_entries(log: &str) -> Vec<String> {
+    let mut entries: Vec<String> = Vec::new();
+    let mut open = false;
+    for line in log.lines() {
+        if let Some(rest) = line.strip_prefix("- ") {
+            entries.push(rest.trim().to_owned());
+            open = true;
+        } else if line.trim().is_empty() || !line.starts_with(char::is_whitespace) {
+            open = false;
+        } else if open && let Some(last) = entries.last_mut() {
+            last.push(' ');
+            last.push_str(line.trim());
+        }
+    }
+    entries
+}
+
+/// One bullet per entry of `new` that `old` does not have, in the log's
+/// order, each cut at [`NOTE_ENTRY_MAX`] characters and the whole at
+/// [`NOTES_MAX`].
+fn release_notes(old: &str, new: &str) -> String {
+    let seen: std::collections::HashSet<String> = log_entries(old).into_iter().collect();
+    let fresh: Vec<String> = log_entries(new)
+        .into_iter()
+        .filter(|e| !seen.contains(e))
+        .collect();
+    if fresh.is_empty() {
+        return "Nenhuma entrada nova em docs/log.md.\n".into();
+    }
+    let mut out = String::new();
+    for (i, e) in fresh.iter().enumerate() {
+        let line = match e.char_indices().nth(NOTE_ENTRY_MAX) {
+            Some((cut, _)) => format!("- {}…\n", e[..cut].trim_end()),
+            None => format!("- {e}\n"),
+        };
+        if out.len() + line.len() > NOTES_MAX {
+            out.push_str(&format!(
+                "- … e mais {} entradas (docs/log.md)\n",
+                fresh.len() - i
+            ));
+            break;
+        }
+        out.push_str(&line);
+    }
+    out
 }
 
 fn commit_time(root: &Path) -> u64 {
@@ -701,5 +840,46 @@ mod tests {
         assert_eq!(rfc2822(1_761_609_600), "Tue, 28 Oct 2025 00:00:00 +0000");
         assert_eq!(deb_arch("x86_64").unwrap(), "amd64");
         assert!(deb_arch("mips").is_err());
+    }
+
+    #[test]
+    fn release_version_is_the_tag_on_the_workspace_version() {
+        assert_eq!(release_version("v0.2.0", "0.2.0").unwrap(), "0.2.0");
+        assert_eq!(release_version("0.2.0", "0.2.0").unwrap(), "0.2.0");
+        assert_eq!(
+            release_version("v0.2.0-rc.1", "0.2.0").unwrap(),
+            "0.2.0~rc.1"
+        );
+        let e = release_version("v0.3.0", "0.2.0").unwrap_err();
+        assert!(e.contains("bump"), "{e}");
+        assert!(release_version("v0.2.0-", "0.2.0").is_err());
+        assert!(release_version("v0.2.0-rc_1", "0.2.0").is_err());
+        assert!(release_version("v0.2.0-rc 1;rm", "0.2.0").is_err());
+    }
+
+    #[test]
+    fn notes_list_the_log_entries_the_previous_tag_lacks() {
+        let old = "# log\n\nNot an entry.\n\n- 2026-10-21 — G0.1: first\n  line two\n";
+        let new = format!(
+            "{old}\n- 2026-10-22 — G0.2: second\n  continues\n\n- 2026-10-23 — G0.3: {}\n",
+            "x".repeat(400)
+        );
+        let notes = release_notes(old, &new);
+        let lines: Vec<&str> = notes.lines().collect();
+        assert_eq!(lines.len(), 2, "{notes}");
+        assert_eq!(lines[0], "- 2026-10-22 — G0.2: second continues");
+        assert!(lines[1].ends_with('…') && lines[1].chars().count() == 2 + NOTE_ENTRY_MAX + 1);
+        assert!(release_notes(&new, &new).starts_with("Nenhuma"));
+        assert_eq!(
+            release_notes("", old),
+            "- 2026-10-21 — G0.1: first line two\n"
+        );
+
+        let many: String = (0..2000)
+            .map(|i| format!("- 2026-10-21 — G{i}: {}\n", "y".repeat(200)))
+            .collect();
+        let notes = release_notes("", &many);
+        assert!(notes.len() <= NOTES_MAX + 100, "{}", notes.len());
+        assert!(notes.trim_end().ends_with("entradas (docs/log.md)"));
     }
 }
