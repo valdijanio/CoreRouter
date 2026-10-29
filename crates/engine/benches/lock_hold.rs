@@ -175,8 +175,9 @@ fn lock_hold(c: &mut Criterion) {
     g.bench_function("state.inspect/pending_identity", |b| {
         b.iter(|| black_box(s.inspect(None).ok()))
     });
-    // One pending route: the 60 000 routes are serialized on both sides
-    // (item-by-item diff of a big list: G0.31a).
+    // One pending route: only the blocks of the routes the two sides do
+    // not share are serialized (G0.31a: 562 ms before, the whole list on
+    // both sides).
     s.execute(
         "ip.route.add",
         &json!({"dst_address": "198.51.100.0/24", "gateway": "192.168.88.254"}),
