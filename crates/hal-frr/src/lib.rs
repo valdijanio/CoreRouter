@@ -486,6 +486,38 @@ impl Frr {
         Ok(Some(st))
     }
 
+    /// G3.9c: the stub router state of `cfg`'s instances (main VRF), one
+    /// `show … json` each.
+    pub fn ospf_stub_state(
+        &self,
+        cfg: &Config,
+    ) -> Result<Vec<corerouter_model::ospf_state::OspfStubState>, HalError> {
+        use corerouter_model::ospf::Version;
+        let mut out = Vec::new();
+        for inst in cfg.routing.ospf.instances.values() {
+            if inst.disabled || inst.vrf != corerouter_model::ospf::MAIN_VRF {
+                continue;
+            }
+            let (d, cmd) = match inst.version {
+                Version::V2 => (Daemon::Ospfd, "show ip ospf json"),
+                Version::V3 => (Daemon::Ospf6d, "show ipv6 ospf6 json"),
+            };
+            let mut vty = self.connect(d)?;
+            let r = vty.run(cmd).map_err(|e| io_err(d, e))?;
+            let t = String::from_utf8_lossy(&r.output).into_owned();
+            // Not running yet: a warning, not JSON.
+            if !r.ok() || !t.trim_start().starts_with('{') {
+                continue;
+            }
+            let st = match inst.version {
+                Version::V2 => ospf::stub_v2(&t, &inst.name),
+                Version::V3 => ospf::stub_v3(&t, &inst.name),
+            };
+            out.push(st.map_err(HalError::Rejected)?);
+        }
+        Ok(out)
+    }
+
     /// G3.4b: the OSPF neighbors and interfaces of `cfg`'s instances (the
     /// main VRF; a VRF instance is read when its daemon prints it the same
     /// way: G3.4h).
@@ -1009,6 +1041,13 @@ impl RoutingReader for FrrReader {
         HalError,
     > {
         self.0.ospf_state(cfg)
+    }
+
+    fn ospf_stub_state(
+        &mut self,
+        cfg: &Config,
+    ) -> Result<Vec<corerouter_model::ospf_state::OspfStubState>, HalError> {
+        self.0.ospf_stub_state(cfg)
     }
 
     fn ospf_lsdb(

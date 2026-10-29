@@ -15,7 +15,9 @@ use std::fmt;
 use std::io::Read;
 use std::net::Ipv4Addr;
 
-use corerouter_model::ospf_state::{Link, Lsa, Lsdb, OspfIfState, OspfNeighbor, OspfRoute};
+use corerouter_model::ospf_state::{
+    Link, Lsa, Lsdb, OspfIfState, OspfNeighbor, OspfRoute, OspfStubState,
+};
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 
@@ -196,6 +198,49 @@ pub fn interfaces_v2(json: &str, instance: &str) -> Result<Vec<OspfIfState>, Str
         });
     }
     Ok(out)
+}
+
+/// G3.9c: `show ip ospf json`: the areas that originate a stub router-LSA
+/// now (`originStubMaxDistRouterLsa`), administratively
+/// (`indefiniteActiveAdmin`) or on startup (`activeStartupRemainderMsecs`;
+/// FRR 10.7.1 `ospfd/ospf_vty.c`, `show_ip_ospf_area`).
+pub fn stub_v2(json: &str, instance: &str) -> Result<OspfStubState, String> {
+    let v: Value =
+        serde_json::from_str(json).map_err(|e| format!("ospfd answered bad JSON: {e}"))?;
+    let mut out = OspfStubState {
+        instance: instance.to_owned(),
+        ..OspfStubState::default()
+    };
+    let Some(Value::Object(areas)) = v.get("areas") else {
+        return Ok(out);
+    };
+    for (id, a) in areas.iter().take(1_000) {
+        let Value::Object(m) = a else { continue };
+        let flag = |k: &str| m.get(k).and_then(Value::as_bool) == Some(true);
+        if !flag("originStubMaxDistRouterLsa") {
+            continue;
+        }
+        out.areas.push(id.chars().take(32).collect());
+        out.admin |= flag("indefiniteActiveAdmin");
+        if let Some(ms) = n(m, "activeStartupRemainderMsecs") {
+            let secs = ms.div_ceil(1000);
+            out.startup_remaining_secs = Some(out.startup_remaining_secs.map_or(secs, |o| o.max(secs)));
+        }
+    }
+    out.areas.sort();
+    Ok(out)
+}
+
+/// G3.9c: `show ipv6 ospf6 json`: `routerIsStubRouter` (FRR 10.7.1
+/// `ospf6d/ospf6_top.c`); ospf6d has the administrative form only.
+pub fn stub_v3(json: &str, instance: &str) -> Result<OspfStubState, String> {
+    let v: Value =
+        serde_json::from_str(json).map_err(|e| format!("ospf6d answered bad JSON: {e}"))?;
+    Ok(OspfStubState {
+        instance: instance.to_owned(),
+        admin: v.get("routerIsStubRouter").and_then(Value::as_bool) == Some(true),
+        ..OspfStubState::default()
+    })
 }
 
 /// Most routes kept from `show ip ospf route json`.
@@ -644,6 +689,24 @@ mod tests {
         assert_eq!(n[0].state_secs, Some(86_400 + 2 * 3600 + 3 * 60));
         assert_eq!(secs("12.5s"), Some(12));
         assert_eq!(secs("x"), None);
+    }
+
+    /// G3.9c: the stub router state, in the form FRR 10.7.1 prints it.
+    #[test]
+    fn stub_router_state_of_ospfd_and_ospf6d() {
+        let none = r#"{"routerId":"10.255.39.2","areas":{"0.0.0.0":{"nbrFullAdjacentCounter":1}}}"#;
+        let st = stub_v2(none, "v2").unwrap();
+        assert!(!st.active(), "{st:?}");
+        let both = r#"{"routerId":"10.255.39.2","stubAdvertisement":true,"postStartEnabledSecs":300,
+            "areas":{"0.0.0.1":{"originStubMaxDistRouterLsa":true,"activeStartupRemainderMsecs":41200},
+                     "0.0.0.0":{"originStubMaxDistRouterLsa":true,"indefiniteActiveAdmin":true,"activeStartupRemainderMsecs":40001}}}"#;
+        let st = stub_v2(both, "v2").unwrap();
+        assert_eq!(st.areas, ["0.0.0.0", "0.0.0.1"]);
+        assert!(st.admin && st.active());
+        assert_eq!(st.startup_remaining_secs, Some(42));
+        assert!(stub_v3(r#"{"routerId":"1.1.1.1","routerIsStubRouter":true}"#, "v3").unwrap().admin);
+        assert!(!stub_v3(r#"{"routerId":"1.1.1.1","routerIsStubRouter":false}"#, "v3").unwrap().active());
+        assert!(stub_v2("garbage", "v2").is_err());
     }
 
     #[test]

@@ -46,6 +46,8 @@ fn config(ifaces: u32, templates: u32) -> Config {
             out_filter_chain: None,
             originate_default: Default::default(),
             subscriber_pools: false,
+            stub_router: false,
+            stub_router_on_startup: None,
             disabled: false,
             comment: String::new(),
         },
