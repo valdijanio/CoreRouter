@@ -85,10 +85,9 @@ fn opt_distance(p: &Value) -> Result<Option<u8>> {
 
 /// Refuse `r` with the first problem the validator sees in it.
 fn check(cfg: &Config, r: &RouteEntry) -> Result<()> {
-    match route_issues(cfg, r, cfg.ip.routes.iter())
-        .into_iter()
-        .next()
-    {
+    // The routes on the same hop, in O(1) from the index (G0.31d).
+    let same = cfg.ip.routes.same_hop(r);
+    match route_issues(cfg, r, same).into_iter().next() {
         Some((field, why)) => Err(EngineError::bad(field, why)),
         None => Ok(()),
     }
@@ -142,12 +141,7 @@ fn existing(cfg: &Config, p: &Value) -> Result<(usize, ItemId)> {
             ),
         ));
     }
-    let pos = cfg
-        .ip
-        .routes
-        .iter()
-        .position(|r| r.id == id)
-        .ok_or_else(|| {
+    let pos = cfg.ip.routes.position(id).ok_or_else(|| {
             EngineError::bad(
                 "id",
                 format!(
@@ -206,9 +200,7 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         route.bfd_profile = b;
     }
     check(cfg, &route)?;
-    if let Some(slot) = cfg.ip.routes.get_mut(pos) {
-        *slot = route;
-    }
+    cfg.ip.routes.update(pos, |slot| *slot = route);
     Ok(json!({ "id": id }))
 }
 

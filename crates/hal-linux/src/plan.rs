@@ -42,7 +42,11 @@ use corerouter_hal::HalError;
 use corerouter_hal::drift::{self, Snapshot, active_addresses, master};
 pub use corerouter_hal::drift::{KernelRoute, kernel_routes};
 use corerouter_model::os_loopback::{is_os_address, is_os_loopback};
-use corerouter_model::{BondMode, Config, HashPolicy, IfName, InterfaceKind, LacpRate};
+use corerouter_model::route::MAIN_TABLE_ID;
+use corerouter_model::routes::Dst;
+use corerouter_model::{
+    BondMode, Config, HashPolicy, IfName, InterfaceKind, LacpRate, RoutingTable,
+};
 use ipnet::IpNet;
 
 /// A link CoreRouter creates and deletes itself.
@@ -380,6 +384,19 @@ pub fn plan(from: &Config, to: &Config) -> Result<Vec<Op>, HalError> {
     if corerouter_model::sections::links_and_routes_same(from, to) {
         return Ok(Vec::new());
     }
+    // Only routes changed: what the full plan gives (routes out, then
+    // in), from the destinations the commit touched (G0.31e: one route
+    // among 60 000 was 28 ms here, resolving every route twice).
+    if let Some((gone, new)) = drift::route_changes(from, to) {
+        let mut ops: Vec<Op> = gone.into_iter().map(Op::DelRoute).collect();
+        ops.extend(new.into_iter().map(Op::AddRoute));
+        return Ok(ops);
+    }
+    plan_whole(from, to)
+}
+
+/// [`plan`] comparing everything.
+fn plan_whole(from: &Config, to: &Config) -> Result<Vec<Op>, HalError> {
     let doomed = doomed(from, to)?;
     // Links of `to` created by this plan: new virtual links and recreated ones.
     let fresh: BTreeSet<&IfName> = to
@@ -589,6 +606,43 @@ pub fn plan(from: &Config, to: &Config) -> Result<Vec<Op>, HalError> {
 
     ops.retain(|op| !os_owned(op, from, to));
     Ok(ops)
+}
+
+/// The static routes (per path) that are CoreRouter's before and after,
+/// at the destinations of the route ops in `ops`: what the executor checks
+/// an ECMP sibling against (same prefix, metric and table) before it
+/// merges a path into it. G0.31e: not every route of both configs on each
+/// commit (18 ms with 60 000).
+pub fn owned_routes(from: &Config, to: &Config, ops: &[Op]) -> BTreeSet<KernelRoute> {
+    let mut out = BTreeSet::new();
+    let touched: Vec<&KernelRoute> = ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::AddRoute(r) | Op::DelRoute(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    if touched.is_empty() {
+        return out;
+    }
+    for cfg in [from, to] {
+        // Kernel table id → the routing table it is in the config.
+        let tables: std::collections::BTreeMap<u32, RoutingTable> = cfg
+            .interfaces
+            .values()
+            .filter_map(|i| match i.kind {
+                InterfaceKind::Vrf { table } => Some((table, RoutingTable::Vrf(i.name.clone()))),
+                _ => None,
+            })
+            .chain([(MAIN_TABLE_ID, RoutingTable::Main)])
+            .collect();
+        let dsts: BTreeSet<Dst> = touched
+            .iter()
+            .filter_map(|r| Some((tables.get(&r.table)?.clone(), r.dst)))
+            .collect();
+        out.extend(drift::kernel_routes_to(cfg, &dsts));
+    }
+    out
 }
 
 /// What on the OS loopback stays the OS's (G3.4i, `os_loopback`): `lo` is
@@ -1403,6 +1457,80 @@ mod tests {
         route(&mut c, "0.0.0.0/0", "10.0.0.1", 1);
         route(&mut c, "::/0", "2001:db8::1", 1);
         c
+    }
+
+    /// G0.31e: with only routes changed, the plan from the touched
+    /// destinations is the plan comparing everything, in the same order;
+    /// and the owned routes hold every path at those destinations.
+    #[test]
+    fn a_routes_only_plan_is_the_whole_plan() {
+        let mut from = routed();
+        addr(&mut from, "ether2", "10.2.0.1/24");
+        for i in 0..600 {
+            route(
+                &mut from,
+                &format!("10.{}.{}.0/24", 100 + i / 256, i % 256),
+                "10.0.0.1",
+                1,
+            );
+        }
+        route(&mut from, "10.9.0.0/16", "10.0.0.1", 1);
+        // Two entries, one kernel route: removing one keeps it.
+        route(&mut from, "10.9.0.0/16", "10.0.0.1%ether1", 1);
+        type Edit = fn(&mut Config);
+        let edits: [(&str, Edit); 7] = [
+            ("add", |c| route(c, "172.16.0.0/12", "10.0.0.1", 1)),
+            ("ecmp path", |c| route(c, "10.100.5.0/24", "10.2.0.9", 1)),
+            ("remove", |c| {
+                c.ip.routes.remove(10);
+            }),
+            ("one of two entries", |c| {
+                let last = c.ip.routes.len() - 1;
+                c.ip.routes.remove(last);
+            }),
+            ("gateway", |c| {
+                c.ip.routes
+                    .update(300, |r| r.gateway = "10.2.0.7".parse().unwrap());
+            }),
+            ("disable", |c| {
+                c.ip.routes.update(400, |r| r.disabled = true);
+            }),
+            ("distance", |c| {
+                c.ip.routes.update(500, |r| r.distance = 7);
+            }),
+        ];
+        for (what, edit) in edits {
+            let mut to = from.clone();
+            edit(&mut to);
+            for (a, b) in [(&from, &to), (&to, &from)] {
+                let fast = plan(a, b).unwrap();
+                assert_eq!(fast, plan_whole(a, b).unwrap(), "{what}");
+                assert!(
+                    !fast.is_empty() || what == "one of two entries",
+                    "{what}: {fast:?}"
+                );
+                let owned = owned_routes(a, b, &fast);
+                let all: BTreeSet<KernelRoute> =
+                    kernel_routes(a).union(&kernel_routes(b)).cloned().collect();
+                for op in &fast {
+                    if let Op::AddRoute(r) | Op::DelRoute(r) = op {
+                        let at: BTreeSet<&KernelRoute> = all
+                            .iter()
+                            .filter(|k| k.dst == r.dst && k.table == r.table)
+                            .collect();
+                        assert_eq!(
+                            at,
+                            owned.iter().filter(|k| k.dst == r.dst).collect(),
+                            "{what}"
+                        );
+                    }
+                }
+            }
+        }
+        // Interfaces or addresses changed: the whole plan.
+        let mut to = from.clone();
+        addr(&mut to, "ether2", "10.3.0.1/24");
+        assert!(drift::route_changes(&from, &to).is_none());
     }
 
     #[test]

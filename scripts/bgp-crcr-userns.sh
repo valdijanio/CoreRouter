@@ -6,8 +6,8 @@
 # repository index) extracted into the target dir, never installed.
 #   scripts/bgp-crcr-userns.sh [case…]
 # Cases (default: all, in this order):
-#   ebgp ebgp6 mpbgp md5 filters extcomm nexthop-self rr maxprefix restart bfd
-#   convergence scale
+#   ebgp ebgp6 mpbgp md5 filters extcomm announce nexthop-self rr maxprefix
+#   restart bfd convergence scale
 # Not in the default list: ospf-static (G3.9fe, OSPF redistributing the
 # CoreRouter's static routes).
 # SCALE_N=<n> changes the 100 000 prefixes of `scale`. Results: a table at
@@ -71,7 +71,7 @@ export LD_LIBRARY_PATH=$FRR_DIR/root/usr/lib/x86_64-linux-gnu:$FRR_DIR/root/usr/
 FRR=$FRR_DIR/root/usr/lib/frr
 bin=$CARGO_TARGET_DIR/release
 CASES=("$@")
-[ ${#CASES[@]} -gt 0 ] || CASES=(ebgp ebgp6 mpbgp md5 filters extcomm nexthop-self rr maxprefix restart bfd convergence scale)
+[ ${#CASES[@]} -gt 0 ] || CASES=(ebgp ebgp6 mpbgp md5 filters extcomm announce nexthop-self rr maxprefix restart bfd convergence scale)
 FAILED=0
 : > "$W/results.txt"
 result() { # result <case> <OK|FAIL|INFO> <text>
@@ -390,7 +390,6 @@ case_filters() {
   pair_down
 }
 
-# R3 (eBGP, AS 65003) → CR1 → CR2 over iBGP with no IGP between them.
 # G3.9fc: extended communities (RFC 4360) in the chains, both ways, on FRR.
 case_extcomm() {
   cr1 routing.filter.rule.add '{"chain":"x-out","rule":"if (dst in 100.64.39.0/24) { append bgp-ext-communities rt:65000:7,soo:10.255.39.2:1 } accept"}' >/dev/null
@@ -428,6 +427,43 @@ case_extcomm() {
   pair_down
 }
 
+# G3.9fb: each connection sends only its own output_network and
+# output_redistribute, as on RouterOS (FRR originates per instance).
+case_announce() {
+  cr1 ip.firewall.address-list.add '{"list":"to-r3","address":"10.255.39.2/32"}' >/dev/null
+  pair_up
+  crc 1 '{"name":"r3","remote_address":"10.39.2.2","remote_as":65003,"input_filter":"all","output_filter":"all","output_network":"to-r3","output_redistribute":"connected"}'
+  local ms t0
+  wait_for 60 cr_up 1 cr2 >/dev/null || { result announce FAIL "no session to CR2: $(cr_state 1 cr2)"; dump; }
+  wait_for 60 cr_up 1 r3 >/dev/null || { result announce FAIL "no session to R3: $(cr_state 1 r3)"; dump; }
+  r3_has() { ip -n r3 route show "$1" 2>/dev/null | grep -q "via 10.39.2.1"; }
+  ms=$(wait_for 30 r3_has 10.255.39.2) && result announce OK "R3 gets its output_network (10.255.39.2/32)" || result announce FAIL "R3: $(ip -n r3 route show 10.255.39.2)"
+  ms=$(wait_for 30 r3_has 10.39.4.0/30) && result announce OK "R3 gets its redistribute connected (10.39.4.0/30)" || result announce FAIL "R3: no 10.39.4.0/30"
+  ms=$(wait_for 30 r3_has 100.64.39.0/24) && result announce OK "R3 gets 100.64.39.0/24 too: connected, though CR2's network line originates it" || result announce FAIL "R3: no 100.64.39.0/24"
+  ms=$(wait_for 30 k_via c2 100.64.39.0/24 10.39.5.1) && result announce OK "CR2 gets its output_network (100.64.39.0/24)" || result announce FAIL "CR2: '$(k_route c2 100.64.39.0/24)'"
+  sleep 3
+  k_has c2 10.255.39.2 && result announce FAIL "CR2 got R3's network 10.255.39.2/32" || result announce OK "CR2 does not get R3's output_network (10.255.39.2/32)"
+  k_has c2 10.39.4.0/30 && result announce FAIL "CR2 got a connected route it did not ask for" || result announce OK "CR2 does not get the connected routes R3 asked for (10.39.4.0/30)"
+  result announce INFO "CR1 sends CR2: $(vt c1 'show bgp ipv4 unicast neighbors 10.39.5.2 advertised-routes json' | jq -c '[.advertisedRoutes // {} | keys[]]' 2>/dev/null)"
+  if k_has c2 10.255.39.2; then
+    echo "--- CR1 bgpd: CR-C maps and neighbors"
+    vt c1 'show running-config' | grep -E -A4 'route-map CR-C|prefix-list CR-C|neighbor 10.39.5.2 route-map|neighbor 10.39.2.2 route-map' || true
+  fi
+  # CR2's connection asks for connected too: it gets them, without a reset.
+  local up0; up0=$(cr_sess 1 cr2 | jq -r .uptime_secs)
+  t0=$(now_ms)
+  cr1 routing.bgp.connection.set '{"id":"cr2","output_redistribute":"connected"}' >/dev/null
+  ms=$(wait_for 30 k_via c2 10.39.4.0/30 10.39.5.1) && result announce OK "redistribute connected on CR2's connection: 10.39.4.0/30 on CR2 $(( $(now_ms) - t0 )) ms after the commit (uptime $up0 → $(cr_sess 1 cr2 | jq -r .uptime_secs) s)" \
+    || result announce FAIL "CR2: no 10.39.4.0/30 after redistribute connected"
+  # The loopback 10.255.39.2/32 is connected too: R3's network line
+  # originates it, and CR2's connection now redistributes connected.
+  ms=$(wait_for 30 k_via c2 10.255.39.2 10.39.5.1) && result announce OK "CR2 now gets the loopback 10.255.39.2/32 as well: connected, though R3's network line originates it" \
+    || result announce FAIL "CR2: no 10.255.39.2/32 after redistribute connected"
+  crd 1 r3; pair_down
+  cr1 ip.firewall.address-list.list '{"list":"to-r3"}' | jq -r '.[]?.id' | while read -r id; do cr1 ip.firewall.address-list.remove "{\"id\":\"$id\"}" >/dev/null; done
+}
+
+# R3 (eBGP, AS 65003) → CR1 → CR2 over iBGP with no IGP between them.
 case_nexthop-self() {
   cr2 routing.bgp.instance.set '{"asn":65000,"router_id":"10.255.39.5"}' >/dev/null
   ip -n r3 route add blackhole 203.0.113.0/24

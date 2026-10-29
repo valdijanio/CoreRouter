@@ -19,7 +19,7 @@ use corerouter_model::os_loopback;
 use corerouter_model::route::{self, FIRST_VRF_TABLE, LAST_VRF_TABLE, Reach};
 use corerouter_model::sections::Sections;
 use corerouter_model::{
-    BondMode, Config, IfName, Interface, InterfaceKind, Issue, RouteEntry, RoutingTable, VlanId,
+    BondMode, Config, IfName, Interface, InterfaceKind, Issue, ItemId, RouteEntry, RoutingTable, VlanId,
 };
 
 /// One validator and the sections of the config it reads.
@@ -68,7 +68,7 @@ pub const UNITS: &[Unit] = &[
         run: address_checks,
     },
     Unit {
-        name: "routes",
+        name: ROUTES_UNIT,
         reads: Sections::ROUTES.union(Sections::ADDRESSES).union(Sections::INTERFACES),
         run: route_checks,
     },
@@ -151,6 +151,30 @@ pub fn validate_changed(cfg: &Config, changed: Sections) -> Vec<Issue> {
         .flat_map(|u| (u.run)(cfg))
         .collect()
 }
+
+/// [`validate_changed`] for a commit from `running` (valid: the commit
+/// path keeps it so, `ValidRunning`) to `cfg`. With the interfaces and
+/// addresses the same, the route checks look only at the destinations the
+/// commit touched (G0.31e: 16 ms with 60 000 routes); the rest as
+/// [`validate_changed`]. Same issues, in the same order.
+pub fn validate_commit(running: &Config, cfg: &Config, changed: Sections) -> Vec<Issue> {
+    let routes_only = !changed.contains(Sections::OTHER)
+        && !changed.intersects(Sections::ADDRESSES.union(Sections::INTERFACES));
+    UNITS
+        .iter()
+        .filter(|u| changed.contains(Sections::OTHER) || u.reads.intersects(changed))
+        .flat_map(|u| {
+            if routes_only && u.name == ROUTES_UNIT {
+                route_checks_since(running, cfg)
+            } else {
+                (u.run)(cfg)
+            }
+        })
+        .collect()
+}
+
+/// Name of the unit that [`validate_commit`] runs incrementally.
+const ROUTES_UNIT: &str = "routes";
 
 fn interface_checks(cfg: &Config) -> Vec<Issue> {
     let mut out = Vec::new();
@@ -306,9 +330,51 @@ fn route_checks(cfg: &Config) -> Vec<Issue> {
             .entry((&r.routing_table, r.dst_address))
             .or_default();
         out.extend(
-            route_issues(cfg, r, group.iter().copied())
+            route_issues(
+                cfg,
+                r,
+                group.iter().filter(|o| o.gateway == r.gateway).map(|o| o.id),
+            )
                 .into_iter()
                 .map(|(field, m)| Issue::new(format!("ip.routes[{}].{field}", r.id), m)),
+        );
+        group.push(r);
+    }
+    out
+}
+
+/// [`route_checks`] when only routes changed since `running` (valid, same
+/// interfaces and addresses): a route resolves through those alone, so an
+/// untouched route gives what it gave there (nothing), and a duplicate
+/// pairs two routes to one destination, one of them touched. So only the
+/// routes at the destinations the commit touched are looked at, through
+/// the index, in list order with the earlier routes of their group, as
+/// [`route_checks`] does.
+fn route_checks_since(running: &Config, cfg: &Config) -> Vec<Issue> {
+    let routes = &cfg.ip.routes;
+    let mut at: Vec<(usize, &RouteEntry)> = routes
+        .changed_dsts(&running.ip.routes)
+        .iter()
+        .flat_map(|d| routes.to_dst(&d.0, d.1))
+        .filter_map(|id| {
+            let pos = routes.position(*id)?;
+            Some((pos, routes.get(pos)?))
+        })
+        .collect();
+    at.sort_by_key(|(pos, _)| *pos);
+    at.dedup_by_key(|(pos, _)| *pos);
+    let mut out = Vec::new();
+    let mut groups: BTreeMap<(&RoutingTable, IpNet), Vec<&RouteEntry>> = BTreeMap::new();
+    for (_, r) in at {
+        let group = groups.entry((&r.routing_table, r.dst_address)).or_default();
+        out.extend(
+            route_issues(
+                cfg,
+                r,
+                group.iter().filter(|o| o.gateway == r.gateway).map(|o| o.id),
+            )
+            .into_iter()
+            .map(|(field, m)| Issue::new(format!("ip.routes[{}].{field}", r.id), m)),
         );
         group.push(r);
     }
@@ -360,13 +426,14 @@ pub(crate) fn v6_twice(addr: Ipv6Addr, iface: &IfName, other: IpNet) -> String {
     )
 }
 
-/// What is wrong with route `r` in `cfg`, as (field, message). `others` are
-/// the routes it must not duplicate. Shared with the `ip.route.*` commands,
-/// which report the first problem as a parameter error.
-pub(crate) fn route_issues<'a>(
+/// What is wrong with route `r` in `cfg`, as (field, message). `same_hop`
+/// are the ids of the routes with its table, destination and gateway (`r`
+/// itself may be among them). Shared with the `ip.route.*` commands, which
+/// report the first problem as a parameter error.
+pub(crate) fn route_issues(
     cfg: &Config,
     r: &RouteEntry,
-    others: impl Iterator<Item = &'a RouteEntry>,
+    same_hop: impl Iterator<Item = ItemId>,
 ) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     let dst = r.dst_address;
@@ -388,16 +455,14 @@ pub(crate) fn route_issues<'a>(
     check_gateway_issues(cfg, r, &mut out);
     // Equal distance is ECMP (RouterOS v7, G1.27): only the very same
     // next hop twice is refused.
-    for o in others.filter(|o| o.id != r.id && o.routing_table == r.routing_table) {
-        if o.dst_address == r.dst_address && o.gateway == r.gateway {
-            out.push((
-                "gateway",
-                format!(
-                    "route {} already goes to {dst} via {} in table {}",
-                    o.id, o.gateway, r.routing_table
-                ),
-            ));
-        }
+    for o in same_hop.filter(|o| *o != r.id) {
+        out.push((
+            "gateway",
+            format!(
+                "route {o} already goes to {dst} via {} in table {}",
+                r.gateway, r.routing_table
+            ),
+        ));
     }
     out
 }
