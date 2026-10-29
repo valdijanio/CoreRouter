@@ -1,4 +1,4 @@
-//! G0.29: at most `COREROUTER_CI_SLOTS` (2) heavy `cargo xtask ci` runs at
+//! G0.29: at most `COREROUTER_CI_SLOTS` (3) heavy `cargo xtask ci` runs at
 //! once on this machine, and none started on a nearly full disk.
 //!
 //! A slot is an exclusive `flock` on `slot-<i>.lock` in
@@ -33,13 +33,13 @@ pub fn dir() -> PathBuf {
     }
 }
 
-/// `COREROUTER_CI_SLOTS`, 1 to 64 (default 2).
+/// `COREROUTER_CI_SLOTS`, 1 to 64 (default 3 on the 32-core dev machine; was 2).
 pub fn count() -> usize {
     std::env::var("COREROUTER_CI_SLOTS")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| (1..=64).contains(n))
-        .unwrap_or(2)
+        .unwrap_or(3)
 }
 
 /// Take a free slot now, or `Ok(None)` with what the holders wrote.
