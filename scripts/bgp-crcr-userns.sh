@@ -499,8 +499,11 @@ case_bfd() {
     && result bfd OK "silent loss on the link: CR1 withdraws CR2's route after ${ms} ms (detect 300 ms; hold time 180 s)" \
     || result bfd FAIL "silent loss: route still on CR1 after 20 s"
   ip netns exec c2 tc qdisc del dev ether1 root
-  ms=$(wait_for 90 cr_up 1 cr2) && result bfd OK "loss over: session back in ${ms} ms" || result bfd FAIL "not back: $(cr_state 1 cr2)"
-  result bfd INFO "history: $(cr1 routing.bgp.session.history '{"connection":"cr2"}' | jq -c '[.[0:3][] | {event, state, reason}]')"
+  # session.list is a sample of the FRR poll: a 0.4 s outage can fall
+  # between two; the route back in the kernel is what counts.
+  ms=$(wait_for 90 k_has c1 100.64.40.0/24) && result bfd OK "loss over: CR2's route back in CR1's kernel in ${ms} ms" || result bfd FAIL "not back: $(cr_state 1 cr2)"
+  sleep 3
+  result bfd INFO "history (sampled each FRR poll): $(cr1 routing.bgp.session.history '{"connection":"cr2"}' | jq -c '[.[0:3][] | {event, state, reason}]')"
   pair_down
 }
 
@@ -561,7 +564,15 @@ case_scale() {
   local N=${SCALE_N:-100000}
   awk -v n="$N" 'BEGIN { for (i = 0; i < n; i++) printf "route add blackhole %d.%d.%d.0/24\n", 20 + int(i / 65536), int(i / 256) % 256, i % 256 }' > "$W/r3.batch"
   ip -n r3 -batch "$W/r3.batch"
-  sleep 5
+  # zebra misses part of 100k kernel notifications sent at once (its netlink
+  # buffer, which a user namespace cannot raise): it reads the table whole
+  # at start, so restart R3's FRR on the loaded table.
+  pkill -f -- "frr/[a-z]+ -N r3( |$)" || true
+  sleep 1
+  frr_start r3 zebra bgpd
+  r3_ready() { [ "$(vtz r3 'show ip route summary json' | jq '[.routes[]? | select(.type == "kernel") | .rib] | add // 0')" -ge "$N" ]; }
+  local ms0; ms0=$(wait_for 120 r3_ready) || true
+  result scale INFO "R3 holds $(vtz r3 'show ip route summary json' | jq '[.routes[]? | select(.type == "kernel") | .rib] | add // 0') kernel routes (${ms0} ms after its restart)"
   local d1 b1 z1 d2 b2 z2
   d1=$(cat "$W/daemon1.pid"); b1=$(pid_of bgpd c1); z1=$(pid_of zebra c1)
   d2=$(cat "$W/daemon2.pid"); b2=$(pid_of bgpd c2); z2=$(pid_of zebra c2)

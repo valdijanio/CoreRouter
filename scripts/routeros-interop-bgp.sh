@@ -824,6 +824,15 @@ case_scale() {
   local t0 ms
   t0=$(now_ms)
   ip -n cfr3 -batch "$W/r3.batch"
+  # zebra can miss part of 100k kernel notifications sent at once (netlink
+  # buffer; seen on the host lab): restart R3's FRR on the loaded table.
+  pkill -f -- "-N cfr3( |$)" || true
+  sleep 1
+  ip netns exec cfr3 /usr/lib/frr/zebra -N cfr3 -d -f /etc/frr/cfr3/zebra.conf
+  sleep 2
+  ip netns exec cfr3 /usr/lib/frr/bgpd -N cfr3 -d -f /etc/frr/cfr3/bgpd.conf
+  wait_for 120 bash -c "[ \"\$(vtysh -N cfr3 -c 'show ip route summary json' | jq '[.routes[]? | select(.type == \"kernel\") | .rib] | add // 0')\" -ge $N ]" >/dev/null || true
+  result scale INFO "R3 holds $(vtysh -N cfr3 -c 'show ip route summary json' | jq '[.routes[]? | select(.type == "kernel") | .rib] | add // 0') kernel routes"
   ms=$(wait_for 300 bash -c "[ \"\$(curl -sf -m 10 -u admin:$PW 'http://$ROS/rest/routing/bgp/session' | jq -r '[.[] | select(.name | startswith(\"r3-\"))][0][\"prefix-count\"] // 0')\" -ge $N ]") || true
   result scale INFO "CHR learnt $N prefixes from R3 in ${ms} ms (CHR: $(ros system/resource | jq -r '"\(.["free-memory"] / 1048576 | floor) MiB free"'))"
   local dpid bpid zpid
