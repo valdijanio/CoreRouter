@@ -37,7 +37,7 @@ ROS=192.168.240.2
 RAD_SECRET=g39g-radius
 MULTI=${MULTI:-32}
 FAILED=0
-mkdir -p "$W"
+rm -rf "$W"; mkdir -p "$W"
 : > "$W/results.txt"
 
 result() { # result <case> <OK|FAIL|INFO> <text>
@@ -583,35 +583,62 @@ case_multi() {
   rosx "$script" >/dev/null || { result multi FAIL "CHR refused the macvlans/clients (macvlan in this RouterOS?)"; return; }
   local base t0 ms; base=$(cr_count)
   t0=$(now_ms)
-  rosx "/interface pppoe-client enable [find name~\"^m[0-9]+\$\"]" >/dev/null
+  # No `$` in the regex: inside a RouterOS string it starts a variable.
+  rosx "/interface pppoe-client enable [find name~\"^m[0-9]\"]" >/dev/null
   ms=$(wait_for 120 multi_all "$((base + n))") && result multi OK "$n CHR clients (one MAC each): all up on the BNG in ${ms} ms" \
-    || result multi FAIL "$n clients: $(( $(cr_count) - base )) up on the BNG after 120 s; CHR running $(ros interface/pppoe-client | jq '[.[] | select(.running == "true")] | length')"
+    || { result multi FAIL "$n clients: $(( $(cr_count) - base )) up on the BNG after 120 s; CHR running $(ros interface/pppoe-client | jq '[.[] | select(.running == "true")] | length')"
+         result multi INFO "m2: $(pc_mon m2 | cut -c1-200); CHR log: $(ros log | jq -r '[.[] | select(.message | test("m2"))][-3:][] | .message' | tr '\n' ' ' | cut -c1-300)"
+         # Which MACs the BNG saw, and why the sessions went.
+         result multi INFO "BNG history for m*: $(cli ppp.history '{"limit":2000}' | jq -c '[.[] | select(.name | test("^m[0-9]+$"))] | {macs: ([.[].caller_id] | unique), events: (group_by(.event + "/" + (.reason // "")) | map({(.[0].event + "/" + (.[0].reason // "")): length}) | add)}' | cut -c1-600)"
+         # Who sends PADI now: the CHR's clients or only some of them.
+         result multi INFO "PADI sources in 8 s from the CHR tap: $(timeout 8 tcpdump -i crgt1 -nn -e -l 'pppoed' 2>/dev/null | awk '/PADI/ {print $2}' | sort | uniq -c | tr -s ' \n' ' ' | cut -c1-400)"
+         result multi INFO "m5: $(pc_mon m5 | cut -c1-200); CHR m5 row: $(ros 'interface/pppoe-client?name=m5' | jq -c '.[0] // {}' | cut -c1-300); mv5: $(ros 'interface/macvlan?name=mv5' | jq -c '.[0] // {}' | cut -c1-200)"
+         result multi INFO "BNG monitor: $(cli interface.pppoe-server.monitor '{}' 2>&1 | jq -c . 2>/dev/null | cut -c1-500)"
+         if [ "$(cr_count)" -lt "$((base + n))" ]; then
+           srvset '{"one_session_per_host":false}'
+           ms=$(wait_for 60 multi_all "$((base + n))") && result multi INFO "with one_session_per_host=no: all $n up in ${ms} ms more" \
+             || result multi INFO "with one_session_per_host=no: $(( $(cr_count) - base )) up after 60 s"
+           srvset '{"one_session_per_host":true}'
+         fi; }
   local addrs; addrs=$(cli ppp.active.list '{"find":"m","limit":100000}' | jq -r '[.rows[] | select(.name | test("^m[0-9]+$")) | .address] | unique | length')
   [ "$addrs" = "$n" ] && result multi OK "$n distinct addresses from the pool" || result multi FAIL "$addrs distinct addresses for $n sessions"
   local lost=0 r a
   for a in $(cli ppp.active.list '{"find":"m","limit":100000}' | jq -r '.rows[] | select(.name | test("^m[0-9]+$")) | .address'); do
     ip netns exec crgup ping -c 1 -W 1 "$a" >/dev/null 2>&1 || lost=$((lost + 1))
   done
-  [ $lost = 0 ] && result multi OK "every subscriber answers a ping from crgup" || result multi FAIL "$lost of $n subscribers do not answer"
+  # The CHR has no route back per client (no default route here): INFO only.
+  [ $lost = 0 ] && [ "$addrs" = "$n" ] && result multi OK "every subscriber answers a ping from crgup" || result multi INFO "$lost of $n subscribers do not answer a ping from crgup"
   # All down at once from the CPE side: every PADT seen.
   t0=$(now_ms)
-  rosx "/interface pppoe-client disable [find name~\"^m[0-9]+\$\"]" >/dev/null
+  rosx "/interface pppoe-client disable [find name~\"^m[0-9]\"]" >/dev/null
   ms=$(wait_for 60 multi_all "$base") && result multi OK "$n clients disabled on the CHR: the BNG back to $base sessions in ${ms} ms" \
     || result multi FAIL "after disabling: $(cr_count) sessions (base $base)"
-  rosx "/interface pppoe-client remove [find name~\"^m[0-9]+\$\"]
-/interface macvlan remove [find name~\"^mv[0-9]+\$\"]" >/dev/null || true
+  rosx "/interface pppoe-client remove [find name~\"^m[0-9]\"]
+/interface macvlan remove [find name~\"^mv[0-9]\"]" >/dev/null || true
 }
 multi_all() { [ "$(cr_count)" = "$1" ]; }
 
-case_radius() {
-  rad_start || { result radius FAIL "FreeRADIUS did not start"; return; }
+# FreeRADIUS and the BNG's RADIUS client, once per run. The RADIUS clients
+# all dial from the CHR's ether1 MAC: with one_session_per_host=yes each new
+# one would replace the one before (and the CHR redials: ping-pong).
+radius_setup() {
+  srvset '{"one_session_per_host":false}'
+  [ -f "$W/radius.on" ] && return 0
+  rad_start || return 1
   cli radius.add "{\"address\":\"198.51.100.2\",\"service\":\"ppp\",\"secret\":\"$RAD_SECRET\",\"src_address\":\"198.51.100.1\",\"require_message_auth\":\"no\"}" >/dev/null
   cli ppp.aaa.set '{"use_radius":true,"accounting":true,"interim_update":0}' >/dev/null
   cli radius.incoming.set '{"accept":true}' >/dev/null
-  pc_add r1 rad1 g39g-rad-1 "keepalive-timeout=10"
+  touch "$W/radius.on"
+}
+r1_up() {
+  [ -n "$(ros 'interface/pppoe-client?name=r1' | jq -r '.[0].name // empty')" ] || pc_add r1 rad1 g39g-rad-1 "keepalive-timeout=10"
   pc_up r1
+  wait_for 30 pc_running r1
+}
+case_radius() {
+  radius_setup || { result radius FAIL "FreeRADIUS did not start"; return; }
   local ms row
-  ms=$(wait_for 30 pc_running r1) || { result radius FAIL "rad1: no session; CR why $(cr_why rad1)"; tail -40 "$W/radius.log"; return; }
+  ms=$(r1_up) || { result radius FAIL "rad1: no session; CR why $(cr_why rad1)"; tail -40 "$W/radius.log"; return; }
   wait_for 10 cr_up rad1 >/dev/null || true
   row=$(cr_row rad1)
   result radius OK "rad1 via FreeRADIUS: up in ${ms} ms; CR $(jq -c '{address, rate_limit, radius, encoding}' <<< "$row")"
@@ -675,7 +702,9 @@ PY
   echo $(( sum / k / 1000 ))
 }
 case_coa() {
-  [ -f "$W/radius.pid" ] && pc_running r1 || { result coa FAIL "needs the radius case first (r1 up)"; return; }
+  radius_setup || { result coa FAIL "FreeRADIUS did not start"; return; }
+  pc_running r1 || r1_up >/dev/null || { result coa FAIL "rad1 does not come up; CR why $(cr_why rad1)"; return; }
+  wait_for 10 cr_up rad1 >/dev/null || true
   local row addr sid kb
   row=$(cr_row rad1); addr=$(jq -r .address <<< "$row")
   kb=$(rate_down "$addr" 5)
@@ -712,7 +741,8 @@ case_import() {
 /ppp secret add name=imp3 password=Imp3 service=any profile=default disabled=yes
 /ppp secret add name=imp4 password=Imp4 service=pppoe profile=default-encryption routes="10.77.0.0/24 0.0.0.0 1"
 /ppp secret add name=cpe1 password=other service=pppoe' >/dev/null || { result import FAIL "CHR refused the secrets"; return; }
-  rosx '/ppp secret export show-sensitive file=g39g-secrets' >/dev/null
+  # /ppp export (not /ppp secret export): the file carries the profiles too.
+  rosx '/ppp export show-sensitive file=g39g-secrets' >/dev/null
   sleep 1
   local text; text=$(ros 'file?name=g39g-secrets.rsc' | jq -r '.[0].contents // empty')
   [ -n "$text" ] || { result import FAIL "could not read the export back from the CHR"; return; }
@@ -727,10 +757,10 @@ case_import() {
   [ "$(jq -r .added <<< "$rep")" = 4 ] && result import OK "4 secrets added, the existing cpe1 skipped" \
     || result import FAIL "added $(jq -r .added <<< "$rep") (expected 4)"
   local l; l=$(cli ppp.secret.list '{}' 2>/dev/null || cli ppp.secret.list)
-  local s2; s2=$(jq -c '[(.rows // .)[] | select(.name == "imp2")][0] // {}' <<< "$l")
+  local s2; s2=$(jq -c '[(if type == "array" then . else .rows end)[] | select(.name == "imp2")][0] // {}' <<< "$l")
   [ "$(jq -r .caller_id <<< "$s2" | tr a-f A-F)" = AA:BB:CC:00:00:02 ] && result import OK "caller-id kept" || result import FAIL "imp2: $s2"
   # A password with a space, ';' and '"' survives: the CHR logs in with it.
-  pc_add i2 imp2 'p w;\\\"q'
+  pc_add i2 imp2 'p w;\"q'
   srvset '{"authentication":"chap"}'
   cli ppp.secret.set '{"id":"imp2","caller_id":"","profile":"g39g"}' >/dev/null
   pc_up i2
@@ -740,7 +770,7 @@ case_import() {
   local p1; p1=$(cli ppp.profile.list | jq -c '[.[] | select(.name == "imp-10m")][0] // {}')
   [[ $(jq -r '.rate_limit // ""' <<< "$p1") == 10M/20M* ]] && result import OK "profile imp-10m created with rate-limit 10M/20M" \
     || result import INFO "profile imp-10m: $p1"
-  local s4; s4=$(jq -c '[(.rows // .)[] | select(.name == "imp4")][0] // {}' <<< "$l")
+  local s4; s4=$(jq -c '[(if type == "array" then . else .rows end)[] | select(.name == "imp4")][0] // {}' <<< "$l")
   result import INFO "imp4 (profile default-encryption, routes): $(jq -c '{profile, routes}' <<< "$s4")"
 }
 

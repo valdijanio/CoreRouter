@@ -352,6 +352,15 @@ impl Fsm {
         s
     }
 
+    /// Sends our Configure-Request again now, without waiting for the
+    /// restart timer, while it is still unanswered (Req-Sent, Ack-Sent).
+    /// For a request that went out before the peer was listening.
+    pub fn resend_request<L: Layer>(&mut self, ctx: &mut Ctx<'_>, layer: &mut L) {
+        if matches!(self.state, State::ReqSent | State::AckSent) && self.restart > 0 {
+            self.scr(ctx, layer);
+        }
+    }
+
     /// Restart timer expiry; call when `now ≥ deadline()`.
     pub fn timeout<L: Layer>(&mut self, ctx: &mut Ctx<'_>, layer: &mut L) -> Signals {
         let mut s = Signals::default();
