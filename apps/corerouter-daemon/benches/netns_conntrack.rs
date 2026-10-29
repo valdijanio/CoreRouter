@@ -92,11 +92,14 @@ mod linux {
         sh("nft", &["add", "table", "ip", "bench"]);
         sh(
             "nft",
+            &["add chain ip bench out { type filter hook output priority 0; }"],
+        );
+        sh(
+            "nft",
             &[
-                "add chain ip bench out { type filter hook output priority 0; }",
+                "add", "rule", "ip", "bench", "out", "ct", "state", "new", "counter",
             ],
         );
-        sh("nft", &["add", "rule", "ip", "bench", "out", "ct", "state", "new", "counter"]);
         let t = Instant::now();
         let mut sent = 0;
         while sent < flows {
@@ -136,10 +139,15 @@ mod linux {
         let mut s = Session::new(Box::new(LinuxHal::new()));
         let cases = [
             ("ip.firewall.connection.list", json!({"count": 5})),
-            ("ip.firewall.connection.list", json!({"count": 50, "sort": "bytes"})),
+            (
+                "ip.firewall.connection.list",
+                json!({"count": 50, "sort": "bytes"}),
+            ),
             ("ip.firewall.connection.top", json!({})),
         ];
-        println!("| command | cold lock | cold answer | warm lock (median / max of 20) | warm answer |");
+        println!(
+            "| command | cold lock | cold answer | warm lock (median / max of 20) | warm answer |"
+        );
         println!("|---|---|---|---|---|");
         for (id, p) in &cases {
             let mut cold = Vec::new();
