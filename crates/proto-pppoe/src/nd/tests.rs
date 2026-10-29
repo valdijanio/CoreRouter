@@ -329,3 +329,64 @@ fn rfc4861_6_2_4_initial_then_spread_and_rs_rate_limited() {
     assert_eq!(t.solicited_at(last + 1), last + MIN_DELAY_BETWEEN_RAS_MS);
     assert_eq!(t.solicited_at(last + 10_000), last + 10_000);
 }
+
+#[test]
+fn icmp_ra_carries_sllao_and_preference() {
+    // G3.9ha: the Ethernet sender's RA, as a raw socket sends it.
+    let cfg = RaConfig {
+        sllao: Some([0x02, 0, 0, 0, 0, 0x14]),
+        preference: 0b01,
+        reachable_ms: 30_000,
+        ..ra_cfg()
+    };
+    let m = router_advert_icmp(&cfg);
+    assert_eq!(
+        &m[..4],
+        &[icmp::ROUTER_ADVERT, 0, 0, 0],
+        "checksum left to the kernel"
+    );
+    // RFC 4191 §2.2: Prf = 01 (high) in bits 3-4, O set.
+    assert_eq!(m[5], 0x40 | 0b01 << 3);
+    // RFC 4861 §4.6.1: type 1, length 1 (8 octets), the MAC.
+    assert_eq!(&m[16..24], &[1, 1, 0x02, 0, 0, 0, 0, 0x14]);
+    let ra = parse_ra_icmp(ll(1), &m).unwrap();
+    assert_eq!(ra.sllao, Some([0x02, 0, 0, 0, 0, 0x14]));
+    assert_eq!(ra.preference, 0b01);
+    assert_eq!(ra.reachable_ms, 30_000);
+    assert_eq!(ra.prefixes, cfg.prefixes);
+    // The same RA as a whole packet (PPP) has the same body.
+    let mut p = Vec::new();
+    router_advert(&mut p, ll(1), ALL_NODES, &cfg);
+    assert_eq!(&p[IPV6_HLEN + 4..], &m[4..]);
+    // 10 is reserved (RFC 4191 §2.2): sent as medium.
+    let m = router_advert_icmp(&RaConfig {
+        preference: 0b10,
+        ..ra_cfg()
+    });
+    assert_eq!((m[5] >> 3) & 0b11, 0);
+}
+
+#[test]
+fn rs_validation_of_rfc_4861_6_1_1() {
+    let host = ll(9);
+    let mut rs = vec![icmp::ROUTER_SOLICIT, 0, 0, 0, 0, 0, 0, 0];
+    assert_eq!(parse_rs_icmp(host, 255, &rs).unwrap().sllao, None);
+    rs.extend_from_slice(&[1, 1, 2, 0, 0, 0, 0, 9]);
+    assert_eq!(
+        parse_rs_icmp(host, 255, &rs).unwrap().sllao,
+        Some([2, 0, 0, 0, 0, 9])
+    );
+    // Hop limit not 255: it crossed a router.
+    assert!(parse_rs_icmp(host, 254, &rs).is_err());
+    // From :: with a link-layer address.
+    assert!(parse_rs_icmp(Ipv6Addr::UNSPECIFIED, 255, &rs).is_err());
+    // Zero-length option, code not 0, too short.
+    let mut bad = rs.clone();
+    bad[9] = 0;
+    assert!(parse_rs_icmp(host, 255, &bad).is_err());
+    let mut bad = rs.clone();
+    bad[1] = 1;
+    assert!(parse_rs_icmp(host, 255, &bad).is_err());
+    assert!(parse_rs_icmp(host, 255, &rs[..6]).is_err());
+    assert!(parse_rs_icmp(host, 255, &[icmp::ROUTER_ADVERT, 0, 0, 0, 0, 0, 0, 0]).is_err());
+}

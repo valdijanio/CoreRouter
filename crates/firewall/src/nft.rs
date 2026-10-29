@@ -976,6 +976,124 @@ pub fn build(cfg: &Config, dynamic: &[DynamicAddress]) -> Option<(String, progra
     Some((out, t))
 }
 
+/// Whether rule `r` reaches the kernel (one or more kernel rules).
+pub fn live(r: &FirewallRule) -> bool {
+    !r.disabled && !r.section
+}
+
+/// What rule `r` of `table` needs in the table besides its own kernel
+/// rules (G0.31f): a commit that changes a few rules adds or drops only
+/// these, counting how many rules need each. [`build`] derives the same
+/// from the whole config (the test `needs_add_up_to_the_build` holds the
+/// two together).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Needs<'a> {
+    /// Kernel names of the chains (`filter_input`, `filter_my-chain`).
+    pub chains: Vec<String>,
+    /// Port lists that live as a shared set.
+    pub ports: Vec<&'a PortSet>,
+    /// Address lists it matches (each has its `al*` sets).
+    pub lists: Vec<&'a Name>,
+    /// The list it fills (`ad*` sets, and every rule matching that list
+    /// changes shape).
+    pub fills: Option<&'a Name>,
+}
+
+pub fn needs(table: Table, r: &FirewallRule) -> Needs<'_> {
+    let mut n = Needs::default();
+    let builtin = graph::is_builtin(table, r.chain.as_str());
+    if (builtin && live(r)) || (!builtin && !r.section) {
+        n.chains.push(chain_name(table, r.chain.as_str()));
+    }
+    if !r.section
+        && let Action::Jump { jump_target } = &r.action
+        && !graph::is_builtin(table, jump_target.as_str())
+    {
+        n.chains.push(chain_name(table, jump_target.as_str()));
+    }
+    if live(r) {
+        n.ports = [&r.matchers.src_port, &r.matchers.dst_port]
+            .into_iter()
+            .flatten()
+            .filter(|p| p.value.0.len() > 1)
+            .map(|p| &p.value)
+            .collect();
+    }
+    n.lists = [&r.matchers.src_address_list, &r.matchers.dst_address_list]
+        .into_iter()
+        .flatten()
+        .map(|l| &l.value)
+        .collect();
+    if !r.section {
+        n.fills = r.action.fills_list();
+    }
+    n
+}
+
+/// Kernel chain `kname` (a [`Needs::chains`] name) of `table`.
+pub fn chain_object(table: Table, kname: &str) -> program::Chain {
+    let chain = table_of_chain(kname).map_or(kname, |(_, c)| c);
+    match base_hook(table, chain) {
+        Some((ty, hook, prio)) => base_chain(kname.to_owned(), ty, hook, prio),
+        None => regular_chain(kname.to_owned()),
+    }
+}
+
+/// The kernel rules of `r` as [`build`] makes them (chain `kname`).
+pub fn program_rules(
+    table: Table,
+    r: &FirewallRule,
+    filled: &BTreeSet<&Name>,
+) -> Vec<program::Rule> {
+    if !live(r) {
+        return Vec::new();
+    }
+    let kname = chain_name(table, r.chain.as_str());
+    kernel_rules(table, r, filled)
+        .into_iter()
+        .map(|k| program::Rule {
+            chain: kname.clone(),
+            exprs: k.exprs,
+            text: k.text,
+            nft: None,
+            comment: Some(k.comment),
+        })
+        .collect()
+}
+
+/// The two sets of address list `list` with no entries (`al4_x`,
+/// `al6_x`), as [`build`] declares them.
+pub fn empty_list_sets(list: &Name) -> [program::FwSet; 2] {
+    let set = |name: String, key| program::FwSet {
+        name,
+        key,
+        interval: true,
+        timeout: true,
+        dynamic: false,
+        size: None,
+        auto_merge: true,
+        elements: Vec::new(),
+    };
+    [
+        set(set_v4(list), program::KeyKind::Ipv4),
+        set(set_v6(list), program::KeyKind::Ipv6),
+    ]
+}
+
+/// The address lists that have sets whatever the rules say: the static
+/// entries' lists and those of the subscriber notices.
+pub fn fixed_lists(cfg: &Config) -> BTreeSet<Name> {
+    let mut out: BTreeSet<Name> = cfg
+        .ip
+        .firewall
+        .address_lists
+        .iter()
+        .map(|e| e.list.clone())
+        .collect();
+    out.extend(crate::notice::lists(cfg));
+    out
+}
+
 /// Whether going from `from` to `to` changes the ruleset. `render` reads
 /// only the firewall, the interface lists and the subscriber notices, so a commit that touches
 /// neither does not render at all (both configs were rendered on every
@@ -1006,6 +1124,65 @@ pub fn script(cfg: &Config, dynamic: &[DynamicAddress]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-rule pieces of a commit (G0.31f) add up to what `build`
+    /// makes of the whole config: chains, port sets, list sets and rules.
+    #[test]
+    fn needs_add_up_to_the_build() {
+        let cfg = crate::sample::sample();
+        let t = program(&cfg, &[]).unwrap();
+        let fw = &cfg.ip.firewall;
+        let filled = filled_lists(&cfg);
+        let mut chains = BTreeSet::new();
+        let mut ports = BTreeSet::new();
+        let mut lists: BTreeSet<Name> = fixed_lists(&cfg);
+        let mut rules = Vec::new();
+        for table in Table::ALL {
+            for r in fw.rules(table) {
+                let n = needs(table, r);
+                chains.extend(n.chains);
+                ports.extend(n.ports.iter().map(|p| crate::bytecode::port_set_name(p)));
+                lists.extend(n.lists.into_iter().cloned());
+                lists.extend(n.fills.cloned());
+                rules.extend(program_rules(table, r, &filled));
+            }
+        }
+        let built: BTreeSet<String> = t
+            .chains
+            .iter()
+            .filter(|c| table_of_chain(&c.name).is_some())
+            .map(|c| c.name.clone())
+            .collect();
+        assert_eq!(chains, built);
+        for c in &t.chains {
+            if let Some((table, _)) = table_of_chain(&c.name) {
+                assert_eq!(chain_object(table, &c.name), *c);
+            }
+        }
+        let named = |prefix: &[&str]| -> BTreeSet<String> {
+            t.fw_sets
+                .iter()
+                .filter(|s| prefix.iter().any(|p| s.name.starts_with(p)))
+                .map(|s| s.name.clone())
+                .collect()
+        };
+        assert_eq!(ports, named(&["ports_"]));
+        let al: BTreeSet<String> = lists
+            .iter()
+            .flat_map(|l| empty_list_sets(l).map(|s| s.name))
+            .collect();
+        assert_eq!(al, named(&["al4_", "al6_"]));
+        // The rules, chain by chain, in order.
+        let by_chain = |rs: &[program::Rule]| {
+            let mut m: BTreeMap<String, Vec<program::Rule>> = BTreeMap::new();
+            for r in rs.iter().filter(|r| table_of_chain(&r.chain).is_some()) {
+                m.entry(r.chain.clone()).or_default().push(r.clone());
+            }
+            m
+        };
+        assert_eq!(by_chain(&rules), by_chain(&t.rules));
+        assert!(!rules.is_empty() && !ports.is_empty() && built.len() > 3);
+    }
 
     #[test]
     fn kernel_rules_map_back_to_ours() {

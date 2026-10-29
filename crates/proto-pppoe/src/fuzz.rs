@@ -287,6 +287,13 @@ pub fn client(data: &[u8]) -> Result<(), String> {
 pub fn nd(data: &[u8]) -> Result<(), String> {
     use crate::nd;
     let _ = nd::classify(data);
+    // The raw-socket readers of the Ethernet sender (G3.9ha), on the
+    // message alone and on whatever follows a 40-byte header.
+    for body in [data, data.get(nd::IPV6_HLEN..).unwrap_or(&[])] {
+        let _ = nd::parse_rs_icmp(std::net::Ipv6Addr::UNSPECIFIED, 255, body);
+        let _ = nd::parse_rs_icmp(nd::link_local([0, 0, 0, 0, 0, 0, 0, 1]), 255, body);
+        let _ = nd::parse_ra_icmp(nd::link_local([0, 0, 0, 0, 0, 0, 0, 1]), body);
+    }
     let Ok(ra) = nd::parse_ra(data) else {
         return Ok(());
     };

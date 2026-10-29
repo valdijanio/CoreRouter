@@ -672,7 +672,7 @@ pub fn anon_set(info: &SetInfo, read: Vec<ReadElement>) -> AnonSet {
 }
 
 #[cfg(target_os = "linux")]
-pub use io::{Dump, Reader, read_table};
+pub use io::{Dump, Reader, read_table, with_reader};
 
 #[cfg(target_os = "linux")]
 mod io {
@@ -693,6 +693,28 @@ mod io {
 
     fn io(e: impl std::fmt::Display) -> HalError {
         HalError::Io(format!("nftables netlink: {e}"))
+    }
+
+    /// The firewall's reader, kept open (G0.31f): closing a netfilter
+    /// socket makes the kernel wait for the release of what the last
+    /// commit deleted (an RCU grace period, see `nfnl`'s batch socket).
+    static SHARED: std::sync::Mutex<Option<Reader>> = std::sync::Mutex::new(None);
+
+    /// Run `f` with the shared reader (opened on first use, dropped after
+    /// an error: it may hold the rest of an answer).
+    pub fn with_reader<T>(
+        f: impl FnOnce(&mut Reader) -> Result<T, HalError>,
+    ) -> Result<T, HalError> {
+        let mut shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+        let rd = match &mut *shared {
+            Some(r) => r,
+            None => shared.insert(Reader::open()?),
+        };
+        let out = f(rd);
+        if out.is_err() {
+            *shared = None;
+        }
+        out
     }
 
     /// One socket for a series of dumps.
