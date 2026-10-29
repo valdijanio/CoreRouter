@@ -220,7 +220,7 @@ MCP: `claude mcp add corerouter -- corerouter-cli mcp` (detalhes em `docs/mcp.md
   `test` usa o `cargo nextest` quando instalado (`cargo install --locked cargo-nextest`; metade do
   tempo, **medido**). Teste que falha e passa ao repetir sai como FLAKY/"flaky netns test" e não
   reprova: corrija-o depois (teste instável trava a fila; foram quatro em 2026-10-22).
-- **No máximo 2 CIs pesados na máquina** (G0.29): o `cargo xtask ci` que compila pega uma de 2
+- **No máximo 3 CIs pesados na máquina** (G0.29; eram 2 até 2026-10-29): o `cargo xtask ci` que compila pega uma de 3
   vagas (`flock` em `$XDG_RUNTIME_DIR/corerouter-ci/`, solta quando o processo morre) e espera
   com "esperando vaga (N rodando: …)"; também espera enquanto o disco do target tiver menos de
   30 GB livres (`COREROUTER_CI_MIN_FREE_GB`). `--no-wait` só avisa; `COREROUTER_CI_SLOTS` muda
