@@ -1,5 +1,6 @@
 //! /ip firewall connection (G2.2): the conntrack table, live — filters,
-//! the subscribers with the most connections, kill, the tracking
+//! the subscribers with the most connections, remove (G3.9hd; `kill` is
+//! its older name), the tracking
 //! timeouts (`/ip firewall connection tracking`) and how full the table
 //! is (`nf_conntrack_max`, the Tuning parameter of G1.26).
 //!
@@ -49,17 +50,26 @@ const MAX_ENTRIES: &str = "net.netfilter.nf_conntrack_max";
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "ip.firewall.connection.list", "Connections", ["IP", "Firewall"], None,
-        "{protocol?: string (tcp, udp, icmp or a number), src?: string (address or prefix of the original source), dst?: string (address or prefix of the original destination), port?: u16 (either port of the original direction), state?: string (established, new, time-wait…), subscriber?: string (a CGNAT subscriber: the original source), public?: string (the public address the NAT chose), via?: rules | software | hardware, nat?: srcnat | dstnat, sort?: timeout | bytes | packets (largest first), offset?: u32, count?: u32 (1..5000; default 200)} → {total (matching), offset, rows: [{id, protocol, src, dst, reply_src, reply_dst, nat? (public address:port of a srcnat), state, flags (S seen-reply, A assured, C confirmed, s srcnat, d dstnat, F fasttrack, H hw-offload), timeout, via, orig_packets, orig_bytes, repl_packets, repl_bytes, pool? (the CGNAT pool of the source)}], table: {count, max, percent, insert_failed, drop, early_drop}}",
+        "{id?: u32 (one connection), protocol?: string (tcp, udp, icmp or a number), src?: string (address or prefix of the original source), dst?: string (address or prefix of the original destination), port?: u16 (either port of the original direction), state?: string (established, new, time-wait…), subscriber?: string (a CGNAT subscriber: the original source), public?: string (the public address the NAT chose), via?: rules | software | hardware, nat?: srcnat | dstnat, sort?: timeout | bytes | packets (largest first), offset?: u32, count?: u32 (1..5000; default 200)} → {total (matching), offset, rows: [{id, protocol, src, dst, reply_src, reply_dst, nat? (public address:port of a srcnat), state, flags (S seen-reply, A assured, C confirmed, s srcnat, d dstnat, F fasttrack, H hw-offload), timeout, via, orig_packets, orig_bytes, repl_packets, repl_bytes, pool? (the CGNAT pool of the source)}], table: {count, max, percent, insert_failed, drop, early_drop}}",
         always, list),
     cmd!(query "ip.firewall.connection.top", "Top Subscribers", [], None,
         "{count?: u32 (1..100; default 10), protocol?: string} → [{subscriber, connections, tcp, udp, icmp, other, pool?, ports_used (public ports of its srcnat connections), ports (its slot), percent}] (most connections first)",
         always, top),
     cmd!(
+        "ip.firewall.connection.remove",
+        "Remove Connections",
+        [],
+        None,
+        "{id?: u32 (one connection, as listed), protocol?: string, src?: string (address or prefix of the original source), dst?: string (address or prefix of the original destination), port?: u16 (either port of the original direction), src_port?: u16, dst_port?: u16, state?: string, subscriber?: string, public?: string, via?: string, nat?: srcnat | dstnat, all?: bool (needed when no filter is given: the whole table), dry_run?: bool (count, remove nothing), include_management?: bool (also the caller's own management connection; default no: it is kept)} → {matched, removed, kept_management, dry_run, warnings: [string]} (the next packet of a removed flow goes through the rules and the NAT again, as a new connection)",
+        always,
+        remove
+    ),
+    cmd!(
         "ip.firewall.connection.kill",
         "Kill Connections",
         [],
         None,
-        "{id?: u32 (one connection), protocol?: string, src?: string, dst?: string, port?: u16, state?: string, subscriber?: string, public?: string, via?: string, nat?: string, all?: bool (needed when no filter is given)} → {matched, killed}",
+        "{id?: u32 (one connection), protocol?: string, src?: string, dst?: string, port?: u16, state?: string, subscriber?: string, public?: string, via?: string, nat?: string, all?: bool (needed when no filter is given)} → {matched, killed, kept_management, warnings: [string]} (older name of ip.firewall.connection.remove)",
         always,
         kill
     ),
@@ -253,6 +263,8 @@ struct Filter {
     src: Option<IpNet>,
     dst: Option<IpNet>,
     port: Option<u16>,
+    src_port: Option<u16>,
+    dst_port: Option<u16>,
     state: Option<String>,
     subscriber: Option<IpAddr>,
     public: Option<IpAddr>,
@@ -271,10 +283,13 @@ impl Filter {
                     .ok_or_else(|| EngineError::bad("protocol", "tcp, udp, icmp or a number 0..255"))?,
             ),
         };
-        let port = match opt_u32(p, "port")? {
-            Some(n) => Some(u16::try_from(n).map_err(|_| EngineError::bad("port", "0..65535"))?),
-            None => None,
+        let port_of = |key: &'static str| -> Result<Option<u16>> {
+            match opt_u32(p, key)? {
+                Some(n) => Ok(Some(u16::try_from(n).map_err(|_| EngineError::bad(key, "0..65535"))?)),
+                None => Ok(None),
+            }
         };
+        let port = port_of("port")?;
         let via = match opt_str(p, "via")? {
             None => None,
             Some("rules") => Some(Via::Rules),
@@ -298,6 +313,8 @@ impl Filter {
             src: prefix(p, "src")?,
             dst: prefix(p, "dst")?,
             port,
+            src_port: port_of("src_port")?,
+            dst_port: port_of("dst_port")?,
             state,
             subscriber: opt_parse::<IpAddr>(p, "subscriber")?,
             public: opt_parse::<IpAddr>(p, "public")?,
@@ -312,6 +329,8 @@ impl Filter {
             && self.src.is_none()
             && self.dst.is_none()
             && self.port.is_none()
+            && self.src_port.is_none()
+            && self.dst_port.is_none()
             && self.state.is_none()
             && self.subscriber.is_none()
             && self.public.is_none()
@@ -328,6 +347,8 @@ impl Filter {
             && self
                 .port
                 .is_none_or(|n| !matches!(c.protocol, 1 | 58) && (c.orig.src_port == n || c.orig.dst_port == n))
+            && self.src_port.is_none_or(|n| !matches!(c.protocol, 1 | 58) && c.orig.src_port == n)
+            && self.dst_port.is_none_or(|n| !matches!(c.protocol, 1 | 58) && c.orig.dst_port == n)
             && self.state.as_deref().is_none_or(|s| c.state() == s)
             && self.subscriber.is_none_or(|a| c.orig.src == a)
             && self.public.is_none_or(|a| c.has(status::SRC_NAT) && c.reply.dst == a)
@@ -537,23 +558,146 @@ fn top_rows(source: Source, f: &Filter, count: usize, cgnat: &corerouter_model::
     Ok(Value::Array(rows))
 }
 
+/// `::ffff:10.0.0.1` (a dual-stack socket) is 10.0.0.1 to conntrack.
+fn plain(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    }
+}
+
+/// Whether `c` carries the caller's own control connection: TCP from its
+/// address and port to ours (the reply side, so a dstnat in front of the
+/// router still matches).
+fn is_link(c: &Conn, link: &crate::lockout::Link) -> bool {
+    c.protocol == 6
+        && c.orig.src == plain(link.peer.ip())
+        && c.orig.src_port == link.peer.port()
+        && c.reply.src == plain(link.local.ip())
+        && c.reply.src_port == link.local.port()
+}
+
+/// What a removal was asked (validated under the lock).
+struct Removal {
+    f: Filter,
+    dry_run: bool,
+    include_management: bool,
+    link: Option<crate::lockout::Link>,
+    whole: bool,
+}
+
+impl Removal {
+    /// Sort a matching connection into the ones to remove or the
+    /// caller's own (kept).
+    fn take(&self, c: &Conn, victims: &mut Vec<Conn>, kept: &mut usize) {
+        if !self.f.keeps(c) {
+            return;
+        }
+        if !self.include_management && self.link.is_some_and(|l| is_link(c, &l)) {
+            *kept += 1;
+        } else {
+            victims.push(c.clone());
+        }
+    }
+
+    fn answer(&self, key: &str, victims: &[Conn], kept: usize, removed: usize) -> Value {
+        let mut warnings = Vec::new();
+        if self.whole {
+            warnings.push(format!(
+                "every connection was matched ({}): flows through the NAT restart with their next packet",
+                victims.len() + kept
+            ));
+        }
+        if kept > 0 {
+            warnings.push(
+                "your own management connection was kept; include_management=true removes it too".to_owned(),
+            );
+        }
+        if self.include_management && self.link.is_some_and(|l| victims.iter().any(|c| is_link(c, &l))) {
+            warnings.push(
+                "your own management connection was removed: a firewall that accepts only established connections drops this session".to_owned(),
+            );
+        }
+        let mut out = json!({
+            "matched": victims.len() + kept,
+            "kept_management": kept,
+            "warnings": warnings,
+        });
+        if let Some(o) = out.as_object_mut() {
+            o.insert(key.into(), json!(removed));
+            if key == "removed" {
+                o.insert("dry_run".into(), json!(self.dry_run));
+            }
+        }
+        out
+    }
+}
+
+fn remove(s: &mut Session, p: &Value) -> Result<Value> {
+    run_remove(s, p, "removed")
+}
+
 fn kill(s: &mut Session, p: &Value) -> Result<Value> {
+    run_remove(s, p, "killed")
+}
+
+/// `remove` and `kill`. On a backend with a conntrack scanner the table is
+/// read, filtered and the matches deleted after the lock (G0.31c), over
+/// the scanner's own netlink socket; the lab does it here.
+fn run_remove(s: &mut Session, p: &Value, key: &'static str) -> Result<Value> {
     let f = Filter::of(p)?;
     let all = super::args::opt_bool(p, "all")?.unwrap_or(false);
     if f.empty() && !all {
-        return Err(EngineError::bad("all", "no filter given: pass all=true to kill every connection"));
+        return Err(EngineError::bad(
+            "all",
+            "no filter given: pass all=true to remove every connection (or dry_run=true to count them)",
+        ));
+    }
+    let r = Removal {
+        whole: f.empty(),
+        f,
+        dry_run: super::args::opt_bool(p, "dry_run")?.unwrap_or(false),
+        include_management: super::args::opt_bool(p, "include_management")?.unwrap_or(false),
+        link: s.caller().link,
+    };
+    let dump = s.ext_mut::<ConnCache>().map(|c| c.dump.clone());
+    let forget = move || {
+        if let Some(d) = &dump {
+            locked(d).at = None;
+        }
+    };
+    if let Ok(mut scanner) = s.hal().conntrack_scanner() {
+        return s.defer(move || {
+            let (mut victims, mut kept) = (Vec::new(), 0);
+            scanner
+                .scan(&mut |c| r.take(c, &mut victims, &mut kept))
+                .map_err(|e| EngineError::Hal(e.to_string()))?;
+            let removed = if r.dry_run {
+                0
+            } else {
+                let n = scanner.remove(&victims).map_err(|e| EngineError::Hal(e.to_string()))?;
+                forget();
+                n
+            };
+            Ok(r.answer(key, &victims, kept, removed))
+        });
     }
     let (conns, _) = s.connections(true)?;
-    let victims: Vec<Conn> = conns.iter().filter(|c| f.keeps(c)).cloned().collect();
-    let killed = s
-        .hal_mut()
-        .connections_kill(&victims)
-        .map_err(|e| EngineError::Hal(e.to_string()))?;
-    // The next list reads the table again.
-    if let Some(c) = s.ext_mut::<ConnCache>() {
-        c.forget();
+    let (mut victims, mut kept) = (Vec::new(), 0);
+    for c in conns.iter() {
+        r.take(c, &mut victims, &mut kept);
     }
-    Ok(json!({"matched": victims.len(), "killed": killed}))
+    let removed = if r.dry_run {
+        0
+    } else {
+        let n = s
+            .hal_mut()
+            .connections_kill(&victims)
+            .map_err(|e| EngineError::Hal(e.to_string()))?;
+        forget();
+        n
+    };
+    Ok(r.answer(key, &victims, kept, removed))
 }
 
 /// The Tuning rows of the conntrack parameters (`system.tuning.parameter.print`).
