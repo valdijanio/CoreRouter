@@ -2767,3 +2767,8 @@ correção revertidas e `--baseline antes` com elas:
 De ponta a ponta (daemon release `--backend linux` num namespace sem root, commit de uma regra de
 filter, 15 commits por rodada) o ganho ficou dentro do ruído da máquina carregada: 90–110 ms antes
 e depois (G0.31j).
+
+- 2026-10-29, G1.6i (**medido**, imagem no QEMU/KVM, 2 vCPUs, 1 GiB, `cargo xtask os boot-test`,
+  três boots cada): memória ociosa sem protocolo de roteamento 98,9 MiB (8 daemons do FRR) →
+  70,9 MiB (mgmtd, zebra, staticd); FRR com os sockets vty prontos 0,82 s depois do kernel
+  (antes 1,0–1,9 s).
