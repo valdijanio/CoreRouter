@@ -8,6 +8,13 @@
 //! `corerouter_` prefix and an `interface` label, so a node_exporter
 //! dashboard needs only the prefix and label renamed.
 //!
+//! G1.6qd: memory and filesystems as node_exporter's `meminfo` and
+//! `filesystem` collectors (`corerouter_memory_MemAvailable_bytes`,
+//! `corerouter_filesystem_avail_bytes{mountpoint}`), the router's own
+//! processes as the client libraries' `process_*` with a `process` label
+//! (summed by name; no `pid` label, which changes on every FRR restart),
+//! and the health checks as numbers (0 ok, 1 warning, 2 error).
+//!
 //! The endpoint has no login, like node_exporter: it binds to 127.0.0.1
 //! unless an address is given, and a non-loopback address is logged as a
 //! warning. It answers `GET`/`HEAD` of `/metrics` (and a small page at
@@ -211,6 +218,7 @@ pub fn render(m: &Value, scrape_seconds: f64) -> String {
     if let Some(d) = m.get("dhcp_server").filter(|d| d.is_object()) {
         dhcp_server(&mut out, d);
     }
+    machine(&mut out, m);
     if let Some(v) = m.get("revision").and_then(Value::as_u64) {
         family(
             &mut out,
@@ -251,6 +259,114 @@ pub fn render(m: &Value, scrape_seconds: f64) -> String {
         "corerouter_scrape_duration_seconds {scrape_seconds:.6}"
     );
     out
+}
+
+/// G1.6qd: memory, filesystems, the router's processes and the health.
+fn machine(out: &mut String, m: &Value) {
+    if let Some(mem) = m.get("memory").filter(|v| v.is_object()) {
+        for (key, metric, help) in [
+            ("total", "corerouter_memory_MemTotal_bytes", "Memory of the machine (MemTotal)."),
+            ("available", "corerouter_memory_MemAvailable_bytes", "Memory available for new work without swapping (MemAvailable): alarm on this, not on free."),
+            ("free", "corerouter_memory_MemFree_bytes", "Memory not used at all (MemFree)."),
+            ("swap_total", "corerouter_memory_SwapTotal_bytes", "Swap space (SwapTotal)."),
+            ("swap_free", "corerouter_memory_SwapFree_bytes", "Swap space unused (SwapFree)."),
+        ] {
+            if let Some(v) = mem.get(key).and_then(Value::as_u64) {
+                family(out, metric, "gauge", help);
+                let _ = writeln!(out, "{metric} {v}");
+            }
+        }
+    }
+    let fss = m.get("filesystems").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    if !fss.is_empty() {
+        for (key, metric, help) in [
+            ("total", "corerouter_filesystem_size_bytes", "Size of the filesystem (the image's /config among them)."),
+            ("free", "corerouter_filesystem_free_bytes", "Free space, the root's reserve included."),
+            ("available", "corerouter_filesystem_avail_bytes", "Space a program can still write (alarm on this)."),
+        ] {
+            family(out, metric, "gauge", help);
+            for f in fss {
+                let s = |k: &str| label(f.get(k).and_then(Value::as_str).unwrap_or(""));
+                if let Some(v) = f.get(key).and_then(Value::as_u64) {
+                    let _ = writeln!(
+                        out,
+                        "{metric}{{mountpoint=\"{}\",device=\"{}\",fstype=\"{}\"}} {v}",
+                        s("mount"),
+                        s("device"),
+                        s("fs")
+                    );
+                }
+            }
+        }
+    }
+    processes(out, m);
+    if let Some(h) = m.get("health").filter(|v| v.is_object()) {
+        let level = |s: Option<&str>| match s {
+            Some("ok") => Some(0),
+            Some("warning") => Some(1),
+            Some("error") => Some(2),
+            _ => None,
+        };
+        if let Some(v) = level(h.get("status").and_then(Value::as_str)) {
+            family(out, "corerouter_health_status", "gauge", "Worst health check (system.health.check): 0 ok, 1 warning, 2 error.");
+            let _ = writeln!(out, "corerouter_health_status {v}");
+        }
+        let checks = h.get("checks").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+        if !checks.is_empty() {
+            family(out, "corerouter_health_check_status", "gauge", "Each health check: 0 ok, 1 warning, 2 error (no sample while unknown).");
+            for c in checks {
+                if let Some(v) = level(c.get("severity").and_then(Value::as_str)) {
+                    let key = label(c.get("key").and_then(Value::as_str).unwrap_or(""));
+                    let _ = writeln!(out, "corerouter_health_check_status{{check=\"{key}\"}} {v}");
+                }
+            }
+        }
+    }
+}
+
+/// The router's own processes, summed by name (two of one name are rare;
+/// a pid label would start a new series on every restart).
+fn processes(out: &mut String, m: &Value) {
+    let list = m.get("processes").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    if list.is_empty() {
+        return;
+    }
+    #[derive(Default)]
+    struct Sum {
+        count: u64,
+        rss: u64,
+        threads: u64,
+        fds: Option<u64>,
+        cpu: f64,
+    }
+    let mut by: std::collections::BTreeMap<String, Sum> = std::collections::BTreeMap::new();
+    for p in list {
+        let e = by.entry(label(p.get("name").and_then(Value::as_str).unwrap_or(""))).or_default();
+        let n = |k: &str| p.get(k).and_then(Value::as_u64);
+        e.count += 1;
+        e.rss += n("rss_bytes").unwrap_or(0);
+        e.threads += n("threads").unwrap_or(0);
+        if let Some(f) = n("fds") {
+            e.fds = Some(e.fds.unwrap_or(0) + f);
+        }
+        e.cpu += p.get("cpu_seconds").and_then(Value::as_f64).unwrap_or(0.0);
+    }
+    type Field = fn(&Sum) -> Option<String>;
+    let fields: [(&str, &str, &str, Field); 5] = [
+        ("corerouter_process_count", "gauge", "Processes of this name running (the daemon, the init, FRR's daemons).", |s| Some(s.count.to_string())),
+        ("corerouter_process_resident_memory_bytes", "gauge", "Resident memory (RSS): a steady climb is a leak.", |s| Some(s.rss.to_string())),
+        ("corerouter_process_threads", "gauge", "Threads of the process.", |s| Some(s.threads.to_string())),
+        ("corerouter_process_open_fds", "gauge", "Open file descriptors (sockets, files): a steady climb is a leak.", |s| s.fds.map(|f| f.to_string())),
+        ("corerouter_process_cpu_seconds_total", "counter", "CPU time (user and system) since the process started.", |s| Some(format!("{:.2}", s.cpu))),
+    ];
+    for (metric, kind, help, get) in fields {
+        family(out, metric, kind, help);
+        for (name, s) in &by {
+            if let Some(v) = get(s) {
+                let _ = writeln!(out, "{metric}{{process=\"{name}\"}} {v}");
+            }
+        }
+    }
 }
 
 /// G4.2a: the DHCP server's numbers (`ip.dhcp-server.statistics.print`).
@@ -757,7 +873,73 @@ mod tests {
                 {"name": "dns-server", "state": "running", "up": true, "restarts": 0},
                 {"name": "ntp-client", "state": "failed", "up": false, "restarts": 5},
             ],
+            "memory": {"total": 4_000_000_000u64, "available": 3_100_000_000u64,
+                       "free": 2_000_000_000u64, "swap_total": 0, "swap_free": 0},
+            "filesystems": [
+                {"mount": "/", "device": "/dev/mapper/root", "fs": "squashfs",
+                 "total": 300_000_000, "free": 0, "available": 0},
+                {"mount": "/config", "device": "/dev/vda4", "fs": "ext4",
+                 "total": 268_435_456, "free": 250_000_000, "available": 236_000_000},
+            ],
+            "processes": [
+                {"name": "corerouter-daemon", "pid": 812, "rss_bytes": 52_428_800,
+                 "threads": 31, "fds": 64, "cpu_seconds": 12.5},
+                {"name": "bgpd", "pid": 900, "rss_bytes": 20_000_000, "threads": 6,
+                 "fds": 20, "cpu_seconds": 1.25},
+                {"name": "bgpd", "pid": 901, "rss_bytes": 1_000_000, "threads": 1,
+                 "fds": null, "cpu_seconds": 0.25},
+                {"name": "zebra", "pid": 902, "rss_bytes": 9_000_000, "threads": 4,
+                 "fds": null, "cpu_seconds": 0.5},
+            ],
+            "health": {"status": "warning", "checks": [
+                {"key": "cpu", "severity": "ok"},
+                {"key": "disk", "severity": "warning"},
+                {"key": "temperature", "severity": "unknown"},
+            ]},
         })
+    }
+
+    /// G1.6qd: memory, filesystems, processes (summed by name) and health.
+    #[test]
+    fn renders_memory_disks_processes_and_health() {
+        let t = render(&sample(), 0.0);
+        for line in [
+            "corerouter_memory_MemAvailable_bytes 3100000000",
+            "corerouter_memory_MemTotal_bytes 4000000000",
+            "corerouter_filesystem_avail_bytes{mountpoint=\"/config\",device=\"/dev/vda4\",fstype=\"ext4\"} 236000000",
+            "corerouter_filesystem_size_bytes{mountpoint=\"/\",device=\"/dev/mapper/root\",fstype=\"squashfs\"} 300000000",
+            "corerouter_process_resident_memory_bytes{process=\"corerouter-daemon\"} 52428800",
+            "corerouter_process_threads{process=\"corerouter-daemon\"} 31",
+            "corerouter_process_open_fds{process=\"corerouter-daemon\"} 64",
+            "corerouter_process_cpu_seconds_total{process=\"corerouter-daemon\"} 12.50",
+            "corerouter_process_count{process=\"bgpd\"} 2",
+            "corerouter_process_resident_memory_bytes{process=\"bgpd\"} 21000000",
+            "corerouter_process_open_fds{process=\"bgpd\"} 20",
+            "corerouter_process_cpu_seconds_total{process=\"bgpd\"} 1.50",
+            "corerouter_health_status 1",
+            "corerouter_health_check_status{check=\"cpu\"} 0",
+            "corerouter_health_check_status{check=\"disk\"} 1",
+        ] {
+            assert!(t.lines().any(|l| l == line), "no `{line}` in:\n{t}");
+        }
+        assert!(!t.contains("process=\"zebra\"} 0\n") && !t.contains("open_fds{process=\"zebra\"}"), "unreadable descriptors: no sample");
+        assert!(!t.contains("check=\"temperature\""), "unknown: no sample");
+        assert!(!t.contains("pid="), "no pid label");
+    }
+
+    /// G1.6qd: the lab's `system.metrics` carries the new parts, and they
+    /// render.
+    #[test]
+    fn the_lab_scrape_has_memory_processes_and_health() {
+        let mut s = corerouter_engine::Session::virtual_lab();
+        let m = s.execute("system.metrics", &json!({})).unwrap();
+        assert!(m["memory"]["available"].as_u64().unwrap() > 0, "{m}");
+        assert_eq!(m["filesystems"][0]["mount"], "/");
+        assert_eq!(m["processes"][0]["name"], "corerouter-daemon");
+        assert!(m["health"]["checks"].as_array().unwrap().len() > 3);
+        let t = render(&m, 0.0);
+        assert!(t.contains("corerouter_process_threads{process=\"bgpd\"} 6"), "{t}");
+        assert!(t.contains("corerouter_health_status "));
     }
 
     #[test]

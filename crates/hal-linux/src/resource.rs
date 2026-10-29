@@ -20,20 +20,27 @@
 //! - `/sys/class/hwmon/*` and the `critical` trip of `/sys/class/thermal`;
 //! - `/proc/net/dev` and `/sys/class/net/<if>/{operstate,speed}`;
 //! - `/proc/vmstat` (`oom_kill`, `pswpin`, `pswpout`), conntrack count/max;
-//! - on demand, `/proc/<pid>/stat` of every process.
+//! - on demand, `/proc/<pid>/stat` of every process;
+//! - on every reading, `/proc/<pid>/stat` and `fd` of the router's own
+//!   processes (G1.6qd: this one, the init, FRR), whose pids are kept and
+//!   looked for again every [`ROUTER_SCAN_MS`] or when one is gone.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use corerouter_hal::system_resource::{
-    CpuIrqs, CpuTimes, Disk, DiskIo, LoadAvg, MAX_CPUS, MAX_DISKS, MAX_NET, MAX_PROCESSES,
-    MAX_SENSORS, Memory, NetDev, Pressure, Process, Psi, ResourceSampler, Sample, Sensor,
-    SensorKind, Want, cut_name,
+    CpuIrqs, CpuTimes, DAEMON_PROCESS, Disk, DiskIo, LoadAvg, MAX_CPUS, MAX_DISKS, MAX_NET,
+    MAX_PROCESSES, MAX_SENSORS, Memory, NetDev, Pressure, Process, Psi, ROUTER_PROCESSES,
+    ResourceSampler, Sample, Sensor, SensorKind, Want, cut_name,
 };
 
 /// Most descriptors counted per process (a reading of the processes lists
 /// each `/proc/<pid>/fd`; a runaway process with millions stops here).
 const MAX_FDS: usize = 1 << 16;
+/// How often (uptime ms) every `/proc/<pid>` is looked at again for the
+/// router's processes; a known one that is gone (FRR restarted by
+/// `watchfrr`) brings the look forward.
+pub const ROUTER_SCAN_MS: u64 = 30_000;
 /// Largest file read (`/proc/interrupts` of a 256-CPU box is ~1 MiB).
 const MAX_FILE: u64 = 4 << 20;
 /// Hottest and coldest temperature believed, °C: outside it is a broken
@@ -361,6 +368,12 @@ fn count_fds(dir: &std::path::Path) -> Option<u32> {
     u32::try_from(n).ok()
 }
 
+/// The name of a `/proc/<pid>/stat` (between the first `(` and the last
+/// `)`), without parsing the rest.
+fn stat_name(text: &str) -> Option<&str> {
+    text.get(text.find('(')? + 1..text.rfind(')')?)
+}
+
 /// `/proc/<pid>/stat`. The name is between the first `(` and the last `)`
 /// (it may hold spaces and parentheses).
 pub fn parse_pid_stat(text: &str, page_size: u64) -> Option<Process> {
@@ -515,6 +528,11 @@ pub struct Collector {
     fixed: Option<(Option<String>, Option<String>)>,
     /// The last sensor reading and when (uptime ms).
     sensors: Option<(u64, Vec<Sensor>)>,
+    /// This process (the daemon): first of [`Sample::router`].
+    own_pid: u32,
+    /// Pids of the router's other processes and when (uptime ms) all of
+    /// `/proc` was last looked at for them.
+    router_pids: Option<(u64, Vec<u32>)>,
 }
 
 impl Default for Collector {
@@ -586,7 +604,15 @@ impl Collector {
             page_size: u64::try_from(rustix::param::page_size()).unwrap_or(4096),
             fixed: None,
             sensors: None,
+            own_pid: std::process::id(),
+            router_pids: None,
         }
+    }
+
+    /// Take `pid` as the daemon's (tests: a pid of the fixture tree).
+    pub fn with_own_pid(mut self, pid: u32) -> Self {
+        self.own_pid = pid;
+        self
     }
 
     /// Replace `statvfs` (tests: the fixture's mounts are not real).
@@ -731,6 +757,66 @@ impl Collector {
             .collect()
     }
 
+    /// One process's stat and descriptors, `None` when it is gone.
+    fn process(&self, pid: u32) -> Option<Process> {
+        let dir = self.proc.join(pid.to_string());
+        let mut p = parse_pid_stat(&read(&dir.join("stat"))?, self.page_size)?;
+        p.fds = count_fds(&dir.join("fd"));
+        Some(p)
+    }
+
+    /// Every pid whose name is one of [`ROUTER_PROCESSES`] (one small
+    /// read per process: done every [`ROUTER_SCAN_MS`], not per reading).
+    fn scan_router(&self) -> Vec<u32> {
+        let Ok(entries) = std::fs::read_dir(&self.proc) else {
+            return Vec::new();
+        };
+        let mut pids: Vec<u32> = entries
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|pid| *pid != self.own_pid)
+            .take(MAX_PROCESSES)
+            .filter(|pid| {
+                read(&self.proc.join(pid.to_string()).join("stat"))
+                    .and_then(|t| stat_name(&t).map(|n| ROUTER_PROCESSES.contains(&n)))
+                    .unwrap_or(false)
+            })
+            .collect();
+        pids.sort_unstable();
+        pids
+    }
+
+    /// The router's own processes now (G1.6qd): the daemon first, then
+    /// the known pids; all of `/proc` again when due or when one is gone
+    /// or renamed (a pid reused). Public for the benchmark.
+    pub fn router(&mut self, now_ms: u64) -> Vec<Process> {
+        let own = self.process(self.own_pid).map(|mut p| {
+            p.name = DAEMON_PROCESS.to_owned();
+            p
+        });
+        let read_known = |c: &Self, pids: &[u32]| -> Option<Vec<Process>> {
+            pids.iter()
+                .map(|pid| c.process(*pid).filter(|p| ROUTER_PROCESSES.contains(&p.name.as_str())))
+                .collect()
+        };
+        let known = match &self.router_pids {
+            Some((at, pids)) if now_ms >= *at && now_ms - at < ROUTER_SCAN_MS => {
+                read_known(self, pids)
+            }
+            _ => None,
+        };
+        let others = match known {
+            Some(list) => list,
+            None => {
+                let pids = self.scan_router();
+                let list = pids.iter().filter_map(|pid| self.process(*pid)).collect();
+                self.router_pids = Some((now_ms, pids));
+                list
+            }
+        };
+        own.into_iter().chain(others).collect()
+    }
+
     fn core_mhz(&self, cores: usize) -> (Vec<u32>, Option<u32>) {
         let khz = |cpu: usize, f: &str| -> Option<u32> {
             let v: u64 = num(self
@@ -818,6 +904,7 @@ impl ResourceSampler for Collector {
             conntrack: ct("nf_conntrack_count"),
             conntrack_max: ct("nf_conntrack_max"),
             processes: want.processes.then(|| self.processes()),
+            router: self.router(uptime_ms),
         }
     }
 }

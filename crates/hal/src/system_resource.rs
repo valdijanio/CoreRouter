@@ -22,6 +22,38 @@ pub const MAX_PROCESSES: usize = 8192;
 /// Longest name kept (process, sensor label, interface, mount).
 pub const MAX_NAME: usize = 64;
 
+/// The router's own processes besides the daemon (G1.6qd), read on every
+/// reading for the `/metrics` (memory, threads, descriptors): the image's
+/// init and the FRR daemons. Matched on the kernel's name (`comm`).
+pub const ROUTER_PROCESSES: &[&str] = &[
+    "corerouter-init",
+    "watchfrr",
+    "zebra",
+    "mgmtd",
+    "staticd",
+    "bgpd",
+    "ospfd",
+    "ospf6d",
+    "bfdd",
+    "ldpd",
+    "isisd",
+    "ripd",
+    "ripngd",
+    "pimd",
+    "pim6d",
+    "pathd",
+    "vrrpd",
+    "pbrd",
+    "nhrpd",
+    "fabricd",
+    "eigrpd",
+    "babeld",
+];
+
+/// The name the daemon's own process gets in [`Sample::router`] (the
+/// kernel cuts `comm` to 15 bytes: `corerouter-daem`).
+pub const DAEMON_PROCESS: &str = "corerouter-daemon";
+
 /// What the caller wants of a reading.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Want {
@@ -265,6 +297,10 @@ pub struct Sample {
     pub conntrack_max: Option<u64>,
     /// `Some` only when [`Want::processes`].
     pub processes: Option<Vec<Process>>,
+    /// The router's own processes, on every reading (G1.6qd): this one
+    /// (named [`DAEMON_PROCESS`]) first, then those of
+    /// [`ROUTER_PROCESSES`] that run, with their descriptors.
+    pub router: Vec<Process>,
 }
 
 /// Cut `s` to [`MAX_NAME`] bytes at a character boundary.
@@ -420,8 +456,7 @@ impl ResourceSampler for LabSampler {
         self.last_secs = ms / 1000;
         let temp = 48.0 + wave(t, 1200, 140) as f64 / 10.0;
         let used = LAB_MEM / 2 - wave(t, 3600, 4 << 30);
-        let processes = want.processes.then(|| {
-            LAB_PROCS
+        let all: Vec<Process> = LAB_PROCS
                 .iter()
                 .zip(&self.procs)
                 .enumerate()
@@ -439,8 +474,13 @@ impl ResourceSampler for LabSampler {
                     rss_bytes: rss << 20,
                     fds: Some(*threads * 3 + 4),
                 })
-                .collect()
-        });
+                .collect();
+        let router = all
+            .iter()
+            .filter(|p| p.name == DAEMON_PROCESS || ROUTER_PROCESSES.contains(&p.name.as_str()))
+            .cloned()
+            .collect();
+        let processes = want.processes.then_some(all);
         Sample {
             uptime_ms,
             hz: hz as u32,
@@ -545,6 +585,7 @@ impl ResourceSampler for LabSampler {
             conntrack: Some(200_000 + wave(t, 900, 80_000)),
             conntrack_max: Some(1 << 20),
             processes,
+            router,
         }
     }
 }
@@ -572,6 +613,9 @@ mod tests {
         assert!((10..=60).contains(&busy), "{busy}");
         assert!(a.processes.is_none());
         assert_eq!(b.processes.as_ref().map(Vec::len), Some(LAB_PROCS.len()));
+        // G1.6qd: the router's own on every reading, the daemon first.
+        let names: Vec<&str> = a.router.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["corerouter-daemon", "bgpd", "zebra", "ospfd"]);
         assert!(b.net[0].rx_bytes > a.net[0].rx_bytes);
         assert!(b.net[3].rx_errors > a.net[3].rx_errors);
         assert!(b.memory.available < b.memory.total);

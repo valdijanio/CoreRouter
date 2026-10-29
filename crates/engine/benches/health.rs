@@ -3,6 +3,9 @@
 //! checks. The reading itself is taken outside the lock
 //! (`hal-linux/benches/resource.rs`).
 //!
+//! G1.6qd: `system_metrics` is one Prometheus scrape's command (memory,
+//! filesystems, the router's processes and the checks included).
+//!
 //! `cargo bench -p corerouter-engine --bench health`
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -31,6 +34,10 @@ fn health(c: &mut Criterion) {
             },
             criterion::BatchSize::SmallInput,
         );
+    });
+    let mut m = Session::virtual_lab();
+    g.bench_function("system_metrics", |b| {
+        b.iter(|| m.execute("system.metrics", &serde_json::json!({})).unwrap());
     });
     g.finish();
 }

@@ -256,8 +256,33 @@ fn the_whole_machine_from_the_fixture_tree() {
     assert!(!s.net.iter().find(|n| n.name == "lo").unwrap().up);
     assert_eq!((s.conntrack, s.conntrack_max), (Some(1873), Some(262_144)));
     let procs = s.processes.unwrap();
-    assert_eq!(procs.len(), 2);
+    assert_eq!(procs.len(), 3);
     assert!(procs.iter().any(|p| p.name == "cp"));
+    // G1.6qd: FRR's bgpd among the router's own; this test is no pid there.
+    let names: Vec<&str> = s.router.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["bgpd"]);
+    assert_eq!((s.router[0].threads, s.router[0].rss_bytes), (6, 104_960 * 4096));
+}
+
+#[test]
+fn the_router_processes_are_found_and_kept() {
+    let mut c = collector().with_own_pid(2_889_393);
+    let s = c.sample(Want::default());
+    assert!(s.processes.is_none(), "the full list stays on demand");
+    let names: Vec<&str> = s.router.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["corerouter-daemon", "bgpd"], "the daemon first, by its own name");
+    assert_eq!(s.router[0].pid, 2_889_393);
+    assert_eq!(c.router_pids.as_ref().map(|(_, p)| p.clone()), Some(vec![412]));
+    // A pid that is gone brings the scan forward (FRR restarted).
+    c.router_pids = Some((s.uptime_ms, vec![77]));
+    let s = c.sample(Want::default());
+    assert_eq!(s.router.iter().map(|p| p.pid).collect::<Vec<_>>(), [2_889_393, 412]);
+    // A pid reused by another program is not FRR's any more.
+    c.router_pids = Some((s.uptime_ms, vec![1]));
+    let s = c.sample(Want::default());
+    assert_eq!(s.router.last().map(|p| p.pid), Some(412));
+    assert_eq!(stat_name("9 (a (b)) S 1"), Some("a (b)"));
+    assert_eq!(stat_name("9 (cut"), None);
 }
 
 #[test]
@@ -285,6 +310,8 @@ fn the_real_machine_reads_cheaply() {
     assert!(!s.cores.is_empty());
     assert!(s.memory.total > 0);
     assert!(s.processes.is_some_and(|p| !p.is_empty()));
+    assert_eq!(s.router.first().map(|p| p.pid), Some(std::process::id()));
+    assert!(s.router[0].fds.is_some_and(|n| n > 0), "this process's descriptors");
 }
 
 fn truncations(text: &str) -> impl Iterator<Item = &str> {
