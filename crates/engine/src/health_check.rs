@@ -508,6 +508,28 @@ pub struct HealthAlerts {
     oom_last: Option<u64>,
 }
 
+impl HealthAlerts {
+    /// OOM kills in the last [`OOM_WINDOW`] seconds, after a reading of
+    /// the kernel's count since boot (`oom_kill` of `/proc/vmstat`) at
+    /// uptime `t` seconds. A rise between two readings is dated by the
+    /// second one. The first reading of this process counts what the
+    /// kernel already counted when the machine came up less than the
+    /// window ago: those kills are recent, and the usual victim is the
+    /// daemon itself, which the init restarts with a fresh count (the VM of
+    /// 2026-10-29 said "ok" ten minutes after its daemon was killed). On a
+    /// machine up for longer they cannot be dated and are not counted.
+    fn oom_seen(&mut self, t: u64, kills: u64) -> u64 {
+        match self.oom_last {
+            Some(prev) if kills > prev => self.oom_rises.push((t, kills - prev)),
+            None if kills > 0 && t < OOM_WINDOW => self.oom_rises.push((t, kills)),
+            _ => {}
+        }
+        self.oom_last = Some(kills);
+        self.oom_rises.retain(|(at, _)| t.saturating_sub(*at) < OOM_WINDOW && *at <= t);
+        self.oom_rises.iter().map(|r| r.1).sum()
+    }
+}
+
 impl Session {
     /// The rules' inputs now.
     pub(crate) fn health_inputs(&mut self) -> Inputs {
@@ -515,14 +537,7 @@ impl Session {
         // OOM bookkeeping first (needs `&mut`).
         let reading = self.ext::<ResourceMonitor>().and_then(|m| m.last.as_ref()).map(|l| (l.uptime_ms / 1000, l.oom_kills));
         if let (Some((t, Some(kills))), Some(a)) = (reading, self.ext_mut::<HealthAlerts>()) {
-            if let Some(prev) = a.oom_last
-                && kills > prev
-            {
-                a.oom_rises.push((t, kills - prev));
-            }
-            a.oom_last = Some(kills);
-            a.oom_rises.retain(|(at, _)| t.saturating_sub(*at) < OOM_WINDOW && *at <= t);
-            i.oom_recent = Some(a.oom_rises.iter().map(|r| r.1).sum());
+            i.oom_recent = Some(a.oom_seen(t, kills));
         }
         if let Some(m) = self.ext::<ResourceMonitor>()
             && let Some(l) = &m.last
@@ -676,6 +691,27 @@ mod tests {
             no_password: Vec::new(),
             root_verity: Some(("a".into(), true)),
         }
+    }
+
+    /// The kernel's count since boot, read by a daemon that just started
+    /// (the init restarted it after the OOM killer took it): counted when
+    /// the machine is young enough to date them, then like any rise.
+    #[test]
+    fn kills_before_the_daemon_started_count_when_they_are_recent() {
+        let mut a = HealthAlerts::default();
+        assert_eq!(a.oom_seen(700, 1), 1, "machine up 700 s: the kill is recent");
+        assert_eq!(a.oom_seen(705, 1), 1, "no new kill, the old one still counts");
+        assert_eq!(a.oom_seen(710, 2), 2);
+        assert_eq!(a.oom_seen(700 + OOM_WINDOW, 2), 1, "the first one left the window");
+        assert_eq!(a.oom_seen(710 + OOM_WINDOW, 2), 0);
+        // Up for days: the kills already counted cannot be dated.
+        let mut old = HealthAlerts::default();
+        assert_eq!(old.oom_seen(3 * 86_400, 4), 0);
+        assert_eq!(old.oom_seen(3 * 86_400 + 5, 5), 1);
+        // A first reading with no kill.
+        let mut clean = HealthAlerts::default();
+        assert_eq!(clean.oom_seen(30, 0), 0);
+        assert_eq!(clean.oom_seen(35, 1), 1);
     }
 
     #[test]
