@@ -11,3 +11,8 @@ test(/(^|::)hundred_thousand_dual_stack_sessions_reach_opened_on_a_lossy_network
 | test(/(^|::)server_survives_mutated_conversations$/)
 """
 priority = 100
+
+# G0.30: o tempo de cada teste, em `target/nextest/default/junit.xml`; o `cargo xtask ci` lê e
+# imprime os 20 mais lentos no fim (xtask/src/slowest.rs).
+[profile.default.junit]
+path = "junit.xml"
