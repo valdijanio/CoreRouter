@@ -217,3 +217,87 @@ fn upload_over_the_control_channel() {
         p["trial"].is_null() && p["primary"] == "b" && p["slots"][1]["version"] == "9.1"
     });
 }
+
+/// Serves `body` (or a 404 for any other path) to `conns` connections.
+fn serve(body: Vec<u8>, conns: usize) -> u16 {
+    use std::io::{BufRead, BufReader, Write};
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for s in l.incoming().take(conns) {
+            let mut s = s.unwrap();
+            let mut first = String::new();
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            r.read_line(&mut first).unwrap();
+            loop {
+                let mut h = String::new();
+                if r.read_line(&mut h).unwrap() == 0 || h == "\r\n" {
+                    break;
+                }
+            }
+            if first.contains(" /b.crpkg ") {
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(&body);
+            } else {
+                let _ = s.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        }
+    });
+    port
+}
+
+fn download(d: &Daemon, params: Value) -> Value {
+    let job = exec(d, "system.package.download", params).unwrap()["job"]
+        .as_u64()
+        .unwrap();
+    result(d, job)
+}
+
+#[test]
+fn download_over_http() {
+    let d = lab("download");
+    let pkg = package(&d.dir.join("config"), "9.2");
+    let mut bad = pkg.clone();
+    let at = bad.len() - 5000;
+    bad[at] ^= 1;
+    let good = serve(pkg, 3);
+    let tampered = serve(bad, 1);
+    let r = download(
+        &d,
+        json!({"url": format!("http://127.0.0.1:{good}/missing.crpkg")}),
+    );
+    assert!(r["error"].as_str().unwrap().contains("404"), "{r}");
+    let r = download(
+        &d,
+        json!({"url": format!("http://127.0.0.1:{tampered}/b.crpkg")}),
+    );
+    assert!(
+        r["error"].as_str().unwrap().contains("signed hashes"),
+        "{r}"
+    );
+    let r = download(
+        &d,
+        json!({"url": format!("http://127.0.0.1:{good}/b.crpkg"), "check": true}),
+    );
+    assert_eq!(
+        (r["ok"].as_bool(), r["result"]["intact"].as_bool()),
+        (Some(true), Some(true)),
+        "{r}"
+    );
+    let r = download(
+        &d,
+        json!({"url": format!("http://127.0.0.1:{good}/b.crpkg"), "confirm": "manual"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["result"]["slot"], "b");
+    wait_for("the trial boot of B", Duration::from_secs(10), || {
+        let p = exec(&d, "system.package.print", json!({})).unwrap();
+        p["running"] == "b" && p["trial"]["slot"] == "b" && p["trial"]["version"] == "9.2"
+    });
+}

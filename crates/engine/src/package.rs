@@ -47,6 +47,16 @@ pub enum JobKind {
         downgrade: bool,
         check: bool,
     },
+    /// A package the router fetches itself over HTTP(S) (G1.6e, like
+    /// RouterOS `/system package update install`): streamed to the slot.
+    Download {
+        url: String,
+        /// Check the server's certificate (`ssl-verify`); the package is
+        /// signed either way.
+        verify: bool,
+        downgrade: bool,
+        check: bool,
+    },
 }
 
 impl JobKind {
@@ -61,6 +71,8 @@ impl JobKind {
             JobKind::Scrub { .. } => "scrub",
             JobKind::Upload { check: true, .. } => "upload-check",
             JobKind::Upload { .. } => "upload",
+            JobKind::Download { check: true, .. } => "download-check",
+            JobKind::Download { .. } => "download",
         }
     }
 
@@ -72,6 +84,7 @@ impl JobKind {
                 | JobKind::Downgrade { .. }
                 | JobKind::BootParams { .. }
                 | JobKind::Upload { check: false, .. }
+                | JobKind::Download { check: false, .. }
         )
     }
 }

@@ -22,6 +22,8 @@ pub struct ChunkReader {
     stall: Duration,
     buf: Vec<u8>,
     at: usize,
+    /// What the stream is, in errors (`upload`, `download`).
+    what: &'static str,
     /// Time spent waiting for the network (the rest is the disk's).
     pub waited: Duration,
 }
@@ -35,8 +37,15 @@ impl ChunkReader {
             stall,
             buf: Vec::new(),
             at: 0,
+            what: "upload",
             waited: Duration::ZERO,
         }
+    }
+
+    /// Names the stream in errors (`download`).
+    pub fn named(mut self, what: &'static str) -> ChunkReader {
+        self.what = what;
+        self
     }
 
     /// Bytes received so far.
@@ -63,8 +72,8 @@ impl Read for ChunkReader {
                     self.got = self.got.saturating_add(chunk.len() as u64);
                     if self.got > self.size {
                         return Err(io_err(format!(
-                            "upload: more than the declared {} bytes",
-                            self.size
+                            "{}: more than the declared {} bytes",
+                            self.what, self.size
                         )));
                     }
                     self.buf = chunk;
@@ -72,13 +81,14 @@ impl Read for ChunkReader {
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     return Err(io_err(format!(
-                        "upload aborted after {} of {} bytes",
-                        self.got, self.size
+                        "{} aborted after {} of {} bytes",
+                        self.what, self.got, self.size
                     )));
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     return Err(io_err(format!(
-                        "upload stalled: no data for {} s after {} of {} bytes",
+                        "{} stalled: no data for {} s after {} of {} bytes",
+                        self.what,
                         self.stall.as_secs(),
                         self.got,
                         self.size

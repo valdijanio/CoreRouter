@@ -73,7 +73,7 @@ struct UpChunk;
 
 pub(crate) struct PackagesPanel {
     pub(crate) status: Value,
-    path: String,
+    pub(crate) path: String,
     /// A package on this computer (G1.6e).
     pub(crate) local: String,
     pub(crate) sending: Option<Sending>,
@@ -138,6 +138,13 @@ impl PackagesPanel {
         if help::info_button(ui, egui::Id::unique(("packages-help", key)), title).clicked() {
             self.help = Some(HelpView::new(key, title));
         }
+    }
+
+    /// G1.6e: an `http(s)://` address in Package file: the router
+    /// downloads it (`system.package.download`).
+    fn is_url(&self) -> bool {
+        let p = self.path.trim();
+        p.starts_with("https://") || p.starts_with("http://")
     }
 
     fn params(&self) -> Value {
@@ -392,7 +399,7 @@ impl PackagesPanel {
             });
             ui.add(
                 egui::TextEdit::singleline(&mut self.path)
-                    .hint_text("/tmp/corerouter.crpkg")
+                    .hint_text("/tmp/corerouter.crpkg  or  https://…/corerouter.crpkg")
                     .desired_width(360.0),
             );
             ui.end_row();
@@ -422,7 +429,11 @@ impl PackagesPanel {
         });
         ui.horizontal(|ui| {
             if action(ui, t(lang, "Check"), needs_path("system.package.check", &self.path)) {
-                send = Some(("system.package.check", json!({"path": self.path.trim()})));
+                send = Some(if self.is_url() {
+                    ("system.package.download", json!({"url": self.path.trim(), "check": true}))
+                } else {
+                    ("system.package.check", json!({"path": self.path.trim()}))
+                });
             }
             let install = needs_path("system.package.update", &self.path)
                 .and_then(|()| if trial { Err("a trial boot is pending".into()) } else { Ok(()) });
@@ -726,6 +737,14 @@ impl PanelState for PackagesPanel {
                 self.ask = None;
                 let mut p = self.params();
                 match ask {
+                    Ask::Install if self.is_url() => {
+                        if let Some(o) = p.as_object_mut()
+                            && let Some(url) = o.remove("path")
+                        {
+                            o.insert("url".into(), url);
+                        }
+                        self.send(app, "system.package.download", p);
+                    }
                     Ask::Install => self.send(app, "system.package.update", p),
                     Ask::Upload => self.start_upload(app, ctx, false),
                     Ask::Downgrade => {

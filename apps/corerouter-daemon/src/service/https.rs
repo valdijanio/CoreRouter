@@ -371,6 +371,10 @@ pub(crate) struct Response {
     pub body: Vec<u8>,
 }
 
+/// Where a response body goes instead of [`Response::body`] (G1.6e: a
+/// system package streamed to the inactive slot, never whole in memory).
+pub(crate) type Sink<'a> = &'a mut dyn FnMut(&[u8]) -> Result<(), String>;
+
 /// Sends one request and reads the response, the body at most `max` bytes.
 pub(crate) fn exchange(
     s: &mut Stream,
@@ -380,6 +384,21 @@ pub(crate) fn exchange(
     body: &[u8],
     max: usize,
     deadline: Instant,
+) -> Result<Response, String> {
+    exchange_to(s, method, url, headers, body, max, deadline, None)
+}
+
+/// [`exchange`], a 2xx body handed to `sink` piece by piece when given.
+#[allow(clippy::too_many_arguments)]
+fn exchange_to(
+    s: &mut Stream,
+    method: &str,
+    url: &Url,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    max: usize,
+    deadline: Instant,
+    sink: Option<Sink<'_>>,
 ) -> Result<Response, String> {
     s.deadline(deadline)?;
     let host = if url.host.contains(':') {
@@ -409,7 +428,35 @@ pub(crate) fn exchange(
     out.extend_from_slice(body);
     s.write_all(&out).map_err(|e| e.to_string())?;
     s.flush().map_err(|e| e.to_string())?;
-    read_response(s, method == "HEAD", max, deadline)
+    read_response(s, method == "HEAD", max, deadline, sink)
+}
+
+/// Bytes read at a time when the body goes to a sink.
+const PIECE: usize = 256 << 10;
+
+/// `n` body bytes from `r`: into `out` (bounded by `max` already), or to
+/// `sink` in pieces.
+fn body_bytes(r: &mut impl Read, n: usize, out: &mut Vec<u8>, sink: &mut Option<Sink<'_>>) -> Result<(), String> {
+    match sink {
+        None => {
+            let start = out.len();
+            out.resize(start + n, 0);
+            r.read_exact(out.get_mut(start..).unwrap_or_default())
+                .map_err(|e| e.to_string())
+        }
+        Some(f) => {
+            let mut buf = vec![0u8; PIECE.min(n)];
+            let mut left = n;
+            while left > 0 {
+                let k = left.min(PIECE);
+                let b = buf.get_mut(..k).ok_or("buffer")?;
+                r.read_exact(b).map_err(|e| e.to_string())?;
+                f(b)?;
+                left -= k;
+            }
+            Ok(())
+        }
+    }
 }
 
 fn read_response(
@@ -417,6 +464,7 @@ fn read_response(
     head_only: bool,
     max: usize,
     deadline: Instant,
+    mut sink: Option<Sink<'_>>,
 ) -> Result<Response, String> {
     let mut r = BufReader::new(Timed { s, deadline });
     // The header block, up to the blank line.
@@ -480,6 +528,11 @@ fn read_response(
         return Ok(out);
     }
     let too_big = || format!("body larger than {max} bytes");
+    // Only a success goes to the sink (an error page is read as usual).
+    if !(200..300).contains(&status) {
+        sink = None;
+    }
+    let mut total = 0usize;
     if chunked {
         loop {
             let mut line = Vec::new();
@@ -508,13 +561,11 @@ fn read_response(
                 }
                 break;
             }
-            if out.body.len().saturating_add(size) > max {
+            total = total.saturating_add(size);
+            if total > max {
                 return Err(too_big());
             }
-            let start = out.body.len();
-            out.body.resize(start + size, 0);
-            r.read_exact(out.body.get_mut(start..).unwrap_or_default())
-                .map_err(|e| e.to_string())?;
+            body_bytes(&mut r, size, &mut out.body, &mut sink)?;
             let mut crlf = Vec::new();
             (&mut r)
                 .take(2)
@@ -525,8 +576,21 @@ fn read_response(
         if n > max {
             return Err(too_big());
         }
-        out.body.resize(n, 0);
-        r.read_exact(&mut out.body).map_err(|e| e.to_string())?;
+        body_bytes(&mut r, n, &mut out.body, &mut sink)?;
+    } else if let Some(f) = sink.as_mut() {
+        out.keep_alive = false;
+        let mut buf = vec![0u8; PIECE];
+        loop {
+            let k = r.read(&mut buf).map_err(|e| e.to_string())?;
+            if k == 0 {
+                break;
+            }
+            total = total.saturating_add(k);
+            if total > max {
+                return Err(too_big());
+            }
+            f(buf.get(..k).unwrap_or_default())?;
+        }
     } else {
         // Until the server closes.
         out.keep_alive = false;
@@ -583,6 +647,28 @@ pub(crate) fn get(
     timeout: Duration,
     resolve: &dyn Fn(&str) -> Result<Vec<IpAddr>, String>,
 ) -> Result<Vec<u8>, String> {
+    get_to(url, verify, max, timeout, resolve, None)
+}
+
+/// [`get`] with the body handed to `sink` as it arrives (when given; the
+/// returned body is then empty). A connection that fails after `sink` got
+/// bytes is not retried on another address: the error goes back.
+pub(crate) fn get_to(
+    url: &str,
+    verify: bool,
+    max: usize,
+    timeout: Duration,
+    resolve: &dyn Fn(&str) -> Result<Vec<IpAddr>, String>,
+    mut sink: Option<Sink<'_>>,
+) -> Result<Vec<u8>, String> {
+    let fed = std::cell::Cell::new(false);
+    let fed = &fed;
+    let mut counted = sink.as_mut().map(|f| {
+        move |b: &[u8]| {
+            fed.set(true);
+            f(b)
+        }
+    });
     let deadline = Instant::now() + timeout;
     let mut url = Url::parse(url)?;
     let mut first: Option<Vec<IpAddr>> = None;
@@ -603,7 +689,7 @@ pub(crate) fn get(
         for ip in addrs.iter().take(4) {
             let attempt = connect(SocketAddr::new(*ip, url.port), url.tls, &url.host, verify, deadline)
                 .and_then(|mut s| {
-                    exchange(
+                    exchange_to(
                         &mut s,
                         "GET",
                         &url,
@@ -611,6 +697,7 @@ pub(crate) fn get(
                         &[],
                         max,
                         deadline,
+                        counted.as_mut().map(|f| f as Sink<'_>),
                     )
                 });
             match attempt {
@@ -618,6 +705,7 @@ pub(crate) fn get(
                     resp = Some(r);
                     break;
                 }
+                Err(e) if fed.get() => return Err(e),
                 Err(e) => last = e,
             }
         }
