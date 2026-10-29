@@ -112,6 +112,7 @@ fn vlan(parent: &str, id: u16) -> InterfaceKind {
     InterfaceKind::Vlan {
         parent: n(parent),
         vlan_id: VlanId::new(id).unwrap(),
+        service_tag: false,
     }
 }
 
@@ -230,6 +231,27 @@ fn vlan_bridge_loopback_and_addresses() {
 
     // Applying the same transition again is a no-op, not an error.
     hal.apply(&to, &to).unwrap();
+
+    // QinQ as RouterOS builds it (G3.9h): an 802.1ad S-VLAN with an
+    // 802.1Q C-VLAN on top; an S-VLAN and a C-VLAN may share an id.
+    let mut qinq = to.clone();
+    add(&mut qinq, "a1s10", vlan("a1eth1", 10)).kind = InterfaceKind::Vlan {
+        parent: n("a1eth1"),
+        vlan_id: VlanId::new(10).unwrap(),
+        service_tag: true,
+    };
+    add(&mut qinq, "a1c7", vlan("a1s10", 7));
+    hal.apply(&to, &qinq).unwrap();
+    let s10 = ip(&["-d", "-o", "link", "show", "a1s10"]);
+    assert!(s10.contains("vlan protocol 802.1ad id 10"), "{s10}");
+    let c7 = ip(&["-d", "-o", "link", "show", "a1c7"]);
+    assert!(
+        c7.contains("a1c7@a1s10") && c7.contains("vlan protocol 802.1Q id 7"),
+        "{c7}"
+    );
+    hal.apply(&qinq, &qinq).unwrap();
+    hal.apply(&qinq, &to).unwrap();
+    assert!(!exists("a1s10") && !exists("a1c7"));
 
     // And back: everything CoreRouter created goes away, ports are restored.
     hal.apply(&to, &base).unwrap();

@@ -173,7 +173,7 @@ fn devices(s: &Session, p: &Value, vlans: bool) -> Result<(IfName, Vec<CaptureDe
     }];
     if vlans && own_vlan.is_none() {
         for (child, i) in &cfg.interfaces {
-            if let InterfaceKind::Vlan { parent, vlan_id } = &i.kind
+            if let InterfaceKind::Vlan { parent, vlan_id, .. } = &i.kind
                 && parent == &name
                 && !i.disabled
                 && out.len() < MAX_DEVICES

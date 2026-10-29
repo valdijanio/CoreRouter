@@ -152,6 +152,53 @@ fn vlan_add_validates_parent_id_name_and_mtu() {
     );
 }
 
+/// G3.9h: QinQ as RouterOS builds it, an 802.1ad S-VLAN (`use-service-tag`)
+/// with an 802.1Q C-VLAN on top. Seen against RouterOS 7.25: without the
+/// S-tag the CoreRouter could only stack 0x8100 on 0x8100.
+#[test]
+fn vlan_add_service_tag_for_qinq() {
+    let mut s = lab();
+    ok(
+        &mut s,
+        "interface.vlan.add",
+        json!({"name": "s100", "parent": "ether1", "vlan_id": 100, "use_service_tag": true}),
+    );
+    ok(
+        &mut s,
+        "interface.vlan.add",
+        json!({"name": "c200", "parent": "s100", "vlan_id": 200}),
+    );
+    assert_eq!(row(&mut s, "s100")["use_service_tag"], true);
+    assert_eq!(row(&mut s, "c200")["use_service_tag"], false);
+    assert_eq!(row(&mut s, "ether1")["use_service_tag"], Value::Null);
+    // The same id as a C-VLAN on the same port is another TPID: allowed
+    // (Linux and RouterOS both take it); a second S-VLAN 100 is not.
+    ok(
+        &mut s,
+        "interface.vlan.add",
+        json!({"name": "v100", "parent": "ether1", "vlan_id": 100}),
+    );
+    fails(
+        &mut s,
+        "interface.vlan.add",
+        json!({"name": "s100b", "parent": "ether1", "vlan_id": 100, "use_service_tag": true}),
+        "S-VLAN 100 on ether1 already exists (s100)",
+    );
+    fails(
+        &mut s,
+        "interface.vlan.add",
+        json!({"name": "s7", "parent": "ether1", "vlan_id": 7, "use_service_tag": "yes please"}),
+        "use_service_tag",
+    );
+    assert!(validate_all(s.store().candidate()).is_empty());
+    // Saved only when set: a plain VLAN's config stays as it was.
+    let cfg = serde_json::to_value(&s.store().running().interfaces).unwrap();
+    assert_eq!(cfg["s100"]["kind"]["service_tag"], true);
+    assert!(cfg["c200"]["kind"].get("service_tag").is_none());
+    ok(&mut s, "config.rollback", json!({"revision": 0}));
+    assert!(!has(&s, "s100"));
+}
+
 #[test]
 fn vlan_add_rolls_back() {
     let mut s = lab();
@@ -585,6 +632,7 @@ fn validator_catches_hand_built_dependency_errors() {
             InterfaceKind::Vlan {
                 parent: name(parent),
                 vlan_id: VlanId::new(id).unwrap(),
+                service_tag: false,
             },
         )
     };

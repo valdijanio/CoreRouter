@@ -154,7 +154,7 @@ pub fn validate_changed(cfg: &Config, changed: Sections) -> Vec<Issue> {
 
 fn interface_checks(cfg: &Config) -> Vec<Issue> {
     let mut out = Vec::new();
-    let mut vlans: BTreeMap<(&IfName, VlanId), &IfName> = BTreeMap::new();
+    let mut vlans: BTreeMap<(&IfName, VlanId, bool), &IfName> = BTreeMap::new();
     let mut vrf_tables: BTreeMap<u32, &IfName> = BTreeMap::new();
     for (name, iface) in &cfg.interfaces {
         if iface.name != *name {
@@ -163,7 +163,12 @@ fn interface_checks(cfg: &Config) -> Vec<Issue> {
                 "name does not match key",
             ));
         }
-        if let InterfaceKind::Vlan { parent, vlan_id } = &iface.kind {
+        if let InterfaceKind::Vlan {
+            parent,
+            vlan_id,
+            service_tag,
+        } = &iface.kind
+        {
             if vlan_lowers(cfg, name).1 {
                 out.push(Issue::new(
                     format!("interfaces.{name}.kind.parent"),
@@ -171,7 +176,8 @@ fn interface_checks(cfg: &Config) -> Vec<Issue> {
                 ));
             }
             vlan_checks(cfg, name, iface, parent, *vlan_id, &mut out);
-            if let Some(other) = vlans.insert((parent, *vlan_id), name) {
+            // A C-VLAN and an S-VLAN may share an id on one port (TPIDs differ).
+            if let Some(other) = vlans.insert((parent, *vlan_id, *service_tag), name) {
                 out.push(Issue::new(
                     format!("interfaces.{name}.kind.vlan_id"),
                     format!(
