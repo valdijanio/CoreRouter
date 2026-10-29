@@ -298,7 +298,7 @@ dos pools de CGNAT (`crates/hal/src/lab_conntrack.rs`).
 |---|---|
 | `ip.firewall.connection.list` | uma página (≤ 5000 linhas) do que casa com os filtros, mais o uso da tabela |
 | `ip.firewall.connection.top` | os assinantes com mais conexões e quanto do bloco de portas do CGNAT cada um usa |
-| `ip.firewall.connection.kill` | derruba uma conexão, por `id`, ou todas as que casam com um filtro |
+| `ip.firewall.connection.remove` | apaga uma conexão, por `id`, ou todas as que casam com um filtro (G3.9hd; `kill` é o nome antigo) |
 | `ip.firewall.connection.tracking.info` | os timeouts e o tamanho da tabela |
 | `ip.firewall.connection.tracking.set` | muda os timeouts e o tamanho da tabela |
 
@@ -315,7 +315,18 @@ dos pools de CGNAT (`crates/hal/src/lab_conntrack.rs`).
 
 `list` ordena por timeout, bytes ou pacotes.
 
-`kill` sem nenhum filtro exige `all=true`.
+`remove` (o `/ip firewall connection remove [find …]` do RouterOS, o `conntrack -D` do Linux)
+serve para limpar as conexões depois de mudar o NAT: uma entrada que já existe mantém a tradução
+antiga até expirar. Além dos filtros da lista, aceita `src_port` e `dst_port`.
+
+- **Sem filtro** exige `all=true`, e a resposta avisa que todo fluxo do NAT recomeça.
+- **`dry_run=true`** só conta (`matched`), sem apagar.
+- **A conexão de gerência de quem pede** fica de fora (`kept_management`, com aviso), a não ser
+  com `include_management=true`. Um firewall que só aceita `established` derrubaria a sessão.
+- **Não é config:** age na hora também em modo transacional, entra no journal e um rollback não
+  traz as conexões de volta.
+- **Fora do lock:** com o backend linux, a leitura e a remoção rodam fora do lock do `Session`, em
+  lotes de 256 pedidos por datagrama (G0.31c).
 
 Os nomes de `tracking.info` e `tracking.set` são os do RouterOS.
 

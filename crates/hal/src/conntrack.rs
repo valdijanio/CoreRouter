@@ -166,6 +166,16 @@ pub trait Scanner: Send {
     /// Call `each` for every connection (at most [`MAX_READ`]); the table's
     /// counters after.
     fn scan(&mut self, each: &mut dyn FnMut(&Conn)) -> Result<Stats, crate::HalError>;
+
+    /// Remove these connections (G3.9hd, `ip.firewall.connection.remove`
+    /// outside the session lock); how many the kernel removed (one already
+    /// gone is not an error).
+    fn remove(&mut self, conns: &[Conn]) -> Result<usize, crate::HalError> {
+        let _ = conns;
+        Err(crate::HalError::Unsupported(
+            "this conntrack scanner cannot remove connections".into(),
+        ))
+    }
 }
 
 /// A live feed of conntrack events (G4.4b): the kernel's, or the lab's.
