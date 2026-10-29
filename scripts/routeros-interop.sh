@@ -811,9 +811,17 @@ case_ospfv3() {
   v3full() { [ "$(cli routing.ospf.neighbor.list | jq -r '[.rows[] | select(.version == 3 and .router_id == "10.255.39.1")][0].state')" = Full ]; }
   ms=$(wait_for 60 v3full) && result ospfv3 OK "OSPFv3 Full in ${ms} ms" \
     || result ospfv3 FAIL "OSPFv3: CR $(cli routing.ospf.neighbor.list | jq -c '[.rows[] | select(.version == 3)]'), CHR $(ros routing/ospf/neighbor | jq -c '[.[] | select(.instance == "v3")]')"
-  sleep 4
-  local r; r=$(ros 'ipv6/route?dst-address=2001:db8:39::2/128' | jq -r '[.[] | select(.active == "true")][0].gateway // "-"')
-  [ "$r" != - ] && result ospfv3 OK "CHR: 2001:db8:39::2/128 via $r" || result ospfv3 FAIL "CHR has no route to the CoreRouter's v6 loopback"
+  v3route() { ros 'ipv6/route?dst-address=2001:db8:39::2/128' | jq -r '[.[] | select(.active == "true")][0].gateway // "-"'; }
+  v3has() { [ "$(v3route)" != - ]; }
+  if ms=$(wait_for 30 v3has); then
+    result ospfv3 OK "CHR: 2001:db8:39::2/128 via $(v3route), ${ms} ms after Full"
+  else
+    result ospfv3 FAIL "CHR has no route to the CoreRouter's v6 loopback 30 s after Full"
+    result ospfv3 INFO "CR's ospf6d: $(vt crcore 'show ipv6 ospf6 database' | grep -E 'Rtr|INP|IAP|Lnk|Network' | tr -s ' ' | paste -sd';' | cut -c1-400)"
+    result ospfv3 INFO "CR's ospf6d interfaces: $(vt crcore 'show ipv6 ospf6 interface brief' | tr -s ' ' | paste -sd';' | cut -c1-300)"
+    result ospfv3 INFO "CHR's v3 LSAs: $(ros 'routing/ospf/lsa' | jq -c '[.[] | select(.instance == "v3") | {type, id, originator}]' | cut -c1-500)"
+    result ospfv3 INFO "CHR's v6 routes: $(ros 'ipv6/route' | jq -c '[.[] | {dst: ."dst-address", gw: .gateway, active}]' | cut -c1-400)"
+  fi
   ip netns exec crcore ip -6 route get 2001:db8:39::1 2>/dev/null | grep -q ether1 \
     && result ospfv3 OK "CR: 2001:db8:39::1 via ether1" || result ospfv3 FAIL "CR has no v6 route to CHR's loopback"
 }

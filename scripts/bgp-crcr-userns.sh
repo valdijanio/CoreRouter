@@ -521,16 +521,28 @@ case_maxprefix() {
   for i in 1 2 3 4 5 6; do ip -n r3 route add blackhole "198.18.$i.0/24"; done
   crc 1 '{"name":"r3","remote_address":"10.39.2.2","remote_as":65003,"input_filter":"all","output_filter":"all","max_prefix_ipv4":3}'
   local ms
-  sleep 2
-  ms=$(wait_for 60 bash -c "! ip netns exec c1 $bin/corerouter-cli --connect 127.0.0.1:7991 run routing.bgp.session.list | jq -e '.[] | select(.connection == \"r3\" and .established)' >/dev/null") || true
-  sleep 3
-  cr_up 1 r3 && result maxprefix FAIL "6 > 3 and still Established" \
-    || result maxprefix OK "6 prefixes over max_prefix_ipv4=3 (shutdown): $(cr_state 1 r3)"
+  # Wait for the Cease itself: the session first has to come up (R3's
+  # connect timer, ~5 s when this case runs alone), and down alone proves
+  # nothing.
+  ms=$(wait_for 60 bash -c "ip netns exec c1 $bin/corerouter-cli --connect 127.0.0.1:7991 run routing.bgp.session.list | jq -e '.[] | select(.connection == \"r3\" and (.reason // \"\" | test(\"prefix\"; \"i\")))' >/dev/null") || true
+  # Down is not enough: a session that never came up is down too.
+  if cr_up 1 r3; then result maxprefix FAIL "6 > 3 and still Established"
+  elif cr_state 1 r3 | grep -qi prefix; then result maxprefix OK "6 prefixes over max_prefix_ipv4=3 (shutdown): $(cr_state 1 r3)"
+  else result maxprefix FAIL "down, but not for the prefix limit: $(cr_state 1 r3); CR1's bgpd: $(vt c1 'show bgp neighbors 10.39.2.2 json' | jq -c '."10.39.2.2" | {bgpState, lastResetDueTo, lastNotificationReason}' 2>/dev/null)"
+  fi
   result maxprefix INFO "R3 saw: $(vt r3 'show bgp neighbors 10.39.2.1 json' | jq -c '."10.39.2.1" | {bgpState, lastNotificationReason, lastErrorCodeSubcode}' 2>/dev/null)"
   result maxprefix INFO "history: $(cr1 routing.bgp.session.history '{"connection":"r3"}' | jq -c '[.[0:2][] | {event, state, reason}]')"
   cr1 routing.bgp.connection.set '{"id":"r3","max_prefix_action":"warning"}' >/dev/null
   cr1 routing.bgp.session.clear '{"connection":"r3"}' >/dev/null 2>&1 || true
-  ms=$(wait_for 60 cr_up 1 r3) && result maxprefix OK "warning: up in ${ms} ms with $(cr_sess 1 r3 | jq -r .prefix_count) prefixes" || result maxprefix FAIL "warning: $(cr_state 1 r3)"
+  # The prefix count right at Established is still 0: wait for the six
+  # (warning keeps them all, over the limit).
+  if ms=$(wait_for 60 cr_up 1 r3); then
+    wait_for 15 bash -c "[ \"\$(ip netns exec c1 $bin/corerouter-cli --connect 127.0.0.1:7991 run routing.bgp.session.list | jq -r '.[] | select(.connection == \"r3\") | .prefix_count')\" = 6 ]" >/dev/null \
+      && result maxprefix OK "warning: up in ${ms} ms, all 6 prefixes kept" \
+      || result maxprefix FAIL "warning: up in ${ms} ms with $(cr_sess 1 r3 | jq -r .prefix_count) prefixes, not 6"
+  else
+    result maxprefix FAIL "warning: $(cr_state 1 r3)"
+  fi
   crd 1 r3
   for i in 1 2 3 4 5 6; do ip -n r3 route del blackhole "198.18.$i.0/24"; done
 }
