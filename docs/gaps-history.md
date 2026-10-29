@@ -225,3 +225,5 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-28 — G4.6i feito (roteador novo nasce sem aviso de NTP)
 - 2026-10-28 — G1.6m criado e feito (primeiro boot de verdade numa VM: assistente, nomes de porta, interfaces do kernel, shell, NVRAM herdada); relacionado à G1.6d, que segue aberta
 - 2026-10-28 — G0.3d criado (pedido do usuário depois do teste na VM: senha vazia pela rede como no CHR e certificado trocado com escolha estilo PuTTY); parte a feita, muda o comportamento da G0.3b
+- 2026-10-28 — G0.28 criado e feito (pacote .deb da GUI + CLI, link corerouter://); G0.28b–d criados (AppImage, Windows, macOS)
+- 2026-10-28 — G0.3d feito (parte b: certificado trocado estilo PuTTY na GUI, `--accept-new-cert` na CLI/MCP)
