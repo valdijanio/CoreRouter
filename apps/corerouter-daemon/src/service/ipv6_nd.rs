@@ -434,7 +434,6 @@ fn ra_config(a: &Advert, mac: Option<[u8; 6]>, deprecated: &[Ipv6Net], last: boo
         dnssl: a.dnssl.clone(),
         dns_lifetime: if last { 0 } else { a.dns_lifetime },
         preference: e.ra_preference.bits(),
-        ..RaConfig::default()
     }
 }
 
