@@ -673,6 +673,7 @@ case_mpls-ttl() {
   result mpls-ttl INFO "traceroute R3 → R4: $(tr '\n' ';' <<< "$lt")"
   grep -q '10.39.1.2.*MPLS' <<< "$lt" && result mpls-ttl OK "R3's traceroute shows the CoreRouter hop with its label" \
     || result mpls-ttl FAIL "R3's traceroute, no labeled CoreRouter hop"
+  sleep 2 # the counters reach the session once a second
   result mpls-ttl INFO "CR icmp_counters: $(cli mpls.settings.get | jq -c .icmp_counters)"
   [ "$(cli mpls.settings.get | jq '.icmp_counters.sent // 0')" -ge 2 ] \
     && result mpls-ttl OK "the CoreRouter counted its errors" || result mpls-ttl FAIL "icmp_counters.sent < 2"
