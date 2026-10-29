@@ -850,9 +850,11 @@ pub struct RouteWatch {
     /// First look with a clock.
     pub since: Option<u64>,
     last_look: Option<u64>,
-    states: HashMap<String, Seen>,
-    /// Bumped by every look: an entry not seen by the last one is gone.
-    generation: u64,
+    /// Shared with the lists that read it outside the lock (G0.31b):
+    /// a look copies it only when a state changed.
+    states: Arc<HashMap<String, Seen>>,
+    /// The table the last look saw ([`RouteWatch::observe_shared`]).
+    looked: Option<Arc<Vec<Line>>>,
     /// Each route's state changes (G1.27b): failover, link down and back.
     /// At most [`MAX_CHANGES`] per route, the last [`KEEP_SECS`].
     changes: HashMap<String, VecDeque<Change>>,
@@ -892,7 +894,17 @@ struct Seen {
     state: State,
     /// Unix second it took `state`; `None`: already so when watching began.
     at: Option<u64>,
-    generation: u64,
+}
+
+/// [`RouteWatch::changed`]: a copy of the states that costs a pointer.
+#[derive(Debug, Clone, Default)]
+pub struct Changed(Arc<HashMap<String, Seen>>);
+
+impl Changed {
+    /// Unix second `key` took its current state, if known.
+    pub fn changed_at(&self, key: &str) -> Option<u64> {
+        self.0.get(key).and_then(|s| s.at)
+    }
 }
 
 impl RouteWatch {
@@ -903,49 +915,61 @@ impl RouteWatch {
         let first = self.since.is_none();
         self.since.get_or_insert(now);
         self.last_look = Some(now);
-        self.generation = self.generation.wrapping_add(1);
-        let generation = self.generation;
         let mut out = Vec::new();
+        // Read first, write after: a look that changes nothing leaves the
+        // map shared with the lists built from it (G0.31b).
+        let mut writes: Vec<(&Line, Seen)> = Vec::new();
         for l in lines.iter().take(MAX_WATCHED) {
-            match self.states.get_mut(&l.key) {
-                Some(seen) => {
-                    if seen.state != l.state {
-                        let change = Change {
-                            at: now,
-                            from: seen.state,
-                            to: l.state,
-                            reason: l.why.clone(),
-                        };
-                        let ring = self.changes.entry(l.key.clone()).or_default();
-                        if ring.len() >= MAX_CHANGES {
-                            ring.pop_front();
-                        }
-                        ring.push_back(change.clone());
-                        out.push(Transition {
-                            key: l.key.clone(),
-                            dst: l.dst,
-                            table: l.table.clone(),
-                            change,
-                        });
-                        seen.state = l.state;
-                        seen.at = Some(now);
+            match self.states.get(&l.key) {
+                Some(seen) if seen.state != l.state => {
+                    let change = Change {
+                        at: now,
+                        from: seen.state,
+                        to: l.state,
+                        reason: l.why.clone(),
+                    };
+                    let ring = self.changes.entry(l.key.clone()).or_default();
+                    if ring.len() >= MAX_CHANGES {
+                        ring.pop_front();
                     }
-                    seen.generation = generation;
-                }
-                None => {
-                    self.states.insert(
-                        l.key.clone(),
+                    ring.push_back(change.clone());
+                    out.push(Transition {
+                        key: l.key.clone(),
+                        dst: l.dst,
+                        table: l.table.clone(),
+                        change,
+                    });
+                    writes.push((
+                        l,
                         Seen {
                             state: l.state,
-                            at: (!first).then_some(now),
-                            generation,
+                            at: Some(now),
                         },
-                    );
+                    ));
                 }
+                Some(_) => {}
+                None => writes.push((
+                    l,
+                    Seen {
+                        state: l.state,
+                        at: (!first).then_some(now),
+                    },
+                )),
+            }
+        }
+        if !writes.is_empty() {
+            let states = Arc::make_mut(&mut self.states);
+            for (l, seen) in writes {
+                states.insert(l.key.clone(), seen);
             }
         }
         if self.states.len() > lines.len().min(MAX_WATCHED) {
-            self.states.retain(|_, s| s.generation == generation);
+            let live: std::collections::HashSet<&str> = lines
+                .iter()
+                .take(MAX_WATCHED)
+                .map(|l| l.key.as_str())
+                .collect();
+            Arc::make_mut(&mut self.states).retain(|k, _| live.contains(k.as_str()));
             let states = &self.states;
             self.changes.retain(|k, _| states.contains_key(k));
         }
@@ -957,6 +981,24 @@ impl RouteWatch {
         }
         self.changes.retain(|_, r| !r.is_empty());
         out
+    }
+
+    /// [`Self::observe`], skipped when `lines` is the table the last look
+    /// saw (the [`RouteCache`] hands out the same `Arc` while nothing it
+    /// was built from changed): no state can have changed, and a list of
+    /// 60 000 routes does not walk them all under the lock again.
+    pub fn observe_shared(&mut self, lines: &Arc<Vec<Line>>, now: u64) -> Vec<Transition> {
+        if self.looked.as_ref().is_some_and(|l| Arc::ptr_eq(l, lines)) {
+            self.last_look = Some(now);
+            return Vec::new();
+        }
+        self.looked = Some(Arc::clone(lines));
+        self.observe(lines, now)
+    }
+
+    /// When each route took its state, shared: read without the session.
+    pub fn changed(&self) -> Changed {
+        Changed(Arc::clone(&self.states))
     }
 
     /// The changes of `key` in the last 24 h, newest first.
@@ -1084,7 +1126,7 @@ impl Session {
         let lines = self.route_lines();
         let seen = self
             .ext_mut::<RouteWatch>()
-            .map(|w| w.observe(&lines, now))
+            .map(|w| w.observe_shared(&lines, now))
             .unwrap_or_default();
         self.log_route_changes(&seen);
     }
@@ -1135,7 +1177,7 @@ impl Session {
         if let Some(now) = now {
             let seen = self
                 .ext_mut::<RouteWatch>()
-                .map(|w| w.observe(&lines, now))
+                .map(|w| w.observe_shared(&lines, now))
                 .unwrap_or_default();
             self.log_route_changes(&seen);
         }

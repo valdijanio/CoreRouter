@@ -211,22 +211,26 @@ fn verdict(v: corerouter_firewall::eval::Verdict) -> &'static str {
 }
 
 fn preview(s: &mut Session, _p: &Value) -> Result<Value> {
-    let dynamic = s.dynamic_now();
-    let store = s.store();
-    let (run, cand) = (store.running(), store.candidate());
-    let render = |c| corerouter_firewall::render(c, &dynamic).unwrap_or_default();
-    let (old, new) = (render(run), render(cand));
-    let lines = diff::lines(&old, &new);
-    let count = |op: &str| lines.iter().filter(|l| l.op() == op).count();
-    let (added, removed) = (count("+"), count("-"));
-    Ok(json!({
-        "changed": added + removed > 0,
-        "added": added,
-        "removed": removed,
-        "lines": lines.iter().map(|l| json!({"op": l.op(), "text": l.text()})).collect::<Vec<_>>(),
-        "running": old,
-        "candidate": new,
-    }))
+    // Pointers under the lock; both rulesets are rendered and compared
+    // after it (G0.31b). The dynamic entries as `dynamic_now` gives them.
+    let (dynamic, now) = (s.dynamic_addresses.shared(), s.now());
+    let (run, cand) = (s.store().running().clone(), s.store().candidate().clone());
+    s.defer(move || {
+        let dynamic: Vec<_> = dynamic.iter().map(|e| e.data_plane(now)).collect();
+        let render = |c| corerouter_firewall::render(c, &dynamic).unwrap_or_default();
+        let (old, new) = (render(&run), render(&cand));
+        let lines = diff::lines(&old, &new);
+        let count = |op: &str| lines.iter().filter(|l| l.op() == op).count();
+        let (added, removed) = (count("+"), count("-"));
+        Ok(json!({
+            "changed": added + removed > 0,
+            "added": added,
+            "removed": removed,
+            "lines": lines.iter().map(|l| json!({"op": l.op(), "text": l.text()})).collect::<Vec<_>>(),
+            "running": old,
+            "candidate": new,
+        }))
+    })
 }
 
 fn counters(s: &mut Session, p: &Value) -> Result<Value> {

@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use corerouter_engine::off_lock::Reply;
 use corerouter_engine::{Caller, Session, Shared, lock};
 use serde_json::{Value, json};
 
@@ -28,6 +29,17 @@ pub trait Host {
         &mut self,
         f: &mut dyn FnMut(&mut Session) -> Result<Value, String>,
     ) -> Result<Value, String>;
+
+    /// [`Host::with_session`] for a command whose answer may be built
+    /// after the session is released ([`Reply::Later`], G0.31b). Here, in
+    /// place; a host that locks a shared session overrides it to run
+    /// [`Reply::finish`] after unlocking.
+    fn with_session_reply(
+        &mut self,
+        f: &mut dyn FnMut(&mut Session) -> Result<Reply, String>,
+    ) -> Result<Value, String> {
+        self.with_session(&mut |s| f(s)?.finish().map_err(|e| e.to_string()))
+    }
 
     fn has_ui(&self) -> bool {
         false
@@ -65,6 +77,16 @@ impl Host for SharedHost {
         f: &mut dyn FnMut(&mut Session) -> Result<Value, String>,
     ) -> Result<Value, String> {
         f(&mut lock(&self.0))
+    }
+
+    /// The lock is released before the answer is built: a list of 60 000
+    /// routes no longer holds DHCP, PPPoE and the other clients (G0.31b).
+    fn with_session_reply(
+        &mut self,
+        f: &mut dyn FnMut(&mut Session) -> Result<Reply, String>,
+    ) -> Result<Value, String> {
+        let reply = f(&mut lock(&self.0))?;
+        reply.finish().map_err(|e| e.to_string())
     }
 }
 
@@ -159,7 +181,7 @@ pub fn dispatch_as(
             let p = params.get("params").cloned().unwrap_or(Value::Null);
             // `via` names the client program, for the log's origin (G4.6d).
             let caller = caller.clone().with_via(params);
-            host.with_session(&mut |s| s.execute_as(&caller, id, &p).map_err(err))
+            host.with_session_reply(&mut |s| s.execute_reply_as(&caller, id, &p).map_err(err))
         }
         "engine.batch" => {
             let steps = params.get("steps").cloned().unwrap_or(Value::Null);
