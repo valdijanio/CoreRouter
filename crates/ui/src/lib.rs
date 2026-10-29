@@ -562,10 +562,8 @@ impl CoreRouterUi {
                         self.cache.commands = list;
                         self.update_can();
                     }
-                    self.cache.commands_etag = m
-                        .get("etag")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
+                    self.cache.commands_etag =
+                        m.get("etag").and_then(Value::as_str).map(str::to_owned);
                 }
                 _ => {}
             },
@@ -778,7 +776,12 @@ impl CoreRouterUi {
         );
         ask(self, Field::Diff, "engine.execute", exec("config.diff"));
         let etag = self.cache.commands_etag.clone().unwrap_or_default();
-        ask(self, Field::Commands, "engine.list", json!({ "if_none_match": etag }));
+        ask(
+            self,
+            Field::Commands,
+            "engine.list",
+            json!({ "if_none_match": etag }),
+        );
         // An old router has no auth.whoami: no question it cannot answer.
         if !self.old_router() {
             ask(self, Field::Whoami, "auth.whoami", Value::Null);

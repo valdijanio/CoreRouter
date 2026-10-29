@@ -237,7 +237,10 @@ mod tests {
     fn the_catalogue_is_not_sent_again_unchanged() {
         let mut h = SharedHost(shared(Session::virtual_lab()));
         let bare = dispatch(&mut h, "engine.list", &Value::Null).unwrap();
-        assert!(bare.as_array().is_some_and(|l| l.len() > 100), "old clients: the list");
+        assert!(
+            bare.as_array().is_some_and(|l| l.len() > 100),
+            "old clients: the list"
+        );
         let first = dispatch(&mut h, "engine.list", &json!({"if_none_match": ""})).unwrap();
         let etag = first["etag"].as_str().unwrap().to_owned();
         assert_eq!(first["commands"], bare);
@@ -245,8 +248,18 @@ mod tests {
         assert_eq!(again, json!({"etag": etag, "unchanged": true}));
         assert!(again.to_string().len() < 100);
         // What greys commands out changed (a pending change): sent again.
-        dispatch(&mut h, "engine.execute", &json!({"command": "config.mode.set", "params": {"mode": "transactional"}})).unwrap();
-        dispatch(&mut h, "engine.execute", &json!({"command": "system.identity.set", "params": {"name": "x"}})).unwrap();
+        dispatch(
+            &mut h,
+            "engine.execute",
+            &json!({"command": "config.mode.set", "params": {"mode": "transactional"}}),
+        )
+        .unwrap();
+        dispatch(
+            &mut h,
+            "engine.execute",
+            &json!({"command": "system.identity.set", "params": {"name": "x"}}),
+        )
+        .unwrap();
         let changed = dispatch(&mut h, "engine.list", &json!({"if_none_match": etag})).unwrap();
         assert_ne!(changed["etag"], json!(etag));
         assert!(changed["commands"].is_array());
