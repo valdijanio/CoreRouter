@@ -49,6 +49,11 @@ use corerouter_model::service::{Listen, MAX_EVENT};
 
 // `supervisor.rs` is a module like the services (build.rs lists it).
 
+/// Heartbeat of an idle service: well under the supervisor's stall limit
+/// (30 s), or an idle service is logged as "no heartbeat (stuck?)". With
+/// 60 s, frr and mpls did that on every daemon without `--frr` (G0.31).
+pub(crate) const IDLE_BEAT: Duration = Duration::from_secs(10);
+
 /// A command-line flag a service takes.
 pub(crate) struct Flag {
     pub name: &'static str,
@@ -242,6 +247,14 @@ impl Health {
         self.report().error = None;
     }
 
+    /// Idle until shutdown, beating every [`IDLE_BEAT`]: a service with
+    /// nothing to run (no `--frr`, the virtual lab) is not reported stuck.
+    pub(crate) fn idle_until_shutdown(&self) {
+        while self.sleep(IDLE_BEAT) {
+            self.beat();
+        }
+    }
+
     /// Idle because the config turns it off (`Some(reason)`), or not.
     pub(crate) fn disabled(&self, reason: Option<&str>) {
         let mut r = self.report();
@@ -296,6 +309,11 @@ impl Health {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_idle_service_beats_before_it_counts_as_stuck() {
+        assert!(super::IDLE_BEAT * 2 <= super::supervisor::Policy::default().stall);
+    }
+
     use super::*;
 
     #[test]
