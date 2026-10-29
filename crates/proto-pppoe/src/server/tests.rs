@@ -1210,3 +1210,103 @@ fn one_session_per_vlan_in_the_1_to_1_model() {
     s.reconfigure(c);
     s.check_invariants().unwrap();
 }
+
+// ------------------------------------------- the router's own client (G3.9ga)
+
+fn client_with(f: impl FnOnce(&mut ClientConfig)) -> Client {
+    let mut c = ClientConfig {
+        mac: HOST,
+        username: b"u".to_vec(),
+        password: "p".into(),
+        discovery_attempts: 2,
+        ..ClientConfig::default()
+    };
+    f(&mut c);
+    Client::new(c, [3; 32])
+}
+
+/// RouterOS `ac-name`: only the named concentrator's offer is taken.
+#[test]
+fn ac_name_takes_only_that_concentrators_offer() {
+    let mut p = Pair::new(AuthProto::Pap);
+    p.s.reconfigure(ServerConfig {
+        ac_name: b"isp-bng".to_vec(),
+        ..p.s.config().clone()
+    });
+    p.c = client_with(|c| {
+        c.ac_name = b"other-bng".to_vec();
+        c.auth = AuthSet::new(&[AuthProto::Pap]);
+    });
+    p.c.start(0, &mut p.co);
+    p.run(10_000, |_, _| false);
+    assert_eq!(
+        p.c.phase(),
+        ClientPhase::Closed(crate::client::ClientDown::NoOffer)
+    );
+    p.c = client_with(|c| {
+        c.ac_name = b"isp-bng".to_vec();
+        c.auth = AuthSet::new(&[AuthProto::Pap]);
+    });
+    p.c.start(p.now, &mut p.co);
+    p.run(2_000, |_, _| false);
+    assert_eq!(p.c.phase(), ClientPhase::Up, "{:?}", p.log);
+    assert_eq!(p.c.ac_name(), Some(&b"isp-bng"[..]));
+    assert_eq!(p.c.ac_mac(), AC);
+}
+
+/// The BNG's refusal text is kept for the operator (RFC 1334 §2.2.2,
+/// RFC 2759 §6: only the `M=` part of an MS-CHAP failure).
+#[test]
+fn the_bngs_refusal_message_is_kept() {
+    for a in [AuthProto::Pap, AuthProto::ChapMd5, AuthProto::MsChapV2] {
+        let mut p = Pair::new(a);
+        p.c = client_with(|c| {
+            c.password = "wrong".into();
+            c.auth = AuthSet::new(&[a]);
+        });
+        p.c.start(0, &mut p.co);
+        p.run(5_000, |_, _| false);
+        assert_eq!(
+            p.c.phase(),
+            ClientPhase::Closed(crate::client::ClientDown::AuthFailed),
+            "{a:?}"
+        );
+        let m = p.c.auth_message().unwrap_or_default().to_owned();
+        assert!(m.contains("no") && !m.contains("E=691"), "{a:?}: {m}");
+    }
+}
+
+/// `max-mtu` below the BNG's MRU caps what the client sends.
+#[test]
+fn max_mtu_caps_the_links_mtu() {
+    let mut p = Pair::new(AuthProto::Pap);
+    p.c = client_with(|c| {
+        c.mtu = 1400;
+        c.mru = 1460;
+        c.auth = AuthSet::new(&[AuthProto::Pap]);
+    });
+    p.c.start(0, &mut p.co);
+    p.run(2_000, |_, _| false);
+    assert_eq!(p.c.phase(), ClientPhase::Up);
+    let (mtu, mru) = p.c.mtu_mru();
+    assert!(mtu <= 1400, "mtu {mtu}");
+    assert_eq!(mru, 1460);
+}
+
+/// RFC 2516 §5.5: the PADT a restarted CPE sends for its old session.
+#[test]
+fn rfc2516_5_5_padt_of_a_stale_session() {
+    let mut out = ClientOutput::new();
+    crate::client::padt(HOST, AC, Vlans::NONE, 0x1234, 1, &mut out);
+    let frames: Vec<Vec<u8>> = out.frames().map(|(_, f)| f.to_vec()).collect();
+    assert_eq!(frames.len(), 1);
+    let d = discovery::parse(&frames[0]).unwrap();
+    assert_eq!(d.code, Code::Padt);
+    assert_eq!(d.session_id, 0x1234);
+    assert_eq!((d.src, d.dst), (HOST, AC));
+    // Nothing for session 0 or a broadcast AC.
+    let mut out = ClientOutput::new();
+    crate::client::padt(HOST, AC, Vlans::NONE, 0, 1, &mut out);
+    crate::client::padt(HOST, Mac::BROADCAST, Vlans::NONE, 7, 1, &mut out);
+    assert!(out.frames.is_empty());
+}

@@ -150,9 +150,15 @@ impl Session {
     }
 
     /// RouterOS `dynamic-servers`: learned by DHCP clients with
-    /// `use_peer_dns` (PPPoE `use-peer-dns` joins when it exists).
+    /// `use_peer_dns`, then by PPPoE clients with `use-peer-dns` (G3.9ga).
     pub fn dns_dynamic_servers(&self) -> Vec<IpAddr> {
-        self.dhcp_peer_dns().into_iter().map(IpAddr::V4).collect()
+        let mut out = self.dhcp_peer_dns();
+        for d in self.pppoe_peer_dns() {
+            if !out.contains(&d) {
+                out.push(d);
+            }
+        }
+        out.into_iter().map(IpAddr::V4).collect()
     }
 
     /// What the resolver must use now: the running `/ip dns` and the

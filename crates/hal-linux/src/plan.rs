@@ -77,12 +77,32 @@ pub enum LinkSpec {
         mii_interval_ms: u32,
         min_links: u32,
     },
+    /// PPPoE client (G3.9ga): a veth pair, the link the routes and the
+    /// firewall see and `peer`, the hidden end the relay reads and writes.
+    PppoeOut {
+        peer: String,
+    },
 }
 
 impl LinkSpec {
     /// `None` for physical ports, which already exist and are never created.
     pub fn of(kind: &InterfaceKind) -> Option<Self> {
+        Self::named(None, kind)
+    }
+
+    /// [`LinkSpec::of`] for interface `name`: a PPPoE client's spec names
+    /// its peer, which comes from the interface name.
+    pub fn of_named(name: &IfName, kind: &InterfaceKind) -> Option<Self> {
+        Self::named(Some(name), kind)
+    }
+
+    fn named(name: Option<&IfName>, kind: &InterfaceKind) -> Option<Self> {
         match kind {
+            InterfaceKind::PppoeClient(_) => Some(Self::PppoeOut {
+                peer: name.map_or_else(String::new, |n| {
+                    corerouter_model::pppoe_client::relay_peer(n.as_str())
+                }),
+            }),
             InterfaceKind::Ethernet => None,
             InterfaceKind::Vlan {
                 parent,
@@ -122,6 +142,7 @@ impl LinkSpec {
             Self::Dummy => "dummy",
             Self::Vrf { .. } => "vrf",
             Self::Bond { .. } => "bond",
+            Self::PppoeOut { .. } => "veth",
         }
     }
 }
@@ -143,6 +164,7 @@ impl fmt::Display for LinkSpec {
             Self::Dummy => f.write_str("loopback (dummy)"),
             Self::Vrf { table } => write!(f, "vrf (table {table})"),
             Self::Bond { mode, .. } => write!(f, "bonding ({mode})"),
+            Self::PppoeOut { peer } => write!(f, "pppoe-out (veth, relay end '{peer}')"),
         }
     }
 }
@@ -335,8 +357,11 @@ fn depth(cfg: &Config, name: &IfName) -> usize {
 fn doomed(from: &Config, to: &Config) -> Result<BTreeSet<IfName>, HalError> {
     let mut out = BTreeSet::new();
     for (name, old) in &from.interfaces {
-        let old_spec = LinkSpec::of(&old.kind);
-        let new_spec = to.interfaces.get(name).map(|i| LinkSpec::of(&i.kind));
+        let old_spec = LinkSpec::of_named(&old.name, &old.kind);
+        let new_spec = to
+            .interfaces
+            .get(name)
+            .map(|i| LinkSpec::of_named(&i.name, &i.kind));
         match (&old_spec, &new_spec) {
             (None, Some(Some(s))) => {
                 return Err(HalError::Rejected(format!(
@@ -402,7 +427,7 @@ fn plan_whole(from: &Config, to: &Config) -> Result<Vec<Op>, HalError> {
     let fresh: BTreeSet<&IfName> = to
         .interfaces
         .values()
-        .filter(|i| LinkSpec::of(&i.kind).is_some())
+        .filter(|i| LinkSpec::of_named(&i.name, &i.kind).is_some())
         .filter(|i| !from.interfaces.contains_key(&i.name) || doomed.contains(&i.name))
         .map(|i| &i.name)
         .collect();
@@ -475,7 +500,7 @@ fn plan_whole(from: &Config, to: &Config) -> Result<Vec<Op>, HalError> {
         if let Some(spec) = from
             .interfaces
             .get(name)
-            .and_then(|i| LinkSpec::of(&i.kind))
+            .and_then(|i| LinkSpec::of_named(&i.name, &i.kind))
         {
             ops.push(Op::DeleteLink {
                 link: name.clone(),
@@ -488,7 +513,11 @@ fn plan_whole(from: &Config, to: &Config) -> Result<Vec<Op>, HalError> {
     let mut adds: Vec<&IfName> = fresh.iter().copied().collect();
     adds.sort_by_key(|n| depth(to, n));
     for name in adds {
-        if let Some(spec) = to.interfaces.get(name).and_then(|i| LinkSpec::of(&i.kind)) {
+        if let Some(spec) = to
+            .interfaces
+            .get(name)
+            .and_then(|i| LinkSpec::of_named(&i.name, &i.kind))
+        {
             ops.push(Op::CreateLink {
                 link: name.clone(),
                 spec,
@@ -504,8 +533,8 @@ fn plan_whole(from: &Config, to: &Config) -> Result<Vec<Op>, HalError> {
         let old = from
             .interfaces
             .get(&new.name)
-            .and_then(|i| LinkSpec::of(&i.kind));
-        let (Some(old), Some(spec)) = (old, LinkSpec::of(&new.kind)) else {
+            .and_then(|i| LinkSpec::of_named(&i.name, &i.kind));
+        let (Some(old), Some(spec)) = (old, LinkSpec::of_named(&new.name, &new.kind)) else {
             continue;
         };
         if bond_in_place(&old, &spec).is_some_and(|s| !s.is_empty()) {
@@ -703,7 +732,11 @@ pub fn repair(cfg: &Config, have: &Snapshot) -> Vec<Op> {
     let mut adds: Vec<&IfName> = fresh.iter().copied().collect();
     adds.sort_by_key(|n| depth(cfg, n));
     for name in adds {
-        if let Some(spec) = cfg.interfaces.get(name).and_then(|i| LinkSpec::of(&i.kind)) {
+        if let Some(spec) = cfg
+            .interfaces
+            .get(name)
+            .and_then(|i| LinkSpec::of_named(&i.name, &i.kind))
+        {
             ops.push(Op::CreateLink {
                 link: name.clone(),
                 spec,

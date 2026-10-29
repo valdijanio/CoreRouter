@@ -36,6 +36,10 @@ pub(crate) struct Badges {
     pub conflicts: u64,
     /// Differences between the config and the router (`kind item`).
     pub drift: Vec<String>,
+    /// PPPoE sessions up on the BNG (G3.9ga: PPP › PPPoE Server).
+    pub ppp_active: Option<u64>,
+    /// PPPoE clients that are down, with why (PPP › PPPoE Client).
+    pub pppoe_down: Vec<String>,
     /// UI time of the last round.
     asked: Cell<Option<f64>>,
 }
@@ -43,6 +47,8 @@ pub(crate) struct Badges {
 /// How bad a badge is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Level {
+    /// A count, nothing wrong (neutral): PPPoE sessions up.
+    Info,
     /// Worth a look (amber).
     Notice,
     /// Broken, needs the operator (red).
@@ -97,6 +103,27 @@ impl Badges {
                 },
             );
         }
+        if let Some(n) = self.ppp_active.filter(|n| *n > 0) {
+            out.insert(
+                crate::ppp::WIN,
+                Badge {
+                    level: Level::Info,
+                    // The number alone: "PPPoE Server (BNG)" leaves no room.
+                    text: n.to_string(),
+                    tip: format!("{n} {}", tr(l, "PPPoE sessions up on this BNG (Active Connections tab).")),
+                },
+            );
+        }
+        if !self.pppoe_down.is_empty() {
+            out.insert(
+                crate::pppoe_client::WIN,
+                Badge {
+                    level: Level::Notice,
+                    text: self.pppoe_down.len().to_string(),
+                    tip: format!("{}\n{}", tr(l, "PPPoE clients down:"), listed(&self.pppoe_down)),
+                },
+            );
+        }
         if !self.drift.is_empty() {
             out.insert(
                 "history",
@@ -124,16 +151,18 @@ impl PanelState for Badges {
         }
         self.asked.set(Some(now));
         [
-            ("services", "system.service.print"),
-            ("dhcp", "ip.dhcp-server.statistics.print"),
-            ("drift", "config.drift.list"),
+            ("services", "system.service.print", Value::Null),
+            ("dhcp", "ip.dhcp-server.statistics.print", Value::Null),
+            ("drift", "config.drift.list", Value::Null),
+            ("ppp", "ppp.active.list", serde_json::json!({"limit": 1})),
+            ("pppoe-client", "interface.pppoe-client.list", Value::Null),
         ]
         .into_iter()
-        .filter(|(_, c)| app.has_command(c))
-        .map(|(key, command)| Query {
+        .filter(|(_, c, _)| app.has_command(c))
+        .map(|(key, command, params)| Query {
             key,
             command,
-            params: Value::Null,
+            params,
         })
         .collect()
     }
@@ -147,6 +176,23 @@ impl PanelState for Badges {
                     .flatten()
                     .filter(|s| s.get("state").and_then(Value::as_str) == Some("failed"))
                     .map(|s| text(s, "name"))
+                    .collect();
+            }
+            "ppp" => self.ppp_active = value.get("total").and_then(Value::as_u64),
+            "pppoe-client" => {
+                self.pppoe_down = value
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|c| matches!(text(c, "status").as_str(), "disconnected" | "error"))
+                    .map(|c| {
+                        let why = c
+                            .pointer("/last_down/reason")
+                            .and_then(Value::as_str)
+                            .map(crate::pppoe_client::reason_label)
+                            .unwrap_or("down");
+                        format!("{} ({why})", text(c, "name"))
+                    })
                     .collect();
             }
             "dhcp" => {

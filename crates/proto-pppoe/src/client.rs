@@ -23,6 +23,9 @@ pub struct ClientConfig {
     pub vlans: Vlans,
     /// Service-Name to ask for (empty = any).
     pub service_name: Vec<u8>,
+    /// Only offers from the AC with this AC-Name (RouterOS `ac-name`;
+    /// empty = the first offer).
+    pub ac_name: Vec<u8>,
     /// Host-Uniq (RFC 2516 §5.1, to match replies to this host).
     pub host_uniq: Option<Vec<u8>>,
     pub username: Vec<u8>,
@@ -30,6 +33,8 @@ pub struct ClientConfig {
     /// Authentication protocols we agree to.
     pub auth: AuthSet,
     pub mru: u16,
+    /// Largest MRU of the BNG we send to (RouterOS `max-mtu`).
+    pub mtu: u16,
     /// RFC 4638 PPP-Max-Payload to ask for.
     pub max_payload: Option<u16>,
     pub want_dns: bool,
@@ -62,11 +67,13 @@ impl Default for ClientConfig {
             ifindex: 1,
             vlans: Vlans::NONE,
             service_name: Vec::new(),
+            ac_name: Vec::new(),
             host_uniq: None,
             username: b"user".to_vec(),
             password: "pass".into(),
             auth: AuthSet::routeros_default(),
             mru: DEFAULT_MRU,
+            mtu: DEFAULT_MRU,
             max_payload: None,
             want_dns: true,
             ipv6: false,
@@ -134,6 +141,10 @@ pub struct Client {
     cfg: ClientConfig,
     phase: ClientPhase,
     ac_mac: Mac,
+    /// AC-Name of the offer taken.
+    ac_name: Option<Box<[u8]>>,
+    /// What the BNG said when it refused the login (PAP Nak, CHAP Failure).
+    auth_message: Option<String>,
     sid: u16,
     cookie: Option<Box<[u8]>>,
     relay: Option<Box<[u8]>>,
@@ -210,9 +221,10 @@ macro_rules! cfsm {
 impl Client {
     pub fn new(cfg: ClientConfig, seed: [u8; 32]) -> Client {
         let mut rng = Rng::new(seed);
-        let mru = match cfg.max_payload {
-            Some(p) if p > DEFAULT_MRU => p,
-            _ => cfg.mru.min(DEFAULT_MRU),
+        // RFC 2516 §7: at most 1492 each way, more only with RFC 4638.
+        let (mru, mtu) = match cfg.max_payload {
+            Some(p) if p > DEFAULT_MRU => (p, p),
+            _ => (cfg.mru.min(DEFAULT_MRU), cfg.mtu.min(DEFAULT_MRU)),
         };
         let magic = rng.nonzero_u32();
         let mut iid = rng.array::<8>();
@@ -225,13 +237,15 @@ impl Client {
         let v6seed = rng.nonzero_u32();
         Client {
             lcp: Fsm::new(rng.u32() as u8),
-            lcp_l: Lcp::new(Role::Client, mru, mru, cfg.auth, magic),
+            lcp_l: Lcp::new(Role::Client, mru, mtu, cfg.auth, magic),
             ipcp: Fsm::new(1),
             ipcp_l: Ipcp::client(cfg.want_dns),
             v6: Fsm::new(1),
             v6_l: Ipv6cp::new(iid, v6seed),
             phase: ClientPhase::Idle,
             ac_mac: Mac::BROADCAST,
+            ac_name: None,
+            auth_message: None,
             sid: 0,
             cookie: None,
             relay: None,
@@ -278,6 +292,41 @@ impl Client {
 
     pub fn config(&self) -> &ClientConfig {
         &self.cfg
+    }
+
+    /// The BNG's MAC once an offer was taken (broadcast before).
+    pub fn ac_mac(&self) -> Mac {
+        self.ac_mac
+    }
+
+    /// AC-Name of the offer taken.
+    pub fn ac_name(&self) -> Option<&[u8]> {
+        self.ac_name.as_deref()
+    }
+
+    /// The BNG's IPCP address (the peer of the point-to-point link).
+    pub fn peer_ipv4(&self) -> Option<Ipv4Addr> {
+        self.ipcp_l.peer.filter(|a| !a.is_unspecified())
+    }
+
+    /// DNS servers IPCP gave (RFC 1877).
+    pub fn dns(&self) -> [Option<Ipv4Addr>; 2] {
+        self.ipcp_l.dns
+    }
+
+    /// (MTU, MRU) of the link: the BNG's MRU we send within, and ours.
+    pub fn mtu_mru(&self) -> (u16, u16) {
+        (self.lcp_l.peer_mru, self.lcp_l.our_mru)
+    }
+
+    /// The protocol the BNG asked us to authenticate with (`None`: none).
+    pub fn auth_proto(&self) -> Option<AuthProto> {
+        self.auth
+    }
+
+    /// What the BNG said when it refused the login, printable and short.
+    pub fn auth_message(&self) -> Option<&str> {
+        self.auth_message.as_deref()
     }
 
     fn link(&self) -> Link {
@@ -452,7 +501,12 @@ impl Client {
                 if !svc.is_empty() && d.tags.service_name != Some(svc.as_slice()) {
                     return;
                 }
+                let ac = &self.cfg.ac_name;
+                if !ac.is_empty() && d.tags.ac_name != Some(ac.as_slice()) {
+                    return;
+                }
                 self.ac_mac = d.src;
+                self.ac_name = d.tags.ac_name.map(Into::into);
                 self.cookie = d.tags.ac_cookie.map(Into::into);
                 self.relay = d.tags.relay_session_id.map(Into::into);
                 self.phase = ClientPhase::Requesting;
@@ -665,7 +719,11 @@ impl Client {
                 self.auth_deadline = 0;
                 self.network(now, out);
             }
-            (proto::PAP, ac::PAP_NAK) if pkt.id == self.auth_id => self.auth_failed(now, out),
+            (proto::PAP, ac::PAP_NAK) if pkt.id == self.auth_id => {
+                // RFC 1334 §2.2.2: Msg-Length, then the message.
+                self.auth_message = printable(pkt.data.get(1..).unwrap_or_default());
+                self.auth_failed(now, out)
+            }
             (proto::CHAP, ac::CHAP_CHALLENGE) => {
                 let Ok(v) = ChapValue::parse(pkt.data) else {
                     return;
@@ -751,6 +809,8 @@ impl Client {
                 self.network(now, out);
             }
             (proto::CHAP, ac::CHAP_FAILURE) if self.answered.iter().any(|a| a.0 == pkt.id) => {
+                // RFC 1994 §4.2: the Message field (MS-CHAP: E=… R=… M=text).
+                self.auth_message = printable(pkt.data);
                 self.auth_failed(now, out)
             }
             _ => {}
@@ -870,6 +930,42 @@ impl Client {
             let s = cfsm!(self, now, out, v6, v6_l, |f, c, l| f.timeout(&mut c, l));
             self.ncp_signals(now, out, true, s);
         }
+    }
+}
+
+/// Longest message kept from the BNG.
+const MAX_AUTH_MESSAGE: usize = 120;
+
+/// `raw` as text without control characters, cut at [`MAX_AUTH_MESSAGE`];
+/// `None` when nothing printable is left (hostile input).
+fn printable(raw: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(raw);
+    // MS-CHAP failure packets (RFC 2759 §6): `E=691 R=0 C=… V=3 M=<text>`;
+    // the operator wants the text.
+    let text = match text.find("M=") {
+        Some(i) if text.starts_with("E=") => text.get(i + 2..).unwrap_or_default().to_owned(),
+        _ => text.into_owned(),
+    };
+    let t: String = text
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_AUTH_MESSAGE)
+        .collect();
+    let t = t.trim();
+    (!t.is_empty()).then(|| t.to_owned())
+}
+
+/// A PADT for session `sid` from `src` to the AC `ac` (RFC 2516 §5.5),
+/// as one frame in `out`. A CPE that restarts sends it for the session it
+/// had, so the BNG frees it at once instead of after its keepalive.
+pub fn padt(src: Mac, ac: Mac, vlans: Vlans, sid: u16, ifindex: u32, out: &mut ClientOutput) {
+    if sid == 0 || !ac.is_unicast() {
+        return;
+    }
+    let start = out.buf.len();
+    let w = DiscoveryWriter::begin(&mut out.buf, ac, src, vlans, Code::Padt, sid);
+    if w.finish().is_ok() {
+        out.push_frame(ifindex, start);
     }
 }
 

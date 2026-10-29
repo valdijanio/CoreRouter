@@ -71,7 +71,7 @@ fn choice<'a>(p: &'a Value, key: &str, choices: &[&str]) -> Result<Option<&'a st
     }
 }
 
-const ORIGINS: [&str; 4] = ["connected", "static", "dhcp", "ra"];
+const ORIGINS: [&str; 5] = ["connected", "static", "dhcp", "ra", "ppp"];
 
 /// The origins asked for (`static,dhcp`); `None`: all.
 fn origins(p: &Value) -> Result<Option<Vec<Origin>>> {
@@ -85,6 +85,7 @@ fn origins(p: &Value) -> Result<Option<Vec<Origin>>> {
             "static" => Origin::Static,
             "dhcp" => Origin::Dhcp,
             "ra" => Origin::Ra,
+            "ppp" => Origin::Ppp,
             other => {
                 return Err(EngineError::bad(
                     "origin",

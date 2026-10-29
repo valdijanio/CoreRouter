@@ -243,7 +243,9 @@ pub enum InterfaceKind {
         /// Up slaves needed before the bond reports carrier.
         #[serde(default)]
         min_links: u32,
-    },
+    },    /// PPPoE client (G3.9ga, RouterOS type `pppoe-out`): the session's
+    /// netdev, its settings in [`crate::pppoe_client`].
+    PppoeClient(Box<crate::pppoe_client::PppoeClient>),
 }
 
 impl InterfaceKind {
@@ -255,6 +257,7 @@ impl InterfaceKind {
             Self::Loopback => "loopback",
             Self::Vrf { .. } => "vrf",
             Self::Bonding { .. } => "bonding",
+            Self::PppoeClient(_) => "pppoe-out",
         }
     }
 }

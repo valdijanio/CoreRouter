@@ -1271,6 +1271,28 @@ de PADIs de uma volta de energia.
   - as perdas do kernel por socket (`SO_RXQ_OVFL`) e as do canal saem no
     `interface.pppoe-server.monitor` (`rx_dropped`).
 
+### Plano de dados do cliente PPPoE: veth e relé (G3.9ga)
+
+**Comparação** (detalhes e números em `docs/pppoe-client.md` §4, **medido** em 2026-10-29). Na
+VM do laboratório, release, em pps:
+
+| | entrada 64 B | entrada 1400 B | saída |
+|---|---|---|---|
+| kernel `ppp`+`pppoe` | ≥ 0,80 M | 0,79 M | ≥ 0,95 M, limitado pelo gerador |
+| TUN + relé | 0,42 M | 0,71 M | — |
+| veth + relé | 0,26 M | 0,37 M | — |
+
+O relé real, no host, faz 1,1 Mpps na saída e 0,69 Mpps na entrada (≈ 7,9 Gbit/s com 1400 B).
+
+**Decisão: veth e relé `AF_PACKET`, uma thread por sentido.**
+- O kernel `ppp` pede ioctls `unsafe` (`/dev/ppp`). Orquestrar o `pppd` trocaria o nosso
+  `Client` (espera crescente, PADT órfão, motivo da queda, `monitor`) por um processo externo.
+- O TUN pede `TUNSETIFF` (dependência nova) e a interface morre com o daemon.
+- A veth é criada por netlink seguro e mantém a interface entre rediscagens. Ela também deixa o
+  caminho rápido em XDP para depois (G3.9gb), sem ioctl.
+
+**Rever** se uma WAN passar de ~0,7 Mpps na entrada num núcleo, o que é o caso do XDP.
+
 ### Rotas do caminho lento: em lote, numa thread só (G4.3hh)
 
 O caminho lento põe uma rota por assinante para `bng0` (e os blocos e prefixos IPv6). Na tomada do
