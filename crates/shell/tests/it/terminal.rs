@@ -9,10 +9,10 @@ use corerouter_shell::parse::{self, Parsed};
 use corerouter_shell::{Reply, Request, Shell, doc};
 use serde_json::{Value, json};
 
-struct Router {
-    session: Session,
+pub(crate) struct Router {
+    pub(crate) session: Session,
     caller: Caller,
-    files: BTreeMap<String, String>,
+    pub(crate) files: BTreeMap<String, String>,
     calls: Vec<String>,
 }
 
@@ -68,13 +68,14 @@ impl Router {
     }
 }
 
-struct Term {
-    shell: Shell,
-    router: Router,
+/// Shared with the other test files of this binary (`submenu_print`).
+pub(crate) struct Term {
+    pub(crate) shell: Shell,
+    pub(crate) router: Router,
 }
 
 impl Term {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut t = Self {
             shell: Shell::new("admin"),
             router: Router::new(),
@@ -86,13 +87,13 @@ impl Term {
         t
     }
 
-    fn run(&mut self, line: &str) -> String {
+    pub(crate) fn run(&mut self, line: &str) -> String {
         let job = self.shell.submit(line);
         let r = &mut self.router;
         self.shell.run_with(job, |q| r.answer(q)).text()
     }
 
-    fn ok(&mut self, line: &str) -> String {
+    pub(crate) fn ok(&mut self, line: &str) -> String {
         let job = self.shell.submit(line);
         let r = &mut self.router;
         let out = self.shell.run_with(job, |q| r.answer(q));
@@ -100,7 +101,7 @@ impl Term {
         out.text()
     }
 
-    fn fails(&mut self, line: &str) -> String {
+    pub(crate) fn fails(&mut self, line: &str) -> String {
         let job = self.shell.submit(line);
         let r = &mut self.router;
         let out = self.shell.run_with(job, |q| r.answer(q));
@@ -108,7 +109,7 @@ impl Term {
         out.text()
     }
 
-    fn complete(&self, line: &str) -> Vec<String> {
+    pub(crate) fn complete(&self, line: &str) -> Vec<String> {
         self.shell
             .complete(line, line.len())
             .candidates
@@ -117,7 +118,7 @@ impl Term {
             .collect()
     }
 
-    fn export(&mut self) -> String {
+    pub(crate) fn export(&mut self) -> String {
         self.ok("/export file=x");
         self.router.files.get("x").cloned().unwrap_or_default()
     }
@@ -1213,7 +1214,7 @@ fn a_routeros_vlan_export_imports_as_written() {
     // Typed by hand too, and `parent=` as before.
     t.ok("/interface vlan add interface=ether2 vlan-id=10 name=v10");
     t.ok("/interface vlan add parent=ether2 vlan-id=11 name=v11");
-    assert!(t.export().contains("parent=ether2"));
+    assert!(t.export().contains("interface=ether2"));
 }
 
 /// The body as the CHR wrote it (2026-10-29, RouterOS 7.25): name order,

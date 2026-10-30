@@ -81,6 +81,10 @@ name = "gateway_check"
 harness = false
 
 [[bench]]
+name = "firewall_commit"
+harness = false
+
+[[bench]]
 name = "scale"
 harness = false
 

@@ -158,6 +158,33 @@ fn session(
                     .collect()
             })
             .unwrap_or_default(),
+        // G3.9fj: FRR reports `nBit` only for an established session with
+        // the capability on both sides (`bgp_vty.c`,
+        // `bgp_show_neighnor_graceful_restart_flags`).
+        n_bit: gr
+            .and_then(|g| g.get("nBit"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        // G3.9fj, RFC 9494: per family under `gracefulRestartInfo`
+        // (`peer->llgr[afi][safi].stale_time`, what the neighbor sent);
+        // FRR sends the capability with 0 whenever it announces GR.
+        llgr_stale_time: gr
+            .map(|g| {
+                g.values()
+                    .filter_map(|f| f.get("timers")?.get("llgrStaleTime")?.as_u64())
+                    .max()
+                    .unwrap_or(0)
+            })
+            .and_then(|t| u32::try_from(t).ok())
+            .filter(|t| *t > 0),
+        // Only while down: FRR clears `notify.hard_reset` when a
+        // graceful-restart session comes back (`bgp_fsm.c`,
+        // `bgp_peer_process_gr_cap_clear_stale`) and keeps the error code,
+        // so an established session always says false (**medido**).
+        last_hard_reset: n
+            .get("lastNotificationHardReset")
+            .and_then(Value::as_bool)
+            .filter(|_| !established && n.get("lastErrorCodeSubcode").is_some()),
     }
 }
 
@@ -194,11 +221,14 @@ mod tests {
             "ipv6Unicast": {"acceptedPrefixCounter": 5, "sentPrefixCounter": 1}
           },
           "gracefulRestartInfo": {"endOfRibSend": {"ipv4Unicast": true}, "endOfRibRecv": {"ipv4Unicast": true},
-            "localGrMode": "Restart", "remoteGrMode": "Helper", "rBit": false, "nBit": true}
+            "localGrMode": "Restart", "remoteGrMode": "Helper", "rBit": false, "nBit": true,
+            "ipv4Unicast": {"timers": {"llgrStaleTime": 3600, "stalePathTimer": 360}},
+            "ipv6Unicast": {"timers": {"llgrStaleTime": 0}}}
         },
         "192.0.2.6": {
           "remoteAs": 65002, "localAs": 65000, "remoteRouterId": "0.0.0.0",
           "bgpState": "Active", "lastResetDueTo": "Waiting for peer OPEN",
+          "lastErrorCodeSubcode": "0609", "lastNotificationReason": "Cease/Hard Reset", "lastNotificationHardReset": true,
           "messageStats": {"totalSent": 0, "totalRecv": 0}
         }
       }
@@ -222,11 +252,17 @@ mod tests {
             (Some("restart"), Some("helper"))
         );
         assert_eq!(up.end_of_rib_received, ["ipv4"]);
+        assert!(up.n_bit, "RFC 8538 §2");
+        assert_eq!(up.llgr_stale_time, Some(3600), "RFC 9494 §3.1");
         let down = &s[1];
         assert_eq!(
             (down.gr_local.as_deref(), down.end_of_rib_received.len()),
             (None, 0)
         );
+        assert!(!down.n_bit);
+        assert_eq!(down.llgr_stale_time, None);
+        assert_eq!(down.last_hard_reset, Some(true), "RFC 8538 §3");
+        assert_eq!(up.last_hard_reset, None, "established: FRR has cleared it");
         assert_eq!(down.state, "active");
         assert_eq!(down.remote_id, None);
         assert_eq!(down.reason.as_deref(), Some("Waiting for peer OPEN"));

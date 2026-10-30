@@ -61,6 +61,14 @@ mod nic;
 #[cfg(target_os = "linux")]
 mod netlink;
 
+/// How many times `apply` read the kernel's whole route table in this
+/// process (G0.31i): tests check a commit of one route reads none.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn route_dumps() -> u64 {
+    netlink::ROUTE_DUMPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg(target_os = "linux")]
 pub mod nft;
 

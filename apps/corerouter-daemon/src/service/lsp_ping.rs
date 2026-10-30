@@ -14,6 +14,13 @@
 //!   every 2 s to read the plan and at most once a second to publish the
 //!   counters, never around a socket.
 //!
+//! - **ICMP time exceeded (G3.9d):** the same taps hear labeled packets
+//!   whose TTL expires here (the Linux forwarder drops them without an
+//!   error, so traceroute showed `*`); `/mpls settings icmp-ttl-exceeded`
+//!   (default on) sends the error with the RFC 4950 label stack
+//!   (`corerouter_hal::lsp::expired`), behind its own token bucket of
+//!   `icmp-rate` per second, also taken before any work.
+//!
 //! Why one thread: the requests are rare (a few per second when someone
 //! traces, 100/s at the limit), each costs ~10 µs (a cached lookup and an
 //! encode, **estimado**), and a second core would only share the rate
@@ -24,8 +31,9 @@ use std::time::{Duration, Instant};
 
 use corerouter_engine::lsp_responder::{self, Counters, Plan};
 use corerouter_engine::{Shared, lock};
+use corerouter_hal::lsp::expired;
 use corerouter_hal::lsp::respond::{Verdict, respond};
-use corerouter_hal::lsp::{LspResponderIo, wire};
+use corerouter_hal::lsp::{Frame, LspResponderIo, wire};
 use corerouter_model::service::Listen;
 
 /// How often the plan (setting, rate, interfaces) is read again.
@@ -91,6 +99,7 @@ fn run(session: &Shared, health: &super::Health) -> Result<(), String> {
     let mut io: Option<Box<dyn LspResponderIo>> = None;
     let mut counters = Counters::default();
     let mut bucket = Bucket::new(1);
+    let mut icmp_bucket = Bucket::new(1);
     let mut plan: Option<Plan> = None;
     let mut next_plan = Instant::now();
     let mut published = Instant::now();
@@ -114,7 +123,7 @@ fn run(session: &Shared, health: &super::Health) -> Result<(), String> {
                 health.disabled(Some(if p.interfaces.is_empty() {
                     "no interface takes MPLS (mpls.interface / mpls.ldp.interface)"
                 } else {
-                    "lsp_ping_responder=no"
+                    "lsp_ping_responder=no and icmp_ttl_exceeded=no"
                 }));
                 plan = Some(p);
                 if !health.sleep(TICK) {
@@ -154,6 +163,7 @@ fn run(session: &Shared, health: &super::Health) -> Result<(), String> {
             {
                 counters.failed = i.set_interfaces(&p.interfaces);
                 bucket.set_rate(p.rate);
+                icmp_bucket.set_rate(p.icmp_rate);
                 for (name, why) in &counters.failed {
                     health.error(format!("{name}: {why}"));
                 }
@@ -174,8 +184,30 @@ fn run(session: &Shared, health: &super::Health) -> Result<(), String> {
             }
             continue;
         };
+        let (echo, icmp) = plan.as_ref().map_or((false, false), |p| (p.echo, p.icmp));
         match i.recv(WAIT) {
-            Ok(Some(heard)) => {
+            Ok(Some(Frame::Expired(e))) if icmp => {
+                let c = &mut counters.icmp;
+                c.expired += 1;
+                // The bucket first, as for echo replies.
+                if !icmp_bucket.take(Instant::now()) {
+                    c.rate_limited += 1;
+                } else {
+                    match expired::answer(&e, i.view()) {
+                        Ok(a) => match i.send_icmp(&a) {
+                            Ok(()) => c.sent += 1,
+                            Err(err) => {
+                                c.drop("send failed");
+                                c.error = Some(err.to_string());
+                            }
+                        },
+                        Err(why) => c.drop(why),
+                    }
+                }
+            }
+            Ok(Some(Frame::Expired(_))) => {}
+            Ok(Some(Frame::Echo(_))) if !echo => counters.ignored += 1,
+            Ok(Some(Frame::Echo(heard))) => {
                 counters.heard += 1;
                 // The bucket first: a flood costs a counter, nothing more.
                 if !bucket.take(Instant::now()) {

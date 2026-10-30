@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use corerouter_hal::lsp::respond::{Verdict, ddmap_of, respond};
 use corerouter_hal::lsp::wire::{self, Echo, Fec, code};
-use corerouter_hal::lsp::{LspPath, LspRequest, LspResponderIo, LspSocket, destination};
+use corerouter_hal::lsp::{Frame, LspPath, LspRequest, LspResponderIo, LspSocket, destination};
 use corerouter_hal::mpls::{MplsNexthop, Origin};
 use corerouter_hal_linux::lsp::{HostLspSocket, HostResponder};
 use corerouter_hal_linux::mpls::available;
@@ -124,7 +124,7 @@ fn responder(stop: Arc<AtomicBool>) -> thread::JoinHandle<u64> {
         .spawn(move || {
             let mut replied = 0;
             while !stop.load(Ordering::Relaxed) {
-                let Some(h) = r.recv(Duration::from_millis(50)).unwrap() else {
+                let Some(Frame::Echo(h)) = r.recv(Duration::from_millis(50)).unwrap() else {
                     continue;
                 };
                 let ntp = r.now_ntp();

@@ -836,6 +836,19 @@ fn preview(s: &mut Session, raw: &Value, what: What) -> Result<Value> {
                             "graceful_restart",
                         ));
                     }
+                    // G3.9fj, RFC 8538 §4: with the N bit a hold timer
+                    // expiry is graceful too, so a silent failure of this
+                    // router leaves its routes on the neighbor for the hold
+                    // time and then the Restart Time; a BFD down is a Hard
+                    // Reset (FRR, Cease 10) and drops them at once.
+                    if eff.bfd.is_none() && inst.and_then(|i| i.graceful_notification) != Some(false) {
+                        checks.push(check(
+                            "warning",
+                            "gr-bfd",
+                            format!("graceful restart without BFD: with the N bit (RFC 8538, on by default) a silent failure of this router (power, cut link) leaves our routes on the neighbor for the hold time ({hold} s) plus the Restart Time ({rt} s); set a BFD profile (a BFD down drops them at once) or turn graceful_notification off on the instance"),
+                            "bfd",
+                        ));
+                    }
                     checks.push(check(
                         "info",
                         "graceful-restart",
@@ -1203,6 +1216,14 @@ mod tests {
         assert!(v["checks"].to_string().contains("gr-restart-time"), "Restart Time 90 s ≥ hold 60 s: {v}");
         let v = s.execute("routing.bgp.connection.check", &json!({"id": "up1"})).unwrap();
         assert!(v["checks"].to_string().contains("\"graceful-restart\"") && !v["checks"].to_string().contains("gr-restart-time"), "{v}");
+        // G3.9fj, RFC 8538: without BFD a silent failure keeps the routes
+        // hold + Restart Time; with a BFD profile, or without the N bit, no warning.
+        assert!(v["checks"].to_string().contains("gr-bfd"), "{v}");
+        let v = s.execute("routing.bgp.connection.check", &json!({"id": "up1", "bfd": "default"})).unwrap();
+        assert!(!v["checks"].to_string().contains("gr-bfd"), "{v}");
+        s.execute("routing.bgp.instance.set", &json!({"asn": 65000, "router_id": "10.0.0.1", "graceful_notification": false})).unwrap();
+        let v = s.execute("routing.bgp.connection.check", &json!({"id": "up1"})).unwrap();
+        assert!(!v["checks"].to_string().contains("gr-bfd"), "{v}");
         let e = s.execute("routing.bgp.connection.set", &json!({"id": "up1", "graceful_restart": "maybe"})).unwrap_err();
         assert!(e.to_string().contains("true or false"), "{e}");
     }
