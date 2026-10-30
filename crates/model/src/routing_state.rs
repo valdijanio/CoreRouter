@@ -98,4 +98,7 @@ pub struct RoutingStatus {
     pub ospf_neighbors: Vec<crate::ospf_state::OspfNeighbor>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ospf_interfaces: Vec<crate::ospf_state::OspfIfState>,
+    /// G3.9c: the stub router state of each instance (RFC 6987).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ospf_stub: Vec<crate::ospf_state::OspfStubState>,
 }

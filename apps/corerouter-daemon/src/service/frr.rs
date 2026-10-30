@@ -142,9 +142,18 @@ fn run(session: &Shared, mut reader: Box<dyn RoutingReader>, synced: bool, healt
                             health.error(e.to_string());
                         }
                     }
+                    // G3.9c: stub router (one more small answer each).
+                    match reader.ospf_stub_state(&cfg) {
+                        Ok(st) => status.ospf_stub = st,
+                        Err(e) => {
+                            status.error = Some(e.to_string());
+                            health.error(e.to_string());
+                        }
+                    }
                 } else {
                     status.ospf_neighbors.clear();
                     status.ospf_interfaces.clear();
+                    status.ospf_stub.clear();
                 }
             }
             Err(e) => {
@@ -156,6 +165,7 @@ fn run(session: &Shared, mut reader: Box<dyn RoutingReader>, synced: bool, healt
                 status.bgp_sessions.clear();
                 status.ospf_neighbors.clear();
                 status.ospf_interfaces.clear();
+                status.ospf_stub.clear();
                 health.error(e.to_string());
             }
         }

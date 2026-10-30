@@ -108,6 +108,29 @@ impl Session {
         }
     }
 
+    /// G3.9c: the stub router state of each instance: the last poll, or
+    /// in the virtual lab what the config asks for (`on-startup` counts as
+    /// over: the lab has no start to count from).
+    pub fn ospf_stub_live(&self) -> (Vec<corerouter_model::ospf_state::OspfStubState>, &'static str) {
+        if self.has_routing() {
+            return (self.routing_status().map(|s| s.ospf_stub.clone()).unwrap_or_default(), "frr");
+        }
+        let rows = self
+            .store()
+            .running()
+            .routing
+            .ospf
+            .instances
+            .values()
+            .map(|i| corerouter_model::ospf_state::OspfStubState {
+                instance: i.name.clone(),
+                admin: i.stub_router && !i.disabled,
+                ..Default::default()
+            })
+            .collect();
+        (rows, "virtual lab sample")
+    }
+
     /// The neighbors and interfaces: the last poll, or the lab's.
     pub fn ospf_live(&self) -> (Vec<OspfNeighbor>, Vec<OspfIfState>, &'static str) {
         if self.has_routing() {
