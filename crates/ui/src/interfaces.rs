@@ -641,7 +641,15 @@ impl CoreRouterUi {
                 Some((name.clone(), on))
             })
             .collect();
+        // G1.29g: "Adopt" on a port outside the configuration.
+        let adopt: Vec<String> = nic
+            .iter_mut()
+            .filter_map(|(name, v)| std::mem::take(&mut v.adopt_go).then(|| name.clone()))
+            .collect();
         self.nic = nic;
+        for name in adopt {
+            self.run("interface.ethernet.adopt", json!({"name": name}));
+        }
         for (name, level) in usb {
             self.run("interface.usb.reset", json!({"name": name, "level": level}));
         }
@@ -1164,6 +1172,10 @@ fn dialog_body(
         toggle_label = Some(if i.disabled { "Enable" } else { "Disable" });
         iface_tabs::tab_bar(ui, &mut p.tab, nic.get(&p.name));
         let view = nic.get_mut(&p.name);
+        let view = view.map(|v| {
+            v.unmanaged = i.unmanaged.clone();
+            v
+        });
         iface_tabs::body(ui, p.tab, view, can, help, |ui, view, help| {
             // A fixed label column: the fields do not move while the
             // window settles (or when the MAC rows arrive).
