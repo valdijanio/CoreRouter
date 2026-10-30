@@ -9285,3 +9285,44 @@ continuação indentadas).
     - a instalação num disco de 300 MiB.
   - Na VM: com ela desligada, `qemu-img resize vm/corerouter-teste.qcow2 2G`, depois dois boots;
     o log do boot mostra "partition grown" e depois "growing the filesystem".
+
+- 2026-10-30 — G1.3g: Boot parcial por rota (segunda parte da G1.3g, escolha do usuário: opção "uma a uma"). O
+  rtnetlink não tem checagem a seco, e a seção `routes` recusada pela G1.3e ficava de fora
+  inteira. Agora:
+
+  - `Hal::apply_routes_each` (novo, `crates/hal`; o padrão é `Unsupported`, que leva ao
+    comportamento da G1.3e). No `hal-linux`, as rotas que `to` tem e `from` não têm vão numa sessão
+    netlink só, uma operação por vez, **sem rollback** (`netlink::apply_each`). Cada rota que o
+    kernel aceita entra uma vez e fica; a recusada não tira as outras.
+    - Só quando nada além de rotas adicionadas separa os dois lados (o plano só tem `AddRoute`/
+      `AddDiscard`); senão, `Unsupported` e o `apply` de sempre, tudo ou nada.
+    - Como no `apply`, nunca uma rota por um link de outro programa.
+    - A rota do kernel recusada vira as rotas da config para aquele destino naquela tabela (um
+      grupo ECMP é uma rota no kernel).
+  - Engine (`boot_apply.rs`): no boot e no retry, a seção `routes` vai direto por esse caminho, sem
+    a tentativa inteira antes, para nenhuma metade subir e cair. A rota recusada fica desligada no
+    que o plano de dados tem e aparece:
+    - em `storage.boot_apply_failed` e no `auth.whoami` (`{section: routes, item: "*N", error}`);
+    - na saúde (`boot.apply` = `routes *N`);
+    - no aviso da CLI/MCP e no selo da GUI;
+    - no `ip.route.list`, com flag I, `invalid` e `invalid_reason` (o params doc foi atualizado).
+  - O campo do item no `boot_apply_failed` passou de `rule` (só firewall) a `item` (regra ou rota).
+  - Máscara de item, não de seção: com uma rota de fora, o commit e os caminhos laterais só a
+    desligam, em vez de copiar a seção do que está aplicado. Por isso as rotas de um lease DHCP
+    entram com uma rota estática de fora. O commit que muda ou tira a rota recusada a tenta de novo,
+    tudo ou nada.
+
+  Como testar:
+
+  - `cargo test -p corerouter-engine --test it boot_routes`: só a rota recusada fica de fora (flag
+    I, `invalid_reason`, saúde); commit com uma rota de fora; lease DHCP com uma rota de fora.
+  - Kernel real: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
+    corerouter-hal-linux --test netns_routes_each`. Outro programa tem a mesma rota com a mesma
+    métrica: o `apply` inteiro é recusado e desfaz tudo; uma a uma, só a recusada fica de fora, as
+    outras ficam no kernel e a do outro programa não é tocada.
+
+  Desempenho e paralelismo: o executor já mandava as rotas uma por uma, então o caminho uma a uma
+  custa o mesmo que o `apply` inteiro (10 000 rotas: 229 ms contra 236 ms, release, **medido**,
+  abaixo) e dispensa a tentativa inteira e o seu rollback. O mapa rota do kernel → rota da config só
+  é montado quando há recusa (por id, O(n)). Nada a dividir: o kernel serializa o rtnetlink por
+  netns, e as rotas dependem dos endereços já aplicados.

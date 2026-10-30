@@ -2953,3 +2953,13 @@ slow_checking_many_rules_with_one_bad`, kernel do host:
 A checagem com erro custa o mesmo que o `apply` recusado: é o replay do kernel validando a
 tabela inteira a cada regra (O(n²)); um erro de mensagem (módulo ausente, `ENOENT`) não faz
 replay.
+
+### G1.3g: rotas uma a uma no boot (2026-10-30, **medido**)
+
+Netns sem root, `cargo test --release -p corerouter-hal-linux --test netns_routes_each
+slow_ten_thousand_routes_one_refused`, kernel do host:
+
+| 10 000 rotas `/24`, 1 recusada | release |
+|---|---|
+| `apply` inteiro (todas aceitas) | 236 ms |
+| `apply_routes_each` (1 recusada, as outras ficam) | 229 ms |
