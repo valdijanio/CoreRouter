@@ -494,11 +494,19 @@ case_padt() {
   pc_up c1
   wait_for 30 pc_running c1 >/dev/null && wait_for 10 cr_up cpe1 >/dev/null || { result padt FAIL "no session"; return; }
   # BNG → CPE: ppp.active.remove sends PADT (and LCP Terminate-Request).
-  local id ms; id=$(cr_row cpe1 | jq -r .id)
-  cli ppp.active.remove "{\"id\":\"$id\"}" >/dev/null || cli ppp.active.remove "{\"name\":\"cpe1\"}" >/dev/null || true
-  ms=$(wait_for 20 pc_not_running c1) \
-    && result padt OK "BNG removes the session: CHR saw it down in ${ms} ms (keepalive 60 s, so by Terminate/PADT)" \
-    || result padt FAIL "BNG removed the session, CHR still up after 20 s"
+  local id ms rm before; id=$(cr_row cpe1 | jq -r .id)
+  before=$(cli ppp.active.list '{"find":"cpe1"}' | jq -c '[.rows[] | {id, session_id, uptime_secs}]')
+  timeout 25 tcpdump -i crgv1 -nn -e -l 'pppoed or (pppoes and ppp proto 0xc021)' > "$W/padt-wire.txt" 2>/dev/null &
+  local tcpd=$!; sleep 1
+  rm=$(cli ppp.active.remove "{\"id\":\"$id\"}" 2>&1) || rm=$(cli ppp.active.remove '{"name":"cpe1"}' 2>&1) || true
+  if ms=$(wait_for 20 pc_not_running c1); then
+    result padt OK "BNG removes the session: CHR saw it down in ${ms} ms (keepalive 60 s, so by Terminate/PADT)"
+  else
+    result padt FAIL "BNG removed the session, CHR still up after 20 s"
+    result padt INFO "cpe1 before: $before; remove: ${rm:0:200}; after: $(cli ppp.active.list '{"find":"cpe1"}' | jq -c '[.rows[] | {id, session_id, uptime_secs}]'); CHR c1 $(pc_mon c1 | jq -c '{status, uptime, "session-id"}' 2>/dev/null)"
+  fi
+  kill "$tcpd" 2>/dev/null; wait "$tcpd" 2>/dev/null || true
+  result padt INFO "on the wire after the remove: $(grep -cE 'PADT' "$W/padt-wire.txt") PADT, $(grep -c 'Terminate' "$W/padt-wire.txt") LCP Terminate: $(grep -E 'PADT|Terminate' "$W/padt-wire.txt" | head -4 | tr -s ' ' | cut -c1-160 | paste -sd'|')"
   # RouterOS redials on its own; wait for it, then CPE → BNG.
   wait_for 40 pc_running c1 >/dev/null && wait_for 10 cr_up cpe1 >/dev/null || { result padt INFO "CHR did not redial in 40 s"; pc_up c1; wait_for 30 cr_up cpe1 >/dev/null; }
   local t0; t0=$(now_ms)
