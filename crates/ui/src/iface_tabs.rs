@@ -145,6 +145,10 @@ pub(crate) struct NicView {
     pub(crate) reset: bool,
     /// Why the last Ethernet-tab action failed.
     pub(crate) action_error: Option<String>,
+    /// G1.29c: a USB recovery level picked, waiting for the confirmation.
+    pub(crate) usb_ask: Option<&'static str>,
+    /// G1.29c: a confirmed USB recovery level, sent by the dialog.
+    pub(crate) usb_go: Option<&'static str>,
 }
 
 impl NicView {
@@ -502,7 +506,7 @@ pub(crate) fn body(
                 Tab::Ethernet => ethernet_tab::ethernet(ui, view, can),
                 Tab::Status => status(ui, view),
                 Tab::Sfp => ethernet_tab::sfp(ui, view),
-                Tab::Hardware => hardware(ui, view, help),
+                Tab::Hardware => hardware(ui, view, can, help),
                 Tab::Traffic => traffic(ui, view),
                 Tab::Stats => statistics(ui, view),
             }
@@ -645,10 +649,11 @@ fn status(ui: &mut Ui, view: &NicView) {
     notes(ui, m);
 }
 
-fn hardware(ui: &mut Ui, view: &NicView, help: &mut Option<(&'static str, &'static str)>) {
-    let Some(h) = loaded(ui, &view.hardware) else {
+fn hardware(ui: &mut Ui, view: &mut NicView, can: &Avail, help: &mut Option<(&'static str, &'static str)>) {
+    let Some(h) = loaded(ui, &view.hardware).cloned() else {
         return;
     };
+    let h = &h;
     let named = |name: &str, id: &str| match (text(h, name), text(h, id)) {
         (Some(n), Some(i)) => Some(format!("{n} [{i}]")),
         (n, i) => n.or(i),
@@ -660,6 +665,7 @@ fn hardware(ui: &mut Ui, view: &NicView, help: &mut Option<(&'static str, &'stat
     // G1.29b: on a USB adapter, the USB part first (it is what limits it).
     if let Some(u) = h.get("usb").filter(|u| u.is_object()) {
         usb_section(ui, u, help);
+        usb_recovery(ui, u, view, can, help);
         ui.add_space(6.0);
     }
     Grid::new("iface-hw")
@@ -828,6 +834,74 @@ fn usb_section(ui: &mut Ui, u: &Value, help: &mut Option<(&'static str, &'static
         ui.add_space(4.0);
         ui.add(egui::Label::new(RichText::new(a).color(crate::chip::AMBER.tone(ui.visuals()).ink)).wrap());
     }
+}
+
+/// The three recovery levels: (command level, button, what it costs).
+const USB_LEVELS: [(&str, &str, &str); 3] = [
+    ("link", "Down/Up", "The interface goes down and up: about 1 s without link."),
+    ("driver", "Restart Driver", "The driver lets go of the adapter and probes it again: about 3 s without link; its configuration goes back on by itself."),
+    ("port", "Reset USB Port", "The USB port is powered off and on (or the device re-authorized): about 5 s without link; its configuration goes back on by itself."),
+];
+
+/// G1.29c: the recoveries so far and the three buttons, each confirmed
+/// inline before it is sent (by the dialog, through `usb_go`).
+fn usb_recovery(
+    ui: &mut Ui,
+    u: &Value,
+    view: &mut NicView,
+    can: &Avail,
+    help: &mut Option<(&'static str, &'static str)>,
+) {
+    let r = u.get("recoveries").cloned().unwrap_or(Value::Null);
+    let n = |k: &str| r.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let mut text = format!("{} link · {} driver · {} port", n("link"), n("driver"), n("port"));
+    if let Some(running) = text_of(&r, "running") {
+        text = format!("{text} · {running} reset running…");
+    } else if let Some(e) = text_of(&r, "last_error") {
+        text = format!("{text} · last failed: {e}");
+    } else if let Some(last) = text_of(&r, "last_level") {
+        let back = r.get("last_back").and_then(Value::as_bool) == Some(true);
+        text = format!("{text} · last: {last}, {}", if back { "came back" } else { "did not come back" });
+    }
+    Grid::new("iface-usb-recovery")
+        .num_columns(2)
+        .spacing([12.0, 4.0])
+        .show(ui, |ui| usb_row(ui, "Recoveries", "iface_usb.recoveries", Some(text), help));
+    let running = r.get("running").is_some_and(|v| !v.is_null());
+    let allowed = can.check("interface.usb.reset");
+    ui.horizontal(|ui| {
+        for (level, label, cost) in USB_LEVELS {
+            let enabled = allowed.is_ok() && !running && view.usb_ask.is_none();
+            let resp = ui.add_enabled(enabled, egui::Button::new(label));
+            let resp = match &allowed {
+                Err(why) => resp.on_disabled_hover_text(why.as_str()),
+                Ok(()) => resp.on_hover_text(cost),
+            };
+            if resp.clicked() {
+                view.usb_ask = Some(level);
+            }
+        }
+        if crate::help::info_button(ui, ui.scope_id().with("iface_usb.recovery"), "Recovering a stalled USB adapter").clicked() {
+            *help = Some(("iface_usb.recovery", "USB recovery"));
+        }
+    });
+    if let Some(level) = view.usb_ask {
+        let (_, label, cost) = USB_LEVELS.iter().find(|(l, _, _)| *l == level).copied().unwrap_or(("", "", ""));
+        ui.label(RichText::new(format!("{label}? {cost}")).color(crate::chip::AMBER.tone(ui.visuals()).ink));
+        ui.horizontal(|ui| {
+            if ui.button("Confirm").clicked() {
+                view.usb_go = Some(level);
+                view.usb_ask = None;
+            }
+            if ui.button("Cancel").clicked() {
+                view.usb_ask = None;
+            }
+        });
+    }
+}
+
+fn text_of(v: &Value, key: &str) -> Option<String> {
+    v.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
 /// Driver notes (what was not supported and why), folded.

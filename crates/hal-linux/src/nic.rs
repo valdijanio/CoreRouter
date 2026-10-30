@@ -360,6 +360,144 @@ fn usb_lpm(dev: &Path, port: Option<&Path>) -> Option<String> {
     }
 }
 
+/// A manual recovery of a USB adapter (G1.29c), on a task thread. `usb`
+/// is `/sys/bus/usb` and `net` `/sys/class/net` (a fake tree in tests).
+pub(crate) struct LinuxUsbReset {
+    pub(crate) name: String,
+    pub(crate) mac: Option<String>,
+    /// The USB interface the network device sits on (`2-1:1.0`).
+    pub(crate) intf: String,
+    pub(crate) level: hnic::UsbResetLevel,
+    pub(crate) usb: PathBuf,
+    pub(crate) net: PathBuf,
+}
+
+/// How long the adapter has to come back under its name (enumeration,
+/// probe, PID 1's rename).
+const BACK_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
+
+impl LinuxUsbReset {
+    /// Writes `value` to a sysfs attribute (the kernel acts on the write).
+    fn write(&self, path: &Path, value: &str, steps: &mut Vec<String>) -> Result<(), HalError> {
+        fs::write(path, value)
+            .map_err(|e| HalError::Io(format!("{}: {e} (writing {value:?})", path.display())))?;
+        steps.push(format!("{} ← {value}", path.display()));
+        Ok(())
+    }
+
+    /// The interface is there again, with the adapter's address.
+    fn back(&self) -> bool {
+        let dir = self.net.join(&self.name);
+        match &self.mac {
+            Some(mac) => {
+                read_trim(&dir.join("address")).is_some_and(|a| a.eq_ignore_ascii_case(mac))
+            }
+            None => dir.is_dir(),
+        }
+    }
+
+    fn wait_back(&self, wait: &dyn Fn(std::time::Duration) -> bool) -> bool {
+        let step = std::time::Duration::from_millis(250);
+        let mut waited = std::time::Duration::ZERO;
+        while waited < BACK_WITHIN {
+            if self.back() {
+                return true;
+            }
+            if !wait(step) {
+                return false;
+            }
+            waited += step;
+        }
+        self.back()
+    }
+}
+
+impl hnic::UsbReset for LinuxUsbReset {
+    fn run(
+        &mut self,
+        wait: &dyn Fn(std::time::Duration) -> bool,
+    ) -> Result<hnic::UsbResetReport, HalError> {
+        use hnic::UsbResetLevel as L;
+        let mut r = hnic::UsbResetReport::default();
+        let sec = |n: u64| std::time::Duration::from_secs(n);
+        match self.level {
+            L::Link => {
+                let link: corerouter_model::IfName = self.name.parse().map_err(|_| {
+                    HalError::Rejected(format!("bad interface name '{}'", self.name))
+                })?;
+                let owned = std::collections::BTreeSet::new();
+                let op = |up| crate::plan::Op::SetUp {
+                    link: link.clone(),
+                    up,
+                };
+                crate::netlink::apply(&[op(false)], &owned)?;
+                r.steps.push(format!("{} down", self.name));
+                wait(sec(1));
+                crate::netlink::apply(&[op(true)], &owned)?;
+                r.steps.push(format!("{} up", self.name));
+            }
+            L::Driver => {
+                let dir = self.usb.join("devices").join(&self.intf);
+                let driver = fs::read_link(dir.join("driver"))
+                    .ok()
+                    .and_then(|l| l.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .filter(|d| safe(d))
+                    .ok_or_else(|| HalError::Rejected(format!("{}: no driver bound", self.intf)))?;
+                let drv = self.usb.join("drivers").join(&driver);
+                self.write(&drv.join("unbind"), &self.intf, &mut r.steps)?;
+                wait(sec(1));
+                self.write(&drv.join("bind"), &self.intf, &mut r.steps)?;
+            }
+            L::Port => {
+                let dev_name = self.intf.split(':').next().unwrap_or_default();
+                let dev = self.usb.join("devices").join(dev_name);
+                let port = fs::canonicalize(dev.join("port")).ok();
+                match port.map(|p| p.join("disable")).filter(|d| d.exists()) {
+                    Some(disable) => {
+                        self.write(&disable, "1", &mut r.steps)?;
+                        wait(sec(2));
+                        self.write(&disable, "0", &mut r.steps)?;
+                        r.power_cycled = true;
+                    }
+                    None => {
+                        self.write(&dev.join("authorized"), "0", &mut r.steps)?;
+                        wait(sec(1));
+                        self.write(&dev.join("authorized"), "1", &mut r.steps)?;
+                    }
+                }
+                // A hub that cuts power but does not bring the device back
+                // (no per-port power switching): re-authorize it.
+                if r.power_cycled && !self.wait_back(wait) && dev.join("authorized").exists() {
+                    r.steps
+                        .push("not back after the power cycle: re-authorizing".into());
+                    self.write(&dev.join("authorized"), "0", &mut r.steps)?;
+                    wait(sec(1));
+                    self.write(&dev.join("authorized"), "1", &mut r.steps)?;
+                }
+            }
+        }
+        r.back = self.wait_back(wait);
+        Ok(r)
+    }
+}
+
+/// The recovery of `name` at `level`: it must sit on a USB interface.
+pub(crate) fn usb_reset(name: &str, level: hnic::UsbResetLevel) -> Result<LinuxUsbReset, HalError> {
+    let d = detail(name)?;
+    let intf = match (d.parent_bus.as_deref(), d.parent_dev.as_deref()) {
+        (Some("usb"), Some(dev)) if safe(dev) && dev.contains(':') => dev.to_owned(),
+        _ => return Err(HalError::Rejected(format!("'{name}' is not a USB adapter"))),
+    };
+    Ok(LinuxUsbReset {
+        name: name.to_owned(),
+        mac: d.perm_mac.clone().or_else(|| d.link.mac.clone()),
+        intf,
+        level,
+        usb: PathBuf::from("/sys/bus/usb"),
+        net: PathBuf::from("/sys/class/net"),
+    })
+}
+
 /// `NETDEV WATCHDOG` hits, summed over the link's transmit queues
 /// (`queues/tx-N/tx_timeout`, kernel 3.3+).
 pub(crate) fn tx_timeouts(link: &Path) -> Option<u64> {
@@ -380,6 +518,92 @@ pub(crate) fn tx_timeouts(link: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fake_usb(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("cr-usbreset-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        root
+    }
+
+    #[test]
+    fn driver_recovery_unbinds_and_binds_the_interface() {
+        let root = fake_usb("drv");
+        let usb = root.join("usb");
+        let net = root.join("net");
+        let drv = usb.join("drivers/r8152");
+        fs::create_dir_all(&drv).unwrap();
+        fs::create_dir_all(usb.join("devices/2-1:1.0")).unwrap();
+        std::os::unix::fs::symlink(&drv, usb.join("devices/2-1:1.0/driver")).unwrap();
+        fs::create_dir_all(net.join("ether4")).unwrap();
+        fs::write(net.join("ether4/address"), "00:e0:4c:68:20:76\n").unwrap();
+        let mut job = LinuxUsbReset {
+            name: "ether4".into(),
+            mac: Some("00:E0:4C:68:20:76".into()),
+            intf: "2-1:1.0".into(),
+            level: hnic::UsbResetLevel::Driver,
+            usb: usb.clone(),
+            net,
+        };
+        let r = hnic::UsbReset::run(&mut job, &|_| true).unwrap();
+        assert!(r.back, "the interface is there with the adapter's address");
+        assert_eq!(r.steps.len(), 2);
+        assert!(
+            r.steps[0].ends_with("r8152/unbind ← 2-1:1.0"),
+            "{:?}",
+            r.steps
+        );
+        assert_eq!(fs::read_to_string(drv.join("bind")).unwrap(), "2-1:1.0");
+        // No driver bound: refused with the reason, nothing written.
+        fs::remove_file(usb.join("devices/2-1:1.0/driver")).unwrap();
+        let e = hnic::UsbReset::run(&mut job, &|_| true).unwrap_err();
+        assert!(e.to_string().contains("no driver bound"), "{e}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn port_recovery_cycles_power_or_authorization() {
+        let root = fake_usb("port");
+        let usb = root.join("usb");
+        let net = root.join("net");
+        let port = usb.join("devices/usb2/2-0:1.0/usb2-port1");
+        fs::create_dir_all(&port).unwrap();
+        fs::create_dir_all(usb.join("devices/2-1")).unwrap();
+        std::os::unix::fs::symlink("../usb2/2-0:1.0/usb2-port1", usb.join("devices/2-1/port"))
+            .unwrap();
+        fs::write(port.join("disable"), "0").unwrap();
+        fs::create_dir_all(net.join("ether4")).unwrap();
+        let mut job = LinuxUsbReset {
+            name: "ether4".into(),
+            mac: None,
+            intf: "2-1:1.0".into(),
+            level: hnic::UsbResetLevel::Port,
+            usb: usb.clone(),
+            net: net.clone(),
+        };
+        let r = hnic::UsbReset::run(&mut job, &|_| true).unwrap();
+        assert!(r.power_cycled && r.back);
+        assert_eq!(
+            fs::read_to_string(port.join("disable")).unwrap(),
+            "0",
+            "power back on"
+        );
+        // No `disable` on the port: de-authorize and authorize again.
+        fs::remove_file(port.join("disable")).unwrap();
+        let r = hnic::UsbReset::run(&mut job, &|_| true).unwrap();
+        assert!(!r.power_cycled);
+        assert_eq!(
+            fs::read_to_string(usb.join("devices/2-1/authorized")).unwrap(),
+            "1"
+        );
+        // Never back: the job says so instead of waiting forever.
+        fs::remove_dir_all(net.join("ether4")).unwrap();
+        let r = hnic::UsbReset::run(&mut job, &|_| true).unwrap();
+        assert!(!r.back);
+        // Stopped while waiting.
+        let r = hnic::UsbReset::run(&mut job, &|_| false).unwrap();
+        assert!(!r.back);
+        let _ = fs::remove_dir_all(&root);
+    }
 
     /// The RTL8153B of the development machine (0bda:8153 on bus 4,
     /// port 2), as sysfs had it, in a fake tree.

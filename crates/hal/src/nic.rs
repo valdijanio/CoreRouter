@@ -285,6 +285,55 @@ pub trait CableTest: Send {
     fn run(&mut self, wait: &dyn Fn(Duration) -> bool) -> Result<CableTestResult, HalError>;
 }
 
+/// How deep a manual USB adapter recovery goes (G1.29c), lightest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UsbResetLevel {
+    /// The interface down and up again (~1 s): the driver resets the chip.
+    Link,
+    /// The driver let go of the USB interface and probe it again
+    /// (unbind/bind, ~2–3 s): a new network device, renamed back by PID 1.
+    Driver,
+    /// The whole USB device again: power off the port and on when its hub
+    /// switches power per port, else de-authorize and re-authorize it (the
+    /// USB core resets and enumerates it again, ~3–5 s).
+    Port,
+}
+
+impl UsbResetLevel {
+    pub const ALL: [Self; 3] = [Self::Link, Self::Driver, Self::Port];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Link => "link",
+            Self::Driver => "driver",
+            Self::Port => "port",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|l| l.as_str() == s)
+    }
+}
+
+/// What a recovery did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct UsbResetReport {
+    /// Steps in order, one line each ("unbind 2-1:1.0 from r8152").
+    pub steps: Vec<String>,
+    /// The port's power was cut (not only the device re-authorized).
+    pub power_cycled: bool,
+    /// The interface came back under its name before the time ran out.
+    pub back: bool,
+}
+
+/// A recovery under way, run on a task thread (the session is not held
+/// while the adapter goes away and comes back).
+pub trait UsbReset: Send {
+    /// `wait(d)` sleeps up to `d`, `false` when the task was stopped.
+    fn run(&mut self, wait: &dyn Fn(Duration) -> bool) -> Result<UsbResetReport, HalError>;
+}
+
 /// Rate and duplex of a kernel link mode: `1000baseT/Full` → (1000, true).
 /// Bits that are not a rate (`Autoneg`, `TP`, `Pause`, `FEC_RS`) are `None`.
 pub fn mode_speed(mode: &str) -> Option<(u32, bool)> {

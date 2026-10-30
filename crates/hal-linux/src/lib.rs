@@ -1230,6 +1230,14 @@ mod linux {
             Ok(std::sync::Arc::new(crate::capture::HostCapture))
         }
 
+        fn usb_reset(
+            &mut self,
+            name: &IfName,
+            level: corerouter_hal::nic::UsbResetLevel,
+        ) -> Result<Box<dyn corerouter_hal::nic::UsbReset>, HalError> {
+            Ok(Box::new(crate::nic::usb_reset(name.as_str(), level)?))
+        }
+
         fn cable_tester(&mut self, name: &IfName) -> Result<Box<dyn CableTest>, HalError> {
             crate::netlink::link_detail(name.as_str())?
                 .ok_or_else(|| HalError::Rejected(format!("no link '{name}' in the kernel")))?;

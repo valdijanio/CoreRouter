@@ -290,6 +290,19 @@ pub trait Hal: Send {
         )))
     }
 
+    /// A manual recovery of USB adapter `name` (G1.29c).
+    fn usb_reset(
+        &mut self,
+        name: &IfName,
+        level: nic::UsbResetLevel,
+    ) -> Result<Box<dyn nic::UsbReset>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} cannot reset '{name}' ({})",
+            self.describe(),
+            level.as_str()
+        )))
+    }
+
     /// Open the DHCP client socket of interface `name` (G4.7).
     fn dhcp_port(&mut self, name: &IfName) -> Result<Box<dyn DhcpPort>, HalError> {
         Err(HalError::Unsupported(format!(
