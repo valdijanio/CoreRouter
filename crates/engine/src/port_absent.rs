@@ -64,36 +64,6 @@ impl Session {
         invalid(self.store().running(), &self.hal().absent_ports(), live)
     }
 
-    /// G1.3d: the platform says these links were created, removed or
-    /// changed (`None`: it dropped events, look at all). When one is a
-    /// physical port of the running config, poll now instead of on the next
-    /// tick, so a port replugged gets its configuration back at once. A
-    /// commit's own changes land here too: that poll finds nothing new.
-    pub fn link_events(&mut self, names: Option<&[String]>) {
-        let running = self.store().running();
-        let ours = names.is_none_or(|names| {
-            names.iter().any(|n| {
-                n.parse::<IfName>()
-                    .ok()
-                    .and_then(|n| running.interfaces.get(&n))
-                    .is_some_and(|i| i.kind == InterfaceKind::Ethernet)
-            })
-        });
-        if !ours {
-            return;
-        }
-        let snapshot = self.store().candidate().clone();
-        let polled = crate::guard::run("link events", || {
-            let live = self.hal_mut().poll();
-            self.watch_links(&live);
-            self.absent_tick(&live);
-            Ok(())
-        });
-        if polled.is_err() {
-            self.store_mut().set_candidate(snapshot);
-        }
-    }
-
     /// Every poll (from `tick`): log ports that went and came back, and
     /// put the configuration back on those that came back. A failure is
     /// tried again on the next poll and logged when its text changes.
@@ -106,15 +76,12 @@ impl Session {
         let present: BTreeSet<&IfName> = live.iter().map(|l| &l.name).collect();
         let gone: BTreeSet<IfName> = absent.iter().filter(|n| !present.contains(n)).cloned().collect();
         let back: Vec<IfName> = absent.iter().filter(|n| present.contains(n)).cloned().collect();
-        let (went, returned, replugged) = match self.ext_mut::<Absence>() {
+        let (went, returned) = match self.ext_mut::<Absence>() {
             Some(a) => {
                 let went: Vec<IfName> = gone.difference(&a.gone).cloned().collect();
                 let returned: Vec<IfName> = a.gone.difference(&gone).cloned().collect();
-                // G1.3d: back without ever being seen gone: replugged
-                // between two polls (the backend saw a new link).
-                let replugged: BTreeSet<IfName> = back.iter().filter(|n| !a.gone.contains(*n)).cloned().collect();
                 a.gone = gone;
-                (went, returned, replugged)
+                (went, returned)
             }
             None => return,
         };
@@ -146,12 +113,7 @@ impl Session {
                     a.error = None;
                 }
                 for n in back {
-                    let msg = if replugged.contains(&n) {
-                        format!("{n}: port was replugged (gone and back within a second); its configuration was applied again")
-                    } else {
-                        format!("{n}: port is back; its configuration was applied")
-                    };
-                    self.log_event(&["interface", "info"], "interface", msg, json!({ "interface": n }));
+                    self.log_event(&["interface", "info"], "interface", format!("{n}: port is back; its configuration was applied"), json!({ "interface": n }));
                 }
             }
             Err(e) => {
@@ -267,47 +229,5 @@ mod tests {
         assert!(log.contains("not on this machine"), "{log}");
         assert!(log.contains("port is back; its configuration was applied"), "{log}");
         assert!(s.hal().absent_ports().is_empty(), "the reapply cleared it");
-    }
-
-    #[test]
-    fn a_port_replugged_between_two_polls_gets_its_configuration_back() {
-        use corerouter_hal::virt::VirtualHal;
-        let hal = VirtualHal::new(4).with_replug(n("ether2"), 8);
-        let mut s = Session::new(Box::new(hal));
-        s.execute("ip.address.add", &json!({"address": "192.0.2.2/24", "interface": "ether2"})).unwrap();
-        let mut t = 0;
-        while t < 12 {
-            s.tick(1_000 + t);
-            t += 1;
-        }
-        let log = s.execute("log.print", &json!({"find": "ether2"})).unwrap().to_string();
-        assert!(log.contains("ether2: port was replugged"), "{log}");
-        assert!(log.contains("its configuration was applied again"), "{log}");
-        assert!(!log.contains("not on this machine"), "never seen gone: {log}");
-        assert!(s.hal().absent_ports().is_empty(), "the reapply cleared it");
-        assert_eq!(row(&mut s, "ether2")["invalid"], false);
-    }
-
-    #[test]
-    fn link_events_on_a_port_poll_at_once() {
-        use corerouter_hal::virt::VirtualHal;
-        let hal = VirtualHal::new(4).with_replug(n("ether2"), 6);
-        let mut s = Session::new(Box::new(hal));
-        s.execute("ip.address.add", &json!({"address": "192.0.2.2/24", "interface": "ether2"})).unwrap();
-        s.tick(1_000);
-        let replugged = |s: &mut Session| s.execute("log.print", &json!({"find": "replugged"})).unwrap().to_string().contains("ether2");
-        // Links that are not ports of the config: no poll, so poll 6 never comes.
-        for _ in 0..20 {
-            s.link_events(Some(&["vlan9".to_owned(), "eth0".to_owned(), "bad name!".to_owned()]));
-        }
-        assert!(!replugged(&mut s));
-        // ether2's events: each one polls, no tick needed.
-        for _ in 0..20 {
-            s.link_events(Some(&["ether2".to_owned()]));
-        }
-        assert!(replugged(&mut s));
-        assert!(s.hal().absent_ports().is_empty());
-        // Events dropped: looks too.
-        s.link_events(None);
     }
 }

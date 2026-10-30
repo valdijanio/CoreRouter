@@ -163,6 +163,10 @@ pub struct Inputs {
     /// dm-verity device of its signed root hash (G1.6qb). `None`: not on
     /// the image (lab, browser, the package service has not reported).
     pub root_verity: Option<(String, bool)>,
+    /// G1.6u: configuration snapshots in `/config` and the bytes of their
+    /// own (partial copies are named `config-<slot>.new`), from the
+    /// package service's status.
+    pub config_snapshots: Vec<(String, u64)>,
     /// G3.9fj: BGP sessions where we restart gracefully toward a neighbor
     /// that announces graceful restart (RFC 4724), and those of them
     /// established for [`EOR_GRACE_SECS`] that never sent End-of-RIB.
@@ -181,9 +185,6 @@ pub struct Inputs {
     /// G1.3b: ports of the running config not on this machine (and the
     /// VLANs on them). Empty: every port is there (no check then).
     pub absent_ports: Vec<String>,
-    /// G1.3e: (section, why) of the restored config the data plane refused
-    /// at boot. Empty: everything is in (no check then).
-    pub boot_apply: Vec<(String, String)>,
     /// Whether any reading exists at all.
     pub readings: bool,
 }
@@ -331,9 +332,10 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
         None => push("disk", "Disk", Severity::Unknown, None, "nenhum disco com dados".into(), None),
         Some((mount, free)) => {
             let s = level(*free, DISK_FREE.0, DISK_FREE.1, false);
+            let snaps = config_reclaim(mount, &i.config_snapshots);
             push("disk", "Disk", s, Some(format!("{mount}: {} livre", pct(*free))),
                 format!("{mount} com {} livre", pct(*free)),
-                Some("Apague logs e capturas antigos, ou reduza o histórico de gráficos (system.graph.set) e de logs em disco."));
+                Some(snaps.as_deref().unwrap_or("Apague logs e capturas antigos, ou reduza o histórico de gráficos (system.graph.set) e de logs em disco.")));
         }
     }
 
@@ -611,26 +613,6 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
             reason: format!("interface(s) da configuração sem a placa nesta máquina (flag I): {list}; o resto da configuração está aplicado e a delas volta sozinha quando a placa voltar"),
             action: Some("Confira o cabo/adaptador USB ou a placa; se ela saiu de vez, tire a configuração dela (ou troque a interface dos itens que a usam).".into()) });
     }
-    // G1.3e: the boot left part of the config out (the rest, management
-    // included, is up). Only while it lasts.
-    if !i.boot_apply.is_empty() {
-        let list = i
-            .boot_apply
-            .iter()
-            .take(5)
-            .map(|(s, e)| format!("{s}: {}", e.trim_start_matches("backend rejected the change: ").chars().take(300).collect::<String>()))
-            .collect::<Vec<_>>()
-            .join("; ");
-        let core = i.boot_apply.iter().any(|(s, _)| s == "core");
-        out.push(Check { key: "boot.apply", name: "Boot apply", severity: Severity::Error,
-            value: Some(i.boot_apply.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join(", ")),
-            reason: if core {
-                format!("a configuração salva não entrou no kernel, nem interfaces e endereços: {list}; nova tentativa com espera crescente (até 60 s)")
-            } else {
-                format!("seção(ões) da configuração salva recusada(s) pelo kernel no boot e fora do ar (o resto, gerência inclusive, está aplicado): {list}; nova tentativa com espera crescente (até 60 s)")
-            },
-            action: Some("Corrija ou tire o item recusado (o motivo é o erro do kernel acima) e faça commit, ou carregue o que falta no kernel (módulo, recurso); um commit que mexe na seção a aplica inteira. Firewall de fora deixa o roteador sem filtro.".into()) });
-    }
     // G1.29b: a USB adapter behind a port slower than itself caps the
     // traffic with no error anywhere. Only on routers that have one.
     if !i.usb.is_empty() {
@@ -669,6 +651,35 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
         }
     }
     out
+}
+
+/// G1.6u: on a full `/config`, what to remove: the snapshots and partial
+/// copies, biggest first, and the command (dry run first).
+fn config_reclaim(mount: &str, snaps: &[(String, u64)]) -> Option<String> {
+    if mount != "/config" || snaps.iter().all(|(_, b)| *b == 0) {
+        return None;
+    }
+    let mut v: Vec<&(String, u64)> = snaps.iter().filter(|(_, b)| *b > 0).collect();
+    v.sort_by_key(|x| std::cmp::Reverse(x.1));
+    let list: Vec<String> = v
+        .iter()
+        .map(|(n, b)| format!("{n} {:.1} MB{}", *b as f64 / 1e6, if n.ends_with(".new") { " (cópia parcial)" } else { "" }))
+        .collect();
+    Some(format!(
+        "Snapshots da configuração no /config: {}. Veja o que sai com system.package.snapshot.remove {{all: true, dry_run: true}} e apague com system.package.snapshot.remove {{name: \"…\"}}; o snapshot de um teste em andamento nunca sai.",
+        list.join(", ")
+    ))
+}
+
+/// The snapshots of the package service's status, with their own bytes.
+fn config_snapshots(st: &serde_json::Value) -> Vec<(String, u64)> {
+    use serde_json::Value;
+    ["snapshots", "partials"]
+        .iter()
+        .filter_map(|k| st.get(*k).and_then(Value::as_array))
+        .flatten()
+        .filter_map(|r| Some((r.get("name")?.as_str()?.to_owned(), r.get("own_bytes")?.as_u64()?)))
+        .collect()
 }
 
 /// (running slot, on dm-verity) from the package service's status, or
@@ -819,7 +830,6 @@ impl Session {
             .collect();
         i.usb_watchdog = self.usb_watchdog_health();
         i.absent_ports = self.invalid_interfaces(&live).into_keys().map(|n| n.to_string()).collect();
-        i.boot_apply = self.boot_failures().into_iter().map(|f| (f.section.to_owned(), f.error)).collect();
         i.bgp_no_eor = self.routing_status().map(|st| {
             let quiet = bgp_without_eor(st)
                 .map(|b| b.connection.clone().unwrap_or_else(|| b.remote_address.clone()))
@@ -844,10 +854,9 @@ impl Session {
                 .collect();
             (all.len(), bare)
         });
-        i.root_verity = self
-            .ext::<crate::package::Packages>()
-            .and_then(|p| p.status.as_ref())
-            .and_then(root_verity);
+        let pkg = self.ext::<crate::package::Packages>().and_then(|p| p.status.as_ref());
+        i.root_verity = pkg.and_then(root_verity);
+        i.config_snapshots = pkg.map(config_snapshots).unwrap_or_default();
         i
     }
 
@@ -926,12 +935,12 @@ mod tests {
             ecmp: Some((0, 0, None)),
             no_password: Vec::new(),
             root_verity: Some(("a".into(), true)),
+            config_snapshots: Vec::new(),
             bgp_no_eor: Some((1, Vec::new())),
             bgp_gr_no_bfd: Some((1, Vec::new())),
             usb: Vec::new(),
             usb_watchdog: Vec::new(),
             absent_ports: Vec::new(),
-            boot_apply: Vec::new(),
         }
     }
 
@@ -965,20 +974,6 @@ mod tests {
             assert!(c.action.is_none());
         }
         assert_eq!(overall(&checks), Severity::Ok);
-    }
-
-    #[test]
-    fn boot_apply_errors_only_while_something_is_out() {
-        assert!(evaluate(&healthy()).iter().all(|c| c.key != "boot.apply"));
-        let mut i = healthy();
-        i.boot_apply = vec![("firewall".into(), "nft refused rule 3".into())];
-        let checks = evaluate(&i);
-        let c = checks.iter().find(|c| c.key == "boot.apply").unwrap();
-        assert_eq!(c.severity, Severity::Error);
-        assert_eq!(c.value.as_deref(), Some("firewall"));
-        assert!(c.reason.contains("firewall: nft refused rule 3"), "{}", c.reason);
-        assert!(c.reason.contains("gerência"), "{}", c.reason);
-        assert!(c.action.is_some());
     }
 
     #[test]
@@ -1061,6 +1056,29 @@ mod tests {
                 assert!(matches!(other.severity, Severity::Ok), "{what} moved {}", other.key);
             }
         }
+    }
+
+    #[test]
+    fn a_full_config_names_the_snapshots_to_remove() {
+        let mut i = healthy();
+        i.disks = vec![("/config".into(), 0.0)];
+        i.config_snapshots = vec![
+            ("config-a".into(), 13_811_709),
+            ("config-b".into(), 0),
+            ("config-a.new".into(), 9_000_000),
+        ];
+        let checks = evaluate(&i);
+        let c = checks.iter().find(|c| c.key == "disk").unwrap();
+        assert_eq!(c.severity, Severity::Error);
+        let a = c.action.as_deref().unwrap();
+        assert!(a.contains("config-a 13.8 MB, config-a.new 9.0 MB (cópia parcial)"), "{a}");
+        assert!(!a.contains("config-b"), "nothing to free there: {a}");
+        assert!(a.contains("system.package.snapshot.remove"), "{a}");
+        // Another mount keeps the old advice.
+        i.disks = vec![("/var".into(), 0.0)];
+        let checks = evaluate(&i);
+        let c = checks.iter().find(|c| c.key == "disk").unwrap();
+        assert!(c.action.as_deref().unwrap().contains("logs"));
     }
 
     #[test]
