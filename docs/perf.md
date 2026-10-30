@@ -2918,3 +2918,8 @@ lote netlink (50 000 regras = 24 MiB num lote, que só um root com `SO_SNDBUFFOR
   `revision_delta_one_filter_rule_of_10000` 29,2 µs → 51,6 µs; `revision_delta_one_route_of_60000`
   (novo) 65,2 µs → 130,7 µs. `one_filter_rule_of_10000` (só o `diff`, código igual) 28,4 → 31,2 µs:
   ruído da máquina compartilhada.
+
+- **medido** (VM `corerouter-lab`, 4 vCPU, kernel 6.18, release, 2026-10-29,
+  `hal-linux/benches/netns_mpls_ttl.rs`, MPLS de 64 octetos): sem taps 2,083 Melem/s; taps
+  `AF_PACKET` do respondedor 1,633; com o filtro de "grande demais" (G3.9da) 1,644 — o filtro
+  novo não custa nada mensurável.
