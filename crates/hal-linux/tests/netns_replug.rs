@@ -104,7 +104,10 @@ fn link_events_name_the_replugged_port() {
     let mut feed = LinkEvents::open().unwrap();
     // The other test shares the namespace: only rq1 counts here.
     let rq1 = |e: &Events| matches!(e, Events::Names(n) if n.contains("rq1"));
-    assert!(!rq1(&feed.wait(1).unwrap()), "nothing while nothing changes");
+    assert!(
+        !rq1(&feed.wait(1).unwrap()),
+        "nothing while nothing changes"
+    );
     ip(&["link", "del", "rq1"]);
     ip(&["link", "add", "rq1", "type", "dummy"]);
     // Both already queued when `ip` returned (**medido**: < 1.5 ms).

@@ -180,10 +180,10 @@ mod cpu_tuning;
 #[cfg(target_os = "linux")]
 pub mod oslog;
 
-/// Neighbor tables over rtnetlink (G1.27d): dump, events, static entries.
-pub mod neigh;
 /// Link events (G1.3d): ports replugged between two polls.
 pub mod link_events;
+/// Neighbor tables over rtnetlink (G1.27d): dump, events, static entries.
+pub mod neigh;
 
 /// MPLS label switching over rtnetlink (G3.5): the label table, static
 /// entries in batches, the `net.mpls` knobs.

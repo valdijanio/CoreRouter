@@ -61,7 +61,9 @@ fn a_replugged_port_gets_its_configuration_back_at_once() {
         .stdout(Stdio::null())
         .stderr(log);
     let _d = Kill(c.spawn().unwrap());
-    wait_for("the daemon", || call(None, "interface.list", json!({})).is_ok());
+    wait_for("the daemon", || {
+        call(None, "interface.list", json!({})).is_ok()
+    });
     run(
         "ip.address.add",
         json!({"address": "10.73.2.1/24", "interface": "ether2"}),
