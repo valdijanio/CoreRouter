@@ -223,6 +223,18 @@ pub struct Batch {
     echoed: Vec<u32>,
     /// The tables the batch writes (see [`Self::str`]).
     touched: std::collections::BTreeSet<String>,
+    /// G1.3g, only for a check ([`Self::track_rules`]): the messages of
+    /// each rule (its anonymous sets, then the rule) and its comment, so an
+    /// error the kernel reports by sequence number names the rule.
+    rule_msgs: Option<Vec<RuleMsgs>>,
+}
+
+/// The sequence numbers one rule took in a batch, and its comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleMsgs {
+    pub first: u32,
+    pub last: u32,
+    pub comment: Option<String>,
 }
 
 impl Batch {
@@ -241,6 +253,7 @@ impl Batch {
             echo: false,
             echoed: Vec::new(),
             touched: std::collections::BTreeSet::new(),
+            rule_msgs: None,
         };
         // The generation id (patched in by `apply`) makes the batch apply
         // only on the ruleset we last saw (G0.31f).
@@ -254,6 +267,12 @@ impl Batch {
     /// (`NLM_F_ECHO`), in the order they were written.
     pub fn echo_rules(&mut self, on: bool) {
         self.echo = on;
+    }
+
+    /// Remember which messages each rule takes from here on (G1.3g: a
+    /// check names the refused rules).
+    pub fn track_rules(&mut self) {
+        self.rule_msgs.get_or_insert_with(Vec::new);
     }
 
     /// How many rules asked for an echo.
@@ -501,6 +520,7 @@ impl Batch {
     /// Rule `r` at `place` (G2.8): its anonymous sets first (they live in
     /// the same transaction), then the rule with its comment.
     pub fn insert_rule(&mut self, table: &str, r: &Rule, place: Place) {
+        let first = self.seq;
         self.anon_ids.clear();
         for e in &r.exprs {
             if let Expr::LookupAnon { set, .. } = e {
@@ -530,7 +550,15 @@ impl Batch {
         if let Some(c) = &r.comment {
             self.put(NFTA_RULE_USERDATA, &comment_udata(c));
         }
+        let last = self.seq;
         self.close_msg();
+        if let Some(m) = self.rule_msgs.as_mut() {
+            m.push(RuleMsgs {
+                first,
+                last,
+                comment: r.comment.clone(),
+            });
+        }
     }
 
     /// Name the anonymous sets that follow `__set<first>`, `__set<first+1>`…
@@ -1026,6 +1054,44 @@ impl Batch {
     }
 }
 
+/// A batch closed for a check (G1.3g, as `nft --check`): no
+/// `NFNL_MSG_BATCH_END`, so the kernel validates every message, reports
+/// each refused one and throws the batch away (`nfnetlink_rcv_batch`:
+/// without the end it aborts with `NFNL_ABORT_VALIDATE`, kernel 6.18
+/// `net/netfilter/nfnetlink.c`); the last message asks for an ACK.
+#[derive(Debug)]
+pub struct CheckBatch {
+    pub bytes: Vec<u8>,
+    pub seqs: std::ops::Range<u32>,
+    pub rules: Vec<RuleMsgs>,
+}
+
+impl Batch {
+    pub fn finish_check(mut self) -> CheckBatch {
+        let last = self.seq;
+        if last != self.first
+            && let Some(f) = self.buf.get_mut(self.msg + 6..self.msg + 8)
+        {
+            let old = <[u8; 2]>::try_from(&f[..]).map_or(0, u16::from_ne_bytes);
+            f.copy_from_slice(&(old | NLM_F_ACK).to_ne_bytes());
+        }
+        CheckBatch {
+            bytes: self.buf,
+            seqs: self.first..last,
+            rules: self.rule_msgs.unwrap_or_default(),
+        }
+    }
+}
+
+impl CheckBatch {
+    /// The comment of the rule that sequence number `seq` belongs to.
+    pub fn rule_of(&self, seq: u32) -> Option<&RuleMsgs> {
+        // In ascending order: the last rule that starts at or before `seq`.
+        let i = self.rules.partition_point(|r| r.first <= seq);
+        self.rules.get(i.checked_sub(1)?).filter(|r| seq <= r.last)
+    }
+}
+
 /// Where a new rule goes in its chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Place {
@@ -1056,13 +1122,21 @@ pub fn comment_udata(c: &str) -> Vec<u8> {
 pub fn replace(t: &Table, seq: u32) -> Batch {
     let mut b = Batch::new(seq);
     b.family(t.family);
-    // The table is new: its anonymous sets start from zero.
-    b.name_anon_sets_from(0);
     b.new_table(&t.name);
     b.del_table(&t.name);
     if t.sets.is_empty() && t.fw_sets.is_empty() && t.chains.is_empty() && t.flowtables.is_empty() {
         return b;
     }
+    fill(t, b)
+}
+
+/// Write table `t` with everything in it into `b` (an empty or absent
+/// table: [`replace`] deletes it first; a check fills an empty scratch
+/// table, G1.3g).
+pub fn fill(t: &Table, mut b: Batch) -> Batch {
+    b.family(t.family);
+    // The table is new: its anonymous sets start from zero.
+    b.name_anon_sets_from(0);
     b.new_table(&t.name);
     for f in &t.flowtables {
         b.new_flowtable(&t.name, f);
@@ -1390,7 +1464,7 @@ mod tests {
 }
 
 #[cfg(target_os = "linux")]
-pub use io::{Committed, apply, apply_checked, epoch, stamp};
+pub use io::{Committed, apply, apply_checked, check, epoch, stamp};
 
 #[cfg(target_os = "linux")]
 mod io {
@@ -1403,7 +1477,9 @@ mod io {
     use netlink_sys::{Socket, protocols::NETLINK_NETFILTER};
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
-    use super::{Batch, GENID_AT, NFNL_SUBSYS_NFTABLES, NFT_MSG_NEWGEN, NFT_MSG_NEWRULE};
+    use super::{
+        Batch, CheckBatch, GENID_AT, NFNL_SUBSYS_NFTABLES, NFT_MSG_NEWGEN, NFT_MSG_NEWRULE,
+    };
     use crate::nft_read::{ReadRule, parse_rule};
 
     /// A batch slower than this is a stuck kernel: give up (the kernel
@@ -1560,6 +1636,93 @@ mod io {
                 }
             }
         }
+    }
+
+    /// Check `batch` without committing it (G1.3g, see [`CheckBatch`]):
+    /// every message the kernel refuses, as (sequence number, errno), in
+    /// batch order; empty when it would load whole. The kernel does not
+    /// stop at the first error ("userspace gets all the errors that the
+    /// batch triggers", `nfnetlink_rcv_batch`), and an error only the
+    /// whole-table validation finds (a jump loop) makes it replay the batch
+    /// validating each rule, so that one names its message too. A refusal
+    /// of the batch itself comes on the begin message (`seqs.start - 1`).
+    /// Nothing is committed: the generation and the cache of what was
+    /// loaded (G0.31f) stay as they were.
+    pub fn check(batch: &CheckBatch, what: &str) -> Result<Vec<(u32, i32)>, HalError> {
+        // The generation id stays 0 (`Batch::new`): checked against
+        // whatever the ruleset is now.
+        let (bytes, seqs) = (&batch.bytes, &batch.seqs);
+        let Some(last) = seqs.clone().last() else {
+            return Ok(Vec::new());
+        };
+        let mut guard = GENERATION.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = &mut guard.sock;
+        let sock = match slot {
+            Some(s) => s,
+            None => {
+                let mut s = Socket::new(NETLINK_NETFILTER).map_err(io)?;
+                s.bind_auto().map_err(io)?;
+                slot.insert(s)
+            }
+        };
+        drain(sock);
+        let want = bytes.len().saturating_add(65_536);
+        use nix::sys::socket::{setsockopt, sockopt};
+        if setsockopt(&sock.as_fd(), sockopt::SndBufForce, &want).is_err() {
+            let _ = setsockopt(&sock.as_fd(), sockopt::SndBuf, &want);
+        }
+        if setsockopt(&sock.as_fd(), sockopt::RcvBufForce, &(4usize << 20)).is_err() {
+            let _ = setsockopt(&sock.as_fd(), sockopt::RcvBuf, &(4usize << 20));
+        }
+        let sent = sock.send(bytes, 0);
+        if let Err(e) = sent {
+            *slot = None;
+            return Err(io(e));
+        }
+        let begin = seqs.start.wrapping_sub(1);
+        let start = Instant::now();
+        let mut buf = vec![0u8; 1 << 16];
+        let mut refused = Vec::new();
+        // The errors come in batch order, the last message's answer last.
+        loop {
+            let left = DEADLINE.saturating_sub(start.elapsed());
+            if left.is_zero() {
+                *slot = None;
+                return Err(HalError::Io(format!(
+                    "{what}: the kernel did not answer the check in {} s",
+                    DEADLINE.as_secs()
+                )));
+            }
+            let ms = u16::try_from(left.as_millis().min(1000)).unwrap_or(1000);
+            let mut fds = [PollFd::new(sock.as_fd(), PollFlags::POLLIN)];
+            if poll(&mut fds, PollTimeout::from(ms)).map_err(io)? == 0 {
+                continue;
+            }
+            let n = match sock.recv(&mut &mut buf[..], 0) {
+                Ok(n) => n,
+                Err(e) => {
+                    *slot = None;
+                    return Err(io(e));
+                }
+            };
+            let mut done = false;
+            for m in messages(buf.get(..n).unwrap_or(&[])) {
+                if let Msg::Ack(seq, code) = m {
+                    if code != 0 {
+                        refused.push((seq, code));
+                    }
+                    // The batch refused whole answers on its begin only.
+                    if seq == last || (seq == begin && code != 0) {
+                        done = true;
+                    }
+                }
+            }
+            if done {
+                break;
+            }
+        }
+        drain(sock);
+        Ok(refused)
     }
 
     /// Read and drop whatever is queued on `sock`, without waiting.

@@ -555,7 +555,7 @@ impl Session {
         if before == after {
             return;
         }
-        if let Err(e) = self.hal_mut().apply(&before, &after) {
+        if let Err(e) = self.apply_side(&before, &after) {
             let msg = format!("lease not applied: {e}");
             if let Some(r) = self.dhcp.runners.get_mut(&id) {
                 (r.addresses, r.routes, r.notes) = old;

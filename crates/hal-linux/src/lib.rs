@@ -823,6 +823,13 @@ mod linux {
             }
         }
 
+        fn check_firewall(
+            &mut self,
+            to: &Config,
+        ) -> Result<Vec<corerouter_hal::RefusedRule>, HalError> {
+            crate::firewall::check(to)
+        }
+
         fn absent_ports(&self) -> Vec<IfName> {
             self.absent.iter().cloned().collect()
         }

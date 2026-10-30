@@ -64,6 +64,13 @@ pub enum HalError {
     Io(String),
 }
 
+/// A firewall rule the data plane would refuse ([`Hal::check_firewall`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RefusedRule {
+    pub id: corerouter_model::ItemId,
+    pub reason: String,
+}
+
 /// A port the platform lets CoreRouter manage (used to seed the default
 /// config). Links CoreRouter must not touch are never `LinkInfo`s; they
 /// show up only in [`Hal::poll`], with [`LinkState::unmanaged`] set.
@@ -190,6 +197,21 @@ pub trait Hal: Send {
     /// Apply the transition `from` → `to`. Must be all-or-nothing: on `Err`
     /// the platform is left as `from`.
     fn apply(&mut self, from: &Config, to: &Config) -> Result<(), HalError>;
+
+    /// G1.3g: whether `to`'s firewall would load, checked without loading
+    /// anything (nftables' `--check`: the kernel validates the batch and
+    /// throws it away). `Ok`: the first rule it refuses, by id, with the
+    /// kernel's reason (empty: it loads whole); the rules after a refused
+    /// one may be refused only because of it, so the caller takes that one
+    /// out and checks again. `Err(Rejected)`: refused
+    /// without naming a rule. The default cannot check (`Unsupported`):
+    /// the boot then leaves a refused firewall out whole (G1.3e).
+    fn check_firewall(&mut self, to: &Config) -> Result<Vec<RefusedRule>, HalError> {
+        let _ = to;
+        Err(HalError::Unsupported(
+            "checking a firewall without loading it".into(),
+        ))
+    }
 
     /// Sample live link state/counters.
     fn poll(&mut self) -> Vec<LinkState>;
