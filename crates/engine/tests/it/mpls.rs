@@ -118,6 +118,43 @@ fn static_lsps_need_labels_outside_the_dynamic_range() {
     assert!(err(&mut s, "mpls.static.remove", json!({"id": 100_000})).contains("no static entry"));
 }
 
+/// G3.9d: ICMP time exceeded for labeled packets, on by default, its rate
+/// bounded; a batch that fails on it changes nothing.
+#[test]
+fn icmp_ttl_exceeded_settings() {
+    let mut s = Session::virtual_lab();
+    let st = ok(&mut s, "mpls.settings.get", json!({}));
+    assert_eq!(st["icmp_ttl_exceeded"], true);
+    assert_eq!(st["icmp_rate"], 100);
+    let set = ok(
+        &mut s,
+        "mpls.settings.set",
+        json!({"icmp_ttl_exceeded": false, "icmp_rate": 500}),
+    );
+    assert_eq!(set["icmp_ttl_exceeded"], false);
+    assert_eq!(set["icmp_rate"], 500);
+    for bad in [0, 10_001] {
+        let e = err(&mut s, "mpls.settings.set", json!({"icmp_rate": bad}));
+        assert!(e.contains("errors per second"), "{e}");
+    }
+    let before = s.store().running().clone();
+    let e = s
+        .batch(
+            &json!([
+                {"command": "mpls.settings.set", "params": {"icmp_ttl_exceeded": true}},
+                {"command": "mpls.settings.set", "params": {"icmp_rate": 0}},
+            ]),
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("icmp_rate"), "{e}");
+    assert_eq!(s.store().running(), &before);
+    let st = ok(&mut s, "mpls.settings.get", json!({}));
+    assert_eq!(st["icmp_ttl_exceeded"], false);
+    assert_eq!(st["icmp_rate"], 500);
+}
+
 #[test]
 fn a_failed_batch_leaves_nothing() {
     let mut s = Session::virtual_lab();

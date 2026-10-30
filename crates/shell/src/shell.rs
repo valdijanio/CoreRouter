@@ -886,9 +886,20 @@ impl Shell {
                     base.insert(key.clone(), convert(cmd.param(key).map(|p| &p.ty), value));
                 }
                 Arg::Positional(text) => {
-                    // The registry names where a bare value goes (`ping 8.8.8.8`).
+                    // The registry names where a bare value goes (`ping 8.8.8.8`),
+                    // unless it is an item number of the menu's print and that
+                    // print lists the value (`/interface ethernet set 3`).
+                    let numbered = first
+                        && numbers(text).is_some()
+                        && cmd.positional.as_deref().is_some_and(|pk| {
+                            self.reg
+                                .menu(path)
+                                .and_then(|m| m.print())
+                                .is_some_and(|p| p.shape.fields.iter().any(|f| f == pk))
+                        });
                     if let Some(pk) = cmd.positional.as_deref()
                         && !base.contains_key(pk)
+                        && !numbered
                     {
                         first = false;
                         base.insert(pk.to_owned(), convert(cmd.param(pk).map(|p| &p.ty), text));

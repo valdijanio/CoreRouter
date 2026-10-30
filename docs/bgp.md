@@ -275,6 +275,59 @@ corerouter-cli run routing.bgp.instance.set '{"asn":65000,"router_id":"10.255.0.
 - RouterOS 7.25: nada documentado sobre a RFC 8538. Como ele não é helper, o bit N não muda nada
   com ele.
 
+### G3.9fj: BFD e graceful restart (RFC 5882 §4.3)
+
+O BFD do CoreRouter roda no `corerouter-daemon`: o `bfdd` só o comanda, pelo plano de dados
+distribuído. **Medido** no host (`scripts/bgp-crcr-userns.sh cbit`), com GR e BFD de
+100 ms × 3, `kill -9` no CR1 e tudo de volta 3 s depois:
+
+| O que morre no CR1 | O CR2 com a rota do CR1 | Pings perdidos (20 ms) |
+|---|---|---|
+| `bgpd` + `bfdd` | fica: o BFD continua no ar | 1–105 de ~560 |
+| `corerouter-daemon` + `bgpd` + `bfdd` | fica | 2–4 de ~564 |
+| só o `corerouter-daemon` | **sai em 416–423 ms** (BFD down com a TCP no ar: Cease 10) | 144–154 de ~560 |
+
+- Com a pilha inteira morta, a TCP cai primeiro. O FRR 10.7.1 não tira as rotas stale por causa
+  de um BFD down que chega depois disso: o `bgp_stop` só mexe nos tempos de GR com a sessão
+  estabelecida, e o `BGP_Stop` em Idle não limpa nada (`bgpd/bgp_fsm.c`). Por isso
+  `neighbor X bfd check-control-plane-failure` (RFC 5882 §4.3) não mudou nada. Com ele
+  desligado, ligado só no helper e ligado nos dois lados, a rota ficou nos três casos (**medido**),
+  e o CoreRouter não o expõe.
+- O `remote_flags` que o CoreRouter manda ao `bfdd` agora traz o bit C recebido do vizinho
+  (`RBIT_CPI`); antes ia sempre 0. O bit C enviado continua 0: o BFD cai junto com o daemon
+  enquanto o kernel continua encaminhando, então C = 1 seria falso (RFC 5880 §6.8.7). O pedido do
+  `bfdd` de pôr C = 1 não é seguido.
+- Gap: com BFD, o `kill -9` (ou uma atualização) só do `corerouter-daemon` derruba as sessões BGP,
+  embora o `bgpd` e o kernel continuem vivos.
+- RouterOS 7.25: nada documentado sobre o bit C, e ele não é helper.
+
+### G3.9fj: Long-Lived Graceful Restart (RFC 9494)
+
+```sh
+corerouter-cli run routing.bgp.instance.set '{"asn":65000,"router_id":"10.255.0.1","llgr_stale_time":3600}'
+```
+
+- `llgr_stale_time` na instância (1..16777215 s, 24 bits; sem valor: desligado, §5) vira
+  `bgp long-lived-graceful-restart stale-time N`. Quando acaba o Restart Time, o vizinho guarda as
+  nossas rotas por mais esse tempo, com a comunidade `llgr-stale` e com a menor preferência (§4.2,
+  §4.3).
+- No FRR o mesmo valor é também o máximo que guardamos das rotas de um vizinho: o
+  `bgp_open.c` fica com MIN(o recebido, o nosso). Um helper com 0 (o padrão) não guarda nada:
+  ligue nos dois lados.
+- É um valor só para todas as famílias. A RFC pede por AFI/SAFI (§5), e a prévia avisa.
+- `no-llgr` no `routing.filter` (`append bgp-communities no-llgr`) marca o que nunca deve ficar
+  velho. `llgr-stale` e `no-llgr` são os nomes que o FRR imprime.
+- `routing.bgp.session.list`: `llgr_stale_time` (o que o vizinho anunciou, quando não é 0); selo
+  `LLGR` na coluna GR.
+- A prévia mostra o pior caso (hold + Restart Time + LLGR) e avisa acima de 1 h: salto a salto,
+  uma rota stale mais específica ainda ganha de uma viva menos específica (§5).
+- RouterOS 7.25: não suporta. O FRR não manda rotas `llgr-stale` a quem não anunciou a
+  capacidade 71 (§4.3).
+
+**Medido** (2026-10-29, host, `scripts/bgp-crcr-userns.sh llgr`): Restart Time 5 s, `kill -9` do
+`bgpd` do CR1, que fica fora 25 s. Sem LLGR, o CR2 tira a rota em 5,1 s. Com 10 s de LLGR, tira em
+15,1 s; aos 7 s a rota ainda está lá, com `llgr-stale`.
+
 ### Ficou para depois
 
 - Políticas e o "quais rotas passam" (G3.2b); RPKI e "Por que essa rota?" (G3.2c).

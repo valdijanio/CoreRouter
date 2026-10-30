@@ -460,6 +460,15 @@ pub struct BgpInstance {
     /// with the N bit keeps them as stale. Unset: on; stored only when off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hard_admin_reset: Option<bool>,
+    /// G3.9fj, RFC 9494: the Long-Lived Stale Time we announce, seconds
+    /// (1..=16777215, 24 bits; FRR `bgp long-lived-graceful-restart
+    /// stale-time`, one value for every family). After the Restart Time the
+    /// neighbor keeps our routes this much longer, marked LLGR_STALE and
+    /// least preferred. It is also the most we keep of a neighbor's
+    /// (`bgp_open.c`: MIN(received, ours)), so a helper needs it set too.
+    /// Unset: off (§5: never on by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llgr_stale_time: Option<u32>,
 }
 
 #[cfg(test)]
