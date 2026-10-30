@@ -400,6 +400,7 @@ fn data_plane_for_a_fake_bfdd() {
     assert_eq!(up.lid, 0x0001_1001);
     assert_ne!(up.rid, 0);
     assert_eq!(up.detect_mult, 3);
+    assert_eq!(up.remote_flags, 0, "G3.9fj: our engine sends C = 0, bfdd hears it");
     assert_eq!(ctl.engine.as_ref().unwrap().steering, "reuseport-cbpf");
     // Counters on request, with the request's id.
     let mut req = vec![1, 0, 0, 5, 0, 77, 0, 12];
