@@ -1147,6 +1147,18 @@ fn cut_under_pointer(
         return Some(tip.to_owned());
     }
     let (text, _) = crate::chip::split(cell);
+    if let Some(m) = crate::usb_mark::get(ui.ctx(), text) {
+        return Some(m.tip);
+    }
+    // The USB icon of a Type cell: the mark of the row's interface.
+    if text.starts_with(crate::icons::USB)
+        && let Some(m) = row
+            .cells
+            .iter()
+            .find_map(|c| crate::usb_mark::get(ui.ctx(), crate::chip::split(c).0))
+    {
+        return Some(m.tip);
+    }
     // Only a cut cell has a tooltip.
     text.char_indices().nth(CELL_CHARS)?;
     let mut tip: String = text.chars().take(TIP_CHARS).collect();
@@ -1199,7 +1211,8 @@ fn text_width(ui: &Ui, text: &str, font: &egui::FontId) -> f32 {
     let (icon, text) = split_icon(text);
     // A cell may carry chips after its text (`chip::cell`).
     let (text, chips) = crate::chip::split(text);
-    (if icon.is_some() { CELL_ICON } else { 0.0 }) + ui.painter()
+    let usb = icon.is_none() && crate::usb_mark::get(ui.ctx(), text).is_some();
+    (if icon.is_some() || usb { CELL_ICON } else { 0.0 }) + ui.painter()
         .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::PLACEHOLDER)
         .size()
         .x
@@ -1235,6 +1248,14 @@ fn paint_cells<'a>(
     font: &egui::FontId,
 ) {
     let color = ink.text;
+    // G1.29b: a row that already shows the USB icon (the Interfaces Type
+    // column) keeps its name plain; that icon turns amber on a slow port.
+    let usb_char = crate::icons::USB.chars().next();
+    let row_usb_icon = layout.iter().any(|&(i, _)| text(i).chars().next() == usb_char);
+    let row_slow = row_usb_icon
+        && layout.iter().any(|&(i, _)| {
+            crate::usb_mark::get(ui.ctx(), crate::chip::split(text(i)).0).is_some_and(|m| m.slow)
+        });
     let mut x = rect.left();
     for &(i, w) in layout {
         if let Some((_, style)) = ink.note.filter(|(c, _)| *c == i) {
@@ -1268,6 +1289,8 @@ fn paint_cells<'a>(
         let shown = shown_text(text(i));
         let (icon, shown) = split_icon(&shown);
         let (cell, chips) = crate::chip::split(shown);
+        // G1.29b: a USB adapter's name gets the USB icon (amber: slow port).
+        let usb = (icon.is_none() && !row_usb_icon).then(|| crate::usb_mark::get(ui.ctx(), cell)).flatten();
         // A weak column greys plain text only (a selected, dimmed or
         // tinted row keeps its colour).
         let weak = columns.get(i).is_some_and(|c| c.weak) && color == ui.visuals().text_color();
@@ -1278,7 +1301,17 @@ fn paint_cells<'a>(
         };
         let at = if let Some(icon) = icon {
             let icon_rect = Rect::from_min_size(pos2(x + CELL_PAD, rect.top()), vec2(CELL_ICON, rect.height()));
-            crate::icons::paint(ui, icon_rect, &icon.to_string(), font.size, ink);
+            let tint = if row_slow && Some(icon) == usb_char {
+                crate::usb_mark::color(ui.visuals(), true, ink)
+            } else {
+                ink
+            };
+            crate::icons::paint(ui, icon_rect, &icon.to_string(), font.size, tint);
+            pos2(at.x + CELL_ICON, at.y)
+        } else if let Some(m) = usb.filter(|_| !right) {
+            let icon_rect = Rect::from_min_size(pos2(x + CELL_PAD, rect.top()), vec2(CELL_ICON, rect.height()));
+            let tint = crate::usb_mark::color(ui.visuals(), m.slow, ink);
+            crate::icons::paint(ui, icon_rect, crate::icons::USB, font.size, tint);
             pos2(at.x + CELL_ICON, at.y)
         } else { at };
         let drawn = ui.painter().text(at, anchor, cell, font.clone(), ink);

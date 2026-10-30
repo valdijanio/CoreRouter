@@ -69,6 +69,8 @@ pub struct KernelLink {
     pub tx_packets: u64,
     /// `IFLA_STATS64` error/drop counters (none without the attribute).
     pub errors: Option<corerouter_hal::LinkErrors>,
+    /// `IFLA_PARENT_DEV_BUS_NAME`: `pci`, `usb`, `virtio` (G1.29b).
+    pub bus: Option<String>,
 }
 
 impl KernelLink {

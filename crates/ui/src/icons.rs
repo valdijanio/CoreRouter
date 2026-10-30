@@ -68,6 +68,7 @@ pub(crate) const TERMINAL: &str = "\u{E47E}";
 pub(crate) const TERMINAL_WINDOW: &str = "\u{EAE8}";
 pub(crate) const TREE_STRUCTURE: &str = "\u{E67C}";
 pub(crate) const TREE_VIEW: &str = "\u{EE48}";
+pub(crate) const USB: &str = "\u{E956}";
 pub(crate) const USERS_THREE: &str = "\u{E68E}";
 pub(crate) const WRENCH: &str = "\u{E5D4}";
 
@@ -168,6 +169,7 @@ pub(crate) const ALL: &[&str] = &[
     TERMINAL_WINDOW,
     TREE_STRUCTURE,
     TREE_VIEW,
+    USB,
     USERS_THREE,
     WRENCH,
 ];

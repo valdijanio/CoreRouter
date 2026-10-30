@@ -97,6 +97,9 @@ impl Session {
         self.watch_links(&live);
         // G4.5: the same poll feeds the traffic graphs.
         self.graph_sample(&live);
+        // G1.29c: finished USB recoveries; configuration back on a
+        // recreated port.
+        self.usb_tick(&live);
     }
 }
 
@@ -115,6 +118,7 @@ mod tests {
             kind: "ether".into(),
             mtu: 1500,
             mac: None,
+            bus: None,
             unmanaged: None,
             errors: None,
         }

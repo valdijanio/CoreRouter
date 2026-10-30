@@ -825,6 +825,11 @@ impl CoreRouterUi {
         self.tools_tick(ui.ctx(), now);
         self.nic_tick(now);
         self.pump();
+        usb_mark::publish(
+            ui.ctx(),
+            self.cache.applied.get(&Field::Interfaces).copied(),
+            &self.cache.interfaces,
+        );
         self.first_login_tick();
         let wake = if self.pending.is_empty() {
             Duration::from_secs_f64(REFRESH_SECS)

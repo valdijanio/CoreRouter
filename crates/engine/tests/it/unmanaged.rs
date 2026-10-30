@@ -53,6 +53,7 @@ impl Hal for Host {
             kind: "bridge".into(),
             mtu: 1400,
             mac: None,
+            bus: None,
             unmanaged: Some(WHY.into()),
             errors: None,
         });

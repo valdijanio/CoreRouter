@@ -34,6 +34,9 @@ use crate::{
 pub const LAB_MLX5: [&str; 2] = ["ether7", "ether8"];
 /// The one of [`LAB_MLX5`] in switchdev mode.
 pub const LAB_SWITCHDEV: [&str; 1] = ["ether8"];
+/// Lab ports that pretend to be USB adapters (G1.29b): a RTL8153 on a
+/// USB 3 port, and the same chip on a USB 2.0 port (the slow-port alert).
+pub const LAB_USB: [(&str, u32); 2] = [("ether5", 5000), ("ether6", 480)];
 
 #[derive(Clone)]
 pub struct VirtualHal {
@@ -391,6 +394,10 @@ impl VirtualHal {
                     kind: iface.kind.label().to_owned(),
                     mtu: u32::from(iface.mtu),
                     mac: iface.mac.map(|m| m.to_string()),
+                    bus: LAB_USB
+                        .iter()
+                        .any(|(p, _)| *p == iface.name.as_str())
+                        .then(|| "usb".to_owned()),
                     unmanaged: None,
                     // Same numbers as `counters` (its `interface` group).
                     errors: Some(LinkErrors {
@@ -409,6 +416,97 @@ impl VirtualHal {
 }
 
 /// Factory MAC of lab port `index` (what `discover_links` reports).
+/// A recovery of a lab USB adapter (G1.29c).
+struct LabUsbReset {
+    name: String,
+    port: String,
+    level: crate::nic::UsbResetLevel,
+}
+
+impl crate::nic::UsbReset for LabUsbReset {
+    fn run(
+        &mut self,
+        wait: &dyn Fn(Duration) -> bool,
+    ) -> Result<crate::nic::UsbResetReport, HalError> {
+        use crate::nic::UsbResetLevel as L;
+        let (steps, secs, power) = match self.level {
+            L::Link => (
+                vec![format!("{} down", self.name), format!("{} up", self.name)],
+                1,
+                false,
+            ),
+            L::Driver => (
+                vec![
+                    format!("unbind {}:1.0 from r8152", self.port),
+                    format!("bind {}:1.0 to r8152", self.port),
+                ],
+                2,
+                false,
+            ),
+            L::Port => (
+                vec![
+                    format!("port {} power off", self.port),
+                    format!("port {} power on", self.port),
+                ],
+                3,
+                true,
+            ),
+        };
+        if !wait(Duration::from_secs(secs)) {
+            return Err(HalError::Io("stopped".into()));
+        }
+        Ok(crate::nic::UsbResetReport {
+            steps,
+            power_cycled: power,
+            back: true,
+        })
+    }
+}
+
+impl NicHardware {
+    /// A lab port of [`LAB_USB`] becomes a RTL8153 behind a USB port that
+    /// negotiated `speed` Mbit/s.
+    fn with_lab_usb(mut self, name: &str, n: u32) -> Self {
+        let Some((_, speed)) = LAB_USB.iter().find(|(p, _)| *p == name) else {
+            return self;
+        };
+        let port = format!("{n}-1");
+        self.bus = Some("usb".into());
+        self.bus_address = Some(format!("{port}:1.0"));
+        self.vendor_id = Some(0x0bda);
+        self.device_id = Some(0x8153);
+        self.vendor = Some("Realtek".into());
+        self.model = Some("USB 10/100/1000 LAN".into());
+        self.driver = Some("r8152".into());
+        self.firmware = None;
+        self.numa_node = None;
+        self.rx_queues = Some(1);
+        self.tx_queues = Some(1);
+        self.combined_channels = None;
+        self.combined_channels_max = None;
+        self.usb = Some(crate::nic::UsbInfo {
+            port,
+            speed_mbps: Some(*speed),
+            adapter_max_mbps: Some(5000),
+            port_max_mbps: Some(*speed),
+            version: Some(if *speed >= 5000 { "3.00" } else { "2.10" }.into()),
+            vendor_id: Some(0x0bda),
+            product_id: Some(0x8153),
+            manufacturer: Some("Realtek".into()),
+            product: Some("USB 10/100/1000 LAN".into()),
+            serial: Some(format!("CRU{n:05}")),
+            revision: Some("3100".into()),
+            max_power_ma: Some(288),
+            autosuspend: Some(false),
+            lpm: (*speed >= 5000).then(|| "0".into()),
+            over_current: Some(0),
+            tx_timeouts: Some(0),
+            port_power_switch: true,
+        });
+        self
+    }
+}
+
 fn lab_mac(index: usize) -> String {
     format!("02:00:00:00:00:{:02X}", (index + 1) & 0xFF)
 }
@@ -1030,6 +1128,28 @@ impl Hal for VirtualHal {
         Ok(m)
     }
 
+    /// The lab's USB adapters ([`LAB_USB`]) recover in simulated time:
+    /// the link in 1 s, the driver in 2 s, the port (its hub switches power
+    /// per port) in 3 s.
+    fn usb_reset(
+        &mut self,
+        name: &IfName,
+        level: crate::nic::UsbResetLevel,
+    ) -> Result<Box<dyn crate::nic::UsbReset>, HalError> {
+        self.lab_port(name)?;
+        let Some(n) = self
+            .port_index(name)
+            .filter(|_| LAB_USB.iter().any(|(p, _)| *p == name.as_str()))
+        else {
+            return Err(HalError::Rejected(format!("'{name}' is not a USB adapter")));
+        };
+        Ok(Box::new(LabUsbReset {
+            name: name.to_string(),
+            port: format!("{}-1", n.saturating_add(1)),
+            level,
+        }))
+    }
+
     /// Copper ports pass, except ether7's damaged cable (pair C shorted
     /// at 23.5 m); a disabled port's cable is open at its far end.
     fn cable_tester(&mut self, name: &IfName) -> Result<Box<dyn CableTest>, HalError> {
@@ -1143,7 +1263,8 @@ impl Hal for VirtualHal {
             ],
             notes: vec!["simulated by the virtual lab".into()],
             ..NicHardware::default()
-        })
+        }
+        .with_lab_usb(name.as_str(), n))
     }
 
     /// The `poll` counters plus rare, deterministic errors (one CRC error

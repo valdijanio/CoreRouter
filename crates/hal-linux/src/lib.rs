@@ -983,6 +983,7 @@ mod linux {
                         mac: l.mac,
                         unmanaged: o.reason().map(str::to_owned),
                         errors: l.errors,
+                        bus: l.bus,
                     })
                 })
                 .collect()
@@ -1242,6 +1243,14 @@ mod linux {
 
         fn packet_capture(&self) -> Result<corerouter_hal::capture::SharedCapture, String> {
             Ok(std::sync::Arc::new(crate::capture::HostCapture))
+        }
+
+        fn usb_reset(
+            &mut self,
+            name: &IfName,
+            level: corerouter_hal::nic::UsbResetLevel,
+        ) -> Result<Box<dyn corerouter_hal::nic::UsbReset>, HalError> {
+            Ok(Box::new(crate::nic::usb_reset(name.as_str(), level)?))
         }
 
         fn cable_tester(&mut self, name: &IfName) -> Result<Box<dyn CableTest>, HalError> {

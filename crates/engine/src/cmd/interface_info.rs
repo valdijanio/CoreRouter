@@ -20,7 +20,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         always, monitor)
     .positional("name"),
     cmd!(query "interface.hardware", "Interface Hardware", [], None,
-        "{name: string} → {name, available, reason, mac, perm_mac, min_mtu, max_mtu, bus, bus_address, vendor_id, device_id, subsystem_vendor_id, subsystem_device_id, vendor, model, subsystem, driver, driver_version, firmware, serial, numa_node, rx_queues, tx_queues, combined_channels, combined_channels_max, irqs, ring_rx, ring_rx_max, ring_tx, ring_tx_max, offloads: [{name, feature, active, fixed}], notes}",
+        "{name: string} → {name, available, reason, mac, perm_mac, min_mtu, max_mtu, bus, bus_address, vendor_id, device_id, subsystem_vendor_id, subsystem_device_id, vendor, model, subsystem, driver, driver_version, firmware, serial, numa_node, rx_queues, tx_queues, combined_channels, combined_channels_max, irqs, ring_rx, ring_rx_max, ring_tx, ring_tx_max, offloads: [{name, feature, active, fixed}], usb: null | {port, speed_mbps, speed, adapter_max_mbps, adapter, port_max_mbps, version, vendor_id, product_id, manufacturer, product, serial, revision, max_power_ma, autosuspend, lpm, over_current, tx_timeouts (NETDEV WATCHDOG), port_power_switch, slow_port (the port caps the adapter), cap_mbps, alert}, notes}",
         always, hardware)
     .positional("name"),
     cmd!(query "interface.stats", "Interface Statistics", [], None,
@@ -180,6 +180,7 @@ fn hardware(s: &mut Session, p: &Value) -> Result<Value> {
     for (key, id) in ids {
         out.insert(key.into(), hex(id));
     }
+    out.insert("usb".into(), crate::usb_nic::detail(s, &name, &hw));
     out.insert("name".into(), json!(name));
     out.insert("available".into(), json!(available));
     out.insert("reason".into(), json!(reason));
