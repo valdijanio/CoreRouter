@@ -175,6 +175,9 @@ pub struct Inputs {
     /// G1.29b: USB Ethernet adapters and, for each, the alert of a port
     /// slower than the adapter. Empty: no USB adapter (no check then).
     pub usb: Vec<(String, Option<String>)>,
+    /// G1.29d: (adapter, watchdog actions in the last hour, gave up, the
+    /// last stall's reason).
+    pub usb_watchdog: Vec<(String, usize, bool, Option<String>)>,
     /// Whether any reading exists at all.
     pub readings: bool,
 }
@@ -606,6 +609,28 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
                 reason: format!("adaptador USB numa porta mais lenta que ele, o tráfego fica limitado sem erro nenhum: {list}"),
                 action: Some("Ligue o adaptador numa porta USB 3 (azul ou marcada SS), direto, com cabo USB 3; a aba Hardware da interface mostra a velocidade negociada.".into()) });
         }
+        // G1.29d: what the watchdog did in the last hour.
+        let (key, name) = ("interface.usb.watchdog", "USB watchdog");
+        let gave: Vec<&str> = i.usb_watchdog.iter().filter(|w| w.2).map(|w| w.0.as_str()).collect();
+        let acted: Vec<String> = i
+            .usb_watchdog
+            .iter()
+            .filter(|w| w.1 > 0 && !w.2)
+            .take(3)
+            .map(|(n, k, _, why)| format!("{n} recuperado {k}× ({})", why.as_deref().unwrap_or("travou")))
+            .collect();
+        if !gave.is_empty() {
+            out.push(Check { key, name, severity: Severity::Error, value: Some(gave.join(", ")),
+                reason: format!("adaptador USB que continua travando depois de várias recuperações na última hora: {}; o vigia parou de agir", gave.join(", ")),
+                action: Some("Confira o cabo, a alimentação da porta (hub com fonte) e o adaptador; troque de porta. O log (tópico interface) tem cada travamento e o motivo.".into()) });
+        } else if !acted.is_empty() {
+            out.push(Check { key, name, severity: Severity::Warning, value: Some(acted.len().to_string()),
+                reason: format!("o vigia recuperou adaptador USB travado na última hora: {}", acted.join("; ")),
+                action: Some("Veja a aba Hardware (Tx Timeouts, Recoveries) e o log; travamentos repetidos pedem outra porta, outro cabo ou uma placa PCIe.".into()) });
+        } else {
+            out.push(Check { key, name, severity: Severity::Ok, value: None,
+                reason: "nenhum adaptador USB travou na última hora".into(), action: None });
+        }
     }
     out
 }
@@ -756,6 +781,7 @@ impl Session {
                 (l.name.to_string(), alert)
             })
             .collect();
+        i.usb_watchdog = self.usb_watchdog_health();
         i.bgp_no_eor = self.routing_status().map(|st| {
             let quiet = bgp_without_eor(st)
                 .map(|b| b.connection.clone().unwrap_or_else(|| b.remote_address.clone()))
@@ -865,6 +891,7 @@ mod tests {
             bgp_no_eor: Some((1, Vec::new())),
             bgp_gr_no_bfd: Some((1, Vec::new())),
             usb: Vec::new(),
+            usb_watchdog: Vec::new(),
         }
     }
 

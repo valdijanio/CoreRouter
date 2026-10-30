@@ -1245,6 +1245,10 @@ mod linux {
             Ok(std::sync::Arc::new(crate::capture::HostCapture))
         }
 
+        fn usb_tx_timeouts(&mut self, name: &IfName) -> Option<u64> {
+            crate::nic::tx_timeouts(&std::path::Path::new("/sys/class/net").join(name.as_str()))
+        }
+
         fn usb_reset(
             &mut self,
             name: &IfName,
