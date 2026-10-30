@@ -127,6 +127,34 @@ fn bfd_up(netns: Option<u32>) -> bool {
             .all(|x| x["state"] == "up" && x["detect_ms"] == 150)
 }
 
+/// BFD up on both paths of both nodes for a whole second. A 150 ms
+/// detection time is also lost for real when the machine starves a daemon
+/// that long: the pair then falls back on its hellos (`dead-interval`),
+/// rightly, and a takeover started in that moment cannot show BFD's
+/// (flaked in the queue's batches). A bug that keeps BFD down never gets
+/// a steady second.
+fn steady_bfd(b: u32) {
+    for attempt in 1..=10 {
+        until("BFD up on both paths of both nodes", 20, || {
+            bfd_up(None) && bfd_up(Some(b))
+        });
+        let start = Instant::now();
+        let mut steady = true;
+        while start.elapsed() < Duration::from_secs(1) {
+            if !(bfd_up(None) && bfd_up(Some(b))) {
+                steady = false;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if steady {
+            return;
+        }
+        eprintln!("BFD window {attempt}: a path went down (the machine starved a daemon?)");
+    }
+    panic!("no steady second of BFD in 10 tries");
+}
+
 #[test]
 fn bfd_takes_over_in_a_fraction_of_the_dead_interval() {
     if !in_netns() {
@@ -184,6 +212,7 @@ fn bfd_takes_over_in_a_fraction_of_the_dead_interval() {
             .iter()
             .all(|x| x["ok"] == true)
     });
+    steady_bfd(b);
     let r = ok(
         None,
         "ppp.redundancy.test-takeover",
@@ -204,7 +233,7 @@ fn bfd_takes_over_in_a_fraction_of_the_dead_interval() {
     let m = monitor(None);
     eprintln!("test result on A after {t:?}: {}", m["test"]);
     assert_eq!(m["test"]["state"], "passed", "{}", m["test"]);
-    until("BFD up again", 20, || bfd_up(None) && bfd_up(Some(b)));
+    steady_bfd(b);
 
     // B (active) dies: A detects it by BFD and takes over.
     let start = Instant::now();

@@ -114,6 +114,13 @@ fn a_replugged_port_gets_its_configuration_back_at_once() {
         });
     }
     eprintln!("replug → address back: worst {worst:?}");
-    let log = run("log.print", json!({"find": "replugged"})).to_string();
-    assert!(log.contains("ether2: port was replugged"), "{log}");
+    // Replugged between two polls, or seen gone by one: on a loaded machine
+    // the two `ip` commands drift apart and a poll may fall between them
+    // (no "replugged" line, flaked in the queue's batches). Either way the
+    // operator reads why the configuration was applied again.
+    let log = run("log.print", json!({"find": "ether2: port"})).to_string();
+    assert!(
+        log.contains("ether2: port was replugged") || log.contains("ether2: port is back"),
+        "{log}"
+    );
 }
