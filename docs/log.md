@@ -9140,3 +9140,43 @@ continuação indentadas).
   cada 1…60 s. Um commit com boot pendente copia a config uma vez (só nesse estado). Nada a
   dividir em threads: os applies são sequenciais por dependência (rotas precisam dos endereços,
   firewall e MPLS das interfaces) e o kernel serializa o netlink de qualquer forma.
+
+- 2026-10-30 — G1.29g: Reset USB de porta fora da configuração (G1.29g). A aba Hardware mostrava os botões Down/Up,
+  Restart Driver e Reset USB Port de um adaptador USB que não está na configuração (o `eth0` da VM
+  `corerouter-teste`, que voltou de um reset com o nome do kernel), e o `interface.usb.reset`
+  recusava com "no interface 'eth0'". Escolha do usuário: o roteador não mexe no que não gerencia
+  (como o `refuse_unmanaged`). Numa porta fora da configuração os três botões e a chave do vigia
+  ficam desligados, com o motivo no hover; uma linha âmbar diz por quê ("Not in the configuration
+  (appeared after boot)"), com ⓘ em português, e o botão **Adopt** manda
+  `interface.ethernet.adopt` (G1.6t). Num daemon sem esse comando, o Adopt fica desligado com o
+  motivo do `Avail` ("its daemon is an older build").
+
+  Como testar: `cargo test -p corerouter-ui --lib usb_nic`
+  (`a_port_outside_the_configuration_offers_adopt_not_reset`). Na tela: Interfaces › `eth0` (fora
+  da configuração) › Hardware; print em `docs/changes/G1.29g-screenshots/` (GUI desta branch
+  ligada à VM de teste, só leitura).
+
+- 2026-10-30 — G1.6u: `/config` cheio na atualização (G1.6u). Na VM `corerouter-teste` (56 MB) o snapshot da
+  configuração copiava 13,8 MB, dos quais 10,7 MB eram uma só revisão do histórico (`rev-81.json`,
+  a rodada de validação com ~10 mil rotas) e 3,7 MB os gráficos; com `config-a` e `config-b` o
+  disco encheu, a cópia parcial `config-a.new` ficou e nenhum comando a apagava.
+
+  - **Hard links:** o que o `storage-fs` só troca por rename (`running.json*`, `rev-*.json`,
+    `state-*.json`) entra no snapshot por link; o journal e as chaves são copiados. O snapshot da
+    VM cai de 13,8 MB para ~1 kB (**medido** no teste `config_full` com a mesma forma).
+  - **`graphs/` fora** do snapshot e do restore: histórico de tráfego não é configuração, e voltar
+    apagaria as horas do teste.
+  - **Espaço antes:** `install`/`upload`/`download` e o Tuning › Boot conferem o `/config`
+    (`statvfs`) antes de tocar no slot e recusam com "needs X and Y is free (biggest: …)"; uma
+    cópia que falha mesmo assim é apagada.
+  - **De longe:** `system.package.snapshot.remove {name?, all?, dry_run?}` (sem nome: só as cópias
+    parciais; `all`: os snapshots também; nunca o backup ou a troca de um teste em andamento, que a
+    sessão confere no plano e o serviço de novo antes de apagar). `system.package.print` traz
+    `config_space` (livre, necessário, o que ocupa), `own_bytes` por snapshot e `partials`. A
+    saúde do disco, quando o pior é o `/config`, lista os snapshots com o tamanho e o comando.
+
+  Como testar: `cargo test -p corerouter-sysupdate --test config_full` (três casos num tmpfs de
+  3 MiB num mount namespace sem root: a história grande cabe linkada; sem espaço é recusado antes
+  de gravar o slot; um `/config` a 0 byte livre com `config-a.new` se recupera por
+  `remove_snapshots` e a atualização passa). Na VM: `system.package.snapshot.remove
+  {all: true, dry_run: true}`, depois `{name: "config-a.new"}`.
