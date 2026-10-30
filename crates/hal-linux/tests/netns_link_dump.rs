@@ -9,6 +9,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
+use corerouter_hal_linux::owner::KernelLink;
 use corerouter_hal_linux::{link_dump, links_rtnetlink};
 
 const ENV: &str = "COREROUTER_NETNS_TESTS";
@@ -59,9 +60,7 @@ fn ip_batch(lines: &[String]) {
     );
 }
 
-fn sorted(
-    mut v: Vec<corerouter_hal_linux::owner::KernelLink>,
-) -> Vec<corerouter_hal_linux::owner::KernelLink> {
+fn sorted(mut v: Vec<KernelLink>) -> Vec<KernelLink> {
     v.sort_by_key(|l| l.index);
     v
 }
@@ -102,13 +101,43 @@ fn reads_what_rtnetlink_read_on_every_kind_and_at_scale() {
     let old = sorted(links_rtnetlink().unwrap());
     assert_eq!(lean.len(), old.len());
     for (a, b) in lean.iter().zip(&old) {
-        assert_eq!(a, b, "{}", b.name);
+        // A link just brought up sends between the two dumps (IPv6 DAD,
+        // MLD): its counters only grow. The rest must match exactly.
+        let grew = counters(a).iter().zip(counters(b)).all(|(x, y)| *x <= y);
+        assert!(grew, "{}: {a:?} then {b:?}", b.name);
+        assert_eq!(without_counters(a), without_counters(b), "{}", b.name);
     }
     let kinds: Vec<&str> = lean.iter().filter_map(|l| l.kind.as_deref()).collect();
     for k in ["dummy", "vlan", "bridge", "veth", "bond", "vrf", "macvlan"] {
         assert!(kinds.contains(&k), "{k} in {kinds:?}");
     }
     assert!(lean.len() > 3000);
+}
+
+/// Packets, bytes, errors and drops, each read once per dump.
+fn counters(l: &KernelLink) -> [u64; 8] {
+    let e = l.errors.unwrap_or_default();
+    [
+        l.rx_packets,
+        l.tx_packets,
+        l.rx_bytes,
+        l.tx_bytes,
+        e.rx_errors,
+        e.tx_errors,
+        e.rx_dropped,
+        e.tx_dropped,
+    ]
+}
+
+fn without_counters(l: &KernelLink) -> KernelLink {
+    KernelLink {
+        rx_packets: 0,
+        tx_packets: 0,
+        rx_bytes: 0,
+        tx_bytes: 0,
+        errors: l.errors.map(|_| corerouter_hal::LinkErrors::default()),
+        ..l.clone()
+    }
 }
 
 fn dumps() -> u64 {
