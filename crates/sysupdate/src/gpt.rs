@@ -1,8 +1,10 @@
 //! The GPT of the boot disk (UEFI 2.10 §5.3), read to find the slots by
 //! partition name (`rootfs-a`, `rootfs-b`, `efi`, `config`) and to name the
-//! ESP in the boot entries. Only the primary header is read; the router
-//! never rewrites the table (the layout is fixed since G1.6a). [`build`]
+//! ESP in the boot entries. Only the primary header is read. [`build`]
 //! writes one (G1.6c): the installer's target disk and the hybrid ISO.
+//! [`grow_last`] (G1.6v) is the one rewrite of a disk in use: the last
+//! partition (`config`) to the end of the disk, every other entry, GUID
+//! and number as it was.
 
 use std::io::{Read, Seek, SeekFrom};
 
@@ -90,6 +92,174 @@ fn parse(
         });
     }
     Ok(out)
+}
+
+/// G1.6v: the smallest `/config` worth a new table; a disk that leaves
+/// less keeps its layout (and says so).
+pub const CONFIG_MIN: u64 = 256 << 20;
+/// Partition ends are aligned to this (as genimage and parted do).
+pub const ALIGN: u64 = 1 << 20;
+
+/// What [`grow_plan`] decided for the last partition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Grow {
+    /// From `from` to `to` bytes (the table to write).
+    Grow { from: u64, to: u64 },
+    /// It already reaches the end of the disk (less than [`ALIGN`] left).
+    Full { bytes: u64 },
+    /// Grown or not, it is under the minimum: the layout stays (and the
+    /// boot log says so).
+    TooSmall { could: u64, min: u64 },
+}
+
+/// The whole table, as [`grow_last`] rewrites it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Table {
+    pub disk_guid: String,
+    /// (entry, attribute bits), in entry order.
+    pub parts: Vec<(Entry, u64)>,
+}
+
+/// The table of `disk`: the primary header and every used entry with its
+/// attributes. Only the layout [`build`] and genimage write (128 entries
+/// of 128 bytes) is accepted.
+pub fn read_table(disk: &mut (impl Read + Seek), lbs: u64) -> Result<Table, String> {
+    let mut hdr = vec![0u8; 92];
+    disk.seek(SeekFrom::Start(lbs)).map_err(|e| e.to_string())?;
+    disk.read_exact(&mut hdr)
+        .map_err(|e| format!("GPT header: {e}"))?;
+    if hdr.get(..8) != Some(b"EFI PART") {
+        return Err("no GPT on the boot disk".into());
+    }
+    let bad = || "GPT header truncated".to_string();
+    let (lba, count, size) = (
+        u64_at(&hdr, 72).ok_or_else(bad)?,
+        u32_at(&hdr, 80).ok_or_else(bad)?,
+        u32_at(&hdr, 84).ok_or_else(bad)?,
+    );
+    if (count, size) != (ENTRIES, ENTRY_SIZE) {
+        return Err(format!(
+            "GPT of {count} entries of {size} bytes: not one this router writes"
+        ));
+    }
+    let disk_guid = crate::efi::guid_text(hdr.get(56..72).unwrap_or(&[])).ok_or_else(bad)?;
+    let mut raw = vec![0u8; (count * size) as usize];
+    disk.seek(SeekFrom::Start(lba * lbs))
+        .map_err(|e| e.to_string())?;
+    disk.read_exact(&mut raw)
+        .map_err(|e| format!("GPT entries: {e}"))?;
+    let entries = parse(&hdr, |_, _| Ok(raw.clone()))?;
+    let parts = entries
+        .into_iter()
+        .map(|e| {
+            let at = (e.number as usize - 1) * size as usize + 48;
+            let attrs = u64_at(&raw, at).unwrap_or(0);
+            (e, attrs)
+        })
+        .collect();
+    Ok(Table { disk_guid, parts })
+}
+
+/// Last usable block of a disk of `disk_lbas` blocks with the table
+/// [`build`] writes (128 entries at the end, then the backup header).
+fn last_usable(disk_lbas: u64, lbs: u64) -> u64 {
+    let table_lbas = u64::from(ENTRIES * ENTRY_SIZE).div_ceil(lbs);
+    disk_lbas.saturating_sub(2 + table_lbas)
+}
+
+/// The last block a partition may end on, on a disk of `disk_lbas` blocks:
+/// the last usable one, rounded down to [`ALIGN`].
+pub fn aligned_last(disk_lbas: u64, lbs: u64) -> u64 {
+    let align = (ALIGN / lbs).max(1);
+    ((last_usable(disk_lbas, lbs) + 1) / align * align).saturating_sub(1)
+}
+
+/// Where partition `name` can end on a disk of `disk_lbas` blocks: the last
+/// usable block, rounded down to [`ALIGN`]. It must be the last partition.
+pub fn grow_plan(
+    t: &Table,
+    name: &str,
+    disk_lbas: u64,
+    lbs: u64,
+    min: u64,
+) -> Result<(Grow, u64), String> {
+    let (e, _) = t
+        .parts
+        .iter()
+        .find(|(e, _)| e.name == name)
+        .ok_or_else(|| format!("no partition named '{name}'"))?;
+    if t.parts.iter().any(|(o, _)| o.first_lba > e.first_lba) {
+        return Err(format!(
+            "partition '{name}' is not the last one: it cannot grow"
+        ));
+    }
+    let last = aligned_last(disk_lbas, lbs).max(e.last_lba);
+    let from = e.size_lba() * lbs;
+    let to = (last + 1 - e.first_lba) * lbs;
+    // `to` ≥ `from`: the partition never shrinks.
+    let grow = if to < min {
+        Grow::TooSmall { could: to, min }
+    } else if to < from + ALIGN {
+        Grow::Full { bytes: from }
+    } else {
+        Grow::Grow { from, to }
+    };
+    Ok((grow, last))
+}
+
+/// G1.6v: rewrites the table of `disk` (a block device or an image of
+/// `disk_bytes`) with partition `name` reaching the end of the disk, when
+/// it grows to at least `min` bytes. Entries keep their number (the boot
+/// entries name partitions by number), GUID, type and attributes. The
+/// primary table is written first, then the backup at the end of the disk
+/// (moved there when the disk grew); a cut between the two leaves the old
+/// backup, which the firmware reads if the primary is bad and which
+/// describes the same ESP and slots. The kernel sees the new size at the
+/// next boot; the filesystem grows then ([`Grow::Grow`] says by how much).
+#[cfg(unix)]
+pub fn grow_last(
+    disk: &std::fs::File,
+    disk_bytes: u64,
+    lbs: u64,
+    name: &str,
+    min: u64,
+) -> Result<Grow, String> {
+    use std::os::unix::fs::FileExt;
+    let mut r = disk;
+    let t = read_table(&mut r, lbs)?;
+    let (grow, last) = grow_plan(&t, name, disk_bytes / lbs, lbs, min)?;
+    if !matches!(grow, Grow::Grow { .. }) {
+        return Ok(grow);
+    }
+    for (i, (e, _)) in t.parts.iter().enumerate() {
+        if e.number as usize != i + 1 {
+            return Err(format!(
+                "GPT entry {} follows an empty one: rewriting it would renumber the partitions",
+                e.number
+            ));
+        }
+    }
+    let parts: Vec<NewPart> = t
+        .parts
+        .iter()
+        .map(|(e, attrs)| NewPart {
+            name: e.name.clone(),
+            type_guid: e.type_guid.clone(),
+            guid: e.guid.clone(),
+            first_lba: e.first_lba,
+            last_lba: if e.name == name { last } else { e.last_lba },
+            attrs: *attrs,
+        })
+        .collect();
+    let (primary, backup_at, backup) = build(disk_bytes / lbs, lbs, &t.disk_guid, &parts)?;
+    // The protective MBR and the primary header and entries: block 0 on.
+    disk.write_all_at(&primary, 0)
+        .map_err(|e| format!("GPT: {e}"))?;
+    disk.sync_data().map_err(|e| format!("GPT: {e}"))?;
+    disk.write_all_at(&backup, backup_at)
+        .map_err(|e| format!("backup GPT: {e}"))?;
+    disk.sync_data().map_err(|e| format!("backup GPT: {e}"))?;
+    Ok(grow)
 }
 
 /// A partition [`build`] writes.
@@ -338,5 +508,135 @@ mod tests {
         assert!(build(40, 512, g, &[]).is_err(), "too small");
         assert!(build(16384, 520, g, &[]).is_err());
         assert!(build(16384, 512, "nope", &[]).is_err());
+    }
+
+    /// The test VM's disk: 705 MiB and the 20 KiB genimage leaves for the
+    /// backup table (`qemu-img info`: 739 266 560 bytes).
+    const VM_DISK: u64 = 739_266_560;
+
+    /// The image's layout (G1.6a), in MiB: efi 128, rootfs-a and -b 256,
+    /// config 64, on a sparse file of `disk` bytes.
+    fn image(path: &std::path::Path, disk: u64) -> std::fs::File {
+        let mib = (1u64 << 20) / 512;
+        let mut parts = Vec::new();
+        let mut at = mib;
+        for (name, size, attrs) in [
+            ("efi", 128, 4u64),
+            ("rootfs-a", 256, 0),
+            ("rootfs-b", 256, 0),
+            ("config", 64, 0),
+        ] {
+            let mut p = part(name, at, at + size * mib - 1);
+            p.attrs = attrs;
+            p.guid = format!("00000000-0000-0000-0000-{:012x}", at);
+            parts.push(p);
+            at += size * mib;
+        }
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .unwrap();
+        f.set_len(disk).unwrap();
+        let (primary, backup_at, backup) = build(
+            disk / 512,
+            512,
+            "39dfcaa2-2c8a-4912-acaa-6af0c68b5350",
+            &parts,
+        )
+        .unwrap();
+        use std::os::unix::fs::FileExt;
+        f.write_all_at(&primary, 0).unwrap();
+        f.write_all_at(&backup, backup_at).unwrap();
+        f
+    }
+
+    #[test]
+    fn config_grows_to_the_end_of_a_bigger_disk_and_nothing_else_moves() {
+        let dir = std::env::temp_dir().join(format!("sysupdate-gpt-grow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("disk");
+        // The test VM: 705 MiB, config already at the end.
+        let f = image(&path, VM_DISK);
+        let before = read_table(&mut &f, 512).unwrap();
+        assert_eq!(
+            grow_last(&f, VM_DISK, 512, "config", CONFIG_MIN).unwrap(),
+            Grow::TooSmall {
+                could: 64 << 20,
+                min: CONFIG_MIN
+            },
+            "nothing to grow into, and under the minimum: said"
+        );
+        // Grown to 800 MiB: config could be ~95 MiB, under the minimum.
+        f.set_len(800 << 20).unwrap();
+        assert!(matches!(
+            grow_last(&f, 800 << 20, 512, "config", CONFIG_MIN).unwrap(),
+            Grow::TooSmall { could, .. } if could < CONFIG_MIN
+        ));
+        assert_eq!(read_table(&mut &f, 512).unwrap(), before, "layout kept");
+        // 2 GiB: config takes the rest, aligned to 1 MiB.
+        f.set_len(2048 << 20).unwrap();
+        let g = grow_last(&f, 2048 << 20, 512, "config", CONFIG_MIN).unwrap();
+        assert_eq!(
+            g,
+            Grow::Grow {
+                from: 64 << 20,
+                to: (2048 - 1 - 128 - 512 - 1) << 20
+            }
+        );
+        let after = read_table(&mut &f, 512).unwrap();
+        assert_eq!(after.disk_guid, before.disk_guid);
+        for ((a, aa), (b, ba)) in after.parts.iter().zip(&before.parts) {
+            assert_eq!(
+                (a.number, &a.name, &a.guid, &a.type_guid, a.first_lba, aa),
+                (b.number, &b.name, &b.guid, &b.type_guid, b.first_lba, ba)
+            );
+            if a.name != "config" {
+                assert_eq!(a.last_lba, b.last_lba);
+            }
+        }
+        assert_eq!(after.parts[0].1, 4, "the ESP keeps its attribute");
+        // The backup moved to the new end, with the same entries.
+        let mut tail = vec![0u8; 512];
+        use std::os::unix::fs::FileExt;
+        f.read_exact_at(&mut tail, (2048 << 20) - 512).unwrap();
+        assert_eq!(&tail[..8], b"EFI PART");
+        assert_eq!(
+            grow_last(&f, 2048 << 20, 512, "config", CONFIG_MIN).unwrap(),
+            Grow::Full { bytes: g_to(&g) }
+        );
+        // Only the last partition grows.
+        assert!(
+            grow_last(&f, 2048 << 20, 512, "rootfs-b", 0)
+                .unwrap_err()
+                .contains("not the last")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn g_to(g: &Grow) -> u64 {
+        match g {
+            Grow::Grow { to, .. } => *to,
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn a_table_with_a_hole_is_not_renumbered() {
+        let dir = std::env::temp_dir().join(format!("sysupdate-gpt-hole-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("disk");
+        let f = image(&path, 2048 << 20);
+        // Entry 3 (rootfs-b) emptied: config is entry 4 after a hole.
+        use std::os::unix::fs::FileExt;
+        f.write_all_at(&[0u8; 128], 1024 + 2 * 128).unwrap();
+        assert!(
+            grow_last(&f, 2048 << 20, 512, "config", CONFIG_MIN)
+                .unwrap_err()
+                .contains("renumber")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

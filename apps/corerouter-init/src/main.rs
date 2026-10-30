@@ -19,6 +19,8 @@ mod console;
 #[cfg(target_os = "linux")]
 mod ctl;
 #[cfg(target_os = "linux")]
+mod grow;
+#[cfg(target_os = "linux")]
 mod install;
 #[cfg(target_os = "linux")]
 mod links;

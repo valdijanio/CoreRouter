@@ -9180,3 +9180,108 @@ continuação indentadas).
   de gravar o slot; um `/config` a 0 byte livre com `config-a.new` se recupera por
   `remove_snapshots` e a atualização passa). Na VM: `system.package.snapshot.remove
   {all: true, dry_run: true}`, depois `{name: "config-a.new"}`.
+
+- 2026-10-30 — G1.3g: Boot parcial por regra de firewall, com trava de gerência. Com a G1.3e, uma regra recusada pelo
+  kernel deixava o firewall inteiro de fora e o roteador sem filtro. Agora:
+
+  - `Hal::check_firewall` (novo, `crates/hal`): diz se o firewall de uma config carregaria, sem
+    carregar nada. `hal-linux`: o lote de sempre, enviado sem `NFNL_MSG_BATCH_END`; o kernel valida
+    cada mensagem, responde as recusadas e joga o lote fora (`NFNL_ABORT_VALIDATE`), como o
+    `nft --check`. O número de sequência de cada erro aponta a regra (`cr:*N`). Lido no fonte do
+    kernel 6.18.59 (`net/netfilter/nfnetlink.c:538-559`, `nf_tables_api.c`):
+    - o lote não para no primeiro erro;
+    - um erro que só a validação da tabela inteira acha (um `dst-nat` em `srcnat`, um jump em
+      laço) faz o kernel repetir o lote validando regra a regra. Isso só funciona numa tabela que
+      já existia antes do lote: o abort da checagem não liga a validação da netns como o commit
+      liga, e numa tabela criada no lote o erro se perde (**medido**: a primeira versão não acusou
+      nada). Por isso a checagem enche uma tabela de rascunho vazia (`corerouter-check`, criada
+      antes e apagada depois; nunca tem nada aplicado);
+    - com a validação ligada, toda regra depois da recusada também volta recusada (**medido**: 1
+      regra ruim, 7 recusas). Por isso só a primeira recusa vale: o engine a tira e checa de novo
+      (k regras ruins = k + 1 checagens).
+  - Engine (`boot_apply.rs`): a seção `firewall` recusada vira checagens até o resto carregar:
+    - sem nome de regra (outro backend, ou recusa de um conjunto ou chain), bisseção por prefixo,
+      também só com checagens (~log₂ n);
+    - teto de 16 regras e 64 checagens; passou disso, firewall inteiro de fora, como na G1.3e;
+    - nenhuma metade chega ao kernel: só o resultado final é aplicado, uma vez.
+  - Trava de gerência: antes de aplicar o firewall reduzido, as sondas do lockout do commit (as
+    mesmas do `force`, agora numa função só, `lockout::firewall_cut`) andam por conexões
+    sintéticas: cada endereço do roteador × cada porta de gerência, vindas de um host de cada rede,
+    de fora e das origens que a regra recusada cita (`src-address`, entradas da `src-address-list`).
+    As portas de gerência são `--control`, `--listen`, `--ws` e `--ws-listen`, que o daemon passa
+    ao boot (`Session::with_storage_env`, `BootEnv`), mais `www`/`www-ssl` da config. Se o
+    firewall salvo deixa entrar e o reduzido corta, **o firewall inteiro fica de fora** (escolha do
+    usuário, sem "aceitar gerência" no topo), com o motivo: "rule *N (…) was refused by the kernel
+    and, without it, the firewall would cut management: …; the whole firewall stays out until it is
+    fixed".
+  - A regra recusada aparece:
+    - `invalid` com flag I e `reason` ("refused at boot, left out until fixed: …") no
+      `ip.firewall.*.list`;
+    - em `storage.boot_apply_failed` e no `auth.whoami` (`{section: firewall, rule: "*N", error}`);
+    - na saúde (`boot.apply`, valor `firewall *N`);
+    - no aviso da CLI/MCP e no selo vermelho da GUI ("boot: firewall *N", ⓘ pt/en atualizado).
+  - Commit com regra de fora: um commit que mexe em outra regra entra e deixa a recusada de fora
+    (desligada no que vai ao kernel); o que muda ou tira a regra a tenta de novo, tudo ou nada.
+  - Retry: só com regras de fora, a espera vai até 10 min (não 60 s). Achá-las de novo custa ao
+    kernel uma validação por regra, com o lock do nftables preso (abaixo), e regra recusada no boot
+    costuma ficar recusada.
+  - Caminhos laterais de `apply`: cliente DHCP e DHCPv6, servidor DHCPv6, cliente PPPoE, gateway
+    check, resiliência DHCP e porta que volta. Agora passam por `Session::apply_side`, com a mesma
+    máscara do commit. Achados reproduzidos em teste antes da correção:
+    - com a seção `xdp` de fora, um lease DHCP era desfeito ("lease not applied: … xdp: attach
+      refused"), porque o `hal-linux` sincroniza o XDP em todo `apply`;
+    - uma porta replugada (G1.3d) não recebia a config de volta enquanto qualquer seção estivesse
+      de fora.
+    - A suspeita do MPLS anotada na G1.3e não se confirmou: lease não muda interfaces, e o MPLS só
+      sincroniza quando elas mudam.
+
+  Como testar:
+
+  - `cargo test -p corerouter-engine --test it boot_rules`: só a regra recusada sai, flag I, saúde,
+    `whoami`, nada parcial no kernel; o `accept` da gerência recusado com um `drop` no fim deixa o
+    firewall inteiro de fora e a gerência entra; `accept` que a gerência não usa sai sozinho; duas
+    recusadas, uma checagem por vez; bisseção sem nome de regra (≤ 9 checagens para 31 regras);
+    commit com regra de fora; retry até 10 min.
+  - `cargo test -p corerouter-engine --test it boot_side_paths`: lease com o XDP de fora; porta
+    replugada com o XDP de fora.
+  - Kernel real: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
+    corerouter-hal-linux --test netns_fw_check`. A checagem nomeia a regra recusada, uma por vez, e
+    não muda o ruleset em uso; o commit seguinte ainda parte do que foi carregado. O
+    `slow_checking_many_rules_with_one_bad` (camada lenta) mede 10 000 regras.
+
+  Desempenho e paralelismo: boot sem erro = um `apply`, como antes, sem checagem. Com regra
+  recusada, o boot faz 1 `apply` recusado, k + 1 checagens e 1 `apply` do firewall reduzido; a trava
+  de gerência anda no máximo 4096 conexões × 6 sondas, em memória. O custo alto é do kernel: com um
+  erro que só a validação acha, o replay valida a tabela a cada regra (O(n²)): 10 000 regras,
+  1,7 s contra 69 ms de uma checagem boa, em release (**medido**, abaixo), o mesmo que o próprio
+  `apply` recusado já custa; por isso o retry de regra espera até 10 min. Nada a dividir em threads: o nfnetlink serializa tudo no `commit_mutex` da netns, e cada
+  checagem depende da anterior.
+
+- 2026-10-30 — G1.3h: G1.3h descartada: o usuário preferiu não subir um firewall de emergência ("deixar mais simples").
+  Com a G1.3g, uma regra recusada no boot sai sozinha e o resto do firewall entra. O firewall
+  inteiro só fica de fora quando a checagem não isola a regra, ou quando o firewall sem ela cortaria
+  a gerência; então o aviso vermelho diz o motivo.
+
+- 2026-10-30 — G1.6v: `/config` ocupa o resto do disco (G1.6v). O `disk.img` continua com 64 MiB de `/config`;
+  `gpt::grow_last` reescreve só a entrada `config` da GPT (primária, depois a backup no fim do
+  disco; números, GUIDs, tipos e atributos ficam) quando isso dá ao `/config` pelo menos 256 MiB
+  (`gpt::CONFIG_MIN`), e `ext4::grow` cresce o filesystem desmontado (`e2fsck -f -p`,
+  `resize2fs`).
+
+  - O **instalador** já grava a partição até o fim do disco, e o primeiro boot cresce o ext4.
+    Reinstalar mantendo a configuração aceita a partição crescida.
+  - Num roteador **já instalado**, o init troca a tabela depois de montar o `/config`, fora de um
+    boot de teste. No boot seguinte, antes de montar, cresce o filesystem. Os dois passos vão para
+    o log do boot.
+  - Disco que deixa menos de 256 MiB (a VM de teste, de 705 MiB): o layout fica, e o log do boot
+    diz quanto caberia.
+  - Na imagem: e2fsprogs só com `e2fsck` e `resize2fs`, mais a libblkid/libuuid do util-linux.
+    **Estimado**: +1,2 MB no rootfs sem compressão, ~0,5 MB no squashfs zstd.
+
+  Como testar:
+  - `cargo test -p corerouter-sysupdate --lib -- gpt ext4 config_takes_the_rest`:
+    - a GPT de 705 MiB da VM e o disco aumentado para 800 MiB e para 2 GiB;
+    - um ext4 de 64 MiB do `mkfs.ext4` do host, crescido pelo `resize2fs` do host até 300 MiB;
+    - a instalação num disco de 300 MiB.
+  - Na VM: com ela desligada, `qemu-img resize vm/corerouter-teste.qcow2 2G`, depois dois boots;
+    o log do boot mostra "partition grown" e depois "growing the filesystem".

@@ -56,7 +56,7 @@ GPT com GUIDs fixos (imagem reprodutível):
 | `efi` | 128 MiB | vfat; `EFI/BOOT/BOOTX64.EFI` é o kernel do slot A (EFI stub), `EFI/COREROUTER/B.EFI` o do B, `A.HDR`/`B.HDR` os cabeçalhos assinados; sem bootloader (G1.6b: era 32 MiB, não cabiam dois kernels) |
 | `rootfs-a` | 256 MiB | squashfs zstd + a árvore do dm-verity logo depois (`rootfs.img`), tipo "Linux root x86-64" do Discoverable Partitions Spec |
 | `rootfs-b` | 256 MiB | o slot B, gravado pela primeira atualização |
-| `config` | 64 MiB | ext4 vazio, rótulo `config`; vira `/config` |
+| `config` | 64 MiB no `disk.img`; o resto do disco depois de instalado (G1.6v) | ext4 vazio, rótulo `config`; vira `/config` |
 
 A linha de comando básica está **dentro do kernel** (`CONFIG_CMDLINE`): `console=tty0
 console=ttyS0,115200 root=PARTUUID=<rootfs-a> rootfstype=squashfs ro
@@ -907,8 +907,16 @@ topo) deram o mesmo `bzImage`, `rootfs.squashfs`, `disk.img`, pacote e imagens d
 - **BIOS legado:** gap G1.6g (acima).
 - **cloud-init (NoCloud/`cidata`):** gap G1.6h; o IP inicial pelo G1.6d e pelo assistente.
 - **Só os daemons do FRR configurados** (hoje sobem os 8, ~88 MiB de RSS somado): gap G1.6i.
-- **`/config` do tamanho do resto do disco:** o layout é o do `disk.img` (64 MiB); crescer a
-  partição e o ext4 na instalação fica para quando o `/config` precisar (logs persistentes).
+- **`/config` do tamanho do resto do disco (G1.6v):** o `disk.img` continua com 64 MiB (imagens
+  pequenas). O instalador grava a partição `config` até o fim do disco (alinhada a 1 MiB) quando
+  isso lhe dá pelo menos 256 MiB; o primeiro boot cresce o ext4. Num roteador já instalado, o
+  init, fora de um boot de teste, reescreve só a entrada `config` da GPT (primária e backup; a
+  backup vai para o fim de um disco que cresceu; números, GUIDs e atributos ficam) e, no boot
+  seguinte, antes de montar, roda `e2fsck -f -p` e `resize2fs` no `/config` desmontado. Um disco
+  que deixaria menos de 256 MiB mantém o layout, e o log do boot diz quanto caberia. Da imagem,
+  só o `e2fsck` e o `resize2fs` do e2fsprogs ficam (`post-build.sh`). Uma VM criada do
+  `disk.img` (705 MiB) não tem para onde crescer: aumente o disco (`qemu-img resize`, com a VM
+  desligada) e o roteador cresce o `/config` em dois boots.
 - **Dois discos CoreRouter na mesma caixa:** os PARTUUIDs são fixos (a linha de comando embutida
   do fallback aponta para o `rootfs-a`); o instalador recusa um disco com a imagem do
   instalador, mas não um segundo CoreRouter. Anotado como risco.
