@@ -3,6 +3,11 @@
 //! timeouts (G1.4) and revision timestamps use this time. The same thread
 //! drives the DHCP clients (G4.7) four times a second, on a monotonic clock
 //! (a wall-clock jump must not expire a lease).
+//!
+//! The tick's link poll reads every link of the platform (on a BNG, one per
+//! subscriber: ~200 ms with 10 000, **medido**). It is read here with the
+//! session unlocked and only folded in under the lock (G1.3f), so commands,
+//! the GUI and MCP do not wait for the kernel.
 
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -33,8 +38,11 @@ pub fn spawn_clock(session: Shared) -> std::io::Result<thread::JoinHandle<()>> {
 }
 
 fn tick(session: &Shared) {
+    // The reader is taken under the lock; it reads with the lock released.
+    let reader = lock(session).link_reader();
+    let links = reader.map(|mut r| r.read());
     match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => lock(session).tick(d.as_secs()),
+        Ok(d) => lock(session).tick_sampled(d.as_secs(), links),
         Err(e) => log::warn!("clock before 1970, not ticking: {e}"),
     }
 }

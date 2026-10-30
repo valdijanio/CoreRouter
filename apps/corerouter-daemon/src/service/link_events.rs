@@ -9,8 +9,9 @@
 //! [`SETTLE`] and handed over in one call, so the session lock is taken once
 //! per burst, not once per event. One thread: the kernel queues the events
 //! in order on one socket, and reading one costs microseconds (**medido**,
-//! 3.4 µs per drain); the work is the engine's poll, under the session lock
-//! like the clock's.
+//! 3.4 µs per drain); the work is the engine's poll, whose kernel dump is
+//! read with the lock released too (G1.3f): the lock is held only to fold
+//! the links in.
 
 use std::time::Duration;
 
@@ -91,7 +92,7 @@ fn run(session: &Shared, health: &super::Health) -> Result<(), String> {
         match all {
             Events::Names(names) => {
                 let names: Vec<String> = names.into_iter().collect();
-                lock(session).link_events(Some(&names));
+                look(session, Some(&names));
                 // `system.service.print`: what the feed last handled (the
                 // netns test waits for its port here, not on a clock).
                 handled = handled.saturating_add(1);
@@ -101,12 +102,28 @@ fn run(session: &Shared, health: &super::Health) -> Result<(), String> {
             Events::Lost => {
                 lost = lost.saturating_add(1);
                 health.error(format!("the kernel dropped link events ({lost} times): looked at every port"));
-                lock(session).link_events(None);
+                look(session, None);
             }
             Events::None => {}
         }
     }
     Ok(())
+}
+
+/// `Session::link_events`, with the links read while the session is
+/// unlocked (G1.3f): the lock is held for the check and the fold, not for
+/// the kernel dump.
+#[cfg(target_os = "linux")]
+fn look(session: &Shared, names: Option<&[String]>) {
+    let reader = {
+        let s = lock(session);
+        if !s.link_events_wanted(names) {
+            return;
+        }
+        s.link_reader()
+    };
+    let links = reader.map(|mut r| r.read());
+    lock(session).link_events_sampled(links);
 }
 
 #[cfg(all(test, target_os = "linux"))]

@@ -18,6 +18,7 @@ pub mod icmp_ext;
 pub mod lab_conntrack;
 pub mod lab_flow;
 pub mod lab_neigh;
+pub mod link_reader;
 pub mod lsp;
 pub mod mpls;
 pub mod neigh;
@@ -231,6 +232,21 @@ pub trait Hal: Send {
 
     /// Sample live link state/counters.
     fn poll(&mut self) -> Vec<LinkState>;
+
+    /// A reader of the links that runs with the session unlocked (G1.3f,
+    /// see [`link_reader`]); `None` (the default): this backend reads them
+    /// cheaply, [`Hal::poll`] it is.
+    fn link_reader(&self) -> Option<Box<dyn link_reader::LinkReader>> {
+        None
+    }
+
+    /// [`Hal::poll`] with the links a [`Hal::link_reader`] read. `None`:
+    /// the sample is older than a change of the hal (an `apply` since the
+    /// reader was made); poll instead.
+    fn poll_sample(&mut self, sample: link_reader::LinkSample) -> Option<Vec<LinkState>> {
+        let _ = sample;
+        Some(self.poll())
+    }
 
     /// Physical ports of the applied config that the platform does not
     /// have (G1.3b, see [`absent`]): `apply` left them out and puts their

@@ -19,6 +19,7 @@
 //! platform has it, so an NTP step of the wall clock neither fires nor
 //! disarms the switch (audit #7); the wall clock is only shown (`since`).
 
+use corerouter_hal::link_reader::LinkSample;
 use corerouter_model::{Config, ConfigStore, Revision};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -166,6 +167,12 @@ impl Session {
     /// guard: a bug in one of the jobs must not take the daemon's clock
     /// thread down, nor leave a half-done undo pending (audit #6).
     pub fn tick(&mut self, now_unix: u64) {
+        self.tick_sampled(now_unix, None);
+    }
+
+    /// [`Session::tick`] with the links a [`Session::link_reader`] read
+    /// while the session was unlocked (G1.3f); `None`: poll here.
+    pub fn tick_sampled(&mut self, now_unix: u64, links: Option<LinkSample>) {
         self.safe_mode_mut().clock = Some(now_unix);
         let snapshot = self.store().candidate().clone();
         let ticked = crate::guard::run("tick", || {
@@ -173,7 +180,7 @@ impl Session {
             self.expire_safe_mode();
             self.expire_dynamic_addresses();
             self.expire_tasks();
-            self.poll_links();
+            self.poll_links(links);
             self.watch_routes();
             self.scan_modules();
             // G2.3c: CGNAT blocks on demand and port alerts.
