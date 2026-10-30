@@ -8467,3 +8467,53 @@ continuação indentadas).
   `.qcow2` e `.ova` ao rascunho com `gh release upload`; nunca cria tag nem publica. Passo a
   passo em `docs/release.md`. Testar: `cargo test -p corerouter-image -p xtask release`; ponta a
   ponta com uma chave temporária, uma tag local num clone descartável e `--dry-run`.
+
+- 2026-10-29 — G0.31i: O commit de `ip.route.set` (distância) sem ler do kernel todas as rotas (achado da validação
+  T1: 105 ms na VM com 60 000). Mudar a distância é tirar a rota da métrica antiga e pô-la na nova;
+  o `add` já tentava direto (G0.31 parte 5), mas o `del` lia os irmãos (`RTM_GETROUTE` da tabela
+  inteira) para saber se a rota era um caminho de um grupo ECMP.
+
+  - Agora o `del` vai direto quando a rota é a única de CoreRouter no seu grupo (tabela, prefixo,
+    métrica), antes e depois do commit (o conjunto `owned` que o plano já monta só para os destinos
+    tocados). `ESRCH`/`ENOENT`: já não estava lá, nada a desfazer.
+  - Um caminho de ECMP continua lendo os irmãos: no Linux 6.18 um `RTM_DELROUTE` de um caminho só
+    compara o primeiro nexthop (`fib_nh_match`, net/ipv4/fib_semantics.c, linhas 958–985) e
+    levaria a rota multipath inteira.
+  - `corerouter_hal_linux::route_dumps()` (oculto) conta as leituras, para o teste.
+
+  Como testar: `cargo xtask netns` (teste `a_distance_change_reads_no_route_table`: 500 rotas,
+  distância e remoção sem dump; distância de um caminho de ECMP lê os irmãos e o outro fica);
+  `COREROUTER_NETNS_BENCH=1 unshare --user --map-root-user --net -- cargo bench -p
+  corerouter-hal-linux --bench netns_apply -- one_of_60000`.
+
+- 2026-10-29 — G3.9fj: BGP: graceful restart com BFD (RFC 5882 §4.3), parte 3 de 5. Medido antes de expor a opção do FRR:
+  o BFD do CoreRouter roda no `corerouter-daemon`, e o `bfdd` só o comanda pelo plano de dados
+  distribuído.
+
+  **Medido** (2026-10-29, host, FRR 10.7.1, `scripts/bgp-crcr-userns.sh cbit`): GR e BFD de
+  100 ms × 3, `kill -9` no CR1, tudo de volta 3 s depois, ping do CR2 ao CR1 a cada 20 ms.
+
+  | O que morre no CR1 | O CR2 com a rota do CR1 | Pings perdidos |
+  |---|---|---|
+  | `bgpd` + `bfdd` | fica (o BFD segue no ar) | 1–105 de ~560 |
+  | `corerouter-daemon` + `bgpd` + `bfdd` | fica | 2–4 de ~564 |
+  | só o `corerouter-daemon` | sai em 416–423 ms (BFD down com a TCP no ar: Cease 10) | 144–154 de ~560 |
+
+  - Com a pilha inteira morta, a TCP cai primeiro. O FRR 10.7.1 não tira as rotas stale por causa
+    de um BFD down que chega depois: o `bgp_stop` mexe nos tempos de GR só com a sessão
+    estabelecida, e o `BGP_Stop` em Idle não limpa nada (`bgpd/bgp_fsm.c`).
+  - Por isso `neighbor X bfd check-control-plane-failure`, aprovado no escopo, não mudou nada.
+    Desligado, ligado só no helper e ligado nos dois lados, a rota ficou nas três rodadas
+    (**medido**). Fica de fora: uma opção sem efeito só confunde.
+  - O BFD agora repassa ao `bfdd` o bit C recebido do vizinho (`RBIT_CPI` no `remote_flags`); antes
+    ia sempre 0. O bit C enviado continua 0, por decisão: o BFD cai junto com o daemon enquanto o
+    kernel continua encaminhando, e C = 1 seria falso (RFC 5880 §6.8.7).
+  - Achado fora do escopo (avisado à sessão principal): o perfil BFD criado com
+    `routing.bfd.profile.add` some no reinício do daemon. O journal grava `"delta":{}` e o
+    `running.json` não tem `routing.bfd`. O laboratório recria o perfil depois do reinício.
+
+  Como testar: `cargo test -p corerouter-proto-bfd --lib session`,
+  `cargo test -p corerouter-daemon --bin corerouter-daemon bfd`; `scripts/bgp-crcr-userns.sh cbit`.
+
+  Desempenho e paralelismo: um bool a mais por pacote BFD recebido (guardado na sessão) e por
+  mudança de estado; nada no caminho por pacote além da cópia do bit, nada a dividir.
