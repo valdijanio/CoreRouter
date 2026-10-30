@@ -25,6 +25,8 @@ const MAX_PER_TICK: usize = 5000;
 const JOURNAL_EVERY: Duration = Duration::from_secs(2);
 /// Router-log lines one tick may add (a burst of new alert rows).
 const MAX_ALERTS: usize = 10;
+/// PID 1's tag in the kernel's log (`corerouter-init[1]: …`, G1.29f).
+const INIT_UNIT: &str = "corerouter-init";
 /// Lines older than this (the backlog read at start) never alert.
 const ALERT_AGE_US: u64 = 300 * 1_000_000;
 
@@ -165,10 +167,34 @@ pub(crate) fn hand_over(session: &Shared, batch: corerouter_hal::oslog::OsLogBat
         })
         .take(MAX_ALERTS)
         .collect();
-    let n = alerts.len();
+    // G1.29f: what PID 1 says (port names given to a card plugged in after
+    // boot, a rename that failed, a restarted daemon) also goes to the
+    // router's log: before, only the serial console had it.
+    let init: Vec<(&'static str, String)> = lines
+        .iter()
+        .zip(&pushed)
+        .filter(|(_, p)| matches!(p, Pushed::New(_)))
+        .filter(|(l, _)| l.time_us.saturating_add(ALERT_AGE_US) >= now_us)
+        .filter(|(l, _)| l.unit == INIT_UNIT && l.source != corerouter_hal::oslog::OsSource::Kernel)
+        .map(|(l, _)| {
+            let msg = l.message.split_once(": ").map_or(l.message.as_str(), |(_, m)| m);
+            let topic = if msg.starts_with("port names") { "interface" } else { "system" };
+            (topic, format!("init: {}", msg.chars().take(300).collect::<String>()))
+        })
+        .take(MAX_ALERTS)
+        .collect();
+    let n = alerts.len() + init.len();
     for (msg, level) in alerts {
         s.log_event(
             &["system", level],
+            corerouter_engine::logging::DAEMON,
+            msg,
+            serde_json::Value::Null,
+        );
+    }
+    for (topic, msg) in init {
+        s.log_event(
+            &[topic, "info"],
             corerouter_engine::logging::DAEMON,
             msg,
             serde_json::Value::Null,
@@ -235,6 +261,41 @@ mod tests {
         assert_eq!(log.len(), 1, "{log:?}");
         assert!(log[0]["message"].as_str().unwrap().contains("conntrack"));
         assert_eq!(log[0]["level"], "warning");
+    }
+
+    /// G1.29f: PID 1's lines, as `/dev/kmsg` records (facility user), reach
+    /// the router's log; the port names under the `interface` topic.
+    #[test]
+    fn pid1_lines_reach_the_router_log() {
+        use corerouter_hal::oslog::{kmsg_line, parse_kmsg};
+        let session = shared(Session::virtual_lab());
+        let now = 10_000_000_000u64;
+        let rec = |seq: u32, msg: &str| {
+            let raw = format!("13,{seq},5000000,-;corerouter-init[1]: {msg}");
+            let mut l = kmsg_line(&parse_kmsg(raw.as_bytes()).unwrap(), now - 5_000_000, "b");
+            l.time_us = now;
+            l
+        };
+        let batch = OsLogBatch {
+            lines: vec![
+                rec(1, "port names: eth0 → ether4: File exists (os error 17); it stays eth0"),
+                rec(2, "daemon exited (status 1); restarting in 2 s"),
+                line(now, 6, "r8152 2-1:1.0 eth0: carrier on"),
+            ],
+            sources: vec![SourceState::ok("kmsg", 3)],
+            boot: "b".into(),
+        };
+        assert_eq!(hand_over(&session, batch, now), 2);
+        let mut s = lock(&session);
+        let os = s.execute("log.os.print", &json!({"find": "port names"})).unwrap();
+        let row = &os["entries"][0];
+        assert_eq!((row["source"].as_str(), row["unit"].as_str()), (Some("services"), Some("corerouter-init")));
+        let log = s.execute("log.print", &json!({"find": "init:"})).unwrap();
+        let log = log.as_array().unwrap();
+        assert_eq!(log.len(), 2, "{log:?}");
+        let names = log.iter().find(|r| r["message"].as_str().unwrap().contains("port names")).unwrap();
+        assert_eq!(names["message"], "init: port names: eth0 → ether4: File exists (os error 17); it stays eth0");
+        assert!(names["topics"].to_string().contains("interface"), "{names}");
     }
 
     #[cfg(target_os = "linux")]
