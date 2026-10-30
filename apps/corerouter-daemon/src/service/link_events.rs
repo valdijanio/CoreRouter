@@ -63,6 +63,7 @@ fn run(session: &Shared, health: &super::Health) -> Result<(), String> {
     let mut feed = LinkEvents::open().map_err(|e| e.to_string())?;
     health.event("listening for link changes");
     let mut lost = 0u64;
+    let mut handled = 0u64;
     while !health.stopping() {
         health.beat();
         let first = feed.wait(WAIT_MS).map_err(|e| e.to_string())?;
@@ -91,6 +92,11 @@ fn run(session: &Shared, health: &super::Health) -> Result<(), String> {
             Events::Names(names) => {
                 let names: Vec<String> = names.into_iter().collect();
                 lock(session).link_events(Some(&names));
+                // `system.service.print`: what the feed last handled (the
+                // netns test waits for its port here, not on a clock).
+                handled = handled.saturating_add(1);
+                let shown: Vec<&str> = names.iter().take(8).map(String::as_str).collect();
+                health.event(format!("link changes handled: {handled} (last: {})", shown.join(", ")));
             }
             Events::Lost => {
                 lost = lost.saturating_add(1);
