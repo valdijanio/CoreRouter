@@ -64,8 +64,9 @@ apontar o parâmetro):
 - `src-nat`/`dst-nat` exigem `to_addresses` (um endereço ou faixa `A-B`, não prefixo);
 - `jump` para chain nativa ou para a própria chain, laços de `jump` (`a → b → a`): erro;
 - nomes (listas, chains, marcas): letras, dígitos, `-`, `_`, `.`, até 63; `log_prefix` ASCII
-  imprimível sem `"`/`\`, até 64; limites contra entrada hostil: 4096 regras por tabela,
-  262 144 entradas de address-list (G4.10b; eram 65 536), 256 listas, 4096 membros (**estimados**).
+  imprimível sem `"`/`\`, até 64; limites contra entrada hostil: 50 000 regras por tabela
+  (G0.31j; eram 4096, abaixo da config de ISP com 10 000; **medido**: ~5,4 KB de memória do
+  daemon por regra), 262 144 entradas de address-list (G4.10b; eram 65 536), 256 listas, 4096 membros (**estimados**).
 
 ## 3. Render nftables
 
