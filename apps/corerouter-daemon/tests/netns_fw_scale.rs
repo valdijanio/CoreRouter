@@ -272,16 +272,19 @@ fn ten_thousand_rules_load_and_one_commits_fast() {
     }
     for (name, cfg) in cases {
         let name = name.as_str();
-        let (_, comment, port) = measure(name, &cfg);
+        let (base, comment, port) = measure(name, &cfg);
         if std::env::var_os("FW_SCALE_N").is_none() {
             let _ = measure_daemon(name, &cfg);
         }
-        // Loose: tens of ms on a shared 4-vCPU runner would still pass;
-        // the ~100 ms of before G0.31j would not.
+        // Against the commit without a firewall of the same run (a debug
+        // build under the parallel netns step is ten times slower, both
+        // alike): within twice it plus 30 ms. A firewall commit that went
+        // over every rule again (~100 ms in release before G0.31j) fails.
         for (what, d) in [("comment", comment), ("dst_port", port)] {
+            let bound = base * 2 + Duration::from_millis(30);
             assert!(
-                d < Duration::from_millis(60),
-                "{name}: one {what} commit took {d:?}"
+                d < bound,
+                "{name}: one {what} commit took {d:?}, the one without a firewall {base:?}"
             );
         }
     }
