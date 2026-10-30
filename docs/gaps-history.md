@@ -280,3 +280,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-29 — G1.6s criado (opção B da release da imagem: CI compila sem assinar, o dono confere a reprodutibilidade e assina)
 - 2026-10-29 — G0.31i feito (set de distância sem ler as rotas do kernel)
 - 2026-10-29 — G3.6n criada (BFD cai junto com o `corerouter-daemon` e derruba o BGP)
+- 2026-10-29 — G0.31j feito; G0.31k criada (memória do daemon por regra de firewall)
