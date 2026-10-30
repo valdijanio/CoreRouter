@@ -55,7 +55,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{gateway?: ip} → [{time (Unix s; null: no clock), gateway, method, to (up | down), routes, message}]",
         always, check_history),
     cmd!(query "ip.route.list", "Routes", ["IP", "Routes"], None,
-        "{routing_table?: string, family?: string (ipv4 | ipv6), state?: string (active | standby | inactive), origin?: string (connected | static | dhcp | ra)} → [{key (stable row key), id (null if connected), dst_address, family, gateway (as configured), gateway_address, gateway_interface, gateway_status (reachable | unreachable | incomplete: the gateway does not answer ARP/ND; null if connected or without next hop), check_gateway (null | {method (arp | ping | bfd), interval_secs (0: bfd), misses, state (up | down), status (checking | reachable | unreachable | not-checked), hold_down_secs (answers again, held for flapping; null), bfd_profile (bfd; null)}), distance, routing_table, flags (X disabled, A active, D dynamic, C connected, S static, B blackhole, U unreachable, P prohibit, + ECMP), state (active | standby: a lower distance wins | inactive), active, static, connected, dynamic (from a DHCP lease, a Router Advertisement or connected), origin (connected | static | dhcp | ra), disabled, immediate_gw, interface, ecmp (paths of its ECMP group), reason (why standby or inactive), reason_id, reason_args, notice (null | {level (info: paths of one origin | warning: origins mixed or the default route, split per connection between uplinks), text, id, args, fix (the command that makes one path a backup; null)}), changed_at (Unix s it took its state; null: before watching), changed_secs, comment, type (unicast | blackhole | unreachable | prohibit)}]",
+        "{routing_table?: string, family?: string (ipv4 | ipv6), state?: string (active | standby | inactive), origin?: string (connected | static | dhcp | ra)} → [{key (stable row key), id (null if connected), dst_address, family, gateway (as configured), gateway_address, gateway_interface, gateway_status (reachable | unreachable | incomplete: the gateway does not answer ARP/ND; null if connected or without next hop), check_gateway (null | {method (arp | ping | bfd), interval_secs (0: bfd), misses, state (up | down), status (checking | reachable | unreachable | not-checked), hold_down_secs (answers again, held for flapping; null), bfd_profile (bfd; null)}), distance, routing_table, flags (X disabled, A active, D dynamic, C connected, S static, B blackhole, U unreachable, P prohibit, + ECMP, I invalid: refused by the kernel at boot and left out), state (active | standby: a lower distance wins | inactive), active, static, connected, dynamic (from a DHCP lease, a Router Advertisement or connected), origin (connected | static | dhcp | ra), disabled, immediate_gw, interface, invalid, invalid_reason (why the kernel refused it at boot; null), ecmp (paths of its ECMP group), reason (why standby or inactive), reason_id, reason_args, notice (null | {level (info: paths of one origin | warning: origins mixed or the default route, split per connection between uplinks), text, id, args, fix (the command that makes one path a backup; null)}), changed_at (Unix s it took its state; null: before watching), changed_secs, comment, type (unicast | blackhole | unreachable | prohibit)}]",
         always, list),
 ];
 
@@ -352,6 +352,9 @@ pub(crate) struct Row<'a> {
     id: Option<ItemId>,
     immediate_gw: Option<String>,
     interface: Option<&'a corerouter_model::IfName>,
+    /// G1.3g: the kernel refused it at boot; it is out until fixed.
+    invalid: bool,
+    invalid_reason: Option<&'a str>,
     key: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     mpls_in: Option<Option<u32>>,
@@ -449,6 +452,8 @@ impl<'a> Row<'a> {
             id: l.id,
             immediate_gw: l.immediate_gw(),
             interface: l.via.as_ref().map(|v| &v.link),
+            invalid: false,
+            invalid_reason: None,
             key: &l.key,
             mpls_in: None,
             mpls_out: None,
@@ -552,6 +557,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
         neigh: s.neigh_fresh(),
         changed: s.ext::<RouteWatch>().map(RouteWatch::changed),
         ldp: crate::mpls::ldp_state(s),
+        refused: s.boot_refused("routes"),
         _slot: slot,
     };
     s.defer_stream(answer)
@@ -565,6 +571,8 @@ struct ListAnswer {
     neigh: crate::neigh_table::NeighShared,
     changed: Option<Changed>,
     ldp: Option<std::sync::Arc<corerouter_model::mpls_state::LdpState>>,
+    /// G1.3g: routes the kernel refused at boot, with why.
+    refused: std::collections::HashMap<ItemId, String>,
     _slot: Option<LargeSlot>,
 }
 
@@ -591,6 +599,11 @@ impl ListAnswer {
             if let Some((local, out)) = labels.get(&l.dst) {
                 r.mpls_in = Some(local);
                 r.mpls_out = Some(out);
+            }
+            if let Some(why) = l.id.and_then(|id| self.refused.get(&id)) {
+                r.flags.push('I');
+                r.invalid = true;
+                r.invalid_reason = Some(why);
             }
             f(r)?;
         }

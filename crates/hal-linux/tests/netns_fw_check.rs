@@ -18,7 +18,7 @@
 use std::process::Command;
 
 use corerouter_firewall::sample::{act, rule, sample};
-use corerouter_hal::{Hal, RefusedRule};
+use corerouter_hal::{Hal, RefusedItem};
 use corerouter_hal_linux::{LinuxHal, nft};
 use corerouter_model::{Config, ItemId};
 
@@ -76,7 +76,7 @@ fn with_bad_nat(cfg: &Config, id: u32) -> Config {
     out
 }
 
-fn ids(r: &[RefusedRule]) -> Vec<ItemId> {
+fn ids(r: &[RefusedItem]) -> Vec<ItemId> {
     r.iter().map(|r| r.id).collect()
 }
 

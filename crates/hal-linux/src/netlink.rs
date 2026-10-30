@@ -69,6 +69,30 @@ pub(crate) fn apply(
     })
 }
 
+/// G1.3g: run each of `ops` on its own, in one netlink session, keeping
+/// what the kernel takes and nothing undone: the ops it refused, with why.
+/// Only for routes added at boot (see `Hal::apply_routes_each`): with no
+/// dry run for routes, a refused one must not take the others back out.
+pub(crate) fn apply_each(
+    ops: &[Op],
+    owned: &std::collections::BTreeSet<KernelRoute>,
+) -> Result<Vec<(Op, String)>, HalError> {
+    if ops.is_empty() {
+        return Ok(Vec::new());
+    }
+    with_kernel(|mut k| async move {
+        k.owned = owned.clone();
+        let mut refused = Vec::new();
+        for op in ops {
+            if let Err(e) = k.exec(op).await {
+                log::warn!("netlink: could not {op}: {e}; the other routes stay");
+                refused.push((op.clone(), e));
+            }
+        }
+        Ok(refused)
+    })
+}
+
 /// Every link of the current network namespace (`RTM_GETLINK` dump): the
 /// same kernel `apply` writes to, so discovery and apply never disagree
 /// (sysfs shows the namespace that mounted `/sys`, not this one).

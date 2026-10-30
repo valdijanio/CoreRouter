@@ -22,9 +22,9 @@ pub(crate) fn boot_failures(summary: &Value) -> Vec<(String, String)> {
         .take(16)
         .map(|f| {
             let field = |k| f.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
-            // G1.3g: one rule of the section (`firewall *5`).
-            let what = match f.get("rule").and_then(Value::as_str) {
-                Some(rule) => format!("{} {rule}", field("section")),
+            // G1.3g: one item of the section (`firewall *5`, `routes *3`).
+            let what = match f.get("item").and_then(Value::as_str) {
+                Some(item) => format!("{} {item}", field("section")),
                 None => field("section"),
             };
             (what, field("error"))
@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn one_rule_out_names_the_rule() {
         let summary = json!({"storage": {"boot_apply_failed": [
-            {"section": "firewall", "rule": "*5", "error": "Operation not supported"}
+            {"section": "firewall", "item": "*5", "error": "Operation not supported"}
         ]}});
         assert_eq!(
             boot_failures(&summary),

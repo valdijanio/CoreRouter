@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use corerouter_engine::auth::whoami;
 use corerouter_engine::boot_apply::BootEnv;
 use corerouter_engine::{MemoryStorage, Principal, Session};
-use corerouter_hal::{Hal, HalError, LinkInfo, LinkState, RefusedRule, VirtualHal};
+use corerouter_hal::{Hal, HalError, LinkInfo, LinkState, RefusedItem, VirtualHal};
 use corerouter_model::firewall::FirewallRule;
 use corerouter_model::{Config, ItemId};
 use serde_json::{Value, json};
@@ -65,12 +65,12 @@ impl Hal for Picky {
         seen.took.push(to.clone());
         Ok(())
     }
-    fn check_firewall(&mut self, to: &Config) -> Result<Vec<RefusedRule>, HalError> {
+    fn check_firewall(&mut self, to: &Config) -> Result<Vec<RefusedItem>, HalError> {
         self.seen.lock().unwrap().checks += 1;
         match bad_rules(to).first() {
             None => Ok(Vec::new()),
             Some(_) if self.anonymous => Err(HalError::Rejected("refused, no rule named".into())),
-            Some(id) => Ok(vec![RefusedRule {
+            Some(id) => Ok(vec![RefusedItem {
                 id: *id,
                 reason: "Operation not supported (os error 95)".into(),
             }]),
@@ -198,7 +198,7 @@ fn only_the_refused_rule_stays_out() {
     let failed = b.failed();
     assert_eq!(failed.len(), 1, "{failed:?}");
     assert_eq!(failed[0]["section"], "firewall");
-    assert_eq!(failed[0]["rule"], bad.as_str());
+    assert_eq!(failed[0]["item"], bad.as_str());
     // Flag I with the reason, in the rule list.
     let row = b.rule(bad);
     assert_eq!(row["flags"], "I");
@@ -213,7 +213,7 @@ fn only_the_refused_rule_stays_out() {
     let c = b.check("boot.apply").unwrap();
     assert_eq!(c["value"], format!("firewall {bad}"));
     let me = whoami(&b.s, &Principal::Local, "test");
-    assert_eq!(me["boot_errors"][0]["rule"], bad.as_str());
+    assert_eq!(me["boot_errors"][0]["item"], bad.as_str());
     // Nothing partial ever reached the data plane: the core, then the
     // firewall without the rule, once.
     let seen = b.seen.lock().unwrap();
@@ -260,7 +260,7 @@ fn the_refused_management_accept_keeps_the_router_reachable() {
     let failed = b.failed();
     assert_eq!(failed.len(), 1, "{failed:?}");
     assert_eq!(failed[0]["section"], "firewall");
-    assert!(failed[0].get("rule").is_none(), "{failed:?}");
+    assert!(failed[0].get("item").is_none(), "{failed:?}");
     let why = failed[0]["error"].as_str().unwrap();
     assert!(why.contains(&format!("rule {}", ids[0])), "{why}");
     assert!(why.contains("would cut management"), "{why}");
@@ -307,7 +307,7 @@ fn a_refused_accept_that_management_does_not_need_stays_out_alone() {
         false,
     );
     assert_eq!(b.live_filter(), [ids[0].clone(), ids[2].clone()]);
-    assert_eq!(b.failed()[0]["rule"], ids[1].as_str());
+    assert_eq!(b.failed()[0]["item"], ids[1].as_str());
 }
 
 /// Two refused rules: the kernel names only the first (the ones after it
@@ -324,7 +324,7 @@ fn two_refused_rules_both_out_one_check_each() {
         false,
     );
     assert_eq!(b.live_filter(), [ids[0].clone(), ids[2].clone()]);
-    let rules: Vec<Value> = b.failed().iter().map(|f| f["rule"].clone()).collect();
+    let rules: Vec<Value> = b.failed().iter().map(|f| f["item"].clone()).collect();
     assert_eq!(rules, [json!(ids[1]), json!(ids[3])]);
     assert_eq!(b.seen.lock().unwrap().checks, 3);
 }
@@ -344,7 +344,7 @@ fn bisection_when_the_refusal_names_no_rule() {
     }
     let (b, ids) = boot(&rules, true);
     let bad = ids[18].clone();
-    assert_eq!(b.failed()[0]["rule"], bad.as_str());
+    assert_eq!(b.failed()[0]["item"], bad.as_str());
     assert_eq!(b.live_filter().len(), 30);
     let seen = b.seen.lock().unwrap();
     assert!(
@@ -374,7 +374,7 @@ fn commits_with_a_rule_out() {
     )
     .unwrap();
     assert_eq!(b.live_filter().len(), 2, "the new rule went in");
-    assert_eq!(b.failed()[0]["rule"], ids[1].as_str(), "still out");
+    assert_eq!(b.failed()[0]["item"], ids[1].as_str(), "still out");
     assert_eq!(b.rule(&ids[1])["flags"], "I");
     b.s.execute("ip.firewall.filter.remove", &json!({"id": ids[1]}))
         .unwrap();

@@ -883,7 +883,7 @@ fn list(s: &mut Session, table: Table, p: &Value) -> Result<Value> {
         .map(|d| std::sync::Arc::clone(&d.live));
     let cfg = s.store().candidate().clone();
     // G1.3g: rules the kernel refused at boot are out, invalid.
-    let refused = s.boot_refused_rules();
+    let refused = s.boot_refused("firewall");
     s.defer(move || {
         let shadows = shadowed(&cfg, table);
         let issues = table_issues(&cfg, table);
