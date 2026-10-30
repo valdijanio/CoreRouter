@@ -19,7 +19,7 @@ Uma requisição JSON por linha, sobre TCP puro **só em loopback** (`--control`
 | `server.info` | — | `{name, version, commit, backend, has_ui, auth: "required"}` (sem token em loopback; da rede, sem login, só `{name, auth}`) |
 | `auth.login` | `{user, password}` | `{token, user, group, idle_timeout_secs, no_password}` (sem token) |
 | `auth.logout` | — | `{}`: o token de sessão deixa de valer |
-| `auth.whoami` | — | `{user, group, via, no_password?}` (`no_password`: contas `full` sem senha, só para quem é `full`) |
+| `auth.whoami` | — | `{user, group, via, no_password?, boot_errors?}` (`no_password`: contas `full` sem senha, só para quem é `full`; `boot_errors`: `[{section, error}]` da config salva que o kernel recusou no boot, G1.3e) |
 | `engine.list` | — | registro de comandos |
 | `engine.execute` | `{command, params?}` | resultado do comando |
 | `engine.batch` | `{steps: [{command, params?}], atomic?: bool = true}` | `{results}` |

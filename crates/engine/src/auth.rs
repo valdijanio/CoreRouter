@@ -238,6 +238,13 @@ pub fn whoami(s: &crate::Session, principal: &Principal, via: &str) -> Value {
             Value::from(s.admins_without_password()),
         );
     }
+    // G1.3e: what the boot left out, so every client warns at login.
+    let boot = s.boot_failures();
+    if !boot.is_empty()
+        && let Some(o) = out.as_object_mut()
+    {
+        o.insert("boot_errors".into(), serde_json::to_value(boot).unwrap_or_default());
+    }
     out
 }
 
