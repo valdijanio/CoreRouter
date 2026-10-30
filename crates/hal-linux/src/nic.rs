@@ -301,9 +301,7 @@ fn usb_info(root: &Path, intf: &str, ifname: &str) -> Option<UsbInfo> {
         .and_then(|p| p.parent()?.parent())
         .and_then(|hub| read_trim(&hub.join("speed")))
         .and_then(|s| hnic::usb_speed_mbps(&s));
-    let lpm = port_dir
-        .as_deref()
-        .and_then(|p| read_trim(&p.join("usb3_lpm_permit")));
+    let lpm = usb_lpm(&dev, port_dir.as_deref());
     let over_current = port_dir
         .as_deref()
         .and_then(|p| read_trim(&p.join("over_current_count")))
@@ -333,6 +331,33 @@ fn usb_info(root: &Path, intf: &str, ifname: &str) -> Option<UsbInfo> {
             .flatten(),
         port_power_switch,
     })
+}
+
+/// USB 3 link power management as it is, not as the port would allow:
+/// off when the kernel quirk NO_LPM (`quirks` bit 10, set for the RTL8153
+/// in `drivers/usb/core/quirks.c`) applies, else the device's
+/// `power/usb3_hardware_lpm_u1`/`_u2` (present only when LPM is in use),
+/// else the port's `usb3_lpm_permit`.
+fn usb_lpm(dev: &Path, port: Option<&Path>) -> Option<String> {
+    const NO_LPM: u32 = 1 << 10;
+    let quirks = read_trim(&dev.join("quirks"))
+        .and_then(|q| u32::from_str_radix(q.trim_start_matches("0x"), 16).ok());
+    if quirks.is_some_and(|q| q & NO_LPM != 0) {
+        return Some("0 (kernel quirk)".into());
+    }
+    let on = |n: &str| read_trim(&dev.join("power").join(n)).map(|v| v == "enabled");
+    match (on("usb3_hardware_lpm_u1"), on("usb3_hardware_lpm_u2")) {
+        (Some(u1), Some(u2)) => Some(
+            match (u1, u2) {
+                (true, true) => "u1_u2",
+                (true, false) => "u1",
+                (false, true) => "u2",
+                (false, false) => "0",
+            }
+            .into(),
+        ),
+        _ => port.and_then(|p| read_trim(&p.join("usb3_lpm_permit"))),
+    }
 }
 
 /// `NETDEV WATCHDOG` hits, summed over the link's transmit queues
@@ -395,6 +420,7 @@ mod tests {
             w(dev.join(f), format!("{v}\n").as_bytes());
         }
         w(link.join("queues/tx-0/tx_timeout"), b"3\n");
+        w(dev.join("quirks"), b"0x0\n");
         let u = usb_info(&root, "4-2:1.0", "ether4").unwrap();
         assert_eq!(u.port, "4-2");
         assert_eq!(
@@ -407,6 +433,12 @@ mod tests {
         assert_eq!(u.lpm.as_deref(), Some("u1_u2"));
         assert_eq!(u.tx_timeouts, Some(3));
         assert!(u.port_power_switch);
+        // The RTL8153's NO_LPM quirk: off whatever the port allows.
+        w(dev.join("quirks"), b"0x400\n");
+        assert_eq!(
+            usb_info(&root, "4-2:1.0", "ether4").unwrap().lpm.as_deref(),
+            Some("0 (kernel quirk)")
+        );
         // Same adapter on a USB 2 port: it negotiates 480 and reports 2.10;
         // the BOS descriptor still says SuperSpeed.
         w(dev.join("speed"), b"480\n");

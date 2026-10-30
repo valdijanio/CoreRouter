@@ -816,7 +816,7 @@ fn usb_section(ui: &mut Ui, u: &Value, help: &mut Option<(&'static str, &'static
                         Some(false) => "off",
                         None => "?",
                     },
-                    l.map(|l| format!(" · LPM {}", if l == "0" { "off".into() } else { l }))
+                    l.map(|l| format!(" · LPM {}", l.replacen('0', "off", 1)))
                         .unwrap_or_default()
                 )),
             };
