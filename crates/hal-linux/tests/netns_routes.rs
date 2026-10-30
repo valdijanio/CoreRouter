@@ -248,3 +248,60 @@ fn a_route_of_someone_else_is_refused_not_replaced() {
     assert_eq!(ip(&["-4", "route", "show", "100.82.0.0/24"]), before);
     assert_eq!(ip(&["-4", "route", "show", "100.82.1.0/24"]), "");
 }
+
+/// G0.31i: changing the distance (metric) of one route, or removing it,
+/// deletes it without reading the kernel's routes; a path of an ECMP
+/// group still reads them, and its sibling stays.
+#[test]
+fn a_distance_change_reads_no_route_table() {
+    if !in_netns() {
+        return;
+    }
+    let mut hal = LinuxHal::new();
+    let base = base("dst", 82);
+    hal.apply(&Config::default(), &base).unwrap();
+    let mut many = base.clone();
+    for i in 0..500u32 {
+        route(
+            &mut many,
+            &format!("172.{}.{}.0/24", 16 + i / 256, i % 256),
+            "10.82.0.1",
+        );
+    }
+    route(&mut many, "198.18.0.0/24", "10.82.0.1");
+    route(&mut many, "198.18.0.0/24", "10.82.1.1");
+    hal.apply(&base, &many).unwrap();
+
+    let dumps = corerouter_hal_linux::route_dumps();
+    let mut far = many.clone();
+    far.ip.routes.update(0, |r| r.distance = 7);
+    hal.apply(&many, &far).unwrap();
+    assert_eq!(corerouter_hal_linux::route_dumps(), dumps);
+    let shown = ip(&["-4", "route", "show", "172.16.0.0/24"]);
+    assert!(
+        shown.contains("metric 7") && shown.lines().count() == 1,
+        "{shown}"
+    );
+    // And back, then removed: still no dump.
+    hal.apply(&far, &many).unwrap();
+    let mut fewer = many.clone();
+    fewer.ip.routes.remove(1);
+    hal.apply(&many, &fewer).unwrap();
+    assert_eq!(corerouter_hal_linux::route_dumps(), dumps);
+    assert_eq!(ip(&["-4", "route", "show", "172.16.1.0/24"]), "");
+
+    // A path of the ECMP group: its siblings are read, the other stays.
+    let last = fewer.ip.routes.len() - 1;
+    let mut split = fewer.clone();
+    split.ip.routes.update(last, |r| r.distance = 2);
+    hal.apply(&fewer, &split).unwrap();
+    assert!(corerouter_hal_linux::route_dumps() > dumps);
+    let v4 = ip(&["-4", "route", "show", "198.18.0.0/24"]);
+    assert!(
+        v4.contains("via 10.82.0.1 dev dst1 proto static metric 1")
+            && v4.contains("via 10.82.1.1 dev dst2 proto static metric 2"),
+        "{v4}"
+    );
+    hal.apply(&split, &base).unwrap();
+    assert_eq!(ip(&["-4", "route", "show", "198.18.0.0/24"]), "");
+}
