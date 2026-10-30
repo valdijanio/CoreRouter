@@ -407,7 +407,7 @@ pub(super) fn management_ports(s: &Session) -> Option<(IpAddr, BTreeSet<IfName>)
 
 /// Refuse to disturb the link of the port this connection uses, unless in
 /// Safe Mode (losing the connection undoes it) or `force`.
-fn guard_link(s: &Session, name: &IfName, force: bool, what: &str) -> Result<Option<String>> {
+pub(super) fn guard_link(s: &Session, name: &IfName, force: bool, what: &str) -> Result<Option<String>> {
     let Some((ip, ports)) = management_ports(s) else {
         return Ok(None);
     };

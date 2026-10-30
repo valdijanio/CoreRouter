@@ -404,8 +404,17 @@ pub fn config_value(cfg: &Config) -> Result<serde_json::Value, PersistError> {
 /// The delta a revision file stores: how to build `rev` from `base`, the
 /// config of the next newer revision. Sections the two share are not
 /// serialized ([`crate::config_delta::diff`]).
+///
+/// The typed delta is checked by applying it: a part of the config the
+/// typed diff does not see (OSPF, MPLS, BFD and RPKI were, until
+/// fix-journal-routing-delta) would be a commit lost at the next start.
+/// Then the delta of the whole JSON trees is stored, slower but complete.
 pub fn revision_delta(base: &Config, rev: &Config) -> Result<serde_json::Value, PersistError> {
-    crate::config_delta::diff(base, rev)
+    let d = crate::config_delta::diff(base, rev)?;
+    if crate::config_delta::apply(base, &d).is_ok_and(|c| c == *rev) {
+        return Ok(d);
+    }
+    Ok(crate::json_delta::diff(&config_value(base)?, &config_value(rev)?))
 }
 
 /// The config of a revision file stored as a difference: `delta` applied

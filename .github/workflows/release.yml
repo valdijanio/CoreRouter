@@ -8,8 +8,8 @@
 # Roda nos runners do GitHub (não no self-hosted): o pacote sai de uma máquina limpa, sem cache.
 # Ubuntu 22.04: o `Depends: libc6 (>= …)` é a glibc mais nova que os binários pedem, a do
 # runner no máximo (2.35); instala no Ubuntu 22.04+ e no Debian 12+. A imagem do roteador não
-# entra: ela é assinada com a chave do dono (os/out/keys), que não vai para o CI público
-# (docs/install-gui.md, "Releases").
+# entra: ela é assinada com a chave de release do dono, que não vai para o CI público; ele a
+# anexa a este rascunho com `cargo xtask os release` (docs/release.md).
 # Actions fixadas por SHA; o comentário diz a versão.
 
 name: release
@@ -113,12 +113,18 @@ jobs:
             echo "Baixe \`$deb\` e \`SHA256SUMS\` desta página, confira e instale:"
             echo
             echo '```sh'
-            echo "sha256sum -c SHA256SUMS"
+            echo "sha256sum -c --ignore-missing SHA256SUMS"
             echo "sudo apt install ./$deb"
             echo '```'
             echo
             echo "O pacote traz a GUI (\`corerouter-gui\`, no menu em Rede → CoreRouter) e a CLI"
             echo "(\`corerouter-cli\`). Detalhes em [docs/install-gui.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/docs/install-gui.md)."
+            echo
+            echo "## Imagem do roteador"
+            echo
+            echo "\`corerouter-<versão>.crpkg\` (atualização), \`-install.iso\` (instalador CD/USB), \`.qcow2\` e \`.ova\` (VM),"
+            echo "assinados com a chave de release (a pública está em \`os/keys/release/\`), quando anexados a esta página."
+            echo "Detalhes em [docs/release.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/docs/release.md)."
             echo
             if [ -n "$prev" ]; then
               echo "## O que mudou desde $prev"

@@ -63,6 +63,10 @@ pub enum Reach {
         link: IfName,
         gateway: Option<IpAddr>,
     },
+    /// No next hop (G1.5a): the kernel drops what it matches, the way
+    /// [`Discard`](crate::types::Discard) says. Needs no interface: always usable
+    /// while enabled.
+    Discard(crate::types::Discard),
     /// Well formed but not usable now: the route, its interface or the
     /// address that reaches its gateway is disabled.
     Inactive(Why),
@@ -199,6 +203,9 @@ pub fn reach(cfg: &Config, r: &RouteEntry) -> Reach {
     }
     if r.disabled {
         return Reach::Inactive(Why::new("disabled", "route is disabled".into()));
+    }
+    if let Some(d) = r.gateway.discards() {
+        return Reach::Discard(d);
     }
     match (gw, r.gateway.iface()) {
         (None, Some(i)) => up_or(cfg, i, None),

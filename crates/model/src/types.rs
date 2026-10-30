@@ -235,21 +235,79 @@ impl fmt::Display for ItemId {
 }
 string_serde!(ItemId);
 
+/// What a route with no next hop does with a packet (G1.5a): RouterOS v6
+/// `type=blackhole|unreachable|prohibit` (v7: `blackhole`), Junos
+/// `discard`/`reject`, IOS `Null0`; in Linux `RTN_BLACKHOLE`,
+/// `RTN_UNREACHABLE`, `RTN_PROHIBIT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Discard {
+    /// Dropped silently.
+    Blackhole,
+    /// Dropped with ICMP "network unreachable" (RFC 792; ICMPv6 "no route",
+    /// RFC 4443 §3.1).
+    Unreachable,
+    /// Dropped with ICMP "administratively prohibited" (RFC 1812 §5.2.7.1;
+    /// ICMPv6 "administratively prohibited").
+    Prohibit,
+}
+
+impl Discard {
+    pub const ALL: [Self; 3] = [Self::Blackhole, Self::Unreachable, Self::Prohibit];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Blackhole => "blackhole",
+            Self::Unreachable => "unreachable",
+            Self::Prohibit => "prohibit",
+        }
+    }
+
+    /// The flag of `ip.route.list` (RouterOS v6: B, U, P).
+    pub fn flag(self) -> char {
+        match self {
+            Self::Blackhole => 'B',
+            Self::Unreachable => 'U',
+            Self::Prohibit => 'P',
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|d| d.as_str() == s)
+    }
+}
+
 /// Next hop of a static route, RouterOS syntax: `10.0.0.1` (resolved through
 /// a connected network), `ether1` (out of that interface) or
-/// `fe80::1%ether1` (that address, out of that interface). At least one of
-/// the two parts is always present.
+/// `fe80::1%ether1` (that address, out of that interface); or no next hop
+/// at all, `blackhole`, `unreachable` or `prohibit` (G1.5a, [`Discard`]).
+/// An address or an interface is present unless it discards.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Gateway {
     address: Option<IpAddr>,
     interface: Option<IfName>,
+    discard: Option<Discard>,
 }
 
 impl Gateway {
+    /// No next hop: the route drops what it matches (G1.5a).
+    pub fn discard(d: Discard) -> Self {
+        Self {
+            address: None,
+            interface: None,
+            discard: Some(d),
+        }
+    }
+
+    /// What it does without a next hop; `None` for a next hop.
+    pub fn discards(&self) -> Option<Discard> {
+        self.discard
+    }
+
     pub fn ip(address: IpAddr) -> Self {
         Self {
             address: Some(address),
             interface: None,
+            discard: None,
         }
     }
 
@@ -257,6 +315,7 @@ impl Gateway {
         Self {
             address: None,
             interface: Some(interface),
+            discard: None,
         }
     }
 
@@ -264,6 +323,7 @@ impl Gateway {
         Self {
             address: Some(address),
             interface: Some(interface),
+            discard: None,
         }
     }
 
@@ -289,6 +349,11 @@ impl FromStr for Gateway {
                 .map_err(|_| ParseError::new("gateway", s, "invalid interface after '%'"))?;
             return Ok(Self::via(ip, iface));
         }
+        // The three words of a route without next hop win over interfaces
+        // of the same name (`blackhole%` would need an address before it).
+        if let Some(d) = Discard::parse(t) {
+            return Ok(Self::discard(d));
+        }
         // An address wins: "10.0.0.1" would also be a legal interface name.
         if let Ok(ip) = t.parse::<IpAddr>() {
             return Ok(Self::ip(ip));
@@ -297,7 +362,8 @@ impl FromStr for Gateway {
             ParseError::new(
                 "gateway",
                 s,
-                "expected an IP, an interface or <ip>%<interface>",
+                "expected an IP, an interface, <ip>%<interface>, blackhole, unreachable or \
+                 prohibit",
             )
         })
     }
@@ -305,6 +371,9 @@ impl FromStr for Gateway {
 
 impl fmt::Display for Gateway {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(d) = self.discard {
+            return f.write_str(d.as_str());
+        }
         match (&self.address, &self.interface) {
             (Some(a), Some(i)) => write!(f, "{a}%{i}"),
             (Some(a), None) => write!(f, "{a}"),

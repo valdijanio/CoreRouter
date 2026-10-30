@@ -19,13 +19,35 @@
 //! (a nested `execute`) answers in place, or its caller would get `null`.
 //! The closure must not reach back into the session: what it reads is
 //! the snapshot it owns (`Send + 'static` makes that a compile error).
+//!
+//! G0.31h: an answer of tens of megabytes (`ip.route.list` of 60 000
+//! routes, 34 MB) is not built at all: [`Session::defer_stream`] hands
+//! over a writer of its JSON, and the control channel writes it into the
+//! socket row by row ([`Reply::Stream`]). A `serde_json::Value` tree of
+//! that list took ~9 KiB per row (847 MiB of RSS in the 2 GiB image, and
+//! an OOM kill on the second call); the stream holds one row at a time.
+
+use std::io::Write;
 
 use serde_json::Value;
 
-use crate::{Caller, Result, Session};
+use crate::{Caller, EngineError, Result, Session};
 
 /// The rest of an answer, built without the session.
 pub type Build = Box<dyn FnOnce() -> Result<Value> + Send>;
+
+/// An answer written without the session (G0.31h): into a connection, a
+/// row at a time, or as a [`Value`] for a caller in this process (with
+/// no bytes in between).
+pub trait Streamed: Send {
+    /// Its JSON into `w`.
+    fn write(self: Box<Self>, w: &mut dyn Write) -> std::io::Result<()>;
+    /// It as a value.
+    fn value(self: Box<Self>) -> Result<Value>;
+}
+
+/// A [`Streamed`] answer.
+pub type Stream = Box<dyn Streamed>;
 
 /// What [`Session::execute_reply_as`] answers.
 pub enum Reply {
@@ -33,23 +55,57 @@ pub enum Reply {
     Ready(Value),
     /// Run [`Reply::finish`] after releasing the lock.
     Later(Build),
+    /// Write it ([`Reply::write`]) after releasing the lock.
+    Stream(Stream),
 }
 
 impl Reply {
-    /// The answer: built now if it was deferred.
+    /// The answer: built now if it was deferred. A stream is written into
+    /// memory and read back (callers in this process, small answers).
     pub fn finish(self) -> Result<Value> {
         match self {
             Self::Ready(v) => Ok(v),
             Self::Later(build) => build(),
+            Self::Stream(st) => crate::guard::run("streamed answer", || st.value()),
+        }
+    }
+
+    /// The JSON of the answer into `w`: a stream straight from its rows,
+    /// the others serialized. An error of the answer is returned before
+    /// anything is written; an I/O error may leave `w` with part of it.
+    pub fn write(self, w: &mut dyn Write) -> std::result::Result<(), WriteError> {
+        match self {
+            // A panic while writing breaks the connection (part of the
+            // answer is out already), not the daemon.
+            Self::Stream(st) => crate::guard::run("streamed answer", || {
+                st.write(w)
+                    .map_err(|e| EngineError::Internal(format!("answer: {e}")))
+            })
+            .map_err(|e| WriteError::Io(std::io::Error::other(e.to_string()))),
+            other => {
+                let v = other.finish().map_err(WriteError::Answer)?;
+                serde_json::to_writer(w, &v).map_err(|e| WriteError::Io(e.into()))
+            }
         }
     }
 }
+
+/// Why [`Reply::write`] failed.
+#[derive(Debug)]
+pub enum WriteError {
+    /// The command failed (nothing was written).
+    Answer(EngineError),
+    /// The writer failed (the connection is broken).
+    Io(std::io::Error),
+}
+
 
 impl std::fmt::Debug for Reply {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Ready(v) => f.debug_tuple("Ready").field(v).finish(),
             Self::Later(_) => f.write_str("Later(..)"),
+            Self::Stream(_) => f.write_str("Stream(..)"),
         }
     }
 }
@@ -59,7 +115,13 @@ impl std::fmt::Debug for Reply {
 pub(crate) struct OffLock {
     depth: u32,
     accept: Option<u32>,
-    pending: Option<Build>,
+    pending: Option<Pending>,
+}
+
+/// The deferred part of the answer being built.
+enum Pending {
+    Build(Build),
+    Stream(Stream),
 }
 
 impl Session {
@@ -81,7 +143,8 @@ impl Session {
         });
         let value = out?;
         Ok(match pending {
-            Some(build) => Reply::Later(build),
+            Some(Pending::Build(build)) => Reply::Later(build),
+            Some(Pending::Stream(write)) => Reply::Stream(write),
             None => Reply::Ready(value),
         })
     }
@@ -96,10 +159,25 @@ impl Session {
             Some(o) if o.accept == Some(o.depth) && o.pending.is_none() => {
                 // Outside `execute`'s guard now: a panic while building
                 // is an error answer, as it was under the lock.
-                o.pending = Some(Box::new(move || crate::guard::run("deferred answer", build)));
+                o.pending = Some(Pending::Build(Box::new(move || {
+                    crate::guard::run("deferred answer", build)
+                })));
                 Ok(Value::Null)
             }
             _ => build(),
+        }
+    }
+
+    /// [`Session::defer`] for an answer too big to hold in memory: written
+    /// into the connection when the caller asked for a [`Reply`], else
+    /// turned into a [`Value`] now.
+    pub(crate) fn defer_stream(&mut self, answer: impl Streamed + 'static) -> Result<Value> {
+        match self.ext_mut::<OffLock>() {
+            Some(o) if o.accept == Some(o.depth) && o.pending.is_none() => {
+                o.pending = Some(Pending::Stream(Box::new(answer)));
+                Ok(Value::Null)
+            }
+            _ => Box::new(answer).value(),
         }
     }
 
@@ -143,7 +221,7 @@ mod tests {
         let reply = s
             .execute_reply_as(&Caller::local(), "ip.route.list", &json!({}))
             .unwrap();
-        assert!(matches!(reply, Reply::Later(_)), "{reply:?}");
+        assert!(matches!(reply, Reply::Stream(_)), "{reply:?}");
         assert_eq!(reply.finish().unwrap(), now);
         // A command that does not defer answers in place.
         let ready = s
@@ -173,7 +251,9 @@ mod tests {
             o.accept = Some(o.depth);
         }
         s.defer(|| panic!("boom")).unwrap();
-        let build = s.ext_mut::<OffLock>().unwrap().pending.take().unwrap();
+        let Some(Pending::Build(build)) = s.ext_mut::<OffLock>().unwrap().pending.take() else {
+            panic!("not deferred");
+        };
         assert!(Reply::Later(build).finish().is_err());
     }
 

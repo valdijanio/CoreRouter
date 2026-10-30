@@ -75,6 +75,9 @@ pub struct System {
     /// `/ip service www-ssl` and `www` (G1.6o): the GUI in a browser.
     #[serde(skip_serializing_if = "crate::web::WebService::is_default")]
     pub web: crate::web::WebService,
+    /// G1.29d: the USB adapter watchdog's per-adapter settings.
+    #[serde(skip_serializing_if = "crate::usb_watchdog::UsbWatchdog::is_default")]
+    pub usb_watchdog: crate::usb_watchdog::UsbWatchdog,
 }
 
 impl Default for System {
@@ -89,6 +92,7 @@ impl Default for System {
             bandwidth_server: crate::bandwidth::BandwidthServer::default(),
             graphing: crate::graphing::Graphing::default(),
             web: crate::web::WebService::default(),
+            usb_watchdog: crate::usb_watchdog::UsbWatchdog::default(),
         }
     }
 }
@@ -460,6 +464,15 @@ pub struct BgpInstance {
     /// with the N bit keeps them as stale. Unset: on; stored only when off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hard_admin_reset: Option<bool>,
+    /// G3.9fj, RFC 9494: the Long-Lived Stale Time we announce, seconds
+    /// (1..=16777215, 24 bits; FRR `bgp long-lived-graceful-restart
+    /// stale-time`, one value for every family). After the Restart Time the
+    /// neighbor keeps our routes this much longer, marked LLGR_STALE and
+    /// least preferred. It is also the most we keep of a neighbor's
+    /// (`bgp_open.c`: MIN(received, ours)), so a helper needs it set too.
+    /// Unset: off (§5: never on by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llgr_stale_time: Option<u32>,
 }
 
 #[cfg(test)]

@@ -395,7 +395,20 @@ impl Floats {
         // Room on both sides of the centred title, so a long one is cut
         // before it reaches the maximize button.
         let pad = |side| Atom::custom(IdSalt::new(side), Vec2::new(bar.button, 0.0));
-        let window = Window::new((pad("float-pad-left"), title, pad("float-pad-right")))
+        let mut atoms = egui::Atoms::new((pad("float-pad-left"), title, pad("float-pad-right")));
+        // G1.29b: "Interface <ether4>" of a USB adapter: the USB icon before
+        // the title (amber on a slow port).
+        if let Some(m) = crate::usb_mark::in_title(ctx, title) {
+            let size = egui::TextStyle::Heading.resolve(&ctx.global_style()).size;
+            let tint = crate::usb_mark::color(&ctx.global_style().visuals, m.slow, ctx.global_style().visuals.text_color());
+            atoms = egui::Atoms::new((
+                pad("float-pad-left"),
+                egui::RichText::new(crate::icons::USB).font(crate::icons::font(size)).color(tint),
+                title,
+                pad("float-pad-right"),
+            ));
+        }
+        let window = Window::new(atoms)
             .id(id)
             .open(open)
             .constrain_to(area);

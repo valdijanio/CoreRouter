@@ -76,6 +76,10 @@ pub struct BgpSession {
     /// routes went at once); false: it was graceful (they stayed stale).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_hard_reset: Option<bool>,
+    /// G3.9fj, RFC 9494 §3.1: the Long-Lived Stale Time the neighbor
+    /// announced (the largest of its families), when not zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llgr_stale_time: Option<u32>,
 }
 
 /// What the routing backend is doing, for the session list and the log.
@@ -94,4 +98,7 @@ pub struct RoutingStatus {
     pub ospf_neighbors: Vec<crate::ospf_state::OspfNeighbor>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ospf_interfaces: Vec<crate::ospf_state::OspfIfState>,
+    /// G3.9c: the stub router state of each instance (RFC 6987).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ospf_stub: Vec<crate::ospf_state::OspfStubState>,
 }

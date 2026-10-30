@@ -100,6 +100,12 @@ pub struct LinkState {
     /// `None`: ask `counters` (or the platform does not count them).
     #[serde(skip)]
     pub errors: Option<LinkErrors>,
+    /// The bus of the device behind the link (`pci`, `usb`, `virtio`), as
+    /// the platform's link dump carries it (Linux: `IFLA_PARENT_DEV_BUS_NAME`);
+    /// `None` for software links. Lets `interface.list` mark USB adapters
+    /// (G1.29b) without a per-port query.
+    #[serde(skip)]
+    pub bus: Option<String>,
 }
 
 /// The four error/drop counters `system.metrics` exports per link, named
@@ -281,6 +287,27 @@ pub trait Hal: Send {
         Err(HalError::Unsupported(format!(
             "{} cannot test the cable of '{name}'",
             self.describe()
+        )))
+    }
+
+    /// The kernel's transmit timeouts of `name` (`NETDEV WATCHDOG`), summed
+    /// over its queues: read every second by the USB watchdog (G1.29d), so
+    /// cheap. `None`: the platform does not count them.
+    fn usb_tx_timeouts(&mut self, name: &IfName) -> Option<u64> {
+        let _ = name;
+        None
+    }
+
+    /// A manual recovery of USB adapter `name` (G1.29c).
+    fn usb_reset(
+        &mut self,
+        name: &IfName,
+        level: nic::UsbResetLevel,
+    ) -> Result<Box<dyn nic::UsbReset>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} cannot reset '{name}' ({})",
+            self.describe(),
+            level.as_str()
         )))
     }
 

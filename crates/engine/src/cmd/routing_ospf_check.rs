@@ -16,7 +16,7 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "routing.ospf.instance.check", "Check OSPF Instance", [], None,
-        "{id?: string (the instance being edited), name?: string, version?: u8 | string, vrf?: string, router_id?: string | null, redistribute?: [string] | string, out_filter_chain?: string | null, originate_default?: string, subscriber_pools?: bool | yes | no, disabled?: bool | yes | no, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk}",
+        "{id?: string (the instance being edited), name?: string, version?: u8 | string, vrf?: string, router_id?: string | null, redistribute?: [string] | string, out_filter_chain?: string | null, originate_default?: string, subscriber_pools?: bool | yes | no, stub_router?: bool | yes | no, stub_router_on_startup?: u32 | string | null, disabled?: bool | yes | no, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk}",
         always, instance_check),
     cmd!(query "routing.ospf.area.check", "Check OSPF Area", [], None,
         "{id?: string (the area being edited), name?: string, instance?: string, area_id?: string, type?: string, no_summaries?: bool | yes | no, default_cost?: u32 | string | null, nssa_translate?: string, disabled?: bool | yes | no, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk}",
@@ -59,7 +59,7 @@ fn normalize(raw: &Value, editing: bool) -> Value {
         }
         for (k, v) in o.iter_mut() {
             if let Value::String(t) = v
-                && matches!(k.as_str(), "disabled" | "no_summaries" | "subscriber_pools" | "advertise")
+                && matches!(k.as_str(), "disabled" | "no_summaries" | "subscriber_pools" | "stub_router" | "advertise")
             {
                 *v = Value::Bool(t == "yes" || t == "true");
             }
@@ -114,6 +114,7 @@ fn preview(s: &mut Session, raw: &Value, what: What) -> Result<Value> {
                     let p = corerouter_proto_ospf::pools::cidrs(&cfg);
                     computed.push(json!({"label": "Pools announced", "value": if p.is_empty() { "none".to_owned() } else { p.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ") }}));
                 }
+                stub_router_checks(s, &cfg, i, &binds, &mut computed, &mut checks);
             }
         }
         What::Area => {
@@ -152,6 +153,60 @@ fn preview(s: &mut Session, raw: &Value, what: What) -> Result<Value> {
         "commands": if ok { vec![json!({"command": if id.is_some() { set } else { add }, "params": params})] } else { Vec::new() },
         "risk": risk,
     }))
+}
+
+/// G3.9c: what the stub router (RFC 6987) of instance `i` does and where
+/// it does not do what the operator expects.
+fn stub_router_checks(
+    s: &Session,
+    cfg: &Config,
+    i: &corerouter_model::ospf::OspfInstance,
+    binds: &[corerouter_proto_ospf::bind::Binding<'_>],
+    computed: &mut Vec<Value>,
+    checks: &mut Vec<Value>,
+) {
+    use corerouter_model::ospf::{NetworkType, Version};
+    if !i.stub_router && i.stub_router_on_startup.is_none() {
+        return;
+    }
+    let transit = binds.iter().filter(|b| b.instance.name == i.name && !b.template.passive).count();
+    computed.push(json!({"label": "Stub router", "value": match (i.stub_router, i.stub_router_on_startup) {
+        (true, _) if i.version == Version::V3 => format!("{transit} transit link(s) with the R-bit cleared (RFC 6987 §2.1): never transit, not even as the only path"),
+        (true, None) => format!("{transit} transit link(s) at cost 65535 until stub_router is unset; loopback and passive networks keep their cost (RFC 6987 §2)"),
+        (true, Some(t)) => format!("{transit} transit link(s) at cost 65535 until stub_router is unset (and {t} s after each start); loopback and passive networks keep their cost (RFC 6987 §2)"),
+        (false, Some(t)) => format!("{transit} transit link(s) at cost 65535 for {t} s after each start of the instance"),
+        (false, None) => String::new(),
+    }}));
+    // Errata 4685 (RFC 6987 §4): a virtual link whose path crosses a stub
+    // router costs more than 0xFFFF and goes down.
+    let vlinks = cfg.routing.ospf.templates.iter().filter(|t| {
+        !t.disabled
+            && t.kind == NetworkType::VirtualLink
+            && t.vlink_transit_area
+                .as_deref()
+                .and_then(|a| cfg.routing.ospf.areas.get(a))
+                .is_some_and(|a| a.instance == i.name)
+    });
+    if vlinks.count() > 0 {
+        checks.push(check("warning", "virtual-link", "a virtual link of this instance crosses this router: while it is a stub router the path costs more than 65535 and the virtual link goes down (RFC 6987 errata 4685)".into(), "stub_router"));
+    }
+    // §4: MaxLinkMetric is not infinity: with no other path the router
+    // still carries the transit.
+    let (nbrs, _, _) = s.ospf_live();
+    let full = nbrs.iter().filter(|n| n.instance == i.name && n.state.starts_with("Full")).count();
+    if full < 2 {
+        checks.push(check("info", "single-path", format!("{full} adjacency(ies) up: where this router is the only path, traffic still crosses it (cost 65535 is not infinity, RFC 6987 §4)"), "stub_router"));
+    }
+    // ospfd arms on-startup at each area's first router-LSA (FRR 10.7.1
+    // `ospf_stub_router_check`): added to a running instance it waits for
+    // the next start.
+    let before = s.store().running().routing.ospf.instances.get(&i.name);
+    if let (Some(t), Some(old)) = (i.stub_router_on_startup, before)
+        && old.stub_router_on_startup.is_none()
+        && !old.disabled
+    {
+        checks.push(check("info", "on-startup", format!("the instance already runs: the {t} s apply at its next start (reboot, FRR restart or disable/enable), not now; use stub_router to drain now"), "stub_router_on_startup"));
+    }
 }
 
 fn instance_check(s: &mut Session, p: &Value) -> Result<Value> {
@@ -229,5 +284,34 @@ mod tests {
         s.execute("routing.ospf.interface-template.add", &json!({"area": "bb", "interfaces": "ether1", "auth_key": "k"})).unwrap();
         let c = s.execute("routing.ospf.instance.check", &json!({"id": "v2", "router_id": "10.0.0.2"})).unwrap();
         assert!(c["risk"].as_str().unwrap().contains("router id"), "{c}");
+    }
+
+    /// G3.9c: the stub router preview: what it changes, the single path,
+    /// on-startup added to a running instance, a virtual link across it.
+    #[test]
+    fn stub_router_preview() {
+        let mut s = Session::new(Box::new(VirtualHal::default()));
+        s.execute("ip.address.add", &json!({"address": "10.0.1.1/24", "interface": "ether1"})).unwrap();
+        s.execute("routing.ospf.instance.add", &json!({"name": "v2", "router_id": "10.0.0.1"})).unwrap();
+        s.execute("routing.ospf.area.add", &json!({"name": "bb", "instance": "v2", "area_id": "0"})).unwrap();
+        s.execute("routing.ospf.interface-template.add", &json!({"area": "bb", "interfaces": "ether1"})).unwrap();
+        let c = s.execute("routing.ospf.instance.check", &json!({"id": "v2", "stub_router": "yes"})).unwrap();
+        let text = c.to_string();
+        assert!(text.contains("1 transit link(s) at cost 65535"), "{c}");
+        assert!(text.contains("RFC 6987 §4"), "{c}");
+        assert!(!text.contains("next start"), "{c}");
+        assert_eq!(c["commands"][0]["params"]["stub_router"], true, "{c}");
+        let c = s.execute("routing.ospf.instance.check", &json!({"id": "v2", "stub_router_on_startup": "300"})).unwrap();
+        assert!(c.to_string().contains("next start"), "{c}");
+        // A new instance has no such note.
+        let c = s.execute("routing.ospf.instance.check", &json!({"name": "v2b", "stub_router_on_startup": "300"})).unwrap();
+        assert!(!c.to_string().contains("next start"), "{c}");
+        s.execute("routing.ospf.area.add", &json!({"name": "a1", "instance": "v2", "area_id": "1"})).unwrap();
+        s.execute("routing.ospf.interface-template.add", &json!({"area": "bb", "type": "virtual-link", "vlink_transit_area": "a1", "vlink_neighbor_id": "10.0.0.9"}))
+            .unwrap();
+        let c = s.execute("routing.ospf.instance.check", &json!({"id": "v2", "stub_router": true})).unwrap();
+        assert!(c.to_string().contains("errata 4685"), "{c}");
+        let c = s.execute("routing.ospf.instance.check", &json!({"id": "v2", "stub_router_on_startup": "2"})).unwrap();
+        assert_eq!(c["checks"][0]["param"], "stub_router_on_startup", "{c}");
     }
 }

@@ -13,10 +13,11 @@ instale:
 v=0.1.0                                    # a versão da página da Release
 base=https://github.com/valdijanio/CoreRouter/releases/download/v$v
 curl -LO "$base/corerouter-gui_${v}_amd64.deb" -LO "$base/SHA256SUMS"
-sha256sum -c SHA256SUMS                    # tem de dizer "OK"; senão não instale
+sha256sum -c --ignore-missing SHA256SUMS     # tem de dizer "OK"; senão não instale
 sudo apt install "./corerouter-gui_${v}_amd64.deb"
 ```
 
+(`--ignore-missing`: o `SHA256SUMS` também lista a imagem do roteador, que você não baixou.)
 O `sha256sum -c` confere se o arquivo baixado é o que o CI gerou (download corrompido ou
 trocado no caminho). O `SHA256SUMS` vem da mesma página, então ele não protege contra a própria
 página adulterada; para isso, compare o hash com o do log do run de release no Actions
@@ -52,16 +53,12 @@ Para testar sem publicar: Actions → release → Run workflow com uma versão c
 `0.1.0-test.1` (só gera os arquivos, como artifact do run, sem Release); um PR que mexe no
 workflow ou no `xtask/src/package*` faz o mesmo.
 
-A **imagem do roteador** (`.crpkg`, ISO, `disk.img`, `.ova`) não entra no workflow: ela é
-assinada com a chave do dono em `os/out/keys`, que não vai para o CI público, e o build do
-Buildroot passa do tempo e do disco de um runner. Quem quiser anexá-la a uma Release assina
-na própria máquina e sobe no rascunho, antes de publicar:
-
-```sh
-cargo xtask os build                        # assina com os/out/keys
-cd os/out/build/images && sha256sum corerouter.crpkg corerouter.ova > SHA256SUMS-image
-gh release upload v0.1.0 corerouter.crpkg corerouter.ova SHA256SUMS-image
-```
+A **imagem do roteador** (`.crpkg`, ISO, `.qcow2`, `.ova`) não entra no workflow: ela é
+assinada com a **chave de release** do dono, que não vai para o CI público, e o build do
+Buildroot passa do tempo e do disco de um runner. Depois que o workflow cria o rascunho, o dono
+compila e anexa a imagem na própria máquina (`cargo xtask os release --tag v0.1.0`) e só então
+publica. Passo a passo completo de uma versão (tag, workflow, imagem, revisão) em
+[release.md](release.md).
 
 ## Gerar e instalar a partir do código (Debian, Ubuntu)
 

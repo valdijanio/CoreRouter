@@ -65,6 +65,7 @@ fn instance(asn: u32, rid: &str) -> BgpInstance {
         graceful_defer_time: None,
         graceful_notification: None,
         hard_admin_reset: None,
+        llgr_stale_time: None,
     }
 }
 
