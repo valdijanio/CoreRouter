@@ -281,6 +281,13 @@ fn parse_args() -> Result<Args, String> {
                 out.policy.unmanaged = corerouter_hal_linux::Policy::patterns(&v)?;
             }
             "-h" | "--help" => return Err(usage()),
+            "-V" | "--version" => {
+                println!(
+                    "{}",
+                    corerouter_buildinfo::version_line("corerouter-daemon")
+                );
+                std::process::exit(0);
+            }
             other => {
                 let Some(f) = service::flag(other) else {
                     return Err(format!("unknown argument '{other}'\n{}", usage()));

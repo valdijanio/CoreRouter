@@ -71,4 +71,5 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("resources.tab.threads", "## Threads\n\nEach thread of the daemon, the init and FRR, with its CPU in % of one core."),
     ("resources.threads.hot", "## Busiest thread\n\nThe busiest thread; amber at 90 % of one core."),
     ("resources.uptime", "## Uptime\n\nTime since the router's operating system booted (`/proc/uptime`)."),
+    ("resources.version", "## Version\n\nThe CoreRouter version the router runs (G0.32): `0.1.0` on a release tag, `0.1.0-dev.<N>` otherwise, N counting the commits behind the build (one per merged PR). Hover for the full build (`0.1.0-dev.500+320cb9d`, `.dirty` with uncommitted changes) and the commit date."),
 ];

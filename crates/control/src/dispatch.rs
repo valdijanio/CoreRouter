@@ -207,8 +207,12 @@ fn dispatch_value(
             host.with_session(&mut |s| {
                 Ok(json!({
                     "name": "corerouter",
-                    "version": env!("CARGO_PKG_VERSION"),
+                    "version": corerouter_buildinfo::VERSION,
+                    "version_full": corerouter_buildinfo::full(),
                     "commit": corerouter_buildinfo::COMMIT,
+                    "build": corerouter_buildinfo::BUILD,
+                    "commit_time": corerouter_buildinfo::commit_unix(),
+                    "protocol": corerouter_buildinfo::PROTOCOL,
                     "backend": s.backend(),
                     "has_ui": has_ui,
                 }))

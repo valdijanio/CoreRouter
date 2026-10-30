@@ -1,6 +1,6 @@
 [package]
 name = "corerouter-buildinfo"
-description = "L0: the git commit this binary was built from (server.info, the GUI's stale-daemon warning)"
+description = "L0: the version, commit and control protocol of this binary (server.info, the GUI's other-build warning)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

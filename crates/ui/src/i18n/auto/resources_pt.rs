@@ -50,6 +50,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("Uptime", "Ligado há"),
     ("Used", "Usado"),
     ("Value", "Valor"),
+    ("Version", "Versão"),
     ("Waiting for the router…", "Esperando o roteador…"),
     ("Written since boot", "Escrito desde o boot"),
     ("cores", "núcleos"),
@@ -143,4 +144,5 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("resources.tab.threads", "## Threads\n\nCada thread do daemon, do `corerouter-init` e dos daemons do FRR, com a CPU entre as duas últimas leituras (uma por segundo com a janela aberta), lida de `/proc/<pid>/task/*/stat`. Serve para ver trabalho preso num núcleo: o processo inteiro pode estar em 6 % da máquina com uma thread a 100 % de um núcleo, como o plano de controle PPPoE do laboratório do BNG de 25/10/2026. Lido só dos processos do roteador, não da máquina inteira."),
     ("resources.threads.hot", "## Thread mais ocupada\n\nA thread que mais usou CPU entre as duas últimas leituras. Fica âmbar a partir de 90 % de um núcleo: o trabalho dela não cabe num núcleo só e está serializado ali (dividir por porta, fila ou hash resolve; veja `docs/perf.md`)."),
     ("resources.uptime", "## Ligado há\n\nTempo desde que o sistema operacional do roteador ligou (`/proc/uptime`), como o `uptime` do `/system resource` do RouterOS."),
+    ("resources.version", "## Versão\n\nA versão do CoreRouter que roda no roteador (G0.32). Numa release com tag ela é `0.1.0`; fora dela é `0.1.0-dev.<N>`, em que N conta os commits até a build: cada PR integrado soma 1, então `dev.498` contra `dev.500` são dois PRs de diferença. Passe o mouse para ver a build completa (`0.1.0-dev.500+320cb9d`, com `.dirty` quando foi compilada com alterações sem commit) e a data do commit. Como o `version` do `/system resource` do RouterOS."),
 ];
