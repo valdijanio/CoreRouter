@@ -514,6 +514,13 @@ fn cgnat_blocks_and_limits_reach_sctp_tls_and_legacy_collectors() {
         Some(cp),
         &["route", "add", "10.200.0.0/20", "via", "192.0.2.1"],
     );
+    // The server takes the storm in silence. With nobody on port 9 it
+    // answered each datagram with an ICMP port unreachable, and the router
+    // resolved every one of the 20 000 subscribers on `lan0`: the kernel's
+    // neighbor table is one for all namespaces (gc_thresh3 = 1024), so
+    // every other test on the machine got ENOBUFS for its own ARP for
+    // seconds (flaked netns_ha_pppoe, netns_dhcp_server, netns_cgnat…).
+    let _sink = within(cp, || UdpSocket::bind("192.0.2.2:9").unwrap());
     std::thread::sleep(Duration::from_secs(2));
     let storm = |r: &Record| matches!(r, Record::PortBlock(b) if b.src.octets()[2] >= 128 && b.event == NatEventType::PortBlockAllocation);
     let cpu0 = cpu_ms(dpid);

@@ -33,7 +33,9 @@ use common::*;
 use serde_json::{Value, json};
 
 fn daemon(netns: Option<u32>, dir: &Path, ifaces: &str, log: &str) -> Kill {
-    let log = std::fs::File::create(std::env::temp_dir().join(log)).unwrap();
+    // Next to the config dirs, in this run's own folder (a fixed name in
+    // /tmp was shared by every run on the machine).
+    let log = std::fs::File::create(dir.parent().unwrap_or(dir).join(log)).unwrap();
     let mut c = in_ns(netns, DAEMON);
     c.args([
         "--backend",

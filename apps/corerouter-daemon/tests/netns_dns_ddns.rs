@@ -149,8 +149,13 @@ fn nsupdate_changes_the_zone() {
         json!({"name": "53.10.in-addr.arpa", "update_keys": "ddns"}),
     )
     .unwrap();
-    wait_for("the zone", || {
-        ask("lan.example.", RecordType::SOA).is_some_and(|m| m.metadata.authoritative)
+    // Both: the service may publish them in two of its rounds (it read the
+    // config between the two adds), and the reverse zone's update got
+    // NOTAUTH (flaked in the queue's batches).
+    wait_for("the zones", || {
+        ["lan.example.", "53.10.in-addr.arpa."]
+            .iter()
+            .all(|z| ask(z, RecordType::SOA).is_some_and(|m| m.metadata.authoritative))
     });
     let serial = |m: Option<Message>| m.map(|m| m.answers[0].data.to_string()).unwrap_or_default();
     let before = serial(ask("lan.example.", RecordType::SOA));
