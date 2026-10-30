@@ -265,11 +265,12 @@ fn rfc8538_shows_the_n_bit_and_the_hard_reset() {
     st.bgp_sessions[0].gr_local = Some("restart".into());
     st.bgp_sessions[0].gr_remote = Some("helper".into());
     st.bgp_sessions[0].n_bit = true;
+    st.bgp_sessions[0].llgr_stale_time = Some(3600);
     st.bgp_sessions[0].end_of_rib_received = vec!["ipv4".into()];
     st.bgp_sessions[1].last_hard_reset = Some(true);
     s.set_routing_status(st);
     let mut h = open(s);
-    for t in ["restart", "N", "EoR"] {
+    for t in ["restart", "N", "LLGR", "EoR"] {
         assert!(h.has_text(t), "{t}");
     }
     h.click(h.text("rr1"));
@@ -278,6 +279,7 @@ fn rfc8538_shows_the_n_bit_and_the_hard_reset() {
     panel(&mut h).tab = Tab::Instances;
     refresh(&mut h);
     assert!(h.has_text("N bit"));
+    assert!(h.has_text("off"), "LLGR off by default");
     act(&mut h, Act::Edit("default".into()), What::Instance);
     let (_, m) = panel(&mut h).modal.as_mut().unwrap();
     assert_eq!(m.values.get("hard_admin_reset").map(String::as_str), Some("yes"));

@@ -7,7 +7,7 @@
 #   scripts/bgp-crcr-userns.sh [case…]
 # Cases (default: all, in this order):
 #   ebgp ebgp6 mpbgp md5 filters extcomm announce nexthop-self rr maxprefix
-#   restart gr hardreset bfd convergence scale
+#   restart gr hardreset cbit llgr bfd convergence scale
 # Not in the default list: ospf-static (G3.9fe, OSPF redistributing the
 # CoreRouter's static routes).
 # SCALE_N=<n> changes the 100 000 prefixes of `scale`. Results: a table at
@@ -71,7 +71,7 @@ export LD_LIBRARY_PATH=$FRR_DIR/root/usr/lib/x86_64-linux-gnu:$FRR_DIR/root/usr/
 FRR=$FRR_DIR/root/usr/lib/frr
 bin=$CARGO_TARGET_DIR/release
 CASES=("$@")
-[ ${#CASES[@]} -gt 0 ] || CASES=(ebgp ebgp6 mpbgp md5 filters extcomm announce nexthop-self rr maxprefix restart gr hardreset bfd convergence scale)
+[ ${#CASES[@]} -gt 0 ] || CASES=(ebgp ebgp6 mpbgp md5 filters extcomm announce nexthop-self rr maxprefix restart gr hardreset cbit llgr bfd convergence scale)
 FAILED=0
 : > "$W/results.txt"
 result() { # result <case> <OK|FAIL|INFO> <text>
@@ -654,6 +654,116 @@ case_hardreset() {
   grep -q '^clear-hard no ' "$W/hr-summary.txt" && grep -q '^clear-graceful yes ' "$W/hr-summary.txt" \
     && result hardreset OK "session.clear: Hard Reset drops the route, hard_admin_reset=no keeps it ($(grep '^clear-' "$W/hr-summary.txt" | tr '\n' ';'))" \
     || result hardreset FAIL "session.clear: $(grep '^clear-' "$W/hr-summary.txt" | tr '\n' ';')"
+}
+
+# G3.9fj, RFC 5882 §4.3: BFD and graceful restart. CR1 restarts
+# gracefully, both sides with BFD (100 ms × 3). CoreRouter's BFD runs in
+# corerouter-daemon (bfdd only drives it, over the distributed data plane).
+# kill -9 on CR1, all back 3 s later, ping CR2 → CR1 20 ms apart:
+#   frr:    bgpd and bfdd; BFD stays up (the daemon sends it): route kept;
+#   daemon: corerouter-daemon only; BFD down with the TCP session up, a
+#           Hard Reset (Cease 10): route gone (gap: BFD dies with the daemon);
+#   stack:  daemon, bgpd and bfdd (zebra keeps forwarding): the TCP drop
+#           comes first, and FRR 10.7.1 does not flush stale routes on a BFD
+#           down after it (`bgp_stop` touches the GR timers only while
+#           established): route kept, with or without `neighbor X bfd
+#           check-control-plane-failure` (measured, G3.9fj).
+cbit_round() { # cbit_round <label> <CR1 extra> <CR2 extra> <what to kill: stack|frr|daemon>
+  local label=$1 x1=$2 x2=$3 what=$4 gone kept
+  crc 1 "$(jq -c '. + $x' --argjson x "$x1" <<< '{"name":"cr2","remote_address":"10.39.5.2","remote_as":65002,"input_filter":"all","output_filter":"all","output_network":"bgp-out","graceful_restart":true,"bfd":"g39f"}')"
+  crc 2 "$(jq -c '. + $x' --argjson x "$x2" <<< '{"name":"cr1","remote_address":"10.39.5.1","remote_as":65000,"input_filter":"all","output_filter":"all","output_network":"bgp-out","bfd":"g39f"}')"
+  wait_for 60 cr_up 2 cr1 >/dev/null || { result cbit FAIL "$label: no session"; pair_down; return; }
+  wait_for 30 k_has c2 100.64.39.0/24 >/dev/null || true
+  wait_for 30 eval '[ "$(cr_sess 2 cr1 | jq -r .bfd)" = up ]' >/dev/null || true
+  sleep 2
+  result cbit INFO "$label: CR2 sees $(cr_sess 2 cr1 | jq -c '{gr_local, gr_remote, n_bit, bfd}')"
+  ip netns exec c2 ping -i 0.02 -w 12 -I 100.64.40.1 100.64.39.1 > "$W/cbit-ping-$label.txt" 2>&1 &
+  local pp=$!
+  sleep 1
+  case $what in
+    stack|daemon) kill -9 "$(cat "$W/daemon1.pid")" ;;
+  esac
+  case $what in
+    stack|frr) pkill -9 -f -- "frr/bgpd -N c1( |$)"; pkill -9 -f -- "frr/bfdd -N c1( |$)" ;;
+  esac
+  gone=$(wait_for 3 k_none c2 100.64.39.0/24) && kept=no || kept=yes
+  [ "$kept" = no ] && sleep 2
+  case $what in
+    stack|frr)
+      ip netns exec c1 "$FRR/bfdd" -N c1 -u root -g root -d --limit-fds 4096 -f /etc/frr/c1/bfdd.conf --dplaneaddr unix:/var/run/frr/c1/bfdd_dplane.sock </dev/null >>"$W/frr-c1.log" 2>&1
+      ip netns exec c1 "$FRR/bgpd" -N c1 -u root -g root -d --limit-fds 4096 -f /etc/frr/c1/bgpd.conf </dev/null >>"$W/frr-c1.log" 2>&1 ;;
+  esac
+  case $what in
+    # The profile is lost across a daemon restart (bug found here, G3.9fj
+    # notes): add it again.
+    stack|daemon) start_daemon 1; cr 1 routing.bfd.profile.add '{"name":"g39f","min_tx":100,"min_rx":100,"multiplier":3}' >/dev/null 2>&1 || true ;;
+  esac
+  wait "$pp" || true
+  local rx tx; rx=$(grep -o '[0-9]* received' "$W/cbit-ping-$label.txt" | grep -o '[0-9]*'); tx=$(grep -o '[0-9]* packets transmitted' "$W/cbit-ping-$label.txt" | grep -o '^[0-9]*')
+  local up; up=$(wait_for 60 cr_up 2 cr1) || up=-1
+  wait_for 30 eval '[ "$(cr_sess 2 cr1 | jq -r .bfd)" = up ]' >/dev/null || true
+  result cbit INFO "$label: kill -9 of $what; CR2 kept CR1's route: $kept$([ "$kept" = no ] && echo " (gone ${gone} ms after the kill)"); ping 20 ms apart: $(( ${tx:-0} - ${rx:-0} )) of ${tx:-0} lost; session up again ${up} ms after the ping ended, BFD $(cr_sess 2 cr1 | jq -r .bfd)"
+  echo "$label $kept $(( ${tx:-0} - ${rx:-0} ))" >> "$W/cbit-summary.txt"
+  pair_down; sleep 3
+}
+case_cbit() {
+  : > "$W/cbit-summary.txt"
+  for n in 1 2; do cr "$n" routing.bfd.profile.add '{"name":"g39f","min_tx":100,"min_rx":100,"multiplier":3}' >/dev/null 2>&1 || true; done
+  cbit_round frr '{}' '{}' frr
+  cbit_round daemon '{}' '{}' daemon
+  cbit_round stack '{}' '{}' stack
+  local s; s=$(tr '\n' ';' < "$W/cbit-summary.txt")
+  grep -q '^frr yes ' "$W/cbit-summary.txt" && grep -q '^stack yes ' "$W/cbit-summary.txt" \
+    && result cbit OK "BFD + graceful restart: CR1's route kept with bgpd+bfdd or the whole stack killed ($s)" \
+    || result cbit FAIL "BFD + graceful restart: $s"
+  grep -q '^daemon no ' "$W/cbit-summary.txt" && result cbit INFO "known gap: corerouter-daemon alone killed takes BFD down and the routes with it ($s)"
+}
+
+# G3.9fj, RFC 9494. CR1 restarts gracefully with Restart Time 5 s; kill -9
+# of its bgpd, which stays down 25 s. Without LLGR CR2 drops CR1's route
+# when the Restart Time ends; with llgr_stale_time 10 it keeps it 10 s
+# longer, with the llgr-stale community (§4.2).
+llgr_round() { # llgr_round <label> <llgr_stale_time or null>
+  local label=$1 llst=$2 t0 ms comm
+  local i; i=$(cr1 routing.bgp.instance.list | jq -c --argjson l "$llst" '.[0] | {name, asn, router_id, graceful_restart_time: 5, llgr_stale_time: $l}')
+  cr1 routing.bgp.instance.set "$i" >/dev/null
+  # FRR keeps a neighbor's LLGR stale time only up to its own (`bgp_open.c`,
+  # MIN(received, bgp->llgr_stale_time)): CR2 needs it too.
+  cr2 routing.bgp.instance.set "$(cr2 routing.bgp.instance.list | jq -c --argjson l "$llst" '.[0] | {name, asn, router_id, llgr_stale_time: $l}')" >/dev/null
+  pair_up '{"graceful_restart":true,"hold_time":30}'
+  wait_for 60 cr_up 2 cr1 >/dev/null || { result llgr FAIL "$label: no session"; pair_down; return; }
+  wait_for 30 k_has c2 100.64.39.0/24 >/dev/null || true
+  sleep 2
+  result llgr INFO "$label: CR2 sees $(cr_sess 2 cr1 | jq -c '{gr_local, gr_remote, llgr_stale_time}'); CR1 bgpd: $(vt c1 'show running-config' | grep -c long-lived) LLGR line(s); CR2 FRR: $(vt c2 'show bgp neighbors 10.39.5.1 json' | jq -c '."10.39.5.1" | {llgr: .neighborCapabilities.longLivedGracefulRestart, t: .gracefulRestartInfo.ipv4Unicast.timers}' 2>/dev/null)"
+  t0=$(now_ms)
+  pkill -9 -f -- "frr/bgpd -N c1( |$)"
+  # Poll from the kill; the communities once, 7 s in (after the Restart Time).
+  comm=""; ms=""
+  while [ $(( $(now_ms) - t0 )) -lt 30000 ]; do
+    if [ -z "$comm" ] && [ $(( $(now_ms) - t0 )) -ge 7000 ]; then
+      comm=$(vt c2 'show bgp ipv4 unicast 100.64.39.0/24 json' | jq -c '[.paths[]? | .community.string // ""]' 2>/dev/null); comm=${comm:-[]}
+    fi
+    if k_none c2 100.64.39.0/24; then ms=$(( $(now_ms) - t0 )); break; fi
+    sleep 0.1
+  done
+  ms=${ms:->30000}; comm=${comm:-gone before 7 s}
+  ip netns exec c1 "$FRR/bgpd" -N c1 -u root -g root -d --limit-fds 4096 -f /etc/frr/c1/bgpd.conf </dev/null >>"$W/frr-c1.log" 2>&1
+  result llgr INFO "$label: bgpd killed; 7 s later CR2's path communities $comm; CR1's route gone from CR2's kernel ${ms} ms after the kill"
+  echo "$label $ms $comm" >> "$W/llgr-summary.txt"
+  wait_for 60 cr_up 2 cr1 >/dev/null || true
+  pair_down; sleep 2
+}
+case_llgr() {
+  : > "$W/llgr-summary.txt"
+  llgr_round off null
+  llgr_round on 10
+  cr1 routing.bgp.instance.set "$(cr1 routing.bgp.instance.list | jq -c '.[0] | {name, asn, router_id, graceful_restart_time: null, llgr_stale_time: null}')" >/dev/null
+  cr2 routing.bgp.instance.set "$(cr2 routing.bgp.instance.list | jq -c '.[0] | {name, asn, router_id, llgr_stale_time: null}')" >/dev/null
+  local off on
+  off=$(awk '$1 == "off" {print $2; exit}' "$W/llgr-summary.txt"); on=$(awk '$1 == "on" {print $2}' "$W/llgr-summary.txt")
+  [[ "$off" =~ ^[0-9]+$ && "$on" =~ ^[0-9]+$ ]] && [ "$off" -lt 9000 ] && [ "$on" -gt 13000 ] && [ "$on" -lt 20000 ] && grep -q '^on .*llgr-stale' "$W/llgr-summary.txt" \
+    && result llgr OK "RFC 9494: Restart Time 5 s, route gone after ${off} ms without LLGR and ${on} ms with 10 s of LLGR, marked llgr-stale meanwhile" \
+    || result llgr FAIL "RFC 9494: $(tr '\n' ';' < "$W/llgr-summary.txt")"
 }
 
 case_restart() {

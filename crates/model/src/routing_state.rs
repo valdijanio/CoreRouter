@@ -76,6 +76,10 @@ pub struct BgpSession {
     /// routes went at once); false: it was graceful (they stayed stale).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_hard_reset: Option<bool>,
+    /// G3.9fj, RFC 9494 §3.1: the Long-Lived Stale Time the neighbor
+    /// announced (the largest of its families), when not zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llgr_stale_time: Option<u32>,
 }
 
 /// What the routing backend is doing, for the session list and the log.

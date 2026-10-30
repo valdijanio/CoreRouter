@@ -82,7 +82,7 @@ pub const UNITS: &[Unit] = &[
         },
     },
     Unit {
-        name: "firewall",
+        name: FIREWALL_UNIT,
         reads: small_and(Sections::FIREWALL),
         run: corerouter_firewall::validate,
     },
@@ -155,17 +155,23 @@ pub fn validate_changed(cfg: &Config, changed: Sections) -> Vec<Issue> {
 /// [`validate_changed`] for a commit from `running` (valid: the commit
 /// path keeps it so, `ValidRunning`) to `cfg`. With the interfaces and
 /// addresses the same, the route checks look only at the destinations the
-/// commit touched (G0.31e: 16 ms with 60 000 routes); the rest as
+/// commit touched (G0.31e: 16 ms with 60 000 routes), and the firewall
+/// checks only the rules it touched when nothing else changes them
+/// (G0.31j, `corerouter_firewall::validate::validate_since`); the rest as
 /// [`validate_changed`]. Same issues, in the same order.
 pub fn validate_commit(running: &Config, cfg: &Config, changed: Sections) -> Vec<Issue> {
-    let routes_only = !changed.contains(Sections::OTHER)
-        && !changed.intersects(Sections::ADDRESSES.union(Sections::INTERFACES));
+    let known_valid = !changed.contains(Sections::OTHER);
+    let routes_only =
+        known_valid && !changed.intersects(Sections::ADDRESSES.union(Sections::INTERFACES));
     UNITS
         .iter()
         .filter(|u| changed.contains(Sections::OTHER) || u.reads.intersects(changed))
         .flat_map(|u| {
             if routes_only && u.name == ROUTES_UNIT {
                 route_checks_since(running, cfg)
+            } else if known_valid && u.name == FIREWALL_UNIT {
+                corerouter_firewall::validate::validate_since(running, cfg)
+                    .unwrap_or_else(|| (u.run)(cfg))
             } else {
                 (u.run)(cfg)
             }
@@ -173,8 +179,9 @@ pub fn validate_commit(running: &Config, cfg: &Config, changed: Sections) -> Vec
         .collect()
 }
 
-/// Name of the unit that [`validate_commit`] runs incrementally.
+/// Names of the units that [`validate_commit`] runs incrementally.
 const ROUTES_UNIT: &str = "routes";
+const FIREWALL_UNIT: &str = "firewall";
 
 fn interface_checks(cfg: &Config) -> Vec<Issue> {
     let mut out = Vec::new();
