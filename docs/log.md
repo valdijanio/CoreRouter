@@ -9020,3 +9020,36 @@ continuação indentadas).
   `## Revisão humana necessária`; a sessão principal resume cada bloco ao usuário; só depois do
   "aprovo" dele ela põe o rótulo e registra a aprovação no PR. Todo bloco novo ou alterado passa
   pela revisão, sem catálogo de padrões já aprovados (decisão do usuário, 2026-10-30).
+
+- 2026-10-30 — G1.29f: Placa USB que voltou do reset de porta como `eth0`, e não como `ether4` (VM `corerouter-teste`,
+  RTL8153 `0bda:8153`, MAC `00:E0:4C:68:20:76`).
+
+  **Causa (reproduzida no roteador do relato, não suposta):** a imagem rodando era a do commit
+  `d383a321` (a barra da GUI mostrava `daemon d383a32`), a ponta da branch da G1.29d. Esse commit
+  **não contém a G1.6n** (#486): `git merge-base --is-ancestor 3afd1d98 d383a321` dá falso. O PID 1
+  dessa imagem não tem a thread "port-names": `system.resource.process.print {threads: true}`
+  mostrava `corerouter-init` com 1 thread e 3 fds, sem o socket netlink. Sem ela, o netdev recriado
+  pelo reset fica com o nome do kernel para sempre. Nenhuma das hipóteses do código da G1.6n (corrida
+  com EEXIST, EBUSY, maiúsculas no MAC) se aplica: o código não estava na imagem. O mapa e o `sysfs`
+  comparam o MAC em minúsculas dos dois lados (`ports::parse_map` e `links::port`).
+
+  O que mudou para o operador não ficar no escuro de novo:
+
+  - **O reset diz com que nome a placa voltou.** Quando ela não volta com o nome, mas há um link com
+    o MAC dela (`eth0`), o log diz "came back as 'eth0', not 'ether4': PID 1 did not give it its
+    name again", e o resumo da tarefa traz `back_as` (antes: "did not come back within 20 s").
+  - **As mensagens do PID 1 vão para o log do roteador.** O `corerouter-init` escreve cada linha
+    também no `/dev/kmsg` (`<13>corerouter-init[1]: …`, nível notice, abaixo do nível de console do
+    `quiet`, então o console não a mostra duas vezes). O leitor do log do SO do daemon já lia o
+    `/dev/kmsg`: a linha aparece em `log.os.print` (fonte `services`, unidade `corerouter-init`) e
+    agora também em `log.print` como `init: …`, com o tópico `interface` para os nomes de porta
+    ("port names: …") e `system` para o resto. Antes só o console serial (o pty do libvirt) as tinha.
+
+  Como testar: `cargo test -p corerouter-engine came_back`, `cargo test -p corerouter-hal-linux
+  port_recovery`, `cargo test -p corerouter-init kmsg`, `cargo test -p corerouter-daemon pid1_lines`.
+  Os quatro falham sem a mudança (o campo `back_as` não existe; a linha do PID 1 não chega ao
+  `log.print`). Na VM: `interface.usb.reset {name: "ether4", level: "port"}` e depois
+  `log.print {find: "init:"}`. Não validado na VM nesta rodada: o `cargo xtask os push` desta branch
+  foi recusado porque o `/config` da VM (56 MB) não tem espaço para o snapshot da configuração (G1.6u,
+  abaixo). O reset de porta com uma imagem que tem a G1.6n voltou como `ether4` na medição da G1.29c
+  (3,54 s, **medido** em 2026-10-29).

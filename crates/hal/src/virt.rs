@@ -520,6 +520,7 @@ impl crate::nic::UsbReset for LabUsbReset {
             steps,
             power_cycled: power,
             back: true,
+            back_as: None,
         })
     }
 }
