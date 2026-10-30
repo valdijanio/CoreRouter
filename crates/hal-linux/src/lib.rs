@@ -1090,12 +1090,10 @@ mod linux {
                         }
                     }
                     Some(&i) => match self.indices.insert(n.clone(), i) {
-                        Some(was) if was != i => {
-                            if self.absent.insert(n.clone()) {
-                                log::warn!(
-                                    "'{n}' was replugged (link #{was} is now #{i}): its configuration is applied again"
-                                );
-                            }
+                        Some(was) if was != i && self.absent.insert(n.clone()) => {
+                            log::warn!(
+                                "'{n}' was replugged (link #{was} is now #{i}): its configuration is applied again"
+                            );
                         }
                         _ => {}
                     },
