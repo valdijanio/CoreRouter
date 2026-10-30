@@ -306,6 +306,7 @@ fn responder(cr2: &Ns, stop: Arc<AtomicBool>) -> thread::JoinHandle<u64> {
             if sent == 0 {
                 eprintln!("responder sent nothing; last error: {last_err:?}");
             }
+            eprintln!("tap: {}", r.tap_kind());
             sent
         })
         .unwrap();

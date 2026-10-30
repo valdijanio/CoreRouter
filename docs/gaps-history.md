@@ -290,3 +290,5 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-29 — G1.6t criado e feito (adoção de porta física que aparece com o roteador ligado)
 - 2026-10-30 — G1.29d criado e feito (vigia automático de placa USB)
 - 2026-10-30 — G3.9da feito (ICMP too big em LSP e taxa de ICMP por origem)
+- 2026-10-30 — G1.3b feito (porta ausente não derruba o `apply`; flag `invalid`; reaplica na volta)
+- 2026-10-30 — G3.9db em revisão (tap MPLS em eBPF)

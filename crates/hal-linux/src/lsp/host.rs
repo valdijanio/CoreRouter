@@ -655,19 +655,43 @@ impl LsrView for HostView {
     }
 }
 
-/// The three packet sockets (MPLS, IPv4, IPv6), for the whole host: the
-/// frame's `sll_ifindex` says which interface, checked against the MPLS
-/// ones after the copy.
+/// How the responder hears frames.
 ///
-/// G3.9d, **medido**: a socket bound to one interface sits on that
-/// device's `ptype_specific` list, which the kernel walks after
-/// `ptype_base`; `mpls_rcv` / `ip_rcv` then get the frame shared with the
-/// tap and clone it (`skb_share_check`) for every packet: MPLS switching
-/// fell from 1.20 to 0.90 Mpps with the taps on the port
-/// (`benches/netns_mpls_ttl.rs`). Unbound, the tap is on `ptype_base`
-/// ahead of them, its filter runs and lets the frame go first: no clone.
-struct Taps {
-    socks: Vec<Socket>,
+/// - **tc (G3.9db):** the `lsp_tap` classifier on the ingress of each MPLS
+///   interface (`ebpf.rs`), the default where eBPF loads (root, kernel
+///   5.8+ for the ring buffer).
+/// - **Packet sockets (G3.5b–G3.9da):** three of them (MPLS, IPv4, IPv6),
+///   for the whole host: the frame's `sll_ifindex` says which interface,
+///   checked against the MPLS ones after the copy. G3.9d, **medido**: a
+///   socket bound to one interface sits on that device's `ptype_specific`
+///   list, which the kernel walks after `ptype_base`; `mpls_rcv` /
+///   `ip_rcv` then get the frame shared with the tap and clone it
+///   (`skb_share_check`) for every packet: MPLS switching fell from 1.20
+///   to 0.90 Mpps with the taps on the port (`benches/netns_mpls_ttl.rs`).
+///   Unbound, the tap is on `ptype_base` ahead of them, its filter runs
+///   and lets the frame go first: no clone, but still a `packet_rcv` per
+///   frame (−19%), which the tc tap removes.
+enum Taps {
+    Ebpf(Box<super::ebpf::EbpfTap>),
+    Packet(Vec<Socket>),
+}
+
+/// `$COREROUTER_LSP_TAP`: `packet` keeps the packet sockets, `ebpf` wants
+/// the tc tap (an error if it cannot load); unset, the tc tap where it
+/// loads ([`TapChoice::Auto`]).
+const TAP_ENV: &str = "COREROUTER_LSP_TAP";
+
+/// Which tap [`HostResponder`] opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TapChoice {
+    /// The tc tap where it loads, else packet sockets; `$COREROUTER_LSP_TAP`
+    /// decides when set.
+    #[default]
+    Auto,
+    /// The tc tap or nothing.
+    Ebpf,
+    /// The packet sockets.
+    Packet,
 }
 
 fn tap(ethertype: u16, prog: &[super::Insn]) -> io::Result<Socket> {
@@ -709,6 +733,9 @@ pub struct HostResponder {
     too_big: bool,
     /// The frame length the MPLS tap's filter keeps above, as attached.
     big: Option<u32>,
+    /// Why the tc tap is not used, when it is not.
+    fallback: Option<String>,
+    choice: TapChoice,
 }
 
 /// An `IPPROTO_RAW` socket: the packet carries its own IP header
@@ -764,7 +791,66 @@ impl HostResponder {
             neighbors: Neighbors::default(),
             too_big: false,
             big: None,
+            fallback: None,
+            choice: TapChoice::Auto,
         })
+    }
+
+    /// Open this tap instead of the default (before
+    /// [`LspResponderIo::set_interfaces`]).
+    pub fn with_tap(mut self, choice: TapChoice) -> Self {
+        self.choice = choice;
+        self
+    }
+
+    /// Which tap hears frames now: `tc` (G3.9db), `packet` with why the tc
+    /// one is not used, or `none` before an interface is listened on.
+    pub fn tap_kind(&self) -> String {
+        let kind = match (&self.taps, &self.fallback) {
+            (Some(Taps::Ebpf(t)), _) => {
+                let (kept, full) = t.stats();
+                format!("tc ({kept} copied, {full} lost to a full ring)")
+            }
+            (Some(Taps::Packet(_)), Some(why)) => format!("packet ({why})"),
+            (Some(Taps::Packet(_)), None) => "packet".to_owned(),
+            (None, _) => "none".to_owned(),
+        };
+        match self.big {
+            Some(b) => format!("{kind}, too big above {b} octets"),
+            None => kind,
+        }
+    }
+
+    /// The tc tap, else the packet sockets.
+    fn open_taps(&mut self) -> Result<Taps, String> {
+        let want = match self.choice {
+            TapChoice::Auto => std::env::var(TAP_ENV).unwrap_or_default(),
+            TapChoice::Ebpf => "ebpf".to_owned(),
+            TapChoice::Packet => "packet".to_owned(),
+        };
+        if want != "packet" {
+            match super::ebpf::EbpfTap::open() {
+                Ok(t) => {
+                    self.fallback = None;
+                    return Ok(Taps::Ebpf(Box::new(t)));
+                }
+                Err(e) if want == "ebpf" => return Err(e),
+                Err(e) => self.fallback = Some(e),
+            }
+        } else {
+            self.fallback = Some(format!("{TAP_ENV}=packet"));
+        }
+        [
+            // First: `sync_filter` replaces its program.
+            (ETH_P_MPLS_UC, super::MPLS_FILTER),
+            (ETH_P_IP, IP4_FILTER),
+            (ETH_P_IPV6, IP6_FILTER),
+        ]
+        .iter()
+        .map(|(t, p)| tap(*t, p))
+        .collect::<io::Result<Vec<Socket>>>()
+        .map(Taps::Packet)
+        .map_err(|e| e.to_string())
     }
 
     /// The MPLS tap's filter for what the view knows now (G3.9da): it
@@ -778,15 +864,22 @@ impl HostResponder {
         } else {
             None
         };
-        let Some(mpls) = self.taps.as_ref().and_then(|t| t.socks.first()) else {
-            return;
-        };
-        if want != self.big
-            && mpls
-                .attach_filter(&sock_filter(&ether_only(&mpls_filter(want))))
-                .is_ok()
-        {
-            self.big = want;
+        match &mut self.taps {
+            Some(Taps::Ebpf(t)) => {
+                t.set_big(want);
+                self.big = t.big();
+            }
+            Some(Taps::Packet(socks)) => {
+                if let Some(mpls) = socks.first()
+                    && want != self.big
+                    && mpls
+                        .attach_filter(&sock_filter(&ether_only(&mpls_filter(want))))
+                        .is_ok()
+                {
+                    self.big = want;
+                }
+            }
+            None => {}
         }
     }
 
@@ -877,26 +970,24 @@ impl LspResponderIo for HostResponder {
         }
         if self.listen.is_empty() {
             self.taps = None;
-        } else if self.taps.is_none() {
-            let socks: io::Result<Vec<Socket>> = [
-                // First: `sync_filter` replaces its program.
-                (ETH_P_MPLS_UC, super::MPLS_FILTER),
-                (ETH_P_IP, IP4_FILTER),
-                (ETH_P_IPV6, IP6_FILTER),
-            ]
-            .iter()
-            .map(|(t, p)| tap(*t, p))
-            .collect();
-            self.big = None;
-            match socks {
-                Ok(socks) => self.taps = Some(Taps { socks }),
-                Err(e) => {
-                    failed.extend(self.listen.drain(..).map(|n| (n, e.to_string())));
+        } else {
+            if self.taps.is_none() {
+                self.big = None;
+                match self.open_taps() {
+                    Ok(t) => self.taps = Some(t),
+                    Err(e) => failed.extend(self.listen.drain(..).map(|n| (n, e.clone()))),
                 }
+            }
+            if let Some(Taps::Ebpf(t)) = &mut self.taps {
+                failed.extend(t.listen(&self.listen));
             }
         }
         self.sync_filter();
         failed
+    }
+
+    fn tap(&self) -> String {
+        self.tap_kind()
     }
 
     fn hear_too_big(&mut self, on: bool) {
@@ -914,12 +1005,14 @@ impl LspResponderIo for HostResponder {
         self.view.refresh();
         self.sync_filter();
         let ms = u16::try_from(wait.as_millis().min(1000)).unwrap_or(1000);
-        let mut fds: Vec<PollFd<'_>> = self
-            .taps
-            .iter()
-            .flat_map(|t| t.socks.iter())
-            .map(|s| PollFd::new(s.as_fd(), PollFlags::POLLIN))
-            .collect();
+        let mut fds: Vec<PollFd<'_>> = match &self.taps {
+            Some(Taps::Ebpf(t)) => vec![PollFd::new(t.fd(), PollFlags::POLLIN)],
+            Some(Taps::Packet(socks)) => socks
+                .iter()
+                .map(|s| PollFd::new(s.as_fd(), PollFlags::POLLIN))
+                .collect(),
+            None => Vec::new(),
+        };
         fds.push(PollFd::new(self.udp4.as_fd(), PollFlags::POLLIN));
         if poll(&mut fds, PollTimeout::from(ms)).map_err(|e| io_hal("poll", e))? == 0 {
             return Ok(None);
@@ -931,25 +1024,46 @@ impl LspResponderIo for HostResponder {
         let big = self
             .big
             .map(|b| b.saturating_sub(ETH_HEADER as u32) as usize);
-        for s in self.taps.iter().flat_map(|t| t.socks.iter()) {
-            for _ in 0..RECV_BUDGET {
-                let (n, from) = match recvfrom::<LinkAddr>(s.as_raw_fd(), &mut self.buf) {
-                    Ok(got) => got,
-                    Err(_) => break,
-                };
-                let Some(name) = from
-                    .and_then(|l| u32::try_from(l.ifindex()).ok())
-                    .and_then(|i| self.view.links.by_index.get(&i))
-                    .filter(|n| self.listen.contains(n))
-                else {
-                    continue;
-                };
-                if let Some(h) = self.buf.get(..n).and_then(|f| classify(f, name, big))
-                    && self.queue.len() < RECV_BUDGET * 4
-                {
-                    self.queue.push_back(h);
+        let Self {
+            taps,
+            view,
+            listen,
+            queue,
+            buf,
+            ..
+        } = self;
+        let mut heard = |ifindex: u32, frame: &[u8]| {
+            let Some(name) = view
+                .links
+                .by_index
+                .get(&ifindex)
+                .filter(|n| listen.contains(n))
+            else {
+                return;
+            };
+            if let Some(h) = classify(frame, name, big)
+                && queue.len() < RECV_BUDGET * 4
+            {
+                queue.push_back(h);
+            }
+        };
+        match taps {
+            Some(Taps::Ebpf(t)) => t.drain(&mut heard),
+            Some(Taps::Packet(socks)) => {
+                for s in socks.iter() {
+                    for _ in 0..RECV_BUDGET {
+                        let Ok((n, from)) = recvfrom::<LinkAddr>(s.as_raw_fd(), buf) else {
+                            break;
+                        };
+                        if let Some(i) = from.and_then(|l| u32::try_from(l.ifindex()).ok())
+                            && let Some(f) = buf.get(..n)
+                        {
+                            heard(i, f);
+                        }
+                    }
                 }
             }
+            None => {}
         }
         Ok(self.queue.pop_front())
     }

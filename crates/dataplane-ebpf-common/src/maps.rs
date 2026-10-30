@@ -31,6 +31,9 @@
 //! | `SHAPE_STATS` | per-CPU array | [`crate::queue::Stat`] | packets `u64` |
 //! | `PPPOE_RT4` | LPM trie | IPv4 block routed to a subscriber | session index (G4.3cd) |
 //! | `PPPOE_RT6` | LPM trie | IPv6 block routed to a subscriber | session index (G4.3cd) |
+//! | `LSP_TAP` | ring buffer | — | [`crate::lsp_tap::record`] (G3.9db) |
+//! | `LSP_TAP_SET` | array | 0 | [`crate::lsp_tap::Settings::to_word`] |
+//! | `LSP_TAP_STATS` | per-CPU array | [`crate::lsp_tap::Stat`] | frames `u64` |
 
 use crate::filter::Reason;
 
@@ -76,6 +79,17 @@ pub const PPPOE_RT6: &str = "PPPOE_RT6";
 pub const PPPOE_SIZED: [&str; 4] = [PPPOE_KEYS, PPPOE_SESSIONS, PPPOE_V4, PPPOE_COUNTERS];
 /// The XDP program's name in the object.
 pub const PROGRAM: &str = "corerouter_xdp";
+/// The LSP responder's tap (G3.9db): a tc ingress program and its maps.
+pub const LSP_TAP_PROGRAM: &str = "lsp_tap";
+pub const LSP_TAP: &str = "LSP_TAP";
+pub const LSP_TAP_SET: &str = "LSP_TAP_SET";
+pub const LSP_TAP_STATS: &str = "LSP_TAP_STATS";
+/// `LSP_TAP`'s size: ~110 jumbo records or ~3800 small ones while the
+/// service is behind.
+pub const LSP_TAP_BYTES: u32 = 1 << 20;
+/// The ring buffer's size where the tap is not used (the XDP and shaper
+/// loader): one page, the least the kernel takes.
+pub const LSP_TAP_IDLE_BYTES: u32 = 4096;
 
 /// Prefixes the IPv4 block (and allow) trie holds. An LPM trie is not
 /// preallocated: memory follows the entries (~64 bytes per node in the

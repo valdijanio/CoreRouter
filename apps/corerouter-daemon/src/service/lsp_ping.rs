@@ -265,6 +265,7 @@ fn run(session: &Shared, health: &super::Health) -> Result<(), String> {
         }
         if published.elapsed() >= PUBLISH {
             published = Instant::now();
+            counters.tap = i.tap();
             publish(session, &counters);
         }
     }

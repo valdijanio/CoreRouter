@@ -396,7 +396,8 @@ do LSP mostrava `*` no salto do CoreRouter. Agora o próprio respondedor do LSP 
   devolveu ~4 pontos; o resto (~125 ns por pacote nesta VM) é o próprio `packet_rcv` com o
   filtro, inerente a qualquer tap `AF_PACKET`. Num enlace real com várias filas o custo se
   divide pelos núcleos que recebem. Quem não precisa de LSP ping nem do ICMP recupera tudo com
-  `lsp-ping-responder=no icmp-ttl-exceeded=no`; um tap em XDP/tc (eBPF) é a gap G3.9db.
+  `lsp-ping-responder=no icmp-ttl-exceeded=no`; o tap em tc (eBPF) da G3.9db (abaixo) tira esse
+  custo.
 - **Por erro** (release, criterion, esta máquina com outras sessões compilando, 2026-10-29,
   **medido**, `cargo bench -p corerouter-hal --bench mpls_icmp`): ler o quadro 74 ns; o erro
   pela tabela IP 0,59 µs, pelo LSP com 100 000 rótulos 0,82 µs, pilha de VPN 0,77 µs. A busca do
@@ -512,3 +513,69 @@ buraco negro: o TCP abre e trava no primeiro segmento cheio. Agora o respondedor
   de ser compartilhados com lock). O que cresce com a carga é a cópia do kernel, limitada pelo
   `SO_RCVBUF`.
 
+
+## Tap do respondedor em eBPF (G3.9db)
+
+Os três sockets `AF_PACKET` do respondedor (MPLS, IPv4 e IPv6, sem bind) faziam o kernel entrar no
+`packet_rcv` com o filtro em todo quadro desses protocolos no host: ~21% da troca de rótulos num
+núcleo, **medido** (seção acima). O tap agora é um classificador tc na entrada de cada interface
+em que o respondedor ouve (`lsp_tap`, no objeto do `dataplane-ebpf`).
+
+### Como funciona
+
+- **Decisão:** a mesma dos filtros clássicos, num código só (`dataplane-ebpf-common/src/lsp_tap.rs`,
+  sem `unsafe`, testado no host): MPLS com TTL ≤ 1 ou explicit null, MPLS maior que o limiar de
+  "grande demais" da G3.9da (agora sem GSO: o tc vê o `gso_size`), UDP 3503 para 127/8 ou
+  `::1`/`::ffff:127.0.0.0/104`. Um teste fixo e um proptest conferem quadro a quadro que o tc e
+  os filtros clássicos guardam os mesmos quadros e cortam no mesmo tamanho.
+- **Entrega:** o quadro candidato vai para um ring buffer (`LSP_TAP`, 1 MiB) com a interface e o
+  comprimento; o programa devolve sempre `TC_ACT_OK`, então o quadro segue para o `mpls_rcv` /
+  `ip_rcv` como antes. Ring cheio conta em `LSP_TAP_STATS` (por CPU) e não atrasa o quadro.
+- **Carga:** à parte do caminho de XDP/CGNAT (`hal-linux/src/lsp/ebpf.rs`): o mesmo objeto, com
+  todos os outros mapas no tamanho mínimo, `clsact` criado se faltar e o programa preso no
+  ingress (tcx no kernel ≥ 6.6, que aceita vários programas por interface). Fail-open: o kernel
+  solta o programa se o daemon morre. Sem `CAP_BPF`/root ou com kernel antigo, volta aos sockets;
+  `$COREROUTER_LSP_TAP=packet|ebpf` força um. `lsp_ping_counters.tap` diz qual ouve, quantos
+  quadros o tc copiou e perdeu, e o limiar de "grande demais".
+
+### Pesquisa
+
+- **Kernel** (`net/core/dev.c`, 6.18.59, lido): `__netif_receive_skb_core` entrega aos taps
+  `ptype_all` primeiro, roda o ingress de tc (`sch_handle_ingress` → `tcx_run`/`tc_run`, linhas
+  4457–4485 e 6024) e só depois a `ptype_base`/`ptype_specific` (linhas 6117–6136), onde estavam os
+  sockets do respondedor e onde está o `mpls_rcv`. Com o tc, nenhum socket fica nessas listas e o
+  `packet_rcv` sai do caminho; o custo vira o de rodar um programa BPF curto.
+- **XDP ou tc:** o XDP rodaria antes de existir o skb, mas não vê o `gso_size` (o caso do GSO
+  grande por veth), nas interfaces sem XDP nativo seria genérico (com skb, o mesmo custo do tc) e
+  disputaria a interface com o programa de XDP do CGNAT/firewall (um programa XDP por interface).
+  O tcx aceita vários programas no ingress. Ficou o tc.
+- **aya 0.14 / aya-ebpf 0.2.1:** ring buffer (`RingBuf::reserve_bytes`, tamanho constante),
+  `SchedClassifier` com tcx. `TcContext::load_bytes` limita o tamanho de novo por `skb->len`, que
+  o verificador do 6.18 vê sem limite inferior (`R4 invalid zero-sized read`, **medido** na VM):
+  a cópia chama o `bpf_skb_load_bytes` direto, com o tamanho em 1..N (bloco `unsafe` 38 em
+  `docs/xdp.md`).
+- **Outros:** o RouterOS e os roteadores de mercado respondem LSP ping e ICMP no plano de
+  controle por punt de hardware; o Linux não tem o equivalente para o MPLS, e o tap tc é a forma
+  sem patch de kernel de ver só o que precisa.
+
+### Desempenho e paralelismo
+
+- **Medido** (VM `corerouter-lab`, 4 vCPU, kernel 6.18, release, 2026-10-30,
+  `hal-linux/benches/netns_mpls_ttl.rs`, MPLS de 64 octetos num núcleo, duas rodadas de 15 s por
+  caso):
+
+  | caso | rodada 1 (Melem/s) | rodada 2 (Melem/s) |
+  |---|---|---|
+  | sem taps (início / fim da rodada) | 1,715 / 1,747 | 2,039 / 1,751 |
+  | taps `AF_PACKET` (antes) | 1,476 | 1,462 |
+  | tap tc | 1,844 | 1,986 |
+  | tap tc com "grande demais" | 1,837 | 1,756 |
+
+  O tap tc fica dentro da faixa do "sem taps" em cada rodada (a VM compartilhada varia até 15%
+  entre início e fim); os sockets `AF_PACKET` ficam abaixo dela nas duas.
+- **Por pacote:** um programa de ~250 instruções (o quadro comum sai em poucas dezenas) que lê no
+  máximo 60 octetos; cópia só do candidato. Nada cresce com o número de rótulos ou de interfaces.
+- **Núcleos:** o tc roda no núcleo que recebe o quadro (sem lock; a estatística é por CPU), e o
+  ring buffer é um só, consumido pela thread do serviço `lsp-ping` — o volume que chega a ela é
+  o de candidatos, limitado pelos baldes de ICMP. Um ring por CPU só ajudaria com milhões de
+  candidatos por segundo, o que não é tráfego de plano de controle.

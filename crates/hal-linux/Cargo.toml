@@ -35,13 +35,14 @@ netlink-sys = { version = "0.9.0", default-features = false }
 # G2.5a (xdp.rs): loads the XDP object and drives its maps (userspace aya;
 # the `unsafe` stays inside aya and crates/dataplane-ebpf).
 aya = { version = "=0.14.0", default-features = false }
+# G3.9db (lsp/ebpf.rs): the object's map names, to load the LSP tap with
+# every other map at its smallest (aya itself depends on it).
+aya-obj = { version = "0.3", default-features = false }
 corerouter-dataplane-ebpf-common.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # Tests open sockets inside nested namespaces (netns_cgnat.rs).
 nix = { version = "0.30.1", default-features = false, features = ["sched"] }
-# The XDP object's sections, checked without loading it (no root).
-aya-obj = { version = "0.3", default-features = false }
 # Frames and the reference model of the kernel differential test (tests/xdp_root.rs).
 corerouter-dataplane-ebpf-common = { workspace = true, features = ["testing"] }
 
