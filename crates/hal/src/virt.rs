@@ -784,6 +784,11 @@ impl Hal for VirtualHal {
         Ok(n)
     }
 
+    /// The lab loads any firewall the engine renders.
+    fn check_firewall(&mut self, _to: &Config) -> Result<Vec<crate::RefusedRule>, HalError> {
+        Ok(Vec::new())
+    }
+
     fn apply(&mut self, from: &Config, to: &Config) -> Result<(), HalError> {
         if corerouter_firewall::nft::inputs_changed(from, to) {
             self.firewall_applied = true;

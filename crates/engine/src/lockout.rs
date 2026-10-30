@@ -365,37 +365,51 @@ impl Session {
         if same {
             return None;
         }
-        let was_probes = probes(before, dyn_before, &link);
-        for (probe, old) in probes(after, dyn_after, &link).into_iter().zip(was_probes) {
-            let now = walk(after, dyn_after, probe.table, probe.chain, &probe.packet);
-            let was = walk(before, dyn_before, old.table, old.chain, &old.packet);
-            if !cut(probe.table, now) || cut(probe.table, was) {
-                continue;
-            }
-            let by = match now.rule.and_then(|id| {
-                after
-                    .ip
-                    .firewall
-                    .rules(probe.table)
-                    .iter()
-                    .find(|r| r.id == id)
-            }) {
-                Some(r) => format!("{} rule {} ({})", probe.table, r.id, summary(r)),
-                None => format!("the {} policy", probe.chain),
-            };
-            let via = probe
-                .packet
-                .in_interface
-                .as_deref()
-                .map(|i| format!(" on {i}"))
-                .unwrap_or_default();
-            return Some(format!(
-                "{by} {} (tcp {} -> {}{via}). {HOW_TO_PROCEED}",
-                probe.what, link.peer, link.local
-            ));
-        }
-        None
+        firewall_cut(before, after, dyn_before, dyn_after, &link)
+            .map(|why| format!("{why}. {HOW_TO_PROCEED}"))
     }
+}
+
+/// The first of `link`'s packets (see [`probes`]) that the firewall of
+/// `after` drops and the one of `before` did not, said as the rule (or
+/// policy) that does it; `None`: none.
+pub(crate) fn firewall_cut(
+    before: &Config,
+    after: &Config,
+    dyn_before: &[DynamicAddress],
+    dyn_after: &[DynamicAddress],
+    link: &Link,
+) -> Option<String> {
+    let was_probes = probes(before, dyn_before, link);
+    for (probe, old) in probes(after, dyn_after, link).into_iter().zip(was_probes) {
+        let now = walk(after, dyn_after, probe.table, probe.chain, &probe.packet);
+        let was = walk(before, dyn_before, old.table, old.chain, &old.packet);
+        if !cut(probe.table, now) || cut(probe.table, was) {
+            continue;
+        }
+        let by = match now.rule.and_then(|id| {
+            after
+                .ip
+                .firewall
+                .rules(probe.table)
+                .iter()
+                .find(|r| r.id == id)
+        }) {
+            Some(r) => format!("{} rule {} ({})", probe.table, r.id, summary(r)),
+            None => format!("the {} policy", probe.chain),
+        };
+        let via = probe
+            .packet
+            .in_interface
+            .as_deref()
+            .map(|i| format!(" on {i}"))
+            .unwrap_or_default();
+        return Some(format!(
+            "{by} {} (tcp {} -> {}{via})",
+            probe.what, link.peer, link.local
+        ));
+    }
+    None
 }
 
 #[cfg(test)]
