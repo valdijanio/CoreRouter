@@ -196,7 +196,7 @@ fn lab() -> Lab {
     }
     ip(&["addr", "add", "fd71::1/64", "dev", "ma0", "nodad"]);
     ip(&["link", "set", "ma0", "up"]);
-    ip(&["route", "replace", "10.70.0.0/14", "via", "10.71.0.2"]);
+    ip(&["route", "replace", "10.64.0.0/12", "via", "10.71.0.2"]);
     ip(&["-6", "route", "replace", "fd70::/12", "via", "fd71::2"]);
     sysctl("net/ipv4/icmp_ratelimit", "0");
 
