@@ -181,6 +181,9 @@ pub struct Inputs {
     /// G1.3b: ports of the running config not on this machine (and the
     /// VLANs on them). Empty: every port is there (no check then).
     pub absent_ports: Vec<String>,
+    /// G1.3e: (section, why) of the restored config the data plane refused
+    /// at boot. Empty: everything is in (no check then).
+    pub boot_apply: Vec<(String, String)>,
     /// Whether any reading exists at all.
     pub readings: bool,
 }
@@ -608,6 +611,26 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
             reason: format!("interface(s) da configuração sem a placa nesta máquina (flag I): {list}; o resto da configuração está aplicado e a delas volta sozinha quando a placa voltar"),
             action: Some("Confira o cabo/adaptador USB ou a placa; se ela saiu de vez, tire a configuração dela (ou troque a interface dos itens que a usam).".into()) });
     }
+    // G1.3e: the boot left part of the config out (the rest, management
+    // included, is up). Only while it lasts.
+    if !i.boot_apply.is_empty() {
+        let list = i
+            .boot_apply
+            .iter()
+            .take(5)
+            .map(|(s, e)| format!("{s}: {}", e.trim_start_matches("backend rejected the change: ").chars().take(300).collect::<String>()))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let core = i.boot_apply.iter().any(|(s, _)| s == "core");
+        out.push(Check { key: "boot.apply", name: "Boot apply", severity: Severity::Error,
+            value: Some(i.boot_apply.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join(", ")),
+            reason: if core {
+                format!("a configuração salva não entrou no kernel, nem interfaces e endereços: {list}; nova tentativa com espera crescente (até 60 s)")
+            } else {
+                format!("seção(ões) da configuração salva recusada(s) pelo kernel no boot e fora do ar (o resto, gerência inclusive, está aplicado): {list}; nova tentativa com espera crescente (até 60 s)")
+            },
+            action: Some("Corrija ou tire o item recusado (o motivo é o erro do kernel acima) e faça commit, ou carregue o que falta no kernel (módulo, recurso); um commit que mexe na seção a aplica inteira. Firewall de fora deixa o roteador sem filtro.".into()) });
+    }
     // G1.29b: a USB adapter behind a port slower than itself caps the
     // traffic with no error anywhere. Only on routers that have one.
     if !i.usb.is_empty() {
@@ -796,6 +819,7 @@ impl Session {
             .collect();
         i.usb_watchdog = self.usb_watchdog_health();
         i.absent_ports = self.invalid_interfaces(&live).into_keys().map(|n| n.to_string()).collect();
+        i.boot_apply = self.boot_failures().into_iter().map(|f| (f.section.to_owned(), f.error)).collect();
         i.bgp_no_eor = self.routing_status().map(|st| {
             let quiet = bgp_without_eor(st)
                 .map(|b| b.connection.clone().unwrap_or_else(|| b.remote_address.clone()))
@@ -907,6 +931,7 @@ mod tests {
             usb: Vec::new(),
             usb_watchdog: Vec::new(),
             absent_ports: Vec::new(),
+            boot_apply: Vec::new(),
         }
     }
 
@@ -940,6 +965,20 @@ mod tests {
             assert!(c.action.is_none());
         }
         assert_eq!(overall(&checks), Severity::Ok);
+    }
+
+    #[test]
+    fn boot_apply_errors_only_while_something_is_out() {
+        assert!(evaluate(&healthy()).iter().all(|c| c.key != "boot.apply"));
+        let mut i = healthy();
+        i.boot_apply = vec![("firewall".into(), "nft refused rule 3".into())];
+        let checks = evaluate(&i);
+        let c = checks.iter().find(|c| c.key == "boot.apply").unwrap();
+        assert_eq!(c.severity, Severity::Error);
+        assert_eq!(c.value.as_deref(), Some("firewall"));
+        assert!(c.reason.contains("firewall: nft refused rule 3"), "{}", c.reason);
+        assert!(c.reason.contains("gerência"), "{}", c.reason);
+        assert!(c.action.is_some());
     }
 
     #[test]
