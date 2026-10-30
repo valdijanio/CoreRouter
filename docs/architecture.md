@@ -830,6 +830,22 @@ namespace: um dump `RTM_GETLINK` (`netlink::links`) dá nome, índice, `IFLA_INF
 num daemon que aplicava no namespace — `ip.address.add` falhava e o boot tentava mudar o MTU de
 `br-…` do Docker.
 
+**Dump enxuto e fora do lock (G1.3f, medido).** O poll lê todos os links a cada segundo, e um BNG
+tem um link `ppp` por assinante. O `rtnetlink` decodifica todos os atributos de cada link e o
+`netlink-packet-route` 0.33.0 ainda formata os contadores como texto a cada link
+(`format!("… {payload:?}")` em `src/link/attribute.rs:674` e `:684`, mesmo sem erro; PR
+upstream rust-netlink/netlink-packet-route#298). O dump do poll passou a ser nosso
+(`link_dump.rs`: um `RTM_GETLINK` num socket netlink, só os atributos do `KernelLink`, parser
+puro com proptest); o `apply` e o diálogo da interface seguem com o `rtnetlink`. Rust puro ganha
+aqui pelo número (tabela em `docs/changes/G1.3f.md`) e sem perder correção: o teste em
+namespace compara os dois leitores em links de todo tipo. O mapa índice → nome das leituras de
+rotas e endereços do mesmo tick vem do poll (antes era um segundo dump). E o dump roda sem o
+lock do `Session`: o `Hal` entrega um `LinkReader` (`crates/hal/src/link_reader.rs`) que o
+relógio e o serviço `link-events` rodam com o lock solto; o lock só junta o resultado
+(`Session::tick_sampled`). A amostra leva a época do `LinuxHal`, que todo `apply` avança: amostra
+de antes de um `apply` é recusada e o engine faz o poll sob o lock (raro: só quando um commit cai
+no meio do dump).
+
 **Posse** (`crates/hal-linux/src/owner.rs`, puro, testado em qualquer plataforma). Cada link é
 `Managed`, `External(motivo)` ou `Conflict(motivo)`; primeira regra que casa:
 

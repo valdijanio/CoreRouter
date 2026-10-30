@@ -10,8 +10,11 @@
 //! `COREROUTER_LINK_POLL_SIZES` (default `100,1000,10000`) dummy links are
 //! added in steps (a BNG has one `ppp` link per subscriber). Per size:
 //! - `hal.poll`: `LinuxHal::poll` alone (dump + counters), no session;
-//! - `tick`: `Session::tick` of a `--backend linux` session, all of it
-//!   under the session lock (what the clock thread holds);
+//! - `read`: the clock's link read with the session unlocked (G1.3f:
+//!   `Session::link_reader`, then `LinkReader::read`);
+//! - `tick`: how long the clock's tick then holds the session lock
+//!   (`Session::tick_sampled` of a `--backend linux` session); before
+//!   G1.3f the whole poll ran here;
 //! - `wait`: a cheap command (`system.identity.get`) sent from another
 //!   thread every 2 ms for 5 s while a second thread ticks once a second,
 //!   as the clock does: how long it waits for the lock and runs (median,
@@ -98,6 +101,17 @@ mod linux {
         assert!(child.wait().unwrap().success());
     }
 
+    /// One tick as the clock thread does it: (read unlocked, lock held).
+    fn clock_tick(session: &corerouter_engine::Shared, now: u64) -> (Duration, Duration) {
+        let t = Instant::now();
+        let reader = lock(session).link_reader();
+        let links = reader.map(|mut r| r.read());
+        let read = t.elapsed();
+        let t = Instant::now();
+        lock(session).tick_sampled(now, links);
+        (read, t.elapsed())
+    }
+
     fn pct(v: &mut [Duration], p: f64) -> Duration {
         v.sort();
         let i = ((v.len() as f64 - 1.0) * p).round() as usize;
@@ -113,10 +127,10 @@ mod linux {
         let session = shared(Session::new(Box::new(LinuxHal::new())));
         let mut have = 0;
         println!(
-            "| links | hal.poll (median / max) | tick under lock (median / max) | \
+            "| links | hal.poll (median / max) | read unlocked (median) | tick under lock (median / max) | \
              command wait while ticking (median / p99 / max) | idle command |"
         );
-        println!("|---|---|---|---|---|");
+        println!("|---|---|---|---|---|---|");
         for n in sizes {
             if n > have {
                 add_dummies(have, n);
@@ -129,13 +143,9 @@ mod linux {
                     t.elapsed()
                 })
                 .collect();
-            let mut ticks: Vec<Duration> = (0..ROUNDS)
-                .map(|i| {
-                    let t = Instant::now();
-                    lock(&session).tick(1_900_000_000 + i as u64);
-                    t.elapsed()
-                })
-                .collect();
+            let (mut reads, mut ticks): (Vec<Duration>, Vec<Duration>) = (0..ROUNDS)
+                .map(|i| clock_tick(&session, 1_900_000_000 + i as u64))
+                .unzip();
             let cmd = |s: &mut Session| {
                 s.execute_as(&Caller::local(), "system.identity.get", &json!({}))
                     .unwrap();
@@ -153,7 +163,7 @@ mod linux {
                 sc.spawn(|| {
                     let mut i = 0u64;
                     while !stop.load(Ordering::Relaxed) {
-                        lock(&session).tick(1_950_000_000 + i);
+                        clock_tick(&session, 1_950_000_000 + i);
                         i += 1;
                         // Once a second, as the clock thread does.
                         std::thread::sleep(Duration::from_secs(1));
@@ -171,7 +181,8 @@ mod linux {
             let (pm, px) = (pct(&mut polls, 0.5), pct(&mut polls, 1.0));
             let (tm, tx) = (pct(&mut ticks, 0.5), pct(&mut ticks, 1.0));
             println!(
-                "| {n} | {pm:.2?} / {px:.2?} | {tm:.2?} / {tx:.2?} | {:.2?} / {:.2?} / {:.2?} ({} calls) | {:.2?} |",
+                "| {n} | {pm:.2?} / {px:.2?} | {:.2?} | {tm:.2?} / {tx:.2?} | {:.2?} / {:.2?} / {:.2?} ({} calls) | {:.2?} |",
+                pct(&mut reads, 0.5),
                 pct(&mut waits, 0.5),
                 pct(&mut waits, 0.99),
                 pct(&mut waits, 1.0),

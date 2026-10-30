@@ -70,21 +70,33 @@ impl Session {
     /// tick, so a port replugged gets its configuration back at once. A
     /// commit's own changes land here too: that poll finds nothing new.
     pub fn link_events(&mut self, names: Option<&[String]>) {
+        if self.link_events_wanted(names) {
+            self.link_events_sampled(None);
+        }
+    }
+
+    /// Whether the links `names` (`None`: unknown, all) are worth a look
+    /// (see [`Session::link_events`]): one of them is a physical port of
+    /// the running config.
+    pub fn link_events_wanted(&self, names: Option<&[String]>) -> bool {
         let running = self.store().running();
-        let ours = names.is_none_or(|names| {
+        names.is_none_or(|names| {
             names.iter().any(|n| {
                 n.parse::<IfName>()
                     .ok()
                     .and_then(|n| running.interfaces.get(&n))
                     .is_some_and(|i| i.kind == InterfaceKind::Ethernet)
             })
-        });
-        if !ours {
-            return;
-        }
+        })
+    }
+
+    /// The look of [`Session::link_events`], with the links a
+    /// [`Session::link_reader`] read while the session was unlocked
+    /// (G1.3f); `None`: poll here.
+    pub fn link_events_sampled(&mut self, links: Option<corerouter_hal::link_reader::LinkSample>) {
         let snapshot = self.store().candidate().clone();
         let polled = crate::guard::run("link events", || {
-            let live = self.hal_mut().poll();
+            let live = self.live_links(links);
             self.watch_links(&live);
             self.absent_tick(&live);
             Ok(())

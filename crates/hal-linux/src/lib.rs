@@ -177,9 +177,18 @@ mod port_tuning;
 mod cpu_tuning;
 
 /// The host's OS log (G4.8b): `/dev/kmsg` and the journal.
+/// Every link read through `rtnetlink`, the way before G1.3f: the netns
+/// test checks the lean [`link_dump`] reads the same.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn links_rtnetlink() -> Result<Vec<owner::KernelLink>, corerouter_hal::HalError> {
+    netlink::links_rtnetlink()
+}
 #[cfg(target_os = "linux")]
 pub mod oslog;
 
+/// The link list read lean, for the poll (G1.3f).
+pub mod link_dump;
 /// Link events (G1.3d): ports replugged between two polls.
 pub mod link_events;
 /// Neighbor tables over rtnetlink (G1.27d): dump, events, static entries.
@@ -266,6 +275,14 @@ mod linux {
         /// index, never reused (`dev_index_reserve` in net/core/dev.c
         /// allocates them cyclically up to 2^31), and none of its settings.
         indices: BTreeMap<IfName, u32>,
+        /// Moves on every `apply` (G1.3f): a link sample read with the
+        /// session unlocked from before it is refused.
+        epoch: u64,
+        /// Index → name of the managed links as the last poll saw them
+        /// (G1.3f), for the route and address reads of the same tick: one
+        /// link dump per tick instead of two. Taken by the first reader,
+        /// dropped by `apply`.
+        managed: Option<BTreeMap<u32, IfName>>,
     }
 
     impl LinuxHal {
@@ -286,7 +303,15 @@ mod linux {
             &self,
             claims: &BTreeMap<IfName, InterfaceKind>,
         ) -> Result<Vec<(KernelLink, Owner)>, HalError> {
-            let links = crate::netlink::links()?;
+            Ok(self.classified(crate::netlink::links()?, claims))
+        }
+
+        /// `links` with their verdict under `claims`, by name.
+        fn classified(
+            &self,
+            links: Vec<KernelLink>,
+            claims: &BTreeMap<IfName, InterfaceKind>,
+        ) -> Vec<(KernelLink, Owner)> {
             let mut by = owner::classify(&links, claims, &self.policy);
             let mut out: Vec<_> = links
                 .into_iter()
@@ -298,11 +323,89 @@ mod linux {
                 })
                 .collect();
             out.sort_by(|a, b| a.0.name.cmp(&b.0.name));
-            Ok(out)
+            out
+        }
+    }
+
+    /// Reads the links with the session unlocked (G1.3f).
+    struct Reader {
+        epoch: u64,
+    }
+
+    impl corerouter_hal::link_reader::LinkReader for Reader {
+        fn read(&mut self) -> corerouter_hal::link_reader::LinkSample {
+            corerouter_hal::link_reader::LinkSample::new(self.epoch, crate::netlink::links())
         }
     }
 
     impl LinuxHal {
+        /// The poll's work on the links read (`Hal::poll`, or a sample
+        /// read unlocked): absent and replugged ports, the managed index
+        /// map, the link states.
+        fn merge(&mut self, links: Result<Vec<KernelLink>, HalError>) -> Vec<LinkState> {
+            // The hardware watchdog (G1.26c) is fed as long as polls come.
+            self.cpu.feed();
+            let view = match links {
+                Ok(l) => self.classified(l, &self.claims),
+                Err(e) => {
+                    log::warn!("link poll failed: {e}");
+                    return Vec::new();
+                }
+            };
+            self.managed = Some(
+                view.iter()
+                    .filter(|(_, o)| *o == Owner::Managed)
+                    .filter_map(|(l, _)| Some((l.index, l.name.parse().ok()?)))
+                    .collect(),
+            );
+            // G1.3b: a claimed port the kernel no longer has lost its
+            // configuration with it; the next apply puts it back. G1.3d:
+            // so did one with a new index (gone and back since the last
+            // look): the engine sees it absent and present, and reapplies.
+            let names: BTreeMap<&str, u32> = view
+                .iter()
+                .map(|(l, _)| (l.name.as_str(), l.index))
+                .collect();
+            for (n, k) in &self.claims {
+                if *k != InterfaceKind::Ethernet {
+                    continue;
+                }
+                match names.get(n.as_str()) {
+                    None => {
+                        if self.absent.insert(n.clone()) {
+                            log::warn!("'{n}' went away: its configuration waits for it (invalid)");
+                        }
+                    }
+                    Some(&i) => match self.indices.insert(n.clone(), i) {
+                        Some(was) if was != i && self.absent.insert(n.clone()) => {
+                            log::warn!(
+                                "'{n}' was replugged (link #{was} is now #{i}): its configuration is applied again"
+                            );
+                        }
+                        _ => {}
+                    },
+                }
+            }
+            view.into_iter()
+                .filter_map(|(l, o)| {
+                    Some(LinkState {
+                        name: l.name.parse().ok()?,
+                        running: l.running,
+                        rx_bytes: l.rx_bytes,
+                        tx_bytes: l.tx_bytes,
+                        rx_packets: l.rx_packets,
+                        tx_packets: l.tx_packets,
+                        kind: l.label(),
+                        mtu: l.mtu,
+                        mac: l.mac,
+                        unmanaged: o.reason().map(str::to_owned),
+                        errors: l.errors,
+                        bus: l.bus,
+                    })
+                })
+                .collect()
+        }
+
         /// `accept_ra` per managed interface of `to` (G4.7b). Best effort:
         /// a failure is logged, never refuses the commit.
         fn sync_ra(&mut self, to: &Config) {
@@ -327,7 +430,12 @@ mod linux {
         }
 
         /// Kernel index → name of the managed links.
-        fn managed_indexes(&self) -> Result<BTreeMap<u32, IfName>, HalError> {
+        fn managed_indexes(&mut self) -> Result<BTreeMap<u32, IfName>, HalError> {
+            // G1.3f: what this tick's poll just read (at most a second old;
+            // an apply drops it).
+            if let Some(m) = self.managed.take() {
+                return Ok(m);
+            }
             Ok(self
                 .view(&self.claims)?
                 .into_iter()
@@ -761,6 +869,9 @@ mod linux {
         /// **medido**): `poll` notes a port that goes, and an op that
         /// fails on one sends this through the retry, which looks.
         fn apply(&mut self, from: &Config, to: &Config) -> Result<(), HalError> {
+            // G1.3f: link samples read before this are stale.
+            self.epoch = self.epoch.wrapping_add(1);
+            self.managed = None;
             let mut retried = false;
             let mut look =
                 !self.absent.is_empty() || corerouter_model::sections::interfaces_changed(from, to);
@@ -1148,61 +1259,27 @@ mod linux {
         }
 
         fn poll(&mut self) -> Vec<LinkState> {
-            // The hardware watchdog (G1.26c) is fed as long as polls come.
-            self.cpu.feed();
-            let view = match self.view(&self.claims) {
-                Ok(v) => v,
-                Err(e) => {
-                    log::warn!("link poll failed: {e}");
-                    return Vec::new();
-                }
-            };
-            // G1.3b: a claimed port the kernel no longer has lost its
-            // configuration with it; the next apply puts it back. G1.3d:
-            // so did one with a new index (gone and back since the last
-            // look): the engine sees it absent and present, and reapplies.
-            let names: BTreeMap<&str, u32> = view
-                .iter()
-                .map(|(l, _)| (l.name.as_str(), l.index))
-                .collect();
-            for (n, k) in &self.claims {
-                if *k != InterfaceKind::Ethernet {
-                    continue;
-                }
-                match names.get(n.as_str()) {
-                    None => {
-                        if self.absent.insert(n.clone()) {
-                            log::warn!("'{n}' went away: its configuration waits for it (invalid)");
-                        }
-                    }
-                    Some(&i) => match self.indices.insert(n.clone(), i) {
-                        Some(was) if was != i && self.absent.insert(n.clone()) => {
-                            log::warn!(
-                                "'{n}' was replugged (link #{was} is now #{i}): its configuration is applied again"
-                            );
-                        }
-                        _ => {}
-                    },
-                }
+            self.merge(crate::netlink::links())
+        }
+
+        fn link_reader(&self) -> Option<Box<dyn corerouter_hal::link_reader::LinkReader>> {
+            Some(Box::new(Reader { epoch: self.epoch }))
+        }
+
+        fn poll_sample(
+            &mut self,
+            sample: corerouter_hal::link_reader::LinkSample,
+        ) -> Option<Vec<LinkState>> {
+            if sample.epoch() != self.epoch {
+                // Fed all the same: a commit every second must not let
+                // the hardware watchdog (G1.26c) reboot the router.
+                self.cpu.feed();
+                return None;
             }
-            view.into_iter()
-                .filter_map(|(l, o)| {
-                    Some(LinkState {
-                        name: l.name.parse().ok()?,
-                        running: l.running,
-                        rx_bytes: l.rx_bytes,
-                        tx_bytes: l.tx_bytes,
-                        rx_packets: l.rx_packets,
-                        tx_packets: l.tx_packets,
-                        kind: l.label(),
-                        mtu: l.mtu,
-                        mac: l.mac,
-                        unmanaged: o.reason().map(str::to_owned),
-                        errors: l.errors,
-                        bus: l.bus,
-                    })
-                })
-                .collect()
+            let links = sample
+                .take::<Result<Vec<KernelLink>, HalError>>()
+                .unwrap_or_else(|| Err(HalError::Io("link sample of another backend".into())));
+            Some(self.merge(links))
         }
 
         /// Managed links of `cfg` as the kernel has them, and the

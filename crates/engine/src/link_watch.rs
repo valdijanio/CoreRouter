@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use corerouter_hal::LinkState;
+use corerouter_hal::link_reader::{LinkReader, LinkSample};
 use corerouter_model::IfName;
 
 use crate::Session;
@@ -91,9 +92,35 @@ impl Session {
         }
     }
 
+    /// A reader of the platform's links for the caller to run with the
+    /// session unlocked, then hand to [`Session::tick_sampled`] or
+    /// [`Session::link_events_sampled`] (G1.3f); `None`: the platform reads
+    /// them cheaply, the session polls by itself.
+    pub fn link_reader(&self) -> Option<Box<dyn LinkReader>> {
+        self.hal().link_reader()
+    }
+
+    /// The links of `sample`, or of a poll now when there is none or it is
+    /// older than an apply (G1.3f: the apply may have replaced a port the
+    /// sample still shows).
+    pub(crate) fn live_links(&mut self, sample: Option<LinkSample>) -> Vec<LinkState> {
+        match sample {
+            Some(s) => match self.hal_mut().poll_sample(s) {
+                Some(live) => live,
+                None => {
+                    if let Some(n) = self.ext_mut::<StaleSamples>() {
+                        n.0 = n.0.saturating_add(1);
+                    }
+                    self.hal_mut().poll()
+                }
+            },
+            None => self.hal_mut().poll(),
+        }
+    }
+
     /// Poll the platform and note link transitions (from `tick`).
-    pub(crate) fn poll_links(&mut self) {
-        let live = self.hal_mut().poll();
+    pub(crate) fn poll_links(&mut self, sample: Option<LinkSample>) {
+        let live = self.live_links(sample);
         self.watch_links(&live);
         // G1.6t: a card plugged in with the router running joins the config.
         self.adopt_new_ports(&live);
@@ -106,6 +133,10 @@ impl Session {
         self.absent_tick(&live);
     }
 }
+
+/// Link samples refused for an apply in between (G1.3f), for the tests.
+#[derive(Debug, Default)]
+pub(crate) struct StaleSamples(pub u64);
 
 #[cfg(test)]
 mod tests {

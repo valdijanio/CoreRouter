@@ -33,6 +33,7 @@ use rtnetlink::{
     LinkVeth, LinkVlan, LinkVrf, RouteMessageBuilder,
 };
 
+use crate::link_dump::mac_text;
 use crate::owner::KernelLink;
 use crate::plan::{BondSetting, KernelDiscard, KernelRoute, LinkSpec, Op, bond_in_place};
 
@@ -95,8 +96,15 @@ pub(crate) fn apply_each(
 
 /// Every link of the current network namespace (`RTM_GETLINK` dump): the
 /// same kernel `apply` writes to, so discovery and apply never disagree
-/// (sysfs shows the namespace that mounted `/sys`, not this one).
+/// (sysfs shows the namespace that mounted `/sys`, not this one). Read lean
+/// (G1.3f, [`crate::link_dump`]): the poll does it every second.
 pub(crate) fn links() -> Result<Vec<KernelLink>, HalError> {
+    crate::link_dump::dump()
+}
+
+/// [`links`] the old way, through `rtnetlink` (the netns test checks both
+/// agree).
+pub(crate) fn links_rtnetlink() -> Result<Vec<KernelLink>, HalError> {
     with_kernel(|k| async move {
         let mut s = k.handle.link().get().execute();
         let mut out = Vec::new();
@@ -146,15 +154,6 @@ pub(crate) fn link_detail(name: &str) -> Result<Option<LinkDetail>, HalError> {
                 readable(&e)
             ))),
         }
-    })
-}
-
-fn mac_text(mac: &[u8]) -> Option<String> {
-    (mac.len() == 6 && mac.iter().any(|b| *b != 0)).then(|| {
-        mac.iter()
-            .map(|b| format!("{b:02X}"))
-            .collect::<Vec<_>>()
-            .join(":")
     })
 }
 

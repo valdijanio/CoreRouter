@@ -47,6 +47,7 @@ mod ip_address;
 mod ip_calc;
 mod ipoe;
 mod journal_sections;
+mod link_sample;
 mod metrics;
 mod mpls;
 mod neighbor;
