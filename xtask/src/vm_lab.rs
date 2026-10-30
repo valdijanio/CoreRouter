@@ -1065,10 +1065,23 @@ impl Lab {
             self.healthy()
                 .map_err(|e| format!("{NAME} still unhealthy after reset: {e}"))?;
         }
+        let dir = self.remote_dir()?;
         if sync {
+            // The sync writes `<dir>/src` before the round waits for the
+            // lock: a second round from this worktree would overwrite the
+            // source of one still queued or running (seen 2026-10-30).
+            let busy = self.ssh_output(&same_dir_rounds_check(&dir))?;
+            let busy = busy.split_whitespace().collect::<Vec<_>>();
+            if !busy.is_empty() {
+                return Err(format!(
+                    "a round from this worktree is already queued or running in the VM \
+                     (pids {}): the sync would overwrite its source in {dir}/src; wait for it \
+                     to end (`cargo xtask vm-lab status`), or pass --no-sync to reuse that source",
+                    busy.join(" ")
+                ));
+            }
             self.sync()?;
         }
-        let dir = self.remote_dir()?;
         let round = own_round();
         let script = format!(
             "if [ ! -r {RUST_ENV} ]; then echo 'vm-lab: no Rust toolchain in the VM; run `cargo xtask vm-lab create`' >&2; exit 1; fi\n\
@@ -1186,6 +1199,21 @@ impl Lab {
             Ok(())
         }
     }
+}
+
+/// A shell line printing the pids of live rounds whose command runs in
+/// `<dir>/src` (the `( cd <dir>/src ||` of `round_script`), one per line.
+fn same_dir_rounds_check(dir: &str) -> String {
+    let needle = shell_quote(&format!("( cd {dir}/src ||"));
+    format!(
+        "sudo env -u {ROUND_VAR} bash -c {}",
+        shell_quote(&format!(
+            "for f in $(grep -lazs '^{ROUND_VAR}=' /proc/[0-9]*/environ); do \
+             p=${{f#/proc/}}; p=${{p%%/*}}; \
+             tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -qF -- {needle} && echo $p; \
+             done; true"
+        ))
+    )
 }
 
 /// What a `run` script needs to know about its round.
@@ -1917,6 +1945,42 @@ mod tests {
             id: "4242.77",
             host_pid: 4242,
         }
+    }
+
+    /// The check finds a live round of the same worktree and only that one
+    /// (run here without `sudo`: the processes are this user's).
+    #[test]
+    fn same_dir_rounds_check_finds_a_queued_round_of_this_worktree() {
+        let tmp = std::env::temp_dir().join(format!("vm-lab-check-{}", std::process::id()));
+        let dir = tmp.join("w").display().to_string();
+        std::fs::create_dir_all(format!("{dir}/src")).unwrap();
+        std::fs::create_dir_all(format!("{dir}-other/src")).unwrap();
+        let spawn = |d: &str| {
+            std::process::Command::new("env")
+                .arg(format!("{ROUND_VAR}=1.2"))
+                .args(["bash", "-c"])
+                .arg(format!("( cd {d}/src || exit 1\nsleep 30\n) 9>&-"))
+                .spawn()
+                .unwrap()
+        };
+        let mut same = spawn(&dir);
+        let mut other = spawn(&format!("{dir}-other"));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let check = same_dir_rounds_check(&dir);
+        let local = check.strip_prefix("sudo ").unwrap();
+        let out = std::process::Command::new("bash")
+            .args(["-c", local])
+            .output()
+            .unwrap();
+        let _ = same.kill();
+        let _ = other.kill();
+        let _ = same.wait();
+        let _ = other.wait();
+        let _ = std::fs::remove_dir_all(&tmp);
+        let pids = String::from_utf8(out.stdout).unwrap();
+        let pids: Vec<&str> = pids.split_whitespace().collect();
+        assert_eq!(pids, vec![same.id().to_string().as_str()]);
+        assert!(same_dir_rounds_check("/srv/lab/none").starts_with("sudo env -u"));
     }
 
     #[test]
