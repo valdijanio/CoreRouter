@@ -36,6 +36,22 @@ Why a FEC has no outgoing label (no LDP neighbor up, the next hop sent none, the
 Show only the FECs without an outgoing label: where the LSP breaks."##),
     (r##"mpls.gtsm"##, r##"## What it is
 GTSM (RFC 6720): LDP packets of a directly connected neighbor must arrive with TTL 255, so a remote attacker cannot reach the session. Negotiated in the Hello; on by default. For IPv6 it is always on (RFC 7552 §9)."##),
+    (r##"mpls.icmp_rate"##, r##"## What it is
+How many ICMP "time exceeded" errors for expired labeled packets this router sends per second at most (default 100). The rest are dropped and counted.
+
+## Why
+A flood of packets with TTL 1 must not keep the control plane busy (RFC 1812 §4.3.2.8 asks routers to limit ICMP errors). Each error is at most about 200 bytes and goes only to the expired packet's source."##),
+    (r##"mpls.icmp_ttl_exceeded"##, r##"## What it is
+When a labeled packet's TTL expires at this router, sends the ICMP "time exceeded" back to its source, with the label stack it arrived with (RFC 4950: traceroute shows `MPLS:L=…`).
+
+## Why
+The Linux MPLS forwarder drops these packets without an error, so a traceroute through the LSP showed `*` at this hop. RouterOS, Cisco and Junos answer.
+
+## How it goes back
+With one label and an IP route to the source, by the IP table. With more labels (a VPN), along the LSP itself, as RFC 3032 §2.3.2 describes: the egress routes it back to the source.
+
+## Diagnosis
+`mpls.settings.get` shows `icmp_counters`: expired packets heard, errors sent, dropped by the rate and by reason."##),
     (r##"mpls.if"##, r##"## What it is
 LDP on one interface: link Hellos to 224.0.0.2 (IPv6 ff02::2) every hello interval, and the adjacencies they form (RFC 5036 §2.4.1)."##),
     (r##"mpls.if.adjacencies"##, r##"## What it is

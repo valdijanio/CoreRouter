@@ -11,6 +11,10 @@ repository.workspace = true
 [dependencies]
 corerouter-sysupdate.workspace = true
 serde_json.workspace = true
+# processo: the release key at rest (Argon2id + ChaCha20-Poly1305) and its passphrase prompt.
+argon2.workspace = true
+ring.workspace = true
+rpassword.workspace = true
 
 [lints]
 workspace = true

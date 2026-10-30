@@ -182,6 +182,7 @@ impl Registry {
             reg.order.push((cmd.id.clone(), path.clone()));
             node.commands.insert(cmd.verb.clone(), cmd);
         }
+        inherit(&mut reg.root);
         // Shortcuts never hide a menu of the root.
         let aliases: Vec<(String, String)> = reg
             .commands()
@@ -217,6 +218,40 @@ impl Registry {
 
     pub fn is_empty(&self) -> bool {
         self.order.is_empty()
+    }
+}
+
+/// A menu whose `print` filters by `type` (`/interface`) lists the rows of
+/// its sub-menus that create a type (`/interface vlan add`): those take the
+/// menu's other verbs as their own where they have none, as RouterOS has
+/// `/interface vlan set` and `remove` (G3.9hl). Numbers then refer to the
+/// sub-menu's own `print`.
+fn inherit(menu: &mut Menu) {
+    let typed = menu
+        .print()
+        .is_some_and(|p| p.param("type").is_some_and(|t| !t.required));
+    if typed {
+        let verbs: Vec<Command> = menu
+            .commands
+            .values()
+            .filter(|c| c.verb != "print" && c.verb != "add")
+            .cloned()
+            .collect();
+        for child in menu
+            .children
+            .values_mut()
+            .filter(|c| c.commands.contains_key("add"))
+        {
+            for c in &verbs {
+                child
+                    .commands
+                    .entry(c.verb.clone())
+                    .or_insert_with(|| c.clone());
+            }
+        }
+    }
+    for child in menu.children.values_mut() {
+        inherit(child);
     }
 }
 
@@ -272,6 +307,46 @@ mod tests {
         let (_, commit) = r.by_id("config.commit").unwrap();
         assert_eq!(commit.enabled, Err("no pending changes".into()));
         assert_eq!(r.commands().count(), 4);
+    }
+
+    #[test]
+    fn type_submenus_take_the_verbs_of_their_menu() {
+        let list = json!([
+            {"id": "interface.list", "params": "{type?: string} → [{name, type}]", "kind": "query"},
+            {"id": "interface.set", "params": "{name: string, mtu?: u32} → {name}"},
+            {"id": "interface.remove", "params": "{name: string} → {name}"},
+            {"id": "interface.vlan.add", "params": "{name: string} → {name}"},
+            {"id": "interface.vlan.list", "params": "{} → [{name}]", "kind": "query"},
+            {"id": "interface.bonding.add", "params": "{name: string} → {name}"},
+            {"id": "interface.bonding.set", "params": "{name: string} → {name}"},
+            {"id": "interface.ethernet.set", "params": "{name: string} → {name}"},
+            {"id": "ip.route.list", "params": "{} → [{dst}]", "kind": "query"},
+            {"id": "ip.route.remove", "params": "{id: string} → {id}"},
+            {"id": "ip.route.rule.add", "params": "{table: string} → {id}"},
+        ]);
+        let r = Registry::from_list(&list);
+        let m = |p: &[&str]| {
+            r.menu(&p.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+                .unwrap()
+        };
+        let vlan = m(&["interface", "vlan"]);
+        assert_eq!(vlan.command("set").unwrap().id, "interface.set");
+        assert_eq!(vlan.command("remove").unwrap().id, "interface.remove");
+        assert_eq!(vlan.print().unwrap().id, "interface.vlan.list");
+        // Its own verb wins; a menu without `add` makes no type.
+        assert_eq!(
+            m(&["interface", "bonding"]).command("set").unwrap().id,
+            "interface.bonding.set"
+        );
+        assert!(m(&["interface", "ethernet"]).command("remove").is_none());
+        // Only a print that filters by type hands its verbs down.
+        assert!(m(&["ip", "route", "rule"]).command("remove").is_none());
+        // `by_id` and the registry order still see each command once.
+        assert_eq!(
+            r.by_id("interface.set").unwrap().0,
+            ["interface".to_owned()]
+        );
+        assert_eq!(r.commands().count(), 11);
     }
 
     #[test]
