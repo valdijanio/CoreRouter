@@ -8912,3 +8912,41 @@ continuação indentadas).
   SLAAC 3,82 s (4,2 s), PD 20 ms (6 ms), cliente 2,43 s (2,46 s), 32 sessões em 321 ms; L2 ra 4,5 s
   (2,3 s), RA final 862 ms (1,1 s); DNS 1,16 M respostas/s com 4 clientes no host (1,12 M). A/B do
   `scale` antes/depois do G3.9fb no mesmo momento: 7,19 s × 7,04 s (sem regressão).
+
+- 2026-10-30 — G3.9da: MPLS: a descoberta de MTU do caminho através de um LSP não vira mais buraco negro. O MPLS do kernel
+  descarta em silêncio o pacote rotulado que não cabe no enlace de saída (`mpls_forward`,
+  `mpls_pkt_too_big`, só conta `tx_errors`); o respondedor do LSP ping agora devolve o ICMP
+  "fragmentation needed" (IPv4 com DF, com a pilha da RFC 4950) ou o ICMPv6 "packet too big", com o
+  MTU do enlace menos a pilha como chegou (RFC 3032 §3.4 passos 2 e 4.b; §3.5).
+
+  - **Captura sem custo com MTU igual:** o filtro do tap MPLS também guarda quadros mais longos que a
+    menor saída da tabela de rótulos (recalculada quando a tabela ou um MTU muda), cortados no que o
+    erro cita. Sem DF, IPv6 pequeno com fragmento, erro sobre erro: contados, sem ICMP.
+  - **Taxa por origem** (`hal/src/lsp/rate.rs`): `icmp_rate_per_source` (padrão 10/s) antes do
+    `icmp_rate` global, para time exceeded e too big; até 4096 origens.
+  - `mpls.settings.set {icmp_too_big, icmp_rate_per_source}`, contadores `too_big`, `too_big_sent`,
+    `rate_limited_source` no `icmp_counters`; campos com ⓘ na janela **MPLS › Settings**.
+  - Pesquisa (kernel 6.18.59 e `master`, RFC 3032/1191/8201/4443/4884/4950, RouterOS, Cisco,
+    Junos) e números em `docs/mpls.md`, "ICMP de pacote rotulado grande demais".
+
+  Validado na VM do laboratório (**medido**, kernel 6.18): `netns_mpls_too_big` (IPv4 e IPv6, MTU
+  1400 no meio do LSP: o kernel sozinho não responde; com o respondedor, MTU 1396 de 10.72.0.2 /
+  fd72::2 e o pacote de 1396 chega) e a enxurrada (2000 pps de TTL 2 de uma origem: sem a taxa por
+  origem o traceroute de outra vê 6/20 saltos, com ela ≥ 18/20). O MTU dos enlaces passou a vir por
+  netlink: o sysfs mostra o namespace de quem montou o `/sys`, e um respondedor movido por `setns`
+  não achava o MTU de saída. Contra o RouterOS 7.25 CHR (`routeros-interop.sh ldp mpls-ttl mpls-mtu`,
+  15/15 OK): com MTU 1400 depois do CoreRouter, o R3 recebe "Frag needed and DF set (mtu = 1396)" de
+  10.39.1.2 e passa a cruzar o LSP com 1392 (ele, como entrada, tira o próprio rótulo); sem a opção,
+  o ping de 1450 com DF some.
+
+  Como testar: `cargo test -p corerouter-hal --lib lsp::too_big lsp::rate`, `cargo test -p
+  corerouter-hal-linux --lib lsp`, `cargo test -p corerouter-engine --test it mpls`; com
+  `mpls_router`: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
+  corerouter-hal-linux --test netns_mpls_too_big -- --nocapture`; CHR: `cargo xtask vm-lab run --
+  scripts/routeros-interop.sh ldp mpls-mtu`.
+
+- 2026-10-30 — processo-ci-runner-registrado: Os runners próprios do CI (`corerouter-ci-1…3`, VM `corerouter-ci`) foram registrados pelo dono e
+  estão `online`; a política de PR de fork ficou em `all_external_contributors`. A partir de agora o
+  lote da fila manda `test`, `bench-check` e `netns` para eles (255 s por lote contra 445 s nos
+  runners do GitHub, **medido** no #465). `docs/ci-runner.md` diz o estado e quando um token novo é
+  preciso.
