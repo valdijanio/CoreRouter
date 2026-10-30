@@ -148,8 +148,8 @@ fn a_frame_parses_with_its_length_and_a_bounded_copy() {
     assert!(parse(&ifn("ether1"), &frame(&[label(100, 64, true)], &[0; 40])).is_none());
 }
 
-/// RFC 3032 §3.4: the Next-Hop MTU is the link MTU minus the stack that
-/// would leave, as the kernel's `mtu - new_header_size` check counts it.
+/// What the kernel takes: the link MTU minus the stack that would leave
+/// (`mtu - new_header_size`).
 #[test]
 fn the_limit_counts_the_labels_that_would_leave() {
     let v = transit(&[]);
@@ -180,6 +180,31 @@ fn the_limit_counts_the_labels_that_would_leave() {
     assert_eq!(
         limit(&[label(100, 64, true)], &unknown),
         Err("MTU of the way out unknown")
+    );
+}
+
+/// RFC 3032 §3.4 steps 2 and 4.b: what the error reports is the frame
+/// payload minus the stack as it came, and never more than what fits.
+#[test]
+fn the_next_hop_mtu_takes_off_the_stack_that_came() {
+    let v = transit(&[]);
+    let mtu = |stack: &[MplsLabel]| next_hop_mtu(stack, &v);
+    // Swap: the same stack leaves.
+    assert_eq!(mtu(&[label(100, 64, true)]), Ok(1396));
+    // PHP: 1400 fits, but the ingress pushes its label again.
+    assert_eq!(mtu(&[label(101, 64, true)]), Ok(1396));
+    assert_eq!(mtu(&[label(101, 64, false), label(16, 64, true)]), Ok(1392));
+    // Swap and push: more leaves than came, the limit wins.
+    assert_eq!(mtu(&[label(102, 64, false), label(16, 64, true)]), Ok(1388));
+    assert_eq!(mtu(&[label(103, 64, true)]), Ok(1396));
+    // A packet between the two after a pop is forwarded: no error.
+    let p = tcp4("192.0.2.1", "198.51.100.9", 1398, true);
+    assert_eq!(
+        answer(
+            &too_big(&[label(101, 64, true)], &p),
+            &transit(&["192.0.2.1"])
+        ),
+        Err("fits the way out")
     );
 }
 

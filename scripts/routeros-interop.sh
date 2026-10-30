@@ -717,11 +717,13 @@ case_mpls-mtu() {
   ip -n crr3 route flush cache 2>/dev/null || true
   p=$(r3_ping 1422)
   local f; f=$(grep -m1 'Frag needed' <<< "$p" || true)
-  [[ $f == *10.39.1.2*"mtu = 1400"* ]] && result mpls-mtu OK "R3 gets fragmentation needed from the CoreRouter: $f" \
-    || result mpls-mtu FAIL "R3, no fragmentation needed with mtu 1400: $(head -4 <<< "$p" | tr '\n' ' ')"
+  # RFC 3032 §3.4: 1400 minus the one label that came (the CoreRouter pops).
+  [[ $f == *10.39.1.2*"mtu = 1396"* ]] && result mpls-mtu OK "R3 gets fragmentation needed from the CoreRouter: $f" \
+    || result mpls-mtu FAIL "R3, no fragmentation needed with mtu 1396: $(head -4 <<< "$p" | tr '\n' ' ')"
   result mpls-mtu INFO "R3 route to R4: $(ip -n crr3 route get 10.255.39.4 | head -1)"
-  r3_ping 1372 | grep -q ' 0% packet loss' && result mpls-mtu OK "1400-octet DF packets now cross the LSP" \
-    || result mpls-mtu FAIL "1400-octet DF ping R3 → R4 lost"
+  # R3 is the ingress: Linux takes its own label (4) off the learned 1396.
+  r3_ping 1364 | grep -q ' 0% packet loss' && result mpls-mtu OK "1392-octet DF packets now cross the LSP" \
+    || result mpls-mtu FAIL "1392-octet DF ping R3 → R4 lost"
   # The CHR's own ping (RouterOS shows how it reads the error).
   local rp; rp=$(ros_ping 10.255.39.4 10.255.39.1 1450)
   echo "$rp" > "$W/ros-ping-mtu.json"

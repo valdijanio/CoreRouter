@@ -427,8 +427,12 @@ buraco negro: o TCP abre e trava no primeiro segmento cheio. Agora o respondedor
   saída. Com ECMP o kernel escolhe por um hash que não vemos: vale a menor saída. O TTL vem
   antes (um pacote expirado recebe time exceeded, como no kernel).
 - **IPv4 com DF** (RFC 3032 §3.4): Destination Unreachable código 4, com o Next-Hop MTU (RFC
-  1191 §4) = MTU do enlace − a pilha que sairia, 128 octetos citados e o objeto da RFC 4950 com a
-  pilha como chegou (o tipo 3 aceita extensões, RFC 4884 §4.1). **Sem DF:** a RFC deixa o LSR
+  1191 §4) = MTU do enlace − N, com N a pilha **como chegou** (§3.4 passos 2 e 4.b: a entrada
+  empilha os rótulos de novo), e nunca mais que o que de fato cabe (com push sai mais do que
+  chegou). Depois de um pop (PHP) o erro diz 4 octetos a menos do que o enlace levaria: o
+  pacote entre os dois passa, sem erro, porque a decisão de "grande demais" segue a conta do
+  kernel. 128 octetos citados e o objeto da RFC 4950 com a pilha como chegou (o tipo 3 aceita
+  extensões, RFC 4884 §4.1). **Sem DF:** a RFC deixa o LSR
   descartar calado ("MAY silently discard"), e é o que o kernel já fez; contado.
 - **IPv6** (RFC 3032 §3.5): Packet Too Big com esse MTU, citando o que couber no MTU mínimo de
   1280 (RFC 4443 §3.2; o tipo 2 não tem extensão RFC 4884, então vai sem a pilha). Pacote de até
@@ -478,8 +482,10 @@ buraco negro: o TCP abre e trava no primeiro segmento cheio. Agora o respondedor
   ([Feature Explorer](https://apps.juniper.net/feature-explorer/feature/8329), 23.4R1).
   **Nokia SR OS:** `icmp-tunneling` também. Relatos de PMTUD em núcleo MPLS:
   [lostintransit](https://lostintransit.se/2024/09/11/pmtud-in-mpls-enabled-networks/).
-- **Adotado:** a conta exata do kernel (o erro só sai quando ele de fato descarta), o MTU já
-  descontado da pilha que sai (RFC 3032 §3.4) e a mesma regra de volta do time exceeded.
+- **Adotado:** a conta exata do kernel (o erro só sai quando ele de fato descarta), o MTU
+  informado pela RFC 3032 §3.4 (menos a pilha que chegou; contra o CHR, com o CoreRouter fazendo
+  PHP, o R3 recebe `mtu = 1396` e, como entrada Linux, tira o próprio rótulo e manda 1392) e a
+  mesma regra de volta do time exceeded.
 - **Melhor que os outros:** limite por origem antes do global, contadores com o motivo de cada
   descarte, e o filtro que só copia o que pode ser grande demais (nenhuma cópia com MTU igual).
 - **Ficou de fora:** fragmentar IPv4 sem DF no LSR (§3.4 3.a: o kernel descarta, a RFC permite;

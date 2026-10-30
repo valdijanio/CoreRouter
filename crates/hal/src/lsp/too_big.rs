@@ -87,10 +87,31 @@ pub fn parse(interface: &IfName, mpls: &[u8]) -> Option<TooBig> {
     })
 }
 
-/// The largest IP packet the top label's way out takes now: its link MTU
-/// minus the labels that would leave (pushed ones and the rest of the
-/// stack; RFC 3032 §3.4 "N"). The smallest over ECMP ways.
+/// The largest IP packet the top label's way out takes now, as the
+/// kernel's `mtu - new_header_size` check counts it: its link MTU minus
+/// the labels that would leave (pushed ones and the rest of the stack).
+/// The smallest over ECMP ways. Larger is dropped, so too big.
 pub fn limit(stack: &[MplsLabel], view: &dyn LsrView) -> Result<usize, &'static str> {
+    ways(stack, view, |out, below| 4 * out + below)
+}
+
+/// The Next-Hop MTU the error reports. RFC 3032 §3.4 step 4.b: the
+/// Effective Maximum Frame Payload Size minus N, N the stack as it came
+/// (step 2), so the ingress, which pushes its labels again, fits — after
+/// a pop that is 4 octets under what the link would take. Never more than
+/// [`limit`]: a push makes the stack that leaves larger than N.
+pub fn next_hop_mtu(stack: &[MplsLabel], view: &dyn LsrView) -> Result<usize, &'static str> {
+    let n = 4 * stack.len();
+    ways(stack, view, |out, below| (4 * out + below).max(n))
+}
+
+/// The smallest of `mtu - taken(labels pushed, octets of stack below the
+/// top)` over the top label's ways out.
+fn ways(
+    stack: &[MplsLabel],
+    view: &dyn LsrView,
+    taken: impl Fn(usize, usize) -> usize,
+) -> Result<usize, &'static str> {
     let top = stack.first().ok_or("no label")?;
     let entry = view.label_entry(top.label).ok_or("label has no entry")?;
     let below = 4 * stack.len().saturating_sub(1);
@@ -99,7 +120,7 @@ pub fn limit(stack: &[MplsLabel], view: &dyn LsrView) -> Result<usize, &'static 
         .iter()
         .filter_map(|nh| {
             let mtu = usize::from(view.mtu(nh.interface.as_ref()?)?);
-            Some(mtu.saturating_sub(4 * nh.out_labels.len() + below))
+            Some(mtu.saturating_sub(taken(nh.out_labels.len(), below)))
         })
         .min()
         .ok_or("MTU of the way out unknown")
@@ -130,11 +151,11 @@ fn has_fragment_header(p: &[u8]) -> bool {
 
 /// The error for `t`, or why none is sent (for the counters).
 pub fn answer(t: &TooBig, view: &dyn LsrView) -> Result<Icmp, &'static str> {
-    let mtu = limit(&t.stack, view)?;
-    if t.len <= mtu {
+    if t.len <= limit(&t.stack, view)? {
         // A GSO packet the kernel segments, or a table that changed.
         return Err("fits the way out");
     }
+    let mtu = next_hop_mtu(&t.stack, view)?;
     let v6 = match t.packet.first().map(|b| b >> 4) {
         Some(4) => false,
         Some(6) => true,
