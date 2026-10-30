@@ -299,3 +299,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-30 — G1.6u feito (atualização num `/config` cheio)
 - 2026-10-30 — G1.3g parcial (só a regra de firewall recusada fica de fora, checagem sem aplicar, trava de gerência; máscara do boot nos caminhos laterais); G1.3h descartada por decisão do usuário (2026-10-30): sem firewall de emergência
 - 2026-10-30 — G1.6v criado e feito (`/config` ocupa o resto do disco)
+- 2026-10-30 — G1.3g feito (rotas uma a uma no boot, só a recusada de fora)
