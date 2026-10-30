@@ -1384,7 +1384,10 @@ mod tests {
         assert!(!text.contains("long-lived"), "{text}");
         cfg.routing.bgp.get_mut("default").unwrap().llgr_stale_time = Some(3600);
         let text = render_config(&cfg, &|_| None).unwrap();
-        assert!(text.contains(" bgp long-lived-graceful-restart stale-time 3600\n"), "{text}");
+        assert!(
+            text.contains(" bgp long-lived-graceful-restart stale-time 3600\n"),
+            "{text}"
+        );
         // Nobody restarting: no F bit.
         cfg.routing.bgp_connections.remove("up");
         assert!(
