@@ -130,7 +130,8 @@ O programa só compila com nightly (`-Z build-std=core`), o alvo `bpfel-unknown-
 
 ## Blocos `unsafe` (revisão humana)
 
-Todos em `crates/dataplane-ebpf/src/main.rs`, cada um com `SAFETY:`:
+Todos em `crates/dataplane-ebpf/src/main.rs`, cada um com `SAFETY:`. Bloco novo ou alterado
+entra por revisão humana (caminho no `CLAUDE.md`, "`unsafe` proibido"):
 
 1. `Frame::bytes`: `read_unaligned` de `[u8; N]` em `data + off` depois de conferir
    `data + off + N <= data_end` (a mesma checagem que o verificador exige).

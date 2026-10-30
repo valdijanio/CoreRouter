@@ -180,8 +180,18 @@ Decisões de desempenho se tomam com números, não com preferência.
 - **Nunca quebrar o WASM.** model, hal, engine, ui e gui compilam para `wasm32-unknown-unknown`.
   Não use `std::time::SystemTime::now`, threads ou `std::net` nessas camadas (o relógio vem do
   `Hal::now_unix`). Imposto por `cargo xtask wasm`.
-- **`unsafe` proibido**, exceto no futuro crate isolado `dataplane-ebpf` (programas XDP), com
-  revisão humana e comentário `SAFETY:` por bloco.
+- **`unsafe` proibido**, exceto no crate isolado `dataplane-ebpf` (programas eBPF: XDP e tc),
+  com comentário `SAFETY:` por bloco e **revisão humana de todo bloco novo ou alterado**
+  (pedido do usuário, 2026-10-30: sem catálogo de "padrões já aprovados"). O caminho:
+  1. a sessão lista o bloco em `docs/xdp.md` ("Blocos `unsafe`", número novo) e abre o PR
+     **sem** o rótulo `fila`, com a seção `## Revisão humana necessária` (o que cada bloco
+     faz, por que precisa de `unsafe`, por que é seguro, o que o verificador do kernel
+     conferiu);
+  2. a sessão principal resume ao usuário, em linguagem simples, cada bloco e o risco, com a
+     recomendação;
+  3. só depois do "aprovo" do usuário na conversa, a sessão principal põe o rótulo `fila` e
+     registra a aprovação num comentário do PR. Nenhuma sessão de feature põe o rótulo num PR
+     com `unsafe`.
 - **Kernel real só com pedido explícito.** O padrão é `--backend virtual`. Nunca rode
   `--backend linux` como root nem altere interfaces da máquina de desenvolvimento (veja "Acesso
   root e testes de rede").
