@@ -13,6 +13,7 @@ use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use corerouter_hal::{Features, HalError, Learned, NO_VRF};
+use corerouter_model::types::Discard;
 use corerouter_model::{BondMode, HashPolicy, IfName, LacpRate};
 use futures_util::{StreamExt, TryStreamExt};
 use ipnet::{IpNet, Ipv6Net};
@@ -25,7 +26,7 @@ use rtnetlink::packet_route::link::{
     InfoVlan, InfoVrf, LinkAttribute, LinkFlags, LinkInfo, LinkMessage, State, VlanProtocol,
 };
 use rtnetlink::packet_route::route::{
-    RouteAddress, RouteAttribute, RouteMessage, RouteNextHop, RouteProtocol, RouteScope,
+    RouteAddress, RouteAttribute, RouteMessage, RouteNextHop, RouteProtocol, RouteScope, RouteType,
 };
 use rtnetlink::{
     AddressMessageBuilder, Handle, LinkBond, LinkBridge, LinkDummy, LinkMessageBuilder, LinkUnspec,
@@ -33,7 +34,7 @@ use rtnetlink::{
 };
 
 use crate::owner::KernelLink;
-use crate::plan::{BondSetting, KernelRoute, LinkSpec, Op, bond_in_place};
+use crate::plan::{BondSetting, KernelDiscard, KernelRoute, LinkSpec, Op, bond_in_place};
 
 /// Bound on one link dump (hostile input: a kernel with more links than
 /// this is not one CoreRouter can manage sensibly anyway).
@@ -313,6 +314,7 @@ pub(crate) fn held(
     (
         std::collections::BTreeSet<(IfName, IpNet)>,
         std::collections::BTreeSet<KernelRoute>,
+        Vec<KernelDiscard>,
     ),
     HalError,
 > {
@@ -864,6 +866,8 @@ impl Kernel {
             Op::DelAddress { link, addr } => self.del_address(link, addr).await,
             Op::AddRoute(r) => self.add_route(r).await,
             Op::DelRoute(r) => self.del_route(r).await,
+            Op::AddDiscard(d) => self.add_discard(d).await,
+            Op::DelDiscard(d) => self.del_discard(d).await,
         }
     }
 
@@ -1292,7 +1296,7 @@ impl Kernel {
                 Some((m.header.index, name))
             })
             .collect();
-        let (_, routes) = self.held(&names).await?;
+        let (_, routes, _) = self.held(&names).await?;
         let mut paths = Paths::new();
         for r in routes {
             paths.entry(group_of(&r)).or_default().push(r);
@@ -1421,6 +1425,67 @@ impl Kernel {
         }
     }
 
+    /// G1.5a: a route without next hop, alone in its prefix, metric and
+    /// table (validation refuses one beside a unicast route of the same
+    /// distance). `EEXIST`: ours already (a restart) when the kernel's is
+    /// the same kind, else someone else's.
+    async fn add_discard(&self, d: &KernelDiscard) -> Result<Vec<Op>, String> {
+        match self.handle.route().add(discard_msg(d)?).execute().await {
+            Ok(()) => Ok(vec![Op::DelDiscard(*d)]),
+            Err(e) if errno(&e) == Some(EEXIST) => {
+                if self.discards_at(d).await?.contains(d) {
+                    return Ok(vec![]);
+                }
+                Err(format!(
+                    "the kernel already has another route to {} with metric {} in table {}; \
+                     refusing to replace it",
+                    d.dst, d.metric, d.table
+                ))
+            }
+            Err(e) => Err(readable(&e)),
+        }
+    }
+
+    async fn del_discard(&self, d: &KernelDiscard) -> Result<Vec<Op>, String> {
+        match self.handle.route().del(discard_msg(d)?).execute().await {
+            Ok(()) => Ok(vec![Op::AddDiscard(*d)]),
+            Err(e) if matches!(errno(&e), Some(ESRCH | ENOENT)) => Ok(vec![]),
+            Err(e) => Err(readable(&e)),
+        }
+    }
+
+    /// The kernel's static routes without next hop to `d`'s prefix, metric
+    /// and table (a dump of its table: only on `EEXIST`).
+    async fn discards_at(&self, d: &KernelDiscard) -> Result<Vec<KernelDiscard>, String> {
+        let all = self.discards().await?;
+        Ok(all
+            .into_iter()
+            .filter(|x| (x.table, x.dst, x.metric) == (d.table, d.dst, d.metric))
+            .collect())
+    }
+
+    /// Every static route without next hop the kernel holds (G1.5a).
+    async fn discards(&self) -> Result<Vec<KernelDiscard>, String> {
+        let v4: Vec<RouteMessage> = self
+            .handle
+            .route()
+            .get(
+                RouteMessageBuilder::<std::net::Ipv4Addr>::new()
+                    .table_id(0)
+                    .build(),
+            )
+            .execute()
+            .take(MAX_DUMP)
+            .try_collect()
+            .await
+            .map_err(|e| format!("listing routes: {}", readable(&e)))?;
+        Ok(v4
+            .iter()
+            .chain(self.routes_v6().await?.iter())
+            .filter_map(discard_of)
+            .collect())
+    }
+
     async fn del_route(&self, r: &KernelRoute) -> Result<Vec<Op>, String> {
         // No link, no route: the kernel removed it with the link.
         let Some(l) = self.find(&r.link).await? else {
@@ -1508,6 +1573,7 @@ impl Kernel {
         (
             std::collections::BTreeSet<(IfName, IpNet)>,
             std::collections::BTreeSet<KernelRoute>,
+            Vec<KernelDiscard>,
         ),
         String,
     > {
@@ -1538,10 +1604,13 @@ impl Kernel {
             .try_collect()
             .await
             .map_err(|e| format!("listing routes: {}", readable(&e)))?;
+        // G1.5a: the routes without next hop come in the same dump.
+        let mut discards = Vec::new();
         for m in v4.iter().chain(self.routes_v6().await?.iter()) {
             routes.extend(static_routes(m, names));
+            discards.extend(discard_of(m));
         }
-        Ok((addresses, routes))
+        Ok((addresses, routes, discards))
     }
 
     async fn learned(
@@ -1667,6 +1736,59 @@ fn route_msg(r: &KernelRoute, oif: u32) -> Result<RouteMessage, String> {
         None => b,
     };
     Ok(b.build())
+}
+
+/// G1.5a: `ip route add blackhole|unreachable|prohibit <dst> metric <m>
+/// table <t> proto static`: no interface, no gateway.
+fn discard_msg(d: &KernelDiscard) -> Result<RouteMessage, String> {
+    Ok(RouteMessageBuilder::<IpAddr>::new()
+        .destination_prefix(d.dst.addr(), d.dst.prefix_len())
+        .map_err(|e| e.to_string())?
+        .priority(d.metric)
+        .table_id(d.table)
+        .protocol(RouteProtocol::Static)
+        .kind(match d.kind {
+            Discard::Blackhole => RouteType::BlackHole,
+            Discard::Unreachable => RouteType::Unreachable,
+            Discard::Prohibit => RouteType::Prohibit,
+        })
+        .build())
+}
+
+/// The static route without next hop of `m` (G1.5a), if it is one.
+fn discard_of(m: &RouteMessage) -> Option<KernelDiscard> {
+    let h = &m.header;
+    if h.protocol != RouteProtocol::Static {
+        return None;
+    }
+    let kind = match h.kind {
+        RouteType::BlackHole => Discard::Blackhole,
+        RouteType::Unreachable => Discard::Unreachable,
+        RouteType::Prohibit => Discard::Prohibit,
+        _ => return None,
+    };
+    let mut table = u32::from(h.table);
+    let (mut dst, mut metric) = (None, 0);
+    for a in &m.attributes {
+        match a {
+            RouteAttribute::Table(t) => table = *t,
+            RouteAttribute::Destination(d) => dst = ip_of(d),
+            RouteAttribute::Priority(p) => metric = *p,
+            _ => {}
+        }
+    }
+    let dst = match (dst, h.address_family) {
+        (Some(d), _) => d,
+        (None, AddressFamily::Inet) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        (None, AddressFamily::Inet6) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        (None, _) => return None,
+    };
+    Some(KernelDiscard {
+        table,
+        dst: IpNet::new(dst, h.destination_prefix_length).ok()?,
+        metric,
+        kind,
+    })
 }
 
 /// One path of a multipath route.

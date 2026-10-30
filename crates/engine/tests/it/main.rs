@@ -56,6 +56,7 @@ mod query_purity;
 mod queue;
 mod route;
 mod route_check;
+mod route_discard;
 mod route_page;
 mod route_view;
 mod safe_mode;

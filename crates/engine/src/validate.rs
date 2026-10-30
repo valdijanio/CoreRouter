@@ -453,6 +453,7 @@ pub(crate) fn route_issues(
         out.push((field, why.text));
     }
     check_gateway_issues(cfg, r, &mut out);
+    discard_issues(cfg, r, &mut out);
     // Equal distance is ECMP (RouterOS v7, G1.27): only the very same
     // next hop twice is refused.
     for o in same_hop.filter(|o| *o != r.id) {
@@ -467,12 +468,53 @@ pub(crate) fn route_issues(
     out
 }
 
+/// G1.5a: the kernel holds one route per prefix, metric and table, and a
+/// route without next hop has no path to merge with another: it cannot
+/// share its distance with a route of the other kind (or another type of
+/// discard) to the same destination. Enabled routes only.
+fn discard_issues(cfg: &Config, r: &RouteEntry, out: &mut Vec<(&'static str, String)>) {
+    if r.disabled {
+        return;
+    }
+    let dst = (r.routing_table.clone(), r.dst_address.trunc());
+    let clash = cfg.ip.routes.routes_to(&dst).find(|o| {
+        o.id != r.id
+            && !o.disabled
+            && o.distance == r.distance
+            && o.dst_address.trunc() == r.dst_address.trunc()
+            && (o.gateway.discards().is_some() || r.gateway.discards().is_some())
+            && o.gateway.discards() != r.gateway.discards()
+    });
+    if let Some(o) = clash {
+        out.push((
+            "distance",
+            format!(
+                "route {} already goes to {} via {} at distance {} in table {}: a {} route \
+                 cannot share a distance with it; give one of them another distance",
+                o.id,
+                r.dst_address,
+                o.gateway,
+                r.distance,
+                r.routing_table,
+                r.gateway.discards().or(o.gateway.discards()).map_or("", |d| d.as_str()),
+            ),
+        ));
+    }
+}
+
 /// G1.27f / G3.6g: what `check_gateway` can check.
 fn check_gateway_issues(cfg: &Config, r: &RouteEntry, out: &mut Vec<(&'static str, String)>) {
     use corerouter_model::dhcp_client::CheckGateway;
     let gw = r.gateway.address();
     match (r.check_gateway, gw) {
         (CheckGateway::None, _) => {}
+        (m, _) if r.gateway.discards().is_some() => out.push((
+            "check_gateway",
+            format!(
+                "check-gateway={m} needs a gateway: a {} route has none to check",
+                r.gateway
+            ),
+        )),
         (m, None) => out.push((
             "check_gateway",
             format!(
