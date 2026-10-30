@@ -12,8 +12,16 @@ on:
     # bench/**: base descartável da bateria de testes da fila de entrada (PRs sintéticos que
     # nunca vão para a main).
     branches: [main, "bench/**"]
-  # Rodar à mão numa branch (Actions → ci → Run workflow).
+  # Rodar à mão numa branch (Actions → ci → Run workflow). A fila de entrada (scripts/land.sh)
+  # dispara assim o lote, em `queue/*`, e escolhe o runner: `corerouter` (o runner próprio,
+  # docs/ci-runner.md) quando o GitHub o mostra online, senão `github`.
   workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner dos jobs pesados: github ou corerouter (só vale em queue/*)"
+        type: choice
+        options: [github, corerouter]
+        default: github
 
 permissions:
   contents: read
@@ -40,6 +48,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       docs_only: ${{ steps.diff.outputs.docs_only }}
+      runs_on: ${{ steps.runner.outputs.runs_on }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -60,6 +69,29 @@ jobs:
           esac
           echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
           echo "só documentação: $docs_only"
+      # Onde rodam `test`, `bench-check` e `netns` (docs/ci-runner.md). O runner próprio só recebe
+      # código confiável: o lote da fila (workflow_dispatch em queue/*, pedido pela fila) e, se a
+      # variável do repositório CI_RUNNER for `corerouter`, o push na main. PR (inclusive de fork)
+      # nunca: fica nos runners do GitHub. O hook do runner recusa o resto mesmo que um workflow
+      # alterado peça `self-hosted`; isto aqui só escolhe.
+      - id: runner
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          WANT: ${{ inputs.runner }}
+          MAIN_RUNNER: ${{ vars.CI_RUNNER }}
+        run: |
+          own=false
+          case "$EVENT:$REF" in
+            workflow_dispatch:refs/heads/queue/*) if [ "$WANT" = corerouter ]; then own=true; fi ;;
+            push:refs/heads/main) if [ "$MAIN_RUNNER" = corerouter ]; then own=true; fi ;;
+          esac
+          if [ "$own" = true ]; then
+            echo 'runs_on=["self-hosted","corerouter"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'runs_on="ubuntu-latest"' >> "$GITHUB_OUTPUT"
+          fi
+          echo "runner próprio: $own"
 
   # O portão completo em jobs paralelos (processo, 2026-10-26): um job serial levava 21 min no
   # lote, 10 deles no bench-check. Cada job roda um grupo de passos do `cargo xtask ci --only`
@@ -93,7 +125,7 @@ jobs:
     name: test (${{ matrix.part }}/${{ strategy.job-total }})
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(needs.changes.outputs.runs_on) }}
     timeout-minutes: 40
     strategy:
       fail-fast: false
@@ -119,7 +151,7 @@ jobs:
     name: bench-check
     needs: changes
     if: needs.changes.outputs.docs_only != 'true' && github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(needs.changes.outputs.runs_on) }}
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -133,7 +165,7 @@ jobs:
     name: netns
     needs: changes
     if: needs.changes.outputs.docs_only != 'true' && github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(needs.changes.outputs.runs_on) }}
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -146,6 +178,9 @@ jobs:
   # COREROUTER_REQUIRE_XDP).
   # Os testes de root medem vazão e precisão: um por vez em cada runner, as partes em runners
   # diferentes (`COREROUTER_CI_PARTITION`, divididas pelo tempo medido de cada teste).
+  # Fica no GitHub mesmo com o runner próprio (docs/ci-runner.md): precisa de root para rodar o
+  # código do job, e lá dentro o `runner` não tem sudo; e mede vazão, que a VM dividida com os
+  # outros jobs distorceria.
   xdp-root:
     name: xdp-root (${{ matrix.part }}/${{ strategy.job-total }})
     needs: changes

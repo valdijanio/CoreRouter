@@ -119,7 +119,8 @@ pub fn control_line(data: &[u8]) -> Result<(), String> {
     let peer = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
     let caller = Caller::new(1, "fuzz");
     let (reply, panicked) =
-        panics(|| answer(&mut host, &gate, &caller, peer, &line).map(|a| a.reply));
+        panics(|| answer(&mut host, &gate, &caller, peer, &line).map(|a| a.reply.into_text()));
+    let reply = reply.map(|t| serde_json::from_str::<Value>(&t).unwrap_or(Value::Null));
     if panicked > 0 {
         return Err(format!("{panicked} panic(s) answering {line}"));
     }

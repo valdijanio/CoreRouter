@@ -245,6 +245,62 @@ corerouter-cli run routing.bgp.instance.check '{"id":"default","asn":"65000","ro
 corerouter-cli run system.health.check | jq '.checks[] | select(.key == "bgp.end-of-rib")'
 ```
 
+### G3.9fj: Hard Reset e o bit N (RFC 8538)
+
+O FRR 10.7.1 já anuncia o bit N e manda Hard Reset no `clear` por padrão (desde a 8.3,
+`FRR_CFG_DEFAULT_BOOL` em `bgpd/bgp_vty.c`). Com o bit N dos dois lados, toda NOTIFICATION que não
+é Hard Reset e o **hold timer expirado** viram graceful restart (§4): as rotas ficam stale.
+Hard Reset (Cease 9) no FRR: Maximum Prefixes, Administrative Shutdown, Peer De-configured,
+BFD Down (Cease 10) e Administrative Reset conforme `hard_admin_reset` (`bgp_packet.c`,
+`bgp_notify_send_hard_reset`).
+
+```sh
+corerouter-cli run routing.bgp.instance.set '{"asn":65000,"router_id":"10.255.0.1","hard_admin_reset":false}'
+```
+
+- Na instância: `graceful_notification` (bit N, padrão `true`) e `hard_admin_reset` (padrão
+  `true`; `false`: um `routing.bgp.session.clear` de um vizinho com bit N mantém as rotas stale).
+  Só o desligado fica na config e vira `no bgp graceful-restart notification` / `no bgp
+  hard-administrative-reset`. O FRR imprime só o que difere do padrão, e digitar a forma ligada a
+  cada commit faria o diff redigitá-la. Pior: `graceful-restart notification` manda a capacidade
+  a todo vizinho cada vez que é digitado.
+- `routing.bgp.session.list`: `n_bit` (o vizinho anunciou, sessão estabelecida com GR) e
+  `last_hard_reset`. Na janela, o selo `N` na coluna GR e "(Hard Reset)" no último erro. Na aba Instances, a coluna Notification (`N bit`, `graceful clear`) e os
+  dois campos no modal.
+- **Risco já existente que o PR expõe:** com GR e bit N, uma queda silenciosa (energia, link
+  cortado) do lado que reinicia deixa as rotas dele no vizinho por hold time + Restart Time. A
+  prévia da conexão avisa (`gr-bfd`) quando há `graceful_restart=yes` sem BFD, e a saúde
+  (`bgp.gr-bfd`) aponta as sessões estabelecidas assim. O remédio é BFD (a queda do BFD é Hard
+  Reset) ou desligar o bit N.
+- RouterOS 7.25: nada documentado sobre a RFC 8538. Como ele não é helper, o bit N não muda nada
+  com ele.
+
+### G3.9fj: BFD e graceful restart (RFC 5882 §4.3)
+
+O BFD do CoreRouter roda no `corerouter-daemon`: o `bfdd` só o comanda, pelo plano de dados
+distribuído. **Medido** no host (`scripts/bgp-crcr-userns.sh cbit`), com GR e BFD de
+100 ms × 3, `kill -9` no CR1 e tudo de volta 3 s depois:
+
+| O que morre no CR1 | O CR2 com a rota do CR1 | Pings perdidos (20 ms) |
+|---|---|---|
+| `bgpd` + `bfdd` | fica: o BFD continua no ar | 1–105 de ~560 |
+| `corerouter-daemon` + `bgpd` + `bfdd` | fica | 2–4 de ~564 |
+| só o `corerouter-daemon` | **sai em 416–423 ms** (BFD down com a TCP no ar: Cease 10) | 144–154 de ~560 |
+
+- Com a pilha inteira morta, a TCP cai primeiro. O FRR 10.7.1 não tira as rotas stale por causa
+  de um BFD down que chega depois disso: o `bgp_stop` só mexe nos tempos de GR com a sessão
+  estabelecida, e o `BGP_Stop` em Idle não limpa nada (`bgpd/bgp_fsm.c`). Por isso
+  `neighbor X bfd check-control-plane-failure` (RFC 5882 §4.3) não mudou nada. Com ele
+  desligado, ligado só no helper e ligado nos dois lados, a rota ficou nos três casos (**medido**),
+  e o CoreRouter não o expõe.
+- O `remote_flags` que o CoreRouter manda ao `bfdd` agora traz o bit C recebido do vizinho
+  (`RBIT_CPI`); antes ia sempre 0. O bit C enviado continua 0: o BFD cai junto com o daemon
+  enquanto o kernel continua encaminhando, então C = 1 seria falso (RFC 5880 §6.8.7). O pedido do
+  `bfdd` de pôr C = 1 não é seguido.
+- Gap: com BFD, o `kill -9` (ou uma atualização) só do `corerouter-daemon` derruba as sessões BGP,
+  embora o `bgpd` e o kernel continuem vivos.
+- RouterOS 7.25: nada documentado sobre o bit C, e ele não é helper.
+
 ### Ficou para depois
 
 - Políticas e o "quais rotas passam" (G3.2b); RPKI e "Por que essa rota?" (G3.2c).

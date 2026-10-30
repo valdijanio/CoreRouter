@@ -2772,3 +2772,74 @@ e depois (G0.31j).
   três boots cada): memória ociosa sem protocolo de roteamento 98,9 MiB (8 daemons do FRR) →
   70,9 MiB (mgmtd, zebra, staticd); FRR com os sockets vty prontos 0,82 s depois do kernel
   (antes 1,0–1,9 s).
+
+### Runner próprio do CI: lote da fila antes e depois (processo, 2026-10-29)
+
+**Medido** em 2026-10-29. Antes: os runners do GitHub (4 vCPU por job). Depois: a VM
+`corerouter-ci` (16 vCPUs EPYC-Genoa `host-model`, 16 GiB + 16 GiB de swap, 3 runners) no host
+de 32 núcleos, com os mesmos jobs (`cargo xtask ci --only test|bench-check|netns`, camada
+`full`, partições 1/2 e 2/2) rodando 3 de cada vez por `cargo xtask ci-runner run`, como os 3
+runners. Uma amostra por linha.
+
+| Job (lote `33c235c5`) | GitHub (run 40947726887) | VM, cache quente (lote anterior `f0c46dc9` compilado) |
+|---|---|---|
+| `test (1/2)` | 225 s | 170 s |
+| `test (2/2)` | 306 s | 79 s |
+| `bench-check` | 428 s | 224 s |
+| `netns` | 163 s | 176 s (começa aos 79 s, no runner que rodou o `test (2/2)`, disputando CPU com os outros dois) |
+| jobs pesados, ponta a ponta | 428 s (o `bench-check`) | 255 s |
+| lote inteiro | 445 s | ~260 s **estimado**: o `xdp-root` (≤ 200 s) e o `lint` (91 s) continuam no GitHub, em paralelo |
+
+A frio (cache vazio, depois de `reset --wipe-cache`), o lote `f0c46dc9` levou 336 s na VM
+contra 437 s no GitHub (run 40936449389). Sem swap, o bench `frames` (6,4 GB de RSS) levou OOM
+com 3 jobs em 16 GiB; com 16 GiB de swap, nenhum OOM. A VM tem 4 jobs e 3 runners: o `netns`
+espera o primeiro terminar. Dois testes saíram FLAKY (falharam e passaram na repetição, sem
+reprovar): `service::bandwidth_server::tests::enabled_by_config_serves_and_refuses_outsiders` e
+`service::bfd::tests::two_engines_come_up_and_detect_the_loss`, do daemon, sob 3 jobs ao mesmo tempo.
+
+### Build rápido da imagem (processo, 2026-10-29)
+
+**Medido** em 2026-10-29, AMD Ryzen AI Max+ 395 (32 threads), 62 GiB, NVMe, build release, com
+5–6 outras sessões compilando (carga 20–90). Cada lado numa cópia própria do out em
+`/srv/build` (ccache do checkout principal, downloads em cache).
+
+| Situação | Antes | Depois |
+|---|---|---|
+| `os build` completo, out vazio só com ccache | 1063 s (`make all` 838 s, serial) | 1010 s (`make all` 800 s, `-j6 -l32`) |
+| Uma linha no daemon, `os build --only crpkg` | 889 s (GUI 331 + `make all` 497; 126 + 97 crates recompilados) | 213 s (GUI 60 s, 0 crates; `make all` 139 s) |
+| CLI do `push`, target novo | 223 s | 66 s |
+| CLI do `push`, uma linha no engine | 144 s | 3,2 s |
+
+O paralelismo médio entre pacotes no build completo foi 2,1× (1714 s de pacotes em 802 s). A
+corrente `host-protobuf` (309 s) → `protobuf-c` → FRR → kernel do instalador limita o `-j` de
+topo.
+
+- 2026-10-29, G3.9d (**medido**, VM do laboratório, release): `benches/netns_mpls_ttl.rs`,
+  troca de rótulo de quadros de 64 bytes num núcleo, mesma rodada: sem taps 1,90 Mpps; um tap
+  `AF_PACKET` preso à porta 1,47 (−23%, clone por pacote no `mpls_rcv`); os taps do respondedor
+  sem bind 1,53 (−19%). `cargo bench -p corerouter-hal --bench mpls_icmp` (host com outras
+  sessões compilando): ler o quadro 74 ns, ICMP pela tabela IP 0,59 µs, pelo LSP com 100 000
+  rótulos 0,82 µs.
+
+### G0.31h — `ip.route.list` de 60 000 rotas pelo canal de controle (**medido**, 2026-10-29)
+
+Daemon release no host (`--backend virtual`, 60 000 rotas /24 por `engine.batch`), cliente
+Python lendo o socket sem guardar a resposta; máquina carregada (load 25–30).
+
+| | `main` | G0.31h |
+|---|---|---|
+| RSS depois da importação | 310–312 MiB | 312–314 MiB |
+| RSS depois da 1ª lista | 680–884 MiB | 313–355 MiB (os +43 MiB, quando aparecem, são o cache das linhas, montado uma vez) |
+| Pico (`VmHWM`) depois de duas listas seguidas | 1 035 MiB | 314 MiB |
+| Pico com duas conexões ao mesmo tempo | 1 415 MiB | 314 MiB (uma recebe `busy`) |
+| Tempo da lista (33,2 MB) | 1,0–2,1 s | 0,10–0,65 s |
+
+Na imagem (`cargo xtask os build` desta branch, QEMU KVM `-m 2048`, TLS + login, 60 000 rotas
+pelo `engine.batch`, RSS do daemon pelo `system.resource.process.print` a cada 50 ms): 468 MiB
+depois da importação, 483 MiB depois de três listas seguidas e de duas ao mesmo tempo (uma
+`busy`), 38,1 MB cada em 0,09–0,12 s, o mesmo pid (sem OOM nem reinício). Antes (validação T1,
+`main`, VM do usuário de 2 GiB): 307 → 847 MiB na primeira e OOM kill na segunda.
+
+Em processo (`cargo bench -p corerouter-engine --bench scale -- ip.route.list`, `Value`
+montado das `Row`): 10 000 rotas 67,5 → 48,8 ms (−17 %, p < 0,05); 1 000 rotas 6,0 → 3,5 ms
+(sem diferença estatística).

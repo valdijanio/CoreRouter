@@ -232,7 +232,7 @@ impl Lab {
         let started = Instant::now();
         std::fs::create_dir_all(self.path("base"))
             .map_err(|e| format!("{}: {e}", self.dir.display()))?;
-        let base = self.image()?;
+        let base = cloud_image(&self.path("base"))?;
         self.keys()?;
         self.seed(&spec)?;
         let overlay = self.path(&format!("{NAME}.qcow2"));
@@ -290,50 +290,6 @@ impl Lab {
             spec.wires
         );
         Ok(())
-    }
-
-    /// The cloud image, downloaded once and checked against the published
-    /// SHA256SUMS; a mismatch is refused (and the file removed).
-    fn image(&self) -> Result<PathBuf, String> {
-        let base = self.path("base");
-        let sums = base.join("SHA256SUMS");
-        let img = base.join(IMAGE);
-        let part = base.join(format!("{IMAGE}.part"));
-        if !sums.exists() {
-            download(&format!("{IMAGE_URL}SHA256SUMS"), &sums)?;
-        }
-        let text =
-            std::fs::read_to_string(&sums).map_err(|e| format!("{}: {e}", sums.display()))?;
-        let want = text
-            .lines()
-            .find_map(|l| {
-                let (hash, file) = l.split_once(' ')?;
-                (file.trim_start_matches([' ', '*']) == IMAGE).then(|| hash.to_ascii_lowercase())
-            })
-            .ok_or_else(|| format!("{IMAGE} is not listed in {}", sums.display()))?;
-        if img.exists() {
-            if sha256_file(&img)? == want {
-                return Ok(img);
-            }
-            return Err(format!(
-                "{} does not match SHA256SUMS ({want}); remove vm/base/ to download again",
-                img.display()
-            ));
-        }
-        if !part.exists() {
-            eprintln!("vm-lab: downloading {IMAGE} (~600 MB)…");
-            download(&format!("{IMAGE_URL}{IMAGE}"), &part)?;
-        }
-        let have = sha256_file(&part)?;
-        if have != want {
-            let _ = std::fs::remove_file(&part);
-            return Err(format!(
-                "checksum mismatch for {IMAGE}: got {have}, SHA256SUMS says {want}; file removed"
-            ));
-        }
-        eprintln!("vm-lab: {IMAGE} sha256 {have} ok");
-        std::fs::rename(&part, &img).map_err(|e| format!("{}: {e}", img.display()))?;
-        Ok(img)
     }
 
     /// The lab's own client key and the VM's host key (pinned in
@@ -773,16 +729,14 @@ impl Lab {
         // The guest agent knows the address in use; the lease table may
         // also hold an older lease of the same NIC (a continuation row).
         if let Ok(out) = virsh(&["domifaddr", NAME, "--source", "agent"])
-            && let Some(ip) = mgmt_ipv4(&out)
+            && let Some(ip) = mgmt_ipv4(&out, MGMT_MAC)
         {
             return Ok(Some(ip));
         }
-        Ok(mgmt_ipv4(&virsh(&[
-            "domifaddr",
-            NAME,
-            "--source",
-            "lease",
-        ])?))
+        Ok(mgmt_ipv4(
+            &virsh(&["domifaddr", NAME, "--source", "lease"])?,
+            MGMT_MAC,
+        ))
     }
 
     fn ssh_base(&self, ip: &str) -> Command {
@@ -1697,9 +1651,51 @@ fn held_by_ancestor(lock: &Path) -> bool {
     false
 }
 
+/// The Ubuntu cloud image in `base`, downloaded once and checked against the published
+/// SHA256SUMS; a mismatch is refused (and the file removed).
+pub(crate) fn cloud_image(base: &Path) -> Result<PathBuf, String> {
+    let sums = base.join("SHA256SUMS");
+    let img = base.join(IMAGE);
+    let part = base.join(format!("{IMAGE}.part"));
+    if !sums.exists() {
+        download(&format!("{IMAGE_URL}SHA256SUMS"), &sums)?;
+    }
+    let text = std::fs::read_to_string(&sums).map_err(|e| format!("{}: {e}", sums.display()))?;
+    let want = text
+        .lines()
+        .find_map(|l| {
+            let (hash, file) = l.split_once(' ')?;
+            (file.trim_start_matches([' ', '*']) == IMAGE).then(|| hash.to_ascii_lowercase())
+        })
+        .ok_or_else(|| format!("{IMAGE} is not listed in {}", sums.display()))?;
+    if img.exists() {
+        if sha256_file(&img)? == want {
+            return Ok(img);
+        }
+        return Err(format!(
+            "{} does not match SHA256SUMS ({want}); remove that directory to download again",
+            img.display()
+        ));
+    }
+    if !part.exists() {
+        eprintln!("vm-lab: downloading {IMAGE} (~600 MB)…");
+        download(&format!("{IMAGE_URL}{IMAGE}"), &part)?;
+    }
+    let have = sha256_file(&part)?;
+    if have != want {
+        let _ = std::fs::remove_file(&part);
+        return Err(format!(
+            "checksum mismatch for {IMAGE}: got {have}, SHA256SUMS says {want}; file removed"
+        ));
+    }
+    eprintln!("vm-lab: {IMAGE} sha256 {have} ok");
+    std::fs::rename(&part, &img).map_err(|e| format!("{}: {e}", img.display()))?;
+    Ok(img)
+}
+
 /// The last IPv4 of the management NIC in a `virsh domifaddr` table, where
 /// a row whose name is `-` continues the NIC above it.
-fn mgmt_ipv4(table: &str) -> Option<String> {
+pub(crate) fn mgmt_ipv4(table: &str, mgmt_mac: &str) -> Option<String> {
     let mut mac = "";
     let mut found = None;
     for line in table.lines() {
@@ -1710,14 +1706,14 @@ fn mgmt_ipv4(table: &str) -> Option<String> {
         if *name != "-" {
             mac = m;
         }
-        if mac.eq_ignore_ascii_case(MGMT_MAC) && *proto == "ipv4" {
+        if mac.eq_ignore_ascii_case(mgmt_mac) && *proto == "ipv4" {
             found = addr.split('/').next().map(str::to_owned);
         }
     }
     found
 }
 
-fn check_snapshot_name(name: &str) -> Result<(), String> {
+pub(crate) fn check_snapshot_name(name: &str) -> Result<(), String> {
     if !name.is_empty()
         && name.len() <= 64
         && name
@@ -1745,7 +1741,7 @@ fn remote_command(args: &[String]) -> String {
     }
 }
 
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     if !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || "-_./=:,@%+".contains(c))
@@ -1764,11 +1760,11 @@ fn exit_like(status: std::process::ExitStatus) -> Result<(), String> {
     }
 }
 
-fn virsh(args: &[&str]) -> Result<String, String> {
+pub(crate) fn virsh(args: &[&str]) -> Result<String, String> {
     output(Command::new("virsh").args(["-c", URI]).args(args))
 }
 
-fn output(cmd: &mut Command) -> Result<String, String> {
+pub(crate) fn output(cmd: &mut Command) -> Result<String, String> {
     let out = cmd
         .stdin(Stdio::null())
         .output()
@@ -1788,7 +1784,7 @@ fn output(cmd: &mut Command) -> Result<String, String> {
     }
 }
 
-fn run_ok(cmd: &mut Command) -> Result<(), String> {
+pub(crate) fn run_ok(cmd: &mut Command) -> Result<(), String> {
     output(cmd).map(|_| ())
 }
 
@@ -1827,15 +1823,15 @@ pub(crate) fn sha256_file(path: &Path) -> Result<String, String> {
         .collect())
 }
 
-fn read(path: &Path) -> Result<String, String> {
+pub(crate) fn read(path: &Path) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-fn write(path: &Path, text: &str) -> Result<(), String> {
+pub(crate) fn write(path: &Path, text: &str) -> Result<(), String> {
     std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -1880,8 +1876,11 @@ mod tests {
  -          -                    ipv4         192.168.122.47/24
  wire0a     52:54:00:c0:73:00    ipv4         10.0.0.1/24
 ";
-        assert_eq!(mgmt_ipv4(table).as_deref(), Some("192.168.122.47"));
-        assert_eq!(mgmt_ipv4(" Name MAC Protocol Address\n"), None);
+        assert_eq!(
+            mgmt_ipv4(table, MGMT_MAC).as_deref(),
+            Some("192.168.122.47")
+        );
+        assert_eq!(mgmt_ipv4(" Name MAC Protocol Address\n", MGMT_MAC), None);
     }
 
     #[test]

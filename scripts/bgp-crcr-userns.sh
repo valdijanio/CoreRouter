@@ -7,7 +7,7 @@
 #   scripts/bgp-crcr-userns.sh [case…]
 # Cases (default: all, in this order):
 #   ebgp ebgp6 mpbgp md5 filters extcomm announce nexthop-self rr maxprefix
-#   restart gr bfd convergence scale
+#   restart gr hardreset cbit bfd convergence scale
 # Not in the default list: ospf-static (G3.9fe, OSPF redistributing the
 # CoreRouter's static routes).
 # SCALE_N=<n> changes the 100 000 prefixes of `scale`. Results: a table at
@@ -71,7 +71,7 @@ export LD_LIBRARY_PATH=$FRR_DIR/root/usr/lib/x86_64-linux-gnu:$FRR_DIR/root/usr/
 FRR=$FRR_DIR/root/usr/lib/frr
 bin=$CARGO_TARGET_DIR/release
 CASES=("$@")
-[ ${#CASES[@]} -gt 0 ] || CASES=(ebgp ebgp6 mpbgp md5 filters extcomm announce nexthop-self rr maxprefix restart gr bfd convergence scale)
+[ ${#CASES[@]} -gt 0 ] || CASES=(ebgp ebgp6 mpbgp md5 filters extcomm announce nexthop-self rr maxprefix restart gr hardreset cbit bfd convergence scale)
 FAILED=0
 : > "$W/results.txt"
 result() { # result <case> <OK|FAIL|INFO> <text>
@@ -588,6 +588,135 @@ case_gr() {
   [ "$gone" = kept ] && [ "$kept" = yes ] && [ "${w:-999}" -le 5 ] \
     && result gr OK "graceful restart: bgpd killed and back in ~3 s, both routes kept; $w lost pings with it, $wo without" \
     || result gr FAIL "graceful restart: $(cat "$W/gr-summary.txt" | tr '\n' ';')"
+}
+
+# G3.9fj, RFC 8538. CR1 restarts gracefully (Restart Time 20 s), hold 9 s.
+# A silent cut of link 5 (netem loss 100 %): with the N bit (FRR's default)
+# the hold expiry is graceful, so CR2 keeps CR1's route hold + Restart
+# Time; without the N bit (graceful_notification=no on CR1) only the hold
+# time; with BFD (100 ms × 3) a BFD down is a Hard Reset (Cease 10).
+# Then routing.bgp.session.clear on CR1: a Hard Reset by default (CR2
+# drops the route), graceful with hard_admin_reset=no (CR2 keeps it).
+hr_inst() { # hr_inst <extra instance json>
+  local i; i=$(cr1 routing.bgp.instance.list | jq -c --argjson x "$1" '.[0] | {name, asn, router_id, graceful_restart_time: 20} + $x')
+  cr1 routing.bgp.instance.set "$i" >/dev/null
+}
+hr_cut() { # hr_cut <label> <instance json> <connection extra json>
+  local label=$1 ms t0
+  hr_inst "$2"
+  pair_up "$(jq -c '. + {"hold_time":9,"graceful_restart":true}' <<< "$3")"
+  wait_for 60 cr_up 2 cr1 >/dev/null || { result hardreset FAIL "$label: no session"; pair_down; return; }
+  wait_for 30 k_has c2 100.64.39.0/24 >/dev/null || true
+  sleep 3
+  result hardreset INFO "$label: CR2 sees $(cr_sess 2 cr1 | jq -c '{gr_local, gr_remote, n_bit, bfd}'); health $(cr2 system.health.check | jq -c '.checks[] | select(.key == "bgp.gr-bfd") | {severity, value}')"
+  t0=$(now_ms)
+  ip netns exec c1 tc qdisc add dev ether1 root netem loss 100%
+  ms=$(wait_for 60 k_none c2 100.64.39.0/24) || ms=">60000"
+  result hardreset INFO "$label: silent cut, CR2 drops CR1's route after ${ms} ms; then $(cr_sess 2 cr1 | jq -c '{state, last_error, last_hard_reset}')"
+  ip netns exec c1 tc qdisc del dev ether1 root
+  echo "$label $ms" >> "$W/hr-summary.txt"
+  pair_down; sleep 2
+}
+hr_clear() { # hr_clear <label> <instance json>
+  local label=$1 kept
+  hr_inst "$2"
+  pair_up '{"graceful_restart":true}'
+  wait_for 60 cr_up 2 cr1 >/dev/null || { result hardreset FAIL "$label: no session"; pair_down; return; }
+  wait_for 30 k_has c2 100.64.39.0/24 >/dev/null || true
+  sleep 3
+  ip netns exec c2 ping -i 0.02 -w 8 -I 100.64.40.1 100.64.39.1 > "$W/hr-ping-$label.txt" 2>&1 &
+  local pp=$!
+  sleep 1
+  cr1 routing.bgp.session.clear '{"connection":"cr2"}' >/dev/null
+  local gone; gone=$(wait_for 2 k_none c2 100.64.39.0/24) && kept=no || kept=yes
+  result hardreset INFO "$label: right after the clear CR2 sees $(cr_sess 2 cr1 | jq -c '{state, last_error, last_hard_reset}')"
+  wait "$pp" || true
+  local rx tx; rx=$(grep -o '[0-9]* received' "$W/hr-ping-$label.txt" | grep -o '[0-9]*'); tx=$(grep -o '[0-9]* packets transmitted' "$W/hr-ping-$label.txt" | grep -o '^[0-9]*')
+  result hardreset INFO "$label: session.clear on CR1, CR2 kept CR1's route: $kept$([ "$kept" = no ] && echo " (gone ${gone} ms after)"); ping 20 ms apart: $(( ${tx:-0} - ${rx:-0} )) of ${tx:-0} lost; CR2 then $(cr_sess 2 cr1 | jq -c '{last_error, last_hard_reset}')"
+  echo "clear-$label $kept $(( ${tx:-0} - ${rx:-0} ))" >> "$W/hr-summary.txt"
+  wait_for 30 cr_up 2 cr1 >/dev/null || true
+  pair_down; sleep 2
+}
+case_hardreset() {
+  : > "$W/hr-summary.txt"
+  for n in 1 2; do cr "$n" routing.bfd.profile.add '{"name":"g39f","min_tx":100,"min_rx":100,"multiplier":3}' >/dev/null 2>&1 || true; done
+  hr_cut nbit '{"graceful_notification":true}' '{}'
+  hr_cut no-nbit '{"graceful_notification":false}' '{}'
+  hr_cut bfd '{"graceful_notification":true}' '{"bfd":"g39f"}'
+  hr_clear hard '{"graceful_notification":true,"hard_admin_reset":true}'
+  hr_clear graceful '{"graceful_notification":true,"hard_admin_reset":false}'
+  hr_inst '{"graceful_notification":true,"hard_admin_reset":true}'
+  local n nn b
+  n=$(awk '$1 == "nbit" {print $2}' "$W/hr-summary.txt"); nn=$(awk '$1 == "no-nbit" {print $2}' "$W/hr-summary.txt"); b=$(awk '$1 == "bfd" {print $2}' "$W/hr-summary.txt")
+  [[ "$n" =~ ^[0-9]+$ && "$nn" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] && [ "$n" -gt $(( nn + 10000 )) ] && [ "$b" -lt 2000 ] \
+    && result hardreset OK "silent cut: CR1's route stays ${n} ms with the N bit (hold 9 s + Restart Time 20 s), ${nn} ms without, ${b} ms with BFD" \
+    || result hardreset FAIL "silent cut: $(tr '\n' ';' < "$W/hr-summary.txt")"
+  grep -q '^clear-hard no ' "$W/hr-summary.txt" && grep -q '^clear-graceful yes ' "$W/hr-summary.txt" \
+    && result hardreset OK "session.clear: Hard Reset drops the route, hard_admin_reset=no keeps it ($(grep '^clear-' "$W/hr-summary.txt" | tr '\n' ';'))" \
+    || result hardreset FAIL "session.clear: $(grep '^clear-' "$W/hr-summary.txt" | tr '\n' ';')"
+}
+
+# G3.9fj, RFC 5882 §4.3: BFD and graceful restart. CR1 restarts
+# gracefully, both sides with BFD (100 ms × 3). CoreRouter's BFD runs in
+# corerouter-daemon (bfdd only drives it, over the distributed data plane).
+# kill -9 on CR1, all back 3 s later, ping CR2 → CR1 20 ms apart:
+#   frr:    bgpd and bfdd; BFD stays up (the daemon sends it): route kept;
+#   daemon: corerouter-daemon only; BFD down with the TCP session up, a
+#           Hard Reset (Cease 10): route gone (gap: BFD dies with the daemon);
+#   stack:  daemon, bgpd and bfdd (zebra keeps forwarding): the TCP drop
+#           comes first, and FRR 10.7.1 does not flush stale routes on a BFD
+#           down after it (`bgp_stop` touches the GR timers only while
+#           established): route kept, with or without `neighbor X bfd
+#           check-control-plane-failure` (measured, G3.9fj).
+cbit_round() { # cbit_round <label> <CR1 extra> <CR2 extra> <what to kill: stack|frr|daemon>
+  local label=$1 x1=$2 x2=$3 what=$4 gone kept
+  crc 1 "$(jq -c '. + $x' --argjson x "$x1" <<< '{"name":"cr2","remote_address":"10.39.5.2","remote_as":65002,"input_filter":"all","output_filter":"all","output_network":"bgp-out","graceful_restart":true,"bfd":"g39f"}')"
+  crc 2 "$(jq -c '. + $x' --argjson x "$x2" <<< '{"name":"cr1","remote_address":"10.39.5.1","remote_as":65000,"input_filter":"all","output_filter":"all","output_network":"bgp-out","bfd":"g39f"}')"
+  wait_for 60 cr_up 2 cr1 >/dev/null || { result cbit FAIL "$label: no session"; pair_down; return; }
+  wait_for 30 k_has c2 100.64.39.0/24 >/dev/null || true
+  wait_for 30 eval '[ "$(cr_sess 2 cr1 | jq -r .bfd)" = up ]' >/dev/null || true
+  sleep 2
+  result cbit INFO "$label: CR2 sees $(cr_sess 2 cr1 | jq -c '{gr_local, gr_remote, n_bit, bfd}')"
+  ip netns exec c2 ping -i 0.02 -w 12 -I 100.64.40.1 100.64.39.1 > "$W/cbit-ping-$label.txt" 2>&1 &
+  local pp=$!
+  sleep 1
+  case $what in
+    stack|daemon) kill -9 "$(cat "$W/daemon1.pid")" ;;
+  esac
+  case $what in
+    stack|frr) pkill -9 -f -- "frr/bgpd -N c1( |$)"; pkill -9 -f -- "frr/bfdd -N c1( |$)" ;;
+  esac
+  gone=$(wait_for 3 k_none c2 100.64.39.0/24) && kept=no || kept=yes
+  [ "$kept" = no ] && sleep 2
+  case $what in
+    stack|frr)
+      ip netns exec c1 "$FRR/bfdd" -N c1 -u root -g root -d --limit-fds 4096 -f /etc/frr/c1/bfdd.conf --dplaneaddr unix:/var/run/frr/c1/bfdd_dplane.sock </dev/null >>"$W/frr-c1.log" 2>&1
+      ip netns exec c1 "$FRR/bgpd" -N c1 -u root -g root -d --limit-fds 4096 -f /etc/frr/c1/bgpd.conf </dev/null >>"$W/frr-c1.log" 2>&1 ;;
+  esac
+  case $what in
+    # The profile is lost across a daemon restart (bug found here, G3.9fj
+    # notes): add it again.
+    stack|daemon) start_daemon 1; cr 1 routing.bfd.profile.add '{"name":"g39f","min_tx":100,"min_rx":100,"multiplier":3}' >/dev/null 2>&1 || true ;;
+  esac
+  wait "$pp" || true
+  local rx tx; rx=$(grep -o '[0-9]* received' "$W/cbit-ping-$label.txt" | grep -o '[0-9]*'); tx=$(grep -o '[0-9]* packets transmitted' "$W/cbit-ping-$label.txt" | grep -o '^[0-9]*')
+  local up; up=$(wait_for 60 cr_up 2 cr1) || up=-1
+  wait_for 30 eval '[ "$(cr_sess 2 cr1 | jq -r .bfd)" = up ]' >/dev/null || true
+  result cbit INFO "$label: kill -9 of $what; CR2 kept CR1's route: $kept$([ "$kept" = no ] && echo " (gone ${gone} ms after the kill)"); ping 20 ms apart: $(( ${tx:-0} - ${rx:-0} )) of ${tx:-0} lost; session up again ${up} ms after the ping ended, BFD $(cr_sess 2 cr1 | jq -r .bfd)"
+  echo "$label $kept $(( ${tx:-0} - ${rx:-0} ))" >> "$W/cbit-summary.txt"
+  pair_down; sleep 3
+}
+case_cbit() {
+  : > "$W/cbit-summary.txt"
+  for n in 1 2; do cr "$n" routing.bfd.profile.add '{"name":"g39f","min_tx":100,"min_rx":100,"multiplier":3}' >/dev/null 2>&1 || true; done
+  cbit_round frr '{}' '{}' frr
+  cbit_round daemon '{}' '{}' daemon
+  cbit_round stack '{}' '{}' stack
+  local s; s=$(tr '\n' ';' < "$W/cbit-summary.txt")
+  grep -q '^frr yes ' "$W/cbit-summary.txt" && grep -q '^stack yes ' "$W/cbit-summary.txt" \
+    && result cbit OK "BFD + graceful restart: CR1's route kept with bgpd+bfdd or the whole stack killed ($s)" \
+    || result cbit FAIL "BFD + graceful restart: $s"
+  grep -q '^daemon no ' "$W/cbit-summary.txt" && result cbit INFO "known gap: corerouter-daemon alone killed takes BFD down and the routes with it ($s)"
 }
 
 case_restart() {
