@@ -1171,11 +1171,10 @@ fn dialog_body(
         };
         toggle_label = Some(if i.disabled { "Enable" } else { "Disable" });
         iface_tabs::tab_bar(ui, &mut p.tab, nic.get(&p.name));
-        let view = nic.get_mut(&p.name);
-        let view = view.map(|v| {
+        if let Some(v) = nic.get_mut(&p.name) {
             v.unmanaged = i.unmanaged.clone();
-            v
-        });
+        }
+        let view = nic.get_mut(&p.name);
         iface_tabs::body(ui, p.tab, view, can, help, |ui, view, help| {
             // A fixed label column: the fields do not move while the
             // window settles (or when the MAC rows arrive).
