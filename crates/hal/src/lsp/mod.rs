@@ -125,6 +125,10 @@ pub trait LspResponderIo: Send {
     /// Also hear labeled packets that may not fit their way out
     /// ([`Frame::TooBig`], G3.9da). Off by default.
     fn hear_too_big(&mut self, _on: bool) {}
+    /// How frames are heard (for the counters): e.g. `tc`, `packet (why)`.
+    fn tap(&self) -> String {
+        String::new()
+    }
     /// The next request or expired packet, waiting at most `wait`.
     fn recv(&mut self, wait: Duration) -> Result<Option<Frame>, HalError>;
     /// Send one reply.
