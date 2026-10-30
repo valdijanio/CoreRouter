@@ -114,6 +114,21 @@ fn lab(name: &str) -> Lab {
     Lab { dir, p, key }
 }
 
+/// Writes the configuration as the storage does: a new file renamed over
+/// the old one (the snapshot links it, G1.6u).
+fn save(config: &Path, text: &str) {
+    std::fs::write(config.join("running.json.tmp"), text).unwrap();
+    std::fs::rename(config.join("running.json.tmp"), config.join("running.json")).unwrap();
+}
+
+/// The status without what moves on its own (free bytes of `/config`).
+fn fixed(mut v: serde_json::Value) -> serde_json::Value {
+    if let Some(o) = v.as_object_mut() {
+        o.remove("config_space");
+    }
+    v
+}
+
 fn st(p: &Platform) -> State {
     State::load(&p.state_dir()).0
 }
@@ -186,11 +201,7 @@ fn unconfirmed_trial_rolls_back_with_the_configuration() {
     l.p.lab_reboot().unwrap();
     // The trial slot rewrites the configuration, then never confirms: the
     // deadline (init) reboots, and the firmware boots BootOrder = A.
-    std::fs::write(
-        l.p.config.join("running.json"),
-        r#"{"format_version":2,"v":"b"}"#,
-    )
-    .unwrap();
+    save(&l.p.config, r#"{"format_version":2,"v":"b"}"#);
     let (boot, log) = l.p.lab_reboot().unwrap();
     assert_eq!(boot, Boot::Normal);
     assert_eq!(l.p.running(), Some(SlotId::A));
@@ -211,12 +222,12 @@ fn bad_packages_are_refused_before_anything_changes() {
     let l = lab("bad");
     let other = package::generate_key().unwrap();
     let foreign = package(&l.dir, &other, "1.1", 20, 2, 1);
-    let before = l.p.status(&st(&l.p));
+    let before = fixed(l.p.status(&st(&l.p)));
     let e =
         l.p.install(&foreign, false, &opts(Reason::Update), &mut |_, _| {})
             .unwrap_err();
     assert!(e.contains("does not trust"), "{e}");
-    assert_eq!(l.p.status(&st(&l.p)), before);
+    assert_eq!(fixed(l.p.status(&st(&l.p))), before);
     // Signed, but the payload was changed after signing.
     let good = package(&l.dir, &l.key, "1.2", 30, 4, 1);
     let mut bytes = std::fs::read(&good).unwrap();
@@ -288,11 +299,7 @@ fn downgrade_back_to_the_previous_slot_takes_its_configuration() {
     l.p.lab_reboot().unwrap();
     l.p.confirm(200, "ok").unwrap();
     // 2.0 migrated the configuration to format 2.
-    std::fs::write(
-        l.p.config.join("running.json"),
-        r#"{"format_version":2,"v":"b"}"#,
-    )
-    .unwrap();
+    save(&l.p.config, r#"{"format_version":2,"v":"b"}"#);
     let mut o = opts(Reason::Downgrade);
     o.config_format = 2;
     let rep = l.p.switch_back(&o).unwrap();

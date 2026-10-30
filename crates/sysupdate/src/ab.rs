@@ -26,6 +26,21 @@ use crate::package::{self, Header, Key, Manifest};
 use crate::state::{self, Confirm, Outcome, Reason, State, Trial};
 use crate::{SlotCmdline, SlotId, cmdline_value, verity};
 
+/// Rows of `config_space.usage` in the status.
+pub const CONFIG_USAGE_ROWS: usize = 8;
+
+/// G1.6u: room in `/config` — free bytes, what the next snapshot needs,
+/// and what takes room (biggest first, at most [`CONFIG_USAGE_ROWS`]).
+fn config_space(config: &Path, usage: Vec<state::Use>) -> Value {
+    let rows = usage.len();
+    json!({
+        "free": state::free_bytes(config),
+        "snapshot_need": state::snapshot_need(config).ok(),
+        "usage": usage.into_iter().take(CONFIG_USAGE_ROWS).collect::<Vec<_>>(),
+        "usage_rows": rows,
+    })
+}
+
 /// A slot's partition.
 #[derive(Debug, Clone)]
 pub struct SlotDev {
@@ -432,15 +447,27 @@ impl Platform {
                 })
             })
             .collect();
+        let usage = state::usage(&self.config);
         let snapshots: Vec<Value> = SlotId::ALL
             .into_iter()
             .filter_map(|s| {
                 let (name, _) = state::snapshot_dir(&self.config, s);
                 let m = state::snapshot_meta(&self.config, &name)?;
+                let own = usage
+                    .iter()
+                    .find(|u| u.path == format!("{}/{name}", state::DIR))
+                    .map_or(0, |u| u.bytes);
                 Some(json!({"name": name, "slot": s.as_str(), "version": m.version,
-                    "format_version": m.format_version, "at_unix": m.at_unix, "files": m.files, "bytes": m.bytes}))
+                    "format_version": m.format_version, "at_unix": m.at_unix, "files": m.files, "bytes": m.bytes,
+                    "own_bytes": own}))
             })
             .collect();
+        let partials: Vec<Value> = usage
+            .iter()
+            .filter(|u| u.kind == "partial")
+            .map(|u| json!({"name": u.path.trim_start_matches(&format!("{}/", state::DIR)), "own_bytes": u.bytes}))
+            .collect();
+        let config_space = config_space(&self.config, usage);
         json!({
             "supported": true,
             "lab": self.lab.is_some(),
@@ -452,14 +479,39 @@ impl Platform {
                 "slot": t.slot.as_str(), "from": t.from.as_str(), "version": t.version,
                 "reason": t.reason, "confirm": t.confirm, "timeout_s": t.timeout_s,
                 "started_unix": t.started_unix, "booted": t.booted, "mgmt": t.mgmt, "stats": t.stats,
+                "config_backup": t.config_backup, "config_swap": t.config_swap,
             })),
             "last": st.last.as_ref().map(|o| json!({
                 "result": o.result, "slot": o.slot.as_str(), "version": o.version,
                 "at_unix": o.at_unix, "detail": o.detail, "stats": o.stats,
             })),
             "snapshots": snapshots,
+            "partials": partials,
+            "config_space": config_space,
             "keys": self.keys.iter().map(Key::id_hex).collect::<Vec<_>>(),
         })
+    }
+
+    /// The snapshots a trial in progress needs (never removed).
+    fn protected_snapshots(&self) -> Vec<String> {
+        let (st, _) = State::load(&self.state_dir());
+        st.trial
+            .map(|t| t.config_backup.into_iter().chain(t.config_swap).collect())
+            .unwrap_or_default()
+    }
+
+    /// `system.package.snapshot.remove` (G1.6u): see [`state::remove`].
+    pub fn remove_snapshots(
+        &self,
+        names: &[String],
+        all: bool,
+        dry_run: bool,
+    ) -> Result<Value, String> {
+        let protected = self.protected_snapshots();
+        let r = state::remove(&self.config, names, all, &protected, dry_run)?;
+        let freed: u64 = r.iter().filter(|x| x.kept.is_none()).map(|x| x.bytes).sum();
+        Ok(json!({"dry_run": dry_run, "snapshots": r, "freed": freed,
+            "free": state::free_bytes(&self.config)}))
     }
 
     /// Makes sure each slot holding a signed image has its boot entry and
@@ -646,6 +698,9 @@ impl Platform {
         } else {
             None
         };
+        // G1.6u: the snapshot is the last step; a /config without room
+        // for it is refused before the slot is touched.
+        state::check_space(&self.config)?;
         let dev = self.dev(target)?.clone();
         if m.rootfs.size > dev.size {
             return Err(format!(
@@ -867,6 +922,7 @@ impl Platform {
         let same = self
             .header(target)
             .is_some_and(|(t, v)| v.is_ok() && t.bytes == h.bytes);
+        state::check_space(&self.config)?;
         if !same {
             let dev_from = self.dev(running)?.clone();
             let dev_to = self.dev(target)?.clone();

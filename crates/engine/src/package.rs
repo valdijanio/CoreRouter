@@ -49,6 +49,9 @@ pub enum JobKind {
     },
     /// A package the router fetches itself over HTTP(S) (G1.6e, like
     /// RouterOS `/system package update install`): streamed to the slot.
+    /// Remove these configuration snapshots (G1.6u; the command picked
+    /// them, the service checks the trial again).
+    SnapshotRemove { names: Vec<String> },
     Download {
         url: String,
         /// Check the server's certificate (`ssl-verify`); the package is
@@ -73,6 +76,7 @@ impl JobKind {
             JobKind::Upload { .. } => "upload",
             JobKind::Download { check: true, .. } => "download-check",
             JobKind::Download { .. } => "download",
+            JobKind::SnapshotRemove { .. } => "snapshot-remove",
         }
     }
 

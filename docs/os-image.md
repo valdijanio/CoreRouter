@@ -456,10 +456,22 @@ Scrub) e **System › Tuning › Boot** (o que cada slot carrega, "Apply on slot
 - **Prazo.** O `corerouter-init` sabe que é um teste (estado em `/config/package/state.json` +
   slot em uso pela `corerouter.slot=` + `BootOrder`) e reinicia se não houver confirmação em
   `timeout` s (30–3600, padrão 300) contados do início do boot.
-- **A configuração volta junto.** Antes de trocar de slot, o `/config` inteiro (com o
-  `format_version`) é copiado para `/config/package/config-<slot>/`. No boot de volta depois de
+- **A configuração volta junto.** Antes de trocar de slot, o `/config` (com o
+  `format_version`) vai para `/config/package/config-<slot>/`. No boot de volta depois de
   um teste que falhou, o init restaura a cópia **antes** do daemon ler a config; um downgrade
   boota a cópia que aquele slot rodou por último (se ele lê o formato).
+- **O snapshot cabe no `/config` (G1.6u).** O que o armazenamento só troca por rename
+  (`running.json`, `running.json.prev`, `rev-*.json`, `state-*.json`) entra por **hard link**
+  (custo zero; o snapshot guarda o conteúdo antigo depois do próximo save); o resto (o journal,
+  que cresce no lugar, chaves) é copiado; `graphs/` (histórico de tráfego) fica fora do snapshot
+  e o restore não o apaga. Antes de gravar o slot, a atualização confere se o `/config` tem o
+  que a cópia precisa mais 1 MiB e recusa com os números e os maiores itens; uma cópia que falha
+  mesmo assim é apagada. Na VM de teste (`/config` de 56 MB, uma revisão de 10,7 MB no
+  histórico) o snapshot passou de 13,8 MB para ~1 kB. `system.package.print` traz
+  `config_space` (livre, o que o próximo snapshot precisa, o que ocupa), o `own_bytes` de cada
+  snapshot e as cópias parciais (`partials`). `system.package.snapshot.remove {name?, all?,
+  dry_run?}` apaga snapshots e cópias parciais de longe (sem nome: só as parciais; nunca o de
+  um teste em andamento), e a saúde do disco do `/config` diz qual apagar.
 - **O slot em uso nunca é escrito**, e o slot alvo sai do `BootOrder` e perde o cabeçalho
   antes de ser gravado: meio gravado, ele não é volta de ninguém. A ordem dos passos está no
   topo de `crates/sysupdate/src/ab.rs`.

@@ -332,6 +332,7 @@ impl Svc {
                 }
                 return Ok(v);
             }
+            JobKind::SnapshotRemove { names } => return p.remove_snapshots(names, false, false),
             JobKind::Scrub { slot } => {
                 let s = SlotId::parse(slot).ok_or("slot must be a or b")?;
                 return p.scrub(s, threads);

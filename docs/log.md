@@ -9053,3 +9053,130 @@ continuação indentadas).
   foi recusado porque o `/config` da VM (56 MB) não tem espaço para o snapshot da configuração (G1.6u,
   abaixo). O reset de porta com uma imagem que tem a G1.6n voltou como `ether4` na medição da G1.29c
   (3,54 s, **medido** em 2026-10-29).
+
+- 2026-10-30 — G1.3d: Drift, parte 4: porta que volta mais rápido que o poll. Uma porta apagada e recriada com o mesmo
+  nome entre dois polls de 1 s (replug rápido, reset de driver de placa USB) voltava sem endereço,
+  MTU, VLANs nem rotas, e nada acusava: o poll via o mesmo nome nas duas vezes.
+
+  - `hal-linux`: o `LinuxHal` guarda o `ifindex` de cada porta física reivindicada quando ela recebe
+    a config (no `apply` que fez o dump) e o confere em todo `poll`. Índice novo para o mesmo nome =
+    link novo, sem nada: a porta vai para o conjunto de ausentes da G1.3b e o `absent_tick` do
+    engine reaplica a config em vigor. O kernel nunca repete um índice (`dev_index_reserve` em
+    `net/core/dev.c` aloca com `xa_alloc_cyclic` até 2³¹), então não há falso positivo; o `apply`
+    não recria porta física (VLAN, bridge e bond ficam de fora da conferência).
+  - `hal-linux::link_events` (novo): socket em `RTNLGRP_LINK`, leitura não bloqueante e parser
+    próprio dos nomes de link (`IFLA_IFNAME`) com proptest; `ENOBUFS` ou mais de 4096 nomes viram
+    "olhe tudo".
+  - daemon, serviço `link-events` (novo, só com `--backend linux`): lê os eventos sem lock, junta a
+    rajada por 50 ms e chama `Session::link_events` uma vez; o engine só faz o poll (links, tempos
+    de link, `absent_tick`) se um dos nomes é porta física da config, então VLANs e bridges que um
+    commit cria não custam nada. Eventos perdidos: poll incondicional e erro na linha do serviço em
+    `system.service.print`. O poll de 1 s continua como rede de segurança.
+  - engine: a porta que volta sem ter sido vista ausente ganha a linha própria no log,
+    "ether4: port was replugged (gone and back within a second); its configuration was applied
+    again" (a que foi vista ausente segue com "port is back").
+
+  Como testar: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
+  corerouter-hal-linux --test netns_replug` (a porta recriada antes do poll volta com endereço e
+  MTU; o socket de eventos dá o nome dela) e `… cargo test -p corerouter-daemon --test netns_replug`
+  (daemon `--backend linux`, `ether2` apagada e recriada três vezes: endereço de volta em ≤36 ms e
+  a linha no log); `cargo test -p corerouter-engine --lib port_absent` (laboratório virtual: replug
+  entre polls, `link_events` só olha para porta da config); `cargo test -p corerouter-hal-linux
+  --lib link_events` (parser e proptest).
+
+  Desempenho e paralelismo (**medido**, 2026-10-30, namespace com dummies, 32 núcleos): o poll
+  completo custa 312 µs com 11 links, 2,18 ms com 101 e 27,3 ms com 1001 (build release); a
+  conferência do `ifindex` é uma busca num mapa por porta reivindicada, dentro de um dump que o poll
+  já fazia. Um evento de link é uma mensagem de 0,7–1,5 KB, já na fila quando o `ip` retorna; drenar
+  custa 3,4 µs; parado, 0 eventos por segundo. Uma thread só basta: o kernel serializa os eventos
+  num socket, e o trabalho é o poll do engine, sob o lock do `Session` como o do relógio; uma
+  rajada (commit com mil VLANs) toma o lock uma vez por janela de 50 ms.
+
+- 2026-10-30 — G1.3e: Gerência sobe mesmo com o `apply` do boot falhando. Achado reproduzido em teste
+  (`boot_partial.rs`, antes da mudança): uma regra de firewall recusada pelo kernel deixava
+  **nenhum** endereço aplicado (o `hal-linux` aplica o nftables antes do plano netlink e desfaz
+  tudo na recusa) e o retry reaplicava a config inteira do zero a cada segundo (11 applies em
+  10 s, **medido**); todo commit falhava junto, e o erro só aparecia em `state.inspect`.
+
+  - engine (`boot_apply.rs`, novo): no boot, a config inteira num `apply` (caso normal, nada a
+    mais). Recusada: o núcleo (interfaces, endereços e o que nenhuma seção leva), depois cada
+    seção por cima do que já subiu, na ordem do `hal-linux`: `ethernet` (velocidade/duplex),
+    `routes`, `firewall` (filter/nat/mangle/raw, listas, listas de interface, avisos ao
+    assinante), `cgnat`, `fastpath`, `tuning`, `xdp`, `arp`, `mpls`. A seção recusada fica de
+    fora com o erro do kernel; `core` quer dizer que nem o núcleo entrou (como antes: tudo
+    fora). Seção inteira, não item: a regra ou rota culpada não é isolada (G1.3g).
+  - Retry com espera crescente (1, 2, 4… 60 s) só do que ficou de fora, um `apply` por seção; o
+    log repete o que está de fora quando muda e a cada 10 min. A seção volta sozinha quando o
+    kernel a aceita.
+  - Commit: parte do que o plano de dados tem de fato (não mais do zero). A seção recusada que o
+    commit não toca fica de fora dos dois lados (como a porta ausente do G1.3b); a que ele toca
+    entra, tudo ou nada como qualquer commit. Safe Mode e transações não mudam: aplicação
+    parcial só no boot e no retry.
+  - Visibilidade: saúde `boot.apply` (erro, com seção e motivo); `state.inspect` →
+    `storage.boot_apply_failed` (`[{section, error}]`, além do `boot_apply_error` de sempre);
+    `auth.whoami` → `boot_errors`, que a CLI e o MCP mostram como aviso no login e na descrição
+    do backend; GUI: selo vermelho "boot: <seções>" na barra de cima, com o motivo no hover e ⓘ
+    (pt/en).
+  - Caminhos laterais de `apply` (cliente DHCP, PPPoE, porta que volta) seguem calculando do
+    `running`, sem a máscara: com a seção `mpls` de fora, uma mudança de interface reaplica os
+    sysctls do MPLS e pode falhar, como já falhava antes (G1.3g).
+  - Risco aceito (escolha do usuário): firewall recusado sai inteiro e o roteador fica sem
+    filtro até a correção; por isso o erro vermelho em todo lugar. Por regra com trava de
+    gerência: G1.3g; firewall mínimo fechado: G1.3h.
+
+  Como testar: `cargo test -p corerouter-engine --test it boot_partial` (sucesso em um `apply`;
+  firewall, rota e MPLS recusados com a gerência no ar; várias seções; backoff; volta sozinha;
+  commit em outra parte e commit na seção recusada); `cargo test -p corerouter-ui --lib
+  boot_warning`; kernel real: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net --
+  cargo test -p corerouter-daemon --test netns_boot_partial` (daemon reiniciado com outra rota
+  no mesmo prefixo e métrica, que o CoreRouter não substitui: `10.13.0.1/24` sobe, a rota fica
+  de fora com `boot.apply`=`routes`, firewall aplicado, commit em outra parte funciona; tirada a
+  rota estranha, a nossa entra no retry e o erro some; 3,5 s, **medido**). Print em
+  `docs/changes/G1.3e-screenshots/top-bar-boot.png`.
+
+  Desempenho e paralelismo: boot sem erro = um `apply`, como antes. Com seção recusada, o boot
+  faz 1 + 1 + (seções presentes) applies, uma vez; o retry passa de um `apply` da config inteira
+  por segundo (O(n)/s com milhares de regras ou rotas) para um `apply` só da seção de fora a
+  cada 1…60 s. Um commit com boot pendente copia a config uma vez (só nesse estado). Nada a
+  dividir em threads: os applies são sequenciais por dependência (rotas precisam dos endereços,
+  firewall e MPLS das interfaces) e o kernel serializa o netlink de qualquer forma.
+
+- 2026-10-30 — G1.29g: Reset USB de porta fora da configuração (G1.29g). A aba Hardware mostrava os botões Down/Up,
+  Restart Driver e Reset USB Port de um adaptador USB que não está na configuração (o `eth0` da VM
+  `corerouter-teste`, que voltou de um reset com o nome do kernel), e o `interface.usb.reset`
+  recusava com "no interface 'eth0'". Escolha do usuário: o roteador não mexe no que não gerencia
+  (como o `refuse_unmanaged`). Numa porta fora da configuração os três botões e a chave do vigia
+  ficam desligados, com o motivo no hover; uma linha âmbar diz por quê ("Not in the configuration
+  (appeared after boot)"), com ⓘ em português, e o botão **Adopt** manda
+  `interface.ethernet.adopt` (G1.6t). Num daemon sem esse comando, o Adopt fica desligado com o
+  motivo do `Avail` ("its daemon is an older build").
+
+  Como testar: `cargo test -p corerouter-ui --lib usb_nic`
+  (`a_port_outside_the_configuration_offers_adopt_not_reset`). Na tela: Interfaces › `eth0` (fora
+  da configuração) › Hardware; print em `docs/changes/G1.29g-screenshots/` (GUI desta branch
+  ligada à VM de teste, só leitura).
+
+- 2026-10-30 — G1.6u: `/config` cheio na atualização (G1.6u). Na VM `corerouter-teste` (56 MB) o snapshot da
+  configuração copiava 13,8 MB, dos quais 10,7 MB eram uma só revisão do histórico (`rev-81.json`,
+  a rodada de validação com ~10 mil rotas) e 3,7 MB os gráficos; com `config-a` e `config-b` o
+  disco encheu, a cópia parcial `config-a.new` ficou e nenhum comando a apagava.
+
+  - **Hard links:** o que o `storage-fs` só troca por rename (`running.json*`, `rev-*.json`,
+    `state-*.json`) entra no snapshot por link; o journal e as chaves são copiados. O snapshot da
+    VM cai de 13,8 MB para ~1 kB (**medido** no teste `config_full` com a mesma forma).
+  - **`graphs/` fora** do snapshot e do restore: histórico de tráfego não é configuração, e voltar
+    apagaria as horas do teste.
+  - **Espaço antes:** `install`/`upload`/`download` e o Tuning › Boot conferem o `/config`
+    (`statvfs`) antes de tocar no slot e recusam com "needs X and Y is free (biggest: …)"; uma
+    cópia que falha mesmo assim é apagada.
+  - **De longe:** `system.package.snapshot.remove {name?, all?, dry_run?}` (sem nome: só as cópias
+    parciais; `all`: os snapshots também; nunca o backup ou a troca de um teste em andamento, que a
+    sessão confere no plano e o serviço de novo antes de apagar). `system.package.print` traz
+    `config_space` (livre, necessário, o que ocupa), `own_bytes` por snapshot e `partials`. A
+    saúde do disco, quando o pior é o `/config`, lista os snapshots com o tamanho e o comando.
+
+  Como testar: `cargo test -p corerouter-sysupdate --test config_full` (três casos num tmpfs de
+  3 MiB num mount namespace sem root: a história grande cabe linkada; sem espaço é recusado antes
+  de gravar o slot; um `/config` a 0 byte livre com `config-a.new` se recupera por
+  `remove_snapshots` e a atualização passa). Na VM: `system.package.snapshot.remove
+  {all: true, dry_run: true}`, depois `{name: "config-a.new"}`.

@@ -2928,3 +2928,12 @@ lote netlink (50 000 regras = 24 MiB num lote, que só um root com `SO_SNDBUFFOR
   `hal-linux/benches/netns_mpls_ttl.rs`, MPLS de 64 octetos, duas rodadas de 15 s por caso):
   sem taps 1,715–2,039 Melem/s (início e fim de cada rodada); taps `AF_PACKET` 1,476 e 1,462;
   tap tc (G3.9db) 1,844 e 1,986 — dentro da faixa do "sem taps", os sockets abaixo dela.
+
+- 2026-10-30 — G1.3d (**medido**, build release, namespace com dummies, 32 núcleos): `LinuxHal::poll` completo 312 µs (11 links), 2,18 ms (101), 27,3 ms (1001), mediana de 30; eventos `RTNLGRP_LINK`: 1 mensagem por del (672 B) e por add (1484 B), drenar 3,4 µs, 0 por segundo parado; replug → endereço de volta no daemon (build debug) ≤36 ms.
+
+- 2026-10-30, G1.6u, **medido** (máquina de desenvolvimento compartilhada, build release,
+  `/tmp` ext4, criterion `config_snapshot`): snapshot do `/config` da VM de teste (revisão de
+  10,7 MB, 60 pequenas, 3,7 MB de gráficos): cópia inteira de antes 51–126 ms (mediana 88 ms),
+  linkado 16–65 ms (mediana 38 ms); o fsync domina e a máquina variou muito. A varredura do
+  `/config` que o status faz a cada 2 s: 82 µs na forma da VM, 3,7 ms com 4096 séries de
+  gráfico (o máximo).

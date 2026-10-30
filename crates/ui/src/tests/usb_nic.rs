@@ -125,3 +125,44 @@ fn the_watchdog_switch_turns_it_off_for_the_adapter() {
     assert!(!wd.port(&"ether6".parse().unwrap()).enabled);
     assert!(h.has_text_containing("disabled · 0 stall(s)"));
 }
+
+/// G1.29g: a USB adapter outside the configuration (one that came back
+/// with the kernel's name): the recovery buttons are off with the reason,
+/// and "Adopt" sends `interface.ethernet.adopt`.
+#[test]
+fn a_port_outside_the_configuration_offers_adopt_not_reset() {
+    let mut h = Harness::new();
+    h.wait(1.1);
+    h.app.open_props("ether6");
+    h.wait(0.2);
+    h.tab("Hardware");
+    assert!(h.has_text("Restart Driver"));
+    assert!(!h.has_text("Adopt"), "a managed port has no Adopt");
+    // What interface.list says of a port the configuration does not have.
+    let unmanage = |h: &mut Harness| {
+        for row in h.app.cache.interfaces.iter_mut() {
+            if row["name"] == "ether6" {
+                row["managed"] = json!(false);
+                row["unmanaged_reason"] = json!("not in the configuration (appeared after boot)");
+            }
+        }
+    };
+    unmanage(&mut h);
+    h.idle();
+    assert!(h.has_text("Not in the configuration (appeared after boot)"));
+    assert!(h.has_text("Adopt"));
+    // The buttons are off: a click asks nothing.
+    let at = h.find_text("Restart Driver").unwrap();
+    h.click(at);
+    unmanage(&mut h);
+    h.idle();
+    assert!(!h.has_text_containing("Restart Driver? The driver lets go"), "disabled");
+    let at = h.find_text("Adopt").unwrap();
+    h.click(at);
+    h.wait(0.5);
+    assert!(
+        h.app.log().iter().any(|l| l.command == "interface.ethernet.adopt"),
+        "{:?}",
+        h.app.log().iter().map(|l| &l.command).collect::<Vec<_>>()
+    );
+}
