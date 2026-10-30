@@ -174,8 +174,8 @@ impl Remote {
                 .take(16)
                 .map(|f| {
                     let field = |k| f.get(k).and_then(Value::as_str).unwrap_or("");
-                    match f.get("rule").and_then(Value::as_str) {
-                        Some(rule) => format!("{} {rule}: {}", field("section"), field("error")),
+                    match f.get("item").and_then(Value::as_str) {
+                        Some(item) => format!("{} {item}: {}", field("section"), field("error")),
                         None => format!("{}: {}", field("section"), field("error")),
                     }
                 })

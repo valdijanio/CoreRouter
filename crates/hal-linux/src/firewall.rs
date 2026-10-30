@@ -191,7 +191,7 @@ pub const SCRATCH: &str = "corerouter-check";
 /// of the replay, so every rule after it is refused too: only the
 /// **first** refusal is certain; the caller takes it out and checks
 /// again.
-pub fn check(cfg: &Config) -> Result<Vec<corerouter_hal::RefusedRule>, HalError> {
+pub fn check(cfg: &Config) -> Result<Vec<corerouter_hal::RefusedItem>, HalError> {
     let Some(mut t) = fwnft::program(cfg, &[]) else {
         return Ok(Vec::new());
     };
@@ -225,7 +225,7 @@ pub fn check(cfg: &Config) -> Result<Vec<corerouter_hal::RefusedRule>, HalError>
         .and_then(|c| c.strip_prefix("cr:"))
         .and_then(|c| c.parse().ok());
     match id {
-        Some(id) => Ok(vec![corerouter_hal::RefusedRule { id, reason: why }]),
+        Some(id) => Ok(vec![corerouter_hal::RefusedItem { id, reason: why }]),
         None => Err(HalError::Rejected(format!(
             "nftables refused message {} of the firewall, which is no rule's ({why})",
             seq.wrapping_sub(lookup.seqs.start)

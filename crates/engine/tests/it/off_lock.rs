@@ -153,6 +153,8 @@ fn a_streamed_list_is_the_json_of_its_rows() {
         "id",
         "immediate_gw",
         "interface",
+        "invalid",
+        "invalid_reason",
         "key",
         "notice",
         "origin",

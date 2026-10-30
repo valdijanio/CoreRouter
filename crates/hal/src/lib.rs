@@ -64,9 +64,10 @@ pub enum HalError {
     Io(String),
 }
 
-/// A firewall rule the data plane would refuse ([`Hal::check_firewall`]).
+/// A firewall rule ([`Hal::check_firewall`]) or a static route
+/// ([`Hal::apply_routes_each`]) the data plane refuses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct RefusedRule {
+pub struct RefusedItem {
     pub id: corerouter_model::ItemId,
     pub reason: String,
 }
@@ -206,11 +207,26 @@ pub trait Hal: Send {
     /// out and checks again. `Err(Rejected)`: refused
     /// without naming a rule. The default cannot check (`Unsupported`):
     /// the boot then leaves a refused firewall out whole (G1.3e).
-    fn check_firewall(&mut self, to: &Config) -> Result<Vec<RefusedRule>, HalError> {
+    fn check_firewall(&mut self, to: &Config) -> Result<Vec<RefusedItem>, HalError> {
         let _ = to;
         Err(HalError::Unsupported(
             "checking a firewall without loading it".into(),
         ))
+    }
+
+    /// G1.3g: add the static routes `to` has and `from` lacks one at a
+    /// time, keeping each one the kernel takes (no undo): the boot's
+    /// `routes` section, since routes have no dry run. Only when nothing
+    /// but added routes separates the two; `Ok`: the routes refused, by
+    /// id, with the kernel's reason. The default cannot
+    /// (`Unsupported`): the caller applies the section whole.
+    fn apply_routes_each(
+        &mut self,
+        from: &Config,
+        to: &Config,
+    ) -> Result<Vec<RefusedItem>, HalError> {
+        let _ = (from, to);
+        Err(HalError::Unsupported("adding routes one at a time".into()))
     }
 
     /// Sample live link state/counters.

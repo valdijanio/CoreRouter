@@ -26,7 +26,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use corerouter_hal::{Hal, HalError, RefusedRule};
+use corerouter_hal::{Hal, HalError, RefusedItem};
 use corerouter_model::ItemId;
 use corerouter_model::config::Config;
 use corerouter_model::firewall::Table;
@@ -138,9 +138,10 @@ fn section(name: &str) -> Option<&'static Section> {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BootFailure {
     pub section: &'static str,
-    /// G1.3g: only this rule of the section is out (the rest is in).
+    /// G1.3g: only this item of the section (a firewall rule, a static
+    /// route) is out; the rest is in.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rule: Option<ItemId>,
+    pub item: Option<ItemId>,
     pub error: String,
 }
 
@@ -148,14 +149,14 @@ impl BootFailure {
     fn whole(section: &'static str, error: String) -> Self {
         Self {
             section,
-            rule: None,
+            item: None,
             error,
         }
     }
 
-    /// `firewall`, or `firewall *5` for one rule.
+    /// `firewall`, or `firewall *5` for one rule (`routes *3`: a route).
     pub fn label(&self) -> String {
-        match self.rule {
+        match self.item {
             Some(id) => format!("{} {id}", self.section),
             None => self.section.to_owned(),
         }
@@ -170,7 +171,7 @@ const MAX_CHECKS: usize = 64;
 /// What [`isolate_firewall`] found.
 enum Isolated {
     /// The firewall without these rules loads and keeps management.
-    Rules(Box<Config>, Vec<RefusedRule>),
+    Rules(Box<Config>, Vec<RefusedItem>),
     /// The firewall stays out whole, for this reason.
     Whole(String),
 }
@@ -245,7 +246,7 @@ fn bisect(hal: &mut dyn Hal, cfg: &Config, checks: &mut usize) -> Option<ItemId>
 /// still lets management in.
 fn isolate_firewall(hal: &mut dyn Hal, next: &Config, why: &str, env: &BootEnv) -> Isolated {
     let mut out = next.clone();
-    let mut left: Vec<RefusedRule> = Vec::new();
+    let mut left: Vec<RefusedItem> = Vec::new();
     let mut checks = 0usize;
     loop {
         if checks >= MAX_CHECKS || left.len() >= MAX_RULES_OUT {
@@ -261,7 +262,7 @@ fn isolate_firewall(hal: &mut dyn Hal, next: &Config, why: &str, env: &BootEnv) 
                 None => break,
             },
             Err(HalError::Rejected(e)) => match bisect(hal, &out, &mut checks) {
-                Some(id) => RefusedRule { id, reason: e },
+                Some(id) => RefusedItem { id, reason: e },
                 None => return Isolated::Whole(why.to_owned()),
             },
             // No check on this backend: as G1.3e, the whole section.
@@ -308,7 +309,7 @@ const MAX_SOURCES: usize = 64;
 fn management_cut(
     intended: &Config,
     reduced: &Config,
-    left: &[RefusedRule],
+    left: &[RefusedItem],
     env: &BootEnv,
 ) -> Option<String> {
     let mut ports = env.management_ports.clone();
@@ -437,6 +438,29 @@ pub(crate) fn staged(hal: &mut dyn Hal, base: &Config, target: &Config, env: &Bo
         }
         let mut next = applied.clone();
         (s.take)(&mut next, target);
+        // G1.3g: routes one at a time (no dry run for them): the refused
+        // ones stay out, the others in, nothing taken back.
+        if s.name == ROUTES {
+            match hal.apply_routes_each(&applied, &next) {
+                Ok(refused) => {
+                    for r in &refused {
+                        disable_route(&mut next, r.id);
+                    }
+                    applied = next;
+                    failed.extend(refused.into_iter().map(|r| BootFailure {
+                        section: ROUTES,
+                        item: Some(r.id),
+                        error: r.reason,
+                    }));
+                    continue;
+                }
+                Err(HalError::Unsupported(_)) => {}
+                Err(e) => {
+                    failed.push(BootFailure::whole(ROUTES, e.to_string()));
+                    continue;
+                }
+            }
+        }
         let e = match hal.apply(&applied, &next) {
             Ok(()) => {
                 applied = next;
@@ -455,7 +479,7 @@ pub(crate) fn staged(hal: &mut dyn Hal, base: &Config, target: &Config, env: &Bo
                     applied = *reduced;
                     failed.extend(rules.into_iter().map(|r| BootFailure {
                         section: FIREWALL,
-                        rule: Some(r.id),
+                        item: Some(r.id),
                         error: r.reason,
                     }));
                 }
@@ -471,14 +495,15 @@ pub(crate) fn staged(hal: &mut dyn Hal, base: &Config, target: &Config, env: &Bo
 }
 
 const FIREWALL: &str = "firewall";
+const ROUTES: &str = "routes";
 
 /// Backoff of the retries, seconds.
 const RETRY_MAX: u64 = 60;
-/// Backoff when only single rules are out (G1.3g): finding them again
+/// Backoff when only single items are out (G1.3g): finding a rule again
 /// costs the kernel a validation per rule (10 000 rules: 1.7 s in a
 /// release build, nftables' lock held, **medido**), and a rule refused at boot is
 /// usually refused for good; a commit that changes it tries at once.
-const RETRY_RULES_MAX: u64 = 600;
+const RETRY_ITEMS_MAX: u64 = 600;
 /// The log says again what is still out this often, seconds.
 const REMIND: u64 = 600;
 
@@ -511,12 +536,16 @@ impl BootApply {
         self.failed.iter().any(|f| f.section == CORE)
     }
 
-    /// `cfg` with what is out taken as the data plane has it.
+    /// `cfg` with what is out kept out: a refused section as the data
+    /// plane has it, a refused item (G1.3g) off. Only the item, not its
+    /// section: the routes of a DHCP lease go in with a static route out.
     fn mask(&self, cfg: &Config) -> Config {
         let mut out = cfg.clone();
         for f in &self.failed {
-            if let Some(s) = section(f.section) {
-                (s.take)(&mut out, &self.applied);
+            match (f.item, section(f.section)) {
+                (Some(id), _) => disable_item(f.section, &mut out, id),
+                (None, Some(s)) => (s.take)(&mut out, &self.applied),
+                (None, None) => {}
             }
         }
         out
@@ -528,6 +557,40 @@ fn rule_of(cfg: &Config, id: ItemId) -> Option<&corerouter_model::FirewallRule> 
     Table::ALL
         .iter()
         .find_map(|t| cfg.ip.firewall.rules(*t).iter().find(|r| r.id == id))
+}
+
+/// Item `id` of `section` is in both `a` and `b`, the same.
+fn same_item(section: &str, a: &Config, b: &Config, id: ItemId) -> bool {
+    match section {
+        FIREWALL => rule_of(a, id).is_some_and(|r| rule_of(b, id) == Some(r)),
+        ROUTES => {
+            let of = |c: &Config| c.ip.routes.iter().find(|r| r.id == id).cloned();
+            of(a).is_some_and(|r| of(b) == Some(r))
+        }
+        _ => false,
+    }
+}
+
+/// Turn item `id` of `section` off in `cfg`.
+fn disable_item(section: &str, cfg: &mut Config, id: ItemId) {
+    match section {
+        FIREWALL => {
+            disable_rule(cfg, id);
+        }
+        ROUTES => disable_route(cfg, id),
+        _ => {}
+    }
+}
+
+fn disable_route(cfg: &mut Config, id: ItemId) {
+    let Some(i) = cfg.ip.routes.iter().position(|r| r.id == id) else {
+        return;
+    };
+    let mut routes = cfg.ip.routes.clone();
+    if let Some(r) = routes.get_mut(i) {
+        r.disabled = true;
+    }
+    cfg.ip.routes = routes;
 }
 
 /// One line for `storage.boot_apply_error` and the old log lines.
@@ -568,9 +631,9 @@ fn log_outcome(failed: &[BootFailure], what: &str) {
         return;
     }
     for f in failed {
-        match f.rule {
+        match f.item {
             Some(id) => log::error!(
-                "{what}: {} rule {id} left out, the rest of the firewall is in \
+                "{what}: {} item {id} left out, the rest of the section is in \
                  (retried with backoff): {}",
                 f.section,
                 f.error
@@ -598,14 +661,15 @@ impl Session {
         self.ext::<BootApply>().is_some_and(|b| b.pending() && b.nothing())
     }
 
-    /// The firewall rules the boot left out (G1.3g), with the kernel's
-    /// reason: `ip.firewall.*.list` shows them invalid (flag I).
-    pub(crate) fn boot_refused_rules(&self) -> std::collections::HashMap<ItemId, String> {
+    /// The items of `section` the boot left out (G1.3g), with the
+    /// kernel's reason: the lists show them invalid (flag I).
+    pub(crate) fn boot_refused(&self, section: &str) -> std::collections::HashMap<ItemId, String> {
         self.ext::<BootApply>()
             .map(|b| {
                 b.failed
                     .iter()
-                    .filter_map(|f| Some((f.rule?, f.error.clone())))
+                    .filter(|f| f.section == section)
+                    .filter_map(|f| Some((f.item?, f.error.clone())))
                     .collect()
             })
             .unwrap_or_default()
@@ -633,15 +697,20 @@ impl Session {
             let Some(s) = section(f.section) else {
                 continue;
             };
-            if (s.same)(running, to) {
-                (s.take)(&mut out, &b.applied);
-                kept.push(f.clone());
-            } else if let Some(id) = f.rule
-                && rule_of(running, id).is_some()
-                && rule_of(running, id) == rule_of(to, id)
-            {
-                disable_rule(&mut out, id);
-                kept.push(f.clone());
+            match f.item {
+                // One item out: off while the commit leaves it as it was.
+                Some(id) => {
+                    if same_item(f.section, running, to, id) {
+                        disable_item(f.section, &mut out, id);
+                        kept.push(f.clone());
+                    }
+                }
+                None => {
+                    if (s.same)(running, to) {
+                        (s.take)(&mut out, &b.applied);
+                        kept.push(f.clone());
+                    }
+                }
             }
         }
         Some((out, kept))
@@ -728,8 +797,8 @@ impl Session {
         if changed {
             b.delay = 1;
         }
-        let max = if b.failed.iter().all(|f| f.rule.is_some()) {
-            RETRY_RULES_MAX
+        let max = if b.failed.iter().all(|f| f.item.is_some()) {
+            RETRY_ITEMS_MAX
         } else {
             RETRY_MAX
         };

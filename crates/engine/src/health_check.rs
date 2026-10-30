@@ -627,22 +627,23 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
             .collect::<Vec<_>>()
             .join("; ");
         let core = i.boot_apply.iter().any(|(s, _)| s == "core");
-        // G1.3g: "firewall *5" is one rule out, the rest of the firewall in.
-        let rules_only = i.boot_apply.iter().all(|(s, _)| s.contains(' '));
+        // G1.3g: "firewall *5" / "routes *3" is one item out, the rest of
+        // its section in.
+        let items_only = i.boot_apply.iter().all(|(s, _)| s.contains(' '));
         let whole_firewall = i.boot_apply.iter().any(|(s, _)| s == "firewall");
         out.push(Check { key: "boot.apply", name: "Boot apply", severity: Severity::Error,
             value: Some(i.boot_apply.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join(", ")),
             reason: if core {
                 format!("a configuração salva não entrou no kernel, nem interfaces e endereços: {list}; nova tentativa com espera crescente (até 60 s)")
-            } else if rules_only {
-                format!("regra(s) de firewall recusada(s) pelo kernel no boot e fora (flag I); o resto do firewall, gerência inclusive, está aplicado: {list}; nova tentativa com espera crescente (até 10 min)")
+            } else if items_only {
+                format!("regra(s) de firewall ou rota(s) recusada(s) pelo kernel no boot e fora (flag I); o resto da seção, gerência inclusive, está aplicado: {list}; nova tentativa com espera crescente (até 10 min)")
             } else {
                 format!("seção(ões) da configuração salva recusada(s) pelo kernel no boot e fora do ar (o resto, gerência inclusive, está aplicado): {list}; nova tentativa com espera crescente (até 60 s)")
             },
             action: Some(if whole_firewall {
                 "Corrija ou tire o item recusado (o motivo é o erro do kernel acima) e faça commit, ou carregue o que falta no kernel (módulo, recurso); um commit que mexe na seção a aplica inteira. O firewall inteiro está de fora: o roteador está sem filtro."
             } else {
-                "Corrija ou tire o item recusado (o motivo é o erro do kernel acima) e faça commit, ou carregue o que falta no kernel (módulo, recurso); um commit que mexe na seção a aplica inteira, menos a regra recusada que ele não muda."
+                "Corrija ou tire o item recusado (o motivo é o erro do kernel acima) e faça commit, ou carregue o que falta no kernel (módulo, recurso); um commit que mexe na seção a aplica inteira, menos a regra ou rota recusada que ele não muda."
             }.into()) });
     }
     // G1.29b: a USB adapter behind a port slower than itself caps the
