@@ -8,8 +8,11 @@
 //! A pure function of [`UsbInfo`] and the link's best rate, so the Hardware
 //! tab, the interface list and the health check say the same thing.
 
-use corerouter_hal::nic::{UsbInfo, mode_speed};
-use corerouter_hal::NicHardware;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex, PoisonError};
+
+use corerouter_hal::nic::{UsbInfo, UsbResetLevel, UsbResetReport, mode_speed};
+use corerouter_hal::{LinkState, NicHardware};
 use corerouter_model::IfName;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -126,6 +129,7 @@ pub fn detail(s: &mut Session, name: &IfName, hw: &NicHardware) -> Value {
         "slow_port": a.slow_port,
         "cap_mbps": a.cap_mbps,
         "alert": a.alert,
+        "recoveries": recoveries(s, name),
     })
 }
 
@@ -142,6 +146,138 @@ pub fn summary(s: &mut Session, name: &IfName) -> Option<Value> {
         "slow_port": a.slow_port,
         "alert": a.alert,
     }))
+}
+
+/// Finished recoveries the task threads hand back, at most this many
+/// waiting (more is a stuck tick: the oldest go).
+const MAX_DONE: usize = 64;
+
+/// One recovery a task finished: the port, how deep, and what it did.
+pub(crate) type Done = (IfName, UsbResetLevel, std::result::Result<UsbResetReport, String>);
+
+/// The queue the task threads push into (G1.29c: a callback between
+/// threads only queues; the tick reads it under the session).
+#[derive(Clone, Default)]
+pub(crate) struct DoneQueue(Arc<Mutex<VecDeque<Done>>>);
+
+impl DoneQueue {
+    pub(crate) fn push(&self, d: Done) {
+        let mut q = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if q.len() >= MAX_DONE {
+            q.pop_front();
+        }
+        q.push_back(d);
+    }
+
+    fn drain(&self) -> Vec<Done> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).drain(..).collect()
+    }
+}
+
+/// Recoveries of one adapter since the start (operational, not saved).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PortRecovery {
+    pub link: u32,
+    pub driver: u32,
+    pub port: u32,
+    /// The last one: level, unix seconds (when the router has a clock),
+    /// whether the interface came back, and the error if it failed.
+    pub last_level: Option<UsbResetLevel>,
+    pub last_at: Option<u64>,
+    pub last_back: Option<bool>,
+    pub last_error: Option<String>,
+    /// A recovery that recreated the network device: its configuration
+    /// goes back on when it is there again (the kernel dropped addresses,
+    /// MTU, state with the old device).
+    pub reapply: bool,
+    /// A recovery is under way.
+    pub running: Option<UsbResetLevel>,
+}
+
+/// G1.29c: manual recoveries of USB adapters (`Session::ext`).
+#[derive(Default)]
+pub struct UsbRecovery {
+    pub ports: BTreeMap<IfName, PortRecovery>,
+    pub(crate) done: DoneQueue,
+}
+
+impl Session {
+    /// Every second with the links just read (`poll_links`): the results
+    /// of finished recoveries, then the configuration of a recreated port
+    /// put back once it is there again.
+    pub(crate) fn usb_tick(&mut self, live: &[LinkState]) {
+        let Some(r) = self.ext::<UsbRecovery>() else {
+            return;
+        };
+        let done = r.done.drain();
+        let now = self.now();
+        for (name, level, result) in done {
+            let (msg, detail) = {
+                let Some(r) = self.ext_mut::<UsbRecovery>() else { return };
+                let p = r.ports.entry(name.clone()).or_default();
+                p.running = None;
+                p.last_level = Some(level);
+                p.last_at = now;
+                match &result {
+                    Ok(rep) => {
+                        match level {
+                            UsbResetLevel::Link => p.link = p.link.saturating_add(1),
+                            UsbResetLevel::Driver => p.driver = p.driver.saturating_add(1),
+                            UsbResetLevel::Port => p.port = p.port.saturating_add(1),
+                        }
+                        p.last_back = Some(rep.back);
+                        p.last_error = None;
+                        p.reapply |= level != UsbResetLevel::Link;
+                    }
+                    Err(e) => {
+                        p.last_back = None;
+                        p.last_error = Some(e.chars().take(200).collect());
+                    }
+                }
+                let msg = match &result {
+                    Ok(rep) if rep.back => format!("{name}: USB adapter recovered ({}{})", level.as_str(), if rep.power_cycled { ", port power cycled" } else { "" }),
+                    Ok(_) => format!("{name}: USB adapter reset ({}) but it did not come back within 20 s", level.as_str()),
+                    Err(e) => format!("{name}: USB adapter reset ({}) failed: {e}", level.as_str()),
+                };
+                (msg, serde_json::to_value(result.as_ref().ok()).unwrap_or(Value::Null))
+            };
+            self.log_event(&["interface", "warning"], "usb", msg, detail);
+        }
+        let due: Vec<IfName> = self
+            .ext::<UsbRecovery>()
+            .map(|r| {
+                r.ports
+                    .iter()
+                    .filter(|(n, p)| p.reapply && live.iter().any(|l| &l.name == *n))
+                    .map(|(n, _)| n.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if due.is_empty() {
+            return;
+        }
+        let cfg = self.effective(self.store().running()).into_owned();
+        let res = self.hal_mut().reconcile(&cfg);
+        for name in due {
+            if let Some(p) = self.ext_mut::<UsbRecovery>().and_then(|r| r.ports.get_mut(&name)) {
+                p.reapply = false;
+            }
+            let msg = match &res {
+                Ok(()) => format!("{name}: configuration put back on the recovered USB adapter"),
+                Err(e) => format!("{name}: configuration could not be put back after the recovery: {e} (config.drift.reconcile)"),
+            };
+            self.log_event(&["interface", "info"], "usb", msg, Value::Null);
+        }
+    }
+}
+
+/// The recoveries of `name` for `interface.hardware`.
+pub(crate) fn recoveries(s: &Session, name: &IfName) -> Value {
+    s.ext::<UsbRecovery>()
+        .and_then(|r| r.ports.get(name))
+        .map_or_else(|| serde_json::to_value(PortRecovery::default()).unwrap_or(Value::Null), |p| {
+            serde_json::to_value(p).unwrap_or(Value::Null)
+        })
 }
 
 #[cfg(test)]

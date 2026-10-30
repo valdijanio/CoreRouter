@@ -99,6 +99,9 @@ impl Session {
         self.adopt_new_ports(&live);
         // G4.5: the same poll feeds the traffic graphs.
         self.graph_sample(&live);
+        // G1.29c: finished USB recoveries; configuration back on a
+        // recreated port.
+        self.usb_tick(&live);
     }
 }
 

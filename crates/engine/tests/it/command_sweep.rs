@@ -22,12 +22,16 @@ fn garbage() -> Vec<Value> {
     ]
 }
 
-/// G0.30: the commands split over the cores (the sweep grows with every
-/// command added; one after the other it took ~8 s in a dev build). Each
-/// input still gets a fresh lab.
-#[test]
-fn no_command_panics_on_garbage() {
-    let specs: Vec<_> = cmd::all().collect();
+/// G0.30: the sweep grows with every command added, so it is split into
+/// `SHARDS` tests that nextest runs side by side (one test over all of them
+/// took 10.2 s on the GitHub runner, above the quick-layer ceiling). Shard
+/// `i` takes every command whose index is `i` modulo `SHARDS`, split again
+/// over the cores; each input still gets a fresh lab.
+const SHARDS: usize = 16;
+
+fn sweep_shard(shard: usize) {
+    let specs: Vec<_> = cmd::all().skip(shard).step_by(SHARDS).collect();
+    assert!(!specs.is_empty(), "shard {shard} has no command");
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
     let chunk = specs.len().div_ceil(threads).max(1);
     let failures: Vec<String> = std::thread::scope(|scope| {
@@ -41,9 +45,59 @@ fn no_command_panics_on_garbage() {
                 })
             })
             .collect();
-        parts.into_iter().flat_map(|p| p.join().unwrap()).collect()
+        parts
+            .into_iter()
+            .flat_map(|p| {
+                p.join()
+                    .unwrap_or_else(|_| vec!["a sweep thread panicked".to_owned()])
+            })
+            .collect()
     });
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+mod no_command_panics_on_garbage {
+    macro_rules! shards {
+        ($($name:ident = $i:expr),* $(,)?) => {
+            $(#[test]
+            fn $name() {
+                super::sweep_shard($i);
+            })*
+        };
+    }
+    shards!(
+        shard_00 = 0,
+        shard_01 = 1,
+        shard_02 = 2,
+        shard_03 = 3,
+        shard_04 = 4,
+        shard_05 = 5,
+        shard_06 = 6,
+        shard_07 = 7,
+        shard_08 = 8,
+        shard_09 = 9,
+        shard_10 = 10,
+        shard_11 = 11,
+        shard_12 = 12,
+        shard_13 = 13,
+        shard_14 = 14,
+        shard_15 = 15,
+    );
+
+    /// The shards cover every command exactly once.
+    #[test]
+    fn the_shards_cover_every_command() {
+        let total = corerouter_engine::cmd::all().count();
+        let covered: usize = (0..super::SHARDS)
+            .map(|i| {
+                corerouter_engine::cmd::all()
+                    .skip(i)
+                    .step_by(super::SHARDS)
+                    .count()
+            })
+            .sum();
+        assert_eq!(covered, total);
+    }
 }
 
 /// Every garbage input of one command; `Err` names the one that panicked.

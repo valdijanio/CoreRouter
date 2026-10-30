@@ -617,7 +617,20 @@ impl CoreRouterUi {
         // Dialogs opened while these were drawn (Apply on "New …") go last.
         dialogs.append(&mut self.dialogs);
         self.dialogs = dialogs;
+        // G1.29c: USB recoveries confirmed in a Hardware tab.
+        let now = ctx.input(|i| i.time);
+        let usb: Vec<(String, &'static str)> = nic
+            .iter_mut()
+            .filter_map(|(name, v)| {
+                let level = v.usb_go.take()?;
+                v.usb_fast_until = now + 15.0;
+                Some((name.clone(), level))
+            })
+            .collect();
         self.nic = nic;
+        for (name, level) in usb {
+            self.run("interface.usb.reset", json!({"name": name, "level": level}));
+        }
         if let Some((key, title)) = help {
             let title = crate::i18n::tr_in("interfaces", self.lang.labels, title);
             if let Some(panel) = self.panel_mut::<crate::interface_list_help::InterfaceListHelp>() {
