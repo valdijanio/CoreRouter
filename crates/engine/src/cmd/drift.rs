@@ -36,9 +36,13 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
 /// while that makes progress.
 const ROUNDS: usize = 3;
 
-/// The config the data plane should hold.
+/// The config the data plane should hold: without the ports that are not
+/// on this machine (G1.3b), which `interface.list` and the health check
+/// show invalid; their configuration waits for them, it did not drift.
 fn applied(s: &Session) -> Config {
-    s.effective(s.store().running()).into_owned()
+    let cfg = s.effective(s.store().running());
+    let gone = s.hal().absent_ports().into_iter().collect();
+    corerouter_hal::absent::mask(&cfg, &gone).into_owned()
 }
 
 fn hal_err(e: corerouter_hal::HalError) -> EngineError {

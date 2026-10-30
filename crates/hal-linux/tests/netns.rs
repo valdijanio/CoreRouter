@@ -291,7 +291,9 @@ fn failure_rolls_back_every_done_step() {
     let before = mine(&["-d", "-o", "link", "show"]);
     let before_addrs = settled(&mine(&["-o", "addr", "show"]));
 
-    // The config believes in a port the kernel does not have (unplugged NIC).
+    // The config believes in a port the kernel does not have (unplugged
+    // NIC): since G1.3b it is left out, not an error. What fails is the
+    // last step: someone else's route to a prefix the config routes too.
     let mut from = base.clone();
     eth(&mut from, "b1ghost");
     let mut to = from.clone();
@@ -301,13 +303,28 @@ fn failure_rolls_back_every_done_step() {
     to.interfaces.get_mut(&n("b1eth2")).unwrap().bridge = Some(n("b1br"));
     addr(&mut to, "b1eth1", "10.20.0.1/24");
     addr(&mut to, "b1ghost", "10.21.0.1/24");
+    route(&mut to, "203.0.114.0/24", "10.20.0.254");
+    ip(&[
+        "route",
+        "add",
+        "203.0.114.0/24",
+        "dev",
+        "b1eth1",
+        "metric",
+        "1",
+        "proto",
+        "static",
+    ]);
 
     let err = hal.apply(&from, &to).unwrap_err().to_string();
     assert!(
-        err.contains("add address 10.21.0.1/24 to 'b1ghost'"),
+        !err.contains("b1ghost"),
+        "the absent port is not the error: {err}"
+    );
+    assert!(
+        err.contains("already has another route to 203.0.114.0/24"),
         "{err}"
     );
-    assert!(err.contains("does not exist in the kernel"), "{err}");
     assert!(err.contains("rolled back"), "{err}");
     assert!(!err.contains("INCOMPLETE"), "{err}");
 
@@ -336,7 +353,7 @@ fn foreign_interfaces_are_never_touched() {
     let snapshot = || {
         (
             ip(&["-d", "-o", "link", "show", "c1host"]),
-            ip(&["-o", "addr", "show", "dev", "c1host"]),
+            settled(&ip(&["-o", "addr", "show", "dev", "c1host"])),
         )
     };
     let before = snapshot();
@@ -584,7 +601,7 @@ fn a_conflicting_kernel_route_rolls_the_apply_back() {
         "static",
     ]);
     let foreign = routes("f1");
-    let addrs = ip(&["-o", "addr", "show", "dev", "f1eth1"]);
+    let addrs = settled(&ip(&["-o", "addr", "show", "dev", "f1eth1"]));
 
     let mut to = base.clone();
     addr(&mut to, "f1eth1", "10.63.0.2/24");
@@ -601,7 +618,10 @@ fn a_conflicting_kernel_route_rolls_the_apply_back() {
     );
     // Our route and address are gone again; the foreign route is untouched.
     assert_eq!(routes("f1"), foreign);
-    assert_eq!(ip(&["-o", "addr", "show", "dev", "f1eth1"]), addrs);
+    assert_eq!(
+        settled(&ip(&["-o", "addr", "show", "dev", "f1eth1"])),
+        addrs
+    );
 
     // Removing a route that is already gone is not an error either.
     let mut with = base.clone();

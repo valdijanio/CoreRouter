@@ -102,6 +102,9 @@ pub struct VirtualHal {
     shaper: crate::queue::lab::LabShaper,
     /// The lab's neighbor tables (G1.27d).
     neigh: crate::lab_neigh::LabNeigh,
+    /// Ports of the applied config unplugged (G1.3b): a late port outside
+    /// its poll range, at the last apply or seen by `poll` since.
+    absent: std::collections::BTreeSet<IfName>,
 }
 
 /// A lab port's own settings (G1.26b); `None`: the NIC has no such knob.
@@ -233,6 +236,7 @@ impl VirtualHal {
             oslog: crate::oslog::LabOsLog::default(),
             neigh: crate::lab_neigh::LabNeigh::default(),
             shaper: crate::queue::lab::LabShaper::default(),
+            absent: std::collections::BTreeSet::new(),
         }
     }
 
@@ -781,6 +785,7 @@ impl Hal for VirtualHal {
         }
         self.carry(from, to);
         self.neigh.sync(to);
+        self.absent = crate::absent::missing(to, |n| self.late_present(n) != Some(false));
         self.applied = to.clone();
         self.applies = self.applies.saturating_add(1);
         Ok(())
@@ -1031,8 +1036,21 @@ impl Hal for VirtualHal {
         Ok(())
     }
 
+    fn absent_ports(&self) -> Vec<IfName> {
+        self.absent.iter().cloned().collect()
+    }
+
     fn poll(&mut self) -> Vec<LinkState> {
         self.ticks = self.ticks.wrapping_add(1);
+        // G1.3b: a configured port unplugged waits for the next apply.
+        let gone: Vec<IfName> = self
+            .applied
+            .interfaces
+            .keys()
+            .filter(|n| self.late_present(n) == Some(false))
+            .cloned()
+            .collect();
+        self.absent.extend(gone);
         let mut out: Vec<LinkState> = self
             .applied
             .interfaces
