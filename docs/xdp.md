@@ -194,6 +194,14 @@ Filas e `bng0` (G4.9b, G4.3ca, G4.3cc; `docs/queues.md`):
 35. `bng_egress`: `bpf_redirect` para a porta de acesso da sessão, sem flags (para a saída dela,
     onde o shaper roda).
 
+Tap do respondedor de LSP ping (G3.9db, `docs/mpls.md`):
+
+36. `tap_stat`: incremento da cópia desta CPU de `LSP_TAP_STATS` (tc roda sem migração).
+37. `lsp_tap`: leitura de `ifindex` e `gso_size` do próprio `__sk_buff`.
+
+A reserva no ring buffer (`reserve_bytes`, tamanho constante), a cópia do quadro
+(`load_bytes`, tamanho limitado ao da reserva) e o `submit` usam a API segura do `aya-ebpf`.
+
 ## Pesquisa
 
 Fontes (abertas em 2026-10-23):

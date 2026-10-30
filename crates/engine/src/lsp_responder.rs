@@ -85,6 +85,9 @@ pub struct Counters {
     pub error: Option<String>,
     /// Interfaces it could not listen on, and why.
     pub failed: Vec<(IfName, String)>,
+    /// How frames are heard: the tc tap (G3.9db) or packet sockets, and
+    /// why.
+    pub tap: String,
     /// ICMP errors for expired (G3.9d) and too big (G3.9da) labeled
     /// packets.
     pub icmp: IcmpCounters,
@@ -156,6 +159,7 @@ pub fn counters_json(s: &Session) -> Value {
         "codes": codes,
         "error": c.error,
         "failed": failed,
+        "tap": c.tap,
     })
 }
 

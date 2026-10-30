@@ -1040,6 +1040,14 @@ mod tests {
     fn the_object_has_the_program_and_maps() {
         let obj = aya_obj::Object::parse(OBJECT).unwrap();
         assert!(
+            obj.programs.contains_key(m::LSP_TAP_PROGRAM),
+            "{:?}",
+            obj.programs.keys()
+        );
+        for name in [m::LSP_TAP, m::LSP_TAP_SET, m::LSP_TAP_STATS] {
+            assert!(obj.maps.contains_key(name), "map {name}");
+        }
+        assert!(
             obj.programs.contains_key(m::PROGRAM),
             "{:?}",
             obj.programs.keys()

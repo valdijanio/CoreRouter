@@ -978,6 +978,10 @@ impl LspResponderIo for HostResponder {
         failed
     }
 
+    fn tap(&self) -> String {
+        self.tap_kind()
+    }
+
     fn hear_too_big(&mut self, on: bool) {
         self.too_big = on;
         self.view.refresh();
