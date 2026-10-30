@@ -181,6 +181,10 @@ impl Vty {
         })
     }
 
+    fn too_long(&self) -> io::Error {
+        io::Error::other(format!("answer longer than {} bytes", self.max_reply))
+    }
+
     fn read_reply(&mut self) -> io::Result<Reply> {
         self.buf.clear();
         let mut scanned = 0usize;
@@ -195,16 +199,18 @@ impl Vty {
                 .map(|p| p + from)
                 && let Some(&code) = self.buf.get(pos + 3)
             {
+                // The limit holds however the answer arrived: a whole
+                // answer in one read (up to the chunk) used to pass it.
+                if pos > self.max_reply {
+                    return Err(self.too_long());
+                }
                 let mut output = std::mem::take(&mut self.buf);
                 output.truncate(pos);
                 return Ok(Reply { code, output });
             }
             scanned = self.buf.len();
             if self.buf.len() > self.max_reply {
-                return Err(io::Error::other(format!(
-                    "answer longer than {} bytes",
-                    self.max_reply
-                )));
+                return Err(self.too_long());
             }
             let n = self.stream.read(&mut self.chunk)?;
             if n == 0 {
@@ -397,6 +403,35 @@ mod tests {
         assert!(v.run(&"x".repeat(MAX_COMMAND + 1)).is_err());
         let e = v.run("show").unwrap_err();
         assert!(e.to_string().contains("longer than 4096"));
+    }
+
+    /// The whole too-long answer in the first read (the server writes it
+    /// in one piece before the client reads): refused all the same. Before
+    /// the fix the limit only held when the answer came in pieces, and
+    /// `hostile_commands_and_answers_are_refused` failed under load.
+    #[test]
+    fn a_too_long_answer_in_one_read_is_refused() {
+        let dir = tempdir::Dir::new();
+        let path = dir.0.join("zebra.vty");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut b = [0u8; 64];
+            let _ = s.read(&mut b);
+            let mut msg = vec![b'x'; 10_000];
+            msg.extend_from_slice(&[0, 0, 0, 0]);
+            s.write_all(&msg).unwrap();
+            ready_tx.send(()).unwrap();
+            // Keep the socket open until the client is done.
+            let _ = s.read(&mut b);
+        });
+        let mut v = Vty::connect(&path, Duration::from_secs(5), 4096).unwrap();
+        v.stream.write_all(b"show\0").unwrap();
+        // The answer is all in the socket before the first read.
+        ready_rx.recv().unwrap();
+        let e = v.read_reply().unwrap_err();
+        assert!(e.to_string().contains("longer than 4096"), "{e}");
     }
 
     #[test]
