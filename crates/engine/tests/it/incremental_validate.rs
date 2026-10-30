@@ -369,6 +369,11 @@ enum Change {
     /// gateway, destination with host bits or distance 0.
     CopyRoute(usize, u8),
     DropRule(usize),
+    /// G0.31j: one rule of filter, nat, mangle or raw edited (a bad
+    /// comment, ports without a protocol, an upper-case chain, its id
+    /// given to a copy, disabled, turned into a jump or a mark, a fine
+    /// comment): the firewall checks only the rules a commit touched.
+    EditRule(usize, u8),
     DropListEntry(usize),
     DropPool(usize),
     DropProfile(usize),
@@ -397,6 +402,7 @@ fn change() -> impl Strategy<Value = Change> {
         any::<usize>().prop_map(Change::DropRoute),
         (any::<usize>(), 0u8..5).prop_map(|(i, how)| Change::CopyRoute(i, how)),
         any::<usize>().prop_map(Change::DropRule),
+        (any::<usize>(), 0u8..8).prop_map(|(i, how)| Change::EditRule(i, how)),
         any::<usize>().prop_map(Change::DropListEntry),
         any::<usize>().prop_map(Change::DropPool),
         any::<usize>().prop_map(Change::DropProfile),
@@ -494,6 +500,40 @@ fn apply(c: &mut Config, ch: &Change) {
         Change::DropRule(i) => {
             if let Some(k) = pick(c.ip.firewall.filter.len(), i) {
                 c.ip.firewall.filter.remove(k);
+            }
+        }
+        Change::EditRule(i, how) => {
+            use corerouter_model::firewall::{Action, Table};
+            let table = Table::ALL[i % Table::ALL.len()];
+            let rules = c.ip.firewall.rules_mut(table);
+            let Some(k) = pick(rules.len(), i / Table::ALL.len()) else {
+                return;
+            };
+            let Some(r) = rules.get_mut(k) else { return };
+            match how {
+                0 => r.comment = "bad\u{1}".into(),
+                1 => {
+                    r.matchers.protocol = None;
+                    r.matchers.dst_port = Some(serde_json::from_value(json!("80")).unwrap());
+                }
+                2 => r.chain = r.chain.as_str().to_uppercase().parse().unwrap(),
+                3 => {
+                    let copy = r.clone();
+                    rules.push(copy);
+                }
+                4 => r.disabled = !r.disabled,
+                5 => {
+                    r.action = Action::Jump {
+                        jump_target: "cust".parse().unwrap(),
+                    }
+                }
+                6 => {
+                    r.action = Action::MarkPacket {
+                        new_packet_mark: "p1".parse().unwrap(),
+                        passthrough: true,
+                    }
+                }
+                _ => r.comment = format!("c{i}"),
             }
         }
         Change::DropListEntry(i) => {

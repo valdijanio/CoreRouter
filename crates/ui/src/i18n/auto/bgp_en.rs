@@ -45,6 +45,14 @@ As a helper: how long we keep the routes of a neighbor that restarted, marked st
 A neighbor that never sends End-of-RIB (RouterOS 7.25) keeps its old routes for the whole time. FRR `bgp graceful-restart stalepath-time`, Junos `stale-routes-time` (300)."##),
     (r##"bgp.instance.hard_admin_reset"##, r##"## What it is
 Whether an administrative reset (Cease 4: `routing.bgp.session.clear`) goes as a Hard Reset (RFC 8538 §3) and drops the neighbor's routes. On by default. Off: a clear of a neighbor with the N bit is graceful, its routes stay stale until it sends them again (useful to apply a policy without a traffic hole). Shutdown always drops them."##),
+    (r##"bgp.instance.llgr_stale_time"##, r##"## What it is
+Long-Lived Graceful Restart (RFC 9494): after the Restart Time of a graceful restart ends, the neighbor keeps our routes this much longer, marked with the `llgr-stale` community and least preferred, so any live route wins over them. 1..16777215 s (24 bits); empty: off (§5: never on by default). FRR has one value for every address family (the RFC asks for it per AFI/SAFI). It is also the most we keep of a neighbor's routes: FRR keeps the smaller of the neighbor's time and ours, so set it on both sides.
+
+## When to use
+For routes with an alternative, or that are better old than gone (VPN, a default route from two upstreams). Routes tagged `no-llgr` (Routing › Filters, `append bgp-communities no-llgr`) are never kept.
+
+## Careful
+Hop by hop, a stale more-specific route still wins over a live less-specific one (§5): traffic may go to a dead next hop for the whole time. The preview shows the worst case (hold + Restart Time + LLGR). RouterOS 7.25 does not support LLGR: FRR does not send it stale routes (§4.3)."##),
     (r##"bgp.instance.name"##, r##"## What it is
 The instance's name; `default` runs in the main table, another name is a separate FRR view."##),
     (r##"bgp.instance.router_id"##, r##"## What it is

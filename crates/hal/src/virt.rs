@@ -45,9 +45,11 @@ pub struct VirtualHal {
     /// `ticks` when the XDP counters were last zeroed (G2.5a).
     xdp_zero: u64,
     applies: u64,
-    /// The nftables script the last firewall change would have loaded
-    /// (the lab records it; nothing runs it).
-    ruleset: Option<String>,
+    /// Whether an apply changed the firewall: its nftables script is
+    /// rendered from `applied` when read (G0.31j: rendering it, and both
+    /// configs to compare them, at every firewall commit cost ~100 ms with
+    /// 10 000 rules, **medido**; nothing runs it).
+    firewall_applied: bool,
     dynamic: Vec<DynamicAddress>,
     /// Diagnostic tools: the simulated network unless the app swaps in the
     /// host's ICMP (`corerouter-daemon --lab-ping host`).
@@ -165,7 +167,7 @@ impl VirtualHal {
             cpu: (0, 0),
             xdp_zero: 0,
             applies: 0,
-            ruleset: None,
+            firewall_applied: false,
             dynamic: Vec::new(),
             prober: Arc::new(SimProber::default()),
             dhcp: None,
@@ -301,9 +303,11 @@ impl VirtualHal {
         self.applies
     }
 
-    /// The firewall script of the last apply that changed the firewall.
-    pub fn ruleset(&self) -> Option<&str> {
-        self.ruleset.as_deref()
+    /// The firewall script of the applied config, once an apply changed
+    /// the firewall.
+    pub fn ruleset(&self) -> Option<String> {
+        self.firewall_applied
+            .then(|| corerouter_firewall::script(&self.applied, &self.dynamic))
     }
 
     /// The CGNAT table (G2.3) the last applied config would load.
@@ -620,8 +624,8 @@ impl Hal for VirtualHal {
     }
 
     fn apply(&mut self, from: &Config, to: &Config) -> Result<(), HalError> {
-        if corerouter_firewall::nft::changed(from, to) {
-            self.ruleset = Some(corerouter_firewall::script(to, &self.dynamic));
+        if corerouter_firewall::nft::inputs_changed(from, to) {
+            self.firewall_applied = true;
         }
         for (name, iface) in &to.interfaces {
             let was_off = from.interfaces.get(name).is_some_and(|i| i.disabled);

@@ -13,6 +13,10 @@
 //! - `package …`: another package of the sealed build.
 //! - `info <package>`: the manifest, as JSON.
 //! - `genkey <file>`: a fresh Ed25519 key (tests: a key nobody trusts).
+//! - `release-key init|decrypt` (processo): the release signing key,
+//!   encrypted with a passphrase (`release_key.rs`).
+//! - `verify <package> --keys <dir>`: the package's signature against the
+//!   public keys in `<dir>` (the release check that it is not a dev build).
 //! - `installer <images>` (G1.6c, post-image.sh): the signed install index
 //!   (layout of `disk.img`, payload hashes) and the hybrid installer ISO
 //!   `corerouter-install.iso` (El Torito + GPT over `efiboot.vfat`).
@@ -26,10 +30,11 @@ use std::time::Instant;
 use corerouter_sysupdate::package::{self, Blob, Manifest, Rootfs};
 use corerouter_sysupdate::verity;
 
-const USAGE: &str = "usage: corerouter-image <seal IMAGES | key --keys DIR [--key PKCS8] | package --images DIR (--keys DIR | --key PKCS8) --out FILE [--version V] [--build N] [--channel C] [--squashfs FILE] | info PACKAGE | genkey FILE | installer IMAGES | ova --vmdk FILE --capacity BYTES --out FILE [--name N]>";
+const USAGE: &str = "usage: corerouter-image <seal IMAGES | key --keys DIR [--key PKCS8] | package --images DIR (--keys DIR | --key PKCS8) --out FILE [--version V] [--build N] [--channel C] [--squashfs FILE] | info PACKAGE | verify PACKAGE --keys DIR | genkey FILE | release-key (init --dir D | check --dir D | decrypt --dir D --out F) | installer IMAGES | ova --vmdk FILE --capacity BYTES --out FILE [--name N]>";
 
 mod installer;
 mod ova;
+mod release_key;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -40,6 +45,8 @@ fn main() {
         Some("package") => package_cmd(rest),
         Some("info") => info(rest),
         Some("genkey") => genkey(rest),
+        Some("verify") => verify(rest),
+        Some("release-key") => release_key::main(rest),
         Some("installer") => installer::main(rest),
         Some("ova") => ova::main(rest),
         _ => Err(USAGE.into()),
@@ -75,6 +82,28 @@ fn info(args: &[String]) -> Result<(), String> {
     let h = package::Header::read(&mut f)?;
     let text = serde_json::to_string(&h.manifest).map_err(|e| e.to_string())?;
     let _ = writeln!(std::io::stdout(), "{text}");
+    Ok(())
+}
+
+/// `verify <package> --keys <dir>`: prints the id of the key that signed it.
+fn verify(args: &[String]) -> Result<(), String> {
+    let (Some(p), Some("--keys"), Some(dir), None) = (
+        args.first(),
+        args.get(1).map(String::as_str),
+        args.get(2),
+        args.get(3),
+    ) else {
+        return Err("usage: corerouter-image verify <package> --keys <dir>".into());
+    };
+    let mut f = std::fs::File::open(p).map_err(|e| format!("{p}: {e}"))?;
+    let h = package::Header::read(&mut f)?;
+    let keys = package::load_keys(Path::new(dir));
+    let k = h.verify(&keys)?;
+    let _ = writeln!(
+        std::io::stdout(),
+        "{}",
+        serde_json::json!({"key": k.id_hex()})
+    );
     Ok(())
 }
 
@@ -127,7 +156,7 @@ fn ensure_key(keys: &Path, given: Option<&Path>) -> Result<(PathBuf, PathBuf), S
 }
 
 #[cfg(unix)]
-fn write_private(p: &Path, data: &[u8]) -> Result<(), String> {
+pub(crate) fn write_private(p: &Path, data: &[u8]) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -139,7 +168,7 @@ fn write_private(p: &Path, data: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-fn write_private(p: &Path, data: &[u8]) -> Result<(), String> {
+pub(crate) fn write_private(p: &Path, data: &[u8]) -> Result<(), String> {
     std::fs::write(p, data).map_err(|e| format!("{}: {e}", p.display()))
 }
 

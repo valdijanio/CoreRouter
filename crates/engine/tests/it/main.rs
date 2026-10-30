@@ -42,6 +42,7 @@ mod interface_info;
 mod ip_address;
 mod ip_calc;
 mod ipoe;
+mod journal_sections;
 mod metrics;
 mod mpls;
 mod neighbor;
