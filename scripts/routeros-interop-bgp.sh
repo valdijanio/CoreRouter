@@ -186,10 +186,13 @@ for _ in $(seq 100); do curl -sf -m 2 -u "admin:$PW" "http://$ROS/rest/system/re
 
 ros() { curl -sf -m 20 -u "admin:$PW" "http://$ROS/rest/$1"; }
 rosx() {
+  # `as-string`: run it and wait. Without it /rest/execute starts a background
+  # job and returns, so two calls in a row race (a client enabled before the
+  # set that came first; the same race the L2 script hit with its VLANs).
   local out
-  out=$(jq -n --arg s "$1" '{script: $s}' |
+  out=$(jq -n --arg s "$1" '{script: $s, "as-string": true}' |
     curl -s -m 60 -u "admin:$PW" -H 'content-type: application/json' -d @- "http://$ROS/rest/execute")
-  if echo "$out" | jq -e 'type == "object" and has("error")' >/dev/null 2>&1; then
+  if echo "$out" | jq -e 'type == "object" and (has("error") or ((.ret // "") | test("failure:|syntax error|bad command|no such item|expected end of command")))' >/dev/null 2>&1; then
     echo "RouterOS refused: $out" >&2
     return 1
   fi
@@ -811,18 +814,27 @@ case_maxprefix() {
 /ip firewall address-list add list=bgp-out address=198.18.$i.0/24" >/dev/null; done
   ebgp4_up '{"max_prefix_ipv4":3,"max_prefix_action":"shutdown"}'
   local ms
-  ms=$(wait_for 60 bash -c "[ \"\$(ip netns exec cf1 $bin/corerouter-cli --connect 127.0.0.1:7991 run routing.bgp.session.list | jq -r '[.[] | select(.connection == \"chr4\")][0].state')\" != Established ]") || true
-  sleep 3
+  # Wait for the Cease itself: down alone also fits a session that never
+  # came up.
+  ms=$(wait_for 60 bash -c "ip netns exec cf1 $bin/corerouter-cli --connect 127.0.0.1:7991 run routing.bgp.session.list | jq -e '.[] | select(.connection == \"chr4\" and (.reason // \"\" | test(\"prefix\"; \"i\")))' >/dev/null") || true
   local s; s=$(cr_sess 1 chr4)
-  ! cr_up 1 chr4 && result maxprefix OK "6 prefixes over max_prefix_ipv4=3 (shutdown): session down, state $(jq -r .state <<< "$s"), reason $(jq -c '{reason, last_error}' <<< "$s")" \
-    || result maxprefix FAIL "6 > 3 and still Established: $s"
+  if cr_up 1 chr4; then result maxprefix FAIL "6 > 3 and still Established: $s"
+  elif grep -qi prefix <<< "$s"; then result maxprefix OK "6 prefixes over max_prefix_ipv4=3 (shutdown): session down, state $(jq -r .state <<< "$s"), reason $(jq -c '{reason, last_error}' <<< "$s")"
+  else result maxprefix FAIL "down, but not for the prefix limit: $(jq -c '{state, reason, last_error}' <<< "$s")"
+  fi
   result maxprefix INFO "CHR side: $(ros_sess cr4 | jq -c '{established, "last-stopped", "stopped"}') ; CHR log: $(ros log | jq -r '[.[] | select(.topics | test("bgp")) | .message][-2:] | join(" | ")' 2>/dev/null | cut -c1-240)"
   result maxprefix INFO "history: $(cr1 routing.bgp.session.history '{"connection":"chr4"}' | jq -c '[.[0:2][] | {event, state, reason}]')"
   # warning: the session stays and everything is kept.
   cr1 routing.bgp.connection.set '{"id":"chr4","max_prefix_action":"warning"}' >/dev/null
   cr1 routing.bgp.session.clear '{"connection":"chr4"}' >/dev/null 2>&1 || true
-  ms=$(wait_for 60 cr_up 1 chr4) && result maxprefix OK "max_prefix_action=warning: session up in ${ms} ms with $(cr_sess 1 chr4 | jq -r .prefix_count) prefixes" \
-    || result maxprefix FAIL "warning: no session ($(cr_state 1 chr4))"
+  # The prefix count right at Established is still 0: wait for the six.
+  if ms=$(wait_for 60 cr_up 1 chr4); then
+    wait_for 15 bash -c "[ \"\$(ip netns exec cf1 $bin/corerouter-cli --connect 127.0.0.1:7991 run routing.bgp.session.list | jq -r '.[] | select(.connection == \"chr4\") | .prefix_count')\" -ge 6 ]" >/dev/null \
+      && result maxprefix OK "max_prefix_action=warning: session up in ${ms} ms, $(cr_sess 1 chr4 | jq -r .prefix_count) prefixes kept" \
+      || result maxprefix FAIL "warning: up in ${ms} ms with $(cr_sess 1 chr4 | jq -r .prefix_count) prefixes, not 6"
+  else
+    result maxprefix FAIL "warning: no session ($(cr_state 1 chr4))"
+  fi
   # The other way: RouterOS input.limit-process-routes-ipv4=10 with 12 from us.
   for i in $(seq 10 21); do cr1 ip.firewall.address-list.add "{\"list\":\"many\",\"address\":\"10.100.$i.0/24\"}" >/dev/null; cr1 ip.route.add "{\"dst_address\":\"10.100.$i.0/24\",\"gateway\":\"10.39.4.2\"}" >/dev/null; done
   cr1 routing.bgp.connection.set '{"id":"chr4","output_network":"many"}' >/dev/null
