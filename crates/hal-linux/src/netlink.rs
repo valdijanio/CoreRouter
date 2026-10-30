@@ -203,6 +203,7 @@ fn kernel_link(m: &LinkMessage) -> KernelLink {
             LinkAttribute::Mtu(v) => l.mtu = *v,
             LinkAttribute::Controller(v) if *v != 0 => l.master = Some(*v),
             LinkAttribute::LinkNetNsId(_) => l.peer_elsewhere = true,
+            LinkAttribute::ParentDevBusName(b) if b.len() <= 32 => l.bus = Some(b.clone()),
             LinkAttribute::OperState(st) => oper = Some(*st),
             LinkAttribute::Address(mac) if mac_text(mac).is_some() => l.mac = mac_text(mac),
             LinkAttribute::Stats64(st) => {

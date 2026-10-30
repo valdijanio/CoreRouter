@@ -474,7 +474,8 @@ pub(crate) fn body(
     tab: Tab,
     view: Option<&mut NicView>,
     can: &Avail,
-    general: impl FnOnce(&mut Ui, Option<&NicView>),
+    help: &mut Option<(&'static str, &'static str)>,
+    general: impl FnOnce(&mut Ui, Option<&NicView>, &mut Option<(&'static str, &'static str)>),
 ) {
     ui.set_min_width(BODY_WIDTH);
     if tab == Tab::General {
@@ -482,7 +483,7 @@ pub(crate) fn body(
         let size = egui::vec2(BODY_WIDTH, BODY_HEIGHT);
         ui.allocate_ui_with_layout(size, egui::Layout::top_down(egui::Align::Min), |ui| {
             ui.set_min_size(size);
-            general(ui, view.as_deref());
+            general(ui, view.as_deref(), help);
         });
         return;
     }
@@ -501,7 +502,7 @@ pub(crate) fn body(
                 Tab::Ethernet => ethernet_tab::ethernet(ui, view, can),
                 Tab::Status => status(ui, view),
                 Tab::Sfp => ethernet_tab::sfp(ui, view),
-                Tab::Hardware => hardware(ui, view),
+                Tab::Hardware => hardware(ui, view, help),
                 Tab::Traffic => traffic(ui, view),
                 Tab::Stats => statistics(ui, view),
             }
@@ -644,7 +645,7 @@ fn status(ui: &mut Ui, view: &NicView) {
     notes(ui, m);
 }
 
-fn hardware(ui: &mut Ui, view: &NicView) {
+fn hardware(ui: &mut Ui, view: &NicView, help: &mut Option<(&'static str, &'static str)>) {
     let Some(h) = loaded(ui, &view.hardware) else {
         return;
     };
@@ -656,6 +657,11 @@ fn hardware(ui: &mut Ui, view: &NicView) {
         (Some(x), Some(y)) => Some(format!("{x}{sep}{y}")),
         (x, y) => x.or(y),
     };
+    // G1.29b: on a USB adapter, the USB part first (it is what limits it).
+    if let Some(u) = h.get("usb").filter(|u| u.is_object()) {
+        usb_section(ui, u, help);
+        ui.add_space(6.0);
+    }
     Grid::new("iface-hw")
         .num_columns(2)
         .spacing([12.0, 4.0])
@@ -687,6 +693,7 @@ fn hardware(ui: &mut Ui, view: &NicView) {
             row(ui, "IRQs", list(h, "irqs"));
             row(ui, "MTU range", pair("min_mtu", "max_mtu", " – "));
         });
+
     let offloads: Vec<&Value> = h
         .get("offloads")
         .and_then(Value::as_array)
@@ -718,6 +725,109 @@ fn hardware(ui: &mut Ui, view: &NicView) {
             });
     }
     notes(ui, h);
+}
+
+/// One row of the USB section: the label, its ⓘ (explanation `key`) and
+/// the value.
+fn usb_row(
+    ui: &mut Ui,
+    label: &'static str,
+    key: &'static str,
+    value: Option<String>,
+    help: &mut Option<(&'static str, &'static str)>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        if crate::help::info_button(ui, ui.scope_id().with(key), "What is this?").clicked() {
+            *help = Some((key, label));
+        }
+    });
+    match value {
+        Some(v) => ui.label(v),
+        None => ui.weak(NOT_SUPPORTED),
+    };
+    ui.end_row();
+}
+
+/// G1.29b: the USB device behind a USB adapter: the bus rate it
+/// negotiated (green, or amber when the port is slower than the adapter),
+/// what it could do, the port, power and the kernel's transmit timeouts.
+fn usb_section(ui: &mut Ui, u: &Value, help: &mut Option<(&'static str, &'static str)>) {
+    let slow = u.get("slow_port").and_then(Value::as_bool).unwrap_or(false);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("USB").strong());
+        if crate::help::info_button(ui, ui.scope_id().with("iface_usb.section"), "USB adapters in production").clicked() {
+            *help = Some(("iface_usb.section", "USB"));
+        }
+    });
+    Grid::new("iface-usb")
+        .num_columns(2)
+        .spacing([12.0, 4.0])
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("USB Speed");
+                if crate::help::info_button(ui, ui.scope_id().with("iface_usb.speed"), "What is this?").clicked() {
+                    *help = Some(("iface_usb.speed", "USB Speed"));
+                }
+            });
+            match text(u, "speed") {
+                Some(sp) => {
+                    let (label, kind) = if slow {
+                        (format!("{sp} · slow port"), crate::chip::Kind::Amber)
+                    } else {
+                        (sp, crate::chip::Kind::Green)
+                    };
+                    let r = crate::chip::chip(ui, &label, kind.tone(ui.visuals()));
+                    if let Some(a) = text(u, "alert") {
+                        r.on_hover_text(a);
+                    }
+                }
+                None => {
+                    ui.weak(NOT_SUPPORTED);
+                }
+            }
+            ui.end_row();
+            usb_row(ui, "Adapter Supports", "iface_usb.adapter", text(u, "adapter"), help);
+            let port = text(u, "port").map(|p| {
+                let kind = match u.get("port_max_mbps").and_then(Value::as_u64) {
+                    Some(m) if m >= 5000 => " · USB 3 port",
+                    Some(_) => " · USB 2 port",
+                    None => "",
+                };
+                format!("{p}{kind}")
+            });
+            usb_row(ui, "Port", "iface_usb.port", port, help);
+            let id = match (text(u, "vendor_id"), text(u, "product_id")) {
+                (Some(v), Some(p)) => Some(match text(u, "revision") {
+                    Some(r) => format!("{v}:{p} rev {r}"),
+                    None => format!("{v}:{p}"),
+                }),
+                _ => None,
+            };
+            usb_row(ui, "USB ID", "iface_usb.id", id, help);
+            usb_row(ui, "USB Version", "iface_usb.version", text(u, "version"), help);
+            usb_row(ui, "Max Power", "iface_usb.power", text(u, "max_power_ma").map(|m| format!("{m} mA")), help);
+            let saving = match (u.get("autosuspend").and_then(Value::as_bool), text(u, "lpm")) {
+                (None, None) => None,
+                (a, l) => Some(format!(
+                    "autosuspend {}{}",
+                    match a {
+                        Some(true) => "on",
+                        Some(false) => "off",
+                        None => "?",
+                    },
+                    l.map(|l| format!(" · LPM {}", if l == "0" { "off".into() } else { l }))
+                        .unwrap_or_default()
+                )),
+            };
+            usb_row(ui, "Power Saving", "iface_usb.power_saving", saving, help);
+            usb_row(ui, "Tx Timeouts", "iface_usb.tx_timeouts", text(u, "tx_timeouts"), help);
+            usb_row(ui, "Over-current", "iface_usb.over_current", text(u, "over_current"), help);
+        });
+    if let Some(a) = text(u, "alert").filter(|_| slow) {
+        ui.add_space(4.0);
+        ui.add(egui::Label::new(RichText::new(a).color(crate::chip::AMBER.tone(ui.visuals()).ink)).wrap());
+    }
 }
 
 /// Driver notes (what was not supported and why), folded.

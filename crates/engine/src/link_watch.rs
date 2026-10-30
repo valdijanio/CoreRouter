@@ -115,6 +115,7 @@ mod tests {
             kind: "ether".into(),
             mtu: 1500,
             mac: None,
+            bus: None,
             unmanaged: None,
             errors: None,
         }

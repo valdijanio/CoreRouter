@@ -11,6 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use corerouter_hal::nic::MAX_ITEMS;
+use corerouter_hal::nic::{self as hnic, UsbInfo};
 use corerouter_hal::sff::{self, DiagPage, HALF_PAGE, SfpModule};
 use corerouter_hal::{CounterGroup, EthernetMonitor, HalError, LinkCounters, NicHardware};
 
@@ -81,6 +82,10 @@ pub(crate) fn hardware(name: &str) -> Result<NicHardware, HalError> {
                 Path::new("/sys/bus").join(bus).join("devices").join(dev),
                 &mut hw,
             );
+            if bus == "usb" {
+                hw.usb = usb_info(Path::new(USB_DEVICES), dev, name);
+                usb_names(&mut hw);
+            }
             if let Err(e) = devlink_info(bus, dev, &mut hw) {
                 notes.push(format!("firmware: {e}"));
             }
@@ -249,9 +254,176 @@ fn pci_db() -> Option<String> {
     })
 }
 
+const USB_DEVICES: &str = "/sys/bus/usb/devices";
+
+/// A USB adapter's ids and strings fill the PCI-shaped rows (Vendor,
+/// Model) the Hardware tab already has.
+fn usb_names(hw: &mut NicHardware) {
+    let Some(u) = &hw.usb else { return };
+    hw.vendor_id = hw.vendor_id.or(u.vendor_id);
+    hw.device_id = hw.device_id.or(u.product_id);
+    hw.vendor = hw.vendor.clone().or_else(|| u.manufacturer.clone());
+    hw.model = hw.model.clone().or_else(|| u.product.clone());
+    hw.serial = hw.serial.clone().or_else(|| u.serial.clone());
+}
+
+/// The USB device behind interface `intf` (`4-2:1.0`) under `root`
+/// (`/sys/bus/usb/devices`; a fake tree in tests), and the link `ifname`
+/// on it. G1.29b.
+fn usb_info(root: &Path, intf: &str, ifname: &str) -> Option<UsbInfo> {
+    let port = intf
+        .split(':')
+        .next()
+        .filter(|p| safe(p) && !p.is_empty())?;
+    let dev = root.join(port);
+    if !dev.is_dir() {
+        return None;
+    }
+    let speed_mbps = read_trim(&dev.join("speed")).and_then(|s| hnic::usb_speed_mbps(&s));
+    let version = read_trim(&dev.join("version"));
+    let bos = fs::File::open(dev.join("bos_descriptors"))
+        .ok()
+        .and_then(|f| {
+            use std::io::Read;
+            let mut b = Vec::new();
+            f.take(4096).read_to_end(&mut b).ok()?;
+            Some(b)
+        });
+    let adapter_max_mbps = bos
+        .as_deref()
+        .and_then(hnic::bos_max_mbps)
+        .max(version.as_deref().and_then(hnic::usb_version_mbps))
+        .max(speed_mbps);
+    // The port: `port` → `../4-0:1.0/usb4-port2`; its hub is two levels up.
+    let port_dir = fs::canonicalize(dev.join("port")).ok();
+    let port_max_mbps = port_dir
+        .as_deref()
+        .and_then(|p| p.parent()?.parent())
+        .and_then(|hub| read_trim(&hub.join("speed")))
+        .and_then(|s| hnic::usb_speed_mbps(&s));
+    let lpm = port_dir
+        .as_deref()
+        .and_then(|p| read_trim(&p.join("usb3_lpm_permit")));
+    let over_current = port_dir
+        .as_deref()
+        .and_then(|p| read_trim(&p.join("over_current_count")))
+        .and_then(|s| s.parse().ok());
+    let port_power_switch = port_dir
+        .as_deref()
+        .is_some_and(|p| p.join("disable").exists());
+    Some(UsbInfo {
+        port: port.to_owned(),
+        speed_mbps,
+        adapter_max_mbps,
+        port_max_mbps,
+        version,
+        vendor_id: hex_id(&dev.join("idVendor")),
+        product_id: hex_id(&dev.join("idProduct")),
+        manufacturer: read_trim(&dev.join("manufacturer")),
+        product: read_trim(&dev.join("product")),
+        serial: read_trim(&dev.join("serial")),
+        revision: read_trim(&dev.join("bcdDevice")),
+        max_power_ma: read_trim(&dev.join("bMaxPower"))
+            .and_then(|s| s.trim_end_matches("mA").trim().parse().ok()),
+        autosuspend: read_trim(&dev.join("power/control")).map(|c| c == "auto"),
+        lpm,
+        over_current,
+        tx_timeouts: safe(ifname)
+            .then(|| tx_timeouts(&root.join(intf).join("net").join(ifname)))
+            .flatten(),
+        port_power_switch,
+    })
+}
+
+/// `NETDEV WATCHDOG` hits, summed over the link's transmit queues
+/// (`queues/tx-N/tx_timeout`, kernel 3.3+).
+pub(crate) fn tx_timeouts(link: &Path) -> Option<u64> {
+    let rd = fs::read_dir(link.join("queues")).ok()?;
+    let mut sum = None;
+    for e in rd.filter_map(Result::ok).take(MAX_ITEMS) {
+        if !e.file_name().to_string_lossy().starts_with("tx-") {
+            continue;
+        }
+        if let Some(n) = read_trim(&e.path().join("tx_timeout")).and_then(|s| s.parse::<u64>().ok())
+        {
+            sum = Some(sum.unwrap_or(0u64).saturating_add(n));
+        }
+    }
+    sum
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The RTL8153B of the development machine (0bda:8153 on bus 4,
+    /// port 2), as sysfs had it, in a fake tree.
+    #[test]
+    fn usb_adapter_from_sysfs() {
+        let root = std::env::temp_dir().join(format!("cr-usb-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let hub = root.join("usb4");
+        let port = hub.join("4-0:1.0/usb4-port2");
+        let dev = root.join("4-2");
+        let link = root.join("4-2:1.0/net/ether4");
+        for d in [
+            &port,
+            &dev.join("power"),
+            &link.join("queues/tx-0"),
+            &link.join("queues/rx-0"),
+        ] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let w = |p: PathBuf, s: &[u8]| fs::write(p, s).unwrap();
+        w(hub.join("speed"), b"10000\n");
+        w(port.join("usb3_lpm_permit"), b"u1_u2\n");
+        w(port.join("over_current_count"), b"0\n");
+        w(port.join("disable"), b"0\n");
+        std::os::unix::fs::symlink("../usb4/4-0:1.0/usb4-port2", dev.join("port")).unwrap();
+        for (f, v) in [
+            ("speed", "5000"),
+            ("version", " 3.00"),
+            ("idVendor", "0bda"),
+            ("idProduct", "8153"),
+            ("manufacturer", "Realtek"),
+            ("product", "USB 10/100/1000 LAN"),
+            ("serial", "001000001"),
+            ("bcdDevice", "3100"),
+            ("bMaxPower", "288mA"),
+            ("power/control", "on"),
+        ] {
+            w(dev.join(f), format!("{v}\n").as_bytes());
+        }
+        w(link.join("queues/tx-0/tx_timeout"), b"3\n");
+        let u = usb_info(&root, "4-2:1.0", "ether4").unwrap();
+        assert_eq!(u.port, "4-2");
+        assert_eq!(
+            (u.speed_mbps, u.adapter_max_mbps, u.port_max_mbps),
+            (Some(5000), Some(5000), Some(10_000))
+        );
+        assert_eq!((u.vendor_id, u.product_id), (Some(0x0bda), Some(0x8153)));
+        assert_eq!(u.max_power_ma, Some(288));
+        assert_eq!(u.autosuspend, Some(false));
+        assert_eq!(u.lpm.as_deref(), Some("u1_u2"));
+        assert_eq!(u.tx_timeouts, Some(3));
+        assert!(u.port_power_switch);
+        // Same adapter on a USB 2 port: it negotiates 480 and reports 2.10;
+        // the BOS descriptor still says SuperSpeed.
+        w(dev.join("speed"), b"480\n");
+        w(dev.join("version"), b" 2.10\n");
+        w(
+            dev.join("bos_descriptors"),
+            &[
+                0x05, 0x0f, 0x0f, 0x00, 0x01, 0x0a, 0x10, 0x03, 0x02, 0x0e, 0x00, 0x02, 0x0a, 0xff,
+                0x07,
+            ],
+        );
+        let u = usb_info(&root, "4-2:1.0", "ether4").unwrap();
+        assert_eq!((u.speed_mbps, u.adapter_max_mbps), (Some(480), Some(5000)));
+        assert!(usb_info(&root, "../x:1.0", "ether4").is_none());
+        assert!(usb_info(&root, "9-9:1.0", "ether4").is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn only_plain_names_become_paths() {

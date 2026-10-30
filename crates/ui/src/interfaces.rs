@@ -861,7 +861,13 @@ fn iface_row(row: &Value, spark: &std::collections::BTreeMap<String, String>) ->
         cells: vec![
             flag.to_owned(),
             i.name.clone(),
-            format!("{} {}", type_icon(&i.kind), i.kernel_kind),
+            // G1.29b: a USB adapter shows the USB icon, not the plug; the
+            // table paints it amber on a slow port (its name is the key).
+            format!(
+                "{} {}",
+                if row.get("usb").is_some_and(Value::is_object) { crate::icons::USB } else { type_icon(&i.kind) },
+                i.kernel_kind
+            ),
             crate::chip::cell("", &[(if i.disabled { "disabled" } else if i.running { "up" } else { "no link" }, if i.running && !i.disabled { crate::chip::Kind::Green } else { crate::chip::Kind::Neutral })]),
             i.mtu.clone(),
             human_bytes(n("rx_bytes")),
@@ -1109,7 +1115,7 @@ fn dialog_body(
         toggle_label = Some(if i.disabled { "Enable" } else { "Disable" });
         iface_tabs::tab_bar(ui, &mut p.tab, nic.get(&p.name));
         let view = nic.get_mut(&p.name);
-        iface_tabs::body(ui, p.tab, view, can, |ui, view| {
+        iface_tabs::body(ui, p.tab, view, can, help, |ui, view, help| {
             // A fixed label column: the fields do not move while the
             // window settles (or when the MAC rows arrive).
             Grid::new("fields")

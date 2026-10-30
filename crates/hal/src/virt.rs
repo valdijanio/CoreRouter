@@ -34,6 +34,9 @@ use crate::{
 pub const LAB_MLX5: [&str; 2] = ["ether7", "ether8"];
 /// The one of [`LAB_MLX5`] in switchdev mode.
 pub const LAB_SWITCHDEV: [&str; 1] = ["ether8"];
+/// Lab ports that pretend to be USB adapters (G1.29b): a RTL8153 on a
+/// USB 3 port, and the same chip on a USB 2.0 port (the slow-port alert).
+pub const LAB_USB: [(&str, u32); 2] = [("ether5", 5000), ("ether6", 480)];
 
 #[derive(Clone)]
 pub struct VirtualHal {
@@ -380,6 +383,10 @@ impl VirtualHal {
                     kind: iface.kind.label().to_owned(),
                     mtu: u32::from(iface.mtu),
                     mac: iface.mac.map(|m| m.to_string()),
+                    bus: LAB_USB
+                        .iter()
+                        .any(|(p, _)| *p == iface.name.as_str())
+                        .then(|| "usb".to_owned()),
                     unmanaged: None,
                     // Same numbers as `counters` (its `interface` group).
                     errors: Some(LinkErrors {
@@ -398,6 +405,50 @@ impl VirtualHal {
 }
 
 /// Factory MAC of lab port `index` (what `discover_links` reports).
+impl NicHardware {
+    /// A lab port of [`LAB_USB`] becomes a RTL8153 behind a USB port that
+    /// negotiated `speed` Mbit/s.
+    fn with_lab_usb(mut self, name: &str, n: u32) -> Self {
+        let Some((_, speed)) = LAB_USB.iter().find(|(p, _)| *p == name) else {
+            return self;
+        };
+        let port = format!("{n}-1");
+        self.bus = Some("usb".into());
+        self.bus_address = Some(format!("{port}:1.0"));
+        self.vendor_id = Some(0x0bda);
+        self.device_id = Some(0x8153);
+        self.vendor = Some("Realtek".into());
+        self.model = Some("USB 10/100/1000 LAN".into());
+        self.driver = Some("r8152".into());
+        self.firmware = None;
+        self.numa_node = None;
+        self.rx_queues = Some(1);
+        self.tx_queues = Some(1);
+        self.combined_channels = None;
+        self.combined_channels_max = None;
+        self.usb = Some(crate::nic::UsbInfo {
+            port,
+            speed_mbps: Some(*speed),
+            adapter_max_mbps: Some(5000),
+            port_max_mbps: Some(*speed),
+            version: Some(if *speed >= 5000 { "3.00" } else { "2.10" }.into()),
+            vendor_id: Some(0x0bda),
+            product_id: Some(0x8153),
+            manufacturer: Some("Realtek".into()),
+            product: Some("USB 10/100/1000 LAN".into()),
+            serial: Some(format!("CRU{n:05}")),
+            revision: Some("3100".into()),
+            max_power_ma: Some(288),
+            autosuspend: Some(false),
+            lpm: (*speed >= 5000).then(|| "0".into()),
+            over_current: Some(0),
+            tx_timeouts: Some(0),
+            port_power_switch: true,
+        });
+        self
+    }
+}
+
 fn lab_mac(index: usize) -> String {
     format!("02:00:00:00:00:{:02X}", (index + 1) & 0xFF)
 }
@@ -1132,7 +1183,8 @@ impl Hal for VirtualHal {
             ],
             notes: vec!["simulated by the virtual lab".into()],
             ..NicHardware::default()
-        })
+        }
+        .with_lab_usb(name.as_str(), n))
     }
 
     /// The `poll` counters plus rare, deterministic errors (one CRC error

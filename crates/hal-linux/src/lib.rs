@@ -982,6 +982,7 @@ mod linux {
                         mac: l.mac,
                         unmanaged: o.reason().map(str::to_owned),
                         errors: l.errors,
+                        bus: l.bus,
                     })
                 })
                 .collect()

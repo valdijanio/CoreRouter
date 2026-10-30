@@ -172,6 +172,9 @@ pub struct Inputs {
     /// where one side restarts gracefully, and those of them without BFD.
     /// `None`: no routing daemon reported.
     pub bgp_gr_no_bfd: Option<(usize, Vec<String>)>,
+    /// G1.29b: USB Ethernet adapters and, for each, the alert of a port
+    /// slower than the adapter. Empty: no USB adapter (no check then).
+    pub usb: Vec<(String, Option<String>)>,
     /// Whether any reading exists at all.
     pub readings: bool,
 }
@@ -589,6 +592,21 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
             });
         }
     }
+    // G1.29b: a USB adapter behind a port slower than itself caps the
+    // traffic with no error anywhere. Only on routers that have one.
+    if !i.usb.is_empty() {
+        let slow: Vec<&(String, Option<String>)> = i.usb.iter().filter(|(_, a)| a.is_some()).collect();
+        let (key, name) = ("interface.usb", "USB adapters");
+        if slow.is_empty() {
+            out.push(Check { key, name, severity: Severity::Ok, value: Some(i.usb.len().to_string()),
+                reason: format!("{} adaptador(es) USB, cada um numa porta da velocidade dele", i.usb.len()), action: None });
+        } else {
+            let list = slow.iter().take(3).map(|(n, a)| format!("{n}: {}", a.as_deref().unwrap_or(""))).collect::<Vec<_>>().join("; ");
+            out.push(Check { key, name, severity: Severity::Warning, value: Some(format!("{} de {}", slow.len(), i.usb.len())),
+                reason: format!("adaptador USB numa porta mais lenta que ele, o tráfego fica limitado sem erro nenhum: {list}"),
+                action: Some("Ligue o adaptador numa porta USB 3 (azul ou marcada SS), direto, com cabo USB 3; a aba Hardware da interface mostra a velocidade negociada.".into()) });
+        }
+    }
     out
 }
 
@@ -726,6 +744,18 @@ impl Session {
             .filter(|t| t.supervised)
             .map(|t| t.rows.iter().map(|r| (r.name.clone(), r.state)).collect());
         i.no_password = self.admins_without_password();
+        // G1.29b: one link dump, then a few sysfs reads per USB adapter.
+        let live = self.hal_mut().poll();
+        i.usb = live
+            .iter()
+            .filter(|l| l.bus.as_deref() == Some("usb"))
+            .take(crate::usb_nic::MAX_LISTED)
+            .map(|l| {
+                let alert = crate::usb_nic::summary(self, &l.name)
+                    .and_then(|v| v.get("alert").and_then(|a| a.as_str()).map(str::to_owned));
+                (l.name.to_string(), alert)
+            })
+            .collect();
         i.bgp_no_eor = self.routing_status().map(|st| {
             let quiet = bgp_without_eor(st)
                 .map(|b| b.connection.clone().unwrap_or_else(|| b.remote_address.clone()))
@@ -834,6 +864,7 @@ mod tests {
             root_verity: Some(("a".into(), true)),
             bgp_no_eor: Some((1, Vec::new())),
             bgp_gr_no_bfd: Some((1, Vec::new())),
+            usb: Vec::new(),
         }
     }
 
