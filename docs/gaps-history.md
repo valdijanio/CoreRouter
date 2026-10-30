@@ -287,3 +287,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-29 — G1.5a feito (rotas blackhole, unreachable e prohibit)
 - 2026-10-29 — G1.6n feito (nome de porta para placa que aparece depois do boot)
 - 2026-10-29 — G3.9c feito (OSPF stub router, RFC 6987); G3.9ca, G3.9cb e G3.9cc abertos
+- 2026-10-29 — G1.6t criado e feito (adoção de porta física que aparece com o roteador ligado)

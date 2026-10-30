@@ -8825,3 +8825,19 @@ continuação indentadas).
   pelo tamanho onde quer que o terminador apareça. Teste novo determinístico
   (`a_too_long_answer_in_one_read_is_refused`: o servidor escreve a resposta toda antes da
   primeira leitura); falha sem a correção. Depois dela, 300 em 300 sob a mesma carga.
+
+- 2026-10-29 — G1.6t: Porta física nova entra na configuração sozinha. Antes só o primeiro boot semeava as portas:
+  um adaptador USB, uma placa PCIe hot-plug ou uma virtio acrescentada à VM ligada ficavam "not
+  in the configuration (appeared after boot)", sem aceitar endereço nem nada (achado na VM
+  `corerouter-teste`: a RTL8153 virou `ether4`, mas `ip.address.add` dizia "no interface
+  'ether4'"). Agora o tick do daemon (uma leitura de links por segundo, a mesma do `poll_links`)
+  chama o comando novo `interface.ethernet.adopt` (journal e log), com o MTU, o MAC e o estado
+  do kernel, para toda porta Ethernet gerenciável fora da config que manteve o nome por 3
+  leituras (o PID 1 renomeia `ethN` → `etherN` em ~100 ms, G1.6n: o nome do kernel nunca é
+  adotado). Com mudanças pendentes no candidato (modo transacional), espera o candidato ficar
+  limpo e o commit leva só a porta. Porta adotada que some e volta não é adotada de novo. Falha
+  tenta de novo depois de 60 leituras. O lab virtual ganhou portas que aparecem depois do boot
+  (`VirtualHal::with_late_port`).
+
+  Como testar: `cargo test -p corerouter-engine adopt`. Na VM, a porta nova aparece em
+  Interfaces como as outras e aceita configuração.
