@@ -8427,3 +8427,43 @@ continuação indentadas).
   `crates/engine/tests/it/interface.rs` (as quatro consultas, a linha ethernet que o `set` aceita
   de volta). Laboratório: `cargo xtask vm-lab run -- scripts/routeros-interop-l2.sh prints` grava a
   saída do CHR 7.25 e a do CoreRouter lado a lado (`/tmp/crg39h/prints.txt` na VM).
+
+- 2026-10-29 — G0.31h: `ip.route.list` de uma tabela grande sem a memória da resposta (achado da validação T1: na VM
+  de 2 GiB o daemon foi de 307 para 847 MiB numa chamada e o kernel o matou por OOM na segunda).
+
+  - **Linhas sem árvore.** Cada linha é uma `Row` (`#[derive(Serialize)]`, emprestada da `Line` em
+    cache), nos campos e na ordem alfabética do mapa do `Value` de antes: o JSON sai igual byte a
+    byte (conferido contra o daemon da `main`).
+  - **Stream.** A consulta devolve um `off_lock::Streamed` (`Session::defer_stream`): o canal de
+    controle (TCP e TLS) escreve o envelope e as linhas direto no socket por um `BufWriter` de
+    64 KiB, sem montar a resposta; quem chama no processo recebe o `Value` montado das mesmas
+    linhas, sem passar por bytes. O WebSocket ainda junta a mensagem (1× a resposta).
+  - **Uma lista grande por vez** (10 000+ linhas depois do filtro, por sessão): a segunda recebe
+    `busy` com o que fazer (filtrar ou `ip.route.page`). A tabela de vizinhos fica travada só na
+    passada que marca os gateways `incomplete`, não enquanto um leitor lento recebe.
+  - **Sem limite padrão de linhas:** um `print` que corta rotas sem avisar engana o operador (o
+    RouterOS também imprime tudo); com o stream o tamanho deixou de custar memória.
+  - **Alocador:** o daemon usa o malloc da glibc (a imagem também: Bootlin glibc 2.39). O pico de
+    antes não voltava ao sistema porque eram blocos pequenos espalhados pela arena; sem eles não há
+    o que devolver, e o `malloc_trim` (que pediria `unsafe`) não entrou.
+
+  Como testar: `cargo nextest run -p corerouter-control --test route_list_memory` (20 000 rotas,
+  duas conexões ao mesmo tempo, reprova se o pico de RSS passar de metade da resposta: na `main`
+  dá +186 MB para 11,7 MB de resposta, aqui +0,3 MB); `cargo nextest run -p corerouter-engine
+  --test it off_lock` (JSON igual ao das linhas da página, todas as chaves do contrato, uma lista
+  grande por vez).
+
+- 2026-10-29 — processo: Release da imagem do roteador com chave própria, fora do CI. `cargo xtask os release-key init`
+  gera o par de **release** (Ed25519) numa pasta fora do repositório e do `/srv/build` (padrão
+  `~/.config/corerouter/release-key/`, 0700), com a privada cifrada por senha (Argon2id 128 MiB +
+  ChaCha20-Poly1305; `release-key check` confere um backup); a pública vai para
+  `os/keys/release/<id>.pub` por PR, e o `os check` recusa outro arquivo ali. A imagem de
+  desenvolvimento confia na chave de dev **e** nas de release (a VM de teste segue aceitando o
+  `os push`); a de release só nas de release. `cargo xtask os release --tag vX.Y.Z` confere que o
+  checkout é a tag (limpo, tag no `origin`, versão do workspace) e que a Release é um rascunho,
+  decifra a chave para o `$XDG_RUNTIME_DIR` só durante o build (apagada no fim), compila em
+  `<out>-release` (separado do build de dev), confere versão, commit, canal, assinatura e as
+  chaves confiadas do rootfs, junta os hashes ao `SHA256SUMS` do `.deb` e anexa `.crpkg`, ISO,
+  `.qcow2` e `.ova` ao rascunho com `gh release upload`; nunca cria tag nem publica. Passo a
+  passo em `docs/release.md`. Testar: `cargo test -p corerouter-image -p xtask release`; ponta a
+  ponta com uma chave temporária, uma tag local num clone descartável e `--dry-run`.
