@@ -180,6 +180,8 @@ const INST_FIELDS: &[Field] = &[
     // RFC 8538 (on by default).
     field("graceful_notification", "GR Notification", "bgp.instance.graceful_notification", Input::Check),
     field("hard_admin_reset", "Hard Admin Reset", "bgp.instance.hard_admin_reset", Input::Check),
+    // RFC 9494 (off by default).
+    field("llgr_stale_time", "LLGR Stale Time", "bgp.instance.llgr_stale_time", Input::Text("off (seconds)")),
 ];
 
 pub(crate) const INST_SPEC: Spec = Spec {
@@ -212,7 +214,7 @@ pub(crate) const TPL_SPEC: Spec = Spec {
     preview: "routing.bgp.template.check",
 };
 
-const INST_COLUMNS: [table::Column; 9] = [
+const INST_COLUMNS: [table::Column; 10] = [
     col("State").help("bgp.instance.disabled"),
     col("Name").help("bgp.instance.name"),
     col("AS").help("bgp.instance.asn"),
@@ -221,6 +223,7 @@ const INST_COLUMNS: [table::Column; 9] = [
     num("Stale Time").help("bgp.instance.graceful_stale_time"),
     num("Defer Time").help("bgp.instance.graceful_defer_time"),
     col("Notification").help("bgp.instance.graceful_notification"),
+    num("LLGR").help("bgp.instance.llgr_stale_time"),
     comment(),
 ];
 
@@ -398,6 +401,10 @@ impl SessionRow {
                 // G3.9fj, RFC 8538 §2: the neighbor's N bit.
                 if self.session.as_ref().is_some_and(|v| flag(v, "n_bit")) {
                     chips.push(("N", Kind::Blue));
+                }
+                // RFC 9494: the neighbor keeps long-lived stale routes too.
+                if self.session.as_ref().and_then(|v| u(v, "llgr_stale_time")).is_some() {
+                    chips.push(("LLGR", Kind::Blue));
                 }
                 if eor {
                     chips.push(("EoR", Kind::Blue));
@@ -582,6 +589,7 @@ fn inst_row(r: &Value) -> Row {
                 }
                 cell("", &chips)
             },
+            u(r, "llgr_stale_time").map_or_else(|| "off".to_owned(), |t| format!("{t} s")),
             s(r, "comment"),
         ],
         dimmed: disabled,
