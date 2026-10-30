@@ -309,8 +309,10 @@ fn config_keepable(
         return false;
     };
     let mut magic = [0u8; 2];
+    // G1.6v: a `/config` grown to the rest of the disk is still the one to
+    // keep (never smaller than the image's).
     let ok = have.first_lba * lbs == want.offset
-        && have.size_lba() * lbs == want.size
+        && have.size_lba() * lbs >= want.size
         && have.guid.eq_ignore_ascii_case(&want.guid)
         && disk
             .seek(SeekFrom::Start(want.offset + EXT4_MAGIC_AT))
@@ -542,17 +544,32 @@ pub fn install<R: Read + Seek + Send>(
         }
     }
     let verify_ms = tv.elapsed().as_millis() as u64;
-    // 5. The partition table, last.
+    // 5. The partition table, last. G1.6v: `/config` (the last partition)
+    // takes the rest of the disk when that gives it at least
+    // `gpt::CONFIG_MIN`; its filesystem (the image's, or the one kept)
+    // grows at the first boot.
+    let last_part = index.partitions.iter().map(|p| p.offset).max();
+    let config_end = gpt::aligned_last(disk_bytes / lbs, lbs);
     let new: Vec<NewPart> = index
         .partitions
         .iter()
-        .map(|p| NewPart {
-            name: p.name.clone(),
-            type_guid: p.type_guid.clone(),
-            guid: p.guid.clone(),
-            first_lba: p.offset / lbs,
-            last_lba: (p.offset + p.size) / lbs - 1,
-            attrs: p.attrs,
+        .map(|p| {
+            let mut last_lba = (p.offset + p.size) / lbs - 1;
+            if p.name == "config"
+                && last_part == Some(p.offset)
+                && config_end > last_lba
+                && (config_end + 1) * lbs - p.offset >= gpt::CONFIG_MIN
+            {
+                last_lba = config_end;
+            }
+            NewPart {
+                name: p.name.clone(),
+                type_guid: p.type_guid.clone(),
+                guid: p.guid.clone(),
+                first_lba: p.offset / lbs,
+                last_lba,
+                attrs: p.attrs,
+            }
         })
         .collect();
     let (primary, backup_at, backup) = gpt::build(disk_bytes / lbs, lbs, &index.disk_guid, &new)?;
@@ -953,6 +970,60 @@ mod tests {
         let mut first = [0u8; 4];
         g.read_exact_at(&mut first, 0).unwrap();
         assert_eq!(first, [0x11; 4]);
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&q);
+    }
+
+    /// G1.6v: on a disk with room, `/config` (the image's 1 MiB here) is
+    /// written to the end of the disk; reinstalling keeps it grown.
+    #[test]
+    fn config_takes_the_rest_of_a_big_disk() {
+        let b = build(|_| {});
+        let mut m = Medium::open(Cursor::new(b.iso.clone()), &b.keys).unwrap();
+        let p = std::env::temp_dir().join(format!("cr-install-big-{}", std::process::id()));
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&p)
+            .unwrap();
+        let len = 300 * MIB;
+        f.set_len(len).unwrap(); // sparse
+        install(&mut m, &f, len, 512, &opts(), &mut |_, _| {}).unwrap();
+        let parts = gpt::read(&mut &f, 512).unwrap();
+        let cfg = parts.iter().find(|p| p.name == "config").unwrap();
+        assert_eq!(cfg.last_lba, gpt::aligned_last(len / 512, 512));
+        assert!(cfg.size_lba() * 512 >= gpt::CONFIG_MIN);
+        let want = gpt::read(&mut Cursor::new(&b.disk), 512).unwrap();
+        for (a, w) in parts.iter().zip(&want).filter(|(a, _)| a.name != "config") {
+            assert_eq!(a, w, "only config moves");
+        }
+        // Reinstall keeping the configuration: the grown partition is kept.
+        assert_eq!(
+            existing(&mut &f, 512, &m.index),
+            Existing::CoreRouter {
+                config_keepable: true
+            }
+        );
+        let r = install(
+            &mut m,
+            &f,
+            len,
+            512,
+            &Opts {
+                keep_config: true,
+                ..opts()
+            },
+            &mut |_, _| {},
+        )
+        .unwrap();
+        assert!(r.kept_config);
+        assert_eq!(gpt::read(&mut &f, 512).unwrap(), parts);
+        // A disk that leaves /config under the minimum keeps the image's.
+        let (g, q) = target(16 * MIB, 0);
+        install(&mut m, &g, 16 * MIB, 512, &opts(), &mut |_, _| {}).unwrap();
+        assert_eq!(gpt::read(&mut &g, 512).unwrap(), want);
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(&q);
     }
