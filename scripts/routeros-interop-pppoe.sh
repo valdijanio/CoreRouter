@@ -290,6 +290,10 @@ pc_down() { pc_set "$1" disabled=yes; }
 pc_del() { rosx "/interface pppoe-client remove [find name=$1]" >/dev/null 2>&1 || true; }
 pc_running() { [ "$(ros "interface/pppoe-client?name=$1" | jq -r '.[0].running // "false"')" = true ]; }
 pc_not_running() { ! pc_running "$1"; }
+# The CHR redials within a second of a PADT, faster than a running=false poll
+# catches; its link-downs counter does not miss the drop.
+pc_downs() { ros "interface?name=$1" | jq -r '.[0]."link-downs" // "0"'; }
+pc_went_down() { [ "$(pc_downs "$1")" -gt "$2" ] || pc_not_running "$1"; }
 pc_mon() { rospost interface/pppoe-client/monitor "{\"numbers\":\"$1\",\"once\":\"\"}" | jq -c '.[0] // {}'; }
 cr_row() { cli ppp.active.list "{\"find\":\"$1\"}" | jq -c --arg n "$1" '[.rows[] | select(.name == $n)][0] // empty'; }
 cr_up() { [ -n "$(cr_row "$1")" ]; }
@@ -494,12 +498,12 @@ case_padt() {
   pc_up c1
   wait_for 30 pc_running c1 >/dev/null && wait_for 10 cr_up cpe1 >/dev/null || { result padt FAIL "no session"; return; }
   # BNG → CPE: ppp.active.remove sends PADT (and LCP Terminate-Request).
-  local id ms rm before; id=$(cr_row cpe1 | jq -r .id)
+  local id ms rm before downs; id=$(cr_row cpe1 | jq -r .id); downs=$(pc_downs c1)
   before=$(cli ppp.active.list '{"find":"cpe1"}' | jq -c '[.rows[] | {id, session_id, uptime_secs}]')
   timeout 25 tcpdump -i crgv1 -nn -e -l 'pppoed or (pppoes and ppp proto 0xc021)' > "$W/padt-wire.txt" 2>/dev/null &
   local tcpd=$!; sleep 1
   rm=$(cli ppp.active.remove "{\"id\":\"$id\"}" 2>&1) || rm=$(cli ppp.active.remove '{"name":"cpe1"}' 2>&1) || true
-  if ms=$(wait_for 20 pc_not_running c1); then
+  if ms=$(wait_for 20 pc_went_down c1 "$downs"); then
     result padt OK "BNG removes the session: CHR saw it down in ${ms} ms (keepalive 60 s, so by Terminate/PADT)"
   else
     result padt FAIL "BNG removed the session, CHR still up after 20 s"
