@@ -247,6 +247,24 @@ impl Cpes {
         r
     }
 
+    /// [`wait_for`] while serving the CPEs. A wait that left them alone
+    /// past the BNG's keepalive (10 s) had A end every session, and the
+    /// replica it waited for never got to `n`: in the queue's batches the
+    /// sync link came up 15–21 s late (the machine's ARP table full, see
+    /// `netns_nat_ipfix`), and a slow link must not fail the test by
+    /// itself. `ok` asks the daemons, so at most every 300 ms.
+    fn wait_for(&mut self, what: &'static str, mut ok: impl FnMut() -> bool) {
+        let mut next = Instant::now();
+        let done = self.run_until(what, 30, |_| {
+            if Instant::now() < next {
+                return false;
+            }
+            next = Instant::now() + Duration::from_millis(300);
+            ok()
+        });
+        assert!(done.is_some(), "timed out waiting for {what}");
+    }
+
     fn serve(
         &mut self,
         secs: u64,
@@ -564,13 +582,13 @@ fn hot_standby_keeps_every_session_when_the_active_dies() {
     let (b, n) = (p.b, p.n);
     let cpes = &mut p.cpes;
     // The standby's replica holds every session.
-    wait_for("the replica", || {
+    cpes.wait_for("the replica", || {
         call(Some(b), "ppp.redundancy.monitor", json!({}))
             .is_ok_and(|m| m["sync"]["synced"].as_u64() == Some(n as u64) && m["in_sync"] == true)
     });
     drop(p.a.take());
     let killed = Instant::now();
-    wait_for("B active", || role(Some(b)) == "active");
+    cpes.wait_for("B active", || role(Some(b)) == "active");
     let took = killed.elapsed();
     // Ten seconds of keepalive (1 s × 3 on the CPEs) on B: nobody falls.
     cpes.run_until("the takeover", 10, |_| false);
@@ -648,12 +666,12 @@ fn coa_to_the_old_active_reaches_the_new_one() {
     let cpes = &mut p.cpes;
     radius_incoming(None);
     radius_incoming(Some(b));
-    wait_for("both listening for CoA", || {
+    cpes.wait_for("both listening for CoA", || {
         [None, Some(b)].iter().all(|ns| {
             call(*ns, "radius.incoming.get", json!({})).is_ok_and(|v| v["listening"].is_string())
         })
     });
-    wait_for("the replica", || {
+    cpes.wait_for("the replica", || {
         call(Some(b), "ppp.redundancy.monitor", json!({}))
             .is_ok_and(|m| m["sync"]["synced"].as_u64() == Some(n as u64) && m["in_sync"] == true)
     });
@@ -667,10 +685,10 @@ fn coa_to_the_old_active_reaches_the_new_one() {
 
     // Switchover: B active, A the standby; the server still knows A.
     ok(None, "ppp.redundancy.switchover", json!({}));
-    wait_for("B active, A standby", || {
+    cpes.wait_for("B active, A standby", || {
         role(Some(b)) == "active" && role(None) == "standby"
     });
-    wait_for("B holds every session", || active(Some(b)) == n);
+    cpes.wait_for("B holds every session", || active(Some(b)) == n);
     cpes.run_until("the switchover", 3, |_| false);
     // CoA to A: B applies it, A answers ACK.
     let on_b = addresses(Some(b));

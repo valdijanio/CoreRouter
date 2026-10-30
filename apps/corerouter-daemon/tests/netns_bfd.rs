@@ -147,8 +147,14 @@ fn two_daemons_detect_a_dead_link_within_the_detection_time() {
     // B's row comes from the service's snapshot, copied every 500 ms: it
     // can still say `inactive` right after A is up.
     until("B's session up", 10, || session(Some(b))["state"] == "up");
-    let s = session(None);
-    assert_eq!(s["detect_time_us"], 150_000);
+    // Up and its detection time read in one row: on a starved machine the
+    // 150 ms session can fall between two reads (back to the slow timers,
+    // 3 s; flaked in the queue's batches), and come back.
+    let mut s = Value::Null;
+    until("A's session up with a 150 ms detection time", 10, || {
+        s = session(None);
+        s["state"] == "up" && s["detect_time_us"] == 150_000
+    });
     assert_eq!(s["users"], json!(["peer b"]));
     let list = ok(None, "routing.bfd.session.list", json!({}));
     assert_eq!(list["running"], true);
