@@ -708,6 +708,10 @@ fn readable(e: &rtnetlink::Error) -> String {
 }
 
 /// Static routes per (table, prefix, metric): the paths of one kernel route.
+/// Dumps of the kernel's routes by `apply` in this process (tests: a commit
+/// that touches one route reads none, G0.31/G0.31i).
+pub(crate) static ROUTE_DUMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 type Paths = std::collections::HashMap<(u32, IpNet, u32), Vec<KernelRoute>>;
 
 fn group_of(r: &KernelRoute) -> (u32, IpNet, u32) {
@@ -1268,6 +1272,7 @@ impl Kernel {
         if self.hops.borrow().is_some() {
             return Ok(());
         }
+        ROUTE_DUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let links: Vec<LinkMessage> = self
             .handle
             .link()
@@ -1307,6 +1312,17 @@ impl Kernel {
             .and_then(|p| p.get(&group_of(r)))
             .cloned()
             .unwrap_or_default())
+    }
+
+    /// `r` is CoreRouter's and no other path of ours, before or after,
+    /// shares its table, prefix and metric.
+    fn alone(&self, r: &KernelRoute) -> bool {
+        self.owned.contains(r)
+            && self
+                .owned
+                .iter()
+                .filter(|o| group_of(o) == group_of(r))
+                .all(|o| o == r)
     }
 
     fn note_hop(&self, r: &KernelRoute, present: bool) {
@@ -1411,6 +1427,26 @@ impl Kernel {
             self.note_hop(r, false);
             return Ok(vec![]);
         };
+        // G0.31i: a route alone in its group (table, prefix, metric) among
+        // CoreRouter's, before and after, is deleted without reading the
+        // kernel's routes: changing the distance of one route among 60 000
+        // dumped them all (85-230 ms). Not for a path of an ECMP group: a
+        // single-path RTM_DELROUTE matches only the first next hop
+        // (`fib_nh_match`, net/ipv4/fib_semantics.c of Linux 6.18) and
+        // would take the whole multipath route with it.
+        if self.hops.borrow().is_none() && self.alone(r) {
+            return match self
+                .handle
+                .route()
+                .del(route_msg(r, l.index)?)
+                .execute()
+                .await
+            {
+                Ok(()) => Ok(vec![Op::AddRoute(r.clone())]),
+                Err(e) if matches!(errno(&e), Some(ESRCH | ENOENT)) => Ok(vec![]),
+                Err(e) => Err(readable(&e)),
+            };
+        }
         let siblings = self.siblings(r).await?;
         if !siblings.contains(r) {
             return Ok(vec![]);

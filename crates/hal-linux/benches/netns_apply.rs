@@ -132,5 +132,47 @@ mod linux {
             }
         }
         g.finish();
+        one_of_many(c, &mut hal, &base);
+    }
+
+    /// G0.31i: one route changed among 60 000 in the kernel, each commit
+    /// timed alone (the way back untimed): its distance, a new one, its
+    /// comment (nothing for the kernel).
+    fn one_of_many(c: &mut Criterion, hal: &mut LinuxHal, base: &Config) {
+        const N: usize = 60_000;
+        let big = common::routes(base, N);
+        hal.apply(base, &big).unwrap();
+        let mut far = big.clone();
+        far.ip.routes.update(N / 2, |r| r.distance = 7);
+        let mut more = big.clone();
+        let mut extra = common::routes(base, 1).ip.routes.get(0).unwrap().clone();
+        extra.id = more.ip.next_route_id();
+        extra.dst_address = "198.18.0.0/24".parse().unwrap();
+        more.ip.routes.push(extra);
+        let mut noted = big.clone();
+        noted
+            .ip
+            .routes
+            .update(N / 2, |r| r.comment = "noted".into());
+        let mut g = c.benchmark_group("hal_linux_apply_one_of_60000");
+        g.sampling_mode(SamplingMode::Flat)
+            .sample_size(10)
+            .warm_up_time(Duration::from_millis(500));
+        for (name, to) in [("distance", &far), ("add", &more), ("comment", &noted)] {
+            g.bench_function(name, |b| {
+                b.iter_custom(|iters| {
+                    let mut spent = Duration::ZERO;
+                    for _ in 0..iters {
+                        let t = Instant::now();
+                        hal.apply(black_box(&big), black_box(to)).unwrap();
+                        spent += t.elapsed();
+                        hal.apply(to, &big).unwrap();
+                    }
+                    spent
+                });
+            });
+        }
+        g.finish();
+        hal.apply(&big, base).unwrap();
     }
 }
