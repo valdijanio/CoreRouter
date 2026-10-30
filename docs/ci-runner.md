@@ -85,9 +85,14 @@ ping), endereços das faixas privadas e IPv6 não. O `create` falha se algo vaza
 
 ## Etapa do usuário (uma vez)
 
+**Feita em 2026-10-30:** os três runners estão registrados e `online`, o snapshot `registered`
+existe e a opção de fork acima está ligada. Um token novo só é preciso depois de `destroy`, de
+`unregister` ou de a VM ficar mais de 14 dias desligada (o GitHub remove o runner sumido).
+
+
 1. **Conferir as opções do repositório** (GitHub → Settings → Actions → General):
    - *Fork pull request workflows from outside collaborators* → **Require approval for all
-     external contributors** (hoje: só *first-time contributors*). Um PR de fork não roda nada
+     external contributors** (ligado em 2026-10-30). Um PR de fork não roda nada
      sem a sua aprovação, e nunca aprove um que mexa em `.github/`.
    - *Workflow permissions* → **Read repository contents and packages permissions** (já está) e
      *Allow GitHub Actions to create and approve pull requests* desmarcado (já está).
