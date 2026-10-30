@@ -95,6 +95,8 @@ impl Session {
     pub(crate) fn poll_links(&mut self) {
         let live = self.hal_mut().poll();
         self.watch_links(&live);
+        // G1.6t: a card plugged in with the router running joins the config.
+        self.adopt_new_ports(&live);
         // G4.5: the same poll feeds the traffic graphs.
         self.graph_sample(&live);
         // G1.29c: finished USB recoveries; configuration back on a

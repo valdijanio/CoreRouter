@@ -38,9 +38,21 @@ pub const LAB_SWITCHDEV: [&str; 1] = ["ether8"];
 /// USB 3 port, and the same chip on a USB 2.0 port (the slow-port alert).
 pub const LAB_USB: [(&str, u32); 2] = [("ether5", 5000), ("ether6", 480)];
 
+/// A lab port that is not there at boot (G1.6t): it appears at poll
+/// `appears` (a card plugged in with the router running) and is gone again
+/// for the polls in `absent` (unplugged and plugged back).
+#[derive(Debug, Clone)]
+pub struct LatePort {
+    pub name: IfName,
+    pub appears: u64,
+    pub absent: Option<std::ops::Range<u64>>,
+}
+
 #[derive(Clone)]
 pub struct VirtualHal {
     ports: Vec<IfName>,
+    /// Ports plugged in after boot (G1.6t).
+    late: Vec<LatePort>,
     applied: Config,
     ticks: u64,
     /// Busy and total CPU ticks handed out by `resources` so far.
@@ -144,6 +156,28 @@ impl std::fmt::Debug for VirtualHal {
 }
 
 impl VirtualHal {
+    /// G1.6t: a port plugged in after boot (see [`LatePort`]).
+    #[must_use]
+    pub fn with_late_port(mut self, port: LatePort) -> Self {
+        self.late.push(port);
+        self
+    }
+
+    /// The late port `name` is plugged in now (`None`: not a late port).
+    fn late_present(&self, name: &IfName) -> Option<bool> {
+        let l = self.late.iter().find(|l| &l.name == name)?;
+        Some(self.ticks >= l.appears && !l.absent.as_ref().is_some_and(|r| r.contains(&self.ticks)))
+    }
+
+    /// The late ports plugged in now, with a MAC after the boot ports'.
+    fn late_now(&self) -> impl Iterator<Item = (usize, &IfName)> {
+        self.late
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| self.late_present(&l.name) == Some(true))
+            .map(|(i, l)| (self.ports.len() + i, &l.name))
+    }
+
     /// `ports` virtual Ethernet ports named `ether1..=etherN` (RouterOS style).
     pub fn new(ports: u8) -> Self {
         let ports: Vec<IfName> = (1..=ports)
@@ -165,6 +199,7 @@ impl VirtualHal {
         };
         Self {
             ports,
+            late: Vec::new(),
             applied: Config::default(),
             ticks: 0,
             cpu: (0, 0),
@@ -527,6 +562,7 @@ impl Hal for VirtualHal {
             .ports
             .iter()
             .enumerate()
+            .chain(self.late_now())
             .map(|(i, name)| LinkInfo {
                 name: name.clone(),
                 mac: Some(lab_mac(i)),
@@ -986,11 +1022,34 @@ impl Hal for VirtualHal {
 
     fn poll(&mut self) -> Vec<LinkState> {
         self.ticks = self.ticks.wrapping_add(1);
-        self.applied
+        let mut out: Vec<LinkState> = self
+            .applied
             .interfaces
             .keys()
+            .filter(|n| self.late_present(n) != Some(false))
             .filter_map(|n| self.sample(n))
-            .collect()
+            .collect();
+        // G1.6t: a late port not (yet) in the configuration, as the
+        // kernel shows a new card: there, up, no traffic.
+        out.extend(
+            self.late_now()
+                .filter(|(_, n)| !self.applied.interfaces.contains_key(*n))
+                .map(|(i, n)| LinkState {
+                    name: n.clone(),
+                    running: true,
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    rx_packets: 0,
+                    tx_packets: 0,
+                    kind: "ether".into(),
+                    mtu: 1500,
+                    mac: Some(lab_mac(i)),
+                    bus: None,
+                    unmanaged: None,
+                    errors: None,
+                }),
+        );
+        out
     }
 
     fn now_unix(&self) -> Option<u64> {
