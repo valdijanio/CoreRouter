@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use corerouter_model::cow_list::CowList;
 use corerouter_model::firewall::{
     Action, Family, FirewallRule, Name, Protocol, RejectWith, Table, Zone,
 };
@@ -13,8 +14,14 @@ use corerouter_model::{Config, Issue};
 use crate::graph;
 use crate::nft::{MarkKind, mark_value};
 
-/// Hostile-input bounds (**estimado**: far above what a router needs).
-pub const MAX_RULES: usize = 4096;
+/// Rules per table (G0.31j; was 4096, below the 10 000 filter rules of an
+/// ISP's config). RouterOS has no low limit: this one is set by what a
+/// rule costs, **medido** (release, 2026-10-29): ~5,4 KB of daemon memory,
+/// so 50 000 rules take ~290 MB, boot in 0,33 s and commit one rule in
+/// 2,6 ms, and some 500 bytes of kernel memory and of netlink batch. Four
+/// full tables (200 000 rules) are refused anyway by the size a config
+/// may have on disk. Still a bound against a hostile config file.
+pub const MAX_RULES: usize = 50_000;
 /// G4.10b: 262 144, room for every subscriber of a big ISP in a notice
 /// list (100 000 load in 0,24 s and cost nothing per packet, **medido**).
 pub const MAX_ADDRESS_LIST_ENTRIES: usize = 262_144;
@@ -463,6 +470,139 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
     out
 }
 
+/// At most this many changed rules are checked one by one by
+/// [`validate_since`]; past it the whole validation is as cheap.
+const MAX_SINCE: usize = 1024;
+
+/// [`validate`] of `new` from `old`, a config [`validate`] found nothing
+/// in, when only rules changed (G0.31j: the whole validation of 10 000
+/// rules took ~0,85 ms of a ~1 ms commit, **medido**). A rule's issues
+/// come from the rule, its table's jumps and the interface lists; with
+/// those the same, an untouched rule gives what it gave in `old`
+/// (nothing). So only the changed rules are looked at, in table order,
+/// as [`validate`] does. `None` (validate it all) when a jump or a mark
+/// changed, an id repeats, a table or the lists outgrow their bounds, or
+/// too many rules changed.
+pub fn validate_since(old: &Config, new: &Config) -> Option<Vec<Issue>> {
+    let (of, nf) = (&old.ip.firewall, &new.ip.firewall);
+    if old.interface_lists != new.interface_lists
+        || of.zones != nf.zones
+        || nf.address_lists.len() > MAX_ADDRESS_LIST_ENTRIES
+    {
+        return None;
+    }
+    let mut out = Vec::new();
+    for table in Table::ALL {
+        let (o, n) = (of.rules(table), nf.rules(table));
+        if CowList::ptr_eq(o, n) {
+            continue;
+        }
+        if n.len() > MAX_RULES {
+            return None;
+        }
+        let mut changed: Vec<&FirewallRule> = Vec::new();
+        for (or, nr) in changed_runs(o, n) {
+            let ov: Vec<&FirewallRule> = o.range(or.start, or.len()).collect();
+            let nv: Vec<&FirewallRule> = n.range(nr.start, nr.len()).collect();
+            let head = ov.iter().zip(&nv).take_while(|(a, b)| a == b).count();
+            let tail = ov
+                .iter()
+                .skip(head)
+                .rev()
+                .zip(nv.iter().skip(head).rev())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let gone = ov
+                .iter()
+                .skip(head)
+                .take(ov.len().saturating_sub(head + tail));
+            let came = nv
+                .iter()
+                .skip(head)
+                .take(nv.len().saturating_sub(head + tail));
+            if gone.chain(came.clone()).any(|r| shapes_others(r)) {
+                return None;
+            }
+            changed.extend(came);
+            if changed.len() > MAX_SINCE {
+                return None;
+            }
+        }
+        if changed.is_empty() {
+            continue;
+        }
+        // An id twice: `validate` reports it at the later rule, maybe an
+        // untouched one; leave the order to it.
+        let mut seen: BTreeMap<corerouter_model::ItemId, u32> =
+            changed.iter().map(|r| (r.id, 0)).collect();
+        for r in n {
+            if let Some(k) = seen.get_mut(&r.id) {
+                *k += 1;
+                if *k > 1 {
+                    return None;
+                }
+            }
+        }
+        let edges = graph::edges(n);
+        let mut roots: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for r in changed {
+            let chain = r.chain.as_str();
+            let reach = roots
+                .entry(chain)
+                .or_insert_with(|| graph::roots_in(table, &edges, chain));
+            out.extend(
+                issues_in(new, table, r, reach)
+                    .into_iter()
+                    .map(|(f, m)| Issue::new(format!("ip.firewall.{table}[{}].{f}", r.id), m)),
+            );
+        }
+    }
+    Some(out)
+}
+
+/// A rule whose change can change other rules' issues: a jump (the
+/// chains' roots, loops) or a mark (two names on one kernel mark).
+fn shapes_others(r: &FirewallRule) -> bool {
+    let m = &r.matchers;
+    !r.section
+        && (matches!(
+            r.action,
+            Action::Jump { .. }
+                | Action::MarkConnection { .. }
+                | Action::MarkPacket { .. }
+                | Action::MarkRouting { .. }
+        ) || m.connection_mark.is_some()
+            || m.packet_mark.is_some()
+            || m.routing_mark.is_some())
+}
+
+/// The runs of `old` and `new` outside the blocks they still share, as
+/// (range in `old`, range in `new`), in order.
+fn changed_runs<T>(
+    old: &CowList<T>,
+    new: &CowList<T>,
+) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    let mut out = Vec::new();
+    let (mut o, mut n, mut rn) = (0usize, 0usize, 0usize);
+    for (len, shared) in new.shared_blocks(old) {
+        match shared {
+            Some(os) if os >= o => {
+                if os > o || n > rn {
+                    out.push((o..os, rn..n));
+                }
+                o = os + len;
+                n += len;
+                rn = n;
+            }
+            _ => n += len,
+        }
+    }
+    if old.len() > o || new.len() > rn {
+        out.push((o..old.len(), rn..new.len()));
+    }
+    out
+}
+
 /// The zone matrix: cells name existing lists, never the same zone twice,
 /// each pair once.
 fn zone_issues(cfg: &Config) -> Vec<Issue> {
@@ -548,4 +688,85 @@ fn mark_collisions(cfg: &Config) -> Vec<Issue> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sample::{act, m, rule};
+
+    fn table(n: u32) -> Config {
+        let mut cfg = Config::default();
+        for i in 0..n {
+            let port = (1 + i % 60_000).to_string();
+            let r = rule(
+                i + 1,
+                "input",
+                m(&[("protocol", "tcp"), ("dst_port", port.as_str())]).unwrap(),
+                Action::Drop,
+            )
+            .unwrap();
+            cfg.ip.firewall.filter.push(r);
+        }
+        cfg
+    }
+
+    /// G0.31j: an ISP's 10 000 rules and up to `MAX_RULES` are fine; one
+    /// more is refused (whole or incremental).
+    #[test]
+    fn a_table_takes_max_rules_and_no_more() {
+        let full = table(u32::try_from(MAX_RULES).unwrap());
+        assert_eq!(validate(&full), Vec::new());
+        let mut over = full.clone();
+        over.ip
+            .firewall
+            .filter
+            .push(rule(u32::MAX, "input", m(&[]).unwrap(), Action::Accept).unwrap());
+        let issues = validate(&over);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(
+            issues[0].to_string().contains("at most 50000 rules"),
+            "{issues:?}"
+        );
+        assert_eq!(validate_since(&full, &over), None);
+    }
+
+    /// A commit's validation looks only at the rules it touched, with the
+    /// issues [`validate`] gives; what it cannot judge alone goes whole.
+    #[test]
+    fn since_checks_the_touched_rules_like_the_whole_validation() {
+        let old = table(3000);
+        assert_eq!(validate(&old), Vec::new());
+        let edit = |f: &dyn Fn(&mut FirewallRule)| {
+            let mut new = old.clone();
+            f(new.ip.firewall.filter.get_mut(1500).unwrap());
+            new
+        };
+        // A bad comment and ports without a protocol: found, in order.
+        let new = edit(&|r| {
+            r.comment = "x\u{7}".into();
+            r.matchers.protocol = None;
+        });
+        let whole = validate(&new);
+        assert_eq!(whole.len(), 2, "{whole:?}");
+        assert_eq!(validate_since(&old, &new), Some(whole));
+        // A fine change: nothing.
+        let new = edit(&|r| r.comment = "fine".into());
+        assert_eq!(validate_since(&old, &new), Some(Vec::new()));
+        // Nothing changed at all.
+        assert_eq!(validate_since(&old, &old.clone()), Some(Vec::new()));
+        // A jump and a mark change other rules' answers: validated whole.
+        let new = edit(&|r| r.action = act(r#"{"type":"jump","jump_target":"c"}"#).unwrap());
+        assert_eq!(validate_since(&old, &new), None);
+        let new =
+            edit(&|r| r.matchers.packet_mark = m(&[("packet_mark", "p")]).unwrap().packet_mark);
+        assert_eq!(validate_since(&old, &new), None);
+        // An id given twice.
+        let new = edit(&|r| r.id = corerouter_model::ItemId(1));
+        assert_eq!(validate_since(&old, &new), None);
+        // Other inputs of the rules' issues: validated whole.
+        let mut new = old.clone();
+        new.interface_lists = crate::sample::sample().interface_lists;
+        assert_eq!(validate_since(&old, &new), None);
+    }
 }
