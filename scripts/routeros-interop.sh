@@ -829,6 +829,9 @@ PY
 cr_stub() { cli routing.ospf.instance.list | jq -r '.[] | select(.name == "v2") | .stub_state.state // "none"'; }
 cr_stub_is() { [ "$(cr_stub)" = "$1" ]; }
 ping_r3_r4() { ip netns exec crr3 ping -D -i 0.01 -W 1 -I 10.255.39.3 10.255.39.4 > "$1" 2>&1 & echo $!; }
+# Writes the pings lost after power-on to $W/reboot-<label>.lost. Never
+# call it inside $(…): the daemon and FRR it restarts inherit the pipe and
+# the command substitution never sees EOF.
 cr_reboot() { # cr_reboot <label>
   local label=$1 log="$W/ping-stub-$1.txt"
   wait_for 90 via_cr 10.255.39.4/32 >/dev/null || true
@@ -861,7 +864,7 @@ cr_reboot() { # cr_reboot <label>
   back=$(lost_after "$tr" "$log")
   result stub-router INFO "reboot $label: Full ${full} ms after power-on (stub state then: $stub); CHR back through the CoreRouter at ${via} ms; $back pings lost after power-on, $((sent - recv)) of $sent in all"
   result stub-router INFO "reboot $label: holes (time after the cut: length): $(gaps "$t0" "$log")"
-  echo "$back"
+  echo "$back" > "$W/reboot-$label.lost"
 }
 case_stub-router() {
   [ -n "$(cli routing.ospf.interface-template.list | jq -r '.[] | select(.comment == "clientes de teste") | .id')" ] || {
@@ -903,13 +906,13 @@ case_stub-router() {
   # A reboot without, then with on-startup. Set on a running instance it
   # must not drain now (ospfd arms it at an area's first router-LSA).
   local plain timed
-  plain=$(cr_reboot plain | tail -1)
+  cr_reboot plain; plain=$(cat "$W/reboot-plain.lost" 2>/dev/null || echo "?")
   cli routing.ospf.instance.set '{"id":"v2","stub_router_on_startup":60}' >/dev/null
   sleep 5
   via_cr 10.255.39.4/32 && [ "$(cr_stub)" = off ] \
     && result stub-router OK "on-startup set on the running instance: no drain until the next start" \
     || result stub-router FAIL "on-startup on a running instance: stub $(cr_stub), CHR → R4 $(ros_route 10.255.39.4/32)"
-  timed=$(cr_reboot on-startup-60 | tail -1)
+  cr_reboot on-startup-60; timed=$(cat "$W/reboot-on-startup-60.lost" 2>/dev/null || echo "?")
   result stub-router INFO "pings lost after power-on: $plain without on-startup, $timed with on-startup 60 s"
   cli routing.ospf.instance.set '{"id":"v2","stub_router_on_startup":null}' >/dev/null
 }
