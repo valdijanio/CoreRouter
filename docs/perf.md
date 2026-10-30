@@ -2820,3 +2820,26 @@ topo.
   sem bind 1,53 (−19%). `cargo bench -p corerouter-hal --bench mpls_icmp` (host com outras
   sessões compilando): ler o quadro 74 ns, ICMP pela tabela IP 0,59 µs, pelo LSP com 100 000
   rótulos 0,82 µs.
+
+### G0.31h — `ip.route.list` de 60 000 rotas pelo canal de controle (**medido**, 2026-10-29)
+
+Daemon release no host (`--backend virtual`, 60 000 rotas /24 por `engine.batch`), cliente
+Python lendo o socket sem guardar a resposta; máquina carregada (load 25–30).
+
+| | `main` | G0.31h |
+|---|---|---|
+| RSS depois da importação | 310–312 MiB | 312–314 MiB |
+| RSS depois da 1ª lista | 680–884 MiB | 313–355 MiB (os +43 MiB, quando aparecem, são o cache das linhas, montado uma vez) |
+| Pico (`VmHWM`) depois de duas listas seguidas | 1 035 MiB | 314 MiB |
+| Pico com duas conexões ao mesmo tempo | 1 415 MiB | 314 MiB (uma recebe `busy`) |
+| Tempo da lista (33,2 MB) | 1,0–2,1 s | 0,10–0,65 s |
+
+Na imagem (`cargo xtask os build` desta branch, QEMU KVM `-m 2048`, TLS + login, 60 000 rotas
+pelo `engine.batch`, RSS do daemon pelo `system.resource.process.print` a cada 50 ms): 468 MiB
+depois da importação, 483 MiB depois de três listas seguidas e de duas ao mesmo tempo (uma
+`busy`), 38,1 MB cada em 0,09–0,12 s, o mesmo pid (sem OOM nem reinício). Antes (validação T1,
+`main`, VM do usuário de 2 GiB): 307 → 847 MiB na primeira e OOM kill na segunda.
+
+Em processo (`cargo bench -p corerouter-engine --bench scale -- ip.route.list`, `Value`
+montado das `Row`): 10 000 rotas 67,5 → 48,8 ms (−17 %, p < 0,05); 1 000 rotas 6,0 → 3,5 ms
+(sem diferença estatística).
