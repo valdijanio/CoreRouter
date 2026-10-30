@@ -2923,3 +2923,8 @@ lote netlink (50 000 regras = 24 MiB num lote, que só um root com `SO_SNDBUFFOR
   `hal-linux/benches/netns_mpls_ttl.rs`, MPLS de 64 octetos): sem taps 2,083 Melem/s; taps
   `AF_PACKET` do respondedor 1,633; com o filtro de "grande demais" (G3.9da) 1,644 — o filtro
   novo não custa nada mensurável.
+
+- **medido** (VM `corerouter-lab`, 4 vCPU, kernel 6.18, release, 2026-10-30,
+  `hal-linux/benches/netns_mpls_ttl.rs`, MPLS de 64 octetos, duas rodadas de 15 s por caso):
+  sem taps 1,715–2,039 Melem/s (início e fim de cada rodada); taps `AF_PACKET` 1,476 e 1,462;
+  tap tc (G3.9db) 1,844 e 1,986 — dentro da faixa do "sem taps", os sockets abaixo dela.

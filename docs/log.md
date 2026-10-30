@@ -8950,3 +8950,73 @@ continuação indentadas).
   lote da fila manda `test`, `bench-check` e `netns` para eles (255 s por lote contra 445 s nos
   runners do GitHub, **medido** no #465). `docs/ci-runner.md` diz o estado e quando um token novo é
   preciso.
+
+- 2026-10-30 — G1.3b: Drift, parte 2: portas que somem e voltam. Achado real (29/10, sessão USB-NIC): na VM de teste,
+  sem a placa da `ether2`, o `apply` do boot, que é tudo ou nada, falhou nas operações da `ether2` e
+  desfez tudo, inclusive o endereço de gerência da `ether3`.
+
+  - `corerouter_hal::absent` (novo): `missing` lista as portas físicas (`ether`) da config que a
+    plataforma não tem; `mask` tira essas portas, as VLANs em cima delas (qualquer profundidade), o
+    `primary` de bond que aponta para elas e a afinação de porta delas. Endereços e rotas delas saem
+    do plano sozinhos (só contam interfaces da config).
+  - `hal-linux`: o `apply` mascara o `to` com o que falta no kernel agora e o `from` com o que faltou
+    no último `apply` ou sumiu desde então (o kernel já não tem nada delas); guarda o conjunto e o
+    devolve em `Hal::absent_ports` (método novo, padrão vazio). Porta que some no meio do `apply`
+    faz ele voltar a `from` e tentar de novo uma vez sem ela. O `poll` anota porta reivindicada que
+    sumiu; o `reconcile` deixa de fora porta ausente agora.
+  - engine (`port_absent.rs`, novo): a cada `tick` anota no log a porta que some e a que volta e,
+    na volta, reaplica a config em vigor (`apply(running, running)`, que agora inclui a porta); erro
+    é repetido a cada segundo e logado quando muda. `interface.list` ganha `invalid` e
+    `invalid_reason` (porta ausente e VLANs nela); saúde ganha `interface.absent` (aviso, só quando
+    há); `config.drift.list`/`reconcile` não contam porta ausente como drift (ela já aparece
+    `invalid`).
+  - GUI: flag `I`, selo âmbar `invalid` na coluna Link e no painel de detalhes, motivo no Info,
+    linha esmaecida; o ⓘ da coluna Link explica (en/pt).
+
+  Como testar: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
+  corerouter-hal-linux --test netns_absent <teste>` (um teste por namespace: boot com porta
+  ausente; porta removida, commit que toca nela, devolvida, removida da config; porta que some
+  entre dois polls, achada pela nova tentativa);
+  `cargo test -p corerouter-engine --lib port_absent` (laboratório virtual: porta tirada e
+  devolvida, flag, saúde, log, reaplicação). Ponta a ponta (**medido**, 2026-10-30): daemon
+  `--backend linux --manage "ether*"` num namespace com dummies, `ether2` apagada: lista com `I`,
+  saúde `interface.absent`, drift vazio; daemon reiniciado sem `ether2`: `10.0.0.2/24` na `ether1`
+  (gerência) sobe; `ip link add ether2`: em ≤3 s `10.2.0.1/24` na `ether2` e a `vlan20` com
+  `10.20.0.1/24` de volta. Print em `docs/changes/G1.3b-screenshots/interfaces-invalid.png`.
+
+  Desempenho (**medido**, 2026-10-30, build release, namespace com dummies): o dump de links custa
+  62 µs com 3 links e 20,7 ms com 1000; o `apply` só o faz quando há porta ausente conhecida ou as
+  interfaces mudaram (commit de rotas ou firewall não paga nada a mais).
+
+- 2026-10-30 — G3.9db: MPLS: o respondedor do LSP ping e dos ICMP de pacote rotulado (G3.5b, G3.9d, G3.9da) passa a ouvir
+  por um classificador tc na entrada de cada interface MPLS (`lsp_tap`, no objeto do
+  `dataplane-ebpf`), que copia para um ring buffer só os quadros candidatos — a mesma decisão dos
+  filtros BPF clássicos, em `dataplane-ebpf-common/src/lsp_tap.rs`, conferida quadro a quadro contra
+  eles (teste fixo e proptest) — e deixa todo quadro seguir. Os sockets `AF_PACKET` faziam o kernel
+  chamar o `packet_rcv` em todo quadro do protocolo no host (−19% da troca de rótulos num núcleo,
+  **medido** na G3.9d).
+
+  - Carregado à parte (`hal-linux/src/lsp/ebpf.rs`), com todos os outros mapas do objeto no tamanho
+    mínimo; fail-open (o kernel solta o programa se o daemon morre); sem root, kernel antigo ou sem
+    `CAP_BPF`, volta aos sockets (`$COREROUTER_LSP_TAP=packet|ebpf` força um). O GSO agora é
+    conferido (`gso_size`): um pacote GSO grande não vira candidato a "too big".
+  - `lsp_ping_counters.tap` diz qual tap ouve e quantos quadros o tc copiou ou perdeu por ring cheio.
+  - Três blocos `unsafe` novos (36–38 em `docs/xdp.md`), para revisão humana.
+
+  Validado na VM do laboratório (kernel 6.18, **medido**): o verificador aceita o programa;
+  `netns_mpls_too_big` e `netns_mpls_ttl` passam com `COREROUTER_LSP_TAP=ebpf` (5/5, 0 quadros
+  perdidos por ring cheio); pesquisa e números em `docs/mpls.md`, "Tap do respondedor em eBPF".
+
+  Como testar: `cargo test -p corerouter-dataplane-ebpf-common --lib lsp_tap`, `cargo test -p
+  corerouter-hal-linux --lib lsp`; na VM como root (sem namespace de usuário):
+  `COREROUTER_NETNS_TESTS=1 COREROUTER_LSP_TAP=ebpf unshare --net -- cargo test -p
+  corerouter-hal-linux --test netns_mpls_too_big --test netns_mpls_ttl -- --nocapture` e
+  `COREROUTER_NETNS_BENCH=1 unshare --net -- cargo bench -p corerouter-hal-linux --bench
+  netns_mpls_ttl`.
+
+- 2026-10-30 — processo-unsafe-revisao: A regra do `unsafe` no `CLAUDE.md`/`AGENTS.md` foi atualizada: o crate `dataplane-ebpf` já existe
+  e tem programas XDP e tc, e o caminho da revisão humana, que só existia na prática (G3.9db,
+  #505), ficou escrito: o PR com `unsafe` abre sem o rótulo `fila` e com a seção
+  `## Revisão humana necessária`; a sessão principal resume cada bloco ao usuário; só depois do
+  "aprovo" dele ela põe o rótulo e registra a aprovação no PR. Todo bloco novo ou alterado passa
+  pela revisão, sem catálogo de padrões já aprovados (decisão do usuário, 2026-10-30).
