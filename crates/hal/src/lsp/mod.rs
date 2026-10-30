@@ -4,6 +4,11 @@
 //! - [`respond`]: what an LSR answers (egress and transit), without I/O;
 //! - [`expired`]: the ICMP "time exceeded" for a labeled packet whose TTL
 //!   expires here (G3.9d; the Linux forwarder sends none), without I/O;
+//! - [`too_big`]: the ICMP "fragmentation needed" / "packet too big" for a
+//!   labeled packet larger than its way out (G3.9da; none from Linux
+//!   either), without I/O;
+//! - [`rate`]: the responder's rate limits (global, per source), without
+//!   a clock;
 //! - [`sim`]: the lab's LSPs, answered by that same responder;
 //! - the traits here: the sending side ([`LspProber`] → [`LspSocket`],
 //!   used by the engine's tasks without the session lock) and the
@@ -17,8 +22,10 @@
 //! Alert option.
 
 pub mod expired;
+pub mod rate;
 pub mod respond;
 pub mod sim;
+pub mod too_big;
 pub mod wire;
 
 use std::net::{IpAddr, SocketAddr};
@@ -42,6 +49,8 @@ pub enum Frame {
     Echo(Heard),
     /// Any other labeled packet whose top TTL expired here.
     Expired(expired::Expired),
+    /// A labeled packet that may not fit its way out (G3.9da).
+    TooBig(too_big::TooBig),
 }
 
 /// One way the FEC leaves this router (the FTN entry: the route of the
@@ -113,6 +122,9 @@ pub type SharedLspProber = Arc<dyn LspProber>;
 pub trait LspResponderIo: Send {
     /// Interfaces to listen on (the MPLS ones); replaces the set.
     fn set_interfaces(&mut self, names: &[IfName]) -> Vec<(IfName, String)>;
+    /// Also hear labeled packets that may not fit their way out
+    /// ([`Frame::TooBig`], G3.9da). Off by default.
+    fn hear_too_big(&mut self, _on: bool) {}
     /// The next request or expired packet, waiting at most `wait`.
     fn recv(&mut self, wait: Duration) -> Result<Option<Frame>, HalError>;
     /// Send one reply.

@@ -155,6 +155,56 @@ fn icmp_ttl_exceeded_settings() {
     assert_eq!(st["icmp_rate"], 500);
 }
 
+/// G3.9da: ICMP too big on by default, a per-source rate under the global
+/// one; bounds and rollback as for `icmp_rate`.
+#[test]
+fn icmp_too_big_and_per_source_rate_settings() {
+    let mut s = Session::virtual_lab();
+    let st = ok(&mut s, "mpls.settings.get", json!({}));
+    assert_eq!(st["icmp_too_big"], true);
+    assert_eq!(st["icmp_rate_per_source"], 10);
+    let set = ok(
+        &mut s,
+        "mpls.settings.set",
+        json!({"icmp_too_big": false, "icmp_rate_per_source": 3}),
+    );
+    assert_eq!(
+        (
+            set["icmp_too_big"].clone(),
+            set["icmp_rate_per_source"].clone()
+        ),
+        (json!(false), json!(3))
+    );
+    for bad in [0, 10_001] {
+        let e = err(
+            &mut s,
+            "mpls.settings.set",
+            json!({"icmp_rate_per_source": bad}),
+        );
+        assert!(
+            e.contains("icmp_rate_per_source") && e.contains("errors per second"),
+            "{e}"
+        );
+    }
+    let before = s.store().running().clone();
+    assert!(
+        s.batch(
+            &json!([
+                {"command": "mpls.settings.set", "params": {"icmp_too_big": true}},
+                {"command": "mpls.settings.set", "params": {"icmp_rate_per_source": 0}},
+            ]),
+            true,
+        )
+        .is_err()
+    );
+    assert_eq!(s.store().running(), &before);
+    let st = ok(&mut s, "mpls.settings.get", json!({}));
+    assert_eq!(st["icmp_too_big"], false);
+    // Only the ICMP side on still listens.
+    let p = corerouter_engine::lsp_responder::plan(&s);
+    assert!(p.icmp && !p.too_big && p.icmp_rate_per_source == 3);
+}
+
 #[test]
 fn a_failed_batch_leaves_nothing() {
     let mut s = Session::virtual_lab();

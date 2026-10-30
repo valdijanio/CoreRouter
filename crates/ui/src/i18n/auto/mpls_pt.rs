@@ -141,10 +141,29 @@ Mostra só as FECs sem rótulo de saída: onde o LSP quebra."##),
     (r##"mpls.gtsm"##, r##"## O que é
 GTSM (RFC 6720): os pacotes LDP de um vizinho diretamente conectado precisam chegar com TTL 255, então um atacante remoto não alcança a sessão. Negociado no Hello; ligado por padrão. No IPv6 é sempre ligado (RFC 7552 §9)."##),
     (r##"mpls.icmp_rate"##, r##"## O que é
-Quantos erros ICMP "time exceeded" de pacotes rotulados expirados este roteador manda por segundo, no máximo (padrão 100). O excedente é descartado e contado.
+Quantos erros ICMP sobre pacotes rotulados (TTL vencido e grande demais) este roteador manda por segundo, no máximo, somando todas as origens (padrão 100). O excedente é descartado e contado.
 
 ## Por quê
-Uma enxurrada de pacotes com TTL 1 não pode ocupar o plano de controle (a RFC 1812 §4.3.2.8 pede limite nos erros ICMP). Cada erro tem uns 200 bytes no máximo e vai só para a origem do pacote expirado."##),
+Uma enxurrada de pacotes com TTL 1 não pode ocupar o plano de controle (a RFC 1812 §4.3.2.8 pede limite nos erros ICMP). Cada erro vai só para a origem do pacote de que fala. Cada origem tem também um limite próprio, menor (ICMP Rate Per Source)."##),
+    (r##"mpls.icmp_rate_per_source"##, r##"## O que é
+Quantos desses erros ICMP uma mesma origem recebe por segundo, no máximo (padrão 10; um traceroute precisa de 3 por salto). Conferido antes do limite total.
+
+## Por quê
+Sem ele, um host mandando uma enxurrada de TTL 1 gastava todo o ICMP Rate, e o traceroute dos outros mostrava `*` neste salto. O Linux faz o mesmo com os erros dele (`icmp_ratelimit`, por destino).
+
+## Diagnóstico
+O `mpls.settings.get` mostra `icmp_counters.rate_limited_source` (recusados por este limite) separado de `rate_limited` (o total)."##),
+    (r##"mpls.icmp_too_big"##, r##"## O que é
+Quando um pacote rotulado é maior que o MTU do enlace por onde o rótulo sai, devolve à origem o ICMP "fragmentation needed" (IPv4 com DF) ou o ICMPv6 "packet too big" com o MTU que cabe: o MTU do enlace menos os rótulos que sairiam (RFC 3032 §3.4–3.5). No IPv4 vai junto a pilha de rótulos com que ele chegou (RFC 4950).
+
+## Por quê
+O MPLS do kernel Linux descarta esses pacotes sem erro, e a descoberta de MTU do caminho (PMTUD) através do LSP falhava: a conexão abre e trava no primeiro pacote cheio. Só os roteadores no meio do LSP precisam disto; onde o pacote ganha o rótulo, a camada IP já responde.
+
+## Não manda
+IPv4 sem DF (a RFC 3032 §3.4 deixa o roteador descartar), fragmento IPv6 pequeno, erro sobre erro ICMP.
+
+## Diagnóstico
+O `mpls.settings.get` mostra `icmp_counters.too_big` (ouvidos) e `too_big_sent`; `reasons` diz por que os outros não tiveram erro ("fits the way out", "DF not set…")."##),
     (r##"mpls.icmp_ttl_exceeded"##, r##"## O que é
 Quando o TTL de um pacote rotulado expira neste roteador, devolve à origem o ICMP "time exceeded" com a pilha de rótulos com que ele chegou (RFC 4950: o traceroute mostra `MPLS:L=…`).
 
@@ -155,7 +174,7 @@ O MPLS do kernel Linux descarta esses pacotes sem erro, e o traceroute através 
 Com um rótulo e uma rota IP até a origem, pela tabela IP. Com mais rótulos (uma VPN), pelo próprio LSP, como descreve a RFC 3032 §2.3.2: o egress o roteia de volta à origem.
 
 ## Diagnóstico
-`mpls.settings.get` mostra `icmp_counters`: pacotes expirados ouvidos, erros enviados, descartados pela taxa e por motivo."##),
+`mpls.settings.get` mostra `icmp_counters`: pacotes expirados ouvidos, erros enviados, descartados pelas taxas e por motivo."##),
     (r##"mpls.if"##, r##"## O que é
 LDP numa interface: Hellos de enlace para 224.0.0.2 (IPv6 ff02::2) a cada intervalo, e as adjacências que eles formam (RFC 5036 §2.4.1)."##),
     (r##"mpls.if.adjacencies"##, r##"## O que é
