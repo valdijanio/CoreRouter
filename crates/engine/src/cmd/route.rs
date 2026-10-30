@@ -2,6 +2,7 @@
 //! addresses in `ip.route.list` (flagged dynamic/connected, as in RouterOS).
 
 use corerouter_model::dhcp_client::CheckGateway;
+use corerouter_model::types::Discard;
 use corerouter_model::{
     Config, DEFAULT_DISTANCE, Gateway, ItemId, RouteEntry, RoutingTable, parse_destination,
 };
@@ -25,7 +26,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add Route",
         ["IP", "Routes"],
         None,
-        "{dst_address: cidr | ip (0.0.0.0/0, ::/0, 10.1.0.0/16, 192.0.2.7), gateway: ip | interface | ip%interface, distance?: u32 (1..=255, default 1), routing_table?: string (main | VRF name, default main), check_gateway?: none | ping | arp | bfd (default none; ping/arp every 10 s, down after 2 misses: the route leaves the kernel and the next distance wins), bfd_profile?: string (check_gateway=bfd; default 'default'), disabled?: bool, comment?: string} → {id}",
+        "{dst_address: cidr | ip (0.0.0.0/0, ::/0, 10.1.0.0/16, 192.0.2.7), gateway?: ip | interface | ip%interface | blackhole | unreachable | prohibit (required unless type is a discard), type?: unicast | blackhole | unreachable | prohibit (RouterOS v6 type; blackhole drops silently, unreachable answers ICMP unreachable, prohibit ICMP administratively prohibited; default unicast), blackhole?: bool (RouterOS v7: type=blackhole), distance?: u32 (1..=255, default 1), routing_table?: string (main | VRF name, default main), check_gateway?: none | ping | arp | bfd (default none; ping/arp every 10 s, down after 2 misses: the route leaves the kernel and the next distance wins), bfd_profile?: string (check_gateway=bfd; default 'default'), disabled?: bool, comment?: string} → {id}",
         always,
         add
     ),
@@ -34,7 +35,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set Route",
         [],
         None,
-        "{id: *hex, dst_address?: cidr | ip, gateway?: ip | interface | ip%interface, distance?: u32 (1..=255), routing_table?: string, check_gateway?: none | ping | arp | bfd, bfd_profile?: string (check_gateway=bfd; empty: default), disabled?: bool, comment?: string} → {id}",
+        "{id: *hex, dst_address?: cidr | ip, gateway?: ip | interface | ip%interface | blackhole | unreachable | prohibit, type?: unicast | blackhole | unreachable | prohibit (unicast needs a gateway), blackhole?: bool, distance?: u32 (1..=255), routing_table?: string, check_gateway?: none | ping | arp | bfd, bfd_profile?: string (check_gateway=bfd; empty: default), disabled?: bool, comment?: string} → {id}",
         has_routes,
         set
     ),
@@ -54,7 +55,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{gateway?: ip} → [{time (Unix s; null: no clock), gateway, method, to (up | down), routes, message}]",
         always, check_history),
     cmd!(query "ip.route.list", "Routes", ["IP", "Routes"], None,
-        "{routing_table?: string, family?: string (ipv4 | ipv6), state?: string (active | standby | inactive), origin?: string (connected | static | dhcp | ra)} → [{key (stable row key), id (null if connected), dst_address, family, gateway (as configured), gateway_address, gateway_interface, gateway_status (reachable | unreachable | incomplete: the gateway does not answer ARP/ND; null if connected), check_gateway (null | {method (arp | ping | bfd), interval_secs (0: bfd), misses, state (up | down), status (checking | reachable | unreachable | not-checked), hold_down_secs (answers again, held for flapping; null), bfd_profile (bfd; null)}), distance, routing_table, flags (X disabled, A active, D dynamic, C connected, S static, + ECMP), state (active | standby: a lower distance wins | inactive), active, static, connected, dynamic (from a DHCP lease, a Router Advertisement or connected), origin (connected | static | dhcp | ra), disabled, immediate_gw, interface, ecmp (paths of its ECMP group), reason (why standby or inactive), reason_id, reason_args, notice (null | {level (info: paths of one origin | warning: origins mixed or the default route, split per connection between uplinks), text, id, args, fix (the command that makes one path a backup; null)}), changed_at (Unix s it took its state; null: before watching), changed_secs, comment}]",
+        "{routing_table?: string, family?: string (ipv4 | ipv6), state?: string (active | standby | inactive), origin?: string (connected | static | dhcp | ra)} → [{key (stable row key), id (null if connected), dst_address, family, gateway (as configured), gateway_address, gateway_interface, gateway_status (reachable | unreachable | incomplete: the gateway does not answer ARP/ND; null if connected or without next hop), check_gateway (null | {method (arp | ping | bfd), interval_secs (0: bfd), misses, state (up | down), status (checking | reachable | unreachable | not-checked), hold_down_secs (answers again, held for flapping; null), bfd_profile (bfd; null)}), distance, routing_table, flags (X disabled, A active, D dynamic, C connected, S static, B blackhole, U unreachable, P prohibit, + ECMP), state (active | standby: a lower distance wins | inactive), active, static, connected, dynamic (from a DHCP lease, a Router Advertisement or connected), origin (connected | static | dhcp | ra), disabled, immediate_gw, interface, ecmp (paths of its ECMP group), reason (why standby or inactive), reason_id, reason_args, notice (null | {level (info: paths of one origin | warning: origins mixed or the default route, split per connection between uplinks), text, id, args, fix (the command that makes one path a backup; null)}), changed_at (Unix s it took its state; null: before watching), changed_secs, comment, type (unicast | blackhole | unreachable | prohibit)}]",
         always, list),
 ];
 
@@ -93,10 +94,74 @@ fn check(cfg: &Config, r: &RouteEntry) -> Result<()> {
     }
 }
 
+/// G1.5a: what the route does with a packet, from `type` (RouterOS v6),
+/// `blackhole` (v7) and `gateway` (which may be one of the three words).
+/// `None`: none of them given. `Some(Err)` for a unicast route without
+/// gateway is left to the caller (`set` keeps the route's own).
+fn gateway_of(p: &Value) -> Result<Option<GatewayAsked>> {
+    let gateway: Option<Gateway> = opt_parse(p, "gateway")?;
+    let kind = opt_choice(p, "type", &["unicast", "blackhole", "unreachable", "prohibit"])?;
+    let blackhole = opt_bool(p, "blackhole")?;
+    let kind = match (kind, blackhole) {
+        (Some(k), Some(true)) if k != "blackhole" => {
+            return Err(EngineError::bad(
+                "blackhole",
+                format!("blackhole=true contradicts type={k}; give one of them"),
+            ));
+        }
+        (Some("unicast"), _) | (None, Some(false)) => Some(None),
+        (Some(k), _) => Some(Discard::parse(k)),
+        (None, Some(true)) => Some(Some(Discard::Blackhole)),
+        (None, None) => None,
+    };
+    Ok(match (kind, gateway) {
+        (None, None) => None,
+        (None, Some(g)) => Some(GatewayAsked::Is(g)),
+        (Some(Some(d)), None) => Some(GatewayAsked::Is(Gateway::discard(d))),
+        (Some(Some(d)), Some(g)) if g.discards() == Some(d) => Some(GatewayAsked::Is(g)),
+        (Some(Some(d)), Some(g)) => {
+            return Err(EngineError::bad(
+                "gateway",
+                format!(
+                    "a {} route has no gateway ('{g}'); leave gateway out",
+                    d.as_str()
+                ),
+            ));
+        }
+        (Some(None), Some(g)) if g.discards().is_some() => {
+            return Err(EngineError::bad(
+                "type",
+                format!("type=unicast needs a gateway, not '{g}'"),
+            ));
+        }
+        (Some(None), Some(g)) => Some(GatewayAsked::Is(g)),
+        (Some(None), None) => Some(GatewayAsked::Unicast),
+    })
+}
+
+/// What [`gateway_of`] read.
+enum GatewayAsked {
+    Is(Gateway),
+    /// `type=unicast` (or `blackhole=false`) without a gateway: the route's
+    /// own, if it has one.
+    Unicast,
+}
+
+fn need_gateway() -> EngineError {
+    EngineError::bad(
+        "gateway",
+        "is required (an IP, an interface or ip%interface; type=blackhole, unreachable or \
+         prohibit for a route without next hop)",
+    )
+}
+
 fn add(s: &mut Session, p: &Value) -> Result<Value> {
     let dst = parse_destination(req_str(p, "dst_address")?)
         .map_err(|e| EngineError::bad("dst_address", e.to_string()))?;
-    let gateway: Gateway = req_parse(p, "gateway")?;
+    let gateway = match gateway_of(p)? {
+        Some(GatewayAsked::Is(g)) => g,
+        None | Some(GatewayAsked::Unicast) => return Err(need_gateway()),
+    };
     let distance = opt_distance(p)?.unwrap_or(DEFAULT_DISTANCE);
     let routing_table: RoutingTable = opt_parse(p, "routing_table")?.unwrap_or_default();
     let disabled = opt_bool(p, "disabled")?.unwrap_or(false);
@@ -155,7 +220,7 @@ fn existing(cfg: &Config, p: &Value) -> Result<(usize, ItemId)> {
 
 fn set(s: &mut Session, p: &Value) -> Result<Value> {
     let dst = opt_dst(p)?;
-    let gateway: Option<Gateway> = opt_parse(p, "gateway")?;
+    let gateway = gateway_of(p)?;
     let distance = opt_distance(p)?;
     let table: Option<RoutingTable> = opt_parse(p, "routing_table")?;
     let disabled = opt_bool(p, "disabled")?;
@@ -174,8 +239,12 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(d) = dst {
         route.dst_address = d;
     }
-    if let Some(g) = gateway {
-        route.gateway = g;
+    match gateway {
+        Some(GatewayAsked::Is(g)) => route.gateway = g,
+        Some(GatewayAsked::Unicast) if route.gateway.discards().is_some() => {
+            return Err(need_gateway());
+        }
+        Some(GatewayAsked::Unicast) | None => {}
     }
     if let Some(d) = distance {
         route.distance = d;
@@ -297,6 +366,9 @@ pub(crate) struct Row<'a> {
     state: &'static str,
     #[serde(rename = "static")]
     is_static: bool,
+    /// G1.5a: `unicast`, or what a route without next hop does.
+    #[serde(rename = "type")]
+    kind: &'static str,
 }
 
 #[derive(serde::Serialize)]
@@ -342,7 +414,9 @@ impl<'a> Row<'a> {
     pub(crate) fn new(l: &'a Line, watch: Option<&Changed>, now: Option<u64>) -> Self {
         let changed_at = watch.and_then(|w| w.changed_at(&l.key));
         let gateway_status = match l.origin {
+            // No gateway to reach: connected, or no next hop (G1.5a).
             Origin::Connected => None,
+            _ if l.discard.is_some() => None,
             _ if l.via.is_some() => Some("reachable"),
             _ => Some("unreachable"),
         };
@@ -392,6 +466,7 @@ impl<'a> Row<'a> {
             routing_table: &l.table,
             state: l.state.as_str(),
             is_static: matches!(l.origin, Origin::Static | Origin::Dhcp),
+            kind: l.discard.map_or("unicast", Discard::as_str),
         }
     }
 }

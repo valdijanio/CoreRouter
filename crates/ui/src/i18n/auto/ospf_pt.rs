@@ -33,6 +33,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Diagnose"##, r##"Diagnosticar"##),
     (r##"Diagnosing…"##, r##"Diagnosticando…"##),
     (r##"Disabled"##, r##"Desativado"##),
+    (r##"Drain"##, r##"Drenar"##),
     (r##"External"##, r##"Externo"##),
     (r##"Fast Reroute"##, r##"Fast Reroute"##),
     (r##"Fit"##, r##"Ajustar"##),
@@ -117,6 +118,8 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Simulate"##, r##"Simular"##),
     (r##"Simulate Link Cut"##, r##"Simular corte de link"##),
     (r##"State"##, r##"Estado"##),
+    (r##"Stub Router"##, r##"Stub router"##),
+    (r##"Stub Router On Startup"##, r##"Stub router na partida"##),
     (r##"Subscriber Pools"##, r##"Pools de assinantes"##),
     (r##"Summary"##, r##"Summary"##),
     (r##"TI-LFA"##, r##"TI-LFA"##),
@@ -130,6 +133,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Turn Off…"##, r##"Desligar…"##),
     (r##"Turn On…"##, r##"Ligar…"##),
     (r##"Type"##, r##"Tipo"##),
+    (r##"Undrain"##, r##"Desfazer drenagem"##),
     (r##"Unprotected"##, r##"Sem proteção"##),
     (r##"Uptime"##, r##"Tempo de pé"##),
     (r##"Used By"##, r##"Usada por"##),
@@ -206,6 +210,11 @@ Os segmentos do reparo calculados como o `ospfd` faz (nó PQ, ou nó P e adjacê
 **Rotas**: cada rota com o próximo salto principal e o de reserva e a pilha de rótulos (como o next-hop de reserva do Junos). **Sem proteção**: as rotas sem reserva e por quê (único caminho, conectada, externa, roteador sem SID). **Simular corte de link**: escolha um vizinho e veja o reserva de cada rota afetada e o caminho depois da convergência, sem tocar a rede."##),
     (r##"ospf.instance"##, r##"## O que é
 Uma instância OSPF (`/routing ospf instance`). A prévia mostra em quais interfaces ela roda e o que a mudança faz (inclusive adjacências que caem)."##),
+    (r##"ospf.instance.drain"##, r##"## O que é
+Liga (Drenar) ou desliga (Desfazer drenagem) o stub router da instância selecionada: `routing.ospf.instance.set {stub_router}`. Drenado, todo enlace de trânsito da router-LSA vai a custo 65535 e o tráfego contorna este roteador; as redes dele continuam alcançáveis (RFC 6987).
+
+## Quando
+Antes de uma manutenção, ou para pôr um roteador novo no núcleo sem carregar tráfego. Em Safe Mode ou em modo transacional, a mudança volta junto com o resto."##),
     (r##"ospf.instance.name"##, r##"## O que é
 O nome da instância (as áreas a citam por ele)."##),
     (r##"ospf.instance.originate_default"##, r##"## O que é
@@ -222,6 +231,22 @@ O identificador de 32 bits do roteador no OSPF, único no AS (RFC 2328 §C.1).
 
 ## Recomendado
 Fixe um (o endereço de uma loopback). Vazio, o daemon escolhe, e trocar o router id derruba **todas** as adjacências."##),
+    (r##"ospf.instance.stub_router"##, r##"## O que é
+Stub router (RFC 6987, `max-metric router-lsa administrative` do FRR): a router-LSA descreve todo enlace de trânsito (ponto a ponto, LAN com DR, enlace virtual) com custo 65535, e a loopback e as redes passivas com o custo delas. Os outros roteadores param de passar **por** este, mas continuam chegando a ele. No OSPFv3 o bit R é limpo: nunca é trânsito, nem como único caminho.
+
+## Cuidados
+Custo 65535 não é infinito: onde este roteador é o único caminho, o tráfego ainda passa por ele (§4). Um enlace virtual cujo caminho passa por ele cai (errata 4685).
+
+## Recomendado
+Para entrar no núcleo: stub router ligado e os custos reais nos templates, em vez de custo 65535 em cada um; desligue quando as adjacências, o LDP e o BFD estiverem de pé."##),
+    (r##"ospf.instance.stub_router_on_startup"##, r##"## O que é
+Segundos (5–86400) como stub router depois de cada partida da instância (`max-metric router-lsa on-startup` do FRR, contados por área a partir da primeira router-LSA). Depois de um reboot, o roteador forma as adjacências e o LDP sobe antes de ele carregar trânsito: o RouterOS não tem sincronização LDP-IGP (RFC 5443), então este é o jeito de não jogar tráfego rotulado no buraco.
+
+## Cuidados
+Acrescentado numa instância que já roda, só vale na próxima partida. Só OSPFv2 (o ospf6d não tem on-startup).
+
+## Recomendado
+300 s num roteador de núcleo; mais se o LDP demorar a chegar a todos os vizinhos."##),
     (r##"ospf.instance.subscriber_pools"##, r##"## O que é
 Anuncia os pools de endereços PPPoE e IPoE, cada um sumarizado em uma rota externa só (o núcleo vê uma rota por pool, não uma por assinante). A rota sai sozinha quando o último assinante do pool cai."##),
     (r##"ospf.instance.version"##, r##"## O que é

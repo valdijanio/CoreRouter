@@ -91,6 +91,8 @@ const INST_FIELDS: &[Field] = &[
     field("out_filter_chain", "Out Filter Chain", "ospf.instance.out_filter_chain", Input::Text("a /routing filter chain")),
     field("originate_default", "Originate Default", "ospf.instance.originate_default", Input::Choice),
     field("subscriber_pools", "Subscriber Pools", "ospf.instance.subscriber_pools", Input::Check),
+    field("stub_router", "Stub Router", "ospf.instance.stub_router", Input::Check),
+    field("stub_router_on_startup", "Stub Router On Startup", "ospf.instance.stub_router_on_startup", Input::Text("300 s (empty: off)")),
     field("disabled", "Disabled", "ospf.disabled", Input::Check),
     field("comment", "Comment", "", Input::Text("")),
 ];
@@ -179,12 +181,13 @@ const NBR_COLUMNS: [table::Column; 8] = [
     col("BFD").help("ospf.template.bfd"),
     col("Instance").help("ospf.area.instance"),
 ];
-const INST_COLUMNS: [table::Column; 8] = [
+const INST_COLUMNS: [table::Column; 9] = [
     col("Name").help("ospf.instance.name"),
     col("Version").help("ospf.instance.version"),
     col("Router ID").help("ospf.instance.router_id"),
     col("VRF").help("ospf.instance.vrf"),
     col("Redistribute").help("ospf.instance.redistribute"),
+    col("Stub Router").help("ospf.instance.stub_router"),
     num("Areas").help("ospf.tab.areas"),
     num("Interfaces").help("ospf.template.interfaces"),
     comment(),
@@ -401,6 +404,7 @@ fn inst_row(r: &Value) -> Row {
                 }
                 chips(&c)
             },
+            stub_cell(r),
             s(r, "areas"),
             s(r, "interfaces"),
             s(r, "comment"),
@@ -408,6 +412,58 @@ fn inst_row(r: &Value) -> Row {
         dimmed: flag(r, "disabled"),
         section: false,
         tint: None,
+    }
+}
+
+/// G3.9c: what the daemon does now (amber while the router is drained),
+/// or what the config asks for until the daemon answers.
+fn stub_cell(r: &Value) -> String {
+    let st = r.get("stub_state").filter(|v| !v.is_null());
+    let configured = flag(r, "stub_router") || r.get("stub_router_on_startup").is_some_and(|v| !v.is_null());
+    match st.map(|v| s(v, "state")).as_deref() {
+        Some("administrative") => cell("", &[("administrative", Kind::Amber)]),
+        Some("startup") => {
+            let left = st.and_then(|v| v.get("remaining_secs")).and_then(Value::as_u64);
+            let text = left.map_or_else(|| "startup".to_owned(), |t| format!("startup {}m{:02}s", t / 60, t % 60));
+            chips(&[(text, Kind::Amber)])
+        }
+        Some("off") if configured => cell("", &[("off", Kind::Neutral)]),
+        None if configured => cell("", &[("pending", Kind::Neutral)]),
+        _ => "–".into(),
+    }
+}
+
+/// G3.9c: Drain / Undrain of the selected instance: `stub_router` on or
+/// off (RFC 6987), the same command as the modal's check box.
+fn drain_button(ui: &mut Ui, picked: &[Item], data: &[Value], tools: &Tools, l: crate::i18n::Lang) -> Option<Value> {
+    let row = match picked {
+        [one] => data.iter().find(|r| s(r, "name") == one.key),
+        _ => None,
+    };
+    let drained = row.is_some_and(|r| flag(r, "stub_router"));
+    let label = tr_in(SCOPE, l, if drained { "Undrain" } else { "Drain" });
+    // `comment` is the bar's "may run set on the selection" rule.
+    let why = match (row, &tools.comment) {
+        (None, _) => Err("select one instance".to_owned()),
+        (Some(_), Err(e)) => Err(e.clone()),
+        (Some(r), Ok(())) => Ok(r),
+    };
+    match why {
+        Ok(r) => {
+            let tip = if drained {
+                "stub_router off: the transit links get their cost back"
+            } else {
+                "stub_router on: every transit link at cost 65535, traffic goes around this router (RFC 6987)"
+            };
+            ui.button(label)
+                .on_hover_text(tip)
+                .clicked()
+                .then(|| json!({"command": "routing.ospf.instance.set", "params": {"id": s(r, "name"), "stub_router": !drained}}))
+        }
+        Err(e) => {
+            ui.add_enabled(false, egui::Button::new(label)).on_disabled_hover_text(e);
+            None
+        }
     }
 }
 
@@ -599,7 +655,7 @@ fn values_of(r: &Value, what: What) -> BTreeMap<&'static str, String> {
     for f in fields {
         let v = match f.param {
             "auth_key" => String::new(),
-            "disabled" | "passive" | "mtu_ignore" | "no_summaries" | "subscriber_pools" | "force" => {
+            "disabled" | "passive" | "mtu_ignore" | "no_summaries" | "subscriber_pools" | "stub_router" | "force" => {
                 if flag(r, f.param) { "yes" } else { "no" }.to_owned()
             }
             "interfaces" | "networks" | "redistribute" => list_of(r, f.param).join(","),
@@ -814,10 +870,20 @@ impl OspfPanel {
             tools.disable = none;
         }
         let mut act = None;
+        let mut drain = None;
         ui.horizontal(|ui| {
             act = list::toolbar(ui, salt, &tools, &selection, l);
+            if what == What::Instance {
+                drain = drain_button(ui, &picked, &data, &tools, l);
+                if help::info_button(ui, egui::Id::unique("ospf-drain-help"), tr_in(SCOPE, l, "Drain")).clicked() {
+                    self.help = Some(HelpView::new("ospf.instance.drain", tr_in(SCOPE, l, "Drain")));
+                }
+            }
             table::find_field(ui, salt, table);
         });
+        if let Some(step) = drain {
+            app.run_steps(vec![step], Then::Nothing);
+        }
         ui.separator();
         let known = !app.cache.commands.is_empty();
         let detail_h = if what == What::Template || what == What::Keychain { 120.0 } else { 0.0 };
@@ -1101,7 +1167,7 @@ impl OspfPanel {
 /// The `add` parameters that recreate a row (the key stays out).
 fn recreate(r: &Value, what: What) -> Value {
     let keys: &[&str] = match what {
-        What::Instance => &["name", "version", "vrf", "router_id", "redistribute", "out_filter_chain", "originate_default", "subscriber_pools", "disabled", "comment"],
+        What::Instance => &["name", "version", "vrf", "router_id", "redistribute", "out_filter_chain", "originate_default", "subscriber_pools", "stub_router", "stub_router_on_startup", "disabled", "comment"],
         What::Area => &["name", "instance", "area_id", "type", "no_summaries", "default_cost", "nssa_translate", "disabled", "comment"],
         What::Template => &["area", "interfaces", "networks", "type", "cost", "priority", "hello_interval", "dead_interval", "passive", "mtu_ignore", "auth", "auth_id", "keychain", "bfd", "disabled", "comment"],
         What::Keychain => &["name", "comment"],
