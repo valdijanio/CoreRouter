@@ -163,6 +163,10 @@ pub struct Inputs {
     /// dm-verity device of its signed root hash (G1.6qb). `None`: not on
     /// the image (lab, browser, the package service has not reported).
     pub root_verity: Option<(String, bool)>,
+    /// G1.6u: configuration snapshots in `/config` and the bytes of their
+    /// own (partial copies are named `config-<slot>.new`), from the
+    /// package service's status.
+    pub config_snapshots: Vec<(String, u64)>,
     /// G3.9fj: BGP sessions where we restart gracefully toward a neighbor
     /// that announces graceful restart (RFC 4724), and those of them
     /// established for [`EOR_GRACE_SECS`] that never sent End-of-RIB.
@@ -331,9 +335,10 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
         None => push("disk", "Disk", Severity::Unknown, None, "nenhum disco com dados".into(), None),
         Some((mount, free)) => {
             let s = level(*free, DISK_FREE.0, DISK_FREE.1, false);
+            let snaps = config_reclaim(mount, &i.config_snapshots);
             push("disk", "Disk", s, Some(format!("{mount}: {} livre", pct(*free))),
                 format!("{mount} com {} livre", pct(*free)),
-                Some("Apague logs e capturas antigos, ou reduza o histórico de gráficos (system.graph.set) e de logs em disco."));
+                Some(snaps.as_deref().unwrap_or("Apague logs e capturas antigos, ou reduza o histórico de gráficos (system.graph.set) e de logs em disco.")));
         }
     }
 
@@ -671,6 +676,35 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
     out
 }
 
+/// G1.6u: on a full `/config`, what to remove: the snapshots and partial
+/// copies, biggest first, and the command (dry run first).
+fn config_reclaim(mount: &str, snaps: &[(String, u64)]) -> Option<String> {
+    if mount != "/config" || snaps.iter().all(|(_, b)| *b == 0) {
+        return None;
+    }
+    let mut v: Vec<&(String, u64)> = snaps.iter().filter(|(_, b)| *b > 0).collect();
+    v.sort_by_key(|x| std::cmp::Reverse(x.1));
+    let list: Vec<String> = v
+        .iter()
+        .map(|(n, b)| format!("{n} {:.1} MB{}", *b as f64 / 1e6, if n.ends_with(".new") { " (cópia parcial)" } else { "" }))
+        .collect();
+    Some(format!(
+        "Snapshots da configuração no /config: {}. Veja o que sai com system.package.snapshot.remove {{all: true, dry_run: true}} e apague com system.package.snapshot.remove {{name: \"…\"}}; o snapshot de um teste em andamento nunca sai.",
+        list.join(", ")
+    ))
+}
+
+/// The snapshots of the package service's status, with their own bytes.
+fn config_snapshots(st: &serde_json::Value) -> Vec<(String, u64)> {
+    use serde_json::Value;
+    ["snapshots", "partials"]
+        .iter()
+        .filter_map(|k| st.get(*k).and_then(Value::as_array))
+        .flatten()
+        .filter_map(|r| Some((r.get("name")?.as_str()?.to_owned(), r.get("own_bytes")?.as_u64()?)))
+        .collect()
+}
+
 /// (running slot, on dm-verity) from the package service's status, or
 /// `None` off the image (and in its lab, which has no real root).
 fn root_verity(st: &serde_json::Value) -> Option<(String, bool)> {
@@ -844,10 +878,9 @@ impl Session {
                 .collect();
             (all.len(), bare)
         });
-        i.root_verity = self
-            .ext::<crate::package::Packages>()
-            .and_then(|p| p.status.as_ref())
-            .and_then(root_verity);
+        let pkg = self.ext::<crate::package::Packages>().and_then(|p| p.status.as_ref());
+        i.root_verity = pkg.and_then(root_verity);
+        i.config_snapshots = pkg.map(config_snapshots).unwrap_or_default();
         i
     }
 
@@ -926,6 +959,7 @@ mod tests {
             ecmp: Some((0, 0, None)),
             no_password: Vec::new(),
             root_verity: Some(("a".into(), true)),
+            config_snapshots: Vec::new(),
             bgp_no_eor: Some((1, Vec::new())),
             bgp_gr_no_bfd: Some((1, Vec::new())),
             usb: Vec::new(),
@@ -1061,6 +1095,29 @@ mod tests {
                 assert!(matches!(other.severity, Severity::Ok), "{what} moved {}", other.key);
             }
         }
+    }
+
+    #[test]
+    fn a_full_config_names_the_snapshots_to_remove() {
+        let mut i = healthy();
+        i.disks = vec![("/config".into(), 0.0)];
+        i.config_snapshots = vec![
+            ("config-a".into(), 13_811_709),
+            ("config-b".into(), 0),
+            ("config-a.new".into(), 9_000_000),
+        ];
+        let checks = evaluate(&i);
+        let c = checks.iter().find(|c| c.key == "disk").unwrap();
+        assert_eq!(c.severity, Severity::Error);
+        let a = c.action.as_deref().unwrap();
+        assert!(a.contains("config-a 13.8 MB, config-a.new 9.0 MB (cópia parcial)"), "{a}");
+        assert!(!a.contains("config-b"), "nothing to free there: {a}");
+        assert!(a.contains("system.package.snapshot.remove"), "{a}");
+        // Another mount keeps the old advice.
+        i.disks = vec![("/var".into(), 0.0)];
+        let checks = evaluate(&i);
+        let c = checks.iter().find(|c| c.key == "disk").unwrap();
+        assert!(c.action.as_deref().unwrap().contains("logs"));
     }
 
     #[test]

@@ -106,6 +106,15 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         download
     ),
     cmd!(
+        "system.package.snapshot.remove",
+        "Remove Snapshot",
+        [],
+        None,
+        "{name?: string (config-a, config-b, or a partial config-a.new / config-b.new; without it every partial copy), all?: bool (without name: every snapshot too, not only partial copies), dry_run?: bool (only say what would go)} → {dry_run, job?, snapshots: [{name, own_bytes, remove, kept?}], freed}",
+        always,
+        snapshot_remove
+    ),
+    cmd!(
         "system.package.scrub",
         "Scrub Slot",
         [],
@@ -318,6 +327,105 @@ fn scrub(s: &mut Session, p: &Value) -> Result<Value> {
     queue(s, JobKind::Scrub { slot: slot.into() }, p)
 }
 
+/// G1.6u: the plan comes from the service's last status (what exists, the
+/// bytes each frees, what a trial needs); the removal itself is a job, and
+/// the service checks the trial again before it deletes anything.
+fn snapshot_remove(s: &mut Session, p: &Value) -> Result<Value> {
+    let name = opt_str(p, "name")?;
+    let all = opt_bool(p, "all")?.unwrap_or(false);
+    let dry_run = opt_bool(p, "dry_run")?.unwrap_or(false);
+    if let Some(n) = name {
+        let base = n.strip_suffix(".new").unwrap_or(n);
+        if !matches!(base, "config-a" | "config-b") {
+            return Err(EngineError::bad(
+                "name",
+                format!(
+                    "'{}' is not a snapshot: config-a, config-b, config-a.new or config-b.new",
+                    n.chars().take(32).collect::<String>()
+                ),
+            ));
+        }
+        if all {
+            return Err(EngineError::bad("all", "give a name or all, not both"));
+        }
+    }
+    supported(s)?;
+    let st = status(s);
+    let rows = |key: &str| -> Vec<(String, u64)> {
+        st.get(key)
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|r| {
+                        Some((
+                            r.get("name")?.as_str()?.to_owned(),
+                            r.get("own_bytes").and_then(Value::as_u64).unwrap_or(0),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let snapshots = rows("snapshots");
+    let partials = rows("partials");
+    let protected: Vec<String> = st
+        .get("trial")
+        .filter(|t| !t.is_null())
+        .map(|t| {
+            ["config_backup", "config_swap"]
+                .iter()
+                .filter_map(|k| t.get(*k).and_then(Value::as_str).map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let picked: Vec<(String, Option<u64>)> = match name {
+        Some(n) => {
+            let found = snapshots.iter().chain(&partials).find(|(x, _)| x == n);
+            vec![(n.to_owned(), found.map(|(_, b)| *b))]
+        }
+        None => partials
+            .iter()
+            .chain(if all { snapshots.as_slice() } else { &[] })
+            .map(|(n, b)| (n.clone(), Some(*b)))
+            .collect(),
+    };
+    let mut freed = 0;
+    let plan: Vec<Value> = picked
+        .iter()
+        .map(|(n, bytes)| {
+            let kept = if protected.contains(n) {
+                Some("the trial boot in progress needs it to go back")
+            } else if bytes.is_none() {
+                Some("no such snapshot")
+            } else {
+                None
+            };
+            if kept.is_none() {
+                freed += bytes.unwrap_or(0);
+            }
+            let mut r = json!({"name": n, "own_bytes": bytes.unwrap_or(0), "remove": kept.is_none()});
+            if let (Some(k), Some(o)) = (kept, r.as_object_mut()) {
+                o.insert("kept".into(), json!(k));
+            }
+            r
+        })
+        .collect();
+    let mut out = json!({"dry_run": dry_run, "snapshots": plan, "freed": freed});
+    let go: Vec<String> = plan
+        .iter()
+        .filter(|r| r.get("remove") == Some(&json!(true)))
+        .filter_map(|r| r.get("name").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    if dry_run || go.is_empty() {
+        return Ok(out);
+    }
+    let job = queue(s, JobKind::SnapshotRemove { names: go }, &json!({}))?;
+    if let (Some(o), Some(id)) = (out.as_object_mut(), job.get("job")) {
+        o.insert("job".into(), id.clone());
+    }
+    Ok(out)
+}
+
 fn req_u64(p: &Value, key: &str) -> Result<u64> {
     opt_u64(p, key)?.ok_or_else(|| EngineError::bad(key, "is required"))
 }
@@ -447,6 +555,75 @@ mod tests {
         feed_status(
             s,
             json!({"supported": true, "running": "a", "trial": null, "slots": []}),
+        );
+    }
+
+    /// G1.6u: the test VM's `/config`: two snapshots and a partial copy,
+    /// a trial that needs `config-a`.
+    fn full(s: &mut Session, trial: bool) {
+        let t = if trial {
+            json!({"slot": "b", "from": "a", "config_backup": "config-a", "config_swap": null})
+        } else {
+            Value::Null
+        };
+        feed_status(
+            s,
+            json!({"supported": true, "running": "a", "trial": t, "slots": [],
+                "snapshots": [{"name": "config-a", "own_bytes": 13_811_709u64},
+                              {"name": "config-b", "own_bytes": 13_811_960u64}],
+                "partials": [{"name": "config-a.new", "own_bytes": 9_000_000u64}]}),
+        );
+    }
+
+    #[test]
+    fn snapshot_remove_plans_then_queues() {
+        let mut s = Session::virtual_lab();
+        full(&mut s, true);
+        // Dry run, everything: the trial's backup stays.
+        let v = s
+            .execute("system.package.snapshot.remove", &json!({"all": true, "dry_run": true}))
+            .unwrap();
+        assert_eq!(v["dry_run"], true);
+        assert_eq!(v["freed"], 9_000_000u64 + 13_811_960);
+        assert_eq!(v["snapshots"][1]["name"], "config-a");
+        assert_eq!(v["snapshots"][1]["remove"], false);
+        assert!(v["snapshots"][1]["kept"].as_str().unwrap().contains("trial"));
+        assert!(v.get("job").is_none());
+        assert!(take_job(&mut s).is_none(), "a dry run queues nothing");
+        // No name: the partial copy only, as a job.
+        let v = s.execute("system.package.snapshot.remove", &json!({})).unwrap();
+        assert_eq!(v["freed"], 9_000_000u64);
+        let job = take_job(&mut s).unwrap();
+        assert_eq!(job.kind, JobKind::SnapshotRemove { names: vec!["config-a.new".into()] });
+        assert_eq!(v["job"], json!(job.id));
+        finish(&mut s, job.id, "snapshot-remove", Ok(json!({"freed": 9_000_000u64})));
+        // By name: the protected one is planned as kept and nothing queued.
+        let v = s
+            .execute("system.package.snapshot.remove", &json!({"name": "config-a"}))
+            .unwrap();
+        assert_eq!(v["freed"], 0);
+        assert!(take_job(&mut s).is_none());
+        let v = s
+            .execute("system.package.snapshot.remove", &json!({"name": "config-c.new"}))
+            .unwrap_err();
+        assert!(v.to_string().contains("not a snapshot"), "{v}");
+        let v = s
+            .execute("system.package.snapshot.remove", &json!({"name": "../running.json"}))
+            .unwrap_err();
+        assert!(v.to_string().contains("not a snapshot"), "{v}");
+        let v = s
+            .execute("system.package.snapshot.remove", &json!({"name": "config-b", "all": true}))
+            .unwrap_err();
+        assert!(v.to_string().contains("not both"), "{v}");
+        // Without a trial, config-a goes too.
+        full(&mut s, false);
+        let v = s
+            .execute("system.package.snapshot.remove", &json!({"name": "config-a"}))
+            .unwrap();
+        assert_eq!(v["snapshots"][0]["remove"], true);
+        assert_eq!(
+            take_job(&mut s).unwrap().kind,
+            JobKind::SnapshotRemove { names: vec!["config-a".into()] }
         );
     }
 
