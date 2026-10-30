@@ -582,6 +582,19 @@ fn router(
     if let Some(r) = inst.router_id {
         let _ = writeln!(s, " {} router-id {r}", if v2 { "ospf" } else { "ospf6" });
     }
+    // G3.9c: stub router (RFC 6987), in the order and form ospfd prints
+    // it (`config_write_stub_router`).
+    if v2 {
+        if let Some(secs) = inst.stub_router_on_startup {
+            let _ = writeln!(s, " max-metric router-lsa on-startup {secs}");
+        }
+        if inst.stub_router {
+            let _ = writeln!(s, " max-metric router-lsa administrative");
+        }
+    } else if inst.stub_router {
+        // RFC 6987 §2.1: ospf6d clears the R-bit and V6-bit.
+        let _ = writeln!(s, " stub-router administrative");
+    }
     for kind in kinds(inst, pools) {
         let mut l = format!(" redistribute {}", kind.name());
         if needs_map(inst, pools, kind) {
@@ -797,6 +810,37 @@ mod tests {
         assert!(text.contains("router ospf\n ospf router-id 10.255.0.1\n redistribute connected\n area 0.0.0.1 stub no-summary\n"), "{text}");
         // The render parses as the FRR tree hal-frr diffs.
         assert!(!text.contains('\t'));
+    }
+
+    /// G3.9c: the stub router lines, as ospfd and ospf6d print them.
+    #[test]
+    fn renders_the_stub_router() {
+        let mut cfg = sample();
+        let text = render(&cfg, &|s| Some(s.stored().to_owned())).unwrap();
+        assert!(!text.contains("max-metric"), "{text}");
+        for i in cfg.routing.ospf.instances.values_mut() {
+            i.stub_router = true;
+            i.stub_router_on_startup = Some(300);
+        }
+        let text = render(&cfg, &|s| Some(s.stored().to_owned())).unwrap();
+        assert!(
+            text.contains(
+                "router ospf\n ospf router-id 10.255.0.1\n max-metric router-lsa on-startup 300\n max-metric router-lsa administrative\n"
+            ),
+            "{text}"
+        );
+        for i in cfg.routing.ospf.instances.values_mut() {
+            i.version = Version::V3;
+            i.stub_router_on_startup = None;
+        }
+        let text = render(&cfg, &|s| Some(s.stored().to_owned())).unwrap();
+        assert!(
+            text.contains(
+                "router ospf6\n ospf6 router-id 10.255.0.1\n stub-router administrative\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("max-metric"), "{text}");
     }
 
     /// G3.9fe: `redistribute=static` goes through `kernel` (the linux

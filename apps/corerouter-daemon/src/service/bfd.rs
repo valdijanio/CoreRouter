@@ -275,6 +275,11 @@ fn dp_spec(cfg: &corerouter_model::Config, m: &corerouter_proto_bfd::dplane::DpS
     spec.cfg.detect_mult = m.detect_mult.max(1);
     spec.cfg.passive = m.passive();
     spec.cfg.admin_down = m.shutdown();
+    // G3.9fj: bfdd's SESSION_CBIT (`bgpd`'s `bfd check-control-plane-failure`)
+    // is not followed: this engine dies with the daemon while the kernel
+    // keeps forwarding, so C = 1 would be a lie (RFC 5880 §6.8.7). Sending
+    // C = 0 also lets two CoreRouters both use the check (FRR's bfdd would
+    // send C = 1 on both sides, and the check would never fire).
     if m.multihop() {
         spec.min_ttl = m.ttl;
     }
@@ -581,7 +586,11 @@ impl Controller {
                 &dp::StateChange {
                     lid: e.discr,
                     rid: e.remote_discr,
-                    remote_flags: 0,
+                    // G3.9fj: the peer's C bit, which `bgpd` reads for
+                    // `bfd check-control-plane-failure` (RFC 5882 §4.3);
+                    // 0 before, so a neighbor whose BFD is independent of
+                    // its control plane looked like one that shares fate.
+                    remote_flags: if e.remote_cpi { dp::RBIT_CPI } else { 0 },
                     desired_tx: e.remote_desired_tx,
                     required_rx: e.remote_min_rx,
                     required_echo_rx: 0,

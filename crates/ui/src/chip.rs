@@ -180,7 +180,10 @@ pub(crate) fn chip(ui: &mut Ui, text: &str, tone: Tone) -> egui::Response {
         let at = rect.center() - galley.size() / 2.0;
         ui.painter().galley(at, galley, tone.ink);
     }
-    resp
+    match crate::usb_mark::get(ui.ctx(), text) {
+        Some(m) => resp.on_hover_text(m.tip),
+        None => resp,
+    }
 }
 
 
@@ -272,6 +275,14 @@ pub(crate) fn label_galley(painter: &egui::Painter, label: &str, size: f32, colo
     let mut chars = label.chars();
     let icon = chars.next().filter(|c| ('\u{E000}'..='\u{F8FF}').contains(c));
     let Some(icon) = icon else {
+        // G1.29b: a chip naming a USB adapter carries the USB icon.
+        if let Some(m) = crate::usb_mark::get(painter.ctx(), label).filter(|_| crate::icons::ready(painter.ctx())) {
+            let tint = crate::usb_mark::color(&painter.ctx().global_style().visuals, m.slow, color);
+            let mut job = egui::text::LayoutJob::default();
+            job.append(crate::icons::USB, 0.0, egui::TextFormat::simple(crate::icons::font(size), tint));
+            job.append(label, size * 0.3, egui::TextFormat::simple(egui::FontId::proportional(size), color));
+            return painter.layout_job(job);
+        }
         return painter.layout_no_wrap(label.to_owned(), egui::FontId::proportional(size), color);
     };
     let rest = chars.as_str().trim_start();

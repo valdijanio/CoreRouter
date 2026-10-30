@@ -40,9 +40,11 @@ use crate::vm_lab::{download, sha256_file};
 
 mod ab;
 mod frr;
+mod hotplug;
 mod install;
 mod out;
 mod push;
+mod release;
 mod web;
 
 const DEFCONFIG: &str = "corerouter_x86_64_defconfig";
@@ -121,7 +123,7 @@ const GUEST_TLS_PORT: u16 = 8729;
 /// G1.6o: `ip.service www-ssl`, on in a new config of the image.
 const GUEST_WEB_PORT: u16 = 443;
 
-const USAGE: &str = "usage: cargo xtask os <build [--only crpkg] [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|push --to HOST:PORT [--user U] [--no-build] [--no-wait] [--confirm manual]|out-dir|boot-test [--efi] [--tcg] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--scenario update|no-confirm|bad-signature|bad-param]|install-test [--tcg]|frr-test [--tcg]|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
+const USAGE: &str = "usage: cargo xtask os <build [--only crpkg] [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|push --to HOST:PORT [--user U] [--no-build] [--no-wait] [--confirm manual]|release-key <init|check> [--dir D]|release --tag vX.Y.Z [--key-dir D] [--dry-run] [--no-build] [--repo OWNER/NAME]|out-dir|boot-test [--efi] [--tcg] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--scenario update|no-confirm|bad-signature|bad-param]|install-test [--tcg]|frr-test [--tcg]|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
 
 pub fn main(root: &Path, args: &[String]) -> Outcome {
     let (sub, rest) = match args.split_first() {
@@ -136,6 +138,8 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
         "frr-test" => images_dir(root).and_then(|i| frr::frr_test(root, &i, rest)),
         "package" => images_dir(root).and_then(|i| package_cmd(root, &i, rest)),
         "push" => images_dir(root).and_then(|i| push::push(root, &i, rest)),
+        "release-key" => release::release_key(root, rest),
+        "release" => release::release(root, rest),
         "out-dir" => out::resolve(root).map(|o| println!("{}", o.dir.display())),
         "check" => check(&root.join("os")).map(|n| eprintln!("ok: os/ configuration ({n} checks)")),
         "-h" | "--help" => {
@@ -317,6 +321,8 @@ pub fn check(os: &Path) -> Result<usize, String> {
     let mut n = 0;
     parse_lock(&read("buildroot.lock")?)?;
     n += 1;
+    // processo: the release public keys the images trust.
+    n += release::release_keys(&os.join("keys/release"))?.len();
     let defconfig = read(&format!("configs/{DEFCONFIG}"))?;
     for want in REQUIRED_BR2 {
         if !defconfig.lines().any(|l| l == *want) {
@@ -588,7 +594,27 @@ fn dirs(root: &Path, top: &Path, lock: &Lock) -> Dirs {
     }
 }
 
+/// processo (release da imagem): a build of a tagged version, made by
+/// `os release` (`os/release.rs`).
+pub(crate) struct ReleaseBuild {
+    /// The build directory (apart from the development one).
+    pub top: PathBuf,
+    /// The decrypted release key, for the time of the build.
+    pub key: PathBuf,
+    /// The manifest's version (the tag without the `v`).
+    pub version: String,
+    pub channel: String,
+}
+
 fn build(root: &Path, args: &[String]) -> Result<(), String> {
+    build_with(root, args, None)
+}
+
+pub(crate) fn build_with(
+    root: &Path,
+    args: &[String],
+    release: Option<&ReleaseBuild>,
+) -> Result<(), String> {
     let mut jobs: Option<String> = None;
     let mut top_jobs: Option<String> = None;
     let mut key: Option<PathBuf> = None;
@@ -618,7 +644,17 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
     let lock = parse_lock(
         &std::fs::read_to_string(root.join("os/buildroot.lock")).map_err(|e| e.to_string())?,
     )?;
-    let o = out::resolve(root)?;
+    let o = match release {
+        Some(r) => out::Out {
+            dir: r.top.clone(),
+            source: out::Source::Env,
+        },
+        None => out::resolve(root)?,
+    };
+    if let Some(r) = release {
+        key = Some(r.key.clone());
+        channel = r.channel.clone();
+    }
     let d = dirs(root, &o.dir, &lock);
     std::fs::create_dir_all(d.os.join("dl")).map_err(|e| e.to_string())?;
     let _lock = out::lock(&d.top)?;
@@ -653,7 +689,16 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
     // G1.6b: the image key (private: outside the tree and the image) and
     // what `corerouter-image seal` puts in the manifest.
     let image_tool = ab::tool(root)?;
-    let (image_key, image_keys_dir) = ab::ensure_key(&d.top, &image_tool, key.as_deref())?;
+    let (image_key, signing_pub) = ab::ensure_key(&d.top, &image_tool, key.as_deref())?;
+    // processo: the public keys the image trusts. A development image: its
+    // own key and the release keys of `os/keys/release/` (a test router
+    // takes both). A release image: only the release keys.
+    let image_keys_dir = release::trust_dir(
+        &d.top,
+        &signing_pub,
+        &d.os.join("keys/release"),
+        release.is_some(),
+    )?;
     let defconfig_text =
         std::fs::read_to_string(d.os.join("configs").join(DEFCONFIG)).map_err(|e| e.to_string())?;
     let seal_env = [
@@ -663,7 +708,10 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
             "CR_SEAL_IMAGE_KEYS_DIR",
             image_keys_dir.display().to_string(),
         ),
-        ("CR_SEAL_VERSION", workspace_version(root)),
+        (
+            "CR_SEAL_VERSION",
+            release.map_or_else(|| workspace_version(root), |r| r.version.clone()),
+        ),
         ("CR_SEAL_BUILD", git_time(root).to_string()),
         ("CR_SEAL_CHANNEL", channel.clone()),
         ("CR_SEAL_KERNEL_VERSION", kernel_version(&defconfig_text)?),
@@ -1243,6 +1291,8 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     let port = free_port()?;
     let web_port = free_port()?;
     let log_path = top.join("boot-test.log");
+    let mon = top.join("boot-test.monitor");
+    let _ = std::fs::remove_file(&mon);
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.args([
         "-machine",
@@ -1260,15 +1310,10 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
         "-m",
         "1024",
     ]);
-    cmd.args([
-        "-display",
-        "none",
-        "-monitor",
-        "none",
-        "-serial",
-        "stdio",
-        "-no-reboot",
-    ]);
+    cmd.args(["-display", "none", "-serial", "stdio", "-no-reboot"]);
+    cmd.arg("-monitor")
+        .arg(format!("unix:{},server=on,wait=off", mon.display()));
+    cmd.args(hotplug::QEMU_ARGS);
     let snapshot = if b.keep_config { "" } else { ",snapshot=on" };
     cmd.arg("-drive").arg(format!(
         "file={},if=virtio,format=raw{snapshot}",
@@ -1321,11 +1366,12 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("qemu-system-x86_64: {e}"))?;
-    let res = watch(&mut child, &b, (port, web_port), started, &log_path);
+    let res = watch(&mut child, &b, (port, web_port), started, &log_path, &mon);
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_file(&vars);
-    let (report, wall_ready, ping, web) = res?;
+    let _ = std::fs::remove_file(&mon);
+    let (report, wall_ready, ping, web, hot) = res?;
     eprintln!("\nboot-test ok ({}):", if kvm { "KVM" } else { "TCG" });
     eprintln!(
         "  kernel start → daemon answers ping: {:.3} s (corerouter-init)",
@@ -1340,6 +1386,7 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     for l in web.lines() {
         eprintln!("    {l}");
     }
+    eprintln!("  card plugged in after boot (G1.6n): {hot}");
     if let Some(kib) = report.idle_kib {
         eprintln!(
             "  idle memory in use:                 {:.1} MiB",
@@ -1355,7 +1402,8 @@ fn watch(
     (port, web_port): (u16, u16),
     started: Instant,
     log_path: &Path,
-) -> Result<(Report, Duration, String, String), String> {
+    mon: &Path,
+) -> Result<(Report, Duration, String, String, String), String> {
     let stdout = child.stdout.take().ok_or("qemu: no stdout")?;
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::Builder::new()
@@ -1420,7 +1468,35 @@ fn watch(
             report.idle_kib = Some(k);
         }
         if let (Some(w), Some(p), Some(_), Some(web)) = (wall_ready, &ping, report.idle_kib, &web) {
-            return Ok((report, w, p.clone(), web.clone()));
+            let mut wait_line = |want: &dyn Fn(&str) -> bool, max: Duration| {
+                let until = Instant::now() + max;
+                loop {
+                    let left = until.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(format!(
+                            "no such console line (console in {})",
+                            log_path.display()
+                        ));
+                    }
+                    match rx.recv_timeout(left) {
+                        Ok(line) => {
+                            let _ = writeln!(log, "{line}");
+                            if line.contains("corerouter-init") {
+                                eprintln!("  | {line}");
+                            }
+                            if want(&line) {
+                                return Ok(());
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err("qemu exited".into());
+                        }
+                    }
+                }
+            };
+            let hot = hotplug::check(mon, &mut wait_line)?;
+            return Ok((report, w, p.clone(), web.clone(), hot));
         }
     }
 }

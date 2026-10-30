@@ -10,7 +10,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("interfaces.traffic", "Recent received and transmitted traffic. Missing history is shown as empty."),
     ("interfaces.tx", "Total bytes transmitted since the counters were last reset."),
     ("interfaces.tx_pkt", "Total packets transmitted since the counters were last reset."),
-    ("interfaces.type", "The interface type reported by the platform; the icon identifies the configured kind."),
+    ("interfaces.type", "A USB adapter shows the USB icon (amber when its port is slower than the adapter; hover for the speed, port and driver). The interface type reported by the platform; the icon identifies the configured kind."),
     ("interfaces.vlan.interface", "## Interface\nThe interface the VLAN rides on: an ethernet port, a bond, a bridge or another VLAN (a C-VLAN on an S-VLAN is QinQ). RouterOS calls it `interface=`; the CoreRouter command calls it `parent`, and the terminal takes both."),
     ("interfaces.vlan.mtu", "## MTU\nThe largest IP packet on the VLAN. Empty takes the MTU of the parent, which is also the ceiling. The tag (4 bytes, 8 for QinQ) goes in the parent's L2 MTU, not here."),
     ("interfaces.vlan.name", "## Name\nThe VLAN interface's name, used in addresses, routes and the firewall. Something that says where it goes (`vlan100`, `cli-acme`) helps the next operator."),

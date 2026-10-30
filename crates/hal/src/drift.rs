@@ -20,6 +20,7 @@ use std::net::IpAddr;
 use corerouter_model::os_loopback::{is_os_address, is_os_loopback};
 use corerouter_model::route::{self, Reach};
 use corerouter_model::routes::Dst;
+use corerouter_model::types::Discard;
 use corerouter_model::{Config, IfName, InterfaceKind, RouteEntry};
 use ipnet::IpNet;
 use serde::Serialize;
@@ -49,6 +50,32 @@ impl fmt::Display for KernelRoute {
     }
 }
 
+/// A route without next hop as the kernel holds it (G1.5a, protocol
+/// `static`, `RTN_BLACKHOLE`/`RTN_UNREACHABLE`/`RTN_PROHIBIT`): no link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KernelDiscard {
+    pub table: u32,
+    pub dst: IpNet,
+    pub metric: u32,
+    pub kind: Discard,
+}
+
+impl fmt::Display for KernelDiscard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} route {} metric {}",
+            self.kind.as_str(),
+            self.dst,
+            self.metric
+        )?;
+        if self.table != route::MAIN_TABLE_ID {
+            write!(f, " table {}", self.table)?;
+        }
+        Ok(())
+    }
+}
+
 /// One link as the drift check sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkSnap {
@@ -66,6 +93,8 @@ pub struct Snapshot {
     pub links: BTreeMap<IfName, LinkSnap>,
     pub addresses: BTreeSet<(IfName, IpNet)>,
     pub routes: BTreeSet<KernelRoute>,
+    /// G1.5a: routes without next hop in the tables CoreRouter manages.
+    pub discards: BTreeSet<KernelDiscard>,
 }
 
 /// Enabled addresses on enabled interfaces of `cfg`, as (link, prefix).
@@ -124,6 +153,54 @@ pub fn kernel_routes_of<'a>(
         .collect()
 }
 
+/// G1.5a: the enabled routes of `cfg` without next hop, as the kernel
+/// holds them.
+pub fn discard_routes(cfg: &Config) -> BTreeSet<KernelDiscard> {
+    discard_routes_of(cfg, cfg.ip.routes.iter())
+}
+
+fn discard_routes_of<'a>(
+    cfg: &Config,
+    routes: impl Iterator<Item = &'a RouteEntry>,
+) -> BTreeSet<KernelDiscard> {
+    // Only the routes without gateway are resolved: `reach` of one with a
+    // gateway walks the addresses (G1.5a doubled a commit's plan, **medido**).
+    routes
+        .filter(|r| r.gateway.discards().is_some())
+        .filter_map(|r| {
+            let Reach::Discard(kind) = route::reach(cfg, r) else {
+                return None;
+            };
+            Some(KernelDiscard {
+                table: route::table_id(cfg, &r.routing_table)?,
+                dst: r.dst_address.trunc(),
+                metric: u32::from(r.distance),
+                kind,
+            })
+        })
+        .collect()
+}
+
+/// The routes without next hop a commit from `from` to `to` removes and
+/// adds, as (gone, new), when [`route_changes`] could not tell (the
+/// interfaces or addresses changed): they need no interface, only their
+/// table, so with the interfaces the same only the touched destinations.
+pub fn discard_changes(
+    from: &Config,
+    to: &Config,
+) -> (BTreeSet<KernelDiscard>, BTreeSet<KernelDiscard>) {
+    let (old, new) = if corerouter_model::sections::interfaces_changed(from, to) {
+        (discard_routes(from), discard_routes(to))
+    } else {
+        let dsts = to.ip.routes.changed_dsts(&from.ip.routes);
+        (discards_to(from, &dsts), discards_to(to, &dsts))
+    };
+    (
+        old.difference(&new).copied().collect(),
+        new.difference(&old).copied().collect(),
+    )
+}
+
 /// [`kernel_routes`] of the routes of `cfg` to the destinations `dsts`,
 /// found through the index of `ip.routes` (G0.31e).
 pub fn kernel_routes_to<'a>(
@@ -136,16 +213,23 @@ pub fn kernel_routes_to<'a>(
     )
 }
 
-/// The kernel routes a commit from `from` to `to` removes and adds, as
-/// (gone, new), resolving only the destinations it touched (G0.31e: one
-/// route among 60 000 resolved ~128, not 120 000). A route resolves
-/// through the interfaces and addresses only (`route::reach`): with those
-/// the same, a route in a block both configs share resolves the same on
-/// both sides. `None` when they changed: compare [`kernel_routes`] whole.
-pub fn route_changes(
-    from: &Config,
-    to: &Config,
-) -> Option<(BTreeSet<KernelRoute>, BTreeSet<KernelRoute>)> {
+/// What a commit changes of the kernel's static routes ([`route_changes`]).
+#[derive(Debug, Default)]
+pub struct RouteChanges {
+    pub gone: BTreeSet<KernelRoute>,
+    pub new: BTreeSet<KernelRoute>,
+    /// G1.5a: routes without next hop.
+    pub discards_gone: BTreeSet<KernelDiscard>,
+    pub discards_new: BTreeSet<KernelDiscard>,
+}
+
+/// The kernel routes a commit from `from` to `to` removes and adds,
+/// resolving only the destinations it touched (G0.31e: one route among
+/// 60 000 resolved ~128, not 120 000). A route resolves through the
+/// interfaces and addresses only (`route::reach`): with those the same, a
+/// route in a block both configs share resolves the same on both sides.
+/// `None` when they changed: compare [`kernel_routes`] whole.
+pub fn route_changes(from: &Config, to: &Config) -> Option<RouteChanges> {
     let addresses_same =
         corerouter_model::cow_list::CowList::ptr_eq(&from.ip.addresses, &to.ip.addresses)
             || from.ip.addresses == to.ip.addresses;
@@ -153,11 +237,53 @@ pub fn route_changes(
         return None;
     }
     let dsts = to.ip.routes.changed_dsts(&from.ip.routes);
-    let (old, new) = (kernel_routes_to(from, &dsts), kernel_routes_to(to, &dsts));
-    Some((
-        old.difference(&new).cloned().collect(),
-        new.difference(&old).cloned().collect(),
-    ))
+    let ((old, dold), (new, dnew)) = (resolved_to(from, &dsts), resolved_to(to, &dsts));
+    Some(RouteChanges {
+        gone: old.difference(&new).cloned().collect(),
+        new: new.difference(&old).cloned().collect(),
+        discards_gone: dold.difference(&dnew).copied().collect(),
+        discards_new: dnew.difference(&dold).copied().collect(),
+    })
+}
+
+/// The routes of `cfg` to `dsts` as the kernel holds them, in one pass:
+/// with a next hop and without (G1.5a).
+fn resolved_to(
+    cfg: &Config,
+    dsts: &BTreeSet<Dst>,
+) -> (BTreeSet<KernelRoute>, BTreeSet<KernelDiscard>) {
+    let (mut routes, mut discards) = (BTreeSet::new(), BTreeSet::new());
+    for r in dsts.iter().flat_map(|d| cfg.ip.routes.routes_to(d)) {
+        let Some(table) = route::table_id(cfg, &r.routing_table) else {
+            continue;
+        };
+        let (dst, metric) = (r.dst_address.trunc(), u32::from(r.distance));
+        match route::reach(cfg, r) {
+            Reach::Active { link, gateway } => {
+                routes.insert(KernelRoute {
+                    table,
+                    dst,
+                    metric,
+                    link,
+                    gateway,
+                });
+            }
+            Reach::Discard(kind) => {
+                discards.insert(KernelDiscard {
+                    table,
+                    dst,
+                    metric,
+                    kind,
+                });
+            }
+            Reach::Inactive(_) | Reach::Invalid { .. } => {}
+        }
+    }
+    (routes, discards)
+}
+
+fn discards_to(cfg: &Config, dsts: &BTreeSet<Dst>) -> BTreeSet<KernelDiscard> {
+    discard_routes_of(cfg, dsts.iter().flat_map(|d| cfg.ip.routes.routes_to(d)))
 }
 
 /// What applying `cfg` leaves in the data plane.
@@ -166,6 +292,7 @@ pub fn expected(cfg: &Config) -> Snapshot {
         links: expected_links(cfg),
         addresses: active_addresses(cfg),
         routes: kernel_routes(cfg),
+        discards: discard_routes(cfg),
     }
 }
 
@@ -312,6 +439,32 @@ pub fn diff(want: &Snapshot, have: &Snapshot) -> Vec<Drift> {
             });
         }
     }
+    // G1.5a: what a backend reads back are the routes without next hop of
+    // protocol static in the tables of the config. They have no link: they
+    // are listed under `lo`, where the kernel shows an IPv6 one.
+    let lo: Option<IfName> = corerouter_model::os_loopback::NAME.parse().ok();
+    for (kind, set, other) in [
+        (DriftKind::RouteMissing, &want.discards, &have.discards),
+        (DriftKind::RouteExtra, &have.discards, &want.discards),
+    ] {
+        for d in set.difference(other) {
+            let Some(interface) = lo.clone() else {
+                break;
+            };
+            let (expected, actual) = if kind == DriftKind::RouteMissing {
+                ("present".into(), String::new())
+            } else {
+                (String::new(), "present".into())
+            };
+            out.push(Drift {
+                kind,
+                interface,
+                item: d.to_string(),
+                expected,
+                actual,
+            });
+        }
+    }
     out.sort();
     out
 }
@@ -351,6 +504,7 @@ pub fn repaired(cfg: &Config, have: &Snapshot) -> Snapshot {
         .retain(|r| !on(&want.links, &r.link) || want.routes.contains(r));
     out.routes
         .extend(want.routes.iter().filter(|r| on(&links, &r.link)).cloned());
+    out.discards.clone_from(&want.discards);
     out
 }
 

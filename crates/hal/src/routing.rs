@@ -139,6 +139,16 @@ pub trait RoutingReader: Send {
         Ok((Vec::new(), Vec::new()))
     }
 
+    /// G3.9c: the stub router state (RFC 6987) of `cfg`'s instances
+    /// (one small JSON answer per instance: read every poll).
+    fn ospf_stub_state(
+        &mut self,
+        cfg: &Config,
+    ) -> Result<Vec<corerouter_model::ospf_state::OspfStubState>, HalError> {
+        let _ = cfg;
+        Ok(Vec::new())
+    }
+
     /// G3.4b: the link-state database and the routes of OSPF instance
     /// `instance` (tens of thousands of LSAs: read streaming, on demand).
     fn ospf_lsdb(

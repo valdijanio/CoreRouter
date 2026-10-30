@@ -123,6 +123,17 @@ pub fn bus_order(found: &mut [Found]) {
     });
 }
 
+/// The ports a hot-plug pass names (G1.6n): the ones still under the
+/// kernel's name and the ones that already carry a name from the map. The
+/// named ones go in so `assign` sees them present (a new card in a slot is
+/// not taken for the replacement of a card that is still there); a port
+/// under a name someone chose (`wan`) is not ours to touch.
+pub fn hotplug_set(all: Vec<Found>, known: &[Known]) -> Vec<Found> {
+    all.into_iter()
+        .filter(|f| is_kernel_name(&f.kernel) || known.iter().any(|k| k.name == f.kernel))
+        .collect()
+}
+
 /// What to do at boot.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Plan {
@@ -327,5 +338,52 @@ mod tests {
         for n in ["eth", "ether1", "eth0.5", "wlan0", "eth12345"] {
             assert!(!is_kernel_name(n), "{n}");
         }
+    }
+
+    #[test]
+    fn a_card_plugged_in_after_boot_takes_the_next_number_and_keeps_it() {
+        // G1.6n: ether1 and ether2 were named at boot; a USB adapter shows up
+        // as eth0 with the router running.
+        let usb = "/sys/devices/pci0000:00/0000:00:04.0/usb4/4-2/4-2:1.0";
+        let (known, _) = parse_map(&format!("ether1 {A} {P1}\nether2 {B} {P2}\n"));
+        let all = vec![
+            f("ether1", A, P1),
+            f("ether2", B, P2),
+            f("eth0", D, usb),
+            f("wan", C, P3),
+        ];
+        let set = hotplug_set(all, &known);
+        assert_eq!(set.len(), 3, "a name someone chose is left alone");
+        let p = assign(&set, &known, false);
+        assert_eq!(p.renames, vec![("eth0".into(), "ether3".into())]);
+        // Unplugged and plugged in again (another port, the kernel calls it
+        // eth1 now): the same name.
+        let set = hotplug_set(
+            vec![
+                f("ether1", A, P1),
+                f("ether2", B, P2),
+                f(
+                    "eth1",
+                    D,
+                    "/sys/devices/pci0000:00/0000:00:04.0/usb3/3-1/3-1:1.0",
+                ),
+            ],
+            &p.map,
+        );
+        let p2 = assign(&set, &p.map, false);
+        assert_eq!(p2.renames, vec![("eth1".into(), "ether3".into())]);
+    }
+
+    #[test]
+    fn a_card_in_a_free_slot_does_not_take_a_present_cards_name() {
+        // ether2 is present under its name: a new card at the same path (a
+        // second port of a USB adapter, say) is new, not a replacement.
+        let (known, _) = parse_map(&format!("ether1 {A} {P1}\nether2 {B} {P2}\n"));
+        let set = hotplug_set(
+            vec![f("ether1", A, P1), f("ether2", B, P2), f("eth0", C, P2)],
+            &known,
+        );
+        let p = assign(&set, &known, false);
+        assert_eq!(p.renames, vec![("eth0".into(), "ether3".into())]);
     }
 }

@@ -316,15 +316,20 @@ pub(crate) fn combo(
     value: &mut String,
     options: &[String],
 ) {
+    // G1.29b: a USB adapter's name carries the USB icon (amber: slow port).
+    let shown: egui::WidgetText = if value.is_empty() {
+        hint.into()
+    } else {
+        crate::usb_mark::rich(ui, value).into()
+    };
     egui::ComboBox::from_id_salt(id)
-        .selected_text(if value.is_empty() {
-            hint
-        } else {
-            value.as_str()
-        })
+        .selected_text(shown)
         .show_ui(ui, |ui| {
             for n in options {
-                ui.selectable_value(value, n.clone(), n);
+                let r = ui.selectable_value(value, n.clone(), crate::usb_mark::rich(ui, n));
+                if let Some(m) = crate::usb_mark::get(ui.ctx(), n) {
+                    r.on_hover_text(m.tip);
+                }
             }
         });
 }

@@ -26,7 +26,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("interfaces.traffic", "Tráfego recente de recebimento e transmissão. Sem histórico, a célula fica vazia."),
     ("interfaces.tx", "Total de bytes transmitidos desde a última reinicialização dos contadores."),
     ("interfaces.tx_pkt", "Total de pacotes transmitidos desde a última reinicialização dos contadores."),
-    ("interfaces.type", "Tipo informado pela plataforma; o ícone identifica o tipo configurado."),
+    ("interfaces.type", "Um adaptador USB mostra o ícone de USB (âmbar quando a porta é mais lenta que o adaptador; passe o mouse para ver velocidade, porta e driver). Tipo informado pela plataforma; o ícone identifica o tipo configurado."),
     ("interfaces.vlan.interface", "## Interface\nA interface por onde a VLAN passa: uma porta ethernet, um bond, uma bridge ou outra VLAN (uma C-VLAN sobre uma S-VLAN é o QinQ). O RouterOS a chama de `interface=`; o comando do CoreRouter, de `parent`, e o terminal aceita os dois."),
     ("interfaces.vlan.mtu", "## MTU\nO maior pacote IP na VLAN. Vazio usa o MTU da interface pai, que também é o teto. A etiqueta (4 bytes, 8 no QinQ) entra no L2 MTU do pai, não aqui."),
     ("interfaces.vlan.name", "## Nome\nO nome da interface VLAN, usado nos endereços, rotas e firewall. Um nome que diga para onde ela vai (`vlan100`, `cli-acme`) ajuda o próximo operador."),

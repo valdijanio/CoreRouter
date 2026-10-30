@@ -17,7 +17,7 @@ pub const MAX_INTERFACES: usize = 4096;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "interface.list", "Interfaces", ["Interfaces"], None,
-        "{type?: string (ether | vlan | bridge | bonding | loopback | vrf | veth | …)} → [{name, type, kind, managed, unmanaged_reason, mtu, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, comment, parent, vlan_id, use_service_tag, bridge, bond, vrf, table}]",
+        "{type?: string (ether | vlan | bridge | bonding | loopback | vrf | veth | …)} → [{name, type, kind, managed, unmanaged_reason, mtu, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, comment, parent, vlan_id, use_service_tag, bridge, bond, vrf, table, usb: null | {port, speed, driver, slow_port, alert} (a USB adapter, G1.29b)}]",
         always, list),
     cmd!(
         "interface.set",
@@ -105,6 +105,14 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
     let filter = opt_str(p, "type")?;
     let live = s.hal_mut().poll();
     s.watch_links(&live);
+    // G1.29b: USB adapters, by the bus the link dump names (no query for
+    // the others).
+    let usb: BTreeMap<IfName, Value> = live
+        .iter()
+        .filter(|l| l.bus.as_deref() == Some("usb"))
+        .take(crate::usb_nic::MAX_LISTED)
+        .filter_map(|l| Some((l.name.clone(), crate::usb_nic::summary(s, &l.name)?)))
+        .collect();
     let cfg = s.store().candidate();
     let mut rows: Vec<Value> = cfg
         .interfaces
@@ -153,6 +161,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                 "bond": i.bond,
                 "vrf": i.vrf,
                 "table": table,
+                "usb": usb.get(&i.name),
             })
         })
         .collect();
@@ -181,6 +190,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                     "comment": "",
                     "parent": null,
                     "vlan_id": null,
+                    "usb": usb.get(&l.name),
                     "bridge": null,
                     "bond": null,
                     "vrf": null,

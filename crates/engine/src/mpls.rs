@@ -131,21 +131,42 @@ pub fn ldp_state(s: &Session) -> Option<Arc<LdpState>> {
 
 /// [`annotate_routes`] with the state already taken.
 pub fn annotate_rows(st: Option<&LdpState>, rows: &mut [serde_json::Value]) {
-    let Some(st) = st else {
-        return;
-    };
-    if st.bindings.is_empty() {
+    let labels = LdpLabels::new(st);
+    if labels.0.is_empty() {
         return;
     }
-    let by: std::collections::HashMap<ipnet::IpNet, &corerouter_model::mpls_state::LdpBinding> =
-        st.bindings.iter().map(|b| (b.prefix, b)).collect();
     for r in rows.iter_mut() {
         let Some(dst) = r.get("dst_address").and_then(serde_json::Value::as_str) else {
             continue;
         };
-        let Some(b) = dst.parse::<ipnet::IpNet>().ok().and_then(|d| by.get(&d)) else {
+        let Some((local, out)) = dst.parse::<ipnet::IpNet>().ok().and_then(|d| labels.get(&d))
+        else {
             continue;
         };
+        if let Some(o) = r.as_object_mut() {
+            o.insert("mpls_in".into(), serde_json::json!(local));
+            o.insert("mpls_out".into(), serde_json::json!(out));
+        }
+    }
+}
+
+/// The LDP labels by FEC, for route rows: `mpls_in` (the local label) and
+/// `mpls_out` (the label in use, `implicit-null (pop)` for PHP).
+pub struct LdpLabels<'a>(
+    std::collections::HashMap<ipnet::IpNet, &'a corerouter_model::mpls_state::LdpBinding>,
+);
+
+impl<'a> LdpLabels<'a> {
+    pub fn new(st: Option<&'a LdpState>) -> Self {
+        Self(
+            st.map(|st| st.bindings.iter().map(|b| (b.prefix, b)).collect())
+                .unwrap_or_default(),
+        )
+    }
+
+    /// `(mpls_in, mpls_out)` of a route to `dst`, if LDP has it.
+    pub fn get(&self, dst: &ipnet::IpNet) -> Option<(Option<u32>, Option<String>)> {
+        let b = self.0.get(dst)?;
         let out = b.in_use().map(|x| {
             if x.label == corerouter_model::mpls::IMPLICIT_NULL {
                 "implicit-null (pop)".to_owned()
@@ -153,10 +174,7 @@ pub fn annotate_rows(st: Option<&LdpState>, rows: &mut [serde_json::Value]) {
                 corerouter_model::mpls::label_text(x.label)
             }
         });
-        if let Some(o) = r.as_object_mut() {
-            o.insert("mpls_in".into(), serde_json::json!(b.local_label));
-            o.insert("mpls_out".into(), serde_json::json!(out));
-        }
+        Some((b.local_label, out))
     }
 }
 

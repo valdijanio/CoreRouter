@@ -492,7 +492,11 @@ buraco negro: o TCP abre e trava no primeiro segmento cheio. Agora o respondedor
 
 - **Por pacote no caminho de dados:** duas instruções a mais no filtro (comprimento e comparação)
   para quadro que não é TTL ≤ 1 nem explicit null; nenhuma cópia enquanto o quadro couber na
-  menor saída. Medido em `benches/netns_mpls_ttl.rs` (abaixo).
+  menor saída. **Medido** (VM `corerouter-lab`, 4 vCPU, kernel 6.18, build release,
+  2026-10-29, `benches/netns_mpls_ttl.rs`, quadros MPLS de 64 octetos num núcleo): sem taps
+  2,083 Melem/s (2,080 no fim da rodada); os três taps do respondedor 1,633; com o filtro de
+  "grande demais" ligado 1,644. O filtro novo não custa nada mensurável; o custo dos taps
+  `AF_PACKET` (~21%) é o que a G3.9db tira.
 - **Recalcular o limiar:** O(rótulos) quando a tabela é relida (no máximo uma vez por segundo, já
   era o custo da releitura), na thread do serviço.
 - **Por erro:** `too_big::answer` é uma busca no `BTreeMap` de rótulos e a montagem do pacote,

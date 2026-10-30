@@ -56,6 +56,7 @@ fn rates_come_from_counter_deltas() {
         kind: "ether".into(),
         mtu: 1500,
         mac: None,
+        bus: None,
         unmanaged: None,
         errors: None,
     };

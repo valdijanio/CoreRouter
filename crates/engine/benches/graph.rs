@@ -39,6 +39,7 @@ fn links(n: usize) -> (Vec<IfName>, Vec<LinkState>) {
             kind: "ether".into(),
             mtu: 1500,
             mac: None,
+            bus: None,
             unmanaged: None,
             errors: Some(corerouter_hal::LinkErrors::default()),
         })

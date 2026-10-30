@@ -80,9 +80,13 @@ Resumo do que interopera e do que não:
 
 ## Configuração de partida (sem atrair tráfego)
 
-O que ela faz: router-id único na loopback; **custo 65535** em todo enlace do CoreRouter (ninguém
-calcula caminho de trânsito por ele, mas o que ele anuncia continua alcançável; medido no caso
-`entry`); prioridade 0 se o enlace for broadcast (nunca DR/BDR); anuncia **só** a loopback e a
+O que ela faz: router-id único na loopback; **stub router** (RFC 6987, G3.9c): todo enlace de
+trânsito do CoreRouter sai na router-LSA com custo 65535, de uma vez e inclusive num template
+acrescentado depois (ninguém calcula caminho de trânsito por ele, mas o que ele anuncia continua
+alcançável; medido no caso `stub-router`), e os templates já levam o custo real; depois de cada
+partida (reboot, FRR reiniciado) ele fica 300 s como stub router (`stub-router-on-startup`), tempo
+para as adjacências, o LDP e o BFD subirem antes de ele voltar a ser trânsito: o RouterOS não tem
+sincronização LDP-IGP (RFC 5443); prioridade 0 se o enlace for broadcast (nunca DR/BDR); anuncia **só** a loopback e a
 sub-rede dos clientes de teste (templates passivos, sem `redistribute`); autenticação sha256; BFD
 300 ms × 4 (detecção em 1,2 s; ver "Como ampliar"); LDP com transport address na loopback; TI-LFA desligado (é o padrão: só
 liga com `routing.ospf.segment-routing.set`).
@@ -100,9 +104,9 @@ file=core-start.rsc` faz o mesmo a partir de um arquivo.
 /ip address add address=10.39.1.2/30 interface=ether1 comment="core MikroTik"
 /ip address add address=100.64.39.1/24 interface=ether3 comment="clientes de teste"
 /routing bfd profile add name=mikrotik min-tx=300 min-rx=300 multiplier=4
-/routing ospf instance add name=v2 router-id=10.255.39.2
+/routing ospf instance add name=v2 router-id=10.255.39.2 stub-router=yes stub-router-on-startup=300
 /routing ospf area add name=backbone instance=v2 area-id=0.0.0.0
-/routing ospf interface-template add area=backbone interfaces=ether1 type=ptp cost=65535 priority=0 auth=sha256 auth-id=1 auth-key=TROQUE-ESTA-CHAVE bfd=mikrotik comment="core MikroTik"
+/routing ospf interface-template add area=backbone interfaces=ether1 type=ptp cost=10 priority=0 auth=sha256 auth-id=1 auth-key=TROQUE-ESTA-CHAVE bfd=mikrotik comment="core MikroTik"
 /routing ospf interface-template add area=backbone interfaces=lo passive=yes comment=loopback
 /routing ospf interface-template add area=backbone interfaces=ether3 passive=yes comment="clientes de teste"
 /mpls ldp add lsr-id=10.255.39.2
@@ -125,7 +129,9 @@ Equivalências, item por item:
 | CoreRouter | RouterOS v7 | Nota |
 |---|---|---|
 | `/routing ospf instance … router-id=` | `/routing ospf instance set … router-id=` | Único no domínio; na loopback |
-| template `cost=65535` | `cost=` no interface-template | O custo vale na saída de cada lado |
+| instância `stub-router=yes` | não existe: `cost=65535` em cada interface-template | RFC 6987: só os enlaces de trânsito vão a 65535, a loopback e os passivos mantêm o custo; vale para todo template, inclusive os novos |
+| `stub-router-on-startup=300` | não existe (nem LDP-IGP sync) | Depois de cada partida, 300 s sem ser trânsito; só OSPFv2 |
+| template `cost=10` | `cost=` no interface-template | O custo vale na saída de cada lado; com o stub router ligado, o de trânsito sai 65535 |
 | `priority=0` | `priority=0` | Só conta em `broadcast`; em `ptp` não há eleição |
 | `auth=sha256 auth-id=1 auth-key=…` | `auth=sha256 auth-id=1 auth-key=…` | Mesmo key id dos dois lados (o RouterOS loga "wrong SA ID") |
 | `bfd=mikrotik` (perfil 300/300/4) | `use-bfd=yes` + `/routing bfd configuration` | O RouterOS só faz BFD nas portas listadas em `configuration`; sem autenticação nem echo |
@@ -249,8 +255,13 @@ Sem acesso de rede ao roteador, o mesmo pacote vai num pendrive: `system.package
 
 ## Como ampliar depois
 
-1. Baixar o custo de um enlace por vez (65535 → o custo real), olhando `/routing ospf route print`
-   no MikroTik para ver o que passou a ir pelo CoreRouter.
+1. Tirar o stub router quando as adjacências, o LDP e o BFD estiverem de pé:
+   `/routing ospf instance set v2 stub-router=no` (ou o botão **Undrain** em Routing › OSPF ›
+   Instances), olhando `/routing ospf route print` no MikroTik para ver o que passou a ir pelo
+   CoreRouter. O `stub-router-on-startup=300` fica: depois de um reboot ele volta a ser trânsito
+   sozinho, 300 s depois da primeira router-LSA. Para manutenção, `stub-router=yes` (**Drain**)
+   tira o trânsito antes e `stub-router=no` o devolve. Quem preferir abrir enlace por enlace
+   deixa o stub router desligado e começa com `cost=65535` nos templates, baixando um por vez.
 2. Mais clientes: mais templates passivos ou um `redistribute` com `out_filter_chain` que aceite só
    as redes certas (caso `redistribute` do laboratório).
 3. BFD mais rápido só depois de medir. Com o RouterOS 7.25 e o G3.9b, 100 ms × 3 ficou estável
@@ -298,8 +309,9 @@ R3 ── CHR (RouterOS) ── CoreRouter ── R4
   [sincronização LDP-IGP](https://juniper.net/documentation/en_US/junos13.1/topics/example/routing-synchronization-between-ldp-and-igps-configuring.html)
   (custo máximo até o LDP subir); Cisco IOS-XE `max-metric router-lsa on-startup` e `mpls ldp
   sync`; o FRR (usado também pelo VyOS) tem os dois (`max-metric router-lsa`, `mpls ldp-sync`).
-  O que fazem melhor: o *stub router* cobre todos os enlaces de uma vez e expira sozinho
-  (gap G3.9c); aqui, sem ele, a partida usa custo 65535 por template.
+  O que fazem melhor: o *stub router* cobre todos os enlaces de uma vez e expira sozinho;
+  o CoreRouter o tem desde a G3.9c (`stub-router`, `stub-router-on-startup`, sobre o
+  `max-metric router-lsa` do `ospfd`).
 - **RFCs:** [RFC 2328](https://www.rfc-editor.org/rfc/rfc2328) §10.6 (MTU no DD), §10.5 (bit E),
   §9.4 (eleição de DR, prioridade 0); [RFC 3101](https://www.rfc-editor.org/rfc/rfc3101) (NSSA);
   [RFC 5709](https://www.rfc-editor.org/rfc/rfc5709) (HMAC-SHA no OSPFv2);
