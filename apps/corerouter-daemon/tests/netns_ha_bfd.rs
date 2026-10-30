@@ -219,10 +219,11 @@ fn bfd_takes_over_in_a_fraction_of_the_dead_interval() {
         active_ms < 400,
         "takeover {active_ms} ms after the last sign of life: {k}"
     );
-    assert!(
-        wall < Duration::from_millis(1100),
-        "faster than the dead interval: {wall:?}"
-    );
+    // Faster than the dead interval: BFD saw it (`detected_by`, not the
+    // hellos) and A took over 0.4 s after the last sign of life. `wall`
+    // also counts reaping B's process and every control round trip of the
+    // polling: 1.58 s with `active_ms` 153 on a loaded machine (flaked in
+    // the queue's batches), so it is printed, not checked.
     let h = monitor(None)["history"][0].clone();
     assert_eq!(h["reason"], "peer-dead", "{h}");
 }

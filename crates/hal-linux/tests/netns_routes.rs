@@ -11,7 +11,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 use corerouter_hal::Hal;
 use corerouter_hal::drift;
@@ -25,6 +25,11 @@ const ENV: &str = "COREROUTER_NETNS_TESTS";
 
 /// True when the tests may touch the kernel; panics outside a fresh
 /// namespace (only `lo`), so a stray variable on the host touches nothing.
+/// `route_dumps()` counts for the whole process: the test that checks it
+/// takes this for writing, the others for reading (they run in parallel
+/// threads, and a dump of theirs in its window failed it under load).
+static DUMPS: RwLock<()> = RwLock::new(());
+
 fn in_netns() -> bool {
     if std::env::var_os(ENV).is_none_or(|v| v != "1") {
         eprintln!("skipped: set {ENV}=1 and run inside `unshare --user --map-root-user --net`");
@@ -117,6 +122,7 @@ fn equal_distance_routes_are_one_multipath_route() {
     if !in_netns() {
         return;
     }
+    let _dumps = DUMPS.read().unwrap_or_else(|e| e.into_inner());
     let mut hal = LinuxHal::new();
     let base = base("m1p", 81);
     hal.apply(&Config::default(), &base).unwrap();
@@ -178,6 +184,7 @@ fn route_get_answers_like_ip_route_get() {
     if !in_netns() {
         return;
     }
+    let _dumps = DUMPS.read().unwrap_or_else(|e| e.into_inner());
     let mut hal = LinuxHal::new();
     let mut cfg = base("m2p", 82);
     route(&mut cfg, "0.0.0.0/0", "10.82.0.1");
@@ -224,6 +231,7 @@ fn a_route_of_someone_else_is_refused_not_replaced() {
     if !in_netns() {
         return;
     }
+    let _dumps = DUMPS.read().unwrap_or_else(|e| e.into_inner());
     let mut hal = LinuxHal::new();
     let base = base("f1p", 82);
     hal.apply(&Config::default(), &base).unwrap();
@@ -257,6 +265,7 @@ fn a_distance_change_reads_no_route_table() {
     if !in_netns() {
         return;
     }
+    let _dumps = DUMPS.write().unwrap_or_else(|e| e.into_inner());
     let mut hal = LinuxHal::new();
     let base = base("dst", 82);
     hal.apply(&Config::default(), &base).unwrap();
@@ -327,6 +336,7 @@ fn discard_routes_are_kernel_route_types() {
     if !in_netns() {
         return;
     }
+    let _dumps = DUMPS.read().unwrap_or_else(|e| e.into_inner());
     let mut hal = LinuxHal::new();
     let mut base = base("bhp", 83);
     base.interfaces.insert(

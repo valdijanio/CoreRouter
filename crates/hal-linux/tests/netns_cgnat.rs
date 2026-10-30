@@ -723,7 +723,7 @@ fn a_subscriber_out_of_ports_never_borrows_another_s() {
     });
     let mut seen = std::collections::BTreeSet::new();
     let mut buf = [0u8; 8];
-    for (_, from) in burst(&server, &mut buf) {
+    for (_, from) in burst(&server, &mut buf, 64) {
         seen.insert(from);
     }
     let slot = layout_of(&p)
@@ -754,22 +754,25 @@ fn a_subscriber_out_of_ports_never_borrows_another_s() {
     hal.apply(&c, &Config::default()).unwrap();
 }
 
-/// The datagrams of a burst: up to 3 s for the first (on a loaded machine
-/// the first packet of a flow, through the ruleset and an ARP, took longer
-/// than 300 ms: flaked in the queue's batches), then until 300 ms pass
-/// without one (the burst is over).
-fn burst(server: &UdpSocket, buf: &mut [u8]) -> Vec<(usize, SocketAddr)> {
+/// The datagrams of a burst that should bring `expect`: up to 3 s for
+/// each until they are in, then 300 ms more for any extra. One 300 ms
+/// wait for all lost the burst on a loaded machine: the first packet of a
+/// flow (the ruleset, an ARP) or a pause in the middle took longer
+/// (flaked in the queue's batches).
+fn burst(server: &UdpSocket, buf: &mut [u8], expect: usize) -> Vec<(usize, SocketAddr)> {
     let mut got = Vec::new();
-    server
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
-    while let Ok(r) = server.recv_from(buf) {
-        got.push(r);
-        server
-            .set_read_timeout(Some(Duration::from_millis(300)))
-            .unwrap();
+    loop {
+        let wait = if got.len() < expect {
+            Duration::from_secs(3)
+        } else {
+            Duration::from_millis(300)
+        };
+        server.set_read_timeout(Some(wait)).unwrap();
+        match server.recv_from(buf) {
+            Ok(r) => got.push(r),
+            Err(_) => return got,
+        }
     }
-    got
 }
 
 /// Serve the exhaustion queues of `hal` on a thread until `stop`.
@@ -870,7 +873,7 @@ fn a_subscriber_out_of_ports_gets_icmp_host_unreachable() {
             .collect()
     });
     let mut buf = [0u8; 8];
-    let through = burst(&server, &mut buf).len();
+    let through = burst(&server, &mut buf, 64).len();
     assert_eq!(through, 64);
 
     let a: Ipv4Addr = "100.64.0.1".parse().unwrap();
@@ -899,7 +902,21 @@ fn a_subscriber_out_of_ports_gets_icmp_host_unreachable() {
         server.recv_from(&mut buf).is_err(),
         "nothing more got through"
     );
-    assert_eq!(seen.len(), 5, "the burst, no more: {seen:?}");
+    // The burst, and what the bucket refills while the ten are refused: on
+    // a loaded machine they spread over more than 200 ms, one more token
+    // (flaked in the queue's batches). Unlimited would be ten at once.
+    let spread = match (
+        seen.iter().map(|s| s.3).min(),
+        seen.iter().map(|s| s.3).max(),
+    ) {
+        (Some(a), Some(b)) => b.duration_since(a),
+        _ => Duration::ZERO,
+    };
+    let allowed = 5 + (spread.as_secs_f64() * 5.0).ceil() as usize;
+    assert!(
+        (5..=allowed).contains(&seen.len()),
+        "the burst, no more ({allowed} in {spread:?}): {seen:?}"
+    );
     for (code, src, port, _) in &seen {
         assert_eq!(*code, 1, "host unreachable (RFC 6888 REQ-11b)");
         assert_eq!(*src, a, "the private source, as sent");
@@ -937,8 +954,8 @@ fn a_subscriber_out_of_ports_gets_icmp_host_unreachable() {
     eprintln!("served {served}, {stats:?}");
     assert_eq!(served, 11, "ten from .1 and one from .2; .65 never");
     assert_eq!(stats.refused, 10);
-    assert_eq!(stats.icmp, 5);
-    assert_eq!(stats.limited, 5);
+    assert_eq!(stats.icmp, seen.len() as u64);
+    assert_eq!(stats.limited, 10 - seen.len() as u64);
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].0, a);
     drop(sockets);

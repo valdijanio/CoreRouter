@@ -194,6 +194,7 @@ fn two_daemons_detect_a_dead_link_within_the_detection_time() {
     // Cut the link in B; A sees the session go down.
     let cut = unix_ms();
     ip(Some(b), &["link", "set", "bfd0", "down"]);
+    let cut_done = unix_ms();
     until("the session down", 5, || session(None)["state"] == "down");
     let h = ok(None, "routing.bfd.history.list", json!({}));
     let down = h
@@ -204,11 +205,17 @@ fn two_daemons_detect_a_dead_link_within_the_detection_time() {
         .unwrap()
         .clone();
     assert_eq!(down["diag"], "control-detection-time-expired");
-    let detect_ms = down["at_ms"].as_u64().unwrap().saturating_sub(cut);
-    eprintln!("BFD detection after the cut: {detect_ms} ms (detection time 150 ms)");
-    // 150 ms plus the `ip` command's own time, which a loaded machine
-    // stretches: the bound only has to tell the fast timers (150 ms) from
-    // the slow ones (3 s) a failed negotiation would leave.
+    let at = down["at_ms"].as_u64().unwrap();
+    let detect_ms = at.saturating_sub(cut_done);
+    eprintln!(
+        "BFD detection after the cut: {detect_ms} ms, {} ms counting the `ip` command (detection time 150 ms)",
+        at.saturating_sub(cut)
+    );
+    // From the end of the `ip` command (the link is down by then): its own
+    // time, which a loaded machine stretched past the bound (1008 ms,
+    // flaked in the queue's batches), is not the BFD's. The bound only has
+    // to tell the fast timers (150 ms) from the slow ones (3 s) a failed
+    // negotiation would leave.
     assert!(detect_ms <= 1000, "{detect_ms} ms");
 
     // Link back: up again.
