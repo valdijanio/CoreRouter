@@ -47,6 +47,29 @@ pub struct OspfNeighbor {
     pub summary: u64,
 }
 
+/// G3.9c: whether an instance is a stub router now (RFC 6987), as the
+/// daemon says (`show ip ospf json`, `show ipv6 ospf6 json`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct OspfStubState {
+    pub instance: String,
+    /// Areas whose router-LSA carries MaxLinkMetric (v2) or a cleared
+    /// R-bit (v3) now.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub areas: Vec<String>,
+    /// Set by `max-metric router-lsa administrative`.
+    pub admin: bool,
+    /// Seconds left of `on-startup` (the longest of the areas).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_remaining_secs: Option<u64>,
+}
+
+impl OspfStubState {
+    /// Some area is stubbed now.
+    pub fn active(&self) -> bool {
+        self.admin || self.startup_remaining_secs.is_some() || !self.areas.is_empty()
+    }
+}
+
 /// One OSPF interface as the daemon runs it.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct OspfIfState {

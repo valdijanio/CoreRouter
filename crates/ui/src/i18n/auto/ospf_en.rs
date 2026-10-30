@@ -45,6 +45,11 @@ The repair segments, computed as ospfd does."##),
 Routes: primary and backup next hop with the label stack. Unprotected: the routes without a backup and why. Simulate Link Cut: the backup each affected route takes and the path after convergence, nothing changed."##),
     (r##"ospf.instance"##, r##"## What it is
 An OSPF instance (RouterOS `/routing ospf instance`). The preview shows the interfaces it runs on and what the change does."##),
+    (r##"ospf.instance.drain"##, r##"## What it is
+Turns the selected instance's stub router on (Drain) or off (Undrain): `routing.ospf.instance.set {stub_router}`. Drained, every transit link of the router-LSA goes to cost 65535 and traffic goes around this router; its own networks stay reachable (RFC 6987).
+
+## When
+Before maintenance, or to bring a new router into the core without carrying traffic. In a Safe Mode or transactional session the change rolls back with the rest."##),
     (r##"ospf.instance.name"##, r##"## What it is
 The instance's name."##),
     (r##"ospf.instance.originate_default"##, r##"## What it is
@@ -58,6 +63,22 @@ The router's 32-bit id in OSPF, unique in the AS.
 
 ## Recommended
 A fixed one (a loopback address): changing it restarts every adjacency."##),
+    (r##"ospf.instance.stub_router"##, r##"## What it is
+Stub router (RFC 6987, FRR `max-metric router-lsa administrative`): the router-LSA describes every transit link (point-to-point, LAN with a DR, virtual link) at cost 65535, the loopback and passive networks at their cost. Other routers stop routing **through** this one but still reach it. OSPFv3 clears the R-bit instead: never transit, not even as the only path.
+
+## Caveats
+Cost 65535 is not infinity: where this router is the only path, traffic still crosses it (§4). A virtual link whose path crosses it goes down (errata 4685).
+
+## Recommended
+To enter the core: stub router on and the real costs on the templates, instead of cost 65535 on each one; take it off once the adjacencies, LDP and BFD are up."##),
+    (r##"ospf.instance.stub_router_on_startup"##, r##"## What it is
+Seconds (5–86400) as a stub router after each start of the instance (FRR `max-metric router-lsa on-startup`, counted per area from its first router-LSA). After a reboot the router forms its adjacencies and LDP comes up before it carries transit: RouterOS has no LDP-IGP sync (RFC 5443), so this is the way to avoid black-holing labelled traffic.
+
+## Caveats
+Added to an instance that already runs it waits for the next start. OSPFv2 only (ospf6d has no on-startup).
+
+## Recommended
+300 s on a core router; more if LDP takes longer to reach every neighbor."##),
     (r##"ospf.instance.subscriber_pools"##, r##"## What it is
 Announce the PPPoE and IPoE address pools, each summarized into one external, withdrawn when its last subscriber goes (G4.3ce)."##),
     (r##"ospf.instance.version"##, r##"## What it is

@@ -12,7 +12,7 @@ use std::net::Ipv4Addr;
 use corerouter_model::Routing;
 use corerouter_model::ospf::{
     AreaId, AreaType, MAX_AREAS, MAX_INSTANCES, MAX_NEIGHBORS, MAX_RANGES, NssaTranslate, OriginateDefault,
-    OspfArea, OspfAreaRange, OspfInstance, OspfStaticNeighbor, Redistribute, Version,
+    OspfArea, OspfAreaRange, OspfInstance, OspfStaticNeighbor, Redistribute, STUB_ROUTER_STARTUP, Version,
 };
 use corerouter_model::types::ItemId;
 use ipnet::IpNet;
@@ -25,16 +25,16 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("routing.ospf.instance.add", "Add OSPF Instance", ["Routing", "OSPF"], None,
-        "{name: string, version?: u8 (2: IPv4, RFC 2328; 3: IPv6, RFC 5340; default 2), vrf?: string (default main), router_id?: ipv4 | null (unique in the AS; default: picked by the daemon), redistribute?: [string] | string (connected, static, bgp, kernel), out_filter_chain?: string | null (the /routing filter chain of redistributed routes), originate_default?: string (never, if-installed, always), subscriber_pools?: bool (announce the PPPoE/IPoE pools, summarized; v2), disabled?: bool, comment?: string} → {name}",
+        "{name: string, version?: u8 (2: IPv4, RFC 2328; 3: IPv6, RFC 5340; default 2), vrf?: string (default main), router_id?: ipv4 | null (unique in the AS; default: picked by the daemon), redistribute?: [string] | string (connected, static, bgp, kernel), out_filter_chain?: string | null (the /routing filter chain of redistributed routes), originate_default?: string (never, if-installed, always), subscriber_pools?: bool (announce the PPPoE/IPoE pools, summarized; v2), stub_router?: bool (RFC 6987: transit links at cost 65535 until unset; drains the router), stub_router_on_startup?: u32 | null (seconds 5..=86400 as a stub router after the instance starts; v2), disabled?: bool, comment?: string} → {name}",
         always, instance_add),
     cmd!("routing.ospf.instance.set", "Set OSPF Instance", [], None,
-        "{id: string (the name), name?: string, version?: u8, vrf?: string, router_id?: ipv4 | null, redistribute?: [string] | string, out_filter_chain?: string | null, originate_default?: string, subscriber_pools?: bool, disabled?: bool, comment?: string} → {name}",
+        "{id: string (the name), name?: string, version?: u8, vrf?: string, router_id?: ipv4 | null, redistribute?: [string] | string, out_filter_chain?: string | null, originate_default?: string, subscriber_pools?: bool, stub_router?: bool, stub_router_on_startup?: u32 | null, disabled?: bool, comment?: string} → {name}",
         has_instances, instance_set),
     cmd!("routing.ospf.instance.remove", "Remove OSPF Instance", [], None,
         "{id: string (the name)} → {name}",
         has_instances, instance_remove),
     cmd!(query "routing.ospf.instance.list", "OSPF Instances", ["Routing", "OSPF"], None,
-        "{} → [{name, version, vrf, router_id, redistribute, out_filter_chain, originate_default, subscriber_pools, pools: [prefix] (announced), areas, interfaces (matched now), disabled, comment}]",
+        "{} → [{name, version, vrf, router_id, redistribute, out_filter_chain, originate_default, subscriber_pools, stub_router, stub_router_on_startup, stub_state: {state (administrative, startup, off), remaining_secs?, areas, source} | null (what the daemon does now), pools: [prefix] (announced), areas, interfaces (matched now), disabled, comment}]",
         always, instance_list),
     cmd!("routing.ospf.area.add", "Add OSPF Area", ["Routing", "OSPF"], None,
         "{name: string, instance: string, area_id: string (dotted 0.0.0.1 or a number; 0.0.0.0 is the backbone), type?: string (default, stub, nssa), no_summaries?: bool (stub/NSSA: only a default route from the ABR), default_cost?: u32 | null, nssa_translate?: string (candidate, yes, no), disabled?: bool, comment?: string} → {name}",
@@ -214,6 +214,8 @@ pub(super) fn apply_instance(routing: &mut Routing, p: &Value, id: Option<&str>)
             out_filter_chain: None,
             originate_default: OriginateDefault::Never,
             subscriber_pools: false,
+            stub_router: false,
+            stub_router_on_startup: None,
             disabled: false,
             comment: String::new(),
         },
@@ -277,6 +279,23 @@ pub(super) fn apply_instance(routing: &mut Routing, p: &Value, id: Option<&str>)
     if let Some(b) = opt_boolean(p, "subscriber_pools")? {
         inst.subscriber_pools = b;
     }
+    if let Some(b) = opt_boolean(p, "stub_router")? {
+        inst.stub_router = b;
+    }
+    opt_number(
+        p,
+        "stub_router_on_startup",
+        u64::from(*STUB_ROUTER_STARTUP.start()),
+        u64::from(*STUB_ROUTER_STARTUP.end()),
+        &mut inst.stub_router_on_startup,
+    )?;
+    if inst.version == Version::V3 && inst.stub_router_on_startup.is_some() {
+        // ospf6d has `stub-router administrative` only.
+        return Err(EngineError::bad(
+            "stub_router_on_startup",
+            "OSPFv3 (ospf6d) has no on-startup stub router: use stub_router and unset it later",
+        ));
+    }
     comment_and_disabled(p, &mut inst.comment, &mut inst.disabled)?;
     let name = inst.name.clone();
     if id != Some(name.as_str()) && ospf.instances.contains_key(&name) {
@@ -336,7 +355,25 @@ fn instance_remove(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "name": id }))
 }
 
+/// G3.9c: the stub router state of one instance as the list shows it:
+/// `administrative`, `startup` (with the seconds left) or `off`; `None`
+/// while the daemon has not answered.
+fn stub_state(st: Option<&corerouter_model::ospf_state::OspfStubState>, source: &str) -> Value {
+    let Some(st) = st else {
+        return Value::Null;
+    };
+    let state = if st.admin {
+        "administrative"
+    } else if st.active() {
+        "startup"
+    } else {
+        "off"
+    };
+    json!({"state": state, "remaining_secs": st.startup_remaining_secs, "areas": st.areas, "source": source})
+}
+
 fn instance_list(s: &mut Session, _: &Value) -> Result<Value> {
+    let (stub, stub_source) = s.ospf_stub_live();
     let cfg = s.store().candidate();
     let binds = corerouter_proto_ospf::bind::bindings(cfg);
     let pools = corerouter_proto_ospf::pools::cidrs(cfg);
@@ -354,6 +391,9 @@ fn instance_list(s: &mut Session, _: &Value) -> Result<Value> {
                 "out_filter_chain": i.out_filter_chain,
                 "originate_default": i.originate_default.name(),
                 "subscriber_pools": i.subscriber_pools,
+                "stub_router": i.stub_router,
+                "stub_router_on_startup": i.stub_router_on_startup,
+                "stub_state": stub_state(stub.iter().find(|st| st.instance == i.name), stub_source),
                 "pools": if i.subscriber_pools && i.version == Version::V2 {
                     pools.iter().map(ToString::to_string).collect::<Vec<_>>()
                 } else {
@@ -750,5 +790,39 @@ mod tests {
         assert_eq!(l[0]["cost"], 20);
         s.execute("routing.ospf.area.range.remove", &json!({"id": id})).unwrap();
         assert!(s.execute("routing.ospf.area.range.remove", &json!({"id": id})).is_err());
+    }
+
+    /// G3.9c: stub router on and off, its validation and a rollback.
+    #[test]
+    fn stub_router_set_validate_and_roll_back() {
+        let mut s = lab();
+        let rev = s.store().current_revision();
+        s.execute("routing.ospf.instance.set", &json!({"id": "v2", "stub_router": true, "stub_router_on_startup": "300"}))
+            .unwrap();
+        let l = s.execute("routing.ospf.instance.list", &json!({})).unwrap();
+        assert_eq!(l[0]["stub_router"], true);
+        assert_eq!(l[0]["stub_state"]["state"], "administrative", "{l}");
+        assert_eq!(l[0]["stub_router_on_startup"], 300);
+        // A form's empty field unsets the timer; the flag stays.
+        s.execute("routing.ospf.instance.set", &json!({"id": "v2", "stub_router_on_startup": ""})).unwrap();
+        let i = &s.store().running().routing.ospf.instances["v2"];
+        assert!(i.stub_router && i.stub_router_on_startup.is_none(), "{i:?}");
+        // Out of FRR's range.
+        for bad in [json!(4), json!(86_401), json!("soon")] {
+            let e = s
+                .execute("routing.ospf.instance.set", &json!({"id": "v2", "stub_router_on_startup": bad}))
+                .unwrap_err();
+            assert!(e.to_string().contains("5..=86400"), "{e}");
+        }
+        // ospf6d has no on-startup.
+        let e = s
+            .execute("routing.ospf.instance.add", &json!({"name": "v3", "version": 3, "stub_router_on_startup": 60}))
+            .unwrap_err();
+        assert!(e.to_string().contains("OSPFv3"), "{e}");
+        s.execute("routing.ospf.instance.add", &json!({"name": "v3", "version": 3, "stub_router": true})).unwrap();
+        // A rollback takes the instance out of stub router.
+        s.execute("config.rollback", &json!({"revision": rev})).unwrap();
+        let i = &s.store().running().routing.ospf.instances["v2"];
+        assert!(!i.stub_router && i.stub_router_on_startup.is_none(), "{i:?}");
     }
 }

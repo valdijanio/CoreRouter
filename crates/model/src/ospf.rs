@@ -215,11 +215,25 @@ pub struct OspfInstance {
     /// in one external (only while a subscriber of the pool is online).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub subscriber_pools: bool,
+    /// G3.9c: stub router (RFC 6987) for as long as it is set: every
+    /// transit link of the router-LSA at MaxLinkMetric 0xFFFF (§2), stub
+    /// links (loopback, passive) at their cost; OSPFv3 clears the R-bit
+    /// instead (§2.1). FRR `max-metric router-lsa administrative`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stub_router: bool,
+    /// G3.9c: stub router for this many seconds after the instance starts
+    /// (FRR `max-metric router-lsa on-startup`, counted per area from its
+    /// first router-LSA); OSPFv2 only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stub_router_on_startup: Option<u32>,
     #[serde(default)]
     pub disabled: bool,
     #[serde(default)]
     pub comment: String,
 }
+
+/// G3.9c: the range of `stub_router_on_startup`, in seconds (FRR's).
+pub const STUB_ROUTER_STARTUP: std::ops::RangeInclusive<u32> = 5..=86_400;
 
 fn main_vrf() -> String {
     MAIN_VRF.to_owned()
@@ -658,6 +672,8 @@ mod tests {
                 out_filter_chain: None,
                 originate_default: OriginateDefault::Never,
                 subscriber_pools: false,
+                stub_router: false,
+                stub_router_on_startup: None,
                 disabled: false,
                 comment: String::new(),
             },
