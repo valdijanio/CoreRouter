@@ -105,6 +105,9 @@ pub struct VirtualHal {
     /// Ports of the applied config unplugged (G1.3b): a late port outside
     /// its poll range, at the last apply or seen by `poll` since.
     absent: std::collections::BTreeSet<IfName>,
+    /// G1.3d: a port replugged between two polls: at this poll it is
+    /// there but a new link (Linux: a new index), without its settings.
+    replug: Option<(IfName, u64)>,
 }
 
 /// A lab port's own settings (G1.26b); `None`: the NIC has no such knob.
@@ -176,6 +179,13 @@ impl VirtualHal {
         self
     }
 
+    /// G1.3d: `name` is replugged just before poll `at` (see `replug`).
+    #[must_use]
+    pub fn with_replug(mut self, name: IfName, at: u64) -> Self {
+        self.replug = Some((name, at));
+        self
+    }
+
     /// The late port `name` is plugged in now (`None`: not a late port).
     fn late_present(&self, name: &IfName) -> Option<bool> {
         let l = self.late.iter().find(|l| &l.name == name)?;
@@ -237,6 +247,7 @@ impl VirtualHal {
             neigh: crate::lab_neigh::LabNeigh::default(),
             shaper: crate::queue::lab::LabShaper::default(),
             absent: std::collections::BTreeSet::new(),
+            replug: None,
         }
     }
 
@@ -1051,6 +1062,12 @@ impl Hal for VirtualHal {
             .cloned()
             .collect();
         self.absent.extend(gone);
+        if let Some((n, at)) = &self.replug
+            && *at == self.ticks
+            && self.applied.interfaces.contains_key(n)
+        {
+            self.absent.insert(n.clone());
+        }
         let mut out: Vec<LinkState> = self
             .applied
             .interfaces

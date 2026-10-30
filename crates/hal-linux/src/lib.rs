@@ -182,6 +182,8 @@ pub mod oslog;
 
 /// Neighbor tables over rtnetlink (G1.27d): dump, events, static entries.
 pub mod neigh;
+/// Link events (G1.3d): ports replugged between two polls.
+pub mod link_events;
 
 /// MPLS label switching over rtnetlink (G3.5): the label table, static
 /// entries in batches, the `net.mpls` knobs.
@@ -258,6 +260,12 @@ mod linux {
         /// since. The next apply puts their configuration back if they
         /// returned.
         absent: BTreeSet<IfName>,
+        /// The kernel index of each claimed physical port when it got its
+        /// configuration (G1.3d). A port gone and back between two polls
+        /// (a fast replug, a USB driver reset) has the same name and a new
+        /// index, never reused (`dev_index_reserve` in net/core/dev.c
+        /// allocates them cyclically up to 2^31), and none of its settings.
+        indices: BTreeMap<IfName, u32>,
     }
 
     impl LinuxHal {
@@ -657,11 +665,11 @@ mod linux {
     }
 
     impl LinuxHal {
-        /// Every link name of the kernel (one dump).
-        fn link_names(&self) -> Result<BTreeSet<String>, HalError> {
+        /// Every link name of the kernel with its index (one dump).
+        fn link_names(&self) -> Result<BTreeMap<String, u32>, HalError> {
             Ok(crate::netlink::links()?
                 .into_iter()
-                .map(|l| l.name)
+                .map(|l| (l.name, l.index))
                 .collect())
         }
 
@@ -758,7 +766,8 @@ mod linux {
                 !self.absent.is_empty() || corerouter_model::sections::interfaces_changed(from, to);
             loop {
                 let names = if look { Some(self.link_names()?) } else { None };
-                let present = |n: &IfName| names.as_ref().is_none_or(|s| s.contains(n.as_str()));
+                let present =
+                    |n: &IfName| names.as_ref().is_none_or(|s| s.contains_key(n.as_str()));
                 let gone = absent::missing(to, present);
                 let mut was = self.absent.clone();
                 was.extend(absent::missing(from, present));
@@ -780,11 +789,25 @@ mod linux {
                         // `poll` sees a claimed port go, and one that comes
                         // back is CoreRouter's again.
                         self.claims = claims_of(to);
+                        // G1.3d: the links that got the configuration. With
+                        // no dump nothing was added nor came back, and an
+                        // apply never recreates a physical port.
+                        if let Some(names) = &names {
+                            for (n, k) in &self.claims {
+                                if let (InterfaceKind::Ethernet, Some(i)) =
+                                    (k, names.get(n.as_str()))
+                                {
+                                    self.indices.insert(n.clone(), *i);
+                                }
+                            }
+                        }
+                        let claims = &self.claims;
+                        self.indices.retain(|n, _| claims.contains_key(n));
                         return Ok(());
                     }
                     Err(e) => {
                         let now = self.link_names().unwrap_or_default();
-                        let here = |n: &IfName| now.contains(n.as_str());
+                        let here = |n: &IfName| now.contains_key(n.as_str());
                         let went = absent::missing(to, here) != gone
                             || !absent::missing(from, here).is_subset(&was);
                         if retried || !went {
@@ -1049,14 +1072,33 @@ mod linux {
                 }
             };
             // G1.3b: a claimed port the kernel no longer has lost its
-            // configuration with it; the next apply puts it back.
-            let names: BTreeSet<&str> = view.iter().map(|(l, _)| l.name.as_str()).collect();
+            // configuration with it; the next apply puts it back. G1.3d:
+            // so did one with a new index (gone and back since the last
+            // look): the engine sees it absent and present, and reapplies.
+            let names: BTreeMap<&str, u32> = view
+                .iter()
+                .map(|(l, _)| (l.name.as_str(), l.index))
+                .collect();
             for (n, k) in &self.claims {
-                if *k == InterfaceKind::Ethernet
-                    && !names.contains(n.as_str())
-                    && self.absent.insert(n.clone())
-                {
-                    log::warn!("'{n}' went away: its configuration waits for it (invalid)");
+                if *k != InterfaceKind::Ethernet {
+                    continue;
+                }
+                match names.get(n.as_str()) {
+                    None => {
+                        if self.absent.insert(n.clone()) {
+                            log::warn!("'{n}' went away: its configuration waits for it (invalid)");
+                        }
+                    }
+                    Some(&i) => match self.indices.insert(n.clone(), i) {
+                        Some(was) if was != i => {
+                            if self.absent.insert(n.clone()) {
+                                log::warn!(
+                                    "'{n}' was replugged (link #{was} is now #{i}): its configuration is applied again"
+                                );
+                            }
+                        }
+                        _ => {}
+                    },
                 }
             }
             view.into_iter()
@@ -1158,7 +1200,7 @@ mod linux {
         fn reconcile(&mut self, cfg: &Config) -> Result<(), HalError> {
             // G1.3b: a port that is gone now is left to come back.
             let names = self.link_names()?;
-            let gone = absent::missing(cfg, |n| names.contains(n.as_str()));
+            let gone = absent::missing(cfg, |n| names.contains_key(n.as_str()));
             let cfg = &*absent::mask(cfg, &gone);
             let have = self.snapshot(cfg)?;
             let ops = crate::plan::repair(cfg, &have);
