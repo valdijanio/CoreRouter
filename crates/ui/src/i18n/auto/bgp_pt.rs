@@ -28,6 +28,8 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Instances"##, r##"Instâncias"##),
     (r##"Key"##, r##"Chave"##),
     (r##"Kind"##, r##"Tipo"##),
+    (r##"LLGR"##, r##"LLGR"##),
+    (r##"LLGR Stale Time"##, r##"Tempo do LLGR"##),
     (r##"Last Error"##, r##"Último erro"##),
     (r##"Limits"##, r##"Limites"##),
     (r##"Local Role"##, r##"Papel local"##),
@@ -123,6 +125,14 @@ Como helper: quanto tempo guardamos as rotas de um vizinho que reiniciou, marcad
 Um vizinho que nunca manda End-of-RIB (RouterOS 7.25) deixa as rotas velhas pelo tempo inteiro. FRR `bgp graceful-restart stalepath-time`, Junos `stale-routes-time` (300)."##),
     (r##"bgp.instance.hard_admin_reset"##, r##"## O que é
 Se um reset administrativo (Cease 4: `routing.bgp.session.clear`) vai como Hard Reset (RFC 8538 §3) e tira as rotas do vizinho. Ligado por padrão. Desligado: o clear de um vizinho com bit N é gracioso, as rotas ficam stale até ele mandar de novo (bom para aplicar uma política sem buraco no tráfego). Shutdown sempre as tira."##),
+    (r##"bgp.instance.llgr_stale_time"##, r##"## O que é
+Long-Lived Graceful Restart (RFC 9494): quando acaba o Restart Time de um graceful restart, o vizinho guarda as nossas rotas por mais este tempo, marcadas com a comunidade `llgr-stale` e com a menor preferência, então qualquer rota viva ganha delas. 1..16777215 s (24 bits); vazio: desligado (§5: nunca ligado por padrão). O FRR tem um valor só para todas as famílias de endereço (a RFC pede por AFI/SAFI). Também é o máximo que guardamos das rotas do vizinho: o FRR fica com o menor entre o tempo dele e o nosso, então configure nos dois lados.
+
+## Quando usar
+Para rotas que têm alternativa, ou que é melhor ter velhas que não ter (VPN, rota padrão de duas operadoras). Rotas marcadas com `no-llgr` (Routing › Filters, `append bgp-communities no-llgr`) nunca ficam.
+
+## Cuidado
+Salto a salto, uma rota stale mais específica ainda ganha de uma rota viva menos específica (§5): o tráfego pode ir para um próximo salto morto o tempo todo. A prévia mostra o pior caso (hold + Restart Time + LLGR). O RouterOS 7.25 não suporta LLGR: o FRR não manda rotas stale para ele (§4.3)."##),
     (r##"bgp.instance.name"##, r##"## O que é
 O nome da instância; `default` roda na tabela principal, outro nome é uma view separada do FRR."##),
     (r##"bgp.instance.router_id"##, r##"## O que é
