@@ -44,7 +44,7 @@ mod shaper;
 pub use pppoe::{PppoeCounters, session_of as pppoe_session_of};
 
 /// The XDP object, built by `cargo xtask ebpf` (crates/dataplane-ebpf).
-static OBJECT: &[u8] =
+pub(crate) static OBJECT: &[u8] =
     aya::include_bytes_aligned!("../../dataplane-ebpf/prebuilt/corerouter-xdp.o");
 
 /// Why loading failed, in words for the operator (`EPERM` is the usual one).
@@ -623,6 +623,8 @@ fn load(fast_nat: bool, pppoe: bool, queues: bool, pcq: bool) -> Result<Loaded, 
     let flows = if fast_nat { m::NAT_FLOWS_MAX } else { 1 };
     let mut loader = aya::EbpfLoader::new();
     loader.map_max_entries(m::NAT_FLOWS, flows);
+    // The LSP tap's ring buffer is the `lsp-ping` service's (lsp/ebpf.rs).
+    loader.map_max_entries(m::LSP_TAP, m::LSP_TAP_IDLE_BYTES);
     if !pppoe {
         for name in m::PPPOE_SIZED.into_iter().chain(m::SUB_SIZED) {
             loader.map_max_entries(name, 1);

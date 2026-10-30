@@ -350,6 +350,7 @@ fn responder(
                     Err(why) => done.last_err = Some(why.to_owned()),
                 }
             }
+            eprintln!("tap: {}", r.tap_kind());
             done
         })
         .unwrap();

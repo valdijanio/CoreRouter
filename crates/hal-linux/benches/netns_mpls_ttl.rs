@@ -17,7 +17,11 @@
 //! `mpls_rcv`); the responder's taps now (unbound, ahead of `mpls_rcv`);
 //! and those with `icmp-too-big` on (G3.9da: the MPLS filter also checks
 //! the frame length against the smallest way out, 1500 here, so these
-//! frames still all pass by).
+//! frames still all pass by); and the tc tap that replaces them (G3.9db,
+//! the `lsp_tap` classifier on `tb`'s ingress), without and with
+//! `icmp-too-big`. The tc cases need real root (`unshare --net`, not a user
+//! namespace: the kernel loads BPF only for the initial one); elsewhere
+//! they are skipped.
 //! Needs `mpls_router` (the lab VM: `cargo xtask vm-lab run`); without it,
 //! skips.
 
@@ -52,7 +56,7 @@ mod linux {
 
     use corerouter_hal::Hal;
     use corerouter_hal::lsp::LspResponderIo;
-    use corerouter_hal_linux::lsp::HostResponder;
+    use corerouter_hal_linux::lsp::{HostResponder, TapChoice};
     use corerouter_hal_linux::{LinuxHal, Policy};
     use criterion::{Criterion, Throughput};
     use nix::ifaddrs::getifaddrs;
@@ -237,7 +241,7 @@ mod linux {
         }
         // The responder's three taps, as the daemon keeps them (nobody
         // reads: these frames all pass the filter by).
-        let mut r = HostResponder::open().unwrap();
+        let mut r = HostResponder::open().unwrap().with_tap(TapChoice::Packet);
         assert!(r.set_interfaces(&["tb".parse().unwrap()]).is_empty());
         g.bench_function("mpls64/responder taps (unbound)", |b| {
             b.iter_custom(|iters| (0..iters).map(|_| lab.burst(BURST).0).sum())
@@ -246,7 +250,25 @@ mod linux {
         g.bench_function("mpls64/responder taps with icmp-too-big (G3.9da)", |b| {
             b.iter_custom(|iters| (0..iters).map(|_| lab.burst(BURST).0).sum())
         });
-        g.finish();
         drop(r);
+        let mut r = HostResponder::open().unwrap().with_tap(TapChoice::Ebpf);
+        if r.set_interfaces(&["tb".parse().unwrap()]).is_empty() {
+            eprintln!("tap: {}", r.tap_kind());
+            g.bench_function("mpls64/tc tap (G3.9db)", |b| {
+                b.iter_custom(|iters| (0..iters).map(|_| lab.burst(BURST).0).sum())
+            });
+            r.hear_too_big(true);
+            g.bench_function("mpls64/tc tap with icmp-too-big (G3.9db)", |b| {
+                b.iter_custom(|iters| (0..iters).map(|_| lab.burst(BURST).0).sum())
+            });
+            eprintln!("tap: {}", r.tap_kind());
+        } else {
+            eprintln!("skipped the tc cases: {}", r.tap_kind());
+        }
+        drop(r);
+        g.bench_function("mpls64/no taps (again, the drift of the round)", |b| {
+            b.iter_custom(|iters| (0..iters).map(|_| lab.burst(BURST).0).sum())
+        });
+        g.finish();
     }
 }
