@@ -97,7 +97,7 @@ mod tests {
         let mut s = Session::virtual_lab();
         let v = s.execute("system.health.check", &json!({})).unwrap();
         let checks = v["checks"].as_array().unwrap();
-        assert_eq!(checks.len(), 19);
+        assert_eq!(checks.len(), 20);
         let by = |k: &str| checks.iter().find(|c| c["key"] == k).unwrap().clone();
         assert_eq!(by("root.verity")["severity"], "unknown", "no A/B image in the lab");
         assert_eq!(by("routes.ecmp")["severity"], "ok", "the lab has no ECMP (G1.27j)");

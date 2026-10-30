@@ -67,6 +67,11 @@ fn commands() -> Vec<(&'static str, Value)> {
         ("ip.service.metrics.set", json!({"port": 9101})),
         ("system.analytics.set", json!({"database": "cr"})),
         ("tool.bandwidth-server.set", json!({"port": 2001})),
+        // G1.29d
+        (
+            "interface.usb.watchdog.set",
+            json!({"name": "ether1", "stall_secs": 45}),
+        ),
         ("system.graph.set", json!({"store_every": 600})),
         ("ip.service.www.set", json!({"port": 8081})),
         // interfaces and lists

@@ -41,6 +41,9 @@ pub const LAB_USB: [(&str, u32); 2] = [("ether5", 5000), ("ether6", 480)];
 #[derive(Clone)]
 pub struct VirtualHal {
     ports: Vec<IfName>,
+    /// G1.29d: a USB adapter that stalls: its transmit timeouts grow by one
+    /// a poll while the poll count is in the range.
+    usb_stall: Option<(IfName, std::ops::Range<u64>)>,
     applied: Config,
     ticks: u64,
     /// Busy and total CPU ticks handed out by `resources` so far.
@@ -144,6 +147,13 @@ impl std::fmt::Debug for VirtualHal {
 }
 
 impl VirtualHal {
+    /// G1.29d: lab USB adapter `name` stalls for the polls in `polls`.
+    #[must_use]
+    pub fn with_usb_stall(mut self, name: IfName, polls: std::ops::Range<u64>) -> Self {
+        self.usb_stall = Some((name, polls));
+        self
+    }
+
     /// `ports` virtual Ethernet ports named `ether1..=etherN` (RouterOS style).
     pub fn new(ports: u8) -> Self {
         let ports: Vec<IfName> = (1..=ports)
@@ -165,6 +175,7 @@ impl VirtualHal {
         };
         Self {
             ports,
+            usb_stall: None,
             applied: Config::default(),
             ticks: 0,
             cpu: (0, 0),
@@ -1126,6 +1137,20 @@ impl Hal for VirtualHal {
         let mut m = sff::decode(&a0, Some(&a2));
         m.notes.push("simulated by the virtual lab".into());
         Ok(m)
+    }
+
+    /// The lab's USB adapters count no transmit timeout, except the one
+    /// set to stall ([`VirtualHal::with_usb_stall`]): one more per poll in
+    /// its range.
+    fn usb_tx_timeouts(&mut self, name: &IfName) -> Option<u64> {
+        LAB_USB
+            .iter()
+            .any(|(p, _)| *p == name.as_str())
+            .then_some(())?;
+        Some(match &self.usb_stall {
+            Some((n, r)) if n == name => self.ticks.min(r.end).saturating_sub(r.start),
+            _ => 0,
+        })
     }
 
     /// The lab's USB adapters ([`LAB_USB`]) recover in simulated time:

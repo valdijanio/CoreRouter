@@ -130,6 +130,7 @@ pub fn detail(s: &mut Session, name: &IfName, hw: &NicHardware) -> Value {
         "cap_mbps": a.cap_mbps,
         "alert": a.alert,
         "recoveries": recoveries(s, name),
+        "watchdog": s.usb_watchdog_row(name),
     })
 }
 
@@ -206,6 +207,8 @@ impl Session {
     /// of finished recoveries, then the configuration of a recreated port
     /// put back once it is there again.
     pub(crate) fn usb_tick(&mut self, live: &[LinkState]) {
+        // G1.29d: the watchdog first; what it starts finishes on a later tick.
+        self.usb_watchdog_tick(live);
         let Some(r) = self.ext::<UsbRecovery>() else {
             return;
         };
