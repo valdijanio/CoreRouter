@@ -281,3 +281,9 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-29 — G0.31i feito (set de distância sem ler as rotas do kernel)
 - 2026-10-29 — G3.6n criada (BFD cai junto com o `corerouter-daemon` e derruba o BGP)
 - 2026-10-29 — G0.31j feito; G0.31k criada (memória do daemon por regra de firewall)
+- 2026-10-29 — G1.29a criado e feito (drivers de placa Ethernet USB na imagem)
+- 2026-10-29 — G1.29b criado e feito (placa USB: dados da porta, alerta de porta lenta, ícone USB)
+- 2026-10-29 — G1.29c criado e feito (recuperação manual de placa USB em três níveis)
+- 2026-10-29 — G1.5a feito (rotas blackhole, unreachable e prohibit)
+- 2026-10-29 — G1.6n feito (nome de porta para placa que aparece depois do boot)
+- 2026-10-29 — G3.9c feito (OSPF stub router, RFC 6987); G3.9ca, G3.9cb e G3.9cc abertos

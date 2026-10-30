@@ -2912,3 +2912,9 @@ Custo por regra para o limite (sessão no laboratório virtual, só filter, rele
 
 Kernel: ~0,4–0,5 KB de slab por regra (SUnreclaim, 10 000 regras no namespace) e ~490 bytes de
 lote netlink (50 000 regras = 24 MiB num lote, que só um root com `SO_SNDBUFFORCE` envia).
+
+- 2026-10-30, **medido**, build de bench (release), máquina de desenvolvimento, `cargo bench -p
+  corerouter-model --bench config_delta`. Antes/depois da conferência no `persist::revision_delta`:
+  `revision_delta_one_filter_rule_of_10000` 29,2 µs → 51,6 µs; `revision_delta_one_route_of_60000`
+  (novo) 65,2 µs → 130,7 µs. `one_filter_rule_of_10000` (só o `diff`, código igual) 28,4 → 31,2 µs:
+  ruído da máquina compartilhada.
