@@ -996,8 +996,10 @@ case_ospfv3() {
     result ospfv3 INFO "CHR's v3 LSAs: $(ros 'routing/ospf/lsa' | jq -c '[.[] | select(.instance == "v3") | {type, id, originator}]' | cut -c1-500)"
     result ospfv3 INFO "CHR's v6 routes: $(ros 'ipv6/route' | jq -c '[.[] | {dst: ."dst-address", gw: .gateway, active}]' | cut -c1-400)"
   fi
-  ip netns exec crcore ip -6 route get 2001:db8:39::1 2>/dev/null | grep -q ether1 \
-    && result ospfv3 OK "CR: 2001:db8:39::1 via ether1" || result ospfv3 FAIL "CR has no v6 route to CHR's loopback"
+  # The CR installs its route on its own SPF run, not when the CHR's appears.
+  cr_v6has() { ip netns exec crcore ip -6 route get 2001:db8:39::1 2>/dev/null | grep -q ether1; }
+  ms=$(wait_for 30 cr_v6has) && result ospfv3 OK "CR: 2001:db8:39::1 via ether1, ${ms} ms after the CHR's" \
+    || result ospfv3 FAIL "CR has no v6 route to CHR's loopback after 30 s"
 }
 
 # docs/producao-core.md, as written: a CoreRouter with an empty config
