@@ -9053,3 +9053,338 @@ continuação indentadas).
   foi recusado porque o `/config` da VM (56 MB) não tem espaço para o snapshot da configuração (G1.6u,
   abaixo). O reset de porta com uma imagem que tem a G1.6n voltou como `ether4` na medição da G1.29c
   (3,54 s, **medido** em 2026-10-29).
+
+- 2026-10-30 — G1.3d: Drift, parte 4: porta que volta mais rápido que o poll. Uma porta apagada e recriada com o mesmo
+  nome entre dois polls de 1 s (replug rápido, reset de driver de placa USB) voltava sem endereço,
+  MTU, VLANs nem rotas, e nada acusava: o poll via o mesmo nome nas duas vezes.
+
+  - `hal-linux`: o `LinuxHal` guarda o `ifindex` de cada porta física reivindicada quando ela recebe
+    a config (no `apply` que fez o dump) e o confere em todo `poll`. Índice novo para o mesmo nome =
+    link novo, sem nada: a porta vai para o conjunto de ausentes da G1.3b e o `absent_tick` do
+    engine reaplica a config em vigor. O kernel nunca repete um índice (`dev_index_reserve` em
+    `net/core/dev.c` aloca com `xa_alloc_cyclic` até 2³¹), então não há falso positivo; o `apply`
+    não recria porta física (VLAN, bridge e bond ficam de fora da conferência).
+  - `hal-linux::link_events` (novo): socket em `RTNLGRP_LINK`, leitura não bloqueante e parser
+    próprio dos nomes de link (`IFLA_IFNAME`) com proptest; `ENOBUFS` ou mais de 4096 nomes viram
+    "olhe tudo".
+  - daemon, serviço `link-events` (novo, só com `--backend linux`): lê os eventos sem lock, junta a
+    rajada por 50 ms e chama `Session::link_events` uma vez; o engine só faz o poll (links, tempos
+    de link, `absent_tick`) se um dos nomes é porta física da config, então VLANs e bridges que um
+    commit cria não custam nada. Eventos perdidos: poll incondicional e erro na linha do serviço em
+    `system.service.print`. O poll de 1 s continua como rede de segurança.
+  - engine: a porta que volta sem ter sido vista ausente ganha a linha própria no log,
+    "ether4: port was replugged (gone and back within a second); its configuration was applied
+    again" (a que foi vista ausente segue com "port is back").
+
+  Como testar: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
+  corerouter-hal-linux --test netns_replug` (a porta recriada antes do poll volta com endereço e
+  MTU; o socket de eventos dá o nome dela) e `… cargo test -p corerouter-daemon --test netns_replug`
+  (daemon `--backend linux`, `ether2` apagada e recriada três vezes: endereço de volta em ≤36 ms e
+  a linha no log); `cargo test -p corerouter-engine --lib port_absent` (laboratório virtual: replug
+  entre polls, `link_events` só olha para porta da config); `cargo test -p corerouter-hal-linux
+  --lib link_events` (parser e proptest).
+
+  Desempenho e paralelismo (**medido**, 2026-10-30, namespace com dummies, 32 núcleos): o poll
+  completo custa 312 µs com 11 links, 2,18 ms com 101 e 27,3 ms com 1001 (build release); a
+  conferência do `ifindex` é uma busca num mapa por porta reivindicada, dentro de um dump que o poll
+  já fazia. Um evento de link é uma mensagem de 0,7–1,5 KB, já na fila quando o `ip` retorna; drenar
+  custa 3,4 µs; parado, 0 eventos por segundo. Uma thread só basta: o kernel serializa os eventos
+  num socket, e o trabalho é o poll do engine, sob o lock do `Session` como o do relógio; uma
+  rajada (commit com mil VLANs) toma o lock uma vez por janela de 50 ms.
+
+- 2026-10-30 — G1.3e: Gerência sobe mesmo com o `apply` do boot falhando. Achado reproduzido em teste
+  (`boot_partial.rs`, antes da mudança): uma regra de firewall recusada pelo kernel deixava
+  **nenhum** endereço aplicado (o `hal-linux` aplica o nftables antes do plano netlink e desfaz
+  tudo na recusa) e o retry reaplicava a config inteira do zero a cada segundo (11 applies em
+  10 s, **medido**); todo commit falhava junto, e o erro só aparecia em `state.inspect`.
+
+  - engine (`boot_apply.rs`, novo): no boot, a config inteira num `apply` (caso normal, nada a
+    mais). Recusada: o núcleo (interfaces, endereços e o que nenhuma seção leva), depois cada
+    seção por cima do que já subiu, na ordem do `hal-linux`: `ethernet` (velocidade/duplex),
+    `routes`, `firewall` (filter/nat/mangle/raw, listas, listas de interface, avisos ao
+    assinante), `cgnat`, `fastpath`, `tuning`, `xdp`, `arp`, `mpls`. A seção recusada fica de
+    fora com o erro do kernel; `core` quer dizer que nem o núcleo entrou (como antes: tudo
+    fora). Seção inteira, não item: a regra ou rota culpada não é isolada (G1.3g).
+  - Retry com espera crescente (1, 2, 4… 60 s) só do que ficou de fora, um `apply` por seção; o
+    log repete o que está de fora quando muda e a cada 10 min. A seção volta sozinha quando o
+    kernel a aceita.
+  - Commit: parte do que o plano de dados tem de fato (não mais do zero). A seção recusada que o
+    commit não toca fica de fora dos dois lados (como a porta ausente do G1.3b); a que ele toca
+    entra, tudo ou nada como qualquer commit. Safe Mode e transações não mudam: aplicação
+    parcial só no boot e no retry.
+  - Visibilidade: saúde `boot.apply` (erro, com seção e motivo); `state.inspect` →
+    `storage.boot_apply_failed` (`[{section, error}]`, além do `boot_apply_error` de sempre);
+    `auth.whoami` → `boot_errors`, que a CLI e o MCP mostram como aviso no login e na descrição
+    do backend; GUI: selo vermelho "boot: <seções>" na barra de cima, com o motivo no hover e ⓘ
+    (pt/en).
+  - Caminhos laterais de `apply` (cliente DHCP, PPPoE, porta que volta) seguem calculando do
+    `running`, sem a máscara: com a seção `mpls` de fora, uma mudança de interface reaplica os
+    sysctls do MPLS e pode falhar, como já falhava antes (G1.3g).
+  - Risco aceito (escolha do usuário): firewall recusado sai inteiro e o roteador fica sem
+    filtro até a correção; por isso o erro vermelho em todo lugar. Por regra com trava de
+    gerência: G1.3g; firewall mínimo fechado: G1.3h.
+
+  Como testar: `cargo test -p corerouter-engine --test it boot_partial` (sucesso em um `apply`;
+  firewall, rota e MPLS recusados com a gerência no ar; várias seções; backoff; volta sozinha;
+  commit em outra parte e commit na seção recusada); `cargo test -p corerouter-ui --lib
+  boot_warning`; kernel real: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net --
+  cargo test -p corerouter-daemon --test netns_boot_partial` (daemon reiniciado com outra rota
+  no mesmo prefixo e métrica, que o CoreRouter não substitui: `10.13.0.1/24` sobe, a rota fica
+  de fora com `boot.apply`=`routes`, firewall aplicado, commit em outra parte funciona; tirada a
+  rota estranha, a nossa entra no retry e o erro some; 3,5 s, **medido**). Print em
+  `docs/changes/G1.3e-screenshots/top-bar-boot.png`.
+
+  Desempenho e paralelismo: boot sem erro = um `apply`, como antes. Com seção recusada, o boot
+  faz 1 + 1 + (seções presentes) applies, uma vez; o retry passa de um `apply` da config inteira
+  por segundo (O(n)/s com milhares de regras ou rotas) para um `apply` só da seção de fora a
+  cada 1…60 s. Um commit com boot pendente copia a config uma vez (só nesse estado). Nada a
+  dividir em threads: os applies são sequenciais por dependência (rotas precisam dos endereços,
+  firewall e MPLS das interfaces) e o kernel serializa o netlink de qualquer forma.
+
+- 2026-10-30 — G1.29g: Reset USB de porta fora da configuração (G1.29g). A aba Hardware mostrava os botões Down/Up,
+  Restart Driver e Reset USB Port de um adaptador USB que não está na configuração (o `eth0` da VM
+  `corerouter-teste`, que voltou de um reset com o nome do kernel), e o `interface.usb.reset`
+  recusava com "no interface 'eth0'". Escolha do usuário: o roteador não mexe no que não gerencia
+  (como o `refuse_unmanaged`). Numa porta fora da configuração os três botões e a chave do vigia
+  ficam desligados, com o motivo no hover; uma linha âmbar diz por quê ("Not in the configuration
+  (appeared after boot)"), com ⓘ em português, e o botão **Adopt** manda
+  `interface.ethernet.adopt` (G1.6t). Num daemon sem esse comando, o Adopt fica desligado com o
+  motivo do `Avail` ("its daemon is an older build").
+
+  Como testar: `cargo test -p corerouter-ui --lib usb_nic`
+  (`a_port_outside_the_configuration_offers_adopt_not_reset`). Na tela: Interfaces › `eth0` (fora
+  da configuração) › Hardware; print em `docs/changes/G1.29g-screenshots/` (GUI desta branch
+  ligada à VM de teste, só leitura).
+
+- 2026-10-30 — G1.6u: `/config` cheio na atualização (G1.6u). Na VM `corerouter-teste` (56 MB) o snapshot da
+  configuração copiava 13,8 MB, dos quais 10,7 MB eram uma só revisão do histórico (`rev-81.json`,
+  a rodada de validação com ~10 mil rotas) e 3,7 MB os gráficos; com `config-a` e `config-b` o
+  disco encheu, a cópia parcial `config-a.new` ficou e nenhum comando a apagava.
+
+  - **Hard links:** o que o `storage-fs` só troca por rename (`running.json*`, `rev-*.json`,
+    `state-*.json`) entra no snapshot por link; o journal e as chaves são copiados. O snapshot da
+    VM cai de 13,8 MB para ~1 kB (**medido** no teste `config_full` com a mesma forma).
+  - **`graphs/` fora** do snapshot e do restore: histórico de tráfego não é configuração, e voltar
+    apagaria as horas do teste.
+  - **Espaço antes:** `install`/`upload`/`download` e o Tuning › Boot conferem o `/config`
+    (`statvfs`) antes de tocar no slot e recusam com "needs X and Y is free (biggest: …)"; uma
+    cópia que falha mesmo assim é apagada.
+  - **De longe:** `system.package.snapshot.remove {name?, all?, dry_run?}` (sem nome: só as cópias
+    parciais; `all`: os snapshots também; nunca o backup ou a troca de um teste em andamento, que a
+    sessão confere no plano e o serviço de novo antes de apagar). `system.package.print` traz
+    `config_space` (livre, necessário, o que ocupa), `own_bytes` por snapshot e `partials`. A
+    saúde do disco, quando o pior é o `/config`, lista os snapshots com o tamanho e o comando.
+
+  Como testar: `cargo test -p corerouter-sysupdate --test config_full` (três casos num tmpfs de
+  3 MiB num mount namespace sem root: a história grande cabe linkada; sem espaço é recusado antes
+  de gravar o slot; um `/config` a 0 byte livre com `config-a.new` se recupera por
+  `remove_snapshots` e a atualização passa). Na VM: `system.package.snapshot.remove
+  {all: true, dry_run: true}`, depois `{name: "config-a.new"}`.
+
+- 2026-10-30 — G1.3g: Boot parcial por regra de firewall, com trava de gerência. Com a G1.3e, uma regra recusada pelo
+  kernel deixava o firewall inteiro de fora e o roteador sem filtro. Agora:
+
+  - `Hal::check_firewall` (novo, `crates/hal`): diz se o firewall de uma config carregaria, sem
+    carregar nada. `hal-linux`: o lote de sempre, enviado sem `NFNL_MSG_BATCH_END`; o kernel valida
+    cada mensagem, responde as recusadas e joga o lote fora (`NFNL_ABORT_VALIDATE`), como o
+    `nft --check`. O número de sequência de cada erro aponta a regra (`cr:*N`). Lido no fonte do
+    kernel 6.18.59 (`net/netfilter/nfnetlink.c:538-559`, `nf_tables_api.c`):
+    - o lote não para no primeiro erro;
+    - um erro que só a validação da tabela inteira acha (um `dst-nat` em `srcnat`, um jump em
+      laço) faz o kernel repetir o lote validando regra a regra. Isso só funciona numa tabela que
+      já existia antes do lote: o abort da checagem não liga a validação da netns como o commit
+      liga, e numa tabela criada no lote o erro se perde (**medido**: a primeira versão não acusou
+      nada). Por isso a checagem enche uma tabela de rascunho vazia (`corerouter-check`, criada
+      antes e apagada depois; nunca tem nada aplicado);
+    - com a validação ligada, toda regra depois da recusada também volta recusada (**medido**: 1
+      regra ruim, 7 recusas). Por isso só a primeira recusa vale: o engine a tira e checa de novo
+      (k regras ruins = k + 1 checagens).
+  - Engine (`boot_apply.rs`): a seção `firewall` recusada vira checagens até o resto carregar:
+    - sem nome de regra (outro backend, ou recusa de um conjunto ou chain), bisseção por prefixo,
+      também só com checagens (~log₂ n);
+    - teto de 16 regras e 64 checagens; passou disso, firewall inteiro de fora, como na G1.3e;
+    - nenhuma metade chega ao kernel: só o resultado final é aplicado, uma vez.
+  - Trava de gerência: antes de aplicar o firewall reduzido, as sondas do lockout do commit (as
+    mesmas do `force`, agora numa função só, `lockout::firewall_cut`) andam por conexões
+    sintéticas: cada endereço do roteador × cada porta de gerência, vindas de um host de cada rede,
+    de fora e das origens que a regra recusada cita (`src-address`, entradas da `src-address-list`).
+    As portas de gerência são `--control`, `--listen`, `--ws` e `--ws-listen`, que o daemon passa
+    ao boot (`Session::with_storage_env`, `BootEnv`), mais `www`/`www-ssl` da config. Se o
+    firewall salvo deixa entrar e o reduzido corta, **o firewall inteiro fica de fora** (escolha do
+    usuário, sem "aceitar gerência" no topo), com o motivo: "rule *N (…) was refused by the kernel
+    and, without it, the firewall would cut management: …; the whole firewall stays out until it is
+    fixed".
+  - A regra recusada aparece:
+    - `invalid` com flag I e `reason` ("refused at boot, left out until fixed: …") no
+      `ip.firewall.*.list`;
+    - em `storage.boot_apply_failed` e no `auth.whoami` (`{section: firewall, rule: "*N", error}`);
+    - na saúde (`boot.apply`, valor `firewall *N`);
+    - no aviso da CLI/MCP e no selo vermelho da GUI ("boot: firewall *N", ⓘ pt/en atualizado).
+  - Commit com regra de fora: um commit que mexe em outra regra entra e deixa a recusada de fora
+    (desligada no que vai ao kernel); o que muda ou tira a regra a tenta de novo, tudo ou nada.
+  - Retry: só com regras de fora, a espera vai até 10 min (não 60 s). Achá-las de novo custa ao
+    kernel uma validação por regra, com o lock do nftables preso (abaixo), e regra recusada no boot
+    costuma ficar recusada.
+  - Caminhos laterais de `apply`: cliente DHCP e DHCPv6, servidor DHCPv6, cliente PPPoE, gateway
+    check, resiliência DHCP e porta que volta. Agora passam por `Session::apply_side`, com a mesma
+    máscara do commit. Achados reproduzidos em teste antes da correção:
+    - com a seção `xdp` de fora, um lease DHCP era desfeito ("lease not applied: … xdp: attach
+      refused"), porque o `hal-linux` sincroniza o XDP em todo `apply`;
+    - uma porta replugada (G1.3d) não recebia a config de volta enquanto qualquer seção estivesse
+      de fora.
+    - A suspeita do MPLS anotada na G1.3e não se confirmou: lease não muda interfaces, e o MPLS só
+      sincroniza quando elas mudam.
+
+  Como testar:
+
+  - `cargo test -p corerouter-engine --test it boot_rules`: só a regra recusada sai, flag I, saúde,
+    `whoami`, nada parcial no kernel; o `accept` da gerência recusado com um `drop` no fim deixa o
+    firewall inteiro de fora e a gerência entra; `accept` que a gerência não usa sai sozinho; duas
+    recusadas, uma checagem por vez; bisseção sem nome de regra (≤ 9 checagens para 31 regras);
+    commit com regra de fora; retry até 10 min.
+  - `cargo test -p corerouter-engine --test it boot_side_paths`: lease com o XDP de fora; porta
+    replugada com o XDP de fora.
+  - Kernel real: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
+    corerouter-hal-linux --test netns_fw_check`. A checagem nomeia a regra recusada, uma por vez, e
+    não muda o ruleset em uso; o commit seguinte ainda parte do que foi carregado. O
+    `slow_checking_many_rules_with_one_bad` (camada lenta) mede 10 000 regras.
+
+  Desempenho e paralelismo: boot sem erro = um `apply`, como antes, sem checagem. Com regra
+  recusada, o boot faz 1 `apply` recusado, k + 1 checagens e 1 `apply` do firewall reduzido; a trava
+  de gerência anda no máximo 4096 conexões × 6 sondas, em memória. O custo alto é do kernel: com um
+  erro que só a validação acha, o replay valida a tabela a cada regra (O(n²)): 10 000 regras,
+  1,7 s contra 69 ms de uma checagem boa, em release (**medido**, abaixo), o mesmo que o próprio
+  `apply` recusado já custa; por isso o retry de regra espera até 10 min. Nada a dividir em threads: o nfnetlink serializa tudo no `commit_mutex` da netns, e cada
+  checagem depende da anterior.
+
+- 2026-10-30 — G1.3h: G1.3h descartada: o usuário preferiu não subir um firewall de emergência ("deixar mais simples").
+  Com a G1.3g, uma regra recusada no boot sai sozinha e o resto do firewall entra. O firewall
+  inteiro só fica de fora quando a checagem não isola a regra, ou quando o firewall sem ela cortaria
+  a gerência; então o aviso vermelho diz o motivo.
+
+- 2026-10-30 — G1.6v: `/config` ocupa o resto do disco (G1.6v). O `disk.img` continua com 64 MiB de `/config`;
+  `gpt::grow_last` reescreve só a entrada `config` da GPT (primária, depois a backup no fim do
+  disco; números, GUIDs, tipos e atributos ficam) quando isso dá ao `/config` pelo menos 256 MiB
+  (`gpt::CONFIG_MIN`), e `ext4::grow` cresce o filesystem desmontado (`e2fsck -f -p`,
+  `resize2fs`).
+
+  - O **instalador** já grava a partição até o fim do disco, e o primeiro boot cresce o ext4.
+    Reinstalar mantendo a configuração aceita a partição crescida.
+  - Num roteador **já instalado**, o init troca a tabela depois de montar o `/config`, fora de um
+    boot de teste. No boot seguinte, antes de montar, cresce o filesystem. Os dois passos vão para
+    o log do boot.
+  - Disco que deixa menos de 256 MiB (a VM de teste, de 705 MiB): o layout fica, e o log do boot
+    diz quanto caberia.
+  - Na imagem: e2fsprogs só com `e2fsck` e `resize2fs`, mais a libblkid/libuuid do util-linux.
+    **Estimado**: +1,2 MB no rootfs sem compressão, ~0,5 MB no squashfs zstd.
+
+  Como testar:
+  - `cargo test -p corerouter-sysupdate --lib -- gpt ext4 config_takes_the_rest`:
+    - a GPT de 705 MiB da VM e o disco aumentado para 800 MiB e para 2 GiB;
+    - um ext4 de 64 MiB do `mkfs.ext4` do host, crescido pelo `resize2fs` do host até 300 MiB;
+    - a instalação num disco de 300 MiB.
+  - Na VM: com ela desligada, `qemu-img resize vm/corerouter-teste.qcow2 2G`, depois dois boots;
+    o log do boot mostra "partition grown" e depois "growing the filesystem".
+
+- 2026-10-30 — G1.3g: Boot parcial por rota (segunda parte da G1.3g, escolha do usuário: opção "uma a uma"). O
+  rtnetlink não tem checagem a seco, e a seção `routes` recusada pela G1.3e ficava de fora
+  inteira. Agora:
+
+  - `Hal::apply_routes_each` (novo, `crates/hal`; o padrão é `Unsupported`, que leva ao
+    comportamento da G1.3e). No `hal-linux`, as rotas que `to` tem e `from` não têm vão numa sessão
+    netlink só, uma operação por vez, **sem rollback** (`netlink::apply_each`). Cada rota que o
+    kernel aceita entra uma vez e fica; a recusada não tira as outras.
+    - Só quando nada além de rotas adicionadas separa os dois lados (o plano só tem `AddRoute`/
+      `AddDiscard`); senão, `Unsupported` e o `apply` de sempre, tudo ou nada.
+    - Como no `apply`, nunca uma rota por um link de outro programa.
+    - A rota do kernel recusada vira as rotas da config para aquele destino naquela tabela (um
+      grupo ECMP é uma rota no kernel).
+  - Engine (`boot_apply.rs`): no boot e no retry, a seção `routes` vai direto por esse caminho, sem
+    a tentativa inteira antes, para nenhuma metade subir e cair. A rota recusada fica desligada no
+    que o plano de dados tem e aparece:
+    - em `storage.boot_apply_failed` e no `auth.whoami` (`{section: routes, item: "*N", error}`);
+    - na saúde (`boot.apply` = `routes *N`);
+    - no aviso da CLI/MCP e no selo da GUI;
+    - no `ip.route.list`, com flag I, `invalid` e `invalid_reason` (o params doc foi atualizado).
+  - O campo do item no `boot_apply_failed` passou de `rule` (só firewall) a `item` (regra ou rota).
+  - Máscara de item, não de seção: com uma rota de fora, o commit e os caminhos laterais só a
+    desligam, em vez de copiar a seção do que está aplicado. Por isso as rotas de um lease DHCP
+    entram com uma rota estática de fora. O commit que muda ou tira a rota recusada a tenta de novo,
+    tudo ou nada.
+
+  Como testar:
+
+  - `cargo test -p corerouter-engine --test it boot_routes`: só a rota recusada fica de fora (flag
+    I, `invalid_reason`, saúde); commit com uma rota de fora; lease DHCP com uma rota de fora.
+  - Kernel real: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
+    corerouter-hal-linux --test netns_routes_each`. Outro programa tem a mesma rota com a mesma
+    métrica: o `apply` inteiro é recusado e desfaz tudo; uma a uma, só a recusada fica de fora, as
+    outras ficam no kernel e a do outro programa não é tocada.
+
+  Desempenho e paralelismo: o executor já mandava as rotas uma por uma, então o caminho uma a uma
+  custa o mesmo que o `apply` inteiro (10 000 rotas: 229 ms contra 236 ms, release, **medido**,
+  abaixo) e dispensa a tentativa inteira e o seu rollback. O mapa rota do kernel → rota da config só
+  é montado quando há recusa (por id, O(n)). Nada a dividir: o kernel serializa o rtnetlink por
+  netns, e as rotas dependem dos endereços já aplicados.
+
+- 2026-10-30 — fix-flaky-netns-arp-table: Testes de namespace instáveis no lote da fila: a causa comum era a tabela de vizinhos IPv4 do
+  kernel, que é **uma só para todos os namespaces** (`arp_tbl`, teto `gc_thresh3` = 1024 do
+  namespace inicial; net/core/neighbour.c `neigh_alloc`, v7.0). A tempestade de 20 000 assinantes
+  do `netns_nat_ipfix` mandava UDP para `192.0.2.2:9`, onde ninguém escutava; cada datagrama
+  voltava como ICMP port unreachable, e o roteador resolvia ARP de cada assinante em `lan0`. A
+  tabela chegava a 1030 entradas e ficava cheia por segundos depois do teste (**medido**:
+  `/proc/net/stat/arp_cache`, cada binário sozinho; nenhum outro passa de 61). Nesse tempo, todo
+  outro teste da máquina recebia ENOBUFS ao criar a própria entrada ARP: o ping do `netns_cgnat`
+  (`sendmsg: No buffer space available`), o unicast da renovação DHCP (tabelas de vizinhos vazias
+  nos dois lados, a próxima tentativa só em T2), o BFD e, pela mesma via, provavelmente o link de
+  sync do `netns_ha_pppoe` (`connect` em timeout por 15–21 s nos 14 de 14 casos do CI, **medido**
+  nos logs; não reproduzido localmente). O servidor agora recebe a tempestade num socket mudo:
+  pico de 35 entradas em vez de 1030 (**medido**).
+
+  Na mesma passada, o que cada teste supunha e a carga quebrava:
+
+  - `netns_ha_pppoe`: as esperas depois que os CPEs sobem (réplica, B ativo, CoA) atendem os
+    CPEs; 30 s sem responder ao LCP echo contra o keepalive de 10 s do BNG derrubavam as sessões
+    que a réplica esperava (o histórico de A mostrava `keepalive`, `uptime 14`).
+  - `netns_cgnat`: `lab()` espera cada veth sair da qdisc `noop` (o kernel só a troca no
+    linkwatch, sob o `rtnl_lock` global: até 381 ms, **medido**; antes disso `noop_enqueue`
+    descarta e conta TX dropped); as rajadas esperam até 3 s por datagrama até chegar o esperado
+    e depois 300 ms de silêncio (um `recv` de 300 ms para tudo perdia a rajada); o limite de ICMP
+    aceita a recarga do balde (5/s) durante os 10 envios, que sob carga passam de 200 ms.
+  - `netns_routes`: `route_dumps()` conta pelo processo inteiro; o teste que o confere roda
+    sozinho (`RwLock`), os outros em paralelo entre si.
+  - `netns_bfd`: "up" e o detection time lidos na mesma linha (a sessão de 150 ms caía entre duas
+    leituras); a detecção medida do fim do `ip link set down`, não do começo do comando.
+  - `netns_ha_bfd`: a parede (1,58 s com `active_ms` 153) contava o recolhimento do processo e o
+    polling pelo canal de controle; `detected_by: bfd` já prova a detecção antes do dead interval.
+    Antes de cada takeover, 1 s seguido de BFD up nos dois nós (como o `netns_bfd`): com 150 ms de
+    detecção, uma pausa da máquina derruba o BFD de verdade e o par cai nos hellos.
+  - `netns_replug` (G1.3d): o teste espera o evento de link do `ether2` chegar ao daemon (o serviço
+    mostra `link changes handled: N (last: …)` no `system.service.print`); o limite de 800 ms de
+    parede não separava o evento do poll de 1 s numa máquina carregada (940–990 ms, **medido**).
+    Reaplicar entre dois polls é o teste do engine (`port_absent`, relógio simulado). O log aceita
+    "replugged" ou "port is back" (sob carga um poll pode cair entre o `del` e o `add`).
+  - `netns_dns_ddns`: espera as duas zonas autoritativas, não só a direta (a reversa dava
+    NOTAUTH quando o serviço as publicava em rodadas diferentes).
+  - `netns_dhcp_server`, `netns_dhcp_relay`: o log do daemon vai para a pasta da execução, não
+    para um nome fixo em `/tmp` compartilhado por todas.
+
+  Como reproduzir: os 62 binários netns do daemon e do hal-linux de uma vez, como o `cargo xtask
+  netns`, cada laço preso em 2 CPUs (`taskset -c`), 4 laços em paralelo. Falhas em 52 rodadas
+  (**medido** em 2026-10-30, 32 threads, build de debug):
+
+  | teste | antes | depois |
+  |---|---|---|
+  | `netns_ha_pppoe` | 0/138 aqui; 30× no CI | 0/52 |
+  | `netns_cgnat` | 10/32 | 0/52 |
+  | `netns_dhcp_server` | 9/16 | 0/52 |
+  | `netns_dhcp_relay` | 9/32 | 0/52 |
+  | `netns_notice` | 11/32 | 0/52 |
+  | `netns_routes` | 22/52 | 0/52 |
+  | `netns_bfd` | 5/32 | 0/52 |
+  | `netns_ha_bfd` | 7/32 | 1/52 e 1/24 (BFD caído de verdade, `dead-interval`: o daemon ficou sem CPU além do dead interval) |
+  | `netns_replug` | 17–33/52 | 0/24 (+1/24 corrigido: log "port is back") |
+  | `netns_dns_ddns` | 2/52 | 0/24 |
+
+  O `hal-linux netns` (12/18 antes) já tinha sido corrigido na `main` pelo G1.3b (#508): DAD
+  `tentative` na comparação de `ip addr`.

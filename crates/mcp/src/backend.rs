@@ -57,6 +57,26 @@ pub struct Remote {
     /// Accounts of group full without a password, as `auth.whoami` said at
     /// the last login (G0.3d).
     no_password: Vec<String>,
+    /// What the router's boot left out of the data plane, as `auth.whoami`
+    /// said at the last login (G1.3e): "section: why".
+    boot_errors: Vec<String>,
+}
+
+/// The warning every client shows while the boot left part of the config
+/// out of the data plane (G1.3e).
+pub fn boot_warning(errors: &[String]) -> Option<String> {
+    if errors.is_empty() {
+        return None;
+    }
+    let list: Vec<String> = errors
+        .iter()
+        .map(|e| e.replacen("backend rejected the change: ", "", 1).chars().take(300).collect())
+        .collect();
+    Some(format!(
+        "WARNING: the router booted without part of its config (the kernel refused it; \
+         the rest, management included, is up): {}. See system.health.",
+        list.join("; ")
+    ))
 }
 
 /// The warning every client shows while an account of group full has no
@@ -96,7 +116,7 @@ impl Remote {
         known: &mut KnownHosts,
         trust: &mut dyn Trust,
     ) -> Result<Self, String> {
-        let (client, has_ui, no_password) = Self::open(target, login, known, trust)?;
+        let (client, has_ui, no_password, boot_errors) = Self::open(target, login, known, trust)?;
         Ok(Self {
             pinned: client.fingerprint().map(str::to_owned),
             client: Some(client),
@@ -104,6 +124,7 @@ impl Remote {
             target: target.clone(),
             login: login.clone(),
             no_password,
+            boot_errors,
         })
     }
 
@@ -117,11 +138,12 @@ impl Remote {
         login: &Login,
         known: &mut KnownHosts,
         trust: &mut dyn Trust,
-    ) -> Result<(Client, bool, Vec<String>), String> {
+    ) -> Result<(Client, bool, Vec<String>, Vec<String>), String> {
         let mut client = dial(target, DIAL_TIMEOUT, login, known, trust)?;
         let info = client.call("server.info", Value::Null)?;
         let has_ui = info.get("has_ui").and_then(Value::as_bool).unwrap_or(false);
         let mut no_password = Vec::new();
+        let mut boot_errors = Vec::new();
         if !matches!(login, Login::Nothing) {
             let me = client.call("auth.whoami", Value::Null).map_err(|e| {
                 if e.starts_with(UNAUTHORIZED) && !target.tls {
@@ -144,8 +166,25 @@ impl Remote {
             if let Some(w) = no_password_warning(&no_password) {
                 log::warn!("{target}: {w}");
             }
+            boot_errors = me
+                .get("boot_errors")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .take(16)
+                .map(|f| {
+                    let field = |k| f.get(k).and_then(Value::as_str).unwrap_or("");
+                    match f.get("item").and_then(Value::as_str) {
+                        Some(item) => format!("{} {item}: {}", field("section"), field("error")),
+                        None => format!("{}: {}", field("section"), field("error")),
+                    }
+                })
+                .collect();
+            if let Some(w) = boot_warning(&boot_errors) {
+                log::warn!("{target}: {w}");
+            }
         }
-        Ok((client, has_ui, no_password))
+        Ok((client, has_ui, no_password, boot_errors))
     }
 
     /// A live connection: the one we have, or a new one when the router
@@ -157,7 +196,7 @@ impl Remote {
         }
         if self.client.is_none() {
             let mut trust = Expect(self.pinned.clone().unwrap_or_default());
-            let (client, has_ui, no_password) = Self::open(
+            let (client, has_ui, no_password, boot_errors) = Self::open(
                 &self.target,
                 &self.login,
                 &mut KnownHosts::load_default(),
@@ -173,6 +212,7 @@ impl Remote {
             }
             self.has_ui = has_ui;
             self.no_password = no_password;
+            self.boot_errors = boot_errors;
             self.client = Some(client);
         }
         self.client
@@ -236,6 +276,23 @@ impl Backend for Remote {
             d.push_str(". ");
             d.push_str(w.trim_end_matches('.'));
         }
+        if let Some(w) = boot_warning(&self.boot_errors) {
+            d.push_str(". ");
+            d.push_str(w.trim_end_matches('.'));
+        }
         d
+    }
+}
+
+#[cfg(test)]
+mod boot_warning_tests {
+    use super::boot_warning;
+
+    #[test]
+    fn warns_only_with_boot_errors_and_keeps_the_kernel_reason() {
+        assert!(boot_warning(&[]).is_none());
+        let w = boot_warning(&["firewall: backend rejected the change: nft refused rule 3".into()]).unwrap();
+        assert!(w.contains("firewall: nft refused rule 3"), "{w}");
+        assert!(w.contains("management included"), "{w}");
     }
 }

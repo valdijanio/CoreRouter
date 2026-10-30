@@ -154,6 +154,12 @@ pub(crate) struct NicView {
     pub(crate) usb_fast_until: f64,
     /// G1.29d: the watchdog switch flipped (sent by the dialog).
     pub(crate) usb_watchdog_set: Option<bool>,
+    /// G1.29g: why the port is not CoreRouter's (`None`: it is in the
+    /// configuration). Set by the window from its interface row.
+    pub(crate) unmanaged: Option<String>,
+    /// G1.29g: "Adopt" pressed on a port outside the configuration (sent
+    /// by the dialog as `interface.ethernet.adopt`).
+    pub(crate) adopt_go: bool,
 }
 
 impl NicView {
@@ -898,6 +904,13 @@ fn usb_recovery(
         });
         return;
     }
+    // G1.29g: a port outside the configuration (a USB adapter that came
+    // back with the kernel's name, one not adopted yet): the router does
+    // not reset what it does not manage; adopting it is one click.
+    let allowed = match &view.unmanaged {
+        Some(_) => Err("Not in the configuration: adopt the port first".to_owned()),
+        None => allowed,
+    };
     ui.horizontal(|ui| {
         for (level, label, cost) in USB_LEVELS {
             let enabled = allowed.is_ok() && !running && view.usb_ask.is_none();
@@ -914,6 +927,29 @@ fn usb_recovery(
             *help = Some(("iface_usb.recovery", "USB recovery"));
         }
     });
+    if let Some(why) = &view.unmanaged {
+        let adopt = can.check("interface.ethernet.adopt");
+        ui.horizontal(|ui| {
+            ui.add(egui::Label::new(RichText::new(capitalized(why)).color(crate::chip::AMBER.tone(ui.visuals()).ink)).wrap());
+            if crate::help::info_button(ui, ui.scope_id().with("iface_usb.unmanaged"), "Why the recovery is off").clicked() {
+                *help = Some(("iface_usb.unmanaged", "Port not in the configuration"));
+            }
+        });
+        let r = ui.add_enabled(adopt.is_ok() && !view.adopt_go, egui::Button::new("Adopt"));
+        let r = match &adopt {
+            Err(why) => r.on_disabled_hover_text(why.as_str()),
+            Ok(()) => r.on_hover_text("Add this port to the configuration (interface.ethernet.adopt)"),
+        };
+        if r.clicked() {
+            view.adopt_go = true;
+        }
+    }
+}
+
+/// "not in the configuration (…)" as a sentence.
+fn capitalized(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
 /// G1.29d: the watchdog's state and its per-adapter switch.
@@ -936,7 +972,10 @@ fn usb_watchdog(ui: &mut Ui, w: &Value, view: &mut NicView, can: &Avail) {
         _ => None,
     };
     {
-        let allowed = can.check("interface.usb.watchdog.set");
+        let allowed = match &view.unmanaged {
+            Some(_) => Err("Not in the configuration: adopt the port first".to_owned()),
+            None => can.check("interface.usb.watchdog.set"),
+        };
         let mut on = view.usb_watchdog_set.unwrap_or(enabled);
         let r = ui.add_enabled(allowed.is_ok(), egui::Checkbox::new(&mut on, "enabled"));
         let r = match &allowed {

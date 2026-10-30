@@ -10,6 +10,10 @@ mod support;
 
 mod arp;
 mod bonding;
+mod boot_partial;
+mod boot_routes;
+mod boot_rules;
+mod boot_side_paths;
 mod cgnat;
 mod cgnat_battery;
 mod cgnat_blocks;

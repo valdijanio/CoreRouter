@@ -199,7 +199,45 @@ fn lab() -> Lab {
     // upstream would.
     net.ip(&["route", "add", "203.0.113.0/30", "via", "192.0.2.1"]);
     net.ip(&["route", "add", "198.51.100.0/24", "via", "192.0.2.1"]);
+    wait_active(None, "i0");
+    wait_active(None, "e0");
+    wait_active(Some(&subs), "s0");
+    wait_active(Some(&net), "x0");
     Lab { subs, net }
+}
+
+/// Waits until `link` passes traffic. A veth gets its real qdisc in place
+/// of the `noop` one, which drops every frame (`noop_enqueue`, counted in
+/// TX dropped), only when the kernel's linkwatch work runs `dev_activate`
+/// under the global `rtnl_lock` (net/core/link_watch.c, v7.0). With the
+/// workspace's netns tests all running at once that came late, the first
+/// ARP request of a test went nowhere, and the retry 1 s later
+/// (`retrans_time_ms`) missed the 300 ms a test waits for its first
+/// packet (flaked in the queue's batches).
+fn wait_active(ns: Option<&Ns>, link: &str) {
+    let start = Instant::now();
+    loop {
+        let mut c = match ns {
+            Some(n) => {
+                let mut c = Command::new("nsenter");
+                c.args(["-t", n.pid().as_str(), "-n", "ip"]);
+                c
+            }
+            None => Command::new("ip"),
+        };
+        let text = run(c.args(["-o", "link", "show", link]));
+        if text.contains("state UP") && !text.contains("qdisc noop") {
+            if start.elapsed() > Duration::from_secs(1) {
+                eprintln!("{link} active after {:?}", start.elapsed());
+            }
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "{link} still not active: {text}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn pool(ports: u16) -> Pool {
@@ -673,9 +711,6 @@ fn a_subscriber_out_of_ports_never_borrows_another_s() {
     let server = lab
         .net
         .within(|| UdpSocket::bind("192.0.2.2:7600").unwrap());
-    server
-        .set_read_timeout(Some(Duration::from_millis(300)))
-        .unwrap();
     // 80 sockets, each its own flow (another local port).
     let sockets: Vec<UdpSocket> = lab.subs.within(|| {
         (0..80)
@@ -688,7 +723,7 @@ fn a_subscriber_out_of_ports_never_borrows_another_s() {
     });
     let mut seen = std::collections::BTreeSet::new();
     let mut buf = [0u8; 8];
-    while let Ok((_, from)) = server.recv_from(&mut buf) {
+    for (_, from) in burst(&server, &mut buf, 64) {
         seen.insert(from);
     }
     let slot = layout_of(&p)
@@ -717,6 +752,27 @@ fn a_subscriber_out_of_ports_never_borrows_another_s() {
     assert!(refused > 0, "the kernel counted the refused flows");
     drop(sockets);
     hal.apply(&c, &Config::default()).unwrap();
+}
+
+/// The datagrams of a burst that should bring `expect`: up to 3 s for
+/// each until they are in, then 300 ms more for any extra. One 300 ms
+/// wait for all lost the burst on a loaded machine: the first packet of a
+/// flow (the ruleset, an ARP) or a pause in the middle took longer
+/// (flaked in the queue's batches).
+fn burst(server: &UdpSocket, buf: &mut [u8], expect: usize) -> Vec<(usize, SocketAddr)> {
+    let mut got = Vec::new();
+    loop {
+        let wait = if got.len() < expect {
+            Duration::from_secs(3)
+        } else {
+            Duration::from_millis(300)
+        };
+        server.set_read_timeout(Some(wait)).unwrap();
+        match server.recv_from(buf) {
+            Ok(r) => got.push(r),
+            Err(_) => return got,
+        }
+    }
 }
 
 /// Serve the exhaustion queues of `hal` on a thread until `stop`.
@@ -806,9 +862,6 @@ fn a_subscriber_out_of_ports_gets_icmp_host_unreachable() {
     let server = lab
         .net
         .within(|| UdpSocket::bind("192.0.2.2:7600").unwrap());
-    server
-        .set_read_timeout(Some(Duration::from_millis(300)))
-        .unwrap();
     // .1 takes its 64 ports to one destination.
     let sockets: Vec<UdpSocket> = lab.subs.within(|| {
         (0..64)
@@ -820,10 +873,7 @@ fn a_subscriber_out_of_ports_gets_icmp_host_unreachable() {
             .collect()
     });
     let mut buf = [0u8; 8];
-    let mut through = 0;
-    while server.recv_from(&mut buf).is_ok() {
-        through += 1;
-    }
+    let through = burst(&server, &mut buf, 64).len();
     assert_eq!(through, 64);
 
     let a: Ipv4Addr = "100.64.0.1".parse().unwrap();
@@ -852,7 +902,21 @@ fn a_subscriber_out_of_ports_gets_icmp_host_unreachable() {
         server.recv_from(&mut buf).is_err(),
         "nothing more got through"
     );
-    assert_eq!(seen.len(), 5, "the burst, no more: {seen:?}");
+    // The burst, and what the bucket refills while the ten are refused: on
+    // a loaded machine they spread over more than 200 ms, one more token
+    // (flaked in the queue's batches). Unlimited would be ten at once.
+    let spread = match (
+        seen.iter().map(|s| s.3).min(),
+        seen.iter().map(|s| s.3).max(),
+    ) {
+        (Some(a), Some(b)) => b.duration_since(a),
+        _ => Duration::ZERO,
+    };
+    let allowed = 5 + (spread.as_secs_f64() * 5.0).ceil() as usize;
+    assert!(
+        (5..=allowed).contains(&seen.len()),
+        "the burst, no more ({allowed} in {spread:?}): {seen:?}"
+    );
     for (code, src, port, _) in &seen {
         assert_eq!(*code, 1, "host unreachable (RFC 6888 REQ-11b)");
         assert_eq!(*src, a, "the private source, as sent");
@@ -890,8 +954,8 @@ fn a_subscriber_out_of_ports_gets_icmp_host_unreachable() {
     eprintln!("served {served}, {stats:?}");
     assert_eq!(served, 11, "ten from .1 and one from .2; .65 never");
     assert_eq!(stats.refused, 10);
-    assert_eq!(stats.icmp, 5);
-    assert_eq!(stats.limited, 5);
+    assert_eq!(stats.icmp, seen.len() as u64);
+    assert_eq!(stats.limited, 10 - seen.len() as u64);
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].0, a);
     drop(sockets);

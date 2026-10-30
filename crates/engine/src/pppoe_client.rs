@@ -744,7 +744,7 @@ impl Session {
         let applied = if before == after {
             Ok(())
         } else {
-            self.hal_mut().apply(&before, &after)
+            self.apply_side(&before, &after)
         };
         let msg = format!(
             "connected to {} ({}), session {}, address {}{}, mtu {}",
@@ -782,7 +782,7 @@ impl Session {
         }
         let after = self.effective(&running).into_owned();
         if before != after
-            && let Err(e) = self.hal_mut().apply(&before, &after)
+            && let Err(e) = self.apply_side(&before, &after)
         {
             log::warn!("pppoe-client {name}: removing the session's routes: {e}");
         }

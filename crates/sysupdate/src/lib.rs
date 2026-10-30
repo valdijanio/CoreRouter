@@ -10,6 +10,8 @@
 //! - [`gpt`]: the slots and the ESP, found by partition name; a new table.
 //! - [`iso`], [`install`]: the installer's hybrid ISO and what it writes on
 //!   an empty disk (G1.6c).
+//! - [`ext4`]: `/config` grown to the rest of the disk (G1.6v, with
+//!   [`gpt::grow_last`]).
 //! - [`state`]: the trial across the reboot, configuration snapshots.
 //! - [`upload`]: a package arriving over the network, read as a stream
 //!   (G1.6e).
@@ -21,6 +23,8 @@
 
 pub mod ab;
 pub mod efi;
+#[cfg(unix)]
+pub mod ext4;
 pub mod gpt;
 #[cfg(unix)]
 pub mod install;

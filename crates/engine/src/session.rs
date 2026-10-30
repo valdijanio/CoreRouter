@@ -56,6 +56,10 @@ pub struct StorageStatus {
     /// set, every tick retries the whole config and the next commit applies
     /// everything, not only its change (audit #8).
     pub boot_apply_error: Option<String>,
+    /// G1.3e: the same, one entry per section left out (`core`: nothing
+    /// went in). Empty once everything is in.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub boot_apply_failed: Vec<crate::boot_apply::BootFailure>,
     /// Oldest revisions the last save left out of the file to keep it
     /// under the size limit (they stay in memory until the restart).
     pub revisions_not_saved: usize,
@@ -167,7 +171,17 @@ impl Session {
     /// Build a session that restores the committed config from `storage`
     /// (newest readable slot) and saves it there after every commit. With
     /// nothing readable stored, it starts from the discovered ports.
-    pub fn with_storage(mut hal: Box<dyn Hal>, mut storage: Box<dyn ConfigStorage>) -> Self {
+    pub fn with_storage(hal: Box<dyn Hal>, storage: Box<dyn ConfigStorage>) -> Self {
+        Self::with_storage_env(hal, storage, crate::boot_apply::BootEnv::default())
+    }
+
+    /// [`Self::with_storage`], knowing what the boot must keep reachable
+    /// (G1.3g: the management ports the daemon opens after the boot).
+    pub fn with_storage_env(
+        mut hal: Box<dyn Hal>,
+        mut storage: Box<dyn ConfigStorage>,
+        env: crate::boot_apply::BootEnv,
+    ) -> Self {
         // The virtual lab's DHCP clients get leases from a simulated server.
         hal.offer_dhcp_lab_server(Arc::new(corerouter_proto_dhcp::lab::LabServer::default()));
         hal.offer_dhcp6_lab_server(Arc::new(corerouter_proto_dhcp::lab6::LabServer6::default()));
@@ -230,6 +244,7 @@ impl Session {
             boot_errors,
             last_error: None,
             boot_apply_error: None,
+            boot_apply_failed: Vec::new(),
             revisions_not_saved: 0,
         };
         let store = match restored {
@@ -246,10 +261,12 @@ impl Session {
                 // No pool has a prefix yet: addresses taken from pools wait.
                 let mut boot = store.running().clone();
                 boot.ip.addresses.retain(|a| a.from_pool.is_none());
-                if let Err(e) = hal.apply(&Config::default(), &boot) {
-                    log::error!("restored config not applied (retried every second): {e}");
-                    status.boot_apply_error = Some(e.to_string());
-                }
+                // G1.3e: refused whole, it goes in by sections (management first).
+                let staged = crate::boot_apply::at_boot(hal.as_mut(), &boot, &env);
+                status.boot_apply_error = crate::boot_apply::summary(staged.failed());
+                status.boot_apply_failed = staged.failed().to_vec();
+                ext.set(staged);
+                ext.set(env);
                 status.loaded_from = Some(slot.name());
                 store
             }
@@ -582,17 +599,16 @@ impl Session {
             let dynamic = self.dynamic_now();
             self.check_lockout(running, to, &dynamic, &dynamic)?;
         }
-        // The boot apply failed: the data plane may hold nothing of the
-        // running config, so install all of it, not only the change.
-        let empty;
-        let from = if self.storage_status.boot_apply_error.is_some() {
-            empty = Config::default();
-            &empty
-        } else {
-            running
-        };
+        // The boot apply did not finish (G1.3e): start from what the data
+        // plane holds, and leave out the refused sections this commit does
+        // not touch.
+        let boot_pending = self.boot_applied().is_some();
+        let applied_now = self.boot_applied().cloned();
+        let from = applied_now.as_ref().unwrap_or(running);
+        let masked = self.boot_mask(running, to);
+        let to_hal = masked.as_ref().map_or(to, |(c, _)| c);
         self.hal
-            .apply(from, to)
+            .apply(from, to_hal)
             .map_err(|e| EngineError::Hal(e.to_string()))?;
         // G3.1: the routing daemons (FRR) take the routing part; when they
         // refuse, the data plane goes back too and the commit fails.
@@ -601,16 +617,18 @@ impl Session {
             && (from.routing != to.routing
                 || corerouter_proto_bgp::networks_changed(from, to)
                 || corerouter_proto_ospf::frr::statics_changed(from, to)
-                || self.storage_status.boot_apply_error.is_some())
+                || boot_pending)
             && let Err(e) = daemon.apply(from, to)
         {
-            if let Err(back) = self.hal.apply(to, from) {
+            if let Err(back) = self.hal.apply(to_hal, from) {
                 log::error!("routing refused the commit and the data plane could not go back: {back}");
             }
             return Err(EngineError::Hal(format!("routing: {e}")));
         }
-        if self.storage_status.boot_apply_error.take().is_some() {
-            log::info!("the whole config reached the data plane with this commit");
+        if boot_pending {
+            let reached = to_hal.clone();
+            let kept = masked.map(|(_, k)| k).unwrap_or_default();
+            self.boot_committed(kept, reached);
         }
         let pending = self.safe_mode.is_active();
         let comment = match (pending, comment.is_empty()) {
@@ -639,35 +657,6 @@ impl Session {
             self.save();
         }
         Ok(revision)
-    }
-
-    /// Retry the boot apply that failed (called by [`Session::tick`]).
-    pub(crate) fn retry_boot_apply(&mut self) {
-        if self.storage_status.boot_apply_error.is_none() {
-            return;
-        }
-        let to = self.effective(self.store.running()).into_owned();
-        let tried = guard::run("boot apply", || {
-            self.hal
-                .apply(&Config::default(), &to)
-                .map_err(|e| EngineError::Hal(e.to_string()))
-        });
-        match tried {
-            Ok(()) => {
-                log::info!(
-                    "restored config (revision {}) applied on retry",
-                    self.store.current_revision()
-                );
-                self.storage_status.boot_apply_error = None;
-            }
-            Err(e) => {
-                let e = e.to_string();
-                if self.storage_status.boot_apply_error.as_deref() != Some(e.as_str()) {
-                    log::error!("restored config still not applied: {e}");
-                }
-                self.storage_status.boot_apply_error = Some(e);
-            }
-        }
     }
 
     /// Persist running + history (bounded: the oldest revisions are left
@@ -900,6 +889,10 @@ impl Session {
     pub fn journal(&self) -> &[JournalEntry] {
         let start = self.journal.len().saturating_sub(MAX_JOURNAL);
         self.journal.get(start..).unwrap_or_default()
+    }
+
+    pub(crate) fn storage_status_mut(&mut self) -> &mut StorageStatus {
+        &mut self.storage_status
     }
 
     pub fn storage_status(&self) -> &StorageStatus {

@@ -35,6 +35,12 @@ BR2_PACKAGE_COREROUTER=y
 BR2_PACKAGE_FRR=y
 BR2_PACKAGE_FRR_BFD=y
 BR2_PACKAGE_LIBCAP=y
+# G1.6v: /config grows to the rest of the disk at boot (corerouter-init:
+# e2fsck -f -p, then resize2fs, on the unmounted partition). Only those two
+# stay in the image (post-build.sh); util-linux comes for libblkid/libuuid.
+BR2_PACKAGE_E2FSPROGS=y
+# BR2_PACKAGE_E2FSPROGS_FSCK is not set
+BR2_PACKAGE_E2FSPROGS_RESIZE2FS=y
 # G1.6c: the installer's kernel (the ISO, post-image.sh).
 BR2_PACKAGE_COREROUTER_INSTALLER=y
 BR2_TARGET_ROOTFS_SQUASHFS=y
