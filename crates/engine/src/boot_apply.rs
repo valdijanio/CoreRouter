@@ -170,7 +170,7 @@ const MAX_CHECKS: usize = 64;
 /// What [`isolate_firewall`] found.
 enum Isolated {
     /// The firewall without these rules loads and keeps management.
-    Rules(Config, Vec<RefusedRule>),
+    Rules(Box<Config>, Vec<RefusedRule>),
     /// The firewall stays out whole, for this reason.
     Whole(String),
 }
@@ -289,7 +289,7 @@ fn isolate_firewall(hal: &mut dyn Hal, next: &Config, why: &str, env: &BootEnv) 
              management: {cut}; the whole firewall stays out until it is fixed"
         ));
     }
-    Isolated::Rules(out, left)
+    Isolated::Rules(Box::new(out), left)
 }
 
 /// Most connections the management guard walks (addresses × ports ×
@@ -452,7 +452,7 @@ pub(crate) fn staged(hal: &mut dyn Hal, base: &Config, target: &Config, env: &Bo
         match isolate_firewall(hal, &next, &e, env) {
             Isolated::Rules(reduced, rules) => match hal.apply(&applied, &reduced) {
                 Ok(()) => {
-                    applied = reduced;
+                    applied = *reduced;
                     failed.extend(rules.into_iter().map(|r| BootFailure {
                         section: FIREWALL,
                         rule: Some(r.id),
@@ -475,8 +475,8 @@ const FIREWALL: &str = "firewall";
 /// Backoff of the retries, seconds.
 const RETRY_MAX: u64 = 60;
 /// Backoff when only single rules are out (G1.3g): finding them again
-/// costs the kernel a validation per rule (10 000 rules: 5.3 s with
-/// nftables' lock held, **medido**), and a rule refused at boot is
+/// costs the kernel a validation per rule (10 000 rules: 1.7 s in a
+/// release build, nftables' lock held, **medido**), and a rule refused at boot is
 /// usually refused for good; a commit that changes it tries at once.
 const RETRY_RULES_MAX: u64 = 600;
 /// The log says again what is still out this often, seconds.
