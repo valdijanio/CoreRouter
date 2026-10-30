@@ -31,14 +31,16 @@ pub trait Host {
     ) -> Result<Value, String>;
 
     /// [`Host::with_session`] for a command whose answer may be built
-    /// after the session is released ([`Reply::Later`], G0.31b). Here, in
-    /// place; a host that locks a shared session overrides it to run
-    /// [`Reply::finish`] after unlocking.
+    /// after the session is released ([`Reply::Later`], G0.31b) or written
+    /// straight into the connection ([`Reply::Stream`], G0.31h). Here,
+    /// built in place; a host that locks a shared session overrides it to
+    /// hand the reply back unlocked.
     fn with_session_reply(
         &mut self,
         f: &mut dyn FnMut(&mut Session) -> Result<Reply, String>,
-    ) -> Result<Value, String> {
+    ) -> Result<Reply, String> {
         self.with_session(&mut |s| f(s)?.finish().map_err(|e| e.to_string()))
+            .map(Reply::Ready)
     }
 
     fn has_ui(&self) -> bool {
@@ -65,6 +67,13 @@ impl Host for Session {
     ) -> Result<Value, String> {
         f(self)
     }
+
+    fn with_session_reply(
+        &mut self,
+        f: &mut dyn FnMut(&mut Session) -> Result<Reply, String>,
+    ) -> Result<Reply, String> {
+        f(self)
+    }
 }
 
 /// Host over a session shared with other threads (daemon, GUI).
@@ -84,9 +93,9 @@ impl Host for SharedHost {
     fn with_session_reply(
         &mut self,
         f: &mut dyn FnMut(&mut Session) -> Result<Reply, String>,
-    ) -> Result<Value, String> {
+    ) -> Result<Reply, String> {
         let reply = f(&mut lock(&self.0))?;
-        reply.finish().map_err(|e| e.to_string())
+        Ok(reply)
     }
 }
 
@@ -149,12 +158,48 @@ pub fn dispatch_as(
     method: &str,
     params: &Value,
 ) -> Result<Value, String> {
-    let err = |e: corerouter_engine::EngineError| e.to_string();
+    dispatch_reply_as(host, caller, method, params)?
+        .finish()
+        .map_err(|e| e.to_string())
+}
+
+/// [`dispatch_as`], with a big answer left as a [`Reply`] for the
+/// connection to write (G0.31h): `engine.execute` of a command that
+/// streams ([`Reply::Stream`]) or builds after unlocking.
+pub fn dispatch_reply_as(
+    host: &mut dyn Host,
+    caller: &Caller,
+    method: &str,
+    params: &Value,
+) -> Result<Reply, String> {
     if !matches!(method, "ping" | "ui.screenshot")
         && let Some(answer) = host.forward(method, params)
     {
-        return answer;
+        return answer.map(Reply::Ready);
     }
+    if method == "engine.execute" {
+        let id = params
+            .get("command")
+            .and_then(Value::as_str)
+            .ok_or("engine.execute needs {command, params?}")?;
+        let p = params.get("params").cloned().unwrap_or(Value::Null);
+        // `via` names the client program, for the log's origin (G4.6d).
+        let caller = caller.clone().with_via(params);
+        return host.with_session_reply(&mut |s| {
+            s.execute_reply_as(&caller, id, &p)
+                .map_err(|e| e.to_string())
+        });
+    }
+    dispatch_value(host, caller, method, params).map(Reply::Ready)
+}
+
+fn dispatch_value(
+    host: &mut dyn Host,
+    caller: &Caller,
+    method: &str,
+    params: &Value,
+) -> Result<Value, String> {
+    let err = |e: corerouter_engine::EngineError| e.to_string();
     match method {
         "ping" => Ok(json!({ "pong": true })),
         "server.info" => {
@@ -172,16 +217,6 @@ pub fn dispatch_as(
         "engine.list" => {
             let list = host.with_session(&mut |s| Ok(s.list_as(caller)))?;
             Ok(catalogue_reply(list, params))
-        }
-        "engine.execute" => {
-            let id = params
-                .get("command")
-                .and_then(Value::as_str)
-                .ok_or("engine.execute needs {command, params?}")?;
-            let p = params.get("params").cloned().unwrap_or(Value::Null);
-            // `via` names the client program, for the log's origin (G4.6d).
-            let caller = caller.clone().with_via(params);
-            host.with_session_reply(&mut |s| s.execute_reply_as(&caller, id, &p).map_err(err))
         }
         "engine.batch" => {
             let steps = params.get("steps").cloned().unwrap_or(Value::Null);
