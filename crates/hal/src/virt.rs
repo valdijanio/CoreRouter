@@ -235,17 +235,24 @@ impl VirtualHal {
         }
         // Routes resolve through interfaces and addresses: with those
         // unchanged, only the destinations the commit touched (G0.31e).
-        let (gone, came) = drift::route_changes(from, to).unwrap_or_else(|| {
+        let c = drift::route_changes(from, to).unwrap_or_else(|| {
             let (a, b) = (drift::kernel_routes(from), drift::kernel_routes(to));
-            (
-                a.difference(&b).cloned().collect(),
-                b.difference(&a).cloned().collect(),
-            )
+            let (discards_gone, discards_new) = drift::discard_changes(from, to);
+            drift::RouteChanges {
+                gone: a.difference(&b).cloned().collect(),
+                new: b.difference(&a).cloned().collect(),
+                discards_gone,
+                discards_new,
+            }
         });
-        for r in &gone {
+        for r in &c.gone {
             k.routes.remove(r);
         }
-        k.routes.extend(came);
+        k.routes.extend(c.new);
+        for d in &c.discards_gone {
+            k.discards.remove(d);
+        }
+        k.discards.extend(c.discards_new);
     }
 
     /// Answer DHCP clients with `server` (a test's own scenario) instead of

@@ -40,7 +40,7 @@ use std::fmt;
 
 use corerouter_hal::HalError;
 use corerouter_hal::drift::{self, Snapshot, active_addresses, master};
-pub use corerouter_hal::drift::{KernelRoute, kernel_routes};
+pub use corerouter_hal::drift::{KernelDiscard, KernelRoute, kernel_routes};
 use corerouter_model::os_loopback::{is_os_address, is_os_loopback};
 use corerouter_model::route::MAIN_TABLE_ID;
 use corerouter_model::routes::Dst;
@@ -246,6 +246,8 @@ pub fn bond_in_place(from: &LinkSpec, to: &LinkSpec) -> Option<Vec<BondSetting>>
 /// One kernel operation. Each one is small enough to undo on its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
+    /// G1.5a: a route without next hop (no link).
+    DelDiscard(KernelDiscard),
     DelRoute(KernelRoute),
     DelAddress {
         link: IfName,
@@ -284,11 +286,13 @@ pub enum Op {
         up: bool,
     },
     AddRoute(KernelRoute),
+    AddDiscard(KernelDiscard),
 }
 
 impl Op {
-    pub fn link(&self) -> &IfName {
-        match self {
+    /// The link it acts on; `None` for a route without next hop.
+    pub fn link(&self) -> Option<&IfName> {
+        Some(match self {
             Self::DelAddress { link, .. }
             | Self::SetMaster { link, .. }
             | Self::DeleteLink { link, .. }
@@ -298,7 +302,8 @@ impl Op {
             | Self::AddAddress { link, .. }
             | Self::SetUp { link, .. } => link,
             Self::DelRoute(r) | Self::AddRoute(r) => &r.link,
-        }
+            Self::DelDiscard(_) | Self::AddDiscard(_) => return None,
+        })
     }
 }
 
@@ -332,6 +337,8 @@ impl fmt::Display for Op {
             Self::SetUp { link, up: false } => write!(f, "bring '{link}' down"),
             Self::AddRoute(r) => write!(f, "add {r}"),
             Self::DelRoute(r) => write!(f, "remove {r}"),
+            Self::AddDiscard(d) => write!(f, "add {d}"),
+            Self::DelDiscard(d) => write!(f, "remove {d}"),
         }
     }
 }
@@ -412,9 +419,11 @@ pub fn plan(from: &Config, to: &Config) -> Result<Vec<Op>, HalError> {
     // Only routes changed: what the full plan gives (routes out, then
     // in), from the destinations the commit touched (G0.31e: one route
     // among 60 000 was 28 ms here, resolving every route twice).
-    if let Some((gone, new)) = drift::route_changes(from, to) {
-        let mut ops: Vec<Op> = gone.into_iter().map(Op::DelRoute).collect();
-        ops.extend(new.into_iter().map(Op::AddRoute));
+    if let Some(c) = drift::route_changes(from, to) {
+        let mut ops: Vec<Op> = c.discards_gone.into_iter().map(Op::DelDiscard).collect();
+        ops.extend(c.gone.into_iter().map(Op::DelRoute));
+        ops.extend(c.new.into_iter().map(Op::AddRoute));
+        ops.extend(c.discards_new.into_iter().map(Op::AddDiscard));
         return Ok(ops);
     }
     plan_whole(from, to)
@@ -454,7 +463,10 @@ fn plan_whole(from: &Config, to: &Config) -> Result<Vec<Op>, HalError> {
 
     let mut ops = Vec::new();
 
-    // 0. Routes that go away, or whose link is rebuilt.
+    // 0. Routes that go away, or whose link is rebuilt; first those
+    // without next hop (G1.5a: their table may be a VRF that goes).
+    let (gone_discards, new_discards) = drift::discard_changes(from, to);
+    ops.extend(gone_discards.into_iter().map(Op::DelDiscard));
     let old_routes = kernel_routes(from);
     let new_routes = kernel_routes(to);
     for r in &old_routes {
@@ -626,12 +638,14 @@ fn plan_whole(from: &Config, to: &Config) -> Result<Vec<Op>, HalError> {
         });
     }
 
-    // 9. Routes that arrive, or whose link was rebuilt.
+    // 9. Routes that arrive, or whose link was rebuilt; then those without
+    // next hop (in a VRF created above).
     for r in &new_routes {
         if rebuilt.contains(&r.link) || !old_routes.contains(r) {
             ops.push(Op::AddRoute(r.clone()));
         }
     }
+    ops.extend(new_discards.into_iter().map(Op::AddDiscard));
 
     ops.retain(|op| !os_owned(op, from, to));
     Ok(ops)
@@ -679,13 +693,15 @@ pub fn owned_routes(from: &Config, to: &Config, ops: &[Op]) -> BTreeSet<KernelRo
 /// 127.0.0.0/8 and ::1 are never touched. Only CoreRouter's addresses and
 /// routes on it go through.
 fn os_owned(op: &Op, from: &Config, to: &Config) -> bool {
-    let link = op.link();
+    let Some(link) = op.link() else {
+        return false;
+    };
     if !is_os_loopback(from, link) && !is_os_loopback(to, link) {
         return false;
     }
     match op {
         Op::AddAddress { addr, .. } | Op::DelAddress { addr, .. } => is_os_address(addr),
-        Op::AddRoute(_) | Op::DelRoute(_) => false,
+        Op::AddRoute(_) | Op::DelRoute(_) | Op::AddDiscard(_) | Op::DelDiscard(_) => false,
         Op::SetMaster { .. }
         | Op::DeleteLink { .. }
         | Op::CreateLink { .. }
@@ -990,7 +1006,7 @@ mod tests {
             spec: LinkSpec::Dummy
         }));
         // Physical ports are never created, and untouched ones get no ops.
-        assert!(!ops.iter().any(|o| o.link() == &n("ether1")));
+        assert!(!ops.iter().any(|o| o.link() == Some(&n("ether1"))));
         assert!(
             !ops.iter()
                 .any(|o| matches!(o, Op::CreateLink { link, .. } if link == &n("ether2")))
