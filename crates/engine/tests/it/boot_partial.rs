@@ -80,7 +80,13 @@ struct Booted {
 impl Booted {
     fn addresses(&self) -> Vec<String> {
         let seen = self.seen.lock().unwrap();
-        let mut a: Vec<String> = seen.applied.ip.addresses.iter().map(|a| a.address.to_string()).collect();
+        let mut a: Vec<String> = seen
+            .applied
+            .ip
+            .addresses
+            .iter()
+            .map(|a| a.address.to_string())
+            .collect();
         a.sort();
         a
     }
@@ -94,7 +100,11 @@ impl Booted {
         let st = self.s.inspect(None).unwrap();
         st["storage"]["boot_apply_failed"]
             .as_array()
-            .map(|a| a.iter().map(|f| f["section"].as_str().unwrap().to_owned()).collect())
+            .map(|a| {
+                a.iter()
+                    .map(|f| f["section"].as_str().unwrap().to_owned())
+                    .collect()
+            })
             .unwrap_or_default()
     }
     fn error(&self) -> Value {
@@ -102,7 +112,12 @@ impl Booted {
     }
     fn check(&mut self, key: &str) -> Option<Value> {
         let v = self.s.execute("system.health.check", &json!({})).unwrap();
-        v["checks"].as_array().unwrap().iter().find(|c| c["key"] == key).cloned()
+        v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["key"] == key)
+            .cloned()
     }
 }
 
@@ -112,9 +127,18 @@ fn boot(refuse: Refuse) -> Booted {
     let storage = MemoryStorage::default();
     let mut s = Session::with_storage(Box::new(VirtualHal::default()), Box::new(storage.clone()));
     for (id, p) in [
-        ("ip.address.add", json!({"address": "10.0.0.1/24", "interface": "ether1"})),
-        ("ip.route.add", json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.0.254"})),
-        ("ip.firewall.filter.add", json!({"action": "drop", "chain": "forward"})),
+        (
+            "ip.address.add",
+            json!({"address": "10.0.0.1/24", "interface": "ether1"}),
+        ),
+        (
+            "ip.route.add",
+            json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.0.254"}),
+        ),
+        (
+            "ip.firewall.filter.add",
+            json!({"action": "drop", "chain": "forward"}),
+        ),
         ("mpls.interface.add", json!({"interface": "all"})),
     ] {
         s.execute(id, &p).unwrap();
@@ -157,16 +181,28 @@ fn management_comes_up_with_the_firewall_refused() {
     assert_eq!(b.addresses(), ["10.0.0.1/24"], "management address applied");
     assert_eq!(b.applied(|c| c.ip.routes.len()), 1, "routes applied");
     assert!(b.applied(mpls_on), "MPLS applied");
-    assert!(b.applied(|c| c.ip.firewall.filter.is_empty()), "the firewall stays out");
+    assert!(
+        b.applied(|c| c.ip.firewall.filter.is_empty()),
+        "the firewall stays out"
+    );
     assert_eq!(b.failed(), ["firewall"]);
     let err = b.error();
     assert!(err.as_str().unwrap().starts_with("firewall: "), "{err}");
-    assert!(err.as_str().unwrap().contains("Could not process rule"), "{err}");
+    assert!(
+        err.as_str().unwrap().contains("Could not process rule"),
+        "{err}"
+    );
     // Health: an error, with the section and the kernel's reason.
     let c = b.check("boot.apply").unwrap();
     assert_eq!(c["severity"], "error");
     assert_eq!(c["value"], "firewall");
-    assert!(c["reason"].as_str().unwrap().contains("Could not process rule"), "{c}");
+    assert!(
+        c["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Could not process rule"),
+        "{c}"
+    );
     // Every client warns at login.
     let me = whoami(&b.s, &Principal::Local, "test");
     assert_eq!(me["boot_errors"][0]["section"], "firewall");
@@ -180,7 +216,11 @@ fn a_refused_route_leaves_the_addresses_and_the_rest_up() {
     });
     assert_eq!(b.addresses(), ["10.0.0.1/24"]);
     assert!(b.applied(|c| c.ip.routes.is_empty()));
-    assert_eq!(b.applied(|c| c.ip.firewall.filter.len()), 1, "the firewall is in");
+    assert_eq!(
+        b.applied(|c| c.ip.firewall.filter.len()),
+        1,
+        "the firewall is in"
+    );
     assert!(b.applied(mpls_on));
     assert_eq!(b.failed(), ["routes"]);
 }
@@ -226,7 +266,11 @@ fn retries_back_off() {
     // apply (only the firewall: the rest is in).
     assert_eq!(b.tries() - after_boot, 7);
     assert_eq!(b.failed(), ["firewall"]);
-    assert_eq!(b.addresses(), ["10.0.0.1/24"], "management stays up across retries");
+    assert_eq!(
+        b.addresses(),
+        ["10.0.0.1/24"],
+        "management stays up across retries"
+    );
 }
 
 #[test]
@@ -242,7 +286,11 @@ fn the_section_goes_in_once_the_kernel_takes_it() {
     assert_eq!(b.applied(|c| c.ip.firewall.filter.len()), 1);
     assert!(b.error().is_null());
     assert!(b.check("boot.apply").is_none());
-    assert!(whoami(&b.s, &Principal::Local, "test").get("boot_errors").is_none());
+    assert!(
+        whoami(&b.s, &Principal::Local, "test")
+            .get("boot_errors")
+            .is_none()
+    );
 }
 
 /// A commit elsewhere works and leaves the refused section out; it does
@@ -283,8 +331,18 @@ fn a_commit_on_the_refused_section_is_all_or_nothing() {
     assert_eq!(*b.s.store().running(), before);
     assert_eq!(b.failed(), ["firewall"]);
     // The operator removes the rule the kernel refuses: the section is in.
-    let id = b.s.store().running().ip.firewall.filter.first().unwrap().id.to_string();
-    b.s.execute("ip.firewall.filter.remove", &json!({"id": id})).unwrap();
+    let id =
+        b.s.store()
+            .running()
+            .ip
+            .firewall
+            .filter
+            .first()
+            .unwrap()
+            .id
+            .to_string();
+    b.s.execute("ip.firewall.filter.remove", &json!({"id": id}))
+        .unwrap();
     assert!(b.failed().is_empty());
     assert!(b.error().is_null());
     assert_eq!(b.addresses(), ["10.0.0.1/24"]);

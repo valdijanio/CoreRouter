@@ -133,7 +133,13 @@ fn management_comes_up_when_a_route_is_refused_at_boot() {
     ip(
         None,
         &[
-            "route", "add", "198.51.100.0/24", "via", "10.30.0.254", "metric", &metric,
+            "route",
+            "add",
+            "198.51.100.0/24",
+            "via",
+            "10.30.0.254",
+            "metric",
+            &metric,
         ],
     );
     assert!(!ip_out(&["-br", "addr", "show", "dev", "eth0"]).contains("10.13.0.1"));
@@ -158,7 +164,13 @@ fn management_comes_up_when_a_route_is_refused_at_boot() {
         .unwrap_or_else(|| panic!("no boot.apply check: {checks}"));
     assert_eq!(c["severity"], "error", "{c}");
     assert_eq!(c["value"], "routes", "{c}");
-    assert!(c["reason"].as_str().unwrap().contains("refusing to replace"), "{c}");
+    assert!(
+        c["reason"]
+            .as_str()
+            .unwrap()
+            .contains("refusing to replace"),
+        "{c}"
+    );
     assert_eq!(whoami()["boot_errors"][0]["section"], "routes");
     // The firewall, after the routes, went in.
     let nft = Command::new("nft")
@@ -168,7 +180,10 @@ fn management_comes_up_when_a_route_is_refused_at_boot() {
         && out.status.success()
     {
         let t = String::from_utf8_lossy(&out.stdout);
-        assert!(t.contains("chain filter_forward") && t.contains("drop"), "firewall applied: {t}");
+        assert!(
+            t.contains("chain filter_forward") && t.contains("drop"),
+            "firewall applied: {t}"
+        );
     }
     // A commit elsewhere still works.
     run(
@@ -181,7 +196,13 @@ fn management_comes_up_when_a_route_is_refused_at_boot() {
     ip(
         None,
         &[
-            "route", "del", "198.51.100.0/24", "via", "10.30.0.254", "metric", &metric,
+            "route",
+            "del",
+            "198.51.100.0/24",
+            "via",
+            "10.30.0.254",
+            "metric",
+            &metric,
         ],
     );
     wait_for("the route on a retry", || {
