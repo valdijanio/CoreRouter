@@ -2843,3 +2843,24 @@ depois da importação, 483 MiB depois de três listas seguidas e de duas ao mes
 Em processo (`cargo bench -p corerouter-engine --bench scale -- ip.route.list`, `Value`
 montado das `Row`): 10 000 rotas 67,5 → 48,8 ms (−17 %, p < 0,05); 1 000 rotas 6,0 → 3,5 ms
 (sem diferença estatística).
+
+### G0.31i — uma rota mudada entre 60 000 no kernel (**medido**, 2026-10-29)
+
+Host carregado (load 25–30), release, namespace descartável sem root.
+
+HAL (`netns_apply`, grupo `hal_linux_apply_one_of_60000`, `--save-baseline antes` na `main`):
+
+| commit | `main` | G0.31i |
+|---|---|---|
+| distância de uma rota | 68,5 ms | 0,214 ms (−99,7 %) |
+| uma rota nova | 0,519 ms | 0,173 ms (−67 %) |
+| comentário (nada no kernel) | 0,148 ms | 0,124 ms (−16 %) |
+
+Daemon `--backend linux --manage ether1` (dummy), 60 000 rotas por `engine.batch`, 20
+`ip.route.set`/`add` pelo canal de controle, mediana (mín–máx):
+
+| | `main` | G0.31i |
+|---|---|---|
+| `ip.route.set` distância | 72,4 ms (58,9–127) | 3,6 ms (3,1–18,2) |
+| `ip.route.set` comentário | 3,5 ms | 3,5 ms |
+| `ip.route.add` | 3,5 ms | 3,5 ms |
