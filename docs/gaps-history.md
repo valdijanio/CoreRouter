@@ -292,3 +292,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-30 — G3.9da feito (ICMP too big em LSP e taxa de ICMP por origem)
 - 2026-10-30 — G1.3b feito (porta ausente não derruba o `apply`; flag `invalid`; reaplica na volta)
 - 2026-10-30 — G3.9db em revisão (tap MPLS em eBPF)
+- 2026-10-30 — G1.29f criado e feito (placa USB que volta do reset com o nome do kernel: causa, diagnóstico e mensagens do PID 1 no log)
