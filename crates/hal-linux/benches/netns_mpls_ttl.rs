@@ -14,7 +14,10 @@
 //! swapped to 200 and leave by dummy `to`, whose `tx_packets` count them.
 //! Three cases: no tap; one MPLS tap **bound** to `tb`, as the responder
 //! had them before G3.9d (the kernel then clones every frame for
-//! `mpls_rcv`); the responder's taps now (unbound, ahead of `mpls_rcv`).
+//! `mpls_rcv`); the responder's taps now (unbound, ahead of `mpls_rcv`);
+//! and those with `icmp-too-big` on (G3.9da: the MPLS filter also checks
+//! the frame length against the smallest way out, 1500 here, so these
+//! frames still all pass by).
 //! Needs `mpls_router` (the lab VM: `cargo xtask vm-lab run`); without it,
 //! skips.
 
@@ -237,6 +240,10 @@ mod linux {
         let mut r = HostResponder::open().unwrap();
         assert!(r.set_interfaces(&["tb".parse().unwrap()]).is_empty());
         g.bench_function("mpls64/responder taps (unbound)", |b| {
+            b.iter_custom(|iters| (0..iters).map(|_| lab.burst(BURST).0).sum())
+        });
+        r.hear_too_big(true);
+        g.bench_function("mpls64/responder taps with icmp-too-big (G3.9da)", |b| {
             b.iter_custom(|iters| (0..iters).map(|_| lab.burst(BURST).0).sum())
         });
         g.finish();

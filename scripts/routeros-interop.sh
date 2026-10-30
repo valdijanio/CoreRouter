@@ -3,7 +3,7 @@
 # RouterOS v7 CHR. Runs as root inside the lab VM only:
 #   cargo xtask vm-lab run -- scripts/routeros-interop.sh [case…]
 # Cases (default: all, in this order): ospf-ptp ospf-broadcast ospf-auth
-#   ospf-mtu ospf-areas redistribute entry ldp mpls-ttl bfd exit failover
+#   ospf-mtu ospf-areas redistribute entry ldp mpls-ttl mpls-mtu bfd exit failover
 #   stub-router ospfv3 prod (last: it restarts the CoreRouter on the
 #   docs/producao-core.md blocks)
 # HOLD=<s> keeps the lab up that long at the end (inspect it with
@@ -33,7 +33,7 @@ exec 9>&-
 ROS_VERSION=${ROS_VERSION:-7.25}
 ROS_SHA256=${ROS_SHA256:-6b981288350de2a2c7a3218bd820ab702633b8cd6cd339f2bb34dda1f1a2550e}
 CASES=("$@")
-[ ${#CASES[@]} -gt 0 ] || CASES=(ospf-ptp ospf-broadcast ospf-auth ospf-mtu ospf-areas redistribute entry ldp mpls-ttl bfd exit failover stub-router ospfv3 prod)
+[ ${#CASES[@]} -gt 0 ] || CASES=(ospf-ptp ospf-broadcast ospf-auth ospf-mtu ospf-areas redistribute entry ldp mpls-ttl mpls-mtu bfd exit failover stub-router ospfv3 prod)
 W=/tmp/crg39
 CHR_DIR=/srv/lab/chr
 PW=g39-lab-only
@@ -685,6 +685,60 @@ case_mpls-ttl() {
   result mpls-ttl INFO "CR icmp_counters: $(cli mpls.settings.get | jq -c .icmp_counters)"
   [ "$(cli mpls.settings.get | jq '.icmp_counters.sent // 0')" -ge 2 ] \
     && result mpls-ttl OK "the CoreRouter counted its errors" || result mpls-ttl FAIL "icmp_counters.sent < 2"
+}
+
+# G3.9da: Path MTU Discovery through the LSP. With the CoreRouter—R4 link
+# at 1400, a 1450-octet DF packet from R3 reaches the CoreRouter labeled
+# (CHR pushed the CoreRouter's label for R4) and does not fit when popped:
+# the kernel drops it silently. Our responder sends fragmentation needed
+# with MTU 1400 (one label in, none out).
+ros_ping() { # ros_ping <dst> <src> <size>: DF pings from the CHR, as JSON
+  jq -n --arg a "$1" --arg s "$2" --arg z "$3" '{address: $a, "src-address": $s, count: "2", size: $z, "do-not-fragment": "", interval: "300ms"}' |
+    curl -s -m 30 -u "admin:$PW" -H 'content-type: application/json' -d @- "http://$ROS/rest/ping"
+}
+r3_ping() { # r3_ping <size>: DF ping R3 → R4 (payload size)
+  ip netns exec crr3 ping -c 3 -i 0.3 -W 1 -M do -s "$1" -I 10.255.39.3 10.255.39.4 2>&1 || true
+}
+case_mpls-mtu() {
+  ldp_up
+  wait_for 90 ldp_ok >/dev/null || { result mpls-mtu FAIL "LDP: CR '$(cr_ldp)' CHR '$(ros_ldp)'"; return; }
+  wait_for 40 mpls_routes >/dev/null || true
+  sleep 3
+  ip -n crr4 link set eth0 mtu 1400
+  cli interface.set '{"name":"ether2","mtu":1400}' >/dev/null
+  ip -n crr3 route flush cache 2>/dev/null || true
+  # Before: the Linux forwarder alone.
+  cli mpls.settings.set '{"icmp_too_big":false}' >/dev/null
+  sleep 3
+  local p; p=$(r3_ping 1422)
+  result mpls-mtu INFO "icmp_too_big=no, R3 1450-octet DF ping: $(tail -2 <<< "$p" | tr '\n' ' ')"
+  grep -q 'Frag needed' <<< "$p" && result mpls-mtu INFO "answered without the setting: $(grep -m1 'Frag needed' <<< "$p")" \
+    || result mpls-mtu OK "without the setting the 1450-octet DF ping vanishes (PMTUD black hole)"
+  # After.
+  cli mpls.settings.set '{"icmp_too_big":true}' >/dev/null
+  sleep 3
+  ip -n crr3 route flush cache 2>/dev/null || true
+  p=$(r3_ping 1422)
+  local f; f=$(grep -m1 'Frag needed' <<< "$p" || true)
+  # RFC 3032 §3.4: 1400 minus the one label that came (the CoreRouter pops).
+  [[ $f == *10.39.1.2*"mtu = 1396"* ]] && result mpls-mtu OK "R3 gets fragmentation needed from the CoreRouter: $f" \
+    || result mpls-mtu FAIL "R3, no fragmentation needed with mtu 1396: $(head -4 <<< "$p" | tr '\n' ' ')"
+  result mpls-mtu INFO "R3 route to R4: $(ip -n crr3 route get 10.255.39.4 | head -1)"
+  # R3 is the ingress: Linux takes its own label (4) off the learned 1396.
+  r3_ping 1364 | grep -q ' 0% packet loss' && result mpls-mtu OK "1392-octet DF packets now cross the LSP" \
+    || result mpls-mtu FAIL "1392-octet DF ping R3 → R4 lost"
+  # The CHR's own ping (RouterOS shows how it reads the error).
+  local rp; rp=$(ros_ping 10.255.39.4 10.255.39.1 1450)
+  echo "$rp" > "$W/ros-ping-mtu.json"
+  result mpls-mtu INFO "CHR 1450-octet DF ping: $(jq -c '[.[] | {host, status, size}]' <<< "$rp" 2>/dev/null | head -c 300)"
+  grep -qi 'fragment\|too large\|mtu' <<< "$rp" && result mpls-mtu OK "the CHR's ping reports the too-big error" \
+    || result mpls-mtu INFO "the CHR's ping shows no too-big status"
+  sleep 2 # the counters reach the session once a second
+  result mpls-mtu INFO "CR icmp_counters: $(cli mpls.settings.get | jq -c .icmp_counters)"
+  [ "$(cli mpls.settings.get | jq '.icmp_counters.too_big_sent // 0')" -ge 1 ] \
+    && result mpls-mtu OK "the CoreRouter counted its too-big errors" || result mpls-mtu FAIL "icmp_counters.too_big_sent < 1"
+  cli interface.set '{"name":"ether2","mtu":1500}' >/dev/null
+  ip -n crr4 link set eth0 mtu 1500
 }
 
 bfd_on=0

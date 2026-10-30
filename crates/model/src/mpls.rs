@@ -141,15 +141,29 @@ pub struct MplsSettings {
     /// drops it silently and traceroute shows `*`. On by default, as on
     /// RouterOS, Cisco and Junos.
     pub icmp_ttl_exceeded: bool,
-    /// Those errors per second at most; the rest are dropped and counted.
+    /// ICMP errors per second at most (time exceeded and too big, from
+    /// all sources); the rest are dropped and counted.
     pub icmp_rate: u32,
+    /// Those errors per second to one source at most (G3.9da, like Linux's
+    /// per-peer `icmp_ratelimit`): a flood from one host does not use up
+    /// [`MplsSettings::icmp_rate`] for everyone else.
+    pub icmp_rate_per_source: u32,
+    /// Send ICMP "fragmentation needed" / ICMPv6 "packet too big" for a
+    /// labeled packet larger than the MTU of its way out (G3.9da, RFC
+    /// 3032 §3.4–3.5): the Linux forwarder drops it silently and Path MTU
+    /// Discovery through the LSP black-holes. On by default.
+    pub icmp_too_big: bool,
 }
 
 /// Default of [`MplsSettings::lsp_ping_rate`] (replies per second).
 pub const DEFAULT_LSP_PING_RATE: u32 = 100;
 /// Default of [`MplsSettings::icmp_rate`] (errors per second).
 pub const DEFAULT_ICMP_RATE: u32 = 100;
-/// Highest [`MplsSettings::icmp_rate`].
+/// Default of [`MplsSettings::icmp_rate_per_source`] (errors per second
+/// and source; a traceroute needs 3 per hop).
+pub const DEFAULT_ICMP_RATE_PER_SOURCE: u32 = 10;
+/// Highest [`MplsSettings::icmp_rate`] and
+/// [`MplsSettings::icmp_rate_per_source`].
 pub const MAX_ICMP_RATE: u32 = 10_000;
 /// Highest [`MplsSettings::lsp_ping_rate`].
 pub const MAX_LSP_PING_RATE: u32 = 10_000;
@@ -164,6 +178,8 @@ impl Default for MplsSettings {
             lsp_ping_rate: DEFAULT_LSP_PING_RATE,
             icmp_ttl_exceeded: true,
             icmp_rate: DEFAULT_ICMP_RATE,
+            icmp_rate_per_source: DEFAULT_ICMP_RATE_PER_SOURCE,
+            icmp_too_big: true,
         }
     }
 }
