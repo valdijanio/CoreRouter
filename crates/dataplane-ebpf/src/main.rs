@@ -37,8 +37,8 @@ use aya_ebpf::bindings::{
     bpf_fib_lookup__bindgen_ty_4, bpf_fib_lookup__bindgen_ty_5, xdp_action,
 };
 use aya_ebpf::helpers::{
-    bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect, bpf_skb_change_head, bpf_skb_set_tstamp,
-    bpf_xdp_adjust_head,
+    bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect, bpf_skb_change_head, bpf_skb_load_bytes,
+    bpf_skb_set_tstamp, bpf_xdp_adjust_head,
 };
 use aya_ebpf::macros::{classifier, map, xdp};
 use aya_ebpf::maps::lpm_trie::Key;
@@ -1354,11 +1354,28 @@ fn tap_copy<const N: usize>(ctx: &TcContext, ifindex: u32, len: u32, want: usize
     let Some(mut r) = LSP_TAP.reserve_bytes(lsp_tap::HEADER + N, 0) else {
         return false;
     };
-    let n = r
+    // At least one octet: the verifier refuses a load that may be empty.
+    // `black_box`: LLVM would drop the bound it proved elsewhere and reload
+    // the length from the context, where the verifier no longer has it.
+    // The helper itself, not `TcContext::load_bytes`: that one caps the
+    // length again by `skb->len`, reloaded with no lower bound.
+    let take = core::hint::black_box(want).clamp(1, N);
+    let n = match r
         .get_mut(lsp_tap::HEADER..)
-        .and_then(|d| d.get_mut(..want.min(N)))
-        .and_then(|d| ctx.load_bytes(0, d).ok())
-        .unwrap_or(0) as u32;
+        .and_then(|d| d.get_mut(..take))
+    {
+        Some(d) => {
+            // SAFETY: `d` is `take` writable octets of the record this
+            // program reserved (1 ≤ take ≤ N, the slice checked it); the
+            // helper writes at most `take` there and fails, writing
+            // nothing we read, past the end of the packet.
+            let ret = unsafe {
+                bpf_skb_load_bytes(ctx.skb.skb.cast(), 0, d.as_mut_ptr().cast(), take as u32)
+            };
+            if ret == 0 { take as u32 } else { 0 }
+        }
+        None => 0,
+    };
     let mut head = [0u8; lsp_tap::HEADER];
     for (i, w) in [ifindex, len, n].into_iter().enumerate() {
         if let Some(d) = head.get_mut(i * 4..i * 4 + 4) {

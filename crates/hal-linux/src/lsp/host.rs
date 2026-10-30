@@ -100,11 +100,15 @@ impl Links {
                 e.addrs.push(IpAddr::V6(v6.ip()));
             }
         }
-        for (name, l) in &mut by_name {
-            l.mtu = std::fs::read_to_string(format!("/sys/class/net/{name}/mtu"))
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .map(|m| u16::try_from(m).unwrap_or(u16::MAX));
+        // By netlink, not sysfs: `/sys` shows the namespace that mounted
+        // it, not the one this thread is in (a responder moved by `setns`).
+        let mtus: HashMap<u32, u32> = crate::netlink::links()
+            .map(|all| all.into_iter().map(|l| (l.index, l.mtu)).collect())
+            .unwrap_or_default();
+        for l in by_name.values_mut() {
+            l.mtu = mtus
+                .get(&l.index)
+                .map(|m| u16::try_from(*m).unwrap_or(u16::MAX));
         }
         self.by_index = by_name.iter().map(|(n, l)| (l.index, n.clone())).collect();
         self.by_name = by_name;
@@ -802,7 +806,7 @@ impl HostResponder {
     /// Which tap hears frames now: `tc` (G3.9db), `packet` with why the tc
     /// one is not used, or `none` before an interface is listened on.
     pub fn tap_kind(&self) -> String {
-        match (&self.taps, &self.fallback) {
+        let kind = match (&self.taps, &self.fallback) {
             (Some(Taps::Ebpf(t)), _) => {
                 let (kept, full) = t.stats();
                 format!("tc ({kept} copied, {full} lost to a full ring)")
@@ -810,6 +814,10 @@ impl HostResponder {
             (Some(Taps::Packet(_)), Some(why)) => format!("packet ({why})"),
             (Some(Taps::Packet(_)), None) => "packet".to_owned(),
             (None, _) => "none".to_owned(),
+        };
+        match self.big {
+            Some(b) => format!("{kind}, too big above {b} octets"),
+            None => kind,
         }
     }
 

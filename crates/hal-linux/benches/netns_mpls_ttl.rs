@@ -252,7 +252,8 @@ mod linux {
         });
         drop(r);
         let mut r = HostResponder::open().unwrap().with_tap(TapChoice::Ebpf);
-        if r.set_interfaces(&["tb".parse().unwrap()]).is_empty() {
+        let failed = r.set_interfaces(&["tb".parse().unwrap()]);
+        if failed.is_empty() {
             eprintln!("tap: {}", r.tap_kind());
             g.bench_function("mpls64/tc tap (G3.9db)", |b| {
                 b.iter_custom(|iters| (0..iters).map(|_| lab.burst(BURST).0).sum())
@@ -263,7 +264,7 @@ mod linux {
             });
             eprintln!("tap: {}", r.tap_kind());
         } else {
-            eprintln!("skipped the tc cases: {}", r.tap_kind());
+            eprintln!("skipped the tc cases: {failed:?}");
         }
         drop(r);
         g.bench_function("mpls64/no taps (again, the drift of the round)", |b| {

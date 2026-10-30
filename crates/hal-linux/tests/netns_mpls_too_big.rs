@@ -276,6 +276,9 @@ fn lab() -> Lab {
     cr3.ip(&[
         "-f", "mpls", "route", "add", "201", "via", "inet6", B6, "dev", "me3",
     ]);
+    // CR2's way to B by IP: rp_filter drops B's answers on md2 without it.
+    cr2.ip(&["route", "add", "10.74.0.0/24", "via", "10.73.0.2"]);
+    cr2.ip(&["-6", "route", "add", "fd74::/64", "via", "fd73::2"]);
     // Back to A by IP.
     for (ns, v4, v6) in [
         (&cr2, "10.72.0.1", "fd72::1"),
@@ -300,6 +303,7 @@ struct Done {
     expired_sent: u64,
     refused: u64,
     last_err: Option<String>,
+    tap: String,
 }
 
 /// The responder in CR2's namespace on `mc2`, behind the limits the
@@ -350,7 +354,8 @@ fn responder(
                     Err(why) => done.last_err = Some(why.to_owned()),
                 }
             }
-            eprintln!("tap: {}", r.tap_kind());
+            done.tap = r.tap_kind();
+            eprintln!("tap: {}", done.tap);
             done
         })
         .unwrap();
@@ -424,7 +429,13 @@ fn path_mtu(dst: &str, from: &str, base: u16) {
     let r = tries(sock.as_mut(), dst, base + 20, 1450);
     stop.store(true, Ordering::Relaxed);
     let done = worker.join().unwrap();
-    let r = r.unwrap_or_else(|| panic!("no ICMP from CR2: {done:?}"));
+    let r = r.unwrap_or_else(|| {
+        panic!(
+            "no ICMP from CR2: {done:?}\n{}{}",
+            lab.cr2.ip(&["-f", "mpls", "route"]),
+            lab.cr2.ip(&["-br", "link"])
+        )
+    });
     // RFC 3032 §3.4–3.5: 1400 minus the one label that leaves.
     assert_eq!(r.kind, ReplyKind::TooBig { mtu: Some(1396) }, "{done:?}");
     assert_eq!(
@@ -500,8 +511,11 @@ fn traced_under_flood(per_source: u32, pps: u32) -> (usize, Done) {
     };
     thread::sleep(Duration::from_millis(300));
     let mut trace = prober.open(&opts(Some("10.71.0.3"))).unwrap();
+    // 5 probes a second, under the tracer's own 10/s (a traceroute sends
+    // three a hop); back to back, its own bucket would refuse some.
     let answered = (0..20u16)
         .filter(|i| {
+            let at = Instant::now();
             let r = probe(
                 trace.as_mut(),
                 B4,
@@ -510,6 +524,7 @@ fn traced_under_flood(per_source: u32, pps: u32) -> (usize, Done) {
                 64,
                 Duration::from_millis(100),
             );
+            thread::sleep(Duration::from_millis(200).saturating_sub(at.elapsed()));
             r.is_some_and(|r| r.kind == ReplyKind::TtlExceeded)
         })
         .count();

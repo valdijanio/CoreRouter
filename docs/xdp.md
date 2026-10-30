@@ -198,9 +198,15 @@ Tap do respondedor de LSP ping (G3.9db, `docs/mpls.md`):
 
 36. `tap_stat`: incremento da cópia desta CPU de `LSP_TAP_STATS` (tc roda sem migração).
 37. `lsp_tap`: leitura de `ifindex` e `gso_size` do próprio `__sk_buff`.
+38. `tap_copy`: `bpf_skb_load_bytes` do início do quadro para a fatia de `take` octetos da
+    reserva (1 ≤ `take` ≤ tamanho da reserva, conferido pela fatia). O `TcContext::load_bytes`
+    seguro não passa no verificador aqui: ele limita o tamanho de novo por `skb->len`, relido do
+    contexto sem limite inferior, e o verificador recusa uma leitura que pode ter 0 octetos
+    (`R4 invalid zero-sized read`, medido no kernel 6.18 do laboratório). Além da fatia, o
+    kernel confere o fim do pacote e devolve erro sem escrever além dele.
 
-A reserva no ring buffer (`reserve_bytes`, tamanho constante), a cópia do quadro
-(`load_bytes`, tamanho limitado ao da reserva) e o `submit` usam a API segura do `aya-ebpf`.
+A reserva no ring buffer (`reserve_bytes`, tamanho constante) e o `submit` usam a API segura do
+`aya-ebpf`.
 
 ## Pesquisa
 
