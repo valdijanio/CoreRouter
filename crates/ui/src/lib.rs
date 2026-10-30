@@ -29,6 +29,9 @@ pub use neighbors::uptime_text;
 pub use prefs::stored_theme;
 pub use windows::Win;
 
+/// The ⓘ of the top bar's other-build chip (G0.32).
+pub(crate) const VERSION_HELP_KEY: &str = "version.other_build";
+
 /// Seconds between automatic refreshes of the live tables.
 const REFRESH_SECS: f64 = 1.0;
 /// Repaint this often while replies are outstanding (a remote router).
@@ -284,6 +287,8 @@ pub struct CoreRouterUi {
     terminal_user: String,
     /// First login without a password: the dialog (G0.3b).
     password_ask: first_login::PasswordAsk,
+    /// The ⓘ of the other-build chip in the top bar (G0.32).
+    version_help: Option<help::HelpView>,
     /// A change the router refused as a lockout, waiting for the
     /// operator's answer (G2.1b).
     lockout: Option<lockout::Held>,
@@ -337,6 +342,7 @@ impl CoreRouterUi {
             terminals: Vec::new(),
             terminal_user: "admin".into(),
             password_ask: first_login::PasswordAsk::default(),
+            version_help: None,
             lockout: None,
             menu: menu::MenuState::default(),
         }
@@ -933,6 +939,7 @@ impl CoreRouterUi {
         self.panel_dialogs(&ctx, area);
         self.terminals(&ctx, area);
         self.password_window(&ctx);
+        help::modal(&ctx, self.lang, &mut self.version_help);
         self.lockout_window(&ctx);
         self.floats.end_frame(&ctx);
         self.stamp_pending(now);
@@ -986,32 +993,99 @@ impl CoreRouterUi {
         !matches!(self.link, Link::Local) && connect::old_router_info(&self.cache.info)
     }
 
-    /// The commit of the daemon this GUI manages, when it differs from the
-    /// GUI's own: a daemon left running after a rebuild (the user tested
-    /// fixes against an old daemon). Local sessions are the GUI itself.
+    /// The version the daemon this GUI manages reports, when it is another
+    /// build than the GUI (G0.32): a daemon left running after a rebuild, or
+    /// a router on an older or newer image. Both versions are shown in full
+    /// (`0.1.0-dev.500+320cb9d`) when only the commit differs. A daemon from
+    /// before G0.32 has no `version_full`: its commit stands in. Local
+    /// sessions are the GUI itself.
     pub fn stale_daemon(&self) -> Option<String> {
-        if matches!(self.link, Link::Local) {
+        if matches!(self.link, Link::Local) || corerouter_buildinfo::COMMIT == "unknown" {
             return None;
         }
-        let theirs = self.cache.info.get("commit").and_then(Value::as_str)?;
-        let ours = corerouter_buildinfo::COMMIT;
-        (theirs != ours && theirs != "unknown" && ours != "unknown").then(|| theirs.to_owned())
+        let info = &self.cache.info;
+        let text = |k: &str| info.get(k).and_then(Value::as_str);
+        let Some(full) = text("version_full") else {
+            let theirs = text("commit")?;
+            return (theirs != corerouter_buildinfo::COMMIT && theirs != "unknown")
+                .then(|| theirs.to_owned());
+        };
+        if full == corerouter_buildinfo::full() || full.ends_with("+unknown") {
+            return None;
+        }
+        match text("version") {
+            Some(v) if v != corerouter_buildinfo::VERSION => Some(v.to_owned()),
+            _ => Some(full.to_owned()),
+        }
     }
 
-    /// The top bar's warning when the daemon was built from another commit.
-    fn stale_daemon_warning(&self, ui: &mut egui::Ui) {
+    /// The daemon speaks another control protocol than this GUI: some
+    /// commands may be misread or refused (red, not amber).
+    pub fn protocol_differs(&self) -> bool {
+        self.cache
+            .info
+            .get("protocol")
+            .and_then(Value::as_u64)
+            .is_some_and(|p| p != u64::from(corerouter_buildinfo::PROTOCOL))
+    }
+
+    /// The top bar's chip when the daemon is another build (G0.32): amber,
+    /// or red when the control protocol differs; the tooltip has both builds
+    /// in full with their commit dates and the ⓘ says what to do.
+    fn stale_daemon_warning(&mut self, ui: &mut egui::Ui) {
         let Some(theirs) = self.stale_daemon() else {
             return;
         };
-        ui.colored_label(
-            ui.visuals().warn_fg_color,
-            format!("daemon {theirs} ≠ GUI {}", corerouter_buildinfo::COMMIT),
-        )
-        .on_hover_text(
-            "The router's daemon was built from another commit than this GUI: fixes may be \
-             missing on one side. Restart it after building (bash plan/hw-lab.sh daemon in the \
-             lab).",
+        let l = self.lang.labels;
+        let ours = if theirs.contains('+') {
+            corerouter_buildinfo::full()
+        } else {
+            corerouter_buildinfo::VERSION.to_owned()
+        };
+        let (kind, title) = if self.protocol_differs() {
+            (chip::Kind::Red, "Control protocol differs")
+        } else {
+            (chip::Kind::Amber, "Another build")
+        };
+        let when = |t: Option<u64>| {
+            t.map_or_else(String::new, |t| {
+                format!(" · {}", corerouter_buildinfo::utc(t))
+            })
+        };
+        let info = &self.cache.info;
+        let theirs_full = info
+            .get("version_full")
+            .and_then(Value::as_str)
+            .map_or_else(|| theirs.clone(), str::to_owned);
+        let tip = format!(
+            "daemon {theirs_full}{}\nGUI {}{}\n\n{}",
+            when(info.get("commit_time").and_then(Value::as_u64)),
+            corerouter_buildinfo::full(),
+            when(corerouter_buildinfo::commit_unix()),
+            i18n::tr_in(
+                "version",
+                l,
+                "The router's daemon is another build than this GUI: fixes may be missing on one side."
+            ),
         );
+        chip::chip(
+            ui,
+            &format!("daemon {theirs} ≠ GUI {ours}"),
+            kind.tone(ui.visuals()),
+        )
+        .on_hover_text(tip);
+        if help::info_button(
+            ui,
+            egui::Id::unique("version-other-build-info"),
+            i18n::tr_in("version", l, title),
+        )
+        .clicked()
+        {
+            self.version_help = Some(help::HelpView::new(
+                VERSION_HELP_KEY,
+                i18n::tr_in("version", l, title),
+            ));
+        }
         ui.separator();
     }
 
@@ -2816,16 +2890,45 @@ mod tests {
     fn a_daemon_built_from_another_commit_is_flagged_in_the_top_bar() {
         let (mut h, _) = Harness::daemon(before_safe_mode());
         let ours = corerouter_buildinfo::COMMIT;
-        h.app.cache.info = json!({"name": "corerouter", "version": "0.1.0", "auth": "required", "commit": "abc1234"});
-        h.idle();
         if ours == "unknown" {
             // Built outside git: nothing to compare.
+            h.app.cache.info = json!({"name": "corerouter", "version": "0.1.0", "auth": "required", "commit": "abc1234"});
+            h.idle();
             assert_eq!(h.app.stale_daemon(), None);
             return;
         }
+        // A daemon from before G0.32: only its commit to compare.
+        h.app.cache.info = json!({"name": "corerouter", "version": "0.1.0", "auth": "required", "commit": "abc1234"});
+        h.idle();
         assert_eq!(h.app.stale_daemon().as_deref(), Some("abc1234"));
-        assert!(h.has_text(&format!("daemon abc1234 ≠ GUI {ours}")));
-        // Same commit: no warning.
+        let v = corerouter_buildinfo::VERSION;
+        assert!(h.has_text(&format!("daemon abc1234 ≠ GUI {v}")));
+        // G0.32: the readable versions, amber while the protocol matches.
+        h.app.cache.info = json!({"name": "corerouter", "version": "0.1.0-dev.1", "version_full": "0.1.0-dev.1+abc1234",
+            "auth": "required", "commit": "abc1234", "protocol": corerouter_buildinfo::PROTOCOL});
+        h.idle();
+        assert_eq!(h.app.stale_daemon().as_deref(), Some("0.1.0-dev.1"));
+        assert!(h.has_text(&format!("daemon 0.1.0-dev.1 ≠ GUI {v}")));
+        assert!(!h.app.protocol_differs());
+        // Same version, other commit: both in full.
+        h.app.cache.info = json!({"name": "corerouter", "version": v, "version_full": format!("{v}+abc1234"),
+            "auth": "required", "commit": "abc1234", "protocol": corerouter_buildinfo::PROTOCOL});
+        h.idle();
+        assert_eq!(h.app.stale_daemon(), Some(format!("{v}+abc1234")));
+        assert!(h.has_text(&format!(
+            "daemon {v}+abc1234 ≠ GUI {}",
+            corerouter_buildinfo::full()
+        )));
+        // Another control protocol: red.
+        h.app.cache.info = json!({"name": "corerouter", "version": "0.2.0", "version_full": "0.2.0+abc1234",
+            "auth": "required", "commit": "abc1234", "protocol": corerouter_buildinfo::PROTOCOL + 1});
+        h.idle();
+        assert!(h.app.protocol_differs());
+        // The same build: no warning.
+        h.app.cache.info = json!({"name": "corerouter", "version": v, "version_full": corerouter_buildinfo::full(),
+            "auth": "required", "commit": ours, "protocol": corerouter_buildinfo::PROTOCOL});
+        h.idle();
+        assert_eq!(h.app.stale_daemon(), None);
         h.app.cache.info =
             json!({"name": "corerouter", "version": "0.1.0", "auth": "required", "commit": ours});
         h.idle();

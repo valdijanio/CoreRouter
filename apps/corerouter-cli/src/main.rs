@@ -106,6 +106,10 @@ fn real_main() -> Result<(), String> {
                 fingerprint = Some(args.next().ok_or("--fingerprint needs SHA256:...")?);
             }
             "-h" | "--help" => return Err(USAGE.into()),
+            "-V" | "--version" => {
+                println!("{}", corerouter_buildinfo::version_line("corerouter-cli"));
+                return Ok(());
+            }
             _ => pos.push(a),
         }
     }

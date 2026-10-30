@@ -220,6 +220,27 @@ fn workspace_version(root: &Path) -> String {
         .unwrap_or_else(|| "0.0.0".into())
 }
 
+/// G0.32: a development image's version, `0.1.0-dev.<N>` (N = commits on
+/// HEAD), the same the daemon inside it reports (`corerouter-buildinfo`).
+/// A release passes the tag's version instead.
+fn dev_version(root: &Path) -> String {
+    let n = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-list", "--count", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
+        .unwrap_or(0);
+    format!("{}-dev.{n}", workspace_version(root))
+}
+
 /// The commit time of HEAD: orders package versions (`build`), reproducible.
 fn git_time(root: &Path) -> u64 {
     Command::new("git")
@@ -713,7 +734,7 @@ pub(crate) fn build_with(
         ),
         (
             "CR_SEAL_VERSION",
-            release.map_or_else(|| workspace_version(root), |r| r.version.clone()),
+            release.map_or_else(|| dev_version(root), |r| r.version.clone()),
         ),
         ("CR_SEAL_BUILD", git_time(root).to_string()),
         ("CR_SEAL_CHANNEL", channel.clone()),

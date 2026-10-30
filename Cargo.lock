@@ -1131,6 +1131,7 @@ name = "corerouter-cli"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "corerouter-buildinfo",
  "corerouter-control",
  "corerouter-engine",
  "corerouter-mcp",
@@ -1166,6 +1167,7 @@ name = "corerouter-daemon"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "corerouter-buildinfo",
  "corerouter-control",
  "corerouter-discovery",
  "corerouter-engine",

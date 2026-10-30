@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+corerouter-buildinfo.workspace = true
 corerouter-engine.workspace = true
 corerouter-control.workspace = true
 corerouter-mcp.workspace = true

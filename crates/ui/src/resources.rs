@@ -320,7 +320,15 @@ impl ResourcesPanel {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned();
-        let commit = app.cache.info.get("commit").and_then(Value::as_str).unwrap_or("").to_owned();
+        // G0.32: the readable version; commit and date in the tooltip.
+        let info = &app.cache.info;
+        let version = info.get("version").and_then(Value::as_str).unwrap_or("").to_owned();
+        let built = {
+            let full = info.get("version_full").and_then(Value::as_str);
+            let commit = info.get("commit").and_then(Value::as_str);
+            let when = info.get("commit_time").and_then(Value::as_u64).map(corerouter_buildinfo::utc);
+            [full.or(commit).map(str::to_owned), when].into_iter().flatten().collect::<Vec<_>>().join(" · ")
+        };
         let uptime = self.print.as_ref().and_then(|p| p.get("uptime_secs")).and_then(Value::as_u64);
         let (st, warnings, errors) = status(self.check.as_ref());
         let st = st.to_owned();
@@ -329,9 +337,13 @@ impl ResourcesPanel {
             self.info(ui, l, "health", "Health");
             ui.separator();
             ui.strong(identity);
-            if !commit.is_empty() {
+            if !version.is_empty() {
                 ui.separator();
-                ui.weak(format!("CoreRouter {commit}"));
+                let r = ui.weak(format!("CoreRouter {version}"));
+                if !built.is_empty() {
+                    r.on_hover_text(built);
+                }
+                self.info(ui, l, "version", "Version");
             }
             if let Some(u) = uptime {
                 ui.separator();
