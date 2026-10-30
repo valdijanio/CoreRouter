@@ -15,6 +15,44 @@ The connection's name; FRR gets it as the neighbor's description, which is how a
 The neighbor's address (RouterOS `remote.address`), IPv4 or IPv6. One connection per address in an instance."##),
     (r##"bgp.instance.asn"##, r##"## What it is
 Our AS, asplain or asdot, 4-byte (RFC 6793). Reserved values are refused."##),
+    (r##"bgp.instance.disabled"##, r##"## What it is
+A disabled instance stops: bgpd closes every session of its connections (Cease, administrative shutdown) and their routes are withdrawn. The instance and its connections stay in the config.
+
+## Careful
+The preview says how many sessions stop."##),
+    (r##"bgp.instance.graceful_defer_time"##, r##"## What it is
+After our `bgpd` starts, how long the best-path selection waits for the End-of-RIB of the neighbors that announce graceful restart before installing and announcing routes (RFC 4724 §4.1; FRR `select-defer-time`). 0..3600 s; empty: 10 s (FRR's own 360 s held the routes of a RouterOS neighbor out of the kernel for 120 s, measured).
+
+## Careful
+A neighbor that never sends End-of-RIB (RouterOS 7.25; the health check `bgp.end-of-rib` names it) holds back its routes for the whole time after every `bgpd` start. 0 does not wait: routes may change while the neighbors resend their tables."##),
+    (r##"bgp.instance.graceful_notification"##, r##"## What it is
+The N bit of the graceful-restart capability (RFC 8538 §2). With it on both sides, a NOTIFICATION or a hold timer expiry is handled as a restart: the neighbor's routes stay (stale) for its Restart Time; only a Hard Reset (Cease 9, and in FRR also Maximum Prefixes, Shutdown, De-configured and BFD Down) drops them at once. On by default (FRR since 8.3).
+
+## Careful
+A silent failure (power, cut link) of a restarting neighbor then keeps its routes for the hold time plus the Restart Time. Use BFD on those connections (a BFD down is a Hard Reset); the preview and the health check `bgp.gr-bfd` warn. Off: a hold expiry or a NOTIFICATION drops the routes as before RFC 8538. RouterOS 7.25 does not document RFC 8538."##),
+    (r##"bgp.instance.graceful_restart_time"##, r##"## What it is
+The Restart Time we announce in the graceful-restart capability (RFC 4724 §3): how long the neighbor keeps our routes (stale) after our `bgpd` dies, waiting for it to come back. Only the connections with Graceful Restart = yes announce it. 1..4095 s (12 bits); empty: 120 s.
+
+## Recommended
+Below the hold time of those connections (RFC 4724 §3; the preview warns). Longer hides a real failure: the neighbor keeps forwarding to a router that will not return.
+
+## Other routers
+FRR `bgp graceful-restart restart-time` (120), Junos `restart-time` (120), Cisco `bgp graceful-restart restart-time` (120). RouterOS 7.25 has no parameter."##),
+    (r##"bgp.instance.graceful_stale_time"##, r##"## What it is
+As a helper: how long we keep the routes of a neighbor that restarted, marked stale, after it comes back and before its End-of-RIB (RFC 4724 §4.2). Stale routes the neighbor did not send again are removed when its End-of-RIB arrives or when this time ends. 1..4095 s; empty: 360 s.
+
+## Careful
+A neighbor that never sends End-of-RIB (RouterOS 7.25) keeps its old routes for the whole time. FRR `bgp graceful-restart stalepath-time`, Junos `stale-routes-time` (300)."##),
+    (r##"bgp.instance.hard_admin_reset"##, r##"## What it is
+Whether an administrative reset (Cease 4: `routing.bgp.session.clear`) goes as a Hard Reset (RFC 8538 §3) and drops the neighbor's routes. On by default. Off: a clear of a neighbor with the N bit is graceful, its routes stay stale until it sends them again (useful to apply a policy without a traffic hole). Shutdown always drops them."##),
+    (r##"bgp.instance.llgr_stale_time"##, r##"## What it is
+Long-Lived Graceful Restart (RFC 9494): after the Restart Time of a graceful restart ends, the neighbor keeps our routes this much longer, marked with the `llgr-stale` community and least preferred, so any live route wins over them. 1..16777215 s (24 bits); empty: off (§5: never on by default). FRR has one value for every address family (the RFC asks for it per AFI/SAFI). It is also the most we keep of a neighbor's routes: FRR keeps the smaller of the neighbor's time and ours, so set it on both sides.
+
+## When to use
+For routes with an alternative, or that are better old than gone (VPN, a default route from two upstreams). Routes tagged `no-llgr` (Routing › Filters, `append bgp-communities no-llgr`) are never kept.
+
+## Careful
+Hop by hop, a stale more-specific route still wins over a live less-specific one (§5): traffic may go to a dead next hop for the whole time. The preview shows the worst case (hold + Restart Time + LLGR). RouterOS 7.25 does not support LLGR: FRR does not send it stale routes (§4.3)."##),
     (r##"bgp.instance.name"##, r##"## What it is
 The instance's name; `default` runs in the main table, another name is a separate FRR view."##),
     (r##"bgp.instance.router_id"##, r##"## What it is
@@ -33,7 +71,7 @@ Graceful restart (RFC 4724) as the restarting speaker: when this router's `bgpd`
 `yes`: announces the restart capability with the F bit (forwarding kept). Empty: helper only (keeps the neighbor's routes when it restarts), FRR's default. `no`: not even that.
 
 ## Mind
-The neighbor must be a helper (RouterOS announces `gr`). The Restart Time should be below the hold time (RFC 4724 §3; the preview warns). The timers are the instance's: `routing.bgp.instance.set` with `graceful_restart_time` and `graceful_stale_time` (1..4095 s) and `graceful_defer_time` (0..3600 s, default 10: how long the best path waits for End-of-RIBs after `bgpd` starts; FRR would use 360 s).
+The neighbor must be a helper (RouterOS announces `gr`). The Restart Time should be below the hold time (RFC 4724 §3; the preview warns). The timers are the instance's (Instances tab, or `routing.bgp.instance.set` with `graceful_restart_time` and `graceful_stale_time` (1..4095 s) and `graceful_defer_time` (0..3600 s, default 10: how long the best path waits for End-of-RIBs after `bgpd` starts; FRR would use 360 s)).
 
 ## With MikroTik
 RouterOS 7.25 announces graceful restart but keeps none of our routes when our `bgpd` dies, and sends no End-of-RIB (measured): no gain on its side. On ours the kernel still keeps its routes."##),
@@ -110,7 +148,7 @@ How long the session has been established."##),
     (r##"bgp.tab.connections"##, r##"## What it is
 The neighbors, as RouterOS `/routing bgp connection`: address, AS, role and the templates each one inherits from. A change goes to FRR as only the lines that changed: the other sessions stay up."##),
     (r##"bgp.tab.instances"##, r##"## What it is
-The local side: our AS (4-byte, RFC 6793) and router id. Connections belong to an instance (`default`)."##),
+Our side: the local AS (4 bytes, RFC 6793), the router id and the graceful-restart timers (RFC 4724). Connections belong to an instance (`default`). Double click edits; the preview says what a change does to the sessions (a new AS or router id resets them)."##),
     (r##"bgp.tab.sessions"##, r##"## What it shows
 The BGP sessions FRR runs now, one per connection, as RouterOS `/routing bgp session` (read-only, live every 2 s): state, uptime, prefixes received and sent, BFD. Select one for its last error, timers, policies, flaps and the actions Refresh, Resend, Clear and Shutdown."##),
     (r##"bgp.tab.templates"##, r##"## What it is

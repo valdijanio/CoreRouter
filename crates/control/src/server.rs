@@ -17,7 +17,9 @@ use corerouter_engine::{Caller, Link};
 
 use crate::auth::Gate;
 use crate::conn::{Slots, Sock, Timeouts, keepalive};
-use crate::dispatch::{Host, dispatch_as, hang_up, new_caller};
+use corerouter_engine::off_lock::Reply;
+
+use crate::dispatch::{Host, dispatch_as, dispatch_reply_as, hang_up, new_caller};
 use crate::tls::{self, ServerStream};
 use crate::wire::{Line, MAX_REQUEST_LINE, read_line_bounded, write_line};
 
@@ -363,8 +365,64 @@ const OPEN_METHODS: &[&str] = &["ping", "server.info"];
 
 /// The reply to one request, and whether its token (or login) was good.
 pub(crate) struct Answer {
-    pub(crate) reply: Value,
+    pub(crate) reply: Body,
     pub(crate) authenticated: bool,
+}
+
+/// A reply line: built, or the result still to be written (G0.31h).
+pub(crate) enum Body {
+    Json(Value),
+    /// `{"id", "ok": true, "result"}` with the result written by `Reply`.
+    Result(Value, corerouter_engine::off_lock::Reply),
+}
+
+impl Body {
+    /// The line, built in memory (WebSocket frames, tests).
+    pub(crate) fn into_text(self) -> String {
+        let mut buf = Vec::new();
+        match self.write_into(&mut buf) {
+            Ok(()) => String::from_utf8(buf).unwrap_or_default(),
+            Err(e) => json!({"id": null, "ok": false, "error": e.to_string()}).to_string(),
+        }
+    }
+
+    /// The line and its `\n` into `w` (unflushed). A result that is
+    /// streamed goes out row by row: a list of 60 000 routes never sits
+    /// whole in memory (G0.31h).
+    fn write_into(self, w: &mut dyn Write) -> io::Result<()> {
+        use corerouter_engine::off_lock::{Reply, WriteError};
+        match self {
+            Self::Json(v) => {
+                serde_json::to_writer(&mut *w, &v)?;
+            }
+            Self::Result(id, reply @ Reply::Stream(_)) => {
+                w.write_all(b"{\"id\":")?;
+                serde_json::to_writer(&mut *w, &id)?;
+                w.write_all(b",\"ok\":true,\"result\":")?;
+                reply.write(w).map_err(|e| match e {
+                    WriteError::Io(e) => e,
+                    WriteError::Answer(e) => io::Error::other(e.to_string()),
+                })?;
+                w.write_all(b"}")?;
+            }
+            Self::Result(id, reply) => {
+                let line = match reply.finish() {
+                    Ok(result) => json!({"id": id, "ok": true, "result": result}),
+                    Err(e) => json!({"id": id, "ok": false, "error": e.to_string()}),
+                };
+                serde_json::to_writer(&mut *w, &line)?;
+            }
+        }
+        w.write_all(b"\n")
+    }
+
+    /// [`wire::write_line`] for a body: the line in 64 KiB writes (one for a
+    /// small reply, as before), then a flush.
+    pub(crate) fn send(self, w: &mut dyn Write) -> io::Result<()> {
+        let mut out = io::BufWriter::with_capacity(64 * 1024, w);
+        self.write_into(&mut out)?;
+        out.flush()
+    }
 }
 
 /// The reply to one request, or `None` when it is not a JSON request (the
@@ -401,7 +459,7 @@ pub(crate) fn answer_with(
         .unwrap_or(Value::Null);
     let token = req.token.as_deref();
     let mut authenticated = false;
-    let result = match req.method.as_str() {
+    let result: Result<Reply, String> = match req.method.as_str() {
         m if OPEN_METHODS.contains(&m) => {
             // The exact build tells which known bugs a router has: strangers
             // on the network get it only after logging in. (`ping` checks no
@@ -423,33 +481,36 @@ pub(crate) fn answer_with(
                     v
                 })
             }
+            .map(Reply::Ready)
         }
-        "auth.login" => {
-            if req.params.is_some_and(|r| r.get().len() > MAX_OPEN_PARAMS) {
-                Err(format!("auth.login params exceed {MAX_OPEN_PARAMS} bytes"))
-            } else {
-                parse_raw(req.params).and_then(|p| {
-                    let r = gate.login(host, caller, peer, &p);
-                    authenticated = r.is_ok();
-                    r
-                })
-            }
+        "auth.login" => if req.params.is_some_and(|r| r.get().len() > MAX_OPEN_PARAMS) {
+            Err(format!("auth.login params exceed {MAX_OPEN_PARAMS} bytes"))
+        } else {
+            parse_raw(req.params).and_then(|p| {
+                let r = gate.login(host, caller, peer, &p);
+                authenticated = r.is_ok();
+                r
+            })
         }
-        "auth.logout" => gate.logout(host, token),
+        .map(Reply::Ready),
+        "auth.logout" => gate.logout(host, token).map(Reply::Ready),
         method => gate.principal(host, token).and_then(|p| {
             authenticated = true;
             on_token();
             let caller = caller.clone().with_principal(p);
             if method == "auth.whoami" {
-                whoami(host, &caller)
+                whoami(host, &caller).map(Reply::Ready)
             } else {
-                parse_raw(req.params).and_then(|params| dispatch_as(host, &caller, method, &params))
+                parse_raw(req.params)
+                    .and_then(|params| dispatch_reply_as(host, &caller, method, &params))
             }
         }),
     };
     let reply = match result {
-        Ok(result) => json!({"id": id, "ok": true, "result": result}),
-        Err(error) => json!({"id": id, "ok": false, "error": error}),
+        // Built after the session is released: by the connection's thread.
+        Ok(Reply::Ready(result)) => Body::Json(json!({"id": id, "ok": true, "result": result})),
+        Ok(reply) => Body::Result(id, reply),
+        Err(error) => Body::Json(json!({"id": id, "ok": false, "error": error})),
     };
     Some(Answer {
         reply,
@@ -521,6 +582,6 @@ fn handle<H: Host>(
         if answer.authenticated {
             reader.get_mut().sock().authenticated();
         }
-        write_line(reader.get_mut(), &answer.reply)?;
+        answer.reply.send(reader.get_mut())?;
     }
 }

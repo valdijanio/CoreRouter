@@ -82,7 +82,7 @@ pub const UNITS: &[Unit] = &[
         },
     },
     Unit {
-        name: "firewall",
+        name: FIREWALL_UNIT,
         reads: small_and(Sections::FIREWALL),
         run: corerouter_firewall::validate,
     },
@@ -155,17 +155,23 @@ pub fn validate_changed(cfg: &Config, changed: Sections) -> Vec<Issue> {
 /// [`validate_changed`] for a commit from `running` (valid: the commit
 /// path keeps it so, `ValidRunning`) to `cfg`. With the interfaces and
 /// addresses the same, the route checks look only at the destinations the
-/// commit touched (G0.31e: 16 ms with 60 000 routes); the rest as
+/// commit touched (G0.31e: 16 ms with 60 000 routes), and the firewall
+/// checks only the rules it touched when nothing else changes them
+/// (G0.31j, `corerouter_firewall::validate::validate_since`); the rest as
 /// [`validate_changed`]. Same issues, in the same order.
 pub fn validate_commit(running: &Config, cfg: &Config, changed: Sections) -> Vec<Issue> {
-    let routes_only = !changed.contains(Sections::OTHER)
-        && !changed.intersects(Sections::ADDRESSES.union(Sections::INTERFACES));
+    let known_valid = !changed.contains(Sections::OTHER);
+    let routes_only =
+        known_valid && !changed.intersects(Sections::ADDRESSES.union(Sections::INTERFACES));
     UNITS
         .iter()
         .filter(|u| changed.contains(Sections::OTHER) || u.reads.intersects(changed))
         .flat_map(|u| {
             if routes_only && u.name == ROUTES_UNIT {
                 route_checks_since(running, cfg)
+            } else if known_valid && u.name == FIREWALL_UNIT {
+                corerouter_firewall::validate::validate_since(running, cfg)
+                    .unwrap_or_else(|| (u.run)(cfg))
             } else {
                 (u.run)(cfg)
             }
@@ -173,8 +179,9 @@ pub fn validate_commit(running: &Config, cfg: &Config, changed: Sections) -> Vec
         .collect()
 }
 
-/// Name of the unit that [`validate_commit`] runs incrementally.
+/// Names of the units that [`validate_commit`] runs incrementally.
 const ROUTES_UNIT: &str = "routes";
+const FIREWALL_UNIT: &str = "firewall";
 
 fn interface_checks(cfg: &Config) -> Vec<Issue> {
     let mut out = Vec::new();
@@ -453,6 +460,7 @@ pub(crate) fn route_issues(
         out.push((field, why.text));
     }
     check_gateway_issues(cfg, r, &mut out);
+    discard_issues(cfg, r, &mut out);
     // Equal distance is ECMP (RouterOS v7, G1.27): only the very same
     // next hop twice is refused.
     for o in same_hop.filter(|o| *o != r.id) {
@@ -467,12 +475,53 @@ pub(crate) fn route_issues(
     out
 }
 
+/// G1.5a: the kernel holds one route per prefix, metric and table, and a
+/// route without next hop has no path to merge with another: it cannot
+/// share its distance with a route of the other kind (or another type of
+/// discard) to the same destination. Enabled routes only.
+fn discard_issues(cfg: &Config, r: &RouteEntry, out: &mut Vec<(&'static str, String)>) {
+    if r.disabled {
+        return;
+    }
+    let dst = (r.routing_table.clone(), r.dst_address.trunc());
+    let clash = cfg.ip.routes.routes_to(&dst).find(|o| {
+        o.id != r.id
+            && !o.disabled
+            && o.distance == r.distance
+            && o.dst_address.trunc() == r.dst_address.trunc()
+            && (o.gateway.discards().is_some() || r.gateway.discards().is_some())
+            && o.gateway.discards() != r.gateway.discards()
+    });
+    if let Some(o) = clash {
+        out.push((
+            "distance",
+            format!(
+                "route {} already goes to {} via {} at distance {} in table {}: a {} route \
+                 cannot share a distance with it; give one of them another distance",
+                o.id,
+                r.dst_address,
+                o.gateway,
+                r.distance,
+                r.routing_table,
+                r.gateway.discards().or(o.gateway.discards()).map_or("", |d| d.as_str()),
+            ),
+        ));
+    }
+}
+
 /// G1.27f / G3.6g: what `check_gateway` can check.
 fn check_gateway_issues(cfg: &Config, r: &RouteEntry, out: &mut Vec<(&'static str, String)>) {
     use corerouter_model::dhcp_client::CheckGateway;
     let gw = r.gateway.address();
     match (r.check_gateway, gw) {
         (CheckGateway::None, _) => {}
+        (m, _) if r.gateway.discards().is_some() => out.push((
+            "check_gateway",
+            format!(
+                "check-gateway={m} needs a gateway: a {} route has none to check",
+                r.gateway
+            ),
+        )),
         (m, None) => out.push((
             "check_gateway",
             format!(

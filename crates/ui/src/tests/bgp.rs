@@ -213,6 +213,86 @@ fn the_filters_page_sets_what_the_connection_announces() {
     assert_eq!(m.values.get("output_network").map(String::as_str), Some("bgp-out"));
 }
 
+/// G3.9fj: the Instances tab lists the graceful-restart timers and edits
+/// them in the modal, with the engine's preview.
+#[test]
+fn the_instances_tab_edits_the_graceful_restart_timers() {
+    let mut s = lab();
+    s.execute("routing.bgp.connection.set", &json!({"id": "rr1", "graceful_restart": true})).unwrap();
+    let mut h = open(s);
+    panel(&mut h).tab = Tab::Instances;
+    refresh(&mut h);
+    for t in ["default", "AS65000", "10.0.0.1", "120 s (default)", "360 s (default)", "10 s (default)", "1 instances"] {
+        assert!(h.has_text(t), "{t}");
+    }
+    act(&mut h, Act::Edit("default".into()), What::Instance);
+    settle(&mut h);
+    let (_, m) = panel(&mut h).modal.as_mut().unwrap();
+    assert_eq!(m.values.get("asn").map(String::as_str), Some("65000"));
+    assert_eq!(m.values.get("graceful_restart_time").map(String::as_str), Some(""), "unset: the default");
+    m.values.insert("graceful_restart_time", "200".into());
+    m.values.insert("graceful_defer_time", "30".into());
+    settle(&mut h);
+    assert!(h.has_text("the Restart Time (200 s) is not shorter than the hold time of rr1 (hold 180 s): RFC 4724 §3 recommends it below the hold time"));
+    h.click(h.text("OK"));
+    settle(&mut h);
+    assert!(panel(&mut h).modal.is_none(), "OK closes: {:?}", h.app.log());
+    let rows = lock(&h.session).execute("routing.bgp.instance.list", &json!({})).unwrap();
+    assert_eq!((rows[0]["graceful_restart_time"].as_u64(), rows[0]["graceful_defer_time"].as_u64()), (Some(200), Some(30)), "{rows}");
+    assert_eq!(rows[0]["graceful_stale_time"], Value::Null, "untouched");
+    refresh(&mut h);
+    for t in ["200 s", "30 s", "Rendered for FRR bgpd:"] {
+        assert!(h.has_text(t), "{t}");
+    }
+    // Emptying a timer puts the default back.
+    act(&mut h, Act::Edit("default".into()), What::Instance);
+    let (_, m) = panel(&mut h).modal.as_mut().unwrap();
+    m.values.insert("graceful_restart_time", String::new());
+    settle(&mut h);
+    h.click(h.text("OK"));
+    settle(&mut h);
+    let rows = lock(&h.session).execute("routing.bgp.instance.list", &json!({})).unwrap();
+    assert_eq!((rows[0]["graceful_restart_time"].clone(), rows[0]["graceful_defer_time"].as_u64()), (Value::Null, Some(30)), "{rows}");
+}
+
+/// G3.9fj, RFC 8538: the N bit in the GR column and the instance list,
+/// the Hard Reset in the last error, and the switches in the modal.
+#[test]
+fn rfc8538_shows_the_n_bit_and_the_hard_reset() {
+    let mut s = lab();
+    s.execute("routing.bgp.connection.set", &json!({"id": "upstream1", "graceful_restart": true})).unwrap();
+    let mut st = s.routing_status().cloned().unwrap();
+    st.bgp_sessions[0].gr_local = Some("restart".into());
+    st.bgp_sessions[0].gr_remote = Some("helper".into());
+    st.bgp_sessions[0].n_bit = true;
+    st.bgp_sessions[0].llgr_stale_time = Some(3600);
+    st.bgp_sessions[0].end_of_rib_received = vec!["ipv4".into()];
+    st.bgp_sessions[1].last_hard_reset = Some(true);
+    s.set_routing_status(st);
+    let mut h = open(s);
+    for t in ["restart", "N", "LLGR", "EoR"] {
+        assert!(h.has_text(t), "{t}");
+    }
+    h.click(h.text("rr1"));
+    h.idle();
+    assert!(h.has_text("Hold Timer Expired (Hard Reset)"));
+    panel(&mut h).tab = Tab::Instances;
+    refresh(&mut h);
+    assert!(h.has_text("N bit"));
+    assert!(h.has_text("off"), "LLGR off by default");
+    act(&mut h, Act::Edit("default".into()), What::Instance);
+    let (_, m) = panel(&mut h).modal.as_mut().unwrap();
+    assert_eq!(m.values.get("hard_admin_reset").map(String::as_str), Some("yes"));
+    m.values.insert("hard_admin_reset", "no".into());
+    settle(&mut h);
+    h.click(h.text("OK"));
+    settle(&mut h);
+    let rows = lock(&h.session).execute("routing.bgp.instance.list", &json!({})).unwrap();
+    assert_eq!(rows[0]["hard_admin_reset"], false, "{rows}");
+    refresh(&mut h);
+    assert!(h.has_text("graceful clear"));
+}
+
 #[test]
 fn every_label_explains_itself_in_both_languages() {
     for key in BgpPanel::help_keys() {

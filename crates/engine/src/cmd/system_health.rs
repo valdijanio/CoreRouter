@@ -97,7 +97,7 @@ mod tests {
         let mut s = Session::virtual_lab();
         let v = s.execute("system.health.check", &json!({})).unwrap();
         let checks = v["checks"].as_array().unwrap();
-        assert_eq!(checks.len(), 16);
+        assert_eq!(checks.len(), 19);
         let by = |k: &str| checks.iter().find(|c| c["key"] == k).unwrap().clone();
         assert_eq!(by("root.verity")["severity"], "unknown", "no A/B image in the lab");
         assert_eq!(by("routes.ecmp")["severity"], "ok", "the lab has no ECMP (G1.27j)");
@@ -106,7 +106,12 @@ mod tests {
         assert!(by("nic.errors")["reason"].as_str().unwrap().contains("ether4"));
         assert_eq!(by("ntp")["severity"], "ok", "NTP off is the factory default (G4.6i)");
         assert_eq!(by("services")["severity"], "unknown", "no supervisor in the lab");
+        assert_eq!(by("bgp.end-of-rib")["severity"], "unknown", "no routing daemon in the lab (G3.9fj)");
+        assert_eq!(by("bgp.gr-bfd")["severity"], "unknown");
         assert_eq!(by("temperature")["severity"], "ok");
+        // G1.29b: ether6 is a USB 3 adapter on a USB 2.0 port.
+        assert_eq!(by("interface.usb")["severity"], "warning");
+        assert!(by("interface.usb")["reason"].as_str().unwrap().contains("ether6: USB 3.0 adapter negotiated USB 2.0"));
         assert_eq!(v["status"], "warning");
         assert_eq!(v["errors"], 0);
         assert!(by("nic.errors")["action"].is_string());

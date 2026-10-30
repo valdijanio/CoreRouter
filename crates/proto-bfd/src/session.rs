@@ -101,6 +101,17 @@ pub struct Session {
     remote_desired_tx: u32,
     remote_mult: u8,
     remote_demand: bool,
+    /// The C bit of the peer's last packet (RFC 5880 §4.1: its BFD does not
+    /// share fate with its control plane). G3.9fj: `bfdd` hands it to
+    /// `bgpd` for RFC 5882 §4.3.
+    remote_cpi: bool,
+    /// The peer's Desired Min TX before it advertised a smaller one, kept
+    /// in the Detection Time until it really sends at the new rate (0:
+    /// none). See [`Session::detection_time`].
+    remote_tx_hold: u32,
+    /// When the last packet that can prove the new rate arrived (one
+    /// sent on the peer's periodic schedule, after the decrease).
+    hold_rx_at: Option<u64>,
     poll_active: bool,
     rcv_seq: RcvSeq,
     xmit_seq: u32,
@@ -132,6 +143,9 @@ impl Session {
             remote_desired_tx: 0,
             remote_mult: 0,
             remote_demand: false,
+            remote_cpi: false,
+            remote_tx_hold: 0,
+            hold_rx_at: None,
             poll_active: false,
             rcv_seq: RcvSeq::default(),
             xmit_seq: 0,
@@ -188,6 +202,9 @@ impl Session {
     pub fn remote_mult(&self) -> u8 {
         self.remote_mult
     }
+    pub fn remote_cpi(&self) -> bool {
+        self.remote_cpi
+    }
     /// The periodic interval before jitter (§6.8.7): the larger of our
     /// bfd.DesiredMinTxInterval and the peer's Required Min RX.
     pub fn tx_interval(&self) -> u32 {
@@ -197,8 +214,71 @@ impl Session {
     /// §6.8.4, asynchronous mode: the received Detect Mult times the
     /// larger of our bfd.RequiredMinRxInterval and the last received
     /// Desired Min TX. 0 before the peer spoke.
+    ///
+    /// G3.9b: after the peer lowers its Desired Min TX (the 1 s → fast
+    /// step right after Up, §6.8.3), the old value stays in the formula
+    /// until a packet proves the new rate ([`Session::remote_tx_hold`]).
     pub fn detection_time(&self) -> u64 {
-        u64::from(self.remote_mult) * u64::from(self.rx_for_detect.max(self.remote_desired_tx))
+        let tx = self.remote_desired_tx.max(self.remote_tx_hold);
+        u64::from(self.remote_mult) * u64::from(self.rx_for_detect.max(tx))
+    }
+
+    /// The peer's former, larger Desired Min TX still held in the
+    /// Detection Time (0: none, the advertised value rules).
+    pub fn remote_tx_hold(&self) -> u32 {
+        self.remote_tx_hold
+    }
+
+    /// G3.9b, the peer's side of RFC 5880 §6.8.3. The RFC protects the
+    /// receiver when *we* lower bfd.RequiredMinRxInterval: "the previous
+    /// value … MUST be used when calculating the Detection Time … to
+    /// ensure that the remote system is transmitting packets at the higher
+    /// rate (and those packets are being received) prior to the Detection
+    /// Time being reduced". When the *peer* lowers its Desired Min TX the
+    /// RFC applies the change at once, which trusts the peer to speed up
+    /// at once. RouterOS 7.25 does not: right after Up it advertises
+    /// 100 ms but keeps sending at ~1 s for a while, so 3 × 100 ms expires
+    /// and every new session flaps (15 downs in 30 s, **measured**; FRR's
+    /// `bfdd`, which follows the letter, 13). So the same principle runs
+    /// on our side: the old, larger value stays in the Detection Time
+    /// until two packets on the peer's periodic schedule arrive no further
+    /// apart than the new interval. The cost is a slower detection for
+    /// that one interval transition, never a false Down.
+    ///
+    /// `prev` is the Desired Min TX received before `p`; `same_state`
+    /// whether `p` kept the peer's state (a state change is sent at once,
+    /// outside the schedule, as is a Final: §6.8.6 / §6.8.7).
+    fn track_remote_tx(&mut self, prev: u32, p: &Packet, same_state: bool, now: u64) {
+        let new = p.desired_min_tx;
+        if prev != 0 && new < prev {
+            // The announcing packet itself may be triggered (a Poll or a
+            // state change sent at once): it never starts the proof.
+            self.remote_tx_hold = self.remote_tx_hold.max(prev);
+            self.hold_rx_at = None;
+            return;
+        }
+        if self.remote_tx_hold == 0 {
+            return;
+        }
+        if new >= self.remote_tx_hold {
+            self.remote_tx_hold = 0;
+            self.hold_rx_at = None;
+            return;
+        }
+        if p.final_ || !same_state {
+            return;
+        }
+        // The peer's interval at the new rate (§6.8.7: the larger of its
+        // Desired Min TX and our Required Min RX, minus 0–25 % jitter).
+        let interval = u64::from(new.max(self.adv_rx));
+        if let Some(at) = self.hold_rx_at
+            && now.saturating_sub(at) <= interval
+        {
+            self.remote_tx_hold = 0;
+            self.hold_rx_at = None;
+        } else {
+            self.hold_rx_at = Some(now);
+        }
     }
 
     /// The earliest time [`Session::on_timer`] has work.
@@ -282,12 +362,16 @@ impl Session {
         }
         self.rx_packets += 1;
         let before_rx = self.remote_min_rx;
+        let prev_tx = self.remote_desired_tx;
+        let same_state = p.state == self.remote_state;
+        self.track_remote_tx(prev_tx, p, same_state, now);
         self.remote_discr = p.my_discr;
         self.remote_state = p.state;
         self.remote_demand = p.demand;
         self.remote_min_rx = p.required_min_rx;
         self.remote_desired_tx = p.desired_min_tx;
         self.remote_mult = p.detect_mult;
+        self.remote_cpi = p.cpi;
         let mut out = Received::default();
         // §6.5: the Final ends our Poll Sequence; the held values apply.
         if p.final_ && self.poll_active {
@@ -351,6 +435,8 @@ impl Session {
             self.remote_discr = 0;
             self.remote_state = State::Down;
             self.remote_demand = false;
+            self.remote_tx_hold = 0;
+            self.hold_rx_at = None;
             if out.change.is_some() {
                 out.send = true;
                 self.schedule_tx(now);
@@ -516,6 +602,22 @@ mod tests {
         }
     }
 
+    /// G3.9fj, RFC 5880 §4.1: the peer's C bit is kept from its packets.
+    #[test]
+    fn the_peers_c_bit_is_kept() {
+        let mut a = Session::new(0x1111, fast(), 0, 1);
+        let mut b = Session::new(0x2222, fast(), 0, 2);
+        let mut buf = [0u8; MAX_LEN];
+        let n = b.build(false, &mut buf);
+        let mut p = Packet::decode(&buf[..n]).unwrap();
+        p.cpi = true;
+        let mut raw = [0u8; MAX_LEN];
+        let m = p.encode(&mut raw);
+        let p = Packet::decode(&raw[..m]).unwrap();
+        a.receive(&raw[..m], &p, MS).unwrap();
+        assert!(a.remote_cpi());
+    }
+
     #[test]
     fn three_way_handshake_comes_up() {
         let mut w = Wire::new(fast(), fast());
@@ -523,6 +625,9 @@ mod tests {
         assert_eq!(w.a.state(), State::Up);
         assert_eq!(w.b.state(), State::Up);
         assert_eq!(w.a.remote_discr(), 0x2222);
+        // G3.9fj: CoreRouter's engine sends C = 0 (it shares fate with the
+        // daemon, not with the kernel's forwarding).
+        assert!(!w.a.remote_cpi());
         // §6.8.3: once Up and the Poll answered, the fast interval rules.
         w.run(200 * MS);
         assert!(!w.a.poll_active() && !w.b.poll_active());
@@ -702,6 +807,152 @@ mod tests {
         // B detects with A's new Desired Min TX: 3 × 200 ms.
         assert_eq!(w.b.detection_time(), 600_000);
         assert!(w.changes.iter().all(|(_, c)| c.to != State::Down));
+    }
+
+    /// A peer driven by hand: what RouterOS 7.25 does around Up.
+    struct Scripted {
+        discr: u32,
+        state: State,
+        desired_tx: u32,
+    }
+
+    impl Scripted {
+        fn send(&self, to: &mut Session, now: u64, poll: bool, final_: bool) -> Received {
+            let mut p = Packet::new(self.discr);
+            p.state = self.state;
+            p.your_discr = if self.state == State::Down {
+                0
+            } else {
+                to.local_discr()
+            };
+            p.desired_min_tx = self.desired_tx;
+            p.required_min_rx = 100_000;
+            p.detect_mult = 3;
+            p.poll = poll;
+            p.final_ = final_;
+            let mut buf = [0u8; MAX_LEN];
+            let n = p.encode(&mut buf);
+            let back = Packet::decode(&buf[..n]).unwrap();
+            to.receive(&buf[..n], &back, now).unwrap()
+        }
+    }
+
+    /// Runs `s`'s timers 1 ms at a time over (from, to]; the first change.
+    fn tick(s: &mut Session, from: u64, to: u64) -> Option<(u64, Change)> {
+        let mut t = from;
+        while t < to {
+            t += MS;
+            if let Some(c) = s.on_timer(t).change {
+                return Some((t, c));
+            }
+        }
+        None
+    }
+
+    fn hundred() -> Config {
+        Config {
+            desired_min_tx: 100_000,
+            required_min_rx: 100_000,
+            detect_mult: 3,
+            ..Config::default()
+        }
+    }
+
+    /// Brings `a` Up against a RouterOS-like peer: Down at 1 s, then Up
+    /// announcing 100 ms (with a Poll) at `t0`. Returns the peer.
+    fn up_with_routeros(a: &mut Session, t0: u64) -> Scripted {
+        let mut r = Scripted {
+            discr: 0x7e57,
+            state: State::Down,
+            desired_tx: SLOW_TX_US,
+        };
+        r.send(a, t0 - 10 * MS, false, false);
+        assert_eq!(a.state(), State::Init);
+        r.state = State::Up;
+        r.desired_tx = 100_000;
+        r.send(a, t0, true, false);
+        assert_eq!(a.state(), State::Up);
+        r
+    }
+
+    #[test]
+    fn routeros_slow_start_after_up_does_not_flap() {
+        // RFC 5880 §6.8.3 (G3.9b): the peer announces 100 ms at Up but
+        // keeps sending at ~1 s for 5 s. The Detection Time keeps the old
+        // 1 s (3 s) until two periodic packets 100 ms apart arrive.
+        let mut a = Session::new(0xa, hundred(), 0, 7);
+        let r = up_with_routeros(&mut a, 20 * MS);
+        assert_eq!(a.remote_tx_hold(), SLOW_TX_US);
+        assert_eq!(a.detection_time(), 3_000_000);
+        let mut t = 20 * MS;
+        // Slow phase: one packet every ~950 ms (a jittered 1 s), 5 s long.
+        for _ in 0..5 {
+            assert_eq!(
+                tick(&mut a, t, t + 950 * MS),
+                None,
+                "flapped at the slow rate"
+            );
+            t += 950 * MS;
+            r.send(&mut a, t, false, false);
+            assert_eq!(a.detection_time(), 3_000_000, "held while slow");
+        }
+        // The peer speeds up: the first periodic packet 100 ms after the
+        // previous one proves the new rate.
+        t += 90 * MS;
+        r.send(&mut a, t, false, false);
+        assert_eq!(a.remote_tx_hold(), 0);
+        assert_eq!(a.detection_time(), 300_000);
+        // Now a silence goes Down in the fast Detection Time, not 3 s.
+        let (at, c) = tick(&mut a, t, t + 1_000 * MS).unwrap();
+        assert_eq!(c.diag, Diag::ControlDetectionTimeExpired);
+        assert_eq!(at - t, 300 * MS);
+    }
+
+    #[test]
+    fn hold_ignores_out_of_schedule_packets() {
+        // A Final (§6.8.6: sent at once) right after a periodic packet,
+        // or the triggered packet that announces the decrease, does not
+        // prove the new rate.
+        let mut a = Session::new(0xa, hundred(), 0, 7);
+        let r = up_with_routeros(&mut a, 20 * MS);
+        r.send(&mut a, 30 * MS, false, true);
+        assert_eq!(
+            a.remote_tx_hold(),
+            SLOW_TX_US,
+            "Final 10 ms after the announcing packet"
+        );
+        r.send(&mut a, 980 * MS, false, false);
+        r.send(&mut a, 985 * MS, false, true);
+        assert_eq!(
+            a.remote_tx_hold(),
+            SLOW_TX_US,
+            "Final 5 ms after a periodic packet"
+        );
+        // A later decrease while held keeps the largest value.
+        let mut r2 = Scripted {
+            desired_tx: 50_000,
+            ..r
+        };
+        r2.send(&mut a, 1_900 * MS, true, false);
+        assert_eq!(a.remote_tx_hold(), SLOW_TX_US);
+        // An increase back to (or above) the held value ends the hold.
+        r2.desired_tx = SLOW_TX_US;
+        r2.send(&mut a, 2_800 * MS, true, false);
+        assert_eq!(a.remote_tx_hold(), 0);
+        assert_eq!(a.state(), State::Up);
+    }
+
+    #[test]
+    fn a_prompt_peer_gets_the_fast_detection_in_two_packets() {
+        // Two CoreRouters: each speeds up at once, so the hold lasts two
+        // fast packets and detection matches the strict §6.8.4 formula.
+        let mut w = Wire::new(fast(), fast());
+        w.run(20 * MS);
+        assert_eq!(w.a.state(), State::Up);
+        w.run(w.now + 150 * MS);
+        assert_eq!(w.a.remote_tx_hold(), 0);
+        assert_eq!(w.b.remote_tx_hold(), 0);
+        assert_eq!(w.a.detection_time(), 150_000);
     }
 
     #[test]

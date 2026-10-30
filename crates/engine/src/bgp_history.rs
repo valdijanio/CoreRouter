@@ -1,8 +1,8 @@
 //! The flap history of each BGP session (G3.3, with G3.2c): when it went
 //! down and came back, why, and how long it had been up. Built from the
 //! samples the daemon's `frr` service takes every 2 s
-//! ([`Session::set_routing_status`]), so a session that went down and up
-//! between two samples is still caught by its flap counter.
+//! ([`Session::set_routing_status`]), so a session that went down and up,
+//! or up and down, between two samples is still caught by its flap counter.
 //!
 //! A ring per session ([`MAX_EVENTS`]) and a bound on sessions
 //! ([`MAX_SESSIONS`]): operational state, never saved, gone on restart.
@@ -22,7 +22,9 @@ const MAX_REASON: usize = 200;
 pub struct FlapEvent {
     /// Unix time of the sample that saw it.
     pub at: Option<u64>,
-    /// `down`, `up`, or `flap` (down and up again between two samples).
+    /// `down`, `up`, or `flap` (down and up again between two samples). A
+    /// session that came up and went down again between two samples (a
+    /// max-prefix Cease right after Established) is a `down`.
     pub event: &'static str,
     pub state: String,
     /// The last NOTIFICATION or the daemon's reason, for `down`/`flap`.
@@ -82,6 +84,7 @@ impl BgpHistory {
                     (true, false) => Some("down"),
                     (false, true) => Some("up"),
                     (true, true) if more_flaps => Some("flap"),
+                    (false, false) if more_flaps => Some("down"),
                     _ => None,
                 };
                 if let Some(event) = event {
@@ -170,6 +173,25 @@ mod tests {
         let down = &l[2].2;
         assert_eq!((down.uptime_secs, down.reason.as_deref()), (Some(100), Some("Hold Timer Expired")));
         assert!(h.list(Some("other")).is_empty());
+    }
+
+    #[test]
+    fn up_and_down_between_two_samples_is_a_down() {
+        // Found against FRR (scripts/bgp-crcr-userns.sh maxprefix): the
+        // session comes up and the prefix limit closes it within 2 s, so
+        // both samples say idle and only the counter moved.
+        let mut h = BgpHistory::default();
+        let idle = |flaps, why: &str| BgpSession {
+            last_error: Some(why.into()),
+            uptime_secs: None,
+            ..s(false, flaps, 0)
+        };
+        h.record(&[idle(0, "No AFI/SAFI activated for peer")], Some(1));
+        h.record(&[idle(1, "Reached received prefix count")], Some(3));
+        h.record(&[idle(1, "Reached received prefix count")], Some(5));
+        let l = h.list(Some("up1"));
+        let got: Vec<_> = l.iter().map(|e| (e.2.event, e.2.reason.as_deref(), e.2.uptime_secs)).collect();
+        assert_eq!(got, [("down", Some("Reached received prefix count"), None)]);
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //!   same `Session::execute` as the CLI and MCP): an address on `ether1` and a
 //!   loopback /32, OSPFv2 point-to-point, Segment Routing with a
 //!   prefix SID for the loopback, MPLS input and LDP on `ether1` (no TI-LFA:
-//!   off in production while G3.4l is open), a BFD peer on the link;
+//!   off in production, G3.4k), a BFD peer on the link;
 //! - what must follow is read back from FRR through hal-frr's queries: the
 //!   OSPF adjacency Full (ospfd), the other router's prefix SID with its
 //!   label (ospfd's SR database), the LDP session operational (ldpd), the
@@ -17,7 +17,11 @@
 //!   plane), labels in the kernel's MPLS table (zebra), the
 //!   other loopback answering ping over the OSPF route;
 //! - the FRR version the daemons report must be the one
-//!   `os/buildroot-patches` pins, and the RSS of each daemon is printed.
+//!   `os/buildroot-patches` pins, and the RSS of each daemon is printed;
+//! - G1.6i: before the configuration only mgmtd, zebra and staticd run;
+//!   on r1 a BGP instance starts bgpd, and removing LDP and the BFD peer
+//!   stops ldpd and bfdd while zebra and ospfd keep their PIDs and the
+//!   other loopback still answers over OSPF.
 
 #![allow(clippy::indexing_slicing)]
 
@@ -30,8 +34,73 @@ use serde_json::Value;
 use super::ab::{Numbers, Vm, check, fresh_vars, qemu_base, ready_s, start};
 use super::install::{sh, until};
 
-/// The FRR daemons corerouter-init starts (`docs/os-image.md`).
+/// The FRR daemons corerouter-init can start (`docs/os-image.md`); bgpd,
+/// ospfd, ospf6d, ldpd and bfdd only while the configuration uses them.
 const DAEMONS: &str = "mgmtd zebra staticd bgpd ospfd ospf6d ldpd bfdd";
+
+/// The on-demand daemons running now (`pidof`, empty when none).
+fn on_demand_running(vm: &mut Vm, log: &mut std::fs::File) -> Result<String, String> {
+    let out = sh(
+        vm,
+        log,
+        "{ for p in bgpd ospfd ospf6d ldpd bfdd; do pidof $p >/dev/null && printf '%s ' $p; done; echo .; }",
+    )?;
+    Ok(out.trim().trim_end_matches('.').trim().to_owned())
+}
+
+/// Waits up to 10 s until `daemon` runs (`up`) or is gone.
+fn wait_daemon(vm: &mut Vm, log: &mut std::fs::File, daemon: &str, up: bool) -> Result<(), String> {
+    let want = if up { "0" } else { "1" };
+    let out = sh(
+        vm,
+        log,
+        &format!(
+            "{{ i=0; while [ $i -lt 50 ]; do pidof {daemon} >/dev/null; [ $? = {want} ] && break; \
+             sleep 0.2; i=$((i+1)); done; pidof {daemon} >/dev/null; [ $? = {want} ] && echo DONE; echo .; }}"
+        ),
+    )?;
+    check(
+        out.contains("DONE"),
+        format!(
+            "{daemon} did not {} in 10 s",
+            if up { "start" } else { "stop" }
+        ),
+    )
+}
+
+/// G1.6i on r1, after `verify`: daemons follow the configuration, and
+/// stopping one does not touch the others nor the routes.
+fn on_demand(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(), String> {
+    let base = sh(vm, log, "pidof zebra ospfd")?;
+    vm.ok(
+        log,
+        "routing.bgp.instance.set",
+        r#"{"asn":65001,"router_id":"10.255.0.1"}"#,
+    )?;
+    wait_daemon(vm, log, "bgpd", true)?;
+    nums.put("r1: with a BGP instance", on_demand_running(vm, log)?);
+    // A disabled instance stays in bgpd (`bgp shutdown`): bgpd stays.
+    vm.ok(log, "mpls.ldp.remove", "{}")?;
+    wait_daemon(vm, log, "ldpd", false)?;
+    vm.ok(log, "routing.bfd.peer.remove", r#"{"id":"10.0.12.2"}"#)?;
+    wait_daemon(vm, log, "bfdd", false)?;
+    nums.put(
+        "r1: LDP and the BFD peer removed",
+        on_demand_running(vm, log)?,
+    );
+    let after = sh(vm, log, "pidof zebra ospfd")?;
+    check(
+        after.trim() == base.trim(),
+        format!("zebra/ospfd restarted: {} → {}", base.trim(), after.trim()),
+    )?;
+    let ping = sh(vm, log, "ping -c 3 -W 2 10.255.0.2 | tail -n 2")?;
+    check(
+        ping.contains(" 0% packet loss"),
+        format!("r1: ping 10.255.0.2 after stopping ldpd and bfdd: {ping}"),
+    )?;
+    nums.put("r1: OSPF route kept (zebra, ospfd PIDs unchanged)", ping);
+    Ok(())
+}
 
 /// The FRR version `os/buildroot-patches/*.patch` sets (`+FRR_VERSION = x`),
 /// if a patch moves FRR off Buildroot's own.
@@ -274,7 +343,7 @@ fn verify(
         vm,
         log,
         &format!(
-            "for p in {DAEMONS} corerouter-daemon; do printf '%s=%s ' $p $(grep VmRSS /proc/$(pidof -s $p)/status | tr -s ' ' | cut -d' ' -f2); done"
+            "for p in {DAEMONS} corerouter-daemon; do pidof -s $p >/dev/null && printf '%s=%s ' $p $(grep VmRSS /proc/$(pidof -s $p)/status | tr -s ' ' | cut -d' ' -f2); done"
         ),
     )?;
     nums.put(&format!("{r}: RSS KiB (OSPF+SR+LDP up)"), rss);
@@ -319,7 +388,7 @@ pub fn frr_test(root: &Path, images: &Path, args: &[String]) -> Result<(), Strin
         )?;
     }
     let frr = pinned_frr(&root.join("os"))?;
-    let work = root.join("os/out/frr-test");
+    let work = super::out_dir(root)?.join("frr-test");
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
     let log_path = work.join("console.log");
@@ -360,6 +429,17 @@ pub fn frr_test(root: &Path, images: &Path, args: &[String]) -> Result<(), Strin
             |v| v["result"][0]["state"] == "running",
         )?;
     }
+    for (vm, n) in [(&mut r1, 1), (&mut r2, 2)] {
+        let idle = on_demand_running(vm, &mut log)?;
+        check(
+            idle.is_empty(),
+            format!("r{n}: on-demand FRR daemons before any configuration: {idle}"),
+        )?;
+        nums.put(
+            &format!("r{n}: on-demand FRR daemons at boot"),
+            "none".to_owned(),
+        );
+    }
     let t0 = Instant::now();
     configure(&mut r1, &mut log, 1)?;
     configure(&mut r2, &mut log, 2)?;
@@ -368,7 +448,8 @@ pub fn frr_test(root: &Path, images: &Path, args: &[String]) -> Result<(), Strin
         format!("{:.1} s", t0.elapsed().as_secs_f64()),
     );
     let res = verify(&mut r1, &mut log, &mut nums, 1, frr.as_deref(), t0)
-        .and_then(|()| verify(&mut r2, &mut log, &mut nums, 2, frr.as_deref(), t0));
+        .and_then(|()| verify(&mut r2, &mut log, &mut nums, 2, frr.as_deref(), t0))
+        .and_then(|()| on_demand(&mut r1, &mut log, &mut nums));
     if let Err(e) = res {
         for (vm, n) in [(&mut r1, 1), (&mut r2, 2)] {
             let diag = sh(

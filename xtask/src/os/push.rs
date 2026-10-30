@@ -9,8 +9,14 @@
 //! managing the router, or a forwarded daemon port): the local token, no
 //! password. Any other address is TLS with `--user` (password from
 //! `$COREROUTER_PASSWORD` or a prompt).
+//!
+//! processo: the CLI is built in its own target under the build's directory
+//! (`<out>/cli-target`, kept between pushes) with a profile that compiles
+//! fast (no LTO, 16 codegen units, incremental): it only sends a file.
+//! Before, it was a release build (thin LTO, 1 codegen unit) in whatever
+//! target the session had: 243 s on each push (**medido**, 2026-10-29).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
@@ -73,23 +79,8 @@ pub fn push(root: &Path, images: &Path, args: &[String]) -> Result<(), String> {
         ));
     }
     let t = Instant::now();
-    let st = Command::new(crate::cargo_bin())
-        .args(["build", "-q", "--release", "-p", "corerouter-cli"])
-        .current_dir(root)
-        .status()
-        .map_err(|e| format!("cargo: {e}"))?;
-    if !st.success() {
-        return Err("cargo build -p corerouter-cli failed".into());
-    }
+    let cli = cli(root)?;
     steps.push(("corerouter-cli", t.elapsed().as_secs_f64()));
-    // The release CLI sits next to this xtask's debug directory.
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let cli = exe
-        .parent()
-        .and_then(Path::parent)
-        .map(|t| t.join("release/corerouter-cli"))
-        .filter(|p| p.exists())
-        .ok_or("corerouter-cli: release binary not found next to the xtask")?;
     let params = format!(
         "{{{}}}",
         a.params
@@ -158,6 +149,32 @@ pub fn push(root: &Path, images: &Path, args: &[String]) -> Result<(), String> {
     }
     eprintln!("  {:<38} {:>7.1} s", "total", t0.elapsed().as_secs_f64());
     Ok(())
+}
+
+/// Build the CLI the push runs (see the module doc); its path. The
+/// variables win over `[profile.release]` and over a session's
+/// `CARGO_INCREMENTAL=0` (meant for its throwaway target, not this one).
+pub(super) fn cli(root: &Path) -> Result<PathBuf, String> {
+    let target = super::out_dir(root)?.join("cli-target");
+    let st = Command::new(crate::cargo_bin())
+        .args(["build", "-q", "--release", "-p", "corerouter-cli"])
+        .current_dir(root)
+        .env("CARGO_TARGET_DIR", &target)
+        .env("CARGO_PROFILE_RELEASE_LTO", "false")
+        .env("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "16")
+        .env("CARGO_PROFILE_RELEASE_INCREMENTAL", "true")
+        .env("CARGO_INCREMENTAL", "1")
+        .status()
+        .map_err(|e| format!("cargo: {e}"))?;
+    if !st.success() {
+        return Err("cargo build -p corerouter-cli failed".into());
+    }
+    let cli = target.join("release/corerouter-cli");
+    if cli.exists() {
+        Ok(cli)
+    } else {
+        Err(format!("{} missing after the build", cli.display()))
+    }
 }
 
 #[cfg(test)]

@@ -44,6 +44,9 @@ const CONFIG_WAIT: Duration = Duration::from_secs(5);
 /// baud console.
 const DAEMON_LOG: &str = "/var/log/corerouter-daemon.log";
 const DAEMON_LOG_MAX: u64 = 8 << 20;
+/// An FRR daemon the config no longer uses gets this long after SIGTERM
+/// (G1.6i); FRR exits in well under a second.
+const FRR_STOP_GRACE: Duration = Duration::from_secs(5);
 /// Idle memory is read this long after the first ready.
 const IDLE_AFTER: Duration = Duration::from_secs(10);
 
@@ -88,6 +91,7 @@ pub fn main() {
     }
     mount_config();
     let names = name_ports(Some(Path::new(crate::ports::MAP_FILE)));
+    spawn_hotplug_names(crate::ports::MAP_FILE);
     let trial = trial_at_boot(&cmdline);
     for dir in [plan::RUNTIME_DIR, "/var/log", "/var/lib", "/var/tmp"] {
         if let Err(e) = fs::create_dir_all(dir) {
@@ -141,6 +145,8 @@ fn prepare_frr() -> Vec<Svc> {
         .filter(|d| Path::new(&format!("{}/{d}", plan::FRR_SBIN)).exists())
         .map(|d| Svc {
             name: d,
+            wanted: plan::FRR_ALWAYS.contains(d),
+            stopping: None,
             pid: None,
             since: Instant::now(),
             restart_at: Instant::now(),
@@ -152,6 +158,11 @@ fn prepare_frr() -> Vec<Svc> {
 /// A supervised FRR daemon.
 struct Svc {
     name: &'static str,
+    /// Runs now: always for [`plan::FRR_ALWAYS`], the others while the
+    /// daemon names them in [`plan::FRR_WANTED`] (G1.6i).
+    wanted: bool,
+    /// SIGTERM sent because it is no longer wanted; SIGKILL past this.
+    stopping: Option<Instant>,
     pid: Option<Pid>,
     since: Instant,
     restart_at: Instant,
@@ -161,6 +172,45 @@ struct Svc {
 impl Svc {
     fn log_path(&self) -> String {
         format!("/var/log/frr-{}.log", self.name)
+    }
+}
+
+/// The daemon's [`plan::FRR_WANTED`] as `(mtime, len)`: read again only
+/// when it changes (one `stat` per tick).
+fn wanted_stamp() -> Option<(std::time::SystemTime, u64)> {
+    let m = fs::metadata(plan::FRR_WANTED).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
+/// Starts what the daemon's list adds and stops (SIGTERM) what it drops.
+/// The daemon drops a daemon only after removing its config, so its
+/// routes are already withdrawn; zebra, mgmtd and staticd never stop.
+fn apply_wanted(frr: &mut [Svc], now: Instant) {
+    let mut text = String::new();
+    if let Ok(f) = File::open(plan::FRR_WANTED) {
+        let _ = f.take(plan::FRR_WANTED_MAX).read_to_string(&mut text);
+    }
+    let list = plan::frr_wanted(&text);
+    for s in frr.iter_mut() {
+        let w = list.contains(&s.name);
+        if w && !s.wanted {
+            s.wanted = true;
+            log!("FRR {}: starting (the configuration uses it)", s.name);
+            if s.pid.is_none() {
+                s.restart_at = now;
+                s.backoff = Backoff::new();
+            }
+        } else if !w && s.wanted {
+            s.wanted = false;
+            if let Some(p) = s.pid {
+                log!(
+                    "FRR {}: stopping (the configuration no longer uses it)",
+                    s.name
+                );
+                let _ = rustix::process::kill_process(p, Signal::TERM);
+                s.stopping = Some(now + FRR_STOP_GRACE);
+            }
+        }
     }
 }
 
@@ -218,6 +268,17 @@ fn name_ports(map: Option<&Path>) -> Vec<(String, String)> {
         log("port names: configuration from before ether names; keeping the kernel's names");
     }
     let p = crate::ports::assign(&found, &known, keep);
+    apply_names(&p, &found, &known, map)
+}
+
+/// Renames what `p` says, logs it and writes the map when it changed.
+/// Every port's name by kernel name (a failed rename keeps the kernel's).
+fn apply_names(
+    p: &crate::ports::Plan,
+    found: &[crate::ports::Found],
+    known: &[crate::ports::Known],
+    map: Option<&Path>,
+) -> Vec<(String, String)> {
     for n in &p.notes {
         log!("port names: {n}");
     }
@@ -247,6 +308,67 @@ fn name_ports(map: Option<&Path>) -> Vec<(String, String)> {
         log!("{}: {e}", m.display());
     }
     names
+}
+
+/// Reads the port-name map (G1.6m): its lines, or none.
+fn read_map(map: &Path) -> Vec<crate::ports::Known> {
+    let text = File::open(map).ok().map(|f| {
+        let mut s = String::new();
+        let _ = f.take(crate::ports::MAX_MAP).read_to_string(&mut s);
+        s
+    });
+    crate::ports::parse_map(text.as_deref().unwrap_or("")).0
+}
+
+/// G1.6n: a card that shows up with the router running (USB adapter,
+/// hot-plug PCIe, a virtio card added to a running VM) gets its `etherN`
+/// the same way as at boot, and keeps it when plugged in again. A thread
+/// that sleeps on the kernel's link messages; when a port carries a kernel
+/// name (`eth<N>`), it waits for the burst to settle and names it. Cost:
+/// one wake per link message (rare on a router: a carrier change, an
+/// address); no polling.
+fn spawn_hotplug_names(map: &'static str) {
+    let events = match crate::links::LinkEvents::open() {
+        Ok(e) => e,
+        Err(e) => {
+            log!(
+                "port names: no link messages ({e}); a card plugged in after boot keeps the kernel's name"
+            );
+            return;
+        }
+    };
+    let spawned = std::thread::Builder::new()
+        .name("port-names".into())
+        .spawn(move || {
+            loop {
+                if let Err(e) = events.wait() {
+                    // ENOBUFS: lost messages, look anyway; anything else:
+                    // do not spin on it.
+                    if e.raw_os_error() != Some(105) {
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                }
+                let pending = crate::links::all_ports()
+                    .iter()
+                    .any(|f| crate::ports::is_kernel_name(&f.kernel));
+                if !pending {
+                    continue;
+                }
+                // A card with several ports, or a driver that registers in
+                // steps: name them in one pass.
+                crate::links::settle(Duration::from_millis(100), Duration::from_secs(1));
+                let path = Path::new(map);
+                let known = read_map(path);
+                let found = crate::ports::hotplug_set(crate::links::all_ports(), &known);
+                let p = crate::ports::assign(&found, &known, false);
+                if !p.renames.is_empty() {
+                    apply_names(&p, &found, &known, Some(path));
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        log!("port names: hot-plug thread: {e}");
+    }
 }
 
 /// Written so it survives a power cut right after (a VM destroyed seconds
@@ -500,6 +622,7 @@ fn supervise(
     let mut idle_done = false;
     let mut next_rotate = Instant::now();
     let mut frr_ready = !with_frr;
+    let mut stamp = None;
     loop {
         let what = action.load(Ordering::Relaxed);
         if what != RUN {
@@ -532,6 +655,24 @@ fn supervise(
                     want_setup.store(false, Ordering::Relaxed);
                 }
             } else if let Some(s) = frr.iter_mut().find(|s| s.pid == Some(pid)) {
+                // Stopped on purpose (G1.6i): no backoff; wanted again
+                // meanwhile, it starts on this tick.
+                if s.stopping.take().is_some() || !s.wanted {
+                    s.pid = None;
+                    s.restart_at = Instant::now();
+                    s.backoff = Backoff::new();
+                    log!(
+                        "FRR {} stopped after {:.1} s{}",
+                        s.name,
+                        s.since.elapsed().as_secs_f64(),
+                        if s.wanted {
+                            "; wanted again, starting"
+                        } else {
+                            ""
+                        }
+                    );
+                    continue;
+                }
                 let ran = s.since.elapsed();
                 let delay = s.backoff.after_exit(ran);
                 log!(
@@ -546,10 +687,28 @@ fn supervise(
             }
         }
         let now = Instant::now();
+        if with_frr {
+            let st = wanted_stamp();
+            if st != stamp {
+                stamp = st;
+                apply_wanted(&mut frr, now);
+            }
+        }
         // FRR first (mgmtd, zebra, the protocols): the daemon attaches to
         // their vty sockets, and resyncs when they come back.
         for s in frr.iter_mut() {
-            if s.pid.is_none() && now >= s.restart_at {
+            if let (Some(p), Some(t)) = (s.pid, s.stopping)
+                && now >= t
+            {
+                log!(
+                    "FRR {} did not stop in {} s: killing it",
+                    s.name,
+                    FRR_STOP_GRACE.as_secs()
+                );
+                let _ = rustix::process::kill_process(p, Signal::KILL);
+                s.stopping = Some(now + FRR_STOP_GRACE);
+            }
+            if s.wanted && s.pid.is_none() && now >= s.restart_at {
                 s.pid = spawn_frr(s);
                 s.since = now;
                 if s.pid.is_none() {
@@ -564,23 +723,20 @@ fn supervise(
                 d.restart_at = now + d.backoff.after_exit(Duration::ZERO);
             }
         }
-        if !frr_ready && frr.iter().all(|s| s.pid.is_some()) {
-            let socks = fs::read_dir(plan::FRR_DIR)
-                .map(|d| {
-                    d.flatten()
-                        .filter(|e| e.file_name().to_string_lossy().ends_with(".vty"))
-                        .count()
-                })
-                .unwrap_or(0);
-            if socks >= frr.len() {
-                frr_ready = true;
-                let up = read_proc("/proc/uptime").and_then(|s| plan::uptime_secs(&s));
-                log!(
-                    "FRR up: {} daemons have their vty sockets, {:.3} s after kernel start",
-                    frr.len(),
-                    up.unwrap_or(-1.0)
-                );
-            }
+        if !frr_ready
+            && frr.iter().filter(|s| s.wanted).all(|s| {
+                s.pid.is_some() && Path::new(&format!("{}/{}.vty", plan::FRR_DIR, s.name)).exists()
+            })
+        {
+            frr_ready = true;
+            let up = read_proc("/proc/uptime").and_then(|s| plan::uptime_secs(&s));
+            let running: Vec<&str> = frr.iter().filter(|s| s.wanted).map(|s| s.name).collect();
+            log!(
+                "FRR up: {} have their vty sockets, {:.3} s after kernel start \
+                 (the others start when the configuration uses them)",
+                running.join(" "),
+                up.unwrap_or(-1.0)
+            );
         }
         if d.pid.is_some() && !d.ready && probe() {
             d.ready = true;

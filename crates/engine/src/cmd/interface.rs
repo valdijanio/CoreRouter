@@ -17,7 +17,7 @@ pub const MAX_INTERFACES: usize = 4096;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "interface.list", "Interfaces", ["Interfaces"], None,
-        "{type?: string (ether | vlan | bridge | bonding | loopback | vrf | veth | …)} → [{name, type, kind, managed, unmanaged_reason, mtu, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, comment, parent, vlan_id, use_service_tag, bridge, bond, vrf, table}]",
+        "{type?: string (ether | vlan | bridge | bonding | loopback | vrf | veth | …)} → [{name, type, kind, managed, unmanaged_reason, mtu, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, comment, parent, vlan_id, use_service_tag, bridge, bond, vrf, table, usb: null | {port, speed, driver, slow_port, alert} (a USB adapter, G1.29b)}]",
         always, list),
     cmd!(
         "interface.set",
@@ -38,6 +38,17 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         vlan_add
     )
     .key_alias(&[("interface", "parent")]),
+    // `/interface vlan print` and the like (G3.9hl): one type each, the
+    // columns RouterOS prints first (`interface.list` keeps every type).
+    cmd!(query "interface.vlan.list", "VLANs", [], None,
+        "{} → [{name, mtu, vlan_id, interface (the parent: interface= in RouterOS), mac_address, use_service_tag, disabled, running, comment}]",
+        always, vlan_list),
+    cmd!(query "interface.bridge.list", "Bridges", [], None,
+        "{} → [{name, mtu, mac_address, ports (count), disabled, running, comment}]",
+        always, bridge_list),
+    cmd!(query "interface.loopback.list", "Loopbacks", [], None,
+        "{} → [{name, mtu, disabled, running, comment}]",
+        always, loopback_list),
     cmd!(
         "interface.bridge.add",
         "Add Bridge",
@@ -66,7 +77,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         port_remove
     ),
     cmd!(query "interface.bridge.port.list", "Bridge Ports", ["Interfaces"], None,
-        "{bridge?: string} → [{bridge, interface}]",
+        "{bridge?: string} → [{interface, bridge}]",
         always, port_list),
     cmd!(
         "interface.loopback.add",
@@ -94,6 +105,14 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
     let filter = opt_str(p, "type")?;
     let live = s.hal_mut().poll();
     s.watch_links(&live);
+    // G1.29b: USB adapters, by the bus the link dump names (no query for
+    // the others).
+    let usb: BTreeMap<IfName, Value> = live
+        .iter()
+        .filter(|l| l.bus.as_deref() == Some("usb"))
+        .take(crate::usb_nic::MAX_LISTED)
+        .filter_map(|l| Some((l.name.clone(), crate::usb_nic::summary(s, &l.name)?)))
+        .collect();
     let cfg = s.store().candidate();
     let mut rows: Vec<Value> = cfg
         .interfaces
@@ -142,6 +161,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                 "bond": i.bond,
                 "vrf": i.vrf,
                 "table": table,
+                "usb": usb.get(&i.name),
             })
         })
         .collect();
@@ -170,6 +190,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                     "comment": "",
                     "parent": null,
                     "vlan_id": null,
+                    "usb": usb.get(&l.name),
                     "bridge": null,
                     "bond": null,
                     "vrf": null,
@@ -177,6 +198,142 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                 })
             }),
     );
+    Ok(Value::Array(rows))
+}
+
+type Typed = Vec<(Interface, Option<corerouter_hal::LinkState>)>;
+
+/// The config interfaces `keep` selects, each with its kernel link (if
+/// any), in config order: the rows of the per-type lists (G3.9hl). Also
+/// the links left over (a VLAN's parent, for its MAC).
+pub(super) fn typed(
+    s: &mut Session,
+    keep: impl Fn(&InterfaceKind) -> bool,
+) -> (Typed, Vec<corerouter_hal::LinkState>) {
+    let mut live = s.hal_mut().poll();
+    s.watch_links(&live);
+    let rows = s
+        .store()
+        .candidate()
+        .interfaces
+        .values()
+        .filter(|i| keep(&i.kind))
+        .map(|i| {
+            let st = live
+                .iter()
+                .position(|l| l.name == i.name)
+                .map(|at| live.swap_remove(at));
+            (i.clone(), st)
+        })
+        .collect();
+    (rows, live)
+}
+
+fn running(st: Option<&corerouter_hal::LinkState>) -> bool {
+    st.is_some_and(|l| l.running)
+}
+
+fn vlan_list(s: &mut Session, _: &Value) -> Result<Value> {
+    let (vlans, live) = typed(s, |k| matches!(k, InterfaceKind::Vlan { .. }));
+    // Without its own, a VLAN carries its parent's MAC (Linux and RouterOS),
+    // up a stack of VLANs (QinQ). Two maps, built once: O(1) per row.
+    let mut macs: BTreeMap<&IfName, &str> = live
+        .iter()
+        .filter_map(|l| Some((&l.name, l.mac.as_deref()?)))
+        .collect();
+    macs.extend(
+        vlans
+            .iter()
+            .filter_map(|(i, st)| Some((&i.name, st.as_ref()?.mac.as_deref()?))),
+    );
+    let parents: BTreeMap<&IfName, &IfName> = vlans
+        .iter()
+        .filter_map(|(i, _)| match &i.kind {
+            InterfaceKind::Vlan { parent, .. } => Some((&i.name, parent)),
+            _ => None,
+        })
+        .collect();
+    let mac_of = |name: &IfName| {
+        let mut at = name;
+        // A stack is short; the bound only stops a loop the config forbids.
+        for _ in 0..8 {
+            if let Some(m) = macs.get(at) {
+                return Some((*m).to_owned());
+            }
+            at = parents.get(at)?;
+        }
+        None
+    };
+    let rows = vlans
+        .iter()
+        .filter_map(|(i, st)| {
+            let InterfaceKind::Vlan {
+                parent,
+                vlan_id,
+                service_tag,
+            } = &i.kind
+            else {
+                return None;
+            };
+            Some(json!({
+                "name": i.name,
+                "mtu": i.mtu,
+                "vlan_id": vlan_id.get(),
+                "interface": parent,
+                "mac_address": mac_of(&i.name),
+                "use_service_tag": service_tag,
+                "disabled": i.disabled,
+                "running": running(st.as_ref()),
+                "comment": i.comment,
+            }))
+        })
+        .collect();
+    Ok(Value::Array(rows))
+}
+
+fn bridge_list(s: &mut Session, _: &Value) -> Result<Value> {
+    let mut ports: BTreeMap<IfName, usize> = BTreeMap::new();
+    for b in s
+        .store()
+        .candidate()
+        .interfaces
+        .values()
+        .filter_map(|i| i.bridge.clone())
+    {
+        *ports.entry(b).or_default() += 1;
+    }
+    let rows = typed(s, |k| matches!(k, InterfaceKind::Bridge))
+        .0
+        .into_iter()
+        .map(|(i, st)| {
+            json!({
+                "name": i.name,
+                "mtu": i.mtu,
+                "mac_address": st.as_ref().and_then(|l| l.mac.clone()),
+                "ports": ports.get(&i.name).copied().unwrap_or(0),
+                "disabled": i.disabled,
+                "running": running(st.as_ref()),
+                "comment": i.comment,
+            })
+        })
+        .collect();
+    Ok(Value::Array(rows))
+}
+
+fn loopback_list(s: &mut Session, _: &Value) -> Result<Value> {
+    let rows = typed(s, |k| matches!(k, InterfaceKind::Loopback))
+        .0
+        .into_iter()
+        .map(|(i, st)| {
+            json!({
+                "name": i.name,
+                "mtu": i.mtu,
+                "disabled": i.disabled,
+                "running": running(st.as_ref()),
+                "comment": i.comment,
+            })
+        })
+        .collect();
     Ok(Value::Array(rows))
 }
 
@@ -487,7 +644,7 @@ fn port_list(s: &mut Session, p: &Value) -> Result<Value> {
         .values()
         .filter_map(|i| Some((i.bridge.as_ref()?, &i.name)))
         .filter(|(b, _)| filter.as_ref().is_none_or(|f| f == *b))
-        .map(|(b, i)| json!({ "bridge": b, "interface": i }))
+        .map(|(b, i)| json!({ "interface": i, "bridge": b }))
         .collect();
     Ok(Value::Array(rows))
 }

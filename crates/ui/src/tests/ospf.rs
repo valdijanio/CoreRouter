@@ -182,3 +182,25 @@ fn a_click_on_a_tab_switches_it() {
     refresh(&mut h);
     assert_eq!(panel(&mut h).tab, Tab::Keychains);
 }
+
+/// G3.9c: the Stub Router column and the Drain / Undrain button of the
+/// Instances tab run `stub_router` on the selected instance.
+#[test]
+fn drain_and_undrain_an_instance() {
+    let mut h = open(lab());
+    tab(&mut h, Tab::Instances);
+    assert!(h.has_text("Stub Router"));
+    assert!(!h.has_text("administrative"));
+    h.click(h.text("10.255.0.1"));
+    h.idle();
+    h.click(h.text("Drain"));
+    settle(&mut h);
+    refresh(&mut h);
+    assert!(lock(&h.session).store().running().routing.ospf.instances["v2"].stub_router);
+    assert!(h.has_text("administrative"), "{:?}", panel(&mut h).instances);
+    h.click(h.text("Undrain"));
+    settle(&mut h);
+    refresh(&mut h);
+    assert!(!lock(&h.session).store().running().routing.ospf.instances["v2"].stub_router);
+    assert!(h.has_text("Drain"));
+}

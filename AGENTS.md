@@ -53,6 +53,25 @@ outros roteadores, RFCs, kernel, crates). Antes de planejar:
 Quando um humano pede uma feature, mostre a ele esse resumo (MikroTik, outros, melhorias
 propostas) **antes** de implementar e deixe-o escolher o escopo.
 
+### Código de terceiros: ler o fonte e testar por dentro (obrigatório)
+
+Pedido do usuário (2026-10-29). Vale para toda dúvida, problema ou análise de desempenho que
+passe por um pacote de terceiros que o CoreRouter usa ou embarca: FRR, kernel Linux, buildroot,
+nftables, crates. Não decida por suposição, documentação ou tentativa e erro por fora:
+
+1. **Leia o código do pacote** na versão que usamos (a da imagem: veja `os/`; a do `Cargo.lock`)
+   e no master atual: a função envolvida, quem a chama, o histórico (`git log`) e as issues.
+2. **Coloque logs e meça por dentro** quando a leitura não fechar a questão: compile o pacote com
+   símbolos (`-O0 -g`) e logs no caminho suspeito, ligue os `debug` dele, pegue core dump e
+   backtrace, e reproduza no laboratório (`cargo xtask vm-lab run`) até ver o que acontece.
+3. **Registre a evidência**: arquivo e linha do pacote, versão, log ou backtrace, número medido.
+   No PR, cite-os na seção `## Pesquisa` ou `## Desempenho e paralelismo`.
+4. **Corrija onde está o defeito**: um patch no pacote da imagem (no buildroot, em `os/`) e o
+   texto do PR/relato para o projeto de origem, que o usuário revisa e publica (publicar é
+   decisão dele). Contorno do nosso lado só com o motivo escrito.
+
+Os builds e fontes de terceiros ficam em `/srv/build`, nunca no `/home`.
+
 ### Todo pedido, feature ou correção: o que mostrar antes de implementar
 
 Vale para pedido de feature nova, melhoria de tela e correção de bug. Antes do código, entregue
@@ -229,7 +248,9 @@ MCP: `claude mcp add corerouter -- corerouter-cli mcp` (detalhes em `docs/mcp.md
   o completo roda no lote da fila de entrada e na `main`. No GitHub os passos
   rodam em jobs paralelos (`lint`, `test`, `bench-check`, `netns`, `xdp-root`, cada um com
   `cargo xtask ci --only <passos>`), e o check exigido `xtask ci (linux)` confere todos. Para
-  repetir só um passo localmente: `cargo xtask ci --only netns` (ou `cargo xtask netns`).
+  repetir só um passo localmente: `cargo xtask ci --only netns` (ou `cargo xtask netns`). No lote
+  da fila, `test`, `bench-check` e `netns` rodam no runner próprio quando ele está online (VM
+  `corerouter-ci`, só código confiável; `docs/ci-runner.md`).
 - **Orçamento de testes (G0.30): o tempo do portão não cresce com o número de testes.**
   - **Camadas:** a **rápida** (`--affected`, `--fast` e o job `test` do PR) roda tudo menos os
     testes cujo nome (da função ou de um módulo) começa com `slow_`, com `PROPTEST_CASES=32`;

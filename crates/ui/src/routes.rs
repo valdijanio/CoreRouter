@@ -52,6 +52,39 @@ const COLUMNS: [table::Column; 9] = [
     comment(),
 ];
 
+/// What a route does with a packet (G1.5a, RouterOS v6 `type`): through
+/// its gateway, or dropped without next hop. A byte: it sits in the
+/// padding of [`RouteForm`], which the dialogs hold twice.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum RouteType {
+    #[default]
+    Unicast,
+    Blackhole,
+    Unreachable,
+    Prohibit,
+}
+
+impl RouteType {
+    const ALL: [Self; 4] = [Self::Unicast, Self::Blackhole, Self::Unreachable, Self::Prohibit];
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Unicast => "unicast",
+            Self::Blackhole => "blackhole",
+            Self::Unreachable => "unreachable",
+            Self::Prohibit => "prohibit",
+        }
+    }
+
+    /// The `type` of a row; unknown or absent (an older daemon): unicast.
+    fn of(s: Option<&str>) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|t| Some(t.as_str()) == s)
+            .unwrap_or_default()
+    }
+}
+
 /// What `check_gateway` takes (RouterOS `check-gateway`).
 const CHECK_METHODS: [&str; 4] = ["none", "ping", "arp", "bfd"];
 
@@ -123,6 +156,8 @@ pub(crate) struct Route {
     pub gateway_interface: Option<String>,
     /// `reachable` | `unreachable`; `None` for a connected route.
     pub gateway_status: Option<String>,
+    /// G1.5a: through the gateway, or dropped without next hop.
+    pub kind: RouteType,
     /// check-gateway (G1.27f): method and status.
     pub check: Option<Check>,
     pub distance: String,
@@ -228,6 +263,7 @@ impl Route {
             gateway_address: opt("gateway_address"),
             gateway_interface: opt("gateway_interface"),
             gateway_status: opt("gateway_status"),
+            kind: RouteType::of(row.get("type").and_then(Value::as_str)),
             mpls: opt("mpls_out"),
             check,
             distance: text("distance"),
@@ -294,8 +330,13 @@ impl Route {
         }
     }
 
-    /// Address, then the interface and reachability as chips.
+    /// Address, then the interface and reachability as chips; a route
+    /// without next hop is its type as a neutral chip (G1.5a: dropped on
+    /// purpose, not a failure).
     pub(crate) fn gateway_cell(&self) -> String {
+        if self.kind != RouteType::Unicast {
+            return cell("", &[(self.kind.as_str(), Kind::Neutral)]);
+        }
         let link = self.interface.as_ref().or(self.gateway_interface.as_ref());
         let mut chips: Vec<(&str, Kind)> = Vec::new();
         let text = match (&self.gateway_address, link) {
@@ -1012,6 +1053,8 @@ pub(crate) struct RouteForm {
     pub table: String,
     pub comment: String,
     pub disabled: bool,
+    /// G1.5a: `Unicast` goes through `gateway`.
+    pub kind: RouteType,
     /// `none` | `ping` | `arp` | `bfd` (G1.27f).
     pub check_gateway: String,
     /// BFD profile of `check_gateway = bfd`; empty: `default`.
@@ -1029,9 +1072,11 @@ impl RouteForm {
     }
 
     pub(crate) fn of(r: &Route) -> Self {
+        let unicast = r.kind == RouteType::Unicast;
         Self {
             dst: r.dst.clone(),
-            gateway: r.gateway.clone(),
+            gateway: if unicast { r.gateway.clone() } else { String::new() },
+            kind: r.kind,
             distance: r.distance.clone(),
             table: r.table.clone(),
             comment: r.comment.clone(),
@@ -1043,6 +1088,15 @@ impl RouteForm {
 
     /// `ip.route.add` params; blank optional fields are left to the engine.
     pub(crate) fn add_params(&self) -> Value {
+        if !self.unicast() {
+            return json!({
+                "dst_address": self.dst.trim(),
+                "type": self.kind.as_str(),
+                "distance": form_number(&self.distance),
+                "routing_table": opt_text(self.table.trim()),
+                "comment": opt_text(&self.comment),
+            });
+        }
         let bfd = self.check_gateway == "bfd";
         json!({
             "dst_address": self.dst.trim(),
@@ -1055,13 +1109,22 @@ impl RouteForm {
         })
     }
 
+    /// Through a gateway (not a route without next hop).
+    fn unicast(&self) -> bool {
+        self.kind == RouteType::Unicast
+    }
+
     /// `ip.route.set` params for what differs from `base`; `None` if nothing.
     pub(crate) fn set_params(&self, id: &str, base: &RouteForm) -> Option<Value> {
         let mut p = Map::new();
         if self.dst.trim() != base.dst {
             p.insert("dst_address".into(), json!(self.dst.trim()));
         }
-        if self.gateway.trim() != base.gateway {
+        if self.kind != base.kind {
+            p.insert("type".into(), json!(self.kind.as_str()));
+        }
+        // Back to unicast sends the gateway even if its text is the same.
+        if self.unicast() && (self.gateway.trim() != base.gateway || self.kind != base.kind) {
             p.insert("gateway".into(), json!(self.gateway.trim()));
         }
         if self.distance.trim() != base.distance {
@@ -1076,7 +1139,7 @@ impl RouteForm {
         if self.disabled != base.disabled {
             p.insert("disabled".into(), json!(self.disabled));
         }
-        if self.check_gateway != base.check_gateway {
+        if self.unicast() && self.check_gateway != base.check_gateway {
             p.insert("check_gateway".into(), json!(self.check_gateway));
         }
         // The engine drops the profile when the method leaves bfd.
@@ -1992,6 +2055,22 @@ fn info(ui: &mut Ui, f: &Form, help: &mut Option<HelpView>, key: &'static str, t
     }
 }
 
+/// G1.5a: the route's type as chips, like check-gateway's.
+fn type_fields(ui: &mut Ui, f: &Form, r: &mut RouteForm, help: &mut Option<HelpView>) {
+    ui.horizontal(|ui| {
+        ui.label("Type");
+        info(ui, f, help, "routes.type", "Type");
+    });
+    ui.horizontal(|ui| {
+        for t in RouteType::ALL {
+            if filter_chip(ui, t.as_str(), r.kind == t) {
+                r.kind = t;
+            }
+        }
+    });
+    ui.end_row();
+}
+
 /// G1.27f: check-gateway as chips, and the BFD profile when it is bfd.
 fn check_fields(ui: &mut Ui, f: &Form, r: &mut RouteForm, help: &mut Option<HelpView>) {
     ui.horizontal(|ui| {
@@ -2031,18 +2110,26 @@ fn form_fields(
     help: &mut Option<HelpView>,
 ) {
     f.text(ui, "Dst. Address", "dst_address", &mut r.dst, "0.0.0.0/0");
-    f.text(
-        ui,
-        "Gateway",
-        "gateway",
-        &mut r.gateway,
-        "10.0.0.1 or ether1",
-    );
+    type_fields(ui, f, r, help);
+    if r.unicast() {
+        f.text(
+            ui,
+            "Gateway",
+            "gateway",
+            &mut r.gateway,
+            "10.0.0.1 or ether1",
+        );
+    } else {
+        // G1.5a: no next hop, nothing to check.
+        read_only(ui, "Gateway", "");
+    }
     f.text(ui, "Distance", "distance", &mut r.distance, "1");
     ui.label("Routing Table");
     crate::windows::combo(ui, "route-table", MAIN, &mut r.table, tables);
     ui.end_row();
-    check_fields(ui, f, r, help);
+    if r.unicast() {
+        check_fields(ui, f, r, help);
+    }
     f.text(ui, "Comment", "comment", &mut r.comment, "");
     if with_disabled {
         ui.label("Disabled");

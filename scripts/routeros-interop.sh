@@ -3,8 +3,9 @@
 # RouterOS v7 CHR. Runs as root inside the lab VM only:
 #   cargo xtask vm-lab run -- scripts/routeros-interop.sh [case…]
 # Cases (default: all, in this order): ospf-ptp ospf-broadcast ospf-auth
-#   ospf-mtu ospf-areas redistribute entry ldp bfd exit failover ospfv3
-#   prod (last: it restarts the CoreRouter on the docs/producao-core.md blocks)
+#   ospf-mtu ospf-areas redistribute entry ldp mpls-ttl bfd exit failover
+#   stub-router ospfv3 prod (last: it restarts the CoreRouter on the
+#   docs/producao-core.md blocks)
 # HOLD=<s> keeps the lab up that long at the end (inspect it with
 # `cargo xtask vm-lab ssh`). Results: a table at the end and
 # /tmp/crg39/results.txt in the VM; exit 1 if any case failed.
@@ -32,7 +33,7 @@ exec 9>&-
 ROS_VERSION=${ROS_VERSION:-7.25}
 ROS_SHA256=${ROS_SHA256:-6b981288350de2a2c7a3218bd820ab702633b8cd6cd339f2bb34dda1f1a2550e}
 CASES=("$@")
-[ ${#CASES[@]} -gt 0 ] || CASES=(ospf-ptp ospf-broadcast ospf-auth ospf-mtu ospf-areas redistribute entry ldp bfd exit failover ospfv3 prod)
+[ ${#CASES[@]} -gt 0 ] || CASES=(ospf-ptp ospf-broadcast ospf-auth ospf-mtu ospf-areas redistribute entry ldp mpls-ttl bfd exit failover stub-router ospfv3 prod)
 W=/tmp/crg39
 CHR_DIR=/srv/lab/chr
 PW=g39-lab-only
@@ -268,15 +269,19 @@ install -d -o frr -g frr "$d" /var/run/frr/crcore
 for p in bgpd ospfd ospf6d ldpd bfdd; do : > "$d/$p.conf"; done
 chown frr:frr "$d"/*.conf
 # The daemons the image starts (corerouter-init), mgmtd first.
-ip netns exec crcore /usr/lib/frr/mgmtd -N crcore -d
-sleep 0.5
-ip netns exec crcore /usr/lib/frr/zebra -N crcore -d -f "$d/zebra.conf"
-sleep 1
-ip netns exec crcore /usr/lib/frr/staticd -N crcore -d
-for p in bgpd ospfd ospf6d ldpd; do ip netns exec crcore /usr/lib/frr/$p -N crcore -d -f "$d/$p.conf"; done
-ip netns exec crcore /usr/lib/frr/bfdd -N crcore -d -f "$d/bfdd.conf" \
-  --dplaneaddr unix:/var/run/frr/crcore/bfdd_dplane.sock
-for _ in $(seq 50); do [ -S /var/run/frr/crcore/bfdd_dplane.sock ] && break; sleep 0.2; done
+start_cr_frr() {
+  local d=/etc/frr/crcore
+  ip netns exec crcore /usr/lib/frr/mgmtd -N crcore -d
+  sleep 0.5
+  ip netns exec crcore /usr/lib/frr/zebra -N crcore -d -f "$d/zebra.conf"
+  sleep 1
+  ip netns exec crcore /usr/lib/frr/staticd -N crcore -d
+  for p in bgpd ospfd ospf6d ldpd; do ip netns exec crcore /usr/lib/frr/$p -N crcore -d -f "$d/$p.conf"; done
+  ip netns exec crcore /usr/lib/frr/bfdd -N crcore -d -f "$d/bfdd.conf" \
+    --dplaneaddr unix:/var/run/frr/crcore/bfdd_dplane.sock
+  for _ in $(seq 50); do [ -S /var/run/frr/crcore/bfdd_dplane.sock ] && break; sleep 0.2; done
+}
+start_cr_frr
 export COREROUTER_RUNTIME_DIR=$W/run
 rm -rf "$COREROUTER_RUNTIME_DIR" "$W/cfg"
 mkdir -p "$COREROUTER_RUNTIME_DIR"
@@ -632,11 +637,61 @@ case_ldp() {
   result ldp INFO "CR LSP ping 10.255.39.3/32 (R3, through CHR): $(cli tool.task.poll "{\"id\":$tid,\"text\":true}" | jq -r '(.summary_lines // []) | join(" ")' | head -c 300)"
 }
 
+# G3.9d: traceroutes that cross the CoreRouter as a labeled hop. CHR pushes
+# the CoreRouter's LDP label for R4's loopback (propagate-ttl: the IP TTL
+# goes into the label); at TTL 1 it expires at the CoreRouter, whose kernel
+# drops it silently. Our responder sends the time exceeded with the label
+# stack (RFC 4950), which RouterOS shows as MPLS:L=…
+ros_trace() { # ros_trace <dst> <src>: one probe per hop, as JSON
+  jq -n --arg a "$1" --arg s "$2" '{address: $a, "src-address": $s, count: "1", "use-dns": "no", timeout: "1s"}' |
+    curl -s -m 30 -u "admin:$PW" -H 'content-type: application/json' -d @- "http://$ROS/rest/tool/traceroute"
+}
+cr_hop() { # cr_hop <json>: the CoreRouter's hop (10.39.1.2, ether1) as text
+  jq -r '[.[] | select((.address // "") == "10.39.1.2")][0] // {} | "\(.address // "-") \(.status // "") loss=\(.loss // "")"' <<< "$1"
+}
+case_mpls-ttl() {
+  ldp_up
+  wait_for 90 ldp_ok >/dev/null || { result mpls-ttl FAIL "LDP: CR '$(cr_ldp)' CHR '$(ros_ldp)'"; return; }
+  wait_for 40 mpls_routes >/dev/null || true
+  sleep 3
+  result mpls-ttl INFO "CR label for R4: $(cr_label 10.255.39.4/32)"
+  # Before: what the Linux forwarder alone does.
+  cli mpls.settings.set '{"icmp_ttl_exceeded":false}' >/dev/null
+  sleep 3
+  local t; t=$(ros_trace 10.255.39.4 10.255.39.1)
+  echo "$t" > "$W/trace-off.json"
+  result mpls-ttl INFO "CHR traceroute, icmp_ttl_exceeded=no: $(jq -c '[.[] | {address, status, loss}]' <<< "$t" | head -c 400)"
+  [ "$(cr_hop "$t" | cut -d' ' -f1)" = - ] \
+    && result mpls-ttl OK "without the setting the CoreRouter hop is silent (the kernel drops it)" \
+    || result mpls-ttl INFO "the CoreRouter hop answered without the setting: $(cr_hop "$t")"
+  # After.
+  cli mpls.settings.set '{"icmp_ttl_exceeded":true}' >/dev/null
+  sleep 3
+  t=$(ros_trace 10.255.39.4 10.255.39.1)
+  echo "$t" > "$W/trace-on.json"
+  result mpls-ttl INFO "CHR traceroute: $(jq -c '[.[] | {address, status, loss}]' <<< "$t" | head -c 400)"
+  local hop; hop=$(cr_hop "$t")
+  [[ $hop == 10.39.1.2*MPLS* ]] && result mpls-ttl OK "CHR traceroute shows the CoreRouter hop with its label: $hop" \
+    || result mpls-ttl FAIL "CHR traceroute, CoreRouter hop: '$hop'"
+  [ "$(jq -r '[.[] | select((.address // "") == "10.255.39.4")] | length' <<< "$t")" -ge 1 ] \
+    && result mpls-ttl OK "and goes on to R4" || result mpls-ttl FAIL "R4 missing from the CHR traceroute"
+  # From R3 (Linux traceroute -e prints the RFC 4950 object), two labels
+  # deep in the CHR's core: R3 → CHR (swap) → CoreRouter (pop) → R4.
+  local lt; lt=$(ip netns exec crr3 traceroute -n -e -q1 -w1 -s 10.255.39.3 10.255.39.4 2>&1 | tail -n +2 | tr -s ' ')
+  result mpls-ttl INFO "traceroute R3 → R4: $(tr '\n' ';' <<< "$lt")"
+  grep -q '10.39.1.2.*MPLS' <<< "$lt" && result mpls-ttl OK "R3's traceroute shows the CoreRouter hop with its label" \
+    || result mpls-ttl FAIL "R3's traceroute, no labeled CoreRouter hop"
+  sleep 2 # the counters reach the session once a second
+  result mpls-ttl INFO "CR icmp_counters: $(cli mpls.settings.get | jq -c .icmp_counters)"
+  [ "$(cli mpls.settings.get | jq '.icmp_counters.sent // 0')" -ge 2 ] \
+    && result mpls-ttl OK "the CoreRouter counted its errors" || result mpls-ttl FAIL "icmp_counters.sent < 2"
+}
+
 bfd_on=0
 bfd_up() {
   [ $bfd_on = 1 ] && return
   bfd_on=1
-  # 300 ms × 3: at 100 ms a new session with RouterOS flaps (case bfd).
+  # 300 ms × 3 first; the case then goes to 100 ms (stable since G3.9b).
   cli routing.bfd.profile.add '{"name":"g39","min_tx":300,"min_rx":300,"multiplier":3,"dampening":false}' >/dev/null
   tset '{"bfd":"g39"}'
   cli routing.ospf.interface-template.set "{\"id\":\"$T2\",\"bfd\":\"g39\"}" >/dev/null
@@ -678,7 +733,8 @@ case_bfd() {
   result bfd INFO "300 ms × 3: $((f1 - f0)) BFD downs in 30 s with the session up"
   set_bfd_ms 100
   sleep 10; f0=$(bfd_downs); sleep 30; f1=$(bfd_downs)
-  result bfd INFO "100 ms × 3, changed with the session up (Poll): $((f1 - f0)) downs in 30 s"
+  [ $((f1 - f0)) = 0 ] && result bfd OK "100 ms × 3, changed with the session up (Poll): no downs in 30 s" \
+    || result bfd FAIL "100 ms × 3, changed with the session up (Poll): $((f1 - f0)) downs in 30 s"
   # New sessions on both of CHR's BFD links: to us and to R4 (FRR bfdd).
   local r0 r1
   r0=$(ros_bfd_downs 10.255.39.4)
@@ -687,7 +743,11 @@ case_bfd() {
 /routing ospf interface-template set [find interfaces=ether3] use-bfd=yes' >/dev/null
   sleep 5; f0=$(bfd_downs); sleep 30; f1=$(bfd_downs)
   r1=$(ros_bfd_downs 10.255.39.4)
-  result bfd INFO "100 ms × 3, new session: CoreRouter—CHR $((f1 - f0)) downs in 30 s; CHR—R4 (FRR bfdd) $((r1 - r0)) 'bfd down' in CHR's log"
+  # G3.9b: RouterOS keeps sending at ~1 s right after Up; our detect
+  # time holds the slow rate until a packet proves the new one.
+  [ $((f1 - f0)) = 0 ] && result bfd OK "100 ms × 3, new session: CoreRouter—CHR no downs in 30 s" \
+    || result bfd FAIL "100 ms × 3, new session: CoreRouter—CHR $((f1 - f0)) downs in 30 s"
+  result bfd INFO "100 ms × 3, new session: CHR—R4 (FRR bfdd) $((r1 - r0)) 'bfd down' in CHR's log; CR session $(cli routing.bfd.session.list | jq -c '[.sessions[] | select(.peer == "10.39.1.1") | {state, detect_time_us, rx_gap_p99_us, flaps_24h}][0]')"
   # Which profile survives a new session: RouterOS sends at ~1 s right
   # after Up, so the detect time has to cover that.
   local m
@@ -797,6 +857,117 @@ case_failover() {
   vtysh -N crr4 -c 'configure terminal' -c 'interface eth0' -c 'no ip ospf bfd' >/dev/null
   outage silent-no-bfd nft_dead nft_alive
   bfd_on=0
+}
+
+# G3.9c: stub router (RFC 6987). R3 pings R4's loopback every 10 ms; the
+# best path crosses the CoreRouter (CHR → CR → R4, cost 30 against the
+# direct CHR → R4 at 1000). Measured: the pings lost when the CoreRouter
+# is drained and undrained with traffic on it, and when it comes back from
+# a reboot with and without `on-startup` (the reboot: carrier lost on both
+# ports, FRR and the daemon killed, routes flushed; then the links come
+# back and everything starts again, as after a power cycle).
+lost_after() { # lost_after <t> <ping -D output>: pings lost after time t
+  python3 -I - "$1" "$2" <<'PY'
+import re, sys
+t = float(sys.argv[1]); prev = None; lost = 0
+for line in open(sys.argv[2]):
+    m = re.match(r"\[(\d+\.\d+)\].*icmp_seq=(\d+)", line)
+    if not m: continue
+    at, seq = float(m.group(1)), int(m.group(2))
+    if prev is not None and at >= t: lost += max(0, seq - prev - 1)
+    prev = seq
+print(lost)
+PY
+}
+cr_stub() { cli routing.ospf.instance.list | jq -r '.[] | select(.name == "v2") | .stub_state.state // "none"'; }
+cr_stub_is() { [ "$(cr_stub)" = "$1" ]; }
+ping_r3_r4() { ip netns exec crr3 ping -D -i 0.01 -W 1 -I 10.255.39.3 10.255.39.4 > "$1" 2>&1 & echo $!; }
+# Writes the pings lost after power-on to $W/reboot-<label>.lost. Never
+# call it inside $(…): the daemon and FRR it restarts inherit the pipe and
+# the command substitution never sees EOF.
+cr_reboot() { # cr_reboot <label>
+  local label=$1 log="$W/ping-stub-$1.txt"
+  wait_for 90 via_cr 10.255.39.4/32 >/dev/null || true
+  sleep 3
+  local pp; pp=$(ping_r3_r4 "$log")
+  sleep 2
+  local t0; t0=$(date +%s.%N)
+  mon 'set_link e1 off'; ip -n crcore link set ether2 down
+  kill -9 "$(cat "$W/daemon.pid")" 2>/dev/null || true
+  pkill -9 -f -- "-N crcore" 2>/dev/null || true
+  ip -n crcore route flush proto ospf 2>/dev/null || true
+  ip -n crcore -f mpls route flush 2>/dev/null || true
+  wait_for 30 not_via_cr >/dev/null || true
+  sleep 5
+  # Power back: the links first, then FRR, then the CoreRouter.
+  local tr trms; tr=$(date +%s.%N); trms=$(now_ms)
+  mon 'set_link e1 on'; ip -n crcore link set ether2 up
+  start_cr_frr
+  start_daemon
+  local full via stub
+  full=$(wait_for 90 full_both) || true
+  stub=$(cr_stub)
+  via=$(wait_for 150 via_cr 10.255.39.4/32) || true
+  [ "$via" = -1 ] || via=$(( $(now_ms) - trms ))
+  sleep 10
+  kill -INT "$pp"; wait "$pp" 2>/dev/null || true
+  local sent recv back
+  sent=$(grep -o '[0-9]* packets transmitted' "$log" | cut -d' ' -f1)
+  recv=$(grep -o '[0-9]* received' "$log" | cut -d' ' -f1)
+  back=$(lost_after "$tr" "$log")
+  result stub-router INFO "reboot $label: Full ${full} ms after power-on (stub state then: $stub); CHR back through the CoreRouter at ${via} ms; $back pings lost after power-on, $((sent - recv)) of $sent in all"
+  result stub-router INFO "reboot $label: holes (time after the cut: length): $(gaps "$t0" "$log")"
+  echo "$back" > "$W/reboot-$label.lost"
+}
+case_stub-router() {
+  [ -n "$(cli routing.ospf.interface-template.list | jq -r '.[] | select(.comment == "clientes de teste") | .id')" ] || {
+    cli ip.address.add '{"address":"100.64.39.1/24","interface":"ether3"}' >/dev/null
+    cli routing.ospf.interface-template.add '{"area":"backbone","interfaces":"ether3","passive":true,"comment":"clientes de teste"}' >/dev/null
+  }
+  wait_for 90 via_cr 10.255.39.4/32 >/dev/null || { result stub-router FAIL "no path through the CoreRouter to start from: $(ros_route 10.255.39.4/32)"; return; }
+  sleep 3
+  # Drain and undrain with traffic on it.
+  local pp t0 ms lost
+  pp=$(ping_r3_r4 "$W/ping-stub-drain.txt")
+  sleep 2
+  t0=$(date +%s.%N)
+  cli routing.ospf.instance.set '{"id":"v2","stub_router":true}' >/dev/null
+  ms=$(wait_for 30 not_via_cr) || true
+  local r c st
+  r=$(ros_route 10.255.39.4/32); c=$(ros_route 100.64.39.0/24)
+  st=$(wait_for 10 cr_stub_is administrative) && st=administrative || st=$(cr_stub)
+  [[ $r == 10.39.3.2* ]] && result stub-router OK "drain: CHR → R4 leaves the CoreRouter ($r) ${ms} ms after the command; the daemon says $st" \
+    || result stub-router FAIL "drain: CHR → R4 is '$r' (stub state $st)"
+  [[ $c == 10.39.1.2* ]] && result stub-router OK "drain: the clients' subnet still goes to the CoreRouter ($c)" \
+    || result stub-router FAIL "drain: 100.64.39.0/24 on CHR is '$c'"
+  ip netns exec crr3 ping -c 3 -i 0.2 -W 1 -I 10.255.39.3 100.64.39.1 >/dev/null \
+    && result stub-router OK "drain: R3 reaches a client gateway on the CoreRouter" || result stub-router FAIL "drain: R3 → 100.64.39.1"
+  local metric
+  metric=$(ros 'routing/ospf/lsa' | jq -r '[.[] | select(.originator == "10.255.39.2" and .type == "router")][0].body // ""' | tr '\n' ' ' | cut -c1-200)
+  result stub-router INFO "drain: the CoreRouter's router-LSA on CHR: $metric"
+  sleep 3
+  lost=$(lost_after "$t0" "$W/ping-stub-drain.txt")
+  result stub-router INFO "drain: $lost pings lost (10 ms apart); holes: $(gaps "$t0" "$W/ping-stub-drain.txt")"
+  local t1; t1=$(date +%s.%N)
+  cli routing.ospf.instance.set '{"id":"v2","stub_router":false}' >/dev/null
+  ms=$(wait_for 30 via_cr 10.255.39.4/32) || true
+  sleep 3
+  kill -INT "$pp"; wait "$pp" 2>/dev/null || true
+  lost=$(lost_after "$t1" "$W/ping-stub-drain.txt")
+  [ "$ms" != -1 ] && result stub-router OK "undrain: CHR back through the CoreRouter ${ms} ms after the command; $lost pings lost" \
+    || result stub-router FAIL "undrain: CHR → R4 is $(ros_route 10.255.39.4/32)"
+  # A reboot without, then with on-startup. Set on a running instance it
+  # must not drain now (ospfd arms it at an area's first router-LSA).
+  local plain timed
+  cr_reboot plain; plain=$(cat "$W/reboot-plain.lost" 2>/dev/null || echo "?")
+  cli routing.ospf.instance.set '{"id":"v2","stub_router_on_startup":60}' >/dev/null
+  sleep 5
+  via_cr 10.255.39.4/32 && [ "$(cr_stub)" = off ] \
+    && result stub-router OK "on-startup set on the running instance: no drain until the next start" \
+    || result stub-router FAIL "on-startup on a running instance: stub $(cr_stub), CHR → R4 $(ros_route 10.255.39.4/32)"
+  cr_reboot on-startup-60; timed=$(cat "$W/reboot-on-startup-60.lost" 2>/dev/null || echo "?")
+  result stub-router INFO "pings lost after power-on: $plain without on-startup, $timed with on-startup 60 s"
+  cli routing.ospf.instance.set '{"id":"v2","stub_router_on_startup":null}' >/dev/null
 }
 
 case_ospfv3() {

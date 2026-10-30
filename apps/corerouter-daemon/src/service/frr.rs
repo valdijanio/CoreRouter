@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use corerouter_engine::{Shared, lock};
 use corerouter_hal::routing::RoutingReader;
 use corerouter_hal_frr::Frr;
+use corerouter_hal_frr::on_demand::OnDemand;
 use corerouter_model::Config;
 use corerouter_model::routing_state::RoutingStatus;
 
@@ -27,12 +28,20 @@ const TICK: Duration = Duration::from_secs(2);
 
 pub(crate) const SERVICE: super::Service = super::Service {
     name: "frr",
-    flags: &[super::Flag {
-        name: "--frr",
-        value: Some("<dir>"),
-        help: "drive FRR through the vty sockets in <dir> (FRR's default is\n/var/run/frr): \
-               routing commits and routing.bgp.session.list",
-    }],
+    flags: &[
+        super::Flag {
+            name: "--frr",
+            value: Some("<dir>"),
+            help: "drive FRR through the vty sockets in <dir> (FRR's default is\n/var/run/frr): \
+                   routing commits and routing.bgp.session.list",
+        },
+        super::Flag {
+            name: "--frr-daemons",
+            value: Some("<file>"),
+            help: "with --frr: write the protocol daemons the config uses (bgpd, ospfd,\n\
+                   ospf6d, ldpd, bfdd) to <file>, for the image's init to start (G1.6i)",
+        },
+    ],
     topic: "route",
     enable: "--frr /var/run/frr",
     depends: &[],
@@ -45,13 +54,20 @@ fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
     if dir.as_deref() == Some("") {
         return Err("--frr needs the directory of FRR's vty sockets".into());
     }
+    let daemons = ctx.flag("--frr-daemons").map(str::to_owned);
+    if daemons.as_deref() == Some("") {
+        return Err("--frr-daemons needs a file".into());
+    }
     Ok(Box::new(move |health: &super::Health| {
         let Some(dir) = &dir else {
             health.disabled(Some("no --frr <dir>"));
             health.idle_until_shutdown();
             return Ok(());
         };
-        let frr = Frr::new(dir);
+        let mut frr = Frr::new(dir);
+        if let Some(f) = &daemons {
+            frr = frr.with_on_demand(OnDemand::new(f));
+        }
         let (reader, synced) = lock(&session).attach_routing(Box::new(frr));
         match &synced {
             Ok(()) => health.event(format!("attached to FRR in {dir}")),
@@ -126,9 +142,18 @@ fn run(session: &Shared, mut reader: Box<dyn RoutingReader>, synced: bool, healt
                             health.error(e.to_string());
                         }
                     }
+                    // G3.9c: stub router (one more small answer each).
+                    match reader.ospf_stub_state(&cfg) {
+                        Ok(st) => status.ospf_stub = st,
+                        Err(e) => {
+                            status.error = Some(e.to_string());
+                            health.error(e.to_string());
+                        }
+                    }
                 } else {
                     status.ospf_neighbors.clear();
                     status.ospf_interfaces.clear();
+                    status.ospf_stub.clear();
                 }
             }
             Err(e) => {
@@ -140,6 +165,7 @@ fn run(session: &Shared, mut reader: Box<dyn RoutingReader>, synced: bool, healt
                 status.bgp_sessions.clear();
                 status.ospf_neighbors.clear();
                 status.ospf_interfaces.clear();
+                status.ospf_stub.clear();
                 health.error(e.to_string());
             }
         }

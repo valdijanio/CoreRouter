@@ -62,6 +62,9 @@ fn base() -> Config {
             graceful_restart_time: None,
             graceful_stale_time: None,
             graceful_defer_time: None,
+            graceful_notification: None,
+            hard_admin_reset: None,
+            llgr_stale_time: None,
         },
     );
     for c in [

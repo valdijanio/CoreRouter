@@ -29,9 +29,15 @@ const MAX_LIST: usize = 128;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("interface.ethernet.set", "Set Ethernet", [], None,
-        "{name: string, auto_negotiation?: bool, speed?: string (forced rate with auto_negotiation=false: 10Mbps | 100Mbps | 1Gbps | 2.5Gbps | 10Gbps | … or a link mode: 100M-baseT-full, 1000baseT/Full), duplex?: full|half (forced, with auto_negotiation=false), advertise?: [string] | string (link modes to advertise, kernel or RouterOS names, comma-separated; all = every one the port supports), rx_flow_control?: on|off|auto, tx_flow_control?: on|off|auto, offloads?: string | object (gro:off,tso:on or {\"rx-gro\": false}; short or kernel names), reset?: bool (forget every setting: back to the port's own), force?: bool (change the link of the port this connection uses outside Safe Mode; turn LRO on)} → {name, ethernet, warnings}",
+        "{name: string, auto_negotiation?: bool (default true: the port negotiates), speed?: string (forced rate with auto_negotiation=false: 10Mbps | 100Mbps | 1Gbps | 2.5Gbps | 10Gbps | … or a link mode: 100M-baseT-full, 1000baseT/Full), duplex?: full|half (forced, with auto_negotiation=false), advertise?: [string] | string (link modes to advertise, kernel or RouterOS names, comma-separated; all = every one the port supports), rx_flow_control?: on|off|auto, tx_flow_control?: on|off|auto, offloads?: string | object (gro:off,tso:on or {\"rx-gro\": false}; short or kernel names), reset?: bool (forget every setting: back to the port's own), force?: bool (change the link of the port this connection uses outside Safe Mode; turn LRO on)} → {name, ethernet, warnings}",
         always, set)
     .positional("name"),
+    // `/interface ethernet print` (G3.9hl): the ports with what
+    // `interface.ethernet.set` changed on them, as `set` takes it back
+    // (`/export` writes it from here).
+    cmd!(query "interface.ethernet.list", "Ethernet", [], None,
+        "{} → [{name, mtu, mac_address, auto_negotiation, speed, duplex, advertise, rx_flow_control, tx_flow_control, offloads (name:on|off,…), disabled, running, comment}]",
+        always, list),
     cmd!(query "interface.ethernet.cable-test", "Cable Test", [], None,
         "{name: string, force?: bool (test the port this connection uses: its link drops for a few seconds)} → {id, task_id, columns}",
         can_run, cable_test)
@@ -401,7 +407,7 @@ pub(super) fn management_ports(s: &Session) -> Option<(IpAddr, BTreeSet<IfName>)
 
 /// Refuse to disturb the link of the port this connection uses, unless in
 /// Safe Mode (losing the connection undoes it) or `force`.
-fn guard_link(s: &Session, name: &IfName, force: bool, what: &str) -> Result<Option<String>> {
+pub(super) fn guard_link(s: &Session, name: &IfName, force: bool, what: &str) -> Result<Option<String>> {
     let Some((ip, ports)) = management_ports(s) else {
         return Ok(None);
     };
@@ -460,6 +466,43 @@ fn capabilities(s: &mut Session, name: &IfName) -> Result<EthernetMonitor> {
             )
         }
     })
+}
+
+fn list(s: &mut Session, _: &Value) -> Result<Value> {
+    let rows = super::interface::typed(s, |k| matches!(k, InterfaceKind::Ethernet))
+        .0
+        .into_iter()
+        .map(|(i, st)| {
+            let e = &i.ethernet;
+            let offloads = (!e.offloads.is_empty()).then(|| {
+                e.offloads
+                    .iter()
+                    .map(|(k, on)| format!("{k}:{}", if *on { "on" } else { "off" }))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            });
+            let mac = st
+                .as_ref()
+                .and_then(|l| l.mac.clone())
+                .or_else(|| i.mac.map(|m| m.to_string()));
+            json!({
+                "name": i.name,
+                "mtu": i.mtu,
+                "mac_address": mac,
+                "auto_negotiation": e.auto_negotiation,
+                "speed": e.speed_mbps.map(rate),
+                "duplex": e.full_duplex.map(|f| if f { "full" } else { "half" }),
+                "advertise": e.advertise,
+                "rx_flow_control": e.rx_flow_control.map(FlowControl::label),
+                "tx_flow_control": e.tx_flow_control.map(FlowControl::label),
+                "offloads": offloads,
+                "disabled": i.disabled,
+                "running": st.as_ref().is_some_and(|l| l.running),
+                "comment": i.comment,
+            })
+        })
+        .collect();
+    Ok(Value::Array(rows))
 }
 
 fn set(s: &mut Session, p: &Value) -> Result<Value> {

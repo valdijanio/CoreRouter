@@ -563,10 +563,11 @@ fn run(s: &mut Session, st: &Step) {
 }
 
 proptest::proptest! {
-    // 48 cases at most (~10 s on the GitHub runner); the quick layer's
-    // `PROPTEST_CASES=32` lowers it (G0.30 ceiling).
+    // 48 cases at most (~10 s on the GitHub runner); the quick layer
+    // (`PROPTEST_CASES=32`) runs 12: 32 took 11.7 s on the runner once the
+    // journal covered every routing section (G0.30 ceiling).
     #![proptest_config(proptest::prelude::ProptestConfig::with_cases(
-        std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).map_or(48, |c: u32| c.min(48))
+        std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).map_or(48, |c: u32| if c <= 32 { 12 } else { c.min(48) })
     ))]
     /// The same commands through the journal and through slot-only saving
     /// (every save writes the slot) give the same store, after every

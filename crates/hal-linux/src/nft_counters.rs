@@ -34,9 +34,9 @@ const NFTA_COUNTER_BYTES: u16 = 1;
 const NFTA_COUNTER_PACKETS: u16 = 2;
 const NFTNL_UDATA_RULE_COMMENT: u8 = 0;
 
-/// At most this many rules from one dump (a hostile kernel, or a table
-/// far above the validator's 4096 rules × a few kernel rules each).
-pub const MAX_RULES: usize = 200_000;
+/// At most this many rules from one dump (a hostile kernel): every table
+/// full (`MAX_RULES` each, G0.31j) with two kernel rules per rule.
+pub const MAX_RULES: usize = corerouter_firewall::validate::MAX_RULES * 8;
 
 /// One kernel rule, as far as counters need it.
 #[derive(Debug, Clone, PartialEq, Eq)]

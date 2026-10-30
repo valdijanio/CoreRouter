@@ -61,6 +61,14 @@ mod nic;
 #[cfg(target_os = "linux")]
 mod netlink;
 
+/// How many times `apply` read the kernel's whole route table in this
+/// process (G0.31i): tests check a commit of one route reads none.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn route_dumps() -> u64 {
+    netlink::ROUTE_DUMPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg(target_os = "linux")]
 pub mod nft;
 
@@ -602,10 +610,11 @@ mod linux {
                 .collect();
             let (skip, run): (Vec<Op>, Vec<Op>) = ops
                 .into_iter()
-                .partition(|op| external.contains_key(op.link().as_str()));
+                .partition(|op| op.link().is_some_and(|l| external.contains_key(l.as_str())));
             for op in &skip {
-                let why = external.get(op.link().as_str()).map_or("", String::as_str);
-                log::warn!("not applied: {op} ('{}' is not managed: {why})", op.link());
+                let link = op.link().map_or("", |l| l.as_str());
+                let why = external.get(link).map_or("", String::as_str);
+                log::warn!("not applied: {op} ('{link}' is not managed: {why})");
             }
             let owned = crate::plan::owned_routes(from, to, &run);
             match crate::netlink::apply(&run, &owned) {
@@ -974,6 +983,7 @@ mod linux {
                         mac: l.mac,
                         unmanaged: o.reason().map(str::to_owned),
                         errors: l.errors,
+                        bus: l.bus,
                     })
                 })
                 .collect()
@@ -1017,16 +1027,30 @@ mod linux {
                 links.insert(name.clone(), snap);
                 managed.insert(l.index, name);
             }
-            let (mut addresses, routes) = crate::netlink::held(&managed)?;
+            let (mut addresses, routes, discards) = crate::netlink::held(&managed)?;
             // 127.0.0.1/8 and ::1 on `lo` are the OS's, never CoreRouter's.
             addresses.retain(|(link, a)| {
                 !(corerouter_model::os_loopback::is_os_loopback(cfg, link)
                     && corerouter_model::os_loopback::is_os_address(a))
             });
+            // G1.5a: routes without next hop have no link; those of the
+            // config's tables (main and its VRFs) are CoreRouter's to compare.
+            let tables: std::collections::BTreeSet<u32> =
+                std::iter::once(corerouter_model::route::MAIN_TABLE_ID)
+                    .chain(cfg.interfaces.values().filter_map(|i| match i.kind {
+                        corerouter_model::InterfaceKind::Vrf { table } => Some(table),
+                        _ => None,
+                    }))
+                    .collect();
+            let discards = discards
+                .into_iter()
+                .filter(|d| tables.contains(&d.table))
+                .collect();
             Ok(Snapshot {
                 links,
                 addresses,
                 routes,
+                discards,
             })
         }
 
@@ -1219,6 +1243,14 @@ mod linux {
 
         fn packet_capture(&self) -> Result<corerouter_hal::capture::SharedCapture, String> {
             Ok(std::sync::Arc::new(crate::capture::HostCapture))
+        }
+
+        fn usb_reset(
+            &mut self,
+            name: &IfName,
+            level: corerouter_hal::nic::UsbResetLevel,
+        ) -> Result<Box<dyn corerouter_hal::nic::UsbReset>, HalError> {
+            Ok(Box::new(crate::nic::usb_reset(name.as_str(), level)?))
         }
 
         fn cable_tester(&mut self, name: &IfName) -> Result<Box<dyn CableTest>, HalError> {

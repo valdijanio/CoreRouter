@@ -1,0 +1,175 @@
+# G0.28: o pacote do gerenciador (GUI + CLI, `cargo xtask package gui`) no GitHub Releases.
+#
+# - tag `v*` (ex. `v0.1.0`, `v0.2.0-rc.1`): build do .deb, SHA256SUMS, notas da versão tiradas
+#   do docs/log.md desde a tag anterior e uma Release em **rascunho** (o dono revisa e publica);
+# - workflow_dispatch (com uma versão) e PR que mexe neste arquivo ou no empacotamento: só o
+#   build, com os arquivos como artifact do run — nenhuma Release.
+#
+# Roda nos runners do GitHub (não no self-hosted): o pacote sai de uma máquina limpa, sem cache.
+# Ubuntu 22.04: o `Depends: libc6 (>= …)` é a glibc mais nova que os binários pedem, a do
+# runner no máximo (2.35); instala no Ubuntu 22.04+ e no Debian 12+. A imagem do roteador não
+# entra: ela é assinada com a chave de release do dono, que não vai para o CI público; ele a
+# anexa a este rascunho com `cargo xtask os release` (docs/release.md).
+# Actions fixadas por SHA; o comentário diz a versão.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/release.yml
+      - xtask/src/package.rs
+      - xtask/src/package/**
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Versão do teste (a do workspace, com pré-release opcional: 0.1.0-test.1). Só gera os arquivos, sem Release."
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (.deb)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # As tags e o histórico: notas desde a tag anterior e a versão do .deb.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Sem cache de propósito (nem o do cargo, nem o de pacotes do .github/actions/setup, que
+      # é das máquinas 24.04 do ci): o pacote publicado não herda nada de outro run.
+      - name: Dependências de sistema e toolchain (rust-toolchain.toml)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev
+          rustup toolchain install --no-self-update
+          rustup show
+
+      - name: Versão
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT: ${{ inputs.version }}
+        run: |
+          case "$EVENT" in
+            push) v="${REF_NAME#v}" ;;
+            workflow_dispatch) v="${INPUT#v}" ;;
+            # PR: a versão do workspace com uma pré-release de teste.
+            *) v="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "xtask") | .version')-pr.${{ github.event.pull_request.number }}" ;;
+          esac
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "versão: $v"
+
+      # `--version` recusa uma versão que não seja a do workspace (+ pré-release): o pacote e os
+      # binários (server.info, barra da GUI) dizem o mesmo.
+      - name: cargo xtask package gui
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cargo xtask package gui --version "$VERSION" --out dist
+          cd dist
+          # Pré-release: o GitHub troca caracteres fora de [A-Za-z0-9._-] no nome do anexo, e o
+          # SHA256SUMS deixaria de bater. O `~` fica na versão de dentro do pacote (dpkg -f).
+          for f in *~*.deb; do [ -e "$f" ] && mv -- "$f" "${f//\~/-}"; done
+          sha256sum -- *.deb > SHA256SUMS
+          cat SHA256SUMS
+          dpkg-deb --info -- *.deb
+
+      - name: Notas da versão (docs/log.md desde a tag anterior)
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          exclude=()
+          [ "$EVENT" = push ] && exclude=(--exclude "$REF_NAME")
+          prev="$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${exclude[@]}" HEAD 2>/dev/null || true)"
+          deb="$(cd dist && ls -- *.deb)"
+          {
+            echo "## Instalar (Debian 12+, Ubuntu 22.04+, amd64)"
+            echo
+            echo "Baixe \`$deb\` e \`SHA256SUMS\` desta página, confira e instale:"
+            echo
+            echo '```sh'
+            echo "sha256sum -c --ignore-missing SHA256SUMS"
+            echo "sudo apt install ./$deb"
+            echo '```'
+            echo
+            echo "O pacote traz a GUI (\`corerouter-gui\`, no menu em Rede → CoreRouter) e a CLI"
+            echo "(\`corerouter-cli\`). Detalhes em [docs/install-gui.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/docs/install-gui.md)."
+            echo
+            echo "## Imagem do roteador"
+            echo
+            echo "\`corerouter-<versão>.crpkg\` (atualização), \`-install.iso\` (instalador CD/USB), \`.qcow2\` e \`.ova\` (VM),"
+            echo "assinados com a chave de release (a pública está em \`os/keys/release/\`), quando anexados a esta página."
+            echo "Detalhes em [docs/release.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/docs/release.md)."
+            echo
+            if [ -n "$prev" ]; then
+              echo "## O que mudou desde $prev"
+            else
+              echo "## O que entrou (primeira versão)"
+            fi
+            echo
+            echo "Uma linha por entrada do [docs/log.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/docs/log.md), que tem o texto inteiro."
+            echo
+            cargo xtask package notes ${prev:+--since "$prev"}
+          } > dist/NOTES.md
+          wc -c dist/NOTES.md
+          head -n 30 dist/NOTES.md
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: corerouter-gui-${{ steps.version.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  # Só numa tag: a Release em rascunho. Único job com escrita, e não roda código do repositório
+  # (só o `gh` sobre os arquivos do build).
+  release:
+    name: release (rascunho)
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: corerouter-gui-${{ needs.build.outputs.version }}
+          path: dist
+
+      - name: gh release create --draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          pre=()
+          case "$VERSION" in *-*) pre=(--prerelease) ;; esac
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft "${pre[@]}" \
+            --title "CoreRouter $TAG" --notes-file dist/NOTES.md \
+            dist/*.deb dist/SHA256SUMS

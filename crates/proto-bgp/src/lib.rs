@@ -48,6 +48,8 @@ pub const GR_DEFER_TIME: u16 = 10;
 pub const GR_MAX_DEFER: u16 = 3600;
 /// The largest Restart Time the capability carries (12 bits).
 pub const GR_MAX_TIME: u16 = 4095;
+/// G3.9fj, RFC 9494 §3.1: the Long-Lived Stale Time is 24 bits.
+pub const LLGR_MAX_STALE: u32 = 0x00FF_FFFF;
 
 /// Minutes before a neighbor over its prefix limit is tried again, when
 /// the action is `restart` and no time is set.
@@ -616,6 +618,23 @@ fn render_instance(
     if let Some(t) = inst.graceful_restart_time.filter(|t| *t != GR_RESTART_TIME) {
         let _ = writeln!(s, " bgp graceful-restart restart-time {t}");
     }
+    // G3.9fj, RFC 8538: the N bit (§2) and the Hard Reset of an
+    // administrative reset (§3), both on by default since FRR 8.3
+    // (`bgp_vty.c`, `FRR_CFG_DEFAULT_BOOL`), which prints them only when
+    // off. Typing the `on` form at every commit would make the diff retype
+    // it, and `graceful-restart notification` sends a capability to every
+    // neighbor each time it is typed.
+    if inst.graceful_notification == Some(false) {
+        let _ = writeln!(s, " no bgp graceful-restart notification");
+    }
+    if inst.hard_admin_reset == Some(false) {
+        let _ = writeln!(s, " no bgp hard-administrative-reset");
+    }
+    // G3.9fj, RFC 9494: one stale time for every family (FRR has no per
+    // AFI/SAFI value); 0 is FRR's default and is not printed.
+    if let Some(t) = inst.llgr_stale_time.filter(|t| *t > 0) {
+        let _ = writeln!(s, " bgp long-lived-graceful-restart stale-time {t}");
+    }
     if neighbors
         .iter()
         .any(|(_, p)| p.graceful_restart == Some(true))
@@ -1089,6 +1108,9 @@ mod tests {
             graceful_restart_time: None,
             graceful_stale_time: None,
             graceful_defer_time: None,
+            graceful_notification: None,
+            hard_admin_reset: None,
+            llgr_stale_time: None,
         }
     }
 
@@ -1340,6 +1362,31 @@ mod tests {
         assert!(
             !text.contains("stalepath-time"),
             "the default is not printed: {text}"
+        );
+        // RFC 8538: only the off forms are printed (FRR's defaults are on).
+        assert!(
+            !text.contains("notification") && !text.contains("hard-administrative-reset"),
+            "{text}"
+        );
+        let inst = cfg.routing.bgp.get_mut("default").unwrap();
+        inst.graceful_notification = Some(false);
+        inst.hard_admin_reset = Some(false);
+        let text = render_config(&cfg, &|_| None).unwrap();
+        assert!(
+            text.contains(" no bgp graceful-restart notification\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(" no bgp hard-administrative-reset\n"),
+            "{text}"
+        );
+        // G3.9fj, RFC 9494: LLGR, off unless set.
+        assert!(!text.contains("long-lived"), "{text}");
+        cfg.routing.bgp.get_mut("default").unwrap().llgr_stale_time = Some(3600);
+        let text = render_config(&cfg, &|_| None).unwrap();
+        assert!(
+            text.contains(" bgp long-lived-graceful-restart stale-time 3600\n"),
+            "{text}"
         );
         // Nobody restarting: no F bit.
         cfg.routing.bgp_connections.remove("up");

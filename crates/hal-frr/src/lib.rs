@@ -21,6 +21,7 @@
 pub mod conf;
 pub mod fast_reroute;
 pub mod ldp;
+pub mod on_demand;
 pub mod ospf;
 pub mod render;
 pub mod rib;
@@ -65,6 +66,9 @@ pub struct Frr {
     owned: render::Owned,
     /// Opens the sealed TCP MD5 keys (the engine's, G3.2a).
     secrets: Option<SecretOpener>,
+    /// G1.6i: the protocol daemons are started by the image's init when
+    /// the config needs them.
+    on_demand: Option<on_demand::OnDemand>,
 }
 
 impl std::fmt::Debug for Frr {
@@ -73,6 +77,7 @@ impl std::fmt::Debug for Frr {
             .field("dir", &self.dir)
             .field("timeout", &self.timeout)
             .field("owned", &self.owned)
+            .field("on_demand", &self.on_demand)
             .finish_non_exhaustive()
     }
 }
@@ -99,7 +104,15 @@ impl Frr {
             max_reply: MAX_REPLY,
             owned: render::OWNED,
             secrets: None,
+            on_demand: None,
         }
+    }
+
+    /// G1.6i: asks for bgpd, ospfd, ospf6d, ldpd and bfdd through `file`
+    /// (the image's init starts and stops them; [`on_demand`]).
+    pub fn with_on_demand(mut self, od: on_demand::OnDemand) -> Self {
+        self.on_demand = Some(od);
+        self
     }
 
     /// What FRR should run for `cfg`, keys opened with the engine's opener.
@@ -254,6 +267,10 @@ impl Frr {
     /// the two, not their sum; docs/architecture.md has the numbers).
     pub fn sync(&self, desired: &Conf) -> Result<Synced, HalError> {
         let wanted = render::by_daemon(self.owned, desired);
+        let needed = on_demand::needed(&wanted);
+        if let Some(od) = &self.on_demand {
+            od.before_sync(&needed, |d| self.socket(d));
+        }
         let jobs: Vec<(Daemon, Conf)> = Daemon::ALL
             .into_iter()
             .filter(|d| self.owned.iter().any(|(_, ds)| ds.contains(d)))
@@ -314,6 +331,9 @@ impl Frr {
         if let Some(e) = error {
             rollback(self, done);
             return Err(e);
+        }
+        if let Some(od) = &self.on_demand {
+            od.after_sync(&needed);
         }
         if !synced.leftover.is_empty() {
             log::warn!(
@@ -464,6 +484,38 @@ impl Frr {
             st.igp_sync = ldp::ospf_sync(&t).unwrap_or_default();
         }
         Ok(Some(st))
+    }
+
+    /// G3.9c: the stub router state of `cfg`'s instances (main VRF), one
+    /// `show … json` each.
+    pub fn ospf_stub_state(
+        &self,
+        cfg: &Config,
+    ) -> Result<Vec<corerouter_model::ospf_state::OspfStubState>, HalError> {
+        use corerouter_model::ospf::Version;
+        let mut out = Vec::new();
+        for inst in cfg.routing.ospf.instances.values() {
+            if inst.disabled || inst.vrf != corerouter_model::ospf::MAIN_VRF {
+                continue;
+            }
+            let (d, cmd) = match inst.version {
+                Version::V2 => (Daemon::Ospfd, "show ip ospf json"),
+                Version::V3 => (Daemon::Ospf6d, "show ipv6 ospf6 json"),
+            };
+            let mut vty = self.connect(d)?;
+            let r = vty.run(cmd).map_err(|e| io_err(d, e))?;
+            let t = String::from_utf8_lossy(&r.output).into_owned();
+            // Not running yet: a warning, not JSON.
+            if !r.ok() || !t.trim_start().starts_with('{') {
+                continue;
+            }
+            let st = match inst.version {
+                Version::V2 => ospf::stub_v2(&t, &inst.name),
+                Version::V3 => ospf::stub_v3(&t, &inst.name),
+            };
+            out.push(st.map_err(HalError::Rejected)?);
+        }
+        Ok(out)
     }
 
     /// G3.4b: the OSPF neighbors and interfaces of `cfg`'s instances (the
@@ -991,6 +1043,13 @@ impl RoutingReader for FrrReader {
         self.0.ospf_state(cfg)
     }
 
+    fn ospf_stub_state(
+        &mut self,
+        cfg: &Config,
+    ) -> Result<Vec<corerouter_model::ospf_state::OspfStubState>, HalError> {
+        self.0.ospf_stub_state(cfg)
+    }
+
     fn ospf_lsdb(
         &mut self,
         cfg: &Config,
@@ -1090,6 +1149,9 @@ mod tests {
                 graceful_restart_time: None,
                 graceful_stale_time: None,
                 graceful_defer_time: None,
+                graceful_notification: None,
+                hard_admin_reset: None,
+                llgr_stale_time: None,
             },
         );
         let e = frr.render(&cfg).map(|c| frr.sync(&c));

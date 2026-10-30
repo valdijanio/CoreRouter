@@ -1359,7 +1359,10 @@ dependencies = [
 name = "corerouter-image"
 version = "0.1.0"
 dependencies = [
+ "argon2",
  "corerouter-sysupdate",
+ "ring",
+ "rpassword",
  "serde_json",
 ]
 

@@ -538,6 +538,33 @@ leitura do kernel continua sob o lock, porque o HAL é do `Session`. Com a confi
 mais de 2 ms. Antes eram 345 ms no `ip.route.list` e 112 ms no `address-list.list` (**medido**;
 tabela no `docs/perf.md`).
 
+### Respostas em stream (G0.31h)
+
+Fora do lock ainda sobrava a memória: o `ip.route.list` de 60 000 rotas montava uma árvore
+`serde_json::Value` de 29 chaves por linha, depois a string da linha inteira (33 MB) e a cópia
+para o socket. No host o RSS do daemon foi de 312 para 884 MiB numa chamada e a 1 415 MiB com
+duas conexões ao mesmo tempo; na imagem de 2 GiB o kernel matou o daemon por OOM. O malloc da
+glibc (o da imagem também: toolchain Bootlin glibc 2.39) não devolve esse pico: os nós do
+`Value` são blocos pequenos espalhados pela arena, e o `systrim` só solta o topo do heap.
+
+Agora a consulta grande devolve um `off_lock::Streamed` (`Session::defer_stream`) com dois modos:
+
+- **`write`**: o canal de controle (TCP e TLS) escreve o envelope `{"id","ok","result":` e as
+  linhas direto no socket, uma por vez (`Row`, `#[derive(Serialize)]` que empresta da `Line`
+  em cache), por um `BufWriter` de 64 KiB. Nada do tamanho da resposta fica na memória.
+- **`value`**: quem chama no processo (`Session::execute`: GUI local, CLI sem daemon, lotes,
+  testes) recebe o `Value` montado das mesmas `Row`, sem passar por bytes.
+
+Sem árvore e sem string, não há o que devolver ao sistema: `malloc_trim` não entrou (e
+precisaria de `unsafe`). O WebSocket ainda junta a mensagem num buffer (1× a resposta), porque o
+frame leva o tamanho na frente. Os campos da `Row` estão na ordem alfabética do mapa do `Value`,
+e o JSON sai igual byte a byte (teste `a_streamed_list_is_the_json_of_its_rows`).
+
+Uma lista de 10 000+ linhas por vez por sessão (`LARGE_LIST`): a segunda recebe "busy" com o que
+fazer (filtrar ou `ip.route.page`), porque o snapshot e o tempo de um leitor lento continuam
+sendo do roteador. Não há limite padrão de linhas: um `print` que corta rotas sem avisar engana
+o operador, e o RouterOS também imprime tudo; com o stream o tamanho deixou de custar memória.
+
 Comparado com as alternativas:
 - **Paginar as listas:** já existe o `ip.route.page`, mas mudaria o contrato das listas inteiras
   que a CLI, o MCP e os scripts usam.
