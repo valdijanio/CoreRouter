@@ -2904,11 +2904,12 @@ mod tests {
         let v = corerouter_buildinfo::VERSION;
         assert!(h.has_text(&format!("daemon abc1234 ≠ GUI {v}")));
         // G0.32: the readable versions, amber while the protocol matches.
-        h.app.cache.info = json!({"name": "corerouter", "version": "0.1.0-dev.1", "version_full": "0.1.0-dev.1+abc1234",
+        // (a version no build of ours has: a shallow CI clone is `0.1.0-dev`)
+        h.app.cache.info = json!({"name": "corerouter", "version": "9.9.9-dev.1", "version_full": "9.9.9-dev.1+abc1234",
             "auth": "required", "commit": "abc1234", "protocol": corerouter_buildinfo::PROTOCOL});
         h.idle();
-        assert_eq!(h.app.stale_daemon().as_deref(), Some("0.1.0-dev.1"));
-        assert!(h.has_text(&format!("daemon 0.1.0-dev.1 ≠ GUI {v}")));
+        assert_eq!(h.app.stale_daemon().as_deref(), Some("9.9.9-dev.1"));
+        assert!(h.has_text(&format!("daemon 9.9.9-dev.1 ≠ GUI {v}")));
         assert!(!h.app.protocol_differs());
         // Same version, other commit: both in full.
         h.app.cache.info = json!({"name": "corerouter", "version": v, "version_full": format!("{v}+abc1234"),

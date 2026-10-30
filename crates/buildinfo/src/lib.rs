@@ -5,7 +5,8 @@
 
 /// `0.1.0` on a release tag, else `0.1.0-dev.<N>`: N counts the commits
 /// behind the build, so it grows by one per PR on the main and tells how far
-/// apart two builds are.
+/// apart two builds are. A shallow clone, without the commits to count, says
+/// `0.1.0-dev`.
 pub const VERSION: &str = env!("COREROUTER_VERSION");
 
 /// Short git commit of the build, or `unknown` outside a git checkout.

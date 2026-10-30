@@ -45,10 +45,14 @@ fn main() {
             if tagged && !dirty {
                 base.clone()
             } else {
-                let n = git(&["rev-list", "--count", "HEAD"])
-                    .and_then(|n| n.parse::<u64>().ok())
-                    .unwrap_or(0);
-                format!("{base}-dev.{n}")
+                // A shallow clone (the GitHub checkout) does not have the
+                // commits to count: say `dev` without a made-up number.
+                let shallow =
+                    git(&["rev-parse", "--is-shallow-repository"]).is_some_and(|s| s == "true");
+                match git(&["rev-list", "--count", "HEAD"]).and_then(|n| n.parse::<u64>().ok()) {
+                    Some(n) if !shallow => format!("{base}-dev.{n}"),
+                    _ => format!("{base}-dev"),
+                }
             }
         }
     };
