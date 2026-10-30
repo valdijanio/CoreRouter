@@ -95,10 +95,17 @@ pub fn main() {
     if let Err(e) = crate::links::loopback_up() {
         log!("lo up: {e} (the control channel listens on 127.0.0.1)");
     }
-    mount_config();
+    let config_dev = mount_config();
     let names = name_ports(Some(Path::new(crate::ports::MAP_FILE)));
     spawn_hotplug_names(crate::ports::MAP_FILE);
     let trial = trial_at_boot(&cmdline);
+    // G1.6v: outside a trial, /config's partition takes the rest of the
+    // disk (its filesystem follows at the next boot).
+    if let Some(dev) = &config_dev {
+        for l in crate::grow::table(dev, trial.is_some()) {
+            log(&l);
+        }
+    }
     for dir in [plan::RUNTIME_DIR, "/var/log", "/var/lib", "/var/tmp"] {
         if let Err(e) = fs::create_dir_all(dir) {
             log!("{dir}: {e}");
@@ -537,8 +544,9 @@ fn mount_api(m: &plan::Mount) {
 
 /// `/config` from the `config` partition; tmpfs (and a loud warning) when
 /// it is missing or does not mount, so the router still comes up and can be
-/// reached to fix it.
-fn mount_config() {
+/// reached to fix it. Returns the partition's device when it mounted.
+/// G1.6v: a filesystem smaller than its partition grows first.
+fn mount_config() -> Option<String> {
     let _ = fs::create_dir_all(plan::CONFIG_DIR);
     let deadline = Instant::now() + CONFIG_WAIT;
     let dev = loop {
@@ -552,6 +560,9 @@ fn mount_config() {
     };
     let fl = MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC | MountFlags::NOATIME;
     if let Some(dev) = dev {
+        for l in crate::grow::filesystem(&dev) {
+            log(&l);
+        }
         match rustix::mount::mount(
             dev.as_str(),
             plan::CONFIG_DIR,
@@ -561,7 +572,7 @@ fn mount_config() {
         ) {
             Ok(()) => {
                 log!("/config: {dev} (ext4)");
-                return;
+                return Some(dev);
             }
             Err(e) => log!("/config: mount {dev}: {e}"),
         }
@@ -578,6 +589,7 @@ fn mount_config() {
     ) {
         log!("/config: tmpfs: {e}");
     }
+    None
 }
 
 fn find_partition(label: &str) -> Option<String> {
