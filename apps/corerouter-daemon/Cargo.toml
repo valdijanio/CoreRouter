@@ -106,5 +106,9 @@ harness = false
 name = "netns_conntrack"
 harness = false
 
+[[bench]]
+name = "netns_link_poll"
+harness = false
+
 [lints]
 workspace = true
