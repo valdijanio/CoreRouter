@@ -2963,3 +2963,5 @@ slow_ten_thousand_routes_one_refused`, kernel do host:
 |---|---|
 | `apply` inteiro (todas aceitas) | 236 ms |
 | `apply_routes_each` (1 recusada, as outras ficam) | 229 ms |
+
+- 2026-10-30 — G1.3f (**medido**, build release, namespace com dummies, 32 núcleos, load 3–5, bench `netns_link_poll` do daemon): com 10 000 links, dump de links 185 → 44 ms (dump enxuto próprio no lugar do `rtnetlink`), lock do `Session` segurado pelo tick 366–375 → 3,9–4,2 ms (leitura fora do lock e um dump por tick em vez de dois), espera máxima de um comando 372–377 → 4,0 ms; 1 000 links: 17,6–18,3 → 1,9 ms, 34–37 → 0,41 ms; 100 links: 1,4–1,6 → 0,2 ms, 2,96 → 0,06 ms.

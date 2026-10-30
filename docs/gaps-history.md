@@ -300,3 +300,5 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-30 — G1.3g parcial (só a regra de firewall recusada fica de fora, checagem sem aplicar, trava de gerência; máscara do boot nos caminhos laterais); G1.3h descartada por decisão do usuário (2026-10-30): sem firewall de emergência
 - 2026-10-30 — G1.6v criado e feito (`/config` ocupa o resto do disco)
 - 2026-10-30 — G1.3g feito (rotas uma a uma no boot, só a recusada de fora)
+- 2026-10-30 — G0.32 criado e feito (versão legível no lugar do commit, pedido do usuário)
+- 2026-10-30 — G1.3f feito (poll de links fora do lock, dump enxuto, um dump por tick); G1.3i criado (o resto da E/S do tick sob o lock)

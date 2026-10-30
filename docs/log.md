@@ -9388,3 +9388,78 @@ continuação indentadas).
 
   O `hal-linux netns` (12/18 antes) já tinha sido corrigido na `main` pelo G1.3b (#508): DAD
   `tentative` na comparação de `ip addr`.
+
+- 2026-10-30 — G0.32: Versão legível no lugar do commit (pedido do usuário). Antes, tudo era `0.1.0`, e só o commit
+  diferenciava as builds: a barra da GUI mostrava "daemon 320cb9d ≠ GUI b325b90". Agora, no padrão
+  SemVer 2.0:
+
+  - `corerouter-buildinfo` dá a versão `0.1.0` numa tag `v0.1.0` limpa, e `0.1.0-dev.<N>` fora
+    dela, com N = commits até a build. Cada PR integrado soma 1, e a mesma árvore dá o mesmo
+    número, então a imagem continua reproduzível.
+  - A versão completa é `0.1.0-dev.500+320cb9d`, com `.dirty` quando a build tem alterações sem
+    commit. Também entram a data do commit e o número do protocolo de controle (`PROTOCOL = 1`).
+    `COREROUTER_VERSION` força a versão numa build fora do git. Num clone raso (o checkout do GitHub), sem os commits para contar, a versão é `0.1.0-dev`, sem número inventado.
+  - `server.info` ganha `version_full`, `build`, `commit_time` e `protocol`, documentados em
+    `docs/control-protocol.md`.
+  - Na barra, o aviso virou um selo: "daemon 0.1.0-dev.498 ≠ GUI 0.1.0-dev.500". Ele é âmbar
+    quando só a build difere e vermelho quando o protocolo difere. O tooltip traz as duas builds
+    completas com a data do commit, e o ⓘ explica em português o que fazer. Com a mesma versão e
+    outro commit, as duas aparecem completas. Um daemon de antes da G0.32 continua comparado pelo
+    commit.
+  - System › Resources mostra "CoreRouter 0.1.0-dev.N" com a build no tooltip e um ⓘ.
+  - A CLI e o daemon ganham `-V`/`--version`: `corerouter-cli 0.1.0-dev.501+f62ead0
+    (2026-10-30 13:44:42 UTC, protocol 1)`.
+  - O pacote da imagem de desenvolvimento passa a se chamar `0.1.0-dev.N`, o mesmo número que o
+    daemon de dentro dela informa. A release continua com a versão da tag. O `.deb` mantém
+    `0.1.0+N.gCOMMIT`, porque mudar para `~dev` faria o apt ver as instalações existentes como mais
+    novas.
+
+  Como testar: `corerouter-cli --version`; abra a GUI contra um daemon de outra build e veja o selo
+  e o ⓘ; `cargo test -p corerouter-buildinfo`; o teste
+  `a_daemon_built_from_another_commit_is_flagged_in_the_top_bar` em `crates/ui`.
+
+- 2026-10-30 — G1.3f: Poll de links sem o lock do `Session`. O tick do relógio (uma vez por segundo) lia todos os links
+  do kernel segurando o lock: com 10 000 links (um BNG tem um `ppp` por assinante) eram ~370 ms em
+  que comandos, GUI e MCP esperavam (**medido**). Três mudanças:
+
+  - **Fora do lock.** O `Hal` ganhou `link_reader()` e `poll_sample()` (`crates/hal/src/link_reader.rs`):
+    o relógio (`crates/control/src/clock.rs`) e o serviço `link-events` do daemon pegam o leitor
+    sob o lock, leem com o lock solto e só juntam o resultado com o lock (`Session::tick_sampled`,
+    `Session::link_events_sampled`). A amostra leva a época do `LinuxHal`, que todo `apply` avança:
+    amostra de antes de um commit é recusada e o engine faz o poll sob o lock, como antes (raro). O
+    watchdog de hardware (G1.26c) é alimentado mesmo na recusa. O engine não ganhou thread
+    (WASM intacto); o laboratório virtual segue com o poll direto.
+  - **Um dump por tick.** O `watch_routes` lia as rotas e endereços IPv6 aprendidos (`ipv6_learned`)
+    com um mapa índice → nome que vinha de **outro** dump completo de links. Agora vem do poll do
+    mesmo tick (no máximo 1 s de idade; o `apply` o descarta).
+  - **Dump enxuto** (`crates/hal-linux/src/link_dump.rs`). O `rtnetlink` decodifica todos os
+    atributos de cada link, e o `netlink-packet-route` 0.33.0 formata os contadores de todo link
+    como texto mesmo sem erro (`src/link/attribute.rs:674` e `:684`; PR upstream
+    rust-netlink/netlink-packet-route#298, aberto). O poll agora faz o `RTM_GETLINK` num socket
+    netlink próprio e lê só os atributos do `KernelLink`. Dump marcado `NLM_F_DUMP_INTR` é lido de
+    novo (até 3 vezes). O `apply` e o diálogo da interface seguem com o `rtnetlink`.
+
+  Como testar: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
+  corerouter-hal-linux --test netns_link_dump` (o dump enxuto lê exatamente o que o `rtnetlink` lia
+  em dummy, VLAN, bridge, veth, bond, VRF, macvlan e 3000 links; um dump por tick; amostra de antes
+  de um `apply` recusada); `cargo test -p corerouter-engine --test it link_sample` (amostra nova sem
+  poll sob o lock; amostra de antes de um commit recusada e refeita, no tick e no `link_events`);
+  `cargo test -p corerouter-hal-linux --lib link_dump` (parser, proptest com bytes hostis). Bench:
+  `COREROUTER_NETNS_BENCH=1 unshare --user --map-root-user --net -- cargo bench -p
+  corerouter-daemon --bench netns_link_poll`.
+
+  Desempenho e paralelismo (**medido**, 2026-10-30, build release, namespace com dummies, 32
+  núcleos, load 3–5; antes = o mesmo bench no commit sem a mudança, rodadas alternadas A D D A):
+
+  | links | dump (`hal.poll`) antes → depois | lock segurado pelo tick antes → depois | espera máxima de um comando antes → depois |
+  |---|---|---|---|
+  | 100 | 1,4–1,6 ms → 0,19–0,22 ms | 2,96 ms → 0,06 ms | 3,2–4,3 ms → 0,01–0,12 ms |
+  | 1 000 | 17,6–18,3 ms → 1,9 ms | 34–37 ms → 0,41–0,42 ms | 40 ms → 0,04–0,52 ms |
+  | 10 000 | 185 ms → 44 ms | 366–375 ms → 3,9–4,2 ms | 372–377 ms → 4,0 ms |
+
+  A mediana da espera fica em ~1 µs nos dois casos: só quem cai no tick esperava. O trabalho por
+  link é constante (O(n) no total, sem custo escondido por item). Uma thread basta: o kernel monta
+  o dump em série num socket, e com 10 000 links ele ocupa 44 ms de um núcleo por segundo (4,4%);
+  dividir em vários sockets não tem como fatiar um `RTM_GETLINK` (o filtro por índice faz um pedido
+  por link). O que fica sob o lock (~4 ms com 10 000 links) é juntar o resultado: posse, ausentes,
+  tempos de link, gráficos.
