@@ -75,6 +75,9 @@ pub struct System {
     /// `/ip service www-ssl` and `www` (G1.6o): the GUI in a browser.
     #[serde(skip_serializing_if = "crate::web::WebService::is_default")]
     pub web: crate::web::WebService,
+    /// G1.29d: the USB adapter watchdog's per-adapter settings.
+    #[serde(skip_serializing_if = "crate::usb_watchdog::UsbWatchdog::is_default")]
+    pub usb_watchdog: crate::usb_watchdog::UsbWatchdog,
 }
 
 impl Default for System {
@@ -89,6 +92,7 @@ impl Default for System {
             bandwidth_server: crate::bandwidth::BandwidthServer::default(),
             graphing: crate::graphing::Graphing::default(),
             web: crate::web::WebService::default(),
+            usb_watchdog: crate::usb_watchdog::UsbWatchdog::default(),
         }
     }
 }

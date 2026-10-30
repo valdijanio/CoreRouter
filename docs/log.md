@@ -8825,3 +8825,55 @@ continuação indentadas).
   pelo tamanho onde quer que o terminador apareça. Teste novo determinístico
   (`a_too_long_answer_in_one_read_is_refused`: o servidor escreve a resposta toda antes da
   primeira leitura); falha sem a correção. Depois dela, 300 em 300 sob a mesma carga.
+
+- 2026-10-29 — G1.6t: Porta física nova entra na configuração sozinha. Antes só o primeiro boot semeava as portas:
+  um adaptador USB, uma placa PCIe hot-plug ou uma virtio acrescentada à VM ligada ficavam "not
+  in the configuration (appeared after boot)", sem aceitar endereço nem nada (achado na VM
+  `corerouter-teste`: a RTL8153 virou `ether4`, mas `ip.address.add` dizia "no interface
+  'ether4'"). Agora o tick do daemon (uma leitura de links por segundo, a mesma do `poll_links`)
+  chama o comando novo `interface.ethernet.adopt` (journal e log), com o MTU, o MAC e o estado
+  do kernel, para toda porta Ethernet gerenciável fora da config que manteve o nome por 3
+  leituras (o PID 1 renomeia `ethN` → `etherN` em ~100 ms, G1.6n: o nome do kernel nunca é
+  adotado). Com mudanças pendentes no candidato (modo transacional), espera o candidato ficar
+  limpo e o commit leva só a porta. Porta adotada que some e volta não é adotada de novo. Falha
+  tenta de novo depois de 60 leituras. O lab virtual ganhou portas que aparecem depois do boot
+  (`VirtualHal::with_late_port`).
+
+  Como testar: `cargo test -p corerouter-engine adopt`. Na VM, a porta nova aparece em
+  Interfaces como as outras e aceita configuração.
+
+- 2026-10-30 — G1.29d: Placas de rede USB, parte 4: vigia automático. Um adaptador USB travado é recuperado sem
+  operador, com os níveis da G1.29c. Travamento = o vigia de transmissão do kernel disparou nele
+  (`tx_timeout` cresceu, `NETDEV WATCHDOG`) ou o enlace está em pé enviando (≥ 5 pacotes) sem
+  receber nada por `stall_secs` (30 s por padrão), o padrão do RTL8153 que fica com o carrier em pé
+  e a fila morta. A primeira ação reinicia o driver; travou de novo antes de 10 min de calma,
+  reinicia a porta USB. Entre ações espera 30 s, dobrando até 15 min; com 6 ações numa hora para
+  e avisa (log de erro uma vez, saúde em erro): cabo, alimentação ou o chip precisam de gente.
+  Cada ação vai para o log ("ether4: USB adapter stalled (…): restarting its driver"). Ligado por
+  padrão em todo adaptador USB; `interface.usb.watchdog.set {name, enabled, stall_secs}` (config,
+  `system.usb_watchdog`, só quem difere do padrão) e `interface.usb.watchdog.print`. Saúde: check
+  `interface.usb.watchdog` (ok / aviso quando agiu na última hora / erro quando desistiu). GUI: linha
+  Watchdog na seção USB da aba Hardware, com a chave por adaptador e o estado; a confirmação dos
+  botões de recuperação toma o lugar deles (a aba tem altura fixa). O lab simula um adaptador que
+  trava (`VirtualHal::with_usb_stall`).
+
+  Como testar: `cargo test -p corerouter-engine watchdog` (Tx timeout é travamento, enlace quieto
+  não é; envia sem receber é; driver, depois porta, espera, desiste e avisa uma vez; calma volta ao
+  driver; desligado só conta; validação e rollback da config), `cargo test -p corerouter-ui usb`
+  (chave da GUI). Prints em `docs/changes/G1.29d-screenshots/`. Na VM `corerouter-teste`, com o
+  RTL8153 real (2026-10-29): `interface.usb.watchdog.print` mostra a `ether4` em `ok`, 0
+  travamentos, sem alarme falso (o adaptador está sem cabo, então sem tráfego). O travamento de
+  verdade não foi provocado no hardware: o kernel não deixa injetar `tx_timeout`, e sem cabo o
+  adaptador não transmite. A detecção e a escalada são testadas no lab simulado.
+
+- 2026-10-30 — G3.4l: O abort do `ospfd` com TI-LFA também acontece no `master` do FRR, e a correção resolve lá. Na VM,
+  com `scripts/frr-tilfa-repro.sh --topo square --sr on --churn rid --runs 40`:
+
+  - `master` `4ac34f1afa` (10.9.0-dev): 15 de 40 iterações com abort, todas no mesmo assert
+    (`ospf_spf.c:1268`);
+  - `master` com a correção do PR FRRouting/frr#24092: 0 de 40, com 19 passagens por LSA ausente
+    puladas e nenhuma rota faltando (**medido**, 2026-10-30).
+
+  Num core do `master` (gdb): `get_reverse_distance (…, w_lsa=0x0)`, com V = 10.255.0.2 e W =
+  10.255.0.1, o router-id antigo do R1. O resultado foi comentado na issue FRRouting/frr#24091, a
+  pedido do usuário. A tabela de `docs/frr-tilfa-abort.md` ganhou as duas linhas.

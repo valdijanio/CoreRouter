@@ -290,6 +290,14 @@ pub trait Hal: Send {
         )))
     }
 
+    /// The kernel's transmit timeouts of `name` (`NETDEV WATCHDOG`), summed
+    /// over its queues: read every second by the USB watchdog (G1.29d), so
+    /// cheap. `None`: the platform does not count them.
+    fn usb_tx_timeouts(&mut self, name: &IfName) -> Option<u64> {
+        let _ = name;
+        None
+    }
+
     /// A manual recovery of USB adapter `name` (G1.29c).
     fn usb_reset(
         &mut self,

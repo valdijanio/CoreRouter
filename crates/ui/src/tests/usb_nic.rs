@@ -107,3 +107,21 @@ fn restart_driver_is_confirmed_then_counted() {
     }
     assert!(h.has_text_containing("0 link · 1 driver · 0 port · last: driver, came back"));
 }
+
+/// G1.29d: the watchdog's line and its switch.
+#[test]
+fn the_watchdog_switch_turns_it_off_for_the_adapter() {
+    let mut h = Harness::new();
+    h.wait(1.1);
+    h.app.open_props("ether6");
+    h.wait(0.2);
+    h.tab("Hardware");
+    assert!(h.has_text("Watchdog"));
+    assert!(h.has_text_containing("ok · 0 stall(s)"));
+    let at = h.find_text("enabled").unwrap();
+    h.click(at);
+    h.wait(1.5);
+    let wd = lock(&h.session).store().running().system.usb_watchdog.clone();
+    assert!(!wd.port(&"ether6".parse().unwrap()).enabled);
+    assert!(h.has_text_containing("disabled · 0 stall(s)"));
+}

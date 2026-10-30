@@ -627,9 +627,21 @@ impl CoreRouterUi {
                 Some((name.clone(), level))
             })
             .collect();
+        let watchdog: Vec<(String, bool)> = nic
+            .iter_mut()
+            .filter_map(|(name, v)| {
+                let on = v.usb_watchdog_set.take()?;
+                v.usb_fast_until = now + 15.0;
+                Some((name.clone(), on))
+            })
+            .collect();
         self.nic = nic;
         for (name, level) in usb {
             self.run("interface.usb.reset", json!({"name": name, "level": level}));
+        }
+        // G1.29d: the watchdog switch of a Hardware tab.
+        for (name, on) in watchdog {
+            self.run("interface.usb.watchdog.set", json!({"name": name, "enabled": on}));
         }
         if let Some((key, title)) = help {
             let title = crate::i18n::tr_in("interfaces", self.lang.labels, title);

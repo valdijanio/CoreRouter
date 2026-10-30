@@ -82,7 +82,10 @@ G34L reverse-spf: root 10.255.0.4 V 10.255.0.2 (distance 30) link to W 10.255.0.
   W router-LSA ABSENT age 0 seq 0x00000000 stat -1; router-LSAs in LSDB 4
 ```
 
-e o backtrace que o próprio FRR grava no log é o mesmo do teste unitário.
+e o backtrace que o próprio FRR grava no log é o mesmo do teste unitário. Num core do `master`
+(gdb no container com os mesmos binários): `get_reverse_distance (…, w_lsa=0x0)` ←
+`ospf_spf_next` (V = 10.255.0.2, `l->link_id` = 10.255.0.1, o router-id antigo do R1,
+`area->spf_reversed = true`) ← `ospf_spf_calculate` ← `ospf_ti_lfa_generate_q_spaces`.
 
 Rodadas na VM, **medido** em 2026-10-29 (8 vCPUs, Ubuntu 24.04, build `-O0 -g3`), quadrado com
 SR e TI-LFA de link; cada iteração monta tudo do zero (~20–25 s):
@@ -92,7 +95,8 @@ SR e TI-LFA de link; cada iteração monta tudo do zero (~20–25 s):
 | 10.7.1 | só subida + flap de link | 50 | **0** | 0 | 0 |
 | 10.7.1 | troca de router-id + flap | 40 | **15** (37 %) | 15 (todas abortaram) | 0 |
 | 10.7.1 + correção | troca de router-id + flap | 40 | **0** | 27 (todas puladas) | 0 |
-| master `4ac34f1afa` | (no teste unitário: aborta sempre sem a correção, passa com ela) | — | — | — | — |
+| master `4ac34f1afa` | troca de router-id + flap | 40 | **15** (37 %) | 15 (todas abortaram) | 0 |
+| master + correção | troca de router-id + flap | 40 | **0** | 19 (todas puladas) | 0 |
 A hipótese inicial (corrida na subida, LSA do vizinho ainda não chegou) não se confirmou: a
 subida sozinha não deixou nenhuma LSA ausente em 50 iterações. O que reproduz é uma LSA que
 **sai** do LSDB enquanto outras ainda a citam.
