@@ -24,6 +24,12 @@
 //! the commit after it, before the slot that needs it (the slot's
 //! directory fsync makes both renames durable). See the engine's
 //! `history_files` for the order and what a crash leaves.
+//!
+//! Slots, revisions and `state-*` files are never written in place: a new
+//! content is a new file renamed over the old one. The A/B update's
+//! configuration snapshot relies on it (G1.6u, `sysupdate::state`): it
+//! hard-links these files instead of copying them. Only journals are
+//! appended to.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};

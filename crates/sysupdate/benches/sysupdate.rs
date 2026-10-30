@@ -4,6 +4,9 @@
 //! G1.6c: a whole install from an ISO file to a disk file (today's sizes:
 //! 20 MiB ESP, 20 MiB rootfs, 64 MiB `/config`), with and without the
 //! pipeline and the parallel read-back.
+//! G1.6u: the configuration snapshot of the test VM's `/config` (a 10.7 MB
+//! revision, 60 small ones, 3.7 MB of graphs) as a full copy (before) and
+//! linked (now), and the walk of `/config` the status makes every 2 s.
 
 #![allow(
     clippy::unwrap_used,
@@ -17,7 +20,7 @@ use std::io::Write;
 use corerouter_sysupdate::gpt::{self, NewPart};
 use corerouter_sysupdate::install::{self, Content};
 use corerouter_sysupdate::package::{Blob, Key, Manifest, Rootfs};
-use corerouter_sysupdate::{iso, package, verity};
+use corerouter_sysupdate::{SlotId, iso, package, state, verity};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
 const MIB: usize = 1 << 20;
@@ -228,5 +231,64 @@ fn install_disk(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, tree, copy, install_disk);
+/// The test VM's `/config` (G1.6u), plus `graphs` series files.
+fn vm_config(dir: &std::path::Path, series: usize) {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir.join("graphs")).unwrap();
+    std::fs::write(dir.join("running.json"), vec![b'{'; 4859]).unwrap();
+    std::fs::write(dir.join("running.json.prev"), vec![b'{'; 4608]).unwrap();
+    std::fs::write(dir.join("rev-81.json"), data(10_753_090)).unwrap();
+    for n in 0..60 {
+        std::fs::write(dir.join(format!("rev-{n}.json")), vec![b'r'; 300]).unwrap();
+    }
+    std::fs::write(dir.join("journal-config.log"), vec![b'j'; 774]).unwrap();
+    for n in 0..series {
+        std::fs::write(
+            dir.join(format!("graphs/interface-ether{n}.rrd")),
+            vec![0u8; 672_984],
+        )
+        .unwrap();
+    }
+}
+
+fn full_copy(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap().flatten() {
+        if e.file_name() == "package" {
+            continue;
+        }
+        if e.file_type().unwrap().is_dir() {
+            full_copy(&e.path(), &to.join(e.file_name()));
+        } else {
+            std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+        }
+    }
+}
+
+fn config_snapshot(c: &mut Criterion) {
+    let mut g = c.benchmark_group("config_snapshot");
+    g.sample_size(20);
+    let dir = std::env::temp_dir().join(format!("crsnap-bench-{}", std::process::id()));
+    vm_config(&dir, 6);
+    g.bench_function("vm_full_copy_before", |b| {
+        b.iter(|| {
+            let to = dir.join("package/config-a");
+            let _ = std::fs::remove_dir_all(&to);
+            full_copy(&dir, &to);
+            // As the old snapshot: its metadata written and synced.
+            state::write_atomic(&to.join("snapshot.json"), b"{}").unwrap();
+        })
+    });
+    let _ = std::fs::remove_dir_all(dir.join("package"));
+    g.bench_function("vm_linked", |b| {
+        b.iter(|| state::snapshot(&dir, SlotId::A, "1", 1).unwrap())
+    });
+    g.bench_function("vm_usage", |b| b.iter(|| state::usage(&dir)));
+    vm_config(&dir, 4096);
+    g.bench_function("usage_4096_series", |b| b.iter(|| state::usage(&dir)));
+    let _ = std::fs::remove_dir_all(&dir);
+    g.finish();
+}
+
+criterion_group!(benches, tree, copy, install_disk, config_snapshot);
 criterion_main!(benches);

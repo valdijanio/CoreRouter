@@ -152,30 +152,243 @@ pub struct SnapshotMeta {
     pub bytes: u64,
 }
 
+/// Traffic history (`system.graph`, G4.5): kept across a slot change as it
+/// is, never part of a snapshot nor replaced by a restore (G1.6u: it is
+/// not configuration, and going back would lose the trial's hours).
+pub const GRAPHS: &str = "graphs";
+/// Room left beyond the snapshot itself (the trial state, a revision the
+/// daemon writes while the update runs).
+pub const SPACE_MARGIN: u64 = 1 << 20;
+/// Allocation unit counted per copied file and directory (ext4's block).
+const BLOCK: u64 = 4096;
+/// Entries named in a refusal.
+const BIGGEST: usize = 4;
+
 fn skip(name: &str) -> bool {
-    name == DIR || name == "lost+found"
+    name == DIR || name == "lost+found" || name == GRAPHS
 }
 
-fn copy_tree(from: &Path, to: &Path, files: &mut usize, bytes: &mut u64) -> Result<(), String> {
+/// Files the configuration storage (`storage-fs`) only ever replaces by
+/// rename and never writes in place: a hard link shares them with the
+/// snapshot for free (G1.6u), and the snapshot still holds the old content
+/// after the next save. Everything else (`journal-*.log` is appended to)
+/// is copied.
+fn linkable(name: &str) -> bool {
+    matches!(name, "running.json" | "running.json.prev")
+        || (name.ends_with(".json") && (name.starts_with("rev-") || name.starts_with("state-")))
+}
+
+fn round_up(n: u64) -> u64 {
+    n.div_ceil(BLOCK).saturating_mul(BLOCK)
+}
+
+#[derive(Debug, Default)]
+struct Tally {
+    files: usize,
+    /// Bytes of the files copied (what the snapshot costs the disk).
+    copied: u64,
+    /// Bytes of the files linked (shared with the configuration).
+    linked: u64,
+}
+
+/// Links `from` to `to` when `link` and the filesystem allows it, copies
+/// otherwise; returns whether it linked.
+fn put(from: &Path, to: &Path, link: bool) -> Result<(bool, u64), String> {
+    if link && std::fs::hard_link(from, to).is_ok() {
+        let n = std::fs::metadata(to).map(|m| m.len()).unwrap_or(0);
+        return Ok((true, n));
+    }
+    let n = std::fs::copy(from, to).map_err(|e| format!("{}: {e}", from.display()))?;
+    Ok((false, n))
+}
+
+fn copy_tree(from: &Path, to: &Path, top: bool, t: &mut Tally) -> Result<(), String> {
     std::fs::create_dir_all(to).map_err(|e| format!("{}: {e}", to.display()))?;
     let rd = std::fs::read_dir(from).map_err(|e| format!("{}: {e}", from.display()))?;
     for e in rd.flatten() {
         let name = e.file_name();
         let Some(n) = name.to_str() else { continue };
-        if skip(n) || n == SNAPSHOT_META {
+        if (top && skip(n)) || n == SNAPSHOT_META {
             continue;
         }
         let Ok(ft) = e.file_type() else { continue };
         let dst = to.join(&name);
         if ft.is_dir() {
-            copy_tree(&e.path(), &dst, files, bytes)?;
+            copy_tree(&e.path(), &dst, false, t)?;
         } else if ft.is_file() {
-            *bytes += std::fs::copy(e.path(), &dst)
-                .map_err(|err| format!("{}: {err}", e.path().display()))?;
-            *files += 1;
+            let (linked, n) = put(&e.path(), &dst, top && linkable(n))?;
+            if linked {
+                t.linked += n;
+            } else {
+                t.copied += n;
+            }
+            t.files += 1;
         }
     }
     Ok(())
+}
+
+/// What a snapshot of `config` would write: the bytes of the files it
+/// copies, rounded to blocks, and one block per directory.
+pub fn snapshot_need(config: &Path) -> Result<u64, String> {
+    fn walk(dir: &Path, top: bool, need: &mut u64) -> Result<(), String> {
+        let rd = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        *need += BLOCK;
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let Some(n) = name.to_str() else { continue };
+            if top && skip(n) {
+                continue;
+            }
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                walk(&e.path(), false, need)?;
+            } else if ft.is_file() && !(top && linkable(n)) {
+                *need += round_up(e.metadata().map(|m| m.len()).unwrap_or(0));
+            }
+        }
+        Ok(())
+    }
+    let mut need = 0;
+    walk(config, true, &mut need)?;
+    Ok(need)
+}
+
+/// Bytes free for an unprivileged writer on the filesystem of `path`
+/// (`None`: unknown, not checked).
+pub fn free_bytes(path: &Path) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let s = rustix::fs::statvfs(path).ok()?;
+        Some(s.f_bavail.saturating_mul(s.f_frsize))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Bytes a file or a tree takes; `own`: files with another link (shared
+/// with the configuration or another snapshot) count nothing, as removing
+/// them frees nothing.
+fn tree_bytes(path: &Path, own: bool) -> u64 {
+    let Ok(m) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if m.is_file() {
+        return if own && links(&m) > 1 {
+            0
+        } else {
+            round_up(m.len())
+        };
+    }
+    if !m.is_dir() {
+        return 0;
+    }
+    let mut n = BLOCK;
+    if let Ok(rd) = std::fs::read_dir(path) {
+        for e in rd.flatten() {
+            n = n.saturating_add(tree_bytes(&e.path(), own));
+        }
+    }
+    n
+}
+
+#[cfg(unix)]
+fn links(m: &std::fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::nlink(m)
+}
+
+#[cfg(not(unix))]
+fn links(_: &std::fs::Metadata) -> u64 {
+    1
+}
+
+/// One thing that takes room in `/config`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Use {
+    /// `rev-81.json`, `graphs`, `package/config-b`, `package/config-a.new`.
+    pub path: String,
+    pub bytes: u64,
+    /// `snapshot`, `partial` (a snapshot cut short), `graphs`, `config`.
+    pub kind: &'static str,
+}
+
+/// What takes room in `config`, biggest first: each top-level entry (a file
+/// shared with a snapshot counts here), each snapshot and each partial one
+/// (bytes of their own: what removing it frees).
+pub fn usage(config: &Path) -> Vec<Use> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(config) {
+        for e in rd.flatten() {
+            let Some(n) = e.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if n == "lost+found" {
+                continue;
+            }
+            if n == DIR {
+                for s in std::fs::read_dir(e.path()).into_iter().flatten().flatten() {
+                    let Some(sn) = s.file_name().to_str().map(str::to_owned) else {
+                        continue;
+                    };
+                    if !s.file_type().is_ok_and(|t| t.is_dir()) {
+                        continue;
+                    }
+                    let kind = if sn.ends_with(".new") {
+                        "partial"
+                    } else {
+                        "snapshot"
+                    };
+                    out.push(Use {
+                        path: format!("{DIR}/{sn}"),
+                        bytes: tree_bytes(&s.path(), true),
+                        kind,
+                    });
+                }
+                continue;
+            }
+            let kind = if n == GRAPHS { "graphs" } else { "config" };
+            out.push(Use {
+                path: n,
+                bytes: tree_bytes(&e.path(), false),
+                kind,
+            });
+        }
+    }
+    out.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
+    out
+}
+
+fn mib(n: u64) -> String {
+    format!("{:.1} MiB", n as f64 / f64::from(1u32 << 20))
+}
+
+/// Refuses a snapshot that does not fit (G1.6u): what it needs, what is
+/// free, and the biggest entries, with the command that frees room.
+pub fn check_space(config: &Path) -> Result<(), String> {
+    let need = snapshot_need(config)?.saturating_add(SPACE_MARGIN);
+    let Some(free) = free_bytes(config) else {
+        return Ok(());
+    };
+    if free >= need {
+        return Ok(());
+    }
+    let biggest: Vec<String> = usage(config)
+        .into_iter()
+        .filter(|u| u.bytes > 0)
+        .take(BIGGEST)
+        .map(|u| format!("{} {}", u.path, mib(u.bytes)))
+        .collect();
+    Err(format!(
+        "{}: the configuration snapshot needs {} and {} is free (biggest: {}); nothing was written. \
+         Free room with system.package.snapshot.remove (dry_run first) or lower the graph history",
+        config.display(),
+        mib(need),
+        mib(free),
+        biggest.join(", ")
+    ))
 }
 
 pub fn snapshot_dir(config: &Path, slot: SlotId) -> (String, PathBuf) {
@@ -184,9 +397,12 @@ pub fn snapshot_dir(config: &Path, slot: SlotId) -> (String, PathBuf) {
     (name, path)
 }
 
-/// Copies the configuration directory (all but [`DIR`]) to
+/// Copies the configuration directory (all but [`DIR`] and [`GRAPHS`]) to
 /// `package/config-<slot>/`, replacing an older snapshot only once the new
-/// one is complete.
+/// one is complete. Files the storage only replaces by rename are hard
+/// links (G1.6u: the 64 revisions of a big config cost nothing twice).
+/// Checks the room first; a copy that fails anyway (the disk filled
+/// meanwhile) is removed, never left to fill `/config`.
 pub fn snapshot(
     config: &Path,
     slot: SlotId,
@@ -196,8 +412,29 @@ pub fn snapshot(
     let (name, dst) = snapshot_dir(config, slot);
     let tmp = dst.with_extension("new");
     let _ = std::fs::remove_dir_all(&tmp);
-    let (mut files, mut bytes) = (0, 0);
-    copy_tree(config, &tmp, &mut files, &mut bytes)?;
+    check_space(config)?;
+    let written = write_snapshot(config, &tmp, slot, version, now);
+    let meta = match written {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(e);
+        }
+    };
+    let _ = std::fs::remove_dir_all(&dst);
+    std::fs::rename(&tmp, &dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+    Ok((name, meta))
+}
+
+fn write_snapshot(
+    config: &Path,
+    tmp: &Path,
+    slot: SlotId,
+    version: &str,
+    now: u64,
+) -> Result<SnapshotMeta, String> {
+    let mut t = Tally::default();
+    copy_tree(config, tmp, true, &mut t)?;
     let format_version = std::fs::read(config.join("running.json"))
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
@@ -207,14 +444,12 @@ pub fn snapshot(
         slot,
         version: version.to_owned(),
         at_unix: now,
-        files,
-        bytes,
+        files: t.files,
+        bytes: t.copied + t.linked,
     };
     let text = serde_json::to_vec_pretty(&meta).map_err(|e| e.to_string())?;
     write_atomic(&tmp.join(SNAPSHOT_META), &text)?;
-    let _ = std::fs::remove_dir_all(&dst);
-    std::fs::rename(&tmp, &dst).map_err(|e| format!("{}: {e}", dst.display()))?;
-    Ok((name, meta))
+    Ok(meta)
 }
 
 pub fn snapshot_meta(config: &Path, name: &str) -> Option<SnapshotMeta> {
@@ -222,8 +457,88 @@ pub fn snapshot_meta(config: &Path, name: &str) -> Option<SnapshotMeta> {
     serde_json::from_slice(&text).ok()
 }
 
+/// A snapshot or partial copy [`remove`] may delete: `config-a`,
+/// `config-b`, or one of them with `.new`.
+fn removable(name: &str) -> bool {
+    let base = name.strip_suffix(".new").unwrap_or(name);
+    SlotId::ALL
+        .iter()
+        .any(|s| base == format!("config-{}", s.as_str()))
+}
+
+/// What [`remove`] did (or, `dry_run`, would do) to one snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Removal {
+    pub name: String,
+    /// Bytes it frees (its own: links shared with the configuration free
+    /// nothing).
+    pub bytes: u64,
+    pub removed: bool,
+    /// Why it stays (`None`: it goes).
+    pub kept: Option<String>,
+}
+
+/// Removes snapshots of `config` (G1.6u, `system.package.snapshot.remove`):
+/// `names` (empty: every partial copy, plus every snapshot when `all`),
+/// never one in `protected` (the trial's backup and the configuration a
+/// downgrade boots). `dry_run`: only says what would go.
+pub fn remove(
+    config: &Path,
+    names: &[String],
+    all: bool,
+    protected: &[String],
+    dry_run: bool,
+) -> Result<Vec<Removal>, String> {
+    let dir = config.join(DIR);
+    let mut pick: Vec<String> = names.to_vec();
+    if pick.is_empty() {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let Some(n) = e.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if removable(&n) && (all || n.ends_with(".new")) {
+                pick.push(n);
+            }
+        }
+        pick.sort();
+    }
+    let mut out = Vec::new();
+    for name in pick {
+        if !removable(&name) {
+            return Err(format!(
+                "'{}' is not a snapshot: config-a, config-b, or a partial config-<slot>.new",
+                name.chars().take(32).collect::<String>()
+            ));
+        }
+        let path = dir.join(&name);
+        let bytes = tree_bytes(&path, true);
+        let kept = if protected.contains(&name) {
+            Some("the trial boot in progress needs it to go back".to_owned())
+        } else if !path.exists() {
+            Some("no such snapshot".to_owned())
+        } else {
+            None
+        };
+        let removed = kept.is_none() && !dry_run;
+        if removed {
+            std::fs::remove_dir_all(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+        out.push(Removal {
+            name,
+            bytes,
+            removed,
+            kept,
+        });
+    }
+    if let Ok(d) = std::fs::File::open(&dir) {
+        let _ = d.sync_all();
+    }
+    Ok(out)
+}
+
 /// Puts snapshot `name` back as the configuration: every entry of `config`
-/// but [`DIR`] is replaced by the snapshot's.
+/// but [`DIR`] and [`GRAPHS`] is replaced by the snapshot's (linked where
+/// the snapshot linked).
 pub fn restore(config: &Path, name: &str) -> Result<usize, String> {
     let src = config.join(DIR).join(name);
     if snapshot_meta(config, name).is_none() {
@@ -243,12 +558,12 @@ pub fn restore(config: &Path, name: &str) -> Result<usize, String> {
         };
         r.map_err(|err| format!("{}: {err}", p.display()))?;
     }
-    let (mut files, mut bytes) = (0, 0);
-    copy_tree(&src, config, &mut files, &mut bytes)?;
+    let mut t = Tally::default();
+    copy_tree(&src, config, true, &mut t)?;
     if let Ok(d) = std::fs::File::open(config) {
         let _ = d.sync_all();
     }
-    Ok(files)
+    Ok(t.files)
 }
 
 #[cfg(test)]
@@ -302,8 +617,10 @@ mod tests {
         let (name, meta) = snapshot(&d, SlotId::A, "0.1", 9).unwrap();
         assert_eq!(name, "config-a");
         assert_eq!((meta.files, meta.format_version), (2, Some(1)));
-        // The trial slot rewrites the config and adds a file.
-        std::fs::write(d.join("running.json"), r#"{"format_version":2}"#).unwrap();
+        // The trial slot rewrites the config (by rename, as the storage
+        // does: the snapshot's link keeps the old one) and adds a file.
+        std::fs::write(d.join("running.json.tmp"), r#"{"format_version":2}"#).unwrap();
+        std::fs::rename(d.join("running.json.tmp"), d.join("running.json")).unwrap();
         std::fs::write(d.join("rev-9.json"), "{}").unwrap();
         assert_eq!(restore(&d, &name).unwrap(), 2);
         assert_eq!(
@@ -314,6 +631,139 @@ mod tests {
         assert!(d.join("certs/key.pem").exists());
         assert!(d.join(DIR).join(&name).exists());
         assert!(restore(&d, "config-b").is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn nlink(p: &Path) -> u64 {
+        std::os::unix::fs::MetadataExt::nlink(&std::fs::metadata(p).unwrap())
+    }
+
+    #[test]
+    fn snapshot_links_what_is_replaced_by_rename_and_skips_graphs() {
+        let d = tmp("link");
+        std::fs::write(d.join("running.json"), r#"{"format_version":1}"#).unwrap();
+        std::fs::write(d.join("rev-81.json"), vec![b'x'; 300_000]).unwrap();
+        std::fs::write(d.join("journal-config.log"), "a\n").unwrap();
+        std::fs::create_dir_all(d.join(GRAPHS)).unwrap();
+        std::fs::write(d.join(GRAPHS).join("system.rrd"), vec![0u8; 200_000]).unwrap();
+        let need = snapshot_need(&d).unwrap();
+        assert!(
+            need < 64 << 10,
+            "only the journal and directories are copied: {need}"
+        );
+        let (name, meta) = snapshot(&d, SlotId::A, "0.1", 1).unwrap();
+        let snap = d.join(DIR).join(&name);
+        assert_eq!(meta.files, 3);
+        assert_eq!(nlink(&snap.join("rev-81.json")), 2, "linked");
+        assert_eq!(
+            nlink(&snap.join("journal-config.log")),
+            1,
+            "appended to: copied"
+        );
+        assert!(!snap.join(GRAPHS).exists(), "graphs are not configuration");
+        // The storage saves by rename: the snapshot keeps the old content.
+        std::fs::write(d.join("running.json.tmp"), r#"{"format_version":2}"#).unwrap();
+        std::fs::rename(d.join("running.json"), d.join("running.json.prev")).unwrap();
+        std::fs::rename(d.join("running.json.tmp"), d.join("running.json")).unwrap();
+        std::fs::remove_file(d.join("rev-81.json")).unwrap();
+        let u = usage(&d);
+        let own = u.iter().find(|u| u.path == "package/config-a").unwrap();
+        assert!(
+            own.bytes >= 300_000,
+            "rev-81 is the snapshot's alone now: {u:?}"
+        );
+        // A restore puts the configuration back and leaves the graphs.
+        std::fs::write(d.join(GRAPHS).join("system.rrd"), b"newer").unwrap();
+        restore(&d, &name).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.join("running.json")).unwrap(),
+            r#"{"format_version":1}"#
+        );
+        assert!(d.join("rev-81.json").exists());
+        assert!(!d.join("running.json.prev").exists());
+        assert_eq!(
+            std::fs::read(d.join(GRAPHS).join("system.rrd")).unwrap(),
+            b"newer"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_failed_snapshot_leaves_no_partial_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("partial");
+        std::fs::write(d.join("running.json"), "{}").unwrap();
+        std::fs::write(d.join("a-key.pem"), "k").unwrap();
+        std::fs::write(d.join("z-key.pem"), "k").unwrap();
+        std::fs::set_permissions(d.join("z-key.pem"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        if std::fs::read(d.join("z-key.pem")).is_ok() {
+            return; // root reads anything: no failure to provoke here
+        }
+        // An older complete snapshot stays as it was.
+        std::fs::create_dir_all(d.join(DIR).join("config-a")).unwrap();
+        let e = snapshot(&d, SlotId::A, "0.1", 1).unwrap_err();
+        assert!(e.contains("z-key.pem"), "{e}");
+        assert!(!d.join(DIR).join("config-a.new").exists());
+        assert!(d.join(DIR).join("config-a").exists());
+        std::fs::set_permissions(d.join("z-key.pem"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn remove_takes_partials_by_default_and_never_a_protected_snapshot() {
+        let d = tmp("remove");
+        std::fs::write(d.join("running.json"), "{}").unwrap();
+        snapshot(&d, SlotId::A, "0.1", 1).unwrap();
+        snapshot(&d, SlotId::B, "0.1", 1).unwrap();
+        std::fs::create_dir_all(d.join(DIR).join("config-b.new")).unwrap();
+        std::fs::write(
+            d.join(DIR).join("config-b.new/rev-1.json"),
+            vec![0u8; 10_000],
+        )
+        .unwrap();
+        let protect = vec!["config-a".to_owned()];
+        // Dry run: says, deletes nothing.
+        let r = remove(&d, &[], true, &protect, true).unwrap();
+        let names: Vec<_> = r
+            .iter()
+            .map(|x| (x.name.as_str(), x.kept.is_none(), x.removed))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("config-a", false, false),
+                ("config-b", true, false),
+                ("config-b.new", true, false)
+            ]
+        );
+        assert!(r.iter().find(|x| x.name == "config-b.new").unwrap().bytes >= 10_000);
+        assert!(d.join(DIR).join("config-b.new").exists());
+        // Default: partial copies only.
+        let r = remove(&d, &[], false, &protect, false).unwrap();
+        assert_eq!(r.len(), 1);
+        assert!(r[0].removed && !d.join(DIR).join("config-b.new").exists());
+        // By name; the protected one stays.
+        let r = remove(
+            &d,
+            &["config-a".into(), "config-b".into()],
+            false,
+            &protect,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            r.iter().map(|x| x.removed).collect::<Vec<_>>(),
+            [false, true]
+        );
+        assert!(d.join(DIR).join("config-a").exists() && !d.join(DIR).join("config-b").exists());
+        assert!(
+            d.join("running.json").exists(),
+            "the configuration is never touched"
+        );
+        assert!(remove(&d, &["../running.json".into()], false, &[], false).is_err());
+        assert!(remove(&d, &["state.json".into()], false, &[], false).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 }
