@@ -163,7 +163,21 @@ fn management_comes_up_when_a_route_is_refused_at_boot() {
         .cloned()
         .unwrap_or_else(|| panic!("no boot.apply check: {checks}"));
     assert_eq!(c["severity"], "error", "{c}");
-    assert_eq!(c["value"], "routes", "{c}");
+    // G1.3g: only the refused route is out (`routes *N`), the rest in.
+    let routes = run("ip.route.list", json!({})).unwrap();
+    let refused = routes
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["dst_address"] == "198.51.100.0/24" && r["static"] == true)
+        .cloned()
+        .unwrap_or_else(|| panic!("our route not listed: {routes}"));
+    let id = refused["id"].as_str().unwrap().to_owned();
+    assert_eq!(c["value"], format!("routes {id}"), "{c}");
+    assert!(
+        refused["flags"].as_str().unwrap().contains('I') && refused["invalid"] == true,
+        "flag I: {refused}"
+    );
     assert!(
         c["reason"]
             .as_str()
@@ -172,6 +186,7 @@ fn management_comes_up_when_a_route_is_refused_at_boot() {
         "{c}"
     );
     assert_eq!(whoami()["boot_errors"][0]["section"], "routes");
+    assert_eq!(whoami()["boot_errors"][0]["item"], id.as_str());
     // The firewall, after the routes, went in.
     let nft = Command::new("nft")
         .args(["list", "table", "inet", "corerouter"])
