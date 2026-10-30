@@ -2864,3 +2864,51 @@ Daemon `--backend linux --manage ether1` (dummy), 60 000 rotas por `engine.batch
 | `ip.route.set` distância | 72,4 ms (58,9–127) | 3,6 ms (3,1–18,2) |
 | `ip.route.set` comentário | 3,5 ms | 3,5 ms |
 | `ip.route.add` | 3,5 ms | 3,5 ms |
+
+### G0.31j — commit de uma regra de firewall com milhares (**medido**, 2026-10-29, AMD Ryzen AI MAX+ 395, 32 CPUs, release, máquina compartilhada com outras sessões)
+
+`cargo bench -p corerouter-engine --bench firewall_commit` (`--save-baseline antes` na `main`
+54f775ec, `--baseline antes` na branch). Sessão no laboratório virtual, config em memória.
+Antes, 10 000 regras numa tabela eram recusadas (`MAX_RULES` 4096).
+
+| Medida | Antes | Depois |
+|---|---|---|
+| `commit/interface_comment/4000_4000_2000` (sem firewall) | 178 µs | 160 µs (sem mudança, p = 0,94) |
+| `commit/filter_comment/4000_4000_2000` | 114,8 ms | 0,247 ms (−99,8 %) |
+| `commit/filter_dst_port/4000_4000_2000` | 125,9 ms | 0,540 ms (−99,4 %) |
+| `commit/raw_comment/4000_4000_2000` | 103,9 ms | 0,548 ms (−99,5 %) |
+| `validate/firewall/4000_4000_2000` (inteira; o commit não a roda mais) | 0,85 ms | 0,79 ms |
+| `commit/interface_comment/filter_10000` | recusado | 0,27 ms |
+| `commit/filter_comment/filter_10000` | recusado | 0,33 ms |
+| `commit/filter_dst_port/filter_10000` | recusado | 0,28 ms |
+
+Parte do antes (perf, `firewall_commit`, commit de um comentário): ~95 % no render do nftables
+do `VirtualHal` (`nft::build`, `statements`, `fmt::write`, malloc/free); depois dele, a
+validação inteira (~0,85 ms).
+
+Kernel real (`apps/corerouter-daemon/tests/netns_fw_scale.rs`, namespace de usuário, sessão
+`LinuxHal` com a config em disco; "daemon" = o binário com todos os serviços e o canal de
+controle), mediana de 15 commits, depois:
+
+| Config | Sem firewall | Um comentário | Uma `dst_port` | Boot (carrega tudo) |
+|---|---|---|---|---|
+| 4 000 filter + 4 000 raw + 2 000 mangle, sessão | 7,5 ms | 7,9 ms | 10,8 ms | 155 ms |
+| idem, daemon | 8,6 ms | 10,9 ms | 14,1 ms | — |
+| 10 000 filter, sessão | 6,8 ms | 7,3 ms | 11,0 ms | 221 ms |
+| idem, daemon | 8,0 ms | 9,7 ms | 13,4 ms | — |
+
+O mesmo teste na `main` (4 000/4 000/2 000, sessão): 3,3–6,1 ms sem firewall, 3,4–6,3 ms um
+comentário, 4,9–9,7 ms uma porta (a máquina variou entre as rodadas). No kernel real o caminho
+da G0.31f já estava perto: os ~100 ms vinham do laboratório virtual.
+
+Custo por regra para o limite (sessão no laboratório virtual, só filter, release):
+
+| Regras | RSS da sessão | Boot | `validate` inteira | Commit de uma | `ip.firewall.filter.list` |
+|---|---|---|---|---|---|
+| 10 000 | 72 MB | 61 ms | 0,75 ms | 0,54 ms | 65 ms |
+| 50 000 | 296 MB | 334 ms | 5,8 ms | 2,6 ms | 321 ms |
+| 100 000 | 582 MB | 668 ms | 11,0 ms | 5,6 ms | 660 ms |
+| 200 000 | 1,07 GB | 1,33 s | 23,2 ms | recusado (config de 36 MiB > 31 MiB em disco) | — |
+
+Kernel: ~0,4–0,5 KB de slab por regra (SUnreclaim, 10 000 regras no namespace) e ~490 bytes de
+lote netlink (50 000 regras = 24 MiB num lote, que só um root com `SO_SNDBUFFORCE` envia).

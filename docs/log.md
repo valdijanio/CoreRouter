@@ -8517,3 +8517,76 @@ continuação indentadas).
 
   Desempenho e paralelismo: um bool a mais por pacote BFD recebido (guardado na sessão) e por
   mudança de estado; nada no caminho por pacote além da cópia do bit, nada a dividir.
+
+- 2026-10-29 — G0.31j: Firewall com milhares de regras, o resto do commit de uma regra (G0.31j):
+
+  - **Laboratório virtual:** o `VirtualHal` renderizava o ruleset inteiro três vezes a cada commit
+    que tocava o firewall (as duas configs para comparar e o script novo), ~110 ms com 10 000
+    regras, para um texto que ninguém lê. Agora ele só marca que o firewall mudou, e
+    `VirtualHal::ruleset()` renderiza na hora da leitura. Era essa a lentidão do daemon de
+    laboratório no host.
+  - **Validação do commit:** com o running válido, a unidade `firewall` olha só as regras que o
+    commit tocou (`corerouter_firewall::validate::validate_since`, como as rotas da G0.31e). A
+    regra vem dos blocos do `CowList` que as duas configs não dividem mais, sem cabeça nem cauda
+    iguais. Uma regra intocada dá o que dava antes (nada), porque os problemas dela dependem só
+    dela, dos saltos da tabela e das listas de interfaces. Volta para a validação inteira quando
+    muda um salto ou uma marca, quando um id se repete, quando uma tabela passa do limite, quando
+    as listas ou as zonas mudam, ou quando mais de 1024 regras mudaram. Os builds de debug
+    continuam comparando com a validação inteira em todo commit, e o proptest
+    `incremental_equals_full` ganhou edições de regra nas quatro tabelas.
+  - **Limite:** `MAX_RULES` passa de 4096 para 50 000 regras por tabela; a config de ISP com
+    10 000 regras de filtro cabe. O RouterOS não tem limite baixo. O nosso vem do custo **medido**
+    de uma regra: ~5,4 KB de memória do daemon (50 000 regras = ~290 MB, boot em 0,33 s, commit de
+    uma regra em 2,6 ms; com 100 000, 540 MB não cabem na imagem de 2 GiB) e ~500 bytes de kernel
+    e de lote netlink. Quatro tabelas cheias (200 000) já passam do tamanho que a config pode ter
+    em disco (31 MiB). O leitor de contadores (`nft_counters::MAX_RULES`) acompanha:
+    4 × 50 000 × 2 regras do kernel.
+  - **Kernel real:** o caminho `--backend linux` (G0.31f) já estava perto do commit sem firewall.
+    O teste em namespace novo mostra: commit de um comentário 7,3–7,9 ms e de uma porta
+    10,8–11,0 ms, contra 6,8–7,5 ms sem firewall (o resto é o fsync do journal), com 10 000 regras
+    carregadas de verdade no nftables.
+
+  Como testar:
+
+  ```sh
+  cargo bench -p corerouter-engine --bench firewall_commit
+  COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- \
+      cargo test --release -p corerouter-daemon --test netns_fw_scale -- --nocapture
+  cargo test -p corerouter-firewall --lib validate
+  cargo test -p corerouter-engine --test it incremental
+  ```
+
+  Fora do namespace de usuário (como root, no roteador), o lote de mais de ~16 000 regras precisa
+  do `SO_SNDBUFFORCE` que o `nfnl` já pede. No namespace sem root o teto é 2 × `wmem_max`
+  (8 MiB), e o teste fica em 10 000.
+
+- 2026-10-29 — G3.9fj: BGP: Long-Lived Graceful Restart (RFC 9494), parte 4 de 5.
+
+  - `llgr_stale_time` na instância (1..16777215 s, 24 bits; sem valor: desligado, §5) vira
+    `bgp long-lived-graceful-restart stale-time N`. Quando acaba o Restart Time, o vizinho guarda as
+    nossas rotas por mais esse tempo, com `llgr-stale` e com a menor preferência.
+  - O FRR usa o mesmo valor como o máximo que guarda das rotas do vizinho (`bgpd/bgp_open.c`,
+    `bgp_capability_llgr`: MIN(o recebido, o nosso)). Um helper com o padrão 0 não guarda nada, por
+    isso a ajuda e a prévia dizem para ligar nos dois lados. A documentação do FRR diz "only
+    restarter mode"; o fonte faz helper também.
+  - Prévia da instância: vale para todas as famílias (a RFC pede por AFI/SAFI, §5); o pior caso
+    (hold + Restart Time + LLGR), com aviso acima de 1 h; aviso quando nenhuma conexão tem
+    `graceful_restart=yes`.
+  - `routing.bgp.session.list`: `llgr_stale_time` do vizinho (o `llgrStaleTime` por família de
+    `gracefulRestartInfo`). Janela: selo `LLGR` na coluna GR, coluna e campo na aba Instances.
+  - `llgr-stale` e `no-llgr` já eram nomes do `routing.filter` (G3.9fc).
+
+  **Medido** (2026-10-29, host, FRR 10.7.1, `scripts/bgp-crcr-userns.sh llgr`): Restart Time 5 s,
+  `kill -9` do `bgpd` do CR1, que fica fora 25 s. Sem LLGR, o CR2 tira a rota do CR1 em 5,1 s.
+  Com 10 s de LLGR nos dois lados, tira em 15,1 s; aos 7 s a rota está marcada `llgr-stale`.
+
+  Para o FRR (upstream), achado no fonte: `longLivedGracefulRestartByPeer` no `show bgp neighbors
+  json` lista as famílias pela flag `PEER_CAP_ENHE_AF_RCV` (extended next hop), não pela do LLGR
+  (`bgp_vty.c`).
+
+  Como testar: `cargo test -p corerouter-engine --lib -- routing`,
+  `cargo test -p corerouter-hal-frr --lib state`, `cargo test -p corerouter-proto-bgp graceful`,
+  `cargo test -p corerouter-ui --lib -- tests::bgp`; `scripts/bgp-crcr-userns.sh llgr`.
+
+  Desempenho e paralelismo: uma linha no render, um campo lido do JSON que o serviço `frr` já lê,
+  O(famílias) por sessão. Nada no caminho quente.
