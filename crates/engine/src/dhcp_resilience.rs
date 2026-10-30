@@ -279,7 +279,7 @@ impl Session {
         f(r);
         let after = self.effective(&running).into_owned();
         if before != after
-            && let Err(e) = self.hal_mut().apply(&before, &after)
+            && let Err(e) = self.apply_side(&before, &after)
         {
             self.dhcp_note_id(id, "error", format!("not applied: {e}"));
         }

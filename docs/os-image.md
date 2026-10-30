@@ -56,7 +56,7 @@ GPT com GUIDs fixos (imagem reprodutível):
 | `efi` | 128 MiB | vfat; `EFI/BOOT/BOOTX64.EFI` é o kernel do slot A (EFI stub), `EFI/COREROUTER/B.EFI` o do B, `A.HDR`/`B.HDR` os cabeçalhos assinados; sem bootloader (G1.6b: era 32 MiB, não cabiam dois kernels) |
 | `rootfs-a` | 256 MiB | squashfs zstd + a árvore do dm-verity logo depois (`rootfs.img`), tipo "Linux root x86-64" do Discoverable Partitions Spec |
 | `rootfs-b` | 256 MiB | o slot B, gravado pela primeira atualização |
-| `config` | 64 MiB | ext4 vazio, rótulo `config`; vira `/config` |
+| `config` | 64 MiB no `disk.img`; o resto do disco depois de instalado (G1.6v) | ext4 vazio, rótulo `config`; vira `/config` |
 
 A linha de comando básica está **dentro do kernel** (`CONFIG_CMDLINE`): `console=tty0
 console=ttyS0,115200 root=PARTUUID=<rootfs-a> rootfstype=squashfs ro
@@ -456,10 +456,22 @@ Scrub) e **System › Tuning › Boot** (o que cada slot carrega, "Apply on slot
 - **Prazo.** O `corerouter-init` sabe que é um teste (estado em `/config/package/state.json` +
   slot em uso pela `corerouter.slot=` + `BootOrder`) e reinicia se não houver confirmação em
   `timeout` s (30–3600, padrão 300) contados do início do boot.
-- **A configuração volta junto.** Antes de trocar de slot, o `/config` inteiro (com o
-  `format_version`) é copiado para `/config/package/config-<slot>/`. No boot de volta depois de
+- **A configuração volta junto.** Antes de trocar de slot, o `/config` (com o
+  `format_version`) vai para `/config/package/config-<slot>/`. No boot de volta depois de
   um teste que falhou, o init restaura a cópia **antes** do daemon ler a config; um downgrade
   boota a cópia que aquele slot rodou por último (se ele lê o formato).
+- **O snapshot cabe no `/config` (G1.6u).** O que o armazenamento só troca por rename
+  (`running.json`, `running.json.prev`, `rev-*.json`, `state-*.json`) entra por **hard link**
+  (custo zero; o snapshot guarda o conteúdo antigo depois do próximo save); o resto (o journal,
+  que cresce no lugar, chaves) é copiado; `graphs/` (histórico de tráfego) fica fora do snapshot
+  e o restore não o apaga. Antes de gravar o slot, a atualização confere se o `/config` tem o
+  que a cópia precisa mais 1 MiB e recusa com os números e os maiores itens; uma cópia que falha
+  mesmo assim é apagada. Na VM de teste (`/config` de 56 MB, uma revisão de 10,7 MB no
+  histórico) o snapshot passou de 13,8 MB para ~1 kB. `system.package.print` traz
+  `config_space` (livre, o que o próximo snapshot precisa, o que ocupa), o `own_bytes` de cada
+  snapshot e as cópias parciais (`partials`). `system.package.snapshot.remove {name?, all?,
+  dry_run?}` apaga snapshots e cópias parciais de longe (sem nome: só as parciais; nunca o de
+  um teste em andamento), e a saúde do disco do `/config` diz qual apagar.
 - **O slot em uso nunca é escrito**, e o slot alvo sai do `BootOrder` e perde o cabeçalho
   antes de ser gravado: meio gravado, ele não é volta de ninguém. A ordem dos passos está no
   topo de `crates/sysupdate/src/ab.rs`.
@@ -895,8 +907,16 @@ topo) deram o mesmo `bzImage`, `rootfs.squashfs`, `disk.img`, pacote e imagens d
 - **BIOS legado:** gap G1.6g (acima).
 - **cloud-init (NoCloud/`cidata`):** gap G1.6h; o IP inicial pelo G1.6d e pelo assistente.
 - **Só os daemons do FRR configurados** (hoje sobem os 8, ~88 MiB de RSS somado): gap G1.6i.
-- **`/config` do tamanho do resto do disco:** o layout é o do `disk.img` (64 MiB); crescer a
-  partição e o ext4 na instalação fica para quando o `/config` precisar (logs persistentes).
+- **`/config` do tamanho do resto do disco (G1.6v):** o `disk.img` continua com 64 MiB (imagens
+  pequenas). O instalador grava a partição `config` até o fim do disco (alinhada a 1 MiB) quando
+  isso lhe dá pelo menos 256 MiB; o primeiro boot cresce o ext4. Num roteador já instalado, o
+  init, fora de um boot de teste, reescreve só a entrada `config` da GPT (primária e backup; a
+  backup vai para o fim de um disco que cresceu; números, GUIDs e atributos ficam) e, no boot
+  seguinte, antes de montar, roda `e2fsck -f -p` e `resize2fs` no `/config` desmontado. Um disco
+  que deixaria menos de 256 MiB mantém o layout, e o log do boot diz quanto caberia. Da imagem,
+  só o `e2fsck` e o `resize2fs` do e2fsprogs ficam (`post-build.sh`). Uma VM criada do
+  `disk.img` (705 MiB) não tem para onde crescer: aumente o disco (`qemu-img resize`, com a VM
+  desligada) e o roteador cresce o `/config` em dois boots.
 - **Dois discos CoreRouter na mesma caixa:** os PARTUUIDs são fixos (a linha de comando embutida
   do fallback aponta para o `rootfs-a`); o instalador recusa um disco com a imagem do
   instalador, mas não um segundo CoreRouter. Anotado como risco.

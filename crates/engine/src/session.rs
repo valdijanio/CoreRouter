@@ -171,7 +171,17 @@ impl Session {
     /// Build a session that restores the committed config from `storage`
     /// (newest readable slot) and saves it there after every commit. With
     /// nothing readable stored, it starts from the discovered ports.
-    pub fn with_storage(mut hal: Box<dyn Hal>, mut storage: Box<dyn ConfigStorage>) -> Self {
+    pub fn with_storage(hal: Box<dyn Hal>, storage: Box<dyn ConfigStorage>) -> Self {
+        Self::with_storage_env(hal, storage, crate::boot_apply::BootEnv::default())
+    }
+
+    /// [`Self::with_storage`], knowing what the boot must keep reachable
+    /// (G1.3g: the management ports the daemon opens after the boot).
+    pub fn with_storage_env(
+        mut hal: Box<dyn Hal>,
+        mut storage: Box<dyn ConfigStorage>,
+        env: crate::boot_apply::BootEnv,
+    ) -> Self {
         // The virtual lab's DHCP clients get leases from a simulated server.
         hal.offer_dhcp_lab_server(Arc::new(corerouter_proto_dhcp::lab::LabServer::default()));
         hal.offer_dhcp6_lab_server(Arc::new(corerouter_proto_dhcp::lab6::LabServer6::default()));
@@ -252,10 +262,11 @@ impl Session {
                 let mut boot = store.running().clone();
                 boot.ip.addresses.retain(|a| a.from_pool.is_none());
                 // G1.3e: refused whole, it goes in by sections (management first).
-                let staged = crate::boot_apply::at_boot(hal.as_mut(), &boot);
+                let staged = crate::boot_apply::at_boot(hal.as_mut(), &boot, &env);
                 status.boot_apply_error = crate::boot_apply::summary(staged.failed());
                 status.boot_apply_failed = staged.failed().to_vec();
                 ext.set(staged);
+                ext.set(env);
                 status.loaded_from = Some(slot.name());
                 store
             }
@@ -595,8 +606,7 @@ impl Session {
         let applied_now = self.boot_applied().cloned();
         let from = applied_now.as_ref().unwrap_or(running);
         let masked = self.boot_mask(running, to);
-        let untouched = self.boot_untouched(running, to);
-        let to_hal = masked.as_ref().unwrap_or(to);
+        let to_hal = masked.as_ref().map_or(to, |(c, _)| c);
         self.hal
             .apply(from, to_hal)
             .map_err(|e| EngineError::Hal(e.to_string()))?;
@@ -617,7 +627,8 @@ impl Session {
         }
         if boot_pending {
             let reached = to_hal.clone();
-            self.boot_committed(&untouched, reached);
+            let kept = masked.map(|(_, k)| k).unwrap_or_default();
+            self.boot_committed(kept, reached);
         }
         let pending = self.safe_mode.is_active();
         let comment = match (pending, comment.is_empty()) {

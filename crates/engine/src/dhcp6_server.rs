@@ -518,7 +518,7 @@ impl Session {
         if routes_changed {
             let after = self.effective(&running).into_owned();
             if before != after
-                && let Err(e) = self.hal_mut().apply(&before, &after)
+                && let Err(e) = self.apply_side(&before, &after)
             {
                 self.log_event(
                     &["dhcp", "warning"],

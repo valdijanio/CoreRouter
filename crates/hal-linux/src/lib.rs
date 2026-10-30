@@ -823,6 +823,92 @@ mod linux {
             }
         }
 
+        fn check_firewall(
+            &mut self,
+            to: &Config,
+        ) -> Result<Vec<corerouter_hal::RefusedItem>, HalError> {
+            crate::firewall::check(to)
+        }
+
+        fn apply_routes_each(
+            &mut self,
+            from: &Config,
+            to: &Config,
+        ) -> Result<Vec<corerouter_hal::RefusedItem>, HalError> {
+            // Only added routes: anything else goes whole, with its undo.
+            let mut only_routes = from.clone();
+            only_routes.ip.routes = to.ip.routes.clone();
+            only_routes.ip.next_route_id = to.ip.next_route_id;
+            if only_routes != *to {
+                return Err(HalError::Unsupported(
+                    "more than the static routes changed".into(),
+                ));
+            }
+            let (f, t) = (
+                absent::mask(from, &self.absent),
+                absent::mask(to, &self.absent),
+            );
+            let ops = crate::plan::plan(&f, &t)?;
+            if ops
+                .iter()
+                .any(|o| !matches!(o, Op::AddRoute(_) | Op::AddDiscard(_)))
+            {
+                return Err(HalError::Unsupported(
+                    "the routes change more than added routes".into(),
+                ));
+            }
+            // As `apply`: never a route through a link of another program.
+            let mut claims = claims_of(&f);
+            claims.extend(claims_of(&t));
+            let external: BTreeMap<String, String> = self
+                .view(&claims)?
+                .into_iter()
+                .filter_map(|(l, o)| match o {
+                    Owner::External(r) => Some((l.name, r)),
+                    Owner::Managed | Owner::Conflict(_) => None,
+                })
+                .collect();
+            let (skip, run): (Vec<Op>, Vec<Op>) = ops
+                .into_iter()
+                .partition(|op| op.link().is_some_and(|l| external.contains_key(l.as_str())));
+            for op in &skip {
+                log::warn!("not applied: {op} (its link is not managed)");
+            }
+            let owned = crate::plan::owned_routes(&f, &t, &run);
+            let refused = crate::netlink::apply_each(&run, &owned)?;
+            if refused.is_empty() {
+                return Ok(Vec::new());
+            }
+            // Each refused kernel route is the config's routes to that
+            // destination in that table (an ECMP group is one).
+            let was: BTreeMap<corerouter_model::ItemId, &corerouter_model::RouteEntry> =
+                f.ip.routes.iter().map(|r| (r.id, r)).collect();
+            let new: Vec<&corerouter_model::RouteEntry> =
+                t.ip.routes
+                    .iter()
+                    .filter(|r| was.get(&r.id) != Some(r))
+                    .collect();
+            let mut out: Vec<corerouter_hal::RefusedItem> = Vec::new();
+            for (op, why) in refused {
+                let (dst, table) = match &op {
+                    Op::AddRoute(r) => (r.dst, r.table),
+                    Op::AddDiscard(d) => (d.dst, d.table),
+                    _ => continue,
+                };
+                for r in &new {
+                    let same = r.dst_address.trunc() == dst
+                        && corerouter_model::route::table_id(&t, &r.routing_table) == Some(table);
+                    if same && !out.iter().any(|o| o.id == r.id) {
+                        out.push(corerouter_hal::RefusedItem {
+                            id: r.id,
+                            reason: format!("could not {op}: {why}"),
+                        });
+                    }
+                }
+            }
+            Ok(out)
+        }
+
         fn absent_ports(&self) -> Vec<IfName> {
             self.absent.iter().cloned().collect()
         }

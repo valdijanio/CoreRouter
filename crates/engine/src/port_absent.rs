@@ -132,13 +132,15 @@ impl Session {
                 self.log_event(&["interface", "info"], "interface", format!("{n}: absent port no longer in the configuration"), json!({ "interface": n }));
             }
         }
-        // The boot apply that failed is retried whole on its own.
-        if back.is_empty() || self.storage_status().boot_apply_error.is_some() {
+        // Nothing of the boot apply went in: its retry puts it all back.
+        // With only some sections out, they stay out (G1.3g: the port got
+        // its config back only once every section was in).
+        if back.is_empty() || self.boot_core_out() {
             return;
         }
         let cfg = self.effective(self.store().running()).into_owned();
         let tried = crate::guard::run("put back a returned port", || {
-            self.hal_mut().apply(&cfg, &cfg).map_err(|e| crate::EngineError::Hal(e.to_string()))
+            self.apply_side(&cfg, &cfg).map_err(|e| crate::EngineError::Hal(e.to_string()))
         });
         match tried {
             Ok(()) => {

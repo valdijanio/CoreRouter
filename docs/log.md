@@ -9140,3 +9140,189 @@ continuação indentadas).
   cada 1…60 s. Um commit com boot pendente copia a config uma vez (só nesse estado). Nada a
   dividir em threads: os applies são sequenciais por dependência (rotas precisam dos endereços,
   firewall e MPLS das interfaces) e o kernel serializa o netlink de qualquer forma.
+
+- 2026-10-30 — G1.29g: Reset USB de porta fora da configuração (G1.29g). A aba Hardware mostrava os botões Down/Up,
+  Restart Driver e Reset USB Port de um adaptador USB que não está na configuração (o `eth0` da VM
+  `corerouter-teste`, que voltou de um reset com o nome do kernel), e o `interface.usb.reset`
+  recusava com "no interface 'eth0'". Escolha do usuário: o roteador não mexe no que não gerencia
+  (como o `refuse_unmanaged`). Numa porta fora da configuração os três botões e a chave do vigia
+  ficam desligados, com o motivo no hover; uma linha âmbar diz por quê ("Not in the configuration
+  (appeared after boot)"), com ⓘ em português, e o botão **Adopt** manda
+  `interface.ethernet.adopt` (G1.6t). Num daemon sem esse comando, o Adopt fica desligado com o
+  motivo do `Avail` ("its daemon is an older build").
+
+  Como testar: `cargo test -p corerouter-ui --lib usb_nic`
+  (`a_port_outside_the_configuration_offers_adopt_not_reset`). Na tela: Interfaces › `eth0` (fora
+  da configuração) › Hardware; print em `docs/changes/G1.29g-screenshots/` (GUI desta branch
+  ligada à VM de teste, só leitura).
+
+- 2026-10-30 — G1.6u: `/config` cheio na atualização (G1.6u). Na VM `corerouter-teste` (56 MB) o snapshot da
+  configuração copiava 13,8 MB, dos quais 10,7 MB eram uma só revisão do histórico (`rev-81.json`,
+  a rodada de validação com ~10 mil rotas) e 3,7 MB os gráficos; com `config-a` e `config-b` o
+  disco encheu, a cópia parcial `config-a.new` ficou e nenhum comando a apagava.
+
+  - **Hard links:** o que o `storage-fs` só troca por rename (`running.json*`, `rev-*.json`,
+    `state-*.json`) entra no snapshot por link; o journal e as chaves são copiados. O snapshot da
+    VM cai de 13,8 MB para ~1 kB (**medido** no teste `config_full` com a mesma forma).
+  - **`graphs/` fora** do snapshot e do restore: histórico de tráfego não é configuração, e voltar
+    apagaria as horas do teste.
+  - **Espaço antes:** `install`/`upload`/`download` e o Tuning › Boot conferem o `/config`
+    (`statvfs`) antes de tocar no slot e recusam com "needs X and Y is free (biggest: …)"; uma
+    cópia que falha mesmo assim é apagada.
+  - **De longe:** `system.package.snapshot.remove {name?, all?, dry_run?}` (sem nome: só as cópias
+    parciais; `all`: os snapshots também; nunca o backup ou a troca de um teste em andamento, que a
+    sessão confere no plano e o serviço de novo antes de apagar). `system.package.print` traz
+    `config_space` (livre, necessário, o que ocupa), `own_bytes` por snapshot e `partials`. A
+    saúde do disco, quando o pior é o `/config`, lista os snapshots com o tamanho e o comando.
+
+  Como testar: `cargo test -p corerouter-sysupdate --test config_full` (três casos num tmpfs de
+  3 MiB num mount namespace sem root: a história grande cabe linkada; sem espaço é recusado antes
+  de gravar o slot; um `/config` a 0 byte livre com `config-a.new` se recupera por
+  `remove_snapshots` e a atualização passa). Na VM: `system.package.snapshot.remove
+  {all: true, dry_run: true}`, depois `{name: "config-a.new"}`.
+
+- 2026-10-30 — G1.3g: Boot parcial por regra de firewall, com trava de gerência. Com a G1.3e, uma regra recusada pelo
+  kernel deixava o firewall inteiro de fora e o roteador sem filtro. Agora:
+
+  - `Hal::check_firewall` (novo, `crates/hal`): diz se o firewall de uma config carregaria, sem
+    carregar nada. `hal-linux`: o lote de sempre, enviado sem `NFNL_MSG_BATCH_END`; o kernel valida
+    cada mensagem, responde as recusadas e joga o lote fora (`NFNL_ABORT_VALIDATE`), como o
+    `nft --check`. O número de sequência de cada erro aponta a regra (`cr:*N`). Lido no fonte do
+    kernel 6.18.59 (`net/netfilter/nfnetlink.c:538-559`, `nf_tables_api.c`):
+    - o lote não para no primeiro erro;
+    - um erro que só a validação da tabela inteira acha (um `dst-nat` em `srcnat`, um jump em
+      laço) faz o kernel repetir o lote validando regra a regra. Isso só funciona numa tabela que
+      já existia antes do lote: o abort da checagem não liga a validação da netns como o commit
+      liga, e numa tabela criada no lote o erro se perde (**medido**: a primeira versão não acusou
+      nada). Por isso a checagem enche uma tabela de rascunho vazia (`corerouter-check`, criada
+      antes e apagada depois; nunca tem nada aplicado);
+    - com a validação ligada, toda regra depois da recusada também volta recusada (**medido**: 1
+      regra ruim, 7 recusas). Por isso só a primeira recusa vale: o engine a tira e checa de novo
+      (k regras ruins = k + 1 checagens).
+  - Engine (`boot_apply.rs`): a seção `firewall` recusada vira checagens até o resto carregar:
+    - sem nome de regra (outro backend, ou recusa de um conjunto ou chain), bisseção por prefixo,
+      também só com checagens (~log₂ n);
+    - teto de 16 regras e 64 checagens; passou disso, firewall inteiro de fora, como na G1.3e;
+    - nenhuma metade chega ao kernel: só o resultado final é aplicado, uma vez.
+  - Trava de gerência: antes de aplicar o firewall reduzido, as sondas do lockout do commit (as
+    mesmas do `force`, agora numa função só, `lockout::firewall_cut`) andam por conexões
+    sintéticas: cada endereço do roteador × cada porta de gerência, vindas de um host de cada rede,
+    de fora e das origens que a regra recusada cita (`src-address`, entradas da `src-address-list`).
+    As portas de gerência são `--control`, `--listen`, `--ws` e `--ws-listen`, que o daemon passa
+    ao boot (`Session::with_storage_env`, `BootEnv`), mais `www`/`www-ssl` da config. Se o
+    firewall salvo deixa entrar e o reduzido corta, **o firewall inteiro fica de fora** (escolha do
+    usuário, sem "aceitar gerência" no topo), com o motivo: "rule *N (…) was refused by the kernel
+    and, without it, the firewall would cut management: …; the whole firewall stays out until it is
+    fixed".
+  - A regra recusada aparece:
+    - `invalid` com flag I e `reason` ("refused at boot, left out until fixed: …") no
+      `ip.firewall.*.list`;
+    - em `storage.boot_apply_failed` e no `auth.whoami` (`{section: firewall, rule: "*N", error}`);
+    - na saúde (`boot.apply`, valor `firewall *N`);
+    - no aviso da CLI/MCP e no selo vermelho da GUI ("boot: firewall *N", ⓘ pt/en atualizado).
+  - Commit com regra de fora: um commit que mexe em outra regra entra e deixa a recusada de fora
+    (desligada no que vai ao kernel); o que muda ou tira a regra a tenta de novo, tudo ou nada.
+  - Retry: só com regras de fora, a espera vai até 10 min (não 60 s). Achá-las de novo custa ao
+    kernel uma validação por regra, com o lock do nftables preso (abaixo), e regra recusada no boot
+    costuma ficar recusada.
+  - Caminhos laterais de `apply`: cliente DHCP e DHCPv6, servidor DHCPv6, cliente PPPoE, gateway
+    check, resiliência DHCP e porta que volta. Agora passam por `Session::apply_side`, com a mesma
+    máscara do commit. Achados reproduzidos em teste antes da correção:
+    - com a seção `xdp` de fora, um lease DHCP era desfeito ("lease not applied: … xdp: attach
+      refused"), porque o `hal-linux` sincroniza o XDP em todo `apply`;
+    - uma porta replugada (G1.3d) não recebia a config de volta enquanto qualquer seção estivesse
+      de fora.
+    - A suspeita do MPLS anotada na G1.3e não se confirmou: lease não muda interfaces, e o MPLS só
+      sincroniza quando elas mudam.
+
+  Como testar:
+
+  - `cargo test -p corerouter-engine --test it boot_rules`: só a regra recusada sai, flag I, saúde,
+    `whoami`, nada parcial no kernel; o `accept` da gerência recusado com um `drop` no fim deixa o
+    firewall inteiro de fora e a gerência entra; `accept` que a gerência não usa sai sozinho; duas
+    recusadas, uma checagem por vez; bisseção sem nome de regra (≤ 9 checagens para 31 regras);
+    commit com regra de fora; retry até 10 min.
+  - `cargo test -p corerouter-engine --test it boot_side_paths`: lease com o XDP de fora; porta
+    replugada com o XDP de fora.
+  - Kernel real: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
+    corerouter-hal-linux --test netns_fw_check`. A checagem nomeia a regra recusada, uma por vez, e
+    não muda o ruleset em uso; o commit seguinte ainda parte do que foi carregado. O
+    `slow_checking_many_rules_with_one_bad` (camada lenta) mede 10 000 regras.
+
+  Desempenho e paralelismo: boot sem erro = um `apply`, como antes, sem checagem. Com regra
+  recusada, o boot faz 1 `apply` recusado, k + 1 checagens e 1 `apply` do firewall reduzido; a trava
+  de gerência anda no máximo 4096 conexões × 6 sondas, em memória. O custo alto é do kernel: com um
+  erro que só a validação acha, o replay valida a tabela a cada regra (O(n²)): 10 000 regras,
+  1,7 s contra 69 ms de uma checagem boa, em release (**medido**, abaixo), o mesmo que o próprio
+  `apply` recusado já custa; por isso o retry de regra espera até 10 min. Nada a dividir em threads: o nfnetlink serializa tudo no `commit_mutex` da netns, e cada
+  checagem depende da anterior.
+
+- 2026-10-30 — G1.3h: G1.3h descartada: o usuário preferiu não subir um firewall de emergência ("deixar mais simples").
+  Com a G1.3g, uma regra recusada no boot sai sozinha e o resto do firewall entra. O firewall
+  inteiro só fica de fora quando a checagem não isola a regra, ou quando o firewall sem ela cortaria
+  a gerência; então o aviso vermelho diz o motivo.
+
+- 2026-10-30 — G1.6v: `/config` ocupa o resto do disco (G1.6v). O `disk.img` continua com 64 MiB de `/config`;
+  `gpt::grow_last` reescreve só a entrada `config` da GPT (primária, depois a backup no fim do
+  disco; números, GUIDs, tipos e atributos ficam) quando isso dá ao `/config` pelo menos 256 MiB
+  (`gpt::CONFIG_MIN`), e `ext4::grow` cresce o filesystem desmontado (`e2fsck -f -p`,
+  `resize2fs`).
+
+  - O **instalador** já grava a partição até o fim do disco, e o primeiro boot cresce o ext4.
+    Reinstalar mantendo a configuração aceita a partição crescida.
+  - Num roteador **já instalado**, o init troca a tabela depois de montar o `/config`, fora de um
+    boot de teste. No boot seguinte, antes de montar, cresce o filesystem. Os dois passos vão para
+    o log do boot.
+  - Disco que deixa menos de 256 MiB (a VM de teste, de 705 MiB): o layout fica, e o log do boot
+    diz quanto caberia.
+  - Na imagem: e2fsprogs só com `e2fsck` e `resize2fs`, mais a libblkid/libuuid do util-linux.
+    **Estimado**: +1,2 MB no rootfs sem compressão, ~0,5 MB no squashfs zstd.
+
+  Como testar:
+  - `cargo test -p corerouter-sysupdate --lib -- gpt ext4 config_takes_the_rest`:
+    - a GPT de 705 MiB da VM e o disco aumentado para 800 MiB e para 2 GiB;
+    - um ext4 de 64 MiB do `mkfs.ext4` do host, crescido pelo `resize2fs` do host até 300 MiB;
+    - a instalação num disco de 300 MiB.
+  - Na VM: com ela desligada, `qemu-img resize vm/corerouter-teste.qcow2 2G`, depois dois boots;
+    o log do boot mostra "partition grown" e depois "growing the filesystem".
+
+- 2026-10-30 — G1.3g: Boot parcial por rota (segunda parte da G1.3g, escolha do usuário: opção "uma a uma"). O
+  rtnetlink não tem checagem a seco, e a seção `routes` recusada pela G1.3e ficava de fora
+  inteira. Agora:
+
+  - `Hal::apply_routes_each` (novo, `crates/hal`; o padrão é `Unsupported`, que leva ao
+    comportamento da G1.3e). No `hal-linux`, as rotas que `to` tem e `from` não têm vão numa sessão
+    netlink só, uma operação por vez, **sem rollback** (`netlink::apply_each`). Cada rota que o
+    kernel aceita entra uma vez e fica; a recusada não tira as outras.
+    - Só quando nada além de rotas adicionadas separa os dois lados (o plano só tem `AddRoute`/
+      `AddDiscard`); senão, `Unsupported` e o `apply` de sempre, tudo ou nada.
+    - Como no `apply`, nunca uma rota por um link de outro programa.
+    - A rota do kernel recusada vira as rotas da config para aquele destino naquela tabela (um
+      grupo ECMP é uma rota no kernel).
+  - Engine (`boot_apply.rs`): no boot e no retry, a seção `routes` vai direto por esse caminho, sem
+    a tentativa inteira antes, para nenhuma metade subir e cair. A rota recusada fica desligada no
+    que o plano de dados tem e aparece:
+    - em `storage.boot_apply_failed` e no `auth.whoami` (`{section: routes, item: "*N", error}`);
+    - na saúde (`boot.apply` = `routes *N`);
+    - no aviso da CLI/MCP e no selo da GUI;
+    - no `ip.route.list`, com flag I, `invalid` e `invalid_reason` (o params doc foi atualizado).
+  - O campo do item no `boot_apply_failed` passou de `rule` (só firewall) a `item` (regra ou rota).
+  - Máscara de item, não de seção: com uma rota de fora, o commit e os caminhos laterais só a
+    desligam, em vez de copiar a seção do que está aplicado. Por isso as rotas de um lease DHCP
+    entram com uma rota estática de fora. O commit que muda ou tira a rota recusada a tenta de novo,
+    tudo ou nada.
+
+  Como testar:
+
+  - `cargo test -p corerouter-engine --test it boot_routes`: só a rota recusada fica de fora (flag
+    I, `invalid_reason`, saúde); commit com uma rota de fora; lease DHCP com uma rota de fora.
+  - Kernel real: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
+    corerouter-hal-linux --test netns_routes_each`. Outro programa tem a mesma rota com a mesma
+    métrica: o `apply` inteiro é recusado e desfaz tudo; uma a uma, só a recusada fica de fora, as
+    outras ficam no kernel e a do outro programa não é tocada.
+
+  Desempenho e paralelismo: o executor já mandava as rotas uma por uma, então o caminho uma a uma
+  custa o mesmo que o `apply` inteiro (10 000 rotas: 229 ms contra 236 ms, release, **medido**,
+  abaixo) e dispensa a tentativa inteira e o seu rollback. O mapa rota do kernel → rota da config só
+  é montado quando há recusa (por id, O(n)). Nada a dividir: o kernel serializa o rtnetlink por
+  netns, e as rotas dependem dos endereços já aplicados.

@@ -882,6 +882,8 @@ fn list(s: &mut Session, table: Table, p: &Value) -> Result<Value> {
         .ext::<crate::firewall_diag::FwDiag>()
         .map(|d| std::sync::Arc::clone(&d.live));
     let cfg = s.store().candidate().clone();
+    // G1.3g: rules the kernel refused at boot are out, invalid.
+    let refused = s.boot_refused("firewall");
     s.defer(move || {
         let shadows = shadowed(&cfg, table);
         let issues = table_issues(&cfg, table);
@@ -894,7 +896,11 @@ fn list(s: &mut Session, table: Table, p: &Value) -> Result<Value> {
                 .enumerate()
                 .filter(|(_, (r, _))| chain.as_ref().is_none_or(|c| *c == r.chain && !r.section))
                 .map(|(i, (r, issue))| {
-                    let first = issue.into_iter().next();
+                    let first = issue.into_iter().next().or_else(|| {
+                        refused.get(&r.id).map(|why| {
+                            ("kernel", format!("refused at boot, left out until fixed: {why}"))
+                        })
+                    });
                     let mut v = row(table, i, r, shadows.get(&r.id).copied(), first);
                     if let (Some(l), Some(o)) =
                         (live.as_ref().and_then(|m| m.get(&(table, r.id))), v.as_object_mut())

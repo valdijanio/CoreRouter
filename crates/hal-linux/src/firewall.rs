@@ -168,6 +168,71 @@ fn read_and_apply(from: &Config, to: &Config) -> Result<(Applied, Option<Box<Loa
     ))
 }
 
+/// The empty table a check fills (G1.3g); never holds anything committed.
+pub const SCRATCH: &str = "corerouter-check";
+
+/// G1.3g: the rules of `cfg` the kernel would refuse, checked without
+/// loading anything (sent as a check: see [`nfnl::CheckBatch`]), in the
+/// order of the batch. A refusal that is no rule's (a set, a chain, the
+/// table, the batch) is an `Err`, with what the kernel said.
+///
+/// Into an empty scratch table that exists before the check (committed
+/// empty, removed after), not by replacing ours: what only the
+/// whole-table validation finds (a `dst-nat` in `srcnat`, a jump loop)
+/// is reported per rule on the kernel's replay only for a table that
+/// was there before the batch. The abort that ends a check sets
+/// `validate_state = DO` on the tables it validated, not on the netns
+/// as the commit does (`nf_tables_api.c`: `__nf_tables_abort` against
+/// `nf_tables_commit` step 0, kernel 6.18), and a table the batch
+/// creates is born again on the replay with the netns' `SKIP`: the error
+/// was lost (**medido**: a check of ours reported nothing).
+///
+/// With validation on, the refused rule stays in its chain for the rest
+/// of the replay, so every rule after it is refused too: only the
+/// **first** refusal is certain; the caller takes it out and checks
+/// again.
+pub fn check(cfg: &Config) -> Result<Vec<corerouter_hal::RefusedItem>, HalError> {
+    let Some(mut t) = fwnft::program(cfg, &[]) else {
+        return Ok(Vec::new());
+    };
+    t.name = SCRATCH.into();
+    let scratch = |add: bool| {
+        let mut b = Batch::new(1);
+        b.family(t.family);
+        b.new_table(SCRATCH);
+        if !add {
+            b.del_table(SCRATCH);
+        }
+        nfnl::apply(b, "the firewall check's scratch table")
+    };
+    scratch(true)?;
+    let mut b = Batch::new(1);
+    b.track_rules();
+    let lookup = nfnl::fill(&t, b).finish_check();
+    let refused = nfnl::check(&lookup, "checking the firewall");
+    if let Err(e) = scratch(false) {
+        log::warn!("firewall check: removing table {SCRATCH}: {e}");
+    }
+    let refused = refused?;
+    // Only the first is certain (see above).
+    let Some(&(seq, errno)) = refused.first() else {
+        return Ok(Vec::new());
+    };
+    let why = std::io::Error::from_raw_os_error(errno).to_string();
+    let id = lookup
+        .rule_of(seq)
+        .and_then(|r| r.comment.as_deref())
+        .and_then(|c| c.strip_prefix("cr:"))
+        .and_then(|c| c.parse().ok());
+    match id {
+        Some(id) => Ok(vec![corerouter_hal::RefusedItem { id, reason: why }]),
+        None => Err(HalError::Rejected(format!(
+            "nftables refused message {} of the firewall, which is no rule's ({why})",
+            seq.wrapping_sub(lookup.seqs.start)
+        ))),
+    }
+}
+
 /// Replace the table whole with `cfg`'s, keeping the dynamic entries.
 pub fn replace(cfg: &Config) -> Result<(), HalError> {
     let mut loaded = loaded();

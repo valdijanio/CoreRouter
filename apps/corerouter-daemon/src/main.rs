@@ -749,7 +749,18 @@ fn main() -> ExitCode {
         }
     };
     let storage_name = storage.describe();
-    let mut session = Session::with_storage(hal, storage);
+    // G1.3g: the boot keeps these reachable (it runs before they open).
+    let management_ports = [
+        Some(args.port),
+        args.listen.map(|a| a.port()),
+        args.ws,
+        args.ws_listen.map(|a| a.port()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let env = corerouter_engine::boot_apply::BootEnv { management_ports };
+    let mut session = Session::with_storage_env(hal, storage, env);
     session.set_runner(thread_runner());
     let session = shared(session);
     if let Err(e) = spawn_clock(session.clone()) {

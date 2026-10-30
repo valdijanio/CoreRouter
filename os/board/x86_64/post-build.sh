@@ -48,6 +48,15 @@ done
 # What only those needed (readline's ncurses, the C++ runtime the toolchain
 # copies because FRR's configure wants a C++ compiler, PCRE2's POSIX layer).
 # `cargo xtask os build` checks every ELF's NEEDED is still in the image.
+# G1.6v: of e2fsprogs, corerouter-init runs e2fsck and resize2fs (growing
+# /config); the other tools (mkfs, tune2fs, debugfs, …) leave the image.
+for b in badblocks debugfs dumpe2fs e2freefrag e2image e2label e2mmpstatus e2undo e4crypt \
+	e4defrag filefrag findfs fsck.ext2 fsck.ext3 fsck.ext4 logsave mke2fs mkfs.ext2 \
+	mkfs.ext3 mkfs.ext4 mklost+found tune2fs; do
+	rm -f "$T/sbin/$b" "$T/usr/sbin/$b"
+done
+rm -f "$T/usr/bin/chattr" "$T/usr/bin/lsattr" "$T/usr/bin/compile_et" "$T/usr/bin/mk_cmds" \
+	"$T/etc/mke2fs.conf"
 rm -rf "$T/usr/share/terminfo"
 rm -f "$T"/usr/lib/libstdc++.so* "$T"/usr/lib/libgomp.so* "$T"/usr/lib/libncurses.so* \
 	"$T"/usr/lib/libcurses.so "$T"/usr/lib/libform.so* "$T"/usr/lib/libmenu.so* \

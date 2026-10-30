@@ -105,6 +105,9 @@ const REQUIRED_BR2: &[&str] = &[
     "BR2_PACKAGE_FRR=y",
     "BR2_PACKAGE_LIBCAP=y",
     "BR2_PACKAGE_COREROUTER_INSTALLER=y",
+    // G1.6v: corerouter-init grows /config with them.
+    "BR2_PACKAGE_E2FSPROGS=y",
+    "BR2_PACKAGE_E2FSPROGS_RESIZE2FS=y",
 ];
 /// What the installer kernel's fragment must say (G1.6c).
 const INSTALLER_KERNEL: &[&str] = &[

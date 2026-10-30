@@ -22,7 +22,12 @@ pub(crate) fn boot_failures(summary: &Value) -> Vec<(String, String)> {
         .take(16)
         .map(|f| {
             let field = |k| f.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
-            (field("section"), field("error"))
+            // G1.3g: one item of the section (`firewall *5`, `routes *3`).
+            let what = match f.get("item").and_then(Value::as_str) {
+                Some(item) => format!("{} {item}", field("section")),
+                None => field("section"),
+            };
+            (what, field("error"))
         })
         .collect()
 }
@@ -150,6 +155,18 @@ mod tests {
             let (_, text) = crate::i18n::explain(langs, HELP_KEY).unwrap();
             assert!(text.contains("firewall"), "{text}");
         }
+    }
+
+    /// G1.3g: one rule out shows as `firewall *5`.
+    #[test]
+    fn one_rule_out_names_the_rule() {
+        let summary = json!({"storage": {"boot_apply_failed": [
+            {"section": "firewall", "item": "*5", "error": "Operation not supported"}
+        ]}});
+        assert_eq!(
+            boot_failures(&summary),
+            [("firewall *5".to_owned(), "Operation not supported".to_owned())]
+        );
     }
 
     #[test]

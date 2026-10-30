@@ -2930,3 +2930,36 @@ lote netlink (50 000 regras = 24 MiB num lote, que só um root com `SO_SNDBUFFOR
   tap tc (G3.9db) 1,844 e 1,986 — dentro da faixa do "sem taps", os sockets abaixo dela.
 
 - 2026-10-30 — G1.3d (**medido**, build release, namespace com dummies, 32 núcleos): `LinuxHal::poll` completo 312 µs (11 links), 2,18 ms (101), 27,3 ms (1001), mediana de 30; eventos `RTNLGRP_LINK`: 1 mensagem por del (672 B) e por add (1484 B), drenar 3,4 µs, 0 por segundo parado; replug → endereço de volta no daemon (build debug) ≤36 ms.
+
+- 2026-10-30, G1.6u, **medido** (máquina de desenvolvimento compartilhada, build release,
+  `/tmp` ext4, criterion `config_snapshot`): snapshot do `/config` da VM de teste (revisão de
+  10,7 MB, 60 pequenas, 3,7 MB de gráficos): cópia inteira de antes 51–126 ms (mediana 88 ms),
+  linkado 16–65 ms (mediana 38 ms); o fsync domina e a máquina variou muito. A varredura do
+  `/config` que o status faz a cada 2 s: 82 µs na forma da VM, 3,7 ms com 4096 séries de
+  gráfico (o máximo).
+
+### G1.3g: checagem do firewall sem aplicar (2026-10-30, **medido**)
+
+Netns sem root, `cargo test [--release] -p corerouter-hal-linux --test netns_fw_check
+slow_checking_many_rules_with_one_bad`, kernel do host:
+
+| 10 000 regras `forward` | debug | release |
+|---|---|---|
+| checagem, todas boas | 252 ms | 69 ms |
+| checagem, 1 regra recusada só na validação (`dst-nat` em `srcnat`) | 5,3 s | 1,7 s |
+| `apply` recusado do mesmo conjunto | 2,2 s | 1,7 s |
+| `apply` das 10 000 boas | 2,4 s | 1,7 s |
+
+A checagem com erro custa o mesmo que o `apply` recusado: é o replay do kernel validando a
+tabela inteira a cada regra (O(n²)); um erro de mensagem (módulo ausente, `ENOENT`) não faz
+replay.
+
+### G1.3g: rotas uma a uma no boot (2026-10-30, **medido**)
+
+Netns sem root, `cargo test --release -p corerouter-hal-linux --test netns_routes_each
+slow_ten_thousand_routes_one_refused`, kernel do host:
+
+| 10 000 rotas `/24`, 1 recusada | release |
+|---|---|
+| `apply` inteiro (todas aceitas) | 236 ms |
+| `apply_routes_each` (1 recusada, as outras ficam) | 229 ms |
