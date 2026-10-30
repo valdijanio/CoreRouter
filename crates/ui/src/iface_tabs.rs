@@ -149,6 +149,9 @@ pub(crate) struct NicView {
     pub(crate) usb_ask: Option<&'static str>,
     /// G1.29c: a confirmed USB recovery level, sent by the dialog.
     pub(crate) usb_go: Option<&'static str>,
+    /// G1.29c: until then the Hardware tab refreshes every second, so the
+    /// recovery's outcome shows as soon as it is known.
+    pub(crate) usb_fast_until: f64,
 }
 
 impl NicView {
@@ -311,7 +314,10 @@ impl CoreRouterUi {
             let due: Vec<What> = What::ALL
                 .into_iter()
                 .filter(|w| !view.pending.contains(w))
-                .filter(|w| view.asked.get(w).is_none_or(|t| now - t >= w.every()))
+                .filter(|w| {
+                    let every = if *w == What::Hardware && now < view.usb_fast_until { 1.0 } else { w.every() };
+                    view.asked.get(w).is_none_or(|t| now - t >= every)
+                })
                 .collect();
             let mut due = due;
             if let Some(v) = self.nic.get(&name) {
@@ -829,6 +835,9 @@ fn usb_section(ui: &mut Ui, u: &Value, help: &mut Option<(&'static str, &'static
             usb_row(ui, "Power Saving", "iface_usb.power_saving", saving, help);
             usb_row(ui, "Tx Timeouts", "iface_usb.tx_timeouts", text(u, "tx_timeouts"), help);
             usb_row(ui, "Over-current", "iface_usb.over_current", text(u, "over_current"), help);
+            if let Some(t) = recoveries_text(u) {
+                usb_row(ui, "Recoveries", "iface_usb.recoveries", Some(t), help);
+            }
         });
     if let Some(a) = text(u, "alert").filter(|_| slow) {
         ui.add_space(4.0);
@@ -853,20 +862,6 @@ fn usb_recovery(
     help: &mut Option<(&'static str, &'static str)>,
 ) {
     let r = u.get("recoveries").cloned().unwrap_or(Value::Null);
-    let n = |k: &str| r.get(k).and_then(Value::as_u64).unwrap_or(0);
-    let mut text = format!("{} link · {} driver · {} port", n("link"), n("driver"), n("port"));
-    if let Some(running) = text_of(&r, "running") {
-        text = format!("{text} · {running} reset running…");
-    } else if let Some(e) = text_of(&r, "last_error") {
-        text = format!("{text} · last failed: {e}");
-    } else if let Some(last) = text_of(&r, "last_level") {
-        let back = r.get("last_back").and_then(Value::as_bool) == Some(true);
-        text = format!("{text} · last: {last}, {}", if back { "came back" } else { "did not come back" });
-    }
-    Grid::new("iface-usb-recovery")
-        .num_columns(2)
-        .spacing([12.0, 4.0])
-        .show(ui, |ui| usb_row(ui, "Recoveries", "iface_usb.recoveries", Some(text), help));
     let running = r.get("running").is_some_and(|v| !v.is_null());
     let allowed = can.check("interface.usb.reset");
     ui.horizontal(|ui| {
@@ -898,6 +893,23 @@ fn usb_recovery(
             }
         });
     }
+}
+
+/// "1 link · 0 driver · 0 port · last: link, came back".
+fn recoveries_text(u: &Value) -> Option<String> {
+    let r = u.get("recoveries").filter(|r| r.is_object())?;
+    let n = |k: &str| r.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let text = format!("{} link · {} driver · {} port", n("link"), n("driver"), n("port"));
+    Some(if let Some(running) = text_of(r, "running") {
+        format!("{text} · {running} reset running…")
+    } else if let Some(e) = text_of(r, "last_error") {
+        format!("{text} · last failed: {e}")
+    } else if let Some(last) = text_of(r, "last_level") {
+        let back = r.get("last_back").and_then(Value::as_bool) == Some(true);
+        format!("{text} · last: {last}, {}", if back { "came back" } else { "did not come back" })
+    } else {
+        text
+    })
 }
 
 fn text_of(v: &Value, key: &str) -> Option<String> {
