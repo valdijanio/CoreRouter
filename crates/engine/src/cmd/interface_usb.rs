@@ -96,6 +96,7 @@ fn reset(s: &mut Session, p: &Value) -> Result<Value> {
                         "name": label,
                         "level": level.as_str(),
                         "back": rep.back,
+                        "back_as": rep.back_as,
                         "power_cycled": rep.power_cycled,
                     }));
                     Ok(())
@@ -202,6 +203,34 @@ mod tests {
         assert!(r["last_error"].as_str().unwrap().contains("Permission denied"));
         let text = s.execute("log.print", &json!({"find": "ether5"})).unwrap().to_string();
         assert!(text.contains("USB adapter reset (driver) failed"), "{text}");
+    }
+
+    /// G1.29f: on the router of the report, the RTL8153 came back from a
+    /// port reset as the kernel's `eth0` (an image whose PID 1 had no
+    /// hot-plug renaming): the log says under which name, not only "did
+    /// not come back".
+    #[test]
+    fn a_recovery_that_came_back_under_the_kernels_name_says_so() {
+        let mut s = lab();
+        let done = s
+            .ext_mut::<crate::usb_nic::UsbRecovery>()
+            .map(|r| r.done.clone())
+            .unwrap();
+        done.push((
+            "ether5".parse().unwrap(),
+            corerouter_hal::nic::UsbResetLevel::Port,
+            Ok(corerouter_hal::nic::UsbResetReport {
+                power_cycled: true,
+                back_as: Some("eth0".into()),
+                ..Default::default()
+            }),
+        ));
+        s.tick(1_000);
+        let text = s.execute("log.print", &json!({"find": "ether5"})).unwrap().to_string();
+        assert!(text.contains("came back as 'eth0', not 'ether5'"), "{text}");
+        assert!(text.contains("PID 1 did not give it its name again"), "{text}");
+        let hw = s.execute("interface.hardware", &json!({"name": "ether5"})).unwrap();
+        assert_eq!(hw["usb"]["recoveries"]["last_back"], false);
     }
 
     #[test]

@@ -594,6 +594,7 @@ pub fn parse_route(body: &[u8]) -> Option<RawFecRoute> {
     Some(r)
 }
 
+mod ebpf;
 mod host;
 pub use host::*;
 

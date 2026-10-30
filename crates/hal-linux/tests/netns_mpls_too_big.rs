@@ -303,6 +303,7 @@ struct Done {
     expired_sent: u64,
     refused: u64,
     last_err: Option<String>,
+    tap: String,
 }
 
 /// The responder in CR2's namespace on `mc2`, behind the limits the
@@ -353,6 +354,8 @@ fn responder(
                     Err(why) => done.last_err = Some(why.to_owned()),
                 }
             }
+            done.tap = r.tap_kind();
+            eprintln!("tap: {}", done.tap);
             done
         })
         .unwrap();

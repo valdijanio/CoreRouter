@@ -1,4 +1,6 @@
 use super::*;
+use corerouter_dataplane_ebpf_common::lsp_tap;
+use corerouter_hal::lsp::too_big;
 
 /// A classic BPF interpreter for the opcodes of the filters: what the
 /// kernel returns for `pkt` (0: dropped).
@@ -428,7 +430,75 @@ fn route_answers_with_mpls_encap_parse() {
     assert_eq!(&q[16..18], &[2, 32]);
 }
 
+/// What the packet socket of a frame's protocol keeps of it, as a
+/// [`lsp_tap::Keep`] (the classic filters, G3.5b–G3.9da).
+fn classic(f: &[u8], big: Option<u32>) -> lsp_tap::Keep {
+    let prog = match f.get(12..14) {
+        Some([0x88, 0x47]) => mpls_filter(big),
+        Some([0x08, 0x00]) => IP4_FILTER.to_vec(),
+        Some([0x86, 0xdd]) => IP6_FILTER.to_vec(),
+        _ => return lsp_tap::Keep::No,
+    };
+    match run(&prog, f) {
+        0 => lsp_tap::Keep::No,
+        KEEP => lsp_tap::Keep::Whole,
+        n => {
+            assert_eq!(n as usize, lsp_tap::SNAP);
+            lsp_tap::Keep::Head
+        }
+    }
+}
+
+/// G3.9db: the tc tap keeps what the packet sockets kept, frame for frame.
+#[test]
+fn the_tc_tap_keeps_what_the_classic_filters_kept() {
+    assert_eq!(lsp_tap::SNAP, 14 + too_big::SNAP);
+    let mut cases = vec![
+        frame(&[100], 1, "10.0.0.1", "127.0.0.1", 3503),
+        frame(&[100], 9, "10.0.0.1", "10.9.9.9", 80),
+        frame(&[0], 9, "10.0.0.1", "127.0.0.1", 3503),
+        frame(&[2], 9, "2001:db8::1", "::1", 3503),
+        frame(&[], 1, "10.0.0.1", "127.0.0.1", 3503),
+        frame(&[], 1, "10.0.0.1", "127.0.0.1", 3504),
+        frame(&[], 1, "10.0.0.1", "10.0.0.2", 3503),
+        frame(&[], 1, "2001:db8::1", "::1", 3503),
+        frame(&[], 1, "2001:db8::1", "::ffff:127.0.0.9", 3503),
+        frame(&[], 1, "2001:db8::1", "2001:db8::2", 3503),
+    ];
+    let mut long = frame(&[100], 9, "10.0.0.1", "10.9.9.9", 80);
+    long.resize(1600, 0);
+    cases.push(long);
+    for f in &cases {
+        for big in [None, Some(1514), Some(100)] {
+            let set = lsp_tap::Settings {
+                big: big.unwrap_or(0),
+            };
+            assert_eq!(
+                lsp_tap::keep(&f[..], f.len() as u32, false, set),
+                classic(f, big),
+                "{f:?} big {big:?}"
+            );
+        }
+    }
+}
+
 proptest::proptest! {
+    /// G3.9db: the same on hostile frames (the protocol word forced to one
+    /// the taps hear).
+    #[test]
+    fn the_tc_tap_and_the_classic_filters_agree(
+        mut b in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..200),
+        kind in 0usize..3,
+        big in proptest::prelude::any::<u8>(),
+    ) {
+        if let Some(t) = b.get_mut(12..14) {
+            t.copy_from_slice(&[[0x88, 0x47], [0x08, 0x00], [0x86, 0xdd]][kind]);
+        }
+        let big = (big > 0).then_some(u32::from(big));
+        let set = lsp_tap::Settings { big: big.unwrap_or(0) };
+        proptest::prop_assert_eq!(lsp_tap::keep(&b[..], b.len() as u32, false, set), classic(&b, big));
+    }
+
     #[test]
     fn hostile_frames_and_routes_never_panic(b in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..300)) {
         let _ = parse_frame(&b, &name());
