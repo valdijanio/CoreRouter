@@ -17,7 +17,7 @@ pub const MAX_INTERFACES: usize = 4096;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "interface.list", "Interfaces", ["Interfaces"], None,
-        "{type?: string (ether | vlan | bridge | bonding | loopback | vrf | veth | …)} → [{name, type, kind, managed, unmanaged_reason, mtu, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, comment, parent, vlan_id, use_service_tag, bridge, bond, vrf, table, usb: null | {port, speed, driver, slow_port, alert} (a USB adapter, G1.29b)}]",
+        "{type?: string (ether | vlan | bridge | bonding | loopback | vrf | veth | …)} → [{name, type, kind, managed, unmanaged_reason, mtu, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, comment, parent, vlan_id, use_service_tag, bridge, bond, vrf, table, usb: null | {port, speed, driver, slow_port, alert} (a USB adapter, G1.29b), invalid: bool (G1.3b: a port not on this machine, or a VLAN on one; flag I), invalid_reason: string | null}]",
         always, list),
     cmd!(
         "interface.set",
@@ -113,7 +113,9 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
         .take(crate::usb_nic::MAX_LISTED)
         .filter_map(|l| Some((l.name.clone(), crate::usb_nic::summary(s, &l.name)?)))
         .collect();
+    let absent = s.hal().absent_ports();
     let cfg = s.store().candidate();
+    let invalid = crate::port_absent::invalid(cfg, &absent, &live);
     let mut rows: Vec<Value> = cfg
         .interfaces
         .values()
@@ -162,6 +164,8 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                 "vrf": i.vrf,
                 "table": table,
                 "usb": usb.get(&i.name),
+                "invalid": invalid.contains_key(&i.name),
+                "invalid_reason": invalid.get(&i.name),
             })
         })
         .collect();
@@ -195,6 +199,8 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                     "bond": null,
                     "vrf": null,
                     "table": null,
+                    "invalid": false,
+                    "invalid_reason": null,
                 })
             }),
     );

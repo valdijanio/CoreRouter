@@ -102,6 +102,8 @@ impl Session {
         // G1.29c: finished USB recoveries; configuration back on a
         // recreated port.
         self.usb_tick(&live);
+        // G1.3b: ports that went and came back.
+        self.absent_tick(&live);
     }
 }
 

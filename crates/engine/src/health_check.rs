@@ -178,6 +178,9 @@ pub struct Inputs {
     /// G1.29d: (adapter, watchdog actions in the last hour, gave up, the
     /// last stall's reason).
     pub usb_watchdog: Vec<(String, usize, bool, Option<String>)>,
+    /// G1.3b: ports of the running config not on this machine (and the
+    /// VLANs on them). Empty: every port is there (no check then).
+    pub absent_ports: Vec<String>,
     /// Whether any reading exists at all.
     pub readings: bool,
 }
@@ -595,6 +598,16 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
             });
         }
     }
+    // G1.3b: a port of the config that is not there (unplugged, a USB
+    // adapter that fell off, a card that burned): the rest runs, its own
+    // configuration waits for it.
+    if !i.absent_ports.is_empty() {
+        let list = i.absent_ports.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+        out.push(Check { key: "interface.absent", name: "Absent ports", severity: Severity::Warning,
+            value: Some(i.absent_ports.len().to_string()),
+            reason: format!("interface(s) da configuração sem a placa nesta máquina (flag I): {list}; o resto da configuração está aplicado e a delas volta sozinha quando a placa voltar"),
+            action: Some("Confira o cabo/adaptador USB ou a placa; se ela saiu de vez, tire a configuração dela (ou troque a interface dos itens que a usam).".into()) });
+    }
     // G1.29b: a USB adapter behind a port slower than itself caps the
     // traffic with no error anywhere. Only on routers that have one.
     if !i.usb.is_empty() {
@@ -782,6 +795,7 @@ impl Session {
             })
             .collect();
         i.usb_watchdog = self.usb_watchdog_health();
+        i.absent_ports = self.invalid_interfaces(&live).into_keys().map(|n| n.to_string()).collect();
         i.bgp_no_eor = self.routing_status().map(|st| {
             let quiet = bgp_without_eor(st)
                 .map(|b| b.connection.clone().unwrap_or_else(|| b.remote_address.clone()))
@@ -892,6 +906,7 @@ mod tests {
             bgp_gr_no_bfd: Some((1, Vec::new())),
             usb: Vec::new(),
             usb_watchdog: Vec::new(),
+            absent_ports: Vec::new(),
         }
     }
 
@@ -925,6 +940,19 @@ mod tests {
             assert!(c.action.is_none());
         }
         assert_eq!(overall(&checks), Severity::Ok);
+    }
+
+    #[test]
+    fn absent_ports_warn_only_when_there_are_some() {
+        assert!(evaluate(&healthy()).iter().all(|c| c.key != "interface.absent"));
+        let mut i = healthy();
+        i.absent_ports = vec!["ether2".into(), "vlan20".into()];
+        let checks = evaluate(&i);
+        let c = checks.iter().find(|c| c.key == "interface.absent").unwrap();
+        assert_eq!(c.severity, Severity::Warning);
+        assert_eq!(c.value.as_deref(), Some("2"));
+        assert!(c.reason.contains("ether2, vlan20"), "{}", c.reason);
+        assert!(c.action.is_some());
     }
 
     #[test]
