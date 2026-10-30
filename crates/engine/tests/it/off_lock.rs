@@ -162,6 +162,7 @@ fn a_streamed_list_is_the_json_of_its_rows() {
         "routing_table",
         "state",
         "static",
+        "type",
     ];
     for r in rows {
         let keys: Vec<&str> = r.as_object().unwrap().keys().map(String::as_str).collect();

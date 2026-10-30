@@ -317,6 +317,11 @@ fn probe_of(cfg: &Config, t: &Target, r: &RouteEntry) -> ProbeHow {
                 Reach::Inactive(why) | Reach::Invalid { why, .. } => {
                     ProbeHow::Unreachable(why.text)
                 }
+                // Refused by validation (a route without gateway has nothing
+                // to check); a hand-edited file still says why.
+                Reach::Discard(d) => {
+                    ProbeHow::Unreachable(format!("a {} route has no gateway", d.as_str()))
+                }
             }
         }
         CheckGateway::Bfd | CheckGateway::None => ProbeHow::Unreachable(String::new()),

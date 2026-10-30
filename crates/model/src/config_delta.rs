@@ -309,11 +309,11 @@ fn diff_config(a: &Config, b: &Config) -> Result<Option<Value>, PersistError> {
 }
 
 /// Routing (G3.2a): its maps by key, so changing one of 1 000 BGP
-/// connections stores that connection, not the section.
+/// connections stores that connection, not the section. Everything else
+/// (RPKI, BFD, OSPF, MPLS…) goes through [`light_routing`]'s small part.
 fn diff_routing(a: &Routing, b: &Routing) -> Result<Option<Value>, PersistError> {
-    let mut p = Parts {
-        changed: Map::new(),
-        gone: Vec::new(),
+    let Some(mut p) = Parts::small(a, b, light_routing)? else {
+        return whole(a, b);
     };
     p.map("bgp", &a.bgp, &b.bgp)?;
     p.map("bgp_templates", &a.bgp_templates, &b.bgp_templates)?;
@@ -334,6 +334,30 @@ fn diff_routing(a: &Routing, b: &Routing) -> Result<Option<Value>, PersistError>
         }
     }
     Ok(p.finish())
+}
+
+/// The routing section without its big parts (the BGP maps and the
+/// filter, diffed on their own above). Destructured whole: a new routing
+/// field either gets its own diff or is in the small part, never neither
+/// (OSPF, MPLS, BFD and RPKI were left out of the journal until this).
+fn light_routing(r: &Routing) -> Routing {
+    let Routing {
+        bgp: _,
+        bgp_templates: _,
+        bgp_connections: _,
+        filter: _,
+        rpki,
+        bfd,
+        ospf,
+        mpls,
+    } = r;
+    Routing {
+        rpki: rpki.clone(),
+        bfd: bfd.clone(),
+        ospf: ospf.clone(),
+        mpls: mpls.clone(),
+        ..Routing::default()
+    }
 }
 
 fn diff_ppp(a: &Ppp, b: &Ppp) -> Result<Option<Value>, PersistError> {
@@ -1054,6 +1078,43 @@ mod tests {
         other.system.identity = "x".into();
         let got = check(&other, &new);
         assert!(CowArc::ptr_eq(&got.routing, &new.routing));
+    }
+
+    /// The routing parts that are not the BGP maps or the filter reach the
+    /// journal: an OSPF instance added alone was a `{}` delta, lost on the
+    /// next start.
+    #[test]
+    fn ospf_mpls_bfd_and_rpki_are_in_the_delta() {
+        use serde_json::{from_value, json};
+        let base = big();
+        let mut ospf = base.clone();
+        ospf.routing.ospf.instances.insert(
+            "v2".into(),
+            from_value(json!({"name": "v2", "router_id": "10.255.0.1"})).unwrap(),
+        );
+        let d = diff(&base, &ospf).unwrap();
+        assert!(d.to_string().contains("10.255.0.1"), "{d}");
+        check(&base, &ospf);
+        check(&ospf, &base);
+        let mut mpls = ospf.clone();
+        mpls.routing.mpls.ldp = Some(from_value(json!({"lsr_id": "10.255.0.1"})).unwrap());
+        check(&ospf, &mpls);
+        check(&mpls, &base);
+        let mut bfd = base.clone();
+        bfd.routing.bfd.profiles.insert(
+            "p".into(),
+            from_value(json!({"name": "p", "min_tx": 300, "min_rx": 300, "multiplier": 3})).unwrap(),
+        );
+        check(&base, &bfd);
+        check(&bfd, &mpls);
+        // BGP next to it: both kinds in one delta.
+        let mut both = mpls.clone();
+        both.routing.bgp.insert(
+            "default".into(),
+            from_value(json!({"name": "default", "asn": 65000, "router_id": "10.0.0.1"})).unwrap(),
+        );
+        check(&mpls, &both);
+        check(&both, &base);
     }
 
     #[test]

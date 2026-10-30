@@ -17,6 +17,7 @@ use std::net::IpAddr;
 
 use corerouter_hal::Learned;
 use corerouter_model::route::{self, Reach, Why};
+use corerouter_model::types::Discard;
 use corerouter_model::{Config, IfName, InterfaceKind, ItemId, RoutingTable};
 use ipnet::IpNet;
 
@@ -133,6 +134,8 @@ pub struct Line {
     pub state: State,
     /// Paths of its ECMP group (1: no ECMP).
     pub ecmp: usize,
+    /// G1.5a: a route without next hop (blackhole, unreachable, prohibit).
+    pub discard: Option<Discard>,
     /// G1.27j: what to know about its ECMP group (active members only).
     /// Boxed: most routes have none, and a million lines are sorted.
     pub notice: Option<Box<Notice>>,
@@ -174,11 +177,12 @@ pub struct Notice {
 
 impl Line {
     fn usable(&self) -> bool {
-        self.via.is_some()
+        self.via.is_some() || self.discard.is_some()
     }
 
     /// RouterOS flags for the terminal: X disabled, A active, then the
-    /// source (D dynamic + C connect / S static; an RA route is just D).
+    /// source (D dynamic + C connect / S static; an RA route is just D),
+    /// then B, U or P for a route without next hop (v6's flags, G1.5a).
     pub fn flags(&self) -> String {
         let mut f = String::new();
         if self.disabled {
@@ -194,6 +198,9 @@ impl Line {
             Origin::Ppp => "D",
             Origin::Static => "S",
         });
+        if let Some(d) = self.discard {
+            f.push(d.flag());
+        }
         if self.ecmp > 1 && self.state == State::Active {
             f.push('+');
         }
@@ -202,6 +209,9 @@ impl Line {
 
     /// `10.0.0.1%ether1`, or the interface alone.
     pub fn immediate_gw(&self) -> Option<String> {
+        if let Some(d) = self.discard {
+            return Some(d.as_str().to_owned());
+        }
         self.via.as_ref().map(|v| match v.gateway {
             Some(g) => format!("{g}%{}", v.link),
             None => v.link.to_string(),
@@ -273,6 +283,8 @@ pub fn build(cfg: &Config, live: &Live) -> Vec<Line> {
         let (via, why) = match route::reach(cfg, r) {
             Reach::Active { link, .. } if down(&link) => (None, Some(link_down(&link))),
             Reach::Active { link, gateway } => (Some(Via { link, gateway }), None),
+            // G1.5a: no link to go down; usable through `discard`.
+            Reach::Discard(_) => (None, None),
             Reach::Inactive(why) | Reach::Invalid { why, .. } => (None, Some(why)),
         };
         lines.push(Line {
@@ -293,6 +305,7 @@ pub fn build(cfg: &Config, live: &Live) -> Vec<Line> {
             state: State::Inactive,
             ecmp: 1,
             notice: None,
+            discard: r.gateway.discards(),
         });
     }
     // Lease routes whose gateway fails check-gateway (G4.7c), and static
@@ -337,6 +350,7 @@ pub fn build(cfg: &Config, live: &Live) -> Vec<Line> {
             state: State::Inactive,
             ecmp: 1,
             notice: None,
+            discard: None,
         });
     }
     for c in route::connected(cfg) {
@@ -380,6 +394,7 @@ pub fn build(cfg: &Config, live: &Live) -> Vec<Line> {
             state: State::Inactive,
             ecmp: 1,
             notice: None,
+            discard: None,
         });
     }
     // What the kernel learned from Router Advertisements: its metric (1024
@@ -435,6 +450,7 @@ pub fn build(cfg: &Config, live: &Live) -> Vec<Line> {
             state: State::Inactive,
             ecmp: 1,
             notice: None,
+            discard: None,
         });
     }
     lines.sort_by(order);
@@ -449,6 +465,13 @@ pub fn build(cfg: &Config, live: &Live) -> Vec<Line> {
 fn shares(a: Origin, b: Origin) -> bool {
     let installed = |o| matches!(o, Origin::Static | Origin::Dhcp);
     (installed(a) && installed(b)) || (a == Origin::Ra && b == Origin::Ra)
+}
+
+/// `l` is the winner or one of its ECMP paths. A route without next hop
+/// shares with nothing (G1.5a): the kernel holds one route per prefix,
+/// metric and table, and a blackhole has no path to merge.
+fn joins(l: &Line, wkey: &str, origin: Origin, wdiscard: Option<Discard>) -> bool {
+    l.key == wkey || (wdiscard.is_none() && l.discard.is_none() && shares(l.origin, origin))
 }
 
 /// Decide the state of every line. `lines` is sorted by `order`, so each
@@ -476,8 +499,8 @@ fn select_group(group: &mut [Line]) {
     let winner = group
         .iter()
         .find(|l| l.usable())
-        .map(|w| (w.distance, w.origin, w.key.clone(), w.immediate_gw(), w.id));
-    let Some((distance, origin, wkey, wvia, wid)) = winner else {
+        .map(|w| (w.distance, w.origin, w.key.clone(), w.immediate_gw(), w.id, w.discard));
+    let Some((distance, origin, wkey, wvia, wid, wdiscard)) = winner else {
         for l in group.iter_mut() {
             l.state = State::Inactive;
         }
@@ -485,9 +508,7 @@ fn select_group(group: &mut [Line]) {
     };
     let ecmp = group
         .iter()
-        .filter(|l| {
-            l.usable() && l.distance == distance && (l.key == wkey || shares(l.origin, origin))
-        })
+        .filter(|l| l.usable() && l.distance == distance && joins(l, &wkey, origin, wdiscard))
         .count();
     for l in group.iter_mut() {
         l.notice = None;
@@ -495,7 +516,7 @@ fn select_group(group: &mut [Line]) {
             l.state = State::Inactive;
             continue;
         }
-        let shared = l.distance == distance && (l.key == wkey || shares(l.origin, origin));
+        let shared = l.distance == distance && joins(l, &wkey, origin, wdiscard);
         if shared {
             l.state = State::Active;
             l.ecmp = ecmp;
@@ -1226,6 +1247,7 @@ mod tests {
             state: State::Inactive,
             ecmp: 1,
             notice: None,
+            discard: None,
         }
     }
 

@@ -225,5 +225,20 @@ CONFIG_USB=y
 CONFIG_USB_XHCI_HCD=y
 CONFIG_USB_EHCI_HCD=y
 CONFIG_USB_STORAGE=y
+
+# --- G1.29a: USB Ethernet adapters. r8152 (Realtek RTL8152/8153/8156, the
+# common gigabit and 2.5G dongles; works without its optional rtl_nic
+# firmware patches), ASIX AX88179/178A and AX88772, Microchip LAN78xx and
+# the class drivers (CDC ECM, NCM) the rest speak. Built in like the PCI
+# ones: no module loading in the image.
+CONFIG_USB_NET_DRIVERS=y
+CONFIG_USB_RTL8152=y
+CONFIG_USB_USBNET=y
+CONFIG_USB_NET_AX8817X=y
+CONFIG_USB_NET_AX88179_178A=y
+CONFIG_USB_NET_CDCETHER=y
+CONFIG_USB_NET_CDC_NCM=y
+CONFIG_USB_LAN78XX=y
+
 CONFIG_FW_CFG_SYSFS=y
 
