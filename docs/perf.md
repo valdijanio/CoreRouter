@@ -2937,3 +2937,19 @@ lote netlink (50 000 regras = 24 MiB num lote, que só um root com `SO_SNDBUFFOR
   linkado 16–65 ms (mediana 38 ms); o fsync domina e a máquina variou muito. A varredura do
   `/config` que o status faz a cada 2 s: 82 µs na forma da VM, 3,7 ms com 4096 séries de
   gráfico (o máximo).
+
+### G1.3g: checagem do firewall sem aplicar (2026-10-30, **medido**)
+
+Netns sem root, `cargo test [--release] -p corerouter-hal-linux --test netns_fw_check
+slow_checking_many_rules_with_one_bad`, kernel do host:
+
+| 10 000 regras `forward` | debug | release |
+|---|---|---|
+| checagem, todas boas | 252 ms | 69 ms |
+| checagem, 1 regra recusada só na validação (`dst-nat` em `srcnat`) | 5,3 s | 1,7 s |
+| `apply` recusado do mesmo conjunto | 2,2 s | 1,7 s |
+| `apply` das 10 000 boas | 2,4 s | 1,7 s |
+
+A checagem com erro custa o mesmo que o `apply` recusado: é o replay do kernel validando a
+tabela inteira a cada regra (O(n²)); um erro de mensagem (módulo ausente, `ENOENT`) não faz
+replay.
