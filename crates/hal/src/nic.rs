@@ -325,6 +325,9 @@ pub struct UsbResetReport {
     pub power_cycled: bool,
     /// The interface came back under its name before the time ran out.
     pub back: bool,
+    /// Not back, but a link with the adapter's MAC is there under another
+    /// name (`eth0`): PID 1 did not give it its name again (G1.29f).
+    pub back_as: Option<String>,
 }
 
 /// A recovery under way, run on a task thread (the session is not held
