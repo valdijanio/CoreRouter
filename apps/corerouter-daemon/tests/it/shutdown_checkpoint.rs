@@ -170,3 +170,77 @@ fn sigterm_puts_the_journaled_commits_in_the_slot() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// fix-journal-routing-delta: a daemon killed with SIGKILL (power cut, OOM
+/// kill) comes back with its OSPF, MPLS/LDP, BFD and RPKI config. Those
+/// commits reached the journal as `{}` and the restart replayed nothing.
+#[test]
+fn sigkill_keeps_the_routing_config() {
+    let dir = std::env::temp_dir().join(format!("cr-routing-kill-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut d = start(&dir);
+    let steps = [
+        (
+            "ip.address.add",
+            json!({"address": "192.0.2.1/24", "interface": "ether1"}),
+        ),
+        (
+            "routing.bfd.profile.add",
+            json!({"name": "core", "min_tx": 100, "min_rx": 100}),
+        ),
+        (
+            "routing.ospf.instance.add",
+            json!({"name": "v2", "router_id": "10.255.0.1"}),
+        ),
+        (
+            "routing.ospf.area.add",
+            json!({"name": "bb", "instance": "v2", "area_id": "0.0.0.0"}),
+        ),
+        (
+            "routing.ospf.interface-template.add",
+            json!({"area": "bb", "interfaces": "ether1", "cost": 10}),
+        ),
+        ("mpls.ldp.add", json!({"lsr_id": "10.255.0.1"})),
+        ("mpls.ldp.interface.add", json!({"interface": "ether1"})),
+        (
+            "routing.rpki.add",
+            json!({"name": "rtr", "address": "192.0.2.3"}),
+        ),
+    ];
+    for (id, params) in &steps {
+        call(&d, id, params.clone()).unwrap_or_else(|e| panic!("{id}: {e}"));
+    }
+    let lists = [
+        "routing.bfd.profile.list",
+        "routing.ospf.instance.list",
+        "routing.ospf.area.list",
+        "routing.ospf.interface-template.list",
+        "mpls.ldp.list",
+        "mpls.ldp.interface.list",
+        "routing.rpki.list",
+    ];
+    // Only the configured part: a list may carry live state too.
+    let config = |d: &Daemon| -> Value {
+        Value::Array(
+            lists
+                .iter()
+                .map(|l| call(d, l, json!({})).unwrap_or_else(|e| panic!("{l}: {e}")))
+                .collect(),
+        )
+    };
+    let before = config(&d);
+    d.child.kill().unwrap();
+    d.child.wait().unwrap();
+    let d = start(&dir);
+    let after = config(&d);
+    for (i, l) in lists.iter().enumerate() {
+        assert_eq!(after[i], before[i], "{l} after SIGKILL");
+    }
+    assert!(
+        before[1].to_string().contains("10.255.0.1"),
+        "{}",
+        before[1]
+    );
+    drop(d);
+    let _ = std::fs::remove_dir_all(&dir);
+}
