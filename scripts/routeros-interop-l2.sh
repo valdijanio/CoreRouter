@@ -407,6 +407,11 @@ case_rsc() {
   sleep 1
   ros 'file?name=g39hb.rsc' | jq -r '.[0].contents // empty' > "$W/ros-vlan.rsc"
   [ -s "$W/ros-vlan.rsc" ] || { result rsc FAIL "no export from the CHR"; return; }
+  # The export also carries what earlier cases left on the CHR (qinq's v101/c201,
+  # which the CoreRouter has too): import only this case's VLANs. Join the
+  # backslash-continued lines first, then keep the menu headers and our adds.
+  sed -e ':a' -e '/\\$/{N;s/\\\n *//;ba' -e '}' "$W/ros-vlan.rsc" |
+    grep -E '^/|name=(r4[01]|s42|c43)( |$)' > "$W/ros-vlan.own.rsc" && mv "$W/ros-vlan.own.rsc" "$W/ros-vlan.rsc"
   result rsc INFO "CHR export: $(grep -v '^#' "$W/ros-vlan.rsc" | tr '\n' ' ' | cut -c1-400)"
   local out
   out=$(printf '/import file=%s\n' "$W/ros-vlan.rsc" |
