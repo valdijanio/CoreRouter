@@ -255,6 +255,44 @@ fn the_instances_tab_edits_the_graceful_restart_timers() {
     assert_eq!((rows[0]["graceful_restart_time"].clone(), rows[0]["graceful_defer_time"].as_u64()), (Value::Null, Some(30)), "{rows}");
 }
 
+/// G3.9fj, RFC 8538: the N bit in the GR column and the instance list,
+/// the Hard Reset in the last error, and the switches in the modal.
+#[test]
+fn rfc8538_shows_the_n_bit_and_the_hard_reset() {
+    let mut s = lab();
+    s.execute("routing.bgp.connection.set", &json!({"id": "upstream1", "graceful_restart": true})).unwrap();
+    let mut st = s.routing_status().cloned().unwrap();
+    st.bgp_sessions[0].gr_local = Some("restart".into());
+    st.bgp_sessions[0].gr_remote = Some("helper".into());
+    st.bgp_sessions[0].n_bit = true;
+    st.bgp_sessions[0].llgr_stale_time = Some(3600);
+    st.bgp_sessions[0].end_of_rib_received = vec!["ipv4".into()];
+    st.bgp_sessions[1].last_hard_reset = Some(true);
+    s.set_routing_status(st);
+    let mut h = open(s);
+    for t in ["restart", "N", "LLGR", "EoR"] {
+        assert!(h.has_text(t), "{t}");
+    }
+    h.click(h.text("rr1"));
+    h.idle();
+    assert!(h.has_text("Hold Timer Expired (Hard Reset)"));
+    panel(&mut h).tab = Tab::Instances;
+    refresh(&mut h);
+    assert!(h.has_text("N bit"));
+    assert!(h.has_text("off"), "LLGR off by default");
+    act(&mut h, Act::Edit("default".into()), What::Instance);
+    let (_, m) = panel(&mut h).modal.as_mut().unwrap();
+    assert_eq!(m.values.get("hard_admin_reset").map(String::as_str), Some("yes"));
+    m.values.insert("hard_admin_reset", "no".into());
+    settle(&mut h);
+    h.click(h.text("OK"));
+    settle(&mut h);
+    let rows = lock(&h.session).execute("routing.bgp.instance.list", &json!({})).unwrap();
+    assert_eq!(rows[0]["hard_admin_reset"], false, "{rows}");
+    refresh(&mut h);
+    assert!(h.has_text("graceful clear"));
+}
+
 #[test]
 fn every_label_explains_itself_in_both_languages() {
     for key in BgpPanel::help_keys() {

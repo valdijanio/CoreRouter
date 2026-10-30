@@ -8246,3 +8246,347 @@ continuação indentadas).
   98,9 → 70,9 MiB (três boots: 101,9/95,2/99,6 → 72,0/69,0/71,8), FRR pronto 0,82 s depois do
   kernel (antes 1,0–1,9 s). Com OSPF+SR+LDP+BFD no ar o RSS por daemon não muda (ospfd 10,9 MiB,
   ldpd 8,6, bfdd 8,9).
+
+- 2026-10-29 — processo: Runner próprio do CI (`docs/ci-runner.md`): os jobs pesados do lote da fila (`test`,
+  `bench-check`, `netns`) rodam numa VM descartável desta máquina, `corerouter-ci` (16 vCPUs,
+  16 GiB, discos em `/srv/build/ci-runner/`), com 3 runners self-hosted, em vez dos runners de
+  4 vCPU do GitHub; o cache de build fica num disco próprio da VM e sobrevive aos resets.
+  `cargo xtask ci-runner create|register|status|check-network|run|reset|down|unregister|destroy`
+  (`xtask/src/ci_runner.rs`, que reaproveita a imagem verificada, o `virsh` e o SSH do `vm_lab`).
+  Segurança (o repositório é público): o workflow só manda para o runner o `workflow_dispatch` em
+  `queue/*` com `runner=corerouter` e, se a variável `CI_RUNNER` do repositório pedir, o push na
+  `main`; PR, inclusive de fork, fica no GitHub. Um hook do runner (root, posto pela unit) reprova
+  antes do primeiro passo qualquer outro job, mesmo que um workflow alterado peça `self-hosted`.
+  Os jobs rodam como `runner`, sem sudo; um nwfilter do libvirt no host deixa a VM falar só com a
+  internet (LAN, endereços do host, faixas privadas e IPv6 bloqueados; conferido por
+  `ci-runner check-network`). A fila (`scripts/land.sh`) escolhe o runner por lote: o próprio
+  quando o GitHub o mostra online, senão os do GitHub (a fila nunca espera um runner fora do ar);
+  lote com PR de fork vai sempre para o GitHub; ociosa, volta a VM ao snapshot a cada 40 jobs.
+  `xdp-root` e `lint` continuam no GitHub. O registro (token) e as opções do repositório são do
+  usuário: roteiro em `docs/ci-runner.md`, "Etapa do usuário".
+
+- 2026-10-29 — processo: Build rápido da imagem (`cargo xtask os build|push`):
+
+  - **Uma pasta de build por checkout fora do repositório.** Buildroot, `O=`, ccache, targets do
+    cargo, GUI web, pastas dos testes no QEMU e a chave de assinatura vão para
+    `/srv/build/os-out/<checkout>-<hash>` (`$COREROUTER_OS_OUT` muda; sem `/srv/build`, `os/out`).
+    `cargo xtask os out-dir` mostra a pasta.
+  - **Chave preservada.** Um checkout cujo `os/out/keys` já tem chave continua usando o `os/out`
+    até migrar, e o build avisa. Com `$COREROUTER_OS_OUT` numa pasta sem chave, o build para e diz
+    o que copiar. O roteiro de migração está em `docs/os-image.md`, "Onde fica o build".
+  - **Um build por pasta**, garantido por um `flock` em `<out>/.build.lock`.
+  - **`make all` com `-j` de topo automático:** núcleos/4, no máximo um por 4 GiB livres, no
+    mínimo 2, mais `-l<núcleos>`. `--top-jobs`/`--jobs` continuam valendo.
+  - **GUI web num target próprio** (`<out>/web-target`). No mesmo `cargo-target` que o daemon,
+    cada build invalidava os artefatos de host do outro.
+  - **CLI do `push` em `<out>/cli-target`**, com perfil rápido (sem LTO, 16 unidades,
+    incremental). O `ab-test --scenario push` usa a mesma CLI.
+  - `RUSTC` fixado ao lado do cargo da toolchain: sem `RUSTUP_TOOLCHAIN`, o `rust-toolchain` do
+    crate `dhcproto` (1.90) trocava o compilador no meio do build.
+  - O `check_needed` compara caminhos canônicos, então um out acessado por symlink funciona.
+
+  **Medido** (2026-10-29, Ryzen AI Max+ 395, 32 threads, outras sessões rodando):
+
+  - uma linha no daemon + `os build --only crpkg`: **889 → 213 s**;
+  - CLI do `push`: 223 → 66 s com target novo e 144 → 3,2 s depois de mudar o engine;
+  - build completo com ccache: 1063 → 1010 s; o caminho crítico é `host-protobuf` → FRR, serial.
+
+  `boot-test` (KVM) e `ab-test --scenario push` passaram com a imagem nova: envio a 83 MiB/s,
+  B confirmado em 18,3 s.
+
+- 2026-10-29 — G3.4l: O abort do `ospfd` com TI-LFA (`ospf_spf.c:1269: get_reverse_distance(): assertion (w_lsa &&
+  w_lsa->data) failed`) é um bug do FRR, no 10.7.1 e no `master`. No SPF reverso dos Q-spaces,
+  `ospf_spf_next` lê o custo de volta da router-LSA do vizinho W antes da checagem "LSA ausente →
+  pula" da RFC 2328 §16.1 (2b). O gatilho medido é uma router-LSA que **sai** do LSDB (troca de
+  router-id ou `no router ospf` no vizinho) enquanto outras ainda a citam. A hipótese da corrida
+  na subida não se confirmou. Análise completa em `docs/frr-tilfa-abort.md`.
+
+  - **Prova:** teste unitário do FRR (`test_ospf_spf`, `topo6` com uma LSA ausente) aborta sempre
+    no 10.7.1 e no `master` (gdb: `w_lsa=0x0`) e passa com a correção, com os mesmos backups da
+    `topo1`. Na VM, `scripts/frr-tilfa-repro.sh` (só OSPF + TI-LFA, sem LDP/BFD, namespaces)
+    com o FRR compilado com logs `G34L`: 10.7.1 aborta em 15 de 40 iterações com troca de
+    router-id no R1 (todas com "W router-LSA ABSENT" na linha anterior), 0 de 50 só com subida e
+    flap; com a correção, 0 de 40 e 27 passagens por LSA ausente puladas, sem rota faltando
+    (**medido**).
+  - **Correção:** `os/patches/frr/0001-ospfd-ti-lfa-missing-router-lsa.patch` (uma condição,
+    `&& w_lsa`), aplicada pelo Buildroot; o `cargo xtask os build` faz `frr-dirclean` quando os
+    patches do FRR mudam. O `.deb` da VM do laboratório não tem a correção.
+  - **Upstream:** issue FRRouting/frr#24091 e PR FRRouting/frr#24092 (correção + teste), abertos
+    pela conta do usuário a pedido dele; texto e patches em `docs/frr-upstream/`.
+  - **Produção:** o TI-LFA continua desligado por padrão (a perda de um corte no Linux não cai com
+    ele, G3.4k); o aviso da prévia passou a dizer isso e a citar a G3.4l só para FRR sem o patch.
+
+- 2026-10-29 — G3.9fj: BGP: graceful restart, Hard Reset e o bit N (RFC 8538). O FRR 10.7.1 já anuncia o bit N e manda
+  Hard Reset no `clear` (padrões desde a 8.3, `bgpd/bgp_vty.c`). Isso já valia entre CoreRouters,
+  mas não aparecia em lugar nenhum nem se desligava.
+
+  - Na instância: `graceful_notification` (bit N) e `hard_admin_reset` (Cease 4 como Hard Reset),
+    os dois ligados por padrão. Só o desligado é guardado e vira `no bgp graceful-restart
+    notification` / `no bgp hard-administrative-reset`, porque o FRR imprime só o que difere do
+    padrão. Digitar a forma ligada a cada commit faria o diff redigitá-la, e `graceful-restart
+    notification` manda a capacidade a todo vizinho a cada vez (`bgp_vty.c`).
+  - `routing.bgp.session.list`: `n_bit` e `last_hard_reset`. O `last_hard_reset` só vale com a
+    sessão fora do ar: o FRR zera o `notify.hard_reset` quando a sessão volta com GR
+    (`bgp_fsm.c`, `bgp_peer_process_gr_cap_clear_stale`) e mantém o código do erro, e por isso uma
+    sessão estabelecida sempre dizia `false` (**medido**).
+  - Janela: selo `N` na coluna GR, "(Hard Reset)" no último erro;
+    na aba Instances, a coluna Notification e os dois campos no modal, com avisos na prévia.
+  - Prévia da conexão: aviso `gr-bfd` quando há `graceful_restart=yes` sem BFD e com o bit N. Saúde:
+    `bgp.gr-bfd` aponta as sessões estabelecidas com GR, bit N e sem BFD.
+
+  **Medido** (2026-10-29, host, FRR 10.7.1, `scripts/bgp-crcr-userns.sh hardreset`). Montagem: CR1
+  em restart com Restart Time 20 s, hold 9 s, corte silencioso do link (netem 100 %):
+
+  | Caso | O CR2 tira a rota do CR1 em |
+  |---|---|
+  | Com o bit N (o padrão) | **27,2–27,8 s** (hold + Restart Time) |
+  | `graceful_notification=no` | 7,9–8,1 s |
+  | BFD 100 ms × 3 | 0,3–0,4 s |
+
+  `routing.bgp.session.clear` no CR1, ping a cada 20 ms: com Hard Reset (o padrão) o CR2 tira a rota
+  em 106–133 ms e 143–144 de ~372 pings se perdem; com `hard_admin_reset=no`, a rota fica e nenhum
+  ping se perde (duas rodadas). A saúde do CR2 dá `bgp.gr-bfd` em aviso ("1 de 1") com o bit N sem
+  BFD, e `ok` sem o bit N ou com BFD. O caso `gr` (kill -9 do `bgpd`) segue igual: 0 de 648 perdidos com GR, 453 de 653 sem.
+
+  Como testar: `cargo test -p corerouter-engine --lib -- routing health`,
+  `cargo test -p corerouter-hal-frr --lib state`, `cargo test -p corerouter-proto-bgp graceful`,
+  `cargo test -p corerouter-ui --lib -- tests::bgp`; `scripts/bgp-crcr-userns.sh hardreset gr`.
+
+  Desempenho e paralelismo: duas linhas no render (O(1) por instância), dois campos lidos do JSON
+  que o serviço `frr` já lê, e a checagem O(sessões) a cada 5 s sobre a amostra em memória. Nada no
+  caminho quente, nada a dividir entre threads.
+
+- 2026-10-29 — G3.9d: MPLS: o traceroute através de um LSP não mostra mais `*` no salto do CoreRouter. O MPLS do kernel
+  Linux descarta em silêncio o pacote rotulado com TTL do topo ≤ 1 (`mpls_forward`, sem sysctl em
+  nenhuma versão); o respondedor do LSP ping (G3.5b), que já copiava esses quadros com um filtro BPF
+  clássico, agora devolve o ICMP time exceeded / ICMPv6 time exceeded com 128 octetos do pacote e o
+  objeto da pilha de rótulos como chegou (RFC 4884, RFC 4950), de um endereço da interface de
+  entrada.
+
+  - A volta segue a regra padrão do Cisco: com um rótulo e rota IP até a origem, pela tabela IP;
+    com pilha de VPN (≥ 2 rótulos), ou sem rota de volta (núcleo sem BGP), pelo próprio LSP, a pilha
+    copiada com o topo trocado como a tabela de rótulos manda e TTL 255 (RFC 3032 §2.3.2). Não
+    manda erro sobre erro ICMP, fragmento não inicial, destino multicast/broadcast nem origem que
+    não é unicast (RFC 1812 §4.3.2.7, RFC 4443 §2.4).
+  - `mpls.settings.set {icmp_ttl_exceeded, icmp_rate}` (padrão ligado, 100 erros/s, até 10 000; o
+    token bucket vem antes de qualquer trabalho) e `icmp_counters` no `mpls.settings.get`; campos
+    na janela **MPLS › Settings** com ⓘ (screenshots em `docs/changes/G3.9d-screenshots/`).
+  - Sans-IO em `hal/src/lsp/expired.rs` (proptest com quadro hostil); E/S em `HostResponder`
+    (`IPPROTO_RAW` para a tabela IP, `AF_PACKET` ao MAC do próximo salto para o LSP); o trait
+    `LspResponderIo` passou a devolver `Frame::{Echo, Expired}` e ganhou `send_icmp`.
+  - Os taps do respondedor (os três sockets `AF_PACKET`) deixam de ser presos a cada interface
+    MPLS: presos, o kernel clonava cada pacote para o `mpls_rcv`/`ip_rcv`. Na mesma rodada da VM
+    (64 bytes, troca de rótulo, um núcleo, **medido**): sem taps 1,90 Mpps, tap preso 1,47 (−23%),
+    taps sem bind 1,53 (−19%); o resto é o `packet_rcv` com o filtro (G3.9db).
+  - Laboratório (VM, **medido**): `netns_mpls_ttl` (A → CR1 → CR2 → B, pela tabela IP e num
+    núcleo sem BGP pelo LSP) e `netns_lsp` com `mpls_router` passam. Contra o RouterOS 7.25 CHR
+    (`routeros-interop.sh ldp mpls-ttl`): com `icmp-ttl-exceeded=no` o salto do CoreRouter some
+    no traceroute do CHR (100% de perda); ligado, `10.39.1.2 <MPLS:L=20,E=0>`, e o traceroute do
+    R3 (FRR) mostra `10.39.1.2 <MPLS:L=20,E=0,S=1,T=1>`.
+  - Pesquisa, regras e números em `docs/mpls.md`, "ICMP de TTL vencido em pacote rotulado".
+
+  Como testar: `cargo test -p corerouter-hal --lib lsp::expired`, `cargo test -p
+  corerouter-hal-linux --lib lsp`, `cargo test -p corerouter-engine --test it mpls`; com
+  `mpls_router`: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
+  corerouter-hal-linux --test netns_mpls_ttl` (A → CR1 → CR2 → B: antes `*`, depois o salto do CR2
+  com o rótulo 100, pela tabela IP e num núcleo sem BGP pelo LSP); CHR: `cargo xtask vm-lab run --
+  scripts/routeros-interop.sh ldp mpls-ttl`.
+
+- 2026-10-29 — G3.9hl: Terminal: `/interface vlan print` (e `bridge`, `loopback`, `ethernet`) existe, com as colunas que o
+  RouterOS 7 mostra primeiro, porque o engine tem agora uma consulta por tipo:
+  `interface.vlan.list` (NAME, MTU, VLAN-ID, INTERFACE, MAC-ADDRESS, USE-SERVICE-TAG; o MAC é o do pai quando a VLAN não tem um, como no RouterOS), `interface.bridge.list`
+  (NAME, MTU, MAC-ADDRESS, PORTS), `interface.loopback.list` e `interface.ethernet.list` (NAME,
+  MTU, MAC-ADDRESS e o que o `interface.ethernet.set` mudou, no formato que ele aceita de volta).
+  `bonding` e `pppoe-client` já tinham o seu; `interface.bridge.port.list` mostra
+  INTERFACE antes de BRIDGE, como o RouterOS. `print detail`, `where`, `count-only`, `as-json` e
+  `proplist` valem como em qualquer `print`.
+
+  Os submenus de um tipo herdam os verbos do `/interface` que não têm (`/interface vlan set 0
+  mtu=1400`, `/interface bridge remove 0` são `interface.set`/`interface.remove`), e os números são
+  os do `print` daquele submenu: `/interface vlan remove 0` remove a primeira VLAN, não o `ether1`.
+  Um número solto vai para o item quando o `print` do menu lista o campo posicional
+  (`/interface ethernet set 3 …`; `set ether4` continua pelo nome).
+
+  `export` em cada submenu escreve só as linhas dele. A VLAN sai com `interface=ether1` (o nome do
+  RouterOS, pelo `key_alias`) em vez de `parent=`; as portas ethernet configuradas saem como
+  `/interface ethernet set name=ether4 auto-negotiation=no speed=100Mbps duplex=full` (antes não
+  saíam no export), e a porta sem configuração não gera linha. O `/interface export` inteiro
+  importa de volta igual (teste).
+
+  Conferido no CHR 7.25 (caso novo `prints` de `scripts/routeros-interop-l2.sh`, **medido** em
+  2026-10-29): as colunas de `/interface vlan` (NAME, MTU, ARP, VLAN-ID, INTERFACE, MAC-ADDRESS),
+  `ethernet` (NAME, MTU, MAC-ADDRESS, ARP) e `bridge port` (INTERFACE, BRIDGE, …) batem nessa ordem,
+  menos a ARP; `print where` renumera a partir de 0 nos dois. O que ficou diferente virou G3.9hm
+  (legenda, `Columns:`, `chave=valor` em bridge/bonding/pppoe-client) e G3.9hn (ARP, `mtu=` padrão
+  no export); o export do RouterOS ordena as chaves em ordem alfabética, aqui é a ordem do `add`.
+
+  Como testar: `corerouter-cli shell` e `/interface vlan add name=v30 vlan-id=30 interface=ether1`,
+  `/interface vlan print`, `/interface vlan print detail where vlan-id=30`, `/interface vlan export`,
+  `/interface vlan remove 0`. Testes: `crates/shell/tests/it/submenu_print.rs` (um por submenu,
+  export e ida e volta), `registry::tests::type_submenus_take_the_verbs_of_their_menu` e
+  `crates/engine/tests/it/interface.rs` (as quatro consultas, a linha ethernet que o `set` aceita
+  de volta). Laboratório: `cargo xtask vm-lab run -- scripts/routeros-interop-l2.sh prints` grava a
+  saída do CHR 7.25 e a do CoreRouter lado a lado (`/tmp/crg39h/prints.txt` na VM).
+
+- 2026-10-29 — G0.31h: `ip.route.list` de uma tabela grande sem a memória da resposta (achado da validação T1: na VM
+  de 2 GiB o daemon foi de 307 para 847 MiB numa chamada e o kernel o matou por OOM na segunda).
+
+  - **Linhas sem árvore.** Cada linha é uma `Row` (`#[derive(Serialize)]`, emprestada da `Line` em
+    cache), nos campos e na ordem alfabética do mapa do `Value` de antes: o JSON sai igual byte a
+    byte (conferido contra o daemon da `main`).
+  - **Stream.** A consulta devolve um `off_lock::Streamed` (`Session::defer_stream`): o canal de
+    controle (TCP e TLS) escreve o envelope e as linhas direto no socket por um `BufWriter` de
+    64 KiB, sem montar a resposta; quem chama no processo recebe o `Value` montado das mesmas
+    linhas, sem passar por bytes. O WebSocket ainda junta a mensagem (1× a resposta).
+  - **Uma lista grande por vez** (10 000+ linhas depois do filtro, por sessão): a segunda recebe
+    `busy` com o que fazer (filtrar ou `ip.route.page`). A tabela de vizinhos fica travada só na
+    passada que marca os gateways `incomplete`, não enquanto um leitor lento recebe.
+  - **Sem limite padrão de linhas:** um `print` que corta rotas sem avisar engana o operador (o
+    RouterOS também imprime tudo); com o stream o tamanho deixou de custar memória.
+  - **Alocador:** o daemon usa o malloc da glibc (a imagem também: Bootlin glibc 2.39). O pico de
+    antes não voltava ao sistema porque eram blocos pequenos espalhados pela arena; sem eles não há
+    o que devolver, e o `malloc_trim` (que pediria `unsafe`) não entrou.
+
+  Como testar: `cargo nextest run -p corerouter-control --test route_list_memory` (20 000 rotas,
+  duas conexões ao mesmo tempo, reprova se o pico de RSS passar de metade da resposta: na `main`
+  dá +186 MB para 11,7 MB de resposta, aqui +0,3 MB); `cargo nextest run -p corerouter-engine
+  --test it off_lock` (JSON igual ao das linhas da página, todas as chaves do contrato, uma lista
+  grande por vez).
+
+- 2026-10-29 — processo: Release da imagem do roteador com chave própria, fora do CI. `cargo xtask os release-key init`
+  gera o par de **release** (Ed25519) numa pasta fora do repositório e do `/srv/build` (padrão
+  `~/.config/corerouter/release-key/`, 0700), com a privada cifrada por senha (Argon2id 128 MiB +
+  ChaCha20-Poly1305; `release-key check` confere um backup); a pública vai para
+  `os/keys/release/<id>.pub` por PR, e o `os check` recusa outro arquivo ali. A imagem de
+  desenvolvimento confia na chave de dev **e** nas de release (a VM de teste segue aceitando o
+  `os push`); a de release só nas de release. `cargo xtask os release --tag vX.Y.Z` confere que o
+  checkout é a tag (limpo, tag no `origin`, versão do workspace) e que a Release é um rascunho,
+  decifra a chave para o `$XDG_RUNTIME_DIR` só durante o build (apagada no fim), compila em
+  `<out>-release` (separado do build de dev), confere versão, commit, canal, assinatura e as
+  chaves confiadas do rootfs, junta os hashes ao `SHA256SUMS` do `.deb` e anexa `.crpkg`, ISO,
+  `.qcow2` e `.ova` ao rascunho com `gh release upload`; nunca cria tag nem publica. Passo a
+  passo em `docs/release.md`. Testar: `cargo test -p corerouter-image -p xtask release`; ponta a
+  ponta com uma chave temporária, uma tag local num clone descartável e `--dry-run`.
+
+- 2026-10-29 — G0.31i: O commit de `ip.route.set` (distância) sem ler do kernel todas as rotas (achado da validação
+  T1: 105 ms na VM com 60 000). Mudar a distância é tirar a rota da métrica antiga e pô-la na nova;
+  o `add` já tentava direto (G0.31 parte 5), mas o `del` lia os irmãos (`RTM_GETROUTE` da tabela
+  inteira) para saber se a rota era um caminho de um grupo ECMP.
+
+  - Agora o `del` vai direto quando a rota é a única de CoreRouter no seu grupo (tabela, prefixo,
+    métrica), antes e depois do commit (o conjunto `owned` que o plano já monta só para os destinos
+    tocados). `ESRCH`/`ENOENT`: já não estava lá, nada a desfazer.
+  - Um caminho de ECMP continua lendo os irmãos: no Linux 6.18 um `RTM_DELROUTE` de um caminho só
+    compara o primeiro nexthop (`fib_nh_match`, net/ipv4/fib_semantics.c, linhas 958–985) e
+    levaria a rota multipath inteira.
+  - `corerouter_hal_linux::route_dumps()` (oculto) conta as leituras, para o teste.
+
+  Como testar: `cargo xtask netns` (teste `a_distance_change_reads_no_route_table`: 500 rotas,
+  distância e remoção sem dump; distância de um caminho de ECMP lê os irmãos e o outro fica);
+  `COREROUTER_NETNS_BENCH=1 unshare --user --map-root-user --net -- cargo bench -p
+  corerouter-hal-linux --bench netns_apply -- one_of_60000`.
+
+- 2026-10-29 — G3.9fj: BGP: graceful restart com BFD (RFC 5882 §4.3), parte 3 de 5. Medido antes de expor a opção do FRR:
+  o BFD do CoreRouter roda no `corerouter-daemon`, e o `bfdd` só o comanda pelo plano de dados
+  distribuído.
+
+  **Medido** (2026-10-29, host, FRR 10.7.1, `scripts/bgp-crcr-userns.sh cbit`): GR e BFD de
+  100 ms × 3, `kill -9` no CR1, tudo de volta 3 s depois, ping do CR2 ao CR1 a cada 20 ms.
+
+  | O que morre no CR1 | O CR2 com a rota do CR1 | Pings perdidos |
+  |---|---|---|
+  | `bgpd` + `bfdd` | fica (o BFD segue no ar) | 1–105 de ~560 |
+  | `corerouter-daemon` + `bgpd` + `bfdd` | fica | 2–4 de ~564 |
+  | só o `corerouter-daemon` | sai em 416–423 ms (BFD down com a TCP no ar: Cease 10) | 144–154 de ~560 |
+
+  - Com a pilha inteira morta, a TCP cai primeiro. O FRR 10.7.1 não tira as rotas stale por causa
+    de um BFD down que chega depois: o `bgp_stop` mexe nos tempos de GR só com a sessão
+    estabelecida, e o `BGP_Stop` em Idle não limpa nada (`bgpd/bgp_fsm.c`).
+  - Por isso `neighbor X bfd check-control-plane-failure`, aprovado no escopo, não mudou nada.
+    Desligado, ligado só no helper e ligado nos dois lados, a rota ficou nas três rodadas
+    (**medido**). Fica de fora: uma opção sem efeito só confunde.
+  - O BFD agora repassa ao `bfdd` o bit C recebido do vizinho (`RBIT_CPI` no `remote_flags`); antes
+    ia sempre 0. O bit C enviado continua 0, por decisão: o BFD cai junto com o daemon enquanto o
+    kernel continua encaminhando, e C = 1 seria falso (RFC 5880 §6.8.7).
+  - Achado fora do escopo (avisado à sessão principal): o perfil BFD criado com
+    `routing.bfd.profile.add` some no reinício do daemon. O journal grava `"delta":{}` e o
+    `running.json` não tem `routing.bfd`. O laboratório recria o perfil depois do reinício.
+
+  Como testar: `cargo test -p corerouter-proto-bfd --lib session`,
+  `cargo test -p corerouter-daemon --bin corerouter-daemon bfd`; `scripts/bgp-crcr-userns.sh cbit`.
+
+  Desempenho e paralelismo: um bool a mais por pacote BFD recebido (guardado na sessão) e por
+  mudança de estado; nada no caminho por pacote além da cópia do bit, nada a dividir.
+
+- 2026-10-29 — G0.31j: Firewall com milhares de regras, o resto do commit de uma regra (G0.31j):
+
+  - **Laboratório virtual:** o `VirtualHal` renderizava o ruleset inteiro três vezes a cada commit
+    que tocava o firewall (as duas configs para comparar e o script novo), ~110 ms com 10 000
+    regras, para um texto que ninguém lê. Agora ele só marca que o firewall mudou, e
+    `VirtualHal::ruleset()` renderiza na hora da leitura. Era essa a lentidão do daemon de
+    laboratório no host.
+  - **Validação do commit:** com o running válido, a unidade `firewall` olha só as regras que o
+    commit tocou (`corerouter_firewall::validate::validate_since`, como as rotas da G0.31e). A
+    regra vem dos blocos do `CowList` que as duas configs não dividem mais, sem cabeça nem cauda
+    iguais. Uma regra intocada dá o que dava antes (nada), porque os problemas dela dependem só
+    dela, dos saltos da tabela e das listas de interfaces. Volta para a validação inteira quando
+    muda um salto ou uma marca, quando um id se repete, quando uma tabela passa do limite, quando
+    as listas ou as zonas mudam, ou quando mais de 1024 regras mudaram. Os builds de debug
+    continuam comparando com a validação inteira em todo commit, e o proptest
+    `incremental_equals_full` ganhou edições de regra nas quatro tabelas.
+  - **Limite:** `MAX_RULES` passa de 4096 para 50 000 regras por tabela; a config de ISP com
+    10 000 regras de filtro cabe. O RouterOS não tem limite baixo. O nosso vem do custo **medido**
+    de uma regra: ~5,4 KB de memória do daemon (50 000 regras = ~290 MB, boot em 0,33 s, commit de
+    uma regra em 2,6 ms; com 100 000, 540 MB não cabem na imagem de 2 GiB) e ~500 bytes de kernel
+    e de lote netlink. Quatro tabelas cheias (200 000) já passam do tamanho que a config pode ter
+    em disco (31 MiB). O leitor de contadores (`nft_counters::MAX_RULES`) acompanha:
+    4 × 50 000 × 2 regras do kernel.
+  - **Kernel real:** o caminho `--backend linux` (G0.31f) já estava perto do commit sem firewall.
+    O teste em namespace novo mostra: commit de um comentário 7,3–7,9 ms e de uma porta
+    10,8–11,0 ms, contra 6,8–7,5 ms sem firewall (o resto é o fsync do journal), com 10 000 regras
+    carregadas de verdade no nftables.
+
+  Como testar:
+
+  ```sh
+  cargo bench -p corerouter-engine --bench firewall_commit
+  COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- \
+      cargo test --release -p corerouter-daemon --test netns_fw_scale -- --nocapture
+  cargo test -p corerouter-firewall --lib validate
+  cargo test -p corerouter-engine --test it incremental
+  ```
+
+  Fora do namespace de usuário (como root, no roteador), o lote de mais de ~16 000 regras precisa
+  do `SO_SNDBUFFORCE` que o `nfnl` já pede. No namespace sem root o teto é 2 × `wmem_max`
+  (8 MiB), e o teste fica em 10 000.
+
+- 2026-10-29 — G3.9fj: BGP: Long-Lived Graceful Restart (RFC 9494), parte 4 de 5.
+
+  - `llgr_stale_time` na instância (1..16777215 s, 24 bits; sem valor: desligado, §5) vira
+    `bgp long-lived-graceful-restart stale-time N`. Quando acaba o Restart Time, o vizinho guarda as
+    nossas rotas por mais esse tempo, com `llgr-stale` e com a menor preferência.
+  - O FRR usa o mesmo valor como o máximo que guarda das rotas do vizinho (`bgpd/bgp_open.c`,
+    `bgp_capability_llgr`: MIN(o recebido, o nosso)). Um helper com o padrão 0 não guarda nada, por
+    isso a ajuda e a prévia dizem para ligar nos dois lados. A documentação do FRR diz "only
+    restarter mode"; o fonte faz helper também.
+  - Prévia da instância: vale para todas as famílias (a RFC pede por AFI/SAFI, §5); o pior caso
+    (hold + Restart Time + LLGR), com aviso acima de 1 h; aviso quando nenhuma conexão tem
+    `graceful_restart=yes`.
+  - `routing.bgp.session.list`: `llgr_stale_time` do vizinho (o `llgrStaleTime` por família de
+    `gracefulRestartInfo`). Janela: selo `LLGR` na coluna GR, coluna e campo na aba Instances.
+  - `llgr-stale` e `no-llgr` já eram nomes do `routing.filter` (G3.9fc).
+
+  **Medido** (2026-10-29, host, FRR 10.7.1, `scripts/bgp-crcr-userns.sh llgr`): Restart Time 5 s,
+  `kill -9` do `bgpd` do CR1, que fica fora 25 s. Sem LLGR, o CR2 tira a rota do CR1 em 5,1 s.
+  Com 10 s de LLGR nos dois lados, tira em 15,1 s; aos 7 s a rota está marcada `llgr-stale`.
+
+  Para o FRR (upstream), achado no fonte: `longLivedGracefulRestartByPeer` no `show bgp neighbors
+  json` lista as famílias pela flag `PEER_CAP_ENHE_AF_RCV` (extended next hop), não pela do LLGR
+  (`bgp_vty.c`).
+
+  Como testar: `cargo test -p corerouter-engine --lib -- routing`,
+  `cargo test -p corerouter-hal-frr --lib state`, `cargo test -p corerouter-proto-bgp graceful`,
+  `cargo test -p corerouter-ui --lib -- tests::bgp`; `scripts/bgp-crcr-userns.sh llgr`.
+
+  Desempenho e paralelismo: uma linha no render, um campo lido do JSON que o serviço `frr` já lê,
+  O(famílias) por sessão. Nada no caminho quente.

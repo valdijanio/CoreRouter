@@ -17,12 +17,15 @@
 //!   libraries; `install-test` runs the installer and the VM images in
 //!   QEMU (`os/install.rs`).
 //! - G1.6o: `build` first builds the browser GUI with trunk (release,
-//!   wasm-opt; pinned tools, `os/web.rs`) into `os/out/web`, which
+//!   wasm-opt; pinned tools, `os/web.rs`) into `<out>/web`, which
 //!   `corerouter.mk` installs as `/usr/share/corerouter/web`.
 //! - G1.6k: `build` applies `os/buildroot-patches/*.patch` to the extracted
 //!   Buildroot tree (package versions newer than the LTS branch ships, FRR
 //!   10.7.1) and extracts it again when those patches change; `frr-test`
 //!   runs OSPF/SR/LDP/BFD between two guests of the image (`os/frr.rs`).
+//! - processo: everything built lives in one directory per checkout, by
+//!   default on the build disk outside the repository (`os/out.rs`), and
+//!   `make all` runs packages in parallel by default.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -38,12 +41,14 @@ use crate::vm_lab::{download, sha256_file};
 mod ab;
 mod frr;
 mod install;
+mod out;
 mod push;
+mod release;
 mod web;
 
 const DEFCONFIG: &str = "corerouter_x86_64_defconfig";
 /// Free space the build wants before it starts (cold build: ~8 GB in
-/// `os/out`, **medido**; the rest is headroom for parallel sessions).
+/// the out directory, **medido**; the rest is headroom for parallel sessions).
 const MIN_FREE_GB: u64 = 25;
 /// Kernel options the router cannot run without: `check` fails when the
 /// fragment loses one, `build` when the configured kernel does.
@@ -117,7 +122,7 @@ const GUEST_TLS_PORT: u16 = 8729;
 /// G1.6o: `ip.service www-ssl`, on in a new config of the image.
 const GUEST_WEB_PORT: u16 = 443;
 
-const USAGE: &str = "usage: cargo xtask os <build [--only crpkg] [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|push --to HOST:PORT [--user U] [--no-build] [--no-wait] [--confirm manual]|boot-test [--efi] [--tcg] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--scenario update|no-confirm|bad-signature|bad-param]|install-test [--tcg]|frr-test [--tcg]|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
+const USAGE: &str = "usage: cargo xtask os <build [--only crpkg] [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|push --to HOST:PORT [--user U] [--no-build] [--no-wait] [--confirm manual]|release-key <init|check> [--dir D]|release --tag vX.Y.Z [--key-dir D] [--dry-run] [--no-build] [--repo OWNER/NAME]|out-dir|boot-test [--efi] [--tcg] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--scenario update|no-confirm|bad-signature|bad-param]|install-test [--tcg]|frr-test [--tcg]|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
 
 pub fn main(root: &Path, args: &[String]) -> Outcome {
     let (sub, rest) = match args.split_first() {
@@ -132,6 +137,9 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
         "frr-test" => images_dir(root).and_then(|i| frr::frr_test(root, &i, rest)),
         "package" => images_dir(root).and_then(|i| package_cmd(root, &i, rest)),
         "push" => images_dir(root).and_then(|i| push::push(root, &i, rest)),
+        "release-key" => release::release_key(root, rest),
+        "release" => release::release(root, rest),
+        "out-dir" => out::resolve(root).map(|o| println!("{}", o.dir.display())),
         "check" => check(&root.join("os")).map(|n| eprintln!("ok: os/ configuration ({n} checks)")),
         "-h" | "--help" => {
             eprintln!("{USAGE}");
@@ -151,7 +159,7 @@ fn package_cmd(root: &Path, images: &Path, args: &[String]) -> Result<(), String
     let mut cmd = Command::new(&tool);
     cmd.arg("package").arg("--images").arg(images);
     if !args.iter().any(|a| a == "--key") {
-        cmd.arg("--keys").arg(root.join("os/out/keys"));
+        cmd.arg("--keys").arg(out_dir(root)?.join("keys"));
     }
     let st = cmd
         .args(args)
@@ -168,7 +176,12 @@ fn images_dir(root: &Path) -> Result<PathBuf, String> {
     let lock = parse_lock(
         &std::fs::read_to_string(root.join("os/buildroot.lock")).map_err(|e| e.to_string())?,
     )?;
-    Ok(dirs(root, &lock).out.join("images"))
+    Ok(dirs(root, &out_dir(root)?, &lock).out.join("images"))
+}
+
+/// Where this checkout's image build lives (`os/out.rs`).
+fn out_dir(root: &Path) -> Result<PathBuf, String> {
+    out::resolve(root).map(|o| o.dir)
 }
 
 /// `pub const FORMAT_VERSION: u32 = N;` of the model (the configuration
@@ -307,6 +320,8 @@ pub fn check(os: &Path) -> Result<usize, String> {
     let mut n = 0;
     parse_lock(&read("buildroot.lock")?)?;
     n += 1;
+    // processo: the release public keys the images trust.
+    n += release::release_keys(&os.join("keys/release"))?.len();
     let defconfig = read(&format!("configs/{DEFCONFIG}"))?;
     for want in REQUIRED_BR2 {
         if !defconfig.lines().any(|l| l == *want) {
@@ -562,21 +577,43 @@ fn is_executable(p: &Path) -> bool {
 
 struct Dirs {
     os: PathBuf,
+    /// Everything built (`os/out.rs`).
+    top: PathBuf,
     buildroot: PathBuf,
     /// Buildroot's `O=`.
     out: PathBuf,
 }
 
-fn dirs(root: &Path, lock: &Lock) -> Dirs {
-    let os = root.join("os");
+fn dirs(root: &Path, top: &Path, lock: &Lock) -> Dirs {
     Dirs {
-        buildroot: os.join("out").join(format!("buildroot-{}", lock.version)),
-        out: os.join("out").join("build"),
-        os,
+        os: root.join("os"),
+        top: top.to_owned(),
+        buildroot: top.join(format!("buildroot-{}", lock.version)),
+        out: top.join("build"),
     }
 }
 
+/// processo (release da imagem): a build of a tagged version, made by
+/// `os release` (`os/release.rs`).
+pub(crate) struct ReleaseBuild {
+    /// The build directory (apart from the development one).
+    pub top: PathBuf,
+    /// The decrypted release key, for the time of the build.
+    pub key: PathBuf,
+    /// The manifest's version (the tag without the `v`).
+    pub version: String,
+    pub channel: String,
+}
+
 fn build(root: &Path, args: &[String]) -> Result<(), String> {
+    build_with(root, args, None)
+}
+
+pub(crate) fn build_with(
+    root: &Path,
+    args: &[String],
+    release: Option<&ReleaseBuild>,
+) -> Result<(), String> {
     let mut jobs: Option<String> = None;
     let mut top_jobs: Option<String> = None;
     let mut key: Option<PathBuf> = None;
@@ -606,18 +643,41 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
     let lock = parse_lock(
         &std::fs::read_to_string(root.join("os/buildroot.lock")).map_err(|e| e.to_string())?,
     )?;
-    let d = dirs(root, &lock);
+    let o = match release {
+        Some(r) => out::Out {
+            dir: r.top.clone(),
+            source: out::Source::Env,
+        },
+        None => out::resolve(root)?,
+    };
+    if let Some(r) = release {
+        key = Some(r.key.clone());
+        channel = r.channel.clone();
+    }
+    let d = dirs(root, &o.dir, &lock);
     std::fs::create_dir_all(d.os.join("dl")).map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(d.os.join("out")).map_err(|e| e.to_string())?;
-    let free = free_gb(&d.os.join("out"))?;
+    let _lock = out::lock(&d.top)?;
+    eprintln!("   out: {}", d.top.display());
+    if o.source == out::Source::Legacy {
+        eprintln!(
+            "   warning: the build is inside the checkout (os/out, it holds the signing key); \
+             move it to the build disk: docs/os-image.md, \"Onde fica o build\""
+        );
+    }
+    let free = free_gb(&d.top)?;
     if free < MIN_FREE_GB {
         return Err(format!(
-            "only {free} GB free under os/out; the build wants {MIN_FREE_GB} GB"
+            "only {free} GB free under {}; the build wants {MIN_FREE_GB} GB",
+            d.top.display()
         ));
     }
     fetch_buildroot(&d, &lock)?;
-    // G1.6o: the browser GUI that `ip.service www-ssl` serves.
-    let web_dir = web::build(root, &d.os.join("out/cargo-target"))?;
+    // G1.6o: the browser GUI that `ip.service www-ssl` serves. processo:
+    // in its own cargo target. Sharing `cargo-target` with the image's
+    // cargo (whose build scripts the Buildroot gcc links) made each build
+    // throw away the other's host artifacts: every `os build` recompiled
+    // the GUI (216 s) and all of the daemon's dependencies (**medido**).
+    let web_dir = web::build(root, &d.top, &d.top.join("web-target"))?;
 
     let cargo = which_cargo()?;
     let commit = git_commit(root);
@@ -628,7 +688,16 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
     // G1.6b: the image key (private: outside the tree and the image) and
     // what `corerouter-image seal` puts in the manifest.
     let image_tool = ab::tool(root)?;
-    let (image_key, image_keys_dir) = ab::ensure_key(root, &image_tool, key.as_deref())?;
+    let (image_key, signing_pub) = ab::ensure_key(&d.top, &image_tool, key.as_deref())?;
+    // processo: the public keys the image trusts. A development image: its
+    // own key and the release keys of `os/keys/release/` (a test router
+    // takes both). A release image: only the release keys.
+    let image_keys_dir = release::trust_dir(
+        &d.top,
+        &signing_pub,
+        &d.os.join("keys/release"),
+        release.is_some(),
+    )?;
     let defconfig_text =
         std::fs::read_to_string(d.os.join("configs").join(DEFCONFIG)).map_err(|e| e.to_string())?;
     let seal_env = [
@@ -638,26 +707,42 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
             "CR_SEAL_IMAGE_KEYS_DIR",
             image_keys_dir.display().to_string(),
         ),
-        ("CR_SEAL_VERSION", workspace_version(root)),
+        (
+            "CR_SEAL_VERSION",
+            release.map_or_else(|| workspace_version(root), |r| r.version.clone()),
+        ),
         ("CR_SEAL_BUILD", git_time(root).to_string()),
         ("CR_SEAL_CHANNEL", channel.clone()),
         ("CR_SEAL_KERNEL_VERSION", kernel_version(&defconfig_text)?),
         ("CR_SEAL_CONFIG_FORMAT", config_format(root)?.to_string()),
     ];
-    let make = |targets: &[&str], parallel: Option<&String>| -> Result<(), String> {
+    let make = |targets: &[&str], parallel: &[String]| -> Result<(), String> {
         let mut cmd = Command::new("make");
         cmd.arg("-C")
             .arg(&d.buildroot)
             .arg(format!("O={}", d.out.display()));
         cmd.arg(format!("BR2_EXTERNAL={}", d.os.display()));
         cmd.arg(format!("COREROUTER_CARGO={}", cargo.display()));
+        // The rustc next to that cargo. Without it cargo runs the rustup
+        // proxy from each crate's directory, and a crate that ships a
+        // `rust-toolchain` (dhcproto pins 1.90) switches the compiler in
+        // the middle of the build (seen when the xtask ran without
+        // `cargo xtask`, i.e. without RUSTUP_TOOLCHAIN).
+        let rustc = cargo.with_file_name("rustc");
+        if rustc.is_file() {
+            cmd.env("RUSTC", rustc);
+        }
         cmd.arg(format!("COREROUTER_WEB_DIR={}", web_dir.display()));
+        cmd.arg(format!(
+            "COREROUTER_CARGO_TARGET_DIR={}",
+            d.top.join("cargo-target").display()
+        ));
+        // Buildroot: the variable overrides the defconfig's BR2_CCACHE_DIR.
+        cmd.env("BR2_CCACHE_DIR", d.top.join("ccache"));
         if let Some(j) = &jobs {
             cmd.arg(format!("BR2_JLEVEL={j}"));
         }
-        if let Some(j) = parallel {
-            cmd.arg(format!("-j{j}"));
-        }
+        cmd.args(parallel);
         cmd.args(targets);
         // The xtask's own cargo environment must not leak into Buildroot's
         // cargo call (target dir, manifest, the toolchain of this process).
@@ -690,11 +775,11 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
             Err(format!("make {} failed: {st}", targets.join(" ")))
         }
     };
-    make(&[DEFCONFIG], None)?;
+    make(&[DEFCONFIG], &[])?;
     // A custom kernel version is in BR_NO_CHECK_HASH_FOR (linux.mk):
     // Buildroot checks it only while linux.hash is there. Checked here too,
     // so deleting that file can never let an unchecked kernel in.
-    make(&["linux-source"], None)?;
+    make(&["linux-source"], &[])?;
     let defconfig =
         std::fs::read_to_string(d.os.join("configs").join(DEFCONFIG)).map_err(|e| e.to_string())?;
     let version = kernel_version(&defconfig)?;
@@ -715,7 +800,7 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
     eprintln!("   linux-{version}.tar.xz: sha256 ok");
     // The workspace changes between builds; Buildroot only rebuilds a
     // package whose stamp is gone. cargo is incremental underneath.
-    make(&["corerouter-dirclean"], None)?;
+    make(&["corerouter-dirclean"], &[])?;
     // G1.6c: the installer kernel embeds the init: rebuilt after it
     // (kbuild relinks the initramfs and vmlinux only).
     let installer_dir = d.out.join("build").join(format!(
@@ -739,9 +824,26 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
             .join(format!("linux-{version}"))
             .exists()
         {
-            make(&["linux-dirclean"], None)?;
+            make(&["linux-dirclean"], &[])?;
         }
         std::fs::write(&kstamp, &kpatches).map_err(|e| format!("{}: {e}", kstamp.display()))?;
+    }
+    // G3.4l: the same for `os/patches/frr/*.patch` (the ospfd TI-LFA fix):
+    // a changed patch needs `frr-dirclean`.
+    let (_, fpatches) = patches_in(&d.os.join("patches/frr"))?;
+    let fstamp = d.out.join(".corerouter-frr-patches.sha256");
+    if std::fs::read_to_string(&fstamp).ok().as_deref() != Some(fpatches.as_str()) {
+        let built = std::fs::read_dir(d.out.join("build")).is_ok_and(|rd| {
+            rd.flatten().any(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("frr-"))
+            })
+        });
+        if built {
+            make(&["frr-dirclean"], &[])?;
+        }
+        std::fs::write(&fstamp, &fpatches).map_err(|e| format!("{}: {e}", fstamp.display()))?;
     }
     // Buildroot reads the kernel fragment only when it configures the
     // kernel: a changed fragment needs `linux-reconfigure` (the kernel's
@@ -754,7 +856,7 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
             .join(format!("linux-{version}/.config"))
             .exists()
         {
-            make(&["linux-reconfigure"], None)?;
+            make(&["linux-reconfigure"], &[])?;
         }
         std::fs::write(&stamp, &fragment_hash).map_err(|e| format!("{}: {e}", stamp.display()))?;
     }
@@ -762,7 +864,7 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
     // files (rsync without delete), and the packages built after ours keep
     // a copy of its files: GUI files of an older build (names carry a
     // content hash) would pile up in the image. Every copy goes; ours is
-    // installed again from os/out/web.
+    // installed again from <out>/web.
     let web = Path::new("usr/share/corerouter/web");
     let mut stale = vec![d.out.join("target").join(web)];
     if let Ok(pkgs) = std::fs::read_dir(d.out.join("per-package")) {
@@ -771,7 +873,18 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
     for dir in stale.iter().filter(|p| p.exists()) {
         std::fs::remove_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
-    make(&["all"], top_jobs.as_ref())?;
+    // processo: packages in parallel (BR2_PER_PACKAGE_DIRECTORIES makes it
+    // safe; a package that cannot build in parallel still runs its own make
+    // with -j1). Serial, the configure steps ran one after another.
+    let top = match &top_jobs {
+        Some(j) => vec![format!("-j{j}")],
+        None => {
+            let (j, cpus) = out::auto_top_jobs();
+            eprintln!("   make all: -j{j} -l{cpus} (automatic; --top-jobs N sets it)");
+            vec![format!("-j{j}"), format!("-l{cpus}")]
+        }
+    };
+    make(&["all"], &top)?;
 
     let kconfig = std::fs::read_dir(d.out.join("build"))
         .map_err(|e| e.to_string())?
@@ -876,6 +989,10 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
 /// in and the image does not need (readline, ncurses, the C++ runtime);
 /// this catches one removal too many. Returns how many files were checked.
 fn check_needed(target: &Path) -> Result<usize, String> {
+    // The libraries are compared by canonical path: an out directory
+    // reached through a symlink would otherwise miss every one.
+    let target =
+        &std::fs::canonicalize(target).map_err(|e| format!("{}: {e}", target.display()))?;
     let mut files = Vec::new();
     let mut stack = vec![target.to_owned()];
     while let Some(dir) = stack.pop() {
@@ -1029,7 +1146,7 @@ fn fetch_buildroot(d: &Dirs, lock: &Lock) -> Result<(), String> {
     }
     let st = Command::new("tar")
         .arg("-C")
-        .arg(d.os.join("out"))
+        .arg(&d.top)
         .arg("-xf")
         .arg(&tarball)
         .status()
@@ -1160,7 +1277,8 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     let lock = parse_lock(
         &std::fs::read_to_string(root.join("os/buildroot.lock")).map_err(|e| e.to_string())?,
     )?;
-    let images = dirs(root, &lock).out.join("images");
+    let top = out_dir(root)?;
+    let images = dirs(root, &top, &lock).out.join("images");
     let disk = images.join("disk.img");
     if !disk.exists() {
         return Err(format!(
@@ -1171,7 +1289,7 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     let kvm = !b.tcg && kvm_usable();
     let port = free_port()?;
     let web_port = free_port()?;
-    let log_path = root.join("os/out/boot-test.log");
+    let log_path = top.join("boot-test.log");
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.args([
         "-machine",
@@ -1209,7 +1327,7 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
          hostfwd=tcp:127.0.0.1:{web_port}-:{GUEST_WEB_PORT}"
     ));
     cmd.args(["-device", "virtio-net-pci,netdev=n0"]);
-    let vars = root.join("os/out/OVMF_VARS.fd");
+    let vars = top.join("OVMF_VARS.fd");
     if b.efi {
         let code = "/usr/share/OVMF/OVMF_CODE_4M.fd";
         std::fs::copy("/usr/share/OVMF/OVMF_VARS_4M.fd", &vars)

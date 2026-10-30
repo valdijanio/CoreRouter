@@ -9,7 +9,7 @@
 //!   same `Session::execute` as the CLI and MCP): an address on `ether1` and a
 //!   loopback /32, OSPFv2 point-to-point, Segment Routing with a
 //!   prefix SID for the loopback, MPLS input and LDP on `ether1` (no TI-LFA:
-//!   off in production while G3.4l is open), a BFD peer on the link;
+//!   off in production, G3.4k), a BFD peer on the link;
 //! - what must follow is read back from FRR through hal-frr's queries: the
 //!   OSPF adjacency Full (ospfd), the other router's prefix SID with its
 //!   label (ospfd's SR database), the LDP session operational (ldpd), the
@@ -388,7 +388,7 @@ pub fn frr_test(root: &Path, images: &Path, args: &[String]) -> Result<(), Strin
         )?;
     }
     let frr = pinned_frr(&root.join("os"))?;
-    let work = root.join("os/out/frr-test");
+    let work = super::out_dir(root)?.join("frr-test");
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
     let log_path = work.join("console.log");

@@ -18,14 +18,18 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Families"##, r##"Famílias"##),
     (r##"Flaps"##, r##"Quedas"##),
     (r##"GR"##, r##"GR"##),
+    (r##"GR Notification"##, r##"Notificação no GR"##),
     (r##"General"##, r##"Geral"##),
     (r##"Graceful Restart"##, r##"Graceful restart"##),
+    (r##"Hard Admin Reset"##, r##"Hard Reset no clear"##),
     (r##"History"##, r##"Histórico"##),
     (r##"Hold"##, r##"Hold"##),
     (r##"Hold / Keepalive"##, r##"Hold / Keepalive"##),
     (r##"Instances"##, r##"Instâncias"##),
     (r##"Key"##, r##"Chave"##),
     (r##"Kind"##, r##"Tipo"##),
+    (r##"LLGR"##, r##"LLGR"##),
+    (r##"LLGR Stale Time"##, r##"Tempo do LLGR"##),
     (r##"Last Error"##, r##"Último erro"##),
     (r##"Limits"##, r##"Limites"##),
     (r##"Local Role"##, r##"Papel local"##),
@@ -37,6 +41,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"New Template…"##, r##"Novo template…"##),
     (r##"No BGP connection yet: add one in the Connections tab."##, r##"Nenhuma conexão BGP ainda: adicione uma na aba Conexões."##),
     (r##"Not a CoreRouter connection (typed into FRR by hand)."##, r##"Não é uma conexão do CoreRouter (digitada no FRR à mão)."##),
+    (r##"Notification"##, r##"Notificação"##),
     (r##"Output Network"##, r##"Redes anunciadas"##),
     (r##"Policy In"##, r##"Política de entrada"##),
     (r##"Policy Out"##, r##"Política de saída"##),
@@ -100,6 +105,11 @@ Depois que o nosso `bgpd` sobe, quanto tempo a escolha do melhor caminho espera 
 
 ## Cuidado
 Um vizinho que nunca manda End-of-RIB (RouterOS 7.25; a checagem de saúde `bgp.end-of-rib` o aponta) segura as rotas dele pelo tempo inteiro depois de cada início do `bgpd`. 0 não espera: as rotas podem mudar enquanto os vizinhos reenviam as tabelas."##),
+    (r##"bgp.instance.graceful_notification"##, r##"## O que é
+O bit N da capacidade de graceful restart (RFC 8538 §2). Com ele dos dois lados, uma NOTIFICATION ou o hold timer expirado viram reinício: as rotas do vizinho ficam (stale) pelo Restart Time dele; só um Hard Reset (Cease 9 e, no FRR, também Maximum Prefixes, Shutdown, De-configured e BFD Down) as tira na hora. Ligado por padrão (FRR desde a 8.3).
+
+## Cuidado
+Uma queda silenciosa (energia, link cortado) de um vizinho que reinicia com GR deixa as rotas dele o hold time mais o Restart Time. Use BFD nessas conexões (a queda do BFD é Hard Reset); a prévia e a checagem de saúde `bgp.gr-bfd` avisam. Desligado: hold expirado ou NOTIFICATION tiram as rotas como antes da RFC 8538. O RouterOS 7.25 não documenta a RFC 8538."##),
     (r##"bgp.instance.graceful_restart_time"##, r##"## O que é
 O Restart Time que anunciamos na capacidade de graceful restart (RFC 4724 §3): quanto tempo o vizinho guarda as nossas rotas (stale) depois que o nosso `bgpd` morre, esperando ele voltar. Só as conexões com Graceful Restart = yes o anunciam. 1..4095 s (12 bits); vazio: 120 s.
 
@@ -113,6 +123,16 @@ Como helper: quanto tempo guardamos as rotas de um vizinho que reiniciou, marcad
 
 ## Cuidado
 Um vizinho que nunca manda End-of-RIB (RouterOS 7.25) deixa as rotas velhas pelo tempo inteiro. FRR `bgp graceful-restart stalepath-time`, Junos `stale-routes-time` (300)."##),
+    (r##"bgp.instance.hard_admin_reset"##, r##"## O que é
+Se um reset administrativo (Cease 4: `routing.bgp.session.clear`) vai como Hard Reset (RFC 8538 §3) e tira as rotas do vizinho. Ligado por padrão. Desligado: o clear de um vizinho com bit N é gracioso, as rotas ficam stale até ele mandar de novo (bom para aplicar uma política sem buraco no tráfego). Shutdown sempre as tira."##),
+    (r##"bgp.instance.llgr_stale_time"##, r##"## O que é
+Long-Lived Graceful Restart (RFC 9494): quando acaba o Restart Time de um graceful restart, o vizinho guarda as nossas rotas por mais este tempo, marcadas com a comunidade `llgr-stale` e com a menor preferência, então qualquer rota viva ganha delas. 1..16777215 s (24 bits); vazio: desligado (§5: nunca ligado por padrão). O FRR tem um valor só para todas as famílias de endereço (a RFC pede por AFI/SAFI). Também é o máximo que guardamos das rotas do vizinho: o FRR fica com o menor entre o tempo dele e o nosso, então configure nos dois lados.
+
+## Quando usar
+Para rotas que têm alternativa, ou que é melhor ter velhas que não ter (VPN, rota padrão de duas operadoras). Rotas marcadas com `no-llgr` (Routing › Filters, `append bgp-communities no-llgr`) nunca ficam.
+
+## Cuidado
+Salto a salto, uma rota stale mais específica ainda ganha de uma rota viva menos específica (§5): o tráfego pode ir para um próximo salto morto o tempo todo. A prévia mostra o pior caso (hold + Restart Time + LLGR). O RouterOS 7.25 não suporta LLGR: o FRR não manda rotas stale para ele (§4.3)."##),
     (r##"bgp.instance.name"##, r##"## O que é
 O nome da instância; `default` roda na tabela principal, outro nome é uma view separada do FRR."##),
     (r##"bgp.instance.router_id"##, r##"## O que é

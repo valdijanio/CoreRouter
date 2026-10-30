@@ -25,8 +25,11 @@ runs:
   steps:
     # Cabeçalhos que eframe/winit/wgpu (x11, wayland, GL) pedem para compilar, e o nftables dos
     # testes em namespace. Em cache: o `apt-get update` variava de 14 s a 114 s conforme o espelho.
+    # No runner próprio (docs/ci-runner.md, `runner.environment == 'self-hosted'`) os pacotes,
+    # o nextest e os módulos já vêm na VM e o job não tem sudo; o target fica no disco de cache
+    # dela (CARGO_TARGET_DIR), então o rust-cache só atrasaria.
     - name: Dependências de sistema
-      if: inputs.apt == 'true'
+      if: inputs.apt == 'true' && runner.environment == 'github-hosted'
       uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
       with:
         packages: >-
@@ -45,13 +48,13 @@ runs:
         rustup target list --installed | grep -qx wasm32-unknown-unknown
 
     - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      if: inputs.cache == 'true'
+      if: inputs.cache == 'true' && runner.environment == 'github-hosted'
       with:
         save-if: ${{ github.ref == 'refs/heads/main' }}
 
     # O `cargo xtask ci` usa o nextest quando existe: os binários de teste rodam em paralelo.
     - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
-      if: inputs.nextest == 'true'
+      if: inputs.nextest == 'true' && runner.environment == 'github-hosted'
       with:
         tool: cargo-nextest
 
@@ -59,7 +62,7 @@ runs:
     # O Ubuntu 24.04 bloqueia user namespaces sem privilégio (AppArmor); isto só
     # muda a VM descartável do runner. Se não pegar, o passo netns vira "skip".
     - name: Liberar user namespaces sem root
-      if: inputs.kernel == 'true'
+      if: inputs.kernel == 'true' && runner.environment == 'github-hosted'
       shell: bash
       run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 
@@ -70,20 +73,20 @@ runs:
     # cache do Actions por versão do kernel; sem cache, o download tem teto de 2 min, e se
     # estourar o CI segue sem o teste de VRF, com aviso, em vez de travar a fila.
     - name: Versão do kernel
-      if: inputs.kernel == 'true'
+      if: inputs.kernel == 'true' && runner.environment == 'github-hosted'
       id: kernel
       shell: bash
       run: echo "release=$(uname -r)" >> "$GITHUB_OUTPUT"
 
     - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      if: inputs.kernel == 'true'
+      if: inputs.kernel == 'true' && runner.environment == 'github-hosted'
       with:
         path: ~/vrf-ko
         # v2: também o mpls_router.ko (G3.5), do mesmo pacote.
         key: vrf-ko-v2-${{ steps.kernel.outputs.release }}
 
     - name: Carregar o módulo vrf
-      if: inputs.kernel == 'true'
+      if: inputs.kernel == 'true' && runner.environment == 'github-hosted'
       shell: bash
       run: |
         # G1.14: com o módulo carregado, o teste de VRF em netns falha em vez de pular (e o
@@ -115,7 +118,7 @@ runs:
     # G1.8: o `bonding` vem no linux-modules base; um user namespace também não o carrega.
     # Módulos simples (só `modprobe`): um arquivo por módulo em ci/kernel-modules/.
     - name: Carregar os módulos do kernel
-      if: inputs.kernel == 'true'
+      if: inputs.kernel == 'true' && runner.environment == 'github-hosted'
       shell: bash
       run: |
         for f in ci/kernel-modules/*; do
@@ -139,4 +142,31 @@ runs:
           sudo modprobe "$mod"
           lsmod | grep -w "^$mod"
           echo "$var=1" >> "$GITHUB_ENV"
+        done
+
+    # Runner próprio: a VM carrega os módulos no boot (cargo xtask ci-runner create lê o
+    # ci/kernel-modules/) e libera os user namespaces; aqui só conferimos e ligamos as variáveis,
+    # com as mesmas regras (obrigatório falha, `optional` avisa).
+    - name: Módulos do kernel (runner próprio)
+      if: inputs.kernel == 'true' && runner.environment == 'self-hosted'
+      shell: bash
+      run: |
+        [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 0 ] ||
+          { echo "::error::user namespaces sem root bloqueados na VM do runner"; exit 1; }
+        loaded() { [ -d "/sys/module/$1" ]; }
+        if loaded vrf; then echo "COREROUTER_REQUIRE_VRF=1" >> "$GITHUB_ENV"
+        else echo "::error::módulo vrf ausente na VM do runner (cargo xtask ci-runner create)"; exit 1; fi
+        for f in ci/kernel-modules/*; do
+          mod=$(basename "$f")
+          [ "$mod" = README.md ] && continue
+          var=$(head -n1 "$f")
+          if loaded "$mod"; then
+            echo "$var=1" >> "$GITHUB_ENV"
+          elif grep -qx optional "$f"; then
+            echo "::warning::módulo $mod indisponível na VM do runner; os testes que dependem dele ficam de fora deste run"
+            echo "$var=0" >> "$GITHUB_ENV"
+          else
+            echo "::error::módulo $mod ausente na VM do runner: recrie-a (cargo xtask ci-runner create) ou carregue-o"
+            exit 1
+          fi
         done

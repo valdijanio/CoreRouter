@@ -140,6 +140,22 @@ Por que uma FEC não tem rótulo de saída (nenhum vizinho LDP de pé, o próxim
 Mostra só as FECs sem rótulo de saída: onde o LSP quebra."##),
     (r##"mpls.gtsm"##, r##"## O que é
 GTSM (RFC 6720): os pacotes LDP de um vizinho diretamente conectado precisam chegar com TTL 255, então um atacante remoto não alcança a sessão. Negociado no Hello; ligado por padrão. No IPv6 é sempre ligado (RFC 7552 §9)."##),
+    (r##"mpls.icmp_rate"##, r##"## O que é
+Quantos erros ICMP "time exceeded" de pacotes rotulados expirados este roteador manda por segundo, no máximo (padrão 100). O excedente é descartado e contado.
+
+## Por quê
+Uma enxurrada de pacotes com TTL 1 não pode ocupar o plano de controle (a RFC 1812 §4.3.2.8 pede limite nos erros ICMP). Cada erro tem uns 200 bytes no máximo e vai só para a origem do pacote expirado."##),
+    (r##"mpls.icmp_ttl_exceeded"##, r##"## O que é
+Quando o TTL de um pacote rotulado expira neste roteador, devolve à origem o ICMP "time exceeded" com a pilha de rótulos com que ele chegou (RFC 4950: o traceroute mostra `MPLS:L=…`).
+
+## Por quê
+O MPLS do kernel Linux descarta esses pacotes sem erro, e o traceroute através do LSP mostrava `*` neste salto. RouterOS, Cisco e Junos respondem.
+
+## Como volta
+Com um rótulo e uma rota IP até a origem, pela tabela IP. Com mais rótulos (uma VPN), pelo próprio LSP, como descreve a RFC 3032 §2.3.2: o egress o roteia de volta à origem.
+
+## Diagnóstico
+`mpls.settings.get` mostra `icmp_counters`: pacotes expirados ouvidos, erros enviados, descartados pela taxa e por motivo."##),
     (r##"mpls.if"##, r##"## O que é
 LDP numa interface: Hellos de enlace para 224.0.0.2 (IPv6 ff02::2) a cada intervalo, e as adjacências que eles formam (RFC 5036 §2.4.1)."##),
     (r##"mpls.if.adjacencies"##, r##"## O que é

@@ -101,6 +101,10 @@ pub struct Session {
     remote_desired_tx: u32,
     remote_mult: u8,
     remote_demand: bool,
+    /// The C bit of the peer's last packet (RFC 5880 §4.1: its BFD does not
+    /// share fate with its control plane). G3.9fj: `bfdd` hands it to
+    /// `bgpd` for RFC 5882 §4.3.
+    remote_cpi: bool,
     /// The peer's Desired Min TX before it advertised a smaller one, kept
     /// in the Detection Time until it really sends at the new rate (0:
     /// none). See [`Session::detection_time`].
@@ -139,6 +143,7 @@ impl Session {
             remote_desired_tx: 0,
             remote_mult: 0,
             remote_demand: false,
+            remote_cpi: false,
             remote_tx_hold: 0,
             hold_rx_at: None,
             poll_active: false,
@@ -196,6 +201,9 @@ impl Session {
     }
     pub fn remote_mult(&self) -> u8 {
         self.remote_mult
+    }
+    pub fn remote_cpi(&self) -> bool {
+        self.remote_cpi
     }
     /// The periodic interval before jitter (§6.8.7): the larger of our
     /// bfd.DesiredMinTxInterval and the peer's Required Min RX.
@@ -363,6 +371,7 @@ impl Session {
         self.remote_min_rx = p.required_min_rx;
         self.remote_desired_tx = p.desired_min_tx;
         self.remote_mult = p.detect_mult;
+        self.remote_cpi = p.cpi;
         let mut out = Received::default();
         // §6.5: the Final ends our Poll Sequence; the held values apply.
         if p.final_ && self.poll_active {
@@ -593,6 +602,22 @@ mod tests {
         }
     }
 
+    /// G3.9fj, RFC 5880 §4.1: the peer's C bit is kept from its packets.
+    #[test]
+    fn the_peers_c_bit_is_kept() {
+        let mut a = Session::new(0x1111, fast(), 0, 1);
+        let mut b = Session::new(0x2222, fast(), 0, 2);
+        let mut buf = [0u8; MAX_LEN];
+        let n = b.build(false, &mut buf);
+        let mut p = Packet::decode(&buf[..n]).unwrap();
+        p.cpi = true;
+        let mut raw = [0u8; MAX_LEN];
+        let m = p.encode(&mut raw);
+        let p = Packet::decode(&raw[..m]).unwrap();
+        a.receive(&raw[..m], &p, MS).unwrap();
+        assert!(a.remote_cpi());
+    }
+
     #[test]
     fn three_way_handshake_comes_up() {
         let mut w = Wire::new(fast(), fast());
@@ -600,6 +625,9 @@ mod tests {
         assert_eq!(w.a.state(), State::Up);
         assert_eq!(w.b.state(), State::Up);
         assert_eq!(w.a.remote_discr(), 0x2222);
+        // G3.9fj: CoreRouter's engine sends C = 0 (it shares fate with the
+        // daemon, not with the kernel's forwarding).
+        assert!(!w.a.remote_cpi());
         // §6.8.3: once Up and the Poll answered, the fast interval rules.
         w.run(200 * MS);
         assert!(!w.a.poll_active() && !w.b.poll_active());

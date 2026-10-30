@@ -226,7 +226,7 @@ slot anterior, com a configuração que tinha. O slot em uso nunca é escrito.
 
    `signature: ok` e `intact: true`; nenhum `trial` pendente; o outro slot em `standby` ou
    `empty`. O pacote precisa ser assinado pela chave da imagem (a de produção, não a de
-   desenvolvimento de `os/out/keys`).
+   desenvolvimento de `<out>/keys`, `cargo xtask os out-dir`).
 2. **Saia do trânsito** se o roteador já for caminho de alguém (seção acima, "Como sair em
    segundos"): o reboot leva ~1 s de kernel e alguns segundos de firmware.
 3. **Envie e instale** com confirmação **manual** e prazo curto, numa janela de manutenção:

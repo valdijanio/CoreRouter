@@ -690,3 +690,120 @@ fn validator_catches_hand_built_dependency_errors() {
     find("bridge 'nobridge' does not exist");
     find("'ether4' is not a bridge (type ether)");
 }
+
+// ---- the per-type lists of `/interface <type> print` (G3.9hl) ----
+
+#[test]
+fn per_type_lists_hold_only_their_type_with_routeros_columns() {
+    let mut s = lab();
+    ok(
+        &mut s,
+        "interface.vlan.add",
+        json!({"name": "v30", "parent": "ether1", "vlan_id": 30, "comment": "c"}),
+    );
+    ok(
+        &mut s,
+        "interface.vlan.add",
+        json!({"name": "s40", "parent": "ether1", "vlan_id": 40, "use_service_tag": true, "disabled": true}),
+    );
+    ok(&mut s, "interface.bridge.add", json!({"name": "br1"}));
+    ok(
+        &mut s,
+        "interface.bridge.port.add",
+        json!({"bridge": "br1", "interface": "v30"}),
+    );
+    ok(&mut s, "interface.loopback.add", json!({"name": "lo1"}));
+
+    let mut vlans = ok(&mut s, "interface.vlan.list", json!({}));
+    // A VLAN shows its parent's MAC, as RouterOS does (v30 = ether1's).
+    let ether1 = ok(&mut s, "interface.ethernet.list", json!({}))[0]["mac_address"].clone();
+    assert!(ether1.is_string(), "{ether1}");
+    assert_eq!(vlans[1]["mac_address"], ether1);
+    for v in vlans.as_array_mut().unwrap() {
+        v.as_object_mut().unwrap().remove("mac_address");
+    }
+    assert_eq!(
+        vlans,
+        json!([
+            {"name": "s40", "mtu": 1500, "vlan_id": 40, "interface": "ether1", "use_service_tag": true,
+             "disabled": true, "running": false, "comment": ""},
+            {"name": "v30", "mtu": 1500, "vlan_id": 30, "interface": "ether1", "use_service_tag": false,
+             "disabled": false, "running": true, "comment": "c"},
+        ])
+    );
+    let bridges = ok(&mut s, "interface.bridge.list", json!({}));
+    assert_eq!(bridges.as_array().unwrap().len(), 1);
+    assert_eq!(bridges[0]["name"], "br1");
+    assert_eq!(bridges[0]["ports"], 1);
+    let lo = ok(&mut s, "interface.loopback.list", json!({}));
+    assert_eq!(lo.as_array().unwrap().len(), 1);
+    assert_eq!(lo[0]["name"], "lo1");
+    // Every port of the lab, nothing else.
+    let eth = ok(&mut s, "interface.ethernet.list", json!({}));
+    let names: Vec<&str> = eth
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"ether1") && !names.contains(&"v30"),
+        "{names:?}"
+    );
+    // Queries: no revision, and a key they do not take is refused.
+    assert_eq!(s.store().current_revision(), 5);
+    fails(
+        &mut s,
+        "interface.vlan.list",
+        json!({"type": "vlan"}),
+        "type",
+    );
+}
+
+#[test]
+fn ethernet_list_gives_back_what_set_takes() {
+    let mut s = lab();
+    ok(
+        &mut s,
+        "interface.ethernet.set",
+        json!({"name": "ether4", "auto_negotiation": false, "speed": "100Mbps", "duplex": "full",
+               "offloads": "gro:off"}),
+    );
+    let eth = ok(&mut s, "interface.ethernet.list", json!({}));
+    let row = eth
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "ether4")
+        .unwrap()
+        .clone();
+    assert_eq!(row["auto_negotiation"], false);
+    assert_eq!(row["speed"], "100Mbps");
+    assert_eq!(row["duplex"], "full");
+    assert!(row["offloads"].as_str().unwrap().ends_with(":off"), "{row}");
+    // The row, fed back to `set` on a fresh router, sets the same thing.
+    let mut b = lab();
+    ok(
+        &mut b,
+        "interface.ethernet.set",
+        json!({"name": "ether4", "auto_negotiation": row["auto_negotiation"], "speed": row["speed"],
+               "duplex": row["duplex"], "offloads": row["offloads"]}),
+    );
+    let ifs = |s: &Session| {
+        s.store().running().interfaces[&"ether4".parse().unwrap()]
+            .ethernet
+            .clone()
+    };
+    assert_eq!(ifs(&b), ifs(&s));
+    // An untouched port shows no setting (its export is no line).
+    let e1 = eth
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "ether1")
+        .unwrap();
+    assert!(
+        e1["speed"].is_null() && e1["auto_negotiation"].is_null(),
+        "{e1}"
+    );
+}

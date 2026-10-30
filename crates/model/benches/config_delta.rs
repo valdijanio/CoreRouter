@@ -1,6 +1,6 @@
 //! The revision delta of a firewall commit (`config_delta::diff`, written
 //! at every commit): one filter rule changed with 4 000 filter, 4 000 raw
-//! and 2 000 mangle rules, the most the tables take (`MAX_RULES`). The
+//! and 2 000 mangle rules (the T1 validation's config). The
 //! raw table was serialized and compared whole at every firewall commit
 //! until it joined the big lists (2026-10-29).
 //!

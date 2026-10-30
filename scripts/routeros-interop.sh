@@ -3,9 +3,9 @@
 # RouterOS v7 CHR. Runs as root inside the lab VM only:
 #   cargo xtask vm-lab run -- scripts/routeros-interop.sh [case…]
 # Cases (default: all, in this order): ospf-ptp ospf-broadcast ospf-auth
-#   ospf-mtu ospf-areas redistribute entry ldp bfd exit failover stub-router
-#   ospfv3 prod (last: it restarts the CoreRouter on the docs/producao-core.md
-#   blocks)
+#   ospf-mtu ospf-areas redistribute entry ldp mpls-ttl bfd exit failover
+#   stub-router ospfv3 prod (last: it restarts the CoreRouter on the
+#   docs/producao-core.md blocks)
 # HOLD=<s> keeps the lab up that long at the end (inspect it with
 # `cargo xtask vm-lab ssh`). Results: a table at the end and
 # /tmp/crg39/results.txt in the VM; exit 1 if any case failed.
@@ -33,7 +33,7 @@ exec 9>&-
 ROS_VERSION=${ROS_VERSION:-7.25}
 ROS_SHA256=${ROS_SHA256:-6b981288350de2a2c7a3218bd820ab702633b8cd6cd339f2bb34dda1f1a2550e}
 CASES=("$@")
-[ ${#CASES[@]} -gt 0 ] || CASES=(ospf-ptp ospf-broadcast ospf-auth ospf-mtu ospf-areas redistribute entry ldp bfd exit failover stub-router ospfv3 prod)
+[ ${#CASES[@]} -gt 0 ] || CASES=(ospf-ptp ospf-broadcast ospf-auth ospf-mtu ospf-areas redistribute entry ldp mpls-ttl bfd exit failover stub-router ospfv3 prod)
 W=/tmp/crg39
 CHR_DIR=/srv/lab/chr
 PW=g39-lab-only
@@ -632,6 +632,56 @@ case_ldp() {
   tid=$(cli tool.mpls.ping.start '{"fec":"10.255.39.3/32","count":3,"interval_ms":200}' | jq -r .task_id)
   sleep 4
   result ldp INFO "CR LSP ping 10.255.39.3/32 (R3, through CHR): $(cli tool.task.poll "{\"id\":$tid,\"text\":true}" | jq -r '(.summary_lines // []) | join(" ")' | head -c 300)"
+}
+
+# G3.9d: traceroutes that cross the CoreRouter as a labeled hop. CHR pushes
+# the CoreRouter's LDP label for R4's loopback (propagate-ttl: the IP TTL
+# goes into the label); at TTL 1 it expires at the CoreRouter, whose kernel
+# drops it silently. Our responder sends the time exceeded with the label
+# stack (RFC 4950), which RouterOS shows as MPLS:L=…
+ros_trace() { # ros_trace <dst> <src>: one probe per hop, as JSON
+  jq -n --arg a "$1" --arg s "$2" '{address: $a, "src-address": $s, count: "1", "use-dns": "no", timeout: "1s"}' |
+    curl -s -m 30 -u "admin:$PW" -H 'content-type: application/json' -d @- "http://$ROS/rest/tool/traceroute"
+}
+cr_hop() { # cr_hop <json>: the CoreRouter's hop (10.39.1.2, ether1) as text
+  jq -r '[.[] | select((.address // "") == "10.39.1.2")][0] // {} | "\(.address // "-") \(.status // "") loss=\(.loss // "")"' <<< "$1"
+}
+case_mpls-ttl() {
+  ldp_up
+  wait_for 90 ldp_ok >/dev/null || { result mpls-ttl FAIL "LDP: CR '$(cr_ldp)' CHR '$(ros_ldp)'"; return; }
+  wait_for 40 mpls_routes >/dev/null || true
+  sleep 3
+  result mpls-ttl INFO "CR label for R4: $(cr_label 10.255.39.4/32)"
+  # Before: what the Linux forwarder alone does.
+  cli mpls.settings.set '{"icmp_ttl_exceeded":false}' >/dev/null
+  sleep 3
+  local t; t=$(ros_trace 10.255.39.4 10.255.39.1)
+  echo "$t" > "$W/trace-off.json"
+  result mpls-ttl INFO "CHR traceroute, icmp_ttl_exceeded=no: $(jq -c '[.[] | {address, status, loss}]' <<< "$t" | head -c 400)"
+  [ "$(cr_hop "$t" | cut -d' ' -f1)" = - ] \
+    && result mpls-ttl OK "without the setting the CoreRouter hop is silent (the kernel drops it)" \
+    || result mpls-ttl INFO "the CoreRouter hop answered without the setting: $(cr_hop "$t")"
+  # After.
+  cli mpls.settings.set '{"icmp_ttl_exceeded":true}' >/dev/null
+  sleep 3
+  t=$(ros_trace 10.255.39.4 10.255.39.1)
+  echo "$t" > "$W/trace-on.json"
+  result mpls-ttl INFO "CHR traceroute: $(jq -c '[.[] | {address, status, loss}]' <<< "$t" | head -c 400)"
+  local hop; hop=$(cr_hop "$t")
+  [[ $hop == 10.39.1.2*MPLS* ]] && result mpls-ttl OK "CHR traceroute shows the CoreRouter hop with its label: $hop" \
+    || result mpls-ttl FAIL "CHR traceroute, CoreRouter hop: '$hop'"
+  [ "$(jq -r '[.[] | select((.address // "") == "10.255.39.4")] | length' <<< "$t")" -ge 1 ] \
+    && result mpls-ttl OK "and goes on to R4" || result mpls-ttl FAIL "R4 missing from the CHR traceroute"
+  # From R3 (Linux traceroute -e prints the RFC 4950 object), two labels
+  # deep in the CHR's core: R3 → CHR (swap) → CoreRouter (pop) → R4.
+  local lt; lt=$(ip netns exec crr3 traceroute -n -e -q1 -w1 -s 10.255.39.3 10.255.39.4 2>&1 | tail -n +2 | tr -s ' ')
+  result mpls-ttl INFO "traceroute R3 → R4: $(tr '\n' ';' <<< "$lt")"
+  grep -q '10.39.1.2.*MPLS' <<< "$lt" && result mpls-ttl OK "R3's traceroute shows the CoreRouter hop with its label" \
+    || result mpls-ttl FAIL "R3's traceroute, no labeled CoreRouter hop"
+  sleep 2 # the counters reach the session once a second
+  result mpls-ttl INFO "CR icmp_counters: $(cli mpls.settings.get | jq -c .icmp_counters)"
+  [ "$(cli mpls.settings.get | jq '.icmp_counters.sent // 0')" -ge 2 ] \
+    && result mpls-ttl OK "the CoreRouter counted its errors" || result mpls-ttl FAIL "icmp_counters.sent < 2"
 }
 
 bfd_on=0
