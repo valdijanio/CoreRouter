@@ -72,6 +72,35 @@ pub fn kernel_named_ports() -> Vec<Found> {
         .collect()
 }
 
+/// Every physical Ethernet port, whatever its name (the hot-plug pass,
+/// G1.6n).
+pub fn all_ports() -> Vec<Found> {
+    names().iter().filter_map(|n| port(n)).collect()
+}
+
+/// A socket that hears every link the kernel adds, changes or removes
+/// (`RTNLGRP_LINK`): PID 1 wakes on it to name a card plugged in after boot
+/// (G1.6n) instead of polling `/sys/class/net`.
+pub struct LinkEvents(netlink_sys::Socket);
+
+impl LinkEvents {
+    pub fn open() -> std::io::Result<Self> {
+        use netlink_sys::{Socket, SocketAddr as NlAddr, protocols::NETLINK_ROUTE};
+        const RTMGRP_LINK: u32 = 1;
+        let mut sock = Socket::new(NETLINK_ROUTE)?;
+        sock.bind(&NlAddr::new(0, RTMGRP_LINK))?;
+        Ok(Self(sock))
+    }
+
+    /// Blocks until the kernel says something about a link. The message is
+    /// not parsed: the caller looks at `/sys/class/net` again. An error
+    /// (`ENOBUFS`: messages were lost) also means "look again".
+    pub fn wait(&self) -> std::io::Result<()> {
+        let mut buf = vec![0u8; 16 << 10];
+        self.0.recv(&mut &mut buf[..], 0).map(|_| ())
+    }
+}
+
 /// Every physical Ethernet port, in bus order, with its carrier: what the
 /// installer lists.
 pub fn ports_with_link() -> Vec<(Found, bool)> {
