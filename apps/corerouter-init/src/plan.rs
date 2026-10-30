@@ -444,6 +444,27 @@ pub fn is_pong(line: &str) -> bool {
     line.contains("\"pong\":true") || line.contains("\"pong\": true")
 }
 
+/// Longest message PID 1 writes to `/dev/kmsg` (a record holds about
+/// 1 KiB; the kernel refuses a longer write).
+pub const KMSG_MAX: usize = 900;
+
+/// `msg` as one `/dev/kmsg` record (G1.29f): facility user, level notice
+/// (`<13>`, below the console level of `quiet`, so the console does not
+/// show the line twice), tagged `corerouter-init[1]` like a syslog line
+/// (the OS log takes the unit and the pid from it), on one line and cut to
+/// [`KMSG_MAX`] bytes on a character boundary.
+pub fn kmsg_record(msg: &str) -> Vec<u8> {
+    let mut out = String::from("<13>corerouter-init[1]: ");
+    for c in msg.chars().map(|c| if c.is_control() { ' ' } else { c }) {
+        if out.len() + c.len_utf8() > KMSG_MAX {
+            break;
+        }
+        out.push(c);
+    }
+    out.push('\n');
+    out.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,5 +642,18 @@ mod tests {
         assert!(pos("/dev") < pos("/dev/pts"));
         assert!(pos("/sys") < pos("/sys/fs/bpf"));
         assert!(pos("/run").is_some() && pos("/proc") == Some(0));
+    }
+
+    #[test]
+    fn kmsg_record_is_one_tagged_line_that_fits() {
+        assert_eq!(
+            kmsg_record("port names: eth0 → ether4: File exists"),
+            "<13>corerouter-init[1]: port names: eth0 → ether4: File exists\n".as_bytes()
+        );
+        let r = kmsg_record(&format!("a\nb{}", "é".repeat(1000)));
+        let t = String::from_utf8(r).unwrap();
+        assert!(t.len() <= KMSG_MAX + 1, "{}", t.len());
+        assert!(t.starts_with("<13>corerouter-init[1]: a b"), "{t}");
+        assert_eq!(t.matches('\n').count(), 1);
     }
 }

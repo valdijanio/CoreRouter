@@ -372,8 +372,8 @@ do LSP mostrava `*` no salto do CoreRouter. Agora o próprio respondedor do LSP 
 - **Descartado:** XDP no `dataplane-ebpf`. Exigiria `unsafe` e revisão humana, e o XDP não tem a
   tabela de rótulos (`bpf_fib_lookup` não faz MPLS; seria preciso espelhar o ILM num mapa) para
   um evento raro, limitado por taxa. O caminho lento custa menos de 1 µs de CPU por erro (abaixo).
-- **Fica de fora** (gap G3.9da): ICMP "fragmentation needed" para pacote rotulado maior que o MTU
-  do LSP (RFC 3032 §3.2: o kernel também descarta) e limite de taxa por origem.
+- **Ficou para a G3.9da** (seção abaixo): ICMP "fragmentation needed" para pacote rotulado maior
+  que o MTU do LSP (o kernel também descarta) e limite de taxa por origem.
 
 ### Desempenho e paralelismo
 
@@ -396,7 +396,8 @@ do LSP mostrava `*` no salto do CoreRouter. Agora o próprio respondedor do LSP 
   devolveu ~4 pontos; o resto (~125 ns por pacote nesta VM) é o próprio `packet_rcv` com o
   filtro, inerente a qualquer tap `AF_PACKET`. Num enlace real com várias filas o custo se
   divide pelos núcleos que recebem. Quem não precisa de LSP ping nem do ICMP recupera tudo com
-  `lsp-ping-responder=no icmp-ttl-exceeded=no`; um tap em XDP/tc (eBPF) é a gap G3.9db.
+  `lsp-ping-responder=no icmp-ttl-exceeded=no`; o tap em tc (eBPF) da G3.9db (abaixo) tira esse
+  custo.
 - **Por erro** (release, criterion, esta máquina com outras sessões compilando, 2026-10-29,
   **medido**, `cargo bench -p corerouter-hal --bench mpls_icmp`): ler o quadro 74 ns; o erro
   pela tabela IP 0,59 µs, pelo LSP com 100 000 rótulos 0,82 µs, pilha de VPN 0,77 µs. A busca do
@@ -405,3 +406,176 @@ do LSP mostrava `*` no salto do CoreRouter. Agora o próprio respondedor do LSP 
   erros/s são < 0,1 ms de CPU por segundo; dividir por núcleo só dividiria o limite de taxa. Uma
   enxurrada de TTL 1 custa ao kernel a cópia para o socket (fila limitada pelo `SO_RCVBUF`; o
   excedente o kernel descarta) e ao serviço um contador por pacote além da taxa.
+
+## ICMP de pacote rotulado grande demais e taxa por origem (G3.9da)
+
+O MPLS do kernel também descarta calado o pacote rotulado que não cabe no enlace de saída
+(`net/mpls/af_mpls.c`, `mpls_forward`: `if (mpls_pkt_too_big(skb, mtu - new_header_size)) goto
+tx_err`, que só conta `tx_errors` na interface de saída; igual no 6.18.59 da imagem e no
+`master`). Sem o ICMP, a descoberta de MTU do caminho (PMTUD, RFC 1191/8201) através do LSP vira
+buraco negro: o TCP abre e trava no primeiro segmento cheio. Agora o respondedor manda o erro.
+
+### Como funciona
+
+- **Captura:** com `icmp-too-big` ligado, o filtro BPF do tap MPLS também guarda os quadros mais
+  longos que a **menor saída da tabela de rótulos** (MTU do enlace − 4 × rótulos empilhados + 4,
+  sobre todas as entradas; recalculado quando a tabela ou um MTU muda, no máximo uma vez por
+  segundo, e o filtro é trocado no socket, o que é atômico). Numa rede de MTU igual nenhum
+  quadro passa desse limite: zero cópia. O que passa é cortado em 14 + 1336 octetos (a pilha e a
+  citação mais longa), então um quadro jumbo não é copiado inteiro.
+- **Quando é grande demais** (`hal/src/lsp/too_big.rs`, sans-IO; a mesma conta do kernel): o
+  pacote sob o rótulo do topo mais os rótulos que a entrada empilha não cabe no MTU do enlace de
+  saída. Com ECMP o kernel escolhe por um hash que não vemos: vale a menor saída. O TTL vem
+  antes (um pacote expirado recebe time exceeded, como no kernel).
+- **IPv4 com DF** (RFC 3032 §3.4): Destination Unreachable código 4, com o Next-Hop MTU (RFC
+  1191 §4) = MTU do enlace − N, com N a pilha **como chegou** (§3.4 passos 2 e 4.b: a entrada
+  empilha os rótulos de novo), e nunca mais que o que de fato cabe (com push sai mais do que
+  chegou). Depois de um pop (PHP) o erro diz 4 octetos a menos do que o enlace levaria: o
+  pacote entre os dois passa, sem erro, porque a decisão de "grande demais" segue a conta do
+  kernel. 128 octetos citados e o objeto da RFC 4950 com a pilha como chegou (o tipo 3 aceita
+  extensões, RFC 4884 §4.1). **Sem DF:** a RFC deixa o LSR
+  descartar calado ("MAY silently discard"), e é o que o kernel já fez; contado.
+- **IPv6** (RFC 3032 §3.5): Packet Too Big com esse MTU, citando o que couber no MTU mínimo de
+  1280 (RFC 4443 §3.2; o tipo 2 não tem extensão RFC 4884, então vai sem a pilha). Pacote de até
+  1280 octetos com cabeçalho de fragmento deveria ser fragmentado (§3.5 passo 4): contado.
+- **Não manda, e como volta:** as mesmas regras do time exceeded (acima): nunca sobre erro ICMP,
+  fragmento não inicial, origem que não é unicast; um rótulo com rota até a origem pela tabela
+  IP, pilha de VPN ou núcleo sem BGP pelo próprio LSP. Packet Too Big pode ser sobre destino
+  multicast (RFC 4443 §2.4(e.2)).
+- **Taxa por origem:** antes do balde global de `icmp-rate` (100/s), um balde de
+  `icmp-rate-per-source` (padrão 10/s, até 10 000) por endereço que receberia o erro, como o
+  `icmp_ratelimit` por destino do Linux. Uma enxurrada de TTL 1 de um host gasta a parte dele, e
+  o traceroute dos outros continua vendo o salto. A tabela guarda até 4096 origens; as ociosas
+  (um segundo sem erro, balde cheio de novo) saem no máximo uma vez por segundo; cheia de
+  origens ativas (enxurrada com origem forjada), uma origem nova não recebe erro — o balde
+  global estaria vazio de qualquer jeito. `hal/src/lsp/rate.rs`, sem relógio (compila no WASM).
+- **Configuração:** `/mpls settings icmp-too-big` (padrão ligado) e `icmp-rate-per-source`;
+  contadores em `mpls.settings.get` (`icmp_counters`: `too_big` ouvidos, `too_big_sent`,
+  `rate_limited_source` à parte de `rate_limited`, e os motivos de descarte: "fits the way out",
+  "DF not set…"). Janela **MPLS › Settings**, com ⓘ.
+
+### Pesquisa
+
+- **Kernel** (`net/mpls/af_mpls.c`, 6.18.59 da imagem e `master`, lidos): `mpls_forward` confere
+  o TTL (`dec.ttl <= 1`) antes do MTU; `mpls_pkt_too_big` só aceita o pacote maior que o MTU se
+  for GSO e os segmentos couberem (`skb_gso_validate_network_len`); `mpls_dev_mtu` é o `dev->mtu`
+  (não há MTU de MPLS por interface no Linux). No LER de entrada, `mpls_iptunnel.c` declara o
+  `headroom` da pilha no lwtunnel, e o IP já desconta isso do MTU da rota: o `ip_forward` manda o
+  ICMP lá. Só o LSR de trânsito ou penúltimo precisa deste trabalho. O `icmp.c` do Linux não
+  limita "fragmentation needed" (`icmpv4_mask_allow`: "Don't limit PMTU discovery"); aqui ele
+  passa pelos baldes porque cada erro custa uma cópia ao espaço de usuário.
+- **RFC 3032** §3 (sem errata técnica em §3; a única de §3.4 é tipográfica; atualizada por 3443,
+  4182, 5332, 5462, 7274, que não mexem em §3): §3.3 quando é "too big", §3.4 IPv4 (DF: MUST
+  ICMP com o MTU − N; sem DF: MAY descartar ou fragmentar), §3.5 IPv6, §3.6 PMTUD. **RFC 1191**
+  §4 (Next-Hop MTU), **RFC 8201** (PMTUD IPv6), **RFC 4443** §3.2 e §2.4(e), **RFC 4884** §4.1,
+  **RFC 4950** (o objeto vai em time exceeded e destination unreachable), **RFC 1812** §4.3.2.8
+  (limitar erros ICMP).
+- **MikroTik RouterOS v7:** `/mpls interface mpls-mtu` (padrão 1508, ≤ L2MTU) e o ICMP "need
+  fragmentation" que imita o IP, comutado até o fim do LSP; recomenda o mesmo MPLS MTU em todo
+  o núcleo ([wiki MPLS](https://wiki.mikrotik.com/wiki/MPLS),
+  [help.mikrotik.com](https://help.mikrotik.com/docs/x/KwCiBQ)). `/ip settings icmp-rate-limit`
+  limita os erros do roteador.
+- **Cisco IOS:** `mpls mtu` por interface; pacote rotulado com DF maior que ele é descartado e o
+  "frag needed" segue pelo LSP (log `MPLS: ICMP: dst frag. needed and DF set unreachable sent`,
+  [fórum](https://community.cisco.com/t5/mpls/mpls-df-bit-set/m-p/2499658),
+  [MPLS Fundamentals](https://www.oreilly.com/library/view/mpls-fundamentals/1587051974/1587051974_ch03lev1sec6.html)).
+  **Junos:** o erro de MTU em pacote rotulado de VPN só com `icmp-tunnelling` em `protocols mpls`
+  ([Feature Explorer](https://apps.juniper.net/feature-explorer/feature/8329), 23.4R1).
+  **Nokia SR OS:** `icmp-tunneling` também. Relatos de PMTUD em núcleo MPLS:
+  [lostintransit](https://lostintransit.se/2024/09/11/pmtud-in-mpls-enabled-networks/).
+- **Adotado:** a conta exata do kernel (o erro só sai quando ele de fato descarta), o MTU
+  informado pela RFC 3032 §3.4 (menos a pilha que chegou; contra o CHR, com o CoreRouter fazendo
+  PHP, o R3 recebe `mtu = 1396` e, como entrada Linux, tira o próprio rótulo e manda 1392) e a
+  mesma regra de volta do time exceeded.
+- **Melhor que os outros:** limite por origem antes do global, contadores com o motivo de cada
+  descarte, e o filtro que só copia o que pode ser grande demais (nenhuma cópia com MTU igual).
+- **Ficou de fora:** fragmentar IPv4 sem DF no LSR (§3.4 3.a: o kernel descarta, a RFC permite;
+  fragmentar em espaço de usuário seria caminho de dados lento); `mpls-mtu` por interface como o
+  RouterOS (o Linux usa o `dev->mtu`; precisaria de patch no kernel); e um GSO grande que chegue
+  por veth é copiado e cai em "fits the way out" (o BPF clássico não vê o `gso_size`; o tap em
+  eBPF da G3.9db vê).
+
+### Desempenho e paralelismo
+
+- **Por pacote no caminho de dados:** duas instruções a mais no filtro (comprimento e comparação)
+  para quadro que não é TTL ≤ 1 nem explicit null; nenhuma cópia enquanto o quadro couber na
+  menor saída. **Medido** (VM `corerouter-lab`, 4 vCPU, kernel 6.18, build release,
+  2026-10-29, `benches/netns_mpls_ttl.rs`, quadros MPLS de 64 octetos num núcleo): sem taps
+  2,083 Melem/s (2,080 no fim da rodada); os três taps do respondedor 1,633; com o filtro de
+  "grande demais" ligado 1,644. O filtro novo não custa nada mensurável; o custo dos taps
+  `AF_PACKET` (~21%) é o que a G3.9db tira.
+- **Recalcular o limiar:** O(rótulos) quando a tabela é relida (no máximo uma vez por segundo, já
+  era o custo da releitura), na thread do serviço.
+- **Por erro:** `too_big::answer` é uma busca no `BTreeMap` de rótulos e a montagem do pacote,
+  como o time exceeded (~0,6–0,8 µs, medido na G3.9d). A taxa por origem é uma busca num
+  `HashMap` de no máximo 4096 entradas, antes de qualquer trabalho.
+- **Thread:** a mesma do serviço `lsp-ping`; um núcleo a mais só dividiria os baldes (que teriam
+  de ser compartilhados com lock). O que cresce com a carga é a cópia do kernel, limitada pelo
+  `SO_RCVBUF`.
+
+
+## Tap do respondedor em eBPF (G3.9db)
+
+Os três sockets `AF_PACKET` do respondedor (MPLS, IPv4 e IPv6, sem bind) faziam o kernel entrar no
+`packet_rcv` com o filtro em todo quadro desses protocolos no host: ~21% da troca de rótulos num
+núcleo, **medido** (seção acima). O tap agora é um classificador tc na entrada de cada interface
+em que o respondedor ouve (`lsp_tap`, no objeto do `dataplane-ebpf`).
+
+### Como funciona
+
+- **Decisão:** a mesma dos filtros clássicos, num código só (`dataplane-ebpf-common/src/lsp_tap.rs`,
+  sem `unsafe`, testado no host): MPLS com TTL ≤ 1 ou explicit null, MPLS maior que o limiar de
+  "grande demais" da G3.9da (agora sem GSO: o tc vê o `gso_size`), UDP 3503 para 127/8 ou
+  `::1`/`::ffff:127.0.0.0/104`. Um teste fixo e um proptest conferem quadro a quadro que o tc e
+  os filtros clássicos guardam os mesmos quadros e cortam no mesmo tamanho.
+- **Entrega:** o quadro candidato vai para um ring buffer (`LSP_TAP`, 1 MiB) com a interface e o
+  comprimento; o programa devolve sempre `TC_ACT_OK`, então o quadro segue para o `mpls_rcv` /
+  `ip_rcv` como antes. Ring cheio conta em `LSP_TAP_STATS` (por CPU) e não atrasa o quadro.
+- **Carga:** à parte do caminho de XDP/CGNAT (`hal-linux/src/lsp/ebpf.rs`): o mesmo objeto, com
+  todos os outros mapas no tamanho mínimo, `clsact` criado se faltar e o programa preso no
+  ingress (tcx no kernel ≥ 6.6, que aceita vários programas por interface). Fail-open: o kernel
+  solta o programa se o daemon morre. Sem `CAP_BPF`/root ou com kernel antigo, volta aos sockets;
+  `$COREROUTER_LSP_TAP=packet|ebpf` força um. `lsp_ping_counters.tap` diz qual ouve, quantos
+  quadros o tc copiou e perdeu, e o limiar de "grande demais".
+
+### Pesquisa
+
+- **Kernel** (`net/core/dev.c`, 6.18.59, lido): `__netif_receive_skb_core` entrega aos taps
+  `ptype_all` primeiro, roda o ingress de tc (`sch_handle_ingress` → `tcx_run`/`tc_run`, linhas
+  4457–4485 e 6024) e só depois a `ptype_base`/`ptype_specific` (linhas 6117–6136), onde estavam os
+  sockets do respondedor e onde está o `mpls_rcv`. Com o tc, nenhum socket fica nessas listas e o
+  `packet_rcv` sai do caminho; o custo vira o de rodar um programa BPF curto.
+- **XDP ou tc:** o XDP rodaria antes de existir o skb, mas não vê o `gso_size` (o caso do GSO
+  grande por veth), nas interfaces sem XDP nativo seria genérico (com skb, o mesmo custo do tc) e
+  disputaria a interface com o programa de XDP do CGNAT/firewall (um programa XDP por interface).
+  O tcx aceita vários programas no ingress. Ficou o tc.
+- **aya 0.14 / aya-ebpf 0.2.1:** ring buffer (`RingBuf::reserve_bytes`, tamanho constante),
+  `SchedClassifier` com tcx. `TcContext::load_bytes` limita o tamanho de novo por `skb->len`, que
+  o verificador do 6.18 vê sem limite inferior (`R4 invalid zero-sized read`, **medido** na VM):
+  a cópia chama o `bpf_skb_load_bytes` direto, com o tamanho em 1..N (bloco `unsafe` 38 em
+  `docs/xdp.md`).
+- **Outros:** o RouterOS e os roteadores de mercado respondem LSP ping e ICMP no plano de
+  controle por punt de hardware; o Linux não tem o equivalente para o MPLS, e o tap tc é a forma
+  sem patch de kernel de ver só o que precisa.
+
+### Desempenho e paralelismo
+
+- **Medido** (VM `corerouter-lab`, 4 vCPU, kernel 6.18, release, 2026-10-30,
+  `hal-linux/benches/netns_mpls_ttl.rs`, MPLS de 64 octetos num núcleo, duas rodadas de 15 s por
+  caso):
+
+  | caso | rodada 1 (Melem/s) | rodada 2 (Melem/s) |
+  |---|---|---|
+  | sem taps (início / fim da rodada) | 1,715 / 1,747 | 2,039 / 1,751 |
+  | taps `AF_PACKET` (antes) | 1,476 | 1,462 |
+  | tap tc | 1,844 | 1,986 |
+  | tap tc com "grande demais" | 1,837 | 1,756 |
+
+  O tap tc fica dentro da faixa do "sem taps" em cada rodada (a VM compartilhada varia até 15%
+  entre início e fim); os sockets `AF_PACKET` ficam abaixo dela nas duas.
+- **Por pacote:** um programa de ~250 instruções (o quadro comum sai em poucas dezenas) que lê no
+  máximo 60 octetos; cópia só do candidato. Nada cresce com o número de rótulos ou de interfaces.
+- **Núcleos:** o tc roda no núcleo que recebe o quadro (sem lock; a estatística é por CPU), e o
+  ring buffer é um só, consumido pela thread do serviço `lsp-ping` — o volume que chega a ela é
+  o de candidatos, limitado pelos baldes de ICMP. Um ring por CPU só ajudaria com milhões de
+  candidatos por segundo, o que não é tráfego de plano de controle.

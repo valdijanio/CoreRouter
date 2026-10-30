@@ -22,9 +22,15 @@ use corerouter_sysupdate::efi::Vars;
 use crate::plan::{self, Backoff, BootOptions, Mode};
 
 /// One line on the console (the kernel gives PID 1 `/dev/console` as fds
-/// 0–2). Never panics, unlike `eprintln!`.
+/// 0–2) and in the kernel's log (G1.29f): the daemon's OS log reader takes
+/// it from there to `log.os.print` and the router's log, where an operator
+/// looks; a VM's serial console is a pty nobody reads. Never panics, unlike
+/// `eprintln!`. Opened per line: PID 1 logs a few lines an hour.
 fn log(msg: &str) {
     let _ = writeln!(std::io::stderr(), "corerouter-init: {msg}");
+    if let Ok(mut k) = OpenOptions::new().write(true).open("/dev/kmsg") {
+        let _ = k.write_all(&plan::kmsg_record(msg));
+    }
 }
 
 macro_rules! log {

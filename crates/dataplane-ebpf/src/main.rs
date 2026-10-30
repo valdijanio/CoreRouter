@@ -37,13 +37,13 @@ use aya_ebpf::bindings::{
     bpf_fib_lookup__bindgen_ty_4, bpf_fib_lookup__bindgen_ty_5, xdp_action,
 };
 use aya_ebpf::helpers::{
-    bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect, bpf_skb_change_head, bpf_skb_set_tstamp,
-    bpf_xdp_adjust_head,
+    bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect, bpf_skb_change_head, bpf_skb_load_bytes,
+    bpf_skb_set_tstamp, bpf_xdp_adjust_head,
 };
 use aya_ebpf::macros::{classifier, map, xdp};
 use aya_ebpf::maps::lpm_trie::Key;
 use aya_ebpf::maps::{
-    Array, HashMap, LpmTrie, LruHashMap, LruPerCpuHashMap, PerCpuArray, PerCpuHashMap,
+    Array, HashMap, LpmTrie, LruHashMap, LruPerCpuHashMap, PerCpuArray, PerCpuHashMap, RingBuf,
 };
 use aya_ebpf::programs::{TcContext, XdpContext};
 use core::intrinsics::AtomicOrdering;
@@ -55,6 +55,7 @@ use corerouter_dataplane_ebpf_common::maps::{self as m, Counter, Top};
 use corerouter_dataplane_ebpf_common::packet::Packet;
 use corerouter_dataplane_ebpf_common::parse::{Addr, ETH_HLEN, IpInfo};
 use corerouter_dataplane_ebpf_common::ipoe;
+use corerouter_dataplane_ebpf_common::lsp_tap::{self, Keep};
 use corerouter_dataplane_ebpf_common::policer;
 use corerouter_dataplane_ebpf_common::queue;
 use corerouter_dataplane_ebpf_common::shaper;
@@ -1318,6 +1319,105 @@ pub fn bng_egress(ctx: TcContext) -> i32 {
     // SAFETY: a BPF helper taking the access port from the session map and
     // no flags (to its egress, where the shaper runs).
     unsafe { bpf_redirect(d.ifindex, 0) as i32 }
+}
+
+// --- G3.9db: the LSP responder's tap ---------------------------------------
+//
+// `lsp_tap` (clsact ingress of each interface the `lsp-ping` service
+// listens on) copies the frames `lsp_tap::keep` picks — expired or
+// explicit-null MPLS, maybe-too-big MPLS, echo requests to 127/8 and ::1 —
+// to the `LSP_TAP` ring buffer and lets every frame go on. It replaces the
+// service's three `AF_PACKET` taps, whose `packet_rcv` ran for every frame
+// of the host (G3.9d: −19% of MPLS switching on one core).
+
+#[map(name = "LSP_TAP")]
+static LSP_TAP: RingBuf = RingBuf::with_byte_size(m::LSP_TAP_BYTES, 0);
+#[map(name = "LSP_TAP_SET")]
+static LSP_TAP_SET: Array<u64> = Array::with_max_entries(1, 0);
+#[map(name = "LSP_TAP_STATS")]
+static LSP_TAP_STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(lsp_tap::Stat::SLOTS, 0);
+
+#[inline(always)]
+fn tap_stat(what: lsp_tap::Stat) {
+    if let Some(c) = LSP_TAP_STATS.get_ptr_mut(what as u32) {
+        // SAFETY: this CPU's copy of a per-CPU array slot the kernel
+        // returned (valid for the run; tc runs without migration, so no
+        // other writer).
+        unsafe { *c += 1 };
+    }
+}
+
+/// One record of `N` octets of frame: the header, then the frame's first
+/// `want` octets (at most `N`). `false`: the ring buffer is full.
+#[inline(always)]
+fn tap_copy<const N: usize>(ctx: &TcContext, ifindex: u32, len: u32, want: usize) -> bool {
+    let Some(mut r) = LSP_TAP.reserve_bytes(lsp_tap::HEADER + N, 0) else {
+        return false;
+    };
+    // At least one octet: the verifier refuses a load that may be empty.
+    // `black_box`: LLVM would drop the bound it proved elsewhere and reload
+    // the length from the context, where the verifier no longer has it.
+    // The helper itself, not `TcContext::load_bytes`: that one caps the
+    // length again by `skb->len`, reloaded with no lower bound.
+    let take = core::hint::black_box(want).clamp(1, N);
+    let n = match r
+        .get_mut(lsp_tap::HEADER..)
+        .and_then(|d| d.get_mut(..take))
+    {
+        Some(d) => {
+            // SAFETY: `d` is `take` writable octets of the record this
+            // program reserved (1 ≤ take ≤ N, the slice checked it); the
+            // helper writes at most `take` there and fails, writing
+            // nothing we read, past the end of the packet.
+            let ret = unsafe {
+                bpf_skb_load_bytes(ctx.skb.skb.cast(), 0, d.as_mut_ptr().cast(), take as u32)
+            };
+            if ret == 0 { take as u32 } else { 0 }
+        }
+        None => 0,
+    };
+    let mut head = [0u8; lsp_tap::HEADER];
+    for (i, w) in [ifindex, len, n].into_iter().enumerate() {
+        if let Some(d) = head.get_mut(i * 4..i * 4 + 4) {
+            for (b, v) in d.iter_mut().zip(w.to_le_bytes()) {
+                *b = v;
+            }
+        }
+    }
+    if let Some(h) = r.get_mut(..lsp_tap::HEADER)
+        && let Ok(h) = <&mut [u8; lsp_tap::HEADER]>::try_from(h)
+    {
+        *h = head;
+    }
+    r.submit(0);
+    true
+}
+
+/// The LSP responder's tap (clsact ingress).
+#[classifier]
+pub fn lsp_tap(ctx: TcContext) -> i32 {
+    // Headers in the linear part (the decision reads 58 octets at most);
+    // a frame that has them already costs no helper call.
+    const HEAD: usize = 14 + 4 + 40 + 2;
+    let len = ctx.len();
+    if ctx.data_end() - ctx.data() < HEAD.min(len as usize) {
+        let _ = ctx.pull_data(HEAD.min(len as usize) as u32);
+    }
+    // SAFETY: reading two fields of this program's own `__sk_buff`.
+    let (ifindex, gso) = unsafe { ((*ctx.skb.skb).ifindex, (*ctx.skb.skb).gso_size != 0) };
+    let set = lsp_tap::Settings::from_word(LSP_TAP_SET.get(0).copied().unwrap_or(0));
+    let k = lsp_tap::keep(&Skb(&ctx), len, gso, set);
+    if k == Keep::No {
+        return TC_OK;
+    }
+    let want = lsp_tap::copied(k, len);
+    let ok = if want <= lsp_tap::SMALL {
+        tap_copy::<{ lsp_tap::SMALL }>(&ctx, ifindex, len, want)
+    } else {
+        tap_copy::<{ lsp_tap::FRAME }>(&ctx, ifindex, len, want)
+    };
+    tap_stat(if ok { lsp_tap::Stat::Kept } else { lsp_tap::Stat::Full });
+    TC_OK
 }
 
 /// Kernel-side license string. This crate is GPL-2.0-or-later (the rest of

@@ -188,10 +188,13 @@ ros() { curl -sf -m 10 -u "admin:$PW" "http://$ROS/rest/$1"; }
 # rospost <path> <json>: POST /rest/<path> (monitor, print with options).
 rospost() { curl -s -m 20 -u "admin:$PW" -H 'content-type: application/json' -d "$2" "http://$ROS/rest/$1"; }
 rosx() {
+  # `as-string`: run it and wait. Without it /rest/execute starts a background
+  # job and returns, so two calls in a row race (a client enabled before the
+  # set that came first; the same race the L2 script hit with its VLANs).
   local out
-  out=$(jq -n --arg s "$1" '{script: $s}' |
-    curl -s -m 30 -u "admin:$PW" -H 'content-type: application/json' -d @- "http://$ROS/rest/execute")
-  if echo "$out" | jq -e 'type == "object" and has("error")' >/dev/null 2>&1; then
+  out=$(jq -n --arg s "$1" '{script: $s, "as-string": true}' |
+    curl -s -m 60 -u "admin:$PW" -H 'content-type: application/json' -d @- "http://$ROS/rest/execute")
+  if echo "$out" | jq -e 'type == "object" and (has("error") or ((.ret // "") | test("failure:|syntax error|bad command|no such item|expected end of command")))' >/dev/null 2>&1; then
     echo "RouterOS refused: $out" >&2
     return 1
   fi
@@ -287,6 +290,10 @@ pc_down() { pc_set "$1" disabled=yes; }
 pc_del() { rosx "/interface pppoe-client remove [find name=$1]" >/dev/null 2>&1 || true; }
 pc_running() { [ "$(ros "interface/pppoe-client?name=$1" | jq -r '.[0].running // "false"')" = true ]; }
 pc_not_running() { ! pc_running "$1"; }
+# The CHR redials within a second of a PADT, faster than a running=false poll
+# catches; its link-downs counter does not miss the drop.
+pc_downs() { ros "interface?name=$1" | jq -r '.[0]."link-downs" // "0"'; }
+pc_went_down() { [ "$(pc_downs "$1")" -gt "$2" ] || pc_not_running "$1"; }
 pc_mon() { rospost interface/pppoe-client/monitor "{\"numbers\":\"$1\",\"once\":\"\"}" | jq -c '.[0] // {}'; }
 cr_row() { cli ppp.active.list "{\"find\":\"$1\"}" | jq -c --arg n "$1" '[.rows[] | select(.name == $n)][0] // empty'; }
 cr_up() { [ -n "$(cr_row "$1")" ]; }
@@ -491,11 +498,19 @@ case_padt() {
   pc_up c1
   wait_for 30 pc_running c1 >/dev/null && wait_for 10 cr_up cpe1 >/dev/null || { result padt FAIL "no session"; return; }
   # BNG → CPE: ppp.active.remove sends PADT (and LCP Terminate-Request).
-  local id ms; id=$(cr_row cpe1 | jq -r .id)
-  cli ppp.active.remove "{\"id\":\"$id\"}" >/dev/null || cli ppp.active.remove "{\"name\":\"cpe1\"}" >/dev/null || true
-  ms=$(wait_for 20 pc_not_running c1) \
-    && result padt OK "BNG removes the session: CHR saw it down in ${ms} ms (keepalive 60 s, so by Terminate/PADT)" \
-    || result padt FAIL "BNG removed the session, CHR still up after 20 s"
+  local id ms rm before downs; id=$(cr_row cpe1 | jq -r .id); downs=$(pc_downs c1)
+  before=$(cli ppp.active.list '{"find":"cpe1"}' | jq -c '[.rows[] | {id, session_id, uptime_secs}]')
+  timeout 25 tcpdump -i crgv1 -nn -e -l 'pppoed or (pppoes and ppp proto 0xc021)' > "$W/padt-wire.txt" 2>/dev/null &
+  local tcpd=$!; sleep 1
+  rm=$(cli ppp.active.remove "{\"id\":\"$id\"}" 2>&1) || rm=$(cli ppp.active.remove '{"name":"cpe1"}' 2>&1) || true
+  if ms=$(wait_for 20 pc_went_down c1 "$downs"); then
+    result padt OK "BNG removes the session: CHR saw it down in ${ms} ms (keepalive 60 s, so by Terminate/PADT)"
+  else
+    result padt FAIL "BNG removed the session, CHR still up after 20 s"
+    result padt INFO "cpe1 before: $before; remove: ${rm:0:200}; after: $(cli ppp.active.list '{"find":"cpe1"}' | jq -c '[.rows[] | {id, session_id, uptime_secs}]'); CHR c1 $(pc_mon c1 | jq -c '{status, uptime, "session-id"}' 2>/dev/null)"
+  fi
+  kill "$tcpd" 2>/dev/null; wait "$tcpd" 2>/dev/null || true
+  result padt INFO "on the wire after the remove: $(grep -cE 'PADT' "$W/padt-wire.txt") PADT, $(grep -c 'Terminate' "$W/padt-wire.txt") LCP Terminate: $(grep -E 'PADT|Terminate' "$W/padt-wire.txt" | head -4 | tr -s ' ' | cut -c1-160 | paste -sd'|')"
   # RouterOS redials on its own; wait for it, then CPE → BNG.
   wait_for 40 pc_running c1 >/dev/null && wait_for 10 cr_up cpe1 >/dev/null || { result padt INFO "CHR did not redial in 40 s"; pc_up c1; wait_for 30 cr_up cpe1 >/dev/null; }
   local t0; t0=$(now_ms)
@@ -582,7 +597,7 @@ case_multi() {
 "
   done
   rosx "$script" >/dev/null || { result multi FAIL "CHR refused the macvlans/clients (macvlan in this RouterOS?)"; return; }
-  # /rest/execute returns before a long script ends: wait for all the
+  # Belt and braces (rosx used to return before a long script ended): wait for all the
   # clients to exist (enabling earlier caught only m1 and m2).
   wait_for 60 multi_made "$n" >/dev/null || { result multi FAIL "CHR made $(multi_made_count) of $n clients"; return; }
   local base t0 ms; base=$(cr_count)

@@ -51,6 +51,9 @@ pub struct LatePort {
 #[derive(Clone)]
 pub struct VirtualHal {
     ports: Vec<IfName>,
+    /// G1.29d: a USB adapter that stalls: its transmit timeouts grow by one
+    /// a poll while the poll count is in the range.
+    usb_stall: Option<(IfName, std::ops::Range<u64>)>,
     /// Ports plugged in after boot (G1.6t).
     late: Vec<LatePort>,
     applied: Config,
@@ -99,6 +102,12 @@ pub struct VirtualHal {
     shaper: crate::queue::lab::LabShaper,
     /// The lab's neighbor tables (G1.27d).
     neigh: crate::lab_neigh::LabNeigh,
+    /// Ports of the applied config unplugged (G1.3b): a late port outside
+    /// its poll range, at the last apply or seen by `poll` since.
+    absent: std::collections::BTreeSet<IfName>,
+    /// G1.3d: a port replugged between two polls: at this poll it is
+    /// there but a new link (Linux: a new index), without its settings.
+    replug: Option<(IfName, u64)>,
 }
 
 /// A lab port's own settings (G1.26b); `None`: the NIC has no such knob.
@@ -156,10 +165,24 @@ impl std::fmt::Debug for VirtualHal {
 }
 
 impl VirtualHal {
+    /// G1.29d: lab USB adapter `name` stalls for the polls in `polls`.
+    #[must_use]
+    pub fn with_usb_stall(mut self, name: IfName, polls: std::ops::Range<u64>) -> Self {
+        self.usb_stall = Some((name, polls));
+        self
+    }
+
     /// G1.6t: a port plugged in after boot (see [`LatePort`]).
     #[must_use]
     pub fn with_late_port(mut self, port: LatePort) -> Self {
         self.late.push(port);
+        self
+    }
+
+    /// G1.3d: `name` is replugged just before poll `at` (see `replug`).
+    #[must_use]
+    pub fn with_replug(mut self, name: IfName, at: u64) -> Self {
+        self.replug = Some((name, at));
         self
     }
 
@@ -199,6 +222,7 @@ impl VirtualHal {
         };
         Self {
             ports,
+            usb_stall: None,
             late: Vec::new(),
             applied: Config::default(),
             ticks: 0,
@@ -222,6 +246,8 @@ impl VirtualHal {
             oslog: crate::oslog::LabOsLog::default(),
             neigh: crate::lab_neigh::LabNeigh::default(),
             shaper: crate::queue::lab::LabShaper::default(),
+            absent: std::collections::BTreeSet::new(),
+            replug: None,
         }
     }
 
@@ -494,6 +520,7 @@ impl crate::nic::UsbReset for LabUsbReset {
             steps,
             power_cycled: power,
             back: true,
+            back_as: None,
         })
     }
 }
@@ -770,6 +797,7 @@ impl Hal for VirtualHal {
         }
         self.carry(from, to);
         self.neigh.sync(to);
+        self.absent = crate::absent::missing(to, |n| self.late_present(n) != Some(false));
         self.applied = to.clone();
         self.applies = self.applies.saturating_add(1);
         Ok(())
@@ -1020,8 +1048,27 @@ impl Hal for VirtualHal {
         Ok(())
     }
 
+    fn absent_ports(&self) -> Vec<IfName> {
+        self.absent.iter().cloned().collect()
+    }
+
     fn poll(&mut self) -> Vec<LinkState> {
         self.ticks = self.ticks.wrapping_add(1);
+        // G1.3b: a configured port unplugged waits for the next apply.
+        let gone: Vec<IfName> = self
+            .applied
+            .interfaces
+            .keys()
+            .filter(|n| self.late_present(n) == Some(false))
+            .cloned()
+            .collect();
+        self.absent.extend(gone);
+        if let Some((n, at)) = &self.replug
+            && *at == self.ticks
+            && self.applied.interfaces.contains_key(n)
+        {
+            self.absent.insert(n.clone());
+        }
         let mut out: Vec<LinkState> = self
             .applied
             .interfaces
@@ -1185,6 +1232,20 @@ impl Hal for VirtualHal {
         let mut m = sff::decode(&a0, Some(&a2));
         m.notes.push("simulated by the virtual lab".into());
         Ok(m)
+    }
+
+    /// The lab's USB adapters count no transmit timeout, except the one
+    /// set to stall ([`VirtualHal::with_usb_stall`]): one more per poll in
+    /// its range.
+    fn usb_tx_timeouts(&mut self, name: &IfName) -> Option<u64> {
+        LAB_USB
+            .iter()
+            .any(|(p, _)| *p == name.as_str())
+            .then_some(())?;
+        Some(match &self.usb_stall {
+            Some((n, r)) if n == name => self.ticks.min(r.end).saturating_sub(r.start),
+            _ => 0,
+        })
     }
 
     /// The lab's USB adapters ([`LAB_USB`]) recover in simulated time:

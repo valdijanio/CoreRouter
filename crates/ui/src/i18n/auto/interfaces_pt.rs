@@ -11,6 +11,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("disabled", "desativada"),
     ("full duplex", "duplex completo"),
     ("half duplex", "duplex parcial"),
+    ("invalid", "inválida"),
     ("no link", "sem enlace"),
     ("up", "ativa"),
     ("up to 5 min", "até 5 min"),
@@ -18,7 +19,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
 pub(super) const HELP: &[(&str, &str)] = &[
     ("interfaces.columns", "Escolha as colunas exibidas neste dispositivo. O nome permanece visível. Restaurar padrão volta à seleção original. Os comentários em faixa são independentes da coluna Comment."),
     ("interfaces.info", "Relações e informações de diagnóstico conhecidas para esta interface."),
-    ("interfaces.link", "Estado operacional do enlace. Uma interface desabilitada ou desconectada não é necessariamente uma falha."),
+    ("interfaces.link", "Estado operacional do enlace. Uma interface desabilitada ou desconectada não é necessariamente uma falha. **invalid** (flag I): uma porta da configuração que não está nesta máquina (desconectada, um adaptador USB que caiu, uma placa que queimou), ou uma VLAN sobre ela. O resto da configuração está aplicado; a desta interface fica guardada e volta sozinha quando a porta voltar. A Saúde a mostra em Absent ports."),
     ("interfaces.mtu", "Tamanho máximo, em bytes, do pacote IP nesta interface."),
     ("interfaces.name", "Nome da interface usado pelos comandos e pela configuração."),
     ("interfaces.rx", "Total de bytes recebidos desde a última reinicialização dos contadores."),

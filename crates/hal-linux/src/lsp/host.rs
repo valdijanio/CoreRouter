@@ -24,9 +24,9 @@ use nix::sys::socket::{LinkAddr, MsgFlags, bind, recvfrom, send};
 use socket2::{Domain, Protocol, Socket, Type};
 
 use super::{
-    ETH_P_IP, ETH_P_IPV6, ETH_P_MPLS_UC, FrameSpec, IP4_FILTER, IP6_FILTER, MAX_FRAME, MPLS_FILTER,
-    RawFecRoute, build_frame, classify, ether_only, icmp_frame, parse_route, route_request,
-    sock_filter,
+    ETH_HEADER, ETH_P_IP, ETH_P_IPV6, ETH_P_MPLS_UC, FrameSpec, IP4_FILTER, IP6_FILTER, MAX_FRAME,
+    RawFecRoute, build_frame, classify, ether_only, icmp_frame, mpls_filter, parse_route,
+    route_request, sock_filter,
 };
 use crate::neigh::nlmsg_header;
 
@@ -100,11 +100,15 @@ impl Links {
                 e.addrs.push(IpAddr::V6(v6.ip()));
             }
         }
-        for (name, l) in &mut by_name {
-            l.mtu = std::fs::read_to_string(format!("/sys/class/net/{name}/mtu"))
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .map(|m| u16::try_from(m).unwrap_or(u16::MAX));
+        // By netlink, not sysfs: `/sys` shows the namespace that mounted
+        // it, not the one this thread is in (a responder moved by `setns`).
+        let mtus: HashMap<u32, u32> = crate::netlink::links()
+            .map(|all| all.into_iter().map(|l| (l.index, l.mtu)).collect())
+            .unwrap_or_default();
+        for l in by_name.values_mut() {
+            l.mtu = mtus
+                .get(&l.index)
+                .map(|m| u16::try_from(*m).unwrap_or(u16::MAX));
         }
         self.by_index = by_name.iter().map(|(n, l)| (l.index, n.clone())).collect();
         self.by_name = by_name;
@@ -530,6 +534,10 @@ pub struct HostView {
     locals: Vec<IpAddr>,
     fecs: RefCell<HashMap<IpNet, Cached>>,
     routes: RefCell<Option<Routes>>,
+    /// The longest MPLS frame payload every way out of the label table
+    /// takes (G3.9da): longer ones may be too big. `None`: no label
+    /// leaves by a link of known MTU.
+    way_out: Option<u32>,
 }
 
 impl HostView {
@@ -542,12 +550,14 @@ impl HostView {
             locals: Vec::new(),
             fecs: RefCell::new(HashMap::new()),
             routes: RefCell::new(Routes::open().ok()),
+            way_out: None,
         }
     }
 
     /// Read again what is older than a second.
     fn refresh(&mut self) {
-        if self.labels_at.is_none_or(|t| t.elapsed() >= FRESH) {
+        let labels_old = self.labels_at.is_none_or(|t| t.elapsed() >= FRESH);
+        if labels_old {
             self.labels_at = Some(Instant::now());
             if let Some(r) = self.reader.as_mut()
                 && crate::mpls::available()
@@ -559,9 +569,29 @@ impl HostView {
                 self.labels.clear();
             }
         }
-        if self.links.refresh() {
+        let links_changed = self.links.refresh();
+        if links_changed {
             self.links_changed();
         }
+        if labels_old || links_changed {
+            self.way_out = self.way_out();
+        }
+    }
+
+    /// The kernel's check (`mpls_forward`): the packet under the top
+    /// label must fit the link MTU minus the labels pushed, so the frame
+    /// payload (with the top label) may be the MTU − 4 × pushed + 4. The
+    /// smallest over the table: O(labels), once a second at most.
+    fn way_out(&self) -> Option<u32> {
+        self.labels
+            .values()
+            .flat_map(|r| r.nexthops.iter())
+            .filter_map(|nh| {
+                let mtu = u32::from(self.links.by_name.get(nh.interface.as_ref()?)?.mtu?);
+                let pushed = u32::try_from(nh.out_labels.len()).ok()?;
+                Some((mtu + 4).saturating_sub(4 * pushed))
+            })
+            .min()
     }
 
     /// Read the links now (the interfaces to listen on changed).
@@ -625,19 +655,43 @@ impl LsrView for HostView {
     }
 }
 
-/// The three packet sockets (MPLS, IPv4, IPv6), for the whole host: the
-/// frame's `sll_ifindex` says which interface, checked against the MPLS
-/// ones after the copy.
+/// How the responder hears frames.
 ///
-/// G3.9d, **medido**: a socket bound to one interface sits on that
-/// device's `ptype_specific` list, which the kernel walks after
-/// `ptype_base`; `mpls_rcv` / `ip_rcv` then get the frame shared with the
-/// tap and clone it (`skb_share_check`) for every packet: MPLS switching
-/// fell from 1.20 to 0.90 Mpps with the taps on the port
-/// (`benches/netns_mpls_ttl.rs`). Unbound, the tap is on `ptype_base`
-/// ahead of them, its filter runs and lets the frame go first: no clone.
-struct Taps {
-    socks: Vec<Socket>,
+/// - **tc (G3.9db):** the `lsp_tap` classifier on the ingress of each MPLS
+///   interface (`ebpf.rs`), the default where eBPF loads (root, kernel
+///   5.8+ for the ring buffer).
+/// - **Packet sockets (G3.5b–G3.9da):** three of them (MPLS, IPv4, IPv6),
+///   for the whole host: the frame's `sll_ifindex` says which interface,
+///   checked against the MPLS ones after the copy. G3.9d, **medido**: a
+///   socket bound to one interface sits on that device's `ptype_specific`
+///   list, which the kernel walks after `ptype_base`; `mpls_rcv` /
+///   `ip_rcv` then get the frame shared with the tap and clone it
+///   (`skb_share_check`) for every packet: MPLS switching fell from 1.20
+///   to 0.90 Mpps with the taps on the port (`benches/netns_mpls_ttl.rs`).
+///   Unbound, the tap is on `ptype_base` ahead of them, its filter runs
+///   and lets the frame go first: no clone, but still a `packet_rcv` per
+///   frame (−19%), which the tc tap removes.
+enum Taps {
+    Ebpf(Box<super::ebpf::EbpfTap>),
+    Packet(Vec<Socket>),
+}
+
+/// `$COREROUTER_LSP_TAP`: `packet` keeps the packet sockets, `ebpf` wants
+/// the tc tap (an error if it cannot load); unset, the tc tap where it
+/// loads ([`TapChoice::Auto`]).
+const TAP_ENV: &str = "COREROUTER_LSP_TAP";
+
+/// Which tap [`HostResponder`] opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TapChoice {
+    /// The tc tap where it loads, else packet sockets; `$COREROUTER_LSP_TAP`
+    /// decides when set.
+    #[default]
+    Auto,
+    /// The tc tap or nothing.
+    Ebpf,
+    /// The packet sockets.
+    Packet,
 }
 
 fn tap(ethertype: u16, prog: &[super::Insn]) -> io::Result<Socket> {
@@ -675,6 +729,13 @@ pub struct HostResponder {
     /// ICMP errors along an LSP: frames to the next hop's MAC.
     packet: HashMap<IfName, Socket>,
     neighbors: Neighbors,
+    /// Hear packets too big for their way out (G3.9da).
+    too_big: bool,
+    /// The frame length the MPLS tap's filter keeps above, as attached.
+    big: Option<u32>,
+    /// Why the tc tap is not used, when it is not.
+    fallback: Option<String>,
+    choice: TapChoice,
 }
 
 /// An `IPPROTO_RAW` socket: the packet carries its own IP header
@@ -728,7 +789,98 @@ impl HostResponder {
             raw6: None,
             packet: HashMap::new(),
             neighbors: Neighbors::default(),
+            too_big: false,
+            big: None,
+            fallback: None,
+            choice: TapChoice::Auto,
         })
+    }
+
+    /// Open this tap instead of the default (before
+    /// [`LspResponderIo::set_interfaces`]).
+    pub fn with_tap(mut self, choice: TapChoice) -> Self {
+        self.choice = choice;
+        self
+    }
+
+    /// Which tap hears frames now: `tc` (G3.9db), `packet` with why the tc
+    /// one is not used, or `none` before an interface is listened on.
+    pub fn tap_kind(&self) -> String {
+        let kind = match (&self.taps, &self.fallback) {
+            (Some(Taps::Ebpf(t)), _) => {
+                let (kept, full) = t.stats();
+                format!("tc ({kept} copied, {full} lost to a full ring)")
+            }
+            (Some(Taps::Packet(_)), Some(why)) => format!("packet ({why})"),
+            (Some(Taps::Packet(_)), None) => "packet".to_owned(),
+            (None, _) => "none".to_owned(),
+        };
+        match self.big {
+            Some(b) => format!("{kind}, too big above {b} octets"),
+            None => kind,
+        }
+    }
+
+    /// The tc tap, else the packet sockets.
+    fn open_taps(&mut self) -> Result<Taps, String> {
+        let want = match self.choice {
+            TapChoice::Auto => std::env::var(TAP_ENV).unwrap_or_default(),
+            TapChoice::Ebpf => "ebpf".to_owned(),
+            TapChoice::Packet => "packet".to_owned(),
+        };
+        if want != "packet" {
+            match super::ebpf::EbpfTap::open() {
+                Ok(t) => {
+                    self.fallback = None;
+                    return Ok(Taps::Ebpf(Box::new(t)));
+                }
+                Err(e) if want == "ebpf" => return Err(e),
+                Err(e) => self.fallback = Some(e),
+            }
+        } else {
+            self.fallback = Some(format!("{TAP_ENV}=packet"));
+        }
+        [
+            // First: `sync_filter` replaces its program.
+            (ETH_P_MPLS_UC, super::MPLS_FILTER),
+            (ETH_P_IP, IP4_FILTER),
+            (ETH_P_IPV6, IP6_FILTER),
+        ]
+        .iter()
+        .map(|(t, p)| tap(*t, p))
+        .collect::<io::Result<Vec<Socket>>>()
+        .map(Taps::Packet)
+        .map_err(|e| e.to_string())
+    }
+
+    /// The MPLS tap's filter for what the view knows now (G3.9da): it
+    /// changes when a link MTU or the label table does, at most once a
+    /// second; replacing a filter is atomic for the socket.
+    fn sync_filter(&mut self) {
+        let want = if self.too_big {
+            self.view
+                .way_out
+                .map(|w| w.saturating_add(ETH_HEADER as u32))
+        } else {
+            None
+        };
+        match &mut self.taps {
+            Some(Taps::Ebpf(t)) => {
+                t.set_big(want);
+                self.big = t.big();
+            }
+            Some(Taps::Packet(socks)) => {
+                if let Some(mpls) = socks.first()
+                    && want != self.big
+                    && mpls
+                        .attach_filter(&sock_filter(&ether_only(&mpls_filter(want))))
+                        .is_ok()
+                {
+                    self.big = want;
+                }
+            }
+            None => {}
+        }
     }
 
     fn send_ip(&mut self, icmp: &Icmp) -> Result<(), HalError> {
@@ -818,36 +970,49 @@ impl LspResponderIo for HostResponder {
         }
         if self.listen.is_empty() {
             self.taps = None;
-        } else if self.taps.is_none() {
-            let socks: io::Result<Vec<Socket>> = [
-                (ETH_P_MPLS_UC, MPLS_FILTER),
-                (ETH_P_IP, IP4_FILTER),
-                (ETH_P_IPV6, IP6_FILTER),
-            ]
-            .iter()
-            .map(|(t, p)| tap(*t, p))
-            .collect();
-            match socks {
-                Ok(socks) => self.taps = Some(Taps { socks }),
-                Err(e) => {
-                    failed.extend(self.listen.drain(..).map(|n| (n, e.to_string())));
+        } else {
+            if self.taps.is_none() {
+                self.big = None;
+                match self.open_taps() {
+                    Ok(t) => self.taps = Some(t),
+                    Err(e) => failed.extend(self.listen.drain(..).map(|n| (n, e.clone()))),
                 }
             }
+            if let Some(Taps::Ebpf(t)) = &mut self.taps {
+                failed.extend(t.listen(&self.listen));
+            }
         }
+        self.sync_filter();
         failed
+    }
+
+    fn tap(&self) -> String {
+        self.tap_kind()
+    }
+
+    fn hear_too_big(&mut self, on: bool) {
+        self.too_big = on;
+        self.view.refresh();
+        self.sync_filter();
     }
 
     fn recv(&mut self, wait: Duration) -> Result<Option<Frame>, HalError> {
         if let Some(h) = self.queue.pop_front() {
             return Ok(Some(h));
         }
+        // Before the wait too: a frame the filter does not keep yet (a
+        // new label, an MTU changed) wakes nothing (G3.9da).
+        self.view.refresh();
+        self.sync_filter();
         let ms = u16::try_from(wait.as_millis().min(1000)).unwrap_or(1000);
-        let mut fds: Vec<PollFd<'_>> = self
-            .taps
-            .iter()
-            .flat_map(|t| t.socks.iter())
-            .map(|s| PollFd::new(s.as_fd(), PollFlags::POLLIN))
-            .collect();
+        let mut fds: Vec<PollFd<'_>> = match &self.taps {
+            Some(Taps::Ebpf(t)) => vec![PollFd::new(t.fd(), PollFlags::POLLIN)],
+            Some(Taps::Packet(socks)) => socks
+                .iter()
+                .map(|s| PollFd::new(s.as_fd(), PollFlags::POLLIN))
+                .collect(),
+            None => Vec::new(),
+        };
         fds.push(PollFd::new(self.udp4.as_fd(), PollFlags::POLLIN));
         if poll(&mut fds, PollTimeout::from(ms)).map_err(|e| io_hal("poll", e))? == 0 {
             return Ok(None);
@@ -855,25 +1020,50 @@ impl LspResponderIo for HostResponder {
         drop(fds);
         self.drain_udp();
         self.view.refresh();
-        for s in self.taps.iter().flat_map(|t| t.socks.iter()) {
-            for _ in 0..RECV_BUDGET {
-                let (n, from) = match recvfrom::<LinkAddr>(s.as_raw_fd(), &mut self.buf) {
-                    Ok(got) => got,
-                    Err(_) => break,
-                };
-                let Some(name) = from
-                    .and_then(|l| u32::try_from(l.ifindex()).ok())
-                    .and_then(|i| self.view.links.by_index.get(&i))
-                    .filter(|n| self.listen.contains(n))
-                else {
-                    continue;
-                };
-                if let Some(h) = self.buf.get(..n).and_then(|f| classify(f, name))
-                    && self.queue.len() < RECV_BUDGET * 4
-                {
-                    self.queue.push_back(h);
+        self.sync_filter();
+        let big = self
+            .big
+            .map(|b| b.saturating_sub(ETH_HEADER as u32) as usize);
+        let Self {
+            taps,
+            view,
+            listen,
+            queue,
+            buf,
+            ..
+        } = self;
+        let mut heard = |ifindex: u32, frame: &[u8]| {
+            let Some(name) = view
+                .links
+                .by_index
+                .get(&ifindex)
+                .filter(|n| listen.contains(n))
+            else {
+                return;
+            };
+            if let Some(h) = classify(frame, name, big)
+                && queue.len() < RECV_BUDGET * 4
+            {
+                queue.push_back(h);
+            }
+        };
+        match taps {
+            Some(Taps::Ebpf(t)) => t.drain(&mut heard),
+            Some(Taps::Packet(socks)) => {
+                for s in socks.iter() {
+                    for _ in 0..RECV_BUDGET {
+                        let Ok((n, from)) = recvfrom::<LinkAddr>(s.as_raw_fd(), buf) else {
+                            break;
+                        };
+                        if let Some(i) = from.and_then(|l| u32::try_from(l.ifindex()).ok())
+                            && let Some(f) = buf.get(..n)
+                        {
+                            heard(i, f);
+                        }
+                    }
                 }
             }
+            None => {}
         }
         Ok(self.queue.pop_front())
     }

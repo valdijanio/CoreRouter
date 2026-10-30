@@ -180,6 +180,8 @@ mod cpu_tuning;
 #[cfg(target_os = "linux")]
 pub mod oslog;
 
+/// Link events (G1.3d): ports replugged between two polls.
+pub mod link_events;
 /// Neighbor tables over rtnetlink (G1.27d): dump, events, static entries.
 pub mod neigh;
 
@@ -201,10 +203,11 @@ pub mod xdp_nat;
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::OnceLock;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use corerouter_hal::absent;
     use corerouter_hal::drift::{LinkSnap, Snapshot};
     use corerouter_hal::tuning::{CpuTuning, KernelStats, PortTuning, Sysctls, SystemInfo};
     use corerouter_hal::{
@@ -252,6 +255,17 @@ mod linux {
         xdp: crate::xdp::XdpState,
         /// Static ARP entries and ARP modes applied (G1.27d).
         neigh: crate::neigh::Applied,
+        /// Physical ports of the applied config that the kernel does not
+        /// have (G1.3b): left out of the last apply, or seen gone by `poll`
+        /// since. The next apply puts their configuration back if they
+        /// returned.
+        absent: BTreeSet<IfName>,
+        /// The kernel index of each claimed physical port when it got its
+        /// configuration (G1.3d). A port gone and back between two polls
+        /// (a fast replug, a USB driver reset) has the same name and a new
+        /// index, never reused (`dev_index_reserve` in net/core/dev.c
+        /// allocates them cyclically up to 2^31), and none of its settings.
+        indices: BTreeMap<IfName, u32>,
     }
 
     impl LinuxHal {
@@ -650,32 +664,19 @@ mod linux {
         }
     }
 
-    impl Hal for LinuxHal {
-        fn describe(&self) -> String {
-            "linux (rtnetlink)".into()
-        }
-
-        /// Managed ports only (`owner` rules 6–8); everything else is in
-        /// `poll`, marked unmanaged.
-        fn discover_links(&mut self) -> Result<Vec<LinkInfo>, HalError> {
-            Ok(self
-                .view(&self.claims)?
+    impl LinuxHal {
+        /// Every link name of the kernel with its index (one dump).
+        fn link_names(&self) -> Result<BTreeMap<String, u32>, HalError> {
+            Ok(crate::netlink::links()?
                 .into_iter()
-                .filter(|(l, o)| *o == Owner::Managed && l.arphrd != owner::ARPHRD_LOOPBACK)
-                .filter_map(|(l, _)| {
-                    Some(LinkInfo {
-                        name: l.name.parse().ok()?,
-                        mtu: u16::try_from(l.mtu).ok()?,
-                        mac: l.mac,
-                        up: l.up,
-                    })
-                })
+                .map(|l| (l.name, l.index))
                 .collect())
         }
 
-        /// Everything else first (the interfaces must exist), XDP last; if
-        /// XDP refuses, the rest goes back to `from`.
-        fn apply(&mut self, from: &Config, to: &Config) -> Result<(), HalError> {
+        /// `apply` with every port there. Everything else first (the
+        /// interfaces must exist), XDP last; if XDP refuses, the rest goes
+        /// back to `from`.
+        fn apply_present(&mut self, from: &Config, to: &Config) -> Result<(), HalError> {
             self.apply_links(from, to)?;
             if let Err(e) = self.xdp.sync(to) {
                 if let Err(back) = self.xdp.sync(from) {
@@ -723,6 +724,107 @@ mod linux {
                 }
             }
             Ok(())
+        }
+    }
+
+    impl Hal for LinuxHal {
+        fn describe(&self) -> String {
+            "linux (rtnetlink)".into()
+        }
+
+        /// Managed ports only (`owner` rules 6–8); everything else is in
+        /// `poll`, marked unmanaged.
+        fn discover_links(&mut self) -> Result<Vec<LinkInfo>, HalError> {
+            Ok(self
+                .view(&self.claims)?
+                .into_iter()
+                .filter(|(l, o)| *o == Owner::Managed && l.arphrd != owner::ARPHRD_LOOPBACK)
+                .filter_map(|(l, _)| {
+                    Some(LinkInfo {
+                        name: l.name.parse().ok()?,
+                        mtu: u16::try_from(l.mtu).ok()?,
+                        mac: l.mac,
+                        up: l.up,
+                    })
+                })
+                .collect())
+        }
+
+        /// G1.3b: without the physical ports the kernel does not have
+        /// ([`absent`]), so a port that is gone never takes the rest (the
+        /// management address on another port) down with it. What `from`
+        /// had on a port that is gone now, or that the last apply left out,
+        /// is not in the kernel either. A port that goes away during the
+        /// apply makes it fail and go back to `from`: tried once more
+        /// without it. With no port known absent and the interfaces the
+        /// same, the link dump is skipped (20.7 ms with 1000 links,
+        /// **medido**): `poll` notes a port that goes, and an op that
+        /// fails on one sends this through the retry, which looks.
+        fn apply(&mut self, from: &Config, to: &Config) -> Result<(), HalError> {
+            let mut retried = false;
+            let mut look =
+                !self.absent.is_empty() || corerouter_model::sections::interfaces_changed(from, to);
+            loop {
+                let names = if look { Some(self.link_names()?) } else { None };
+                let present =
+                    |n: &IfName| names.as_ref().is_none_or(|s| s.contains_key(n.as_str()));
+                let gone = absent::missing(to, present);
+                let mut was = self.absent.clone();
+                was.extend(absent::missing(from, present));
+                let (f, t) = (absent::mask(from, &was), absent::mask(to, &gone));
+                match self.apply_present(&f, &t) {
+                    Ok(()) => {
+                        for n in gone.difference(&self.absent) {
+                            log::warn!(
+                                "'{n}' is not on this machine: its configuration waits for it (invalid)"
+                            );
+                        }
+                        for n in self.absent.difference(&gone) {
+                            if to.interfaces.contains_key(n) {
+                                log::info!("'{n}' is back: its configuration was applied");
+                            }
+                        }
+                        self.absent = gone;
+                        // Every name of the config, absent ones included:
+                        // `poll` sees a claimed port go, and one that comes
+                        // back is CoreRouter's again.
+                        self.claims = claims_of(to);
+                        // G1.3d: the links that got the configuration. With
+                        // no dump nothing was added nor came back, and an
+                        // apply never recreates a physical port.
+                        if let Some(names) = &names {
+                            for (n, k) in &self.claims {
+                                if let (InterfaceKind::Ethernet, Some(i)) =
+                                    (k, names.get(n.as_str()))
+                                {
+                                    self.indices.insert(n.clone(), *i);
+                                }
+                            }
+                        }
+                        let claims = &self.claims;
+                        self.indices.retain(|n, _| claims.contains_key(n));
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        let now = self.link_names().unwrap_or_default();
+                        let here = |n: &IfName| now.contains_key(n.as_str());
+                        let went = absent::missing(to, here) != gone
+                            || !absent::missing(from, here).is_subset(&was);
+                        if retried || !went {
+                            return Err(e);
+                        }
+                        log::warn!(
+                            "a port went away during the apply ({e}): trying again without it"
+                        );
+                        retried = true;
+                        look = true;
+                    }
+                }
+            }
+        }
+
+        fn absent_ports(&self) -> Vec<IfName> {
+            self.absent.iter().cloned().collect()
         }
 
         fn mpls_routes(&mut self) -> Result<Vec<corerouter_hal::mpls::MplsRoute>, HalError> {
@@ -969,6 +1071,34 @@ mod linux {
                     return Vec::new();
                 }
             };
+            // G1.3b: a claimed port the kernel no longer has lost its
+            // configuration with it; the next apply puts it back. G1.3d:
+            // so did one with a new index (gone and back since the last
+            // look): the engine sees it absent and present, and reapplies.
+            let names: BTreeMap<&str, u32> = view
+                .iter()
+                .map(|(l, _)| (l.name.as_str(), l.index))
+                .collect();
+            for (n, k) in &self.claims {
+                if *k != InterfaceKind::Ethernet {
+                    continue;
+                }
+                match names.get(n.as_str()) {
+                    None => {
+                        if self.absent.insert(n.clone()) {
+                            log::warn!("'{n}' went away: its configuration waits for it (invalid)");
+                        }
+                    }
+                    Some(&i) => match self.indices.insert(n.clone(), i) {
+                        Some(was) if was != i && self.absent.insert(n.clone()) => {
+                            log::warn!(
+                                "'{n}' was replugged (link #{was} is now #{i}): its configuration is applied again"
+                            );
+                        }
+                        _ => {}
+                    },
+                }
+            }
             view.into_iter()
                 .filter_map(|(l, o)| {
                     Some(LinkState {
@@ -1066,6 +1196,10 @@ mod linux {
 
         /// One round of [`crate::plan::repair`], all or nothing.
         fn reconcile(&mut self, cfg: &Config) -> Result<(), HalError> {
+            // G1.3b: a port that is gone now is left to come back.
+            let names = self.link_names()?;
+            let gone = absent::missing(cfg, |n| names.contains_key(n.as_str()));
+            let cfg = &*absent::mask(cfg, &gone);
             let have = self.snapshot(cfg)?;
             let ops = crate::plan::repair(cfg, &have);
             for op in &ops {
@@ -1243,6 +1377,10 @@ mod linux {
 
         fn packet_capture(&self) -> Result<corerouter_hal::capture::SharedCapture, String> {
             Ok(std::sync::Arc::new(crate::capture::HostCapture))
+        }
+
+        fn usb_tx_timeouts(&mut self, name: &IfName) -> Option<u64> {
+            crate::nic::tx_timeouts(&std::path::Path::new("/sys/class/net").join(name.as_str()))
         }
 
         fn usb_reset(

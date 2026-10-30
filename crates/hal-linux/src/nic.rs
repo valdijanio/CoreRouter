@@ -396,6 +396,22 @@ impl LinuxUsbReset {
         }
     }
 
+    /// Another link with the adapter's MAC (the kernel's `eth0` that was
+    /// never renamed): what the log says instead of only "not back".
+    fn back_as(&self) -> Option<String> {
+        let mac = self.mac.as_deref()?;
+        fs::read_dir(&self.net)
+            .ok()?
+            .filter_map(Result::ok)
+            .take(MAX_ITEMS)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != &self.name && safe(n))
+            .find(|n| {
+                read_trim(&self.net.join(n).join("address"))
+                    .is_some_and(|a| a.eq_ignore_ascii_case(mac))
+            })
+    }
+
     fn wait_back(&self, wait: &dyn Fn(std::time::Duration) -> bool) -> bool {
         let step = std::time::Duration::from_millis(250);
         let mut waited = std::time::Duration::ZERO;
@@ -477,6 +493,9 @@ impl hnic::UsbReset for LinuxUsbReset {
             }
         }
         r.back = self.wait_back(wait);
+        if !r.back {
+            r.back_as = self.back_as();
+        }
         Ok(r)
     }
 }
@@ -599,6 +618,17 @@ mod tests {
         fs::remove_dir_all(net.join("ether4")).unwrap();
         let r = hnic::UsbReset::run(&mut job, &|_| true).unwrap();
         assert!(!r.back);
+        assert_eq!(r.back_as, None, "no MAC known: no guess");
+        // G1.29f: back with the kernel's name (PID 1 did not rename it):
+        // the report names it.
+        job.mac = Some("00:E0:4C:68:20:76".into());
+        fs::create_dir_all(net.join("eth0")).unwrap();
+        fs::write(net.join("eth0/address"), "00:e0:4c:68:20:76\n").unwrap();
+        fs::create_dir_all(net.join("ether1")).unwrap();
+        fs::write(net.join("ether1/address"), "52:54:00:00:00:01\n").unwrap();
+        let r = hnic::UsbReset::run(&mut job, &|_| true).unwrap();
+        assert!(!r.back);
+        assert_eq!(r.back_as.as_deref(), Some("eth0"));
         // Stopped while waiting.
         let r = hnic::UsbReset::run(&mut job, &|_| false).unwrap();
         assert!(!r.back);

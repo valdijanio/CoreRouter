@@ -5,6 +5,7 @@
 //! platform crates that only the apps (L6) may depend on; `VirtualHal` runs
 //! everywhere, including wasm, CI, Windows, macOS and iOS, without root.
 
+pub mod absent;
 pub mod address_state;
 pub mod capture;
 pub mod cgnat;
@@ -193,6 +194,14 @@ pub trait Hal: Send {
     /// Sample live link state/counters.
     fn poll(&mut self) -> Vec<LinkState>;
 
+    /// Physical ports of the applied config that the platform does not
+    /// have (G1.3b, see [`absent`]): `apply` left them out and puts their
+    /// configuration back on the first `apply` after they return. The
+    /// default (a backend whose ports never go away) has none.
+    fn absent_ports(&self) -> Vec<IfName> {
+        Vec::new()
+    }
+
     /// Links present on the platform that CoreRouter must not change, with
     /// the reason (see [`LinkState::unmanaged`]). Commands check it before
     /// touching a name; the default (virtual lab) has none.
@@ -288,6 +297,14 @@ pub trait Hal: Send {
             "{} cannot test the cable of '{name}'",
             self.describe()
         )))
+    }
+
+    /// The kernel's transmit timeouts of `name` (`NETDEV WATCHDOG`), summed
+    /// over its queues: read every second by the USB watchdog (G1.29d), so
+    /// cheap. `None`: the platform does not count them.
+    fn usb_tx_timeouts(&mut self, name: &IfName) -> Option<u64> {
+        let _ = name;
+        None
     }
 
     /// A manual recovery of USB adapter `name` (G1.29c).

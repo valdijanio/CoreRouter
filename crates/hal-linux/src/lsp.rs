@@ -24,13 +24,18 @@
 //!   its time exceeded leaves by the IP table from an `IPPROTO_RAW` socket,
 //!   or along the LSP as a whole frame on the packet socket of the label's
 //!   way out, to the next hop's MAC ([`icmp_frame`]).
+//! - **ICMP for labeled packets too big for their way out** (G3.9da): with
+//!   `icmp-too-big` on, the MPLS filter also keeps frames longer than the
+//!   smallest way out of the label table ([`mpls_filter`]; on a network of
+//!   equal MTUs no frame is, so no copy), cut to what the error quotes;
+//!   [`classify`] makes them a [`too_big::TooBig`].
 //! - **What the LSR knows** ([`LsrView`]): the label table (one dump,
 //!   kept a second), the addresses and MTUs of the links (kept a second),
 //!   the route of each FEC asked (kept a second, 1024 at most).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use corerouter_hal::lsp::{Frame, Heard, expired};
+use corerouter_hal::lsp::{Frame, Heard, expired, too_big};
 use corerouter_hal::probe::MplsLabel;
 use corerouter_model::IfName;
 use socket2::SockFilter;
@@ -257,15 +262,23 @@ fn is_echo(h: &Heard) -> bool {
 }
 
 /// What a frame heard on `interface` is for: an echo request candidate
-/// for the responder, or a labeled packet whose TTL expired here (G3.9d:
-/// the kernel drops it without the ICMP error). `None`: neither.
-pub fn classify(frame: &[u8], interface: &IfName) -> Option<Frame> {
+/// for the responder, a labeled packet whose TTL expired here (G3.9d: the
+/// kernel drops it without the ICMP error), or, when `big` is given, one
+/// whose frame payload (labels and IP packet) is longer than `big` and so
+/// may not fit its way out (G3.9da). `None`: none of these.
+pub fn classify(frame: &[u8], interface: &IfName, big: Option<usize>) -> Option<Frame> {
     let heard = parse_frame(frame, interface);
-    if u16_at(frame, 12)? == ETH_P_MPLS_UC
-        && !heard.as_ref().is_some_and(is_echo)
-        && let Some(e) = expired::parse(interface, frame.get(ETH_HEADER..)?)
-    {
-        return Some(Frame::Expired(e));
+    if u16_at(frame, 12)? == ETH_P_MPLS_UC && !heard.as_ref().is_some_and(is_echo) {
+        let mpls = frame.get(ETH_HEADER..)?;
+        if let Some(e) = expired::parse(interface, mpls) {
+            return Some(Frame::Expired(e));
+        }
+        if let Some(big) = big
+            && let Some(t) = too_big::parse(interface, mpls)
+            && 4 * t.stack.len() + t.len > big
+        {
+            return Some(Frame::TooBig(t));
+        }
     }
     heard.map(Frame::Echo)
 }
@@ -299,6 +312,7 @@ pub fn icmp_frame(
 const LD_W_ABS: u16 = 0x20;
 const LD_H_ABS: u16 = 0x28;
 const LD_B_ABS: u16 = 0x30;
+const LD_W_LEN: u16 = 0x80;
 const LD_H_IND: u16 = 0x48;
 const LDX_B_MSH: u16 = 0xb1;
 const JEQ_K: u16 = 0x15;
@@ -347,6 +361,29 @@ pub const MPLS_FILTER: &[Insn] = &[
     /* 5 */ (RET_K, 0, 0, 0),
     /* 6 */ (RET_K, 0, 0, KEEP),
 ];
+
+/// [`MPLS_FILTER`], also keeping frames longer than `frame_len` octets
+/// (Ethernet header included: `skb->len` once `packet_rcv` pushed it),
+/// cut to the Ethernet header plus [`too_big::SNAP`] (G3.9da: the error
+/// quotes no more, and a jumbo frame is not copied whole). `None`: as
+/// [`MPLS_FILTER`].
+pub fn mpls_filter(frame_len: Option<u32>) -> Vec<Insn> {
+    let Some(len) = frame_len else {
+        return MPLS_FILTER.to_vec();
+    };
+    vec![
+        /* 0 */ (LD_B_ABS, 0, 0, 17), // top label TTL
+        /* 1 */ (JGT_K, 0, 6, 1), // ≤ 1 → keep
+        /* 2 */ (LD_W_ABS, 0, 0, 14),
+        /* 3 */ (AND_K, 0, 0, 0xffff_d000), // explicit null → keep
+        /* 4 */ (JEQ_K, 3, 0, 0),
+        /* 5 */ (LD_W_LEN, 0, 0, 0),
+        /* 6 */ (JGT_K, 2, 0, len), // longer → keep the start
+        /* 7 */ (RET_K, 0, 0, 0),
+        /* 8 */ (RET_K, 0, 0, KEEP),
+        /* 9 */ (RET_K, 0, 0, (ETH_HEADER + too_big::SNAP) as u32),
+    ]
+}
 
 /// IPv4: UDP to 3503 and 127/8, not a fragment.
 pub const IP4_FILTER: &[Insn] = &[
@@ -557,6 +594,7 @@ pub fn parse_route(body: &[u8]) -> Option<RawFecRoute> {
     Some(r)
 }
 
+mod ebpf;
 mod host;
 pub use host::*;
 

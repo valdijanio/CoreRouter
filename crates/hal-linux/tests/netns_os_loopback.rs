@@ -156,15 +156,42 @@ fn a_failed_apply_takes_the_lo_addresses_back() {
     cfg.interfaces
         .insert(n("lo"), Interface::new(n("lo"), InterfaceKind::Loopback));
     addr(&mut cfg, "lo", "10.255.0.9/32");
-    // A port that does not exist: its address fails after lo's went in
-    // ("lo" < "nope"), so the executor undoes lo's.
-    cfg.interfaces.insert(
-        n("nope"),
-        Interface::new(n("nope"), InterfaceKind::Ethernet),
-    );
-    addr(&mut cfg, "nope", "192.0.2.1/24");
+    // Someone else's route to a prefix the config routes through lo: the
+    // last step fails after lo's address went in, so the executor undoes
+    // lo's. (A missing port was the trigger before G1.3b, which leaves it
+    // out instead of failing.)
+    let id = cfg.ip.next_route_id();
+    cfg.ip.routes.push(corerouter_model::RouteEntry {
+        id,
+        dst_address: "198.18.7.0/24".parse().unwrap(),
+        gateway: "lo".parse().unwrap(),
+        distance: 1,
+        routing_table: corerouter_model::RoutingTable::Main,
+        disabled: false,
+        comment: String::new(),
+        check_gateway: Default::default(),
+        bfd_profile: String::new(),
+    });
+    ip(&[
+        "route",
+        "add",
+        "198.18.7.0/24",
+        "via",
+        "127.0.0.2",
+        "dev",
+        "lo",
+        "metric",
+        "1",
+        "proto",
+        "static",
+    ]);
     let mut hal = LinuxHal::new();
-    assert!(hal.apply(&base, &cfg).is_err());
+    let err = hal.apply(&base, &cfg).unwrap_err().to_string();
+    assert!(
+        err.contains("already has another route to 198.18.7.0/24"),
+        "{err}"
+    );
     assert!(!lo_addrs().contains("10.255.0.9"), "{}", lo_addrs());
+    ip(&["route", "del", "198.18.7.0/24", "dev", "lo"]);
     assert_os_lo_intact();
 }

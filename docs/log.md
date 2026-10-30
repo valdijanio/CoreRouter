@@ -8841,3 +8841,302 @@ continuação indentadas).
 
   Como testar: `cargo test -p corerouter-engine adopt`. Na VM, a porta nova aparece em
   Interfaces como as outras e aceita configuração.
+
+- 2026-10-30 — G1.29d: Placas de rede USB, parte 4: vigia automático. Um adaptador USB travado é recuperado sem
+  operador, com os níveis da G1.29c. Travamento = o vigia de transmissão do kernel disparou nele
+  (`tx_timeout` cresceu, `NETDEV WATCHDOG`) ou o enlace está em pé enviando (≥ 5 pacotes) sem
+  receber nada por `stall_secs` (30 s por padrão), o padrão do RTL8153 que fica com o carrier em pé
+  e a fila morta. A primeira ação reinicia o driver; travou de novo antes de 10 min de calma,
+  reinicia a porta USB. Entre ações espera 30 s, dobrando até 15 min; com 6 ações numa hora para
+  e avisa (log de erro uma vez, saúde em erro): cabo, alimentação ou o chip precisam de gente.
+  Cada ação vai para o log ("ether4: USB adapter stalled (…): restarting its driver"). Ligado por
+  padrão em todo adaptador USB; `interface.usb.watchdog.set {name, enabled, stall_secs}` (config,
+  `system.usb_watchdog`, só quem difere do padrão) e `interface.usb.watchdog.print`. Saúde: check
+  `interface.usb.watchdog` (ok / aviso quando agiu na última hora / erro quando desistiu). GUI: linha
+  Watchdog na seção USB da aba Hardware, com a chave por adaptador e o estado; a confirmação dos
+  botões de recuperação toma o lugar deles (a aba tem altura fixa). O lab simula um adaptador que
+  trava (`VirtualHal::with_usb_stall`).
+
+  Como testar: `cargo test -p corerouter-engine watchdog` (Tx timeout é travamento, enlace quieto
+  não é; envia sem receber é; driver, depois porta, espera, desiste e avisa uma vez; calma volta ao
+  driver; desligado só conta; validação e rollback da config), `cargo test -p corerouter-ui usb`
+  (chave da GUI). Prints em `docs/changes/G1.29d-screenshots/`. Na VM `corerouter-teste`, com o
+  RTL8153 real (2026-10-29): `interface.usb.watchdog.print` mostra a `ether4` em `ok`, 0
+  travamentos, sem alarme falso (o adaptador está sem cabo, então sem tráfego). O travamento de
+  verdade não foi provocado no hardware: o kernel não deixa injetar `tx_timeout`, e sem cabo o
+  adaptador não transmite. A detecção e a escalada são testadas no lab simulado.
+
+- 2026-10-30 — G3.4l: O abort do `ospfd` com TI-LFA também acontece no `master` do FRR, e a correção resolve lá. Na VM,
+  com `scripts/frr-tilfa-repro.sh --topo square --sr on --churn rid --runs 40`:
+
+  - `master` `4ac34f1afa` (10.9.0-dev): 15 de 40 iterações com abort, todas no mesmo assert
+    (`ospf_spf.c:1268`);
+  - `master` com a correção do PR FRRouting/frr#24092: 0 de 40, com 19 passagens por LSA ausente
+    puladas e nenhuma rota faltando (**medido**, 2026-10-30).
+
+  Num core do `master` (gdb): `get_reverse_distance (…, w_lsa=0x0)`, com V = 10.255.0.2 e W =
+  10.255.0.1, o router-id antigo do R1. O resultado foi comentado na issue FRRouting/frr#24091, a
+  pedido do usuário. A tabela de `docs/frr-tilfa-abort.md` ganhou as duas linhas.
+
+- 2026-10-30 — fix-vm-lab-one-round: O `cargo xtask vm-lab run` sincroniza a worktree para `/srv/lab/<worktree>/src` antes de esperar a
+  trava da VM. Uma segunda rodada da mesma worktree, posta na fila enquanto a primeira esperava,
+  sobrescrevia o código dela: a sessão da G3.9da/db viu a rodada da G3.9da compilar o código da
+  G3.9db (2026-10-30), o que também explicava builds "velhos" de antes. Agora o `run` procura na VM
+  uma rodada viva cujo comando roda nessa pasta e, se houver, recusa antes do `sync`, com os pids e
+  o caminho (`--no-sync` continua rodando sobre o código que está lá). Teste:
+  `same_dir_rounds_check_finds_a_queued_round_of_this_worktree` (acha a rodada da mesma pasta e não
+  a de outra).
+
+- 2026-10-30 — valida-interop-roteiros: Validação T2 dos roteiros de interop sobre a `main` (RouterOS 7.25 CHR na VM do lab e CR × CR no
+  host): tudo passa; nenhuma regressão do CoreRouter. As falhas encontradas eram dos roteiros:
+
+  - `rosx` síncrono (`"as-string": true` no `/rest/execute`) nos roteiros OSPF, BGP e PPPoE, como já
+    era no L2: sem ele o RouterOS roda o script em segundo plano e dois comandos seguidos disputam
+    entre si. Era a causa da falha do `ipv6` do PPPoE (CHR sem SLAAC/PD).
+  - `padt`: o CHR responde ao PADT do BNG e redisca em menos de 1 s, antes de o poll ver
+    `running=false`; o caso agora espera o contador `link-downs` do CHR. Guarda também o fio (PADT e
+    LCP Terminate) e as linhas do `cpe1` para o diagnóstico.
+  - `maxprefix` (CR × CR e contra o CHR) espera o Cease com a razão de limite de prefixos, em vez de
+    "não Established" + `sleep 3`; o modo `warning` espera os 6 prefixos.
+  - `ospfv3` espera a rota nos dois lados (até 30 s) em vez de `sleep 4`, com diagnóstico no FAIL.
+  - `rsc` (L2) importa só as VLANs do próprio caso: o `qinq` deixa `c201` no CHR e no CoreRouter, e o
+    import atômico do CoreRouter recusava o arquivo inteiro (comportamento certo).
+
+  O `client` do PPPoE contra o CHR só passa com `XDP=0` (como na medição de 29/10): o BNG e o cliente
+  dividem o `ether1` do laboratório.
+
+  Números (**medido**, 2026-10-29/30, host carregado por outras sessões; entre parênteses, 28–29/10):
+  OSPF ptp Full 1,77 s (1,8–7,6 s), OSPFv3 Full 1,0–1,5 s; LDP 1,6 s (1–2,5 s); BFD 2,15 s; BGP CR × CR
+  ebgp 5,4 s (5,5 s), GR 2 pings perdidos com GR e 412 sem (2 e 469), hold 9,03 s / BFD 370 ms
+  (8,98 s / 420 ms); BGP × CHR ebgp4 4,8 s (5,2 s), ebgp6 1,9 s (2,1 s); PPPoE padt 10 ms (121 ms),
+  SLAAC 3,82 s (4,2 s), PD 20 ms (6 ms), cliente 2,43 s (2,46 s), 32 sessões em 321 ms; L2 ra 4,5 s
+  (2,3 s), RA final 862 ms (1,1 s); DNS 1,16 M respostas/s com 4 clientes no host (1,12 M). A/B do
+  `scale` antes/depois do G3.9fb no mesmo momento: 7,19 s × 7,04 s (sem regressão).
+
+- 2026-10-30 — G3.9da: MPLS: a descoberta de MTU do caminho através de um LSP não vira mais buraco negro. O MPLS do kernel
+  descarta em silêncio o pacote rotulado que não cabe no enlace de saída (`mpls_forward`,
+  `mpls_pkt_too_big`, só conta `tx_errors`); o respondedor do LSP ping agora devolve o ICMP
+  "fragmentation needed" (IPv4 com DF, com a pilha da RFC 4950) ou o ICMPv6 "packet too big", com o
+  MTU do enlace menos a pilha como chegou (RFC 3032 §3.4 passos 2 e 4.b; §3.5).
+
+  - **Captura sem custo com MTU igual:** o filtro do tap MPLS também guarda quadros mais longos que a
+    menor saída da tabela de rótulos (recalculada quando a tabela ou um MTU muda), cortados no que o
+    erro cita. Sem DF, IPv6 pequeno com fragmento, erro sobre erro: contados, sem ICMP.
+  - **Taxa por origem** (`hal/src/lsp/rate.rs`): `icmp_rate_per_source` (padrão 10/s) antes do
+    `icmp_rate` global, para time exceeded e too big; até 4096 origens.
+  - `mpls.settings.set {icmp_too_big, icmp_rate_per_source}`, contadores `too_big`, `too_big_sent`,
+    `rate_limited_source` no `icmp_counters`; campos com ⓘ na janela **MPLS › Settings**.
+  - Pesquisa (kernel 6.18.59 e `master`, RFC 3032/1191/8201/4443/4884/4950, RouterOS, Cisco,
+    Junos) e números em `docs/mpls.md`, "ICMP de pacote rotulado grande demais".
+
+  Validado na VM do laboratório (**medido**, kernel 6.18): `netns_mpls_too_big` (IPv4 e IPv6, MTU
+  1400 no meio do LSP: o kernel sozinho não responde; com o respondedor, MTU 1396 de 10.72.0.2 /
+  fd72::2 e o pacote de 1396 chega) e a enxurrada (2000 pps de TTL 2 de uma origem: sem a taxa por
+  origem o traceroute de outra vê 6/20 saltos, com ela ≥ 18/20). O MTU dos enlaces passou a vir por
+  netlink: o sysfs mostra o namespace de quem montou o `/sys`, e um respondedor movido por `setns`
+  não achava o MTU de saída. Contra o RouterOS 7.25 CHR (`routeros-interop.sh ldp mpls-ttl mpls-mtu`,
+  15/15 OK): com MTU 1400 depois do CoreRouter, o R3 recebe "Frag needed and DF set (mtu = 1396)" de
+  10.39.1.2 e passa a cruzar o LSP com 1392 (ele, como entrada, tira o próprio rótulo); sem a opção,
+  o ping de 1450 com DF some.
+
+  Como testar: `cargo test -p corerouter-hal --lib lsp::too_big lsp::rate`, `cargo test -p
+  corerouter-hal-linux --lib lsp`, `cargo test -p corerouter-engine --test it mpls`; com
+  `mpls_router`: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
+  corerouter-hal-linux --test netns_mpls_too_big -- --nocapture`; CHR: `cargo xtask vm-lab run --
+  scripts/routeros-interop.sh ldp mpls-mtu`.
+
+- 2026-10-30 — processo-ci-runner-registrado: Os runners próprios do CI (`corerouter-ci-1…3`, VM `corerouter-ci`) foram registrados pelo dono e
+  estão `online`; a política de PR de fork ficou em `all_external_contributors`. A partir de agora o
+  lote da fila manda `test`, `bench-check` e `netns` para eles (255 s por lote contra 445 s nos
+  runners do GitHub, **medido** no #465). `docs/ci-runner.md` diz o estado e quando um token novo é
+  preciso.
+
+- 2026-10-30 — G1.3b: Drift, parte 2: portas que somem e voltam. Achado real (29/10, sessão USB-NIC): na VM de teste,
+  sem a placa da `ether2`, o `apply` do boot, que é tudo ou nada, falhou nas operações da `ether2` e
+  desfez tudo, inclusive o endereço de gerência da `ether3`.
+
+  - `corerouter_hal::absent` (novo): `missing` lista as portas físicas (`ether`) da config que a
+    plataforma não tem; `mask` tira essas portas, as VLANs em cima delas (qualquer profundidade), o
+    `primary` de bond que aponta para elas e a afinação de porta delas. Endereços e rotas delas saem
+    do plano sozinhos (só contam interfaces da config).
+  - `hal-linux`: o `apply` mascara o `to` com o que falta no kernel agora e o `from` com o que faltou
+    no último `apply` ou sumiu desde então (o kernel já não tem nada delas); guarda o conjunto e o
+    devolve em `Hal::absent_ports` (método novo, padrão vazio). Porta que some no meio do `apply`
+    faz ele voltar a `from` e tentar de novo uma vez sem ela. O `poll` anota porta reivindicada que
+    sumiu; o `reconcile` deixa de fora porta ausente agora.
+  - engine (`port_absent.rs`, novo): a cada `tick` anota no log a porta que some e a que volta e,
+    na volta, reaplica a config em vigor (`apply(running, running)`, que agora inclui a porta); erro
+    é repetido a cada segundo e logado quando muda. `interface.list` ganha `invalid` e
+    `invalid_reason` (porta ausente e VLANs nela); saúde ganha `interface.absent` (aviso, só quando
+    há); `config.drift.list`/`reconcile` não contam porta ausente como drift (ela já aparece
+    `invalid`).
+  - GUI: flag `I`, selo âmbar `invalid` na coluna Link e no painel de detalhes, motivo no Info,
+    linha esmaecida; o ⓘ da coluna Link explica (en/pt).
+
+  Como testar: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
+  corerouter-hal-linux --test netns_absent <teste>` (um teste por namespace: boot com porta
+  ausente; porta removida, commit que toca nela, devolvida, removida da config; porta que some
+  entre dois polls, achada pela nova tentativa);
+  `cargo test -p corerouter-engine --lib port_absent` (laboratório virtual: porta tirada e
+  devolvida, flag, saúde, log, reaplicação). Ponta a ponta (**medido**, 2026-10-30): daemon
+  `--backend linux --manage "ether*"` num namespace com dummies, `ether2` apagada: lista com `I`,
+  saúde `interface.absent`, drift vazio; daemon reiniciado sem `ether2`: `10.0.0.2/24` na `ether1`
+  (gerência) sobe; `ip link add ether2`: em ≤3 s `10.2.0.1/24` na `ether2` e a `vlan20` com
+  `10.20.0.1/24` de volta. Print em `docs/changes/G1.3b-screenshots/interfaces-invalid.png`.
+
+  Desempenho (**medido**, 2026-10-30, build release, namespace com dummies): o dump de links custa
+  62 µs com 3 links e 20,7 ms com 1000; o `apply` só o faz quando há porta ausente conhecida ou as
+  interfaces mudaram (commit de rotas ou firewall não paga nada a mais).
+
+- 2026-10-30 — G3.9db: MPLS: o respondedor do LSP ping e dos ICMP de pacote rotulado (G3.5b, G3.9d, G3.9da) passa a ouvir
+  por um classificador tc na entrada de cada interface MPLS (`lsp_tap`, no objeto do
+  `dataplane-ebpf`), que copia para um ring buffer só os quadros candidatos — a mesma decisão dos
+  filtros BPF clássicos, em `dataplane-ebpf-common/src/lsp_tap.rs`, conferida quadro a quadro contra
+  eles (teste fixo e proptest) — e deixa todo quadro seguir. Os sockets `AF_PACKET` faziam o kernel
+  chamar o `packet_rcv` em todo quadro do protocolo no host (−19% da troca de rótulos num núcleo,
+  **medido** na G3.9d).
+
+  - Carregado à parte (`hal-linux/src/lsp/ebpf.rs`), com todos os outros mapas do objeto no tamanho
+    mínimo; fail-open (o kernel solta o programa se o daemon morre); sem root, kernel antigo ou sem
+    `CAP_BPF`, volta aos sockets (`$COREROUTER_LSP_TAP=packet|ebpf` força um). O GSO agora é
+    conferido (`gso_size`): um pacote GSO grande não vira candidato a "too big".
+  - `lsp_ping_counters.tap` diz qual tap ouve e quantos quadros o tc copiou ou perdeu por ring cheio.
+  - Três blocos `unsafe` novos (36–38 em `docs/xdp.md`), para revisão humana.
+
+  Validado na VM do laboratório (kernel 6.18, **medido**): o verificador aceita o programa;
+  `netns_mpls_too_big` e `netns_mpls_ttl` passam com `COREROUTER_LSP_TAP=ebpf` (5/5, 0 quadros
+  perdidos por ring cheio); pesquisa e números em `docs/mpls.md`, "Tap do respondedor em eBPF".
+
+  Como testar: `cargo test -p corerouter-dataplane-ebpf-common --lib lsp_tap`, `cargo test -p
+  corerouter-hal-linux --lib lsp`; na VM como root (sem namespace de usuário):
+  `COREROUTER_NETNS_TESTS=1 COREROUTER_LSP_TAP=ebpf unshare --net -- cargo test -p
+  corerouter-hal-linux --test netns_mpls_too_big --test netns_mpls_ttl -- --nocapture` e
+  `COREROUTER_NETNS_BENCH=1 unshare --net -- cargo bench -p corerouter-hal-linux --bench
+  netns_mpls_ttl`.
+
+- 2026-10-30 — processo-unsafe-revisao: A regra do `unsafe` no `CLAUDE.md`/`AGENTS.md` foi atualizada: o crate `dataplane-ebpf` já existe
+  e tem programas XDP e tc, e o caminho da revisão humana, que só existia na prática (G3.9db,
+  #505), ficou escrito: o PR com `unsafe` abre sem o rótulo `fila` e com a seção
+  `## Revisão humana necessária`; a sessão principal resume cada bloco ao usuário; só depois do
+  "aprovo" dele ela põe o rótulo e registra a aprovação no PR. Todo bloco novo ou alterado passa
+  pela revisão, sem catálogo de padrões já aprovados (decisão do usuário, 2026-10-30).
+
+- 2026-10-30 — G1.29f: Placa USB que voltou do reset de porta como `eth0`, e não como `ether4` (VM `corerouter-teste`,
+  RTL8153 `0bda:8153`, MAC `00:E0:4C:68:20:76`).
+
+  **Causa (reproduzida no roteador do relato, não suposta):** a imagem rodando era a do commit
+  `d383a321` (a barra da GUI mostrava `daemon d383a32`), a ponta da branch da G1.29d. Esse commit
+  **não contém a G1.6n** (#486): `git merge-base --is-ancestor 3afd1d98 d383a321` dá falso. O PID 1
+  dessa imagem não tem a thread "port-names": `system.resource.process.print {threads: true}`
+  mostrava `corerouter-init` com 1 thread e 3 fds, sem o socket netlink. Sem ela, o netdev recriado
+  pelo reset fica com o nome do kernel para sempre. Nenhuma das hipóteses do código da G1.6n (corrida
+  com EEXIST, EBUSY, maiúsculas no MAC) se aplica: o código não estava na imagem. O mapa e o `sysfs`
+  comparam o MAC em minúsculas dos dois lados (`ports::parse_map` e `links::port`).
+
+  O que mudou para o operador não ficar no escuro de novo:
+
+  - **O reset diz com que nome a placa voltou.** Quando ela não volta com o nome, mas há um link com
+    o MAC dela (`eth0`), o log diz "came back as 'eth0', not 'ether4': PID 1 did not give it its
+    name again", e o resumo da tarefa traz `back_as` (antes: "did not come back within 20 s").
+  - **As mensagens do PID 1 vão para o log do roteador.** O `corerouter-init` escreve cada linha
+    também no `/dev/kmsg` (`<13>corerouter-init[1]: …`, nível notice, abaixo do nível de console do
+    `quiet`, então o console não a mostra duas vezes). O leitor do log do SO do daemon já lia o
+    `/dev/kmsg`: a linha aparece em `log.os.print` (fonte `services`, unidade `corerouter-init`) e
+    agora também em `log.print` como `init: …`, com o tópico `interface` para os nomes de porta
+    ("port names: …") e `system` para o resto. Antes só o console serial (o pty do libvirt) as tinha.
+
+  Como testar: `cargo test -p corerouter-engine came_back`, `cargo test -p corerouter-hal-linux
+  port_recovery`, `cargo test -p corerouter-init kmsg`, `cargo test -p corerouter-daemon pid1_lines`.
+  Os quatro falham sem a mudança (o campo `back_as` não existe; a linha do PID 1 não chega ao
+  `log.print`). Na VM: `interface.usb.reset {name: "ether4", level: "port"}` e depois
+  `log.print {find: "init:"}`. Não validado na VM nesta rodada: o `cargo xtask os push` desta branch
+  foi recusado porque o `/config` da VM (56 MB) não tem espaço para o snapshot da configuração (G1.6u,
+  abaixo). O reset de porta com uma imagem que tem a G1.6n voltou como `ether4` na medição da G1.29c
+  (3,54 s, **medido** em 2026-10-29).
+
+- 2026-10-30 — G1.3d: Drift, parte 4: porta que volta mais rápido que o poll. Uma porta apagada e recriada com o mesmo
+  nome entre dois polls de 1 s (replug rápido, reset de driver de placa USB) voltava sem endereço,
+  MTU, VLANs nem rotas, e nada acusava: o poll via o mesmo nome nas duas vezes.
+
+  - `hal-linux`: o `LinuxHal` guarda o `ifindex` de cada porta física reivindicada quando ela recebe
+    a config (no `apply` que fez o dump) e o confere em todo `poll`. Índice novo para o mesmo nome =
+    link novo, sem nada: a porta vai para o conjunto de ausentes da G1.3b e o `absent_tick` do
+    engine reaplica a config em vigor. O kernel nunca repete um índice (`dev_index_reserve` em
+    `net/core/dev.c` aloca com `xa_alloc_cyclic` até 2³¹), então não há falso positivo; o `apply`
+    não recria porta física (VLAN, bridge e bond ficam de fora da conferência).
+  - `hal-linux::link_events` (novo): socket em `RTNLGRP_LINK`, leitura não bloqueante e parser
+    próprio dos nomes de link (`IFLA_IFNAME`) com proptest; `ENOBUFS` ou mais de 4096 nomes viram
+    "olhe tudo".
+  - daemon, serviço `link-events` (novo, só com `--backend linux`): lê os eventos sem lock, junta a
+    rajada por 50 ms e chama `Session::link_events` uma vez; o engine só faz o poll (links, tempos
+    de link, `absent_tick`) se um dos nomes é porta física da config, então VLANs e bridges que um
+    commit cria não custam nada. Eventos perdidos: poll incondicional e erro na linha do serviço em
+    `system.service.print`. O poll de 1 s continua como rede de segurança.
+  - engine: a porta que volta sem ter sido vista ausente ganha a linha própria no log,
+    "ether4: port was replugged (gone and back within a second); its configuration was applied
+    again" (a que foi vista ausente segue com "port is back").
+
+  Como testar: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
+  corerouter-hal-linux --test netns_replug` (a porta recriada antes do poll volta com endereço e
+  MTU; o socket de eventos dá o nome dela) e `… cargo test -p corerouter-daemon --test netns_replug`
+  (daemon `--backend linux`, `ether2` apagada e recriada três vezes: endereço de volta em ≤36 ms e
+  a linha no log); `cargo test -p corerouter-engine --lib port_absent` (laboratório virtual: replug
+  entre polls, `link_events` só olha para porta da config); `cargo test -p corerouter-hal-linux
+  --lib link_events` (parser e proptest).
+
+  Desempenho e paralelismo (**medido**, 2026-10-30, namespace com dummies, 32 núcleos): o poll
+  completo custa 312 µs com 11 links, 2,18 ms com 101 e 27,3 ms com 1001 (build release); a
+  conferência do `ifindex` é uma busca num mapa por porta reivindicada, dentro de um dump que o poll
+  já fazia. Um evento de link é uma mensagem de 0,7–1,5 KB, já na fila quando o `ip` retorna; drenar
+  custa 3,4 µs; parado, 0 eventos por segundo. Uma thread só basta: o kernel serializa os eventos
+  num socket, e o trabalho é o poll do engine, sob o lock do `Session` como o do relógio; uma
+  rajada (commit com mil VLANs) toma o lock uma vez por janela de 50 ms.
+
+- 2026-10-30 — G1.3e: Gerência sobe mesmo com o `apply` do boot falhando. Achado reproduzido em teste
+  (`boot_partial.rs`, antes da mudança): uma regra de firewall recusada pelo kernel deixava
+  **nenhum** endereço aplicado (o `hal-linux` aplica o nftables antes do plano netlink e desfaz
+  tudo na recusa) e o retry reaplicava a config inteira do zero a cada segundo (11 applies em
+  10 s, **medido**); todo commit falhava junto, e o erro só aparecia em `state.inspect`.
+
+  - engine (`boot_apply.rs`, novo): no boot, a config inteira num `apply` (caso normal, nada a
+    mais). Recusada: o núcleo (interfaces, endereços e o que nenhuma seção leva), depois cada
+    seção por cima do que já subiu, na ordem do `hal-linux`: `ethernet` (velocidade/duplex),
+    `routes`, `firewall` (filter/nat/mangle/raw, listas, listas de interface, avisos ao
+    assinante), `cgnat`, `fastpath`, `tuning`, `xdp`, `arp`, `mpls`. A seção recusada fica de
+    fora com o erro do kernel; `core` quer dizer que nem o núcleo entrou (como antes: tudo
+    fora). Seção inteira, não item: a regra ou rota culpada não é isolada (G1.3g).
+  - Retry com espera crescente (1, 2, 4… 60 s) só do que ficou de fora, um `apply` por seção; o
+    log repete o que está de fora quando muda e a cada 10 min. A seção volta sozinha quando o
+    kernel a aceita.
+  - Commit: parte do que o plano de dados tem de fato (não mais do zero). A seção recusada que o
+    commit não toca fica de fora dos dois lados (como a porta ausente do G1.3b); a que ele toca
+    entra, tudo ou nada como qualquer commit. Safe Mode e transações não mudam: aplicação
+    parcial só no boot e no retry.
+  - Visibilidade: saúde `boot.apply` (erro, com seção e motivo); `state.inspect` →
+    `storage.boot_apply_failed` (`[{section, error}]`, além do `boot_apply_error` de sempre);
+    `auth.whoami` → `boot_errors`, que a CLI e o MCP mostram como aviso no login e na descrição
+    do backend; GUI: selo vermelho "boot: <seções>" na barra de cima, com o motivo no hover e ⓘ
+    (pt/en).
+  - Caminhos laterais de `apply` (cliente DHCP, PPPoE, porta que volta) seguem calculando do
+    `running`, sem a máscara: com a seção `mpls` de fora, uma mudança de interface reaplica os
+    sysctls do MPLS e pode falhar, como já falhava antes (G1.3g).
+  - Risco aceito (escolha do usuário): firewall recusado sai inteiro e o roteador fica sem
+    filtro até a correção; por isso o erro vermelho em todo lugar. Por regra com trava de
+    gerência: G1.3g; firewall mínimo fechado: G1.3h.
+
+  Como testar: `cargo test -p corerouter-engine --test it boot_partial` (sucesso em um `apply`;
+  firewall, rota e MPLS recusados com a gerência no ar; várias seções; backoff; volta sozinha;
+  commit em outra parte e commit na seção recusada); `cargo test -p corerouter-ui --lib
+  boot_warning`; kernel real: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net --
+  cargo test -p corerouter-daemon --test netns_boot_partial` (daemon reiniciado com outra rota
+  no mesmo prefixo e métrica, que o CoreRouter não substitui: `10.13.0.1/24` sobe, a rota fica
+  de fora com `boot.apply`=`routes`, firewall aplicado, commit em outra parte funciona; tirada a
+  rota estranha, a nossa entra no retry e o erro some; 3,5 s, **medido**). Print em
+  `docs/changes/G1.3e-screenshots/top-bar-boot.png`.
+
+  Desempenho e paralelismo: boot sem erro = um `apply`, como antes. Com seção recusada, o boot
+  faz 1 + 1 + (seções presentes) applies, uma vez; o retry passa de um `apply` da config inteira
+  por segundo (O(n)/s com milhares de regras ou rotas) para um `apply` só da seção de fora a
+  cada 1…60 s. Um commit com boot pendente copia a config uma vez (só nesse estado). Nada a
+  dividir em threads: os applies são sequenciais por dependência (rotas precisam dos endereços,
+  firewall e MPLS das interfaces) e o kernel serializa o netlink de qualquer forma.

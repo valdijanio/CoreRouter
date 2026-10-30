@@ -130,6 +130,7 @@ pub fn detail(s: &mut Session, name: &IfName, hw: &NicHardware) -> Value {
         "cap_mbps": a.cap_mbps,
         "alert": a.alert,
         "recoveries": recoveries(s, name),
+        "watchdog": s.usb_watchdog_row(name),
     })
 }
 
@@ -206,6 +207,8 @@ impl Session {
     /// of finished recoveries, then the configuration of a recreated port
     /// put back once it is there again.
     pub(crate) fn usb_tick(&mut self, live: &[LinkState]) {
+        // G1.29d: the watchdog first; what it starts finishes on a later tick.
+        self.usb_watchdog_tick(live);
         let Some(r) = self.ext::<UsbRecovery>() else {
             return;
         };
@@ -236,7 +239,13 @@ impl Session {
                 }
                 let msg = match &result {
                     Ok(rep) if rep.back => format!("{name}: USB adapter recovered ({}{})", level.as_str(), if rep.power_cycled { ", port power cycled" } else { "" }),
-                    Ok(_) => format!("{name}: USB adapter reset ({}) but it did not come back within 20 s", level.as_str()),
+                    Ok(rep) => match &rep.back_as {
+                        // G1.29f: the image's PID 1 did not rename it
+                        // (an init without G1.6n, or its port-names thread
+                        // gone): say so, not only "did not come back".
+                        Some(k) => format!("{name}: USB adapter reset ({}) and it came back as '{k}', not '{name}': PID 1 did not give it its name again (log.os.print find 'port names')", level.as_str()),
+                        None => format!("{name}: USB adapter reset ({}) but it did not come back within 20 s", level.as_str()),
+                    },
                     Err(e) => format!("{name}: USB adapter reset ({}) failed: {e}", level.as_str()),
                 };
                 (msg, serde_json::to_value(result.as_ref().ok()).unwrap_or(Value::Null))

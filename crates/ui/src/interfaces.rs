@@ -63,6 +63,9 @@ pub(crate) struct Iface {
     /// `Some(why)`: a platform link CoreRouter does not manage (G1.18);
     /// listed, never changed.
     pub unmanaged: Option<String>,
+    /// `Some(why)`: a port of the config not on this machine, or a VLAN on
+    /// one (G1.3b, RouterOS flag I); its configuration waits for it.
+    pub invalid: Option<String>,
 }
 
 impl Iface {
@@ -87,6 +90,7 @@ impl Iface {
             // Older daemons send no `managed`: everything was theirs.
             unmanaged: (row.get("managed").and_then(Value::as_bool) == Some(false))
                 .then(|| opt("unmanaged_reason").unwrap_or_else(|| "not managed".into())),
+            invalid: flag("invalid").then(|| opt("invalid_reason").unwrap_or_else(|| "not on this machine".into())),
         }
     }
 
@@ -417,7 +421,9 @@ impl CoreRouterUi {
             let mut explain_link = false;
             ui.horizontal_wrapped(|ui| {
                 ui.strong(&i.name);
-                let (status, tone) = if i.disabled {
+                let (status, tone) = if i.invalid.is_some() {
+                    ("invalid", crate::chip::AMBER.tone(&visuals))
+                } else if i.disabled {
                     ("disabled", crate::chip::neutral_tone(&visuals))
                 } else if i.running {
                     ("up", crate::chip::GREEN.tone(&visuals))
@@ -627,9 +633,21 @@ impl CoreRouterUi {
                 Some((name.clone(), level))
             })
             .collect();
+        let watchdog: Vec<(String, bool)> = nic
+            .iter_mut()
+            .filter_map(|(name, v)| {
+                let on = v.usb_watchdog_set.take()?;
+                v.usb_fast_until = now + 15.0;
+                Some((name.clone(), on))
+            })
+            .collect();
         self.nic = nic;
         for (name, level) in usb {
             self.run("interface.usb.reset", json!({"name": name, "level": level}));
+        }
+        // G1.29d: the watchdog switch of a Hardware tab.
+        for (name, on) in watchdog {
+            self.run("interface.usb.watchdog.set", json!({"name": name, "enabled": on}));
         }
         if let Some((key, title)) = help {
             let title = crate::i18n::tr_in("interfaces", self.lang.labels, title);
@@ -858,11 +876,13 @@ pub(crate) fn opt_text(s: &str) -> Value {
     if s.is_empty() { Value::Null } else { json!(s) }
 }
 
-fn iface_row(row: &Value, spark: &std::collections::BTreeMap<String, String>) -> Row {
+pub(crate) fn iface_row(row: &Value, spark: &std::collections::BTreeMap<String, String>) -> Row {
     let i = Iface::from_row(row);
     let n = |k: &str| row.get(k).and_then(Value::as_u64).unwrap_or(0);
-    // RouterOS flags: X = disabled, R = running.
-    let flag = if i.disabled {
+    // RouterOS flags: I = invalid, X = disabled, R = running.
+    let flag = if i.invalid.is_some() {
+        "I"
+    } else if i.disabled {
         "X"
     } else if i.running {
         "R"
@@ -881,7 +901,7 @@ fn iface_row(row: &Value, spark: &std::collections::BTreeMap<String, String>) ->
                 if row.get("usb").is_some_and(Value::is_object) { crate::icons::USB } else { type_icon(&i.kind) },
                 i.kernel_kind
             ),
-            crate::chip::cell("", &[(if i.disabled { "disabled" } else if i.running { "up" } else { "no link" }, if i.running && !i.disabled { crate::chip::Kind::Green } else { crate::chip::Kind::Neutral })]),
+            crate::chip::cell("", &[link_chip(&i)]),
             i.mtu.clone(),
             human_bytes(n("rx_bytes")),
             human_bytes(n("tx_bytes")),
@@ -891,9 +911,22 @@ fn iface_row(row: &Value, spark: &std::collections::BTreeMap<String, String>) ->
             info_cell(&i),
             i.comment.clone(),
         ],
-        dimmed: i.disabled || i.unmanaged.is_some(),
+        dimmed: i.disabled || i.unmanaged.is_some() || i.invalid.is_some(),
         section: false,
         tint: None,
+    }
+}
+
+/// The Link cell: invalid (G1.3b) before disabled, then up or no link.
+fn link_chip(i: &Iface) -> (&'static str, crate::chip::Kind) {
+    if i.invalid.is_some() {
+        ("invalid", crate::chip::Kind::Amber)
+    } else if i.disabled {
+        ("disabled", crate::chip::Kind::Neutral)
+    } else if i.running {
+        ("up", crate::chip::Kind::Green)
+    } else {
+        ("no link", crate::chip::Kind::Neutral)
     }
 }
 
@@ -945,6 +978,9 @@ fn info(i: &Iface) -> String {
     }
     if let Some(why) = &i.unmanaged {
         parts.push(format!("not managed: {why}"));
+    }
+    if let Some(why) = &i.invalid {
+        parts.push(format!("invalid: {why}"));
     }
     parts.join(", ")
 }

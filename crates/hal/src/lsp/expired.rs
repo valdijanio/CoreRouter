@@ -88,10 +88,10 @@ pub struct Icmp {
     pub delivery: Delivery,
 }
 
-/// The stack and the start of the IP packet of an MPLS frame's payload
-/// (after the Ethernet header), if its top TTL expired. `None`: not
-/// expired, malformed, or not IP under the stack.
-pub fn parse(interface: &IfName, mpls: &[u8]) -> Option<Expired> {
+/// The label stack at the start of an MPLS frame's payload and where the
+/// packet under it starts. `None`: truncated, or deeper than
+/// [`MAX_STACK`].
+pub(super) fn read_stack(mpls: &[u8]) -> Option<(Vec<MplsLabel>, usize)> {
     let mut stack = Vec::new();
     let mut at = 0;
     loop {
@@ -105,22 +105,34 @@ pub fn parse(interface: &IfName, mpls: &[u8]) -> Option<Expired> {
         stack.push(l);
         at += 4;
         if l.bottom {
-            break;
+            return Some((stack, at));
         }
         if stack.len() >= MAX_STACK {
             return None;
         }
     }
+}
+
+/// The length of the IP packet starting `ip`, from its header (IPv6:
+/// header plus payload length; a jumbogram's 0 reads as 40).
+pub(super) fn ip_len(ip: &[u8]) -> Option<usize> {
+    match ip.first()? >> 4 {
+        4 => Some(usize::from(u16::from_be_bytes([*ip.get(2)?, *ip.get(3)?]))),
+        6 => Some(40 + usize::from(u16::from_be_bytes([*ip.get(4)?, *ip.get(5)?]))),
+        _ => None,
+    }
+}
+
+/// The stack and the start of the IP packet of an MPLS frame's payload
+/// (after the Ethernet header), if its top TTL expired. `None`: not
+/// expired, malformed, or not IP under the stack.
+pub fn parse(interface: &IfName, mpls: &[u8]) -> Option<Expired> {
+    let (stack, at) = read_stack(mpls)?;
     if stack.first()?.ttl > 1 {
         return None;
     }
     let ip = mpls.get(at..)?;
-    let len = match ip.first()? >> 4 {
-        4 => usize::from(u16::from_be_bytes([*ip.get(2)?, *ip.get(3)?])),
-        6 => 40 + usize::from(u16::from_be_bytes([*ip.get(4)?, *ip.get(5)?])),
-        _ => return None,
-    };
-    let keep = len.min(ip.len()).min(QUOTE);
+    let keep = ip_len(ip)?.min(ip.len()).min(QUOTE);
     Some(Expired {
         interface: interface.clone(),
         stack,
@@ -128,9 +140,25 @@ pub fn parse(interface: &IfName, mpls: &[u8]) -> Option<Expired> {
     })
 }
 
-/// What the expired packet was, read from its header.
-struct Original {
-    src: IpAddr,
+/// The source of the IP packet starting `packet` (the address an error
+/// about it goes to; the key of the per-source rate limit, G3.9da).
+pub fn origin(packet: &[u8]) -> Option<IpAddr> {
+    match packet.first()? >> 4 {
+        4 => {
+            let s: [u8; 4] = packet.get(12..16)?.try_into().ok()?;
+            Some(IpAddr::V4(Ipv4Addr::from(s)))
+        }
+        6 => {
+            let s: [u8; 16] = packet.get(8..24)?.try_into().ok()?;
+            Some(IpAddr::V6(Ipv6Addr::from(s)))
+        }
+        _ => None,
+    }
+}
+
+/// What the packet an error is about was, read from its header.
+pub(super) struct Original {
+    pub(super) src: IpAddr,
 }
 
 fn v4_unicast(a: Ipv4Addr) -> bool {
@@ -138,8 +166,9 @@ fn v4_unicast(a: Ipv4Addr) -> bool {
 }
 
 /// RFC 1812 §4.3.2.7 / RFC 4443 §2.4(e): whether an error may be sent
-/// about `p`, and to whom.
-fn original(p: &[u8]) -> Result<Original, &'static str> {
+/// about `p`, and to whom. `too_big`: an ICMPv6 Packet Too Big, which
+/// RFC 4443 §2.4(e.2) allows about a multicast destination.
+pub(super) fn original(p: &[u8], too_big: bool) -> Result<Original, &'static str> {
     match p.first().map(|b| b >> 4) {
         Some(4) => {
             let ihl = usize::from(p.first().copied().unwrap_or(0) & 0x0f) * 4;
@@ -188,7 +217,7 @@ fn original(p: &[u8]) -> Result<Original, &'static str> {
             if src.is_unspecified() || src.is_multicast() || src.is_loopback() {
                 return Err("source is not a unicast host");
             }
-            if dst.is_multicast() {
+            if dst.is_multicast() && !too_big {
                 return Err("multicast destination");
             }
             // ICMPv6 errors have types below 128 (RFC 4443 §2.1).
@@ -213,9 +242,9 @@ fn link_local(a: &IpAddr) -> bool {
 /// The address the error comes from: one of the incoming interface (a
 /// routable one first, as traceroute users expect the hop's link
 /// address), else what the view picks.
-fn source(e: &Expired, to: IpAddr, view: &dyn LsrView) -> Option<IpAddr> {
+pub(super) fn source(interface: &IfName, to: IpAddr, view: &dyn LsrView) -> Option<IpAddr> {
     let addrs: Vec<IpAddr> = view
-        .interface_addrs(&e.interface)
+        .interface_addrs(interface)
         .into_iter()
         .filter(|a| a.is_ipv6() == to.is_ipv6())
         .collect();
@@ -227,23 +256,24 @@ fn source(e: &Expired, to: IpAddr, view: &dyn LsrView) -> Option<IpAddr> {
         .or_else(|| view.source_for(to))
 }
 
-/// The ICMP message (header, quote, extensions) with its checksum;
-/// ICMPv6's covers the pseudo-header (RFC 4443 §2.3).
-fn icmp_message(e: &Expired, src: IpAddr, to: IpAddr) -> Vec<u8> {
-    let v6 = to.is_ipv6();
-    let ext = icmp_ext::encode_extension(&[icmp_ext::mpls_object(&e.stack)]);
-    let mut m = Vec::with_capacity(8 + QUOTE + ext.len());
-    if v6 {
-        // Length in 64-bit words at octet 4 (RFC 4884 §4.5).
-        m.extend_from_slice(&[ICMP6_TIME_EXCEEDED, 0, 0, 0, (QUOTE / 8) as u8, 0, 0, 0]);
-    } else {
-        // Length in 32-bit words at octet 5 (RFC 4884 §4.1).
-        m.extend_from_slice(&[ICMP_TIME_EXCEEDED, 0, 0, 0, 0, (QUOTE / 4) as u8, 0, 0]);
+/// The ICMP message: the 8-octet `head` (type, code, the rest; checksum
+/// zero), `body` (the quote, already sized), and the RFC 4950 object with
+/// `ext` when given, with its checksum; ICMPv6's covers the pseudo-header
+/// (RFC 4443 §2.3).
+pub(super) fn message(
+    head: [u8; 8],
+    body: &[u8],
+    ext: Option<&[MplsLabel]>,
+    src: IpAddr,
+    to: IpAddr,
+) -> Vec<u8> {
+    let ext = ext.map(|s| icmp_ext::encode_extension(&[icmp_ext::mpls_object(s)]));
+    let mut m = Vec::with_capacity(8 + body.len() + ext.as_ref().map_or(0, Vec::len));
+    m.extend_from_slice(&head);
+    m.extend_from_slice(body);
+    if let Some(ext) = &ext {
+        m.extend_from_slice(ext);
     }
-    let quote = e.packet.get(..QUOTE).unwrap_or(&e.packet);
-    m.extend_from_slice(quote);
-    m.resize(8 + QUOTE, 0);
-    m.extend_from_slice(&ext);
     let sum = match (src, to) {
         (IpAddr::V6(s), IpAddr::V6(d)) => {
             let mut pseudo = Vec::with_capacity(40 + m.len());
@@ -262,8 +292,23 @@ fn icmp_message(e: &Expired, src: IpAddr, to: IpAddr) -> Vec<u8> {
     m
 }
 
+/// The time exceeded message for `e`: the quote padded to [`QUOTE`] and
+/// the stack as it arrived.
+fn icmp_message(e: &Expired, src: IpAddr, to: IpAddr) -> Vec<u8> {
+    let head = if to.is_ipv6() {
+        // Length in 64-bit words at octet 4 (RFC 4884 §4.5).
+        [ICMP6_TIME_EXCEEDED, 0, 0, 0, (QUOTE / 8) as u8, 0, 0, 0]
+    } else {
+        // Length in 32-bit words at octet 5 (RFC 4884 §4.1).
+        [ICMP_TIME_EXCEEDED, 0, 0, 0, 0, (QUOTE / 4) as u8, 0, 0]
+    };
+    let mut body = e.packet.get(..QUOTE).unwrap_or(&e.packet).to_vec();
+    body.resize(QUOTE, 0);
+    message(head, &body, Some(&e.stack), src, to)
+}
+
 /// The whole IP packet of the error.
-fn ip_packet(src: IpAddr, to: IpAddr, icmp: &[u8]) -> Option<Vec<u8>> {
+pub(super) fn ip_packet(src: IpAddr, to: IpAddr, icmp: &[u8]) -> Option<Vec<u8>> {
     match (src, to) {
         (IpAddr::V4(s), IpAddr::V4(d)) => {
             let total = u16::try_from(20 + icmp.len()).ok()?;
@@ -293,8 +338,8 @@ fn ip_packet(src: IpAddr, to: IpAddr, icmp: &[u8]) -> Option<Vec<u8>> {
 
 /// The original stack with its top label swapped as the label table says
 /// (RFC 3032 §2.3.2), every TTL 255. `None`: the label has no entry.
-fn along_the_lsp(e: &Expired, view: &dyn LsrView) -> Option<Delivery> {
-    let (top, rest) = e.stack.split_first()?;
+fn along_the_lsp(stack: &[MplsLabel], view: &dyn LsrView) -> Option<Delivery> {
+    let (top, rest) = stack.split_first()?;
     let entry = view.label_entry(top.label)?;
     // ECMP: any way out does for an error.
     let nh = entry.nexthops.into_iter().find(|n| n.interface.is_some())?;
@@ -323,29 +368,38 @@ fn along_the_lsp(e: &Expired, view: &dyn LsrView) -> Option<Delivery> {
     })
 }
 
+/// How an error about a packet that came with `stack` goes back to `to`
+/// (RFC 3032 §2.3.2, see the module's doc).
+pub(super) fn delivery(
+    stack: &[MplsLabel],
+    to: IpAddr,
+    view: &dyn LsrView,
+) -> Result<Delivery, &'static str> {
+    let routed = || {
+        view.fec_route(IpNet::from(to))
+            .is_some_and(|nhs| !nhs.is_empty())
+    };
+    if stack.len() == 1 && routed() {
+        Ok(Delivery::Ip)
+    } else if let Some(d) = along_the_lsp(stack, view) {
+        Ok(d)
+    } else if routed() {
+        Ok(Delivery::Ip)
+    } else {
+        Err("no way back to the source")
+    }
+}
+
 /// The error for `e`, or why none is sent (for the counters).
 pub fn answer(e: &Expired, view: &dyn LsrView) -> Result<Icmp, &'static str> {
     if e.stack.first().is_none_or(|l| l.ttl > 1) {
         return Err("TTL not expired");
     }
-    let o = original(&e.packet)?;
-    let to = o.src;
-    let src = source(e, to, view).ok_or("no address to send from")?;
+    let to = original(&e.packet, false)?.src;
+    let src = source(&e.interface, to, view).ok_or("no address to send from")?;
     let message = icmp_message(e, src, to);
     let packet = ip_packet(src, to, &message).ok_or("address families differ")?;
-    let routed = || {
-        view.fec_route(IpNet::from(to))
-            .is_some_and(|nhs| !nhs.is_empty())
-    };
-    let delivery = if e.stack.len() == 1 && routed() {
-        Delivery::Ip
-    } else if let Some(d) = along_the_lsp(e, view) {
-        d
-    } else if routed() {
-        Delivery::Ip
-    } else {
-        return Err("no way back to the source");
-    };
+    let delivery = delivery(&e.stack, to, view)?;
     Ok(Icmp {
         packet,
         to,

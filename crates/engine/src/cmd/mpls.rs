@@ -24,10 +24,10 @@ const DEFAULT_LIMIT: u32 = 500;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "mpls.settings.get", "MPLS Settings", ["MPLS", "Settings"], None,
-        "{} → {dynamic_label_range, propagate_ttl, payload_mtu, lsp_ping_responder, lsp_ping_rate, lsp_ping_counters (null without a responder: {running, heard, replied, rate_limited, ignored, codes, error, failed}), icmp_ttl_exceeded, icmp_rate, icmp_counters (null without a responder: {expired, sent, rate_limited, dropped, reasons, error}), platform_labels (Linux table size), available, why?}",
+        "{} → {dynamic_label_range, propagate_ttl, payload_mtu, lsp_ping_responder, lsp_ping_rate, lsp_ping_counters (null without a responder: {running, heard, replied, rate_limited, ignored, codes, error, failed, tap}), icmp_ttl_exceeded, icmp_too_big, icmp_rate, icmp_rate_per_source, icmp_counters (null without a responder: {expired, too_big, sent, too_big_sent, rate_limited, rate_limited_source, dropped, reasons, error}), platform_labels (Linux table size), available, why?}",
         always, settings_get),
     cmd!("mpls.settings.set", "Set MPLS Settings", [], None,
-        "{dynamic_label_range?: string (\"16-1048575\": the labels LDP hands out; /mpls static uses labels above it), propagate_ttl?: bool (copy the IP TTL into labels, RFC 3032 §2.4.3), payload_mtu?: u32 (576..=65535, the IP packet size the MTU check assumes; default 1500), lsp_ping_responder?: bool (answer MPLS echo requests, RFC 8029; default yes), lsp_ping_rate?: u32 (1..=10000 echo replies per second, default 100), icmp_ttl_exceeded?: bool (ICMP time exceeded with the label stack for labeled packets whose TTL expires here, RFC 4950; default yes), icmp_rate?: u32 (1..=10000 of those per second, default 100)} → {dynamic_label_range, propagate_ttl, payload_mtu, lsp_ping_responder, lsp_ping_rate, icmp_ttl_exceeded, icmp_rate}",
+        "{dynamic_label_range?: string (\"16-1048575\": the labels LDP hands out; /mpls static uses labels above it), propagate_ttl?: bool (copy the IP TTL into labels, RFC 3032 §2.4.3), payload_mtu?: u32 (576..=65535, the IP packet size the MTU check assumes; default 1500), lsp_ping_responder?: bool (answer MPLS echo requests, RFC 8029; default yes), lsp_ping_rate?: u32 (1..=10000 echo replies per second, default 100), icmp_ttl_exceeded?: bool (ICMP time exceeded with the label stack for labeled packets whose TTL expires here, RFC 4950; default yes), icmp_too_big?: bool (ICMP fragmentation needed / packet too big for labeled packets larger than the MTU of their way out, RFC 3032 §3.4; default yes), icmp_rate?: u32 (1..=10000 of those ICMP errors per second in all, default 100), icmp_rate_per_source?: u32 (1..=10000 per second to one source, default 10)} → {dynamic_label_range, propagate_ttl, payload_mtu, lsp_ping_responder, lsp_ping_rate, icmp_ttl_exceeded, icmp_too_big, icmp_rate, icmp_rate_per_source}",
         mpls_supported, settings_set),
     cmd!("mpls.interface.add", "Add MPLS Interface", ["MPLS", "Interface"], None,
         "{interface: string (a name, or all), input?: bool (accept labeled packets; default yes), disabled?: bool, comment?: string} → {interface}",
@@ -160,7 +160,9 @@ fn settings_get(s: &mut Session, _: &Value) -> Result<Value> {
         "lsp_ping_rate": st.lsp_ping_rate,
         "lsp_ping_counters": crate::lsp_responder::counters_json(s),
         "icmp_ttl_exceeded": st.icmp_ttl_exceeded,
+        "icmp_too_big": st.icmp_too_big,
         "icmp_rate": st.icmp_rate,
+        "icmp_rate_per_source": st.icmp_rate_per_source,
         "icmp_counters": crate::lsp_responder::icmp_json(s),
         "platform_labels": st.platform_labels(),
         "available": why.is_none(),
@@ -188,21 +190,32 @@ fn settings_set(s: &mut Session, p: &Value) -> Result<Value> {
         ));
     }
     let icmp = opt_bool(p, "icmp_ttl_exceeded")?;
-    let icmp_rate = opt_u32(p, "icmp_rate")?;
-    if let Some(r) = icmp_rate
-        && !(1..=corerouter_model::mpls::MAX_ICMP_RATE).contains(&r)
-    {
-        return Err(EngineError::bad(
-            "icmp_rate",
-            format!("1..={} errors per second", corerouter_model::mpls::MAX_ICMP_RATE),
-        ));
+    let too_big = opt_bool(p, "icmp_too_big")?;
+    let mut rates = [None; 2];
+    for (slot, key) in rates.iter_mut().zip(["icmp_rate", "icmp_rate_per_source"]) {
+        *slot = opt_u32(p, key)?;
+        if let Some(r) = *slot
+            && !(1..=corerouter_model::mpls::MAX_ICMP_RATE).contains(&r)
+        {
+            return Err(EngineError::bad(
+                key,
+                format!("1..={} errors per second", corerouter_model::mpls::MAX_ICMP_RATE),
+            ));
+        }
     }
+    let [icmp_rate, per_source] = rates;
     let st = &mut s.store_mut().candidate_mut().routing.mpls.settings;
     if let Some(v) = icmp {
         st.icmp_ttl_exceeded = v;
     }
     if let Some(r) = icmp_rate {
         st.icmp_rate = r;
+    }
+    if let Some(r) = per_source {
+        st.icmp_rate_per_source = r;
+    }
+    if let Some(v) = too_big {
+        st.icmp_too_big = v;
     }
     if let Some(v) = responder {
         st.lsp_ping_responder = v;
@@ -226,7 +239,9 @@ fn settings_set(s: &mut Session, p: &Value) -> Result<Value> {
         "lsp_ping_responder": st.lsp_ping_responder,
         "lsp_ping_rate": st.lsp_ping_rate,
         "icmp_ttl_exceeded": st.icmp_ttl_exceeded,
+        "icmp_too_big": st.icmp_too_big,
         "icmp_rate": st.icmp_rate,
+        "icmp_rate_per_source": st.icmp_rate_per_source,
     }))
 }
 

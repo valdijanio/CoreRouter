@@ -2918,3 +2918,15 @@ lote netlink (50 000 regras = 24 MiB num lote, que só um root com `SO_SNDBUFFOR
   `revision_delta_one_filter_rule_of_10000` 29,2 µs → 51,6 µs; `revision_delta_one_route_of_60000`
   (novo) 65,2 µs → 130,7 µs. `one_filter_rule_of_10000` (só o `diff`, código igual) 28,4 → 31,2 µs:
   ruído da máquina compartilhada.
+
+- **medido** (VM `corerouter-lab`, 4 vCPU, kernel 6.18, release, 2026-10-29,
+  `hal-linux/benches/netns_mpls_ttl.rs`, MPLS de 64 octetos): sem taps 2,083 Melem/s; taps
+  `AF_PACKET` do respondedor 1,633; com o filtro de "grande demais" (G3.9da) 1,644 — o filtro
+  novo não custa nada mensurável.
+
+- **medido** (VM `corerouter-lab`, 4 vCPU, kernel 6.18, release, 2026-10-30,
+  `hal-linux/benches/netns_mpls_ttl.rs`, MPLS de 64 octetos, duas rodadas de 15 s por caso):
+  sem taps 1,715–2,039 Melem/s (início e fim de cada rodada); taps `AF_PACKET` 1,476 e 1,462;
+  tap tc (G3.9db) 1,844 e 1,986 — dentro da faixa do "sem taps", os sockets abaixo dela.
+
+- 2026-10-30 — G1.3d (**medido**, build release, namespace com dummies, 32 núcleos): `LinuxHal::poll` completo 312 µs (11 links), 2,18 ms (101), 27,3 ms (1001), mediana de 30; eventos `RTNLGRP_LINK`: 1 mensagem por del (672 B) e por add (1484 B), drenar 3,4 µs, 0 por segundo parado; replug → endereço de volta no daemon (build debug) ≤36 ms.

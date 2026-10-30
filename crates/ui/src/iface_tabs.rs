@@ -152,6 +152,8 @@ pub(crate) struct NicView {
     /// G1.29c: until then the Hardware tab refreshes every second, so the
     /// recovery's outcome shows as soon as it is known.
     pub(crate) usb_fast_until: f64,
+    /// G1.29d: the watchdog switch flipped (sent by the dialog).
+    pub(crate) usb_watchdog_set: Option<bool>,
 }
 
 impl NicView {
@@ -670,7 +672,7 @@ fn hardware(ui: &mut Ui, view: &mut NicView, can: &Avail, help: &mut Option<(&'s
     };
     // G1.29b: on a USB adapter, the USB part first (it is what limits it).
     if let Some(u) = h.get("usb").filter(|u| u.is_object()) {
-        usb_section(ui, u, help);
+        usb_section(ui, u, view, can, help);
         usb_recovery(ui, u, view, can, help);
         ui.add_space(6.0);
     }
@@ -764,7 +766,13 @@ fn usb_row(
 /// G1.29b: the USB device behind a USB adapter: the bus rate it
 /// negotiated (green, or amber when the port is slower than the adapter),
 /// what it could do, the port, power and the kernel's transmit timeouts.
-fn usb_section(ui: &mut Ui, u: &Value, help: &mut Option<(&'static str, &'static str)>) {
+fn usb_section(
+    ui: &mut Ui,
+    u: &Value,
+    view: &mut NicView,
+    can: &Avail,
+    help: &mut Option<(&'static str, &'static str)>,
+) {
     let slow = u.get("slow_port").and_then(Value::as_bool).unwrap_or(false);
     ui.horizontal(|ui| {
         ui.label(RichText::new("USB").strong());
@@ -838,6 +846,16 @@ fn usb_section(ui: &mut Ui, u: &Value, help: &mut Option<(&'static str, &'static
             if let Some(t) = recoveries_text(u) {
                 usb_row(ui, "Recoveries", "iface_usb.recoveries", Some(t), help);
             }
+            if let Some(w) = u.get("watchdog").filter(|w| w.is_object()) {
+                ui.horizontal(|ui| {
+                    ui.label("Watchdog");
+                    if crate::help::info_button(ui, ui.scope_id().with("iface_usb.watchdog"), "What is this?").clicked() {
+                        *help = Some(("iface_usb.watchdog", "Watchdog"));
+                    }
+                });
+                ui.horizontal(|ui| usb_watchdog(ui, w, view, can));
+                ui.end_row();
+            }
         });
     if let Some(a) = text(u, "alert").filter(|_| slow) {
         ui.add_space(4.0);
@@ -864,6 +882,22 @@ fn usb_recovery(
     let r = u.get("recoveries").cloned().unwrap_or(Value::Null);
     let running = r.get("running").is_some_and(|v| !v.is_null());
     let allowed = can.check("interface.usb.reset");
+    // Asking: the question takes the buttons' place (the tab has a fixed
+    // height; a line more would push Confirm out of sight).
+    if let Some(level) = view.usb_ask {
+        let (_, label, cost) = USB_LEVELS.iter().find(|(l, _, _)| *l == level).copied().unwrap_or(("", "", ""));
+        ui.add(egui::Label::new(RichText::new(format!("{label}? {cost}")).color(crate::chip::AMBER.tone(ui.visuals()).ink)).wrap());
+        ui.horizontal(|ui| {
+            if ui.button("Confirm").clicked() {
+                view.usb_go = Some(level);
+                view.usb_ask = None;
+            }
+            if ui.button("Cancel").clicked() {
+                view.usb_ask = None;
+            }
+        });
+        return;
+    }
     ui.horizontal(|ui| {
         for (level, label, cost) in USB_LEVELS {
             let enabled = allowed.is_ok() && !running && view.usb_ask.is_none();
@@ -880,18 +914,46 @@ fn usb_recovery(
             *help = Some(("iface_usb.recovery", "USB recovery"));
         }
     });
-    if let Some(level) = view.usb_ask {
-        let (_, label, cost) = USB_LEVELS.iter().find(|(l, _, _)| *l == level).copied().unwrap_or(("", "", ""));
-        ui.label(RichText::new(format!("{label}? {cost}")).color(crate::chip::AMBER.tone(ui.visuals()).ink));
-        ui.horizontal(|ui| {
-            if ui.button("Confirm").clicked() {
-                view.usb_go = Some(level);
-                view.usb_ask = None;
+}
+
+/// G1.29d: the watchdog's state and its per-adapter switch.
+fn usb_watchdog(ui: &mut Ui, w: &Value, view: &mut NicView, can: &Avail) {
+    let enabled = w.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    let state = text_of(w, "state").unwrap_or_default();
+    let stalls = w.get("stalls").and_then(Value::as_u64).unwrap_or(0);
+    let mut line = format!("{state} · {stalls} stall(s)");
+    if let Some(last) = w.get("last_action").filter(|l| l.is_object()) {
+        line = format!(
+            "{line} · last: {} {} s ago ({})",
+            text_of(last, "level").unwrap_or_default(),
+            last.get("secs_ago").and_then(Value::as_u64).unwrap_or(0),
+            text_of(last, "why").unwrap_or_default()
+        );
+    }
+    let kind = match state.as_str() {
+        "gave-up" => Some(crate::chip::Kind::Red),
+        "cooldown" => Some(crate::chip::Kind::Amber),
+        _ => None,
+    };
+    {
+        let allowed = can.check("interface.usb.watchdog.set");
+        let mut on = view.usb_watchdog_set.unwrap_or(enabled);
+        let r = ui.add_enabled(allowed.is_ok(), egui::Checkbox::new(&mut on, "enabled"));
+        let r = match &allowed {
+            Err(why) => r.on_disabled_hover_text(why.as_str()),
+            Ok(()) => r,
+        };
+        if r.changed() {
+            view.usb_watchdog_set = Some(on);
+        }
+        match kind {
+            Some(k) => {
+                crate::chip::chip(ui, &line, k.tone(ui.visuals()));
             }
-            if ui.button("Cancel").clicked() {
-                view.usb_ask = None;
+            None => {
+                ui.weak(line);
             }
-        });
+        }
     }
 }
 
