@@ -477,6 +477,9 @@ fn first_boot(
                     log!("{}: {e}", plan::MGMT_DONE);
                 }
             }
+            if !live {
+                apply_install_data(&ttys);
+            }
             let n = crate::ctl::call("ip.address.list", &serde_json::json!({}))
                 .ok()
                 .and_then(|v| v.as_array().map(Vec::len));
@@ -489,6 +492,40 @@ fn first_boot(
         });
     if let Err(e) = spawned {
         log!("first-boot thread: {e}");
+    }
+}
+
+/// What the install from the live image left in `/config` (G1.6y), once: the
+/// file goes even when a command fails, so a bad value cannot repeat at every
+/// boot. Parameters are not logged (a password hash).
+fn apply_install_data(ttys: &[String]) {
+    use corerouter_sysupdate::disks::{FIRST_BOOT, FIRST_BOOT_MAX};
+    let path = Path::new(plan::CONFIG_DIR).join(FIRST_BOOT);
+    let Ok(f) = File::open(&path) else {
+        return;
+    };
+    let mut text = String::new();
+    if let Err(e) = f.take(FIRST_BOOT_MAX).read_to_string(&mut text) {
+        log!("{}: {e}", path.display());
+    }
+    match plan::first_boot_commands(&text) {
+        Ok((commands, said)) => {
+            for (cmd, params) in commands {
+                match crate::ctl::call(cmd, &params) {
+                    Ok(_) => log!("install: {cmd}"),
+                    Err(e) => log!("install: {cmd}: {e}"),
+                }
+            }
+            log!("install: {said}");
+            crate::console::announce(ttys, &format!("CoreRouter installed; {said}"));
+        }
+        Err(e) => log!("{}: {e}", path.display()),
+    }
+    if let Err(e) = fs::remove_file(&path) {
+        log!("{}: {e}", path.display());
+    }
+    if let Ok(dir) = File::open(plan::CONFIG_DIR) {
+        let _ = dir.sync_all();
     }
 }
 
@@ -691,7 +728,25 @@ fn supervise(
     let mut stamp = None;
     loop {
         let what = action.load(Ordering::Relaxed);
-        if what != RUN {
+        // G1.6y: a challenge of System › Install to disk is open: the power
+        // button counts as presence at the machine, it does not power off.
+        // The daemon refuses `system.shutdown` meanwhile, so only the button
+        // arrives here.
+        if what == POWEROFF
+            && opts.mode == Mode::Live
+            && Path::new(corerouter_sysupdate::disks::CHALLENGE_OPEN).exists()
+        {
+            action.store(RUN, Ordering::Relaxed);
+            log("power button: counted for the install, not powering off");
+            let press = fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(corerouter_sysupdate::disks::BUTTON_PRESSES)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, b"x"));
+            if let Err(e) = press {
+                log!("{}: {e}", corerouter_sysupdate::disks::BUTTON_PRESSES);
+            }
+        } else if what != RUN {
             shutdown(what, d.pid, shell, &frr, setup);
         }
         // Reap every child that exited: ours and orphans reparented to PID 1.

@@ -23,34 +23,20 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use corerouter_sysupdate::efi::{LoadOption, Vars, boot_name};
+use corerouter_sysupdate::CARRY_PREFIXES;
+use corerouter_sysupdate::disks::{self, Disk, describe, human, sys};
 use corerouter_sysupdate::install::{self, Existing, Medium};
 use corerouter_sysupdate::package;
-use corerouter_sysupdate::{CARRY_PREFIXES, SlotCmdline, SlotId, ab};
 use rustix::system::RebootCommand;
 
 use crate::console::{self, Console};
 use crate::plan::{self, BootOptions, Mgmt};
 
-pub(crate) const KEYS: &str = "/etc/corerouter/image-keys";
+pub(crate) use corerouter_sysupdate::disks::KEYS;
 pub(crate) const AUTOINSTALL: &str =
     "/sys/firmware/qemu_fw_cfg/by_name/opt/org.corerouter/autoinstall/raw";
 /// USB sticks take a few seconds to show up.
 const MEDIUM_WAIT: Duration = Duration::from_secs(30);
-
-/// A disk that could be the target.
-struct Disk {
-    name: String,
-    bytes: u64,
-    lbs: u64,
-    model: String,
-    serial: String,
-    bus: &'static str,
-    removable: bool,
-    existing: Existing,
-    /// Why it cannot be the target.
-    refused: Option<String>,
-}
 
 /// The unattended install asked by the hypervisor.
 #[derive(Debug, PartialEq)]
@@ -105,41 +91,6 @@ fn parse_auto(text: &str) -> Result<Auto, String> {
     })
 }
 
-fn sys(path: &str) -> String {
-    std::fs::read_to_string(path)
-        .map(|s| s.trim().to_owned())
-        .unwrap_or_default()
-}
-
-fn human(bytes: u64) -> String {
-    let g = bytes as f64 / (1u64 << 30) as f64;
-    if g >= 1.0 {
-        format!("{g:.1} GiB")
-    } else {
-        format!("{} MiB", bytes >> 20)
-    }
-}
-
-/// Whole disks (no partitions, loop, ram, device-mapper); optical drives
-/// only with `optical` (the medium may be a CD, a target never is).
-fn block_devices(optical: bool) -> Vec<String> {
-    let mut out: Vec<String> = std::fs::read_dir("/sys/block")
-        .map(|d| {
-            d.flatten()
-                .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|n| optical || !n.starts_with("sr"))
-                .filter(|n| {
-                    !["loop", "ram", "zram", "dm-", "md", "nbd", "fd"]
-                        .iter()
-                        .any(|p| n.starts_with(p))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    out.sort();
-    out
-}
-
 pub(crate) fn find_medium(
     con: &Console,
     keys: &[package::Key],
@@ -147,21 +98,13 @@ pub(crate) fn find_medium(
     let t = Instant::now();
     let mut said = std::collections::BTreeSet::new();
     loop {
-        for name in block_devices(true) {
-            let Ok(mut f) = File::open(format!("/dev/{name}")) else {
-                continue;
-            };
-            if !corerouter_sysupdate::iso::is_installer(&mut f) {
-                continue;
+        let found = disks::find_medium(keys, &mut |name, e| {
+            if said.insert(name.to_owned()) {
+                con.say(&format!("  {name}: an installer medium, but unusable: {e}"));
             }
-            match Medium::open(f, keys) {
-                Ok(m) => return Ok((name, m)),
-                Err(e) => {
-                    if said.insert(name.clone()) {
-                        con.say(&format!("  {name}: an installer medium, but unusable: {e}"));
-                    }
-                }
-            }
+        });
+        if let Some(m) = found {
+            return Ok(m);
         }
         if t.elapsed() >= MEDIUM_WAIT {
             return Err(format!(
@@ -170,107 +113,6 @@ pub(crate) fn find_medium(
             ));
         }
         std::thread::sleep(Duration::from_millis(250));
-    }
-}
-
-fn bus(name: &str) -> &'static str {
-    let p = std::fs::canonicalize(format!("/sys/block/{name}"))
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    if p.contains("/usb") {
-        "USB"
-    } else if name.starts_with("nvme") {
-        "NVMe"
-    } else if p.contains("/virtio") {
-        "virtio"
-    } else if p.contains("/ata") {
-        "SATA"
-    } else if name.starts_with("mmcblk") {
-        "SD/eMMC"
-    } else if name.starts_with("sr") {
-        "optical"
-    } else {
-        "SCSI"
-    }
-}
-
-/// G1.6g: a BIOS reads 512-byte blocks: GRUB and its offsets assume them.
-fn sector_refusal(bios: bool, lbs: u64) -> Option<String> {
-    (bios && lbs != 512).then(|| {
-        format!("{lbs}-byte sectors: a BIOS cannot boot it (start this installer in UEFI mode)")
-    })
-}
-
-fn disks(medium: &str, index: &install::Index, bios: bool) -> Vec<Disk> {
-    block_devices(false)
-        .into_iter()
-        .map(|name| {
-            let base = format!("/sys/block/{name}");
-            let bytes = sys(&format!("{base}/size")).parse::<u64>().unwrap_or(0) * 512;
-            let lbs = sys(&format!("{base}/queue/logical_block_size"))
-                .parse()
-                .unwrap_or(512);
-            let model = [
-                sys(&format!("{base}/device/vendor")),
-                sys(&format!("{base}/device/model")),
-            ]
-            .iter()
-            // virtio's "vendor" is the PCI id (0x1af4), not a name.
-            .filter(|s| !s.is_empty() && !s.starts_with("0x"))
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" ");
-            let serial = [format!("{base}/device/serial"), format!("{base}/serial")]
-                .iter()
-                .map(|p| sys(p))
-                .find(|s| !s.is_empty())
-                .unwrap_or_default();
-            let mut existing = Existing::Unknown;
-            let mut refused = None;
-            if name == medium {
-                refused = Some("the installer medium".into());
-            } else if let Some(r) = sector_refusal(bios, lbs) {
-                refused = Some(r);
-            } else if name.starts_with("sr") {
-                refused = Some("optical drive".into());
-            } else if sys(&format!("{base}/ro")) == "1" {
-                refused = Some("read-only".into());
-            } else if bytes < index.min_disk() {
-                refused = Some(format!(
-                    "smaller than the {} the image needs",
-                    human(index.min_disk())
-                ));
-            }
-            if let Ok(mut f) = File::open(format!("/dev/{name}")) {
-                if corerouter_sysupdate::iso::is_installer(&mut f) {
-                    refused.get_or_insert_with(|| "holds an installer image".into());
-                }
-                existing = install::existing(&mut f, lbs, index);
-            } else {
-                refused.get_or_insert_with(|| "cannot be opened".into());
-            }
-            Disk {
-                bus: bus(&name),
-                removable: sys(&format!("{base}/removable")) == "1",
-                name,
-                bytes,
-                lbs,
-                model,
-                serial,
-                existing,
-                refused,
-            }
-        })
-        .collect()
-}
-
-fn describe(e: &Existing) -> String {
-    match e {
-        Existing::Empty => "empty".into(),
-        Existing::Gpt(names) if names.is_empty() => "GPT, no partitions".into(),
-        Existing::Gpt(names) => format!("GPT: {}", names.join(", ")),
-        Existing::CoreRouter { .. } => "CoreRouter".into(),
-        Existing::Unknown => "data (MBR or a filesystem)".into(),
     }
 }
 
@@ -397,7 +239,7 @@ fn flow(
         None => None,
     };
     loop {
-        let ds = disks(&medium_dev, &medium.index, bios);
+        let ds = disks::list(&medium_dev, &medium.index, bios);
         table(con, &ds);
         let pick = match &auto {
             Some(a) => ds
@@ -622,15 +464,7 @@ fn slot_a_line(
     let tuning: Vec<(String, String)> = mgmt
         .map(|g| vec![("corerouter.mgmt".to_owned(), g.render())])
         .unwrap_or_default();
-    SlotCmdline {
-        slot: SlotId::A,
-        partuuid: rootfs_a,
-        manifest: m,
-        tuning: &tuning,
-        running,
-        drill: false,
-    }
-    .render()
+    install::slot_a_line(rootfs_a, m, running, &tuning)
 }
 
 fn mgmt_note(mgmt: Option<&Mgmt>) -> String {
@@ -643,45 +477,10 @@ fn mgmt_note(mgmt: Option<&Mgmt>) -> String {
     .unwrap_or_default()
 }
 
-/// `Boot####` "CoreRouter A" for the new disk, first in `BootOrder`; an
-/// earlier install's "CoreRouter B" entry goes (its slot is empty now).
+/// The boot entry for the new disk.
 fn boot_entry(r: &install::Report, line: &str, mgmt: Option<&Mgmt>) -> Result<String, String> {
-    let vars = Vars::efivarfs(plan::EFIVARS.target);
-    let ents = ab::entries(&vars);
-    let opt = LoadOption {
-        active: true,
-        description: SlotId::A.label().into(),
-        partition: r.esp.clone(),
-        file: Some(SlotId::A.efi_path()),
-        cmdline: line.to_owned(),
-    };
-    let used = vars.boot_numbers();
-    let n = match ents.first().copied().flatten() {
-        Some(n) => n,
-        None => (0..=0xffffu16)
-            .find(|n| !used.contains(n))
-            .ok_or("no free Boot#### number")?,
-    };
-    vars.set(&boot_name(n), &opt.encode()?)
-        .map_err(|e| format!("{}: {e}", boot_name(n)))?;
-    let stale_b = ents.get(1).copied().flatten();
-    if let Some(b) = stale_b {
-        let _ = vars.remove(&boot_name(b));
-    }
-    let mut order = vec![n];
-    for x in vars.boot_order().unwrap_or_default() {
-        if x != n && Some(x) != stale_b {
-            order.push(x);
-        }
-    }
-    vars.set_u16_list("BootOrder", &order)
-        .map_err(|e| format!("BootOrder: {e}"))?;
-    Ok(format!(
-        "Boot entry {} \"{}\" first in BootOrder{}",
-        boot_name(n),
-        SlotId::A.label(),
-        mgmt_note(mgmt)
-    ))
+    let entry = install::boot_entry(plan::EFIVARS.target, r, line)?;
+    Ok(format!("{entry}{}", mgmt_note(mgmt)))
 }
 
 #[cfg(test)]

@@ -49,6 +49,14 @@ fn shutdown(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn request(s: &mut Session, p: &Value, action: Action) -> Result<Value> {
     let what = action.as_str();
+    // G1.6y: PID 1 counts the power-off signal as the power button while a
+    // challenge is open; a command must not stand in for someone at the machine.
+    if action == Action::Shutdown && crate::install::challenge_open(s) {
+        return Err(EngineError::Disabled {
+            id: "system.shutdown".into(),
+            reason: "a disk erase is waiting for its code: cancel it first (system.install.cancel)".into(),
+        });
+    }
     if opt_bool(p, "confirm")? != Some(true) {
         return Err(EngineError::bad(
             "confirm",
