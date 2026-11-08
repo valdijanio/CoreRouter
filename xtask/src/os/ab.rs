@@ -160,10 +160,44 @@ pub(super) struct Vm {
 
 const SHELL_APPEND: &str = "ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off corerouter.shell=ttyS0";
 
+/// The firmware a test machine boots (G1.6g).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Firmware {
+    Ovmf,
+    SeaBios,
+}
+
+impl Firmware {
+    /// `--firmware <name>`.
+    pub(super) fn parse(s: Option<&str>) -> Result<Self, String> {
+        match s {
+            Some("ovmf") => Ok(Firmware::Ovmf),
+            Some("seabios") => Ok(Firmware::SeaBios),
+            other => Err(format!(
+                "--firmware {}: ovmf or seabios",
+                other.unwrap_or("needs a value")
+            )),
+        }
+    }
+
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Firmware::Ovmf => "OVMF",
+            Firmware::SeaBios => "SeaBIOS",
+        }
+    }
+}
+
 /// The QEMU machine every image test boots: q35, 2 vCPUs, 1 GiB, serial
 /// console on stdio, OVMF with the NVRAM in `vars`, no reboot (a guest
 /// reboot ends the run).
 pub(super) fn qemu_base(kvm: bool, vars: &Path) -> Command {
+    qemu_machine(kvm, Firmware::Ovmf, vars)
+}
+
+/// [`qemu_base`] with the firmware chosen (SeaBIOS is QEMU's default, it has
+/// no NVRAM).
+pub(super) fn qemu_machine(kvm: bool, fw: Firmware, vars: &Path) -> Command {
     let mut cmd = Command::new("qemu-system-x86_64");
     let accel = if kvm {
         "q35,accel=kvm"
@@ -175,10 +209,12 @@ pub(super) fn qemu_base(kvm: bool, vars: &Path) -> Command {
         "-smp", "2", "-m", "1024", "-display", "none", "-monitor", "none",
     ]);
     cmd.args(["-serial", "stdio", "-no-reboot"]);
-    cmd.arg("-drive")
-        .arg(format!("if=pflash,format=raw,readonly=on,file={OVMF_CODE}"));
-    cmd.arg("-drive")
-        .arg(format!("if=pflash,format=raw,file={}", vars.display()));
+    if fw == Firmware::Ovmf {
+        cmd.arg("-drive")
+            .arg(format!("if=pflash,format=raw,readonly=on,file={OVMF_CODE}"));
+        cmd.arg("-drive")
+            .arg(format!("if=pflash,format=raw,file={}", vars.display()));
+    }
     cmd.args(["-device", "virtio-rng-pci"]);
     cmd
 }
