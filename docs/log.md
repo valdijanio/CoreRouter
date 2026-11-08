@@ -9492,3 +9492,7 @@ continuação indentadas).
   Como testar: `cargo xtask os build`, `cargo xtask os install-test --firmware seabios`, e sem a opção
   para UEFI. **Medido** (KVM, QEMU 8.2.2): os 7 cenários passam nos dois firmwares em ~40 s. Sem máquina
   física. `system.package.print` e o A/B ainda respondem "not booted by UEFI" em BIOS: é a parte 2.
+
+- 2026-11-08 — G1.6y: Comandos `system.install.print|rescan|challenge|cancel|run` e o serviço `install` do daemon: lista os discos, escreve fora do lock e cria a entrada de boot. Disco vazio pede o nome; disco com dados ou CoreRouter pede também o código do console ou o botão de energia 3 vezes. Corrige a classificação de vazio: um `mkfs.btrfs` passava por vazio porque só o começo do disco era lido (reproduzido); agora lê primeiro e último MiB e 64 amostras, também no instalador de console. Testar: `cargo xtask os build && cargo xtask os install-test` (cenário `live_install`).
+
+- 2026-11-08 — G1.6y: `system.install.test`: por porta, driver, firmware que falta, link, velocidade, DHCP, gateway, DNS e a porta por onde a GUI chegou. `system.install.run` leva a porta de gerência (DHCP ou fixo), e o primeiro boot aplica isso e a senha definida no live, com o mesmo certificado TLS. Novo em `user.set`: `password_hash`. Testar: `cargo xtask os build && cargo xtask os install-test` (cenário `live_install`).
