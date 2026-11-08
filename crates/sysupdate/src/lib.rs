@@ -22,6 +22,7 @@
 //! directory that stands in for efivarfs, the ESP and the partitions.
 
 pub mod ab;
+pub mod disks;
 pub mod efi;
 #[cfg(unix)]
 pub mod ext4;

@@ -34,11 +34,12 @@ use std::time::Instant;
 use ring::digest::{Context, SHA256};
 use serde::{Deserialize, Serialize};
 
-use crate::efi::Partition;
+use crate::efi::{LoadOption, Partition, Vars, boot_name};
 use crate::gpt::{self, NewPart};
 use crate::iso::{self, Extent};
 use crate::package::{self, Header, Key, Manifest};
 use crate::verity;
+use crate::{SlotCmdline, SlotId};
 
 pub const INDEX: &str = "INSTALL.JSON";
 pub const SIGNATURE: &str = "INSTALL.SIG";
@@ -295,15 +296,115 @@ pub fn existing(disk: &mut (impl Read + Seek), lbs: u64, index: &Index) -> Exist
         }
         return Existing::Gpt(names);
     }
-    let mut head = vec![0u8; 64 << 10];
-    if disk.seek(SeekFrom::Start(0)).is_err() || disk.read(&mut head).is_err() {
-        return Existing::Unknown;
-    }
-    if head.iter().all(|&b| b == 0) {
+    if looks_blank(disk) {
         Existing::Empty
     } else {
         Existing::Unknown
     }
+}
+
+/// The edges of a disk, where partition tables and filesystem signatures live.
+const BLANK_EDGE: u64 = 1 << 20;
+const BLANK_SAMPLE: u64 = 64 << 10;
+const BLANK_SAMPLES: u64 = 64;
+
+/// G1.6y: "empty" decides that typing the name is enough, so it needs more
+/// than the first sectors: `mkfs.btrfs` leaves the first 64 KiB zero (its
+/// magic is at 64 KiB + 64) and many filesystems keep data far from the
+/// start. All zero in the first and last MiB and in samples across the disk;
+/// a read error is not "empty". A disk that is zero everywhere looked at can
+/// still hold data between the samples: 64 samples of 64 KiB, about a second
+/// on a spinning disk (**estimado**).
+fn looks_blank(disk: &mut (impl Read + Seek)) -> bool {
+    let Ok(size) = disk.seek(SeekFrom::End(0)) else {
+        return false;
+    };
+    if size == 0 {
+        return false;
+    }
+    let mut buf = vec![0u8; CHUNK];
+    let mut zero_at = |at: u64, len: u64| -> bool {
+        if disk.seek(SeekFrom::Start(at)).is_err() {
+            return false;
+        }
+        let mut left = len;
+        while left > 0 {
+            let n = left.min(CHUNK as u64) as usize;
+            let Some(b) = buf.get_mut(..n) else {
+                return false;
+            };
+            if disk.read_exact(b).is_err() || b.iter().any(|&x| x != 0) {
+                return false;
+            }
+            left -= n as u64;
+        }
+        true
+    };
+    let edge = BLANK_EDGE.min(size);
+    if !zero_at(0, edge) || !zero_at(size - edge, edge) {
+        return false;
+    }
+    let step = size / (BLANK_SAMPLES + 1);
+    (1..=BLANK_SAMPLES).all(|i| {
+        let at = step * i;
+        at + BLANK_SAMPLE > size || zero_at(at, BLANK_SAMPLE)
+    })
+}
+
+/// `Boot####` "CoreRouter A" for the disk just written, first in `BootOrder`;
+/// an earlier install's "CoreRouter B" entry goes (its slot is empty now).
+/// Returns the line for the operator.
+pub fn boot_entry(
+    efivars: &str,
+    r: &Report,
+    m: &Manifest,
+    running: &str,
+    tuning: &[(String, String)],
+) -> Result<String, String> {
+    let vars = Vars::efivarfs(efivars);
+    let ents = crate::ab::entries(&vars);
+    let line = SlotCmdline {
+        slot: SlotId::A,
+        partuuid: &r.rootfs_a,
+        manifest: m,
+        tuning,
+        running,
+        drill: false,
+    }
+    .render();
+    let opt = LoadOption {
+        active: true,
+        description: SlotId::A.label().into(),
+        partition: r.esp.clone(),
+        file: Some(SlotId::A.efi_path()),
+        cmdline: line,
+    };
+    let used = vars.boot_numbers();
+    let n = match ents.first().copied().flatten() {
+        Some(n) => n,
+        None => (0..=0xffffu16)
+            .find(|n| !used.contains(n))
+            .ok_or("no free Boot#### number")?,
+    };
+    vars.set(&boot_name(n), &opt.encode()?)
+        .map_err(|e| format!("{}: {e}", boot_name(n)))?;
+    let stale_b = ents.get(1).copied().flatten();
+    if let Some(b) = stale_b {
+        let _ = vars.remove(&boot_name(b));
+    }
+    let mut order = vec![n];
+    for x in vars.boot_order().unwrap_or_default() {
+        if x != n && Some(x) != stale_b {
+            order.push(x);
+        }
+    }
+    vars.set_u16_list("BootOrder", &order)
+        .map_err(|e| format!("BootOrder: {e}"))?;
+    Ok(format!(
+        "Boot entry {} \"{}\" first in BootOrder",
+        boot_name(n),
+        SlotId::A.label()
+    ))
 }
 
 fn config_keepable(
@@ -1101,5 +1202,31 @@ mod tests {
         assert_eq!(trim(&d).len(), 8192);
         d[9999] = 1;
         assert_eq!(trim(&d).len(), 10000);
+    }
+
+    /// G1.6y: reproduced with `mkfs.btrfs`: zero first 64 KiB, magic right
+    /// after. "Empty" lets a disk be erased by typing its name.
+    #[test]
+    fn only_a_disk_blank_at_every_look_is_empty() {
+        let b = build(|_| {});
+        let m = Medium::open(Cursor::new(b.iso.clone()), &b.keys).unwrap();
+        let size = 64usize << 20;
+        let look = |d: &[u8]| existing(&mut Cursor::new(d), 512, &m.index);
+        assert_eq!(look(&vec![0; size]), Existing::Empty);
+        for (what, at) in [
+            ("btrfs magic at 64 KiB + 64", (64 << 10) + 64),
+            ("the end of the first MiB", (1 << 20) - 1),
+            ("a backup GPT on the last sector", size - 512),
+            ("a sample in the middle", size / 65 * 32 + 10),
+        ] {
+            let mut d = vec![0; size];
+            d[at] = 1;
+            assert_eq!(look(&d), Existing::Unknown, "{what}");
+        }
+        assert_eq!(
+            look(&[]),
+            Existing::Unknown,
+            "a disk of no size is not empty"
+        );
     }
 }

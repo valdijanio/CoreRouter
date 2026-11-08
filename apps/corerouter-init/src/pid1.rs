@@ -675,7 +675,25 @@ fn supervise(
     let mut stamp = None;
     loop {
         let what = action.load(Ordering::Relaxed);
-        if what != RUN {
+        // G1.6y: a challenge of System › Install to disk is open: the power
+        // button counts as presence at the machine, it does not power off.
+        // The daemon refuses `system.shutdown` meanwhile, so only the button
+        // arrives here.
+        if what == POWEROFF
+            && opts.mode == Mode::Live
+            && Path::new(corerouter_sysupdate::disks::CHALLENGE_OPEN).exists()
+        {
+            action.store(RUN, Ordering::Relaxed);
+            log("power button: counted for the install, not powering off");
+            let press = fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(corerouter_sysupdate::disks::BUTTON_PRESSES)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, b"x"));
+            if let Err(e) = press {
+                log!("{}: {e}", corerouter_sysupdate::disks::BUTTON_PRESSES);
+            }
+        } else if what != RUN {
             shutdown(what, d.pid, shell, &frr, setup);
         }
         // Reap every child that exited: ours and orphans reparented to PID 1.

@@ -13,6 +13,8 @@
 //!    address (once) and the BGP config, pushed again to the new FRR.
 //! 4. `live`: the ISO without the flag, over that disk: the image from RAM,
 //!    DHCP on `ether1`, the router's work refused, the disk not touched.
+//!    `live_install`: `system.install.*` on an empty disk, a disk with data
+//!    (the console's code; the power button) and the boot of what it wrote.
 //! 5. `qcow2` and `ova`: the VM images boot as they are (the removable-media
 //!    path), with the console setup offered (no address yet).
 
@@ -426,6 +428,273 @@ fn live(t: &mut T) -> Result<(), String> {
     Ok(())
 }
 
+/// A press of the ACPI power button.
+fn power_button(qmp: &Path) -> Result<(), String> {
+    use std::io::{BufRead, BufReader, Write as _};
+    let s = std::os::unix::net::UnixStream::connect(qmp).map_err(|e| format!("qmp: {e}"))?;
+    let mut w = s.try_clone().map_err(|e| e.to_string())?;
+    let mut r = BufReader::new(s);
+    let mut line = String::new();
+    r.read_line(&mut line).map_err(|e| e.to_string())?;
+    for cmd in ["qmp_capabilities", "system_powerdown"] {
+        writeln!(w, "{{\"execute\":\"{cmd}\"}}").map_err(|e| e.to_string())?;
+        // Events (POWERDOWN) can come before the answer.
+        loop {
+            line.clear();
+            let n = r.read_line(&mut line).map_err(|e| e.to_string())?;
+            check(
+                n > 0 && !line.contains("\"error\""),
+                format!("qmp {cmd}: {line}"),
+            )?;
+            if line.contains("\"return\"") {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `system.install.print` until the scan is in, as JSON.
+fn install_print(t: &T, cli: &Path, port: u16) -> Result<serde_json::Value, String> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let got = live_cli(t, cli, port, "system.install.print", "{}").unwrap_or_default();
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(got.trim())
+            && v["scanned"] == true
+            && v["medium"].is_object()
+        {
+            return Ok(v);
+        }
+        check(Instant::now() < deadline, format!("no scan: {got}"))?;
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// A live VM with two writable raw disks (serials `BLANK`, `DATA`) and the
+/// power button on a QMP socket.
+fn live_two_disks(t: &mut T, name: &str, port: u16) -> Result<(Vm, PathBuf), String> {
+    let iso = t.images.join("corerouter-install.iso");
+    fresh_vars(&t.vars())?;
+    let qmp = t.work.join(format!("{name}.qmp"));
+    let _ = std::fs::remove_file(&qmp);
+    let mut cmd = qemu_base(t.kvm, &t.vars());
+    // The least the live image takes: the install must fit too. The last
+    // `-m` wins.
+    cmd.args(["-m", "256"]);
+    cmd.arg("-qmp")
+        .arg(format!("unix:{},server=on,wait=off", qmp.display()));
+    for (id, serial) in [("blank", "BLANK"), ("data", "DATA")] {
+        cmd.arg("-drive").arg(format!(
+            "file={},if=none,id={id},format=raw",
+            t.work.join(format!("{name}-{id}.raw")).display()
+        ));
+        cmd.arg("-device")
+            .arg(format!("virtio-blk-pci,drive={id},serial={serial}"));
+    }
+    cmd.arg("-drive").arg(format!(
+        "file={},if=none,id=cd,format=raw,media=cdrom,readonly=on",
+        iso.display()
+    ));
+    cmd.args(["-device", "ide-cd,drive=cd,bootindex=0"]);
+    cmd.arg("-netdev").arg(format!(
+        "user,id=n0,hostfwd=tcp:127.0.0.1:{port}-:{}",
+        super::GUEST_TLS_PORT
+    ));
+    cmd.args(["-device", "virtio-net-pci,netdev=n0"]);
+    let mut log = t.log.try_clone().map_err(|e| e.to_string())?;
+    let mut vm = start(&mut log, name, cmd)?;
+    vm.expect(&mut log, &["ready:"], 120)?;
+    Ok((vm, qmp))
+}
+
+/// Two disks of 2 GiB: all zero, and zero but for a btrfs-like signature past
+/// the first 64 KiB (what the first version called empty).
+fn two_disks(t: &T, name: &str) -> Result<(), String> {
+    use std::io::{Seek, Write as _};
+    for (id, signature) in [("blank", false), ("data", true)] {
+        let mut f = std::fs::File::create(t.work.join(format!("{name}-{id}.raw")))
+            .map_err(|e| e.to_string())?;
+        f.set_len(2 << 30).map_err(|e| e.to_string())?;
+        if signature {
+            f.seek(std::io::SeekFrom::Start((64 << 10) + 64))
+                .map_err(|e| e.to_string())?;
+            f.write_all(b"_BHRfS_M").map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn disk_named<'a>(v: &'a serde_json::Value, serial: &str) -> Result<&'a serde_json::Value, String> {
+    v["disks"]
+        .as_array()
+        .and_then(|a| a.iter().find(|d| d["serial"] == serial))
+        .ok_or_else(|| format!("no disk with serial {serial}: {v}"))
+}
+
+fn run_params(d: &serde_json::Value, typed: &str, code: Option<&str>) -> String {
+    let mut p = serde_json::json!({
+        "disk": d["name"], "serial": d["serial"], "size": d["bytes"], "typed_name": typed,
+    });
+    if let Some(c) = code {
+        p["code"] = serde_json::json!(c);
+    }
+    p.to_string()
+}
+
+/// `system.install.print` until the job ended; its result.
+fn install_result(t: &T, cli: &Path, port: u16) -> Result<serde_json::Value, String> {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let v = install_print(t, cli, port)?;
+        if v["job"].is_null() && !v["result"].is_null() {
+            return Ok(v["result"].clone());
+        }
+        check(
+            Instant::now() < deadline,
+            format!("install did not end: {v}"),
+        )?;
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// G1.6y: installing through the commands. A disk with data needs the code
+/// from the console (wrong ones refused, `system.shutdown` refused meanwhile);
+/// the disk then boots. An empty disk needs the name; the power button pressed
+/// three times stands for the code and, once the challenge is gone, powers off.
+fn live_install(t: &mut T) -> Result<(), String> {
+    let cli = super::push::cli(&t.root)?;
+    let mut log = t.log.try_clone().map_err(|e| e.to_string())?;
+
+    // A disk with data, by the code.
+    two_disks(t, "live1")?;
+    let port = super::free_port()?;
+    let (mut vm, _) = live_two_disks(t, "live1", port)?;
+    let v = install_print(t, &cli, port)?;
+    let (blank, data) = (
+        disk_named(&v, "BLANK")?.clone(),
+        disk_named(&v, "DATA")?.clone(),
+    );
+    check(blank["holds"] == "empty", format!("blank disk: {blank}"))?;
+    check(
+        data["holds"] == "data",
+        format!("a filesystem past 64 KiB called: {data}"),
+    )?;
+    check(data["confirm"] == "name+code", format!("{data}"))?;
+    let name = data["name"].as_str().unwrap_or_default().to_owned();
+    let refused = |p: String, want: &str, t: &T| -> Result<(), String> {
+        let e = live_cli(t, &cli, port, "system.install.run", &p)
+            .err()
+            .unwrap_or_default();
+        check(e.contains(want), format!("{p}: wanted '{want}': {e}"))
+    };
+    refused(run_params(&data, "wrong", None), "nothing was written", t)?;
+    refused(run_params(&data, &name, None), "challenge", t)?;
+    let ask = serde_json::json!({"disk": name, "serial": "DATA"}).to_string();
+    live_cli(t, &cli, port, "system.install.challenge", &ask)?;
+    let line = vm.expect(&mut log, &["*** Code: "], 20)?;
+    let code = line
+        .split("*** Code: ")
+        .nth(1)
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_default()
+        .to_owned();
+    check(code.len() == 6, format!("code on the console: {line}"))?;
+    let printed = live_cli(t, &cli, port, "system.install.print", "{}")?;
+    check(!printed.contains(&code), "print shows the code".to_owned())?;
+    refused(run_params(&data, &name, Some("WRONG0")), "2 tries", t)?;
+    let e = live_cli(t, &cli, port, "system.shutdown", r#"{"confirm":true}"#)
+        .err()
+        .unwrap_or_default();
+    check(
+        e.contains("code"),
+        format!("shutdown during a challenge: {e}"),
+    )?;
+    live_cli(
+        t,
+        &cli,
+        port,
+        "system.install.run",
+        &run_params(&data, &name, Some(&code)),
+    )?;
+    let r = install_result(t, &cli, port)?;
+    check(r["ok"] == true, format!("install: {r}"))?;
+    check(r["boot_entry"].is_string(), format!("boot entry: {r}"))?;
+    t.n.put(
+        "live: disk with data, by the console's code",
+        format!("{} ms, {r}", r["total_ms"]),
+    );
+    live_cli(t, &cli, port, "system.reboot", r#"{"confirm":true}"#)?;
+    vm.wait_exit(&mut log, 60)?;
+    // The firmware's new entry boots the disk, with the ISO still in.
+    let mut cmd = qemu_base(t.kvm, &t.vars());
+    cmd.arg("-drive").arg(format!(
+        "file={},if=none,id=d,format=raw",
+        t.work.join("live1-data.raw").display()
+    ));
+    cmd.args(["-device", "virtio-blk-pci,drive=d,serial=DATA"]);
+    cmd.arg("-drive").arg(format!(
+        "file={},if=none,id=cd,format=raw,media=cdrom,readonly=on",
+        t.images.join("corerouter-install.iso").display()
+    ));
+    cmd.args(["-device", "ide-cd,drive=cd"]);
+    cmd.args([
+        "-netdev",
+        "user,id=n0",
+        "-device",
+        "virtio-net-pci,netdev=n0",
+    ]);
+    let mut booted = start(&mut log, "live1/disk", cmd)?;
+    booted.expect_all(&mut log, &["/config: /dev/", "FRR up", "ready:"], 120)?;
+    drop(booted);
+    t.n.put(
+        "live: the disk boots after the install, the ISO still in",
+        "ok".to_owned(),
+    );
+
+    // The empty disk, by the name; the button.
+    two_disks(t, "live2")?;
+    let port = super::free_port()?;
+    let (mut vm, qmp) = live_two_disks(t, "live2", port)?;
+    let v = install_print(t, &cli, port)?;
+    let data = disk_named(&v, "DATA")?.clone();
+    let name = data["name"].as_str().unwrap_or_default().to_owned();
+    let ask = serde_json::json!({"disk": name, "serial": "DATA"}).to_string();
+    live_cli(t, &cli, port, "system.install.challenge", &ask)?;
+    vm.expect(&mut log, &["*** Code: "], 20)?;
+    for _ in 0..3 {
+        power_button(&qmp)?;
+        vm.expect(&mut log, &["power button: counted"], 10)?;
+    }
+    vm.expect(&mut log, &["*** Power button: confirmed"], 10)?;
+    let v = install_print(t, &cli, port)?;
+    check(v["challenge"]["presence"] == true, format!("presence: {v}"))?;
+    live_cli(t, &cli, port, "system.install.cancel", "{}")?;
+    let blank = disk_named(&v, "BLANK")?.clone();
+    let name = blank["name"].as_str().unwrap_or_default().to_owned();
+    live_cli(
+        t,
+        &cli,
+        port,
+        "system.install.run",
+        &run_params(&blank, &name, None),
+    )?;
+    let r = install_result(t, &cli, port)?;
+    check(r["ok"] == true, format!("install: {r}"))?;
+    t.n.put(
+        "live: empty disk by its name, button stands for the code",
+        "ok".to_owned(),
+    );
+    // No challenge open: the button is a power button again.
+    std::thread::sleep(Duration::from_millis(600));
+    power_button(&qmp)?;
+    vm.wait_exit(&mut log, 60)?;
+    t.n.put(
+        "live: the power button powers off with no challenge",
+        "ok".to_owned(),
+    );
+    Ok(())
+}
+
 /// `sh` in the guest: the output of `cmd`, marked.
 pub(super) fn sh(vm: &mut Vm, log: &mut std::fs::File, cmd: &str) -> Result<String, String> {
     let line = format!("{cmd} 2>&1 | tr '\\n' ' ' | sed \"s/^/@@$((2+2))S /\"; echo\n");
@@ -678,6 +947,7 @@ pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), S
 
     interactive(&mut t)?;
     live(&mut t)?;
+    live_install(&mut t)?;
 
     let qcow2 = images.join("corerouter.qcow2");
     t.boot_image("qcow2", &qcow2, "qcow2", true)?;
