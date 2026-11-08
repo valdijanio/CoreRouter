@@ -13,7 +13,21 @@ CONFIG_INITRAMFS_COMPRESSION_ZSTD=y
 # CONFIG_DEBUG_INFO_BTF is not set
 # CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT is not set
 CONFIG_DEBUG_INFO_NONE=y
-# G1.6j: the installer loads no modules (the image's are not in its
-# initramfs): the E810 is built in, in Safe Mode without its firmware, enough
-# to show the port. It works in full on the installed router.
+# G1.6j: the installer and the live image load no modules (the ones in the
+# image were built for the installed kernel), so a card must be built in here
+# to show a port on the ISO. The E810 runs in Safe Mode without its firmware
+# (it asks while probing, before the root is there), enough to show the port;
+# it works in full on the installed router. The others ask at open, or need
+# nothing. These are the common cards; the rest of nics.fragment gets its port
+# on the installed router only (docs/os-image.md has the table).
 CONFIG_ICE=y
+CONFIG_BNXT=y
+CONFIG_BNX2=y
+CONFIG_BNX2X=y
+CONFIG_MLX4_EN=y
+CONFIG_SFC=y
+CONFIG_AQTION=y
+CONFIG_ALX=y
+CONFIG_ATL1C=y
+CONFIG_SKY2=y
+CONFIG_8139TOO=y

@@ -48,6 +48,19 @@ mod push;
 mod release;
 mod web;
 
+/// G1.6j: the families an operator buys, to catch a list regenerated wrong.
+const REQUIRED_NICS: &[&str] = &[
+    "CONFIG_BNXT",
+    "CONFIG_BNX2X",
+    "CONFIG_MLX4_EN",
+    "CONFIG_CHELSIO_T4",
+    "CONFIG_QEDE",
+    "CONFIG_SFC",
+    "CONFIG_AQTION",
+    "CONFIG_DWMAC_INTEL",
+    "CONFIG_USB_RTL8150",
+];
+
 const DEFCONFIG: &str = "corerouter_x86_64_defconfig";
 /// Free space the build wants before it starts (cold build: ~8 GB in
 /// the out directory, **medido**; the rest is headroom for parallel sessions).
@@ -332,6 +345,15 @@ fn kernel_hash(hash_file: &str, version: &str) -> Option<String> {
     })
 }
 
+/// The `=m` symbols of a kernel config fragment.
+fn module_symbols(fragment: &str) -> Vec<&str> {
+    fragment
+        .lines()
+        .filter_map(|l| l.strip_suffix("=m"))
+        .filter(|s| s.starts_with("CONFIG_"))
+        .collect()
+}
+
 /// The `=y` symbols of a kernel config fragment.
 fn fragment_symbols(fragment: &str) -> Vec<&str> {
     fragment
@@ -409,6 +431,14 @@ pub fn check(os: &Path) -> Result<usize, String> {
     for want in REQUIRED_MODULES {
         if !fragment.lines().any(|l| l == format!("{want}=m")) {
             return Err(format!("linux.fragment: {want}=m is required"));
+        }
+        n += 1;
+    }
+    let nics = read("board/x86_64/nics.fragment")?;
+    let wide = module_symbols(&nics);
+    for want in REQUIRED_NICS {
+        if !wide.contains(want) {
+            return Err(format!("nics.fragment: {want}=m is required"));
         }
         n += 1;
     }
@@ -908,9 +938,23 @@ pub(crate) fn build_with(
     // Buildroot reads the kernel fragment only when it configures the
     // kernel: a changed fragment needs `linux-reconfigure` (the kernel's
     // own make is incremental underneath).
-    let fragment_hash = sha256_file(&d.os.join("board/x86_64/linux.fragment"))?;
+    let fragment_hash = format!(
+        "{} {} {}",
+        sha256_file(&d.os.join("board/x86_64/linux.fragment"))?,
+        sha256_file(&d.os.join("board/x86_64/nics.fragment"))?,
+        sha256_file(&d.os.join("board/x86_64/installer.fragment"))?,
+    );
     let stamp = d.out.join(".corerouter-linux-fragment.sha256");
     if std::fs::read_to_string(&stamp).ok().as_deref() != Some(fragment_hash.as_str()) {
+        // G1.6j: a driver taken off the list must leave the image too, and
+        // the target only gains files (below). The kernel installs them again.
+        let mut old_modules = vec![d.out.join("target/lib/modules")];
+        if let Ok(pkgs) = std::fs::read_dir(d.out.join("per-package")) {
+            old_modules.extend(pkgs.flatten().map(|p| p.path().join("target/lib/modules")));
+        }
+        for dir in old_modules.iter().filter(|p| p.exists()) {
+            std::fs::remove_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
         if d.out
             .join("build")
             .join(format!("linux-{version}/.config"))
@@ -918,6 +962,13 @@ pub(crate) fn build_with(
         {
             make(&["linux-reconfigure"], &[])?;
         }
+        // The installer's .config comes from the image's and its fragment;
+        // only its build stamp goes on every build, so this one goes here.
+        let _ = std::fs::remove_file(
+            d.out
+                .join("build")
+                .join(format!("corerouter-installer-{version}/.stamp_configured")),
+        );
         std::fs::write(&stamp, &fragment_hash).map_err(|e| format!("{}: {e}", stamp.display()))?;
     }
     // G1.6o: with per-package directories the final target only gains
@@ -977,6 +1028,23 @@ pub(crate) fn build_with(
         return Err(format!(
             "the kernel config dropped (missing dependency?): {}",
             lost.join(" ")
+        ));
+    }
+    let nics = std::fs::read_to_string(d.os.join("board/x86_64/nics.fragment"))
+        .map_err(|e| e.to_string())?;
+    // A driver of the wide list may be built in by linux.fragment, not less.
+    let wide = module_symbols(&nics);
+    let dropped: Vec<&str> = wide
+        .into_iter()
+        .filter(|s| {
+            !kc.lines()
+                .any(|l| l == format!("{s}=m") || l == format!("{s}=y"))
+        })
+        .collect();
+    if !dropped.is_empty() {
+        return Err(format!(
+            "the kernel config dropped drivers of nics.fragment (a new kernel? see docs/os-image.md): {}",
+            dropped.join(" ")
         ));
     }
     let lost: Vec<&str> = REQUIRED_MODULES
