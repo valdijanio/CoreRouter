@@ -829,6 +829,14 @@ comando do kernel e `/config` em disco).
   vez e apaga. O certificado TLS e os nomes das portas são copiados do live: a GUI que confiou nele
   reconecta sem aviso. Com `keep_config`, vale o que está no disco, e nada disso é escrito.
 
+### Janela Install to disk (G1.6y)
+
+System › Install to disk, na GUI e no navegador. No live, a barra de cima mostra o selo
+`live: not installed` e a janela abre sozinha uma vez. Uma janela só: discos, teste de rede, porta de
+gerência e senha. A confirmação pede o que o disco pede, com o tempo e as tentativas que o `print`
+informa. Depois de **Reboot**, a janela espera a reconexão e diz a versão e a porta; passados 3
+minutos sem resposta, manda olhar o console.
+
 ### FRR na imagem
 
 - **FRR 10.7.1 e libyang 3.13.6 (G1.6k).** O Buildroot 2025.02.19 traz o FRR 10.3 e a libyang

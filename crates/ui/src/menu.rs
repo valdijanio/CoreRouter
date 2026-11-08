@@ -93,6 +93,7 @@ pub(crate) const CATALOG: &[Entry] = &[
     e("graphs", None, None, icons::CHART_BAR, "/tool graphing", &["system.graph"], &["graphing", "gráfico", "grafico", "gráficos", "traffic", "tráfego", "trafego", "banda", "bandwidth", "p95", "percentil", "95th percentile", "cobrança", "billing", "mrtg", "rrd", "cacti", "librenms", "histórico", "cpu", "memória", "conntrack"]),
     e("history", None, None, icons::CLOCK_COUNTER_CLOCKWISE, "/system history", &["config.history", "config.rollback"], &["undo", "rollback", "desfazer", "revision", "revisão", "commit"]),
     e("identity", None, None, icons::IDENTIFICATION_BADGE, "/system identity", &["system.identity"], &["hostname", "nome", "name"]),
+    e("install_to_disk", None, None, icons::HARD_DRIVES, "/system install", &["system.install"], &["install", "instalar", "installer", "instalador", "disk", "disco", "live", "iso", "netinstall"]),
     e("interface-list", None, None, icons::LIST_BULLETS, "/interface list", &["interface.list"], &["lan", "wan", "lista", "member"]),
     e("interfaces", None, None, icons::PLUGS, "/interface", &["interface.print", "interface.set", "interface.ethernet", "interface.vlan", "interface.bridge"], &["ethernet", "porta", "port", "vlan", "bridge", "mtu", "link"]),
     e("ip-calc", None, None, icons::SQUARES_FOUR, "/tool ip-calc", &["tool.ip-calc"], &["subnet", "sub-rede", "calculadora", "calculator", "cidr", "máscara", "mask", "wildcard", "broadcast", "summarize", "sumarizar", "supernet", "pd", "prefix delegation", "cgnat planner", "planejar cgnat"]),

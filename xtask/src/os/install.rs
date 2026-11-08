@@ -369,9 +369,11 @@ fn live(t: &mut T) -> Result<(), String> {
         iso.display()
     ));
     cmd.args(["-device", "ide-cd,drive=cd,bootindex=0"]);
+    let web = super::free_port()?;
     cmd.arg("-netdev").arg(format!(
-        "user,id=n0,hostfwd=tcp:127.0.0.1:{port}-:{}",
-        super::GUEST_TLS_PORT
+        "user,id=n0,hostfwd=tcp:127.0.0.1:{port}-:{},hostfwd=tcp:127.0.0.1:{web}-:{}",
+        super::GUEST_TLS_PORT,
+        super::GUEST_WEB_PORT
     ));
     cmd.args(["-device", "virtio-net-pci,netdev=n0"]);
     let mut log = t.log.try_clone().map_err(|e| e.to_string())?;
@@ -405,6 +407,8 @@ fn live(t: &mut T) -> Result<(), String> {
         addresses.contains("ether1"),
         format!("address: {addresses}"),
     )?;
+    // The other way in: the browser's GUI.
+    t.n.put("live: the web GUI answers", super::web_check(web)?);
     let e = live_cli(
         t,
         &cli,

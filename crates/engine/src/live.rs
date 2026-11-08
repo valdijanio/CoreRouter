@@ -13,8 +13,9 @@ use crate::Session;
 pub struct Live;
 
 /// What may change something on a live image: a prefix ending in `.`, or a
-/// whole id. The port and the client side of the network, a password, an
-/// install, the power.
+/// whole id. The port and the client side of the network, the web GUI the
+/// install is made from (`--web-factory-on` turns it on through here), a
+/// password, an install, the power.
 const ALLOWED: &[&str] = &[
     "interface.set",
     "interface.ethernet.adopt",
@@ -22,6 +23,8 @@ const ALLOWED: &[&str] = &[
     "ip.route.",
     "ip.dhcp-client.",
     "ip.dns.set",
+    "ip.service.www-ssl.",
+    "ip.service.www.",
     "user.",
     "system.install.",
     "system.reboot",
@@ -78,6 +81,8 @@ mod tests {
     fn only_the_listed_commands_change_anything() {
         assert!(allowed("ip.dhcp-client.add"));
         assert!(allowed("system.install.run"));
+        assert!(allowed("ip.service.www-ssl.set"));
+        assert!(!allowed("ip.service.api.set"));
         assert!(!allowed("system.installer"));
         assert!(!allowed("ip.dhcp-server.add"));
         assert!(!allowed("routing.bgp.instance.add"));
