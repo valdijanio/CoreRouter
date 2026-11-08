@@ -27,8 +27,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use corerouter_sysupdate::biosboot;
 use corerouter_sysupdate::package::{self, Blob, Manifest, Rootfs};
 use corerouter_sysupdate::verity;
+use corerouter_sysupdate::{SlotCmdline, SlotId};
 
 const USAGE: &str = "usage: corerouter-image <seal IMAGES | key --keys DIR [--key PKCS8] | package --images DIR (--keys DIR | --key PKCS8) --out FILE [--version V] [--build N] [--channel C] [--squashfs FILE] | info PACKAGE | verify PACKAGE --keys DIR | genkey FILE | release-key (init --dir D | check --dir D | decrypt --dir D --out F) | installer IMAGES | ova --vmdk FILE --capacity BYTES --out FILE [--name N]>";
 
@@ -277,6 +279,7 @@ fn seal(args: &[String]) -> Result<(), String> {
     }
     std::fs::write(esp.join("BOOT/BOOTX64.EFI"), &kernel).map_err(|e| e.to_string())?;
     std::fs::write(esp.join("COREROUTER/A.HDR"), &header).map_err(|e| e.to_string())?;
+    grub_files(&images, &header)?;
     let size = std::fs::metadata(&pkg).map(|m| m.len()).unwrap_or(0);
     let _ = writeln!(
         std::io::stderr(),
@@ -288,6 +291,40 @@ fn seal(args: &[String]) -> Result<(), String> {
         size as f64 / 1048576.0,
         t.elapsed().as_millis()
     );
+    Ok(())
+}
+
+/// G1.6g: GRUB's files on the ESP, slot A's with its verity table: a disk
+/// booted by BIOS is on dm-verity from the first boot.
+fn grub_files(images: &Path, mut header: &[u8]) -> Result<(), String> {
+    let manifest = package::Header::read(&mut header)?.manifest;
+    let dir = images.join("efi-part").join(biosboot::DIR);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let line = SlotCmdline {
+        slot: SlotId::A,
+        partuuid: corerouter_sysupdate::builtin_rootfs_a().ok_or("no built-in root=")?,
+        manifest: &manifest,
+        tuning: &[],
+        running: "",
+        drill: false,
+    }
+    .render();
+    for (name, data) in [
+        (
+            biosboot::CFG_FILE.to_owned(),
+            biosboot::GRUB_CFG.as_bytes().to_vec(),
+        ),
+        (
+            biosboot::ENV_FILE.to_owned(),
+            biosboot::grubenv(SlotId::A, None),
+        ),
+        (
+            biosboot::cfg_name(SlotId::A),
+            biosboot::slot_cfg(SlotId::A, &line)?,
+        ),
+    ] {
+        std::fs::write(dir.join(name), data).map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 

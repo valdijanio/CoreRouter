@@ -183,7 +183,7 @@ fn medium() -> (Vec<u8>, Vec<Key>) {
         })
         .collect();
     let mut out = Vec::new();
-    iso::write(&mut out, &mut files, "EFIBOOT.IMG", 0).unwrap();
+    iso::write(&mut out, &mut files, "EFIBOOT.IMG", None, 0).unwrap();
     (out, keys)
 }
 
@@ -212,6 +212,8 @@ fn install_disk(c: &mut Criterion) {
             pipelined,
             parallel_verify,
             threads: 4,
+            bios_active: false,
+            bios_cmdline: None,
         };
         g.bench_function(name, |b| {
             b.iter(|| {

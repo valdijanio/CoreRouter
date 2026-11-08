@@ -23,6 +23,9 @@ PRETTY_NAME="CoreRouter (${COREROUTER_COMMIT:-dev})"
 VERSION_ID=${COREROUTER_COMMIT:-dev}
 HOME_URL=https://github.com/valdijanio/CoreRouter
 EOR
+# G1.6g: GRUB lives on the ESP and in the disk's first blocks; its recipe
+# also leaves a sample configuration here.
+rm -rf "$T/boot/grub"
 # G1.6c: FRR. corerouter-init starts the daemons hal-frr drives (no
 # frrinit.sh, watchfrr or bash); the daemon talks to their vty sockets
 # (no vtysh, which is the only FRR binary that links readline). Out of the

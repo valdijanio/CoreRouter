@@ -231,7 +231,7 @@ pub fn mgmt_notice(m: &Mgmt, ports: &[String]) -> String {
         .unwrap_or_default();
     let mut s = format!(
         "\nCoreRouter: management address {} on {}{gw}, from the kernel command line \
-         (corerouter.mgmt=, put in the UEFI boot entry by the installer). Applied once on this /config.\n\
+         (corerouter.mgmt=, put on the boot line by the installer). Applied once on this /config.\n\
          Not expected? The VM may have kept an earlier VM's NVRAM: start it with fresh NVRAM \
          (virsh start --reset-nvram; Proxmox: a new EFI disk).",
         m.address, m.interface

@@ -102,6 +102,9 @@ const REQUIRED_MODULES: &[&str] = &["CONFIG_ICE", "CONFIG_E100", "CONFIG_PCNET32
 const REQUIRED_BR2: &[&str] = &[
     "BR2_INIT_NONE=y",
     "BR2_TARGET_ROOTFS_SQUASHFS=y",
+    // G1.6g: post-image.sh makes the BIOS images with its grub-mkimage.
+    "BR2_TARGET_GRUB2=y",
+    "BR2_TARGET_GRUB2_I386_PC=y",
     "BR2_REPRODUCIBLE=y",
     "BR2_DOWNLOAD_FORCE_CHECK_HASHES=y",
     "BR2_PER_PACKAGE_DIRECTORIES=y",
@@ -135,7 +138,7 @@ const GUEST_TLS_PORT: u16 = 8729;
 /// G1.6o: `ip.service www-ssl`, on in a new config of the image.
 const GUEST_WEB_PORT: u16 = 443;
 
-const USAGE: &str = "usage: cargo xtask os <build [--only crpkg] [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|push --to HOST:PORT [--user U] [--no-build] [--no-wait] [--confirm manual]|release-key <init|check> [--dir D]|release --tag vX.Y.Z [--key-dir D] [--dry-run] [--no-build] [--repo OWNER/NAME]|out-dir|boot-test [--efi] [--tcg] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--scenario update|no-confirm|bad-signature|bad-param]|install-test [--tcg]|frr-test [--tcg]|firmware-lock --tag T|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
+const USAGE: &str = "usage: cargo xtask os <build [--only crpkg] [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|push --to HOST:PORT [--user U] [--no-build] [--no-wait] [--confirm manual]|release-key <init|check> [--dir D]|release --tag vX.Y.Z [--key-dir D] [--dry-run] [--no-build] [--repo OWNER/NAME]|out-dir|boot-test [--efi] [--tcg] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--scenario update|no-confirm|bad-signature|bad-param]|install-test [--tcg] [--firmware ovmf|seabios]|frr-test [--tcg]|firmware-lock --tag T|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
 
 pub fn main(root: &Path, args: &[String]) -> Outcome {
     let (sub, rest) = match args.split_first() {
