@@ -305,3 +305,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-11-08 — G1.6y criado (instalar pela GUI e pela web a partir da ISO live)
 - 2026-11-08 — G1.6j parte 1 feita (firmware na imagem e carga automática de drivers em módulo)
 - 2026-11-08 — G1.6g parte 1 (imagem e instalador por BIOS, GRUB)
+- 2026-11-08 — G1.6j feito (conjunto amplo de placas com fio e USB)

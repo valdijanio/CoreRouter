@@ -331,7 +331,16 @@ fn judge(text: &str) -> Whence {
             (w.starts_with("LICENSE") || w.starts_with("LICENCE") || w.starts_with("GPL-"))
                 && w.len() > 7
         })
-        .map_or_else(|| "WHENCE".to_owned(), |w| format!("LICENSES/{w}"));
+        .map_or_else(
+            || "WHENCE".to_owned(),
+            // An SPDX id names the license, not a file: the tree has `GPL-2.0`
+            // for every GPL-2.0-only and GPL-2.0-or-later.
+            |w| match w {
+                _ if w.starts_with("GPL-2") => "LICENSES/GPL-2.0".to_owned(),
+                _ if w.starts_with("GPL-3") => "LICENSES/GPL-3.0-only".to_owned(),
+                _ => format!("LICENSES/{w}"),
+            },
+        );
     let flat = text
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -348,9 +357,14 @@ fn judge(text: &str) -> Whence {
     ]
     .iter()
     .any(|w| flat.contains(w));
+    // "Allegedly GPLv2, but no source visible": the GPL asks for the source
+    // and nobody has it, so that claim does not let us ship the binary. A BSD
+    // alternative in the same line does.
+    let gpl_without_source = (flat.contains("no source visible") || flat.contains("allegedly gpl"))
+        && !flat.contains("bsd");
     Whence {
         license,
-        redistributable,
+        redistributable: redistributable && !gpl_without_source,
     }
 }
 
@@ -938,5 +952,33 @@ Licence: Proprietary. All rights reserved.
     fn the_tree_lock_is_valid() {
         let os = Path::new(env!("CARGO_MANIFEST_DIR")).join("../os");
         assert!(check(&os).unwrap() > 0);
+    }
+
+    #[test]
+    fn gpl_with_no_source_is_not_redistributable() {
+        let cases = [
+            ("Licence: Allegedly GPLv2, but no source visible.", false),
+            (
+                "Licence: Allegedly GPLv2+, but no source visible. Marked:",
+                false,
+            ),
+            (
+                "Licence: GPLv2 or OpenIB.org BSD license, no source visible",
+                true,
+            ),
+            ("Licence: GPLv2 or later. See GPL-2.0 for details.", true),
+            (
+                "Licence: Redistributable. See LICENSE.r8169 for details.",
+                true,
+            ),
+            ("Licence: Unknown", false),
+        ];
+        for (text, want) in cases {
+            assert_eq!(judge(text).redistributable, want, "{text}");
+        }
+        let spdx = "Licence: x. SPDX-License-Identifier: GPL-2.0-only";
+        assert_eq!(judge(spdx).license, "LICENSES/GPL-2.0");
+        let named = "Licence: GPLv2. See GPL-2.0-only for details.";
+        assert_eq!(judge(named).license, "LICENSES/GPL-2.0");
     }
 }
