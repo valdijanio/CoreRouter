@@ -198,8 +198,13 @@ CONFIG_NET_ACT_GACT=y
 CONFIG_NET_ACT_POLICE=y
 
 # --- NICs: Intel 10/25/40/100G, Mellanox ConnectX-4+, virtio, the common 1G.
-# ice loads its DDP package from /lib/firmware; without linux-firmware in the
-# image (G1.6c) it runs in safe mode (no RSS/flow director tuning).
+# G1.6j: a built-in driver probes before / is mounted, so one that asks for
+# its firmware while probing never finds the file. ice is such a driver, and
+# without its DDP package it runs in Safe Mode (one queue, no RSS, no XDP, no
+# offloads): it is a module, which corerouter-init loads after / is up.
+# e100 and pcnet32 are modules for the image's tests: QEMU emulates them
+# (boot-test: one at boot, one plugged in later), and e100 reads its firmware
+# from the root, the path no other emulated card exercises.
 CONFIG_NETDEVICES=y
 CONFIG_ETHERNET=y
 CONFIG_PCI=y
@@ -214,7 +219,11 @@ CONFIG_IXGBE=y
 CONFIG_IXGBEVF=y
 CONFIG_I40E=y
 CONFIG_I40EVF=y
-CONFIG_ICE=y
+CONFIG_ICE=m
+CONFIG_E100=m
+CONFIG_PCNET32=m
+CONFIG_MODULES=y
+CONFIG_FW_LOADER=y
 CONFIG_NET_VENDOR_MELLANOX=y
 CONFIG_MLX5_CORE=y
 CONFIG_MLX5_CORE_EN=y

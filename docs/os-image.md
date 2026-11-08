@@ -40,11 +40,12 @@ FRR: seção "Instalador, imagens de VM e FRR (G1.6c)" no fim.
 | Espaço de usuário | `nft` sem JSON e sem CLI interativa (só diagnóstico no shell de manutenção: o hal-linux fala nfnetlink, G2.8), glibc, busybox (só para o shell de manutenção) | defconfig |
 | Roteamento | FRR **10.7.1** com libyang 3.13.6 (a versão validada na VM do laboratório; receita do Buildroot `master` portada, G1.6k): `mgmtd`, `zebra`, `staticd`, `bgpd`, `ospfd`, `ospf6d`, `ldpd`, `bfdd`, iniciados pelo `corerouter-init`; sem `vtysh`, scripts nem bash (G1.6c) | defconfig, `post-build.sh`, `os/buildroot-patches/` |
 
-Tudo que o roteador precisa no kernel é `=y` (sem módulos): eBPF/XDP com BTF e JIT sempre
+O que o roteador precisa no kernel é `=y`; só os drivers de placa que precisam do `/` são módulo
+(`ice`: seção "Firmware das placas e drivers em módulo (G1.6j)"). eBPF/XDP com BTF e JIT sempre
 ligado, AF_XDP, nftables completo (NAT, conntrack, flowtable, fib, socket, synproxy), **VRF**
 (`CONFIG_NET_VRF=y`, que destrava o `ip.vrf.add`, G1.14), MPLS (roteamento e túnel), bonding,
 802.1Q, bridge com VLAN filtering, PPP/PPPoE, L2TP, WireGuard, VXLAN, GRE, filas (HTB, fq,
-fq_codel, cake) e as placas ixgbe/ixgbevf, i40e/iavf (`I40EVF`), ice, mlx5, virtio, e1000/e1000e/igb/igc
+fq_codel, cake) e as placas ixgbe/ixgbevf, i40e/iavf (`I40EVF`), mlx5, virtio, e1000/e1000e/igb/igc
 e r8169. O `cargo xtask os build` confere que **todo** `=y` do fragmento sobreviveu ao
 `olddefconfig` (um símbolo cuja dependência falta some sem aviso) e falha se algum sumiu.
 
@@ -184,9 +185,7 @@ precisar de streaming delta, o RAUC volta a ser a opção (o formato de bundle v
 ### O que ficou de fora e por quê
 
 - **A/B, dm-verity, assinatura, atualização**: G1.6b.
-- **Instalador, qcow2/OVA, FRR na imagem, firmware**: G1.6c. Sem o `linux-firmware`, a placa
-  `ice` sobe em modo seguro (sem o pacote DDP: sem ajuste fino de RSS/flow director); ixgbe, i40e
-  e mlx5 não precisam de arquivo de firmware.
+- **Instalador, qcow2/OVA, FRR na imagem**: G1.6c. **Firmware**: G1.6j.
 - **Secure Boot**: o kernel é o próprio `BOOTX64.EFI`; assinar o EFI stub (ou um UKI) entra
   junto com a assinatura da imagem no G1.6b.
 - **musl/estático**: a toolchain glibc do Bootlin serve ao daemon e ao `nft`; o daemon liga
@@ -621,6 +620,79 @@ desenvolvimento do mesmo commit; o host tinha outras sessões rodando.
 - **Instalador e imagens de VM** criando as entradas de boot na instalação: G1.6c (até lá, o
   primeiro boot de uma imagem gravada sobe sem verity, pelo fallback, e cria as entradas).
 
+## Firmware das placas e drivers em módulo (G1.6j)
+
+Pegadinha que decidiu o desenho: **um driver embutido (`=y`) sonda antes de o `/` existir.** As
+`do_initcalls` rodam antes de `prepare_namespace` (`init/main.c`, kernel 6.18.59). O `ice` pede o
+pacote DDP na sonda (`ice_main.c:4521`), recebe `-ENOENT` e entra em **Safe Mode** para sempre,
+mesmo com o arquivo no squashfs: uma fila (`ice_common.c:3249`), sem RSS, sem XDP
+(`ice_xdp_safe_mode`, `ice_main.c:3041`), sem checksum nem TSO por hardware (`ice_main.c:3554`).
+
+| Peça | O que faz | Onde |
+|---|---|---|
+| `ice` como módulo | a sonda roda depois do `/`, com o arquivo à vista | `linux.fragment`, `REQUIRED_MODULES` |
+| Carga automática | o PID 1 lê `modules.dep`/`modules.alias`, olha as placas PCI/USB sem driver e carrega o que casa, no boot e a cada placa nova (mensagens de dispositivo do kernel). Só módulos em `kernel/drivers/net/`. Numa thread: uma sonda travada não para o boot, que espera no máximo 20 s; a porta que chega depois recebe o nome pelo hot-plug | `apps/corerouter-init/src/modules.rs` |
+| Firmware | os arquivos que os drivers de rede declaram (`firmware=` no modinfo, como o VyOS), de um commit fixo do `linux-firmware`, com o SHA-256 de cada um, sem comprimir (o squashfs comprime) | `os/package/corerouter-firmware/firmware.lock` |
+| Licenças | só entra o que o `WHENCE` diz que pode ser redistribuído; o resto vira linha `skip`. Os textos e as entradas do `WHENCE` vão em `/usr/share/licenses/firmware/` | `cargo xtask os firmware-lock`, `xtask/src/os/firmware.rs` |
+| Conferência | depois de cada build: hash de cada arquivo na imagem, links, licenças, e todo `firmware=` dos drivers de rede presente ou em `skip`, senão o build falha | `firmware::verify` |
+
+```sh
+cargo xtask os firmware-lock --tag 20261019   # refaz a trava (precisa de um build pronto)
+```
+
+`corerouter.modules=off` na linha de comando do kernel desliga a carga automática: só fica o que é
+embutido, e uma E810 fica sem driver. Serve para quem não quer que um dispositivo USB plugado
+carregue um driver.
+
+**Os drivers e o firmware andam junto com o slot:** módulos e arquivos estão no rootfs (dm-verity)
+e o kernel no mesmo pacote `.crpkg`; o rollback volta os três. Por isso nada de firmware no
+`/config` (sem verity, e não voltaria no rollback) nem pacote de firmware separado.
+
+**O instalador e o live da ISO** não carregam módulos: o kernel é o da ISO, e os módulos do rootfs
+foram compilados para o kernel instalado. A `ice` é `=y` no `installer.fragment` e fica em Safe
+Mode, o que basta para mostrar a porta. O live trata isso como "completa depois de instalar".
+
+**Como o `boot-test` prova isso sem E810.** O QEMU não emula a `ice`, mas emula a `i82551`, cuja
+revisão faz o `e100` recusar abrir a porta sem `e100/d102e_ucode.bin`. O teste liga essa placa
+desde o boot (driver em módulo, varredura de boot), pluga uma `pcnet` depois (driver em módulo,
+mensagens de dispositivo) e sobe a `ether2` pelo canal de controle. Contraprova (**medido**,
+imagem sem firmware, mesma placa): `Direct firmware load for e100/d102e_ucode.bin failed with
+error -2` e o comando volta com erro; na imagem nova, `NIC Link is Up`. O caminho da própria E810
+só se confirma em placa real: a mensagem de pacote DDP carregado, mais de uma fila, XDP ligando,
+e o tempo da sonda.
+
+**Números (medido, 2026-11-08, build release da imagem, KVM nesta máquina):**
+
+| O quê | Valor |
+|---|---|
+| Firmware na trava | 41 arquivos + 1 link, 1 506 937 B crus, 5 textos de licença, nenhum `skip` |
+| `rootfs.squashfs` | 37 281 792 B (36 597 760 B numa build anterior de outro commit, sem firmware; não é comparação estrita) |
+| `corerouter.crpkg` | 57 357 909 B |
+| `linux-firmware` inteiro, para comparar | 1 408 384 541 B crus, 619 114 496 B em squashfs: não cabe no slot de 256 MiB |
+| Carregar `e100` no boot | ~91–100 ms; `ready` em 0,98–1,09 s depois do kernel |
+| Placa nova, driver já carregado | 112 ms até a porta ter nome |
+| Placa nova, driver em módulo (`pcnet32`) | 157 ms até a porta ter nome (50 ms na carga) |
+| Reprodutível | `linux-dirclean` e rebuild: rootfs, bzImage, todos os `.ko`, `disk.img`, instalador, ISO, qcow2 e crpkg com o mesmo hash |
+
+### Pesquisa
+
+- **Kernel 6.18.59:** `MODULE_FIRMWARE`/`request_firmware` lidos no fonte de cada driver.
+  `Documentation/driver-api/firmware/built-in-fw.rst` cita firmware não compatível com GPL como
+  motivo para não embutir (`CONFIG_EXTRA_FIRMWARE`), que foi a alternativa recusada.
+- **RouterOS** ([pacotes](https://manual.mikrotik.com/docs/getting-started/installation-and-upgrade/packages/)):
+  no x86 há um pacote de sistema; os de driver (`extra-nic`, `wifi-qcom`) são de ARM. O manual
+  não diz como o x86 trata firmware de placa.
+- **VyOS** ([build-linux-firmware.sh](https://github.com/vyos/vyos-build/blob/current/scripts/package-build/linux-kernel/build-linux-firmware.sh)):
+  o `modinfo` dos drivers de rede escolhe os arquivos. Adotado.
+- **OpenWrt** ([intel.mk](https://github.com/openwrt/openwrt/blob/main/package/firmware/linux-firmware/intel.mk)):
+  um pacote por família (`ice-firmware`, `r8169-firmware`, `r8152-firmware`). Não adotado: a
+  imagem aqui é uma só.
+- **FreeBSD/OPNsense** ([ice(4)](https://man.freebsd.org/cgi/man.cgi?query=ice&sektion=4)):
+  o DDP é um módulo (`ice_ddp`); há [relato de fórum](https://forum.opnsense.org/index.php?topic=52881.0)
+  de link caindo com DDP no 26.7, sem confirmação oficial: testar em placa real.
+- **Buildroot** (`BR2_PACKAGE_LINUX_FIRMWARE_*`): baixa o tarball inteiro (431 MB no 20250211,
+  642 MB no 20261019) e o 20250211 não tem `rtl8127a-1.fw`, que o 6.18 pede. Daí o pacote próprio.
+
 ## Instalador, imagens de VM e FRR (G1.6c)
 
 ```sh
@@ -1002,8 +1074,8 @@ topo) deram o mesmo `bzImage`, `rootfs.squashfs`, `disk.img`, pacote e imagens d
 - **Dois discos CoreRouter na mesma caixa:** os PARTUUIDs são fixos (a linha de comando embutida
   do fallback aponta para o `rootfs-a`); o instalador recusa um disco com a imagem do
   instalador, mas não um segundo CoreRouter. Anotado como risco.
-- **`linux-firmware` (pacote DDP da `ice`)**: não entrou; a `ice` segue em modo seguro (G1.6a).
-  Gap G1.6j.
+- **Firmware das placas (pacote DDP da `ice`)**: entrou no G1.6j; no instalador a `ice` segue
+  em Safe Mode, o que basta para listar a porta.
 - **Senha do `admin` no instalador:** não vai na linha de comando (fica na NVRAM); o assistente
   de console do primeiro boot a pede.
 

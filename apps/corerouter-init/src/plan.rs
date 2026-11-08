@@ -326,6 +326,9 @@ pub struct BootOptions {
     pub backend: String,
     pub mode: Mode,
     pub mgmt: Option<Mgmt>,
+    /// G1.6j: load the drivers of the cards found (`corerouter.modules=off`:
+    /// only what is built into the kernel).
+    pub modules: bool,
     /// Complaints about the command line, logged once at boot.
     pub warnings: Vec<String>,
 }
@@ -339,6 +342,7 @@ impl BootOptions {
             backend: "linux".into(),
             mode: Mode::Router,
             mgmt: None,
+            modules: true,
             warnings: Vec::new(),
         };
         for word in cmdline.split_ascii_whitespace() {
@@ -378,6 +382,13 @@ impl BootOptions {
                         "corerouter.mode={}: use install, live or router",
                         clip(value)
                     )),
+                },
+                "modules" => match value {
+                    "on" => out.modules = true,
+                    "off" => out.modules = false,
+                    _ => out
+                        .warnings
+                        .push(format!("corerouter.modules={}: use on or off", clip(value))),
                 },
                 "mgmt" => match Mgmt::parse(value) {
                     Ok(m) => out.mgmt = Some(m),
@@ -523,6 +534,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn modules_option() {
+        assert!(BootOptions::parse("quiet").modules);
+        assert!(!BootOptions::parse("corerouter.modules=off").modules);
+        assert!(BootOptions::parse("corerouter.modules=on").modules);
+        let bad = BootOptions::parse("corerouter.modules=maybe");
+        assert!(bad.modules);
+        assert_eq!(bad.warnings.len(), 1);
+    }
+
+    #[test]
     fn cmdline_defaults_and_options() {
         let o = BootOptions::parse("console=ttyS0 root=PARTLABEL=rootfs-a ro quiet");
         assert_eq!(
@@ -532,6 +553,7 @@ mod tests {
                 backend: "linux".into(),
                 mode: Mode::Router,
                 mgmt: None,
+                modules: true,
                 warnings: vec![]
             }
         );

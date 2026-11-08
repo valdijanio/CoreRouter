@@ -30,6 +30,8 @@ mod links;
 #[cfg(target_os = "linux")]
 mod live;
 #[cfg(target_os = "linux")]
+mod modules;
+#[cfg(target_os = "linux")]
 mod pid1;
 mod plan;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
