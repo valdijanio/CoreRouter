@@ -206,6 +206,7 @@ pub fn describe(session: &Session) -> Value {
             .map(|c| {
                 let enabled = session
                     .permit(crate::auth::required_group(c.id, c.journal))
+                    .and_then(|()| crate::live::permit(session, c.id, c.journal))
                     .and_then(|()| (c.enabled)(session));
                 json!({
                     "id": c.id,

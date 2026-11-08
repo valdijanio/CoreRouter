@@ -1,6 +1,8 @@
 //! The installer (G1.6c, `docs/os-image.md`): what PID 1 does when the
-//! installer ISO's kernel booted it (`corerouter.mode=install`, running
-//! from the initramfs; the medium can be a CD or a USB stick).
+//! installer ISO's kernel booted it and the console is what is left: the
+//! live image could not start, `i` on its console, or the hypervisor asked
+//! (`corerouter.mode=install` still means this directly). It runs from the
+//! initramfs; the medium can be a CD or a USB stick.
 //!
 //! It finds the medium (the ISO's volume id, then the signed index), lists
 //! the disks with size, model and bus, and installs only after the person
@@ -28,8 +30,9 @@ use rustix::system::RebootCommand;
 use crate::console::{self, Console};
 use crate::plan::{self, BootOptions, Mgmt};
 
-const KEYS: &str = "/etc/corerouter/image-keys";
-const AUTOINSTALL: &str = "/sys/firmware/qemu_fw_cfg/by_name/opt/org.corerouter/autoinstall/raw";
+pub(crate) const KEYS: &str = "/etc/corerouter/image-keys";
+pub(crate) const AUTOINSTALL: &str =
+    "/sys/firmware/qemu_fw_cfg/by_name/opt/org.corerouter/autoinstall/raw";
 /// USB sticks take a few seconds to show up.
 const MEDIUM_WAIT: Duration = Duration::from_secs(30);
 
@@ -135,7 +138,10 @@ fn block_devices(optical: bool) -> Vec<String> {
     out
 }
 
-fn find_medium(con: &Console, keys: &[package::Key]) -> Result<(String, Medium<File>), String> {
+pub(crate) fn find_medium(
+    con: &Console,
+    keys: &[package::Key],
+) -> Result<(String, Medium<File>), String> {
     let t = Instant::now();
     let mut said = std::collections::BTreeSet::new();
     loop {

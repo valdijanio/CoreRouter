@@ -11,7 +11,9 @@
 //! 3. `usb`: the ISO as a USB stick (the hybrid GPT), installing again over
 //!    the same disk keeping its configuration; the next boot still has the
 //!    address (once) and the BGP config, pushed again to the new FRR.
-//! 4. `qcow2` and `ova`: the VM images boot as they are (the removable-media
+//! 4. `live`: the ISO without the flag, over that disk: the image from RAM,
+//!    DHCP on `ether1`, the router's work refused, the disk not touched.
+//! 5. `qcow2` and `ova`: the VM images boot as they are (the removable-media
 //!    path), with the console setup offered (no address yet).
 
 #![allow(clippy::indexing_slicing)]
@@ -42,6 +44,7 @@ fn autoinstall(keep: bool) -> String {
 }
 
 struct T {
+    root: PathBuf,
     work: PathBuf,
     images: PathBuf,
     kvm: bool,
@@ -247,6 +250,8 @@ fn interactive(t: &mut T) -> Result<(), String> {
     ]);
     let mut log = t.log.try_clone().map_err(|e| e.to_string())?;
     let mut vm = start(&mut log, "install/interactive", cmd)?;
+    // G1.6y: the ISO boots live; `i` on its console is the installer.
+    answer(&mut vm, &mut log, "NOT INSTALLED", "i")?;
     let row = vm.expect(&mut log, &["not offered: the installer medium"], 120)?;
     check(row.contains("sda"), format!("the stick is not sda: {row}"))?;
     std::thread::sleep(Duration::from_millis(800));
@@ -298,6 +303,125 @@ fn interactive(t: &mut T) -> Result<(), String> {
     t.n.put(
         "interactive (USB): stick refused, wrong name refused, then",
         line.trim().to_owned(),
+    );
+    Ok(())
+}
+
+/// `corerouter-cli run` on the guest over TLS, as the first operator: `admin`
+/// without a password, the certificate accepted on first use.
+fn live_cli(t: &T, cli: &Path, port: u16, id: &str, params: &str) -> Result<String, String> {
+    let home = t.work.join("live-home");
+    std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
+    let out = Command::new(cli)
+        .args([
+            "--connect",
+            &format!("tls://127.0.0.1:{port}"),
+            "--user",
+            "admin",
+        ])
+        .arg("--accept-new-cert")
+        .args(["run", id, params])
+        .env("HOME", &home)
+        .env("COREROUTER_KNOWN_HOSTS", home.join("known_hosts"))
+        .env("COREROUTER_PASSWORD", "")
+        .env("RUST_LOG", "off")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("{}: {e}", cli.display()))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if out.status.success() {
+        Ok(text)
+    } else {
+        Err(text)
+    }
+}
+
+/// G1.6y: the ISO boots live with an installed CoreRouter on the (read-only)
+/// disk: the root in RAM, `/config` a tmpfs and not that disk's, no FRR, an
+/// address by DHCP on `ether1`, the router's work refused, and nothing
+/// survives. The port forward is the operator's GUI.
+fn live(t: &mut T) -> Result<(), String> {
+    let cli = super::push::cli(&t.root)?;
+    let iso = t.images.join("corerouter-install.iso");
+    fresh_vars(&t.vars())?;
+    let port = super::free_port()?;
+    let mut cmd = qemu_base(t.kvm, &t.vars());
+    cmd.arg("-drive").arg(format!(
+        "file={},if=none,id=target,format=qcow2,readonly=on",
+        t.work.join("target.qcow2").display()
+    ));
+    cmd.args(["-device", "virtio-blk-pci,drive=target"]);
+    cmd.arg("-drive").arg(format!(
+        "file={},if=none,id=cd,format=raw,media=cdrom,readonly=on",
+        iso.display()
+    ));
+    cmd.args(["-device", "ide-cd,drive=cd,bootindex=0"]);
+    cmd.arg("-netdev").arg(format!(
+        "user,id=n0,hostfwd=tcp:127.0.0.1:{port}-:{}",
+        super::GUEST_TLS_PORT
+    ));
+    cmd.args(["-device", "virtio-net-pci,netdev=n0"]);
+    let mut log = t.log.try_clone().map_err(|e| e.to_string())?;
+    let booted = Instant::now();
+    let mut vm = start(&mut log, "live", cmd)?;
+    vm.expect_all(
+        &mut log,
+        &[
+            "MiB in RAM, signed by key",
+            "/config: tmpfs (live image",
+            "eth0→ether1 (",
+            "ready:",
+            "NOT INSTALLED",
+        ],
+        120,
+    )?;
+    t.n.put(
+        "live: qemu start → console says not installed",
+        format!("{:.1} s", booted.elapsed().as_secs_f64()),
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let addresses = loop {
+        let got = live_cli(t, &cli, port, "ip.address.list", "{}").unwrap_or_default();
+        if got.contains("10.0.2.15") {
+            break got;
+        }
+        check(Instant::now() < deadline, format!("no DHCP address: {got}"))?;
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    check(
+        addresses.contains("ether1"),
+        format!("address: {addresses}"),
+    )?;
+    let e = live_cli(
+        t,
+        &cli,
+        port,
+        "ip.pool.add",
+        r#"{"name":"p","ranges":"10.0.0.2-10.0.0.9"}"#,
+    )
+    .err()
+    .unwrap_or_default();
+    check(
+        e.contains("live image"),
+        format!("a pool was not refused: {e}"),
+    )?;
+    let e = live_cli(t, &cli, port, "system.package.print", "{}")?;
+    check(
+        e.contains("not installed"),
+        format!("the package service looked at the disk: {e}"),
+    )?;
+    let services = live_cli(t, &cli, port, "system.resource.process.print", "{}")?;
+    check(
+        !services.contains("zebra") && !services.contains("mgmtd"),
+        format!("FRR runs in the live image: {services}"),
+    )?;
+    t.n.put(
+        "live: admin over TLS, DHCP on ether1, a pool refused",
+        "ok".to_owned(),
     );
     Ok(())
 }
@@ -428,11 +552,12 @@ fn check_installed(t: &mut T, vm: &mut Vm, port: u16, first: bool) -> Result<(),
         &format!("{what}: shell after exit"),
         "started again, no zombies".to_owned(),
     );
-    // FRR: the daemons, the frr service attached.
+    // FRR: the daemons always on (G1.6i starts the others when the config
+    // uses them), the frr service attached.
     let vty = sh(vm, &mut log, "ls /var/run/frr/ | grep -c 'vty$'")?;
     t.n.put(&format!("{what}: FRR vty sockets"), vty.clone());
     check(
-        vty.trim().parse::<u32>().unwrap_or(0) >= 7,
+        vty.trim().parse::<u32>().unwrap_or(0) >= 3,
         format!("FRR vty sockets: {vty}"),
     )?;
     let s = until(
@@ -518,6 +643,7 @@ pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), S
     let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
     let started = Instant::now();
     let mut t = T {
+        root: root.to_owned(),
         work: work.clone(),
         images: images.to_owned(),
         kvm: !tcg && super::kvm_usable(),
@@ -551,6 +677,7 @@ pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), S
     drop(vm);
 
     interactive(&mut t)?;
+    live(&mut t)?;
 
     let qcow2 = images.join("corerouter.qcow2");
     t.boot_image("qcow2", &qcow2, "qcow2", true)?;
