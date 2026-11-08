@@ -165,6 +165,15 @@ pub fn cmdline_value(cmdline: &str, key: &str) -> Option<String> {
     })
 }
 
+/// The words of the running line that the next slot written carries.
+pub fn carried(running: &str) -> Vec<String> {
+    let builtin = cmdline_words(BUILTIN_CMDLINE);
+    cmdline_words(running)
+        .into_iter()
+        .filter(|w| CARRY_PREFIXES.iter().any(|p| w.starts_with(p)) && !builtin.contains(w))
+        .collect()
+}
+
 /// What a slot's boot entry passes to its kernel (after the built-in line).
 pub struct SlotCmdline<'a> {
     pub slot: SlotId,
@@ -190,12 +199,8 @@ impl SlotCmdline<'_> {
         for (k, v) in self.tuning {
             w.push(format!("{k}={v}"));
         }
-        let builtin = cmdline_words(BUILTIN_CMDLINE);
-        for word in cmdline_words(self.running) {
-            if CARRY_PREFIXES.iter().any(|p| word.starts_with(p))
-                && !builtin.contains(&word)
-                && !w.contains(&word)
-            {
+        for word in carried(self.running) {
+            if !w.contains(&word) {
                 w.push(word);
             }
         }

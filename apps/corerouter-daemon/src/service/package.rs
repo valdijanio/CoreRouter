@@ -52,7 +52,6 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(1800);
 /// An upload with no chunk for this long is dropped (the client is gone).
 const UPLOAD_STALL: Duration = Duration::from_secs(60);
 const KEYS_DIR: &str = "/etc/corerouter/image-keys";
-const ESP_MOUNT: &str = "/run/corerouter/esp";
 /// Lab slots (sparse files).
 const LAB_SLOT: u64 = 256 << 20;
 const TUNING_KEYS: &[&str] = &[
@@ -434,12 +433,12 @@ fn check(p: &Platform, path: &Path) -> Result<Value, String> {
 
 #[cfg(target_os = "linux")]
 fn discover(config: &Path, keys: &Path) -> Result<Platform, String> {
-    corerouter_sysupdate::ab::discover(config, keys, Path::new(ESP_MOUNT))
+    use corerouter_sysupdate::ab;
+    ab::discover(config, keys, Path::new(ab::ESP_MOUNT))
 }
 
 #[cfg(not(target_os = "linux"))]
 fn discover(_: &Path, _: &Path) -> Result<Platform, String> {
-    let _ = ESP_MOUNT;
     Err("A/B updates run on the CoreRouter image (Linux) only".into())
 }
 

@@ -16,7 +16,7 @@ use rustix::process::{Pid, Signal, WaitOptions};
 use rustix::system::RebootCommand;
 
 use corerouter_sysupdate::SlotId;
-use corerouter_sysupdate::ab::{self, Boot};
+use corerouter_sysupdate::ab::{self, Boot, BootStore};
 use corerouter_sysupdate::efi::Vars;
 
 use crate::plan::{self, Backoff, BootOptions, Mode};
@@ -518,22 +518,31 @@ struct TrialWatch {
     from: SlotId,
     timeout_s: u64,
     deadline: Instant,
-    vars: Vars,
+    boot: BootStore,
     next_check: Instant,
 }
 
-/// efivarfs, then the boot step of the A/B image: marks a trial booted or
-/// records the failed one (restoring the configuration it ran with) before
-/// the daemon reads `/config`.
+/// efivarfs (G1.6g, on a BIOS: GRUB's files on the ESP), then the boot step of
+/// the A/B image: marks a trial booted or records the failed one (restoring
+/// the configuration it ran with) before the daemon reads `/config`.
 fn trial_at_boot(cmdline: &str) -> Option<TrialWatch> {
-    if !std::path::Path::new("/sys/firmware/efi").exists() {
-        return None;
-    }
-    mount_api(&plan::EFIVARS);
-    let vars = Vars::efivarfs(plan::EFIVARS.target);
+    let store = if std::path::Path::new("/sys/firmware/efi").exists() {
+        mount_api(&plan::EFIVARS);
+        BootStore::Uefi(Vars::efivarfs(plan::EFIVARS.target))
+    } else {
+        let esp = std::path::Path::new(ab::ESP_MOUNT);
+        if let Err(e) = ab::mount_esp(esp) {
+            log!("no GRUB state, no trial boot here: {e}");
+            return None;
+        }
+        BootStore::Bios(ab::Grub {
+            esp_dir: esp.to_owned(),
+            remount: true,
+        })
+    };
     let (boot, lines) = ab::at_boot(
         std::path::Path::new(plan::CONFIG_DIR),
-        &vars,
+        &store,
         cmdline,
         ab::fallback_partuuids(),
     );
@@ -551,7 +560,7 @@ fn trial_at_boot(cmdline: &str) -> Option<TrialWatch> {
             from,
             timeout_s,
             deadline: Instant::now() + Duration::from_secs(timeout_s),
-            vars,
+            boot: store,
             next_check: Instant::now(),
         }),
     }
@@ -833,7 +842,7 @@ fn supervise(
             && now >= t.next_check
         {
             t.next_check = now + Duration::from_secs(1);
-            if ab::primary(&t.vars) == Some(t.slot) {
+            if t.boot.primary() == Some(t.slot) {
                 log!("trial boot of slot {} confirmed", t.slot.as_str());
                 trial = None;
             } else if now >= t.deadline {

@@ -144,6 +144,7 @@ struct Ctx {
     work: PathBuf,
     images: PathBuf,
     kvm: bool,
+    fw: Firmware,
     log: std::fs::File,
     /// G1.6e: a host port forwarded to the guest's TLS control port.
     fwd: Option<u16>,
@@ -198,13 +199,15 @@ pub(super) fn qemu_base(kvm: bool, vars: &Path) -> Command {
 /// [`qemu_base`] with the firmware chosen (SeaBIOS is QEMU's default, it has
 /// no NVRAM).
 pub(super) fn qemu_machine(kvm: bool, fw: Firmware, vars: &Path) -> Command {
+    qemu_board("q35", kvm, fw, vars)
+}
+
+/// [`qemu_machine`] on another board (`pc`: the old PCI one, as Proxmox's
+/// default, where a SCSI controller goes).
+pub(super) fn qemu_board(board: &str, kvm: bool, fw: Firmware, vars: &Path) -> Command {
     let mut cmd = Command::new("qemu-system-x86_64");
-    let accel = if kvm {
-        "q35,accel=kvm"
-    } else {
-        "q35,accel=tcg"
-    };
-    cmd.args(["-machine", accel, "-cpu", if kvm { "host" } else { "max" }]);
+    let accel = format!("{board},accel={}", if kvm { "kvm" } else { "tcg" });
+    cmd.args(["-machine", &accel, "-cpu", if kvm { "host" } else { "max" }]);
     cmd.args([
         "-smp", "2", "-m", "1024", "-display", "none", "-monitor", "none",
     ]);
@@ -261,7 +264,7 @@ pub(super) fn start(log: &mut std::fs::File, name: &str, mut cmd: Command) -> Re
 
 impl Ctx {
     fn boot(&mut self, name: &str, first: bool, extra: &[&Path]) -> Result<Vm, String> {
-        let mut cmd = qemu_base(self.kvm, &self.work.join("vars.fd"));
+        let mut cmd = qemu_machine(self.kvm, self.fw, &self.work.join("vars.fd"));
         cmd.arg("-drive").arg(format!(
             "file={},if=virtio,format=qcow2",
             self.work.join("disk.qcow2").display()
@@ -281,10 +284,10 @@ impl Ctx {
         };
         cmd.args(["-netdev", &netdev, "-device", "virtio-net-pci,netdev=n0"]);
         if first {
-            // The factory boot: OVMF loads the kernel QEMU hands it, with the
-            // test's platform arguments; the image provisions its boot
-            // entries (carrying those arguments) and later boots go through
-            // the firmware's boot manager.
+            // The factory boot: the firmware loads the kernel QEMU hands it,
+            // with the test's platform arguments; the image provisions its
+            // boot entries (carrying those arguments) and later boots go
+            // through the firmware's boot manager, or GRUB.
             cmd.arg("-kernel").arg(self.images.join("bzImage"));
             cmd.arg("-append").arg(SHELL_APPEND);
         }
@@ -502,16 +505,7 @@ pub(super) fn check(cond: bool, what: impl Into<String>) -> Result<(), String> {
 /// and once through the boot entries it created. Returns the second run,
 /// on slot A with dm-verity.
 fn fresh(ctx: &mut Ctx, n: &mut Numbers, scenario: &str, extra: &[&Path]) -> Result<Vm, String> {
-    let disk = ctx.work.join("disk.qcow2");
-    let _ = std::fs::remove_file(&disk);
-    let st = Command::new("qemu-img")
-        .args(["create", "-q", "-f", "qcow2", "-F", "raw", "-b"])
-        .arg(ctx.images.join("disk.img"))
-        .arg(&disk)
-        .status()
-        .map_err(|e| format!("qemu-img: {e}"))?;
-    check(st.success(), "qemu-img create failed")?;
-    fresh_vars(&ctx.work.join("vars.fd"))?;
+    new_disk(ctx)?;
     let mut log = ctx.log.try_clone().map_err(|e| e.to_string())?;
     let mut vm = ctx.boot(&format!("{scenario}/factory"), true, &[])?;
     let r = vm.expect_all(&mut log, &["ready:", "maintenance shell"], 120)?;
@@ -521,7 +515,13 @@ fn fresh(ctx: &mut Ctx, n: &mut Numbers, scenario: &str, extra: &[&Path]) -> Res
             ready_s(r.first().map_or("", String::as_str)),
         );
     }
-    vm.print_until(&mut log, 30, |v| !slot(v, "a")["boot_entry"].is_null())?;
+    // On a BIOS the entry comes with the image: this is the line, with what it
+    // carries.
+    vm.print_until(&mut log, 30, |v| {
+        slot(v, "a")["cmdline"]
+            .as_str()
+            .is_some_and(|c| c.contains("corerouter.shell="))
+    })?;
     vm.poweroff(&mut log)?;
     drop(vm);
     let mut vm = ctx.boot(&format!("{scenario}/slot-a"), false, extra)?;
@@ -539,7 +539,29 @@ fn fresh(ctx: &mut Ctx, n: &mut Numbers, scenario: &str, extra: &[&Path]) -> Res
         slot(&v, "a")["verity"] == Value::Bool(true),
         format!("slot A is not on dm-verity: {}", slot(&v, "a")),
     )?;
+    let firmware = match ctx.fw {
+        Firmware::Ovmf => "uefi",
+        Firmware::SeaBios => "bios",
+    };
+    check(v["firmware"] == firmware, format!("firmware: {v}"))?;
     Ok(vm)
+}
+
+/// A new disk (qcow2 over disk.img) and an empty NVRAM.
+fn new_disk(ctx: &Ctx) -> Result<(), String> {
+    let disk = ctx.work.join("disk.qcow2");
+    let _ = std::fs::remove_file(&disk);
+    let st = Command::new("qemu-img")
+        .args(["create", "-q", "-f", "qcow2", "-F", "raw", "-b"])
+        .arg(ctx.images.join("disk.img"))
+        .arg(&disk)
+        .status()
+        .map_err(|e| format!("qemu-img: {e}"))?;
+    check(st.success(), "qemu-img create failed")?;
+    if ctx.fw == Firmware::Ovmf {
+        fresh_vars(&ctx.work.join("vars.fd"))?;
+    }
+    Ok(())
 }
 
 /// The result of job `queued` (what the queuing command answered).
@@ -1007,14 +1029,180 @@ fn scenario_push(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
     r
 }
 
-/// `cargo xtask os ab-test [--tcg] [--scenario update|push|no-confirm|bad-signature|bad-param]`.
+/// One update and its trial, confirmed. `next` is the slot it goes to.
+fn update_and_confirm(
+    ctx: &mut Ctx,
+    log: &mut std::fs::File,
+    mut vm: Vm,
+    next: &str,
+    name: &str,
+) -> Result<Value, String> {
+    vm.ok(
+        log,
+        "system.package.update",
+        r#"{"path":"/dev/vdb","timeout":120}"#,
+    )?;
+    vm.wait_exit(log, 120)?;
+    drop(vm);
+    let mut vm = ctx.boot(name, false, &[])?;
+    vm.expect_all(log, &["ready:", "maintenance shell"], 120)?;
+    let v = vm.print_until(log, 60, |v| v["primary"] == next)?;
+    check(
+        v["running"] == next && slot(&v, next)["verity"] == Value::Bool(true),
+        format!("{name}: {v}"),
+    )?;
+    vm.poweroff(log)?;
+    Ok(v)
+}
+
+/// G1.6g: the same disk, on each firmware in turn.
+fn scenario_cross(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
+    let first = ctx.fw;
+    let (a, b) = (Firmware::Ovmf, Firmware::SeaBios);
+    let r = (|| {
+        ctx.fw = a;
+        let pkg_b = ctx.work.join("cross-b.crpkg");
+        let pkg_c = ctx.work.join("cross-c.crpkg");
+        package(ctx, &pkg_b, "-b", None, None)?;
+        package(ctx, &pkg_c, "-c", None, None)?;
+        let mut log = ctx.log.try_clone().map_err(|e| e.to_string())?;
+        let vm = fresh(ctx, n, "cross", &[&pkg_b])?;
+        update_and_confirm(ctx, &mut log, vm, "b", "cross/uefi-trial-b")?;
+        // To a BIOS: the slot and the order UEFI left.
+        ctx.fw = b;
+        let mut vm = ctx.boot("cross/bios", false, &[&pkg_c])?;
+        vm.expect_all(&mut log, &["ready:", "maintenance shell"], 120)?;
+        let v = vm.print_until(&mut log, 30, |v| v["running"] == "b")?;
+        check(
+            v["firmware"] == "bios"
+                && v["primary"] == "b"
+                && slot(&v, "b")["verity"] == Value::Bool(true),
+            format!("moved to BIOS: {v}"),
+        )?;
+        let v = update_and_confirm(ctx, &mut log, vm, "a", "cross/bios-trial-a")?;
+        let hash = slot(&v, "a")["cmdline"].as_str().unwrap_or("").to_owned();
+        // Back on the old NVRAM: its order, and slot A's entry put right.
+        ctx.fw = a;
+        let mut vm = ctx.boot("cross/uefi", false, &[])?;
+        vm.expect_all(&mut log, &["ready:", "maintenance shell"], 120)?;
+        let v = vm.print_until(&mut log, 30, |v| {
+            slot(v, "a")["cmdline"].as_str() == Some(hash.as_str())
+        })?;
+        check(
+            v["firmware"] == "uefi" && v["running"] == "b",
+            format!("back on UEFI: {v}"),
+        )?;
+        vm.poweroff(&mut log)?;
+        Ok(())
+    })();
+    ctx.fw = first;
+    r
+}
+
+/// G1.6g: the power goes during an update (141 ms, **measured**) and around
+/// the moment GRUB erases `next=`. The next boot comes up on a verified slot.
+/// A torn block is the lab's (`bios_power_cut_around_grubenv`): a kill cannot
+/// aim at one sector.
+fn scenario_cut(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
+    let pkg = ctx.work.join("cut.crpkg");
+    package(ctx, &pkg, "-b", None, None)?;
+    let mut log = ctx.log.try_clone().map_err(|e| e.to_string())?;
+    let mut landed = Vec::new();
+    for (i, (update_ms, grub_ms)) in [
+        (Some(20), None),
+        (Some(60), None),
+        (Some(100), None),
+        (None, Some(100)),
+        (None, Some(200)),
+        (None, Some(300)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut vm = fresh(ctx, n, "cut", &[&pkg])?;
+        vm.ok(
+            &mut log,
+            "system.package.update",
+            r#"{"path":"/dev/vdb","timeout":120}"#,
+        )?;
+        if let Some(ms) = update_ms {
+            std::thread::sleep(Duration::from_millis(ms));
+            drop(vm);
+        } else {
+            vm.wait_exit(&mut log, 120)?;
+            drop(vm);
+            let vm = ctx.boot(&format!("cut/{i}-grub"), false, &[])?;
+            std::thread::sleep(Duration::from_millis(grub_ms.unwrap_or(0)));
+            drop(vm);
+        }
+        let mut vm = ctx.boot(&format!("cut/{i}-after"), false, &[])?;
+        vm.expect_all(&mut log, &["ready:", "maintenance shell"], 120)?;
+        let v = vm.print_until(&mut log, 30, |v| v["running"].is_string())?;
+        let on = v["running"].as_str().unwrap_or("").to_owned();
+        check(
+            slot(&v, &on)["verity"] == Value::Bool(true),
+            format!("cut {i}: {v}"),
+        )?;
+        landed.push(on);
+        vm.poweroff(&mut log)?;
+    }
+    n.put(
+        "power cuts: the slot each next boot came up on",
+        landed.join(" "),
+    );
+    Ok(())
+}
+
+/// G1.6g: Proxmox's controllers on its default board. The kernel needs each
+/// driver and SeaBIOS must read the disk through each one; `megasas` is out:
+/// QEMU's device fails the reads of SeaBIOS (`docs/os-image.md`).
+fn scenario_controllers(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
+    let mut log = ctx.log.try_clone().map_err(|e| e.to_string())?;
+    for (name, dev) in [
+        ("virtio-blk", "-device virtio-blk-pci,drive=d"),
+        (
+            "virtio-scsi",
+            "-device virtio-scsi-pci,id=s -device scsi-hd,drive=d,bus=s.0",
+        ),
+        (
+            "lsi53c895a",
+            "-device lsi53c895a,id=s -device scsi-hd,drive=d,bus=s.0",
+        ),
+        (
+            "pvscsi",
+            "-device pvscsi,id=s -device scsi-hd,drive=d,bus=s.0",
+        ),
+        ("ide", "-device ide-hd,drive=d,bus=ide.0"),
+    ] {
+        // A disk per controller: each boot ends with a cut, with no shell to
+        // power off from.
+        new_disk(ctx)?;
+        let mut cmd = qemu_board("pc", ctx.kvm, Firmware::SeaBios, &ctx.work.join("vars.fd"));
+        cmd.arg("-drive").arg(format!(
+            "file={},if=none,id=d,format=qcow2",
+            ctx.work.join("disk.qcow2").display()
+        ));
+        cmd.args(dev.split_whitespace());
+        let mut vm = start(&mut ctx.log, &format!("controllers/{name}"), cmd)?;
+        let r = vm.expect_all(&mut log, &["ready:"], 120)?;
+        n.put(
+            &format!("{name} on pc: kernel → daemon ready"),
+            ready_s(r.first().map_or("", String::as_str)),
+        );
+    }
+    Ok(())
+}
+
+/// `cargo xtask os ab-test [--tcg] [--firmware ovmf|seabios] [--scenario update|push|no-confirm|bad-signature|bad-param|cross|cut|controllers]`.
 pub fn ab_test(root: &Path, images: &Path, args: &[String]) -> Result<(), String> {
     let mut tcg = false;
     let mut only: Option<String> = None;
+    let mut fw = Firmware::Ovmf;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--tcg" => tcg = true,
+            "--firmware" => fw = Firmware::parse(it.next().map(String::as_str))?,
             "--scenario" => only = Some(it.next().ok_or("--scenario needs a name")?.clone()),
             other => return Err(format!("unknown argument '{other}'")),
         }
@@ -1037,17 +1225,21 @@ pub fn ab_test(root: &Path, images: &Path, args: &[String]) -> Result<(), String
         work: work.clone(),
         images: images.to_owned(),
         kvm: !tcg && super::kvm_usable(),
+        fw,
         log,
         fwd: None,
     };
     let mut n = Numbers(Vec::new());
     type Scenario = fn(&mut Ctx, &mut Numbers) -> Result<(), String>;
-    let all: [(&str, Scenario); 5] = [
+    let all: [(&str, Scenario); 8] = [
         ("update", scenario_update),
         ("push", scenario_push),
         ("no-confirm", scenario_no_confirm),
         ("bad-signature", scenario_bad_signature),
         ("bad-param", scenario_bad_param),
+        ("cross", scenario_cross),
+        ("cut", scenario_cut),
+        ("controllers", scenario_controllers),
     ];
     let t = Instant::now();
     let mut passed = Vec::new();
@@ -1055,9 +1247,14 @@ pub fn ab_test(root: &Path, images: &Path, args: &[String]) -> Result<(), String
         if only.as_deref().is_some_and(|o| o != name) {
             continue;
         }
+        // What is about GRUB's files and the old board runs with SeaBIOS.
+        if fw == Firmware::Ovmf && matches!(name, "cut" | "controllers") {
+            continue;
+        }
         eprintln!(
-            "\n== ab-test {name} ({}) ==",
-            if ctx.kvm { "KVM" } else { "TCG" }
+            "\n== ab-test {name} ({}, {}) ==",
+            if ctx.kvm { "KVM" } else { "TCG" },
+            fw.name()
         );
         let ts = Instant::now();
         f(&mut ctx, &mut n)
