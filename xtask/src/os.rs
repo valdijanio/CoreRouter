@@ -39,6 +39,7 @@ use crate::Outcome;
 use crate::vm_lab::{download, sha256_file};
 
 mod ab;
+mod firmware;
 mod frr;
 mod hotplug;
 mod install;
@@ -71,7 +72,8 @@ const REQUIRED_KERNEL: &[&str] = &[
     "CONFIG_PPPOE",
     "CONFIG_IXGBE",
     "CONFIG_I40E",
-    "CONFIG_ICE",
+    "CONFIG_MODULES",
+    "CONFIG_FW_LOADER",
     "CONFIG_MLX5_CORE_EN",
     "CONFIG_VIRTIO_NET",
     "CONFIG_VIRTIO_BLK",
@@ -92,6 +94,10 @@ const REQUIRED_KERNEL: &[&str] = &[
     "CONFIG_ATA_PIIX",
     "CONFIG_VMXNET3",
 ];
+/// G1.6j: drivers that must be modules. `ice` asks for its firmware while
+/// probing, which a built-in driver does before `/` is mounted; `e100` and
+/// `pcnet32` are what `boot-test` sees (QEMU emulates them).
+const REQUIRED_MODULES: &[&str] = &["CONFIG_ICE", "CONFIG_E100", "CONFIG_PCNET32"];
 /// Buildroot options the image's design rests on (docs/os-image.md).
 const REQUIRED_BR2: &[&str] = &[
     "BR2_INIT_NONE=y",
@@ -100,6 +106,7 @@ const REQUIRED_BR2: &[&str] = &[
     "BR2_DOWNLOAD_FORCE_CHECK_HASHES=y",
     "BR2_PER_PACKAGE_DIRECTORIES=y",
     "BR2_PACKAGE_COREROUTER=y",
+    "BR2_PACKAGE_COREROUTER_FIRMWARE=y",
     "BR2_PACKAGE_NFTABLES=y",
     "# BR2_TARGET_ENABLE_ROOT_LOGIN is not set",
     "BR2_PACKAGE_FRR=y",
@@ -114,6 +121,8 @@ const INSTALLER_KERNEL: &[&str] = &[
     "CONFIG_CMDLINE=\"console=tty0 console=ttyS0,115200 corerouter.mode=install panic=10 quiet\"",
     "CONFIG_INITRAMFS_COMPRESSION_ZSTD=y",
     "# CONFIG_DEBUG_INFO_BTF is not set",
+    // G1.6j: built in, or the installer would not show an E810 port.
+    "CONFIG_ICE=y",
 ];
 /// The installer's boot image (El Torito counts 16-bit 512-byte sectors).
 const MAX_BOOT_IMAGE: u64 = 65535 * 512;
@@ -126,7 +135,7 @@ const GUEST_TLS_PORT: u16 = 8729;
 /// G1.6o: `ip.service www-ssl`, on in a new config of the image.
 const GUEST_WEB_PORT: u16 = 443;
 
-const USAGE: &str = "usage: cargo xtask os <build [--only crpkg] [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|push --to HOST:PORT [--user U] [--no-build] [--no-wait] [--confirm manual]|release-key <init|check> [--dir D]|release --tag vX.Y.Z [--key-dir D] [--dry-run] [--no-build] [--repo OWNER/NAME]|out-dir|boot-test [--efi] [--tcg] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--scenario update|no-confirm|bad-signature|bad-param]|install-test [--tcg]|frr-test [--tcg]|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
+const USAGE: &str = "usage: cargo xtask os <build [--only crpkg] [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|push --to HOST:PORT [--user U] [--no-build] [--no-wait] [--confirm manual]|release-key <init|check> [--dir D]|release --tag vX.Y.Z [--key-dir D] [--dry-run] [--no-build] [--repo OWNER/NAME]|out-dir|boot-test [--efi] [--tcg] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--scenario update|no-confirm|bad-signature|bad-param]|install-test [--tcg]|frr-test [--tcg]|firmware-lock --tag T|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
 
 pub fn main(root: &Path, args: &[String]) -> Outcome {
     let (sub, rest) = match args.split_first() {
@@ -140,6 +149,13 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
         "install-test" => images_dir(root).and_then(|i| install::install_test(root, &i, rest)),
         "frr-test" => images_dir(root).and_then(|i| frr::frr_test(root, &i, rest)),
         "package" => images_dir(root).and_then(|i| package_cmd(root, &i, rest)),
+        "firmware-lock" => images_dir(root).and_then(|i| {
+            let target = i
+                .parent()
+                .map(|p| p.join("target"))
+                .ok_or("no target directory")?;
+            firmware::lock_cmd(root, &target, rest)
+        }),
         "push" => images_dir(root).and_then(|i| push::push(root, &i, rest)),
         "release-key" => release::release_key(root, rest),
         "release" => release::release(root, rest),
@@ -387,6 +403,13 @@ pub fn check(os: &Path) -> Result<usize, String> {
         }
         n += 1;
     }
+    for want in REQUIRED_MODULES {
+        if !fragment.lines().any(|l| l == format!("{want}=m")) {
+            return Err(format!("linux.fragment: {want}=m is required"));
+        }
+        n += 1;
+    }
+    n += firmware::check(os)?;
     let cmdline =
         config_value(&fragment, "CONFIG_CMDLINE").ok_or("linux.fragment: no CONFIG_CMDLINE")?;
     let root_uuid = cmdline
@@ -697,6 +720,8 @@ pub(crate) fn build_with(
         ));
     }
     fetch_buildroot(&d, &lock)?;
+    // G1.6j: the firmware files firmware.lock pins, hash checked.
+    let firmware_stage = firmware::stage(&d.os, &d.top)?;
     // G1.6o: the browser GUI that `ip.service www-ssl` serves. processo:
     // in its own cargo target. Sharing `cargo-target` with the image's
     // cargo (whose build scripts the Buildroot gcc links) made each build
@@ -758,6 +783,10 @@ pub(crate) fn build_with(
             cmd.env("RUSTC", rustc);
         }
         cmd.arg(format!("COREROUTER_WEB_DIR={}", web_dir.display()));
+        cmd.arg(format!(
+            "COREROUTER_FIRMWARE_STAGE={}",
+            firmware_stage.display()
+        ));
         cmd.arg(format!(
             "COREROUTER_CARGO_TARGET_DIR={}",
             d.top.join("cargo-target").display()
@@ -825,7 +854,10 @@ pub(crate) fn build_with(
     eprintln!("   linux-{version}.tar.xz: sha256 ok");
     // The workspace changes between builds; Buildroot only rebuilds a
     // package whose stamp is gone. cargo is incremental underneath.
-    make(&["corerouter-dirclean"], &[])?;
+    make(
+        &["corerouter-dirclean", "corerouter-firmware-dirclean"],
+        &[],
+    )?;
     // G1.6c: the installer kernel embeds the init: rebuilt after it
     // (kbuild relinks the initramfs and vmlinux only).
     let installer_dir = d.out.join("build").join(format!(
@@ -890,10 +922,18 @@ pub(crate) fn build_with(
     // a copy of its files: GUI files of an older build (names carry a
     // content hash) would pile up in the image. Every copy goes; ours is
     // installed again from <out>/web.
-    let web = Path::new("usr/share/corerouter/web");
-    let mut stale = vec![d.out.join("target").join(web)];
-    if let Ok(pkgs) = std::fs::read_dir(d.out.join("per-package")) {
-        stale.extend(pkgs.flatten().map(|p| p.path().join("target").join(web)));
+    // G1.6j: the same for the firmware of an older firmware.lock.
+    let mut stale = Vec::new();
+    for tree in [
+        "usr/share/corerouter/web",
+        "lib/firmware",
+        "usr/share/licenses/firmware",
+    ] {
+        let tree = Path::new(tree);
+        stale.push(d.out.join("target").join(tree));
+        if let Ok(pkgs) = std::fs::read_dir(d.out.join("per-package")) {
+            stale.extend(pkgs.flatten().map(|p| p.path().join("target").join(tree)));
+        }
     }
     for dir in stale.iter().filter(|p| p.exists()) {
         std::fs::remove_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -936,7 +976,20 @@ pub(crate) fn build_with(
             lost.join(" ")
         ));
     }
+    let lost: Vec<&str> = REQUIRED_MODULES
+        .iter()
+        .filter(|s| !kc.lines().any(|l| l == format!("{s}=m")))
+        .copied()
+        .collect();
+    if !lost.is_empty() {
+        return Err(format!(
+            "the kernel config lost the modules: {}",
+            lost.join(" ")
+        ));
+    }
     let libs = check_needed(&d.out.join("target"))?;
+    let fw = firmware::verify(&d.os, &d.out.join("target"))?;
+    eprintln!("   firmware: {fw} files, hashes and what the drivers declare checked");
     let images = d.out.join("images");
     if only_crpkg {
         eprintln!(
@@ -1410,7 +1463,7 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     for l in web.lines() {
         eprintln!("    {l}");
     }
-    eprintln!("  card plugged in after boot (G1.6n): {hot}");
+    eprintln!("  cards plugged in after boot (G1.6n, G1.6j): {hot}");
     if let Some(kib) = report.idle_kib {
         eprintln!(
             "  idle memory in use:                 {:.1} MiB",
@@ -1447,6 +1500,7 @@ fn watch(
     let mut wall_ready = None;
     let mut ping = None;
     let mut web = None;
+    let mut boot_driver = false;
     let deadline = started + b.timeout;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -1491,7 +1545,14 @@ fn watch(
         if let Some(k) = parse_idle(&line) {
             report.idle_kib = Some(k);
         }
+        boot_driver |= hotplug::boot_driver(&line);
         if let (Some(w), Some(p), Some(_), Some(web)) = (wall_ready, &ping, report.idle_kib, &web) {
+            if !boot_driver {
+                return Err(format!(
+                    "G1.6j: the driver of the card present at boot (e100) did not load (console in {})",
+                    log_path.display()
+                ));
+            }
             let mut wait_line = |want: &dyn Fn(&str) -> bool, max: Duration| {
                 let until = Instant::now() + max;
                 loop {
@@ -1632,16 +1693,14 @@ fn wasm_name(page: &str) -> Option<String> {
 /// s_client` (no WebSocket or TLS crate in xtask); the answer's text.
 fn ws_login(port: u16) -> Result<String, String> {
     let login = br#"{"id":1,"method":"auth.login","params":{"user":"admin","password":""}}"#;
+    // G1.6j: `hotplug.rs`'s i82551. Its driver opens the port only with its
+    // firmware, so this answers whether the kernel reads `/lib/firmware`.
     let req = format!(
         "GET /ws HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n\
          Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
          Sec-WebSocket-Version: 13\r\n\r\n"
     );
-    let mask = [0x37u8, 0xfa, 0x21, 0x3d];
-    let len = u8::try_from(login.len()).map_err(|_| "login frame too long")?;
-    let mut frame = vec![0x81, 0x80 | len];
-    frame.extend(mask);
-    frame.extend(login.iter().zip(mask.iter().cycle()).map(|(b, m)| b ^ m));
+    let frame = ws_client_frame(login)?;
     let mut child = Command::new("openssl")
         .args(["s_client", "-quiet", "-ign_eof", "-connect"])
         .arg(format!("127.0.0.1:{port}"))
@@ -1676,6 +1735,7 @@ fn ws_login(port: u16) -> Result<String, String> {
         });
     let until = Instant::now() + Duration::from_secs(10);
     let mut sent = false;
+    let mut up_sent = false;
     let mut got = Vec::new();
     let done = loop {
         let left = until.saturating_duration_since(Instant::now());
@@ -1686,8 +1746,31 @@ fn ws_login(port: u16) -> Result<String, String> {
         if !got.windows(4).any(|w| w == b"\r\n\r\n") {
             continue;
         }
-        if !got.starts_with(b"HTTP/1.1 101") || ws_text(&got).is_some() {
+        if !got.starts_with(b"HTTP/1.1 101") {
             break true;
+        }
+        let texts = ws_texts(&got);
+        if let Some(first) = texts.first() {
+            if !first.contains("\"token\"") || texts.iter().any(|t| t.contains("\"id\":2")) {
+                break true;
+            }
+            if !up_sent {
+                // The session token travels next to `id` and `method`
+                // (`docs/control-protocol.md`).
+                let answer: serde_json::Value =
+                    serde_json::from_str(first).map_err(|e| format!("web: {e}"))?;
+                let bring_up = serde_json::json!({
+                    "id": 2,
+                    "method": "engine.execute",
+                    "params": {"command": "interface.set",
+                               "params": {"name": "ether2", "disabled": false}},
+                    "token": answer.pointer("/result/token"),
+                });
+                let up_frame = ws_client_frame(bring_up.to_string().as_bytes())?;
+                let _ = stdin.write_all(&up_frame);
+                let _ = stdin.flush();
+                up_sent = true;
+            }
         }
         if !sent {
             let _ = stdin.write_all(&frame);
@@ -1708,9 +1791,19 @@ fn ws_login(port: u16) -> Result<String, String> {
         let head: String = String::from_utf8_lossy(&got).chars().take(120).collect();
         return Err(format!("web: WebSocket handshake refused: {head}"));
     }
-    let text = ws_text(&got).ok_or("web: no text frame after the handshake")?;
+    let texts = ws_texts(&got);
+    let text = texts
+        .first()
+        .ok_or("web: no text frame after the handshake")?;
     if text.contains("\"token\"") {
-        Ok("logged in".into())
+        let up = texts.iter().find(|t| t.contains("\"id\":2"));
+        match up {
+            Some(t) if t.contains("\"ok\":true") => {
+                Ok("logged in; ether2 (e100, opens only with its firmware) brought up".into())
+            }
+            Some(t) => Err(format!("G1.6j: firmware from /lib/firmware: {t}")),
+            None => Err("G1.6j: no answer to interface.set on ether2 in 10 s".into()),
+        }
     } else if text.contains("no password") {
         Ok(format!(
             "answered, refused as expected for a new router: {}",
@@ -1721,10 +1814,40 @@ fn ws_login(port: u16) -> Result<String, String> {
     }
 }
 
-/// The first unmasked text frame after an HTTP head.
-fn ws_text(got: &[u8]) -> Option<String> {
-    let at = got.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
-    let frame = got.get(at..)?;
+/// A masked text frame, what a client sends (RFC 6455 §5.3).
+fn ws_client_frame(text: &[u8]) -> Result<Vec<u8>, String> {
+    let mask = [0x37u8, 0xfa, 0x21, 0x3d];
+    let mut frame = vec![0x81];
+    match text.len() {
+        // Seven bits, or 126 and a 16-bit length (RFC 6455 §5.2).
+        n @ 0..=125 => frame.push(0x80 | u8::try_from(n).map_err(|e| e.to_string())?),
+        n => {
+            let n = u16::try_from(n).map_err(|_| "frame too long for this test")?;
+            frame.push(0x80 | 126);
+            frame.extend(n.to_be_bytes());
+        }
+    }
+    frame.extend(mask);
+    frame.extend(text.iter().zip(mask.iter().cycle()).map(|(b, m)| b ^ m));
+    Ok(frame)
+}
+
+/// The complete unmasked text frames after an HTTP head.
+fn ws_texts(got: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(at) = got.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return out;
+    };
+    let mut rest = got.get(at + 4..).unwrap_or_default();
+    while let Some((text, next)) = ws_one_text(rest) {
+        out.push(text);
+        rest = next;
+    }
+    out
+}
+
+/// One text frame and what follows it. `None`: incomplete, or not text.
+fn ws_one_text(frame: &[u8]) -> Option<(String, &[u8])> {
     let (op, len) = (*frame.first()?, *frame.get(1)?);
     if op != 0x81 {
         return None;
@@ -1738,7 +1861,10 @@ fn ws_text(got: &[u8]) -> Option<String> {
         n => (usize::from(n), 2),
     };
     let body = frame.get(from..from + len)?;
-    Some(String::from_utf8_lossy(body).into_owned())
+    Some((
+        String::from_utf8_lossy(body).into_owned(),
+        frame.get(from + len..)?,
+    ))
 }
 
 fn kvm_usable() -> bool {
@@ -1820,8 +1946,14 @@ mod tests {
         let mut got = b"HTTP/1.1 101 Switching Protocols\r\n\r\n".to_vec();
         got.extend([0x81, 5]);
         got.extend(b"hello");
-        assert_eq!(ws_text(&got).as_deref(), Some("hello"));
-        assert_eq!(ws_text(&got[..got.len() - 1]), None);
+        assert_eq!(ws_texts(&got), ["hello"]);
+        assert!(ws_texts(&got[..got.len() - 1]).is_empty());
+        // Two frames in one read, then one cut short.
+        let two = [got.as_slice(), &[0x81, 2], b"ok", &[0x81, 9], b"cut"].concat();
+        assert_eq!(ws_texts(&two), ["hello", "ok"]);
+        assert_eq!(ws_client_frame(b"abc").unwrap().len(), 2 + 4 + 3);
+        assert_eq!(ws_client_frame(&[b'a'; 126]).unwrap().len(), 4 + 4 + 126);
+        assert!(ws_client_frame(&vec![b'a'; 70_000]).is_err());
     }
 
     #[test]

@@ -96,6 +96,12 @@ pub fn main() {
         log!("lo up: {e} (the control channel listens on 127.0.0.1)");
     }
     let config_dev = mount_config();
+    // G1.6j: before the ports get their names, and only now: a driver that
+    // asks for its firmware while probing needs / (the kernel's own probes
+    // run before it is mounted).
+    if opts.modules {
+        crate::modules::start(log);
+    }
     let names = name_ports(Some(Path::new(crate::ports::MAP_FILE)));
     spawn_hotplug_names(crate::ports::MAP_FILE);
     let trial = trial_at_boot(&cmdline);
