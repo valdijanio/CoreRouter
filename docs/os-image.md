@@ -914,6 +914,25 @@ A ISO real (KVM, UEFI): com 256, 320 e 512 MiB sobe live (`ready` em 1,24–1,26
 com 192 e 224 MiB fica no instalador de console, sem OOM. A ISO cresceu 1,2 MB (116.531.200 →
 117.776.384 B): o rootfs já estava nela, entrou o busybox no initramfs.
 
+### Instalar pelos comandos (`system.install.*`, G1.6y)
+
+Só no live: um roteador instalado recusa (a flag `--live` e o que o serviço vê no sistema: linha de
+comando do kernel e `/config` em disco).
+
+- `system.install.print` traz a mídia e os discos, com `holds` (`empty`, `data`, `corerouter`) e
+  `confirm`. `system.install.rescan` relê; um pendrive novo é visto sozinho.
+- **Disco vazio:** `system.install.run` com o nome digitado. Vazio é zero no primeiro MiB, no
+  último MiB e em 64 amostras ao longo do disco; erro de leitura não conta como vazio. Dado entre as
+  amostras escapa: a tela mostra o que achou, o tamanho e o serial.
+- **Disco com dados ou CoreRouter:** `system.install.challenge` mostra nos consoles o disco, quem
+  pediu e um código de 6 caracteres (uso único, 5 minutos, 3 tentativas, preso a nome e serial). O
+  `print` nunca traz o código. Sem console: botão de energia 3 vezes em 30 s, só com o pedido aberto;
+  fora disso ele desliga. Enquanto o pedido estiver aberto, `system.shutdown` é recusado, para um
+  comando não se passar pelo botão.
+- Antes de gravar, o serviço relê o disco: se o serial, o tamanho ou o conteúdo mudou desde a
+  confirmação, não grava nada. Falhou? O live continua e dá para tentar de novo.
+- Quem pode: grupo `full`.
+
 ### FRR na imagem
 
 - **FRR 10.7.1 e libyang 3.13.6 (G1.6k).** O Buildroot 2025.02.19 traz o FRR 10.3 e a libyang

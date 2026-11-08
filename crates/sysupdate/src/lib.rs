@@ -23,6 +23,8 @@
 
 pub mod ab;
 pub mod biosboot;
+#[cfg(unix)]
+pub mod disks;
 pub mod efi;
 #[cfg(unix)]
 pub mod ext4;

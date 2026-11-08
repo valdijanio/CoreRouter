@@ -1,8 +1,16 @@
 //! System › Install to disk (G1.6y): `--live` tells the daemon it runs from
-//! the ISO, not installed (`corerouter_engine::live`).
+//! the ISO, not installed (`corerouter_engine::live`). This service reads the
+//! disks and writes the image for `system.install.*`.
+//!
+//! The body only ticks: reads and writes run on one worker thread at a time,
+//! outside the session lock, so `print` answers and the health beats while a
+//! spinning disk takes minutes. One install per machine: nothing to divide
+//! here, and `corerouter_sysupdate::install` already reads, hashes and writes
+//! on separate threads.
 
-use corerouter_engine::{Shared, lock};
-use std::time::Duration;
+//!
+//! The work is in `install/linux.rs`: the disks, `/proc` and `O_EXCL` are
+//! Linux's, and only the image runs live. Elsewhere the row says so.
 
 pub(crate) const SERVICE: super::Service = super::Service {
     name: "install",
@@ -17,21 +25,18 @@ pub(crate) const SERVICE: super::Service = super::Service {
     start,
 };
 
-const TICK: Duration = Duration::from_secs(10);
+#[cfg(target_os = "linux")]
+#[path = "install/linux.rs"]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux::start;
 
-fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
-    let session: Shared = ctx.session.clone();
-    let live = ctx.flag("--live").is_some();
-    if live {
-        corerouter_engine::live::set(&mut lock(&session));
-        log::warn!("live image: not installed; only the network test and the install can change anything");
-    }
-    Ok(Box::new(move |health: &super::Health| {
-        if !live {
-            health.disabled(Some("this router is installed"));
-        }
+#[cfg(not(target_os = "linux"))]
+fn start(_ctx: &super::Ctx) -> Result<super::Run, String> {
+    Ok(Box::new(|health: &super::Health| {
+        health.disabled(Some("the live image runs on Linux only"));
         health.beat();
-        while health.sleep(TICK) {
+        while health.sleep(super::IDLE_BEAT) {
             health.beat();
         }
         Ok(())
