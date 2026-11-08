@@ -86,6 +86,18 @@ pub fn find_medium(
     None
 }
 
+/// This boot came through a BIOS, not UEFI (G1.6g).
+pub fn booted_by_bios() -> bool {
+    !Path::new("/sys/firmware/efi").exists()
+}
+
+/// G1.6g: a BIOS reads 512-byte blocks: GRUB and its offsets assume them.
+pub fn sector_refusal(bios: bool, lbs: u64) -> Option<String> {
+    (bios && lbs != 512).then(|| {
+        format!("{lbs}-byte sectors: a BIOS cannot boot it (start this installer in UEFI mode)")
+    })
+}
+
 fn bus(name: &str) -> &'static str {
     let p = std::fs::canonicalize(format!("/sys/block/{name}"))
         .map(|p| p.display().to_string())
@@ -121,7 +133,7 @@ fn holders(name: &str) -> Vec<String> {
 
 /// Reads every disk; a few seconds on spinning disks ([`install::existing`]),
 /// so never under a lock.
-pub fn list(medium: &str, index: &Index) -> Vec<Disk> {
+pub fn list(medium: &str, index: &Index, bios: bool) -> Vec<Disk> {
     block_devices(false)
         .into_iter()
         .map(|name| {
@@ -149,6 +161,8 @@ pub fn list(medium: &str, index: &Index) -> Vec<Disk> {
             let mut refused = None;
             if name == medium {
                 refused = Some("the installer medium".into());
+            } else if let Some(r) = sector_refusal(bios, lbs) {
+                refused = Some(r);
             } else if name.starts_with("sr") {
                 refused = Some("optical drive".into());
             } else if sys(&format!("{base}/ro")) == "1" {

@@ -24,8 +24,8 @@ Resumo do que interopera e do que não:
 
 - **Imagem com FRR 10.7.x** (G1.6k). O laboratório usou o FRR 10.7.1 de deb.frrouting.org. Se a
   imagem vier sem OpenSSL no FRR, valem só md5 e sha256 na autenticação OSPF (acima).
-- **VM Proxmox com OVMF (UEFI).** A imagem boota sem bootloader (EFI stub); em SeaBIOS, o padrão do
-  Proxmox, ela não sobe (G1.6g). Na criação: *BIOS: OVMF (UEFI)*, um *EFI Disk*, *Machine: q35*,
+- **VM Proxmox.** A imagem boota em SeaBIOS, o padrão do Proxmox (G1.6g), e em OVMF. Na criação,
+  com OVMF: *BIOS: OVMF (UEFI)*, um *EFI Disk*, *Machine: q35*; nos dois, o
   disco a partir do `corerouter.qcow2` (`qm importdisk <vmid> corerouter.qcow2 <storage>`), CPU
   `host`, 2 vCPUs e 1 GiB bastam para o teste.
 - **Placas virtio** (ou passthrough de uma porta física). Uma placa para o enlace com o MikroTik

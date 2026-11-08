@@ -14,6 +14,7 @@ cargo xtask os boot-test --efi       # o mesmo, pelo firmware UEFI (OVMF) e o di
 cargo xtask os boot-test --append corerouter.shell=ttyS0 --timeout 600   # com shell de manutenção na serial
 cargo xtask os ab-test               # G1.6b: os 4 cenários A/B no QEMU (UEFI, sem root)
 cargo xtask os install-test          # G1.6c: instalador (CD, USB, interativo), qcow2 e OVA no QEMU
+cargo xtask os install-test --firmware seabios   # G1.6g: o mesmo por BIOS, pelo GRUB
 cargo xtask os frr-test              # G1.6k: dois roteadores da imagem com OSPF, SR, LDP e BFD entre eles
 cargo xtask os package --out b.crpkg --version 0.1.1 --build 1800000000  # outro pacote deste build
 cargo xtask os build --only crpkg    # G1.6e: só o pacote de atualização (sem disk.img, ISO, qcow2, OVA)
@@ -39,11 +40,12 @@ FRR: seção "Instalador, imagens de VM e FRR (G1.6c)" no fim.
 | Espaço de usuário | `nft` sem JSON e sem CLI interativa (só diagnóstico no shell de manutenção: o hal-linux fala nfnetlink, G2.8), glibc, busybox (só para o shell de manutenção) | defconfig |
 | Roteamento | FRR **10.7.1** com libyang 3.13.6 (a versão validada na VM do laboratório; receita do Buildroot `master` portada, G1.6k): `mgmtd`, `zebra`, `staticd`, `bgpd`, `ospfd`, `ospf6d`, `ldpd`, `bfdd`, iniciados pelo `corerouter-init`; sem `vtysh`, scripts nem bash (G1.6c) | defconfig, `post-build.sh`, `os/buildroot-patches/` |
 
-Tudo que o roteador precisa no kernel é `=y` (sem módulos): eBPF/XDP com BTF e JIT sempre
+O que o roteador precisa no kernel é `=y`; só os drivers de placa que precisam do `/` são módulo
+(`ice`: seção "Firmware das placas e drivers em módulo (G1.6j)"). eBPF/XDP com BTF e JIT sempre
 ligado, AF_XDP, nftables completo (NAT, conntrack, flowtable, fib, socket, synproxy), **VRF**
 (`CONFIG_NET_VRF=y`, que destrava o `ip.vrf.add`, G1.14), MPLS (roteamento e túnel), bonding,
 802.1Q, bridge com VLAN filtering, PPP/PPPoE, L2TP, WireGuard, VXLAN, GRE, filas (HTB, fq,
-fq_codel, cake) e as placas ixgbe/ixgbevf, i40e/iavf (`I40EVF`), ice, mlx5, virtio, e1000/e1000e/igb/igc
+fq_codel, cake) e as placas ixgbe/ixgbevf, i40e/iavf (`I40EVF`), mlx5, virtio, e1000/e1000e/igb/igc
 e r8169. O `cargo xtask os build` confere que **todo** `=y` do fragmento sobreviveu ao
 `olddefconfig` (um símbolo cuja dependência falta some sem aviso) e falha se algum sumiu.
 
@@ -183,9 +185,7 @@ precisar de streaming delta, o RAUC volta a ser a opção (o formato de bundle v
 ### O que ficou de fora e por quê
 
 - **A/B, dm-verity, assinatura, atualização**: G1.6b.
-- **Instalador, qcow2/OVA, FRR na imagem, firmware**: G1.6c. Sem o `linux-firmware`, a placa
-  `ice` sobe em modo seguro (sem o pacote DDP: sem ajuste fino de RSS/flow director); ixgbe, i40e
-  e mlx5 não precisam de arquivo de firmware.
+- **Instalador, qcow2/OVA, FRR na imagem**: G1.6c. **Firmware**: G1.6j.
 - **Secure Boot**: o kernel é o próprio `BOOTX64.EFI`; assinar o EFI stub (ou um UKI) entra
   junto com a assinatura da imagem no G1.6b.
 - **musl/estático**: a toolchain glibc do Bootlin serve ao daemon e ao `nft`; o daemon liga
@@ -620,6 +620,79 @@ desenvolvimento do mesmo commit; o host tinha outras sessões rodando.
 - **Instalador e imagens de VM** criando as entradas de boot na instalação: G1.6c (até lá, o
   primeiro boot de uma imagem gravada sobe sem verity, pelo fallback, e cria as entradas).
 
+## Firmware das placas e drivers em módulo (G1.6j)
+
+Pegadinha que decidiu o desenho: **um driver embutido (`=y`) sonda antes de o `/` existir.** As
+`do_initcalls` rodam antes de `prepare_namespace` (`init/main.c`, kernel 6.18.59). O `ice` pede o
+pacote DDP na sonda (`ice_main.c:4521`), recebe `-ENOENT` e entra em **Safe Mode** para sempre,
+mesmo com o arquivo no squashfs: uma fila (`ice_common.c:3249`), sem RSS, sem XDP
+(`ice_xdp_safe_mode`, `ice_main.c:3041`), sem checksum nem TSO por hardware (`ice_main.c:3554`).
+
+| Peça | O que faz | Onde |
+|---|---|---|
+| `ice` como módulo | a sonda roda depois do `/`, com o arquivo à vista | `linux.fragment`, `REQUIRED_MODULES` |
+| Carga automática | o PID 1 lê `modules.dep`/`modules.alias`, olha as placas PCI/USB sem driver e carrega o que casa, no boot e a cada placa nova (mensagens de dispositivo do kernel). Só módulos em `kernel/drivers/net/`. Numa thread: uma sonda travada não para o boot, que espera no máximo 20 s; a porta que chega depois recebe o nome pelo hot-plug | `apps/corerouter-init/src/modules.rs` |
+| Firmware | os arquivos que os drivers de rede declaram (`firmware=` no modinfo, como o VyOS), de um commit fixo do `linux-firmware`, com o SHA-256 de cada um, sem comprimir (o squashfs comprime) | `os/package/corerouter-firmware/firmware.lock` |
+| Licenças | só entra o que o `WHENCE` diz que pode ser redistribuído; o resto vira linha `skip`. Os textos e as entradas do `WHENCE` vão em `/usr/share/licenses/firmware/` | `cargo xtask os firmware-lock`, `xtask/src/os/firmware.rs` |
+| Conferência | depois de cada build: hash de cada arquivo na imagem, links, licenças, e todo `firmware=` dos drivers de rede presente ou em `skip`, senão o build falha | `firmware::verify` |
+
+```sh
+cargo xtask os firmware-lock --tag 20261019   # refaz a trava (precisa de um build pronto)
+```
+
+`corerouter.modules=off` na linha de comando do kernel desliga a carga automática: só fica o que é
+embutido, e uma E810 fica sem driver. Serve para quem não quer que um dispositivo USB plugado
+carregue um driver.
+
+**Os drivers e o firmware andam junto com o slot:** módulos e arquivos estão no rootfs (dm-verity)
+e o kernel no mesmo pacote `.crpkg`; o rollback volta os três. Por isso nada de firmware no
+`/config` (sem verity, e não voltaria no rollback) nem pacote de firmware separado.
+
+**O instalador e o live da ISO** não carregam módulos: o kernel é o da ISO, e os módulos do rootfs
+foram compilados para o kernel instalado. A `ice` é `=y` no `installer.fragment` e fica em Safe
+Mode, o que basta para mostrar a porta. O live trata isso como "completa depois de instalar".
+
+**Como o `boot-test` prova isso sem E810.** O QEMU não emula a `ice`, mas emula a `i82551`, cuja
+revisão faz o `e100` recusar abrir a porta sem `e100/d102e_ucode.bin`. O teste liga essa placa
+desde o boot (driver em módulo, varredura de boot), pluga uma `pcnet` depois (driver em módulo,
+mensagens de dispositivo) e sobe a `ether2` pelo canal de controle. Contraprova (**medido**,
+imagem sem firmware, mesma placa): `Direct firmware load for e100/d102e_ucode.bin failed with
+error -2` e o comando volta com erro; na imagem nova, `NIC Link is Up`. O caminho da própria E810
+só se confirma em placa real: a mensagem de pacote DDP carregado, mais de uma fila, XDP ligando,
+e o tempo da sonda.
+
+**Números (medido, 2026-11-08, build release da imagem, KVM nesta máquina):**
+
+| O quê | Valor |
+|---|---|
+| Firmware na trava | 41 arquivos + 1 link, 1 506 937 B crus, 5 textos de licença, nenhum `skip` |
+| `rootfs.squashfs` | 37 281 792 B (36 597 760 B numa build anterior de outro commit, sem firmware; não é comparação estrita) |
+| `corerouter.crpkg` | 57 357 909 B |
+| `linux-firmware` inteiro, para comparar | 1 408 384 541 B crus, 619 114 496 B em squashfs: não cabe no slot de 256 MiB |
+| Carregar `e100` no boot | ~91–100 ms; `ready` em 0,98–1,09 s depois do kernel |
+| Placa nova, driver já carregado | 112 ms até a porta ter nome |
+| Placa nova, driver em módulo (`pcnet32`) | 157 ms até a porta ter nome (50 ms na carga) |
+| Reprodutível | `linux-dirclean` e rebuild: rootfs, bzImage, todos os `.ko`, `disk.img`, instalador, ISO, qcow2 e crpkg com o mesmo hash |
+
+### Pesquisa
+
+- **Kernel 6.18.59:** `MODULE_FIRMWARE`/`request_firmware` lidos no fonte de cada driver.
+  `Documentation/driver-api/firmware/built-in-fw.rst` cita firmware não compatível com GPL como
+  motivo para não embutir (`CONFIG_EXTRA_FIRMWARE`), que foi a alternativa recusada.
+- **RouterOS** ([pacotes](https://manual.mikrotik.com/docs/getting-started/installation-and-upgrade/packages/)):
+  no x86 há um pacote de sistema; os de driver (`extra-nic`, `wifi-qcom`) são de ARM. O manual
+  não diz como o x86 trata firmware de placa.
+- **VyOS** ([build-linux-firmware.sh](https://github.com/vyos/vyos-build/blob/current/scripts/package-build/linux-kernel/build-linux-firmware.sh)):
+  o `modinfo` dos drivers de rede escolhe os arquivos. Adotado.
+- **OpenWrt** ([intel.mk](https://github.com/openwrt/openwrt/blob/main/package/firmware/linux-firmware/intel.mk)):
+  um pacote por família (`ice-firmware`, `r8169-firmware`, `r8152-firmware`). Não adotado: a
+  imagem aqui é uma só.
+- **FreeBSD/OPNsense** ([ice(4)](https://man.freebsd.org/cgi/man.cgi?query=ice&sektion=4)):
+  o DDP é um módulo (`ice_ddp`); há [relato de fórum](https://forum.opnsense.org/index.php?topic=52881.0)
+  de link caindo com DDP no 26.7, sem confirmação oficial: testar em placa real.
+- **Buildroot** (`BR2_PACKAGE_LINUX_FIRMWARE_*`): baixa o tarball inteiro (431 MB no 20250211,
+  642 MB no 20261019) e o 20250211 não tem `rtl8127a-1.fw`, que o 6.18 pede. Daí o pacote próprio.
+
 ## Instalador, imagens de VM e FRR (G1.6c)
 
 ```sh
@@ -631,7 +704,7 @@ Saídas em `<out>/build/images/`:
 
 | Arquivo | Para quê |
 |---|---|
-| `corerouter-install.iso` | ISO híbrida: CD (El Torito UEFI) ou pendrive (`dd`, GPT com a partição EFI). Instala no disco do roteador |
+| `corerouter-install.iso` | ISO híbrida: CD (El Torito, BIOS e UEFI) ou pendrive (`dd`, GPT com a partição EFI e o GRUB na MBR). Instala no disco do roteador |
 | `corerouter.qcow2` | KVM/Proxmox: o `disk.img` (já A/B) em qcow2 comprimido |
 | `corerouter.ova` | VMware/VirtualBox: OVF 1.0 + manifesto SHA-256 + VMDK streamOptimized |
 | `corerouter.crpkg` | o pacote de atualização (também dentro da ISO) |
@@ -698,7 +771,54 @@ Saídas em `<out>/build/images/`:
   name=opt/org.corerouter/autoinstall,string=<json>` do QEMU, que nenhuma máquina física tem; o
   JSON nomeia o disco duas vezes (`disk`, `confirm`), e `append` só aceita `console=`, `ip=` e
   `corerouter.shell=`. É a flag do `install-test`.
-- **Só UEFI.** Ver a pesquisa abaixo.
+- **UEFI e BIOS** (G1.6g): seção "Boot por BIOS", abaixo.
+
+### Boot por BIOS (G1.6g)
+
+O mesmo disco boota pelos dois firmwares; nada do caminho UEFI muda.
+
+| Onde | O quê |
+|---|---|
+| Bloco 0, 440 primeiros bytes | `boot.img` do GRUB, ao lado do registro da MBR protetora |
+| Blocos 128 a 2047, antes da primeira partição | `core` do GRUB, ~150 KiB. Sem entrada na GPT: os números das partições continuam os mesmos, e o `first_usable` do cabeçalho deixa o espaço fora da área livre |
+| ESP, `corerouter/grub.cfg` | A lógica: lê o `grubenv`, escolhe o slot, cai no outro se o kernel não carrega |
+| ESP, `corerouter/grubenv` | Um bloco de 512 bytes: `primary=` e `next=` (papel do `BootOrder` e do `BootNext`) |
+| ESP, `corerouter/a.cfg`, `b.cfg` | A linha de comando de cada slot, com a tabela do dm-verity, de 4096 bytes fixos |
+
+- **O disco que a BIOS escolheu, não "o primeiro disco".** O prefixo é `(,gpt1)/corerouter`, e o `boot.img`
+  confia no número do drive que a BIOS passou (o `DRIVE_CHECK` que o `grub-install` também
+  desliga): um pendrive esquecido não troca a raiz.
+- **dm-verity desde o primeiro boot.** O `a.cfg` já sai do build com a tabela: um qcow2 em
+  SeaBIOS nunca sobe sem verificação, o que o caminho removível da UEFI faz uma vez.
+- **Instalador.** Roda pelos dois firmwares e grava as duas coisas sempre. Com BIOS: marca a
+  partição protetora como ativa e recusa disco de setor de 4 KiB com o motivo na tabela. O
+  `a.cfg` é reescrito com a linha da máquina (`corerouter.mgmt=`, `console=`) direto nos bytes
+  dele: o kernel ainda não releu as partições do disco, e o índice assinado diz onde o arquivo
+  está (por isso tamanho fixo).
+- **Selo ativo.** A UEFI 2.10 §5.2.3 manda ignorar o `BootIndicator` da partição protetora, mas
+  o EDK2 recusava o disco até 2021 (bz#1978966). Algumas BIOS, ao contrário, só bootam uma
+  partição ativa. Por isso a imagem e a ISO ficam com 0 e só o instalador rodando em BIOS liga;
+  numa BIOS exigente, o `dd` da imagem precisa do selo à mão (`sfdisk --activate`).
+- **ISO.** O catálogo El Torito tem a entrada padrão para BIOS e uma seção EFI (`BIOSCD.IMG`,
+  com a *boot info table*); como disco, o `boot.img` aponta para `BIOSUSB.IMG`. Os dois `core`
+  usam só o parser de resgate do GRUB e não passam linha de comando: vale a embutida no kernel do
+  instalador. Sem xorriso: `crates/sysupdate/src/iso.rs` faz tudo.
+- **Dois slots quebrados** param no prompt do GRUB, na tela e na serial.
+- **Sem serial** o GRUB segue só na tela (`if serial`).
+- **Controladoras.** O kernel ganhou `SYM53C8XX_2` (LSI, padrão do Proxmox), `MEGARAID_SAS`,
+  `MPT2SAS`/`MPT3SAS`, `HPSA`, `AACRAID` e `FUSION_SPI`/`FUSION_SAS`. Em QEMU 8.2.2 (SeaBIOS, `pc`),
+  **medido**: `virtio-blk`, `virtio-scsi`, `lsi53c895a`, `pvscsi` e IDE bootam. `mptsas1068` chega ao
+  kernel e o driver acha a controladora, mas o disco não aparece (não investigado: não é opção do
+  Proxmox; `FUSION_*` ficou sem prova para o hardware real). Dois nem isso: `lsi53c810`, para o qual
+  o SeaBIOS não tem driver (nem chega ao GRUB), e `megasas`/
+  `megasas-gen2`, por defeito do QEMU: `hw/scsi/megasas.c` (`megasas_handle_io`) monta um READ(16)
+  e chama `scsi_req_new` com o `cdb_len` do quadro, que o driver não preenche nos quadros
+  `MFI_CMD_LD_READ`/`WRITE` (o kernel vê "Invalid command operation code"; o sintoma começou na 7.2,
+  [QEMU #1888](https://gitlab.com/qemu-project/qemu/-/issues/1888); a linha é igual na `master`). Qualquer
+  Linux recente cai nisso; numa VM, use outra controladora. O driver fica para a placa de verdade.
+- **Licença.** O GRUB é GPL-3.0 e fica só na área de boot (bloco 0, espaço antes da partição,
+  arquivos da ESP) e na ISO; a raiz continua sem GPL-3.0. O fonte correspondente é o que a
+  receita do Buildroot baixa (`make legal-info`).
 
 ### ISO live (G1.6y)
 
@@ -812,17 +932,19 @@ comando do kernel e `/config` em disco).
 - **Fora da imagem** (`post-build.sh`): `vtysh` (o único que liga readline), bash, readline,
   ncurses, o runtime C++ que a toolchain copia, scripts Python e os daemons que o CoreRouter não
   configura (rip, isis, pim, babel, eigrp, …). O `nft` deixa de ter CLI interativa (ela puxava
-  readline). Assim a imagem continua **sem GPL-3.0** (bash e readline são GPL-3.0). O `os build`
+  readline). Assim a raiz continua **sem GPL-3.0** (bash e readline são GPL-3.0; o GRUB, G1.6g,
+  fica só na área de boot). O `os build`
   confere que todo ELF da imagem acha as bibliotecas que pede (uma remoção a mais falha o build).
 
 ### Imagens de VM
 
-- **qcow2**: `qemu-img convert -c` (zlib) do `disk.img`, que já é a imagem instalada A/B. O
-  primeiro boot é pelo caminho de mídia removível e cria as entradas de boot (G1.6b).
+- **qcow2**: `qemu-img convert -c` (zlib) do `disk.img`, que já é a imagem instalada A/B. Em UEFI,
+  o primeiro boot é pelo caminho de mídia removível e cria as entradas de boot (G1.6b); em SeaBIOS,
+  é pelo GRUB, já em dm-verity (G1.6g).
 - **OVA** (`corerouter-image ova`): ustar com o `.ovf` primeiro, o `.mf` (SHA-256) e o disco
   (DSP0243). VMDK streamOptimized pelo `qemu-img`. Máquina: 2 vCPUs, 1 GiB, SATA/AHCI, duas
-  e1000, `firmware=efi` (VMware). No VirtualBox, marcar "Enable EFI" depois de importar (o OVF não
-  tem como dizer isso ao VirtualBox sem o XML próprio dele).
+  e1000, `firmware=efi` (VMware). O VirtualBox importa com o BIOS dele, e o disco boota assim
+  (G1.6g).
 - **cloud-init: não agora.** O MikroTik CHR não usa cloud-init (sobe com DHCP na primeira porta);
   o VyOS tem. Para o IP inicial, a configuração padrão de primeiro boot do G1.6d (cliente DHCP na
   primeira porta, como o CHR) e o assistente de console resolvem Proxmox/VMware/VirtualBox; o
@@ -872,13 +994,15 @@ usa com GRUB/isolinux. Escrever a ISO em Rust deu ~540 linhas com testes (o leit
 instalador usa vem junto), saída idêntica entre builds, sem download nem ferramenta GPL-3.0 no
 build. **Adotado: Rust**; o `file`, o `sfdisk` e o OVMF (CD e USB) aceitam a imagem.
 
-**BIOS legado: não agora.** A imagem instalada só boota por UEFI (EFI stub, A/B por
-`BootOrder`/`BootNext`, G1.6b); BIOS exigiria um bootloader (GRUB ou syslinux) e outro esquema
-de A/B só para ele. Quem ainda precisa: o Proxmox cria VMs com SeaBIOS por padrão (OVMF é uma
-opção na criação), algumas nuvens bootam imagens próprias por BIOS (a AWS só passou a aceitar
-imagem que boota nos dois em 2023), e servidores antigos sem UEFI. O Talos ainda faz ISO BIOS +
-UEFI no x86. Servidores atuais têm UEFI (e há fornecedores que já desligam o CSM). Fica a gap G1.6g, com o número do custo: um bootloader na
-ESP e o A/B por variável dele.
+**BIOS legado: GRUB (G1.6g).** A UEFI continua sem bootloader (EFI stub, A/B por
+`BootOrder`/`BootNext`, G1.6b). Quem precisa de BIOS: o Proxmox cria VMs com SeaBIOS por padrão,
+algumas nuvens bootam imagens próprias por BIOS e há servidores antigos sem UEFI. GRUB × syslinux,
+**medido** em protótipo pela receita do Buildroot (SeaBIOS, KVM): 149 KiB contra 171 KiB, kernel
+em 0,65 s contra 0,40 s, e o motivo da escolha: no `ONCE` do syslinux,
+`com32/elflink/ldlinux/ldlinux.c:312-337` ignora o retorno do `adv_write` e boota mesmo assim, o
+que num teste A/B vira laço de pânico; o `save_env` do GRUB
+(`grub-core/commands/loadenv.c:286-340`) confere os blocos e dá para decidir no script. Preço: o
+GRUB é GPL-3.0 (só na área de boot).
 
 **OVA:** `qemu-img` (VMDK streamOptimized, o único que uma OVA pode levar) + OVF e tar escritos
 em Rust (`corerouter-image ova`), datas fixas. O OVA ainda não é reprodutível: o `qemu-img`
@@ -954,7 +1078,6 @@ topo) deram o mesmo `bzImage`, `rootfs.squashfs`, `disk.img`, pacote e imagens d
 
 ### O que ficou de fora e por quê
 
-- **BIOS legado:** gap G1.6g (acima).
 - **cloud-init (NoCloud/`cidata`):** gap G1.6h; o IP inicial pelo G1.6d e pelo assistente.
 - **Só os daemons do FRR configurados** (hoje sobem os 8, ~88 MiB de RSS somado): gap G1.6i.
 - **`/config` do tamanho do resto do disco (G1.6v):** o `disk.img` continua com 64 MiB (imagens
@@ -970,8 +1093,8 @@ topo) deram o mesmo `bzImage`, `rootfs.squashfs`, `disk.img`, pacote e imagens d
 - **Dois discos CoreRouter na mesma caixa:** os PARTUUIDs são fixos (a linha de comando embutida
   do fallback aponta para o `rootfs-a`); o instalador recusa um disco com a imagem do
   instalador, mas não um segundo CoreRouter. Anotado como risco.
-- **`linux-firmware` (pacote DDP da `ice`)**: não entrou; a `ice` segue em modo seguro (G1.6a).
-  Gap G1.6j.
+- **Firmware das placas (pacote DDP da `ice`)**: entrou no G1.6j; no instalador a `ice` segue
+  em Safe Mode, o que basta para listar a porta.
 - **Senha do `admin` no instalador:** não vai na linha de comando (fica na NVRAM); o assistente
   de console do primeiro boot a pede.
 

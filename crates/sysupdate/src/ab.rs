@@ -177,11 +177,7 @@ pub fn running_slot(cmdline: &str, partuuids: [&str; 2]) -> Option<SlotId> {
 /// the built-in command line names slot A's; a boot entry always says
 /// `corerouter.slot=`.
 pub fn fallback_partuuids() -> [&'static str; 2] {
-    let a = crate::BUILTIN_CMDLINE
-        .split_whitespace()
-        .find_map(|w| w.strip_prefix("root=PARTUUID="))
-        .unwrap_or("");
-    [a, ""]
+    [crate::builtin_rootfs_a().unwrap_or(""), ""]
 }
 
 /// What `corerouter-init` does about the trial at boot.

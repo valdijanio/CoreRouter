@@ -66,6 +66,20 @@ CONFIG_VIRTIO=y
 CONFIG_VIRTIO_PCI=y
 CONFIG_VIRTIO_BLK=y
 CONFIG_VIRTIO_CONSOLE=y
+# G1.6g: the controllers of old servers and of Proxmox's defaults for a BIOS
+# guest (LSI 53C895A, emulated MegaRAID): a kernel without the driver stops at
+# "waiting for device" whatever the bootloader did.
+CONFIG_SCSI_LOWLEVEL=y
+CONFIG_SCSI_SYM53C8XX_2=y
+CONFIG_SCSI_MPT3SAS=y
+CONFIG_SCSI_MPT2SAS=y
+CONFIG_MEGARAID_SAS=y
+CONFIG_SCSI_HPSA=y
+CONFIG_SCSI_AACRAID=y
+# LSI SAS1068 and 53C1030 (Fusion MPT): old servers, and VMware's LSI Logic.
+CONFIG_FUSION=y
+CONFIG_FUSION_SPI=y
+CONFIG_FUSION_SAS=y
 
 # --- eBPF and XDP (G2.5): JIT always on, BTF for CO-RE, AF_XDP.
 CONFIG_BPF=y
@@ -184,8 +198,13 @@ CONFIG_NET_ACT_GACT=y
 CONFIG_NET_ACT_POLICE=y
 
 # --- NICs: Intel 10/25/40/100G, Mellanox ConnectX-4+, virtio, the common 1G.
-# ice loads its DDP package from /lib/firmware; without linux-firmware in the
-# image (G1.6c) it runs in safe mode (no RSS/flow director tuning).
+# G1.6j: a built-in driver probes before / is mounted, so one that asks for
+# its firmware while probing never finds the file. ice is such a driver, and
+# without its DDP package it runs in Safe Mode (one queue, no RSS, no XDP, no
+# offloads): it is a module, which corerouter-init loads after / is up.
+# e100 and pcnet32 are modules for the image's tests: QEMU emulates them
+# (boot-test: one at boot, one plugged in later), and e100 reads its firmware
+# from the root, the path no other emulated card exercises.
 CONFIG_NETDEVICES=y
 CONFIG_ETHERNET=y
 CONFIG_PCI=y
@@ -200,7 +219,11 @@ CONFIG_IXGBE=y
 CONFIG_IXGBEVF=y
 CONFIG_I40E=y
 CONFIG_I40EVF=y
-CONFIG_ICE=y
+CONFIG_ICE=m
+CONFIG_E100=m
+CONFIG_PCNET32=m
+CONFIG_MODULES=y
+CONFIG_FW_LOADER=y
 CONFIG_NET_VENDOR_MELLANOX=y
 CONFIG_MLX5_CORE=y
 CONFIG_MLX5_CORE_EN=y
