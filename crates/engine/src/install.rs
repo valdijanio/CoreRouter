@@ -97,6 +97,16 @@ pub struct Challenge {
     pub shown: bool,
 }
 
+/// The port the installed router is managed through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mgmt {
+    pub port: String,
+    /// `None`: DHCP (the address may change).
+    pub address: Option<String>,
+    pub gateway: Option<String>,
+    pub dns: Vec<String>,
+}
+
 /// The install the service must carry out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
@@ -106,7 +116,15 @@ pub struct Job {
     /// What it held when confirmed: the service looks again before writing.
     pub holds: Holds,
     pub keep_config: bool,
+    pub mgmt: Option<Mgmt>,
     pub by: String,
+}
+
+/// A network test to run; the address the asking GUI reached us on tells which
+/// port it came through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestRequest {
+    pub local: Option<std::net::IpAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +147,9 @@ pub struct Install {
     pub job: Option<Job>,
     pub running: Option<Progress>,
     pub result: Option<Value>,
+    pub test: Option<TestRequest>,
+    pub testing: bool,
+    pub network: Option<Value>,
 }
 
 impl Install {
@@ -179,6 +200,8 @@ impl Install {
                 "disk": j.disk, "phase": "queued", "done": 0, "total": 0,
             }))),
             "result": self.result,
+            "testing": self.testing || self.test.is_some(),
+            "network": self.network,
         })
     }
 }
@@ -200,6 +223,21 @@ pub fn set_scan(s: &mut Session, medium: Option<MediumInfo>, disks: Vec<Disk>) {
 
 pub fn take_rescan(s: &mut Session) -> bool {
     s.ext_mut::<Install>().is_some_and(|i| std::mem::take(&mut i.rescan))
+}
+
+/// The network test to run, now shown as running.
+pub fn take_test(s: &mut Session) -> Option<TestRequest> {
+    let i = s.ext_mut::<Install>()?;
+    let t = i.test.take()?;
+    i.testing = true;
+    Some(t)
+}
+
+pub fn set_network(s: &mut Session, network: Value) {
+    if let Some(i) = s.ext_mut::<Install>() {
+        i.testing = false;
+        i.network = Some(network);
+    }
 }
 
 /// The job to run, now shown as running.

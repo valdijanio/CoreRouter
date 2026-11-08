@@ -15,6 +15,12 @@ pub const KEYS: &str = "/etc/corerouter/image-keys";
 pub const CHALLENGE_OPEN: &str = "/run/corerouter/install-challenge";
 pub const BUTTON_PRESSES: &str = "/run/corerouter/install-presses";
 
+/// What the install left for the first boot, on the new `/config`; PID 1
+/// applies it once and removes it.
+pub const FIRST_BOOT: &str = "first-boot.json";
+/// More than this is not ours.
+pub const FIRST_BOOT_MAX: u64 = 16 << 10;
+
 /// A disk that could be the target.
 #[derive(Debug, Clone)]
 pub struct Disk {

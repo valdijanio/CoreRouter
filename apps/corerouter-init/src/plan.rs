@@ -219,6 +219,61 @@ impl Mgmt {
     }
 }
 
+/// The commands to run on the first boot, and the line for the console.
+pub type FirstBootPlan = (Vec<(&'static str, serde_json::Value)>, String);
+
+/// What the install from the live image left for the first boot (G1.6y): the
+/// commands to run, and what to tell the console. Read from the new `/config`.
+pub fn first_boot_commands(text: &str) -> Result<FirstBootPlan, String> {
+    let v: serde_json::Value = serde_json::from_str(text).map_err(|e| format!("not JSON: {e}"))?;
+    let mut out = Vec::new();
+    let mut said = String::from("no management port chosen");
+    if let Some(m) = v.get("mgmt").filter(|m| !m.is_null()) {
+        let s = |k: &str| m.get(k).and_then(serde_json::Value::as_str);
+        let port = s("port").ok_or("mgmt: no port")?;
+        out.push((
+            "interface.set",
+            serde_json::json!({"name": port, "disabled": false}),
+        ));
+        if let Some(address) = s("address") {
+            let mg = Mgmt {
+                interface: port.to_owned(),
+                address: address.to_owned(),
+                gateway: s("gateway").map(str::to_owned),
+            };
+            out.extend(
+                mg.commands()
+                    .into_iter()
+                    .filter(|(c, _)| *c != "interface.set"),
+            );
+            said = format!("management: {address} on {port}");
+        } else {
+            out.push((
+                "ip.dhcp-client.add",
+                serde_json::json!({"interface": port, "comment": "management (installer)"}),
+            ));
+            said = format!("management: DHCP on {port} (the address may change)");
+        }
+        if let Some(dns) = m
+            .get("dns")
+            .and_then(serde_json::Value::as_array)
+            .filter(|d| !d.is_empty())
+        {
+            out.push(("ip.dns.set", serde_json::json!({"servers": dns})));
+        }
+    }
+    if let Some(h) = v
+        .get("admin_password_hash")
+        .and_then(serde_json::Value::as_str)
+    {
+        out.push((
+            "user.set",
+            serde_json::json!({"name": "admin", "password_hash": h}),
+        ));
+    }
+    Ok((out, said))
+}
+
 /// What the console says when `corerouter.mgmt=` is applied (G1.6m): the
 /// address, where it came from, and what to do when it was not expected (a
 /// new VM that inherited an old one's NVRAM and its boot entry). `ports`:
@@ -738,5 +793,37 @@ mod tests {
         assert!(t.len() <= KMSG_MAX + 1, "{}", t.len());
         assert!(t.starts_with("<13>corerouter-init[1]: a b"), "{t}");
         assert_eq!(t.matches('\n').count(), 1);
+    }
+
+    #[test]
+    fn the_install_tells_the_first_boot_what_to_do() {
+        let (c, said) = first_boot_commands(
+            r#"{"mgmt":{"port":"ether2","address":null,"gateway":null,"dns":[]}}"#,
+        )
+        .unwrap();
+        let ids: Vec<&str> = c.iter().map(|x| x.0).collect();
+        assert_eq!(ids, ["interface.set", "ip.dhcp-client.add"]);
+        assert!(said.contains("DHCP on ether2"), "{said}");
+        let (c, said) = first_boot_commands(
+            r#"{"mgmt":{"port":"ether1","address":"10.0.0.2/24","gateway":"10.0.0.1","dns":["1.1.1.1"]},"admin_password_hash":"$argon2id$x"}"#,
+        )
+        .unwrap();
+        let ids: Vec<&str> = c.iter().map(|x| x.0).collect();
+        assert_eq!(
+            ids,
+            [
+                "interface.set",
+                "ip.address.add",
+                "ip.route.add",
+                "ip.dns.set",
+                "user.set"
+            ]
+        );
+        assert!(said.contains("10.0.0.2/24 on ether1"), "{said}");
+        let (c, _) = first_boot_commands("{}").unwrap();
+        assert!(c.is_empty());
+        for bad in ["not json", r#"{"mgmt":{"address":"10.0.0.2/24"}}"#] {
+            assert!(first_boot_commands(bad).is_err(), "{bad}");
+        }
     }
 }

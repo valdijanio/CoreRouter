@@ -3,19 +3,22 @@
 //! service (`crate::install`); `print` shows how far it went. Only on the
 //! live image: an installed router refuses all of it.
 
+use std::net::IpAddr;
+
 use serde_json::{Value, json};
 
 use super::args::{opt_bool, opt_str, req_str};
 use super::{CommandSpec, always};
 use crate::auth::Group;
 use crate::install::{
-    CHALLENGE_ATTEMPTS, CHALLENGE_SECS, Challenge, Disk, Holds, Install, Job, new_code,
+    CHALLENGE_ATTEMPTS, CHALLENGE_SECS, Challenge, Disk, Holds, Install, Job, Mgmt, TestRequest,
+    new_code,
 };
 use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "system.install.print", "Install to Disk", ["System", "Install to Disk"], None,
-        "{} → {supported, reason?, scanned, medium: {device, version, commit, channel, signed_by, min_disk} | null, disks: [{name, bytes, model, serial, bus, removable, holds: empty|data|corerouter, detail, config_keepable, refused, confirm: name|name+code}], challenge: {disk, serial, attempts_left, presence, remaining_s} | null, job: {disk, phase, done, total} | null, result: {ok, error?, ...} | null}",
+        "{} → {supported, reason?, scanned, medium: {device, version, commit, channel, signed_by, min_disk} | null, disks: [{name, bytes, model, serial, bus, removable, holds: empty|data|corerouter, detail, config_keepable, refused, confirm: name|name+code}], challenge: {disk, serial, attempts_left, presence, remaining_s} | null, job: {disk, phase, done, total} | null, result: {ok, error?, ...} | null, testing, network: {connected_port, problems, ports: [{name, mac, driver, link, speed_mbps, address, dhcp_status, gateway, gateway_ok, dns, dns_ok, firmware, connected}], firmware} | null}",
         always, print),
     cmd!(
         "system.install.rescan",
@@ -25,6 +28,15 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{} → {queued}",
         supported,
         rescan
+    ),
+    cmd!(
+        "system.install.test",
+        "Test Network",
+        [],
+        None,
+        "{} → {queued} (driver, firmware, link, DHCP, gateway and DNS of each port, and the port this connection came through: system.install.print shows them)",
+        supported,
+        test
     ),
     cmd!(
         "system.install.challenge",
@@ -49,12 +61,13 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Install",
         [],
         None,
-        "{disk: string, serial: string, size: u64 (bytes, as print shows them: the disk must still be that one), typed_name: string (the disk's name, typed by the person), code?: string (from the console; a disk that holds something needs it or the power button), keep_config?: bool (keep the configuration of the CoreRouter on it)} → {disk, queued}",
+        "{disk: string, serial: string, size: u64 (bytes, as print shows them: the disk must still be that one), typed_name: string (the disk's name, typed by the person), code?: string (from the console; a disk that holds something needs it or the power button), keep_config?: bool (keep the configuration of the CoreRouter on it), mgmt_port?: string (the port for management after the first boot), mgmt_mode?: dhcp|static, mgmt_address?: string (static: address/prefix), mgmt_gateway?: ip, mgmt_dns?: [ip]} → {disk, queued}",
         supported,
         run
     ),
 ];
 
+const MAX_DNS: usize = 3;
 const INSTALLED: &str = "this router is installed: only the live image installs";
 
 fn state(s: &Session) -> Option<&Install> {
@@ -97,6 +110,76 @@ fn rescan(s: &mut Session, _: &Value) -> Result<Value> {
         i.rescan = true;
     }
     Ok(json!({"queued": true}))
+}
+
+fn test(s: &mut Session, _: &Value) -> Result<Value> {
+    let local = s.caller().link.as_ref().map(|l| match l.local.ip() {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 => v4,
+    });
+    let i = s
+        .ext_mut::<Install>()
+        .ok_or_else(|| EngineError::Internal("install state".into()))?;
+    if !i.testing {
+        i.test = Some(TestRequest { local });
+    }
+    Ok(json!({"queued": true}))
+}
+
+/// What the operator chose for the first boot (hostile: checked here, read by
+/// PID 1 from a file on the disk).
+fn mgmt(s: &mut Session, p: &Value) -> Result<Option<Mgmt>> {
+    let Some(port) = opt_str(p, "mgmt_port")?.map(str::to_owned) else {
+        for k in ["mgmt_mode", "mgmt_address", "mgmt_gateway", "mgmt_dns"] {
+            if p.get(k).is_some() {
+                return Err(EngineError::bad(k, "needs mgmt_port"));
+            }
+        }
+        return Ok(None);
+    };
+    let clip: String = port.chars().take(32).collect();
+    if !s.hal_mut().poll().iter().any(|l| l.name.as_str() == port) {
+        return Err(EngineError::bad("mgmt_port", format!("no port '{clip}' here")));
+    }
+    let ip = |k: &str, v: &str| -> Result<String> {
+        v.parse::<IpAddr>().map(|a| a.to_string()).map_err(|_| {
+            EngineError::bad(k, format!("'{}' is not an IP address", v.chars().take(45).collect::<String>()))
+        })
+    };
+    let gateway = opt_str(p, "mgmt_gateway")?.map(|g| ip("mgmt_gateway", g)).transpose()?;
+    let mut dns = Vec::new();
+    if let Some(list) = p.get("mgmt_dns") {
+        let list = list
+            .as_array()
+            .filter(|l| l.len() <= MAX_DNS)
+            .ok_or_else(|| EngineError::bad("mgmt_dns", format!("a list of up to {MAX_DNS} addresses")))?;
+        for d in list {
+            let d = d.as_str().ok_or_else(|| EngineError::bad("mgmt_dns", "a list of addresses"))?;
+            dns.push(ip("mgmt_dns", d)?);
+        }
+    }
+    let address = match opt_str(p, "mgmt_mode")? {
+        Some("dhcp") => {
+            if p.get("mgmt_address").is_some() || gateway.is_some() || !dns.is_empty() {
+                return Err(EngineError::bad("mgmt_mode", "dhcp takes no address, gateway or DNS"));
+            }
+            None
+        }
+        Some("static") => {
+            let a = opt_str(p, "mgmt_address")?
+                .ok_or_else(|| EngineError::bad("mgmt_address", "static needs address/prefix"))?;
+            let bad = || EngineError::bad("mgmt_address", format!("'{}' is not address/prefix", a.chars().take(49).collect::<String>()));
+            let (addr, prefix) = a.split_once('/').ok_or_else(bad)?;
+            let addr: IpAddr = addr.parse().map_err(|_| bad())?;
+            let max = if addr.is_ipv4() { 32 } else { 128 };
+            if !prefix.parse::<u8>().is_ok_and(|n| n <= max) {
+                return Err(bad());
+            }
+            Some(format!("{addr}/{prefix}"))
+        }
+        _ => return Err(EngineError::bad("mgmt_mode", "must be dhcp or static")),
+    };
+    Ok(Some(Mgmt { port, address, gateway, dns }))
 }
 
 /// The disk `print` showed: the same name, serial and, if given, size.
@@ -202,6 +285,13 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             format!("'{clip}' is not the disk's name: nothing was written"),
         ));
     }
+    let mgmt = mgmt(s, p)?;
+    if keep_config && mgmt.is_some() {
+        return Err(EngineError::bad(
+            "mgmt_port",
+            "the configuration kept on the disk says how it is managed",
+        ));
+    }
     let by = s.caller().name.clone();
     let i = s
         .ext_mut::<Install>()
@@ -224,7 +314,7 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
         confirmed(i, &name, &serial, code.as_deref())?;
     }
     i.result = None;
-    i.job = Some(Job { disk: name.clone(), serial, bytes: size, holds, keep_config, by });
+    i.job = Some(Job { disk: name.clone(), serial, bytes: size, holds, keep_config, mgmt, by });
     Ok(json!({"disk": name, "queued": true}))
 }
 
@@ -395,6 +485,46 @@ mod tests {
         assert!(e.contains("code"), "{e}");
         s.execute("system.install.cancel", &json!({})).unwrap();
         s.execute("system.shutdown", &json!({"confirm": true})).unwrap();
+    }
+
+    #[test]
+    fn the_management_choice_is_checked_before_anything_runs() {
+        let mut s = live();
+        for (extra, want) in [
+            (json!({"mgmt_mode": "dhcp"}), "needs mgmt_port"),
+            (json!({"mgmt_port": "nope", "mgmt_mode": "dhcp"}), "no port"),
+            (json!({"mgmt_port": "ether1"}), "dhcp or static"),
+            (json!({"mgmt_port": "ether1", "mgmt_mode": "static"}), "address/prefix"),
+            (json!({"mgmt_port": "ether1", "mgmt_mode": "static", "mgmt_address": "10.0.0.1"}), "address/prefix"),
+            (json!({"mgmt_port": "ether1", "mgmt_mode": "static", "mgmt_address": "10.0.0.1/33"}), "address/prefix"),
+            (json!({"mgmt_port": "ether1", "mgmt_mode": "static", "mgmt_address": "10.0.0.1/24", "mgmt_gateway": "x"}), "not an IP"),
+            (json!({"mgmt_port": "ether1", "mgmt_mode": "static", "mgmt_address": "10.0.0.1/24", "mgmt_dns": ["1.1.1.1", "x"]}), "not an IP"),
+            (json!({"mgmt_port": "ether1", "mgmt_mode": "dhcp", "mgmt_gateway": "10.0.0.1"}), "takes no"),
+            (json!({"mgmt_port": "ether1", "mgmt_mode": "dhcp", "keep_config": true}), "kept"),
+        ] {
+            let p = run(if extra.get("keep_config").is_some() { "nvme0n1" } else { "vda" }, extra);
+            let e = s.execute("system.install.run", &p).unwrap_err().to_string();
+            assert!(e.contains(want), "{p}: {e}");
+            assert!(s.ext::<Install>().unwrap().job.is_none());
+        }
+        let p = run("vda", json!({"mgmt_port": "ether1", "mgmt_mode": "static", "mgmt_address": "10.0.0.1/24", "mgmt_gateway": "10.0.0.254", "mgmt_dns": ["1.1.1.1"]}));
+        s.execute("system.install.run", &p).unwrap();
+        let m = s.ext::<Install>().unwrap().job.as_ref().unwrap().mgmt.clone().unwrap();
+        assert_eq!(m.address.as_deref(), Some("10.0.0.1/24"));
+        assert_eq!(m.dns, ["1.1.1.1"]);
+    }
+
+    #[test]
+    fn a_network_test_is_queued_once() {
+        let mut s = live();
+        s.execute("system.install.test", &json!({})).unwrap();
+        assert_eq!(s.execute("system.install.print", &json!({})).unwrap()["testing"], true);
+        assert!(install::take_test(&mut s).is_some());
+        s.execute("system.install.test", &json!({})).unwrap();
+        assert!(install::take_test(&mut s).is_none(), "one at a time");
+        install::set_network(&mut s, json!({"problems": []}));
+        let v = s.execute("system.install.print", &json!({})).unwrap();
+        assert_eq!((v["testing"].as_bool(), v["network"]["problems"].is_array()), (Some(false), true));
     }
 
     #[test]

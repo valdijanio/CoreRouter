@@ -470,6 +470,9 @@ fn first_boot(
                     log!("{}: {e}", plan::MGMT_DONE);
                 }
             }
+            if !live {
+                apply_install_data(&ttys);
+            }
             let n = crate::ctl::call("ip.address.list", &serde_json::json!({}))
                 .ok()
                 .and_then(|v| v.as_array().map(Vec::len));
@@ -482,6 +485,40 @@ fn first_boot(
         });
     if let Err(e) = spawned {
         log!("first-boot thread: {e}");
+    }
+}
+
+/// What the install from the live image left in `/config` (G1.6y), once: the
+/// file goes even when a command fails, so a bad value cannot repeat at every
+/// boot. Parameters are not logged (a password hash).
+fn apply_install_data(ttys: &[String]) {
+    use corerouter_sysupdate::disks::{FIRST_BOOT, FIRST_BOOT_MAX};
+    let path = Path::new(plan::CONFIG_DIR).join(FIRST_BOOT);
+    let Ok(f) = File::open(&path) else {
+        return;
+    };
+    let mut text = String::new();
+    if let Err(e) = f.take(FIRST_BOOT_MAX).read_to_string(&mut text) {
+        log!("{}: {e}", path.display());
+    }
+    match plan::first_boot_commands(&text) {
+        Ok((commands, said)) => {
+            for (cmd, params) in commands {
+                match crate::ctl::call(cmd, &params) {
+                    Ok(_) => log!("install: {cmd}"),
+                    Err(e) => log!("install: {cmd}: {e}"),
+                }
+            }
+            log!("install: {said}");
+            crate::console::announce(ttys, &format!("CoreRouter installed; {said}"));
+        }
+        Err(e) => log!("{}: {e}", path.display()),
+    }
+    if let Err(e) = fs::remove_file(&path) {
+        log!("{}: {e}", path.display());
+    }
+    if let Ok(dir) = File::open(plan::CONFIG_DIR) {
+        let _ = dir.sync_all();
     }
 }
 
