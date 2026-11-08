@@ -303,3 +303,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-30 — G0.32 criado e feito (versão legível no lugar do commit, pedido do usuário)
 - 2026-10-30 — G1.3f feito (poll de links fora do lock, dump enxuto, um dump por tick); G1.3i criado (o resto da E/S do tick sob o lock)
 - 2026-11-08 — G1.6y criado (instalar pela GUI e pela web a partir da ISO live)
+- 2026-11-08 — G1.6j parte 1 feita (firmware na imagem e carga automática de drivers em módulo)
