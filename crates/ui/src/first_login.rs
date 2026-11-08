@@ -40,6 +40,8 @@ pub(crate) struct PasswordAsk {
     focus: bool,
     /// The ⓘ's explanation, while open.
     help: Option<HelpView>,
+    /// Opened from the top bar's button, not by itself.
+    by_hand: bool,
 }
 
 impl CoreRouterUi {
@@ -81,6 +83,7 @@ impl CoreRouterUi {
             a.open = true;
             a.focus = true;
             a.error = None;
+            a.by_hand = true;
         }
     }
 
@@ -88,6 +91,7 @@ impl CoreRouterUi {
     pub fn password_not_now(&mut self) {
         let a = &mut self.password_ask;
         a.open = false;
+        a.by_hand = false;
         a.password.clear();
         a.again.clear();
         a.error = None;
@@ -104,6 +108,15 @@ impl CoreRouterUi {
     /// Open the dialog by itself the first time the router reports an
     /// account without a password; close it if that changed elsewhere.
     pub(crate) fn first_login_tick(&mut self) {
+        // G1.6y: a live image keeps nothing, and the password that lasts is
+        // asked in the Install to disk window this dialog would cover. The
+        // top bar still warns and has the button.
+        if self.cache.info.get("boot").and_then(|b| b.as_str()) == Some("live") {
+            if self.password_ask.open && !self.password_ask.sending && !self.password_ask.by_hand {
+                self.password_not_now();
+            }
+            return;
+        }
         match self.no_password_user() {
             Some(user) if !self.password_ask.shown => {
                 self.password_ask.shown = true;
