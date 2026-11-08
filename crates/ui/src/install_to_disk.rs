@@ -15,6 +15,17 @@ use crate::i18n::tr_in;
 use crate::panel::{self, Panel, PanelState, PanelThen, Query, WinDef};
 use crate::{CoreRouterUi, Win};
 
+/// A field of a JSON object, or null.
+fn g<'a>(v: &'a Value, key: &str) -> &'a Value {
+    v.get(key).unwrap_or(&Value::Null)
+}
+
+fn set(v: &mut Value, key: &str, value: Value) {
+    if let Some(o) = v.as_object_mut() {
+        o.insert(key.to_owned(), value);
+    }
+}
+
 const SCOPE: &str = "install_to_disk";
 pub(crate) const WIN: &str = "install_to_disk";
 /// How long after the reboot the window keeps saying "coming back".
@@ -92,11 +103,11 @@ impl InstallPanel {
 
     fn disk_row(&self) -> Option<&Value> {
         let name = self.disk.as_deref()?;
-        self.status["disks"].as_array()?.iter().find(|d| s(d, "name") == name)
+        g(&self.status, "disks").as_array()?.iter().find(|d| s(d, "name") == name)
     }
 
     fn connected(&self) -> Option<String> {
-        self.status["network"]["connected_port"].as_str().map(str::to_owned)
+        g(g(&self.status, "network"), "connected_port").as_str().map(str::to_owned)
     }
 
     /// The port chosen, or the one this GUI comes through.
@@ -105,7 +116,7 @@ impl InstallPanel {
     }
 
     fn port_row(&self, name: &str) -> Option<&Value> {
-        self.status["network"]["ports"].as_array()?.iter().find(|p| s(p, "name") == name)
+        g(g(&self.status, "network"), "ports").as_array()?.iter().find(|p| s(p, "name") == name)
     }
 
     /// The parameters of `run`; the engine checks them.
@@ -113,32 +124,32 @@ impl InstallPanel {
         let mut p = json!({
             "disk": s(d, "name"),
             "serial": s(d, "serial"),
-            "size": d["bytes"],
+            "size": g(d, "bytes"),
             "typed_name": self.typed,
         });
         if !self.code.trim().is_empty() {
-            p["code"] = json!(self.code.trim());
+            set(&mut p, "code", json!(self.code.trim()));
         }
         if self.keep {
-            p["keep_config"] = json!(true);
+            set(&mut p, "keep_config", json!(true));
             return p;
         }
         if let Some(port) = self.chosen_port() {
             let row = self.port_row(&port).cloned().unwrap_or(Value::Null);
             let address = s(&row, "address");
             if self.fix_address && !address.is_empty() {
-                p["mgmt_port"] = json!(port);
-                p["mgmt_mode"] = json!("static");
-                p["mgmt_address"] = json!(address);
+                set(&mut p, "mgmt_port", json!(port));
+                set(&mut p, "mgmt_mode", json!("static"));
+                set(&mut p, "mgmt_address", json!(address));
                 if !s(&row, "gateway").is_empty() {
-                    p["mgmt_gateway"] = row["gateway"].clone();
+                    set(&mut p, "mgmt_gateway", g(&row, "gateway").clone());
                 }
-                if row["dns"].as_array().is_some_and(|d| !d.is_empty()) {
-                    p["mgmt_dns"] = row["dns"].clone();
+                if g(&row, "dns").as_array().is_some_and(|d| !d.is_empty()) {
+                    set(&mut p, "mgmt_dns", g(&row, "dns").clone());
                 }
             } else {
-                p["mgmt_port"] = json!(port);
-                p["mgmt_mode"] = json!("dhcp");
+                set(&mut p, "mgmt_port", json!(port));
+                set(&mut p, "mgmt_mode", json!("dhcp"));
             }
         }
         p
@@ -150,12 +161,12 @@ impl InstallPanel {
         };
         self.error = None;
         // A password first: the install carries what the router has.
-        if !self.password.is_empty() {
-            if let Some(user) = app.no_password_user() {
-                let params = json!({"name": user, "password": self.password});
-                app.run_then("user.set", params, panel::then(PANEL.name, Sent::Password));
-                return;
-            }
+        if !self.password.is_empty()
+            && let Some(user) = app.no_password_user()
+        {
+            let params = json!({"name": user, "password": self.password});
+            app.run_then("user.set", params, panel::then(PANEL.name, Sent::Password));
+            return;
         }
         app.run_then("system.install.run", self.run_params(&d), panel::then(PANEL.name, Sent::Run));
     }
@@ -188,12 +199,12 @@ impl InstallPanel {
             self.draw_after(app, ui);
             return;
         }
-        if self.status["supported"] != true {
+        if g(&self.status, "supported") != true {
             let reason = s(&self.status, "reason");
             ui.label(if reason.is_empty() { t(lang, "Waiting for the router…") } else { reason });
             return;
         }
-        let m = self.status["medium"].clone();
+        let m = g(&self.status, "medium").clone();
         if m.is_null() {
             ui.colored_label(ui.visuals().warn_fg_color, t(lang, "Looking for the installation medium…"));
             ui.weak(t(lang, "Keep it in the machine until the install ends: the image is read from it."));
@@ -224,7 +235,7 @@ impl InstallPanel {
                 app.run("system.install.rescan", json!({}));
             }
         });
-        let disks = self.status["disks"].as_array().cloned().unwrap_or_default();
+        let disks = g(&self.status, "disks").as_array().cloned().unwrap_or_default();
         if disks.is_empty() {
             ui.colored_label(ui.visuals().warn_fg_color, t(lang, "No disk found"));
             return;
@@ -251,7 +262,7 @@ impl InstallPanel {
                 if row.clicked() {
                     self.disk = Some(name.to_owned());
                 }
-                ui.label(human(d["bytes"].as_u64().unwrap_or(0)));
+                ui.label(human(g(d, "bytes").as_u64().unwrap_or(0)));
                 ui.label(s(d, "model"));
                 ui.label(s(d, "bus"));
                 ui.horizontal(|ui| {
@@ -278,7 +289,7 @@ impl InstallPanel {
             self.tested = true;
             app.run("system.install.test", json!({}));
         }
-        let testing = self.status["testing"] == true;
+        let testing = g(&self.status, "testing") == true;
         ui.horizontal(|ui| {
             ui.strong(t(lang, "Network test"));
             self.info(ui, "install_to_disk.network", t(lang, "Network test"));
@@ -289,8 +300,8 @@ impl InstallPanel {
                 ui.spinner();
             }
         });
-        let net = self.status["network"].clone();
-        let ports = net["ports"].as_array().cloned().unwrap_or_default();
+        let net = g(&self.status, "network").clone();
+        let ports = g(&net, "ports").as_array().cloned().unwrap_or_default();
         if ports.is_empty() && !testing {
             ui.colored_label(ui.visuals().warn_fg_color, t(lang, "No port found: its driver may be missing here"));
         }
@@ -307,14 +318,14 @@ impl InstallPanel {
         };
         for p in &ports {
             let name = s(p, "name");
-            let link = p["link"] == true;
-            let speed = p["speed_mbps"].as_u64().map_or_else(String::new, |v| format!(" {v} Mbps"));
+            let link = g(p, "link") == true;
+            let speed = g(p, "speed_mbps").as_u64().map_or_else(String::new, |v| format!(" {v} Mbps"));
             let what = if link { format!("{}{speed}", t(lang, "link")) } else { t(lang, "no link").to_owned() };
             line(ui, link.then_some(true), format!("{name}: {} {} · {what}", t(lang, "driver"), s(p, "driver")));
             if !link {
                 continue;
             }
-            for f in p["firmware"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+            for f in g(p, "firmware").as_array().into_iter().flatten().filter_map(Value::as_str) {
                 line(ui, Some(false), format!("{name}: {}: {f}", t(lang, "not on the live image, works in full once installed")));
             }
             let address = s(p, "address");
@@ -324,10 +335,10 @@ impl InstallPanel {
                 line(ui, Some(false), format!("{name}: {}", t(lang, "no address yet")));
             }
             if !s(p, "gateway").is_empty() {
-                line(ui, p["gateway_ok"].as_bool(), format!("{} {}", t(lang, "Gateway"), s(p, "gateway")));
+                line(ui, g(p, "gateway_ok").as_bool(), format!("{} {}", t(lang, "Gateway"), s(p, "gateway")));
             }
-            if p["dns"].as_array().is_some_and(|d| !d.is_empty()) {
-                line(ui, p["dns_ok"].as_bool(), t(lang, "DNS answers").to_owned());
+            if g(p, "dns").as_array().is_some_and(|d| !d.is_empty()) {
+                line(ui, g(p, "dns_ok").as_bool(), t(lang, "DNS answers").to_owned());
             }
         }
         if let Some(port) = self.connected() {
@@ -344,7 +355,7 @@ impl InstallPanel {
             ui.strong(t(lang, "Management after install"));
             self.info(ui, "install_to_disk.mgmt", t(lang, "Management after install"));
         });
-        let ports: Vec<String> = self.status["network"]["ports"]
+        let ports: Vec<String> = g(g(&self.status, "network"), "ports")
             .as_array()
             .into_iter()
             .flatten()
@@ -394,27 +405,27 @@ impl InstallPanel {
 
     fn draw_action(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
         let lang = app.lang.labels;
-        let job = self.status["job"].clone();
-        let result = self.status["result"].clone();
+        let job = g(&self.status, "job").clone();
+        let result = g(&self.status, "result").clone();
         if !job.is_null() {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(format!("{} {}: {}", t(lang, "Installing on"), s(&job, "disk"), s(&job, "phase")));
             });
-            let total = job["total"].as_u64().unwrap_or(0).max(1);
-            ui.add(ProgressBar::new(job["done"].as_u64().unwrap_or(0) as f32 / total as f32).show_percentage());
+            let total = g(&job, "total").as_u64().unwrap_or(0).max(1);
+            ui.add(ProgressBar::new(g(&job, "done").as_u64().unwrap_or(0) as f32 / total as f32).show_percentage());
             return;
         }
-        if result["ok"] == true {
+        if g(&result, "ok") == true {
             chip::chip(ui, t(lang, "written and read back"), Kind::Green.tone(ui.visuals()));
-            if let Some(e) = result["boot_entry_error"].as_str() {
+            if let Some(e) = g(&result, "boot_entry_error").as_str() {
                 ui.colored_label(ui.visuals().warn_fg_color, format!("{}: {e}", t(lang, "No boot entry; remove the medium before rebooting")));
             }
-            if let Some(e) = result["first_boot_error"].as_str() {
+            if let Some(e) = g(&result, "first_boot_error").as_str() {
                 ui.colored_label(ui.visuals().warn_fg_color, format!("{}: {e}", t(lang, "Set the management address on the console after the reboot")));
             }
             if ui.button(t(lang, "Reboot")).clicked() {
-                let port = result["mgmt_port"].as_str().map(str::to_owned);
+                let port = g(&result, "mgmt_port").as_str().map(str::to_owned);
                 let address = port.as_deref().and_then(|p| self.port_row(p)).map(|r| s(r, "address").to_owned());
                 self.after = Some(After {
                     version: s(&result, "version").to_owned(),
@@ -426,11 +437,11 @@ impl InstallPanel {
             }
             return;
         }
-        if let Some(e) = result["error"].as_str() {
+        if let Some(e) = g(&result, "error").as_str() {
             ui.colored_label(ui.visuals().error_fg_color, format!("{}: {e}", t(lang, "Not installed")));
         }
-        let problems = self.status["network"]["problems"].as_array().map_or(0, Vec::len);
-        for p in self.status["network"]["problems"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        let problems = g(g(&self.status, "network"), "problems").as_array().map_or(0, Vec::len);
+        for p in g(g(&self.status, "network"), "problems").as_array().into_iter().flatten().filter_map(Value::as_str) {
             ui.colored_label(ui.visuals().warn_fg_color, p);
         }
         let mismatch = self.password != self.again;
@@ -522,9 +533,9 @@ impl PanelState for InstallPanel {
         let lang = app.lang.labels;
         let name = s(&d, "name").to_owned();
         let holds = s(&d, "holds").to_owned();
-        let challenge = self.status["challenge"].clone();
+        let challenge = g(&self.status, "challenge").clone();
         let mine = s(&challenge, "disk") == name;
-        let presence = mine && challenge["presence"] == true;
+        let presence = mine && g(&challenge, "presence") == true;
         let mut cancel = false;
         let mut go = false;
         egui::Modal::new(egui::Id::unique("install-confirm")).show(ctx, |ui| {
@@ -538,13 +549,13 @@ impl PanelState for InstallPanel {
                 ui.heading(title);
                 self.info(ui, "install_to_disk.confirm", title);
             });
-            let size = human(d["bytes"].as_u64().unwrap_or(0));
+            let size = human(g(&d, "bytes").as_u64().unwrap_or(0));
             ui.label(match s(&d, "model") {
                 "" => format!("{name} · {size}"),
                 model => format!("{name} · {size} · {model}"),
             });
             ui.weak(format!("{} {} · {}", t(lang, "Serial"), s(&d, "serial"), s(&d, "detail")));
-            if holds == "corerouter" && d["config_keepable"] == true {
+            if holds == "corerouter" && g(&d, "config_keepable") == true {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.keep, t(lang, "Keep configuration"));
                     self.info(ui, "install_to_disk.keep", t(lang, "Keep configuration"));
@@ -569,14 +580,14 @@ impl PanelState for InstallPanel {
                         self.info(ui, "install_to_disk.code", t(lang, "Code on the console"));
                     });
                     if mine {
-                        let left = challenge["remaining_s"].as_u64().unwrap_or(0);
+                        let left = g(&challenge, "remaining_s").as_u64().unwrap_or(0);
                         ui.weak(format!(
                             "{} {}:{:02}. {} {}. {}",
                             t(lang, "Expires in"),
                             left / 60,
                             left % 60,
                             t(lang, "Tries left:"),
-                            challenge["attempts_left"].as_u64().unwrap_or(0),
+                            g(&challenge, "attempts_left").as_u64().unwrap_or(0),
                             t(lang, "No screen? Press the power button 3 times."),
                         ));
                     } else if ui.small_button(t(lang, "Ask for a new code")).clicked() {
