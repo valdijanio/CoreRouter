@@ -731,12 +731,12 @@ da lista.
 |---|---|---|
 | Módulos | 3 | 192 (28,2 MB crus) |
 | Firmware | 41 arquivos, 1,5 MB | 79 arquivos e 4 links, 11,1 MB crus; 19 licenças; 6 `skip` |
-| `rootfs.squashfs` | 37 281 792 B | 48 844 800 B (slot de 256 MiB) |
-| `corerouter.crpkg` | 57 357 909 B | 69 150 294 B |
-| `bzImage` | 19 776 512 B | 19 915 776 B |
-| `BOOTX64.EFI` da ISO | 19 428 352 B | 20 984 832 B (limite da FAT: 32 MiB) |
-| Memória ociosa | 79–86 MiB | 72–74 MiB: o conjunto amplo não aumenta (a variação é entre rodadas) |
-| `ready` depois do kernel | 0,98–1,02 s | 1,07 s |
+| `rootfs.squashfs` | 37 281 792 B | 48 848 896 B (slot de 256 MiB) |
+| `corerouter.crpkg` | 57 357 909 B | 69 682 774 B |
+| `bzImage` | 19 776 512 B | 20 444 160 B (inclui o que a `main` trouxe no meio, como o suporte a BIOS) |
+| `BOOTX64.EFI` da ISO | 19 428 352 B | 21 447 680 B (limite da FAT: 32 MiB) |
+| Memória ociosa | 79–86 MiB | 72–76 MiB: o conjunto amplo não aumenta (a variação é entre rodadas) |
+| `ready` depois do kernel | 0,98–1,02 s | 0,98–1,07 s |
 
 ### Pesquisa
 
