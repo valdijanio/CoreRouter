@@ -114,7 +114,7 @@ const REQUIRED_BR2: &[&str] = &[
 ];
 /// What the installer kernel's fragment must say (G1.6c).
 const INSTALLER_KERNEL: &[&str] = &[
-    "CONFIG_CMDLINE=\"console=tty0 console=ttyS0,115200 corerouter.mode=install panic=10 quiet\"",
+    "CONFIG_CMDLINE=\"console=tty0 console=ttyS0,115200 corerouter.mode=live panic=10 quiet\"",
     "CONFIG_INITRAMFS_COMPRESSION_ZSTD=y",
     "# CONFIG_DEBUG_INFO_BTF is not set",
 ];

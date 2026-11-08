@@ -333,10 +333,12 @@ impl Session {
                 reason,
             })?;
         check_params(spec, params)?;
-        (spec.enabled)(self).map_err(|reason| EngineError::Disabled {
-            id: id.to_owned(),
-            reason,
-        })?;
+        crate::live::permit(self, spec.id, spec.journal)
+            .and_then(|()| (spec.enabled)(self))
+            .map_err(|reason| EngineError::Disabled {
+                id: id.to_owned(),
+                reason,
+            })?;
 
         // Queries never change the config: no rollback point to copy
         // (`queries_leave_the_candidate_alone` runs every one of them).

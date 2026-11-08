@@ -644,7 +644,8 @@ Saídas em `<out>/build/images/`:
   linha: num CD não há PARTUUID, e num disco com CoreRouter instalado o mesmo PARTUUID existiria
   duas vezes. O pacote `os/package/corerouter-installer` compila o **mesmo** kernel (o mesmo
   tarball e hash, o `.config` final da imagem) com `installer.fragment` por cima: outra linha de
-  comando (`corerouter.mode=install`, sem `root=`), um initramfs embutido e sem BTF. O
+  comando (`corerouter.mode=live`, sem `root=`; se o live não puder subir, o PID 1 passa para o
+  instalador, e `corerouter.mode=install` continua indo direto para ele), um initramfs embutido e sem BTF. O
   initramfs é uma lista do `gen_init_cpio` (donos e modos fixos: reprodutível) com o
   `corerouter-init`, as bibliotecas que ele usa e as chaves públicas da imagem. Roda inteiro na
   RAM: o pendrive pode sair depois.
@@ -746,6 +747,36 @@ O mesmo disco boota pelos dois firmwares; nada do caminho UEFI muda.
 - **Licença.** O GRUB é GPL-3.0 e fica só na área de boot (bloco 0, espaço antes da partição,
   arquivos da ESP) e na ISO; a raiz continua sem GPL-3.0. O fonte correspondente é o que a
   receita do Buildroot baixa (`make legal-info`).
+
+### ISO live (G1.6y)
+
+A ISO boota **live** (`corerouter.mode=live`): a imagem roda da RAM, com o daemon completo, para
+instalar pela GUI e pelo navegador. O console continua sendo alternativa: `i` + Enter abre o
+instalador acima.
+
+- **Boot em dois estágios.** No initramfs, o `corerouter-init` (`apps/corerouter-init/src/live.rs`)
+  acha a mídia, confere as assinaturas, copia o rootfs de dentro do `COREROUTER.CRPKG` para um tmpfs
+  conferindo o SHA-256 assinado, monta o squashfs por loop e troca a raiz com o busybox
+  (`mount -o loop`, `switch_root`: sem `ioctl` em Rust, que exigiria `unsafe`). Na raiz nova, o
+  init roda de novo (`--live-root`), como o de um roteador. A pendrive fica até o fim da instalação:
+  a carga é lida dela na hora de gravar.
+- **Se algo falha, instala igual.** Menos de ~256 MiB de RAM, mídia ruim ou erro na troca de raiz:
+  fica no instalador de console, que não precisa de nada disso. O `fw_cfg` do hipervisor vai
+  direto para ele.
+- **Não toca em disco nenhum.** `/config` é um tmpfs (não procura a partição `config` de um
+  CoreRouter instalado), sem estado A/B, sem `grow`, sem `system.package.*`.
+- **Só cliente.** Sem FRR. Cliente DHCP em todas as portas, com distância 200+ na rota; só manda
+  pacote em porta com link. O motor recusa qualquer comando que muda algo fora de uma lista curta
+  (`crates/engine/src/live.rs`): porta, endereço, rota, cliente DHCP, DNS, senha, instalação,
+  energia e ferramentas. O descobrimento (CRDP) continua: é como a GUI acha a máquina.
+- **`server.info`** traz `boot: live | installed` para quem está logado.
+
+Medido (2026-11-08, KVM, 2 vCPUs, sem FRR, sem GUI conectada, `-kernel`, protótipo com o mesmo
+kernel e o mesmo rootfs): 128 MiB sobe (69,5 MiB em uso), 112 MiB o OOM mata o daemon, 96 MiB não
+boota; com 256 MiB, 76,6–78,2 MiB em uso. O instalador de console instala com 160 MiB, não com 128.
+A ISO real (KVM, UEFI): com 256, 320 e 512 MiB sobe live (`ready` em 1,24–1,26 s depois do kernel);
+com 192 e 224 MiB fica no instalador de console, sem OOM. A ISO cresceu 1,2 MB (116.531.200 →
+117.776.384 B): o rootfs já estava nela, entrou o busybox no initramfs.
 
 ### FRR na imagem
 

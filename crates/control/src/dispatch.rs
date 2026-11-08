@@ -214,6 +214,7 @@ fn dispatch_value(
                     "commit_time": corerouter_buildinfo::commit_unix(),
                     "protocol": corerouter_buildinfo::PROTOCOL,
                     "backend": s.backend(),
+                    "boot": if corerouter_engine::live::is_live(s) { "live" } else { "installed" },
                     "has_ui": has_ui,
                 }))
             })

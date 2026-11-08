@@ -257,6 +257,16 @@ impl<R: Read + Seek + Send> Medium<R> {
         })
     }
 
+    /// Where the signed root filesystem (squashfs + verity tree) is on the
+    /// medium: inside the update package, after its header and kernel.
+    pub fn rootfs_extent(&self) -> Result<Extent, String> {
+        let pkg = self.extent(PACKAGE)?;
+        Ok(Extent {
+            offset: pkg.offset + self.header.len() + self.header.manifest.kernel.size,
+            size: self.header.manifest.rootfs.size,
+        })
+    }
+
     fn extent(&self, name: &str) -> Result<Extent, String> {
         self.files
             .get(name)
@@ -468,8 +478,7 @@ pub fn install<R: Read + Seek + Send>(
     if opts.keep_config && !keep {
         return Err("the configuration on this disk cannot be kept (no CoreRouter config partition in the same place)".into());
     }
-    let pkg = medium.extent(PACKAGE)?;
-    let rootfs_at = pkg.offset + medium.header.len() + m.kernel.size;
+    let rootfs = medium.rootfs_extent()?;
     // What gets written, in order: (partition, source extent, zero fill).
     let mut jobs: Vec<(Part, Extent, u64)> = Vec::new();
     for p in &index.partitions {
@@ -483,13 +492,7 @@ pub fn install<R: Read + Seek + Send>(
                 let e = medium.extent(file)?;
                 (e, p.size - e.size)
             }
-            Content::Rootfs => (
-                Extent {
-                    offset: rootfs_at,
-                    size: m.rootfs.size,
-                },
-                0,
-            ),
+            Content::Rootfs => (rootfs, 0),
             Content::Empty => continue,
         };
         if src.size + fill > p.size {
@@ -1316,6 +1319,15 @@ mod tests {
         let mut t = &f;
         assert!(gpt::read(&mut t, 512).is_err(), "no partition table");
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_rootfs_extent_is_the_signed_rootfs() {
+        let b = build(|_| {});
+        let m = Medium::open(Cursor::new(b.iso.clone()), &b.keys).unwrap();
+        let e = m.rootfs_extent().unwrap();
+        let (at, size) = (e.offset as usize, e.size as usize);
+        assert_eq!(&b.iso[at..at + size], &b.rootfs[..]);
     }
 
     #[test]
