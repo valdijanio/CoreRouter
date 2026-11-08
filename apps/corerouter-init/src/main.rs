@@ -13,6 +13,9 @@
 //! the installer's management address on the first boot, runs the console
 //! setup when no port has an address (`setup`), and is the installer when
 //! the installer ISO's kernel boots it (`corerouter.mode=install`).
+//!
+//! G1.6y: the ISO boots live (`corerouter.mode=live`, `live`): the image from
+//! RAM, so the GUI and the browser can install it over the network.
 
 #[cfg(target_os = "linux")]
 mod console;
@@ -24,6 +27,8 @@ mod grow;
 mod install;
 #[cfg(target_os = "linux")]
 mod links;
+#[cfg(target_os = "linux")]
+mod live;
 #[cfg(target_os = "linux")]
 mod modules;
 #[cfg(target_os = "linux")]
@@ -40,6 +45,11 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("run") => std::process::exit(ctl::main(args.get(1..).unwrap_or(&[]))),
         Some("setup") => std::process::exit(setup::main(args.get(1..).unwrap_or(&[]))),
+        // G1.6y: `i` on the live image's console.
+        Some("install-here") => {
+            let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+            install::run(&plan::BootOptions::parse(&cmdline), cmdline.trim())
+        }
         _ => {}
     }
     pid1::main();

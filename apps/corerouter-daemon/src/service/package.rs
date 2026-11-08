@@ -83,8 +83,11 @@ fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
     let keys_dir = PathBuf::from(ctx.flag("--image-keys").unwrap_or(KEYS_DIR));
     let config_dir = ctx.config_dir.clone();
     let lab = lock(&session).backend().starts_with("virtual lab");
+    // G1.6y: a live image has no slots of its own, and the disks it sees are
+    // not its to touch.
+    let live = ctx.flag("--live").is_some();
     Ok(Box::new(move |health: &super::Health| {
-        let mut svc = Svc::new(&session, &keys_dir, config_dir.as_deref(), lab);
+        let mut svc = Svc::new(&session, &keys_dir, config_dir.as_deref(), lab, live);
         if let Some(e) = &svc.off {
             health.disabled(Some(e));
         }
@@ -121,8 +124,9 @@ fn uptime_s() -> u64 {
 }
 
 impl Svc {
-    fn new(session: &Shared, keys_dir: &Path, config: Option<&Path>, lab: bool) -> Svc {
+    fn new(session: &Shared, keys_dir: &Path, config: Option<&Path>, lab: bool, live: bool) -> Svc {
         let made = match (lab, config) {
+            _ if live => Err("the live image is not installed: install it first (System › Install to disk)".into()),
             (true, Some(c)) => Platform::lab(&c.join("lab-image"), c, load_keys(keys_dir), LAB_SLOT),
             (true, None) => Err("virtual lab without --config-dir: nowhere to keep the lab image".into()),
             (false, Some(c)) => discover(c, keys_dir),

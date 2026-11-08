@@ -81,8 +81,57 @@ pub fn frr_args(daemon: &str) -> Vec<String> {
 pub enum Mode {
     /// The router (the installed image).
     Router,
-    /// The installer ISO's kernel (`corerouter.mode=install`, G1.6c).
+    /// The installer ISO's console installer (`corerouter.mode=install`,
+    /// G1.6c): also what the live ISO falls back to.
     Install,
+    /// The ISO's default (`corerouter.mode=live`, G1.6y): the image from RAM,
+    /// `/config` on a tmpfs, nothing written until an install is asked for.
+    Live,
+}
+
+/// The argument the first stage of the live ISO passes to `corerouter-init`
+/// on the image's root: this boot already moved there (G1.6y).
+pub const LIVE_STAGE2: &str = "--live-root";
+/// Below this `MemTotal` the ISO stays on the console installer (G1.6y): the
+/// image needs a 128 MiB machine to come up (**medido**, QEMU, no GUI
+/// connected) and an install reads the 35 MiB root back into memory on top
+/// of it. A 256 MiB machine shows less than 256 MiB here (the kernel's own).
+pub const LIVE_MIN_RAM_KIB: u64 = 200 * 1024;
+/// The live image's host name.
+pub const LIVE_HOSTNAME: &str = "corerouter-live";
+
+/// `MemTotal` of `/proc/meminfo`, in KiB.
+pub fn mem_total_kib(meminfo: &str) -> Option<u64> {
+    meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// The commands that give every port of the live image a DHCP client
+/// (G1.6y): client only, a route of low preference per port (the first one
+/// wins while it has a lease), and a name the network's operator recognizes.
+pub fn live_dhcp_commands(ports: &[String]) -> Vec<(&'static str, serde_json::Value)> {
+    let mut out = Vec::new();
+    for (i, port) in ports.iter().enumerate() {
+        out.push((
+            "interface.set",
+            serde_json::json!({"name": port, "disabled": false}),
+        ));
+        out.push((
+            "ip.dhcp-client.add",
+            serde_json::json!({
+                "interface": port,
+                "host_name": LIVE_HOSTNAME,
+                "default_route_distance": 200 + i.min(50),
+                "comment": "live image",
+            }),
+        ));
+    }
+    out
 }
 
 /// A management address set by the installer for the first boot
@@ -327,9 +376,10 @@ impl BootOptions {
                 },
                 "mode" => match value {
                     "install" => out.mode = Mode::Install,
+                    "live" => out.mode = Mode::Live,
                     "router" => out.mode = Mode::Router,
                     _ => out.warnings.push(format!(
-                        "corerouter.mode={}: use install or router",
+                        "corerouter.mode={}: use install, live or router",
                         clip(value)
                     )),
                 },
@@ -378,6 +428,9 @@ pub fn daemon_args(opts: &BootOptions, frr: bool) -> Vec<String> {
     a.extend(["--web-files", WEB_DIR, "--web-factory-on"].map(str::to_owned));
     if frr {
         a.extend(["--frr", FRR_DIR, "--frr-daemons", FRR_WANTED].map(str::to_owned));
+    }
+    if opts.mode == Mode::Live {
+        a.push("--live".to_owned());
     }
     a
 }
@@ -557,6 +610,36 @@ mod tests {
                 .ends_with("--dplaneaddr unix:/var/run/frr/bfdd_dplane.sock")
         );
         assert_eq!(FRR_DAEMONS.first(), Some(&"mgmtd"));
+    }
+
+    #[test]
+    fn live_mode_is_one_more_mode_and_tells_the_daemon() {
+        let o = BootOptions::parse("console=ttyS0 corerouter.mode=live quiet");
+        assert_eq!(o.mode, Mode::Live);
+        assert!(o.warnings.is_empty());
+        assert!(daemon_args(&o, false).contains(&"--live".to_owned()));
+        let r = BootOptions::parse("corerouter.slot=a");
+        assert!(!daemon_args(&r, false).contains(&"--live".to_owned()));
+    }
+
+    #[test]
+    fn live_memory_floor_and_dhcp_on_every_port() {
+        assert_eq!(
+            mem_total_kib("MemFree: 1 kB\nMemTotal:  1024 kB\n"),
+            Some(1024)
+        );
+        assert_eq!(mem_total_kib("garbage"), None);
+        assert_eq!(mem_total_kib("MemTotal: x kB"), None);
+        let c = live_dhcp_commands(&["ether1".into(), "ether2".into()]);
+        assert_eq!(c.len(), 4);
+        assert_eq!(c[0].0, "interface.set");
+        assert_eq!(c[1].1["interface"], "ether1");
+        assert_eq!(c[1].1["default_route_distance"], 200);
+        assert_eq!(c[3].1["default_route_distance"], 201);
+        // Far more ports than a distance can tell apart: still a valid one.
+        let many: Vec<String> = (0..1024).map(|i| format!("ether{i}")).collect();
+        let last = live_dhcp_commands(&many);
+        assert_eq!(last.last().unwrap().1["default_route_distance"], 250);
     }
 
     #[test]

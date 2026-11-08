@@ -9463,3 +9463,5 @@ continuação indentadas).
   dividir em vários sockets não tem como fatiar um `RTM_GETLINK` (o filtro por índice faz um pedido
   por link). O que fica sob o lock (~4 ms com 10 000 links) é juntar o resultado: posse, ausentes,
   tempos de link, gráficos.
+
+- 2026-11-08 — G1.6y: ISO live, parte 1 de 4: `corerouter.mode=live`, rootfs da mídia copiado para a RAM com o hash assinado conferido, `/config` em tmpfs, sem FRR, DHCP em todas as portas, `server.info.boot` e o motor recusando o que não seja cliente (`crates/engine/src/live.rs`). Falhou (RAM, mídia)? Fica no instalador de console; `i` no console do live também abre ele. Testar: `cargo xtask os build && cargo xtask os install-test` (cenário `live`).
