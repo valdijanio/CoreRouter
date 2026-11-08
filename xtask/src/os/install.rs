@@ -48,6 +48,10 @@ fn autoinstall(keep: bool) -> String {
 }
 
 struct T {
+    /// The admin password of the VM `live_cli` talks to.
+    admin: String,
+    /// The certificate must be the one seen before.
+    strict: bool,
     root: PathBuf,
     work: PathBuf,
     images: PathBuf,
@@ -317,18 +321,21 @@ fn interactive(t: &mut T) -> Result<(), String> {
 fn live_cli(t: &T, cli: &Path, port: u16, id: &str, params: &str) -> Result<String, String> {
     let home = t.work.join("live-home");
     std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
-    let out = Command::new(cli)
-        .args([
-            "--connect",
-            &format!("tls://127.0.0.1:{port}"),
-            "--user",
-            "admin",
-        ])
-        .arg("--accept-new-cert")
+    let mut cmd = Command::new(cli);
+    cmd.args([
+        "--connect",
+        &format!("tls://127.0.0.1:{port}"),
+        "--user",
+        "admin",
+    ]);
+    if !t.strict {
+        cmd.arg("--accept-new-cert");
+    }
+    let out = cmd
         .args(["run", id, params])
         .env("HOME", &home)
         .env("COREROUTER_KNOWN_HOSTS", home.join("known_hosts"))
-        .env("COREROUTER_PASSWORD", "")
+        .env("COREROUTER_PASSWORD", &t.admin)
         .env("RUST_LOG", "off")
         .stdin(std::process::Stdio::null())
         .output()
@@ -560,6 +567,33 @@ fn install_result(t: &T, cli: &Path, port: u16) -> Result<serde_json::Value, Str
     }
 }
 
+/// What the install wrote, alone, with the ISO still in the drive.
+fn boot_written(
+    t: &T,
+    log: &mut std::fs::File,
+    name: &str,
+    disk: &str,
+    port: u16,
+) -> Result<Vm, String> {
+    let mut cmd = qemu_machine(t.kvm, t.fw, &t.vars());
+    cmd.arg("-drive").arg(format!(
+        "file={},if=none,id=d,format=raw",
+        t.work.join(disk).display()
+    ));
+    cmd.args(["-device", "virtio-blk-pci,drive=d"]);
+    cmd.arg("-drive").arg(format!(
+        "file={},if=none,id=cd,format=raw,media=cdrom,readonly=on",
+        t.images.join("corerouter-install.iso").display()
+    ));
+    cmd.args(["-device", "ide-cd,drive=cd"]);
+    cmd.arg("-netdev").arg(format!(
+        "user,id=n0,hostfwd=tcp:127.0.0.1:{port}-:{}",
+        super::GUEST_TLS_PORT
+    ));
+    cmd.args(["-device", "virtio-net-pci,netdev=n0"]);
+    start(log, name, cmd)
+}
+
 /// G1.6y: installing through the commands. A disk with data needs the code
 /// from the console (wrong ones refused, `system.shutdown` refused meanwhile);
 /// the disk then boots. An empty disk needs the name; the power button pressed
@@ -583,6 +617,32 @@ fn live_install(t: &mut T) -> Result<(), String> {
         format!("a filesystem past 64 KiB called: {data}"),
     )?;
     check(data["confirm"] == "name+code", format!("{data}"))?;
+    // The test the window shows before anything is erased.
+    live_cli(t, &cli, port, "system.install.test", "{}")?;
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let net = loop {
+        let v = install_print(t, &cli, port)?;
+        let dhcp = v["network"]["ports"][0]["address"].is_string();
+        if v["testing"] == false && dhcp {
+            break v["network"].clone();
+        }
+        check(Instant::now() < deadline, format!("network test: {v}"))?;
+        if v["testing"] == false {
+            live_cli(t, &cli, port, "system.install.test", "{}")?;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let first = &net["ports"][0];
+    check(
+        net["connected_port"] == "ether1"
+            && first["name"] == "ether1"
+            && first["connected"] == true
+            && first["driver"] == "virtio_net"
+            && first["link"] == true
+            && first["gateway_ok"] == true,
+        format!("network test: {net}"),
+    )?;
+    t.n.put("live: network test", net.to_string());
     let name = data["name"].as_str().unwrap_or_default().to_owned();
     let refused = |p: String, want: &str, t: &T| -> Result<(), String> {
         let e = live_cli(t, &cli, port, "system.install.run", &p)
@@ -612,45 +672,73 @@ fn live_install(t: &mut T) -> Result<(), String> {
         e.contains("code"),
         format!("shutdown during a challenge: {e}"),
     )?;
+    // The password set here must be the router's. Test value, on a disposable VM.
     live_cli(
         t,
         &cli,
         port,
-        "system.install.run",
-        &run_params(&data, &name, Some(&code)),
+        "user.set",
+        r#"{"name":"admin","password":"live-test-pass-1"}"#,
     )?;
+    t.admin = "live-test-pass-1".to_owned();
+    let mut p: serde_json::Value =
+        serde_json::from_str(&run_params(&data, &name, Some(&code))).map_err(|e| e.to_string())?;
+    p["mgmt_port"] = serde_json::json!("ether1");
+    p["mgmt_mode"] = serde_json::json!("dhcp");
+    live_cli(t, &cli, port, "system.install.run", &p.to_string())?;
     let r = install_result(t, &cli, port)?;
     check(r["ok"] == true, format!("install: {r}"))?;
     check(r["boot_entry"].is_string(), format!("boot entry: {r}"))?;
+    check(
+        r["first_boot_error"].is_null(),
+        format!("first boot data: {r}"),
+    )?;
     t.n.put(
         "live: disk with data, by the console's code",
         format!("{} ms, {r}", r["total_ms"]),
     );
     live_cli(t, &cli, port, "system.reboot", r#"{"confirm":true}"#)?;
     vm.wait_exit(&mut log, 60)?;
-    // The firmware's new entry boots the disk, with the ISO still in.
-    let mut cmd = qemu_machine(t.kvm, t.fw, &t.vars());
-    cmd.arg("-drive").arg(format!(
-        "file={},if=none,id=d,format=raw",
-        t.work.join("live1-data.raw").display()
-    ));
-    cmd.args(["-device", "virtio-blk-pci,drive=d,serial=DATA"]);
-    cmd.arg("-drive").arg(format!(
-        "file={},if=none,id=cd,format=raw,media=cdrom,readonly=on",
-        t.images.join("corerouter-install.iso").display()
-    ));
-    cmd.args(["-device", "ide-cd,drive=cd"]);
-    cmd.args([
-        "-netdev",
-        "user,id=n0",
-        "-device",
-        "virtio-net-pci,netdev=n0",
-    ]);
-    let mut booted = start(&mut log, "live1/disk", cmd)?;
-    booted.expect_all(&mut log, &["/config: /dev/", "FRR up", "ready:"], 120)?;
+    // The firmware's new entry boots the disk, with the ISO still in; the
+    // GUI's connection comes back: same certificate, the password, DHCP.
+    t.strict = true;
+    // Same host and port: the entry in known_hosts is what proves it.
+    let port2 = port;
+    let mut booted = boot_written(t, &mut log, "live1/disk", "live1-data.raw", port2)?;
+    booted.expect_all(
+        &mut log,
+        &[
+            "/config: /dev/",
+            "FRR up",
+            "ready:",
+            "install: management: DHCP on ether1",
+        ],
+        120,
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        let got = live_cli(t, &cli, port2, "ip.address.list", "{}").unwrap_or_else(|e| e);
+        if got.contains("10.0.2.15") {
+            break;
+        }
+        check(
+            Instant::now() < deadline,
+            format!("no address after the install: {got}"),
+        )?;
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let info = live_cli(t, &cli, port2, "ip.dhcp-client.list", "{}")?;
+    check(info.contains("ether1"), format!("the DHCP choice: {info}"))?;
+    let users = live_cli(t, &cli, port2, "user.list", "{}")?;
+    check(
+        users.contains("\"no_password\":false") || users.contains("\"no_password\": false"),
+        format!("the password: {users}"),
+    )?;
     drop(booted);
+    t.strict = false;
+    t.admin = String::new();
     t.n.put(
-        "live: the disk boots after the install, the ISO still in",
+        "live: the disk boots with the same certificate, the password and DHCP on ether1",
         "ok".to_owned(),
     );
 
@@ -674,15 +762,20 @@ fn live_install(t: &mut T) -> Result<(), String> {
     live_cli(t, &cli, port, "system.install.cancel", "{}")?;
     let blank = disk_named(&v, "BLANK")?.clone();
     let name = blank["name"].as_str().unwrap_or_default().to_owned();
-    live_cli(
-        t,
-        &cli,
-        port,
-        "system.install.run",
-        &run_params(&blank, &name, None),
-    )?;
+    let mut p: serde_json::Value =
+        serde_json::from_str(&run_params(&blank, &name, None)).map_err(|e| e.to_string())?;
+    p["mgmt_port"] = serde_json::json!("ether1");
+    p["mgmt_mode"] = serde_json::json!("static");
+    p["mgmt_address"] = serde_json::json!("10.0.2.15/24");
+    p["mgmt_gateway"] = serde_json::json!("10.0.2.2");
+    p["mgmt_dns"] = serde_json::json!(["10.0.2.3"]);
+    live_cli(t, &cli, port, "system.install.run", &p.to_string())?;
     let r = install_result(t, &cli, port)?;
     check(r["ok"] == true, format!("install: {r}"))?;
+    check(
+        r["first_boot_error"].is_null(),
+        format!("first boot data: {r}"),
+    )?;
     t.n.put(
         "live: empty disk by its name, button stands for the code",
         "ok".to_owned(),
@@ -693,6 +786,25 @@ fn live_install(t: &mut T) -> Result<(), String> {
     vm.wait_exit(&mut log, 60)?;
     t.n.put(
         "live: the power button powers off with no challenge",
+        "ok".to_owned(),
+    );
+    t.strict = true;
+    let port3 = port;
+    let mut booted = boot_written(t, &mut log, "live2/disk", "live2-blank.raw", port3)?;
+    booted.expect_all(
+        &mut log,
+        &["ready:", "install: management: 10.0.2.15/24 on ether1"],
+        120,
+    )?;
+    let routes = live_cli(t, &cli, port3, "ip.route.list", "{}")?;
+    check(
+        routes.contains("10.0.2.2"),
+        format!("the static gateway: {routes}"),
+    )?;
+    drop(booted);
+    t.strict = false;
+    t.n.put(
+        "live: static management applied on the first boot",
         "ok".to_owned(),
     );
     Ok(())
@@ -938,6 +1050,8 @@ pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), S
     let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
     let started = Instant::now();
     let mut t = T {
+        admin: String::new(),
+        strict: false,
         root: root.to_owned(),
         work: work.clone(),
         images: images.to_owned(),

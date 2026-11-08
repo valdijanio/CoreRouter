@@ -40,7 +40,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Edit User",
         ["System", "Users"],
         None,
-        "{name: string, password?: string, group?: read|write|full, disabled?: bool, comment?: string} → {name, group, disabled}",
+        "{name: string, password?: string, password_hash?: string (an Argon2 hash from another CoreRouter: the install carries it to the first boot), group?: read|write|full, disabled?: bool, comment?: string} → {name, group, disabled}",
         not_in_safe_mode,
         set
     ),
@@ -135,7 +135,14 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(c) = opt_text(p, "comment", 256)? {
         user.comment = c;
     }
-    let new_password = password(p)?;
+    let new_password = match opt_str(p, "password_hash")? {
+        Some(_) if p.get("password").is_some() => {
+            return Err(EngineError::bad("password_hash", "give password or password_hash, not both"));
+        }
+        Some(h) if crate::auth::is_password_hash(h) => Some(h.to_owned()),
+        Some(_) => return Err(EngineError::bad("password_hash", "not an Argon2 hash")),
+        None => password(p)?,
+    };
     let password_changed = new_password.is_some();
     if let Some(h) = new_password {
         user.password_hash = Some(h);

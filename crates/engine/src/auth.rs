@@ -36,6 +36,7 @@ pub const SECRET_KEYS: &[&str] = &[
     "password",
     "old_password",
     "new_password",
+    "password_hash",
     "token",
     "secret",
     "psk",
@@ -158,6 +159,12 @@ fn hash_with_salt(password: &str, salt: &[u8]) -> Result<String, String> {
 
 /// Does `password` match the PHC string `phc`? Any malformed hash or an
 /// over-long password is a plain `false`.
+/// Whether `phc` is a hash [`verify_password`] can use (bounded: it comes in a
+/// parameter).
+pub fn is_password_hash(phc: &str) -> bool {
+    phc.len() <= 512 && phc.starts_with("$argon2") && PasswordHash::new(phc).is_ok()
+}
+
 pub fn verify_password(phc: &str, password: &str) -> bool {
     if password.len() > MAX_PASSWORD {
         return false;

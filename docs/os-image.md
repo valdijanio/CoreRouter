@@ -868,6 +868,14 @@ comando do kernel e `/config` em disco).
 - Antes de gravar, o serviço relê o disco: se o serial, o tamanho ou o conteúdo mudou desde a
   confirmação, não grava nada. Falhou? O live continua e dá para tentar de novo.
 - Quem pode: grupo `full`.
+- **Teste de rede** (`system.install.test`, resultado no `print`): por porta, driver, link,
+  velocidade, DHCP, gateway (ARP respondido), DNS (resposta de qualquer tipo, 3 tentativas) e a porta
+  por onde esta conexão chegou. Só avisa, não impede instalar. Firmware que falta aparece como
+  aviso de agora: o kernel da ISO não traz arquivos de firmware; o sistema instalado, sim (G1.6j).
+- **Primeiro boot:** `mgmt_port` e `mgmt_mode` (`dhcp`, ou `static` com endereço, gateway e DNS) vão
+  em `/config/first-boot.json`, com o hash da senha do `admin` definida no live. O PID 1 aplica uma
+  vez e apaga. O certificado TLS e os nomes das portas são copiados do live: a GUI que confiou nele
+  reconecta sem aviso. Com `keep_config`, vale o que está no disco, e nada disso é escrito.
 
 ### FRR na imagem
 
