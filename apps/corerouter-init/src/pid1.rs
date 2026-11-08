@@ -119,6 +119,13 @@ pub fn main() {
     } else {
         mount_config()
     };
+    // G1.6j: before the ports get their names, and only now: a driver that
+    // asks for its firmware while probing needs / (the kernel's own probes
+    // run before it is mounted). Not in the live image: its kernel is the
+    // ISO's, and the modules in this root were built for the installed one.
+    if opts.modules && !live {
+        crate::modules::start(log);
+    }
     let names = name_ports(Some(Path::new(crate::ports::MAP_FILE)));
     spawn_hotplug_names(crate::ports::MAP_FILE);
     let trial = if live { None } else { trial_at_boot(&cmdline) };

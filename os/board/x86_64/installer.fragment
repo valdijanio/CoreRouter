@@ -13,3 +13,7 @@ CONFIG_INITRAMFS_COMPRESSION_ZSTD=y
 # CONFIG_DEBUG_INFO_BTF is not set
 # CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT is not set
 CONFIG_DEBUG_INFO_NONE=y
+# G1.6j: the installer loads no modules (the image's are not in its
+# initramfs): the E810 is built in, in Safe Mode without its firmware, enough
+# to show the port. It works in full on the installed router.
+CONFIG_ICE=y

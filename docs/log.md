@@ -9465,3 +9465,16 @@ continuação indentadas).
   tempos de link, gráficos.
 
 - 2026-11-08 — G1.6y: ISO live, parte 1 de 4: `corerouter.mode=live`, rootfs da mídia copiado para a RAM com o hash assinado conferido, `/config` em tmpfs, sem FRR, DHCP em todas as portas, `server.info.boot` e o motor recusando o que não seja cliente (`crates/engine/src/live.rs`). Falhou (RAM, mídia)? Fica no instalador de console; `i` no console do live também abre ele. Testar: `cargo xtask os build && cargo xtask os install-test` (cenário `live`).
+
+- 2026-11-08 — G1.6j: Firmware das placas, parte 1. Um driver embutido sonda antes de o `/` existir, então a `ice` ficava
+  em Safe Mode (uma fila, sem RSS, sem XDP) mesmo com o arquivo na imagem. Agora a `ice` é módulo e o
+  `corerouter-init` carrega os drivers de rede sozinho, sem udev: lê `modules.dep`/`modules.alias`,
+  olha as placas PCI e USB sem driver no boot e a cada placa nova. `corerouter.modules=off` desliga.
+  O firmware vem do novo pacote `corerouter-firmware`: os arquivos que os drivers de rede declaram, de
+  um commit fixo do `linux-firmware`, com SHA-256 e licença de cada um (`cargo xtask os
+  firmware-lock`); só entra o que o `WHENCE` marca como redistribuível, e o build falha se faltar
+  algum. Como testar: `cargo xtask os boot-test` liga uma `i82551`, que só abre a porta com
+  `e100/d102e_ucode.bin`, e pluga uma `pcnet` depois do boot. **Medido** (KVM, 2026-11-08): 41
+  arquivos e 1,5 MB de firmware, `rootfs.squashfs` de 37 281 792 B, `e100` carregado em ~91 ms, `ready`
+  em 0,98 s, placa com driver em módulo pronta em 157 ms, imagem reprodutível. A E810 em si só se
+  confirma em placa real. Detalhes em `docs/os-image.md`.
