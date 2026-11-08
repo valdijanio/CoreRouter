@@ -10,6 +10,11 @@
 //! - The system area (the first 32 KiB, ignored by ISO 9660) holds a
 //!   protective MBR and the GPT, the backup at the end of the image, like
 //!   the `-isohybrid-gpt-basdat`/`-append_partition` layout of xorriso.
+//! - G1.6g, with [`BiosIso`]: the catalog's default entry is the BIOS's (GRUB
+//!   for El Torito, no emulation, with its boot info table) and the EFI image
+//!   moves to a section of its own (El Torito 1.0 §2.5); a BIOS reading the
+//!   image as a disk finds GRUB's `boot.img` in the MBR, pointing at a second
+//!   `core` file.
 //!
 //! [`read_dir`] is the installer's side: it finds the files by name on the
 //! raw medium (CD or stick) without a filesystem driver.
@@ -37,6 +42,42 @@ pub struct File<'a> {
     pub name: String,
     pub size: u64,
     pub data: &'a mut dyn Read,
+}
+
+/// G1.6g: what lets a BIOS boot the image. GRUB's El Torito image and its disk
+/// `core` become files of the image (they need to know their own place).
+pub struct BiosIso<'a> {
+    /// `boot.img`.
+    pub boot_img: &'a [u8],
+    /// El Torito: `cdboot.img` + `core` (`grub-mkimage -O i386-pc-eltorito`).
+    pub cd: &'a [u8],
+    /// As a disk: `core` (`grub-mkimage -O i386-pc`).
+    pub usb: &'a [u8],
+}
+
+/// Names of the [`BiosIso`] files in the image.
+pub const BIOS_CD: &str = "BIOSCD.IMG";
+pub const BIOS_USB: &str = "BIOSUSB.IMG";
+/// What a BIOS loads of a no-emulation image: `cdboot.img` itself (4 × 512).
+const CD_LOAD_SECTORS: u16 = 4;
+
+/// El Torito's boot info table (the `-boot-info-table` of mkisofs): the
+/// primary descriptor's place, the file's place and length, the 32-bit sum of
+/// everything from byte 64 on. `cdboot.S` reads the length from it.
+fn boot_info_table(cd: &mut [u8], lba: u32) -> Result<(), String> {
+    let len = u32::try_from(cd.len()).map_err(|_| "El Torito image too large")?;
+    let body = cd.get(64..).ok_or("El Torito image too short")?;
+    // Whole words only, like mkisofs: an odd tail does not count.
+    let sum = body
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .fold(0u32, |a, w| a.wrapping_add(u32::from_le_bytes(*w)));
+    put(cd, 8, &16u32.to_le_bytes());
+    put(cd, 12, &lba.to_le_bytes());
+    put(cd, 16, &len.to_le_bytes());
+    put(cd, 20, &sum.to_le_bytes());
+    Ok(())
 }
 
 /// Where a file landed (byte offset in the image, size).
@@ -134,13 +175,15 @@ fn pad_to_sector(out: &mut dyn Write, written: u64) -> Result<u64, String> {
 }
 
 /// Writes the image: the files in the order given, the one named
-/// `boot_image` (a FAT filesystem with `EFI/BOOT/BOOTX64.EFI`) also the El
-/// Torito default entry and the GPT's EFI System partition. `epoch` dates
-/// everything (reproducible). Returns each file's extent.
+/// `boot_image` (a FAT filesystem with `EFI/BOOT/BOOTX64.EFI`) also El
+/// Torito's EFI entry and the GPT's EFI System partition; with `bios`, also
+/// what a BIOS boots from a CD and from a stick. `epoch` dates everything
+/// (reproducible). Returns each file's extent.
 pub fn write(
     out: &mut dyn Write,
     files: &mut [File<'_>],
     boot_image: &str,
+    bios: Option<&BiosIso<'_>>,
     epoch: u64,
 ) -> Result<BTreeMap<String, Extent>, String> {
     for f in files.iter() {
@@ -164,18 +207,27 @@ pub fn write(
     // Sectors: 0–15 system area, 16 PVD, 17 boot record, 18 terminator,
     // 19 catalog, 20/21 path tables, 22… root directory, then the files.
     let date = dir_date(epoch);
-    let mut names: Vec<(String, usize)> = files
+    // `lbas` holds the files' places, then the BIOS's two.
+    let mut names: Vec<(String, usize, u64)> = files
         .iter()
         .enumerate()
-        .map(|(i, f)| (format!("{};1", f.name), i))
+        .map(|(i, f)| (format!("{};1", f.name), i, f.size))
         .collect();
+    if let Some(b) = bios {
+        for (i, (n, d)) in [(BIOS_CD, b.cd), (BIOS_USB, b.usb)].iter().enumerate() {
+            if files.iter().any(|f| f.name == *n) {
+                return Err(format!("{n} is a name of the BIOS boot"));
+            }
+            names.push((format!("{n};1"), files.len() + i, d.len() as u64));
+        }
+    }
     names.sort();
     let rec_len = |id_len: usize| 33 + id_len + usize::from(id_len.is_multiple_of(2));
     // Root directory size: records never cross a sector.
     let mut dir_bytes = 0u64;
     for n in [1usize, 1]
         .into_iter()
-        .chain(names.iter().map(|(n, _)| n.len()))
+        .chain(names.iter().map(|(n, _, _)| n.len()))
     {
         let l = rec_len(n) as u64;
         if dir_bytes % SECTOR + l > SECTOR {
@@ -198,6 +250,21 @@ pub fn write(
             },
         );
         next += f.size.div_ceil(SECTOR).max(1);
+    }
+    let mut bios_files: Vec<(u64, Vec<u8>)> = Vec::new();
+    if let Some(b) = bios {
+        for (n, d) in [(BIOS_CD, b.cd), (BIOS_USB, b.usb)] {
+            lbas.push(next);
+            extents.insert(
+                n.to_owned(),
+                Extent {
+                    offset: next * SECTOR,
+                    size: d.len() as u64,
+                },
+            );
+            bios_files.push((next, d.to_vec()));
+            next += (d.len() as u64).div_ceil(SECTOR).max(1);
+        }
     }
     // Room for the backup GPT (entries + header, 512-byte blocks) at the end.
     let backup_lbas = (u64::from(gpt::ENTRIES) * 128).div_ceil(512) + 1;
@@ -230,6 +297,12 @@ pub fn write(
     }
     let mut head = vec![0u8; (root_lba * SECTOR) as usize];
     put(&mut head, 0, &primary);
+    if let (Some(b), [(cd_lba, cd), (usb_lba, usb)]) = (bios, bios_files.as_mut_slice()) {
+        boot_info_table(cd, lba32(*cd_lba)?)?;
+        let s = crate::biosboot::stage(b.boot_img, usb, *usb_lba * 4)?;
+        s.set_code(&mut head);
+        *usb = s.core;
+    }
 
     let mut pvd = vec![0u8; SECTOR as usize];
     put(&mut pvd, 0, b"\x01CD001\x01");
@@ -271,8 +344,10 @@ pub fn write(
     put(&mut head, (17 * SECTOR) as usize, &br);
     put(&mut head, (18 * SECTOR) as usize, b"\xffCD001\x01");
 
-    let mut cat = vec![0u8; 64];
-    put(&mut cat, 0, &[1, 0xEF]);
+    // El Torito 1.0 §2: the validation entry names the default entry's
+    // platform, and a section header the next ones'.
+    let mut cat = vec![0u8; if bios.is_some() { 128 } else { 64 }];
+    put(&mut cat, 0, &[1, if bios.is_some() { 0 } else { 0xEF }]);
     put(&mut cat, 4, b"CoreRouter");
     put(&mut cat, 30, &[0x55, 0xAA]);
     let sum = cat
@@ -283,9 +358,24 @@ pub fn write(
         .iter()
         .fold(0u16, |a, w| a.wrapping_add(u16::from_le_bytes(*w)));
     put(&mut cat, 28, &(0u16.wrapping_sub(sum)).to_le_bytes());
-    put(&mut cat, 32, &[0x88, 0]);
-    put(&mut cat, 38, &((boot.size / 512) as u16).to_le_bytes());
-    put(&mut cat, 40, &lba32(boot_lba)?.to_le_bytes());
+    let efi_at = match bios_files.first() {
+        Some((cd_lba, _)) => {
+            put(&mut cat, 32, &[0x88, 0]);
+            put(&mut cat, 38, &CD_LOAD_SECTORS.to_le_bytes());
+            put(&mut cat, 40, &lba32(*cd_lba)?.to_le_bytes());
+            // Final section header: platform EFI, one entry.
+            put(&mut cat, 64, &[0x91, 0xEF, 1, 0]);
+            96
+        }
+        None => 32,
+    };
+    put(&mut cat, efi_at, &[0x88, 0]);
+    put(
+        &mut cat,
+        efi_at + 6,
+        &((boot.size / 512) as u16).to_le_bytes(),
+    );
+    put(&mut cat, efi_at + 8, &lba32(boot_lba)?.to_le_bytes());
     put(&mut head, (19 * SECTOR) as usize, &cat);
 
     // Path tables: the root only (§9.4).
@@ -311,11 +401,11 @@ pub fn write(
     };
     push(&mut dir, dir_record(&[0], root32, dir_size, true, date));
     push(&mut dir, dir_record(&[1], root32, dir_size, true, date));
-    for (n, i) in &names {
-        let (Some(f), Some(l)) = (files.get(*i), lbas.get(*i)) else {
+    for (n, i, size) in &names {
+        let Some(l) = lbas.get(*i) else {
             continue;
         };
-        let size = u32::try_from(f.size).map_err(|_| format!("{n}: larger than 4 GiB"))?;
+        let size = u32::try_from(*size).map_err(|_| format!("{n}: larger than 4 GiB"))?;
         push(
             &mut dir,
             dir_record(n.as_bytes(), lba32(*l)?, size, false, date),
@@ -336,6 +426,10 @@ pub fn write(
                 .map_err(|e| e.to_string())?;
             at += SECTOR;
         }
+    }
+    for (_, d) in &bios_files {
+        out.write_all(d).map_err(|e| e.to_string())?;
+        at = pad_to_sector(out, at + d.len() as u64)?;
     }
     let end = total * SECTOR;
     let gap = backup_at
@@ -439,7 +533,7 @@ mod tests {
             })
             .collect();
         let mut out = Vec::new();
-        let ext = write(&mut out, &mut fl, boot, 1_800_000_000).unwrap();
+        let ext = write(&mut out, &mut fl, boot, None, 1_800_000_000).unwrap();
         (out, ext)
     }
 
@@ -492,6 +586,113 @@ mod tests {
         assert_eq!(&img[img.len() - 512..img.len() - 504], b"EFI PART");
     }
 
+    fn bios_image(cd_len: usize, usb_len: usize) -> (Vec<u8>, BTreeMap<String, Extent>) {
+        use crate::biosboot::tests::{fake_boot_img, fake_core};
+        let boot = vec![0xEB; 64 * 1024];
+        let mut r = Cursor::new(boot.clone());
+        let mut fl = [File {
+            name: "EFIBOOT.IMG".into(),
+            size: boot.len() as u64,
+            data: &mut r,
+        }];
+        let cd: Vec<u8> = (0..cd_len).map(|i| i as u8).collect();
+        let bios = BiosIso {
+            boot_img: &fake_boot_img(),
+            cd: &cd,
+            usb: &fake_core(usb_len),
+        };
+        let mut out = Vec::new();
+        let ext = write(&mut out, &mut fl, "EFIBOOT.IMG", Some(&bios), 1).unwrap();
+        (out, ext)
+    }
+
+    /// G1.6g: the layout `xorriso -report_el_torito` showed for the prototype
+    /// that booted in SeaBIOS and OVMF, CD and USB.
+    #[test]
+    fn a_bios_catalog_keeps_the_efi_entry_in_a_section() {
+        let (img, ext) = bios_image(8192, 4096);
+        assert_eq!(img.len() as u64 % SECTOR, 0);
+        let dir = read_dir(&mut Cursor::new(&img)).unwrap();
+        assert_eq!(dir, ext);
+        let cat = 19 * 2048;
+        // Validation entry: platform 0 (x86), checksum over the 32 bytes.
+        assert_eq!(&img[cat..cat + 2], &[1, 0]);
+        let sum = img[cat..cat + 32].chunks(2).fold(0u16, |a, w| {
+            a.wrapping_add(u16::from_le_bytes([w[0], w[1]]))
+        });
+        assert_eq!(sum, 0);
+        // Default entry: bootable, no emulation, 4 × 512 loaded, GRUB's file.
+        assert_eq!(&img[cat + 32..cat + 34], &[0x88, 0]);
+        assert_eq!(u16::from_le_bytes([img[cat + 38], img[cat + 39]]), 4);
+        let at = |o: usize| u32::from_le_bytes(img[o..o + 4].try_into().unwrap());
+        assert_eq!(u64::from(at(cat + 40)) * SECTOR, dir[BIOS_CD].offset);
+        // The last section: EFI, one entry, the FAT image.
+        assert_eq!(&img[cat + 64..cat + 68], &[0x91, 0xEF, 1, 0]);
+        assert_eq!(&img[cat + 96..cat + 98], &[0x88, 0]);
+        assert_eq!(u16::from_le_bytes([img[cat + 102], img[cat + 103]]), 128);
+        assert_eq!(u64::from(at(cat + 104)) * SECTOR, dir["EFIBOOT.IMG"].offset);
+    }
+
+    #[test]
+    fn the_boot_info_table_describes_the_file() {
+        let (img, ext) = bios_image(8192, 4096);
+        let e = ext[BIOS_CD];
+        let f = &img[e.offset as usize..(e.offset + e.size) as usize];
+        let u = |o: usize| u32::from_le_bytes(f[o..o + 4].try_into().unwrap());
+        assert_eq!(u(8), 16, "primary volume descriptor");
+        assert_eq!(u64::from(u(12)) * SECTOR, e.offset);
+        assert_eq!(u64::from(u(16)), e.size);
+        let sum = f[64..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .fold(0u32, |a, w| a.wrapping_add(u32::from_le_bytes(*w)));
+        assert_eq!(u(20), sum);
+        // The rest of the header is the file's.
+        assert_eq!(f[7], 7);
+        assert_eq!(f[24], 24);
+    }
+
+    #[test]
+    fn a_bios_reading_the_stick_finds_its_core() {
+        let (img, ext) = bios_image(2048, 4096);
+        let e = ext[BIOS_USB];
+        let lba = e.offset / 512;
+        assert_eq!(&img[0x5c..0x64], &lba.to_le_bytes(), "boot.img → core");
+        assert_eq!(&img[0x66..0x68], &[0x90, 0x90]);
+        let f = &img[e.offset as usize..(e.offset + e.size) as usize];
+        assert_eq!(&f[0x1f4..0x1fc], &(lba + 1).to_le_bytes());
+        assert_eq!(&f[0x1fc..0x1fe], &7u16.to_le_bytes());
+        // Still a protective MBR and a GPT over the same FAT image.
+        assert_eq!(img[446], 0, "not marked active");
+        assert_eq!(img[446 + 4], 0xEE);
+        assert_eq!(&img[510..512], &[0x55, 0xAA]);
+        let parts = gpt::read(&mut Cursor::new(&img), 512).unwrap();
+        assert_eq!(parts[0].first_lba * 512, ext["EFIBOOT.IMG"].offset);
+        assert_eq!(&img[img.len() - 512..img.len() - 504], b"EFI PART");
+        // The header leaves nothing between the table and the partition free.
+        let first_usable = u64::from_le_bytes(img[512 + 40..512 + 48].try_into().unwrap());
+        assert_eq!(first_usable, parts[0].first_lba);
+    }
+
+    #[test]
+    fn bios_names_are_reserved() {
+        use crate::biosboot::tests::{fake_boot_img, fake_core};
+        let mut d = Cursor::new(vec![0u8; 1024]);
+        let mut f = [File {
+            name: BIOS_CD.into(),
+            size: 1024,
+            data: &mut d,
+        }];
+        let bios = BiosIso {
+            boot_img: &fake_boot_img(),
+            cd: &[0; 2048],
+            usb: &fake_core(1024),
+        };
+        let mut out = Vec::new();
+        assert!(write(&mut out, &mut f, BIOS_CD, Some(&bios), 0).is_err());
+    }
+
     #[test]
     fn same_input_same_image() {
         let f = [("A.BIN", vec![1; 3000]), ("BOOT.IMG", vec![2; 1024])];
@@ -513,7 +714,7 @@ mod tests {
                 size,
                 data: &mut d,
             }];
-            assert!(write(&mut out, &mut f, boot, 0).is_err(), "{name}");
+            assert!(write(&mut out, &mut f, boot, None, 0).is_err(), "{name}");
         }
         assert!(!valid_name(&"A".repeat(31)));
     }

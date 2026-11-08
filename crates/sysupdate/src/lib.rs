@@ -22,6 +22,7 @@
 //! directory that stands in for efivarfs, the ESP and the partitions.
 
 pub mod ab;
+pub mod biosboot;
 pub mod efi;
 #[cfg(unix)]
 pub mod ext4;
@@ -151,11 +152,15 @@ pub fn cmdline_words(cmdline: &str) -> Vec<String> {
     out
 }
 
-/// The last value of `key=` on the command line.
+/// The last value of `key=` on the command line. The boot entries write
+/// `key="a b"`; GRUB hands the same word over as `"key=a b"`
+/// (`grub-core/lib/cmdline.c`), G1.6g.
 pub fn cmdline_value(cmdline: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}=");
     cmdline_words(cmdline).into_iter().rev().find_map(|w| {
-        w.strip_prefix(&prefix)
+        w.strip_prefix('"')
+            .unwrap_or(&w)
+            .strip_prefix(&prefix)
             .map(|v| v.trim_matches('"').to_owned())
     })
 }
@@ -204,6 +209,13 @@ impl SlotCmdline<'_> {
     }
 }
 
+/// Slot A's PARTUUID, the built-in `root=` (it stays the same on every install).
+pub fn builtin_rootfs_a() -> Option<&'static str> {
+    BUILTIN_CMDLINE
+        .split_ascii_whitespace()
+        .find_map(|w| w.strip_prefix("root=PARTUUID="))
+}
+
 /// The tuning parameters a slot command line carries (G1.26h: shown per
 /// slot in Tuning › Boot), out of everything else on it.
 pub fn tuning_of(cmdline: &str, keys: &[&str]) -> Vec<(String, String)> {
@@ -219,6 +231,20 @@ pub fn tuning_of(cmdline: &str, keys: &[&str]) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G1.6g: the same parameter as a boot entry and as GRUB hand it over.
+    #[test]
+    fn cmdline_value_reads_both_quotings() {
+        let t = "vroot,,,ro,0 16 verity 1";
+        for line in [
+            format!("BOOT_IMAGE=/x root=/dev/dm-0 dm-mod.create=\"{t}\" panic=10"),
+            format!("BOOT_IMAGE=/x root=/dev/dm-0 \"dm-mod.create={t}\" panic=10"),
+        ] {
+            assert_eq!(cmdline_value(&line, "dm-mod.create").as_deref(), Some(t));
+            assert_eq!(cmdline_value(&line, "panic").as_deref(), Some("10"));
+            assert_eq!(cmdline_value(&line, "create"), None);
+        }
+    }
 
     #[test]
     fn words_keep_quotes() {
