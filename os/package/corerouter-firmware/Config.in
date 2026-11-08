@@ -1,0 +1,7 @@
+config BR2_PACKAGE_COREROUTER_FIRMWARE
+	bool "corerouter-firmware"
+	help
+	  The firmware the kernel's network drivers declare (G1.6j), from
+	  the linux-firmware files pinned in firmware.lock, with their
+	  licenses. `cargo xtask os build` downloads, checks and stages
+	  them.

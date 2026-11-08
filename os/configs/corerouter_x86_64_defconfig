@@ -28,6 +28,8 @@ BR2_LINUX_KERNEL_NEEDS_HOST_LIBELF=y
 BR2_LINUX_KERNEL_NEEDS_HOST_PAHOLE=y
 BR2_PACKAGE_NFTABLES=y
 BR2_PACKAGE_COREROUTER=y
+# G1.6j: the firmware the network drivers declare (firmware.lock).
+BR2_PACKAGE_COREROUTER_FIRMWARE=y
 # G1.6c: FRR (G3.1) — the routing daemons hal-frr drives through their vty
 # sockets; corerouter-init starts them (no bash init scripts, no vtysh in the
 # image: post-build.sh). libcap: the daemons keep only the capabilities
