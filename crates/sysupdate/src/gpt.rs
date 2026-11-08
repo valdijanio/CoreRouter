@@ -251,7 +251,13 @@ pub fn grow_last(
             attrs: *attrs,
         })
         .collect();
-    let (primary, backup_at, backup) = build(disk_bytes / lbs, lbs, &t.disk_guid, &parts)?;
+    let (mut primary, backup_at, backup) = build(disk_bytes / lbs, lbs, &t.disk_guid, &parts)?;
+    // G1.6g: block 0 holds the BIOS boot code too, and the disk must keep
+    // booting by BIOS after this.
+    let mut old = vec![0u8; lbs as usize];
+    disk.read_exact_at(&mut old, 0)
+        .map_err(|e| format!("GPT: {e}"))?;
+    crate::biosboot::keep_block0(&old, &mut primary);
     // The protective MBR and the primary header and entries: block 0 on.
     disk.write_all_at(&primary, 0)
         .map_err(|e| format!("GPT: {e}"))?;
@@ -300,14 +306,22 @@ pub fn build(
     }
     let table = u64::from(ENTRIES * ENTRY_SIZE);
     let table_lbas = table.div_ceil(lbs);
-    let first_usable = 2 + table_lbas;
+    let table_end = 2 + table_lbas;
+    // G1.6g: the gap before the first partition holds GRUB's `core`; a header
+    // that says it is free would invite a tool to use it.
+    let first_usable = parts
+        .iter()
+        .map(|p| p.first_lba)
+        .min()
+        .filter(|l| *l >= table_end)
+        .unwrap_or(table_end);
     let last_usable = disk_lbas
         .checked_sub(2 + table_lbas)
         .filter(|l| *l > first_usable)
         .ok_or_else(|| format!("disk of {disk_lbas} blocks is too small for a GPT"))?;
     let mut sorted: Vec<&NewPart> = parts.iter().collect();
     sorted.sort_by_key(|p| p.first_lba);
-    let mut prev_end = first_usable;
+    let mut prev_end = table_end;
     for p in &sorted {
         if p.first_lba < prev_end || p.last_lba < p.first_lba || p.last_lba > last_usable {
             return Err(format!(
@@ -368,7 +382,7 @@ pub fn build(
     put(&mut primary, 510, &[0x55, 0xAA]);
     primary.extend_from_slice(&header(1, last, 2));
     primary.extend_from_slice(&entries);
-    primary.resize((first_usable * lbs) as usize, 0);
+    primary.resize((table_end * lbs) as usize, 0);
     let backup_lba = last - table_lbas;
     let mut backup = entries;
     backup.resize((table_lbas * lbs) as usize, 0);
@@ -386,6 +400,31 @@ fn put(b: &mut [u8], at: usize, src: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G1.6g: the gap before the first partition is not free space.
+    #[test]
+    fn the_header_keeps_the_gap_out_of_the_usable_area() {
+        let part = NewPart {
+            name: "a".into(),
+            type_guid: "c12a7328-f81f-11d2-ba4b-00a0c93ec93b".into(),
+            guid: "4f9a520b-35f7-4633-a4bb-e9f871d1473c".into(),
+            first_lba: 2048,
+            last_lba: 4095,
+            attrs: 0,
+        };
+        let g = "39dfcaa2-2c8a-4912-acaa-6af0c68b5350";
+        let (p, _, _) = build(8192, 512, g, std::slice::from_ref(&part)).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(p[512 + 40..512 + 48].try_into().unwrap()),
+            2048
+        );
+        assert_eq!(p.len(), 34 * 512, "writes only the table, never the gap");
+        let (p, _, _) = build(8192, 512, g, &[]).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(p[512 + 40..512 + 48].try_into().unwrap()),
+            34
+        );
+    }
 
     /// A disk with two partitions, built by hand like genimage would.
     pub fn disk() -> Vec<u8> {
@@ -576,9 +615,18 @@ mod tests {
             Grow::TooSmall { could, .. } if could < CONFIG_MIN
         ));
         assert_eq!(read_table(&mut &f, 512).unwrap(), before, "layout kept");
+        // G1.6g: the BIOS boot code and the active mark survive the rewrite.
+        f.write_all_at(&[0xB8; crate::biosboot::CODE], 0).unwrap();
+        f.write_all_at(&[0x80], 446).unwrap();
         // 2 GiB: config takes the rest, aligned to 1 MiB.
         f.set_len(2048 << 20).unwrap();
         let g = grow_last(&f, 2048 << 20, 512, "config", CONFIG_MIN).unwrap();
+        let mut block0 = [0u8; 512];
+        f.read_exact_at(&mut block0, 0).unwrap();
+        assert!(block0[..crate::biosboot::CODE].iter().all(|&x| x == 0xB8));
+        assert_eq!(block0[446], 0x80);
+        assert_eq!(block0[446 + 4], 0xEE);
+        assert_eq!(&block0[510..512], &[0x55, 0xAA]);
         assert_eq!(
             g,
             Grow::Grow {

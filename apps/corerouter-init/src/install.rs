@@ -8,7 +8,9 @@
 //! the disks with size, model and bus, and installs only after the person
 //! at a console typed the disk's name; the medium itself is never offered.
 //! The writing and checking is `corerouter_sysupdate::install`; this file
-//! adds the consoles, the disks and the UEFI boot entry.
+//! adds the consoles, the disks and the UEFI boot entry (G1.6g: on a BIOS,
+//! the disk already boots through GRUB, whose configuration the install
+//! writes with the same command line).
 //!
 //! Unattended install: only from the hypervisor, through QEMU's fw_cfg
 //! (`-fw_cfg name=opt/org.corerouter/autoinstall,string=<json>`), which no
@@ -211,11 +213,12 @@ fn flow(
     for w in &opts.warnings {
         con.say(&format!("kernel command line: {w}"));
     }
-    if !Path::new("/sys/firmware/efi").exists() {
-        return Err(
-            "not booted by UEFI: CoreRouter boots only through the UEFI boot manager".into(),
-        );
-    }
+    let bios = !Path::new("/sys/firmware/efi").exists();
+    con.say(if bios {
+        "Booted by BIOS: the disk boots through GRUB (and by UEFI, if it moves to such a machine)."
+    } else {
+        "Booted by UEFI: the disk gets a boot entry (and boots by BIOS too, through GRUB)."
+    });
     let keys = package::load_keys(Path::new(KEYS));
     con.say("Looking for the installer medium…");
     let (medium_dev, mut medium) = find_medium(con, &keys)?;
@@ -236,7 +239,7 @@ fn flow(
         None => None,
     };
     loop {
-        let ds = disks::list(&medium_dev, &medium.index);
+        let ds = disks::list(&medium_dev, &medium.index, bios);
         table(con, &ds);
         let pick = match &auto {
             Some(a) => ds
@@ -350,12 +353,26 @@ fn flow(
         };
         let running = format!("{cmdline} {}", append.join(" "));
         let poweroff = auto.as_ref().is_some_and(|a| a.poweroff);
-        let report = write(con, &mut medium, pick, keep)?;
-        match boot_entry(&report, &m, &running, mgmt.as_ref()) {
-            Ok(line) => con.say(&line),
-            Err(e) => con.say(&format!(
-                "boot entry: {e} — the firmware boots the disk by its removable-media path; the router makes its entries on the first boot"
-            )),
+        let rootfs_a = medium
+            .index
+            .part("rootfs-a")
+            .map(|p| p.guid.clone())
+            .unwrap_or_default();
+        let line = slot_a_line(&rootfs_a, &m, &running, mgmt.as_ref());
+        let report = write(con, &mut medium, pick, keep, bios, &line)?;
+        if bios {
+            con.say(&format!(
+                "BIOS boot: GRUB in the first blocks of {}, slot A{}",
+                pick.name,
+                mgmt_note(mgmt.as_ref())
+            ));
+        } else {
+            match boot_entry(&report, &line, mgmt.as_ref()) {
+                Ok(line) => con.say(&line),
+                Err(e) => con.say(&format!(
+                    "boot entry: {e} — the firmware boots the disk by its removable-media path; the router makes its entries on the first boot"
+                )),
+            }
         }
         con.say(&format!(
             "\nINSTALLED CoreRouter {} on {} in {:.1} s ({} MiB written in {} ms, read back in {} ms){}",
@@ -382,6 +399,8 @@ fn write(
     medium: &mut Medium<File>,
     d: &Disk,
     keep: bool,
+    bios: bool,
+    line: &str,
 ) -> Result<install::Report, String> {
     // O_EXCL on a block device: refused while anything (a mount, a holder)
     // uses it.
@@ -411,6 +430,8 @@ fn write(
             pipelined: true,
             parallel_verify: true,
             threads,
+            bios_active: bios,
+            bios_cmdline: Some(line.to_owned()),
         },
         &mut |done, total| {
             let pct = done * 100 / total.max(1);
@@ -433,26 +454,33 @@ fn write(
     Ok(r)
 }
 
-/// The boot entry for the new disk, with the management address the first
-/// boot applies.
-fn boot_entry(
-    r: &install::Report,
+/// What slot A's kernel is given, by the boot entry or by GRUB.
+fn slot_a_line(
+    rootfs_a: &str,
     m: &package::Manifest,
     running: &str,
     mgmt: Option<&Mgmt>,
-) -> Result<String, String> {
+) -> String {
     let tuning: Vec<(String, String)> = mgmt
         .map(|g| vec![("corerouter.mgmt".to_owned(), g.render())])
         .unwrap_or_default();
-    let line = install::boot_entry(plan::EFIVARS.target, r, m, running, &tuning)?;
-    Ok(format!(
-        "{line}{}",
-        mgmt.map(|g| format!(
+    install::slot_a_line(rootfs_a, m, running, &tuning)
+}
+
+fn mgmt_note(mgmt: Option<&Mgmt>) -> String {
+    mgmt.map(|g| {
+        format!(
             "; management address {} on {} at the first boot",
             g.address, g.interface
-        ))
-        .unwrap_or_default()
-    ))
+        )
+    })
+    .unwrap_or_default()
+}
+
+/// The boot entry for the new disk.
+fn boot_entry(r: &install::Report, line: &str, mgmt: Option<&Mgmt>) -> Result<String, String> {
+    let entry = install::boot_entry(plan::EFIVARS.target, r, line)?;
+    Ok(format!("{entry}{}", mgmt_note(mgmt)))
 }
 
 #[cfg(test)]

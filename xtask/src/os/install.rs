@@ -17,6 +17,8 @@
 //!    (the console's code; the power button) and the boot of what it wrote.
 //! 5. `qcow2` and `ova`: the VM images boot as they are (the removable-media
 //!    path), with the console setup offered (no address yet).
+//!
+//! G1.6g: `--firmware seabios` does all of that by BIOS, through GRUB.
 
 #![allow(clippy::indexing_slicing)]
 
@@ -27,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::ab::{Numbers, Vm, check, fresh_vars, qemu_base, ready_s, slot, start};
+use super::ab::{Firmware, Numbers, Vm, check, fresh_vars, qemu_machine, ready_s, slot, start};
 
 /// The kernel's name, as an installer from before G1.6m wrote it (or a
 /// VM's old NVRAM keeps it): the first boot applies it to `ether1`.
@@ -54,6 +56,7 @@ struct T {
     work: PathBuf,
     images: PathBuf,
     kvm: bool,
+    fw: Firmware,
     log: std::fs::File,
     n: Numbers,
 }
@@ -66,7 +69,7 @@ impl T {
     /// The installer from `medium` onto `target.qcow2`.
     fn install(&mut self, medium: &str, keep: bool) -> Result<(), String> {
         let iso = self.images.join("corerouter-install.iso");
-        let mut cmd = qemu_base(self.kvm, &self.vars());
+        let mut cmd = qemu_machine(self.kvm, self.fw, &self.vars());
         cmd.arg("-drive").arg(format!(
             "file={},if=none,id=target,format=qcow2",
             self.work.join("target.qcow2").display()
@@ -119,7 +122,7 @@ impl T {
 
     /// The installed disk alone, through the firmware's boot entries.
     fn boot_disk(&mut self, name: &str, port: u16) -> Result<Vm, String> {
-        let mut cmd = qemu_base(self.kvm, &self.vars());
+        let mut cmd = qemu_machine(self.kvm, self.fw, &self.vars());
         cmd.arg("-drive").arg(format!(
             "file={},if=virtio,format=qcow2",
             self.work.join("target.qcow2").display()
@@ -151,7 +154,7 @@ impl T {
     ) -> Result<(), String> {
         fresh_vars(&self.vars())?;
         let port = super::free_port()?;
-        let mut cmd = qemu_base(self.kvm, &self.vars());
+        let mut cmd = qemu_machine(self.kvm, self.fw, &self.vars());
         cmd.arg("-drive").arg(format!(
             "file={},if=virtio,format={format},snapshot=on",
             file.display()
@@ -232,7 +235,7 @@ fn answer(vm: &mut Vm, log: &mut std::fs::File, after: &str, text: &str) -> Resu
 /// keeping the configuration.
 fn interactive(t: &mut T) -> Result<(), String> {
     let iso = t.images.join("corerouter-install.iso");
-    let mut cmd = qemu_base(t.kvm, &t.vars());
+    let mut cmd = qemu_machine(t.kvm, t.fw, &t.vars());
     cmd.arg("-drive").arg(format!(
         "file={},if=none,id=target,format=qcow2",
         t.work.join("target.qcow2").display()
@@ -358,7 +361,7 @@ fn live(t: &mut T) -> Result<(), String> {
     let iso = t.images.join("corerouter-install.iso");
     fresh_vars(&t.vars())?;
     let port = super::free_port()?;
-    let mut cmd = qemu_base(t.kvm, &t.vars());
+    let mut cmd = qemu_machine(t.kvm, t.fw, &t.vars());
     cmd.arg("-drive").arg(format!(
         "file={},if=none,id=target,format=qcow2,readonly=on",
         t.work.join("target.qcow2").display()
@@ -484,7 +487,7 @@ fn live_two_disks(t: &mut T, name: &str, port: u16) -> Result<(Vm, PathBuf), Str
     fresh_vars(&t.vars())?;
     let qmp = t.work.join(format!("{name}.qmp"));
     let _ = std::fs::remove_file(&qmp);
-    let mut cmd = qemu_base(t.kvm, &t.vars());
+    let mut cmd = qemu_machine(t.kvm, t.fw, &t.vars());
     // The least the live image takes: the install must fit too. The last
     // `-m` wins.
     cmd.args(["-m", "256"]);
@@ -572,7 +575,7 @@ fn boot_written(
     disk: &str,
     port: u16,
 ) -> Result<Vm, String> {
-    let mut cmd = qemu_base(t.kvm, &t.vars());
+    let mut cmd = qemu_machine(t.kvm, t.fw, &t.vars());
     cmd.arg("-drive").arg(format!(
         "file={},if=none,id=d,format=raw",
         t.work.join(disk).display()
@@ -862,13 +865,32 @@ fn check_installed(t: &mut T, vm: &mut Vm, port: u16, first: bool) -> Result<(),
             .unwrap_or("?")
             .to_owned(),
     );
-    let p = vm.print_until(&mut log, 30, |v| {
-        v.get("running").and_then(Value::as_str) == Some("a")
-    })?;
-    check(
-        slot(&p, "a")["verity"] == Value::Bool(true),
-        format!("not slot A on dm-verity: {p}"),
-    )?;
+    if t.fw == Firmware::Ovmf {
+        let p = vm.print_until(&mut log, 30, |v| {
+            v.get("running").and_then(Value::as_str) == Some("a")
+        })?;
+        check(
+            slot(&p, "a")["verity"] == Value::Bool(true),
+            format!("not slot A on dm-verity: {p}"),
+        )?;
+    } else {
+        // G1.6g: GRUB handed over the slot's line, quoting and all.
+        let c = sh(
+            vm,
+            &mut log,
+            "{ cat /proc/cmdline; grep -c ' / squashfs ' /proc/mounts; cat /sys/block/dm-0/dm/name; }",
+        )?;
+        check(
+            c.contains("corerouter.slot=a")
+                && c.contains("\"dm-mod.create=vroot,")
+                && c.contains(" 1 vroot"),
+            format!("not slot A on dm-verity through GRUB: {c}"),
+        )?;
+        t.n.put(
+            &format!("{what}: slot A on dm-verity through GRUB"),
+            "yes".to_owned(),
+        );
+    }
     // The installer's address, applied once (the reinstall keeps the
     // configuration and the marker).
     let a = until(vm, &mut log, 30, "ip.address.list", "{}", |v| {
@@ -937,6 +959,7 @@ fn check_installed(t: &mut T, vm: &mut Vm, port: u16, first: bool) -> Result<(),
     // uses them), the frr service attached.
     let vty = sh(vm, &mut log, "ls /var/run/frr/ | grep -c 'vty$'")?;
     t.n.put(&format!("{what}: FRR vty sockets"), vty.clone());
+    // G1.6i: mgmtd, zebra and staticd; the others start with their config.
     check(
         vty.trim().parse::<u32>().unwrap_or(0) >= 3,
         format!("FRR vty sockets: {vty}"),
@@ -998,9 +1021,12 @@ fn check_installed(t: &mut T, vm: &mut Vm, port: u16, first: bool) -> Result<(),
 
 pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), String> {
     let mut tcg = false;
-    for a in args {
+    let mut fw = Firmware::Ovmf;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
         match a.as_str() {
             "--tcg" => tcg = true,
+            "--firmware" => fw = Firmware::parse(it.next().map(String::as_str))?,
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
@@ -1030,12 +1056,14 @@ pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), S
         work: work.clone(),
         images: images.to_owned(),
         kvm: !tcg && super::kvm_usable(),
+        fw,
         log,
         n: Numbers(Vec::new()),
     };
     eprintln!(
-        "install-test ({}), console → {}",
+        "install-test ({}, {}), console → {}",
         if t.kvm { "KVM" } else { "TCG" },
+        fw.name(),
         log_path.display()
     );
     let st = Command::new("qemu-img")
@@ -1077,9 +1105,10 @@ pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), S
 
     let _ = writeln!(t.log, "===== done =====");
     eprintln!(
-        "\ninstall-test ok in {:.1} s ({}):",
+        "\ninstall-test ok in {:.1} s ({}, {}):",
         started.elapsed().as_secs_f64(),
-        if t.kvm { "KVM" } else { "TCG" }
+        if t.kvm { "KVM" } else { "TCG" },
+        fw.name()
     );
     for (k, v) in &t.n.0 {
         eprintln!("  {k}: {v}");
