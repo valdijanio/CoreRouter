@@ -19,6 +19,8 @@ signal-hook.workspace = true
 netlink-sys = { version = "0.9.0", default-features = false }
 # G1.6b: the trial boot of the A/B image (state, boot variables).
 corerouter-sysupdate.workspace = true
+# G1.6y: the live image's root, checked while it is copied to RAM.
+ring.workspace = true
 
 [lints]
 workspace = true

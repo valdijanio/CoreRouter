@@ -26,7 +26,7 @@ use crate::plan::{self, Backoff, BootOptions, Mode};
 /// it from there to `log.os.print` and the router's log, where an operator
 /// looks; a VM's serial console is a pty nobody reads. Never panics, unlike
 /// `eprintln!`. Opened per line: PID 1 logs a few lines an hour.
-fn log(msg: &str) {
+pub(crate) fn log(msg: &str) {
     let _ = writeln!(std::io::stderr(), "corerouter-init: {msg}");
     if let Ok(mut k) = OpenOptions::new().write(true).open("/dev/kmsg") {
         let _ = k.write_all(&plan::kmsg_record(msg));
@@ -73,6 +73,13 @@ pub fn main() {
     }
     let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
     let opts = BootOptions::parse(&cmdline);
+    // G1.6y: the first stage of the live ISO moves to the image's root and
+    // comes back here with LIVE_STAGE2; it stays on the console installer
+    // when that cannot be done.
+    let live = opts.mode == Mode::Live && std::env::args().any(|a| a == plan::LIVE_STAGE2);
+    if opts.mode == Mode::Live && !live {
+        crate::live::enter(&cmdline);
+    }
     if opts.mode == Mode::Install {
         // G1.6c: the installer ISO's kernel, running from its initramfs.
         if Path::new("/sys/firmware/efi").exists() {
@@ -89,16 +96,32 @@ pub fn main() {
     }
     // Ctrl-Alt-Del becomes SIGINT to us (a clean reboot), not an instant one.
     let _ = rustix::system::reboot(RebootCommand::CadOff);
-    if let Err(e) = rustix::system::sethostname(b"corerouter") {
+    let hostname: &[u8] = if live {
+        plan::LIVE_HOSTNAME.as_bytes()
+    } else {
+        b"corerouter"
+    };
+    if let Err(e) = rustix::system::sethostname(hostname) {
         log!("hostname: {e}");
     }
     if let Err(e) = crate::links::loopback_up() {
         log!("lo up: {e} (the control channel listens on 127.0.0.1)");
     }
-    let config_dev = mount_config();
+    // G1.6y: the live image never touches a disk it finds: not the `config`
+    // partition of an installed CoreRouter, not its A/B state. EFI variables
+    // are mounted for the install's boot entry; nothing reads them at boot.
+    let config_dev = if live {
+        crate::live::mount_config();
+        if Path::new("/sys/firmware/efi").exists() {
+            mount_api(&plan::EFIVARS);
+        }
+        None
+    } else {
+        mount_config()
+    };
     let names = name_ports(Some(Path::new(crate::ports::MAP_FILE)));
     spawn_hotplug_names(crate::ports::MAP_FILE);
-    let trial = trial_at_boot(&cmdline);
+    let trial = if live { None } else { trial_at_boot(&cmdline) };
     // G1.6v: outside a trial, /config's partition takes the rest of the
     // disk (its filesystem follows at the next boot).
     if let Some(dev) = &config_dev {
@@ -116,7 +139,8 @@ pub fn main() {
     if let Err(e) = std::os::unix::fs::symlink("/run", "/var/run") {
         log!("/var/run: {e}");
     }
-    let frr = prepare_frr();
+    // G1.6y: no routing in the live image, and 28 MiB less in use.
+    let frr = if live { Vec::new() } else { prepare_frr() };
     let action = Arc::new(AtomicUsize::new(RUN));
     for (sig, what) in [
         (signal_hook::consts::SIGTERM, REBOOT),
@@ -257,7 +281,7 @@ fn spawn_frr(s: &Svc) -> Option<Pid> {
 /// Renames the kernel's `eth<N>` to `ether<N+1>` (G1.6m, `ports.rs`),
 /// before the daemon sees them; `map`: where the names are kept (`None`:
 /// the installer, nothing kept). Every port's name by kernel name.
-fn name_ports(map: Option<&Path>) -> Vec<(String, String)> {
+pub(crate) fn name_ports(map: Option<&Path>) -> Vec<(String, String)> {
     crate::links::settle(Duration::from_millis(100), Duration::from_secs(2));
     let found = crate::links::kernel_named_ports();
     let text = map.and_then(|p| File::open(p).ok()).map(|f| {
@@ -408,7 +432,8 @@ fn first_boot(
     ttys: &[String],
     want_setup: Arc<AtomicBool>,
 ) {
-    let mgmt = opts.mgmt.clone().map(|mut m| {
+    let live = opts.mode == Mode::Live;
+    let mgmt = opts.mgmt.clone().filter(|_| !live).map(|mut m| {
         // An entry written before the ports were renamed (or by an older
         // installer) names the kernel's port.
         if let Some((_, n)) = names.iter().find(|(k, _)| *k == m.interface) {
@@ -421,6 +446,13 @@ fn first_boot(
     let spawned = std::thread::Builder::new()
         .name("first-boot".into())
         .spawn(move || {
+            if live {
+                for (cmd, params) in plan::live_dhcp_commands(&ports) {
+                    if let Err(e) = crate::ctl::call(cmd, &params) {
+                        log!("live image: {cmd}: {e}");
+                    }
+                }
+            }
             if let Some(m) = mgmt
                 && !Path::new(plan::MGMT_DONE).exists()
             {
@@ -532,7 +564,7 @@ fn flags(m: &plan::Mount) -> MountFlags {
     f
 }
 
-fn mount_api(m: &plan::Mount) {
+pub(crate) fn mount_api(m: &plan::Mount) {
     let _ = fs::create_dir_all(m.target);
     let data = std::ffi::CString::new(m.data).unwrap_or_default();
     match rustix::mount::mount(m.source, m.target, m.fstype, flags(m), data.as_c_str()) {

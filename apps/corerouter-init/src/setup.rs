@@ -16,6 +16,8 @@
 //! port is confirmed by its link and MAC; and the text says there is no
 //! command shell here and what to use instead.
 
+use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -104,12 +106,34 @@ fn status(addrs: &[(String, String)]) -> String {
     s
 }
 
+/// G1.6y: what the console of the live ISO says on top of the rest.
+const LIVE_BANNER: &str = "\nThis is the CoreRouter live image: NOT INSTALLED, and nothing is written \
+     to a disk until you ask.\nInstall it from the GUI or the browser once it has an address, or \
+     press i and Enter to install from this console.";
+
+fn is_live() -> bool {
+    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    crate::plan::BootOptions::parse(&cmdline).mode == crate::plan::Mode::Live
+}
+
+/// The console installer of the live image (`i`): it ends in a reboot.
+fn console_install(line: &str, live: bool) {
+    if live && line.trim().eq_ignore_ascii_case("i") {
+        // A new process image: this one's threads read the same consoles.
+        let e = std::process::Command::new("/proc/self/exe")
+            .arg("install-here")
+            .exec();
+        let _ = writeln!(std::io::stderr(), "console installer: {e}");
+    }
+}
+
 pub fn main(ttys: &[String]) -> i32 {
     let con = Console::open(ttys);
     if con.names().is_empty() {
         // Nothing to serve; PID 1 does not start it again.
         return 0;
     }
+    let live = is_live();
     let mut next_banner = Instant::now();
     let mut had: Option<bool> = None;
     loop {
@@ -124,20 +148,32 @@ pub fn main(ttys: &[String]) -> i32 {
                 con.say("\nAn address was set: the first-boot setup is closed.");
                 con.say(&status(&addrs));
             }
+            if live && had != Some(true) {
+                con.say(LIVE_BANNER);
+                con.say(&status(&addrs));
+            }
             had = Some(true);
-            if con.ask("", Some(POLL)).is_some() {
+            if let Some(line) = con.ask("", Some(POLL)) {
+                console_install(&line, live);
+                if live {
+                    con.say(LIVE_BANNER);
+                }
                 con.say(&status(&addrs));
             }
             continue;
         }
         had = Some(false);
         if Instant::now() >= next_banner {
+            if live {
+                con.say(LIVE_BANNER);
+            }
             con.say(&banner());
             next_banner = Instant::now() + BANNER_EVERY;
         }
-        if con.ask("", Some(POLL)).is_none() {
+        let Some(line) = con.ask("", Some(POLL)) else {
             continue;
-        }
+        };
+        console_install(&line, live);
         if addresses().is_some_and(|a| !a.is_empty()) {
             continue;
         }
@@ -323,6 +359,12 @@ mod tests {
         for a in [None, Some(""), Some("n"), Some("s"), Some("yy")] {
             assert!(!yes(a), "{a:?}");
         }
+    }
+
+    #[test]
+    fn the_live_console_says_it_is_not_installed_and_how_to_install() {
+        assert!(LIVE_BANNER.contains("NOT INSTALLED"));
+        assert!(LIVE_BANNER.contains("press i"));
     }
 
     #[test]
