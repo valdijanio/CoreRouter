@@ -352,7 +352,7 @@ fn live(t: &mut T) -> Result<(), String> {
     let iso = t.images.join("corerouter-install.iso");
     fresh_vars(&t.vars())?;
     let port = super::free_port()?;
-    let mut cmd = qemu_base(t.kvm, &t.vars());
+    let mut cmd = qemu_machine(t.kvm, t.fw, &t.vars());
     cmd.arg("-drive").arg(format!(
         "file={},if=none,id=target,format=qcow2,readonly=on",
         t.work.join("target.qcow2").display()
