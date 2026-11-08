@@ -46,6 +46,11 @@ BR2_PACKAGE_E2FSPROGS_RESIZE2FS=y
 # G1.6c: the installer's kernel (the ISO, post-image.sh).
 BR2_PACKAGE_COREROUTER_INSTALLER=y
 BR2_TARGET_ROOTFS_SQUASHFS=y
+# G1.6g: boot by BIOS (docs/os-image.md); the images are made by post-image.sh.
+BR2_TARGET_GRUB2=y
+BR2_TARGET_GRUB2_I386_PC=y
+BR2_TARGET_GRUB2_BOOT_PARTITION="hd0,gpt1"
+BR2_TARGET_GRUB2_BUILTIN_MODULES_PC="biosdisk part_gpt fat normal linux loadenv test echo serial terminal configfile"
 BR2_TARGET_ROOTFS_SQUASHFS4_ZSTD=y
 # BR2_TARGET_ROOTFS_TAR is not set
 BR2_PACKAGE_HOST_DOSFSTOOLS=y

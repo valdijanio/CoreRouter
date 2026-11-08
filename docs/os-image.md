@@ -14,6 +14,7 @@ cargo xtask os boot-test --efi       # o mesmo, pelo firmware UEFI (OVMF) e o di
 cargo xtask os boot-test --append corerouter.shell=ttyS0 --timeout 600   # com shell de manutenção na serial
 cargo xtask os ab-test               # G1.6b: os 4 cenários A/B no QEMU (UEFI, sem root)
 cargo xtask os install-test          # G1.6c: instalador (CD, USB, interativo), qcow2 e OVA no QEMU
+cargo xtask os install-test --firmware seabios   # G1.6g: o mesmo por BIOS, pelo GRUB
 cargo xtask os frr-test              # G1.6k: dois roteadores da imagem com OSPF, SR, LDP e BFD entre eles
 cargo xtask os package --out b.crpkg --version 0.1.1 --build 1800000000  # outro pacote deste build
 cargo xtask os build --only crpkg    # G1.6e: só o pacote de atualização (sem disk.img, ISO, qcow2, OVA)
@@ -703,7 +704,7 @@ Saídas em `<out>/build/images/`:
 
 | Arquivo | Para quê |
 |---|---|
-| `corerouter-install.iso` | ISO híbrida: CD (El Torito UEFI) ou pendrive (`dd`, GPT com a partição EFI). Instala no disco do roteador |
+| `corerouter-install.iso` | ISO híbrida: CD (El Torito, BIOS e UEFI) ou pendrive (`dd`, GPT com a partição EFI e o GRUB na MBR). Instala no disco do roteador |
 | `corerouter.qcow2` | KVM/Proxmox: o `disk.img` (já A/B) em qcow2 comprimido |
 | `corerouter.ova` | VMware/VirtualBox: OVF 1.0 + manifesto SHA-256 + VMDK streamOptimized |
 | `corerouter.crpkg` | o pacote de atualização (também dentro da ISO) |
@@ -770,7 +771,54 @@ Saídas em `<out>/build/images/`:
   name=opt/org.corerouter/autoinstall,string=<json>` do QEMU, que nenhuma máquina física tem; o
   JSON nomeia o disco duas vezes (`disk`, `confirm`), e `append` só aceita `console=`, `ip=` e
   `corerouter.shell=`. É a flag do `install-test`.
-- **Só UEFI.** Ver a pesquisa abaixo.
+- **UEFI e BIOS** (G1.6g): seção "Boot por BIOS", abaixo.
+
+### Boot por BIOS (G1.6g)
+
+O mesmo disco boota pelos dois firmwares; nada do caminho UEFI muda.
+
+| Onde | O quê |
+|---|---|
+| Bloco 0, 440 primeiros bytes | `boot.img` do GRUB, ao lado do registro da MBR protetora |
+| Blocos 128 a 2047, antes da primeira partição | `core` do GRUB, ~150 KiB. Sem entrada na GPT: os números das partições continuam os mesmos, e o `first_usable` do cabeçalho deixa o espaço fora da área livre |
+| ESP, `corerouter/grub.cfg` | A lógica: lê o `grubenv`, escolhe o slot, cai no outro se o kernel não carrega |
+| ESP, `corerouter/grubenv` | Um bloco de 512 bytes: `primary=` e `next=` (papel do `BootOrder` e do `BootNext`) |
+| ESP, `corerouter/a.cfg`, `b.cfg` | A linha de comando de cada slot, com a tabela do dm-verity, de 4096 bytes fixos |
+
+- **O disco que a BIOS escolheu, não "o primeiro disco".** O prefixo é `(,gpt1)/corerouter`, e o `boot.img`
+  confia no número do drive que a BIOS passou (o `DRIVE_CHECK` que o `grub-install` também
+  desliga): um pendrive esquecido não troca a raiz.
+- **dm-verity desde o primeiro boot.** O `a.cfg` já sai do build com a tabela: um qcow2 em
+  SeaBIOS nunca sobe sem verificação, o que o caminho removível da UEFI faz uma vez.
+- **Instalador.** Roda pelos dois firmwares e grava as duas coisas sempre. Com BIOS: marca a
+  partição protetora como ativa e recusa disco de setor de 4 KiB com o motivo na tabela. O
+  `a.cfg` é reescrito com a linha da máquina (`corerouter.mgmt=`, `console=`) direto nos bytes
+  dele: o kernel ainda não releu as partições do disco, e o índice assinado diz onde o arquivo
+  está (por isso tamanho fixo).
+- **Selo ativo.** A UEFI 2.10 §5.2.3 manda ignorar o `BootIndicator` da partição protetora, mas
+  o EDK2 recusava o disco até 2021 (bz#1978966). Algumas BIOS, ao contrário, só bootam uma
+  partição ativa. Por isso a imagem e a ISO ficam com 0 e só o instalador rodando em BIOS liga;
+  numa BIOS exigente, o `dd` da imagem precisa do selo à mão (`sfdisk --activate`).
+- **ISO.** O catálogo El Torito tem a entrada padrão para BIOS e uma seção EFI (`BIOSCD.IMG`,
+  com a *boot info table*); como disco, o `boot.img` aponta para `BIOSUSB.IMG`. Os dois `core`
+  usam só o parser de resgate do GRUB e não passam linha de comando: vale a embutida no kernel do
+  instalador. Sem xorriso: `crates/sysupdate/src/iso.rs` faz tudo.
+- **Dois slots quebrados** param no prompt do GRUB, na tela e na serial.
+- **Sem serial** o GRUB segue só na tela (`if serial`).
+- **Controladoras.** O kernel ganhou `SYM53C8XX_2` (LSI, padrão do Proxmox), `MEGARAID_SAS`,
+  `MPT2SAS`/`MPT3SAS`, `HPSA`, `AACRAID` e `FUSION_SPI`/`FUSION_SAS`. Em QEMU 8.2.2 (SeaBIOS, `pc`),
+  **medido**: `virtio-blk`, `virtio-scsi`, `lsi53c895a`, `pvscsi` e IDE bootam. `mptsas1068` chega ao
+  kernel e o driver acha a controladora, mas o disco não aparece (não investigado: não é opção do
+  Proxmox; `FUSION_*` ficou sem prova para o hardware real). Dois nem isso: `lsi53c810`, para o qual
+  o SeaBIOS não tem driver (nem chega ao GRUB), e `megasas`/
+  `megasas-gen2`, por defeito do QEMU: `hw/scsi/megasas.c` (`megasas_handle_io`) monta um READ(16)
+  e chama `scsi_req_new` com o `cdb_len` do quadro, que o driver não preenche nos quadros
+  `MFI_CMD_LD_READ`/`WRITE` (o kernel vê "Invalid command operation code"; o sintoma começou na 7.2,
+  [QEMU #1888](https://gitlab.com/qemu-project/qemu/-/issues/1888); a linha é igual na `master`). Qualquer
+  Linux recente cai nisso; numa VM, use outra controladora. O driver fica para a placa de verdade.
+- **Licença.** O GRUB é GPL-3.0 e fica só na área de boot (bloco 0, espaço antes da partição,
+  arquivos da ESP) e na ISO; a raiz continua sem GPL-3.0. O fonte correspondente é o que a
+  receita do Buildroot baixa (`make legal-info`).
 
 ### ISO live (G1.6y)
 
@@ -900,17 +948,19 @@ minutos sem resposta, manda olhar o console.
 - **Fora da imagem** (`post-build.sh`): `vtysh` (o único que liga readline), bash, readline,
   ncurses, o runtime C++ que a toolchain copia, scripts Python e os daemons que o CoreRouter não
   configura (rip, isis, pim, babel, eigrp, …). O `nft` deixa de ter CLI interativa (ela puxava
-  readline). Assim a imagem continua **sem GPL-3.0** (bash e readline são GPL-3.0). O `os build`
+  readline). Assim a raiz continua **sem GPL-3.0** (bash e readline são GPL-3.0; o GRUB, G1.6g,
+  fica só na área de boot). O `os build`
   confere que todo ELF da imagem acha as bibliotecas que pede (uma remoção a mais falha o build).
 
 ### Imagens de VM
 
-- **qcow2**: `qemu-img convert -c` (zlib) do `disk.img`, que já é a imagem instalada A/B. O
-  primeiro boot é pelo caminho de mídia removível e cria as entradas de boot (G1.6b).
+- **qcow2**: `qemu-img convert -c` (zlib) do `disk.img`, que já é a imagem instalada A/B. Em UEFI,
+  o primeiro boot é pelo caminho de mídia removível e cria as entradas de boot (G1.6b); em SeaBIOS,
+  é pelo GRUB, já em dm-verity (G1.6g).
 - **OVA** (`corerouter-image ova`): ustar com o `.ovf` primeiro, o `.mf` (SHA-256) e o disco
   (DSP0243). VMDK streamOptimized pelo `qemu-img`. Máquina: 2 vCPUs, 1 GiB, SATA/AHCI, duas
-  e1000, `firmware=efi` (VMware). No VirtualBox, marcar "Enable EFI" depois de importar (o OVF não
-  tem como dizer isso ao VirtualBox sem o XML próprio dele).
+  e1000, `firmware=efi` (VMware). O VirtualBox importa com o BIOS dele, e o disco boota assim
+  (G1.6g).
 - **cloud-init: não agora.** O MikroTik CHR não usa cloud-init (sobe com DHCP na primeira porta);
   o VyOS tem. Para o IP inicial, a configuração padrão de primeiro boot do G1.6d (cliente DHCP na
   primeira porta, como o CHR) e o assistente de console resolvem Proxmox/VMware/VirtualBox; o
@@ -960,13 +1010,15 @@ usa com GRUB/isolinux. Escrever a ISO em Rust deu ~540 linhas com testes (o leit
 instalador usa vem junto), saída idêntica entre builds, sem download nem ferramenta GPL-3.0 no
 build. **Adotado: Rust**; o `file`, o `sfdisk` e o OVMF (CD e USB) aceitam a imagem.
 
-**BIOS legado: não agora.** A imagem instalada só boota por UEFI (EFI stub, A/B por
-`BootOrder`/`BootNext`, G1.6b); BIOS exigiria um bootloader (GRUB ou syslinux) e outro esquema
-de A/B só para ele. Quem ainda precisa: o Proxmox cria VMs com SeaBIOS por padrão (OVMF é uma
-opção na criação), algumas nuvens bootam imagens próprias por BIOS (a AWS só passou a aceitar
-imagem que boota nos dois em 2023), e servidores antigos sem UEFI. O Talos ainda faz ISO BIOS +
-UEFI no x86. Servidores atuais têm UEFI (e há fornecedores que já desligam o CSM). Fica a gap G1.6g, com o número do custo: um bootloader na
-ESP e o A/B por variável dele.
+**BIOS legado: GRUB (G1.6g).** A UEFI continua sem bootloader (EFI stub, A/B por
+`BootOrder`/`BootNext`, G1.6b). Quem precisa de BIOS: o Proxmox cria VMs com SeaBIOS por padrão,
+algumas nuvens bootam imagens próprias por BIOS e há servidores antigos sem UEFI. GRUB × syslinux,
+**medido** em protótipo pela receita do Buildroot (SeaBIOS, KVM): 149 KiB contra 171 KiB, kernel
+em 0,65 s contra 0,40 s, e o motivo da escolha: no `ONCE` do syslinux,
+`com32/elflink/ldlinux/ldlinux.c:312-337` ignora o retorno do `adv_write` e boota mesmo assim, o
+que num teste A/B vira laço de pânico; o `save_env` do GRUB
+(`grub-core/commands/loadenv.c:286-340`) confere os blocos e dá para decidir no script. Preço: o
+GRUB é GPL-3.0 (só na área de boot).
 
 **OVA:** `qemu-img` (VMDK streamOptimized, o único que uma OVA pode levar) + OVF e tar escritos
 em Rust (`corerouter-image ova`), datas fixas. O OVA ainda não é reprodutível: o `qemu-img`
@@ -1042,7 +1094,6 @@ topo) deram o mesmo `bzImage`, `rootfs.squashfs`, `disk.img`, pacote e imagens d
 
 ### O que ficou de fora e por quê
 
-- **BIOS legado:** gap G1.6g (acima).
 - **cloud-init (NoCloud/`cidata`):** gap G1.6h; o IP inicial pelo G1.6d e pelo assistente.
 - **Só os daemons do FRR configurados** (hoje sobem os 8, ~88 MiB de RSS somado): gap G1.6i.
 - **`/config` do tamanho do resto do disco (G1.6v):** o `disk.img` continua com 64 MiB (imagens
