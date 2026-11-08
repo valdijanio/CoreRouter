@@ -630,7 +630,7 @@ mesmo com o arquivo no squashfs: uma fila (`ice_common.c:3249`), sem RSS, sem XD
 | Peça | O que faz | Onde |
 |---|---|---|
 | `ice` como módulo | a sonda roda depois do `/`, com o arquivo à vista | `linux.fragment`, `REQUIRED_MODULES` |
-| Carga automática | o PID 1 lê `modules.dep`/`modules.alias`, olha as placas PCI/USB sem driver e carrega o que casa, no boot e a cada placa nova (mensagens de dispositivo do kernel). Só módulos em `kernel/drivers/net/`. Numa thread: uma sonda travada não para o boot, que espera no máximo 20 s; a porta que chega depois recebe o nome pelo hot-plug | `apps/corerouter-init/src/modules.rs` |
+| Carga automática | o PID 1 lê `modules.dep`/`modules.alias`, olha as placas PCI/USB sem driver e carrega o que casa, no boot e a cada dispositivo novo (mensagens do kernel, inclusive do barramento `auxiliary`). Só módulos em `kernel/drivers/net/`. Numa thread: uma sonda travada não para o boot, que espera no máximo 20 s; a porta que chega depois recebe o nome pelo hot-plug | `apps/corerouter-init/src/modules.rs` |
 | Firmware | os arquivos que os drivers de rede declaram (`firmware=` no modinfo, como o VyOS), de um commit fixo do `linux-firmware`, com o SHA-256 de cada um, sem comprimir (o squashfs comprime) | `os/package/corerouter-firmware/firmware.lock` |
 | Licenças | só entra o que o `WHENCE` diz que pode ser redistribuído; o resto vira linha `skip`. Os textos e as entradas do `WHENCE` vão em `/usr/share/licenses/firmware/` | `cargo xtask os firmware-lock`, `xtask/src/os/firmware.rs` |
 | Conferência | depois de cada build: hash de cada arquivo na imagem, links, licenças, e todo `firmware=` dos drivers de rede presente ou em `skip`, senão o build falha | `firmware::verify` |
@@ -672,6 +672,70 @@ e o tempo da sonda.
 | Placa nova, driver já carregado | 112 ms até a porta ter nome |
 | Placa nova, driver em módulo (`pcnet32`) | 157 ms até a porta ter nome (50 ms na carga) |
 | Reprodutível | `linux-dirclean` e rebuild: rootfs, bzImage, todos os `.ko`, `disk.img`, instalador, ISO, qcow2 e crpkg com o mesmo hash |
+
+### Placas suportadas
+
+`os/board/x86_64/nics.fragment` liga 175 drivers com fio e de PHY como módulo, além dos que o
+`linux.fragment` já embute. Uma placa que não está na máquina só ocupa disco: o driver não carrega.
+
+| Família | Drivers | Situação |
+|---|---|---|
+| Intel 1G/10G/25G/40G | `e1000`, `e1000e`, `igb`, `igc`, `ixgbe`, `i40e`, `iavf` (embutidos) | `e1000`, `e1000e` e `igb` **testadas** no QEMU; as outras devem funcionar |
+| Intel E810 (100G) | `ice` | deve funcionar; DDP e Safe Mode só se confirmam em placa real |
+| Intel 100/10 antigas | `e100` | **testada** no QEMU, com firmware |
+| Intel mGbE (Atom, Core) | `dwmac-intel` | deve funcionar |
+| Mellanox/NVIDIA ConnectX-3 | `mlx4_en` | deve funcionar (a porta vem do barramento `auxiliary`) |
+| Mellanox/NVIDIA ConnectX-4 em diante | `mlx5_core` (embutido) | deve funcionar |
+| Broadcom | `tg3` (embutido), `bnxt_en`, `bnx2`, `bnx2x`, `b44` | deve funcionar |
+| Realtek | `r8169`, `8139too` (embutidos), `8139cp`, `rtase` | `rtl8139` **testada** no QEMU; as outras devem funcionar |
+| Marvell/QLogic | `qede`, `qlcnic`, `netxen`, `qla3xxx`, `sky2` (embutido), `skge` | deve funcionar |
+| Chelsio | `cxgb4`, `cxgb4vf`, `cxgb3`, `cxgb` | deve funcionar |
+| Solarflare/AMD | `sfc`, `sfc-siena`, `sfc-falcon`, `amd-xgbe` | deve funcionar |
+| Aquantia/Atheros | `atlantic`, `alx`, `atl1c`, `atl1e`, `atl1`, `atl2` | deve funcionar |
+| Nuvem e virtuais | `virtio_net`, `vmxnet3` (embutidos), `ena`, `gve`, `enic`, `idpf` | `virtio_net` e `vmxnet3` **testadas** no QEMU; as outras devem funcionar |
+| Antigas (Tulip, NE2000, AMD, Via, SiS…) | `tulip`, `ne2k-pci`, `pcnet32`, `via-rhine`, `sis900`… | `tulip`, `ne2k-pci` e `pcnet32` **testadas** no QEMU |
+| USB | `r8152`, `ax88179_178a`, `asix`, `cdc_ether`, `cdc_ncm`, `lan78xx` (embutidos), `smsc95xx`, `aqc111`, `dm9601`, `mcs7830`, `rtl8150`… | deve funcionar; RTL8153 pede teste com o adaptador real |
+
+"Testada" aqui é emulação: prova a carga, o nome da porta e o firmware, não o silício. Nenhuma
+placa física foi testada ainda.
+
+**Fora de propósito:** Netronome, LiquidIO, Octeon EP, Mellanox Spectrum e Prestera (ASIC de switch
+ou SmartNIC, com firmware grande), Wi-Fi, LTE e tethering, PCMCIA, drivers fora da árvore do kernel.
+
+**Sem firmware na imagem (linhas `skip` da trava):** Adaptec Starfire (o `WHENCE` não dá
+permissão), `acenic`, `cassini` e `tehuti/aqr105-tn40xx.cld` (o `linux-firmware` não tem o
+arquivo). O driver carrega, mas essas placas podem não subir. Licença "GPL sem código-fonte visível"
+sem alternativa BSD também fica de fora: a GPL pede o fonte, e sem ele o binário não pode ser
+redistribuído.
+
+**Na ISO (live e instalador)** só há porta para o que é embutido no kernel dela: os embutidos da
+tabela e mais `ice`, `bnxt_en`, `bnx2`, `bnx2x`, `mlx4_en`, `sfc`, `atlantic`, `alx`, `atl1c`
+(`installer.fragment`). A placa que só existe em módulo não tem porta na ISO, e a instalação
+continua pelo console: **ela funciona depois de instalar** (carga assinada à parte: gap G1.6za).
+
+**PHYs em módulo** carregam pelo pedido do próprio kernel (`request_module`, `/sbin/modprobe` do
+busybox). Um driver embutido sonda antes do `/` e não consegue carregar um PHY em módulo: fica com
+o PHY genérico. Só os PHYs Realtek, Microchip e AX88796B são embutidos; um caso real com outro PHY
+pede passar o driver para módulo ou o PHY para embutido.
+
+**Para refazer a lista num kernel novo:** ligue todo `tristate` de
+`drivers/net/{ethernet,usb,phy,mdio,pcs}` (menos os de fora), compile uma vez pelo `cargo xtask os
+build` e fique com os módulos que têm alias `pci:`, `usb:`, `auxiliary:` ou `mdio:` e com o que eles
+pedem no `modules.dep`. Depois rode `firmware-lock`. O build falha se o kernel derrubar um símbolo
+da lista.
+
+**Números do conjunto amplo (medido, 2026-11-08):**
+
+| O quê | Antes | Depois |
+|---|---|---|
+| Módulos | 3 | 192 (28,2 MB crus) |
+| Firmware | 41 arquivos, 1,5 MB | 79 arquivos e 4 links, 11,1 MB crus; 19 licenças; 6 `skip` |
+| `rootfs.squashfs` | 37 281 792 B | 48 844 800 B (slot de 256 MiB) |
+| `corerouter.crpkg` | 57 357 909 B | 69 150 294 B |
+| `bzImage` | 19 776 512 B | 19 915 776 B |
+| `BOOTX64.EFI` da ISO | 19 428 352 B | 20 984 832 B (limite da FAT: 32 MiB) |
+| Memória ociosa | 79–86 MiB | 72–74 MiB: o conjunto amplo não aumenta (a variação é entre rodadas) |
+| `ready` depois do kernel | 0,98–1,02 s | 1,07 s |
 
 ### Pesquisa
 

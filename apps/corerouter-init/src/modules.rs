@@ -1,6 +1,7 @@
 //! G1.6j: the network drivers built as modules load themselves. The image
 //! has no udev: PID 1 reads the kernel's module index (`modules.alias`,
 //! `modules.dep`), looks at the PCI and USB devices that have no driver yet
+//! (and the auxiliary ones a driver makes while it probes)
 //! and loads what matches, once at boot (after `/` is mounted, so a driver
 //! that asks for its firmware while probing finds it: `ice`) and again when
 //! the kernel announces a new device (a card plugged in with the router
@@ -32,9 +33,12 @@ const MAX_DEVICES: usize = 4096;
 /// How long the boot waits for the drivers before it goes on naming the
 /// ports. `ice` takes seconds per function, loading its firmware.
 const BOOT_WAIT: Duration = Duration::from_secs(20);
-const BUSES: [(&str, &str); 2] = [
+const BUSES: [(&str, &str); 3] = [
     ("pci", "/sys/bus/pci/devices"),
     ("usb", "/sys/bus/usb/devices"),
+    // `mlx4_en` binds here: `mlx4_core` makes the device while it probes. The
+    // bus has no `modalias` file, so these arrive as device messages only.
+    ("auxiliary", "/sys/bus/auxiliary/devices"),
 ];
 
 /// `*`, `?` and `[a-z]`, what `modules.alias` uses: the single pass with a
@@ -524,5 +528,23 @@ broken line
         }
         // ~1 ms in a release build; generous for a shared CI machine.
         assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    }
+
+    /// `mlx4_core` makes the device `mlx4_en` binds to while it probes: the
+    /// port of a ConnectX-3 depends on this message.
+    #[test]
+    fn a_driver_of_the_auxiliary_bus() {
+        let dep = "kernel/drivers/net/ethernet/mellanox/mlx4/mlx4_en.ko: kernel/drivers/net/ethernet/mellanox/mlx4/mlx4_core.ko
+                   kernel/drivers/net/ethernet/mellanox/mlx4/mlx4_core.ko:
+";
+        let i = Index::parse(
+            dep,
+            "alias auxiliary:mlx4_core.eth mlx4_en
+",
+        );
+        let add = b"add@/devices/pci0000:00/0000:00:03.0/mlx4_core.eth.0 ACTION=add SUBSYSTEM=auxiliary MODALIAS=auxiliary:mlx4_core.eth ";
+        let alias = uevent_modalias(add).unwrap();
+        assert_eq!(i.matches(alias), ["mlx4_en"]);
+        assert_eq!(i.chain("mlx4_en").len(), 2);
     }
 }
