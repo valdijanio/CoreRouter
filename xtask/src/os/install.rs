@@ -411,7 +411,7 @@ fn live(t: &mut T) -> Result<(), String> {
         format!("address: {addresses}"),
     )?;
     // The other way in: the browser's GUI.
-    t.n.put("live: the web GUI answers", super::web_check(web)?);
+    t.n.put("live: the web GUI answers", super::web_files(web)?);
     let e = live_cli(
         t,
         &cli,

@@ -1635,6 +1635,13 @@ fn tls_ping(port: u16) -> Result<String, String> {
 /// network until a password is set (G0.3b): either answer proves the
 /// channel works end to end.
 fn web_check(port: u16) -> Result<String, String> {
+    let files = web_files(port)?;
+    let login = ws_login(port)?;
+    Ok(format!("{files}\nwss /ws auth.login: {login}"))
+}
+
+/// The GUI's page and its wasm over HTTPS.
+fn web_files(port: u16) -> Result<String, String> {
     let base = format!("https://127.0.0.1:{port}");
     // The daemon may open 443 a tick after it answers the TLS ping.
     let mut page = String::new();
@@ -1676,9 +1683,8 @@ fn web_check(port: u16) -> Result<String, String> {
         return Err(format!("web: GET /{wasm}: {got}"));
     }
     let size: u64 = size.and_then(|s| s.parse().ok()).unwrap_or(0);
-    let login = ws_login(port)?;
     Ok(format!(
-        "GET / ok ({} bytes)\nGET /{wasm}: {:.1} MiB on the wire (gzip) in {} s\nwss /ws auth.login: {login}",
+        "GET / ok ({} bytes)\nGET /{wasm}: {:.1} MiB on the wire (gzip) in {} s",
         page.len(),
         size as f64 / 1048576.0,
         secs.unwrap_or("?")
