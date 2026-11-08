@@ -1040,7 +1040,8 @@ em 0,65 s contra 0,40 s, e o motivo da escolha: no `ONCE` do syslinux,
 `com32/elflink/ldlinux/ldlinux.c:312-337` ignora o retorno do `adv_write` e boota mesmo assim, o
 que num teste A/B vira laço de pânico; o `save_env` do GRUB
 (`grub-core/commands/loadenv.c:286-340`) confere os blocos e dá para decidir no script. Preço: o
-GRUB é GPL-3.0 (só na área de boot).
+GRUB é GPL-3.0 (só na área de boot). O A/B fica uma lógica só atrás do `BootStore`
+(`crates/sysupdate/src/ab.rs`): um firmware a mais, não um segundo atualizador.
 
 **OVA:** `qemu-img` (VMDK streamOptimized, o único que uma OVA pode levar) + OVF e tar escritos
 em Rust (`corerouter-image ova`), datas fixas. O OVA ainda não é reprodutível: o `qemu-img`
