@@ -9496,3 +9496,16 @@ continuação indentadas).
 - 2026-11-08 — G1.6y: Comandos `system.install.print|rescan|challenge|cancel|run` e o serviço `install` do daemon: lista os discos, escreve fora do lock e cria a entrada de boot. Disco vazio pede o nome; disco com dados ou CoreRouter pede também o código do console ou o botão de energia 3 vezes. Corrige a classificação de vazio: um `mkfs.btrfs` passava por vazio porque só o começo do disco era lido (reproduzido); agora lê primeiro e último MiB e 64 amostras, também no instalador de console. Testar: `cargo xtask os build && cargo xtask os install-test` (cenário `live_install`).
 
 - 2026-11-08 — G1.6y: `system.install.test`: por porta, driver, firmware que falta, link, velocidade, DHCP, gateway, DNS e a porta por onde a GUI chegou. `system.install.run` leva a porta de gerência (DHCP ou fixo), e o primeiro boot aplica isso e a senha definida no live, com o mesmo certificado TLS. Novo em `user.set`: `password_hash`. Testar: `cargo xtask os build && cargo xtask os install-test` (cenário `live_install`).
+
+- 2026-11-08 — G1.6j: Firmware das placas, parte 2: a imagem passa a trazer os drivers com fio de PCI e USB e os PHYs,
+  em módulo (`os/board/x86_64/nics.fragment`), e o firmware que eles declaram. Só entra o que o
+  `WHENCE` marca como redistribuível; GPL sem código-fonte visível fica de fora, e os 6 arquivos sem
+  licença ou sem fonte viram linha `skip`. A carga automática passa a ouvir o barramento `auxiliary`,
+  de onde vem a porta da ConnectX-3. A ISO embute também `bnxt_en`, `bnx2`, `bnx2x`, `mlx4_en`, `sfc`,
+  `atlantic`, `alx` e `atl1c`; quem só existe em módulo tem porta depois de instalar. Como testar:
+  `cargo xtask os boot-test`, `install-test` e `ab-test`. **Medido** (KVM, 2026-11-08): 192 módulos
+  (28,2 MB crus), 79 arquivos de firmware (11,1 MB crus), `rootfs.squashfs` de 48 848 896 B, memória
+  ociosa de 72–76 MiB, `tulip` e `ne2k_pci` no QEMU carregadas e com nome de porta. Tabela de placas
+  em `docs/os-image.md`.
+
+- 2026-11-08 — G1.6y: Janela System › Install to disk na GUI e no navegador, selo `live: not installed` na barra de cima, modais de confirmação por conteúdo do disco e tela depois do reinício. Testar: `cargo xtask os build && cargo xtask os install-test`; a janela, com a GUI conectada ao live no QEMU. Hardware real não foi testado.
