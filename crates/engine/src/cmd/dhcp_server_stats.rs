@@ -116,6 +116,6 @@ fn print(s: &mut Session, _: &Value) -> Result<Value> {
 
 fn reset(s: &mut Session, _: &Value) -> Result<Value> {
     let now = s.dhcp_server_clock().unix;
-    let done = s.dhcp_server_mut().map(|c| c.reset_stats(now)).is_some();
+    let done = s.dhcp_server_op(|c| (c.reset_stats(now), Vec::new())).is_some();
     Ok(json!({"reset": done}))
 }
