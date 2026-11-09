@@ -1182,6 +1182,30 @@ impl Hal for VirtualHal {
         Ok(())
     }
 
+    /// Added entries leave the old ones in one pass (one per entry walked
+    /// the whole list: a lab with a storm of DHCP bindings, G4.2h).
+    fn address_list_dynamic_many(&mut self, changes: &[DynamicChange<'_>]) -> Result<(), HalError> {
+        let adds: Vec<&DynamicAddress> = changes
+            .iter()
+            .filter_map(|c| match c {
+                DynamicChange::Add(d) => Some(*d),
+                _ => None,
+            })
+            .collect();
+        if adds.len() != changes.len() {
+            for c in changes {
+                self.address_list_dynamic(*c)?;
+            }
+            return Ok(());
+        }
+        let keys: std::collections::BTreeSet<_> =
+            adds.iter().map(|d| (&d.list, d.address)).collect();
+        self.dynamic
+            .retain(|x| !keys.contains(&(&x.list, x.address)));
+        self.dynamic.extend(adds.into_iter().cloned());
+        Ok(())
+    }
+
     fn prober(&self) -> Result<SharedProber, String> {
         Ok(Arc::clone(&self.prober))
     }

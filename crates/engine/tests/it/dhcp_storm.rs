@@ -80,10 +80,20 @@ fn a_storm_round_writes_once_per_journal() {
     lan(&mut s);
     let ms = rounds(&mut s, 0, 3);
     let before = f.lock().unwrap().acks;
+    // One lock for both: two `f.lock()` in one statement wait for each other.
+    let lists_of = |f: &flood::Shared| {
+        let g = f.lock().unwrap();
+        (g.list_calls, g.list_batches)
+    };
+    let lists_before = lists_of(&f);
     counting.take();
     rounds(&mut s, ms, 1);
     let w = counting.take();
     let acks = f.lock().unwrap().acks - before;
+    // G4.2h: their address-list entries reach the kernel in one batch.
+    let lists = lists_of(&f);
+    assert_eq!(lists.0, lists_before.0, "no entry alone");
+    assert_eq!(lists.1, lists_before.1 + 1, "one batch for the round");
     assert_eq!(acks, 128, "the round bound 128 clients");
     assert!(w.appends <= 2, "{w:?}: leases + history, once each");
     assert!(w.states <= 1, "{w:?}: the DNS records, once");

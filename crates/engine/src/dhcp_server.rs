@@ -810,14 +810,74 @@ impl Session {
                 self.check_lockout(running, running, b, &after).is_ok()
             }
         };
+        if all_ok {
+            self.dhcp_lists_add(pending, now);
+            return;
+        }
         for (list, ip, timeout) in pending {
-            if !self.dhcp_list_put(&list, ip, timeout, now, !all_ok)
-                && let Some(reg) = self
-                    .ext_mut::<DhcpServerRuntime>()
-                    .and_then(|r| r.registered.get_mut(&ip))
-            {
-                reg.lists.retain(|l| *l != list);
+            if !self.dhcp_list_put(&list, ip, timeout, now, true) {
+                self.dhcp_list_refused(&list, ip);
             }
+        }
+    }
+
+    /// The round's entries, checked already: the new ones reach the kernel
+    /// in one batch (one per binding was a netlink transaction each, under
+    /// the session lock, G4.2h); one to refresh goes alone.
+    fn dhcp_lists_add(&mut self, pending: Vec<(String, Ipv4Addr, u64)>, now: Now) {
+        let at = self.now();
+        let mut fresh = Vec::new();
+        let mut room = MAX_DYNAMIC.saturating_sub(self.dynamic_addresses.entries().len());
+        for (list, ip, timeout) in pending {
+            let Ok(name) = list.parse::<Name>() else {
+                self.dhcp_list_refused(&list, ip);
+                continue;
+            };
+            let addr = AddrMatch::Net(ipnet::IpNet::from(IpAddr::V4(ip)));
+            if self.dynamic_addresses.find(&name, &addr).is_some() {
+                if !self.dhcp_list_put(&list, ip, timeout, now, false) {
+                    self.dhcp_list_refused(&list, ip);
+                }
+                continue;
+            }
+            if room == 0 {
+                self.dhcp_list_refused(&list, ip);
+                continue;
+            }
+            room -= 1;
+            let entry = DynamicEntry {
+                id: self.dynamic_addresses.next_id(),
+                list: name,
+                address: addr,
+                timeout_secs: timeout.max(1),
+                added: Some(now.unix),
+                comment: "dhcp".into(),
+            };
+            // Each takes its id now: the next `next_id` must see it.
+            self.dynamic_addresses.push(entry.clone());
+            fresh.push((list, ip, entry));
+        }
+        if fresh.is_empty() {
+            return;
+        }
+        let planes: Vec<_> = fresh.iter().map(|(_, _, e)| e.data_plane(at)).collect();
+        let changes: Vec<DynamicChange<'_>> = planes.iter().map(DynamicChange::Add).collect();
+        if let Err(e) = self.hal_mut().address_list_dynamic_many(&changes) {
+            log::warn!("dhcp-server: {} address-list entries: {e}", fresh.len());
+            for (list, ip, entry) in fresh {
+                self.dynamic_addresses.remove(entry.id);
+                self.dhcp_list_refused(&list, ip);
+            }
+        }
+    }
+
+    /// `list` refused `ip`: it leaves the lease's lists.
+    fn dhcp_list_refused(&mut self, list: &str, ip: Ipv4Addr) {
+        if let Some(reg) = self
+            .ext_mut::<DhcpServerRuntime>()
+            .and_then(|r| r.registered.get_mut(&ip))
+        {
+            reg.lists.retain(|l| l != list);
         }
     }
 

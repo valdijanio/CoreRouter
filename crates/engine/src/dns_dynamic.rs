@@ -18,6 +18,7 @@
 //! deletes a configured name only deletes its dynamic records. Every change
 //! moves the zone's served serial (§3.6), past the config's.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 
 use corerouter_model::dns_dynamic::{DynamicOp, DynamicRecord, DynamicState, MAX_DYNAMIC};
@@ -42,6 +43,74 @@ struct DynamicRuntime {
     deferred: bool,
     /// Zones changed while deferred (their serial moves at the flush).
     dirty: Vec<String>,
+    /// While deferred: where each (zone, name) is in `state.records`. A DHCP
+    /// round names hundreds of leases, and walking every record per update
+    /// took ~1 s of session lock per round at the cap (G4.2h, **medido**).
+    /// Built once a round; gone at the flush or when the state is replaced.
+    index: Option<RecordIndex>,
+}
+
+type RecordIndex = HashMap<(String, String), Vec<usize>>;
+
+fn index_of(state: &DynamicState) -> RecordIndex {
+    let mut ix: RecordIndex = HashMap::with_capacity(state.records.len());
+    for (i, d) in state.records.iter().enumerate() {
+        ix.entry((d.record.zone.clone(), d.record.name.clone())).or_default().push(i);
+    }
+    ix
+}
+
+/// Where the records of `name` in `zone` are.
+fn places(next: &DynamicState, index: Option<&RecordIndex>, zone: &str, name: &str) -> Vec<usize> {
+    match index {
+        Some(ix) => ix.get(&(zone.to_owned(), name.to_owned())).cloned().unwrap_or_default(),
+        None => next
+            .records
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.record.zone == zone && d.record.name == name)
+            .map(|(i, _)| i)
+            .collect(),
+    }
+}
+
+/// Removes the records at `gone`. With an index, by swapping the last into
+/// the hole (O(1); the order means nothing to DNS, RFC 2181 §5: an RRset has
+/// no order); without one, keeping the order.
+fn remove_at(next: &mut DynamicState, index: Option<&mut RecordIndex>, mut gone: Vec<usize>) -> usize {
+    let n = gone.len();
+    gone.sort_unstable();
+    let Some(ix) = index else {
+        let mut at = 0;
+        next.records.retain(|_| {
+            let keep = gone.binary_search(&at).is_err();
+            at += 1;
+            keep
+        });
+        return n;
+    };
+    // From the back: the swap only moves a record from behind the holes left.
+    for &i in gone.iter().rev() {
+        let last = next.records.len().saturating_sub(1);
+        if i >= next.records.len() {
+            continue;
+        }
+        let leaving = next.records.swap_remove(i);
+        let key = (leaving.record.zone, leaving.record.name);
+        if let Some(list) = ix.get_mut(&key) {
+            list.retain(|p| *p != i);
+            if list.is_empty() {
+                ix.remove(&key);
+            }
+        }
+        if let Some(moved) = next.records.get(i).filter(|_| i != last)
+            && let Some(list) = ix.get_mut(&(moved.record.zone.clone(), moved.record.name.clone()))
+            && let Some(p) = list.iter_mut().find(|p| **p == last)
+        {
+            *p = i;
+        }
+    }
+    n
 }
 
 /// A lease for [`Session::dns_dynamic_lease`].
@@ -116,6 +185,7 @@ impl Session {
         if self.ext::<DynamicRuntime>().is_some_and(|r| r.deferred) {
             let rt = self.dyn_rt().ok_or("no dynamic DNS state")?;
             rt.state = next;
+            rt.index = None;
             rt.version = rt.version.wrapping_add(1);
             for z in zones {
                 if !rt.dirty.contains(z) {
@@ -143,6 +213,7 @@ impl Session {
     pub(crate) fn dns_dynamic_flush(&mut self, now: u64) {
         let Some(zones) = self.ext_mut::<DynamicRuntime>().map(|r| {
             r.deferred = false;
+            r.index = None;
             std::mem::take(&mut r.dirty)
         }) else {
             return;
@@ -223,17 +294,43 @@ impl Session {
             }
             _ => true,
         });
-        let fits = self
-            .dyn_rt()
-            .is_some_and(|r| r.deferred && r.state.records.len() + adds <= MAX_DYNAMIC);
-        if valid && fits {
+        let deferred = self.dyn_rt().is_some_and(|r| r.deferred);
+        if valid && deferred {
             let Some(rt) = self.dyn_rt() else {
                 return Err("no dynamic DNS state".into());
             };
-            let mut changed = 0usize;
-            for op in ops {
-                changed += apply(&mut rt.state, &config, zone, op, source, expires_unix, now)?;
+            // At the cap an update that adds fails unless it also takes one
+            // away (a lease's new name replacing the old): known from the
+            // index, without copying the state to find out.
+            let ix = rt.index.get_or_insert_with(|| index_of(&rt.state));
+            let goes: usize = ops
+                .iter()
+                .map(|o| match o {
+                    DynamicOp::Add(_) => 0,
+                    DynamicOp::DeleteRrset { name, rtype } => places(&rt.state, Some(ix), zone, name)
+                        .iter()
+                        .filter(|i| rt.state.records.get(**i).is_some_and(|d| d.record.rtype == *rtype))
+                        .count(),
+                    DynamicOp::DeleteName { name } => places(&rt.state, Some(ix), zone, name).len(),
+                    DynamicOp::DeleteRecord(r) => {
+                        let mut r = r.clone();
+                        r.zone = zone.to_owned();
+                        places(&rt.state, Some(ix), zone, &r.name)
+                            .iter()
+                            .filter(|i| rt.state.records.get(**i).is_some_and(|d| d.record.same_data(&r)))
+                            .count()
+                    }
+                })
+                .sum();
+            if rt.state.records.len() + adds > MAX_DYNAMIC + goes {
+                return Err(format!("more than {MAX_DYNAMIC} dynamic records"));
             }
+            let mut changed = 0usize;
+            let mut index = rt.index.take();
+            for op in ops {
+                changed += apply(&mut rt.state, index.as_mut(), &config, zone, op, source, expires_unix, now)?;
+            }
+            rt.index = index;
             if changed > 0 {
                 rt.version = rt.version.wrapping_add(1);
                 if !rt.dirty.iter().any(|z| z == zone) {
@@ -245,7 +342,7 @@ impl Session {
         let (_, mut next) = self.dns_dynamic();
         let mut changed = 0usize;
         for op in ops {
-            changed += apply(&mut next, &config, zone, op, source, expires_unix, now)?;
+            changed += apply(&mut next, None, &config, zone, op, source, expires_unix, now)?;
         }
         if next.records.len() > MAX_DYNAMIC {
             return Err(format!("more than {MAX_DYNAMIC} dynamic records"));
@@ -424,8 +521,11 @@ pub fn reverse_name(ip: IpAddr) -> String {
 }
 
 /// One op on `next`; the configured records `config` are only read.
+/// `index`: keep it with the records (and use it instead of walking them).
+#[allow(clippy::too_many_arguments)]
 fn apply(
     next: &mut DynamicState,
+    mut index: Option<&mut RecordIndex>,
     config: &[ZoneRecord],
     zone: &str,
     op: &DynamicOp,
@@ -433,7 +533,6 @@ fn apply(
     expires_unix: Option<u64>,
     now: u64,
 ) -> Result<usize, String> {
-    let in_zone = |r: &&DynamicRecord| r.record.zone == zone;
     match op {
         DynamicOp::Add(r) => {
             let mut r = r.clone();
@@ -448,16 +547,18 @@ fn apply(
             if config.iter().any(|c| c.same_data(&r)) {
                 return Ok(0);
             }
+            let here = places(next, index.as_deref(), zone, &r.name);
             // §3.4.2.2: a CNAME and other data never share a name.
             let others = config
                 .iter()
                 .filter(|c| c.name == r.name)
-                .chain(next.records.iter().filter(in_zone).map(|d| &d.record).filter(|c| c.name == r.name))
+                .chain(here.iter().filter_map(|i| next.records.get(*i)).map(|d| &d.record))
                 .any(|c| (c.rtype == RecordType::Cname) != (r.rtype == RecordType::Cname));
             if others {
                 return Ok(0);
             }
-            if let Some(d) = next.records.iter_mut().find(|d| d.record.zone == zone && d.record.same_data(&r)) {
+            let same = here.iter().copied().find(|i| next.records.get(*i).is_some_and(|d| d.record.same_data(&r)));
+            if let Some(d) = same.and_then(|i| next.records.get_mut(i)) {
                 if d.record.ttl_secs == r.ttl_secs && d.expires_unix == expires_unix {
                     return Ok(0);
                 }
@@ -467,6 +568,9 @@ fn apply(
             }
             next.next_id = next.next_id.saturating_add(1);
             r.id = ItemId(next.next_id);
+            if let Some(ix) = index.as_deref_mut() {
+                ix.entry((r.zone.clone(), r.name.clone())).or_default().push(next.records.len());
+            }
             next.records.push(DynamicRecord {
                 record: r,
                 expires_unix,
@@ -479,29 +583,104 @@ fn apply(
             if name == "@" && *rtype == RecordType::Ns {
                 return Ok(0);
             }
-            Ok(remove(next, |d| d.record.zone == zone && d.record.name == *name && d.record.rtype == *rtype))
+            let gone = places(next, index.as_deref(), zone, name)
+                .into_iter()
+                .filter(|i| next.records.get(*i).is_some_and(|d| d.record.rtype == *rtype))
+                .collect();
+            Ok(remove_at(next, index, gone))
         }
         DynamicOp::DeleteName { name } => {
-            Ok(remove(next, |d| d.record.zone == zone && d.record.name == *name && !(name == "@" && d.record.rtype == RecordType::Ns)))
+            let gone = places(next, index.as_deref(), zone, name)
+                .into_iter()
+                .filter(|i| next.records.get(*i).is_some_and(|d| !(name == "@" && d.record.rtype == RecordType::Ns)))
+                .collect();
+            Ok(remove_at(next, index, gone))
         }
         DynamicOp::DeleteRecord(r) => {
             let mut r = r.clone();
             r.zone = zone.to_owned();
-            Ok(remove(next, |d| d.record.same_data(&r)))
+            let gone = places(next, index.as_deref(), zone, &r.name)
+                .into_iter()
+                .filter(|i| next.records.get(*i).is_some_and(|d| d.record.same_data(&r)))
+                .collect();
+            Ok(remove_at(next, index, gone))
         }
     }
-}
-
-fn remove(next: &mut DynamicState, f: impl Fn(&DynamicRecord) -> bool) -> usize {
-    let before = next.records.len();
-    next.records.retain(|d| !f(d));
-    before - next.records.len()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use serde_json::json;
+
+    fn sorted(s: &DynamicState) -> Vec<(String, String, u8, String, Option<u32>)> {
+        let mut v: Vec<_> = s
+            .records
+            .iter()
+            .map(|d| {
+                let r = &d.record;
+                (r.zone.clone(), r.name.clone(), u8::from(r.rtype == RecordType::Ptr), r.data(), r.ttl_secs)
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn op_of(kind: u8, name: u8, ip: u8) -> DynamicOp {
+        let name = format!("h{name}");
+        let mut r = ZoneRecord::new(ItemId(0), "z.example", &name);
+        r.address = Some(IpAddr::from([10, 0, 0, ip]));
+        r.ttl_secs = Some(300 + u32::from(ip % 3));
+        match kind % 4 {
+            0 | 1 => DynamicOp::Add(r),
+            2 => DynamicOp::DeleteRrset { name, rtype: RecordType::A },
+            _ => DynamicOp::DeleteRecord(r),
+        }
+    }
+
+    proptest! {
+        /// G4.2h: with the index or walking the records, the same updates
+        /// give the same records, and the index stays true.
+        #[test]
+        fn the_index_changes_nothing_but_the_cost(
+            ops in proptest::collection::vec((0u8..4, 0u8..6, 0u8..4), 0..200),
+        ) {
+            let (mut plain, mut fast) = (DynamicState::default(), DynamicState::default());
+            let mut ix = index_of(&fast);
+            for (k, n, ip) in ops {
+                let op = op_of(k, n, ip);
+                let a = apply(&mut plain, None, &[], "z.example", &op, "t", None, 0).unwrap();
+                let b = apply(&mut fast, Some(&mut ix), &[], "z.example", &op, "t", None, 0).unwrap();
+                prop_assert_eq!(a, b);
+                prop_assert_eq!(sorted(&plain), sorted(&fast));
+                let mut got: Vec<_> = ix.iter().map(|(k, v)| { let mut v = v.clone(); v.sort_unstable(); (k.clone(), v) }).collect();
+                got.sort();
+                let mut want: Vec<_> = index_of(&fast).into_iter().map(|(k, mut v)| { v.sort_unstable(); (k, v) }).collect();
+                want.sort();
+                prop_assert_eq!(got, want);
+            }
+        }
+    }
+
+    /// At the cap, deferred: a new name is refused without copying the state,
+    /// and a name that replaces its old record still goes through.
+    #[test]
+    fn the_cap_holds_while_deferred() {
+        let mut s = lab();
+        s.dns_dynamic_defer();
+        let z = "lan.example";
+        for i in 0..MAX_DYNAMIC as u32 {
+            let [_, _, b, c] = i.to_be_bytes();
+            s.dns_dynamic_apply(z, &[DynamicOp::Add(a(&format!("h{i}"), &format!("10.0.{b}.{c}")))], "t", None, 0).unwrap();
+        }
+        let e = s.dns_dynamic_apply(z, &[DynamicOp::Add(a("new", "10.9.9.9"))], "t", None, 0).unwrap_err();
+        assert!(e.contains("more than"), "{e}");
+        let swap = [DynamicOp::DeleteRrset { name: "h7".into(), rtype: RecordType::A }, DynamicOp::Add(a("h7", "10.9.9.9"))];
+        assert_eq!(s.dns_dynamic_apply(z, &swap, "t", None, 0).unwrap(), 2);
+        s.dns_dynamic_flush(0);
+        assert_eq!(s.dns_dynamic().1.records.len(), MAX_DYNAMIC);
+    }
 
     fn lab() -> Session {
         let mut s = Session::virtual_lab();
