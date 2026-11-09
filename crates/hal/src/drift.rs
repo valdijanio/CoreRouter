@@ -95,6 +95,9 @@ pub struct Snapshot {
     pub routes: BTreeSet<KernelRoute>,
     /// G1.5a: routes without next hop in the tables CoreRouter manages.
     pub discards: BTreeSet<KernelDiscard>,
+    /// G1.27e: the kernel's rules written by CoreRouter (another program's
+    /// are not compared).
+    pub rules: BTreeSet<crate::policy::KernelRule>,
 }
 
 /// Enabled addresses on enabled interfaces of `cfg`, as (link, prefix).
@@ -293,6 +296,7 @@ pub fn expected(cfg: &Config) -> Snapshot {
         addresses: active_addresses(cfg),
         routes: kernel_routes(cfg),
         discards: discard_routes(cfg),
+        rules: crate::policy::expected_rules(cfg),
     }
 }
 
@@ -328,6 +332,11 @@ pub enum DriftKind {
     RouteMissing,
     /// A static route through a managed link that the config does not have.
     RouteExtra,
+    /// G1.27e: a kernel rule of the config is gone.
+    RuleMissing,
+    /// G1.27e: a kernel rule of CoreRouter's protocol that the config does
+    /// not have (another program's is never drift).
+    RuleExtra,
 }
 
 /// One difference between the config and the data plane.
@@ -465,6 +474,35 @@ pub fn diff(want: &Snapshot, have: &Snapshot) -> Vec<Drift> {
             });
         }
     }
+    // G1.27e: a rule has no link of its own; `lo` says "the router's".
+    if let Ok(lo) = "lo".parse::<IfName>() {
+        for (kind, rule) in want
+            .rules
+            .difference(&have.rules)
+            .map(|r| (DriftKind::RuleMissing, r))
+            // `l3mdev unreachable` stays when the last VRF goes, as the
+            // kernel's `l3mdev` does; it matches nothing then.
+            .chain(
+                have.rules
+                    .difference(&want.rules)
+                    .filter(|r| !r.l3mdev)
+                    .map(|r| (DriftKind::RuleExtra, r)),
+            )
+        {
+            let present = String::from("present");
+            let (expected, actual) = match kind {
+                DriftKind::RuleMissing => (present, String::new()),
+                _ => (String::new(), present),
+            };
+            out.push(Drift {
+                kind,
+                interface: rule.iif.clone().unwrap_or_else(|| lo.clone()),
+                item: rule.to_string(),
+                expected,
+                actual,
+            });
+        }
+    }
     out.sort();
     out
 }
@@ -505,6 +543,7 @@ pub fn repaired(cfg: &Config, have: &Snapshot) -> Snapshot {
     out.routes
         .extend(want.routes.iter().filter(|r| on(&links, &r.link)).cloned());
     out.discards.clone_from(&want.discards);
+    out.rules.clone_from(&want.rules);
     out
 }
 

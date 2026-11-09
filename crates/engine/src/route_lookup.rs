@@ -6,18 +6,20 @@
 //! Order of the rules: the router's own addresses first (the kernel's
 //! `local` table, rule 0), then the longest matching prefix among the
 //! active routes of the table (RFC 1812 §5.2.4.3, RFC 4632 §5.1); an ECMP
-//! group gives every path. There are no policy rules yet (`/routing rule`
-//! is gap G1.27e): the table is the one asked for, the VRF of the source
-//! address, or main.
+//! group gives every path. The table is the one asked for or, as the
+//! kernel chooses it (G1.27e), what the rule list says: the routing marks of
+//! the mangle, the VRF, `/routing rule`, main (`corerouter_hal::policy`).
 
 use std::net::IpAddr;
 
+use corerouter_hal::policy::{KernelRuleAction, L3MDEV_PREF, RulePacket, RuleVerdict, expected_rules, walk};
 use corerouter_hal::route_get::{KernelLookup, RouteKind, RouteQuery};
 use corerouter_model::route::{self, is_link_local, table_of};
-use corerouter_model::{Config, IfName, RoutingTable};
+use corerouter_model::{Config, IfName, ItemId, RoutingTable};
 use ipnet::IpNet;
 use serde::Serialize;
 
+use crate::policy_rule::describe_pref;
 use crate::route_table::{Line, State};
 
 /// What the engine answers.
@@ -46,15 +48,17 @@ pub fn choose_table(
     cfg: &Config,
     table: Option<&RoutingTable>,
     src: Option<IpAddr>,
+    forwarded: bool,
 ) -> Result<(RoutingTable, String), (&'static str, String)> {
     if let Some(src) = src
+        && !forwarded
         && !cfg.ip.addresses.iter().any(|a| a.address.addr() == src)
     {
         return Err((
             "src",
             format!(
-                "{src} is not an address of this router (a forwarded packet's source would also \
-                 need its incoming interface)"
+                "{src} is not an address of this router (for a forwarded packet give its \
+                 incoming interface too)"
             ),
         ));
     }
@@ -81,7 +85,7 @@ pub fn choose_table(
         }
         _ => Ok((
             RoutingTable::Main,
-            "main table: no routing rule matches (there are none yet)".into(),
+            "main table: no routing rule decided".into(),
         )),
     }
 }
@@ -188,6 +192,14 @@ pub fn differences(engine: &Lookup, kernel: &KernelLookup) -> Vec<String> {
         ));
         return out;
     }
+    // Which table chose it: only a forwarded route says (the kernel's local
+    // table holds the router's own addresses).
+    if engine.kind == RouteKind::Unicast && engine.table_id != kernel.table {
+        out.push(format!(
+            "the kernel looks in table {}, the config in {}",
+            kernel.table, engine.table_id
+        ));
+    }
     if let (Some(e), Some(k)) = (engine.prefix, kernel.prefix)
         && e != k
     {
@@ -226,11 +238,146 @@ pub fn differences(engine: &Lookup, kernel: &KernelLookup) -> Vec<String> {
     out
 }
 
-/// The query for the data plane.
-pub fn query(l: &Lookup, dst: IpAddr, src: Option<IpAddr>) -> RouteQuery {
+/// The query for the data plane: `policy` to walk its rule list too.
+pub fn query(
+    l: &Lookup,
+    dst: IpAddr,
+    src: Option<IpAddr>,
+    policy: Option<corerouter_hal::route_get::PolicyQuery>,
+) -> RouteQuery {
     RouteQuery {
         dst,
         table: l.table_id,
         src,
+        policy,
     }
+}
+
+/// What the walk of the rules looks at besides the addresses.
+#[derive(Debug, Clone, Default)]
+pub struct Flow<'a> {
+    pub iif: Option<&'a IfName>,
+    pub mark: u32,
+}
+
+/// One rule the packet matched, for the answer's `trace`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TraceStep {
+    pub priority: u32,
+    /// The id of the routing rule; `None`: not one of `/routing rule`.
+    pub rule: Option<ItemId>,
+    pub what: String,
+    /// `route found`, `no route: next`, `dropped`, `unreachable`.
+    pub result: &'static str,
+}
+
+/// The kernel table id of the VRF a packet is in: its incoming interface's,
+/// else its source's (an address of this router).
+pub fn vrf_of(cfg: &Config, iif: Option<&IfName>, src: Option<IpAddr>) -> Option<u32> {
+    let holder = iif.or_else(|| {
+        let src = src?;
+        cfg.ip
+            .addresses
+            .iter()
+            .find(|a| a.address.addr() == src)
+            .map(|a| &a.interface)
+    })?;
+    let table = table_of(cfg, holder);
+    if route::is_vrf_table(cfg, &table) {
+        route::table_id(cfg, &table)
+    } else {
+        None
+    }
+}
+
+/// [`lookup`] with the table chosen the kernel's way: rule 0 (`local`), then
+/// the rule list. The second value says which rules the packet matched.
+pub fn lookup_by_rules(
+    cfg: &Config,
+    lines: &[Line],
+    dst: IpAddr,
+    src: Option<IpAddr>,
+    flow: &Flow<'_>,
+) -> (Lookup, Vec<TraceStep>) {
+    let vrf = vrf_of(cfg, flow.iif, src);
+    let tables = route::tables_by_id(cfg);
+    let start = vrf
+        .and_then(|t| tables.get(&t).cloned())
+        .unwrap_or(RoutingTable::Main);
+    // Rule 0: the router's own addresses (in a VRF, its table holds them).
+    let own = lookup(cfg, lines, dst, start.clone(), String::new(), src);
+    if own.kind == RouteKind::Local {
+        let local = TraceStep {
+            priority: 0,
+            rule: None,
+            what: "local table".to_owned(),
+            result: "route found",
+        };
+        return (own, vec![local]);
+    }
+    let packet = RulePacket {
+        src,
+        dst,
+        iif: flow.iif,
+        mark: flow.mark,
+        vrf,
+    };
+    let rules = expected_rules(cfg);
+    let walked = walk(&rules, &packet, |id, suppress| {
+        let Some(t) = tables.get(&id) else {
+            return false;
+        };
+        let found = lookup(cfg, lines, dst, t.clone(), String::new(), src);
+        found.kind != RouteKind::Unreachable
+            && suppress.is_none_or(|s| found.prefix.is_some_and(|p| p.prefix_len() > s))
+    });
+    let trace: Vec<TraceStep> = walked
+        .steps
+        .iter()
+        .map(|st| {
+            let (rule, mut what) = describe_pref(cfg, st.pref);
+            if st.pref == L3MDEV_PREF {
+                what = format!("the table of VRF '{start}'");
+            }
+            let result = match (st.action, st.decided) {
+                (KernelRuleAction::Table(_), true) => "route found",
+                (KernelRuleAction::Table(_), false) => "no route: next",
+                (KernelRuleAction::Blackhole, _) => "dropped",
+                (KernelRuleAction::Unreachable | KernelRuleAction::Other(_), _) => "unreachable",
+            };
+            TraceStep {
+                priority: st.pref,
+                rule,
+                what,
+                result,
+            }
+        })
+        .collect();
+    let why = trace
+        .last()
+        .map_or_else(String::new, |t| t.what.clone());
+    let found = match walked.verdict {
+        RuleVerdict::Table(id) => {
+            let table = tables.get(&id).cloned().unwrap_or(RoutingTable::Main);
+            lookup(cfg, lines, dst, table, why, src)
+        }
+        verdict => {
+            let kind = if verdict == RuleVerdict::Blackhole {
+                RouteKind::Blackhole
+            } else {
+                RouteKind::Unreachable
+            };
+            Lookup {
+                table: start,
+                table_id: vrf.unwrap_or(route::MAIN_TABLE_ID),
+                rule: why,
+                kind,
+                route: None,
+                prefix: None,
+                hops: Vec::new(),
+                src: None,
+            }
+        }
+    };
+    (found, trace)
 }

@@ -175,6 +175,20 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
             routes.join(", ")
         ));
     }
+    let rules: Vec<String> = cfg
+        .routing
+        .rules
+        .iter()
+        .filter(|r| r.action.looks_up() && r.table == table)
+        .take(8)
+        .map(|r| r.id.to_string())
+        .collect();
+    if !rules.is_empty() {
+        blockers.push(format!(
+            "routing rule {} looks in its table (routing.rule.remove)",
+            rules.join(", ")
+        ));
+    }
     let addrs: Vec<String> = cfg
         .ip
         .addresses
