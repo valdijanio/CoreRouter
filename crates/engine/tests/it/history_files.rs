@@ -471,6 +471,8 @@ struct Flaky {
     fail: Arc<Mutex<Option<&'static str>>>,
     dead: Arc<Mutex<bool>>,
     quota: Arc<Mutex<Option<usize>>>,
+    /// A disk that fails every write but is not full (bad flash).
+    broken: Arc<Mutex<bool>>,
 }
 
 impl Flaky {
@@ -493,6 +495,9 @@ impl Flaky {
         Ok(())
     }
     fn fits(&self, len: usize) -> Result<(), StorageError> {
+        if *self.broken.lock().unwrap() {
+            return Err(StorageError("Input/output error (os error 5)".into()));
+        }
         match *self.quota.lock().unwrap() {
             Some(q) if self.inner.revision_bytes() + len > q => {
                 Err(StorageError("no space left on device".into()))
@@ -629,6 +634,30 @@ fn a_full_disk_costs_old_revisions_not_the_running_config() {
     s.execute("config.rollback", &json!({"revision": active - 1}))
         .unwrap();
     assert_eq!(s.store().running().system.identity, "r29");
+}
+
+/// G1.6w: only a full disk costs revisions. A disk that fails for another
+/// reason gets the error reported, and deleting would free nothing useful.
+#[test]
+fn an_error_that_is_not_a_full_disk_costs_no_revisions() {
+    let storage = Flaky::default();
+    let mut s = Session::with_storage(Box::new(VirtualHal::default()), Box::new(storage.clone()));
+    for i in 0..30 {
+        rename(&mut s, &format!("r{i}"));
+    }
+    let files = storage.inner.clone().list_revisions().unwrap().len();
+    *storage.broken.lock().unwrap() = true;
+    rename(&mut s, "in flight");
+    assert!(s.storage_status().last_error.is_some());
+    assert_eq!(storage.inner.clone().list_revisions().unwrap().len(), files);
+    // The disk comes back: nothing was lost.
+    *storage.broken.lock().unwrap() = false;
+    rename(&mut s, "after");
+    assert!(s.storage_status().last_error.is_none());
+    let all = numbers(&s);
+    drop(s);
+    let s = Session::with_storage(Box::new(VirtualHal::default()), Box::new(storage.clone()));
+    assert_eq!(numbers(&s), all);
 }
 
 #[test]
