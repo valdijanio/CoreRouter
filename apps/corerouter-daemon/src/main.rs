@@ -70,8 +70,9 @@
 //! here, no async runtime, and the same path on unix and Windows.
 //!
 //! NTP and remote syslog (G4.6): the SNTP client of `system.ntp.client.set`
-//! measures the clock offset (it does not set the clock yet) and reports
-//! to `system.ntp.client.get`; `system.logging.*` rules send config changes,
+//! measures the clock offset, disciplines the system clock on the linux
+//! backend (G4.6b, docs/ntp.md) and reports to `system.ntp.client.get`;
+//! `system.logging.*` rules send config changes,
 //! failed commands and NTP state changes to remote syslog collectors (RFC
 //! 5424 over UDP). Both run with either backend: they are this process
 //! talking to the network, like the control channel.

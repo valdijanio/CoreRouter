@@ -19,7 +19,7 @@
 
 use std::collections::BTreeMap;
 
-use corerouter_model::ntp::{NtpState, NtpStatus};
+use corerouter_model::ntp::NtpState;
 use corerouter_model::routing_state::{BgpSession, RoutingStatus};
 use corerouter_model::service::{ServiceState, ServiceTable};
 use serde::Serialize;
@@ -837,7 +837,7 @@ impl Session {
         let ntp = &self.store().running().system.ntp_client;
         let enabled = ntp.enabled;
         i.ntp_needed = self.store().running().radius.servers.iter().any(|r| !r.service.is_empty());
-        i.ntp = Some((enabled, self.ext::<NtpStatus>().map(|s| s.status).unwrap_or_default()));
+        i.ntp = Some((enabled, self.ntp_status().status));
         i.sockbuf = self
             .ext::<SocketBuffers>()
             .filter(|b| !b.sockets.is_empty())

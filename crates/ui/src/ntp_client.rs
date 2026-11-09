@@ -1,18 +1,22 @@
 //! The System › NTP Client window (G4.6e), WinBox `/system ntp client`
-//! style: one settings form (Enabled, Servers, poll interval) with Apply,
-//! and under it the client's status, refreshed live: state, synced server
-//! and stratum, offset, round trip, last sync and the last error.
+//! style: one settings form (Enabled, Servers, poll interval, VRF, Set System
+//! Clock) with Apply, and under it the client's status, refreshed live: state,
+//! synced server and stratum, offset, round trip, what is being done to the
+//! clock (G4.6b), last sync and the last error. A step above 1000 s shows a
+//! banner with the button that confirms it.
 //!
 //! The engine validates (`system.ntp.client.set`) and keeps the status
 //! (`system.ntp.client.get`); the window only shows and sends.
 //!
 //! A panel (`panel.rs`): its state lives here, not in `CoreRouterUi`.
 
-use egui::{Grid, TextEdit, Ui};
+use egui::{Grid, Id, TextEdit, Ui};
 use serde_json::{Map, Value, json};
 
 use crate::backend::RequestId;
 use crate::dhcp_client::{flag, text};
+use crate::help::{self, HelpView};
+use crate::i18n::{Lang, tr_in};
 use crate::panel::{Panel, PanelState, PanelThen, Query, WinDef};
 use crate::table::action;
 use crate::{CoreRouterUi, Win, form_number};
@@ -22,6 +26,8 @@ const NAME: &str = "ntp-client";
 pub(crate) const WIN: &str = "ntp-client";
 const SET: &str = "system.ntp.client.set";
 const GET: &str = "system.ntp.client.get";
+const CONFIRM: &str = "system.ntp.client.confirm-step";
+const SCOPE: &str = "ntp";
 
 pub(crate) const PANEL: Panel = Panel {
     name: NAME,
@@ -29,7 +35,7 @@ pub(crate) const PANEL: Panel = Panel {
         id: WIN,
         group: "System",
         title: "NTP Client",
-        size: [460.0, 420.0],
+        size: [500.0, 600.0],
         escape: false,
     }],
     new: || Box::new(NtpPanel::default()),
@@ -47,6 +53,8 @@ pub(crate) struct NtpPanel {
     waiting: usize,
     /// The engine's refusal of the last Apply, shown under the form.
     pub(crate) error: Option<String>,
+    /// The ⓘ modal.
+    help: Option<HelpView>,
 }
 
 /// The editable settings, as typed.
@@ -57,6 +65,8 @@ pub(crate) struct NtpForm {
     pub servers: String,
     pub min_poll: String,
     pub max_poll: String,
+    pub vrf: String,
+    pub set_system_clock: bool,
 }
 
 impl NtpForm {
@@ -76,6 +86,8 @@ impl NtpForm {
             servers,
             min_poll: text(v, "min_poll"),
             max_poll: text(v, "max_poll"),
+            vrf: text(v, "vrf"),
+            set_system_clock: flag(v, "set_system_clock"),
         }
     }
 
@@ -104,6 +116,12 @@ impl NtpForm {
             if now.trim() != was.trim() {
                 p.insert(k.into(), form_number(now));
             }
+        }
+        if self.vrf.trim() != base.vrf.trim() {
+            p.insert("vrf".into(), json!(self.vrf.trim()));
+        }
+        if self.set_system_clock != base.set_system_clock {
+            p.insert("set_system_clock".into(), json!(self.set_system_clock));
         }
         (!p.is_empty()).then_some(Value::Object(p))
     }
@@ -142,6 +160,10 @@ impl PanelState for NtpPanel {
         self.draw(app, ui);
     }
 
+    fn dialogs(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, _area: egui::Rect) {
+        help::modal(ctx, app.lang, &mut self.help);
+    }
+
     fn reply(&mut self, app: &mut CoreRouterUi, then: PanelThen, result: &Result<Value, String>) {
         let Ok(r) = then.downcast::<Reply>() else {
             return;
@@ -158,21 +180,30 @@ impl PanelState for NtpPanel {
     }
 }
 
+/// A label with its ⓘ; the explanation key is `ntp.<key>`.
+fn label(ui: &mut Ui, help: &mut Option<HelpView>, l: Lang, key: &str, text: &'static str) {
+    ui.horizontal(|ui| {
+        ui.label(tr_in(SCOPE, l, text));
+        if help::info_button(ui, Id::unique(("ntp-help", key)), tr_in(SCOPE, l, text)).clicked() {
+            *help = Some(HelpView::new(format!("ntp.{key}"), tr_in(SCOPE, l, text)));
+        }
+    });
+}
+
 impl NtpPanel {
     fn draw(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
         let can = app.can();
+        let l = app.lang.labels;
         let dirty = self.form.set_params(&self.base).is_some();
+        let help = &mut self.help;
         Grid::new("ntp-settings")
             .num_columns(2)
             .spacing([12.0, 6.0])
             .show(ui, |ui| {
-                ui.label("Enabled");
+                label(ui, help, l, "enabled", "Enabled");
                 ui.checkbox(&mut self.form.enabled, "");
                 ui.end_row();
-                ui.label("Servers").on_hover_text(
-                    "One per line: an IP address or a DNS name (pool.ntp.org). \
-                     The client asks them all and keeps the best answer.",
-                );
+                label(ui, help, l, "servers", "Servers");
                 ui.add(
                     TextEdit::multiline(&mut self.form.servers)
                         .hint_text("pool.ntp.org")
@@ -180,37 +211,41 @@ impl NtpPanel {
                         .desired_width(220.0),
                 );
                 ui.end_row();
-                ui.label("Min Poll").on_hover_text(
-                    "Poll interval as a power of two in seconds: 6 = 64 s, 10 = 17 min",
-                );
+                label(ui, help, l, "min_poll", "Min Poll");
                 ui.add(TextEdit::singleline(&mut self.form.min_poll).desired_width(60.0));
                 ui.end_row();
-                ui.label("Max Poll");
+                label(ui, help, l, "max_poll", "Max Poll");
                 ui.add(TextEdit::singleline(&mut self.form.max_poll).desired_width(60.0));
+                ui.end_row();
+                label(ui, help, l, "vrf", "VRF");
+                ui.add(TextEdit::singleline(&mut self.form.vrf).desired_width(120.0));
+                ui.end_row();
+                label(ui, help, l, "set_system_clock", "Set System Clock");
+                ui.checkbox(&mut self.form.set_system_clock, "");
                 ui.end_row();
             });
         let mut apply = false;
         let mut reset = false;
         ui.horizontal(|ui| {
             let ok = if self.waiting > 0 {
-                Err("Saving…".to_owned())
+                Err(tr_in(SCOPE, l, "Saving…").to_owned())
             } else if !dirty {
-                Err("Nothing changed".to_owned())
+                Err(tr_in(SCOPE, l, "Nothing changed").to_owned())
             } else {
                 can.check(SET)
             };
-            apply = action(ui, "Apply", ok);
+            apply = action(ui, tr_in(SCOPE, l, "Apply"), ok);
             reset = action(
                 ui,
-                "Revert",
+                tr_in(SCOPE, l, "Revert"),
                 if dirty {
                     Ok(())
                 } else {
-                    Err("Nothing changed".into())
+                    Err(tr_in(SCOPE, l, "Nothing changed").to_owned())
                 },
             );
             if dirty {
-                ui.weak(format!("{} not applied", crate::dialog::UNSAVED));
+                ui.weak(format!("{} {}", crate::dialog::UNSAVED, tr_in(SCOPE, l, "not applied")));
             }
         });
         if let Some(e) = &self.error {
@@ -225,22 +260,37 @@ impl NtpPanel {
             self.error = None;
         }
         ui.separator();
-        ui.strong("Status");
-        match &self.state {
-            Some(s) => status(ui, s),
-            None => {
-                ui.weak("waiting for the router…");
+        ui.strong(tr_in(SCOPE, l, "Status"));
+        let Some(s) = self.state.clone() else {
+            ui.weak(tr_in(SCOPE, l, "waiting for the router…"));
+            return;
+        };
+        if let Some(pending) = s.get("pending_step_ms").and_then(Value::as_f64) {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!(
+                    "{}: {:+.0} s",
+                    tr_in(SCOPE, l, "The clock needs a jump above 1000 s"),
+                    pending / 1000.0
+                ),
+            );
+            if action(ui, tr_in(SCOPE, l, "Confirm Clock Step"), can.check(CONFIRM)) {
+                app.run(CONFIRM, json!({}));
             }
         }
+        status(ui, &s, &mut self.help, l);
     }
 }
 
-fn status(ui: &mut Ui, s: &Value) {
+fn status(ui: &mut Ui, s: &Value, help: &mut Option<HelpView>, l: Lang) {
     let state = text(s, "status");
     // A state is a chip in the theme's tones (docs/ui-style.md).
-    let tone = match state.as_str() {
-        "synchronized" => Some(crate::chip::GREEN.tone(ui.visuals())),
-        "waiting" => Some(crate::chip::AMBER.tone(ui.visuals())),
+    let tone = |ui: &Ui, name: &str| match name {
+        "synchronized" | "slewing" | "stepped" => Some(crate::chip::GREEN.tone(ui.visuals())),
+        "waiting" | "holding-spike" | "awaiting-confirmation" | "using-local-clock" => {
+            Some(crate::chip::AMBER.tone(ui.visuals()))
+        }
+        "refused" => Some(crate::chip::RED.tone(ui.visuals())),
         _ => None,
     };
     let ms = |k: &str| {
@@ -253,10 +303,17 @@ fn status(ui: &mut Ui, s: &Value) {
         .num_columns(2)
         .spacing([12.0, 4.0])
         .show(ui, |ui| {
-            ui.label("Status");
-            match tone {
+            label(ui, help, l, "status", "Status");
+            match tone(ui, &state) {
                 Some(t) => crate::chip::chip(ui, &state, t),
                 None => ui.label(&state),
+            };
+            ui.end_row();
+            let clock = text(s, "clock");
+            label(ui, help, l, "clock", "System Clock");
+            match tone(ui, &clock) {
+                Some(t) => crate::chip::chip(ui, &clock, t),
+                None => ui.label(&clock),
             };
             ui.end_row();
             let server = match (text(s, "synced_server"), text(s, "synced_address")) {
@@ -273,28 +330,48 @@ fn status(ui: &mut Ui, s: &Value) {
                 .and_then(Value::as_u64)
                 .map(utc)
                 .unwrap_or_default();
-            for (label, value) in [
-                ("Synced Server", server),
-                ("Synced Stratum", text(s, "synced_stratum")),
-                ("System Offset", ms("system_offset_ms")),
-                ("Round Trip", ms("round_trip_ms")),
-                ("Last Sync", last),
-                ("Next Poll", poll),
-            ] {
-                ui.label(label);
+            let dynamic = s
+                .get("dynamic_servers")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "))
+                .unwrap_or_default();
+            let drift = s
+                .get("freq_drift_ppm")
+                .and_then(Value::as_f64)
+                .map(|v| format!("{v:+.3} ppm"))
+                .unwrap_or_default();
+            let rows: [(&str, &'static str, String); 8] = [
+                ("synced_server", "Synced Server", server),
+                ("synced_stratum", "Synced Stratum", text(s, "synced_stratum")),
+                ("system_offset", "System Offset", ms("system_offset_ms")),
+                ("round_trip", "Round Trip", ms("round_trip_ms")),
+                ("last_adjustment", "Last Adjustment", ms("last_adjustment_ms")),
+                ("freq_drift", "Frequency Drift", drift),
+                ("last_sync", "Last Sync", last),
+                ("next_poll", "Next Poll", poll),
+            ];
+            for (key, name, value) in rows {
+                label(ui, help, l, key, name);
                 ui.label(value);
                 ui.end_row();
             }
-            let err = text(s, "last_error");
-            if !err.is_empty() {
-                ui.label("Last Error");
-                ui.colored_label(ui.visuals().warn_fg_color, err);
+            if !dynamic.is_empty() {
+                label(ui, help, l, "dynamic_servers", "Dynamic Servers");
+                ui.label(dynamic);
                 ui.end_row();
             }
+            for (key, name, field) in [
+                ("clock_error", "Clock Error", "clock_error"),
+                ("last_error", "Last Error", "last_error"),
+            ] {
+                let err = text(s, field);
+                if !err.is_empty() {
+                    label(ui, help, l, key, name);
+                    ui.colored_label(ui.visuals().warn_fg_color, err);
+                    ui.end_row();
+                }
+            }
         });
-    if text(s, "status") == "synchronized" {
-        ui.weak("Measured only: the system clock is not set yet (G4.6b).");
-    }
 }
 
 /// Unix seconds as `2026-10-22 13:05:09 UTC` (proleptic Gregorian, the

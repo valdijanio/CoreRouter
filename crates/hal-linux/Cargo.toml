@@ -27,6 +27,9 @@ tokio = { version = "1.54.1", default-features = false, features = ["rt", "net"]
 socket2 = { version = "0.6.5", features = ["all"] }
 serde_json.workspace = true
 nix = { version = "0.30.1", default-features = false, features = ["socket", "net", "uio", "poll"] }
+# clock.rs (G4.6b): clock_adjtime (ADJ_FREQUENCY, ADJ_SETOFFSET), which std,
+# nix and rustix lack; `unsafe` stays in that crate (ntpd-rs and statime use it).
+clock-steering = "0.2.1"
 # Tools (icmp.rs): IP_MTU_DISCOVER / IPV6_MTU_DISCOVER, which socket2 and nix lack.
 rustix = { version = "1.1.5", default-features = false, features = ["std", "net", "time", "fs", "param", "process"] }
 # G1.19 (genl.rs): sync generic netlink socket for ethtool/devlink queries
