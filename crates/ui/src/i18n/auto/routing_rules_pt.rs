@@ -68,6 +68,8 @@ Menor roda primeiro. A regra 0 é a tabela `local`, as marcas do mangle 100 a 99
 A regra da aba Rules por trás desta linha."##),
     (r##"kernel.what"##, r##"## O que é
 O que a linha representa, em palavras."##),
+    (r##"menu.routing-rules"##, r##"## O que faz
+Roteamento por política: regras que escolhem a tabela de rotas pela origem, destino, interface de entrada ou marca de roteamento, as tabelas nomeadas para onde apontam e a lista inteira de regras do kernel."##),
     (r##"rules"##, r##"## O que é
 Uma regra de roteamento por política (`/routing rule` do RouterOS). As regras rodam de cima para baixo e a primeira que decide vence. Um pacote para um endereço deste roteador nunca chega a elas: a tabela `local` do kernel vem antes.
 

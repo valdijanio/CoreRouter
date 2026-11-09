@@ -19,6 +19,8 @@ Lower runs first. Rule 0 is the `local` table, the marks of the mangle 100 to 99
 The rule of the Rules tab behind this line."##),
     (r##"kernel.what"##, r##"## What it is
 What the line stands for, in words."##),
+    (r##"menu.routing-rules"##, r##"## What it does
+Policy routing: rules that choose the routing table by source, destination, incoming interface or routing mark, the named tables they point at, and the kernel's whole rule list."##),
     (r##"rules"##, r##"## What it is
 One policy routing rule (RouterOS `/routing rule`). Rules run top to bottom and the first one that decides wins. A packet to an address of this router never reaches them: the kernel's `local` table comes first.
 
