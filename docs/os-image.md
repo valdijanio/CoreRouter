@@ -15,6 +15,7 @@ cargo xtask os boot-test --append corerouter.shell=ttyS0 --timeout 600   # com s
 cargo xtask os ab-test               # G1.6b: os 4 cenários A/B no QEMU (UEFI, sem root)
 cargo xtask os install-test          # G1.6c: instalador (CD, USB, interativo), qcow2 e OVA no QEMU
 cargo xtask os install-test --firmware seabios   # G1.6g: o mesmo por BIOS, pelo GRUB
+cargo xtask os ab-test --firmware seabios        # G1.6g: o A/B por BIOS, cruzado, cortes e controladoras
 cargo xtask os frr-test              # G1.6k: dois roteadores da imagem com OSPF, SR, LDP e BFD entre eles
 cargo xtask os package --out b.crpkg --version 0.1.1 --build 1800000000  # outro pacote deste build
 cargo xtask os build --only crpkg    # G1.6e: só o pacote de atualização (sem disk.img, ISO, qcow2, OVA)
@@ -508,6 +509,9 @@ controle que o shell de manutenção usa) e cada reboot é um QEMU novo (`-no-re
 | `update` | A boota pela entrada com dm-verity; pacote B (mesma imagem, versão e build novos) conferido, gravado; boot de teste de B, confirmação automática, B padrão, A intacto; parâmetro de Tuning na linha de B e não na de A; segundo boot em B sem teste |
 | `no-confirm` | B com um daemon que nunca responde (squashfs refeito pelo teste): o init reinicia no prazo (30 s), o firmware boota A, a config volta, `failed` em B |
 | `bad-signature` | pacote assinado por uma chave gerada na hora e jogada fora: recusado; pacote da chave certa com um byte do payload trocado: recusado ("signed hashes"); B continua vazio, nenhum teste armado |
+| `cross` (G1.6g) | O mesmo disco: atualização confirmada na UEFI, boot na BIOS no mesmo slot, atualização confirmada na BIOS, volta à UEFI na NVRAM antiga com a entrada do outro slot regravada |
+| `cut` (G1.6g, só `--firmware seabios`) | QEMU morto no meio da atualização e nos instantes em que o GRUB apaga `next=`: o boot seguinte sobe num slot com dm-verity |
+| `controllers` (G1.6g, só `--firmware seabios`) | Disco atrás de `virtio-blk`, `virtio-scsi`, `lsi53c895a`, `pvscsi` e IDE, placa `pc` |
 | `bad-param` | `system.tuning.boot.apply` com `drill=true` (um `init=` que não existe, depois de `intel_idle.max_cstate=1`): o kernel de B entra em pânico, `panic=10`, o firmware boota A; a linha de A não mudou |
 
 ### Pesquisa
@@ -867,6 +871,32 @@ O mesmo disco boota pelos dois firmwares; nada do caminho UEFI muda.
   com a *boot info table*); como disco, o `boot.img` aponta para `BIOSUSB.IMG`. Os dois `core`
   usam só o parser de resgate do GRUB e não passam linha de comando: vale a embutida no kernel do
   instalador. Sem xorriso: `crates/sysupdate/src/iso.rs` faz tudo.
+- **A/B em BIOS.** As mesmas operações, a mesma ordem de passos e o mesmo estado do `ab.rs`, por
+  trás do `BootStore` (`Uefi(Vars)` ou `Bios(Grub)`):
+
+  | UEFI | BIOS | Como grava |
+  |---|---|---|
+  | `Boot####` | `a.cfg`, `b.cfg` | arquivo novo e `rename` |
+  | `BootOrder` | `primary=` | um bloco, no lugar |
+  | `BootNext` | `next=` (o `grub.cfg` apaga antes do kernel) | um bloco, no lugar |
+  | tirar o slot do `BootOrder` antes de escrever | apagar o `.cfg` dele (o GRUB cairia nele) | `unlink` |
+
+  O `system.package.print` diz `firmware` (`uefi` ou `bios`) e `boot_entry` é o `.cfg`.
+- **Sem `next=` gravável, sem teste.** Se o `save_env` falha, o GRUB boota o `primary=` e o init vê
+  `next=` ainda lá: `failed`, "this box cannot run a trial boot". Nunca um laço de pânico.
+- **Pânico não é "kernel não carregou".** O GRUB cai no outro slot só se o `linux` falha (`.cfg` ou
+  kernel faltando). Um kernel que entra em pânico reinicia (`panic=10`) e o `next=` já se foi: é
+  isso que devolve um teste ruim ao slot anterior, como o `BootNext`.
+- **Disco que troca de firmware.** Com a pasta `corerouter/` na ESP, a atualização por UEFI também
+  mantém os `.cfg` e o `primary=` certos (sem o parâmetro do `drill`): senão, levado a uma BIOS, o
+  disco bootaria um hash de verity que já não existe. A volta tem dois casos:
+  - NVRAM antiga: vale a última ordem daquele firmware, e o `provision` regrava a entrada cujo hash
+    não bate mais. Antes disso, a entrada de um slot atualizado na BIOS está velha: se a ordem
+    apontar para ela, é pânico e reinício até trocar a ordem no firmware (só quem leva o mesmo disco
+    de volta à mesma máquina, com o slot primário atualizado no meio do caminho);
+  - NVRAM vazia: o caminho removível, que é o slot A com a linha embutida (o que a UEFI já fazia), e o
+    `provision` faz do slot A o padrão, mesmo que a BIOS estivesse no B. Os parâmetros do instalador
+    (`corerouter.mgmt=`, `console=`) ficam só no `a.cfg`.
 - **Dois slots quebrados** param no prompt do GRUB, na tela e na serial.
 - **Sem serial** o GRUB segue só na tela (`if serial`).
 - **Controladoras.** O kernel ganhou `SYM53C8XX_2` (LSI, padrão do Proxmox), `MEGARAID_SAS`,
@@ -1082,7 +1112,8 @@ em 0,65 s contra 0,40 s, e o motivo da escolha: no `ONCE` do syslinux,
 `com32/elflink/ldlinux/ldlinux.c:312-337` ignora o retorno do `adv_write` e boota mesmo assim, o
 que num teste A/B vira laço de pânico; o `save_env` do GRUB
 (`grub-core/commands/loadenv.c:286-340`) confere os blocos e dá para decidir no script. Preço: o
-GRUB é GPL-3.0 (só na área de boot).
+GRUB é GPL-3.0 (só na área de boot). O A/B fica uma lógica só atrás do `BootStore`
+(`crates/sysupdate/src/ab.rs`): um firmware a mais, não um segundo atualizador.
 
 **OVA:** `qemu-img` (VMDK streamOptimized, o único que uma OVA pode levar) + OVF e tar escritos
 em Rust (`corerouter-image ova`), datas fixas. O OVA ainda não é reprodutível: o `qemu-img`

@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use corerouter_sysupdate::ab::{Boot, Opts, Platform};
+use corerouter_sysupdate::ab::{Boot, BootStore, Grub, Opts, Platform};
 use corerouter_sysupdate::package::{self, Blob, Key, Manifest, Rootfs};
 use corerouter_sysupdate::state::{Confirm, Reason, State};
 use corerouter_sysupdate::{SlotId, verity};
@@ -90,6 +90,17 @@ struct Lab {
 }
 
 fn lab(name: &str) -> Lab {
+    make(name, Platform::lab)
+}
+
+/// The same box, booted by BIOS through GRUB's files (G1.6g).
+fn lab_bios(name: &str) -> Lab {
+    make(&format!("{name}-bios"), Platform::lab_bios)
+}
+
+type NewPlatform = fn(&Path, &Path, Vec<Key>, u64) -> Result<Platform, String>;
+
+fn make(name: &str, new: NewPlatform) -> Lab {
     let dir = tmp(name);
     let key = package::generate_key().unwrap();
     let keys = vec![Key::from_hex(&package::public_hex(&key).unwrap()).unwrap()];
@@ -100,7 +111,7 @@ fn lab(name: &str) -> Lab {
         r#"{"format_version":1,"v":"a"}"#,
     )
     .unwrap();
-    let mut p = Platform::lab(&dir.join("box"), &config, keys, 4 << 20).unwrap();
+    let mut p = new(&dir.join("box"), &config, keys, 4 << 20).unwrap();
     // The factory image in slot A, booted by the fallback path (built-in
     // command line), then the first boot provisions the entries.
     assert!(p.lab_seed("1.0", 10).unwrap());
@@ -135,7 +146,15 @@ fn st(p: &Platform) -> State {
 
 #[test]
 fn update_confirm_and_status() {
-    let mut l = lab("ok");
+    update_confirm_and_status_on(lab("ok"));
+}
+
+#[test]
+fn bios_update_confirm_and_status() {
+    update_confirm_and_status_on(lab_bios("ok"));
+}
+
+fn update_confirm_and_status_on(mut l: Lab) {
     let b = package(&l.dir, &l.key, "1.1", 20, 2, 1);
     let mut last = (0, 0);
     let rep =
@@ -194,7 +213,15 @@ fn update_confirm_and_status() {
 
 #[test]
 fn unconfirmed_trial_rolls_back_with_the_configuration() {
-    let mut l = lab("rollback");
+    unconfirmed_trial_rolls_back_with_the_configuration_on(lab("rollback"));
+}
+
+#[test]
+fn bios_unconfirmed_trial_rolls_back_with_the_configuration() {
+    unconfirmed_trial_rolls_back_with_the_configuration_on(lab_bios("rollback"));
+}
+
+fn unconfirmed_trial_rolls_back_with_the_configuration_on(mut l: Lab) {
     let b = package(&l.dir, &l.key, "1.1", 20, 2, 1);
     l.p.install(&b, false, &opts(Reason::Update), &mut |_, _| {})
         .unwrap();
@@ -253,7 +280,15 @@ fn bad_packages_are_refused_before_anything_changes() {
 
 #[test]
 fn boot_parameter_that_does_not_boot_falls_back() {
-    let mut l = lab("drill");
+    boot_parameter_that_does_not_boot_falls_back_on(lab("drill"));
+}
+
+#[test]
+fn bios_boot_parameter_that_does_not_boot_falls_back() {
+    boot_parameter_that_does_not_boot_falls_back_on(lab_bios("drill"));
+}
+
+fn boot_parameter_that_does_not_boot_falls_back_on(mut l: Lab) {
     let mut o = opts(Reason::BootParams);
     o.tuning = vec![("isolcpus".into(), "1".into())];
     o.drill = true;
@@ -292,7 +327,15 @@ fn boot_parameter_that_does_not_boot_falls_back() {
 
 #[test]
 fn downgrade_back_to_the_previous_slot_takes_its_configuration() {
-    let mut l = lab("down");
+    downgrade_back_to_the_previous_slot_takes_its_configuration_on(lab("down"));
+}
+
+#[test]
+fn bios_downgrade_back_to_the_previous_slot_takes_its_configuration() {
+    downgrade_back_to_the_previous_slot_takes_its_configuration_on(lab_bios("down"));
+}
+
+fn downgrade_back_to_the_previous_slot_takes_its_configuration_on(mut l: Lab) {
     let b = package(&l.dir, &l.key, "2.0", 20, 2, 2);
     l.p.install(&b, false, &opts(Reason::Update), &mut |_, _| {})
         .unwrap();
@@ -401,5 +444,177 @@ fn streamed_install_and_its_failures() {
         (c["version"].as_str(), c["intact"].as_bool()),
         (Some("1.1"), Some(true))
     );
+    let _ = std::fs::remove_dir_all(&l.dir);
+}
+
+// G1.6g: what only GRUB's files do.
+
+fn grub(l: &Lab) -> PathBuf {
+    l.dir.join("box/esp/corerouter")
+}
+
+#[test]
+fn bios_status_says_bios_and_names_the_cfg() {
+    let l = lab_bios("fw");
+    let s = l.p.status(&st(&l.p));
+    assert_eq!(s["firmware"], "bios");
+    assert_eq!(s["primary"], "a");
+    assert_eq!(s["slots"][0]["boot_entry"], "corerouter/a.cfg");
+    assert!(s["slots"][1]["boot_entry"].is_null());
+    let c = s["slots"][0]["cmdline"].as_str().unwrap();
+    assert!(
+        c.contains("dm-mod.create=\"") && c.ends_with("panic=10"),
+        "{c}"
+    );
+    assert_eq!(lab("fw").p.status(&State::default())["firmware"], "uefi");
+}
+
+/// A value GRUB would read as script never reaches a `.cfg`, and the box stays
+/// as it was. (Whitespace is the engine's to refuse: here it is one more word,
+/// inside its own quotes, `biosboot::hostile_parameters_stay_data`.)
+#[test]
+fn bios_hostile_boot_parameter_is_refused() {
+    let l = lab_bios("hostile");
+    let before = std::fs::read(grub(&l).join("a.cfg")).unwrap();
+    for bad in ["1' ; reboot ; '", "1\\", "1\"x"] {
+        let mut o = opts(Reason::BootParams);
+        o.tuning = vec![("isolcpus".into(), bad.into())];
+        let err = l.p.clone_running(&o, &mut |_, _| {});
+        assert!(err.is_err(), "{bad:?} went through");
+        assert!(!grub(&l).join("b.cfg").exists(), "{bad:?}");
+        assert!(l.p.status(&st(&l.p))["slots"][1]["next"] == false);
+    }
+    assert_eq!(std::fs::read(grub(&l).join("a.cfg")).unwrap(), before);
+    let _ = std::fs::remove_dir_all(&l.dir);
+}
+
+/// A block GRUB cannot rewrite: it boots the primary and the next boot's
+/// init sees `next=` still there.
+#[test]
+fn bios_grubenv_that_cannot_be_written_means_no_trial() {
+    let mut l = lab_bios("readonly");
+    let b = package(&l.dir, &l.key, "1.1", 20, 2, 1);
+    l.p.install(&b, false, &opts(Reason::Update), &mut |_, _| {})
+        .unwrap();
+    std::fs::write(l.dir.join("box/lab-grubenv-readonly"), "").unwrap();
+    let (boot, log) = l.p.lab_reboot().unwrap();
+    assert_eq!(l.p.running(), Some(SlotId::A), "{log:?}");
+    assert_eq!(boot, Boot::Normal, "{log:?}");
+    let last = l.p.status(&st(&l.p));
+    let detail = last["last"]["detail"].as_str().unwrap();
+    assert!(detail.contains("cannot run a trial boot"), "{detail}");
+    assert!(l.p.status(&st(&l.p))["slots"][1]["next"] == false);
+    let _ = std::fs::remove_dir_all(&l.dir);
+}
+
+/// Each point of a power cut: the old block, the new block or garbage where
+/// the block was; the box boots something and goes back to one primary.
+#[test]
+fn bios_power_cut_around_grubenv() {
+    let mut l = lab_bios("cut");
+    let b = package(&l.dir, &l.key, "1.1", 20, 2, 1);
+    l.p.install(&b, false, &opts(Reason::Update), &mut |_, _| {})
+        .unwrap();
+    let env = grub(&l).join("grubenv");
+    // Before the `next=` block: the old one, no trial.
+    std::fs::write(
+        &env,
+        corerouter_sysupdate::biosboot::grubenv(SlotId::A, None),
+    )
+    .unwrap();
+    let (_, log) = l.p.lab_reboot().unwrap();
+    assert_eq!(l.p.running(), Some(SlotId::A), "{log:?}");
+    // A block that is not one: slot A by default, and repaired.
+    std::fs::write(&env, [0xFF; 512]).unwrap();
+    let (_, log) = l.p.lab_reboot().unwrap();
+    assert_eq!(l.p.running(), Some(SlotId::A), "{log:?}");
+    assert_eq!(l.p.status(&st(&l.p))["primary"], serde_json::Value::Null);
+    l.p.provision(&[]).unwrap();
+    assert_eq!(l.p.status(&st(&l.p))["primary"], "a");
+    let _ = std::fs::remove_dir_all(&l.dir);
+}
+
+#[test]
+fn bios_primary_without_kernel_or_cfg_falls_to_the_other_slot() {
+    let mut l = lab_bios("fall");
+    let b = package(&l.dir, &l.key, "1.1", 20, 2, 1);
+    l.p.install(&b, false, &opts(Reason::Update), &mut |_, _| {})
+        .unwrap();
+    l.p.lab_reboot().unwrap();
+    l.p.confirm(200, "healthy").unwrap();
+    assert_eq!(l.p.status(&st(&l.p))["primary"], "b");
+    std::fs::remove_file(grub(&l).join("b.cfg")).unwrap();
+    let (_, log) = l.p.lab_reboot().unwrap();
+    assert_eq!(l.p.running(), Some(SlotId::A), "{log:?}");
+    let _ = std::fs::remove_dir_all(&l.dir);
+}
+
+/// Updated under UEFI, the disk keeps GRUB's files true: the disk moved to a
+/// BIOS boots the new image and not a verity hash that is gone.
+#[test]
+fn uefi_update_keeps_grub_files_for_a_move_to_bios() {
+    let mut l = lab("mirror");
+    let g = grub(&l);
+    std::fs::create_dir_all(&g).unwrap();
+    std::fs::write(g.join("grub.cfg"), corerouter_sysupdate::biosboot::GRUB_CFG).unwrap();
+    let b = package(&l.dir, &l.key, "1.1", 20, 2, 1);
+    let rep =
+        l.p.install(&b, false, &opts(Reason::Update), &mut |_, _| {})
+            .unwrap();
+    l.p.lab_reboot().unwrap();
+    l.p.confirm(200, "healthy").unwrap();
+    assert_eq!(l.p.status(&st(&l.p))["primary"], "b");
+    let env = std::fs::read(g.join("grubenv")).unwrap();
+    assert_eq!(
+        corerouter_sysupdate::biosboot::parse_env(&env),
+        Some((Some(SlotId::B), None))
+    );
+    let cfg = std::fs::read(g.join("b.cfg")).unwrap();
+    assert_eq!(
+        corerouter_sysupdate::biosboot::slot_cmdline(&cfg).as_deref(),
+        Some(rep.cmdline.as_str())
+    );
+    let _ = std::fs::remove_dir_all(&l.dir);
+}
+
+/// Updated on one firmware, then the other, and back to the first one's
+/// NVRAM: the entry of the slot that moved is rewritten.
+#[test]
+fn entry_written_under_the_other_firmware_is_refreshed() {
+    let mut l = lab("moved");
+    let g = grub(&l);
+    std::fs::create_dir_all(&g).unwrap();
+    std::fs::write(g.join("grub.cfg"), corerouter_sysupdate::biosboot::GRUB_CFG).unwrap();
+    let uefi = l.p.boot.clone();
+    let b = package(&l.dir, &l.key, "1.1", 20, 2, 1);
+    l.p.install(&b, false, &opts(Reason::Update), &mut |_, _| {})
+        .unwrap();
+    l.p.lab_reboot().unwrap();
+    l.p.confirm(200, "healthy").unwrap();
+    // To a BIOS: the trial goes to slot A, whose Boot#### does not change.
+    l.p.boot = BootStore::Bios(Grub {
+        esp_dir: l.dir.join("box/esp"),
+        remount: false,
+    });
+    let (_, log) = l.p.lab_reboot().unwrap();
+    assert_eq!(l.p.running(), Some(SlotId::B), "{log:?}");
+    let c = package(&l.dir, &l.key, "1.2", 30, 3, 1);
+    let rep =
+        l.p.install(&c, false, &opts(Reason::Update), &mut |_, _| {})
+            .unwrap();
+    l.p.lab_reboot().unwrap();
+    l.p.confirm(200, "healthy").unwrap();
+    assert_eq!(l.p.running(), Some(SlotId::A));
+    let bios_line = rep.cmdline;
+    // Back on the old NVRAM: running slot B by its old order.
+    l.p.boot = uefi;
+    let (_, log) = l.p.lab_reboot().unwrap();
+    assert_eq!(l.p.running(), Some(SlotId::B), "{log:?}");
+    let before = l.p.status(&st(&l.p));
+    assert_ne!(before["slots"][0]["cmdline"], bios_line.as_str());
+    let wrote = l.p.provision(&["iommu", "isolcpus"]).unwrap();
+    assert!(wrote.iter().any(|x| x.contains("slot a")), "{wrote:?}");
+    let after = l.p.status(&st(&l.p));
+    assert_eq!(after["slots"][0]["cmdline"], bios_line.as_str());
     let _ = std::fs::remove_dir_all(&l.dir);
 }

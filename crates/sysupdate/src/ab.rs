@@ -13,6 +13,11 @@
 //!    the verity table and the tuning parameters);
 //! 4. the configuration is snapshotted and the trial recorded;
 //! 5. `BootNext` — from here the next boot is the trial, once.
+//!
+//! G1.6g: on a BIOS the same steps go through GRUB's files on the ESP
+//! ([`BootStore`]): `primary=` plays `BootOrder`, `next=` plays `BootNext`
+//! (GRUB erases it before loading the kernel), `a.cfg`/`b.cfg` play the
+//! `Boot####`. A trial or a confirmation is one block written in place.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -21,6 +26,7 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
+use crate::biosboot;
 use crate::efi::{LoadOption, Partition, Vars, boot_name};
 use crate::package::{self, Header, Key, Manifest};
 use crate::state::{self, Confirm, Outcome, Reason, State, Trial};
@@ -49,10 +55,184 @@ pub struct SlotDev {
     pub size: u64,
 }
 
+/// Where the image mounts its ESP.
+pub const ESP_MOUNT: &str = "/run/corerouter/esp";
+
+/// G1.6g: GRUB's files on an ESP.
+#[derive(Debug, Clone)]
+pub struct Grub {
+    pub esp_dir: PathBuf,
+    /// Mounted read-only: remounted read-write around a write.
+    pub remount: bool,
+}
+
+impl Grub {
+    fn file(&self, name: &str) -> PathBuf {
+        self.esp_dir.join(biosboot::DIR).join(name)
+    }
+
+    fn cfg_path(&self, s: SlotId) -> PathBuf {
+        self.file(&biosboot::cfg_name(s))
+    }
+
+    /// This disk has GRUB's files (one from before G1.6g does not).
+    pub fn present(&self) -> bool {
+        self.file(biosboot::CFG_FILE).exists()
+    }
+
+    fn env(&self) -> (Option<SlotId>, Option<SlotId>) {
+        std::fs::read(self.file(biosboot::ENV_FILE))
+            .ok()
+            .and_then(|e| biosboot::parse_env(&e))
+            .unwrap_or((None, None))
+    }
+
+    /// `grubenv`: in place, one block, so a power cut leaves the old or the
+    /// new one. (The file is rewritten only when it is not a block: GRUB's
+    /// `save_env` could not write to it either.)
+    fn set_env(&self, primary: SlotId, next: Option<SlotId>) -> Result<(), String> {
+        use std::io::Write;
+        let path = self.file(biosboot::ENV_FILE);
+        let data = biosboot::grubenv(primary, next);
+        let err = |e: std::io::Error| format!("{}: {e}", path.display());
+        esp_rw(&self.esp_dir, self.remount, || {
+            if std::fs::metadata(&path).map(|m| m.len()).ok() != Some(data.len() as u64) {
+                return state::write_atomic(&path, &data);
+            }
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .map_err(err)?;
+            // Opened at offset 0, without truncating: the same clusters.
+            f.write_all(&data).map_err(err)?;
+            f.sync_data().map_err(err)
+        })
+    }
+
+    fn cmdline(&self, s: SlotId) -> Option<String> {
+        biosboot::slot_cmdline(&std::fs::read(self.cfg_path(s)).ok()?)
+    }
+
+    fn write_cfg(&self, s: SlotId, cmdline: &str) -> Result<(), String> {
+        let cfg = biosboot::slot_cfg(s, cmdline)?;
+        esp_rw(&self.esp_dir, self.remount, || {
+            state::write_atomic(&self.cfg_path(s), &cfg)
+        })
+    }
+
+    fn remove_cfg(&self, s: SlotId) -> Result<(), String> {
+        if !self.cfg_path(s).exists() {
+            return Ok(());
+        }
+        esp_rw(&self.esp_dir, self.remount, || {
+            std::fs::remove_file(self.cfg_path(s))
+                .map_err(|e| format!("{}: {e}", self.cfg_path(s).display()))
+        })
+    }
+}
+
+/// G1.6g: who decides what boots.
+#[derive(Debug, Clone)]
+pub enum BootStore {
+    /// The firmware's boot manager, through its variables.
+    Uefi(Vars),
+    /// A BIOS: GRUB, through its files.
+    Bios(Grub),
+}
+
+impl BootStore {
+    /// The slot booted by default.
+    pub fn primary(&self) -> Option<SlotId> {
+        match self {
+            BootStore::Uefi(v) => primary(v),
+            BootStore::Bios(g) => g.env().0,
+        }
+    }
+
+    /// The slot of the next boot only, while that is still set.
+    pub fn next(&self) -> Option<SlotId> {
+        match self {
+            BootStore::Uefi(v) => {
+                let n = v.boot_next()?;
+                let e = entries(v);
+                SlotId::ALL
+                    .into_iter()
+                    .find(|s| e.get(idx(*s)).copied().flatten() == Some(n))
+            }
+            BootStore::Bios(g) => g.env().1,
+        }
+    }
+
+    fn clear_next(&self) {
+        match self {
+            BootStore::Uefi(v) => {
+                let _ = v.remove("BootNext");
+            }
+            BootStore::Bios(g) => {
+                let (prim, next) = g.env();
+                if next.is_some() {
+                    let _ = g.set_env(prim.unwrap_or(SlotId::A), None);
+                }
+            }
+        }
+    }
+
+    /// `system.package.print`'s `firmware`.
+    pub fn firmware(&self) -> &'static str {
+        match self {
+            BootStore::Uefi(_) => "uefi",
+            BootStore::Bios(_) => "bios",
+        }
+    }
+
+    fn cannot_trial(&self) -> &'static str {
+        match self {
+            BootStore::Uefi(_) => {
+                "the firmware did not boot BootNext: this box cannot run a trial boot"
+            }
+            BootStore::Bios(_) => {
+                "GRUB could not erase next= in grubenv: this box cannot run a trial boot"
+            }
+        }
+    }
+}
+
+/// Runs `f` with the ESP at `dir` writable.
+fn esp_rw<T>(
+    dir: &Path,
+    remount: bool,
+    f: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    #[cfg(target_os = "linux")]
+    if remount {
+        use rustix::mount::{MountFlags, mount_remount};
+        mount_remount(
+            dir,
+            MountFlags::NOEXEC | MountFlags::NOSUID | MountFlags::NODEV,
+            "",
+        )
+        .map_err(|e| format!("ESP: remount read-write: {e}"))?;
+        let out = f();
+        rustix::fs::sync();
+        let ro = mount_remount(
+            dir,
+            MountFlags::RDONLY | MountFlags::NOEXEC | MountFlags::NOSUID | MountFlags::NODEV,
+            "",
+        );
+        return match (out, ro) {
+            (Err(e), _) => Err(e),
+            (Ok(_), Err(e)) => Err(format!("ESP: remount read-only: {e}")),
+            (Ok(v), Ok(())) => Ok(v),
+        };
+    }
+    let _ = (dir, remount);
+    f()
+}
+
 /// Everything the operations touch.
 #[derive(Debug, Clone)]
 pub struct Platform {
-    pub vars: Vars,
+    pub boot: BootStore,
     /// Where the ESP is (mounted read-only on the router; remounted
     /// read-write around a write).
     pub esp_dir: PathBuf,
@@ -198,7 +378,7 @@ pub enum Boot {
 /// configuration it ran with. Returns what to do and lines for the console.
 pub fn at_boot(
     config: &Path,
-    vars: &Vars,
+    boot: &BootStore,
     cmdline: &str,
     partuuids: [&str; 2],
 ) -> (Boot, Vec<String>) {
@@ -209,15 +389,13 @@ pub fn at_boot(
         return (Boot::Normal, log);
     };
     let running = running_slot(cmdline, partuuids);
-    let prim = primary(vars);
-    let ents = entries(vars);
-    let trial_entry = ents.get(idx(t.slot)).copied().flatten();
-    let next = vars.boot_next();
+    let prim = boot.primary();
+    let next = boot.next();
     let now = now_unix();
     if running == Some(t.slot) && prim != Some(t.slot) {
-        if next.is_some() && next == trial_entry {
+        if next == Some(t.slot) {
             // A firmware that keeps BootNext would boot the trial forever.
-            let _ = vars.remove("BootNext");
+            boot.clear_next();
             log.push("BootNext was still set after the trial boot: removed".into());
         }
         if !t.booted {
@@ -265,9 +443,9 @@ pub fn at_boot(
             stats: t.stats.clone(),
         });
     } else {
-        let detail = if next.is_some() && next == trial_entry {
-            let _ = vars.remove("BootNext");
-            "the firmware did not boot BootNext: this box cannot run a trial boot".to_owned()
+        let detail = if next == Some(t.slot) {
+            boot.clear_next();
+            boot.cannot_trial().to_owned()
         } else if t.booted {
             format!(
                 "slot {} booted but was not confirmed within {} s",
@@ -367,43 +545,53 @@ impl Platform {
 
     /// Runs `f` with the ESP writable.
     fn esp_rw<T>(&self, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-        #[cfg(target_os = "linux")]
-        if self.esp_remount {
-            use rustix::mount::{MountFlags, mount_remount};
-            mount_remount(
-                &self.esp_dir,
-                MountFlags::NOEXEC | MountFlags::NOSUID | MountFlags::NODEV,
-                "",
-            )
-            .map_err(|e| format!("ESP: remount read-write: {e}"))?;
-            let out = f();
-            rustix::fs::sync();
-            let ro = mount_remount(
-                &self.esp_dir,
-                MountFlags::RDONLY | MountFlags::NOEXEC | MountFlags::NOSUID | MountFlags::NODEV,
-                "",
-            );
-            return match (out, ro) {
-                (Err(e), _) => Err(e),
-                (Ok(_), Err(e)) => Err(format!("ESP: remount read-only: {e}")),
-                (Ok(v), Ok(())) => Ok(v),
+        esp_rw(&self.esp_dir, self.esp_remount, f)
+    }
+
+    /// Booted by UEFI, a disk that has GRUB's files keeps them true: moved to
+    /// a BIOS, a slot's old `.cfg` would name a verity hash that is gone
+    /// (a panic at every boot). Best effort: it is not what boots this box.
+    fn mirror(&self, f: impl FnOnce(&Grub) -> Result<(), String>) {
+        if matches!(self.boot, BootStore::Uefi(_)) {
+            let g = Grub {
+                esp_dir: self.esp_dir.clone(),
+                remount: self.esp_remount,
             };
+            if g.present() {
+                let _ = f(&g);
+            }
         }
-        f()
+    }
+
+    /// The slot's boot entry, by name, and its command line.
+    fn entry_of(&self, s: SlotId) -> (Option<String>, Option<String>) {
+        match &self.boot {
+            BootStore::Uefi(v) => {
+                let n = entries(v).get(idx(s)).copied().flatten();
+                (
+                    n.map(boot_name),
+                    n.and_then(|n| v.load_option(n)).map(|o| o.cmdline),
+                )
+            }
+            BootStore::Bios(g) => (
+                g.cfg_path(s)
+                    .exists()
+                    .then(|| format!("{}/{}", biosboot::DIR, biosboot::cfg_name(s))),
+                g.cmdline(s),
+            ),
+        }
     }
 
     /// The status `system.package.print` shows.
     pub fn status(&self, st: &State) -> Value {
         let running = self.running();
-        let prim = primary(&self.vars);
-        let ents = entries(&self.vars);
-        let next_n = self.vars.boot_next();
+        let prim = self.boot.primary();
+        let next = self.boot.next();
         let slots: Vec<Value> = SlotId::ALL
             .into_iter()
             .map(|s| {
                 let dev = self.dev(s).ok();
-                let entry = ents.get(idx(s)).copied().flatten();
-                let opt = entry.and_then(|n| self.vars.load_option(n));
+                let (entry, cmdline) = self.entry_of(s);
                 let hdr = self.header(s);
                 let trial = st.trial.as_ref().is_some_and(|t| t.slot == s);
                 let failed = st.failed.get(&s).cloned();
@@ -425,7 +613,7 @@ impl Platform {
                     "detail": detail,
                     "running": running == Some(s),
                     "primary": prim == Some(s),
-                    "next": next_n.is_some() && next_n == entry,
+                    "next": next == Some(s),
                     "version": m.map(|m| m.version.clone()),
                     "build": m.map(|m| m.build),
                     "commit": m.map(|m| m.commit.clone()),
@@ -438,8 +626,8 @@ impl Platform {
                     "signed_by": hdr.as_ref().and_then(|(_, v)| v.as_ref().ok().cloned()),
                     "verified": hdr.as_ref().is_some_and(|(_, v)| v.is_ok()),
                     "verity": running == Some(s) && self.running_verified(),
-                    "boot_entry": entry.map(boot_name),
-                    "cmdline": opt.map(|o| o.cmdline),
+                    "boot_entry": entry,
+                    "cmdline": cmdline,
                 })
             })
             .collect();
@@ -466,6 +654,7 @@ impl Platform {
         let config_space = config_space(&self.config, usage);
         json!({
             "supported": true,
+            "firmware": self.boot.firmware(),
             "lab": self.lab.is_some(),
             "running": running.map(SlotId::as_str),
             "primary": prim.map(SlotId::as_str),
@@ -521,24 +710,32 @@ impl Platform {
             return Ok(log);
         };
         let (st, _) = State::load(&self.state_dir());
-        let mut ents = entries(&self.vars);
         for s in SlotId::ALL {
-            if ents.get(idx(s)).copied().flatten().is_some() {
-                continue;
-            }
             let Ok(h) = self.verified_header(s) else {
                 continue;
             };
-            let tuning = crate::tuning_of(&self.cmdline, tuning_keys);
-            let n = self.write_entry(s, &h.manifest, &tuning, false)?;
-            if let Some(e) = ents.get_mut(idx(s)) {
-                *e = Some(n);
+            let (entry, line) = self.entry_of(s);
+            let line = line.unwrap_or_default();
+            // G1.6g: the entry of an image written under the other firmware
+            // names a verity hash that is gone. And a slot's `.cfg` comes
+            // with the image, so what this boot carries may not be in it.
+            let stale = !line.contains(&h.manifest.rootfs.root_hash);
+            let lacks_carry = s == running
+                && matches!(self.boot, BootStore::Bios(_))
+                && crate::carried(&self.cmdline)
+                    .iter()
+                    .any(|w| !crate::cmdline_words(&line).contains(w));
+            if entry.is_some() && !stale && !lacks_carry {
+                continue;
             }
-            log.push(format!("created {} for slot {}", boot_name(n), s.as_str()));
+            let tuning = crate::tuning_of(&self.cmdline, tuning_keys);
+            self.write_entry(s, &h.manifest, &tuning, false)?;
+            let name = self.entry_of(s).0.unwrap_or_default();
+            log.push(format!("wrote {name} for slot {}", s.as_str()));
         }
-        let prim = primary(&self.vars);
+        let prim = self.boot.primary();
         if st.trial.is_none() && prim != Some(running) {
-            self.set_order(running, &ents)?;
+            self.set_order(running)?;
             log.push(match prim {
                 Some(p) => format!(
                     "slot {} did not boot: slot {} is the default now",
@@ -551,53 +748,76 @@ impl Platform {
         Ok(log)
     }
 
-    /// `BootOrder` = `first`, the other slot, then everything else.
-    fn set_order(&self, first: SlotId, ents: &[Option<u16>; 2]) -> Result<(), String> {
+    /// `BootOrder` = `first`, the other slot, then everything else (GRUB:
+    /// `primary=first`; it falls to the other slot on its own).
+    fn set_order(&self, first: SlotId) -> Result<(), String> {
+        let vars = match &self.boot {
+            BootStore::Uefi(v) => v,
+            BootStore::Bios(g) => return g.set_env(first, g.env().1),
+        };
+        let ents = entries(vars);
         let ours: Vec<u16> = [first, first.other()]
             .into_iter()
             .filter_map(|s| ents.get(idx(s)).copied().flatten())
-            .filter(|n| self.vars.load_option(*n).is_some())
+            .filter(|n| vars.load_option(*n).is_some())
             .collect();
         let mut order = ours.clone();
-        for n in self.vars.boot_order().unwrap_or_default() {
+        for n in vars.boot_order().unwrap_or_default() {
             if !order.contains(&n) && !ents.contains(&Some(n)) {
                 order.push(n);
             }
         }
-        self.vars
-            .set_u16_list("BootOrder", &order)
-            .map_err(|e| format!("BootOrder: {e}"))
+        vars.set_u16_list("BootOrder", &order)
+            .map_err(|e| format!("BootOrder: {e}"))?;
+        self.mirror(|g| g.set_env(first, None));
+        Ok(())
     }
 
-    /// Takes slot `s` out of `BootOrder` (keeps its entry number).
+    /// Takes slot `s` out of `BootOrder` (keeps its entry number). GRUB falls
+    /// to the other slot when one does not load, so there its `.cfg` goes.
     fn detach(&self, s: SlotId) -> Result<(), String> {
-        let ents = entries(&self.vars);
+        let vars = match &self.boot {
+            BootStore::Uefi(v) => v,
+            BootStore::Bios(g) => {
+                let (prim, next) = g.env();
+                if prim == Some(s) || next == Some(s) {
+                    let keep = if prim == Some(s) {
+                        s.other()
+                    } else {
+                        prim.unwrap_or(s.other())
+                    };
+                    g.set_env(keep, None)?;
+                }
+                return g.remove_cfg(s);
+            }
+        };
+        self.mirror(|g| g.remove_cfg(s));
+        let ents = entries(vars);
         let Some(n) = ents.get(idx(s)).copied().flatten() else {
             return Ok(());
         };
-        let order: Vec<u16> = self
-            .vars
+        let order: Vec<u16> = vars
             .boot_order()
             .unwrap_or_default()
             .into_iter()
             .filter(|x| *x != n)
             .collect();
-        self.vars
-            .set_u16_list("BootOrder", &order)
+        vars.set_u16_list("BootOrder", &order)
             .map_err(|e| format!("BootOrder: {e}"))?;
-        if self.vars.boot_next() == Some(n) {
-            let _ = self.vars.remove("BootNext");
+        if vars.boot_next() == Some(n) {
+            let _ = vars.remove("BootNext");
         }
         Ok(())
     }
 
+    /// The slot's entry; returns the command line it carries.
     fn write_entry(
         &self,
         s: SlotId,
         m: &Manifest,
         tuning: &[(String, String)],
         drill: bool,
-    ) -> Result<u16, String> {
+    ) -> Result<String, String> {
         let dev = self.dev(s)?;
         let cmdline = SlotCmdline {
             slot: s,
@@ -608,25 +828,35 @@ impl Platform {
             drill,
         }
         .render();
+        let vars = match &self.boot {
+            BootStore::Uefi(v) => v,
+            BootStore::Bios(g) => {
+                g.write_cfg(s, &cmdline)?;
+                return Ok(cmdline);
+            }
+        };
         let opt = LoadOption {
             active: true,
             description: s.label().into(),
             partition: Some(self.esp.clone()),
             file: Some(s.efi_path()),
-            cmdline,
+            cmdline: cmdline.clone(),
         };
-        let ents = entries(&self.vars);
-        let used = self.vars.boot_numbers();
+        let ents = entries(vars);
+        let used = vars.boot_numbers();
         let n = match ents.get(idx(s)).copied().flatten() {
             Some(n) => n,
             None => (0..=0xffffu16)
                 .find(|n| !used.contains(n))
                 .ok_or("no free Boot#### number")?,
         };
-        self.vars
-            .set(&boot_name(n), &opt.encode()?)
+        vars.set(&boot_name(n), &opt.encode()?)
             .map_err(|e| format!("{}: {e}", boot_name(n)))?;
-        Ok(n)
+        // Not the drill's line: the disk may move, the drill does not.
+        if !drill {
+            self.mirror(|g| g.write_cfg(s, &cmdline));
+        }
+        Ok(cmdline)
     }
 
     fn check_no_trial(&self) -> Result<State, String> {
@@ -858,7 +1088,7 @@ impl Platform {
         o: &Opts,
         swap: Option<String>,
     ) -> Result<(String, u64), String> {
-        let n = self.write_entry(target, m, &o.tuning, o.drill)?;
+        let cmdline = self.write_entry(target, m, &o.tuning, o.drill)?;
         let ts = Instant::now();
         let from_version = self
             .header(from)
@@ -883,14 +1113,18 @@ impl Platform {
             stats: None,
         });
         st.save(&self.state_dir())?;
-        self.vars
-            .set_u16_list("BootNext", &[n])
-            .map_err(|e| format!("BootNext: {e}"))?;
-        let cmdline = self
-            .vars
-            .load_option(n)
-            .map(|o| o.cmdline)
-            .unwrap_or_default();
+        match &self.boot {
+            BootStore::Uefi(v) => {
+                let n = entries(v)
+                    .get(idx(target))
+                    .copied()
+                    .flatten()
+                    .ok_or("the trial slot has no boot entry")?;
+                v.set_u16_list("BootNext", &[n])
+                    .map_err(|e| format!("BootNext: {e}"))?;
+            }
+            BootStore::Bios(g) => g.set_env(g.env().0.unwrap_or(from), Some(target))?,
+        }
         Ok((cmdline, snap_ms))
     }
 
@@ -1010,8 +1244,7 @@ impl Platform {
                 t.slot.as_str()
             ));
         }
-        let ents = entries(&self.vars);
-        self.set_order(t.slot, &ents)?;
+        self.set_order(t.slot)?;
         let out = Outcome {
             result: "confirmed".into(),
             slot: t.slot,
@@ -1038,7 +1271,7 @@ impl Platform {
         if self.running() == Some(t.slot) {
             return Err("the trial is running: it can only be confirmed or let roll back".into());
         }
-        let _ = self.vars.remove("BootNext");
+        self.boot.clear_next();
         st.trial = None;
         st.save(&dir)
     }
@@ -1051,13 +1284,20 @@ impl Platform {
     pub fn lab_reboot(&mut self) -> Result<(Boot, Vec<String>), String> {
         let lab = self.lab.clone().ok_or("not a lab platform")?;
         let mut log = Vec::new();
-        let ents = entries(&self.vars);
+        let vars = match &self.boot {
+            BootStore::Uefi(v) => v.clone(),
+            BootStore::Bios(g) => {
+                let g = g.clone();
+                return self.lab_reboot_grub(&lab, &g);
+            }
+        };
+        let ents = entries(&vars);
         let mut candidates: Vec<u16> = Vec::new();
-        if let Some(n) = self.vars.boot_next() {
+        if let Some(n) = vars.boot_next() {
             candidates.push(n);
-            let _ = self.vars.remove("BootNext");
+            let _ = vars.remove("BootNext");
         }
-        candidates.extend(self.vars.boot_order().unwrap_or_default());
+        candidates.extend(vars.boot_order().unwrap_or_default());
         let mut booted = None;
         for n in candidates {
             let Some(s) = SlotId::ALL
@@ -1066,11 +1306,7 @@ impl Platform {
             else {
                 continue;
             };
-            let opt = self
-                .vars
-                .load_option(n)
-                .map(|o| o.cmdline)
-                .unwrap_or_default();
+            let opt = vars.load_option(n).map(|o| o.cmdline).unwrap_or_default();
             let ok =
                 self.header(s).is_some_and(|(_, v)| v.is_ok()) && !opt.contains(crate::DRILL_INIT);
             if ok {
@@ -1086,11 +1322,64 @@ impl Platform {
         let (n, s, opt) = booted.ok_or("lab: no slot boots")?;
         self.cmdline = format!("{} {opt}", crate::BUILTIN_CMDLINE);
         std::fs::write(lab.join("cmdline"), &self.cmdline).map_err(|e| e.to_string())?;
-        self.vars
-            .set_u16_list("BootCurrent", &[n])
+        vars.set_u16_list("BootCurrent", &[n])
             .map_err(|e| e.to_string())?;
         log.push(format!("lab: booted slot {}", s.as_str()));
-        let (b, more) = at_boot(&self.config, &self.vars, &self.cmdline, self.partuuids());
+        let (b, more) = at_boot(&self.config, &self.boot, &self.cmdline, self.partuuids());
+        log.extend(more);
+        Ok((b, log))
+    }
+
+    /// [`Platform::lab_reboot`] on a BIOS: what `biosboot::GRUB_CFG` does.
+    /// Also the words as GRUB hands them over (`"dm-mod.create=…"`).
+    fn lab_reboot_grub(&mut self, lab: &Path, g: &Grub) -> Result<(Boot, Vec<String>), String> {
+        let mut log = Vec::new();
+        let (prim, next) = g.env();
+        let default = prim.unwrap_or(SlotId::A);
+        let mut order = vec![default, default.other()];
+        if let Some(n) = next {
+            // Erased first: the trial gets one attempt. A store that cannot
+            // write (`lab-grubenv-readonly`) gets none, like `save_env`.
+            if lab.join("lab-grubenv-readonly").exists() {
+                log.push("lab: save_env failed: no trial".to_owned());
+            } else {
+                g.set_env(default, None)?;
+                order.insert(0, n);
+            }
+        }
+        let mut booted = None;
+        for s in order {
+            let line = g.cmdline(s);
+            let ok = self.header(s).is_some_and(|(_, v)| v.is_ok())
+                && line
+                    .as_ref()
+                    .is_some_and(|l| !l.contains(crate::DRILL_INIT));
+            if let (true, Some(l)) = (ok, line) {
+                booted = Some((s, l));
+                break;
+            }
+            log.push(format!(
+                "lab: slot {} did not boot (panic=10: reboot)",
+                s.as_str()
+            ));
+        }
+        let (s, line) = booted.ok_or("lab: no slot boots")?;
+        let line = crate::cmdline_words(&line)
+            .into_iter()
+            .map(|w| match w.split_once("=\"") {
+                Some((k, v)) => format!("\"{k}={v}"),
+                None => w,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.cmdline = format!(
+            "{} BOOT_IMAGE=/{} {line}",
+            crate::BUILTIN_CMDLINE,
+            s.kernel_file()
+        );
+        std::fs::write(lab.join("cmdline"), &self.cmdline).map_err(|e| e.to_string())?;
+        log.push(format!("lab: booted slot {}", s.as_str()));
+        let (b, more) = at_boot(&self.config, &self.boot, &self.cmdline, self.partuuids());
         log.extend(more);
         Ok((b, log))
     }
@@ -1171,6 +1460,36 @@ impl Platform {
         keys: Vec<Key>,
         slot_size: u64,
     ) -> Result<Platform, String> {
+        Self::lab_dirs(dir, config, keys, slot_size)
+    }
+
+    /// [`Platform::lab`] of a box booted by BIOS: GRUB's files under `esp/`.
+    pub fn lab_bios(
+        dir: &Path,
+        config: &Path,
+        keys: Vec<Key>,
+        slot_size: u64,
+    ) -> Result<Platform, String> {
+        let mut p = Self::lab_dirs(dir, config, keys, slot_size)?;
+        p.boot = BootStore::Bios(Grub {
+            esp_dir: dir.join("esp"),
+            remount: false,
+        });
+        let grub = dir.join("esp").join(biosboot::DIR);
+        std::fs::create_dir_all(&grub).map_err(|e| e.to_string())?;
+        state::write_atomic(
+            &grub.join(biosboot::CFG_FILE),
+            biosboot::GRUB_CFG.as_bytes(),
+        )?;
+        Ok(p)
+    }
+
+    fn lab_dirs(
+        dir: &Path,
+        config: &Path,
+        keys: Vec<Key>,
+        slot_size: u64,
+    ) -> Result<Platform, String> {
         let e = |p: &Path, err: std::io::Error| format!("{}: {err}", p.display());
         for d in ["efivars", "esp"] {
             std::fs::create_dir_all(dir.join(d)).map_err(|err| e(&dir.join(d), err))?;
@@ -1201,7 +1520,7 @@ impl Platform {
             .unwrap_or_else(|_| crate::BUILTIN_CMDLINE.to_owned());
         let [a, b]: [SlotDev; 2] = slots.try_into().map_err(|_| "slots".to_string())?;
         Ok(Platform {
-            vars: Vars::directory(dir.join("efivars")),
+            boot: BootStore::Uefi(Vars::directory(dir.join("efivars"))),
             esp_dir: dir.join("esp"),
             esp_remount: false,
             esp: Partition {
@@ -1239,26 +1558,10 @@ pub(crate) fn drop_cache(f: &File) {
     let _ = f;
 }
 
-/// Linux: the platform of the running CoreRouter image, or why there is
-/// none. Refuses anything but the image (PID 1 must be `corerouter-init`):
-/// on a development machine the daemon must never write the host's boot
-/// variables nor its disks.
+/// Partitions by name, and the disk that holds them: (name, dev, disk).
 #[cfg(target_os = "linux")]
-pub fn discover(config: &Path, keys_dir: &Path, esp_mount: &Path) -> Result<Platform, String> {
-    let comm = std::fs::read_to_string("/proc/1/comm").unwrap_or_default();
-    if comm.trim() != "corerouter-init" {
-        return Err(
-            "not the CoreRouter image (PID 1 is not corerouter-init): A/B updates are off".into(),
-        );
-    }
-    let efivars = Path::new("/sys/firmware/efi/efivars");
-    if !crate::efi::available(efivars) {
-        return Err(
-            "not booted by UEFI (no efivarfs): A/B updates need the UEFI boot manager".into(),
-        );
-    }
-    // Partitions by name, and the disk that holds them.
-    let mut named: Vec<(String, String, String)> = Vec::new(); // (name, dev, disk)
+fn named_partitions() -> Result<Vec<(String, String, String)>, String> {
+    let mut named = Vec::new();
     for e in std::fs::read_dir("/sys/class/block")
         .map_err(|e| e.to_string())?
         .flatten()
@@ -1274,6 +1577,63 @@ pub fn discover(config: &Path, keys_dir: &Path, esp_mount: &Path) -> Result<Plat
             .unwrap_or_default();
         named.push((name.to_owned(), dev, disk));
     }
+    Ok(named)
+}
+
+/// Linux: mounts the ESP of the disk with the slots read-only at `esp_mount`,
+/// unless it is there already.
+#[cfg(target_os = "linux")]
+pub fn mount_esp(esp_mount: &Path) -> Result<(), String> {
+    let mounted = std::fs::read_to_string("/proc/mounts")
+        .unwrap_or_default()
+        .lines()
+        .any(|l| l.split_whitespace().nth(1) == esp_mount.to_str());
+    if mounted {
+        return Ok(());
+    }
+    let named = named_partitions()?;
+    let disk = named
+        .iter()
+        .find(|(n, _, _)| n == "rootfs-a")
+        .map(|(_, _, d)| d)
+        .ok_or("no partition named rootfs-a")?;
+    let dev = named
+        .iter()
+        .find(|(n, _, d)| n == "efi" && d == disk)
+        .map(|(_, dev, _)| dev)
+        .ok_or_else(|| format!("no partition named efi on {disk}"))?;
+    use rustix::mount::{MountFlags, mount};
+    std::fs::create_dir_all(esp_mount).map_err(|e| e.to_string())?;
+    mount(
+        format!("/dev/{dev}").as_str(),
+        esp_mount,
+        "vfat",
+        MountFlags::RDONLY | MountFlags::NOEXEC | MountFlags::NOSUID | MountFlags::NODEV,
+        c"",
+    )
+    .map_err(|e| format!("mount ESP /dev/{dev}: {e}"))
+}
+
+/// Linux: the platform of the running CoreRouter image, or why there is
+/// none. Refuses anything but the image (PID 1 must be `corerouter-init`):
+/// on a development machine the daemon must never write the host's boot
+/// variables nor its disks.
+#[cfg(target_os = "linux")]
+pub fn discover(config: &Path, keys_dir: &Path, esp_mount: &Path) -> Result<Platform, String> {
+    let comm = std::fs::read_to_string("/proc/1/comm").unwrap_or_default();
+    if comm.trim() != "corerouter-init" {
+        return Err(
+            "not the CoreRouter image (PID 1 is not corerouter-init): A/B updates are off".into(),
+        );
+    }
+    let efivars = Path::new("/sys/firmware/efi/efivars");
+    let uefi = Path::new("/sys/firmware/efi").exists();
+    if uefi && !crate::efi::available(efivars) {
+        return Err(
+            "booted by UEFI, but no efivarfs: A/B updates need the UEFI boot manager".into(),
+        );
+    }
+    let named = named_partitions()?;
     let find = |n: &str| named.iter().find(|(name, _, _)| name == n).cloned();
     let (_, _, disk) = find("rootfs-a").ok_or("no partition named rootfs-a")?;
     let lbs: u64 = std::fs::read_to_string(format!("/sys/block/{disk}/queue/logical_block_size"))
@@ -1298,25 +1658,24 @@ pub fn discover(config: &Path, keys_dir: &Path, esp_mount: &Path) -> Result<Plat
         })
     };
     let esp = part("efi")?;
-    let (_, esp_dev, _) = find("efi").ok_or("ESP device")?;
-    let mounted = std::fs::read_to_string("/proc/mounts")
-        .unwrap_or_default()
-        .lines()
-        .any(|l| l.split_whitespace().nth(1) == esp_mount.to_str());
-    if !mounted {
-        use rustix::mount::{MountFlags, mount};
-        std::fs::create_dir_all(esp_mount).map_err(|e| e.to_string())?;
-        mount(
-            format!("/dev/{esp_dev}").as_str(),
-            esp_mount,
-            "vfat",
-            MountFlags::RDONLY | MountFlags::NOEXEC | MountFlags::NOSUID | MountFlags::NODEV,
-            c"",
-        )
-        .map_err(|e| format!("mount ESP /dev/{esp_dev}: {e}"))?;
-    }
+    mount_esp(esp_mount)?;
+    let boot = if uefi {
+        BootStore::Uefi(Vars::efivarfs(efivars))
+    } else {
+        let g = Grub {
+            esp_dir: esp_mount.to_owned(),
+            remount: true,
+        };
+        if !g.present() {
+            return Err(
+                "booted by BIOS, but this disk has no GRUB files on its ESP: A/B updates are off"
+                    .into(),
+            );
+        }
+        BootStore::Bios(g)
+    };
     Ok(Platform {
-        vars: Vars::efivarfs(efivars),
+        boot,
         esp_dir: esp_mount.to_owned(),
         esp_remount: true,
         esp: Partition {

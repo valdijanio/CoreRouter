@@ -869,15 +869,14 @@ fn check_installed(t: &mut T, vm: &mut Vm, port: u16, first: bool) -> Result<(),
             .unwrap_or("?")
             .to_owned(),
     );
-    if t.fw == Firmware::Ovmf {
-        let p = vm.print_until(&mut log, 30, |v| {
-            v.get("running").and_then(Value::as_str) == Some("a")
-        })?;
-        check(
-            slot(&p, "a")["verity"] == Value::Bool(true),
-            format!("not slot A on dm-verity: {p}"),
-        )?;
-    } else {
+    let p = vm.print_until(&mut log, 30, |v| {
+        v.get("running").and_then(Value::as_str) == Some("a")
+    })?;
+    check(
+        slot(&p, "a")["verity"] == Value::Bool(true),
+        format!("not slot A on dm-verity: {p}"),
+    )?;
+    if t.fw == Firmware::SeaBios {
         // G1.6g: GRUB handed over the slot's line, quoting and all.
         let c = sh(
             vm,
@@ -1023,6 +1022,36 @@ fn check_installed(t: &mut T, vm: &mut Vm, port: u16, first: bool) -> Result<(),
     vm.poweroff(&mut log)
 }
 
+/// G1.6g: what was installed here boots under the other firmware.
+fn cross_boot(t: &mut T) -> Result<(), String> {
+    let installed = t.fw;
+    let r = (|| {
+        if installed == Firmware::Ovmf {
+            // The installer writes GRUB's line too: address, shell and all.
+            t.fw = Firmware::SeaBios;
+            let port = super::free_port()?;
+            let mut vm = t.boot_disk("disk/uefi-to-bios", port)?;
+            return check_installed(t, &mut vm, port, false);
+        }
+        // An empty NVRAM: the removable path, then the entries it provisions.
+        // Parameters from the installer are GRUB's alone, so no shell here:
+        // what shows the slot is the console.
+        t.fw = Firmware::Ovmf;
+        fresh_vars(&t.vars())?;
+        let mut log = t.log.try_clone().map_err(|e| e.to_string())?;
+        for name in ["disk/bios-to-uefi", "disk/bios-to-uefi-entry"] {
+            let port = super::free_port()?;
+            let mut vm = t.boot_disk(name, port)?;
+            vm.expect(&mut log, &["ready:"], 120)?;
+            std::thread::sleep(Duration::from_secs(3));
+            drop(vm);
+        }
+        Ok(())
+    })();
+    t.fw = installed;
+    r
+}
+
 pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), String> {
     let mut tcg = false;
     let mut fw = Firmware::Ovmf;
@@ -1090,6 +1119,8 @@ pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), S
     let mut vm = t.boot_disk("disk/reinstalled", port)?;
     check_installed(&mut t, &mut vm, port, false)?;
     drop(vm);
+
+    cross_boot(&mut t)?;
 
     interactive(&mut t)?;
     live(&mut t)?;

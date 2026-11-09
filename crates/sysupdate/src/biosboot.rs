@@ -123,6 +123,38 @@ pub fn slot_cfg(slot: SlotId, cmdline: &str) -> Result<Vec<u8>, String> {
     Ok(text)
 }
 
+/// `primary=` and `next=` of a `grubenv`, as `grub-editenv` or GRUB's
+/// `save_env` left it (any order, then padding). Not a block with the header:
+/// `None`, what GRUB itself treats as an empty environment.
+pub fn parse_env(env: &[u8]) -> Option<(Option<SlotId>, Option<SlotId>)> {
+    if env.len() != ENV_SIZE || !env.starts_with(ENV_HEADER.as_bytes()) {
+        return None;
+    }
+    let text = std::str::from_utf8(env).ok()?;
+    let value = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .and_then(SlotId::parse)
+    };
+    Some((value("primary="), value("next=")))
+}
+
+/// The kernel's command line a slot's configuration carries, the way a boot
+/// entry writes it ([`crate::SlotCmdline`]): what [`slot_cfg`] was given, back.
+pub fn slot_cmdline(cfg: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(cfg).ok()?;
+    let line = text.lines().next()?.strip_prefix("if linux ")?;
+    let line = line.strip_suffix("; then")?;
+    let mut words = Vec::new();
+    for w in line.split('\'').skip(1).step_by(2) {
+        words.push(match w.split_once('=') {
+            Some((k, v)) if v.contains(' ') => format!("{k}=\"{v}\""),
+            _ => w.to_owned(),
+        });
+    }
+    Some(words.join(" "))
+}
+
 /// What a disk's BIOS boot is: `boot.img`'s code and `core`, both patched for
 /// where `core` sits.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,6 +328,38 @@ pub(crate) mod tests {
         assert_eq!(e[511], b'#');
         let e = grubenv(SlotId::A, None);
         assert!(e.starts_with(b"# GRUB Environment Block\nprimary=a\nnext=\n#"));
+    }
+
+    #[test]
+    fn grubenv_reads_back_in_any_order() {
+        assert_eq!(
+            parse_env(&grubenv(SlotId::B, Some(SlotId::A))),
+            Some((Some(SlotId::B), Some(SlotId::A)))
+        );
+        assert_eq!(
+            parse_env(&grubenv(SlotId::A, None)),
+            Some((Some(SlotId::A), None))
+        );
+        // What `save_env next` leaves: the variable moved, empty.
+        let mut e = b"# GRUB Environment Block\nnext=\nprimary=b\n".to_vec();
+        e.resize(512, b'#');
+        assert_eq!(parse_env(&e), Some((Some(SlotId::B), None)));
+        // A bad value is no slot; a bad block is no environment.
+        let mut e = b"# GRUB Environment Block\nprimary=z\nnext=$(x)\n".to_vec();
+        e.resize(512, b'#');
+        assert_eq!(parse_env(&e), Some((None, None)));
+        assert_eq!(parse_env(&[0; 512]), None);
+        assert_eq!(parse_env(b"# GRUB Environment Block\n"), None);
+        assert_eq!(parse_env(&vec![0xFF; 512]), None);
+    }
+
+    #[test]
+    fn slot_cmdline_is_what_went_in() {
+        let line = "root=/dev/dm-0 dm-mod.create=\"vroot,,,ro,0 16 verity 1\" panic=10";
+        let cfg = slot_cfg(SlotId::A, line).unwrap();
+        assert_eq!(slot_cmdline(&cfg).as_deref(), Some(line));
+        assert_eq!(slot_cmdline(b"garbage"), None);
+        assert_eq!(slot_cmdline(&[0xFF; 32]), None);
     }
 
     #[test]
