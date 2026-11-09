@@ -1211,6 +1211,350 @@ fn one_session_per_vlan_in_the_1_to_1_model() {
     s.check_invariants().unwrap();
 }
 
+// ---------------------------------------------------- limits of G4.3m
+
+/// One discovery to session: PADI, then PADR with its cookie. The PADS's
+/// SESSION_ID, `None` without a PADO, `Some(0)` with an error PADS.
+fn dial(s: &mut Server, out: &mut ServerOutput, now: u64, mac: Mac, v: Vlans) -> Option<u16> {
+    out.clear();
+    s.handle_frame(now, 1, &padi_on(mac, v), out);
+    let r = replies(out);
+    let pado = r.first()?;
+    let mut b = Vec::new();
+    let mut w = DiscoveryWriter::begin(&mut b, AC, mac, v, Code::Padr, 0);
+    w.tag(tag::SERVICE_NAME, b"");
+    w.tag(tag::AC_COOKIE, pado.tags.ac_cookie.unwrap());
+    w.finish().unwrap();
+    out.clear();
+    s.handle_frame(now, 1, &b, out);
+    pads(out).map(|p| p.session_id)
+}
+
+fn padt_from_to(ac: Mac, mac: Mac, v: Vlans, sid: u16) -> Vec<u8> {
+    let mut b = Vec::new();
+    DiscoveryWriter::begin(&mut b, ac, mac, v, Code::Padt, sid)
+        .finish()
+        .unwrap();
+    b
+}
+
+fn padt_from(mac: Mac, v: Vlans, sid: u16) -> Vec<u8> {
+    padt_from_to(AC, mac, v, sid)
+}
+
+fn refusal(out: &ServerOutput) -> Option<Refusal> {
+    out.events.iter().find_map(|e| match e {
+        Event::Refused { refusal, .. } => Some(*refusal),
+        _ => None,
+    })
+}
+
+/// Cisco `sessions per-mac limit`: over VLANs, and with several sessions
+/// per host allowed. A session that ends frees its place.
+#[test]
+fn sessions_per_mac() {
+    let (mut s, mut out) = server(|c| {
+        c.max_per_mac = 2;
+        c.one_session_per_host = false;
+    });
+    let a = dial(&mut s, &mut out, 0, HOST, Vlans::single(10)).unwrap();
+    assert_ne!(a, 0);
+    assert_ne!(
+        dial(&mut s, &mut out, 0, HOST, Vlans::single(11)).unwrap(),
+        0
+    );
+    // The third gets no PADO, and says why.
+    assert_eq!(dial(&mut s, &mut out, 0, HOST, Vlans::single(12)), None);
+    assert_eq!(refusal(&out), Some(Refusal::Mac));
+    assert_eq!(s.stats().mac_refused, 1);
+    assert!(s.refuses(0, 1, Vlans::single(12), HOST));
+    // Another MAC is not affected.
+    assert_ne!(
+        dial(&mut s, &mut out, 0, HOST2, Vlans::single(12)).unwrap(),
+        0
+    );
+    s.check_invariants().unwrap();
+    // One ends: room again.
+    out.clear();
+    s.handle_frame(1, 1, &padt_from(HOST, Vlans::single(10), a), &mut out);
+    assert!(!s.refuses(1, 1, Vlans::single(12), HOST));
+    assert_ne!(
+        dial(&mut s, &mut out, 1, HOST, Vlans::single(12)).unwrap(),
+        0
+    );
+    s.check_invariants().unwrap();
+    // Off and on keeps the count.
+    let mut c = s.config().clone();
+    c.max_per_mac = 0;
+    s.reconfigure(c.clone());
+    c.max_per_mac = 2;
+    s.reconfigure(c);
+    s.check_invariants().unwrap();
+    assert!(s.refuses(2, 1, Vlans::single(13), HOST));
+}
+
+/// A PADR of an older offer, once the limit is reached: RFC 2516 §5.4
+/// AC-System-Error, with SESSION_ID 0, and no session.
+#[test]
+fn a_late_padr_past_the_mac_limit_gets_an_error() {
+    let (mut s, mut out) = server(|c| {
+        c.max_per_mac = 1;
+        c.one_session_per_host = false;
+    });
+    let v = Vlans::single(10);
+    out.clear();
+    s.handle_frame(0, 1, &padi_on(HOST, v), &mut out);
+    let old = replies(&out)
+        .first()
+        .unwrap()
+        .tags
+        .ac_cookie
+        .unwrap()
+        .to_vec();
+    assert_ne!(
+        dial(&mut s, &mut out, 0, HOST, Vlans::single(11)).unwrap(),
+        0
+    );
+    let mut b = Vec::new();
+    let mut w = DiscoveryWriter::begin(&mut b, AC, HOST, v, Code::Padr, 0);
+    w.tag(tag::SERVICE_NAME, b"");
+    w.tag(tag::AC_COOKIE, &old);
+    w.finish().unwrap();
+    out.clear();
+    s.handle_frame(0, 1, &b, &mut out);
+    assert_eq!(pads(&out).map(|p| p.session_id), Some(0));
+    assert_eq!(s.active(), 1);
+}
+
+/// With one_session_per_host the host's own session is replaced, not
+/// counted against it: a CPE that reboots comes back.
+#[test]
+fn the_mac_limit_leaves_room_for_the_hosts_own_return() {
+    let (mut s, mut out) = server(|c| c.max_per_mac = 1);
+    let v = Vlans::single(10);
+    assert_ne!(dial(&mut s, &mut out, 0, HOST, v).unwrap(), 0);
+    assert_ne!(dial(&mut s, &mut out, 6000, HOST, v).unwrap(), 0);
+    assert_eq!(s.active(), 1);
+    s.check_invariants().unwrap();
+}
+
+/// A CPE in a loop: each short session locks it out longer, its PADIs and
+/// PADRs are dropped in silence meanwhile, and past 15 minutes it starts over.
+#[test]
+fn short_cycle_locks_out_longer_each_time() {
+    let (mut s, mut out) = server(|c| {
+        c.short_cycle = Some(ShortCycle {
+            min_ms: 20_000,
+            max_ms: 120_000,
+        });
+    });
+    let v = Vlans::single(10);
+    let mut now = 0;
+    for (n, secs) in [(1, 20), (2, 40), (3, 80), (4, 120), (5, 120)] {
+        let sid = dial(&mut s, &mut out, now, HOST, v).unwrap();
+        assert_ne!(sid, 0, "strike {n}");
+        now += 5000;
+        out.clear();
+        s.handle_frame(now, 1, &padt_from(HOST, v, sid), &mut out);
+        let locked = out.events.iter().find_map(|e| match e {
+            Event::LockedOut {
+                strikes,
+                left_ms,
+                cause,
+                ..
+            } => Some((*strikes, *left_ms, *cause)),
+            _ => None,
+        });
+        assert_eq!(locked, Some((n, secs * 1000, DownReason::PeerPadt)));
+        // Locked out: no PADO, and the reason names the last end.
+        assert_eq!(dial(&mut s, &mut out, now + 1, HOST, v), None);
+        assert!(matches!(
+            refusal(&out),
+            Some(Refusal::ShortCycle { strikes, cause: DownReason::PeerPadt, .. }) if strikes == n
+        ));
+        assert_eq!(dial(&mut s, &mut out, now + secs * 1000 - 1, HOST, v), None);
+        // Another host goes on as if nothing happened.
+        let other = dial(&mut s, &mut out, now, HOST2, v).unwrap();
+        assert_ne!(other, 0);
+        s.handle_frame(now + 200_000, 1, &padt_from(HOST2, v, other), &mut out);
+        now += secs * 1000;
+    }
+    assert_eq!(s.stats().short_cycles, 5);
+    assert!(s.stats().short_cycle_refused >= 10);
+    s.check_invariants().unwrap();
+    // Quiet past the grace: the next cycle counts as the first.
+    now += GRACE_MS + 1;
+    let sid = dial(&mut s, &mut out, now, HOST, v).unwrap();
+    out.clear();
+    s.handle_frame(now + 1000, 1, &padt_from(HOST, v, sid), &mut out);
+    assert!(
+        s.lockouts(now + 1000)
+            .any(|l| l.strikes == 1 && l.left_ms == 20_000)
+    );
+    // The operator lets it back in, and its history goes too.
+    assert_eq!(s.clear_lockouts(now + 1000, Some(HOST)), 1);
+    assert_eq!(s.lockouts(now + 1000).count(), 0);
+    assert_ne!(dial(&mut s, &mut out, now + 1000, HOST, v).unwrap(), 0);
+}
+
+/// A PADR with a cookie taken before the lockout gets nothing either: no
+/// session, no PADS.
+#[test]
+fn a_padr_with_an_older_cookie_is_dropped_while_locked_out() {
+    let (mut s, mut out) = server(|c| c.short_cycle = Some(ShortCycle::default()));
+    let v = Vlans::single(10);
+    out.clear();
+    s.handle_frame(0, 1, &padi_on(HOST, v), &mut out);
+    let old = replies(&out)
+        .first()
+        .unwrap()
+        .tags
+        .ac_cookie
+        .unwrap()
+        .to_vec();
+    let sid = dial(&mut s, &mut out, 0, HOST, v).unwrap();
+    out.clear();
+    s.handle_frame(0, 1, &padt_from(HOST, v, sid), &mut out);
+    let mut b = Vec::new();
+    let mut w = DiscoveryWriter::begin(&mut b, AC, HOST, v, Code::Padr, 0);
+    w.tag(tag::SERVICE_NAME, b"");
+    w.tag(tag::AC_COOKIE, &old);
+    w.finish().unwrap();
+    out.clear();
+    s.handle_frame(1, 1, &b, &mut out);
+    assert!(out.frames().next().is_none(), "silence");
+    assert_eq!(s.active(), 0);
+}
+
+/// What was not the host's doing, and a session past 150 s, are no cycle.
+#[test]
+fn only_a_short_session_ended_by_the_host_is_a_short_cycle() {
+    let (mut s, mut out) = server(|c| c.short_cycle = Some(ShortCycle::default()));
+    let v = Vlans::single(10);
+    // Long: 150 s exactly is not short.
+    let sid = dial(&mut s, &mut out, 0, HOST, v).unwrap();
+    s.handle_frame(SHORT_MS, 1, &padt_from(HOST, v, sid), &mut out);
+    assert_eq!(s.stats().short_cycles, 0);
+    // The operator disconnects it after a second.
+    let now = SHORT_MS + 6000;
+    let _ = dial(&mut s, &mut out, now, HOST2, v).unwrap();
+    let r = s.sessions().next().unwrap();
+    assert!(s.terminate(now + 1000, r, &mut out));
+    // Terminate-Request unanswered: it ends by the FSM's timers.
+    for t in 0..40 {
+        s.handle_timers(now + 1000 + t * 1000, &mut out);
+    }
+    assert_eq!(s.active(), 0);
+    assert_eq!(s.stats().short_cycles, 0, "{:?}", s.stats());
+}
+
+/// Off by default: nothing is kept, nobody is locked out.
+#[test]
+fn off_by_default() {
+    let (mut s, mut out) = server(|_| {});
+    let v = Vlans::single(10);
+    for t in 0..5 {
+        let now = t * 6000;
+        let sid = dial(&mut s, &mut out, now, HOST, v).unwrap();
+        assert_ne!(sid, 0);
+        s.handle_frame(now + 1, 1, &padt_from(HOST, v, sid), &mut out);
+    }
+    assert_eq!(s.stats().short_cycles, 0);
+    assert_eq!(s.lockouts(0).count(), 0);
+}
+
+/// A takeover's sessions count against the limits: past one the VLAN is full,
+/// and they end without being counted as short cycles (found by this gap:
+/// `import` did not keep `per_vlan`).
+#[test]
+fn a_takeover_counts_against_the_limits() {
+    let cfg = |c: &mut ServerConfig| {
+        c.max_per_vlan = 1;
+        c.max_per_mac = 1;
+        c.short_cycle = Some(ShortCycle::default());
+    };
+    let mut l = lab(1, |_| {});
+    l.run_until(10_000);
+    let states = l.servers[0].export_all(l.now);
+    assert_eq!(states.len(), 1);
+    let (host, v) = (states[0].client_mac, states[0].vlans);
+    let other = Mac([0x02, 0x77, 0, 0, 0, 9]);
+    let (mut b, mut out2) = server(cfg);
+    let res = b.import(1000, &states, &mut out2);
+    assert!(res[0].is_ok());
+    b.check_invariants().unwrap();
+    let port = states[0].ifindex;
+    assert!(b.refuses(1000, port, v, other), "the line is full");
+    let sid = states[0].sid;
+    b.handle_frame(
+        2000,
+        port,
+        &padt_from_to(b.config().ac_mac, host, v, sid),
+        &mut out2,
+    );
+    assert_eq!(b.active(), 0);
+    assert_eq!(b.stats().short_cycles, 0, "it did not start here");
+    b.check_invariants().unwrap();
+}
+
+/// Workers share a VLAN's count with one tag: the limit is the whole
+/// server's, and a server that leaves takes its sessions out of the count.
+#[test]
+fn the_vlan_limit_holds_over_the_workers() {
+    let share = VlanShare::default();
+    let cfg = |lane: u16| {
+        let share = share.clone();
+        move |c: &mut ServerConfig| {
+            c.max_per_vlan = 2;
+            c.vlan_share = Some(share);
+            c.sid_lane = (lane, 2);
+        }
+    };
+    let v = Vlans::single(10);
+    let (mut w0, mut o0) = server(cfg(0));
+    let (mut w1, mut o1) = server(cfg(1));
+    let m = |i: u8| Mac([2, 0, 0, 0, 0, i]);
+    assert_ne!(dial(&mut w0, &mut o0, 0, m(1), v).unwrap(), 0);
+    assert_ne!(dial(&mut w1, &mut o1, 0, m(2), v).unwrap(), 0);
+    // Each worker holds one, the VLAN two: nobody gets a third.
+    assert_eq!(dial(&mut w0, &mut o0, 0, m(3), v), None);
+    assert_eq!(dial(&mut w1, &mut o1, 0, m(4), v), None);
+    assert_eq!(refusal(&o1), Some(Refusal::Vlan));
+    // A host of the VLAN coming back takes its place.
+    assert_ne!(dial(&mut w0, &mut o0, 6000, m(1), v).unwrap(), 0);
+    w0.check_invariants().unwrap();
+    // Another VLAN has its own count.
+    assert_ne!(
+        dial(&mut w0, &mut o0, 0, m(5), Vlans::single(11)).unwrap(),
+        0
+    );
+    // A reconfigure leaves the count as it was.
+    let c = w1.config().clone();
+    w1.reconfigure(c);
+    assert_eq!(dial(&mut w1, &mut o1, 0, m(4), v), None);
+    // A worker that leaves frees its place.
+    drop(w0);
+    assert_ne!(dial(&mut w1, &mut o1, 0, m(4), v).unwrap(), 0);
+}
+
+/// QinQ lines are one worker's: the count stays local, the share untouched.
+#[test]
+fn a_qinq_line_does_not_use_the_shared_count() {
+    let share = VlanShare::default();
+    let probe = share.clone();
+    let (mut s, mut out) = server(move |c| {
+        c.max_per_vlan = 1;
+        c.vlan_share = Some(share);
+    });
+    assert_ne!(
+        dial(&mut s, &mut out, 0, HOST, Vlans::qinq(100, 7)).unwrap(),
+        0
+    );
+    assert_eq!(probe.get(100), 0);
+    assert!(s.refuses(0, 1, Vlans::qinq(100, 7), HOST2));
+    assert!(!s.refuses(0, 1, Vlans::qinq(100, 8), HOST2));
+}
+
 // ------------------------------------------- the router's own client (G3.9ga)
 
 fn client_with(f: impl FnOnce(&mut ClientConfig)) -> Client {
