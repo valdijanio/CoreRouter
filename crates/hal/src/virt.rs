@@ -270,6 +270,18 @@ impl VirtualHal {
         let ifaces = corerouter_model::sections::interfaces_changed(from, to);
         let addrs = ifaces || from.ip.addresses != to.ip.addresses;
         let routes = from.ip.routes != to.ip.routes;
+        // G1.27e: the rule list reads the rules, the tables, the mangle's
+        // marks and whether there is a VRF.
+        if ifaces
+            || from.routing.rules != to.routing.rules
+            || from.routing.tables != to.routing.tables
+            || from.ip.firewall.mangle != to.ip.firewall.mangle
+        {
+            self.kernel
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .rules = crate::policy::expected_rules(to);
+        }
         if !addrs && !routes {
             return;
         }
@@ -735,6 +747,10 @@ impl Hal for VirtualHal {
         Ok(self.oslog.read(now, max))
     }
 
+    fn nic_reading(&mut self) -> Option<crate::nic_problem::NicReading> {
+        Some(crate::nic_problem::lab_reading())
+    }
+
     fn resources(&mut self) -> Option<crate::resources::Resources> {
         let t = self.ticks;
         let wave = |period: u64, amp: u64| {
@@ -1054,6 +1070,11 @@ impl Hal for VirtualHal {
     ) -> Result<crate::route_get::KernelLookup, HalError> {
         let k = self.kernel.lock().unwrap_or_else(PoisonError::into_inner);
         Ok(crate::route_get::lookup(cfg, &k, q))
+    }
+
+    fn rule_dump(&mut self) -> Result<Vec<crate::policy::KernelRuleRow>, HalError> {
+        let k = self.kernel.lock().unwrap_or_else(PoisonError::into_inner);
+        Ok(crate::policy::listed(&k.rules))
     }
 
     fn reconcile(&mut self, cfg: &Config) -> Result<(), HalError> {

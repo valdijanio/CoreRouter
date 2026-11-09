@@ -77,6 +77,47 @@ const FIREWALL: Action = Action {
 const K: Option<OsSource> = Some(OsSource::Kernel);
 
 pub const KNOWN: &[Known] = &[
+    // G1.6ja: narrow ones first: this file is asked for on every kernel with
+    // Wi-Fi support and costs nothing.
+    Known {
+        id: "firmware-regulatory",
+        source: K,
+        all: &["regulatory.db"],
+        any: &[],
+        title: "Base regulatória de Wi-Fi (inofensivo)",
+        meaning: "O suporte a Wi-Fi do kernel procura a base de canais permitidos por país. O \
+                  CoreRouter não usa Wi-Fi e não traz esse arquivo: pode ignorar esta linha, ela \
+                  não aponta problema em nenhuma placa de rede.",
+        actions: &[],
+        alert: false,
+    },
+    Known {
+        id: "nic-ice-safe-mode",
+        source: K,
+        all: &["ice "],
+        any: &["safe mode"],
+        title: "Placa E810 em Safe Mode",
+        meaning: "O driver ice não conseguiu usar o pacote DDP e a placa ficou em Safe Mode: uma \
+                  fila só, sem RSS, sem XDP e sem offloads. O tráfego passa, preso a um núcleo. A \
+                  mensagem diz o motivo: arquivo faltando, inválido, ou versão que não combina \
+                  com o driver ou o NVM. A saúde do roteador e a janela Interfaces dizem o que \
+                  fazer em cada caso.",
+        actions: &[INTERFACES],
+        alert: false,
+    },
+    Known {
+        id: "nic-firmware-missing",
+        source: K,
+        all: &[],
+        any: &["direct firmware load for", "unable to load firmware", "failed to load firmware", "failed to find fw file"],
+        title: "Firmware não carregou",
+        meaning: "Um driver pediu um arquivo de firmware e não conseguiu carregar. Se a linha for \
+                  de uma placa de rede, ela pode não subir ou subir sem recursos, e a janela \
+                  Interfaces e a saúde do roteador avisam com o nome do arquivo. Se for de outro \
+                  dispositivo (vídeo, Bluetooth), o roteador não depende dele.",
+        actions: &[INTERFACES],
+        alert: false,
+    },
     Known {
         id: "nic-ring-full",
         source: K,
@@ -343,6 +384,10 @@ mod tests {
         let cases: &[(OsSource, &str, Option<&str>)] = &[
             (Kernel, "r8169 0000:03:00.0 ether2: rx_missed 1 (ring full, frame dropped)", Some("nic-ring-full")),
             (Kernel, "ixgbe 0000:01:00.0 eth4: rx_no_buffer_count 1022", Some("nic-ring-full")),
+            (Kernel, "platform regulatory.0: Direct firmware load for regulatory.db failed with error -2", Some("firmware-regulatory")),
+            (Kernel, "ice 0000:03:00.0: The DDP package file was not found or could not be read. Entering Safe Mode", Some("nic-ice-safe-mode")),
+            (Kernel, "r8169 0000:02:00.0: Unable to load firmware rtl_nic/rtl8168h-2.fw (-2)", Some("nic-firmware-missing")),
+            (Kernel, "tg3 0000:04:00.0: Direct firmware load for tigon/tg3_tso5.bin failed with error -2", Some("nic-firmware-missing")),
             (Kernel, "NETDEV WATCHDOG: eth0 (r8169): transmit queue 0 timed out 5000 ms", Some("nic-tx-timeout")),
             (Kernel, "e1000e 0000:00:19.0 eno1: Detected Hardware Unit Hang:", Some("nic-tx-timeout")),
             (Kernel, "b1bond: Warning: No 802.3ad response from the link partner for any adapters in the bond", Some("lacp-no-partner")),

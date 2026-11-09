@@ -25,8 +25,11 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("routing.table.remove", "Remove Routing Table", [], None,
         "{name: string (nothing may use it: routes, mangle routing marks, routing rules)} → {name}",
         has_tables, remove),
+    cmd!(query "routing.table.preview", "Check Routing Table", [], None,
+        "{id?: string (the table being edited), name?: string, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]} (form texts accepted; never an error: bad input is a check)",
+        always, preview),
     cmd!(query "routing.table.list", "Routing Tables", ["Routing", "Tables"], None,
-        "{} → [{name, table (kernel id), type (main | vrf | named), routes (static routes in it), marks (mangle rules that mark packets for it), dynamic (true: main and VRFs, not removable here), comment}]",
+        "{} → [{name, table (kernel id), type (main | vrf | named), routes (static routes in it), marks (mangle rules that mark packets for it), rules (routing rules that look in it), dynamic (true: main and VRFs, not removable here), comment}]",
         always, list),
 ];
 
@@ -148,6 +151,20 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
             "{n} mangle rule(s) mark packets for it (ip.firewall.mangle.list)"
         ));
     }
+    let rules: Vec<String> = cfg
+        .routing
+        .rules
+        .iter()
+        .filter(|r| r.action.looks_up() && r.table == table)
+        .take(8)
+        .map(|r| r.id.to_string())
+        .collect();
+    if !rules.is_empty() {
+        blockers.push(format!(
+            "routing rule {} looks in it (routing.rule.remove)",
+            rules.join(", ")
+        ));
+    }
     if !blockers.is_empty() {
         return Err(EngineError::bad(
             "name",
@@ -165,6 +182,10 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
         *routes.entry(&r.routing_table).or_default() += 1;
     }
     let marks = marks_of(cfg);
+    let mut rules: BTreeMap<&RoutingTable, usize> = BTreeMap::new();
+    for r in cfg.routing.rules.iter().filter(|r| r.action.looks_up()) {
+        *rules.entry(&r.table).or_default() += 1;
+    }
     let rows: Vec<Value> = tables_by_id(cfg)
         .into_iter()
         .map(|(id, table)| {
@@ -184,12 +205,57 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
                 "type": kind,
                 "routes": routes.get(&table).copied().unwrap_or(0),
                 "marks": marks.get(name.as_str()).copied().unwrap_or(0),
+                "rules": rules.get(&table).copied().unwrap_or(0),
                 "dynamic": named.is_none(),
                 "comment": named.map_or("", |t| t.comment.as_str()),
             })
         })
         .collect();
     Ok(Value::Array(rows))
+}
+
+fn preview(s: &mut Session, raw: &Value) -> Result<Value> {
+    let text = |k: &str| raw.get(k).and_then(Value::as_str).map_or("", str::trim).to_owned();
+    let check = |message: String, param: &str| {
+        json!({"level": "error", "check": "param", "message": message, "param": param})
+    };
+    let (id, name, comment) = (text("id"), text("name"), text("comment"));
+    let cfg = s.store().candidate();
+    let mut checks = Vec::new();
+    let mut computed = Vec::new();
+    let mut commands = Vec::new();
+    if id.is_empty() {
+        match name.parse::<IfName>() {
+            Ok(n) if RESERVED.contains(&n.as_str()) => {
+                checks.push(check(format!("'{n}' is the name of a table of the kernel"), "name"));
+            }
+            Ok(n) if cfg.routing.tables.contains_key(&n) => {
+                checks.push(check(format!("routing table '{n}' already exists"), "name"));
+            }
+            Ok(n) if is_vrf_table(cfg, &RoutingTable::Vrf(n.clone())) => {
+                checks.push(check(format!("a VRF is already named '{n}'"), "name"));
+            }
+            Ok(_) => {
+                if let Some(t) = free_table(cfg) {
+                    computed.push(json!({"label": "Kernel table", "value": t.to_string()}));
+                }
+                let mut p = json!({"name": name});
+                if !comment.is_empty()
+                    && let Some(o) = p.as_object_mut()
+                {
+                    o.insert("comment".to_owned(), json!(comment));
+                }
+                commands.push(json!({"command": "routing.table.add", "params": p}));
+            }
+            Err(e) => checks.push(check(e.to_string(), "name")),
+        }
+    } else {
+        commands.push(json!({
+            "command": "routing.table.set",
+            "params": {"name": id, "comment": comment},
+        }));
+    }
+    Ok(json!({"computed": computed, "checks": checks, "commands": commands}))
 }
 
 #[cfg(test)]

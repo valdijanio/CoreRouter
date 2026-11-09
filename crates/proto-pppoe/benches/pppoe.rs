@@ -26,7 +26,7 @@ use corerouter_proto_pppoe::lab::{Lab, LabConfig, ac_mac, client_mac};
 use corerouter_proto_pppoe::lcp::{self, AuthProto};
 use corerouter_proto_pppoe::ppp::{self, Link, SessionWriter, proto};
 use corerouter_proto_pppoe::server::{
-    Server, ServerConfig, ServerOutput, ServiceRule, ServiceTable,
+    Server, ServerConfig, ServerOutput, ServiceRule, ServiceTable, ShortCycle,
 };
 use corerouter_proto_pppoe::wire::Mac;
 use criterion::{Criterion, Throughput, criterion_group};
@@ -171,6 +171,66 @@ fn established() -> (Lab, u16) {
     (l, sid)
 }
 
+/// When the benches below read the table (the fill runs before it).
+const FULL_AT: u64 = 1_000_000;
+const CLIENT_LOCKED: Mac = Mac([0x02, 0x99, 0, 0, 0, 1]);
+
+/// One PADI → PADR → PADT at `FULL_AT - 1000`: a short cycle of `mac`.
+fn cycle(s: &mut Server, out: &mut ServerOutput, mac: Mac) -> (Vec<u8>, u16) {
+    let at = FULL_AT - 1000;
+    let mut f = Vec::new();
+    let mut w = DiscoveryWriter::begin(&mut f, Mac::BROADCAST, mac, Vlans::NONE, Code::Padi, 0);
+    w.tag(tag::SERVICE_NAME, b"");
+    w.finish().unwrap();
+    out.clear();
+    s.handle_frame(at, 1, &f, out);
+    let pado = out.frames().next().map(|(_, x)| x.to_vec()).unwrap();
+    let pado = discovery::parse(&pado).unwrap();
+    let mut r = Vec::new();
+    let mut w = DiscoveryWriter::begin(&mut r, s.config().ac_mac, mac, Vlans::NONE, Code::Padr, 0);
+    w.tag(tag::SERVICE_NAME, b"");
+    w.tag(tag::AC_COOKIE, pado.tags.ac_cookie.unwrap());
+    w.finish().unwrap();
+    out.clear();
+    s.handle_frame(at, 1, &r, out);
+    let sid = out
+        .frames()
+        .filter_map(|(_, x)| discovery::parse(x).ok())
+        .find(|d| d.code == Code::Pads)
+        .map_or(0, |d| d.session_id);
+    let mut t = Vec::new();
+    DiscoveryWriter::begin(&mut t, s.config().ac_mac, mac, Vlans::NONE, Code::Padt, sid)
+        .finish()
+        .unwrap();
+    out.clear();
+    s.handle_frame(at, 1, &t, out);
+    (f, sid)
+}
+
+/// A server with every limit on and 50 000 short cycles behind it: more
+/// than its lockout table holds.
+fn limited_server() -> Server {
+    let mut s = Server::new(
+        ServerConfig {
+            max_per_vlan: 1000,
+            max_per_mac: 2,
+            short_cycle: Some(ShortCycle {
+                min_ms: 600_000,
+                max_ms: 600_000,
+            }),
+            ..ServerConfig::default()
+        },
+        [7; 32],
+        0,
+    );
+    let mut out = ServerOutput::new();
+    for i in 0..50_000u32 {
+        let [_, a, b, c] = i.to_be_bytes();
+        cycle(&mut s, &mut out, Mac([0x02, 0x55, 0, a, b, c]));
+    }
+    s
+}
+
 fn server(c: &mut Criterion) {
     let mut g = c.benchmark_group("pppoe");
     g.throughput(Throughput::Elements(1));
@@ -231,6 +291,26 @@ fn server(c: &mut Criterion) {
     let mut out = ServerOutput::new();
     srv.handle_frame(6000, 1, &echo, &mut out);
     assert_eq!(out.frames.len(), 1, "echo answered");
+    // G4.3m: what the limits add to a PADI that gets its PADO (limits on,
+    // the lockout table full of other hosts), and the cost of one refused.
+    let mut s = limited_server();
+    let f = padi();
+    g.bench_function("server_padi_to_pado_limits_on", |b| {
+        b.iter(|| {
+            out.clear();
+            s.handle_frame(FULL_AT, 1, black_box(&f), &mut out);
+            out.frames.len()
+        })
+    });
+    let mut s = limited_server();
+    let (f, _) = cycle(&mut s, &mut out, CLIENT_LOCKED);
+    g.bench_function("server_padi_locked_out", |b| {
+        b.iter(|| {
+            out.clear();
+            s.handle_frame(FULL_AT, 1, black_box(&f), &mut out);
+            out.events.len()
+        })
+    });
     g.bench_function("server_lcp_echo", |b| {
         b.iter(|| {
             out.clear();

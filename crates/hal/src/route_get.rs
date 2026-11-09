@@ -16,8 +16,22 @@ use crate::drift::Snapshot;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteQuery {
     pub dst: IpAddr,
+    /// Ignored when `policy` is set.
     pub table: u32,
     pub src: Option<IpAddr>,
+    /// G1.27e: walk the rule list instead of asking for one table.
+    pub policy: Option<PolicyQuery>,
+}
+
+/// What the rules look at besides the addresses.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PolicyQuery {
+    /// Incoming interface; `None`: the router's own packet.
+    pub iif: Option<IfName>,
+    /// The packet's mark (`RTA_MARK`).
+    pub mark: u32,
+    /// Kernel table of the VRF it is in, for the virtual lab's walk.
+    pub vrf: Option<u32>,
 }
 
 /// What the route found is.
@@ -30,7 +44,8 @@ pub enum RouteKind {
     Local,
     /// No route (`ENETUNREACH`), or an `unreachable` route (`EHOSTUNREACH`).
     Unreachable,
-    /// A `blackhole` route (`RTM_GETROUTE` answers `EINVAL`, **medido**, G1.5b).
+    /// A `blackhole` route (`RTM_GETROUTE` answers `EINVAL`, **medido**, G1.5b),
+    /// or discarded by a rule (`FR_ACT_BLACKHOLE`, G1.27e).
     Blackhole,
     /// A `prohibit` route (`EACCES`).
     Prohibit,
@@ -98,6 +113,62 @@ fn table_of_link(cfg: &Config, snap: &Snapshot, name: &IfName) -> u32 {
 /// make the connected and local routes), then the lowest metric; equal
 /// metrics are all returned (ECMP). The table ids of VRFs come from `cfg`.
 pub fn lookup(cfg: &Config, snap: &Snapshot, q: &RouteQuery) -> KernelLookup {
+    match &q.policy {
+        Some(p) => lookup_by_rules(cfg, snap, q, p),
+        None => lookup_in_table(cfg, snap, q),
+    }
+}
+
+/// G1.27e: the lab's rule walk over what `snap` holds; rule 0 is `local`.
+fn lookup_by_rules(cfg: &Config, snap: &Snapshot, q: &RouteQuery, p: &PolicyQuery) -> KernelLookup {
+    use crate::policy::{RulePacket, RuleVerdict, walk};
+    let in_one = |table: u32| {
+        lookup_in_table(
+            cfg,
+            snap,
+            &RouteQuery {
+                table,
+                policy: None,
+                ..q.clone()
+            },
+        )
+    };
+    let local = in_one(p.vrf.unwrap_or(route::MAIN_TABLE_ID));
+    if local.kind == RouteKind::Local {
+        return local;
+    }
+    let packet = RulePacket {
+        src: q.src,
+        dst: q.dst,
+        iif: p.iif.as_ref(),
+        mark: p.mark,
+        vrf: p.vrf,
+    };
+    let walked = walk(&snap.rules, &packet, |table, suppress| {
+        let found = in_one(table);
+        // An `unreachable` route decides too (G1.5b); only no route goes on.
+        let reject = snap
+            .discards
+            .iter()
+            .any(|d| d.table == table && d.dst.contains(&q.dst));
+        (found.kind != RouteKind::Unreachable || reject)
+            && suppress.is_none_or(|s| found.prefix.is_some_and(|f| f.prefix_len() > s))
+    });
+    let discard = |kind| KernelLookup {
+        kind,
+        prefix: None,
+        hops: Vec::new(),
+        src: None,
+        table: q.table,
+    };
+    match walked.verdict {
+        RuleVerdict::Table(t) => in_one(t),
+        RuleVerdict::Blackhole => discard(RouteKind::Blackhole),
+        RuleVerdict::Unreachable => discard(RouteKind::Unreachable),
+    }
+}
+
+fn lookup_in_table(cfg: &Config, snap: &Snapshot, q: &RouteQuery) -> KernelLookup {
     let in_table = |link: &IfName| table_of_link(cfg, snap, link) == q.table;
     let src_of = |link: &IfName, gw: Option<IpAddr>| {
         q.src.or_else(|| {
@@ -253,6 +324,7 @@ mod tests {
                 dst: dst.parse().unwrap(),
                 table: route::MAIN_TABLE_ID,
                 src: None,
+                policy: None,
             },
         )
     }

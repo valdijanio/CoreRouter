@@ -54,7 +54,7 @@ pub struct Link {
 }
 
 /// `::ffff:10.0.0.1` (a dual-stack socket) is 10.0.0.1 to the firewall.
-fn plain(ip: IpAddr) -> IpAddr {
+pub(crate) fn plain(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
         v4 => v4,
@@ -129,14 +129,14 @@ pub(crate) fn route_out(cfg: &Config, peer: IpAddr, table: &RoutingTable) -> Opt
 }
 
 /// What routing does with a packet to `peer`.
-enum Way<'a> {
+pub(crate) enum Way<'a> {
     Link(IfName),
     Discard(&'a RouteEntry),
 }
 
 /// The longest enabled connected network or active route to `peer` in
 /// `table`; discard routes (G1.5a) compete only with `discards`.
-fn best_way<'a>(
+pub(crate) fn best_way<'a>(
     cfg: &'a Config,
     peer: IpAddr,
     table: &RoutingTable,
@@ -179,14 +179,12 @@ fn best_way<'a>(
     best.map(|(_, _, way)| way)
 }
 
-/// G1.5b: the discard route that takes the replies to `peer`, the caller,
-/// in the table of the interface that holds `local`. The connection still
+/// G1.5b: the discard route that takes the replies to `peer`, the caller, in
+/// the table the routing rules choose for them. The connection still
 /// reaches the router (its addresses are in the local table, looked up
 /// first), but nothing comes back: from the operator's side it hangs.
 pub(crate) fn discard_for(cfg: &Config, peer: IpAddr, local: IpAddr) -> Option<&RouteEntry> {
-    let table = local_interface(cfg, local)
-        .and_then(|h| h.parse::<IfName>().ok())
-        .map_or(RoutingTable::Main, |h| route::table_of(cfg, &h));
+    let table = crate::policy_rule::reply_table(cfg, peer, local)?;
     match best_way(cfg, peer, &table, true)? {
         Way::Discard(r) => Some(r),
         Way::Link(_) => None,
@@ -456,6 +454,10 @@ impl Session {
                     link.peer, link.local
                 ));
             }
+        }
+        // G1.27e: a routing rule takes the replies away.
+        if let Some(why) = crate::policy_rule::reply_cut(before, after, &link) {
+            return Some(format!("{why}. {HOW_TO_PROCEED}"));
         }
         let same = before.ip.firewall == after.ip.firewall
             && before.interface_lists == after.interface_lists

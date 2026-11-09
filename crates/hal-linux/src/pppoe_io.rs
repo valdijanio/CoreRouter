@@ -187,23 +187,29 @@ fn bound(link: &LinkAddr, protocol: u16, prog: &[Ins]) -> io::Result<Socket> {
     let proto = Protocol::from(i32::from(protocol.to_be()));
     let sock = Socket::new(Domain::PACKET, Type::RAW, Some(proto))?;
     sock.set_nonblocking(true)?;
+    // An `ETH_P_ALL` socket reads every interface from `socket()` on, until
+    // the bind: an IPv6 MLD report of another port reached the BNG as a PPPoE
+    // frame of this one (2026-10-26). Nothing is kept until the bind (as
+    // libpcap does), and the real filter and buffer come after it. With the
+    // real filter and buffer before the bind, a flood of PPPoE on another
+    // port queued past what the drain reads while the bind waited: 4328
+    // frames, 232 of them read as this port's (G0.30g). The protocol cannot wait for the bind instead (0 at
+    // `socket()`, `ETH_P_ALL` in the bind address): nix builds no
+    // `sockaddr_ll` with a protocol without `unsafe`.
+    sock.attach_filter(&filter(&[(RET_K, 0, 0, 0)]))?;
+    bind(sock.as_raw_fd(), link).map_err(io_err)?;
+    drop_queued(&sock);
     crate::l2::rcvbuf(&sock, RCVBUF);
-    sock.attach_filter(&filter(prog))?;
     // The kernel's count of frames it dropped on this socket (buffer full),
     // with each frame read: `PppoePort::dropped`.
     let _ = nix::sys::socket::setsockopt(&sock, nix::sys::socket::sockopt::RxqOvfl, &1);
-    bind(sock.as_raw_fd(), link).map_err(io_err)?;
-    drop_queued(&sock);
+    sock.attach_filter(&filter(prog))?;
     Ok(sock)
 }
 
-/// Drop what a socket queued before its filter and its bind. An
-/// `ETH_P_ALL` socket reads every interface, unfiltered, from `socket()`
-/// on: an IPv6 MLD report of another port reached the BNG as a PPPoE frame
-/// of this one (the flaky `netns_pppoe_io`, 2026-10-26). The protocol
-/// cannot wait for the bind instead (0 at `socket()`, `ETH_P_ALL` in the
-/// bind address): nix builds no `sockaddr_ll` with a protocol without
-/// `unsafe`. libpcap drains the same way.
+/// Drop what a socket queued between `socket()` and its filter: at most the
+/// default buffer, and with the filter and the bind in place nothing more
+/// comes, so [`DRAIN`] reads it all.
 fn drop_queued(sock: &Socket) {
     let mut buf = [0u8; 64];
     for _ in 0..DRAIN {

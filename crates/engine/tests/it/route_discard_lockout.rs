@@ -164,6 +164,74 @@ fn only_what_wins_routing_counts() {
     .unwrap();
 }
 
+/// G1.27e: the table that counts is the one the routing rules choose.
+#[test]
+fn the_routing_rules_choose_the_table_it_looks_at() {
+    let mut s = router();
+    s.execute("routing.table.add", &json!({"name": "isp2"}))
+        .unwrap();
+    s.execute(
+        "ip.route.add",
+        &json!({"dst_address": "198.51.100.0/24", "blackhole": true, "routing_table": "isp2"}),
+    )
+    .unwrap();
+    let to_isp2 = json!({"dst_address": "198.51.100.0/24", "action": "lookup", "table": "isp2"});
+    let e = as_operator(&mut s, "routing.rule.add", to_isp2).unwrap_err();
+    assert!(matches!(e, EngineError::Lockout(_)), "{e}");
+    assert!(
+        e.to_string()
+            .contains("the blackhole route 198.51.100.0/24"),
+        "{e}"
+    );
+
+    // The other way round: the rule takes the replies past a discard of main.
+    let mut s = router();
+    s.execute("routing.table.add", &json!({"name": "isp2"}))
+        .unwrap();
+    s.execute(
+        "ip.route.add",
+        &json!({"dst_address": "198.51.100.0/24", "gateway": "ether1", "routing_table": "isp2"}),
+    )
+    .unwrap();
+    as_operator(
+        &mut s,
+        "routing.rule.add",
+        json!({"dst_address": "198.51.100.0/24", "action": "lookup", "table": "isp2"}),
+    )
+    .unwrap();
+    let r = as_operator(
+        &mut s,
+        "ip.route.add",
+        json!({"dst_address": "198.51.100.7", "blackhole": true}),
+    )
+    .unwrap();
+    assert!(warnings(&r).is_empty(), "{r}");
+}
+
+/// A table with an `unreachable` route decides: no next rule.
+#[test]
+fn a_rejecting_table_stops_the_walk() {
+    let mut s = router();
+    s.execute("routing.table.add", &json!({"name": "isp2"}))
+        .unwrap();
+    s.execute(
+        "ip.route.add",
+        &json!({"dst_address": "100.64.0.0/10", "type": "unreachable", "routing_table": "isp2"}),
+    )
+    .unwrap();
+    s.execute(
+        "routing.rule.add",
+        &json!({"dst_address": "100.64.0.0/10", "action": "lookup", "table": "isp2"}),
+    )
+    .unwrap();
+    let r = s
+        .execute("ip.route.lookup", &json!({"address": "100.64.0.1"}))
+        .unwrap();
+    assert_eq!(r["type"], "unreachable", "{r}");
+    assert_eq!(r["routing_table"], "isp2", "{r}");
+    assert_eq!(r["kernel"]["same"], true, "{r}");
+}
+
 #[test]
 fn enabling_setting_and_removing_are_checked_too() {
     let mut s = router();

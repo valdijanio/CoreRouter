@@ -24,7 +24,9 @@ pub mod lsp;
 pub mod mpls;
 pub mod neigh;
 pub mod nic;
+pub mod nic_problem;
 pub mod oslog;
+pub mod policy;
 pub mod pppoe;
 pub mod pppoe_client;
 pub mod probe;
@@ -508,6 +510,14 @@ pub trait Hal: Send {
         )))
     }
 
+    /// G1.27e: the data plane's whole rule list, in order, whoever wrote it.
+    fn rule_dump(&mut self) -> Result<Vec<policy::KernelRuleRow>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no rule list",
+            self.describe()
+        )))
+    }
+
     /// What the data plane holds now of what `cfg` (the applied config)
     /// manages, for the drift check (G1.3, see [`drift`]).
     fn snapshot(&mut self, cfg: &Config) -> Result<drift::Snapshot, HalError> {
@@ -785,6 +795,13 @@ pub trait Hal: Send {
         Err(HalError::Unsupported(
             "this backend has no OS log (the daemon's oslog service reads it)".into(),
         ))
+    }
+
+    /// The network cards and what the kernel said about them (G1.6ja), for a
+    /// backend that knows without reading a real machine (the lab). On Linux
+    /// the daemon's `nic_problems` service reads them on its own thread.
+    fn nic_reading(&mut self) -> Option<nic_problem::NicReading> {
+        None
     }
 
     fn resources(&mut self) -> Option<resources::Resources> {

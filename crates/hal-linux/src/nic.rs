@@ -243,7 +243,7 @@ fn irqs(dir: &Path) -> Vec<u32> {
 }
 
 /// The system's `pci.ids`, if any (bounded read).
-fn pci_db() -> Option<String> {
+pub(crate) fn pci_db() -> Option<String> {
     pci_ids::PATHS.iter().find_map(|p| {
         let meta = fs::metadata(p).ok()?;
         if meta.len() > pci_ids::MAX_BYTES {

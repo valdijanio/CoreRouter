@@ -199,6 +199,7 @@ fn route_get_answers_like_ip_route_get() {
                 dst: dst.parse().unwrap(),
                 table: 254,
                 src: None,
+                policy: None,
             },
         )
         .unwrap()
@@ -252,6 +253,7 @@ fn route_get_tells_the_discard_routes_apart() {
             dst: dst.parse().unwrap(),
             table: 254,
             src: None,
+            policy: None,
         };
         assert_eq!(hal.route_get(&cfg, &q).unwrap().kind, kind, "{dst}");
     }

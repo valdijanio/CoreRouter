@@ -755,13 +755,14 @@ case_ntp() {
   local ms
   ms=$(wait_for 90 ntp_sync) && result ntp OK "CoreRouter client synchronized to the CHR in ${ms} ms: $(cli system.ntp.client.get | jq -c '{status, synced_address, synced_stratum, system_offset_ms, round_trip_ms, poll_secs}')" \
     || result ntp FAIL "CoreRouter NTP client: $(cli system.ntp.client.get | jq -c '{status, last_error, synced_stratum}')"
-  # CHR → CoreRouter: there is no NTP server on the CoreRouter yet (G4.6c).
+  # CHR → CoreRouter (G4.6c): the CoreRouter answers once it has synchronized.
+  cli system.ntp.server.set '{"enabled":true}' >/dev/null
   rosx '/system ntp client set enabled=yes mode=unicast servers=10.39.1.2' >/dev/null || true
-  sleep 15
-  local s; s=$(ros system/ntp/client | jq -c '{status: (.status // null), "synced-server": (.["synced-server"] // null)}')
-  [[ $s == *synchronized* ]] && result ntp OK "CHR synchronized to the CoreRouter: $s" \
-    || result ntp INFO "CHR as client of the CoreRouter: $s (no NTP server in the CoreRouter: gap G4.6c)"
+  ros_ntp_sync() { [[ $(ros system/ntp/client | jq -r '.status // ""') == synchronized ]]; }
+  ms=$(wait_for 120 ros_ntp_sync) && result ntp OK "CHR synchronized to the CoreRouter in ${ms} ms: $(ros system/ntp/client | jq -c '{status, "synced-server": (.["synced-server"] // null), "synced-stratum": (.["synced-stratum"] // null), "system-offset": (.["system-offset"] // null)}'); server: $(cli system.ntp.server.get | jq -c '{serving, stratum, requests, replies, kisses}')" \
+    || result ntp FAIL "CHR as client of the CoreRouter: $(ros system/ntp/client | jq -c '{status: (.status // null)}'); server: $(cli system.ntp.server.get | jq -c '{listening, serving, requests, replies, denied, unsynchronized, last_error}')"
   rosx '/system ntp client set enabled=no' >/dev/null || true
+  cli system.ntp.server.set '{"enabled":false}' >/dev/null
 }
 ntp_sync() { [ "$(cli system.ntp.client.get | jq -r .status)" = synchronized ]; }
 

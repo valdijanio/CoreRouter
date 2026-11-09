@@ -310,7 +310,8 @@ fn responder(cr2: &Ns, stop: Arc<AtomicBool>) -> thread::JoinHandle<u64> {
             sent
         })
         .unwrap();
-    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    // What it takes to start with the whole suite running (G0.30e).
+    ready_rx.recv_timeout(Duration::from_secs(60)).unwrap();
     h
 }
 

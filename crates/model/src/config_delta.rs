@@ -351,9 +351,13 @@ fn light_routing(r: &Routing) -> Routing {
         ospf,
         mpls,
         tables,
+        rules,
+        next_rule_id,
     } = r;
     Routing {
         tables: tables.clone(),
+        rules: rules.clone(),
+        next_rule_id: *next_rule_id,
         rpki: rpki.clone(),
         bfd: bfd.clone(),
         ospf: ospf.clone(),
