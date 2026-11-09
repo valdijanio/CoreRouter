@@ -9,8 +9,8 @@
 
 use serde_json::{Value, json};
 
-use super::CommandSpec;
-use super::args::opt_bool;
+use super::args::{opt_bool, opt_str};
+use super::{CommandSpec, always};
 use crate::power::{Action, Power, Request, unsupported};
 use crate::{EngineError, Result, Session};
 
@@ -33,6 +33,9 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         supported,
         shutdown
     ),
+    cmd!(query "system.power.preview", "Reboot or Shutdown: what it would do", [], None,
+        "{action?: reboot|shutdown (default reboot)} → {action, supported, reason?, needs_force, safe_mode, pending_changes, blocks: [{check: safe-mode|uncommitted|install-challenge, message, forceable, fix?: {command, params}}], impact: [{what: ppp-sessions|bgp-sessions|ospf-neighbors, count}]}",
+        always, preview),
 ];
 
 fn supported(s: &Session) -> std::result::Result<(), String> {
@@ -47,6 +50,87 @@ fn shutdown(s: &mut Session, p: &Value) -> Result<Value> {
     request(s, p, Action::Shutdown)
 }
 
+const CHALLENGE_OPEN: &str = "a disk erase is waiting for its code: cancel it first (system.install.cancel)";
+
+fn safe_mode_message(what: &str) -> String {
+    format!(
+        "Safe Mode is on: the {what} would boot the config from its entry and undo the changes \
+         since; leave it first (config.safe-mode.exit keeps them) or force=true"
+    )
+}
+
+fn uncommitted_message(what: &str) -> String {
+    format!(
+        "uncommitted changes would be lost by the {what}: config.commit (or config.discard) \
+         first, or force=true"
+    )
+}
+
+/// What `request` would refuse and what the machine would drop, for the
+/// question before asking (the GUI's confirmation, a script). The refusals
+/// are `request`'s own, with what clears each; a test keeps the two together.
+fn preview(s: &mut Session, p: &Value) -> Result<Value> {
+    let action = match opt_str(p, "action")? {
+        None | Some("reboot") => Action::Reboot,
+        Some("shutdown") => Action::Shutdown,
+        Some(_) => return Err(EngineError::bad("action", "must be reboot or shutdown")),
+    };
+    let what = action.as_str();
+    let safe_mode = s.in_safe_mode();
+    let dirty = s.store().is_dirty();
+    let mut blocks = Vec::new();
+    if action == Action::Shutdown && crate::install::challenge_open(s) {
+        blocks.push(json!({
+            "check": "install-challenge",
+            "message": CHALLENGE_OPEN,
+            "forceable": false,
+            "fix": {"command": "system.install.cancel", "params": {}},
+        }));
+    }
+    if safe_mode {
+        blocks.push(json!({
+            "check": "safe-mode",
+            "message": safe_mode_message(what),
+            "forceable": true,
+            "fix": {"command": "config.safe-mode.exit", "params": {}},
+        }));
+    }
+    if dirty {
+        blocks.push(json!({
+            "check": "uncommitted",
+            "message": uncommitted_message(what),
+            "forceable": true,
+            "fix": {"command": "config.commit", "params": {}},
+        }));
+    }
+    let mut impact = Vec::new();
+    let mut count = |what: &str, n: u64| {
+        if n > 0 {
+            impact.push(json!({"what": what, "count": n}));
+        }
+    };
+    // Counters kept by the services: nothing here walks the sessions.
+    count("ppp-sessions", s.ppp_backend().map_or(0, |b| b.stats().sessions));
+    if let Some(r) = s.routing_status() {
+        count("bgp-sessions", r.bgp_sessions.iter().filter(|b| b.established).count() as u64);
+        count("ospf-neighbors", r.ospf_neighbors.len() as u64);
+    }
+    let reason = unsupported(s);
+    let mut out = json!({
+        "action": what,
+        "supported": reason.is_none(),
+        "needs_force": safe_mode || dirty,
+        "safe_mode": safe_mode,
+        "pending_changes": s.store().diff().len(),
+        "blocks": blocks,
+        "impact": impact,
+    });
+    if let (Some(r), Some(o)) = (reason, out.as_object_mut()) {
+        o.insert("reason".into(), json!(r));
+    }
+    Ok(out)
+}
+
 fn request(s: &mut Session, p: &Value, action: Action) -> Result<Value> {
     let what = action.as_str();
     // G1.6y: PID 1 counts the power-off signal as the power button while a
@@ -54,7 +138,7 @@ fn request(s: &mut Session, p: &Value, action: Action) -> Result<Value> {
     if action == Action::Shutdown && crate::install::challenge_open(s) {
         return Err(EngineError::Disabled {
             id: "system.shutdown".into(),
-            reason: "a disk erase is waiting for its code: cancel it first (system.install.cancel)".into(),
+            reason: CHALLENGE_OPEN.into(),
         });
     }
     if opt_bool(p, "confirm")? != Some(true) {
@@ -66,23 +150,11 @@ fn request(s: &mut Session, p: &Value, action: Action) -> Result<Value> {
     let force = opt_bool(p, "force")?.unwrap_or(false);
     let safe_mode = s.in_safe_mode();
     if safe_mode && !force {
-        return Err(EngineError::bad(
-            "force",
-            format!(
-                "Safe Mode is on: the {what} would boot the config from its entry and undo the \
-                 changes since; leave it first (config.safe-mode.exit keeps them) or force=true"
-            ),
-        ));
+        return Err(EngineError::bad("force", safe_mode_message(what)));
     }
     let dirty = s.store().is_dirty();
     if dirty && !force {
-        return Err(EngineError::bad(
-            "force",
-            format!(
-                "uncommitted changes would be lost by the {what}: config.commit (or \
-                 config.discard) first, or force=true"
-            ),
-        ));
+        return Err(EngineError::bad("force", uncommitted_message(what)));
     }
     let by = s.caller().name.clone();
     let p = s
@@ -166,6 +238,58 @@ mod tests {
         assert!(power::take_request(&mut s).is_none(), "nothing asked");
         let out = s.execute("system.shutdown", &json!({"confirm": true, "force": true})).unwrap();
         assert_eq!(out["discarded_changes"], true);
+    }
+
+    #[test]
+    fn preview_says_what_the_command_would_refuse_and_clears_with_the_fix() {
+        let ask = |s: &mut Session| s.execute("system.power.preview", &json!({})).unwrap();
+        let mut lab = Session::virtual_lab();
+        let v = ask(&mut lab);
+        assert_eq!(v["supported"], false, "{v}");
+        assert!(v["reason"].as_str().unwrap().contains("virtual lab"), "{v}");
+
+        let mut s = image();
+        let v = ask(&mut s);
+        assert_eq!((&v["supported"], &v["needs_force"], &v["action"]), (&json!(true), &json!(false), &json!("reboot")));
+        assert_eq!(v["blocks"], json!([]));
+        assert!(v.get("reason").is_none());
+
+        // Each block is what the command answers, and its fix clears it.
+        s.execute("config.safe-mode.enter", &json!({})).unwrap();
+        let v = ask(&mut s);
+        assert_eq!(v["needs_force"], true);
+        assert_eq!(v["blocks"][0]["check"], "safe-mode");
+        let refused = s.execute("system.reboot", &json!({"confirm": true})).unwrap_err().to_string();
+        assert!(refused.contains(v["blocks"][0]["message"].as_str().unwrap()), "{refused}");
+        let fix = &v["blocks"][0]["fix"];
+        s.execute(fix["command"].as_str().unwrap(), &fix["params"]).unwrap();
+        assert_eq!(ask(&mut s)["needs_force"], false);
+
+        s.execute("config.mode.set", &json!({"mode": "transactional"})).unwrap();
+        s.execute("system.identity.set", &json!({"name": "pending"})).unwrap();
+        let v = ask(&mut s);
+        assert_eq!(v["blocks"][0]["check"], "uncommitted");
+        assert_eq!(v["pending_changes"], 1);
+        let fix = &v["blocks"][0]["fix"];
+        s.execute(fix["command"].as_str().unwrap(), &fix["params"]).unwrap();
+        s.execute("system.reboot", &json!({"confirm": true})).unwrap();
+
+        let e = s.execute("system.power.preview", &json!({"action": "halt"})).unwrap_err().to_string();
+        assert!(e.contains("reboot or shutdown"), "{e}");
+    }
+
+    #[test]
+    fn preview_counts_only_what_is_up() {
+        use corerouter_model::routing_state::{BgpSession, RoutingStatus};
+        let mut s = image();
+        assert_eq!(s.execute("system.power.preview", &json!({})).unwrap()["impact"], json!([]));
+        let session = |established| BgpSession { established, ..Default::default() };
+        if let Some(r) = s.ext_mut::<RoutingStatus>() {
+            r.bgp_sessions = vec![session(true), session(false), session(true)];
+        }
+        let v = s.execute("system.power.preview", &json!({"action": "shutdown"})).unwrap();
+        assert_eq!(v["action"], "shutdown");
+        assert_eq!(v["impact"], json!([{"what": "bgp-sessions", "count": 2}]));
     }
 
     /// Rollback: in an atomic batch nothing may happen until the whole
