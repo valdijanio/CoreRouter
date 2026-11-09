@@ -158,9 +158,16 @@ impl FileStorage {
             // The config will hold secrets (BGP/RADIUS keys): owner only.
             opts.mode(0o600);
         }
-        let mut f = opts.open(self.path(file))?;
-        f.write_all(data.as_bytes())?;
-        f.sync_all()
+        let path = self.path(file);
+        let mut f = opts.open(&path)?;
+        let written = f.write_all(data.as_bytes()).and_then(|()| f.sync_all());
+        if written.is_err() {
+            // A full disk must not also collect half-written temporaries,
+            // one per failed commit (G1.6w).
+            drop(f);
+            let _ = fs::remove_file(&path);
+        }
+        written
     }
 
     /// Make the renames durable (POSIX: a rename is only on disk once the

@@ -16,7 +16,15 @@
 //! restart loses only the time the router was down (`NaN` slots, holes in
 //! the graph). A file that cannot be read is renamed `*.corrupt` and the
 //! series starts again.
+//!
+//! G1.6w: the files stay under their share of `/config`
+//! ([`corerouter_engine::config_disk`]). A new series past it is refused by
+//! the engine; here, at boot and after each store, what is on disk past it
+//! is deleted, the oldest first (`*.corrupt`, then the files that have not
+//! been written for longest; a series being kept is never deleted, it would
+//! only be written again).
 
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -101,6 +109,8 @@ fn load(session: &Shared, dir: &Path) {
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     let max = Rrd::size_for(MAX_DS) as u64;
+    let disk_cap = lock(session).ext::<GraphDb>().and_then(GraphDb::disk_cap);
+    let removed = disk_cap.map_or(0, |cap| trim(dir, cap, &BTreeSet::new(), &mut errors));
     match fs::read_dir(dir) {
         Ok(entries) => {
             for e in entries.flatten() {
@@ -125,13 +135,14 @@ fn load(session: &Shared, dir: &Path) {
         Err(e) => errors.push(format!("{}: {e}", dir.display())),
     }
     let mut s = lock(session);
-    let cap = s.store().running().system.graphing.max_memory_bytes();
+    let graphing = s.store().running().system.graphing.clone();
     let Some(db) = s.ext_mut::<GraphDb>() else { return };
+    let cap = db.cap(&graphing);
     db.set_persistent(&dir.display().to_string());
     let mut loaded = 0;
     for (name, bytes) in files {
         if db.memory_bytes().saturating_add(bytes.len() as u64) > cap {
-            errors.push(format!("{name}: over max-memory, not loaded (kept on disk)"));
+            errors.push(format!("{name}: over the ceiling, not loaded (kept on disk)"));
             continue;
         }
         match db.load(&name, &bytes) {
@@ -144,6 +155,7 @@ fn load(session: &Shared, dir: &Path) {
     }
     db.disk.loaded = loaded;
     db.disk.files = loaded;
+    db.disk.removed = db.disk.removed.saturating_add(removed);
     for e in &errors {
         log::warn!("graphing: {e}");
     }
@@ -154,13 +166,61 @@ fn load(session: &Shared, dir: &Path) {
     }
 }
 
+/// Delete what is past `cap` bytes in `dir`, the oldest first, never a
+/// file in `keep`. Returns how many went; each goes to `errors` and the log.
+fn trim(dir: &Path, cap: u64, keep: &BTreeSet<String>, errors: &mut Vec<String>) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else { return 0 };
+    let mut files: Vec<(bool, std::time::SystemTime, String, u64)> = Vec::new();
+    for e in entries.flatten() {
+        let (Some(name), Ok(m)) = (e.file_name().to_str().map(str::to_owned), e.metadata()) else {
+            continue;
+        };
+        if m.is_file() && (name.ends_with(".rrd") || name.ends_with(".corrupt")) {
+            let when = m.modified().unwrap_or(std::time::UNIX_EPOCH);
+            files.push((name.ends_with(".rrd"), when, name, m.len()));
+        }
+    }
+    let mut total: u64 = files.iter().map(|f| f.3).sum();
+    if total <= cap {
+        return 0;
+    }
+    // `.corrupt` first (false sorts first), then the least recently written.
+    files.sort();
+    let mut removed = 0;
+    for (_, _, name, len) in files {
+        if total <= cap {
+            break;
+        }
+        if keep.contains(&name) {
+            continue;
+        }
+        match fs::remove_file(dir.join(&name)) {
+            Ok(()) => {
+                total = total.saturating_sub(len);
+                removed += 1;
+                errors.push(format!("{name}: deleted, the graph files would pass their share of /config"));
+            }
+            Err(e) => errors.push(format!("{name}: cannot delete: {e}")),
+        }
+    }
+    removed
+}
+
 /// Write what changed (`seconds`: the 1 s rings too). Returns the bytes
 /// written. The session is locked only to take the patches and to report.
 pub(crate) fn store(session: &Shared, dir: &Path, seconds: bool) -> Result<u64, String> {
     let started = Instant::now();
-    let patches = match lock(session).ext_mut::<GraphDb>() {
-        Some(db) => db.take_patches(seconds),
-        None => return Ok(0),
+    let (patches, disk_cap, keep) = {
+        let mut s = lock(session);
+        let Some(db) = s.ext_mut::<GraphDb>() else { return Ok(0) };
+        let patches = db.take_patches(seconds);
+        let cap = db.disk_cap();
+        let keep: BTreeSet<String> = if cap.is_some() {
+            db.keys().filter_map(corerouter_engine::graph::file_name).collect()
+        } else {
+            BTreeSet::new()
+        };
+        (patches, cap, keep)
     };
     let mut bytes = 0u64;
     let mut failed: Vec<(String, String)> = Vec::new();
@@ -181,6 +241,11 @@ pub(crate) fn store(session: &Shared, dir: &Path, seconds: bool) -> Result<u64, 
             Err(e) => failed.push((file.clone(), e.to_string())),
         }
     }
+    let mut trimmed = Vec::new();
+    let removed = disk_cap.map_or(0, |cap| trim(dir, cap, &keep, &mut trimmed));
+    for line in &trimmed {
+        log::warn!("graphing: {line}");
+    }
     let files = fs::read_dir(dir)
         .map(|d| d.flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".rrd")).count())
         .unwrap_or(0);
@@ -190,6 +255,7 @@ pub(crate) fn store(session: &Shared, dir: &Path, seconds: bool) -> Result<u64, 
         db.rewrite(file);
     }
     let d = &mut db.disk;
+    d.removed = d.removed.saturating_add(removed);
     d.files = files;
     d.stores += 1;
     d.bytes_written = d.bytes_written.saturating_add(bytes);
@@ -274,6 +340,40 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// G1.6w: past the share, the oldest files go (a damaged one first),
+    /// never one being kept; a boot brings a directory back under it.
+    #[test]
+    fn the_files_stay_under_the_share_of_config() {
+        let dir = tmp();
+        for (name, age) in [("a.rrd", 300), ("b.rrd", 200), ("c.rrd", 100), ("d.rrd.corrupt", 1)] {
+            let path = dir.join(name);
+            fs::write(&path, vec![0u8; 1000]).unwrap();
+            let when = std::time::SystemTime::now() - Duration::from_secs(age);
+            File::options().write(true).open(&path).unwrap().set_modified(when).unwrap();
+        }
+        let mut errors = Vec::new();
+        assert_eq!(trim(&dir, 4000, &BTreeSet::new(), &mut errors), 0, "fits");
+        assert_eq!(trim(&dir, 3000, &BTreeSet::new(), &mut errors), 1);
+        assert!(!dir.join("d.rrd.corrupt").exists(), "the damaged one goes first");
+        let keep = BTreeSet::from(["a.rrd".to_owned()]);
+        assert_eq!(trim(&dir, 2000, &keep, &mut errors), 1);
+        assert!(dir.join("a.rrd").exists(), "kept, though the oldest");
+        assert!(!dir.join("b.rrd").exists());
+        assert_eq!(errors.len(), 2, "{errors:?}");
+
+        // What a boot does with a small /config: a file past the share is
+        // gone, and the status says so.
+        let s = shared(Session::virtual_lab());
+        lock(&s).set_config_capacity(Some(4000));
+        load(&s, &dir);
+        let print = lock(&s).execute("system.graph.print", &serde_json::json!({})).unwrap();
+        assert_eq!(print["max_memory_bytes"], 1000);
+        assert_eq!(print["disk"]["removed"], 1, "{print}");
+        let left = fs::read_dir(&dir).unwrap().count();
+        assert_eq!(left, 1);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
