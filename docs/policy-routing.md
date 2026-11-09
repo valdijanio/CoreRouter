@@ -141,3 +141,11 @@ ajudam):
 Inserir no topo renumera todas as de baixo, e o kernel percorre a lista a cada inserção. É o pior caso
 de uma operação rara. A primeira regra sobre 200 000 rotas na `main` levou 3,7 ms: o `fib_unmerge`,
 que roda uma vez, não pesa.
+
+## Na GUI
+
+Routing › Rules tem três abas. **Rules** lista as regras em ordem, com ação e tabela em selos, Move Up e
+Move Down, o modal de adicionar e editar (o motor faz a prévia e pergunta antes de cortar a sessão) e
+**Test a Packet**, que mostra a regra que decidiu e por quais passou. **Tables** lista as tabelas,
+incluindo `main` e VRFs, que ficam travadas. **Kernel List** mostra a lista do kernel com o dono de cada
+linha, o drift e as marcas sem tabela.

@@ -207,6 +207,157 @@ fn health_sees_the_client_state() {
     assert!(text.contains("relógio sincronizado"), "{text}");
 }
 
+/// G4.6c: `system.ntp.server.*`.
+#[test]
+fn ntp_server_settings() {
+    let mut s = Session::virtual_lab();
+    let got = ok(&mut s, "system.ntp.server.get", Value::Null);
+    assert_eq!(got["enabled"], false, "off by default");
+    assert_eq!(got["local_clock_stratum"], 5);
+    assert_eq!(got["rate_limit"], true);
+    assert_eq!(got["listening"], false);
+    assert_eq!(got["serving"], "no");
+    assert!(
+        got["allowed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n == "192.168.0.0/16")
+    );
+
+    let set = ok(
+        &mut s,
+        "system.ntp.server.set",
+        json!({"enabled": true, "use_local_clock": true, "local_clock_stratum": 8, "allowed": "10.0.0.0/8, 2001:db8::/32"}),
+    );
+    assert_eq!(set["allowed"], json!(["10.0.0.0/8", "2001:db8::/32"]));
+    assert!(s.store().running().system.ntp_server.enabled);
+
+    for (p, needle) in [
+        (json!({"local_clock_stratum": 0}), "1..=15"),
+        (json!({"local_clock_stratum": 16}), "1..=15"),
+        (json!({"allowed": ["not a net"]}), "address-list name"),
+        (
+            json!({"allowed": (0..65).map(|i| format!("10.{i}.0.0/16")).collect::<Vec<_>>()}),
+            "at most 64",
+        ),
+        (json!({"broadcast": true}), "at least one address"),
+        (
+            json!({"broadcast_addresses": ["nope"]}),
+            "broadcast_addresses",
+        ),
+        (
+            json!({"broadcast": true, "broadcast_addresses": ["ff02::1"]}),
+            "only IPv4",
+        ),
+        (json!({"vrf": "ghost"}), "no VRF"),
+        (json!({"enable": true}), "did you mean"),
+    ] {
+        fails(&mut s, "system.ntp.server.set", p, needle);
+    }
+    ok(
+        &mut s,
+        "system.ntp.server.set",
+        json!({"broadcast": true, "broadcast_addresses": ["192.168.88.255"]}),
+    );
+    // An empty list is allowed: it answers nobody, the VyOS way of saying no.
+    ok(&mut s, "system.ntp.server.set", json!({"allowed": []}));
+    let mut cfg = s.store().candidate().clone();
+    cfg.system.ntp_server.local_clock_stratum = 0;
+    cfg.system.ntp_server.vrf = "ghost".into();
+    cfg.system.ntp_server.broadcast_addresses.clear();
+    let issues = corerouter_engine::validate::validate_all(&cfg);
+    for path in ["local_clock_stratum", "vrf", "broadcast_addresses"] {
+        let path = format!("system.ntp_server.{path}");
+        assert!(issues.iter().any(|i| i.path == path), "{path}: {issues:?}");
+    }
+}
+
+/// `allowed` takes firewall address lists: static and dynamic entries, not
+/// the disabled ones; a list with nothing in it lets nobody in.
+#[test]
+fn ntp_server_allowed_takes_address_lists() {
+    let mut s = Session::virtual_lab();
+    ok(
+        &mut s,
+        "system.ntp.server.set",
+        json!({"allowed": ["10.0.0.0/8", "lan", "ghost"]}),
+    );
+    let (sources, empty) = s.ntp_server_sources();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(empty, ["lan", "ghost"], "named, and nothing in them yet");
+
+    ok(
+        &mut s,
+        "ip.firewall.address-list.add",
+        json!({"list": "lan", "address": "192.168.88.0/24"}),
+    );
+    ok(
+        &mut s,
+        "ip.firewall.address-list.add",
+        json!({"list": "lan", "address": "192.168.99.0/24", "disabled": true}),
+    );
+    ok(
+        &mut s,
+        "ip.firewall.address-list.add",
+        json!({"list": "lan", "address": "192.168.77.7", "timeout": "1h"}),
+    );
+    ok(
+        &mut s,
+        "ip.firewall.address-list.add",
+        json!({"list": "other", "address": "172.16.0.0/12"}),
+    );
+    let (sources, empty) = s.ntp_server_sources();
+    assert_eq!(empty, ["ghost"]);
+    let set = corerouter_model::source_set::SourceSet::new(sources);
+    for (ip, want) in [
+        ("10.1.2.3", true),
+        ("192.168.88.5", true),
+        ("192.168.77.7", true),
+        ("192.168.99.5", false),
+        ("172.16.0.1", false),
+        ("8.8.8.8", false),
+    ] {
+        assert_eq!(set.contains(ip.parse().unwrap()), want, "{ip}");
+    }
+}
+
+/// RouterOS's `using-local-clock`: only with no good answer.
+#[test]
+fn the_client_reports_the_local_clock() {
+    let mut s = Session::virtual_lab();
+    ok(
+        &mut s,
+        "system.ntp.client.set",
+        json!({"enabled": true, "servers": ["192.0.2.1"]}),
+    );
+    s.set_ntp_status(NtpStatus {
+        status: NtpState::Waiting,
+        ..NtpStatus::default()
+    });
+    assert_eq!(
+        ok(&mut s, "system.ntp.client.get", Value::Null)["status"],
+        "waiting"
+    );
+    ok(
+        &mut s,
+        "system.ntp.server.set",
+        json!({"enabled": true, "use_local_clock": true}),
+    );
+    assert_eq!(
+        ok(&mut s, "system.ntp.client.get", Value::Null)["status"],
+        "using-local-clock"
+    );
+    s.set_ntp_status(NtpStatus {
+        status: NtpState::Synchronized,
+        ..NtpStatus::default()
+    });
+    assert_eq!(
+        ok(&mut s, "system.ntp.client.get", Value::Null)["status"],
+        "synchronized"
+    );
+}
+
 #[test]
 fn ntp_status_comes_from_the_daemon_and_stops_with_the_client() {
     let mut s = Session::virtual_lab();
