@@ -23,6 +23,11 @@
 //! said `force: true` (or Safe Mode is on: then losing the connection
 //! already undoes the change). Callers inside the process (the GUI lab,
 //! tests, `corerouter-cli run`) have no connection to lose.
+//!
+//! G1.6p: a browser's session comes through `www-ssl`. Changing the service
+//! leaves the open connection up, but the next login comes through it too:
+//! turning it off, moving it or leaving the caller's address out of
+//! `available_from` is refused the same way ([`service_cut`]).
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -30,6 +35,7 @@ use corerouter_firewall::eval::{Outcome, Packet, Verdict, walk};
 use corerouter_model::route::{self, Reach};
 use corerouter_model::{Config, IfName, RoutingTable};
 use corerouter_model::firewall::{ConnState, DynamicAddress, Protocol, Table};
+use corerouter_model::web::WebListener;
 use serde_json::Value;
 
 use crate::cmd::args::opt_bool;
@@ -175,6 +181,36 @@ pub fn access_addresses(cfg: &Config, link: &Link) -> Vec<(corerouter_model::Ite
         .collect()
 }
 
+/// Whether this connection came in through listener `w`: the port and an
+/// address that covers ours. The listeners are the only sockets on their port.
+pub(crate) fn comes_through(w: &WebListener, link: &Link) -> bool {
+    w.enabled
+        && w.port == link.local.port()
+        && (w.address.is_unspecified() || plain(w.address) == plain(link.local.ip()))
+}
+
+/// What changing `www-ssl` from `before` to `after` does to the caller's next
+/// login, when this session comes through it (G1.6p); `None`: nothing.
+pub(crate) fn service_cut(before: &WebListener, after: &WebListener, link: &Link) -> Option<String> {
+    if !comes_through(before, link) {
+        return None;
+    }
+    let what = if !after.enabled {
+        "would turn off www-ssl"
+    } else if !comes_through(after, link) {
+        "would move www-ssl away from the address and port"
+    } else if !after.allows(link.peer.ip()) {
+        "would leave your address out of the available_from of www-ssl"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "{what}, which this session uses (tcp {} -> {}): this connection stays up, but the next \
+         login from here would find nothing. {HOW_TO_PROCEED}",
+        link.peer, link.local
+    ))
+}
+
 fn probes(cfg: &Config, dynamic: &[DynamicAddress], link: &Link) -> Vec<Probe> {
     let (peer, local) = (plain(link.peer.ip()), plain(link.local.ip()));
     let iface = ingress_interface(cfg, peer, local);
@@ -303,6 +339,9 @@ impl Session {
         dyn_after: &[DynamicAddress],
     ) -> Option<String> {
         let link = self.caller().link?;
+        if let Some(why) = service_cut(&before.system.web.www_ssl, &after.system.web.www_ssl, &link) {
+            return Some(why);
+        }
         let local = plain(link.local.ip());
         let (iface_before, iface_after) =
             (local_interface(before, local), local_interface(after, local));
@@ -419,6 +458,39 @@ pub(crate) fn firewall_cut(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_service_cuts_only_the_session_it_carries() {
+        let link = Link { peer: "192.0.2.7:50000".parse().unwrap(), local: "192.0.2.1:443".parse().unwrap() };
+        let on = WebListener { enabled: true, ..corerouter_model::web::WebService::factory().www_ssl };
+        let with = |f: &dyn Fn(&mut WebListener)| {
+            let mut w = on.clone();
+            f(&mut w);
+            w
+        };
+        assert!(comes_through(&on, &link), "every address, port 443");
+        // Unchanged, or a change that still lets this client back in.
+        assert_eq!(service_cut(&on, &on, &link), None);
+        let ok = with(&|w| w.available_from = vec!["192.0.2.0/24".parse().unwrap()]);
+        assert_eq!(service_cut(&on, &ok, &link), None);
+        let ok = with(&|w| w.address = "192.0.2.1".parse().unwrap());
+        assert_eq!(service_cut(&on, &ok, &link), None);
+        // Each way of losing the next login.
+        for (after, says) in [
+            (with(&|w| w.enabled = false), "turn off"),
+            (with(&|w| w.port = 8443), "move"),
+            (with(&|w| w.address = "192.0.2.9".parse().unwrap()), "move"),
+            (with(&|w| w.available_from = vec!["198.51.100.0/24".parse().unwrap()]), "leave your address out"),
+        ] {
+            let why = service_cut(&on, &after, &link).unwrap();
+            assert!(why.contains(says) && why.contains("Safe Mode"), "{why}");
+        }
+        // Another session (the TLS control port): the service is not its way in.
+        let other = Link { local: "192.0.2.1:8729".parse().unwrap(), ..link };
+        assert_eq!(service_cut(&on, &with(&|w| w.enabled = false), &other), None);
+        // Off before: nothing to lose.
+        assert_eq!(service_cut(&with(&|w| w.enabled = false), &on, &link), None);
+    }
 
     #[test]
     fn mapped_addresses_and_interfaces() {
