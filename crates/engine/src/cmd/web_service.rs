@@ -19,7 +19,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Web Access (HTTPS)",
         [],
         None,
-        "{enabled?: bool, address?: ip, port?: int 1..65535, available_from?: [prefix]} → {enabled, address, port, available_from, warning?}",
+        "{enabled?: bool, address?: ip, port?: int 1..65535, available_from?: [prefix], force?: bool (even if the next login of this session could not come back through it)} → {enabled, address, port, available_from, warning?}",
         always,
         set_ssl
     ),
@@ -41,7 +41,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Row {
+pub(super) enum Row {
     Ssl,
     Plain,
 }
@@ -62,7 +62,9 @@ fn settings_json(c: &WebListener) -> Value {
     })
 }
 
-fn set(s: &mut Session, p: &Value, r: Row) -> Result<Value> {
+/// Applies `p` to row `r` of `web`: the rules of `set`, also for the preview
+/// (`ip.service.check`, on a copy).
+pub(super) fn apply(web: &mut WebService, p: &Value, r: Row) -> Result<Value> {
     let enabled = opt_bool(p, "enabled")?;
     let address = opt_parse::<std::net::IpAddr>(p, "address")?;
     let port = opt_u32(p, "port")?
@@ -74,8 +76,7 @@ fn set(s: &mut Session, p: &Value, r: Row) -> Result<Value> {
         })
         .transpose()?;
     let from = available_from(p)?;
-    let mut web = s.store().candidate().system.web.clone();
-    let c = row(&mut web, r);
+    let c = row(web, r);
     if let Some(e) = enabled {
         c.enabled = e;
     }
@@ -118,11 +119,20 @@ fn set(s: &mut Session, p: &Value, r: Row) -> Result<Value> {
     if let (Some(w), Some(o)) = (warning, out.as_object_mut()) {
         o.insert("warning".into(), json!(w));
     }
+    Ok(out)
+}
+
+fn set(s: &mut Session, p: &Value, r: Row) -> Result<Value> {
+    if r == Row::Ssl {
+        crate::lockout::take_force(s, p)?;
+    }
+    let mut web = s.store().candidate().system.web.clone();
+    let out = apply(&mut web, p, r)?;
     s.store_mut().candidate_mut().system.web = web;
     Ok(out)
 }
 
-fn get(s: &mut Session, r: Row) -> Result<Value> {
+pub(super) fn get(s: &mut Session, r: Row) -> Result<Value> {
     let mut cfg = s.store().candidate().system.web.clone();
     let mut out = settings_json(row(&mut cfg, r));
     let mut running = s.store().running().system.web.clone();

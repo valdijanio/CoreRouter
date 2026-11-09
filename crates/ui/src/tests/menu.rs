@@ -87,7 +87,7 @@ fn ip_groups_dhcp_and_dns_and_keeps_single_items_loose() {
             Node::Sub { .. } => None,
         })
         .collect();
-    assert_eq!(loose, ["Addresses", "ARP", "Fast Path", "Firewall", "Firewall XDP", "Neighbors", "Routes", "Subscriber Notices", "Traffic Flow", "VRF"]);
+    assert_eq!(loose, ["Addresses", "ARP", "Fast Path", "Firewall", "Firewall XDP", "Neighbors", "Routes", "IP Services", "Subscriber Notices", "Traffic Flow", "VRF"]);
     let names: Vec<&str> = ip.nodes.iter().map(|n| match n {
         Node::Item(w) => menu::label(*w),
         Node::Sub { name, .. } => name,
