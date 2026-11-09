@@ -34,6 +34,9 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "routing.rule.list", "Routing Rules", ["Routing", "Rules"], None,
         "{} → [{id, position, flags (X disabled), src_address, dst_address, interface, routing_mark, action, table (null: the action has none), min_prefix, family (ipv4 | ipv6 | both), priority (kernel priority), disabled, comment, summary, notices: [{level, text, id, args}]}]",
         always, list),
+    cmd!(query "routing.rule.preview", "Check Routing Rule", [], None,
+        "{id?: *hex (the rule being edited), src_address?: string, dst_address?: string, interface?: string, routing_mark?: string, action?: string, table?: string, min_prefix?: u32 | string, disabled?: bool | yes | no, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk} (form texts accepted; never an error: bad input is a check)",
+        always, preview),
     cmd!(query "routing.rule.kernel", "Kernel Rule List", [], None,
         "{} → {available, reason, rules: [{priority, family, src, dst, iif, fwmark, action, table, owner (kernel | corerouter | foreign), rule (the id of the routing rule; null), what}], marks_without_table: [string], drift: [string]}",
         always, kernel),
@@ -151,7 +154,7 @@ fn fill(r: &mut RoutingRule, p: &Value) -> Result<()> {
     Ok(())
 }
 
-fn check(cfg: &Config, r: &RoutingRule) -> Result<()> {
+fn check_rule(cfg: &Config, r: &RoutingRule) -> Result<()> {
     match rule_issues(cfg, r).into_iter().next() {
         Some((field, why)) => Err(EngineError::bad(field, why)),
         None => Ok(()),
@@ -167,12 +170,8 @@ fn position(cfg: &Config, id: ItemId, key: &str) -> Result<usize> {
         .ok_or_else(|| EngineError::bad(key, format!("no routing rule {id} (see routing.rule.list)")))
 }
 
-/// `min_prefix: Some` on a family decided only now: checked again by
-/// [`check`] with the final addresses.
-fn add(s: &mut Session, p: &Value) -> Result<Value> {
-    take_force(s, p)?;
-    let before: Option<ItemId> = opt_parse(p, "place_before")?;
-    let mut rule = RoutingRule {
+fn blank_rule() -> RoutingRule {
+    RoutingRule {
         id: ItemId(0),
         src_address: None,
         dst_address: None,
@@ -183,10 +182,16 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
         min_prefix: None,
         disabled: false,
         comment: String::new(),
-    };
+    }
+}
+
+fn add(s: &mut Session, p: &Value) -> Result<Value> {
+    take_force(s, p)?;
+    let before: Option<ItemId> = opt_parse(p, "place_before")?;
+    let mut rule = blank_rule();
     fill(&mut rule, p)?;
     let cfg = s.store_mut().candidate_mut();
-    check(cfg, &rule)?;
+    check_rule(cfg, &rule)?;
     if cfg.routing.rules.len() >= MAX_RULES {
         return Err(EngineError::bad(
             "action",
@@ -239,7 +244,7 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         .cloned()
         .ok_or_else(|| EngineError::bad("id", format!("no routing rule {id}")))?;
     fill(&mut rule, p)?;
-    check(cfg, &rule)?;
+    check_rule(cfg, &rule)?;
     let text = summary(&rule);
     if let Some(slot) = cfg.routing.rules.get_mut(pos) {
         *slot = rule;
@@ -333,6 +338,119 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
         })
         .collect();
     Ok(Value::Array(rows))
+}
+
+/// The form's texts as `add`/`set` parameters: empty leaves a field out when
+/// adding and clears it when editing.
+fn form_params(raw: &Value, editing: bool) -> Value {
+    let mut p = serde_json::Map::new();
+    for key in ["src_address", "dst_address", "interface", "routing_mark", "action", "table", "comment"] {
+        match raw.get(key).and_then(Value::as_str).map(str::trim) {
+            Some("") if key == "comment" && editing => {
+                p.insert(key.into(), json!(""));
+            }
+            Some("") if editing && !matches!(key, "action" | "table") => {
+                p.insert(key.into(), Value::Null);
+            }
+            Some("") | None => {}
+            Some(v) => {
+                p.insert(key.into(), json!(v));
+            }
+        }
+    }
+    match raw.get("min_prefix") {
+        Some(Value::String(t)) if t.trim().is_empty() => {
+            if editing {
+                p.insert("min_prefix".into(), Value::Null);
+            }
+        }
+        Some(Value::String(t)) => {
+            let v = t.trim().parse::<u32>().map_or_else(|_| json!(t), |n| json!(n));
+            p.insert("min_prefix".into(), v);
+        }
+        Some(v @ Value::Number(_)) => {
+            p.insert("min_prefix".into(), v.clone());
+        }
+        _ => {}
+    }
+    let disabled = match raw.get("disabled") {
+        Some(Value::Bool(b)) => Some(*b),
+        Some(Value::String(t)) => Some(t == "yes" || t == "true"),
+        _ => None,
+    };
+    if let Some(d) = disabled.filter(|d| *d || editing) {
+        p.insert("disabled".into(), json!(d));
+    }
+    if let Some(id) = raw.get("id").filter(|_| editing) {
+        p.insert("id".into(), id.clone());
+    }
+    Value::Object(p)
+}
+
+fn preview(s: &mut Session, raw: &Value) -> Result<Value> {
+    let editing = raw.get("id").is_some_and(|i| !i.is_null());
+    let p = form_params(raw, editing);
+    let check = |level: &str, check: &str, message: String, param: &str| {
+        json!({"level": level, "check": check, "message": message, "param": param})
+    };
+    let mut checks = Vec::new();
+    let mut computed = Vec::new();
+    let mut commands = Vec::new();
+    let mut risk = None;
+    let mut next = s.store().candidate().clone();
+    let fail = |e: EngineError, checks: &mut Vec<Value>| match e {
+        EngineError::BadParam { param, reason } => {
+            checks.push(check("error", "param", reason, &param));
+        }
+        e => checks.push(check("error", "param", e.to_string(), "")),
+    };
+    let base = if editing {
+        let id: Option<ItemId> = opt_parse(&p, "id").unwrap_or(None);
+        id.and_then(|id| next.routing.rules.iter().position(|r| r.id == id))
+            .and_then(|pos| next.routing.rules.get(pos).cloned().map(|r| (pos, r)))
+    } else {
+        let at = next.routing.rules.len();
+        Some((at, blank_rule()))
+    };
+    match base {
+        None => checks.push(check("error", "param", "no such rule".to_owned(), "id")),
+        Some((pos, mut rule)) => match fill(&mut rule, &p).and_then(|()| check_rule(&next, &rule)) {
+            Err(e) => fail(e, &mut checks),
+            Ok(()) => {
+                if editing {
+                    if let Some(slot) = next.routing.rules.get_mut(pos) {
+                        *slot = rule.clone();
+                    }
+                } else {
+                    next.routing.rules.insert(pos, rule.clone());
+                }
+                let family = match rule.is_v6() {
+                    Some(true) => "IPv6",
+                    Some(false) => "IPv4",
+                    None => "IPv4 and IPv6",
+                };
+                computed.push(json!({"label": "Family", "value": family}));
+                computed.push(json!({"label": "Kernel priority", "value": rule_pref(pos).to_string()}));
+                computed.push(json!({"label": "Summary", "value": summary(&rule)}));
+                let cfg = &next;
+                let has_route = |r: &RoutingRule| table_has_route(cfg, r);
+                for n in notices(cfg, pos, &has_route) {
+                    let text = n.get("text").and_then(Value::as_str).unwrap_or_default().to_owned();
+                    checks.push(check("warning", "effect", text, ""));
+                }
+                if next.routing.rules.len() >= COST_NOTICE {
+                    checks.push(check("warning", "cost", cost_notice(next.routing.rules.len()), ""));
+                }
+                let command = if editing { "routing.rule.set" } else { "routing.rule.add" };
+                commands.push(json!({"command": command, "params": p}));
+                risk = super::ip_address::access_risk(s, &next);
+                if risk.is_none() && s.in_safe_mode() {
+                    checks.push(check("info", "access", "Safe Mode is on: a change that cuts this session is undone".to_owned(), ""));
+                }
+            }
+        },
+    }
+    Ok(json!({"computed": computed, "checks": checks, "commands": commands, "risk": risk}))
 }
 
 fn row(cfg: &Config, k: &KernelRuleRow) -> Value {

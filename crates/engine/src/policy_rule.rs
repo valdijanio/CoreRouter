@@ -297,9 +297,13 @@ pub(crate) fn reply_cut(before: &Config, after: &Config, link: &Link) -> Option<
 pub(crate) fn action_json(a: KernelRuleAction, cfg: &Config) -> (&'static str, Value) {
     match a {
         KernelRuleAction::Table(t) => {
-            let name = route::tables_by_id(cfg)
-                .get(&t)
-                .map_or_else(|| t.to_string(), ToString::to_string);
+            let name = match t {
+                255 => "local".to_owned(),
+                253 => "default".to_owned(),
+                _ => route::tables_by_id(cfg)
+                    .get(&t)
+                    .map_or_else(|| t.to_string(), ToString::to_string),
+            };
             ("lookup", json!(name))
         }
         KernelRuleAction::Blackhole => ("drop", Value::Null),

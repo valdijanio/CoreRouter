@@ -51,7 +51,11 @@ use nix::sched::{CloneFlags, setns};
 const ENV: &str = "COREROUTER_NETNS_TESTS";
 const REQUIRE: &str = "COREROUTER_REQUIRE_MPLS";
 static ONE: Mutex<()> = Mutex::new(());
+/// Setting up on a machine running the whole suite: what it takes to start,
+/// not a tolerance on what the test measures (5 s failed on two CPUs).
+const READY: Duration = Duration::from_secs(60);
 
+const TRACER: [u8; 4] = [10, 71, 0, 3];
 const B4: &str = "10.74.0.2";
 const B6: &str = "fd74::2";
 
@@ -182,6 +186,36 @@ fn veth(from: Option<&Ns>, a: &str, b: &str, to: &Ns) {
     };
 }
 
+/// Every link of the lab has its carrier handled. Until `linkwatch` does it,
+/// which needs the RTNL, the kernel drops what is sent on the link (its
+/// qdisc is `noop`), so a first ARP or ND is lost and retried a second
+/// later, one hop after the other; with the rest of the suite holding the
+/// RTNL that used up the tries of the first ping (G0.30e).
+fn wait_links_up(lab: &Lab) {
+    let start = Instant::now();
+    let nses: [(&Ns, &[&str]); 4] = [
+        (&lab._cr1, &["mb0", "mc1"]),
+        (&lab.cr2, &["mc2", "md2"]),
+        (&lab._cr3, &["md3", "me3"]),
+        (&lab._b, &["me4"]),
+    ];
+    let up = |text: String| text.contains("state UP");
+    while !up(ip(&["-o", "link", "show", "ma0"]))
+        || !nses
+            .iter()
+            .all(|(ns, devs)| devs.iter().all(|d| up(ns.ip(&["-o", "link", "show", d]))))
+    {
+        assert!(
+            start.elapsed() < READY,
+            "the lab's links did not come up in {READY:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    if start.elapsed() > Duration::from_millis(500) {
+        eprintln!("links up after {:?}", start.elapsed());
+    }
+}
+
 /// The topology of the module docs.
 fn lab() -> Lab {
     let _ = Command::new("ip").args(["link", "del", "ma0"]).output();
@@ -288,12 +322,14 @@ fn lab() -> Lab {
         ns.ip(&["route", "add", "10.71.0.0/24", "via", v4]);
         ns.ip(&["-6", "route", "add", "fd71::/64", "via", v6]);
     }
-    Lab {
+    let lab = Lab {
         _cr1: cr1,
         cr2,
         _cr3: cr3,
         _b: b,
-    }
+    };
+    wait_links_up(&lab);
+    lab
 }
 
 /// What the responder did.
@@ -302,6 +338,10 @@ struct Done {
     too_big_sent: u64,
     expired_sent: u64,
     refused: u64,
+    /// Of the tracer's frames: those the responder heard and those its
+    /// limits refused.
+    heard_tracer: u64,
+    refused_tracer: u64,
     last_err: Option<String>,
     tap: String,
 }
@@ -337,7 +377,10 @@ fn responder(
                     Frame::TooBig(t) => too_big::origin(t),
                     Frame::Echo(_) => None,
                 };
+                let tracer = to == Some(IpAddr::from(TRACER));
+                done.heard_tracer += u64::from(tracer);
                 if limit.take(to, Instant::now()).is_err() {
+                    done.refused_tracer += u64::from(tracer);
                     done.refused += 1;
                     continue;
                 }
@@ -359,7 +402,7 @@ fn responder(
             done
         })
         .unwrap();
-    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    ready_rx.recv_timeout(READY).unwrap();
     h
 }
 
@@ -549,6 +592,19 @@ fn a_flood_from_one_source_does_not_hide_the_hop_from_another() {
     eprintln!(
         "flood {pps} pps of TTL 2 from 10.71.0.1; traced from 10.71.0.3: without the per-source limit {off}/20 ({d_off:?}), with 10/s per source {on}/20 ({d_on:?})"
     );
-    assert!(on >= 18, "with the per-source limit: {on}/20 ({d_on:?})");
-    assert!(off < on, "without: {off}/20, with: {on}/20");
+    // What the limit does is at the limit: the tracer is refused with the
+    // global budget alone, and not with one per source. A frame that never
+    // reached it (a machine too busy to read the tap in time) says nothing
+    // about the limit, so what counts is what the responder heard; most of
+    // it has to be heard, and answered, or the hop is hidden after all.
+    assert_eq!(d_on.refused_tracer, 0, "with the limit: {d_on:?}");
+    assert!(
+        d_off.refused_tracer > 0,
+        "without the limit the flood takes the budget: {d_off:?}"
+    );
+    assert!(d_on.heard_tracer >= 10, "the hop is hidden: {d_on:?}");
+    assert!(
+        on as u64 + 2 >= d_on.heard_tracer,
+        "with the limit, {on}/20 answered of {d_on:?}"
+    );
 }
