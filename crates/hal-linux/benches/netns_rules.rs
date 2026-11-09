@@ -245,11 +245,15 @@ mod linux {
                 .find(|l| l.name.as_str() == "ro")
                 .map_or(0, |l| l.tx_packets)
         };
-        let mut burst = |hal: &mut LinuxHal| {
+        let burst = |hal: &mut LinuxHal| {
             let before = tx(hal);
             let start = Instant::now();
             for i in 0..BURST {
-                let _ = send(sock.as_raw_fd(), &frames[(i % 256) as usize], MsgFlags::empty());
+                let _ = send(
+                    sock.as_raw_fd(),
+                    &frames[(i % 256) as usize],
+                    MsgFlags::empty(),
+                );
             }
             let mut last = tx(hal);
             loop {
@@ -284,7 +288,10 @@ mod linux {
             let entry = serde_json::json!({
                 "id": format!("*{:X}", i + 1), "list": "many", "address": format!("10.200.{a}.{b}/32"),
             });
-            to.ip.firewall.address_lists.push(serde_json::from_value(entry).unwrap());
+            to.ip
+                .firewall
+                .address_lists
+                .push(serde_json::from_value(entry).unwrap());
         }
         to.ip.firewall.address_lists.push(
             serde_json::from_value(serde_json::json!({

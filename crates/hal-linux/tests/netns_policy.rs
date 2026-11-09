@@ -11,7 +11,12 @@
 //!
 //! Helpers outside `#[test]` fns may unwrap/panic too.
 #![cfg(target_os = "linux")]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::os::fd::AsRawFd;
 use std::process::Command;
@@ -26,12 +31,12 @@ use corerouter_hal_linux::{LinuxHal, Policy};
 use corerouter_model::firewall::FirewallRule;
 use corerouter_model::policy_rule::{RoutingRule, RuleAction};
 use corerouter_model::routing_table::NamedTable;
-use nix::ifaddrs::getifaddrs;
-use nix::sys::socket::{LinkAddr, MsgFlags, bind, send};
-use socket2::{Domain, Protocol, Socket, Type};
 use corerouter_model::{
     AddressEntry, Config, IfName, Interface, InterfaceKind, ItemId, RouteEntry, RoutingTable,
 };
+use nix::ifaddrs::getifaddrs;
+use nix::sys::socket::{LinkAddr, MsgFlags, bind, send};
+use socket2::{Domain, Protocol, Socket, Type};
 
 /// The rule list is one per namespace and each `apply` makes it what its
 /// config says: these tests take turns.
@@ -334,7 +339,17 @@ fn real_traffic_leaves_by_the_table_each_rule_chooses() {
         .collect::<Vec<_>>()
         .join(":");
     for host in ["10.95.0.1", "10.94.0.1"] {
-        ip(&["neigh", "add", host, "lladdr", &mac, "dev", "pfb", "nud", "permanent"]);
+        ip(&[
+            "neigh",
+            "add",
+            host,
+            "lladdr",
+            &mac,
+            "dev",
+            "pfb",
+            "nud",
+            "permanent",
+        ]);
     }
 
     let mut to = base.clone();
@@ -366,7 +381,10 @@ fn real_traffic_leaves_by_the_table_each_rule_chooses() {
     }
     hal.apply(&base, &to).unwrap();
     let list = ip(&["rule"]);
-    assert!(list.contains("100:\tfrom all fwmark"), "the mark of a table: {list}");
+    assert!(
+        list.contains("100:\tfrom all fwmark"),
+        "the mark of a table: {list}"
+    );
 
     let wire = Wire::new();
     let far = [8, 8, 8, 8];
@@ -378,13 +396,22 @@ fn real_traffic_leaves_by_the_table_each_rule_chooses() {
     check("src, lookup", [10, 91, 0, 1], far, (0, FRAMES, 0));
     // Unreachable: nothing forwarded, the ICMP back starts with an ARP request.
     let got = wire.send(&mut hal, [10, 92, 0, 1], far);
-    assert_eq!((got.0, got.1), (0, 0), "lookup-only-in-table, empty: {got:?}");
+    assert_eq!(
+        (got.0, got.1),
+        (0, 0),
+        "lookup-only-in-table, empty: {got:?}"
+    );
     assert!(got.2 > 0, "lookup-only-in-table answers: {got:?}");
     let mut check = |what: &str, src: [u8; 4], dst: [u8; 4], want: (u64, u64, u64)| {
         let got = wire.send(&mut hal, src, dst);
         assert_eq!(got, want, "{what}: (main, isp2, back)\n{}", ip(&["rule"]));
     };
-    check("lookup, empty: falls through", [10, 93, 0, 1], far, (FRAMES, 0, 0));
+    check(
+        "lookup, empty: falls through",
+        [10, 93, 0, 1],
+        far,
+        (FRAMES, 0, 0),
+    );
     check("drop: silent", [10, 94, 0, 1], far, (0, 0, 0));
     let got = wire.send(&mut hal, [10, 95, 0, 1], far);
     assert_eq!((got.0, got.1), (0, 0), "unreachable forwards nothing");
@@ -393,10 +420,25 @@ fn real_traffic_leaves_by_the_table_each_rule_chooses() {
         let got = wire.send(&mut hal, src, dst);
         assert_eq!(got, want, "{what}: (main, isp2, back)\n{}", ip(&["rule"]));
     };
-    check("iif + dst", [10, 89, 0, 2], [198, 51, 100, 7], (0, FRAMES, 0));
-    check("mark of the mangle names a table", [10, 96, 0, 1], far, (0, FRAMES, 0));
+    check(
+        "iif + dst",
+        [10, 89, 0, 2],
+        [198, 51, 100, 7],
+        (0, FRAMES, 0),
+    );
+    check(
+        "mark of the mangle names a table",
+        [10, 96, 0, 1],
+        far,
+        (0, FRAMES, 0),
+    );
     check("rule on a mark", [10, 97, 0, 1], far, (0, FRAMES, 0));
-    check("min-prefix hides the default route", [10, 90, 0, 1], far, (FRAMES, 0, 0));
+    check(
+        "min-prefix hides the default route",
+        [10, 90, 0, 1],
+        far,
+        (FRAMES, 0, 0),
+    );
 
     // The kernel's answer and the shared walk agree on every one.
     let want: Vec<_> = policy::expected_rules(&to).into_iter().collect();
@@ -452,9 +494,8 @@ fn real_traffic_leaves_by_the_table_each_rule_chooses() {
     }
 
     // A disabled rule leaves the kernel; the others keep their priority.
-    let prefs = |cfg: &Config| -> Vec<u32> {
-        policy::expected_rules(cfg).iter().map(|r| r.pref).collect()
-    };
+    let prefs =
+        |cfg: &Config| -> Vec<u32> { policy::expected_rules(cfg).iter().map(|r| r.pref).collect() };
     let mut off = to.clone();
     off.routing.rules[0].disabled = true;
     hal.apply(&to, &off).unwrap();
@@ -464,7 +505,10 @@ fn real_traffic_leaves_by_the_table_each_rule_chooses() {
     assert_eq!(wire2.send(&mut hal, [10, 91, 0, 1], far), (FRAMES, 0, 0));
     hal.apply(&off, &base).unwrap();
     let left = ip(&["rule"]);
-    assert!(!left.contains("proto 200"), "only the kernel's stay: {left}");
+    assert!(
+        !left.contains("proto 200"),
+        "only the kernel's stay: {left}"
+    );
     ip(&["link", "del", "pfa"]);
     hal.apply(&base, &Config::default()).unwrap();
 }
@@ -486,7 +530,16 @@ fn only_our_rules_are_ours() {
     let mut hal = LinuxHal::new();
     hal.apply(&Config::default(), &base).unwrap();
     // Someone else's rules, one right in our range.
-    ip(&["rule", "add", "pref", "2000", "from", "192.0.2.0/24", "lookup", "77"]);
+    ip(&[
+        "rule",
+        "add",
+        "pref",
+        "2000",
+        "from",
+        "192.0.2.0/24",
+        "lookup",
+        "77",
+    ]);
     ip(&["rule", "add", "pref", "1500", "fwmark", "0x7", "prohibit"]);
     hal.apply(&base, &to).unwrap();
     let rows = hal.rule_dump().unwrap();
@@ -500,13 +553,21 @@ fn only_our_rules_are_ours() {
     assert_eq!(owner(1500), [RuleOwner::Foreign]);
     assert!(owner(2000).contains(&RuleOwner::Foreign));
     assert!(owner(2000).contains(&RuleOwner::Corerouter));
-    assert_eq!(owner(2001), [RuleOwner::Corerouter], "lookup-only: the unreachable after it");
+    assert_eq!(
+        owner(2001),
+        [RuleOwner::Corerouter],
+        "lookup-only: the unreachable after it"
+    );
     let prohibit = rows.iter().find(|r| r.rule.pref == 1500).unwrap();
     assert_eq!(prohibit.rule.action, KernelRuleAction::Other(8));
 
     // They are not drift.
     let have = hal.snapshot(&to).unwrap();
-    assert_eq!(drift::diff(&drift::expected(&to), &have), vec![], "{have:?}");
+    assert_eq!(
+        drift::diff(&drift::expected(&to), &have),
+        vec![],
+        "{have:?}"
+    );
 
     // A new process over the same kernel: no twins, and theirs stay.
     let before = ip(&["rule"]);
@@ -528,13 +589,24 @@ fn only_our_rules_are_ours() {
     let d = drift::diff(&drift::expected(&to), &hal.snapshot(&to).unwrap());
     assert_eq!(d.len(), 1, "{d:?}");
     assert_eq!(d[0].kind, drift::DriftKind::RuleMissing);
-    ip(&["rule", "add", "pref", "2500", "unreachable", "protocol", "200"]);
+    ip(&[
+        "rule",
+        "add",
+        "pref",
+        "2500",
+        "unreachable",
+        "protocol",
+        "200",
+    ]);
     let d = drift::diff(&drift::expected(&to), &hal.snapshot(&to).unwrap());
     assert_eq!(d.len(), 2, "one of our protocol the config lacks: {d:?}");
     hal.reconcile(&to).unwrap();
     let d = drift::diff(&drift::expected(&to), &hal.snapshot(&to).unwrap());
     assert_eq!(d, vec![]);
-    assert!(ip(&["rule"]).contains("from 192.0.2.0/24 lookup 77"), "theirs stay");
+    assert!(
+        ip(&["rule"]).contains("from 192.0.2.0/24 lookup 77"),
+        "theirs stay"
+    );
 
     hal.apply(&to, &base).unwrap();
     ip(&["rule", "del", "pref", "2000"]);
@@ -590,7 +662,11 @@ fn a_vrf_miss_does_not_leak_to_main_or_a_rule() {
     };
     ip(&["link", "set", "vp2", "up"]);
     let k = hal.route_get(&base, &forwarded).unwrap();
-    assert_eq!(k.kind, RouteKind::Unreachable, "no leak to main's default: {k:?}");
+    assert_eq!(
+        k.kind,
+        RouteKind::Unreachable,
+        "no leak to main's default: {k:?}"
+    );
 
     hal.apply(&base, &Config::default()).unwrap();
     // As the kernel's own `l3mdev`, it stays: it matches nothing now.

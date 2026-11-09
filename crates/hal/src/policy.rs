@@ -322,8 +322,7 @@ fn matches(r: &KernelRule, p: &RulePacket<'_>) -> bool {
             // `ip_route_output_key_hash` sets `flowi4_iif = LOOPBACK_IFINDEX`.
             None => i.as_str() == "lo",
         })
-        && r.mark
-            .is_none_or(|m| (p.mark ^ m) & ROUTING_MARK_MASK == 0)
+        && r.mark.is_none_or(|m| (p.mark ^ m) & ROUTING_MARK_MASK == 0)
         && (!r.l3mdev || p.vrf.is_some())
 }
 
@@ -583,11 +582,18 @@ mod tests {
         c.routing.rules = vec![r];
         let want = expected_rules(&c);
         let has = |t: u32, _: Option<u8>| t == 254;
-        assert_eq!(walk(&want, &packet("8.8.8.8"), has).verdict, RuleVerdict::Table(254));
+        assert_eq!(
+            walk(&want, &packet("8.8.8.8"), has).verdict,
+            RuleVerdict::Table(254)
+        );
         let iif = n("ether1");
         let mut p = packet("8.8.8.8");
         p.src = Some("10.0.0.9".parse().unwrap());
-        assert_eq!(walk(&want, &p, has).verdict, RuleVerdict::Table(254), "no iif");
+        assert_eq!(
+            walk(&want, &p, has).verdict,
+            RuleVerdict::Table(254),
+            "no iif"
+        );
         p.iif = Some(&iif);
         assert_eq!(walk(&want, &p, has).verdict, RuleVerdict::Blackhole);
         assert_eq!(
@@ -625,7 +631,11 @@ mod tests {
         p.vrf = Some(1001);
         let want = expected_rules(&c);
         let w = walk(&want, &p, |t, _| t != 1001);
-        assert_eq!(w.verdict, RuleVerdict::Unreachable, "no leak to main: {w:?}");
+        assert_eq!(
+            w.verdict,
+            RuleVerdict::Unreachable,
+            "no leak to main: {w:?}"
+        );
         let w = walk(&want, &p, |t, _| t == 1001);
         assert_eq!(w.verdict, RuleVerdict::Table(1001));
     }

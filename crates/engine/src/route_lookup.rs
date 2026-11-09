@@ -12,7 +12,7 @@
 
 use std::net::IpAddr;
 
-use corerouter_hal::policy::{KernelRuleAction, RulePacket, RuleVerdict, expected_rules, walk};
+use corerouter_hal::policy::{KernelRuleAction, L3MDEV_PREF, RulePacket, RuleVerdict, expected_rules, walk};
 use corerouter_hal::route_get::{KernelLookup, RouteKind, RouteQuery};
 use corerouter_model::route::{self, is_link_local, table_of};
 use corerouter_model::{Config, IfName, ItemId, RoutingTable};
@@ -335,7 +335,10 @@ pub fn lookup_by_rules(
         .steps
         .iter()
         .map(|st| {
-            let (rule, what) = describe_pref(cfg, st.pref);
+            let (rule, mut what) = describe_pref(cfg, st.pref);
+            if st.pref == L3MDEV_PREF {
+                what = format!("the table of VRF '{start}'");
+            }
             let result = match (st.action, st.decided) {
                 (KernelRuleAction::Table(_), true) => "route found",
                 (KernelRuleAction::Table(_), false) => "no route: next",

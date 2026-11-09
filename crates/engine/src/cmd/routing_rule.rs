@@ -203,20 +203,25 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
     let id = rule.id;
     cfg.routing.rules.insert(at, rule);
     let mut out = json!({ "id": id, "summary": text });
-    if cfg.routing.rules.len() >= COST_NOTICE {
-        out["notice"] = json!(cost_notice(cfg.routing.rules.len()));
+    if cfg.routing.rules.len() >= COST_NOTICE
+        && let Some(o) = out.as_object_mut()
+    {
+        o.insert(
+            "notice".to_owned(),
+            json!(cost_notice(cfg.routing.rules.len())),
+        );
     }
     Ok(out)
 }
 
 /// From here on the walk per packet costs more than the rest of forwarding
-/// (`docs/policy-routing.md`: 100 rules cut one core from 910 to 127 kpps,
-/// **medido**).
+/// (`docs/policy-routing.md`: 100 rules cut one core to about 40% or less of
+/// the rate without rules, **medido** on a loaded machine).
 pub(crate) const COST_NOTICE: usize = 100;
 
 pub(crate) fn cost_notice(n: usize) -> String {
     format!(
-        "{n} rules: the kernel walks them one by one for every packet (about 28 ns each). Many \
+        "{n} rules: the kernel walks them one by one for every packet (about 15 to 30 ns each). Many \
          sources going to one table cost far less as one firewall address list and one mangle \
          mark-routing rule, which look up in a hash"
     )

@@ -103,3 +103,41 @@ Fica de fora: a ida de uma sessão encaminhada através do roteador, e `min_pref
 onde a busca terminou (`inet_rtm_getroute`, `net/ipv4/route.c`). Por isso `ip.route.lookup` com `table`
 não tem comparação quando as regras levam a outra tabela: `kernel.available` fica `false` e o motivo é
 dito. Uma regra `drop` responde `EINVAL` (`fib4_rule_action`), que o `route_get` traduz em `blackhole`.
+
+## Custo
+
+Medido com `crates/hal-linux/benches/netns_rules.rs`, build release, kernel 7.0.0-42 do host,
+2026-11-08/09, frames UDP de 64 bytes numa veth, um núcleo, numa máquina com carga média de 30 a 57
+porque outras sessões compilavam ao mesmo tempo. O ruído é alto: valem as ordens de grandeza.
+
+| Regras que não casam antes da `main` | Rodada 1 (kpps) | Rodada 2 (kpps) |
+|---|---|---|
+| 0 | 910 | 381 |
+| 1 | 640 | 256 |
+| 10 | 567 | 600 |
+| 100 | 127 | 377 |
+| 1000 | 26 | 80 |
+| 4096 | 8,7 | 17 |
+| 4096 origens numa address list, 1 marca no mangle, 1 regra | não medido | 1051 |
+
+O kernel percorre a lista inteira por pacote, sem índice (`fib_rules_lookup`), cerca de 15 a 30 ns por
+regra. **Muitas origens indo para uma tabela custam muito menos como uma address list e uma regra
+`mark-routing`**: o mangle procura num hash e a lista de regras fica com uma linha só. A partir de 100
+regras o `routing.rule.add` avisa.
+
+O caminho é por leitura (RCU), sem lock entre núcleos. `sendto` em 1 e 4 threads, em milhares de
+lookups por segundo: sem regras 858 e 2196; 100 regras 523 e 763; 1000 regras 96 e 155; 4096 regras 25
+e 85. O ganho varia com a carga da máquina. Uma NIC com várias filas divide os pacotes do mesmo jeito.
+
+Escrever regras (`LinuxHal::apply`, uma mensagem por regra, serializadas pelo kernel; mais threads não
+ajudam):
+
+| Regras | Escrever | Remover | Inserir uma no topo | Commit sem mudança nelas |
+|---|---|---|---|---|
+| 100 | 1,7 ms | 2,7 ms | 4,0 ms | 41 µs |
+| 1000 | 11 ms | 6,8 ms | 30 ms | 117 µs |
+| 4096 | 76 ms | 39 ms | 929 ms | 379 µs |
+
+Inserir no topo renumera todas as de baixo, e o kernel percorre a lista a cada inserção. É o pior caso
+de uma operação rara. A primeira regra sobre 200 000 rotas na `main` levou 3,7 ms: o `fib_unmerge`,
+que roda uma vez, não pesa.

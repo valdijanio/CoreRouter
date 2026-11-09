@@ -27,10 +27,10 @@ use corerouter_hal::policy::{
 };
 use futures_util::stream::TryStreamExt;
 use ipnet::IpNet;
+use rtnetlink::IpVersion;
+use rtnetlink::packet_route::AddressFamily;
 use rtnetlink::packet_route::route::RouteProtocol;
 use rtnetlink::packet_route::rule::{RuleAction, RuleAttribute, RuleMessage};
-use rtnetlink::packet_route::AddressFamily;
-use rtnetlink::IpVersion;
 
 use crate::netlink::{Kernel, errno, readable, with_kernel};
 
@@ -250,7 +250,10 @@ mod tests {
         };
         let row = parse(&message(&r)).unwrap();
         assert_eq!(row.rule, r);
-        assert_eq!((row.owner, row.protocol), (RuleOwner::Corerouter, RULE_PROTOCOL));
+        assert_eq!(
+            (row.owner, row.protocol),
+            (RuleOwner::Corerouter, RULE_PROTOCOL)
+        );
     }
 
     #[test]
@@ -266,7 +269,8 @@ mod tests {
             suppress: None,
             l3mdev: false,
         });
-        m.attributes.push(RuleAttribute::SuppressPrefixLen(u32::MAX));
+        m.attributes
+            .push(RuleAttribute::SuppressPrefixLen(u32::MAX));
         assert_eq!(parse(&m).unwrap().rule.suppress, None);
     }
 }

@@ -1186,12 +1186,21 @@ impl Kernel {
         const EINVAL: i32 = 22;
         let iif = match q.policy.as_ref().and_then(|p| p.iif.as_ref()) {
             Some(name) => {
-                let mut links = self.handle.link().get().match_name(name.to_string()).execute();
+                let mut links = self
+                    .handle
+                    .link()
+                    .get()
+                    .match_name(name.to_string())
+                    .execute();
                 let link = links
                     .try_next()
                     .await
                     .map_err(|e| format!("interface {name}: {}", readable(&e)))?;
-                Some(link.ok_or_else(|| format!("no interface {name}"))?.header.index)
+                Some(
+                    link.ok_or_else(|| format!("no interface {name}"))?
+                        .header
+                        .index,
+                )
             }
             None => None,
         };
