@@ -32,5 +32,5 @@ O roteador olha as placas de rede PCI e USB da máquina a cada 10 segundos e o q
 
 **Não contam:** placas Wi-Fi (fora do propósito da imagem), funções virtuais sem driver (entregues a uma VM de propósito) e o `regulatory.db`, que o kernel pede sempre que tem suporte a Wi-Fi.
 
-A mesma lista está na saúde do roteador (`interface.hardware`), no log do roteador e no aviso da CLI e do MCP; `interface.hardware.problems` devolve a lista.",
+A mesma lista está na saúde do roteador (`interface.hardware`), no log do roteador e no aviso da CLI e do MCP; `interface.hardware-problem.print` devolve a lista.",
 )];

@@ -14,5 +14,5 @@ The router looks at the machine's PCI and USB network cards every 10 seconds and
 
 **Not counted:** Wi-Fi cards (out of the image's purpose), virtual functions without a driver (handed to a VM on purpose), and `regulatory.db`, which the kernel asks for whenever it has Wi-Fi support.
 
-The same list is in the health checks (`interface.hardware`), the router log, and the CLI and MCP warning; `interface.hardware.problems` returns it.",
+The same list is in the health checks (`interface.hardware`), the router log, and the CLI and MCP warning; `interface.hardware-problem.print` returns it.",
 )];

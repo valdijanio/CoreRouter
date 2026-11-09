@@ -1,7 +1,7 @@
 //! Interfaces: the network cards the kernel could not bring up in full
 //! (G1.6ja). A card without a driver has no row in the table, so the toolbar's
 //! chips are what shows it; click one for the list, with the file that went
-//! missing and what to do. All from `interface.hardware.problems`: the rules
+//! missing and what to do. All from `interface.hardware-problem.print`: the rules
 //! are the engine's.
 
 use serde_json::Value;
@@ -14,7 +14,7 @@ use crate::windows::Win;
 use crate::{CoreRouterUi, chip};
 
 const SCOPE: &str = "nic_problems";
-pub(crate) const COMMAND: &str = "interface.hardware.problems";
+pub(crate) const COMMAND: &str = "interface.hardware-problem.print";
 const HELP_KEY: &str = "nic_problems.overview";
 
 pub(crate) const PANEL: Panel = Panel {

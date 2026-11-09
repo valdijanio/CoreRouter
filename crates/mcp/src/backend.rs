@@ -102,10 +102,14 @@ pub fn nic_warning(lines: &[String]) -> Option<String> {
     }
     let list: Vec<String> = lines.iter().map(|l| l.chars().take(200).collect()).collect();
     Some(format!(
-        "WARNING: network card problem: {}. See interface.hardware.problems.",
+        "WARNING: network card problem: {}. See interface.hardware-problem.print.",
         list.join("; ")
     ))
 }
+
+/// A login: the client, whether it has a UI, and the warnings `auth.whoami`
+/// gave (no password, boot errors, network cards).
+type Opened = (Client, bool, Vec<String>, Vec<String>, Vec<String>);
 
 /// How long a (re)connection may take.
 const DIAL_TIMEOUT: Duration = Duration::from_millis(2000);
@@ -153,7 +157,7 @@ impl Remote {
         login: &Login,
         known: &mut KnownHosts,
         trust: &mut dyn Trust,
-    ) -> Result<(Client, bool, Vec<String>, Vec<String>, Vec<String>), String> {
+    ) -> Result<Opened, String> {
         let mut client = dial(target, DIAL_TIMEOUT, login, known, trust)?;
         let info = client.call("server.info", Value::Null)?;
         let has_ui = info.get("has_ui").and_then(Value::as_bool).unwrap_or(false);
@@ -326,7 +330,7 @@ mod boot_warning_tests {
         assert!(nic_warning(&[]).is_none());
         let w = nic_warning(&["ether7: ice in Safe Mode, one queue, no XDP (intel/ice/ddp/ice.pkg)".into()]).unwrap();
         assert!(w.contains("ice.pkg"), "{w}");
-        assert!(w.contains("interface.hardware.problems"), "{w}");
+        assert!(w.contains("interface.hardware-problem.print"), "{w}");
     }
 
     #[test]

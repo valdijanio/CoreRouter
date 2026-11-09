@@ -499,7 +499,7 @@ fn network_test(session: &Shared, req: &TestRequest) -> serde_json::Value {
         (
             s.execute("ip.address.list", &json!({})).unwrap_or_default(),
             s.execute("ip.dhcp-client.list", &json!({})).unwrap_or_default(),
-            s.execute("interface.hardware.problems", &json!({})).unwrap_or_default(),
+            s.execute("interface.hardware-problem.print", &json!({})).unwrap_or_default(),
         )
     };
     let empty = Vec::new();
@@ -571,8 +571,11 @@ fn network_test(session: &Shared, req: &TestRequest) -> serde_json::Value {
     }
     // G1.6ja: the health check's list: a card with no port here. Firmware is
     // said port by port above.
-    for p in hardware["problems"].as_array().into_iter().flatten().filter(|p| p["kind"] == "no-driver") {
-        if let Some(line) = p["line"].as_str() {
+    let rows = hardware.get("problems").and_then(serde_json::Value::as_array);
+    for p in rows.into_iter().flatten() {
+        if p.get("kind").and_then(serde_json::Value::as_str) == Some("no-driver")
+            && let Some(line) = p.get("line").and_then(serde_json::Value::as_str)
+        {
             problems.push(line.to_owned());
         }
     }

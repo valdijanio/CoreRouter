@@ -274,7 +274,7 @@ impl Session {
         self.ext::<NicState>().filter(|s| s.reading.is_some())
     }
 
-    /// `interface.hardware.problems`.
+    /// `interface.hardware-problem.print`.
     pub(crate) fn nic_problems_json(&mut self) -> Value {
         let Some(s) = self.nic_state() else {
             return json!({

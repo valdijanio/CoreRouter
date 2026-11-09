@@ -17,7 +17,7 @@ pub const MAX_INTERFACES: usize = 4096;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "interface.list", "Interfaces", ["Interfaces"], None,
-        "{type?: string (ether | vlan | bridge | bonding | loopback | vrf | veth | …)} → [{name, type, kind, managed, unmanaged_reason, mtu, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, comment, parent, vlan_id, use_service_tag, bridge, bond, vrf, table, usb: null | {port, speed, driver, slow_port, alert} (a USB adapter, G1.29b), invalid: bool (G1.3b: a port not on this machine, or a VLAN on one; flag I), invalid_reason: string | null, hardware_problem: null | firmware | safe-mode (G1.6ja: see interface.hardware.problems), hardware_problem_reason: string | null}]",
+        "{type?: string (ether | vlan | bridge | bonding | loopback | vrf | veth | …)} → [{name, type, kind, managed, unmanaged_reason, mtu, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, comment, parent, vlan_id, use_service_tag, bridge, bond, vrf, table, usb: null | {port, speed, driver, slow_port, alert} (a USB adapter, G1.29b), invalid: bool (G1.3b: a port not on this machine, or a VLAN on one; flag I), invalid_reason: string | null, hardware_problem: null | firmware | safe-mode (G1.6ja: see interface.hardware-problem.print), hardware_problem_reason: string | null}]",
         always, list),
     cmd!(
         "interface.set",

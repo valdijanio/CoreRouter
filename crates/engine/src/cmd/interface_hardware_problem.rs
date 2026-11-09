@@ -1,4 +1,4 @@
-//! `interface.hardware.problems` (G1.6ja): the network cards the kernel could
+//! `interface.hardware-problem.print` (G1.6ja): the network cards the kernel could
 //! not bring up in full, with the reason and what to do.
 
 use serde_json::Value;
@@ -6,7 +6,7 @@ use serde_json::Value;
 use super::{CommandSpec, always};
 use crate::{Result, Session};
 
-pub(super) const COMMANDS: &[CommandSpec] = &[cmd!(query "interface.hardware.problems", "Interface Hardware Problems", [], None,
+pub(super) const COMMANDS: &[CommandSpec] = &[cmd!(query "interface.hardware-problem.print", "Interface Hardware Problems", [], None,
     "{} → {scanned, reason, live, kernel_log, kernel_log_reason, devices, problems: [{kind: no-driver|firmware|safe-mode, device, bus: pci|usb|mdio, ports, driver, vendor_id, product_id, name, files, error, module, expected, reason, action, line}], ignored: [{device, bus, name, why}]}",
     always, problems)];
 
@@ -23,7 +23,7 @@ mod tests {
     #[test]
     fn the_lab_has_a_card_without_driver_and_one_in_safe_mode() {
         let mut s = Session::virtual_lab();
-        let v = s.execute("interface.hardware.problems", &json!({})).unwrap();
+        let v = s.execute("interface.hardware-problem.print", &json!({})).unwrap();
         assert_eq!(v["scanned"], true);
         let rows = v["problems"].as_array().unwrap();
         let kinds: Vec<&str> = rows.iter().map(|r| r["kind"].as_str().unwrap()).collect();
@@ -39,7 +39,7 @@ mod tests {
     #[test]
     fn refuses_what_it_does_not_declare() {
         let mut s = Session::virtual_lab();
-        assert!(s.execute("interface.hardware.problems", &json!({"all": true})).is_err());
+        assert!(s.execute("interface.hardware-problem.print", &json!({"all": true})).is_err());
     }
 
     #[test]

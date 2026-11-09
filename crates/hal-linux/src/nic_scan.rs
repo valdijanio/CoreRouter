@@ -452,8 +452,8 @@ mod tests {
                 &format!("{base}/modalias"),
                 &format!(
                     "pci:v0000{}d0000{}sv0sd0bc02sc00i00\n",
-                    &vendor[2..].to_uppercase(),
-                    &device[2..].to_uppercase()
+                    vendor[2..].to_uppercase(),
+                    device[2..].to_uppercase()
                 ),
             );
             if let Some(d) = driver {
