@@ -44,7 +44,7 @@ pub struct Link {
 }
 
 /// `::ffff:10.0.0.1` (a dual-stack socket) is 10.0.0.1 to the firewall.
-fn plain(ip: IpAddr) -> IpAddr {
+pub(crate) fn plain(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
         v4 => v4,
@@ -357,6 +357,10 @@ impl Session {
                     link.peer, link.local
                 ));
             }
+        }
+        // G1.27e: a routing rule takes the replies away.
+        if let Some(why) = crate::policy_rule::reply_cut(before, after, &link) {
+            return Some(format!("{why}. {HOW_TO_PROCEED}"));
         }
         let same = before.ip.firewall == after.ip.firewall
             && before.interface_lists == after.interface_lists

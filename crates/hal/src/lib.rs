@@ -13,6 +13,7 @@ pub mod conntrack;
 pub mod dhcp;
 pub mod dhcp_server;
 pub mod drift;
+pub mod policy;
 pub mod fastpath;
 pub mod icmp_ext;
 pub mod lab_conntrack;
@@ -493,6 +494,14 @@ pub trait Hal: Send {
         let _ = (cfg, q);
         Err(HalError::Unsupported(format!(
             "{} cannot look routes up",
+            self.describe()
+        )))
+    }
+
+    /// G1.27e: the data plane's whole rule list, in order, whoever wrote it.
+    fn rule_dump(&mut self) -> Result<Vec<policy::KernelRuleRow>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no rule list",
             self.describe()
         )))
     }

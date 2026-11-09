@@ -532,7 +532,7 @@ fn ra_route(m: &RouteMessage) -> Option<(Ipv6Net, Option<Ipv6Addr>, u32, u32, u3
 }
 
 /// A private current-thread runtime and netlink connection for one call.
-fn with_kernel<T, F, Fut>(f: F) -> Result<T, HalError>
+pub(crate) fn with_kernel<T, F, Fut>(f: F) -> Result<T, HalError>
 where
     F: FnOnce(Kernel) -> Fut,
     Fut: Future<Output = Result<T, HalError>>,
@@ -719,14 +719,14 @@ fn kernel_hash(h: HashPolicy) -> BondXmitHashPolicy {
     }
 }
 
-fn errno(e: &rtnetlink::Error) -> Option<i32> {
+pub(crate) fn errno(e: &rtnetlink::Error) -> Option<i32> {
     match e {
         rtnetlink::Error::NetlinkError(m) => Some(m.raw_code().abs()),
         _ => None,
     }
 }
 
-fn readable(e: &rtnetlink::Error) -> String {
+pub(crate) fn readable(e: &rtnetlink::Error) -> String {
     match e {
         rtnetlink::Error::NetlinkError(m) => m.to_io().to_string(),
         other => other.to_string(),
@@ -744,8 +744,8 @@ fn group_of(r: &KernelRoute) -> (u32, IpNet, u32) {
     (r.table, r.dst, r.metric)
 }
 
-struct Kernel {
-    handle: Handle,
+pub(crate) struct Kernel {
+    pub(crate) handle: Handle,
     /// The kernel's static routes, one entry per next hop, read at the
     /// first route op of a run and kept up to date by the run's own route
     /// ops (G1.27: an ECMP group is one multipath route in the kernel, so
@@ -1182,6 +1182,19 @@ impl Kernel {
         use rtnetlink::packet_route::route::{RouteFlags, RouteType};
         const ENETUNREACH: i32 = 101;
         const EHOSTUNREACH: i32 = 113;
+        // `fib4_rule_action`: a blackhole rule answers `-EINVAL`.
+        const EINVAL: i32 = 22;
+        let iif = match q.policy.as_ref().and_then(|p| p.iif.as_ref()) {
+            Some(name) => {
+                let mut links = self.handle.link().get().match_name(name.to_string()).execute();
+                let link = links
+                    .try_next()
+                    .await
+                    .map_err(|e| format!("interface {name}: {}", readable(&e)))?;
+                Some(link.ok_or_else(|| format!("no interface {name}"))?.header.index)
+            }
+            None => None,
+        };
         let full = if q.dst.is_ipv4() { 32 } else { 128 };
         let ask = |fib_match: bool| -> Result<RouteMessage, String> {
             let b = RouteMessageBuilder::<IpAddr>::new()
@@ -1193,7 +1206,18 @@ impl Kernel {
                 None => b,
             };
             let mut m = b.build();
+            // `RTM_F_LOOKUP_TABLE` only asks the reply to say the table the
+            // lookup ended in (`inet_rtm_getroute`, net/ipv4/route.c); the
+            // kernel always walks its rules and takes no table to look in.
             m.header.flags |= RouteFlags::LookupTable;
+            if let Some(p) = &q.policy {
+                if let Some(i) = iif {
+                    m.attributes.push(RouteAttribute::Iif(i));
+                }
+                if p.mark != 0 {
+                    m.attributes.push(RouteAttribute::Mark(p.mark));
+                }
+            }
             if fib_match {
                 m.header.flags |= RouteFlags::FibMatch;
             }
@@ -1216,6 +1240,12 @@ impl Kernel {
             Err(e) if matches!(errno(&e), Some(ENETUNREACH | EHOSTUNREACH)) => {
                 return Ok(unreachable);
             }
+            Err(e) if q.policy.is_some() && errno(&e) == Some(EINVAL) => {
+                return Ok(KernelLookup {
+                    kind: RouteKind::Blackhole,
+                    ..unreachable
+                });
+            }
             Err(e) => return Err(format!("route get {}: {}", q.dst, readable(&e))),
         };
         // The FIB entry itself: its prefix and every path of a multipath.
@@ -1229,7 +1259,17 @@ impl Kernel {
                 _ => {}
             }
         }
+        // A table asked for by name is not what the rules chose: the kernel
+        // cannot answer about it, and an answer from another would mislead.
+        if q.policy.is_none() && table != q.table && resolved.header.kind != RouteType::Local {
+            return Err(format!(
+                "the kernel looks up by its rules (it chose table {table}), it cannot be asked \
+                 about table {}",
+                q.table
+            ));
+        }
         let kind = match resolved.header.kind {
+            RouteType::BlackHole if q.policy.is_some() => RouteKind::Blackhole,
             RouteType::Local => RouteKind::Local,
             RouteType::Unicast => RouteKind::Unicast,
             _ => RouteKind::Unreachable,

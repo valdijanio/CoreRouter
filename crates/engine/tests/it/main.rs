@@ -56,6 +56,7 @@ mod netsim_scenarios;
 mod ntp_logging;
 mod off_lock;
 mod os_loopback;
+mod policy_rule;
 mod persistence;
 mod ppp_import;
 mod query_purity;

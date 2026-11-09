@@ -430,6 +430,16 @@ pub struct Routing {
     /// `/routing table` (G1.27e, `crate::routing_table`): by name.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub tables: BTreeMap<crate::IfName, crate::routing_table::NamedTable>,
+    /// `/routing rule` (G1.27e, `crate::policy_rule`), in order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<crate::policy_rule::RoutingRule>,
+    /// Next id handed out to a rule (never reused, like RouterOS).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub next_rule_id: u32,
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

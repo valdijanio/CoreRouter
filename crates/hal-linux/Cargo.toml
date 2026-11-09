@@ -63,6 +63,10 @@ name = "netns_forward"
 harness = false
 
 [[bench]]
+name = "netns_rules"
+harness = false
+
+[[bench]]
 name = "netns_raw"
 harness = false
 
