@@ -1006,6 +1006,10 @@ com a G1.6jb.
 | Placa plugada → driver e nome | sem porta | 113–125 ms |
 | Placa plugada → endereço por DHCP | sem porta | 3,9–5,2 s |
 
+Reprodutível (**medido**): apagar o pacote `corerouter-installer` e refazer dá o mesmo hash em
+`live-modules.img`, `BOOTX64.EFI` e na ISO. O `bzImage` do roteador é o mesmo de antes desta gap
+(`bee6e9bd…`): o kernel instalado não mudou. A ISO do commit final tem 135 106 560 B, por causa do que a `main` trouxe no meio.
+
 Compressão, medido sobre a mesma árvore: zstd 3 dá 4 554 752 B, zstd 15 dá 3 903 488 B, zstd 19 e 22 dão
 3 813 376 B (5,3 s de CPU a cada `os build` que refaz a ISO; `--only crpkg` não paga).
 
