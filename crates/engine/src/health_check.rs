@@ -167,6 +167,8 @@ pub struct Inputs {
     /// own (partial copies are named `config-<slot>.new`), from the
     /// package service's status.
     pub config_snapshots: Vec<(String, u64)>,
+    /// G1.6w: how the histories share `/config` (`None`: no disk measured).
+    pub config_disk: Option<crate::config_disk::Usage>,
     /// G3.9fj: BGP sessions where we restart gracefully toward a neighbor
     /// that announces graceful restart (RFC 4724), and those of them
     /// established for [`EOR_GRACE_SECS`] that never sent End-of-RIB.
@@ -342,6 +344,42 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
             push("disk", "Disk", s, Some(format!("{mount}: {} livre", pct(*free))),
                 format!("{mount} com {} livre", pct(*free)),
                 Some(snaps.as_deref().unwrap_or("Apague logs e capturas antigos, ou reduza o histórico de gráficos (system.graph.set) e de logs em disco.")));
+        }
+    }
+
+    // G1.6w: the histories under their shares of /config.
+    match &i.config_disk {
+        None => push("config_disk", "Config disk", Severity::Unknown, None, "sem disco medido (sem --config-dir)".into(), None),
+        Some(u) => {
+            use crate::config_disk::mib;
+            let mut cut = Vec::new();
+            if u.revisions_not_saved > 0 {
+                cut.push(format!(
+                    "{} revisões mais antigas fora do disco (ficam {}; teto {})",
+                    u.revisions_not_saved,
+                    u.revisions_saved,
+                    mib(u.history_budget)
+                ));
+            }
+            if u.graph_refused > 0 {
+                cut.push(format!("{} gráficos não guardados (teto {})", u.graph_refused, mib(u.graph_budget)));
+            }
+            if u.graph_removed > 0 {
+                cut.push(format!("{} arquivos antigos de gráfico apagados", u.graph_removed));
+            }
+            if u.log_dropped > 0 {
+                cut.push(format!("{} linhas de log não chegaram ao disco", u.log_dropped));
+            }
+            if let Some(e) = &u.log_error {
+                cut.push(format!("log em disco: {e}"));
+            }
+            let value = format!("revisões {} de {}, gráficos {} de {}, log {} de {}", mib(u.history_bytes), mib(u.history_budget), mib(u.graph_bytes), mib(u.graph_budget), mib(u.log_bytes), mib(u.log_budget));
+            if cut.is_empty() {
+                push("config_disk", "Config disk", Severity::Ok, Some(value), format!("históricos dentro da cota de {} do /config", mib(u.capacity)), None);
+            } else {
+                push("config_disk", "Config disk", Severity::Warning, Some(value), cut.join("; "),
+                    Some("A configuração ativa e a revisão anterior nunca saem. Para guardar mais: um /config maior, menos interfaces nos gráficos (system.graph.set exclude), menos log em disco (system.logging) ou uma configuração menor; veja system.config-disk.print."));
+            }
         }
     }
 
@@ -917,6 +955,7 @@ impl Session {
         let pkg = self.ext::<crate::package::Packages>().and_then(|p| p.status.as_ref());
         i.root_verity = pkg.and_then(root_verity);
         i.config_snapshots = pkg.map(config_snapshots).unwrap_or_default();
+        i.config_disk = self.config_disk_usage();
         i
     }
 
@@ -997,6 +1036,7 @@ mod tests {
             no_password: Vec::new(),
             root_verity: Some(("a".into(), true)),
             config_snapshots: Vec::new(),
+            config_disk: Some(Default::default()),
             bgp_no_eor: Some((1, Vec::new())),
             bgp_gr_no_bfd: Some((1, Vec::new())),
             usb: Vec::new(),
@@ -1030,7 +1070,7 @@ mod tests {
     #[test]
     fn healthy_is_all_ok() {
         let checks = evaluate(&healthy());
-        assert_eq!(checks.len(), 18);
+        assert_eq!(checks.len(), 19);
         for c in &checks {
             assert_eq!(c.severity, Severity::Ok, "{c:?}");
             assert!(c.action.is_none());
@@ -1089,6 +1129,32 @@ mod tests {
             ("disk 10 % free", |i| i.disks.push(("/var".into(), 10.0)), "disk", Severity::Warning),
             ("disk 3 % free", |i| i.disks = vec![("/".into(), 3.0)], "disk", Severity::Error),
             ("no disk", |i| i.disks.clear(), "disk", Severity::Unknown),
+            ("config disk not measured", |i| i.config_disk = None, "config_disk", Severity::Unknown),
+            ("histories fit", |i| i.config_disk = Some(Default::default()), "config_disk", Severity::Ok),
+            (
+                "revisions cut",
+                |i| {
+                    i.config_disk = Some(crate::config_disk::Usage { revisions_not_saved: 3, ..Default::default() });
+                },
+                "config_disk",
+                Severity::Warning,
+            ),
+            (
+                "log lines dropped",
+                |i| {
+                    i.config_disk = Some(crate::config_disk::Usage { log_dropped: 1, ..Default::default() });
+                },
+                "config_disk",
+                Severity::Warning,
+            ),
+            (
+                "graphs refused by the disk",
+                |i| {
+                    i.config_disk = Some(crate::config_disk::Usage { graph_refused: 1, ..Default::default() });
+                },
+                "config_disk",
+                Severity::Warning,
+            ),
             ("temp near crit", |i| i.temps.push(("nvme".into(), 92.0, Some(100.0), Level::Warning)), "temperature", Severity::Warning),
             ("temp at crit", |i| i.temps = vec![("acpitz".into(), 99.0, Some(100.0), Level::Error)], "temperature", Severity::Error),
             ("nic errors", |i| i.nics.push(("ether4".into(), 2.0, 15.0)), "nic.errors", Severity::Warning),

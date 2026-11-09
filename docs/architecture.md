@@ -603,6 +603,15 @@ isso o botão oferece 1/5/10 min no clique direito.
 
 ### Persistência (G0.6)
 
+**Cotas do `/config` (G1.6w).** O `/config` é pequeno (56 MB na VM) e os históricos o dividem por
+percentual do filesystem, como o `SystemMaxUse` do journald: revisões 10 %, gráficos 25 %, log em
+disco 5 % (`engine::config_disk`; o daemon mede o disco na partida, o engine não faz E/S). Os outros
+60 % ficam para os slots, o journal da config e os snapshots de pacote. O log para antes de tirar
+o lugar da config: deixa livres 10 % do disco ou 3× o slot, o que for maior (G4.6g). Porcentagem e não número fixo
+porque o mesmo binário roda em discos de 56 MB e de centenas de GB; sem parâmetro por enquanto
+porque não há caso para mudar, e o histórico nunca precisa de ajuste para o rollback funcionar: a
+ativa e a última boa não entram na conta de descarte.
+
 Todo commit bem-sucedido grava running + histórico (`model::persist::encode`, JSON com
 `format_version`) num `ConfigStorage` (trait do engine, sem I/O). No boot,
 `Session::with_storage` tenta o slot `current` e depois o `previous`; o que não decodifica

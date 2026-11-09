@@ -210,6 +210,8 @@ pub struct DiskStatus {
     /// Files read at boot, and those refused (name: why).
     pub loaded: usize,
     pub load_errors: Vec<String>,
+    /// G1.6w: old files deleted to stay under the share of `/config`.
+    pub removed: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -246,6 +248,8 @@ pub struct GraphDb {
     removed: Vec<String>,
     /// The daemon stores the history (else memory only).
     persistent: bool,
+    /// G1.6w: the share of `/config` the files may take.
+    disk_cap: Option<u64>,
     pub disk: DiskStatus,
     /// Bandwidth alerts: state by rule, link speeds by interface.
     alerts: BTreeMap<corerouter_model::ItemId, alert::AlertState>,
@@ -404,7 +408,7 @@ impl GraphDb {
         resources: Option<Resources>,
     ) -> Vec<(bool, String)> {
         let mut log = Vec::new();
-        let cap = cfg.max_memory_bytes();
+        let cap = self.cap(cfg);
         let mut used = self.memory_bytes();
         let mut kept_now: BTreeSet<String> = BTreeSet::new();
         let mut refused = BTreeSet::new();
@@ -431,13 +435,11 @@ impl GraphDb {
                 self.sample_link(now, &key, l);
             }
         }
+        let cap_text = self.cap_text(cfg);
         for name in refused.difference(&self.refused) {
             log.push((
                 true,
-                format!(
-                    "graphing: interface {name} not kept, the history would pass max-memory {} MiB",
-                    cfg.max_memory_mib
-                ),
+                format!("graphing: interface {name} not kept, the history would pass {cap_text}"),
             ));
         }
         self.refused = refused;
@@ -486,7 +488,7 @@ impl GraphDb {
     /// names were collected (**medido**, G4.9g).
     pub fn sample_queues(&mut self, now: u64, cfg: &Graphing, kept: &[(&str, QueueCounters)]) -> Vec<(bool, String)> {
         let mut log = Vec::new();
-        let cap = cfg.max_memory_bytes();
+        let cap = self.cap(cfg);
         let size = Rrd::size_for(QUEUE_SOURCES.len()) as u64;
         let mut used = self.memory_bytes();
         let mut refused = 0usize;
@@ -527,9 +529,9 @@ impl GraphDb {
             log.push((
                 true,
                 format!(
-                    "graphing: {refused} queue{} not kept ({first}…), the history would pass max-memory {} MiB",
+                    "graphing: {refused} queue{} not kept ({first}…), the history would pass {}",
                     if refused == 1 { "" } else { "s" },
-                    cfg.max_memory_mib
+                    self.cap_text(cfg)
                 ),
             ));
         }
@@ -562,6 +564,36 @@ impl GraphDb {
     /// How many queues would be kept but did not fit under the cap.
     pub fn refused_queues(&self) -> usize {
         self.refused_queues
+    }
+
+    /// G1.6w: the share of `/config` the files may take.
+    pub fn set_disk_cap(&mut self, cap: Option<u64>) {
+        self.disk_cap = cap;
+    }
+
+    /// The share of `/config`, if a disk was measured.
+    pub fn disk_cap(&self) -> Option<u64> {
+        self.disk_cap
+    }
+
+    /// The history's ceiling: `max_memory_mib`, or the share of `/config`
+    /// when that is less (the same bytes go to disk).
+    pub fn cap(&self, cfg: &Graphing) -> u64 {
+        self.disk_cap.map_or(cfg.max_memory_bytes(), |d| d.min(cfg.max_memory_bytes()))
+    }
+
+    /// Whether what limits the history now is `/config`, not `max_memory_mib`.
+    pub fn cap_is_disk(&self, cfg: &Graphing) -> bool {
+        self.disk_cap.is_some_and(|d| d < cfg.max_memory_bytes())
+    }
+
+    /// The ceiling in a log line.
+    fn cap_text(&self, cfg: &Graphing) -> String {
+        if self.cap_is_disk(cfg) {
+            format!("its share of /config ({})", crate::config_disk::mib(self.cap(cfg)))
+        } else {
+            format!("max-memory {} MiB", cfg.max_memory_mib)
+        }
     }
 
     /// Whether series `key` is (now) kept under the cap.
@@ -673,7 +705,8 @@ impl GraphDb {
             "refused": self.refused,
             "refused_queues": self.refused_queues,
             "memory_bytes": self.memory_bytes(),
-            "max_memory_bytes": cfg.max_memory_bytes(),
+            "max_memory_bytes": self.cap(cfg),
+            "disk_cap_bytes": self.disk_cap,
             "series_bytes": Rrd::size_for(INTERFACE_SOURCES.len()),
             "queue_series_bytes": Rrd::size_for(QUEUE_SOURCES.len()),
             "tiers": rrd::TIERS.iter().map(|t| json!({"step": t.step, "rows": t.rows, "window": t.window()})).collect::<Vec<_>>(),

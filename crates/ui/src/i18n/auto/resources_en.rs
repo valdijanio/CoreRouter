@@ -10,6 +10,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("resources.check.bgp.end-of-rib", "## BGP End-of-RIB\n\nA BGP neighbor with graceful restart on both sides that never sent End-of-RIB after 5 min established (RFC 4724 §2, §4.2). After every `bgpd` start the best path waits for it for the whole Defer Time (Routing › BGP › Instances). RouterOS 7.25 behaves so: keep the Defer Time short or set Graceful Restart = no on that connection."),
     ("resources.check.bgp.gr-bfd", "## BGP GR without BFD\n\nA BGP session with graceful restart and the N bit on both sides (RFC 8538) without BFD: if the restarting side dies silently (power, cut link), its routes stay for the hold time plus the Restart Time. Set a BFD profile on the connection (a BFD down is a Hard Reset) or turn graceful_notification off on the instance."),
     ("resources.check.cgnat.ports", "## CGNAT ports\n\nSubscribers above their pool's alert, connections without a free port."),
+    ("resources.check.config_disk", "## Config disk\n\nThe histories against their shares of /config: revisions 10 %, graphs 25 %. What does not fit goes, oldest first; the running config and the revision before it never go."),
     ("resources.check.conntrack", "## Conntrack\n\nConnection table fill: 80/95 %."),
     ("resources.check.cpu", "## CPU\n\nAverage CPU load over 5 minutes: warning at 80 %, error at 95 %."),
     ("resources.check.disk", "## Disk\n\nFree space of the fullest disk: warning below 15 %, error below 5 %."),

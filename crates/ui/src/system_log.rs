@@ -69,6 +69,9 @@ pub(crate) struct Line {
     pub level: String,
     pub origin: String,
     pub message: String,
+    /// G4.6g: only the disk has it (before the last boot, or past
+    /// `memory_lines`).
+    pub from_disk: bool,
     pub detail: Value,
 }
 
@@ -86,6 +89,7 @@ impl Line {
             level: s("level"),
             origin: s("origin"),
             message: s("message"),
+            from_disk: v.get("from_disk").and_then(Value::as_bool).unwrap_or(false),
             detail: v.get("detail").cloned().unwrap_or(Value::Null),
         })
     }
@@ -269,10 +273,18 @@ impl LogPanel {
                         }
                         ui.end_row();
                         for l in &shown {
-                            let time = ui.label(RichText::new(short_time(l.time, today)).monospace());
-                            if l.time > 0 {
-                                time.on_hover_text(utc(l.time));
-                            }
+                            ui.horizontal(|ui| {
+                                let time = ui.label(RichText::new(short_time(l.time, today)).monospace());
+                                if l.time > 0 {
+                                    time.on_hover_text(utc(l.time));
+                                }
+                                if l.from_disk {
+                                    let tone = crate::chip::neutral_tone(ui.visuals());
+                                    crate::chip::chip(ui, "disco", tone).on_hover_text(
+                                        "Veio do log em disco: de antes da última partida, ou além das linhas guardadas na memória.",
+                                    );
+                                }
+                            });
                             ui.label(l.topics.join(","));
                             ui.label(if l.origin.is_empty() { "—" } else { &l.origin });
                             let mut msg = RichText::new(&l.message);

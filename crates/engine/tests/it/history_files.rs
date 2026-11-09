@@ -103,6 +103,104 @@ fn the_history_survives_a_reboot_and_old_files_are_deleted() {
     assert_eq!(s.store().running().system.identity, "r6");
 }
 
+/// G1.6w: on a small `/config` the revision files stay under their share:
+/// the oldest go, and the log and the health say so. The revision right
+/// before the running one stays whatever its size, so a rollback after a
+/// reboot still works.
+#[test]
+fn the_history_stays_under_its_share_and_the_last_good_revision_never_goes() {
+    let storage = MemoryStorage::default();
+    let mut s = boot(&storage);
+    // 1 MiB of /config: a share of about 100 KiB.
+    s.set_config_capacity(Some(1 << 20));
+    let empty = s.store().current_revision();
+    big(&mut s, 4_000);
+    rename(&mut s, "big");
+    let big_rev = s.store().current_revision();
+    // Going back to nothing makes the file of `big_rev` a list of 4 000
+    // entries (about 500 KiB): past the share by itself, and the last good
+    // revision now.
+    s.execute("config.rollback", &json!({"revision": empty}))
+        .unwrap();
+    let u = s.config_disk_usage().unwrap();
+    assert!(
+        u.history_bytes > u.history_budget,
+        "the last good stays: {u:?}"
+    );
+    assert!(u.revisions_not_saved > 0, "the older ones go: {u:?}");
+    let rows = s
+        .execute("log.print", &json!({"find": "Histórico de revisões"}))
+        .unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
+    let checks = s.health_alerts();
+    let c = checks.iter().find(|c| c.key == "config_disk").unwrap();
+    assert_eq!(c.severity.as_str(), "warning", "{}", c.reason);
+    assert!(c.reason.contains("revisões mais antigas"), "{}", c.reason);
+    drop(s);
+
+    let mut s = boot(&storage);
+    assert!(
+        s.storage_status().boot_errors.is_empty(),
+        "{:?}",
+        s.storage_status().boot_errors
+    );
+    assert!(numbers(&s).contains(&big_rev), "{:?}", numbers(&s));
+    s.set_config_capacity(Some(1 << 20));
+
+    // A small commit: the big file is no longer the last good, and goes.
+    rename(&mut s, "small");
+    let active = s.store().current_revision();
+    let u = s.config_disk_usage().unwrap();
+    assert!(u.history_bytes <= u.history_budget, "{u:?}");
+    assert!(u.revisions_not_saved > 0, "{u:?}");
+    let last_good = s.store().history()[s.store().history().len() - 2].number;
+    let identity = s.store().history()[s.store().history().len() - 2]
+        .config
+        .system
+        .identity
+        .clone();
+    drop(s);
+
+    let mut s = boot(&storage);
+    assert_eq!(s.store().current_revision(), active);
+    assert_eq!(s.store().running().system.identity, "small");
+    assert!(numbers(&s).contains(&last_good), "{:?}", numbers(&s));
+    let files = storage.clone().list_revisions().unwrap();
+    assert!(!files.contains(&big_rev), "the big file went: {files:?}");
+    s.execute("config.rollback", &json!({"revision": last_good}))
+        .unwrap();
+    assert_eq!(s.store().running().system.identity, identity);
+}
+
+/// G1.6w: a directory from before the shares is cut at boot, not at the
+/// next commit.
+#[test]
+fn a_history_past_the_share_is_cut_when_the_disk_is_measured() {
+    let storage = MemoryStorage::default();
+    let mut s = boot(&storage);
+    big(&mut s, 2_000);
+    for i in 0..20 {
+        rename(&mut s, &format!("r{i}"));
+    }
+    assert_eq!(s.storage_status().revisions_not_saved, 0);
+    drop(s);
+    let mut s = boot(&storage);
+    let all = s.store().history().len();
+    assert!(all > 3);
+    s.set_config_capacity(Some(1 << 10));
+    assert!(s.storage_status().revisions_not_saved > 0, "of {all}");
+    assert!(s.storage_status().last_error.is_none());
+    let active = s.store().current_revision();
+    drop(s);
+    let s = boot(&storage);
+    assert_eq!(s.store().current_revision(), active);
+    assert_eq!(
+        storage.clone().list_revisions().unwrap().len(),
+        1,
+        "the last good"
+    );
+}
+
 /// Fail-first for audit-history: with full copies a ~750 KB config kept
 /// 42 of its 64 revisions in the 32 MiB budget (6 of a 5 MiB config,
 /// **medido** in `storage_fs/history64`); as differences all of them fit.
@@ -363,25 +461,49 @@ fn a_revision_file_newer_than_the_slot_is_replaced() {
     assert_eq!(s.store().history()[3].config.system.identity, "third");
 }
 
-/// A storage whose next write of `fail` kind fails (a crash between the
-/// steps of a save: what was written before it stays, nothing after).
+/// A storage that dies at the next write of `fail` kind (a crash between
+/// the steps of a save: what was written before it stays, nothing after,
+/// until [`Flaky::revive`], the next boot). `quota`: a full disk, past it
+/// a revision file does not fit and neither does a slot.
 #[derive(Clone, Default)]
 struct Flaky {
     inner: MemoryStorage,
     fail: Arc<Mutex<Option<&'static str>>>,
+    dead: Arc<Mutex<bool>>,
+    quota: Arc<Mutex<Option<usize>>>,
+    /// A disk that fails every write but is not full (bad flash).
+    broken: Arc<Mutex<bool>>,
 }
 
 impl Flaky {
     fn fail_next(&self, what: &'static str) {
         *self.fail.lock().unwrap() = Some(what);
     }
+    fn revive(&self) {
+        *self.dead.lock().unwrap() = false;
+    }
     fn check(&self, what: &str) -> Result<(), StorageError> {
+        let mut dead = self.dead.lock().unwrap();
         let mut f = self.fail.lock().unwrap();
         if *f == Some(what) {
             *f = None;
+            *dead = true;
+        }
+        if *dead {
             return Err(StorageError(format!("{what}: power cut")));
         }
         Ok(())
+    }
+    fn fits(&self, len: usize) -> Result<(), StorageError> {
+        if *self.broken.lock().unwrap() {
+            return Err(StorageError("Input/output error (os error 5)".into()));
+        }
+        match *self.quota.lock().unwrap() {
+            Some(q) if self.inner.revision_bytes() + len > q => {
+                Err(StorageError("no space left on device".into()))
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -394,6 +516,7 @@ impl ConfigStorage for Flaky {
     }
     fn save(&mut self, data: &str) -> Result<(), StorageError> {
         self.check("slot")?;
+        self.fits(0)?;
         self.inner.save(data)
     }
     fn quarantine(&mut self, slot: Slot) -> Result<(), StorageError> {
@@ -410,6 +533,7 @@ impl ConfigStorage for Flaky {
     }
     fn save_revision(&mut self, number: u32, data: &str) -> Result<(), StorageError> {
         self.check("revision")?;
+        self.fits(data.len())?;
         self.inner.save_revision(number, data)
     }
     fn remove_revision(&mut self, number: u32) -> Result<(), StorageError> {
@@ -439,6 +563,7 @@ fn a_crash_between_the_steps_of_a_save_loses_only_that_revision() {
             assert!(s.storage_status().last_error.is_some(), "{step}");
         }
         drop(s);
+        storage.revive();
 
         let mut s =
             Session::with_storage(Box::new(VirtualHal::default()), Box::new(storage.clone()));
@@ -472,6 +597,67 @@ fn a_crash_between_the_steps_of_a_save_loses_only_that_revision() {
             "{step}: stale file left"
         );
     }
+}
+
+/// G1.6w: on a full disk the running config wins: the old revisions go so
+/// that the commit is saved, and what is left still boots and rolls back.
+#[test]
+fn a_full_disk_costs_old_revisions_not_the_running_config() {
+    let storage = Flaky::default();
+    let mut s = Session::with_storage(Box::new(VirtualHal::default()), Box::new(storage.clone()));
+    for i in 0..30 {
+        rename(&mut s, &format!("r{i}"));
+    }
+    let used = storage.inner.revision_bytes();
+    assert!(used > 1000, "{used}");
+    // Nothing more fits; a file fits again only when older ones go.
+    *storage.quota.lock().unwrap() = Some(used);
+    rename(&mut s, "in flight");
+    assert!(
+        s.storage_status().last_error.is_none(),
+        "{:?}",
+        s.storage_status().last_error
+    );
+    assert!(s.storage_status().revisions_not_saved > 0);
+    let active = s.store().current_revision();
+    drop(s);
+
+    let mut s = Session::with_storage(Box::new(VirtualHal::default()), Box::new(storage.clone()));
+    assert!(
+        s.storage_status().boot_errors.is_empty(),
+        "{:?}",
+        s.storage_status().boot_errors
+    );
+    assert_eq!(s.store().current_revision(), active);
+    assert_eq!(s.store().running().system.identity, "in flight");
+    assert_eq!(numbers(&s).len(), 2, "{:?}", numbers(&s));
+    s.execute("config.rollback", &json!({"revision": active - 1}))
+        .unwrap();
+    assert_eq!(s.store().running().system.identity, "r29");
+}
+
+/// G1.6w: only a full disk costs revisions. A disk that fails for another
+/// reason gets the error reported, and deleting would free nothing useful.
+#[test]
+fn an_error_that_is_not_a_full_disk_costs_no_revisions() {
+    let storage = Flaky::default();
+    let mut s = Session::with_storage(Box::new(VirtualHal::default()), Box::new(storage.clone()));
+    for i in 0..30 {
+        rename(&mut s, &format!("r{i}"));
+    }
+    let files = storage.inner.clone().list_revisions().unwrap().len();
+    *storage.broken.lock().unwrap() = true;
+    rename(&mut s, "in flight");
+    assert!(s.storage_status().last_error.is_some());
+    assert_eq!(storage.inner.clone().list_revisions().unwrap().len(), files);
+    // The disk comes back: nothing was lost.
+    *storage.broken.lock().unwrap() = false;
+    rename(&mut s, "after");
+    assert!(s.storage_status().last_error.is_none());
+    let all = numbers(&s);
+    drop(s);
+    let s = Session::with_storage(Box::new(VirtualHal::default()), Box::new(storage.clone()));
+    assert_eq!(numbers(&s), all);
 }
 
 #[test]

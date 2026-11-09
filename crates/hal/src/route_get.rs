@@ -42,10 +42,24 @@ pub enum RouteKind {
     Unicast,
     /// One of the router's own addresses.
     Local,
-    /// No route (`ENETUNREACH`), or a reject route.
+    /// No route (`ENETUNREACH`), or an `unreachable` route (`EHOSTUNREACH`).
     Unreachable,
-    /// G1.27e: silently discarded by a rule (`FR_ACT_BLACKHOLE`).
+    /// A `blackhole` route (`RTM_GETROUTE` answers `EINVAL`, **medido**, G1.5b),
+    /// or discarded by a rule (`FR_ACT_BLACKHOLE`, G1.27e).
     Blackhole,
+    /// A `prohibit` route (`EACCES`).
+    Prohibit,
+}
+
+impl From<corerouter_model::types::Discard> for RouteKind {
+    fn from(d: corerouter_model::types::Discard) -> Self {
+        use corerouter_model::types::Discard;
+        match d {
+            Discard::Blackhole => Self::Blackhole,
+            Discard::Unreachable => Self::Unreachable,
+            Discard::Prohibit => Self::Prohibit,
+        }
+    }
 }
 
 impl RouteKind {
@@ -55,6 +69,7 @@ impl RouteKind {
             Self::Local => "local",
             Self::Unreachable => "unreachable",
             Self::Blackhole => "blackhole",
+            Self::Prohibit => "prohibit",
         }
     }
 }
@@ -131,7 +146,12 @@ fn lookup_by_rules(cfg: &Config, snap: &Snapshot, q: &RouteQuery, p: &PolicyQuer
     };
     let walked = walk(&snap.rules, &packet, |table, suppress| {
         let found = in_one(table);
-        found.kind != RouteKind::Unreachable
+        // An `unreachable` route decides too (G1.5b); only no route goes on.
+        let reject = snap
+            .discards
+            .iter()
+            .any(|d| d.table == table && d.dst.contains(&q.dst));
+        (found.kind != RouteKind::Unreachable || reject)
             && suppress.is_none_or(|s| found.prefix.is_some_and(|f| f.prefix_len() > s))
     });
     let discard = |kind| KernelLookup {
@@ -221,6 +241,28 @@ fn lookup_in_table(cfg: &Config, snap: &Snapshot, q: &RouteQuery) -> KernelLooku
                 },
             );
         }
+    }
+    // G1.5a: a discard route more specific than the best (or as specific,
+    // with a lower metric). As the kernel, it answers no prefix.
+    let discard = snap
+        .discards
+        .iter()
+        .filter(|d| d.table == q.table && d.dst.contains(&q.dst))
+        .max_by_key(|d| (d.dst.prefix_len(), std::cmp::Reverse(d.metric)))
+        .filter(|d| {
+            best.is_none_or(|(b, m)| {
+                (d.dst.prefix_len(), std::cmp::Reverse(d.metric))
+                    > (b.prefix_len(), std::cmp::Reverse(m))
+            })
+        });
+    if let Some(d) = discard {
+        return KernelLookup {
+            kind: d.kind.into(),
+            prefix: None,
+            hops: Vec::new(),
+            src: None,
+            table: q.table,
+        };
     }
     match (best, hops.first()) {
         (Some((prefix, _)), Some(first)) => KernelLookup {

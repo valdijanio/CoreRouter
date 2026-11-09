@@ -147,3 +147,24 @@ fn times_show_the_date_only_on_other_days() {
     assert_eq!(short_time(1_792_674_309 - 86_400, today), "2026-10-21 13:05:09");
     assert_eq!(short_time(0, today), "—");
 }
+
+/// G4.6g: what only the disk has says so.
+#[test]
+fn a_line_from_the_disk_carries_a_chip() {
+    let mut s = lab();
+    s.log_disk_attach(
+        vec![corerouter_model::logging::LogEvent {
+            seq: 0,
+            time: 1_700_000_000,
+            topics: vec!["system".into(), "info".into()],
+            origin: "daemon".into(),
+            message: "antes de reiniciar".into(),
+            detail: serde_json::Value::Null,
+        }],
+        0,
+    );
+    let mut h = open(s);
+    assert!(h.has_text("antes de reiniciar"));
+    assert!(h.has_text("disco"));
+    refresh(&mut h);
+}

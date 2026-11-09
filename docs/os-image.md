@@ -464,7 +464,7 @@ Scrub) e **System › Tuning › Boot** (o que cada slot carrega, "Apply on slot
 - **O snapshot cabe no `/config` (G1.6u).** O que o armazenamento só troca por rename
   (`running.json`, `running.json.prev`, `rev-*.json`, `state-*.json`) entra por **hard link**
   (custo zero; o snapshot guarda o conteúdo antigo depois do próximo save); o resto (o journal,
-  que cresce no lugar, chaves) é copiado; `graphs/` (histórico de tráfego) fica fora do snapshot
+  que cresce no lugar, chaves) é copiado; `graphs/` (histórico de tráfego) e `log/` (log em disco, G4.6g) ficam fora do snapshot
   e o restore não o apaga. Antes de gravar o slot, a atualização confere se o `/config` tem o
   que a cópia precisa mais 1 MiB e recusa com os números e os maiores itens; uma cópia que falha
   mesmo assim é apagada. Na VM de teste (`/config` de 56 MB, uma revisão de 10,7 MB no
@@ -652,9 +652,10 @@ carregue um driver.
 e o kernel no mesmo pacote `.crpkg`; o rollback volta os três. Por isso nada de firmware no
 `/config` (sem verity, e não voltaria no rollback) nem pacote de firmware separado.
 
-**O instalador e o live da ISO** não carregam módulos: o kernel é o da ISO, e os módulos do rootfs
-foram compilados para o kernel instalado. A `ice` é `=y` no `installer.fragment` e fica em Safe
-Mode, o que basta para mostrar a porta. O live trata isso como "completa depois de instalar".
+**O live da ISO** carrega módulos desde a G1.6za, os do kernel dele ("Módulos do kernel da ISO",
+abaixo). O instalador de console que roda no initramfs não carrega nenhum. A `ice` continua `=y` no
+`installer.fragment` e fica em Safe Mode, o que basta para mostrar a porta: o live trata isso como
+"completa depois de instalar".
 
 **Como o `boot-test` prova isso sem E810.** O QEMU não emula a `ice`, mas emula a `i82551`, cuja
 revisão faz o `e100` recusar abrir a porta sem `e100/d102e_ucode.bin`. O teste liga essa placa
@@ -731,10 +732,11 @@ arquivo). O driver carrega, mas essas placas podem não subir. Licença "GPL sem
 sem alternativa BSD também fica de fora: a GPL pede o fonte, e sem ele o binário não pode ser
 redistribuído.
 
-**Na ISO (live e instalador)** só há porta para o que é embutido no kernel dela: os embutidos da
-tabela e mais `ice`, `bnxt_en`, `bnx2`, `bnx2x`, `mlx4_en`, `sfc`, `atlantic`, `alx`, `atl1c`
-(`installer.fragment`). A placa que só existe em módulo não tem porta na ISO, e a instalação
-continua pelo console: **ela funciona depois de instalar** (carga assinada à parte: gap G1.6za).
+**Na ISO:** o live tem porta para toda placa da tabela: as embutidas no kernel dela (as da tabela e
+mais `ice`, `bnxt_en`, `bnx2`, `bnx2x`, `mlx4_en`, `sfc`, `atlantic`, `alx`, `atl1c`,
+`installer.fragment`) e as outras pela carga de módulos (G1.6za). O instalador de console que fica no
+initramfs (pouca RAM, mídia ruim, `fw_cfg`) só vê as embutidas; o `i` no console do live já roda na
+raiz nova e vê todas.
 
 **PHYs em módulo** carregam pelo pedido do próprio kernel (`request_module`, `/sbin/modprobe` do
 busybox). Um driver embutido sonda antes do `/` e não consegue carregar um PHY em módulo: fica com
@@ -944,7 +946,7 @@ instalador acima.
   (`mount -o loop`, `switch_root`: sem `ioctl` em Rust, que exigiria `unsafe`). Na raiz nova, o
   init roda de novo (`--live-root`), como o de um roteador. A pendrive fica até o fim da instalação:
   a carga é lida dela na hora de gravar.
-- **Se algo falha, instala igual.** Menos de ~256 MiB de RAM, mídia ruim ou erro na troca de raiz:
+- **Se algo falha, instala igual.** Menos de 320 MiB de RAM (G1.6za, abaixo), mídia ruim ou erro na troca de raiz:
   fica no instalador de console, que não precisa de nada disso. O `fw_cfg` do hipervisor vai
   direto para ele.
 - **Não toca em disco nenhum.** `/config` é um tmpfs (não procura a partição `config` de um
@@ -961,6 +963,103 @@ boota; com 256 MiB, 76,6–78,2 MiB em uso. O instalador de console instala com 
 A ISO real (KVM, UEFI): com 256, 320 e 512 MiB sobe live (`ready` em 1,24–1,26 s depois do kernel);
 com 192 e 224 MiB fica no instalador de console, sem OOM. A ISO cresceu 1,2 MB (116.531.200 →
 117.776.384 B): o rootfs já estava nela, entrou o busybox no initramfs.
+
+### Módulos do kernel da ISO no live (G1.6za)
+
+Uma placa cujo driver só existe em módulo vira porta no live e pode gerenciar a instalação.
+
+- **Por que não os módulos da raiz.** Eles foram compilados para o kernel instalado, com outro
+  `.config`: o que é módulo lá pode ser embutido aqui, e o símbolo apareceria duas vezes.
+- **Outra versão de kernel.** O `installer.fragment` tem `CONFIG_LOCALVERSION="-live"`, então o
+  `uname -r` é `6.18.59-live`. O vermagic começa pela versão e o kernel compara o texto inteiro
+  (`same_magic`, `kernel/module/version.c`, sem `MODVERSIONS`). Antes, os dois kernels diziam
+  `6.18.59` e o vermagic não separava um do outro. **Medido:** carregar o `pcnet32.ko` da raiz no kernel da
+  ISO dá `version magic '6.18.59 SMP preempt mod_unload ' should be '6.18.59-live SMP preempt
+  mod_unload '`.
+- **A carga.** O pacote `corerouter-installer` compila `bzImage modules`, instala os módulos sem
+  símbolos, apaga os links `build` e `source` (apontam para a máquina do build) e faz o squashfs
+  `live-modules.img`. O `corerouter-image installer` grava o arquivo como `LIVEMODS.IMG` e o lista no
+  `INSTALL.JSON`, com tamanho e SHA-256, sob a mesma assinatura Ed25519 do índice.
+- **Na ISO, não no initramfs.** O initramfs vai dentro do kernel: pesaria no limite de 32 MiB da imagem
+  de boot e seria descomprimido na RAM em todo boot, inclusive para quem só instala.
+- **O boot.** Depois de montar a raiz, o primeiro estágio copia a carga para o mesmo tmpfs, confere o
+  SHA-256 do índice assinado, monta por loop em `/newroot/lib/modules` (`ro,nosuid,nodev,noexec`) e
+  confere que há `<uname -r>/modules.dep`. O segundo estágio roda `modules::start`, igual ao de um
+  roteador: varredura no boot e mensagens do kernel para o que for plugado. O `request_module` do
+  kernel (PHY em módulo) acha o mesmo diretório.
+- **Se a carga falha, o live sobe igual.** Hash errado, arquivo fora do índice ou erro ao montar: o
+  console diz o que houve, a RAM é devolvida e só as placas embutidas têm porta. Como
+  `/lib/modules/6.18.59-live` não existe nesse caso, nada carrega. As placas comuns seguem `=y` por isso.
+- **Porta que chega depois.** O live pôs cliente DHCP só nas portas da primeira passada; agora a porta
+  nomeada depois (placa plugada, sonda demorada) também recebe o seu (`live_dhcp_later`), com a
+  distância da rota pelo número da porta.
+- **`corerouter.modules=off`** vale no live: a carga nem é copiada.
+- **O build confere** (`xtask/src/os/livemods.rs`): todo `.ko` da carga tem o vermagic de
+  `6.18.59-live`, `e100` e `pcnet32` estão lá, há `modules.dep` e `modules.alias`, e nenhum link sobrou.
+
+**O teste** é `cargo xtask os install-test --only live-modules [--firmware seabios]`, e faz parte do
+`install-test` completo. A máquina tem só uma `i82551` (`e100`, só módulo, e o driver não abre a porta
+sem o arquivo de firmware da raiz): o endereço por DHCP e o TLS passam por essa placa. Depois pluga uma
+`pcnet`, que recebe `ether2` e endereço; instala pelo comando, com a gerência pela placa, e o disco
+responde nela com o mesmo certificado. Por fim boota uma ISO com um byte trocado na carga: recusada, o
+live sobe, a placa embutida tem porta e a `i82551` não. Contraprova (**medido**, a ISO de antes na mesma
+máquina): nenhum `driver e100 loaded`, nenhuma linha `port names`.
+
+**Nenhuma placa física foi testada.** "Testada" é emulação em QEMU, como na G1.6j; as placas reais ficam
+com a G1.6jb.
+
+**Números (medido, 2026-11-09, KVM, build da imagem, máquina com load 34–46 de outras sessões):**
+
+| O quê | Antes | Depois |
+|---|---|---|
+| `corerouter-install.iso` | 131 176 448 B | 134 995 968 B (+3 819 520 B, 2,9%) |
+| `LIVEMODS.IMG` | — | 3 813 376 B: 181 módulos, 16,8 MiB crus, zstd 19 |
+| `BOOTX64.EFI` | 21 455 872 B | 21 459 968 B (limite da FAT: 32 MiB) |
+| `ready` depois do kernel, 3 rodadas | virtio: 0,86–1,51 s | virtio: 1,06–1,43 s; `e100`: 0,92–1,72 s. A variação entre rodadas é maior que a diferença |
+| Copiar, conferir e montar a carga | — | 29–31 ms |
+| Carregar `e100` no boot do live | — | 98–117 ms |
+| `MemAvailable` com 256 MiB, 10 s depois de `ready`, virtio | 111,6–113,4 MiB | 107,9–108,5 MiB (a carga no tmpfs e o índice lido) |
+| O mesmo, com a `e100` carregada | sem porta | 103,8–106,0 MiB |
+| QEMU → admin por TLS pela placa | sem porta | 9,3–9,4 s (UEFI e BIOS) |
+| Placa plugada → driver e nome | sem porta | 113–125 ms |
+| Placa plugada → endereço por DHCP | sem porta | 3,9–5,2 s |
+
+Reprodutível (**medido**): apagar o pacote `corerouter-installer` e refazer dá o mesmo hash em
+`live-modules.img`, `BOOTX64.EFI` e na ISO. O `bzImage` do roteador é o mesmo de antes desta gap
+(`bee6e9bd…`): o kernel instalado não mudou. A ISO do commit final tem 135 106 560 B, por causa do que a `main` trouxe no meio.
+
+Compressão, medido sobre a mesma árvore: zstd 3 dá 4 554 752 B, zstd 15 dá 3 903 488 B, zstd 19 e 22 dão
+3 813 376 B (5,3 s de CPU a cada `os build` que refaz a ISO; `--only crpkg` não paga).
+
+**O mínimo do live subiu de 256 para 320 MiB.** O `install-test` falhava em `live_install`, também
+na ISO de antes desta gap (**medido**, a mesma falha com a ISO do commit `976fdd5d`). O login com
+senha (Argon2) leva o daemon a ~128 MiB, e o OOM o matava a cada login, levando junto a instalação em
+andamento: `job` e `result` voltavam a `null`, sem erro na tela. Com a raiz na RAM crescendo de 37 para 47 MiB (G1.6j), 256 MiB
+deixou de bastar. Com 288 MiB instala, com pouca folga; com 320 MiB instala e continua logando (**medido**). Abaixo disso fica no
+instalador de console.
+
+**Desempenho e paralelismo.** A carga é lida e conferida uma vez, em fluxo, com custo proporcional ao
+tamanho dela (29–31 ms). No boot, o custo é o de sempre em `modules.rs`: cada dispositivo sem driver
+contra cada alias, medido em ~1 ms na G1.6j, numa thread própria e com espera limitada. A sonda da placa é do
+kernel e fica nessa thread. Dividir em mais threads não compensa: uma máquina carrega poucos módulos, e os 29 ms são
+menores que a variação do boot.
+
+**Pesquisa.**
+
+- **RouterOS** ([pacotes](https://manual.mikrotik.com/docs/getting-started/installation-and-upgrade/packages/)):
+  no x86 há um pacote de sistema; `extra-nic` é só de arm64. O manual não diz como o instalador do x86
+  trata os drivers. Nada a copiar de nome: é interno da ISO.
+- **Alpine:** o `modloop` é um squashfs montado em `/.modloop`, alvo de `/lib/modules`, com
+  [verificação de assinatura](https://lists.alpinelinux.org/~alpine/users/%3CCAEhkKgV-OdZ8y406_yynrH7tcxjgXkKzSc6dCSZ_a6CUPUfBiA@mail.gmail.com%3E)
+  (opção `modloop_verify`): a mesma ideia. Não adotamos a opção de desligar: aqui, sem carga válida, o live sobe sem ela.
+- **Ubuntu live-server** ([livecd-rootfs](https://git.lubuntu.me/Lubuntu/livecd-rootfs/commit/d5b4aed65623f8695be9b2cb57449d5bf2e1269e)):
+  módulos num squashfs próprio, e um gancho do initrd monta `/lib/modules` dele. Adotado o lugar da
+  montagem.
+- **Arch** ([FS#50456](https://bugs.archlinux.org/task/50456)): módulos da ISO que não batem com o kernel
+  depois de atualizar o live. Aqui não acontece: o live não atualiza, e o vermagic recusa a mistura.
+- **Kernel 6.18.59:** `check_modinfo` (`kernel/module/main.c:2592`) e `same_magic`
+  (`kernel/module/version.c:97`), lidos no fonte.
+- **VyOS e pfSense:** a busca não trouxe como tratam isso; fica sem comparação.
 
 ### Instalar pelos comandos (`system.install.*`, G1.6y)
 
@@ -983,7 +1082,8 @@ comando do kernel e `/config` em disco).
 - **Teste de rede** (`system.install.test`, resultado no `print`): por porta, driver, link,
   velocidade, DHCP, gateway (ARP respondido), DNS (resposta de qualquer tipo, 3 tentativas) e a porta
   por onde esta conexão chegou. Só avisa, não impede instalar. Firmware que falta aparece como
-  aviso de agora: o kernel da ISO não traz arquivos de firmware; o sistema instalado, sim (G1.6j).
+  aviso de agora. Quem sonda antes da raiz (embutido, como a `ice`) não acha o arquivo; módulo carregado
+  no live acha, porque o firmware está na raiz (G1.6j, G1.6za).
 - **Primeiro boot:** `mgmt_port` e `mgmt_mode` (`dhcp`, ou `static` com endereço, gateway e DNS) vão
   em `/config/first-boot.json`, com o hash da senha do `admin` definida no live. O PID 1 aplica uma
   vez e apaga. O certificado TLS e os nomes das portas são copiados do live: a GUI que confiou nele

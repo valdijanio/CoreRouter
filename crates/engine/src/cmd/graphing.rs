@@ -28,7 +28,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         set
     ),
     cmd!(query "system.graph.print", "Graphing", [], None,
-        "{} → {enabled, store_every, physical, bridges, vlans, tunnels, resources, include, exclude, max_memory_mib, queues, dynamic_queues, queue_include, series: [{series, bytes, last, kept}], refused: [ifname], refused_queues (how many queues do not fit), memory_bytes, max_memory_bytes, series_bytes, queue_series_bytes, tiers: [{step, rows, window}], disk: {dir, files, last_store, last_store_bytes, last_store_ms, stores, bytes_written, last_error, loaded, load_errors}}",
+        "{} → {enabled, store_every, physical, bridges, vlans, tunnels, resources, include, exclude, max_memory_mib, queues, dynamic_queues, queue_include, series: [{series, bytes, last, kept}], refused: [ifname], refused_queues (how many queues do not fit), memory_bytes, max_memory_bytes (the ceiling in force: max_memory_mib or the share of /config, whichever is less), disk_cap_bytes, series_bytes, queue_series_bytes, tiers: [{step, rows, window}], disk: {dir, files, last_store, last_store_bytes, last_store_ms, stores, bytes_written, last_error, loaded, load_errors, removed}}",
         always, print),
     cmd!(query "system.graph.query", "Graph Query", [], None,
         "{series: string | [string], range: hour|day|week|month|year|int, step?: int, end?: int, fields?: [string], stats?: bool, max?: bool} → {start, end, step, resolution, points, series: [{series, units, data: {<field>: [number|null], <field>_max}, stats: {<field>: {current, avg, max, p95}}, totals, coverage, p95_step, p95_approximate, p95_billing, p95_sum}]}",

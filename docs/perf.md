@@ -2976,3 +2976,30 @@ slow_ten_thousand_routes_one_refused`, kernel do host:
   14,5 s (10 s de carência), kernel → `ready` 0,90 s com dm-verity. Mudar `primary=`/`next=` é um bloco por
   operação, fora de caminho quente. Na placa `pc`: `virtio-blk` e `virtio-scsi` ~1,2 s, `pvscsi` 1,3 s, IDE 1,2 s,
   `lsi53c895a` 4,2 s (a varredura do driver do SCSI).
+
+G0.18, `batch_import/dhcp_lease` (**medido**, 2026-11-09, host de desenvolvimento de 32 threads carregado por outras sessões, build de bench, Session virtual, lote atômico com commit): 1000 concessões 409 ms → 15,6 ms; 10 000 concessões 23,66 s → 99 ms (−99,6%).
+
+G1.27e, `crates/hal-linux/benches/netns_rules.rs`, build release, host com kernel 7.0.0-42, 2026-11-08/09, carga média de 30 a 57 (**medido**, com ruído alto). UDP de 64 bytes, um núcleo: 0 regras 381–910 kpps; 100 regras 127–377; 1000 regras 26–80; 4096 regras 8,7–17; as mesmas 4096 origens numa address list com uma marca e uma regra, 1051 kpps. Escrever 4096 regras 76 ms, remover 39 ms, inserir uma no topo de 4096 929 ms, commit sem mudança nelas 379 µs. Primeira regra sobre 200 000 rotas: 3,7 ms.
+
+G4.2h, duas threads, release, fsync real, 30 s de tempestade de DISCOVERs de MACs aleatórios, `slow_the_control_channel_stays_quick_in_a_discover_storm` (**medido**, 2026-11-09, host de 32 threads, carga ~5 de outras sessões): `interface.list` p99 865 µs → 55 µs, máximo 238,7 ms → 108 µs; `ip.dhcp-server.print` p99 868 µs → 604 µs (antes da contagem O(1), com carga ~35: 140 ms); 5,39 → 5,48 milhões de mensagens tratadas, a vazão não caiu.
+
+G4.3m, `proto-pppoe` `pppoe/*` (**medido**, 2026-11-09, host de 32 threads carregado por outras sessões, perfil de bench): `server_padi_to_pado` 246 ns; `server_padi_to_pado_limits_on` (limites ligados, tabela de bloqueios cheia, 50 mil ciclos) 283 ns; `server_padi_locked_out` 74 ns. Tabela fixa de ~655 KB por servidor e worker (**estimado** pelo `size_of`, 40 B × 16 384; o teste prende o teto em 1 MiB).
+
+G4.6c, servidor NTP, **medido** em 2026-11-09. Build release. Carga por loopback com
+`crates/proto-ntp/examples/ntp_load.rs` (4 threads, janela 16), na VM `corerouter-lab` (8 vCPU), sem
+limite de taxa: CoreRouter com 1, 2 e 4 leitores `SO_REUSEPORT`, 406 870, 841 030 e 1 442 325
+respostas/s (p50 158, 61 e 25 µs); ntpd-rs 1.9.0, 79 278 e 120 077 (p50 729 e 500 µs; duas rodadas).
+Ligar o servidor com 1 leitor por família soma 3,9 MB ao daemon. Criterion no host: resposta 31 ns,
+limite 13 ns, origem contra 60 000 entradas 40 ns; ler a address-list de 60 000 entradas 0,56 ms sob o
+lock, a cada 2 s; ordenar 0,40 ms fora dele.
+
+### G4.6g: custo do log em disco (**medido**, , build release, 2026-11-09)
+
+`cargo bench -p corerouter-engine --bench log_disk`:
+
+| Caminho | Tempo |
+|---|---|
+| `log_event` sem regra de disco (sob o lock do `Session`) | 156 ns |
+| `log_event` com regra de disco, mais a troca da fila (pior caso: uma troca por evento) | 348 ns |
+| `encode` de uma linha (fora do lock) | 469 ns |
+| Devolver as 2000 linhas da janela na partida | 3,9 ms |

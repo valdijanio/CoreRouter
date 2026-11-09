@@ -694,6 +694,7 @@ fn run_until_signal(
         }
     }
     service::graphing::final_store(session);
+    service::disk_log::final_flush(session);
     // Held until the process ends: a commit in progress finishes first and
     // no new one (no new save) starts.
     let mut s = corerouter_engine::lock(session);
@@ -770,6 +771,12 @@ fn main() -> ExitCode {
     let env = corerouter_engine::boot_apply::BootEnv { management_ports };
     let mut session = Session::with_storage_env(hal, storage, env);
     session.set_runner(thread_runner());
+    // G1.6w: the histories' ceilings are shares of this filesystem.
+    if let Some(dir) = &config_dir {
+        session.set_config_capacity(corerouter_sysupdate::state::total_bytes(dir));
+        // G4.6g: the log files come back before any service reads the log.
+        service::disk_log::restore(&mut session, dir);
+    }
     let session = shared(session);
     if let Err(e) = spawn_clock(session.clone()) {
         eprintln!("cannot start the clock thread: {e}");

@@ -403,8 +403,10 @@ fn logging_actions_and_rules() {
     assert_eq!(list[0]["name"], "memory");
     assert_eq!(list[0]["memory_lines"], 1000);
     assert_eq!(
-        list[1],
+        list[2],
         json!({"name": "siem", "target": "remote", "default": false, "memory_lines": null,
+            "disk_file_name": null, "disk_lines_per_file": null, "disk_file_count": null,
+            "disk_stop_on_full": null, "disk_status": null,
                "remote": "192.0.2.10", "remote_port": 514, "src_address": null,
                "syslog_facility": "local3", "syslog_severity": "auto", "comment": ""})
     );
@@ -663,4 +665,124 @@ fn a_loaded_config_with_bad_poll_bounds_is_reported() {
     cfg.system.ntp_client.servers.clear();
     let issues = corerouter_engine::validate::validate_all(&cfg);
     assert_eq!(issues.len(), 1, "{issues:?}");
+}
+
+/// G4.6g: the built-in `disk` action, with RouterOS' defaults.
+#[test]
+fn the_disk_action_has_routeros_defaults_and_refuses_bad_values() {
+    let mut s = Session::virtual_lab();
+    let list = s.execute("system.logging.action.list", &json!({})).unwrap();
+    let disk = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == "disk")
+        .unwrap()
+        .clone();
+    assert_eq!(disk["target"], "disk");
+    assert_eq!(disk["default"], true);
+    assert_eq!(disk["disk_file_name"], "log");
+    assert_eq!(disk["disk_lines_per_file"], 1000);
+    assert_eq!(disk["disk_file_count"], 2);
+    assert_eq!(disk["disk_stop_on_full"], false);
+    assert!(disk["disk_status"]["dir"].is_null(), "no writer in the lab");
+    let rules = s.execute("system.logging.list", &json!({})).unwrap();
+    assert!(
+        rules
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["action"] != "disk"),
+        "writing is a choice, as in RouterOS"
+    );
+
+    s.execute(
+        "system.logging.action.set",
+        &json!({"name": "disk", "disk_file_name": "audit", "disk_lines_per_file": 50, "disk_file_count": 4, "disk_stop_on_full": true}),
+    )
+    .unwrap();
+    let d = &s.store().running().system.logging.disk;
+    assert_eq!(
+        (
+            d.file_name.as_str(),
+            d.lines_per_file,
+            d.file_count,
+            d.stop_on_full
+        ),
+        ("audit", 50, 4, true)
+    );
+    let rev = s.store().current_revision();
+    s.execute("system.identity.set", &json!({"name": "x"}))
+        .unwrap();
+    s.execute("config.rollback", &json!({"revision": rev - 1}))
+        .unwrap();
+    assert_eq!(
+        s.store().running().system.logging.disk.file_name,
+        "log",
+        "rollback takes it back"
+    );
+
+    for (p, needle) in [
+        (
+            json!({"name": "disk", "disk_file_name": "../../etc/x"}),
+            "no directories",
+        ),
+        (
+            json!({"name": "disk", "disk_file_name": ""}),
+            "no directories",
+        ),
+        (
+            json!({"name": "disk", "disk_lines_per_file": 0}),
+            "1..=65535",
+        ),
+        (json!({"name": "disk", "disk_file_count": 0}), "1..=256"),
+        (json!({"name": "disk", "disk_file_count": 257}), "1..=256"),
+        (
+            json!({"name": "disk", "remote": "192.0.2.1"}),
+            "only takes disk_*",
+        ),
+        (
+            json!({"name": "disk", "memory_lines": 5}),
+            "only takes disk_*",
+        ),
+        (
+            json!({"name": "memory", "disk_file_count": 5}),
+            "only takes memory_lines",
+        ),
+    ] {
+        let e = s
+            .execute("system.logging.action.set", &p)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(needle), "{p}: {e}");
+    }
+    let e = s
+        .execute("system.logging.action.remove", &json!({"name": "disk"}))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("built in"), "{e}");
+    let e = s
+        .execute(
+            "system.logging.action.add",
+            &json!({"name": "disk", "remote": "192.0.2.1"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("already exists"), "{e}");
+    s.execute(
+        "system.logging.add",
+        &json!({"topics": ["info"], "action": "disk"}),
+    )
+    .unwrap();
+}
+
+/// A config without the field (every older one) reads as the defaults, and
+/// a default one is written without it, so an older build still reads it.
+#[test]
+fn the_disk_settings_stay_out_of_the_saved_config_while_default() {
+    let l = corerouter_model::logging::Logging::default();
+    let text = serde_json::to_string(&l).unwrap();
+    assert!(!text.contains("\"disk\""), "{text}");
+    let back: corerouter_model::logging::Logging = serde_json::from_str(&text).unwrap();
+    assert_eq!(back, l);
 }
