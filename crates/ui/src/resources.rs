@@ -836,6 +836,7 @@ fn static_name(name: &str) -> &'static str {
         "Memory pressure",
         "Swap",
         "Disk",
+        "Config disk",
         "Temperature",
         "NIC errors",
         "Conntrack",

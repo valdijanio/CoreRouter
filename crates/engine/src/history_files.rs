@@ -120,6 +120,11 @@ fn journal_budget(slot: usize) -> usize {
 }
 
 impl RevisionFiles {
+    /// Bytes of the revision files that hold in-memory revisions.
+    pub(crate) fn saved_bytes(&self) -> usize {
+        self.saved.values().fold(0, |sum, f| sum.saturating_add(f.size))
+    }
+
     /// The commit that made revision `number` already serialized it.
     pub(crate) fn note_encoded(&mut self, number: u32, text: String) {
         self.encoded = Some((number, text));
@@ -293,7 +298,9 @@ fn read(storage: &mut dyn ConfigStorage, number: u32) -> Result<(RevisionFile, u
 /// Save `store` as revision files + the slot: only the revisions without a
 /// file (the previous newest, after a commit) are written. Keeps the
 /// newest revisions whose files fit in `budget` bytes and returns how many
-/// older ones were left out, like [`persist::encode_bounded`]. `slot`: the
+/// older ones were left out, like [`persist::encode_bounded`]; the revision
+/// right before the newest stays whatever its size (G1.6w: it is the last
+/// good one, what a rollback after a reboot goes back to). `slot`: the
 /// newest revision goes to the slot even when the journal could take it
 /// (G0.27, the checkpoint of a clean shutdown).
 pub(crate) fn save(
@@ -305,9 +312,9 @@ pub(crate) fn save(
     slot: bool,
 ) -> Result<usize, String> {
     let history = store.history();
-    let Some(newest) = history.last() else {
+    if history.is_empty() {
         return Err("empty history".into());
-    };
+    }
     // Newest first: each revision is a difference against the next newer
     // one, so the chain stops at the first that does not fit (an older
     // file without its base would be useless).
@@ -329,36 +336,106 @@ pub(crate) fn save(
                 size
             }
         };
-        if used.saturating_add(size) > budget {
+        if !keep.is_empty() && used.saturating_add(size) > budget {
             write.retain(|(n, _, _)| *n != rev.number);
             break;
         }
         used = used.saturating_add(size);
         keep.insert(rev.number);
     }
-    // The newest revision is in the slot.
-    let skipped = history.len().saturating_sub(keep.len()).saturating_sub(1);
     for (number, text, base) in &write {
         // Whatever was there is replaced: until it is written, no file counts.
         files.saved.remove(number);
         files.present.insert(*number);
-        storage
-            .save_revision(*number, text)
-            .map_err(|e| e.to_string())?;
-        files.saved.insert(
-            *number,
-            Saved {
-                size: text.len(),
-                base: Some(*base),
-            },
-        );
+        // One retry for a passing error: it must not cost any history.
+        let mut wrote = storage.save_revision(*number, text);
+        if wrote.is_err() {
+            wrote = storage.save_revision(*number, text);
+        }
+        let mut full = false;
+        if let Err(e) = &wrote {
+            let e = e.to_string();
+            // Not a full disk (bad flash, read-only): deleting frees nothing
+            // that helps. The error goes up, the files stay.
+            if !crate::storage::no_space(&e) {
+                return Err(e);
+            }
+            // G1.6w: the disk is full. The running config matters more than
+            // the history: what is older goes now (each file only serves
+            // the ones older than it) and this one gets a last try; if that
+            // fails too, the chain ends here and the slot still gets its
+            // turn below.
+            log::warn!("revision {number} file does not fit, freeing the older ones: {e}");
+            full = true;
+            keep.retain(|k| *k >= *number);
+            remove_stale(storage, files, &keep);
+            wrote = storage.save_revision(*number, text);
+        }
+        match wrote {
+            Ok(()) => {
+                files.saved.insert(
+                    *number,
+                    Saved {
+                        size: text.len(),
+                        base: Some(*base),
+                    },
+                );
+            }
+            Err(e) => {
+                log::error!("revision {number} file not written, the history stops at the next newer one: {e}");
+                keep.remove(number);
+            }
+        }
+        if full {
+            break;
+        }
     }
+    // The newest revision is in the slot.
+    let skipped = history.len().saturating_sub(keep.len()).saturating_sub(1);
+    let mut saved = save_newest(storage, files, store, users, slot);
+    if saved.is_err() {
+        saved = save_newest(storage, files, store, users, slot);
+    }
+    if let Err(e) = &saved
+        && crate::storage::no_space(e)
+    {
+        // G1.6w: the same with the slot or the journal line: every revision
+        // but the last good one gives way to the running config. Only for a
+        // full disk, and only after a retry: anything else costs no history.
+        log::warn!("the running config does not fit, freeing the old revisions: {e}");
+        let last_good = keep.last().copied();
+        keep.retain(|k| Some(*k) == last_good);
+        remove_stale(storage, files, &keep);
+        saved = save_newest(storage, files, store, users, slot);
+    }
+    saved?;
+    let skipped = skipped.max(history.len().saturating_sub(keep.len()).saturating_sub(1));
+    // Past the history now, or the newest (whole in the slot or built by
+    // the journal).
+    remove_stale(storage, files, &keep);
+    Ok(skipped)
+}
+
+/// The newest revision to the journal or, when that cannot take it, the slot.
+fn save_newest(
+    storage: &mut dyn ConfigStorage,
+    files: &mut RevisionFiles,
+    store: &ConfigStore,
+    users: &Users,
+    slot: bool,
+) -> Result<(), String> {
+    let Some(newest) = store.history().last() else {
+        return Err("empty history".into());
+    };
     if slot || !(storage.config_journal() && journal_append(storage, files, store, users)?) {
         checkpoint(storage, files, newest, users)?;
     }
-    // Past the history now, or the newest (whole in the slot or built by
-    // the journal).
-    let stale: Vec<u32> = files.present.difference(&keep).copied().collect();
+    Ok(())
+}
+
+/// Delete the revision files that are not in `keep`.
+fn remove_stale(storage: &mut dyn ConfigStorage, files: &mut RevisionFiles, keep: &BTreeSet<u32>) {
+    let stale: Vec<u32> = files.present.difference(keep).copied().collect();
     for n in stale {
         match storage.remove_revision(n) {
             Ok(()) => {
@@ -368,7 +445,6 @@ pub(crate) fn save(
             Err(e) => log::warn!("cannot delete revision {n} file: {e}"),
         }
     }
-    Ok(skipped)
 }
 
 /// Whether the slot already holds the newest revision of `store` (no

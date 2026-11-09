@@ -275,6 +275,29 @@ fn slow_a_power_cut_one_commit_after_the_checkpoint() {
     power_cut_at_any_step(&[1025]);
 }
 
+/// G1.6w: a write that fails once, whatever it is, costs no revision: the
+/// slow tests above saw 62 of them go at a checkpoint's passing failure.
+#[test]
+fn a_passing_failure_costs_no_revision() {
+    for step in ["revision", "append", "slot", "rewrite"] {
+        let storage = Flaky::default();
+        let mut s = boot_flaky(&storage);
+        for i in 0..40 {
+            add(&mut s, i);
+        }
+        storage.fail_next(step);
+        rename(&mut s, "one");
+        // A checkpoint writes the slot and rewrites the journal.
+        s.checkpoint().ok();
+        rename(&mut s, "two");
+        let all = numbers(&s);
+        drop(s);
+        let t = boot_flaky(&storage);
+        assert!(t.storage_status().boot_errors.is_empty(), "{step}");
+        assert_eq!(numbers(&t), all, "{step}");
+    }
+}
+
 fn power_cut_at_any_step(counts: &[usize]) {
     for &commits in counts {
         for step in ["revision", "append", "slot", "rewrite", "remove"] {

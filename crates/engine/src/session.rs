@@ -708,6 +708,7 @@ impl Session {
     fn save_to(&mut self, slot: bool) {
         let entry_store = self.safe_mode_entry_store();
         let store = entry_store.as_ref().unwrap_or(&self.store);
+        let budget = self.ext.get::<crate::config_disk::ConfigDisk>().map_or(persist::SAVE_BUDGET_BYTES, |d| d.history_budget());
         let saved = if self.storage.revision_files() {
             // Only what is new is written (G1.23).
             let mut files = self
@@ -720,10 +721,14 @@ impl Session {
                 &mut files,
                 store,
                 &self.users,
-                persist::SAVE_BUDGET_BYTES,
+                budget,
                 slot,
             );
+            let bytes = files.saved_bytes() as u64;
             self.ext.set(files);
+            if let Some(d) = self.ext_mut::<crate::config_disk::ConfigDisk>() {
+                d.history_bytes = bytes;
+            }
             saved
         } else {
             persist::encode_bounded(store, &self.users, persist::SAVE_BUDGET_BYTES)
@@ -737,12 +742,27 @@ impl Session {
         };
         match saved {
             Ok(skipped) => {
-                if skipped > 0 && skipped != self.storage_status.revisions_not_saved {
+                let before = self.storage_status.revisions_not_saved;
+                if skipped > 0 && skipped != before {
                     log::warn!(
-                        "config file kept under {} MiB: the {skipped} oldest revision(s) \
+                        "revision history kept under {:.1} MiB: the {skipped} oldest revision(s) \
                          were left out",
-                        persist::SAVE_BUDGET_BYTES >> 20
+                        budget as f64 / f64::from(1u32 << 20)
                     );
+                }
+                // One line when it starts and one when it ends: a commit
+                // per minute past the ceiling is not a line per minute.
+                if (skipped > 0) != (before > 0) {
+                    let cap = crate::config_disk::mib(budget as u64);
+                    let (topics, text) = if skipped > 0 {
+                        (
+                            ["system", "warning"],
+                            format!("Histórico de revisões no disco limitado a {cap}: as {skipped} mais antigas saem e não voltam depois de reiniciar"),
+                        )
+                    } else {
+                        (["system", "info"], format!("Histórico de revisões cabe de novo em {cap}"))
+                    };
+                    self.log_event(&topics, crate::logging::DAEMON, text, json!({"revisions_not_saved": skipped, "budget_bytes": budget}));
                 }
                 self.storage_status.revisions_not_saved = skipped;
                 self.storage_status.last_error = None;
