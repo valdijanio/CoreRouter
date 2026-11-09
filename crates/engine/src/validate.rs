@@ -108,6 +108,12 @@ pub const UNITS: &[Unit] = &[
         run: routing_table_checks,
     },
     Unit {
+        name: "routing-rules",
+        // A rule names interfaces and tables, and the mangle's marks.
+        reads: small_and(Sections::INTERFACES.union(Sections::MANGLE)),
+        run: crate::policy_rule::checks,
+    },
+    Unit {
         name: "mpls",
         reads: small_and(Sections::NONE),
         run: corerouter_proto_mpls::validate,

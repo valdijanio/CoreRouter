@@ -58,6 +58,7 @@ mod ntp_logging;
 mod off_lock;
 mod os_loopback;
 mod persistence;
+mod policy_rule;
 mod ppp_import;
 mod query_purity;
 mod queue;

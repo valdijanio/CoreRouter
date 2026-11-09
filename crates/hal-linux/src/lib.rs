@@ -63,6 +63,8 @@ pub mod clock;
 
 #[cfg(target_os = "linux")]
 mod netlink;
+#[cfg(target_os = "linux")]
+mod rules;
 
 /// How many times `apply` read the kernel's whole route table in this
 /// process (G0.31i): tests check a commit of one route reads none.
@@ -247,6 +249,9 @@ mod linux {
         claims: BTreeMap<IfName, InterfaceKind>,
         /// Whether `ra::sync` ran once (the first one flushes stale RA state).
         ra_synced: bool,
+        /// G1.27e: the rule list last written (`None`: not compared with the
+        /// kernel yet, which a restart may have left with rules of ours).
+        rules: Option<BTreeSet<corerouter_hal::policy::KernelRule>>,
         /// Each port's Ethernet settings before CoreRouter first changed
         /// them (G1.20): what a setting taken out of the config returns to.
         ether_orig: BTreeMap<IfName, EtherState>,
@@ -779,6 +784,19 @@ mod linux {
     }
 
     impl LinuxHal {
+        /// G1.27e: the rule list of `cfg`, when it differs from the last one
+        /// written. The first time, even an empty one: a restart may have
+        /// left rules of ours in the kernel.
+        fn sync_rules(&mut self, cfg: &Config) -> Result<(), HalError> {
+            let want = corerouter_hal::policy::expected_rules(cfg);
+            if self.rules.as_ref() == Some(&want) {
+                return Ok(());
+            }
+            crate::rules::sync(&want)?;
+            self.rules = Some(want);
+            Ok(())
+        }
+
         /// Every link name of the kernel with its index (one dump).
         fn link_names(&self) -> Result<BTreeMap<String, u32>, HalError> {
             Ok(crate::netlink::links()?
@@ -792,9 +810,20 @@ mod linux {
         /// back to `from`.
         fn apply_present(&mut self, from: &Config, to: &Config) -> Result<(), HalError> {
             self.apply_links(from, to)?;
+            // G1.27e: after the routes, so a rule never points at a table
+            // still being filled.
+            if let Err(e) = self.sync_rules(to) {
+                if let Err(back) = self.apply_links(to, from) {
+                    log::error!("restoring the rest after a routing rule was refused: {back}");
+                }
+                return Err(e);
+            }
             if let Err(e) = self.xdp.sync(to) {
                 if let Err(back) = self.xdp.sync(from) {
                     log::error!("restoring the previous XDP filter: {back}");
+                }
+                if let Err(back) = self.sync_rules(from) {
+                    log::error!("restoring the routing rules after XDP refused: {back}");
                 }
                 if let Err(back) = self.apply_links(to, from) {
                     log::error!("restoring the rest after XDP refused: {back}");
@@ -809,6 +838,9 @@ mod linux {
                 if let Err(e) = self.neigh.sync(to, &|n| managed.contains(n)) {
                     if let Err(back) = self.xdp.sync(from) {
                         log::error!("restoring the previous XDP filter: {back}");
+                    }
+                    if let Err(back) = self.sync_rules(from) {
+                        log::error!("restoring the routing rules: {back}");
                     }
                     if let Err(back) = self.apply_links(to, from) {
                         log::error!(
@@ -1340,12 +1372,23 @@ mod linux {
                 .into_iter()
                 .filter(|d| tables.contains_key(&d.table))
                 .collect();
+            // G1.27e: only ours: another program's rules are not drift.
+            let rules = crate::rules::dump()?
+                .into_iter()
+                .filter(|r| r.owner == corerouter_hal::policy::RuleOwner::Corerouter)
+                .map(|r| r.rule)
+                .collect();
             Ok(Snapshot {
                 links,
                 addresses,
                 routes,
                 discards,
+                rules,
             })
+        }
+
+        fn rule_dump(&mut self) -> Result<Vec<corerouter_hal::policy::KernelRuleRow>, HalError> {
+            crate::rules::dump()
         }
 
         /// `RTM_GETROUTE` (G1.27).
@@ -1369,7 +1412,11 @@ mod linux {
             for op in &ops {
                 log::info!("reconcile: {op}");
             }
-            crate::netlink::apply(&ops, &crate::plan::kernel_routes(cfg))
+            crate::netlink::apply(&ops, &crate::plan::kernel_routes(cfg))?;
+            // Compared with the kernel, whatever was written last: someone
+            // removed or added a rule of ours (G1.27e).
+            self.rules = None;
+            self.sync_rules(cfg)
         }
 
         fn unmanaged(&mut self) -> Vec<(IfName, String)> {
