@@ -2768,8 +2768,13 @@ mod tests {
                 "engine.execute" if !known => Err(format!("unknown command '{command}'")),
                 // The interface window's tab queries (G1.19).
                 "engine.execute"
-                    if [iface_tabs::MONITOR, iface_tabs::HARDWARE, iface_tabs::STATS]
-                        .contains(&command.as_str()) =>
+                    if [
+                        iface_tabs::MONITOR,
+                        iface_tabs::HARDWARE,
+                        iface_tabs::STATS,
+                        crate::nic_problems::COMMAND,
+                    ]
+                    .contains(&command.as_str()) =>
                 {
                     Ok(json!({"available": false, "reason": "fake daemon"}))
                 }

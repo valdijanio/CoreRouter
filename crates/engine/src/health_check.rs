@@ -185,6 +185,9 @@ pub struct Inputs {
     /// G1.3b: ports of the running config not on this machine (and the
     /// VLANs on them). Empty: every port is there (no check then).
     pub absent_ports: Vec<String>,
+    /// G1.6ja: the network cards and what is wrong with them (`None`: nobody
+    /// looked at this machine's cards).
+    pub nic_hardware: Option<crate::nic_problems::NicHealth>,
     /// G1.3e: (section, why) of the restored config the data plane refused
     /// at boot. Empty: everything is in (no check then).
     pub boot_apply: Vec<(String, String)>,
@@ -619,6 +622,25 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
             reason: format!("interface(s) da configuração sem a placa nesta máquina (flag I): {list}; o resto da configuração está aplicado e a delas volta sozinha quando a placa voltar"),
             action: Some("Confira o cabo/adaptador USB ou a placa; se ela saiu de vez, tire a configuração dela (ou troque a interface dos itens que a usam).".into()) });
     }
+    // G1.6ja: a card the kernel could not bring up in full.
+    if let Some(n) = &i.nic_hardware {
+        let (key, name) = ("interface.hardware", "Network card drivers");
+        if !n.warn.is_empty() {
+            let list = n.warn.iter().take(5).cloned().collect::<Vec<_>>().join("; ");
+            out.push(Check { key, name, severity: Severity::Warning, value: Some(format!("{} de {}", n.warn.len(), n.devices)),
+                reason: list,
+                action: Some(n.actions.iter().take(3).cloned().collect::<Vec<_>>().join(" ")) });
+        } else if !n.expected.is_empty() {
+            out.push(Check { key, name, severity: Severity::Ok, value: Some(n.devices.to_string()),
+                reason: format!("na ISO, sem firmware até instalar (é o esperado): {}", n.expected.iter().take(5).cloned().collect::<Vec<_>>().join("; ")), action: None });
+        } else if n.kernel_log {
+            out.push(Check { key, name, severity: Severity::Ok, value: Some(n.devices.to_string()),
+                reason: format!("{} placa(s) de rede, todas com driver e sem firmware faltando", n.devices), action: None });
+        } else {
+            out.push(Check { key, name, severity: Severity::Ok, value: Some(n.devices.to_string()),
+                reason: format!("{} placa(s) de rede com driver; o log do kernel não pode ser lido, então firmware faltando não aparece aqui", n.devices), action: None });
+        }
+    }
     // G1.3e: the boot left part of the config out (the rest, management
     // included, is up). Only while it lasts.
     if !i.boot_apply.is_empty() {
@@ -866,6 +888,7 @@ impl Session {
             .collect();
         i.usb_watchdog = self.usb_watchdog_health();
         i.absent_ports = self.invalid_interfaces(&live).into_keys().map(|n| n.to_string()).collect();
+        i.nic_hardware = self.nic_health();
         i.boot_apply = self.boot_failures().into_iter().map(|f| (f.label(), f.error)).collect();
         i.bgp_no_eor = self.routing_status().map(|st| {
             let quiet = bgp_without_eor(st)
@@ -951,6 +974,7 @@ mod tests {
 
     fn healthy() -> Inputs {
         Inputs {
+            nic_hardware: None,
             readings: true,
             cpu_avg: Some((20.0, 60)),
             psi_some60: Some(0.5),
