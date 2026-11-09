@@ -8,12 +8,13 @@
 //! router's own addresses, two pools sharing addresses, a server on what
 //! looks like the WAN.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr};
 
 use corerouter_model::dhcp_server::{
     DhcpServers, MAX_ALERTS, MAX_LEASE_TIME, MAX_LIST, MAX_MATCHERS, MAX_NETWORKS, MAX_OPTION_SETS,
-    MAX_OPTIONS, MAX_SERVERS, MAX_STATIC_LEASES, MAX_VALUE_TEXT, MIN_LEASE_TIME, parse_client_id,
+    MAX_OPTIONS, MAX_SERVERS, MAX_STATIC_LEASES, MAX_VALUE_TEXT, MIN_LEASE_TIME, StaticLease,
+    parse_client_id,
 };
 use corerouter_model::dns_zone::ZoneType;
 use corerouter_model::ip_pool::{self, IpPool, MAX_POOL_SIZE, MAX_POOLS, MAX_RANGES};
@@ -636,137 +637,199 @@ fn lease_checks(cfg: &Config, out: &mut Out) {
         );
     }
     let mine = router_addresses(cfg);
-    let mut by_addr: BTreeMap<(Option<&str>, Ipv4Addr), ItemId> = BTreeMap::new();
-    let mut by_client: BTreeMap<(Option<&str>, Vec<u8>), ItemId> = BTreeMap::new();
+    let mut dups = LeaseDups::default();
     for l in &d.leases {
-        let at = |f: &str| format!("ip.dhcp_server.leases[{}].{f}", l.id);
-        if let Some(s) = &l.server
-            && d.server(s).is_none()
-        {
-            out.err(at("server"), l.id, "server", format!("no server '{s}'"));
+        lease_check(cfg, &mine, &mut dups, l, out);
+    }
+}
+
+/// Which enabled static lease holds each address and each client, per
+/// server: what makes a new lease a duplicate. Filling it is what the
+/// checks of a whole list do; kept between `lease.add`s, it spares each one
+/// a walk of the list (G0.18).
+#[derive(Debug, Default, Clone)]
+pub struct LeaseDups {
+    /// Server names as small numbers (`None`: every server, 0): a key
+    /// without an allocation for each lease.
+    servers: HashMap<String, u32>,
+    by_addr: HashMap<(u32, Ipv4Addr), ItemId>,
+    by_client: HashMap<(u32, Vec<u8>), ItemId>,
+}
+
+impl LeaseDups {
+    /// The leases of `cfg` already in place.
+    pub fn of(cfg: &Config) -> Self {
+        let mut dups = Self::default();
+        for l in cfg.ip.dhcp_server.leases.iter().filter(|l| !l.disabled) {
+            dups.note(l);
         }
-        if l.mac_address.is_none()
-            && l.client_id.is_empty()
-            && l.agent_circuit_id.is_empty()
-            && l.agent_remote_id.is_empty()
-        {
-            out.err(
-                at("mac_address"),
-                l.id,
-                "client",
-                "a static lease needs a MAC or a client id (or an option 82 id)",
-            );
+        dups
+    }
+
+    fn server(&mut self, name: Option<&str>) -> u32 {
+        let Some(name) = name else { return 0 };
+        if let Some(n) = self.servers.get(name) {
+            return *n;
         }
-        for (field, v) in [
-            ("agent_circuit_id", &l.agent_circuit_id),
-            ("agent_remote_id", &l.agent_remote_id),
-        ] {
-            if !v.is_empty() && super::agent::parse(v).is_none() {
-                out.err(
-                    at(field),
-                    l.id,
-                    "option 82",
-                    "text, or 0x… bytes; at most 255",
-                );
-            }
-        }
-        let cid = if l.client_id.is_empty() {
-            None
-        } else {
-            match parse_client_id(&l.client_id) {
-                Some(c) => Some(c),
-                None => {
-                    out.err(
-                        at("client_id"),
-                        l.id,
-                        "client id",
-                        "write it as RouterOS prints it (1:aa:bb:cc:dd:ee:ff) or 0x…",
-                    );
-                    None
-                }
-            }
-        };
-        if let Some(t) = l.lease_time
-            && !(MIN_LEASE_TIME..=MAX_LEASE_TIME).contains(&t)
-        {
-            out.err(
-                at("lease_time"),
-                l.id,
-                "lease-time",
-                format!("{MIN_LEASE_TIME}..={MAX_LEASE_TIME} seconds"),
-            );
-        }
-        if let Err(e) = options_ok(d, &l.dhcp_option) {
-            out.err(at("dhcp_option"), l.id, "options", e);
-        }
-        if let Err(e) = set_ok(d, l.dhcp_option_set.as_ref()) {
-            out.err(at("dhcp_option_set"), l.id, "option set", e);
-        }
-        if l.address_lists.len() > MAX_LIST {
-            out.err(
-                at("address_lists"),
-                l.id,
-                "lists",
-                format!("at most {MAX_LIST} lists"),
-            );
-        }
-        if l.host_name.len() > 63 || !crate::check_host_name(&l.host_name).is_ok() {
-            out.err(
-                at("host_name"),
-                l.id,
-                "host name",
-                "a DNS label: letters, digits, '-'; at most 63",
-            );
-        }
-        if let Some((_, iface)) = mine.iter().find(|(a, _)| a.addr() == l.address) {
-            out.err(
-                at("address"),
-                l.id,
-                "router",
-                format!("{} is the router's address on '{iface}'", l.address),
-            );
-        }
-        if l.disabled {
-            continue;
-        }
-        let srv = l.server.as_deref();
-        if let Some(other) = by_addr.insert((srv, l.address), l.id) {
-            out.err(
-                at("address"),
-                l.id,
-                "address",
-                format!("{} is already static lease {other}", l.address),
-            );
-        }
-        let key = cid.or_else(|| {
+        let n = u32::try_from(self.servers.len() + 1).unwrap_or(u32::MAX);
+        self.servers.insert(name.to_owned(), n);
+        n
+    }
+
+    /// `l` now holds its address and client; the leases that held them.
+    fn note(&mut self, l: &StaticLease) -> (Option<ItemId>, Option<ItemId>) {
+        let srv = self.server(l.server.as_deref());
+        let addr = self.by_addr.insert((srv, l.address), l.id);
+        let key = parse_client_id_of(l).or_else(|| {
             l.mac_address.map(|m| {
                 let mut k = vec![1u8];
                 k.extend_from_slice(&m.0);
                 k
             })
         });
-        if let Some(k) = key
-            && let Some(other) = by_client.insert((srv, k), l.id)
-        {
+        let client = key.and_then(|k| self.by_client.insert((srv, k), l.id));
+        (addr, client)
+    }
+}
+
+/// The client id of `l` when it has a valid one.
+fn parse_client_id_of(l: &StaticLease) -> Option<Vec<u8>> {
+    if l.client_id.is_empty() {
+        None
+    } else {
+        parse_client_id(&l.client_id)
+    }
+}
+
+/// What is wrong with one lease, with `dups` holding the leases before it.
+fn lease_check(
+    cfg: &Config,
+    mine: &[(Ipv4Net, &IfName)],
+    dups: &mut LeaseDups,
+    l: &StaticLease,
+    out: &mut Out,
+) {
+    let d = &cfg.ip.dhcp_server;
+    let at = |f: &str| format!("ip.dhcp_server.leases[{}].{f}", l.id);
+    if let Some(s) = &l.server
+        && d.server(s).is_none()
+    {
+        out.err(at("server"), l.id, "server", format!("no server '{s}'"));
+    }
+    if l.mac_address.is_none()
+        && l.client_id.is_empty()
+        && l.agent_circuit_id.is_empty()
+        && l.agent_remote_id.is_empty()
+    {
+        out.err(
+            at("mac_address"),
+            l.id,
+            "client",
+            "a static lease needs a MAC or a client id (or an option 82 id)",
+        );
+    }
+    for (field, v) in [
+        ("agent_circuit_id", &l.agent_circuit_id),
+        ("agent_remote_id", &l.agent_remote_id),
+    ] {
+        if !v.is_empty() && super::agent::parse(v).is_none() {
             out.err(
-                at("mac_address"),
+                at(field),
                 l.id,
-                "client",
-                format!("that client already has static lease {other}"),
-            );
-        }
-        if d.network_of(l.address).is_none() {
-            out.warn(
-                at("address"),
-                l.id,
-                "no network",
-                format!(
-                    "no /ip dhcp-server network holds {}: the client gets no mask nor gateway",
-                    l.address
-                ),
+                "option 82",
+                "text, or 0x… bytes; at most 255",
             );
         }
     }
+    if !l.client_id.is_empty() && parse_client_id(&l.client_id).is_none() {
+        out.err(
+            at("client_id"),
+            l.id,
+            "client id",
+            "write it as RouterOS prints it (1:aa:bb:cc:dd:ee:ff) or 0x…",
+        );
+    }
+    if let Some(t) = l.lease_time
+        && !(MIN_LEASE_TIME..=MAX_LEASE_TIME).contains(&t)
+    {
+        out.err(
+            at("lease_time"),
+            l.id,
+            "lease-time",
+            format!("{MIN_LEASE_TIME}..={MAX_LEASE_TIME} seconds"),
+        );
+    }
+    if let Err(e) = options_ok(d, &l.dhcp_option) {
+        out.err(at("dhcp_option"), l.id, "options", e);
+    }
+    if let Err(e) = set_ok(d, l.dhcp_option_set.as_ref()) {
+        out.err(at("dhcp_option_set"), l.id, "option set", e);
+    }
+    if l.address_lists.len() > MAX_LIST {
+        out.err(
+            at("address_lists"),
+            l.id,
+            "lists",
+            format!("at most {MAX_LIST} lists"),
+        );
+    }
+    if l.host_name.len() > 63 || !crate::check_host_name(&l.host_name).is_ok() {
+        out.err(
+            at("host_name"),
+            l.id,
+            "host name",
+            "a DNS label: letters, digits, '-'; at most 63",
+        );
+    }
+    if let Some((_, iface)) = mine.iter().find(|(a, _)| a.addr() == l.address) {
+        out.err(
+            at("address"),
+            l.id,
+            "router",
+            format!("{} is the router's address on '{iface}'", l.address),
+        );
+    }
+    if l.disabled {
+        return;
+    }
+    let (same_addr, same_client) = dups.note(l);
+    if let Some(other) = same_addr {
+        out.err(
+            at("address"),
+            l.id,
+            "address",
+            format!("{} is already static lease {other}", l.address),
+        );
+    }
+    if let Some(other) = same_client {
+        out.err(
+            at("mac_address"),
+            l.id,
+            "client",
+            format!("that client already has static lease {other}"),
+        );
+    }
+    if d.network_of(l.address).is_none() {
+        out.warn(
+            at("address"),
+            l.id,
+            "no network",
+            format!(
+                "no /ip dhcp-server network holds {}: the client gets no mask nor gateway",
+                l.address
+            ),
+        );
+    }
+}
+
+/// The checks about `l`, the lease after those `dups` holds, and notes it
+/// there: the same as [`checks`] says about it, without walking the list
+/// (G0.18).
+pub fn lease_checks_of(cfg: &Config, l: &StaticLease, dups: &mut LeaseDups) -> Vec<Check> {
+    let mut out = Out(Vec::new());
+    lease_check(cfg, &router_addresses(cfg), dups, l, &mut out);
+    lease_rate_check(cfg, l, &mut out);
+    out.0
 }
 
 fn other_checks(cfg: &Config, out: &mut Out) {
@@ -1077,24 +1140,29 @@ fn ipoe_checks(cfg: &Config, out: &mut Out) {
         }
     }
     for l in &cfg.ip.dhcp_server.leases {
-        if l.rate_limit.is_empty() {
-            continue;
-        }
-        let on_ipoe = cfg
-            .ip
-            .dhcp_server
-            .servers
-            .iter()
-            .filter(|s| l.server.as_ref().is_none_or(|n| *n == s.name))
-            .any(|s| s.sessions());
-        if !on_ipoe {
-            out.warn(
-                format!("ip.dhcp_server.leases[{}].rate_limit", l.id),
-                l.id,
-                "rate-limit",
-                "rate_limit applies only on an ipoe server (ipoe=yes or use_radius): here it does nothing",
-            );
-        }
+        lease_rate_check(cfg, l, out);
+    }
+}
+
+/// A rate limit on a lease no IPoE server uses.
+fn lease_rate_check(cfg: &Config, l: &StaticLease, out: &mut Out) {
+    if l.rate_limit.is_empty() {
+        return;
+    }
+    let on_ipoe = cfg
+        .ip
+        .dhcp_server
+        .servers
+        .iter()
+        .filter(|s| l.server.as_ref().is_none_or(|n| *n == s.name))
+        .any(|s| s.sessions());
+    if !on_ipoe {
+        out.warn(
+            format!("ip.dhcp_server.leases[{}].rate_limit", l.id),
+            l.id,
+            "rate-limit",
+            "rate_limit applies only on an ipoe server (ipoe=yes or use_radius): here it does nothing",
+        );
     }
 }
 
@@ -1108,4 +1176,82 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
         .filter(|c| c.level == Level::Error)
         .map(|c| Issue::new(c.path, c.text))
         .collect()
+}
+
+#[cfg(test)]
+mod lease_one_by_one {
+    use corerouter_model::dhcp_server::{DhcpNetwork, DhcpServer};
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn cfg() -> Config {
+        let mut c = Config::default();
+        let d = &mut c.ip.dhcp_server;
+        d.servers.push(DhcpServer::new(
+            ItemId(1),
+            "dhcp1".into(),
+            "ether2".parse().unwrap(),
+        ));
+        d.networks
+            .push(DhcpNetwork::new(ItemId(2), "10.0.0.0/30".parse().unwrap()));
+        c
+    }
+
+    /// Few addresses and clients, so duplicates are common.
+    fn lease() -> impl Strategy<Value = StaticLease> {
+        (
+            0u8..6,
+            0u8..4,
+            prop_oneof![
+                Just(""),
+                Just("1:02:00:00:00:00:01"),
+                Just("0x0102"),
+                Just("x")
+            ],
+            prop_oneof![Just(None), Just(Some("dhcp1")), Just(Some("nope"))],
+            any::<bool>(),
+            prop_oneof![Just(""), Just("1M/1M")],
+            prop_oneof![Just(""), Just("bad name!")],
+        )
+            .prop_map(|(a, m, cid, srv, disabled, rate, host)| {
+                let mut l = StaticLease::new(ItemId(0), Ipv4Addr::new(10, 0, 0, a));
+                l.mac_address = (m > 0).then_some(corerouter_model::MacAddr([2, 0, 0, 0, 0, m]));
+                l.client_id = cid.to_owned();
+                l.server = srv.map(str::to_owned);
+                l.disabled = disabled;
+                l.rate_limit = rate.to_owned();
+                l.host_name = host.to_owned();
+                l
+            })
+    }
+
+    proptest! {
+        /// G0.18: what `lease.add` says about the new lease is what the
+        /// checks of the whole config say about it, word for word.
+        #[test]
+        fn same_words_as_the_whole_list(leases in proptest::collection::vec(lease(), 1..30)) {
+            let mut c = cfg();
+            let mut dups = LeaseDups::of(&c);
+            for (i, mut l) in leases.into_iter().enumerate() {
+                l.id = ItemId(100 + i as u32);
+                let one = lease_checks_of(&c, &l, &mut dups);
+                let tag = format!("leases[{}]", l.id);
+                let id = l.id;
+                c.ip.dhcp_server.leases.push(l);
+                let mut all: Vec<Check> = checks(&c)
+                    .into_iter()
+                    .filter(|x| x.item == id && x.path.contains(&tag))
+                    .collect();
+                let mut one = one;
+                all.sort_by(|a, b| a.path.cmp(&b.path).then(a.text.cmp(&b.text)));
+                one.sort_by(|a, b| a.path.cmp(&b.path).then(a.text.cmp(&b.text)));
+                prop_assert_eq!(one, all);
+                // Rebuilt from the list, it knows the same holders.
+                let rebuilt = LeaseDups::of(&c);
+                prop_assert_eq!(rebuilt.by_addr.len(), dups.by_addr.len());
+                prop_assert_eq!(rebuilt.by_client.len(), dups.by_client.len());
+            }
+        }
+    }
 }

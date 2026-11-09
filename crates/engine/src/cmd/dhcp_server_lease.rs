@@ -7,6 +7,7 @@ use std::net::Ipv4Addr;
 use corerouter_model::dhcp_server::{StaticLease, format_client_id, parse_client_id};
 use corerouter_model::firewall::Name;
 use corerouter_model::MacAddr;
+use corerouter_proto_dhcp::server::checks;
 use corerouter_proto_dhcp::server::leases::{Lease, State};
 use serde_json::{Value, json};
 
@@ -164,8 +165,23 @@ fn apply(l: &mut StaticLease, p: &Value) -> Result<()> {
     Ok(())
 }
 
+/// The candidate's leases by address and client, as of `generation`: while
+/// nothing else touches the candidate, the next `lease.add` picks up from
+/// here instead of checking every lease again (G0.18: 10 000 of them in an
+/// `/import` took 17 s).
+#[derive(Default)]
+struct AddIndex {
+    generation: u64,
+    dups: checks::LeaseDups,
+}
+
 fn add(s: &mut Session, p: &Value) -> Result<Value> {
     let addr: Ipv4Addr = super::args::req_parse(p, "address")?;
+    let before = s.store().generation();
+    let mut index = s.ext_mut::<AddIndex>().map(std::mem::take).unwrap_or_default();
+    if index.generation != before {
+        index.dups = checks::LeaseDups::of(s.store().candidate());
+    }
     let d = &mut s.store_mut().candidate_mut().ip.dhcp_server;
     if d.leases.len() >= corerouter_model::dhcp_server::MAX_STATIC_LEASES {
         return Err(EngineError::bad("address", "too many static leases"));
@@ -173,8 +189,13 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
     let mut l = StaticLease::new(d.next_id(), addr);
     apply(&mut l, p)?;
     let id = l.id;
-    d.leases.push(l);
-    let warnings = verdict(s, "leases", id)?;
+    let found = checks::lease_checks_of(s.store().candidate(), &l, &mut index.dups);
+    s.store_mut().candidate_mut().ip.dhcp_server.leases.push(l);
+    let warnings = super::dhcp_server::judged(found.into_iter())?;
+    index.generation = s.store().generation();
+    if let Some(slot) = s.ext_mut::<AddIndex>() {
+        *slot = index;
+    }
     Ok(json!({"id": id, "warnings": warnings}))
 }
 
