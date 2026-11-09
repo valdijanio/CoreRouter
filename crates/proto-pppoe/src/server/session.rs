@@ -79,6 +79,9 @@ pub(crate) struct Session {
     /// The PADR's Service-Name and its row (G4.3k).
     pub service: Box<[u8]>,
     pub svc: ServiceSlot,
+    /// When its PADR came; `None` for a session taken over from the other
+    /// node (it is no short cycle, however soon it ends here).
+    pub started_at: Option<Millis>,
     link: Link,
     phase: Phase,
     lcp: Fsm,
@@ -192,6 +195,7 @@ impl Session {
             uniq: i.uniq,
             service: i.service,
             svc: i.svc,
+            started_at: Some(now),
             link,
             phase: Phase::Establish,
             lcp: Fsm::new(rng.u32() as u8),
@@ -1083,6 +1087,7 @@ impl Session {
             },
             now,
         );
+        s.started_at = None;
         s.lcp = Fsm::opened(rng.u32() as u8);
         s.lcp_l.our_magic = st.our_magic;
         s.lcp_l.peer_magic = st.peer_magic;

@@ -990,8 +990,8 @@ Fontes lidas em 2026-10-26:
   então todos os CPEs de uma linha se encontram no mesmo worker.
 - `max_sessions_per_vlan` (1 = TR-101 1:1): o AC não manda PADO a um segundo CPE da linha
   (RFC 2516 §5.2) e responde AC-System-Error a um PADR atrasado (§5.4); o CPE da própria linha
-  que volta toma o lugar da sessão antiga. No QinQ o limite é exato; numa VLAN simples (N:1), é
-  por worker.
+  que volta toma o lugar da sessão antiga. No QinQ o limite é exato; numa VLAN simples (N:1),
+  era por worker até a G4.3m, que passou a usar uma contagem compartilhada (§14).
 - **RADIUS:** ADSL-Agent-Circuit-Id e ADSL-Agent-Remote-Id (RFC 4679) no Access-Request e na
   contabilização; NAS-Port-Id = o circuit id (com `use_circuit_id_in_nas_port_id`), senão
   `<porta>:<s>-<c>` numa linha QinQ (a forma do Junos) ou a porta.
@@ -1055,3 +1055,80 @@ Sem XDP, o BNG encaminha também o IPv6 dos assinantes, como já fazia com o IPv
 
 Em todos os casos, `ppp.active` mostra as duas tags, o Service-Name e o circuit id, e um BNG
 Blaster que pede um nome descartado (`bloqueado`) não sobe nenhuma sessão.
+
+## 14. Reconexão em loop e limites por MAC e VLAN (G4.3m)
+
+Um CPE com senha errada, ou com um firmware que derruba a sessão a cada poucos segundos, custa um
+Access-Request, um endereço e uma linha de histórico a cada volta. Os limites de PADI seguram o
+excesso por segundo, mas não distinguem quem está em loop de quem está chegando.
+
+### 14.1 Pesquisa
+
+- **MikroTik RouterOS v7:** não tem. `one-session-per-host` e `max-sessions` são os únicos limites
+  do `/interface pppoe-server server`.
+- **Juniper Junos** (`short-cycle-protection lockout-time-min/max`, `show`/`clear pppoe lockout`):
+  sessão terminada em até 150 s é um evento; o bloqueio é `min × 2^(n-1)`, limitado por `max`
+  (padrão 1 a 300 s; aceita até 86 400 s); `n` volta a 1 se o intervalo passar de
+  `max(15 min, max)`; durante o bloqueio os pacotes de negociação são descartados. Desligado por
+  padrão. `filter aci` bloqueia pelo Agent-Circuit-Id em vez do MAC.
+- **Cisco IOS-XE** (BBA group): `sessions per-mac limit`, `sessions per-vlan limit` e `sessions
+  per-mac throttle`; os antigos `pppoe limit per-mac/per-vlan` são os mesmos limites. Limite por
+  MAC vale por porta.
+- **accel-ppp:** só `padi-limit` e `mac-filter`, sem penalidade crescente.
+- **RFC 2516:** §5.2 (o AC não deve responder ao PADI que não pode servir), §5.4 (AC-System-Error).
+
+### 14.2 O que adotamos
+
+- `short_cycle_protection` (desligado, como no Junos: atualizar o roteador não pode começar a
+  bloquear ninguém), `lockout_time_min` (1) e `lockout_time_max` (300), com a fórmula, os 150 s e os
+  15 min do Junos.
+- `max_sessions_per_mac` (por porta, somando as VLANs, como o Cisco); `max_sessions_per_vlan`
+  continua o da G4.3l.
+- `ppp.why` dá o motivo: `short-cycle`, com a causa real da última queda e o tempo que falta;
+  `max-sessions-per-vlan`, `max-sessions-per-mac`, `service-limit`, `max-sessions`. Vai só para a
+  tabela do Why?, não para o `ppp.history`: um CPE bloqueado repete PADI, e a inundação empurraria
+  o histórico para fora.
+- `ppp.lockout.list` e `ppp.lockout.clear` (Junos `show`/`clear pppoe lockout`); contadores no
+  `interface.pppoe-server.monitor`.
+
+### 14.3 O que fizemos diferente
+
+- **Não conta o que não foi culpa do CPE:** RADIUS sem responder, operador e Session-Timeout. No
+  Junos qualquer término conta. Uma queda do RADIUS não pode bloquear a base inteira na volta.
+  `NcpFailed` conta, porque pool cheio e CPE recusando IPCP não se distinguem aqui; o Why? mostra a
+  causa e o `clear` libera.
+- **PADR de um bloqueado também é descartado, sem PADS de erro:** o erro só faria o CPE recomeçar
+  mais cedo. Limite por MAC e VLAN continua com AC-System-Error (§5.4), como na G4.3l.
+- **Quem está bloqueado não gasta ficha do `new_session_rate`:** o PADI recusado passa antes do
+  balde, senão um CPE em loop tiraria o lugar de quem consegue sessão.
+- **Limite por VLAN exato com vários workers:** numa VLAN simples os assinantes se dividem entre
+  os workers por MAC, e o limite valia por worker (6 workers, 6 × o limite). Agora é uma contagem
+  atômica por VID, compartilhada; a reserva é por CAS no PADR, então dois workers disputando a
+  última vaga não passam do limite.
+- **Correção de bug:** a tomada de sessões do HA (`Server::import`) não contava `per_vlan`: depois
+  de uma troca, o limite ficava folgado e `check_invariants` falhava.
+
+### 14.4 Memória e o atacante que troca de MAC
+
+A tabela de bloqueios tem tamanho fixo (4096 conjuntos × 4 vias, 40 B cada: ~655 KB por servidor e
+worker, alocada no primeiro evento; teste com 200 mil MACs). Só entra quem completou
+PADI/PADO/PADR com cookie válido, então MAC forjado não escreve nada. O conjunto vem de um hash com
+chave, para não mirar a entrada de outro assinante. Cheio o conjunto, sai quem está mais perto de
+terminar o bloqueio: quem troca de MAC a cada sessão pode, no pior caso, esquecer entradas, nunca
+crescer a memória. Com um único CPE trocando de MAC o bloqueio por MAC não o pega; isso pede o filtro
+por linha (G4.3ma).
+
+### 14.5 Desempenho (**medido**, 2026-11-09, máquina de 32 threads carregada por outras sessões, `cargo bench` com perfil de bench)
+
+| Caminho | Tempo |
+|---|---|
+| PADI → PADO, sem limites | 246 ns |
+| PADI → PADO, limites ligados, tabela cheia (50 mil ciclos) | 283 ns |
+| PADI de bloqueado, descartado | 74 ns |
+
+O custo não cresce com o número de assinantes: um hash e 4 comparações.
+
+**Paralelismo:** a tabela é por worker. No caminho de um MAC ou de uma linha QinQ o quadro vai sempre
+ao mesmo worker, então não há lock novo. A exceção é o mesmo MAC em duas linhas
+QinQ, que cai em workers diferentes: ali `max_sessions_per_mac` vale por worker. A contagem por VLAN é
+atômica e só é escrita quando uma sessão começa ou termina.

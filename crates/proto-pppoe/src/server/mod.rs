@@ -12,6 +12,7 @@
 pub mod ha;
 mod services;
 mod session;
+mod short_cycle;
 
 use crate::auth::{self, AUTH_STRING_LEN, MsChapResponse};
 use crate::discovery::{self, Code, DEFAULT_MRU, Discovery, DiscoveryWriter, tag};
@@ -33,6 +34,7 @@ use std::ops::RangeInclusive;
 
 pub use crate::descriptor::{SessionDescriptor, SessionKey};
 pub use services::{ServiceAction, ServiceRule, ServiceSlot, ServiceTable};
+pub use short_cycle::{GRACE_MS, Lockout, SHORT_MS, ShortCycle, VlanShare};
 
 /// RFC 2516 §4: SESSION_ID 0xffff is reserved, 0 means "no session".
 pub const MAX_SID: u16 = 0xfffe;
@@ -143,6 +145,16 @@ pub struct ServerConfig {
     /// Sessions per (port, VLAN stack); 0 = no limit (G4.3l: 1 is TR-101's
     /// 1:1 model, a line per VLAN).
     pub max_per_vlan: u32,
+    /// G4.3m: the workers' shared count of `max_per_vlan` with one tag (they
+    /// split a VLAN's subscribers by MAC). `None`: one worker, or QinQ only
+    /// (a line's CPEs meet on one worker): the server's own count is exact.
+    pub vlan_share: Option<VlanShare>,
+    /// Sessions per (port, MAC); 0 = no limit (G4.3m, Cisco `sessions
+    /// per-mac limit`). Past `one_session_per_host`: it holds across VLANs
+    /// and with several sessions per host allowed.
+    pub max_per_mac: u32,
+    /// Short-cycle protection (G4.3m, Junos); `None` = off.
+    pub short_cycle: Option<ShortCycle>,
     /// `(lane, lanes)`: this server hands out only the SESSION_IDs with
     /// `sid % lanes == lane`. Several servers on one port (the service's
     /// workers, one per core) then share its SESSION_ID space without a
@@ -193,6 +205,9 @@ impl Default for ServerConfig {
             setup_timeout_ms: 60_000,
             pado_queue: 4096,
             max_per_vlan: 0,
+            vlan_share: None,
+            max_per_mac: 0,
+            short_cycle: None,
             sid_lane: (0, 1),
             cookie_secret: None,
         }
@@ -370,6 +385,37 @@ pub enum Event {
         was_up: bool,
         reason: DownReason,
     },
+    /// A PADI or PADR got no session, by a limit (G4.3m): for `ppp.why`.
+    Refused {
+        mac: Mac,
+        vlans: Vlans,
+        refusal: Refusal,
+    },
+    /// A short cycle: the host is locked out from now on (G4.3m).
+    LockedOut {
+        mac: Mac,
+        vlans: Vlans,
+        strikes: u32,
+        left_ms: Millis,
+        cause: DownReason,
+    },
+}
+
+/// Which limit refused a PADI or PADR (`ppp.why`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The Service-Name table: a drop row, or a row's limit.
+    Service,
+    /// `max_per_vlan`.
+    Vlan,
+    /// `max_per_mac`.
+    Mac,
+    /// Locked out by short-cycle protection, for this long yet.
+    ShortCycle {
+        left_ms: Millis,
+        strikes: u32,
+        cause: DownReason,
+    },
 }
 
 /// Counters (RouterOS-style `print stats`).
@@ -384,6 +430,13 @@ pub struct Stats {
     /// PADIs and PADRs refused because their VLAN holds `max_per_vlan`
     /// sessions (G4.3l).
     pub vlan_refused: u64,
+    /// PADIs and PADRs refused because their MAC holds `max_per_mac`
+    /// sessions (G4.3m).
+    pub mac_refused: u64,
+    /// PADIs and PADRs dropped from hosts locked out (G4.3m), and the
+    /// lockouts started.
+    pub short_cycle_refused: u64,
+    pub short_cycles: u64,
     pub pado_tx: u64,
     pub pado_delayed: u64,
     pub padr_rx: u64,
@@ -408,10 +461,10 @@ pub struct Stats {
 pub type ServerOutput = Output<Event>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct HostKey {
-    ifindex: u32,
-    vlans: Vlans,
-    mac: Mac,
+pub(crate) struct HostKey {
+    pub(crate) ifindex: u32,
+    pub(crate) vlans: Vlans,
+    pub(crate) mac: Mac,
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -457,6 +510,18 @@ pub struct Server {
     svc: services::ServiceState,
     /// Sessions per (port, VLANs), kept only with `max_per_vlan`.
     per_vlan: HashMap<(u32, Vlans), u32>,
+    /// Sessions per (port, MAC), kept only with `max_per_mac`.
+    per_mac: HashMap<(u32, Mac), u32>,
+    /// Who is locked out and why (G4.3m); fixed size.
+    short: short_cycle::Table,
+}
+
+impl Drop for Server {
+    /// The shared count must not keep the sessions of a server that left
+    /// (a port restart, a worker gone).
+    fn drop(&mut self) {
+        self.vlan_share_all(false);
+    }
 }
 
 /// Identifies the PADR that created a session: Host-Uniq and AC-Cookie.
@@ -495,6 +560,8 @@ impl Server {
             stats: Stats::default(),
             svc: services::ServiceState::new(&cfg.services),
             per_vlan: HashMap::new(),
+            per_mac: HashMap::new(),
+            short: short_cycle::Table::new(),
             cfg,
         }
     }
@@ -528,12 +595,25 @@ impl Server {
         }
         let table = cfg.services != self.cfg.services;
         let per_vlan = (cfg.max_per_vlan > 0) != (self.cfg.max_per_vlan > 0);
+        let per_mac = (cfg.max_per_mac > 0) != (self.cfg.max_per_mac > 0);
+        // What this server put in the shared count leaves it, and comes
+        // back under the new settings.
+        self.vlan_share_all(false);
         self.cfg = cfg;
         if per_vlan {
             self.per_vlan.clear();
             if self.cfg.max_per_vlan > 0 {
                 for s in self.sessions.iter().flatten() {
                     *self.per_vlan.entry((s.ifindex, s.vlans)).or_default() += 1;
+                }
+            }
+        }
+        self.vlan_share_all(true);
+        if per_mac {
+            self.per_mac.clear();
+            if self.cfg.max_per_mac > 0 {
+                for s in self.sessions.iter().flatten() {
+                    *self.per_mac.entry((s.ifindex, s.client_mac)).or_default() += 1;
                 }
             }
         }
@@ -662,7 +742,7 @@ impl Server {
         let next = s.next_deadline(&self.cfg);
         let gen_ = s.gen_;
         if let Some(reason) = dead {
-            self.free_session(sid, reason, out);
+            self.free_session(now, sid, reason, out);
         } else if let Some(d) = next
             && s.want_schedule(d, now)
         {
@@ -675,7 +755,7 @@ impl Server {
         true
     }
 
-    fn free_session(&mut self, sid: u16, reason: DownReason, out: &mut ServerOutput) {
+    fn free_session(&mut self, now: Millis, sid: u16, reason: DownReason, out: &mut ServerOutput) {
         let Some(slot) = self.sessions.get_mut(usize::from(sid)) else {
             return;
         };
@@ -685,15 +765,9 @@ impl Server {
         self.active -= 1;
         self.free.push_back(sid);
         self.svc.remove(s.svc);
-        if self.cfg.max_per_vlan > 0
-            && let Some(n) = self.per_vlan.get_mut(&(s.ifindex, s.vlans))
-        {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                self.per_vlan.remove(&(s.ifindex, s.vlans));
-            }
-        }
+        self.count_session(s.ifindex, s.vlans, s.client_mac, false);
         let hk = s.host_key();
+        self.short_cycle_end(now, hk, &s, reason, out);
         if self.by_host.get(&hk) == Some(&sid) {
             self.by_host.remove(&hk);
         }
@@ -831,15 +905,169 @@ impl Server {
     /// them `host`'s own (which one-session-per-host would replace).
     fn vlan_full(&self, host: HostKey) -> bool {
         let max = self.cfg.max_per_vlan;
-        if max == 0
-            || self
+        if max == 0 {
+            return false;
+        }
+        let held = match self.vlan_shared(host.vlans) {
+            Some(share) => share.get(host.vlans.outer),
+            None => self
                 .per_vlan
                 .get(&(host.ifindex, host.vlans))
+                .copied()
+                .unwrap_or(0),
+        };
+        held >= max && !self.replaces(host, |_| true)
+    }
+
+    /// How the VLAN stack's sessions are counted against `max_per_vlan`:
+    /// with one tag (or none) the workers' shared count, if there is one.
+    fn vlan_shared(&self, vlans: Vlans) -> Option<&VlanShare> {
+        self.cfg.vlan_share.as_ref().filter(|_| vlans.inner == 0)
+    }
+
+    /// `host`'s MAC holds `max_per_mac` sessions, none of them one that
+    /// one-session-per-host would replace.
+    fn mac_full(&self, host: HostKey) -> bool {
+        let max = self.cfg.max_per_mac;
+        if max == 0
+            || self
+                .per_mac
+                .get(&(host.ifindex, host.mac))
                 .is_none_or(|n| *n < max)
         {
             return false;
         }
         !self.replaces(host, |_| true)
+    }
+
+    /// Keeps the VLAN and MAC counts with a session starting or ending.
+    fn count_session(&mut self, ifindex: u32, vlans: Vlans, mac: Mac, up: bool) {
+        fn step<K: std::hash::Hash + Eq>(m: &mut HashMap<K, u32>, k: K, up: bool) {
+            if up {
+                *m.entry(k).or_default() += 1;
+            } else if let Some(n) = m.get_mut(&k) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    m.remove(&k);
+                }
+            }
+        }
+        if self.cfg.max_per_vlan > 0 {
+            step(&mut self.per_vlan, (ifindex, vlans), up);
+            // Going up, `padr` reserved it (a takeover adds it itself).
+            if !up && let Some(share) = self.vlan_shared(vlans) {
+                share.sub(vlans.outer, 1);
+            }
+        }
+        if self.cfg.max_per_mac > 0 {
+            step(&mut self.per_mac, (ifindex, mac), up);
+        }
+    }
+
+    /// Puts this server's VLAN counts in the shared count, or takes them out.
+    fn vlan_share_all(&mut self, add: bool) {
+        if self.cfg.max_per_vlan == 0 {
+            return;
+        }
+        let Some(share) = self.cfg.vlan_share.as_ref() else {
+            return;
+        };
+        for ((_, v), n) in self.per_vlan.iter().filter(|((_, v), _)| v.inner == 0) {
+            if add {
+                share.add(v.outer, *n);
+            } else {
+                share.sub(v.outer, *n);
+            }
+        }
+    }
+
+    /// A session ended: was it a short cycle (G4.3m)?
+    fn short_cycle_end(
+        &mut self,
+        now: Millis,
+        host: HostKey,
+        s: &Session,
+        reason: DownReason,
+        out: &mut ServerOutput,
+    ) {
+        let Some(cfg) = self.cfg.short_cycle else {
+            return;
+        };
+        let young = s
+            .started_at
+            .is_some_and(|t| now.saturating_sub(t) < short_cycle::SHORT_MS);
+        if !young || !short_cycle::counts(reason) {
+            return;
+        }
+        let (strikes, left_ms) = self.short.strike(now, &cfg, host, reason);
+        self.stats.short_cycles += 1;
+        out.events.push(Event::LockedOut {
+            mac: host.mac,
+            vlans: host.vlans,
+            strikes,
+            left_ms,
+            cause: reason,
+        });
+    }
+
+    /// Why a PADI or PADR from `host` is refused now by the limits of G4.3m
+    /// (and G4.3l), if it is. No state changes: the caller also asks before
+    /// it spends a token of `new_session_rate`.
+    fn limit(&self, now: Millis, host: HostKey) -> Option<Refusal> {
+        if let Some((left_ms, strikes, cause)) = self.short.locked(now, &host) {
+            return Some(Refusal::ShortCycle {
+                left_ms,
+                strikes,
+                cause,
+            });
+        }
+        if self.vlan_full(host) {
+            return Some(Refusal::Vlan);
+        }
+        if self.mac_full(host) {
+            return Some(Refusal::Mac);
+        }
+        None
+    }
+
+    /// The limits of G4.3m would refuse a PADI from this host now: the
+    /// service's session-rate token is not spent on it.
+    pub fn refuses(&self, now: Millis, ifindex: u32, vlans: Vlans, mac: Mac) -> bool {
+        self.limit(
+            now,
+            HostKey {
+                ifindex,
+                vlans,
+                mac,
+            },
+        )
+        .is_some()
+    }
+
+    /// Counts a refusal and tells the caller (`ppp.why`).
+    fn refused(&mut self, host: HostKey, refusal: Refusal, out: &mut ServerOutput) {
+        match refusal {
+            Refusal::Vlan => self.stats.vlan_refused += 1,
+            Refusal::Mac => self.stats.mac_refused += 1,
+            Refusal::ShortCycle { .. } => self.stats.short_cycle_refused += 1,
+            Refusal::Service => {}
+        }
+        out.events.push(Event::Refused {
+            mac: host.mac,
+            vlans: host.vlans,
+            refusal,
+        });
+    }
+
+    /// The hosts locked out now.
+    pub fn lockouts(&self, now: Millis) -> impl Iterator<Item = Lockout> + '_ {
+        self.short.lockouts(now)
+    }
+
+    /// Forgets the lockout and the history of `mac` (of all, with `None`):
+    /// Junos `clear pppoe lockout`. How many were locked out.
+    pub fn clear_lockouts(&mut self, now: Millis, mac: Option<Mac>) -> usize {
+        self.short.clear(now, mac)
     }
 
     /// `host` has a session that one-session-per-host would replace, and
@@ -890,12 +1118,15 @@ impl Server {
         if rule.action == ServiceAction::Drop || self.row_full(host, slot) {
             self.stats.padi_refused += 1;
             self.stats.service_refused += 1;
+            self.refused(host, Refusal::Service, out);
             return;
         }
-        // G4.3l: the VLAN holds its sessions already (§5.2: cannot serve).
-        if self.vlan_full(host) {
+        // G4.3l, G4.3m: the VLAN or the MAC holds its sessions already, or
+        // the host is locked out (§5.2: cannot serve). Before the limiters:
+        // nobody else's PADI token goes to a PADI that gets no PADO.
+        if let Some(r) = self.limit(now, host) {
             self.stats.padi_refused += 1;
-            self.stats.vlan_refused += 1;
+            self.refused(host, r, out);
             return;
         }
         if !self.limiter.allow(now, d.src) {
@@ -1016,6 +1247,12 @@ impl Server {
             self.send_pads(ifindex, d, sid, out);
             return;
         }
+        // G4.3m: locked out, nothing more (no PADS error: it would only make
+        // the CPE start over sooner). Before the cookie's HMAC.
+        if let Some(r @ Refusal::ShortCycle { .. }) = self.limit(now, host) {
+            self.refused(host, r, out);
+            return;
+        }
         // RFC 2516 §9: no valid cookie, no state.
         let cookie_ok = d.tags.ac_cookie.is_some_and(|c| {
             self.cookies
@@ -1052,6 +1289,7 @@ impl Server {
         // row takes its old session's place.
         if self.row_full(host, slot) {
             self.stats.service_refused += 1;
+            self.refused(host, Refusal::Service, out);
             self.pads_error(
                 ifindex,
                 d,
@@ -1062,8 +1300,13 @@ impl Server {
             return;
         }
         if self.vlan_full(host) {
-            self.stats.vlan_refused += 1;
+            self.refused(host, Refusal::Vlan, out);
             self.pads_error(ifindex, d, tag::AC_SYSTEM_ERROR, b"VLAN session limit", out);
+            return;
+        }
+        if self.mac_full(host) {
+            self.refused(host, Refusal::Mac, out);
+            self.pads_error(ifindex, d, tag::AC_SYSTEM_ERROR, b"MAC session limit", out);
             return;
         }
         if self.cfg.one_session_per_host
@@ -1071,9 +1314,22 @@ impl Server {
         {
             self.with_session(now, old, None, out, |s, env| s.replace(env));
         }
-        let Some(sid) = self.free.pop_front() else {
+        if self.free.is_empty() {
             // §5.4: AC-System-Error, "insufficient resources".
             self.pads_error(ifindex, d, tag::AC_SYSTEM_ERROR, b"session limit", out);
+            return;
+        }
+        // The place in the VLAN's shared count: another worker may have
+        // taken the last one since `vlan_full`.
+        if self.cfg.max_per_vlan > 0
+            && let Some(share) = self.vlan_shared(d.vlans)
+            && !share.reserve(d.vlans.outer, self.cfg.max_per_vlan)
+        {
+            self.refused(host, Refusal::Vlan, out);
+            self.pads_error(ifindex, d, tag::AC_SYSTEM_ERROR, b"VLAN session limit", out);
+            return;
+        }
+        let Some(sid) = self.free.pop_front() else {
             return;
         };
         self.generation = self.generation.wrapping_add(1);
@@ -1101,9 +1357,7 @@ impl Server {
         }
         self.active += 1;
         self.svc.add(slot);
-        if self.cfg.max_per_vlan > 0 {
-            *self.per_vlan.entry((ifindex, d.vlans)).or_default() += 1;
-        }
+        self.count_session(ifindex, d.vlans, d.src, true);
         self.stats.sessions_created += 1;
         self.by_host.insert(host, sid);
         self.by_uniq.insert((host, uniq), sid);
@@ -1111,7 +1365,7 @@ impl Server {
         self.with_session(now, sid, None, out, |s, env| s.start(env));
     }
 
-    fn padt(&mut self, _now: Millis, ifindex: u32, d: &Discovery<'_>, out: &mut ServerOutput) {
+    fn padt(&mut self, now: Millis, ifindex: u32, d: &Discovery<'_>, out: &mut ServerOutput) {
         self.stats.padt_rx += 1;
         let sid = d.session_id;
         let ours = self.slot(sid).is_some_and(|s| {
@@ -1120,7 +1374,7 @@ impl Server {
         if ours && d.dst == self.cfg.ac_mac {
             // RFC 2516 §5.5: no PPP traffic after a PADT, not even LCP
             // Terminate: the session ends here.
-            self.free_session(sid, DownReason::PeerPadt, out);
+            self.free_session(now, sid, DownReason::PeerPadt, out);
         } else {
             self.stats.unknown_session += 1;
         }
@@ -1264,6 +1518,15 @@ impl Server {
             }
             if v != self.per_vlan {
                 return Err("sessions per VLAN out of step".into());
+            }
+        }
+        if self.cfg.max_per_mac > 0 {
+            let mut v: HashMap<(u32, Mac), u32> = HashMap::new();
+            for s in self.sessions.iter().flatten() {
+                *v.entry((s.ifindex, s.client_mac)).or_default() += 1;
+            }
+            if v != self.per_mac {
+                return Err("sessions per MAC out of step".into());
             }
         }
         if rows != self.svc.active {
