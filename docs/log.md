@@ -9509,3 +9509,22 @@ continuação indentadas).
   em `docs/os-image.md`.
 
 - 2026-11-08 — G1.6y: Janela System › Install to disk na GUI e no navegador, selo `live: not installed` na barra de cima, modais de confirmação por conteúdo do disco e tela depois do reinício. Testar: `cargo xtask os build && cargo xtask os install-test`; a janela, com a GUI conectada ao live no QEMU. Hardware real não foi testado.
+
+- 2026-11-08 — G1.6g: Boot por BIOS, parte 2: as atualizações A/B funcionam em BIOS. `crates/sysupdate/src/ab.rs` ganhou o
+  `BootStore` (`Uefi(Vars)` ou `Bios(Grub)`): `primary=`, `next=` e `a.cfg`/`b.cfg` fazem o papel de
+  `BootOrder`, `BootNext` e `Boot####`. O init monta a ESP e faz o passo de boot do teste também em BIOS.
+  `system.package.print` diz `firmware`. Atualizado por UEFI, o disco mantém os arquivos do GRUB certos, e o
+  `provision` regrava a entrada cujo hash de verity não bate com o slot. Parâmetro de ajuste que o GRUB leria
+  como script é recusado.
+
+  Como testar: `cargo xtask os build`, `cargo xtask os ab-test --firmware seabios`,
+  `cargo xtask os ab-test` (`cross` roda em ambos), `cargo xtask os install-test --firmware seabios`.
+  Os cenários do laboratório (`crates/sysupdate/tests/ab.rs`) rodam nos dois firmwares.
+
+  **Medido** (KVM, QEMU 8.2.2): `ab-test` 8 cenários em SeaBIOS (298 s) e 6 em OVMF (217 s), `install-test`
+  nos dois (88 s), com o boot no outro firmware. Cortes: 3 durante a atualização (voltam no slot A), 2 antes do
+  GRUB apagar `next=` (seguem no teste do B), 1 depois (slot A, com a falha registrada). Sem máquina física.
+  Corrigido: com os drivers da parte 1 e da G1.6j, uma máquina de 256 MiB em OVMF mostra `MemTotal` de 199 MiB e a ISO
+  não subia live (limite de 200 MiB); o limite agora é 180 MiB. Fica o
+  limite escrito em `docs/os-image.md`: disco levado de volta à NVRAM antiga com o slot primário atualizado
+  no meio do caminho entra em laço de pânico até trocar a ordem no firmware.

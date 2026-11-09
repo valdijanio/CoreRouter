@@ -2970,3 +2970,9 @@ slow_ten_thousand_routes_one_refused`, kernel do host:
   `ready` 0,87–0,93 s (igual à UEFI, 0,85–0,88 s); QEMU → `ready` 1,5 s (UEFI: 2,1 s). `core` 149 KiB,
   ISO +~300 KiB. Drivers novos, `size` dos objetos: 761 KiB sem comprimir (`mpt3sas` 266, `megaraid` 128,
   `fusion` 118, `aacraid` 100, `hpsa` 79, `sym53c8xx_2` 69).
+
+- G1.6g, 2026-11-08, **medido** (KVM, QEMU 8.2.2, SeaBIOS, build release da imagem): atualização completa em
+  BIOS 141 ms (slot 82 ms para 55,3 MiB, releitura 31 ms, instantâneo 6 ms), QEMU → teste confirmado
+  14,5 s (10 s de carência), kernel → `ready` 0,90 s com dm-verity. Mudar `primary=`/`next=` é um bloco por
+  operação, fora de caminho quente. Na placa `pc`: `virtio-blk` e `virtio-scsi` ~1,2 s, `pvscsi` 1,3 s, IDE 1,2 s,
+  `lsi53c895a` 4,2 s (a varredura do driver do SCSI).
