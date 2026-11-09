@@ -174,6 +174,11 @@ fn measure(name: &str, cfg: &Config) -> (Duration, Duration, Duration) {
         ));
     }
     assert_eq!(kernel_rules(), total, "one rule changed in place");
+    // The fastest of each, for the bound: what the code costs. A commit that
+    // walks every rule costs that every time; a busy machine only some times,
+    // and not alike (G0.30h: a median of 460 ms against 145 ms with no change).
+    let fastest = |v: &[Duration]| v.iter().min().copied().unwrap_or_default();
+    let least = (fastest(&iface), fastest(&comment), fastest(&port));
     let (a, b, c) = (median(iface), median(comment), median(port));
     let rss = std::fs::read_to_string("/proc/self/status")
         .unwrap_or_default()
@@ -187,7 +192,7 @@ fn measure(name: &str, cfg: &Config) -> (Duration, Duration, Duration) {
     );
     drop(s);
     let _ = std::fs::remove_dir_all(&dir);
-    (a, b, c)
+    least
 }
 
 /// The same through the real daemon (every service on, the commands over
@@ -276,15 +281,15 @@ fn ten_thousand_rules_load_and_one_commits_fast() {
         if std::env::var_os("FW_SCALE_N").is_none() {
             let _ = measure_daemon(name, &cfg);
         }
-        // Against the commit without a firewall of the same run (a debug
-        // build under the parallel netns step is ten times slower, both
+        // The fastest against the fastest without a firewall of the same run
+        // (a debug build under the parallel netns step is ten times slower, both
         // alike): within twice it plus 30 ms. A firewall commit that went
         // over every rule again (~100 ms in release before G0.31j) fails.
         for (what, d) in [("comment", comment), ("dst_port", port)] {
             let bound = base * 2 + Duration::from_millis(30);
             assert!(
                 d < bound,
-                "{name}: one {what} commit took {d:?}, the one without a firewall {base:?}"
+                "{name}: one {what} commit took at least {d:?}, the one without a firewall {base:?}"
             );
         }
     }

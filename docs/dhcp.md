@@ -366,3 +366,69 @@ laboratório com hosts simulados.
 Civil): G4.2b (feito, §11–§13). DHCPv6/PD: G4.2c. Alta disponibilidade (failover/HA como o Kea):
 G4.2d. RADIUS, filas e `lease-script`: dependem de subsistemas que não existem. ICMP na sonda (para
 relays) e limite de concessões por remote id: G4.2e.
+
+## 15. Fora do lock da sessão (G4.2h)
+
+Antes, a rodada inteira do servidor rodava sob o `Mutex<Session>`: ler o socket, decodificar,
+escolher o endereço, gravar o diário, DNS, listas e responder.
+
+### 15.1 Pesquisa
+
+- **MikroTik RouterOS v7:** a documentação não fala do assunto.
+- **Kea** ([desempenho e multithread](https://kb.isc.org/docs/kea-performance-tests-17-multithreading)):
+  uma thread por pacote num pool (`thread-pool-size`, `packet-queue-size`), ligado por padrão desde a
+  2.4. O próprio ISC alerta que mais threads nem sempre rende e registrou um bug de endereço dado duas
+  vezes (Kea 1.7.5, notas de versão); a contenção cresce com o pool cheio.
+- **RFC 2131** §1.6 (meta de projeto: um endereço em uso por um cliente só por vez), §2.2 (não
+  realocar dentro do tempo pedido), §4.3.1 (SHOULD NOT reusar o endereço antes de o cliente responder à
+  oferta) e §3.1, passo 4 (grava a vinculação em armazenamento persistente e responde com o ACK).
+
+### 15.2 Como funciona
+
+A rodada do serviço (`dhcp_server::server_round`) tem fases:
+
+1. **Sob o lock da sessão:** segue a config, os relays e os veredictos do IPoE.
+2. **Sem ele:** lê os sockets e roda o servidor puro, sob o lock próprio do `core`, 32 mensagens por vez.
+3. **Sob o lock da sessão:** diário, DNS, listas, histórico.
+4. **Sem ele:** as respostas, já cobertas pelo diário.
+
+Por isso uma resposta agora sai depois do nome no DNS e das listas (antes saía antes): o cliente recebe
+o ACK com o nome pronto, e um pouco mais tarde.
+
+**Sem concessão dupla.** Quem recebe um endereço só se decide sob o lock do `core`, e os comandos que
+mudam uma concessão usam `Session::dhcp_server_op`, que também o toma. Os efeitos de tudo que muda o
+`core` entram numa fila, em ordem, antes de o lock ser solto; quem aplica leva a fila toda. Assim um
+comando entre duas fases não inverte `Bound` e `Gone`, nem o diário. O teste
+`an_address_never_goes_to_two_clients_with_commands_in_between` roda rodadas e operador ao mesmo tempo:
+toda troca de dono de um endereço corresponde a uma retirada, e o diário reproduz a tabela.
+
+**Ordem dos locks:** sessão → `ports` → `core`. Nada toma a sessão nem `ports` segurando o `core`.
+
+### 15.3 Medidas
+
+Duas threads, build release, fsync real, 30 s, `G42H_SECS=30 cargo test --release -p corerouter-engine
+--test it slow_the_control_channel -- --nocapture` (**medido**, 2026-11-09, 32 threads, carga ~5 de outras
+sessões). A meta da gap era p99 abaixo de 50 ms.
+
+| Tempestade de DISCOVERs de MACs aleatórios | Sob o lock | Fora do lock |
+|---|---|---|
+| `interface.list`, p50 | 33,6 µs | 25,7 µs |
+| `interface.list`, p99 | 865 µs | 55 µs |
+| `interface.list`, máximo | 238,7 ms | 108 µs |
+| `ip.dhcp-server.print`, p99 | 868 µs | 604 µs |
+| Mensagens tratadas | 5,39 milhões | 5,48 milhões |
+
+Nesta mesma rodada a coluna "sob o lock" já tem a contagem por servidor em O(1) (`Leases::bound_of`):
+antes dela, com carga ~35, o `print` chegava a 140 ms de p99 e `interface.list` a 80 ms.
+
+### 15.4 Paralelismo
+
+- **Trabalho por mensagem:** O(1) nos índices da tabela, cerca de 5,5 µs (~180 mil mensagens/s numa
+  thread, **medido**, com o tempo de rodada e o `sleep` de 1 ms incluídos).
+- **Mais threads:** não entram agora. O que dá para dividir é a escolha por pool, mas os índices por
+  cliente e por MAC, as cotas por cliente e o `exhausted` são globais; o lock do `core` viraria o gargalo
+  ou exigiria dividir a tabela, e foi aí que o Kea teve bug de endereço duplicado. Com 180 mil
+  mensagens/s numa thread, muito acima do que uma rede de acesso gera, o ganho não paga o risco.
+- **O que ficou sob o lock da sessão:** o diário e os efeitos. O relay e o DHCPv6 continuam inteiros
+  sob ele.
+

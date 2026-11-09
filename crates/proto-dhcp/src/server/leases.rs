@@ -234,9 +234,34 @@ pub struct Leases {
     free: BTreeSet<(u64, u32)>,
     /// MAC → its addresses (`client_mac_limit` counts them per DISCOVER).
     by_mac: HashMap<[u8; 6], Vec<Ipv4Addr>>,
+    /// Bound records per server: `ip.dhcp-server.print` runs under the
+    /// session lock, and walking 1 million records for it took ~150 ms
+    /// (G4.2h, **medido**).
+    bound: HashMap<String, usize>,
 }
 
 impl Leases {
+    /// How many records of `server` are bound (O(1)).
+    pub fn bound_of(&self, server: &str) -> usize {
+        self.bound.get(server).copied().unwrap_or(0)
+    }
+
+    fn count_bound(&mut self, server: &str, up: bool) {
+        if up {
+            match self.bound.get_mut(server) {
+                Some(n) => *n += 1,
+                None => {
+                    self.bound.insert(server.to_owned(), 1);
+                }
+            }
+        } else if let Some(n) = self.bound.get_mut(server) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.bound.remove(server);
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.by_addr.len()
     }
@@ -286,6 +311,10 @@ impl Leases {
         if let Some(old) = self.by_addr.get(&ip) {
             let old_key = old.client_key();
             let (old_mac, old_free) = (old.mac, old.state.free().then_some(old.expires));
+            if old.state == State::Bound {
+                let server = old.server.clone();
+                self.count_bound(&server, false);
+            }
             if old_key != key {
                 self.unindex(&old_key, ip);
             }
@@ -306,6 +335,9 @@ impl Leases {
         }
         if l.state.free() {
             self.free.insert((l.expires, u32::from(ip)));
+        }
+        if l.state == State::Bound {
+            self.count_bound(&l.server, true);
         }
         self.by_addr.insert(ip, l);
     }
@@ -334,6 +366,9 @@ impl Leases {
         self.unindex_mac(l.mac, ip);
         if l.state.free() {
             self.free.remove(&(l.expires, u32::from(ip)));
+        }
+        if l.state == State::Bound {
+            self.count_bound(&l.server, false);
         }
         Some(l)
     }
@@ -416,6 +451,27 @@ mod tests {
             relay_info: None,
             hw: None,
         }
+    }
+
+    /// The count follows every way a record changes (G4.2h).
+    #[test]
+    fn the_bound_count_follows_the_records() {
+        let mut t = Leases::default();
+        assert_eq!(t.bound_of("dhcp1"), 0);
+        t.put(lease([10, 0, 0, 1], 1, State::Offered));
+        assert_eq!(t.bound_of("dhcp1"), 0);
+        t.put(lease([10, 0, 0, 1], 1, State::Bound));
+        t.put(lease([10, 0, 0, 2], 2, State::Bound));
+        t.put(lease([10, 0, 0, 1], 1, State::Bound));
+        assert_eq!(t.bound_of("dhcp1"), 2, "a renewal counts once");
+        let moved = t.get_mut_with(Ipv4Addr::new(10, 0, 0, 2), |l| l.server = "other".into());
+        assert!(moved.is_some());
+        assert_eq!((t.bound_of("dhcp1"), t.bound_of("other")), (1, 1));
+        t.get_mut_with(Ipv4Addr::new(10, 0, 0, 1), |l| l.state = State::Expired);
+        assert_eq!(t.bound_of("dhcp1"), 0);
+        t.remove(Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(t.bound_of("other"), 0);
+        assert!(t.bound.is_empty(), "nothing left behind");
     }
 
     #[test]

@@ -213,8 +213,7 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     let i = static_index(s, p).map_err(|e| {
         let dynamic = address(p)
             .ok()
-            .and_then(|ip| s.dhcp_server().and_then(|c| c.leases().get(ip)))
-            .is_some();
+            .is_some_and(|ip| s.dhcp_server().is_some_and(|c| c.leases().get(ip).is_some()));
         if dynamic {
             EngineError::bad("id", "a dynamic lease: make it static first (ip.dhcp-server.lease.make-static)")
         } else {
@@ -241,14 +240,15 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
         return Ok(json!({"address": l.address, "static": true}));
     }
     let ip = address(p)?;
-    let Some(core) = s.dhcp_server_mut() else {
-        return Err(EngineError::bad("id", format!("no lease for {ip}")));
-    };
-    if core.leases().get(ip).is_none() {
+    let known = s.dhcp_server_op(|core| {
+        if core.leases().get(ip).is_none() {
+            return (false, Vec::new());
+        }
+        (true, core.forget(ip))
+    });
+    if known != Some(true) {
         return Err(EngineError::bad("id", format!("no lease for {ip}")));
     }
-    let fx = core.forget(ip);
-    s.dhcp_server_effects(fx);
     Ok(json!({"address": ip, "static": false}))
 }
 
@@ -282,11 +282,12 @@ fn make_static(s: &mut Session, p: &Value) -> Result<Value> {
 fn release(s: &mut Session, p: &Value) -> Result<Value> {
     let ip = address(p)?;
     let now = s.dhcp_server_clock();
-    let Some(core) = s.dhcp_server_mut() else {
-        return Err(EngineError::bad("address", format!("no lease for {ip}")));
-    };
-    let fx = core.release(ip, now).map_err(|e| EngineError::bad("address", e))?;
-    s.dhcp_server_effects(fx);
+    s.dhcp_server_op(|core| match core.release(ip, now) {
+        Ok(fx) => (Ok(()), fx),
+        Err(e) => (Err(e), Vec::new()),
+    })
+    .ok_or_else(|| EngineError::bad("address", format!("no lease for {ip}")))?
+    .map_err(|e| EngineError::bad("address", e))?;
     Ok(json!({"address": ip, "status": "released"}))
 }
 
@@ -316,11 +317,12 @@ fn block(s: &mut Session, p: &Value) -> Result<Value> {
 fn check_status(s: &mut Session, p: &Value) -> Result<Value> {
     let ip = address(p)?;
     let now = s.dhcp_server_clock();
-    let Some(core) = s.dhcp_server_mut() else {
-        return Err(EngineError::bad("address", format!("no lease for {ip}")));
-    };
-    let fx = core.check_status(ip, now).map_err(|e| EngineError::bad("address", e))?;
-    s.dhcp_server_effects(fx);
+    s.dhcp_server_op(|core| match core.check_status(ip, now) {
+        Ok(fx) => (Ok(()), fx),
+        Err(e) => (Err(e), Vec::new()),
+    })
+    .ok_or_else(|| EngineError::bad("address", format!("no lease for {ip}")))?
+    .map_err(|e| EngineError::bad("address", e))?;
     Ok(json!({"address": ip, "status": "testing"}))
 }
 
@@ -334,6 +336,7 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
     let cand = s.store().candidate();
     let now = s.dhcp_server_clock().unix;
     let core = s.dhcp_server();
+    let core = core.as_deref();
     let testing: Vec<Ipv4Addr> = core.map(|c| c.testing().into_iter().map(|(ip, _)| ip).collect()).unwrap_or_default();
     let mut rows: Vec<(u32, Value)> = Vec::new();
     let lists = |v: &[Name]| v.iter().map(Name::as_str).map(str::to_owned).collect::<Vec<_>>();

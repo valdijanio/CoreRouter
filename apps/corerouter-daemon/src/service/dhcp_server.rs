@@ -18,11 +18,12 @@ use corerouter_model::service::Listen;
 
 /// Rest between rounds when nothing was heard.
 const QUIET: Duration = Duration::from_millis(5);
-/// Rest between rounds in a storm. Never zero: the session lock is a
-/// plain mutex (not fair), and a loop that takes it again at once starves
-/// the control channel, the GUI and the other services — the operator
-/// could not log in to stop the storm. Each round is bounded too (the
-/// engine's `ROUND_BUDGET_US`).
+/// Rest between rounds in a storm. Never zero: a round still takes the
+/// session lock twice (its effects need it, G4.2h), the lock is a plain
+/// mutex (not fair), and a loop that takes it again at once starves the
+/// control channel, the GUI and the other services — the operator could
+/// not log in to stop the storm. Each round is bounded too (the engine's
+/// `ROUND_BUDGET_US`).
 const STORM: Duration = Duration::from_millis(1);
 /// Rest while idle (no server configured).
 const IDLE: Duration = Duration::from_millis(500);
@@ -59,16 +60,18 @@ fn run(session: &Shared, health: &super::Health) {
     while health.sleep(rest) {
         health.beat();
         let ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let (heard, ports, configured, journal) = {
-            let mut s = lock(session);
-            let heard = s.dhcp_server_poll(ms, &clock);
+        // G4.2h: lets go of the session lock while it reads the sockets and
+        // picks addresses.
+        let heard = corerouter_engine::dhcp_server::server_round(session, ms, &clock);
+        let (ports, configured, journal) = {
+            let s = lock(session);
             let d = &s.store().running().ip.dhcp_server;
             let configured = d.servers.iter().any(|x| !x.disabled)
                 || d.alerts.iter().any(|a| !a.disabled)
                 || s.store().running().ip.dhcp_relays.relays.iter().any(|r| !r.disabled)
                 || s.store().running().ipv6.dhcp_server.servers.iter().any(|x| !x.disabled)
                 || s.store().running().ipv6.dhcp_server.relays.iter().any(|r| !r.disabled);
-            (heard, s.dhcp_server_ports(), configured, s.dhcp_server_journal_error())
+            (s.dhcp_server_ports(), configured, s.dhcp_server_journal_error())
         };
         if !configured {
             health.disabled(Some("no enabled DHCP server nor relay (ip.dhcp-server.add, ip.dhcp-relay.add)"));

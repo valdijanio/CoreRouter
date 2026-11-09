@@ -139,13 +139,14 @@ fn reset(s: &mut Session, p: &Value) -> Result<Value> {
     let Some(iface) = s.store().candidate().ip.dhcp_server.alerts.get(i).map(|a| a.interface.clone()) else {
         return Err(EngineError::bad("id", "no such alert"));
     };
-    let n = s.dhcp_server_mut().map_or(0, |c| c.reset_alert(&iface));
+    let n = s.dhcp_server_op(|c| (c.reset_alert(&iface), Vec::new())).unwrap_or(0);
     Ok(json!({"interface": iface, "forgotten": n}))
 }
 
 fn print(s: &mut Session, _: &Value) -> Result<Value> {
     let now = s.dhcp_server_clock().unix;
     let core = s.dhcp_server();
+    let core = core.as_deref();
     let rows: Vec<Value> = s
         .store()
         .candidate()
