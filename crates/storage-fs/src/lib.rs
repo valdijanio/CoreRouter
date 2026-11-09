@@ -126,6 +126,14 @@ impl FileStorage {
     }
 
     fn err(&self, what: &str, e: &io::Error) -> StorageError {
+        if e.kind() == io::ErrorKind::StorageFull {
+            // The same word on every system (G1.6w, `storage::no_space`).
+            return StorageError(format!(
+                "{what} in {}: {e} ({})",
+                self.dir.display(),
+                corerouter_engine::storage::NO_SPACE
+            ));
+        }
         StorageError(format!("{what} in {}: {e}", self.dir.display()))
     }
 

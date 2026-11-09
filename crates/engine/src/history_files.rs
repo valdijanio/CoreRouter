@@ -347,19 +347,26 @@ pub(crate) fn save(
         // Whatever was there is replaced: until it is written, no file counts.
         files.saved.remove(number);
         files.present.insert(*number);
-        // One retry for a passing error; only a second failure costs history.
+        // One retry for a passing error: it must not cost any history.
         let mut wrote = storage.save_revision(*number, text);
         if wrote.is_err() {
             wrote = storage.save_revision(*number, text);
         }
-        let full = wrote.is_err();
+        let mut full = false;
         if let Err(e) = &wrote {
+            let e = e.to_string();
+            // Not a full disk (bad flash, read-only): deleting frees nothing
+            // that helps. The error goes up, the files stay.
+            if !crate::storage::no_space(&e) {
+                return Err(e);
+            }
             // G1.6w: the disk is full. The running config matters more than
             // the history: what is older goes now (each file only serves
             // the ones older than it) and this one gets a last try; if that
             // fails too, the chain ends here and the slot still gets its
             // turn below.
-            log::warn!("cannot write revision {number} file, freeing the older ones: {e}");
+            log::warn!("revision {number} file does not fit, freeing the older ones: {e}");
+            full = true;
             keep.retain(|k| *k >= *number);
             remove_stale(storage, files, &keep);
             wrote = storage.save_revision(*number, text);
@@ -386,10 +393,16 @@ pub(crate) fn save(
     // The newest revision is in the slot.
     let skipped = history.len().saturating_sub(keep.len()).saturating_sub(1);
     let mut saved = save_newest(storage, files, store, users, slot);
-    if let Err(e) = &saved {
+    if saved.is_err() {
+        saved = save_newest(storage, files, store, users, slot);
+    }
+    if let Err(e) = &saved
+        && crate::storage::no_space(e)
+    {
         // G1.6w: the same with the slot or the journal line: every revision
-        // but the last good one gives way to the running config.
-        log::warn!("cannot save the running config, freeing the old revisions: {e}");
+        // but the last good one gives way to the running config. Only for a
+        // full disk, and only after a retry: anything else costs no history.
+        log::warn!("the running config does not fit, freeing the old revisions: {e}");
         let last_good = keep.last().copied();
         keep.retain(|k| Some(*k) == last_good);
         remove_stale(storage, files, &keep);

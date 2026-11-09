@@ -494,11 +494,12 @@ fn busybox(args: &[&str]) -> Result<String, String> {
 
 /// A port, as the operator needs it before erasing a disk.
 fn network_test(session: &Shared, req: &TestRequest) -> serde_json::Value {
-    let (addresses, clients) = {
+    let (addresses, clients, hardware) = {
         let mut s = lock(session);
         (
             s.execute("ip.address.list", &json!({})).unwrap_or_default(),
             s.execute("ip.dhcp-client.list", &json!({})).unwrap_or_default(),
+            s.execute("interface.hardware-problem.print", &json!({})).unwrap_or_default(),
         )
     };
     let empty = Vec::new();
@@ -567,6 +568,16 @@ fn network_test(session: &Shared, req: &TestRequest) -> serde_json::Value {
             "firmware": firmware,
             "connected": connected.as_deref() == Some(p.name.as_str()),
         }));
+    }
+    // G1.6ja: the health check's list: a card with no port here. Firmware is
+    // said port by port above.
+    let rows = hardware.get("problems").and_then(serde_json::Value::as_array);
+    for p in rows.into_iter().flatten() {
+        if p.get("kind").and_then(serde_json::Value::as_str) == Some("no-driver")
+            && let Some(line) = p.get("line").and_then(serde_json::Value::as_str)
+        {
+            problems.push(line.to_owned());
+        }
     }
     // A port without a cable is normal; no port with one is not.
     if !ports.iter().any(|p| p.link) {
@@ -716,32 +727,11 @@ fn read_kmsg() -> Vec<String> {
     out
 }
 
-/// The firmware file a kernel line says is missing, and the device it names.
-/// Not one text: `request_firmware` says "Direct firmware load", `r8169` asks
-/// without a warning and logs its own, `e100` and `ice` theirs (G1.6j read
-/// them in the kernel's source).
-fn missing_firmware(line: &str) -> Option<(Option<String>, String)> {
-    let between = |from: &str, to: &str| -> Option<String> {
-        let (_, rest) = line.split_once(from)?;
-        let (file, _) = rest.split_once(to)?;
-        Some(file.to_owned())
-    };
-    let file = between("Direct firmware load for ", " failed")
-        .or_else(|| between("Unable to load firmware ", " ("))
-        .or_else(|| between("Needs \"", "\""))
-        .or_else(|| line.contains("DDP package file was not found").then(|| "intel/ice/ddp/ice.pkg".to_owned()))?;
-    // "r8169 0000:02:00.0: Unable to …": driver, device, text.
-    let device = line
-        .split_once(": ")
-        .and_then(|(head, _)| head.split_whitespace().nth(1))
-        .map(str::to_owned);
-    Some((device, file))
-}
-
 fn firmware_by_device(lines: &[String]) -> (BTreeMap<String, Vec<String>>, Vec<String>) {
     let mut by = BTreeMap::<String, Vec<String>>::new();
     let mut other = Vec::new();
-    for (device, file) in lines.iter().filter_map(|l| missing_firmware(l)) {
+    // G1.6ja: one parser of these lines, the health check's too.
+    for (device, file, _) in lines.iter().filter_map(|l| corerouter_hal::nic_problem::missing_firmware(l)) {
         match device {
             Some(d) => {
                 let files = by.entry(d).or_default();
@@ -760,23 +750,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn firmware_lines_of_every_kind() {
-        for (line, device, file) in [
-            ("r8169 0000:02:00.0: Unable to load firmware rtl_nic/rtl8168h-2.fw (-2)", Some("0000:02:00.0"), "rtl_nic/rtl8168h-2.fw"),
-            ("e100 0000:01:01.0: CPUSaver disabled. Needs \"e100/d101m_ucode.bin\": -2", Some("0000:01:01.0"), "e100/d101m_ucode.bin"),
-            ("ice 0000:03:00.0: The DDP package file was not found or could not be read", Some("0000:03:00.0"), "intel/ice/ddp/ice.pkg"),
-            ("tg3 0000:04:00.0: Direct firmware load for tigon/tg3_tso5.bin failed with error -2", Some("0000:04:00.0"), "tigon/tg3_tso5.bin"),
-        ] {
-            let (d, f) = missing_firmware(line).unwrap();
-            assert_eq!((d.as_deref(), f.as_str()), (device, file), "{line}");
-        }
-        assert_eq!(missing_firmware("r8169 0000:02:00.0: eth0: link up"), None);
+    fn firmware_is_grouped_by_device_and_regulatory_db_stays_apart() {
         let (by, other) = firmware_by_device(&[
             "r8169 0000:02:00.0: Unable to load firmware a.fw (-2)".into(),
             "r8169 0000:02:00.0: Unable to load firmware a.fw (-2)".into(),
+            "platform regulatory.0: Direct firmware load for regulatory.db failed with error -2".into(),
+            "r8169 0000:02:00.0: eth0: link up".into(),
         ]);
         assert_eq!(by.get("0000:02:00.0").unwrap(), &["a.fw"]);
-        assert!(other.is_empty());
+        assert_eq!(other, ["regulatory.db"], "the curious see it, never a problem of a port");
     }
 
     #[test]

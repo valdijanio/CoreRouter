@@ -678,6 +678,24 @@ e o tempo da sonda.
 | Placa nova, driver em módulo (`pcnet32`) | 157 ms até a porta ter nome (50 ms na carga) |
 | Reprodutível | `linux-dirclean` e rebuild: rootfs, bzImage, todos os `.ko`, `disk.img`, instalador, ISO, qcow2 e crpkg com o mesmo hash |
 
+### O que o roteador avisa quando a placa não sobe (G1.6ja)
+
+O serviço `nic-problems` do daemon olha a máquina a cada 10 s, fora do lock do `Session`: as placas
+em `/sys/bus/{pci,usb,mdio_bus}/devices` e o `/dev/kmsg`, com a posição própria. O parser das linhas
+é um só (`corerouter_hal::nic_problem`), usado também pelo teste de rede do instalador.
+
+| Caso | Como vê | O que diz |
+|---|---|---|
+| Sem driver | classe PCI `0x0200`; USB CDC/RNDIS, ou chip conhecido quando a classe é só "vendor" | o módulo que casa em `modules.alias`, ou que a imagem não conhece a placa, com o id |
+| Firmware | `Direct firmware load…` e as mensagens próprias de quem pede sem aviso (`r8169`, `r8152`, `e100`, `tg3`, `cxgb4`, PHYs), só de placa de rede | o arquivo, o erro e o que fazer |
+| `ice` em Safe Mode | a mensagem de `ice_log_pkg_init`; ou o máximo de 1 canal com mais de uma CPU (`ice_ethtool.c:3803`), que sobrevive a um log que deu a volta | o motivo: arquivo faltando, inválido, versão |
+
+**Não contam:** `regulatory.db` (pedido a todo kernel com Wi-Fi), `cxgb4/*-config.txt` (a placa usa o
+da flash), `ice-<serial>.pkg` (opcional), qualquer linha de outro dispositivo (vídeo, Bluetooth), Wi-Fi
+(classe `0x0280`, listada em `ignored`) e função virtual sem driver. Na ISO, firmware e Safe Mode
+são o esperado: nota, não aviso. Um cartão sem driver na ISO continua avisando, porque o operador
+pode estar para perder a única porta.
+
 ### Placas suportadas
 
 `os/board/x86_64/nics.fragment` liga 175 drivers com fio e de PHY como módulo, além dos que o

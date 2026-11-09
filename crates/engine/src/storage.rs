@@ -39,6 +39,16 @@ impl Slot {
 #[error("config storage: {0}")]
 pub struct StorageError(pub String);
 
+/// In a [`StorageError`]'s text when the disk is full (G1.6w): only then
+/// is deleting old revisions worth anything. Lowercase: Linux's own text
+/// ("No space left on device") matches too, whoever reports it.
+pub const NO_SPACE: &str = "no space left";
+
+/// A save's error text says the disk is full.
+pub fn no_space(error: &str) -> bool {
+    error.to_lowercase().contains(NO_SPACE)
+}
+
 pub trait ConfigStorage: Send {
     /// "file /config", "memory": shown by `state.inspect`.
     fn describe(&self) -> String;
