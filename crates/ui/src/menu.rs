@@ -125,6 +125,7 @@ pub(crate) const CATALOG: &[Entry] = &[
     e("resources", None, None, icons::PULSE, "/system resource", &["system.resource", "system.health"], &["health", "saúde", "saude", "cpu", "memória", "memoria", "memory", "ram", "disk", "disco", "temperature", "temperatura", "sensores", "sensors", "fan", "ventoinha", "processos", "processes", "profile", "top", "htop", "uptime", "psi", "softirq", "irq", "rss"]),
     e("routes", None, None, icons::SIGNPOST, "/ip route", &["ip.route"], &["rota", "rotas", "rota padrão", "default route", "gateway", "0.0.0.0/0", "static route", "ipv4"]),
     e("routing-filters", None, None, icons::TREE_STRUCTURE, "/routing filter", &["routing.filter"], &["filter", "filtro", "route-map", "prefix-list", "policy", "política", "community", "as-path", "chain", "rfc 8212", "bogons", "prepend"]),
+    e("routing-rules", None, None, icons::SIGNPOST, "/routing rule", &["routing.rule", "routing.table"], &["policy routing", "roteamento por política", "pbr", "ip rule", "routing table", "tabela de rotas", "routing mark", "marca de roteamento", "multi-wan", "fwmark", "lookup-only-in-table"]),
     e("services", None, None, icons::HEARTBEAT, "/system service", &["system.service"], &["supervisor", "daemon", "processo", "failed", "restart", "reiniciar"]),
     e("settings", None, None, icons::SLIDERS_HORIZONTAL, "", &[], &["language", "idioma", "theme", "tema", "preferences", "preferências"]),
     e("shutdown", None, None, icons::POWER, "/system shutdown", &["system.shutdown"], &["power off", "poweroff", "desligar", "halt", "turn off"]),
