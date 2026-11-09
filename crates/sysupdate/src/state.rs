@@ -269,6 +269,20 @@ pub fn free_bytes(path: &Path) -> Option<u64> {
     }
 }
 
+/// Size of the filesystem holding `path`; `None` off Linux.
+pub fn total_bytes(path: &Path) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let s = rustix::fs::statvfs(path).ok()?;
+        Some(s.f_blocks.saturating_mul(s.f_frsize))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// Bytes a file or a tree takes; `own`: files with another link (shared
 /// with the configuration or another snapshot) count nothing, as removing
 /// them frees nothing.

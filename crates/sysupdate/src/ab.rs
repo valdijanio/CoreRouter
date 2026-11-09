@@ -35,13 +35,19 @@ use crate::{SlotCmdline, SlotId, cmdline_value, verity};
 /// Rows of `config_space.usage` in the status.
 pub const CONFIG_USAGE_ROWS: usize = 8;
 
-/// G1.6u: room in `/config` — free bytes, what the next snapshot needs,
-/// and what takes room (biggest first, at most [`CONFIG_USAGE_ROWS`]).
+/// G1.6u: room in `/config` — size, free bytes, what the next snapshot needs,
+/// whether it would be let through (G1.6x), and what takes room (biggest
+/// first, at most [`CONFIG_USAGE_ROWS`]).
 fn config_space(config: &Path, usage: Vec<state::Use>) -> Value {
     let rows = usage.len();
+    let free = state::free_bytes(config);
+    let need = state::snapshot_need(config).ok();
     json!({
-        "free": state::free_bytes(config),
-        "snapshot_need": state::snapshot_need(config).ok(),
+        "total": state::total_bytes(config),
+        "free": free,
+        "snapshot_need": need,
+        // The room check before a snapshot (`state.rs`), with the same margin.
+        "snapshot_fits": need.zip(free).map(|(n, f)| f >= n.saturating_add(state::SPACE_MARGIN)),
         "usage": usage.into_iter().take(CONFIG_USAGE_ROWS).collect::<Vec<_>>(),
         "usage_rows": rows,
     })

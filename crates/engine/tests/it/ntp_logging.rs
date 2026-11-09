@@ -4,7 +4,7 @@
 
 use corerouter_engine::Session;
 use corerouter_engine::logging::routes;
-use corerouter_model::ntp::{NtpState, NtpStatus};
+use corerouter_model::ntp::{NtpClient, NtpState, NtpStatus};
 use serde_json::{Value, json};
 
 fn ok(s: &mut Session, id: &str, p: Value) -> Value {
@@ -72,6 +72,139 @@ fn ntp_client_settings() {
         json!({"server": "x"}),
         "did you mean",
     );
+}
+
+/// G4.6b: `vrf`, `set_system_clock`, and what a config file can say.
+#[test]
+fn ntp_client_vrf_and_clock_switch() {
+    let mut s = Session::virtual_lab();
+    let got = ok(&mut s, "system.ntp.client.get", Value::Null);
+    assert_eq!(got["vrf"], "main");
+    assert_eq!(got["set_system_clock"], true);
+    assert_eq!(got["clock"], "not-set");
+    fails(
+        &mut s,
+        "system.ntp.client.set",
+        json!({"vrf": "nope"}),
+        "no VRF 'nope'",
+    );
+    fails(
+        &mut s,
+        "system.ntp.client.set",
+        json!({"vrf": "ether1"}),
+        "no VRF 'ether1'",
+    );
+    ok(&mut s, "ip.vrf.add", json!({"name": "red"}));
+    let set = ok(
+        &mut s,
+        "system.ntp.client.set",
+        json!({"vrf": "red", "set_system_clock": false}),
+    );
+    assert_eq!(set["vrf"], "red");
+    assert_eq!(set["set_system_clock"], false);
+    assert_eq!(s.store().running().system.ntp_client.vrf, "red");
+    // A refused set changes nothing, whatever else it carried.
+    fails(
+        &mut s,
+        "system.ntp.client.set",
+        json!({"vrf": "main", "min_poll": 2}),
+        "RFC 4330",
+    );
+    assert_eq!(s.store().running().system.ntp_client.vrf, "red");
+    s.execute(
+        "system.ntp.client.set",
+        &json!({"vrf": "main", "set_system_clock": true}),
+    )
+    .unwrap();
+    assert_eq!(s.store().running().system.ntp_client.vrf, "main");
+    // Validation of a hand-edited file.
+    let mut cfg = s.store().candidate().clone();
+    cfg.system.ntp_client.vrf = "ghost".into();
+    let issues = corerouter_engine::validate::validate_all(&cfg);
+    assert!(
+        issues.iter().any(|i| i.path == "system.ntp_client.vrf"),
+        "{issues:?}"
+    );
+    // Default values stay out of the saved file.
+    let saved = serde_json::to_value(NtpClient::default()).unwrap();
+    assert!(
+        saved.get("vrf").is_none() && saved.get("set_system_clock").is_none(),
+        "{saved}"
+    );
+}
+
+/// G4.6b: a client may rely on a DHCP client's servers.
+#[test]
+fn ntp_client_without_servers_needs_a_dhcp_client() {
+    let mut s = Session::virtual_lab();
+    fails(
+        &mut s,
+        "system.ntp.client.set",
+        json!({"enabled": true}),
+        "at least one server",
+    );
+    ok(&mut s, "ip.dhcp-client.add", json!({"interface": "ether1"}));
+    ok(&mut s, "system.ntp.client.set", json!({"enabled": true}));
+    assert!(s.store().running().system.ntp_client.enabled);
+    assert_eq!(
+        ok(&mut s, "system.ntp.client.get", Value::Null)["servers"],
+        json!([])
+    );
+}
+
+/// G4.6b: confirming needs something to confirm; the daemon takes it once.
+#[test]
+fn ntp_step_confirmation() {
+    let mut s = Session::virtual_lab();
+    fails(
+        &mut s,
+        "system.ntp.client.confirm-step",
+        json!({}),
+        "no clock step",
+    );
+    assert!(!s.take_ntp_step_confirmation());
+    ok(
+        &mut s,
+        "system.ntp.client.set",
+        json!({"enabled": true, "servers": ["192.0.2.1"]}),
+    );
+    s.set_ntp_status(NtpStatus {
+        status: NtpState::Synchronized,
+        pending_step_ms: Some(5_000_000.0),
+        ..NtpStatus::default()
+    });
+    let got = ok(&mut s, "system.ntp.client.confirm-step", json!({}));
+    assert_eq!(got["pending_step_ms"], 5_000_000.0);
+    assert!(s.take_ntp_step_confirmation());
+    assert!(!s.take_ntp_step_confirmation(), "once");
+    // The client off: nothing is pending any more.
+    ok(&mut s, "system.ntp.client.set", json!({"enabled": false}));
+    fails(
+        &mut s,
+        "system.ntp.client.confirm-step",
+        json!({}),
+        "no clock step",
+    );
+}
+
+/// The health check read a status nobody wrote: an enabled client always
+/// said "no daemon".
+#[test]
+fn health_sees_the_client_state() {
+    let mut s = Session::virtual_lab();
+    ok(
+        &mut s,
+        "system.ntp.client.set",
+        json!({"enabled": true, "servers": ["192.0.2.1"]}),
+    );
+    s.set_ntp_status(NtpStatus {
+        status: NtpState::Synchronized,
+        ..NtpStatus::default()
+    });
+    assert_eq!(s.ntp_status().status, NtpState::Synchronized);
+    let health = ok(&mut s, "system.health.check", json!({}));
+    let text = health.to_string();
+    assert!(text.contains("relógio sincronizado"), "{text}");
 }
 
 #[test]

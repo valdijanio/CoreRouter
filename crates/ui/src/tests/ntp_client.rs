@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::ntp_client::{NtpPanel, WIN, utc};
-use corerouter_model::ntp::{NtpState, NtpStatus};
+use corerouter_model::ntp::{ClockState, NtpState, NtpStatus};
 
 fn open(s: Session) -> Harness {
     let mut h = Harness::with_session(s);
@@ -47,6 +47,7 @@ fn ntp_window_shows_live_status_and_applies() {
         last_sync: Some(1_792_674_309),
         last_error: None,
         poll_secs: Some(64),
+        ..NtpStatus::default()
     });
     refresh(&mut h);
     assert!(h.has_text("synchronized"));
@@ -83,6 +84,70 @@ fn ntp_window_keeps_the_edit_and_shows_the_refusal() {
     // Revert puts back what the router has.
     h.click(h.text("Revert"));
     assert_eq!(h.app.panel_mut::<NtpPanel>().unwrap().form.min_poll, "6");
+}
+
+/// G4.6b: the clock's state, the drift and the confirmation of a big step.
+#[test]
+fn ntp_window_shows_the_clock_and_confirms_a_step() {
+    let mut s = Session::virtual_lab();
+    s.execute(
+        "system.ntp.client.set",
+        &json!({"enabled": true, "servers": ["192.0.2.1"]}),
+    )
+    .unwrap();
+    s.set_ntp_status(NtpStatus {
+        status: NtpState::Synchronized,
+        clock: ClockState::Slewing,
+        last_adjustment_ms: Some(3.5),
+        freq_drift_ppm: Some(12.25),
+        dynamic_servers: vec!["198.51.100.9".into()],
+        ..NtpStatus::default()
+    });
+    let mut h = open(s);
+    assert!(h.has_text("slewing"));
+    assert!(h.has_text("3.500 ms"));
+    assert!(h.has_text("+12.250 ppm"));
+    assert!(h.has_text("198.51.100.9"));
+    assert!(!h.has_text("Confirm Clock Step"), "nothing to confirm");
+
+    lock(&h.session).set_ntp_status(NtpStatus {
+        status: NtpState::Synchronized,
+        clock: ClockState::AwaitingConfirmation,
+        pending_step_ms: Some(5_000_000.0),
+        clock_error: Some("no permission".into()),
+        ..NtpStatus::default()
+    });
+    refresh(&mut h);
+    assert!(h.has_text("awaiting-confirmation"));
+    assert!(h.has_text_containing("+5000 s"));
+    assert!(h.has_text("no permission"));
+    h.click(h.text("Confirm Clock Step"));
+    refresh(&mut h);
+    assert!(
+        lock(&h.session).take_ntp_step_confirmation(),
+        "the button confirmed: {:?}",
+        h.app.log()
+    );
+}
+
+/// G4.6b: VRF and Set System Clock go to the engine.
+#[test]
+fn ntp_window_applies_vrf_and_clock_switch() {
+    let mut s = Session::virtual_lab();
+    s.execute("ip.vrf.add", &json!({"name": "red"})).unwrap();
+    let mut h = open(s);
+    let p = h.app.panel_mut::<NtpPanel>().unwrap();
+    assert!(p.form.set_system_clock, "on by default");
+    p.form.vrf = "red".into();
+    p.form.set_system_clock = false;
+    h.idle();
+    h.click(h.text("Apply"));
+    refresh(&mut h);
+    let got = lock(&h.session)
+        .execute("system.ntp.client.get", &Value::Null)
+        .unwrap();
+    assert_eq!(got["vrf"], "red", "{:?}", h.app.log());
+    assert_eq!(got["set_system_clock"], false);
 }
 
 #[test]

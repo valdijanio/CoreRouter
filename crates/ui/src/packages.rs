@@ -70,6 +70,17 @@ pub(crate) struct Sending {
 /// Replies of the upload.
 struct UpStart;
 struct UpChunk;
+/// The `dry_run` for "every snapshot too" (`all`) or not.
+struct Plan(bool);
+
+/// The "Free space" question.
+#[derive(Debug, Default)]
+struct Freeing {
+    all: bool,
+    /// The last `dry_run` answer for `all`; null while it is on its way.
+    plan: Value,
+    error: Option<String>,
+}
 
 pub(crate) struct PackagesPanel {
     pub(crate) status: Value,
@@ -80,6 +91,7 @@ pub(crate) struct PackagesPanel {
     manual: bool,
     timeout: u32,
     ask: Option<Ask>,
+    freeing: Option<Freeing>,
     help: Option<HelpView>,
     notice: Option<String>,
     error: Option<String>,
@@ -101,6 +113,21 @@ fn mib(v: &Value, k: &str) -> String {
         .and_then(Value::as_u64)
         .map(|b| format!("{:.1} MiB", b as f64 / 1_048_576.0))
         .unwrap_or_else(|| "–".into())
+}
+
+/// `13.2 MiB`, `812 KiB`, `96 B`: a snapshot of hard links takes a few KiB.
+pub(crate) fn size(b: u64) -> String {
+    const KIB: f64 = 1024.0;
+    let f = b as f64;
+    if f >= KIB * KIB * KIB {
+        format!("{:.1} GiB", f / (KIB * KIB * KIB))
+    } else if f >= KIB * KIB {
+        format!("{:.1} MiB", f / (KIB * KIB))
+    } else if f >= KIB {
+        format!("{:.0} KiB", f / KIB)
+    } else {
+        format!("{b} B")
+    }
 }
 
 /// The state chip of a slot row.
@@ -128,6 +155,7 @@ impl PackagesPanel {
             manual: false,
             timeout: 300,
             ask: None,
+            freeing: None,
             help: None,
             notice: None,
             error: None,
@@ -356,6 +384,9 @@ impl PackagesPanel {
                         if let Some(ms) = res.get(k).and_then(Value::as_u64) {
                             parts.push(format!("{label} {ms} ms"));
                         }
+                    }
+                    if let Some(freed) = res.get("freed").and_then(Value::as_u64) {
+                        parts.push(format!("{} {}", t(lang, "freed"), size(freed)));
                     }
                     if let Some(sig) = res.get("signature").and_then(Value::as_str) {
                         parts.push(format!("{} {}: {sig}", s(&res, "version"), t(lang, "signature")));
@@ -617,22 +648,178 @@ impl PackagesPanel {
         }
         ui.separator();
         self.actions(app, ui, lang);
+        ui.separator();
+        self.space(app, ui, lang);
+    }
+
+    /// `/config`: the bar, whether the next snapshot fits, the biggest items
+    /// and what can be removed.
+    fn space(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, lang: Lang) {
+        let v = ui.visuals().clone();
+        let cs = self.status.get("config_space").cloned().unwrap_or(Value::Null);
+        let n = |k: &str| cs.get(k).and_then(Value::as_u64);
         let snaps = self.status.get("snapshots").and_then(Value::as_array).cloned().unwrap_or_default();
-        if !snaps.is_empty() {
-            ui.add_space(4.0);
+        let partials = self.status.get("partials").and_then(Value::as_array).cloned().unwrap_or_default();
+        let busy = self.status.get("job").is_some_and(|j| !j.is_null());
+        let free_space = app.can().check("system.package.snapshot.remove").and_then(|()| {
+            if busy {
+                Err(t(lang, "a job is running").to_owned())
+            } else if snaps.is_empty() && partials.is_empty() {
+                Err(t(lang, "no snapshot and no partial copy to remove").to_owned())
+            } else {
+                Ok(())
+            }
+        });
+        let mut open = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("/config");
+            self.info(ui, "packages.space", t(lang, "Room in /config"));
+            if let (Some(total), Some(free)) = (n("total"), n("free")) {
+                let used = total.saturating_sub(free);
+                let frac = if total > 0 { used as f32 / total as f32 } else { 0.0 };
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .desired_width(200.0)
+                        .text(format!("{} / {}", size(used), size(total))),
+                );
+                ui.weak(format!("{} {}", size(free), t(lang, "free")));
+            }
+            let need = n("snapshot_need").map_or_else(|| "–".to_owned(), size);
+            let need = format!("{}: {need}", t(lang, "The next snapshot needs"));
+            match cs.get("snapshot_fits").and_then(Value::as_bool) {
+                Some(true) => {
+                    chip(ui, t(lang, "snapshot fits"), GREEN.tone(&v)).on_hover_text(need);
+                }
+                Some(false) => {
+                    chip(ui, t(lang, "no room for the snapshot"), RED.tone(&v))
+                        .on_hover_text(format!("{need}. {}", t(lang, "An update is refused until there is room.")));
+                }
+                None => {}
+            }
+            open = action(ui, t(lang, "Free space…"), free_space);
+            self.info(ui, "packages.free_space", t(lang, "Free space"));
+        });
+        if open {
+            self.freeing = Some(Freeing::default());
+            self.ask_plan(app, false);
+        }
+        let usage = cs.get("usage").and_then(Value::as_array).cloned().unwrap_or_default();
+        if !usage.is_empty() {
+            let line = |u: &Value| format!("{} {}", s(u, "path"), size(u.get("bytes").and_then(Value::as_u64).unwrap_or(0)));
+            let top: Vec<String> = usage.iter().take(3).map(line).collect();
+            let mut all: Vec<String> = usage.iter().map(line).collect();
+            let more = n("usage_rows").unwrap_or(0).saturating_sub(usage.len() as u64);
+            if more > 0 {
+                all.push(format!("+{more}"));
+            }
+            ui.weak(format!("{}: {}", t(lang, "Biggest"), top.join(" · "))).on_hover_text(all.join("\n"));
+        }
+        if !snaps.is_empty() || !partials.is_empty() {
             ui.horizontal_wrapped(|ui| {
                 ui.weak(t(lang, "Configuration snapshots:"));
                 for sn in &snaps {
-                    ui.weak(format!(
-                        "{} ({}, format {}, {} files)",
-                        s(sn, "name"),
+                    let own = size(sn.get("own_bytes").and_then(Value::as_u64).unwrap_or(0));
+                    chip(ui, &format!("{} {own}", s(sn, "name")), neutral_tone(&v)).on_hover_text(format!(
+                        "{} · format {} · {} files · {} {}",
                         s(sn, "version"),
                         sn.get("format_version").and_then(Value::as_u64).unwrap_or(0),
-                        sn.get("files").and_then(Value::as_u64).unwrap_or(0)
+                        sn.get("files").and_then(Value::as_u64).unwrap_or(0),
+                        size(sn.get("bytes").and_then(Value::as_u64).unwrap_or(0)),
+                        t(lang, "in all, the rest shared with the configuration"),
                     ));
                 }
-                self.info(ui, "packages.snapshot", "Configuration snapshots");
+                for p in &partials {
+                    let own = size(p.get("own_bytes").and_then(Value::as_u64).unwrap_or(0));
+                    chip(ui, &format!("{} {own}", s(p, "name")), AMBER.tone(&v))
+                        .on_hover_text(t(lang, "A copy cut short: it serves nothing and is safe to remove."));
+                }
+                self.info(ui, "packages.snapshot", t(lang, "Configuration snapshots"));
             });
+        }
+    }
+
+    /// Asks what would go; the answer fills the question.
+    fn ask_plan(&mut self, app: &mut CoreRouterUi, all: bool) {
+        let mut p = json!({"dry_run": true});
+        if all
+            && let Some(o) = p.as_object_mut()
+        {
+            o.insert("all".into(), json!(true));
+        }
+        app.run_then("system.package.snapshot.remove", p, crate::panel::then(NAME, Plan(all)));
+    }
+
+    fn freeing_dialog(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context) {
+        let Some(f) = self.freeing.as_mut() else { return };
+        let lang = app.lang.labels;
+        let v = ctx.global_style().visuals.clone();
+        let was_all = f.all;
+        let rows = f.plan.get("snapshots").and_then(Value::as_array).cloned().unwrap_or_default();
+        let freed = f.plan.get("freed").and_then(Value::as_u64).unwrap_or(0);
+        let goes = rows.iter().filter(|r| r.get("remove") == Some(&json!(true))).count();
+        let mut help = false;
+        let mut cancel = false;
+        let mut go = false;
+        egui::Modal::new(egui::Id::unique("packages-free")).show(ctx, |ui| {
+            ui.set_max_width(480.0);
+            ui.horizontal(|ui| {
+                ui.heading(t(lang, "Free space"));
+                help = help::info_button(ui, egui::Id::unique("packages-free-help"), t(lang, "Free space")).clicked();
+            });
+            ui.radio_value(&mut f.all, false, t(lang, "Partial copies only"));
+            ui.radio_value(&mut f.all, true, t(lang, "Every snapshot too"));
+            if f.all {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    t(lang, "Without its snapshot, going back to that slot has no saved configuration to return to."),
+                );
+            }
+            ui.add_space(4.0);
+            if f.plan.is_null() {
+                ui.weak(t(lang, "Asking the router…"));
+            } else if rows.is_empty() {
+                ui.weak(t(lang, "Nothing to remove."));
+            } else {
+                Grid::new("packages-free-plan").striped(true).spacing([14.0, 4.0]).show(ui, |ui| {
+                    for r in &rows {
+                        ui.label(RichText::new(s(r, "name")).monospace());
+                        ui.label(size(r.get("own_bytes").and_then(Value::as_u64).unwrap_or(0)));
+                        if r.get("remove") == Some(&json!(true)) {
+                            chip(ui, t(lang, "remove"), AMBER.tone(&v));
+                        } else {
+                            chip(ui, t(lang, "kept"), BLUE.tone(&v)).on_hover_text(s(r, "kept"));
+                        }
+                        ui.end_row();
+                    }
+                });
+                ui.strong(format!("{} {}", t(lang, "Frees"), size(freed)));
+            }
+            if let Some(e) = &f.error {
+                ui.colored_label(ui.visuals().error_fg_color, e);
+            }
+            ui.add_space(6.0);
+            let ready = if goes > 0 { Ok(()) } else { Err(t(lang, "Nothing to remove.").to_owned()) };
+            ui.horizontal(|ui| {
+                cancel = ui.button(t(lang, "Cancel")).clicked();
+                go = action(ui, t(lang, "Remove"), ready);
+            });
+        });
+        let all = f.all;
+        if all != was_all {
+            f.plan = Value::Null;
+            f.error = None;
+            self.ask_plan(app, all);
+        }
+        if help {
+            self.help = Some(HelpView::new("packages.free_space", t(lang, "Free space")));
+        }
+        if cancel {
+            self.freeing = None;
+        }
+        if go {
+            self.freeing = None;
+            let p = if all { json!({"all": true}) } else { json!({}) };
+            self.send(app, "system.package.snapshot.remove", p);
         }
     }
 }
@@ -671,6 +858,7 @@ impl PanelState for PackagesPanel {
     }
 
     fn dialogs(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, _area: egui::Rect) {
+        self.freeing_dialog(app, ctx);
         help::modal(ctx, app.lang, &mut self.help);
         let Some(ask) = self.ask.clone() else { return };
         let lang = app.lang.labels;
@@ -763,6 +951,21 @@ impl PanelState for PackagesPanel {
     }
 
     fn reply(&mut self, app: &mut CoreRouterUi, then: PanelThen, result: &Result<Value, String>) {
+        let then = match then.downcast::<Plan>() {
+            Ok(plan) => {
+                // An answer for the other choice is old news.
+                if let Some(f) = self.freeing.as_mut()
+                    && f.all == plan.0
+                {
+                    match result {
+                        Ok(v) => f.plan = v.clone(),
+                        Err(e) => f.error = Some(e.clone()),
+                    }
+                }
+                return;
+            }
+            Err(other) => other,
+        };
         let then = match then.downcast::<UpStart>() {
             Ok(_) => {
                 match (result, self.sending.as_mut()) {
@@ -821,6 +1024,9 @@ impl PanelState for PackagesPanel {
     }
 
     fn escape(&mut self, _win: &'static str) -> bool {
+        if self.freeing.take().is_some() {
+            return true;
+        }
         if self.ask.is_some() {
             self.ask = None;
             return true;
@@ -841,5 +1047,9 @@ mod tests {
         assert_eq!(state_chip(&v, "trial"), AMBER.tone(&v));
         assert_eq!(state_chip(&v, "failed"), RED.tone(&v));
         assert_eq!(mib(&json!({"x": 1_572_864}), "x"), "1.5 MiB");
+        assert_eq!(size(96), "96 B");
+        assert_eq!(size(1536), "2 KiB");
+        assert_eq!(size(13_811_709), "13.2 MiB");
+        assert_eq!(size(3 << 30), "3.0 GiB");
     }
 }
