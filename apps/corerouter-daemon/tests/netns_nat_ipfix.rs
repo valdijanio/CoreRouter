@@ -523,14 +523,26 @@ fn cgnat_blocks_and_limits_reach_sctp_tls_and_legacy_collectors() {
     let _sink = within(cp, || UdpSocket::bind("192.0.2.2:9").unwrap());
     std::thread::sleep(Duration::from_secs(2));
     let storm = |r: &Record| matches!(r, Record::PortBlock(b) if b.src.octets()[2] >= 128 && b.event == NatEventType::PortBlockAllocation);
+    // Every record of the storm's blocks, whatever the event: it is what the
+    // exporter's `nat_log` counter has to add up to at the end.
+    let of_storm = |r: &Record| matches!(r, Record::PortBlock(b) if b.src.octets()[2] >= 128);
+    let nat_log = || run("ip.traffic-flow.stats", json!({})).unwrap()["nat_log"].as_u64();
+    let nat_log0 = nat_log().unwrap();
     let cpu0 = cpu_ms(dpid);
     let t0 = Instant::now();
     // Rounds, as clients do: whoever got no block sends again. The kernel
-    // queue holds 4096 first packets (`nfqueue::MAXLEN`); one thread
-    // sending as fast as it can outruns it.
+    // queue holds 4096 first packets (`nfqueue::MAXLEN`); one thread sending
+    // as fast as it can outruns it, and how many rounds that takes depends on
+    // the CPU left (6 alone, more than 20 on two busy ones, G0.30d). So the
+    // limit is progress, not a number of rounds: a record that was lost never
+    // comes back (its subscriber has a block, the daemon logs nothing new),
+    // and then no new record arrives however many rounds go by.
+    const STALLED: Duration = Duration::from_secs(30);
+    const CEILING: Duration = Duration::from_secs(240);
     let mut rounds = 0;
     let mut sent = Duration::ZERO;
-    while rounds < 20 {
+    let (mut best, mut progress) = (0, Instant::now());
+    while progress.elapsed() < STALLED && t0.elapsed() < CEILING {
         rounds += 1;
         let have: std::collections::HashSet<Ipv4Addr> = sctp
             .lock()
@@ -544,6 +556,9 @@ fn cgnat_blocks_and_limits_reach_sctp_tls_and_legacy_collectors() {
             .collect();
         if have.len() >= n as usize {
             break;
+        }
+        if have.len() > best {
+            (best, progress) = (have.len(), Instant::now());
         }
         let t = Instant::now();
         within(bp, move || {
@@ -569,8 +584,18 @@ fn cgnat_blocks_and_limits_reach_sctp_tls_and_legacy_collectors() {
     }
     let took = t0.elapsed().saturating_sub(Duration::from_millis(500));
     let cpu = cpu_ms(dpid) - cpu0;
-    let (s_n, t_n) = (count(&sctp, &storm), count(&tls, &storm));
-    std::thread::sleep(Duration::from_millis(1500));
+    let s_n = count(&sctp, &storm);
+    // What the exporter logged has to arrive, however long the machine took:
+    // the counters settle first (the TLS writer may be behind), then they are
+    // compared, so a record lost on the way fails here.
+    let settled = Instant::now();
+    let reached = |g: &Shared| count(g, &of_storm) as u64 + nat_log0;
+    while settled.elapsed() < STALLED
+        && (reached(&sctp) != nat_log().unwrap() || reached(&tls) != nat_log().unwrap())
+    {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let t_n = count(&tls, &storm);
     let st = run("ip.traffic-flow.stats", json!({})).unwrap();
     eprintln!(
         "MEASURED PBA storm: {n} subscribers, {rounds} rounds of first packets ({:.3} s sending); {s_n} block records over SCTP and {t_n} over TLS, the last {:.2} s after the first packet ({:.0} blocks/s); daemon CPU {cpu} ms ({:.1} us/block); nat_log +{} dropped {}",
@@ -582,11 +607,13 @@ fn cgnat_blocks_and_limits_reach_sctp_tls_and_legacy_collectors() {
         st["nat_log_dropped"],
     );
     assert_eq!(st["nat_log_dropped"], 0, "{st}");
-    assert!(
-        s_n >= n as usize * 99 / 100,
-        "SCTP got {s_n} of {n} blocks: {st}"
-    );
+    assert_eq!(s_n, n as usize, "SCTP got {s_n} of {n} blocks: {st}");
     assert_eq!(s_n, t_n, "both collectors got every block");
+    assert_eq!(
+        st["nat_log"].as_u64(),
+        Some(reached(&sctp)),
+        "every record the exporter logged reached the collector: {st}"
+    );
 
     drop(daemon);
     let _ = std::fs::remove_dir_all(&dir);
