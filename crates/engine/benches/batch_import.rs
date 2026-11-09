@@ -43,6 +43,19 @@ fn secrets_from(base: usize, n: usize) -> Value {
     Value::Array(steps)
 }
 
+/// G0.18: static DHCP leases, one per client, as a `/import` brings them.
+fn leases(n: usize) -> Value {
+    let steps: Vec<Value> = (0..n)
+        .map(|i| {
+            json!({"command": "ip.dhcp-server.lease.add", "params": {
+                "address": format!("10.{}.{}.{}", 1 + i / 65_536, (i / 256) % 256, i % 256),
+                "mac_address": format!("02:00:00:{:02x}:{:02x}:{:02x}", (i >> 16) & 255, (i >> 8) & 255, i & 255),
+            }})
+        })
+        .collect();
+    Value::Array(steps)
+}
+
 fn bench(c: &mut Criterion) {
     // G4.3g: 100 000 secrets in batches of 10 000 (the batch limit) on one
     // session. The steps cost the same; the commit at the end of each batch
@@ -74,6 +87,19 @@ fn bench(c: &mut Criterion) {
     for n in [1000usize, 10_000] {
         let batch = secrets(n);
         g.bench_with_input(BenchmarkId::new("ppp_secret", n), &batch, |b, batch| {
+            b.iter_batched(
+                Session::virtual_lab,
+                |mut s| {
+                    s.batch(batch, true).unwrap();
+                    s
+                },
+                criterion::BatchSize::LargeInput,
+            );
+        });
+    }
+    for n in [1000usize, 10_000] {
+        let batch = leases(n);
+        g.bench_with_input(BenchmarkId::new("dhcp_lease", n), &batch, |b, batch| {
             b.iter_batched(
                 Session::virtual_lab,
                 |mut s| {

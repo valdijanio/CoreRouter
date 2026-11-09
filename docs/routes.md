@@ -145,8 +145,10 @@ RouterOS. Ordem (RFC 1812 §5.2.4.3, RFC 4632 §5.1):
 2. o prefixo mais longo entre as rotas **ativas** da tabela; um grupo ECMP dá todos os caminhos;
 3. nada → `unreachable`.
 
-A tabela é a pedida, a da VRF do `src` ou a `main`. Ainda não há regras de política
-(`/routing rule`, gap G1.27e): o campo `rule` diz como a tabela foi escolhida. O IP de origem segue a
+A tabela é a pedida ou, sem `table`, a que a lista de regras escolhe: marcas do mangle, VRF, `/routing
+rule` e `main` (`docs/policy-routing.md`). O campo `rule` diz como a tabela foi escolhida, `matched_rule`
+qual regra decidiu e `trace` por quais passou. `interface` e `routing_mark` simulam um pacote
+encaminhado e uma marca do mangle. O IP de origem segue a
 regra do kernel: o endereço da interface de saída cuja rede contém o gateway, senão o primeiro (no
 IPv6 sem link-local, uma versão simples da RFC 6724 §5 regra 2).
 
@@ -284,6 +286,6 @@ conectadas da `main`, porque essa tabela não tem interface própria; uma interf
 recusada. O id do kernel sai da mesma faixa das VRFs (1000 em diante) e fica gravado na config.
 `routing.table.list` mostra também a `main` e as VRFs, marcadas como dinâmicas.
 
-Remover uma tabela em uso é recusado: rotas, regras de mangle que marcam pacotes para ela e, com as
-regras de política, as regras que a usam. O flag `fib` do RouterOS é aceito ao colar um export;
+Remover uma tabela em uso é recusado: rotas, regras de mangle que marcam pacotes para ela e as
+regras de política que a usam. O flag `fib` do RouterOS é aceito ao colar um export;
 `fib=false` é recusado, porque toda tabela aqui entra no FIB.

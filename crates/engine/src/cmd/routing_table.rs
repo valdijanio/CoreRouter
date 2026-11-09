@@ -26,7 +26,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{name: string (nothing may use it: routes, mangle routing marks, routing rules)} → {name}",
         has_tables, remove),
     cmd!(query "routing.table.list", "Routing Tables", ["Routing", "Tables"], None,
-        "{} → [{name, table (kernel id), type (main | vrf | named), routes (static routes in it), marks (mangle rules that mark packets for it), dynamic (true: main and VRFs, not removable here), comment}]",
+        "{} → [{name, table (kernel id), type (main | vrf | named), routes (static routes in it), marks (mangle rules that mark packets for it), rules (routing rules that look in it), dynamic (true: main and VRFs, not removable here), comment}]",
         always, list),
 ];
 
@@ -148,6 +148,20 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
             "{n} mangle rule(s) mark packets for it (ip.firewall.mangle.list)"
         ));
     }
+    let rules: Vec<String> = cfg
+        .routing
+        .rules
+        .iter()
+        .filter(|r| r.action.looks_up() && r.table == table)
+        .take(8)
+        .map(|r| r.id.to_string())
+        .collect();
+    if !rules.is_empty() {
+        blockers.push(format!(
+            "routing rule {} looks in it (routing.rule.remove)",
+            rules.join(", ")
+        ));
+    }
     if !blockers.is_empty() {
         return Err(EngineError::bad(
             "name",
@@ -165,6 +179,10 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
         *routes.entry(&r.routing_table).or_default() += 1;
     }
     let marks = marks_of(cfg);
+    let mut rules: BTreeMap<&RoutingTable, usize> = BTreeMap::new();
+    for r in cfg.routing.rules.iter().filter(|r| r.action.looks_up()) {
+        *rules.entry(&r.table).or_default() += 1;
+    }
     let rows: Vec<Value> = tables_by_id(cfg)
         .into_iter()
         .map(|(id, table)| {
@@ -184,6 +202,7 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
                 "type": kind,
                 "routes": routes.get(&table).copied().unwrap_or(0),
                 "marks": marks.get(name.as_str()).copied().unwrap_or(0),
+                "rules": rules.get(&table).copied().unwrap_or(0),
                 "dynamic": named.is_none(),
                 "comment": named.map_or("", |t| t.comment.as_str()),
             })
