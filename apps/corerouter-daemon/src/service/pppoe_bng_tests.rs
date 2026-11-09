@@ -1667,3 +1667,156 @@ fn ipv6_on_the_slow_path_inside_qinq() {
     lab.bng.data_down(&back);
     assert!(lab.bng.frames.iter().all(|(_, f)| f.get(28..30) != Some(&[0x00, 0x57])), "no session, no frame");
 }
+
+// ---------------------------------------------------- limits of G4.3m
+
+/// A wrong password in a loop: `ppp.why` says locked out and why, the list
+/// shows it, RADIUS and the secrets are asked less and less, and the operator
+/// lets it back in.
+#[test]
+fn a_cpe_in_a_loop_is_locked_out_and_why_says_so() {
+    let srv = server(serde_json::json!({"short_cycle_protection": true, "lockout_time_min": 20, "lockout_time_max": 120}));
+    let mut lab = Lab::with(1, snap(1, srv, 10), |_| ("u0".into(), "errada".into()), |_, c| {
+        c.discovery_timeout_ms = 500;
+        c.discovery_attempts = 255;
+    });
+    // Dials again every 5 s, for 200 s (the lab's client stops at a refusal).
+    for _ in 0..40 {
+        lab.start(0..1);
+        lab.run(100, 50);
+    }
+    let mac = corerouter_model::MacAddr([0x02, 0x10, 0, 0, 0, 1]);
+    let be = lab.backend();
+    let w = be.why(None, Some(mac));
+    assert_eq!(w.last_stage, Some(Stage::Padi), "{w:?}");
+    let last = w.last.unwrap();
+    assert_eq!(last.reason, "short-cycle", "{last:?}");
+    assert_eq!(last.event, "failed");
+    // The hint names the real cause too.
+    assert!(last.hint.contains("auth-failed"), "{}", last.hint);
+    assert!(last.hint.contains("ppp.lockout.clear"));
+    lab.bng.tick(lab.now, &[]);
+    let st = be.stats();
+    assert!(st.short_cycles >= 2, "{st:?}");
+    assert!(st.short_cycle_refused >= 1, "{st:?}");
+    assert_eq!(st.locked_out, 1);
+    // Without protection, 40 logins; locked out 20, 40, 80, 120 s: at most 5.
+    assert!(st.auth_reject <= 5, "{st:?}");
+    let (total, rows) = be.lockouts(10);
+    assert_eq!(total, 1);
+    assert_eq!(rows[0].caller_id, mac.to_string());
+    assert_eq!(rows[0].reason, "auth-failed");
+    assert_eq!(rows[0].server, "pppoe-ether2");
+    assert!(rows[0].left_secs >= 1 && rows[0].left_secs <= 120, "{:?}", rows[0]);
+    // ppp.history is not filled by the dropped PADIs.
+    assert!(be.history().iter().all(|h| h.reason != "short-cycle"));
+    // Cleared: its next PADI is answered, even in a burst of them.
+    assert_eq!(be.lockout_clear(Some(mac)), 1);
+    assert_eq!(be.lockouts(10).0, 1, "the count waits for the next tick");
+    assert!(be.lockouts(10).1.is_empty(), "the row goes at once");
+    lab.bng.requests(lab.now);
+    lab.bng.tick(lab.now, &[]);
+    assert_eq!(be.stats().locked_out, 0);
+    assert_eq!(be.lockouts(10).0, 0);
+    lab.bng.check().unwrap();
+}
+
+/// A locked-out CPE spends none of the `new_session_rate`: the others get
+/// their sessions as if it were not there.
+#[test]
+fn a_host_locked_out_does_not_spend_the_session_rate() {
+    use corerouter_proto_pppoe::discovery::{Code, DiscoveryWriter, tag};
+    use corerouter_proto_pppoe::eth::Vlans;
+    let srv = server(serde_json::json!({"short_cycle_protection": true, "lockout_time_min": 600, "lockout_time_max": 600, "new_session_rate": 5}));
+    let mut lab = Lab::with(6, snap(6, srv, 10), |i| (format!("u{i}"), if i == 0 { "errada".into() } else { format!("p{i}") }), |_, c| {
+        c.discovery_timeout_ms = 500;
+        c.discovery_attempts = 255;
+    });
+    lab.start(0..1);
+    lab.run(100, 50);
+    let be = lab.backend();
+    lab.bng.tick(lab.now, &[]);
+    assert_eq!(be.stats().locked_out, 1);
+    let throttled = be.stats().throttled;
+    // A burst of its PADIs at one instant: more than the bucket holds.
+    let padi = |mac: [u8; 6]| {
+        let mut b = Vec::new();
+        let mut w = DiscoveryWriter::begin(&mut b, Mac::BROADCAST, Mac(mac), Vlans::NONE, Code::Padi, 0);
+        w.tag(tag::SERVICE_NAME, b"");
+        w.finish().unwrap();
+        b
+    };
+    for _ in 0..100 {
+        lab.bng.frame(lab.now, IFINDEX, &padi([0x02, 0x10, 0, 0, 0, 1]));
+    }
+    lab.bng.tick(lab.now, &[]);
+    assert_eq!(be.stats().throttled, throttled, "it took no token and no throttle");
+    // The bucket is whole: all five others come up.
+    lab.start(1..6);
+    lab.run(400, 50);
+    assert_eq!(lab.ups(), 5);
+}
+
+/// `max_sessions_per_mac` and `max_sessions_per_vlan` end in `ppp.why`.
+#[test]
+fn why_names_the_limit_that_refused() {
+    use corerouter_proto_pppoe::eth::Vlans;
+    let srv = server(serde_json::json!({
+        "pppoe_over_vlan_range": ["10"], "accept_untagged": false, "max_sessions_per_vlan": 1,
+    }));
+    let mut lab = Lab::with(2, snap(2, srv, 10), |i| (format!("u{i}"), format!("p{i}")), |_, c| {
+        c.vlans = Vlans::single(10);
+    });
+    lab.start(0..2);
+    lab.run(100, 50);
+    assert_eq!(lab.ups(), 1);
+    let loser = if lab.up[0] { 1u8 } else { 0 };
+    let w = lab.backend().why(None, Some(corerouter_model::MacAddr([0x02, 0x10, 0, 0, loser, 1])));
+    assert_eq!(w.last.unwrap().reason, "max-sessions-per-vlan");
+    lab.bng.tick(lab.now, &[]);
+    assert!(lab.backend().stats().vlan_refused >= 1);
+}
+
+/// Two workers, one VLAN: the limit is the server's (it was per worker,
+/// so 2 × the limit with two workers: `docs/pppoe.md` §13.2).
+#[test]
+fn the_vlan_limit_is_the_servers_with_several_workers() {
+    use corerouter_proto_pppoe::discovery::{Code, DiscoveryWriter, tag};
+    use corerouter_proto_pppoe::eth::Vlans;
+    let srv = server(serde_json::json!({
+        "pppoe_over_vlan_range": ["10"], "accept_untagged": false, "max_sessions_per_vlan": 3,
+    }));
+    let sn = snap(0, srv, 100);
+    let ports = HashMap::from([("pppoe-ether2".to_owned(), PortInfo { ifindex: IFINDEX, mac: BNG_MAC })]);
+    let mut w0 = Bng::first_of([7; 32], 2);
+    let mut w1 = w0.sibling([8; 32], 1, 2);
+    w0.configure(0, sn.clone(), &ports);
+    w1.configure(0, sn, &ports);
+    let dial = |w: &mut Bng, i: u8| -> bool {
+        let mac = Mac([0x02, 0x10, 0, 0, i, 1]);
+        let v = Vlans::single(10);
+        let mut b = Vec::new();
+        let mut d = DiscoveryWriter::begin(&mut b, Mac::BROADCAST, mac, v, Code::Padi, 0);
+        d.tag(tag::SERVICE_NAME, b"");
+        d.finish().unwrap();
+        w.frames.clear();
+        w.frame(0, IFINDEX, &b);
+        let Some((_, pado)) = w.frames.pop() else {
+            return false;
+        };
+        let pado = corerouter_proto_pppoe::discovery::parse(&pado).unwrap();
+        let mut b = Vec::new();
+        let mut d = DiscoveryWriter::begin(&mut b, Mac(BNG_MAC), mac, v, Code::Padr, 0);
+        d.tag(tag::SERVICE_NAME, b"");
+        d.tag(tag::AC_COOKIE, pado.tags.ac_cookie.unwrap());
+        d.finish().unwrap();
+        w.frame(0, IFINDEX, &b);
+        true
+    };
+    let w = [dial(&mut w0, 1), dial(&mut w1, 2), dial(&mut w0, 3), dial(&mut w1, 4), dial(&mut w0, 5)];
+    assert_eq!(w, [true, true, true, false, false], "the VLAN holds 3, whichever worker");
+    // A worker's server stops: its sessions leave the shared count.
+    drop(w0);
+    assert!(dial(&mut w1, 6));
+}
+

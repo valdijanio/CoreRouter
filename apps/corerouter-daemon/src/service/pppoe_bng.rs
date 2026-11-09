@@ -27,8 +27,8 @@ use corerouter_model::MacAddr;
 use corerouter_model::framed_route::{FramedRoute, RouteOrigin};
 use corerouter_model::ip_pool::IpPools;
 use corerouter_model::ppp::{
-    ActiveSession, AddrOrPool, DEFAULT_PROFILE, Effective, HistoryEntry, Ppp, PppAuth, PppHook,
-    PppService, PppoeServer, ServiceStats, Stage, Why,
+    ActiveSession, AddrOrPool, DEFAULT_PROFILE, Effective, HistoryEntry, LockedOut, Ppp, PppAuth,
+    PppHook, PppService, PppoeServer, ServiceStats, Stage, Why,
 };
 use corerouter_model::pppoe_services::{PppoeService, ServiceAction, ServiceName};
 use corerouter_model::pppoe_vlans::VlanMode;
@@ -44,9 +44,9 @@ use corerouter_proto_pppoe::layers::AuthSet;
 use corerouter_proto_pppoe::lcp::AuthProto;
 use corerouter_proto_pppoe::ppp::{self as wire_ppp, proto};
 use corerouter_proto_pppoe::server::{
-    AuthMethod, AuthVerdict, Authorization, DownReason, Event, Ipv4Assignment, Ipv6Mode, Server,
-    ServerConfig, ServerOutput, ServiceAction as ProtoAction, ServiceRule, ServiceTable,
-    SessionRef, VlanFilter,
+    AuthMethod, AuthVerdict, Authorization, DownReason, Event, Ipv4Assignment, Ipv6Mode, Refusal,
+    Server, ServerConfig, ServerOutput, ServiceAction as ProtoAction, ServiceRule, ServiceTable,
+    SessionRef, ShortCycle, VlanFilter, VlanShare,
 };
 use corerouter_proto_pppoe::timer::Millis;
 use corerouter_proto_pppoe::wire::Mac;
@@ -75,6 +75,12 @@ pub(crate) const XDP_SLOTS: u32 = 1 << 16;
 /// A subscriber's address-list entry is made again this often (dynamic
 /// entries last at most 35 days; the driver adds them for 35).
 const LIST_REFRESH_MS: u64 = 30 * 86_400_000;
+/// A lockout makes a log line from this many short cycles in a row.
+const LOCKOUT_LOG_FROM: u32 = 3;
+/// Lockouts a worker publishes for `ppp.lockout.list` (the count is exact).
+const LOCKOUT_ROWS: usize = 1000;
+/// Clears waiting for a worker (an operator's commands: few).
+const LOCKOUT_CLEARS: usize = 64;
 /// RADIUS answers older than this are dropped (the server gave up first).
 const RADIUS_GRACE_MS: u64 = 35_000;
 
@@ -156,6 +162,9 @@ pub(crate) struct Shared {
     pub lists: Vec<(String, String)>,
     /// Acct-Session-Id → session id.
     by_acct: HashMap<String, String>,
+    /// G4.3m: each server's count of sessions per VLAN, shared by the
+    /// workers.
+    vlan_shares: HashMap<corerouter_model::ItemId, VlanShare>,
     /// What each worker counts on its own (summed by [`Backend::stats`]).
     lanes: Vec<LaneStats>,
     /// G4.3cd: CoA route changes (session id, the new routes), checked
@@ -174,6 +183,21 @@ pub(crate) struct LaneStats {
     admission_rate: u32,
     admission_reason: Option<String>,
     counts: Counts,
+    /// G4.3m, refreshed once a second.
+    limits: Limits,
+    lockouts: Vec<LockedOut>,
+    /// Clears for this worker to do: a MAC, or all (`None`).
+    clear: Vec<Option<Mac>>,
+}
+
+/// What the limits of G4.3m refused, per worker.
+#[derive(Debug, Clone, Copy, Default)]
+struct Limits {
+    vlan: u64,
+    mac: u64,
+    short: u64,
+    cycles: u64,
+    locked: u64,
 }
 
 /// Discovery and login counters a worker keeps without the shared lock
@@ -248,6 +272,40 @@ impl WhyTable {
                 t.last_stage = Some(stage);
             }
         }
+    }
+
+    /// A refused PADI or PADR of MAC `key`. Asked several times a second
+    /// by a CPE locked out, so the same reason within a second costs no
+    /// allocation.
+    fn refused(
+        &mut self,
+        key: &str,
+        at: u64,
+        server: &str,
+        stage: Stage,
+        reason: &str,
+        hint: impl FnOnce() -> String,
+    ) {
+        let Some(t) = self.track(key) else {
+            return;
+        };
+        t.last_stage = Some(stage);
+        if t.last
+            .as_ref()
+            .is_some_and(|l| l.at == at && l.reason == reason)
+        {
+            return;
+        }
+        t.last = Some(Box::new(HistoryEntry {
+            at,
+            caller_id: key.to_owned(),
+            server: server.to_owned(),
+            event: "failed".into(),
+            stage: Some(stage),
+            reason: reason.to_owned(),
+            hint: hint(),
+            ..HistoryEntry::default()
+        }));
     }
 
     fn record(&mut self, keys: &[&str], h: &HistoryEntry) {
@@ -430,7 +488,46 @@ impl PppBackend for Backend {
             .filter(|a| a.link_local.is_some())
             .count() as u64;
         st.delegated = sh.active.values().filter(|a| a.delegated_bound).count() as u64;
+        let limit = |f: fn(&Limits) -> u64| sh.lanes.iter().map(|l| f(&l.limits)).sum::<u64>();
+        st.vlan_refused = limit(|l| l.vlan);
+        st.mac_refused = limit(|l| l.mac);
+        st.short_cycle_refused = limit(|l| l.short);
+        st.short_cycles = limit(|l| l.cycles);
+        st.locked_out = limit(|l| l.locked);
         st
+    }
+
+    fn lockouts(&self, limit: usize) -> (usize, Vec<LockedOut>) {
+        let sh = guard(&self.0);
+        let total = sh.lanes.iter().map(|l| l.limits.locked as usize).sum();
+        let rows = sh
+            .lanes
+            .iter()
+            .flat_map(|l| l.lockouts.iter().cloned())
+            .take(limit)
+            .collect();
+        (total, rows)
+    }
+
+    fn lockout_clear(&self, mac: Option<MacAddr>) -> usize {
+        let mut sh = guard(&self.0);
+        let text = mac.map(|m| m.to_string());
+        let mut n = 0;
+        for l in &mut sh.lanes {
+            n += match &text {
+                Some(t) => l.lockouts.iter().filter(|r| r.caller_id == *t).count(),
+                None => l.limits.locked as usize,
+            };
+            if l.clear.len() < LOCKOUT_CLEARS {
+                l.clear.push(mac.map(|m| Mac(m.0)));
+            }
+            // What the list shows goes at once, not at the next tick.
+            match &text {
+                Some(t) => l.lockouts.retain(|r| r.caller_id != *t),
+                None => l.lockouts.clear(),
+            }
+        }
+        n
     }
 
     fn who(&self, ip: Ipv4Addr) -> Option<String> {
@@ -1240,9 +1337,9 @@ pub(crate) struct Bng {
 
 /// One discovery or session frame's code and source, read before the
 /// server sees it (`ppp.why` counts, the session-rate limit).
-fn peek(frame: &[u8]) -> Option<(Code, Mac)> {
+fn peek(frame: &[u8]) -> Option<(Code, Mac, Vlans)> {
     let d = discovery::parse(frame).ok()?;
-    Some((d.code, d.src))
+    Some((d.code, d.src, d.vlans))
 }
 
 fn mac_text(m: Mac) -> String {
@@ -1301,6 +1398,12 @@ pub(crate) fn server_config(
     // G4.3l: RFC 4638 and sessions per VLAN.
     c.max_payload = v.max_payload;
     c.max_per_vlan = v.max_sessions_per_vlan;
+    // G4.3m: sessions per MAC and short-cycle protection.
+    c.max_per_mac = v.max_sessions_per_mac;
+    c.short_cycle = v.short_cycle_protection.then(|| ShortCycle {
+        min_ms: u64::from(v.lockout_time_min) * 1000,
+        max_ms: u64::from(v.lockout_time_max) * 1000,
+    });
     let ranges = |r: &[corerouter_model::ppp::VlanRange]| -> Vec<std::ops::RangeInclusive<u16>> {
         r.iter().map(|x| x.first..=x.last).collect()
     };
@@ -1358,6 +1461,32 @@ pub(crate) fn service_table(rows: &[PppoeService]) -> ServiceTable {
 }
 
 /// What a session ending means, for the log, the history and RADIUS.
+/// The key `ppp.why` gives a refusal (G4.3m).
+fn refusal_key(r: Refusal) -> &'static str {
+    match r {
+        Refusal::Service => "service-limit",
+        Refusal::Vlan => "max-sessions-per-vlan",
+        Refusal::Mac => "max-sessions-per-mac",
+        Refusal::ShortCycle { .. } => "short-cycle",
+    }
+}
+
+/// What to do about a refusal, in Portuguese (the "Why?" panel).
+fn refusal_hint(r: Refusal) -> String {
+    match r {
+        Refusal::Service => "A linha do Service-Name recusou: ação drop, ou max_sessions/padi_limit da linha (interface.pppoe-server.server.service.list).".to_owned(),
+        Refusal::Vlan => "A VLAN já tem o máximo de sessões (max_sessions_per_vlan): outro CPE ocupa a linha, ou aumente o limite.".to_owned(),
+        Refusal::Mac => "Este MAC já tem o máximo de sessões (max_sessions_per_mac): veja ppp.active.list por este MAC.".to_owned(),
+        Refusal::ShortCycle { left_ms, strikes, cause } => {
+            let (last, hint, ..) = explain(cause);
+            format!(
+                "Reconexão em loop: {strikes} sessões curtas seguidas, bloqueado por mais {} s. A última caiu por {last}: {hint} Para liberar agora: ppp.lockout.clear.",
+                left_ms.div_ceil(1000)
+            )
+        }
+    }
+}
+
 pub(crate) fn explain(r: DownReason) -> (&'static str, &'static str, Stage, u32) {
     // (reason, hint in Portuguese, stage, RFC 2866 §5.10 Acct-Terminate-Cause)
     match r {
@@ -1645,6 +1774,17 @@ impl Bng {
             // (`Reply::Ipv6` before the verdict); identifiers stable per line.
             sc.ipv6 = true;
             sc.ipv6_iid_key = Some(self.cfg.iid_key.unwrap_or(self.seed));
+            // G4.3m: with one tag a VLAN's subscribers split over the workers
+            // by MAC: `max_sessions_per_vlan` holds on a count they share.
+            if self.lanes > 1 {
+                sc.vlan_share = Some(
+                    guard(&self.shared)
+                        .vlan_shares
+                        .entry(w.id)
+                        .or_default()
+                        .clone(),
+                );
+            }
             // G4.3h: both nodes of a pair accept each other's AC-Cookie.
             let ha = &self.cfg.ppp.redundancy;
             sc.cookie_secret = (ha.enabled && !ha.secret.is_empty())
@@ -1770,11 +1910,18 @@ impl Bng {
         if self.ha_adopting() {
             self.ha_adopt_for(now, frame);
         }
-        if let Some((code, src)) = peek(frame) {
+        if let Some((code, src, vlans)) = peek(frame) {
             let key = mac_text(src);
             let sessions = self.subs.len();
+            let at = self.cfg.unix_base + now / 1000;
             let Some(slot) = self.slots.get_mut(i) else {
                 return;
+            };
+            let refused_full = |why: &Mutex<WhyTable>, server: &str| {
+                guard(why).refused(&key, at, server, Stage::Padi, "max-sessions", || {
+                    "O servidor está cheio (max_sessions): novas sessões só quando outra sair."
+                        .to_owned()
+                });
             };
             let full =
                 slot.cfg.max_sessions > 0 && slot.server.active() >= slot.cfg.max_sessions as usize;
@@ -1783,8 +1930,14 @@ impl Bng {
                     self.counts.padi += 1;
                     guard(&self.why).reach(&[&key], Stage::Padi);
                     if full {
+                        refused_full(&self.why, &slot.cfg.name);
                         return;
                     }
+                    // G4.3m: a PADI the server's limits will refuse (a host
+                    // locked out, a full VLAN or MAC) spends no token of
+                    // `new_session_rate`: a CPE in a loop would otherwise eat
+                    // the place of those who get a session.
+                    let refused = slot.server.refuses(now, ifindex, vlans, src);
                     // `new_session_rate` is spent at the PADI: no PADO, the
                     // CPE asks again (RFC 2516 §5.1: PADI retransmitted with
                     // back-off). At the PADR it would be worse: the CPE
@@ -1794,12 +1947,20 @@ impl Bng {
                     // logins queued here (about AUTO_BACKLOG_S of what it
                     // answers), not to the PADIs: a CPE told "no" backs off
                     // (RFC 2516 §5) and comes back late, idling the server.
-                    let held = if slot.cfg.new_session_rate_auto {
-                        let backlog = self.admission.backlog(self.lanes);
-                        self.pending_auth + self.auth_queue.len() >= backlog
-                    } else {
-                        !slot.bucket.allow(now)
+                    let (backlog, waiting) = (
+                        self.admission.backlog(self.lanes),
+                        self.pending_auth + self.auth_queue.len(),
+                    );
+                    let bucket = &mut slot.bucket;
+                    let auto = slot.cfg.new_session_rate_auto;
+                    let mut held = || {
+                        if auto {
+                            waiting >= backlog
+                        } else {
+                            !bucket.allow(now)
+                        }
                     };
+                    let held = !refused && held();
                     if !setting_up && held {
                         self.padr_throttled += 1;
                         return;
@@ -1808,6 +1969,7 @@ impl Bng {
                 Code::Padr => {
                     self.counts.padr += 1;
                     if full {
+                        refused_full(&self.why, &slot.cfg.name);
                         return;
                     }
                     guard(&self.why).reach(&[&key], Stage::Padr);
@@ -2316,7 +2478,45 @@ impl Bng {
                     self.failed_early(now, i, key.client_mac, reason);
                 }
             }
+            Event::Refused { mac, refusal, .. } => self.refused(now, i, mac, refusal),
+            Event::LockedOut {
+                mac,
+                strikes,
+                left_ms,
+                cause,
+                ..
+            } => {
+                // Past the third in a row it is a loop, worth a log line; one
+                // per lockout, not per PADI.
+                if strikes >= LOCKOUT_LOG_FROM {
+                    let (why, ..) = explain(cause);
+                    self.log(
+                        false,
+                        format!(
+                            "PPP: {} reconectando em loop ({why}, {strikes} seguidas): bloqueado por {} s",
+                            mac_text(mac),
+                            left_ms.div_ceil(1000)
+                        ),
+                    );
+                }
+            }
         }
+    }
+
+    /// A limit refused a PADI or PADR: what `ppp.why` says (G4.3m). Only in
+    /// the "Why?" table, not in `ppp.history`: a CPE locked out asks several
+    /// times a minute, and a flood would push the history out.
+    fn refused(&mut self, now: Millis, i: usize, mac: Mac, refusal: Refusal) {
+        let at = self.cfg.unix_base + now / 1000;
+        let server = self
+            .slots
+            .get(i)
+            .map(|s| s.cfg.name.as_str())
+            .unwrap_or_default();
+        let key = mac_text(mac);
+        guard(&self.why).refused(&key, at, server, Stage::Padi, refusal_key(refusal), || {
+            refusal_hint(refusal)
+        });
     }
 
     fn reject(&mut self, i: usize, sref: SessionRef, why: &str) {
@@ -3311,6 +3511,7 @@ impl Bng {
             .map(|s| s.server.stats().padi_limited)
             .sum();
         let throttled = self.padr_throttled + limited;
+        let (limits, lockouts) = self.limits(now);
         // new_session_rate=auto: one AIMD step a second.
         self.admission
             .second(self.padr_throttled + self.queued_total, self.pending_auth);
@@ -3331,12 +3532,12 @@ impl Bng {
                 sh.lanes.resize(lane + 1, LaneStats::default());
             }
             if let Some(l) = sh.lanes.get_mut(lane) {
-                *l = LaneStats {
-                    throttled,
-                    admission_rate: if auto { rate } else { 0 },
-                    admission_reason: auto.then(|| self.admission.reason.clone()),
-                    counts: self.counts,
-                };
+                l.throttled = throttled;
+                l.admission_rate = if auto { rate } else { 0 };
+                l.admission_reason = auto.then(|| self.admission.reason.clone());
+                l.counts = self.counts;
+                l.limits = limits;
+                l.lockouts = lockouts;
             }
         }
         let mut ending: Vec<(usize, SessionRef, (u32, &'static str))> = Vec::new();
@@ -3420,6 +3621,44 @@ impl Bng {
     }
 
     /// `ppp.active.remove`, Disconnect and CoA rate changes.
+    /// The counts of G4.3m and the hosts locked out now, for the shared
+    /// state (once a second: a walk of the fixed table, ~16 000 entries).
+    fn limits(&self, now: Millis) -> (Limits, Vec<LockedOut>) {
+        let mut l = Limits::default();
+        let mut rows = Vec::new();
+        for s in &self.slots {
+            let st = s.server.stats();
+            l.vlan += st.vlan_refused;
+            l.mac += st.mac_refused;
+            l.short += st.short_cycle_refused;
+            l.cycles += st.short_cycles;
+            for x in s.server.lockouts(now) {
+                l.locked += 1;
+                if rows.len() < LOCKOUT_ROWS {
+                    rows.push(LockedOut {
+                        caller_id: mac_text(x.mac),
+                        server: s.cfg.name.clone(),
+                        vlan: (x.vlans.outer != 0).then_some(x.vlans.outer),
+                        inner_vlan: (x.vlans.inner != 0).then_some(x.vlans.inner),
+                        strikes: x.strikes,
+                        left_secs: x.left_ms.div_ceil(1000),
+                        reason: explain(x.cause).0.to_owned(),
+                    });
+                }
+            }
+        }
+        (l, rows)
+    }
+
+    /// `ppp.lockout.clear` for this worker.
+    fn lockout_clears(&mut self, now: Millis, clears: Vec<Option<Mac>>) {
+        for c in clears {
+            for s in &mut self.slots {
+                s.server.clear_lockouts(now, c);
+            }
+        }
+    }
+
     pub(crate) fn requests(&mut self, now: Millis) {
         // Each worker takes the requests for its own SESSION_IDs and leaves
         // the rest for the others (the id says which: `*server-sid`).
@@ -3427,6 +3666,16 @@ impl Bng {
         let mine = |id: &str| parse_session_id(id).is_none_or(|(_, sid)| sid % lanes == lane);
         let (ids, rates, lists, changes) = {
             let mut sh = guard(&self.shared);
+            let clears = sh
+                .lanes
+                .get_mut(usize::from(lane))
+                .map(|l| std::mem::take(&mut l.clear))
+                .unwrap_or_default();
+            if !clears.is_empty() {
+                drop(sh);
+                self.lockout_clears(now, clears);
+                sh = guard(&self.shared);
+            }
             if sh.terminate.is_empty()
                 && sh.rates.is_empty()
                 && sh.lists.is_empty()

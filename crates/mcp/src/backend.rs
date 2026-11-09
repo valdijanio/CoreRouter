@@ -60,6 +60,8 @@ pub struct Remote {
     /// What the router's boot left out of the data plane, as `auth.whoami`
     /// said at the last login (G1.3e): "section: why".
     boot_errors: Vec<String>,
+    /// Cards without a driver or firmware, as `auth.whoami` said (G1.6ja).
+    nic_problems: Vec<String>,
 }
 
 /// The warning every client shows while the boot left part of the config
@@ -93,6 +95,22 @@ pub fn no_password_warning(users: &[String]) -> Option<String> {
     ))
 }
 
+/// The warning while a network card has no driver or firmware (G1.6ja).
+pub fn nic_warning(lines: &[String]) -> Option<String> {
+    if lines.is_empty() {
+        return None;
+    }
+    let list: Vec<String> = lines.iter().map(|l| l.chars().take(200).collect()).collect();
+    Some(format!(
+        "WARNING: network card problem: {}. See interface.hardware-problem.print.",
+        list.join("; ")
+    ))
+}
+
+/// A login: the client, whether it has a UI, and the warnings `auth.whoami`
+/// gave (no password, boot errors, network cards).
+type Opened = (Client, bool, Vec<String>, Vec<String>, Vec<String>);
+
 /// How long a (re)connection may take.
 const DIAL_TIMEOUT: Duration = Duration::from_millis(2000);
 
@@ -116,7 +134,7 @@ impl Remote {
         known: &mut KnownHosts,
         trust: &mut dyn Trust,
     ) -> Result<Self, String> {
-        let (client, has_ui, no_password, boot_errors) = Self::open(target, login, known, trust)?;
+        let (client, has_ui, no_password, boot_errors, nic_problems) = Self::open(target, login, known, trust)?;
         Ok(Self {
             pinned: client.fingerprint().map(str::to_owned),
             client: Some(client),
@@ -125,6 +143,7 @@ impl Remote {
             login: login.clone(),
             no_password,
             boot_errors,
+            nic_problems,
         })
     }
 
@@ -138,12 +157,13 @@ impl Remote {
         login: &Login,
         known: &mut KnownHosts,
         trust: &mut dyn Trust,
-    ) -> Result<(Client, bool, Vec<String>, Vec<String>), String> {
+    ) -> Result<Opened, String> {
         let mut client = dial(target, DIAL_TIMEOUT, login, known, trust)?;
         let info = client.call("server.info", Value::Null)?;
         let has_ui = info.get("has_ui").and_then(Value::as_bool).unwrap_or(false);
         let mut no_password = Vec::new();
         let mut boot_errors = Vec::new();
+        let mut nic_problems = Vec::new();
         if !matches!(login, Login::Nothing) {
             let me = client.call("auth.whoami", Value::Null).map_err(|e| {
                 if e.starts_with(UNAUTHORIZED) && !target.tls {
@@ -183,8 +203,20 @@ impl Remote {
             if let Some(w) = boot_warning(&boot_errors) {
                 log::warn!("{target}: {w}");
             }
+            nic_problems = me
+                .get("nic_problems")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .take(16)
+                .map(str::to_owned)
+                .collect();
+            if let Some(w) = nic_warning(&nic_problems) {
+                log::warn!("{target}: {w}");
+            }
         }
-        Ok((client, has_ui, no_password, boot_errors))
+        Ok((client, has_ui, no_password, boot_errors, nic_problems))
     }
 
     /// A live connection: the one we have, or a new one when the router
@@ -196,7 +228,7 @@ impl Remote {
         }
         if self.client.is_none() {
             let mut trust = Expect(self.pinned.clone().unwrap_or_default());
-            let (client, has_ui, no_password, boot_errors) = Self::open(
+            let (client, has_ui, no_password, boot_errors, nic_problems) = Self::open(
                 &self.target,
                 &self.login,
                 &mut KnownHosts::load_default(),
@@ -213,6 +245,7 @@ impl Remote {
             self.has_ui = has_ui;
             self.no_password = no_password;
             self.boot_errors = boot_errors;
+            self.nic_problems = nic_problems;
             self.client = Some(client);
         }
         self.client
@@ -280,13 +313,25 @@ impl Backend for Remote {
             d.push_str(". ");
             d.push_str(w.trim_end_matches('.'));
         }
+        if let Some(w) = nic_warning(&self.nic_problems) {
+            d.push_str(". ");
+            d.push_str(w.trim_end_matches('.'));
+        }
         d
     }
 }
 
 #[cfg(test)]
 mod boot_warning_tests {
-    use super::boot_warning;
+    use super::{boot_warning, nic_warning};
+
+    #[test]
+    fn warns_about_a_card_and_points_at_the_command() {
+        assert!(nic_warning(&[]).is_none());
+        let w = nic_warning(&["ether7: ice in Safe Mode, one queue, no XDP (intel/ice/ddp/ice.pkg)".into()]).unwrap();
+        assert!(w.contains("ice.pkg"), "{w}");
+        assert!(w.contains("interface.hardware-problem.print"), "{w}");
+    }
 
     #[test]
     fn warns_only_with_boot_errors_and_keeps_the_kernel_reason() {

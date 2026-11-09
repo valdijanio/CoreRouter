@@ -252,6 +252,13 @@ pub fn whoami(s: &crate::Session, principal: &Principal, via: &str) -> Value {
     {
         o.insert("boot_errors".into(), serde_json::to_value(boot).unwrap_or_default());
     }
+    // G1.6ja: a card with no driver or firmware, so every client warns too.
+    let cards = s.nic_problem_lines();
+    if !cards.is_empty()
+        && let Some(o) = out.as_object_mut()
+    {
+        o.insert("nic_problems".into(), Value::from(cards));
+    }
     out
 }
 

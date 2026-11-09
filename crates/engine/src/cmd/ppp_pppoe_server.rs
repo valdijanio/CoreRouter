@@ -7,8 +7,8 @@
 //! `force=yes`.
 
 use corerouter_model::ppp::{
-    LoadDelay, MAX_MTU, MAX_PADO_DELAY, MAX_PPPOE_SERVERS, MIN_MTU, PppAuth, PppoeServer,
-    VlanRange,
+    LoadDelay, MAX_LOCKOUT, MAX_MTU, MAX_PADO_DELAY, MAX_PPPOE_SERVERS, MIN_MTU, PppAuth,
+    PppoeServer, VlanRange,
 };
 use corerouter_model::{IfName, ItemId};
 use serde_json::{Value, json};
@@ -24,10 +24,10 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("interface.pppoe-server.server.add", "Add PPPoE Server", [], None,
-        "{interface: string, name?: string (default pppoe-<interface>), service_name?: string (RouterOS: this name and the empty one; empty: any), services?: [{name, profile?, action?, pado_delay?, max_sessions?, padi_limit?}] | string (the Service-Name table, G4.3k: name is a Service-Name, empty or any; action terminate|delay|drop; the same list as JSON text), max_mtu?: int 64..1492 (default 1480), max_mru?: int 64..1492 (default 1480), mrru?: int 512..65535 | disabled, authentication?: [mschap2|mschap1|chap|pap] | string (default all four), keepalive_timeout?: int 1..3600 (s; disabled: no LCP echo) , one_session_per_host?: bool (default yes), max_sessions?: int 0..65534 (0: no limit), pado_delay?: int 0..30000 (ms), default_profile?: string (default default), pppoe_over_vlan_range?: string (100-115,120) | [string], accept_untagged?: bool (default yes), vlan_mode?: single|stacked (G4.3l: stacked = QinQ, two tags), outer_vlan_range?: string (stacked: the S-tags, 100-199,300; at most 512) | [string], inner_vlan_range?: string (stacked: the C-tags; any or empty: all) | [string], outer_tpid?: 0x88a8|0x8100 (stacked: the S-tag's, default 0x88a8), max_sessions_per_vlan?: int (sessions per VLAN, the pair in stacked mode; 1 = TR-101 1:1; 0: no limit), max_payload?: int 1493..1500 | none (RFC 4638 PPP-Max-Payload accepted; none: 1492), ac_cookie?: bool (default yes, RFC 2516 §9), padi_limit?: int (PADIs answered per second, default 2000; 0: none), mac_padi_limit?: int (per MAC per second, default 1; 0: none), new_session_rate?: int | auto (sessions accepted per second, default 2000; 0: none; auto: follows the RADIUS server's health, 1000 up to 20000), pado_delay_by_load?: string (sessions:ms,… as 5000:100,20000:300) | [string], disabled?: bool, comment?: string} → {id, name, warnings}",
+        "{interface: string, name?: string (default pppoe-<interface>), service_name?: string (RouterOS: this name and the empty one; empty: any), services?: [{name, profile?, action?, pado_delay?, max_sessions?, padi_limit?}] | string (the Service-Name table, G4.3k: name is a Service-Name, empty or any; action terminate|delay|drop; the same list as JSON text), max_mtu?: int 64..1492 (default 1480), max_mru?: int 64..1492 (default 1480), mrru?: int 512..65535 | disabled, authentication?: [mschap2|mschap1|chap|pap] | string (default all four), keepalive_timeout?: int 1..3600 (s; disabled: no LCP echo) , one_session_per_host?: bool (default yes), max_sessions?: int 0..65534 (0: no limit), pado_delay?: int 0..30000 (ms), default_profile?: string (default default), pppoe_over_vlan_range?: string (100-115,120) | [string], accept_untagged?: bool (default yes), vlan_mode?: single|stacked (G4.3l: stacked = QinQ, two tags), outer_vlan_range?: string (stacked: the S-tags, 100-199,300; at most 512) | [string], inner_vlan_range?: string (stacked: the C-tags; any or empty: all) | [string], outer_tpid?: 0x88a8|0x8100 (stacked: the S-tag's, default 0x88a8), max_sessions_per_vlan?: int (sessions per VLAN, the pair in stacked mode; 1 = TR-101 1:1; 0: no limit), max_sessions_per_mac?: int (sessions per MAC on the port; 0: no limit), short_cycle_protection?: bool (default no; lock out a host whose sessions keep ending within 150 s), lockout_time_min?: int 1..86400 (s, default 1), lockout_time_max?: int 1..86400 (s, default 300; lockout = min × 2^(n-1), up to this), max_payload?: int 1493..1500 | none (RFC 4638 PPP-Max-Payload accepted; none: 1492), ac_cookie?: bool (default yes, RFC 2516 §9), padi_limit?: int (PADIs answered per second, default 2000; 0: none), mac_padi_limit?: int (per MAC per second, default 1; 0: none), new_session_rate?: int | auto (sessions accepted per second, default 2000; 0: none; auto: follows the RADIUS server's health, 1000 up to 20000), pado_delay_by_load?: string (sessions:ms,… as 5000:100,20000:300) | [string], disabled?: bool, comment?: string} → {id, name, warnings}",
         always, add),
     cmd!("interface.pppoe-server.server.set", "Set PPPoE Server", [], None,
-        "{id: *hex | name, interface?: string, name?: string, service_name?: string, services?: [{name, profile?, action?, pado_delay?, max_sessions?, padi_limit?}] | string, max_mtu?: int 64..1492, max_mru?: int 64..1492, mrru?: int 512..65535 | disabled, authentication?: [mschap2|mschap1|chap|pap] | string, keepalive_timeout?: int 1..3600 | disabled, one_session_per_host?: bool, max_sessions?: int 0..65534, pado_delay?: int 0..30000, default_profile?: string, pppoe_over_vlan_range?: string | [string], accept_untagged?: bool, vlan_mode?: single|stacked, outer_vlan_range?: string | [string], inner_vlan_range?: string | [string], outer_tpid?: 0x88a8|0x8100, max_sessions_per_vlan?: int, max_payload?: int 1493..1500 | none, ac_cookie?: bool, padi_limit?: int, mac_padi_limit?: int, new_session_rate?: int | auto, pado_delay_by_load?: string | [string], disabled?: bool, comment?: string, force?: bool (apply even if it drops active sessions)} → {id, name, warnings, dropped}",
+        "{id: *hex | name, interface?: string, name?: string, service_name?: string, services?: [{name, profile?, action?, pado_delay?, max_sessions?, padi_limit?}] | string, max_mtu?: int 64..1492, max_mru?: int 64..1492, mrru?: int 512..65535 | disabled, authentication?: [mschap2|mschap1|chap|pap] | string, keepalive_timeout?: int 1..3600 | disabled, one_session_per_host?: bool, max_sessions?: int 0..65534, pado_delay?: int 0..30000, default_profile?: string, pppoe_over_vlan_range?: string | [string], accept_untagged?: bool, vlan_mode?: single|stacked, outer_vlan_range?: string | [string], inner_vlan_range?: string | [string], outer_tpid?: 0x88a8|0x8100, max_sessions_per_vlan?: int, max_sessions_per_mac?: int, short_cycle_protection?: bool, lockout_time_min?: int 1..86400, lockout_time_max?: int 1..86400, max_payload?: int 1493..1500 | none, ac_cookie?: bool, padi_limit?: int, mac_padi_limit?: int, new_session_rate?: int | auto, pado_delay_by_load?: string | [string], disabled?: bool, comment?: string, force?: bool (apply even if it drops active sessions)} → {id, name, warnings, dropped}",
         has_servers, set),
     cmd!("interface.pppoe-server.server.remove", "Remove PPPoE Server", [], None,
         "{id: *hex | name, force?: bool (remove even with sessions up)} → {id, name, dropped}",
@@ -38,13 +38,13 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{id: *hex | name, force?: bool (disable even with sessions up)} → {id, name, dropped}",
         has_servers, disable),
     cmd!(query "interface.pppoe-server.server.list", "PPPoE Servers", [], None,
-        "{} → [{id, name, interface, service_name? (the names served, comma-separated), services (the Service-Name table as JSON text, as services= takes it; per row with sessions: interface.pppoe-server.server.service.list), max_mtu, max_mru, mrru, authentication, keepalive_timeout, one_session_per_host, max_sessions, pado_delay, default_profile, pppoe_over_vlan_range, accept_untagged, vlan_mode, outer_vlan_range, inner_vlan_range (empty: any), outer_tpid, max_sessions_per_vlan, max_payload (none or the RFC 4638 cap), ac_cookie, padi_limit, mac_padi_limit, new_session_rate, pado_delay_by_load, disabled, comment?, flags (X disabled), sessions (up now), admission_rate? (new_session_rate=auto: the rate now), admission_reason?, warnings}]",
+        "{} → [{id, name, interface, service_name? (the names served, comma-separated), services (the Service-Name table as JSON text, as services= takes it; per row with sessions: interface.pppoe-server.server.service.list), max_mtu, max_mru, mrru, authentication, keepalive_timeout, one_session_per_host, max_sessions, pado_delay, default_profile, pppoe_over_vlan_range, accept_untagged, vlan_mode, outer_vlan_range, inner_vlan_range (empty: any), outer_tpid, max_sessions_per_vlan, max_sessions_per_mac, short_cycle_protection, lockout_time_min, lockout_time_max, max_payload (none or the RFC 4638 cap), ac_cookie, padi_limit, mac_padi_limit, new_session_rate, pado_delay_by_load, disabled, comment?, flags (X disabled), sessions (up now), admission_rate? (new_session_rate=auto: the rate now), admission_reason?, warnings}]",
         always, list),
     cmd!(query "interface.pppoe-server.server.preview", "PPPoE Server Preview", [], None,
-        "{id?: *hex | name, interface?: string, name?: string, service_name?: string, max_mtu?: string, max_mru?: string, mrru?: string, authentication?: string, keepalive_timeout?: string, one_session_per_host?: bool, max_sessions?: string, pado_delay?: string, default_profile?: string, pppoe_over_vlan_range?: string, accept_untagged?: bool, vlan_mode?: string, outer_vlan_range?: string, inner_vlan_range?: string, outer_tpid?: string, max_sessions_per_vlan?: string, max_payload?: string, ac_cookie?: bool, padi_limit?: string, mac_padi_limit?: string, new_session_rate?: string, pado_delay_by_load?: string, disabled?: bool, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk?}",
+        "{id?: *hex | name, interface?: string, name?: string, service_name?: string, max_mtu?: string, max_mru?: string, mrru?: string, authentication?: string, keepalive_timeout?: string, one_session_per_host?: bool, max_sessions?: string, pado_delay?: string, default_profile?: string, pppoe_over_vlan_range?: string, accept_untagged?: bool, vlan_mode?: string, outer_vlan_range?: string, inner_vlan_range?: string, outer_tpid?: string, max_sessions_per_vlan?: string, max_sessions_per_mac?: string, short_cycle_protection?: bool, lockout_time_min?: string, lockout_time_max?: string, max_payload?: string, ac_cookie?: bool, padi_limit?: string, mac_padi_limit?: string, new_session_rate?: string, pado_delay_by_load?: string, disabled?: bool, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk?}",
         always, preview),
     cmd!(query "interface.pppoe-server.monitor", "PPPoE Server Monitor", [], None,
-        "{} → {running, sessions, padi, pado, padr, pads, padt_rx, padt_tx, auth_accept, auth_reject, throttled, dataplane, admission_rate (new_session_rate=auto now; 0: no server uses it), admission_reason?, last_error?, ipv6_sessions (IPv6CP up), delegated (DHCPv6-PD held), ipv6_dropped (ND/DHCPv6 refused), rx_dropped (frames lost before the BNG read them: a burst past its queues)}",
+        "{} → {running, sessions, padi, pado, padr, pads, padt_rx, padt_tx, auth_accept, auth_reject, throttled, dataplane, admission_rate (new_session_rate=auto now; 0: no server uses it), admission_reason?, last_error?, ipv6_sessions (IPv6CP up), delegated (DHCPv6-PD held), ipv6_dropped (ND/DHCPv6 refused), rx_dropped (frames lost before the BNG read them: a burst past its queues), vlan_refused, mac_refused (PADIs and PADRs refused by max_sessions_per_vlan and max_sessions_per_mac), short_cycle_refused (dropped from hosts locked out), short_cycles (lockouts started), locked_out (hosts locked out now)}",
         always, monitor),
 ];
 
@@ -258,6 +258,27 @@ fn apply(s: &Session, v: &mut PppoeServer, p: &Value) -> Result<()> {
             return Err(EngineError::bad("max_sessions_per_vlan", "0..=65534"));
         }
         v.max_sessions_per_vlan = n;
+    }
+    if let Some(n) = opt_u32(p, "max_sessions_per_mac")? {
+        if n > u32::from(proto_max_sid()) {
+            return Err(EngineError::bad("max_sessions_per_mac", "0..=65534"));
+        }
+        v.max_sessions_per_mac = n;
+    }
+    if let Some(b) = opt_bool(p, "short_cycle_protection")? {
+        v.short_cycle_protection = b;
+    }
+    for (key, field) in [("lockout_time_min", &mut v.lockout_time_min), ("lockout_time_max", &mut v.lockout_time_max)] {
+        if let Some(n) = opt_u32(p, key)? {
+            if !(1..=MAX_LOCKOUT).contains(&n) {
+                return Err(EngineError::bad(key, format!("1..={MAX_LOCKOUT} seconds")));
+            }
+            *field = n;
+        }
+    }
+    // Junos: minimum ≤ maximum; equal makes the lockout a fixed time.
+    if v.lockout_time_min > v.lockout_time_max {
+        return Err(EngineError::bad("lockout_time_min", format!("{} is above lockout_time_max {}", v.lockout_time_min, v.lockout_time_max)));
     }
     if let Some(m) = int_or_disabled(p, "max_payload", 1492..=u32::from(MAX_PAYLOAD))? {
         // 1492 is RFC 2516's own: nothing to agree on.
@@ -495,6 +516,10 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
                 "inner_vlan_range": if v.inner_vlan_range.is_empty() { "any".to_owned() } else { v.inner_vlan_range.iter().map(ToString::to_string).collect::<Vec<_>>().join(",") },
                 "outer_tpid": v.outer_tpid.to_string(),
                 "max_sessions_per_vlan": v.max_sessions_per_vlan,
+                "max_sessions_per_mac": v.max_sessions_per_mac,
+                "short_cycle_protection": v.short_cycle_protection,
+                "lockout_time_min": v.lockout_time_min,
+                "lockout_time_max": v.lockout_time_max,
                 "max_payload": v.max_payload.map_or_else(|| json!("none"), |m| json!(m)),
                 "ac_cookie": v.ac_cookie,
                 "padi_limit": v.padi_limit,
@@ -534,7 +559,7 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
 fn preview(s: &mut Session, p: &Value) -> Result<Value> {
     let mut q = p.clone();
     if let Some(o) = q.as_object_mut() {
-        for k in ["max_mtu", "max_mru", "max_sessions", "pado_delay", "padi_limit", "mac_padi_limit", "new_session_rate", "keepalive_timeout", "mrru", "max_sessions_per_vlan", "max_payload"] {
+        for k in ["max_mtu", "max_mru", "max_sessions", "pado_delay", "padi_limit", "mac_padi_limit", "new_session_rate", "keepalive_timeout", "mrru", "max_sessions_per_vlan", "max_sessions_per_mac", "lockout_time_min", "lockout_time_max", "max_payload"] {
             if let Some(n) = o.get(k).and_then(Value::as_str).and_then(|t| t.trim().parse::<u64>().ok()) {
                 o.insert(k.into(), json!(n));
             }
@@ -590,7 +615,8 @@ fn monitor(s: &mut Session, _: &Value) -> Result<Value> {
     let Some(b) = s.ppp_backend() else {
         return Ok(json!({"running": false, "sessions": 0, "padi": 0, "pado": 0, "padr": 0, "pads": 0,
             "padt_rx": 0, "padt_tx": 0, "auth_accept": 0, "auth_reject": 0, "throttled": 0, "dataplane": false, "admission_rate": 0,
-            "ipv6_sessions": 0, "delegated": 0, "ipv6_dropped": 0, "rx_dropped": 0}));
+            "ipv6_sessions": 0, "delegated": 0, "ipv6_dropped": 0, "rx_dropped": 0,
+            "vlan_refused": 0, "mac_refused": 0, "short_cycle_refused": 0, "short_cycles": 0, "locked_out": 0}));
     };
     let st = b.stats();
     let mut v = serde_json::to_value(&st).map_err(|e| EngineError::bad("stats", e.to_string()))?;
