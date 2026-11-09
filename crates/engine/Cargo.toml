@@ -44,6 +44,11 @@ criterion.workspace = true
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 proptest.workspace = true
 
+# G4.6c: an allow list that names a big address list.
+[[bench]]
+name = "ntp_sources"
+harness = false
+
 [[bench]]
 name = "cgnat_pba_storm"
 harness = false

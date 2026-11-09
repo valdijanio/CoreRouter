@@ -1058,7 +1058,10 @@ fn wrapped_and_terse_export_round_trip() {
     let screen = a.ok("/export");
     assert!(screen.contains(" \\\n    "), "{screen}");
     for l in screen.lines().filter(|l| !l.starts_with('#')) {
-        assert!(l.chars().count() <= 48, "{l:?} in:\n{screen}");
+        // One argument longer than the width stays whole on its own line
+        // (the NTP server's default `allowed`, G4.6c): a value is never cut.
+        let alone = l.trim_end_matches(" \\").split_whitespace().count() == 1;
+        assert!(l.chars().count() <= 48 || alone, "{l:?} in:\n{screen}");
     }
     // A quoted value is never cut.
     assert!(screen.contains("comment=\"uplink to the ISP\""), "{screen}");

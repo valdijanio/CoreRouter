@@ -534,3 +534,71 @@ fn many_rules_say_what_they_cost() {
         "{last}"
     );
 }
+
+#[test]
+fn the_preview_checks_what_add_would_do() {
+    let mut s = lab();
+    let v = ok(
+        &mut s,
+        "routing.rule.preview",
+        json!({
+            "src_address": "10.91.0.0/24", "action": "lookup", "table": "isp2", "min_prefix": "",
+            "disabled": "no", "comment": ""
+        }),
+    );
+    assert_eq!(v["checks"], json!([]), "{v}");
+    assert_eq!(v["commands"][0]["command"], "routing.rule.add");
+    assert_eq!(v["commands"][0]["params"]["table"], "isp2");
+    assert_eq!(v["computed"][1]["value"], "2000");
+    let v = ok(
+        &mut s,
+        "routing.rule.preview",
+        json!({"src_address": "10.0.0.1/24"}),
+    );
+    assert_eq!(v["checks"][0]["param"], "src_address", "{v}");
+    assert_eq!(v["commands"], json!([]));
+    let v = ok(&mut s, "routing.rule.preview", json!({"table": "empty"}));
+    assert_eq!(v["checks"][0]["level"], "warning", "{v}");
+
+    let r = ok(
+        &mut s,
+        "routing.rule.add",
+        json!({"src_address": "10.91.0.0/24", "interface": "ether3"}),
+    );
+    let v = ok(
+        &mut s,
+        "routing.rule.preview",
+        json!({
+            "id": r["id"], "src_address": "10.91.0.0/24", "interface": "", "action": "drop", "table": "main"
+        }),
+    );
+    assert_eq!(v["commands"][0]["command"], "routing.rule.set", "{v}");
+    assert_eq!(v["commands"][0]["params"]["interface"], Value::Null);
+    let v = ok(&mut s, "routing.rule.preview", json!({"id": "*FFFF"}));
+    assert_eq!(v["checks"][0]["param"], "id", "{v}");
+
+    // The risk to this session comes back for the modal to ask.
+    let me = remote();
+    let v = s
+        .execute_as(
+            &me,
+            "routing.rule.preview",
+            &json!({"dst_address": "203.0.113.0/24", "action": "drop"}),
+        )
+        .unwrap();
+    assert!(
+        v["risk"].as_str().unwrap().contains("stop the replies"),
+        "{v}"
+    );
+
+    let t = ok(&mut s, "routing.table.preview", json!({"name": "isp3"}));
+    assert_eq!(t["commands"][0]["command"], "routing.table.add");
+    let t = ok(&mut s, "routing.table.preview", json!({"name": "main"}));
+    assert_eq!(t["checks"][0]["param"], "name");
+    let t = ok(
+        &mut s,
+        "routing.table.preview",
+        json!({"id": "isp2", "comment": "x"}),
+    );
+    assert_eq!(t["commands"][0]["command"], "routing.table.set");
+}
