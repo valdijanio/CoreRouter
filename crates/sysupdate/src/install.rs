@@ -48,6 +48,9 @@ use crate::{SlotCmdline, SlotId};
 pub const INDEX: &str = "INSTALL.JSON";
 pub const SIGNATURE: &str = "INSTALL.SIG";
 pub const PACKAGE: &str = "COREROUTER.CRPKG";
+/// G1.6za: the modules of the ISO's kernel (a squashfs), for the live image.
+/// Listed in the signed index like the other files.
+pub const LIVE_MODULES: &str = "LIVEMODS.IMG";
 /// Largest index read (a few hundred bytes in practice).
 const MAX_INDEX: u64 = 64 << 10;
 /// Cleared at both ends of the target before anything is written.
@@ -266,6 +269,18 @@ impl<R: Read + Seek + Send> Medium<R> {
             offset: pkg.offset + self.header.len() + self.header.manifest.kernel.size,
             size: self.header.manifest.rootfs.size,
         })
+    }
+
+    /// G1.6za: where a file of the signed index is, and the SHA-256 the index
+    /// gives for it. A file that is not in the index is an error: being on
+    /// the medium proves nothing.
+    pub fn signed_file(&self, name: &str) -> Result<(Extent, String), String> {
+        let sum = self
+            .index
+            .files
+            .get(name)
+            .ok_or_else(|| format!("{name} is not in the signed index"))?;
+        Ok((self.extent(name)?, sum.sha256.clone()))
     }
 
     fn extent(&self, name: &str) -> Result<Extent, String> {
