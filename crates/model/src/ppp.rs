@@ -662,6 +662,19 @@ pub struct PppoeServer {
     /// 1 is TR-101's 1:1 model (a line per VLAN).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub max_sessions_per_vlan: u32,
+    /// G4.3m: sessions per MAC on the port (across VLANs); 0 = no limit
+    /// (Cisco `sessions per-mac limit`). Not in RouterOS.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_sessions_per_mac: u32,
+    /// G4.3m: a host whose sessions keep ending within 150 s is locked out
+    /// for `lockout_time_min × 2^(n-1)` seconds, up to `lockout_time_max`
+    /// (Junos `short-cycle-protection`). Off by default, as in Junos.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub short_cycle_protection: bool,
+    #[serde(default = "lockout_min_default", skip_serializing_if = "is_lockout_min_default")]
+    pub lockout_time_min: u32,
+    #[serde(default = "lockout_max_default", skip_serializing_if = "is_lockout_max_default")]
+    pub lockout_time_max: u32,
     /// RFC 4638: the largest PPP-Max-Payload accepted (1493..=1500); `None`
     /// keeps the RFC 2516 1492 (a CPE that asks for more gets 1492).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -742,6 +755,27 @@ impl<'de> Deserialize<'de> for LoadDelay {
 
 /// Longest PADO delay, ms (a CPE gives up on PADO after ~5 s × retries).
 pub const MAX_PADO_DELAY: u32 = 30_000;
+
+/// Junos' default lockout range, seconds (1 to 5 minutes).
+pub const DEFAULT_LOCKOUT_MIN: u32 = 1;
+pub const DEFAULT_LOCKOUT_MAX: u32 = 300;
+/// The longest lockout (Junos: 24 hours).
+pub const MAX_LOCKOUT: u32 = 86_400;
+
+fn lockout_min_default() -> u32 {
+    DEFAULT_LOCKOUT_MIN
+}
+fn lockout_max_default() -> u32 {
+    DEFAULT_LOCKOUT_MAX
+}
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_lockout_min_default(v: &u32) -> bool {
+    *v == DEFAULT_LOCKOUT_MIN
+}
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_lockout_max_default(v: &u32) -> bool {
+    *v == DEFAULT_LOCKOUT_MAX
+}
 
 impl PppoeServer {
     /// The delay before a PADO with `sessions` up: `pado_delay` plus the
@@ -1067,6 +1101,24 @@ pub struct HistoryEntry {
     pub refused_routes: Vec<String>,
 }
 
+/// A host locked out by short-cycle protection now (`ppp.lockout.list`,
+/// G4.3m).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LockedOut {
+    pub caller_id: String,
+    pub server: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vlan: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inner_vlan: Option<u16>,
+    /// Short cycles in a row.
+    pub strikes: u32,
+    pub left_secs: u64,
+    /// How its last session ended (the reason key of `ppp.why`).
+    pub reason: String,
+}
+
 /// `ppp.why`: where the logins of a user or MAC get to, and why the last
 /// one stopped.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1122,6 +1174,19 @@ pub struct ServiceStats {
     /// service holds).
     #[serde(default)]
     pub rx_dropped: u64,
+    /// G4.3m: PADIs and PADRs refused by `max_sessions_per_vlan`, by
+    /// `max_sessions_per_mac`, and dropped from hosts locked out; lockouts
+    /// started; hosts locked out now.
+    #[serde(default)]
+    pub vlan_refused: u64,
+    #[serde(default)]
+    pub mac_refused: u64,
+    #[serde(default)]
+    pub short_cycle_refused: u64,
+    #[serde(default)]
+    pub short_cycles: u64,
+    #[serde(default)]
+    pub locked_out: u64,
 }
 
 #[cfg(test)]

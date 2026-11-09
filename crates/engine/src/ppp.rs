@@ -11,7 +11,9 @@
 use std::sync::Arc;
 
 use corerouter_model::MacAddr;
-use corerouter_model::ppp::{ActiveSession, HOOK_VARS, HistoryEntry, ServiceStats, Why};
+use corerouter_model::ppp::{
+    ActiveSession, HOOK_VARS, HistoryEntry, LockedOut, ServiceStats, Why,
+};
 use serde_json::Value;
 
 use crate::Session;
@@ -42,6 +44,18 @@ pub trait PppBackend: Send + Sync {
         all.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
         all.truncate(limit);
         (total, all)
+    }
+    /// The hosts locked out by short-cycle protection, at most `limit`, and
+    /// how many there are (G4.3m; refreshed once a second).
+    fn lockouts(&self, limit: usize) -> (usize, Vec<LockedOut>) {
+        let _ = limit;
+        (0, Vec::new())
+    }
+    /// Forgets the lockouts of `mac` (of all, with `None`), with their
+    /// history. How many were locked out (of what `lockouts` shows).
+    fn lockout_clear(&self, mac: Option<MacAddr>) -> usize {
+        let _ = mac;
+        0
     }
     /// The session `id` (`queue.simple.stats` of its queue, G4.9g). The
     /// default walks the table; a backend with a map by id answers in O(1).

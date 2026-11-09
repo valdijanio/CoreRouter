@@ -115,6 +115,15 @@ impl Server {
             }
             self.active += 1;
             self.svc.add(svc);
+            // G4.3m: taken sessions count against the VLAN and MAC limits
+            // too (they did not: past a takeover the limit was too generous
+            // and the invariant check failed).
+            self.count_session(st.ifindex, st.vlans, st.client_mac, true);
+            if self.cfg.max_per_vlan > 0
+                && let Some(share) = self.vlan_shared(st.vlans)
+            {
+                share.add(st.vlans.outer, 1);
+            }
             self.by_host.insert(host, st.sid);
             taken.push(st.sid);
             results.push(Ok(r));
