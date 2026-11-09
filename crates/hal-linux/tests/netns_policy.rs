@@ -331,14 +331,18 @@ fn real_traffic_leaves_by_the_table_each_rule_chooses() {
     let _list = LIST.lock().unwrap_or_else(|e| e.into_inner());
     let (base, mut hal) = wired();
     hal.apply(&Config::default(), &base).unwrap();
-    // A permanent neighbor, so the ICMP errors go out at once.
+    // A permanent neighbor for every source that gets an ICMP back, so the
+    // errors go out at once. Without it the kernel asks ARP and asks again
+    // 1 s and 2 s later (`mcast_solicit`, `retrans_time_ms`): on a loaded
+    // machine, where `poll` is slow, that retry lands in a later check's
+    // count of `pfb` (G0.30i).
     let (_, fa_mac) = link("pfa");
     let mac = fa_mac
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<Vec<_>>()
         .join(":");
-    for host in ["10.95.0.1", "10.94.0.1"] {
+    for host in ["10.92.0.1", "10.95.0.1", "10.94.0.1"] {
         ip(&[
             "neigh",
             "add",
@@ -394,7 +398,7 @@ fn real_traffic_leaves_by_the_table_each_rule_chooses() {
     };
     check("no rule: main", [10, 89, 0, 1], far, (FRAMES, 0, 0));
     check("src, lookup", [10, 91, 0, 1], far, (0, FRAMES, 0));
-    // Unreachable: nothing forwarded, the ICMP back starts with an ARP request.
+    // Unreachable: nothing forwarded, an ICMP back.
     let got = wire.send(&mut hal, [10, 92, 0, 1], far);
     assert_eq!(
         (got.0, got.1),
