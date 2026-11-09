@@ -997,7 +997,7 @@ com a G1.6jb.
 | `corerouter-install.iso` | 131 176 448 B | 134 995 968 B (+3 819 520 B, 2,9%) |
 | `LIVEMODS.IMG` | — | 3 813 376 B: 181 módulos, 16,8 MiB crus, zstd 19 |
 | `BOOTX64.EFI` | 21 455 872 B | 21 459 968 B (limite da FAT: 32 MiB) |
-| `ready` depois do kernel, placa virtio, 3 rodadas | 0,86–1,51 s | 0,92–1,72 s; 1,06–1,43 s só na virtio: a variação entre rodadas é maior que a diferença |
+| `ready` depois do kernel, 3 rodadas | virtio: 0,86–1,51 s | virtio: 1,06–1,43 s; `e100`: 0,92–1,72 s. A variação entre rodadas é maior que a diferença |
 | Copiar, conferir e montar a carga | — | 29–31 ms |
 | Carregar `e100` no boot do live | — | 98–117 ms |
 | `MemAvailable` com 256 MiB, 10 s depois de `ready`, virtio | 111,6–113,4 MiB | 107,9–108,5 MiB (a carga no tmpfs e o índice lido) |
