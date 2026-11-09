@@ -9682,3 +9682,16 @@ continuação indentadas).
   (`last_error` nulo, revisão 79 de volta depois de reiniciar).
 
 - 2026-11-09 — G4.2h: Tempestade de DHCP com vinculações: o DNS dinâmico deixa de varrer os registros por concessão (índice por zona e nome durante a rodada adiada; no teto de 20 mil registros, recusa sem copiar o estado) e as entradas de address-list de uma rodada chegam ao kernel em um lote, não uma transação `nfnetlink` por vinculação. Testar: `cargo test -p corerouter-engine --lib dns_dynamic`; `cargo test -p corerouter-engine --test it a_storm_round`; `G42H_ONLY=binding G42H_SECS=30 cargo test --release -p corerouter-engine --test it slow_the_control_channel -- --nocapture`.
+
+- 2026-11-09 — G0.30i: `netns_policy` não falha mais por carga da máquina. Na rodada noturna de 2026-11-08 ele falhou e
+  passou ao repetir em 4 lotes: `real_traffic_leaves_by_the_table_each_rule_chooses` contava um
+  quadro a mais saindo por `pfb` (`(5, 0, 1)` em vez de `(5, 0, 0)`), e os outros dois testes caíam
+  em seguida porque o primeiro não limpou o namespace. Causa, reproduzida: a origem 10.92.0.1
+  (`lookup-only-in-table` numa tabela vazia) recebe ICMP de volta sem vizinho permanente, e o
+  kernel repete o pedido ARP 1 s e 2 s depois (`mcast_solicit`, `retrans_time_ms`). Com a máquina
+  carregada, o `poll` de cada checagem fica lento e a repetição cai na janela de uma checagem
+  seguinte. Com uma espera forçada de 1 s depois da etapa, falhava 5 de 5 com a mesma mensagem do
+  CI; com o vizinho permanente, como já tinham 10.94 e 10.95, 0 de 5 e 0 de 20 com 12 laços
+  ocupados nos mesmos 2 núcleos (**medido**). Pacote atrasado foi descartado: com a espera de 30 ms
+  reduzida a 1 ms e 24 laços ocupados, 0 de 20 (o envio pelo `AF_PACKET` encaminha e responde
+  dentro da própria chamada). Só o teste muda.
