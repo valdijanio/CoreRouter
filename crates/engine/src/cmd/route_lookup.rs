@@ -13,7 +13,7 @@ use crate::route_lookup::{choose_table, differences, lookup, query};
 use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[cmd!(query "ip.route.lookup", "Route Lookup", [], None,
-    "{address: ip (where the packet goes), table?: string (main | VRF name; default: the VRF of src, else main), src?: ip (one of the router's addresses)} → {address, routing_table, rule (how the table was chosen), type (unicast | local | unreachable), route (null | {key, id, dst_address, gateway, distance, origin, flags}), prefix, nexthops: [{gateway, interface}], interface, gateway, src, ecmp, kernel: {available, reason, type, prefix, nexthops, src, same, differences: [string]}}",
+    "{address: ip (where the packet goes), table?: string (main | VRF | routing.table name; default: the VRF of src, else main), src?: ip (one of the router's addresses)} → {address, routing_table, rule (how the table was chosen), type (unicast | local | unreachable), route (null | {key, id, dst_address, gateway, distance, origin, flags}), prefix, nexthops: [{gateway, interface}], interface, gateway, src, ecmp, kernel: {available, reason, type, prefix, nexthops, src, same, differences: [string]}}",
     always, run)
 .positional("address")];
 

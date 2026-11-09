@@ -275,3 +275,15 @@ agregação por /16 que abre sob demanda e a paginação no engine.
 **Ficou para depois:** a janela Nexthops (`/routing nexthop`: estado por gateway, flaps); a vista
 RIB × FIB do Junos/FRR (selecionada × instalada); regras de política (G1.27e); vizinhos ARP/ND para
 o `incomplete` (G1.27d); avisos ao criar uma rota que esconde outra (RFC 4632) ou com distância 255.
+
+## Tabelas nomeadas (`routing.table.*`, G1.27e)
+
+`routing.table.add {name}` cria uma tabela do kernel com nome, sem ser VRF, como o `/routing table`
+do RouterOS v7. A rota entra nela com `routing_table: <nome>`. O gateway resolve pelas redes
+conectadas da `main`, porque essa tabela não tem interface própria; uma interface dentro de VRF é
+recusada. O id do kernel sai da mesma faixa das VRFs (1000 em diante) e fica gravado na config.
+`routing.table.list` mostra também a `main` e as VRFs, marcadas como dinâmicas.
+
+Remover uma tabela em uso é recusado: rotas, regras de mangle que marcam pacotes para ela e, com as
+regras de política, as regras que a usam. O flag `fib` do RouterOS é aceito ao colar um export;
+`fib=false` é recusado, porque toda tabela aqui entra no FIB.

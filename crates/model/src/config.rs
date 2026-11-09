@@ -427,6 +427,9 @@ pub struct Routing {
     /// `/mpls` (G3.5, `crate::mpls`): kernel label switching and LDP.
     #[serde(skip_serializing_if = "crate::mpls::Mpls::is_default")]
     pub mpls: crate::mpls::Mpls,
+    /// `/routing table` (G1.27e, `crate::routing_table`): by name.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub tables: BTreeMap<crate::IfName, crate::routing_table::NamedTable>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

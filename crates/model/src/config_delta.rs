@@ -350,8 +350,10 @@ fn light_routing(r: &Routing) -> Routing {
         bfd,
         ospf,
         mpls,
+        tables,
     } = r;
     Routing {
+        tables: tables.clone(),
         rpki: rpki.clone(),
         bfd: bfd.clone(),
         ospf: ospf.clone(),
