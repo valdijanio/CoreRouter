@@ -78,21 +78,28 @@ fn where_of(d: &NicDevice) -> String {
 
 fn no_driver(d: &NicDevice, r: &NicReading) -> Problem {
     let name = name_of(d);
+    // The live ISO first: its PID 1 loads no module, even with the index of
+    // the installed image at hand (**medido** in QEMU: `pcnet32` "existed").
     let (reason, action, line) = match (&d.module, r.modules_off, r.live) {
-        (Some(m), true, _) => (
+        (Some(m), _, true) => (
+            format!("{name} ({}) sem porta aqui: a ISO não carrega módulos; o driver {m} vem na imagem instalada", d.address),
+            "Depois de instalar ela deve virar porta. Se for a sua porta de gerência, instale por outra porta ou pelo console.".to_owned(),
+            format!("{name} ({}): no port on the live ISO; module {m} loads once installed", d.address),
+        ),
+        (None, _, true) => (
+            format!("{name} ({}, id {}:{}) sem porta aqui: a ISO só traz os drivers embutidos", d.address, d.vendor_id, d.product_id),
+            "Se ela for a sua porta de gerência, instale por outra porta ou pelo console, e confira a placa na tabela de docs/os-image.md: os drivers em módulo estão na imagem instalada.".to_owned(),
+            format!("{name} ({}, {}:{}): no driver on the live ISO; it may work once installed", d.address, d.vendor_id, d.product_id),
+        ),
+        (Some(m), true, false) => (
             format!("{name} ({}) sem driver: o boot tem corerouter.modules=off e o módulo {m} não foi carregado", d.address),
             "Tire corerouter.modules=off da linha do kernel (system.tuning.boot) e reinicie, para a placa virar porta.".to_owned(),
             format!("{name} ({}): no driver, corerouter.modules=off kept module {m} out", d.address),
         ),
-        (Some(m), false, _) => (
+        (Some(m), false, false) => (
             format!("{name} ({}) sem driver: o módulo {m} existe nesta imagem e não ficou preso à placa", d.address),
             format!("Veja o que o kernel disse (log.os.print, filtre por {m}) e reinicie. Se repetir, a placa pode estar com defeito ou ser uma revisão que o driver recusa."),
             format!("{name} ({}): no driver, module {m} did not bind", d.address),
-        ),
-        (None, _, true) => (
-            format!("{name} ({}) sem porta aqui: a ISO só traz os drivers embutidos", d.address),
-            "Se ela for a sua porta de gerência, instale por outra porta ou pelo console: os drivers em módulo estão na imagem instalada (tabela em docs/os-image.md).".to_owned(),
-            format!("{name} ({}): no driver on the live ISO; it may work once installed", d.address),
         ),
         (None, _, false) => (
             format!("{name} ({}, id {}:{}) sem driver: nenhum módulo desta imagem conhece a placa", d.address, d.vendor_id, d.product_id),
@@ -415,6 +422,15 @@ mod tests {
         let (p, _) = evaluate(&r);
         assert!(!p[0].expected);
         assert!(p[0].action.contains("instale"), "{}", p[0].action);
+        // The index of the installed image is at hand on the ISO, whose PID 1
+        // loads nothing: "did not bind" would be false (found in QEMU).
+        let mut with_module = dev("0000:05:00.0", None, None);
+        with_module.module = Some("pcnet32".into());
+        let mut r = reading(vec![with_module], &[]);
+        r.live = true;
+        let (p, _) = evaluate(&r);
+        assert!(p[0].reason.contains("imagem instalada"), "{}", p[0].reason);
+        assert!(p[0].line.contains("once installed"), "{}", p[0].line);
     }
 
     #[test]
