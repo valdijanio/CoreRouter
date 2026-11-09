@@ -505,8 +505,11 @@ fn real_traffic_leaves_by_the_table_each_rule_chooses() {
     assert_eq!(wire2.send(&mut hal, [10, 91, 0, 1], far), (FRAMES, 0, 0));
     hal.apply(&off, &base).unwrap();
     let left = ip(&["rule"]);
+    // Besides `l3mdev unreachable`, which the VRF test may have left.
     assert!(
-        !left.contains("proto 200"),
+        !left
+            .lines()
+            .any(|l| l.contains("proto 200") && !l.contains("l3mdev")),
         "only the kernel's stay: {left}"
     );
     ip(&["link", "del", "pfa"]);
