@@ -43,6 +43,7 @@ mod firmware;
 mod frr;
 mod hotplug;
 mod install;
+mod livemods;
 mod out;
 mod push;
 mod release;
@@ -139,7 +140,12 @@ const INSTALLER_KERNEL: &[&str] = &[
     "# CONFIG_DEBUG_INFO_BTF is not set",
     // G1.6j: built in, or the installer would not show an E810 port.
     "CONFIG_ICE=y",
+    // G1.6za: another release, so a module of the image's kernel cannot load
+    // in this one (and the reverse). `livemods::SUFFIX`.
+    "CONFIG_LOCALVERSION=\"-live\"",
 ];
+/// The modules `boot-test` and `install-test` see, by file name.
+const REQUIRED_MODULE_FILES: &[&str] = &["e100", "pcnet32"];
 /// The installer's boot image (El Torito counts 16-bit 512-byte sectors).
 const MAX_BOOT_IMAGE: u64 = 65535 * 512;
 const INIT_PATH: &str = "/usr/sbin/corerouter-init";
@@ -151,7 +157,7 @@ const GUEST_TLS_PORT: u16 = 8729;
 /// G1.6o: `ip.service www-ssl`, on in a new config of the image.
 const GUEST_WEB_PORT: u16 = 443;
 
-const USAGE: &str = "usage: cargo xtask os <build [--only crpkg] [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|push --to HOST:PORT [--user U] [--no-build] [--no-wait] [--confirm manual]|release-key <init|check> [--dir D]|release --tag vX.Y.Z [--key-dir D] [--dry-run] [--no-build] [--repo OWNER/NAME]|out-dir|boot-test [--efi] [--tcg] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--firmware ovmf|seabios] [--scenario update|push|no-confirm|bad-signature|bad-param|cross|cut|controllers]|install-test [--tcg] [--firmware ovmf|seabios]|frr-test [--tcg]|firmware-lock --tag T|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
+const USAGE: &str = "usage: cargo xtask os <build [--only crpkg] [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|push --to HOST:PORT [--user U] [--no-build] [--no-wait] [--confirm manual]|release-key <init|check> [--dir D]|release --tag vX.Y.Z [--key-dir D] [--dry-run] [--no-build] [--repo OWNER/NAME]|out-dir|boot-test [--efi] [--tcg] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--firmware ovmf|seabios] [--scenario update|push|no-confirm|bad-signature|bad-param|cross|cut|controllers]|install-test [--tcg] [--firmware ovmf|seabios] [--only live-modules]|frr-test [--tcg]|firmware-lock --tag T|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
 
 pub fn main(root: &Path, args: &[String]) -> Outcome {
     let (sub, rest) = match args.split_first() {
@@ -600,6 +606,16 @@ fn check_installer(os: &Path, genimage: &str, version: &str) -> Result<usize, St
         return Err(
             "corerouter-installer.mk: share the kernel download (DL_SUBDIR = linux)".into(),
         );
+    }
+    n += 1;
+    // G1.6za: the ISO's modules, with no link back to the build machine.
+    for want in ["modules_install", "live-modules.img", "rm -f"] {
+        if !mk.contains(want) {
+            return Err(format!("corerouter-installer.mk: no '{want}' (G1.6za)"));
+        }
+    }
+    if !frag.contains(&format!("CONFIG_LOCALVERSION=\"{}\"", livemods::SUFFIX)) {
+        return Err("installer.fragment: the ISO's kernel needs its own release".into());
     }
     n += 1;
     // The boot image: present, the installer kernel inside, under El
@@ -1101,6 +1117,12 @@ pub(crate) fn build_with(
             "the installer kernel ({boot} bytes) does not fit the boot image"
         ));
     }
+    let (mods, mods_size) = livemods::verify(&installer_dir, &version, REQUIRED_MODULE_FILES)?;
+    eprintln!(
+        "   live modules: {mods} modules of {version}{}, {:.1} MiB raw",
+        livemods::SUFFIX,
+        mods_size as f64 / 1048576.0
+    );
     vm_images(root, &images)?;
     eprintln!(
         "\nimage ({} kernel options checked, {libs} ELF files find their libraries):",
@@ -1113,6 +1135,7 @@ pub(crate) fn build_with(
         "rootfs.img",
         "corerouter.crpkg",
         "installer/EFI/BOOT/BOOTX64.EFI",
+        "live-modules.img",
         "corerouter-install.iso",
         "corerouter.qcow2",
         "corerouter.ova",

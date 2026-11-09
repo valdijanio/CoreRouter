@@ -49,7 +49,7 @@ pub(super) type WaitLine<'a> =
 
 /// One HMP command on the monitor socket; its output, up to the next
 /// prompt.
-fn hmp(sock: &Path, cmd: &str) -> Result<String, String> {
+pub(super) fn hmp(sock: &Path, cmd: &str) -> Result<String, String> {
     let mut s = UnixStream::connect(sock).map_err(|e| format!("{}: {e}", sock.display()))?;
     s.set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;

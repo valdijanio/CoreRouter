@@ -471,7 +471,7 @@ fn declared_builtin(builtin: &str, modinfo: &[u8]) -> Vec<String> {
     out
 }
 
-fn ko_files(dir: &Path, out: &mut Vec<PathBuf>) {
+pub(super) fn ko_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };

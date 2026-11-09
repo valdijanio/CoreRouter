@@ -44,6 +44,8 @@ pub fn main(args: &[String]) -> Result<(), String> {
     let esp_full = crate::read(&images.join("efi.vfat"))?;
     let config_full = crate::read(&images.join("config.ext4"))?;
     let boot = crate::read(&images.join("efiboot.vfat"))?;
+    // G1.6za: the ISO kernel's modules, for the live image.
+    let modules = crate::read(&images.join("live-modules.img"))?;
     let esp = install::trim(&esp_full);
     let config = install::trim(&config_full);
     // The ESP must carry the package's kernel as slot A's (what seal wrote).
@@ -81,6 +83,7 @@ pub fn main(args: &[String]) -> Result<(), String> {
             ("ESP.IMG", esp),
             ("CONFIG.IMG", config),
             (BIOS_STAGE, &stage_file),
+            (install::LIVE_MODULES, &modules),
         ],
         &[
             (
@@ -104,7 +107,7 @@ pub fn main(args: &[String]) -> Result<(), String> {
     });
     let text = serde_json::to_vec_pretty(&index).map_err(|e| e.to_string())?;
     let sig = package::sign_detached(&text, &key)?;
-    let parts: [(&str, &[u8]); 8] = [
+    let parts: [(&str, &[u8]); 9] = [
         (install::INDEX, &text),
         (install::SIGNATURE, &sig),
         ("README.TXT", README.as_bytes()),
@@ -112,6 +115,7 @@ pub fn main(args: &[String]) -> Result<(), String> {
         ("ESP.IMG", esp),
         ("CONFIG.IMG", config),
         (BIOS_STAGE, &stage_file),
+        (install::LIVE_MODULES, &modules),
         (BOOT, &boot),
     ];
     let mut readers: Vec<Cursor<&[u8]>> = parts.iter().map(|(_, d)| Cursor::new(*d)).collect();
@@ -139,10 +143,11 @@ pub fn main(args: &[String]) -> Result<(), String> {
     let size = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
     let _ = writeln!(
         std::io::stderr(),
-        "   installer: {ISO} {:.1} MiB (boot image {:.1} MiB, ESP {:.1} MiB, config {} KiB of {} MiB), {} ms",
+        "   installer: {ISO} {:.1} MiB (boot image {:.1} MiB, ESP {:.1} MiB, live modules {:.1} MiB, config {} KiB of {} MiB), {} ms",
         size as f64 / 1048576.0,
         boot.len() as f64 / 1048576.0,
         esp.len() as f64 / 1048576.0,
+        modules.len() as f64 / 1048576.0,
         config.len() / 1024,
         config_full.len() >> 20,
         t.elapsed().as_millis()
