@@ -117,13 +117,21 @@ pub fn mem_total_kib(meminfo: &str) -> Option<u64> {
 /// (G1.6y): client only, a route of low preference per port (the first one
 /// wins while it has a lease), and a name the network's operator recognizes.
 pub fn live_dhcp_commands(ports: &[String]) -> Vec<(&'static str, serde_json::Value)> {
-    let mut out = Vec::new();
-    for (i, port) in ports.iter().enumerate() {
-        out.push((
+    ports
+        .iter()
+        .enumerate()
+        .flat_map(|(i, port)| live_dhcp_port(port, i))
+        .collect()
+}
+
+/// [`live_dhcp_commands`] for one port, the `i`-th of the machine.
+pub fn live_dhcp_port(port: &str, i: usize) -> [(&'static str, serde_json::Value); 2] {
+    [
+        (
             "interface.set",
             serde_json::json!({"name": port, "disabled": false}),
-        ));
-        out.push((
+        ),
+        (
             "ip.dhcp-client.add",
             serde_json::json!({
                 "interface": port,
@@ -131,9 +139,15 @@ pub fn live_dhcp_commands(ports: &[String]) -> Vec<(&'static str, serde_json::Va
                 "default_route_distance": 200 + i.min(50),
                 "comment": "live image",
             }),
-        ));
-    }
-    out
+        ),
+    ]
+}
+
+/// `ether3` → 2, the route preference of its DHCP client.
+pub fn port_index(port: &str) -> usize {
+    port.strip_prefix("ether")
+        .and_then(|n| n.parse::<usize>().ok())
+        .map_or(0, |n| n.saturating_sub(1))
 }
 
 /// A management address set by the installer for the first boot
@@ -677,6 +691,9 @@ mod tests {
         assert!(daemon_args(&o, false).contains(&"--live".to_owned()));
         let r = BootOptions::parse("corerouter.slot=a");
         assert!(!daemon_args(&r, false).contains(&"--live".to_owned()));
+        // G1.6za: `corerouter.modules=off` holds in the live image too.
+        assert!(o.modules);
+        assert!(!BootOptions::parse("corerouter.mode=live corerouter.modules=off").modules);
     }
 
     #[test]
@@ -849,5 +866,19 @@ mod tests {
         for bad in ["not json", r#"{"mgmt":{"address":"10.0.0.2/24"}}"#] {
             assert!(first_boot_commands(bad).is_err(), "{bad}");
         }
+    }
+
+    /// G1.6za: a port that shows up late gets the same client as the others.
+    #[test]
+    fn a_late_port_gets_its_place_in_the_route_preference() {
+        assert_eq!(port_index("ether1"), 0);
+        assert_eq!(port_index("ether4"), 3);
+        assert_eq!(port_index("ether0"), 0);
+        assert_eq!(port_index("eth2"), 0);
+        assert_eq!(port_index("ether999999999999999999999"), 0);
+        let all = live_dhcp_commands(&["ether1".to_owned(), "ether2".to_owned()]);
+        let late = live_dhcp_port("ether2", port_index("ether2"));
+        assert_eq!(all[2], late[0]);
+        assert_eq!(all[3], late[1]);
     }
 }

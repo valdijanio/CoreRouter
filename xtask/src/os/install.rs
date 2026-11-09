@@ -18,6 +18,11 @@
 //! 5. `qcow2` and `ova`: the VM images boot as they are (the removable-media
 //!    path), with the console setup offered (no address yet).
 //!
+//! 6. `live_modules` (G1.6za): an ISO whose only port is a card with its
+//!    driver in a module: the port comes from the signed payload, carries the
+//!    management, installs over itself; a second card plugged in gets a port
+//!    and an address.
+//!
 //! G1.6g: `--firmware seabios` does all of that by BIOS, through GRUB.
 
 #![allow(clippy::indexing_slicing)]
@@ -571,13 +576,15 @@ fn install_result(t: &T, cli: &Path, port: u16) -> Result<serde_json::Value, Str
     }
 }
 
-/// What the install wrote, alone, with the ISO still in the drive.
+/// What the install wrote, alone, with the ISO still in the drive; `nic` is
+/// the QEMU card.
 fn boot_written(
     t: &T,
     log: &mut std::fs::File,
     name: &str,
     disk: &str,
     port: u16,
+    nic: &str,
 ) -> Result<Vm, String> {
     let mut cmd = qemu_machine(t.kvm, t.fw, &t.vars());
     cmd.arg("-drive").arg(format!(
@@ -594,7 +601,7 @@ fn boot_written(
         "user,id=n0,hostfwd=tcp:127.0.0.1:{port}-:{}",
         super::GUEST_TLS_PORT
     ));
-    cmd.args(["-device", "virtio-net-pci,netdev=n0"]);
+    cmd.arg("-device").arg(format!("{nic},netdev=n0"));
     start(log, name, cmd)
 }
 
@@ -708,7 +715,14 @@ fn live_install(t: &mut T) -> Result<(), String> {
     t.strict = true;
     // Same host and port: the entry in known_hosts is what proves it.
     let port2 = port;
-    let mut booted = boot_written(t, &mut log, "live1/disk", "live1-data.raw", port2)?;
+    let mut booted = boot_written(
+        t,
+        &mut log,
+        "live1/disk",
+        "live1-data.raw",
+        port2,
+        "virtio-net-pci",
+    )?;
     booted.expect_all(
         &mut log,
         &[
@@ -794,7 +808,14 @@ fn live_install(t: &mut T) -> Result<(), String> {
     );
     t.strict = true;
     let port3 = port;
-    let mut booted = boot_written(t, &mut log, "live2/disk", "live2-blank.raw", port3)?;
+    let mut booted = boot_written(
+        t,
+        &mut log,
+        "live2/disk",
+        "live2-blank.raw",
+        port3,
+        "virtio-net-pci",
+    )?;
     booted.expect_all(
         &mut log,
         &["ready:", "install: management: 10.0.2.15/24 on ether1"],
@@ -809,6 +830,261 @@ fn live_install(t: &mut T) -> Result<(), String> {
     t.strict = false;
     t.n.put(
         "live: static management applied on the first boot",
+        "ok".to_owned(),
+    );
+    Ok(())
+}
+
+/// The card of G1.6za's test: its driver exists only as a module in the ISO's
+/// kernel, and its revision makes the driver refuse to open the port without
+/// its firmware file (`e100/d102e_ucode.bin`, on the image's root).
+const MODULE_NIC: &str = "i82551,mac=52:54:00:e1:00:01,bus=pcie.0,addr=0x10";
+const MODULE_NIC_MAC: &str = "52:54:00:e1:00:01";
+/// Plugged in with the live image running; another driver in a module.
+const PLUGGED_MAC: &str = "52:54:00:9c:4e:02";
+
+/// G1.6za: the ISO on a machine whose only port is a card with its driver in
+/// a module. Nothing but the signed payload can make that port: the address
+/// by DHCP and everything after it come through the card. Then a card plugged
+/// in with the live image running gets a port and an address, and the install
+/// made through the first card boots and answers on it.
+fn live_modules(t: &mut T) -> Result<(), String> {
+    let cli = super::push::cli(&t.root)?;
+    let iso = t.images.join("corerouter-install.iso");
+    let mut log = t.log.try_clone().map_err(|e| e.to_string())?;
+    fresh_vars(&t.vars())?;
+    two_disks(t, "mods")?;
+    let port = super::free_port()?;
+    let mon = t.work.join("mods.monitor");
+    let _ = std::fs::remove_file(&mon);
+    let mut cmd = qemu_machine(t.kvm, t.fw, &t.vars());
+    // The least the live image takes, as in `live_two_disks`.
+    cmd.args(["-m", "256"]);
+    cmd.arg("-monitor")
+        .arg(format!("unix:{},server=on,wait=off", mon.display()));
+    cmd.arg("-drive").arg(format!(
+        "file={},if=none,id=blank,format=raw",
+        t.work.join("mods-blank.raw").display()
+    ));
+    cmd.args(["-device", "virtio-blk-pci,drive=blank,serial=BLANK"]);
+    cmd.arg("-drive").arg(format!(
+        "file={},if=none,id=cd,format=raw,media=cdrom,readonly=on",
+        iso.display()
+    ));
+    cmd.args(["-device", "ide-cd,drive=cd,bootindex=0"]);
+    cmd.arg("-netdev").arg(format!(
+        "user,id=n0,hostfwd=tcp:127.0.0.1:{port}-:{}",
+        super::GUEST_TLS_PORT
+    ));
+    cmd.arg("-device").arg(format!("{MODULE_NIC},netdev=n0"));
+    cmd.args([
+        "-device",
+        "pcie-root-port,id=hp0,bus=pcie.0,chassis=9,slot=9",
+        "-netdev",
+        "user,id=n1,net=10.0.3.0/24,restrict=on",
+    ]);
+    let booted = Instant::now();
+    let mut vm = start(&mut log, "live/modules", cmd)?;
+    let r = vm.expect_all(
+        &mut log,
+        &[
+            "live: driver modules from",
+            "driver e100 loaded",
+            &format!("eth0→ether1 ({MODULE_NIC_MAC})"),
+            "ready:",
+            "NOT INSTALLED",
+        ],
+        120,
+    )?;
+    t.n.put(
+        "live modules: the payload",
+        r.first().cloned().unwrap_or_default().trim().to_owned(),
+    );
+    t.n.put(
+        "live modules: the driver",
+        r.get(1).cloned().unwrap_or_default().trim().to_owned(),
+    );
+    t.n.put(
+        "live modules: qemu start → console says not installed",
+        format!("{:.1} s", booted.elapsed().as_secs_f64()),
+    );
+    // All the way through the card (and so through its firmware file).
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let got = live_cli(t, &cli, port, "ip.address.list", "{}").unwrap_or_else(|e| e);
+        if got.contains("10.0.2.15") && got.contains("ether1") {
+            break;
+        }
+        check(
+            Instant::now() < deadline,
+            format!("no DHCP address through the module's card: {got}"),
+        )?;
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    t.n.put(
+        "live modules: qemu start → admin over TLS through the card",
+        format!("{:.1} s", booted.elapsed().as_secs_f64()),
+    );
+    // The window's network test names the driver.
+    live_cli(t, &cli, port, "system.install.test", "{}")?;
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let net = loop {
+        let v = install_print(t, &cli, port)?;
+        if v["testing"] == false && v["network"]["ports"][0]["address"].is_string() {
+            break v["network"].clone();
+        }
+        check(Instant::now() < deadline, format!("network test: {v}"))?;
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let first = &net["ports"][0];
+    check(
+        net["connected_port"] == "ether1"
+            && first["driver"] == "e100"
+            && first["connected"] == true
+            && first["link"] == true,
+        format!("network test: {net}"),
+    )?;
+    // A card plugged in now: the same payload, by the device messages.
+    let t3 = Instant::now();
+    super::hotplug::hmp(
+        &mon,
+        &format!("device_add pcnet,bus=hp0,id=hot,netdev=n1,mac={PLUGGED_MAC}"),
+    )?;
+    vm.expect_all(
+        &mut log,
+        &["driver pcnet32 loaded", &format!("→ether2 ({PLUGGED_MAC})")],
+        30,
+    )?;
+    t.n.put(
+        "live modules: card plugged in → driver loaded and port named",
+        format!("{} ms", t3.elapsed().as_millis()),
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let got = live_cli(t, &cli, port, "ip.address.list", "{}").unwrap_or_else(|e| e);
+        if got.contains("10.0.3.15") {
+            break;
+        }
+        check(
+            Instant::now() < deadline,
+            format!("no DHCP on the card plugged in: {got}"),
+        )?;
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    t.n.put(
+        "live modules: card plugged in → address by DHCP",
+        format!("{} ms", t3.elapsed().as_millis()),
+    );
+    // The install, managed through the card.
+    let v = install_print(t, &cli, port)?;
+    let blank = disk_named(&v, "BLANK")?.clone();
+    let name = blank["name"].as_str().unwrap_or_default().to_owned();
+    let mut p: serde_json::Value =
+        serde_json::from_str(&run_params(&blank, &name, None)).map_err(|e| e.to_string())?;
+    p["mgmt_port"] = serde_json::json!("ether1");
+    p["mgmt_mode"] = serde_json::json!("dhcp");
+    live_cli(t, &cli, port, "system.install.run", &p.to_string())?;
+    let r = install_result(t, &cli, port)?;
+    check(r["ok"] == true, format!("install: {r}"))?;
+    live_cli(t, &cli, port, "system.reboot", r#"{"confirm":true}"#)?;
+    vm.wait_exit(&mut log, 60)?;
+    // The installed kernel, its own modules, the same card and certificate.
+    t.strict = true;
+    let mut disk = boot_written(
+        t,
+        &mut log,
+        "live/modules-disk",
+        "mods-blank.raw",
+        port,
+        "i82551,mac=52:54:00:e1:00:01",
+    )?;
+    disk.expect_all(&mut log, &["driver e100 loaded", "ready:"], 120)?;
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        let got = live_cli(t, &cli, port, "ip.address.list", "{}").unwrap_or_else(|e| e);
+        if got.contains("10.0.2.15") {
+            break;
+        }
+        check(
+            Instant::now() < deadline,
+            format!("no address after the install: {got}"),
+        )?;
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    drop(disk);
+    t.strict = false;
+    t.n.put(
+        "live modules: installed through the card; the disk answers on it",
+        "ok".to_owned(),
+    );
+    Ok(())
+}
+
+/// G1.6za: a byte changed in the payload on the medium. The hash in the signed
+/// index stops it before anything is mounted, the console says so, and the
+/// live image comes up anyway: a built-in card has its port, the card that
+/// needs a module has none, and no module of any kind was loaded.
+fn live_modules_tampered(t: &mut T) -> Result<(), String> {
+    let mut iso =
+        std::fs::read(t.images.join("corerouter-install.iso")).map_err(|e| e.to_string())?;
+    let img = std::fs::read(t.images.join("live-modules.img")).map_err(|e| e.to_string())?;
+    let head = img.get(..4096).ok_or("live-modules.img: too short")?;
+    // ISO 9660 files start on a 2 KiB sector.
+    let at = (0..iso.len())
+        .step_by(2048)
+        .find(|&o| iso.get(o..o + head.len()) == Some(head))
+        .ok_or("the payload is not on the ISO")?;
+    iso[at + img.len() / 2] ^= 0xff;
+    let bad = t.work.join("tampered.iso");
+    std::fs::write(&bad, &iso).map_err(|e| e.to_string())?;
+    drop(iso);
+    fresh_vars(&t.vars())?;
+    let mut log = t.log.try_clone().map_err(|e| e.to_string())?;
+    let mut cmd = qemu_machine(t.kvm, t.fw, &t.vars());
+    cmd.arg("-drive").arg(format!(
+        "file={},if=none,id=cd,format=raw,media=cdrom,readonly=on",
+        bad.display()
+    ));
+    cmd.args(["-device", "ide-cd,drive=cd,bootindex=0"]);
+    cmd.args([
+        "-netdev",
+        "user,id=n0",
+        "-device",
+        "virtio-net-pci,netdev=n0",
+        "-netdev",
+        "user,id=n1,restrict=on",
+    ]);
+    cmd.arg("-device").arg(format!("{MODULE_NIC},netdev=n1"));
+    let mut vm = start(&mut log, "live/tampered", cmd)?;
+    let r = vm.expect_all(
+        &mut log,
+        &[
+            "live: driver modules: the module payload on the medium does not match",
+            "port names:",
+            "ready:",
+            "NOT INSTALLED",
+        ],
+        120,
+    )?;
+    let names = r.get(1).cloned().unwrap_or_default();
+    check(
+        names.contains("→ether1") && !names.contains(MODULE_NIC_MAC),
+        format!("ports with a refused payload: {names}"),
+    )?;
+    drop(vm);
+    let text = std::fs::read(t.work.join("console.log")).map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&text);
+    let section = text
+        .rsplit("===== live/tampered =====")
+        .next()
+        .unwrap_or_default();
+    check(
+        !section.contains("driver e100 loaded"),
+        "a driver loaded from a refused payload".to_owned(),
+    )?;
+    let _ = std::fs::remove_file(&bad);
+    t.n.put(
+        "live modules: a changed payload is refused, the live image comes up",
         "ok".to_owned(),
     );
     Ok(())
@@ -1055,11 +1331,20 @@ fn cross_boot(t: &mut T) -> Result<(), String> {
 pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), String> {
     let mut tcg = false;
     let mut fw = Firmware::Ovmf;
+    let mut only_modules = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--tcg" => tcg = true,
             "--firmware" => fw = Firmware::parse(it.next().map(String::as_str))?,
+            "--only" => {
+                let what = it.next().map(String::as_str);
+                check(
+                    what == Some("live-modules"),
+                    format!("--only {what:?}: only live-modules"),
+                )?;
+                only_modules = true;
+            }
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
@@ -1099,6 +1384,15 @@ pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), S
         fw.name(),
         log_path.display()
     );
+    if only_modules {
+        live_modules(&mut t)?;
+        live_modules_tampered(&mut t)?;
+        eprintln!("\nlive-modules ok ({}):", fw.name());
+        for (k, v) in &t.n.0 {
+            eprintln!("  {k}: {v}");
+        }
+        return Ok(());
+    }
     let st = Command::new("qemu-img")
         .args(["create", "-q", "-f", "qcow2"])
         .arg(work.join("target.qcow2"))
@@ -1125,6 +1419,8 @@ pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), S
     interactive(&mut t)?;
     live(&mut t)?;
     live_install(&mut t)?;
+    live_modules(&mut t)?;
+    live_modules_tampered(&mut t)?;
 
     let qcow2 = images.join("corerouter.qcow2");
     t.boot_image("qcow2", &qcow2, "qcow2", true)?;
@@ -1150,5 +1446,8 @@ pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), S
     }
     let _ = std::fs::remove_file(work.join("target.qcow2"));
     let _ = std::fs::remove_file(work.join("corerouter-disk1.vmdk"));
+    for f in ["mods-blank.raw", "mods-data.raw"] {
+        let _ = std::fs::remove_file(work.join(f));
+    }
     Ok(())
 }

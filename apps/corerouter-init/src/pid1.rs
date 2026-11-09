@@ -121,13 +121,14 @@ pub fn main() {
     };
     // G1.6j: before the ports get their names, and only now: a driver that
     // asks for its firmware while probing needs / (the kernel's own probes
-    // run before it is mounted). Not in the live image: its kernel is the
-    // ISO's, and the modules in this root were built for the installed one.
-    if opts.modules && !live {
+    // run before it is mounted). G1.6za: the live image too: the first stage
+    // mounted the ISO kernel's modules over /lib/modules (without them, this
+    // kernel's directory is not there and this finds nothing).
+    if opts.modules {
         crate::modules::start(log);
     }
     let names = name_ports(Some(Path::new(crate::ports::MAP_FILE)));
-    spawn_hotplug_names(crate::ports::MAP_FILE);
+    spawn_hotplug_names(crate::ports::MAP_FILE, live);
     let trial = if live { None } else { trial_at_boot(&cmdline) };
     // G1.6v: outside a trial, /config's partition takes the rest of the
     // disk (its filesystem follows at the next boot).
@@ -371,7 +372,7 @@ fn read_map(map: &Path) -> Vec<crate::ports::Known> {
 /// name (`eth<N>`), it waits for the burst to settle and names it. Cost:
 /// one wake per link message (rare on a router: a carrier change, an
 /// address); no polling.
-fn spawn_hotplug_names(map: &'static str) {
+fn spawn_hotplug_names(map: &'static str, live: bool) {
     let events = match crate::links::LinkEvents::open() {
         Ok(e) => e,
         Err(e) => {
@@ -407,11 +408,49 @@ fn spawn_hotplug_names(map: &'static str) {
                 let p = crate::ports::assign(&found, &known, false);
                 if !p.renames.is_empty() {
                     apply_names(&p, &found, &known, Some(path));
+                    if live {
+                        for (_, port) in &p.renames {
+                            live_dhcp_later(port.clone());
+                        }
+                    }
                 }
             }
         });
     if let Err(e) = spawned {
         log!("port names: hot-plug thread: {e}");
+    }
+}
+
+/// G1.6za: a port the live image got after its first pass (a card plugged in, a
+/// driver that took its time) gets its DHCP client. In a thread of its own: the
+/// daemon sees the new name a moment later, and the names must not wait for it.
+/// Before the daemon is up this gives up, and `first_boot` covers the port.
+fn live_dhcp_later(port: String) {
+    const TRIES: u32 = 40;
+    let spawned = std::thread::Builder::new()
+        .name("live-dhcp".into())
+        .spawn(move || {
+            let commands = plan::live_dhcp_port(&port, plan::port_index(&port));
+            for (i, (cmd, params)) in commands.iter().enumerate() {
+                let mut tries = if i == 0 { TRIES } else { 1 };
+                loop {
+                    tries -= 1;
+                    match crate::ctl::call(cmd, params) {
+                        Ok(_) => break,
+                        Err(_) if tries > 0 => std::thread::sleep(Duration::from_millis(250)),
+                        // Plugged in again: the client it had still stands.
+                        Err(e) if e.contains("already has") => break,
+                        Err(e) => {
+                            log!("live image: {port}: {cmd}: {e}");
+                            return;
+                        }
+                    }
+                }
+            }
+            log!("live image: DHCP client on {port}");
+        });
+    if let Err(e) = spawned {
+        log!("live image: DHCP thread: {e}");
     }
 }
 
@@ -448,12 +487,20 @@ fn first_boot(
         }
         m
     });
-    let ports: Vec<String> = names.iter().map(|(_, n)| n.clone()).collect();
+    let mut ports: Vec<String> = names.iter().map(|(_, n)| n.clone()).collect();
     let ttys = ttys.to_vec();
     let spawned = std::thread::Builder::new()
         .name("first-boot".into())
         .spawn(move || {
             if live {
+                // G1.6za: what the daemon sees now, not what there was at the
+                // first naming: a port named while it started has no one else
+                // to give it a client (`live_dhcp_later` gave up by then).
+                for f in crate::links::all_ports() {
+                    if !crate::ports::is_kernel_name(&f.kernel) && !ports.contains(&f.kernel) {
+                        ports.push(f.kernel);
+                    }
+                }
                 for (cmd, params) in plan::live_dhcp_commands(&ports) {
                     if let Err(e) = crate::ctl::call(cmd, &params) {
                         log!("live image: {cmd}: {e}");

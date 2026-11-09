@@ -13,13 +13,19 @@ CONFIG_INITRAMFS_COMPRESSION_ZSTD=y
 # CONFIG_DEBUG_INFO_BTF is not set
 # CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT is not set
 CONFIG_DEBUG_INFO_NONE=y
-# G1.6j: the installer and the live image load no modules (the ones in the
-# image were built for the installed kernel), so a card must be built in here
-# to show a port on the ISO. The E810 runs in Safe Mode without its firmware
-# (it asks while probing, before the root is there), enough to show the port;
-# it works in full on the installed router. The others ask at open, or need
-# nothing. These are the common cards; the rest of nics.fragment gets its port
-# on the installed router only (docs/os-image.md has the table).
+# G1.6za: this kernel is another release. A module's vermagic starts with the
+# release (kernel/module/version.c), so the modules of the image's kernel,
+# built against another .config, cannot load here, nor these in that one; the
+# release also names the directory the live image looks in. The ISO carries
+# this kernel's own modules in a signed payload (LIVEMODS.IMG).
+CONFIG_LOCALVERSION="-live"
+# G1.6j, G1.6za: the console installer of the initramfs loads no modules, and
+# the live image loads them only when the payload is good: the common cards
+# stay built in, so they show a port whatever happens. The E810 runs in Safe
+# Mode without its firmware (it asks while probing, before the root is there),
+# enough to show the port; it works in full on the installed router. The others
+# ask at open, or need nothing. The rest of nics.fragment comes from the payload
+# (docs/os-image.md has the table).
 CONFIG_ICE=y
 CONFIG_BNXT=y
 CONFIG_BNX2=y
