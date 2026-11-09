@@ -91,7 +91,7 @@ impl Grub {
     /// new one. (The file is rewritten only when it is not a block: GRUB's
     /// `save_env` could not write to it either.)
     fn set_env(&self, primary: SlotId, next: Option<SlotId>) -> Result<(), String> {
-        use std::os::unix::fs::FileExt;
+        use std::io::Write;
         let path = self.file(biosboot::ENV_FILE);
         let data = biosboot::grubenv(primary, next);
         let err = |e: std::io::Error| format!("{}: {e}", path.display());
@@ -99,11 +99,12 @@ impl Grub {
             if std::fs::metadata(&path).map(|m| m.len()).ok() != Some(data.len() as u64) {
                 return state::write_atomic(&path, &data);
             }
-            let f = std::fs::OpenOptions::new()
+            let mut f = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&path)
                 .map_err(err)?;
-            f.write_all_at(&data, 0).map_err(err)?;
+            // Opened at offset 0, without truncating: the same clusters.
+            f.write_all(&data).map_err(err)?;
             f.sync_data().map_err(err)
         })
     }
