@@ -9551,3 +9551,132 @@ continuação indentadas).
   `system.health.check` lia um status que ninguém gravava e dizia "sem daemon" com o cliente ligado.
 
   Como testar: `docs/ntp.md`, seção "Como testar".
+
+- 2026-11-09 — G0.18: `ip.dhcp-server.lease.add` não reavalia mais o servidor inteiro: confere só a concessão nova, contra um índice de quem ocupa cada endereço e cada cliente (`checks::LeaseDups`). O índice fica no `Session` e vale enquanto a `generation` do candidato não mudar; qualquer outro comando, `discard`, rollback ou lote que falhou o faz ser refeito no próximo `add`. O texto de erro e de aviso sai do mesmo código da verificação completa, e um proptest confere palavra por palavra contra `checks()`. O commit no fim do lote continua validando tudo. Testar: `cargo test -p corerouter-engine --test it dhcp_lease_index`; `cargo bench -p corerouter-engine --bench batch_import -- dhcp_lease`. `lease.set` e `make-static` continuam com a verificação completa: são de um item por vez, não de import.
+
+- 2026-11-09 — G0.30e: `netns_mpls_too_big` falhava e passava ao repetir em quase todos os lotes de 2026-11-08, de três modos. Dois vinham de o teste não esperar o que precisava; o terceiro era defeito do produto. **Produto:** o `HostResponder` fazia os dumps de netlink do `view.refresh`, que esperam pelo RTNL, na thread que drena o tap: com o RTNL ocupado, 89–128 ms parados em 2000 frames/s estouravam o buffer do socket (`ss`: d17, d187, d510, d937) e perdiam frames de todos (**medido**, VM de 3 e 2 CPUs com a suíte netns inteira). Agora os dumps rodam numa thread própria (`lsp-view`) e a thread do tap nunca espera por eles, exceto na primeira leitura. **Teste:** espera os links ficarem UP (até o `linkwatch` rodar, o que precisa do RTNL, o kernel descarta o que é enviado no link; causa provável da falha do primeiro ping, não reproduzida aqui), 60 s para o respondedor subir (5 s falhavam em 2 CPUs, também no `netns_mpls_ttl`), e o teste de inundação passa a medir o limite no próprio limite: o rastreador nunca recusado com limite por origem, recusado sem ele, e quase tudo que foi ouvido respondido. Com a correção, a suíte netns inteira na VM passou o `netns_mpls_too_big` em 6 de 6 rodadas (3 em 3 CPUs, 3 em 2 CPUs), com 20/20 traços respondidos com o limite por origem; os links levaram até 2,7 s para ficar UP (**medido**). O CI do GitHub, onde a falha aparecia, ainda não confirmou. Testar: `cargo xtask vm-lab run -- cargo xtask netns`.
+
+- 2026-11-09 — G0.30g: `netns_pppoe_io::a_port_never_reads_another_interface` falhava sob carga, e o defeito é do produto: ao abrir uma porta PPPoE, o socket instalava o filtro de PPPoE e o buffer de 4 MiB antes do `bind`, então a inundação de PPPoE de outra interface enfileirava enquanto o `bind` esperava. O dreno lê no máximo 4096 quadros, e o resto chegava ao BNG como quadros desta porta: "232 frames of piod read on piof" na VM (4328 na fila) e 1024 no runner do CI, 4 × o orçamento de 256 por leitura (**medido**). Agora o socket nasce com um filtro que descarta tudo, faz o `bind`, drena o pouco que entrou antes do filtro e só então ganha o buffer e o filtro real, como faz o libpcap. Processos girando não reproduzem a falha (30/30 antes e depois, **medido**); ela apareceu 1 vez em 6 rodadas da suíte netns inteira em 2 e 3 CPUs, então a correção vem da causa, e não de uma repetição antes e depois.
+
+- 2026-11-09 — G0.30h: `netns_fw_scale` falhou no run 42555613427 do runner próprio: mediana de 460 ms contra 145 ms sem firewall, enquanto o `comment` da mesma rodada ficou em 235 ms e a mesma conta no daemon em 243 ms contra 196 ms (**medido**). Nenhuma mudança no código explica isso, só a carga da máquina, que pega os commits de forma desigual. O limite agora compara o commit mais rápido de cada tipo; um commit que volta a percorrer todas as regras custa isso sempre e continua reprovando. O relatório segue com as medianas. Não reproduzi a falha: com 8 processos girando em 2 CPUs passou 12/12 antes e 18/18 depois (**medido**), então o efeito só se confirma quando esta instabilidade sumir da fila.
+
+- 2026-11-09 — G1.27e: Roteamento por política, parte b: `routing.rule.add/set/remove/move/list` e `routing.rule.kernel`, como o `/routing rule` do RouterOS v7 (`src_address`, `dst_address`, `interface`, `routing_mark`, `action` lookup, lookup-only-in-table, drop, unreachable, `table`, `min_prefix`), aplicadas por `FRA_*` com protocolo próprio. A marca do mangle com nome de tabela manda o pacote para ela; VRF sem rota não vaza mais para a `main`; `ip.route.lookup` caminha pela lista como o kernel e mostra `matched_rule` e `trace`; regra que corta a volta da sessão pede `force` ou Safe Mode; regra de outro programa fica intacta e regra nossa apagada vira drift. Como testar: `docs/policy-routing.md`; `cargo xtask netns` roda `tests/netns_policy.rs`, com tráfego real saindo pela porta da tabela escolhida.
+
+- 2026-11-09 — G1.27e: Roteamento por política, parte c: a janela Routing › Rules, com as abas Rules, Tables e Kernel List, o modal com prévia do motor (`routing.rule.preview`, `routing.table.preview`), Move Up e Move Down e Test a Packet, que mostra a regra que decidiu. Como testar: abra Routing › Rules, ou rode `crates/ui/src/tests/routing_rules.rs`. Prints em `docs/changes/G1.27e-screenshots/`.
+
+- 2026-11-09 — G1.29e: Conferido na trava do firmware, sem mudança de código: `os/package/corerouter-firmware/firmware.lock` tem 33 linhas de `rtl_nic`, entre elas `rtl8153a-*`,
+  `rtl8153b-*`, `rtl8153c-*`, `rtl8156a-*` e `rtl8156b-*`; `cargo xtask os build` confere que todo `firmware=` dos drivers de rede está na imagem ou numa linha `skip`, e
+  passou (**medido**). Não medido: o que muda no RTL8153B, que precisa do adaptador físico (G1.6jb).
+
+- 2026-11-09 — G1.5b: Um `blackhole`, `unreachable` ou `prohibit` que passa a ganhar o roteamento de volta para o endereço de onde o operador está conectado é recusado como o lockout do firewall (G2.1b): erro `Lockout` com a rota e como seguir, `force=true` ou Safe Mode passam (o commit transacional usa `config.commit force=true`). O caminho de volta segue a tabela que as regras de roteamento escolhem (a mesma caminhada do lockout de regras, G1.27e), e uma tabela com rota de descarte encerra a caminhada, como no kernel. A conferência vale para `add`, `set` e `remove`, porque tirar a rota específica que escondia um descarte mais largo corta do mesmo jeito. `ip.route.add` e `ip.route.set` respondem `warnings`: descarte dentro de um connected, descarte de mesmo prefixo de um connected (o connected ganha enquanto o endereço estiver de pé) e descarte sobre o operador. Descarte mais largo que um connected não avisa: o connected é mais específico e essa é a âncora normal de prefixo no BGP. `ip.route.lookup` passa a dizer `type` blackhole, unreachable ou prohibit, com a rota; antes dizia `unicast` sem próximo salto, e o `kernel` respondia "EINVAL" como falha. Testar: `cargo test -p corerouter-engine --test it route_discard_lockout`; `cargo xtask netns` cobre o `RTM_GETROUTE` no kernel real.
+
+- 2026-11-09 — G1.6ja: Placa que o kernel não subiu inteira agora aparece. O serviço `nic-problems` do daemon olha sysfs e
+  `/dev/kmsg` a cada 10 s, fora do lock; o engine julga e escreve o motivo e o que fazer em português.
+  Sai em `interface.hardware-problem.print`, no check `interface.hardware`, nos selos da janela Interfaces
+  (na barra para a placa sem driver, que não tem linha; na linha da porta para firmware e Safe Mode,
+  com modal e ⓘ), no aviso da CLI/MCP, no log do roteador e no teste de rede do instalador. O parser
+  de firmware do instalador (G1.6y) mudou para `corerouter_hal::nic_problem`: uma lista só.
+
+  Como testar: `cargo run -p corerouter-cli -- run interface.hardware-problem.print` (o lab tem uma E810 em
+  Safe Mode na ether7, uma Netronome sem driver e um Wi-Fi que não conta); a GUI, janela Interfaces,
+  clique no selo.
+
+  Números: varredura de `/sys` real desta máquina, 41 PCI + 40 USB, 1,2–1,7 ms em build de teste
+  (**medido**, 2026-11-08), ~15–20 µs por entrada; 108 PCI em árvore de teste, ~5 µs por dispositivo
+  (**medido**). A primeira leitura do anel inteiro do kmsg, 31 ms (**medido**).
+
+  QEMU (**medido**, KVM, imagem desta branch): com `corerouter.modules=off` e uma `pcnet`, o aviso sai na
+  saúde, em `interface.hardware-problem.print` e no login da CLI, com o módulo `pcnet32`; a mesma placa
+  sem a opção vira `ether2`, sem aviso; a `rocker` (classe "outra") fica em `ignored`. Na ISO o defeito
+  apareceu aqui: dizia "módulo não subiu", e o live não carrega módulos; corrigido. Firmware faltando e
+  Safe Mode não rodaram em ponta a ponta: a imagem traz os arquivos e o QEMU não emula a E810; só as
+  linhas do fonte do kernel, nos testes. Placa física: nenhuma (G1.6jb).
+
+- 2026-11-09 — G1.6p: Janela IP › Services no padrão de lista: status, endereço, porta, `available_from`, recusadas e último erro, com ⓘ em cada coluna; ✓ ✗ e o modal com a prévia `ip.service.check`, que roda as regras de cada `set` numa cópia. O selo `this session` e um aviso marcam o serviço por onde a sessão chegou (`ip.service.print`). A proteção fica no engine, na verificação de lockout: desligar, mover ou tirar o próprio endereço do `available_from` do `www-ssl` usado pela sessão é recusado sem `force` ou Safe Mode, em qualquer cliente; a GUI usa a janela de lockout que já existe. Teste: `cargo test -p corerouter-engine --lib ip_service`, `cargo test -p corerouter-ui --lib ip_services`. **Medido** numa conexão WSS real contra o daemon virtual: as três recusas, Safe Mode desfazendo ao cair a conexão, `force` passando, a conexão aberta seguindo viva e a nova sendo recusada. A GUI em navegador real não foi exercitada: o navegador embutido não aceita o certificado autoassinado.
+
+- 2026-11-09 — G1.6w: Teto de disco para os históricos. O daemon mede o filesystem do `--config-dir` na partida
+  (`Session::set_config_capacity`) e cada história fica com uma cota: arquivos de revisão até 10 %
+  (e nunca mais que os 64 MiB de antes), arquivos de gráfico até 25 % (ou `max_memory_mib`, o que
+  for menor; `system.graph.print` mostra o teto em vigor em `max_memory_bytes`). O que passa sai do
+  mais velho: revisão pela cadeia de diferenças; gráfico apaga primeiro `*.corrupt`, depois o
+  arquivo escrito há mais tempo que nenhuma série usa (na partida e a cada store); série nova além
+  da cota é recusada, como já acontecia com `max_memory_mib`. A revisão logo antes da ativa fica
+  qualquer que seja o tamanho: é o alvo do rollback depois de reiniciar. Um diretório antigo acima
+  da cota é cortado na partida, não no próximo commit. Uma linha no log quando o corte começa e
+  outra quando acaba (não uma por commit) e o item `Config disk` em Saúde.
+
+  Disco cheio de verdade: `history_files::save` não abandona mais a gravação porque um arquivo de
+  revisão não coube. Primeiro repete, sem apagar nada. Se o erro continua e é disco cheio
+  (`storage::no_space`), apaga as mais velhas (no slot ou no journal, todas menos a última boa) e
+  tenta outra vez. Qualquer outro erro (flash ruim, somente leitura) sobe como antes e não custa
+  nenhuma revisão. O `storage-fs` apaga o temporário de uma escrita que falhou: cada commit
+  com o disco cheio deixava um `rev-N.json.tmp` (**medido**: dezenas em 256 KiB).
+
+  Como testar: `unshare --user --map-root-user --mount`, `mount -t tmpfs -o size=16m none <dir>`,
+  daemon com `--config-dir <dir>`; lotes de 2000 `address-list.add` seguidos de `config.rollback`
+  (diferença de 357 KB cada) e `system.config-disk.print`. **Medido** (16 MiB, 2026-11-09):
+  cota de 1,6 MiB, ficaram 1,43 MiB em 9 revisões, 7 fora do disco, item de saúde em warning;
+  depois de reiniciar a revisão 15 voltou e o rollback para a 14 funcionou.
+
+- 2026-11-09 — G1.6za: Placa cujo driver é só módulo vira porta no live e gerencia a instalação. A ISO traz os módulos do kernel
+  dela num squashfs à parte, listado no `INSTALL.JSON` assinado; o primeiro estágio copia para a RAM, confere
+  o SHA-256 e monta em `/lib/modules`; o segundo carrega os drivers como um roteador. O kernel da ISO virou
+  `6.18.59-live`: os módulos do kernel instalado são recusados pelo vermagic (**medido**). Carga ruim: o console
+  avisa e o live sobe só com as placas embutidas. Porta que chega depois recebe cliente DHCP.
+
+  Testar: `cargo xtask os install-test --only live-modules [--firmware seabios]`. A máquina só tem uma `i82551`
+  (`e100`, só módulo): DHCP, TLS e a instalação passam por ela, uma `pcnet` plugada vira `ether2` com endereço,
+  e o disco instalado responde na mesma placa. Depois, uma ISO com a carga alterada é recusada e o live sobe. Na ISO de antes, a
+  mesma máquina não tem porta nenhuma (**medido**).
+
+  ISO de 131 176 448 B para 134 995 968 B (+3 819 520 B, **medido**); `ready` sem diferença acima da variação
+  entre rodadas (**medido**, máquina carregada, 3 rodadas); `MemAvailable` ~4 MiB menor com 256 MiB, ~7 MiB com a `e100` carregada
+  (**medido**). Placa física não testada (G1.6jb). Detalhes em `docs/os-image.md`.
+
+  O mínimo de RAM do live subiu de 256 para 320 MiB: com 256 MiB, o login com senha matava o daemon por falta de memória e levava junto a
+  instalação em andamento, também na ISO de antes (**medido**); era o que fazia o `install-test` falhar.
+
+- 2026-11-09 — G4.2h: O serviço `dhcp-server` lê os sockets, decodifica e escolhe o endereço sem o lock da sessão, sob o lock próprio do `core`, 32 mensagens por vez. Só o diário, o DNS, as listas e o histórico ficam sob o lock da sessão; as respostas saem depois, sem ele. Os efeitos entram numa fila em ordem, e os comandos que mudam concessões passam por ela (`Session::dhcp_server_op`). `ip.dhcp-server.print` conta as concessões em O(1). Testar: `cargo test -p corerouter-engine --test it dhcp_lock`; `G42H_SECS=30 cargo test --release -p corerouter-engine --test it slow_the_control_channel -- --nocapture`.
+
+- 2026-11-09 — G4.3m: PPPoE: quem reconecta em loop fica bloqueado por `min × 2^(n-1)` segundos (fórmula, 150 s e 15 min do Junos; desligado por padrão), com PADI e PADR descartados e a causa real no `ppp.why`. `max_sessions_per_mac` por porta. `max_sessions_per_vlan` numa VLAN simples passou a valer para o servidor todo, não por worker. A tomada de sessões do HA agora conta nos limites (ela não contava `per_vlan`). `ppp.lockout.list`, `ppp.lockout.clear` e contadores no `interface.pppoe-server.monitor`; quatro campos novos no modal do servidor. Queda por RADIUS fora do ar, pelo operador ou por Session-Timeout não conta como ciclo. Testar: `cargo test -p corerouter-proto-pppoe --lib server`; `cargo test -p corerouter-daemon --bin corerouter-daemon pppoe_bng_tests`; `cargo test -p corerouter-engine --lib ppp_lockout`.
+
+- 2026-11-09 — G4.6c: Servidor NTP (`docs/ntp.md`), desligado por padrão: responde modo 4 só com hora boa, a quem está em
+  `allowed`: prefixos, intervalos ou nomes de address-list do firewall, com entradas fixas e dinâmicas
+  (padrão do VyOS: loopback, link-local, privadas). Silêncio para o resto, sem resposta a modos 6 e 7, e
+  sem amplificação (sempre 48 bytes). Limite por origem com Kiss-o'-Death RATE (RFC 5905 §7.4), em tabela
+  fixa. Holdover até a distância à raiz chegar a 1 s. `use_local_clock`/`local_clock_stratum` (o cliente
+  mostra `using-local-clock`), `broadcast` e `vrf`. Instante de chegada do kernel e resposta do mesmo
+  endereço da pergunta. `SourceSet` no model: busca binária, reutilizável. Janela System › NTP Server.
+  `scripts/routeros-interop-l2.sh ntp` agora exige que o CHR sincronize no CoreRouter.
+
+  Como testar: `docs/ntp.md`, seção "Como testar".
+
+- 2026-11-09 — G4.6g: Log em disco, a ação `disk` do RouterOS. Embutida como a `memory`; nenhuma regra manda para ela
+  por padrão, como no RouterOS: `system.logging.add {"topics":["info"],"action":"disk"}` liga.
+  `system.logging.action.set name=disk` aceita `disk_file_name` (`log`), `disk_lines_per_file` (1000),
+  `disk_file_count` (2, até 256) e `disk_stop_on_full` (não); a janela System › Logging edita e mostra
+  o estado. Os arquivos ficam em `<config>/log/log.0.txt` (em uso), `log.1.txt`…, uma linha JSON por
+  evento. Depois de reiniciar, `log.print` traz o que estava nos arquivos antes da partida, com
+  `from_disk: true` (selo "disco" na janela Log); uma linha além de `memory_lines` também vem de lá.
+  `log.clear` apaga os arquivos.
+
+  Escrita em lote: o serviço `disk-log` tira a fila do `Session` uma vez por segundo (só uma troca sob
+  o lock; codificar e escrever é fora dele) e escreve no cache de páginas, então a queda do daemon não
+  perde nada; o `fsync` é por minuto, na hora para `critical` e na saída limpa, como o
+  `SyncIntervalSec` do journald. Falta de energia perde até um minuto.
+
+  Teto: os arquivos ficam em 5 % do `/config` (`system.config-disk.print`), o mais velho sai primeiro,
+  os de um nome antigo antes de todos. Antes de escrever, deixa livres 10 % do disco ou 3× o slot da
+  config, o que for maior; se apagar arquivos não bastar, a linha fica só na memória e é contada, com
+  log e item `Config disk` na saúde.
+
+  Arquivo hostil: uma linha ruim custa só ela; a última sem `\n` é o que uma queda deixa e não conta
+  como dano; o que volta é conferido como se fosse novo (tópicos da lista, sem escapes de terminal,
+  tudo limitado). Proptest em `crates/engine/tests/it/log_disk.rs`.
+
+  Como testar: daemon com `--config-dir` (tmpfs em user namespace serve), a regra acima, comandos,
+  `kill` e nova partida, `corerouter-cli run log.print`. **Medido** (daemon real, tmpfs de 16 MiB,
+  2026-11-09): 47 linhas voltaram depois de SIGTERM; a linha de um commit voltou depois de `kill -9`
+  2 s depois dele; lixo e linha cortada no fim do arquivo custaram 2 linhas contadas em `bad_lines`,
+  com 48 de volta; `/config` a 100 %: 31 linhas descartadas e contadas, a config continuou salvando
+  (`last_error` nulo, revisão 79 de volta depois de reiniciar).
