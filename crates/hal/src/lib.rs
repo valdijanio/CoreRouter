@@ -23,6 +23,7 @@ pub mod lsp;
 pub mod mpls;
 pub mod neigh;
 pub mod nic;
+pub mod nic_problem;
 pub mod oslog;
 pub mod pppoe;
 pub mod pppoe_client;
@@ -774,6 +775,13 @@ pub trait Hal: Send {
         Err(HalError::Unsupported(
             "this backend has no OS log (the daemon's oslog service reads it)".into(),
         ))
+    }
+
+    /// The network cards and what the kernel said about them (G1.6ja), for a
+    /// backend that knows without reading a real machine (the lab). On Linux
+    /// the daemon's `nic_problems` service reads them on its own thread.
+    fn nic_reading(&mut self) -> Option<nic_problem::NicReading> {
+        None
     }
 
     fn resources(&mut self) -> Option<resources::Resources> {

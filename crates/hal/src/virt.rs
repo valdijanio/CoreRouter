@@ -735,6 +735,10 @@ impl Hal for VirtualHal {
         Ok(self.oslog.read(now, max))
     }
 
+    fn nic_reading(&mut self) -> Option<crate::nic_problem::NicReading> {
+        Some(crate::nic_problem::lab_reading())
+    }
+
     fn resources(&mut self) -> Option<crate::resources::Resources> {
         let t = self.ticks;
         let wave = |period: u64, amp: u64| {

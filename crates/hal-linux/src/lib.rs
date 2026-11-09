@@ -184,6 +184,9 @@ mod cpu_tuning;
 pub fn links_rtnetlink() -> Result<Vec<owner::KernelLink>, corerouter_hal::HalError> {
     netlink::links_rtnetlink()
 }
+/// Network cards without a driver or firmware (G1.6ja).
+#[cfg(target_os = "linux")]
+pub mod nic_scan;
 #[cfg(target_os = "linux")]
 pub mod oslog;
 

@@ -66,6 +66,9 @@ pub(crate) struct Iface {
     /// `Some(why)`: a port of the config not on this machine, or a VLAN on
     /// one (G1.3b, RouterOS flag I); its configuration waits for it.
     pub invalid: Option<String>,
+    /// G1.6ja: (`firmware` | `safe-mode`, why): the kernel could not bring
+    /// the card behind this port up in full.
+    pub hardware: Option<(String, String)>,
 }
 
 impl Iface {
@@ -91,6 +94,7 @@ impl Iface {
             unmanaged: (row.get("managed").and_then(Value::as_bool) == Some(false))
                 .then(|| opt("unmanaged_reason").unwrap_or_else(|| "not managed".into())),
             invalid: flag("invalid").then(|| opt("invalid_reason").unwrap_or_else(|| "not on this machine".into())),
+            hardware: opt("hardware_problem").map(|k| (k, opt("hardware_problem_reason").unwrap_or_default())),
         }
     }
 
@@ -369,6 +373,8 @@ impl CoreRouterUi {
             crate::chip::chip(ui, &format!("{} interfaces", ifaces.len()), crate::chip::neutral_tone(ui.visuals()));
             let running = ifaces.iter().filter(|i| i.running && !i.disabled).count();
             crate::chip::chip(ui, &format!("{running} up"), crate::chip::GREEN.tone(ui.visuals()));
+            // G1.6ja: a card with no driver has no row below.
+            self.nic_problem_chips(ui);
         });
         ui.separator();
 
@@ -431,6 +437,9 @@ impl CoreRouterUi {
                     ("no link", crate::chip::neutral_tone(&visuals))
                 };
                 crate::chip::chip(ui, crate::i18n::tr_in("interfaces", self.lang.labels, status), tone);
+                if let Some((kind, why)) = &i.hardware {
+                    crate::chip::chip(ui, hardware_word(kind), crate::chip::AMBER.tone(&visuals)).on_hover_text(why);
+                }
                 if let Some(view) = self.nic.get(&i.name)
                     && let Some(m) = view.monitor_value()
                         && let Some(rate) = m.get("rate").and_then(Value::as_str) {
@@ -909,7 +918,10 @@ pub(crate) fn iface_row(row: &Value, spark: &std::collections::BTreeMap<String, 
                 if row.get("usb").is_some_and(Value::is_object) { crate::icons::USB } else { type_icon(&i.kind) },
                 i.kernel_kind
             ),
-            crate::chip::cell("", &[link_chip(&i)]),
+            match &i.hardware {
+                Some((kind, _)) => crate::chip::cell("", &[link_chip(&i), (hardware_word(kind), crate::chip::Kind::Amber)]),
+                None => crate::chip::cell("", &[link_chip(&i)]),
+            },
             i.mtu.clone(),
             human_bytes(n("rx_bytes")),
             human_bytes(n("tx_bytes")),
@@ -923,6 +935,11 @@ pub(crate) fn iface_row(row: &Value, spark: &std::collections::BTreeMap<String, 
         section: false,
         tint: None,
     }
+}
+
+/// The chip's word for what `interface.list` says about the card (G1.6ja).
+fn hardware_word(kind: &str) -> &'static str {
+    if kind == "safe-mode" { "safe mode" } else { "firmware" }
 }
 
 /// The Link cell: invalid (G1.3b) before disabled, then up or no link.
@@ -989,6 +1006,9 @@ fn info(i: &Iface) -> String {
     }
     if let Some(why) = &i.invalid {
         parts.push(format!("invalid: {why}"));
+    }
+    if let Some((_, why)) = &i.hardware {
+        parts.push(why.clone());
     }
     parts.join(", ")
 }
