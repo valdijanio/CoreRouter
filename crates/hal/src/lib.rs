@@ -9,6 +9,7 @@ pub mod absent;
 pub mod address_state;
 pub mod capture;
 pub mod cgnat;
+pub mod clock;
 pub mod conntrack;
 pub mod dhcp;
 pub mod dhcp_server;
@@ -392,6 +393,16 @@ pub trait Hal: Send {
     ) -> Result<Box<dyn pppoe_client::PppoeClientPort>, HalError> {
         Err(HalError::Unsupported(format!(
             "{} has no PPPoE client transport (asked for '{client}' on '{uplink}')",
+            self.describe()
+        )))
+    }
+
+    /// The system clock, for the NTP client to discipline (G4.6b). Only a
+    /// backend that owns a real machine has one; the virtual lab never
+    /// touches the clock of the computer it runs on.
+    fn system_clock(&mut self) -> Result<Box<dyn clock::SystemClock>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no system clock to set",
             self.describe()
         )))
     }

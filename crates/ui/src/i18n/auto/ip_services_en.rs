@@ -1,0 +1,14 @@
+//! English explanations of IP › Services (G1.6p), scope `ip_services`, sorted by key.
+
+/// Explanations: (key, Markdown).
+pub(super) const HELP: &[(&str, &str)] = &[
+    ("ip_services.address", "## Address\n\nThe address the service listens on. `::` is every IPv6 and IPv4 address; `0.0.0.0`, every IPv4 one. It must be an address of the router. To limit **who** may connect, use **Available From**; this field limits **where** the service answers.\n\n## Careful\nOn `www-ssl`, moving away from the address this window uses blocks your next login."),
+    ("ip_services.available_from", "## Available From\n\nThe networks allowed to connect (RouterOS `address`), comma-separated; a bare address is a host. Empty is everyone who reaches the port. Others are disconnected without an answer and counted in **Refused**.\n\n## Recommended\nOn `metrics`, which has no login, name the Prometheus server. For untrusted networks, a firewall rule protects better: the packet does not even reach the service.\n\n## Careful\nOn `www-ssl`, leaving your address out blocks your next login."),
+    ("ip_services.enabled", "## Enabled\n\nWhether the service listens. The router opens or closes the listener at once, without a restart; connections already open stay up."),
+    ("ip_services.last_error", "## Last Error\n\nWhy the listener could not open, such as a port already in use. The router tries again every few seconds."),
+    ("ip_services.name", "## Name\n\n**www-ssl**: the GUI in a browser and the control channel over WebSocket, on HTTPS with the router's certificate. **www**: plain HTTP that only redirects to `www-ssl`, so a password never travels in clear text. **metrics**: the Prometheus `/metrics` endpoint, without login.\n\nThe chip **this session** marks the service this window came through."),
+    ("ip_services.port", "## Port\n\nThe TCP port, 1 to 65535. Defaults: 443 for `www-ssl`, 80 for `www`, 9100 for `metrics`. `www-ssl` and `www` cannot share a port.\n\n## Careful\nOn `www-ssl`, changing the port this window uses blocks your next login at the old address: the browser must use the new port."),
+    ("ip_services.refused", "## Refused\n\nConnections dropped because the client is not in **Available From**, since the listener opened. A count that grows may be someone scanning the router, or a client you forgot to allow."),
+    ("ip_services.status", "## Status\n\n**listening**: the socket is open. **stopped**: turned off, or no daemon is running it. **error**: it could not open; see **Last Error**."),
+    ("menu.ip-services", "## What it does\nThe router's services on the network, as RouterOS `/ip service`: which ones are on, on what port and address, and who may connect.\n\n## Careful\nThe router refuses a change that would block the next login of the session using that service, unless you confirm it. Safe Mode is the way to try one: if the connection is lost, the router undoes the change."),
+];

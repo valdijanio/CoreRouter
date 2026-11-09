@@ -307,3 +307,8 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-11-08 — G1.6g parte 1 (imagem e instalador por BIOS, GRUB)
 - 2026-11-08 — G1.6j feito (conjunto amplo de placas com fio e USB)
 - 2026-11-08 — G1.6g feito (A/B em BIOS)
+- 2026-11-09 — G0.30d feito (`netns_nat_ipfix` espera por progresso e confere o que o exportador contou)
+- 2026-11-09 — G1.27e em andamento (parte a: tabelas nomeadas)
+- 2026-11-09 — G1.6qh feito (Reboot e Shutdown na GUI)
+- 2026-11-09 — G1.6x feito (espaço do /config e remoção de cópias na janela Packages)
+- 2026-11-09 — G4.6b feito (o cliente NTP acerta o relógio do sistema)

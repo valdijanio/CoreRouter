@@ -18,6 +18,8 @@
 
 use thiserror::Error;
 
+pub mod discipline;
+
 /// RFC 5905 §7.2: NTP is UDP port 123.
 pub const PORT: u16 = 123;
 /// RFC 4330 §4 / RFC 5905 §7.3: the header without extensions.
@@ -64,6 +66,9 @@ pub const MODE_SERVER: u8 = 4;
 pub const LEAP_ALARM: u8 = 3;
 /// RFC 5905 §7.3: stratum 16 = unsynchronized; 0 = Kiss-o'-Death (§7.4).
 pub const STRATUM_UNSYNC: u8 = 16;
+
+/// RFC 5905 Figure 6: MAXDISP = 16 s, in the short format (16.16 seconds).
+const MAX_DISPERSION_SHORT: u64 = 16 << 16;
 
 /// The NTP header (RFC 5905 §7.3, Figure 8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -196,6 +201,8 @@ pub enum ReplyError {
     TransmitBeforeReceive,
     #[error("server is not synchronized")]
     Unsynchronized,
+    #[error("server's root distance or reference time is not believable")]
+    BadHeader,
     /// RFC 5905 §7.4: DENY and RSTR mean stop asking this server; RATE
     /// means poll less often.
     #[error("kiss-o'-death {0}")]
@@ -206,7 +213,10 @@ pub enum ReplyError {
 /// version 1..=4 (§5 lets the server answer in an older version), Origin
 /// equal to the Transmit we sent, Transmit non-zero, stratum 0 is a kiss,
 /// LI 3 or stratum ≥ 16 is an unsynchronized server. RFC 5905 §8 packet
-/// sanity: Receive non-zero too, and not after Transmit (T2 ≤ T3).
+/// sanity: Receive non-zero too, and not after Transmit (T2 ≤ T3). RFC 5905
+/// A.5.1.1 `packet()` (erratum 5978 for the units): a root distance of
+/// MAXDISP or more, or a Reference after Transmit, is a bad header. This
+/// answer can set the system clock (G4.6b).
 pub fn check_reply(sent: Timestamp, reply: &Packet) -> Result<(), ReplyError> {
     if reply.mode != MODE_SERVER {
         return Err(ReplyError::NotServer(reply.mode));
@@ -231,6 +241,13 @@ pub fn check_reply(sent: Timestamp, reply: &Packet) -> Result<(), ReplyError> {
     }
     if reply.leap == LEAP_ALARM || reply.stratum >= STRATUM_UNSYNC {
         return Err(ReplyError::Unsynchronized);
+    }
+    let distance = u64::from(reply.root_delay / 2) + u64::from(reply.root_dispersion);
+    if distance >= MAX_DISPERSION_SHORT
+        || (!reply.reference.is_zero()
+            && reply.reference.to_unix_nanos() > reply.transmit.to_unix_nanos())
+    {
+        return Err(ReplyError::BadHeader);
     }
     Ok(())
 }
@@ -390,6 +407,69 @@ mod tests {
         assert_eq!(
             check_reply(sent, &Packet { version: 0, ..ok }),
             Err(ReplyError::Version(0))
+        );
+        // RFC 5905 A.5.1.1: root distance ≥ MAXDISP (16 s), and a Reference
+        // Timestamp after Transmit.
+        assert_eq!(
+            check_reply(
+                sent,
+                &Packet {
+                    root_dispersion: 16 << 16,
+                    ..ok
+                }
+            ),
+            Err(ReplyError::BadHeader)
+        );
+        assert_eq!(
+            check_reply(
+                sent,
+                &Packet {
+                    root_delay: 32 << 16,
+                    ..ok
+                }
+            ),
+            Err(ReplyError::BadHeader)
+        );
+        assert_eq!(
+            check_reply(
+                sent,
+                &Packet {
+                    root_delay: u32::MAX,
+                    root_dispersion: u32::MAX,
+                    ..ok
+                }
+            ),
+            Err(ReplyError::BadHeader)
+        );
+        assert_eq!(
+            check_reply(
+                sent,
+                &Packet {
+                    root_dispersion: (16 << 16) - 1,
+                    ..ok
+                }
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check_reply(
+                sent,
+                &Packet {
+                    reference: Timestamp(ok.transmit.0 + (1 << 32)),
+                    ..ok
+                }
+            ),
+            Err(ReplyError::BadHeader)
+        );
+        assert_eq!(
+            check_reply(
+                sent,
+                &Packet {
+                    reference: ok.transmit,
+                    ..ok
+                }
+            ),
+            Ok(())
         );
     }
 

@@ -173,19 +173,27 @@ pub(super) fn opt_secs(p: &Value, key: &str) -> Result<Option<u32>> {
 /// The checks about item `id` in the candidate: the first error refuses
 /// the command (on the parameter it names); the warnings come back.
 pub(super) fn verdict(s: &Session, kind: &str, id: ItemId) -> Result<Vec<String>> {
-    let all = checks::checks(s.store().candidate());
     let mine = about(kind, id);
-    if let Some(e) = all.iter().find(|c| mine(c) && c.level == Level::Error) {
-        let field = e.path.rsplit('.').next().unwrap_or("id");
-        return Err(EngineError::bad(field, e.text.clone()));
+    let about_it = checks::checks(s.store().candidate()).into_iter().filter(|c| mine(c));
+    judged(about_it)
+}
+
+/// The first error refuses the command; the warnings come back. Errors
+/// elsewhere that this change caused (a pool now overlapping one it did
+/// not before) are reported by the commit.
+pub(super) fn judged(about_it: impl Iterator<Item = Check>) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
+    for c in about_it {
+        match c.level {
+            Level::Error => {
+                let field = c.path.rsplit('.').next().unwrap_or("id");
+                return Err(EngineError::bad(field, c.text));
+            }
+            Level::Warn => warnings.push(c.text),
+            Level::Ok => {}
+        }
     }
-    // Errors elsewhere that this change caused (a pool now overlapping one
-    // it did not before) are reported by the commit; here, warnings.
-    Ok(all
-        .into_iter()
-        .filter(|c| mine(c) && c.level == Level::Warn)
-        .map(|c| c.text)
-        .collect())
+    Ok(warnings)
 }
 
 /// Whether a check is about item `id` of list `kind` (`servers`, `pools`…:
