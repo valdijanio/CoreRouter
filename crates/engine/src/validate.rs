@@ -74,7 +74,8 @@ pub const UNITS: &[Unit] = &[
     },
     Unit {
         name: "ntp",
-        reads: Sections::SYSTEM,
+        // The client's VRF is an interface.
+        reads: Sections::SYSTEM.union(Sections::INTERFACES),
         run: |cfg| {
             let mut out = Vec::new();
             ntp_checks(cfg, &mut out);
@@ -405,6 +406,16 @@ fn ntp_checks(cfg: &Config, out: &mut Vec<Issue>) {
         out.push(Issue::new(
             "system.ntp_client.min_poll",
             "min_poll must not be above max_poll",
+        ));
+    }
+    if c.vrf != corerouter_model::ntp::MAIN_VRF
+        && !cfg.interfaces.iter().any(|(name, i)| {
+            name.as_str() == c.vrf && matches!(i.kind, InterfaceKind::Vrf { .. })
+        })
+    {
+        out.push(Issue::new(
+            "system.ntp_client.vrf",
+            format!("VRF '{}' does not exist", c.vrf),
         ));
     }
     if c.servers.len() > MAX_SERVERS {
