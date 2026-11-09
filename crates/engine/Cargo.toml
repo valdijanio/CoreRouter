@@ -46,6 +46,10 @@ proptest.workspace = true
 
 # G4.6c: an allow list that names a big address list.
 [[bench]]
+name = "log_disk"
+harness = false
+
+[[bench]]
 name = "ntp_sources"
 harness = false
 

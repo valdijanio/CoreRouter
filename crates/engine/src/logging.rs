@@ -11,7 +11,12 @@
 //! sends it there (the RouterOS defaults: `info`, `warning`, `error`,
 //! `critical`), which keeps the last `memory_lines` for `log.print`; the
 //! daemon reads [`Session::log_since`] and sends the events the rules route
-//! to remote actions as syslog datagrams (`routes`).
+//! to remote actions as syslog datagrams (`routes`). An event a rule sends
+//! to `disk` (G4.6g) waits in a bounded queue for the daemon's writer, which
+//! takes it out without doing any I/O under the session lock; the newest
+//! [`crate::log_disk::WINDOW`] of them stay here, with what the files gave
+//! back at boot, so `log.print` reads memory and disk without touching the
+//! disk.
 
 use std::collections::VecDeque;
 
@@ -31,8 +36,7 @@ const MAX_PARAMS_TEXT: usize = 200;
 /// Longest JSON kept in the technical detail of one event.
 const MAX_DETAIL_TEXT: usize = 2048;
 
-/// The log at run time (`Session::ext`): never saved, gone on restart
-/// (writing it to disk is G4.6f).
+/// The log at run time (`Session::ext`).
 #[derive(Debug, Default)]
 pub struct LogBook {
     seq: u64,
@@ -40,12 +44,74 @@ pub struct LogBook {
     recent: VecDeque<LogEvent>,
     /// What rules sent to `memory`: `log.print`.
     memory: VecDeque<LogEvent>,
+    /// G4.6g: a writer exists (the daemon, with a config directory).
+    disk_attached: bool,
+    /// What rules sent to `disk`, for the writer.
+    disk_queue: Vec<LogEvent>,
+    /// The newest lines of the disk, restored ones first: `log.print`.
+    disk_window: VecDeque<LogEvent>,
+    /// `log.clear` counts here: the writer deletes the files.
+    disk_clears: u64,
+    pub disk: DiskLogStatus,
 }
 
 impl LogBook {
     pub fn memory(&self) -> impl DoubleEndedIterator<Item = &LogEvent> {
         self.memory.iter()
     }
+
+    /// What `log.print` looks at, oldest first; `true`: only the disk has it.
+    pub fn rows(&self) -> Vec<(&LogEvent, bool)> {
+        let mut out = Vec::with_capacity(self.memory.len().saturating_add(self.disk_window.len()));
+        let (mut m, mut d) = (self.memory.iter().peekable(), self.disk_window.iter().peekable());
+        loop {
+            match (m.peek(), d.peek()) {
+                (Some(a), Some(b)) if a.seq == b.seq => {
+                    out.push((*a, false));
+                    m.next();
+                    d.next();
+                }
+                (Some(a), Some(b)) if a.seq < b.seq => {
+                    out.push((*a, false));
+                    m.next();
+                }
+                (Some(a), None) => {
+                    out.push((*a, false));
+                    m.next();
+                }
+                (_, Some(b)) => {
+                    out.push((*b, true));
+                    d.next();
+                }
+                (None, None) => return out,
+            }
+        }
+    }
+}
+
+/// How the log files are doing, reported by the writer (`disk_status` in
+/// `system.logging.action.list`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct DiskLogStatus {
+    /// Where the files are; `None`: no writer (no `--config-dir`).
+    pub dir: Option<String>,
+    pub files: usize,
+    pub bytes: u64,
+    /// The ceiling (a share of `/config`).
+    pub cap_bytes: u64,
+    pub lines_written: u64,
+    /// Lines that did not reach a file (queue full, disk full, stop on full).
+    pub lines_dropped: u64,
+    /// Files deleted before `disk_file_count` because of the ceiling.
+    pub files_cut: u64,
+    /// `disk_stop_on_full` reached.
+    pub stopped: bool,
+    /// Lines given back at boot and bad lines left out.
+    pub restored: usize,
+    pub bad_lines: usize,
+    pub flushes: u64,
+    pub last_flush: Option<u64>,
+    pub last_error: Option<String>,
 }
 
 /// Topic of a command by its id, RouterOS-like.
@@ -386,7 +452,7 @@ pub fn routes<'a>(logging: &'a Logging, ev: &LogEvent) -> Vec<&'a LogRule> {
 }
 
 /// `s` with every control character (newline, ESC, …) as a space.
-fn one_line(s: &str) -> String {
+pub(crate) fn one_line(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
@@ -403,6 +469,21 @@ pub(crate) fn cut(s: &str, max: usize) -> String {
     format!("{}…", s.get(..end).unwrap_or_default())
 }
 
+impl LogBook {
+    /// `ev` goes to the writer and to `log.print`'s window.
+    fn disk_note(&mut self, ev: &LogEvent) {
+        if self.disk_queue.len() < crate::log_disk::MAX_QUEUE {
+            self.disk_queue.push(ev.clone());
+        } else {
+            self.disk.lines_dropped = self.disk.lines_dropped.saturating_add(1);
+        }
+        self.disk_window.push_back(ev.clone());
+        while self.disk_window.len() > crate::log_disk::WINDOW {
+            self.disk_window.pop_front();
+        }
+    }
+}
+
 impl Session {
     /// Log one event: numbered, timed by the session clock, kept for the
     /// remote forwarder and, when a rule says so, in `memory`.
@@ -411,6 +492,7 @@ impl Session {
         let logging = &self.store().running().system.logging;
         let topics: Vec<String> = topics.iter().map(|t| (*t).to_owned()).collect();
         let keep = logging.to_memory(&topics);
+        let to_disk = logging.to_disk(&topics);
         let lines = usize::try_from(logging.memory_lines.max(1)).unwrap_or(usize::MAX);
         let Some(book) = self.ext_mut::<LogBook>() else {
             return;
@@ -431,6 +513,9 @@ impl Session {
         }
         while book.memory.len() > lines {
             book.memory.pop_front();
+        }
+        if to_disk && book.disk_attached {
+            book.disk_note(&ev);
         }
         book.recent.push_back(ev);
         while book.recent.len() > MAX_RECENT {
@@ -454,13 +539,55 @@ impl Session {
         self.ext::<LogBook>().map_or(0, |b| b.seq)
     }
 
-    /// Empty `memory` (`log.clear`); the numbering goes on.
+    /// Empty `memory` and the disk (`log.clear`; the writer deletes the
+    /// files); the numbering goes on.
     pub(crate) fn log_clear(&mut self) -> usize {
         self.ext_mut::<LogBook>().map_or(0, |b| {
-            let n = b.memory.len();
+            let n = b.rows().len();
             b.memory.clear();
+            b.disk_window.clear();
+            b.disk_queue.clear();
+            b.disk_clears = b.disk_clears.saturating_add(1);
             n
         })
+    }
+
+    /// G4.6g, at boot, before any service reads the log: a writer exists and
+    /// the files gave these lines back. They become the oldest lines: 1..=k,
+    /// and what the boot logged so far moves up (nobody has seen those
+    /// numbers yet). What the boot logged goes to the writer too.
+    pub fn log_disk_attach(&mut self, mut restored: Vec<LogEvent>, bad_lines: usize) {
+        let skip = restored.len().saturating_sub(crate::log_disk::WINDOW);
+        restored.drain(..skip);
+        let k = restored.len() as u64;
+        let logging = self.store().running().system.logging.clone();
+        let Some(book) = self.ext_mut::<LogBook>() else { return };
+        for (e, seq) in restored.iter_mut().zip(1u64..) {
+            e.seq = seq;
+        }
+        for e in book.memory.iter_mut().chain(book.recent.iter_mut()) {
+            e.seq = e.seq.saturating_add(k);
+        }
+        book.seq = book.seq.saturating_add(k);
+        book.disk.restored = restored.len();
+        book.disk.bad_lines = bad_lines;
+        book.disk_window = restored.into();
+        book.disk_attached = true;
+        let booted: Vec<LogEvent> = book.recent.iter().filter(|e| logging.to_disk(&e.topics)).cloned().collect();
+        for e in &booted {
+            book.disk_note(e);
+        }
+    }
+
+    /// How many `log.clear` so far.
+    pub fn log_disk_clears(&self) -> u64 {
+        self.ext::<LogBook>().map_or(0, |b| b.disk_clears)
+    }
+
+    /// What is waiting for the writer, and how many `log.clear` so far.
+    pub fn log_disk_take(&mut self) -> (Vec<LogEvent>, u64) {
+        self.ext_mut::<LogBook>()
+            .map_or_else(|| (Vec::new(), 0), |b| (std::mem::take(&mut b.disk_queue), b.disk_clears))
     }
 
     /// A trimmed `memory_lines` takes effect at once.

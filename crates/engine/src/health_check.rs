@@ -367,12 +367,18 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
             if u.graph_removed > 0 {
                 cut.push(format!("{} arquivos antigos de gráfico apagados", u.graph_removed));
             }
-            let value = format!("revisões {} de {}, gráficos {} de {}", mib(u.history_bytes), mib(u.history_budget), mib(u.graph_bytes), mib(u.graph_budget));
+            if u.log_dropped > 0 {
+                cut.push(format!("{} linhas de log não chegaram ao disco", u.log_dropped));
+            }
+            if let Some(e) = &u.log_error {
+                cut.push(format!("log em disco: {e}"));
+            }
+            let value = format!("revisões {} de {}, gráficos {} de {}, log {} de {}", mib(u.history_bytes), mib(u.history_budget), mib(u.graph_bytes), mib(u.graph_budget), mib(u.log_bytes), mib(u.log_budget));
             if cut.is_empty() {
-                push("config_disk", "Config disk", Severity::Ok, Some(value), format!("histórico e gráficos dentro da cota de {} do /config", mib(u.capacity)), None);
+                push("config_disk", "Config disk", Severity::Ok, Some(value), format!("históricos dentro da cota de {} do /config", mib(u.capacity)), None);
             } else {
                 push("config_disk", "Config disk", Severity::Warning, Some(value), cut.join("; "),
-                    Some("A configuração ativa e a revisão anterior nunca saem. Para guardar mais: um /config maior, menos interfaces nos gráficos (system.graph.set exclude) ou uma configuração menor; veja system.config-disk.print."));
+                    Some("A configuração ativa e a revisão anterior nunca saem. Para guardar mais: um /config maior, menos interfaces nos gráficos (system.graph.set exclude), menos log em disco (system.logging) ou uma configuração menor; veja system.config-disk.print."));
             }
         }
     }
@@ -1129,6 +1135,14 @@ mod tests {
                 "revisions cut",
                 |i| {
                     i.config_disk = Some(crate::config_disk::Usage { revisions_not_saved: 3, ..Default::default() });
+                },
+                "config_disk",
+                Severity::Warning,
+            ),
+            (
+                "log lines dropped",
+                |i| {
+                    i.config_disk = Some(crate::config_disk::Usage { log_dropped: 1, ..Default::default() });
                 },
                 "config_disk",
                 Severity::Warning,

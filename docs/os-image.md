@@ -464,7 +464,7 @@ Scrub) e **System › Tuning › Boot** (o que cada slot carrega, "Apply on slot
 - **O snapshot cabe no `/config` (G1.6u).** O que o armazenamento só troca por rename
   (`running.json`, `running.json.prev`, `rev-*.json`, `state-*.json`) entra por **hard link**
   (custo zero; o snapshot guarda o conteúdo antigo depois do próximo save); o resto (o journal,
-  que cresce no lugar, chaves) é copiado; `graphs/` (histórico de tráfego) fica fora do snapshot
+  que cresce no lugar, chaves) é copiado; `graphs/` (histórico de tráfego) e `log/` (log em disco, G4.6g) ficam fora do snapshot
   e o restore não o apaga. Antes de gravar o slot, a atualização confere se o `/config` tem o
   que a cópia precisa mais 1 MiB e recusa com os números e os maiores itens; uma cópia que falha
   mesmo assim é apagada. Na VM de teste (`/config` de 56 MB, uma revisão de 10,7 MB no

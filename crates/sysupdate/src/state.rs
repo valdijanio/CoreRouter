@@ -156,6 +156,9 @@ pub struct SnapshotMeta {
 /// is, never part of a snapshot nor replaced by a restore (G1.6u: it is
 /// not configuration, and going back would lose the trial's hours).
 pub const GRAPHS: &str = "graphs";
+/// The log files (the `disk` action, G4.6g): like [`GRAPHS`]. Going back
+/// must not undo what the log says happened during the trial.
+pub const LOG: &str = "log";
 /// Room left beyond the snapshot itself (the trial state, a revision the
 /// daemon writes while the update runs).
 pub const SPACE_MARGIN: u64 = 1 << 20;
@@ -165,7 +168,7 @@ const BLOCK: u64 = 4096;
 const BIGGEST: usize = 4;
 
 fn skip(name: &str) -> bool {
-    name == DIR || name == "lost+found" || name == GRAPHS
+    name == DIR || name == "lost+found" || name == GRAPHS || name == LOG
 }
 
 /// Files the configuration storage (`storage-fs`) only ever replaces by
@@ -325,7 +328,7 @@ pub struct Use {
     /// `rev-81.json`, `graphs`, `package/config-b`, `package/config-a.new`.
     pub path: String,
     pub bytes: u64,
-    /// `snapshot`, `partial` (a snapshot cut short), `graphs`, `config`.
+    /// `snapshot`, `partial` (a snapshot cut short), `graphs`, `log`, `config`.
     pub kind: &'static str,
 }
 
@@ -363,7 +366,11 @@ pub fn usage(config: &Path) -> Vec<Use> {
                 }
                 continue;
             }
-            let kind = if n == GRAPHS { "graphs" } else { "config" };
+            let kind = match n.as_str() {
+                GRAPHS => "graphs",
+                LOG => "log",
+                _ => "config",
+            };
             out.push(Use {
                 path: n,
                 bytes: tree_bytes(&e.path(), false),
@@ -411,7 +418,7 @@ pub fn snapshot_dir(config: &Path, slot: SlotId) -> (String, PathBuf) {
     (name, path)
 }
 
-/// Copies the configuration directory (all but [`DIR`] and [`GRAPHS`]) to
+/// Copies the configuration directory (all but [`DIR`], [`GRAPHS`] and [`LOG`]) to
 /// `package/config-<slot>/`, replacing an older snapshot only once the new
 /// one is complete. Files the storage only replaces by rename are hard
 /// links (G1.6u: the 64 revisions of a big config cost nothing twice).
@@ -551,7 +558,7 @@ pub fn remove(
 }
 
 /// Puts snapshot `name` back as the configuration: every entry of `config`
-/// but [`DIR`] and [`GRAPHS`] is replaced by the snapshot's (linked where
+/// but [`DIR`], [`GRAPHS`] and [`LOG`] is replaced by the snapshot's (linked where
 /// the snapshot linked).
 pub fn restore(config: &Path, name: &str) -> Result<usize, String> {
     let src = config.join(DIR).join(name);
@@ -660,6 +667,8 @@ mod tests {
         std::fs::write(d.join("journal-config.log"), "a\n").unwrap();
         std::fs::create_dir_all(d.join(GRAPHS)).unwrap();
         std::fs::write(d.join(GRAPHS).join("system.rrd"), vec![0u8; 200_000]).unwrap();
+        std::fs::create_dir_all(d.join(LOG)).unwrap();
+        std::fs::write(d.join(LOG).join("log.0.txt"), b"during the trial").unwrap();
         let need = snapshot_need(&d).unwrap();
         assert!(
             need < 64 << 10,
@@ -675,6 +684,7 @@ mod tests {
             "appended to: copied"
         );
         assert!(!snap.join(GRAPHS).exists(), "graphs are not configuration");
+        assert!(!snap.join(LOG).exists(), "nor is the log");
         // The storage saves by rename: the snapshot keeps the old content.
         std::fs::write(d.join("running.json.tmp"), r#"{"format_version":2}"#).unwrap();
         std::fs::rename(d.join("running.json"), d.join("running.json.prev")).unwrap();
@@ -695,6 +705,11 @@ mod tests {
         );
         assert!(d.join("rev-81.json").exists());
         assert!(!d.join("running.json.prev").exists());
+        assert_eq!(
+            std::fs::read(d.join(LOG).join("log.0.txt")).unwrap(),
+            b"during the trial",
+            "a restore leaves the log"
+        );
         assert_eq!(
             std::fs::read(d.join(GRAPHS).join("system.rrd")).unwrap(),
             b"newer"

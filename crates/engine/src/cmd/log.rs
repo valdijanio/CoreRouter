@@ -1,6 +1,8 @@
 //! /log (G4.6d): the router's own log, what the rules sent to the `memory`
-//! action — journal, DHCP, NTP and the tools, with topics, origin, a
-//! message for people and the technical detail.
+//! and `disk` actions — journal, DHCP, NTP and the tools, with topics,
+//! origin, a message for people and the technical detail. What only the
+//! disk has (from before the last boot, or past `memory_lines`) says
+//! `from_disk`; G4.6g.
 
 use corerouter_model::logging::{LEVELS, LogEvent, level_rank, valid_topic};
 use serde_json::{Value, json};
@@ -16,7 +18,7 @@ const MAX_FIND: usize = 128;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "log.print", "Log", [], None,
-        "{topics?: [string], level?: debug|info|warning|error|critical, since?: int, find?: string, limit?: int 1..2000} → [{seq, date, topics, message, origin, level, time, detail}]",
+        "{topics?: [string], level?: debug|info|warning|error|critical, since?: int, find?: string, limit?: int 1..2000} → [{seq, date, topics, message, origin, level, time, from_disk, detail}]",
         always, print),
     cmd!(
         "log.clear",
@@ -59,7 +61,7 @@ fn wanted_topics(p: &Value) -> Result<Vec<String>> {
 
 /// A line; `date` is `time` for people (UTC, the router has no time zone
 /// yet), first so a terminal table shows it with the message.
-fn row(e: &LogEvent) -> Value {
+fn row(e: &LogEvent, from_disk: bool) -> Value {
     let date = if e.time == 0 {
         String::new()
     } else {
@@ -73,6 +75,7 @@ fn row(e: &LogEvent) -> Value {
         "level": e.level(),
         "origin": e.origin,
         "message": e.message,
+        "from_disk": from_disk,
         "detail": e.detail,
     })
 }
@@ -114,18 +117,19 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
         return Ok(Value::Array(Vec::new()));
     };
     let mut out: Vec<Value> = book
-        .memory()
+        .rows()
+        .into_iter()
         .rev()
-        .filter(|e| e.seq > since)
-        .filter(|e| topics.is_empty() || e.topics.iter().any(|t| topics.contains(t)))
-        .filter(|e| level_rank(e.level()) >= min_rank)
-        .filter(|e| {
+        .filter(|(e, _)| e.seq > since)
+        .filter(|(e, _)| topics.is_empty() || e.topics.iter().any(|t| topics.contains(t)))
+        .filter(|(e, _)| level_rank(e.level()) >= min_rank)
+        .filter(|(e, _)| {
             find.as_ref().is_none_or(|f| {
                 e.message.to_lowercase().contains(f) || e.origin.to_lowercase().contains(f)
             })
         })
         .take(limit)
-        .map(row)
+        .map(|(e, from_disk)| row(e, from_disk))
         .collect();
     out.reverse();
     Ok(Value::Array(out))
@@ -234,5 +238,110 @@ mod tests {
         let rows = print(&mut s, json!({}));
         assert_eq!(rows.len(), 1, "only the clear itself: {rows:?}");
         assert_eq!(rows[0]["message"], "Log apagado");
+    }
+
+    fn disk_rule(s: &mut Session) {
+        s.execute("system.logging.add", &json!({"topics": ["info"], "action": "disk"})).unwrap();
+    }
+
+    fn event(text: &str) -> LogEvent {
+        LogEvent {
+            seq: 0,
+            time: 1_700_000_000,
+            topics: vec!["system".into(), "info".into()],
+            origin: DAEMON.into(),
+            message: text.into(),
+            detail: Value::Null,
+        }
+    }
+
+    /// G4.6g: what the files gave back comes first, marked; nothing shows
+    /// twice; the numbers keep rising; the boot's own lines go to the writer.
+    #[test]
+    fn print_reads_memory_and_disk_and_says_which() {
+        let mut s = Session::virtual_lab();
+        disk_rule(&mut s);
+        let booted = print(&mut s, json!({})).len();
+        assert!(booted > 0);
+        s.log_disk_attach(vec![event("antes de reiniciar 1"), event("antes de reiniciar 2")], 0);
+        let rows = print(&mut s, json!({}));
+        assert_eq!(rows.len(), booted + 2);
+        assert_eq!(rows[0]["message"], "antes de reiniciar 1");
+        assert_eq!(rows[0]["seq"], 1);
+        assert_eq!(rows[0]["from_disk"], true);
+        assert_eq!(rows[1]["from_disk"], true);
+        assert_eq!(rows[2]["from_disk"], false);
+        assert_eq!(rows[2]["seq"], 3, "the boot's lines moved up");
+        let seqs: Vec<u64> = rows.iter().map(|r| r["seq"].as_u64().unwrap()).collect();
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+        let (queued, _) = s.log_disk_take();
+        assert!(queued.iter().any(|e| e.topics.iter().any(|t| t == "info")));
+        assert!(!queued.iter().any(|e| e.message.starts_with("antes")), "not written again");
+
+        // Live lines are in both, shown once, from memory; `since` still
+        // goes forward only.
+        s.log_event(&["system", "info"], DAEMON, "novo".into(), Value::Null);
+        let last = print(&mut s, json!({})).pop().unwrap();
+        assert_eq!(last["message"], "novo");
+        assert_eq!(last["from_disk"], false);
+        let seq = last["seq"].as_u64().unwrap();
+        assert!(print(&mut s, json!({"since": seq})).is_empty());
+        let (queued, _) = s.log_disk_take();
+        assert_eq!(queued.len(), 1);
+        assert!(s.log_disk_take().0.is_empty(), "taken once");
+    }
+
+    /// Past `memory_lines`, the disk still has it.
+    #[test]
+    fn a_line_past_memory_lines_comes_from_the_disk() {
+        let mut s = Session::virtual_lab();
+        disk_rule(&mut s);
+        s.log_disk_attach(Vec::new(), 0);
+        s.execute("system.logging.action.set", &json!({"name": "memory", "memory_lines": 2})).unwrap();
+        for i in 0..5 {
+            s.log_event(&["system", "info"], DAEMON, format!("l{i}"), Value::Null);
+        }
+        let rows = print(&mut s, json!({"find": "l"}));
+        let of = |m: &str| rows.iter().find(|r| r["message"] == m).unwrap()["from_disk"].clone();
+        assert_eq!(of("l0"), true);
+        assert_eq!(of("l4"), false);
+    }
+
+    /// No writer (the GUI's lab, no --config-dir): nothing piles up.
+    #[test]
+    fn without_a_writer_nothing_is_queued() {
+        let mut s = Session::virtual_lab();
+        disk_rule(&mut s);
+        s.log_event(&["system", "info"], DAEMON, "x".into(), Value::Null);
+        assert!(s.log_disk_take().0.is_empty());
+    }
+
+    /// Every line of a full queue is counted; memory does not grow.
+    #[test]
+    fn the_queue_and_the_window_are_bounded() {
+        let mut s = Session::virtual_lab();
+        disk_rule(&mut s);
+        s.log_disk_attach(Vec::new(), 0);
+        let extra = 10;
+        for _ in 0..crate::log_disk::MAX_QUEUE + extra {
+            s.log_event(&["system", "info"], DAEMON, "x".into(), Value::Null);
+        }
+        let book = s.ext::<LogBook>().unwrap();
+        assert!(book.disk.lines_dropped >= extra as u64, "{:?}", book.disk);
+        assert!(book.rows().len() <= crate::log_disk::WINDOW + 1000 + extra, "{}", book.rows().len());
+    }
+
+    #[test]
+    fn clear_also_tells_the_writer_to_delete_the_files() {
+        let mut s = Session::virtual_lab();
+        disk_rule(&mut s);
+        s.log_disk_attach(vec![event("velho")], 0);
+        let (_, clears) = s.log_disk_take();
+        assert_eq!(clears, 0);
+        s.execute("log.clear", &json!({})).unwrap();
+        let (queued, clears) = s.log_disk_take();
+        assert_eq!(clears, 1);
+        assert!(queued.iter().all(|e| e.message == "Log apagado"), "{queued:?}");
+        assert!(print(&mut s, json!({"find": "velho"})).is_empty());
     }
 }

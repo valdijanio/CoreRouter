@@ -1,6 +1,8 @@
 //! /system logging (G4.6): remote syslog actions and the rules that send
 //! events with some topics to them; the built-in `memory` action keeps the
 //! router's own log (`log.print`, G4.6d) and only takes `memory_lines`;
+//! the built-in `disk` keeps it in files that come back after a reboot
+//! (G4.6g, `disk_*`);
 //! the built-in `analytics` action is the ClickHouse exporter's `logs`
 //! table (G4.4f), configured with `system.analytics.*`.
 
@@ -9,7 +11,7 @@ use std::net::IpAddr;
 use corerouter_model::ItemId;
 use corerouter_model::logging::{
     Facility, LogAction, LogRule, Logging, MAX_ACTIONS, MAX_MEMORY_LINES, MAX_NAME, MAX_PREFIX,
-    ANALYTICS_ACTION, MAX_RULES, MAX_TOPICS, MEMORY_ACTION, SeverityChoice, valid_topic,
+    ANALYTICS_ACTION, DISK_ACTION, MAX_DISK_FILE_COUNT, MAX_DISK_LINES_PER_FILE, MAX_RULES, MAX_TOPICS, MEMORY_ACTION, SeverityChoice, valid_disk_file_name, valid_topic,
 };
 use serde_json::{Value, json};
 
@@ -32,7 +34,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Edit Logging Action",
         [],
         None,
-        "{name: string, remote?: ip, remote_port?: int 1..65535, src_address?: ip|\"\", syslog_facility?: kern|user|mail|daemon|auth|syslog|lpr|news|uucp|cron|authpriv|ftp|ntp|local0..local7, syslog_severity?: auto|emergency|alert|critical|error|warning|notice|info|debug, comment?: string, memory_lines?: int 1..65535} → {name}",
+        "{name: string, remote?: ip, remote_port?: int 1..65535, src_address?: ip|\"\", syslog_facility?: kern|user|mail|daemon|auth|syslog|lpr|news|uucp|cron|authpriv|ftp|ntp|local0..local7, syslog_severity?: auto|emergency|alert|critical|error|warning|notice|info|debug, comment?: string, memory_lines?: int 1..65535, disk_file_name?: string (letters, digits, - or _), disk_lines_per_file?: int 1..65535, disk_file_count?: int 1..256, disk_stop_on_full?: bool} → {name}",
         always,
         action_set
     ),
@@ -46,7 +48,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         action_remove
     ),
     cmd!(query "system.logging.action.list", "Logging Actions", [], None,
-        "{} → [{name, target, default, memory_lines, remote, remote_port, src_address, syslog_facility, syslog_severity, comment}]",
+        "{} → [{name, target, default, memory_lines, disk_file_name, disk_lines_per_file, disk_file_count, disk_stop_on_full, disk_status, remote, remote_port, src_address, syslog_facility, syslog_severity, comment}]",
         always, action_list),
     cmd!(
         "system.logging.add",
@@ -105,6 +107,11 @@ fn action_json(a: &LogAction) -> Value {
         "target": "remote",
         "default": false,
         "memory_lines": null,
+        "disk_file_name": null,
+        "disk_lines_per_file": null,
+        "disk_file_count": null,
+        "disk_stop_on_full": null,
+        "disk_status": null,
         "remote": a.remote,
         "remote_port": a.remote_port,
         "src_address": a.src_address,
@@ -198,6 +205,10 @@ fn memory_set(s: &mut Session, p: &Value) -> Result<Value> {
         "syslog_facility",
         "syslog_severity",
         "comment",
+        "disk_file_name",
+        "disk_lines_per_file",
+        "disk_file_count",
+        "disk_stop_on_full",
     ];
     if let Some(k) = remote_keys.iter().find(|k| p.get(**k).is_some_and(|v| !v.is_null())) {
         return Err(EngineError::bad(
@@ -217,10 +228,53 @@ fn memory_set(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "name": MEMORY_ACTION }))
 }
 
+const DISK_KEYS: [&str; 4] = ["disk_file_name", "disk_lines_per_file", "disk_file_count", "disk_stop_on_full"];
+
+/// The `disk_*` of the built-in `disk` action, the only things it has.
+fn disk_set(s: &mut Session, p: &Value) -> Result<Value> {
+    if let Some(k) = p
+        .as_object()
+        .and_then(|o| o.iter().find(|(k, v)| *k != "name" && !v.is_null() && !DISK_KEYS.contains(&k.as_str())))
+        .map(|(k, _)| k.clone())
+    {
+        return Err(EngineError::bad(&k, "the disk action keeps the log in files: it only takes disk_*"));
+    }
+    let mut d = s.store().candidate().system.logging.disk.clone();
+    if let Some(n) = opt_text(p, "disk_file_name", MAX_NAME)? {
+        let n = n.trim().to_owned();
+        valid_disk_file_name(&n).map_err(|e| EngineError::bad("disk_file_name", e))?;
+        d.file_name = n;
+    }
+    if let Some(n) = opt_u32(p, "disk_lines_per_file")? {
+        if !(1..=MAX_DISK_LINES_PER_FILE).contains(&n) {
+            return Err(EngineError::bad("disk_lines_per_file", format!("must be 1..={MAX_DISK_LINES_PER_FILE}")));
+        }
+        d.lines_per_file = n;
+    }
+    if let Some(n) = opt_u32(p, "disk_file_count")? {
+        if !(1..=MAX_DISK_FILE_COUNT).contains(&n) {
+            return Err(EngineError::bad("disk_file_count", format!("must be 1..={MAX_DISK_FILE_COUNT}")));
+        }
+        d.file_count = n;
+    }
+    if let Some(b) = opt_bool(p, "disk_stop_on_full")? {
+        d.stop_on_full = b;
+    }
+    logging(s).disk = d;
+    Ok(json!({ "name": DISK_ACTION }))
+}
+
 fn action_set(s: &mut Session, p: &Value) -> Result<Value> {
     let name = action_name(p, "name")?;
     if name == MEMORY_ACTION {
         return memory_set(s, p);
+    }
+    let remote_named_disk = s.store().candidate().system.logging.action(DISK_ACTION).is_some();
+    if name == DISK_ACTION && !remote_named_disk {
+        return disk_set(s, p);
+    }
+    if let Some(k) = DISK_KEYS.iter().find(|k| p.get(**k).is_some_and(|v| !v.is_null())) {
+        return Err(EngineError::bad(k, format!("only the disk action has {k}; '{name}' is not it")));
     }
     if name == ANALYTICS_ACTION {
         // Nothing to set (an /export round trip names it); any field is a
@@ -279,6 +333,12 @@ fn action_remove(s: &mut Session, p: &Value) -> Result<Value> {
         ));
     }
     let l = &s.store().candidate().system.logging;
+    if name == DISK_ACTION && l.action(&name).is_none() {
+        return Err(EngineError::bad(
+            "name",
+            "disk is built in: it cannot be removed (disable its rules instead)",
+        ));
+    }
     if l.action(&name).is_none() {
         return Err(no_action(&name));
     }
@@ -297,12 +357,35 @@ fn action_remove(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn action_list(s: &mut Session, _: &Value) -> Result<Value> {
+    let status = s.ext::<crate::logging::LogBook>().map(|b| b.disk.clone()).unwrap_or_default();
     let l = &s.store().candidate().system.logging;
     let memory = json!({
         "name": MEMORY_ACTION,
         "target": "memory",
         "default": true,
         "memory_lines": l.memory_lines,
+        "disk_file_name": null,
+        "disk_lines_per_file": null,
+        "disk_file_count": null,
+        "disk_stop_on_full": null,
+        "disk_status": null,
+        "remote": null,
+        "remote_port": null,
+        "src_address": null,
+        "syslog_facility": null,
+        "syslog_severity": null,
+        "comment": "",
+    });
+    let disk = json!({
+        "name": DISK_ACTION,
+        "target": "disk",
+        "default": true,
+        "memory_lines": null,
+        "disk_file_name": l.disk.file_name,
+        "disk_lines_per_file": l.disk.lines_per_file,
+        "disk_file_count": l.disk.file_count,
+        "disk_stop_on_full": l.disk.stop_on_full,
+        "disk_status": status,
         "remote": null,
         "remote_port": null,
         "src_address": null,
@@ -315,6 +398,11 @@ fn action_list(s: &mut Session, _: &Value) -> Result<Value> {
         "target": "analytics",
         "default": true,
         "memory_lines": null,
+        "disk_file_name": null,
+        "disk_lines_per_file": null,
+        "disk_file_count": null,
+        "disk_stop_on_full": null,
+        "disk_status": null,
         "remote": null,
         "remote_port": null,
         "src_address": null,
@@ -322,10 +410,12 @@ fn action_list(s: &mut Session, _: &Value) -> Result<Value> {
         "syslog_severity": null,
         "comment": "",
     });
-    // Built-ins around the remote ones: memory first (as RouterOS lists
-    // it), analytics last.
+    // Built-ins around the remote ones: memory and disk first (as RouterOS
+    // lists them), analytics last.
+    let remote_named_disk = l.action(DISK_ACTION).is_some();
     Ok(Value::Array(
         std::iter::once(memory)
+            .chain((!remote_named_disk).then_some(disk))
             .chain(l.actions.iter().map(action_json))
             .chain(std::iter::once(analytics))
             .collect(),
