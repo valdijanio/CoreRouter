@@ -26,7 +26,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add Route",
         ["IP", "Routes"],
         None,
-        "{dst_address: cidr | ip (0.0.0.0/0, ::/0, 10.1.0.0/16, 192.0.2.7), gateway?: ip | interface | ip%interface | blackhole | unreachable | prohibit (required unless type is a discard), type?: unicast | blackhole | unreachable | prohibit (RouterOS v6 type; blackhole drops silently, unreachable answers ICMP unreachable, prohibit ICMP administratively prohibited; default unicast), blackhole?: bool (RouterOS v7: type=blackhole), distance?: u32 (1..=255, default 1), routing_table?: string (main | VRF name, default main), check_gateway?: none | ping | arp | bfd (default none; ping/arp every 10 s, down after 2 misses: the route leaves the kernel and the next distance wins), bfd_profile?: string (check_gateway=bfd; default 'default'), disabled?: bool, comment?: string} → {id}",
+        "{dst_address: cidr | ip (0.0.0.0/0, ::/0, 10.1.0.0/16, 192.0.2.7), gateway?: ip | interface | ip%interface | blackhole | unreachable | prohibit (required unless type is a discard), type?: unicast | blackhole | unreachable | prohibit (RouterOS v6 type; blackhole drops silently, unreachable answers ICMP unreachable, prohibit ICMP administratively prohibited; default unicast), blackhole?: bool (RouterOS v7: type=blackhole), distance?: u32 (1..=255, default 1), routing_table?: string (main | VRF | routing.table name, default main), check_gateway?: none | ping | arp | bfd (default none; ping/arp every 10 s, down after 2 misses: the route leaves the kernel and the next distance wins), bfd_profile?: string (check_gateway=bfd; default 'default'), disabled?: bool, comment?: string} → {id}",
         always,
         add
     ),

@@ -1327,17 +1327,12 @@ mod linux {
                     && corerouter_model::os_loopback::is_os_address(a))
             });
             // G1.5a: routes without next hop have no link; those of the
-            // config's tables (main and its VRFs) are CoreRouter's to compare.
-            let tables: std::collections::BTreeSet<u32> =
-                std::iter::once(corerouter_model::route::MAIN_TABLE_ID)
-                    .chain(cfg.interfaces.values().filter_map(|i| match i.kind {
-                        corerouter_model::InterfaceKind::Vrf { table } => Some(table),
-                        _ => None,
-                    }))
-                    .collect();
+            // config's tables (main, its VRFs and its named tables) are
+            // CoreRouter's to compare.
+            let tables = corerouter_model::route::tables_by_id(cfg);
             let discards = discards
                 .into_iter()
-                .filter(|d| tables.contains(&d.table))
+                .filter(|d| tables.contains_key(&d.table))
                 .collect();
             Ok(Snapshot {
                 links,
