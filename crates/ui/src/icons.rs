@@ -17,6 +17,7 @@ const FONT: &[u8] = include_bytes!("../assets/phosphor/Phosphor-subset.ttf");
 const NAME: &str = "phosphor";
 
 pub(crate) const ARROW_BEND_UP_RIGHT: &str = "\u{E026}";
+pub(crate) const ARROW_CLOCKWISE: &str = "\u{E036}";
 pub(crate) const ARROWS_LEFT_RIGHT: &str = "\u{E0A0}";
 pub(crate) const ARROWS_SPLIT: &str = "\u{ED3C}";
 pub(crate) const BROADCAST: &str = "\u{E0F2}";
@@ -49,6 +50,7 @@ pub(crate) const PAUSE: &str = "\u{E39E}";
 pub(crate) const PLAY: &str = "\u{E3D0}";
 pub(crate) const PLUGS: &str = "\u{EB56}";
 pub(crate) const PLUGS_CONNECTED: &str = "\u{EB5A}";
+pub(crate) const POWER: &str = "\u{E3DA}";
 pub(crate) const PROHIBIT: &str = "\u{E3DE}";
 pub(crate) const PULSE: &str = "\u{E000}";
 pub(crate) const PUSH_PIN: &str = "\u{E3E2}";
@@ -118,6 +120,7 @@ pub(crate) fn paint(ui: &Ui, rect: egui::Rect, icon: &str, size: f32, color: Col
 #[cfg(test)]
 pub(crate) const ALL: &[&str] = &[
     ARROW_BEND_UP_RIGHT,
+    ARROW_CLOCKWISE,
     ARROWS_LEFT_RIGHT,
     ARROWS_SPLIT,
     BROADCAST,
@@ -150,6 +153,7 @@ pub(crate) const ALL: &[&str] = &[
     PLAY,
     PLUGS,
     PLUGS_CONNECTED,
+    POWER,
     PROHIBIT,
     PULSE,
     PUSH_PIN,

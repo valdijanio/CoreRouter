@@ -59,6 +59,9 @@ mod ethtool;
 mod nic;
 
 #[cfg(target_os = "linux")]
+pub mod clock;
+
+#[cfg(target_os = "linux")]
 mod netlink;
 
 /// How many times `apply` read the kernel's whole route table in this
@@ -1452,6 +1455,12 @@ mod linux {
             crate::pppoe_client_io::LinuxPppoeClientPort::open(client, &relay, uplink)
                 .map(|p| Box::new(p) as Box<dyn corerouter_hal::pppoe_client::PppoeClientPort>)
                 .map_err(|e| HalError::Io(e.to_string()))
+        }
+
+        fn system_clock(
+            &mut self,
+        ) -> Result<Box<dyn corerouter_hal::clock::SystemClock>, HalError> {
+            Ok(Box::new(crate::clock::LinuxClock::realtime()))
         }
 
         fn dhcp_server_port(
