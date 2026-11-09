@@ -79,11 +79,18 @@ pub struct Flood {
     /// Each ACK is answered by the same REQUEST again (clients renewing
     /// in a loop: journal lines without new records).
     pub echo_acks: bool,
+    /// Clients never answer an OFFER: DISCOVERs only (G4.2h).
+    pub discover_only: bool,
+    /// Every ACK sent, in order, as (address, client MAC) (G4.2h).
+    pub acked: Vec<(Ipv4Addr, [u8; 6])>,
+    /// Keep [`Flood::acked`].
+    pub record_acks: bool,
 }
 
 impl Flood {
     fn discover(&mut self) -> Heard {
-        let mac = mac_of(self.next);
+        // Scattered, as MACs of a storm are; never the same twice.
+        let mac = mac_of(self.next.wrapping_mul(0x9E37_79B1));
         let h = Heard {
             payload: request(1, mac, self.next, None, None),
             src: Ipv4Addr::UNSPECIFIED,
@@ -131,8 +138,12 @@ impl DhcpServerPort for FloodPort {
         let kind = u8::from(m.kind);
         if kind == 5 {
             f.acks += 1;
+            if f.record_acks {
+                f.acked.push((m.yiaddr, m.chaddr));
+            }
         }
         match kind {
+            2 if f.discover_only => {}
             2 | 5 if kind == 2 || f.echo_acks => {
                 // OFFER: the client takes it (SELECTING); an ACK echoed.
                 let mac = m.chaddr;

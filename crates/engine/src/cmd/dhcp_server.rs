@@ -14,7 +14,6 @@ use corerouter_model::dhcp_server::{Authoritative, DhcpServer};
 use corerouter_model::firewall::Name;
 use corerouter_model::{IfName, ItemId};
 use corerouter_proto_dhcp::server::checks::{self, Check, Level};
-use corerouter_proto_dhcp::server::leases::State;
 use serde_json::{Value, json};
 
 use super::args::{opt_bool, opt_parse, opt_str, opt_text, opt_u32};
@@ -396,6 +395,7 @@ fn print(s: &mut Session, _: &Value) -> Result<Value> {
     let all = checks::checks(cand);
     let ports = s.dhcp_server_ports();
     let core = s.dhcp_server();
+    let core = core.as_deref();
     let invalid = |id: ItemId| all.iter().any(|c| about("servers", id)(c) && c.level == Level::Error);
     let rows: Vec<Value> = cand
         .ip
@@ -416,12 +416,7 @@ fn print(s: &mut Session, _: &Value) -> Result<Value> {
             } else {
                 "starting"
             };
-            let bound = core.map_or(0, |c| {
-                c.leases()
-                    .iter()
-                    .filter(|l| l.server == d.name && l.state == State::Bound)
-                    .count()
-            });
+            let bound = core.map_or(0, |c| c.leases().bound_of(&d.name));
             let mut v = json!({
                 "id": d.id,
                 "name": d.name,

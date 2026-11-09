@@ -26,8 +26,30 @@
 //! 4. log lines go to the router's log (topic `dhcp`).
 //!
 //! A round reads at most [`RECV_BUDGET`] messages per socket and stops
-//! reading after [`ROUND_BUDGET_US`]: the session lock it holds is the one
-//! the control channel and the GUI need too.
+//! reading after [`ROUND_BUDGET_US`].
+//!
+//! **Locks (G4.2h).** The daemon's service runs a round in three phases
+//! ([`server_round`]), so reading, decoding and picking addresses do not
+//! hold the session lock the control channel and the GUI need:
+//!
+//! 1. under the session lock, [`Session::dhcp_round_begin`]: follows the
+//!    config, the relays and the IPoE verdicts;
+//! 2. without it, [`DhcpRound::decide`]: reads the sockets and runs the pure
+//!    server on what it read, under `core`'s own lock, a chunk at a time;
+//! 3. under the session lock, [`Session::dhcp_round_finish`]: journal, DNS,
+//!    lists, history; and without it again, [`DhcpWire::send`]: the replies
+//!    that the journal now covers.
+//!
+//! Who gets an address is decided only under `core`'s lock, and commands
+//! that change a lease take it too: nothing can hand out one address twice.
+//! The effects of everything done under it go, in order and under it, to
+//! one queue (`CoreCell::pending`), and whoever applies them takes the whole
+//! queue, so the journal and the DNS see them in the order the leases
+//! changed even when a command lands between two phases.
+//!
+//! Lock order: session → `ports` → `core`, each optional; nothing takes the
+//! session or `ports` while it holds `core`, and phase 2 takes `ports` and
+//! `core` without the session.
 //!
 //! After a restart the bound leases of the journal get their address-list
 //! entries back (they are not stored) and their DNS names are adopted, so
@@ -38,6 +60,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr};
+use std::ops::Deref;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use corerouter_hal::DynamicChange;
 use corerouter_hal::dhcp_server::{DhcpServerPort, Heard, ReplyTo};
@@ -47,8 +71,9 @@ use corerouter_proto_dhcp::server::plan::Plan;
 use corerouter_proto_dhcp::server::{Binding, Effect, Level, Now, Server};
 use serde_json::json;
 
-use crate::Session;
 use crate::dns_dynamic::LeaseName;
+use crate::ipoe::IpoeBackend;
+use crate::{Session, Shared, lock};
 use crate::firewall_dyn::{DynamicEntry, MAX_DYNAMIC};
 
 /// The journal's name in the storage (`journal-dhcp-leases.log`).
@@ -56,8 +81,11 @@ pub const JOURNAL: &str = "dhcp-leases";
 /// Messages read per socket per round (a flood cannot stall the rest).
 const RECV_BUDGET: usize = 256;
 /// Microseconds a round may spend reading messages (the rest wait for the
-/// next round; the session lock is released in between).
+/// next round).
 pub const ROUND_BUDGET_US: u64 = 20_000;
+/// Messages handled per hold of `core`'s lock: a command that needs the
+/// leases waits for one chunk at most (G4.2h).
+const CORE_CHUNK: usize = 32;
 /// A compaction that failed (a full or read-only disk) is tried again
 /// after this, not every round (each try serializes the whole table).
 pub const COMPACT_RETRY_SECS: u64 = 60;
@@ -83,12 +111,55 @@ struct Registered {
     lists: Vec<String>,
 }
 
+/// An effect and when the message behind it was read (for the statistics).
+type Queued = (Effect, Option<u64>);
+
+/// The pure server and what it decided that nobody applied yet (G4.2h).
+struct CoreCell {
+    server: Server,
+    /// `server` holds a real plan (an empty cell has a placeholder, so a
+    /// reference to the server cannot be missing: no panic in `deref`).
+    started: bool,
+    /// In the order the leases changed. Anything done to `server` puts its
+    /// effects here before the lock is released.
+    pending: Vec<Queued>,
+}
+
+impl Default for CoreCell {
+    fn default() -> Self {
+        CoreCell {
+            server: Server::new(Plan::default(), 0),
+            started: false,
+            pending: Vec::new(),
+        }
+    }
+}
+
+fn hold<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The server, read under its own lock: do not hold it across a call that
+/// needs the server again (`Session::dhcp_server`), or it waits for itself.
+pub struct CoreRef<'a>(MutexGuard<'a, CoreCell>);
+
+impl Deref for CoreRef<'_> {
+    type Target = Server;
+
+    fn deref(&self) -> &Server {
+        &self.0.server
+    }
+}
+
 /// The server's run-time state in the session.
 #[derive(Default)]
 pub struct DhcpServerRuntime {
-    core: Option<Server>,
+    core: Arc<Mutex<CoreCell>>,
     revision: Option<u32>,
-    slots: BTreeMap<IfName, Slot>,
+    slots: Arc<Mutex<BTreeMap<IfName, Slot>>>,
+    /// The sockets as the last round left them: a read of them must not wait
+    /// for a round.
+    port_status: Vec<PortStatus>,
     loaded: bool,
     /// Lines appended since the last compaction.
     appended: u64,
@@ -136,30 +207,32 @@ impl Session {
     }
 
     /// The server, if it has run.
-    pub fn dhcp_server(&self) -> Option<&Server> {
-        self.ext::<DhcpServerRuntime>().and_then(|r| r.core.as_ref())
+    pub fn dhcp_server(&self) -> Option<CoreRef<'_>> {
+        let g = hold(&self.ext::<DhcpServerRuntime>()?.core);
+        g.started.then(|| CoreRef(g))
     }
 
-    pub(crate) fn dhcp_server_mut(&mut self) -> Option<&mut Server> {
-        self.ext_mut::<DhcpServerRuntime>().and_then(|r| r.core.as_mut())
+    /// Runs `f` on the server (`None`: it has not run) and applies the
+    /// effects it returns, in their place among the rounds' (G4.2h).
+    pub(crate) fn dhcp_server_op<R>(&mut self, f: impl FnOnce(&mut Server) -> (R, Vec<Effect>)) -> Option<R> {
+        let cell = self.ext::<DhcpServerRuntime>()?.core.clone();
+        let r = {
+            let mut g = hold(&cell);
+            if !g.started {
+                return None;
+            }
+            let (r, fx) = f(&mut g.server);
+            g.pending.extend(fx.into_iter().map(|e| (e, None)));
+            r
+        };
+        self.dhcp_server_effects();
+        Some(r)
     }
 
-    /// The sockets and their state.
+    /// The sockets and their state, as the last round left them.
     pub fn dhcp_server_ports(&self) -> Vec<PortStatus> {
         self.ext::<DhcpServerRuntime>()
-            .map(|r| {
-                r.slots
-                    .iter()
-                    .map(|(i, s)| PortStatus {
-                        interface: i.clone(),
-                        listening: s.port.as_ref().map(|p| {
-                            let d = p.describe();
-                            if d.is_empty() { format!("udp 67 on {i}") } else { d }
-                        }),
-                        error: s.error.clone(),
-                    })
-                    .collect()
-            })
+            .map(|r| r.port_status.clone())
             .unwrap_or_default()
     }
 
@@ -189,23 +262,28 @@ impl Session {
         }
     }
 
-    /// One round: config, sockets, messages, timers, effects. `clock_us`
-    /// reads a monotonic clock in microseconds (the processing time of each
-    /// reply goes into the statistics). Returns whether anything was heard.
+    /// One round: config, sockets, messages, timers, effects, all under the
+    /// `&mut self` the caller holds (the daemon's service: [`server_round`]).
+    /// `clock_us` reads a monotonic clock in microseconds (the processing
+    /// time of each reply goes into the statistics). Returns whether
+    /// anything was heard.
     pub fn dhcp_server_poll(&mut self, now_ms: u64, clock_us: &dyn Fn() -> u64) -> bool {
         // The DNS records the round changes are saved once, at its end.
         self.dns_dynamic_defer();
-        let heard = self.dhcp_server_round(now_ms, clock_us);
-        let now = self.dhcp_now(now_ms);
+        let round = self.dhcp_round_begin(now_ms, clock_us);
+        let now = round.now;
+        let decided = round.decide(clock_us);
+        let wire = self.dhcp_round_finish(decided, clock_us);
+        let heard = wire.send(clock_us);
         self.dns_dynamic_flush(now.unix);
         heard
     }
 
-    fn dhcp_server_round(&mut self, now_ms: u64, clock_us: &dyn Fn() -> u64) -> bool {
+    /// Phase 1 of a round: what needs the session, up to the sockets.
+    fn dhcp_round_begin(&mut self, now_ms: u64, clock_us: &dyn Fn() -> u64) -> DhcpRound {
         let start = clock_us();
         let now = self.dhcp_now(now_ms);
-        let mut fx: Vec<(Effect, Option<u64>)> = Vec::new();
-        self.dhcp_server_sync(now, &mut fx);
+        self.dhcp_server_sync(now);
         self.dhcp_history_load(now);
         self.dhcp_server_restore(now);
         // G4.2b: the relays first; requests for our own servers come back.
@@ -225,107 +303,111 @@ impl Session {
             .filter(|s| s.sessions())
             .map(|s| s.name.clone())
             .collect();
+        let mut round = DhcpRound {
+            now,
+            start,
+            core: Arc::default(),
+            slots: Arc::default(),
+            relayed,
+            silent: Vec::new(),
+            ipoe: ipoe.clone(),
+            heard,
+        };
         let Some(rt) = self.ext_mut::<DhcpServerRuntime>() else {
-            return heard;
+            return round;
         };
         rt.last_ms = now_ms;
-        let Some(core) = rt.core.as_mut() else {
-            return heard;
-        };
-        // G4.3hd: a redundant pair's standby keeps the session servers'
-        // ports silent (what it hears is dropped); at a takeover the peer's
-        // bindings come in before this node answers.
-        let silent: Vec<IfName> = match &ipoe {
-            Some(b) if !b.answering() => core
-                .plan()
-                .servers
-                .iter()
-                .filter(|s| ipoe_names.contains(&s.name))
-                .map(|s| s.interface.clone())
-                .collect(),
-            _ => Vec::new(),
-        };
-        if let Some((servers, leases)) = ipoe.as_ref().and_then(|b| b.takeover()) {
-            let n = leases.len();
-            fx.extend(core.adopt(&servers, leases).into_iter().map(|e| (e, None)));
-            rt.restore = true;
-            fx.push((
-                Effect::Log {
-                    level: Level::Info,
-                    text: format!("dhcp-server: {n} concessões assumidas do outro BNG do par"),
-                },
-                None,
-            ));
-        }
-        // G4.3f: what the IPoE service decided since the last round.
-        if let Some(b) = &ipoe {
-            for (server, key, v) in b.verdicts() {
-                fx.extend(core.authorized(now, &server, &key, v).into_iter().map(|e| (e, None)));
+        round.core = rt.core.clone();
+        round.slots = rt.slots.clone();
+        let mut restore = false;
+        let mut pings = Vec::new();
+        {
+            let held = round.core.clone();
+            let mut g = hold(&held);
+            let cell = &mut *g;
+            if !cell.started {
+                drop(g);
+                return round;
             }
-            for r in b.revokes() {
-                fx.extend(core.revoke(now, &r.server, &r.client_key, &r.why).into_iter().map(|e| (e, None)));
-            }
-            for (iface, ip) in b.pings() {
-                let src = core
+            let core = &mut cell.server;
+            let fx = &mut cell.pending;
+            // G4.3hd: a redundant pair's standby keeps the session servers'
+            // ports silent (what it hears is dropped); at a takeover the
+            // peer's bindings come in before this node answers.
+            if ipoe.as_ref().is_some_and(|b| !b.answering()) {
+                round.silent = core
                     .plan()
                     .servers
                     .iter()
-                    .find(|s| s.interface == iface)
-                    .and_then(|s| s.source_for(ip));
-                if let (Some(src), Some(port)) = (src, rt.slots.get_mut(&iface).and_then(|s| s.port.as_mut())) {
+                    .filter(|s| ipoe_names.contains(&s.name))
+                    .map(|s| s.interface.clone())
+                    .collect();
+            }
+            if let Some((servers, leases)) = ipoe.as_ref().and_then(|b| b.takeover()) {
+                let n = leases.len();
+                fx.extend(core.adopt(&servers, leases).into_iter().map(|e| (e, None)));
+                restore = true;
+                fx.push((
+                    Effect::Log {
+                        level: Level::Info,
+                        text: format!("dhcp-server: {n} concessões assumidas do outro BNG do par"),
+                    },
+                    None,
+                ));
+            }
+            // G4.3f: what the IPoE service decided since the last round.
+            if let Some(b) = &ipoe {
+                for (server, key, v) in b.verdicts() {
+                    fx.extend(core.authorized(now, &server, &key, v).into_iter().map(|e| (e, None)));
+                }
+                for r in b.revokes() {
+                    fx.extend(core.revoke(now, &r.server, &r.client_key, &r.why).into_iter().map(|e| (e, None)));
+                }
+                for (iface, ip) in b.pings() {
+                    let src = core
+                        .plan()
+                        .servers
+                        .iter()
+                        .find(|s| s.interface == iface)
+                        .and_then(|s| s.source_for(ip));
+                    if let Some(src) = src {
+                        pings.push((iface, ip, src));
+                    }
+                }
+            }
+        }
+        if restore {
+            rt.restore = true;
+        }
+        if !pings.is_empty() {
+            let mut slots = hold(&round.slots);
+            for (iface, ip, src) in pings {
+                if let Some(port) = slots.get_mut(&iface).and_then(|s| s.port.as_mut()) {
                     let _ = port.probe(ip, src);
                 }
             }
         }
-        for (iface, h) in relayed {
-            if silent.contains(&iface) {
-                continue;
-            }
-            let t0 = clock_us();
-            fx.extend(core.handle(now, &iface, &h).into_iter().map(|e| (e, Some(t0))));
-        }
-        for (iface, slot) in rt.slots.iter_mut() {
-            let Some(port) = slot.port.as_mut() else {
-                continue;
-            };
-            port.tick(now.unix);
-            for _ in 0..RECV_BUDGET {
-                if clock_us().saturating_sub(start) >= ROUND_BUDGET_US {
-                    // The rest waits for the next round (the lock is let go).
-                    break;
-                }
-                match port.recv() {
-                    Ok(Some(_)) if silent.contains(iface) => heard = true,
-                    Ok(Some(h)) => {
-                        heard = true;
-                        let t0 = clock_us();
-                        fx.extend(core.handle(now, iface, &h).into_iter().map(|e| (e, Some(t0))));
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        slot.error = Some(e.to_string());
-                        break;
-                    }
-                }
-            }
-            match port.probe_replies() {
-                Ok(replies) => {
-                    for (ip, mac) in replies {
-                        if let Some(b) = &ipoe {
-                            b.arp_reply(iface, ip, mac);
-                        }
-                        fx.extend(core.probe_reply(now, iface, ip, mac).into_iter().map(|e| (e, None)));
-                    }
-                }
-                Err(e) => slot.error = Some(e.to_string()),
-            }
-        }
-        fx.extend(core.tick(now).into_iter().map(|e| (e, None)));
-        self.ipoe_resolve(now, &mut fx);
-        self.dhcp_server_apply(now, fx, clock_us);
+        round
+    }
+
+    /// Phase 3 of a round: the effects (journal first), then the sockets'
+    /// state and the compactions. The replies go after the session lock.
+    fn dhcp_round_finish(&mut self, round: DhcpRound, clock_us: &dyn Fn() -> u64) -> DhcpWire {
+        let now = round.now;
+        let wire = self.dhcp_server_drain(now, clock_us);
         self.dhcp_server_compact(now, false);
         self.dhcp_history_compact(now);
-        heard
+        let status = port_status(&hold(&round.slots));
+        if let Some(rt) = self.ext_mut::<DhcpServerRuntime>() {
+            rt.port_status = status;
+        }
+        DhcpWire {
+            now,
+            wire,
+            core: round.core,
+            slots: round.slots,
+            heard: round.heard,
+        }
     }
 
     /// After the journal was loaded: the bound leases' address-list
@@ -377,7 +459,7 @@ impl Session {
 
     /// Follow the running config: the plan, the journal (first time), the
     /// sockets.
-    fn dhcp_server_sync(&mut self, now: Now, fx: &mut Vec<(Effect, Option<u64>)>) {
+    fn dhcp_server_sync(&mut self, now: Now) {
         // G1.27d: add-arp entries of servers that no longer want them.
         self.dhcp_add_arp_sync();
         let rev = self.store().current_revision();
@@ -385,7 +467,7 @@ impl Session {
         let empty = running.ip.dhcp_server.servers.is_empty() && running.ip.dhcp_server.alerts.is_empty();
         let changed = self
             .ext::<DhcpServerRuntime>()
-            .is_none_or(|r| r.revision != Some(rev) || r.core.is_none());
+            .is_none_or(|r| r.revision != Some(rev) || !hold(&r.core).started);
         if changed {
             let plan = Plan::from_config(self.store().running());
             let journal = if self.ext::<DhcpServerRuntime>().is_none_or(|r| !r.loaded) && !empty {
@@ -397,38 +479,42 @@ impl Session {
                 return;
             };
             rt.revision = Some(rev);
-            match rt.core.as_mut() {
-                Some(core) => fx.extend(core.configure(plan).into_iter().map(|e| (e, None))),
-                None if empty => {}
-                None => {
-                    let mut core = Server::new(plan, now.unix);
-                    let mut lines = 0;
-                    match journal {
-                        Some(Ok(Some(text))) => {
-                            lines = text.lines().count() as u64;
-                            let bad = core.replay(text.lines());
-                            if bad > 0 {
-                                fx.push((
-                                    Effect::Log {
-                                        level: Level::Warning,
-                                        text: format!("dhcp-server: {bad} unreadable journal lines skipped"),
-                                    },
-                                    None,
-                                ));
-                            }
+            let core = rt.core.clone();
+            let mut g = hold(&core);
+            let cell = &mut *g;
+            if cell.started {
+                let fx = cell.server.configure(plan);
+                cell.pending.extend(fx.into_iter().map(|e| (e, None)));
+            } else if !empty {
+                let mut server = Server::new(plan, now.unix);
+                let mut lines = 0;
+                match journal {
+                    Some(Ok(Some(text))) => {
+                        lines = text.lines().count() as u64;
+                        let bad = server.replay(text.lines());
+                        if bad > 0 {
+                            cell.pending.push((
+                                Effect::Log {
+                                    level: Level::Warning,
+                                    text: format!("dhcp-server: {bad} unreadable journal lines skipped"),
+                                },
+                                None,
+                            ));
                         }
-                        Some(Err(e)) => rt.journal_error = Some(e.to_string()),
-                        _ => {}
                     }
-                    rt.loaded = true;
-                    rt.appended = lines;
-                    rt.compacted_at = now.unix;
-                    rt.restore = lines > 0;
-                    // Records of servers that are gone end now.
-                    let plan = core.plan().clone();
-                    fx.extend(core.configure(plan).into_iter().map(|e| (e, None)));
-                    rt.core = Some(core);
+                    Some(Err(e)) => rt.journal_error = Some(e.to_string()),
+                    _ => {}
                 }
+                rt.loaded = true;
+                rt.appended = lines;
+                rt.compacted_at = now.unix;
+                rt.restore = lines > 0;
+                // Records of servers that are gone end now.
+                let plan = server.plan().clone();
+                let fx = server.configure(plan);
+                cell.pending.extend(fx.into_iter().map(|e| (e, None)));
+                cell.server = server;
+                cell.started = true;
             }
         }
         let wanted = self
@@ -436,10 +522,12 @@ impl Session {
             .map(|c| c.plan().interfaces())
             .unwrap_or_default();
         let mut open = Vec::new();
-        if let Some(rt) = self.ext_mut::<DhcpServerRuntime>() {
-            rt.slots.retain(|i, _| wanted.contains(i));
+        let slots = self.ext::<DhcpServerRuntime>().map(|rt| rt.slots.clone()).unwrap_or_default();
+        {
+            let mut g = hold(&slots);
+            g.retain(|i, _| wanted.contains(i));
             for i in &wanted {
-                let s = rt.slots.entry(i.clone()).or_default();
+                let s = g.entry(i.clone()).or_default();
                 if s.port.is_none() && s.retry_at <= now.ms {
                     open.push(i.clone());
                 }
@@ -447,7 +535,7 @@ impl Session {
         }
         for i in open {
             let r = self.hal_mut().dhcp_server_port(&i);
-            if let Some(s) = self.ext_mut::<DhcpServerRuntime>().and_then(|rt| rt.slots.get_mut(&i)) {
+            if let Some(s) = hold(&slots).get_mut(&i) {
                 match r {
                     Ok(p) => {
                         s.port = Some(p);
@@ -462,9 +550,17 @@ impl Session {
         }
     }
 
-    fn dhcp_server_apply(&mut self, now: Now, fx: Vec<(Effect, Option<u64>)>, clock_us: &dyn Fn() -> u64) {
+    /// Applies everything the server decided so far, in order: the journal,
+    /// synced; the replies to the router's own relays; the DNS, the address
+    /// lists and the history. What is left for the sockets comes back.
+    fn dhcp_server_drain(&mut self, now: Now, clock_us: &dyn Fn() -> u64) -> Vec<Queued> {
+        let mut fx = self
+            .ext::<DhcpServerRuntime>()
+            .map(|r| std::mem::take(&mut hold(&r.core).pending))
+            .unwrap_or_default();
+        self.ipoe_resolve(now, &mut fx);
         if fx.is_empty() {
-            return;
+            return fx;
         }
         // 1. The journal, synced, before any reply.
         let mut text = String::new();
@@ -505,51 +601,29 @@ impl Session {
             })
             .filter(|ip| self.dhcp_relay_is_ours(*ip))
             .collect();
-        // 2. Replies and probes.
-        if let Some(rt) = self.ext_mut::<DhcpServerRuntime>() {
-            for (e, t0) in fx {
-                match e {
-                    Effect::Send { to: ReplyTo::Relay(ip), payload, .. } if relays.contains(&ip) => {
-                        if let (Some(t0), Some(core)) = (t0, rt.core.as_mut()) {
-                            core.stats_mut().latency(clock_us().saturating_sub(t0));
-                        }
-                        to_relays.push(payload);
+        // 2. What goes to the sockets is sorted out here and sent by the
+        // caller, without the session lock.
+        let mut wire = Vec::new();
+        let mut latencies = Vec::new();
+        for (e, t0) in fx {
+            match e {
+                Effect::Send { to: ReplyTo::Relay(ip), payload, .. } if relays.contains(&ip) => {
+                    if let Some(t0) = t0 {
+                        latencies.push(clock_us().saturating_sub(t0));
                     }
-                    Effect::Discover { interface } => {
-                        if let Some(port) = rt.slots.get_mut(&interface).and_then(|s| s.port.as_mut()) {
-                            let mac = port.mac();
-                            let xid = corerouter_hal::dhcp::lab_hash(&now.ms.to_be_bytes());
-                            let payload = corerouter_proto_dhcp::server::alert_discover(mac, xid);
-                            if let Some(p) = payload
-                                && let Err(err) = port.send_discover(&p)
-                            {
-                                log::debug!("dhcp-server: alert DISCOVER on {interface}: {err}");
-                            }
-                        }
-                    }
-                    Effect::Send { interface, payload, src, to, .. } => {
-                        let Some(slot) = rt.slots.get_mut(&interface) else {
-                            continue;
-                        };
-                        let Some(port) = slot.port.as_mut() else {
-                            continue;
-                        };
-                        if let Err(err) = port.send(&payload, src, to) {
-                            slot.error = Some(format!("send: {err}"));
-                        } else if let (Some(t0), Some(core)) = (t0, rt.core.as_mut()) {
-                            core.stats_mut().latency(clock_us().saturating_sub(t0));
-                        }
-                    }
-                    Effect::Probe { interface, ip, src } => {
-                        if let Some(port) = rt.slots.get_mut(&interface).and_then(|s| s.port.as_mut())
-                            && let Err(err) = port.probe(ip, src)
-                        {
-                            log::debug!("dhcp-server: probe of {ip} on {interface}: {err}");
-                        }
-                    }
-                    Effect::Journal(_) => {}
-                    other => later.push(other),
+                    to_relays.push(payload);
                 }
+                e @ (Effect::Discover { .. } | Effect::Send { .. } | Effect::Probe { .. }) => wire.push((e, t0)),
+                Effect::Journal(_) => {}
+                other => later.push(other),
+            }
+        }
+        if !latencies.is_empty()
+            && let Some(rt) = self.ext::<DhcpServerRuntime>()
+        {
+            let mut g = hold(&rt.core);
+            for l in latencies {
+                g.server.stats_mut().latency(l);
             }
         }
         for r in to_relays {
@@ -590,6 +664,7 @@ impl Session {
         }
         self.dhcp_lists_flush(now);
         self.dhcp_history_flush();
+        wire
     }
 
     /// G4.3f: the round's [`Effect::Authorize`]s get their verdict — at
@@ -614,11 +689,12 @@ impl Session {
                 .into_iter()
                 .filter_map(|(a, t)| self.ipoe_authorize(&a).map(|v| (a, v, t)))
                 .collect();
-            let Some(core) = self.ext_mut::<DhcpServerRuntime>().and_then(|r| r.core.as_mut()) else {
+            let Some(rt) = self.ext::<DhcpServerRuntime>() else {
                 return;
             };
+            let mut g = hold(&rt.core);
             for (a, v, t) in decided {
-                fx.extend(core.authorized(now, &a.server, &a.client_key, v).into_iter().map(|e| (e, t)));
+                fx.extend(g.server.authorized(now, &a.server, &a.client_key, v).into_iter().map(|e| (e, t)));
             }
         }
     }
@@ -825,7 +901,7 @@ impl Session {
     /// now).
     pub(crate) fn dhcp_server_compact(&mut self, now: Now, force: bool) {
         let due = self.ext::<DhcpServerRuntime>().is_some_and(|r| {
-            let records = r.core.as_ref().map_or(0, |c| c.leases().len() as u64);
+            let records = hold(&r.core).server.leases().len() as u64;
             r.loaded
                 && r.appended > 0
                 && (force || now.unix >= r.compact_retry_at)
@@ -853,13 +929,18 @@ impl Session {
         }
     }
 
-    /// Run server operations that produce effects (operator commands).
-    pub(crate) fn dhcp_server_effects(&mut self, fx: Vec<Effect>) {
+    /// Applies what is waiting, here and now, replies included: an operator
+    /// command, under the session lock.
+    fn dhcp_server_effects(&mut self) {
         let now_ms = self.ext::<DhcpServerRuntime>().map_or(0, |r| r.last_ms);
         let now = self.dhcp_now(now_ms);
         let ms = now.ms;
+        let clock = || ms * 1000;
         self.dns_dynamic_defer();
-        self.dhcp_server_apply(now, fx.into_iter().map(|e| (e, None)).collect(), &|| ms * 1000);
+        let wire = self.dhcp_server_drain(now, &clock);
+        if let Some(rt) = self.ext::<DhcpServerRuntime>() {
+            send_wire(wire, now, &rt.slots, &rt.core, &clock);
+        }
         self.dns_dynamic_flush(now.unix);
     }
 
@@ -868,4 +949,225 @@ impl Session {
         self.dhcp_now(now_ms)
     }
 
+}
+
+/// A round between its phases: what [`DhcpRound::decide`] needs, with no
+/// borrow of the session.
+pub struct DhcpRound {
+    now: Now,
+    /// When the round began ([`ROUND_BUDGET_US`] counts from here).
+    start: u64,
+    core: Arc<Mutex<CoreCell>>,
+    slots: Arc<Mutex<BTreeMap<IfName, Slot>>>,
+    relayed: Vec<(IfName, Heard)>,
+    /// Sockets whose messages are dropped (a redundant pair's standby).
+    silent: Vec<IfName>,
+    ipoe: Option<Arc<dyn IpoeBackend>>,
+    heard: bool,
+}
+
+impl DhcpRound {
+    /// Phase 2 of a round, without the session: reads the sockets and runs
+    /// the server on what they heard. The read is outside `core`'s lock, and
+    /// each chunk of [`CORE_CHUNK`] messages holds it once.
+    fn decide(mut self, clock_us: &dyn Fn() -> u64) -> Self {
+        let now = self.now;
+        let relayed = std::mem::take(&mut self.relayed);
+        {
+            let mut g = hold(&self.core);
+            let cell = &mut *g;
+            for (iface, h) in relayed {
+                if self.silent.contains(&iface) {
+                    continue;
+                }
+                let t0 = clock_us();
+                cell.pending
+                    .extend(cell.server.handle(now, &iface, &h).into_iter().map(|e| (e, Some(t0))));
+            }
+        }
+        let mut slots = hold(&self.slots);
+        let mut chunk: Vec<(Heard, u64)> = Vec::with_capacity(CORE_CHUNK);
+        for (iface, slot) in slots.iter_mut() {
+            let Some(port) = slot.port.as_mut() else {
+                continue;
+            };
+            port.tick(now.unix);
+            let silent = self.silent.contains(iface);
+            let mut read = 0;
+            let mut more = true;
+            while more {
+                // RECV_BUDGET and the time budget are per round, as ever.
+                while chunk.len() < CORE_CHUNK {
+                    if read >= RECV_BUDGET || clock_us().saturating_sub(self.start) >= ROUND_BUDGET_US {
+                        // The rest waits for the next round.
+                        more = false;
+                        break;
+                    }
+                    read += 1;
+                    match port.recv() {
+                        Ok(Some(h)) => {
+                            self.heard = true;
+                            if !silent {
+                                let t0 = clock_us();
+                                chunk.push((h, t0));
+                            }
+                        }
+                        Ok(None) => {
+                            more = false;
+                            break;
+                        }
+                        Err(e) => {
+                            slot.error = Some(e.to_string());
+                            more = false;
+                            break;
+                        }
+                    }
+                }
+                if !chunk.is_empty() {
+                    let mut g = hold(&self.core);
+                    let cell = &mut *g;
+                    for (h, t0) in chunk.drain(..) {
+                        cell.pending
+                            .extend(cell.server.handle(now, iface, &h).into_iter().map(|e| (e, Some(t0))));
+                    }
+                }
+            }
+            match port.probe_replies() {
+                Ok(replies) => {
+                    for (ip, mac) in replies {
+                        if let Some(b) = &self.ipoe {
+                            b.arp_reply(iface, ip, mac);
+                        }
+                        let mut g = hold(&self.core);
+                        let cell = &mut *g;
+                        cell.pending
+                            .extend(cell.server.probe_reply(now, iface, ip, mac).into_iter().map(|e| (e, None)));
+                    }
+                }
+                Err(e) => slot.error = Some(e.to_string()),
+            }
+        }
+        drop(slots);
+        {
+            let mut g = hold(&self.core);
+            let cell = &mut *g;
+            if cell.started {
+                cell.pending.extend(cell.server.tick(now).into_iter().map(|e| (e, None)));
+            }
+        }
+        self
+    }
+}
+
+/// What a round leaves for the sockets, covered by the journal.
+pub struct DhcpWire {
+    now: Now,
+    wire: Vec<Queued>,
+    core: Arc<Mutex<CoreCell>>,
+    slots: Arc<Mutex<BTreeMap<IfName, Slot>>>,
+    heard: bool,
+}
+
+impl DhcpWire {
+    /// The round's last step. Returns whether the round heard anything.
+    fn send(self, clock_us: &dyn Fn() -> u64) -> bool {
+        send_wire(self.wire, self.now, &self.slots, &self.core, clock_us);
+        self.heard
+    }
+}
+
+fn send_wire(
+    wire: Vec<Queued>,
+    now: Now,
+    slots: &Mutex<BTreeMap<IfName, Slot>>,
+    core: &Mutex<CoreCell>,
+    clock_us: &dyn Fn() -> u64,
+) {
+    if wire.is_empty() {
+        return;
+    }
+    let mut latencies = Vec::new();
+    {
+        let mut slots = hold(slots);
+        for (e, t0) in wire {
+            match e {
+                Effect::Discover { interface } => {
+                    if let Some(port) = slots.get_mut(&interface).and_then(|s| s.port.as_mut()) {
+                        let mac = port.mac();
+                        let xid = corerouter_hal::dhcp::lab_hash(&now.ms.to_be_bytes());
+                        let payload = corerouter_proto_dhcp::server::alert_discover(mac, xid);
+                        if let Some(p) = payload
+                            && let Err(err) = port.send_discover(&p)
+                        {
+                            log::debug!("dhcp-server: alert DISCOVER on {interface}: {err}");
+                        }
+                    }
+                }
+                Effect::Send { interface, payload, src, to, .. } => {
+                    let Some(slot) = slots.get_mut(&interface) else {
+                        continue;
+                    };
+                    let Some(port) = slot.port.as_mut() else {
+                        continue;
+                    };
+                    if let Err(err) = port.send(&payload, src, to) {
+                        slot.error = Some(format!("send: {err}"));
+                    } else if let Some(t0) = t0 {
+                        latencies.push(clock_us().saturating_sub(t0));
+                    }
+                }
+                Effect::Probe { interface, ip, src } => {
+                    if let Some(port) = slots.get_mut(&interface).and_then(|s| s.port.as_mut())
+                        && let Err(err) = port.probe(ip, src)
+                    {
+                        log::debug!("dhcp-server: probe of {ip} on {interface}: {err}");
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if !latencies.is_empty() {
+        let mut g = hold(core);
+        for l in latencies {
+            g.server.stats_mut().latency(l);
+        }
+    }
+}
+
+fn port_status(slots: &BTreeMap<IfName, Slot>) -> Vec<PortStatus> {
+    slots
+        .iter()
+        .map(|(i, s)| PortStatus {
+            interface: i.clone(),
+            listening: s.port.as_ref().map(|p| {
+                let d = p.describe();
+                if d.is_empty() { format!("udp 67 on {i}") } else { d }
+            }),
+            error: s.error.clone(),
+        })
+        .collect()
+}
+
+/// One round of the daemon's service (G4.2h), letting go of the session lock
+/// while it reads the sockets, picks addresses and sends the replies. Returns
+/// whether anything was heard.
+pub fn server_round(session: &Shared, now_ms: u64, clock_us: &dyn Fn() -> u64) -> bool {
+    let round = {
+        let mut s = lock(session);
+        s.dns_dynamic_defer();
+        let round = s.dhcp_round_begin(now_ms, clock_us);
+        s.dns_dynamic_flush(round.now.unix);
+        round
+    };
+    let decided = round.decide(clock_us);
+    let wire = {
+        let mut s = lock(session);
+        s.dns_dynamic_defer();
+        let now = decided.now;
+        let wire = s.dhcp_round_finish(decided, clock_us);
+        s.dns_dynamic_flush(now.unix);
+        wire
+    };
+    wire.send(clock_us)
 }

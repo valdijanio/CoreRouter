@@ -205,7 +205,8 @@ fn lookup(s: &mut Session, p: &Value) -> Result<Value> {
     let history = at.map(|t| held_at(s, &v4, t));
     let mut cache = s.ext_mut::<IdentityCache>().map(std::mem::take).unwrap_or_default();
     let cfg = s.store().running();
-    let leases = s.dhcp_server().map(|c| c.leases());
+    let core = s.dhcp_server();
+    let leases = core.as_deref().map(|c| c.leases());
 
     let mut out = Vec::with_capacity(asks.len());
     for a in asks {
@@ -286,6 +287,7 @@ fn lookup(s: &mut Session, p: &Value) -> Result<Value> {
         o.insert("all".into(), Value::Array(names.iter().map(item_value).collect()));
         out.push(v);
     }
+    drop(core);
     if let Some(slot) = s.ext_mut::<IdentityCache>() {
         *slot = cache;
     }
