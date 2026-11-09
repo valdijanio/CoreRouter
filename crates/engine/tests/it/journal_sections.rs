@@ -53,6 +53,10 @@ fn commands() -> Vec<(&'static str, Value)> {
             json!({"enabled": true, "servers": ["192.0.2.123"]}),
         ),
         (
+            "system.ntp.server.set",
+            json!({"enabled": true, "use_local_clock": true, "allowed": ["10.0.0.0/8", "ntp-lan"]}),
+        ),
+        (
             "system.logging.action.add",
             json!({"name": "remote", "remote": "192.0.2.14"}),
         ),

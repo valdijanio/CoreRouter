@@ -123,15 +123,23 @@ impl Board {
     }
 }
 
+/// The times one verdict needs.
+struct Clocks<'a> {
+    /// A clock no step moves, for the rate limit.
+    steady_ms: u64,
+    /// When the request arrived.
+    rx_nanos: i128,
+    /// The wall clock, read when the reply goes out.
+    now: &'a dyn Fn() -> i128,
+}
+
 /// The verdict on one datagram, with every outcome counted.
 fn answer(
     bytes: &[u8],
     from: SocketAddr,
     view: &View,
     limiter: &mut RateLimiter<RandomState>,
-    steady_ms: u64,
-    rx_nanos: i128,
-    now: &dyn Fn() -> i128,
+    clocks: &Clocks<'_>,
     counters: &Counters,
 ) -> Option<[u8; corerouter_proto_ntp::HEADER_LEN]> {
     let c = |counter: &AtomicU64| {
@@ -154,24 +162,24 @@ fn answer(
         }
     };
     c(&counters.requests);
-    let tx = now();
+    let tx = (clocks.now)();
     let Some(sys) = view.serve.as_ref().filter(|s| s.usable_at(tx)) else {
         c(&counters.unsynchronized);
         return None;
     };
     let verdict = if view.rate_limit {
-        limiter.check(ip, steady_ms)
+        limiter.check(ip, clocks.steady_ms)
     } else {
         Limit::Allow
     };
     match verdict {
         Limit::Allow => {
             c(&counters.replies);
-            Some(server::reply(&request, sys, rx_nanos, now()).encode())
+            Some(server::reply(&request, sys, clocks.rx_nanos, (clocks.now)()).encode())
         }
         Limit::Kiss => {
             c(&counters.kisses);
-            Some(server::kiss(&request, b"RATE", rx_nanos, now()).encode())
+            Some(server::kiss(&request, b"RATE", clocks.rx_nanos, (clocks.now)()).encode())
         }
         Limit::Silent => {
             c(&counters.limited);
@@ -213,7 +221,12 @@ fn reader(sock: Arc<sock::Udp>, board: Arc<Board>, counters: Arc<Counters>) {
         let steady_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
         let rx = stamp.unwrap_or_else(unix_nanos);
         let bytes = buf.get(..n).unwrap_or_default();
-        if let Some(out) = answer(bytes, from, &view, &mut limiter, steady_ms, rx, &unix_nanos, &counters) {
+        let clocks = Clocks {
+            steady_ms,
+            rx_nanos: rx,
+            now: &unix_nanos,
+        };
+        if let Some(out) = answer(bytes, from, &view, &mut limiter, &clocks, &counters) {
             sock.send(&out, from, local);
         }
     }
@@ -776,16 +789,12 @@ mod tests {
         bytes: &[u8],
     ) -> (Option<Packet>, Counters) {
         let c = Counters::default();
-        let out = answer(
-            bytes,
-            from.parse().unwrap(),
-            v,
-            limiter,
-            1000,
-            T,
-            &|| T + 1000,
-            &c,
-        );
+        let clocks = Clocks {
+            steady_ms: 1000,
+            rx_nanos: T,
+            now: &|| T + 1000,
+        };
+        let out = answer(bytes, from.parse().unwrap(), v, limiter, &clocks, &c);
         (out.map(|b| Packet::decode(&b).unwrap()), c)
     }
 
