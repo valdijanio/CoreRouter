@@ -28,7 +28,7 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "system.package.print", "Packages", ["System", "Packages"], None,
-        "{} → {supported, reason?, firmware, lab, running, primary, fallback, slots: [{slot, state, running, primary, next, version, build, commit, channel, kernel, verified, verity, signed_by, boot_entry, cmdline, size, rootfs_size, kernel_size}], trial: {slot, from, version, reason, confirm, timeout_s, remaining_s?} | null, last, snapshots, keys, job: {id, kind, phase, done, total} | null, result}",
+        "{} → {supported, reason?, firmware, lab, running, primary, fallback, slots: [{slot, state, running, primary, next, version, build, commit, channel, kernel, verified, verity, signed_by, boot_entry, cmdline, size, rootfs_size, kernel_size}], trial: {slot, from, version, reason, confirm, timeout_s, remaining_s?} | null, last, snapshots: [{name, slot, version, format_version, at_unix, files, bytes, own_bytes}], partials: [{name, own_bytes}], config_space: {total?, free?, snapshot_need?, snapshot_fits?, usage: [{path, bytes, kind}], usage_rows}, keys, job: {id, kind, phase, done, total} | null, result}",
         always, print),
     cmd!(
         "system.package.update",
