@@ -9528,3 +9528,26 @@ continuação indentadas).
   não subia live (limite de 200 MiB); o limite agora é 180 MiB. Fica o
   limite escrito em `docs/os-image.md`: disco levado de volta à NVRAM antiga com o slot primário atualizado
   no meio do caminho entra em laço de pânico até trocar a ordem no firmware.
+
+- 2026-11-09 — G0.30d: `netns_nat_ipfix`: a tempestade de 20 000 blocos parava em 20 rodadas fixas; com pouca CPU ela precisa de mais (a fila do kernel guarda 4096 primeiros pacotes e o resto se perde, e o cliente manda de novo). Agora as rodadas seguem enquanto chegam registros novos: 30 s sem nenhum, ou 240 s no total, encerra. O teste também ficou mais estrito: exige todos os blocos (antes aceitava 99%), espera SCTP e TLS assentarem e confere que o `nat_log` do exportador é igual ao que chegou ao coletor. Na VM do laboratório, em 2 CPUs com 6 processos girando, antes 0/3 ("SCTP got 12986–16634 of 20000"), depois 4/4 (12–20 rodadas), e 1/1 com 16 processos (37 rodadas, 46 s); sem carga 6 rodadas, ~17 s, como antes (**medido**). Um coletor que descarta 1 mensagem em 50 de propósito reprova: o laço para depois de 30 s sem progresso, "SCTP got 19812 of 20000" (**medido**). Testar: `cargo xtask ci --only netns` (ou `taskset -c 0,1` em volta do binário na VM, com `modprobe sctp nfnetlink_queue`).
+
+- 2026-11-09 — G1.27e: Roteamento por política, parte a: tabelas nomeadas (`routing.table.add/set/remove/list`), como o `/routing table` do RouterOS v7. A rota entra com `routing_table: <nome>` e o gateway resolve pelas redes da `main`. Como testar: `routing.table.add {"name":"isp2"}`, `ip.route.add {"dst_address":"0.0.0.0/0","gateway":"192.0.2.1","routing_table":"isp2"}`, `ip.route.lookup {"address":"8.8.8.8","table":"isp2"}`; `tests/netns_policy.rs` confere no kernel.
+
+- 2026-11-09 — G1.6qh: System › Reboot e System › Shutdown, os itens do WinBox. A janela é a pergunta: o nome do roteador, o que vai cair (com as sessões PPP, BGP e vizinhos OSPF de pé agora), o que o roteador recusaria e um botão que resolve cada caso (sair do Safe Mode mantendo as mudanças, commit), `Force` só quando precisa, e depois da resposta a espera pela conexão, até o selo `back`. As regras ficam no engine: consulta nova `system.power.preview`, com as mesmas mensagens que `system.reboot` e `system.shutdown` respondem. Ícones `ARROW_CLOCKWISE` e `POWER`. Teste: `cargo test -p corerouter-ui --lib power`, `cargo test -p corerouter-engine --lib system_power`; prints em `docs/changes/G1.6qh-screenshots/`. Conferido com o daemon virtual num namespace de usuário e PID cujo PID 1 se chama `corerouter-init`: pedido real, queda da conexão e volta **medidos** na GUI em Xvfb; o boot real da imagem não foi exercitado.
+
+- 2026-11-09 — G1.6x: Janela System › Packages: uma linha do `/config` com a barra de uso, o livre, o selo `snapshot fits` ou `no room for the snapshot`, os três maiores itens (a lista no tooltip) e as cópias em selos, parciais em âmbar. "Free space…" mostra o `dry_run` de `system.package.snapshot.remove` (só parciais por padrão, ou todas as cópias com aviso; o que um teste de boot precisa aparece como `kept`) e só remove no botão; o resultado do trabalho diz quanto liberou. `config_space` ganhou `total` e `snapshot_fits`, com a mesma margem da conferência real. Teste: `cargo test -p corerouter-ui --lib packages`, `cargo test -p corerouter-sysupdate --test config_full`. Conferido no laboratório (`--backend virtual --config-dir`): a remoção real apagou as duas cópias e informou 21,0 MiB liberados (**medido**).
+
+- 2026-11-09 — G4.6b: O cliente SNTP acerta o relógio do sistema (`docs/ntp.md`). Disciplina pura em
+  `proto-ntp/discipline.rs` (RFC 5905 §11.3 Figura 28): abaixo de 128 ms o relógio anda um pouco mais
+  rápido ou devagar (até 300 ppm) e aprende o desvio do cristal; acima, o primeiro acerto salta e um
+  pico num relógio já certo espera 900 s; a partir de 1000 s pede `system.ntp.client.confirm-step`,
+  exceto com o relógio antes de 2026 (roteador sem bateria); nada leva o relógio para antes de 2026
+  (RFC 8633 §5.2). Chamadas ao kernel pelo crate `clock-steering` 0.2.1 (`ADJ_FREQUENCY`,
+  `ADJ_SETOFFSET`), atrás de `Hal::system_clock`; sem `unsafe` nosso. `set_system_clock=no` só mede.
+  `use_peer_ntp` acrescenta servidores dinâmicos (`dynamic_servers`, no máximo 8 no total) e o `vrf`
+  prende o socket por `SO_BINDTODEVICE`. Resposta com distância à raiz ≥ 16 s ou referência depois da
+  transmissão é descartada (RFC 5905 A.5.1.1). Janela System › NTP Client com relógio, desvio, último
+  ajuste, VRF, Set System Clock, ⓘ em todo rótulo e o botão de confirmar. Corrigido de passagem: o
+  `system.health.check` lia um status que ninguém gravava e dizia "sem daemon" com o cliente ligado.
+
+  Como testar: `docs/ntp.md`, seção "Como testar".
