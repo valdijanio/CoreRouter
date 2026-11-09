@@ -85,6 +85,10 @@ pub struct Flood {
     pub acked: Vec<(Ipv4Addr, [u8; 6])>,
     /// Keep [`Flood::acked`].
     pub record_acks: bool,
+    /// Calls to the data plane for address-list entries: one by one, and in
+    /// batches (G4.2h).
+    pub list_calls: u64,
+    pub list_batches: u64,
 }
 
 impl Flood {
@@ -202,7 +206,13 @@ impl Hal for FloodHal {
     }
 
     fn address_list_dynamic(&mut self, change: DynamicChange<'_>) -> Result<(), HalError> {
+        self.flood.lock().unwrap().list_calls += 1;
         self.inner.address_list_dynamic(change)
+    }
+
+    fn address_list_dynamic_many(&mut self, changes: &[DynamicChange<'_>]) -> Result<(), HalError> {
+        self.flood.lock().unwrap().list_batches += 1;
+        self.inner.address_list_dynamic_many(changes)
     }
 
     fn dhcp_server_port(&mut self, _name: &IfName) -> Result<Box<dyn DhcpServerPort>, HalError> {
