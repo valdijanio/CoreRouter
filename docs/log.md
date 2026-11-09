@@ -9680,3 +9680,5 @@ continuação indentadas).
   2 s depois dele; lixo e linha cortada no fim do arquivo custaram 2 linhas contadas em `bad_lines`,
   com 48 de volta; `/config` a 100 %: 31 linhas descartadas e contadas, a config continuou salvando
   (`last_error` nulo, revisão 79 de volta depois de reiniciar).
+
+- 2026-11-09 — G4.2h: Tempestade de DHCP com vinculações: o DNS dinâmico deixa de varrer os registros por concessão (índice por zona e nome durante a rodada adiada; no teto de 20 mil registros, recusa sem copiar o estado) e as entradas de address-list de uma rodada chegam ao kernel em um lote, não uma transação `nfnetlink` por vinculação. Testar: `cargo test -p corerouter-engine --lib dns_dynamic`; `cargo test -p corerouter-engine --test it a_storm_round`; `G42H_ONLY=binding G42H_SECS=30 cargo test --release -p corerouter-engine --test it slow_the_control_channel -- --nocapture`.
