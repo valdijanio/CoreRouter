@@ -147,8 +147,8 @@ fn logging_actions_tab_lists_edits_and_refuses_removing_one_in_use() {
     let actions = lock(&h.session)
         .execute("system.logging.action.list", &Value::Null)
         .unwrap();
-    assert_eq!(actions[1]["remote_port"], 6514, "{:?}", h.app.log());
-    assert_eq!(actions[1]["syslog_severity"], "warning");
+    assert_eq!(actions[2]["remote_port"], 6514, "{:?}", h.app.log());
+    assert_eq!(actions[2]["syslog_severity"], "warning");
     // Remove while a rule uses it: the engine says why, the window stays.
     h.click(h.text("Remove"));
     refresh(&mut h);
@@ -180,8 +180,8 @@ fn logging_actions_tab_lists_edits_and_refuses_removing_one_in_use() {
     let actions = lock(&h.session)
         .execute("system.logging.action.list", &Value::Null)
         .unwrap();
-    assert_eq!(actions[2]["name"], "remote1", "{:?}", h.app.log());
-    assert_eq!(actions[2]["remote_port"], 514);
+    assert_eq!(actions[3]["name"], "remote1", "{:?}", h.app.log());
+    assert_eq!(actions[3]["remote_port"], 514);
 }
 
 #[test]
@@ -223,4 +223,40 @@ fn logging_lists_match_the_model() {
         .map(|f| f.as_str())
         .collect();
     assert_eq!(FACILITIES.as_slice(), model.as_slice());
+}
+
+/// G4.6g: the built-in `disk` action is edited here, and a rule can name it.
+#[test]
+fn the_disk_action_edits_its_files() {
+    let mut h = lab();
+    tab(&mut h, Tab::Actions);
+    assert!(h.has_text("disk"), "listed");
+    let row = h
+        .ctx
+        .read_response(table::row_id(ACTIONS, "disk"))
+        .expect("row drawn")
+        .rect
+        .center();
+    h.right_click(row);
+    h.click(h.text("Properties…"));
+    assert!(h.has_text("Logging Action <disk>"));
+    assert!(h.has_text("Lines per File"));
+    assert!(!h.has_text("Syslog Facility"), "no remote fields");
+    assert!(!h.has_text("Remove"), "the built-in action stays");
+    assert!(h.has_text_containing("no config directory"), "no writer in the lab");
+    if let LogDialog::Action { form, .. } = dialog(&mut h) {
+        assert!(form.disk);
+        assert_eq!(form.disk_file_name, "log");
+        assert_eq!(form.disk_lines_per_file, "1000");
+        assert_eq!(form.disk_file_count, "2");
+        form.disk_file_name = "audit".into();
+        form.disk_file_count = "4".into();
+        form.disk_stop_on_full = true;
+    }
+    h.idle();
+    h.click(h.text("OK"));
+    refresh(&mut h);
+    let s = lock(&h.session);
+    let d = &s.store().running().system.logging.disk;
+    assert_eq!((d.file_name.as_str(), d.lines_per_file, d.file_count, d.stop_on_full), ("audit", 1000, 4, true), "{:?}", h.app.log());
 }

@@ -83,10 +83,12 @@ const SEVERITIES: [&str; 9] = [
 ];
 
 const RULE_COLUMNS: [table::Column; 4] = [col(""), col("Topics"), col("Prefix"), col("Action")];
-const ACTION_COLUMNS: [table::Column; 9] = [
+const ACTION_COLUMNS: [table::Column; 11] = [
     col("Name"),
     col("Type"),
     num("Lines"),
+    col("File Name"),
+    num("File Count"),
     col("Remote Address"),
     num("Remote Port"),
     col("Src. Address"),
@@ -185,6 +187,34 @@ impl RuleForm {
     }
 }
 
+/// `2 files, 1.2 of 2.8 MiB; 40 lines dropped`, from `disk_status`.
+fn disk_status_text(status: Option<&Value>) -> String {
+    let Some(st) = status.filter(|v| v.is_object()) else {
+        return String::new();
+    };
+    let n = |k: &str| st.get(k).and_then(Value::as_u64).unwrap_or(0);
+    if st.get("dir").is_none_or(Value::is_null) {
+        return "Nothing is written: this router has no config directory".into();
+    }
+    let mib = |b: u64| b as f64 / f64::from(1u32 << 20);
+    let mut out = format!(
+        "{} file(s), {:.1} of {:.1} MiB",
+        n("files"),
+        mib(n("bytes")),
+        mib(n("cap_bytes"))
+    );
+    if n("lines_dropped") > 0 {
+        out.push_str(&format!("; {} line(s) did not reach the disk", n("lines_dropped")));
+    }
+    if st.get("stopped").and_then(Value::as_bool) == Some(true) {
+        out.push_str("; stopped, the files are full");
+    }
+    if let Some(e) = st.get("last_error").and_then(Value::as_str) {
+        out.push_str(&format!("; {e}"));
+    }
+    out
+}
+
 /// An action as typed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ActionForm {
@@ -193,7 +223,15 @@ pub(crate) struct ActionForm {
     pub memory: bool,
     /// The built-in `analytics` action (G4.4f): nothing to edit here.
     pub analytics: bool,
+    /// The built-in `disk` action (G4.6g): only `disk_*` applies.
+    pub disk: bool,
     pub memory_lines: String,
+    pub disk_file_name: String,
+    pub disk_lines_per_file: String,
+    pub disk_file_count: String,
+    pub disk_stop_on_full: bool,
+    /// What the writer reports, for people.
+    pub disk_status: String,
     pub remote: String,
     pub remote_port: String,
     /// Empty: the router picks.
@@ -210,7 +248,13 @@ impl ActionForm {
             name: String::new(),
             memory: false,
             analytics: false,
+            disk: false,
             memory_lines: String::new(),
+            disk_file_name: String::new(),
+            disk_lines_per_file: String::new(),
+            disk_file_count: String::new(),
+            disk_stop_on_full: false,
+            disk_status: String::new(),
             remote: String::new(),
             remote_port: "514".into(),
             src_address: String::new(),
@@ -225,7 +269,13 @@ impl ActionForm {
             name: text(row, "name"),
             memory: text(row, "target") == "memory",
             analytics: text(row, "target") == "analytics",
+            disk: text(row, "target") == "disk",
             memory_lines: text(row, "memory_lines"),
+            disk_file_name: text(row, "disk_file_name"),
+            disk_lines_per_file: text(row, "disk_lines_per_file"),
+            disk_file_count: text(row, "disk_file_count"),
+            disk_stop_on_full: flag(row, "disk_stop_on_full"),
+            disk_status: disk_status_text(row.get("disk_status")),
             remote: text(row, "remote"),
             remote_port: text(row, "remote_port"),
             src_address: text(row, "src_address"),
@@ -244,6 +294,21 @@ impl ActionForm {
         if self.memory {
             if self.memory_lines.trim() != base.memory_lines {
                 p.insert("memory_lines".into(), form_number(&self.memory_lines));
+            }
+            return p;
+        }
+        if self.disk {
+            if self.disk_file_name.trim() != base.disk_file_name {
+                p.insert("disk_file_name".into(), json!(self.disk_file_name.trim()));
+            }
+            if self.disk_lines_per_file.trim() != base.disk_lines_per_file {
+                p.insert("disk_lines_per_file".into(), form_number(&self.disk_lines_per_file));
+            }
+            if self.disk_file_count.trim() != base.disk_file_count {
+                p.insert("disk_file_count".into(), form_number(&self.disk_file_count));
+            }
+            if self.disk_stop_on_full != base.disk_stop_on_full {
+                p.insert("disk_stop_on_full".into(), json!(self.disk_stop_on_full));
             }
             return p;
         }
@@ -346,7 +411,7 @@ pub(crate) struct LogDialogWin {
 enum Applied {
     None,
     Rule(RuleForm),
-    Action(ActionForm),
+    Action(Box<ActionForm>),
 }
 
 struct Reply {
@@ -416,7 +481,13 @@ fn action_row(a: &Value) -> Row {
         cells: vec![
             text(a, "name"),
             text(a, "target"),
-            text(a, "memory_lines"),
+            if text(a, "target") == "disk" {
+                text(a, "disk_lines_per_file")
+            } else {
+                text(a, "memory_lines")
+            },
+            text(a, "disk_file_name"),
+            text(a, "disk_file_count"),
             text(a, "remote"),
             text(a, "remote_port"),
             text(a, "src_address"),
@@ -847,7 +918,7 @@ impl LogPanel {
                     Some(p) => (
                         "system.logging.action.set",
                         p,
-                        Applied::Action(form.clone()),
+                        Applied::Action(Box::new(form.clone())),
                         ok,
                     ),
                     None => return !ok,
@@ -896,7 +967,7 @@ impl LogPanel {
                 let close = d.status.replied(result);
                 match (result, r.applied, &mut d.dialog) {
                     (Ok(_), Applied::Rule(sent), LogDialog::Rule { base, .. }) => *base = sent,
-                    (Ok(_), Applied::Action(sent), LogDialog::Action { base, .. }) => *base = sent,
+                    (Ok(_), Applied::Action(sent), LogDialog::Action { base, .. }) => *base = *sent,
                     _ => {}
                 }
                 close
@@ -1009,6 +1080,8 @@ fn dialog_body(
                 ui.label("Type");
                 ui.label(if form.memory {
                     "memory"
+                } else if form.disk {
+                    "disk"
                 } else if form.analytics {
                     "analytics"
                 } else {
@@ -1026,6 +1099,23 @@ fn dialog_body(
                     ui.label("");
                     ui.weak("The router's own log (Log window): the newest lines kept");
                     ui.end_row();
+                    return;
+                }
+                if form.disk {
+                    f.text(ui, "File Name", "disk_file_name", &mut form.disk_file_name, "log");
+                    f.text(ui, "Lines per File", "disk_lines_per_file", &mut form.disk_lines_per_file, "1000");
+                    f.text(ui, "File Count", "disk_file_count", &mut form.disk_file_count, "2");
+                    ui.label("Stop on Full");
+                    ui.checkbox(&mut form.disk_stop_on_full, "");
+                    ui.end_row();
+                    ui.label("");
+                    ui.weak("Files that come back after a reboot. No rule sends here until you add one; the bytes stay under 5 % of /config");
+                    ui.end_row();
+                    if !form.disk_status.is_empty() {
+                        ui.label("Status");
+                        ui.label(form.disk_status.as_str());
+                        ui.end_row();
+                    }
                     return;
                 }
                 f.text(ui, "Remote Address", "remote", &mut form.remote, "192.0.2.10");

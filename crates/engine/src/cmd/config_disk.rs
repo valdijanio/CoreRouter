@@ -6,7 +6,7 @@ use super::{CommandSpec, always};
 use crate::{Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[cmd!(query "system.config-disk.print", "Config Disk", [], None,
-    "{} → {capacity_bytes (null: no disk measured), history: {bytes, budget_bytes, percent, revisions_saved, revisions_not_saved}, graphs: {bytes, budget_bytes, percent, refused, removed}}",
+    "{} → {capacity_bytes (null: no disk measured), history: {bytes, budget_bytes, percent, revisions_saved, revisions_not_saved}, graphs: {bytes, budget_bytes, percent, refused, removed}, log: {bytes, budget_bytes, percent, lines_dropped, last_error}}",
     always, print)];
 
 fn print(s: &mut Session, _: &Value) -> Result<Value> {

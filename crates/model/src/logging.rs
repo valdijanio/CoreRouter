@@ -4,9 +4,10 @@
 //! As in RouterOS, an event carries topics (`system,info`, `ntp,warning`)
 //! and a rule matches when the event has every topic of the rule and none
 //! of its `!`-negated ones. Action targets: `remote` (syslog over UDP,
-//! RFC 5424 + RFC 5426) and the built-in `memory` (the router's own log,
+//! RFC 5424 + RFC 5426), the built-in `memory` (the router's own log,
 //! `log.print`; G4.6d), which keeps the last [`Logging::memory_lines`],
-//! and the built-in `analytics` (G4.4f), the `logs` table of the external
+//! the built-in `disk` (G4.6g), files that come back after a reboot, and
+//! the built-in `analytics` (G4.4f), the `logs` table of the external
 //! ClickHouse (`system.analytics`).
 
 use std::fmt;
@@ -30,6 +31,21 @@ pub const MEMORY_ACTION: &str = "memory";
 /// The built-in action of the ClickHouse exporter (G4.4f): like
 /// [`MEMORY_ACTION`], always there and never in [`Logging::actions`].
 pub const ANALYTICS_ACTION: &str = "analytics";
+/// The built-in action of the log files (RouterOS `disk`, G4.6g): like
+/// [`MEMORY_ACTION`], always there and never in [`Logging::actions`]. No
+/// rule sends to it by default, as in RouterOS: writing is a choice, flash
+/// wears.
+pub const DISK_ACTION: &str = "disk";
+/// RouterOS `disk-file-name` default; longer names do not fit a file name
+/// worth reading.
+pub const DEFAULT_DISK_FILE_NAME: &str = "log";
+/// RouterOS `disk-lines-per-file` default (manual 7.25) and range.
+pub const DEFAULT_DISK_LINES_PER_FILE: u32 = 1000;
+pub const MAX_DISK_LINES_PER_FILE: u32 = 65_535;
+/// RouterOS `disk-file-count` default. RouterOS takes up to 65535; here 256:
+/// a rotation renames every file, and the bytes are capped anyway.
+pub const DEFAULT_DISK_FILE_COUNT: u32 = 2;
+pub const MAX_DISK_FILE_COUNT: u32 = 256;
 /// RouterOS `memory-lines` default and range.
 pub const DEFAULT_MEMORY_LINES: u32 = 1000;
 pub const MAX_MEMORY_LINES: u32 = 65_535;
@@ -356,6 +372,46 @@ pub fn valid_topic(t: &str) -> Result<(), String> {
     }
 }
 
+/// The built-in `disk` action's settings (RouterOS `disk-*`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiskLog {
+    pub file_name: String,
+    pub lines_per_file: u32,
+    pub file_count: u32,
+    /// Stop writing when the files are full, instead of deleting the oldest.
+    pub stop_on_full: bool,
+}
+
+impl Default for DiskLog {
+    fn default() -> Self {
+        Self {
+            file_name: DEFAULT_DISK_FILE_NAME.to_owned(),
+            lines_per_file: DEFAULT_DISK_LINES_PER_FILE,
+            file_count: DEFAULT_DISK_FILE_COUNT,
+            stop_on_full: false,
+        }
+    }
+}
+
+impl DiskLog {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// A `disk_file_name`: it becomes a file name, so no directories (RouterOS
+/// takes `usb1/log`; there is one directory here, `<config>/log`).
+pub fn valid_disk_file_name(name: &str) -> Result<(), String> {
+    let ok = (1..=MAX_NAME).contains(&name.len())
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("1..={MAX_NAME} letters, digits, '-' or '_' (no directories)"))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Logging {
@@ -366,6 +422,10 @@ pub struct Logging {
     pub next_rule_id: u32,
     /// Lines the `memory` action keeps (RouterOS `memory-lines`).
     pub memory_lines: u32,
+    /// Not written while default: an older build (a slot rolled back after
+    /// an update) refuses a field it does not know.
+    #[serde(skip_serializing_if = "DiskLog::is_default")]
+    pub disk: DiskLog,
 }
 
 /// RouterOS' default rules: `info`, `error`, `warning` and `critical` go to
@@ -389,6 +449,7 @@ impl Default for Logging {
             next_rule_id: u32::try_from(rules.len()).unwrap_or(0),
             rules,
             memory_lines: DEFAULT_MEMORY_LINES,
+            disk: DiskLog::default(),
         }
     }
 }
@@ -407,10 +468,16 @@ impl Logging {
         self.actions.iter().find(|a| a.name == name)
     }
 
-    /// `name` is an action a rule may name: a remote one, `memory` or
-    /// `analytics`.
+    /// `name` is an action a rule may name: a remote one, `memory`, `disk`
+    /// or `analytics`.
     pub fn has_action(&self, name: &str) -> bool {
-        name == MEMORY_ACTION || name == ANALYTICS_ACTION || self.action(name).is_some()
+        name == MEMORY_ACTION || name == DISK_ACTION || name == ANALYTICS_ACTION || self.action(name).is_some()
+    }
+
+    /// Some enabled rule sends events with `topics` to `disk` (a remote
+    /// action that an older config named `disk` keeps its rules).
+    pub fn to_disk(&self, topics: &[String]) -> bool {
+        self.action(DISK_ACTION).is_none() && self.rules.iter().any(|r| r.action == DISK_ACTION && r.matches(topics))
     }
 
     /// The first enabled rule that sends events with `topics` to
