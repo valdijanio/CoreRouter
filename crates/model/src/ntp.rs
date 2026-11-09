@@ -9,7 +9,6 @@
 
 use std::net::IpAddr;
 
-use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
 /// At most this many servers (RouterOS has no fixed limit; 8 is plenty and
@@ -185,7 +184,7 @@ pub const DEFAULT_LOCAL_STRATUM: u8 = 5;
 /// VyOS's default `allow-client`, RFC 8633 §5.1: loopback, link-local and
 /// private networks. A public address gets silence until the operator says
 /// otherwise, so a WAN address never answers by accident.
-pub fn default_allowed() -> Vec<IpNet> {
+pub fn default_allowed() -> Vec<String> {
     [
         "127.0.0.0/8",
         "169.254.0.0/16",
@@ -196,9 +195,8 @@ pub fn default_allowed() -> Vec<IpNet> {
         "fe80::/10",
         "fc00::/7",
     ]
-    .iter()
-    .filter_map(|n| n.parse().ok())
-    .collect()
+    .map(str::to_owned)
+    .to_vec()
 }
 
 /// `/system ntp server` (G4.6c).
@@ -215,8 +213,10 @@ pub struct NtpServer {
     pub use_local_clock: bool,
     /// The stratum announced for that clock.
     pub local_clock_stratum: u8,
-    /// Who may ask. VyOS's `allow-client`; RouterOS has no such list.
-    pub allowed: Vec<IpNet>,
+    /// Who may ask: prefixes, ranges and names of firewall address lists
+    /// (`crate::source_set`). VyOS's `allow-client`, with RouterOS's lists;
+    /// RouterOS's NTP server has no such thing.
+    pub allowed: Vec<String>,
     /// Per-source limit with Kiss-o'-Death RATE (RFC 5905 §7.4). Off only
     /// for many clients behind one address.
     pub rate_limit: bool,
@@ -277,6 +277,9 @@ pub struct NtpServerStats {
     /// Asked while the clock was not good: dropped in silence.
     pub unsynchronized: u64,
     pub last_error: Option<String>,
+    /// Address lists in `allowed` with nothing in them (or that do not
+    /// exist): they let nobody in.
+    pub empty_lists: Vec<String>,
 }
 
 #[cfg(test)]
@@ -302,10 +305,10 @@ mod tests {
         assert!(!c.enabled && !c.broadcast && !c.use_local_clock);
         assert_eq!(c.local_clock_stratum, 5);
         assert!(c.rate_limit);
-        let has = |ip: &str| {
-            let ip: IpAddr = ip.parse().unwrap();
-            c.allowed.iter().any(|n| n.contains(&ip))
-        };
+        let set = crate::source_set::SourceSet::new(
+            c.allowed.iter().map(|n| n.parse::<crate::firewall::AddrMatch>().unwrap()),
+        );
+        let has = |ip: &str| set.contains(ip.parse().unwrap());
         for private in ["127.0.0.1", "10.1.2.3", "172.31.0.1", "192.168.88.2", "169.254.1.1", "::1", "fe80::1", "fd00::1"] {
             assert!(has(private), "{private}");
         }

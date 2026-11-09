@@ -338,7 +338,10 @@ mod tests {
     fn dispersion_grows_at_15_ppm_and_the_clock_expires() {
         let s = sys();
         assert_eq!(s.dispersion_at(s.reference_nanos), 5_000_000);
-        assert_eq!(s.dispersion_at(s.reference_nanos + 1000 * NANOS), 20_000_000);
+        assert_eq!(
+            s.dispersion_at(s.reference_nanos + 1000 * NANOS),
+            20_000_000
+        );
         // A reference in the future (a step back) never subtracts.
         assert_eq!(s.dispersion_at(s.reference_nanos - NANOS), 5_000_000);
         assert!(s.usable_at(s.reference_nanos));
@@ -394,12 +397,20 @@ mod tests {
         for mode in [0u8, 1, 2, 4, 5, 6, 7] {
             let mut p = request();
             p.mode = mode;
-            assert_eq!(parse_request(&p.encode()), Err(Refused::NotARequest), "{mode}");
+            assert_eq!(
+                parse_request(&p.encode()),
+                Err(Refused::NotARequest),
+                "{mode}"
+            );
         }
         for version in [0u8, 5, 7] {
             let mut p = request();
             p.version = version;
-            assert_eq!(parse_request(&p.encode()), Err(Refused::Version), "{version}");
+            assert_eq!(
+                parse_request(&p.encode()),
+                Err(Refused::Version),
+                "{version}"
+            );
         }
         let mut p = request();
         p.transmit = Timestamp(0);
@@ -499,7 +510,10 @@ mod tests {
             let ip: IpAddr = format!("2001:db8:1:2::{:x}", i + 1).parse().unwrap();
             assert_eq!(l.check(ip, 1), Limit::Allow);
         }
-        assert_eq!(l.check("2001:db8:1:2::ffff".parse().unwrap(), 1), Limit::Kiss);
+        assert_eq!(
+            l.check("2001:db8:1:2::ffff".parse().unwrap(), 1),
+            Limit::Kiss
+        );
         assert_eq!(l.check("2001:db8:1:3::1".parse().unwrap(), 1), Limit::Allow);
     }
 

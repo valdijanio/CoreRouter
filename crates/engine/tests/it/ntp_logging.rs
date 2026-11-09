@@ -217,7 +217,13 @@ fn ntp_server_settings() {
     assert_eq!(got["rate_limit"], true);
     assert_eq!(got["listening"], false);
     assert_eq!(got["serving"], "no");
-    assert!(got["allowed"].as_array().unwrap().iter().any(|n| n == "192.168.0.0/16"));
+    assert!(
+        got["allowed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n == "192.168.0.0/16")
+    );
 
     let set = ok(
         &mut s,
@@ -230,11 +236,20 @@ fn ntp_server_settings() {
     for (p, needle) in [
         (json!({"local_clock_stratum": 0}), "1..=15"),
         (json!({"local_clock_stratum": 16}), "1..=15"),
-        (json!({"allowed": ["not a net"]}), "allowed"),
-        (json!({"allowed": (0..65).map(|i| format!("10.{i}.0.0/16")).collect::<Vec<_>>()}), "at most 64"),
+        (json!({"allowed": ["not a net"]}), "address-list name"),
+        (
+            json!({"allowed": (0..65).map(|i| format!("10.{i}.0.0/16")).collect::<Vec<_>>()}),
+            "at most 64",
+        ),
         (json!({"broadcast": true}), "at least one address"),
-        (json!({"broadcast_addresses": ["nope"]}), "broadcast_addresses"),
-        (json!({"broadcast": true, "broadcast_addresses": ["ff02::1"]}), "only IPv4"),
+        (
+            json!({"broadcast_addresses": ["nope"]}),
+            "broadcast_addresses",
+        ),
+        (
+            json!({"broadcast": true, "broadcast_addresses": ["ff02::1"]}),
+            "only IPv4",
+        ),
         (json!({"vrf": "ghost"}), "no VRF"),
         (json!({"enable": true}), "did you mean"),
     ] {
@@ -258,6 +273,55 @@ fn ntp_server_settings() {
     }
 }
 
+/// `allowed` takes firewall address lists: static and dynamic entries, not
+/// the disabled ones; a list with nothing in it lets nobody in.
+#[test]
+fn ntp_server_allowed_takes_address_lists() {
+    let mut s = Session::virtual_lab();
+    ok(
+        &mut s,
+        "system.ntp.server.set",
+        json!({"allowed": ["10.0.0.0/8", "lan", "ghost"]}),
+    );
+    let (sources, empty) = s.ntp_server_sources();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(empty, ["lan", "ghost"], "named, and nothing in them yet");
+
+    ok(
+        &mut s,
+        "ip.firewall.address-list.add",
+        json!({"list": "lan", "address": "192.168.88.0/24"}),
+    );
+    ok(
+        &mut s,
+        "ip.firewall.address-list.add",
+        json!({"list": "lan", "address": "192.168.99.0/24", "disabled": true}),
+    );
+    ok(
+        &mut s,
+        "ip.firewall.address-list.add",
+        json!({"list": "lan", "address": "192.168.77.7", "timeout": "1h"}),
+    );
+    ok(
+        &mut s,
+        "ip.firewall.address-list.add",
+        json!({"list": "other", "address": "172.16.0.0/12"}),
+    );
+    let (sources, empty) = s.ntp_server_sources();
+    assert_eq!(empty, ["ghost"]);
+    let set = corerouter_model::source_set::SourceSet::new(sources);
+    for (ip, want) in [
+        ("10.1.2.3", true),
+        ("192.168.88.5", true),
+        ("192.168.77.7", true),
+        ("192.168.99.5", false),
+        ("172.16.0.1", false),
+        ("8.8.8.8", false),
+    ] {
+        assert_eq!(set.contains(ip.parse().unwrap()), want, "{ip}");
+    }
+}
+
 /// RouterOS's `using-local-clock`: only with no good answer.
 #[test]
 fn the_client_reports_the_local_clock() {
@@ -271,7 +335,10 @@ fn the_client_reports_the_local_clock() {
         status: NtpState::Waiting,
         ..NtpStatus::default()
     });
-    assert_eq!(ok(&mut s, "system.ntp.client.get", Value::Null)["status"], "waiting");
+    assert_eq!(
+        ok(&mut s, "system.ntp.client.get", Value::Null)["status"],
+        "waiting"
+    );
     ok(
         &mut s,
         "system.ntp.server.set",
@@ -285,7 +352,10 @@ fn the_client_reports_the_local_clock() {
         status: NtpState::Synchronized,
         ..NtpStatus::default()
     });
-    assert_eq!(ok(&mut s, "system.ntp.client.get", Value::Null)["status"], "synchronized");
+    assert_eq!(
+        ok(&mut s, "system.ntp.client.get", Value::Null)["status"],
+        "synchronized"
+    );
 }
 
 #[test]

@@ -60,7 +60,10 @@ fn daemon(dir: &Path) -> Kill {
 }
 
 fn nanos() -> i128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i128
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i128
 }
 
 /// A source of time on `127.0.0.2:123`, sharing the port with the server's
@@ -98,7 +101,8 @@ fn upstream() {
 fn client(src: &str, dst: &str) -> UdpSocket {
     let s = UdpSocket::bind((src, 0)).unwrap();
     s.connect((dst, 123)).unwrap();
-    s.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+    s.set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
     s
 }
 
@@ -167,8 +171,13 @@ fn the_server_from_outside() {
     assert_eq!(ask(&client("10.7.0.1", "10.7.0.2")).unwrap().stratum, 3);
     // IPv6 too.
     let v6 = UdpSocket::bind("[::1]:0").unwrap();
-    v6.connect(SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 123)).unwrap();
-    v6.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+    v6.connect(SocketAddr::new(
+        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        123,
+    ))
+    .unwrap();
+    v6.set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
     assert_eq!(ask(&v6).unwrap().stratum, 3);
 
     // A public source: silence by default.
@@ -184,15 +193,22 @@ fn the_server_from_outside() {
         ctl.send(&p.encode()).unwrap();
         assert!(ctl.recv(&mut buf).is_err(), "mode {mode} got an answer");
     }
-    let mut long = Packet::client_request(Timestamp::from_unix_nanos(nanos())).encode().to_vec();
+    let mut long = Packet::client_request(Timestamp::from_unix_nanos(nanos()))
+        .encode()
+        .to_vec();
     long.extend_from_slice(&[0u8; 28]);
     ctl.send(&long).unwrap();
-    assert_eq!(ctl.recv(&mut buf).unwrap(), 48, "extension fields are not echoed");
+    assert_eq!(
+        ctl.recv(&mut buf).unwrap(),
+        48,
+        "extension fields are not echoed"
+    );
 
     // Hostile bytes: an answer is the header and nothing else, and the server
     // survives. (Replies arrive late, so they cannot be matched to a request.)
     let junk = client("10.7.0.2", "10.7.0.1");
-    junk.set_read_timeout(Some(Duration::from_millis(2))).unwrap();
+    junk.set_read_timeout(Some(Duration::from_millis(2)))
+        .unwrap();
     let mut x = 0x1234_5678u32;
     let mut wrong_size = 0;
     for i in 0..2000usize {
@@ -203,7 +219,10 @@ fn the_server_from_outside() {
                 (x >> 24) as u8
             })
             .collect();
-        if junk.send(&bytes).is_ok() && i % 50 == 0 && let Ok(n) = junk.recv(&mut buf) {
+        if junk.send(&bytes).is_ok()
+            && i % 50 == 0
+            && let Ok(n) = junk.recv(&mut buf)
+        {
             wrong_size += usize::from(n != 48);
         }
     }
@@ -214,14 +233,21 @@ fn the_server_from_outside() {
     run("system.ntp.server.set", json!({"allowed": ["10.7.0.3/32"]})).unwrap();
     ip(None, &["addr", "add", "10.7.0.3/24", "dev", "d0"]);
     let flood = client("10.7.0.3", "10.7.0.1");
-    wait_for("the new list", || ask(&client("10.7.0.2", "10.7.0.1")).is_none());
-    flood.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+    wait_for("the new list", || {
+        ask(&client("10.7.0.2", "10.7.0.1")).is_none()
+    });
+    flood
+        .set_read_timeout(Some(Duration::from_millis(20)))
+        .unwrap();
     let (mut replies, mut kiss, mut silence) = (0, 0, 0);
     for _ in 0..40 {
         match ask(&flood) {
             Some(p) if p.stratum == 0 => {
                 assert_eq!(p.kiss_code().as_deref(), Some("RATE"));
-                assert_eq!(check_reply(p.origin, &p), Err(corerouter_proto_ntp::ReplyError::Kiss("RATE".into())));
+                assert_eq!(
+                    check_reply(p.origin, &p),
+                    Err(corerouter_proto_ntp::ReplyError::Kiss("RATE".into()))
+                );
                 kiss += 1;
             }
             Some(_) => replies += 1,
@@ -238,6 +264,26 @@ fn the_server_from_outside() {
         s["kisses"].as_u64().unwrap() >= 1 && s["limited"].as_u64().unwrap() > 0
     });
 
+    // A firewall address list: nobody until an entry names the client. A
+    // dynamic entry counts too.
+    run("system.ntp.server.set", json!({"allowed": ["ntp-lan"]})).unwrap();
+    let member = client("10.7.0.2", "10.7.0.1");
+    wait_for("the list applied", || ask(&member).is_none());
+    wait_for("the empty list reported", || {
+        stats()["empty_lists"] == json!(["ntp-lan"])
+    });
+    run(
+        "ip.firewall.address-list.add",
+        json!({"list": "ntp-lan", "address": "10.7.0.2", "timeout": "1h"}),
+    )
+    .unwrap();
+    wait_for("the entry counts", || ask(&member).is_some());
+    wait_for("no complaint", || stats()["empty_lists"] == json!([]));
+    assert!(
+        ask(&client("10.7.0.3", "10.7.0.1")).is_none(),
+        "not on the list"
+    );
+
     // Broadcast: mode 5 to the subnet's address.
     run(
         "system.ntp.server.set",
@@ -249,7 +295,9 @@ fn the_server_from_outside() {
     let at: SocketAddr = "10.7.0.255:123".parse().unwrap();
     listen.bind(&at.into()).unwrap();
     let listen: UdpSocket = listen.into();
-    listen.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    listen
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     let start = Instant::now();
     let n = listen.recv(&mut buf).expect("a broadcast within 10 s");
     let b = Packet::decode(&buf[..n]).unwrap();
@@ -279,12 +327,18 @@ fn the_server_from_outside() {
             .unwrap()
             .success()
     });
-    run("system.ntp.server.set", json!({"broadcast": false, "vrf": "red"})).unwrap();
+    run(
+        "system.ntp.server.set",
+        json!({"broadcast": false, "vrf": "red"}),
+    )
+    .unwrap();
     ip(None, &["link", "add", "d1", "type", "dummy"]);
     ip(None, &["link", "set", "d1", "master", "red", "up"]);
     ip(None, &["addr", "add", "10.8.0.1/24", "dev", "d1"]);
     ip(None, &["addr", "add", "10.8.0.2/24", "dev", "d1"]);
-    wait_for("out of the main table", || ask(&client("10.7.0.2", "10.7.0.1")).is_none());
+    wait_for("out of the main table", || {
+        ask(&client("10.7.0.2", "10.7.0.1")).is_none()
+    });
     let inside = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
     inside.bind_device(Some(b"red")).unwrap();
     let src: SocketAddr = "10.8.0.2:0".parse().unwrap();
@@ -292,6 +346,10 @@ fn the_server_from_outside() {
     let dst: SocketAddr = "10.8.0.1:123".parse().unwrap();
     inside.connect(&dst.into()).unwrap();
     let inside: UdpSocket = inside.into();
-    inside.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
-    wait_for("an answer inside the VRF", || ask(&inside).is_some_and(|p| p.stratum == 3));
+    inside
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
+    wait_for("an answer inside the VRF", || {
+        ask(&inside).is_some_and(|p| p.stratum == 3)
+    });
 }

@@ -1,6 +1,7 @@
 //! /system ntp client (G4.6): servers to ask and the client's status.
 //! /system ntp server (G4.6c): who may ask and whose time to give.
 
+use corerouter_model::source_set::SourceEntry;
 use corerouter_model::{IfName, InterfaceKind};
 use corerouter_model::ntp::{
     LOCAL_STRATUM_RANGE, MAIN_VRF, MAX_ALLOWED, MAX_BROADCAST, MAX_SERVERS, NtpClient, NtpServer,
@@ -18,12 +19,12 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "NTP Server",
         ["System", "NTP Server"],
         None,
-        "{enabled?: bool, broadcast?: bool, broadcast_addresses?: [ip] | string (comma-separated), use_local_clock?: bool, local_clock_stratum?: int 1..15 (default 5), allowed?: [cidr] | string (comma-separated; default loopback, link-local, private), rate_limit?: bool (default yes), vrf?: string (default main)} → {enabled, broadcast, broadcast_addresses, use_local_clock, local_clock_stratum, allowed, rate_limit, vrf}",
+        "{enabled?: bool, broadcast?: bool, broadcast_addresses?: [ip] | string (comma-separated), use_local_clock?: bool, local_clock_stratum?: int 1..15 (default 5), allowed?: [prefix, range or address-list name] | string (comma-separated; default loopback, link-local, private), rate_limit?: bool (default yes), vrf?: string (default main)} → {enabled, broadcast, broadcast_addresses, use_local_clock, local_clock_stratum, allowed, rate_limit, vrf}",
         always,
         server_set
     ),
     cmd!(query "system.ntp.server.get", "NTP Server", [], None,
-        "{} → {enabled, broadcast, broadcast_addresses, use_local_clock, local_clock_stratum, allowed, rate_limit, vrf, listening, serving: no|upstream|local-clock, stratum, requests, replies, kisses, denied, limited, malformed, unsynchronized, last_error}",
+        "{} → {enabled, broadcast, broadcast_addresses, use_local_clock, local_clock_stratum, allowed, rate_limit, vrf, listening, serving: no|upstream|local-clock, stratum, requests, replies, kisses, denied, limited, malformed, unsynchronized, last_error, empty_lists}",
         always, server_get),
     cmd!(
         "system.ntp.client.set",
@@ -294,7 +295,10 @@ fn server_set(s: &mut Session, p: &Value) -> Result<Value> {
                 )
             })?;
     }
-    if let Some(v) = list(p, "allowed", MAX_ALLOWED)? {
+    if let Some(v) = list::<String>(p, "allowed", MAX_ALLOWED)? {
+        for item in &v {
+            SourceEntry::parse(item).map_err(|e| EngineError::bad("allowed", e))?;
+        }
         c.allowed = v;
     }
     if let Some(v) = opt_bool(p, "rate_limit")? {

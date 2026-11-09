@@ -200,7 +200,7 @@ impl NtpServerPanel {
                 label(ui, help, l, "allowed", "Allowed");
                 ui.add(
                     TextEdit::multiline(&mut form.allowed)
-                        .hint_text("192.168.0.0/16")
+                        .hint_text("192.168.0.0/16 or a list name")
                         .desired_rows(4)
                         .desired_width(220.0),
                 );
@@ -304,6 +304,16 @@ fn status(ui: &mut Ui, s: &Value, help: &mut Option<HelpView>, l: Lang) {
             for (key, name, field) in rows {
                 label(ui, help, l, key, name);
                 ui.label(text(s, field));
+                ui.end_row();
+            }
+            let empty = s
+                .get("empty_lists")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "))
+                .unwrap_or_default();
+            if !empty.is_empty() {
+                label(ui, help, l, "empty_lists", "Empty Lists");
+                ui.colored_label(ui.visuals().warn_fg_color, empty);
                 ui.end_row();
             }
             let err = text(s, "last_error");

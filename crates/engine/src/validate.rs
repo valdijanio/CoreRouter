@@ -507,6 +507,11 @@ fn ntp_server_checks(cfg: &Config, out: &mut Vec<Issue>) {
             format!("at most {MAX_ALLOWED} networks"),
         ));
     }
+    for item in c.allowed.iter().take(MAX_ALLOWED.saturating_add(1)) {
+        if let Err(e) = corerouter_model::source_set::SourceEntry::parse(item) {
+            out.push(Issue::new("system.ntp_server.allowed", e));
+        }
+    }
     if c.broadcast_addresses.len() > MAX_BROADCAST {
         out.push(Issue::new(
             "system.ntp_server.broadcast_addresses",

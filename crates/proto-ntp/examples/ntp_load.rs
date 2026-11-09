@@ -7,7 +7,12 @@
 //! cargo run --release -p corerouter-proto-ntp --example ntp_load -- \
 //!     127.0.0.1:123 <threads> <seconds> [window] [sources]
 //! ```
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;

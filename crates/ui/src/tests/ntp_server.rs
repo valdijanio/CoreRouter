@@ -44,10 +44,17 @@ fn window_shows_the_state_and_applies() {
     assert!(h.has_text("upstream"));
     assert!(h.has_text("1234"));
     assert!(h.has_text("7"));
+    assert!(!h.has_text("Empty Lists"));
+    lock(&h.session).set_ntp_server_stats(NtpServerStats {
+        empty_lists: vec!["ghost".into()],
+        ..NtpServerStats::default()
+    });
+    refresh(&mut h);
+    assert!(h.has_text("ghost"), "a list that lets nobody in is shown");
 
     let p = h.app.panel_mut::<NtpServerPanel>().unwrap();
     p.form.enabled = true;
-    p.form.allowed = "10.0.0.0/8\n192.168.88.0/24".into();
+    p.form.allowed = "10.0.0.0/8\nlan-clients".into();
     p.form.use_local_clock = true;
     h.idle();
     h.click(h.text("Apply"));
@@ -57,7 +64,7 @@ fn window_shows_the_state_and_applies() {
         .unwrap();
     assert_eq!(got["enabled"], true, "{:?}", h.app.log());
     assert_eq!(got["use_local_clock"], true);
-    assert_eq!(got["allowed"], json!(["10.0.0.0/8", "192.168.88.0/24"]));
+    assert_eq!(got["allowed"], json!(["10.0.0.0/8", "lan-clients"]));
 }
 
 #[test]

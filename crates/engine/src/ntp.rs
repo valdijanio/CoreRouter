@@ -3,7 +3,9 @@
 //! shows it. Operational state, never saved.
 
 use corerouter_hal::clock::SystemClock;
+use corerouter_model::firewall::AddrMatch;
 use corerouter_model::ntp::{NtpServerStats, NtpState, NtpStatus};
+use corerouter_model::source_set::SourceEntry;
 use serde_json::Value;
 
 use crate::Session;
@@ -59,6 +61,44 @@ impl Session {
             status.status = NtpState::UsingLocalClock;
         }
         status
+    }
+
+    /// What `allowed` of `/system ntp server` holds right now, and the
+    /// address lists in it with nothing in them. The caller sorts it into a
+    /// `SourceSet` outside the session lock. A name that is not a list holds
+    /// nobody, like a firewall rule that names one: entries may come later.
+    pub fn ntp_server_sources(&self) -> (Vec<AddrMatch>, Vec<String>) {
+        let cfg = self.store().running();
+        let mut out = Vec::new();
+        let mut empty = Vec::new();
+        for item in &cfg.system.ntp_server.allowed {
+            match SourceEntry::parse(item) {
+                Ok(SourceEntry::Match(m)) => out.push(m),
+                Ok(SourceEntry::List(name)) => {
+                    let before = out.len();
+                    out.extend(
+                        cfg.ip
+                            .firewall
+                            .address_lists
+                            .iter()
+                            .filter(|e| !e.disabled && e.list == name)
+                            .map(|e| e.address),
+                    );
+                    out.extend(
+                        self.dynamic_addresses
+                            .entries()
+                            .iter()
+                            .filter(|e| e.list == name)
+                            .map(|e| e.address),
+                    );
+                    if out.len() == before {
+                        empty.push(name.to_string());
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        (out, empty)
     }
 
     /// The daemon's NTP server reports its counters (G4.6c).

@@ -1,14 +1,17 @@
 //! NTP server (G4.6c, `/system ntp server`): answers the LAN's clients (mode
-//! 4) only while this router's clock is good, from the allowed networks, under
-//! a per-source rate limit (`corerouter_proto_ntp::server`, docs/ntp.md).
+//! 4) only while this router's clock is good, from the allowed sources
+//! (prefixes and firewall address lists), under a per-source rate limit
+//! (`corerouter_proto_ntp::server`, docs/ntp.md).
 //!
 //! Off by default. What is asked of a packet, cheapest first: an address no
 //! reply can go to, the allowed list (silence, also the default for a WAN
 //! address), the header, the clock, the rate.
 //!
-//! Threads (`workers`): one `SO_REUSEPORT` socket per reader, each with its
-//! rate table and counters, so a packet takes no lock and shares no cache line
-//! (docs/perf.md, G4.6c). Nothing here holds the session lock per packet: the
+//! Threads: one reader per address family unless `--ntp-server-readers` says
+//! otherwise: one reader answers 400 000 requests a second (**medido**,
+//! docs/perf.md, G4.6c) and more of them only burn more cores in a flood. Each
+//! reader has its `SO_REUSEPORT` socket, rate table and counters, so a packet
+//! takes no lock and shares no cache line. Nothing here holds the session lock per packet: the
 //! main loop copies the config and the client's status once per [`TICK`] and
 //! publishes a new [`View`]; a reader sees that through one relaxed atomic.
 
@@ -27,13 +30,20 @@ use corerouter_proto_ntp::discipline::STEP_NANOS;
 use corerouter_proto_ntp::server::{
     self, Limit, RATE_SLOTS, RateLimiter, Refused, SystemVars,
 };
-use ipnet::IpNet;
+use corerouter_model::source_set::{SourceEntry, SourceSet};
 
 /// How often the main loop looks at the config and the client.
 const TICK: Duration = if cfg!(test) {
     Duration::from_millis(50)
 } else {
     Duration::from_secs(1)
+};
+/// How often the address lists named in `allowed` are read again. They may
+/// hold thousands of entries and change with every session, so not per tick.
+const LIST_REFRESH: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(2)
 };
 /// How long a reader waits for a datagram before looking at the stop flag.
 const POLL: Duration = Duration::from_millis(200);
@@ -53,11 +63,8 @@ const BROADCAST_POLL: i8 = 6;
 /// "LOCL": RFC 5905 Figure 12's name for an uncalibrated local clock.
 const REFID_LOCAL: [u8; 4] = *b"LOCL";
 
-/// Readers per socket family: half the cores, 1 to 4 (docs/perf.md, G4.6c).
-fn default_readers() -> usize {
-    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    (cores / 2).clamp(1, 4)
-}
+/// Readers per socket family (see the module's text).
+const DEFAULT_READERS: usize = 1;
 
 fn unix_nanos() -> i128 {
     SystemTime::now()
@@ -70,18 +77,11 @@ fn unix_nanos() -> i128 {
 #[derive(Debug, Clone, Default, PartialEq)]
 struct View {
     serve: Option<SystemVars>,
-    allowed: Vec<IpNet>,
+    allowed: Arc<SourceSet>,
     /// Never answer to these: they are configured broadcast addresses, and
     /// one socket holds `SO_BROADCAST`.
     no_reply: Vec<IpAddr>,
     rate_limit: bool,
-}
-
-impl View {
-    fn allows(&self, ip: IpAddr) -> bool {
-        let ip = ip.to_canonical();
-        self.allowed.iter().any(|n| n.contains(&ip))
-    }
 }
 
 /// One reader's counters, on a cache line of its own.
@@ -142,7 +142,7 @@ fn answer(
         c(&counters.malformed);
         return None;
     }
-    if !view.allows(ip) {
+    if !view.allowed.contains(ip) {
         c(&counters.denied);
         return None;
     }
@@ -381,6 +381,10 @@ fn run(session: &Shared, port: u16, readers: usize, health: &super::Health) -> R
     let mut last_stats: Option<NtpServerStats> = None;
     let mut retry = Instant::now();
     let mut next_broadcast = Instant::now();
+    let mut allowed_from: Option<Vec<String>> = None;
+    let mut allowed = Arc::new(SourceSet::default());
+    let mut empty_lists: Vec<String> = Vec::new();
+    let mut next_lists = Instant::now();
     loop {
         health.beat();
         if health.stopping() {
@@ -389,10 +393,33 @@ fn run(session: &Shared, port: u16, readers: usize, health: &super::Health) -> R
             }
             return Ok(());
         }
+        // The list only when it changed or may have: the set is sorted outside
+        // the session lock.
+        let mut sources = None;
         let (cfg, status) = {
             let s = lock(session);
-            (s.store().running().system.ntp_server.clone(), s.ntp_status())
+            let cfg = s.store().running().system.ntp_server.clone();
+            let names = cfg
+                .allowed
+                .iter()
+                .any(|i| matches!(SourceEntry::parse(i), Ok(SourceEntry::List(_))));
+            if allowed_from.as_ref() != Some(&cfg.allowed)
+                || (names && Instant::now() >= next_lists)
+            {
+                sources = Some(s.ntp_server_sources());
+            }
+            let status = s.ntp_status();
+            (cfg, status)
         };
+        if let Some((items, empty)) = sources {
+            let set = SourceSet::new(items);
+            if *allowed != set {
+                allowed = Arc::new(set);
+            }
+            empty_lists = empty;
+            allowed_from = Some(cfg.allowed.clone());
+            next_lists = Instant::now() + LIST_REFRESH;
+        }
         let mut stats = NtpServerStats::default();
         if cfg.enabled {
             health.disabled(None);
@@ -400,7 +427,7 @@ fn run(session: &Shared, port: u16, readers: usize, health: &super::Health) -> R
             let serve = holdover.decide(&status, &cfg, now);
             let view = View {
                 serve,
-                allowed: cfg.allowed.clone(),
+                allowed: allowed.clone(),
                 no_reply: if cfg.broadcast {
                     cfg.broadcast_addresses.clone()
                 } else {
@@ -466,6 +493,7 @@ fn run(session: &Shared, port: u16, readers: usize, health: &super::Health) -> R
                 Some(_) => NtpServing::Upstream,
             };
             stats.stratum = view.serve.map(|v| v.stratum);
+            stats.empty_lists = empty_lists.clone();
         } else {
             health.disabled(Some("system.ntp.server enabled=no"));
             if let Some(o) = opened.take() {
@@ -494,7 +522,7 @@ pub(crate) const SERVICE: super::Service = super::Service {
     flags: &[super::Flag {
         name: "--ntp-server-readers",
         value: Some("<n>"),
-        help: "Threads answering NTP per address family, 1..=64\n(default half the cores, 1 to 4).",
+        help: "Threads answering NTP per address family, 1..=64\n(default 1: about 400 000 answers a second).",
     }],
     topic: "ntp",
     enable: "system.ntp.server.set enabled=yes",
@@ -509,7 +537,7 @@ fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
             .ok()
             .filter(|n| (1..=64).contains(n))
             .ok_or_else(|| format!("--ntp-server-readers {v}: expected 1..=64"))?,
-        None => default_readers(),
+        None => DEFAULT_READERS,
     };
     let session = ctx.session.clone();
     Ok(Box::new(move |health: &super::Health| {
@@ -718,7 +746,11 @@ mod tests {
     fn view() -> View {
         View {
             serve: Some(sys()),
-            allowed: corerouter_model::ntp::default_allowed(),
+            allowed: Arc::new(SourceSet::new(
+                corerouter_model::ntp::default_allowed()
+                    .iter()
+                    .map(|n| n.parse().unwrap()),
+            )),
             no_reply: Vec::new(),
             rate_limit: true,
         }
@@ -1047,6 +1079,24 @@ mod tests {
             .unwrap();
         wait_for("the new list", || query(port).is_err());
         wait_for("denied", || lock(&session).ntp_server_stats().denied > 0);
+
+        // An address list: empty lets nobody in, and says so; a new entry
+        // opens the door, with no change to the server's config.
+        lock(&session)
+            .execute("system.ntp.server.set", &json!({"allowed": ["ntp-ok"]}))
+            .unwrap();
+        wait_for("the empty list reported", || {
+            lock(&session).ntp_server_stats().empty_lists == ["ntp-ok"]
+        });
+        assert!(query(port).is_err());
+        lock(&session)
+            .execute(
+                "ip.firewall.address-list.add",
+                &json!({"list": "ntp-ok", "address": "127.0.0.1"}),
+            )
+            .unwrap();
+        wait_for("the entry counts", || query(port).is_ok());
+        wait_for("no complaint", || lock(&session).ntp_server_stats().empty_lists.is_empty());
 
         // Off closes the sockets.
         lock(&session)
