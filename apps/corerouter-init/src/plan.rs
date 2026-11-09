@@ -92,13 +92,14 @@ pub enum Mode {
 /// The argument the first stage of the live ISO passes to `corerouter-init`
 /// on the image's root: this boot already moved there (G1.6y).
 pub const LIVE_STAGE2: &str = "--live-root";
-/// Below this `MemTotal` the ISO stays on the console installer (G1.6y): the
-/// image needs a 128 MiB machine to come up (**medido**, QEMU, no GUI
-/// connected) and an install reads the 35 MiB root back into memory on top
-/// of it. A 256 MiB machine shows less than 256 MiB here, what the kernel and
-/// the firmware keep: 199 MiB under OVMF with the drivers of G1.6g and G1.6j
-/// (**medido**), hence the margin below it.
-pub const LIVE_MIN_RAM_KIB: u64 = 180 * 1024;
+/// Below this `MemTotal` the ISO stays on the console installer (G1.6y). The
+/// root and the driver modules live in RAM (51 MiB), and a login with a
+/// password (Argon2) takes the daemon to ~128 MiB: with 256 MiB of RAM that is
+/// an OOM kill at every login, and the install in progress goes with the
+/// daemon; with 288 MiB it fits, with little to spare (**medido**, G1.6za). A
+/// machine shows less than it has, what the kernel and the firmware keep: ~263
+/// MiB here for 320 MiB (199 MiB for 256 MiB under OVMF, **medido**).
+pub const LIVE_MIN_RAM_KIB: u64 = 250 * 1024;
 /// The live image's host name.
 pub const LIVE_HOSTNAME: &str = "corerouter-live";
 

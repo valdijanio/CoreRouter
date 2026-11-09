@@ -928,7 +928,7 @@ instalador acima.
   (`mount -o loop`, `switch_root`: sem `ioctl` em Rust, que exigiria `unsafe`). Na raiz nova, o
   init roda de novo (`--live-root`), como o de um roteador. A pendrive fica até o fim da instalação:
   a carga é lida dela na hora de gravar.
-- **Se algo falha, instala igual.** Menos de ~256 MiB de RAM, mídia ruim ou erro na troca de raiz:
+- **Se algo falha, instala igual.** Menos de 320 MiB de RAM (G1.6za, abaixo), mídia ruim ou erro na troca de raiz:
   fica no instalador de console, que não precisa de nada disso. O `fw_cfg` do hipervisor vai
   direto para ele.
 - **Não toca em disco nenhum.** `/config` é um tmpfs (não procura a partição `config` de um
@@ -1008,6 +1008,13 @@ com a G1.6jb.
 
 Compressão, medido sobre a mesma árvore: zstd 3 dá 4 554 752 B, zstd 15 dá 3 903 488 B, zstd 19 e 22 dão
 3 813 376 B (5,3 s de CPU a cada `os build` que refaz a ISO; `--only crpkg` não paga).
+
+**O mínimo do live subiu de 256 para 320 MiB.** O `install-test` falhava em `live_install`, também
+na ISO de antes desta gap (**medido**, a mesma falha com a ISO do commit `976fdd5d`). O login com
+senha (Argon2) leva o daemon a ~128 MiB, e o OOM o matava a cada login, levando junto a instalação em
+andamento: `job` e `result` voltavam a `null`, sem erro na tela. Com a raiz na RAM crescendo de 37 para 47 MiB (G1.6j), 256 MiB
+deixou de bastar. Com 288 MiB instala, com pouca folga; com 320 MiB instala e continua logando (**medido**). Abaixo disso fica no
+instalador de console.
 
 **Desempenho e paralelismo.** A carga é lida e conferida uma vez, em fluxo, com custo proporcional ao
 tamanho dela (29–31 ms). No boot, o custo é o de sempre em `modules.rs`: cada dispositivo sem driver
