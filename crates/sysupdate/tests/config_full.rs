@@ -180,6 +180,8 @@ fn a_big_history_fits_because_it_is_linked() {
         "{s}"
     );
     assert!(s["config_space"]["free"].as_u64().is_some());
+    assert!(s["config_space"]["total"].as_u64() >= s["config_space"]["free"].as_u64());
+    assert_eq!(s["config_space"]["snapshot_fits"], true);
     assert_eq!(s["config_space"]["usage"][0]["path"], "rev-81.json");
 }
 
