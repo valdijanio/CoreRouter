@@ -226,6 +226,38 @@ fn route_get_answers_like_ip_route_get() {
     );
 }
 
+/// G1.5b: `RTM_GETROUTE` answers a discard route with an error of its own
+/// (even with `RTM_F_FIB_MATCH`), and `ip.route.lookup` says which.
+#[test]
+fn route_get_tells_the_discard_routes_apart() {
+    if !in_netns() {
+        return;
+    }
+    // Alone: the other tests count the discard routes of the namespace.
+    let _dumps = DUMPS.write().unwrap_or_else(|e| e.into_inner());
+    let mut hal = LinuxHal::new();
+    let mut cfg = base("g5b", 85);
+    route(&mut cfg, "100.65.0.0/16", "blackhole");
+    route(&mut cfg, "198.18.85.0/24", "unreachable");
+    route(&mut cfg, "2001:db8:dead:85::/64", "prohibit");
+    route(&mut cfg, "203.0.113.0/24", "10.85.0.1");
+    hal.apply(&Config::default(), &cfg).unwrap();
+    for (dst, kind) in [
+        ("100.65.0.1", RouteKind::Blackhole),
+        ("198.18.85.1", RouteKind::Unreachable),
+        ("2001:db8:dead:85::1", RouteKind::Prohibit),
+        ("203.0.113.1", RouteKind::Unicast),
+    ] {
+        let q = RouteQuery {
+            dst: dst.parse().unwrap(),
+            table: 254,
+            src: None,
+        };
+        assert_eq!(hal.route_get(&cfg, &q).unwrap().kind, kind, "{dst}");
+    }
+    hal.apply(&cfg, &Config::default()).unwrap();
+}
+
 #[test]
 fn a_route_of_someone_else_is_refused_not_replaced() {
     if !in_netns() {

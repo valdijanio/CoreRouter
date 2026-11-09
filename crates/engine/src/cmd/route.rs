@@ -2,6 +2,7 @@
 //! addresses in `ip.route.list` (flagged dynamic/connected, as in RouterOS).
 
 use corerouter_model::dhcp_client::CheckGateway;
+use corerouter_model::route;
 use corerouter_model::types::Discard;
 use corerouter_model::{
     Config, DEFAULT_DISTANCE, Gateway, ItemId, RouteEntry, RoutingTable, parse_destination,
@@ -12,6 +13,7 @@ use serde_json::{Value, json};
 use super::args::{opt_bool, opt_parse, opt_str, opt_text, opt_u32, req_parse, req_str};
 use super::{CommandSpec, always};
 use crate::dhcp_client::is_dynamic;
+use crate::lockout::{discard_for, plain_ends, take_force};
 use crate::route_table::{Changed, Line, Origin, RouteWatch, State};
 use crate::validate::route_issues;
 use crate::{EngineError, Result, Session};
@@ -26,7 +28,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add Route",
         ["IP", "Routes"],
         None,
-        "{dst_address: cidr | ip (0.0.0.0/0, ::/0, 10.1.0.0/16, 192.0.2.7), gateway?: ip | interface | ip%interface | blackhole | unreachable | prohibit (required unless type is a discard), type?: unicast | blackhole | unreachable | prohibit (RouterOS v6 type; blackhole drops silently, unreachable answers ICMP unreachable, prohibit ICMP administratively prohibited; default unicast), blackhole?: bool (RouterOS v7: type=blackhole), distance?: u32 (1..=255, default 1), routing_table?: string (main | VRF | routing.table name, default main), check_gateway?: none | ping | arp | bfd (default none; ping/arp every 10 s, down after 2 misses: the route leaves the kernel and the next distance wins), bfd_profile?: string (check_gateway=bfd; default 'default'), disabled?: bool, comment?: string} → {id}",
+        "{dst_address: cidr | ip (0.0.0.0/0, ::/0, 10.1.0.0/16, 192.0.2.7), gateway?: ip | interface | ip%interface | blackhole | unreachable | prohibit (required unless type is a discard), type?: unicast | blackhole | unreachable | prohibit (RouterOS v6 type; blackhole drops silently, unreachable answers ICMP unreachable, prohibit ICMP administratively prohibited; default unicast), blackhole?: bool (RouterOS v7: type=blackhole), distance?: u32 (1..=255, default 1), routing_table?: string (main | VRF | routing.table name, default main), check_gateway?: none | ping | arp | bfd (default none; ping/arp every 10 s, down after 2 misses: the route leaves the kernel and the next distance wins), bfd_profile?: string (check_gateway=bfd; default 'default'), disabled?: bool, comment?: string, force?: bool (apply even if it cuts this session's own connection)} → {id, warnings: [string]}",
         always,
         add
     ),
@@ -35,7 +37,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set Route",
         [],
         None,
-        "{id: *hex, dst_address?: cidr | ip, gateway?: ip | interface | ip%interface | blackhole | unreachable | prohibit, type?: unicast | blackhole | unreachable | prohibit (unicast needs a gateway), blackhole?: bool, distance?: u32 (1..=255), routing_table?: string, check_gateway?: none | ping | arp | bfd, bfd_profile?: string (check_gateway=bfd; empty: default), disabled?: bool, comment?: string} → {id}",
+        "{id: *hex, dst_address?: cidr | ip, gateway?: ip | interface | ip%interface | blackhole | unreachable | prohibit, type?: unicast | blackhole | unreachable | prohibit (unicast needs a gateway), blackhole?: bool, distance?: u32 (1..=255), routing_table?: string, check_gateway?: none | ping | arp | bfd, bfd_profile?: string (check_gateway=bfd; empty: default), disabled?: bool, comment?: string, force?: bool (apply even if it cuts this session's own connection)} → {id, warnings: [string]}",
         has_routes,
         set
     ),
@@ -44,7 +46,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Remove Route",
         [],
         None,
-        "{id: *hex (a static route; connected ones go with their address)} → {id}",
+        "{id: *hex (a static route; connected ones go with their address), force?: bool (apply even if it cuts this session's own connection)} → {id}",
         has_routes,
         remove
     ),
@@ -156,6 +158,7 @@ fn need_gateway() -> EngineError {
 }
 
 fn add(s: &mut Session, p: &Value) -> Result<Value> {
+    take_force(s, p)?;
     let dst = parse_destination(req_str(p, "dst_address")?)
         .map_err(|e| EngineError::bad("dst_address", e.to_string()))?;
     let gateway = match gateway_of(p)? {
@@ -189,8 +192,9 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
         bfd_profile,
     };
     check(cfg, &route)?;
-    cfg.ip.routes.push(route);
-    Ok(json!({ "id": id }))
+    cfg.ip.routes.push(route.clone());
+    let warnings = discard_warnings(s, &route);
+    Ok(json!({ "id": id, "warnings": warnings }))
 }
 
 /// Parse `id` as a static route of the candidate.
@@ -218,7 +222,51 @@ fn existing(cfg: &Config, p: &Value) -> Result<(usize, ItemId)> {
     Ok((pos, id))
 }
 
+/// G1.5b: what a discard route does to what the router is connected to. A
+/// route wider than a connected network says nothing: the connected one is
+/// more specific, and that is how a prefix is anchored for BGP.
+fn discard_warnings(s: &Session, r: &RouteEntry) -> Vec<String> {
+    let Some(kind) = r.gateway.discards().filter(|_| !r.disabled) else {
+        return Vec::new();
+    };
+    let (kind, cfg) = (kind.as_str(), s.store().candidate());
+    let dst = r.dst_address.trunc();
+    let mut warnings = Vec::new();
+    for a in cfg.ip.addresses.iter().filter(|a| !a.disabled) {
+        if route::table_of(cfg, &a.interface) != r.routing_table {
+            continue;
+        }
+        let (net, on) = (a.address.trunc(), &a.interface);
+        let text = if net == dst {
+            format!(
+                "the connected network {net} on {on} has the same prefix: it wins while the \
+                 address is up, and this {kind} route takes over when it goes down"
+            )
+        } else if net.contains(&dst) {
+            format!(
+                "this {kind} route drops {dst}, part of the connected network {net} on {on}: \
+                 the hosts there stop being reachable"
+            )
+        } else {
+            continue;
+        };
+        if !warnings.contains(&text) {
+            warnings.push(text);
+        }
+    }
+    if let Some(link) = s.caller().link {
+        let (peer, local) = plain_ends(&link);
+        if !local.is_loopback() && discard_for(cfg, peer, local).is_some_and(|d| d.id == r.id) {
+            warnings.push(format!(
+                "this {kind} route drops the replies to {peer}, where this connection comes from"
+            ));
+        }
+    }
+    warnings
+}
+
 fn set(s: &mut Session, p: &Value) -> Result<Value> {
+    take_force(s, p)?;
     let dst = opt_dst(p)?;
     let gateway = gateway_of(p)?;
     let distance = opt_distance(p)?;
@@ -269,11 +317,13 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         route.bfd_profile = b;
     }
     check(cfg, &route)?;
-    cfg.ip.routes.update(pos, |slot| *slot = route);
-    Ok(json!({ "id": id }))
+    cfg.ip.routes.update(pos, |slot| *slot = route.clone());
+    let warnings = discard_warnings(s, &route);
+    Ok(json!({ "id": id, "warnings": warnings }))
 }
 
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {
+    take_force(s, p)?;
     let cfg = s.store_mut().candidate_mut();
     let (pos, id) = existing(cfg, p)?;
     cfg.ip.routes.remove(pos);

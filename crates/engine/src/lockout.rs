@@ -24,6 +24,10 @@
 //! already undoes the change). Callers inside the process (the GUI lab,
 //! tests, `corerouter-cli run`) have no connection to lose.
 //!
+//! G1.5b: a route that drops the caller's replies (`blackhole`,
+//! `unreachable`, `prohibit`, more specific than the way back) is refused
+//! the same way ([`discard_for`]).
+//!
 //! G1.6p: a browser's session comes through `www-ssl`. Changing the service
 //! leaves the open connection up, but the next login comes through it too:
 //! turning it off, moving it or leaving the caller's address out of
@@ -33,7 +37,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use corerouter_firewall::eval::{Outcome, Packet, Verdict, walk};
 use corerouter_model::route::{self, Reach};
-use corerouter_model::{Config, IfName, RoutingTable};
+use corerouter_model::{Config, IfName, RouteEntry, RoutingTable};
 use corerouter_model::firewall::{ConnState, DynamicAddress, Protocol, Table};
 use corerouter_model::web::WebListener;
 use serde_json::Value;
@@ -118,36 +122,80 @@ fn way_back(cfg: &Config, peer: IpAddr, local: IpAddr) -> Option<String> {
 /// enabled connected network or active route (the packet tester uses it
 /// too, G2.1c).
 pub(crate) fn route_out(cfg: &Config, peer: IpAddr, table: &RoutingTable) -> Option<String> {
-    let table = table.clone();
+    match best_way(cfg, peer, table, false)? {
+        Way::Link(link) => Some(link.as_str().to_owned()),
+        Way::Discard(_) => None,
+    }
+}
+
+/// What routing does with a packet to `peer`.
+enum Way<'a> {
+    Link(IfName),
+    Discard(&'a RouteEntry),
+}
+
+/// The longest enabled connected network or active route to `peer` in
+/// `table`; discard routes (G1.5a) compete only with `discards`.
+fn best_way<'a>(
+    cfg: &'a Config,
+    peer: IpAddr,
+    table: &RoutingTable,
+    discards: bool,
+) -> Option<Way<'a>> {
     // Longest prefix wins; a connected network beats a route of the same
     // length (distance 0), then the lower distance.
-    let mut best: Option<(u8, u8, IfName)> = None;
-    let mut consider = |len: u8, distance: u8, link: &IfName| {
+    let mut best: Option<(u8, u8, Way<'a>)> = None;
+    let mut consider = |len: u8, distance: u8, way: Way<'a>| {
         let better = best
             .as_ref()
             .is_none_or(|(l, d, _)| len > *l || (len == *l && distance < *d));
         if better {
-            best = Some((len, distance, link.clone()));
+            best = Some((len, distance, way));
         }
     };
     for a in &cfg.ip.addresses {
         if !a.disabled
             && a.address.contains(&peer)
             && route::is_up(cfg, &a.interface)
-            && route::table_of(cfg, &a.interface) == table
+            && route::table_of(cfg, &a.interface) == *table
         {
-            consider(a.address.prefix_len(), 0, &a.interface);
+            consider(a.address.prefix_len(), 0, Way::Link(a.interface.clone()));
         }
     }
     for r in &cfg.ip.routes {
-        if r.routing_table != table || !r.dst_address.contains(&peer) {
+        if r.routing_table != *table || !r.dst_address.contains(&peer) {
             continue;
         }
-        if let Reach::Active { link, .. } = route::reach(cfg, r) {
-            consider(r.dst_address.prefix_len(), r.distance, &link);
+        match route::reach(cfg, r) {
+            Reach::Active { link, .. } => {
+                consider(r.dst_address.prefix_len(), r.distance, Way::Link(link));
+            }
+            Reach::Discard(_) if discards => {
+                consider(r.dst_address.prefix_len(), r.distance, Way::Discard(r));
+            }
+            _ => {}
         }
     }
-    best.map(|(_, _, link)| link.as_str().to_owned())
+    best.map(|(_, _, way)| way)
+}
+
+/// G1.5b: the discard route that takes the replies to `peer`, the caller,
+/// in the table of the interface that holds `local`. The connection still
+/// reaches the router (its addresses are in the local table, looked up
+/// first), but nothing comes back: from the operator's side it hangs.
+pub(crate) fn discard_for(cfg: &Config, peer: IpAddr, local: IpAddr) -> Option<&RouteEntry> {
+    let table = local_interface(cfg, local)
+        .and_then(|h| h.parse::<IfName>().ok())
+        .map_or(RoutingTable::Main, |h| route::table_of(cfg, &h));
+    match best_way(cfg, peer, &table, true)? {
+        Way::Discard(r) => Some(r),
+        Way::Link(_) => None,
+    }
+}
+
+/// The connection's two addresses, as the firewall and routing see them.
+pub(crate) fn plain_ends(link: &Link) -> (IpAddr, IpAddr) {
+    (plain(link.peer.ip()), plain(link.local.ip()))
 }
 
 /// The addresses of `cfg` this connection depends on (G1.28), with why:
@@ -374,6 +422,18 @@ impl Session {
         // The way back goes: the connected network (or route) the caller's
         // packets arrive through, removed or disabled (G1.28).
         let peer = plain(link.peer.ip());
+        // G1.5b: a blackhole, unreachable or prohibit route takes them first.
+        if !local.is_loopback()
+            && let Some(r) = discard_for(after, peer, local)
+            && discard_for(before, peer, local).is_none()
+        {
+            let kind = r.gateway.discards().map_or("discard", |d| d.as_str());
+            return Some(format!(
+                "the {kind} route {} would drop the replies to {peer}, where this connection \
+                 comes from (tcp {} -> {}). {HOW_TO_PROCEED}",
+                r.dst_address, link.peer, link.local
+            ));
+        }
         if !local.is_loopback()
             && let Some(was) = way_back(before, peer, local)
             && way_back(after, peer, local).is_none()

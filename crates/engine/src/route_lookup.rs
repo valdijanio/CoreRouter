@@ -168,7 +168,8 @@ pub fn lookup(
         table,
         table_id,
         rule,
-        kind: RouteKind::Unicast,
+        // G1.5b: a discard route has no next hop; it says what it does.
+        kind: best.discard.map_or(RouteKind::Unicast, RouteKind::from),
         route: Some(best.key.clone()),
         prefix: Some(best.dst),
         hops,

@@ -1182,6 +1182,8 @@ impl Kernel {
         use rtnetlink::packet_route::route::{RouteFlags, RouteType};
         const ENETUNREACH: i32 = 101;
         const EHOSTUNREACH: i32 = 113;
+        const EINVAL: i32 = 22;
+        const EACCES: i32 = 13;
         let full = if q.dst.is_ipv4() { 32 } else { 128 };
         let ask = |fib_match: bool| -> Result<RouteMessage, String> {
             let b = RouteMessageBuilder::<IpAddr>::new()
@@ -1199,8 +1201,8 @@ impl Kernel {
             }
             Ok(m)
         };
-        let unreachable = KernelLookup {
-            kind: RouteKind::Unreachable,
+        let answer = |kind: RouteKind| KernelLookup {
+            kind,
             prefix: None,
             hops: Vec::new(),
             src: None,
@@ -1212,10 +1214,15 @@ impl Kernel {
         };
         let resolved = match get(ask(false)?).await {
             Ok(Some(m)) => m,
-            Ok(None) => return Ok(unreachable),
+            Ok(None) => return Ok(answer(RouteKind::Unreachable)),
             Err(e) if matches!(errno(&e), Some(ENETUNREACH | EHOSTUNREACH)) => {
-                return Ok(unreachable);
+                return Ok(answer(RouteKind::Unreachable));
             }
+            // G1.5b: a discard route is an error to `RTM_GETROUTE`, even
+            // with `RTM_F_FIB_MATCH`: EINVAL for blackhole, EACCES for
+            // prohibit (**medido**, IPv4 and IPv6, kernel 7.0).
+            Err(e) if errno(&e) == Some(EINVAL) => return Ok(answer(RouteKind::Blackhole)),
+            Err(e) if errno(&e) == Some(EACCES) => return Ok(answer(RouteKind::Prohibit)),
             Err(e) => return Err(format!("route get {}: {}", q.dst, readable(&e))),
         };
         // The FIB entry itself: its prefix and every path of a multipath.
