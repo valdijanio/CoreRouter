@@ -62,7 +62,7 @@ pub fn choose_table(
         if route::table_id(cfg, t).is_none() {
             return Err((
                 "table",
-                format!("routing table '{t}' does not exist (see ip.vrf.list)"),
+                format!("routing table '{t}' does not exist (see routing.table.list)"),
             ));
         }
         return Ok((t.clone(), format!("routing table '{t}' asked for")));

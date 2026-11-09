@@ -3,7 +3,6 @@
 //! so its name follows interface-name rules and shows in `interface.list`.
 //! `ip.vrf.add` is disabled, with the reason, on a kernel without VRF.
 
-use corerouter_model::route::{FIRST_VRF_TABLE, LAST_VRF_TABLE};
 use corerouter_model::{Config, IfName, Interface, InterfaceKind, RoutingTable};
 use serde_json::{Value, json};
 
@@ -73,18 +72,9 @@ fn existing(cfg: &Config, p: &Value) -> Result<IfName> {
     Ok(name)
 }
 
-/// Lowest kernel table id no VRF uses.
+/// Lowest kernel table id no VRF nor named table uses.
 fn free_table(cfg: &Config) -> Result<u32> {
-    let used: Vec<u32> = cfg
-        .interfaces
-        .values()
-        .filter_map(|i| match i.kind {
-            InterfaceKind::Vrf { table } => Some(table),
-            _ => None,
-        })
-        .collect();
-    (FIRST_VRF_TABLE..=LAST_VRF_TABLE)
-        .find(|t| !used.contains(t))
+    corerouter_model::route::free_table(cfg)
         .ok_or_else(|| EngineError::bad("name", "no free routing table id left"))
 }
 
