@@ -117,6 +117,7 @@ fn settings_window(service: &str) -> Option<&'static str> {
         "dns-zones" => crate::dns_zones::WIN,
         "dhcp-server" => crate::dhcp_server::WIN,
         "ntp-client" => crate::ntp_client::WIN,
+        "ntp-server" => crate::ntp_server::WIN,
         "remote-logging" => crate::logging::WIN,
         _ => return None,
     })

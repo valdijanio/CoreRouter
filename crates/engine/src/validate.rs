@@ -79,6 +79,7 @@ pub const UNITS: &[Unit] = &[
         run: |cfg| {
             let mut out = Vec::new();
             ntp_checks(cfg, &mut out);
+            ntp_server_checks(cfg, &mut out);
             out
         },
     },
@@ -485,6 +486,48 @@ fn ntp_checks(cfg: &Config, out: &mut Vec<Issue>) {
         if let Err(e) = valid_server(s) {
             out.push(Issue::new("system.ntp_client.servers", e));
         }
+    }
+}
+
+/// What `system.ntp.server.set` enforces, for a saved or hand-edited file.
+fn ntp_server_checks(cfg: &Config, out: &mut Vec<Issue>) {
+    use corerouter_model::ntp::{
+        LOCAL_STRATUM_RANGE, MAIN_VRF, MAX_ALLOWED, MAX_BROADCAST,
+    };
+    let c = &cfg.system.ntp_server;
+    if !LOCAL_STRATUM_RANGE.contains(&c.local_clock_stratum) {
+        out.push(Issue::new(
+            "system.ntp_server.local_clock_stratum",
+            "must be 1..=15",
+        ));
+    }
+    if c.allowed.len() > MAX_ALLOWED {
+        out.push(Issue::new(
+            "system.ntp_server.allowed",
+            format!("at most {MAX_ALLOWED} networks"),
+        ));
+    }
+    if c.broadcast_addresses.len() > MAX_BROADCAST {
+        out.push(Issue::new(
+            "system.ntp_server.broadcast_addresses",
+            format!("at most {MAX_BROADCAST} addresses"),
+        ));
+    }
+    if c.broadcast && c.broadcast_addresses.is_empty() {
+        out.push(Issue::new(
+            "system.ntp_server.broadcast_addresses",
+            "broadcast needs at least one address",
+        ));
+    }
+    if c.vrf != MAIN_VRF
+        && !cfg.interfaces.iter().any(|(name, i)| {
+            name.as_str() == c.vrf && matches!(i.kind, InterfaceKind::Vrf { .. })
+        })
+    {
+        out.push(Issue::new(
+            "system.ntp_server.vrf",
+            format!("VRF '{}' does not exist", c.vrf),
+        ));
     }
 }
 

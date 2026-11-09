@@ -471,8 +471,8 @@ fn run(session: &Shared, port: u16, health: &super::Health, open: OpenClock<'_>)
 /// What one round learned.
 #[derive(Debug, Default)]
 pub struct Round {
-    /// Best answer: (server as configured, address, stratum, sample).
-    pub best: Option<(String, SocketAddr, u8, Sample)>,
+    /// Best answer: (server as configured, address, its header, sample).
+    pub best: Option<(String, SocketAddr, Packet, Sample)>,
     pub errors: Vec<String>,
     pub rate_limited: bool,
 }
@@ -482,11 +482,14 @@ impl Round {
         let ms = |n: i64| n as f64 / 1e6;
         let error = (!self.errors.is_empty()).then(|| self.errors.join("; "));
         match &self.best {
-            Some((server, addr, stratum, s)) => NtpStatus {
+            Some((server, addr, reply, s)) => NtpStatus {
                 status: NtpState::Synchronized,
                 synced_server: Some(server.clone()),
                 synced_address: Some(addr.ip().to_string()),
-                synced_stratum: Some(*stratum),
+                synced_stratum: Some(reply.stratum),
+                root_delay_ms: Some(f64::from(reply.root_delay) / 65.536),
+                root_dispersion_ms: Some(f64::from(reply.root_dispersion) / 65.536),
+                leap: Some(reply.leap),
                 system_offset_ms: Some(ms(s.offset_nanos)),
                 round_trip_ms: Some(ms(s.delay_nanos)),
                 last_sync: u64::try_from(unix_nanos() / 1_000_000_000).ok(),
@@ -573,7 +576,7 @@ pub fn poll_round(
                     .as_ref()
                     .is_none_or(|(_, _, _, b)| sample.delay_nanos < b.delay_nanos);
                 if better {
-                    round.best = Some((server.clone(), addr, reply.stratum, sample));
+                    round.best = Some((server.clone(), addr, reply, sample));
                 }
             }
             Err(QueryError::Reply(ReplyError::Kiss(code))) => {
@@ -797,7 +800,7 @@ mod tests {
             best: Some((
                 "s".into(),
                 ([127, 0, 0, 1], 123).into(),
-                1,
+                Packet::default(),
                 Sample {
                     offset_nanos: 0,
                     delay_nanos: 0,
