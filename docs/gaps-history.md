@@ -328,3 +328,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-11-09 — G4.3m feito (reconexão em loop e limites por MAC e VLAN)
 - 2026-11-09 — G4.6c feito (servidor NTP próprio, comparado com o ntpd-rs)
 - 2026-11-09 — G4.6g feito (log em disco, ação `disk` do RouterOS)
+- 2026-11-09 — G4.2h também nas vinculações: DNS dinâmico com índice durante a rodada e listas em lote (p99 361 ms → 31 ms)

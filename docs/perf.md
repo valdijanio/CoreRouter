@@ -3003,3 +3003,5 @@ lock, a cada 2 s; ordenar 0,40 ms fora dele.
 | `log_event` com regra de disco, mais a troca da fila (pior caso: uma troca por evento) | 348 ns |
 | `encode` de uma linha (fora do lock) | 469 ns |
 | Devolver as 2000 linhas da janela na partida | 3,9 ms |
+
+G4.2h, tempestade com vinculações, duas threads, release, fsync real, 30 s (**medido**, 2026-11-09, host de 32 threads, carga ~2; laboratório, sem `nfnetlink`): `interface.list` p99 361 ms → 31 ms, máximo 445 ms → 120 ms; `ip.dhcp-server.print` p99 332 ms → 35 ms; mensagens tratadas 42,4 mil → 375 mil.
