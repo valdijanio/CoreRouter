@@ -14,10 +14,10 @@ use corerouter_model::firewall::Name;
 use corerouter_model::policy_rule::{MAX_RULES, RoutingRule};
 use corerouter_model::route::{self, table_id};
 use corerouter_model::validate::Issue;
-use corerouter_model::{Config, IfName, InterfaceKind, ItemId};
+use corerouter_model::{Config, IfName, InterfaceKind, ItemId, RoutingTable};
 use serde_json::{Value, json};
 
-use crate::lockout::{Link, local_interface, plain, route_out};
+use crate::lockout::{Link, best_way, local_interface, plain, route_out};
 
 /// Why rule `r` cannot be applied, as (field, why). `Config` holds it or not
 /// yet; only `r` and what it names are read.
@@ -230,22 +230,15 @@ pub(crate) fn notices(cfg: &Config, pos: usize, has_route: &dyn Fn(&RoutingRule)
     out
 }
 
-/// Which way routing sends `peer` from `local` in `cfg`: the interface, or
-/// what stops it.
-fn way_out(cfg: &Config, peer: IpAddr, local: IpAddr) -> Result<String, String> {
+/// The rule walk of a reply to `peer` from `local`. A table decides when it
+/// has any route to `peer`, a discard route (G1.5a) included: the kernel stops
+/// at that too.
+fn reply_walk(cfg: &Config, peer: IpAddr, local: IpAddr) -> policy::RuleWalk {
     let vrf = local_interface(cfg, local)
         .and_then(|i| i.parse::<IfName>().ok())
         .map(|i| route::table_of(cfg, &i))
         .filter(|t| route::is_vrf_table(cfg, t));
     let tables = route::tables_by_id(cfg);
-    let in_table = |id: u32, suppress: Option<u8>| {
-        let t = tables.get(&id)?;
-        // `route_out` does not say the prefix: a route of the default length
-        // counts as the whole table for `min-prefix`, which errs on the side
-        // of reporting nothing.
-        let _ = suppress;
-        route_out(cfg, peer, t)
-    };
     let packet = RulePacket {
         src: Some(local),
         dst: peer,
@@ -253,16 +246,41 @@ fn way_out(cfg: &Config, peer: IpAddr, local: IpAddr) -> Result<String, String> 
         mark: 0,
         vrf: vrf.and_then(|t| table_id(cfg, &t)),
     };
-    let walked = policy::walk(&expected_rules(cfg), &packet, |t, s| in_table(t, s).is_some());
-    let by = |walked: &policy::RuleWalk| {
+    // `min-prefix` is not looked at (`best_way` does not say the prefix): a
+    // route of the default length counts as the whole table, which errs on
+    // the side of reporting nothing.
+    policy::walk(&expected_rules(cfg), &packet, |id, _suppress| {
+        tables
+            .get(&id)
+            .is_some_and(|t| best_way(cfg, peer, t, true).is_some())
+    })
+}
+
+/// The table the rules choose for a reply to `peer` from `local` (`None`: a
+/// rule drops it, or the table is not one of `cfg`'s).
+pub(crate) fn reply_table(cfg: &Config, peer: IpAddr, local: IpAddr) -> Option<RoutingTable> {
+    match reply_walk(cfg, peer, local).verdict {
+        RuleVerdict::Table(t) => route::tables_by_id(cfg).get(&t).map(|t| (*t).clone()),
+        RuleVerdict::Blackhole | RuleVerdict::Unreachable => None,
+    }
+}
+
+/// Which way routing sends `peer` from `local` in `cfg`: the interface, or
+/// what stops it.
+fn way_out(cfg: &Config, peer: IpAddr, local: IpAddr) -> Result<String, String> {
+    let walked = reply_walk(cfg, peer, local);
+    let by = || {
         walked
             .steps
             .last()
             .map_or_else(String::new, |s| describe_pref(cfg, s.pref).1)
     };
     match walked.verdict {
-        RuleVerdict::Table(t) => in_table(t, None).ok_or_else(|| by(&walked)),
-        RuleVerdict::Blackhole | RuleVerdict::Unreachable => Err(by(&walked)),
+        RuleVerdict::Table(t) => route::tables_by_id(cfg)
+            .get(&t)
+            .and_then(|table| route_out(cfg, peer, table))
+            .ok_or_else(by),
+        RuleVerdict::Blackhole | RuleVerdict::Unreachable => Err(by()),
     }
 }
 

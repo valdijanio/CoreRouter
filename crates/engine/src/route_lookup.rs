@@ -172,7 +172,8 @@ pub fn lookup(
         table,
         table_id,
         rule,
-        kind: RouteKind::Unicast,
+        // G1.5b: a discard route has no next hop; it says what it does.
+        kind: best.discard.map_or(RouteKind::Unicast, RouteKind::from),
         route: Some(best.key.clone()),
         prefix: Some(best.dst),
         hops,
@@ -328,7 +329,8 @@ pub fn lookup_by_rules(
             return false;
         };
         let found = lookup(cfg, lines, dst, t.clone(), String::new(), src);
-        found.kind != RouteKind::Unreachable
+        // An `unreachable` route decides too (G1.5b); only no route goes on.
+        (found.kind != RouteKind::Unreachable || found.route.is_some())
             && suppress.is_none_or(|s| found.prefix.is_some_and(|p| p.prefix_len() > s))
     });
     let trace: Vec<TraceStep> = walked
