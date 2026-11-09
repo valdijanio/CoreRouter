@@ -74,7 +74,8 @@ pub const UNITS: &[Unit] = &[
     },
     Unit {
         name: "ntp",
-        reads: Sections::SYSTEM,
+        // The client's VRF is an interface.
+        reads: Sections::SYSTEM.union(Sections::INTERFACES),
         run: |cfg| {
             let mut out = Vec::new();
             ntp_checks(cfg, &mut out);
@@ -100,6 +101,11 @@ pub const UNITS: &[Unit] = &[
         name: "bfd",
         reads: small_and(Sections::NONE),
         run: corerouter_proto_bfd::frr::validate,
+    },
+    Unit {
+        name: "routing-tables",
+        reads: small_and(Sections::INTERFACES),
+        run: routing_table_checks,
     },
     Unit {
         name: "mpls",
@@ -182,6 +188,58 @@ pub fn validate_commit(running: &Config, cfg: &Config, changed: Sections) -> Vec
 /// Names of the units that [`validate_commit`] runs incrementally.
 const ROUTES_UNIT: &str = "routes";
 const FIREWALL_UNIT: &str = "firewall";
+
+/// What `routing.table.add` enforces, for a config that did not come
+/// through it (G1.27e).
+fn routing_table_checks(cfg: &Config) -> Vec<Issue> {
+    use corerouter_model::routing_table::{MAX_TABLES, RESERVED};
+    let mut out = Vec::new();
+    if cfg.routing.tables.len() > MAX_TABLES {
+        out.push(Issue::new(
+            "routing.tables",
+            format!("at most {MAX_TABLES} routing tables"),
+        ));
+    }
+    let mut ids: BTreeMap<u32, &str> = cfg
+        .interfaces
+        .values()
+        .filter_map(|i| match i.kind {
+            InterfaceKind::Vrf { table } => Some((table, i.name.as_str())),
+            _ => None,
+        })
+        .collect();
+    for (name, t) in &cfg.routing.tables {
+        let at = format!("routing.tables.{name}");
+        if t.name != *name {
+            out.push(Issue::new(at.clone(), "name does not match key"));
+        }
+        if RESERVED.contains(&name.as_str()) {
+            out.push(Issue::new(
+                at.clone(),
+                format!("'{name}' is the name of a table of the kernel"),
+            ));
+        }
+        if matches!(
+            cfg.interfaces.get(name).map(|i| &i.kind),
+            Some(InterfaceKind::Vrf { .. })
+        ) {
+            out.push(Issue::new(at.clone(), format!("a VRF is named '{name}'")));
+        }
+        if !(FIRST_VRF_TABLE..=LAST_VRF_TABLE).contains(&t.table) {
+            out.push(Issue::new(
+                format!("{at}.table"),
+                format!("table must be {FIRST_VRF_TABLE}..={LAST_VRF_TABLE}"),
+            ));
+        }
+        if let Some(other) = ids.insert(t.table, name.as_str()) {
+            out.push(Issue::new(
+                format!("{at}.table"),
+                format!("table {} is already used by '{other}'", t.table),
+            ));
+        }
+    }
+    out
+}
 
 fn interface_checks(cfg: &Config) -> Vec<Issue> {
     let mut out = Vec::new();
@@ -405,6 +463,16 @@ fn ntp_checks(cfg: &Config, out: &mut Vec<Issue>) {
         out.push(Issue::new(
             "system.ntp_client.min_poll",
             "min_poll must not be above max_poll",
+        ));
+    }
+    if c.vrf != corerouter_model::ntp::MAIN_VRF
+        && !cfg.interfaces.iter().any(|(name, i)| {
+            name.as_str() == c.vrf && matches!(i.kind, InterfaceKind::Vrf { .. })
+        })
+    {
+        out.push(Issue::new(
+            "system.ntp_client.vrf",
+            format!("VRF '{}' does not exist", c.vrf),
         ));
     }
     if c.servers.len() > MAX_SERVERS {

@@ -2,7 +2,8 @@
 //! what the last answer said (operational state, never saved).
 //!
 //! The client is SNTP (RFC 5905 §14, formerly RFC 4330): it measures the
-//! offset to the best server it hears. Poll intervals are powers of two, in
+//! offset to the best server it hears and, on a real machine, disciplines
+//! the system clock (G4.6b, docs/ntp.md). Poll intervals are powers of two, in
 //! seconds, like RouterOS `min-poll`/`max-poll`.
 
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,25 @@ pub struct NtpClient {
     pub servers: Vec<String>,
     pub min_poll: u8,
     pub max_poll: u8,
+    /// VRF the servers are reached through (RouterOS `vrf`; `main` is the
+    /// main table).
+    #[serde(skip_serializing_if = "is_main")]
+    pub vrf: String,
+    /// Apply what is measured to the system clock (G4.6b). Off only measures:
+    /// for a general-purpose host where chrony or timesyncd owns the clock.
+    /// RouterOS has no such switch: its client always sets the clock.
+    #[serde(skip_serializing_if = "is_true")]
+    pub set_system_clock: bool,
+}
+
+pub const MAIN_VRF: &str = "main";
+
+fn is_main(v: &str) -> bool {
+    v == MAIN_VRF
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
 }
 
 impl Default for NtpClient {
@@ -37,6 +57,8 @@ impl Default for NtpClient {
             servers: Vec::new(),
             min_poll: DEFAULT_MIN_POLL,
             max_poll: DEFAULT_MAX_POLL,
+            vrf: MAIN_VRF.to_owned(),
+            set_system_clock: true,
         }
     }
 }
@@ -103,6 +125,40 @@ pub struct NtpStatus {
     pub last_error: Option<String>,
     /// Seconds until the next round.
     pub poll_secs: Option<u64>,
+    /// Servers learned from DHCP clients with `use_peer_ntp` (RouterOS
+    /// `dynamic-servers`).
+    pub dynamic_servers: Vec<String>,
+    /// What the client is doing to the system clock.
+    pub clock: ClockState,
+    /// The last correction: size of the slew or step, in milliseconds
+    /// (RouterOS `last-adjustment`).
+    pub last_adjustment_ms: Option<f64>,
+    /// The drift learned (RouterOS `freq-drift`), in ppm.
+    pub freq_drift_ppm: Option<f64>,
+    /// A step above the panic threshold waiting for
+    /// `system.ntp.client.confirm-step`, in milliseconds.
+    pub pending_step_ms: Option<f64>,
+    /// Why the clock could not be changed.
+    pub clock_error: Option<String>,
+}
+
+/// What the client does to the clock. RFC 5905 §11.3 names in parentheses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClockState {
+    /// Measuring only: switched off, or this backend or process cannot.
+    #[default]
+    NotSet,
+    /// Within reach: the frequency corrects it (SYNC).
+    Slewing,
+    /// The last answer moved the clock at once.
+    Stepped,
+    /// A big offset in a clock in sync, held for 900 s (SPIK).
+    HoldingSpike,
+    /// Above 1000 s (PANICT): waits for the operator.
+    AwaitingConfirmation,
+    /// The answer would put the clock before 2026: never applied.
+    Refused,
 }
 
 #[cfg(test)]

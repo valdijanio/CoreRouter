@@ -301,6 +301,9 @@ fn probe_of(cfg: &Config, t: &Target, r: &RouteEntry) -> ProbeHow {
         CheckGateway::Ping => {
             let device = t.interface.as_ref().map(|i| i.to_string()).or_else(|| match &t.table {
                 RoutingTable::Main => None,
+                // A `/routing table` has no device: the sonda goes out
+                // through main, where its gateway resolves (G1.27e).
+                RoutingTable::Vrf(_) if !route::is_vrf_table(cfg, &t.table) => None,
                 RoutingTable::Vrf(name) => Some(name.to_string()),
             });
             ProbeHow::Ping { device }

@@ -80,14 +80,60 @@ fn invalid(field: &'static str, why: Why) -> Reach {
     Reach::Invalid { field, why }
 }
 
-/// Kernel table id of `table`; `None` when the VRF does not exist.
+/// Kernel table id of `table`; `None` when no VRF nor `/routing table`
+/// has that name.
 pub fn table_id(cfg: &Config, table: &RoutingTable) -> Option<u32> {
     match table {
         RoutingTable::Main => Some(MAIN_TABLE_ID),
         RoutingTable::Vrf(name) => match cfg.interfaces.get(name).map(|i| &i.kind) {
             Some(InterfaceKind::Vrf { table }) => Some(*table),
-            _ => None,
+            _ => cfg.routing.tables.get(name).map(|t| t.table),
         },
+    }
+}
+
+/// `name` is a VRF (with a device of that name), not a `/routing table`.
+pub fn is_vrf_table(cfg: &Config, table: &RoutingTable) -> bool {
+    match table {
+        RoutingTable::Main => false,
+        RoutingTable::Vrf(name) => matches!(
+            cfg.interfaces.get(name).map(|i| &i.kind),
+            Some(InterfaceKind::Vrf { .. })
+        ),
+    }
+}
+
+/// Every table of `cfg` by kernel id: main, the VRFs and the named ones.
+pub fn tables_by_id(cfg: &Config) -> BTreeMap<u32, RoutingTable> {
+    let mut out: BTreeMap<u32, RoutingTable> = cfg
+        .interfaces
+        .values()
+        .filter_map(|i| match i.kind {
+            InterfaceKind::Vrf { table } => Some((table, RoutingTable::Vrf(i.name.clone()))),
+            _ => None,
+        })
+        .collect();
+    for t in cfg.routing.tables.values() {
+        out.insert(t.table, RoutingTable::Vrf(t.name.clone()));
+    }
+    out.insert(MAIN_TABLE_ID, RoutingTable::Main);
+    out
+}
+
+/// The lowest kernel table id neither a VRF nor a named table uses.
+pub fn free_table(cfg: &Config) -> Option<u32> {
+    let used = tables_by_id(cfg);
+    (FIRST_VRF_TABLE..=LAST_VRF_TABLE).find(|t| !used.contains_key(t))
+}
+
+/// The table whose connected networks a route of `table` resolves its
+/// gateway in: its own for main and a VRF; main for a `/routing table`,
+/// which has no interfaces of its own (G1.27e).
+fn gateway_scope(cfg: &Config, table: &RoutingTable) -> RoutingTable {
+    if is_vrf_table(cfg, table) {
+        table.clone()
+    } else {
+        RoutingTable::Main
     }
 }
 
@@ -150,13 +196,14 @@ pub fn reach(cfg: &Config, r: &RouteEntry) -> Reach {
             Why::new(
                 "no-table",
                 format!(
-                    "routing table '{}' does not exist (create it with ip.vrf.add)",
+                    "routing table '{}' does not exist (create it with routing.table.add or ip.vrf.add)",
                     r.routing_table
                 ),
             )
             .arg("table", &r.routing_table),
         );
     }
+    let scope = gateway_scope(cfg, &r.routing_table);
     if let Some(i) = r.gateway.iface() {
         let Some(iface) = cfg.interfaces.get(i) else {
             return invalid(
@@ -188,7 +235,7 @@ pub fn reach(cfg: &Config, r: &RouteEntry) -> Reach {
             );
         }
         let t = table_of(cfg, i);
-        if t != r.routing_table {
+        if t != scope {
             return invalid(
                 "gateway",
                 Why::new(
@@ -211,7 +258,7 @@ pub fn reach(cfg: &Config, r: &RouteEntry) -> Reach {
         (None, Some(i)) => up_or(cfg, i, None),
         (Some(g), Some(i)) if is_link_local(g) => up_or(cfg, i, Some(g)),
         (Some(g), Some(i)) => {
-            if let Some(why) = own_address(cfg, g, &r.routing_table) {
+            if let Some(why) = own_address(cfg, g, &scope) {
                 return invalid("gateway", why);
             }
             let nets: Vec<_> = cfg
@@ -243,7 +290,7 @@ pub fn reach(cfg: &Config, r: &RouteEntry) -> Reach {
             }
             up_or(cfg, i, Some(g))
         }
-        (Some(g), None) => resolve_ip(cfg, g, &r.routing_table),
+        (Some(g), None) => resolve_ip(cfg, g, &scope),
         // `Gateway` cannot be built empty; a hand-edited file still is not.
         (None, None) => invalid("gateway", Why::new("empty", "gateway is empty".into())),
     }

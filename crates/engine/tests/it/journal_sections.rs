@@ -215,6 +215,7 @@ fn commands() -> Vec<(&'static str, Value)> {
             "routing.rpki.add",
             json!({"name": "r", "address": "192.0.2.3"}),
         ),
+        ("routing.table.add", json!({"name": "isp2"})),
         ("routing.bfd.profile.add", json!({"name": "bp"})),
         ("routing.bfd.peer.add", json!({"address": "192.0.2.4"})),
         (

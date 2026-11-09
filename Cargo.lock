@@ -1003,6 +1003,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clock-steering"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2410abf030f2eb46cba840d343455078538e7c8755507b37ffd4074064f08f62"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "cmov"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1339,6 +1348,7 @@ version = "0.1.0"
 dependencies = [
  "aya",
  "aya-obj",
+ "clock-steering",
  "corerouter-dataplane-ebpf-common",
  "corerouter-firewall",
  "corerouter-hal",

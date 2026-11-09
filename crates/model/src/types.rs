@@ -384,8 +384,10 @@ impl fmt::Display for Gateway {
 }
 string_serde!(Gateway);
 
-/// Routing table of a route: `main`, or the name of a VRF (whose kernel
-/// device has the same name, so VRF names follow interface-name rules).
+/// Routing table of a route: `main`, or a name: a VRF (whose kernel device
+/// has the same name, so VRF names follow interface-name rules) or a
+/// `/routing table` (G1.27e). The variant says "not main"; which of the two
+/// a name is comes from the config (`route::is_vrf_table`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RoutingTable {
     #[default]
@@ -412,7 +414,7 @@ impl FromStr for RoutingTable {
             ParseError::new(
                 "routing table",
                 s,
-                "expected \"main\" or a VRF name (1..=15 of A-Z a-z 0-9 - _ .)",
+                "expected \"main\" or the name of a VRF or routing table (1..=15 of A-Z a-z 0-9 - _ .)",
             )
         })
     }

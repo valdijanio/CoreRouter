@@ -42,11 +42,8 @@ use corerouter_hal::HalError;
 use corerouter_hal::drift::{self, Snapshot, active_addresses, master};
 pub use corerouter_hal::drift::{KernelDiscard, KernelRoute, kernel_routes};
 use corerouter_model::os_loopback::{is_os_address, is_os_loopback};
-use corerouter_model::route::MAIN_TABLE_ID;
 use corerouter_model::routes::Dst;
-use corerouter_model::{
-    BondMode, Config, HashPolicy, IfName, InterfaceKind, LacpRate, RoutingTable,
-};
+use corerouter_model::{BondMode, Config, HashPolicy, IfName, InterfaceKind, LacpRate};
 use ipnet::IpNet;
 
 /// A link CoreRouter creates and deletes itself.
@@ -670,15 +667,7 @@ pub fn owned_routes(from: &Config, to: &Config, ops: &[Op]) -> BTreeSet<KernelRo
     }
     for cfg in [from, to] {
         // Kernel table id → the routing table it is in the config.
-        let tables: std::collections::BTreeMap<u32, RoutingTable> = cfg
-            .interfaces
-            .values()
-            .filter_map(|i| match i.kind {
-                InterfaceKind::Vrf { table } => Some((table, RoutingTable::Vrf(i.name.clone()))),
-                _ => None,
-            })
-            .chain([(MAIN_TABLE_ID, RoutingTable::Main)])
-            .collect();
+        let tables = corerouter_model::route::tables_by_id(cfg);
         let dsts: BTreeSet<Dst> = touched
             .iter()
             .filter_map(|r| Some((tables.get(&r.table)?.clone(), r.dst)))
