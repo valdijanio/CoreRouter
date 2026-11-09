@@ -432,3 +432,29 @@ antes dela, com carga ~35, o `print` chegava a 140 ms de p99 e `interface.list` 
 - **O que ficou sob o lock da sessão:** o diário e os efeitos. O relay e o DHCPv6 continuam inteiros
   sob ele.
 
+### 15.5 Tempestade com vinculações
+
+Com ACK, o que pesa é o efeito. Dois custos cresciam ou repetiam por concessão, sob o lock da sessão:
+
+- **DNS dinâmico:** cada atualização varria todos os registros, e cada concessão faz quatro operações. No
+  teto (`MAX_DYNAMIC`, 20 mil registros), cada concessão também copiava o estado inteiro só para descobrir
+  que não cabia. Agora há um índice por (zona, nome), válido durante a rodada adiada e construído uma vez
+  por rodada; o teto é decidido por ele, sem cópia. Um proptest confere que com e sem índice saem os mesmos
+  registros. Com índice a ordem dos registros pode mudar (RFC 2181 §5: um RRset não tem ordem).
+- **Listas de endereços:** no Linux, cada vinculação era uma transação `nfnetlink`. Agora é um lote por
+  rodada (`address_list_dynamic_many`, como o PPP já faz).
+
+Mesmo teste, com a mesma máquina calma (**medido**, 2026-11-09, carga ~2, `G42H_ONLY=binding G42H_SECS=30`):
+
+| Tempestade com vinculações, fora do lock | Antes | Depois |
+|---|---|---|
+| `interface.list`, p50 | 36,6 ms | 10,3 ms |
+| `interface.list`, p99 | 361 ms | 31 ms |
+| `interface.list`, máximo | 445 ms | 120 ms |
+| `ip.dhcp-server.print`, p99 | 332 ms | 35 ms |
+| Mensagens tratadas | 42,4 mil | 375 mil |
+
+**O que falta:** o laboratório (`VirtualHal`) não passa pelo `nfnetlink`, então o ganho do lote no kernel
+real não está nestes números. Continuam sob o lock o diário e a gravação do estado do DNS, em JSON com
+fsync, O(registros) por rodada; é daí que vêm os ~10 ms de p50.
+

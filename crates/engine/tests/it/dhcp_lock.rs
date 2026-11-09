@@ -172,8 +172,9 @@ fn slow_the_control_channel_stays_quick_in_a_discover_storm() {
             server_round(s, ms, clock);
         });
         eprintln!("G4.2h {name} outside the lock: {after:?}");
-        // The gap's target. Bindings: their DNS names still take long under
-        // the lock (`dns_dynamic::apply` walks the records per lease).
+        // The gap's target, for DISCOVERs. Bindings are measured (31 ms on a
+        // quiet machine, `docs/dhcp.md` §15) but not held to it: their fsyncs
+        // are under the lock and depend on the disk and the load.
         if name == "discover" {
             assert!(after.p99 < Duration::from_millis(50), "{after:?}");
             assert!(after.leases_p99 < Duration::from_millis(50), "{after:?}");

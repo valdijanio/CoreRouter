@@ -1198,8 +1198,10 @@ impl Hal for VirtualHal {
             }
             return Ok(());
         }
-        let keys: std::collections::BTreeSet<_> = adds.iter().map(|d| (&d.list, d.address)).collect();
-        self.dynamic.retain(|x| !keys.contains(&(&x.list, x.address)));
+        let keys: std::collections::BTreeSet<_> =
+            adds.iter().map(|d| (&d.list, d.address)).collect();
+        self.dynamic
+            .retain(|x| !keys.contains(&(&x.list, x.address)));
         self.dynamic.extend(adds.into_iter().cloned());
         Ok(())
     }
