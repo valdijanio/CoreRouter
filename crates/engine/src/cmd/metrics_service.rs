@@ -85,7 +85,9 @@ pub(super) fn available_from(p: &Value) -> Result<Option<Vec<IpNet>>> {
     Ok(Some(out))
 }
 
-fn set(s: &mut Session, p: &Value) -> Result<Value> {
+/// Applies `p` to `c`: the rules of `set`, also for the preview
+/// (`ip.service.check`, on a copy).
+pub(super) fn apply(c: &mut MetricsService, p: &Value) -> Result<Value> {
     let enabled = opt_bool(p, "enabled")?;
     let address = opt_parse::<std::net::IpAddr>(p, "address")?;
     let port = opt_u32(p, "port")?
@@ -97,7 +99,6 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         })
         .transpose()?;
     let from = available_from(p)?;
-    let mut c = s.store().candidate().system.metrics.clone();
     if let Some(e) = enabled {
         c.enabled = e;
     }
@@ -113,7 +114,7 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(list) = from {
         c.available_from = list;
     }
-    let mut out = settings_json(&c);
+    let mut out = settings_json(c);
     // The endpoint has no login: say so when anyone on the network can read it.
     if c.enabled && !c.address.is_loopback() && c.available_from.is_empty()
         && let Some(o) = out.as_object_mut()
@@ -124,11 +125,17 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
                    set available_from (e.g. the Prometheus server's address)"),
         );
     }
+    Ok(out)
+}
+
+fn set(s: &mut Session, p: &Value) -> Result<Value> {
+    let mut c = s.store().candidate().system.metrics.clone();
+    let out = apply(&mut c, p)?;
     s.store_mut().candidate_mut().system.metrics = c;
     Ok(out)
 }
 
-fn get(s: &mut Session, _: &Value) -> Result<Value> {
+pub(super) fn get(s: &mut Session, _: &Value) -> Result<Value> {
     let mut out = settings_json(&s.store().candidate().system.metrics);
     let status = if s.store().running().system.metrics.enabled {
         s.ext::<MetricsStatus>().cloned().unwrap_or_default()

@@ -53,6 +53,10 @@ fn commands() -> Vec<(&'static str, Value)> {
             json!({"enabled": true, "servers": ["192.0.2.123"]}),
         ),
         (
+            "system.ntp.server.set",
+            json!({"enabled": true, "use_local_clock": true, "allowed": ["10.0.0.0/8", "ntp-lan"]}),
+        ),
+        (
             "system.logging.action.add",
             json!({"name": "remote", "remote": "192.0.2.14"}),
         ),
@@ -216,6 +220,10 @@ fn commands() -> Vec<(&'static str, Value)> {
             json!({"name": "r", "address": "192.0.2.3"}),
         ),
         ("routing.table.add", json!({"name": "isp2"})),
+        (
+            "routing.rule.add",
+            json!({"dst_address": "198.18.0.0/15", "action": "unreachable"}),
+        ),
         ("routing.bfd.profile.add", json!({"name": "bp"})),
         ("routing.bfd.peer.add", json!({"address": "192.0.2.4"})),
         (

@@ -20,7 +20,7 @@ use crate::ipv6::Ipv6;
 use crate::logging::Logging;
 use crate::metrics::MetricsService;
 use crate::neighbor::NeighborDiscovery;
-use crate::ntp::NtpClient;
+use crate::ntp::{NtpClient, NtpServer};
 use crate::types::{Asn, Gateway, IfName, ItemId, MacAddr, RoutingTable, VlanId};
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -54,6 +54,9 @@ pub struct System {
     /// `/system ntp client` (G4.6).
     #[serde(skip_serializing_if = "NtpClient::is_default")]
     pub ntp_client: NtpClient,
+    /// `/system ntp server` (G4.6c).
+    #[serde(skip_serializing_if = "NtpServer::is_default")]
+    pub ntp_server: NtpServer,
     /// `/system logging` (G4.6): rules and remote syslog actions.
     #[serde(skip_serializing_if = "Logging::is_default")]
     pub logging: Logging,
@@ -85,6 +88,7 @@ impl Default for System {
         Self {
             identity: "CoreRouter".into(),
             ntp_client: NtpClient::default(),
+            ntp_server: NtpServer::default(),
             logging: Logging::default(),
             metrics: MetricsService::default(),
             tuning: crate::tuning::Tuning::default(),
@@ -430,6 +434,16 @@ pub struct Routing {
     /// `/routing table` (G1.27e, `crate::routing_table`): by name.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub tables: BTreeMap<crate::IfName, crate::routing_table::NamedTable>,
+    /// `/routing rule` (G1.27e, `crate::policy_rule`), in order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<crate::policy_rule::RoutingRule>,
+    /// Next id handed out to a rule (never reused, like RouterOS).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub next_rule_id: u32,
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -1,6 +1,6 @@
 [package]
 name = "corerouter-proto-ntp"
-description = "L2: SNTPv4 client packets (RFC 5905 §14 / RFC 4330): encode the request, decode and check the reply, compute offset and delay"
+description = "L2: SNTPv4 (RFC 5905): client packets and offset, the clock discipline, and the server's replies, Kiss-o'-Death and rate limit"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,9 +10,18 @@ repository.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+# RFC 5905 §7.3: the Reference ID of an IPv6 source is a hash of its address.
+md-5.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+
+[dev-dependencies.criterion]
+workspace = true
+
+[[bench]]
+name = "server"
+harness = false
 
 [lints]
 workspace = true

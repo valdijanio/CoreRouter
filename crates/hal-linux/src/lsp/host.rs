@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd};
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use corerouter_hal::HalError;
@@ -82,7 +83,17 @@ impl Links {
             return false;
         }
         self.at = Some(Instant::now());
-        let Ok(all) = getifaddrs() else { return true };
+        if let Some(read) = Self::read() {
+            self.by_name = read.by_name;
+            self.by_index = read.by_index;
+        }
+        true
+    }
+
+    /// What the kernel says now (`None`: it would not say). Dumps that wait
+    /// for the RTNL.
+    fn read() -> Option<Self> {
+        let all = getifaddrs().ok()?;
         let mut by_name: HashMap<IfName, Link> = HashMap::new();
         for a in all {
             let Ok(name) = a.interface_name.parse::<IfName>() else {
@@ -110,9 +121,12 @@ impl Links {
                 .get(&l.index)
                 .map(|m| u16::try_from(*m).unwrap_or(u16::MAX));
         }
-        self.by_index = by_name.iter().map(|(n, l)| (l.index, n.clone())).collect();
-        self.by_name = by_name;
-        true
+        let by_index = by_name.iter().map(|(n, l)| (l.index, n.clone())).collect();
+        Some(Self {
+            at: Some(Instant::now()),
+            by_name,
+            by_index,
+        })
     }
 
     /// A source address of `name` for `v6` (a global one first).
@@ -525,11 +539,90 @@ impl LspSocket for HostLspSocket {
 /// A FEC's route and when it was read.
 type Cached = (Instant, Option<Vec<MplsNexthop>>);
 
+/// A new look at the label table and the links.
+struct Reading {
+    /// `None`: the dump failed, keep what is known.
+    labels: Option<BTreeMap<u32, MplsRoute>>,
+    links: Option<Links>,
+}
+
+fn read_labels(reader: Option<&mut crate::mpls::Reader>) -> Option<BTreeMap<u32, MplsRoute>> {
+    match reader {
+        Some(r) if crate::mpls::available() => r
+            .routes()
+            .ok()
+            .map(|all| all.into_iter().map(|r| (r.label, r)).collect()),
+        _ => Some(BTreeMap::new()),
+    }
+}
+
+/// Reads the view on a thread of its own (G0.30e). The dumps wait for the
+/// RTNL, which anything changing the network holds: 130 ms on the thread
+/// that drains the tap, under 2000 frames/s, overflowed the socket buffer
+/// and lost the frames of everyone else (**medido**, `netns_mpls_too_big`).
+/// Asked at most one reading at a time; both queues hold one item.
+struct Refresher<R> {
+    ask: mpsc::SyncSender<()>,
+    got: mpsc::Receiver<R>,
+    pending: bool,
+    /// The reading on its way predates something read since: drop it.
+    stale: bool,
+}
+
+impl<R: Send + 'static> Refresher<R> {
+    /// The thread inherits the caller's network namespace, where the view
+    /// reads (a responder moved by `setns`).
+    fn start(mut read: impl FnMut() -> R + Send + 'static) -> io::Result<Self> {
+        let (ask, asked) = mpsc::sync_channel(1);
+        let (give, got) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("lsp-view".into())
+            .spawn(move || {
+                while asked.recv().is_ok() {
+                    if give.send(read()).is_err() {
+                        break;
+                    }
+                }
+            })?;
+        Ok(Self {
+            ask,
+            got,
+            pending: false,
+            stale: false,
+        })
+    }
+
+    /// Ask for a reading, unless one is on its way. Never waits.
+    fn ask(&mut self) {
+        if !self.pending && self.ask.try_send(()).is_ok() {
+            self.pending = true;
+        }
+    }
+
+    /// The reading that arrived, if any. Never waits. `Err`: the thread is
+    /// gone.
+    fn take(&mut self) -> Result<Option<R>, ()> {
+        match self.got.try_recv() {
+            Ok(r) => {
+                self.pending = false;
+                if std::mem::take(&mut self.stale) {
+                    Ok(None)
+                } else {
+                    Ok(Some(r))
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => Err(()),
+        }
+    }
+}
+
 /// What this host knows, cached ([`FRESH`]).
 pub struct HostView {
     labels: BTreeMap<u32, MplsRoute>,
     labels_at: Option<Instant>,
     reader: Option<crate::mpls::Reader>,
+    refresher: Option<Refresher<Reading>>,
     links: Links,
     locals: Vec<IpAddr>,
     fecs: RefCell<HashMap<IpNet, Cached>>,
@@ -546,6 +639,7 @@ impl HostView {
             labels: BTreeMap::new(),
             labels_at: None,
             reader: crate::mpls::Reader::open().ok(),
+            refresher: None,
             links: Links::default(),
             locals: Vec::new(),
             fecs: RefCell::new(HashMap::new()),
@@ -554,28 +648,64 @@ impl HostView {
         }
     }
 
-    /// Read again what is older than a second.
+    /// Look again at what is older than a second, on the [`Refresher`]'s
+    /// thread: this never waits for the kernel, except for the first look,
+    /// when nothing is known (the filter of the tap depends on it).
     fn refresh(&mut self) {
-        let labels_old = self.labels_at.is_none_or(|t| t.elapsed() >= FRESH);
-        if labels_old {
+        if self.labels_at.is_none() {
             self.labels_at = Some(Instant::now());
-            if let Some(r) = self.reader.as_mut()
-                && crate::mpls::available()
-            {
-                if let Ok(all) = r.routes() {
-                    self.labels = all.into_iter().map(|r| (r.label, r)).collect();
+            let labels = read_labels(self.reader.as_mut());
+            self.install(Reading {
+                labels,
+                links: Links::read(),
+            });
+            self.refresher = Refresher::start(|| {
+                let mut reader = crate::mpls::Reader::open().ok();
+                move || Reading {
+                    labels: read_labels(reader.as_mut()),
+                    links: Links::read(),
                 }
-            } else {
-                self.labels.clear();
+            }())
+            .ok();
+            return;
+        }
+        let Some(r) = self.refresher.as_mut() else {
+            // No thread could start: as before, here.
+            if self.labels_at.is_none_or(|t| t.elapsed() >= FRESH) {
+                self.labels_at = Some(Instant::now());
+                let labels = read_labels(self.reader.as_mut());
+                self.install(Reading {
+                    labels,
+                    links: Links::read(),
+                });
+            }
+            return;
+        };
+        match r.take() {
+            Ok(Some(reading)) => self.install(reading),
+            Ok(None) => {}
+            Err(()) => {
+                self.refresher = None;
+                return;
             }
         }
-        let links_changed = self.links.refresh();
-        if links_changed {
-            self.links_changed();
+        if self.labels_at.is_none_or(|t| t.elapsed() >= FRESH)
+            && let Some(r) = self.refresher.as_mut()
+        {
+            r.ask();
+            self.labels_at = Some(Instant::now());
         }
-        if labels_old || links_changed {
-            self.way_out = self.way_out();
+    }
+
+    fn install(&mut self, reading: Reading) {
+        if let Some(labels) = reading.labels {
+            self.labels = labels;
         }
+        if let Some(links) = reading.links {
+            self.links = links;
+        }
+        self.links_changed();
+        self.way_out = self.way_out();
     }
 
     /// The kernel's check (`mpls_forward`): the packet under the top
@@ -599,6 +729,9 @@ impl HostView {
         self.links.at = None;
         self.links.refresh();
         self.links_changed();
+        if let Some(r) = self.refresher.as_mut() {
+            r.stale = r.pending;
+        }
     }
 
     fn links_changed(&mut self) {
@@ -1111,5 +1244,58 @@ impl LspResponderIo for HostResponder {
 
     fn now_ntp(&self) -> (u32, u32) {
         ntp_now()
+    }
+}
+
+#[cfg(test)]
+mod refresher_tests {
+    use super::*;
+
+    /// G0.30e: a slow dump (the RTNL held elsewhere) does not stop whoever
+    /// asked, and one reading is asked at a time.
+    #[test]
+    fn a_slow_reading_does_not_hold_the_caller() {
+        let mut count = 0u32;
+        let mut r = Refresher::start(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            count += 1;
+            count
+        })
+        .unwrap();
+        let t = Instant::now();
+        r.ask();
+        r.ask();
+        assert_eq!(r.take(), Ok(None));
+        assert!(
+            t.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            t.elapsed()
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let first = loop {
+            if let Some(v) = r.take().unwrap() {
+                break v;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(first, 1);
+        assert!(!r.pending);
+    }
+
+    /// A reading that predates a reread is dropped.
+    #[test]
+    fn a_stale_reading_is_dropped() {
+        let (go, wait) = mpsc::channel::<()>();
+        let mut r = Refresher::start(move || wait.recv().is_ok()).unwrap();
+        r.ask();
+        r.stale = r.pending;
+        go.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while r.pending {
+            assert_eq!(r.take(), Ok(None));
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }

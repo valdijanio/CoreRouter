@@ -1,8 +1,9 @@
-//! L2 — SNTPv4 client packets (G4.6).
+//! L2 — SNTPv4 packets (G4.6): both ends.
 //!
 //! The client half of the Simple Network Time Protocol: build the request,
 //! decode and sanity-check the server's reply, and compute clock offset and
-//! round-trip delay. Pure: no sockets and no clock (the caller passes the
+//! round-trip delay. [`discipline`] decides what to do with the offset
+//! (G4.6b) and [`server`] is the answering half (G4.6c). Pure: no sockets and no clock (the caller passes the
 //! timestamps), so it is tested with the RFC's own arithmetic.
 //!
 //! References (read 2026-10-22):
@@ -19,6 +20,7 @@
 use thiserror::Error;
 
 pub mod discipline;
+pub mod server;
 
 /// RFC 5905 §7.2: NTP is UDP port 123.
 pub const PORT: u16 = 123;

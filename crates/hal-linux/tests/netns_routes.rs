@@ -199,6 +199,7 @@ fn route_get_answers_like_ip_route_get() {
                 dst: dst.parse().unwrap(),
                 table: 254,
                 src: None,
+                policy: None,
             },
         )
         .unwrap()
