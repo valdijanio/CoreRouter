@@ -464,7 +464,7 @@ impl Lab {
                     self.up.insert((shard, session.sid), i);
                 }
             }
-            Event::Changed { .. } => {}
+            Event::Changed { .. } | Event::Refused { .. } | Event::LockedOut { .. } => {}
             Event::Down {
                 session,
                 reason,
