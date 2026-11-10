@@ -524,6 +524,64 @@ fn the_detail_shows_routes_through_the_neighbor() {
     );
 }
 
+/// G1.27da: a WAN that takes its address by DHCP has no static one, and
+/// ARP ping, the modal's "Router address" and the detail's subnet still
+/// find the router's address there (the lease, flag D).
+#[test]
+fn a_dhcp_address_is_the_routers_address_on_its_port() {
+    use std::sync::Arc;
+
+    use corerouter_hal::VirtualHal;
+    use corerouter_proto_dhcp::lab::{Knobs, LabServer};
+
+    let server = Arc::new(LabServer::new(Knobs::default()));
+    let hal = VirtualHal::default().with_dhcp_server(server);
+    let mut s = Session::new(Box::new(hal));
+    s.tick(1_000_000);
+    run(&mut s, "ip.dhcp-client.add", json!({"interface": "ether1"}));
+    for now in (0..=1_000).step_by(250) {
+        s.dhcp_service(now);
+    }
+    let lease = LabServer::address_for(&"ether1".parse().unwrap(), [2, 0, 0, 0, 0, 1]).to_string();
+    let addrs = run(&mut s, "ip.address.list", Value::Null);
+    let rows = addrs.as_array().unwrap();
+    assert!(
+        rows.iter()
+            .all(|a| a["dynamic"] == true || a["interface"] != "ether1"),
+        "only the lease on ether1: {addrs}"
+    );
+    assert!(
+        rows.iter().any(|a| a["dynamic"] == true),
+        "the client is bound: {addrs}"
+    );
+
+    s.set_runner(Arc::new(Threads));
+    let started = run(
+        &mut s,
+        "ip.arp.ping",
+        json!({"address": "100.64.1.1", "count": 1, "interval_ms": 100}),
+    );
+    assert_eq!(
+        (&started["interface"], &started["src_address"]),
+        (&json!("ether1"), &json!(lease))
+    );
+
+    let c = run(
+        &mut s,
+        "ip.arp.check",
+        json!({"address": "100.64.1.50", "mac_address": "02:00:00:00:00:50", "interface": "ether1"}),
+    );
+    assert_eq!(c["computed"][0]["value"], json!(lease), "{c}");
+    assert!(
+        c["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k["check"] == "subnet" && k["level"] == "ok"),
+        "{c}"
+    );
+}
+
 #[test]
 fn vendors_come_from_the_ieee_table_and_a_download_wins() {
     let mut s = lab();
