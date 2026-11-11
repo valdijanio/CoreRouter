@@ -435,6 +435,12 @@ impl BfdPanel {
         ui.separator();
         let known = !app.cache.commands.is_empty();
         let footer_h = ui.spacing().interact_size.y * 2.0 + 14.0;
+        self.session_table.empty = tr_in(
+            SCOPE,
+            l,
+            "No BFD session: + adds a peer; Use BFD Everywhere puts the default profile on every BGP connection and OSPF interface.",
+        )
+        .to_owned();
         let out = table::show(ui, SESSIONS, footer_h, &mut self.session_table, &SESSION_COLUMNS, &rows, |ui, menu| match menu {
             Menu::Rows(sel) => {
                 if let Some(a) = list::row_menu(ui, &tools, sel, known, l) {
@@ -465,13 +471,6 @@ impl BfdPanel {
             l,
         );
         self.engine_line(ui, l);
-        if data.is_empty() {
-            ui.weak(tr_in(
-                SCOPE,
-                l,
-                "No BFD session: + adds a peer; Use BFD Everywhere puts the default profile on every BGP connection and OSPF interface.",
-            ));
-        }
         if attach {
             app.run_then("routing.bfd.attach", json!({}), crate::panel::then(NAME, Attached));
         }

@@ -410,6 +410,12 @@ impl NoticePanel {
             }
             table::find_field(ui, PROFILES, &mut self.profiles_table);
         });
+        self.profiles_table.empty = tr_in(
+            SCOPE,
+            l,
+            "No profiles. Add one: an address list (bloqueados, aviso) and what its members get. RADIUS Mikrotik-Address-List, PPP profiles and DHCP leases fill the list.",
+        )
+        .to_owned();
         let out = table::show(ui, PROFILES, 24.0, &mut self.profiles_table, &PROFILE_COLUMNS, &rows, |ui, menu| {
             if let Menu::Rows(sel) = menu
                 && let Some(a) = list::row_menu(ui, &tools, sel, true, l)
@@ -440,13 +446,6 @@ impl NoticePanel {
             ],
             l,
         );
-        if self.profiles.is_empty() {
-            ui.weak(tr_in(
-                SCOPE,
-                l,
-                "No profiles. Add one: an address list (bloqueados, aviso) and what its members get. RADIUS Mikrotik-Address-List, PPP profiles and DHCP leases fill the list.",
-            ));
-        }
         if let Some(a) = act {
             self.list_act(app, a, ui, &rows, true);
         }
@@ -470,6 +469,12 @@ impl NoticePanel {
             }
             table::find_field(ui, GARDEN, &mut self.garden_table);
         });
+        self.garden_table.empty = tr_in(
+            SCOPE,
+            l,
+            "Empty: a blocked subscriber reaches only the page. Add the ISP's site and the payment pages (PIX, boleto).",
+        )
+        .to_owned();
         let out = table::show(ui, GARDEN, 24.0, &mut self.garden_table, &GARDEN_COLUMNS, &rows, |ui, menu| {
             if let Menu::Rows(sel) = menu
                 && let Some(a) = list::row_menu(ui, &tools, sel, true, l)
@@ -496,13 +501,6 @@ impl NoticePanel {
             ],
             l,
         );
-        if self.garden.is_empty() {
-            ui.weak(tr_in(
-                SCOPE,
-                l,
-                "Empty: a blocked subscriber reaches only the page. Add the ISP's site and the payment pages (PIX, boleto).",
-            ));
-        }
         if let Some(a) = act {
             self.list_act(app, a, ui, &rows, false);
         }

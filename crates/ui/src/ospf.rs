@@ -758,6 +758,7 @@ impl OspfPanel {
         let picked = selection.as_slice().first().and_then(|k| data.iter().zip(&rows).find(|(_, r)| &r.key == k)).map(|(d, _)| d.clone());
         let detail_h = if picked.is_some() { 190.0 } else { 0.0 };
         let footer_h = ui.spacing().interact_size.y + 6.0 + detail_h;
+        self.nbr_table.empty = tr_in(SCOPE, l, "No neighbor: add an instance, an area and an interface template.").to_owned();
         let out = table::show(ui, NBR, footer_h, &mut self.nbr_table, &NBR_COLUMNS, &rows, |_, _| {});
         self.column_help(app, out.help, &NBR_COLUMNS);
         if let Some(r) = picked {
@@ -775,9 +776,6 @@ impl OspfPanel {
             ],
             l,
         );
-        if data.is_empty() {
-            ui.weak(tr_in(SCOPE, l, "No neighbor: add an instance, an area and an interface template."));
-        }
     }
 
     fn neighbor_detail(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, r: &Value) {
