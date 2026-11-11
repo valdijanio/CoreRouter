@@ -216,6 +216,25 @@ fn wait_links_up(lab: &Lab) {
     }
 }
 
+/// No duplicate address detection on a link of the lab, set before the link
+/// goes up. `nodad` on the global addresses is not enough: the link-local
+/// address is the source of the Neighbor Solicitation a router sends for a
+/// packet it forwards, and while that address is tentative (RFC 4862 §5.4: a
+/// random delay under 1 s, then 1 s for the probe) no solicitation goes out.
+/// The first IPv6 echo then came back only after 2 s, on the third try; with
+/// the rest of the suite holding the RTNL, which the DAD work needs, it came
+/// after the last one. The kernel skips DAD when `accept_dad` is below 1 on
+/// both `all` (the default) and the device (`addrconf_dad_begin`).
+fn no_dad(ns: Option<&Ns>, dev: &str) {
+    for conf in ["all", dev] {
+        let path = format!("net/ipv6/conf/{conf}/accept_dad");
+        match ns {
+            Some(ns) => ns.sysctl(&path, "0"),
+            None => sysctl(&path, "0"),
+        }
+    }
+}
+
 /// The topology of the module docs.
 fn lab() -> Lab {
     let _ = Command::new("ip").args(["link", "del", "ma0"]).output();
@@ -229,6 +248,7 @@ fn lab() -> Lab {
         ip(&["addr", "add", a, "dev", "ma0"]);
     }
     ip(&["addr", "add", "fd71::1/64", "dev", "ma0", "nodad"]);
+    no_dad(None, "ma0");
     ip(&["link", "set", "ma0", "up"]);
     ip(&["route", "replace", "10.64.0.0/12", "via", "10.71.0.2"]);
     ip(&["-6", "route", "replace", "fd70::/12", "via", "fd71::2"]);
@@ -245,6 +265,7 @@ fn lab() -> Lab {
         ns.sysctl("net/ipv4/icmp_ratelimit", "0");
         ns.sysctl("net/mpls/platform_labels", "1000");
         for d in devs {
+            no_dad(Some(ns), d);
             ns.ip(&["link", "set", d, "up"]);
             ns.sysctl(&format!("net/mpls/conf/{d}/input"), "1");
         }
@@ -441,7 +462,8 @@ fn probe(
     None
 }
 
-/// A few tries (ARP and ND on fresh links).
+/// A few tries, for a loaded machine: on the lab's links (carrier handled,
+/// no DAD) the first one is answered in about 3 ms, IPv4 and IPv6.
 fn tries(sock: &mut dyn ProbeSocket, dst: &str, seq: u16, size: u16) -> Option<Reply> {
     (0..5).find_map(|i| probe(sock, dst, seq + i, 64, size, Duration::from_millis(700)))
 }
