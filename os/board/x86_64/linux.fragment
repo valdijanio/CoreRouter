@@ -39,6 +39,23 @@ CONFIG_TMPFS_POSIX_ACL=y
 CONFIG_CGROUPS=y
 CONFIG_SERIAL_8250=y
 CONFIG_SERIAL_8250_CONSOLE=y
+# G1.6zc: the screen console after a UEFI boot. UEFI leaves no VGA text mode,
+# only the firmware's framebuffer (GOP). With VGA_CONSOLE alone, tty1 was the
+# dummy console: the screen froze on the firmware's last frame and the
+# installer, the first-boot notices and a panic showed on the serial port
+# only (a notebook or a mini PC has none). simpledrm takes the framebuffer
+# the firmware left, fbcon draws tty1 on it, and the card's own driver
+# (i915, virtio-gpu) takes it over when it probes
+# (aperture_remove_conflicting_pci_devices). Under BIOS in text mode vgacon
+# stays. The 16x32 font is the kernel's choice above ~2560x1440
+# (lib/fonts/fonts.c, get_default_font); below that it stays 8x16.
+CONFIG_SYSFB_SIMPLEFB=y
+CONFIG_DRM_SIMPLEDRM=y
+CONFIG_DRM_FBDEV_EMULATION=y
+CONFIG_FRAMEBUFFER_CONSOLE=y
+CONFIG_FONTS=y
+CONFIG_FONT_8x16=y
+CONFIG_FONT_TER16x32=y
 CONFIG_HW_RANDOM=y
 CONFIG_HW_RANDOM_VIRTIO=y
 # ACPI power button and power-off (VMs, servers). The tiny driver signals

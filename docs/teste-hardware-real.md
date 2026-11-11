@@ -57,7 +57,8 @@ Confira duas vezes o `/dev/sdX`: o `dd` apaga o disco que receber, sem perguntar
 - O firmware pode ser UEFI ou BIOS (legacy/CSM); os dois funcionam. Escolha o pendrive no menu de
   boot (F12, F11, Esc ou F8, conforme o fabricante).
 - Ligue um cabo de rede a uma porta que tenha DHCP.
-- **Console:** a tela (VGA) e a serial (`ttyS0`, 115200 8N1) ao mesmo tempo. Se a placa-mãe tem
+- **Console:** a tela e a serial (`ttyS0`, 115200 8N1) ao mesmo tempo, em UEFI e em BIOS
+  (G1.6zc: ISO gerada antes dela não mostra nada na tela num boot UEFI). Se a placa-mãe tem
   serial, ligue-a também: ela mostra o boot inteiro e serve quando a tela não aparece.
 - A ISO sobe o **live**, que roda inteiro na RAM. Ele põe cliente DHCP em todas as portas e
   mostra no console os endereços que pegou.
