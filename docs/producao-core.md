@@ -46,20 +46,24 @@ Resumo do que interopera e do que não:
   assistente, que mostra link e MAC de cada uma, e compare com os MACs do hipervisor.
 - **Primeiro IP pelo console.** Não há cloud-init (G1.6h) nem terminal de comandos no console:
   abra o console (noVNC ou serial `qm terminal <vmid>`; libvirt: `virsh console <vm>`) e
-  aperte Enter. O assistente de primeiro boot lista as portas, pede a de gerência pelo número
-  (e confirma: `Use ether4 (link up, bc:24:11:…)? [y/N]`), o endereço, o gateway e a senha do
-  `admin`, mostra o resumo e só aplica com `y`:
+  aperte Enter. O assistente de primeiro boot liga as portas para ler o enlace, lista as
+  portas, pede a de gerência pelo número (e confirma: `Use ether4 (link up, bc:24:11:…)?
+  [y/N]`), o endereço (Enter = DHCP; ou endereço e gateway) e a senha do `admin`, mostra o
+  resumo e só aplica com `y`:
 
   ```text
-  Ethernet ports (empty answer: cancel):
-    1) ether1 (link up, bc:24:11:00:00:01)
-    2) ether2 (no link, bc:24:11:00:00:02)
-    3) ether3 (no link, bc:24:11:00:00:03)
-    4) ether4 (link up, bc:24:11:00:00:04)
-  Management port (number or name): 4
-  Use ether4 (link up, bc:24:11:00:00:04)? [y/N] y
-  Address/prefix (e.g. 192.0.2.10/24; empty: cancel): 192.0.2.10/24
-  Gateway (empty: none): 192.0.2.1
+  [1/4] Management port
+    #  PORT             LINK   MAC
+    1  ether1           up     bc:24:11:00:00:01
+    2  ether2           down   bc:24:11:00:00:02
+    3  ether3           down   bc:24:11:00:00:03
+    4  ether4           up     bc:24:11:00:00:04
+  Port (number or name): 4
+  Use ether4 (link up, bc:24:11:00:00:04)? [y/N]: y
+
+  [2/4] Address
+  Address/prefix [dhcp] (or e.g. 192.0.2.10/24): 192.0.2.10/24
+  Gateway [none]: 192.0.2.1
   ```
 
   A senha do `admin` é opcional aqui: sem ela, como no CHR, o roteador aceita a senha vazia

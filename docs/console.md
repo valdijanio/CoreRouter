@@ -121,6 +121,21 @@ conforme o terminal), sequências de escape (uma seta) e caracteres de controle 
 **Assistente do primeiro boot**: passos `[1/4] Management port`, `[2/4] Address`,
 `[3/4] Admin password`, `[4/4] Apply`; nada muda antes do `Apply? [y/N]`.
 
+Portas e endereço (G1.6zl):
+
+- **Enlace lido de verdade.** Num primeiro boot as portas começam desligadas, e porta desligada
+  não tem enlace para ler (a tela dizia `off` com o cabo ligado, no notebook de 2026-11-11). Ao
+  abrir o assistente, ele liga as portas desligadas da configuração (`interface.set
+  disabled=no`), espera até 5 s pelo enlace e só então mostra a tabela com `up` ou `down`. A
+  linha `Turning ether1, ether2 on to read the link…` avisa. Cancelado ou com erro, todas voltam
+  a desligadas; aplicado, só a porta de gerência fica ligada. Porta que o daemon ainda não
+  adotou não é tocada (G1.6ze).
+- **DHCP em qualquer porta.** O `Address/prefix [dhcp]` aceita Enter (ou `dhcp`) também numa
+  porta de cabo, como já aceitava no Wi-Fi; o gateway não é perguntado. O resumo diz
+  `from DHCP, on this port's network`, e um Enter perdido ali não aplica nada: o `Apply? [y/N]`
+  vem antes. Aplicado: `interface.set`, `ip.dhcp-client.add` (se a porta ainda não tem
+  cliente) e até 16 s esperando o endereço, que a tela mostra.
+
 Com um rádio Wi-Fi escolhido como porta (G1.30, `setup_wifi.rs`) são cinco passos: entra o
 `[2/5] Wi-Fi network` (país, varredura, rede, senha sem eco), e o endereço aceita `dhcp`. A
 varredura precisa do rádio ligado, então o país e o rádio mudam antes do `Apply?`, e o
