@@ -405,11 +405,20 @@ fn it_says_why_it_did_not_get_in() {
         "{m}"
     );
 
+    // Another network needs its own passphrase: the one of the network
+    // before is forgotten, not tried on it.
+    let e = fails(
+        &mut s,
+        "interface.wifi.set",
+        json!({"name": "wifi1", "ssid": "Nao-Existe"}),
+    );
+    assert!(e.contains("needs its passphrase"), "{e}");
+    assert_eq!(monitor(&mut s)["ssid"], "CoreRouter-Lab", "nothing changed");
     // A network that is not there, and one held to a band it is not on.
     run(
         &mut s,
         "interface.wifi.set",
-        json!({"name": "wifi1", "ssid": "Nao-Existe"}),
+        json!({"name": "wifi1", "ssid": "Nao-Existe", "passphrase": LAB_PASSPHRASE}),
     );
     ms = spin(&mut s, ms);
     let m = monitor(&mut s);
@@ -782,5 +791,92 @@ fn a_batch_may_enable_the_radio_before_it_sets_the_country() {
     assert!(
         issues.iter().any(|i| i.path == "interfaces.wifi1.disabled"),
         "{issues:?}"
+    );
+}
+
+/// The edit modal's preview: `set` tried on the candidate and undone.
+#[test]
+fn the_preview_says_what_set_would_do_and_changes_nothing() {
+    let (mut s, _air) = lab();
+    let level = |v: &Value, check: &str| {
+        v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["check"] == check)
+            .map(|c| c["level"].as_str().unwrap().to_owned())
+    };
+    // Empty fields of the modal are "not given"; a radio on with no country
+    // is an error here, before the commit says so.
+    let want = json!({"id": "wifi1", "ssid": "CoreRouter-Lab", "passphrase": LAB_PASSPHRASE,
+                      "security": "", "mtu": "", "disabled": false});
+    let p = run(&mut s, "interface.wifi.preview", want.clone());
+    assert_eq!(level(&p, "country").as_deref(), Some("error"), "{p}");
+    assert!(p.to_string().contains("interface.wifi.country.set"), "{p}");
+    run(
+        &mut s,
+        "interface.wifi.country.set",
+        json!({"country": "BR"}),
+    );
+    let p = run(&mut s, "interface.wifi.preview", want.clone());
+    assert_eq!(level(&p, "valid").as_deref(), Some("ok"), "{p}");
+    assert_eq!(level(&p, "country"), None, "{p}");
+    assert_eq!(p["commands"][0]["command"], "interface.wifi.set");
+    assert_eq!(p["commands"][0]["params"]["name"], "wifi1");
+    assert!(p["commands"][0]["params"].get("id").is_none(), "{p}");
+    let computed = p["computed"].to_string();
+    assert!(
+        computed.contains("CoreRouter-Lab") && computed.contains("no scan yet"),
+        "{p}"
+    );
+    // Nothing changed.
+    let row = &run(&mut s, "interface.wifi.list", json!({}))[0];
+    assert_eq!(
+        (row["ssid"].as_str(), row["disabled"].as_bool()),
+        (Some(""), Some(true))
+    );
+    assert!(!s.store().is_dirty());
+
+    // After a scan, whether the network is in range.
+    run(&mut s, "interface.wifi.enable", json!({"name": "wifi1"}));
+    let ms = spin(&mut s, 0);
+    run(&mut s, "interface.wifi.scan", json!({"name": "wifi1"}));
+    spin(&mut s, ms);
+    let p = run(&mut s, "interface.wifi.preview", want);
+    assert!(p["computed"].to_string().contains("yes: -"), "{p}");
+    let p = run(
+        &mut s,
+        "interface.wifi.preview",
+        json!({"id": "wifi1", "ssid": "Nao-Existe", "passphrase": "12345678"}),
+    );
+    assert!(p["computed"].to_string().contains("not heard"), "{p}");
+
+    // What `set` refuses comes back as a check on its field, with no command.
+    let p = run(
+        &mut s,
+        "interface.wifi.preview",
+        json!({"id": "wifi1", "ssid": "CoreRouter-Lab", "passphrase": "curta"}),
+    );
+    let bad = &p["checks"][0];
+    assert_eq!(
+        (bad["level"].as_str(), bad["param"].as_str()),
+        (Some("error"), Some("passphrase")),
+        "{p}"
+    );
+    assert_eq!(p["commands"], json!([]));
+    // Its warnings too.
+    let p = run(
+        &mut s,
+        "interface.wifi.preview",
+        json!({"id": "wifi1", "ssid": "Cafe", "security": "open"}),
+    );
+    assert!(
+        p["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["level"] == "warning"
+                && c["message"].as_str().unwrap().contains("open network")),
+        "{p}"
     );
 }

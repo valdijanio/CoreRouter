@@ -63,6 +63,8 @@ pub enum Link {
     Down,
     /// The port is off (disabled): whether a cable is in cannot be told.
     Off,
+    /// A Wi-Fi radio (G1.30): no cable to tell about.
+    Wifi,
 }
 
 impl Link {
@@ -71,6 +73,7 @@ impl Link {
             Link::Up => good("up"),
             Link::Down => "down".to_owned(),
             Link::Off => dim("off"),
+            Link::Wifi => "Wi-Fi".to_owned(),
         }
     }
 
@@ -79,6 +82,7 @@ impl Link {
             Link::Up => "link up",
             Link::Down => "no link",
             Link::Off => "port off, link unknown",
+            Link::Wifi => "Wi-Fi radio",
         }
     }
 }
@@ -286,7 +290,8 @@ fn gather(live: bool, addrs: &[(String, String)]) -> Snapshot {
         .filter_map(|i| {
             let name = text(i, "name");
             let addresses = of(&name);
-            let shown = text(i, "type") == "ether" || !addresses.is_empty();
+            let kind = text(i, "type");
+            let shown = kind == "ether" || kind == "wifi" || !addresses.is_empty();
             (shown && !name.is_empty()).then(|| Port {
                 link: if flag(i, "disabled") {
                     Link::Off
@@ -645,6 +650,10 @@ pub fn main(ttys: &[String]) -> i32 {
             continue;
         }
         match ask_and_apply(&con) {
+            Ok(Some(a)) if a.is_empty() => con.say(&format!(
+                "\n  {}  Done: the router is on the network and asks for its address by DHCP.",
+                good("OK")
+            )),
             Ok(Some(_)) => con.say(&format!(
                 "\n  {}  Done: the router has its management address.",
                 good("OK")
@@ -689,15 +698,30 @@ fn intro() -> String {
 }
 
 /// The questions, a summary, then the commands. `Ok(None)`: cancelled.
+/// `Ok(Some(""))`: applied, with the address still to come from DHCP.
 fn ask_and_apply(con: &Console) -> Result<Option<String>, String> {
-    const STEPS: usize = 4;
-    let nics = nics();
+    // A radio is a port to pick too (G1.30): a notebook may have no other.
+    let mut nics = nics();
+    nics.extend(crate::setup_wifi::radios().into_iter().map(|r| Nic {
+        name: r.name,
+        mac: r.mac,
+        link: Link::Wifi,
+    }));
     con.say(&intro());
-    con.say(&style::step(1, STEPS, "Management port"));
+    let wifi_steps = nics.iter().any(|n| n.link == Link::Wifi);
+    let first = |steps: usize| style::step(1, steps, "Management port");
+    // The number of steps is known once the port is: say the longer one
+    // only when the port picked is a radio.
+    con.say(&first(4));
     if nics.is_empty() {
         con.say("  No Ethernet port found: type the port's name.");
     } else {
         con.say(&nic_table(&nics, true));
+    }
+    if wifi_steps {
+        con.say(&dim(
+            "  A Wi-Fi port asks for its network next (one more step).",
+        ));
     }
     let port = loop {
         let Some(a) = ask(con, &style::prompt("Port", None, Some("number or name"))) else {
@@ -718,17 +742,63 @@ fn ask_and_apply(con: &Console) -> Result<Option<String>, String> {
         };
         let q = style::prompt(&format!("Use {}?", describe(&p)), Some("y/N"), None);
         if yes(ask(con, &q).as_deref()) {
-            break p.name;
+            break p;
         }
     };
-    con.say(&style::step(2, STEPS, "Address"));
-    let m = loop {
-        let q = style::prompt("Address/prefix", None, Some("e.g. 192.0.2.10/24"));
+    if port.link != Link::Wifi {
+        return rest(con, &port.name, None, 4);
+    }
+    con.say(&style::step(2, 5, "Wi-Fi network"));
+    let question = |q: &str| ask(con, q);
+    let kept = "  The radio is as it was. The country stays set.";
+    let Some(chosen) = crate::setup_wifi::questions(con, &question, &port.name)? else {
+        con.say(&dim(kept));
+        return Ok(None);
+    };
+    let done = rest(con, &port.name, Some(&chosen), 5);
+    if !matches!(done, Ok(Some(_))) {
+        // Cancelled or failed after the scan turned the radio on.
+        crate::setup_wifi::undo(&port.name, chosen.was_off);
+    }
+    if matches!(done, Ok(None)) {
+        con.say(&dim(kept));
+    }
+    done
+}
+
+/// Where the address comes from.
+enum Address {
+    Fixed(Mgmt),
+    /// Asked from the network the radio joins (a Wi-Fi port only).
+    Dhcp,
+}
+
+/// The steps after the port (and, on a radio, its network): the address,
+/// the admin password, the summary and the commands.
+fn rest(
+    con: &Console,
+    port: &str,
+    wifi: Option<&crate::setup_wifi::Chosen>,
+    steps: usize,
+) -> Result<Option<String>, String> {
+    let at = steps.saturating_sub(2);
+    con.say(&style::step(at, steps, "Address"));
+    let address = loop {
+        let q = if wifi.is_some() {
+            style::prompt("Address/prefix", Some("dhcp"), Some("e.g. 192.0.2.10/24"))
+        } else {
+            style::prompt("Address/prefix", None, Some("e.g. 192.0.2.10/24"))
+        };
         let Some(addr) = ask(con, &q) else {
             return Ok(None);
         };
-        if addr.is_empty() {
-            return Ok(None);
+        if addr.is_empty() || addr.eq_ignore_ascii_case("dhcp") {
+            if wifi.is_some() {
+                break Address::Dhcp;
+            }
+            if addr.is_empty() {
+                return Ok(None);
+            }
         }
         let Some(gw) = ask(con, &style::prompt("Gateway", Some("none"), None)) else {
             return Ok(None);
@@ -739,11 +809,11 @@ fn ask_and_apply(con: &Console) -> Result<Option<String>, String> {
             format!("{port},{addr},{gw}")
         };
         match Mgmt::parse(&spec) {
-            Ok(m) => break m,
+            Ok(m) => break Address::Fixed(m),
             Err(e) => con.say(&style::block(2, "", 0, &format!("{e}. Try again."))),
         }
     };
-    con.say(&style::step(3, STEPS, "Admin password"));
+    con.say(&style::step(at + 1, steps, "Admin password"));
     let mut password = None;
     if admin_without_password() {
         con.say(&style::block(
@@ -773,15 +843,43 @@ fn ask_and_apply(con: &Console) -> Result<Option<String>, String> {
     } else {
         con.say("  admin already has a password: it stays.");
     }
-    con.say(&style::step(4, STEPS, "Apply"));
-    con.say(&summary(&m, password.is_some()));
+    con.say(&style::step(steps, steps, "Apply"));
+    let (shown_address, gateway) = match &address {
+        Address::Fixed(m) => (m.address.as_str(), m.gateway.as_deref()),
+        Address::Dhcp => ("from DHCP, on the network joined", None),
+    };
+    con.say(&summary_rows(
+        port,
+        wifi.map(|c| (c.summary(), c.country.clone())),
+        shown_address,
+        gateway,
+        password.is_some(),
+    ));
     if !yes(ask(con, &style::prompt("Apply?", Some("y/N"), None)).as_deref()) {
         return Ok(None);
     }
-    for (cmd, params) in m.commands() {
-        ctl::call(cmd, &params).map_err(|e| format!("{cmd}: {e}"))?;
-        con.say(&format!("  {}  {cmd}", good("OK")));
+    if let Some(c) = wifi {
+        crate::setup_wifi::join(con, port, c)?;
     }
+    let got = match &address {
+        Address::Fixed(m) => {
+            for (cmd, params) in m.commands() {
+                // The radio is on already, with its network.
+                if wifi.is_some() && cmd == "interface.set" {
+                    continue;
+                }
+                ctl::call(cmd, &params).map_err(|e| format!("{cmd}: {e}"))?;
+                con.say(&format!("  {}  {cmd}", good("OK")));
+            }
+            m.address.clone()
+        }
+        Address::Dhcp => {
+            ctl::call("ip.dhcp-client.add", &json!({ "interface": port }))
+                .map_err(|e| format!("ip.dhcp-client.add: {e}"))?;
+            con.say(&format!("  {}  ip.dhcp-client.add", good("OK")));
+            leased(con, port)
+        }
+    };
     if let Some(p) = password {
         ctl::call("user.set", &json!({"name": "admin", "password": p}))
             .map_err(|e| format!("admin password: {e}"))?;
@@ -789,7 +887,32 @@ fn ask_and_apply(con: &Console) -> Result<Option<String>, String> {
     } else {
         con.say(&no_password_yet());
     }
-    Ok(Some(m.address))
+    Ok(Some(got))
+}
+
+/// The address `port` got from DHCP, waited for a moment; empty: none yet
+/// (the client keeps asking, and the status screen shows it when it comes).
+fn leased(con: &Console, port: &str) -> String {
+    let start = Instant::now();
+    while start.elapsed() < DHCP_WAIT * 2 {
+        if let Some((a, _)) = addresses()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|(_, i)| i == port)
+        {
+            con.say(&format!(
+                "  {}  {port}: {} from DHCP",
+                good("OK"),
+                style::ascii(&a)
+            ));
+            return a;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    con.say(&dim(&format!(
+        "  No address from DHCP on {port} yet: the client keeps asking."
+    )));
+    String::new()
 }
 
 /// The last words of a setup that kept admin without a password (G0.3d).
@@ -804,12 +927,35 @@ pub fn no_password_yet() -> String {
     )
 }
 
+#[cfg(test)]
 pub fn summary(m: &Mgmt, password: bool) -> String {
+    summary_rows(
+        &m.interface,
+        None,
+        &m.address,
+        m.gateway.as_deref(),
+        password,
+    )
+}
+
+/// The summary before the last question; `wifi`: the network and the
+/// country of a Wi-Fi port.
+pub fn summary_rows(
+    port: &str,
+    wifi: Option<(String, String)>,
+    address: &str,
+    gateway: Option<&str>,
+    password: bool,
+) -> String {
     let row = |label: &str, value: &str| format!("  {label:<10}{value}");
-    [
-        row("Port", &m.interface),
-        row("Address", &m.address),
-        row("Gateway", m.gateway.as_deref().unwrap_or("none")),
+    let mut rows = vec![row("Port", port)];
+    if let Some((network, country)) = &wifi {
+        rows.push(row("Network", network));
+        rows.push(row("Country", country));
+    }
+    rows.extend([
+        row("Address", address),
+        row("Gateway", gateway.unwrap_or("none")),
         row(
             "Admin",
             &if password {
@@ -821,8 +967,8 @@ pub fn summary(m: &Mgmt, password: bool) -> String {
                 )
             },
         ),
-    ]
-    .join("\n")
+    ]);
+    rows.join("\n")
 }
 
 #[cfg(test)]
@@ -1100,5 +1246,48 @@ mod tests {
         check("no password yet", &t);
         assert!(t.contains("empty password") && t.contains("set one"));
         assert_eq!(host_of("2001:db8::1/64"), "[2001:db8::1]");
+    }
+
+    /// G1.30: a Wi-Fi port adds its network and country to the summary, and
+    /// the radio is a port of the list like the others.
+    #[test]
+    fn a_wifi_port_in_the_list_and_in_the_summary() {
+        let mut all = nics();
+        all.push(Nic {
+            name: "wifi1".into(),
+            mac: "4c:79:6e:ab:cd:ef".into(),
+            link: Link::Wifi,
+        });
+        let table = style::render(&nic_table(&all, true), false);
+        assert!(
+            table.contains("  3  wifi1            Wi-Fi  4c:79:6e:ab:cd:ef"),
+            "{table}"
+        );
+        assert_eq!(pick("3", &all).map(|n| n.name.as_str()), Some("wifi1"));
+        assert_eq!(describe(&all[2]), "wifi1 (Wi-Fi radio, 4c:79:6e:ab:cd:ef)");
+        let t = style::render(
+            &summary_rows(
+                "wifi1",
+                Some(("Casa (WPA2/WPA3, passphrase not shown)".into(), "BR".into())),
+                "from DHCP, on the network joined",
+                None,
+                true,
+            ),
+            false,
+        );
+        let lines: Vec<&str> = t.lines().map(str::trim).collect();
+        assert_eq!(
+            lines.get(..5),
+            Some(
+                &[
+                    "Port      wifi1",
+                    "Network   Casa (WPA2/WPA3, passphrase not shown)",
+                    "Country   BR",
+                    "Address   from DHCP, on the network joined",
+                    "Gateway   none",
+                ][..]
+            ),
+            "{t}"
+        );
     }
 }
