@@ -19,7 +19,7 @@
 
 use std::collections::BTreeMap;
 
-use corerouter_model::ntp::NtpState;
+use corerouter_model::ntp::{ClockState, NtpState};
 use corerouter_model::routing_state::{BgpSession, RoutingStatus};
 use corerouter_model::service::{ServiceState, ServiceTable};
 use serde::Serialize;
@@ -74,6 +74,41 @@ pub struct Check {
     pub reason: String,
     /// What to do, in Portuguese (`None` when ok).
     pub action: Option<String>,
+}
+
+/// What the NTP check needs beyond the client's state (G1.6zh).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NtpClock {
+    /// The last round had nobody to ask: no server configured, none from DHCP.
+    pub no_server: bool,
+    pub clock: ClockState,
+    /// A step above 1000 s waiting for `system.ntp.client.confirm-step`.
+    pub pending_step_ms: Option<f64>,
+    /// Server clock minus ours.
+    pub offset_ms: Option<f64>,
+    /// Why the clock cannot be changed.
+    pub clock_error: Option<String>,
+}
+
+/// 2026-01-01 00:00:00 UTC: a clock before it was never set (a dead RTC
+/// battery starts in 1970 or at the board's build date). The NTP client's
+/// `MIN_VALID_UNIX` (proto-ntp, `discipline.rs`).
+pub const CLOCK_MIN_VALID_UNIX: u64 = 1_767_225_600;
+/// An offset the NTP client measures and nobody corrects is a warning above
+/// this (the client's own `WARN_OFFSET_MS`).
+pub const CLOCK_OFF_MS: f64 = 1000.0;
+
+/// `3 h 12 min`, `45 s`: how far the clock is off, for people.
+fn off_text(ms: f64) -> String {
+    let s = (ms.abs() / 1000.0).round() as u64;
+    let sign = if ms < 0.0 { "adiantado" } else { "atrasado" };
+    let size = match s {
+        0..=119 => format!("{s} s"),
+        120..=7199 => format!("{} min", s / 60),
+        7200..=172_799 => format!("{} h {} min", s / 3600, s % 3600 / 60),
+        _ => format!("{} dias", s / 86_400),
+    };
+    format!("{size} {sign}")
 }
 
 // Thresholds (warning, error).
@@ -143,8 +178,13 @@ pub struct Inputs {
     /// NTP client enabled and its state.
     pub ntp: Option<(bool, NtpState)>,
     /// Something configured depends on the clock (RADIUS servers in use):
-    /// a disabled NTP client is then a warning, not the factory default.
+    /// a disabled NTP client is then a warning, not just a choice.
     pub ntp_needed: bool,
+    /// G1.6zh: what the client is doing to the clock, to say why it is not
+    /// set and what to do.
+    pub ntp_clock: NtpClock,
+    /// The router's clock (Unix seconds), when it has one.
+    pub clock_unix: Option<u64>,
     /// Supervised services by state (`None`: no supervisor — lab).
     pub services: Option<Vec<(String, ServiceState)>>,
     /// (busiest CPU, its share of NET_RX %, CPUs, NET_RX/s).
@@ -454,22 +494,47 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
             Some("O kernel matou processos para liberar memória: veja o OS Log e quem cresce na aba Processes.")),
     }
 
-    // NTP.
+    // NTP and the clock (G1.6zh: "relógio não ajustado" with what to do).
+    let unset = "relógio não ajustado";
+    let c = &i.ntp_clock;
     match i.ntp {
-        // G4.6i: off is the RouterOS factory default, so a new router must not
-        // be born with a warning; it matters once RADIUS depends on the clock.
         Some((false, _)) if i.ntp_needed => push("ntp", "NTP", Severity::Warning, Some("disabled".into()),
             "cliente NTP desligado, mas há servidores RADIUS configurados: o horário errado quebra Event-Timestamp e a contabilidade".into(),
             Some("Ligue o cliente NTP: system.ntp.client.set enabled=yes servers=…")),
+        // Off and the clock was never set (no RTC battery): every log line,
+        // certificate check and TLS login runs on a wrong date.
+        Some((false, _)) if i.clock_unix.is_some_and(|t| t < CLOCK_MIN_VALID_UNIX) => push("ntp", "NTP", Severity::Warning, Some("disabled".into()),
+            format!("{unset}: a data do roteador é anterior a 2026 (placa sem bateria no relógio?) e o cliente NTP está desligado; log, certificados e TLS dependem dela"),
+            Some("Ligue o cliente NTP: system.ntp.client.set enabled=yes (System › NTP Client); sem servidor configurado ele usa o que o DHCP entregar.")),
+        // Off is the operator's choice (or a config saved before G1.6zh,
+        // when off was the first-boot default): not a warning by itself.
         Some((false, _)) => push("ntp", "NTP", Severity::Ok, Some("disabled".into()),
-            "cliente NTP desligado (padrão de fábrica); ligue em System › NTP Client se logs e certificados precisarem do horário certo".into(),
+            "cliente NTP desligado: o relógio segue o da placa (RTC); ligue em System › NTP Client se logs e certificados precisarem do horário certo".into(),
             None),
-        Some((true, NtpState::Synchronized)) => push("ntp", "NTP", Severity::Ok, Some("synchronized".into()), "relógio sincronizado".into(), None),
+        Some((true, NtpState::Synchronized)) => match c.clock {
+            ClockState::AwaitingConfirmation => push("ntp", "NTP", Severity::Warning, Some("awaiting-confirmation".into()),
+                format!("{unset}: está {} em relação ao servidor; acima de 1000 s o acerto espera confirmação",
+                    c.pending_step_ms.or(c.offset_ms).map_or_else(|| "mais de 1000 s fora".to_owned(), off_text)),
+                Some("Confira a hora do servidor e confirme: system.ntp.client.confirm-step (botão Confirm Step em System › NTP Client).")),
+            ClockState::Refused => push("ntp", "NTP", Severity::Warning, Some("refused".into()),
+                format!("{unset}: a resposta do servidor levaria o relógio para antes de 2026 e foi recusada"),
+                Some("O servidor NTP está com a hora errada: troque-o em System › NTP Client.")),
+            // Measured, not corrected (set_system_clock=no, no CAP_SYS_TIME,
+            // the virtual lab): a warning only when it is really off.
+            ClockState::NotSet if c.offset_ms.is_some_and(|o| o.abs() > CLOCK_OFF_MS) => push("ntp", "NTP", Severity::Warning, Some("not-set".into()),
+                format!("{unset}: está {} e não está sendo corrigido: {}", c.offset_ms.map_or_else(String::new, off_text),
+                    c.clock_error.as_deref().unwrap_or("set_system_clock=no")),
+                Some("Ligue set_system_clock (System › NTP Client), ou acerte o relógio por quem cuida dele nesta máquina.")),
+            _ => push("ntp", "NTP", Severity::Ok, Some("synchronized".into()), "relógio sincronizado".into(), None),
+        },
         Some((true, NtpState::UsingLocalClock)) => push("ntp", "NTP", Severity::Warning, Some("using-local-clock".into()),
             "sem resposta dos servidores: o servidor NTP está dando a hora do relógio local".into(),
             Some("Confira os servidores do cliente; o relógio local deriva sem correção.")),
+        Some((true, NtpState::Waiting)) if c.no_server => push("ntp", "NTP", Severity::Warning, Some("no-server".into()),
+            format!("{unset}: o cliente NTP não tem a quem perguntar (nenhum servidor configurado e nenhum cliente DHCP entregou um, opção 42)"),
+            Some("Defina um servidor: system.ntp.client.set servers=… (System › NTP Client), ou use um cliente DHCP com use_peer_ntp numa rede que entregue a opção 42.")),
         Some((true, NtpState::Waiting)) => push("ntp", "NTP", Severity::Warning, Some("waiting".into()),
-            "cliente NTP sem resposta dos servidores".into(),
+            format!("{unset}: cliente NTP sem resposta dos servidores"),
             Some("Confira os servidores e se a porta UDP 123 sai (System › NTP Client mostra o último erro).")),
         Some((true, NtpState::Stopped)) | None => push("ntp", "NTP", Severity::Unknown, None, "sem daemon rodando o cliente NTP".into(), None),
     }
@@ -900,7 +965,16 @@ impl Session {
         let ntp = &self.store().running().system.ntp_client;
         let enabled = ntp.enabled;
         i.ntp_needed = self.store().running().radius.servers.iter().any(|r| !r.service.is_empty());
-        i.ntp = Some((enabled, self.ntp_status().status));
+        let status = self.ntp_status();
+        i.ntp = Some((enabled, status.status));
+        i.ntp_clock = NtpClock {
+            no_server: status.last_error.as_deref() == Some(corerouter_model::ntp::NO_SERVER),
+            clock: status.clock,
+            pending_step_ms: status.pending_step_ms,
+            offset_ms: status.system_offset_ms,
+            clock_error: status.clock_error,
+        };
+        i.clock_unix = self.now();
         i.sockbuf = self
             .ext::<SocketBuffers>()
             .filter(|b| !b.sockets.is_empty())
@@ -1029,6 +1103,8 @@ mod tests {
             oom_recent: Some(0),
             ntp: Some((true, NtpState::Synchronized)),
             ntp_needed: false,
+            ntp_clock: NtpClock { clock: ClockState::Slewing, offset_ms: Some(1.5), ..NtpClock::default() },
+            clock_unix: Some(1_800_000_000),
             services: Some(vec![("dns-resolver".into(), ServiceState::Running)]),
             rss: Some((0, 20.0, 8, 50_000.0)),
             sockbuf: Some(vec![("radius".into(), 4 << 20, 4 << 20)]),
@@ -1170,6 +1246,12 @@ mod tests {
             ("ntp off, nothing needs it", |i| i.ntp = Some((false, NtpState::Stopped)), "ntp", Severity::Ok),
             ("ntp off, radius needs it", |i| { i.ntp = Some((false, NtpState::Stopped)); i.ntp_needed = true }, "ntp", Severity::Warning),
             ("ntp waiting", |i| i.ntp = Some((true, NtpState::Waiting)), "ntp", Severity::Warning),
+            ("ntp nobody to ask", |i| { i.ntp = Some((true, NtpState::Waiting)); i.ntp_clock.no_server = true }, "ntp", Severity::Warning),
+            ("ntp step waits for the operator", |i| { i.ntp_clock.clock = ClockState::AwaitingConfirmation; i.ntp_clock.pending_step_ms = Some(10_800_000.0) }, "ntp", Severity::Warning),
+            ("ntp answer refused", |i| i.ntp_clock.clock = ClockState::Refused, "ntp", Severity::Warning),
+            ("ntp measures a clock nobody corrects", |i| { i.ntp_clock.clock = ClockState::NotSet; i.ntp_clock.offset_ms = Some(-4000.0) }, "ntp", Severity::Warning),
+            ("ntp measures only, clock right", |i| { i.ntp_clock.clock = ClockState::NotSet; i.ntp_clock.offset_ms = Some(3.0) }, "ntp", Severity::Ok),
+            ("ntp off, clock never set", |i| { i.ntp = Some((false, NtpState::Stopped)); i.clock_unix = Some(86_400) }, "ntp", Severity::Warning),
             ("ntp no daemon", |i| i.ntp = Some((true, NtpState::Stopped)), "ntp", Severity::Unknown),
             ("service restarting", |i| i.services = Some(vec![("dns".into(), ServiceState::Restarting)]), "services", Severity::Warning),
             ("service failed", |i| i.services = Some(vec![("a".into(), ServiceState::Running), ("dns".into(), ServiceState::Failed)]), "services", Severity::Error),
@@ -1221,6 +1303,51 @@ mod tests {
         let checks = evaluate(&i);
         let c = checks.iter().find(|c| c.key == "disk").unwrap();
         assert!(c.action.as_deref().unwrap().contains("logs"));
+    }
+
+    /// G1.6zh: what the session tells the NTP check, and what it says to do.
+    #[test]
+    fn the_ntp_check_says_why_the_clock_is_not_set_and_what_to_do() {
+        use corerouter_model::ntp::{NO_SERVER, NtpStatus};
+        let mut s = Session::virtual_lab();
+        let ntp = |s: &mut Session| evaluate(&s.health_inputs()).into_iter().find(|c| c.key == "ntp").unwrap();
+        s.execute("system.ntp.client.set", &serde_json::json!({"enabled": true})).unwrap();
+        // No daemon yet runs the client.
+        assert_eq!(ntp(&mut s).severity, Severity::Unknown);
+        // On, nobody to ask: a new router whose network gave no option 42.
+        s.set_ntp_status(NtpStatus { status: NtpState::Waiting, last_error: Some(NO_SERVER.into()), ..NtpStatus::default() });
+        let c = ntp(&mut s);
+        assert_eq!((c.severity, c.value.as_deref()), (Severity::Warning, Some("no-server")));
+        assert!(c.reason.starts_with("relógio não ajustado"), "{}", c.reason);
+        assert!(c.action.as_deref().unwrap().contains("system.ntp.client.set servers="), "{:?}", c.action);
+        // Servers that do not answer.
+        s.set_ntp_status(NtpStatus { status: NtpState::Waiting, last_error: Some("192.0.2.1: timed out".into()), ..NtpStatus::default() });
+        assert_eq!(ntp(&mut s).value.as_deref(), Some("waiting"));
+        // A clock three hours behind (an RTC kept in local time): the step
+        // waits for the operator, and the check says how to confirm.
+        s.set_ntp_status(NtpStatus {
+            status: NtpState::Synchronized,
+            system_offset_ms: Some(10_800_000.0),
+            clock: ClockState::AwaitingConfirmation,
+            pending_step_ms: Some(10_800_000.0),
+            ..NtpStatus::default()
+        });
+        let c = ntp(&mut s);
+        assert_eq!(c.severity, Severity::Warning);
+        assert!(c.reason.contains("3 h 0 min atrasado"), "{}", c.reason);
+        assert!(c.action.as_deref().unwrap().contains("system.ntp.client.confirm-step"));
+        // Corrected.
+        s.set_ntp_status(NtpStatus { status: NtpState::Synchronized, system_offset_ms: Some(2.0), clock: ClockState::Slewing, ..NtpStatus::default() });
+        let c = ntp(&mut s);
+        assert_eq!((c.severity, c.reason.as_str()), (Severity::Ok, "relógio sincronizado"));
+        // Off: fine with a plausible clock, a warning with one never set.
+        s.execute("system.ntp.client.set", &serde_json::json!({"enabled": false})).unwrap();
+        s.tick(1_800_000_000);
+        assert_eq!(ntp(&mut s).severity, Severity::Ok);
+        s.tick(86_400);
+        let c = ntp(&mut s);
+        assert_eq!(c.severity, Severity::Warning);
+        assert!(c.reason.contains("anterior a 2026"), "{}", c.reason);
     }
 
     #[test]

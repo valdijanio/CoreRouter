@@ -57,12 +57,6 @@ fn ntp_client_settings() {
     fails(
         &mut s,
         "system.ntp.client.set",
-        json!({"servers": []}),
-        "at least one server",
-    );
-    fails(
-        &mut s,
-        "system.ntp.client.set",
         json!({"servers": (1..=9).map(|i| format!("192.0.2.{i}")).collect::<Vec<_>>()}),
         "at most 8",
     );
@@ -133,17 +127,30 @@ fn ntp_client_vrf_and_clock_switch() {
     );
 }
 
-/// G4.6b: a client may rely on a DHCP client's servers.
+/// G4.6b: a client may rely on a DHCP client's servers. G1.6zh: on with
+/// nobody to ask yet is accepted (it is how a new router starts, before its
+/// DHCP clients exist) and the answer says what is missing.
 #[test]
-fn ntp_client_without_servers_needs_a_dhcp_client() {
+fn ntp_client_without_servers_waits_for_a_dhcp_client() {
     let mut s = Session::virtual_lab();
-    fails(
+    let r = ok(&mut s, "system.ntp.client.set", json!({"enabled": true}));
+    assert!(
+        r["warning"].as_str().unwrap().contains("use_peer_ntp"),
+        "{r}"
+    );
+    assert!(s.store().running().system.ntp_client.enabled);
+    ok(&mut s, "ip.dhcp-client.add", json!({"interface": "ether1"}));
+    let r = ok(&mut s, "system.ntp.client.set", json!({"enabled": true}));
+    assert!(
+        r.get("warning").is_none(),
+        "a DHCP client may bring one: {r}"
+    );
+    let r = ok(
         &mut s,
         "system.ntp.client.set",
-        json!({"enabled": true}),
-        "at least one server",
+        json!({"enabled": false, "servers": []}),
     );
-    ok(&mut s, "ip.dhcp-client.add", json!({"interface": "ether1"}));
+    assert!(r.get("warning").is_none(), "off needs nobody: {r}");
     ok(&mut s, "system.ntp.client.set", json!({"enabled": true}));
     assert!(s.store().running().system.ntp_client.enabled);
     assert_eq!(
