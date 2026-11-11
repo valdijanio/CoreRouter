@@ -340,3 +340,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-11-10 — G4.7 feito (as três partes entraram; a linha guarda-chuva estava desatualizada)
 - 2026-11-10 — G1.29h criado e feito (r8152 como módulo: o firmware rtl_nic do RTL8153 carrega no boot)
 - 2026-11-11 — G1.6zc criado e feito (console de tela num boot UEFI: simpledrm + fbcon)
+- 2026-11-11 — G1.6zd criado e feito (boot sem linhas de erro do i915 e do som); G1.30 e G1.30a criados (Wi-Fi: estação e AP)

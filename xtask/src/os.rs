@@ -116,7 +116,20 @@ const REQUIRED_KERNEL: &[&str] = &[
 /// G1.6j: drivers that must be modules. `ice` asks for its firmware while
 /// probing, which a built-in driver does before `/` is mounted; `e100` and
 /// `pcnet32` are what `boot-test` sees (QEMU emulates them).
-const REQUIRED_MODULES: &[&str] = &["CONFIG_ICE", "CONFIG_E100", "CONFIG_PCNET32"];
+/// G1.6zd: `i915` is one too (GuC, HuC and DMC at probe); built in, an Intel
+/// GPU of the 12th generation or later fails to start and the console shows
+/// four error lines at every boot.
+const REQUIRED_MODULES: &[&str] = &[
+    "CONFIG_ICE",
+    "CONFIG_E100",
+    "CONFIG_PCNET32",
+    "CONFIG_DRM_I915",
+];
+/// What the kernel must not have (`# … is not set` in the fragment, absent
+/// from the built `.config`). G1.6zd: a router plays no sound, and on a
+/// notebook `snd_hda_intel` wrote "Cannot probe codecs, giving up" on the
+/// console at every boot (the x86_64 defconfig turns it on).
+const KERNEL_OFF: &[&str] = &["CONFIG_SOUND"];
 /// Buildroot options the image's design rests on (docs/os-image.md).
 const REQUIRED_BR2: &[&str] = &[
     "BR2_INIT_NONE=y",
@@ -365,6 +378,15 @@ fn module_symbols(fragment: &str) -> Vec<&str> {
         .collect()
 }
 
+/// The first symbol of `off` a kernel `.config` has on (`=y` or `=m`).
+fn kernel_on<'a>(config: &str, off: &[&'a str]) -> Option<&'a str> {
+    off.iter().copied().find(|s| {
+        config
+            .lines()
+            .any(|l| l.strip_prefix(s).is_some_and(|v| v == "=y" || v == "=m"))
+    })
+}
+
 /// The `=y` symbols of a kernel config fragment.
 fn fragment_symbols(fragment: &str) -> Vec<&str> {
     fragment
@@ -442,6 +464,12 @@ pub fn check(os: &Path) -> Result<usize, String> {
     for want in REQUIRED_MODULES {
         if !fragment.lines().any(|l| l == format!("{want}=m")) {
             return Err(format!("linux.fragment: {want}=m is required"));
+        }
+        n += 1;
+    }
+    for off in KERNEL_OFF {
+        if !fragment.lines().any(|l| l == format!("# {off} is not set")) {
+            return Err(format!("linux.fragment: '# {off} is not set' is required"));
         }
         n += 1;
     }
@@ -1079,6 +1107,9 @@ pub(crate) fn build_with(
             lost.join(" ")
         ));
     }
+    if let Some(on) = kernel_on(&kc, KERNEL_OFF) {
+        return Err(format!("the kernel config has {on}, which must be off"));
+    }
     let libs = check_needed(&d.out.join("target"))?;
     let fw = firmware::verify(&d.os, &d.out.join("target"))?;
     eprintln!("   firmware: {fw} files, hashes and what the drivers declare checked");
@@ -1113,6 +1144,11 @@ pub(crate) fn build_with(
     }
     if ic.lines().any(|l| l == "CONFIG_DEBUG_INFO_BTF=y") {
         return Err("the installer kernel still has BTF".into());
+    }
+    if let Some(on) = kernel_on(&ic, KERNEL_OFF) {
+        return Err(format!(
+            "the installer kernel config has {on}, which must be off"
+        ));
     }
     let boot = std::fs::metadata(images.join("installer/EFI/BOOT/BOOTX64.EFI"))
         .map(|m| m.len())
@@ -2046,6 +2082,9 @@ mod tests {
     fn fragment_and_genimage_parsing() {
         let f = "# c\nCONFIG_A=y\nCONFIG_B=m\n# CONFIG_C is not set\nCONFIG_CMDLINE=\"root=PARTUUID=u1 ro\"\n";
         assert_eq!(fragment_symbols(f), ["CONFIG_A"]);
+        assert_eq!(kernel_on(f, &["CONFIG_C", "CONFIG_AB"]), None);
+        assert_eq!(kernel_on(f, &["CONFIG_C", "CONFIG_B"]), Some("CONFIG_B"));
+        assert_eq!(kernel_on(f, &["CONFIG_A"]), Some("CONFIG_A"));
         assert_eq!(
             config_value(f, "CONFIG_CMDLINE"),
             Some("root=PARTUUID=u1 ro")

@@ -42,7 +42,8 @@ FRR: seção "Instalador, imagens de VM e FRR (G1.6c)" no fim.
 | Roteamento | FRR **10.7.1** com libyang 3.13.6 (a versão validada na VM do laboratório; receita do Buildroot `master` portada, G1.6k): `mgmtd`, `zebra`, `staticd`, `bgpd`, `ospfd`, `ospf6d`, `ldpd`, `bfdd`, iniciados pelo `corerouter-init`; sem `vtysh`, scripts nem bash (G1.6c) | defconfig, `post-build.sh`, `os/buildroot-patches/` |
 
 O que o roteador precisa no kernel é `=y`; só os drivers de placa que precisam do `/` são módulo
-(`ice`: seção "Firmware das placas e drivers em módulo (G1.6j)"). eBPF/XDP com BTF e JIT sempre
+(`ice`, `i915`: seção "Firmware das placas e drivers em módulo (G1.6j)"). Som não entra
+(`# CONFIG_SOUND is not set`, G1.6zd). eBPF/XDP com BTF e JIT sempre
 ligado, AF_XDP, nftables completo (NAT, conntrack, flowtable, fib, socket, synproxy), **VRF**
 (`CONFIG_NET_VRF=y`, que destrava o `ip.vrf.add`, G1.14), MPLS (roteamento e túnel), bonding,
 802.1Q, bridge com VLAN filtering, PPP/PPPoE, L2TP, WireGuard, VXLAN, GRE, filas (HTB, fq,
@@ -635,10 +636,10 @@ mesmo com o arquivo no squashfs: uma fila (`ice_common.c:3249`), sem RSS, sem XD
 | Peça | O que faz | Onde |
 |---|---|---|
 | `ice` como módulo | a sonda roda depois do `/`, com o arquivo à vista | `linux.fragment`, `REQUIRED_MODULES` |
-| Carga automática | o PID 1 lê `modules.dep`/`modules.alias`, olha as placas PCI/USB sem driver e carrega o que casa, no boot e a cada dispositivo novo (mensagens do kernel, inclusive do barramento `auxiliary`). Só módulos em `kernel/drivers/net/`. Numa thread: uma sonda travada não para o boot, que espera no máximo 20 s; a porta que chega depois recebe o nome pelo hot-plug | `apps/corerouter-init/src/modules.rs` |
-| Firmware | os arquivos que os drivers de rede declaram (`firmware=` no modinfo, como o VyOS), de um commit fixo do `linux-firmware`, com o SHA-256 de cada um, sem comprimir (o squashfs comprime) | `os/package/corerouter-firmware/firmware.lock` |
+| Carga automática | o PID 1 lê `modules.dep`/`modules.alias`, olha as placas PCI/USB sem driver e carrega o que casa, no boot e a cada dispositivo novo (mensagens do kernel, inclusive do barramento `auxiliary`). Só módulos em `kernel/drivers/net/` e, depois deles, em `kernel/drivers/gpu/drm/` (a tela, G1.6zd). Numa thread: uma sonda travada não para o boot, que espera no máximo 20 s e só pelos drivers de rede; a porta que chega depois recebe o nome pelo hot-plug | `apps/corerouter-init/src/modules.rs` |
+| Firmware | os arquivos que os drivers de rede e de tela declaram (`firmware=` no modinfo, como o VyOS), de um commit fixo do `linux-firmware`, com o SHA-256 de cada um, sem comprimir (o squashfs comprime) | `os/package/corerouter-firmware/firmware.lock` |
 | Licenças | só entra o que o `WHENCE` diz que pode ser redistribuído; o resto vira linha `skip`. Os textos e as entradas do `WHENCE` vão em `/usr/share/licenses/firmware/` | `cargo xtask os firmware-lock`, `xtask/src/os/firmware.rs` |
-| Conferência | depois de cada build: hash de cada arquivo na imagem, links, licenças, e todo `firmware=` dos drivers de rede presente ou em `skip`, senão o build falha | `firmware::verify` |
+| Conferência | depois de cada build: hash de cada arquivo na imagem, links, licenças, e todo `firmware=` dos drivers de rede e de tela presente ou em `skip`, senão o build falha | `firmware::verify` |
 
 ```sh
 cargo xtask os firmware-lock --tag 20261019   # refaz a trava (precisa de um build pronto)
@@ -678,6 +679,63 @@ e o tempo da sonda.
 | Placa nova, driver já carregado | 112 ms até a porta ter nome |
 | Placa nova, driver em módulo (`pcnet32`) | 157 ms até a porta ter nome (50 ms na carga) |
 | Reprodutível | `linux-dirclean` e rebuild: rootfs, bzImage, todos os `.ko`, `disk.img`, instalador, ISO, qcow2 e crpkg com o mesmo hash |
+
+### Tela: `i915` em módulo, sem som (G1.6zd)
+
+O primeiro boot num notebook real (Lenovo LOQ 15IRH8, Raptor Lake-P, kernel 6.18.59 com `quiet`,
+que deixa passar só as mensagens de erro) mostrou na tela, antes do setup:
+
+- `i915 … GuC firmware i915/adlp_guc_70.bin: fetch failed -ENOENT`, `GuC initialization failed`,
+  `Enabling uc failed (-5)`, `Failed to initialize GPU, declaring it wedged!`;
+- `snd_hda_intel … Cannot probe codecs, giving up`;
+- `ACPI BIOS Error … _UPC … AE_ALREADY_EXISTS`, um defeito da tabela ACPI do fabricante, que
+  nenhuma config do kernel tira.
+
+**i915.** É a mesma pegadinha do `ice`: o driver era `=y`, sondava a ~0,4 s, antes do `/`, e a
+imagem nem tinha `lib/firmware/i915`. Da geração Alder Lake-P em diante o i915 liga a submissão
+pelo GuC por padrão (`uc_expand_default_options`, `drivers/gpu/drm/i915/gt/uc/intel_uc.c:26-53`);
+sem o arquivo, `intel_uc.c:578` e `gt/intel_gt.c:215` falham e o GT fica "wedged"
+(`gt/intel_gt_pm.c:273`). A tela continuava (só o modeset), mas com quatro linhas de erro e a
+GPU sem gerência de energia. O que entrou:
+
+| Peça | O que faz | Onde |
+|---|---|---|
+| `i915` como módulo | a sonda roda depois do `/`, com o firmware à vista; até lá o console fica no `simpledrm` (G1.6zc) | `linux.fragment`, `REQUIRED_MODULES` |
+| Segunda passada do PID 1 | depois dos drivers de rede, carrega o driver de tela que casa com a placa (`kernel/drivers/gpu/drm/`). O boot não espera por ela: a espera de 20 s vale só para as portas | `modules.rs` (`Pass::Ports`, `Pass::Screen`) |
+| Firmware do i915 | os 46 arquivos que o driver declara (GuC, HuC, DMC, GSC), 11 257 968 B crus, licença `LICENSE.i915` (redistribuível) | `firmware.lock` |
+| Trava | `os check` e o build reprovam um i915 embutido, um kernel com `CONFIG_SOUND` e uma `firmware.lock` sem `i915/` | `xtask/src/os.rs`, `firmware.rs` |
+
+O que foi descartado, com o motivo:
+
+- **`i915.enable_guc=0` na linha de comando:** o parâmetro é `i915_param_named_unsafe`
+  (`i915_params.c:95`), e mexer nele marca o kernel como alterado pelo usuário (`TAINT_USER`,
+  `kernel/params.c:108-111`), com um aviso a mais no log.
+- **Tirar o i915 e ficar só no `simpledrm`:** funciona para o console, mas um monitor ligado
+  depois do boot não acende (o `simpledrm` só usa o que o firmware deixou) e a GPU fica sem
+  gerência de energia. Fica como alternativa se o módulo der problema em hardware real.
+
+**Som.** O `x86_64_defconfig` liga `CONFIG_SOUND` (34 símbolos `SND*`, HDA embutido). Um roteador
+não toca som: `# CONFIG_SOUND is not set` no fragmento.
+
+**O instalador de console do initramfs** não carrega módulos: fica no `simpledrm`, agora sem
+linhas de erro do i915. O live da ISO carrega o `i915` do `LIVEMODS.IMG`, como os de rede.
+
+**Como foi conferido sem placa Intel.** O QEMU não emula GPU Intel. Para provar o caminho (driver
+de tela em módulo, carregado na segunda passada, tomando o console do `simpledrm`), um build de
+laboratório ligou `CONFIG_DRM_BOCHS=m` (a VGA padrão do QEMU): em UEFI, o log tem
+`driver bochs loaded in 23 ms` depois da linha da varredura, e a tela segue com o aviso do
+primeiro boot, no disco e na ISO (`docs/changes/G1.6zd-screenshots/`). O `bochs` não ficou na
+imagem. No notebook (LOQ 15IRH8, ISO live, **medido** em 2026-11-11) o log do sistema traz
+`driver i915 loaded in 1040 ms`, o GuC 70.49.4, o HuC e o DMC carregados e o `fbcon` passando
+para o `i915drmfb`, sem as linhas de erro.
+
+**Última linha do console no reboot.** O PID 1 chama `tcdrain` no console (até 1 s, numa thread
+`console-drain`, para uma serial com o fluxo segurado não travar o desligamento) antes de mandar
+o SIGHUP aos serviços e antes do `reboot(2)`. Quando o shell de manutenção (líder da sessão do
+`ttyS0`) sai, o kernel desfaz o terminal de controle e descarta o que ainda estava na fila da
+UART (`drivers/tty/tty_jobctrl.c:265-275` → `tty_ldisc.c:700` → `serial/serial_core.c:685`,
+6.18.59); o `reboot(2)` também não espera a UART. Sem a espera, a linha com o motivo do reboot
+podia sair cortada.
 
 ### O que o roteador avisa quando a placa não sobe (G1.6ja)
 

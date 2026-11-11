@@ -53,6 +53,9 @@ const DAEMON_LOG_MAX: u64 = 8 << 20;
 /// An FRR daemon the config no longer uses gets this long after SIGTERM
 /// (G1.6i); FRR exits in well under a second.
 const FRR_STOP_GRACE: Duration = Duration::from_secs(5);
+/// The console gets this long to send what was written to it before a
+/// reboot (115200 baud sends a full 4 KiB buffer in 0.36 s).
+const CONSOLE_DRAIN: Duration = Duration::from_secs(1);
 /// Idle memory is read this long after the first ready.
 const IDLE_AFTER: Duration = Duration::from_secs(10);
 
@@ -1087,6 +1090,33 @@ fn rotate_log(path: &str) {
     }
 }
 
+/// Waits, at most [`CONSOLE_DRAIN`], until the text written to the console
+/// has left the port (G1.6zd). A serial console sends from a buffer, and two
+/// things empty that buffer without sending it:
+///
+/// - the exit of the maintenance shell or of the console setup, the
+///   console's session leader: the kernel hangs the terminal up and drops
+///   the pending output (`tty_ldisc_hangup` → `uart_flush_buffer`,
+///   `drivers/tty/tty_ldisc.c:700` and `serial/serial_core.c:685` in 6.18);
+/// - `reboot(2)`, which resets the machine with the buffer as it is.
+///
+/// The A/B test saw `trial boot of s` and then the kernel's `Restarting
+/// system`: the line that says why the router went back was cut. `tcdrain`
+/// has no timeout and a line held by flow control never drains, so a helper
+/// thread waits and this one gives up after the limit.
+fn drain_console() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("console-drain".into())
+        .spawn(move || {
+            let _ = rustix::termios::tcdrain(std::io::stderr());
+            let _ = tx.send(());
+        });
+    if spawned.is_ok() {
+        let _ = rx.recv_timeout(CONSOLE_DRAIN);
+    }
+}
+
 fn shutdown(
     what: usize,
     daemon: Option<Pid>,
@@ -1100,6 +1130,9 @@ fn shutdown(
         _ => "reboot",
     };
     log!("{name}: stopping services");
+    // Before the shell goes: its exit hangs the console up, which drops
+    // what is still in the port's buffer (the reason of this reboot).
+    drain_console();
     for p in [shell, setup].into_iter().flatten() {
         let _ = rustix::process::kill_process(p, Signal::HUP);
     }
@@ -1150,6 +1183,8 @@ fn shutdown(
         HALT => RebootCommand::Halt,
         _ => RebootCommand::Restart,
     };
+    // `reboot(2)` does not wait for the UART either.
+    drain_console();
     let e = rustix::system::reboot(cmd);
     log!("{name}: {e:?}; halting here");
     loop {
