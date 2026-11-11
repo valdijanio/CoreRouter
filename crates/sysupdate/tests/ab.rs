@@ -618,3 +618,27 @@ fn entry_written_under_the_other_firmware_is_refreshed() {
     assert_eq!(after["slots"][0]["cmdline"], bios_line.as_str());
     let _ = std::fs::remove_dir_all(&l.dir);
 }
+
+/// G1.6zm: an entry naming another ESP (written while this disk's ESP had
+/// the image's GUID, or by another image over this disk) is written anew
+/// for this ESP, in its place; the status says which ESP that is.
+#[test]
+fn an_entry_naming_another_esp_is_written_anew() {
+    let mut l = lab("esp-guid");
+    let own = l.p.esp.guid.clone();
+    let before = l.p.status(&st(&l.p));
+    assert_eq!(before["esp_guid"], own.as_str());
+    // The disk is written over and boots with another ESP GUID: the entries
+    // still name the old one.
+    l.p.esp.guid = "0d2c41a7-1b6e-4c3e-9d1f-5a7b8c9d0e1f".into();
+    let wrote = l.p.provision(&[]).unwrap();
+    assert!(wrote.iter().any(|x| x.contains("slot a")), "{wrote:?}");
+    let after = l.p.status(&st(&l.p));
+    assert_eq!(after["esp_guid"], "0d2c41a7-1b6e-4c3e-9d1f-5a7b8c9d0e1f");
+    assert_eq!(
+        after["slots"][0]["boot_entry"], before["slots"][0]["boot_entry"],
+        "the same Boot#### number"
+    );
+    assert!(l.p.provision(&[]).unwrap().is_empty(), "then nothing to do");
+    let _ = std::fs::remove_dir_all(&l.dir);
+}

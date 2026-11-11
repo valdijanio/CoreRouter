@@ -118,6 +118,49 @@ impl SlotId {
 /// given twice the last one counts.
 pub const BUILTIN_CMDLINE: &str = "console=tty0 console=ttyS0,115200 root=PARTUUID=3e1088b8-5b4b-4fbb-b756-a271f641d018 rootfstype=squashfs rootwait ro bonding.max_bonds=0 dummy.numdummies=0 init=/usr/sbin/corerouter-init panic=10 quiet";
 
+/// G1.6zm: the ESP's partition GUID in `disk.img` (`partition-uuid` of
+/// `efi` in `os/board/x86_64/genimage.cfg`). Every copy of the image has
+/// it, so a boot entry written on one copy also "finds" the next image
+/// written over it, with the verity hash of the old one in its command line
+/// (a Lenovo notebook, 2026-11-11: `verity: metadata block 22096 is
+/// corrupted`). The first boot of a copy gives its ESP a GUID of its own
+/// ([`gpt::renew_guid`]) before the boot entries are written, and the
+/// installer writes one: an entry from an earlier image then names a
+/// partition that is not there, the firmware moves on to the next boot
+/// option and to the removable-media path (`\EFI\BOOT\BOOTX64.EFI`), and
+/// that boot writes the entries anew.
+pub const IMAGE_ESP_GUID: &str = "4f9a520b-35f7-4633-a4bb-e9f871d1473c";
+
+/// A random GUID (RFC 9562 §5.4, version 4), as text.
+pub fn new_guid() -> Result<String, String> {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut b = [0u8; 16];
+    SystemRandom::new()
+        .fill(&mut b)
+        .map_err(|_| "no random bytes from the kernel".to_string())?;
+    if let Some(v) = b.get_mut(6) {
+        *v = (*v & 0x0f) | 0x40;
+    }
+    if let Some(v) = b.get_mut(8) {
+        *v = (*v & 0x3f) | 0x80;
+    }
+    let hex = |r: std::ops::Range<usize>| {
+        b.get(r)
+            .unwrap_or_default()
+            .iter()
+            .map(|x| format!("{x:02x}"))
+            .collect::<String>()
+    };
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        hex(0..4),
+        hex(4..6),
+        hex(6..8),
+        hex(8..10),
+        hex(10..16)
+    ))
+}
+
 /// Platform parameters carried from the running command line to the slot
 /// written next, when not already built in: a serial console on another
 /// port or speed, the kernel's own address for a lab, the maintenance
@@ -288,6 +331,36 @@ mod tests {
         assert_eq!(
             tuning_of(&c, &["isolcpus", "iommu"]),
             [("isolcpus".into(), "2-3".into())]
+        );
+    }
+}
+
+#[cfg(test)]
+mod g16zm_tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+
+    #[test]
+    fn a_new_guid_is_version_4_and_new_each_time() {
+        let a = super::new_guid().unwrap();
+        let b = super::new_guid().unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 36);
+        assert_eq!(&a[14..15], "4", "{a}");
+        assert!(matches!(&a[19..20], "8" | "9" | "a" | "b"), "{a}");
+        assert!(crate::efi::guid_bytes(&a).is_some());
+    }
+
+    /// The constant is the image's: genimage writes the ESP with it.
+    #[test]
+    fn the_image_esp_guid_is_the_one_genimage_writes() {
+        let cfg = include_str!("../../../os/board/x86_64/genimage.cfg");
+        let efi = cfg
+            .split("partition ")
+            .find(|p| p.starts_with("efi "))
+            .expect("the efi partition in genimage.cfg");
+        assert!(
+            efi.contains(&format!("partition-uuid = \"{}\"", super::IMAGE_ESP_GUID)),
+            "{efi}"
         );
     }
 }

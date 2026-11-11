@@ -351,3 +351,7 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-11-11 — G1.6zf criado e feito (sensores de CPU, disco e placa-mãe em qualquer hardware); G4.8g criado (temperatura dos DIMMs)
 - 2026-11-11 — G1.6zg criado e feito (console local com cor e formato: status, assistente do primeiro boot e instalador)
 - 2026-11-11 — G1.6zi criado e feito (cobertura de hardware do kernel: núcleos, disco de boot, hipervisores, diagnóstico); G1.6zw, G1.6zx e G1.6zy criados
+- 2026-11-11 — G1.30g criado e feito (janela Interface de uma porta Wi-Fi)
+- 2026-11-11 — G1.6zl criado e feito (assistente do primeiro boot: enlace real e DHCP no cabo)
+- 2026-11-11 — G1.6zm criado e feito (disco regravado não boota pela entrada velha da NVRAM)
+- 2026-11-11 — G1.6zn criado (sistema na RAM no disco instalado; aviso claro quando o disco do sistema some)

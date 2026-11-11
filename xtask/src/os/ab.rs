@@ -564,6 +564,126 @@ fn fresh(ctx: &mut Ctx, n: &mut Numbers, scenario: &str, extra: &[&Path]) -> Res
     Ok(vm)
 }
 
+/// G1.6zm: a disk booted once (its boot entries in the NVRAM), then
+/// another image written over it with the NVRAM kept, as on the notebook of
+/// 2026-11-11. The other image is `disk.img` with its verity tree changed,
+/// so the old entries' command line does not fit it: the firmware must pass
+/// over them (they name the ESP GUID the first boot gave the disk) and
+/// boot the disk's removable-media path, and that boot gives the ESP a new
+/// GUID. Before G1.6zm the entries matched the image's fixed ESP GUID and
+/// the kernel stopped on `verity: metadata block … is corrupted`.
+fn scenario_reflash(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
+    let mut log = ctx.log.try_clone().map_err(|e| e.to_string())?;
+    let mut vm = fresh(ctx, n, "reflash", &[])?;
+    let v = vm.print_until(&mut log, 30, |v| v["running"] == "a")?;
+    // An image from before G1.6zm says nothing (and fails below, at the
+    // next image's boot: that is the defect this scenario shows).
+    let first = v["esp_guid"].as_str().unwrap_or(IMAGE_ESP_GUID).to_owned();
+    if v.get("esp_guid").is_some() {
+        check(
+            first != IMAGE_ESP_GUID,
+            format!("the first boot left the image's ESP GUID: {first}"),
+        )?;
+    }
+    vm.poweroff(&mut log)?;
+    drop(vm);
+    let other = other_image(ctx)?;
+    let disk = ctx.work.join("disk.qcow2");
+    let _ = std::fs::remove_file(&disk);
+    let st = Command::new("qemu-img")
+        .args(["create", "-q", "-f", "qcow2", "-F", "raw", "-b"])
+        .arg(&other)
+        .arg(&disk)
+        .status()
+        .map_err(|e| format!("qemu-img: {e}"))?;
+    check(st.success(), "qemu-img create failed")?;
+    let t = Instant::now();
+    let mut vm = ctx.boot("reflash/next-image", false, &[])?;
+    let line = vm.expect(&mut log, &["boot partition: GUID"], 120)?;
+    check(
+        !line.contains(&first),
+        format!("the next image's ESP kept the old GUID: {line}"),
+    )?;
+    vm.expect(&mut log, &["ready:"], 120)?;
+    n.put(
+        "image written over a disk whose NVRAM has the old one's entries: firmware → ready",
+        format!("{:.1} s", t.elapsed().as_secs_f64()),
+    );
+    drop(vm);
+    let _ = std::fs::remove_file(&other);
+    Ok(())
+}
+
+/// The ESP GUID `disk.img` carries (`crates/sysupdate/src/lib.rs`).
+const IMAGE_ESP_GUID: &str = "4f9a520b-35f7-4633-a4bb-e9f871d1473c";
+
+/// `disk.img` with the first block of slot A's verity tree changed: what a
+/// boot entry of another image finds when its hash is checked.
+fn other_image(ctx: &Ctx) -> Result<PathBuf, String> {
+    use std::os::unix::fs::FileExt;
+    let info = run_tool(
+        &ctx.tool,
+        &[
+            "info",
+            &ctx.images.join("corerouter.crpkg").to_string_lossy(),
+        ],
+    )?;
+    let m: Value = serde_json::from_str(info.trim()).map_err(|e| format!("info: {e}"))?;
+    let blocks = m["rootfs"]["data_blocks"]
+        .as_u64()
+        .ok_or("info: no rootfs.data_blocks")?;
+    let out = ctx.work.join("other.img");
+    std::fs::copy(ctx.images.join("disk.img"), &out).map_err(|e| e.to_string())?;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&out)
+        .map_err(|e| e.to_string())?;
+    let start = partition_start(&f, "rootfs-a")?;
+    f.write_all_at(&[0xA5; 4096], start + blocks * 4096)
+        .map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+/// Byte offset of GPT partition `name` in a disk image of 512-byte blocks.
+fn partition_start(f: &std::fs::File, name: &str) -> Result<u64, String> {
+    use std::os::unix::fs::FileExt;
+    let mut hdr = [0u8; 92];
+    f.read_exact_at(&mut hdr, 512).map_err(|e| e.to_string())?;
+    check(&hdr[..8] == b"EFI PART", "no GPT")?;
+    let u64_at = |b: &[u8], at: usize| -> u64 {
+        b.get(at..at + 8)
+            .and_then(|x| x.try_into().ok())
+            .map_or(0, u64::from_le_bytes)
+    };
+    let u32_at = |b: &[u8], at: usize| -> u32 {
+        b.get(at..at + 4)
+            .and_then(|x| x.try_into().ok())
+            .map_or(0, u32::from_le_bytes)
+    };
+    let (lba, count, size) = (
+        u64_at(&hdr, 72),
+        u32_at(&hdr, 80),
+        u32_at(&hdr, 84) as usize,
+    );
+    let mut entries = vec![0u8; count as usize * size];
+    f.read_exact_at(&mut entries, lba * 512)
+        .map_err(|e| e.to_string())?;
+    for e in entries.chunks(size) {
+        let units: Vec<u16> = e
+            .get(56..128)
+            .unwrap_or_default()
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c.get(1).copied().unwrap_or(0)]))
+            .take_while(|u| *u != 0)
+            .collect();
+        if String::from_utf16_lossy(&units) == name {
+            return Ok(u64_at(e, 32) * 512);
+        }
+    }
+    Err(format!("no partition {name}"))
+}
+
 /// A new disk (qcow2 over disk.img) and an empty NVRAM.
 fn new_disk(ctx: &Ctx) -> Result<(), String> {
     let disk = ctx.work.join("disk.qcow2");
@@ -1270,8 +1390,9 @@ pub fn ab_test(root: &Path, images: &Path, args: &[String]) -> Result<(), String
     };
     let mut n = Numbers(Vec::new());
     type Scenario = fn(&mut Ctx, &mut Numbers) -> Result<(), String>;
-    let all: [(&str, Scenario); 8] = [
+    let all: [(&str, Scenario); 9] = [
         ("update", scenario_update),
+        ("reflash", scenario_reflash),
         ("push", scenario_push),
         ("no-confirm", scenario_no_confirm),
         ("bad-signature", scenario_bad_signature),
@@ -1288,6 +1409,10 @@ pub fn ab_test(root: &Path, images: &Path, args: &[String]) -> Result<(), String
         }
         // What is about GRUB's files and the old board runs with SeaBIOS.
         if fw == Firmware::Ovmf && matches!(name, "cut" | "controllers") {
+            continue;
+        }
+        // Boot entries in NVRAM are UEFI's.
+        if fw == Firmware::SeaBios && name == "reflash" {
             continue;
         }
         eprintln!(

@@ -758,6 +758,10 @@ pub fn install<R: Read + Seek + Send>(
     // grows at the first boot.
     let last_part = index.partitions.iter().map(|p| p.offset).max();
     let config_end = gpt::aligned_last(disk_bytes / lbs, lbs);
+    // G1.6zm: this disk's ESP gets a GUID of its own: a boot entry left by
+    // an earlier install (or another disk with the image) names another
+    // partition.
+    let esp_guid = crate::new_guid()?;
     let new: Vec<NewPart> = index
         .partitions
         .iter()
@@ -773,7 +777,11 @@ pub fn install<R: Read + Seek + Send>(
             NewPart {
                 name: p.name.clone(),
                 type_guid: p.type_guid.clone(),
-                guid: p.guid.clone(),
+                guid: if p.name == "efi" {
+                    esp_guid.clone()
+                } else {
+                    p.guid.clone()
+                },
                 first_lba: p.offset / lbs,
                 last_lba,
                 attrs: p.attrs,
@@ -1157,8 +1165,17 @@ mod tests {
                     .all(|&x| x == 0xA5),
                 "slot B untouched"
             );
-            // Same partitions as the build's disk image, backup GPT at the end.
-            assert_eq!(parts, gpt::read(&mut Cursor::new(&b.disk), 512).unwrap());
+            // Same partitions as the build's disk image, backup GPT at the
+            // end; G1.6zm: but the ESP's GUID is this disk's own, and the
+            // boot entry names it.
+            let mut want = gpt::read(&mut Cursor::new(&b.disk), 512).unwrap();
+            let esp = parts.iter().find(|p| p.name == "efi").unwrap();
+            assert_ne!(esp.guid, crate::IMAGE_ESP_GUID);
+            assert_eq!(r.esp.as_ref().unwrap().guid, esp.guid);
+            if let Some(w) = want.iter_mut().find(|p| p.name == "efi") {
+                w.guid = esp.guid.clone();
+            }
+            assert_eq!(parts, want);
             assert_eq!(&disk[disk.len() - 512..disk.len() - 504], b"EFI PART");
             assert_eq!(r.esp.as_ref().unwrap().number, 1);
             assert_eq!(r.rootfs_a, "3e1088b8-5b4b-4fbb-b756-a271f641d018");
@@ -1356,6 +1373,11 @@ mod tests {
         assert!(cfg.size_lba() * 512 >= gpt::CONFIG_MIN);
         let want = gpt::read(&mut Cursor::new(&b.disk), 512).unwrap();
         for (a, w) in parts.iter().zip(&want).filter(|(a, _)| a.name != "config") {
+            // G1.6zm: the ESP has a GUID of its own on every installed disk.
+            let w = &gpt::Entry {
+                guid: a.guid.clone(),
+                ..w.clone()
+            };
             assert_eq!(a, w, "only config moves");
         }
         // Reinstall keeping the configuration: the grown partition is kept.
@@ -1378,11 +1400,31 @@ mod tests {
         )
         .unwrap();
         assert!(r.kept_config);
-        assert_eq!(gpt::read(&mut &f, 512).unwrap(), parts);
+        // G1.6zm: the same layout; the ESP's GUID is new with each install.
+        let no_esp_guid = |v: Vec<gpt::Entry>| -> Vec<gpt::Entry> {
+            v.into_iter()
+                .map(|e| {
+                    if e.name == "efi" {
+                        gpt::Entry {
+                            guid: String::new(),
+                            ..e
+                        }
+                    } else {
+                        e
+                    }
+                })
+                .collect()
+        };
+        let again = gpt::read(&mut &f, 512).unwrap();
+        assert_ne!(again[0].guid, parts[0].guid, "a new ESP GUID");
+        assert_eq!(no_esp_guid(again), no_esp_guid(parts));
         // A disk that leaves /config under the minimum keeps the image's.
         let (g, q) = target(16 * MIB, 0);
         install(&mut m, &g, 16 * MIB, 512, &opts(), &mut |_, _| {}).unwrap();
-        assert_eq!(gpt::read(&mut &g, 512).unwrap(), want);
+        assert_eq!(
+            no_esp_guid(gpt::read(&mut &g, 512).unwrap()),
+            no_esp_guid(want)
+        );
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(&q);
     }

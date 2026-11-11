@@ -64,6 +64,61 @@ pub(crate) fn filesystem(dev: &str) -> Vec<String> {
     log
 }
 
+/// G1.6zm: the ESP of the disk holding `dev` gets a GUID of its own when it
+/// still has the image's ([`corerouter_sysupdate::IMAGE_ESP_GUID`]), before
+/// the daemon writes the boot entries: an entry left by an image written
+/// earlier on this disk names another partition then, and the firmware
+/// passes over it. Not during a trial boot (its entries are the other
+/// slot's).
+pub(crate) fn esp(dev: &str, trial: bool) -> Vec<String> {
+    if trial {
+        return Vec::new();
+    }
+    let Some((disk, sectors, lbs)) = disk_of(dev) else {
+        return Vec::new();
+    };
+    let to = match corerouter_sysupdate::new_guid() {
+        Ok(g) => g,
+        Err(e) => return vec![format!("boot partition: {e}")],
+    };
+    let f = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(format!("/dev/{disk}"))
+    {
+        Ok(f) => f,
+        Err(e) => return vec![format!("boot partition: /dev/{disk}: {e}")],
+    };
+    match gpt::renew_guid(
+        &f,
+        sectors * 512,
+        lbs,
+        "efi",
+        corerouter_sysupdate::IMAGE_ESP_GUID,
+        &to,
+    ) {
+        Ok(true) => vec![format!(
+            "boot partition: GUID {to} of its own (boot entries of an image written earlier on /dev/{disk} no longer match it)"
+        )],
+        Ok(false) => Vec::new(),
+        Err(e) => vec![format!(
+            "boot partition: partition table of /dev/{disk}: {e}"
+        )],
+    }
+}
+
+/// The disk holding partition `dev` (`/dev/vda4` → `vda`), its size in
+/// 512-byte sectors and its logical block size.
+fn disk_of(dev: &str) -> Option<(String, u64, u64)> {
+    let name = dev.trim_start_matches("/dev/");
+    let disk = fs::read_link(format!("/sys/class/block/{name}"))
+        .ok()
+        .and_then(|l| Some(l.parent()?.file_name()?.to_str()?.to_owned()))?;
+    let sectors = sys_u64(&format!("/sys/block/{disk}/size"))?;
+    let lbs = sys_u64(&format!("/sys/block/{disk}/queue/logical_block_size"))?;
+    Some((disk, sectors, lbs))
+}
+
 /// Step 1: the `config` partition of the disk holding `dev` reaches the
 /// end of the disk. Not during a trial boot: the table changes once the
 /// update is confirmed (the next normal boot).

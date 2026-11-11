@@ -142,6 +142,9 @@ pub fn main() {
         for l in crate::grow::table(dev, trial.is_some()) {
             log(&l);
         }
+        for l in crate::grow::esp(dev, trial.is_some()) {
+            log(&l);
+        }
     }
     for dir in [plan::RUNTIME_DIR, "/var/log", "/var/lib", "/var/tmp"] {
         if let Err(e) = fs::create_dir_all(dir) {

@@ -3079,3 +3079,19 @@ release, máquina de 32 CPUs com carga média 33 de outros builds, mediana de 7 
 Os 10 ms a mais são as consultas da tela de status ao daemon (portas, serviços, identidade,
 saúde, usuários: 6 conexões de loopback em vez de 1). A tela só é desenhada quando o estado
 muda ou alguém aperta Enter.
+
+### G1.30: a conversa com o `wpa_supplicant` fora do tick (medido, 2026-11-11, QEMU/KVM q35, 2 vCPU, imagem release)
+
+Tempo de resposta de `interface.wifi.list` pedido sem parar (o comando espera a trava da sessão).
+
+| Situação | Antes | Depois |
+|---|---|---|
+| Supplicant travado por 12 s, pior caso | 918 ms | 13 ms e 28 ms (duas rodadas) |
+| Supplicant travado, mediana | 12 ms | 10 ms e 11 ms |
+| Sem rádio ligado, mediana / pior | 13 / 25 ms | 10 / 12 ms |
+| Pior caso enquanto o rádio é ligado (`mac80211_hwsim`, sem firmware a carregar) | 23 ms | 12 ms |
+
+- 2026-11-11, G1.30g, `wifi::radio()` (nl80211 `GET_WIPHY` dividido + `GET_INTERFACE` + rfkill +
+  firmware no `/dev/kmsg`), host com mt7925e, build de teste: 13 ms na primeira chamada (log do
+  kernel inteiro + família genl), 0,4 ms nas seguintes (**medido**). A GUI pede a cada 10 s, e o
+  `GET_STATION` a cada leitura de estado do rádio.
