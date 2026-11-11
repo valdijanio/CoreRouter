@@ -779,7 +779,7 @@ fn run(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(), S
 /// The station's MAC (`mac80211_hwsim`'s second radio).
 const STA_MAC: &str = "02:00:00:00:01:00";
 
-/// A sniffer task until it ends; its snooper table.
+/// A sniffer task until it ends: its summary and its snooper table.
 fn sniffed(
     vm: &mut Vm,
     log: &mut std::fs::File,
@@ -791,7 +791,7 @@ fn sniffed(
         v["result"]["done"] == true
     })?;
     let table = vm.ok(log, "interface.wifi.snooper.print", &poll)?;
-    Ok((done["result"].clone(), table))
+    Ok((done["result"]["summary"].clone(), table))
 }
 
 fn network<'a>(table: &'a Value, bssid: &str) -> Option<&'a Value> {

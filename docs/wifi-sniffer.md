@@ -118,10 +118,13 @@ segundo (cada A-MPDU chega como vários MPDUs): mesmo 100 mil quadros/s custam ~
 - **Laboratório** (`--backend virtual`): GUI com `--control` num Xvfb próprio, snooper pulando
   canais e captura no canal 1, screenshots olhados; o pcap baixado pela GUI abre no `tshark`
   (radiotap, taxa HT MCS3 de 26 Mb/s, flag de retry, SSID nos beacons).
-- **QEMU com `mac80211_hwsim`** (`cargo xtask os wifi-test`): monitor ao lado da estação
-  conectada ao `hostapd` (beacons, a estação, o deauth e o handshake 4/4 de um `reconnect`, o
-  pcap com link type 127, a lista ao vivo), e o rádio desativado pulando 1/6/11 até achar o AP no
-  canal 1; a interface monitor some no fim.
+- **QEMU com `mac80211_hwsim`** (`cargo xtask os wifi-test`, KVM, 2026-11-11, **medido**):
+  monitor ao lado da estação conectada ao `hostapd` em WPA3: 137 quadros e 117 beacons em 12 s;
+  a estação com o deauth do `reconnect` (motivo cifrado: o PMF do WPA3 protege o deauth) e o
+  handshake 4/4, e continua conectada; captura de 59 quadros num pcap de 14 479 bytes (link type
+  127) e a lista ao vivo. Depois, com o rádio desativado, pulando 1/6/11 a 300 ms: 30 beacons do
+  AP no canal 1 (um terço dos 10/s, o tempo que passou nele) e a interface monitor removida no
+  fim.
 - **Não conferido em placa**: a RTL8852BE (`rtw89`) do notebook do usuário e a mt7925e do host
   (proibido mexer no Wi-Fi do host). O `rtw89` e o `mt76` têm monitor no mac80211, mas o
   comportamento do firmware (o que ele passa em monitor, `otherbss`, se mede ruído) só aparece
