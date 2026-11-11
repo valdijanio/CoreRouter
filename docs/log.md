@@ -10135,3 +10135,67 @@ continuação indentadas).
   `proto-dhcp` entregando 100.64.1.1, sincronizado em 2,3 s. Antes: nunca (cliente desligado), ou
   64 s depois do lease com o cliente ligado à mão antes do DHCP. Tela em
   `docs/changes/G1.6zh-screenshots/ntp-client-primeiro-boot.png`.
+
+- 2026-11-11 — G1.26i: Um CoreRouter recém-instalado, e a ISO live, roteiam sem configuração: o encaminhamento IPv4 e
+  IPv6 passou a ser o padrão do CoreRouter (`corerouter_model::tuning::DEFAULTS`), aplicado pelo
+  HAL do Linux em todo `apply` (o primeiro é o da partida), como o RouterOS (`/ip settings
+  ip-forward=yes`, `/ipv6 settings forward=yes`). Antes só aplicar um perfil de tuning ligava o
+  `ip_forward`, e a janela System › Tuning de uma instalação nova abria com o achado crítico "o
+  encaminhamento IPv4 está desligado" (visto na ISO live num notebook, 2026-11-11).
+
+  - O 0 do operador vale, por família (`system.tuning.set name=net.ipv4.ip_forward value=0`), com o
+    achado crítico e o botão que religa; `unset` volta ao padrão (1). Achado novo, aviso, para o
+    IPv6 desligado.
+  - O formato da config não mudou: o padrão não é gravado nela. Config antiga carrega igual.
+  - Melhor esforço: kernel sem IPv6 ou `/proc/sys` só de leitura dá um aviso no log, uma vez, e
+    não recusa commit.
+  - IPv6, lido no fonte do kernel 6.18.59 da imagem: ligar o encaminhamento apaga as rotas de RA
+    das interfaces com `accept_ra` diferente de 2 (`addrconf_fixup_forwarding` →
+    `rt6_purge_dflt_routers`) e o kernel deixa de pedir RA. O HAL acerta o `accept_ra` das
+    interfaces que já existem **antes** de ligar, e envia ele mesmo um Router Solicitation
+    (RFC 4861 §4.1, §6.3.7) quando uma porta já no ar passa a aceitar RA, em vez de esperar o RA
+    periódico (até 600 s).
+  - Janela: selo `router default` na coluna Configurado; o Resumo de uma máquina sem nada
+    configurado diz "nada foi configurado ainda, valem os valores do próprio kernel. N parâmetros
+    mudam ao aplicar este perfil" em vez de "N parâmetros diferem deste perfil".
+  - ISO live: roteia como o disco instalado, e aceita `system.tuning.set`, `unset` e
+    `profile.apply` (kernel, em tempo de execução, nada persiste) e `config.safe-mode.*`. Portas,
+    CPU e boot continuam recusados na live.
+  - `cargo xtask os forward-test`: três VMs da imagem (`a ── r ── b`) e a ISO live, no QEMU.
+
+  Como testar:
+
+  - `cargo test -p corerouter-model tuning`, `cargo test -p corerouter-engine --lib tuning`,
+    `cargo test -p corerouter-ui tests::tuning`;
+  - `cargo xtask netns` (`netns_tuning` do hal-linux e `netns_dhcp6` do daemon);
+  - `cargo xtask os build && cargo xtask os forward-test`;
+  - na GUI: System › Tuning, aba Kernel, seção Routing.
+
+  Números (**medido**, 2026-11-11, 32 CPUs):
+
+  - custo por `apply`: duas leituras de `/proc/sys`, 28 µs no host (laço de 100 000 em Python, o
+    teto); nada por pacote;
+  - imagem no QEMU/KVM, kernel 6.18.59 (`cargo xtask os forward-test`, 98,8 s):
+    - `ip_forward` / `ipv6.conf.all.forwarding` na partida, sem config: 1 / 1 (disco instalado e
+      ISO live);
+    - `a → b` por `r`: IPv4 3/3 com `ttl=63`, 0,57 a 1,12 ms; IPv6 3/3, média 1,69 ms; a primeira
+      resposta roteada 5,3 s depois dos endereços (inclui ARP, DAD e os três pings de cada sentido);
+    - com `ip_forward = 0` em `r`: 0/3 no IPv4, IPv6 continua; depois do `unset`, 3/3;
+    - o que o kernel deixa ao ligar: `accept_redirects` (all) 0, `send_redirects` 1, `rp_filter` 0;
+    - o perfil Balanced mudaria 23 parâmetros nessa máquina (eram 24 com o `ip_forward`): 3 de
+      recepção, 4 de roteamento, 5 de conntrack, 6 de vizinhos, 2 de estabilidade e 3 do plano de
+      controle; 10 deles são calculados da RAM e das portas;
+  - build da imagem do zero, com o ccache copiado: 2588,7 s.
+
+  Documentação: `docs/tuning.md`, seção "Encaminhamento ligado por padrão (G1.26i)".
+
+- 2026-11-11 — processo-fold-conta-md: A fila de entrada (`scripts/land.sh`) voltou a consolidar os `docs/changes/` só de tempos em
+  tempos. A conta dos pendentes somava as pastas `<id>-screenshots`, que ficam em `docs/changes/`
+  depois do fold: com 37 pastas (**medido**, `origin/main` em 2026-11-11) a conta nunca ficava
+  abaixo de `FOLD_MIN` (10) e cada lote ganhava um PR de fold só seu (#584, #587 e #589 na mesma
+  noite, cada um com o título "38 arquivos" e um arquivo consolidado). Agora contam só os `.md`
+  que não são o `README.md`: na `origin/main` a conta passa de 37 para 0 (**medido**).
+
+  Como testar: `git ls-tree --name-only origin/main docs/changes/ | grep '\.md$' | grep -vc
+  '/README\.md$'` dá o número de arquivos pendentes; com menos de 10 a fila escreve "fold adiado:
+  N arquivo(s)" no fim do lote, e `scripts/land.sh --fold` consolida na hora.

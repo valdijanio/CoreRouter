@@ -344,3 +344,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-11-11 — G0.3f criado e feito (aviso "Login sem senha" agrupado; "Alterado" só para mudança de config)
 - 2026-11-11 — G1.6ze criado e feito (ISO live sem interfaces criadas pelo kernel; porta ligada depois do boot sem comando recusado no log)
 - 2026-11-11 — G1.6zh criado e feito (relógio certo no primeiro boot: cliente NTP ligado só com os servidores do DHCP)
+- 2026-11-11 — G1.26i criado e feito (encaminhamento IPv4/IPv6 ligado por padrão; a ISO live roteia); G1.26j criado (o daemon seguir um perfil de tuning)
