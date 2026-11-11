@@ -27,6 +27,11 @@ pub struct CommandSpec {
     pub run: Run,
     /// false for queries: no journal entry, no auto-commit.
     pub journal: bool,
+    /// Needs group `write` although it is not journaled (`cmd!(quiet …)`):
+    /// it starts or changes something that is neither configuration nor
+    /// worth a line of the journal — a test, a rescan, the commit mode, a
+    /// chunk of an upload.
+    pub writes: bool,
     /// Terminal: shortcuts usable from any menu (`ping` for
     /// `tool.ping.start`); several are comma-separated (`"traceroute,mtr"`).
     /// A menu named like one of its commands' aliases also runs it
@@ -72,16 +77,27 @@ impl CommandSpec {
 
 /// One line per command:
 /// `cmd!("ip.address.add", "Add Address", ["IP", "Addresses"], None, "{...} → {id}", always, add)`
-/// Prefix with `query` for read-only commands.
+/// Prefix with `query` for read-only commands (group `read`, no journal
+/// entry), or with `quiet` for one that only looks or tests but must not be
+/// open to group `read` (G0.3f: `system.install.test`): group `write`, and
+/// no journal entry either — the journal and the log say what changed and
+/// what was done to the router, not every look at it. Without a prefix the
+/// command is journaled: a configuration change ("Alterado: …" in the log)
+/// or an action on the router ("Executado: …": a reboot, a cache flush).
 macro_rules! cmd {
     (query $id:literal, $label:literal, [$($menu:literal),* $(,)?], $shortcut:expr, $params:literal, $enabled:path, $run:path) => {
         $crate::cmd::CommandSpec { id: $id, label: $label, menu: &[$($menu),*], shortcut: $shortcut,
-            params: $params, enabled: $enabled, run: $run, journal: false,
+            params: $params, enabled: $enabled, run: $run, journal: false, writes: false,
+            alias: None, positional: None, key_alias: &[], task: false }
+    };
+    (quiet $id:literal, $label:literal, [$($menu:literal),* $(,)?], $shortcut:expr, $params:literal, $enabled:path, $run:path) => {
+        $crate::cmd::CommandSpec { id: $id, label: $label, menu: &[$($menu),*], shortcut: $shortcut,
+            params: $params, enabled: $enabled, run: $run, journal: false, writes: true,
             alias: None, positional: None, key_alias: &[], task: false }
     };
     ($id:literal, $label:literal, [$($menu:literal),* $(,)?], $shortcut:expr, $params:literal, $enabled:path, $run:path) => {
         $crate::cmd::CommandSpec { id: $id, label: $label, menu: &[$($menu),*], shortcut: $shortcut,
-            params: $params, enabled: $enabled, run: $run, journal: true,
+            params: $params, enabled: $enabled, run: $run, journal: true, writes: true,
             alias: None, positional: None, key_alias: &[], task: false }
     };
 }
@@ -205,8 +221,8 @@ pub fn describe(session: &Session) -> Value {
         all()
             .map(|c| {
                 let enabled = session
-                    .permit(crate::auth::required_group(c.id, c.journal))
-                    .and_then(|()| crate::live::permit(session, c.id, c.journal))
+                    .permit(crate::auth::required_group(c))
+                    .and_then(|()| crate::live::permit(session, c))
                     .and_then(|()| (c.enabled)(session));
                 json!({
                     "id": c.id,

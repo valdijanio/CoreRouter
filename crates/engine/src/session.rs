@@ -327,13 +327,13 @@ impl Session {
     ) -> Result<Value> {
         self.expire_safe_mode();
         let spec = spec.ok_or_else(|| unknown_command(id))?;
-        self.permit(auth::required_group(spec.id, spec.journal))
+        self.permit(auth::required_group(spec))
             .map_err(|reason| EngineError::Denied {
                 id: id.to_owned(),
                 reason,
             })?;
         check_params(spec, params)?;
-        crate::live::permit(self, spec.id, spec.journal)
+        crate::live::permit(self, spec)
             .and_then(|()| (spec.enabled)(self))
             .map_err(|reason| EngineError::Disabled {
                 id: id.to_owned(),
@@ -349,6 +349,7 @@ impl Session {
         let in_atomic = self.ext::<AtomicBatch>().is_some_and(|a| a.0);
         let snapshot = (spec.journal && !in_atomic).then(|| self.store.candidate().clone());
         let rev_before = self.store.current_revision();
+        let generation = self.store.generation();
         // The commit runs inside the guard too: a panic in a validator or
         // the data plane must not leave the edit behind for the next
         // command to commit (audit #6).
@@ -359,6 +360,10 @@ impl Session {
             }
             Ok(value)
         });
+        // G0.3f: whether it wrote to the configuration (asked before a
+        // failed command is rolled back, which is a write too): the log
+        // says "Alterado" only for a change.
+        let wrote = self.store.generation() != generation;
         if let (Err(_), Some(snapshot)) = (&result, snapshot) {
             self.store.set_candidate(snapshot);
         }
@@ -367,7 +372,8 @@ impl Session {
         }
         if spec.journal {
             let rev = self.store.current_revision();
-            self.record(id, params, &result, (rev != rev_before).then_some(rev));
+            let revision = (rev != rev_before).then_some(rev);
+            self.record(id, params, &result, revision, wrote || revision.is_some());
         }
         result
     }
@@ -789,11 +795,19 @@ impl Session {
             .as_ref()
             .map(|rev| json!({ "revision": rev }))
             .map_err(Clone::clone);
-        self.record(id, &json!({ "automatic": reason }), &result, revision);
+        self.record(id, &json!({ "automatic": reason }), &result, revision, true);
     }
 
-    /// Journal a command and log it (G4.6d); `revision`: the one it created.
-    fn record(&mut self, id: &str, params: &Value, result: &Result<Value>, revision: Option<u32>) {
+    /// Journal a command and log it (G4.6d); `revision`: the one it created;
+    /// `changed`: it wrote to the configuration.
+    fn record(
+        &mut self,
+        id: &str,
+        params: &Value,
+        result: &Result<Value>,
+        revision: Option<u32>,
+        changed: bool,
+    ) {
         self.seq = self.seq.saturating_add(1);
         // Passwords and tokens never reach the journal nor the log (G0.3).
         let params = auth::mask_params(id, params);
@@ -816,7 +830,7 @@ impl Session {
             let excess = self.journal.len().saturating_sub(MAX_JOURNAL);
             self.journal.drain(..excess);
         }
-        self.log_journal(self.seq, id, &params, result, revision);
+        self.log_journal(self.seq, id, &params, result, revision, changed);
     }
 
     /// Command registry with enabled state, for `list_commands` and menus.

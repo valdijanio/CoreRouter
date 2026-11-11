@@ -40,7 +40,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "config.diff", "Pending Changes", ["System", "Configuration"], None,
         "{} → [{op: add|remove|change, path, value | from, to}]",
         always, diff),
-    cmd!(query "config.mode.set", "Commit Mode", ["System", "Configuration"], None,
+    cmd!(quiet "config.mode.set", "Commit Mode", ["System", "Configuration"], None,
         "{mode: immediate|transactional} → {mode}",
         always, mode_set),
     cmd!(
