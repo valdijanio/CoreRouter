@@ -263,9 +263,10 @@ meio, o rádio volta a como estava; o país fica (é um fato sobre onde o rotead
 das redes passa por `style::ascii` antes de ir para a tela: qualquer um no alcance escolhe um
 SSID.
 
-`cargo xtask os wifi-test --only setup` responde ao assistente numa segunda serial da VM, como
+`cargo xtask os wifi-test --only setup` responde ao assistente num segundo console da VM, como
 uma pessoa: país inválido, senha curta, senha errada (nada fica aplicado), depois a certa e um
-endereço fixo.
+endereço fixo. O segundo console é virtio (`hvc0`) e não uma segunda serial: o kernel aceita um
+console por tipo de dispositivo, e a serial fica com o shell de manutenção do teste.
 
 ## Pesquisa
 

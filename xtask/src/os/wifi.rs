@@ -20,7 +20,7 @@
 //!   domain, no line about `regulatory.db`).
 //!
 //! - a second boot (`--only setup` runs it alone) answers the first-boot
-//!   setup on the console as a person would, on a second serial port: the
+//!   setup on the console as a person would, on a second console: the
 //!   radio as the management port, the country, the network out of the
 //!   scan, a passphrase that is wrong first, a fixed address;
 //!
@@ -95,8 +95,8 @@ fn tools_disk(images: &Path, work: &Path) -> Result<std::path::PathBuf, String> 
     Ok(img)
 }
 
-/// The first-boot setup's console: the VM's second serial port (`ttyS1`),
-/// a UNIX socket here. The first one keeps the maintenance shell.
+/// The first-boot setup's console: a virtio console of the VM (`hvc0`), a
+/// UNIX socket here. The serial port keeps the maintenance shell.
 struct Tty {
     stream: UnixStream,
     /// Everything the console wrote, as it came (colours included).
@@ -192,8 +192,8 @@ fn boot(
     boot_with(work, images, tools, kvm, log, None)
 }
 
-/// [`boot`]; with `setup`, a second serial port on that socket, where the
-/// first-boot setup runs (the first one is the maintenance shell's).
+/// [`boot`]; with `setup`, a second console on that socket, where the
+/// first-boot setup runs (the serial one is the maintenance shell's).
 fn boot_with(
     work: &Path,
     images: &Path,
@@ -231,10 +231,18 @@ fn boot_with(
         String::from("corerouter.shell=ttyS0 corerouter.hwsim=2 corerouter.unmanaged=wifi1");
     if let Some(sock) = setup {
         let _ = std::fs::remove_file(sock);
-        cmd.arg("-serial")
-            .arg(format!("unix:{},server=on,wait=off", sock.display()));
+        // A virtio console (`hvc0`), not a second serial port: the kernel
+        // takes one console per kind of device, and the serial one is the
+        // maintenance shell's (`/sys/class/tty/console/active` said
+        // `tty0 ttyS0` with `console=ttyS1` given).
+        cmd.args(["-device", "virtio-serial-pci"]);
+        cmd.arg("-chardev").arg(format!(
+            "socket,id=setup,path={},server=on,wait=off",
+            sock.display()
+        ));
+        cmd.args(["-device", "virtconsole,chardev=setup"]);
         // The last `console=` is /dev/console: the shell's stays there.
-        append.push_str(" console=ttyS1,115200 console=ttyS0,115200");
+        append.push_str(" console=hvc0 console=ttyS0,115200");
     }
     cmd.arg("-append").arg(append);
     start(log, if setup.is_some() { "setup" } else { "r" }, cmd)
@@ -758,7 +766,13 @@ pub fn wifi_test(root: &Path, images: &Path, args: &[String]) -> Result<(), Stri
             let m = vm
                 .run(&mut log, "interface.wifi.monitor", r#"{"name":"wifi2"}"#)
                 .unwrap_or_default();
-            eprintln!("   MONITOR {m}");
+            let diag = sh(
+                &mut vm,
+                &mut log,
+                "{ cat /sys/class/tty/console/active; for p in /proc/[0-9]*; do tr '\\0' ' ' < $p/cmdline 2>/dev/null | grep -a 'init setup'; done; echo .; }",
+            )
+            .unwrap_or_default();
+            eprintln!("   MONITOR {m}\n   CONSOLES {diag}");
             return Err(e);
         }
         vm.poweroff(&mut log)?;
