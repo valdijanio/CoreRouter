@@ -135,7 +135,7 @@ fn a_radio_is_there_like_a_port_and_joins_a_network() {
     let seen = run(&mut s, "interface.wifi.networks", json!({"name": "wifi1"}));
     let nets = seen["networks"].as_array().unwrap();
     assert_eq!(seen["scanning"], false);
-    assert_eq!(nets.len(), 7, "{seen}");
+    assert_eq!(nets.len(), 11, "{seen}");
     assert_eq!(nets[0]["ssid"], "CoreRouter-Lab");
     assert_eq!(
         (nets[0]["band"].as_str(), nets[0]["channel"].as_u64()),

@@ -318,6 +318,66 @@ uma pessoa: país inválido, senha curta, senha errada (nada fica aplicado), dep
 endereço fixo. O segundo console é virtio (`hvc0`) e não uma segunda serial: o kernel aceita um
 console por tipo de dispositivo, e a serial fica com o shell de manutenção do teste.
 
+### Aba Networks: lista, canais e espectro (G1.30i)
+
+Três visões do que o rádio ouviu, escolhidas na segunda linha da aba (`crates/ui/src/wifi_scan.rs`).
+O motor calcula tudo (`crates/engine/src/wifi_air.rs`, `wifi_spectrum.rs`,
+`cmd/wifi_scan.rs`); a GUI só desenha, com o painter do egui.
+
+- **Lista** (`interface.wifi.networks`): canal com selo de largura (20 a 320 MHz) e geração
+  (Wi-Fi 4 a 7), carga do BSS Load (clientes e % de ocupação, âmbar de 30%, vermelho de 60%) e
+  a coluna **Air**: `same channel ×N`, `overlaps ch …` e `shares airtime ×N`. A rede em uso tem
+  o selo verde `yours`. Filtro por banda em selos com contagem (`All`, `2.4 GHz`, `5 GHz`,
+  `6 GHz`), `Group by channel` (um cabeçalho por canal primário) e, embaixo, o canal menos
+  ocupado de cada banda (com o selo `DFS` quando é um).
+- **Canais** (`interface.wifi.frequency-scan`): por banda, cada rede é uma curva da largura do
+  canal, da altura do sinal (como o Channel Analysis do LuCI). Embaixo, uma barra por canal
+  com a ocupação medida pelo driver (`NL80211_CMD_GET_SURVEY`), e um traço onde ele não mediu.
+  O selo do título diz se a medida é completa, parcial (só o canal em uso: mt7925e, **medido**)
+  ou não existe.
+- **Espectro** (`interface.wifi.spectral-scan`, `spectral-data`): como o airView. Mostra a
+  cascata (último minuto, quatro linhas por segundo, do piso de ruído até 50 dB acima), os
+  traços de tempo real, média e pico, e o uso de cada canal de 20 MHz (a parte das amostras em
+  que a energia acima do ruído passou de −82 dBm). Também lista as fontes: `Wi-Fi`, `carrier`
+  (cw), `microwave oven` (mwo), `Bluetooth`/`hopper` (fhss) e `unknown`, classificadas pela
+  forma. A faixa é o canal em uso, a banda de 2,4 GHz ou a de 5 GHz; a banda é varrida com um
+  scan a cada 4 s, e a tela avisa que o enlace para durante cada um. Só existe em rádio com
+  spectral scan (Qualcomm Atheros: ath9k, ath10k, ath11k, por debugfs). Nos outros o botão fica
+  desligado, e a dica diz o motivo, por exemplo "this radio (rtw89_8852be) has no spectral
+  scan: it needs a Qualcomm Atheros chip".
+
+**Sobreposição e disputa** (`wifi_air.rs`):
+
+- Cada rede ocupa `centro ± largura/2`, lidos dos elementos do beacon: HT, VHT, HE com a
+  informação de 6 GHz e EHT (IEEE 802.11-2020 §9.4.2.56, §9.4.2.158, §9.4.2.249; IEEE
+  802.11be-2024 §9.4.2.311). Em 2,4 GHz, 1 MHz a mais de cada lado (a máscara DSSS), então
+  canais a menos de 5 de distância se sobrepõem.
+- Outra rede divide o ar desta nos dois casos da CCA (IEEE 802.11-2020 §17.3.10.6, §19.3.19.5,
+  §21.3.18.5):
+  - o primário desta cai num dos 20 MHz do canal dela e ela chega a −82 dBm ou mais (preâmbulo);
+  - os canais só se sobrepõem e ela chega a −62 dBm ou mais (energia).
+- O nível é o que este rádio ouve, uma estimativa do que o ponto de acesso ao lado ouve.
+
+**Como o scan chega** (`hal-linux`):
+
+- O `BSS <n>` passou a pedir só os campos usados (`MASK=0x1c86`).
+- Antes, a máscara padrão trazia também os elementos do beacon. Uma resposta acima de 4096 bytes
+  (`ctrl_iface.c`, `reply_size`) volta vazia, e isso parecia o fim da lista: um ponto de acesso
+  com muitos elementos cortava a varredura. Agora, se a resposta vem vazia, a mesma entrada é
+  pedida de novo sem os elementos.
+- O survey é lido junto com o resultado de cada scan.
+
+**O spectral scan no Linux:**
+
+- O spectral scan roda numa thread `wifi-spectral-<rádio>`. Ela escreve `background` (ou
+  `chanscan` no ath9k, ao varrer uma banda) e `trigger` em `spectral_scan_ctl`, e lê os
+  arquivos relay `spectral_scan<cpu>`.
+- As amostras vão para uma fila de até 4096, e a mais velha sai primeiro. O formato é o de
+  `drivers/net/wireless/ath/spectral_common.h` (HT20, HT20/40, ath10k, ath11k).
+- A potência por bin segue a conta do FFT_eval:
+  `ruído + rssi + 20·log10(bin << max_exp) − 10·log10(Σ bin²)`.
+- O laboratório gera o espectro no formato do ath10k e o lê pelo mesmo parser.
+
 ## Pesquisa
 
 Feita antes do código (2026-11-11). Os arquivos completos, com todos os links e a marca
@@ -407,6 +467,59 @@ de controle do roteador. Rever se aparecer um supplicant Rust maduro.
 
 O que a escolha traz: OpenSSL entra na imagem pela primeira vez (o SAE do `wpa_supplicant` só
 existe com OpenSSL ou wolfSSL) e um processo C a mais, supervisionado pelo PID 1.
+
+### Visões do scan (G1.30i)
+
+- **MikroTik** (<https://help.mikrotik.com/docs/spaces/ROS/pages/224559120/WiFi>):
+  - `/interface/wifi/frequency-scan` (`duration`, `frequency`, `rounds`, `save-file`) dá por
+    canal `networks`, `load`, `nf`, `max-signal` e `min-signal`, com as flags P e S. Avisa que
+    derruba os clientes do AP.
+  - `/interface/wifi/spectral-scan` só existe no `wifi-qcom`, a partir da 7.16. Os parâmetros
+    são `range`, `duration`, `peak-hold-duration` e `show-interference`, e as classes são MWO,
+    CW, WIFI, CORDLESS24/5, BLUETOOTH e FHSS.
+  - O legado `/interface wireless spectral-scan` e o `spectral-history`
+    (<https://help.mikrotik.com/docs/spaces/ROS/pages/139526162/Spectral+scan>) são Atheros
+    802.11n. Eles tiram janelas de 20 MHz em passos de 10 MHz, com `range` 2.4ghz, 5ghz ou
+    current-channel. Não funcionam em QCA98xx nem IPQ-4018.
+  - Adotamos os nomes `frequency-scan` e `spectral-scan`, as colunas do frequency-scan e as
+    classes do spectral-scan.
+- **Ubiquiti airView** (<https://dl.ui.com/datasheets/airmax/UBNT_DS_airView.pdf>;
+  <https://help.uisp.com/hc/en-us/articles/22590893851927-airMAX-Guide-to-Channel-Scanning-with-airView>):
+  - Mostra a cascata (cores frias a quentes, do piso de ruído ao máximo), a waveform, o tempo
+    real com Max Hold, Average e Real-time, e o "Channel Usage".
+  - No airMAX M avisa para não rodar com estações conectadas, porque o enlace pode cair. No
+    airMAX AC usa um rádio dedicado.
+  - Adotamos a cascata, os três traços e o uso por canal. O UniFi (Environment, Channel AI)
+    sugere canal, e adotamos a sugestão do canal menos ocupado.
+- **OpenWrt LuCI Channel Analysis** (`channel_analysis.js`):
+  - Desenha um trapézio por rede, largura do canal por altura do sinal, e lê HT, VHT (CCFS1 a 8
+    de distância = 160 MHz), HE e EHT.
+  - No fórum, o scan derruba clientes
+    (<https://forum.openwrt.org/t/feedback-request-new-channel-analysis-feature-in-webui/79564/61>).
+    Por isso o aviso nos ⓘ e na varredura de banda.
+- **Normas:**
+  - CCA: −82 dBm de preâmbulo no primário de 20 MHz e −62 dBm de energia, nas cláusulas OFDM, HT
+    e VHT de IEEE 802.11-2020 (§17.3.10.6, §19.3.19.5, §21.3.18.5). O HE fica no 802.11ax-2021,
+    cláusula 27; a subcláusula exata não foi conferida.
+  - Elementos: §9.4.2.26 do BSS Load (numeração do 802.11-2024, a do kernel), §9.4.2.56,
+    §9.4.2.158 com a regra CCFS1 do 160/80+80, §9.4.2.249 com a informação de 6 GHz.
+  - O CCA de canal secundário (−72 dBm) não foi conferido no texto da norma e ficou de fora: o
+    secundário entra pela regra de energia.
+- **Fonte:**
+  - Linux 6.18.59: `spectral_common.h`, `ath9k/common-spectral.c`, `ath10k/spectral.c` e
+    `ath11k/spectral.c`, com os comandos do `spectral_scan_ctl` e `relay_open("spectral_scan",
+    …)`, um arquivo por CPU.
+  - Os números de `nl80211.h` foram conferidos compilando o cabeçalho: `GET_SURVEY` = 50,
+    `ATTR_SURVEY_INFO` = 84.
+  - wpa_supplicant 2.12: `print_bss_info` e `reply_size = 4096`.
+  - Uma placa real: um AP Wi-Fi 7 de 160 MHz lido do host com nl80211 (VHT CCFS0 106, CCFS1
+    114). Virou teste, com o nome trocado e sem os elementos com MAC.
+- **Melhorias sobre os outros:**
+  - a disputa pela regra da CCA, não só "mesmo canal";
+  - o motivo de cada coisa no ⓘ;
+  - o survey parcial dito como parcial, em vez de 0%;
+  - o espectro em comandos que o MCP e a CLI também leem;
+  - a varredura de banda com aviso.
 
 ### O que ficou de fora e por quê
 

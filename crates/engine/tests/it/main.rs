@@ -77,4 +77,5 @@ mod tool_params;
 mod unmanaged;
 mod users;
 mod wifi;
+mod wifi_scan;
 mod xdp;

@@ -108,7 +108,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{name: string} → {name, scanning} (the networks: interface.wifi.networks, a few seconds later)",
         has_radios, scan),
     cmd!(query "interface.wifi.networks", "Wi-Fi Networks", [], None,
-        "{name: string} → {name, scanning, age_secs, error, networks: [{ssid (empty: hidden), bssid, signal, frequency, band, channel, security (open | owe | legacy | wpa2 | wpa2-wpa3 | wpa3 | enterprise), joinable, why_not, connected}]}",
+        "{name: string} → {name, scanning, age_secs, error, networks: [{ssid (empty: hidden), bssid, signal, frequency, band, channel, security (open | owe | legacy | wpa2 | wpa2-wpa3 | wpa3 | enterprise), joinable, why_not, connected, width, center_frequency, center_frequency2, low, high, generation, stations, utilization (%), same_channel, overlaps: [int], contenders: [bssid], contention (same-channel | covered | overlap)}], suggested: [{band, channel, frequency, networks, score (%), dfs}]}",
         has_radios, networks),
     cmd!(query "interface.wifi.history", "Wi-Fi History", [], None,
         "{name?: string, limit?: int (newest first, default 100)} → [{seq, time, name, event (joining | connected | disconnected | failed | blocked | unblocked | error), message}]",
@@ -125,7 +125,7 @@ fn radios(cfg: &Config) -> impl Iterator<Item = (&IfName, &Interface, &WifiStati
     })
 }
 
-fn has_radios(s: &Session) -> std::result::Result<(), String> {
+pub(super) fn has_radios(s: &Session) -> std::result::Result<(), String> {
     if radios(s.store().candidate()).next().is_none() {
         Err("this router has no Wi-Fi radio".into())
     } else {
@@ -133,7 +133,7 @@ fn has_radios(s: &Session) -> std::result::Result<(), String> {
     }
 }
 
-fn radio_of<'a>(cfg: &'a Config, name: &IfName) -> Result<(&'a Interface, &'a WifiStation)> {
+pub(super) fn radio_of<'a>(cfg: &'a Config, name: &IfName) -> Result<(&'a Interface, &'a WifiStation)> {
     match cfg.interfaces.get(name) {
         Some(i) => match &i.kind {
             InterfaceKind::Wifi(st) => Ok((i, st)),
@@ -481,7 +481,7 @@ fn state_of(s: &Session, cfg: &Config, name: &IfName, iface: &Interface, present
     }
 }
 
-fn band_of(mhz: Option<u32>) -> Option<&'static str> {
+pub(super) fn band_of(mhz: Option<u32>) -> Option<&'static str> {
     mhz.and_then(WifiBand::of_mhz).map(WifiBand::as_str)
 }
 
@@ -783,7 +783,7 @@ fn radio(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// Why radio `name` cannot scan now, if it cannot.
-fn not_running(cfg: &Config, name: &IfName) -> Result<()> {
+pub(super) fn not_running(cfg: &Config, name: &IfName) -> Result<()> {
     let (iface, _) = radio_of(cfg, name)?;
     if cfg.system.wifi.country.is_none() {
         return Err(EngineError::bad(
@@ -813,7 +813,7 @@ fn scan(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// Can the router join a network secured like this, and why not.
-fn joinable(sec: BssSecurity) -> Option<&'static str> {
+pub(super) fn joinable(sec: BssSecurity) -> Option<&'static str> {
     match sec {
         BssSecurity::Open | BssSecurity::Wpa2 | BssSecurity::Wpa2Wpa3 | BssSecurity::Wpa3 => None,
         BssSecurity::Owe => Some("opportunistic encryption (OWE) is not supported yet"),
@@ -840,41 +840,8 @@ fn unjoinable(s: &Session, name: &IfName, ssid: &str) -> Option<&'static str> {
 }
 
 fn networks(s: &mut Session, p: &Value) -> Result<Value> {
-    let name: IfName = req_parse(p, "name")?;
-    radio_of(s.store().candidate(), &name)?;
-    let unix = s.now();
-    let Some(r) = s.wifi().and_then(|rt| rt.radios.get(&name)) else {
-        return Ok(json!({
-            "name": name, "scanning": false, "age_secs": null, "error": null, "networks": [],
-        }));
-    };
-    let on = r.status.bssid.as_deref().filter(|_| r.status.state == WifiState::Connected);
-    let rows: Vec<Value> = r
-        .scan
-        .iter()
-        .map(|b| {
-            let why = joinable(b.security);
-            json!({
-                "ssid": b.ssid,
-                "bssid": b.bssid,
-                "signal": b.signal_dbm,
-                "frequency": b.frequency_mhz,
-                "band": band_of(Some(b.frequency_mhz)),
-                "channel": channel(b.frequency_mhz),
-                "security": b.security.as_str(),
-                "joinable": why.is_none(),
-                "why_not": why,
-                "connected": on.is_some_and(|x| x.eq_ignore_ascii_case(&b.bssid)),
-            })
-        })
-        .collect();
-    Ok(json!({
-        "name": name,
-        "scanning": r.scan_started_ms.is_some(),
-        "age_secs": r.scanned_at.zip(unix).map(|(at, now)| now.saturating_sub(at)),
-        "error": r.scan_error,
-        "networks": rows,
-    }))
+    // G1.30i: with the air of each network (cmd/wifi_scan.rs).
+    super::wifi_scan::networks(s, p)
 }
 
 fn history(s: &mut Session, p: &Value) -> Result<Value> {

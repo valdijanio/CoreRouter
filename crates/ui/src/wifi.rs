@@ -8,7 +8,8 @@
 //!   radio's `monitor`. No + nor −: a radio is there because the card is,
 //!   like an Ethernet port.
 //! - **Networks:** what the last scan of one radio heard, strongest first;
-//!   Connect… opens the radio's modal with the network filled in.
+//!   Connect… opens the radio's modal with the network filled in. G1.30i:
+//!   three views of it (list, channel graph, spectrum), `wifi_scan.rs`.
 //!
 //! The country every radio follows is on the first line, with its dialog.
 //! The modal is fed by `interface.wifi.preview` (the checks and warnings of
@@ -50,7 +51,8 @@ pub(crate) const PANEL: Panel = Panel {
         id: WIN,
         group: "Interfaces",
         title: "Wi-Fi",
-        size: [1040.0, 640.0],
+        // G1.30i: room for the Networks tab's columns and graphs.
+        size: [1240.0, 700.0],
         escape: true,
     }],
     new: || Box::new(WifiPanel::default()),
@@ -89,15 +91,6 @@ const COLUMNS: [table::Column; 9] = [
     col("Rate").help("interface.wifi.rate"),
     col("Radio").help("interface.wifi.radio"),
     comment(),
-];
-
-const HEARD_COLUMNS: [table::Column; 6] = [
-    col("SSID").help("interface.wifi.ssid"),
-    col("Signal").help("interface.wifi.signal"),
-    col("Channel").help("interface.wifi.channel"),
-    col("Security").help("interface.wifi.networks.security"),
-    col("BSSID").help("interface.wifi.bssid"),
-    col("Note").help("interface.wifi.networks"),
 ];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -144,6 +137,8 @@ pub(crate) struct WifiPanel {
     pub(crate) country_dialog: Option<CountryDialog>,
     pub(crate) table: TableState,
     pub(crate) heard_table: TableState,
+    /// G1.30i: the views of the Networks tab.
+    pub(crate) scan: crate::wifi_scan::ScanView,
     help: Option<HelpView>,
 }
 
@@ -203,19 +198,6 @@ fn security_label(code: &str) -> &'static str {
         "wpa2" => "WPA2",
         "open" => "open",
         _ => "",
-    }
-}
-
-/// What a network heard offers.
-fn heard_security(code: &str) -> (&'static str, Kind) {
-    match code {
-        "wpa3" => ("WPA3", Kind::Green),
-        "wpa2-wpa3" => ("WPA2/WPA3", Kind::Green),
-        "wpa2" => ("WPA2", Kind::Neutral),
-        "open" => ("open", Kind::Amber),
-        "owe" => ("OWE", Kind::Neutral),
-        "enterprise" => ("802.1X", Kind::Neutral),
-        _ => ("WEP/WPA", Kind::Red),
     }
 }
 
@@ -305,31 +287,6 @@ pub(crate) fn row(r: &Value, l: Lang) -> Row {
             s(r, "comment"),
         ],
         dimmed: flag(r, "disabled"),
-        section: false,
-        tint: None,
-    }
-}
-
-/// The row of a network the scan heard; its key is the access point.
-pub(crate) fn heard_row(n: &Value, l: Lang) -> Row {
-    let (sec, kind) = heard_security(&s(n, "security"));
-    let mut note = s(n, "why_not");
-    let mut chips = Vec::new();
-    if flag(n, "connected") {
-        chips.push((tr_in(SCOPE, l, "connected"), Kind::Green));
-        note.clear();
-    }
-    Row {
-        key: s(n, "bssid"),
-        cells: vec![
-            ssid_cell(&s(n, "ssid"), l),
-            signal_cell(n),
-            channel_text(n),
-            cell("", &[(tr_in(SCOPE, l, sec), kind)]),
-            s(n, "bssid"),
-            cell(&note, &chips),
-        ],
-        dimmed: !flag(n, "joinable"),
         section: false,
         tint: None,
     }
@@ -707,9 +664,11 @@ impl WifiPanel {
         if !names.contains(&self.radio) {
             self.radio = names.first().cloned().unwrap_or_default();
             self.heard = None;
+            self.scan.clear();
         }
-        let nets = self.networks().to_vec();
-        let rows: Vec<Row> = nets.iter().map(|n| heard_row(n, l)).collect();
+        let all = self.networks().to_vec();
+        let nets = self.scan.filter(&all);
+        let rows: Vec<Row> = crate::wifi_scan::rows(&nets, self.scan.group, l);
         let selection = self.heard_table.selection(&rows);
         let can = app.can();
         let on = self.radio_row(&self.radio).is_some_and(|r| !flag(r, "disabled"));
@@ -773,11 +732,29 @@ impl WifiPanel {
                 },
                 None => {}
             }
-            table::find_field(ui, HEARD, &mut self.heard_table);
+            if self.scan.mode == crate::wifi_scan::Mode::List {
+                table::find_field(ui, HEARD, &mut self.heard_table);
+            }
         });
+        self.scan.controls(ui, l, &all, &mut self.help);
         ui.separator();
-        let footer_h = ui.spacing().interact_size.y * 3.0;
-        let out = table::show(ui, HEARD, footer_h, &mut self.heard_table, &HEARD_COLUMNS, &rows, |ui, menu| {
+        match self.scan.mode {
+            crate::wifi_scan::Mode::List => {}
+            crate::wifi_scan::Mode::Channels => {
+                self.scan.channels(ui, l, &nets, &mut self.help);
+                self.after_networks(app, picked_radio, rescan, None, &all);
+                return;
+            }
+            crate::wifi_scan::Mode::Spectrum => {
+                let radio = self.radio.clone();
+                self.scan.spectrum(app, ui, l, &radio, &mut self.help);
+                self.after_networks(app, picked_radio, rescan, None, &all);
+                return;
+            }
+        }
+        let footer_h = ui.spacing().interact_size.y * 4.2;
+        let columns = &crate::wifi_scan::COLUMNS;
+        let out = table::show(ui, HEARD, footer_h, &mut self.heard_table, columns, &rows, |ui, menu| {
             if let Menu::Rows(sel) = menu {
                 if let [one] = sel.as_slice()
                     && ui.button(tr_in(SCOPE, l, "Connect…")).clicked()
@@ -791,8 +768,8 @@ impl WifiPanel {
             }
         });
         if let Some(key) = out.help {
-            let title = HEARD_COLUMNS.iter().find(|c| c.help == key).map_or("", |c| c.title);
-            self.help = Some(HelpView::new(key, tr_in(SCOPE, l, title)));
+            let title = columns.iter().find(|c| c.help == key).map_or("", |c| c.title);
+            self.help = Some(HelpView::new(key, tr_in("wifi_scan", l, title)));
         }
         if let Some(k) = out.opened {
             connect = Some(k);
@@ -808,9 +785,25 @@ impl WifiPanel {
             ],
             l,
         );
+        let heard = self.heard.clone();
+        self.scan.suggestion(ui, l, heard.as_ref(), &mut self.help);
+        self.after_networks(app, picked_radio, rescan, connect, &all);
+    }
+
+    /// What the Networks tab's bar asked for: another radio, a scan, a
+    /// network to join.
+    fn after_networks(
+        &mut self,
+        app: &mut CoreRouterUi,
+        picked_radio: Option<String>,
+        rescan: bool,
+        connect: Option<String>,
+        nets: &[Value],
+    ) {
         if let Some(n) = picked_radio {
             self.radio = n;
             self.heard = None;
+            self.scan.clear();
         }
         if rescan {
             app.run("interface.wifi.scan", json!({ "name": self.radio }));
@@ -919,6 +912,7 @@ impl PanelState for WifiPanel {
                         params: json!({ "name": self.radio }),
                     });
                 }
+                out.extend(self.scan.queries(&self.radio, app));
             }
         }
         out
@@ -940,7 +934,9 @@ impl PanelState for WifiPanel {
                     m.arrived(value);
                 }
             }
-            _ => {}
+            other => {
+                self.scan.arrived(other, value);
+            }
         }
     }
 
@@ -1007,7 +1003,7 @@ impl PanelState for WifiPanel {
 pub(crate) fn help_keys() -> Vec<&'static str> {
     COLUMNS
         .iter()
-        .chain(&HEARD_COLUMNS)
+        .chain(&crate::wifi_scan::COLUMNS)
         .map(|c| c.help)
         .chain(FIELDS.iter().map(|f| f.help))
         .filter(|k| !k.is_empty())
@@ -1022,7 +1018,6 @@ pub(crate) fn labels() -> Vec<&'static str> {
     let failures = ["wrong-key", "not-found", "rejected", "no-answer", "other"];
     COLUMNS
         .iter()
-        .chain(&HEARD_COLUMNS)
         .map(|c| c.title)
         .chain(FIELDS.iter().map(|f| f.label))
         .chain(states.into_iter().map(state_label))

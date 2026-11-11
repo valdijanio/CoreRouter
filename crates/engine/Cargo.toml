@@ -161,5 +161,9 @@ harness = false
 name = "ipv6_nd"
 harness = false
 
+[[bench]]
+name = "wifi_spectrum"
+harness = false
+
 [lints]
 workspace = true
