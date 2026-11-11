@@ -1,13 +1,13 @@
-//! G1.6j: the NIC firmware of the image (`docs/os-image.md`, "Firmware das
-//! placas"). `os/package/corerouter-firmware/firmware.lock` pins a tag of
+//! G1.6j: the firmware of the image's drivers (`docs/os-image.md`, "Firmware
+//! das placas"): the network cards' and, since G1.6zd, the screen's (`i915`). `os/package/corerouter-firmware/firmware.lock` pins a tag of
 //! `linux-firmware` and the SHA-256 of each file; the build downloads only
 //! those files (the whole tarball is over 600 MB for what is a few MB here)
 //! into `os/dl/`, checks them and stages them, with their licenses, for the
 //! package to install.
 //!
 //! `cargo xtask os firmware-lock --tag T` writes the lock from what the
-//! built kernel's network drivers declare (`firmware=` in their modinfo, the
-//! way VyOS picks its set) and from `WHENCE`: a file whose entry states no
+//! built kernel's drivers of [`DRIVERS`] declare (`firmware=` in their modinfo,
+//! the way VyOS picks its set) and from `WHENCE`: a file whose entry states no
 //! permission to redistribute does not enter, it is listed as `skip`.
 //! After each build, [`verify`] fails if a driver declares a file that is
 //! neither in the image nor in a `skip` line.
@@ -20,6 +20,9 @@ use crate::vm_lab::{download, sha256_file};
 
 pub(super) const LOCK: &str = "package/corerouter-firmware/firmware.lock";
 const REPO: &str = "https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git";
+/// The drivers whose firmware the image carries, by their directory in
+/// `lib/modules`: the ports' and the screen's.
+const DRIVERS: [&str; 2] = ["kernel/drivers/net/", "kernel/drivers/gpu/drm/"];
 /// Where the licenses go in the image.
 const LICENSE_DIR: &str = "usr/share/licenses/firmware";
 /// Files downloaded at the same time (kernel.org answers small files fast;
@@ -150,6 +153,11 @@ pub(super) fn check(os: &Path) -> Result<usize, String> {
         && !l.files.iter().any(|f| f.path == "intel/ice/ddp/ice.pkg")
     {
         return Err("firmware.lock: intel/ice/ddp/ice.pkg is required".into());
+    }
+    // G1.6zd: without its GuC a 12th-gen-or-later Intel GPU fails to start
+    // ("declaring it wedged") and says so on the console at every boot.
+    if !l.files.iter().any(|f| f.path.starts_with("i915/")) {
+        return Err("firmware.lock: the i915 firmware (i915/...) is required".into());
     }
     Ok(l.files.len() + l.links.len() + l.meta.len())
 }
@@ -447,11 +455,11 @@ fn declared_in_ko(bytes: &[u8]) -> Vec<String> {
 }
 
 /// `<module>.firmware=<file>` lines of `modules.builtin.modinfo`, only for
-/// the modules `modules.builtin` lists under `kernel/drivers/net/`.
+/// the modules `modules.builtin` lists under [`DRIVERS`].
 fn declared_builtin(builtin: &str, modinfo: &[u8]) -> Vec<String> {
-    let net: BTreeSet<String> = builtin
+    let ours: BTreeSet<String> = builtin
         .lines()
-        .filter(|l| l.starts_with("kernel/drivers/net/"))
+        .filter(|l| DRIVERS.iter().any(|d| l.starts_with(d)))
         .filter_map(|l| l.rsplit('/').next())
         .filter_map(|f| f.split(".ko").next())
         .map(|n| n.replace('-', "_"))
@@ -462,7 +470,7 @@ fn declared_builtin(builtin: &str, modinfo: &[u8]) -> Vec<String> {
             continue;
         };
         if let Some((module, file)) = rec.split_once(".firmware=")
-            && net.contains(module)
+            && ours.contains(module)
             && safe_path(file)
         {
             out.push(file.to_owned());
@@ -485,8 +493,8 @@ pub(super) fn ko_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// What the kernel's network drivers declare: built in, and the modules in
-/// `<modules>/kernel/drivers/net`.
+/// What the kernel's drivers of [`DRIVERS`] declare: built in, and the
+/// modules in those directories.
 fn declared(modules: &Path) -> Result<BTreeSet<String>, String> {
     let builtin = std::fs::read_to_string(modules.join("modules.builtin"))
         .map_err(|e| format!("{}: {e}", modules.display()))?;
@@ -494,7 +502,9 @@ fn declared(modules: &Path) -> Result<BTreeSet<String>, String> {
         .map_err(|e| format!("{}: {e}", modules.display()))?;
     let mut out: BTreeSet<String> = declared_builtin(&builtin, &info).into_iter().collect();
     let mut kos = Vec::new();
-    ko_files(&modules.join("kernel/drivers/net"), &mut kos);
+    for d in DRIVERS {
+        ko_files(&modules.join(d), &mut kos);
+    }
     for ko in kos {
         let b = std::fs::read(&ko).map_err(|e| format!("{}: {e}", ko.display()))?;
         out.extend(declared_in_ko(&b));
@@ -513,8 +523,8 @@ fn modules_dir(target: &Path) -> Result<PathBuf, String> {
 }
 
 /// After the build: the image has every locked file with its hash, the
-/// links resolve, each license is there, and every file the network drivers
-/// declare is in the image or in a `skip` line. Returns the files checked.
+/// links resolve, each license is there, and every file the drivers declare
+/// is in the image or in a `skip` line. Returns the files checked.
 pub(super) fn verify(os: &Path, target: &Path) -> Result<usize, String> {
     let text = std::fs::read_to_string(os.join(LOCK)).map_err(|e| format!("os/{LOCK}: {e}"))?;
     let lock = parse(&text)?;
@@ -544,7 +554,7 @@ pub(super) fn verify(os: &Path, target: &Path) -> Result<usize, String> {
     let missing = undeclared(&wanted, &lock);
     if !missing.is_empty() {
         return Err(format!(
-            "network drivers declare firmware that is not in the image nor in a skip line: {} \
+            "drivers declare firmware that is not in the image nor in a skip line: {} \
              (cargo xtask os firmware-lock --tag {})",
             missing.join(" "),
             lock.tag
@@ -637,7 +647,7 @@ fn build_lock(
 fn render(l: &Lock) -> String {
     let mut s = String::from(
         "# Generated by `cargo xtask os firmware-lock` (G1.6j, docs/os-image.md).\n\
-         # What the kernel's network drivers declare, from linux-firmware, with the\n\
+         # What the kernel's network and screen drivers declare, from linux-firmware, with the\n\
          # license each file's WHENCE entry names. `skip`: declared, not shipped.\n",
     );
     s.push_str(&format!("tag = {}\ncommit = {}\n\n", l.tag, l.commit));
@@ -939,11 +949,11 @@ Licence: Proprietary. All rights reserved.
         let ko =
             b"\x7fELF\0license=GPL\0firmware=intel/ice/ddp/ice.pkg\0firmware=../evil\0vermagic=6\0";
         assert_eq!(declared_in_ko(ko), ["intel/ice/ddp/ice.pkg"]);
-        let builtin = "kernel/drivers/net/ethernet/broadcom/tg3.ko\nkernel/drivers/gpu/i915.ko\nkernel/drivers/net/usb/r-8152.ko\n";
-        let info = b"tg3.license=GPL\0tg3.firmware=tigon/tg3.bin\0i915.firmware=i915/a.bin\0r_8152.firmware=rtl_nic/a.fw\0";
+        let builtin = "kernel/drivers/net/ethernet/broadcom/tg3.ko\nkernel/drivers/gpu/drm/i915/i915.ko\nkernel/sound/snd.ko\nkernel/drivers/net/usb/r-8152.ko\n";
+        let info = b"tg3.license=GPL\0tg3.firmware=tigon/tg3.bin\0i915.firmware=i915/a.bin\0snd.firmware=snd/a.bin\0r_8152.firmware=rtl_nic/a.fw\0";
         assert_eq!(
             declared_builtin(builtin, info),
-            ["tigon/tg3.bin", "rtl_nic/a.fw"]
+            ["tigon/tg3.bin", "i915/a.bin", "rtl_nic/a.fw"]
         );
     }
 
