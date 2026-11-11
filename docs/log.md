@@ -9695,3 +9695,106 @@ continuação indentadas).
   ocupados nos mesmos 2 núcleos (**medido**). Pacote atrasado foi descartado: com a espera de 30 ms
   reduzida a 1 ms e 24 laços ocupados, 0 de 20 (o envio pelo `AF_PACKET` encaminha e responde
   dentro da própria chamada). Só o teste muda.
+
+- 2026-11-10 — G0.24b: Janelas de lista que cresciam sozinhas: ao deixar a DNS Adlist mais baixa e soltar o mouse, ela
+  voltava a crescer até ocupar toda a altura. A tabela (`table::show`) ocupa a altura da janela
+  menos o `reserve`, e a janela desenhava a dica de lista vazia ("No lists. Add …") embaixo dela,
+  sem reservar espaço. O conteúdo ficava uma linha maior que a janela, e o egui 0.37
+  (`containers/resize.rs`, ao soltar o arrasto: `desired_size = max(desired_size, conteúdo)`)
+  aumentava a janela até caber. No quadro seguinte a tabela pegava a altura nova, e assim por
+  diante, ~9 px por quadro, até o fim da área (**medido** no teste headless). Um teste que abre
+  cada janela sozinha achou 8 com o defeito: DNS Adlist, DNS Forwarders, BGP, BFD, OSPF, Routing
+  Filters, Subscriber Notices e OS Log.
+
+  O que mudou: `TableState::empty` recebe a dica a cada quadro e o `table::show` a desenha no
+  corpo vazio da tabela (letra pequena, quebrada na largura), sem altura extra; as sete janelas
+  de lista passaram a usá-lo, e a OS Log, que tem tabela própria, desconta o cabeçalho da altura
+  das linhas. A regra entrou em `docs/ui-style.md` (lista vazia). Testes:
+  `no_window_grows_by_itself` abre cada janela, espera os dados e reprova a que continua
+  crescendo (reprova com a DNS Adlist antiga: 858 → 1128 px em 15 quadros; ~1 s em debug com
+  as janelas divididas em 4 threads, 3,9 s numa só, **medido**); `the_empty_hint_is_inside_the_table_and_goes_with_the_first_item`.
+
+  Como testar: abrir IP › DNS › Adlist sem listas, arrastar o canto para deixá-la mais baixa e
+  soltar; ela fica do tamanho escolhido, com a dica dentro da tabela.
+  `cargo test -p corerouter-ui --lib window_growth`.
+
+- 2026-11-10 — G1.27da: ARP Ping, o "Router address" do modal de ARP e o do painel de detalhe passam a achar o endereço do
+  roteador que veio do cliente DHCP (flag D). Antes, os três só olhavam os endereços estáticos da
+  configuração. Numa WAN por DHCP, como a ether1 da VM `corerouter-teste`, o `ip.arp.ping` recusava
+  com "is in no subnet of the router on ether1" e o detalhe mostrava "Router address –". Agora os
+  três usam os endereços da configuração efetiva (`Session::effective`: DHCP, pools e o resto do que o
+  plano de dados roda), montados uma vez por comando. Teste novo
+  `arp::a_dhcp_address_is_the_routers_address_on_its_port`: concessão de um servidor DHCP de
+  laboratório na ether1, sem endereço estático; com o código antigo falha com a mesma mensagem que o
+  operador viu, e passa com a correção.
+
+- 2026-11-10 — G1.3: Reconciliação e drift: a linha guarda-chuva ainda dizia "falta G1.3b", que já entrou. Agora diz o que falta de fato. Só o status muda.
+
+- 2026-11-10 — G2.1: Firewall: a linha guarda-chuva da G2.1 ainda dizia "G2.1c aberto", mas a G2.1c (diagnóstico: raw, `ip.firewall.test`, contadores ao vivo, trace e preview) já tinha entrado. Só o status muda.
+
+- 2026-11-10 — G3.7: Simulador de protocolos: o critério (N roteadores virtuais, BGP/OSPF convergindo no `VirtualHal`, wasm incluso) está atendido desde a parte 1, e a janela e a fidelidade com o FRR já entraram. Só o status muda.
+
+- 2026-11-10 — G3.9db: MPLS: a linha da G3.9db ainda dizia "em revisão", mas o PR #505 já tinha entrado depois da revisão humana dos blocos `unsafe`. Só o status muda.
+
+- 2026-11-10 — G3.9h: Interoperabilidade de L2 e serviços: rodada completa do `scripts/routeros-interop-l2.sh` na VM do
+  laboratório (`cargo xtask vm-lab run -- scripts/routeros-interop-l2.sh`, 731 s) em cima da `main`
+  49e017d9. Os 24 casos (wire, vlan, qinq, rsc, mtu, lldp, arp, tools, dhcp, dhcp-client, dhcp-relay,
+  dhcp-conflict, dhcp6, dhcp6-client, ra, ntp, dns, nat, cgnat, bond, cr-dhcp, cr-bond, storm, dns-qps)
+  deram 77 OK e nenhuma falha. Os dois que faltavam para fechar a gap passaram (**medido**):
+
+  - **RA do CoreRouter (G3.9ha):** o CHR se configurou pelo RA do CoreRouter em 1708 ms e pegou a
+    rota padrão pelo link-local dele; o RA final do `ipv6.nd.disable` tirou essa rota em 860 ms. No
+    outro sentido, o SLAAC do CoreRouter pelo RA do CHR levou 3705 ms.
+  - **Servidor NTP (G4.6c):** o CHR sincronizou no CoreRouter em 19131 ms (stratum 7, offset
+    18 ms); o cliente do CoreRouter sincronizou no CHR em 1040 ms.
+
+  Outros números da mesma rodada (**medido**, VM do laboratório, veth):
+
+  - **LACP:** agregado com o CHR em 442 ms e A × B em 416 ms. O corte silencioso do membro ocupado
+    perde 2770 ms até o timeout do LACP, e o corte com perda de portadora perde de 0 a 200 ms.
+  - **Tempestade DHCP:** 20 000 clientes do BNG Blaster com concessão em 86,7 s, com
+    `svc-dhcp-server` a 1% de CPU.
+  - **DNS:** até 621 mil respostas/s com 8 clientes e 32 consultas em voo.
+
+- 2026-11-10 — G4.10: Avisos ao assinante: a linha guarda-chuva dizia só "em partes". Agora diz quais partes entraram e quais faltam. Só o status muda.
+
+- 2026-11-10 — G4.2i: `/ip pool used` como no RouterOS v7. A aba Used Addresses (`ip.pool.used.print`) passa a listar,
+  além das concessões do servidor DHCP, as sessões PPP (PPPoE) que tiraram o endereço de um pool.
+  Cada linha mostra o dono (o servidor DHCP ou PPP, com o selo DHCP, IPoE ou PPP), o cliente (DHCP:
+  MAC e host name; IPoE: também o login; PPP: usuário, MAC e VLAN) e o estado (`active` nas sessões).
+  Um endereço que está ao mesmo tempo numa concessão e numa sessão aparece como `conflict` nas duas
+  linhas, dizendo quem mais está com ele.
+
+  O comando agora responde `{total, rows}` em ordem de endereço, com `owner` (dhcp|ppp), `find` e
+  `limit` (padrão 10 000): com milhares de assinantes, a tela mostra uma página e o total. O
+  `ip.pool.print` soma as sessões PPP em Used, Available e % (campo novo `ppp`): um pool só de
+  PPPoE deixava de aparecer com 0 %. A verificação do pool ganhou o aviso **DHCP + PPP**: um pool
+  que o servidor DHCP e um perfil PPP em uso entregam ao mesmo tempo (os dois alocadores não se
+  veem). Um perfil que só secrets IPoE usam não conta, porque o endereço do IPoE vem do DHCP.
+
+  Menu: IP › Pool e IPv6 › Pool saem do subgrupo DHCP e ficam direto em IP e IPv6, como no RouterOS
+  v7 e no WinBox, porque o pool é compartilhado. O `ppp.active.list` mostra o `pool` de cada sessão.
+  O selo de identidade do assinante também vale na aba (Settings › Subscriber identity › IP › Pool ›
+  Used).
+
+  Como testar: IP › Pool › Used Addresses, filtro Owner (All/DHCP/PPP) e ⓘ nas colunas; pela CLI:
+  `corerouter-cli run ip.pool.used.print '{"owner":"ppp","limit":100}'`. Testes:
+  `pool_used_lists_ppp_sessions_and_conflicts` e `a_pool_shared_by_dhcp_and_ppp_is_a_warning`
+  (engine), `pool_used_pages_counts_and_finds_the_holder` (daemon, 100 000 sessões),
+  `netns_pppoe` (PPPoE real num namespace: a sessão aparece no pool used e na contagem).
+
+  Desempenho (**medido**, 2026-11-10, máquina de desenvolvimento com 32 threads, build release, 100 000
+  sessões PPPoE no serviço): a página de 10 000 sai em 8,1 ms e a contagem por pool em 5,7 ms, sem
+  copiar a tabela (o serviço percorre no lugar e copia só a página). A conferência de conflito e o
+  login do IPoE são O(1) por linha da página (índice por endereço). O lock do servidor DHCP não fica
+  preso enquanto o serviço PPP é consultado.
+
+- 2026-11-10 — G4.4: Prometheus e fluxos: a linha guarda-chuva ainda mandava os fluxos para a G4.4b, que já entrou (IPFIX e NetFlow v9). O que falta do critério é o sFlow (G4.4i). Só o status muda.
+
+- 2026-11-10 — G4.6d: Log do sistema: a linha ainda mandava o disco para a G4.6g, que já entrou. Agora diz o que falta de fato. Só o status muda.
+
+- 2026-11-10 — G4.7: Cliente DHCP na WAN: a linha guarda-chuva ainda dizia "G4.7c aberto", mas a resiliência (reserva, `check_gateway`, concessão lembrada) já tinha entrado. Só o status muda.
+
+- 2026-11-10 — G4.8: System › Resources: a linha guarda-chuva dizia só "em partes". Agora diz quais partes entraram e quais faltam. Só o status muda.
+
+- 2026-11-10 — G4.9: Filas: a linha guarda-chuva dizia só "em partes". Agora diz quais partes entraram e quais faltam. Só o status muda.
