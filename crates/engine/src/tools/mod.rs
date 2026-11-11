@@ -10,6 +10,7 @@ pub mod sniffer;
 pub mod stats;
 pub mod text;
 pub mod torch;
+pub mod wifi_snoop;
 
 use std::net::IpAddr;
 use std::ops::ControlFlow;

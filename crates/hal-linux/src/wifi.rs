@@ -1284,6 +1284,8 @@ mod io {
                     r.bands = w.bands();
                     r.antennas_tx = w.antennas_tx;
                     r.antennas_rx = w.antennas_rx;
+                    r.monitor = w.monitor;
+                    r.monitor_shared = w.monitor_shared;
                     r.phy = w.name.or(r.phy);
                 }
                 Err(e) => log::debug!("wifi {name}: nl80211 wiphy: {e}"),

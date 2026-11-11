@@ -163,3 +163,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "wifi_snoop"
+harness = false
