@@ -10087,3 +10087,51 @@ continuação indentadas).
 
   Não conferido: o notebook real (a ISO nova não foi gravada nele); adaptador `r8152` (o QEMU não
   emula; o caminho no PID 1 é o mesmo de qualquer placa que aparece depois do boot).
+
+- 2026-11-11 — G1.6zh: Relógio certo no primeiro boot. No notebook de teste (ISO live) o `system.ntp.client.get` mostrava
+  o cliente desligado e `clock: "not-set"`, embora o DHCP tivesse entregue um servidor NTP
+  (`primary_ntp`, com `use_peer_ntp` ligado): os servidores do DHCP só valem com o cliente ligado,
+  e no live ele nem podia ser ligado (o comando não estava na lista do que o live muda).
+
+  O que entrou:
+
+  - **Primeiro boot com o cliente NTP ligado, sem servidor configurado.** O serviço `ntp-client` do
+    daemon, na partida, roda `system.ntp.client.set enabled=yes` quando há `--config-dir`, nada foi
+    restaurado e a config do cliente ainda é a padrão. Ele pergunta só aos servidores que os
+    clientes DHCP aprendem (opção 42, RFC 2132 §8.3): nenhum pool público embutido (RFC 8633 §6.2,
+    RFC 4085), o roteador não fala com terceiros que o operador não indicou.
+  - **Config já gravada não muda.** O `Default` do modelo continua desligado: um arquivo sem a chave
+    `ntp_client` (gravado antes disto) segue desligado, e quem desligar depois fica desligado. Não
+    houve mudança de formato, então não há migração; há teste com o arquivo antigo.
+  - **`system.ntp.client.set enabled=yes` sem servidor e sem cliente DHCP é aceito**, com `warning`
+    na resposta (antes era recusado; o estado já existia ao remover o último cliente DHCP).
+  - **O servidor que o lease traz é perguntado na hora.** A rodada sem a quem perguntar não envia
+    nada e não conta para os 64 s mínimos entre rodadas (RFC 4330 §5); antes o primeiro acerto
+    vinha 64 s depois.
+  - **ISO live:** `system.ntp.client.*` entrou na lista do que o live pode mudar.
+  - **Saúde (`ntp`) avisa "relógio não ajustado" com a ação:** sem a quem perguntar (`no-server`:
+    defina um servidor ou use um DHCP que entregue a opção 42); sem resposta; acerto acima de
+    1000 s esperando confirmação (diz quanto e como confirmar); resposta recusada; medindo sem
+    corrigir e mais de 1 s fora; cliente desligado com a data do roteador anterior a 2026.
+  - **Log:** "NTP: sem servidor: nenhum configurado e nenhum cliente DHCP entregou um (opção 42)"
+    é `info` (é como um roteador novo nasce), não mais aviso.
+
+  De onde vem a hora antes do NTP (lido no fonte do kernel 6.18.59 da imagem): em x86 o kernel põe
+  a hora do CMOS no relógio do sistema em `timekeeping_init` → `read_persistent_clock64` →
+  `mach_get_cmos_time`, com ou sem `CONFIG_RTC_HCTOSYS` (desligado na imagem; ele só repetiria a
+  leitura). `clock: "not-set"` quer dizer "o cliente NTP não está mexendo no relógio", não "relógio
+  sem hora": no notebook o relógio já tinha a hora do CMOS. Sincronizado, o kernel regrava o CMOS em
+  UTC a cada ~11 min. Nada a mudar em `os/`. Tudo em `docs/ntp.md` ("Primeiro boot").
+
+  Como testar: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
+  corerouter-daemon --test netns_ntp_first_boot` (dois daemons: um serve DHCP com a opção 42 e NTP,
+  o outro é o roteador novo, sem nenhum comando de NTP). À mão: `corerouter-daemon --config-dir
+  <pasta nova> --control 7945`, `system.ntp.client.get` (ligado, `waiting`, "no server to ask"),
+  `ip.dhcp-client.add interface=ether1`, e System › NTP Client na GUI.
+
+  Conferido (**medido**, 2026-11-11): no namespace, sincronizado 3 s depois de o daemon subir; na
+  VM do laboratório como root de verdade, `clock: slewing` 2,8 s depois do `ip.dhcp-client.add`
+  (o relógio do sistema sendo disciplinado); no laboratório virtual, com o servidor DHCP do
+  `proto-dhcp` entregando 100.64.1.1, sincronizado em 2,3 s. Antes: nunca (cliente desligado), ou
+  64 s depois do lease com o cliente ligado à mão antes do DHCP. Tela em
+  `docs/changes/G1.6zh-screenshots/ntp-client-primeiro-boot.png`.
