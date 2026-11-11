@@ -3042,3 +3042,40 @@ outras sessões compilando ao mesmo tempo):
 O custo fica sob o lock do `Session` que o login já pegava para gravar a linha; não há lock
 novo. Os 30 logins por TLS da CLI levaram 0,88 s (29 ms cada, quase tudo processo novo e
 handshake TLS): o agrupamento é ~0,004 % disso.
+
+Wi-Fi na imagem (G1.30 parte 1), **medido** em 2026-11-11, QEMU/KVM q35, 2 vCPUs, build release
+da imagem, máquina dividida com outras sessões:
+
+| O quê | Valor |
+|---|---|
+| Carga de `rfkill`, `cfg80211`, `mac80211` e `mac80211_hwsim` (2 rádios) pelo PID 1 | 114 ms, fora da espera do boot |
+| Passada `Wifi` numa máquina sem placa | nenhum módulo carregado, nenhuma linha no log |
+| `kernel → daemon pronto`, G1.6zd × G1.30, 7 boots de cada, alternados (load average 10 a 12) | 0,89 a 0,94 s (mediana 0,91) × 0,85 a 0,99 s (mediana 0,94). A diferença cabe no passo de ~50 ms com que o init sonda o daemon: os dois caem em 0,10 a 0,12 s ou em 0,16 a 0,20 s de `daemon start` |
+| O mesmo, antes de o `hal-linux` deixar de perguntar pela família nl80211 sem o cfg80211 carregado | 0,87 a 0,90 s × 0,90 a 0,96 s: +48 ms em todo boot, e `cfg80211` e `rfkill` carregados em toda máquina (o kernel roda o `modprobe` ao procurar uma família generic netlink pelo nome) |
+| Pergunta ao nl80211 no dump de links do `hal-linux` | só quando aparece um link de índice novo; zero por tick no regime |
+
+### G1.30: Wi-Fi em modo estação, motor (medido, 2026-11-11, QEMU/KVM q35, 2 vCPU, imagem release)
+
+| O quê | Valor |
+|---|---|
+| Varredura completa (2,4 e 5 GHz, `mac80211_hwsim`) | 7,1 s |
+| Entrar na rede (SAE ou PSK), do comando ao `connected` | menos de 0,8 s (resolução do teste: 0,7 s) |
+| Volta sozinho depois de o AP reiniciar | 6,0 s |
+| Eco pelo enlace cifrado, média de 3 | 0,11–0,16 ms |
+| RSS do `wpa_supplicant` com um rádio conectado | 7,3 MiB |
+| `kernel → daemon pronto`, 7 boots alternados | 0,84–0,97 s antes, 0,84–0,86 s depois (mediana 0,85 nos dois) |
+| Trabalho do motor por tick com rádio conectado | 1 leitura de eventos (não bloqueante) por rádio; `STATUS` e `SIGNAL_POLL` a cada 2 s |
+
+G1.6zg, console local (**medido**, 2026-11-11, QEMU/KVM q35 com 2 vCPUs e 1 GiB, OVMF, imagem
+release, máquina de 32 CPUs com carga média 33 de outros builds, mediana de 7 boots):
+
+| Medição | Antes | Depois |
+|---|---|---|
+| Linha `ready:` do init → fim da primeira tela do console | 58 ms (56–64) | 68 ms (64–93) |
+| Kernel → `ready:` | 1,06 s | 1,01 s |
+| Tela de status na serial | 410 bytes, 7 linhas | 938 bytes (85 de escapes), 17 linhas |
+| Tempo da tela de status numa serial de 115200 baud (**estimado**, 11 520 B/s) | 36 ms | 81 ms |
+
+Os 10 ms a mais são as consultas da tela de status ao daemon (portas, serviços, identidade,
+saúde, usuários: 6 conexões de loopback em vez de 1). A tela só é desenhada quando o estado
+muda ou alguém aperta Enter.

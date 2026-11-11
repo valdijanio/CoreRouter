@@ -363,12 +363,19 @@ fn notices_reach_every_os_directly_and_behind_a_cpe() {
         "ip.firewall.address-list.add",
         json!({"list": "bloqueados", "address": "100.64.1.10"}),
     );
-    wait_for("the portal's snapshot", || {
-        matches!(
-            get(sub_p, "198.51.100.7:80", "captive.apple.com", "/").0,
-            Got::Http(302, _)
-        )
-    });
+    // The kernel redirects a member as soon as the command returns; the
+    // portal answers from a snapshot its round rebuilds (every 2 s). A round
+    // between the two commands knows only the first member, and the second
+    // then gets what a non-member gets: what its OS expects (204). So both
+    // must be in the snapshot before the probes are checked.
+    for (pid, who) in [(sub_p, "the subscriber"), (lan_p, "the CPE")] {
+        wait_for(&format!("{who} in the portal's snapshot"), || {
+            matches!(
+                get(pid, "198.51.100.7:80", "captive.apple.com", "/").0,
+                Got::Http(302, _)
+            )
+        });
+    }
     every_probe_redirected(sub_p, "100.64.0.1");
     // Behind the CPE: the phone on the customer's Wi-Fi makes its own probe.
     every_probe_redirected(lan_p, "100.64.1.1");
