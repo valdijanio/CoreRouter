@@ -340,7 +340,7 @@ pub fn journal_message(
             let c = &cfg.system.ntp_client;
             Some(if c.enabled {
                 let servers = if c.servers.is_empty() {
-                    "nenhum servidor".to_owned()
+                    "servidores do DHCP (opção 42)".to_owned()
                 } else {
                     format!("servidores {}", c.servers.join(", "))
                 };
@@ -459,9 +459,12 @@ pub fn ntp_event(before: &NtpStatus, now: &NtpStatus) -> Option<(&'static str, S
             ),
         )),
         (_, NtpState::Waiting) if now.last_error.is_some() && now.last_error != before.last_error => {
-            now.last_error
-                .as_deref()
-                .map(|e| ("warning", format!("NTP: {}", ntp_error(e))))
+            now.last_error.as_deref().map(|e| {
+                // G1.6zh: nobody to ask yet is how a new router starts (the
+                // DHCP lease brings the server a moment later): not a warning.
+                let level = if e == corerouter_model::ntp::NO_SERVER { "info" } else { "warning" };
+                (level, format!("NTP: {}", ntp_error(e)))
+            })
         }
         _ => None,
     }
@@ -481,8 +484,8 @@ pub fn ntp_error(raw: &str) -> String {
                 Some("sem resposta de")
             } else if lower.contains("unreachable") {
                 Some("rede inalcançável para")
-            } else if lower.contains("no server to ask") {
-                return "nenhum servidor configurado".to_owned();
+            } else if lower.contains(corerouter_model::ntp::NO_SERVER) {
+                return "sem servidor: nenhum configurado e nenhum cliente DHCP entregou um (opção 42)".to_owned();
             } else {
                 None
             };
@@ -965,6 +968,16 @@ mod tests {
         assert_eq!(level, "warning");
         assert_eq!(m, "NTP: não foi possível resolver pool.ntp.org");
         assert_eq!(ntp_event(&failing, &failing.clone()), None);
+        // G1.6zh: nobody to ask yet (a new router before its DHCP lease) is
+        // said once, as information.
+        let nobody = NtpStatus {
+            last_error: Some(corerouter_model::ntp::NO_SERVER.into()),
+            ..waiting.clone()
+        };
+        let (level, m) = ntp_event(&waiting, &nobody).unwrap();
+        assert_eq!(level, "info");
+        assert!(m.contains("nenhum cliente DHCP entregou um (opção 42)"), "{m}");
+        assert_eq!(ntp_event(&nobody, &nobody.clone()), None);
     }
 
     #[test]

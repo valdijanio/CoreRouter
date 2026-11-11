@@ -343,3 +343,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-11-11 — G1.6zd criado e feito (boot sem linhas de erro do i915 e do som); G1.30 e G1.30a criados (Wi-Fi: estação e AP)
 - 2026-11-11 — G0.3f criado e feito (aviso "Login sem senha" agrupado; "Alterado" só para mudança de config)
 - 2026-11-11 — G1.6ze criado e feito (ISO live sem interfaces criadas pelo kernel; porta ligada depois do boot sem comando recusado no log)
+- 2026-11-11 — G1.6zh criado e feito (relógio certo no primeiro boot: cliente NTP ligado só com os servidores do DHCP)
