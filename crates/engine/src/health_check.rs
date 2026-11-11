@@ -203,6 +203,11 @@ pub struct Inputs {
     /// dm-verity device of its signed root hash (G1.6qb). `None`: not on
     /// the image (lab, browser, the package service has not reported).
     pub root_verity: Option<(String, bool)>,
+    /// The running slot's header has no signature of a key this image
+    /// trusts (a package signed by a key the installed image does not
+    /// carry). The root is then not checked against a signed hash, and a
+    /// reboot does not change that.
+    pub root_untrusted: bool,
     /// G1.6u: configuration snapshots in `/config` and the bytes of their
     /// own (partial copies are named `config-<slot>.new`), from the
     /// package service's status.
@@ -562,6 +567,9 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
             "fora da imagem A/B (laboratório, ou o serviço de pacotes não respondeu)".into(), None),
         Some((slot, true)) => push("root.verity", "Root verity", Severity::Ok, Some(format!("slot {slot}")),
             format!("o slot {slot} roda pela raiz dm-verity, conferida contra o hash assinado"), None),
+        Some((slot, false)) if i.root_untrusted => push("root.verity", "Root verity", Severity::Warning, Some(format!("slot {slot}")),
+            format!("o slot {slot} rodando não tem cabeçalho assinado por uma chave em que esta imagem confia (pacote assinado por uma chave que a imagem instalada não traz, ou cabeçalho danificado): a raiz não é conferida contra um hash assinado"),
+            Some("Reiniciar não resolve. Instale um pacote assinado por uma das chaves que esta imagem aceita (System › Packages mostra as chaves; campo `keys` de system.package.print). O outro slot aparece como `invalid` pelo mesmo motivo quando foi assinado pela chave antiga.")),
         Some((slot, false)) => push("root.verity", "Root verity", Severity::Warning, Some(format!("slot {slot}")),
             format!("o slot {slot} rodando não está em dm-verity: a raiz não é conferida contra o hash assinado (primeiro boot de qcow2/OVA ou de disco gravado com dd pelo caminho reserva, ou NVRAM apagada)"),
             Some("Reinicie uma vez (`/system reboot confirm=yes` no terminal, ou system.reboot): este boot já gravou a entrada de boot do slot e o próximo sobe pela raiz verificada. Se o aviso voltar, confira em System › Packages a entrada de boot e a linha de comando do slot.")),
@@ -855,6 +863,18 @@ fn root_verity(st: &serde_json::Value) -> Option<(String, bool)> {
     Some((slot.get("slot")?.as_str()?.to_owned(), on(slot, "verity")))
 }
 
+/// The running slot says its header is not verified (`verified: false`; a
+/// status without the field, from an older service, is not judged).
+fn root_untrusted(st: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    st.get("slots")
+        .and_then(Value::as_array)
+        .and_then(|slots| slots.iter().find(|s| s.get("running").and_then(Value::as_bool) == Some(true)))
+        .and_then(|s| s.get("verified"))
+        .and_then(Value::as_bool)
+        == Some(false)
+}
+
 /// The worst severity of `checks` (unknown counts as ok).
 pub fn overall(checks: &[Check]) -> Severity {
     checks
@@ -1025,6 +1045,7 @@ impl Session {
         });
         let pkg = self.ext::<crate::package::Packages>().and_then(|p| p.status.as_ref());
         i.root_verity = pkg.and_then(root_verity);
+        i.root_untrusted = pkg.is_some_and(root_untrusted);
         i.config_snapshots = pkg.map(config_snapshots).unwrap_or_default();
         i.config_disk = self.config_disk_usage();
         i
@@ -1108,6 +1129,7 @@ mod tests {
             ecmp: Some((0, 0, None)),
             no_password: Vec::new(),
             root_verity: Some(("a".into(), true)),
+            root_untrusted: false,
             config_snapshots: Vec::new(),
             config_disk: Some(Default::default()),
             bgp_no_eor: Some((1, Vec::new())),

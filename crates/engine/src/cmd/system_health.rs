@@ -150,6 +150,37 @@ mod tests {
         assert_eq!(check(&mut s)["severity"], "unknown");
     }
 
+    /// A package signed by a key the installed image does not carry leaves
+    /// the running slot unverified (test VM, 2026-11-11: `verified: false,
+    /// signed_by: null, verity: false`). Rebooting does not fix that, so the
+    /// check must not say "reboot once".
+    #[test]
+    fn root_signed_by_an_untrusted_key_says_install_not_reboot() {
+        let mut s = Session::virtual_lab();
+        let status = |verified: bool| {
+            json!({"supported": true, "lab": false, "running": "b", "keys": ["df0376340ceee539"], "slots": [
+                {"slot": "a", "running": false, "state": "invalid", "verified": false, "verity": false},
+                {"slot": "b", "running": true, "state": "running", "signed_by": null,
+                 "verified": verified, "verity": false}]})
+        };
+        let check = |s: &mut Session| {
+            let v = s.execute("system.health.check", &json!({})).unwrap();
+            v["checks"].as_array().unwrap().iter().find(|c| c["key"] == "root.verity").unwrap().clone()
+        };
+        crate::package::feed_status(&mut s, status(false));
+        let c = check(&mut s);
+        assert_eq!(c["severity"], "warning");
+        assert_eq!(c["value"], "slot b");
+        assert!(c["reason"].as_str().unwrap().contains("chave"), "{c}");
+        let action = c["action"].as_str().unwrap();
+        assert!(action.contains("Reiniciar não resolve"), "{c}");
+        assert!(!action.contains("Reinicie uma vez"), "{c}");
+        // Verified header on the fallback root (first boot of a dd image):
+        // the reboot advice stays.
+        crate::package::feed_status(&mut s, status(true));
+        assert!(check(&mut s)["action"].as_str().unwrap().contains("Reinicie uma vez"));
+    }
+
     /// G1.6zf: a Super-I/O input the board does not wire reads 127 °C. It is
     /// listed, and it is neither the router's temperature nor a health alarm.
     #[test]
