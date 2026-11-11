@@ -9,7 +9,7 @@ A G1.30 entra em três partes:
 |---|---|---|
 | 1. Imagem | pilha Wi-Fi em módulo, drivers e firmware, `regulatory.db`, `wpa_supplicant`, passada própria no PID 1; rádio deixa de ser confundido com porta Ethernet | este documento, "Imagem" |
 | 2. Motor | interface `wifi` em modo `station`, comandos (`interface.wifi.*`), o `wpa_supplicant` dirigido pelo `hal-linux`, teste de ponta a ponta com `mac80211_hwsim` | este documento, "Motor" |
-| 3. Telas | janela Interfaces › Wi-Fi e a porta Wi-Fi no setup do console | a seguir |
+| 3. Telas | janela Interfaces › Wi-Fi e a porta Wi-Fi no setup do console | este documento, "Telas" |
 
 ## Imagem (parte 1)
 
@@ -214,6 +214,59 @@ verdade, quadros entre os rádios em software). No primeiro roda um `hostapd` co
 segundo é o do roteador, dirigido só por comandos. O `hostapd` não está na imagem: o build o
 deixa em `images/test-tools/` e o teste o entrega num disco próprio. `corerouter.unmanaged=wifi1`
 na linha de comando do kernel mantém o roteador longe do rádio do AP.
+
+## Telas (parte 3)
+
+### Janela Interfaces › Wi-Fi
+
+Painel `crates/ui/src/wifi.rs`, padrão de janela de lista (G0.24). Só desenha e manda
+`interface.wifi.*`.
+
+- **Primeira linha:** as abas e o país de todos os rádios, com o selo âmbar `no country`
+  enquanto não há um, e `Change…` (um campo, `interface.wifi.country.set`). Quando o kernel
+  aplica outro domínio, um selo diz qual.
+- **Aba Radios:** uma linha por rádio. Selo de estado (verde `connected`, azul `searching` e
+  `connecting`, âmbar `no country` e `blocked`, cinza `disabled`), e ao lado o motivo da
+  última falha (`wrong passphrase?`, `network not found`, `refused by the access point`,
+  `no answer`). A rede vai em selo colorido pelo nome; o sinal fica verde até −65 dBm, âmbar
+  até −75 e vermelho abaixo. Barra: ✓ ✗ 💬, `Scan…` e `Reconnect`. Não tem `+` nem `−`: o
+  rádio existe porque a placa existe. Embaixo, o `monitor` do rádio selecionado, com a falha
+  em palavras quebrando linha.
+- **Aba Networks:** o que a última varredura de um rádio ouviu, com `Rescan` e a idade da
+  varredura. Rede em que não dá para entrar fica esmaecida, com o motivo. `Connect…` (ou
+  duplo clique) abre o modal do rádio com a rede preenchida e o rádio ligado.
+- **Modal** (`list_modal`, alimentado por `interface.wifi.preview`): `set` tentado no candidato
+  e desfeito, então os erros e avisos são os do comando. Mostra também se a última varredura
+  ouviu a rede, e recusa ligar o rádio sem país antes de o commit recusar. A senha é digitada
+  escondida e sai como `•••` nos comandos mostrados.
+- **Outra rede pede a própria senha:** trocar o `ssid` sem dar a senha esquece a anterior
+  (antes ela era tentada na rede nova e virava "senha errada?" minutos depois).
+- Ícone próprio (`WIFI_HIGH` do Phosphor) no menu e na coluna Type da lista de interfaces;
+  o log da GUI esconde `passphrase`.
+
+### Porta Wi-Fi no assistente do console
+
+`apps/corerouter-init/src/setup_wifi.rs`. O assistente do primeiro boot lista os rádios junto
+das portas (`wifi1`, `Wi-Fi`). Escolhido um rádio, entra um passo a mais, `[2/5] Wi-Fi network`:
+
+1. **País**, se o roteador ainda não tem (duas letras; o motor valida).
+2. **Varredura:** o rádio é ligado para varrer, e o assistente avisa. Lista numerada das redes
+   em que dá para entrar, a mais forte de cada nome primeiro; `r` varre de novo, `h` é rede
+   oculta (digita-se o nome).
+3. **Senha**, lida sem eco. O `interface.wifi.preview` confere antes de seguir; rede aberta
+   pede confirmação.
+4. **Endereço:** `dhcp` (o padrão num rádio) ou endereço/prefixo e gateway.
+
+Depois do resumo e do sim, o rádio tem 30 s para entrar. Se não entrar (senha errada, AP que
+recusa), a rede é tirada, o rádio volta a ficar desligado e o motivo aparece. Cancelado no
+meio, o rádio volta a como estava; o país fica (é um fato sobre onde o roteador está). O nome
+das redes passa por `style::ascii` antes de ir para a tela: qualquer um no alcance escolhe um
+SSID.
+
+`cargo xtask os wifi-test --only setup` responde ao assistente num segundo console da VM, como
+uma pessoa: país inválido, senha curta, senha errada (nada fica aplicado), depois a certa e um
+endereço fixo. O segundo console é virtio (`hvc0`) e não uma segunda serial: o kernel aceita um
+console por tipo de dispositivo, e a serial fica com o shell de manutenção do teste.
 
 ## Pesquisa
 

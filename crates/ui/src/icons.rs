@@ -72,6 +72,7 @@ pub(crate) const TREE_STRUCTURE: &str = "\u{E67C}";
 pub(crate) const TREE_VIEW: &str = "\u{EE48}";
 pub(crate) const USB: &str = "\u{E956}";
 pub(crate) const USERS_THREE: &str = "\u{E68E}";
+pub(crate) const WIFI_HIGH: &str = "\u{E4EA}";
 pub(crate) const WRENCH: &str = "\u{E5D4}";
 
 /// The icons' family, apart from text: egui's own emoji font uses the
@@ -175,6 +176,7 @@ pub(crate) const ALL: &[&str] = &[
     TREE_VIEW,
     USB,
     USERS_THREE,
+    WIFI_HIGH,
     WRENCH,
 ];
 

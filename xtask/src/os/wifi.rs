@@ -19,14 +19,22 @@
 //!   and from the kernel (an echo across the encrypted link, the regulatory
 //!   domain, no line about `regulatory.db`).
 //!
+//! - a second boot (`--only setup` runs it alone) answers the first-boot
+//!   setup on the console as a person would, on a second console: the
+//!   radio as the management port, the country, the network out of the
+//!   scan, a passphrase that is wrong first, a fixed address;
+//!
 //! What it cannot show: a card. Firmware loading, a driver's quirks and the
 //! airplane-mode key are the notebook's.
 
 #![allow(clippy::indexing_slicing)]
 
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Command;
-use std::time::Instant;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -87,12 +95,112 @@ fn tools_disk(images: &Path, work: &Path) -> Result<std::path::PathBuf, String> 
     Ok(img)
 }
 
+/// The first-boot setup's console: a virtio console of the VM (`hvc0`), a
+/// UNIX socket here. The serial port keeps the maintenance shell.
+struct Tty {
+    stream: UnixStream,
+    /// Everything the console wrote, as it came (colours included).
+    raw: Arc<Mutex<Vec<u8>>>,
+    /// Up to where the text was already matched.
+    at: usize,
+}
+
+impl Tty {
+    fn connect(path: &Path) -> Result<Self, String> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let stream = loop {
+            match UnixStream::connect(path) {
+                Ok(s) => break s,
+                Err(e) if Instant::now() >= deadline => {
+                    return Err(format!("{}: {e}", path.display()));
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(100)),
+            }
+        };
+        let raw = Arc::new(Mutex::new(Vec::new()));
+        let (mut from, to) = (
+            stream.try_clone().map_err(|e| e.to_string())?,
+            Arc::clone(&raw),
+        );
+        std::thread::Builder::new()
+            .name("setup-console".into())
+            .spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = from.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    to.lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .extend_from_slice(&buf[..n]);
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(Self { stream, raw, at: 0 })
+    }
+
+    /// What a person reads: the text without the colours.
+    fn text(&self) -> String {
+        let raw = self.raw.lock().unwrap_or_else(PoisonError::into_inner);
+        crate::os::console_text(&String::from_utf8_lossy(&raw))
+    }
+
+    /// Waits for `needle` after what was already matched.
+    fn wait(&mut self, needle: &str, secs: u64) -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            let text = self.text();
+            if let Some(i) = text.get(self.at..).and_then(|t| t.find(needle)) {
+                self.at += i + needle.len();
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                let tail: String = text
+                    .chars()
+                    .rev()
+                    .take(600)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                return Err(format!(
+                    "the setup never said '{needle}'; its console ends with:\n{tail}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// `needle`, then the answer typed and Enter.
+    fn answer(&mut self, needle: &str, typed: &str, secs: u64) -> Result<(), String> {
+        self.wait(needle, secs)?;
+        // A person does not answer in the same millisecond.
+        std::thread::sleep(Duration::from_millis(150));
+        self.stream
+            .write_all(format!("{typed}\n").as_bytes())
+            .map_err(|e| format!("setup console: {e}"))
+    }
+}
+
 fn boot(
     work: &Path,
     images: &Path,
     tools: &Path,
     kvm: bool,
     log: &mut std::fs::File,
+) -> Result<Vm, String> {
+    boot_with(work, images, tools, kvm, log, None)
+}
+
+/// [`boot`]; with `setup`, a second console on that socket, where the
+/// first-boot setup runs (the serial one is the maintenance shell's).
+fn boot_with(
+    work: &Path,
+    images: &Path,
+    tools: &Path,
+    kvm: bool,
+    log: &mut std::fs::File,
+    setup: Option<&Path>,
 ) -> Result<Vm, String> {
     let disk = work.join("r.qcow2");
     let _ = std::fs::remove_file(&disk);
@@ -119,9 +227,162 @@ fn boot(
         "virtio-net-pci,netdev=n0",
     ]);
     cmd.arg("-kernel").arg(images.join("bzImage"));
-    cmd.arg("-append")
-        .arg("corerouter.shell=ttyS0 corerouter.hwsim=2 corerouter.unmanaged=wifi1");
-    start(log, "r", cmd)
+    let mut append =
+        String::from("corerouter.shell=ttyS0 corerouter.hwsim=2 corerouter.unmanaged=wifi1");
+    if let Some(sock) = setup {
+        let _ = std::fs::remove_file(sock);
+        // A virtio console (`hvc0`), not a second serial port: the kernel
+        // takes one console per kind of device, and the serial one is the
+        // maintenance shell's (`/sys/class/tty/console/active` said
+        // `tty0 ttyS0` with `console=ttyS1` given).
+        cmd.args(["-device", "virtio-serial-pci"]);
+        cmd.arg("-chardev").arg(format!(
+            "socket,id=setup,path={},server=on,wait=off",
+            sock.display()
+        ));
+        cmd.args(["-device", "virtconsole,chardev=setup"]);
+        // The last `console=` is /dev/console: the shell's stays there.
+        append.push_str(" console=hvc0 console=ttyS0,115200");
+    }
+    cmd.arg("-append").arg(append);
+    start(log, if setup.is_some() { "setup" } else { "r" }, cmd)
+}
+
+/// The tools disk mounted and the access point on the first radio.
+fn access_point(vm: &mut Vm, log: &mut std::fs::File) -> Result<(), String> {
+    let out = sh(
+        vm,
+        log,
+        &format!("{{ mkdir -p {TOOLS} && mount -t ext4 -o ro /dev/vdb {TOOLS} && ls {TOOLS}; }}"),
+    )?;
+    check(out.contains("hostapd"), format!("tools disk: {out}"))?;
+    start_ap(vm, log)
+}
+
+/// The first-boot setup, answered on the console as a person would: the
+/// radio as the management port, a passphrase the access point refuses
+/// (nothing may be left half applied), then the right one.
+fn setup(
+    vm: &mut Vm,
+    tty: &mut Tty,
+    log: &mut std::fs::File,
+    nums: &mut Numbers,
+) -> Result<(), String> {
+    until(vm, log, 30, "interface.wifi.list", "{}", |v| {
+        v["result"]
+            .as_array()
+            .is_some_and(|a| a.len() == 1 && a[0]["name"] == "wifi2")
+    })?;
+    access_point(vm, log)?;
+    let radio = "Use wifi2 (Wi-Fi radio, 02:00:00:00:01:00)?";
+    let wrong = "senha-que-nao-e-a-certa";
+
+    // First: the wrong passphrase. It is as long as it must be, so only the
+    // access point can say no.
+    tty.wait("Press Enter to set the management port", 60)?;
+    tty.answer("", "", 5)?;
+    tty.wait("[1/4] Management port", 20)?;
+    tty.wait("wifi2", 5)?;
+    tty.answer("Port", "wifi2", 10)?;
+    tty.answer(radio, "y", 10)?;
+    tty.wait("[2/5] Wi-Fi network", 10)?;
+    tty.answer("Country code", "Brasil", 10)?;
+    // The engine's refusal, then the question again (the text wraps: a
+    // needle of one word).
+    tty.wait("ISO", 10)?;
+    tty.answer("Country code", "br", 10)?;
+    tty.wait("Scanning on wifi2", 20)?;
+    let t = Instant::now();
+    tty.wait(SSID, 30)?;
+    nums.put(
+        "setup: scan",
+        format!("{SSID} listed in {:.1} s", t.elapsed().as_secs_f64()),
+    );
+    tty.answer("Network", "9", 10)?;
+    tty.answer("Use a number from the list", "1", 10)?;
+    tty.answer(&format!("Passphrase for {SSID}"), "curta", 10)?;
+    tty.wait("the passphrase has 5 characters", 10)?;
+    tty.answer(&format!("Passphrase for {SSID}"), wrong, 10)?;
+    tty.wait("[3/5] Address", 10)?;
+    tty.answer("Address/prefix [dhcp]", "192.168.77.2/24", 10)?;
+    tty.answer("Gateway [none]", "", 10)?;
+    tty.wait("[4/5] Admin password", 10)?;
+    tty.answer("New admin password", "", 10)?;
+    tty.wait("[5/5] Apply", 10)?;
+    tty.wait(&format!("{SSID} (WPA2/WPA3, passphrase not shown)"), 10)?;
+    tty.answer("Apply?", "y", 10)?;
+    let t = Instant::now();
+    tty.wait("did not get on", 45)?;
+    tty.wait("wrong", 5)?;
+    nums.put(
+        "setup: wrong passphrase",
+        format!(
+            "said in {:.1} s, the network taken back",
+            t.elapsed().as_secs_f64()
+        ),
+    );
+    let row = until(vm, log, 10, "interface.wifi.list", "{}", |v| {
+        v["result"][0]["disabled"] == true
+    })?;
+    check(
+        row["result"][0]["ssid"] == "" && row["result"][0]["passphrase"] == "",
+        format!("the refused network was left on the radio: {row}"),
+    )?;
+    let addrs = vm.ok(log, "ip.address.list", "{}")?;
+    check(
+        addrs == serde_json::json!([]),
+        format!("an address was set: {addrs}"),
+    )?;
+
+    // Again, right this time: the country is already there.
+    tty.answer("", "", 5)?;
+    tty.answer("Port", "wifi2", 20)?;
+    tty.answer(radio, "y", 10)?;
+    tty.wait("Country: BR (already set)", 10)?;
+    tty.wait(SSID, 30)?;
+    tty.answer("Network", "1", 10)?;
+    tty.answer(&format!("Passphrase for {SSID}"), PASSPHRASE, 10)?;
+    tty.answer("Address/prefix [dhcp]", "192.168.77.2/24", 10)?;
+    tty.answer("Gateway [none]", "", 10)?;
+    tty.answer("New admin password", "", 10)?;
+    tty.answer("Apply?", "y", 10)?;
+    let t = Instant::now();
+    tty.wait(&format!("wifi2: connected to {SSID}"), 45)?;
+    tty.wait("ip.address.add", 10)?;
+    tty.wait("Done: the router has its management address", 10)?;
+    nums.put(
+        "setup: join",
+        format!(
+            "connected and addressed in {:.1} s",
+            t.elapsed().as_secs_f64()
+        ),
+    );
+    let m = monitor(vm, log, 10, |m| m["state"] == "connected")?;
+    check(
+        m["security"] == "wpa3" && m["ssid"] == SSID,
+        format!("the link the setup made: {m}"),
+    )?;
+    let addrs = vm.ok(log, "ip.address.list", "{}")?;
+    check(
+        addrs.as_array().is_some_and(|a| {
+            a.iter()
+                .any(|x| x["address"] == "192.168.77.2/24" && x["interface"] == "wifi2")
+        }),
+        format!("the management address: {addrs}"),
+    )?;
+    // The status screen that follows shows the radio like a port.
+    tty.wait("192.168.77.2", 20)?;
+    // Neither passphrase was ever on the console.
+    let seen = tty.text();
+    check(
+        !seen.contains(PASSPHRASE) && !seen.contains(wrong) && !seen.contains("curta"),
+        "a passphrase was echoed on the console",
+    )?;
+    nums.put(
+        "setup: passphrases on the console",
+        "none of the three typed",
+    );
+    Ok(())
 }
 
 fn monitor(
@@ -186,13 +447,7 @@ fn run(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(), S
     );
 
     // The access point, from the tools disk.
-    let out = sh(
-        vm,
-        log,
-        &format!("{{ mkdir -p {TOOLS} && mount -t ext4 -o ro /dev/vdb {TOOLS} && ls {TOOLS}; }}"),
-    )?;
-    check(out.contains("hostapd"), format!("tools disk: {out}"))?;
-    start_ap(vm, log)?;
+    access_point(vm, log)?;
     // No country, no radio.
     let e = vm.run(log, "interface.wifi.enable", r#"{"name":"wifi2"}"#)?;
     check(
@@ -399,14 +654,18 @@ fn run(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(), S
     set(
         vm,
         log,
-        &serde_json::json!({"name": "wifi2", "ssid": "Nao-Existe", "security": "auto"}),
+        &serde_json::json!({"name": "wifi2", "ssid": "Nao-Existe", "security": "auto", "passphrase": PASSPHRASE}),
     )?;
     monitor(vm, log, 60, |m| m["failure"]["code"] == "not-found")?;
     nums.put("a network that is not there", "failure not-found");
 
     // The access point goes away and comes back: the router is told
     // nothing, and gets back on by itself.
-    set(vm, log, &serde_json::json!({"name": "wifi2", "ssid": SSID}))?;
+    set(
+        vm,
+        log,
+        &serde_json::json!({"name": "wifi2", "ssid": SSID, "passphrase": PASSPHRASE}),
+    )?;
     monitor(vm, log, 60, |m| m["state"] == "connected")?;
     sh(
         vm,
@@ -453,12 +712,19 @@ fn run(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(), S
 
 pub fn wifi_test(root: &Path, images: &Path, args: &[String]) -> Result<(), String> {
     let mut tcg = false;
-    for a in args {
+    let mut only: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
         match a.as_str() {
             "--tcg" => tcg = true,
+            "--only" => match it.next().map(String::as_str) {
+                Some(s @ ("commands" | "setup")) => only = Some(s.to_owned()),
+                _ => return Err("--only takes commands or setup".into()),
+            },
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
+    let wants = |s: &str| only.as_deref().is_none_or(|o| o == s);
     for f in ["disk.img", "bzImage"] {
         check(
             images.join(f).exists(),
@@ -482,17 +748,40 @@ pub fn wifi_test(root: &Path, images: &Path, args: &[String]) -> Result<(), Stri
     );
     let started = Instant::now();
     let mut nums = Numbers(Vec::new());
+    let booted = [
+        "ready:",
+        "maintenance shell",
+        "wifi: 2 test radios",
+        "wifi names:",
+    ];
+    if wants("setup") {
+        let sock = work.join("setup.sock");
+        let mut vm = boot_with(&work, images, &tools, kvm, &mut log, Some(&sock))?;
+        let mut tty = Tty::connect(&sock)?;
+        vm.expect_all(&mut log, &booted, 120)?;
+        let done = setup(&mut vm, &mut tty, &mut log, &mut nums);
+        // What the person saw, next to the VM's own console.
+        let _ = std::fs::write(work.join("setup-console.txt"), tty.text());
+        if let Err(e) = done {
+            let m = vm
+                .run(&mut log, "interface.wifi.monitor", r#"{"name":"wifi2"}"#)
+                .unwrap_or_default();
+            let diag = sh(
+                &mut vm,
+                &mut log,
+                "{ cat /sys/class/tty/console/active; for p in /proc/[0-9]*; do tr '\\0' ' ' < $p/cmdline 2>/dev/null | grep -a 'init setup'; done; echo .; }",
+            )
+            .unwrap_or_default();
+            eprintln!("   MONITOR {m}\n   CONSOLES {diag}");
+            return Err(e);
+        }
+        vm.poweroff(&mut log)?;
+    }
+    if !wants("commands") {
+        return finish(&work, &nums, started, kvm);
+    }
     let mut vm = boot(&work, images, &tools, kvm, &mut log)?;
-    let r = vm.expect_all(
-        &mut log,
-        &[
-            "ready:",
-            "maintenance shell",
-            "wifi: 2 test radios",
-            "wifi names:",
-        ],
-        120,
-    )?;
+    let r = vm.expect_all(&mut log, &booted, 120)?;
     nums.put(
         "kernel → daemon ready",
         ready_s(r.first().map_or("", String::as_str)),
@@ -514,6 +803,10 @@ pub fn wifi_test(root: &Path, images: &Path, args: &[String]) -> Result<(), Stri
         return Err(e);
     }
     vm.poweroff(&mut log)?;
+    finish(&work, &nums, started, kvm)
+}
+
+fn finish(work: &Path, nums: &Numbers, started: Instant, kvm: bool) -> Result<(), String> {
     eprintln!(
         "\nwifi-test ok in {:.1} s ({}):",
         started.elapsed().as_secs_f64(),

@@ -121,6 +121,12 @@ conforme o terminal), sequências de escape (uma seta) e caracteres de controle 
 **Assistente do primeiro boot**: passos `[1/4] Management port`, `[2/4] Address`,
 `[3/4] Admin password`, `[4/4] Apply`; nada muda antes do `Apply? [y/N]`.
 
+Com um rádio Wi-Fi escolhido como porta (G1.30, `setup_wifi.rs`) são cinco passos: entra o
+`[2/5] Wi-Fi network` (país, varredura, rede, senha sem eco), e o endereço aceita `dhcp`. A
+varredura precisa do rádio ligado, então o país e o rádio mudam antes do `Apply?`, e o
+assistente diz isso; cancelado, o rádio volta a como estava. A tela de status mostra o rádio
+como uma porta. Detalhes em [wifi.md](wifi.md), "Porta Wi-Fi no assistente do console".
+
 **Instalador**: cabeçalho com firmware e consoles, depois `[1/5] Medium`, `[2/5] Disk`,
 `[3/5] Management address for the first boot`, `[4/5] Confirm`, `[5/5] Write`.
 
