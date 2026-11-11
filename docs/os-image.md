@@ -737,6 +737,76 @@ UART (`drivers/tty/tty_jobctrl.c:265-275` → `tty_ldisc.c:700` → `serial/seri
 6.18.59); o `reboot(2)` também não espera a UART. Sem a espera, a linha com o motivo do reboot
 podia sair cortada.
 
+### Sensores: o que é embutido e o que é módulo (G1.6zf)
+
+Num notebook real (Lenovo LOQ 15IRH8) o `system.health.print` trouxe só a zona ACPI (`acpitz`,
+27,8 °C) e a bateria: nada da CPU nem do NVMe. O kernel tinha `HWMON=y` e nenhum driver de CPU,
+disco ou placa-mãe. O coletor (`crates/hal-linux/src/resource.rs`) já lia qualquer chip de
+`/sys/class/hwmon`; faltava o kernel.
+
+| Sensor | Símbolo | Como entra | Por quê |
+|---|---|---|---|
+| CPU Intel | `SENSORS_CORETEMP=y` | embutido | só se liga pelo CPUID (`X86_FEATURE_DTHERM`, `drivers/hwmon/coretemp.c:776-797`); em AMD e em VM sai em silêncio |
+| CPU AMD/Hygon | `SENSORS_K10TEMP=y` | embutido | driver PCI da função 3 do nó (`k10temp.c:539-581`) |
+| Disco NVMe | `NVME_HWMON=y` | embutido | parte do `nvme-core` (`drivers/nvme/host/core.c:3742`); VyOS, OpenWrt e Debian ligam `=y` |
+| Disco SATA | `SENSORS_DRIVETEMP=y` | embutido | interface de classe SCSI, só aceita disco SATA com SCT ou SMART (`drivetemp.c:333-372`) |
+| Chipset Intel | `INTEL_PCH_THERMAL=y` | embutido | PCI: PCH até Comet Lake, Lewisburg, Wellsburg |
+| Porta Realtek 2,5G | `REALTEK_PHY_HWMON=y` | embutido | no `probe` do PHY das RTL8125/8126 (as portas dos mini-PCs) |
+| Chip da placa-mãe (ventoinhas, tensões) | `SENSORS_NCT6775`, `SENSORS_NCT6683`, `SENSORS_IT87`, `SENSORS_F71882FG`, `SENSORS_W83627EHF` `=m` | módulo, carregado pelo PID 1 | ver abaixo |
+
+**Por que o chip da placa-mãe é módulo.** O Super-I/O não é enumerado por nada: cada driver
+escreve a chave de desbloqueio nas portas 0x2e e 0x4e e lê quem responde
+(`nct6775-platform.c:1502-1629`, `it87.c:2695-2760`). Embutido, isso rodaria em toda máquina e
+em toda VM, sem como desligar. Debian e VyOS deixam em módulo (o VyOS só sonda quando o operador
+pede os sensores); o OpenWrt embute os de CPU e traz os de placa-mãe em pacotes. O PID 1
+(`apps/corerouter-init/src/modules.rs`, `load_sensors`) carrega os cinco pelo nome, por último,
+depois das portas e da tela, sem o boot esperar:
+
+- **nunca em máquina virtual** (bit `hypervisor` do `/proc/cpuinfo`): não há chip para achar;
+- **`corerouter.sensors=off`** na linha de comando desliga a procura (a placa em que ela
+  atrapalhar); `corerouter.sensors=on` força, também em VM. No roteador instalado o operador
+  muda isso como os outros parâmetros de boot: `system.tuning.boot.set` (System › Tuning ›
+  Boot, seção Hardware) e `system.tuning.boot.apply`, que testa no outro slot (G1.26h);
+- driver cujo chip não existe sai sozinho (`ENODEV`), sem linha no log; uma linha só resume:
+  `sensors: motherboard sensor chip: nct6775 (41 ms)` ou `sensors: no motherboard sensor chip
+  answered`;
+- chip que existe mas cujas portas o firmware usa por ACPI (`EBUSY`, o padrão
+  `acpi_enforce_resources=strict`, comum em placas ASUS e Gigabyte): o driver fica de fora e o
+  console diz por quê. O `acpi_enforce_resources=lax` não é usado: a documentação do it87
+  (`Documentation/hwmon/it87.rst:204-213`) avisa de corrida com o ACPI e de reboot inesperado.
+
+**Entrada que a placa não liga.** O chip tem mais entradas do que a placa usa: um pino de
+temperatura aberto marca qualquer coisa (88 °C, 127 °C), e os limites dele são os alarmes que o
+firmware programou, não os do hardware. Por isso as leituras do chip da placa-mãe vêm marcadas
+(`board: true` no `system.health.print`), sem `max` nem `crit`, e não entram na temperatura do
+roteador (barra superior, gráfico, verificação `temperature`) enquanto houver outro sensor.
+
+**Nomes.** Dois discos NVMe eram dois chips `nvme` com os mesmos rótulos, e as linhas colidiam
+(`nvme-composite` duas vezes). O coletor agora junta ao nome o que distingue o chip: `nvme0`,
+`drivetemp sda`, `ixgbe ether3`; o que sobrar igual ganha o número de ordem (`k10temp 2`).
+
+**Decisão com números** (**medido**, kernel 6.18.59 compilado fora da imagem com o `.config`
+dela, mesmo compilador; o `bzImage` da base bate byte a byte com o da imagem):
+
+| Variante | `bzImage` | Módulos novos |
+|---|---|---|
+| base (G1.6ze) | 18 371 584 B | — |
+| tudo embutido (os 11 acima, mais `JC42`, `SPD5118`, `ACPI_POWER`) | +118 784 B | — |
+| tudo módulo | +4 096 B (só o `NVME_HWMON`, que é `bool`) | 15, 276 665 B de `text+data+bss` |
+| **adotada**: enumerados embutidos, Super-I/O em módulo | +16 384 B | 7, 212 866 B de `text+data+bss` |
+
+O tamanho não decide (0,6 % do `bzImage` no pior caso): decide a sonda cega do Super-I/O. O que
+se liga a um dispositivo enumerado fica embutido, sem código novo no PID 1 e valendo também no
+instalador de console; o que sonda portas fica em módulo. Na imagem (**medido**): `bzImage`
+18 371 584 → 18 392 064 B (+20 KiB), `rootfs.squashfs` +116 KiB, `live-modules.img` +96 KiB,
+ISO +256 KiB. `X86_PKG_TEMP_THERMAL`, que o defconfig deixava em módulo e ninguém carregava
+(mostra o mesmo sensor de pacote do coretemp), saiu.
+
+**Travas.** `os check`: os quatro sensores de CPU e disco `=y`, os cinco Super-I/O `=m`
+(embutido é reprovado) e a lista do PID 1 igual à do kernel; o build confere os módulos no
+`.config` e na carga do live; o `boot-test` liga um disco NVMe na VM e exige a temperatura dele
+no `system.health.print`, pedido como o operador pede (`admin` por TLS).
+
 ### O que o roteador avisa quando a placa não sobe (G1.6ja)
 
 O serviço `nic-problems` do daemon olha a máquina a cada 10 s, fora do lock do `Session`: as placas

@@ -13,6 +13,15 @@ Vão na linha de comando do kernel da imagem do roteador e valem a partir do **p
 "Running" é o que este boot usou (`/proc/cmdline`); as linhas dos slots mostram o que cada entrada de boot carrega. Uma atualização (System › Packages) também leva estes parâmetros para o slot novo."##,
     ),
     (
+        "tuning.boot.corerouter.sensors",
+        r##"## O que faz
+Diz se o roteador procura o chip de sensores da placa-mãe (ventoinhas, tensões, temperaturas da placa) ao ligar. **auto** (padrão): procura numa máquina de verdade e não numa máquina virtual; **on**: procura sempre; **off**: nunca. Vale a partir do próximo boot.
+## Quando mudar
+off numa placa em que a procura atrapalha. Esse chip não aparece em nenhuma lista do hardware: o driver escreve em duas portas de E/S (0x2e e 0x4e) e vê quem responde.
+## Cuidado
+Com off, System › Resources › Sensors perde as ventoinhas e as tensões da placa. As temperaturas da CPU e dos discos não dependem disto."##,
+    ),
+    (
         "tuning.boot.intel_idle.max_cstate",
         r##"## O que faz
 O C-state mais profundo que o driver de ociosidade intel_idle pode usar, desde o boot: 0 desliga esse driver, 1 mantém as CPUs em C1. Vale a partir do próximo boot.

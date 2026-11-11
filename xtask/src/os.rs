@@ -125,6 +125,27 @@ const REQUIRED_MODULES: &[&str] = &[
     "CONFIG_PCNET32",
     "CONFIG_DRM_I915",
 ];
+/// G1.6zf: the sensors System › Health reads, built in: these drivers bind
+/// only to a device the machine enumerates (CPUID, PCI, an NVMe controller,
+/// a SATA disk). A notebook showed one ACPI zone and no CPU or NVMe
+/// temperature: none of them was on.
+const SENSORS_BUILT_IN: &[&str] = &[
+    "CONFIG_SENSORS_CORETEMP",
+    "CONFIG_SENSORS_K10TEMP",
+    "CONFIG_NVME_HWMON",
+    "CONFIG_SENSORS_DRIVETEMP",
+];
+/// G1.6zf: the motherboard's Super-I/O drivers, (kernel symbol, module).
+/// Modules, never built in: each writes to I/O ports 0x2e/0x4e to find its
+/// chip, so PID 1 decides when (never in a VM, `corerouter.sensors=off`).
+/// The names are `SENSOR_MODULES` of `corerouter-init`.
+const SENSOR_MODULES: &[(&str, &str)] = &[
+    ("CONFIG_SENSORS_NCT6775", "nct6775"),
+    ("CONFIG_SENSORS_NCT6683", "nct6683"),
+    ("CONFIG_SENSORS_IT87", "it87"),
+    ("CONFIG_SENSORS_F71882FG", "f71882fg"),
+    ("CONFIG_SENSORS_W83627EHF", "w83627ehf"),
+];
 /// What the kernel must not have (`# … is not set` in the fragment, absent
 /// from the built `.config`). G1.6zd: a router plays no sound, and on a
 /// notebook `snd_hda_intel` wrote "Cannot probe codecs, giving up" on the
@@ -480,6 +501,9 @@ pub fn check(os: &Path) -> Result<usize, String> {
         }
         n += 1;
     }
+    let init = std::fs::read_to_string(os.join("../apps/corerouter-init/src/modules.rs"))
+        .map_err(|e| format!("apps/corerouter-init/src/modules.rs: {e}"))?;
+    n += check_sensors(&fragment, &init)?;
     let nics = read("board/x86_64/nics.fragment")?;
     let wide = module_symbols(&nics);
     for want in REQUIRED_NICS {
@@ -611,6 +635,44 @@ fn patches_in(dir: &Path) -> Result<(Vec<PathBuf>, String), String> {
         .map(|b| format!("{b:02x}"))
         .collect();
     Ok((patches, hash))
+}
+
+/// G1.6zf: the fragment has the built-in sensors and the Super-I/O drivers as
+/// modules, and PID 1 (`init`: the text of its `modules.rs`) loads exactly
+/// those modules.
+fn check_sensors(fragment: &str, init: &str) -> Result<usize, String> {
+    let built_in = fragment_symbols(fragment);
+    if let Some(want) = SENSORS_BUILT_IN.iter().find(|s| !built_in.contains(s)) {
+        return Err(format!(
+            "linux.fragment: {want}=y is required (System › Health has no such sensor without it)"
+        ));
+    }
+    let modules = module_symbols(fragment);
+    for (symbol, _) in SENSOR_MODULES {
+        if !modules.contains(symbol) {
+            return Err(format!(
+                "linux.fragment: {symbol}=m is required (a module: it pokes I/O ports to find its chip, PID 1 decides when)"
+            ));
+        }
+    }
+    let list = init
+        .lines()
+        .find_map(|l| l.strip_prefix("pub const SENSOR_MODULES: ["))
+        .and_then(|l| l.split_once("] = [")?.1.strip_suffix("];"))
+        .ok_or("corerouter-init modules.rs: no `pub const SENSOR_MODULES: [&str; N] = [...];` on one line")?;
+    let mut loaded: Vec<&str> = list
+        .split(',')
+        .map(|m| m.trim().trim_matches('"'))
+        .collect();
+    let mut built: Vec<&str> = SENSOR_MODULES.iter().map(|(_, m)| *m).collect();
+    loaded.sort_unstable();
+    built.sort_unstable();
+    if loaded != built {
+        return Err(format!(
+            "corerouter-init loads the sensor modules {loaded:?}, the kernel builds {built:?}"
+        ));
+    }
+    Ok(SENSORS_BUILT_IN.len() + SENSOR_MODULES.len() + 1)
 }
 
 /// G1.6m, G1.6ze: the command line of `what` keeps the built-in drivers from
@@ -1171,6 +1233,7 @@ pub(crate) fn build_with(
     }
     let lost: Vec<&str> = REQUIRED_MODULES
         .iter()
+        .chain(SENSOR_MODULES.iter().map(|(symbol, _)| symbol))
         .filter(|s| !kc.lines().any(|l| l == format!("{s}=m")))
         .copied()
         .collect();
@@ -1231,7 +1294,13 @@ pub(crate) fn build_with(
             "the installer kernel ({boot} bytes) does not fit the boot image"
         ));
     }
-    let (mods, mods_size) = livemods::verify(&installer_dir, &version, REQUIRED_MODULE_FILES)?;
+    // G1.6zf: the live image looks for the motherboard's sensor chip too.
+    let live_required: Vec<&str> = REQUIRED_MODULE_FILES
+        .iter()
+        .copied()
+        .chain(SENSOR_MODULES.iter().map(|(_, module)| *module))
+        .collect();
+    let (mods, mods_size) = livemods::verify(&installer_dir, &version, &live_required)?;
     eprintln!(
         "   live modules: {mods} modules of {version}{}, {:.1} MiB raw",
         livemods::SUFFIX,
@@ -1599,6 +1668,17 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     cmd.arg("-monitor")
         .arg(format!("unix:{},server=on,wait=off", mon.display()));
     cmd.args(hotplug::QEMU_ARGS);
+    // G1.6zf: a second disk, NVMe, only to be read: its temperature must be
+    // in `system.health.print` (QEMU's says 50 °C).
+    let nvme = top.join("boot-test-nvme.raw");
+    std::fs::File::create(&nvme)
+        .and_then(|f| f.set_len(16 << 20))
+        .map_err(|e| format!("{}: {e}", nvme.display()))?;
+    cmd.arg("-drive").arg(format!(
+        "file={},if=none,id=sensor0,format=raw",
+        nvme.display()
+    ));
+    cmd.args(["-device", "nvme,drive=sensor0,serial=CRSENSOR0"]);
     let snapshot = if b.keep_config { "" } else { ",snapshot=on" };
     cmd.arg("-drive").arg(format!(
         "file={},if=virtio,format=raw{snapshot}",
@@ -1651,12 +1731,21 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("qemu-system-x86_64: {e}"))?;
-    let res = watch(&mut child, &b, (port, web_port), started, &log_path, &mon);
+    let res = watch(&mut child, &b, (port, web_port), started, &log_path, &mon).and_then(|r| {
+        // With --efi the guest has no address (the built-in command line).
+        let sensors = if b.efi {
+            "skipped: no address with --efi".to_owned()
+        } else {
+            sensors_check(root, &top, port)?
+        };
+        Ok((r, sensors))
+    });
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_file(&vars);
     let _ = std::fs::remove_file(&mon);
-    let (report, wall_ready, ping, web, hot) = res?;
+    let _ = std::fs::remove_file(&nvme);
+    let ((report, wall_ready, ping, web, hot), sensors) = res?;
     eprintln!("\nboot-test ok ({}):", if kvm { "KVM" } else { "TCG" });
     eprintln!(
         "  kernel start → daemon answers ping: {:.3} s (corerouter-init)",
@@ -1672,6 +1761,7 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
         eprintln!("    {l}");
     }
     eprintln!("  cards plugged in after boot (G1.6n, G1.6j): {hot}");
+    eprintln!("  sensors (G1.6zf):                   {sensors}");
     if let Some(kib) = report.idle_kib {
         eprintln!(
             "  idle memory in use:                 {:.1} MiB",
@@ -1679,6 +1769,56 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// G1.6zf: the image reads the temperature of what the machine has. QEMU has
+/// no CPU sensor, and its NVMe disk has one: `system.health.print`, asked as
+/// an operator does (`admin` over TLS), must list it.
+fn sensors_check(root: &Path, top: &Path, port: u16) -> Result<String, String> {
+    let cli = push::cli(root)?;
+    let home = top.join("boot-test-home");
+    let _ = std::fs::remove_dir_all(&home);
+    let who = install::Admin {
+        home: &home,
+        password: "",
+        strict: false,
+    };
+    // The first reading is the health service's, seconds after ready.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let got = loop {
+        let got =
+            install::cli_run(&cli, &who, port, "system.health.print", "{}").unwrap_or_else(|e| e);
+        let found = disk_temperatures(&got);
+        if !found.is_empty() || Instant::now() >= deadline {
+            break (found, got);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let _ = std::fs::remove_dir_all(&home);
+    match got {
+        (found, _) if !found.is_empty() => Ok(found.join(", ")),
+        (_, text) => Err(format!(
+            "G1.6zf: system.health.print has no temperature of the NVMe disk (CONFIG_NVME_HWMON off?): {}",
+            text.chars().take(600).collect::<String>()
+        )),
+    }
+}
+
+/// The NVMe temperatures of a `system.health.print` answer that make sense
+/// (QEMU's disk says 50 °C), as `chip label value`.
+fn disk_temperatures(answer: &str) -> Vec<String> {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(answer.trim()).unwrap_or_default();
+    rows.iter()
+        .filter(|r| r["type"] == "temperature")
+        .filter_map(|r| {
+            let chip = r["chip"].as_str().filter(|c| c.starts_with("nvme"))?;
+            let value = r["value"].as_f64().filter(|v| (1.0..=120.0).contains(v))?;
+            Some(format!(
+                "{chip} {} {value} °C",
+                r["label"].as_str().unwrap_or_default()
+            ))
+        })
+        .collect()
 }
 
 fn watch(
@@ -2151,6 +2291,48 @@ mod tests {
         assert!(patches_missing(&tree, &patches).is_empty());
         assert!(patches_missing(&tree, &[]).is_empty());
         std::fs::remove_dir_all(&tree).unwrap();
+    }
+
+    /// G1.6zf: the sensors stay in the kernel, the Super-I/O drivers stay
+    /// modules, and PID 1 loads the modules the kernel builds.
+    #[test]
+    fn sensors_built_in_and_super_io_as_modules() {
+        let os = Path::new(env!("CARGO_MANIFEST_DIR")).join("../os");
+        let fragment = std::fs::read_to_string(os.join("board/x86_64/linux.fragment")).unwrap();
+        let init =
+            std::fs::read_to_string(os.join("../apps/corerouter-init/src/modules.rs")).unwrap();
+        assert_eq!(check_sensors(&fragment, &init).unwrap(), 10);
+        let e = check_sensors(&fragment.replace("CONFIG_NVME_HWMON=y", ""), &init).unwrap_err();
+        assert!(e.contains("CONFIG_NVME_HWMON=y is required"), "{e}");
+        // Built in, a Super-I/O driver would probe on every machine and VM.
+        let built_in = fragment.replace("CONFIG_SENSORS_IT87=m", "CONFIG_SENSORS_IT87=y");
+        let e = check_sensors(&built_in, &init).unwrap_err();
+        assert!(e.contains("CONFIG_SENSORS_IT87=m is required"), "{e}");
+        let e = check_sensors(&fragment, &init.replace("\"it87\", ", "")).unwrap_err();
+        assert!(e.contains("loads the sensor modules"), "{e}");
+        let e = check_sensors(&fragment, "").unwrap_err();
+        assert!(e.contains("no `pub const SENSOR_MODULES"), "{e}");
+    }
+
+    /// G1.6zf: what `boot-test` wants from `system.health.print`.
+    #[test]
+    fn the_nvme_disks_temperature_is_found_in_the_answer() {
+        let answer = r#"[
+            {"name":"acpitz-temp1","chip":"acpitz","label":"temp1","type":"temperature","value":27.8},
+            {"name":"nvme0-composite","chip":"nvme0","label":"Composite","type":"temperature","value":50.0,"crit":100.0},
+            {"name":"nvme1-composite","chip":"nvme1","label":"Composite","type":"temperature","value":0.0},
+            {"name":"nvme0-fan1","chip":"nvme0","label":"fan1","type":"fan","value":50.0}
+        ]"#;
+        assert_eq!(disk_temperatures(answer), ["nvme0 Composite 50 °C"]);
+        // Before the first reading, an error text, a kernel without the driver.
+        for none in [
+            "[]",
+            "",
+            "error: connection refused",
+            r#"[{"chip":"acpitz","type":"temperature","value":27.8}]"#,
+        ] {
+            assert!(disk_temperatures(none).is_empty(), "{none}");
+        }
     }
 
     #[test]
