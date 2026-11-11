@@ -20,6 +20,19 @@
 //! No step ever lands before [`MIN_VALID_UNIX`], confirmed or not (RFC 8633
 //! §5.2: prevent steps to a time earlier than the daemon's compile date).
 //!
+//! # The first step of a boot (G4.6m)
+//!
+//! RFC 8633 §5.2 allows the panic threshold to be ignored "at startup":
+//! ntpd `-g`, chrony `makestep`, systemd-timesyncd and ntpd-rs all set the
+//! clock on their first sample. A machine whose battery clock keeps local
+//! time (dual boot with Windows) or a flat battery starts hours off, and
+//! waited for a person. With [`Discipline::allow_boot_step`] (the daemon
+//! calls it once per boot, kept in tmpfs) the first synchronization steps
+//! any offset forward and up to [`BOOT_STEP_BACK_NANOS`] backward without
+//! asking; the first slew or step spends it, and PANICT holds again. A
+//! backward step that large is what a lying server would do to replay old
+//! certificates or logs: beyond a day it still asks.
+//!
 //! # Slew by frequency
 //!
 //! The clock runs slightly fast or slow for a bounded time, the way ntpd-rs
@@ -50,6 +63,10 @@ const MIN_SLEW_SECS: f64 = 16.0;
 /// A confirmation holds while the new measurement stays this close to what
 /// the operator saw; otherwise they are asked again with the new number.
 pub const CONFIRM_TOLERANCE_NANOS: i64 = 60_000_000_000;
+/// G4.6m: the first step of a boot goes back without asking only this far
+/// (a day: a battery clock in local time is at most 14 h ahead), as ntpd-rs
+/// limits its startup step.
+pub const BOOT_STEP_BACK_NANOS: i64 = 86_400 * 1_000_000_000;
 /// Nanoseconds per second per ppm.
 const NANOS_PER_PPM_SEC: f64 = 1000.0;
 
@@ -95,6 +112,8 @@ pub struct Discipline {
     applied_nanos: f64,
     /// The offset the operator is being asked about.
     pending: Option<i64>,
+    /// G4.6m: this boot's first synchronization may pass PANICT.
+    boot_step: bool,
 }
 
 impl Default for Discipline {
@@ -106,6 +125,7 @@ impl Default for Discipline {
             last: None,
             applied_nanos: 0.0,
             pending: None,
+            boot_step: false,
         }
     }
 }
@@ -131,9 +151,24 @@ impl Discipline {
         self.slew.map(|s| s.until)
     }
 
-    /// Forget everything: the clock could not be changed.
+    /// Forget everything: the clock could not be changed (a failed step
+    /// does not spend the boot's first step).
     pub fn reset(&mut self) {
-        *self = Self::default();
+        *self = Self {
+            boot_step: self.boot_step,
+            ..Self::default()
+        };
+    }
+
+    /// G4.6m: this is the boot's first synchronization; it may step past
+    /// PANICT (RFC 8633 §5.2, "at startup"). Spent by the first slew or step.
+    pub fn allow_boot_step(&mut self) {
+        self.boot_step = true;
+    }
+
+    /// The boot's first step is still unspent.
+    pub fn boot_step_open(&self) -> bool {
+        self.boot_step
     }
 
     /// Ends the slew when its time is up. Call it often: the later it runs,
@@ -175,7 +210,10 @@ impl Discipline {
                 confirmed
                     && offset_nanos.saturating_sub(p).saturating_abs() <= CONFIRM_TOLERANCE_NANOS
             });
-            if accepted || wall_unix < MIN_VALID_UNIX {
+            // RFC 8633 §5.2: the panic threshold may be ignored at startup;
+            // forward any amount, backward a day at most (G4.6m).
+            let at_boot = self.boot_step && (offset_nanos > 0 || size <= BOOT_STEP_BACK_NANOS);
+            if accepted || at_boot || wall_unix < MIN_VALID_UNIX {
                 return self.step(offset_nanos);
             }
             self.pending = Some(offset_nanos);
@@ -207,6 +245,7 @@ impl Discipline {
     fn step(&mut self, offset_nanos: i64) -> Action {
         self.phase = Phase::Sync;
         self.pending = None;
+        self.boot_step = false;
         // The step says nothing about the frequency.
         self.last = None;
         self.applied_nanos = 0.0;
@@ -230,6 +269,7 @@ impl Discipline {
     }
 
     fn slew_away(&mut self, now: f64, offset_nanos: i64) -> Action {
+        self.boot_step = false;
         let nanos = offset_nanos as f64;
         let secs = (nanos.abs() / (MAX_SLEW_PPM * NANOS_PER_PPM_SEC)).max(MIN_SLEW_SECS);
         let extra_ppm = nanos / secs / NANOS_PER_PPM_SEC;
@@ -364,6 +404,100 @@ mod tests {
     }
 
     /// The operator saw one number; a very different one is asked again.
+    fn at_boot() -> Discipline {
+        let mut d = Discipline::default();
+        d.allow_boot_step();
+        d
+    }
+
+    /// G4.6m, RFC 8633 §5.2 (the panic threshold may be ignored at
+    /// startup): forward, any amount, without asking.
+    #[test]
+    fn the_first_step_of_a_boot_goes_forward_without_limit() {
+        // The notebook of the audit: 2 h 50 min behind (battery clock in
+        // local time); and a flat battery, a year behind.
+        for off in [10_200 * SEC, 365 * 86_400 * SEC] {
+            let mut d = at_boot();
+            assert_eq!(
+                d.update(0.0, WALL, off, false),
+                Action::Step { offset_nanos: off }
+            );
+            assert!(!d.boot_step_open(), "spent");
+            assert_eq!(d.pending_step(), None);
+        }
+    }
+
+    /// G4.6m, RFC 8633 §5.2: backward a day at most without asking.
+    #[test]
+    fn the_first_step_of_a_boot_goes_back_up_to_a_day() {
+        for off in [-10_800 * SEC, -BOOT_STEP_BACK_NANOS] {
+            let mut d = at_boot();
+            assert_eq!(
+                d.update(0.0, WALL, off, false),
+                Action::Step { offset_nanos: off }
+            );
+        }
+    }
+
+    /// G4.6m, RFC 8633 §5.2: more than a day back is what a lying server
+    /// does to replay the past; it still asks, and the boot's step stays
+    /// open for a sample that makes sense.
+    #[test]
+    fn the_first_step_of_a_boot_asks_beyond_a_day_back() {
+        let mut d = at_boot();
+        let off = -BOOT_STEP_BACK_NANOS - SEC;
+        assert_eq!(
+            d.update(0.0, WALL, off, false),
+            Action::NeedConfirm { offset_nanos: off }
+        );
+        assert_eq!(d.pending_step(), Some(off));
+        assert!(d.boot_step_open());
+        // Nothing lands before the floor either (the earlier rule).
+        let mut d = at_boot();
+        let past = (MIN_VALID_UNIX - WALL - 10) * SEC;
+        assert!(matches!(
+            d.update(0.0, WALL, past, false),
+            Action::Refuse { .. }
+        ));
+    }
+
+    /// G4.6m, RFC 8633 §5.2: only the first synchronization of the boot.
+    /// After it (a step, or a slew: the clock was right) PANICT holds again.
+    #[test]
+    fn the_second_step_of_the_same_boot_asks_again() {
+        let mut d = at_boot();
+        assert!(matches!(
+            d.update(0.0, WALL, 10_200 * SEC, false),
+            Action::Step { .. }
+        ));
+        let off = 5_000 * SEC;
+        assert_eq!(
+            d.update(64.0, WALL, off, false),
+            Action::NeedConfirm { offset_nanos: off }
+        );
+        // A first sample that only slews spends it too.
+        let mut d = at_boot();
+        assert!(matches!(
+            d.update(0.0, WALL, 3 * MS, false),
+            Action::Slew { .. }
+        ));
+        assert!(!d.boot_step_open());
+        assert!(matches!(
+            d.update(64.0, WALL, off, false),
+            Action::NeedConfirm { .. }
+        ));
+        // A clock that could not be set keeps it (the step did not happen).
+        let mut d = at_boot();
+        d.reset();
+        assert!(d.boot_step_open());
+        // Without the boot's step (a daemon restarted in the same boot):
+        // PANICT, as before.
+        assert!(matches!(
+            Discipline::default().update(0.0, WALL, 10_200 * SEC, false),
+            Action::NeedConfirm { .. }
+        ));
+    }
+
     #[test]
     fn a_confirmation_does_not_cover_another_offset() {
         let mut d = Discipline::default();

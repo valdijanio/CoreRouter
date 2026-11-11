@@ -57,6 +57,9 @@ fn daemon(dir: &Path) -> Kill {
     .arg("--token-file")
     .arg(common::token_file(None, dir))
     .env("RUST_LOG", "info")
+    // G4.6m: the boot's first-step mark of this run only (the first sample,
+    // 2 s, spends it; the 1100 s after it must still ask).
+    .env("COREROUTER_RUNTIME_DIR", dir)
     .stdout(Stdio::null())
     .stderr(Stdio::null());
     let d = Kill(c.spawn().unwrap());
