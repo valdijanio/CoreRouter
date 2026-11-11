@@ -10199,3 +10199,524 @@ continuação indentadas).
   Como testar: `git ls-tree --name-only origin/main docs/changes/ | grep '\.md$' | grep -vc
   '/README\.md$'` dá o número de arquivos pendentes; com menos de 10 a fila escreve "fold adiado:
   N arquivo(s)" no fim do lote, e `scripts/land.sh --fold` consolida na hora.
+
+- 2026-11-11 — G1.30: Wi-Fi em modo estação, parte 1 de 3: a imagem. Pedido do dono depois de instalar num notebook
+  (Lenovo LOQ 15IRH8, Wi-Fi Realtek RTL8852BE, `10ec:b852`) e não ver a placa. Escopo escolhido
+  por ele em 2026-11-11, depois da pesquisa: conjunto "recomendado" de drivers, `wpa_supplicant`
+  orquestrado, WPA2-PSK e WPA3-SAE, uma rede por interface, sem Wi-Fi na ISO live, três PRs
+  empilhados. Pesquisa, comparação Rust puro × `wpa_supplicant` × iwd e o que ficou de fora:
+  `docs/wifi.md`. O que toca a imagem: `docs/os-image.md`, "Wi-Fi (G1.30)".
+
+  O que entrou:
+
+  - **Pilha em módulo** (`nics.fragment`): `cfg80211`, `mac80211` e `rfkill` vinham embutidos pelo
+    `x86_64_defconfig`, sem nenhum driver. Embutido, o cfg80211 pedia o `regulatory.db` antes do
+    `/` e ficava sem base para sempre (`net/wireless/reg.c`: `regdb = ERR_PTR(-ENODATA)`).
+  - **Drivers:** `iwlwifi` com `iwlmvm` e `iwlmld`, `mt7921e`, `mt7925e`, `rtw88` e `rtw89`
+    (PCIe e USB), `mac80211_hwsim` para teste. Fora, com o motivo no `docs/wifi.md`: `iwldvm`,
+    Atheros, Broadcom e adaptadores USB antigos.
+  - **Trava de firmware** (`xtask/src/os/firmware.rs`): regra própria para o `iwlwifi`
+    (`iwlwifi_requests`). O driver declara a versão mais nova que conhece e, em tempo de
+    execução, tenta dela para baixo com o passo real do chip (`iwl-drv.c`,
+    `iwl_request_firmware`), e pede um `.pnvm` que não declara. Dos 49 nomes declarados, 30 não
+    existem na tag `20261019`; a trava leva, por prefixo, a versão mais nova que o driver tenta.
+  - **`regulatory.db` e `.p7s`** instalados pelo `corerouter-firmware`, o dono de `lib/firmware`.
+    Achado no QEMU: o `os build` esvazia o `lib/firmware` de toda pasta por pacote a cada build,
+    e no segundo build o arquivo do `wireless-regdb` sumia (`cfg80211: failed to load
+    regulatory.db`). O `firmware::verify` agora reprova imagem com `cfg80211.ko` e sem a base.
+  - **`wpa_supplicant` 2.12** com nl80211, WPA3 e socket de controle (`REQUIRED_BR2`). O
+    `post-build.sh` tira o `wpa_supplicant.conf` de exemplo do Buildroot (ele entra em qualquer
+    rede aberta), os scripts de ifupdown, as bibliotecas do libnl que ele não liga e as amostras
+    do OpenSSL. Nada o inicia ainda: é da parte 2.
+  - **PID 1** (`apps/corerouter-init/src/modules.rs`): passada `Wifi`, depois do sinal de boot
+    pronto (o driver de um rádio não entra na espera do boot). O `iwlwifi` carrega junto com
+    `iwlmvm` e `iwlmld`: ele pede a metade certa ao `/sbin/modprobe` (`request_module_nowait`),
+    que o carregador por modalias não atende.
+  - **Rádio não é porta.** O netdev de uma estação tem `type` 1 e `device`, sem
+    `IFLA_INFO_KIND`, igual a uma porta Ethernet. O PID 1 passa a olhar o `phy80211`
+    (`links.rs`) e o `hal-linux` pergunta ao nl80211 só quando aparece um link novo e o
+    cfg80211 já está no kernel (`wifi_links.rs`): o rádio sai em `interface.list` como `wifi`,
+    não gerenciado, em vez de virar `ether`, ganhar lugar no setup do console e cliente DHCP na
+    ISO live. Achado ao medir o boot: sem a condição do cfg80211, a própria pergunta fazia o
+    kernel carregar `cfg80211` e `rfkill` em toda máquina (+48 ms por boot).
+  - **ISO live sem Wi-Fi** (`installer.fragment`, `INSTALLER_OFF`): o kernel da ISO não tem a
+    pilha. Mas a raiz do live é a da imagem e vai para a RAM: o mínimo de RAM do live subiu de
+    320 para 448 MiB (abaixo).
+  - `cargo xtask os boot-test --wifi` e `corerouter.hwsim=N` na linha do kernel: o PID 1 carrega
+    N rádios simulados, para conferir a pilha onde não há placa.
+
+  Como testar:
+
+  ```sh
+  cargo xtask os build
+  cargo xtask os boot-test --wifi     # espera "wifi: 2 test radios" no console
+  cargo xtask os install-test         # e --firmware seabios
+  cargo test -p corerouter-init -p xtask firmware
+  ```
+
+  Conferido (**medido**, QEMU/KVM q35, 2026-11-11):
+
+  - boot sem placa Wi-Fi: `/proc/modules` vazio (nenhum módulo de Wi-Fi carregado);
+  - `boot-test --wifi`: `driver mac80211_hwsim loaded in 114 ms`, `wifi: 2 test radios`; no shell
+    de manutenção, o `dmesg` traz só `cfg80211: Loading compiled-in X.509 certificates for
+    regulatory database` (sem `failed to load`), `/proc/modules` com `rfkill`, `cfg80211`,
+    `libarc4`, `mac80211`, `mac80211_hwsim`, e `wpa_supplicant -v` responde `v2.12`;
+  - pelo canal de controle da mesma VM, `interface.list` mostra `wlan0` e `wlan1` com
+    `type: wifi`, `managed: false`, e `ether1` gerenciada; `interface.hardware-problem.print`
+    sem problemas;
+  - contraprova do `regulatory.db`: na imagem do segundo build, antes da correção, o `dmesg`
+    trazia `cfg80211: failed to load regulatory.db` e o arquivo não estava em `/lib/firmware`.
+
+  Custo (**medido**, antes = G1.6zd):
+
+  | O quê | Antes | Depois |
+  |---|---|---|
+  | `bzImage` | 18 371 584 B | 17 376 256 B (−0,95 MiB) |
+  | `rootfs.squashfs` | 56 094 720 B | 90 030 080 B (+32,36 MiB) |
+  | `corerouter.crpkg` | 74 909 271 B | 108 123 735 B (+31,68 MiB) |
+  | ISO | 139 735 040 B | 171 954 176 B (+30,73 MiB) |
+  | Kernel da ISO | 19 633 152 B | 18 777 088 B (−0,82 MiB) |
+  | `live-modules.img` | 5 607 424 B | 5 607 424 B |
+
+  - Firmware de Wi-Fi: 61 arquivos, 62 961 222 B crus; módulos: 55 `.ko`, 23 068 224 B;
+    `wpa_supplicant` com OpenSSL e libnl: 9 018 784 B crus.
+  - **Mínimo de RAM da ISO live: 320 → 448 MiB.** A raiz na RAM foi de 47 para 86 MiB. Com
+    320 MiB o primeiro login com senha (Argon2) mata o daemon (`terminating_signal: 9`) e a
+    instalação em andamento some; com 384 MiB instala quase sempre, mas 300 dos 329 MiB chegam a
+    ficar em uso e 1 de 11 instalações falhou; o teste usa 448. Com menos RAM a ISO fica no
+    instalador de console, que instala igual. O roteador instalado não paga isso.
+
+  Não conferido: placa de verdade. O QEMU não emula Wi-Fi. Só no notebook se vê o `rtw89_8852be`
+  carregar com o firmware `rtw89/rtw8852b_fw-1.bin`, o tempo dessa sonda e se a tecla de modo
+  avião bloqueia o rádio. O carregamento das duas metades do `iwlwifi` só se confirma numa placa
+  Intel. A regra do `iwlwifi` na trava foi conferida contra o fonte e a tag, não contra cada
+  chip.
+
+- 2026-11-11 — G1.30: Wi-Fi em modo estação, parte 2 de 3: o motor. O roteador entra numa rede Wi-Fi por comandos.
+  Desenho, comandos e o que ficou de fora: `docs/wifi.md`, "Motor (parte 2)".
+
+  O que entrou:
+
+  - **Modelo** (`crates/model/src/wifi.rs`): interface de tipo `wifi` (`InterfaceKind::Wifi`)
+    com a rede (`ssid`, `security` auto/wpa3/wpa2/open, `passphrase` selada, `hidden`, `band`,
+    `bssid`) e o país do roteador (`system.wifi.country`). Config antiga carrega igual.
+  - **Comandos** (`crates/engine/src/cmd/wifi.rs`): `interface.wifi.list`, `.set`, `.enable`,
+    `.disable`, `.scan`, `.networks`, `.monitor`, `.reconnect`, `.history`, `.adopt`,
+    `.country.set` e `.country.get`.
+  - **Recusas:** rádio ligado sem país (na validação do commit, com o comando a rodar na
+    mensagem); mudar a rede do rádio por onde a sessão chega sem Safe Mode nem `force`; rádio em
+    bridge; redes 802.1X, OWE e WEP/TKIP aparecem na varredura com o motivo de não entrar.
+  - **Runtime** (`crates/engine/src/wifi.rs`): no relógio dos clientes DHCP e PPPoE; diz a rede
+    ao rádio uma vez por mudança da config em uso, lê os eventos, guarda a falha em palavras
+    (`wrong-key`, `not-found`, `rejected`, `no-answer`) e o histórico. A causa fica: depois de
+    uma senha errada o supplicant deixa o AP de lado e "não acha a rede"; o motor mantém
+    `wrong-key` enquanto a rede continuar sendo ouvida. Segue commit, rollback, modo
+    transacional e Safe Mode.
+  - **Plataforma:** trait `WifiPort` (`crates/hal/src/wifi.rs`); rádio de laboratório com sete
+    redes (`crates/hal/src/lab_wifi.rs`), ligado no `--backend virtual` do daemon como `wifi1`.
+  - **Linux** (`crates/hal-linux/src/wifi.rs`): um `wpa_supplicant` para todos os rádios,
+    iniciado no primeiro uso, sem arquivo de configuração; a senha vai pelo socket de controle.
+    País por nl80211 (`REQ_SET_REG`), domínio em vigor lido do kernel (`GET_REG`).
+  - **PID 1:** o `wlanN` do kernel vira `wifiN`, guardado pelo MAC em `/config/.wifi-names`;
+    `corerouter.unmanaged=<nomes>` na linha do kernel passa `--unmanaged` ao daemon.
+  - **Segredo:** a senha fica selada na config e sai como `***` em lista, journal, log, diff,
+    inspect e export; `passphrase` entrou nas palavras secretas do `/export`.
+  - **Tópico de log** `wireless`.
+
+  Como testar:
+
+  ```sh
+  cargo test -p corerouter-engine --test it wifi
+  cargo test -p corerouter-hal-linux --lib wifi
+  cargo xtask os build && cargo xtask os wifi-test
+  cargo run -p corerouter-daemon -- --control 7979     # o laboratório tem o wifi1
+  cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run interface.wifi.country.set '{"country":"BR"}'
+  cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run interface.wifi.set '{"name":"wifi1","ssid":"CoreRouter-Lab","passphrase":"corerouter-lab","disabled":false}'
+  cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run interface.wifi.monitor '{"name":"wifi1"}'
+  ```
+
+  Conferido na imagem (`cargo xtask os wifi-test`, QEMU/KVM, `mac80211_hwsim` com `hostapd`
+  2.12 em WPA2+WPA3, **medido** em 2026-11-11):
+
+  - domínio regulatório `BR` em vigor, sem linha de `regulatory.db` no `dmesg`;
+  - varredura ouve o AP em 7,1 s (todos os canais de 2,4 e 5 GHz);
+  - `security=auto` entra com WPA3 (SAE) e PMF; `wpa2` e `wpa3` forçados entram cada um com o
+    seu; o teste lê o estado a cada 0,7 s e viu `connected` na primeira leitura;
+  - 3 de 3 ecos pelo enlace cifrado (IPv6 de enlace, `tool.ping.start`), média 0,11–0,16 ms;
+  - senha errada vira `wrong-key` e fica; rede que não existe vira `not-found`;
+  - AP reiniciado: o rádio volta sozinho em 6,0 s, e a queda é contada;
+  - rádio desligado: sai da rede e o `wpa_supplicant` termina;
+  - a senha não está em nenhum arquivo de `/config`, `/run`, `/var` e `/etc`.
+
+  Custo (**medido**, mesma máquina; antes = `main` em 4dcddb99, com a parte 1):
+
+  - `rootfs.squashfs` 90 222 592 → 90 411 008 B (+0,18 MiB); `bzImage` igual (18 301 952 B);
+    `corerouter.crpkg` 109 246 039 → 109 434 455 B; ISO 174 108 672 → 174 297 088 B.
+  - Boot (`kernel → daemon pronto`, 7 boots de cada, alternados): 0,84–0,97 s (mediana 0,85)
+    antes, 0,84–0,86 s (mediana 0,85) depois.
+  - Memória com o rádio conectado: `wpa_supplicant` 7,3 MiB de RSS; daemon 42 MiB (igual a sem
+    rádio, dentro da variação). Sem rádio ligado o supplicant não roda.
+  - `hostapd` (1 493 776 B) é compilado e fica fora da imagem, em `images/test-tools/`.
+
+  Não conferido: placa de verdade (firmware, tecla de modo avião, placa Intel autogerida, DFS).
+
+- 2026-11-11 — G1.30: Wi-Fi em modo estação, parte 3 de 3: as telas. Desenho em `docs/wifi.md`, "Telas (parte 3)".
+
+  O que entrou:
+
+  - **Janela Interfaces › Wi-Fi** (`crates/ui/src/wifi.rs`, painel): aba Radios (estado em selo
+    com o motivo da última falha ao lado, rede em selo colorido, sinal, canal, taxa, driver;
+    ✓ ✗ 💬, `Scan…`, `Reconnect`; o `monitor` do rádio selecionado embaixo) e aba Networks (o
+    que a varredura ouviu, `Rescan`, `Connect…`). O país fica na primeira linha, com o diálogo
+    `Change…`.
+  - **Modal do rádio** alimentado por `interface.wifi.preview` (novo): os erros e avisos do
+    `interface.wifi.set`, se a rede está ao alcance, o país que falta, o risco de acesso e os
+    comandos, com a senha como `•••`.
+  - **`interface.wifi.set`: outra rede pede a própria senha.** Trocar o `ssid` sem dar a
+    `passphrase` esquece a anterior.
+  - **Assistente do console** (`apps/corerouter-init/src/setup_wifi.rs`): o rádio aparece na
+    lista de portas; escolhido, entra o passo `[2/5] Wi-Fi network` (país, varredura, rede,
+    senha sem eco) e o endereço aceita `dhcp`. Se o rádio não entra em 30 s, a rede é tirada e o
+    motivo aparece. A tela de status mostra o rádio como porta.
+  - Ícone `WIFI_HIGH` (Phosphor) no menu e na lista de interfaces; explicações ⓘ em português e
+    inglês para cada coluna, campo e para o item de menu.
+  - `cargo xtask os wifi-test` ganhou o cenário do assistente (`--only setup`), num segundo
+    console da VM (virtio, `hvc0`).
+
+  Como testar:
+
+  ```sh
+  cargo test -p corerouter-ui wifi
+  cargo test -p corerouter-engine --test it wifi
+  cargo test -p corerouter-init
+  cargo run -p corerouter-daemon -- --control 7979      # o laboratório tem o wifi1
+  cargo run -p corerouter-gui -- --connect 127.0.0.1:7979 --control 7990
+  #   Interfaces › Wi-Fi: Change… (BR), ✓ no wifi1, Scan…, Connect… em CoreRouter-Lab
+  #   (a senha dela no laboratório é "corerouter-lab")
+  cargo xtask os build && cargo xtask os wifi-test
+  ```
+
+  Conferido (**medido**, 2026-11-11, QEMU/KVM, `mac80211_hwsim` com `hostapd` WPA2+WPA3):
+
+  - GUI contra o daemon com o laboratório virtual, `screenshot` olhado nos temas escuro e claro e
+    com rótulos em português: lista, monitor, aba Networks, modal com e sem senha, senha errada.
+  - Assistente na imagem (`wifi-test --only setup`): país inválido recusado pelo motor e
+    perguntado de novo; a rede aparece na lista 7,0 s depois de a varredura começar; senha curta
+    recusada antes de aplicar; senha errada dita em 0,6 s, com a rede tirada e o rádio desligado
+    de novo, sem endereço nenhum aplicado; na segunda vez, conectado com WPA3 e com o endereço
+    fixo em 0,6 s; nenhuma das três senhas digitadas aparece no console.
+
+  Não conferido: placa de verdade; o caminho `dhcp` do assistente além do `ip.dhcp-client.add`
+  (o AP de teste não tem servidor DHCP).
+
+- 2026-11-11 — G1.6zf: Sensores em qualquer hardware. Num notebook real (Lenovo LOQ 15IRH8) o `system.health.print`
+  trouxe só a zona ACPI (`acpitz`, 27,8 °C) e a bateria. O coletor já lia qualquer chip de
+  `/sys/class/hwmon`; o kernel da imagem tinha `HWMON=y` e nenhum driver de CPU, disco ou
+  placa-mãe.
+
+  O que entrou:
+
+  - kernel (`os/board/x86_64/linux.fragment`, vale também para o da ISO): embutidos os sensores
+    que só se ligam a um dispositivo que a máquina enumera: `SENSORS_CORETEMP` (CPU Intel),
+    `SENSORS_K10TEMP` (CPU AMD/Hygon), `NVME_HWMON`, `SENSORS_DRIVETEMP` (disco SATA),
+    `INTEL_PCH_THERMAL` (chipset Intel), `REALTEK_PHY_HWMON` (portas RTL8125/8126);
+  - o chip de sensores da placa-mãe (Super-I/O: ventoinhas, tensões, temperaturas da placa) em
+    módulo: `SENSORS_NCT6775`, `SENSORS_NCT6683`, `SENSORS_IT87`, `SENSORS_F71882FG`,
+    `SENSORS_W83627EHF`. Esses chips não são enumerados: o driver escreve nas portas 0x2e/0x4e
+    para ver quem responde. O PID 1 (`apps/corerouter-init/src/modules.rs`, `load_sensors`) os
+    carrega pelo nome, por último e sem o boot esperar, nunca em máquina virtual; chip ausente
+    não gera linha, chip que o firmware usa por ACPI gera uma linha de aviso;
+  - `corerouter.sensors=auto|on|off` (PID 1) e o mesmo parâmetro em `system.tuning.boot.set`
+    (aba Boot de System › Tuning, seção Hardware), para desligar a procura numa placa em que ela
+    atrapalhe;
+  - nomes: dois discos NVMe eram dois chips `nvme` com os mesmos rótulos (`nvme-composite` duas
+    vezes). O coletor (`crates/hal-linux/src/resource.rs`) junta ao nome o que distingue o chip:
+    `nvme0`, `drivetemp sda`, `ixgbe ether3`, e o que sobrar igual ganha o número (`k10temp 2`);
+  - entrada que a placa não liga: as leituras do chip da placa-mãe vêm marcadas (`board` no
+    `Sensor` do hal e no `system.health.print`), sem `max` nem `crit` (são os alarmes do
+    firmware), e não entram na temperatura do roteador (barra, gráfico, verificação
+    `temperature`) enquanto houver outro sensor. Um pino aberto marca 127 °C e viraria alarme;
+  - `X86_PKG_TEMP_THERMAL`, módulo do defconfig que ninguém carregava, saiu;
+  - travas: `os check` exige os quatro sensores de CPU e disco `=y`, os cinco Super-I/O `=m`
+    (embutido reprova) e a lista do PID 1 igual à do kernel; o build confere os módulos no
+    `.config` e na carga do live; o `boot-test` liga um disco NVMe na VM e exige a temperatura
+    dele no `system.health.print` pedido por TLS.
+
+  Decisão embutir × módulo (**medido**, kernel 6.18.59 com o `.config` da imagem, compilado à
+  parte; o `bzImage` da base bate byte a byte com o da imagem): tudo embutido +118 784 B; tudo
+  módulo +4 096 B e 15 módulos (276 665 B de `text+data+bss`); adotada +16 384 B e 7 módulos
+  (212 866 B). O tamanho não decide: decide a sonda cega do Super-I/O, que embutida rodaria em
+  toda máquina e VM sem como desligar. Debian e VyOS usam módulo; o OpenWrt embute os de CPU.
+
+  Conferido (**medido**, QEMU/KVM q35, 2026-11-11, imagem desta branch):
+
+  - disco instalado com dois discos NVMe a mais (`-device nvme`), `system.health.print` pela CLI
+    por TLS: `nvme0 Composite 49.9 °C` e `nvme1 Composite 49.9 °C` (max 69.9, crit 99.9, `ok`),
+    nomes distintos; `system.resource.print` dá `temperature = nvme1 Composite 49.9 °C` e a
+    verificação `temperature` fica `ok`; nenhuma linha de erro no log;
+  - `boot-test`: `sensors (G1.6zf): nvme0 Composite 49.9 °C` (a trava nova);
+  - `corerouter.sensors=on` numa VM: `sensors: no motherboard sensor chip answered (58 ms)`; sem
+    o parâmetro a procura não roda na VM (nenhuma linha `sensors:`);
+  - o caminho do operador de ponta a ponta, no `ab-test`: `system.tuning.boot.set
+    corerouter.sensors=on`, atualização para o slot B, e o boot de teste do B traz a linha
+    `sensors: …` (o parâmetro chegou ao PID 1);
+  - telas (`docs/changes/G1.6zf-screenshots/`): aba Sensors e a explicação dela, aba Boot de
+    System › Tuning com a seção Hardware e a explicação de `corerouter.sensors`. A primeira
+    captura mostrou "Ainda sem explicação" (a entrada estava fora da ordem da tabela, que é
+    buscada por bisseção); corrigido e fotografado de novo;
+  - `install-test` e `ab-test` em OVMF e SeaBIOS, `boot-test` e `boot-test --efi`: verdes.
+
+  Custo na imagem (**medido**, antes = G1.6ze): `bzImage` 18 371 584 → 18 392 064 B (+20 KiB);
+  `rootfs.squashfs` 56 094 720 → 56 213 504 B (+116 KiB); `live-modules.img` 5 607 424 →
+  5 705 728 B (+96 KiB); `BOOTX64.EFI` do instalador +12 KiB; ISO 139 735 040 → 139 997 184 B
+  (+256 KiB); `corerouter.crpkg` +140 KiB. Boot (kernel → daemon pronto, três rodadas alternadas
+  de cada imagem com a máquina carregada, média de carga 25–50): antes 0,97 / 1,09 / 1,69 s,
+  depois 0,98 / 1,06 / 2,39 s; o trecho do kernel até o init, 0,66 s antes e 0,67 s depois (o
+  melhor de três). Sem diferença que o ruído deixe ver.
+
+  Não conferido, por falta de hardware (o QEMU não emula nenhum destes): `coretemp`, `k10temp`,
+  `intel_pch_thermal`, o PHY Realtek e os cinco Super-I/O numa placa de verdade (inclusive o caso
+  `EBUSY` do ACPI e os rótulos de cada chip); `drivetemp` (o disco SATA do QEMU não se declara
+  SATA no IDENTIFY, palavra 93, e o driver o recusa). O dono confere no notebook: devem aparecer
+  `coretemp` (Package e núcleos), `nvme0` e, se a placa tiver um Super-I/O que o firmware não
+  reserve, ventoinhas e tensões.
+
+- 2026-11-11 — G1.6zg: Console local com cor e formato, sem perder compatibilidade. O dono deu boot da ISO num notebook
+  real e achou o console "muito pobre e mal formatado"; depois pediu o mesmo para o instalador de
+  console e escolheu a opção A (linhas com cor, sem tela cheia). Regras e desenho em
+  `docs/console.md`.
+
+  O que entrou em `apps/corerouter-init`:
+
+  - **`style.rs`** (novo): a tabela de estilos num lugar só (`Title`, `Key`, `Good`, `Warn`, `Bad`,
+    `Dim`, `Ask`), só SGR básico (negrito, meio-brilho, 8 cores, sem azul), reset no fim de cada
+    trecho e de cada linha; largura máxima de 78 colunas depois de uma margem de 1 (a coluna 0
+    fica vazia: monitor com overscan a corta); só ASCII; quebra de linha nos espaços;
+    a chave da cor. Texto de fora (erro do daemon, modelo do disco, o que foi digitado) perde
+    todo caractere de controle antes de ir para o terminal.
+  - **Cor ligada na tela e na serial**, desligável na linha do kernel: `corerouter.color=off`,
+    `corerouter.color=screen` (só na tela), `NO_COLOR=1` ou `TERM=dumb`. O instalador e a
+    atualização levam `corerouter.color=` para o slot gravado (`CARRY_PREFIXES`).
+  - **Tela de status única** (`setup.rs`), no máximo 24 linhas de 78 colunas: produto, versão
+    (`corerouter-buildinfo`, a mesma do daemon) e a máquina (DMI); `Web`/`GUI`/`CLI` com o
+    endereço de gerência em destaque; a impressão digital SHA-256 do certificado TLS (a que a
+    GUI, a CLI e o navegador mostram na primeira conexão); tabela de portas com enlace (`up`,
+    `down`, `off`) e endereço; avisos (`WARNING`: live não instalada, `admin` sem senha, checagens
+    de saúde em alerta). Sem endereço, a mesma tela convida ao assistente.
+  - **Assistente do primeiro boot** em passos `[1/4] Management port`, `[2/4] Address`,
+    `[3/4] Admin password`, `[4/4] Apply`, perguntas num formato só (`Pergunta [padrão] (forma): `).
+  - **Instalador** (`install.rs`) em passos `[1/5] Medium` … `[5/5] Write`: cabeçalho com firmware
+    e consoles; tabela de discos com o oferecido em negrito e o não oferecido esmaecido, sem
+    número, com o motivo na linha de baixo; `!! ALL DATA ON <disco> WILL BE ERASED !!` em vermelho
+    com tamanho, modelo, serial e o que o disco guarda; gravação numa linha que só cresce
+    (`Writing vda: 10% 20% … 100%`, sem `\r`); `OK  INSTALLED CoreRouter <versão> on <disco>` em
+    verde com o que fazer agora e o endereço para abrir; `FAILED  The install failed: <causa>` em
+    vermelho; detalhes técnicos (commit, chave, tempos) esmaecidos. A instalação não assistida
+    passa pelos mesmos passos sem perguntar.
+
+  Defeitos corrigidos no caminho:
+
+  - na ISO live o bloco de status saía duas vezes (`setup.rs:147-155`): agora uma tela por
+    mudança, e o primeiro desenho espera até 8 s pelo DHCP quando há cliente ligado, em vez de
+    mostrar "sem endereço" e, um instante depois, tudo de novo;
+  - a resposta digitada num console deixava a linha do outro aberta, e as perguntas seguintes
+    saíam emendadas (na serial, quando se respondia na tela): a resposta agora aparece nos
+    outros consoles (a senha, só a quebra de linha);
+  - porta desligada (toda porta no primeiro boot) aparecia como `no link`: agora `off` ("port
+    off, link unknown");
+  - `^H`/`DEL` do terminal que apaga com o outro caractere e teclas de seta ficavam na resposta;
+  - linhas de até 160 colunas quebravam no meio da palavra na tela VGA de 80 colunas (BIOS), e
+    `…`/`—` iam em UTF-8 para a serial.
+
+  Testes: 15 de unidade novos no init e 1 no xtask (nenhuma linha começa na coluna 0 nem passa
+  da 79, só ASCII, nenhum escape com a cor
+  desligada, só os SGR da tabela e reset em toda linha colorida, texto hostil neutralizado, a
+  tela de status em ≤ 24 linhas com 48 portas e tudo ligado, impressão digital igual à do
+  `control::tls`). O `cargo xtask os install-test` segue os passos novos, lê a serial sem os SGR
+  (`console_text`) e confere que ela veio com cor.
+
+  Como testar: `cargo xtask os build`, depois `cargo xtask os install-test` (e `--firmware
+  seabios`), `cargo xtask os ab-test`, `cargo xtask os boot-test`; para ver, a ISO ou o `disk.img`
+  no QEMU com `-vga std` (tela) e `-serial stdio`.
+
+  Conferido (**medido**, QEMU/KVM q35, 2026-11-11; telas em `docs/changes/G1.6zg-screenshots/`):
+
+  - **tela VGA em UEFI** (OVMF, framebuffer 1280×800) e **em BIOS** (SeaBIOS, texto 80×25), disco
+    instalado: tela sem endereço, assistente inteiro (porta, endereço, gateway, senha, `Apply`),
+    status depois de aplicar e de novo com Enter; em BIOS a tela de status cabe nas 25 linhas e
+    nenhuma linha quebra;
+  - **ISO live** nos dois firmwares: uma tela de status só (antes saía duas vezes), depois da
+    espera do DHCP;
+  - **instalador** nos dois firmwares, digitando no teclado da VM: discos, endereço, confirmação
+    em vermelho, gravação, `OK  INSTALLED` em verde e o que fazer agora;
+  - **serial**: capturada crua e mostrada num terminal VTE (o motor do gnome-terminal), com cor;
+    só SGR depois que o init começa (`ESC[0m`, `1`, `1;33`, `1;36`, `2`, `32`, `1;31`), nenhum
+    byte fora do ASCII no texto do console, linha mais larga com 79 colunas (margem + 78); as
+    respostas digitadas na tela aparecem na serial;
+  - **cor desligada**: `corerouter.color=off`, `corerouter.color=screen` e `NO_COLOR=1` na linha
+    do kernel: 0 bytes ESC na serial nos três; com `screen` a tela continua colorida;
+  - **impressão digital**: a do console é a que o `openssl s_client` vê na porta 8729 e na 443, e
+    `https://<endereço>/` responde 200;
+  - **mockups** das opções não adotadas (caixas em Unicode, menu numerado) desenhados no VT de
+    verdade: o `⚠` vira `■` na fonte do kernel;
+  - `cargo xtask os install-test` e `ab-test` com OVMF e com `--firmware seabios`, `boot-test` e
+    `boot-test --efi`: verdes. Repetido depois dos merges da `main` da noite, o `install-test
+    --firmware seabios` passou 5 vezes em 7; as duas falhas são intermitentes e não vêm do
+    console (abaixo).
+
+  Achado fora do escopo (**medido**, reproduzido também na ISO anterior a esta mudança): ao
+  instalar pela rede na live com 320 MiB de RAM (o piso que o `install-test` usa), o kernel mata
+  o daemon por falta de memória (`Out of memory: Killed process … corerouter-daem …
+  anon-rss:183164kB`), a instalação some do estado e a live fica sem endereço. É a causa da
+  falha rara `install did not end` do `install-test`. A outra falha rara (`marker and port map`)
+  é uma corrida do próprio teste, que lê o marcador antes de o PID 1 gravá-lo.
+
+  Não conferido: máquina real (o notebook do dono), o console serial-over-LAN de um BMC e um
+  terminal de serial físico. O `xterm.js` do Proxmox, o PuTTY e o minicom não foram abertos: a
+  serial foi vista num terminal VTE (o motor do gnome-terminal).
+
+- 2026-11-11 — G1.6zi: Cobertura de hardware do kernel da imagem e da ISO. O primeiro boot num notebook real e a
+  leitura do `.config` mostraram o que impedia o roteador de dar boot, enxergar o disco ou usar
+  todos os núcleos em hardware comum, e o que deixava um defeito sem rastro. Tudo embutido (não há
+  initramfs); detalhe, decisões e números em `docs/os-image.md`, "Cobertura de hardware".
+
+  O que entrou (`os/board/x86_64/linux.fragment`):
+
+  - **núcleos**: `MAXSMP` (`NR_CPUS=8192`; eram 64: `CPU limit of 64 reached. Ignoring further
+    CPUs`) e `IRQ_REMAP` (sem ele uma máquina real não usa x2APIC e as CPUs de APIC id ≥ 255 não
+    sobem). `INTEL_IOMMU_DEFAULT_ON` segue desligado: o DMA não muda;
+  - **disco de boot**: eMMC e SD (`MMC`, `MMC_BLOCK`, `MMC_SDHCI`, `MMC_SDHCI_PCI`,
+    `MMC_SDHCI_ACPI`), NVMe atrás de Intel VMD (`VMD`), HPE Smart Array Gen10+
+    (`SCSI_SMARTPQI`), Broadcom MPI3 (`SCSI_MPI3MR`), `USB_UAS`;
+  - **hipervisores**: Hyper-V e Azure (`HYPERV`, `HYPERV_VMBUS`, `HYPERV_STORAGE`, `HYPERV_NET`,
+    `HYPERV_KEYBOARD`, `HYPERV_UTILS`), Xen HVM com drivers paravirtuais (`XEN`,
+    `XEN_PVHVM_GUEST`, `XEN_BLKDEV_FRONTEND`, `XEN_NETDEV_FRONTEND`; sem `XEN_PV`, sem balão),
+    `PARAVIRT_SPINLOCKS`, `VMGENID`;
+  - **diagnóstico**, só registro, sem ação automática: `SOFTLOCKUP_DETECTOR`,
+    `HARDLOCKUP_DETECTOR` no modo vizinho, `DETECT_HUNG_TASK`; `PSTORE` com o ERST do firmware
+    (`ACPI_APEI`) e o meio EFI compilado e desligado (`EFI_VARS_PSTORE_DEFAULT_DISABLE`);
+    `PCIEAER`, `PCIE_DPC`, `ACPI_APEI_GHES`, `ACPI_APEI_PCIEAER`, `ACPI_EXTLOG`; `EDAC` com os
+    controladores de servidor (AMD64, SKX, I10NM, SBRIDGE, IE31200);
+  - instalador (`crates/sysupdate/src/disks.rs`): as áreas de boot de um eMMC (`mmcblk0boot0`,
+    `mmcblk0boot1`) saem da lista de discos de destino; disco do Xen aparece como `Xen`;
+  - travas: `os check` (`HARDWARE_COVERAGE`, e `XEN_PV`, `XEN_BALLOON`, `INTEL_IOMMU_DEFAULT_ON`
+    proibidos), o build (os mesmos no `.config` da imagem e da ISO, e `NR_CPUS=8192`), o
+    `boot-test` (o roteador usa todas as CPUs da VM; `--smp N` novo, acima de 255 com IOMMU), o
+    `install-test` (instala num cartão SD em SDHCI e dá boot por ele; `--only sd`).
+
+  Decisões (**medido**, kernel 6.18.59 com o `.config` da imagem compilado à parte):
+
+  - 8192 CPUs e não 512: `NR_CPUS=512` custa 0 de RAM e 0 no `bzImage` contra 64; `MAXSMP` custa
+    1 624 KiB de RAM e 16 KiB contra 512, fixos (igual com 2 e com 16 CPUs). As operações de
+    máscara são as mesmas acima de 64 CPUs (`include/linux/cpumask.h:66-76`); o `MAXSMP` só aloca
+    as máscaras em caminhos de controle. 512 deixaria de fora servidores de 2 soquetes com mais de
+    256 núcleos;
+  - por grupo, no `bzImage`: `IRQ_REMAP` +20 KiB; disco de boot +360 KiB; hipervisores até
+    +356 KiB; diagnóstico até +236 KiB;
+  - de fora, com o motivo: `PCI_HYPERV` (a função virtual da rede acelerada do Azure viraria uma
+    porta do roteador: G1.6zw); `EDAC_IGEN6` e `EDAC_PND2` (escrevem linha de nível erro em
+    máquina sem ECC, em todo boot) e `MEMORY_FAILURE` (política: G1.6zy); meio EFI do pstore
+    ligado e pânico automático em travamento (G1.6zx); balões, `VMWARE_VMCI`, `VIRTIO_MMIO`,
+    `XEN_PVH`.
+
+  Custo na imagem (**medido**, antes = G1.6zf): `bzImage` 18 392 064 → 19 305 472 B (+892 KiB);
+  `BOOTX64.EFI` da ISO +756 KiB; ISO 139 997 184 → 141 873 152 B (+1,79 MiB); `corerouter.crpkg`
+  +928 KiB; `MemTotal` numa VM de 1 GiB 981 292 → 978 124 KiB (−3,1 MiB). Boot, kernel → daemon
+  pronto, rodadas alternadas com a máquina carregada: antes 1,04 / 1,41 / 1,06 s, depois 1,12 /
+  1,05 s (sem diferença que o ruído deixe ver).
+
+  Conferido (**medido**, QEMU/KVM q35, 2026-11-11, imagem desta branch):
+
+  - `boot-test --smp 128`: `128 of 128 in use`, 2,26 s do kernel ao daemon; a imagem anterior,
+    com 128 CPUs: `cpu_count 64` e `CPU limit of 64 reached`;
+  - `boot-test --smp 300`, com `intel-iommu` e sem o destino estendido de MSI: `DMAR-IR: Enabled
+    IRQ remapping in x2apic mode`, `300 of 300 in use`, 5,52 s. Um kernel de laboratório com
+    `NR_CPUS=512` e sem `IRQ_REMAP`, na mesma máquina: 256 CPUs e `smpboot: CPU 299 has invalid
+    APIC ID 12b. Aborting bringup`. Nenhuma linha `DMAR: IOMMU enabled` (DMA sem tradução);
+  - `install-test --only sd`: a ISO live lista o cartão (`mmcblk0`, `SD/eMMC`), instala nele e o
+    SeaBIOS dá boot por ele (`/config: /dev/mmcblk0p4 (ext4)`); em OVMF o firmware do teste não
+    tem driver de SD e o segundo boot recebe o kernel da imagem, que acha a raiz e o `/config` no
+    cartão;
+  - convidado Xen HVM emulado pelo QEMU (disco e placa do Xen): `Hypervisor detected: Xen HVM`,
+    raiz e `/config` em `xvda`, `ether1` pelo `netfront`, daemon pronto, sem linha de erro; o
+    kernel anterior, na mesma VM, não acha o disco;
+  - Hyper-V emulado: `Hypervisor detected: Microsoft Hyper-V`, `hv_vmbus: Vmbus version:4.0`,
+    drivers de disco, rede e teclado registrados, roteador pronto, sem linha de erro;
+  - pânico (`sysrq c`) com ERST emulado: depois do reboot, três `dmesg-erst-*` em
+    `/sys/fs/pstore`;
+  - `install-test` e `ab-test` em OVMF e SeaBIOS, `boot-test` e `boot-test --efi`: verdes. Uma
+    das três rodadas do `install-test` em OVMF reprovou em "zombies after the shell exit: 1", com
+    a máquina carregada (CI e uma VM de 300 CPUs ao mesmo tempo); não se repetiu em duas rodadas
+    nem em 150 varreduras de um roteador ligado. Causa não achada. A conferência passou a dizer
+    qual processo é e de quem, e a reprovar só o zumbi que continua lá 500 ms depois (o defeito
+    que ela existe para pegar).
+
+  Não conferido, por não haver emulação: eMMC real (áreas de boot, firmware UEFI lendo o eMMC),
+  NVMe atrás de VMD, HPE `smartpqi`, Broadcom `mpi3mr`, Hyper-V e Azure reais (disco e rede do
+  VMBus), XCP-ng real, um travamento de CPU de verdade, AER/APEI/EDAC com erro de hardware, o
+  efeito de `MAXSMP` e `IRQ_REMAP` na vazão (o caminho de pacote não usa `cpumask`; não há aqui
+  instrumento que resolva diferença dessa ordem).
+
+- 2026-11-11 — fix-flaky-conntrack-remove: Teste instável `netns_conntrack_remove` (lote 594 da fila: `left: 19, right: 20` na linha 89,
+  passou sozinho na repetição). Causa: o teste abria 20 sockets UDP em sequência com porta 0 e
+  fechava cada um antes de abrir o próximo. A porta de origem liberada pode ser sorteada de novo
+  pelo kernel, e dois sockets com a mesma porta de origem são um fluxo só no conntrack. Correção
+  no teste: os 20 sockets ficam abertos até o último envio, então as portas são distintas por
+  construção. O comando `ip.firewall.connection.remove` não mudou.
+
+  **Medido** (kernel 7.0, faixa padrão de portas efêmeras 32768–60999, 2026-11-11): o teste
+  antigo falhou em 11 de 1500 rodadas (0,73 %), cada uma num namespace novo; o corrigido, em 0 de
+  500. Só o sorteio de portas: 198 de 30 000 rodadas de 20 `bind` em sequência repetiram porta
+  (0,66 %); com os 20 sockets abertos ao mesmo tempo, 0 de 30 000.
+
+  Como testar:
+  `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-daemon --test netns_conntrack_remove`
+  (ou `cargo xtask netns`, que roda todos os testes de namespace).
+
+- 2026-11-11 — fix-flaky-netns-notice-mpls: Dois testes de namespace instáveis no lote 599 da fila (run 43007252303; os dois passaram na
+  repetição). As duas correções são nos testes; o produto não mudou.
+
+  **`netns_notice`** (`left: Http(204, "")`, `right: Http(302, …/?via=android)`, linha 204). O
+  kernel redireciona um membro da lista assim que o `ip.firewall.address-list.add` retorna, mas
+  o portal responde por uma cópia das listas que a rodada do serviço `notice` refaz a cada 2 s.
+  O teste bloqueia dois endereços em dois comandos e esperava só o primeiro aparecer no portal.
+  Uma rodada entre os dois comandos conhece só o primeiro; o cliente atrás do CPE era então
+  respondido como não membro, que recebe o que o sistema dele espera (204). Agora o teste espera
+  os dois membros no portal antes de conferir as sondas. **Medido** (2026-11-11): com uma pausa
+  de 2,1 s forçada entre os dois comandos, o teste antigo falhou em 6 de 6 rodadas, com a mesma
+  mensagem do CI, e o corrigido passou em 6 de 6; sem a pausa, 4 de 4, ~12 s cada.
+
+  **`netns_mpls_too_big`** (`B answers through the LSP`, só no IPv6, linha 454). Os endereços
+  globais do laboratório usam `nodad`, mas o link-local de cada enlace ficava `tentative` por
+  cerca de 2 s depois do link subir (RFC 4862 §5.4: atraso aleatório de até 1 s e 1 s da
+  sonda). O roteador que encaminha um pacote envia o Neighbor Solicitation a partir do
+  link-local; enquanto ele é tentativo, nada sai. O primeiro eco IPv6 só voltava na terceira
+  tentativa, e a janela do teste é de cinco tentativas de 700 ms. Com o resto da suíte segurando
+  o RTNL (o DAD precisa dele), o DAD termina mais tarde e as cinco se perdem (esta última parte
+  é inferência do comportamento do kernel; o atraso sob carga não foi reproduzido). Agora o
+  laboratório desliga o DAD (`accept_dad = 0` em `all` e no enlace) antes de subir cada link.
+  **Medido** na VM do laboratório (kernel 7.0.0-38, 2026-11-11): primeiro eco IPv6 em
+  2,03–2,08 s, na terceira tentativa, em 12 de 12 rodadas antes; em 2,3–3,3 ms, na primeira, em
+  6 de 6 depois (IPv4: ~3 ms antes e depois). O binário inteiro passou 4 de 4 vezes, 11,2 s.
+
+  O `netns_icmp` tem o mesmo desenho (roteador IPv6 com `nodad` só nos globais), mas espera até
+  10 s por resposta e repete respostas "unreachable"; não foi alterado.
+
+  Como testar: `cargo xtask netns` (o `netns_mpls_too_big` precisa do módulo `mpls_router`: na
+  VM, `cargo xtask vm-lab run -- env COREROUTER_NETNS_TESTS=1 COREROUTER_REQUIRE_MPLS=1 unshare
+  --net -- cargo test -p corerouter-hal-linux --test netns_mpls_too_big`).
+
+- 2026-11-11 — processo-fila-fetch-repete: Fila de entrada: `git fetch` com nova tentativa (`scripts/land.sh`, função `fetch`). Depois do
+  #594 a fila escreveu `cannot lock ref 'refs/remotes/origin/main': is at a3494e8e… but expected
+  895e5fa0…` e "checkout não avançou para a main (ff): não recompila": o checkout principal
+  ficou um commit atrás e com os binários velhos. Causa: as worktrees das sessões dividem os refs
+  do repositório; quando outra sessão faz `git fetch` no mesmo instante, um dos dois perde a
+  trava do ref e sai com erro, embora o ref já esteja atualizado. Nos outros fetches da fila, que
+  não estão dentro de um `if`, o mesmo erro encerrava a fila (`set -e`).
+
+  Agora todo fetch da fila passa por `fetch`, que repete até três vezes (espera de 1, 2 e 3 s) e
+  só mostra o erro da última tentativa. **Medido** (repositório de teste, dois fetches
+  simultâneos logo depois de um push, 2026-11-11): sem repetir, 199 de 200 rodadas têm um fetch
+  com erro; com a repetição, 0 de 200, e o ref fica no commit novo em todas.
+
+  Vale só depois de religar a fila (ela roda o script com que começou).
