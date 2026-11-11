@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::bonding::{BondDialog, BondPanel, TABLE, WIN};
+use corerouter_hal::VirtualHal;
 
 #[test]
 fn bonding_window_lists_opens_and_adds() {
@@ -89,4 +90,64 @@ fn bonding_window_lists_opens_and_adds() {
     assert_eq!(list[1]["name"], "bonding1", "{list} {:?}", h.app.log());
     assert_eq!(list[1]["slaves"], json!(["ether3", "ether4"]));
     assert_eq!(list[1]["mode"], "802.3ad");
+}
+
+/// G1.30m: the lab's radio shows greyed in "New Bonding", with an ⓘ that
+/// opens the explanation; it cannot be picked.
+#[test]
+fn wifi_ports_show_greyed_with_an_explanation() {
+    let mut s = Session::new(Box::new(VirtualHal::new(8).with_wifi(1)));
+    for t in 0..4 {
+        s.tick(1_000 + t);
+    }
+    let mut h = Harness::with_session(s);
+    h.app.open.clear();
+    h.app.open(Win::Panel(WIN));
+    h.app.cache.refreshed_at = None;
+    h.idle();
+    h.idle();
+    let add = h
+        .ctx
+        .read_response(table::tool_id(TABLE, table::Icon::Add))
+        .expect("add tool")
+        .rect
+        .center();
+    h.click(add);
+    for _ in 0..3 {
+        h.idle();
+    }
+    assert!(h.has_text("New Bonding"));
+    assert!(h.has_text("wifi1"), "the radio is listed");
+    // Clicking it changes nothing: it is disabled.
+    h.click(h.text("wifi1"));
+    h.idle();
+    let form = match h
+        .app
+        .panel_mut::<BondPanel>()
+        .unwrap()
+        .dialogs
+        .first()
+        .map(|d| &d.dialog)
+    {
+        Some(BondDialog::New { form, .. }) => form.clone(),
+        _ => panic!("no New Bonding dialog"),
+    };
+    assert!(form.slaves.is_empty(), "{:?}", form.slaves);
+    let info = h
+        .ctx
+        .read_response(egui::Id::unique("bond-wifi-help"))
+        .expect("ⓘ drawn")
+        .rect
+        .center();
+    h.click(info);
+    h.idle();
+    assert_eq!(
+        h.app
+            .panel_mut::<BondPanel>()
+            .unwrap()
+            .help
+            .as_ref()
+            .map(|v| v.key.as_str()),
+        Some("bonding.wifi_slave")
+    );
 }

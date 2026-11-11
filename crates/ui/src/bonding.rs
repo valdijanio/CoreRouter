@@ -2,7 +2,8 @@
 //! style: one row per bond with its mode, slaves and settings, the toolbar,
 //! menus and keys of the G1.9 table, and "New Bonding" / "Bonding <name>"
 //! windows. The slaves are picked among the ethernet ports; which one may
-//! join is the engine's call (it says why not). Removing a bond is
+//! join is the engine's call (it says why not). Wi-Fi ports are listed
+//! too, greyed, with an ⓘ that says why a Wi-Fi client cannot join (G1.30m). Removing a bond is
 //! `interface.remove`, which releases its slaves.
 //!
 //! A panel (`panel.rs`): its state lives here, not in `CoreRouterUi`.
@@ -13,12 +14,18 @@ use serde_json::{Map, Value, json};
 use crate::avail::Avail;
 use crate::dialog::{self, Footer, Form, Head, Press, Status};
 use crate::dhcp_client::{flag, text};
+use crate::help::{self, HelpView};
+use crate::i18n::{Langs, tr_in};
 use crate::interfaces::{cascade, dialog_id};
 use crate::panel::{Panel, PanelState, PanelThen, Query, WinDef};
 use crate::table::{self, Icon, Menu, Row, Shortcut, TableState, action, col, comment};
 use crate::{CoreRouterUi, Win, form_number};
 
 const NAME: &str = "bonding";
+/// The i18n scope of this window (`i18n/auto/bonding_*.rs`).
+const SCOPE: &str = "bonding";
+/// The explanation of the greyed Wi-Fi ports.
+const WIFI_HELP: &str = "bonding.wifi_slave";
 /// The window's id (`Win::Panel`).
 pub(crate) const WIN: &str = "bonding";
 pub(crate) const TABLE: &str = "bonding";
@@ -75,6 +82,8 @@ pub(crate) struct BondPanel {
     bonds: Vec<Value>,
     pub(crate) dialogs: Vec<BondDialogWin>,
     pub(crate) table: TableState,
+    /// The ⓘ modal open, if any.
+    pub(crate) help: Option<HelpView>,
 }
 
 /// The editable fields of a bond, as typed.
@@ -351,6 +360,7 @@ impl PanelState for BondPanel {
 
     fn dialogs(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
         self.draw_dialogs(app, ctx, area);
+        help::modal(ctx, app.lang, &mut self.help);
     }
 
     fn reply(&mut self, app: &mut CoreRouterUi, then: PanelThen, result: &Result<Value, String>) {
@@ -596,6 +606,9 @@ impl BondPanel {
     fn draw_dialogs(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
         let bonds = self.bonds.clone();
         let ports = app.interface_names(Some("ether"));
+        let wifi = app.interface_names(Some("wifi"));
+        let lang = app.lang;
+        let mut help = None;
         let mut dialogs = std::mem::take(&mut self.dialogs);
         dialogs.retain_mut(|d| {
             let wid = dialog_id(d.id);
@@ -625,7 +638,11 @@ impl BondPanel {
             };
             let pressed =
                 dialog::show(&mut app.floats, ctx, area, head, &mut d.status, |ui, f| {
-                    dialog_body(ui, f, &mut d.dialog, row.as_ref(), &ports, &can)
+                    let ports = Ports {
+                        ether: &ports,
+                        wifi: &wifi,
+                    };
+                    dialog_body(ui, f, &mut d.dialog, row.as_ref(), ports, &can, lang, &mut help)
                 });
             let keep = pressed.is_none_or(|b| self.button(app, d, b, row.as_ref()));
             if !keep {
@@ -635,6 +652,9 @@ impl BondPanel {
         });
         dialogs.append(&mut self.dialogs);
         self.dialogs = dialogs;
+        if help.is_some() {
+            self.help = help;
+        }
     }
 
     fn button(
@@ -712,13 +732,52 @@ impl BondPanel {
     }
 }
 
+/// The ports a dialog lists: the ethernet ones to pick, the Wi-Fi ones
+/// greyed.
+#[derive(Clone, Copy)]
+struct Ports<'a> {
+    ether: &'a [String],
+    wifi: &'a [String],
+}
+
+/// The Wi-Fi ports, greyed: a Wi-Fi client is never a slave (the engine
+/// says why too, `slave_problem`); the ⓘ explains it and points to
+/// station-bridge.
+fn wifi_ports(ui: &mut Ui, wifi: &[String], lang: Langs, help: &mut Option<HelpView>) {
+    let l = lang.labels;
+    let why = tr_in(
+        SCOPE,
+        l,
+        "A Wi-Fi client cannot be a slave: the access point only passes its own MAC",
+    );
+    ui.horizontal(|ui| {
+        ui.label(tr_in(SCOPE, l, "Wi-Fi"));
+        if help::info_button(ui, egui::Id::unique("bond-wifi-help"), why).clicked() {
+            *help = Some(HelpView::new(WIFI_HELP, tr_in(SCOPE, l, "Wi-Fi ports")));
+        }
+    });
+    Grid::new("bond-wifi").num_columns(4).show(ui, |ui| {
+        for (i, p) in wifi.iter().enumerate() {
+            let mut off = false;
+            ui.add_enabled(false, egui::Checkbox::new(&mut off, p.as_str()))
+                .on_disabled_hover_text(why);
+            if i % 4 == 3 {
+                ui.end_row();
+            }
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
 fn dialog_body(
     ui: &mut Ui,
     f: &Form,
     d: &mut BondDialog,
     row: Option<&Value>,
-    ports: &[String],
+    ports: Ports<'_>,
     can: &Avail,
+    lang: Langs,
+    help: &mut Option<HelpView>,
 ) -> Footer<Button> {
     let props = matches!(d, BondDialog::Props { .. });
     let (BondDialog::New { form, .. } | BondDialog::Props { form, .. }) = d;
@@ -736,7 +795,7 @@ fn dialog_body(
             f.text(ui, "MTU", "mtu", &mut form.mtu, "(first slave's)");
             ui.label("Slaves");
             Grid::new("bond-slaves").num_columns(4).show(ui, |ui| {
-                for (i, p) in ports.iter().enumerate() {
+                for (i, p) in ports.ether.iter().enumerate() {
                     let mut on = form.slaves.contains(p);
                     if ui.checkbox(&mut on, p.as_str()).changed() {
                         if on {
@@ -752,6 +811,10 @@ fn dialog_body(
                 }
             });
             ui.end_row();
+            if !ports.wifi.is_empty() {
+                wifi_ports(ui, ports.wifi, lang, help);
+                ui.end_row();
+            }
             ui.label("Mode");
             egui::ComboBox::from_id_salt("bond-mode")
                 .selected_text(form.mode.as_str())

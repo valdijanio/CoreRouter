@@ -176,6 +176,12 @@ fn slave_problem(cfg: &Config, bond: &IfName, port: &IfName) -> Option<String> {
     let Some(iface) = cfg.interfaces.get(port) else {
         return Some(format!("no interface '{port}' (see interface.list)"));
     };
+    if matches!(iface.kind, InterfaceKind::Wifi(_)) {
+        return Some(format!(
+            "'{port}' is a Wi-Fi client; it cannot be a slave: {}",
+            corerouter_model::wifi::NO_BOND
+        ));
+    }
     if !matches!(iface.kind, InterfaceKind::Ethernet) {
         return Some(format!(
             "'{port}' is a {}; only ethernet ports can be slaves",
