@@ -426,8 +426,44 @@ pub struct BootOptions {
     /// G1.6j: load the drivers of the cards found (`corerouter.modules=off`:
     /// only what is built into the kernel).
     pub modules: bool,
+    /// G1.6zf: look for the motherboard's sensor chip (`corerouter.sensors=`).
+    pub sensors: Sensors,
     /// Complaints about the command line, logged once at boot.
     pub warnings: Vec<String>,
+}
+
+/// G1.6zf: whether PID 1 loads the Super-I/O drivers (fans, voltages, board
+/// temperatures). The chips are not enumerated: a driver finds its chip by
+/// writing an unlock key to I/O ports 0x2e and 0x4e.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sensors {
+    /// On a real machine, not in a virtual one (nothing is there to find).
+    Auto,
+    /// In a virtual machine too.
+    On,
+    /// Never: for the board where looking does harm.
+    Off,
+}
+
+impl Sensors {
+    /// Look for the chips on a machine with this `/proc/cpuinfo`?
+    pub fn wanted(self, cpuinfo: &str) -> bool {
+        match self {
+            Sensors::On => true,
+            Sensors::Off => false,
+            Sensors::Auto => !virtual_machine(cpuinfo),
+        }
+    }
+}
+
+/// The CPU says it runs under a hypervisor (CPUID.1:ECX[31], the
+/// `hypervisor` flag of `/proc/cpuinfo`: KVM, VMware, Hyper-V, Xen HVM,
+/// VirtualBox, bhyve all set it).
+pub fn virtual_machine(cpuinfo: &str) -> bool {
+    cpuinfo
+        .lines()
+        .find_map(|l| l.strip_prefix("flags"))
+        .is_some_and(|flags| flags.split_ascii_whitespace().any(|f| f == "hypervisor"))
 }
 
 const MAX_TTY: usize = 16;
@@ -440,6 +476,7 @@ impl BootOptions {
             mode: Mode::Router,
             mgmt: None,
             modules: true,
+            sensors: Sensors::Auto,
             warnings: Vec::new(),
         };
         for word in cmdline.split_ascii_whitespace() {
@@ -486,6 +523,15 @@ impl BootOptions {
                     _ => out
                         .warnings
                         .push(format!("corerouter.modules={}: use on or off", clip(value))),
+                },
+                "sensors" => match value {
+                    "auto" => out.sensors = Sensors::Auto,
+                    "on" => out.sensors = Sensors::On,
+                    "off" => out.sensors = Sensors::Off,
+                    _ => out.warnings.push(format!(
+                        "corerouter.sensors={}: use auto, on or off",
+                        clip(value)
+                    )),
                 },
                 "mgmt" => match Mgmt::parse(value) {
                     Ok(m) => out.mgmt = Some(m),
@@ -635,6 +681,19 @@ mod tests {
         assert!(BootOptions::parse("quiet").modules);
         assert!(!BootOptions::parse("corerouter.modules=off").modules);
         assert!(BootOptions::parse("corerouter.modules=on").modules);
+        // G1.6zf: the motherboard's sensor chips.
+        assert_eq!(BootOptions::parse("").sensors, Sensors::Auto);
+        assert_eq!(
+            BootOptions::parse("corerouter.sensors=off").sensors,
+            Sensors::Off
+        );
+        assert_eq!(
+            BootOptions::parse("corerouter.sensors=on").sensors,
+            Sensors::On
+        );
+        let bad = BootOptions::parse("corerouter.sensors=lax");
+        assert_eq!(bad.sensors, Sensors::Auto);
+        assert_eq!(bad.warnings.len(), 1);
         let bad = BootOptions::parse("corerouter.modules=maybe");
         assert!(bad.modules);
         assert_eq!(bad.warnings.len(), 1);
@@ -651,6 +710,7 @@ mod tests {
                 mode: Mode::Router,
                 mgmt: None,
                 modules: true,
+                sensors: Sensors::Auto,
                 warnings: vec![]
             }
         );
@@ -720,6 +780,28 @@ mod tests {
         // G1.6za: `corerouter.modules=off` holds in the live image too.
         assert!(o.modules);
         assert!(!BootOptions::parse("corerouter.mode=live corerouter.modules=off").modules);
+    }
+
+    /// G1.6zf: the Super-I/O drivers poke I/O ports to find their chip; a
+    /// virtual machine has none, and the operator can say never.
+    #[test]
+    fn sensor_chips_are_looked_for_on_real_machines_only() {
+        let real = "processor\t: 0\nmodel name\t: 13th Gen Intel(R) Core(TM) i5\nflags\t\t: fpu vme de pse tsc msr dtherm ida arat\n";
+        let vm = "processor\t: 0\nflags\t\t: fpu vme hypervisor lahf_lm\n";
+        assert!(!virtual_machine(real));
+        assert!(virtual_machine(vm));
+        // Not a word of another line, nor a part of another flag.
+        assert!(!virtual_machine(
+            "model name\t: hypervisor\nflags\t\t: fpu nohypervisor\n"
+        ));
+        assert!(!virtual_machine(""));
+        assert!(Sensors::Auto.wanted(real));
+        assert!(!Sensors::Auto.wanted(vm));
+        assert!(Sensors::On.wanted(vm));
+        assert!(!Sensors::Off.wanted(real));
+        // No /proc/cpuinfo read: a real machine is assumed (the drivers
+        // themselves find nothing where there is nothing).
+        assert!(Sensors::Auto.wanted(""));
     }
 
     #[test]

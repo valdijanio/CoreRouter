@@ -12,6 +12,15 @@ They go on the kernel command line of the router's image and are valid from the 
 "Running" is what this boot used (`/proc/cmdline`); the slot lines show what each boot entry carries. An update (System › Packages) also takes these parameters to the new slot."##,
     ),
     (
+        "tuning.boot.corerouter.sensors",
+        r##"## What it does
+Whether the router looks for the motherboard's sensor chip (fans, voltages, board temperatures) at boot. **auto** (default): on a real machine, not in a virtual one; **on**: always; **off**: never. Valid from the next boot.
+## When to change
+off on a board where the search does harm. No hardware list names this chip: the driver writes to two I/O ports (0x2e and 0x4e) and sees who answers.
+## Careful
+With off, System › Resources › Sensors loses the board's fans and voltages. The CPU and disk temperatures do not depend on it."##,
+    ),
+    (
         "tuning.boot.intel_idle.max_cstate",
         r##"## What it does
 The deepest C-state the intel_idle idle driver may use, from boot: 0 turns that driver off, 1 keeps the CPUs in C1. Valid from the next boot.

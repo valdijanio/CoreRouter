@@ -127,8 +127,11 @@ pub fn main() {
     // run before it is mounted). G1.6za: the live image too: the first stage
     // mounted the ISO kernel's modules over /lib/modules (without them, this
     // kernel's directory is not there and this finds nothing).
+    // G1.6zf: and, last and only on a real machine, the motherboard's sensor
+    // chip (`corerouter.sensors=`).
     if opts.modules {
-        crate::modules::start(log);
+        let cpuinfo = read_proc("/proc/cpuinfo").unwrap_or_default();
+        crate::modules::start(log, opts.sensors.wanted(&cpuinfo));
     }
     let names = name_ports(Some(Path::new(crate::ports::MAP_FILE)));
     spawn_hotplug_names(crate::ports::MAP_FILE, live);

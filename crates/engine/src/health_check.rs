@@ -931,10 +931,7 @@ impl Session {
                 .iter()
                 .filter_map(|d| Some((d.mount.clone(), percent(d.available, d.total)?)))
                 .collect();
-            i.temps = l
-                .sensors
-                .iter()
-                .filter(|s| s.kind == corerouter_hal::system_resource::SensorKind::Temperature)
+            i.temps = crate::system_resource::temperatures(l)
                 .map(|s| (format!("{} {}", s.chip, s.label), s.value, s.crit, sensor_level(s)))
                 .collect();
             if m.pair().is_some() {

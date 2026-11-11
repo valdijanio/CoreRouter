@@ -498,6 +498,7 @@ pub const SEC_ISOLATION: &str = "CPU isolation";
 pub const SEC_POWER: &str = "Power saving";
 pub const SEC_IOMMU: &str = "IOMMU";
 pub const SEC_SECURITY: &str = "Security";
+pub const SEC_HARDWARE: &str = "Hardware";
 
 /// The kernel command-line parameters of the Boot tab, in display order.
 pub const BOOT_PARAMS: &[BootParam] = &[
@@ -542,6 +543,14 @@ pub const BOOT_PARAMS: &[BootParam] = &[
         section: SEC_SECURITY,
         kind: BootKind::Choice(&["auto", "auto,nosmt", "off"]),
         danger: true,
+    },
+    // G1.6zf: read by `corerouter-init`, not by the kernel: whether it looks
+    // for the motherboard's sensor chip (a probe of I/O ports).
+    BootParam {
+        name: "corerouter.sensors",
+        section: SEC_HARDWARE,
+        kind: BootKind::Choice(&["auto", "on", "off"]),
+        danger: false,
     },
 ];
 

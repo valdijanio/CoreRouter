@@ -486,6 +486,7 @@ pub fn parse_hwmon(chip: &str, files: &[(String, String)]) -> Vec<Sensor> {
                 value,
                 max,
                 crit,
+                board: false,
             })
         })
         .take(MAX_SENSORS)
@@ -595,6 +596,47 @@ fn files_of(dir: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
+/// A hwmon chip's name with what tells it from another of the same driver
+/// (G1.6zf): every NVMe disk is `nvme` with the same labels, every SATA disk
+/// `drivetemp` with none, every port of a card `ixgbe`. From the device the
+/// chip sits on: its disk (`drivetemp sda`), its port (`ixgbe ether3`), or
+/// the device's own numbered name (`nvme0`).
+fn chip_instance(dir: &Path, name: &str) -> String {
+    let device = dir.join("device");
+    let first = |sub: &str| -> Option<String> {
+        std::fs::read_dir(device.join(sub))
+            .ok()?
+            .flatten()
+            .take(64)
+            .filter_map(|e| e.file_name().into_string().ok())
+            .min()
+    };
+    if let Some(of) = first("block").or_else(|| first("net")) {
+        return cut_name(&format!("{name} {of}"));
+    }
+    std::fs::read_link(&device)
+        .ok()
+        .and_then(|p| p.file_name()?.to_str().map(str::to_owned))
+        .filter(|d| {
+            d.strip_prefix(name)
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .unwrap_or_else(|| name.to_owned())
+}
+
+/// The platform drivers of the motherboard's Super-I/O chips (the modules
+/// PID 1 loads in the image, `SENSOR_MODULES` of `corerouter-init`).
+const BOARD_DRIVERS: [&str; 5] = ["nct6775", "nct6683", "it87", "f71882fg", "w83627ehf"];
+
+/// Is this hwmon chip a Super-I/O (G1.6zf, [`Sensor::board`])? By the driver
+/// its device is bound to: the chip's own name is the model (`nct6798`).
+fn board_chip(dir: &Path) -> bool {
+    std::fs::read_link(dir.join("device/driver"))
+        .ok()
+        .and_then(|p| p.file_name()?.to_str().map(str::to_owned))
+        .is_some_and(|d| BOARD_DRIVERS.contains(&d.as_str()))
+}
+
 fn sorted_dir(dir: &Path, prefix: &str) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
         .map(|r| {
@@ -686,14 +728,32 @@ impl Collector {
     /// Every sensor, read now.
     pub fn sensors(&self) -> Vec<Sensor> {
         let mut out: Vec<Sensor> = Vec::new();
+        let mut seen: Vec<(String, u32)> = Vec::new();
         for dir in sorted_dir(&self.sys.join("class/hwmon"), "hwmon") {
             let files = files_of(&dir);
-            let chip = files
+            let name = files
                 .iter()
                 .find(|(f, _)| f == "name")
                 .map(|(_, v)| v.trim().to_owned())
                 .unwrap_or_else(|| "hwmon".into());
-            out.extend(parse_hwmon(&chip, &files));
+            let mut chip = chip_instance(&dir, &name);
+            // Still the same name (two AMD sockets: `k10temp` twice, both
+            // `Tctl`): the second is `k10temp 2`, in hwmon order.
+            match seen.iter_mut().find(|(c, _)| *c == chip) {
+                Some((_, n)) => {
+                    *n += 1;
+                    chip = format!("{chip} {n}");
+                }
+                None => seen.push((chip.clone(), 1)),
+            }
+            let board = board_chip(&dir);
+            out.extend(parse_hwmon(&chip, &files).into_iter().map(|mut s| {
+                if board {
+                    // The firmware's alarm settings, not what the part stands.
+                    (s.board, s.max, s.crit) = (true, None, None);
+                }
+                s
+            }));
         }
         for dir in sorted_dir(&self.sys.join("class/thermal"), "thermal_zone") {
             let Some((kind, t, crit)) = parse_thermal_zone(&files_of(&dir)) else {
@@ -712,6 +772,7 @@ impl Collector {
                     value: t,
                     max: None,
                     crit,
+                    board: false,
                 }),
             }
         }

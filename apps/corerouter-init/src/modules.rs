@@ -20,6 +20,14 @@
 //! after the network drivers and the boot does not wait for it: until it
 //! takes the screen, the console is on the firmware's framebuffer
 //! (`simpledrm`, G1.6zc).
+//!
+//! G1.6zf: the motherboard's sensor chips (Super-I/O: fans, voltages, board
+//! temperatures) are modules for another reason. Nothing enumerates them: a
+//! driver writes its unlock key to I/O ports 0x2e and 0x4e and reads who
+//! answers. So they load by name ([`SENSOR_MODULES`]), last, with nothing
+//! waiting, only on a real machine and unless `corerouter.sensors=off`. The
+//! sensors that bind to a device the machine lists (CPU, NVMe, SATA, chipset)
+//! are built into the kernel.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -33,6 +41,13 @@ const MODULES: &str = "/lib/modules";
 /// and the screen's.
 const NET_DRIVERS: &str = "kernel/drivers/net/";
 const SCREEN_DRIVERS: &str = "kernel/drivers/gpu/drm/";
+/// The sensor drivers: by name, never by a device's alias.
+const SENSOR_DRIVERS: &str = "kernel/drivers/hwmon/";
+/// G1.6zf: the Super-I/O families of x86 boards, by module name: Nuvoton
+/// (NCT6775…NCT6799, NCT6683/6686/6687), ITE (IT87xx/IT86xx), Fintek
+/// (F718xx/F818xx), Winbond (W83627EHF/DHG, W83667HG). `cargo xtask os check`
+/// keeps this list and the kernel's (`linux.fragment`) the same.
+pub const SENSOR_MODULES: [&str; 5] = ["nct6775", "nct6683", "it87", "f71882fg", "w83627ehf"];
 /// `modules.alias` of every network driver is ~1 MiB.
 const MAX_INDEX: u64 = 16 << 20;
 /// The kernel's `MODALIAS` values are far shorter (USB: ~70 bytes).
@@ -144,7 +159,10 @@ impl Index {
             let Some((path, needs)) = line.split_once(':') else {
                 continue;
             };
-            if !path.starts_with(NET_DRIVERS) && !path.starts_with(SCREEN_DRIVERS) {
+            if ![NET_DRIVERS, SCREEN_DRIVERS, SENSOR_DRIVERS]
+                .iter()
+                .any(|d| path.starts_with(d))
+            {
                 continue;
             }
             let Some(name) = module_name(path) else {
@@ -170,7 +188,12 @@ impl Index {
             let Some((bus, _)) = pattern.split_once(':') else {
                 continue;
             };
-            if chains.contains_key(&module) && BUSES.iter().any(|(b, _)| *b == bus) {
+            // A sensor driver never loads because a device asked for it.
+            let by_alias = chains
+                .get(&module)
+                .and_then(|c: &Vec<String>| c.last())
+                .is_some_and(|p| !p.starts_with(SENSOR_DRIVERS));
+            if by_alias && BUSES.iter().any(|(b, _)| *b == bus) {
                 aliases.push((bus.to_owned(), pattern.to_owned(), module));
             }
         }
@@ -278,6 +301,68 @@ fn load(index: &Index, dir: &Path, module: &str) -> Option<String> {
     loaded.then(|| format!("driver {module} loaded in {} ms", t.elapsed().as_millis()))
 }
 
+/// What became of one sensor driver.
+#[derive(Debug, PartialEq, Eq)]
+enum Probe {
+    /// Its chip is there: the module stays, the readings are in hwmon.
+    Found,
+    /// No chip of its family answered (`ENODEV`): the normal case, silent.
+    Absent,
+    /// The chip answered, and the firmware's ACPI code uses the same ports
+    /// (`EBUSY`, `acpi_enforce_resources=strict`): the driver stays out, or
+    /// two would talk to the chip at once.
+    Firmware,
+    /// Anything else: said as it is.
+    Failed(String),
+}
+
+/// How the kernel answered the driver's own file (its chain's last).
+fn probe_result(r: std::io::Result<bool>) -> Probe {
+    const ENODEV: i32 = 19;
+    const EBUSY: i32 = 16;
+    match r {
+        Ok(_) => Probe::Found,
+        Err(e) if e.raw_os_error() == Some(ENODEV) => Probe::Absent,
+        Err(e) if e.raw_os_error() == Some(EBUSY) => Probe::Firmware,
+        Err(e) => Probe::Failed(e.to_string()),
+    }
+}
+
+/// G1.6zf: looks for the motherboard's sensor chip, each family's driver in
+/// turn; one line with what was found. A driver whose chip is not there
+/// leaves the kernel again by itself (its init fails), the libraries it
+/// needs stay (a few KiB).
+fn load_sensors(index: &Index, dir: &Path, log: impl Fn(&str)) {
+    let t = Instant::now();
+    let mut found = Vec::new();
+    for module in SENSOR_MODULES {
+        let Some((own, needs)) = index.chain(module).split_last() else {
+            continue;
+        };
+        if let Some((rel, e)) = needs
+            .iter()
+            .find_map(|rel| insert(dir, rel).err().map(|e| (rel, e)))
+        {
+            log(&format!("sensors: {module}: {rel}: {e}"));
+            continue;
+        }
+        match probe_result(insert(dir, own)) {
+            Probe::Found => found.push(module),
+            Probe::Absent => {}
+            Probe::Firmware => log(&format!(
+                "sensors: {module}: the chip is there, but the firmware (ACPI) uses its ports: no fan or voltage readings from it"
+            )),
+            Probe::Failed(e) => log(&format!("sensors: {module}: {own}: {e}")),
+        }
+    }
+    let what = if found.is_empty() {
+        "no motherboard sensor chip answered".to_owned()
+    } else {
+        format!("motherboard sensor chip: {}", found.join(", "))
+    };
+    log(&format!("sensors: {what} ({} ms)", t.elapsed().as_millis()));
+}
+
 /// The modules of `pass` the devices in `aliases` ask for, each once, in
 /// the devices' order.
 fn wanted<'a>(index: &'a Index, aliases: &[String], pass: Pass) -> Vec<&'a str> {
@@ -362,8 +447,9 @@ fn hotplug_loop(events: &DeviceEvents, index: &Index, dir: &Path, log: &dyn Fn(&
 /// Loads the drivers of what is in the machine and keeps listening for what
 /// is plugged in later, in its own thread. Returns when the boot's network
 /// drivers are in, or at [`BOOT_WAIT`] with the loading still going; the
-/// screen's driver loads after that, with the boot already going on.
-pub fn start(log: fn(&str)) {
+/// screen's driver loads after that, with the boot already going on, and
+/// then, with `sensors`, the motherboard's sensor chip is looked for.
+pub fn start(log: fn(&str), sensors: bool) {
     let dir = kernel_dir();
     let index = Index::parse(
         &read_limited(&dir.join("modules.dep"), MAX_INDEX),
@@ -388,6 +474,9 @@ pub fn start(log: fn(&str)) {
             ));
             let _ = done.send(());
             load_for(&index, &dir, &devices, Pass::Screen, log);
+            if sensors {
+                load_sensors(&index, &dir, log);
+            }
             match events {
                 Ok(events) => hotplug_loop(&events, &index, &dir, &log),
                 Err(e) => log(&format!(
@@ -419,6 +508,11 @@ kernel/net/netfilter/xt_mark.ko:
 kernel/drivers/gpu/drm/i915/i915.ko: kernel/drivers/gpu/drm/ttm/ttm.ko kernel/drivers/gpu/drm/drm_buddy.ko
 kernel/drivers/gpu/drm/ttm/ttm.ko:
 kernel/drivers/gpu/drm/drm_buddy.ko:
+kernel/drivers/hwmon/nct6775.ko: kernel/drivers/hwmon/nct6775-core.ko kernel/drivers/hwmon/hwmon-vid.ko
+kernel/drivers/hwmon/nct6775-core.ko: kernel/drivers/hwmon/hwmon-vid.ko
+kernel/drivers/hwmon/hwmon-vid.ko:
+kernel/drivers/hwmon/it87.ko: kernel/drivers/hwmon/hwmon-vid.ko
+kernel/drivers/hwmon/k10temp.ko:
 ";
     const ALIAS: &str = "\
 # Aliases extracted from modules themselves.
@@ -428,6 +522,7 @@ alias usb:v0B95p1790d*dc*dsc*dp*ic*isc*ip*in* ax_88179
 alias pci:v00001234d*sv*sd*bc*sc*i* xt_mark
 alias pci:v00008086d0000A7A0sv*sd*bc03sc*i* i915
 alias cpu:type:x86,ven*fam*mod*:feature:*0073* ice
+alias pci:v00001022d00001443sv*sd*bc*sc*i* k10temp
 broken line
 ";
 
@@ -456,6 +551,52 @@ broken line
         ] {
             assert_eq!(glob(p.as_bytes(), t.as_bytes()), want, "{p} ~ {t}");
         }
+    }
+
+    /// G1.6zf: the motherboard's sensor chips load by name, what they need
+    /// first, and a missing chip is not an error.
+    #[test]
+    fn sensor_drivers_load_by_name_never_by_alias() {
+        let i = Index::parse(DEP, ALIAS);
+        assert_eq!(
+            i.chain("nct6775"),
+            [
+                "kernel/drivers/hwmon/hwmon-vid.ko",
+                "kernel/drivers/hwmon/nct6775-core.ko",
+                "kernel/drivers/hwmon/nct6775.ko"
+            ]
+        );
+        assert_eq!(i.chain("it87").len(), 2);
+        // In this image's kernel, or not built at all: nothing to load.
+        assert!(i.chain("f71882fg").is_empty());
+        // A sensor driver with a device alias still waits for its turn: the
+        // device messages (`Pass::Any`) load ports and screens only.
+        assert!(!i.chain("k10temp").is_empty());
+        assert!(
+            i.matches("pci:v00001022d00001443sv0sd0bc06sc00i00")
+                .is_empty()
+        );
+        assert!(
+            wanted(
+                &i,
+                &["pci:v00001022d00001443sv0sd0bc06sc00i00".into()],
+                Pass::Any
+            )
+            .is_empty()
+        );
+        for m in SENSOR_MODULES {
+            assert!(
+                m.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
+                "{m}"
+            );
+        }
+        let errno = |n: i32| Err(std::io::Error::from_raw_os_error(n));
+        assert_eq!(probe_result(Ok(true)), Probe::Found);
+        assert_eq!(probe_result(Ok(false)), Probe::Found);
+        assert_eq!(probe_result(errno(19)), Probe::Absent);
+        assert_eq!(probe_result(errno(16)), Probe::Firmware);
+        assert!(matches!(probe_result(errno(8)), Probe::Failed(e) if e.contains("Exec format")));
     }
 
     #[test]

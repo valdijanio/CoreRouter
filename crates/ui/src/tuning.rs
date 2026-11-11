@@ -47,12 +47,13 @@ const BOOT_SET: &str = "system.tuning.boot.set";
 const BOOT_UNSET: &str = "system.tuning.boot.unset";
 
 /// The Boot sections (G1.26d).
-const BOOT_SECTIONS: [&str; 5] = [
+const BOOT_SECTIONS: [&str; 6] = [
     "CPU isolation",
     "Idle states",
     "Power saving",
     "IOMMU",
     "Security",
+    "Hardware",
 ];
 
 /// The CPU sections (G1.26c), and the port section shown with them.
