@@ -28,7 +28,7 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "system.package.print", "Packages", ["System", "Packages"], None,
-        "{} → {supported, reason?, firmware, lab, running, primary, fallback, slots: [{slot, state, running, primary, next, version, build, commit, channel, kernel, verified, verity, signed_by, boot_entry, cmdline, size, rootfs_size, kernel_size}], trial: {slot, from, version, reason, confirm, timeout_s, remaining_s?} | null, last, snapshots: [{name, slot, version, format_version, at_unix, files, bytes, own_bytes}], partials: [{name, own_bytes}], config_space: {total?, free?, snapshot_need?, snapshot_fits?, usage: [{path, bytes, kind}], usage_rows}, keys, job: {id, kind, phase, done, total} | null, result}",
+        "{} → {supported, reason?, firmware, lab, running, primary, fallback, slots: [{slot, state, running, primary, next, version, build, commit, channel, kernel, verified, verity, signed_by, boot_entry, cmdline, size, rootfs_size, kernel_size}], trial: {slot, from, version, reason, confirm, timeout_s, remaining_s?} | null, last, snapshots: [{name, slot, version, format_version, at_unix, files, bytes, own_bytes}], partials: [{name, own_bytes}], config_space: {total?, free?, snapshot_need?, snapshot_fits?, usage: [{path, bytes, kind}], usage_rows}, keys, job: {id, kind, phase, done, total} | null, result, root: {in_ram, bytes, copy_ms, disk?, note?} | null (G1.6zn: where this boot's root came from), system_disk_removed?: string (G1.6zn: the system disk went away), to_ram: bool (system.boot's choice for the next boot)}",
         always, print),
     cmd!(
         "system.package.update",
@@ -156,6 +156,7 @@ fn print(s: &mut Session, _: &Value) -> Result<Value> {
     if let Some(o) = v.as_object_mut() {
         o.insert("job".into(), job.unwrap_or(Value::Null));
         o.insert("result".into(), result.unwrap_or(Value::Null));
+        o.insert("to_ram".into(), json!(s.store().candidate().system.boot.to_ram));
     }
     Ok(v)
 }
@@ -225,6 +226,10 @@ fn conflict(reason: impl Into<String>) -> EngineError {
 
 fn supported(s: &Session) -> Result<()> {
     let st = status(s);
+    // G1.6zn: the slots and /config are on the disk that went away.
+    if let Some(line) = st.get("system_disk_removed").and_then(Value::as_str) {
+        return Err(EngineError::NotSaved(line.to_owned()));
+    }
     if st.get("supported").and_then(Value::as_bool) == Some(true) {
         return Ok(());
     }

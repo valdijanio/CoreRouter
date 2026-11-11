@@ -152,6 +152,20 @@ pub struct SocketBuffers {
 /// The first ECMP warning: its prefix with the paths, and the fix.
 pub type EcmpFirst = (String, Option<String>);
 
+/// G1.6zn: where the root runs from and whether the system disk is still
+/// there, from the package service's status.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SystemDisk {
+    pub in_ram: bool,
+    pub bytes: u64,
+    pub copy_ms: u64,
+    pub disk: Option<String>,
+    /// Why the root stayed on the disk although the RAM was asked for.
+    pub note: Option<String>,
+    /// The line of a system disk that went away during this boot.
+    pub removed: Option<String>,
+}
+
 /// What the rules look at, gathered from the session.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Inputs {
@@ -208,6 +222,8 @@ pub struct Inputs {
     /// carry). The root is then not checked against a signed hash, and a
     /// reboot does not change that.
     pub root_untrusted: bool,
+    /// G1.6zn: `None` off the image (or before the service reported).
+    pub system_disk: Option<SystemDisk>,
     /// G1.6u: configuration snapshots in `/config` and the bytes of their
     /// own (partial copies are named `config-<slot>.new`), from the
     /// package service's status.
@@ -575,6 +591,30 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
             Some("Reinicie uma vez (`/system reboot confirm=yes` no terminal, ou system.reboot): este boot já gravou a entrada de boot do slot e o próximo sobe pela raiz verificada. Se o aviso voltar, confira em System › Packages a entrada de boot e a linha de comando do slot.")),
     }
 
+    // G1.6zn: the disk the system and its configuration are on.
+    if let Some(d) = &i.system_disk {
+        let (key, name) = ("system.disk", "System disk");
+        let disk = d.disk.clone().unwrap_or_else(|| "?".into());
+        if d.removed.is_some() {
+            let reason = if d.in_ram {
+                format!("o disco do sistema ({disk}) saiu com o roteador ligado: ele segue rodando da RAM, mas a configuração não é mais gravada (todo commit é recusado)")
+            } else {
+                format!("o disco do sistema ({disk}) saiu com o roteador ligado e o sistema roda desse disco: o roteador pode parar a qualquer momento, e a configuração não é mais gravada (todo commit é recusado)")
+            };
+            push(key, name, Severity::Error, Some(disk), reason,
+                Some("Recoloque o disco e reinicie (System › Reboot): sem ele o roteador não volta depois de desligado. Para mudar algo agora sem gravar, use o Safe Mode. Num pendrive ou SSD USB, ligue o sistema na RAM (system.boot.set to_ram=yes) para o roteador seguir rodando se o disco sair."));
+        } else if let Some(note) = &d.note {
+            push(key, name, Severity::Warning, Some(disk),
+                format!("o sistema na RAM foi pedido, mas este boot ficou no disco: {note}"),
+                Some("Com pouca RAM, ponha mais memória ou desligue a opção (system.boot.set to_ram=no); outro motivo aparece no log do boot (tópico system)."));
+        } else if d.in_ram {
+            push(key, name, Severity::Ok, Some(disk.clone()),
+                format!("sistema na RAM ({} MiB, copiado e conferido pelo dm-verity em {} ms): o disco {disk} só guarda a configuração", d.bytes >> 20, d.copy_ms), None);
+        } else {
+            push(key, name, Severity::Ok, Some(disk.clone()), format!("sistema lido do disco {disk} conforme é usado"), None);
+        }
+    }
+
     // Supervised services.
     match &i.services {
         None => push("services", "Services", Severity::Unknown, None, "sem supervisor de serviços (laboratório)".into(), None),
@@ -863,6 +903,26 @@ fn root_verity(st: &serde_json::Value) -> Option<(String, bool)> {
     Some((slot.get("slot")?.as_str()?.to_owned(), on(slot, "verity")))
 }
 
+/// G1.6zn: the `root` and `system_disk_removed` of the package status.
+fn system_disk(st: &serde_json::Value) -> Option<SystemDisk> {
+    use serde_json::Value;
+    let removed = st.get("system_disk_removed").and_then(Value::as_str).map(str::to_owned);
+    let root = st.get("root").filter(|r| r.is_object());
+    if root.is_none() && removed.is_none() {
+        return None;
+    }
+    let r = root.cloned().unwrap_or(Value::Null);
+    let text = |k: &str| r.get(k).and_then(Value::as_str).map(str::to_owned);
+    Some(SystemDisk {
+        in_ram: r.get("in_ram").and_then(Value::as_bool) == Some(true),
+        bytes: r.get("bytes").and_then(Value::as_u64).unwrap_or(0),
+        copy_ms: r.get("copy_ms").and_then(Value::as_u64).unwrap_or(0),
+        disk: text("disk"),
+        note: text("note"),
+        removed,
+    })
+}
+
 /// The running slot says its header is not verified (`verified: false`; a
 /// status without the field, from an older service, is not judged).
 fn root_untrusted(st: &serde_json::Value) -> bool {
@@ -1046,6 +1106,7 @@ impl Session {
         let pkg = self.ext::<crate::package::Packages>().and_then(|p| p.status.as_ref());
         i.root_verity = pkg.and_then(root_verity);
         i.root_untrusted = pkg.is_some_and(root_untrusted);
+        i.system_disk = pkg.and_then(system_disk);
         i.config_snapshots = pkg.map(config_snapshots).unwrap_or_default();
         i.config_disk = self.config_disk_usage();
         i
@@ -1130,6 +1191,7 @@ mod tests {
             no_password: Vec::new(),
             root_verity: Some(("a".into(), true)),
             root_untrusted: false,
+            system_disk: None,
             config_snapshots: Vec::new(),
             config_disk: Some(Default::default()),
             bgp_no_eor: Some((1, Vec::new())),
@@ -1204,6 +1266,10 @@ mod tests {
     fn every_rule_by_table() {
         let cases: &[Case] = &[
             ("cpu 85", |i| i.cpu_avg = Some((85.0, 60)), "cpu", Severity::Warning),
+            ("root on the disk", |i| i.system_disk = Some(SystemDisk { disk: Some("sda".into()), ..Default::default() }), "system.disk", Severity::Ok),
+            ("root in RAM", |i| i.system_disk = Some(SystemDisk { in_ram: true, bytes: 87 << 20, ..Default::default() }), "system.disk", Severity::Ok),
+            ("RAM asked, too little", |i| i.system_disk = Some(SystemDisk { note: Some("200 MiB of RAM".into()), ..Default::default() }), "system.disk", Severity::Warning),
+            ("system disk pulled out", |i| i.system_disk = Some(SystemDisk { in_ram: true, removed: Some("system disk sda removed".into()), ..Default::default() }), "system.disk", Severity::Error),
             ("bgp neighbor without End-of-RIB", |i| i.bgp_no_eor = Some((2, vec!["chr".into()])), "bgp.end-of-rib", Severity::Warning),
             ("bgp without graceful restart", |i| i.bgp_no_eor = Some((0, Vec::new())), "bgp.end-of-rib", Severity::Ok),
             ("no routing daemon", |i| i.bgp_no_eor = None, "bgp.end-of-rib", Severity::Unknown),

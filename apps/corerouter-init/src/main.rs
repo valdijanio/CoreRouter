@@ -16,11 +16,16 @@
 //!
 //! G1.6y: the ISO boots live (`corerouter.mode=live`, `live`): the image from
 //! RAM, so the GUI and the browser can install it over the network.
+//!
+//! G1.6zn: the installed image too, when asked (`to_ram`), and a system disk
+//! that goes away is one clear line (`disk_watch`).
 
 #[cfg(target_os = "linux")]
 mod console;
 #[cfg(target_os = "linux")]
 mod ctl;
+#[cfg(target_os = "linux")]
+mod disk_watch;
 #[cfg(target_os = "linux")]
 mod grow;
 #[cfg(target_os = "linux")]
@@ -41,6 +46,8 @@ mod setup;
 mod setup_wifi;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod style;
+#[cfg(target_os = "linux")]
+mod to_ram;
 #[cfg(target_os = "linux")]
 mod wifi_names;
 

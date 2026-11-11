@@ -19,6 +19,11 @@
 //! - Anywhere else (a development machine with `--backend linux`): off, and
 //!   it says why. It never writes a host's boot variables or disks.
 //!
+//! G1.6zn: it keeps `system.boot`'s choice where the init reads it at the
+//! next boot, reports where this boot's root came from (`root`), and, once
+//! the init says the system disk went away, asks nothing more of it: the
+//! status is the last one with `system_disk_removed`, and no job runs.
+//!
 //! G1.6e: an upload job reads the chunks the control channel queues
 //! (`system.package.upload.chunk`) as a stream and installs (or checks) it
 //! like a file: header and signature first, then straight to the slot.
@@ -32,6 +37,7 @@ use corerouter_sysupdate::SlotId;
 use corerouter_sysupdate::ab::{Opts, Platform};
 use corerouter_sysupdate::package::load_keys;
 use corerouter_sysupdate::state::{Confirm, Reason, State};
+use corerouter_sysupdate::system_disk::{self, BootOptions};
 use corerouter_sysupdate::upload::ChunkReader;
 use serde_json::{Value, json};
 
@@ -107,6 +113,14 @@ struct Svc {
     boot_unix: u64,
     status_at: Option<Instant>,
     healthy_since: Option<Instant>,
+    /// G1.6zn: `/config` (the boot options), the runtime directory (the
+    /// init's files), what the options file holds, the last status and
+    /// whether the disk is known gone.
+    config: Option<PathBuf>,
+    runtime: Option<PathBuf>,
+    boot_saved: Option<bool>,
+    last: Option<Value>,
+    gone: bool,
 }
 
 fn now_unix() -> u64 {
@@ -146,6 +160,8 @@ impl Svc {
             package::feed_status(&mut lock(session), json!({"supported": false, "reason": e}));
         }
         let boot_unix = if lab { now_unix() } else { now_unix().saturating_sub(uptime_s()) };
+        let runtime = std::env::var_os("COREROUTER_RUNTIME_DIR").filter(|d| !d.is_empty()).map(PathBuf::from);
+        let boot_saved = config.and_then(|c| system_disk::load_options(c).ok()).map(|o| o.to_ram);
         Svc {
             platform,
             off,
@@ -153,10 +169,37 @@ impl Svc {
             boot_unix,
             status_at: None,
             healthy_since: None,
+            config: config.map(Path::to_owned),
+            runtime,
+            boot_saved,
+            last: None,
+            gone: false,
         }
     }
 
     fn tick(&mut self, session: &Shared, health: &super::Health) {
+        if self.platform.is_none() {
+            return;
+        }
+        // G1.6zn: the init's line, once the system disk is gone.
+        if let Some(line) = self.runtime.as_deref().and_then(system_disk::read_gone) {
+            if !self.gone {
+                self.gone = true;
+                health.error(line.clone());
+                self.status_at = None;
+            }
+            if self.status_at.is_none_or(|t| t.elapsed() >= STATUS_EVERY) {
+                let mut v = self.last.clone().unwrap_or_else(|| json!({"supported": true}));
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("system_disk_removed".into(), json!(line));
+                    o.insert("root".into(), self.root());
+                }
+                package::feed_status(&mut lock(session), v);
+                self.status_at = Some(Instant::now());
+            }
+            return;
+        }
+        self.save_boot_options(session, health);
         let Some(p) = self.platform.as_mut() else { return };
         if self.status_at.is_none() {
             match p.provision(TUNING_KEYS) {
@@ -191,8 +234,44 @@ impl Svc {
             // has none): at most STATUS_EVERY old.
             trial.insert("remaining_s".into(), json!(deadline.saturating_sub(now_unix())));
         }
+        if let Some(o) = v.as_object_mut() {
+            o.insert("root".into(), self.root());
+        }
+        self.last = Some(v.clone());
         package::feed_status(&mut lock(session), v);
         self.status_at = Some(Instant::now());
+    }
+
+    /// Where this boot's root came from (the init's `root.json`).
+    fn root(&self) -> Value {
+        self.runtime
+            .as_deref()
+            .and_then(system_disk::read_root)
+            .and_then(|r| serde_json::to_value(r).ok())
+            .unwrap_or(Value::Null)
+    }
+
+    /// G1.6zn: `system.boot` of the running configuration where the init
+    /// reads it at the next boot, when it changed (one comparison a tick).
+    fn save_boot_options(&mut self, session: &Shared, health: &super::Health) {
+        let Some(config) = &self.config else { return };
+        let want = lock(session).store().running().system.boot.to_ram;
+        if self.boot_saved == Some(want) {
+            return;
+        }
+        self.boot_saved = Some(want);
+        match system_disk::save_options(config, BootOptions { to_ram: want }) {
+            Ok(()) => {
+                let l = if want {
+                    "next boot: the system in RAM (system.boot to_ram=yes)"
+                } else {
+                    "next boot: the system read from the disk (system.boot to_ram=no)"
+                };
+                log::info!("package: {l}");
+                health.event(l);
+            }
+            Err(e) => health.error(format!("boot options: {e}")),
+        }
     }
 
     /// During a trial boot: confirm (auto) once healthy; in the lab, play

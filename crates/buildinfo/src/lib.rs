@@ -15,6 +15,11 @@ pub const COMMIT: &str = env!("COREROUTER_COMMIT");
 /// The commit, with `.dirty` when the tree had uncommitted changes.
 pub const BUILD: &str = env!("COREROUTER_BUILD");
 
+/// Short git tree of the commit (`unknown` outside git): the files that were
+/// built. A branch's last commit and the squash the merge queue makes of it
+/// differ in id and count but not in tree.
+pub const TREE: &str = env!("COREROUTER_TREE");
+
 /// Unix time of the commit (0 when unknown): the build's date, the same on
 /// every machine that builds that commit.
 pub const COMMIT_TIME: &str = env!("COREROUTER_COMMIT_TIME");
@@ -64,6 +69,13 @@ pub fn version_line(program: &str) -> String {
     format!("{program} {} ({when}protocol {PROTOCOL})", full())
 }
 
+/// Is a build that reports `tree` and `build` (its `server.info`) made of
+/// the same files as this one? Only for clean builds: with uncommitted
+/// changes on either side the tree does not say what was built.
+pub fn same_files(tree: &str, build: &str) -> bool {
+    TREE != "unknown" && tree == TREE && !build.ends_with(".dirty") && !BUILD.ends_with(".dirty")
+}
+
 /// The version's dev number (`0.1.0-dev.500` → 500); `None` for a release.
 pub fn dev_number(version: &str) -> Option<u64> {
     version.rsplit_once("-dev.")?.1.parse().ok()
@@ -94,6 +106,16 @@ mod tests {
         assert_eq!(utc(0), "1970-01-01 00:00:00 UTC");
         assert_eq!(utc(1_793_337_250), "2026-10-30 05:14:10 UTC");
         assert!(version_line("x").starts_with(&format!("x {}", full())));
+    }
+
+    #[test]
+    fn the_same_tree_is_the_same_build_only_when_both_are_clean() {
+        assert!(!same_files("unknown", "x"));
+        assert!(!same_files("000000000000", "abc1234"));
+        assert!(!same_files(TREE, "abc1234.dirty"));
+        if TREE != "unknown" && !BUILD.ends_with(".dirty") {
+            assert!(same_files(TREE, "abc1234"));
+        }
     }
 
     #[test]

@@ -655,6 +655,60 @@ desenvolvimento do mesmo commit; o host tinha outras sessões rodando.
 - **Instalador e imagens de VM** criando as entradas de boot na instalação: G1.6c (até lá, o
   primeiro boot de uma imagem gravada sobe sem verity, pelo fallback, e cria as entradas).
 
+## Sistema na RAM e disco do sistema removido (G1.6zn)
+
+Num notebook bootando de pendrive, tirar o pendrive com o roteador ligado enchia o console de
+`SQUASHFS error`, `EXT4-fs (sda4) … I/O error` e `FAT-fs (sda1) … bread failed`: a raiz é lida
+do disco conforme é usada, e nada dizia o que tinha acontecido.
+
+**Sistema na RAM** (`system.boot.set {to_ram: yes}`, desligado por padrão; System › Packages,
+"Run the system from RAM"). Vale do boot seguinte:
+
+1. o serviço `package` do daemon grava a escolha em `/config/package/boot.json` (arquivo próprio,
+   não o `running.json`: os commits vão antes para o journal, G0.22, e o PID 1 lê poucos bytes);
+2. no boot, o `corerouter-init` monta o `/config`, lê a opção e, ligada, lê o dispositivo
+   dm-verity inteiro (`/dev/dm-0`, o tamanho vem da tabela da linha de comando) para um arquivo
+   num tmpfs em `/mnt`. Ler pelo dm-verity confere cada bloco contra o hash raiz assinado, a
+   mesma conferência do boot pelo disco; um bloco que não bate é EIO e o boot fica no disco;
+3. monta o arquivo (loop, squashfs), faz dele a raiz com `pivot_root(".", ".")` (o
+   `switch_root` da ISO live só funciona a partir de um initramfs), solta a raiz velha com
+   `umount -l` e executa o `corerouter-init` de novo de lá (`--ram-root <bytes> <ms>`), que
+   segue o boot normal (monta o `/config` de novo).
+
+Sem `MemAvailable` para a raiz mais 256 MiB de sobra (`RAM_LEFT_KIB`), sem verity (boot pelo
+caminho reserva) ou com qualquer falha antes da troca, o boot segue do disco com uma linha que diz
+por quê, e a saúde mostra `system.disk` em aviso. `system.boot.print` e `system.package.print`
+(`root`) dizem de onde veio a raiz deste boot.
+
+**Disco do sistema removido** (com ou sem a opção). Uma thread do init dorme nas mensagens de
+dispositivo do kernel (uevent, sem polling) e, quando some o disco do `/config` ou o de baixo do
+`dm-0`:
+
+- baixa o `console_loglevel` para 1 (só `KERN_EMERG`): os erros do kernel continuam no log do
+  kernel e no do roteador, mas não enterram a linha (ext4 imprime em `KERN_CRIT`, squashfs e FAT em
+  `KERN_ERR`, acima do nível 4 do `quiet`);
+- desmonta (lazy) o `/config` e a ESP, para não pedir mais nada ao disco;
+- escreve uma linha no console e no log do roteador e a grava em
+  `/run/corerouter/system-disk-removed`: "system disk sda removed: the router keeps running from
+  RAM, but configuration changes are no longer saved; reboot with the disk in place" (ou "the
+  system runs from that disk and may stop at any moment" sem a opção).
+
+Com o arquivo presente, o armazenamento da config recusa toda gravação com essa linha, e o engine
+recusa o commit **antes** de aplicar (aplicado e perdido no reboot, ninguém saberia); o Safe Mode,
+que não grava, continua mudando o roteador. O serviço `package` para de ler a ESP e o `/config`,
+recusa as tarefas de slot com a mesma linha e a saúde mostra `system.disk` em erro.
+
+Teste: `cargo xtask os ab-test --scenario to-ram` (o disco instalado vira um pendrive
+`usb-storage` no xHCI; `device_del` pelo monitor do QEMU tira o pendrive a quente).
+
+| Medida (QEMU KVM, OVMF, 2 vCPUs, 1 GiB, pendrive usb-storage sobre qcow2) | Valor |
+|---|---|
+| Cópia da raiz (86 MiB) pelo dm-verity | 78–83 ms (**medido**; o qcow2 está no cache do host) |
+| Kernel → daemon pronto, raiz no disco / na RAM | 1,88–1,96 s / 1,90–1,94 s (**medido**) |
+| `MemAvailable`, raiz no disco / na RAM | 875 / 744 MiB (**medido**; 86 MiB do arquivo em `Shmem`) |
+| Linhas do kernel no console depois do aviso | 0 (antes dele, ~9 em 7 ms: o journal do ext4 em voo) |
+| Cópia num pendrive USB 2 (~30 MB/s) / USB 3 (~150 MB/s) | ~3 s / ~0,6 s (**estimado**) |
+
 ## Firmware das placas e drivers em módulo (G1.6j)
 
 Pegadinha que decidiu o desenho: **um driver embutido (`=y`) sonda antes de o `/` existir.** As
