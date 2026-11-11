@@ -28,11 +28,32 @@ pub(crate) const CMD_GET_INTERFACE: u8 = 5;
 pub(crate) const CMD_GET_STATION: u8 = 17;
 /// G1.30i (checked compiling the header: 50).
 pub(crate) const CMD_GET_SURVEY: u8 = 50;
+// G1.30j: the monitor interface (Linux 6.18.59 values, read from the
+// header by a C program: NEW_INTERFACE 7, DEL_INTERFACE 8, SET_CHANNEL 65).
+pub(crate) const CMD_NEW_INTERFACE: u8 = 7;
+pub(crate) const CMD_DEL_INTERFACE: u8 = 8;
+pub(crate) const CMD_SET_CHANNEL: u8 = 65;
 
 // `enum nl80211_attrs` (l. 3077).
-const ATTR_WIPHY: u16 = 1;
+pub(crate) const ATTR_WIPHY: u16 = 1;
 const ATTR_WIPHY_NAME: u16 = 2;
 pub(crate) const ATTR_IFINDEX: u16 = 3;
+pub(crate) const ATTR_IFNAME: u16 = 4;
+pub(crate) const ATTR_IFTYPE: u16 = 5;
+/// Nested flags, `enum nl80211_mntr_flags` (l. 5001).
+pub(crate) const ATTR_MNTR_FLAGS: u16 = 23;
+const ATTR_SUPPORTED_IFTYPES: u16 = 32;
+pub(crate) const ATTR_WIPHY_FREQ: u16 = 38;
+const ATTR_SOFTWARE_IFTYPES: u16 = 121;
+/// `enum nl80211_chan_width` (l. 5101): 20 = 1, 40 = 2, 80 = 3, 160 = 5.
+pub(crate) const ATTR_CHANNEL_WIDTH: u16 = 159;
+pub(crate) const ATTR_CENTER_FREQ1: u16 = 160;
+/// `NL80211_IFTYPE_MONITOR` (l. 3765).
+pub(crate) const IFTYPE_MONITOR: u32 = 6;
+/// `NL80211_MNTR_FLAG_CONTROL`: pass control frames.
+pub(crate) const MNTR_FLAG_CONTROL: u16 = 3;
+/// `NL80211_MNTR_FLAG_OTHER_BSS`: every network's frames, not only ours.
+pub(crate) const MNTR_FLAG_OTHER_BSS: u16 = 4;
 const ATTR_MAC: u16 = 6;
 const ATTR_STA_INFO: u16 = 21;
 const ATTR_WIPHY_BANDS: u16 = 22;
@@ -464,6 +485,11 @@ pub(crate) struct Wiphy {
     pub antennas_tx: Option<u32>,
     pub antennas_rx: Option<u32>,
     bands: BTreeMap<u16, Band>,
+    /// G1.30j: monitor among the interface types the wiphy offers.
+    pub monitor: Option<bool>,
+    /// G1.30j: monitor among its software types (mac80211's: they need no
+    /// interface combination, so a monitor runs beside the station).
+    pub monitor_shared: Option<bool>,
 }
 
 impl Wiphy {
@@ -497,6 +523,15 @@ impl Wiphy {
                         .map(u32::count_ones)
                         .filter(|n| *n > 0)
                         .or(self.antennas_rx);
+                }
+                ATTR_SUPPORTED_IFTYPES => {
+                    let has = a.nested().any(|t| u32::from(t.kind) == IFTYPE_MONITOR);
+                    self.monitor = Some(has || self.monitor == Some(true));
+                }
+                ATTR_SOFTWARE_IFTYPES => {
+                    if a.nested().any(|t| u32::from(t.kind) == IFTYPE_MONITOR) {
+                        self.monitor_shared = Some(true);
+                    }
                 }
                 ATTR_WIPHY_BANDS => {
                     for b in a.nested() {
@@ -542,10 +577,13 @@ mod io {
     use corerouter_hal::wifi::WifiLink;
 
     use super::{
-        ATTR_IFINDEX, ATTR_SPLIT_WIPHY_DUMP, CMD_GET_INTERFACE, CMD_GET_STATION, CMD_GET_SURVEY,
-        CMD_GET_WIPHY, MAX_SURVEY, MAX_WIPHY_MESSAGES, Wiphy, station, survey, tx_power,
+        ATTR_CENTER_FREQ1, ATTR_CHANNEL_WIDTH, ATTR_IFINDEX, ATTR_IFNAME, ATTR_IFTYPE,
+        ATTR_MNTR_FLAGS, ATTR_SPLIT_WIPHY_DUMP, ATTR_WIPHY, ATTR_WIPHY_FREQ, CMD_DEL_INTERFACE,
+        CMD_GET_INTERFACE, CMD_GET_STATION, CMD_GET_SURVEY, CMD_GET_WIPHY, CMD_NEW_INTERFACE,
+        CMD_SET_CHANNEL, IFTYPE_MONITOR, MAX_SURVEY, MAX_WIPHY_MESSAGES, MNTR_FLAG_CONTROL,
+        MNTR_FLAG_OTHER_BSS, Wiphy, station, survey, tx_power,
     };
-    use crate::genl::{Genl, GenlError, Msg};
+    use crate::genl::{Genl, GenlError, Msg, attrs, find};
     use corerouter_hal::wifi::WifiSurvey;
 
     /// cfg80211 in the kernel (see `crate::wifi_links`: asking for the
@@ -618,6 +656,73 @@ mod io {
             }
             Ok(w)
         }
+
+        /// G1.30j: the wiphy index and the frequency in use of interface
+        /// `ifindex` (`GET_INTERFACE`).
+        pub fn interface(&mut self, ifindex: u32) -> Result<(Option<u32>, Option<u32>), GenlError> {
+            let seq = self.genl.next_seq();
+            let mut m = Msg::new(self.family, CMD_GET_INTERFACE, 0, seq);
+            m.u32(ATTR_IFINDEX, ifindex);
+            let replies = self.genl.call(m.finish(), seq)?;
+            let wiphy = replies
+                .iter()
+                .find_map(|(_, a)| find(attrs(a), ATTR_WIPHY)?.u32());
+            let freq = replies
+                .iter()
+                .find_map(|(_, a)| find(attrs(a), ATTR_WIPHY_FREQ)?.u32());
+            Ok((wiphy, freq))
+        }
+
+        /// G1.30j: a monitor interface `name` on wiphy `wiphy` that passes
+        /// control frames and every network's; its ifindex.
+        pub fn new_monitor(&mut self, wiphy: u32, name: &str) -> Result<Option<u32>, GenlError> {
+            let seq = self.genl.next_seq();
+            let mut m = Msg::new(self.family, CMD_NEW_INTERFACE, 0, seq);
+            m.u32(ATTR_WIPHY, wiphy)
+                .str(ATTR_IFNAME, name)
+                .u32(ATTR_IFTYPE, IFTYPE_MONITOR)
+                .begin(ATTR_MNTR_FLAGS)
+                .flag(MNTR_FLAG_CONTROL)
+                .flag(MNTR_FLAG_OTHER_BSS)
+                .end();
+            let replies = self.genl.call(m.finish(), seq)?;
+            Ok(replies
+                .iter()
+                .find_map(|(_, a)| find(attrs(a), ATTR_IFINDEX)?.u32()))
+        }
+
+        /// G1.30j: remove interface `ifindex` (a monitor this made).
+        pub fn del_interface(&mut self, ifindex: u32) -> Result<(), GenlError> {
+            let seq = self.genl.next_seq();
+            let mut m = Msg::new(self.family, CMD_DEL_INTERFACE, 0, seq);
+            m.u32(ATTR_IFINDEX, ifindex);
+            self.genl.call(m.finish(), seq).map(|_| ())
+        }
+
+        /// G1.30j: tune monitor `ifindex` to `freq` MHz, `width` MHz wide
+        /// around `center` (`nl80211_parse_chandef`: the width and centre
+        /// attributes, not the old channel type).
+        pub fn set_channel(
+            &mut self,
+            ifindex: u32,
+            freq: u32,
+            width: u32,
+            center: u32,
+        ) -> Result<(), GenlError> {
+            let code = match width {
+                40 => 2,
+                80 => 3,
+                160 => 5,
+                _ => 1,
+            };
+            let seq = self.genl.next_seq();
+            let mut m = Msg::new(self.family, CMD_SET_CHANNEL, 0, seq);
+            m.u32(ATTR_IFINDEX, ifindex)
+                .u32(ATTR_WIPHY_FREQ, freq)
+                .u32(ATTR_CHANNEL_WIDTH, code)
+                .u32(ATTR_CENTER_FREQ1, center);
+            self.genl.call(m.finish(), seq).map(|_| ())
+        }
     }
 }
 
@@ -651,6 +756,37 @@ mod tests {
 
     fn u32a(kind: u16, v: u32) -> Vec<u8> {
         nla(kind, &v.to_ne_bytes())
+    }
+
+    #[test]
+    fn monitor_support_from_the_interface_types() {
+        // A mac80211 card: station, AP and monitor; monitor among the
+        // software types too.
+        let msg = [
+            u32a(ATTR_WIPHY, 0),
+            nest(
+                ATTR_SUPPORTED_IFTYPES,
+                &[nla(2, &[]), nla(3, &[]), nla(6, &[])],
+            ),
+            nest(ATTR_SOFTWARE_IFTYPES, &[nla(6, &[]), nla(8, &[])]),
+        ]
+        .concat();
+        let mut w = Wiphy::default();
+        w.add(&msg);
+        assert_eq!((w.monitor, w.monitor_shared), (Some(true), Some(true)));
+        // A FullMAC card without monitor.
+        let msg = [
+            u32a(ATTR_WIPHY, 1),
+            nest(ATTR_SUPPORTED_IFTYPES, &[nla(2, &[])]),
+        ]
+        .concat();
+        let mut w = Wiphy::default();
+        w.add(&msg);
+        assert_eq!((w.monitor, w.monitor_shared), (Some(false), None));
+        // Nothing said: not known.
+        let mut w = Wiphy::default();
+        w.add(&u32a(ATTR_WIPHY, 2));
+        assert_eq!((w.monitor, w.monitor_shared), (None, None));
     }
 
     fn s8a(kind: u16, v: i8) -> Vec<u8> {

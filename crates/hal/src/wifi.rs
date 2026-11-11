@@ -401,6 +401,11 @@ pub struct WifiRadio {
     pub spectral_scan: bool,
     /// Why not, in words, when it does not.
     pub spectral_why_not: Option<String>,
+    /// G1.30j: the driver offers monitor mode (`None`: not known).
+    pub monitor: Option<bool>,
+    /// G1.30j: a monitor interface runs beside the station, which stays
+    /// connected (mac80211 drivers: monitor is a software interface type).
+    pub monitor_shared: Option<bool>,
 }
 
 /// One band of a radio (nl80211 wiphy bands).

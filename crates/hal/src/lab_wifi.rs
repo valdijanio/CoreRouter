@@ -693,6 +693,8 @@ impl LabWifi {
                      needs a Qualcomm Atheros chip (ath9k, ath10k, ath11k)"
                         .to_owned()
                 }),
+                monitor: Some(true),
+                monitor_shared: Some(true),
             }
         })
     }
@@ -728,6 +730,17 @@ impl LabWifi {
     /// Times radio `name` was told to join (a test's: no rejoin on a tick).
     pub fn joins(&self, name: &IfName) -> u32 {
         self.air().radios.get(name).map_or(0, |r| r.joins)
+    }
+
+    /// G1.30j: the networks in the air (the monitor's beacons).
+    pub fn networks(&self) -> Vec<LabNetwork> {
+        self.air().networks.clone()
+    }
+
+    /// G1.30j: the frequency radio `name` is connected on.
+    pub fn frequency(&self, name: &IfName) -> Option<u32> {
+        let air = self.air();
+        air.radios.get(name)?.on.as_ref().map(|n| n.frequency_mhz)
     }
 
     /// Take the networks named `ssid` off the air (a test's).

@@ -1633,6 +1633,13 @@ impl Hal for VirtualHal {
         self.wifi.radio(name)
     }
 
+    /// The lab's air, frame by frame (`lab_wifi_air`).
+    fn wifi_monitor(&self) -> Result<crate::wifi_monitor::SharedWifiMonitor, String> {
+        Ok(Arc::new(crate::lab_wifi_air::LabMonitor::new(
+            self.wifi.clone(),
+        )))
+    }
+
     fn wifi_regdomain(&mut self) -> Option<String> {
         self.wifi.country()
     }

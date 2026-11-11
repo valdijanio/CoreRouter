@@ -25,6 +25,9 @@ use serde::Serialize;
 
 /// Most bytes of a frame a socket keeps (a jumbo frame and its tags).
 pub const MAX_SNAPLEN: u16 = 9216;
+/// G1.30j: a Wi-Fi monitor's frames whole — the radiotap header and the
+/// largest 802.11 MPDU (11 454 bytes, IEEE 802.11-2020 §9.2.4.7.1).
+pub const MAX_SNAPLEN_RADIO: u16 = 12_288;
 /// What Torch needs: Ethernet + two tags + IPv6 + a few extension headers
 /// + the ports.
 pub const HEADERS_SNAPLEN: u16 = 128;
@@ -429,13 +432,18 @@ pub const PCAP_RECORD_HEADER_LEN: usize = 16;
 /// version 2.4, SnapLen, LinkType Ethernet. Little-endian, as written by
 /// the hosts readers expect (the magic tells them the order).
 pub fn pcap_header(snaplen: u16) -> [u8; PCAP_HEADER_LEN] {
+    pcap_header_for(u32::from(snaplen), LINKTYPE_ETHERNET)
+}
+
+/// [`pcap_header`] with another link type (G1.30j: 127, radiotap + 802.11).
+pub fn pcap_header_for(snaplen: u32, linktype: u32) -> [u8; PCAP_HEADER_LEN] {
     let mut h = [0u8; PCAP_HEADER_LEN];
     let fields: [(usize, &[u8]); 5] = [
         (0, &0xA1B2_C3D4u32.to_le_bytes()),
         (4, &2u16.to_le_bytes()),
         (6, &4u16.to_le_bytes()),
-        (16, &u32::from(snaplen).to_le_bytes()),
-        (20, &LINKTYPE_ETHERNET.to_le_bytes()),
+        (16, &snaplen.to_le_bytes()),
+        (20, &linktype.to_le_bytes()),
     ];
     for (at, bytes) in fields {
         if let Some(dst) = h.get_mut(at..at + bytes.len()) {
