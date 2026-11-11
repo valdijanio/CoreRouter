@@ -9798,3 +9798,59 @@ continuação indentadas).
 - 2026-11-10 — G4.8: System › Resources: a linha guarda-chuva dizia só "em partes". Agora diz quais partes entraram e quais faltam. Só o status muda.
 
 - 2026-11-10 — G4.9: Filas: a linha guarda-chuva dizia só "em partes". Agora diz quais partes entraram e quais faltam. Só o status muda.
+
+- 2026-11-10 — fix-main-netns-nft-novo: `netns` verde com o `nft` antigo e com o novo. Os lotes da fila de 2026-11-10 rodaram no GitHub
+  (imagem `ubuntu-26.04` 20261101.186.1, nftables 1.1.6), sem o runner próprio (nftables 1.0.9),
+  e o job `netns` quebrou em `netns_fw_nfnl` e `netns_fastpath` (runs 42926374234 e 42927427905).
+  Duas mudanças do nftables, achadas no fonte (`git.netfilter.org/nftables`, em
+  `/srv/build/nftables-src`):
+
+  - **Faixa `a-b` num `range`** (commit `50741c52`, "netlink_linearize: use range expression for
+    OP_EQ and OP_IMPLICIT", entrou na v1.1.2): `netlink_gen_range` (`src/netlink_linearize.c`)
+    grava `== a-b` como `range eq` em vez de `cmp gte` + `cmp lte`. O leitor do `nft` continua
+    juntando o par antigo (`expr_may_merge_range`, `src/netlink_delinearize.c`, desde a v0.7, commit
+    `3ed93291`), e a v1.0.9 já lê `range eq` (`netlink_parse_range_op`). O kernel tem `nft_range`
+    desde o 4.9 e o avalia por chamada direta (`expr_call_ops_eval`, `nf_tables_core.c`, 6.18).
+  - **Nomes de dispositivo entre aspas** no `nft list` (commit `eb30f236`, "rule: print chain and
+    flowtable devices in quotes", v1.1.4): `devices = { "e0", "i0" }`.
+
+  A imagem embarca o nftables 1.1.0 (Buildroot 2025.02.19, `os/buildroot.lock`), que ainda grava o
+  par e não põe aspas.
+
+  O que mudou:
+
+  - **Codificador** (`corerouter_firewall::bytecode`): uma faixa vira `range eq`, como o nftables
+    ≥ 1.1.2 (antes: o par). Medido: +33% de pps com o quadro acima da faixa, empate abaixo (`## perf`).
+  - **Leitor** (`hal_linux::nft_read`): o par `cmp gte` + `cmp lte` no mesmo registrador, com o
+    mesmo tamanho e um logo depois do outro, é lido como `range eq` (os dois casam os mesmos
+    pacotes). Assim a tabela que o kernel tem, venha do `nft` < 1.1.2, do ≥ 1.1.2 ou de um
+    CoreRouter anterior a esta mudança, é comparada com o que carregamos sem diferença falsa. Sem
+    isso, o commit seguinte trocava a tabela inteira (31 regras, perdendo os contadores): conferido
+    desligando a junção, o teste novo falha com `replaced: true` nos dois `nft`.
+  - **Testes:** `netns_fw_nfnl::a_table_with_either_range_form_is_diffed_not_replaced` (tabela
+    carregada pelo `nft -f` e na forma antiga; o bytecode no kernel é conferido com
+    `nft --debug=netlink`; o commit seguinte sai por diff, 1 regra trocada, as outras com o mesmo
+    handle); `nft_read::tests::a_cmp_pair_reads_as_one_range` (o par vira `range`; ordem trocada,
+    registradores, tamanhos, `gt`, um limite só ou expressão no meio ficam como estão);
+    `netns_fastpath` aceita os nomes com e sem aspas.
+
+  Como testar: `cargo xtask ci --only netns` (o `nft` do sistema) e, com o nftables 1.1.6
+  compilado em `/srv/build/nft-new` (libmnl 1.0.5, libnftnl 1.3.1, jansson 2.14.1, tarballs
+  oficiais com assinatura GPG conferida),
+  `PATH=/srv/build/nft-new/bin:$PATH COREROUTER_NFT=/srv/build/nft-new/bin/nft cargo xtask ci --only netns`.
+  Os dois verdes (**medido**, 2026-11-10).
+
+- 2026-11-10 — processo-regras-basicas: Regras básicas do dono do projeto no topo do `AGENTS.md`/`CLAUDE.md`, valendo antes das outras:
+
+  1. o projeto é do agente: reorganizar o que existe quando isso deixa o código mais simples;
+  2. não parar enquanto faltar algo do pedido, com uma lista única de paradas permitidas;
+  3. erro se resolve achando a causa, sem perguntar;
+  4. conferir no sistema rodando antes de dizer que terminou, dizendo o que não deu para conferir;
+  5. o relato começa pelo resultado, em frases curtas.
+
+  As regras que conflitavam foram ajustadas:
+
+  - "Pare e pergunte só para" aponta para a lista da regra 2.
+  - "Com o PR aberto, pare" pede o sistema conferido antes e deixa claro que o pedido só termina
+    quando o PR entra.
+  - Os pontos quentes e os crates compartilhados admitem uma reorganização maior num PR próprio.

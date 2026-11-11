@@ -3010,3 +3010,19 @@ G4.2h, tempestade com vinculações, duas threads, release, fsync real, 30 s (**
   desenvolvimento com 32 threads, teste `pool_used_pages_counts_and_finds_the_holder`): 100 000 sessões
   PPPoE no serviço, página de 10 000 em ordem de endereço em 8,1 ms, contagem por pool em 5,7 ms
   (debug: 28 ms e 21 ms).
+
+- 2026-11-10, fix-main-netns-nft-novo (**medido**): faixa de porta como `range eq` × `cmp gte` +
+  `cmp lte`. Kernel 7.0.0-42, build release (`cargo bench`), netns sem root, máquina compartilhada
+  (carga 18–52), `netns_forward` "500 port ranges": 500 regras `udp dport A-B drop` no forward
+  que nenhum quadro casa, quadros UDP de 64 bytes para as portas 9000–9255, as duas formas
+  alternadas no mesmo processo (mediana de 15 rodadas de 20 000 quadros; duas execuções):
+
+  | quadro | `range eq` | par `cmp` | range/par |
+  |---|---|---|---|
+  | acima da faixa (1000-2000) | 72,5 / 77,9 kpps | 54,4 / 58,3 kpps | 1,33 / 1,34 |
+  | abaixo da faixa (20000-30000) | 74,6 / 76,1 kpps | 75,1 / 78,1 kpps | 0,99 / 0,97 |
+
+  Acima, o par avalia as duas expressões e o `range` uma (com as duas `memcmp`); abaixo, o par
+  para no primeiro `cmp`. Medir as formas em execuções separadas não serviu: com a carga da
+  máquina mudando (carga 52 → 33), o `range` saiu com −58% e −47% (`--baseline`); alternadas,
+  a diferença é a de cima.
