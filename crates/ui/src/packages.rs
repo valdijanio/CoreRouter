@@ -283,7 +283,8 @@ impl PackagesPanel {
                 chip(ui, &text, neutral_tone(&v));
             }
             if to_ram != in_ram {
-                chip(ui, t(lang, "next boot"), AMBER.tone(&v)).on_hover_text(t(lang, "changes at the next boot"));
+                let next = if to_ram { t(lang, "next boot: RAM") } else { t(lang, "next boot: disk") };
+                chip(ui, next, AMBER.tone(&v)).on_hover_text(t(lang, "changes at the next boot"));
             }
         });
         if let Some(on) = want {

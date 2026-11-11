@@ -72,6 +72,8 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("it must be confirmed within", "precisa ser confirmado em"),
     ("kept", "mantida"),
     ("next boot", "próximo boot"),
+    ("next boot: RAM", "próximo boot: RAM"),
+    ("next boot: disk", "próximo boot: disco"),
     ("no room for the snapshot", "sem espaço para a cópia"),
     ("no snapshot and no partial copy to remove", "nenhuma cópia para remover"),
     ("no verity", "sem verity"),
