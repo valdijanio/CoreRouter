@@ -22,7 +22,7 @@ use std::collections::VecDeque;
 use corerouter_hal::wifi::SpectralSample;
 use corerouter_hal::wifi::WifiBss;
 
-use crate::wifi_air::{self, CCA_PREAMBLE_DBM};
+use crate::wifi_air::{self, CCA_ENERGY_DBM, CCA_PREAMBLE_DBM};
 
 /// Points of a row at most.
 pub const MAX_POINTS: usize = 1024;
@@ -294,12 +294,16 @@ impl Spectrum {
     }
 
     /// Each 20 MHz channel a sample covered: the share of the samples
-    /// over it in which the power above the noise floor, its bins summed,
-    /// reached the CCA preamble level, −82 dBm: as often as a station there
-    /// would find the channel busy if all of it were Wi-Fi (airView's
-    /// "channel usage", the share of time). Counted per sample as they
-    /// arrive, not per row: a row holds the maximum of a quarter of a
-    /// second, and a hopper lands somewhere in most of them.
+    /// over it in which a station there would find the channel busy
+    /// (airView's "channel usage", the share of time), by the two rules of
+    /// the CCA on the power above the noise floor, its bins summed:
+    /// - energy wide like Wi-Fi's (a quarter of the channel's bins or more
+    ///   6 dB over the floor) from −82 dBm, the preamble level;
+    /// - any energy from −62 dBm (a carrier, a hopper, an oven).
+    ///
+    /// Counted per sample as they arrive, not per row: a row holds the
+    /// maximum of a quarter of a second, and a hopper lands somewhere in
+    /// most of them.
     pub fn channel_usage(&self) -> Vec<(u32, u32, f64)> {
         self.usage
             .iter()
@@ -331,9 +335,14 @@ impl Spectrum {
             // Bins whose centre is in [a, b).
             let first = ((a - s.start_mhz) / step).ceil().max(0.0) as usize;
             let last = (((b - s.start_mhz) / step).ceil().max(0.0) as usize).min(excess.len());
-            let mw: f64 = excess.get(first..last).map_or(0.0, |e| e.iter().sum());
+            let bins = excess.get(first..last).unwrap_or(&[]);
+            let mw: f64 = bins.iter().sum();
+            // 6 dB over the floor: the excess at least three times the floor.
+            let lit = bins.iter().filter(|&&e| e >= 3.0 * floor).count();
+            let wide = !bins.is_empty() && lit * 4 >= bins.len();
+            let dbm = 10.0 * mw.max(1e-30).log10();
             u.seen = u.seen.saturating_add(1);
-            if 10.0 * mw.max(1e-30).log10() >= f64::from(CCA_PREAMBLE_DBM) {
+            if dbm >= f64::from(CCA_ENERGY_DBM) || (wide && dbm >= f64::from(CCA_PREAMBLE_DBM)) {
                 u.busy = u.busy.saturating_add(1);
             }
         }

@@ -435,8 +435,9 @@ fn next(state: &mut u64) -> u64 {
 /// that overlap it, each sending in a share of the samples as busy as it
 /// is (an OFDM block 2 MHz narrower than its channel, its signal spread
 /// over its width), and, on 2.4 GHz, a microwave oven (2450–2470 MHz, half
-/// the time), a Bluetooth-like hopper (1 MHz, anywhere) and a continuous
-/// carrier at 2417 MHz; on 5 GHz a carrier at 5232 MHz. Written in
+/// the time), a Bluetooth-like hopper (1 MHz, anywhere, half the samples)
+/// and a continuous carrier at 2417 MHz; on 5 GHz a carrier at 5232
+/// MHz. Written in
 /// ath10k's format and read back by the parser a real radio's goes
 /// through.
 fn lab_fft(
@@ -476,8 +477,10 @@ fn lab_fft(
             let wander = (next(rng) % 6) as f64;
             add(2450.0 + wander, 2466.0 + wander, -58.0);
         }
-        let hop = 2402.0 + (next(rng) % 79) as f64;
-        add(hop - 0.5, hop + 0.5, -62.0);
+        if next(rng).is_multiple_of(2) {
+            let hop = 2402.0 + (next(rng) % 79) as f64;
+            add(hop - 0.5, hop + 0.5, -62.0);
+        }
         add(2416.8, 2417.2, -70.0);
     } else {
         add(5231.8, 5232.2, -72.0);

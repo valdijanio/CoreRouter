@@ -950,7 +950,9 @@ fn draw_usage(ui: &Ui, rect: Rect, axis: &Axis, usage: &[(f32, f64, u64)]) {
     p.rect_filled(plot, 2.0, v.extreme_bg_color);
     let font = egui::FontId::proportional(chip::small(ui));
     for &(f, u, ch) in usage {
-        let (x0, x1) = (axis.x(plot, f - 9.0), axis.x(plot, f + 9.0));
+        // As wide as the channels are apart (5 MHz on 2.4 GHz, 20 above).
+        let half = if f < 3000.0 { 2.2 } else { 9.0 };
+        let (x0, x1) = (axis.x(plot, f - half), axis.x(plot, f + half));
         let k = if u >= 60.0 { chip::RED.tone(&v) } else if u >= 30.0 { chip::AMBER.tone(&v) } else { chip::GREEN.tone(&v) };
         let h = (plot.height() - 14.0) * (u as f32 / 100.0).clamp(0.02, 1.0);
         p.rect_filled(Rect::from_min_max(Pos2::new(x0, plot.bottom() - h), Pos2::new(x1, plot.bottom())), 1.0, k.ink.gamma_multiply(0.7));

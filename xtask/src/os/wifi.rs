@@ -50,12 +50,14 @@ const TOOLS: &str = "/tmp/tt";
 
 /// The access point's configuration: 2.4 GHz channel 1 (allowed in every
 /// domain), WPA2 and WPA3 with one passphrase, management frame protection
-/// offered, both ways of deriving the SAE element.
+/// offered, both ways of deriving the SAE element. G1.30i: the BSS Load
+/// element in its beacons (`bss_load_update_period`, in beacons), for the
+/// scan's load column.
 fn hostapd_conf() -> String {
     format!(
         "interface=wifi1\ndriver=nl80211\nssid={SSID}\nhw_mode=g\nchannel=1\nieee80211n=1\n\
          wpa=2\nwpa_key_mgmt=WPA-PSK SAE\nrsn_pairwise=CCMP\nwpa_passphrase={PASSPHRASE}\n\
-         ieee80211w=1\nsae_pwe=2\n"
+         ieee80211w=1\nsae_pwe=2\nbss_load_update_period=10\n"
     )
 }
 
@@ -422,6 +424,66 @@ fn round_trips(vm: &mut Vm, log: &mut std::fs::File, secs: f64) -> Result<(f64, 
     Ok((ms[ms.len() / 2], ms[ms.len() - 1]))
 }
 
+/// G1.30i: what the Networks tab's three views read, from a real
+/// `wpa_supplicant` and `hostapd`: the elements of the access point (an
+/// 802.11n 20 MHz channel with BSS Load), the survey `mac80211_hwsim` keeps
+/// for the channels its scan visited (noise −92 dBm, 12.5 % busy:
+/// `mac80211_hwsim_get_survey`), and the spectral scan refused with why.
+fn views(
+    vm: &mut Vm,
+    log: &mut std::fs::File,
+    nums: &mut Numbers,
+    net: &Value,
+) -> Result<(), String> {
+    check(
+        net["width"] == 20
+            && net["center_frequency"] == 2412
+            && net["generation"] == 4
+            && net["stations"].is_u64()
+            && net["utilization"].is_number(),
+        format!("the access point's elements in the scan: {net}"),
+    )?;
+    let f = vm.ok(log, "interface.wifi.frequency-scan", r#"{"name":"wifi2"}"#)?;
+    let one = f["channels"]
+        .as_array()
+        .and_then(|a| a.iter().find(|c| c["channel"] == 1 && c["band"] == "2ghz"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    check(
+        one["networks"] == 1
+            && one["noise"] == -92
+            && one["load"]
+                .as_f64()
+                .is_some_and(|l| (11.0..=14.0).contains(&l)),
+        format!(
+            "channel 1 in the frequency scan: {one} (survey {})",
+            f["survey"]
+        ),
+    )?;
+    let refused = vm.run(log, "interface.wifi.spectral-scan", r#"{"name":"wifi2"}"#)?;
+    let why = refused.to_string();
+    check(
+        refused.get("ok") != Some(&Value::Bool(true))
+            && why.contains("mac80211_hwsim")
+            && why.contains("Qualcomm Atheros"),
+        format!("the spectral scan on a radio without it: {why}"),
+    )?;
+    let d = vm.ok(
+        log,
+        "interface.wifi.spectral-data",
+        r#"{"name":"wifi2","limit":0}"#,
+    )?;
+    check(d["supported"] == false, format!("spectral-data: {d}"))?;
+    nums.put(
+        "scan views",
+        format!(
+            "20 MHz, Wi-Fi 4, BSS Load {} stations {}%; survey {} (ch 1: {}% busy, noise {} dBm); spectral scan refused with why",
+            net["stations"], net["utilization"], f["survey"], one["load"], one["noise"]
+        ),
+    );
+    Ok(())
+}
+
 fn start_ap(vm: &mut Vm, log: &mut std::fs::File) -> Result<(), String> {
     let out = sh(
         vm,
@@ -535,6 +597,7 @@ fn run(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(), S
             net["signal"]
         ),
     );
+    views(vm, log, nums, &net)?;
 
     // Join: WPA3 where the access point offers it.
     let t = Instant::now();

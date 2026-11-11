@@ -85,7 +85,11 @@ Each point is the power of one point of the radio's FFT (about 0.3 MHz), not of 
     (
         "interface.wifi.spectral.usage",
         r##"## What it is
-For each 20 MHz channel, the share of the waterfall's rows in which the energy above the noise, summed over the channel, passed −82 dBm: the level at which a station would take the channel as busy if all of it were Wi-Fi (airView's "channel usage")."##,
+For each 20 MHz channel, the share of the time (of the samples) in which a station there would find the channel busy, like airView's "channel usage". The CCA's rule on the energy above the noise, summed over the channel:
+- energy wide like Wi-Fi's (a quarter of the channel or more above the noise) from −82 dBm, the preamble level;
+- any energy from −62 dBm (a carrier, Bluetooth, a microwave oven).
+
+A weak carrier shows among the sources but does not make the channel busy."##,
     ),
     (
         "interface.wifi.spectral.waterfall",

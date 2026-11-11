@@ -231,11 +231,10 @@ fn spectral_scan_of_the_channel_in_use() {
         [36, 40, 44, 48],
         "{usage:?}"
     );
-    // Each as busy as its networks' duty (some 10 to 40 % in the lab);
-    // 48 always, by the carrier at 5232 MHz (energy, not Wi-Fi, but a
-    // station there defers to it all the same).
-    assert!(usage.iter().all(|u| u.1 > 10.0), "{usage:?}");
-    assert_eq!(usage.last().map(|u| u.1), Some(100.0), "{usage:?}");
+    // Each as busy as its networks' duty (some 10 to 40 % in the lab).
+    // The carrier at 5232 MHz (−72 dBm, narrow) does not hold 48: a signal
+    // that is not Wi-Fi counts only from the energy level, −62 dBm.
+    assert!(usage.iter().all(|u| u.1 > 5.0 && u.1 < 60.0), "{usage:?}");
     // Only the rows after `since`.
     let last = d["last_seq"].as_u64().unwrap();
     let ms = spin(&mut s, ms, 2);

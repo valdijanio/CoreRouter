@@ -160,7 +160,11 @@ Cada ponto é a potência de um ponto da FFT do rádio (uns 0,3 MHz), não a do 
     (
         "interface.wifi.spectral.usage",
         r##"## O que é
-Para cada canal de 20 MHz, a parte das linhas da cascata em que a energia acima do ruído, somada no canal, passou de −82 dBm: o nível em que uma estação já trataria o canal como ocupado se tudo fosse Wi-Fi (como o "channel usage" do airView)."##,
+Para cada canal de 20 MHz, a parte do tempo (das amostras) em que uma estação ali acharia o canal ocupado, como o "channel usage" do airView. Vale a regra da CCA sobre a energia acima do ruído, somada no canal:
+- energia larga como a do Wi-Fi (um quarto do canal ou mais acima do ruído) a partir de −82 dBm, o nível do preâmbulo;
+- qualquer energia a partir de −62 dBm (portadora, Bluetooth, micro-ondas).
+
+Uma portadora fraca aparece nas fontes mas não ocupa o canal."##,
     ),
     (
         "interface.wifi.spectral.waterfall",

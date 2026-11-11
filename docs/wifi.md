@@ -338,7 +338,8 @@ O motor calcula tudo (`crates/engine/src/wifi_air.rs`, `wifi_spectrum.rs`,
 - **Espectro** (`interface.wifi.spectral-scan`, `spectral-data`): como o airView. Mostra a
   cascata (último minuto, quatro linhas por segundo, do piso de ruído até 50 dB acima), os
   traços de tempo real, média e pico, e o uso de cada canal de 20 MHz (a parte das amostras em
-  que a energia acima do ruído passou de −82 dBm). Também lista as fontes: `Wi-Fi`, `carrier`
+  que a CCA acharia o canal ocupado: energia larga como Wi-Fi a partir de −82 dBm, qualquer
+  energia a partir de −62 dBm). Também lista as fontes: `Wi-Fi`, `carrier`
   (cw), `microwave oven` (mwo), `Bluetooth`/`hopper` (fhss) e `unknown`, classificadas pela
   forma. A faixa é o canal em uso, a banda de 2,4 GHz ou a de 5 GHz; a banda é varrida com um
   scan a cada 4 s, e a tela avisa que o enlace para durante cada um. Só existe em rádio com
