@@ -482,12 +482,12 @@ impl WifiSnifferPanel {
             self.info(ui, l, "hop", "Hop");
             if self.hop {
                 ui.label(tr_in(SCOPE, l, "Channels"));
-                ui.add_enabled(free, TextEdit::singleline(&mut self.channels).hint_text("1,6,11,36,44").desired_width(110.0))
+                ui.add_enabled(free, TextEdit::singleline(&mut self.channels).hint_text("1,6,11,36,44").desired_width(90.0))
                     .on_disabled_hover_text(why);
                 self.info(ui, l, "channels", "Channels");
-                ui.label(tr_in(SCOPE, l, "Time per channel (ms)"));
+                ui.label(tr_in(SCOPE, l, "Channel time (ms)"));
                 ui.add_enabled(free, TextEdit::singleline(&mut self.channel_time).desired_width(45.0));
-                self.info(ui, l, "channel_time", "Time per channel (ms)");
+                self.info(ui, l, "channel_time", "Channel time (ms)");
             } else {
                 ui.label(tr_in(SCOPE, l, "Channel"));
                 ui.add_enabled(free, TextEdit::singleline(&mut self.channel).hint_text("44").desired_width(50.0))
