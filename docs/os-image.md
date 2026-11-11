@@ -718,7 +718,15 @@ pode estar para perder a única porta.
 | Aquantia/Atheros | `atlantic`, `alx`, `atl1c`, `atl1e`, `atl1`, `atl2` | deve funcionar |
 | Nuvem e virtuais | `virtio_net`, `vmxnet3` (embutidos), `ena`, `gve`, `enic`, `idpf` | `virtio_net` e `vmxnet3` **testadas** no QEMU; as outras devem funcionar |
 | Antigas (Tulip, NE2000, AMD, Via, SiS…) | `tulip`, `ne2k-pci`, `pcnet32`, `via-rhine`, `sis900`… | `tulip`, `ne2k-pci` e `pcnet32` **testadas** no QEMU |
-| USB | `r8152`, `ax88179_178a`, `asix`, `cdc_ether`, `cdc_ncm`, `lan78xx` (embutidos), `smsc95xx`, `aqc111`, `dm9601`, `mcs7830`, `rtl8150`… | deve funcionar; RTL8153 pede teste com o adaptador real |
+| USB | `ax88179_178a`, `asix`, `cdc_ether`, `cdc_ncm`, `lan78xx` (embutidos), `r8152`, `smsc95xx`, `aqc111`, `dm9601`, `mcs7830`, `rtl8150`… | deve funcionar; RTL8153 pede teste com o adaptador real |
+
+O `r8152` é módulo (G1.29h). Embutido, ele sonda um adaptador plugado no boot antes de a raiz
+estar montada e pede o patch `rtl_nic/rtl8153*.fw` ali: dá `-ENOENT`, não tenta de novo, e o chip
+roda sem as correções da Realtek (`drivers/net/usb/r8152.c`, `rtl_hw_phy_work_func_t`, kernel
+6.18.59). Como módulo, o init o carrega da raiz e o arquivo é achado. Embutir o firmware no kernel
+(`CONFIG_EXTRA_FIRMWARE`) também resolveria, mas põe o binário proprietário dentro do kernel GPL,
+o que as distribuições evitam. O `r8169` e o `tg3`, embutidos, pedem o firmware ao abrir a porta
+(`rtl_open`, `tg3_open`), já com a raiz montada.
 
 "Testada" aqui é emulação: prova a carga, o nome da porta e o firmware, não o silício. Nenhuma
 placa física foi testada ainda.
