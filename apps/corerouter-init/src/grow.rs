@@ -109,7 +109,7 @@ pub(crate) fn esp(dev: &str, trial: bool) -> Vec<String> {
 
 /// The disk holding partition `dev` (`/dev/vda4` → `vda`), its size in
 /// 512-byte sectors and its logical block size.
-fn disk_of(dev: &str) -> Option<(String, u64, u64)> {
+pub(crate) fn disk_of(dev: &str) -> Option<(String, u64, u64)> {
     let name = dev.trim_start_matches("/dev/");
     let disk = fs::read_link(format!("/sys/class/block/{name}"))
         .ok()

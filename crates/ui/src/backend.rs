@@ -87,6 +87,7 @@ impl Local {
                 "version_full": corerouter_buildinfo::full(),
                 "commit": corerouter_buildinfo::COMMIT,
                 "build": corerouter_buildinfo::BUILD,
+                "tree": corerouter_buildinfo::TREE,
                 "commit_time": corerouter_buildinfo::commit_unix(),
                 "protocol": corerouter_buildinfo::PROTOCOL,
                 "backend": s.backend(),

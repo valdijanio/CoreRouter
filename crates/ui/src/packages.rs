@@ -30,6 +30,8 @@ const NAME: &str = "packages";
 pub(crate) const WIN: &str = "packages";
 const PRINT: &str = "system.package.print";
 const SCOPE: &str = "packages";
+/// G1.6zn: the root in RAM at the next boot.
+const BOOT_SET: &str = "system.boot.set";
 
 pub(crate) const PANEL: Panel = Panel {
     name: NAME,
@@ -214,6 +216,80 @@ impl PackagesPanel {
             ui.weak(format!("{keys} {}", t(lang, "trusted keys")));
             self.info(ui, "packages.overview", "Packages");
         });
+    }
+
+    /// G1.6zn: the system disk. A red band when it went away; one row with
+    /// the choice for the next boot (`system.boot.set {to_ram}`) and where
+    /// this boot's root is. Hidden for a daemon without `system.boot`.
+    fn system_disk(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, lang: Lang) {
+        let gone = self.status.get("system_disk_removed").and_then(Value::as_str).map(str::to_owned);
+        let root = self.status.get("root").filter(|r| r.is_object()).cloned();
+        let to_ram = self.status.get("to_ram").and_then(Value::as_bool).unwrap_or(false);
+        if root.is_none() && !to_ram && gone.is_none() && !app.has_command(BOOT_SET) {
+            return;
+        }
+        let v = ui.visuals().clone();
+        if let Some(line) = &gone {
+            egui::Frame::group(ui.style())
+                .fill(v.error_fg_color.gamma_multiply(0.12))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        chip(ui, t(lang, "disk removed"), RED.tone(&v));
+                        ui.strong(line);
+                        self.info(ui, "packages.disk_removed", t(lang, "System disk removed"));
+                    });
+                });
+        }
+        let allowed = app.can().check(BOOT_SET).and_then(|()| match &gone {
+            Some(_) => Err(t(lang, "the system disk is gone: reboot with it in place").to_owned()),
+            None => Ok(()),
+        });
+        let mut want: Option<bool> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(t(lang, "System disk"));
+            let mut on = to_ram;
+            let resp = ui.add_enabled(allowed.is_ok(), egui::Checkbox::new(&mut on, t(lang, "Run the system from RAM")));
+            let resp = match &allowed {
+                Ok(()) => resp.on_hover_text(t(
+                    lang,
+                    "Copy the root to RAM at boot: the system disk can be pulled with the router running.",
+                )),
+                Err(why) => resp.on_disabled_hover_text(why),
+            };
+            if resp.changed() {
+                want = Some(on);
+            }
+            self.info(ui, "packages.to_ram", t(lang, "Run the system from RAM"));
+            let Some(r) = &root else { return };
+            let in_ram = r.get("in_ram").and_then(Value::as_bool).unwrap_or(false);
+            if in_ram {
+                let bytes = r.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+                let ms = r.get("copy_ms").and_then(Value::as_u64).unwrap_or(0);
+                let mut hover = format!("{}, {} {ms} ms", size(bytes), t(lang, "copied in"));
+                let disk = s(r, "disk");
+                if !disk.is_empty() {
+                    hover.push_str(&format!(" ({disk})"));
+                }
+                chip(ui, t(lang, "root in RAM"), GREEN.tone(&v)).on_hover_text(hover);
+            } else if let Some(note) = r.get("note").and_then(Value::as_str) {
+                chip(ui, t(lang, "stayed on disk"), AMBER.tone(&v)).on_hover_text(note);
+            } else {
+                let disk = s(r, "disk");
+                let text = if disk.is_empty() {
+                    t(lang, "root on disk").to_owned()
+                } else {
+                    format!("{} {disk}", t(lang, "root on disk"))
+                };
+                chip(ui, &text, neutral_tone(&v));
+            }
+            if to_ram != in_ram {
+                let next = if to_ram { t(lang, "next boot: RAM") } else { t(lang, "next boot: disk") };
+                chip(ui, next, AMBER.tone(&v)).on_hover_text(t(lang, "changes at the next boot"));
+            }
+        });
+        if let Some(on) = want {
+            self.send(app, BOOT_SET, json!({"to_ram": on}));
+        }
     }
 
     fn trial(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, lang: Lang) {
@@ -635,6 +711,7 @@ impl PackagesPanel {
             return;
         }
         self.summary(ui, lang);
+        self.system_disk(app, ui, lang);
         self.trial(app, ui, lang);
         ui.separator();
         self.slots(ui, lang);
@@ -1016,6 +1093,12 @@ impl PanelState for PackagesPanel {
         let Ok(sent) = then.downcast::<Sent>() else { return };
         app.cache.refreshed_at = None;
         match result {
+            // A setting, not a job: say where the next boot runs from.
+            Ok(v) if sent.0 == BOOT_SET => {
+                let lang = app.lang.labels;
+                let ram = v.get("next_boot").and_then(Value::as_str) == Some("ram");
+                self.notice = Some(t(lang, if ram { "Next boot from RAM." } else { "Next boot from the disk." }).to_owned());
+            }
             Ok(v) => {
                 self.notice = Some(format!("{}: job {} queued", sent.0, v.get("job").and_then(Value::as_u64).unwrap_or(0)));
             }

@@ -1,6 +1,7 @@
 //! Bakes what this build is into the environment (G0.32): the version
 //! (`0.1.0` on a release tag, `0.1.0-dev.<commits on HEAD>` otherwise), the
-//! git commit, whether the tree had uncommitted changes and the commit time.
+//! git commit, its tree (what was built, the same after a squash), whether the
+//! tree had uncommitted changes and the commit time.
 //! A crate of its own: a new commit rebuilds only it and the few crates that
 //! read it, not the workspace.
 
@@ -27,6 +28,9 @@ fn clean(s: &str) -> Option<String> {
 fn main() {
     let base = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
     let commit = git(&["rev-parse", "--short=7", "HEAD"]).and_then(|c| clean(&c));
+    // The files of HEAD: a branch's last commit and its squash on the main
+    // have different ids and the same tree.
+    let tree = git(&["rev-parse", "--short=12", "HEAD^{tree}"]).and_then(|t| clean(&t));
     // A tree with tracked changes: the commit alone does not say what was
     // built. Untracked files (build output, notes) do not count.
     let dirty = git(&["status", "--porcelain", "--untracked-files=no"]).is_some();
@@ -70,6 +74,10 @@ fn main() {
         commit.as_deref().unwrap_or("unknown")
     );
     println!("cargo:rustc-env=COREROUTER_BUILD={build}");
+    println!(
+        "cargo:rustc-env=COREROUTER_TREE={}",
+        tree.as_deref().unwrap_or("unknown")
+    );
     println!("cargo:rustc-env=COREROUTER_COMMIT_TIME={time}");
     println!("cargo:rerun-if-env-changed=COREROUTER_VERSION");
     // Rebuild when HEAD moves (a checkout, a new commit on the branch, loose

@@ -79,7 +79,13 @@ pub fn main() {
     // G1.6y: the first stage of the live ISO moves to the image's root and
     // comes back here with LIVE_STAGE2; it stays on the console installer
     // when that cannot be done.
-    let live = opts.mode == Mode::Live && std::env::args().any(|a| a == plan::LIVE_STAGE2);
+    let args: Vec<String> = std::env::args().collect();
+    let live = opts.mode == Mode::Live && args.iter().any(|a| a == plan::LIVE_STAGE2);
+    // G1.6zn: the first stage of the system in RAM moved here.
+    let ram_stage2 = args
+        .iter()
+        .position(|a| a == crate::to_ram::STAGE2)
+        .map(|i| args.get(i + 1..).unwrap_or_default().to_vec());
     if opts.mode == Mode::Live && !live {
         crate::live::enter(&cmdline);
     }
@@ -122,6 +128,10 @@ pub fn main() {
     } else {
         mount_config()
     };
+    // G1.6zn: the root to RAM when asked, before anything else reads it
+    // (with the option on, this returns only when the boot stays here).
+    let root = (!live)
+        .then(|| crate::to_ram::at_boot(&cmdline, config_dev.as_deref(), ram_stage2.as_deref()));
     // G1.6j: before the ports get their names, and only now: a driver that
     // asks for its firmware while probing needs / (the kernel's own probes
     // run before it is mounted). G1.6za: the live image too: the first stage
@@ -150,6 +160,17 @@ pub fn main() {
         if let Err(e) = fs::create_dir_all(dir) {
             log!("{dir}: {e}");
         }
+    }
+    if let Some(root) = &root {
+        if let Err(e) =
+            corerouter_sysupdate::system_disk::write_root(Path::new(plan::RUNTIME_DIR), root)
+        {
+            log!("{e}");
+        }
+        crate::disk_watch::spawn(
+            crate::disk_watch::system_disks(config_dev.as_deref()),
+            root.in_ram,
+        );
     }
     // /var is a tmpfs over the squashfs: the usual /var/run → /run link
     // (FRR's compiled-in state directory is /var/run/frr).
@@ -761,7 +782,7 @@ fn mount_config() -> Option<String> {
     None
 }
 
-fn find_partition(label: &str) -> Option<String> {
+pub(crate) fn find_partition(label: &str) -> Option<String> {
     let entries = fs::read_dir("/sys/class/block").ok()?;
     let devs: Vec<(String, String)> = entries
         .flatten()
