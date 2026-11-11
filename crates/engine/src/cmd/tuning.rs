@@ -23,7 +23,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{} → [{name, value}]",
         always, print_set),
     cmd!(query "system.tuning.parameter.print", "Tuning", ["System", "Tuning"], None,
-        "{profile?: conservative|balanced|throughput|latency, tab?: kernel|interfaces|cpu|boot} → {profile, machine: bool, params: [{name, tab, section, current, configured, recommended, why, why_id, why_args, min, max, unit, choices, default, init_ns_only, obsolete, control_plane}]}",
+        "{profile?: conservative|balanced|throughput|latency, tab?: kernel|interfaces|cpu|boot} → {profile, machine: bool, params: [{name, tab, section, current, configured, recommended, why, why_id, why_args, min, max, unit, choices, default (the kernel's), router_default (CoreRouter's, kept while not configured), init_ns_only, obsolete, control_plane}]}",
         always, print),
     cmd!(
         "system.tuning.set",
@@ -261,6 +261,7 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
                 "unit": p.unit,
                 "choices": p.choices.iter().map(|(v, n)| json!({"value": v, "name": n})).collect::<Vec<_>>(),
                 "default": p.default,
+                "router_default": corerouter_model::tuning::default_of(p.name),
                 "init_ns_only": p.init_ns_only,
                 "obsolete": p.obsolete,
                 "control_plane": p.control_plane,
@@ -399,10 +400,11 @@ fn unset(s: &mut Session, p: &Value) -> Result<Value> {
         .sysctl
         .remove(prm.name)
         .ok_or_else(|| {
-            EngineError::bad(
-                "name",
-                format!("{} is not set: the kernel's own value is in use", prm.name),
-            )
+            let in_use = match corerouter_model::tuning::default_of(prm.name) {
+                Some(d) => format!("CoreRouter's default ({d}) is in use"),
+                None => "the kernel's own value is in use".to_owned(),
+            };
+            EngineError::bad("name", format!("{} is not set: {in_use}", prm.name))
         })?;
     Ok(json!({"name": prm.name, "was": was}))
 }
@@ -630,6 +632,92 @@ mod tests {
         assert_eq!(some["changed"], json!([{"name": "net.core.netdev_budget", "from": 300, "to": 600}]));
         assert!(run(&mut s, "system.tuning.profile.apply", json!({})).is_err());
         assert!(run(&mut s, "system.tuning.profile.apply", json!({"profile": "balanced", "names": ["x"]})).is_err());
+    }
+
+    /// G1.26i: nothing configured, the router forwards and says where the
+    /// value comes from; the operator's 0 is kept, with the critical
+    /// finding; unset goes back to forwarding; no profile writes a
+    /// forwarding entry into the config any more.
+    #[test]
+    fn a_router_forwards_by_default_and_an_explicit_off_is_kept() {
+        use corerouter_model::tuning::{IP_FORWARD, IPV6_FORWARDING};
+        let mut s = lab();
+        let forwarding = |s: &mut Session| {
+            let d = run(s, "system.tuning.diagnose", json!({})).unwrap();
+            d["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|f| f["id"].as_str().map(str::to_owned))
+                .filter(|id| id.starts_with("forwarding"))
+                .collect::<Vec<_>>()
+        };
+        let v = run(&mut s, "system.tuning.parameter.print", json!({})).unwrap();
+        for name in [IP_FORWARD, IPV6_FORWARDING] {
+            let r = row(&v, name);
+            assert_eq!(r["current"], 1, "{name}");
+            assert_eq!(r["configured"], Value::Null, "{name}: not in the config");
+            assert_eq!(r["router_default"], 1, "{name}");
+            assert_eq!(r["default"], 0, "{name}: the kernel's own default");
+            assert_eq!(r["recommended"], 1, "{name}");
+        }
+        assert_eq!(row(&v, "net.core.netdev_budget")["router_default"], Value::Null);
+        assert!(forwarding(&mut s).is_empty());
+        assert_eq!(run(&mut s, "system.tuning.print", json!({})).unwrap(), json!([]));
+        let e = run(&mut s, "system.tuning.unset", json!({"name": IP_FORWARD}))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("CoreRouter's default (1) is in use"), "{e}");
+        // Every profile leaves forwarding out of the config.
+        for profile in Profile::ALL {
+            let diff = run(&mut s, "system.tuning.profile.diff", json!({"profile": profile.id()})).unwrap();
+            assert!(!diff.to_string().contains("forward"), "{profile:?}: {diff}");
+        }
+
+        run(&mut s, "system.tuning.set", json!({"name": IP_FORWARD, "value": 0})).unwrap();
+        let v = run(&mut s, "system.tuning.parameter.print", json!({})).unwrap();
+        assert_eq!(row(&v, IP_FORWARD)["current"], 0);
+        assert_eq!(row(&v, IP_FORWARD)["configured"], 0);
+        assert_eq!(row(&v, IPV6_FORWARDING)["current"], 1, "IPv6 on its own");
+        assert_eq!(forwarding(&mut s), ["forwarding_off"]);
+        assert_eq!(
+            run(&mut s, "system.tuning.print", json!({})).unwrap(),
+            json!([{"name": IP_FORWARD, "value": 0}]),
+            "the export keeps the operator's 0"
+        );
+        run(&mut s, "system.tuning.set", json!({"name": IPV6_FORWARDING, "value": 0})).unwrap();
+        assert_eq!(forwarding(&mut s), ["forwarding_off", "forwarding6_off"]);
+
+        let un = run(&mut s, "system.tuning.unset", json!({"name": IP_FORWARD})).unwrap();
+        assert_eq!(un["was"], 0);
+        run(&mut s, "system.tuning.unset", json!({"name": IPV6_FORWARDING})).unwrap();
+        let v = run(&mut s, "system.tuning.parameter.print", json!({})).unwrap();
+        assert_eq!(row(&v, IP_FORWARD)["current"], 1);
+        assert!(forwarding(&mut s).is_empty());
+    }
+
+    /// A config written before G1.26i, by a router that applied a profile
+    /// (forwarding 1 among the rest) or that turned forwarding off, loads
+    /// as it is and means the same.
+    #[test]
+    fn a_config_from_before_the_default_loads_the_same() {
+        use corerouter_model::Config;
+        use corerouter_model::tuning::{IP_FORWARD, IPV6_FORWARDING};
+        let old: Config = serde_json::from_value(json!({"system": {"tuning": {"sysctl": {
+            IP_FORWARD: 1, IPV6_FORWARDING: 0, "net.core.netdev_budget": 600,
+        }}}}))
+        .unwrap();
+        let t = &old.system.tuning;
+        assert_eq!(t.sysctl.len(), 3);
+        assert_eq!(t.effective_sysctl().get(IP_FORWARD), Some(&1));
+        assert_eq!(t.effective_sysctl().get(IPV6_FORWARDING), Some(&0));
+        // Written back unchanged: no migration, nothing added.
+        let back = serde_json::to_value(&old).unwrap();
+        assert_eq!(back["system"]["tuning"]["sysctl"].as_object().unwrap().len(), 3);
+        // One with no tuning at all (most routers): forwards now.
+        let bare: Config = serde_json::from_value(json!({})).unwrap();
+        assert!(bare.system.tuning.is_default());
+        assert_eq!(bare.system.tuning.effective_sysctl().get(IPV6_FORWARDING), Some(&1));
     }
 
     #[test]
