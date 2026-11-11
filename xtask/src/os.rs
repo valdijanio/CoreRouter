@@ -195,28 +195,46 @@ const HARDWARE_COVERAGE: &[&str] = &[
     "CONFIG_VMD",
     "CONFIG_SCSI_SMARTPQI",
     "CONFIG_SCSI_MPI3MR",
+    "CONFIG_USB_UAS",
     // Hyper-V/Azure and Xen HVM: disk and port.
     "CONFIG_HYPERV",
     "CONFIG_HYPERV_VMBUS",
     "CONFIG_HYPERV_STORAGE",
     "CONFIG_HYPERV_NET",
     "CONFIG_HYPERV_KEYBOARD",
+    "CONFIG_HYPERV_UTILS",
     "CONFIG_XEN",
     "CONFIG_XEN_PVHVM_GUEST",
     "CONFIG_XEN_BLKDEV_FRONTEND",
     "CONFIG_XEN_NETDEV_FRONTEND",
+    "CONFIG_PARAVIRT_SPINLOCKS",
+    "CONFIG_VIRT_DRIVERS",
     "CONFIG_VMGENID",
     // A hang, a panic, a PCIe or memory error leaves a trace.
     "CONFIG_SOFTLOCKUP_DETECTOR",
     "CONFIG_HARDLOCKUP_DETECTOR",
+    // Each CPU watches its neighbour: no PMU counter, works in a VM.
+    "CONFIG_HARDLOCKUP_DETECTOR_PREFER_BUDDY",
     "CONFIG_DETECT_HUNG_TASK",
     "CONFIG_PSTORE",
+    "CONFIG_PSTORE_COMPRESS",
+    "CONFIG_EFI_VARS_PSTORE",
     // With pstore on, or panics would fill the NVRAM of the A/B boot entries.
     "CONFIG_EFI_VARS_PSTORE_DEFAULT_DISABLE",
     "CONFIG_PCIEAER",
+    "CONFIG_PCIE_DPC",
+    "CONFIG_RAS",
     "CONFIG_ACPI_APEI",
     "CONFIG_ACPI_APEI_GHES",
+    "CONFIG_ACPI_APEI_PCIEAER",
+    "CONFIG_ACPI_EXTLOG",
     "CONFIG_EDAC",
+    "CONFIG_EDAC_DECODE_MCE",
+    "CONFIG_EDAC_AMD64",
+    "CONFIG_EDAC_SKX",
+    "CONFIG_EDAC_I10NM",
+    "CONFIG_EDAC_SBRIDGE",
+    "CONFIG_EDAC_IE31200",
 ];
 /// G1.6zi: what both built `.config`s must say, as a value: `MAXSMP` took
 /// effect (it is dropped in silence without `DEBUG_KERNEL`).
@@ -2542,6 +2560,40 @@ mod tests {
         assert!(e.contains("loads the sensor modules"), "{e}");
         let e = check_sensors(&fragment, "").unwrap_err();
         assert!(e.contains("no `pub const SENSOR_MODULES"), "{e}");
+    }
+
+    /// G1.6zi: every option the hardware coverage adopted is in the list the
+    /// checks read, and the two EDAC drivers that write an error line on a
+    /// machine without ECC memory stay out.
+    #[test]
+    fn every_adopted_kernel_option_has_its_check() {
+        let os = Path::new(env!("CARGO_MANIFEST_DIR")).join("../os");
+        let fragment = std::fs::read_to_string(os.join("board/x86_64/linux.fragment")).unwrap();
+        let start = fragment
+            .find("# --- Every core of a big machine (G1.6zi)")
+            .unwrap();
+        let end = fragment.find("# CONFIG_RAS_FMPM is not set").unwrap();
+        let adopted = fragment_symbols(&fragment[start..end]);
+        assert!(adopted.len() > 40, "{}", adopted.len());
+        for symbol in &adopted {
+            assert!(HARDWARE_COVERAGE.contains(symbol), "{symbol} has no check");
+        }
+        for symbol in HARDWARE_COVERAGE {
+            assert!(
+                adopted.contains(symbol),
+                "{symbol} is checked and not in the section"
+            );
+        }
+        for noisy in [
+            "CONFIG_EDAC_IGEN6",
+            "CONFIG_EDAC_PND2",
+            "CONFIG_MEMORY_FAILURE",
+        ] {
+            assert!(!fragment.contains(&format!("{noisy}=")), "{noisy}");
+        }
+        for off in KERNEL_OFF {
+            assert!(fragment.contains(&format!("# {off} is not set")), "{off}");
+        }
     }
 
     /// G1.6zf: what `boot-test` wants from `system.health.print`.
