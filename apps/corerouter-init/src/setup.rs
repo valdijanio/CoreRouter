@@ -46,6 +46,10 @@ const POLL: Duration = Duration::from_secs(10);
 /// asking (the live image has one on every port), so it shows the address
 /// instead of "no address yet" and, a moment later, everything again.
 const DHCP_WAIT: Duration = Duration::from_secs(8);
+/// G1.6zl: how long the setup waits for the links of the ports it turned
+/// on. A gigabit PHY negotiates in 1 to 3 s (**estimado**: e1000e, r8169,
+/// r8152); a port without a cable waits all of it, once per setup.
+const LINK_WAIT: Duration = Duration::from_secs(if cfg!(test) { 0 } else { 5 });
 /// The status screen with everything on it fits a 25-line VGA text screen
 /// (its first line is blank and may scroll away; the last line of the
 /// screen is the cursor's); the port table gets what is left.
@@ -211,6 +215,17 @@ fn admin_without_password() -> bool {
             })
         })
     })
+}
+
+/// `port` has a DHCP client already (a configuration that had one, a port
+/// that lost its lease): adding a second would be refused.
+fn has_dhcp_client(port: &str) -> bool {
+    ctl::call("ip.dhcp-client.list", &json!({}))
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .any(|c| c.get("interface").and_then(Value::as_str) == Some(port))
 }
 
 /// A DHCP client is on (the live image has one on every port): an address
@@ -692,14 +707,96 @@ pub fn describe(p: &Nic) -> String {
 /// The first words of the setup.
 fn intro() -> String {
     format!(
-        "\n{}\n  An empty answer cancels. Nothing changes before the last question.",
+        "\n{}\n  An empty answer takes the [default] shown, or cancels where there is none.\n  \
+         Nothing changes before the last question.",
         title("First-boot setup")
     )
+}
+
+/// G1.6zl: the ports the setup turns on to read their link. A first boot
+/// starts every port off (disabled in the configuration), and an off port
+/// has no carrier to read: the notebook of 2026-11-11 showed "off" on a port
+/// with a cable. Only ports of the configuration (`managed`), disabled, and
+/// off in the kernel; never one the daemon has not adopted yet (G1.6ze).
+pub fn ports_to_wake(interfaces: &Value, nics: &[Nic]) -> Vec<String> {
+    let rows = interfaces.as_array().cloned().unwrap_or_default();
+    let flag = |r: &Value, k: &str| r.get(k).and_then(Value::as_bool);
+    nics.iter()
+        .filter(|n| n.link == Link::Off)
+        .filter(|n| {
+            rows.iter().any(|r| {
+                r.get("name").and_then(Value::as_str) == Some(n.name.as_str())
+                    && flag(r, "managed") == Some(true)
+                    && flag(r, "disabled") == Some(true)
+            })
+        })
+        .map(|n| n.name.clone())
+        .collect()
+}
+
+/// Turns the off ports on and waits up to [`LINK_WAIT`] for their links:
+/// the ports it turned on (put back off by [`back_off`]).
+fn wake(con: &Console, nics: &[Nic]) -> Vec<String> {
+    let Ok(list) = ctl::call("interface.list", &json!({})) else {
+        return Vec::new();
+    };
+    let want = ports_to_wake(&list, nics);
+    if want.is_empty() {
+        return want;
+    }
+    con.say(&dim(&format!(
+        "  Turning {} on to read the link (up to {} s; back off if you cancel)...",
+        style::ascii(&want.join(", ")),
+        LINK_WAIT.as_secs()
+    )));
+    let woken: Vec<String> = want
+        .into_iter()
+        .filter(|p| ctl::call("interface.set", &json!({"name": p, "disabled": false})).is_ok())
+        .collect();
+    let start = Instant::now();
+    while start.elapsed() < LINK_WAIT {
+        std::thread::sleep(Duration::from_millis(200));
+        let now = self::nics();
+        let all_up = woken
+            .iter()
+            .all(|w| now.iter().any(|n| &n.name == w && n.link == Link::Up));
+        if all_up {
+            break;
+        }
+    }
+    woken
+}
+
+/// The ports [`wake`] turned on go back off, but `keep` (the management
+/// port, once applied).
+fn back_off(woken: &[String], keep: Option<&str>) {
+    for p in woken.iter().filter(|p| Some(p.as_str()) != keep) {
+        let _ = ctl::call("interface.set", &json!({"name": p, "disabled": true}));
+    }
+}
+
+/// An answer to "Address/prefix" that asks for DHCP: empty (the default) or
+/// `dhcp`.
+pub fn wants_dhcp(answer: &str) -> bool {
+    let a = answer.trim();
+    a.is_empty() || a.eq_ignore_ascii_case("dhcp")
 }
 
 /// The questions, a summary, then the commands. `Ok(None)`: cancelled.
 /// `Ok(Some(""))`: applied, with the address still to come from DHCP.
 fn ask_and_apply(con: &Console) -> Result<Option<String>, String> {
+    con.say(&intro());
+    let woken = wake(con, &nics());
+    let (done, port) = pick_and_apply(con);
+    // Applied: the management port stays on. Cancelled or failed: every
+    // port the setup turned on goes back off, the picked one too.
+    let keep = port.as_deref().filter(|_| matches!(done, Ok(Some(_))));
+    back_off(&woken, keep);
+    done
+}
+
+/// The port, then [`rest`]; with the port picked, if one was.
+fn pick_and_apply(con: &Console) -> (Result<Option<String>, String>, Option<String>) {
     // A radio is a port to pick too (G1.30): a notebook may have no other.
     let mut nics = nics();
     nics.extend(crate::setup_wifi::radios().into_iter().map(|r| Nic {
@@ -707,7 +804,6 @@ fn ask_and_apply(con: &Console) -> Result<Option<String>, String> {
         mac: r.mac,
         link: Link::Wifi,
     }));
-    con.say(&intro());
     let wifi_steps = nics.iter().any(|n| n.link == Link::Wifi);
     let first = |steps: usize| style::step(1, steps, "Management port");
     // The number of steps is known once the port is: say the longer one
@@ -725,10 +821,10 @@ fn ask_and_apply(con: &Console) -> Result<Option<String>, String> {
     }
     let port = loop {
         let Some(a) = ask(con, &style::prompt("Port", None, Some("number or name"))) else {
-            return Ok(None);
+            return (Ok(None), None);
         };
         if a.is_empty() {
-            return Ok(None);
+            return (Ok(None), None);
         }
         let Some(p) = pick(&a, &nics).cloned().or_else(|| {
             nics.is_empty().then(|| Nic {
@@ -745,15 +841,20 @@ fn ask_and_apply(con: &Console) -> Result<Option<String>, String> {
             break p;
         }
     };
+    let name = Some(port.name.clone());
     if port.link != Link::Wifi {
-        return rest(con, &port.name, None, 4);
+        return (rest(con, &port.name, None, 4), name);
     }
     con.say(&style::step(2, 5, "Wi-Fi network"));
     let question = |q: &str| ask(con, q);
     let kept = "  The radio is as it was. The country stays set.";
-    let Some(chosen) = crate::setup_wifi::questions(con, &question, &port.name)? else {
-        con.say(&dim(kept));
-        return Ok(None);
+    let chosen = match crate::setup_wifi::questions(con, &question, &port.name) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            con.say(&dim(kept));
+            return (Ok(None), name);
+        }
+        Err(e) => return (Err(e), name),
     };
     let done = rest(con, &port.name, Some(&chosen), 5);
     if !matches!(done, Ok(Some(_))) {
@@ -763,13 +864,14 @@ fn ask_and_apply(con: &Console) -> Result<Option<String>, String> {
     if matches!(done, Ok(None)) {
         con.say(&dim(kept));
     }
-    done
+    (done, name)
 }
 
 /// Where the address comes from.
 enum Address {
     Fixed(Mgmt),
-    /// Asked from the network the radio joins (a Wi-Fi port only).
+    /// Asked from the network: the one the radio joins, or the cable's
+    /// (G1.6zl: a port with a cable to a home or office network).
     Dhcp,
 }
 
@@ -784,21 +886,18 @@ fn rest(
     let at = steps.saturating_sub(2);
     con.say(&style::step(at, steps, "Address"));
     let address = loop {
-        let q = if wifi.is_some() {
-            style::prompt("Address/prefix", Some("dhcp"), Some("e.g. 192.0.2.10/24"))
-        } else {
-            style::prompt("Address/prefix", None, Some("e.g. 192.0.2.10/24"))
-        };
+        // G1.6zl: DHCP on any port, as on a radio. A stray Enter here still
+        // applies nothing: the summary and its y/N come first.
+        let q = style::prompt(
+            "Address/prefix",
+            Some("dhcp"),
+            Some("or e.g. 192.0.2.10/24"),
+        );
         let Some(addr) = ask(con, &q) else {
             return Ok(None);
         };
-        if addr.is_empty() || addr.eq_ignore_ascii_case("dhcp") {
-            if wifi.is_some() {
-                break Address::Dhcp;
-            }
-            if addr.is_empty() {
-                return Ok(None);
-            }
+        if wants_dhcp(&addr) {
+            break Address::Dhcp;
         }
         let Some(gw) = ask(con, &style::prompt("Gateway", Some("none"), None)) else {
             return Ok(None);
@@ -846,7 +945,8 @@ fn rest(
     con.say(&style::step(steps, steps, "Apply"));
     let (shown_address, gateway) = match &address {
         Address::Fixed(m) => (m.address.as_str(), m.gateway.as_deref()),
-        Address::Dhcp => ("from DHCP, on the network joined", None),
+        Address::Dhcp if wifi.is_some() => ("from DHCP, on the network joined", None),
+        Address::Dhcp => ("from DHCP, on this port's network", None),
     };
     con.say(&summary_rows(
         port,
@@ -874,9 +974,19 @@ fn rest(
             m.address.clone()
         }
         Address::Dhcp => {
-            ctl::call("ip.dhcp-client.add", &json!({ "interface": port }))
-                .map_err(|e| format!("ip.dhcp-client.add: {e}"))?;
-            con.say(&format!("  {}  ip.dhcp-client.add", good("OK")));
+            // The radio is on already, with its network; a cable's port is
+            // turned on here (it may be off: a first boot starts them off).
+            let mut cmds = Vec::new();
+            if wifi.is_none() {
+                cmds.push(("interface.set", json!({"name": port, "disabled": false})));
+            }
+            if !has_dhcp_client(port) {
+                cmds.push(("ip.dhcp-client.add", json!({ "interface": port })));
+            }
+            for (cmd, params) in cmds {
+                ctl::call(cmd, &params).map_err(|e| format!("{cmd}: {e}"))?;
+                con.say(&format!("  {}  {cmd}", good("OK")));
+            }
             leased(con, port)
         }
     };
@@ -1173,6 +1283,66 @@ mod tests {
         assert!(t.contains("tls://[2001:db8::1]:8729"), "{t}");
         s.ports.truncate(1);
         assert_eq!(s.management(), Some("192.0.2.10/24"));
+    }
+
+    /// G1.6zl: the ports a first boot left off are turned on to read their
+    /// link; one the daemon has not adopted, one on already, or one enabled
+    /// in the configuration is left alone.
+    #[test]
+    fn only_disabled_ports_of_the_configuration_are_turned_on_to_read_the_link() {
+        let mut p = nics();
+        p.push(Nic {
+            name: "ether3".into(),
+            mac: "52:54:00:00:00:03".into(),
+            link: Link::Off,
+        });
+        p.push(Nic {
+            name: "ether4".into(),
+            mac: "52:54:00:00:00:04".into(),
+            link: Link::Off,
+        });
+        let list = json!([
+            {"name": "lo", "managed": true, "disabled": false},
+            {"name": "ether1", "managed": true, "disabled": true},
+            {"name": "ether2", "managed": true, "disabled": true},
+            {"name": "ether3", "managed": false, "disabled": true},
+            {"name": "ether4", "managed": true, "disabled": false},
+        ]);
+        // ether2 has its link already (on in the kernel); ether3 is not
+        // adopted; ether4 is enabled (its link reads "off" only for a moment).
+        assert_eq!(ports_to_wake(&list, &p), ["ether1"]);
+        assert!(ports_to_wake(&json!(null), &p).is_empty());
+        assert!(ports_to_wake(&json!({"error": 1}), &p).is_empty());
+    }
+
+    /// G1.6zl: DHCP on a cable's port too, by default; anything else is an
+    /// address to check.
+    #[test]
+    fn the_address_question_takes_dhcp_by_default_on_any_port() {
+        for a in ["", "  ", "dhcp", "DHCP", " Dhcp "] {
+            assert!(wants_dhcp(a), "{a:?}");
+        }
+        for a in ["192.0.2.10/24", "dhcpd", "d", "none"] {
+            assert!(!wants_dhcp(a), "{a:?}");
+        }
+        let t = style::render(
+            &summary_rows(
+                "ether1",
+                None,
+                "from DHCP, on this port's network",
+                None,
+                false,
+            ),
+            false,
+        );
+        assert!(t.contains("Port      ether1"), "{t}");
+        assert!(
+            t.contains("Address   from DHCP, on this port's network"),
+            "{t}"
+        );
+        assert!(t.contains("Gateway   none"), "{t}");
+        let i = style::render(&intro(), false);
+        assert!(i.contains("takes the [default] shown"), "{i}");
     }
 
     #[test]
