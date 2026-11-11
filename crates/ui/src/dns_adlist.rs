@@ -344,6 +344,10 @@ impl AdlistPanel {
                 Dialog::New(_) => None,
             })
             .collect();
+        self.table.empty = "No lists. Add a hosts file or a domain list by URL, e.g. \
+             https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts; \
+             listed names get 0.0.0.0 / ::. A static FWD entry lets a name through."
+            .to_owned();
         let out = table::show(ui, TABLE, 0.0, &mut self.table, &COLUMNS, &rows, |ui, menu| match menu {
             Menu::Rows(sel) => {
                 let picked: Vec<&Value> = lists
@@ -377,17 +381,6 @@ impl AdlistPanel {
                 }
             }
         });
-        if lists.is_empty() {
-            ui.label(
-                RichText::new(
-                    "No lists. Add a hosts file or a domain list by URL, e.g. \
-                     https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts; \
-                     listed names get 0.0.0.0 / ::. A static FWD entry lets a name through.",
-                )
-                .weak()
-                .small(),
-            );
-        }
         if let Some(key) = out.opened {
             act = Some(Act::Open(vec![key]));
         }

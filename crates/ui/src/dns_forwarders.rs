@@ -330,6 +330,10 @@ impl ForwardersPanel {
                 Dialog::New(_) => None,
             })
             .collect();
+        self.table.empty = "No forwarders. A group of servers (plain, DoH or DoT) that a static FWD \
+             entry sends its names to: /ip dns static add name=corp.example type=FWD \
+             forward-to=<group>."
+            .to_owned();
         let out = table::show(ui, TABLE, 0.0, &mut self.table, &COLUMNS, &rows, |ui, menu| match menu {
             Menu::Rows(sel) => {
                 let picked: Vec<&Value> = lists
@@ -362,17 +366,6 @@ impl ForwardersPanel {
                 }
             }
         });
-        if lists.is_empty() {
-            ui.label(
-                RichText::new(
-                    "No forwarders. A group of servers (plain, DoH or DoT) that a static FWD \
-                     entry sends its names to: /ip dns static add name=corp.example type=FWD \
-                     forward-to=<group>.",
-                )
-                .weak()
-                .small(),
-            );
-        }
         if let Some(key) = out.opened {
             act = Some(Act::Open(vec![key]));
         }

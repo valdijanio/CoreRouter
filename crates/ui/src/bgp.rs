@@ -706,6 +706,7 @@ impl BgpPanel {
             .cloned();
         let detail_h = if picked.is_some() { 170.0 } else { 0.0 };
         let footer_h = ui.spacing().interact_size.y + 6.0 + detail_h;
+        self.session_table.empty = tr_in(SCOPE, l, "No BGP connection yet: add one in the Connections tab.").to_owned();
         let out = table::show(ui, SESSIONS, footer_h, &mut self.session_table, &SESSION_COLUMNS, &rows, |_, _| {});
         self.column_help(app, out.help, &SESSION_COLUMNS);
         if let Some(r) = picked {
@@ -728,9 +729,6 @@ impl BgpPanel {
             ],
             l,
         );
-        if rows_data.is_empty() {
-            ui.weak(tr_in(SCOPE, l, "No BGP connection yet: add one in the Connections tab."));
-        }
     }
 
     /// The selected session: what the table has no room for, and its actions.

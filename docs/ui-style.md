@@ -218,6 +218,14 @@ manda diz (`disabled`, `dynamic`, motivo), e o `engine.list` diz se o comando ex
   sua chave em `help`; `help: ""` só para o que é óbvio (Comment).
 - **Rodapé:** `list::footer(ui, &[(n, "addresses", tom), …], lang)`; contagem zero depois da
   primeira some. `list::count(linhas, campo, valor)` conta.
+- **Lista vazia (G0.24b):** a dica do que fazer ("No lists. Add …") vai em
+  `estado_da_tabela.empty = …` antes do `table::show`, que a desenha no corpo vazio da tabela,
+  em letra pequena e quebrada na largura; nunca num `ui.weak`/`ui.label` depois da tabela. A
+  tabela ocupa a altura da janela menos o `reserve`: tudo que fica embaixo dela (rodapé, detalhe,
+  linha de estado) entra no `reserve` com a altura que tem de verdade. Sobra fora dele faz a
+  janela crescer sozinha a cada quadro, até o fim da tela (o egui aumenta a janela até caber o
+  conteúdo). O teste `no_window_grows_by_itself` (`crates/ui/src/tests/window_growth.rs`)
+  abre cada janela e reprova a que cresce.
 - **Clique direito e teclado:** dentro do `Menu::Rows` do `table::show`, `list::row_menu(ui, &tools,
   sel, comandos_conhecidos, lang)` (abrir, copiar, copiar como comando CoreRouter e RouterOS,
   ativar, desativar, comentar, remover); `list::from_shortcut(out.shortcut, &tools, &sel)` faz o

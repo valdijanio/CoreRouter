@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use egui::{ComboBox, RichText, Ui};
+use egui::{ComboBox, Ui};
 use serde_json::{Value, json};
 
 use crate::backend::RequestId;
@@ -540,6 +540,9 @@ impl FilterPanel {
             What::PrefixList => &mut self.plist_table,
             What::CommunityList => &mut self.clist_table,
         };
+        if what == What::Rule {
+            state.empty = tr_in(SCOPE, l, "No rules yet. An eBGP connection without a chain accepts and sends nothing (RFC 8212): add rules, then set the connection's Input Filter and Output Filter.").to_owned();
+        }
         let out = table::show(ui, salt, footer_h, state, columns, &rows, |ui, menu| match menu {
             Menu::Rows(sel) => {
                 if let Some(a) = list::row_menu(ui, &tools, sel, known, l) {
@@ -875,10 +878,6 @@ impl PanelState for FilterPanel {
             Tab::PrefixLists => self.list_tab(app, ui, What::PrefixList),
             Tab::CommunityLists => self.list_tab(app, ui, What::CommunityList),
             Tab::Preview => self.preview_tab(app, ui),
-        }
-        if self.rules.is_empty() && self.tab == Tab::Rules {
-            ui.add_space(6.0);
-            ui.label(RichText::new(tr_in(SCOPE, app.lang.labels, "No rules yet. An eBGP connection without a chain accepts and sends nothing (RFC 8212): add rules, then set the connection's Input Filter and Output Filter.")).weak());
         }
     }
 

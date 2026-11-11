@@ -234,6 +234,12 @@ pub(crate) struct TableState {
     /// a mark at the left end of the row, and a click on the mark brings
     /// that window to the front (as a double click on the row does).
     pub open: BTreeSet<String>,
+    /// What to do when the list has no items ("No lists. Add …"), set by
+    /// the list before each frame and taken by [`show`], which paints it in
+    /// the table's empty body (G0.24b). Drawn under the table instead, it
+    /// overflowed the window by its height every frame, and egui grew the
+    /// window to fit until it filled the screen.
+    pub empty: String,
     /// [`Self::reveal`]: the selection waits for the rows to arrive.
     revealing: bool,
 }
@@ -529,6 +535,7 @@ pub(crate) fn show(
     mut menu: impl FnMut(&mut Ui, Menu<'_>),
 ) -> TableOutput {
     let mut out = TableOutput::default();
+    let empty_hint = std::mem::take(&mut state.empty);
     let visible: Vec<&Row> = state.visible(rows).collect();
     let order: Vec<&str> = visible.iter().map(|r| r.key.as_str()).collect();
     state.retain(&order);
@@ -654,6 +661,9 @@ pub(crate) fn show(
                 vec2(width, rows_h.max(ui.available_height())),
             );
             let bg = ui.interact(body, id, Sense::click());
+            if rows.is_empty() && !empty_hint.is_empty() {
+                paint_empty_hint(ui, body, &empty_hint);
+            }
             let row_sense = if state.reorder {
                 Sense::click_and_drag()
             } else {
@@ -1122,6 +1132,17 @@ pub(crate) fn shown_text(cell: &str) -> Cow<'_, str> {
     }
     out.push_str(chips);
     Cow::Owned(out)
+}
+
+/// [`TableState::empty`] in the empty body: small, weak and wrapped to the
+/// width, so it never adds height under the table.
+fn paint_empty_hint(ui: &Ui, body: Rect, hint: &str) {
+    let font = TextStyle::Small.resolve(ui.style());
+    let width = (body.width() - 2.0 * CELL_PAD).max(40.0);
+    let color = ui.visuals().weak_text_color();
+    let galley = ui.painter().layout(hint.to_owned(), font, color, width);
+    let at = pos2(body.left() + CELL_PAD, body.top() + 6.0);
+    ui.painter().galley(at, galley, color);
 }
 
 /// The whole text of the cut cell under the pointer, for its tooltip.

@@ -390,8 +390,10 @@ impl OsLogPanel {
         });
     }
 
-    /// The table: a header with ⓘ, then only the rows in view.
+    /// The table: a header with ⓘ, then only the rows in view, all in
+    /// `height` (the header counts: G0.24b, a window that grew by itself).
     fn table(&mut self, app: &CoreRouterUi, ui: &mut Ui, height: f32) {
+        let top = ui.cursor().top();
         let l = app.lang.labels;
         let row_h = ui.spacing().interact_size.y;
         let font = egui::TextStyle::Body.resolve(ui.style());
@@ -428,6 +430,7 @@ impl OsLogPanel {
             }
         }
         ui.separator();
+        let height = height - (ui.cursor().top() - top);
         let visuals = ui.visuals().clone();
         let n = self.shown.len();
         let mut clicked = None;
