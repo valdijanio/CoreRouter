@@ -204,6 +204,7 @@ pub(crate) fn parse_status(status: &str, signal: Option<&str>) -> WifiStatus {
         pmf: field(status, "pmf")
             .map(|p| matches!(p.trim(), "1" | "2"))
             .or(on.then_some(false)),
+        ..WifiStatus::default()
     }
 }
 
@@ -1137,6 +1138,7 @@ mod io {
         Some(WifiRadio {
             driver,
             self_managed,
+            ..WifiRadio::default()
         })
     }
 
