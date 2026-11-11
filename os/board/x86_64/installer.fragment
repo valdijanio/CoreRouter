@@ -5,8 +5,11 @@
 # from the medium, or stays on the console installer when it cannot). No
 # BTF: nothing here needs eBPF yet (XDP is off in the live image), and
 # kbuild then has no pahole step (faster relink, smaller kernel).
+# G1.6ze: `bonding.max_bonds=0 dummy.numdummies=0` as in linux.fragment (this
+# line replaces that one), and the package applies os/patches/linux: the live
+# image showed `bond0`, `dummy0` and the seven catch-all tunnels as ports.
 CONFIG_CMDLINE_BOOL=y
-CONFIG_CMDLINE="console=tty0 console=ttyS0,115200 corerouter.mode=live panic=10 quiet"
+CONFIG_CMDLINE="console=tty0 console=ttyS0,115200 corerouter.mode=live bonding.max_bonds=0 dummy.numdummies=0 panic=10 quiet"
 CONFIG_BLK_DEV_INITRD=y
 CONFIG_RD_ZSTD=y
 CONFIG_INITRAMFS_COMPRESSION_ZSTD=y

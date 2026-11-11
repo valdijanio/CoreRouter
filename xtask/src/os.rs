@@ -153,7 +153,7 @@ const REQUIRED_BR2: &[&str] = &[
 ];
 /// What the installer kernel's fragment must say (G1.6c).
 const INSTALLER_KERNEL: &[&str] = &[
-    "CONFIG_CMDLINE=\"console=tty0 console=ttyS0,115200 corerouter.mode=live panic=10 quiet\"",
+    "CONFIG_CMDLINE=\"console=tty0 console=ttyS0,115200 corerouter.mode=live bonding.max_bonds=0 dummy.numdummies=0 panic=10 quiet\"",
     "CONFIG_INITRAMFS_COMPRESSION_ZSTD=y",
     "# CONFIG_DEBUG_INFO_BTF is not set",
     // G1.6j: built in, or the installer would not show an E810 port.
@@ -162,6 +162,13 @@ const INSTALLER_KERNEL: &[&str] = &[
     // in this one (and the reverse). `livemods::SUFFIX`.
     "CONFIG_LOCALVERSION=\"-live\"",
 ];
+/// G1.6m, G1.6ze: on both kernels' command lines, or the built-in drivers
+/// create `bond0` and `dummy0` by themselves and the router lists them.
+const NO_KERNEL_DEVICES: [&str; 2] = ["bonding.max_bonds=0", "dummy.numdummies=0"];
+/// G1.6ze: what makes the installer's kernel take `os/patches/linux` (the
+/// tunnels' catch-all devices are turned off by one of them).
+const INSTALLER_PATCH_HOOK: &str =
+    "$(APPLY_PATCHES) $(@D) $(BR2_EXTERNAL_COREROUTER_PATH)/patches/linux \\*.patch";
 /// The modules `boot-test` and `install-test` see, by file name.
 const REQUIRED_MODULE_FILES: &[&str] = &["e100", "pcnet32"];
 /// The installer's boot image (El Torito counts 16-bit 512-byte sectors).
@@ -529,6 +536,8 @@ pub fn check(os: &Path) -> Result<usize, String> {
     {
         return Err(format!("CONFIG_CMDLINE: needs init={INIT_PATH}"));
     }
+    no_kernel_devices("linux.fragment", cmdline)?;
+    n += 1;
     if !read("package/corerouter/corerouter.mk")?.contains(&format!("$(TARGET_DIR){INIT_PATH}")) {
         return Err(format!("corerouter.mk does not install {INIT_PATH}"));
     }
@@ -604,6 +613,38 @@ fn patches_in(dir: &Path) -> Result<(Vec<PathBuf>, String), String> {
     Ok((patches, hash))
 }
 
+/// G1.6m, G1.6ze: the command line of `what` keeps the built-in drivers from
+/// creating devices of their own.
+fn no_kernel_devices(what: &str, cmdline: &str) -> Result<(), String> {
+    match NO_KERNEL_DEVICES
+        .iter()
+        .find(|p| !cmdline.split_whitespace().any(|w| w == **p))
+    {
+        Some(p) => Err(format!(
+            "{what}: CONFIG_CMDLINE needs '{p}' (the driver is built in and would create its own device)"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The patches of `patches` that Buildroot did not apply to the kernel tree
+/// `tree`, by file name (its `.applied_patches_list`, written by
+/// `support/scripts/apply-patches.sh`). G1.6ze: the installer's kernel was
+/// built from the plain tarball since the patches exist, and nothing said so.
+fn patches_missing(tree: &Path, patches: &[PathBuf]) -> Vec<String> {
+    let applied = std::fs::read_to_string(tree.join(".applied_patches_list")).unwrap_or_default();
+    let applied: Vec<&str> = applied
+        .lines()
+        .filter_map(|l| l.rsplit('/').next())
+        .collect();
+    patches
+        .iter()
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+        .filter(|n| !applied.contains(n))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// G1.6c: the installer's kernel, boot image and payload stay consistent.
 fn check_installer(os: &Path, genimage: &str, version: &str) -> Result<usize, String> {
     let read =
@@ -622,6 +663,11 @@ fn check_installer(os: &Path, genimage: &str, version: &str) -> Result<usize, St
     {
         return Err("installer.fragment: the installer runs from its initramfs (no root=)".into());
     }
+    no_kernel_devices(
+        "installer.fragment",
+        config_value(&frag, "CONFIG_CMDLINE").unwrap_or_default(),
+    )?;
+    n += 1;
     // The same kernel tarball as the image, with the same hash.
     let main = kernel_hash(&read("patches/linux/linux.hash")?, version);
     let inst = kernel_hash(
@@ -639,6 +685,15 @@ fn check_installer(os: &Path, genimage: &str, version: &str) -> Result<usize, St
         return Err(
             "corerouter-installer.mk: share the kernel download (DL_SUBDIR = linux)".into(),
         );
+    }
+    n += 1;
+    // G1.6ze: the same kernel source too, patches included.
+    if !mk.contains(INSTALLER_PATCH_HOOK)
+        || !mk.contains("COREROUTER_INSTALLER_POST_PATCH_HOOKS += ")
+    {
+        return Err(format!(
+            "corerouter-installer.mk: the installer's kernel must apply os/patches/linux ('{INSTALLER_PATCH_HOOK}' in a POST_PATCH hook)"
+        ));
     }
     n += 1;
     // G1.6za: the ISO's modules, with no link back to the build machine.
@@ -955,16 +1010,24 @@ pub(crate) fn build_with(
     // G1.6m: Buildroot applies `os/patches/linux/*.patch` only when it
     // extracts the kernel: changed patches need `linux-dirclean` (then a
     // full kernel build).
-    let (_, kpatches) = patches_in(&d.os.join("patches/linux"))?;
+    // G1.6ze: the installer's kernel takes the same patches; a tree
+    // extracted without them (before this) goes too.
+    let (kpatch_files, kpatches) = patches_in(&d.os.join("patches/linux"))?;
     let kstamp = d.out.join(".corerouter-linux-patches.sha256");
-    if std::fs::read_to_string(&kstamp).ok().as_deref() != Some(kpatches.as_str()) {
-        if d.out
-            .join("build")
-            .join(format!("linux-{version}"))
-            .exists()
-        {
-            make(&["linux-dirclean"], &[])?;
+    let changed = std::fs::read_to_string(&kstamp).ok().as_deref() != Some(kpatches.as_str());
+    let kernel_trees = [
+        (
+            d.out.join("build").join(format!("linux-{version}")),
+            "linux-dirclean",
+        ),
+        (installer_dir.clone(), "corerouter-installer-dirclean"),
+    ];
+    for (tree, dirclean) in &kernel_trees {
+        if tree.exists() && (changed || !patches_missing(tree, &kpatch_files).is_empty()) {
+            make(&[dirclean], &[])?;
         }
+    }
+    if changed {
         std::fs::write(&kstamp, &kpatches).map_err(|e| format!("{}: {e}", kstamp.display()))?;
     }
     // G3.4l: the same for `os/patches/frr/*.patch` (the ospfd TI-LFA fix):
@@ -1053,6 +1116,16 @@ pub(crate) fn build_with(
         }
     };
     make(&["all"], &top)?;
+    for (tree, _) in &kernel_trees {
+        let missing = patches_missing(tree, &kpatch_files);
+        if !missing.is_empty() {
+            return Err(format!(
+                "{}: built without os/patches/linux/{}",
+                tree.display(),
+                missing.join(", ")
+            ));
+        }
+    }
 
     let kconfig = std::fs::read_dir(d.out.join("build"))
         .map_err(|e| e.to_string())?
@@ -2033,6 +2106,51 @@ mod tests {
         let os = Path::new(env!("CARGO_MANIFEST_DIR")).join("../os");
         let n = check(&os).unwrap();
         assert!(n > 40, "{n}");
+    }
+
+    /// G1.6ze: the ISO's kernel listed `bond0`, `dummy0` and seven tunnels:
+    /// its command line lacked the two parameters, and its tree the patches.
+    #[test]
+    fn both_kernels_keep_their_drivers_from_creating_devices() {
+        let ok = "console=tty0 corerouter.mode=live bonding.max_bonds=0 dummy.numdummies=0 quiet";
+        no_kernel_devices("x", ok).unwrap();
+        for bad in [
+            "",
+            "console=tty0 corerouter.mode=live panic=10 quiet",
+            "bonding.max_bonds=0 quiet",
+            "bonding.max_bonds=1 dummy.numdummies=0",
+            "xbonding.max_bonds=0 dummy.numdummies=01",
+        ] {
+            let e = no_kernel_devices("installer.fragment", bad).unwrap_err();
+            assert!(
+                e.starts_with("installer.fragment: CONFIG_CMDLINE needs '"),
+                "{e}"
+            );
+        }
+        for want in INSTALLER_KERNEL.iter().filter(|w| w.contains("CMDLINE")) {
+            no_kernel_devices("INSTALLER_KERNEL", want.trim_end_matches('"')).unwrap();
+        }
+        let tree = std::env::temp_dir().join(format!("cr-xtask-patches-{}", std::process::id()));
+        std::fs::create_dir_all(&tree).unwrap();
+        let patches = [
+            PathBuf::from("/os/patches/linux/0001-a.patch"),
+            PathBuf::from("/os/patches/linux/0002-b.patch"),
+        ];
+        // No list at all (a tree Buildroot never patched), then an empty one
+        // (what the installer's tree had), one patch, both.
+        assert_eq!(patches_missing(&tree, &patches).len(), 2);
+        let list = tree.join(".applied_patches_list");
+        std::fs::write(&list, "").unwrap();
+        assert_eq!(
+            patches_missing(&tree, &patches),
+            ["0001-a.patch", "0002-b.patch"]
+        );
+        std::fs::write(&list, "/elsewhere/os/patches/linux/0001-a.patch\n").unwrap();
+        assert_eq!(patches_missing(&tree, &patches), ["0002-b.patch"]);
+        std::fs::write(&list, "/x/0001-a.patch\n/x/0002-b.patch\n/x/0003-c.patch\n").unwrap();
+        assert!(patches_missing(&tree, &patches).is_empty());
+        assert!(patches_missing(&tree, &[]).is_empty());
+        std::fs::remove_dir_all(&tree).unwrap();
     }
 
     #[test]
