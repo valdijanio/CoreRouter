@@ -746,20 +746,30 @@ fn flush(s: &mut Session, p: &Value, v4: bool) -> Result<Value> {
     Ok(json!({ "removed": removed, "kept": kept }))
 }
 
-/// The router's address on `iface` in the subnet of `target`, and the
-/// interface itself when not given.
-fn source_for(cfg: &Config, target: Ipv4Addr, iface: Option<&IfName>) -> Option<(IfName, Ipv4Addr)> {
-    cfg.ip
+/// The router's IPv4 addresses the data plane runs: `cfg` plus the ones
+/// DHCP clients and pools put there ([`Session::effective`], flag D in
+/// `ip.address.list`). A WAN that takes its address by DHCP has no static
+/// one, and ARP still asks from it (G1.27da). Built once per command.
+fn own_v4(s: &Session, cfg: &Config) -> Vec<(IfName, ipnet::Ipv4Net)> {
+    s.effective(cfg)
+        .ip
         .addresses
         .iter()
         .filter(|a| !a.disabled)
-        .filter(|a| iface.is_none_or(|i| *i == a.interface))
         .filter_map(|a| match a.address {
-            IpNet::V4(n) => Some((a, n)),
+            IpNet::V4(n) => Some((a.interface.clone(), n)),
             IpNet::V6(_) => None,
         })
+        .collect()
+}
+
+/// The router's address on `iface` in the subnet of `target`, and the
+/// interface itself when not given.
+fn source_for(own: &[(IfName, ipnet::Ipv4Net)], target: Ipv4Addr, iface: Option<&IfName>) -> Option<(IfName, Ipv4Addr)> {
+    own.iter()
+        .filter(|(i, _)| iface.is_none_or(|want| want == i))
         .find(|(_, n)| n.contains(&target))
-        .map(|(a, n)| (a.interface.clone(), n.addr()))
+        .map(|(i, n)| (i.clone(), n.addr()))
 }
 
 fn ranged(p: &Value, key: &str, lo: u32, hi: u32, default: u32) -> Result<u32> {
@@ -776,8 +786,9 @@ fn ping(s: &mut Session, p: &Value) -> Result<Value> {
     let count = ranged(p, "count", 1, 1000, 4)?;
     let interval = Duration::from_millis(u64::from(ranged(p, "interval_ms", 100, 10_000, 1000)?));
     let timeout = Duration::from_millis(u64::from(ranged(p, "timeout_ms", 10, 5000, 1000)?));
-    let cfg = s.store().running().clone();
-    let (iface, src) = source_for(&cfg, target, iface.as_ref()).ok_or_else(|| {
+    let running = s.store().running().clone();
+    let own = own_v4(s, &running);
+    let (iface, src) = source_for(&own, target, iface.as_ref()).ok_or_else(|| {
         EngineError::bad(
             "address",
             format!("{target} is in no subnet of the router{}: ARP reaches only the link", iface.map(|i| format!(" on {i}")).unwrap_or_default()),
@@ -1099,7 +1110,7 @@ fn check(s: &mut Session, p: &Value) -> Result<Value> {
             Ok(()) => {}
         }
         // Not in a subnet of the interface: ARP never asks for it there.
-        match source_for(&cfg, address, Some(&interface)) {
+        match source_for(&own_v4(s, &cfg), address, Some(&interface)) {
             Some((_, own)) => {
                 computed.push(json!({"label": "Router address", "value": own.to_string()}));
                 checks.push(chk("ok", "subnet", format!("{address} is in a network of {interface}"), "address"));
@@ -1167,6 +1178,7 @@ fn detail(s: &mut Session, p: &Value) -> Result<Value> {
     let lines = s.route_lines();
     let neigh = s.neigh_fresh();
     let cfg = s.store().candidate().clone();
+    let own = own_v4(s, &cfg);
     let t = neigh.lock();
     let now = now.max(t.clock);
     let found = t
@@ -1205,7 +1217,7 @@ fn detail(s: &mut Session, p: &Value) -> Result<Value> {
         .map(|l| json!({"dst_address": l.dst.to_string(), "routing_table": l.table.to_string(), "state": l.state.as_str()}))
         .collect();
     let subnet = match address {
-        IpAddr::V4(a) => source_for(&cfg, a, Some(name)).map(|(_, own)| own.to_string()),
+        IpAddr::V4(a) => source_for(&own, a, Some(name)).map(|(_, own)| own.to_string()),
         IpAddr::V6(_) => None,
     };
     Ok(json!({
