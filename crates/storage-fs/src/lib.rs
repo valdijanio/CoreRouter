@@ -70,6 +70,8 @@ fn revision_number(name: &str) -> Option<u32> {
 #[derive(Debug, Clone)]
 pub struct FileStorage {
     dir: PathBuf,
+    /// G1.6zn: while this file exists the disk is gone, and its text says so.
+    gone: Option<PathBuf>,
 }
 
 impl FileStorage {
@@ -84,7 +86,7 @@ impl FileStorage {
                 dir.display()
             )));
         }
-        let me = Self { dir };
+        let me = Self { dir, gone: None };
         match fs::remove_file(me.path(TEMP)) {
             Ok(()) => log::warn!("removed {TEMP} left by an interrupted save"),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -112,6 +114,34 @@ impl FileStorage {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// G1.6zn: refuse every write while `marker` exists, with its text
+    /// (`corerouter-init` writes it when the system disk goes away:
+    /// `corerouter_sysupdate::system_disk`). One `stat` per write.
+    pub fn refuse_while(mut self, marker: impl Into<PathBuf>) -> Self {
+        self.gone = Some(marker.into());
+        self
+    }
+
+    /// The marker's line, while it exists.
+    fn gone_text(&self) -> Option<String> {
+        let f = File::open(self.gone.as_ref()?).ok()?;
+        let mut text = String::new();
+        let _ = f.take(4096).read_to_string(&mut text);
+        let text = text.trim();
+        Some(if text.is_empty() {
+            "the disk of the configuration is gone: changes are no longer saved".to_owned()
+        } else {
+            text.to_owned()
+        })
+    }
+
+    fn guard(&self) -> Result<(), StorageError> {
+        match self.gone_text() {
+            Some(t) => Err(StorageError(t)),
+            None => Ok(()),
+        }
     }
 
     pub fn path(&self, file: &str) -> PathBuf {
@@ -192,6 +222,10 @@ impl ConfigStorage for FileStorage {
         format!("file {}", self.dir.display())
     }
 
+    fn unavailable(&self) -> Option<String> {
+        self.gone_text()
+    }
+
     fn load(&mut self, slot: Slot) -> Result<Option<String>, StorageError> {
         let file = Self::slot_file(slot);
         let f = match File::open(self.path(file)) {
@@ -215,6 +249,7 @@ impl ConfigStorage for FileStorage {
     }
 
     fn save(&mut self, data: &str) -> Result<(), StorageError> {
+        self.guard()?;
         self.write_temp(data)
             .map_err(|e| self.err(&format!("write {TEMP}"), &e))?;
         match fs::rename(self.path(CURRENT), self.path(PREVIOUS)) {
@@ -228,6 +263,7 @@ impl ConfigStorage for FileStorage {
     }
 
     fn quarantine(&mut self, slot: Slot) -> Result<(), StorageError> {
+        self.guard()?;
         let file = Self::slot_file(slot);
         // Never over an earlier copy: each one is evidence.
         let mut bad = format!("{file}{CORRUPT_SUFFIX}");
@@ -262,6 +298,7 @@ impl ConfigStorage for FileStorage {
     }
 
     fn save_state(&mut self, name: &str, data: &str) -> Result<(), StorageError> {
+        self.guard()?;
         let file = Self::state_file(name)?;
         if data.len() > MAX_STATE_BYTES {
             return Err(StorageError(format!("{file}: too large")));
@@ -287,6 +324,7 @@ impl ConfigStorage for FileStorage {
     }
 
     fn append_journal(&mut self, name: &str, lines: &str) -> Result<(), StorageError> {
+        self.guard()?;
         let file = Self::journal_file(name)?;
         let mut opts = OpenOptions::new();
         opts.append(true).create(true);
@@ -312,6 +350,7 @@ impl ConfigStorage for FileStorage {
     }
 
     fn rewrite_journal(&mut self, name: &str, text: &str) -> Result<(), StorageError> {
+        self.guard()?;
         let file = Self::journal_file(name)?;
         let temp = format!("{file}.tmp");
         self.write_file(&temp, text)
@@ -361,6 +400,7 @@ impl ConfigStorage for FileStorage {
     }
 
     fn save_revision(&mut self, number: u32, data: &str) -> Result<(), StorageError> {
+        self.guard()?;
         let file = revision_file(number);
         let temp = format!("{file}.tmp");
         self.write_file(&temp, data)
@@ -371,6 +411,7 @@ impl ConfigStorage for FileStorage {
     }
 
     fn remove_revision(&mut self, number: u32) -> Result<(), StorageError> {
+        self.guard()?;
         let file = revision_file(number);
         match fs::remove_file(self.path(&file)) {
             Ok(()) => Ok(()),
@@ -425,5 +466,28 @@ mod tests {
         ] {
             assert_eq!(revision_number(bad), None, "{bad}");
         }
+    }
+
+    /// G1.6zn: the system disk went away: every write is refused with the
+    /// line `corerouter-init` wrote, and what was saved still reads.
+    #[test]
+    fn a_missing_disk_refuses_writes_with_its_line() {
+        let base = std::env::temp_dir().join(format!("cr-fs-gone-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let marker = base.join("system-disk-removed");
+        let mut st = FileStorage::open(base.join("config")).unwrap().refuse_while(&marker);
+        st.save("{}").unwrap();
+        assert_eq!(st.unavailable(), None);
+        fs::write(&marker, "system disk sda removed: changes are no longer saved\n").unwrap();
+        let line = st.unavailable().unwrap();
+        assert_eq!(line, "system disk sda removed: changes are no longer saved");
+        assert!(st.save("{\"x\":1}").unwrap_err().0.contains("sda removed"));
+        assert!(st.save_state("dhcp-leases", "[]").is_err());
+        assert!(st.append_journal("config", "x\n").is_err());
+        assert!(st.save_revision(3, "{}").is_err());
+        assert_eq!(st.load(Slot::Current).unwrap().as_deref(), Some("{}"));
+        fs::remove_file(&marker).unwrap();
+        st.save("{\"x\":1}").unwrap();
+        let _ = fs::remove_dir_all(&base);
     }
 }

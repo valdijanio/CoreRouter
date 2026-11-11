@@ -61,6 +61,13 @@ pub trait ConfigStorage: Send {
     /// slot holds either its old or its new contents, never a mix.
     fn save(&mut self, data: &str) -> Result<(), StorageError>;
 
+    /// G1.6zn: why nothing can be saved now (the system disk went away), or
+    /// `None`. A commit is refused with it before it reaches the data
+    /// plane: applied and then lost at the next boot, nobody would know.
+    fn unavailable(&self) -> Option<String> {
+        None
+    }
+
     /// Move an unreadable `slot` out of the way (kept for forensics), so the
     /// next save does not rotate garbage over a good [`Slot::Previous`].
     fn quarantine(&mut self, slot: Slot) -> Result<(), StorageError>;
@@ -174,6 +181,8 @@ struct Slots {
     state: std::collections::BTreeMap<String, String>,
     journals: std::collections::BTreeMap<String, String>,
     revisions: std::collections::BTreeMap<u32, String>,
+    /// [`MemoryStorage::set_unavailable`].
+    unavailable: Option<String>,
 }
 
 /// In-memory storage. Clones share the same slots, so a test can keep a
@@ -247,6 +256,12 @@ impl MemoryStorage {
         });
     }
 
+    /// G1.6zn: what [`ConfigStorage::unavailable`] says (tests: the system
+    /// disk went away).
+    pub fn set_unavailable(&self, why: Option<String>) {
+        self.with(|s| s.unavailable = why);
+    }
+
     /// Bytes stored in revision files (tests: what the history costs).
     pub fn revision_bytes(&self) -> usize {
         self.with(|s| s.revisions.values().map(String::len).sum())
@@ -260,6 +275,10 @@ impl ConfigStorage for MemoryStorage {
 
     fn load(&mut self, slot: Slot) -> Result<Option<String>, StorageError> {
         Ok(self.get(slot))
+    }
+
+    fn unavailable(&self) -> Option<String> {
+        self.with(|s| s.unavailable.clone())
     }
 
     fn save(&mut self, data: &str) -> Result<(), StorageError> {

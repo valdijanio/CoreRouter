@@ -15,6 +15,8 @@
 //! - [`state`]: the trial across the reboot, configuration snapshots.
 //! - [`upload`]: a package arriving over the network, read as a stream
 //!   (G1.6e).
+//! - [`system_disk`]: the system in RAM and the system disk going away
+//!   (G1.6zn).
 //! - [`ab`]: the operations (status, install, confirm, the boot-time
 //!   decision corerouter-init takes).
 //!
@@ -34,6 +36,7 @@ pub mod install;
 pub mod iso;
 pub mod package;
 pub mod state;
+pub mod system_disk;
 pub mod upload;
 pub mod verity;
 

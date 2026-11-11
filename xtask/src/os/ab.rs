@@ -139,14 +139,14 @@ fn read(p: &Path) -> Result<Vec<u8>, String> {
 }
 // --------------------------------------------------------------- ab-test --
 
-struct Ctx {
+pub(super) struct Ctx {
     root: PathBuf,
     tool: PathBuf,
-    work: PathBuf,
+    pub(super) work: PathBuf,
     images: PathBuf,
-    kvm: bool,
-    fw: Firmware,
-    log: std::fs::File,
+    pub(super) kvm: bool,
+    pub(super) fw: Firmware,
+    pub(super) log: std::fs::File,
     /// G1.6e: a host port forwarded to the guest's TLS control port.
     fwd: Option<u16>,
 }
@@ -387,6 +387,26 @@ impl Vm {
         Ok(got.into_iter().flatten().collect())
     }
 
+    /// Every console line for `secs` seconds (G1.6zn: what follows an event).
+    pub(super) fn lines_for(&mut self, log: &mut std::fs::File, secs: u64) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        let mut out = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return out;
+            }
+            match self.rx.recv_timeout(left) {
+                Ok(line) => {
+                    let _ = writeln!(log, "{line}");
+                    out.push(line);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return out,
+            }
+        }
+    }
+
     /// Types `b` on the guest's serial console.
     pub(super) fn stdin_write(&mut self, b: &[u8]) -> Result<(), String> {
         self.stdin
@@ -521,7 +541,7 @@ pub(super) fn check(cond: bool, what: impl Into<String>) -> Result<(), String> {
 /// A fresh disk (qcow2 over disk.img) and NVRAM, booted once the factory way
 /// and once through the boot entries it created. Returns the second run,
 /// on slot A with dm-verity.
-fn fresh(ctx: &mut Ctx, n: &mut Numbers, scenario: &str, extra: &[&Path]) -> Result<Vm, String> {
+pub(super) fn fresh(ctx: &mut Ctx, n: &mut Numbers, scenario: &str, extra: &[&Path]) -> Result<Vm, String> {
     new_disk(ctx)?;
     let mut log = ctx.log.try_clone().map_err(|e| e.to_string())?;
     let mut vm = ctx.boot(&format!("{scenario}/factory"), true, &[])?;
@@ -1016,7 +1036,7 @@ fn scenario_bad_param(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
 }
 
 /// A shell command's output line on the guest's console.
-fn shell_line(vm: &mut Vm, log: &mut std::fs::File, cmd: &str) -> Result<String, String> {
+pub(super) fn shell_line(vm: &mut Vm, log: &mut std::fs::File, cmd: &str) -> Result<String, String> {
     vm.stdin_write(format!("{cmd} 2>&1 | sed \"s/^/@@$((2+1))S /\"\n").as_bytes())?;
     let got = vm.expect(log, &["@@3S "], 30)?;
     Ok(got.split("@@3S ").nth(1).unwrap_or("").trim().to_owned())
@@ -1352,7 +1372,7 @@ fn scenario_controllers(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
     Ok(())
 }
 
-/// `cargo xtask os ab-test [--tcg] [--firmware ovmf|seabios] [--scenario update|push|no-confirm|bad-signature|bad-param|cross|cut|controllers]`.
+/// `cargo xtask os ab-test [--tcg] [--firmware ovmf|seabios] [--scenario update|reflash|push|no-confirm|bad-signature|bad-param|cross|cut|controllers|to-ram]`.
 pub fn ab_test(root: &Path, images: &Path, args: &[String]) -> Result<(), String> {
     let mut tcg = false;
     let mut only: Option<String> = None;
@@ -1390,7 +1410,7 @@ pub fn ab_test(root: &Path, images: &Path, args: &[String]) -> Result<(), String
     };
     let mut n = Numbers(Vec::new());
     type Scenario = fn(&mut Ctx, &mut Numbers) -> Result<(), String>;
-    let all: [(&str, Scenario); 9] = [
+    let all: [(&str, Scenario); 10] = [
         ("update", scenario_update),
         ("reflash", scenario_reflash),
         ("push", scenario_push),
@@ -1400,6 +1420,8 @@ pub fn ab_test(root: &Path, images: &Path, args: &[String]) -> Result<(), String
         ("cross", scenario_cross),
         ("cut", scenario_cut),
         ("controllers", scenario_controllers),
+        // G1.6zn: the system in RAM, and the system disk pulled out.
+        ("to-ram", super::to_ram::scenario),
     ];
     let t = Instant::now();
     let mut passed = Vec::new();

@@ -553,8 +553,18 @@ fn storage(args: &Args) -> Result<(Box<dyn ConfigStorage>, Option<PathBuf>), Str
         (None, "linux") => (PathBuf::from(PRODUCTION_CONFIG_DIR), false),
         (None, _) => return Ok((Box::new(MemoryStorage::default()), None)),
     };
+    // G1.6zn: the init's line when the system disk goes away.
+    let gone = std::env::var_os("COREROUTER_RUNTIME_DIR")
+        .filter(|d| !d.is_empty())
+        .map(|d| PathBuf::from(d).join(corerouter_sysupdate::system_disk::GONE_FILE));
     match FileStorage::open(&dir) {
-        Ok(fs) => Ok((Box::new(fs), Some(dir))),
+        Ok(fs) => {
+            let fs = match gone {
+                Some(m) => fs.refuse_while(m),
+                None => fs,
+            };
+            Ok((Box::new(fs), Some(dir)))
+        }
         Err(e) if explicit => Err(format!("cannot use --config-dir {}: {e}", dir.display())),
         Err(e) => {
             log::error!(
