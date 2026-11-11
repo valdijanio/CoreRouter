@@ -811,6 +811,13 @@ impl WifiPanel {
         let mut rescan = false;
         let mut connect: Option<String> = None;
         let mut picked_radio = None;
+        // G1.30i: Auto runs only while this tab is drawn.
+        let now = ui.input(|i| i.time);
+        self.scan.drawn(now);
+        let connected = self.radio_row(&self.radio).is_some_and(|r| s(r, "state") == "connected");
+        if on && can.check("interface.wifi.scan").is_ok() && self.scan.auto_scan_due(now, connected) {
+            rescan = true;
+        }
         ui.horizontal(|ui| {
             ui.label(tr_in(SCOPE, l, "Radio"));
             egui::ComboBox::from_id_salt("wifi-scan-radio")
@@ -825,6 +832,7 @@ impl WifiPanel {
             if table::action(ui, tr_in(SCOPE, l, "Rescan"), can.and("interface.wifi.scan", radio_on())) {
                 rescan = true;
             }
+            self.scan.auto_controls(ui, l, connected, &mut self.help);
             if table::action(ui, tr_in(SCOPE, l, "Connect…"), can.and("interface.wifi.set", joinable())) {
                 connect = selection.as_slice().first().cloned();
             }

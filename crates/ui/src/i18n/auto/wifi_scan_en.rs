@@ -4,6 +4,18 @@
 /// Explanations: (key, Markdown).
 pub(super) const HELP: &[(&str, &str)] = &[
     (
+        "interface.wifi.auto",
+        r##"## What it is
+Refreshes the tab by itself:
+- in **List** and **Channels**, a new scan every 10, 30 or 60 seconds;
+- in **Spectrum**, the spectral scan starts again when its duration ends.
+
+It starts off. It runs only while the window is open on this tab: close the window or change tab and it turns off. **Stop** in the spectrum turns it off too.
+
+## Careful
+With the radio on a network (a station), each scan takes it off the network's channel for a moment, some 3 s for both bands: the link stalls and latency rises meanwhile. Hence the **leaves the channel** pill and the 30 s minimum. On a radio that is an uplink, leave it off or use 60 s."##,
+    ),
+    (
         "interface.wifi.band-filter",
         r##"## What it is
 Show only the networks of one band: 2.4 GHz, 5 GHz or 6 GHz. The number on each pill is how many access points the scan heard there. It applies to the list and the channel graph."##,

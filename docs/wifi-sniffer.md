@@ -42,6 +42,13 @@ Monitor no rádio por onde chega a gerência derrubaria o acesso. A regra:
   (`<rádio>mon`), que continua conectada. Escuta só o canal da estação. Pedir canal, largura,
   hop ou `mode=exclusive` é recusado com a saída: desativar a interface; se esta conexão chega
   por ela, entrar em Safe Mode antes.
+  - **Com a estação ociosa** (rádio ativo, sem rede): o kernel não informa canal nem do monitor
+    nem da estação. O `ieee80211_cfg_get_channel` do mac80211 só responde para uma estação numa
+    rede ou para um rádio só com monitores, e a placa fica no último canal em que esteve (rtw89
+    no notebook: 2412 MHz). Então o canal mostrado é o que os quadros dizem (radiotap): o mais
+    ouvido a cada segundo, em `snooper.print`, nos eventos do `tool.task.poll` e no resumo. O
+    `snooper.start` responde `channel: null` nesse caso, porque o canal só se sabe quando chegam
+    quadros (G1.30i-auto-scan).
 - **Rádio desativado**: o sniffer fica com o rádio (`exclusive`), escolhe canal e largura e
   pode pular canais.
 - **O rádio volta a ser habilitado** (à mão, ou o Safe Mode desfazendo o `disable` porque a

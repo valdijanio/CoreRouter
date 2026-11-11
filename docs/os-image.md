@@ -1011,6 +1011,50 @@ da imagem e no da ISO, e `NR_CPUS=8192` (o `MAXSMP` cai em silêncio sem `DEBUG_
 máquina (acima de 255, com IOMMU e sem o atalho que só VM tem); o `install-test` instala num
 cartão SD numa controladora SDHCI e dá boot por ele.
 
+### Boot lento no handoff do USB (xHCI) (G1.6zq)
+
+No notebook Lenovo 83EU (i5-12450H, BIOS LZCN41WW) com a dev.591, dando boot pelo pendrive, o
+`ready` saiu 25,1 s depois do kernel, e 20,47 s disso foram um passo só (**medido**, log do
+roteador, `636,280399 → 656,753205`):
+`pci 0000:00:14.0: quirk_usb_early_handoff+0x0/0x780 took 19992855 usecs`. O número do kernel
+não é µs: `drivers/pci/quirks.c:147` faz `ns >> 10`.
+
+**O que o passo faz** (`drivers/usb/host/pci-quirks.c`, igual no 6.18.59 e no master 7.4-rc2):
+`quirk_usb_early_handoff` (linha 1261) liga o dispositivo (`pci_enable_device`, que pode rodar o
+`_PS0` da ACPI) e chama `quirk_usb_handoff_xhci` (linha 1158), que pede o controlador ao BIOS
+(escreve *HC OS Owned* no USBLEGSUP e espera *HC BIOS Owned* zerar, até 1 s, linha 1203),
+desliga os SMIs do legado (linha 1221), espera *Controller Not Ready* (até 5 s, linha 1232) e
+para o controlador (até 32 ms, linha 1248). Nenhum dos avisos de estouro desses prazos saiu.
+
+**Por que um prazo de 1 s pode virar 20 s sem aviso.** O `handshake()` (linha 1030) usa
+`readl_poll_timeout_atomic`, que desde o commit `7349a69cf312` ("iopoll: Do not use timekeeping
+in read_poll_timeout_atomic()", 2024) não olha o relógio: soma o `udelay` de cada volta
+(`include/linux/iopoll.h`, `poll_timeout_us_atomic`). O tempo que o processador passa em SMM
+(o BIOS tratando o legado USB) não entra na conta. Sobram quatro hipóteses, e cada uma pede uma
+correção diferente:
+
+| Hipótese | Onde o tempo aparece | Correção |
+|---|---|---|
+| Um SMI longo do BIOS ao soltar o controlador | "OS-owned write" ou "BIOS release", com 1–2 SMIs | do firmware (BIOS novo ou "USB Legacy" desligado); o kernel não encurta um SMI |
+| Tempestade de SMIs enquanto o kernel espera | "BIOS release", com milhares de SMIs | prazo pelo relógio no `handshake()`: 1 s de verdade, e o kernel toma o controlador |
+| `_PS0` da ACPI demorado | "enable", sem SMI | contornar na tabela ACPI ou no BIOS |
+| Controlador lento para sair do CNR | "CNR" | prazo pelo relógio, como acima |
+
+**Diagnóstico na imagem** (`os/patches/linux/0003-usb-pci-quirks-time-the-xhci-handoff.patch`):
+cada passo do handoff é cronometrado com `ktime_get()` e, em Intel, conta os SMIs dele
+(`MSR_SMI_COUNT`, 0x34). Quando o handoff passa de 10 ms (o mesmo limite da linha "took"), ou com
+`initcall_debug`, o kernel escreve no log:
+
+```text
+pci 0000:00:14.0: xHCI handoff: <total> us, <n> SMIs; USBLEGSUP <hex> USBLEGCTLSTS <hex>
+pci 0000:00:14.0: xHCI handoff:   <passo>: <µs> us, <n> SMIs     (só os passos ≥ 1 ms ou com SMI)
+```
+
+Os valores de USBLEGSUP e USBLEGCTLSTS são os que o firmware deixou (bit 16: BIOS dono; bit 24:
+SO dono; bits 0, 4, 13–15 de USBLEGCTLSTS: quais SMIs o BIOS ligou — o 14, "SMI on PCI Command",
+dispara já no `pci_enable_device`, e por isso o passo "enable" também conta SMIs). Fora isso, o patch só
+acrescenta duas leituras que esvaziam escritas postadas, para o custo cair no passo certo.
+
 ### O que o roteador avisa quando a placa não sobe (G1.6ja)
 
 O serviço `nic-problems` do daemon olha a máquina a cada 10 s, fora do lock do `Session`: as placas
