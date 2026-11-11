@@ -14,6 +14,11 @@
 //! criterion's elements/s is the forwarding rate. One CPU does it all
 //! (veth hands the frame to the receive backlog of the sending CPU).
 //!
+//! "500 port ranges": the same frames through 500 firewall rules
+//! `udp dport A-B` that none matches, with each range as one `range eq`
+//! (ours, and nftables ≥ 1.1.2) and as a `cmp gte` + `cmp lte` pair
+//! (nftables < 1.1.2), alternated in one process; it prints both rates.
+//!
 //! A namespace has its own `rp_filter` and forwarding, but not the
 //! host-wide `netdev_budget`/`netdev_max_backlog` (those need the real
 //! host, as root: docs/tuning.md). So the "before" is the kernel's own
@@ -40,6 +45,7 @@ fn main() {
     }
     let mut c = criterion::Criterion::default().configure_from_args();
     linux::forward(&mut c);
+    linux::port_ranges(&mut c);
     c.final_summary();
 }
 
@@ -49,9 +55,12 @@ mod linux {
     use std::process::Command;
     use std::time::{Duration, Instant};
 
+    use corerouter_firewall::program::{Expr, Order, Table};
+    use corerouter_firewall::sample::{act, m, rule};
     use corerouter_hal::Hal;
-    use corerouter_hal_linux::{LinuxHal, Policy};
+    use corerouter_hal_linux::{LinuxHal, Policy, firewall, nfnl};
     use corerouter_model::Config;
+    use corerouter_model::cow_list::CowList;
     use criterion::{Criterion, Throughput};
     use nix::ifaddrs::getifaddrs;
     use nix::sys::socket::{LinkAddr, MsgFlags, bind, send};
@@ -280,6 +289,124 @@ mod linux {
         });
         let (_, got) = lab.burst(BURST);
         eprintln!("after + fq_codel: {got} of {BURST} frames forwarded");
+        g.finish();
+    }
+
+    /// Rules in the forward chain the frames walk: none matches, so each
+    /// frame runs all of them. `udp dport A-B` is a port range, the
+    /// expression nftables 1.1.2 changed (two `cmp` → one `range`).
+    const RANGE_RULES: u32 = 500;
+    /// A/B rounds of the comparison (each loads one form, then the other).
+    const ROUNDS: usize = 15;
+
+    fn port_rules(ports: &str) -> Config {
+        let mut c = Config::default();
+        c.ip.firewall.filter = CowList::from(
+            (0..RANGE_RULES)
+                .map(|i| {
+                    let pairs = [("protocol", "udp"), ("dst_port", ports)];
+                    rule(
+                        i + 1,
+                        "forward",
+                        m(&pairs).unwrap(),
+                        act(r#"{"type":"drop"}"#).unwrap(),
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>(),
+        );
+        c.ip.firewall.next_rule_id = RANGE_RULES + 1;
+        c
+    }
+
+    /// `t` with each `range eq` written as nftables < 1.1.2 did: `cmp gte`
+    /// + `cmp lte`.
+    fn as_cmp_pairs(mut t: Table) -> Table {
+        for r in &mut t.rules {
+            r.exprs = std::mem::take(&mut r.exprs)
+                .into_iter()
+                .flat_map(|e| match e {
+                    Expr::Range {
+                        sreg,
+                        eq: true,
+                        from,
+                        to,
+                    } => vec![
+                        Expr::Order {
+                            sreg,
+                            op: Order::Gte,
+                            data: from,
+                        },
+                        Expr::Order {
+                            sreg,
+                            op: Order::Lte,
+                            data: to,
+                        },
+                    ],
+                    e => vec![e],
+                })
+                .collect();
+        }
+        t
+    }
+
+    fn load(t: &Table) {
+        nfnl::apply(nfnl::replace(t, 1), "bench").unwrap();
+    }
+
+    fn median(mut v: Vec<f64>) -> f64 {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    }
+
+    /// The cost of a port-range match per frame (the frames go to UDP
+    /// ports 9000–9255): above the range both bounds are compared, below
+    /// it a pair of `cmp` stops at the first. The two forms alternate in
+    /// one process (a shared machine's load moves between runs).
+    pub fn port_ranges(c: &mut Criterion) {
+        let mut lab = Lab::new();
+        let mut g = c.benchmark_group("netns_forward");
+        g.throughput(Throughput::Elements(BURST));
+        g.sample_size(20);
+        lab.tune(
+            &[
+                ("net.ipv4.ip_forward", 1),
+                ("net.ipv4.conf.all.rp_filter", 0),
+                ("net.ipv4.conf.default.rp_filter", 0),
+            ],
+            &[],
+        );
+        for (name, ports) in [
+            ("udp64/500 port ranges, frame above", "1000-2000"),
+            ("udp64/500 port ranges, frame below", "20000-30000"),
+        ] {
+            let ours = corerouter_firewall::nft::program(&port_rules(ports), &[]).unwrap();
+            let pairs = as_cmp_pairs(ours.clone());
+            assert_ne!(ours.rules, pairs.rules, "the rules have a port range");
+            load(&ours);
+            g.bench_function(name, |b| {
+                b.iter_custom(|iters| (0..iters).map(|_| lab.burst(BURST).0).sum())
+            });
+            let pps = |lab: &mut Lab| {
+                let (t, n) = lab.burst(BURST);
+                n as f64 / t.as_secs_f64()
+            };
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            for _ in 0..ROUNDS {
+                load(&ours);
+                a.push(pps(&mut lab));
+                load(&pairs);
+                b.push(pps(&mut lab));
+            }
+            let (a, b) = (median(a), median(b));
+            eprintln!(
+                "{name}: range {:.1} kpps, cmp pair {:.1} kpps (range/pair {:.3}, median of {ROUNDS})",
+                a / 1e3,
+                b / 1e3,
+                a / b
+            );
+        }
+        firewall::remove().unwrap();
         g.finish();
     }
 }

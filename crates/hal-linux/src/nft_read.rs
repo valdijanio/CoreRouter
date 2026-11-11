@@ -352,10 +352,18 @@ pub fn parse_rule(body: &[u8]) -> Option<ReadRule> {
             2 => chain = a.str(),
             3 => handle = be64(&a)?,
             4 => {
+                // The expression before was read (not skipped as unknown).
+                let mut adjacent = false;
                 for elem in a.nested().filter(|e| e.kind == 1) {
                     match parse_expr(&elem) {
-                        Some(e) => exprs.push(e),
-                        None => unknown = true,
+                        Some(e) => {
+                            push_folding_ranges(&mut exprs, e, adjacent);
+                            adjacent = true;
+                        }
+                        None => {
+                            unknown = true;
+                            adjacent = false;
+                        }
                     }
                 }
             }
@@ -375,6 +383,45 @@ pub fn parse_rule(body: &[u8]) -> Option<ReadRule> {
         handle,
         unknown,
     })
+}
+
+/// Push `e`, folding `cmp gte lo` + `cmp lte hi` on one register (the
+/// expression just before, when `adjacent`) into `range eq lo hi`.
+///
+/// Both forms match the same packets (`lo <= x && x <= hi`, byte by byte,
+/// `nft_cmp_eval` and `nft_range_eval`). Our encoder writes `range` like
+/// nftables ≥ 1.1.2 (commit 50741c52, `netlink_gen_range`); nftables
+/// < 1.1.2 and CoreRouter before it wrote the pair. Reading both as one
+/// form keeps a table they loaded comparable with ours (the commit diff
+/// keeps its rules and counters), as `nft` itself does when it lists them
+/// (`expr_may_merge_range`, `src/netlink_delinearize.c`, since 0.7).
+fn push_folding_ranges(exprs: &mut Vec<Expr>, e: Expr, adjacent: bool) {
+    if adjacent
+        && let Expr::Order {
+            sreg,
+            op: Order::Lte,
+            data: to,
+        } = &e
+        && let Some(Expr::Order {
+            sreg: s0,
+            op: Order::Gte,
+            data: from,
+        }) = exprs.last()
+        && s0 == sreg
+        && from.len() == to.len()
+    {
+        let range = Expr::Range {
+            sreg: *sreg,
+            eq: true,
+            from: from.clone(),
+            to: to.clone(),
+        };
+        if let Some(last) = exprs.last_mut() {
+            *last = range;
+            return;
+        }
+    }
+    exprs.push(e);
 }
 
 /// The attributes of an expression's data, by number (every expression
@@ -976,6 +1023,117 @@ mod tests {
         assert_eq!(priority_text(-5), "filter - 5");
         assert_eq!(priority_text(110), "srcnat + 10");
         assert_eq!(priority_text(-150), "mangle");
+    }
+
+    /// The rules of a batch, read back as the kernel would dump them.
+    fn read_back(rules: &[Vec<Expr>]) -> Vec<Vec<Expr>> {
+        let mut b = crate::nfnl::Batch::new(1);
+        for exprs in rules {
+            b.new_rule(
+                "t",
+                &Rule {
+                    chain: "c".into(),
+                    exprs: exprs.clone(),
+                    text: String::new(),
+                    nft: None,
+                    comment: None,
+                },
+            );
+        }
+        let (bytes, _) = b.finish();
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at + 20 <= bytes.len() {
+            let len = u32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            let kind = u16::from_ne_bytes(bytes[at + 4..at + 6].try_into().unwrap());
+            // NFNL_SUBSYS_NFTABLES << 8 | NFT_MSG_NEWRULE; body after the
+            // nlmsghdr (16) and nfgenmsg (4).
+            if kind == (10 << 8) | 6 {
+                let r = parse_rule(&bytes[at + 20..at + len]).unwrap();
+                assert!(!r.unknown);
+                out.push(r.rule.exprs);
+            }
+            at += len.div_ceil(4) * 4;
+        }
+        out
+    }
+
+    fn port(reg: u32) -> Expr {
+        Expr::Payload {
+            base: corerouter_firewall::program::Base::Transport,
+            offset: 2,
+            len: 2,
+            dreg: reg,
+        }
+    }
+
+    fn order(sreg: u32, op: Order, data: &[u8]) -> Expr {
+        Expr::Order {
+            sreg,
+            op,
+            data: data.to_vec(),
+        }
+    }
+
+    /// `th dport 1024-65535` as nftables < 1.1.2 wrote it (`cmp gte` +
+    /// `cmp lte`) reads as the `range eq` nftables ≥ 1.1.2 and our encoder
+    /// write (tests/py/inet/tcp.t.payload, nftables commit 50741c52);
+    /// anything else stays as it is.
+    #[test]
+    fn a_cmp_pair_reads_as_one_range() {
+        let range = Expr::Range {
+            sreg: 1,
+            eq: true,
+            from: vec![4, 0],
+            to: vec![0xff, 0xff],
+        };
+        let pair = vec![
+            port(1),
+            order(1, Order::Gte, &[4, 0]),
+            order(1, Order::Lte, &[0xff, 0xff]),
+            Expr::Accept,
+        ];
+        let ours = vec![port(1), range.clone(), Expr::Accept];
+        // Not one range: other registers, other order, other lengths, a
+        // lone bound, or an expression between the two.
+        let kept = [
+            vec![
+                port(1),
+                port(2),
+                order(1, Order::Gte, &[4, 0]),
+                order(2, Order::Lte, &[0xff, 0xff]),
+            ],
+            vec![
+                port(1),
+                order(1, Order::Lte, &[0xff, 0xff]),
+                order(1, Order::Gte, &[4, 0]),
+            ],
+            vec![
+                port(1),
+                order(1, Order::Gte, &[4, 0]),
+                order(1, Order::Lte, &[0, 0, 0xff, 0xff]),
+            ],
+            vec![
+                port(1),
+                order(1, Order::Gt, &[4, 0]),
+                order(1, Order::Lte, &[9, 0]),
+            ],
+            vec![port(1), order(1, Order::Gte, &[4, 0]), Expr::Accept],
+            vec![
+                port(1),
+                order(1, Order::Gte, &[4, 0]),
+                Expr::Counter,
+                order(1, Order::Lte, &[0xff, 0xff]),
+            ],
+        ];
+        let mut all = vec![pair, ours.clone()];
+        all.extend(kept.iter().cloned());
+        let got = read_back(&all);
+        assert_eq!(got[0], ours, "the pair");
+        assert_eq!(got[1], ours, "our range");
+        for (i, k) in kept.iter().enumerate() {
+            assert_eq!(&got[i + 2], k, "case {i}");
+        }
     }
 
     /// Ranges survive encoding and reading back, in any dump order.
