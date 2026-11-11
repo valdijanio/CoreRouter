@@ -144,6 +144,40 @@ mod tests {
         assert!(!s.store().is_dirty(), "the adoption committed only itself");
     }
 
+    /// G1.6ze: the live image's PID 1 names a card plugged in and gives it a
+    /// DHCP client. It adopts the port itself, at once (it knows the name is
+    /// final), instead of sending `interface.set` until the tick's three
+    /// polls pass: that left ten refused commands in the notebook's log.
+    #[test]
+    fn the_live_image_adopts_a_new_port_at_once_and_nothing_is_refused() {
+        let mut s = lab_with(2, None);
+        crate::live::set(&mut s);
+        for t in 0..3 {
+            s.tick(1_000 + t);
+        }
+        assert!(!adopted(&s), "the tick has not adopted it yet");
+        let row = |s: &mut Session| {
+            let rows = s.execute("interface.list", &json!({})).unwrap();
+            rows.as_array().unwrap().iter().find(|r| r["name"] == "ether9").cloned().unwrap()
+        };
+        assert_eq!(row(&mut s)["managed"], false, "listed as the platform's, not adopted");
+        // What `corerouter-init` sends for such a row, in its order.
+        s.execute("interface.ethernet.adopt", &json!({"name": "ether9"})).unwrap();
+        s.execute("interface.set", &json!({"name": "ether9", "disabled": false})).unwrap();
+        s.execute("ip.dhcp-client.add", &json!({"interface": "ether9", "comment": "live image"}))
+            .unwrap();
+        let after = row(&mut s);
+        assert_eq!((&after["managed"], &after["disabled"]), (&json!(true), &json!(false)));
+        // The tick finds nothing left to adopt, and no line of error anywhere.
+        let rev = s.store().current_revision();
+        for t in 3..12 {
+            s.tick(1_000 + t);
+        }
+        assert_eq!(s.store().current_revision(), rev, "not adopted a second time");
+        let errors = s.execute("log.print", &json!({"level": "error"})).unwrap();
+        assert_eq!(errors, json!([]), "{errors}");
+    }
+
     #[test]
     fn the_command_refuses_what_it_cannot_adopt() {
         let mut s = Session::virtual_lab();

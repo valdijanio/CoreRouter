@@ -38,6 +38,8 @@ mod plan;
 mod ports;
 #[cfg(target_os = "linux")]
 mod setup;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod style;
 
 #[cfg(target_os = "linux")]
 fn main() {

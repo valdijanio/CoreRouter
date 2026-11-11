@@ -189,29 +189,54 @@ impl T {
         }
         // G1.6m: no default answers; the port by number, confirmed; a
         // summary and an explicit yes.
-        vm.expect(&mut log, &["no command shell"], 30)?;
-        answer(&mut vm, &mut log, "or the CLI (corerouter-cli", "")?;
-        let row = answer(&mut vm, &mut log, "1) ", "1")?;
+        // G1.6zg: one screen (who, the ports, what needs attention), the
+        // invitation at its end; the questions in numbered steps.
+        vm.expect(&mut log, &["no port has a management address yet"], 30)?;
+        answer(&mut vm, &mut log, "no command shell", "")?;
+        vm.expect(&mut log, &["[1/4] Management port"], 30)?;
+        let row = answer(&mut vm, &mut log, "  1  ether1 ", "1")?;
         check(
-            row.contains("1) ether1 (") && row.contains("52:54:"),
+            row.contains("52:54:") && row.contains(" off "),
             format!("port list: {row}"),
         )?;
-        answer(&mut vm, &mut log, "Management port (number", "y")?;
+        answer(&mut vm, &mut log, "Port (number or name)", "y")?;
         answer(&mut vm, &mut log, "Use ether1", "10.0.2.15/24")?;
         answer(&mut vm, &mut log, "Address/prefix", "10.0.2.2")?;
-        answer(&mut vm, &mut log, "has no password", "corerouter-test-1")?;
-        answer(&mut vm, &mut log, "New admin password", "corerouter-test-1")?;
-        answer(&mut vm, &mut log, "admin     new password", "y")?;
-        vm.expect(&mut log, &["admin password: set"], 30)?;
-        vm.expect(&mut log, &["Done. Manage it"], 30)?;
-        // Enter on the quiet console: the status, not a shell.
         answer(
             &mut vm,
             &mut log,
-            "CLI: corerouter-cli --connect tls://10.0.2.15",
-            "",
+            "admin has no password",
+            "corerouter-test-1",
         )?;
-        vm.expect(&mut log, &["10.0.2.15/24 on ether1"], 30)?;
+        answer(&mut vm, &mut log, "New admin password", "corerouter-test-1")?;
+        answer(&mut vm, &mut log, "Admin     new password", "y")?;
+        vm.expect(&mut log, &["OK  admin password set"], 30)?;
+        vm.expect(
+            &mut log,
+            &["Done: the router has its management address"],
+            30,
+        )?;
+        // The status follows, with the way in; Enter on the quiet console
+        // shows it again, not a shell.
+        vm.expect(&mut log, &["Web   https://10.0.2.15/"], 30)?;
+        vm.expect(
+            &mut log,
+            &["CLI   corerouter-cli --connect tls://10.0.2.15"],
+            30,
+        )?;
+        answer(&mut vm, &mut log, "to show this status again", "")?;
+        vm.expect(&mut log, &["Web   https://10.0.2.15/"], 30)?;
+        let row = vm.expect(&mut log, &["ether1 "], 30)?;
+        check(
+            row.contains("10.0.2.15/24"),
+            format!("status after Enter: {row}"),
+        )?;
+        // The serial console is coloured by default, and a test reads it
+        // all the same.
+        check(
+            vm.colored() > 0,
+            "no console line came with colour".to_owned(),
+        )?;
         let mut ping = Err(String::new());
         for _ in 0..10 {
             ping = super::tls_ping(port);
@@ -266,8 +291,14 @@ fn interactive(t: &mut T) -> Result<(), String> {
     let mut vm = start(&mut log, "install/interactive", cmd)?;
     // G1.6y: the ISO boots live; `i` on its console is the installer.
     answer(&mut vm, &mut log, "NOT INSTALLED", "i")?;
-    let row = vm.expect(&mut log, &["not offered: the installer medium"], 120)?;
-    check(row.contains("sda"), format!("the stick is not sda: {row}"))?;
+    // G1.6zg: what is not offered has no number, and the reason on a line
+    // of its own.
+    let row = vm.expect(&mut log, &["  -  sda ", "not offered:"], 120)?;
+    check(
+        row.contains("  -  sda "),
+        format!("the stick is not sda: {row}"),
+    )?;
+    vm.expect(&mut log, &["not offered: the installer medium"], 30)?;
     std::thread::sleep(Duration::from_millis(800));
     vm.stdin_write(b"sda\n")?;
     vm.expect(
@@ -275,42 +306,52 @@ fn interactive(t: &mut T) -> Result<(), String> {
         &["sda cannot be the target: the installer medium"],
         30,
     )?;
+    // G1.6zg: the steps. [2/5] Disk: the table again, then the disk by
+    // name; it holds a CoreRouter whose configuration can be kept.
+    vm.expect(&mut log, &["[2/5] Disk"], 30)?;
     answer(&mut vm, &mut log, "CoreRouter", "vda")?;
-    answer(&mut vm, &mut log, "ALL DATA ON vda WILL BE ERASED", "y")?;
+    answer(&mut vm, &mut log, "OK  vda: ", "y")?;
     // G1.6m: the ports by the router's names; one that is not there is
     // refused, then none.
-    answer(
-        &mut vm,
+    vm.expect(
         &mut log,
-        "Management address for the first boot",
-        "eth9 192.0.2.10/24",
+        &["[3/5] Management address for the first boot"],
+        30,
     )?;
-    let row = vm.expect(&mut log, &["ether1 (", "(e.g."], 30)?;
+    let row = vm.expect(&mut log, &["ether1 ", "e.g. ether1"], 30)?;
     check(
-        row.contains("ether1 ("),
+        row.contains("52:54:"),
         format!("installer port list: {row}"),
     )?;
+    answer(&mut vm, &mut log, "e.g. ether1", "eth9 192.0.2.10/24")?;
     answer(&mut vm, &mut log, "There is no port eth9 here.", "")?;
-    vm.expect(&mut log, &["(e.g. ether1"], 30)?;
-    std::thread::sleep(Duration::from_millis(800));
-    vm.stdin_write(b"vdb\n")?;
+    // [4/5] Confirm: anything but the disk's name goes back to the disks.
+    vm.expect(&mut log, &["[4/5] Confirm"], 30)?;
+    let row = answer(&mut vm, &mut log, "ALL DATA ON vda WILL BE ERASED", "vdb")?;
+    check(row.contains("!! ALL DATA"), format!("the warning: {row}"))?;
     vm.expect(&mut log, &["Nothing was written."], 30)?;
-    answer(&mut vm, &mut log, "CoreRouter", "1")?;
-    answer(&mut vm, &mut log, "ALL DATA ON vda WILL BE ERASED", "y")?;
-    answer(
-        &mut vm,
-        &mut log,
-        "Management address for the first boot",
-        "",
+    // One disk to offer: Enter takes it, and nothing is written yet.
+    answer(&mut vm, &mut log, "CoreRouter", "")?;
+    answer(&mut vm, &mut log, "OK  vda: ", "y")?;
+    answer(&mut vm, &mut log, "e.g. ether1", "")?;
+    let row = vm.expect(&mut log, &["Holds "], 30)?;
+    check(
+        row.contains("its configuration is kept"),
+        format!("what the confirmation says is kept: {row}"),
     )?;
-    vm.expect(&mut log, &["(e.g. ether1"], 30)?;
-    std::thread::sleep(Duration::from_millis(800));
-    vm.stdin_write(b"vda\n")?;
+    answer(&mut vm, &mut log, "Address ", "vda")?;
+    vm.expect(&mut log, &["[5/5] Write"], 30)?;
+    let row = vm.expect(&mut log, &["Writing vda:"], 60)?;
+    check(
+        row.contains(" 100%") && row.contains("MiB/s"),
+        format!("the progress line: {row}"),
+    )?;
     let line = vm.expect(&mut log, &["INSTALLED", "install failed"], 120)?;
     check(
-        line.contains("INSTALLED") && line.contains("configuration kept"),
+        line.contains("OK  INSTALLED CoreRouter") && line.contains("configuration kept"),
         format!("[interactive] {line}"),
     )?;
+    vm.expect(&mut log, &["Next: remove the installation medium"], 30)?;
     std::thread::sleep(Duration::from_millis(800));
     vm.stdin_write(b"\n")?;
     vm.wait_exit(&mut log, 60)?;
@@ -324,8 +365,32 @@ fn interactive(t: &mut T) -> Result<(), String> {
 /// `corerouter-cli run` on the guest over TLS, as the first operator: `admin`
 /// without a password, the certificate accepted on first use.
 fn live_cli(t: &T, cli: &Path, port: u16, id: &str, params: &str) -> Result<String, String> {
-    let home = t.work.join("live-home");
-    std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
+    let who = Admin {
+        home: &t.work.join("live-home"),
+        password: &t.admin,
+        strict: t.strict,
+    };
+    cli_run(cli, &who, port, id, params)
+}
+
+/// Who `cli_run` is: `admin` with this password, the known hosts under
+/// `home`; `strict`: the certificate must be the one already known.
+pub(super) struct Admin<'a> {
+    pub home: &'a Path,
+    pub password: &'a str,
+    pub strict: bool,
+}
+
+/// One command of `corerouter-cli run` on a guest's forwarded TLS port.
+pub(super) fn cli_run(
+    cli: &Path,
+    who: &Admin<'_>,
+    port: u16,
+    id: &str,
+    params: &str,
+) -> Result<String, String> {
+    let home = who.home;
+    std::fs::create_dir_all(home).map_err(|e| e.to_string())?;
     let mut cmd = Command::new(cli);
     cmd.args([
         "--connect",
@@ -333,14 +398,14 @@ fn live_cli(t: &T, cli: &Path, port: u16, id: &str, params: &str) -> Result<Stri
         "--user",
         "admin",
     ]);
-    if !t.strict {
+    if !who.strict {
         cmd.arg("--accept-new-cert");
     }
     let out = cmd
         .args(["run", id, params])
-        .env("HOME", &home)
+        .env("HOME", home)
         .env("COREROUTER_KNOWN_HOSTS", home.join("known_hosts"))
-        .env("COREROUTER_PASSWORD", &t.admin)
+        .env("COREROUTER_PASSWORD", who.password)
         .env("RUST_LOG", "off")
         .stdin(std::process::Stdio::null())
         .output()
@@ -355,6 +420,52 @@ fn live_cli(t: &T, cli: &Path, port: u16, id: &str, params: &str) -> Result<Stri
     } else {
         Err(text)
     }
+}
+
+/// G1.6ze: what `interface.list` has that is neither a port nor the loopback
+/// (the kernel's own `bond0`, `dummy0`, `gre0`, `sit0`…), and every name.
+fn kernel_made(list: &str) -> Result<(Vec<String>, Vec<String>), String> {
+    let v: serde_json::Value =
+        serde_json::from_str(list.trim()).map_err(|e| format!("interface.list: {e}: {list}"))?;
+    let names: Vec<String> = v
+        .as_array()
+        .ok_or("interface.list: not a list")?
+        .iter()
+        .filter_map(|r| r["name"].as_str().map(str::to_owned))
+        .collect();
+    let extra = names
+        .iter()
+        .filter(|n| {
+            *n != "lo"
+                && !n
+                    .strip_prefix("ether")
+                    .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .cloned()
+        .collect();
+    Ok((extra, names))
+}
+
+/// G1.6ze: the router's log has no line of level error (a command refused is
+/// one: "Falhou: /interface set … no interface 'ether2'").
+fn no_errors_logged(t: &T, cli: &Path, port: u16, when: &str) -> Result<(), String> {
+    let got = live_cli(t, cli, port, "log.print", r#"{"level":"error"}"#)?;
+    let v: serde_json::Value =
+        serde_json::from_str(got.trim()).map_err(|e| format!("log.print: {e}: {got}"))?;
+    let lines: Vec<&str> = v
+        .as_array()
+        .ok_or("log.print: not a list")?
+        .iter()
+        .filter_map(|r| r["message"].as_str())
+        .collect();
+    check(
+        lines.is_empty(),
+        format!(
+            "{when}: {} error lines in the router's log: {}",
+            lines.len(),
+            lines.join(" | ")
+        ),
+    )
 }
 
 /// G1.6y: the ISO boots live with an installed CoreRouter on the (read-only)
@@ -415,6 +526,18 @@ fn live(t: &mut T) -> Result<(), String> {
         addresses.contains("ether1"),
         format!("address: {addresses}"),
     )?;
+    // G1.6ze: the installer's kernel creates no device of its own, as the
+    // image's does not (the same command line parameters and patches).
+    let (extra, names) = kernel_made(&live_cli(t, &cli, port, "interface.list", "{}")?)?;
+    check(
+        extra.is_empty(),
+        format!(
+            "the live image lists what the kernel made by itself: {}",
+            extra.join(" ")
+        ),
+    )?;
+    t.n.put("live: interface.list", names.join(" "));
+    no_errors_logged(t, &cli, port, "live image booted, DHCP on ether1")?;
     // The other way in: the browser's GUI.
     t.n.put("live: the web GUI answers", super::web_files(web)?);
     let e = live_cli(
@@ -976,6 +1099,13 @@ fn live_modules(t: &mut T) -> Result<(), String> {
         "live modules: card plugged in → address by DHCP",
         format!("{} ms", t3.elapsed().as_millis()),
     );
+    // G1.6ze: PID 1 adopted the port before it set anything on it.
+    no_errors_logged(t, &cli, port, "card plugged into the live image")?;
+    let (extra, names) = kernel_made(&live_cli(t, &cli, port, "interface.list", "{}")?)?;
+    check(
+        extra.is_empty() && names.iter().any(|n| n == "ether2"),
+        format!("interface.list after the card: {}", names.join(" ")),
+    )?;
     // The install, managed through the card.
     let v = install_print(t, &cli, port)?;
     let blank = disk_named(&v, "BLANK")?.clone();
@@ -1468,4 +1598,41 @@ pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), S
         let _ = std::fs::remove_file(work.join(f));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// G1.6ze: what the notebook's live image listed, and what it must list.
+    #[test]
+    fn the_kernels_own_devices_are_told_from_ports() {
+        let row = |n: &str| format!(r#"{{"name":"{n}","managed":true}}"#);
+        let list = |names: &[&str]| {
+            format!(
+                "[{}]\n",
+                names.iter().map(|n| row(n)).collect::<Vec<_>>().join(",")
+            )
+        };
+        let (extra, names) = kernel_made(&list(&["ether1", "ether2", "lo"])).unwrap();
+        assert!(extra.is_empty(), "{extra:?}");
+        assert_eq!(names, ["ether1", "ether2", "lo"]);
+        let seen = [
+            "ether1", "ether2", "bond0", "dummy0", "erspan0", "gre0", "gretap0", "ip6gre0",
+            "ip6tnl0", "sit0", "tunl0", "lo",
+        ];
+        let (extra, _) = kernel_made(&list(&seen)).unwrap();
+        assert_eq!(
+            extra,
+            [
+                "bond0", "dummy0", "erspan0", "gre0", "gretap0", "ip6gre0", "ip6tnl0", "sit0",
+                "tunl0"
+            ]
+        );
+        // A port the init could not rename is not a port name either.
+        let (extra, _) = kernel_made(&list(&["eth0", "ether", "etherx", "lo0"])).unwrap();
+        assert_eq!(extra.len(), 4);
+        assert!(kernel_made("not json").is_err());
+        assert!(kernel_made("{}").is_err());
+    }
 }

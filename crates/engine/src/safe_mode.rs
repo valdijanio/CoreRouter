@@ -152,7 +152,7 @@ pub(crate) struct SafeMode {
     /// a client that reconnects after its connection dropped).
     last: Option<String>,
     /// Latest time given to [`Session::tick`].
-    clock: Option<u64>,
+    pub(crate) clock: Option<u64>,
 }
 
 impl SafeMode {
@@ -185,6 +185,8 @@ impl Session {
             self.scan_modules();
             // G2.3c: CGNAT blocks on demand and port alerts.
             self.cgnat_tick(now_unix);
+            // G0.3f: the counts of the grouped log lines whose window ended.
+            self.log_groups_flush();
             Ok(())
         });
         if ticked.is_err() {

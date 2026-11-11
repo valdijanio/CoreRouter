@@ -421,16 +421,24 @@ mod linux {
         }
 
         /// `accept_ra` per managed interface of `to` (G4.7b). Best effort:
-        /// a failure is logged, never refuses the commit.
-        fn sync_ra(&mut self, to: &Config) {
+        /// a failure is logged, never refuses the commit. `settled`: the
+        /// links of `to` exist (the stale RA state of before CoreRouter ran
+        /// counts as flushed from here on).
+        fn sync_ra(&mut self, to: &Config, settled: bool) {
             let mut claims = self.claims.clone();
             claims.extend(claims_of(to));
-            let managed: std::collections::BTreeSet<IfName> = match self.view(&claims) {
+            let managed: BTreeMap<IfName, crate::ra::RaLink> = match self.view(&claims) {
                 // Not the OS loopback (G3.4i): RA never reaches `lo`.
                 Ok(v) => v
                     .into_iter()
                     .filter(|(l, o)| *o == Owner::Managed && l.arphrd != owner::ARPHRD_LOOPBACK)
-                    .filter_map(|(l, _)| l.name.parse().ok())
+                    .filter_map(|(l, _)| {
+                        let link = crate::ra::RaLink {
+                            index: l.index,
+                            mac: l.mac.as_deref().and_then(crate::ra::parse_mac),
+                        };
+                        Some((l.name.parse().ok()?, link))
+                    })
                     .collect(),
                 Err(e) => {
                     log::warn!("ipv6 RA settings not applied: {e}");
@@ -440,7 +448,7 @@ mod linux {
             for p in crate::ra::sync(to, &managed, !self.ra_synced) {
                 log::warn!("ipv6 RA settings: {p}");
             }
-            self.ra_synced = true;
+            self.ra_synced |= settled;
         }
 
         /// Kernel index → name of the managed links.
@@ -704,6 +712,14 @@ mod linux {
                     log::error!("restoring CPU settings: {b}");
                 }
             };
+            // G1.26i: `accept_ra` of the links that already exist goes in
+            // before IPv6 forwarding turns on (the first apply of a boot):
+            // at that moment the kernel drops the RA routes of every
+            // interface that is not at 2, and would only get the WAN's
+            // default route back with the router's next periodic RA.
+            if self.sysctl.turns_ipv6_forwarding_on(tuning.1) {
+                self.sync_ra(to, false);
+            }
             let tuned = self.sysctl.transition(tuning.0, tuning.1).and_then(|()| {
                 self.ports
                     .transition(ports.0, ports.1, &root)
@@ -731,7 +747,7 @@ mod linux {
             if ops.is_empty() {
                 self.claims = claims_of(to);
                 // After the links exist (a new VLAN has no sysctl before).
-                self.sync_ra(to);
+                self.sync_ra(to, true);
                 return Ok(());
             }
             let mut claims = claims_of(from);
@@ -756,7 +772,7 @@ mod linux {
             match crate::netlink::apply(&run, &owned) {
                 Ok(()) => {
                     self.claims = claims_of(to);
-                    self.sync_ra(to);
+                    self.sync_ra(to, true);
                     Ok(())
                 }
                 Err(e) => {

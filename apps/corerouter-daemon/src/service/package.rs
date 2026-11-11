@@ -62,6 +62,7 @@ const TUNING_KEYS: &[&str] = &[
     "pcie_aspm",
     "iommu",
     "mitigations",
+    "corerouter.sensors",
 ];
 
 pub(crate) const SERVICE: super::Service = super::Service {

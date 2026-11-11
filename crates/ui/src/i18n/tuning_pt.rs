@@ -13,6 +13,15 @@ Vão na linha de comando do kernel da imagem do roteador e valem a partir do **p
 "Running" é o que este boot usou (`/proc/cmdline`); as linhas dos slots mostram o que cada entrada de boot carrega. Uma atualização (System › Packages) também leva estes parâmetros para o slot novo."##,
     ),
     (
+        "tuning.boot.corerouter.sensors",
+        r##"## O que faz
+Diz se o roteador procura o chip de sensores da placa-mãe (ventoinhas, tensões, temperaturas da placa) ao ligar. **auto** (padrão): procura numa máquina de verdade e não numa máquina virtual; **on**: procura sempre; **off**: nunca. Vale a partir do próximo boot.
+## Quando mudar
+off numa placa em que a procura atrapalha. Esse chip não aparece em nenhuma lista do hardware: o driver escreve em duas portas de E/S (0x2e e 0x4e) e vê quem responde.
+## Cuidado
+Com off, System › Resources › Sensors perde as ventoinhas e as tensões da placa. As temperaturas da CPU e dos discos não dependem disto."##,
+    ),
+    (
         "tuning.boot.intel_idle.max_cstate",
         r##"## O que faz
 O C-state mais profundo que o driver de ociosidade intel_idle pode usar, desde o boot: 0 desliga esse driver, 1 mantém as CPUs em C1. Vale a partir do próximo boot.
@@ -217,11 +226,12 @@ Os pacotes de um mesmo fluxo seguem sempre pelo mesmo caminho nos dois casos; s�
         "tuning.net.ipv4.ip_forward",
         r##"## O que faz
 Se o kernel encaminha pacotes IPv4 entre interfaces. Um roteador precisa dele ligado; desligado, a máquina só responde por si.
+**O CoreRouter o liga por padrão**, como o RouterOS (`/ip settings ip-forward=yes`): o kernel sozinho sobe como host, sem encaminhar. "padrão do roteador" na coluna Configurado quer dizer que ninguém o definiu aqui.
 ## Quando mudar
-Nunca num roteador. Desligado é para um host.
+Nunca num roteador. Desligado (defina 0) é para um host; Unset volta a encaminhar.
 ## Cuidado
 Desligar para todo o roteamento IPv4 na hora. Ligar também desliga o LRO de todas as portas (o kernel faz isso).
-Mudá-lo reinicia outros parâmetros de configuração para o padrão de host ou de roteador (`ip-sysctl.rst`): o CoreRouter sempre o grava antes dos outros."##,
+Mudá-lo reinicia o `conf/all/accept_redirects` (um roteador não obedece a redirecionamentos ICMP, RFC 1812 4.3.3.2) e o encaminhamento de cada interface (`ip-sysctl.rst`): o CoreRouter sempre o grava antes dos outros."##,
     ),
     (
         "tuning.net.ipv4.neigh.default.gc_thresh1",
@@ -280,11 +290,12 @@ Deixe "quando precisar" (1): os cookies só entram com a fila cheia.
     (
         "tuning.net.ipv6.conf.all.forwarding",
         r##"## O que faz
-Se o kernel encaminha pacotes IPv6. Ligado, as interfaces também deixam de aceitar Router Advertisements, a não ser com `accept_ra` = 2 (o CoreRouter põe isso onde um cliente DHCPv6 precisa).
+Se o kernel encaminha pacotes IPv6. **O CoreRouter o liga por padrão**, como o RouterOS (`/ipv6 settings forward=yes`).
+Ligado, as interfaces se comportam como as de um roteador (RFC 4861): deixam de aceitar Router Advertisements e redirecionamentos ICMPv6 e deixam de pedir RAs, a não ser com `accept_ra` = 2. O CoreRouter põe 2 onde IPv6 › Settings manda aceitar RA (por padrão, onde roda um cliente DHCPv6: a WAN) e pede um RA aos roteadores dali na hora, então a rota padrão e o SLAAC da WAN continuam funcionando.
 ## Quando mudar
-Nunca num roteador que roteia IPv6.
+Nunca num roteador que roteia IPv6. Desligado (defina 0) é para um host; Unset volta a encaminhar.
 ## Cuidado
-Desligado, o roteamento IPv6 para na hora."##,
+Desligado, o roteamento IPv6 para na hora. Ao ligar, o kernel apaga as rotas de RA de toda interface que não aceita RA."##,
     ),
     (
         "tuning.net.ipv6.fib_multipath_hash_policy",
@@ -716,6 +727,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
         r##"Copia a imagem em uso para o slot"##,
     ),
     (
+        "CoreRouter keeps this value while the configuration does not set it: a router forwards. Set it to 0 to turn it off.",
+        r##"O CoreRouter mantém este valor enquanto a configuração não o define: um roteador encaminha. Defina 0 para desligar."##,
+    ),
+    (
         "Current",
         r##"Atual"##,
     ),
@@ -786,6 +801,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (
         "Not set for the next boot",
         r##"Não definido para o próximo boot"##,
+    ),
+    (
+        "Not set: CoreRouter's default is in use",
+        r##"Não definido: vale o padrão do CoreRouter"##,
     ),
     (
         "Not set: the kernel's own value is in use",
@@ -1032,12 +1051,24 @@ pub(super) const LABELS: &[(&str, &str)] = &[
         r##"não aplicado"##,
     ),
     (
+        "nothing is configured yet, the kernel's own values are in use.",
+        r##"nada foi configurado ainda, valem os valores do próprio kernel."##,
+    ),
+    (
         "obsolete",
         r##"obsoleto"##,
     ),
     (
+        "parameters change when this profile is applied.",
+        r##"parâmetros mudam ao aplicar este perfil."##,
+    ),
+    (
         "parameters differ from this profile.",
         r##"parâmetros diferem deste perfil."##,
+    ),
+    (
+        "router default",
+        r##"padrão do roteador"##,
     ),
     (
         "running",
@@ -1071,6 +1102,10 @@ pub(super) const TEMPLATES: &[(&str, &str)] = &[
     (
         "finding.flow_control_on",
         r##"O controle de fluxo (quadros de pausa) está ligado em {nics}: uma fila cheia para a porta inteira (aba Interfaces)."##,
+    ),
+    (
+        "finding.forwarding6_off",
+        r##"O encaminhamento IPv6 está desligado: este roteador não roteia IPv6."##,
     ),
     (
         "finding.forwarding_off",

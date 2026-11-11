@@ -24,7 +24,8 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -157,6 +158,8 @@ pub(super) struct Vm {
     rx: mpsc::Receiver<String>,
     started: Instant,
     name: String,
+    /// Console lines that came with colour (G1.6zg).
+    colored: Arc<AtomicUsize>,
 }
 
 const SHELL_APPEND: &str = "ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off corerouter.shell=ttyS0";
@@ -240,11 +243,19 @@ pub(super) fn start(log: &mut std::fs::File, name: &str, mut cmd: Command) -> Re
     let stdin = child.stdin.take().ok_or("qemu stdin")?;
     let stdout = child.stdout.take().ok_or("qemu stdout")?;
     let (tx, rx) = mpsc::channel();
+    let colored = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&colored);
     std::thread::Builder::new()
         .name("qemu-serial".into())
         .spawn(move || {
             for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
+                let Ok(raw) = line else { break };
+                // G1.6zg: the consoles are coloured; a test reads the text
+                // a person reads.
+                let line = super::console_text(&raw);
+                if line != raw {
+                    seen.fetch_add(1, Ordering::Relaxed);
+                }
                 if tx.send(line).is_err() {
                     break;
                 }
@@ -259,6 +270,7 @@ pub(super) fn start(log: &mut std::fs::File, name: &str, mut cmd: Command) -> Re
         rx,
         started: Instant::now(),
         name: name.to_owned(),
+        colored,
     })
 }
 
@@ -296,6 +308,11 @@ impl Ctx {
 }
 
 impl Vm {
+    /// How many console lines came with colour so far (G1.6zg).
+    pub(super) fn colored(&self) -> usize {
+        self.colored.load(Ordering::Relaxed)
+    }
+
     /// The next console line that contains one of `pats`; error on a
     /// timeout, on QEMU exiting, and on a kernel panic unless one of `pats`
     /// is "Kernel panic".
@@ -593,6 +610,14 @@ fn scenario_update(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
         "system.tuning.boot.set",
         r#"{"key":"iommu","value":"pt"}"#,
     )?;
+    // G1.6zf: the init's own option goes the same way. `on`: look for the
+    // motherboard's sensor chip in a virtual machine too, so the next boot
+    // shows that PID 1 got it (no such chip here: it says nobody answered).
+    vm.ok(
+        &mut log,
+        "system.tuning.boot.set",
+        r#"{"key":"corerouter.sensors","value":"on"}"#,
+    )?;
     let q = vm.ok(&mut log, "system.package.check", r#"{"path":"/dev/vdb"}"#)?;
     let c = result_of(&mut vm, &mut log, &q, 60)?;
     check(
@@ -609,7 +634,21 @@ fn scenario_update(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
     vm.wait_exit(&mut log, 120)?;
     drop(vm);
     let mut vm = ctx.boot("update/trial-b", false, &[])?;
-    vm.expect(&mut log, &["trial boot of slot b"], 120)?;
+    let r = vm.expect_all(
+        &mut log,
+        &[
+            "trial boot of slot b",
+            "sensors: no motherboard sensor chip answered",
+        ],
+        120,
+    )?;
+    n.put(
+        "trial boot of slot B: corerouter.sensors=on reached PID 1",
+        r.get(1)
+            .map_or("", |l| l.split("corerouter-init: ").last().unwrap_or(""))
+            .trim()
+            .to_owned(),
+    );
     let r = vm.expect_all(
         &mut log,
         &[

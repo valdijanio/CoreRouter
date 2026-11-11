@@ -298,6 +298,119 @@ fn the_router_processes_are_found_and_kept() {
     assert_eq!(stat_name("9 (cut"), None);
 }
 
+/// G1.6zf: two NVMe disks, two SATA disks, two AMD sockets and a card's
+/// ports all read as one name each without this: `system.health.print` had
+/// `nvme-composite` twice.
+#[test]
+fn chips_of_the_same_driver_are_told_apart() {
+    let dir = std::env::temp_dir().join(format!("cr-res-chips-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let hwmon = dir.join("sys/class/hwmon");
+    let chip = |n: u32, name: &str, files: &[(&str, &str)]| -> PathBuf {
+        let d = hwmon.join(format!("hwmon{n}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("name"), format!("{name}\n")).unwrap();
+        for (f, v) in files {
+            std::fs::write(d.join(f), v).unwrap();
+        }
+        d
+    };
+    let temp = [("temp1_input", "41000")];
+    chip(
+        0,
+        "coretemp",
+        &[("temp1_input", "50000"), ("temp1_label", "Package id 0")],
+    );
+    // The NVMe controllers: `device` is a link to `nvme0`, `nvme1`.
+    for n in 0..2 {
+        let d = chip(
+            1 + n,
+            "nvme",
+            &[("temp1_input", "38850"), ("temp1_label", "Composite")],
+        );
+        let ctrl = dir.join(format!("sys/devices/nvme{n}"));
+        std::fs::create_dir_all(&ctrl).unwrap();
+        std::os::unix::fs::symlink(&ctrl, d.join("device")).unwrap();
+    }
+    // SATA disks: the SCSI device has `block/<disk>`.
+    for (n, disk) in [(3, "sda"), (4, "sdb")] {
+        std::fs::create_dir_all(chip(n, "drivetemp", &temp).join("device/block").join(disk))
+            .unwrap();
+    }
+    // A card's port: the PCI function has `net/<port>`.
+    std::fs::create_dir_all(chip(5, "ixgbe", &temp).join("device/net/ether3")).unwrap();
+    // Nothing to tell them apart but the order.
+    chip(
+        6,
+        "k10temp",
+        &[("temp1_input", "44000"), ("temp1_label", "Tctl")],
+    );
+    chip(
+        7,
+        "k10temp",
+        &[("temp1_input", "45000"), ("temp1_label", "Tctl")],
+    );
+    // A device whose name only starts like the chip's is not a number of it.
+    let d = chip(10, "nvme", &temp);
+    let other = dir.join("sys/devices/nvme-fabric");
+    std::fs::create_dir_all(&other).unwrap();
+    std::os::unix::fs::symlink(&other, d.join("device")).unwrap();
+    // The motherboard's chip: named after its model, bound to the family's
+    // driver. Its limits are the firmware's alarm settings: left out.
+    let d = chip(
+        11,
+        "nct6798",
+        &[
+            ("temp1_input", "34000"),
+            ("temp1_label", "SYSTIN"),
+            ("temp3_input", "127000"),
+            ("temp3_label", "AUXTIN1"),
+            ("temp3_max", "80000"),
+            ("temp3_crit", "100000"),
+            ("fan2_input", "1180"),
+            ("in0_input", "1016"),
+        ],
+    );
+    let driver = dir.join("sys/bus/platform/drivers/nct6775");
+    std::fs::create_dir_all(&driver).unwrap();
+    std::fs::create_dir_all(d.join("device")).unwrap();
+    std::os::unix::fs::symlink(&driver, d.join("device/driver")).unwrap();
+    let c = Collector::at(&dir.join("proc"), &dir.join("sys"));
+    let all = c.sensors();
+    let board: Vec<&Sensor> = all.iter().filter(|s| s.board).collect();
+    assert_eq!(board.len(), 4);
+    assert!(
+        board
+            .iter()
+            .all(|s| s.chip == "nct6798" && s.max.is_none() && s.crit.is_none())
+    );
+    assert_eq!(
+        board.iter().find(|s| s.label == "AUXTIN1").map(|s| s.value),
+        Some(127.0),
+        "shown as read"
+    );
+    let chips: Vec<String> = all
+        .into_iter()
+        .filter(|s| !s.board)
+        .map(|s| s.chip)
+        .collect();
+    assert_eq!(
+        chips,
+        [
+            "coretemp",
+            "nvme0",
+            "nvme1",
+            "drivetemp sda",
+            "drivetemp sdb",
+            "ixgbe ether3",
+            "k10temp",
+            "k10temp 2",
+            "nvme",
+        ]
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn an_empty_or_missing_tree_reads_as_nothing() {
     let dir = std::env::temp_dir().join(format!("cr-res-empty-{}", std::process::id()));

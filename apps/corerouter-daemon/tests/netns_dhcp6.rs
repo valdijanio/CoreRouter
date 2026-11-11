@@ -268,6 +268,19 @@ fn linux_dhcpv6_client_gets_address_and_prefix_and_controls_ra() {
     let daemon = Kill(c.spawn().unwrap());
     wait_for("the daemon", || run("interface.list", json!({})).is_ok());
 
+    // G1.26i: the daemon forwards by default (the kernel booted as a
+    // host), so everything below, the RA on the WAN included, happens on a
+    // router: a forwarding kernel takes RAs only where `accept_ra` is 2.
+    let sysctl = |path: &str| {
+        std::fs::read_to_string(format!("/proc/sys/net/{path}"))
+            .unwrap()
+            .trim()
+            .to_owned()
+    };
+    assert_eq!(sysctl("ipv4/ip_forward"), "1");
+    assert_eq!(sysctl("ipv6/conf/all/forwarding"), "1");
+    assert_eq!(sysctl("ipv6/conf/wan0/forwarding"), "1");
+
     // The safe default (auto, no DHCPv6 client): RA off on every managed
     // interface, and what the kernel learned before is gone.
     assert_eq!(accept_ra("wan0"), "0");
@@ -306,6 +319,7 @@ fn linux_dhcpv6_client_gets_address_and_prefix_and_controls_ra() {
             && ip_out(&["-6", "route", "show"])
                 .contains("default via fe80::dc:ff:fe00:1 dev wan0 proto ra")
     });
+    assert_eq!(sysctl("ipv6/conf/wan0/forwarding"), "1", "still a router");
     assert!(ip_out(&["-6", "addr", "show", "dev", "wan0"]).contains(&address));
     assert!(ip_out(&["-6", "addr", "show", "dev", "lan0"]).contains("2001:db8:1:100::1/64"));
     // … and the lists say where each came from.

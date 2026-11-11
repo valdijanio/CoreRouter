@@ -472,7 +472,10 @@ FOLD_MIN=${FOLD_MIN:-10}
 maybe_fold() {
   local wt pending fb fpr
   git -C "$root" fetch --quiet origin "$base"
-  pending=$(git -C "$root" ls-tree --name-only "origin/$base" docs/changes/ | grep -vc 'README.md$' || true)
+  # Só os arquivos de mudança contam: as pastas `<id>-screenshots` ficam em docs/changes depois
+  # do fold, e contá-las (37 em 2026-11-11) fazia um PR de fold a cada lote.
+  pending=$(git -C "$root" ls-tree --name-only "origin/$base" docs/changes/ |
+    grep '\.md$' | grep -vc '/README\.md$' || true)
   if [ "$fold" != 1 ] && [ "$pending" -lt "$FOLD_MIN" ]; then
     [ "$pending" -gt 0 ] && say "fold adiado: $pending arquivo(s) em docs/changes (consolida com $FOLD_MIN ou --fold)"
     return 0

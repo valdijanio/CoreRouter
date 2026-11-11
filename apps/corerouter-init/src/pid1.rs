@@ -53,6 +53,9 @@ const DAEMON_LOG_MAX: u64 = 8 << 20;
 /// An FRR daemon the config no longer uses gets this long after SIGTERM
 /// (G1.6i); FRR exits in well under a second.
 const FRR_STOP_GRACE: Duration = Duration::from_secs(5);
+/// The console gets this long to send what was written to it before a
+/// reboot (115200 baud sends a full 4 KiB buffer in 0.36 s).
+const CONSOLE_DRAIN: Duration = Duration::from_secs(1);
 /// Idle memory is read this long after the first ready.
 const IDLE_AFTER: Duration = Duration::from_secs(10);
 
@@ -124,8 +127,11 @@ pub fn main() {
     // run before it is mounted). G1.6za: the live image too: the first stage
     // mounted the ISO kernel's modules over /lib/modules (without them, this
     // kernel's directory is not there and this finds nothing).
+    // G1.6zf: and, last and only on a real machine, the motherboard's sensor
+    // chip (`corerouter.sensors=`).
     if opts.modules {
-        crate::modules::start(log, opts.hwsim);
+        let cpuinfo = read_proc("/proc/cpuinfo").unwrap_or_default();
+        crate::modules::start(log, opts.sensors.wanted(&cpuinfo), opts.hwsim);
     }
     let names = name_ports(Some(Path::new(crate::ports::MAP_FILE)));
     spawn_hotplug_names(crate::ports::MAP_FILE, live);
@@ -421,34 +427,53 @@ fn spawn_hotplug_names(map: &'static str, live: bool) {
     }
 }
 
+/// One port of the live image, from what the daemon says of it: adopted,
+/// enabled, a DHCP client (`plan::live_port_commands`). `Ok(false)`: the
+/// daemon does not answer or does not list the port yet; `Err`: it refused a
+/// command. One at a time: the first-boot thread and a card's own thread may
+/// look at the same port.
+fn live_port(port: &str, i: usize) -> Result<bool, String> {
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ONE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let none = serde_json::json!({});
+    let (Ok(interfaces), Ok(clients)) = (
+        crate::ctl::call("interface.list", &none),
+        crate::ctl::call("ip.dhcp-client.list", &none),
+    ) else {
+        return Ok(false);
+    };
+    let Some(commands) = plan::live_port_commands(port, i, &interfaces, &clients) else {
+        return Ok(false);
+    };
+    for (cmd, params) in &commands {
+        crate::ctl::call(cmd, params).map_err(|e| format!("{cmd}: {e}"))?;
+    }
+    Ok(true)
+}
+
+/// [`live_port`], asking again every 250 ms while the daemon does not list
+/// the port, `tries` times; what happened goes to the console.
+fn live_port_wait(port: &str, i: usize, tries: u32) {
+    for left in (0..tries).rev() {
+        match live_port(port, i) {
+            Ok(true) => return log!("live image: DHCP client on {port}"),
+            Ok(false) if left > 0 => std::thread::sleep(Duration::from_millis(250)),
+            Ok(false) => log!("live image: {port}: the daemon does not list it; no DHCP client"),
+            Err(e) => return log!("live image: {port}: {e}"),
+        }
+    }
+}
+
 /// G1.6za: a port the live image got after its first pass (a card plugged in, a
 /// driver that took its time) gets its DHCP client. In a thread of its own: the
 /// daemon sees the new name a moment later, and the names must not wait for it.
 /// Before the daemon is up this gives up, and `first_boot` covers the port.
 fn live_dhcp_later(port: String) {
-    const TRIES: u32 = 40;
     let spawned = std::thread::Builder::new()
         .name("live-dhcp".into())
-        .spawn(move || {
-            let commands = plan::live_dhcp_port(&port, plan::port_index(&port));
-            for (i, (cmd, params)) in commands.iter().enumerate() {
-                let mut tries = if i == 0 { TRIES } else { 1 };
-                loop {
-                    tries -= 1;
-                    match crate::ctl::call(cmd, params) {
-                        Ok(_) => break,
-                        Err(_) if tries > 0 => std::thread::sleep(Duration::from_millis(250)),
-                        // Plugged in again: the client it had still stands.
-                        Err(e) if e.contains("already has") => break,
-                        Err(e) => {
-                            log!("live image: {port}: {cmd}: {e}");
-                            return;
-                        }
-                    }
-                }
-            }
-            log!("live image: DHCP client on {port}");
-        });
+        .spawn(move || live_port_wait(&port, plan::port_index(&port), 40));
     if let Err(e) = spawned {
         log!("live image: DHCP thread: {e}");
     }
@@ -501,10 +526,8 @@ fn first_boot(
                         ports.push(f.kernel);
                     }
                 }
-                for (cmd, params) in plan::live_dhcp_commands(&ports) {
-                    if let Err(e) = crate::ctl::call(cmd, &params) {
-                        log!("live image: {cmd}: {e}");
-                    }
+                for (i, port) in ports.iter().enumerate() {
+                    live_port_wait(port, i, 4);
                 }
             }
             if let Some(m) = mgmt
@@ -1087,6 +1110,33 @@ fn rotate_log(path: &str) {
     }
 }
 
+/// Waits, at most [`CONSOLE_DRAIN`], until the text written to the console
+/// has left the port (G1.6zd). A serial console sends from a buffer, and two
+/// things empty that buffer without sending it:
+///
+/// - the exit of the maintenance shell or of the console setup, the
+///   console's session leader: the kernel hangs the terminal up and drops
+///   the pending output (`tty_ldisc_hangup` → `uart_flush_buffer`,
+///   `drivers/tty/tty_ldisc.c:700` and `serial/serial_core.c:685` in 6.18);
+/// - `reboot(2)`, which resets the machine with the buffer as it is.
+///
+/// The A/B test saw `trial boot of s` and then the kernel's `Restarting
+/// system`: the line that says why the router went back was cut. `tcdrain`
+/// has no timeout and a line held by flow control never drains, so a helper
+/// thread waits and this one gives up after the limit.
+fn drain_console() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("console-drain".into())
+        .spawn(move || {
+            let _ = rustix::termios::tcdrain(std::io::stderr());
+            let _ = tx.send(());
+        });
+    if spawned.is_ok() {
+        let _ = rx.recv_timeout(CONSOLE_DRAIN);
+    }
+}
+
 fn shutdown(
     what: usize,
     daemon: Option<Pid>,
@@ -1100,6 +1150,9 @@ fn shutdown(
         _ => "reboot",
     };
     log!("{name}: stopping services");
+    // Before the shell goes: its exit hangs the console up, which drops
+    // what is still in the port's buffer (the reason of this reboot).
+    drain_console();
     for p in [shell, setup].into_iter().flatten() {
         let _ = rustix::process::kill_process(p, Signal::HUP);
     }
@@ -1150,6 +1203,8 @@ fn shutdown(
         HALT => RebootCommand::Halt,
         _ => RebootCommand::Restart,
     };
+    // `reboot(2)` does not wait for the UART either.
+    drain_console();
     let e = rustix::system::reboot(cmd);
     log!("{name}: {e:?}; halting here");
     loop {

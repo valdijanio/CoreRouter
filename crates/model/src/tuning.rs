@@ -6,7 +6,9 @@
 //! The config keeps only what the operator (or a profile) set: a parameter
 //! missing from [`Tuning::sysctl`] is left as the kernel has it, and taking
 //! one out puts back the value the kernel had before CoreRouter first
-//! changed it. [`PARAMS`] is the catalog: which kernel parameters exist
+//! changed it. The exception is [`DEFAULTS`] (G1.26i): what a router needs
+//! to be one (it forwards), kept by CoreRouter until the config says
+//! otherwise. [`PARAMS`] is the catalog: which kernel parameters exist
 //! here, where the window shows them and the values they accept.
 //! [`PORT_PARAMS`] is the same for the settings of each port (G1.26b):
 //! rings, queues, interrupt coalescing, transmit queue and filter, kept in
@@ -46,6 +48,35 @@ impl Tuning {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
     }
+
+    /// The kernel parameters CoreRouter keeps under this config: the
+    /// [`DEFAULTS`], then what the config sets over them.
+    pub fn effective_sysctl(&self) -> BTreeMap<String, i64> {
+        let mut out: BTreeMap<String, i64> = DEFAULTS
+            .iter()
+            .map(|(n, v)| ((*n).to_owned(), *v))
+            .collect();
+        out.extend(self.sysctl.iter().map(|(n, v)| (n.clone(), *v)));
+        out
+    }
+}
+
+pub const IP_FORWARD: &str = "net.ipv4.ip_forward";
+pub const IPV6_FORWARDING: &str = "net.ipv6.conf.all.forwarding";
+
+/// What CoreRouter keeps in the kernel while the config does not set the
+/// parameter (G1.26i). A router is the node that forwards packets not
+/// addressed to itself (RFC 4861 §2.1; RFC 1812 §2.2.8.1), and RouterOS
+/// ships `/ip settings ip-forward=yes` and `/ipv6 settings forward=yes`.
+/// Linux boots as a host (RFC 1122 §3.1: the gateway function of a host
+/// MUST default to off), so a new install, and the live image, would not
+/// route before a profile was applied. `system.tuning.set` with 0 still
+/// turns either family off.
+pub const DEFAULTS: &[(&str, i64)] = &[(IP_FORWARD, 1), (IPV6_FORWARDING, 1)];
+
+/// CoreRouter's own default of `name` (see [`DEFAULTS`]).
+pub fn default_of(name: &str) -> Option<i64> {
+    DEFAULTS.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
 }
 
 /// Tab of the Tuning window a parameter belongs to.
@@ -183,8 +214,8 @@ pub const PARAMS: &[Param] = &[
         None,
     )),
     init_ns(p("net.core.dev_weight", SEC_RX, (16, 10_000), "packets", Some(64))),
-    choice("net.ipv4.ip_forward", SEC_ROUTING, OFF_ON, 0),
-    choice("net.ipv6.conf.all.forwarding", SEC_ROUTING, OFF_ON, 0),
+    choice(IP_FORWARD, SEC_ROUTING, OFF_ON, 0),
+    choice(IPV6_FORWARDING, SEC_ROUTING, OFF_ON, 0),
     choice("net.ipv4.conf.all.rp_filter", SEC_ROUTING, RP_FILTER, 0),
     choice("net.ipv4.conf.default.rp_filter", SEC_ROUTING, RP_FILTER, 0),
     choice("net.ipv4.fib_multipath_hash_policy", SEC_ROUTING, HASH, 0),
@@ -467,6 +498,7 @@ pub const SEC_ISOLATION: &str = "CPU isolation";
 pub const SEC_POWER: &str = "Power saving";
 pub const SEC_IOMMU: &str = "IOMMU";
 pub const SEC_SECURITY: &str = "Security";
+pub const SEC_HARDWARE: &str = "Hardware";
 
 /// The kernel command-line parameters of the Boot tab, in display order.
 pub const BOOT_PARAMS: &[BootParam] = &[
@@ -511,6 +543,14 @@ pub const BOOT_PARAMS: &[BootParam] = &[
         section: SEC_SECURITY,
         kind: BootKind::Choice(&["auto", "auto,nosmt", "off"]),
         danger: true,
+    },
+    // G1.6zf: read by `corerouter-init`, not by the kernel: whether it looks
+    // for the motherboard's sensor chip (a probe of I/O ports).
+    BootParam {
+        name: "corerouter.sensors",
+        section: SEC_HARDWARE,
+        kind: BootKind::Choice(&["auto", "on", "off"]),
+        danger: false,
     },
 ];
 
@@ -720,5 +760,37 @@ mod tests {
             value_text(param("net.ipv4.conf.all.rp_filter").unwrap(), 2),
             "2 (loose)"
         );
+    }
+
+    /// G1.26i: with nothing configured the router forwards IPv4 and IPv6; a
+    /// config written before this (no forwarding entry, or the 1 a profile
+    /// wrote) loads the same and means the same; an explicit 0 stays 0.
+    #[test]
+    fn a_router_forwards_unless_the_config_says_no() {
+        for (name, value) in DEFAULTS {
+            let p = param(name).expect("a default is a catalog parameter");
+            assert!((p.min..=p.max).contains(value), "{name}");
+            assert_eq!(default_of(name), Some(*value));
+        }
+        assert_eq!(default_of("net.core.netdev_budget"), None);
+        let fresh = Tuning::default();
+        assert_eq!(fresh.effective_sysctl().get(IP_FORWARD), Some(&1));
+        assert_eq!(fresh.effective_sysctl().get(IPV6_FORWARDING), Some(&1));
+        // The defaults are not written into the config.
+        assert_eq!(serde_json::to_string(&fresh).unwrap(), "{}");
+        // A router that applied a profile before G1.26i.
+        let old: Tuning = serde_json::from_str(
+            r#"{"sysctl": {"net.ipv4.ip_forward": 1, "net.core.netdev_budget": 600}}"#,
+        )
+        .unwrap();
+        let eff = old.effective_sysctl();
+        assert_eq!(eff.get(IP_FORWARD), Some(&1));
+        assert_eq!(eff.get(IPV6_FORWARDING), Some(&1));
+        assert_eq!(eff.get("net.core.netdev_budget"), Some(&600));
+        // The operator's 0 wins, for each family on its own.
+        let off: Tuning =
+            serde_json::from_str(r#"{"sysctl": {"net.ipv4.ip_forward": 0}}"#).unwrap();
+        assert_eq!(off.effective_sysctl().get(IP_FORWARD), Some(&0));
+        assert_eq!(off.effective_sysctl().get(IPV6_FORWARDING), Some(&1));
     }
 }

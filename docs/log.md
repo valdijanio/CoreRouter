@@ -9919,3 +9919,283 @@ continuação indentadas).
 
   Não conferido: hardware real. No notebook do relato a ISO ainda não chegou ao kernel (o firmware
   responde "boot failed" antes); essa causa está em investigação e não é esta gap.
+
+- 2026-11-11 — G1.6zd: Boot limpo na tela. O primeiro boot num notebook real (Lenovo LOQ 15IRH8, Raptor Lake-P) mostrou,
+  antes do setup, quatro linhas de erro do i915 (`GuC firmware i915/adlp_guc_70.bin: fetch failed
+  -ENOENT` … `Failed to initialize GPU, declaring it wedged!`) e uma do som (`snd_hda_intel …
+  Cannot probe codecs, giving up`). Causa: o i915 era `=y` e sondava antes do `/` (a mesma
+  pegadinha do `ice`, G1.6j), a imagem não tinha `lib/firmware/i915`, e o `x86_64_defconfig` liga
+  `CONFIG_SOUND` (34 símbolos `SND*`).
+
+  O que entrou:
+
+  - `CONFIG_DRM_I915=m` e `# CONFIG_SOUND is not set` em `os/board/x86_64/linux.fragment` (vale
+    para a imagem e para o kernel do instalador, que herda o `.config`);
+  - o PID 1 (`apps/corerouter-init/src/modules.rs`) carrega, depois dos drivers de rede, o driver
+    de tela que casa com a placa (`kernel/drivers/gpu/drm/`). O boot não espera por essa segunda
+    passada; até ela terminar o console fica no `simpledrm` (G1.6zc);
+  - os 46 arquivos de firmware que o i915 declara (GuC, HuC, DMC, GSC; 11 257 968 B crus,
+    `LICENSE.i915`) em `os/package/corerouter-firmware/firmware.lock`; a trava agora cobre os
+    drivers de rede e de tela (`xtask/src/os/firmware.rs`);
+  - travas: `os check` e o build reprovam um i915 embutido (`REQUIRED_MODULES`), um kernel com
+    `CONFIG_SOUND` (`KERNEL_OFF`, na imagem e no instalador) e uma `firmware.lock` sem `i915/`;
+  - o PID 1 (`apps/corerouter-init/src/pid1.rs`) espera o console esvaziar (`tcdrain`, até 1 s)
+    antes de encerrar os serviços e antes do `reboot(2)`. Sem isso a última linha do console
+    serial (o motivo do reboot) podia sair cortada: quando o shell de manutenção, líder da sessão
+    do `ttyS0`, sai, o kernel descarta o que ainda estava na fila da UART
+    (`tty_jobctrl.c:265-275` → `tty_ldisc.c:700` → `serial_core.c:685`, 6.18.59). Corrida antiga,
+    não causada pelo i915; deixou o `ab-test --firmware seabios` vermelho uma vez nesta branch.
+
+  Decisão (detalhe em `docs/os-image.md`, "Tela: `i915` em módulo, sem som"): `i915.enable_guc=0`
+  foi descartado porque o parâmetro é `unsafe` e marca o kernel (`TAINT_USER`,
+  `i915_params.c:95`, `kernel/params.c:108-111`, 6.18.59); tirar o i915 e ficar só no `simpledrm`
+  fica como alternativa.
+
+  Conferido (**medido**, QEMU/KVM q35, 2026-11-11, telas em `docs/changes/G1.6zd-screenshots/`):
+
+  - build de laboratório com `CONFIG_DRM_BOCHS=m` (a VGA do QEMU; o QEMU não emula GPU Intel): em
+    UEFI o log traz `driver bochs loaded in 23 ms` depois da linha da varredura das portas, e a
+    tela segue com o aviso do primeiro boot, no disco instalado e na ISO live (25 ms). O `bochs`
+    não ficou na imagem;
+  - imagem final: telas do disco em UEFI (VGA padrão e virtio-gpu), em BIOS e da ISO em UEFI;
+    `.config` da imagem e do instalador com `DRM_I915=m` e sem `SOUND`; a `firmware.lock` refeita
+    a partir do build novo sai idêntica;
+  - `install-test` e `ab-test` nos dois firmwares, `boot-test` e `boot-test --efi`: verdes, na
+    imagem refeita com a espera do console;
+  - espera do console: com a saída serial segurada (^S) e um SIGTERM no PID 1, antes da correção
+    3 de 3 rodadas perdem a linha `reboot: stopping services`; depois, 3 de 3 a mostram.
+
+  Conferido no hardware (**medido**, Lenovo LOQ 15IRH8, ISO live desta branch, log do sistema lido
+  pelo canal de controle): `driver i915 loaded in 1040 ms`, depois das portas; `Finished loading
+  DMC firmware i915/adlp_dmc.bin (v2.20)`, `GuC firmware i915/adlp_guc_70.bin version 70.49.4`,
+  `HuC firmware i915/tgl_huc.bin version 7.9.3`, `GUC: submission enabled`, `fbcon: i915drmfb
+  (fb0) is primary device`; nenhuma linha `GuC … failed`, `declaring it wedged` nem `snd_hda`;
+  canal de controle respondendo 3,370 s depois do início do kernel.
+
+  Custo (**medido**, antes = G1.6zc): `bzImage` 20 489 216 → 18 371 584 B (−2,02 MiB);
+  `rootfs.squashfs` 49 942 528 → 56 094 720 B (+5,87 MiB: firmware e `i915.ko`);
+  `live-modules.img` 3 870 720 → 5 607 424 B; `corerouter.crpkg` 70 829 654 → 74 909 271 B; ISO
+  136 036 352 → 139 735 040 B (+3,53 MiB); kernel → daemon pronto 0,94 s → 0,93–0,94 s (sem
+  mudança).
+
+  Não conferido: a tela do notebook no instante em que o console passa do `simpledrm` para o i915
+  (o log mostra a troca; se pisca, só olhando). Sobram no log dele, em nível de informação, `unusable
+  PPS, disabling eDP` e `Transparent Hugepage support is recommended` do i915. A linha `ACPI BIOS
+  Error … _UPC … AE_ALREADY_EXISTS` é da tabela ACPI do fabricante e continua. Em Meteor Lake o
+  GSC depende do MEI (`CONFIG_INTEL_MEI_GSC_PROXY` não está ligado): pode sobrar aviso, não
+  testado. Vídeo Intel de outras gerações e AMD/Nvidia: não testados (ficam no `simpledrm`).
+
+  Wi-Fi (pedido do dono, 2026-11-11): a imagem não tem driver nem firmware de placa Wi-Fi e o
+  modelo só tem portas Ethernet. Pesquisa resumida: o MikroTik só entrega o `wireless` legado em
+  x86/CHR (os `wifi-qcom*` são arm/arm64); OPNsense e pfSense recomendam AP externo; placa Intel
+  de notebook só faz AP em 2,4 GHz. Escolha do dono: modo estação primeiro (G1.30), AP como gap
+  futura (G1.30a). Um controlador de APs próprio (não o protocolo do CAPsMAN, decisão do G5) só
+  faz sentido depois da G1.30a.
+
+- 2026-11-11 — G0.3f: O aviso "Login sem senha" não inunda mais o log, e o log não chama de "Alterado" o que não mudou
+  nada. Achado no notebook de teste (ISO live): a janela Log tinha dezenas de linhas iguais no
+  mesmo segundo (a CLI abre uma conexão por comando), e "Alterado: /system install test" a cada
+  abertura da janela Install to Disk.
+
+  **Aviso agrupado.** `Session::log_event_grouped(chave, …)` (engine, `logging.rs`) é o
+  agrupamento do motor de log para uma fonte que repete: a primeira linha de uma chave sai na
+  hora; as repetições são contadas e viram uma linha só quando a janela fecha ("Login sem senha:
+  usuário admin de 192.168.0.180 (tls); defina uma senha (user.set) — mais 29 vezes nos últimos
+  30 s"). As janelas são as do "last message repeated N times" do syslogd BSD: 30 s, depois
+  2 min, depois 10 min enquanto durar; depois de uma janela sem repetição a próxima ocorrência é
+  linha de novo, e com 10 min de silêncio o grupo recomeça. O login sem senha usa a chave conta +
+  origem (IPv4, ou o /64 no IPv6, como a contagem de falhas). O log continua só de acréscimo:
+  `log.print since`, o syslog remoto e o disco veem as mesmas linhas, e a GUI não mudou. Estado
+  limitado: 256 grupos; o que chega com a tabela cheia tira o grupo mais quieto (a contagem dele
+  sai antes). O relógio das janelas é o monotônico do HAL quando existe (um passo do NTP não fecha
+  nem estica janela). O selo "admin: no password" da barra, a linha da CLI/MCP e a verificação de
+  saúde `auth.no_password` continuam como antes. O `log::warn!` do processo segue a mesma regra.
+
+  **"Alterado" só para mudança.** O `cmd!` tinha duas formas, consulta ou mutação, e tudo que
+  pedia o grupo `write` entrava no journal como "Alterado: …". Agora:
+
+  - `cmd!(quiet …)`: pede `write`, não entra no journal nem no log. É para o que só olha ou
+    testa: `system.install.test`, `system.install.rescan`, `system.package.check`, e os dois que
+    estavam numa lista à parte (`WRITE_QUERIES`, removida): `config.mode.set` e
+    `system.package.upload.chunk`. O grupo exigido sai do `CommandSpec` (`writes`).
+  - comando com journal que não escreveu na config (reboot, flush de cache, renew, kill de
+    conexão, reset de contadores: ~60 comandos, **estimado**) aparece como "Executado: /ip dns cache flush". A
+    regra é uma só, sem marcar comando por comando: "Alterado" se o comando escreveu na config
+    (a geração do `ConfigStore` mudou ou saiu revisão) ou se o verbo é de mudança (`add`, `set`,
+    `remove`, `move`, `enable`, `disable`, `unset`: as contas ficam fora do store).
+
+  Como testar: `corerouter-daemon --config-dir <dir> --control 7941 --listen 127.0.0.1:8741`,
+  30× `COREROUTER_PASSWORD= corerouter-cli --connect tls://127.0.0.1:8741 --user admin run
+  interface.list`, e `corerouter-cli --connect 127.0.0.1:7941 run log.print`: uma linha na hora, a
+  contagem 30 s depois. Conferido assim (**medido**, 2026-11-11): 37 logins em três rajadas = 3
+  linhas (a primeira, "mais 30 vezes nos últimos 30 s", "mais 6 vezes nos últimos 2 min"); antes
+  seriam 37. Tela em `docs/changes/G0.3f-screenshots/log-agrupado.png`.
+
+- 2026-11-11 — G1.6ze: ISO live igual ao disco instalado em Interfaces, e sem linhas de erro ao ligar uma placa. Dois
+  defeitos vistos num notebook real (Lenovo LOQ 15IRH8) com a ISO live:
+
+  1. `interface.list` trazia `bond0`, `dummy0`, `erspan0`, `gre0`, `gretap0`, `ip6gre0`,
+     `ip6tnl0`, `sit0` e `tunl0` além das portas. Causa: o kernel da ISO é outro pacote do
+     Buildroot (`corerouter-installer`) e as duas correções da G1.6m não chegavam nele. O
+     `CONFIG_CMDLINE` do `installer.fragment` substitui o da imagem e não tinha
+     `bonding.max_bonds=0 dummy.numdummies=0`; e o `BR2_GLOBAL_PATCH_DIR` só entrega a um pacote
+     a pasta `patches/<nome do pacote>`, então o kernel do instalador era o tarball puro
+     (`.applied_patches_list` vazio, `sysctl_fb_tunnels_only_for_init_net = 0`).
+  2. Ao ligar um adaptador USB com o live rodando, dez linhas `Falhou: /interface set
+     disabled=false name=ether2 — parameter 'name': no interface 'ether2'` no log do roteador.
+     Causa: o daemon só adota a porta nova depois de três leituras com o mesmo nome (~3 s, G1.6t)
+     e o PID 1 repetia o `interface.set` a cada 250 ms até lá. Reproduzido no QEMU com a ISO
+     antiga: as mesmas dez linhas.
+
+  O que entrou:
+
+  - `installer.fragment` e `INSTALLER_KERNEL` (xtask) com os dois parâmetros;
+    `corerouter-installer.mk` aplica `os/patches/linux` num `POST_PATCH_HOOKS`;
+  - PID 1 (`apps/corerouter-init/src/plan.rs`, `live_port_commands`; `pid1.rs`, `live_port`): lê
+    `interface.list` e `ip.dhcp-client.list` e manda só o que falta. A porta que ele acabou de
+    nomear ele mesmo adota (`interface.ethernet.adopt`), depois liga e cria o cliente DHCP; a
+    porta plugada de novo, que já tem cliente, não recebe nada (antes: um `ip.dhcp-client.add`
+    recusado). O primeiro boot do live usa o mesmo caminho;
+  - travas: `os check` exige os dois parâmetros nas duas linhas de comando e o gancho de patches
+    no `.mk`; o build apaga uma árvore de kernel extraída sem os patches
+    (`corerouter-installer-dirclean`) e reprova se o `.applied_patches_list` de qualquer das duas
+    não tiver todos; o `install-test` reprova uma ISO live cujo `interface.list` tenha algo além
+    de `etherN` e `lo`, e qualquer linha de nível erro no log do live (no boot e depois de plugar
+    a placa).
+
+  Conferido (**medido**, QEMU/KVM q35, 2026-11-11, imagem desta branch):
+
+  - ISO antiga com as travas novas: `install-test --only live-modules` reprova com `card plugged
+    into the live image: 10 error lines in the router's log: Falhou: /interface set
+    disabled=false name=ether2 …` (o defeito do notebook, reproduzido);
+  - ISO nova, `install-test` em OVMF e em SeaBIOS: `live: interface.list: ether1 lo`; placa
+    plugada no live → endereço por DHCP em 1665 ms (OVMF) e 2263 ms (SeaBIOS), contra 4253 ms
+    na ISO antiga (a espera de ~3 s pela adoção saiu); nenhuma linha de erro no log;
+  - à mão, ISO live em BIOS com um adaptador USB (`usb-net`, driver `cdc_ether`) plugado pelo
+    monitor do QEMU, como no notebook: `interface.list` = `ether1`, `ether2`, `lo`; o log traz
+    `Alterado: /interface ethernet adopt name=ether2`, `/interface set disabled=false`,
+    `/ip dhcp-client add …` e o lease `10.0.3.15/24`; `log.print level=error` vazio. Tirado e
+    plugado de novo: volta como `ether2` com o mesmo cliente, sem linha de erro;
+  - o build apagou sozinho a árvore do kernel do instalador extraída sem os patches (`make
+    corerouter-installer-dirclean`) e aplicou os dois; `.applied_patches_list` das duas árvores
+    com `0001` e `0002`;
+  - `boot-test` e `boot-test --efi`: verdes.
+
+  Custo (**medido**): nenhum byte. `BOOTX64.EFI` do instalador 19 633 152 B, `live-modules.img`
+  5 607 424 B e ISO 139 735 040 B, iguais aos da G1.6zd; a imagem do disco não muda. O build
+  refaz o kernel do instalador uma vez (766 s o build inteiro, com a GUI recompilada).
+
+  Não conferido: o notebook real (a ISO nova não foi gravada nele); adaptador `r8152` (o QEMU não
+  emula; o caminho no PID 1 é o mesmo de qualquer placa que aparece depois do boot).
+
+- 2026-11-11 — G1.6zh: Relógio certo no primeiro boot. No notebook de teste (ISO live) o `system.ntp.client.get` mostrava
+  o cliente desligado e `clock: "not-set"`, embora o DHCP tivesse entregue um servidor NTP
+  (`primary_ntp`, com `use_peer_ntp` ligado): os servidores do DHCP só valem com o cliente ligado,
+  e no live ele nem podia ser ligado (o comando não estava na lista do que o live muda).
+
+  O que entrou:
+
+  - **Primeiro boot com o cliente NTP ligado, sem servidor configurado.** O serviço `ntp-client` do
+    daemon, na partida, roda `system.ntp.client.set enabled=yes` quando há `--config-dir`, nada foi
+    restaurado e a config do cliente ainda é a padrão. Ele pergunta só aos servidores que os
+    clientes DHCP aprendem (opção 42, RFC 2132 §8.3): nenhum pool público embutido (RFC 8633 §6.2,
+    RFC 4085), o roteador não fala com terceiros que o operador não indicou.
+  - **Config já gravada não muda.** O `Default` do modelo continua desligado: um arquivo sem a chave
+    `ntp_client` (gravado antes disto) segue desligado, e quem desligar depois fica desligado. Não
+    houve mudança de formato, então não há migração; há teste com o arquivo antigo.
+  - **`system.ntp.client.set enabled=yes` sem servidor e sem cliente DHCP é aceito**, com `warning`
+    na resposta (antes era recusado; o estado já existia ao remover o último cliente DHCP).
+  - **O servidor que o lease traz é perguntado na hora.** A rodada sem a quem perguntar não envia
+    nada e não conta para os 64 s mínimos entre rodadas (RFC 4330 §5); antes o primeiro acerto
+    vinha 64 s depois.
+  - **ISO live:** `system.ntp.client.*` entrou na lista do que o live pode mudar.
+  - **Saúde (`ntp`) avisa "relógio não ajustado" com a ação:** sem a quem perguntar (`no-server`:
+    defina um servidor ou use um DHCP que entregue a opção 42); sem resposta; acerto acima de
+    1000 s esperando confirmação (diz quanto e como confirmar); resposta recusada; medindo sem
+    corrigir e mais de 1 s fora; cliente desligado com a data do roteador anterior a 2026.
+  - **Log:** "NTP: sem servidor: nenhum configurado e nenhum cliente DHCP entregou um (opção 42)"
+    é `info` (é como um roteador novo nasce), não mais aviso.
+
+  De onde vem a hora antes do NTP (lido no fonte do kernel 6.18.59 da imagem): em x86 o kernel põe
+  a hora do CMOS no relógio do sistema em `timekeeping_init` → `read_persistent_clock64` →
+  `mach_get_cmos_time`, com ou sem `CONFIG_RTC_HCTOSYS` (desligado na imagem; ele só repetiria a
+  leitura). `clock: "not-set"` quer dizer "o cliente NTP não está mexendo no relógio", não "relógio
+  sem hora": no notebook o relógio já tinha a hora do CMOS. Sincronizado, o kernel regrava o CMOS em
+  UTC a cada ~11 min. Nada a mudar em `os/`. Tudo em `docs/ntp.md` ("Primeiro boot").
+
+  Como testar: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
+  corerouter-daemon --test netns_ntp_first_boot` (dois daemons: um serve DHCP com a opção 42 e NTP,
+  o outro é o roteador novo, sem nenhum comando de NTP). À mão: `corerouter-daemon --config-dir
+  <pasta nova> --control 7945`, `system.ntp.client.get` (ligado, `waiting`, "no server to ask"),
+  `ip.dhcp-client.add interface=ether1`, e System › NTP Client na GUI.
+
+  Conferido (**medido**, 2026-11-11): no namespace, sincronizado 3 s depois de o daemon subir; na
+  VM do laboratório como root de verdade, `clock: slewing` 2,8 s depois do `ip.dhcp-client.add`
+  (o relógio do sistema sendo disciplinado); no laboratório virtual, com o servidor DHCP do
+  `proto-dhcp` entregando 100.64.1.1, sincronizado em 2,3 s. Antes: nunca (cliente desligado), ou
+  64 s depois do lease com o cliente ligado à mão antes do DHCP. Tela em
+  `docs/changes/G1.6zh-screenshots/ntp-client-primeiro-boot.png`.
+
+- 2026-11-11 — G1.26i: Um CoreRouter recém-instalado, e a ISO live, roteiam sem configuração: o encaminhamento IPv4 e
+  IPv6 passou a ser o padrão do CoreRouter (`corerouter_model::tuning::DEFAULTS`), aplicado pelo
+  HAL do Linux em todo `apply` (o primeiro é o da partida), como o RouterOS (`/ip settings
+  ip-forward=yes`, `/ipv6 settings forward=yes`). Antes só aplicar um perfil de tuning ligava o
+  `ip_forward`, e a janela System › Tuning de uma instalação nova abria com o achado crítico "o
+  encaminhamento IPv4 está desligado" (visto na ISO live num notebook, 2026-11-11).
+
+  - O 0 do operador vale, por família (`system.tuning.set name=net.ipv4.ip_forward value=0`), com o
+    achado crítico e o botão que religa; `unset` volta ao padrão (1). Achado novo, aviso, para o
+    IPv6 desligado.
+  - O formato da config não mudou: o padrão não é gravado nela. Config antiga carrega igual.
+  - Melhor esforço: kernel sem IPv6 ou `/proc/sys` só de leitura dá um aviso no log, uma vez, e
+    não recusa commit.
+  - IPv6, lido no fonte do kernel 6.18.59 da imagem: ligar o encaminhamento apaga as rotas de RA
+    das interfaces com `accept_ra` diferente de 2 (`addrconf_fixup_forwarding` →
+    `rt6_purge_dflt_routers`) e o kernel deixa de pedir RA. O HAL acerta o `accept_ra` das
+    interfaces que já existem **antes** de ligar, e envia ele mesmo um Router Solicitation
+    (RFC 4861 §4.1, §6.3.7) quando uma porta já no ar passa a aceitar RA, em vez de esperar o RA
+    periódico (até 600 s).
+  - Janela: selo `router default` na coluna Configurado; o Resumo de uma máquina sem nada
+    configurado diz "nada foi configurado ainda, valem os valores do próprio kernel. N parâmetros
+    mudam ao aplicar este perfil" em vez de "N parâmetros diferem deste perfil".
+  - ISO live: roteia como o disco instalado, e aceita `system.tuning.set`, `unset` e
+    `profile.apply` (kernel, em tempo de execução, nada persiste) e `config.safe-mode.*`. Portas,
+    CPU e boot continuam recusados na live.
+  - `cargo xtask os forward-test`: três VMs da imagem (`a ── r ── b`) e a ISO live, no QEMU.
+
+  Como testar:
+
+  - `cargo test -p corerouter-model tuning`, `cargo test -p corerouter-engine --lib tuning`,
+    `cargo test -p corerouter-ui tests::tuning`;
+  - `cargo xtask netns` (`netns_tuning` do hal-linux e `netns_dhcp6` do daemon);
+  - `cargo xtask os build && cargo xtask os forward-test`;
+  - na GUI: System › Tuning, aba Kernel, seção Routing.
+
+  Números (**medido**, 2026-11-11, 32 CPUs):
+
+  - custo por `apply`: duas leituras de `/proc/sys`, 28 µs no host (laço de 100 000 em Python, o
+    teto); nada por pacote;
+  - imagem no QEMU/KVM, kernel 6.18.59 (`cargo xtask os forward-test`, 98,8 s):
+    - `ip_forward` / `ipv6.conf.all.forwarding` na partida, sem config: 1 / 1 (disco instalado e
+      ISO live);
+    - `a → b` por `r`: IPv4 3/3 com `ttl=63`, 0,57 a 1,12 ms; IPv6 3/3, média 1,69 ms; a primeira
+      resposta roteada 5,3 s depois dos endereços (inclui ARP, DAD e os três pings de cada sentido);
+    - com `ip_forward = 0` em `r`: 0/3 no IPv4, IPv6 continua; depois do `unset`, 3/3;
+    - o que o kernel deixa ao ligar: `accept_redirects` (all) 0, `send_redirects` 1, `rp_filter` 0;
+    - o perfil Balanced mudaria 23 parâmetros nessa máquina (eram 24 com o `ip_forward`): 3 de
+      recepção, 4 de roteamento, 5 de conntrack, 6 de vizinhos, 2 de estabilidade e 3 do plano de
+      controle; 10 deles são calculados da RAM e das portas;
+  - build da imagem do zero, com o ccache copiado: 2588,7 s.
+
+  Documentação: `docs/tuning.md`, seção "Encaminhamento ligado por padrão (G1.26i)".
+
+- 2026-11-11 — processo-fold-conta-md: A fila de entrada (`scripts/land.sh`) voltou a consolidar os `docs/changes/` só de tempos em
+  tempos. A conta dos pendentes somava as pastas `<id>-screenshots`, que ficam em `docs/changes/`
+  depois do fold: com 37 pastas (**medido**, `origin/main` em 2026-11-11) a conta nunca ficava
+  abaixo de `FOLD_MIN` (10) e cada lote ganhava um PR de fold só seu (#584, #587 e #589 na mesma
+  noite, cada um com o título "38 arquivos" e um arquivo consolidado). Agora contam só os `.md`
+  que não são o `README.md`: na `origin/main` a conta passa de 37 para 0 (**medido**).
+
+  Como testar: `git ls-tree --name-only origin/main docs/changes/ | grep '\.md$' | grep -vc
+  '/README\.md$'` dá o número de arquivos pendentes; com menos de 10 a fila escreve "fold adiado:
+  N arquivo(s)" no fim do lote, e `scripts/land.sh --fold` consolida na hora.

@@ -13,7 +13,7 @@ use crate::system_resource::sensor_level;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "system.health.print", "Health", [], None,
-        "{} → [{name, chip, label, type: temperature|fan|voltage|power, value, unit, max, crit, state: ok|warning|error}]",
+        "{} → [{name, chip, label, type: temperature|fan|voltage|power, value, unit, max, crit, state: ok|warning|error, board: bool (read by the motherboard's sensor chip: an input the board does not wire reads anything, so it has no limits and is not the router's temperature)}]",
         always, print),
     cmd!(query "system.health.check", "Health Checks", [], None,
         "{} → {status: ok|warning|error, warnings, errors, checks: [{key, name, severity: ok|warning|error|unknown, value, reason, action}]}",
@@ -51,6 +51,7 @@ fn print(s: &mut Session, _: &Value) -> Result<Value> {
                     "max": x.max.map(r1),
                     "crit": x.crit.map(r1),
                     "state": sensor_level(x).as_str(),
+                    "board": x.board,
                 })
             })
             .collect(),
@@ -104,7 +105,7 @@ mod tests {
         assert_eq!(by("auth.no_password")["severity"], "ok", "the lab has no admin yet");
         assert_eq!(by("nic.errors")["severity"], "warning", "ether4's bad cable");
         assert!(by("nic.errors")["reason"].as_str().unwrap().contains("ether4"));
-        assert_eq!(by("ntp")["severity"], "ok", "NTP off is the factory default (G4.6i)");
+        assert_eq!(by("ntp")["severity"], "ok", "NTP is off in the lab session; a router's first boot turns it on (G1.6zh)");
         assert_eq!(by("services")["severity"], "unknown", "no supervisor in the lab");
         assert_eq!(by("bgp.end-of-rib")["severity"], "unknown", "no routing daemon in the lab (G3.9fj)");
         assert_eq!(by("bgp.gr-bfd")["severity"], "unknown");
@@ -147,6 +148,45 @@ mod tests {
         lab["lab"] = json!(true);
         crate::package::feed_status(&mut s, lab);
         assert_eq!(check(&mut s)["severity"], "unknown");
+    }
+
+    /// G1.6zf: a Super-I/O input the board does not wire reads 127 °C. It is
+    /// listed, and it is neither the router's temperature nor a health alarm.
+    #[test]
+    fn a_motherboard_chips_open_input_is_not_the_routers_temperature() {
+        use corerouter_hal::system_resource::{Sample, Sensor, SensorKind};
+        use crate::system_resource::{hottest, temperatures};
+        let t = |chip: &str, label: &str, value, crit, board| Sensor {
+            chip: chip.into(),
+            label: label.into(),
+            kind: SensorKind::Temperature,
+            value,
+            crit,
+            board,
+            ..Sensor::default()
+        };
+        let mut s = Sample {
+            sensors: vec![
+                t("k10temp", "Tctl", 61.0, None, false),
+                t("nct6798", "AUXTIN1", 127.0, None, true),
+                t("nvme0", "Composite", 44.0, Some(90.0), false),
+                Sensor { chip: "nct6798".into(), label: "fan2".into(), kind: SensorKind::Fan, value: 0.0, board: true, ..Sensor::default() },
+            ],
+            ..Sample::default()
+        };
+        assert_eq!(hottest(&s).unwrap().2, "k10temp Tctl");
+        assert_eq!(temperatures(&s).count(), 2);
+        // A machine whose only temperatures are the board's: better than none.
+        s.sensors.retain(|x| x.board);
+        assert_eq!(hottest(&s).unwrap().2, "nct6798 AUXTIN1");
+        s.sensors.clear();
+        assert!(hottest(&s).is_none());
+        // The lab's rows say which are the board's.
+        let mut lab = Session::virtual_lab();
+        let v = lab.execute("system.health.print", &json!({})).unwrap();
+        let rows = v.as_array().unwrap();
+        assert!(rows.iter().any(|r| r["chip"] == "board" && r["board"] == true));
+        assert!(rows.iter().all(|r| r["chip"] == "board" || r["board"] == false));
     }
 
     #[test]

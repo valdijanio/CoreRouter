@@ -23,6 +23,9 @@
 //!   Buildroot tree (package versions newer than the LTS branch ships, FRR
 //!   10.7.1) and extracts it again when those patches change; `frr-test`
 //!   runs OSPF/SR/LDP/BFD between two guests of the image (`os/frr.rs`).
+//! - G1.26i: `forward-test` routes IPv4 and IPv6 between two guests through
+//!   a third nobody tuned, and reads the live ISO's forwarding
+//!   (`os/forward.rs`).
 //! - processo: everything built lives in one directory per checkout, by
 //!   default on the build disk outside the repository (`os/out.rs`), and
 //!   `make all` runs packages in parallel by default.
@@ -40,6 +43,7 @@ use crate::vm_lab::{download, sha256_file};
 
 mod ab;
 mod firmware;
+mod forward;
 mod frr;
 mod hotplug;
 mod install;
@@ -138,6 +142,27 @@ const REQUIRED_MODULES: &[&str] = &[
     "CONFIG_PCNET32",
     "CONFIG_DRM_I915",
 ];
+/// G1.6zf: the sensors System › Health reads, built in: these drivers bind
+/// only to a device the machine enumerates (CPUID, PCI, an NVMe controller,
+/// a SATA disk). A notebook showed one ACPI zone and no CPU or NVMe
+/// temperature: none of them was on.
+const SENSORS_BUILT_IN: &[&str] = &[
+    "CONFIG_SENSORS_CORETEMP",
+    "CONFIG_SENSORS_K10TEMP",
+    "CONFIG_NVME_HWMON",
+    "CONFIG_SENSORS_DRIVETEMP",
+];
+/// G1.6zf: the motherboard's Super-I/O drivers, (kernel symbol, module).
+/// Modules, never built in: each writes to I/O ports 0x2e/0x4e to find its
+/// chip, so PID 1 decides when (never in a VM, `corerouter.sensors=off`).
+/// The names are `SENSOR_MODULES` of `corerouter-init`.
+const SENSOR_MODULES: &[(&str, &str)] = &[
+    ("CONFIG_SENSORS_NCT6775", "nct6775"),
+    ("CONFIG_SENSORS_NCT6683", "nct6683"),
+    ("CONFIG_SENSORS_IT87", "it87"),
+    ("CONFIG_SENSORS_F71882FG", "f71882fg"),
+    ("CONFIG_SENSORS_W83627EHF", "w83627ehf"),
+];
 /// What the kernel must not have (`# … is not set` in the fragment, absent
 /// from the built `.config`). G1.6zd: a router plays no sound, and on a
 /// notebook `snd_hda_intel` wrote "Cannot probe codecs, giving up" on the
@@ -177,7 +202,7 @@ const REQUIRED_BR2: &[&str] = &[
 ];
 /// What the installer kernel's fragment must say (G1.6c).
 const INSTALLER_KERNEL: &[&str] = &[
-    "CONFIG_CMDLINE=\"console=tty0 console=ttyS0,115200 corerouter.mode=live panic=10 quiet\"",
+    "CONFIG_CMDLINE=\"console=tty0 console=ttyS0,115200 corerouter.mode=live bonding.max_bonds=0 dummy.numdummies=0 panic=10 quiet\"",
     "CONFIG_INITRAMFS_COMPRESSION_ZSTD=y",
     "# CONFIG_DEBUG_INFO_BTF is not set",
     // G1.6j: built in, or the installer would not show an E810 port.
@@ -186,6 +211,13 @@ const INSTALLER_KERNEL: &[&str] = &[
     // in this one (and the reverse). `livemods::SUFFIX`.
     "CONFIG_LOCALVERSION=\"-live\"",
 ];
+/// G1.6m, G1.6ze: on both kernels' command lines, or the built-in drivers
+/// create `bond0` and `dummy0` by themselves and the router lists them.
+const NO_KERNEL_DEVICES: [&str; 2] = ["bonding.max_bonds=0", "dummy.numdummies=0"];
+/// G1.6ze: what makes the installer's kernel take `os/patches/linux` (the
+/// tunnels' catch-all devices are turned off by one of them).
+const INSTALLER_PATCH_HOOK: &str =
+    "$(APPLY_PATCHES) $(@D) $(BR2_EXTERNAL_COREROUTER_PATH)/patches/linux \\*.patch";
 /// The modules `boot-test` and `install-test` see, by file name.
 const REQUIRED_MODULE_FILES: &[&str] = &["e100", "pcnet32"];
 /// The installer's boot image (El Torito counts 16-bit 512-byte sectors).
@@ -199,7 +231,7 @@ const GUEST_TLS_PORT: u16 = 8729;
 /// G1.6o: `ip.service www-ssl`, on in a new config of the image.
 const GUEST_WEB_PORT: u16 = 443;
 
-const USAGE: &str = "usage: cargo xtask os <build [--only crpkg] [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|push --to HOST:PORT [--user U] [--no-build] [--no-wait] [--confirm manual]|release-key <init|check> [--dir D]|release --tag vX.Y.Z [--key-dir D] [--dry-run] [--no-build] [--repo OWNER/NAME]|out-dir|boot-test [--efi] [--tcg] [--wifi] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--firmware ovmf|seabios] [--scenario update|push|no-confirm|bad-signature|bad-param|cross|cut|controllers]|install-test [--tcg] [--firmware ovmf|seabios] [--only live-modules]|frr-test [--tcg]|firmware-lock --tag T|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
+const USAGE: &str = "usage: cargo xtask os <build [--only crpkg] [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|push --to HOST:PORT [--user U] [--no-build] [--no-wait] [--confirm manual]|release-key <init|check> [--dir D]|release --tag vX.Y.Z [--key-dir D] [--dry-run] [--no-build] [--repo OWNER/NAME]|out-dir|boot-test [--efi] [--tcg] [--wifi] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--firmware ovmf|seabios] [--scenario update|push|no-confirm|bad-signature|bad-param|cross|cut|controllers]|install-test [--tcg] [--firmware ovmf|seabios] [--only live-modules]|frr-test [--tcg]|forward-test [--tcg] [--no-live]|firmware-lock --tag T|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
 
 pub fn main(root: &Path, args: &[String]) -> Outcome {
     let (sub, rest) = match args.split_first() {
@@ -212,6 +244,7 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
         "ab-test" => images_dir(root).and_then(|i| ab::ab_test(root, &i, rest)),
         "install-test" => images_dir(root).and_then(|i| install::install_test(root, &i, rest)),
         "frr-test" => images_dir(root).and_then(|i| frr::frr_test(root, &i, rest)),
+        "forward-test" => images_dir(root).and_then(|i| forward::forward_test(root, &i, rest)),
         "package" => images_dir(root).and_then(|i| package_cmd(root, &i, rest)),
         "firmware-lock" => images_dir(root).and_then(|i| {
             let target = i
@@ -497,6 +530,9 @@ pub fn check(os: &Path) -> Result<usize, String> {
         }
         n += 1;
     }
+    let init = std::fs::read_to_string(os.join("../apps/corerouter-init/src/modules.rs"))
+        .map_err(|e| format!("apps/corerouter-init/src/modules.rs: {e}"))?;
+    n += check_sensors(&fragment, &init)?;
     let nics = read("board/x86_64/nics.fragment")?;
     let wide = module_symbols(&nics);
     for want in REQUIRED_NICS {
@@ -553,6 +589,8 @@ pub fn check(os: &Path) -> Result<usize, String> {
     {
         return Err(format!("CONFIG_CMDLINE: needs init={INIT_PATH}"));
     }
+    no_kernel_devices("linux.fragment", cmdline)?;
+    n += 1;
     if !read("package/corerouter/corerouter.mk")?.contains(&format!("$(TARGET_DIR){INIT_PATH}")) {
         return Err(format!("corerouter.mk does not install {INIT_PATH}"));
     }
@@ -628,6 +666,76 @@ fn patches_in(dir: &Path) -> Result<(Vec<PathBuf>, String), String> {
     Ok((patches, hash))
 }
 
+/// G1.6zf: the fragment has the built-in sensors and the Super-I/O drivers as
+/// modules, and PID 1 (`init`: the text of its `modules.rs`) loads exactly
+/// those modules.
+fn check_sensors(fragment: &str, init: &str) -> Result<usize, String> {
+    let built_in = fragment_symbols(fragment);
+    if let Some(want) = SENSORS_BUILT_IN.iter().find(|s| !built_in.contains(s)) {
+        return Err(format!(
+            "linux.fragment: {want}=y is required (System › Health has no such sensor without it)"
+        ));
+    }
+    let modules = module_symbols(fragment);
+    for (symbol, _) in SENSOR_MODULES {
+        if !modules.contains(symbol) {
+            return Err(format!(
+                "linux.fragment: {symbol}=m is required (a module: it pokes I/O ports to find its chip, PID 1 decides when)"
+            ));
+        }
+    }
+    let list = init
+        .lines()
+        .find_map(|l| l.strip_prefix("pub const SENSOR_MODULES: ["))
+        .and_then(|l| l.split_once("] = [")?.1.strip_suffix("];"))
+        .ok_or("corerouter-init modules.rs: no `pub const SENSOR_MODULES: [&str; N] = [...];` on one line")?;
+    let mut loaded: Vec<&str> = list
+        .split(',')
+        .map(|m| m.trim().trim_matches('"'))
+        .collect();
+    let mut built: Vec<&str> = SENSOR_MODULES.iter().map(|(_, m)| *m).collect();
+    loaded.sort_unstable();
+    built.sort_unstable();
+    if loaded != built {
+        return Err(format!(
+            "corerouter-init loads the sensor modules {loaded:?}, the kernel builds {built:?}"
+        ));
+    }
+    Ok(SENSORS_BUILT_IN.len() + SENSOR_MODULES.len() + 1)
+}
+
+/// G1.6m, G1.6ze: the command line of `what` keeps the built-in drivers from
+/// creating devices of their own.
+fn no_kernel_devices(what: &str, cmdline: &str) -> Result<(), String> {
+    match NO_KERNEL_DEVICES
+        .iter()
+        .find(|p| !cmdline.split_whitespace().any(|w| w == **p))
+    {
+        Some(p) => Err(format!(
+            "{what}: CONFIG_CMDLINE needs '{p}' (the driver is built in and would create its own device)"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The patches of `patches` that Buildroot did not apply to the kernel tree
+/// `tree`, by file name (its `.applied_patches_list`, written by
+/// `support/scripts/apply-patches.sh`). G1.6ze: the installer's kernel was
+/// built from the plain tarball since the patches exist, and nothing said so.
+fn patches_missing(tree: &Path, patches: &[PathBuf]) -> Vec<String> {
+    let applied = std::fs::read_to_string(tree.join(".applied_patches_list")).unwrap_or_default();
+    let applied: Vec<&str> = applied
+        .lines()
+        .filter_map(|l| l.rsplit('/').next())
+        .collect();
+    patches
+        .iter()
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+        .filter(|n| !applied.contains(n))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// G1.6c: the installer's kernel, boot image and payload stay consistent.
 fn check_installer(os: &Path, genimage: &str, version: &str) -> Result<usize, String> {
     let read =
@@ -654,6 +762,11 @@ fn check_installer(os: &Path, genimage: &str, version: &str) -> Result<usize, St
     {
         return Err("installer.fragment: the installer runs from its initramfs (no root=)".into());
     }
+    no_kernel_devices(
+        "installer.fragment",
+        config_value(&frag, "CONFIG_CMDLINE").unwrap_or_default(),
+    )?;
+    n += 1;
     // The same kernel tarball as the image, with the same hash.
     let main = kernel_hash(&read("patches/linux/linux.hash")?, version);
     let inst = kernel_hash(
@@ -671,6 +784,15 @@ fn check_installer(os: &Path, genimage: &str, version: &str) -> Result<usize, St
         return Err(
             "corerouter-installer.mk: share the kernel download (DL_SUBDIR = linux)".into(),
         );
+    }
+    n += 1;
+    // G1.6ze: the same kernel source too, patches included.
+    if !mk.contains(INSTALLER_PATCH_HOOK)
+        || !mk.contains("COREROUTER_INSTALLER_POST_PATCH_HOOKS += ")
+    {
+        return Err(format!(
+            "corerouter-installer.mk: the installer's kernel must apply os/patches/linux ('{INSTALLER_PATCH_HOOK}' in a POST_PATCH hook)"
+        ));
     }
     n += 1;
     // G1.6za: the ISO's modules, with no link back to the build machine.
@@ -987,16 +1109,24 @@ pub(crate) fn build_with(
     // G1.6m: Buildroot applies `os/patches/linux/*.patch` only when it
     // extracts the kernel: changed patches need `linux-dirclean` (then a
     // full kernel build).
-    let (_, kpatches) = patches_in(&d.os.join("patches/linux"))?;
+    // G1.6ze: the installer's kernel takes the same patches; a tree
+    // extracted without them (before this) goes too.
+    let (kpatch_files, kpatches) = patches_in(&d.os.join("patches/linux"))?;
     let kstamp = d.out.join(".corerouter-linux-patches.sha256");
-    if std::fs::read_to_string(&kstamp).ok().as_deref() != Some(kpatches.as_str()) {
-        if d.out
-            .join("build")
-            .join(format!("linux-{version}"))
-            .exists()
-        {
-            make(&["linux-dirclean"], &[])?;
+    let changed = std::fs::read_to_string(&kstamp).ok().as_deref() != Some(kpatches.as_str());
+    let kernel_trees = [
+        (
+            d.out.join("build").join(format!("linux-{version}")),
+            "linux-dirclean",
+        ),
+        (installer_dir.clone(), "corerouter-installer-dirclean"),
+    ];
+    for (tree, dirclean) in &kernel_trees {
+        if tree.exists() && (changed || !patches_missing(tree, &kpatch_files).is_empty()) {
+            make(&[dirclean], &[])?;
         }
+    }
+    if changed {
         std::fs::write(&kstamp, &kpatches).map_err(|e| format!("{}: {e}", kstamp.display()))?;
     }
     // G3.4l: the same for `os/patches/frr/*.patch` (the ospfd TI-LFA fix):
@@ -1085,6 +1215,16 @@ pub(crate) fn build_with(
         }
     };
     make(&["all"], &top)?;
+    for (tree, _) in &kernel_trees {
+        let missing = patches_missing(tree, &kpatch_files);
+        if !missing.is_empty() {
+            return Err(format!(
+                "{}: built without os/patches/linux/{}",
+                tree.display(),
+                missing.join(", ")
+            ));
+        }
+    }
 
     let kconfig = std::fs::read_dir(d.out.join("build"))
         .map_err(|e| e.to_string())?
@@ -1130,6 +1270,7 @@ pub(crate) fn build_with(
     }
     let lost: Vec<&str> = REQUIRED_MODULES
         .iter()
+        .chain(SENSOR_MODULES.iter().map(|(symbol, _)| symbol))
         .filter(|s| !kc.lines().any(|l| l == format!("{s}=m")))
         .copied()
         .collect();
@@ -1190,7 +1331,13 @@ pub(crate) fn build_with(
             "the installer kernel ({boot} bytes) does not fit the boot image"
         ));
     }
-    let (mods, mods_size) = livemods::verify(&installer_dir, &version, REQUIRED_MODULE_FILES)?;
+    // G1.6zf: the live image looks for the motherboard's sensor chip too.
+    let live_required: Vec<&str> = REQUIRED_MODULE_FILES
+        .iter()
+        .copied()
+        .chain(SENSOR_MODULES.iter().map(|(_, module)| *module))
+        .collect();
+    let (mods, mods_size) = livemods::verify(&installer_dir, &version, &live_required)?;
     eprintln!(
         "   live modules: {mods} modules of {version}{}, {:.1} MiB raw",
         livemods::SUFFIX,
@@ -1521,6 +1668,31 @@ struct Report {
     idle_kib: Option<u64>,
 }
 
+/// A console line without its colour (G1.6zg): the SGR sequences
+/// (`ESC [ … m`) the image's consoles send by default are dropped, so the
+/// tests match the text a person reads. Anything else stays (the firmware's
+/// and GRUB's cursor sequences were always there).
+pub(crate) fn console_text(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(i) = rest.find("\u{1b}[") {
+        let (before, seq) = rest.split_at(i);
+        out.push_str(before);
+        let params = seq.get(2..).unwrap_or("");
+        let end = params
+            .find(|c: char| !(c.is_ascii_digit() || c == ';'))
+            .unwrap_or(params.len());
+        if params.get(end..).is_some_and(|r| r.starts_with('m')) {
+            rest = params.get(end + 1..).unwrap_or("");
+        } else {
+            out.push_str("\u{1b}[");
+            rest = params;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn parse_ready(line: &str) -> Option<f64> {
     let rest = line.split("corerouter-init: ready:").nth(1)?;
     let at = rest.split(", ").nth(1)?;
@@ -1573,6 +1745,17 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     cmd.arg("-monitor")
         .arg(format!("unix:{},server=on,wait=off", mon.display()));
     cmd.args(hotplug::QEMU_ARGS);
+    // G1.6zf: a second disk, NVMe, only to be read: its temperature must be
+    // in `system.health.print` (QEMU's says 50 °C).
+    let nvme = top.join("boot-test-nvme.raw");
+    std::fs::File::create(&nvme)
+        .and_then(|f| f.set_len(16 << 20))
+        .map_err(|e| format!("{}: {e}", nvme.display()))?;
+    cmd.arg("-drive").arg(format!(
+        "file={},if=none,id=sensor0,format=raw",
+        nvme.display()
+    ));
+    cmd.args(["-device", "nvme,drive=sensor0,serial=CRSENSOR0"]);
     let snapshot = if b.keep_config { "" } else { ",snapshot=on" };
     cmd.arg("-drive").arg(format!(
         "file={},if=virtio,format=raw{snapshot}",
@@ -1626,12 +1809,21 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("qemu-system-x86_64: {e}"))?;
-    let res = watch(&mut child, &b, (port, web_port), started, &log_path, &mon);
+    let res = watch(&mut child, &b, (port, web_port), started, &log_path, &mon).and_then(|r| {
+        // With --efi the guest has no address (the built-in command line).
+        let sensors = if b.efi {
+            "skipped: no address with --efi".to_owned()
+        } else {
+            sensors_check(root, &top, port)?
+        };
+        Ok((r, sensors))
+    });
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_file(&vars);
     let _ = std::fs::remove_file(&mon);
-    let (report, wall_ready, ping, web, hot) = res?;
+    let _ = std::fs::remove_file(&nvme);
+    let ((report, wall_ready, ping, web, hot), sensors) = res?;
     eprintln!("\nboot-test ok ({}):", if kvm { "KVM" } else { "TCG" });
     eprintln!(
         "  kernel start → daemon answers ping: {:.3} s (corerouter-init)",
@@ -1647,6 +1839,7 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
         eprintln!("    {l}");
     }
     eprintln!("  cards plugged in after boot (G1.6n, G1.6j): {hot}");
+    eprintln!("  sensors (G1.6zf):                   {sensors}");
     if let Some(kib) = report.idle_kib {
         eprintln!(
             "  idle memory in use:                 {:.1} MiB",
@@ -1654,6 +1847,56 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// G1.6zf: the image reads the temperature of what the machine has. QEMU has
+/// no CPU sensor, and its NVMe disk has one: `system.health.print`, asked as
+/// an operator does (`admin` over TLS), must list it.
+fn sensors_check(root: &Path, top: &Path, port: u16) -> Result<String, String> {
+    let cli = push::cli(root)?;
+    let home = top.join("boot-test-home");
+    let _ = std::fs::remove_dir_all(&home);
+    let who = install::Admin {
+        home: &home,
+        password: "",
+        strict: false,
+    };
+    // The first reading is the health service's, seconds after ready.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let got = loop {
+        let got =
+            install::cli_run(&cli, &who, port, "system.health.print", "{}").unwrap_or_else(|e| e);
+        let found = disk_temperatures(&got);
+        if !found.is_empty() || Instant::now() >= deadline {
+            break (found, got);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let _ = std::fs::remove_dir_all(&home);
+    match got {
+        (found, _) if !found.is_empty() => Ok(found.join(", ")),
+        (_, text) => Err(format!(
+            "G1.6zf: system.health.print has no temperature of the NVMe disk (CONFIG_NVME_HWMON off?): {}",
+            text.chars().take(600).collect::<String>()
+        )),
+    }
+}
+
+/// The NVMe temperatures of a `system.health.print` answer that make sense
+/// (QEMU's disk says 50 °C), as `chip label value`.
+fn disk_temperatures(answer: &str) -> Vec<String> {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(answer.trim()).unwrap_or_default();
+    rows.iter()
+        .filter(|r| r["type"] == "temperature")
+        .filter_map(|r| {
+            let chip = r["chip"].as_str().filter(|c| c.starts_with("nvme"))?;
+            let value = r["value"].as_f64().filter(|v| (1.0..=120.0).contains(v))?;
+            Some(format!(
+                "{chip} {} {value} °C",
+                r["label"].as_str().unwrap_or_default()
+            ))
+        })
+        .collect()
 }
 
 fn watch(
@@ -1671,7 +1914,7 @@ fn watch(
         .spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
-                if tx.send(line).is_err() {
+                if tx.send(console_text(&line)).is_err() {
                     break;
                 }
             }
@@ -2095,6 +2338,93 @@ mod tests {
         assert!(n > 40, "{n}");
     }
 
+    /// G1.6ze: the ISO's kernel listed `bond0`, `dummy0` and seven tunnels:
+    /// its command line lacked the two parameters, and its tree the patches.
+    #[test]
+    fn both_kernels_keep_their_drivers_from_creating_devices() {
+        let ok = "console=tty0 corerouter.mode=live bonding.max_bonds=0 dummy.numdummies=0 quiet";
+        no_kernel_devices("x", ok).unwrap();
+        for bad in [
+            "",
+            "console=tty0 corerouter.mode=live panic=10 quiet",
+            "bonding.max_bonds=0 quiet",
+            "bonding.max_bonds=1 dummy.numdummies=0",
+            "xbonding.max_bonds=0 dummy.numdummies=01",
+        ] {
+            let e = no_kernel_devices("installer.fragment", bad).unwrap_err();
+            assert!(
+                e.starts_with("installer.fragment: CONFIG_CMDLINE needs '"),
+                "{e}"
+            );
+        }
+        for want in INSTALLER_KERNEL.iter().filter(|w| w.contains("CMDLINE")) {
+            no_kernel_devices("INSTALLER_KERNEL", want.trim_end_matches('"')).unwrap();
+        }
+        let tree = std::env::temp_dir().join(format!("cr-xtask-patches-{}", std::process::id()));
+        std::fs::create_dir_all(&tree).unwrap();
+        let patches = [
+            PathBuf::from("/os/patches/linux/0001-a.patch"),
+            PathBuf::from("/os/patches/linux/0002-b.patch"),
+        ];
+        // No list at all (a tree Buildroot never patched), then an empty one
+        // (what the installer's tree had), one patch, both.
+        assert_eq!(patches_missing(&tree, &patches).len(), 2);
+        let list = tree.join(".applied_patches_list");
+        std::fs::write(&list, "").unwrap();
+        assert_eq!(
+            patches_missing(&tree, &patches),
+            ["0001-a.patch", "0002-b.patch"]
+        );
+        std::fs::write(&list, "/elsewhere/os/patches/linux/0001-a.patch\n").unwrap();
+        assert_eq!(patches_missing(&tree, &patches), ["0002-b.patch"]);
+        std::fs::write(&list, "/x/0001-a.patch\n/x/0002-b.patch\n/x/0003-c.patch\n").unwrap();
+        assert!(patches_missing(&tree, &patches).is_empty());
+        assert!(patches_missing(&tree, &[]).is_empty());
+        std::fs::remove_dir_all(&tree).unwrap();
+    }
+
+    /// G1.6zf: the sensors stay in the kernel, the Super-I/O drivers stay
+    /// modules, and PID 1 loads the modules the kernel builds.
+    #[test]
+    fn sensors_built_in_and_super_io_as_modules() {
+        let os = Path::new(env!("CARGO_MANIFEST_DIR")).join("../os");
+        let fragment = std::fs::read_to_string(os.join("board/x86_64/linux.fragment")).unwrap();
+        let init =
+            std::fs::read_to_string(os.join("../apps/corerouter-init/src/modules.rs")).unwrap();
+        assert_eq!(check_sensors(&fragment, &init).unwrap(), 10);
+        let e = check_sensors(&fragment.replace("CONFIG_NVME_HWMON=y", ""), &init).unwrap_err();
+        assert!(e.contains("CONFIG_NVME_HWMON=y is required"), "{e}");
+        // Built in, a Super-I/O driver would probe on every machine and VM.
+        let built_in = fragment.replace("CONFIG_SENSORS_IT87=m", "CONFIG_SENSORS_IT87=y");
+        let e = check_sensors(&built_in, &init).unwrap_err();
+        assert!(e.contains("CONFIG_SENSORS_IT87=m is required"), "{e}");
+        let e = check_sensors(&fragment, &init.replace("\"it87\", ", "")).unwrap_err();
+        assert!(e.contains("loads the sensor modules"), "{e}");
+        let e = check_sensors(&fragment, "").unwrap_err();
+        assert!(e.contains("no `pub const SENSOR_MODULES"), "{e}");
+    }
+
+    /// G1.6zf: what `boot-test` wants from `system.health.print`.
+    #[test]
+    fn the_nvme_disks_temperature_is_found_in_the_answer() {
+        let answer = r#"[
+            {"name":"acpitz-temp1","chip":"acpitz","label":"temp1","type":"temperature","value":27.8},
+            {"name":"nvme0-composite","chip":"nvme0","label":"Composite","type":"temperature","value":50.0,"crit":100.0},
+            {"name":"nvme1-composite","chip":"nvme1","label":"Composite","type":"temperature","value":0.0},
+            {"name":"nvme0-fan1","chip":"nvme0","label":"fan1","type":"fan","value":50.0}
+        ]"#;
+        assert_eq!(disk_temperatures(answer), ["nvme0 Composite 50 °C"]);
+        // Before the first reading, an error text, a kernel without the driver.
+        for none in [
+            "[]",
+            "",
+            "error: connection refused",
+            r#"[{"chip":"acpitz","type":"temperature","value":27.8}]"#,
+        ] {
+            assert!(disk_temperatures(none).is_empty(), "{none}");
+        }
+    }
+
     #[test]
     fn lock_and_hash_parsing() {
         let l = parse_lock(
@@ -2137,6 +2467,26 @@ mod tests {
         assert_eq!(
             parse_idle("corerouter-init: idle: memory in use 51234 KiB (MemTotal − MemAvailable)"),
             Some(51234)
+        );
+    }
+
+    #[test]
+    fn console_lines_are_read_without_their_colour() {
+        // What the image's consoles send (G1.6zg): SGR only, a reset at the
+        // end of every span.
+        assert_eq!(
+            console_text("  \u{1b}[1;33mWARNING\u{1b}[0m  admin has \u{1b}[2mno\u{1b}[0m password"),
+            "  WARNING  admin has no password"
+        );
+        assert_eq!(console_text("\u{1b}[32mOK\u{1b}[0m"), "OK");
+        assert_eq!(console_text("\u{1b}[m"), "");
+        // The firmware's cursor sequences and a cut one stay as they came.
+        let fw = "\u{1b}[2J\u{1b}[01;01HBdsDxe: loading Boot0001";
+        assert_eq!(console_text(fw), fw);
+        assert_eq!(console_text("x\u{1b}[1;3"), "x\u{1b}[1;3");
+        assert_eq!(
+            console_text("corerouter-init: ready: 1 s"),
+            "corerouter-init: ready: 1 s"
         );
     }
 
