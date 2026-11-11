@@ -345,3 +345,9 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-11-11 — G1.6ze criado e feito (ISO live sem interfaces criadas pelo kernel; porta ligada depois do boot sem comando recusado no log)
 - 2026-11-11 — G1.6zh criado e feito (relógio certo no primeiro boot: cliente NTP ligado só com os servidores do DHCP)
 - 2026-11-11 — G1.26i criado e feito (encaminhamento IPv4/IPv6 ligado por padrão; a ISO live roteia); G1.26j criado (o daemon seguir um perfil de tuning)
+- 2026-11-11 — G1.30 parte 1 (imagem pronta para Wi-Fi em modo estação); mínimo de RAM da ISO live de 320 para 448 MiB
+- 2026-11-11 — G1.30 parte 2 (motor: interface wifi, comandos, wpa_supplicant, wifi-test)
+- 2026-11-11 — G1.30 feito (parte 3: janela Interfaces › Wi-Fi e porta Wi-Fi no assistente do console)
+- 2026-11-11 — G1.6zf criado e feito (sensores de CPU, disco e placa-mãe em qualquer hardware); G4.8g criado (temperatura dos DIMMs)
+- 2026-11-11 — G1.6zg criado e feito (console local com cor e formato: status, assistente do primeiro boot e instalador)
+- 2026-11-11 — G1.6zi criado e feito (cobertura de hardware do kernel: núcleos, disco de boot, hipervisores, diagnóstico); G1.6zw, G1.6zx e G1.6zy criados
