@@ -7,14 +7,37 @@
 //! power, antennas, transmit power and the radio switch. A value the driver
 //! does not report is left out and named in one line at the end, so the
 //! tab does not fill with "not supported".
+//!
+//! G1.30h: a radio without a country says so (amber chip) with Set
+//! Country… beside it; Scan… and Connect… open Interfaces › Wi-Fi on this
+//! radio. The buttons only ask ([`WifiGo`]): the window opens the dialogs.
 
 use egui::{CollapsingHeader, Grid, RichText, Ui};
 use serde_json::Value;
 
+use crate::avail::Avail;
 use crate::iface_tabs::{loaded, notes};
 use crate::value_text;
 
 type Help<'a> = &'a mut Option<(&'static str, &'static str)>;
+
+/// What a button of the Wi-Fi tab asked for (G1.30h).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WifiGo {
+    /// The country dialog (`interface.wifi.country.set`).
+    Country,
+    /// `interface.wifi.scan`, then the Networks tab of Interfaces › Wi-Fi.
+    Scan,
+    /// The radio's modal in Interfaces › Wi-Fi (network, passphrase).
+    Connect,
+}
+
+/// The router's Wi-Fi country (`interface.wifi.monitor`), `Some(None)`
+/// when it has none; `None` while the monitor has not answered.
+pub(crate) fn country(r: &Option<Result<Value, String>>) -> Option<Option<String>> {
+    let m = r.as_ref()?.as_ref().ok()?;
+    Some(text(m, "country"))
+}
 
 /// The label column of every grid of both tabs, so the sections line up.
 const LABEL_WIDTH: f32 = 120.0;
@@ -100,13 +123,14 @@ fn joined(parts: impl IntoIterator<Item = Option<String>>) -> Option<String> {
     (!v.is_empty()).then(|| v.join(" · "))
 }
 
-/// The state's chip: green connected, amber on its way, red when it
-/// cannot (blocked, error, no country), none when idle or disabled.
+/// The state's chip: green connected, amber on its way or waiting for the
+/// country (G1.30h: a setting to make, not a fault), red when it cannot
+/// (blocked, error), none when idle or disabled.
 fn state_hue(state: &str) -> Option<&'static crate::chip::Hue> {
     match state {
         "connected" => Some(&crate::chip::GREEN),
-        "searching" | "connecting" => Some(&crate::chip::AMBER),
-        "blocked" | "error" | "no-country" | "absent" => Some(&crate::chip::RED),
+        "searching" | "connecting" | "no-country" => Some(&crate::chip::AMBER),
+        "blocked" | "error" | "absent" => Some(&crate::chip::RED),
         _ => None,
     }
 }
@@ -140,13 +164,36 @@ fn section(ui: &mut Ui, title: &str) {
     ui.label(RichText::new(title).strong());
 }
 
-/// The Wi-Fi tab: the link right now.
-pub(crate) fn wifi(ui: &mut Ui, r: &Option<Result<Value, String>>, help: Help<'_>) {
+/// The Wi-Fi tab: the link right now; `go`: what its buttons asked for.
+pub(crate) fn wifi(
+    ui: &mut Ui,
+    r: &Option<Result<Value, String>>,
+    can: &Avail,
+    help: Help<'_>,
+    go: &mut Option<WifiGo>,
+) {
     let Some(m) = loaded(ui, r) else {
         return;
     };
     let state = text(m, "state").unwrap_or_default();
     let connected = state == "connected";
+    let no_country = text(m, "country").is_none();
+    // G1.30h: join a network from here, as the Wi-Fi window does.
+    ui.horizontal(|ui| {
+        let on = match state.as_str() {
+            "no-country" => Err("Set the Wi-Fi country first".to_owned()),
+            "disabled" => Err("Enable the radio first: an off radio does not scan".to_owned()),
+            _ => Ok(()),
+        };
+        if crate::table::action(ui, "Scan…", can.and("interface.wifi.scan", on)) {
+            *go = Some(WifiGo::Scan);
+        }
+        let set = if no_country { Err("Set the Wi-Fi country first".to_owned()) } else { Ok(()) };
+        if crate::table::action(ui, "Connect…", can.and("interface.wifi.set", set)) {
+            *go = Some(WifiGo::Connect);
+        }
+    });
+    ui.add_space(4.0);
     let mut missing = Vec::new();
     let mut rows = Rows {
         help,
@@ -163,13 +210,18 @@ pub(crate) fn wifi(ui: &mut Ui, r: &Option<Result<Value, String>>, help: Help<'_
             let reconnects = uint(m, "reconnects")
                 .filter(|n| *n > 0)
                 .map(|n| format!("{n} reconnect{}", if n == 1 { "" } else { "s" }));
+            let shown = crate::wifi::state_label(&state);
             rows.chip(
                 ui,
                 "State",
                 "iface_wifi.state",
-                state_hue(&state).map(|h| (state.as_str(), h)),
+                state_hue(&state).map(|h| (shown, h)),
                 joined([(state_hue(&state).is_none()).then(|| state.clone()), since, reconnects]),
             );
+            if no_country {
+                // G1.30h: what the radio waits for, right under its state.
+                country_row(ui, &mut rows, m, can, go);
+            }
             let pmf = m.get("pmf").and_then(Value::as_bool).map(|p| {
                 if p { "PMF on" } else { "PMF off" }.to_owned()
             });
@@ -309,12 +361,9 @@ pub(crate) fn wifi(ui: &mut Ui, r: &Option<Result<Value, String>>, help: Help<'_
                 "iface_wifi.addresses",
                 Some(if addresses.is_empty() { "none".to_owned() } else { addresses.join(", ") }),
             );
-            let country = match (text(m, "country"), text(m, "country_in_force")) {
-                (Some(c), Some(f)) if c == f => Some(format!("{c} (in force)")),
-                (Some(c), Some(f)) => Some(format!("{c} (in force: {f})")),
-                (c, f) => c.or(f),
-            };
-            rows.text(ui, "Country", "iface_wifi.country", joined([country, text(m, "country_error")]));
+            if !no_country {
+                country_row(ui, &mut rows, m, can, go);
+            }
             let failure = m
                 .get("failure")
                 .filter(|f| !f.is_null())
@@ -333,6 +382,31 @@ pub(crate) fn wifi(ui: &mut Ui, r: &Option<Result<Value, String>>, help: Help<'_
     }
     missing_line(ui, &missing);
     notes(ui, m);
+}
+
+/// The Country row of the Wi-Fi tab: the country (and what the kernel
+/// applies), or the amber chip, with the button that sets it (G1.30h).
+fn country_row(ui: &mut Ui, rows: &mut Rows<'_, '_>, m: &Value, can: &Avail, go: &mut Option<WifiGo>) {
+    let set = text(m, "country");
+    let country = match (set.clone(), text(m, "country_in_force")) {
+        (Some(c), Some(f)) if c == f => Some(format!("{c} (in force)")),
+        (Some(c), Some(f)) => Some(format!("{c} (in force: {f})")),
+        (c, f) => c.or(f),
+    };
+    rows.label(ui, "Country", "iface_wifi.country");
+    ui.horizontal_wrapped(|ui| {
+        if set.is_none() {
+            crate::chip::chip(ui, "no country", crate::chip::AMBER.tone(ui.visuals()));
+        }
+        if let Some(c) = joined([country, text(m, "country_error")]) {
+            ui.label(c);
+        }
+        let label = if set.is_none() { "Set Country…" } else { "Change…" };
+        if crate::table::action(ui, label, can.check("interface.wifi.country.set")) {
+            *go = Some(WifiGo::Country);
+        }
+    });
+    ui.end_row();
 }
 
 /// The Radio tab: what the card is and can do.

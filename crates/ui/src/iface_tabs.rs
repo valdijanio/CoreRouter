@@ -208,6 +208,9 @@ pub(crate) struct NicView {
     /// G1.29g: "Adopt" pressed on a port outside the configuration (sent
     /// by the dialog as `interface.ethernet.adopt`).
     pub(crate) adopt_go: bool,
+    /// G1.30h: a button of the Wi-Fi tab (Set Country…, Scan…, Connect…),
+    /// acted on by the window.
+    pub(crate) wifi_go: Option<crate::iface_wifi::WifiGo>,
 }
 
 impl NicView {
@@ -223,6 +226,15 @@ impl NicView {
             Some(Ok(v)) => Some(v),
             _ => None,
         }
+    }
+
+    /// G1.30h: the router's Wi-Fi country on a Wi-Fi port whose monitor
+    /// answered, `Some(None)` when there is none (`None` otherwise).
+    pub(crate) fn wifi_country(&self) -> Option<Option<String>> {
+        if !self.wifi {
+            return None;
+        }
+        crate::iface_wifi::country(&self.wifi_monitor)
     }
 
     pub(crate) fn hardware_value(&self) -> Option<&Value> {
@@ -594,7 +606,9 @@ pub(crate) fn body(
                 Tab::Ethernet => ethernet_tab::ethernet(ui, view, can),
                 Tab::Status => status(ui, view),
                 Tab::Sfp => ethernet_tab::sfp(ui, view),
-                Tab::Wifi => crate::iface_wifi::wifi(ui, &view.wifi_monitor, help),
+                Tab::Wifi => {
+                    crate::iface_wifi::wifi(ui, &view.wifi_monitor, can, help, &mut view.wifi_go);
+                }
                 Tab::Radio => crate::iface_wifi::radio(ui, &view.wifi_radio, help),
                 Tab::Hardware => hardware(ui, view, can, help),
                 Tab::Traffic => traffic(ui, view),

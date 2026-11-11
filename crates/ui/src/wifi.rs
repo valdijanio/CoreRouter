@@ -11,6 +11,9 @@
 //!   Connect… opens the radio's modal with the network filled in.
 //!
 //! The country every radio follows is on the first line, with its dialog.
+//! G1.30h: the same dialog opens from "Interface <wifi1>" and from Enable
+//! on a radio without a country ([`ask_country`]), with "Also enable" so
+//! one OK sets the country and turns the radio on.
 //! The modal is fed by `interface.wifi.preview` (the checks and warnings of
 //! `interface.wifi.set`, whether the network is in range, the access risk,
 //! the commands).
@@ -107,15 +110,96 @@ pub(crate) enum Tab {
     Networks,
 }
 
-/// The country dialog: one field.
+/// The country dialog: one field, and the radios to enable after it.
 pub(crate) struct CountryDialog {
     pub id: u64,
     pub value: String,
     pub status: Status,
+    /// The window it was opened from (G1.30h); `None`: this panel's.
+    pub parent: Option<Id>,
+    /// Radios an Enable without a country asked for (G1.30h): enabled
+    /// once the country is set, while [`Self::enable_on`].
+    pub enable: Vec<String>,
+    pub enable_on: bool,
+    /// The country went in and the radios' Enable is out.
+    enabling: bool,
 }
 
 /// The reply of the country dialog's command.
 struct CountrySet(u64);
+
+/// The reply of an Enable the country dialog sent after the country.
+struct CountryEnabled(u64);
+
+/// The reply of an Enable sent from a list (G1.30h): refused for want of
+/// a country, it opens the country dialog over window `parent`.
+struct EnableTried {
+    parent: Id,
+    name: String,
+}
+
+/// The words of the engine's "no country yet" refusal
+/// (`corerouter_model::wifi::NO_COUNTRY`, the same in the commit and in the
+/// preview) that tell it apart; a test keeps the two in step.
+pub(crate) const NO_COUNTRY_MARK: &str = "cannot be enabled before the country is set";
+
+/// Whether an engine error (or one issue of it) is the "no country yet" one.
+pub(crate) fn is_no_country(error: &str) -> bool {
+    error.contains(NO_COUNTRY_MARK)
+}
+
+/// G1.30h: open (or raise) the country dialog over window `parent`,
+/// offering to enable radios `enable` after it (ticked when `on`: the
+/// operator pressed Enable). From the windows outside this panel.
+pub(crate) fn ask_country(app: &mut CoreRouterUi, parent: Id, enable: Vec<String>, on: bool) {
+    app.next_dialog = app.next_dialog.wrapping_add(1);
+    let id = app.next_dialog;
+    if let Some(p) = app.panel_mut::<WifiPanel>() {
+        p.open_country(id, Some(parent), enable, on);
+    }
+}
+
+/// G1.30h: Enable on radio `name` from window `parent`: the country
+/// dialog when the router refuses it for want of a country.
+pub(crate) fn enable_then(parent: Id, name: &str) -> crate::Then {
+    crate::panel::then(
+        NAME,
+        EnableTried {
+            parent,
+            name: name.to_owned(),
+        },
+    )
+}
+
+/// G1.30h: Scan… from "Interface <name>": scan, and show what radio `name`
+/// hears in this panel's Networks tab.
+pub(crate) fn scan_from(app: &mut CoreRouterUi, name: &str) {
+    app.run("interface.wifi.scan", json!({ "name": name }));
+    if let Some(p) = app.panel_mut::<WifiPanel>() {
+        p.radio = name.to_owned();
+        p.heard = None;
+        p.tab = Tab::Networks;
+    }
+    open_window(app);
+}
+
+/// G1.30h: Connect… from "Interface <name>": the radio's modal (network,
+/// passphrase), once the list of radios is in.
+pub(crate) fn connect_from(app: &mut CoreRouterUi, name: &str) {
+    if let Some(p) = app.panel_mut::<WifiPanel>() {
+        p.tab = Tab::Radios;
+        p.edit_when_listed = Some(name.to_owned());
+    }
+    open_window(app);
+}
+
+/// Open (or raise) Interfaces › Wi-Fi.
+fn open_window(app: &mut CoreRouterUi) {
+    if !app.open.insert(Win::Panel(WIN)) {
+        app.floats.raise(crate::win_id(Win::Panel(WIN)));
+    }
+    app.cache.refreshed_at = None;
+}
 
 /// What the bar or a menu asked for.
 enum Do {
@@ -142,6 +226,9 @@ pub(crate) struct WifiPanel {
     pub(crate) radio: String,
     pub(crate) modal: Option<Modal>,
     pub(crate) country_dialog: Option<CountryDialog>,
+    /// Connect… from "Interface <name>" (G1.30h): open this radio's modal
+    /// when `interface.wifi.list` arrives.
+    pub(crate) edit_when_listed: Option<String>,
     pub(crate) table: TableState,
     pub(crate) heard_table: TableState,
     help: Option<HelpView>,
@@ -417,7 +504,20 @@ impl WifiPanel {
         };
         match what {
             Do::Edit(k) => self.edit(app, &k, &[]),
-            Do::Enable(keys) => each(app, &keys, "interface.wifi.enable"),
+            Do::Enable(keys) => {
+                // G1.30h: no country yet: the country dialog, which enables
+                // them after it, instead of a refusal.
+                let none = self.country.as_ref().is_some_and(|c| s(c, "country").is_empty());
+                if none {
+                    app.next_dialog = app.next_dialog.wrapping_add(1);
+                    self.open_country(app.next_dialog, None, keys, true);
+                } else {
+                    let parent = crate::win_id(Win::Panel(WIN));
+                    for k in keys {
+                        app.run_then("interface.wifi.enable", json!({ "name": k }), enable_then(parent, &k));
+                    }
+                }
+            }
             Do::Disable(keys) => each(app, &keys, "interface.wifi.disable"),
             Do::Reconnect(keys) => each(app, &keys, "interface.wifi.reconnect"),
             Do::Scan(k) => {
@@ -461,18 +561,35 @@ impl WifiPanel {
                 }
             }
             if table::action(ui, tr_in(SCOPE, l, "Change…"), app.can().check("interface.wifi.country.set")) {
-                match &mut self.country_dialog {
-                    Some(d) => d.status.bring_to_front(),
-                    None => {
-                        app.next_dialog = app.next_dialog.wrapping_add(1);
-                        self.country_dialog = Some(CountryDialog {
-                            id: app.next_dialog,
-                            value: set,
-                            status: Status::default(),
-                        });
-                    }
+                app.next_dialog = app.next_dialog.wrapping_add(1);
+                self.open_country(app.next_dialog, None, Vec::new(), false);
+            }
+        });
+    }
+
+    /// Open the country dialog as `id` over `parent` (`None`: this panel's
+    /// window), or raise the open one; `enable`: radios it offers to turn
+    /// on after it, ticked when `on`.
+    pub(crate) fn open_country(&mut self, id: u64, parent: Option<Id>, enable: Vec<String>, on: bool) {
+        if let Some(d) = &mut self.country_dialog {
+            d.status.bring_to_front();
+            d.enable_on |= on && !enable.is_empty();
+            for n in enable {
+                if !d.enable.contains(&n) {
+                    d.enable.push(n);
                 }
             }
+            return;
+        }
+        let value = self.country.as_ref().map(|c| s(c, "country")).unwrap_or_default();
+        self.country_dialog = Some(CountryDialog {
+            id,
+            value,
+            status: Status::default(),
+            parent,
+            enable_on: on && !enable.is_empty(),
+            enable,
+            enabling: false,
         });
     }
 
@@ -836,9 +953,10 @@ impl WifiPanel {
             title: tr_in(SCOPE, l, "Wi-Fi Country"),
             dirty: false,
             pos: cascade(area, d.id),
-            parent: Some(crate::win_id(Win::Panel(WIN))),
+            parent: d.parent.or(Some(crate::win_id(Win::Panel(WIN)))),
         };
         let mut info = false;
+        let also = tr_in(SCOPE, l, "Also enable");
         let pressed = dialog::show(&mut app.floats, ctx, area, head, &mut d.status, |ui, f| {
             Grid::new("wifi-country").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -848,6 +966,9 @@ impl WifiPanel {
                 f.field(ui, "country", &mut d.value, "BR");
             });
             ui.weak(tr_in(SCOPE, l, "Two letters (ISO 3166-1): BR, US, DE. One country for every radio."));
+            if !d.enable.is_empty() {
+                ui.checkbox(&mut d.enable_on, format!("{also} {}", d.enable.join(", ")));
+            }
             Footer::<()>::edit(false, can.check("interface.wifi.country.set"))
         });
         if info {
@@ -861,6 +982,7 @@ impl WifiPanel {
             Some(Press::Ok | Press::Apply) => {
                 d.status.close_on_success = true;
                 d.status.sent();
+                d.enabling = false;
                 app.run_then(
                     "interface.wifi.country.set",
                     json!({ "country": d.value.trim() }),
@@ -924,13 +1046,16 @@ impl PanelState for WifiPanel {
         out
     }
 
-    fn arrived(&mut self, _app: &mut CoreRouterUi, key: &'static str, _: RequestId, value: Value) {
+    fn arrived(&mut self, app: &mut CoreRouterUi, key: &'static str, _: RequestId, value: Value) {
         match key {
             "list" => {
                 self.rows = match value {
                     Value::Array(a) => a,
                     _ => Vec::new(),
                 };
+                if let Some(name) = self.edit_when_listed.take() {
+                    self.edit(app, &name, &[]);
+                }
             }
             "country" => self.country = Some(value),
             "monitor" => self.monitor = Some(value),
@@ -978,10 +1103,46 @@ impl PanelState for WifiPanel {
             }
         } else if let Some(c) = then.downcast_ref::<CountrySet>()
             && let Some(d) = self.country_dialog.as_mut().filter(|d| d.id == c.0)
+        {
+            let mut close = d.status.replied(result);
+            let wants = d.enable_on && !d.enabling && !d.enable.is_empty();
+            // An empty field clears the country: nothing to enable with.
+            let none = result.as_ref().is_ok_and(|r| r.get("country").is_none_or(Value::is_null));
+            if wants && none {
+                d.status.error = Some(
+                    tr_in(SCOPE, app.lang.labels, "Type the country's two letters (BR, US, DE) to enable the radio")
+                        .to_owned(),
+                );
+                close = false;
+            } else if result.is_ok() && wants {
+                // G1.30h: the country is in: now the radios that waited for it.
+                d.enabling = true;
+                close = false;
+                for name in d.enable.clone() {
+                    d.status.sent();
+                    app.run_then(
+                        "interface.wifi.enable",
+                        json!({ "name": name }),
+                        crate::panel::then(NAME, CountryEnabled(d.id)),
+                    );
+                }
+            }
+            if close {
+                app.floats.forget(dialog_id(d.id));
+                self.country_dialog = None;
+            }
+        } else if let Some(c) = then.downcast_ref::<CountryEnabled>()
+            && let Some(d) = self.country_dialog.as_mut().filter(|d| d.id == c.0)
             && d.status.replied(result)
         {
             app.floats.forget(dialog_id(d.id));
             self.country_dialog = None;
+        } else if let Some(e) = then.downcast_ref::<EnableTried>()
+            && let Err(error) = result
+            && is_no_country(error)
+        {
+            app.next_dialog = app.next_dialog.wrapping_add(1);
+            self.open_country(app.next_dialog, Some(e.parent), vec![e.name.clone()], true);
         }
     }
 
