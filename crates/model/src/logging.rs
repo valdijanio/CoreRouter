@@ -71,6 +71,8 @@ pub const TOPICS: &[&str] = &[
     "system",
     "tool",
     "warning",
+    // G1.30: the Wi-Fi radios (RouterOS' name for the topic).
+    "wireless",
 ];
 
 /// Topics that say how bad, not what (RouterOS levels), mildest first.

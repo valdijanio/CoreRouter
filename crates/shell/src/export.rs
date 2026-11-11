@@ -43,7 +43,14 @@ use crate::lex::quote;
 use crate::registry::{Command, Menu, Registry, path_text};
 
 /// Field names never exported in clear.
-const SECRET_WORDS: &[&str] = &["password", "secret", "psk", "token", "private"];
+const SECRET_WORDS: &[&str] = &[
+    "password",
+    "passphrase",
+    "secret",
+    "psk",
+    "token",
+    "private",
+];
 
 fn secret(key: &str) -> bool {
     SECRET_WORDS.iter().any(|w| key.contains(w))

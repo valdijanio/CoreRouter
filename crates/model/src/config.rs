@@ -81,6 +81,9 @@ pub struct System {
     /// G1.29d: the USB adapter watchdog's per-adapter settings.
     #[serde(skip_serializing_if = "crate::usb_watchdog::UsbWatchdog::is_default")]
     pub usb_watchdog: crate::usb_watchdog::UsbWatchdog,
+    /// `/interface wifi` settings every radio shares (G1.30): the country.
+    #[serde(skip_serializing_if = "crate::wifi::WifiSettings::is_default")]
+    pub wifi: crate::wifi::WifiSettings,
 }
 
 impl Default for System {
@@ -97,6 +100,7 @@ impl Default for System {
             graphing: crate::graphing::Graphing::default(),
             web: crate::web::WebService::default(),
             usb_watchdog: crate::usb_watchdog::UsbWatchdog::default(),
+            wifi: crate::wifi::WifiSettings::default(),
         }
     }
 }
@@ -254,6 +258,10 @@ pub enum InterfaceKind {
     },    /// PPPoE client (G3.9ga, RouterOS type `pppoe-out`): the session's
     /// netdev, its settings in [`crate::pppoe_client`].
     PppoeClient(Box<crate::pppoe_client::PppoeClient>),
+    /// A Wi-Fi radio in station mode (G1.30, RouterOS type `wifi`): there
+    /// because the card is, like an Ethernet port; the network it joins in
+    /// [`crate::wifi`].
+    Wifi(Box<crate::wifi::WifiStation>),
 }
 
 impl InterfaceKind {
@@ -266,6 +274,7 @@ impl InterfaceKind {
             Self::Vrf { .. } => "vrf",
             Self::Bonding { .. } => "bonding",
             Self::PppoeClient(_) => "pppoe-out",
+            Self::Wifi(_) => "wifi",
         }
     }
 }

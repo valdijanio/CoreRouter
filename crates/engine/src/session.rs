@@ -1094,6 +1094,16 @@ fn discovered(hal: &mut dyn Hal) -> Config {
     match hal.discover_links() {
         Ok(links) => {
             for l in links {
+                // G1.30: a radio is not seeded. Its netdev shows up when its
+                // driver has its firmware, after the boot named the ports,
+                // and is renamed a moment later (`wlan0` → `wifi1`): seeded
+                // here it entered the configuration under the kernel's name
+                // (**medido** in QEMU: a daemon that started 95 ms before
+                // the rename). The tick adopts it once its name held for
+                // three polls (`port_adopt`), like a card plugged in later.
+                if l.wifi {
+                    continue;
+                }
                 let mut iface = Interface::new(l.name.clone(), InterfaceKind::Ethernet);
                 iface.mtu = l.mtu;
                 iface.mac = l.mac.and_then(|m| m.parse().ok());

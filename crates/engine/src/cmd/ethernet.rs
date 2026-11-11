@@ -328,7 +328,8 @@ fn physical(cfg: &Config, name: &IfName, depth: u8, out: &mut BTreeSet<IfName>) 
         return;
     }
     match &iface.kind {
-        InterfaceKind::Ethernet => {
+        // G1.30: a radio carries a connection like a port does.
+        InterfaceKind::Ethernet | InterfaceKind::Wifi(_) => {
             out.insert(name.clone());
         }
         InterfaceKind::Vlan { parent, .. } => physical(cfg, parent, depth + 1, out),

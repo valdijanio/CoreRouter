@@ -201,6 +201,10 @@ pub mod link_dump;
 pub mod link_events;
 /// Neighbor tables over rtnetlink (G1.27d): dump, events, static entries.
 pub mod neigh;
+/// Wi-Fi in station mode (G1.30): `wpa_supplicant`, driven through its
+/// control socket; the parsers of what it says are pure.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub mod wifi;
 /// Which links are Wi-Fi radios (G1.30): the link dump does not say.
 #[cfg(target_os = "linux")]
 mod wifi_links;
@@ -910,6 +914,7 @@ mod linux {
                         mtu: u16::try_from(l.mtu).ok()?,
                         mac: l.mac,
                         up: l.up,
+                        wifi: l.wireless,
                     })
                 })
                 .collect())
@@ -1513,6 +1518,26 @@ mod linux {
             crate::dhcp::LinuxDhcpPort::open(name)
                 .map(|p| Box::new(p) as Box<dyn corerouter_hal::DhcpPort>)
                 .map_err(|e| HalError::Io(e.to_string()))
+        }
+
+        fn wifi_port(
+            &mut self,
+            name: &IfName,
+        ) -> Result<Box<dyn corerouter_hal::wifi::WifiPort>, HalError> {
+            crate::wifi::LinuxWifiPort::open(name)
+                .map(|p| Box::new(p) as Box<dyn corerouter_hal::wifi::WifiPort>)
+        }
+
+        fn wifi_country(&mut self, country: Option<&str>) -> Result<(), HalError> {
+            crate::wifi::set_country(country)
+        }
+
+        fn wifi_radio(&mut self, name: &IfName) -> Option<corerouter_hal::wifi::WifiRadio> {
+            crate::wifi::radio(name)
+        }
+
+        fn wifi_regdomain(&mut self) -> Option<String> {
+            crate::wifi::regdomain()
         }
 
         fn pppoe_client_port(

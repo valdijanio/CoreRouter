@@ -12,7 +12,7 @@ The router looks at the machine's PCI and USB network cards every 10 seconds and
 - **safe mode**: the `ice` driver of the Intel E810 could not use its DDP package: one queue, no RSS, no XDP, no offloads. Traffic passes, on one core.
 - **until installed**: on the ISO, which has no firmware files, this is normal. Nothing to do.
 
-**Not counted:** Wi-Fi cards (out of the image's purpose), virtual functions without a driver (handed to a VM on purpose), and `regulatory.db`, which the kernel asks for whenever it has Wi-Fi support.
+**Not counted:** a Wi-Fi card this image has no driver for (one with its driver is an interface of type wifi: Interfaces › Wi-Fi), virtual functions without a driver (handed to a VM on purpose), and `regulatory.db`, which an image from before Wi-Fi did not have.
 
 The same list is in the health checks (`interface.hardware`), the router log, and the CLI and MCP warning; `interface.hardware-problem.print` returns it.",
 )];

@@ -76,4 +76,5 @@ mod subscriber_notice;
 mod tool_params;
 mod unmanaged;
 mod users;
+mod wifi;
 mod xdp;

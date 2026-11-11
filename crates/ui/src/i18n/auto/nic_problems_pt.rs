@@ -30,7 +30,7 @@ O roteador olha as placas de rede PCI e USB da máquina a cada 10 segundos e o q
 - **safe mode**: o driver `ice` da Intel E810 não conseguiu usar o pacote DDP: uma fila só, sem RSS, sem XDP, sem offloads. O tráfego passa, num núcleo só.
 - **até instalar**: na ISO, que não traz firmware, é o normal. Nada a fazer.
 
-**Não contam:** placas Wi-Fi (fora do propósito da imagem), funções virtuais sem driver (entregues a uma VM de propósito) e o `regulatory.db`, que o kernel pede sempre que tem suporte a Wi-Fi.
+**Não contam:** placa Wi-Fi para a qual esta imagem não tem driver (a que tem driver é uma interface de tipo wifi: Interfaces › Wi-Fi), funções virtuais sem driver (entregues a uma VM de propósito) e o `regulatory.db`, que uma imagem anterior ao Wi-Fi não trazia.
 
 A mesma lista está na saúde do roteador (`interface.hardware`), no log do roteador e no aviso da CLI e do MCP; `interface.hardware-problem.print` devolve a lista.",
 )];

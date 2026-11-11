@@ -214,7 +214,9 @@ pub fn evaluate(r: &NicReading) -> (Vec<Problem>, Vec<Ignored>) {
         let ignore = |why| Ignored { device: d.address.clone(), bus: d.bus, name: name_of(d), why };
         if d.kind == NicKind::Other {
             if d.driver.is_none() {
-                ignored.push(ignore("not Ethernet (Wi-Fi and the like are out of the image's purpose)"));
+                ignored.push(ignore(
+                    "not Ethernet: a Wi-Fi card this image has no driver for (docs/wifi.md has the ones it has), or another kind of network device",
+                ));
             }
             continue;
         }

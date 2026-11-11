@@ -24,7 +24,10 @@ use corerouter_model::{Config, IfName, InterfaceKind};
 pub fn missing(cfg: &Config, present: impl Fn(&IfName) -> bool) -> BTreeSet<IfName> {
     cfg.interfaces
         .values()
-        .filter(|i| i.kind == InterfaceKind::Ethernet && !present(&i.name))
+        // G1.30: a radio is hardware as well (a USB adapter pulled out).
+        .filter(|i| {
+            matches!(i.kind, InterfaceKind::Ethernet | InterfaceKind::Wifi(_)) && !present(&i.name)
+        })
         .map(|i| i.name.clone())
         .collect()
 }

@@ -449,6 +449,8 @@ impl Session {
         self.dhcp_server_from_clock(now_ms);
         // PPPoE clients (G3.9ga) run on the same clock.
         self.pppoe_client_service(now_ms);
+        // And the Wi-Fi radios (G1.30).
+        self.wifi_service(now_ms);
     }
 
     /// Apply what a state machine asked for (bind, unbind, log).

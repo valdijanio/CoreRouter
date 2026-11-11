@@ -50,8 +50,9 @@ pub enum NicKind {
     /// What the router routes with: judged.
     Ethernet,
     /// PCI class "network, other" and the like (Wi-Fi cards live here), and a
-    /// wireless USB adapter: out of the image's purpose (`docs/os-image.md`),
-    /// so listed and never a warning.
+    /// wireless USB adapter: listed and never a warning. A Wi-Fi card with
+    /// its driver is an interface of type `wifi` (G1.30, `docs/wifi.md`);
+    /// one without is not something every router wants to hear about.
     Other,
 }
 

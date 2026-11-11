@@ -40,6 +40,8 @@ mod ports;
 mod setup;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod style;
+#[cfg(target_os = "linux")]
+mod wifi_names;
 
 #[cfg(target_os = "linux")]
 fn main() {

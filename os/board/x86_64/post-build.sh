@@ -80,3 +80,11 @@ rm -f "$T"/usr/lib/libnl-route-3.so* "$T"/usr/lib/libnl-nf-3.so* \
 	"$T"/usr/lib/libnl-idiag-3.so* "$T"/usr/lib/libnl-xfrm-3.so*
 rm -rf "$T/etc/libnl" "$T/etc/ssl/misc"
 rm -f "$T"/etc/ssl/*.dist "$T/etc/ssl/ct_log_list.cnf"
+# G1.30: hostapd is a test's tool (the access point `cargo xtask os wifi-test`
+# puts in front of the image's station), not the image's: out of the root,
+# into the images directory, from where the test puts it on a disk of its own.
+if [ -f "$T/usr/sbin/hostapd" ]; then
+	mkdir -p "$BINARIES_DIR/test-tools"
+	mv "$T/usr/sbin/hostapd" "$BINARIES_DIR/test-tools/hostapd"
+fi
+rm -f "$T/usr/bin/hostapd_cli" "$T/etc/hostapd.conf"
