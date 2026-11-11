@@ -224,21 +224,13 @@ pub fn grow_last(
     name: &str,
     min: u64,
 ) -> Result<Grow, String> {
-    use std::os::unix::fs::FileExt;
     let mut r = disk;
     let t = read_table(&mut r, lbs)?;
     let (grow, last) = grow_plan(&t, name, disk_bytes / lbs, lbs, min)?;
     if !matches!(grow, Grow::Grow { .. }) {
         return Ok(grow);
     }
-    for (i, (e, _)) in t.parts.iter().enumerate() {
-        if e.number as usize != i + 1 {
-            return Err(format!(
-                "GPT entry {} follows an empty one: rewriting it would renumber the partitions",
-                e.number
-            ));
-        }
-    }
+    numbered_in_order(&t)?;
     let parts: Vec<NewPart> = t
         .parts
         .iter()
@@ -251,7 +243,81 @@ pub fn grow_last(
             attrs: *attrs,
         })
         .collect();
-    let (mut primary, backup_at, backup) = build(disk_bytes / lbs, lbs, &t.disk_guid, &parts)?;
+    rewrite(disk, disk_bytes, lbs, &t.disk_guid, &parts)?;
+    Ok(grow)
+}
+
+/// G1.6zm: gives partition `name` the GUID `to` when it still has `from`
+/// (the image's, [`crate::IMAGE_ESP_GUID`]); every other field and entry
+/// as it was. `Ok(false)`: it had another GUID already, nothing written.
+/// Written like [`grow_last`]: primary first, then the backup.
+#[cfg(unix)]
+pub fn renew_guid(
+    disk: &std::fs::File,
+    disk_bytes: u64,
+    lbs: u64,
+    name: &str,
+    from: &str,
+    to: &str,
+) -> Result<bool, String> {
+    let mut r = disk;
+    let t = read_table(&mut r, lbs)?;
+    let Some((e, _)) = t.parts.iter().find(|(e, _)| e.name == name) else {
+        return Err(format!("no partition named '{name}'"));
+    };
+    if !e.guid.eq_ignore_ascii_case(from) {
+        return Ok(false);
+    }
+    if crate::efi::guid_bytes(to).is_none() {
+        return Err(format!("'{to}' is not a GUID"));
+    }
+    numbered_in_order(&t)?;
+    let parts: Vec<NewPart> = t
+        .parts
+        .iter()
+        .map(|(e, attrs)| NewPart {
+            name: e.name.clone(),
+            type_guid: e.type_guid.clone(),
+            guid: if e.name == name {
+                to.to_owned()
+            } else {
+                e.guid.clone()
+            },
+            first_lba: e.first_lba,
+            last_lba: e.last_lba,
+            attrs: *attrs,
+        })
+        .collect();
+    rewrite(disk, disk_bytes, lbs, &t.disk_guid, &parts)?;
+    Ok(true)
+}
+
+/// Rewriting must not renumber: the boot entries name partitions by number.
+fn numbered_in_order(t: &Table) -> Result<(), String> {
+    for (i, (e, _)) in t.parts.iter().enumerate() {
+        if e.number as usize != i + 1 {
+            return Err(format!(
+                "GPT entry {} follows an empty one: rewriting it would renumber the partitions",
+                e.number
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Writes the table of `parts` over `disk`: block 0 keeps its BIOS boot
+/// code, the primary header and entries go first (synced), then the backup
+/// at the end of the disk.
+#[cfg(unix)]
+fn rewrite(
+    disk: &std::fs::File,
+    disk_bytes: u64,
+    lbs: u64,
+    disk_guid: &str,
+    parts: &[NewPart],
+) -> Result<(), String> {
+    use std::os::unix::fs::FileExt;
+    let (mut primary, backup_at, backup) = build(disk_bytes / lbs, lbs, disk_guid, parts)?;
     // G1.6g: block 0 holds the BIOS boot code too, and the disk must keep
     // booting by BIOS after this.
     let mut old = vec![0u8; lbs as usize];
@@ -265,7 +331,7 @@ pub fn grow_last(
     disk.write_all_at(&backup, backup_at)
         .map_err(|e| format!("backup GPT: {e}"))?;
     disk.sync_data().map_err(|e| format!("backup GPT: {e}"))?;
-    Ok(grow)
+    Ok(())
 }
 
 /// A partition [`build`] writes.
@@ -590,6 +656,65 @@ mod tests {
         f.write_all_at(&primary, 0).unwrap();
         f.write_all_at(&backup, backup_at).unwrap();
         f
+    }
+
+    /// G1.6zm: the ESP gets a GUID of its own once; nothing else changes,
+    /// and a second call (or another GUID already there) writes nothing.
+    #[test]
+    fn the_esp_gets_a_guid_of_its_own_once() {
+        use std::os::unix::fs::FileExt;
+        let dir = std::env::temp_dir().join(format!("sysupdate-gpt-esp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("disk");
+        let f = image(&path, VM_DISK);
+        f.write_all_at(&[0xB8; crate::biosboot::CODE], 0).unwrap();
+        let before = read_table(&mut &f, 512).unwrap();
+        // This test's disk names its ESP by its first block.
+        let from = "00000000-0000-0000-0000-000000000800";
+        let to = "0d2c41a7-1b6e-4c3e-9d1f-5a7b8c9d0e1f";
+        assert!(renew_guid(&f, VM_DISK, 512, "efi", from, to).unwrap());
+        let after = read_table(&mut &f, 512).unwrap();
+        assert_eq!(after.disk_guid, before.disk_guid);
+        for ((a, aa), (b, ba)) in after.parts.iter().zip(&before.parts) {
+            assert_eq!(aa, ba, "attributes kept");
+            if a.name == "efi" {
+                assert_eq!(a.guid, to);
+                assert_eq!(
+                    Entry {
+                        guid: b.guid.clone(),
+                        ..a.clone()
+                    },
+                    *b
+                );
+            } else {
+                assert_eq!(a, b, "{} untouched", a.name);
+            }
+        }
+        // The backup at the end of the disk says the same.
+        let mut tail = vec![0u8; 512];
+        f.read_exact_at(&mut tail, VM_DISK - 512).unwrap();
+        assert_eq!(&tail[..8], b"EFI PART");
+        let mut block0 = [0u8; 512];
+        f.read_exact_at(&mut block0, 0).unwrap();
+        assert!(
+            block0[..crate::biosboot::CODE].iter().all(|&x| x == 0xB8),
+            "BIOS code kept"
+        );
+        assert!(
+            !renew_guid(
+                &f,
+                VM_DISK,
+                512,
+                "efi",
+                from,
+                "11111111-2222-4333-8444-555555555555"
+            )
+            .unwrap()
+        );
+        assert_eq!(read_table(&mut &f, 512).unwrap(), after, "once only");
+        assert!(renew_guid(&f, VM_DISK, 512, "efi", to, "not a guid").is_err());
+        assert!(renew_guid(&f, VM_DISK, 512, "nope", from, to).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

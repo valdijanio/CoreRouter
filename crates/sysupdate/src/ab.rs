@@ -588,6 +588,16 @@ impl Platform {
         }
     }
 
+    /// The partition GUID of the ESP slot `s`'s UEFI entry names (`None`:
+    /// no entry, not `HD()`, or a BIOS).
+    fn entry_esp(&self, s: SlotId) -> Option<String> {
+        let BootStore::Uefi(v) = &self.boot else {
+            return None;
+        };
+        let n = entries(v).get(idx(s)).copied().flatten()?;
+        v.load_option(n)?.partition.map(|p| p.guid)
+    }
+
     /// The status `system.package.print` shows.
     pub fn status(&self, st: &State) -> Value {
         let running = self.running();
@@ -661,6 +671,8 @@ impl Platform {
         json!({
             "supported": true,
             "firmware": self.boot.firmware(),
+            // G1.6zm: this disk's ESP, as the boot entries name it.
+            "esp_guid": self.esp.guid,
             "lab": self.lab.is_some(),
             "running": running.map(SlotId::as_str),
             "primary": prim.map(SlotId::as_str),
@@ -725,7 +737,10 @@ impl Platform {
             // G1.6g: the entry of an image written under the other firmware
             // names a verity hash that is gone. And a slot's `.cfg` comes
             // with the image, so what this boot carries may not be in it.
-            let stale = !line.contains(&h.manifest.rootfs.root_hash);
+            let stale = !line.contains(&h.manifest.rootfs.root_hash)
+                // G1.6zm: an entry naming another ESP (this disk's had the
+                // image's GUID then, or another image wrote it) is renewed.
+                || self.entry_esp(s).is_some_and(|g| !g.eq_ignore_ascii_case(&self.esp.guid));
             let lacks_carry = s == running
                 && matches!(self.boot, BootStore::Bios(_))
                 && crate::carried(&self.cmdline)
