@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use crate::avail::Avail;
 use crate::dialog::{self, Footer, Form, Head, Press, Status};
 use crate::iface_tabs::{self, NicView, Tab};
+use crate::iface_wifi::WifiGo;
 use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment, num};
 use crate::{CoreRouterUi, Then, Win, form_number, human_bytes, value_text};
 
@@ -182,6 +183,9 @@ pub(crate) struct Props {
     pub port_pick: String,
     /// The tab shown (G1.19).
     pub tab: Tab,
+    /// G1.30h: OK or Enable was refused for want of a Wi-Fi country: the
+    /// window says so with Set Country… until the router has one.
+    pub need_country: bool,
 }
 
 impl Props {
@@ -196,6 +200,19 @@ impl Props {
             base_disabled: i.disabled,
             port_pick: String::new(),
             tab: Tab::General,
+            need_country: false,
+        }
+    }
+
+    /// The interface was enabled or disabled elsewhere (the country dialog
+    /// enabling a radio, the list): the Disabled box follows, unless the
+    /// operator changed it here.
+    fn follow_disabled(&mut self, now: bool) {
+        if now != self.base_disabled {
+            if self.disabled == self.base_disabled {
+                self.disabled = now;
+            }
+            self.base_disabled = now;
         }
     }
 
@@ -256,6 +273,30 @@ enum Button {
         bridge: String,
         port: String,
     },
+    /// G1.30h: the Wi-Fi country dialog; `enable`: it came from Enable, so
+    /// "Also enable" starts ticked.
+    Country {
+        enable: bool,
+    },
+    /// G1.30h: the Wi-Fi tab's Scan… and Connect….
+    WifiScan,
+    WifiConnect,
+}
+
+/// G1.30h: `error` without the "no Wi-Fi country" issue, which the window
+/// says its own way (with Set Country…, no terminal command): `None` when
+/// the error does not have it, `Some(None)` when nothing else is left.
+pub(crate) fn without_no_country(error: &str) -> Option<Option<String>> {
+    if !crate::wifi::is_no_country(error) {
+        return None;
+    }
+    const PREFIX: &str = "validation failed: ";
+    let issues = error.strip_prefix(PREFIX).unwrap_or(error);
+    let others: Vec<&str> = issues
+        .split("; ")
+        .filter(|i| !crate::wifi::is_no_country(i))
+        .collect();
+    Some((!others.is_empty()).then(|| format!("{PREFIX}{}", others.join("; "))))
 }
 
 impl CoreRouterUi {
@@ -564,8 +605,21 @@ impl CoreRouterUi {
     }
 
     fn set_disabled(&mut self, names: &[String], disabled: bool) {
+        // G1.30h: a radio refused for want of a country opens the country
+        // dialog, which enables it after.
+        let radios: Vec<String> = if disabled {
+            Vec::new()
+        } else {
+            self.ifaces().into_iter().filter(|i| i.kind == "wifi").map(|i| i.name).collect()
+        };
+        let parent = crate::win_id(Win::Interfaces);
         for n in names {
-            self.run("interface.set", json!({ "name": n, "disabled": disabled }));
+            let params = json!({ "name": n, "disabled": disabled });
+            if radios.contains(n) {
+                self.run_then("interface.set", params, crate::wifi::enable_then(parent, n));
+            } else {
+                self.run("interface.set", params);
+            }
         }
     }
 
@@ -606,6 +660,16 @@ impl CoreRouterUi {
             {
                 self.floats.forget(id);
                 return false;
+            }
+            if let Dialog::Props(p) = &mut d.dialog {
+                // G1.30h: no country: the window's own words and button.
+                if let Some(rest) = d.status.error.as_deref().and_then(without_no_country) {
+                    d.status.error = rest;
+                    p.need_country = true;
+                }
+                if let Some(i) = ifaces.iter().find(|i| i.name == p.name) {
+                    p.follow_disabled(i.disabled);
+                }
             }
             let title = dialog_title(&d.dialog);
             let eth = match &d.dialog {
@@ -740,6 +804,25 @@ impl CoreRouterUi {
                 })
                 .collect(),
             Dialog::Props(p) => {
+                match &b {
+                    Press::Other(Button::Country { enable }) => {
+                        // A radio still off is offered to the dialog's
+                        // "Also enable"; ticked when Enable brought it here.
+                        let off = ifaces.iter().any(|i| i.name == p.name && i.disabled);
+                        let names = if off { vec![p.name.clone()] } else { Vec::new() };
+                        crate::wifi::ask_country(self, dialog_id(d.id), names, *enable);
+                        return true;
+                    }
+                    Press::Other(Button::WifiScan) => {
+                        crate::wifi::scan_from(self, &p.name);
+                        return true;
+                    }
+                    Press::Other(Button::WifiConnect) => {
+                        crate::wifi::connect_from(self, &p.name);
+                        return true;
+                    }
+                    _ => {}
+                }
                 let (mut sends, close) = props_sends(p, &b, ifaces);
                 if let (Press::Ok | Press::Apply, Some(params)) = (&b, eth) {
                     sends.push((
@@ -878,6 +961,9 @@ fn props_sends(
                 )],
                 false,
             )
+        }
+        Press::Other(Button::Country { .. } | Button::WifiScan | Button::WifiConnect) => {
+            (Vec::new(), false)
         }
         Press::Cancel => (Vec::new(), true),
     }
@@ -1190,17 +1276,32 @@ fn dialog_body(
 ) -> Footer<Button> {
     let names: Vec<String> = ifaces.iter().map(|i| i.name.clone()).collect();
     let mut port_op: Option<(bool, String, String)> = None;
-    let mut toggle_label = None;
+    let mut go: Option<Button> = None;
+    let mut toggle = None;
     if let Dialog::Props(p) = d {
         let Some(i) = ifaces.iter().find(|i| i.name == p.name) else {
             return Footer::edit(true, can.check("interface.set"));
         };
-        toggle_label = Some(if i.disabled { "Enable" } else { "Disable" });
+        let country = nic.get(&p.name).and_then(NicView::wifi_country);
+        let no_country = country == Some(None);
+        if country.as_ref().is_some_and(Option::is_some) {
+            p.need_country = false;
+        }
+        toggle = Some(match (i.disabled, no_country) {
+            // G1.30h: Enable on a radio without a country asks for it first.
+            (true, true) => ("Enable", Button::Country { enable: true }, can.check("interface.wifi.country.set")),
+            (true, false) => ("Enable", Button::Toggle, can.check("interface.set")),
+            (false, _) => ("Disable", Button::Toggle, can.check("interface.set")),
+        });
         iface_tabs::tab_bar(ui, &mut p.tab, nic.get(&p.name));
+        if p.need_country && country_banner(ui, f.window(), can, help) {
+            go = Some(Button::Country { enable: true });
+        }
         if let Some(v) = nic.get_mut(&p.name) {
             v.unmanaged = i.unmanaged.clone();
         }
         let view = nic.get_mut(&p.name);
+        let mut set_country = false;
         iface_tabs::body(ui, p.tab, view, can, help, |ui, view, help| {
             // A fixed label column: the fields do not move while the
             // window settles (or when the MAC rows arrive).
@@ -1209,9 +1310,25 @@ fn dialog_body(
                 .min_col_width(96.0)
                 .spacing([12.0, 6.0])
                 .show(ui, |ui| {
-                    props_general(ui, f, p, i, ifaces, can, &mut port_op, view, help)
+                    let country = view.and_then(NicView::wifi_country);
+                    let ops = Ops {
+                        port: &mut port_op,
+                        country: &mut set_country,
+                    };
+                    props_general(ui, f, p, i, ifaces, can, ops, view, country, help)
                 });
         });
+        if set_country {
+            go = Some(Button::Country { enable: false });
+        }
+        // G1.30h: the Wi-Fi tab's buttons.
+        if let Some(g) = nic.get_mut(&p.name).and_then(|v| v.wifi_go.take()) {
+            go = Some(match g {
+                WifiGo::Country => Button::Country { enable: false },
+                WifiGo::Scan => Button::WifiScan,
+                WifiGo::Connect => Button::WifiConnect,
+            });
+        }
     } else {
         Grid::new("fields")
             .num_columns(2)
@@ -1262,14 +1379,46 @@ fn dialog_body(
         Dialog::Comment { .. } | Dialog::Props(_) => "interface.set",
     });
     let mut footer = Footer::edit(!matches!(d, Dialog::Comment { .. }), ok);
-    if let Some(t) = toggle_label {
-        footer.extra = vec![
-            (t, Button::Toggle, can.check("interface.set")),
-            ("Remove", Button::Remove, can.check("interface.remove")),
-        ];
+    if let Some(t) = toggle {
+        footer.extra = vec![t, ("Remove", Button::Remove, can.check("interface.remove"))];
     }
-    footer.pressed = port_op.map(|(add, bridge, port)| Button::Port { add, bridge, port });
+    footer.pressed = go.or(port_op.map(|(add, bridge, port)| Button::Port { add, bridge, port }));
     footer
+}
+
+/// G1.30h: under the tabs of a radio whose Enable was refused for want of
+/// a country: why, in the window's words, and the button. Whether it was
+/// pressed.
+fn country_banner(
+    ui: &mut Ui,
+    window: egui::Id,
+    can: &Avail,
+    help: &mut Option<(&'static str, &'static str)>,
+) -> bool {
+    let mut pressed = false;
+    let warn = ui.visuals().warn_fg_color;
+    egui::Frame::group(ui.style()).stroke(egui::Stroke::new(1.0, warn)).show(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(
+                warn,
+                "Set the Wi-Fi country before enabling this radio: it decides the channels and \
+                 the power the radio may use.",
+            );
+            if crate::help::info_button(ui, window.with("need-country"), "Wi-Fi Country").clicked() {
+                *help = Some(("iface_wifi.need_country", "Wi-Fi Country"));
+            }
+            pressed = action(ui, "Set Country…", can.check("interface.wifi.country.set"));
+        });
+    });
+    pressed
+}
+
+/// What the General tab's own buttons asked for.
+struct Ops<'a> {
+    /// Bridge port edits: (add, bridge, port).
+    port: &'a mut Option<(bool, String, String)>,
+    /// G1.30h: Set Country… / Change… on a Wi-Fi port.
+    country: &'a mut bool,
 }
 
 /// The General tab of "Interface <name>": the editable fields, the MAC
@@ -1282,10 +1431,12 @@ fn props_general(
     i: &Iface,
     ifaces: &[Iface],
     can: &Avail,
-    port_op: &mut Option<(bool, String, String)>,
+    ops: Ops<'_>,
     view: Option<&NicView>,
+    country: Option<Option<String>>,
     help: &mut Option<(&'static str, &'static str)>,
 ) {
+    let port_op = ops.port;
     let (mac, perm_mac, l2mtu) = view.map(NicView::general).unwrap_or_default();
     ui.label("Name");
     ui.add_enabled(
@@ -1315,6 +1466,27 @@ fn props_general(
     ui.label("Disabled");
     ui.checkbox(&mut p.disabled, "");
     ui.end_row();
+    // G1.30h: the country every radio needs, settable from here.
+    if let Some(country) = country {
+        help_label(ui, f.window(), "Country", "iface_wifi.country", help);
+        ui.horizontal(|ui| {
+            let v = ui.visuals().clone();
+            let label = match &country {
+                Some(c) => {
+                    crate::chip::chip(ui, c, crate::chip::neutral_tone(&v));
+                    "Change…"
+                }
+                None => {
+                    crate::chip::chip(ui, "no country", crate::chip::AMBER.tone(&v));
+                    "Set Country…"
+                }
+            };
+            if small_action(ui, label, None, can.check("interface.wifi.country.set")) {
+                *ops.country = true;
+            }
+        });
+        ui.end_row();
+    }
     if let (Some(parent), Some(id)) = (&i.parent, &i.vlan_id) {
         ui.label("Interface");
         ui.label(parent);

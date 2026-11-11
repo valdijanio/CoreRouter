@@ -997,14 +997,22 @@ impl CoreRouterUi {
     /// build than the GUI (G0.32): a daemon left running after a rebuild, or
     /// a router on an older or newer image. Both versions are shown in full
     /// (`0.1.0-dev.500+320cb9d`) when only the commit differs. A daemon from
-    /// before G0.32 has no `version_full`: its commit stands in. Local
-    /// sessions are the GUI itself.
+    /// before G0.32 has no `version_full`: its commit stands in. A daemon
+    /// built from the same files under another commit (`tree`) is not
+    /// flagged. Local sessions are the GUI itself.
     pub fn stale_daemon(&self) -> Option<String> {
         if matches!(self.link, Link::Local) || corerouter_buildinfo::COMMIT == "unknown" {
             return None;
         }
         let info = &self.cache.info;
         let text = |k: &str| info.get(k).and_then(Value::as_str);
+        // The same files under another commit (a branch's build and its
+        // squash on the main): nothing is missing on either side.
+        if let (Some(tree), Some(build)) = (text("tree"), text("build"))
+            && corerouter_buildinfo::same_files(tree, build)
+        {
+            return None;
+        }
         let Some(full) = text("version_full") else {
             let theirs = text("commit")?;
             return (theirs != corerouter_buildinfo::COMMIT && theirs != "unknown")
@@ -2926,6 +2934,20 @@ mod tests {
             "daemon {v}+abc1234 ≠ GUI {}",
             corerouter_buildinfo::full()
         )));
+        // Another commit with the same files (a branch build and its squash
+        // on the main): no warning, unless either build was dirty.
+        if !corerouter_buildinfo::BUILD.ends_with(".dirty") {
+            h.app.cache.info = json!({"name": "corerouter", "version": "0.1.0-dev.1", "version_full": "0.1.0-dev.1+abc1234",
+                "auth": "required", "commit": "abc1234", "build": "abc1234", "tree": corerouter_buildinfo::TREE,
+                "protocol": corerouter_buildinfo::PROTOCOL});
+            h.idle();
+            assert_eq!(h.app.stale_daemon(), None);
+        }
+        h.app.cache.info = json!({"name": "corerouter", "version": "0.1.0-dev.1", "version_full": "0.1.0-dev.1+abc1234.dirty",
+            "auth": "required", "commit": "abc1234", "build": "abc1234.dirty", "tree": corerouter_buildinfo::TREE,
+            "protocol": corerouter_buildinfo::PROTOCOL});
+        h.idle();
+        assert_eq!(h.app.stale_daemon().as_deref(), Some("0.1.0-dev.1"));
         // Another control protocol: red.
         h.app.cache.info = json!({"name": "corerouter", "version": "0.2.0", "version_full": "0.2.0+abc1234",
             "auth": "required", "commit": "abc1234", "protocol": corerouter_buildinfo::PROTOCOL + 1});

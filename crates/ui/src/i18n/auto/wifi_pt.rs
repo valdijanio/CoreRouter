@@ -3,6 +3,7 @@
 
 /// Labels: (English, Portuguese).
 pub(super) const LABELS: &[(&str, &str)] = &[
+    (r##"Also enable"##, r##"Ativar também"##),
     (r##"BSSID"##, r##"BSSID"##),
     (r##"Band"##, r##"Banda"##),
     (r##"Change…"##, r##"Alterar…"##),
@@ -41,6 +42,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"State"##, r##"Estado"##),
     (r##"This router has no Wi-Fi radio"##, r##"Este roteador não tem rádio Wi-Fi"##),
     (r##"Two letters (ISO 3166-1): BR, US, DE. One country for every radio."##, r##"Duas letras (ISO 3166-1): BR, US, DE. Um país para todos os rádios."##),
+    (r##"Type the country's two letters (BR, US, DE) to enable the radio"##, r##"Digite as duas letras do país (BR, US, DE) para ativar o rádio"##),
     (r##"Wi-Fi"##, r##"Wi-Fi"##),
     (r##"Wi-Fi Country"##, r##"País do Wi-Fi"##),
     (r##"absent"##, r##"ausente"##),
