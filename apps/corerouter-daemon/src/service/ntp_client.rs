@@ -17,6 +17,12 @@
 //! [`SystemClock`]. The virtual lab has none: it only measures. Without
 //! `CAP_SYS_TIME` the client keeps measuring and says why.
 //!
+//! The first step of a boot (G4.6m): [`BootStep`] lets the discipline pass
+//! PANICT (1000 s) once per boot (RFC 8633 §5.2, "at startup"): forward any
+//! amount, backward a day at most. The mark is the kernel's `boot_id` in the
+//! runtime directory (tmpfs on the image), so a daemon restarted in the same
+//! boot asks again.
+//!
 //! Servers: the configured ones, then those of DHCP clients with
 //! `use_peer_ntp` (G4.7a), at most [`MAX_SERVERS`] (a DHCP answer is hostile
 //! input). Sockets: a new one per exchange, on a port the kernel picks
@@ -30,7 +36,9 @@
 //! that brings a server is asked at once.
 
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::path::PathBuf;
 #[cfg(test)]
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -40,7 +48,7 @@ use corerouter_hal::clock::{ClockError, SystemClock};
 use corerouter_model::ntp::{
     ClockState, MAIN_VRF, MAX_SERVERS, NO_SERVER, NtpClient, NtpState, NtpStatus, POLL_RANGE,
 };
-use corerouter_proto_ntp::discipline::{Action, Discipline};
+use corerouter_proto_ntp::discipline::{Action, Discipline, PANIC_NANOS};
 use corerouter_proto_ntp::{Packet, ReplyError, Sample, Timestamp, check_reply, sample_of};
 
 /// How long to wait for one server's answer.
@@ -59,7 +67,7 @@ pub fn spawn(session: Shared, port: u16) -> std::io::Result<()> {
     let health = super::Health::new(corerouter_control::Shutdown::default());
     thread::Builder::new()
         .name("ntp-client".into())
-        .spawn(move || run(&session, port, &health, None))
+        .spawn(move || run(&session, port, &health, None, &BootStep::system()))
         .map(|_| ())
 }
 
@@ -68,6 +76,56 @@ fn unix_nanos() -> i128 {
         .duration_since(UNIX_EPOCH)
         .map(|d| i128::try_from(d.as_nanos()).unwrap_or(i128::MAX))
         .unwrap_or(0)
+}
+
+/// G4.6m: the mark of this boot's first clock step. The file holds the
+/// kernel's `boot_id`: another boot (or no file) leaves the step open, the
+/// same boot (a daemon restarted) has spent it. In the runtime directory,
+/// tmpfs on the image; the `boot_id` keeps it right where it is not.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BootStep {
+    marker: Option<PathBuf>,
+    boot: Option<String>,
+}
+
+/// The mark's file name in the runtime directory.
+const BOOT_STEP_FILE: &str = "ntp-boot-step";
+
+impl BootStep {
+    pub(crate) fn system() -> Self {
+        Self::at(
+            corerouter_control::local_token::runtime_dir().map(|d| d.join(BOOT_STEP_FILE)),
+            read_small("/proc/sys/kernel/random/boot_id"),
+        )
+    }
+
+    fn at(marker: Option<PathBuf>, boot: Option<String>) -> Self {
+        Self { marker, boot }
+    }
+
+    /// The step of this boot is still unspent. Without a runtime directory
+    /// or a `boot_id` it is open for this run of the daemon only.
+    fn open(&self) -> bool {
+        match (&self.marker, &self.boot) {
+            (Some(m), Some(b)) => read_small(m).is_none_or(|t| t != *b),
+            _ => true,
+        }
+    }
+
+    fn spend(&self) {
+        if let (Some(m), Some(b)) = (&self.marker, &self.boot)
+            && let Err(e) = std::fs::write(m, b)
+        {
+            log::warn!("NTP: {}: {e} (the first-step mark of this boot)", m.display());
+        }
+    }
+}
+
+/// A small text file, trimmed (at most 128 bytes: hostile input).
+fn read_small(path: impl AsRef<std::path::Path>) -> Option<String> {
+    let mut text = String::new();
+    std::fs::File::open(path).ok()?.take(128).read_to_string(&mut text).ok()?;
+    Some(text.trim().to_owned()).filter(|t| !t.is_empty())
 }
 
 /// Carries out the discipline on the backend's clock.
@@ -87,6 +145,8 @@ struct ClockDriver {
     complained: bool,
     /// The question to the operator was already logged, for this offset.
     asked: Option<i64>,
+    /// G4.6m: where this boot's first step is marked (`None`: never open).
+    boot: Option<BootStep>,
 }
 
 impl ClockDriver {
@@ -106,7 +166,17 @@ impl ClockDriver {
             start: Instant::now(),
             complained: false,
             asked: None,
+            boot: None,
         }
+    }
+
+    /// G4.6m: with the boot's first step, when this boot has not spent it.
+    fn with_boot_step(mut self, boot: &BootStep) -> Self {
+        if boot.open() {
+            self.discipline.allow_boot_step();
+        }
+        self.boot = Some(boot.clone());
+        self
     }
 
     fn now(&self) -> f64 {
@@ -168,16 +238,32 @@ impl ClockDriver {
         confirmed: bool,
     ) -> Option<(&'static str, String)> {
         self.clock.as_ref()?;
+        let open = self.discipline.boot_step_open();
         let action = self.discipline.update(self.now(), wall_unix, offset_nanos, confirmed);
+        let spent = open && !self.discipline.boot_step_open();
         match self.carry_out(action, delay_nanos) {
             Ok(said) => {
                 self.error = None;
                 self.complained = false;
-                said
+                if spent && let Some(boot) = &self.boot {
+                    boot.spend();
+                }
+                // RFC 8633 §5.2: past PANICT only at startup; the log says why.
+                let big = matches!(action, Action::Step { offset_nanos } if offset_nanos.saturating_abs() >= PANIC_NANOS);
+                match said {
+                    Some((level, text)) if spent && big && !confirmed => Some((
+                        level,
+                        format!("{text} (primeiro acerto deste boot, sem confirmação: RFC 8633 §5.2)"),
+                    )),
+                    other => other,
+                }
             }
             Err(e) => {
                 // Whatever the discipline believed did not happen.
                 self.discipline.reset();
+                if open {
+                    self.discipline.allow_boot_step();
+                }
                 self.frequency = None;
                 self.taken_over = false;
                 self.state = ClockState::NotSet;
@@ -307,14 +393,15 @@ fn merged_servers(cfg: &NtpClient, dynamic: &[std::net::Ipv4Addr]) -> (Vec<Strin
 
 type OpenClock<'a> = Option<&'a dyn Fn() -> Result<Box<dyn SystemClock>, String>>;
 
-fn open_clock(session: &Shared, open: OpenClock<'_>) -> ClockDriver {
+fn open_clock(session: &Shared, open: OpenClock<'_>, boot: &BootStep) -> ClockDriver {
     ClockDriver::new(match open {
         Some(f) => f(),
         None => lock(session).open_system_clock(),
     })
+    .with_boot_step(boot)
 }
 
-fn run(session: &Shared, port: u16, health: &super::Health, open: OpenClock<'_>) {
+fn run(session: &Shared, port: u16, health: &super::Health, open: OpenClock<'_>, boot: &BootStep) {
     let mut cfg: Option<NtpClient> = None;
     let mut status = NtpStatus::default();
     let mut poll_exp = 0u8;
@@ -356,7 +443,7 @@ fn run(session: &Shared, port: u16, health: &super::Health, open: OpenClock<'_>)
                 d.stand_down();
             }
             if now_cfg.enabled && now_cfg.set_system_clock {
-                driver.get_or_insert_with(|| open_clock(session, open));
+                driver.get_or_insert_with(|| open_clock(session, open, boot));
             }
             cfg = Some(now_cfg.clone());
         } else if now_dynamic != dynamic {
@@ -737,7 +824,7 @@ fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
     }
     let session = ctx.session.clone();
     Ok(Box::new(move |health: &super::Health| {
-        run(&session, corerouter_proto_ntp::PORT, health, None);
+        run(&session, corerouter_proto_ntp::PORT, health, None, &BootStep::system());
         Ok(())
     }))
 }
@@ -1134,7 +1221,7 @@ mod tests {
         );
         thread::spawn(move || {
             let open = move || opener.boxed();
-            run(&s2, port, &health, Some(&open));
+            run(&s2, port, &health, Some(&open), &BootStep::default());
         });
         let deadline = Instant::now() + Duration::from_secs(10);
         let st = loop {
@@ -1153,6 +1240,65 @@ mod tests {
         assert!((2_900..=3_100).contains(&step_ms), "{step_ms} ms");
         assert!(st.last_adjustment_ms.is_some());
         assert_eq!(st.poll_secs, Some(64), "settling: not doubled after a step");
+    }
+
+    /// G4.6m, RFC 8633 §5.2: the notebook of the audit booted 2 h 50 min
+    /// behind and waited for `confirm-step`. Now the boot's first step goes
+    /// through, the mark (this boot's id) is written, and a daemon started
+    /// again in the same boot asks for a big step as before.
+    #[test]
+    fn the_first_step_of_a_boot_needs_no_confirmation_once() {
+        let dir = std::env::temp_dir().join(format!("cr-ntp-boot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join(BOOT_STEP_FILE);
+        // A mark of an earlier boot does not count.
+        std::fs::write(&marker, "earlier-boot").unwrap();
+        let boot = BootStep::at(Some(marker.clone()), Some("this-boot".into()));
+        let start = |skew_ms: i128| {
+            let port = server(skew_ms, None);
+            let session = shared(Session::virtual_lab());
+            lock(&session)
+                .execute("system.ntp.client.set", &json!({"enabled": true, "servers": ["127.0.0.1"]}))
+                .unwrap();
+            let fake = FakeClock::default();
+            let opener = fake.clone();
+            let (s2, health, boot) = (
+                session.clone(),
+                super::super::Health::new(corerouter_control::Shutdown::default()),
+                boot.clone(),
+            );
+            thread::spawn(move || {
+                let open = move || opener.boxed();
+                run(&s2, port, &health, Some(&open), &boot);
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let st = loop {
+                let st = lock(&session).ntp_status();
+                let settled = matches!(st.clock, ClockState::Stepped | ClockState::AwaitingConfirmation);
+                if settled || Instant::now() > deadline {
+                    break st;
+                }
+                thread::sleep(Duration::from_millis(50));
+            };
+            let log = lock(&session).execute("log.print", &json!({"find": "NTP"})).unwrap().to_string();
+            (st, fake, log)
+        };
+        let (st, fake, log) = start(10_200_000);
+        assert_eq!(st.clock, ClockState::Stepped, "{st:?}");
+        let step = fake.ops().into_iter().find_map(|o| match o {
+            Op::Step(n) => Some(n / SEC),
+            _ => None,
+        });
+        assert!(step.is_some_and(|s| (10_199..=10_201).contains(&s)), "{step:?}");
+        assert!(log.contains("primeiro acerto deste boot"), "{log}");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "this-boot");
+        // The daemon again, same boot: PANICT holds.
+        let (st, fake, log) = start(5_000_000);
+        assert_eq!(st.clock, ClockState::AwaitingConfirmation, "{st:?}");
+        assert!(!fake.ops().iter().any(|o| matches!(o, Op::Step(_))));
+        assert!(log.contains("confirm-step"), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `set_system_clock=no`: measures, never opens the clock.
@@ -1174,7 +1320,7 @@ mod tests {
         );
         thread::spawn(move || {
             let open = move || opener.boxed();
-            run(&s2, port, &health, Some(&open));
+            run(&s2, port, &health, Some(&open), &BootStep::default());
         });
         let deadline = Instant::now() + Duration::from_secs(10);
         let st = loop {

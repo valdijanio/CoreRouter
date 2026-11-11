@@ -65,13 +65,22 @@ medida passa pela disciplina (`crates/proto-ntp/src/discipline.rs`, pura), que s
 |---|---|---|---|
 | < 128 ms | slew | slew | slew, volta a sincronia |
 | 128 ms a 1000 s | salto | fica em observação (`holding-spike`) | após 900 s, salto |
-| ≥ 1000 s | pede confirmação | pede confirmação | pede confirmação |
+| ≥ 1000 s | primeiro acerto do boot: salto (para trás, até 1 dia); depois, pede confirmação | pede confirmação | pede confirmação |
 
 - **Pede confirmação:** `clock: awaiting-confirmation` e `pending_step_ms`. O operador roda
   `system.ntp.client.confirm-step` (ou o botão da janela); a rodada seguinte mede de novo e só salta
   se a nova medida estiver a até 60 s do que ele viu.
+- **Primeiro acerto do boot (G4.6m):** a primeira sincronia de cada boot salta sem confirmação,
+  para frente qualquer valor e para trás até 1 dia; acima de 1 dia para trás, pede confirmação
+  como antes. É o que a RFC 8633 §5.2 permite "na partida" e o que fazem o ntpd `-g`, o chrony
+  `makestep`, o systemd-timesyncd, o ntpd-rs e o RouterOS. O caso típico: relógio da placa em
+  hora local (máquina com Windows) ou bateria fraca; o notebook da auditoria ficou 2 h 50 min
+  atrasado esperando alguém. A primeira sincronia (salto ou slew) gasta a vez, e o limite de
+  1000 s volta. A marca é o `boot_id` do kernel em `ntp-boot-step`, na pasta de execução (tmpfs
+  na imagem): reiniciar o daemon no mesmo boot não abre a vez de novo. O log diz "primeiro
+  acerto deste boot, sem confirmação".
 - **Relógio antes de 2026-01-01:** está errado com certeza (roteador sem bateria depois do boot):
-  o limite de 1000 s não vale. É o único caso sem confirmação.
+  o limite de 1000 s não vale, em qualquer momento.
 - **Nunca para trás de 2026-01-01:** recusado sempre, mesmo confirmado (`clock: refused`, RFC 8633
   §5.2).
 - **Só o backend linux com `CAP_SYS_TIME`.** O laboratório virtual nunca toca no relógio. Sem a
