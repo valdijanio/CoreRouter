@@ -386,7 +386,7 @@ fn run(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(), S
             &serde_json::json!({"name": "wifi2", "passphrase": PASSPHRASE, "security": security}),
         )?;
         // The link of before stays up until the next tick tells the radio.
-        let m = monitor(vm, log, 60, |m| {
+        monitor(vm, log, 60, |m| {
             m["state"] == "connected" && m["failure"].is_null() && m["security"] == want
         })?;
         nums.put(
