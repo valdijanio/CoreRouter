@@ -126,6 +126,10 @@ struct Slot {
     delay: Duration,
     last_event: String,
     last_error: Option<String>,
+    /// `last_error` came from the current run's own report (G1.6zr): when
+    /// the service clears it (`Health::clear_error`), it goes away; the
+    /// supervisor's word on a past failure stays until then.
+    error_from_run: bool,
     /// The late heartbeat was logged.
     stalled: bool,
     /// Restart asked for: the next run waits until the last run's helper
@@ -226,6 +230,7 @@ impl Supervisor {
             delay: self.policy.first_delay,
             last_event: String::new(),
             last_error: None,
+            error_from_run: false,
             stalled: false,
             drain_until: None,
         });
@@ -502,6 +507,7 @@ impl Supervisor {
         match spawned {
             Ok(t) => {
                 slot.health = health;
+                slot.error_from_run = false;
                 slot.thread = Some(t);
                 slot.started = Some(now);
                 slot.phase = Phase::Running;
@@ -574,8 +580,14 @@ impl Supervisor {
                 if let Some(e) = &report.event {
                     slot.last_event.clone_from(e);
                 }
+                // G1.6zr: the NTP client kept "no server to ask" while
+                // synchronized: an error the service cleared stayed.
                 if report.error.is_some() {
                     slot.last_error.clone_from(&report.error);
+                    slot.error_from_run = true;
+                } else if slot.error_from_run {
+                    slot.last_error = None;
+                    slot.error_from_run = false;
                 }
                 if age.is_some_and(|a| a > policy.stall) {
                     let a = age.unwrap_or_default().as_secs();
@@ -705,6 +717,32 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    /// G1.6zr: `ntp-client` showed `last_error: "no server to ask"` long
+    /// after the DHCP server's NTP server synchronized it.
+    #[test]
+    fn an_error_the_service_clears_leaves_its_row() {
+        let (mut sup, _session) = sup();
+        let phase = Arc::new(AtomicU32::new(0));
+        let p = phase.clone();
+        sup.add(
+            leak("clock", &[]),
+            Box::new(move |h: &Health| {
+                while h.sleep(Duration::from_millis(5)) {
+                    h.beat();
+                    match p.load(Ordering::SeqCst) {
+                        0 => h.error("no server to ask"),
+                        _ => h.clear_error(),
+                    }
+                }
+                Ok(())
+            }),
+        );
+        until(&mut sup, "clock", |r| r.last_error.as_deref() == Some("no server to ask"));
+        phase.store(1, Ordering::SeqCst);
+        let r = until(&mut sup, "clock", |r| r.last_error.is_none());
+        assert_eq!(r.state, ServiceState::Running, "{r:?}");
     }
 
     #[test]

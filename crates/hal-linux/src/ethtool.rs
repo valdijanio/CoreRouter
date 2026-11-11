@@ -790,13 +790,18 @@ pub(crate) fn bitset(set: Attrs<'_>) -> Vec<(String, bool)> {
         .collect()
 }
 
+/// `PORT_*` of `include/uapi/linux/ethtool.h` (6.18: `PORT_TP 0x00`,
+/// `PORT_AUI 0x01`, `PORT_MII 0x02`, `PORT_FIBRE 0x03`, `PORT_BNC 0x04`,
+/// `PORT_DA 0x05`, `PORT_NONE 0xef`, `PORT_OTHER 0xff`). G1.6zr: BNC and
+/// MII were swapped, so the r8152 (`mii_ethtool_get_link_ksettings`
+/// reports `PORT_MII`) showed as `bnc`.
 fn port_name(p: u8) -> String {
     match p {
         0 => "twisted-pair",
         1 => "aui",
-        2 => "bnc",
-        3 => "mii",
-        4 => "fibre",
+        2 => "mii",
+        3 => "fibre",
+        4 => "bnc",
         5 => "direct-attach",
         0xef => "none",
         _ => "other",
@@ -965,6 +970,24 @@ pub(crate) fn devlink_info(bus: &str, dev: &str, hw: &mut NicHardware) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G1.6zr: every `PORT_*` of `include/uapi/linux/ethtool.h` (6.18.59),
+    /// value by value.
+    #[test]
+    fn port_names_follow_the_kernel_header() {
+        for (value, name) in [
+            (0x00, "twisted-pair"),  // PORT_TP
+            (0x01, "aui"),           // PORT_AUI
+            (0x02, "mii"),           // PORT_MII (r8152, drivers/net/mii.c)
+            (0x03, "fibre"),         // PORT_FIBRE
+            (0x04, "bnc"),           // PORT_BNC
+            (0x05, "direct-attach"), // PORT_DA
+            (0xef, "none"),          // PORT_NONE
+            (0xff, "other"),         // PORT_OTHER
+        ] {
+            assert_eq!(port_name(value), name, "PORT value {value:#04x}");
+        }
+    }
 
     /// A nested attribute, encoded by hand.
     fn nla(kind: u16, data: &[u8]) -> Vec<u8> {

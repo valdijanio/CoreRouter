@@ -111,7 +111,9 @@ pub fn parse(body: &[u8]) -> Option<RawNeigh> {
         }
     }
     let address = address?;
-    if address.is_multicast() {
+    // G1.6zr: the kernel's own `NOARP` entries are not neighbors either:
+    // 0.0.0.0 on `lo` (and the loopback addresses) showed in `ip.arp.list`.
+    if address.is_multicast() || address.is_unspecified() || address.is_loopback() {
         return None;
     }
     let state = NeighState::from_nud(state);
@@ -1010,6 +1012,30 @@ mod tests {
         assert!(parse(&body(AF_INET, 1, 0x02, 0, &[])).is_none());
         // A wrong-size address is skipped, not trusted.
         assert!(parse(&body(AF_INET, 1, 0x02, 0, &[(NDA_DST, &[1, 2, 3])])).is_none());
+    }
+
+    /// G1.6zr: the notebook's `ip.arp.list` had 0.0.0.0 /
+    /// 00:00:00:00:00:00 on `lo` (state NOARP), the kernel's own entry.
+    #[test]
+    fn the_kernels_unspecified_and_loopback_entries_are_not_neighbors() {
+        let lo = 1;
+        for dst in [&[0u8, 0, 0, 0][..], &[127, 0, 0, 1]] {
+            let b = body(
+                AF_INET,
+                lo,
+                0x40,
+                0,
+                &[(NDA_DST, dst), (NDA_LLADDR, &[0; 6])],
+            );
+            assert!(parse(&b).is_none(), "{dst:?}");
+        }
+        for dst in [Ipv6Addr::UNSPECIFIED, Ipv6Addr::LOCALHOST] {
+            let b = body(AF_INET6, lo, 0x40, 0, &[(NDA_DST, &dst.octets())]);
+            assert!(parse(&b).is_none(), "{dst}");
+        }
+        // A NOARP entry of a real address (a point-to-point peer) stays.
+        let b = body(AF_INET, 5, 0x40, 0, &[(NDA_DST, &[10, 9, 9, 1])]);
+        assert_eq!(parse(&b).unwrap().state, Some(NeighState::Noarp));
     }
 
     #[test]

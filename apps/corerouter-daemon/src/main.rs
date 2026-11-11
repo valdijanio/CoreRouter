@@ -813,6 +813,8 @@ fn main() -> ExitCode {
     );
     bootstrap_admin(&session, args.reset_admin);
     warn_open_admin(&session, &args);
+    // Before the certificate: a new one is named after the node id (G1.6zr).
+    let node_id = node_id::load_or_create(config_dir.as_deref());
     let tls = match tls_identity(&args, config_dir.as_deref()) {
         Ok(t) => t,
         Err(e) => {
@@ -830,7 +832,6 @@ fn main() -> ExitCode {
     };
     gate.add_local_token(&token);
     let token_file = write_local_token(&args, &token);
-    let node_id = node_id::load_or_create(config_dir.as_deref());
     let crdp = match args.discovery_port {
         None => None,
         Some(port) => {

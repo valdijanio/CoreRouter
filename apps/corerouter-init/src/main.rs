@@ -21,6 +21,8 @@
 //! that goes away is one clear line (`disk_watch`).
 
 #[cfg(target_os = "linux")]
+mod comm;
+#[cfg(target_os = "linux")]
 mod console;
 #[cfg(target_os = "linux")]
 mod ctl;
@@ -54,6 +56,11 @@ mod wifi_names;
 #[cfg(target_os = "linux")]
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // G1.6zr: not `exe` in the process list (PID 1 runs these through
+    // `/proc/self/exe`).
+    if let Some(name) = args.first().and_then(|m| comm::of_mode(m)) {
+        let _ = comm::set(name);
+    }
     match args.first().map(String::as_str) {
         Some("run") => std::process::exit(ctl::main(args.get(1..).unwrap_or(&[]))),
         Some("setup") => std::process::exit(setup::main(args.get(1..).unwrap_or(&[]))),

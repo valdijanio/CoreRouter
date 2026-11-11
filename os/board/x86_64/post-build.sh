@@ -88,3 +88,38 @@ if [ -f "$T/usr/sbin/hostapd" ]; then
 	mv "$T/usr/sbin/hostapd" "$BINARIES_DIR/test-tools/hostapd"
 fi
 rm -f "$T/usr/bin/hostapd_cli" "$T/etc/hostapd.conf"
+# G1.6zr: pci.ids (hwdata) only for the PCI network cards the image's drivers
+# bind: the ids in the pci: aliases of the modules and built-ins under
+# drivers/net and of virtio_pci (a VM's virtio-net card is a PCI device of
+# its), named from the full database (vendor and device lines; the
+# subsystem lines and the classes go). interface.hardware and the health
+# check name a card from it (hal-linux pci_ids); `cargo xtask os build`
+# checks it still names the cards of docs/os-image.md.
+IDS="$T/usr/share/hwdata/pci.ids"
+if [ -f "$IDS" ]; then
+	MODS=$(ls -d "$T"/lib/modules/*/ | head -n 1)
+	{
+		echo "M virtio_pci"
+		awk -F: '$1 ~ /\/drivers\/net\// { n = $1; sub(/.*\//, "", n); sub(/\.ko.*/, "", n); gsub(/-/, "_", n); print "M " n }' "$MODS/modules.dep"
+		awk '/\/drivers\/net\// { n = $0; sub(/.*\//, "", n); sub(/\.ko.*/, "", n); gsub(/-/, "_", n); print "M " n }' "$MODS/modules.builtin"
+		awk '$1 == "alias" && $2 ~ /^pci:v/ { n = $NF; gsub(/-/, "_", n); print "A " n " " $2 }' "$MODS/modules.alias"
+		tr '\0' '\n' < "$MODS/modules.builtin.modinfo" |
+			awk -F'.alias=' 'NF == 2 && $2 ~ /^pci:v/ { n = $1; gsub(/-/, "_", n); print "A " n " " $2 }'
+	} | awk '
+		$1 == "M" { net[$2] = 1; next }
+		$1 == "A" && ($2 in net) {
+			v = tolower(substr($3, 10, 4)); d = tolower(substr($3, 19, 4))
+			if (substr($3, 6, 1) == "*") next
+			if (substr($3, 15, 1) == "*") print "V " v; else print "D " v " " d
+		}' | sort -u > "$IDS.want"
+	awk '
+		FILENAME == ARGV[1] { if ($1 == "V") wild[$2] = 1; else { dev[$2 " " $3] = 1; vend[$2] = 1 } next }
+		/^#/ { if (!seen) print; next }
+		/^C / { exit }
+		/^\t\t/ || /^[ \t]*$/ { next }
+		/^\t/ { seen = 1; if (cur != "" && ((cur " " substr($0, 2, 4)) in dev || cur in wild)) print; next }
+		{ seen = 1; cur = ""; if (substr($0, 1, 4) in vend || substr($0, 1, 4) in wild) { cur = substr($0, 1, 4); print } }
+	' "$IDS.want" "$IDS" > "$IDS.net"
+	mv "$IDS.net" "$IDS"
+	rm -f "$IDS.want"
+fi

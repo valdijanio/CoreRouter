@@ -82,7 +82,7 @@ pub fn load_or_create(dir: &Path) -> Result<(ServerIdentity, bool), String> {
     let key_path = dir.join(KEY_FILE);
     let created = !(cert_path.exists() && key_path.exists());
     if created {
-        let (cert_pem, key_pem) = generate()?;
+        let (cert_pem, key_pem) = generate_for(node_tag(dir).as_deref())?;
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         write_private(&key_path, key_pem.as_bytes())
             .map_err(|e| format!("{}: {e}", key_path.display()))?;
@@ -95,11 +95,71 @@ pub fn load_or_create(dir: &Path) -> Result<(ServerIdentity, bool), String> {
     Ok((identity_from_pem(&cert, &key)?, created))
 }
 
-/// A new self-signed certificate and its key, as PEM.
+/// A new self-signed certificate and its key, as PEM (see [`generate_for`]).
 pub fn generate() -> Result<(String, String), String> {
-    let names = vec![SERVER_NAME.to_owned(), "localhost".to_owned()];
-    let ck = rcgen::generate_simple_self_signed(names).map_err(|e| format!("certificate: {e}"))?;
-    Ok((ck.cert.pem(), ck.signing_key.serialize_pem()))
+    generate_for(None)
+}
+
+/// The router's node id kept next to the certificate (`<dir>/node-id`, 32
+/// hex digits, made by the daemon before the certificate): its first 8
+/// digits tell two routers' certificates apart.
+fn node_tag(dir: &Path) -> Option<String> {
+    let mut text = String::new();
+    fs::File::open(dir.join("node-id"))
+        .ok()?
+        .take(64)
+        .read_to_string(&mut text)
+        .ok()?;
+    let tag: String = text.trim().chars().take(8).collect();
+    (tag.len() == 8 && tag.chars().all(|c| c.is_ascii_hexdigit())).then(|| tag.to_ascii_lowercase())
+}
+
+/// A new self-signed certificate and its key, as PEM (G1.6zr). Before, the
+/// certificate was rcgen's sample: CN "rcgen self signed cert", valid from
+/// 1975 to 4096. Now:
+///
+/// - CN `CoreRouter <tag>` (the node id's first digits) and O `CoreRouter`:
+///   a browser's warning and certificate list say what it is and which
+///   router;
+/// - SAN `corerouter` (the name the CLI/GUI check against the pinned
+///   certificate), `localhost`, `127.0.0.1`, `::1`. The router's own
+///   addresses and identity stay out: the certificate is pinned on first
+///   use and an address change must not change it (a certificate made
+///   from them on demand is the gap G1.6zs);
+/// - valid from 2025-01-01 (before any CoreRouter, so a client whose clock
+///   is behind still accepts it) to 9999-12-31 23:59:59, RFC 5280
+///   §4.1.2.5's "no well-defined expiration date": a self-signed
+///   certificate that expires locks the operator out (RouterOS'
+///   `days-valid` default is 365);
+/// - a server certificate, not a CA (`basicConstraints` CA:FALSE, key
+///   usage digitalSignature, extended key usage serverAuth).
+pub fn generate_for(tag: Option<&str>) -> Result<(String, String), String> {
+    use rcgen::{DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType};
+    let err = |e: rcgen::Error| format!("certificate: {e}");
+    let mut params =
+        rcgen::CertificateParams::new(vec![SERVER_NAME.to_owned(), "localhost".to_owned()])
+            .map_err(err)?;
+    params.subject_alt_names.extend([
+        SanType::IpAddress(std::net::Ipv4Addr::LOCALHOST.into()),
+        SanType::IpAddress(std::net::Ipv6Addr::LOCALHOST.into()),
+    ]);
+    let cn = match tag {
+        Some(t) => format!("CoreRouter {t}"),
+        None => "CoreRouter".to_owned(),
+    };
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params.distinguished_name.push(DnType::CommonName, cn);
+    params
+        .distinguished_name
+        .push(DnType::OrganizationName, "CoreRouter");
+    params.not_before = rcgen::date_time_ymd(2025, 1, 1);
+    params.not_after = rcgen::date_time_ymd(9999, 12, 31) + Duration::from_secs(86_399);
+    params.is_ca = IsCa::ExplicitNoCa;
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let key = KeyPair::generate().map_err(err)?;
+    let cert = params.self_signed(&key).map_err(err)?;
+    Ok((cert.pem(), key.serialize_pem()))
 }
 
 /// Server identity from PEM bytes.
@@ -349,6 +409,42 @@ mod tests {
             }
             other => panic!("expected Changed, got {:?}", other.map(|(_, f)| f)),
         }
+    }
+
+    fn der(pem: &str) -> Vec<u8> {
+        CertificateDer::from_pem_slice(pem.as_bytes())
+            .unwrap()
+            .as_ref()
+            .to_vec()
+    }
+
+    fn has(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// G1.6zr: the notebook's www-ssl and API showed rcgen's sample
+    /// certificate (CN "rcgen self signed cert", 1975–4096).
+    #[test]
+    fn the_certificate_says_whose_it_is_and_never_expires() {
+        let dir = std::env::temp_dir().join(format!("cr-tls-cn-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("node-id"), "3FA2B1C9d0e1f2a3b4c5d6e7f8091a2b\n").unwrap();
+        load_or_create(&dir).unwrap();
+        let cert = der(&fs::read_to_string(dir.join(CERT_FILE)).unwrap());
+        assert!(!has(&cert, b"rcgen self signed cert"));
+        assert!(has(&cert, b"CoreRouter 3fa2b1c9"), "CN from the node id");
+        // RFC 5280 §4.1.2.5: UTCTime up to 2049, then GeneralizedTime;
+        // 99991231235959Z is "no well-defined expiration date".
+        assert!(has(&cert, b"250101000000Z"), "not before 2025-01-01");
+        assert!(has(&cert, b"99991231235959Z"), "never expires");
+        assert!(has(&cert, b"corerouter") && has(&cert, b"localhost"));
+        assert!(has(&cert, &[127, 0, 0, 1]), "SAN 127.0.0.1");
+        let _ = fs::remove_dir_all(&dir);
+        // Without a node id: "CoreRouter", and the pinned handshake works
+        // with it (`pinned_handshake_end_to_end`).
+        let (plain, _) = generate().unwrap();
+        assert!(has(&der(&plain), b"CoreRouter"));
     }
 
     #[test]

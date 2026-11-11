@@ -131,6 +131,8 @@ const REQUIRED_KERNEL: &[&str] = &[
     "CONFIG_DRM_SIMPLEDRM",
     "CONFIG_DRM_FBDEV_EMULATION",
     "CONFIG_FRAMEBUFFER_CONSOLE",
+    // G1.6zr: /proc/pressure (Resources, the memory pressure check).
+    "CONFIG_PSI",
 ];
 /// G1.6j: drivers that must be modules. `ice` asks for its firmware while
 /// probing, which a built-in driver does before `/` is mounted; `e100` and
@@ -1369,6 +1371,8 @@ pub(crate) fn build_with(
         return Err(format!("the kernel config lost '{lost}'"));
     }
     let libs = check_needed(&d.out.join("target"))?;
+    let pci = check_pci_names(&d.out.join("target"))?;
+    eprintln!("   pci.ids: {pci} network cards named");
     let fw = firmware::verify(&d.os, &d.out.join("target"))?;
     eprintln!("   firmware: {fw} files, hashes and what the drivers declare checked");
     let images = d.out.join("images");
@@ -1468,6 +1472,50 @@ pub(crate) fn build_with(
         images.display()
     );
     Ok(())
+}
+
+/// G1.6zr: cards `/usr/share/hwdata/pci.ids` must name (vendor, device):
+/// the r8169 and rtw89 of the notebook audit, Intel's e1000e and igb, virtio.
+const PCI_NAMED: &[(&str, &str)] = &[
+    ("10ec", "8168"),
+    ("10ec", "b852"),
+    ("8086", "10d3"),
+    ("8086", "1533"),
+    ("1af4", "1041"),
+];
+/// The cut database is ~66 KB; the whole one (1.4 MB) means the cut failed.
+const PCI_IDS_MAX: usize = 256 * 1024;
+
+/// The image's `pci.ids` (post-build.sh cuts it to the network cards): it
+/// names [`PCI_NAMED`] and is small. Returns the device lines.
+fn check_pci_names(target: &Path) -> Result<usize, String> {
+    let path = target.join("usr/share/hwdata/pci.ids");
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    pci_names_ok(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn pci_names_ok(text: &str) -> Result<usize, String> {
+    if text.len() > PCI_IDS_MAX {
+        return Err(format!(
+            "{} bytes: not cut to the network cards (post-build.sh)",
+            text.len()
+        ));
+    }
+    if !text.contains("GNU General Public License") {
+        return Err("the license lines of the header were lost".into());
+    }
+    for (v, d) in PCI_NAMED {
+        let block = text
+            .split('\n')
+            .skip_while(|l| !l.starts_with(&format!("{v}  ")))
+            .skip(1)
+            .take_while(|l| l.starts_with('\t'))
+            .any(|l| l.starts_with(&format!("\t{d}  ")));
+        if !block {
+            return Err(format!("no name for {v}:{d}"));
+        }
+    }
+    Ok(text.lines().filter(|l| l.starts_with('\t')).count())
 }
 
 /// Every ELF file of the image finds each library it names (`DT_NEEDED`)
@@ -1948,11 +1996,12 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
         // With --efi the guest has no address (the built-in command line).
         let seen = if b.efi {
             let skipped = "skipped: no address with --efi".to_owned();
-            (skipped.clone(), skipped)
+            (skipped.clone(), skipped.clone(), skipped)
         } else {
             (
                 cpus_check(root, &top, port, b.smp)?,
                 sensors_check(root, &top, port)?,
+                audit_check(root, &top, port)?,
             )
         };
         Ok((r, seen))
@@ -1962,7 +2011,7 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     let _ = std::fs::remove_file(&vars);
     let _ = std::fs::remove_file(&mon);
     let _ = std::fs::remove_file(&nvme);
-    let ((report, wall_ready, ping, web, hot), (cpus, sensors)) = res?;
+    let ((report, wall_ready, ping, web, hot), (cpus, sensors, audit)) = res?;
     eprintln!("\nboot-test ok ({}):", if kvm { "KVM" } else { "TCG" });
     eprintln!(
         "  kernel start → daemon answers ping: {:.3} s (corerouter-init)",
@@ -1980,6 +2029,7 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     eprintln!("  cards plugged in after boot (G1.6n, G1.6j): {hot}");
     eprintln!("  sensors (G1.6zf):                   {sensors}");
     eprintln!("  CPUs (G1.6zi):                      {cpus}");
+    eprintln!("  PSI and PCI names (G1.6zr):         {audit}");
     if let Some(kib) = report.idle_kib {
         eprintln!(
             "  idle memory in use:                 {:.1} MiB",
@@ -1992,6 +2042,17 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
 /// `corerouter-cli run` on the booted image, as `admin` over TLS (no password
 /// on a first boot).
 fn guest_cli(root: &Path, top: &Path, port: u16, id: &str) -> Result<String, String> {
+    guest_cli_with(root, top, port, id, "{}")
+}
+
+/// [`guest_cli`] with parameters.
+fn guest_cli_with(
+    root: &Path,
+    top: &Path,
+    port: u16,
+    id: &str,
+    params: &str,
+) -> Result<String, String> {
     let cli = push::cli(root)?;
     let home = top.join("boot-test-home");
     let who = install::Admin {
@@ -1999,9 +2060,70 @@ fn guest_cli(root: &Path, top: &Path, port: u16, id: &str) -> Result<String, Str
         password: "",
         strict: false,
     };
-    let out = install::cli_run(&cli, &who, port, id, "{}");
+    let out = install::cli_run(&cli, &who, port, id, params);
     let _ = std::fs::remove_dir_all(&home);
     out
+}
+
+/// G1.6zr: the kernel has PSI (`/proc/pressure`: Resources and the memory
+/// pressure check were always empty) and the image names its PCI cards
+/// (`pci.ids`, cut to the network cards): ether2 is QEMU's e100 (Intel
+/// 82557, on the PCI bus; a virtio-net port's device is the virtio one).
+fn audit_check(root: &Path, top: &Path, port: u16) -> Result<String, String> {
+    let get = |id: &str, params: &str| -> Result<serde_json::Value, String> {
+        let got = guest_cli_with(root, top, port, id, params)?;
+        serde_json::from_str(got.trim()).map_err(|e| format!("{id}: {e}: {got:.300}"))
+    };
+    let res = get("system.resource.print", "{}")?;
+    let memory = res
+        .pointer("/pressure/memory")
+        .filter(|m| !m.is_null())
+        .ok_or_else(|| {
+            format!(
+                "G1.6zr: system.resource.print has no memory pressure (CONFIG_PSI off?): {}",
+                res.get("pressure").cloned().unwrap_or_default()
+            )
+        })?
+        .to_string();
+    let hw = get("interface.hardware", r#"{"name":"ether2"}"#)?;
+    let text = |k: &str| {
+        hw.get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    if text("vendor").is_empty() || text("model").is_empty() {
+        let id = |k: &str| hw.get(k).cloned().unwrap_or_default();
+        return Err(format!(
+            "G1.6zr: interface.hardware ether2 ({}:{}) has no vendor/model name (pci.ids?)",
+            id("vendor_id"),
+            id("device_id")
+        ));
+    }
+    // The console setup runs (no address on a first boot) as
+    // `/proc/self/exe setup`: named `cr-setup`, never `exe`.
+    let procs = get("system.resource.process.print", r#"{"limit":500}"#)?;
+    let names: Vec<&str> = procs
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| p.get("name").and_then(serde_json::Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    if names.contains(&"exe") {
+        return Err("G1.6zr: a process named `exe` (a mode of corerouter-init not named)".into());
+    }
+    let setup = if names.contains(&"cr-setup") {
+        "cr-setup running"
+    } else {
+        "no console setup"
+    };
+    Ok(format!(
+        "pressure memory {memory}; ether2 = {} {}; {setup}, no `exe`",
+        text("vendor"),
+        text("model")
+    ))
 }
 
 /// G1.6zi: the router uses every CPU the machine has (`system.resource.print`
@@ -2488,6 +2610,24 @@ fn free_port() -> Result<u16, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_image_pci_ids_must_be_cut_and_name_the_cards() {
+        let head = "#\tThis file can be distributed under either the GNU General Public License\n";
+        let good = format!(
+            "{head}10ec  Realtek\n\t8168  RTL8111\n\tb852  RTL8852BE\n8086  Intel\n\t10d3  82574L\n\t1533  I210\n1af4  Red Hat\n\t1041  Virtio 1.0 network device\n"
+        );
+        assert_eq!(pci_names_ok(&good), Ok(5));
+        let lost = good.replace("\tb852  RTL8852BE\n", "");
+        assert!(pci_names_ok(&lost).unwrap_err().contains("10ec:b852"));
+        // A device of another vendor's block does not count.
+        let moved = good
+            .replace("\t8168  RTL8111\n", "")
+            .replace("\t1533  I210\n", "\t1533  I210\n\t8168  x\n");
+        assert!(pci_names_ok(&moved).unwrap_err().contains("10ec:8168"));
+        let whole = format!("{good}{}", "#\n".repeat(PCI_IDS_MAX));
+        assert!(pci_names_ok(&whole).unwrap_err().contains("not cut"));
+    }
 
     /// The real `os/` tree passes the static checks: this is how
     /// `cargo xtask ci` validates the image configuration without
