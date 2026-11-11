@@ -406,6 +406,22 @@ fn set(vm: &mut Vm, log: &mut std::fs::File, params: &Value) -> Result<Value, St
     vm.ok(log, "interface.wifi.set", &params.to_string())
 }
 
+/// Round trips of a query that does no I/O, back to back for `secs`: the
+/// median and the worst, in milliseconds. A command waits for the session's
+/// lock, so a tick that holds it (talking to a supplicant that is slow, or
+/// starting one) shows here as the worst round trip.
+fn round_trips(vm: &mut Vm, log: &mut std::fs::File, secs: f64) -> Result<(f64, f64), String> {
+    let end = Instant::now() + Duration::from_secs_f64(secs);
+    let mut ms = Vec::new();
+    while Instant::now() < end || ms.is_empty() {
+        let t = Instant::now();
+        vm.ok(log, "interface.wifi.list", "{}")?;
+        ms.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    ms.sort_by(f64::total_cmp);
+    Ok((ms[ms.len() / 2], ms[ms.len() - 1]))
+}
+
 fn start_ap(vm: &mut Vm, log: &mut std::fs::File) -> Result<(), String> {
     let out = sh(
         vm,
@@ -455,7 +471,20 @@ fn run(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(), S
         format!("enabling without a country: {e}"),
     )?;
     vm.ok(log, "interface.wifi.country.set", r#"{"country":"BR"}"#)?;
+    // What a command waits for the session's lock: with no radio on, while
+    // the radio is turned on (the supplicant is started and takes the
+    // radio), and further down with a supplicant that hangs.
+    let (quiet, quiet_worst) = round_trips(vm, log, 3.0)?;
     vm.ok(log, "interface.wifi.enable", r#"{"name":"wifi2"}"#)?;
+    let (_, opening) = round_trips(vm, log, 4.0)?;
+    nums.put(
+        "a command's round trip, no radio on",
+        format!("median {quiet:.0} ms, worst {quiet_worst:.0} ms"),
+    );
+    nums.put(
+        "worst round trip while the radio is turned on",
+        format!("{opening:.0} ms"),
+    );
     monitor(vm, log, 20, |m| m["state"] == "idle")?;
     let reg = until(vm, log, 20, "interface.wifi.country.get", "{}", |v| {
         v["result"]["in_force"] == "BR"
@@ -596,6 +625,33 @@ fn run(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(), S
         "{ for p in wpa_supplicant corerouter-daemon; do printf '%s=%s ' $p $(grep VmRSS /proc/$(pidof $p)/status | tr -s ' ' | cut -d' ' -f2); done; }",
     )?;
     nums.put("RSS KiB, connected", rss);
+
+    // A supplicant that hangs (stopped, as a debugger would): commands must
+    // not wait for it. Then it is killed, and the router starts another.
+    sh(
+        vm,
+        log,
+        "{ kill -STOP $(pidof wpa_supplicant); echo stopped; }",
+    )?;
+    let (hung, hung_worst) = round_trips(vm, log, 12.0)?;
+    nums.put(
+        "a command's round trip, supplicant hung for 12 s",
+        format!("median {hung:.0} ms, worst {hung_worst:.0} ms"),
+    );
+    sh(
+        vm,
+        log,
+        "{ for p in $(pidof wpa_supplicant); do grep -q 'State:.*T' /proc/$p/status && kill -KILL $p; done; echo killed; }",
+    )?;
+    let t = Instant::now();
+    monitor(vm, log, 60, |m| m["state"] == "connected")?;
+    nums.put(
+        "supplicant killed",
+        format!(
+            "another one started, back on in {:.1} s",
+            t.elapsed().as_secs_f64()
+        ),
+    );
 
     // The passphrase is in the supplicant's memory and sealed in the
     // configuration: on no file in clear.

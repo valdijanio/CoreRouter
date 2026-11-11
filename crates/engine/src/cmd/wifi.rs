@@ -454,6 +454,16 @@ fn state_of(s: &Session, cfg: &Config, name: &IfName, iface: &Interface, present
     }
     match s.wifi().and_then(|rt| rt.radios.get(name)) {
         Some(r) if r.error.is_some() => "error",
+        // With no network to look for, the supplicant's own scans (after a
+        // change of country, say) are not a search for anything: the
+        // radio read "searching" for good, with nothing configured
+        // (seen on the image, 2026-11-11).
+        Some(r)
+            if matches!(r.status.state, WifiState::Searching | WifiState::Connecting)
+                && !matches!(&iface.kind, InterfaceKind::Wifi(st) if !st.ssid.is_empty()) =>
+        {
+            WifiState::Idle.as_str()
+        }
         Some(r) => r.status.state.as_str(),
         None => WifiState::Idle.as_str(),
     }
