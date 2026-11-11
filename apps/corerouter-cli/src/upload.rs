@@ -12,7 +12,11 @@ use serde_json::{Value, json};
 
 /// How long `--wait` waits for the router to come back and confirm.
 const WAIT_LIMIT: Duration = Duration::from_secs(900);
-const POLL: Duration = Duration::from_millis(500);
+const POLL: Duration = Duration::from_millis(if cfg!(test) { 2 } else { 500 });
+/// How long `--wait` accepts "the package service has not reported" from a
+/// router that already answers: the service reads the slots right after the
+/// daemon starts (under 2 s, measured), so longer than this is a failure.
+const STARTING_LIMIT: Duration = Duration::from_millis(if cfg!(test) { 40 } else { 60_000 });
 
 pub struct Opts {
     pub file: String,
@@ -200,6 +204,7 @@ fn wait(
     let t = Instant::now();
     let mut back = None;
     let mut said = String::new();
+    let mut starting: Option<Instant> = None;
     while t.elapsed() < WAIT_LIMIT {
         std::thread::sleep(POLL);
         let p = match exec(b, "system.package.print", json!({})) {
@@ -212,6 +217,27 @@ fn wait(
                 continue;
             }
         };
+        // The daemon answers before its package service read the slots:
+        // `{supported: false, reason}` has no trial and no outcome yet, and
+        // is not "the trial ended".
+        if p.get("supported").and_then(Value::as_bool) != Some(true) {
+            let reason = p
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("no package status");
+            let since = *starting.get_or_insert_with(Instant::now);
+            if since.elapsed() >= STARTING_LIMIT {
+                return Err(format!(
+                    "slot {slot}: the router answers but has no package status: {reason}"
+                ));
+            }
+            if said != reason {
+                log::info!("waiting: {reason}");
+                said = reason.to_owned();
+            }
+            continue;
+        }
+        starting = None;
         let running = p.get("running").and_then(Value::as_str);
         if running == Some(slot) && back.is_none() {
             back = Some(t.elapsed());
@@ -240,4 +266,83 @@ fn wait(
         "slot {slot}: no confirmation in {} s",
         WAIT_LIMIT.as_secs()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Answers `system.package.print` from a script; the last answer repeats.
+    struct Script(Vec<Result<Value, String>>);
+
+    impl Backend for Script {
+        fn call(&mut self, _method: &str, _params: Value) -> Result<Value, String> {
+            if self.0.len() > 1 {
+                self.0.remove(0)
+            } else {
+                self.0.first().cloned().ok_or("empty script")?
+            }
+        }
+        fn has_ui(&self) -> bool {
+            false
+        }
+        fn describe(&self) -> String {
+            "script".into()
+        }
+    }
+
+    fn starting() -> Value {
+        json!({"supported": false, "reason": "the package service has not reported (daemon without it, or still starting)"})
+    }
+
+    fn old() -> Value {
+        json!({"result": "confirmed", "slot": "a", "at_unix": 1})
+    }
+
+    /// The freshly booted daemon answers before the package service read the
+    /// slots; that answer has no outcome and used to end the wait with
+    /// "slot b was not kept ()" while the trial went on and was confirmed
+    /// (seen on the test VM, 2026-11-11).
+    #[test]
+    fn wait_goes_on_while_the_package_service_starts() {
+        let done = json!({"result": "confirmed", "slot": "b", "at_unix": 2});
+        let mut b = Script(vec![
+            Err("connection refused".into()),
+            Ok(starting()),
+            Ok(starting()),
+            Ok(json!({"supported": true, "running": "b", "trial": {"slot": "b"}, "last": old()})),
+            Ok(json!({"supported": true, "running": "b", "trial": null, "last": done})),
+        ]);
+        let (back, confirmed, last) = wait(&mut b, "b", Some(&old())).unwrap();
+        assert_eq!(last, done);
+        assert!(back <= confirmed);
+    }
+
+    #[test]
+    fn wait_reports_a_rollback_with_its_reason() {
+        let mut b = Script(vec![
+            Ok(starting()),
+            Ok(json!({"supported": true, "running": "a", "trial": null,
+                "last": {"result": "rolled-back", "slot": "b", "detail": "no management interface"}})),
+        ]);
+        let e = wait(&mut b, "b", Some(&old())).unwrap_err();
+        assert!(
+            e.contains("rolled-back") && e.contains("no management interface"),
+            "{e}"
+        );
+    }
+
+    /// A router that keeps answering without a package status is a failure
+    /// with its reason, not a 15-minute wait.
+    #[test]
+    fn wait_gives_up_on_a_router_without_package_status() {
+        let mut b = Script(vec![Ok(
+            json!({"supported": false, "reason": "state file unreadable"}),
+        )]);
+        let e = wait(&mut b, "b", Some(&old())).unwrap_err();
+        assert!(
+            e.contains("no package status") && e.contains("state file unreadable"),
+            "{e}"
+        );
+    }
 }
