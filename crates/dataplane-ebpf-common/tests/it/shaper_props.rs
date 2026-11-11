@@ -54,6 +54,77 @@ impl<const N: usize> Words for Racy<N> {
     }
 }
 
+/// Three times the rate offered for `secs`, `cpus` packets of `size` in the
+/// same instant, each one racing the others on the clock. The policer never
+/// passes more than its bucket plus the rate. It still passes the rate while
+/// one instant's refill fits in the bucket; with the instants further apart
+/// than that, it passes a bucket per instant, which is all a policer owes a
+/// burst (a lost swap retries, it does not double count; four lost swaps in
+/// a row drop the packet).
+fn races(rate_k: u64, cpus: usize, size: u64, secs: u64) -> Result<(), TestCaseError> {
+    let r = Rate::mikrotik(rate_k * 1000, 0, 0, 0);
+    let mut racy = Racy::<{ policer::STATE_WORDS }> {
+        st: policer::fresh(&r, 0),
+        others: Vec::new(),
+        other_passed: 0,
+        rate: r,
+        now: 0,
+        nested: false,
+        lost: 0,
+    };
+    let step = (NANOS * size * cpus as u64 / (3 * r.rate)).max(1);
+    let (mut t, mut passed, mut instants) = (0u64, 0u64, 0u64);
+    while t < secs * NANOS {
+        racy.now = t;
+        racy.lost = 0;
+        racy.others = vec![size; cpus - 1];
+        if policer::admit(&mut racy, &r, t, size) {
+            passed += size;
+        }
+        // Whatever the race did not consume goes in after.
+        while let Some(b) = racy.others.pop() {
+            if policer::admit(&mut racy.st, &r, t, b) {
+                passed += b;
+            }
+        }
+        t += step;
+        instants += 1;
+    }
+    passed += racy.other_passed;
+    let upper = r.depth + r.rate * secs;
+    prop_assert!(passed <= upper, "{passed} > {upper}");
+    // What is left of the bucket after an instant is under one packet. If
+    // the refill until the next instant fits on top of it, nothing is lost
+    // and the rate is owed. If not, the bucket overflows between instants
+    // (256 kbit/s, 13 packets of 801 bytes every 108 ms against a 100 ms
+    // bucket) and each instant is owed the bucket less that one packet.
+    let room = r.depth.saturating_sub(size);
+    let owed = if r.rate * step <= room * NANOS {
+        r.rate * secs
+    } else {
+        room * instants
+    };
+    let lower = owed.saturating_sub(cpus as u64 * size + r.rate * step / NANOS);
+    prop_assert!(passed >= lower, "{passed} < {lower}");
+    Ok(())
+}
+
+/// The input that turned `main` red on 2026-11-11 (issue 605): the instants
+/// are 108 ms apart and the bucket holds 100 ms, so 3 of each 13 packets
+/// pass. The old lower bound asked for the full rate.
+#[test]
+fn policer_owes_a_bucket_per_instant_when_the_refill_overflows_it() {
+    races(256, 13, 801, 2).unwrap();
+    // The edge: the refill just fits and just does not.
+    for size in [64, 639, 640, 641, 800, 1499] {
+        for cpus in 1..16 {
+            for rate_k in [256, 300, 400, 599, 600, 601, 1000] {
+                races(rate_k, cpus, size, 3).unwrap();
+            }
+        }
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 256,
@@ -63,8 +134,7 @@ proptest! {
 
     /// G4.3cc: with up to 16 "CPUs" interleaving on one subscriber, the
     /// policer never passes more than its bucket plus the rate, and under
-    /// load still passes the rate (a lost swap retries, it does not double
-    /// count; four lost swaps in a row drop the packet).
+    /// load still passes what a policer owes ([`races`]).
     #[test]
     fn policer_exact_under_races(
         rate_k in 256u64..100_000,
@@ -72,39 +142,7 @@ proptest! {
         size in 64u64..1500,
         secs in 1u64..4,
     ) {
-        let r = Rate::mikrotik(rate_k * 1000, 0, 0, 0);
-        let mut racy = Racy::<{ policer::STATE_WORDS }> {
-            st: policer::fresh(&r, 0),
-            others: Vec::new(),
-            other_passed: 0,
-            rate: r,
-            now: 0,
-            nested: false,
-            lost: 0,
-        };
-        // Three times the rate offered, `cpus` packets per instant.
-        let step = (NANOS * size * cpus as u64 / (3 * r.rate)).max(1);
-        let (mut t, mut passed) = (0u64, 0u64);
-        while t < secs * NANOS {
-            racy.now = t;
-            racy.lost = 0;
-            racy.others = vec![size; cpus - 1];
-            if policer::admit(&mut racy, &r, t, size) {
-                passed += size;
-            }
-            // Whatever the race did not consume goes in after.
-            while let Some(b) = racy.others.pop() {
-                if policer::admit(&mut racy.st, &r, t, b) {
-                    passed += b;
-                }
-            }
-            t += step;
-        }
-        passed += racy.other_passed;
-        let upper = r.depth + r.rate * secs;
-        prop_assert!(passed <= upper, "{passed} > {upper}");
-        let lower = (r.rate * secs).saturating_sub(cpus as u64 * size + r.rate * step / NANOS);
-        prop_assert!(passed >= lower, "{passed} < {lower}");
+        races(rate_k, cpus, size, secs)?;
     }
 
     /// The shaper's departures never run ahead of bucket + rate × time,
