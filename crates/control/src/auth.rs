@@ -16,10 +16,12 @@
 //! **No password yet (G0.3b, G0.3d; as on a RouterOS CHR).** The first
 //! `admin` has no password. An account without one logs in with the empty
 //! password from anywhere (the network listeners are TLS only): keeping it
-//! so is the operator's choice, never forced nor limited. Each such login
-//! is a warning in the router's log with the source address, the answer
-//! says `no_password` so every client warns, and the health checks keep a
-//! warning until a password is set. Routers before G0.3d refused network
+//! so is the operator's choice, never forced nor limited. Such a login is
+//! a warning in the router's log with the source address — the first one of
+//! an account and source at once, the repeats as a count (G0.3f:
+//! `Session::log_event_grouped`) — the answer says `no_password` so every
+//! client warns, and the health checks keep a warning until a password is
+//! set. Routers before G0.3d refused network
 //! logins with [`NO_PASSWORD_REMOTE`]; clients still recognise it.
 //!
 //! Tokens are compared in constant time. Failed logins are counted per
@@ -355,24 +357,52 @@ impl Gate {
         let no_password = stored == Value::Bool(true);
         if no_password {
             let from = peer.map(|p| p.to_string()).unwrap_or_else(|| "?".into());
-            log::warn!(
-                "control: '{name}' logged in WITHOUT A PASSWORD from {from} ({}); set one \
-                 with user.set",
-                caller.name
+            // G0.3f: one line per account and source (an IPv4 address or an
+            // IPv6 /64, as the failures are counted), then a count: a tool
+            // that logs in once per command must not bury the rest of the
+            // log. The table is the engine's, under the session lock this
+            // login takes anyway.
+            let key = format!(
+                "auth.no_password {name} {}",
+                peer.map(|p| crate::conn::source_of(p).to_string())
+                    .unwrap_or_default()
             );
+            // "tls 192.0.2.9:45466": the port changes on every connection
+            // and stays in the detail; the line names the transport.
+            let transport = caller
+                .name
+                .split_whitespace()
+                .next()
+                .unwrap_or("?")
+                .to_owned();
             let (who, via) = (name.clone(), caller.name.clone());
-            let _ = host.with_session(&mut |s| {
-                s.log_event(
-                    &["system", "account", "warning"],
-                    "auth",
-                    format!(
-                        "Login sem senha: usuário {who} de {from} ({via}); defina uma senha \
-                         (user.set)"
-                    ),
-                    json!({"user": who, "address": from, "via": via, "no_password": true}),
+            let logged = host
+                .with_session(&mut |s| {
+                    Ok(Value::Bool(s.log_event_grouped(
+                        &key,
+                        &["system", "account", "warning"],
+                        "auth",
+                        format!(
+                            "Login sem senha: usuário {who} de {from} ({transport}); defina uma \
+                             senha (user.set)"
+                        ),
+                        json!({"user": who, "address": from, "via": via, "no_password": true}),
+                    )))
+                })
+                .is_ok_and(|v| v == Value::Bool(true));
+            // The process log follows the router's: the repeats are counted there.
+            if logged {
+                log::warn!(
+                    "control: '{name}' logged in WITHOUT A PASSWORD from {from} ({}); set one \
+                     with user.set",
+                    caller.name
                 );
-                Ok(Value::Null)
-            });
+            } else {
+                log::debug!(
+                    "control: '{name}' logged in without a password from {from} ({}) again",
+                    caller.name
+                );
+            }
         } else {
             log::info!("control: '{name}' logged in ({})", caller.name);
         }
@@ -843,6 +873,73 @@ mod tests {
             at(&gate, &mut s, "10.0.0.9", "admin", "a-real-password").unwrap_err(),
             INVALID_LOGIN
         );
+    }
+
+    /// G0.3f: a tool that logs in once per command (the CLI in a loop) is
+    /// one line in the router's log and then a count, per account and
+    /// source; the answer still says `no_password` every time.
+    #[test]
+    fn repeated_no_password_logins_are_one_line_then_a_count() {
+        let gate = Gate::new(quick());
+        let mut s = Session::virtual_lab();
+        assert!(s.bootstrap_admin(false).is_some());
+        s.tick(1_000);
+        let at = |s: &mut Session, ip: &str, port: u32| {
+            let ok = gate
+                .login(
+                    s,
+                    &Caller::new(u64::from(port), format!("tls {ip}:{port}")),
+                    Some(ip.parse().unwrap()),
+                    &json!({"user": "admin", "password": ""}),
+                )
+                .unwrap();
+            assert_eq!(ok["no_password"], true, "every client is still told");
+        };
+        for port in 45_400..45_430 {
+            at(&mut s, "192.168.0.180", port);
+        }
+        // Another source is not mixed in; an IPv6 /64 is one source.
+        at(&mut s, "192.168.0.7", 50_000);
+        at(&mut s, "2001:db8:1:2::a", 50_001);
+        at(&mut s, "2001:db8:1:2::b", 50_002);
+        let print = |s: &mut Session| -> Vec<String> {
+            s.execute("log.print", &json!({"find": "Login sem senha"}))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["message"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            print(&mut s),
+            [
+                "Login sem senha: usuário admin de 192.168.0.180 (tls); defina uma senha (user.set)",
+                "Login sem senha: usuário admin de 192.168.0.7 (tls); defina uma senha (user.set)",
+                "Login sem senha: usuário admin de 2001:db8:1:2::a (tls); defina uma senha (user.set)",
+            ]
+        );
+        s.tick(1_030);
+        let after = print(&mut s);
+        assert_eq!(after.len(), 5, "{after:?}");
+        assert_eq!(
+            after[3],
+            "Login sem senha: usuário admin de 192.168.0.180 (tls); defina uma senha (user.set) \
+             — mais 29 vezes nos últimos 30 s"
+        );
+        assert!(after[4].starts_with("Login sem senha: usuário admin de 2001:db8:1:2::a"));
+        assert!(
+            after[4].ends_with("mais 1 vez nos últimos 30 s"),
+            "{after:?}"
+        );
+        // The detail keeps the whole origin of the first one.
+        let rows = s
+            .execute("log.print", &json!({"find": "192.168.0.180"}))
+            .unwrap();
+        assert_eq!(rows[0]["detail"]["via"], "tls 192.168.0.180:45400");
+        assert_eq!(rows[1]["detail"]["repeats"], 29);
+        // The health check keeps warning whatever the log shows.
+        assert_eq!(s.admins_without_password(), ["admin"]);
     }
 
     #[test]

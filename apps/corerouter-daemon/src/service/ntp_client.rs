@@ -21,6 +21,13 @@
 //! `use_peer_ntp` (G4.7a), at most [`MAX_SERVERS`] (a DHCP answer is hostile
 //! input). Sockets: a new one per exchange, on a port the kernel picks
 //! (RFC 9109 §4), bound to the client's VRF.
+//!
+//! First boot (G1.6zh): a router whose config was never saved starts with
+//! the client on and no server configured ([`factory_default`]), so it asks
+//! only what the network's DHCP server names (RFC 2132 §8.3, option 42) and
+//! nobody else: no public pool is built in (RFC 8633 §6.2, RFC 4085). A
+//! round with nobody to ask sends nothing and waits for nothing: the lease
+//! that brings a server is asked at once.
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -31,7 +38,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use corerouter_engine::{Shared, lock};
 use corerouter_hal::clock::{ClockError, SystemClock};
 use corerouter_model::ntp::{
-    ClockState, MAIN_VRF, MAX_SERVERS, NtpClient, NtpState, NtpStatus, POLL_RANGE,
+    ClockState, MAIN_VRF, MAX_SERVERS, NO_SERVER, NtpClient, NtpState, NtpStatus, POLL_RANGE,
 };
 use corerouter_proto_ntp::discipline::{Action, Discipline};
 use corerouter_proto_ntp::{Packet, ReplyError, Sample, Timestamp, check_reply, sample_of};
@@ -380,7 +387,12 @@ fn run(session: &Shared, port: u16, health: &super::Health, open: OpenClock<'_>)
                 }
                 return;
             }
-            last_round = Some(Instant::now());
+            // A round with nobody to ask sent nothing (G1.6zh): the servers
+            // a DHCP lease brings a moment later are asked at once, not
+            // `MIN_ROUND_GAP` after it.
+            if !servers.is_empty() {
+                last_round = Some(Instant::now());
+            }
             poll_exp = next_poll(poll_exp, &now_cfg, &round);
             let said = match (&round.best, active.then_some(driver.as_mut()).flatten()) {
                 (Some((_, _, _, sample)), Some(d)) => {
@@ -402,7 +414,7 @@ fn run(session: &Shared, port: u16, health: &super::Health, open: OpenClock<'_>)
                 _ => None,
             };
             let wait = 1u64 << poll_exp.min(17);
-            status = round.status(&status, wait);
+            status = round.status(&status, wait, !servers.is_empty());
             status.dynamic_servers = dynamic.clone();
             if let Some(d) = driver.as_ref().filter(|_| active) {
                 d.fill(&mut status);
@@ -478,7 +490,11 @@ pub struct Round {
 }
 
 impl Round {
-    fn status(&self, before: &NtpStatus, poll_secs: u64) -> NtpStatus {
+    /// `asked`: there was somebody to ask. A round that asked nobody says
+    /// [`NO_SERVER`]; one whose servers all told it to go away (kiss-o'-death,
+    /// skipped from then on) says that instead: the health check sends the
+    /// operator to the right place.
+    fn status(&self, before: &NtpStatus, poll_secs: u64, asked: bool) -> NtpStatus {
         let ms = |n: i64| n as f64 / 1e6;
         let error = (!self.errors.is_empty()).then(|| self.errors.join("; "));
         match &self.best {
@@ -500,7 +516,13 @@ impl Round {
             None => NtpStatus {
                 status: NtpState::Waiting,
                 last_sync: before.last_sync,
-                last_error: Some(error.unwrap_or_else(|| "no server to ask".into())),
+                last_error: Some(error.unwrap_or_else(|| {
+                    if asked {
+                        "every server refused this client (kiss-o'-death DENY or RSTR)".into()
+                    } else {
+                        NO_SERVER.into()
+                    }
+                })),
                 poll_secs: Some(poll_secs),
                 ..NtpStatus::default()
             },
@@ -688,7 +710,31 @@ pub(crate) const SERVICE: super::Service = super::Service {
     start,
 };
 
+/// G1.6zh: the client on for a config that was never saved (a new router,
+/// the live image) and that nobody touched yet. No server goes in: it asks
+/// what the DHCP clients learn (`use_peer_ntp`, on by default), so the
+/// router talks to no third party the operator did not name. A saved config
+/// is left as it is: a file without `ntp_client` still means off.
+fn factory_default(session: &Shared) {
+    let mut s = lock(session);
+    if s.storage_status().loaded_from.is_some()
+        || !s.store().running().system.ntp_client.is_default()
+    {
+        return;
+    }
+    match s.execute("system.ntp.client.set", &serde_json::json!({"enabled": true})) {
+        Ok(_) => log::info!(
+            "new config: NTP client on, asking the servers the DHCP clients learn (option 42)"
+        ),
+        Err(e) => log::warn!("new config: NTP client not turned on: {e}"),
+    }
+}
+
 fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
+    // A router has a config directory; the lab without one stays as it is.
+    if ctx.config_dir.is_some() {
+        factory_default(&ctx.session);
+    }
     let session = ctx.session.clone();
     Ok(Box::new(move |health: &super::Health| {
         run(&session, corerouter_proto_ntp::PORT, health, None);
@@ -782,6 +828,13 @@ mod tests {
                 .errors
                 .is_empty()
         );
+
+        // G1.6zh: servers that all refused are not "nobody to ask".
+        let quiet = poll_round(&["127.0.0.1".into()], deny, MAIN_VRF, &mut denied, &literal, &|| true);
+        let refused = quiet.status(&NtpStatus::default(), 64, true).last_error.unwrap();
+        assert!(refused.contains("refused this client"), "{refused}");
+        let nobody = Round::default().status(&NtpStatus::default(), 64, false).last_error.unwrap();
+        assert_eq!(nobody, NO_SERVER);
 
         let rate = server(0, Some(b"RATE"));
         let r = poll_round(&["127.0.0.1".into()], rate, MAIN_VRF, &mut BTreeSet::new(), &literal, &|| true);
@@ -1137,17 +1190,112 @@ mod tests {
     }
 
     /// A DHCP lease's servers are asked (G4.7a `use_peer_ntp`), with no
-    /// static server configured.
+    /// static server configured; G1.6zh: also before any DHCP client exists.
     #[test]
     fn a_client_with_only_dynamic_servers_is_allowed_by_config() {
         let session = shared(Session::virtual_lab());
         let mut s = lock(&session);
-        let err = s
-            .execute("system.ntp.client.set", &json!({"enabled": true}))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("at least one server"), "{err}");
+        let r = s.execute("system.ntp.client.set", &json!({"enabled": true})).unwrap();
+        assert!(r["warning"].is_string(), "{r}");
         s.execute("ip.dhcp-client.add", &json!({"interface": "ether1"})).unwrap();
-        s.execute("system.ntp.client.set", &json!({"enabled": true})).unwrap();
+        let r = s.execute("system.ntp.client.set", &json!({"enabled": true})).unwrap();
+        assert!(r.get("warning").is_none(), "{r}");
+    }
+
+    fn stored(storage: &corerouter_engine::MemoryStorage) -> Shared {
+        shared(Session::with_storage(
+            Box::new(corerouter_hal::VirtualHal::default()),
+            Box::new(storage.clone()),
+        ))
+    }
+
+    /// G1.6zh: a config that was never saved starts with the client on and
+    /// no server of its own; once saved, what the file says holds, on or
+    /// off — a file from before this default (no `ntp_client` in it) means
+    /// off, as it always did.
+    #[test]
+    fn a_new_config_starts_with_the_client_on_and_a_saved_one_is_left_alone() {
+        // First boot.
+        let storage = corerouter_engine::MemoryStorage::default();
+        let session = stored(&storage);
+        factory_default(&session);
+        {
+            let s = lock(&session);
+            let c = &s.store().running().system.ntp_client;
+            assert!(c.enabled && c.servers.is_empty(), "{c:?}");
+            let log = s.log_since(0);
+            assert!(
+                log.iter().any(|e| e.message == "NTP Client ligado: servidores do DHCP (opção 42), poll 6–10"),
+                "{log:?}"
+            );
+        }
+        // The operator turns it off: the next boot keeps it off.
+        lock(&session).execute("system.ntp.client.set", &json!({"enabled": false})).unwrap();
+        drop(session);
+        let session = stored(&storage);
+        assert!(lock(&session).storage_status().loaded_from.is_some());
+        factory_default(&session);
+        assert!(!lock(&session).store().running().system.ntp_client.enabled);
+
+        // A router saved before G1.6zh: its file has no `ntp_client` (off was
+        // the default and defaults are not written). Nothing changes.
+        let storage = corerouter_engine::MemoryStorage::default();
+        let session = stored(&storage);
+        lock(&session).execute("system.identity.set", &json!({"name": "edge1"})).unwrap();
+        drop(session);
+        let saved = corerouter_engine::ConfigStorage::load(&mut storage.clone(), corerouter_engine::Slot::Current)
+            .unwrap()
+            .unwrap();
+        assert!(!saved.contains("ntp_client"), "{saved}");
+        let session = stored(&storage);
+        factory_default(&session);
+        let s = lock(&session);
+        assert_eq!(s.store().running().system.identity, "edge1");
+        assert!(s.store().running().system.ntp_client.is_default());
+        assert_eq!(s.store().current_revision(), 1, "no commit of ours");
+    }
+
+    /// Before the first save, a client the operator already configured is
+    /// not touched either.
+    #[test]
+    fn the_factory_default_does_not_undo_the_operator() {
+        let session = stored(&corerouter_engine::MemoryStorage::default());
+        // Off again, but no longer the default: the operator was here.
+        lock(&session)
+            .execute("system.ntp.client.set", &json!({"servers": ["192.0.2.1"], "max_poll": 12}))
+            .unwrap();
+        factory_default(&session);
+        assert!(!lock(&session).store().running().system.ntp_client.enabled);
+    }
+
+    /// G1.6zh: on with nobody to ask says so and sends nothing; a server
+    /// that shows up is asked at once. (The server a DHCP lease brings takes
+    /// the other path, `MIN_ROUND_GAP` after the last round that asked
+    /// somebody: `tests/netns_ntp_first_boot.rs` times it.)
+    #[test]
+    fn nobody_to_ask_waits_without_delaying_the_first_server() {
+        let port = server(250, None);
+        let session = shared(Session::virtual_lab());
+        lock(&session).execute("system.ntp.client.set", &json!({"enabled": true})).unwrap();
+        spawn(session.clone(), port).unwrap();
+        let until = |what: &str, ok: &dyn Fn(&NtpStatus) -> bool| {
+            let end = Instant::now() + Duration::from_secs(10);
+            loop {
+                let st = lock(&session).ntp_status();
+                if ok(&st) {
+                    return st;
+                }
+                assert!(Instant::now() < end, "timed out waiting for {what}: {st:?}");
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let st = until("the empty round", &|st| st.last_error.is_some());
+        assert_eq!(st.status, NtpState::Waiting);
+        assert_eq!(st.last_error.as_deref(), Some(NO_SERVER));
+        let asked = Instant::now();
+        lock(&session).execute("system.ntp.client.set", &json!({"servers": ["127.0.0.1"]})).unwrap();
+        let st = until("the first answer", &|st| st.status == NtpState::Synchronized);
+        assert!(asked.elapsed() < Duration::from_secs(5), "{:?}", asked.elapsed());
+        assert!((200.0..=300.0).contains(&st.system_offset_ms.unwrap()), "{st:?}");
     }
 }

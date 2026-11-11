@@ -20,24 +20,14 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "system.install.print", "Install to Disk", ["System", "Install to Disk"], None,
         "{} → {supported, reason?, scanned, medium: {device, version, commit, channel, signed_by, min_disk} | null, disks: [{name, bytes, model, serial, bus, removable, holds: empty|data|corerouter, detail, config_keepable, refused, confirm: name|name+code}], challenge: {disk, serial, attempts_left, presence, remaining_s} | null, job: {disk, phase, done, total} | null, result: {ok, error?, ...} | null, testing, network: {connected_port, problems, ports: [{name, mac, driver, link, speed_mbps, address, dhcp_status, gateway, gateway_ok, dns, dns_ok, firmware, connected}], firmware} | null}",
         always, print),
-    cmd!(
-        "system.install.rescan",
-        "Rescan Disks",
-        [],
-        None,
+    // G0.3f: looking again and testing change nothing: group write, but no
+    // line in the journal nor in the log (the window runs the test by itself).
+    cmd!(quiet "system.install.rescan", "Rescan Disks", [], None,
         "{} → {queued}",
-        supported,
-        rescan
-    ),
-    cmd!(
-        "system.install.test",
-        "Test Network",
-        [],
-        None,
+        supported, rescan),
+    cmd!(quiet "system.install.test", "Test Network", [], None,
         "{} → {queued} (driver, firmware, link, DHCP, gateway and DNS of each port, and the port this connection came through: system.install.print shows them)",
-        supported,
-        test
-    ),
+        supported, test),
     cmd!(
         "system.install.challenge",
         "Ask for Code",
@@ -371,6 +361,29 @@ mod tests {
 
     fn code(s: &Session) -> String {
         s.ext::<Install>().unwrap().challenge.as_ref().unwrap().code.clone()
+    }
+
+    /// G0.3f: the network test and the rescan change nothing: they are not
+    /// in the journal nor in the log ("Alterado: /system install test" was
+    /// there every time the window opened), and still need group write.
+    #[test]
+    fn testing_and_rescanning_leave_no_journal_entry() {
+        let mut s = live();
+        let before = (s.journal().len(), s.log_seq());
+        assert_eq!(s.execute("system.install.test", &json!({})).unwrap()["queued"], true);
+        assert_eq!(s.execute("system.install.rescan", &json!({})).unwrap()["queued"], true);
+        assert!(s.ext::<Install>().unwrap().test.is_some(), "the test was asked for");
+        assert_eq!((s.journal().len(), s.log_seq()), before);
+        let reader = crate::Caller::new(1, "x").with_principal(crate::auth::Principal::User("noc".into()));
+        s.execute("user.add", &json!({"name": "noc", "group": "read", "password": "noc-password"}))
+            .unwrap();
+        for id in ["system.install.test", "system.install.rescan"] {
+            let e = s.execute_as(&reader, id, &json!({})).unwrap_err().to_string();
+            assert!(e.contains("needs group write"), "{id}: {e}");
+        }
+        // What is done to the router still is: the install itself.
+        s.execute("system.install.run", &run("vda", json!({}))).unwrap();
+        assert_eq!(s.journal().last().unwrap().command, "system.install.run");
     }
 
     #[test]

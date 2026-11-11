@@ -55,7 +55,12 @@ fn summary_shows_the_machine_and_the_diagnosis() {
         "Portuguese finding"
     );
     assert!(h.has_text("warning") || h.has_text("critical"));
-    assert!(h.has_text_containing("parameters differ from this profile."));
+    // G1.26i: the lab forwards with nothing configured, so no critical
+    // finding, and a router nobody tuned is not shown as off the profile.
+    assert!(!h.has_text_containing("encaminhamento"), "no forwarding finding");
+    assert!(!h.has_text("critical"));
+    assert!(h.has_text_containing("nothing is configured yet, the kernel's own values are in use."));
+    assert!(h.has_text_containing("parameters change when this profile is applied."));
 
     // "Set" on the finding raises nf_conntrack_max to the balanced value.
     h.click(h.text("Set net.netfilter.nf_conntrack_max = 6684672"));
@@ -70,6 +75,8 @@ fn summary_shows_the_machine_and_the_diagnosis() {
         .copied();
     assert_eq!(set, Some(6_684_672), "{:?}", h.app.log());
     assert!(!h.has_text_containing("conntrack está"), "the finding is gone");
+    // Something is configured now: the count reads as a difference.
+    assert!(h.has_text_containing("parameters differ from this profile."));
 }
 
 #[test]
@@ -297,4 +304,30 @@ fn boot_tab_saves_for_the_next_boot_and_guards_mitigations() {
     refresh(&mut h);
     let boot = lock(&h.session).store().running().system.tuning.boot.clone();
     assert_eq!(boot.get("mitigations").map(String::as_str), Some("off"));
+}
+
+/// G1.26i: forwarding is the router's default (a chip, not a "–"), and the
+/// operator's 0 brings the critical finding with its fix.
+#[test]
+fn forwarding_is_the_router_default_and_an_explicit_off_is_critical() {
+    let mut h = open(Tab::Kernel);
+    assert!(h.has_text("net.ipv4.ip_forward"));
+    assert!(h.has_text("router default"), "the Configured column says whose value it is");
+    let rows = params(panel(&mut h).print.as_ref().unwrap());
+    for name in ["net.ipv4.ip_forward", "net.ipv6.conf.all.forwarding"] {
+        let p = rows.iter().find(|p| p.name == name).unwrap();
+        assert_eq!((p.current, p.configured, p.router_default), (Some(1), None, Some(1)), "{name}");
+        assert!(!p.differs(), "{name}");
+    }
+
+    lock(&h.session)
+        .execute("system.tuning.set", &json!({"name": "net.ipv4.ip_forward", "value": 0}))
+        .unwrap();
+    panel(&mut h).tab = Tab::Summary;
+    refresh(&mut h);
+    assert!(h.has_text("critical"));
+    assert!(h.has_text("O encaminhamento IPv4 está desligado: este roteador não roteia."));
+    h.click(h.text("Set net.ipv4.ip_forward = 1"));
+    refresh(&mut h);
+    assert!(!h.has_text_containing("encaminhamento IPv4"), "{:?}", h.app.log());
 }

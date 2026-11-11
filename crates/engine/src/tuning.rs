@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use corerouter_hal::tuning::{KernelStats, SystemInfo, Sysctls};
-use corerouter_model::tuning::{PARAMS, Param};
+use corerouter_model::tuning::{IP_FORWARD, IPV6_FORWARDING, PARAMS, Param};
 use serde::Serialize;
 
 /// Estimated memory per conntrack entry (struct `nf_conn` with its
@@ -230,7 +230,7 @@ pub fn recommend(profile: Profile, m: &Machine) -> BTreeMap<&'static str, Rec> {
     for p in PARAMS {
         let n = p.name;
         let r = match n {
-            "net.ipv4.ip_forward" | "net.ipv6.conf.all.forwarding" => Some(rec("forward", 1, &[])),
+            IP_FORWARD | IPV6_FORWARDING => Some(rec("forward", 1, &[])),
             "net.ipv4.fib_multipath_hash_policy" | "net.ipv6.fib_multipath_hash_policy" => {
                 Some(rec("hash_l4", 1, &[]))
             }
@@ -394,6 +394,7 @@ pub struct Finding {
 pub const FINDINGS: &[(&str, &str)] = &[
     ("conntrack_full", "The conntrack table is {pct}% full ({count} of {max}): new connections are dropped when it fills."),
     ("flow_control_on", "Flow control (pause frames) is on on {nics}: one full queue stops the whole port (Interfaces tab)."),
+    ("forwarding6_off", "IPv6 forwarding is off: this router does not route IPv6."),
     ("forwarding_off", "IPv4 forwarding is off: this router does not route."),
     ("irqbalance", "irqbalance is running: it moves IRQs every 10 s and undoes the IRQ affinity (stop it: systemctl disable --now irqbalance)."),
     ("lro_on", "LRO is on on {nics}: it merges packets in a way a router must not forward (Interfaces tab)."),
@@ -442,12 +443,24 @@ pub fn diagnose(m: &Machine, stats: &KernelStats, cur: &Sysctls) -> Vec<Finding>
         if suggest(n).is_some() { s } else { Severity::Info }
     };
 
-    if get("net.ipv4.ip_forward") == Some(0) {
+    // G1.26i: CoreRouter forwards by default, so a 0 here is the
+    // operator's (`system.tuning.set`), or a kernel that refused the
+    // default (a read-only /proc/sys: the log says so).
+    if get(IP_FORWARD) == Some(0) {
         out.push(finding(
             Severity::Critical,
             "forwarding_off",
             &[],
-            Some("net.ipv4.ip_forward"),
+            Some(IP_FORWARD),
+            Some(1),
+        ));
+    }
+    if get(IPV6_FORWARDING) == Some(0) {
+        out.push(finding(
+            Severity::Warning,
+            "forwarding6_off",
+            &[],
+            Some(IPV6_FORWARDING),
             Some(1),
         ));
     }
@@ -696,7 +709,8 @@ mod tests {
         };
         let mut cur = Sysctls::new();
         cur.insert("net.netfilter.nf_conntrack_max".into(), Some(262_144));
-        cur.insert("net.ipv4.ip_forward".into(), Some(0));
+        cur.insert(IP_FORWARD.into(), Some(0));
+        cur.insert(IPV6_FORWARDING.into(), Some(0));
         let f = diagnose(&m, &stats, &cur);
         let ids: Vec<&str> = f.iter().map(|f| f.id).collect();
         assert_eq!(
@@ -704,6 +718,7 @@ mod tests {
             [
                 "forwarding_off",
                 "conntrack_full",
+                "forwarding6_off",
                 "softnet_dropped",
                 "softnet_squeeze",
                 "neigh_full",
@@ -712,10 +727,21 @@ mod tests {
                 "flow_control_on"
             ]
         );
-        let squeeze = &f[3];
+        assert_eq!((f[0].severity, f[0].suggest), (Severity::Critical, Some(1)));
+        assert_eq!((f[2].severity, f[2].param), (Severity::Warning, Some(IPV6_FORWARDING)));
+        let squeeze = &f[4];
         assert!(squeeze.text.contains("CPU 1"), "{}", squeeze.text);
         assert_eq!(squeeze.suggest, Some(600));
         assert_eq!(f[1].severity, Severity::Critical, "95%: {}", f[1].text);
+        // G1.26i: forwarding, as CoreRouter leaves it by default, says
+        // nothing; one family off says only that one.
+        let mut on = cur.clone();
+        on.insert(IP_FORWARD.into(), Some(1));
+        let ids: Vec<&str> = diagnose(&m, &stats, &on).iter().map(|f| f.id).collect();
+        assert!(!ids.contains(&"forwarding_off") && ids.contains(&"forwarding6_off"), "{ids:?}");
+        on.insert(IPV6_FORWARDING.into(), Some(1));
+        let ids: Vec<&str> = diagnose(&m, &stats, &on).iter().map(|f| f.id).collect();
+        assert!(!ids.iter().any(|i| i.starts_with("forwarding")), "{ids:?}");
         // Already at the suggestion: a note without a button.
         cur.insert("net.core.netdev_budget".into(), Some(600));
         let f = diagnose(&m, &stats, &cur);

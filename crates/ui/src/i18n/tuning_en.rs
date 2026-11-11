@@ -225,11 +225,12 @@ A packet of one flow always takes the same path either way; only fragments may d
         "tuning.net.ipv4.ip_forward",
         r##"## What it does
 Whether the kernel forwards IPv4 packets between interfaces. A router needs it on; off, the box only answers for itself.
+**CoreRouter turns it on by default**, as RouterOS does (`/ip settings ip-forward=yes`): the kernel itself boots as a host, with forwarding off. "router default" in the Configured column means nobody set it here.
 ## When to change
-Never on a router. Off is for a host.
+Never on a router. Off (set it to 0) is for a host; Unset goes back to forwarding.
 ## Careful
 Turning it off stops all IPv4 routing at once. Turning it on also turns off LRO on every port (the kernel does it).
-Changing it resets other configuration parameters to the host or router defaults (`ip-sysctl.rst`): CoreRouter always writes it before the others."##,
+Changing it resets `conf/all/accept_redirects` (a router does not obey ICMP redirects, RFC 1812 4.3.3.2) and the forwarding of every interface (`ip-sysctl.rst`): CoreRouter always writes it before the others."##,
     ),
     (
         "tuning.net.ipv4.neigh.default.gc_thresh1",
@@ -288,11 +289,12 @@ Keep "when needed" (1): cookies start only when the queue is full.
     (
         "tuning.net.ipv6.conf.all.forwarding",
         r##"## What it does
-Whether the kernel forwards IPv6 packets. On, the interfaces also stop accepting Router Advertisements unless `accept_ra` is 2 (CoreRouter sets that where a DHCPv6 client needs it).
+Whether the kernel forwards IPv6 packets. **CoreRouter turns it on by default**, as RouterOS does (`/ipv6 settings forward=yes`).
+On, the interfaces behave as a router's (RFC 4861): they stop accepting Router Advertisements and ICMPv6 redirects and stop asking for RAs, unless `accept_ra` is 2. CoreRouter sets 2 where IPv6 › Settings says to accept RAs (by default, where a DHCPv6 client runs: the WAN) and asks the routers there for an RA at once, so the default route and SLAAC of the WAN keep working.
 ## When to change
-Never on a router that routes IPv6.
+Never on a router that routes IPv6. Off (set it to 0) is for a host; Unset goes back to forwarding.
 ## Careful
-Off stops IPv6 routing at once."##,
+Off stops IPv6 routing at once. When it turns on, the kernel drops the RA routes of every interface that does not accept RAs."##,
     ),
     (
         "tuning.net.ipv6.fib_multipath_hash_policy",

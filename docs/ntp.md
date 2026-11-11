@@ -6,6 +6,55 @@ Janela: System › NTP Client.
 `/system ntp server` (G4.6c). Comandos: `system.ntp.server.set` e `.get`. Janela: System › NTP
 Server. Veja "Servidor NTP", abaixo.
 
+## Primeiro boot: ligado, só com os servidores do DHCP (G1.6zh)
+
+Um roteador cuja config nunca foi gravada (o primeiro boot do disco instalado, e todo boot da ISO
+live) nasce com o cliente NTP **ligado e sem servidor configurado**. Ele pergunta só aos
+servidores que os clientes DHCP aprendem (`use_peer_ntp`, ligado por padrão; opção 42, RFC 2132
+§8.3) e a mais ninguém: nenhum pool público vem embutido, o roteador não fala com terceiros que o
+operador não indicou (RFC 8633 §6.2, RFC 4085; o NTP Pool proíbe `pool.ntp.org` como padrão de
+appliance).
+
+- **Quem liga:** o serviço `ntp-client` do daemon, na partida, roda `system.ntp.client.set
+  enabled=yes` quando há `--config-dir`, nada foi restaurado (`loaded_from` vazio) e a config do
+  cliente ainda é a padrão. Fica no journal e no log ("NTP Client ligado: servidores do DHCP
+  (opção 42)"). O `Default` do modelo continua desligado.
+- **Config já gravada não muda:** um arquivo sem a chave `ntp_client` (gravado antes disto, ou
+  por quem nunca mexeu no NTP) continua significando desligado. Quem desligar depois do primeiro
+  boot fica desligado.
+- **Sem a quem perguntar:** `status: waiting`, `last_error: "no server to ask"`. Não é erro: é
+  linha `info` no log, e a verificação de saúde `ntp` fica em aviso, "relógio não ajustado: o
+  cliente NTP não tem a quem perguntar", com a ação (`system.ntp.client.set servers=…`, ou um
+  cliente DHCP numa rede que entregue a opção 42). `system.ntp.client.set enabled=yes` sem
+  servidor e sem cliente DHCP é aceito e responde com `warning` (antes era recusado; o estado já
+  existia ao remover o último cliente DHCP).
+- **O lease chega, o servidor é perguntado na hora:** a rodada que não tinha a quem perguntar não
+  enviou nada, então não conta para o intervalo mínimo de 64 s (RFC 4330 §5). Medido em
+  namespace: sincronizado 3 s depois do daemon subir.
+- **ISO live:** `system.ntp.client.*` entrou na lista do que o live pode mudar
+  (`crates/engine/src/live.rs`); antes o cliente não podia nem ser ligado ali.
+- **Saúde (`ntp`):** além de "sem a quem perguntar": sem resposta dos servidores; acerto acima de
+  1000 s esperando confirmação (diz quanto e como confirmar); resposta recusada; medindo mas sem
+  corrigir e mais de 1 s fora; e cliente desligado com a data do roteador anterior a 2026 (placa
+  sem bateria no relógio).
+
+### De onde vem a hora antes do NTP
+
+- **x86, com ou sem `CONFIG_RTC_HCTOSYS`:** o kernel põe a hora do CMOS no relógio do sistema já
+  em `timekeeping_init` (`kernel/time/timekeeping.c` → `read_persistent_clock64`,
+  `arch/x86/kernel/rtc.c` → `mach_get_cmos_time`; kernel 6.18.59). A imagem tem
+  `RTC_HCTOSYS` desligado e não precisa dele: ele só repetiria a leitura quando o `rtc0`
+  registra. O CMOS é lido como UTC.
+- **Sem bateria no RTC:** o relógio começa em 1970 (ou na data de fábrica da placa). Abaixo de
+  2026-01-01 o cliente acerta sem pedir confirmação (tabela abaixo).
+- **Sincronizado, o kernel regrava o CMOS em UTC a cada ~11 min** (`sync_hw_clock`,
+  `kernel/time/ntp.c`; o cliente limpa `STA_UNSYNC`). Num disco instalado é o que se quer: o
+  próximo boot já nasce certo. Na ISO live, numa máquina que também tem Windows (RTC em hora
+  local), o Windows mostra a hora deslocada pelo fuso até ressincronizar (G4.6o).
+- **`clock: "not-set"` não quer dizer "relógio sem hora":** quer dizer que o cliente NTP não está
+  mexendo no relógio (desligado, só medindo, ou ainda sem resposta). Com o cliente desligado o
+  status inteiro vem zerado, inclusive `dynamic_servers`.
+
 ## Como o relógio é acertado (G4.6b)
 
 Cada rodada pergunta a todos os servidores e fica com a resposta de menor ida e volta. A diferença
@@ -52,10 +101,11 @@ Limites conhecidos:
 
 ## Servidores e VRF
 
-- `servers`: até 8. Com um cliente DHCP com `use_peer_ntp`, a lista pode ficar vazia.
+- `servers`: até 8. A lista pode ficar vazia: o cliente usa os que um cliente DHCP com
+  `use_peer_ntp` aprender (é assim que um roteador novo nasce, veja "Primeiro boot").
 - `dynamic_servers`: os recebidos por DHCP (opção 42), depois dos configurados, sem repetir e com
   o total limitado a 8, porque a resposta DHCP é entrada hostil. Mudar a lista nunca faz perguntar
-  mais de uma vez a cada 64 s (RFC 4330 §5).
+  mais de uma vez a cada 64 s (RFC 4330 §5); a rodada que não tinha a quem perguntar não conta.
 - `vrf`: o socket fica preso ao VRF por `SO_BINDTODEVICE`. Nomes DNS são resolvidos pelo resolvedor
   do roteador, na tabela principal.
 - Porta: uma nova por troca, escolhida pelo kernel, com `connect` (RFC 9109 §4).
@@ -144,6 +194,8 @@ COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- \
     cargo test -p corerouter-daemon --test netns_ntp
 COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- \
     cargo test -p corerouter-daemon --test netns_ntp_server
+COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- \
+    cargo test -p corerouter-daemon --test netns_ntp_first_boot   # G1.6zh: DHCP entrega o NTP
 cargo xtask vm-lab run -- scripts/routeros-interop-l2.sh ntp
 cargo xtask vm-lab run -- 'systemctl stop systemd-timesyncd chrony; COREROUTER_CLOCK_ROOT=1 cargo test -p corerouter-hal-linux --test clock_root -- --test-threads=1 --nocapture; COREROUTER_CLOCK_ROOT=1 cargo test -p corerouter-daemon --test ntp_clock_root -- --nocapture; systemctl start systemd-timesyncd'
 ```

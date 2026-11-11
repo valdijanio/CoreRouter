@@ -23,6 +23,9 @@
 //!   Buildroot tree (package versions newer than the LTS branch ships, FRR
 //!   10.7.1) and extracts it again when those patches change; `frr-test`
 //!   runs OSPF/SR/LDP/BFD between two guests of the image (`os/frr.rs`).
+//! - G1.26i: `forward-test` routes IPv4 and IPv6 between two guests through
+//!   a third nobody tuned, and reads the live ISO's forwarding
+//!   (`os/forward.rs`).
 //! - processo: everything built lives in one directory per checkout, by
 //!   default on the build disk outside the repository (`os/out.rs`), and
 //!   `make all` runs packages in parallel by default.
@@ -40,6 +43,7 @@ use crate::vm_lab::{download, sha256_file};
 
 mod ab;
 mod firmware;
+mod forward;
 mod frr;
 mod hotplug;
 mod install;
@@ -203,7 +207,7 @@ const GUEST_TLS_PORT: u16 = 8729;
 /// G1.6o: `ip.service www-ssl`, on in a new config of the image.
 const GUEST_WEB_PORT: u16 = 443;
 
-const USAGE: &str = "usage: cargo xtask os <build [--only crpkg] [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|push --to HOST:PORT [--user U] [--no-build] [--no-wait] [--confirm manual]|release-key <init|check> [--dir D]|release --tag vX.Y.Z [--key-dir D] [--dry-run] [--no-build] [--repo OWNER/NAME]|out-dir|boot-test [--efi] [--tcg] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--firmware ovmf|seabios] [--scenario update|push|no-confirm|bad-signature|bad-param|cross|cut|controllers]|install-test [--tcg] [--firmware ovmf|seabios] [--only live-modules]|frr-test [--tcg]|firmware-lock --tag T|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
+const USAGE: &str = "usage: cargo xtask os <build [--only crpkg] [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|push --to HOST:PORT [--user U] [--no-build] [--no-wait] [--confirm manual]|release-key <init|check> [--dir D]|release --tag vX.Y.Z [--key-dir D] [--dry-run] [--no-build] [--repo OWNER/NAME]|out-dir|boot-test [--efi] [--tcg] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--firmware ovmf|seabios] [--scenario update|push|no-confirm|bad-signature|bad-param|cross|cut|controllers]|install-test [--tcg] [--firmware ovmf|seabios] [--only live-modules]|frr-test [--tcg]|forward-test [--tcg] [--no-live]|firmware-lock --tag T|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
 
 pub fn main(root: &Path, args: &[String]) -> Outcome {
     let (sub, rest) = match args.split_first() {
@@ -216,6 +220,7 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
         "ab-test" => images_dir(root).and_then(|i| ab::ab_test(root, &i, rest)),
         "install-test" => images_dir(root).and_then(|i| install::install_test(root, &i, rest)),
         "frr-test" => images_dir(root).and_then(|i| frr::frr_test(root, &i, rest)),
+        "forward-test" => images_dir(root).and_then(|i| forward::forward_test(root, &i, rest)),
         "package" => images_dir(root).and_then(|i| package_cmd(root, &i, rest)),
         "firmware-lock" => images_dir(root).and_then(|i| {
             let target = i

@@ -105,7 +105,7 @@ mod tests {
         assert_eq!(by("auth.no_password")["severity"], "ok", "the lab has no admin yet");
         assert_eq!(by("nic.errors")["severity"], "warning", "ether4's bad cable");
         assert!(by("nic.errors")["reason"].as_str().unwrap().contains("ether4"));
-        assert_eq!(by("ntp")["severity"], "ok", "NTP off is the factory default (G4.6i)");
+        assert_eq!(by("ntp")["severity"], "ok", "NTP is off in the lab session; a router's first boot turns it on (G1.6zh)");
         assert_eq!(by("services")["severity"], "unknown", "no supervisor in the lab");
         assert_eq!(by("bgp.end-of-rib")["severity"], "unknown", "no routing daemon in the lab (G3.9fj)");
         assert_eq!(by("bgp.gr-bfd")["severity"], "unknown");
