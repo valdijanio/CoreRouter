@@ -918,3 +918,92 @@ fn the_preview_says_what_set_would_do_and_changes_nothing() {
         "{p}"
     );
 }
+
+/// G1.30g: the monitor's link in detail — what the Wi-Fi tab of
+/// "Interface <wifi1>" shows: quality, SNR, generation, both rates with
+/// their line, retries, the address.
+#[test]
+fn the_monitor_reads_the_link_in_detail() {
+    let (mut s, _air, _) = joined();
+    let m = monitor(&mut s);
+    assert_eq!(m["generation"], 6, "{m}");
+    assert_eq!(m["standard"], "802.11ax");
+    assert_eq!(m["cipher"], "CCMP");
+    let (signal, noise) = (m["signal"].as_i64().unwrap(), m["noise"].as_i64().unwrap());
+    assert_eq!(m["snr"].as_i64(), Some(signal - noise));
+    assert!(["excellent", "good", "fair", "poor"].contains(&m["quality"].as_str().unwrap()));
+    let tx = &m["tx_rate"];
+    assert_eq!(
+        (tx["mode"].as_str(), tx["nss"].as_u64()),
+        (Some("he"), Some(2)),
+        "{tx}"
+    );
+    let text = tx["text"].as_str().unwrap();
+    assert!(
+        text.contains("Mbit/s") && text.contains("HE-MCS") && text.contains("2 streams"),
+        "{text}"
+    );
+    assert!(m["rx_rate"]["mbps"].as_f64().unwrap() > 0.0);
+    assert_eq!(m["chain_signal"].as_array().unwrap().len(), 2);
+    // 65 retries of 3084 frames.
+    assert_eq!(m["retry_percent"].as_f64(), Some(2.1));
+    assert!(m["addresses"].is_array());
+}
+
+/// Not connected: the detail is empty, not stale.
+#[test]
+fn the_monitor_has_no_link_detail_while_not_connected() {
+    let (mut s, _air) = lab();
+    let m = monitor(&mut s);
+    assert_ne!(m["state"], "connected");
+    for k in [
+        "tx_rate",
+        "rx_rate",
+        "noise",
+        "snr",
+        "quality",
+        "generation",
+    ] {
+        assert!(m.get(k).is_none_or(Value::is_null), "{k}: {m}");
+    }
+}
+
+/// G1.30g: `interface.wifi.radio`: what the card is and can do.
+#[test]
+fn the_radio_says_what_the_card_can_do() {
+    let (mut s, _air, _) = joined();
+    let r = run(&mut s, "interface.wifi.radio", json!({"name": "wifi1"}));
+    assert_eq!(r["driver"], "lab_wifi");
+    assert_eq!(
+        r["standards"],
+        json!(["a", "b", "g", "n", "ac", "ax"]),
+        "{r}"
+    );
+    assert_eq!(
+        (r["antennas_tx"].as_u64(), r["antennas_rx"].as_u64()),
+        (Some(2), Some(2))
+    );
+    let bands = r["bands"].as_array().unwrap();
+    assert_eq!(bands.len(), 2);
+    let five = bands.iter().find(|b| b["band"] == "5ghz").unwrap();
+    assert_eq!(five["max_width"], 80);
+    assert_eq!(five["allowed"], 12);
+    assert_eq!(five["dfs"], 4, "5260–5320 MHz need radar detection");
+    assert_eq!(five["channels"][0]["channel"], 36);
+    assert_eq!(r["tx_power"], 20);
+    assert!(
+        r["max_tx_power"].is_i64(),
+        "the channel in use has a limit: {r}"
+    );
+    assert_eq!(r["country"], "BR");
+    assert!(r["blocked"].is_null());
+}
+
+#[test]
+fn the_radio_refuses_a_port_that_is_not_one() {
+    let (mut s, _air) = lab();
+    let e = fails(&mut s, "interface.wifi.radio", json!({"name": "ether1"}));
+    assert!(e.contains("ether1"), "{e}");
+    let e = fails(&mut s, "interface.wifi.radio", json!({}));
+    assert!(e.contains("name"), "{e}");
+}

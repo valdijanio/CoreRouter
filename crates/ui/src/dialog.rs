@@ -180,6 +180,10 @@ pub(crate) struct Head<'a> {
     pub parent: Option<Id>,
 }
 
+/// Room for the error line and the buttons before a resizable dialog drew
+/// them once.
+const FOOTER_ROOM: f32 = 44.0;
+
 /// Draw one dialog: its fields (`body`), the error line, the buttons, and
 /// read the keyboard. Returns what the operator asked for; the window's ✕
 /// is Cancel. While a request is out only Cancel gets through. A dialog
@@ -217,6 +221,8 @@ pub(crate) fn show<B>(
     let busy = status.busy();
     let error = status.error.as_deref();
     let mut open = true;
+    let resizable = floats.resizable(head.id);
+    let room_id = head.id.with("footer-room");
     let mut view = false;
     let mut can_ok = true;
     let pressed = floats
@@ -226,12 +232,37 @@ pub(crate) fn show<B>(
             head.id,
             &title,
             &mut open,
-            |w| w.default_pos(pos).resizable(false).collapsible(false),
+            |w| w.default_pos(pos).resizable(resizable).collapsible(false),
             |ui| {
-                let footer = body(ui, &form);
+                // G1.30g: a resizable dialog gives its body the window less
+                // the footer as drawn last frame (the error line comes and
+                // goes): the body fills the window, and the window does not
+                // grow a little more every frame.
+                let footer = if resizable {
+                    let room = ui
+                        .ctx()
+                        .data(|d| d.get_temp::<f32>(room_id))
+                        .unwrap_or(FOOTER_ROOM);
+                    let size = egui::vec2(
+                        ui.available_width(),
+                        (ui.available_height() - room).max(0.0),
+                    );
+                    ui.allocate_ui_with_layout(size, egui::Layout::top_down(egui::Align::Min), |ui| {
+                        body(ui, &form)
+                    })
+                    .inner
+                } else {
+                    body(ui, &form)
+                };
                 view = matches!(footer.buttons, Buttons::View);
                 can_ok = footer.ok.is_ok();
-                buttons(ui, footer, error, busy)
+                let top = ui.cursor().top();
+                let pressed = buttons(ui, footer, error, busy);
+                if resizable {
+                    let used = ui.min_rect().bottom() - top + ui.spacing().item_spacing.y;
+                    ui.ctx().data_mut(|d| d.insert_temp(room_id, used));
+                }
+                pressed
             },
         )
         .flatten();

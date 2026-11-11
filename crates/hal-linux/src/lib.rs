@@ -201,6 +201,10 @@ pub mod link_dump;
 pub mod link_events;
 /// Neighbor tables over rtnetlink (G1.27d): dump, events, static entries.
 pub mod neigh;
+/// A radio and its link as nl80211 reports them (G1.30g); the parsers are
+/// pure.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod nl80211;
 /// Wi-Fi in station mode (G1.30): `wpa_supplicant`, driven through its
 /// control socket; the parsers of what it says are pure.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

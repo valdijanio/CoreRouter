@@ -99,8 +99,11 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{show_sensitive?: bool (the passphrases in clear; group full)} → [{name, mode, ssid, security, passphrase, hidden, band, bssid, mtu, mac_address, disabled, comment, running, state (disabled | no-country | idle | searching | connecting | connected | blocked | error | absent), connected_bssid, frequency, channel, signal, rate, failure, driver}]",
         always, list),
     cmd!(query "interface.wifi.monitor", "Wi-Fi Monitor", [], None,
-        "{name: string} → {name, state, ssid, bssid, frequency, band, channel, signal, rate, security, pmf, uptime_secs, reconnects, failure: {code (wrong-key | not-found | rejected | no-answer | error), text, time}, error, country, country_in_force, country_error, driver, self_managed}",
+        "{name: string} → {name, state, ssid, bssid, frequency, band, channel, signal, rate, security, pmf, uptime_secs, reconnects, failure: {code (wrong-key | not-found | rejected | no-answer | error), text, time}, error, country, country_in_force, country_error, driver, self_managed, quality (excellent | good | fair | poor), noise, snr, width, center_frequency, generation, standard, cipher, tx_rate: {mbps, mode, mcs, nss, width, guard_ns, text}, rx_rate: {mbps, mode, mcs, nss, width, guard_ns, text}, signal_avg, beacon_signal, chain_signal: [int], tx_packets, rx_packets, tx_retries, tx_failed, retry_percent, beacon_loss, inactive_ms, addresses: [{address, dynamic}]}",
         has_radios, monitor),
+    cmd!(query "interface.wifi.radio", "Wi-Fi Radio", [], None,
+        "{name: string} → {name, phy, driver, firmware, self_managed, blocked (soft | hard | null), standards: [string], bands: [{band (2ghz | 5ghz | 6ghz), standards: [string], max_width, allowed, dfs, max_power, channels: [{mhz, channel, max_power, radar, disabled}]}], antennas_tx, antennas_rx, tx_power, max_tx_power (here, on the channel in use), frequency, country, country_in_force}",
+        has_radios, radio),
     cmd!(query "interface.wifi.scan", "Wi-Fi Scan", [], None,
         "{name: string} → {name, scanning} (the networks: interface.wifi.networks, a few seconds later)",
         has_radios, scan),
@@ -554,7 +557,7 @@ fn monitor(s: &mut Session, p: &Value) -> Result<Value> {
     let r = rt.and_then(|rt| rt.radios.get(&name));
     let status = r.map(|r| &r.status);
     let frequency = status.and_then(|st| st.frequency_mhz);
-    Ok(json!({
+    let mut out = json!({
         "name": name,
         "state": state_of(s, cfg, &name, iface, present),
         "ssid": status.and_then(|x| x.ssid.clone()).or_else(|| (!st.ssid.is_empty()).then(|| st.ssid.clone())),
@@ -577,6 +580,205 @@ fn monitor(s: &mut Session, p: &Value) -> Result<Value> {
         "country_error": rt.and_then(|rt| rt.country_error.clone()),
         "driver": r.and_then(|r| r.hardware.as_ref()).and_then(|h| h.driver.clone()),
         "self_managed": r.and_then(|r| r.hardware.as_ref()).map(|h| h.self_managed),
+    });
+    // G1.30g: the link in detail, for the Wi-Fi tab of "Interface <name>".
+    if let (Value::Object(o), Some(st)) = (&mut out, status) {
+        let connected = st.state == corerouter_hal::wifi::WifiState::Connected;
+        let link = st.link.as_ref().filter(|_| connected);
+        let signal = st.signal_dbm.filter(|_| connected);
+        let noise = st.noise_dbm.filter(|_| connected);
+        let tx_packets = link.and_then(|l| l.tx_packets);
+        let retries = link.and_then(|l| l.tx_retries);
+        let detail = json!({
+            "quality": signal.map(quality),
+            "noise": noise,
+            "snr": signal.zip(noise).map(|(s, n)| s - n),
+            "width": st.width_mhz.filter(|_| connected),
+            "center_frequency": st.center_mhz.filter(|_| connected),
+            "generation": st.generation.filter(|_| connected),
+            "standard": st.generation.filter(|_| connected).and_then(standard_of),
+            "cipher": st.cipher.clone().filter(|_| connected),
+            "tx_rate": link.and_then(|l| l.tx.as_ref()).map(rate_json),
+            "rx_rate": link.and_then(|l| l.rx.as_ref()).map(rate_json),
+            "signal_avg": link.and_then(|l| l.signal_avg_dbm),
+            "beacon_signal": link.and_then(|l| l.beacon_signal_dbm),
+            "chain_signal": link.map(|l| l.chain_signal_dbm.clone()).unwrap_or_default(),
+            "tx_packets": tx_packets,
+            "rx_packets": link.and_then(|l| l.rx_packets),
+            "tx_retries": retries,
+            "tx_failed": link.and_then(|l| l.tx_failed),
+            "retry_percent": retry_percent(retries, tx_packets),
+            "beacon_loss": link.and_then(|l| l.beacon_loss),
+            "inactive_ms": link.and_then(|l| l.inactive_ms),
+        });
+        if let Value::Object(d) = detail {
+            o.extend(d);
+        }
+    }
+    let addresses = addresses_on(s, &name);
+    if let Value::Object(o) = &mut out {
+        o.insert("addresses".into(), addresses);
+    }
+    Ok(out)
+}
+
+/// How a station's signal reads to an operator. Thresholds as the Wi-Fi
+/// design guides put them (Cisco's −67 dBm for voice, −75 for data):
+/// excellent from −55 dBm, good from −67, fair from −75, poor below.
+fn quality(dbm: i32) -> &'static str {
+    match dbm {
+        d if d >= -55 => "excellent",
+        d if d >= -67 => "good",
+        d if d >= -75 => "fair",
+        _ => "poor",
+    }
+}
+
+/// `6` → `802.11ax`.
+fn standard_of(generation: u8) -> Option<&'static str> {
+    match generation {
+        4 => Some("802.11n"),
+        5 => Some("802.11ac"),
+        6 => Some("802.11ax"),
+        7 => Some("802.11be"),
+        _ => None,
+    }
+}
+
+/// Retries per hundred frames sent, one decimal; `None` before the first.
+fn retry_percent(retries: Option<u64>, packets: Option<u64>) -> Option<f64> {
+    let (r, p) = (retries?, packets?);
+    (p > 0).then(|| ((r as f64 / p as f64) * 1000.0).round() / 10.0)
+}
+
+/// A rate as JSON, with the line the GUI shows: `576.5 Mbit/s, HE-MCS 11,
+/// 2 streams, 80 MHz, GI 0.8 µs`.
+fn rate_json(r: &corerouter_hal::wifi::WifiRate) -> Value {
+    let mbps = r.kbps.map(|k| (f64::from(k) / 100.0).round() / 10.0);
+    let mut parts = Vec::new();
+    if let Some(m) = mbps {
+        parts.push(format!("{m} Mbit/s"));
+    }
+    match (r.mode.as_deref(), r.mcs) {
+        (Some(mode), Some(mcs)) if mode != "legacy" => {
+            parts.push(format!("{}-MCS {mcs}", mode.to_ascii_uppercase()));
+        }
+        (Some("legacy"), _) => parts.push("legacy".into()),
+        _ => {}
+    }
+    if let Some(n) = r.nss {
+        parts.push(if n == 1 { "1 stream".into() } else { format!("{n} streams") });
+    }
+    if let Some(w) = r.width_mhz {
+        parts.push(format!("{w} MHz"));
+    }
+    if let Some(g) = r.guard_ns {
+        parts.push(format!("GI {} µs", f64::from(g) / 1000.0));
+    }
+    json!({
+        "mbps": mbps,
+        "mode": r.mode,
+        "mcs": r.mcs,
+        "nss": r.nss,
+        "width": r.width_mhz,
+        "guard_ns": r.guard_ns,
+        "text": parts.join(", "),
+    })
+}
+
+/// The addresses on `name` now (static and the ones a DHCP client got).
+fn addresses_on(s: &Session, name: &IfName) -> Value {
+    let cfg = s.effective(s.store().candidate());
+    Value::Array(
+        cfg.ip
+            .addresses
+            .iter()
+            .filter(|a| &a.interface == name && !a.disabled)
+            .take(16)
+            .map(|a| {
+                json!({
+                    "address": a.address.to_string(),
+                    "dynamic": crate::dhcp_client::is_dynamic(a.id),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// G1.30g: what the radio behind `name` is and can do.
+fn radio(s: &mut Session, p: &Value) -> Result<Value> {
+    let name: IfName = req_parse(p, "name")?;
+    let cfg = s.store().candidate();
+    radio_of(cfg, &name)?;
+    let country = cfg.system.wifi.country.map(|c| c.to_string());
+    let frequency = s
+        .wifi()
+        .and_then(|rt| rt.radios.get(&name))
+        .filter(|r| r.status.state == corerouter_hal::wifi::WifiState::Connected)
+        .and_then(|r| r.status.frequency_mhz);
+    let in_force = s.hal_mut().wifi_regdomain();
+    let Some(r) = s.hal_mut().wifi_radio(&name) else {
+        return Ok(json!({
+            "name": name, "driver": null, "bands": [], "standards": [],
+            "frequency": frequency, "country": country, "country_in_force": in_force,
+        }));
+    };
+    let mut standards: Vec<String> = Vec::new();
+    for b in &r.bands {
+        for st in &b.standards {
+            if !standards.contains(st) {
+                standards.push(st.clone());
+            }
+        }
+    }
+    let order = ["a", "b", "g", "n", "ac", "ax", "be"];
+    standards.sort_by_key(|x| order.iter().position(|o| o == x).unwrap_or(order.len()));
+    let max_here = frequency.and_then(|f| {
+        r.bands
+            .iter()
+            .flat_map(|b| &b.channels)
+            .find(|c| c.mhz == f)
+            .and_then(|c| c.max_power_dbm)
+    });
+    let bands: Vec<Value> = r
+        .bands
+        .iter()
+        .map(|b| {
+            let allowed = b.channels.iter().filter(|c| !c.disabled).count();
+            let dfs = b.channels.iter().filter(|c| !c.disabled && c.radar).count();
+            json!({
+                "band": b.band,
+                "standards": b.standards,
+                "max_width": b.max_width_mhz,
+                "allowed": allowed,
+                "dfs": dfs,
+                "max_power": b.channels.iter().filter(|c| !c.disabled).filter_map(|c| c.max_power_dbm).max(),
+                "channels": b.channels.iter().map(|c| json!({
+                    "mhz": c.mhz,
+                    "channel": channel(c.mhz),
+                    "max_power": c.max_power_dbm,
+                    "radar": c.radar,
+                    "disabled": c.disabled,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "name": name,
+        "phy": r.phy,
+        "driver": r.driver,
+        "firmware": r.firmware,
+        "self_managed": r.self_managed,
+        "blocked": r.blocked,
+        "standards": standards,
+        "bands": bands,
+        "antennas_tx": r.antennas_tx,
+        "antennas_rx": r.antennas_rx,
+        "tx_power": r.tx_power_dbm,
+        "max_tx_power": max_here,
+        "frequency": frequency,
+        "country": country,
+        "country_in_force": in_force,
     }))
 }
 
@@ -825,3 +1027,51 @@ fn preview(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(out)
 }
 
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn quality_follows_the_design_thresholds() {
+        for (dbm, q) in [
+            (-40, "excellent"),
+            (-55, "excellent"),
+            (-56, "good"),
+            (-67, "good"),
+            (-68, "fair"),
+            (-75, "fair"),
+            (-76, "poor"),
+            (-95, "poor"),
+        ] {
+            assert_eq!(quality(dbm), q, "{dbm}");
+        }
+    }
+
+    #[test]
+    fn a_rate_reads_as_one_line() {
+        let he = corerouter_hal::wifi::WifiRate {
+            kbps: Some(576_500),
+            mode: Some("he".into()),
+            mcs: Some(11),
+            nss: Some(2),
+            width_mhz: Some(80),
+            guard_ns: Some(800),
+        };
+        let v = rate_json(&he);
+        assert_eq!(v["mbps"], 576.5);
+        assert_eq!(v["text"], "576.5 Mbit/s, HE-MCS 11, 2 streams, 80 MHz, GI 0.8 µs");
+        let legacy = corerouter_hal::wifi::WifiRate {
+            kbps: Some(5_500),
+            mode: Some("legacy".into()),
+            ..Default::default()
+        };
+        assert_eq!(rate_json(&legacy)["text"], "5.5 Mbit/s, legacy");
+        assert_eq!(rate_json(&Default::default())["text"], "");
+        assert_eq!(retry_percent(Some(65), Some(3084)), Some(2.1));
+        assert_eq!(retry_percent(Some(1), Some(0)), None);
+        assert_eq!(standard_of(6), Some("802.11ax"));
+        assert_eq!(standard_of(3), None);
+    }
+}

@@ -112,7 +112,7 @@ fn ethernet_tab_shows_the_engine_refusal() {
 }
 
 #[test]
-fn sfp_tab_reads_the_module_and_copper_ports_say_why_not() {
+fn sfp_tab_reads_the_module() {
     let mut h = lab();
     h.app.open_props("ether8");
     h.wait(1.2);
@@ -129,11 +129,7 @@ fn sfp_tab_reads_the_module_and_copper_ports_say_why_not() {
     ] {
         assert!(h.has_text(t), "{t}");
     }
-    h.key(egui::Key::Escape, egui::Modifiers::NONE);
-    h.app.open_props("ether1");
-    h.wait(1.2);
-    h.tab("SFP");
-    assert!(h.has_text_containing("No SFP: 'ether1' is a copper port"));
+    // G1.30g: a copper port has no SFP tab (tests/iface_wifi.rs).
 }
 
 #[test]

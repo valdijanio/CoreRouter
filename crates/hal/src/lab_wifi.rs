@@ -11,8 +11,8 @@ use corerouter_model::IfName;
 
 use crate::HalError;
 use crate::wifi::{
-    BssSecurity, JoinSecurity, MAX_EVENTS, WifiBss, WifiEvent, WifiFailure, WifiNetwork, WifiPort,
-    WifiRadio, WifiState, WifiStatus,
+    BssSecurity, JoinSecurity, MAX_EVENTS, WifiBand, WifiBss, WifiChannel, WifiEvent, WifiFailure,
+    WifiLink, WifiNetwork, WifiPort, WifiRadio, WifiRate, WifiState, WifiStatus,
 };
 
 /// The passphrase of the lab's main network (`CoreRouter-Lab`).
@@ -303,9 +303,43 @@ impl LabWifi {
     }
 
     pub fn radio(&self, name: &IfName) -> Option<WifiRadio> {
-        self.has_radio(name).then(|| WifiRadio {
-            driver: Some("lab_wifi".into()),
-            self_managed: false,
+        self.has_radio(name).then(|| {
+            // G1.30g: a 2x2 Wi-Fi 6 card, the shape of the common laptop ones.
+            let ch = |mhz: u32, max: i32, radar: bool| WifiChannel {
+                mhz,
+                max_power_dbm: Some(max),
+                radar,
+                disabled: false,
+            };
+            WifiRadio {
+                driver: Some("lab_wifi".into()),
+                self_managed: false,
+                phy: Some("phy0".into()),
+                firmware: Some("lab 1.0".into()),
+                bands: vec![
+                    WifiBand {
+                        band: "2ghz".into(),
+                        standards: ["b", "g", "n", "ax"].map(String::from).to_vec(),
+                        max_width_mhz: Some(40),
+                        channels: (0..13).map(|i| ch(2412 + 5 * i, 20, false)).collect(),
+                    },
+                    WifiBand {
+                        band: "5ghz".into(),
+                        standards: ["a", "n", "ac", "ax"].map(String::from).to_vec(),
+                        max_width_mhz: Some(80),
+                        channels: [
+                            5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320, 5745, 5765, 5785, 5805,
+                        ]
+                        .into_iter()
+                        .map(|f| ch(f, if f < 5250 { 23 } else { 30 }, (5260..5700).contains(&f)))
+                        .collect(),
+                    },
+                ],
+                antennas_tx: Some(2),
+                antennas_rx: Some(2),
+                tx_power_dbm: Some(20),
+                blocked: None,
+            }
         })
     }
 
@@ -451,6 +485,58 @@ impl WifiPort for LabPort {
                 .to_owned()
             }),
             pmf: on.map(|n| matches!(n.security, BssSecurity::Wpa3 | BssSecurity::Wpa2Wpa3)),
+            // G1.30g: what a 2x2 Wi-Fi 6 link reads like.
+            noise_dbm: on.map(|_| -92),
+            width_mhz: on.map(|n| if n.frequency_mhz > 5000 { 80 } else { 20 }),
+            center_mhz: on.map(|n| {
+                if n.frequency_mhz > 5000 {
+                    n.frequency_mhz + 30
+                } else {
+                    n.frequency_mhz
+                }
+            }),
+            generation: on.map(|_| 6),
+            cipher: on.map(|n| {
+                if n.security == BssSecurity::Open {
+                    "NONE"
+                } else {
+                    "CCMP"
+                }
+                .to_owned()
+            }),
+            link: on.map(|n| {
+                let wide = n.frequency_mhz > 5000;
+                let rate = |kbps: u32, mcs: u8| WifiRate {
+                    kbps: Some(kbps),
+                    mode: Some("he".into()),
+                    mcs: Some(mcs),
+                    nss: Some(2),
+                    width_mhz: Some(if wide { 80 } else { 20 }),
+                    guard_ns: Some(800),
+                };
+                WifiLink {
+                    tx: Some(if wide {
+                        rate(864_800, 9)
+                    } else {
+                        rate(229_400, 11)
+                    }),
+                    rx: Some(if wide {
+                        rate(1_201_000, 11)
+                    } else {
+                        rate(206_500, 10)
+                    }),
+                    signal_avg_dbm: Some(n.signal_dbm),
+                    beacon_signal_dbm: Some(n.signal_dbm - 2),
+                    chain_signal_dbm: vec![n.signal_dbm - 1, n.signal_dbm - 3],
+                    tx_packets: Some(3084),
+                    rx_packets: Some(4207),
+                    tx_retries: Some(65),
+                    tx_failed: Some(0),
+                    beacon_loss: Some(0),
+                    connected_secs: None,
+                    inactive_ms: Some(40),
+                }
+            }),
         })
     }
 

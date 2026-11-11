@@ -199,7 +199,12 @@ fn every_interface_tab_renders_with_data() {
     h.click(at);
     h.click(at);
     assert!(h.has_text("Interface <ether2>"));
-    for tab in crate::iface_tabs::Tab::ALL {
+    h.time += 1.1;
+    h.idle();
+    // G1.30g: the tabs this port has (a copper port has no SFP tab).
+    let tabs = crate::iface_tabs::Tab::of(h.app.nic.get("ether2"));
+    assert!(tabs.len() >= 6, "{tabs:?}");
+    for tab in tabs {
         if let Some(interfaces::Dialog::Props(p)) = h.app.dialogs.first_mut().map(|d| &mut d.dialog)
         {
             p.tab = tab;

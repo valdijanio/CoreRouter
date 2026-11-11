@@ -22,13 +22,17 @@ use crate::{CoreRouterUi, Pending, REFRESH_SECS, value_text};
 pub(crate) const MONITOR: &str = "interface.ethernet.monitor";
 pub(crate) const HARDWARE: &str = "interface.hardware";
 pub(crate) const STATS: &str = "interface.stats";
+/// G1.30g: the link of a Wi-Fi port, and what its radio is.
+pub(crate) const WIFI_MONITOR: &str = "interface.wifi.monitor";
+pub(crate) const WIFI_RADIO: &str = "interface.wifi.radio";
 /// The hardware rarely changes: asked again this often.
 const HARDWARE_SECS: f64 = 10.0;
 /// A query unanswered this long is asked again (the reply was lost).
 const STALE_SECS: f64 = 15.0;
 /// Traffic samples kept (about two minutes at one per second).
 const HISTORY: usize = 120;
-/// Height of the tab area, so switching tabs does not resize the window.
+/// Least size of the tab area, so switching tabs does not resize the
+/// window. G1.30g: the window resizes with the mouse, the tabs fill it.
 const BODY_HEIGHT: f32 = 380.0;
 const BODY_WIDTH: f32 = 470.0;
 const NOT_SUPPORTED: &str = "not supported";
@@ -40,21 +44,47 @@ pub(crate) enum Tab {
     Ethernet,
     Status,
     Sfp,
+    /// G1.30g: the link of a Wi-Fi port (network, signal, channel, rates).
+    Wifi,
+    /// G1.30g: what the radio is and can do.
+    Radio,
     Hardware,
     Traffic,
     Stats,
 }
 
 impl Tab {
-    pub(crate) const ALL: [Tab; 7] = [
+    pub(crate) const ALL: [Tab; 9] = [
         Tab::General,
         Tab::Ethernet,
         Tab::Status,
         Tab::Sfp,
+        Tab::Wifi,
+        Tab::Radio,
         Tab::Hardware,
         Tab::Traffic,
         Tab::Stats,
     ];
+
+    /// The tabs a port has (G1.30g): a Wi-Fi port has Wi-Fi and Radio and
+    /// no Ethernet, Status or SFP; SFP only on a port with a module cage
+    /// (the router read one, empty or not).
+    pub(crate) fn of(view: Option<&NicView>) -> Vec<Tab> {
+        let wifi = view.is_some_and(|v| v.wifi);
+        let cage = view
+            .and_then(NicView::monitor_value)
+            .and_then(|m| m.get("sfp"))
+            .is_some_and(|v| !v.is_null());
+        Tab::ALL
+            .into_iter()
+            .filter(|t| match t {
+                Tab::Ethernet | Tab::Status => !wifi,
+                Tab::Sfp => !wifi && cage,
+                Tab::Wifi | Tab::Radio => wifi,
+                _ => true,
+            })
+            .collect()
+    }
 
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -62,6 +92,8 @@ impl Tab {
             Tab::Ethernet => "Ethernet",
             Tab::Status => "Status",
             Tab::Sfp => "SFP",
+            Tab::Wifi => "Wi-Fi",
+            Tab::Radio => "Radio",
             Tab::Hardware => "Hardware",
             Tab::Traffic => "Traffic",
             Tab::Stats => "Statistics",
@@ -75,6 +107,9 @@ pub(crate) enum What {
     Monitor,
     Hardware,
     Stats,
+    /// G1.30g: `interface.wifi.monitor` and `interface.wifi.radio`.
+    WifiMonitor,
+    WifiRadio,
     /// The operator's actions from the Ethernet tab (G1.20).
     CableStart,
     CablePoll,
@@ -82,14 +117,23 @@ pub(crate) enum What {
 }
 
 impl What {
-    /// The periodic queries.
-    const ALL: [What; 3] = [What::Monitor, What::Hardware, What::Stats];
+    /// The periodic queries of a port; a Wi-Fi port asks its link and
+    /// radio instead of the Ethernet monitor.
+    fn periodic(wifi: bool) -> &'static [What] {
+        if wifi {
+            &[What::WifiMonitor, What::WifiRadio, What::Hardware, What::Stats]
+        } else {
+            &[What::Monitor, What::Hardware, What::Stats]
+        }
+    }
 
     fn command(self) -> &'static str {
         match self {
             What::Monitor => MONITOR,
             What::Hardware => HARDWARE,
             What::Stats => STATS,
+            What::WifiMonitor => WIFI_MONITOR,
+            What::WifiRadio => WIFI_RADIO,
             What::CableStart => CABLE_TEST,
             What::CablePoll => TASK_POLL,
             What::Reset => SET,
@@ -98,7 +142,7 @@ impl What {
 
     fn every(self) -> f64 {
         match self {
-            What::Hardware => HARDWARE_SECS,
+            What::Hardware | What::WifiRadio => HARDWARE_SECS,
             What::CablePoll => 0.5,
             _ => REFRESH_SECS,
         }
@@ -128,6 +172,10 @@ pub(crate) struct NicView {
     monitor: Option<Result<Value, String>>,
     hardware: Option<Result<Value, String>>,
     stats: Option<Result<Value, String>>,
+    wifi_monitor: Option<Result<Value, String>>,
+    wifi_radio: Option<Result<Value, String>>,
+    /// G1.30g: a Wi-Fi port (set by the window from its interface row).
+    pub(crate) wifi: bool,
     asked: BTreeMap<What, f64>,
     pending: BTreeSet<What>,
     opened: Option<f64>,
@@ -312,15 +360,24 @@ impl CoreRouterUi {
             }
         }
         self.nic.retain(|name, _| open.contains(name));
+        // G1.30g: a Wi-Fi port asks for its link and radio, not Ethernet's.
+        let wifi: Vec<String> = self
+            .ifaces()
+            .into_iter()
+            .filter(|i| i.kind == "wifi")
+            .map(|i| i.name)
+            .collect();
         for name in open {
             let view = self.nic.entry(name.clone()).or_default();
+            view.wifi = wifi.contains(&name);
             view.opened.get_or_insert(now);
             // A reply lost with the link: ask again after a while.
             let asked = view.asked.clone();
             view.pending
                 .retain(|w| asked.get(w).is_some_and(|t| now - t < STALE_SECS));
-            let due: Vec<What> = What::ALL
-                .into_iter()
+            let due: Vec<What> = What::periodic(view.wifi)
+                .iter()
+                .copied()
                 .filter(|w| !view.pending.contains(w))
                 .filter(|w| {
                     let every = if *w == What::Hardware && now < view.usb_fast_until { 1.0 } else { w.every() };
@@ -379,7 +436,9 @@ impl CoreRouterUi {
             _ => {}
         }
         match req.what {
-            What::Monitor | What::Hardware | What::Stats => *view.slot(req.what) = Some(result),
+            What::Monitor | What::Hardware | What::Stats | What::WifiMonitor | What::WifiRadio => {
+                *view.slot(req.what) = Some(result);
+            }
             What::CableStart => {
                 view.cable = match result {
                     Ok(v) => match v.get("id").and_then(Value::as_u64) {
@@ -454,7 +513,9 @@ fn action_params(v: &mut NicView, what: What, name: &str) -> Value {
             v.reset = false;
             json!({ "name": name, "reset": true })
         }
-        What::Monitor | What::Hardware | What::Stats => json!({ "name": name }),
+        What::Monitor | What::Hardware | What::Stats | What::WifiMonitor | What::WifiRadio => {
+            json!({ "name": name })
+        }
     }
 }
 
@@ -463,6 +524,8 @@ impl NicView {
         match what {
             What::Monitor => &mut self.monitor,
             What::Hardware => &mut self.hardware,
+            What::WifiMonitor => &mut self.wifi_monitor,
+            What::WifiRadio => &mut self.wifi_radio,
             What::Stats | What::CableStart | What::CablePoll | What::Reset => &mut self.stats,
         }
     }
@@ -472,8 +535,14 @@ impl NicView {
 /// reading is past its thresholds.
 pub(crate) fn tab_bar(ui: &mut Ui, tab: &mut Tab, view: Option<&NicView>) {
     let alert = view.and_then(ethernet_tab::sfp_alert);
+    let tabs = Tab::of(view);
+    // A tab the port does not have (the SFP tab of a copper port once its
+    // monitor answered) goes back to General.
+    if !tabs.contains(tab) {
+        *tab = Tab::General;
+    }
     ui.horizontal(|ui| {
-        for t in Tab::ALL {
+        for t in tabs {
             let label = match (t, alert) {
                 (Tab::Sfp, Some(true)) => RichText::new("SFP ⚠").color(ui.visuals().error_fg_color),
                 (Tab::Sfp, Some(false)) => RichText::new("SFP ⚠").color(ui.visuals().warn_fg_color),
@@ -495,10 +564,15 @@ pub(crate) fn body(
     help: &mut Option<(&'static str, &'static str)>,
     general: impl FnOnce(&mut Ui, Option<&NicView>, &mut Option<(&'static str, &'static str)>),
 ) {
-    ui.set_min_width(BODY_WIDTH);
+    // G1.30g: at least the old fixed size; more when the window is resized.
+    let size = egui::vec2(
+        ui.available_width().max(BODY_WIDTH),
+        // The dialog keeps the footer's room out of it (`dialog::show`).
+        (ui.available_height() - ui.spacing().item_spacing.y).max(BODY_HEIGHT),
+    );
+    ui.set_min_width(size.x);
     if tab == Tab::General {
         // Editable fields: no scrolling, so they lay out on the first frame.
-        let size = egui::vec2(BODY_WIDTH, BODY_HEIGHT);
         ui.allocate_ui_with_layout(size, egui::Layout::top_down(egui::Align::Min), |ui| {
             ui.set_min_size(size);
             general(ui, view.as_deref(), help);
@@ -507,10 +581,10 @@ pub(crate) fn body(
     }
     ScrollArea::vertical()
         .id_salt(("iface-tab", tab.label()))
-        .max_height(BODY_HEIGHT)
+        .max_height(size.y)
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.set_min_height(BODY_HEIGHT);
+            ui.set_min_height(size.y);
             let Some(view) = view else {
                 ui.weak("Loading…");
                 return;
@@ -520,6 +594,8 @@ pub(crate) fn body(
                 Tab::Ethernet => ethernet_tab::ethernet(ui, view, can),
                 Tab::Status => status(ui, view),
                 Tab::Sfp => ethernet_tab::sfp(ui, view),
+                Tab::Wifi => crate::iface_wifi::wifi(ui, &view.wifi_monitor, help),
+                Tab::Radio => crate::iface_wifi::radio(ui, &view.wifi_radio, help),
                 Tab::Hardware => hardware(ui, view, can, help),
                 Tab::Traffic => traffic(ui, view),
                 Tab::Stats => statistics(ui, view),
@@ -528,7 +604,7 @@ pub(crate) fn body(
 }
 
 /// The reply of a query, or why there is none yet: "Loading…", the error.
-fn loaded<'a>(ui: &mut Ui, r: &'a Option<Result<Value, String>>) -> Option<&'a Value> {
+pub(crate) fn loaded<'a>(ui: &mut Ui, r: &'a Option<Result<Value, String>>) -> Option<&'a Value> {
     match r {
         None => {
             ui.weak("Loading…");
@@ -682,10 +758,21 @@ fn hardware(ui: &mut Ui, view: &mut NicView, can: &Avail, help: &mut Option<(&'s
         usb_recovery(ui, u, view, can, help);
         ui.add_space(6.0);
     }
+    // G1.30g: a row the driver does not report is left out; their names go
+    // in one line under the table (a Wi-Fi card has no rings or channels).
+    let mut missing: Vec<&str> = Vec::new();
     Grid::new("iface-hw")
         .num_columns(2)
         .spacing([12.0, 4.0])
         .show(ui, |ui| {
+            let mut row = |ui: &mut Ui, label: &'static str, value: Option<String>| match value {
+                Some(v) => {
+                    ui.label(label);
+                    ui.label(v);
+                    ui.end_row();
+                }
+                None => missing.push(label),
+            };
             row(ui, "Vendor", named("vendor", "vendor_id"));
             row(ui, "Model", named("model", "device_id"));
             let sub = match (
@@ -719,11 +806,23 @@ fn hardware(ui: &mut Ui, view: &mut NicView, can: &Avail, help: &mut Option<(&'s
         .and_then(Value::as_array)
         .map(|a| a.iter().collect())
         .unwrap_or_default();
-    ui.add_space(6.0);
-    ui.label(RichText::new("Offloads").strong());
     if offloads.is_empty() {
-        ui.weak(NOT_SUPPORTED);
-    } else {
+        missing.push("Offloads");
+    }
+    if !missing.is_empty() {
+        ui.add_space(4.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!("Not reported by this driver: {}", missing.join(", ")))
+                    .weak()
+                    .italics(),
+            )
+            .wrap(),
+        );
+    }
+    if !offloads.is_empty() {
+        ui.add_space(6.0);
+        ui.label(RichText::new("Offloads").strong());
         Grid::new("iface-offloads")
             .num_columns(3)
             .spacing([12.0, 2.0])
@@ -1018,7 +1117,7 @@ fn text_of(v: &Value, key: &str) -> Option<String> {
 }
 
 /// Driver notes (what was not supported and why), folded.
-fn notes(ui: &mut Ui, v: &Value) {
+pub(crate) fn notes(ui: &mut Ui, v: &Value) {
     let Some(notes) = v
         .get("notes")
         .and_then(Value::as_array)

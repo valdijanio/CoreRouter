@@ -187,6 +187,61 @@ pub struct WifiStatus {
     pub security: Option<String>,
     /// Management frame protection in use.
     pub pmf: Option<bool>,
+    /// G1.30g: the noise floor the driver measures, dBm (many do not).
+    pub noise_dbm: Option<i32>,
+    /// Width of the channel in use, MHz (20, 40, 80, 160, 320).
+    pub width_mhz: Option<u32>,
+    /// Centre of the whole channel, MHz (differs from `frequency_mhz` on
+    /// 40 MHz and wider).
+    pub center_mhz: Option<u32>,
+    /// The Wi-Fi generation negotiated: 4 (802.11n), 5 (ac), 6 (ax), 7 (be).
+    pub generation: Option<u8>,
+    /// The pairwise cipher: `CCMP`, `GCMP-256`.
+    pub cipher: Option<String>,
+    /// What the driver keeps about the link to the access point (nl80211
+    /// station info); `None` when not connected or not readable.
+    pub link: Option<WifiLink>,
+}
+
+/// One direction's rate as the driver reports it (nl80211 rate info).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct WifiRate {
+    /// kbit/s (the kernel's unit is 100 kbit/s: 5.5 Mbit/s is 5500).
+    pub kbps: Option<u32>,
+    /// `legacy`, `ht` (802.11n), `vht` (ac), `he` (ax), `eht` (be).
+    pub mode: Option<String>,
+    /// Modulation and coding scheme index of `mode`.
+    pub mcs: Option<u8>,
+    /// Spatial streams (VHT, HE, EHT; HT folds them into the MCS).
+    pub nss: Option<u8>,
+    pub width_mhz: Option<u32>,
+    /// Guard interval, ns: 800 or 400 (HT/VHT short GI); 800, 1600, 3200 (HE).
+    pub guard_ns: Option<u32>,
+}
+
+/// The station's view of its link to the access point.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct WifiLink {
+    pub tx: Option<WifiRate>,
+    pub rx: Option<WifiRate>,
+    /// Average of the frames heard from the access point, dBm.
+    pub signal_avg_dbm: Option<i32>,
+    /// Average of its beacons, dBm.
+    pub beacon_signal_dbm: Option<i32>,
+    /// Per receive chain (antenna), dBm.
+    pub chain_signal_dbm: Vec<i32>,
+    pub tx_packets: Option<u64>,
+    pub rx_packets: Option<u64>,
+    /// Frames sent again (no acknowledgement the first time).
+    pub tx_retries: Option<u64>,
+    /// Frames given up on after every retry.
+    pub tx_failed: Option<u64>,
+    /// Beacons expected and not heard.
+    pub beacon_loss: Option<u64>,
+    /// Seconds since this association began.
+    pub connected_secs: Option<u64>,
+    /// Milliseconds since anything was heard from the access point.
+    pub inactive_ms: Option<u64>,
 }
 
 /// Something that happened to a radio since the last [`WifiPort::events`].
@@ -242,7 +297,51 @@ pub struct WifiRadio {
     /// the country from the air and its own tables): the configured country
     /// is asked for and not necessarily followed.
     pub self_managed: bool,
+    /// G1.30g: the wiphy (`phy0`).
+    pub phy: Option<String>,
+    /// The firmware the card runs, as the driver announced it.
+    pub firmware: Option<String>,
+    /// What the radio can do in each band.
+    pub bands: Vec<WifiBand>,
+    /// Antennas (chains) the card has for sending and receiving.
+    pub antennas_tx: Option<u32>,
+    pub antennas_rx: Option<u32>,
+    /// Transmit power in use now, dBm.
+    pub tx_power_dbm: Option<i32>,
+    /// Off by a switch or key: `soft` (rfkill in software), `hard` (a
+    /// physical switch); `None`: free (or not known).
+    pub blocked: Option<String>,
 }
+
+/// One band of a radio (nl80211 wiphy bands).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct WifiBand {
+    /// `2ghz`, `5ghz`, `6ghz`.
+    pub band: String,
+    /// IEEE 802.11 amendments it speaks: `b`, `g`, `a`, `n`, `ac`, `ax`, `be`.
+    pub standards: Vec<String>,
+    /// Widest channel, MHz.
+    pub max_width_mhz: Option<u32>,
+    /// The channels the regulatory domain in force allows, with their power.
+    pub channels: Vec<WifiChannel>,
+}
+
+/// One channel of a band.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct WifiChannel {
+    pub mhz: u32,
+    /// Most the regulatory domain allows here, dBm.
+    pub max_power_dbm: Option<i32>,
+    /// Radar detection (DFS) required before sending.
+    pub radar: bool,
+    /// Not allowed in the domain in force.
+    pub disabled: bool,
+}
+
+/// Bounds on what a platform reports about one radio.
+pub const MAX_BANDS: usize = 4;
+pub const MAX_CHANNELS: usize = 128;
+pub const MAX_CHAINS: usize = 8;
 
 #[cfg(test)]
 mod tests {

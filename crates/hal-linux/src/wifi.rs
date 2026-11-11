@@ -204,7 +204,99 @@ pub(crate) fn parse_status(status: &str, signal: Option<&str>) -> WifiStatus {
         pmf: field(status, "pmf")
             .map(|p| matches!(p.trim(), "1" | "2"))
             .or(on.then_some(false)),
+        // wpa_supplicant 2.12 `wpa_supplicant_signal_poll`: `NOISE=%d` is
+        // `WPA_INVALID_NOISE` (9999, `src/drivers/driver.h`) when the
+        // driver has no survey.
+        noise_dbm: signal
+            .and_then(|s| number(field(s, "NOISE")))
+            .filter(|v| (-150..0).contains(v))
+            .filter(|_| on),
+        width_mhz: signal
+            .and_then(|s| field(s, "WIDTH"))
+            .and_then(width)
+            .filter(|_| on),
+        center_mhz: signal
+            .and_then(|s| number(field(s, "CENTER_FRQ1")))
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|v| (1..100_000).contains(v))
+            .filter(|_| on),
+        // `wpa_supplicant_ctrl_iface_status`: 7 EHT, 6 HE, 5 VHT, 4 HT;
+        // absent for a legacy link.
+        generation: field(status, "wifi_generation")
+            .and_then(|g| g.trim().parse::<u8>().ok())
+            .filter(|g| (4..=7).contains(g))
+            .filter(|_| on),
+        // `wpa_sm_get_status` (`src/rsn_supp/wpa.c`): `wpa_cipher_txt`.
+        cipher: field(status, "pairwise_cipher")
+            .map(str::trim)
+            .filter(|c| {
+                !c.is_empty()
+                    && *c != "NONE"
+                    && c.len() <= 24
+                    && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+            .map(str::to_owned)
+            .filter(|_| on),
+        link: None,
     }
+}
+
+/// `WIDTH=` of `SIGNAL_POLL` (`channel_width_to_string`, wpa_supplicant
+/// 2.12 `src/drivers/driver_common.c`): `20 MHz (no HT)`, `20 MHz` …
+/// `320 MHz`; `80+80 MHz` is as wide as 160.
+fn width(text: &str) -> Option<u32> {
+    let t = text.trim();
+    if t.starts_with("80+80") {
+        return Some(160);
+    }
+    let mhz = t
+        .strip_suffix(" (no HT)")
+        .unwrap_or(t)
+        .strip_suffix(" MHz")?;
+    mhz.parse::<u32>()
+        .ok()
+        .filter(|w| matches!(w, 20 | 40 | 80 | 160 | 320))
+}
+
+/// The firmware's version in one line of the kernel log, and whose it is:
+/// the device (`0000:c3:00.0`, `2-1:1.0`) of a `dev_info` line
+/// (`<driver> <device>: <text>`), or the driver of a `pr_info` one
+/// (`<driver>: <text>`). The drivers of the image say it as
+/// - rtw88/rtw89: `Firmware version 0.29.29.5 (af1ab4bf), cmd version 0, type 5`
+/// - iwlwifi: `loaded firmware version 89.202a2f7b.0 so-a0-gf-a0-89.ucode op_mode iwlmvm`
+/// - mt76 (mt7921, mt7925): `WM Firmware Version: ____010000, Build Time: 20230526130958`
+/// - ath10k/ath11k: `firmware ver WLAN.RM.4.4.1-…`, `fw_version 0x1106196e …`
+pub(crate) fn firmware_line(message: &str) -> Option<(String, String)> {
+    const MAX_KEY: usize = 32;
+    const MAX_VERSION: usize = 48;
+    let message = message.get(..message.len().min(512)).unwrap_or("");
+    let (driver, rest) = message.split_once(' ')?;
+    let token_ok =
+        |t: &str| !t.is_empty() && t.len() <= MAX_KEY && t.bytes().all(|b| b.is_ascii_graphic());
+    let (key, text) = match driver.strip_suffix(':') {
+        Some(d) => (d, rest),
+        None => {
+            let (device, text) = rest.split_once(": ")?;
+            (device, text)
+        }
+    };
+    if !token_ok(key) {
+        return None;
+    }
+    let lower = text.to_ascii_lowercase();
+    let at = ["firmware version", "fw_version", "firmware ver"]
+        .iter()
+        .find_map(|p| lower.find(p).map(|i| i.saturating_add(p.len())))?;
+    let version = text
+        .get(at..)?
+        .trim_start_matches([':', '=', ' '])
+        .split([' ', ','])
+        .next()?
+        .trim_end_matches([';', '.', ')']);
+    let ok = !version.is_empty()
+        && version.len() <= MAX_VERSION
+        && version.bytes().all(|b| b.is_ascii_graphic());
+    ok.then(|| (key.to_owned(), version.to_owned()))
 }
 
 /// `key=value` of an event line (`reason=3 locally_generated=1`).
@@ -439,14 +531,19 @@ mod io {
     use std::time::{Duration, Instant};
 
     use corerouter_hal::HalError;
+    use corerouter_hal::oslog::OsSource;
     use corerouter_hal::wifi::{
-        MAX_EVENTS, MAX_SCAN_RESULTS, WifiBss, WifiEvent, WifiFailure, WifiNetwork, WifiPort,
-        WifiRadio, WifiState, WifiStatus,
+        MAX_EVENTS, MAX_SCAN_RESULTS, WifiBss, WifiEvent, WifiFailure, WifiLink, WifiNetwork,
+        WifiPort, WifiRadio, WifiState, WifiStatus,
     };
     use corerouter_model::IfName;
 
-    use super::{MAX_COMMAND, SECRET_FIELDS, network_fields, parse_bss, parse_event, parse_status};
+    use super::{
+        MAX_COMMAND, SECRET_FIELDS, firmware_line, network_fields, parse_bss, parse_event,
+        parse_status,
+    };
     use crate::genl::{Genl, Msg};
+    use crate::nl80211::Nl80211;
 
     /// A reply slower than this is a supplicant that hangs: the radio is
     /// given up and opened again later. Local replies take 10 to 200 µs.
@@ -710,6 +807,9 @@ mod io {
         events: Ctrl,
         queued: Vec<WifiEvent>,
         blocked: bool,
+        /// nl80211, for the link's rates and counters (G1.30g); opened when
+        /// first connected, dropped after a failure and opened again.
+        nl: Option<Nl80211>,
     }
 
     impl Direct {
@@ -745,7 +845,26 @@ mod io {
                 events,
                 queued: Vec::new(),
                 blocked: false,
+                nl: None,
             })
+        }
+
+        /// What the kernel keeps about the link to `bssid`; `None` when it
+        /// cannot be read (no cfg80211, the interface gone, a driver
+        /// without station info): the supplicant's numbers stand alone.
+        fn link(&mut self, bssid: Option<&str>) -> Option<WifiLink> {
+            let ifindex = nix::net::if_::if_nametoindex(self.name.as_str()).ok()?;
+            if self.nl.is_none() {
+                self.nl = Nl80211::open();
+            }
+            match self.nl.as_mut()?.station(ifindex, bssid) {
+                Ok(l) => l,
+                Err(e) => {
+                    log::debug!("wifi {}: nl80211 station: {e}", self.name);
+                    self.nl = None;
+                    None
+                }
+            }
         }
 
         fn forget_networks(&self) -> Result<(), HalError> {
@@ -823,7 +942,10 @@ mod io {
             } else {
                 None
             };
-            let st = parse_status(&status, signal.as_deref());
+            let mut st = parse_status(&status, signal.as_deref());
+            if connected {
+                st.link = self.link(st.bssid.as_deref());
+            }
             let blocked = st.state == WifiState::Blocked;
             if blocked != self.blocked {
                 self.blocked = blocked;
@@ -1121,23 +1243,141 @@ mod io {
     /// in Linux 6.18): a country hint does not move them.
     const SELF_MANAGED: [&str; 3] = ["iwlwifi", "ath11k", "ath12k"];
 
-    /// What sysfs says about the radio behind `name`.
+    /// The last part of a sysfs link (`phy0`, `0000:c3:00.0`, `iwlwifi`),
+    /// bounded.
+    fn link_name(path: &Path) -> Option<String> {
+        std::fs::read_link(path)
+            .ok()
+            .and_then(|l| l.file_name().map(|f| f.to_string_lossy().into_owned()))
+            .map(|d| d.chars().take(32).collect::<String>())
+            .filter(|d| !d.is_empty())
+    }
+
+    /// What sysfs, nl80211 and the kernel log say about the radio behind
+    /// `name`. Asked every few seconds by a window that shows it: two
+    /// nl80211 requests and the kernel log's new lines.
     pub fn radio(name: &IfName) -> Option<WifiRadio> {
         let dev = Path::new("/sys/class/net").join(name.as_str());
         if !dev.join("phy80211").exists() {
             return None;
         }
-        let driver = std::fs::read_link(dev.join("device/driver"))
-            .ok()
-            .and_then(|l| l.file_name().map(|f| f.to_string_lossy().into_owned()))
-            .map(|d| d.chars().take(32).collect::<String>());
+        let driver = link_name(&dev.join("device/driver"));
         let self_managed = driver
             .as_deref()
             .is_some_and(|d| SELF_MANAGED.iter().any(|s| d.starts_with(s)));
-        Some(WifiRadio {
-            driver,
+        let mut r = WifiRadio {
+            driver: driver.clone(),
             self_managed,
-        })
+            phy: link_name(&dev.join("phy80211")),
+            ..WifiRadio::default()
+        };
+        // Each part on its own: a driver without one still has the others.
+        if let Ok(ifindex) = nix::net::if_::if_nametoindex(name.as_str())
+            && let Some(mut nl) = Nl80211::open()
+        {
+            match nl.tx_power(ifindex) {
+                Ok(p) => r.tx_power_dbm = p,
+                Err(e) => log::debug!("wifi {name}: nl80211 interface: {e}"),
+            }
+            match nl.wiphy(ifindex) {
+                Ok(w) => {
+                    r.bands = w.bands();
+                    r.antennas_tx = w.antennas_tx;
+                    r.antennas_rx = w.antennas_rx;
+                    r.phy = w.name.or(r.phy);
+                }
+                Err(e) => log::debug!("wifi {name}: nl80211 wiphy: {e}"),
+            }
+        }
+        r.blocked = r
+            .phy
+            .as_deref()
+            .and_then(|p| rfkill(&Path::new("/sys/class/ieee80211").join(p)));
+        let device = link_name(&dev.join("device"));
+        r.firmware = firmware(device.as_deref(), driver.as_deref());
+        Some(r)
+    }
+
+    /// How the radio's rfkill switches stand (`/sys/class/ieee80211/<phy>/
+    /// rfkill<n>/{hard,soft}`): `hard` wins over `soft`; `None` when free.
+    fn rfkill(phy: &Path) -> Option<String> {
+        let read = |p: PathBuf| {
+            std::fs::read_to_string(p)
+                .ok()
+                .is_some_and(|t| t.trim() == "1")
+        };
+        let (mut hard, mut soft) = (false, false);
+        for e in std::fs::read_dir(phy)
+            .ok()?
+            .flatten()
+            .take(MAX_SYSFS_ENTRIES)
+        {
+            if !e.file_name().to_string_lossy().starts_with("rfkill") {
+                continue;
+            }
+            hard |= read(e.path().join("hard"));
+            soft |= read(e.path().join("soft"));
+        }
+        if hard {
+            Some("hard".into())
+        } else if soft {
+            Some("soft".into())
+        } else {
+            None
+        }
+    }
+
+    /// Entries of a phy's sysfs directory looked at (some ten).
+    const MAX_SYSFS_ENTRIES: usize = 64;
+    /// Firmware versions remembered, by device or driver.
+    const MAX_FIRMWARES: usize = 32;
+    /// Kernel log records read per call at most: the whole ring the first
+    /// time (some thousands), the new ones after.
+    const MAX_KMSG_RECORDS: usize = 65_536;
+    const KMSG_BATCH: usize = 1024;
+
+    /// The kernel log, read on from where it was left, and the firmware
+    /// versions it announced, by device (or driver).
+    struct FirmwareLog {
+        kmsg: crate::oslog::Kmsg,
+        seen: BTreeMap<String, String>,
+    }
+
+    static FIRMWARE: Mutex<Option<FirmwareLog>> = Mutex::new(None);
+
+    /// The firmware the driver announced for `device` (its newest line), or
+    /// for the driver when it does not name the device. There is no nl80211
+    /// attribute for it, and ethtool's `ETHTOOL_GDRVINFO` is an ioctl
+    /// (`unsafe` here); the drivers all log it when they load it.
+    fn firmware(device: Option<&str>, driver: Option<&str>) -> Option<String> {
+        let mut guard = FIRMWARE.lock().unwrap_or_else(PoisonError::into_inner);
+        let log = guard.get_or_insert_with(|| FirmwareLog {
+            kmsg: crate::oslog::Kmsg::open("/dev/kmsg"),
+            seen: BTreeMap::new(),
+        });
+        let mut read = 0usize;
+        while read < MAX_KMSG_RECORDS {
+            let lines = log.kmsg.read(KMSG_BATCH, "");
+            read = read.saturating_add(lines.len());
+            for l in &lines {
+                // A program can write to /dev/kmsg; only the kernel counts.
+                if l.source != OsSource::Kernel {
+                    continue;
+                }
+                if let Some((key, version)) = firmware_line(&l.message)
+                    && (log.seen.len() < MAX_FIRMWARES || log.seen.contains_key(&key))
+                {
+                    log.seen.insert(key, version);
+                }
+            }
+            if lines.len() < KMSG_BATCH {
+                break;
+            }
+        }
+        device
+            .and_then(|d| log.seen.get(d))
+            .or_else(|| driver.and_then(|d| log.seen.get(d)))
+            .cloned()
     }
 
     #[cfg(test)]
@@ -1202,8 +1442,8 @@ mod io {
                                     "OK\n".into()
                                 }
                                 (false, "ADD_NETWORK") => "0\n".into(),
-                                (false, "STATUS") => "wpa_state=COMPLETED\nbssid=d8:47:32:aa:bb:cc\nfreq=5220\nssid=Casa\nkey_mgmt=SAE\npmf=2\n".into(),
-                                (false, "SIGNAL_POLL") => "RSSI=-52\nLINKSPEED=866\n".into(),
+                                (false, "STATUS") => "wpa_state=COMPLETED\nbssid=d8:47:32:aa:bb:cc\nfreq=5220\nssid=Casa\nwifi_generation=5\npairwise_cipher=CCMP\nkey_mgmt=SAE\npmf=2\n".into(),
+                                (false, "SIGNAL_POLL") => "RSSI=-52\nLINKSPEED=866\nNOISE=-91\nFREQUENCY=5220\nWIDTH=80 MHz\nCENTER_FRQ1=5210\n".into(),
                                 (false, "BSS") if cmd == "BSS 0" => "bssid=d8:47:32:aa:bb:cc\nfreq=5220\nlevel=-52\nflags=[WPA2-SAE-CCMP]\nssid=Casa\n".into(),
                                 (false, "BSS") => String::new(),
                                 (false, "SET_NETWORK") if cmd.contains(" bssid ") => "FAIL\n".into(),
@@ -1234,6 +1474,28 @@ mod io {
             let _ = std::fs::remove_dir_all(&d);
             std::fs::create_dir_all(&d).unwrap();
             d
+        }
+
+        #[test]
+        fn rfkill_hard_wins_over_soft() {
+            let dir = temp("rfkill");
+            let phy = dir.join("phy9");
+            let switch = |n: &str, hard: &str, soft: &str| {
+                let d = phy.join(n);
+                std::fs::create_dir_all(&d).unwrap();
+                std::fs::write(d.join("hard"), hard).unwrap();
+                std::fs::write(d.join("soft"), soft).unwrap();
+            };
+            std::fs::create_dir_all(phy.join("device")).unwrap();
+            assert_eq!(rfkill(&phy), None);
+            switch("rfkill3", "0\n", "0\n");
+            assert_eq!(rfkill(&phy), None);
+            switch("rfkill3", "0\n", "1\n");
+            assert_eq!(rfkill(&phy).as_deref(), Some("soft"));
+            switch("rfkill4", "1\n", "0\n");
+            assert_eq!(rfkill(&phy).as_deref(), Some("hard"));
+            assert_eq!(rfkill(&dir.join("missing")), None);
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         #[test]
@@ -1286,6 +1548,14 @@ mod io {
                 (st.state, st.signal_dbm, st.rate_mbps),
                 (WifiState::Connected, Some(-52), Some(866))
             );
+            assert_eq!(
+                (st.noise_dbm, st.width_mhz, st.center_mhz, st.generation),
+                (Some(-91), Some(80), Some(5210), Some(5))
+            );
+            assert_eq!(st.cipher.as_deref(), Some("CCMP"));
+            // No such interface in this namespace: no nl80211 link, and the
+            // rest stands.
+            assert_eq!(st.link, None);
             port.scan().unwrap();
             let heard = port.scan_results().unwrap();
             assert_eq!(heard.len(), 1);
@@ -1666,6 +1936,15 @@ mod tests {
             (Some(5220), Some(-52), Some(866))
         );
         assert_eq!((st.security.as_deref(), st.pmf), (Some("wpa3"), Some(true)));
+        // G1.30g: 9999 is "no noise reading"; no CENTER_FRQ1 in this reply.
+        assert_eq!(
+            (st.noise_dbm, st.width_mhz, st.center_mhz),
+            (None, Some(80), None)
+        );
+        assert_eq!(
+            (st.generation, st.cipher.as_deref(), st.link.as_ref()),
+            (Some(6), Some("CCMP"), None)
+        );
         for (state, want) in [
             ("SCANNING", WifiState::Searching),
             ("DISCONNECTED", WifiState::Searching),
@@ -1701,6 +1980,117 @@ mod tests {
             (open.security.as_deref(), open.signal_dbm, open.rate_mbps),
             (Some("open"), Some(0), None)
         );
+    }
+
+    #[test]
+    fn noise_width_centre_generation_and_cipher() {
+        let status = "wpa_state=COMPLETED\nbssid=d8:47:32:aa:bb:cc\nfreq=5955\n\
+                      wifi_generation=7\npairwise_cipher=GCMP-256\nkey_mgmt=SAE\n";
+        // wpa_supplicant 2.12 prints these in this order.
+        let signal = "RSSI=-61\nLINKSPEED=2882\nNOISE=-92\nFREQUENCY=5955\n\
+                      WIDTH=320 MHz\nCENTER_FRQ1=6105\nAVG_RSSI=-60\n";
+        let st = parse_status(status, Some(signal));
+        assert_eq!(
+            (st.noise_dbm, st.width_mhz, st.center_mhz, st.generation),
+            (Some(-92), Some(320), Some(6105), Some(7))
+        );
+        assert_eq!(st.cipher.as_deref(), Some("GCMP-256"));
+        for (text, want) in [
+            ("20 MHz (no HT)", Some(20)),
+            ("20 MHz", Some(20)),
+            ("40 MHz", Some(40)),
+            ("80+80 MHz", Some(160)),
+            ("160 MHz", Some(160)),
+            ("unknown", None),
+            ("33 MHz", None),
+            ("", None),
+        ] {
+            assert_eq!(width(text), want, "{text}");
+        }
+        // Not connected: none of it, whatever the replies say.
+        let idle = parse_status(&status.replace("COMPLETED", "SCANNING"), Some(signal));
+        assert_eq!(
+            (idle.noise_dbm, idle.width_mhz, idle.center_mhz),
+            (None, None, None)
+        );
+        assert_eq!((idle.generation, idle.cipher), (None, None));
+        // Open network, legacy link, nonsense numbers.
+        let open = parse_status(
+            "wpa_state=COMPLETED\npairwise_cipher=NONE\nwifi_generation=9\n",
+            Some("NOISE=12\nCENTER_FRQ1=-5\nWIDTH=80 MHz junk\n"),
+        );
+        assert_eq!(
+            (open.noise_dbm, open.center_mhz, open.width_mhz),
+            (None, None, None)
+        );
+        assert_eq!((open.generation, open.cipher), (None, None));
+        let odd = parse_status(
+            "wpa_state=COMPLETED\npairwise_cipher=CC\u{1b}MP\n",
+            Some("NOISE=-9999\n"),
+        );
+        assert_eq!((odd.cipher, odd.noise_dbm), (None, None));
+    }
+
+    #[test]
+    fn the_firmware_a_driver_announced() {
+        for (line, key, version) in [
+            (
+                "rtw89_8852be 0000:c3:00.0: Firmware version 0.29.29.5 (af1ab4bf), cmd version 0, type 5",
+                "0000:c3:00.0",
+                "0.29.29.5",
+            ),
+            (
+                "iwlwifi 0000:00:14.3: loaded firmware version 89.202a2f7b.0 so-a0-gf-a0-89.ucode op_mode iwlmvm",
+                "0000:00:14.3",
+                "89.202a2f7b.0",
+            ),
+            (
+                "mt7921e 0000:01:00.0: WM Firmware Version: ____010000, Build Time: 20230526130958",
+                "0000:01:00.0",
+                "____010000",
+            ),
+            (
+                "mt7921u 2-1:1.0: WM Firmware Version: ____010000, Build Time: 20230526130958",
+                "2-1:1.0",
+                "____010000",
+            ),
+            (
+                "rtw_8822ce 0000:02:00.0: Firmware version 9.9.4, H2C version 15",
+                "0000:02:00.0",
+                "9.9.4",
+            ),
+            (
+                "ath11k_pci 0000:03:00.0: fw_version 0x1106196e fw_build_timestamp 2024-01-12 11:24",
+                "0000:03:00.0",
+                "0x1106196e",
+            ),
+            (
+                "ath10k_pci 0000:02:00.0: firmware ver WLAN.RM.4.4.1-00309- api 6 features wowlan",
+                "0000:02:00.0",
+                "WLAN.RM.4.4.1-00309-",
+            ),
+            ("somedrv: firmware version 1.2.3 loaded", "somedrv", "1.2.3"),
+        ] {
+            assert_eq!(
+                firmware_line(line),
+                Some((key.to_owned(), version.to_owned())),
+                "{line}"
+            );
+        }
+        for line in [
+            "",
+            "r8169 0000:05:00.0 eth0: link up",
+            "mt7921e 0000:01:00.0: HW/SW Version: 0x8a108a10, Build Time: 20230526130917a",
+            "rtw89_8852be 0000:c3:00.0: Firmware version ",
+            "x 0000:c3:00.0: firmware version \u{1b}[31m",
+        ] {
+            assert_eq!(firmware_line(line), None, "{line}");
+        }
+        // A version past 48 characters, a device past 32: not taken.
+        let long = format!("drv 0000:01:00.0: firmware version {}", "9".repeat(49));
+        assert_eq!(firmware_line(&long), None);
+        let dev = format!("drv {}: firmware version 1.0", "d".repeat(33));
+        assert_eq!(firmware_line(&dev), None);
     }
 
     #[test]
@@ -1798,6 +2188,10 @@ mod tests {
                 }
                 let st = parse_status(t, Some(t));
                 prop_assert!(st.ssid.is_none_or(|s| !s.chars().any(char::is_control)));
+                prop_assert!(st.cipher.is_none_or(|c| c.len() <= 24));
+                if let Some((key, version)) = firmware_line(t) {
+                    prop_assert!(key.len() <= 32 && version.len() <= 48);
+                }
                 let _ = parse_event(t);
                 let _ = bss_security(t);
                 prop_assert!(unescape(t).len() <= MAX_SSID);
