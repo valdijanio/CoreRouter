@@ -840,6 +840,13 @@ pub fn run(job: SnoopJob, monitor: SharedWifiMonitor, ctx: &TaskCtx) -> Result<(
     let mut sock = monitor.open(&job.spec).map_err(|e| e.to_string())?;
     let mut snoop = Snooper::default();
     let mut tuned = sock.channel().or(job.spec.freq_mhz).unwrap_or(0);
+    // Beside an idle station (no network) the kernel knows no channel for
+    // either interface: mac80211's `ieee80211_cfg_get_channel` answers
+    // only for a station on a network or a radio that is all monitors,
+    // and the card stays on the last channel it was on (rtw89 on the
+    // notebook: 2412 MHz). Then the channel is the one the frames say
+    // (radiotap), the most heard each second.
+    let mut heard_on: BTreeMap<u32, u64> = BTreeMap::new();
     let pcap = job.capture.is_some();
     {
         let mut st = lock(&job.shared);
@@ -915,9 +922,17 @@ pub fn run(job: SnoopJob, monitor: SharedWifiMonitor, ctx: &TaskCtx) -> Result<(
             hop_at = now.saturating_add(job.channel_time);
         }
         if end.is_some() || now >= next {
-            if !hopping && let Some(c) = sock.channel() {
-                tuned = c;
+            if !hopping {
+                match sock.channel() {
+                    Some(c) => tuned = c,
+                    None => {
+                        if let Some((&f, _)) = heard_on.iter().max_by_key(|(_, n)| **n) {
+                            tuned = f;
+                        }
+                    }
+                }
             }
+            heard_on.clear();
             let mut table = snoop.snapshot();
             if let Value::Object(o) = &mut table {
                 o.insert("channel".into(), json!(tuned));
@@ -958,6 +973,9 @@ pub fn run(job: SnoopJob, monitor: SharedWifiMonitor, ctx: &TaskCtx) -> Result<(
                 let Some(heard) = snoop.add(at_us, data, tuned) else {
                     continue;
                 };
+                if heard.freq != 0 && (heard_on.len() < 64 || heard_on.contains_key(&heard.freq)) {
+                    *heard_on.entry(heard.freq).or_default() += 1;
+                }
                 let (Some(cap), Some(st)) = (job.capture.as_ref(), st.as_mut()) else {
                     continue;
                 };
@@ -1059,6 +1077,56 @@ mod tests {
 
     fn codes(v: &Value) -> Vec<&str> {
         v["notes"].as_array().unwrap().iter().map(|n| n["code"].as_str().unwrap()).collect()
+    }
+
+    /// A monitor whose kernel says no channel (beside an idle station on
+    /// rtw89, seen on the notebook): the frames still say where it is.
+    struct Unknowing(SharedWifiMonitor);
+    struct UnknowingSocket(Box<dyn corerouter_hal::wifi_monitor::MonitorSocket>);
+
+    impl corerouter_hal::wifi_monitor::MonitorSocket for UnknowingSocket {
+        fn recv(&mut self, wait: Duration, batch: &mut FrameBatch) -> Result<(), corerouter_hal::capture::CaptureError> {
+            self.0.recv(wait, batch)
+        }
+        fn set_channel(&mut self, freq_mhz: u32) -> Result<(), corerouter_hal::capture::CaptureError> {
+            self.0.set_channel(freq_mhz)
+        }
+        fn channel(&mut self) -> Option<u32> {
+            None
+        }
+        fn interface(&self) -> String {
+            self.0.interface()
+        }
+        fn blocks(&self) -> bool {
+            self.0.blocks()
+        }
+    }
+
+    impl corerouter_hal::wifi_monitor::WifiMonitor for Unknowing {
+        fn describe(&self) -> String {
+            "a monitor with no channel from the kernel".into()
+        }
+        fn open(&self, spec: &MonitorSpec) -> Result<Box<dyn corerouter_hal::wifi_monitor::MonitorSocket>, corerouter_hal::capture::CaptureError> {
+            Ok(Box::new(UnknowingSocket(self.0.open(spec)?)))
+        }
+    }
+
+    #[test]
+    fn beside_an_idle_station_the_channel_is_the_one_the_frames_say() {
+        let (mut j, shared) = job(5220, vec![], 5, None);
+        j.spec.mode = MonitorMode::Shared;
+        j.spec.freq_mhz = None;
+        let cell = TaskCell::for_test();
+        let clock = FakeClock(AtomicU64::new(0));
+        run(j, Arc::new(Unknowing(monitor())), &TaskCtx::new(&cell, &clock)).unwrap();
+        let summary = cell.snapshot().1;
+        // The lab's idle radio sits on 5220 MHz (channel 44).
+        assert_eq!(summary["channel"], 5220, "{summary}");
+        let st = lock(&shared);
+        assert_eq!(st.channel, Some(5220));
+        assert_eq!(st.table["channel"], 5220);
+        let ch = st.table["channels"].as_array().unwrap();
+        assert!(ch.iter().any(|c| c["channel"] == 44 && c["dwell_ms"].as_u64().unwrap_or(0) > 0), "{ch:?}");
     }
 
     #[test]

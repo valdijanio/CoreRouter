@@ -13,6 +13,8 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Air"##, r##"Ar"##),
     (r##"All"##, r##"Todas"##),
     (r##"Asking the radio…"##, r##"Perguntando ao rádio…"##),
+    (r##"At least 30 s while the radio is on a network"##, r##"No mínimo 30 s com o rádio conectado a uma rede"##),
+    (r##"Auto"##, r##"Auto"##),
     (r##"BSSID"##, r##"BSSID"##),
     (r##"Band"##, r##"Banda"##),
     (r##"Bluetooth"##, r##"Bluetooth"##),
@@ -21,6 +23,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Channel usage"##, r##"Uso por canal"##),
     (r##"Channels"##, r##"Canais"##),
     (r##"Duration"##, r##"Duração"##),
+    (r##"Each scan takes the radio off its network's channel for a moment: the link stalls (latency) while it does."##, r##"Cada scan tira o rádio do canal da rede dele por um instante: o enlace para (latência) enquanto isso."##),
     (r##"Group by channel"##, r##"Agrupar por canal"##),
     (r##"Least busy channel"##, r##"Canal menos ocupado"##),
     (r##"List"##, r##"Lista"##),
@@ -54,6 +57,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"estimated airtime"##, r##"tempo de ar estimado"##),
     (r##"hidden"##, r##"oculta"##),
     (r##"hopper"##, r##"saltos de frequência"##),
+    (r##"leaves the channel"##, r##"sai do canal"##),
     (r##"microwave oven"##, r##"micro-ondas"##),
     (r##"network"##, r##"rede"##),
     (r##"networks"##, r##"redes"##),
@@ -78,6 +82,18 @@ pub(super) const LABELS: &[(&str, &str)] = &[
 
 /// Explanations: (key, Markdown).
 pub(super) const HELP: &[(&str, &str)] = &[
+    (
+        "interface.wifi.auto",
+        r##"## O que é
+Atualiza a aba sozinho:
+- em **Lista** e **Canais**, faz um scan novo a cada 10, 30 ou 60 segundos;
+- em **Espectro**, começa o spectral scan de novo quando a duração acaba.
+
+Começa desligado. Só roda com a janela aberta nesta aba: fechou a janela ou trocou de aba, ele desliga. **Parar** no espectro também desliga.
+
+## Cuidado
+Com o rádio conectado a uma rede (estação), cada scan tira o rádio do canal da rede por um instante, uns 3 s para as duas bandas: o enlace para e a latência sobe enquanto isso. Por isso aparece o selo **sai do canal** e o intervalo mínimo vira 30 s. Num rádio que serve de uplink, deixe desligado ou use 60 s."##,
+    ),
     (
         "interface.wifi.band-filter",
         r##"## O que é

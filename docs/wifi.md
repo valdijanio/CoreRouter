@@ -321,6 +321,11 @@ console por tipo de dispositivo, e a serial fica com o shell de manutenção do 
 ### Aba Networks: lista, canais e espectro (G1.30i)
 
 Três visões do que o rádio ouviu, escolhidas na segunda linha da aba (`crates/ui/src/wifi_scan.rs`).
+Na linha do `Rescan`, a caixa **Auto** com o intervalo (10, 30 ou 60 s) refaz o scan sozinha na
+Lista e nos Canais e começa de novo o spectral scan quando a duração acaba. Ela começa desligada,
+só roda com a aba desenhada e desliga ao fechar a janela, ao trocar de aba ou com **Stop** no
+espectro. Com o rádio conectado a uma rede, mostra o selo âmbar `leaves the channel` (cada scan
+tira a estação do canal, e a latência sobe) e o intervalo mínimo vira 30 s.
 O motor calcula tudo (`crates/engine/src/wifi_air.rs`, `wifi_spectrum.rs`,
 `cmd/wifi_scan.rs`); a GUI só desenha, com o painter do egui.
 
