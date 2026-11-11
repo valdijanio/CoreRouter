@@ -10,6 +10,8 @@ repository.workspace = true
 
 [dependencies]
 serde_json.workspace = true
+# G1.6zg: the version the consoles show (the same the daemon reports).
+corerouter-buildinfo.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # termios: the installer and the first-boot setup read the consoles

@@ -537,6 +537,15 @@ impl BootOptions {
                     Ok(m) => out.mgmt = Some(m),
                     Err(e) => out.warnings.push(format!("corerouter.mgmt: {e}")),
                 },
+                // G1.6zg: the consoles' colour, read by `style::Color`.
+                "color" => {
+                    if !matches!(value, "on" | "screen" | "off") {
+                        out.warnings.push(format!(
+                            "corerouter.color={}: use on, screen or off",
+                            clip(value)
+                        ));
+                    }
+                }
                 _ => out
                     .warnings
                     .push(format!("corerouter.{}: unknown option", clip(key))),

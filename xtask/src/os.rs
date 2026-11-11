@@ -1621,6 +1621,31 @@ struct Report {
     idle_kib: Option<u64>,
 }
 
+/// A console line without its colour (G1.6zg): the SGR sequences
+/// (`ESC [ … m`) the image's consoles send by default are dropped, so the
+/// tests match the text a person reads. Anything else stays (the firmware's
+/// and GRUB's cursor sequences were always there).
+pub(crate) fn console_text(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(i) = rest.find("\u{1b}[") {
+        let (before, seq) = rest.split_at(i);
+        out.push_str(before);
+        let params = seq.get(2..).unwrap_or("");
+        let end = params
+            .find(|c: char| !(c.is_ascii_digit() || c == ';'))
+            .unwrap_or(params.len());
+        if params.get(end..).is_some_and(|r| r.starts_with('m')) {
+            rest = params.get(end + 1..).unwrap_or("");
+        } else {
+            out.push_str("\u{1b}[");
+            rest = params;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn parse_ready(line: &str) -> Option<f64> {
     let rest = line.split("corerouter-init: ready:").nth(1)?;
     let at = rest.split(", ").nth(1)?;
@@ -1841,7 +1866,7 @@ fn watch(
         .spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
-                if tx.send(line).is_err() {
+                if tx.send(console_text(&line)).is_err() {
                     break;
                 }
             }
@@ -2382,6 +2407,26 @@ mod tests {
         assert_eq!(
             parse_idle("corerouter-init: idle: memory in use 51234 KiB (MemTotal − MemAvailable)"),
             Some(51234)
+        );
+    }
+
+    #[test]
+    fn console_lines_are_read_without_their_colour() {
+        // What the image's consoles send (G1.6zg): SGR only, a reset at the
+        // end of every span.
+        assert_eq!(
+            console_text("  \u{1b}[1;33mWARNING\u{1b}[0m  admin has \u{1b}[2mno\u{1b}[0m password"),
+            "  WARNING  admin has no password"
+        );
+        assert_eq!(console_text("\u{1b}[32mOK\u{1b}[0m"), "OK");
+        assert_eq!(console_text("\u{1b}[m"), "");
+        // The firmware's cursor sequences and a cut one stay as they came.
+        let fw = "\u{1b}[2J\u{1b}[01;01HBdsDxe: loading Boot0001";
+        assert_eq!(console_text(fw), fw);
+        assert_eq!(console_text("x\u{1b}[1;3"), "x\u{1b}[1;3");
+        assert_eq!(
+            console_text("corerouter-init: ready: 1 s"),
+            "corerouter-init: ready: 1 s"
         );
     }
 
