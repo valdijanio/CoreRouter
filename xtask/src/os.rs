@@ -167,7 +167,8 @@ const INSTALLER_KERNEL: &[&str] = &[
 const NO_KERNEL_DEVICES: [&str; 2] = ["bonding.max_bonds=0", "dummy.numdummies=0"];
 /// G1.6ze: what makes the installer's kernel take `os/patches/linux` (the
 /// tunnels' catch-all devices are turned off by one of them).
-const INSTALLER_PATCH_HOOK: &str = "$(APPLY_PATCHES) $(@D) $(BR2_EXTERNAL_COREROUTER_PATH)/patches/linux \\*.patch";
+const INSTALLER_PATCH_HOOK: &str =
+    "$(APPLY_PATCHES) $(@D) $(BR2_EXTERNAL_COREROUTER_PATH)/patches/linux \\*.patch";
 /// The modules `boot-test` and `install-test` see, by file name.
 const REQUIRED_MODULE_FILES: &[&str] = &["e100", "pcnet32"];
 /// The installer's boot image (El Torito counts 16-bit 512-byte sectors).
@@ -629,7 +630,7 @@ fn no_kernel_devices(what: &str, cmdline: &str) -> Result<(), String> {
 /// The patches of `patches` that Buildroot did not apply to the kernel tree
 /// `tree`, by file name (its `.applied_patches_list`, written by
 /// `support/scripts/apply-patches.sh`). G1.6ze: the installer's kernel was
-/// built from the plain tarball for 20 gaps and nothing said so.
+/// built from the plain tarball since the patches exist, and nothing said so.
 fn patches_missing(tree: &Path, patches: &[PathBuf]) -> Vec<String> {
     let applied = std::fs::read_to_string(tree.join(".applied_patches_list")).unwrap_or_default();
     let applied: Vec<&str> = applied
@@ -2105,6 +2106,51 @@ mod tests {
         let os = Path::new(env!("CARGO_MANIFEST_DIR")).join("../os");
         let n = check(&os).unwrap();
         assert!(n > 40, "{n}");
+    }
+
+    /// G1.6ze: the ISO's kernel listed `bond0`, `dummy0` and seven tunnels:
+    /// its command line lacked the two parameters, and its tree the patches.
+    #[test]
+    fn both_kernels_keep_their_drivers_from_creating_devices() {
+        let ok = "console=tty0 corerouter.mode=live bonding.max_bonds=0 dummy.numdummies=0 quiet";
+        no_kernel_devices("x", ok).unwrap();
+        for bad in [
+            "",
+            "console=tty0 corerouter.mode=live panic=10 quiet",
+            "bonding.max_bonds=0 quiet",
+            "bonding.max_bonds=1 dummy.numdummies=0",
+            "xbonding.max_bonds=0 dummy.numdummies=01",
+        ] {
+            let e = no_kernel_devices("installer.fragment", bad).unwrap_err();
+            assert!(
+                e.starts_with("installer.fragment: CONFIG_CMDLINE needs '"),
+                "{e}"
+            );
+        }
+        for want in INSTALLER_KERNEL.iter().filter(|w| w.contains("CMDLINE")) {
+            no_kernel_devices("INSTALLER_KERNEL", want.trim_end_matches('"')).unwrap();
+        }
+        let tree = std::env::temp_dir().join(format!("cr-xtask-patches-{}", std::process::id()));
+        std::fs::create_dir_all(&tree).unwrap();
+        let patches = [
+            PathBuf::from("/os/patches/linux/0001-a.patch"),
+            PathBuf::from("/os/patches/linux/0002-b.patch"),
+        ];
+        // No list at all (a tree Buildroot never patched), then an empty one
+        // (what the installer's tree had), one patch, both.
+        assert_eq!(patches_missing(&tree, &patches).len(), 2);
+        let list = tree.join(".applied_patches_list");
+        std::fs::write(&list, "").unwrap();
+        assert_eq!(
+            patches_missing(&tree, &patches),
+            ["0001-a.patch", "0002-b.patch"]
+        );
+        std::fs::write(&list, "/elsewhere/os/patches/linux/0001-a.patch\n").unwrap();
+        assert_eq!(patches_missing(&tree, &patches), ["0002-b.patch"]);
+        std::fs::write(&list, "/x/0001-a.patch\n/x/0002-b.patch\n/x/0003-c.patch\n").unwrap();
+        assert!(patches_missing(&tree, &patches).is_empty());
+        assert!(patches_missing(&tree, &[]).is_empty());
+        std::fs::remove_dir_all(&tree).unwrap();
     }
 
     #[test]

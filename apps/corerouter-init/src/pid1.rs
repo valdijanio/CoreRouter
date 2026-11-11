@@ -431,7 +431,9 @@ fn spawn_hotplug_names(map: &'static str, live: bool) {
 /// look at the same port.
 fn live_port(port: &str, i: usize) -> Result<bool, String> {
     static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _one = ONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _one = ONE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let none = serde_json::json!({});
     let (Ok(interfaces), Ok(clients)) = (
         crate::ctl::call("interface.list", &none),

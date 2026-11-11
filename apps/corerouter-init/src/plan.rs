@@ -133,7 +133,8 @@ pub fn live_port_commands(
     interfaces: &serde_json::Value,
     clients: &serde_json::Value,
 ) -> Option<Vec<(&'static str, serde_json::Value)>> {
-    let named = |v: &serde_json::Value, key: &str| v.get(key).and_then(|n| n.as_str()) == Some(port);
+    let named =
+        |v: &serde_json::Value, key: &str| v.get(key).and_then(|n| n.as_str()) == Some(port);
     let row = interfaces.as_array()?.iter().find(|r| named(r, "name"))?;
     let mut out = Vec::new();
     // A row of the platform, not of the configuration (`managed: false`):
@@ -739,7 +740,10 @@ mod tests {
         let c = live_port_commands("ether1", 0, &ifaces, &none).unwrap();
         let ids: Vec<&str> = c.iter().map(|x| x.0).collect();
         assert_eq!(ids, ["interface.set", "ip.dhcp-client.add"]);
-        assert_eq!(c[0].1, serde_json::json!({"name": "ether1", "disabled": false}));
+        assert_eq!(
+            c[0].1,
+            serde_json::json!({"name": "ether1", "disabled": false})
+        );
         assert_eq!(c[1].1["interface"], "ether1");
         assert_eq!(c[1].1["default_route_distance"], 200);
         let c = live_port_commands("ether2", 1, &ifaces, &none).unwrap();
@@ -762,7 +766,10 @@ mod tests {
         let before = serde_json::json!([{"name": "ether1", "managed": true, "disabled": false}]);
         assert!(live_port_commands("ether2", 1, &before, &none).is_none());
         // Garbage instead of a list: the same.
-        for bad in [serde_json::json!(null), serde_json::json!({"name": "ether2"})] {
+        for bad in [
+            serde_json::json!(null),
+            serde_json::json!({"name": "ether2"}),
+        ] {
             assert!(live_port_commands("ether2", 1, &bad, &none).is_none());
         }
         // Listed as the platform's (not adopted): adoption first.
@@ -774,7 +781,11 @@ mod tests {
         let c = live_port_commands("ether2", 1, &plugged, &none).unwrap();
         assert_eq!(
             ids(&c),
-            ["interface.ethernet.adopt", "interface.set", "ip.dhcp-client.add"]
+            [
+                "interface.ethernet.adopt",
+                "interface.set",
+                "ip.dhcp-client.add"
+            ]
         );
         assert_eq!(c[0].1, serde_json::json!({"name": "ether2"}));
         // The daemon adopted it first (its tick): only what is missing.
@@ -784,7 +795,11 @@ mod tests {
         // Plugged in again: in the configuration, enabled, its client kept.
         let again = serde_json::json!([{"name": "ether2", "managed": true, "disabled": false}]);
         let client = serde_json::json!([{"id": "*1", "interface": "ether2"}]);
-        assert!(live_port_commands("ether2", 1, &again, &client).unwrap().is_empty());
+        assert!(
+            live_port_commands("ether2", 1, &again, &client)
+                .unwrap()
+                .is_empty()
+        );
         // Another port's client is not this one's.
         let other = serde_json::json!([{"id": "*1", "interface": "ether1"}]);
         assert_eq!(
