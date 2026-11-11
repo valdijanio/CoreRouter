@@ -79,13 +79,20 @@ fn remove_deletes_from_the_kernel_table_and_spares_the_management_connection() {
             "add", "rule", "ip", "t", "out", "ct", "state", "new", "counter",
         ],
     );
-    // 3 × 20 UDP flows to ports 5001..5003 of 127.0.0.2.
-    for _ in 0..20 {
-        let u = UdpSocket::bind("127.0.0.1:0").unwrap();
+    // 3 × 20 UDP flows to ports 5001..5003 of 127.0.0.2. The 20 sockets
+    // stay open until the last flow is sent: a closed socket frees its
+    // source port, the kernel can hand the same one to a later bind, and
+    // two sockets with one source port are a single flow (19 instead of
+    // 20 in 11 of 1500 runs, measured).
+    let sources: Vec<UdpSocket> = (0..20)
+        .map(|_| UdpSocket::bind("127.0.0.1:0").unwrap())
+        .collect();
+    for u in &sources {
         for port in 5001..=5003u16 {
             u.send_to(b"x", ("127.0.0.2", port)).unwrap();
         }
     }
+    drop(sources);
     assert_eq!(to_port(5001), 20);
     // The "management" TCP connection.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

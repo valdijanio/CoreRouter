@@ -1382,6 +1382,7 @@ dependencies = [
 name = "corerouter-init"
 version = "0.1.0"
 dependencies = [
+ "corerouter-buildinfo",
  "corerouter-sysupdate",
  "netlink-sys",
  "ring",

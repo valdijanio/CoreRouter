@@ -121,9 +121,10 @@ pub const BUILTIN_CMDLINE: &str = "console=tty0 console=ttyS0,115200 root=PARTUU
 /// Platform parameters carried from the running command line to the slot
 /// written next, when not already built in: a serial console on another
 /// port or speed, the kernel's own address for a lab, the maintenance
-/// shell. Like Flatcar's OEM `linux_append`: set once for the box, kept
-/// across updates.
-pub const CARRY_PREFIXES: &[&str] = &["console=", "ip=", "corerouter.shell="];
+/// shell, the consoles' colour (G1.6zg: a terminal that shows escapes as
+/// text keeps `corerouter.color=off`). Like Flatcar's OEM `linux_append`:
+/// set once for the box, kept across updates.
+pub const CARRY_PREFIXES: &[&str] = &["console=", "ip=", "corerouter.shell=", "corerouter.color="];
 
 /// The kernel parameter a rollback drill adds: an `init` that does not
 /// exist, so the kernel panics before userspace (`panic=10` reboots).
@@ -274,12 +275,12 @@ mod tests {
             partuuid: "u-b",
             manifest: &m,
             tuning: &[("isolcpus".into(), "2-3".into())],
-            running: &format!("{BUILTIN_CMDLINE} ip=10.0.2.15::::eth0:off corerouter.shell=ttyS0 isolcpus=1 panic=0"),
+            running: &format!("{BUILTIN_CMDLINE} ip=10.0.2.15::::eth0:off corerouter.shell=ttyS0 corerouter.color=off isolcpus=1 panic=0"),
             drill: false,
         }
         .render();
         assert!(c.starts_with("root=/dev/dm-0 dm-mod.waitfor=PARTUUID=u-b dm-mod.create=\"vroot,,,ro,0 16 verity 1 PARTUUID=u-b PARTUUID=u-b 4096 4096 2 2 sha256 "));
-        assert!(c.ends_with("isolcpus=2-3 ip=10.0.2.15::::eth0:off corerouter.shell=ttyS0 corerouter.slot=b panic=10"));
+        assert!(c.ends_with("isolcpus=2-3 ip=10.0.2.15::::eth0:off corerouter.shell=ttyS0 corerouter.color=off corerouter.slot=b panic=10"));
         assert!(
             !c.contains("console="),
             "built-in consoles are not repeated"

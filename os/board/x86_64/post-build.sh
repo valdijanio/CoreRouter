@@ -65,3 +65,18 @@ rm -f "$T"/usr/lib/libstdc++.so* "$T"/usr/lib/libgomp.so* "$T"/usr/lib/libncurse
 	"$T"/usr/lib/libcurses.so "$T"/usr/lib/libform.so* "$T"/usr/lib/libmenu.so* \
 	"$T"/usr/lib/libpanel.so* "$T"/usr/lib/libpcre2-posix.so* "$T/usr/bin/pcre2test" \
 	"$T/usr/bin/pcre2grep" "$T/usr/bin/yanglint" "$T/usr/bin/yangre" "$T/usr/bin/mtracebis"
+# G1.30: wpa_supplicant gets its networks from corerouter-daemon, through
+# its control socket, and keeps them in memory. The package's sample
+# configuration joins any open network in range (`network={ key_mgmt=NONE }`):
+# it must not be in the image, where a stray `-c` would use it.
+rm -f "$T/etc/wpa_supplicant.conf" "$T/etc/network/if-up.d/wpasupplicant" \
+	"$T/etc/network/if-down.d/wpasupplicant"
+# It links libnl-3 and libnl-genl-3 (nl80211) and OpenSSL's libcrypto and
+# libssl (SAE's elliptic curves; no TLS without EAP, but the link names it).
+# The rest of the two packages leaves the image: libnl's route, netfilter,
+# xfrm and sock-diag libraries with their tables, OpenSSL's sample files.
+# `legacy.so` stays: RC4 for the group key of an old WPA/WPA2 mixed network.
+rm -f "$T"/usr/lib/libnl-route-3.so* "$T"/usr/lib/libnl-nf-3.so* \
+	"$T"/usr/lib/libnl-idiag-3.so* "$T"/usr/lib/libnl-xfrm-3.so*
+rm -rf "$T/etc/libnl" "$T/etc/ssl/misc"
+rm -f "$T"/etc/ssl/*.dist "$T/etc/ssl/ct_log_list.cnf"

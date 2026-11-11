@@ -93,13 +93,17 @@ pub enum Mode {
 /// on the image's root: this boot already moved there (G1.6y).
 pub const LIVE_STAGE2: &str = "--live-root";
 /// Below this `MemTotal` the ISO stays on the console installer (G1.6y). The
-/// root and the driver modules live in RAM (51 MiB), and a login with a
-/// password (Argon2) takes the daemon to ~128 MiB: with 256 MiB of RAM that is
-/// an OOM kill at every login, and the install in progress goes with the
-/// daemon; with 288 MiB it fits, with little to spare (**medido**, G1.6za). A
-/// machine shows less than it has, what the kernel and the firmware keep: ~263
-/// MiB here for 320 MiB (199 MiB for 256 MiB under OVMF, **medido**).
-pub const LIVE_MIN_RAM_KIB: u64 = 250 * 1024;
+/// root and the driver modules live in RAM, and a login with a password
+/// (Argon2) takes the daemon to ~128 MiB: without room for both that is an
+/// OOM kill at every login, and the install in progress goes with the daemon.
+/// The root was 47 MiB when 320 MiB of RAM became the least (G1.6za); with the
+/// Wi-Fi firmware it is 86 MiB (G1.30). Then 320 MiB kills the daemon at the
+/// first login with a password; 384 MiB installs most of the time, with 300
+/// of its 329 MiB in use at the worst moment, and failed 1 time in 8; 448 MiB
+/// is the least (**medido**). A machine shows less than it has, what the
+/// kernel and the firmware keep: under OVMF, 329 MiB for 384 MiB and 359 MiB
+/// for 416 MiB (**medido**).
+pub const LIVE_MIN_RAM_KIB: u64 = 370 * 1024;
 /// The live image's host name.
 pub const LIVE_HOSTNAME: &str = "corerouter-live";
 
@@ -428,6 +432,9 @@ pub struct BootOptions {
     pub modules: bool,
     /// G1.6zf: look for the motherboard's sensor chip (`corerouter.sensors=`).
     pub sensors: Sensors,
+    /// G1.30: that many simulated Wi-Fi radios (`corerouter.hwsim=2`,
+    /// `mac80211_hwsim`), for a test of the image where there is no card.
+    pub hwsim: Option<u8>,
     /// Complaints about the command line, logged once at boot.
     pub warnings: Vec<String>,
 }
@@ -467,6 +474,8 @@ pub fn virtual_machine(cpuinfo: &str) -> bool {
 }
 
 const MAX_TTY: usize = 16;
+/// Simulated radios a test may ask for.
+const MAX_HWSIM: u8 = 8;
 
 impl BootOptions {
     pub fn parse(cmdline: &str) -> Self {
@@ -477,6 +486,7 @@ impl BootOptions {
             mgmt: None,
             modules: true,
             sensors: Sensors::Auto,
+            hwsim: None,
             warnings: Vec::new(),
         };
         for word in cmdline.split_ascii_whitespace() {
@@ -524,6 +534,13 @@ impl BootOptions {
                         .warnings
                         .push(format!("corerouter.modules={}: use on or off", clip(value))),
                 },
+                "hwsim" => match value.parse::<u8>() {
+                    Ok(n) if (1..=MAX_HWSIM).contains(&n) => out.hwsim = Some(n),
+                    _ => out.warnings.push(format!(
+                        "corerouter.hwsim={}: use a number of radios, 1 to {MAX_HWSIM}",
+                        clip(value)
+                    )),
+                },
                 "sensors" => match value {
                     "auto" => out.sensors = Sensors::Auto,
                     "on" => out.sensors = Sensors::On,
@@ -537,6 +554,15 @@ impl BootOptions {
                     Ok(m) => out.mgmt = Some(m),
                     Err(e) => out.warnings.push(format!("corerouter.mgmt: {e}")),
                 },
+                // G1.6zg: the consoles' colour, read by `style::Color`.
+                "color" => {
+                    if !matches!(value, "on" | "screen" | "off") {
+                        out.warnings.push(format!(
+                            "corerouter.color={}: use on, screen or off",
+                            clip(value)
+                        ));
+                    }
+                }
                 _ => out
                     .warnings
                     .push(format!("corerouter.{}: unknown option", clip(key))),
@@ -677,6 +703,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hwsim_option() {
+        assert_eq!(BootOptions::parse("quiet").hwsim, None);
+        assert_eq!(BootOptions::parse("corerouter.hwsim=2").hwsim, Some(2));
+        for bad in ["0", "9", "-1", "two", "", "2x", "300"] {
+            let o = BootOptions::parse(&format!("corerouter.hwsim={bad}"));
+            assert_eq!(o.hwsim, None, "{bad}");
+            assert_eq!(o.warnings.len(), 1, "{bad}");
+        }
+    }
+
+    #[test]
     fn modules_option() {
         assert!(BootOptions::parse("quiet").modules);
         assert!(!BootOptions::parse("corerouter.modules=off").modules);
@@ -711,6 +748,7 @@ mod tests {
                 mgmt: None,
                 modules: true,
                 sensors: Sensors::Auto,
+                hwsim: None,
                 warnings: vec![]
             }
         );

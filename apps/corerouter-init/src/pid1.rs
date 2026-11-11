@@ -131,7 +131,7 @@ pub fn main() {
     // chip (`corerouter.sensors=`).
     if opts.modules {
         let cpuinfo = read_proc("/proc/cpuinfo").unwrap_or_default();
-        crate::modules::start(log, opts.sensors.wanted(&cpuinfo));
+        crate::modules::start(log, opts.sensors.wanted(&cpuinfo), opts.hwsim);
     }
     let names = name_ports(Some(Path::new(crate::ports::MAP_FILE)));
     spawn_hotplug_names(crate::ports::MAP_FILE, live);

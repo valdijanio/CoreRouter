@@ -189,29 +189,54 @@ impl T {
         }
         // G1.6m: no default answers; the port by number, confirmed; a
         // summary and an explicit yes.
-        vm.expect(&mut log, &["no command shell"], 30)?;
-        answer(&mut vm, &mut log, "or the CLI (corerouter-cli", "")?;
-        let row = answer(&mut vm, &mut log, "1) ", "1")?;
+        // G1.6zg: one screen (who, the ports, what needs attention), the
+        // invitation at its end; the questions in numbered steps.
+        vm.expect(&mut log, &["no port has a management address yet"], 30)?;
+        answer(&mut vm, &mut log, "no command shell", "")?;
+        vm.expect(&mut log, &["[1/4] Management port"], 30)?;
+        let row = answer(&mut vm, &mut log, "  1  ether1 ", "1")?;
         check(
-            row.contains("1) ether1 (") && row.contains("52:54:"),
+            row.contains("52:54:") && row.contains(" off "),
             format!("port list: {row}"),
         )?;
-        answer(&mut vm, &mut log, "Management port (number", "y")?;
+        answer(&mut vm, &mut log, "Port (number or name)", "y")?;
         answer(&mut vm, &mut log, "Use ether1", "10.0.2.15/24")?;
         answer(&mut vm, &mut log, "Address/prefix", "10.0.2.2")?;
-        answer(&mut vm, &mut log, "has no password", "corerouter-test-1")?;
-        answer(&mut vm, &mut log, "New admin password", "corerouter-test-1")?;
-        answer(&mut vm, &mut log, "admin     new password", "y")?;
-        vm.expect(&mut log, &["admin password: set"], 30)?;
-        vm.expect(&mut log, &["Done. Manage it"], 30)?;
-        // Enter on the quiet console: the status, not a shell.
         answer(
             &mut vm,
             &mut log,
-            "CLI: corerouter-cli --connect tls://10.0.2.15",
-            "",
+            "admin has no password",
+            "corerouter-test-1",
         )?;
-        vm.expect(&mut log, &["10.0.2.15/24 on ether1"], 30)?;
+        answer(&mut vm, &mut log, "New admin password", "corerouter-test-1")?;
+        answer(&mut vm, &mut log, "Admin     new password", "y")?;
+        vm.expect(&mut log, &["OK  admin password set"], 30)?;
+        vm.expect(
+            &mut log,
+            &["Done: the router has its management address"],
+            30,
+        )?;
+        // The status follows, with the way in; Enter on the quiet console
+        // shows it again, not a shell.
+        vm.expect(&mut log, &["Web   https://10.0.2.15/"], 30)?;
+        vm.expect(
+            &mut log,
+            &["CLI   corerouter-cli --connect tls://10.0.2.15"],
+            30,
+        )?;
+        answer(&mut vm, &mut log, "to show this status again", "")?;
+        vm.expect(&mut log, &["Web   https://10.0.2.15/"], 30)?;
+        let row = vm.expect(&mut log, &["ether1 "], 30)?;
+        check(
+            row.contains("10.0.2.15/24"),
+            format!("status after Enter: {row}"),
+        )?;
+        // The serial console is coloured by default, and a test reads it
+        // all the same.
+        check(
+            vm.colored() > 0,
+            "no console line came with colour".to_owned(),
+        )?;
         let mut ping = Err(String::new());
         for _ in 0..10 {
             ping = super::tls_ping(port);
@@ -266,8 +291,14 @@ fn interactive(t: &mut T) -> Result<(), String> {
     let mut vm = start(&mut log, "install/interactive", cmd)?;
     // G1.6y: the ISO boots live; `i` on its console is the installer.
     answer(&mut vm, &mut log, "NOT INSTALLED", "i")?;
-    let row = vm.expect(&mut log, &["not offered: the installer medium"], 120)?;
-    check(row.contains("sda"), format!("the stick is not sda: {row}"))?;
+    // G1.6zg: what is not offered has no number, and the reason on a line
+    // of its own.
+    let row = vm.expect(&mut log, &["  -  sda ", "not offered:"], 120)?;
+    check(
+        row.contains("  -  sda "),
+        format!("the stick is not sda: {row}"),
+    )?;
+    vm.expect(&mut log, &["not offered: the installer medium"], 30)?;
     std::thread::sleep(Duration::from_millis(800));
     vm.stdin_write(b"sda\n")?;
     vm.expect(
@@ -275,42 +306,52 @@ fn interactive(t: &mut T) -> Result<(), String> {
         &["sda cannot be the target: the installer medium"],
         30,
     )?;
+    // G1.6zg: the steps. [2/5] Disk: the table again, then the disk by
+    // name; it holds a CoreRouter whose configuration can be kept.
+    vm.expect(&mut log, &["[2/5] Disk"], 30)?;
     answer(&mut vm, &mut log, "CoreRouter", "vda")?;
-    answer(&mut vm, &mut log, "ALL DATA ON vda WILL BE ERASED", "y")?;
+    answer(&mut vm, &mut log, "OK  vda: ", "y")?;
     // G1.6m: the ports by the router's names; one that is not there is
     // refused, then none.
-    answer(
-        &mut vm,
+    vm.expect(
         &mut log,
-        "Management address for the first boot",
-        "eth9 192.0.2.10/24",
+        &["[3/5] Management address for the first boot"],
+        30,
     )?;
-    let row = vm.expect(&mut log, &["ether1 (", "(e.g."], 30)?;
+    let row = vm.expect(&mut log, &["ether1 ", "e.g. ether1"], 30)?;
     check(
-        row.contains("ether1 ("),
+        row.contains("52:54:"),
         format!("installer port list: {row}"),
     )?;
+    answer(&mut vm, &mut log, "e.g. ether1", "eth9 192.0.2.10/24")?;
     answer(&mut vm, &mut log, "There is no port eth9 here.", "")?;
-    vm.expect(&mut log, &["(e.g. ether1"], 30)?;
-    std::thread::sleep(Duration::from_millis(800));
-    vm.stdin_write(b"vdb\n")?;
+    // [4/5] Confirm: anything but the disk's name goes back to the disks.
+    vm.expect(&mut log, &["[4/5] Confirm"], 30)?;
+    let row = answer(&mut vm, &mut log, "ALL DATA ON vda WILL BE ERASED", "vdb")?;
+    check(row.contains("!! ALL DATA"), format!("the warning: {row}"))?;
     vm.expect(&mut log, &["Nothing was written."], 30)?;
-    answer(&mut vm, &mut log, "CoreRouter", "1")?;
-    answer(&mut vm, &mut log, "ALL DATA ON vda WILL BE ERASED", "y")?;
-    answer(
-        &mut vm,
-        &mut log,
-        "Management address for the first boot",
-        "",
+    // One disk to offer: Enter takes it, and nothing is written yet.
+    answer(&mut vm, &mut log, "CoreRouter", "")?;
+    answer(&mut vm, &mut log, "OK  vda: ", "y")?;
+    answer(&mut vm, &mut log, "e.g. ether1", "")?;
+    let row = vm.expect(&mut log, &["Holds "], 30)?;
+    check(
+        row.contains("its configuration is kept"),
+        format!("what the confirmation says is kept: {row}"),
     )?;
-    vm.expect(&mut log, &["(e.g. ether1"], 30)?;
-    std::thread::sleep(Duration::from_millis(800));
-    vm.stdin_write(b"vda\n")?;
+    answer(&mut vm, &mut log, "Address ", "vda")?;
+    vm.expect(&mut log, &["[5/5] Write"], 30)?;
+    let row = vm.expect(&mut log, &["Writing vda:"], 60)?;
+    check(
+        row.contains(" 100%") && row.contains("MiB/s"),
+        format!("the progress line: {row}"),
+    )?;
     let line = vm.expect(&mut log, &["INSTALLED", "install failed"], 120)?;
     check(
-        line.contains("INSTALLED") && line.contains("configuration kept"),
+        line.contains("OK  INSTALLED CoreRouter") && line.contains("configuration kept"),
         format!("[interactive] {line}"),
     )?;
+    vm.expect(&mut log, &["Next: remove the installation medium"], 30)?;
     std::thread::sleep(Duration::from_millis(800));
     vm.stdin_write(b"\n")?;
     vm.wait_exit(&mut log, 60)?;
@@ -595,8 +636,9 @@ fn live_two_disks(t: &mut T, name: &str, port: u16) -> Result<(Vm, PathBuf), Str
     let _ = std::fs::remove_file(&qmp);
     let mut cmd = qemu_machine(t.kvm, t.fw, &t.vars());
     // The least the live image takes: the install and a login with a password
-    // must fit too. The last `-m` wins.
-    cmd.args(["-m", "320"]);
+    // must fit too (448 MiB since G1.30: the root in RAM grew by the Wi-Fi
+    // firmware). The last `-m` wins.
+    cmd.args(["-m", "448"]);
     cmd.arg("-qmp")
         .arg(format!("unix:{},server=on,wait=off", qmp.display()));
     for (id, serial) in [("blank", "BLANK"), ("data", "DATA")] {
@@ -956,7 +998,7 @@ fn live_modules(t: &mut T) -> Result<(), String> {
     let _ = std::fs::remove_file(&mon);
     let mut cmd = qemu_machine(t.kvm, t.fw, &t.vars());
     // The least the live image takes, as in `live_two_disks`.
-    cmd.args(["-m", "320"]);
+    cmd.args(["-m", "448"]);
     cmd.arg("-monitor")
         .arg(format!("unix:{},server=on,wait=off", mon.display()));
     cmd.arg("-drive").arg(format!(

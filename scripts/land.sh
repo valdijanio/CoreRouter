@@ -59,6 +59,21 @@ mkdir -p "$dir"
 say() { printf '%s\n' "$*"; }
 stop() { say "PARADO em #$1: $2"; exit 1; }
 
+# `git fetch origin <refs>` com nova tentativa. As worktrees das sessões dividem os refs deste
+# repositório: quando outra sessão faz fetch no mesmo instante, um dos dois perde a trava do
+# ref ("cannot lock ref 'refs/remotes/origin/main': is at X but expected Y") e sai com erro,
+# embora o ref já esteja atualizado. Sem repetir, o checkout principal ficava para trás e, nos
+# fetches fora de um `if`, a fila morria (`set -e`). Medido: 199 de 200 pares de fetch
+# simultâneos falham um dos dois; com a repetição, 0 de 200.
+fetch() {
+  local try
+  for try in 1 2 3; do
+    git -C "$root" fetch --quiet origin "$@" 2>/dev/null && return 0
+    sleep "$try"
+  done
+  git -C "$root" fetch --quiet origin "$@"
+}
+
 # Os checks exigidos pela proteção da main (nomes).
 required=$(gh api "repos/$repo/branches/$base/protection/required_status_checks" \
   --jq '.checks[].context' 2>/dev/null || true)
@@ -320,8 +335,8 @@ build_combo() {
   local from=$1 name=$2 n state cross branch head wt runner fork=0
   shift 2
   members=()
-  git -C "$root" fetch --quiet origin "$base"
-  case "$from" in origin/queue/*) git -C "$root" fetch --quiet origin "${from#origin/}" ;; esac
+  fetch "$base"
+  case "$from" in origin/queue/*) fetch "${from#origin/}" ;; esac
   wt="$dir/$name"
   git -C "$root" worktree remove --force "$wt" 2>/dev/null || true
   git -C "$root" worktree add --quiet --detach "$wt" "$from"
@@ -337,7 +352,7 @@ build_combo() {
       SKIP[$n]=$head
       continue
     fi
-    git fetch --quiet origin "$branch"
+    fetch "$branch"
     if [ "$(git rev-parse "origin/$branch")" != "$head" ]; then
       say "  #$n fora: a branch andou durante a fila"
       continue
@@ -407,7 +422,7 @@ refresh_checkout() {
     say "  checkout com alterações: não recompila"
     return 0
   fi
-  if ! { git -C "$root" fetch --quiet origin "$base" && git -C "$root" merge --quiet --ff-only "origin/$base"; }; then
+  if ! { fetch "$base" && git -C "$root" merge --quiet --ff-only "origin/$base"; }; then
     say "  checkout não avançou para a $base (ff): não recompila"
     return 0
   fi
@@ -471,7 +486,7 @@ land_set() {
 FOLD_MIN=${FOLD_MIN:-10}
 maybe_fold() {
   local wt pending fb fpr
-  git -C "$root" fetch --quiet origin "$base"
+  fetch "$base"
   # Só os arquivos de mudança contam: as pastas `<id>-screenshots` ficam em docs/changes depois
   # do fold, e contá-las (37 em 2026-11-11) fazia um PR de fold a cada lote.
   pending=$(git -C "$root" ls-tree --name-only "origin/$base" docs/changes/ |
@@ -610,7 +625,7 @@ for n in "${serial[@]}"; do
   [ "$cross" = false ] || stop "$n" "PR de fork: integre à mão"
   say "== #$n ($branch)"
 
-  git -C "$root" fetch --quiet origin "$base" "$branch"
+  fetch "$base" "$branch"
   wt="$dir/pr-$n"
   git -C "$root" worktree remove --force "$wt" 2>/dev/null || true
   git -C "$root" worktree add --quiet --detach "$wt" "origin/$branch"
@@ -655,5 +670,5 @@ for n in "${serial[@]}"; do
 done
 
 maybe_fold
-git -C "$root" fetch --quiet origin "$base"
+fetch "$base"
 say "fila concluída: $*"

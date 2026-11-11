@@ -22,6 +22,8 @@ pub(crate) const NLMSG_ERROR: u16 = 2;
 pub(crate) const NLMSG_DONE: u16 = 3;
 const NLM_F_REQUEST: u16 = 1;
 const NLM_F_ACK: u16 = 4;
+/// `NLM_F_ROOT | NLM_F_MATCH`: every object, ended by `NLMSG_DONE`.
+const NLM_F_DUMP: u16 = 0x300;
 
 fn align(n: usize) -> usize {
     n.div_ceil(ALIGN).saturating_mul(ALIGN)
@@ -173,10 +175,21 @@ pub(crate) struct Msg {
 
 impl Msg {
     pub fn new(family: u16, cmd: u8, version: u8, seq: u32) -> Self {
+        Self::with_flags(family, cmd, version, seq, NLM_F_REQUEST | NLM_F_ACK)
+    }
+
+    /// A dump request (G1.30): the kernel answers with one message per
+    /// object and `NLMSG_DONE`. [`Genl::call`] bounds how many it takes.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn dump(family: u16, cmd: u8, version: u8, seq: u32) -> Self {
+        Self::with_flags(family, cmd, version, seq, NLM_F_REQUEST | NLM_F_DUMP)
+    }
+
+    fn with_flags(family: u16, cmd: u8, version: u8, seq: u32, flags: u16) -> Self {
         let mut buf = Vec::with_capacity(128);
         buf.extend_from_slice(&0u32.to_ne_bytes()); // length, set by `finish`
         buf.extend_from_slice(&family.to_ne_bytes());
-        buf.extend_from_slice(&(NLM_F_REQUEST | NLM_F_ACK).to_ne_bytes());
+        buf.extend_from_slice(&flags.to_ne_bytes());
         buf.extend_from_slice(&seq.to_ne_bytes());
         buf.extend_from_slice(&0u32.to_ne_bytes()); // port id: the kernel's
         buf.extend_from_slice(&[cmd, version, 0, 0]);
