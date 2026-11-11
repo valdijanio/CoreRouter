@@ -275,7 +275,7 @@ mod io {
     const CTRL_ATTR_MCAST_GRP_ID: u16 = 2;
     /// A reply slower than this is a stuck driver: give up on it.
     const TIMEOUT_MS: u16 = 1000;
-    /// Bound on the messages of one reply (dumps are not used).
+    /// Bound on the messages of one reply ([`Genl::call_up_to`] for more).
     const MAX_REPLIES: usize = 64;
 
     /// One generic netlink socket of the current network namespace.
@@ -389,6 +389,17 @@ mod io {
 
         /// Send `req` and collect the data messages until the ACK.
         pub fn call(&mut self, req: Vec<u8>, seq: u32) -> Result<Vec<(u8, Vec<u8>)>, GenlError> {
+            self.call_up_to(req, seq, MAX_REPLIES)
+        }
+
+        /// [`call`](Self::call) taking up to `max` messages (G1.30g: the
+        /// split dump of a radio is one message per channel).
+        pub fn call_up_to(
+            &mut self,
+            req: Vec<u8>,
+            seq: u32,
+            max: usize,
+        ) -> Result<Vec<(u8, Vec<u8>)>, GenlError> {
             self.sock
                 .send(&req, 0)
                 .map_err(|e| GenlError::Io(format!("netlink send: {e}")))?;
@@ -420,7 +431,7 @@ mod io {
                 for r in replies(&buf, seq) {
                     match r {
                         Reply::Data { cmd, attrs } => {
-                            if out.len() >= MAX_REPLIES {
+                            if out.len() >= max {
                                 return Err(GenlError::Io("reply too long".into()));
                             }
                             out.push((cmd, attrs.to_vec()));

@@ -60,6 +60,9 @@ pub(crate) struct Floats {
     flash: IdMap<f64>,
     /// Windows with edits not applied (as of the last frame they drew).
     dirty: IdSet,
+    /// G1.30g: dialogs the operator may resize with the mouse (a dialog is
+    /// fixed unless its owner asks).
+    resizable: IdSet,
     titles: IdMap<String>,
     /// Windows told to close (their parent closed).
     closing: IdSet,
@@ -337,8 +340,18 @@ impl Floats {
         })
     }
 
+    /// G1.30g: let dialog `id` be resized with the mouse.
+    pub(crate) fn allow_resize(&mut self, id: Id) {
+        self.resizable.insert(id);
+    }
+
+    pub(crate) fn resizable(&self, id: Id) -> bool {
+        self.resizable.contains(&id)
+    }
+
     /// Drop what is kept for a window that will never be shown again.
     pub(crate) fn forget(&mut self, id: Id) {
+        self.resizable.remove(&id);
         self.closed(id);
         self.closing.remove(&id);
         self.maximized.remove(&id);

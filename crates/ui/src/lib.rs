@@ -3169,7 +3169,11 @@ mod tests {
         assert!(h.has_text("CoreRouter"));
         assert!(h.has_text("Virtual NIC"));
         assert!(h.has_text("corerouter-virt"));
-        assert!(h.has_text("not supported"), "the lab has no PCI ids");
+        // G1.30g: what the driver does not report is named in one line.
+        assert!(
+            h.has_text_containing("Not reported by this driver:"),
+            "the lab has no PCI ids"
+        );
         // The offloads are further down the tab: scroll there.
         let over = h.text("corerouter-virt");
         h.frame(vec![egui::Event::PointerMoved(over)], egui::Modifiers::NONE);

@@ -253,6 +253,47 @@ Painel `crates/ui/src/wifi.rs`, padrão de janela de lista (G0.24). Só desenha 
 - Ícone próprio (`WIFI_HIGH` do Phosphor) no menu e na coluna Type da lista de interfaces;
   o log da GUI esconde `passphrase`.
 
+### Janela "Interface <wifi1>" (G1.30g)
+
+Uma porta Wi-Fi tem as abas **General, Wi-Fi, Radio, Hardware, Traffic, Statistics**. As abas
+Ethernet, Status e SFP não aparecem nela, e a SFP só aparece numa porta com gaiola de módulo (o
+`interface.ethernet.monitor` leu uma, vazia ou não). A janela redimensiona pelo mouse, e as abas
+ocupam o espaço.
+
+- **Wi-Fi** (`interface.wifi.monitor`, a cada 1 s) mostra:
+  - estado, há quanto tempo e quantas reconexões;
+  - rede, segurança, cifra, PMF e ponto de acesso;
+  - sinal com selo de qualidade (excellent ≥ −55 dBm, good ≥ −67, fair ≥ −75, poor abaixo),
+    médias, sinal por antena, ruído e SNR;
+  - faixa, padrão e geração, canal, largura e centro;
+  - taxas de TX e RX (Mbit/s, modo e MCS, fluxos, largura, GI), retransmissões em % e
+    falhas, beacons perdidos e última vez ouvido;
+  - endereços (com a origem DHCP), país e última falha.
+- **Radio** (`interface.wifi.radio`, comando novo, a cada 10 s) mostra:
+  - driver, firmware (a linha que o driver escreveu no log do kernel) e phy;
+  - padrões e, por faixa, padrões, largura máxima, canais liberados, DFS e potência máxima;
+  - antenas, potência em uso e o máximo no canal atual;
+  - país e chave do rádio (rfkill);
+  - a lista de canais de cada faixa, recolhida.
+- O que o driver não informa sai das tabelas e fica numa linha "Not reported by this driver: …",
+  inclusive na aba Hardware.
+
+De onde vem no Linux (`crates/hal-linux/src/nl80211.rs`, `wifi.rs`):
+
+- `SIGNAL_POLL`/`STATUS` do `wpa_supplicant`: ruído, largura, centro, geração e cifra.
+- nl80211 `GET_STATION`: taxas, MCS, fluxos, GI, sinal médio e por cadeia, retransmissões,
+  beacons perdidos e inatividade.
+- `GET_WIPHY` (dump dividido): faixas, capacidades HT/VHT/HE/EHT, canais com potência e radar,
+  antenas.
+- `GET_INTERFACE`: potência em uso.
+- `/sys/class/ieee80211/<phy>/rfkill*`: a chave do rádio.
+- `/dev/kmsg`: o firmware. Não há atributo nl80211 para ele, e o `ETHTOOL_GDRVINFO` pede ioctl,
+  que exigiria `unsafe`.
+
+Números das constantes: `include/uapi/linux/nl80211.h` do kernel 6.18.59, com a linha citada no
+código. Um `radio()` custa 13 ms na primeira chamada (lê o log inteiro e procura a família
+genl) e 0,4 ms depois (**medido** num mt7925e).
+
 ### Porta Wi-Fi no assistente do console
 
 `apps/corerouter-init/src/setup_wifi.rs`. O assistente do primeiro boot lista os rádios junto

@@ -612,6 +612,11 @@ impl CoreRouterUi {
                 Dialog::Props(p) => nic.get(&p.name).and_then(|v| v.eth.params(&p.name)),
                 _ => None,
             };
+            // G1.30g: "Interface <name>" resizes with the mouse; its tabs
+            // fill the window.
+            if matches!(d.dialog, Dialog::Props(_)) {
+                self.floats.allow_resize(id);
+            }
             let head = Head {
                 id,
                 title: &title,
