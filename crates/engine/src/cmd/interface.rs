@@ -586,6 +586,12 @@ fn port_add(s: &mut Session, p: &Value) -> Result<Value> {
                 ),
             ));
         }
+        InterfaceKind::Wifi(_) => {
+            return Err(EngineError::bad(
+                "interface",
+                format!("'{port}': {}", corerouter_model::wifi::NO_BRIDGE),
+            ));
+        }
         _ => {}
     }
     match &iface.bridge {
@@ -664,12 +670,17 @@ pub(super) fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     let external = unmanaged(s);
     let cfg = s.store().candidate();
     let (name, iface) = existing(cfg, p, "name")?;
-    if matches!(iface.kind, InterfaceKind::Ethernet) && !external.contains_key(&name) {
+    if matches!(iface.kind, InterfaceKind::Ethernet | InterfaceKind::Wifi(_))
+        && !external.contains_key(&name)
+    {
+        let what = if matches!(iface.kind, InterfaceKind::Wifi(_)) {
+            "Wi-Fi radio"
+        } else {
+            "physical port"
+        };
         return Err(EngineError::bad(
             "name",
-            format!(
-                "'{name}' is a physical port and cannot be removed (disable it with interface.set)"
-            ),
+            format!("'{name}' is a {what} and cannot be removed (disable it with interface.set)"),
         ));
     }
     let blockers = dependents(cfg, &name, iface);

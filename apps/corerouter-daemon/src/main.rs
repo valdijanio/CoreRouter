@@ -526,7 +526,12 @@ fn backend(
 ) -> Result<Box<dyn Hal>, String> {
     let _ = policy; // only the linux backend has one
     match name {
-        "virtual" => Ok(Box::new(lab_tools(VirtualHal::default(), lab_ping)?)),
+        // G1.30: the lab has a Wi-Fi radio too (`wifi1`, off until told to
+        // join one of the lab's networks).
+        "virtual" => Ok(Box::new(lab_tools(
+            VirtualHal::default().with_wifi(1),
+            lab_ping,
+        )?)),
         #[cfg(target_os = "linux")]
         "linux" => Ok(Box::new(corerouter_hal_linux::LinuxHal::with_policy(
             policy.clone(),

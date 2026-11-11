@@ -76,6 +76,8 @@ fn commands() -> Vec<(&'static str, Value)> {
             "interface.usb.watchdog.set",
             json!({"name": "ether1", "stall_secs": 45}),
         ),
+        // G1.30: the radios' country (`system.wifi`).
+        ("interface.wifi.country.set", json!({"country": "BR"})),
         ("system.graph.set", json!({"store_every": 600})),
         ("ip.service.www.set", json!({"port": 8081})),
         // interfaces and lists

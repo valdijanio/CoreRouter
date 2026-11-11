@@ -17,6 +17,7 @@ cargo xtask os install-test          # G1.6c: instalador (CD, USB, interativo), 
 cargo xtask os install-test --firmware seabios   # G1.6g: o mesmo por BIOS, pelo GRUB
 cargo xtask os ab-test --firmware seabios        # G1.6g: o A/B por BIOS, cruzado, cortes e controladoras
 cargo xtask os frr-test              # G1.6k: dois roteadores da imagem com OSPF, SR, LDP e BFD entre eles
+cargo xtask os wifi-test             # G1.30: a imagem como estação Wi-Fi contra um AP de teste (mac80211_hwsim + hostapd)
 cargo xtask os package --out b.crpkg --version 0.1.1 --build 1800000000  # outro pacote deste build
 cargo xtask os build --only crpkg    # G1.6e: só o pacote de atualização (sem disk.img, ISO, qcow2, OVA)
 cargo xtask os push --to 127.0.0.1:7990   # G1.6e: --only crpkg, envia pela rede, espera o slot novo confirmar
@@ -1041,6 +1042,21 @@ pastas por pacote a cada build (para o firmware de uma trava antiga não sobrar)
 segundo build da mesma árvore o arquivo sumia e o kernel dizia `cfg80211: failed to load
 regulatory.db`. Por isso quem instala a base é o `corerouter-firmware`, e o `firmware::verify`
 reprova uma imagem com `cfg80211.ko` e sem a base.
+
+**O que o motor (parte 2) usa da imagem:**
+
+- **Nomes:** o kernel chama os rádios de `wlanN`; o PID 1 os renomeia para `wifiN` e guarda o
+  par MAC → nome em `/config/.wifi-names`, para o nome não trocar entre boots
+  (`corerouter-init/src/wifi_names.rs`). O daemon só adota um rádio depois do nome final.
+- **`wpa_supplicant`:** quem o inicia é o daemon, quando o primeiro rádio é ligado
+  (`-B -g /run/corerouter/wpa/global`), e ele termina com o último. Sem rádio ligado, nenhum
+  processo a mais.
+- **`corerouter.unmanaged=<nomes>`** na linha de comando do kernel passa `--unmanaged` ao
+  daemon: ele não toca nessas interfaces. Existe para o teste (o rádio do AP) e não é levada
+  para o slot gravado.
+- **`hostapd` é ferramenta de teste, fora da imagem.** O Buildroot o compila (mesma árvore
+  hostap do `wpa_supplicant`) e o `post-build.sh` o tira da raiz para `images/test-tools/`. O
+  `cargo xtask os wifi-test` o entrega à VM num disco só de leitura.
 
 **Acrescentar uma família de drivers:** ligue os símbolos no `nics.fragment`, rode o build (ele
 falha no fim, dizendo o firmware que falta), rode `cargo xtask os firmware-lock --tag <tag>` e o

@@ -30,7 +30,12 @@ pub(crate) fn invalid(cfg: &Config, absent: &[IfName], live: &[LinkState]) -> BT
     let mut out: BTreeMap<IfName, String> = absent
         .iter()
         .filter(|n| !present.contains(n))
-        .filter(|n| cfg.interfaces.get(*n).is_some_and(|i| i.kind == InterfaceKind::Ethernet))
+        // G1.30: a radio is hardware too (a USB adapter pulled out).
+        .filter(|n| {
+            cfg.interfaces
+                .get(*n)
+                .is_some_and(|i| matches!(i.kind, InterfaceKind::Ethernet | InterfaceKind::Wifi(_)))
+        })
         .map(|n| (n.clone(), "port not on this machine (unplugged or failed): its configuration waits for it".to_owned()))
         .collect();
     if out.is_empty() {

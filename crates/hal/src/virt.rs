@@ -108,6 +108,8 @@ pub struct VirtualHal {
     /// G1.3d: a port replugged between two polls: at this poll it is
     /// there but a new link (Linux: a new index), without its settings.
     replug: Option<(IfName, u64)>,
+    /// G1.30: the lab's Wi-Fi radios and what they hear.
+    wifi: crate::lab_wifi::LabWifi,
 }
 
 /// A lab port's own settings (G1.26b); `None`: the NIC has no such knob.
@@ -173,6 +175,36 @@ impl VirtualHal {
     pub fn with_usb_stall(mut self, name: IfName, polls: std::ops::Range<u64>) -> Self {
         self.usb_stall = Some((name, polls));
         self
+    }
+
+    /// G1.30: `radios` Wi-Fi radios, `wifi1..=wifiN`, down like a card
+    /// nobody configured yet, hearing the lab's networks
+    /// ([`crate::lab_wifi::default_networks`]).
+    #[must_use]
+    pub fn with_wifi(self, radios: u8) -> Self {
+        for i in 1..=radios {
+            if let Ok(name) = format!("wifi{i}").parse::<IfName>() {
+                self.wifi.add_radio(name);
+            }
+        }
+        self
+    }
+
+    /// The lab's air, to change what the radios hear behind CoreRouter's
+    /// back.
+    pub fn wifi(&self) -> crate::lab_wifi::LabWifi {
+        self.wifi.clone()
+    }
+
+    /// A MAC for lab radio `name`, after the ports'.
+    fn radio_mac(&self, name: &IfName) -> String {
+        let n = self
+            .wifi
+            .radio_names()
+            .iter()
+            .position(|r| r == name)
+            .unwrap_or(0);
+        lab_mac(200 + n)
     }
 
     /// G1.6t: a port plugged in after boot (see [`LatePort`]).
@@ -251,6 +283,7 @@ impl VirtualHal {
             shaper: crate::queue::lab::LabShaper::default(),
             absent: std::collections::BTreeSet::new(),
             replug: None,
+            wifi: crate::lab_wifi::LabWifi::default(),
         }
     }
 
@@ -610,7 +643,16 @@ impl Hal for VirtualHal {
                 mac: Some(lab_mac(i)),
                 mtu: 1500,
                 up: true,
+                wifi: false,
             })
+            .chain(self.wifi.radio_names().into_iter().map(|name| LinkInfo {
+                mac: Some(self.radio_mac(&name)),
+                name,
+                mtu: 1500,
+                // A radio is down until somebody tells it to join a network.
+                up: false,
+                wifi: true,
+            }))
             .collect())
     }
 
@@ -1113,7 +1155,35 @@ impl Hal for VirtualHal {
             .keys()
             .filter(|n| self.late_present(n) != Some(false))
             .filter_map(|n| self.sample(n))
+            .map(|mut l| {
+                // G1.30: a radio has carrier while it is on a network.
+                if self.wifi.has_radio(&l.name) {
+                    l.running &= self.wifi.connected(&l.name);
+                }
+                l
+            })
             .collect();
+        // G1.30: a radio not (yet) in the configuration.
+        out.extend(
+            self.wifi
+                .radio_names()
+                .into_iter()
+                .filter(|n| !self.applied.interfaces.contains_key(n))
+                .map(|n| LinkState {
+                    mac: Some(self.radio_mac(&n)),
+                    name: n,
+                    running: false,
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    rx_packets: 0,
+                    tx_packets: 0,
+                    kind: "wifi".into(),
+                    mtu: 1500,
+                    bus: None,
+                    unmanaged: None,
+                    errors: None,
+                }),
+        );
         // G1.6t: a late port not (yet) in the configuration, as the
         // kernel shows a new card: there, up, no traffic.
         out.extend(
@@ -1548,6 +1618,23 @@ impl Hal for VirtualHal {
             inbox: VecDeque::new(),
             probing: None,
         }))
+    }
+
+    fn wifi_port(&mut self, name: &IfName) -> Result<Box<dyn crate::wifi::WifiPort>, HalError> {
+        self.wifi.port(name)
+    }
+
+    fn wifi_country(&mut self, country: Option<&str>) -> Result<(), HalError> {
+        self.wifi.set_country(country);
+        Ok(())
+    }
+
+    fn wifi_radio(&mut self, name: &IfName) -> Option<crate::wifi::WifiRadio> {
+        self.wifi.radio(name)
+    }
+
+    fn wifi_regdomain(&mut self) -> Option<String> {
+        self.wifi.country()
     }
 
     fn pppoe_client_port(

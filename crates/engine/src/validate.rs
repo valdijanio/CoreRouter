@@ -316,6 +316,27 @@ fn interface_checks(cfg: &Config) -> Vec<Issue> {
             }
         }
         os_loopback_checks(name, iface, &mut out);
+        // G1.30: a radio on needs the country; its network, if it has
+        // one, a name that can be one and its passphrase.
+        if let InterfaceKind::Wifi(st) = &iface.kind {
+            if !iface.disabled && cfg.system.wifi.country.is_none() {
+                out.push(Issue::new(
+                    format!("interfaces.{name}.disabled"),
+                    corerouter_model::wifi::NO_COUNTRY,
+                ));
+            }
+            if !st.ssid.is_empty() {
+                if let Some(why) = corerouter_model::wifi::ssid_problem(&st.ssid) {
+                    out.push(Issue::new(format!("interfaces.{name}.ssid"), why));
+                }
+                if st.security.keyed() && st.passphrase.is_empty() {
+                    out.push(Issue::new(
+                        format!("interfaces.{name}.passphrase"),
+                        format!("network '{}' needs its passphrase", st.ssid),
+                    ));
+                }
+            }
+        }
         if !(68..=9216).contains(&iface.mtu) {
             out.push(Issue::new(
                 format!("interfaces.{name}.mtu"),
@@ -764,6 +785,9 @@ fn bridge_port_checks(
             "'{bridge}' is not a bridge (type {})",
             other.label()
         )),
+    }
+    if matches!(iface.kind, InterfaceKind::Wifi(_)) {
+        problems.push(format!("'{name}': {}", corerouter_model::wifi::NO_BRIDGE));
     }
     if matches!(
         iface.kind,

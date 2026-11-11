@@ -391,6 +391,16 @@ fn spawn_hotplug_names(map: &'static str, live: bool) {
     let spawned = std::thread::Builder::new()
         .name("port-names".into())
         .spawn(move || {
+            // G1.30: a radio's netdev shows up when its driver has its
+            // firmware, after the boot named the ports: `wlanN` → `wifiN`.
+            let name_radios = || {
+                if crate::wifi_names::pending() {
+                    crate::links::settle(Duration::from_millis(100), Duration::from_secs(1));
+                    crate::wifi_names::pass(log, write_durable);
+                }
+            };
+            // One that came between the boot's pass and this thread.
+            name_radios();
             loop {
                 if let Err(e) = events.wait() {
                     // ENOBUFS: lost messages, look anyway; anything else:
@@ -399,6 +409,7 @@ fn spawn_hotplug_names(map: &'static str, live: bool) {
                         std::thread::sleep(Duration::from_secs(1));
                     }
                 }
+                name_radios();
                 let pending = crate::links::all_ports()
                     .iter()
                     .any(|f| crate::ports::is_kernel_name(&f.kernel));

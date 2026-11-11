@@ -177,6 +177,8 @@ impl Owner {
 fn claim_fits(claim: &InterfaceKind, link: &KernelLink) -> bool {
     match claim {
         InterfaceKind::Ethernet => link.port_like(),
+        // G1.30: a radio's netdev, and nothing else.
+        InterfaceKind::Wifi(_) => link.wireless && link.kind.is_none(),
         InterfaceKind::Vlan { .. } => link.is("vlan"),
         InterfaceKind::Bridge => link.is("bridge"),
         InterfaceKind::Loopback => link.is("dummy"),
@@ -225,10 +227,12 @@ fn base(link: &KernelLink, claim: Option<&InterfaceKind>, policy: &Policy) -> Ow
     if link.physical() {
         return Owner::Managed;
     }
-    // G1.30: a radio is not a port. Taken for one, it was seeded as
-    // `ether`, got the ports' settings and a place in the console setup.
-    if link.wireless {
-        return ext("a Wi-Fi radio, which this version does not configure".into());
+    // G1.30: a radio is the router's, like a port, and is not one: it is
+    // seeded and adopted as an interface of type `wifi` (`label`). Taken
+    // for a port, it got the ports' settings and a place in the console
+    // setup's list.
+    if link.wireless && link.kind.is_none() {
+        return Owner::Managed;
     }
     let listed = Policy::hit(&policy.manage, &link.name);
     if link.is("veth") {

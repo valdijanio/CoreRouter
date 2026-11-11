@@ -435,6 +435,11 @@ pub struct BootOptions {
     /// G1.30: that many simulated Wi-Fi radios (`corerouter.hwsim=2`,
     /// `mac80211_hwsim`), for a test of the image where there is no card.
     pub hwsim: Option<u8>,
+    /// G1.30: links the router must never touch, as the daemon's
+    /// `--unmanaged` takes them (`corerouter.unmanaged=wifi1,eth9`): a port
+    /// lent to something else on the machine. The image's own test keeps the
+    /// radio of its access point out of the router's hands with it.
+    pub unmanaged: Option<String>,
     /// Complaints about the command line, logged once at boot.
     pub warnings: Vec<String>,
 }
@@ -476,6 +481,8 @@ pub fn virtual_machine(cpuinfo: &str) -> bool {
 const MAX_TTY: usize = 16;
 /// Simulated radios a test may ask for.
 const MAX_HWSIM: u8 = 8;
+/// The longest `corerouter.unmanaged=` list.
+const MAX_UNMANAGED: usize = 256;
 
 impl BootOptions {
     pub fn parse(cmdline: &str) -> Self {
@@ -487,6 +494,7 @@ impl BootOptions {
             modules: true,
             sensors: Sensors::Auto,
             hwsim: None,
+            unmanaged: None,
             warnings: Vec::new(),
         };
         for word in cmdline.split_ascii_whitespace() {
@@ -534,6 +542,22 @@ impl BootOptions {
                         .warnings
                         .push(format!("corerouter.modules={}: use on or off", clip(value))),
                 },
+                "unmanaged" => {
+                    let ok = !value.is_empty()
+                        && value.len() <= MAX_UNMANAGED
+                        && value.bytes().all(|b| {
+                            b.is_ascii_alphanumeric()
+                                || matches!(b, b',' | b'-' | b'_' | b'.' | b'*')
+                        });
+                    if ok {
+                        out.unmanaged = Some(value.to_owned());
+                    } else {
+                        out.warnings.push(format!(
+                            "corerouter.unmanaged={}: use link names separated by commas",
+                            clip(value)
+                        ));
+                    }
+                }
                 "hwsim" => match value.parse::<u8>() {
                     Ok(n) if (1..=MAX_HWSIM).contains(&n) => out.hwsim = Some(n),
                     _ => out.warnings.push(format!(
@@ -600,6 +624,9 @@ pub fn daemon_args(opts: &BootOptions, frr: bool) -> Vec<String> {
     }
     if opts.mode == Mode::Live {
         a.push("--live".to_owned());
+    }
+    if let Some(names) = &opts.unmanaged {
+        a.extend(["--unmanaged".to_owned(), names.clone()]);
     }
     a
 }
@@ -703,6 +730,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unmanaged_option() {
+        assert_eq!(BootOptions::parse("quiet").unmanaged, None);
+        let o = BootOptions::parse("corerouter.unmanaged=wifi1,eth9,veth*");
+        assert_eq!(o.unmanaged.as_deref(), Some("wifi1,eth9,veth*"));
+        let a = daemon_args(&o, false);
+        let at = a.iter().position(|x| x == "--unmanaged").unwrap();
+        assert_eq!(a[at + 1], "wifi1,eth9,veth*");
+        assert!(!daemon_args(&BootOptions::parse(""), false).contains(&"--unmanaged".to_owned()));
+        let long = "a".repeat(300);
+        for bad in ["", "a=b", "x;rm", long.as_str(), "a/b", "\"q\""] {
+            let o = BootOptions::parse(&format!("corerouter.unmanaged={bad}"));
+            assert_eq!(o.unmanaged, None, "{bad}");
+        }
+    }
+
+    #[test]
     fn hwsim_option() {
         assert_eq!(BootOptions::parse("quiet").hwsim, None);
         assert_eq!(BootOptions::parse("corerouter.hwsim=2").hwsim, Some(2));
@@ -749,6 +792,7 @@ mod tests {
                 modules: true,
                 sensors: Sensors::Auto,
                 hwsim: None,
+                unmanaged: None,
                 warnings: vec![]
             }
         );

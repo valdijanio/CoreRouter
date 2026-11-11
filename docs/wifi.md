@@ -8,7 +8,7 @@ A G1.30 entra em três partes:
 | Parte | O que entra | Estado |
 |---|---|---|
 | 1. Imagem | pilha Wi-Fi em módulo, drivers e firmware, `regulatory.db`, `wpa_supplicant`, passada própria no PID 1; rádio deixa de ser confundido com porta Ethernet | este documento, "Imagem" |
-| 2. Motor | interface `wifi` em modo `station`, comandos (`interface.wifi.*`), `hal-wpa`, teste com `mac80211_hwsim` | a seguir |
+| 2. Motor | interface `wifi` em modo `station`, comandos (`interface.wifi.*`), o `wpa_supplicant` dirigido pelo `hal-linux`, teste de ponta a ponta com `mac80211_hwsim` | este documento, "Motor" |
 | 3. Telas | janela Interfaces › Wi-Fi e a porta Wi-Fi no setup do console | a seguir |
 
 ## Imagem (parte 1)
@@ -113,6 +113,107 @@ ele nunca carrega sozinho.
 ```sh
 cargo xtask os boot-test --wifi    # boot com corerouter.hwsim=2; espera "wifi: 2 test radios"
 ```
+
+## Motor (parte 2)
+
+### Como se usa
+
+```sh
+corerouter-cli run interface.wifi.country.set '{"country":"BR"}'
+corerouter-cli run interface.wifi.enable '{"name":"wifi1"}'
+corerouter-cli run interface.wifi.scan '{"name":"wifi1"}'
+corerouter-cli run interface.wifi.networks '{"name":"wifi1"}'      # alguns segundos depois
+corerouter-cli run interface.wifi.set '{"name":"wifi1","ssid":"Casa","passphrase":"…"}'
+corerouter-cli run interface.wifi.monitor '{"name":"wifi1"}'
+corerouter-cli run ip.dhcp-client.add '{"interface":"wifi1"}'
+```
+
+No terminal: `/interface wifi country set country=BR`, `/interface wifi set wifi1 ssid=Casa
+passphrase=…`, `/interface wifi monitor wifi1`.
+
+| Comando | O que faz |
+|---|---|
+| `interface.wifi.list` | os rádios: rede configurada, estado, sinal, canal; a senha sai como `***` (`show_sensitive`, grupo full, mostra) |
+| `interface.wifi.set` | a rede (`ssid`, `security`, `passphrase`, `hidden`, `band`, `bssid`), `disabled`, `comment`, `mtu`; `ssid=""` esquece a rede e a senha |
+| `interface.wifi.enable` / `.disable` | liga e desliga o rádio |
+| `interface.wifi.scan` / `.networks` | começa uma varredura; o que ela ouviu, com o que dá para entrar e por que não |
+| `interface.wifi.monitor` | o enlace agora: estado, BSSID, banda, canal, sinal, taxa, segurança negociada, PMF, falha em palavras, reconexões, país pedido e em vigor |
+| `interface.wifi.reconnect` | sai e entra de novo |
+| `interface.wifi.history` | os eventos (entrando, conectado, caiu, falhou, bloqueado) |
+| `interface.wifi.country.set` / `.get` | o país de todos os rádios (ISO 3166-1, duas letras) |
+| `interface.wifi.adopt` | põe na config um rádio que apareceu; o tick faz isso sozinho |
+
+`security`: `auto` (WPA3 se o AP oferece, senão WPA2; o padrão), `wpa3`, `wpa2`, `open`.
+A senha tem de 8 a 63 caracteres ASCII, ou é a chave de 64 dígitos hexadecimais, que só vale
+com `security=wpa2` (o SAE precisa da frase).
+
+### O rádio na config
+
+- O rádio é uma interface de tipo `wifi` (`InterfaceKind::Wifi`, `crates/model/src/wifi.rs`),
+  que existe porque a placa existe, como uma porta Ethernet. Ela entra na config pela adoção
+  do tick (`interface.wifi.adopt`), depois que o nome ficou igual por três leituras, sempre
+  **desligada** e sem rede, como no RouterOS. Não entra na semeadura do primeiro boot: o
+  netdev de um rádio aparece quando o driver tem o firmware, depois de o boot nomear as
+  portas, e é renomeado em seguida; semeado ali ele entrava na config como `wlan0`
+  (**medido** no QEMU: um daemon que subiu 95 ms antes da troca de nome).
+- O nome é `wifi1`, `wifi2`… (o do RouterOS 7). Na imagem o PID 1 renomeia o `wlanN` do kernel
+  e guarda o nome pelo MAC em `/config/.wifi-names` (`apps/corerouter-init/src/wifi_names.rs`):
+  a ordem em que os drivers sondam muda de um boot para outro, o nome não.
+- A senha fica selada (`Sealed`, AES-256-GCM, a mesma chave dos segredos PPP). Journal, log,
+  `config.diff`, `state.inspect` e `/export` não a mostram; `/export show-sensitive` sim.
+- O país é um só para o roteador (`system.wifi.country`): no Linux o domínio regulatório é do
+  sistema, não da placa.
+- Config antiga carrega igual: o tipo e a seção são novos e não escrevem nada quando vazios.
+  Uma versão anterior não lê uma config com um rádio; a volta do A/B usa a cópia da config.
+
+### O que os comandos recusam
+
+- **Rádio ligado sem país** (na validação do commit, para um lote poder definir os dois em
+  qualquer ordem): no domínio mundial o rádio não transmite em 5 GHz, e com o país errado
+  transmite onde não pode. A mensagem traz o comando a rodar.
+- **Mudar a rede do rádio por onde a sessão chega** (`ssid`, senha, segurança, desligar,
+  reconectar): pede Safe Mode, em que perder a conexão desfaz a mudança, ou `force=yes`.
+- **Rádio em bridge:** uma estação leva três endereços no quadro e só o próprio MAC atravessa
+  o AP; o kernel também recusa (`IFF_DONT_BRIDGE`). A mensagem diz para rotear.
+- **Rede 802.1X, OWE, WEP ou só WPA/TKIP:** aparecem na varredura com `joinable: false` e o
+  motivo.
+
+### Como roda
+
+- **Motor** (`crates/engine/src/wifi.rs`): no relógio que já move os clientes DHCP e PPPoE.
+  Para cada rádio da config em uso, abre a porta do rádio na plataforma, diz a rede **uma vez
+  por mudança** (o que distingue uma config da outra é a caixa selada, não a senha) e lê os
+  eventos. A senha só é aberta para o `join`.
+- **Plataforma** (`crates/hal/src/wifi.rs`): o trait `WifiPort` (`join`, `leave`, `scan`,
+  `scan_results`, `status`, `events`). O laboratório virtual tem um rádio com sete redes
+  inventadas (`crates/hal/src/lab_wifi.rs`): os testes do motor e a GUI rodam nele.
+- **Linux** (`crates/hal-linux/src/wifi.rs`): um `wpa_supplicant` para todos os rádios,
+  iniciado quando o primeiro rádio é aberto (`-B -g <runtime>/wpa/global`), sem arquivo de
+  configuração; cada rádio entra por `INTERFACE_ADD` e tem dois sockets, um de comandos e um de
+  eventos. A senha vai num `SET_NETWORK` pelo socket, nunca para arquivo. O supplicant
+  sobrevive a um restart do daemon (o rádio continua na rede) e termina com o último rádio.
+  O país vai ao kernel por nl80211 (`NL80211_CMD_REQ_SET_REG`), e o domínio em vigor é lido de
+  lá (`NL80211_CMD_GET_REG`).
+- **Falhas em palavras:** `wrong-key` ("provavelmente a senha": no WPA2 o AP não diz que a
+  senha está errada, só para de responder; sinal muito fraco e filtro de MAC dão o mesmo
+  evento), `not-found`, `rejected` com o código do AP traduzido, `no-answer` (várias tentativas
+  sem resposta) e o rádio bloqueado (rfkill). **A causa fica na tela:** depois de uma senha
+  errada o `wpa_supplicant` deixa aquele AP de lado, a varredura seguinte dele "não acha a
+  rede" e ele pausa a rede. Esses dois eventos são consequência; o motor mantém `wrong-key`
+  (ou `rejected`) enquanto a rede continuar sendo ouvida. Se ela sumir de verdade, passa a
+  `not-found`.
+
+### Teste de ponta a ponta
+
+```sh
+cargo xtask os wifi-test
+```
+
+Sobe a imagem no QEMU com dois rádios simulados (`mac80211_hwsim`: cfg80211 e mac80211 de
+verdade, quadros entre os rádios em software). No primeiro roda um `hostapd` com WPA2 e WPA3; o
+segundo é o do roteador, dirigido só por comandos. O `hostapd` não está na imagem: o build o
+deixa em `images/test-tools/` e o teste o entrega num disco próprio. `corerouter.unmanaged=wifi1`
+na linha de comando do kernel mantém o roteador longe do rádio do AP.
 
 ## Pesquisa
 

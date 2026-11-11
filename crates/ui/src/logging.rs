@@ -45,7 +45,7 @@ pub(crate) const PANEL: Panel = Panel {
 
 /// The topics an event can carry (`corerouter_model::logging::TOPICS`,
 /// which a test keeps in step; the engine refuses any other).
-pub(crate) const TOPICS: [&str; 18] = [
+pub(crate) const TOPICS: [&str; 19] = [
     "account",
     "arp",
     "cgnat",
@@ -64,6 +64,7 @@ pub(crate) const TOPICS: [&str; 18] = [
     "system",
     "tool",
     "warning",
+    "wireless",
 ];
 /// RFC 5424 §6.2.1 order (`Facility::ALL`, kept in step by a test).
 pub(crate) const FACILITIES: [&str; 21] = [

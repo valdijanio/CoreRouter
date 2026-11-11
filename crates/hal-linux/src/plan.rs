@@ -100,7 +100,8 @@ impl LinkSpec {
                     corerouter_model::pppoe_client::relay_peer(n.as_str())
                 }),
             }),
-            InterfaceKind::Ethernet => None,
+            // A port and a radio are there or are not: never created.
+            InterfaceKind::Ethernet | InterfaceKind::Wifi(_) => None,
             InterfaceKind::Vlan {
                 parent,
                 vlan_id,

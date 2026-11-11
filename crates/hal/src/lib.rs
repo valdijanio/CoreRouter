@@ -19,6 +19,7 @@ pub mod icmp_ext;
 pub mod lab_conntrack;
 pub mod lab_flow;
 pub mod lab_neigh;
+pub mod lab_wifi;
 pub mod link_reader;
 pub mod lsp;
 pub mod mpls;
@@ -39,6 +40,7 @@ pub mod sim;
 pub mod system_resource;
 pub mod tuning;
 pub mod virt;
+pub mod wifi;
 pub mod xdp;
 pub mod xdp_nat;
 
@@ -87,6 +89,9 @@ pub struct LinkInfo {
     /// Administratively up: the seed sets `disabled = !up`, so the first
     /// apply changes nothing in the kernel.
     pub up: bool,
+    /// A Wi-Fi radio (G1.30), not an Ethernet port: seeded and adopted as
+    /// an interface of type `wifi`.
+    pub wifi: bool,
 }
 
 /// Live operational state of a link.
@@ -383,6 +388,40 @@ pub trait Hal: Send {
             "{} has no DHCP client transport (asked for '{name}')",
             self.describe()
         )))
+    }
+
+    /// Open the radio of Wi-Fi interface `name` (G1.30): join and leave a
+    /// network, scan, read the link.
+    fn wifi_port(&mut self, name: &IfName) -> Result<Box<dyn wifi::WifiPort>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no Wi-Fi (asked for '{name}')",
+            self.describe()
+        )))
+    }
+
+    /// Ask for the regulatory domain of `country` (ISO 3166-1 alpha-2) for
+    /// every radio; `None`: back to the world domain. The platform's answer
+    /// is the request's, not the radio's: a card that manages its own
+    /// domain ([`wifi::WifiRadio::self_managed`]) may not follow.
+    fn wifi_country(&mut self, country: Option<&str>) -> Result<(), HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no Wi-Fi regulatory domain (asked for {})",
+            self.describe(),
+            country.unwrap_or("the world domain")
+        )))
+    }
+
+    /// What the platform knows about the radio behind `name`.
+    fn wifi_radio(&mut self, _name: &IfName) -> Option<wifi::WifiRadio> {
+        None
+    }
+
+    /// The regulatory domain in force now, as the platform names it (`BR`;
+    /// `00`: the world domain). `None`: no Wi-Fi stack, or it cannot be
+    /// read. What [`wifi_country`](Self::wifi_country) asked for is not
+    /// necessarily it.
+    fn wifi_regdomain(&mut self) -> Option<String> {
+        None
     }
 
     /// Open the port of PPPoE client `client` on Ethernet port `uplink`

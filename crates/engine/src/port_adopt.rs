@@ -37,12 +37,13 @@ pub struct PortAdoption {
 }
 
 impl Session {
-    /// From `poll_links`: adopt the Ethernet links of `live` that are not
-    /// in the configuration and kept their name long enough.
+    /// From `poll_links`: adopt the Ethernet links and the Wi-Fi radios
+    /// (G1.30) of `live` that are not in the configuration and kept their
+    /// name long enough.
     pub(crate) fn adopt_new_ports(&mut self, live: &[LinkState]) {
         let new: Vec<&LinkState> = live
             .iter()
-            .filter(|l| l.kind == "ether" && l.unmanaged.is_none())
+            .filter(|l| (l.kind == "ether" || l.kind == "wifi") && l.unmanaged.is_none())
             .filter(|l| {
                 !self.store().candidate().interfaces.contains_key(&l.name)
                     && !self.store().running().interfaces.contains_key(&l.name)
@@ -57,7 +58,7 @@ impl Session {
         }
         a.seen.retain(|n, _| new.iter().any(|l| &l.name == n));
         a.backoff.retain(|n, _| new.iter().any(|l| &l.name == n));
-        let mut due = Vec::new();
+        let mut due: Vec<(IfName, &'static str)> = Vec::new();
         for l in &new {
             if let Some(left) = a.backoff.get_mut(&l.name) {
                 *left = left.saturating_sub(1);
@@ -68,20 +69,25 @@ impl Session {
             let n = a.seen.entry(l.name.clone()).or_default();
             *n = n.saturating_add(1);
             if *n >= STABLE_POLLS {
-                due.push(l.name.clone());
+                let command = if l.kind == "wifi" {
+                    "interface.wifi.adopt"
+                } else {
+                    "interface.ethernet.adopt"
+                };
+                due.push((l.name.clone(), command));
             }
         }
         if due.is_empty() || self.store().is_dirty() {
             return;
         }
         let caller = Caller::new(Caller::LOCAL_ID, "router: new port").with_principal(Principal::Local);
-        for name in due {
-            let r = self.execute_as(&caller, "interface.ethernet.adopt", &json!({ "name": name }));
+        for (name, command) in due {
+            let r = self.execute_as(&caller, command, &json!({ "name": name }));
             // The command commits in immediate mode; in transactional mode
             // the candidate was clean, so committing takes only this port.
             let r = r.and_then(|v| {
                 if self.store().is_dirty() {
-                    self.commit_candidate("interface.ethernet.adopt")?;
+                    self.commit_candidate(command)?;
                 }
                 Ok(v)
             });
