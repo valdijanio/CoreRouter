@@ -610,6 +610,14 @@ fn scenario_update(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
         "system.tuning.boot.set",
         r#"{"key":"iommu","value":"pt"}"#,
     )?;
+    // G1.6zf: the init's own option goes the same way. `on`: look for the
+    // motherboard's sensor chip in a virtual machine too, so the next boot
+    // shows that PID 1 got it (no such chip here: it says nobody answered).
+    vm.ok(
+        &mut log,
+        "system.tuning.boot.set",
+        r#"{"key":"corerouter.sensors","value":"on"}"#,
+    )?;
     let q = vm.ok(&mut log, "system.package.check", r#"{"path":"/dev/vdb"}"#)?;
     let c = result_of(&mut vm, &mut log, &q, 60)?;
     check(
@@ -626,7 +634,21 @@ fn scenario_update(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
     vm.wait_exit(&mut log, 120)?;
     drop(vm);
     let mut vm = ctx.boot("update/trial-b", false, &[])?;
-    vm.expect(&mut log, &["trial boot of slot b"], 120)?;
+    let r = vm.expect_all(
+        &mut log,
+        &[
+            "trial boot of slot b",
+            "sensors: no motherboard sensor chip answered",
+        ],
+        120,
+    )?;
+    n.put(
+        "trial boot of slot B: corerouter.sensors=on reached PID 1",
+        r.get(1)
+            .map_or("", |l| l.split("corerouter-init: ").last().unwrap_or(""))
+            .trim()
+            .to_owned(),
+    );
     let r = vm.expect_all(
         &mut log,
         &[

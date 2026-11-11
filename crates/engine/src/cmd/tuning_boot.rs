@@ -245,6 +245,10 @@ mod tests {
         s.execute(id, &p)
     }
 
+    fn err_of(s: &mut Session, p: Value) -> String {
+        run(s, "system.tuning.boot.set", p).unwrap_err().to_string()
+    }
+
     #[test]
     fn boot_parameters_wait_for_the_next_boot() {
         let mut s = Session::virtual_lab();
@@ -283,6 +287,15 @@ mod tests {
         assert!(err(json!({"key": "isolcpus", "value": "2 quiet init=/bin/sh"})).contains("CPU list"));
         assert!(err(json!({"key": "init", "value": "/bin/sh"})).contains("not a boot parameter"));
         assert!(err(json!({"key": "processor.max_cstate", "value": "12"})).contains("0..=9"));
+
+        // G1.6zf: the init's own option travels the same way (the search for
+        // the motherboard's sensor chip, off on a board where it does harm).
+        let out = run(&mut s, "system.tuning.boot.set", json!({"key": "corerouter.sensors", "value": "off"})).unwrap();
+        assert_eq!(out["next_cmdline"], "isolcpus=2-7 mitigations=off corerouter.sensors=off");
+        assert_eq!(row(&v, "corerouter.sensors")["section"], "Hardware");
+        assert_eq!(row(&v, "corerouter.sensors")["recommended"], Value::Null);
+        assert!(err_of(&mut s, json!({"key": "corerouter.sensors", "value": "lax"})).contains("auto"));
+        run(&mut s, "system.tuning.boot.unset", json!({"key": "corerouter.sensors"})).unwrap();
 
         // One transaction like the rest: a rollback takes it back.
         let rev = s.store().current_revision();

@@ -115,6 +115,31 @@ CONFIG_FUSION=y
 CONFIG_FUSION_SPI=y
 CONFIG_FUSION_SAS=y
 
+# --- Sensors (G1.6zf, docs/os-image.md): what System › Health reads from
+# /sys/class/hwmon. Built in: the drivers that only bind to a device the
+# machine enumerates (CPUID, PCI, the NVMe controller, a SATA disk, the
+# PHY), so they cost nothing where the chip is not. CPU: Intel (coretemp)
+# and AMD (k10temp); disks: NVMe and SATA; the Intel chipset; the Realtek
+# 2.5G ports of the mini-PCs.
+CONFIG_SENSORS_CORETEMP=y
+CONFIG_SENSORS_K10TEMP=y
+CONFIG_NVME_HWMON=y
+CONFIG_SENSORS_DRIVETEMP=y
+CONFIG_INTEL_PCH_THERMAL=y
+CONFIG_REALTEK_PHY_HWMON=y
+# The motherboard's Super-I/O (fans, voltages, board temperatures): modules.
+# These chips are not enumerated: each driver writes its unlock key to ports
+# 0x2e/0x4e to see who answers. PID 1 loads them after the ports and the
+# screen, never in a virtual machine, and `corerouter.sensors=off` keeps
+# them out (apps/corerouter-init/src/modules.rs, SENSOR_MODULES).
+CONFIG_SENSORS_NCT6775=m
+CONFIG_SENSORS_NCT6683=m
+CONFIG_SENSORS_IT87=m
+CONFIG_SENSORS_F71882FG=m
+CONFIG_SENSORS_W83627EHF=m
+# The defconfig's module nobody loaded: the package sensor coretemp shows.
+# CONFIG_X86_PKG_TEMP_THERMAL is not set
+
 # --- eBPF and XDP (G2.5): JIT always on, BTF for CO-RE, AF_XDP.
 CONFIG_BPF=y
 CONFIG_BPF_SYSCALL=y

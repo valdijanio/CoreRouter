@@ -134,11 +134,18 @@ pub fn memory_used(s: &Sample) -> Option<f32> {
     percent(m.total.saturating_sub(m.available), m.total)
 }
 
+/// The temperature sensors that speak for the router (G1.6zf): every one
+/// but the motherboard chip's (`Sensor::board`: a pin left open reads 127 °C),
+/// and those only when there is no other.
+pub fn temperatures(s: &Sample) -> impl Iterator<Item = &corerouter_hal::system_resource::Sensor> {
+    let temps = || s.sensors.iter().filter(|x| x.kind == SensorKind::Temperature);
+    let only_board = temps().all(|x| x.board);
+    temps().filter(move |x| only_board || !x.board)
+}
+
 /// The hottest temperature sensor: (value, crit, "chip label").
 pub fn hottest(s: &Sample) -> Option<(f64, Option<f64>, String)> {
-    s.sensors
-        .iter()
-        .filter(|x| x.kind == SensorKind::Temperature)
+    temperatures(s)
         .max_by(|a, b| a.value.total_cmp(&b.value))
         .map(|x| (x.value, x.crit, format!("{} {}", x.chip, x.label)))
 }

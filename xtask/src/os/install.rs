@@ -365,8 +365,32 @@ fn interactive(t: &mut T) -> Result<(), String> {
 /// `corerouter-cli run` on the guest over TLS, as the first operator: `admin`
 /// without a password, the certificate accepted on first use.
 fn live_cli(t: &T, cli: &Path, port: u16, id: &str, params: &str) -> Result<String, String> {
-    let home = t.work.join("live-home");
-    std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
+    let who = Admin {
+        home: &t.work.join("live-home"),
+        password: &t.admin,
+        strict: t.strict,
+    };
+    cli_run(cli, &who, port, id, params)
+}
+
+/// Who `cli_run` is: `admin` with this password, the known hosts under
+/// `home`; `strict`: the certificate must be the one already known.
+pub(super) struct Admin<'a> {
+    pub home: &'a Path,
+    pub password: &'a str,
+    pub strict: bool,
+}
+
+/// One command of `corerouter-cli run` on a guest's forwarded TLS port.
+pub(super) fn cli_run(
+    cli: &Path,
+    who: &Admin<'_>,
+    port: u16,
+    id: &str,
+    params: &str,
+) -> Result<String, String> {
+    let home = who.home;
+    std::fs::create_dir_all(home).map_err(|e| e.to_string())?;
     let mut cmd = Command::new(cli);
     cmd.args([
         "--connect",
@@ -374,14 +398,14 @@ fn live_cli(t: &T, cli: &Path, port: u16, id: &str, params: &str) -> Result<Stri
         "--user",
         "admin",
     ]);
-    if !t.strict {
+    if !who.strict {
         cmd.arg("--accept-new-cert");
     }
     let out = cmd
         .args(["run", id, params])
-        .env("HOME", &home)
+        .env("HOME", home)
         .env("COREROUTER_KNOWN_HOSTS", home.join("known_hosts"))
-        .env("COREROUTER_PASSWORD", &t.admin)
+        .env("COREROUTER_PASSWORD", who.password)
         .env("RUST_LOG", "off")
         .stdin(std::process::Stdio::null())
         .output()

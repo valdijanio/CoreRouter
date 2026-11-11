@@ -35,6 +35,8 @@ Partes:
   - Um parâmetro ausente fica como o kernel tem.
   - Tirar um parâmetro devolve o valor que o kernel tinha antes da primeira mudança do CoreRouter
     (o mesmo modelo das opções Ethernet, G1.20).
+  - **Exceção: o encaminhamento IPv4 e IPv6 nasce ligado** (G1.26i, seção "Encaminhamento ligado
+    por padrão"). Ele não entra na config: é o padrão do CoreRouter enquanto ela não disser 0.
 - **HAL**:
   - `system_info` lê a máquina: CPUs, nós NUMA, RAM, kernel.
   - `sysctls` lê os valores atuais.
@@ -42,7 +44,8 @@ Partes:
   - `apply` grava, tudo ou nada: se um valor é recusado (ausente, só leitura, ou o kernel guardou
     outro), os já gravados voltam e o commit falha com o motivo.
   - O `ip_forward` é gravado antes dos outros, porque mudá-lo reinicia parâmetros de configuração
-    (`ip-sysctl.rst`).
+    (`ip-sysctl.rst`; no kernel 6.18 são o `conf/all/accept_redirects`, o `conf/default/forwarding`
+    e o `forwarding` de cada interface, `inet_forward_change` em `net/ipv4/devinet.c`).
   - O laboratório virtual simula uma máquina de 16 CPUs, 2 nós NUMA e 32 GiB, com contadores que
     disparam o diagnóstico.
 - **Engine** (`crates/engine/src/tuning.rs`, puro, testado sem kernel):
@@ -73,7 +76,7 @@ No terminal: `/system tuning parameter print`, `/system tuning print` (o que est
 Cada perfil é **calculado para a máquina**, não copiado de uma tabela:
 
 - **Conservador**: só o que é seguro em qualquer lugar.
-  - encaminhamento ligado;
+  - encaminhamento ligado (já é o padrão do CoreRouter: o perfil não grava nada);
   - ECMP por camada 4;
   - `kernel.panic = 10`, `panic_on_oops = 1`;
   - `tcp_syncookies = 1`.
@@ -110,7 +113,12 @@ Os contadores são desde o boot:
 | `nf_conntrack_count / max` ≥ 80 % (crítico a partir de 95 %) | tabela quase cheia | `nf_conntrack_max` |
 | `table_fulls` de `/proc/net/stat/{arp,ndisc}_cache` | estouro da tabela de vizinhos | `gc_thresh3` |
 | `rx_missed_errors` com anel abaixo do máximo | a placa ficou sem descritor | aba Interfaces (G1.26b) |
-| `ip_forward = 0` | o roteador não roteia | crítico |
+| `ip_forward = 0` | o roteador não roteia | crítico, com o botão `Set net.ipv4.ip_forward = 1` |
+| `ipv6.conf.all.forwarding = 0` | o roteador não roteia IPv6 | aviso, com o botão |
+
+Desde a G1.26i o encaminhamento nasce ligado, então esses dois achados só aparecem quando o
+operador gravou 0 (`system.tuning.set`) ou quando o kernel recusou o padrão (um `/proc/sys` só de
+leitura, num container: o log do roteador diz).
 
 Quando o parâmetro já tem o valor sugerido (ou mais), o achado fica como nota, sem botão. Os
 contadores não zeram, e o diagnóstico por taxa é o G1.26e.
@@ -139,6 +147,93 @@ contadores não zeram, e o diagnóstico por taxa é o G1.26e.
   - quantos parâmetros diferem do perfil;
   - "Show differences" (modal com o motivo de cada um) e "Apply with Safe Mode".
 - **Perfis**: os quatro lado a lado, com o atual; em negrito o que muda.
+
+## Encaminhamento ligado por padrão (G1.26i)
+
+Um CoreRouter recém-instalado, e a ISO live, **roteiam sem configuração nenhuma**. O Linux sobe
+como host (`net.ipv4.ip_forward = 0`, `net.ipv6.conf.all.forwarding = 0`; RFC 1122 §3.1 manda a
+função de gateway de um host nascer desligada). Antes da G1.26i só aplicar um perfil ligava o
+encaminhamento, e a janela Tuning de uma instalação nova abria com o achado crítico "o
+encaminhamento IPv4 está desligado".
+
+- **Onde mora**: `corerouter_model::tuning::DEFAULTS` (`ip_forward = 1` e
+  `ipv6.conf.all.forwarding = 1`). O `Tuning::effective_sysctl` é o padrão com a config por cima.
+- **Quem aplica**: o HAL do Linux, em todo `apply` (o primeiro é o da partida do daemon), antes
+  dos outros parâmetros (`Sysctl::keep_defaults`, `crates/hal-linux/src/tuning.rs`). Não há nada
+  no init nem na imagem (`sysctl.conf`): o daemon rodando numa máquina qualquer se comporta igual.
+- **Melhor esforço**: um kernel sem IPv6 ou um `/proc/sys` só de leitura (container) gera uma
+  linha de aviso no log, uma vez, e nunca recusa um commit. O que o operador define continua tudo
+  ou nada.
+- **O 0 do operador vale**, por família: `system.tuning.set name=net.ipv4.ip_forward value=0`
+  desliga o IPv4 e deixa o IPv6; o achado crítico aparece com o botão que religa. `unset` volta ao
+  padrão do CoreRouter (1), não ao 0 do kernel.
+- **Config já gravada**: o formato não mudou. Uma config sem `system.tuning` passa a rotear; uma
+  que tem `ip_forward: 1` (um perfil aplicado antes) ou `0` continua valendo como está.
+- **Na janela**: a coluna Configurado mostra `1 (on)` com o selo `router default` em vez de "–";
+  o ⓘ dos dois parâmetros explica. No comando, `system.tuning.parameter.print` traz
+  `router_default`.
+- **Algo desligou por fora** (um `echo 0`, outro programa): o próximo `apply` religa.
+
+### O que o kernel faz ao ligar (lido no fonte do 6.18.59 da imagem)
+
+| Efeito | Onde | O que o CoreRouter faz |
+|---|---|---|
+| IPv4: `conf/all/accept_redirects = 0`, `conf/default/forwarding = 1`, `forwarding` de cada interface, LRO desligado em todas as portas | `inet_forward_change`, `net/ipv4/devinet.c:2423` | Grava o `ip_forward` antes de qualquer outro parâmetro. Um roteador não obedece a redirects (RFC 1812 §4.3.3.2) e continua enviando (`send_redirects = 1`, RFC 1812 §5.2.7.2; o RouterOS também) |
+| IPv4: `rp_filter` | não muda (fica 0, o padrão do kernel) | Nada: a RFC 1812 §5.3.8 manda a validação de origem nascer desligada; os perfis a ligam em modo solto |
+| IPv6: `default` e cada interface passam a `forwarding = 1`; entram nos grupos all-routers (`ff02::2`) e anycast | `addrconf_fixup_forwarding` e `dev_forward_change`, `net/ipv6/addrconf.c:873` e `:806` | Nada: é o que um roteador faz (RFC 4861 §6.2) |
+| IPv6: **apaga as rotas aprendidas por RA** de toda interface cujo `accept_ra` não é 2 | `rt6_purge_dflt_routers`, `net/ipv6/route.c:4516`, chamado em `addrconf.c:914` | **Acerta o `accept_ra` das interfaces que já existem antes de ligar o encaminhamento** (`LinuxHal::apply_links`): a WAN que já tinha a rota padrão por RA não a perde |
+| IPv6: RA ignorado e nenhum Router Solicitation enviado, a não ser com `accept_ra = 2` | `ipv6_accept_ra`, `include/net/ipv6.h:531`; `ndisc.c:1276`; RS só no fim do DAD, `addrconf.c:4351` | O `accept_ra = 2` já era posto onde o IPv6 › Settings manda aceitar (G4.7b: por padrão, onde roda um cliente DHCPv6). **Novo: ao pôr 2 numa porta já no ar, o CoreRouter envia ele mesmo um Router Solicitation** (RFC 4861 §4.1 e §6.3.7, `crates/hal-linux/src/ra.rs`), senão a rota padrão só viria no próximo RA periódico, até 600 s (`MaxRtrAdvInterval`, RFC 4861 §6.2.1) |
+| IPv6: redirects ignorados | `rt6_do_redirect`, `net/ipv6/route.c:4272` | Nada (RFC 4861 §8.2: um roteador não muda a tabela por um redirect) |
+
+Como a WAN continua com SLAAC e rota padrão por RA: uma WAN com cliente DHCPv6 fica com
+`accept_ra = 2` (RFC 7084 W-1 e W-3: a WAN age como host). Sem cliente DHCPv6, o padrão `auto`
+não aceita RA em lugar nenhum, como o RouterOS (`accept-router-advertisements =
+yes-if-forwarding-disabled` com `forward=yes`); `ipv6.settings.set
+accept_router_advertisements=yes` aceita.
+
+### ISO live
+
+A live roteia como o disco instalado (o padrão está no HAL, não na config). Ela também passou a
+aceitar `system.tuning.set`, `system.tuning.unset` e `system.tuning.profile.apply` (os parâmetros
+de kernel, em tempo de execução; nada persiste, a live não tem disco), mais `config.safe-mode.*`,
+que só desfaz. Continuam recusados na live: os ajustes de porta (anéis e filas piscam o link por
+onde a instalação é feita), os de CPU (um watchdog de hardware reiniciaria a live) e os de boot
+(não há próximo boot).
+
+### "Balanced: N parâmetros diferem" numa instalação nova
+
+Numa máquina em que ninguém configurou nada, o Resumo passa a dizer "Balanced: nada foi
+configurado ainda, valem os valores do próprio kernel. N parâmetros mudam ao aplicar este perfil",
+em vez de "N parâmetros diferem deste perfil". Com algo configurado volta a contagem de
+diferenças.
+
+Nascer com o perfil Balanced aplicado ficou para a G1.26j, e não é só mudar o padrão:
+
+- os valores do perfil são **calculados da máquina** (RAM, soma das portas). Gravados na config
+  na primeira partida, ficariam congelados: a config levada para outra máquina, ou a mesma
+  máquina com mais RAM, teria valores errados;
+- a aplicação de hoje é tudo ou nada, e parte dos parâmetros não existe em todo lugar (o
+  conntrack só com o módulo carregado, os `netdev_*` e `gc_thresh` só no namespace inicial). Um
+  padrão que recusa a config no boot é pior que um valor do kernel;
+- RouterOS, VyOS, OpenWrt e OPNsense trazem padrões de roteador, mas como base **do sistema**,
+  não como config do operador. O equivalente aqui é o daemon seguir um perfil (calculado em cada
+  partida, melhor esforço, com a config do operador por cima), o que muda modelo, engine, HAL e
+  janela.
+
+### Testes
+
+- modelo e engine: o padrão, o 0 respeitado, config antiga, o `unset`, o achado
+  (`a_router_forwards_unless_the_config_says_no`,
+  `a_router_forwards_by_default_and_an_explicit_off_is_kept`,
+  `a_config_from_before_the_default_loads_the_same`);
+- `crates/hal-linux/tests/netns_tuning.rs`, no kernel, num namespace sem root:
+  - `a_router_forwards_by_default_and_the_config_can_turn_it_off`;
+  - `the_wan_keeps_its_ra_route_when_forwarding_turns_on` (mostra também o kernel sozinho
+    apagando a rota);
+  - `an_interface_that_starts_accepting_asks_for_an_ra` (o RS com a opção de endereço de enlace);
+- `apps/corerouter-daemon/tests/netns_dhcp6.rs`: o daemon com o encaminhamento ligado recebe
+  endereço, prefixo e a rota padrão por RA;
+- a imagem no QEMU: `cargo xtask os forward-test` (três VMs, `a ── r ── b`, mais a ISO live).
 
 ## Interfaces (G1.26b)
 
@@ -439,7 +534,12 @@ traz o que for dele, numa seção "Medido" quando há número):
 - **`fq_codel` numa porta virtual custa 7 %** (1,82 para 1,70 Mpps). O perfil mantém `noqueue` em
   porta virtual e só põe `fq_codel` em placa de fila única; com várias filas, `mq`.
 - **Mudar `ip_forward` reinicia outros parâmetros** (`ip-sysctl.rst`). O CoreRouter sempre o grava
-  primeiro, senão um valor gravado antes podia voltar ao padrão.
+  primeiro, senão um valor gravado antes podia voltar ao padrão. Lido no fonte do 6.18.59
+  (G1.26i): hoje o kernel só mexe no `accept_redirects` do `all` e no `forwarding` do `default` e
+  de cada interface; o `rp_filter` não muda.
+- **Ligar o encaminhamento IPv6 apaga as rotas de RA** das interfaces que não estão com
+  `accept_ra = 2` (G1.26i). O CoreRouter acerta o `accept_ra` antes de ligar e pede um RA ao
+  ligar o aceite numa porta já no ar (seção "Encaminhamento ligado por padrão").
 - **Num namespace (container, teste)**:
   - `netdev_budget`, `netdev_max_backlog` e os `gc_thresh` não existem;
   - `rmem_max`, `kernel.panic`, `vm.min_free_kbytes` e `nf_conntrack_max` são só leitura;

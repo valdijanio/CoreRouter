@@ -226,6 +226,12 @@ pub struct Sensor {
     /// `critical` trip point). Nonsense values are left out.
     pub max: Option<f64>,
     pub crit: Option<f64>,
+    /// G1.6zf: read by the motherboard's Super-I/O chip (`nct6798`, `it8728`,
+    /// fans and voltages too). The chip has more inputs than a board wires:
+    /// a temperature pin left open reads anything (88 °C, 127 °C), and its
+    /// limits are the firmware's alarm settings, not the hardware's. Shown,
+    /// but never the router's temperature while another sensor has one.
+    pub board: bool,
 }
 
 /// One interface's counters (`/proc/net/dev`) and link.
@@ -614,6 +620,7 @@ impl ResourceSampler for LabSampler {
                     value: temp,
                     max: Some(90.0),
                     crit: Some(100.0),
+                    board: false,
                 },
                 Sensor {
                     chip: "nvme".into(),
@@ -622,6 +629,7 @@ impl ResourceSampler for LabSampler {
                     value: 38.0 + wave(t, 1800, 40) as f64 / 10.0,
                     max: Some(80.0),
                     crit: Some(85.0),
+                    board: false,
                 },
                 Sensor {
                     chip: "board".into(),
@@ -630,6 +638,7 @@ impl ResourceSampler for LabSampler {
                     value: (2200 + wave(t, 1200, 600)) as f64,
                     max: None,
                     crit: None,
+                    board: true,
                 },
                 Sensor {
                     chip: "board".into(),
@@ -638,6 +647,7 @@ impl ResourceSampler for LabSampler {
                     value: 12.06,
                     max: None,
                     crit: None,
+                    board: true,
                 },
             ],
             net: self.net.clone(),

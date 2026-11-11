@@ -12,7 +12,7 @@
 //! Paths hang off a [`Root`], so the parsing and the all-or-nothing writes
 //! are tested on a scratch directory.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -20,10 +20,10 @@ use corerouter_hal::HalError;
 use corerouter_hal::tuning::{
     self, KernelStats, MAX_CPUS, NumaNode, Sysctls, SystemInfo, parse_cpu_list,
 };
-use corerouter_model::tuning::{param, proc_path};
+use corerouter_model::tuning::{DEFAULTS, IP_FORWARD, IPV6_FORWARDING, param, proc_path};
 
 /// Written before every other parameter (see [`Sysctl::transition`]).
-const FORWARDING: [&str; 2] = ["net.ipv4.ip_forward", "net.ipv6.conf.all.forwarding"];
+const FORWARDING: [&str; 2] = [IP_FORWARD, IPV6_FORWARDING];
 
 /// Largest `/proc` or `/sys` file read (softnet_stat of 4096 CPUs is
 /// ~600 KiB; anything bigger is not what we think it is).
@@ -222,6 +222,8 @@ fn mem_total(text: &str, key: &str) -> Option<u64> {
 pub struct Sysctl {
     pub root: Root,
     orig: BTreeMap<String, i64>,
+    /// Defaults this kernel refused, already logged (once each).
+    refused: BTreeSet<&'static str>,
 }
 
 impl Sysctl {
@@ -229,16 +231,75 @@ impl Sysctl {
         Self {
             root,
             orig: BTreeMap::new(),
+            refused: BTreeSet::new(),
         }
     }
 
-    /// Bring the kernel from `from` to `to`, all or nothing: on a failure
-    /// the parameters written so far go back.
+    /// Whether [`Self::transition`] to `to` is about to turn IPv6
+    /// forwarding on. The caller settles `accept_ra` first: the kernel
+    /// drops the RA routes of every interface whose `accept_ra` is not 2
+    /// the moment forwarding goes on (`addrconf_fixup_forwarding` →
+    /// `rt6_purge_dflt_routers`, net/ipv6/addrconf.c and route.c).
+    pub fn turns_ipv6_forwarding_on(&self, to: &BTreeMap<String, i64>) -> bool {
+        to.get(IPV6_FORWARDING)
+            .copied()
+            .or(corerouter_model::tuning::default_of(IPV6_FORWARDING))
+            == Some(1)
+            && self.root.sysctl(IPV6_FORWARDING) == Some(0)
+    }
+
+    /// CoreRouter's own defaults (G1.26i: a router forwards) for what `to`
+    /// leaves unset. Best effort, unlike what the operator set: a kernel
+    /// without the parameter (no IPv6) or a read-only `/proc/sys` (a
+    /// container) is logged once and never fails a commit nobody asked
+    /// this of. Checked on every apply: two small files, and a default
+    /// something else turned off comes back.
+    fn keep_defaults(&mut self, to: &BTreeMap<String, i64>) {
+        for (name, value) in DEFAULTS {
+            if to.contains_key(*name) {
+                continue;
+            }
+            // Not the operator's any more: nothing of theirs to put back.
+            self.orig.remove(*name);
+            // No such file: this kernel or namespace has no such thing.
+            let Some(now) = self.root.sysctl(name) else {
+                continue;
+            };
+            if now == *value {
+                self.refused.remove(name);
+                continue;
+            }
+            match self.root.write_sysctl(name, *value) {
+                Ok(()) => {
+                    self.refused.remove(name);
+                    log::info!(
+                        "tuning: {name} = {value} (CoreRouter's default: a router forwards)"
+                    );
+                }
+                Err(e) => {
+                    if self.refused.insert(name) {
+                        log::warn!("tuning: default not applied: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Bring the kernel from `from` to `to` (each a config's
+    /// `system.tuning.sysctl`), all or nothing: on a failure the
+    /// parameters written so far go back. The [`DEFAULTS`] fill what `to`
+    /// does not set ([`Self::keep_defaults`]).
     pub fn transition(
         &mut self,
         from: &BTreeMap<String, i64>,
         to: &BTreeMap<String, i64>,
     ) -> Result<(), HalError> {
+        // ip-sysctl.rst: changing `ip_forward` resets configuration
+        // parameters (`inet_forward_change`, net/ipv4/devinet.c: today
+        // `conf/all/accept_redirects`, `conf/default/forwarding` and each
+        // interface's), so forwarding goes first, defaults included, and
+        // the rest is written over it.
+        self.keep_defaults(to);
         let mut done: Vec<(String, i64)> = Vec::new();
         let mut wanted: Vec<(&String, Option<i64>)> = to
             .iter()
@@ -247,12 +308,10 @@ impl Sysctl {
             .collect();
         wanted.extend(
             from.keys()
-                .filter(|n| !to.contains_key(*n))
+                // Taken out with a default of ours: `keep_defaults` wrote it.
+                .filter(|n| !to.contains_key(*n) && !DEFAULTS.iter().any(|(d, _)| d == n))
                 .map(|n| (n, None)),
         );
-        // ip-sysctl.rst: changing `ip_forward` resets the configuration
-        // parameters to the host or router defaults, so forwarding goes
-        // first and the rest is written over it.
         wanted.sort_by_key(|(n, _)| !FORWARDING.contains(&n.as_str()));
         for (name, want) in wanted {
             let now = self.root.sysctl(name);
@@ -414,6 +473,60 @@ mod tests {
         let mut evil = BTreeMap::new();
         evil.insert("kernel.core_pattern".to_owned(), 1);
         assert!(s.transition(&none, &evil).is_err());
+    }
+
+    /// G1.26i: forwarding is kept on while the config does not set it,
+    /// best effort (a kernel without IPv6, a read-only `/proc/sys`), and
+    /// the operator's 0 wins.
+    #[test]
+    fn keeps_the_forwarding_defaults_best_effort() {
+        let (_s, r) = scratch("defaults");
+        let v4 = r.proc.join("sys/net/ipv4/ip_forward");
+        put(&v4, "0\n");
+        let mut s = Sysctl::new(r.clone());
+        let none = BTreeMap::new();
+        // No IPv6 in this kernel: skipped, not an error.
+        assert!(!s.turns_ipv6_forwarding_on(&none));
+        s.transition(&none, &none).unwrap();
+        assert_eq!(r.sysctl(IP_FORWARD), Some(1));
+        assert_eq!(r.sysctl(IPV6_FORWARDING), None);
+
+        let v6 = r.proc.join("sys/net/ipv6/conf/all/forwarding");
+        put(&v6, "0\n");
+        assert!(s.turns_ipv6_forwarding_on(&none));
+        let mut off = BTreeMap::new();
+        off.insert(IPV6_FORWARDING.to_owned(), 0);
+        assert!(!s.turns_ipv6_forwarding_on(&off), "the operator's 0");
+        s.transition(&none, &off).unwrap();
+        assert_eq!(r.sysctl(IPV6_FORWARDING), Some(0));
+        // Taken out: the default, not the 0 it had.
+        s.transition(&off, &none).unwrap();
+        assert_eq!(r.sysctl(IPV6_FORWARDING), Some(1));
+        assert!(!s.turns_ipv6_forwarding_on(&none), "already on");
+        assert!(s.orig.is_empty());
+
+        // Something else turned it off: the next apply turns it on again.
+        put(&v4, "0\n");
+        s.transition(&none, &none).unwrap();
+        assert_eq!(r.sysctl(IP_FORWARD), Some(1));
+
+        // A read-only /proc/sys (a container): logged once, the commit and
+        // the operator's own parameters still go through.
+        use std::os::unix::fs::PermissionsExt;
+        put(&v4, "0\n");
+        std::fs::set_permissions(&v4, std::fs::Permissions::from_mode(0o444)).unwrap();
+        put(&r.proc.join("sys/net/core/somaxconn"), "4096\n");
+        let mut to = BTreeMap::new();
+        to.insert("net.core.somaxconn".to_owned(), 8192);
+        // root (a container build) writes through the mode: nothing to see.
+        if std::fs::write(&v4, "0\n").is_err() {
+            s.transition(&none, &to).unwrap();
+            assert_eq!(r.sysctl(IP_FORWARD), Some(0));
+            assert_eq!(r.sysctl("net.core.somaxconn"), Some(8192));
+            assert!(s.refused.contains(IP_FORWARD));
+            s.transition(&to, &to).unwrap();
+            assert_eq!(s.refused.len(), 1, "said once");
+        }
     }
 
     #[test]
