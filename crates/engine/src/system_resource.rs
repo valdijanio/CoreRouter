@@ -13,7 +13,12 @@
 //!   a sampler from the `Hal`, when the last reading is older than a second.
 //!
 //! Readings from two samplers are never subtracted from each other: a new
-//! source starts the rates over.
+//! source starts the rates over. So while the service is alive (a reading
+//! of the last [`SERVICE_ALIVE_SECS`]) the commands serve its readings and
+//! never read the machine themselves (G1.6zq: a query between two slow
+//! readings threw the pair away, and with someone asking every few seconds
+//! the rates never came); a process list read on the spot fills only the
+//! processes.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -33,6 +38,10 @@ pub const WANTED_SECS: u64 = 15;
 /// A process list older than this (ms of uptime before the last reading)
 /// is not served while the service catches up (G1.6q).
 const PROCS_STALE_MS: u64 = 2_000;
+/// The service reads every 5 s when nobody looks: a reading this recent
+/// (two of its periods and a margin) means it is alive, and the commands
+/// take its readings instead of reading themselves.
+pub const SERVICE_ALIVE_SECS: u64 = 12;
 /// A scrape of `system.metrics` takes the service's reading up to this old
 /// (s; it reads every 5 s) instead of reading under the lock (G1.6qd).
 pub const METRICS_STALE_SECS: u64 = 15;
@@ -74,6 +83,8 @@ pub struct ResourceMonitor {
     /// The two last process lists: (uptime ms, list).
     procs_prev: Option<(u64, BTreeMap<u32, u64>)>,
     pub procs_last: Option<(u64, Vec<Process>)>,
+    /// Who read `procs_last` (two samplers' lists are not subtracted).
+    procs_source: Option<Source>,
     /// Engine clock (s) until which someone wants fast readings, and
     /// processes.
     wanted_until: u64,
@@ -289,11 +300,7 @@ impl ResourceMonitor {
         self.source = Some(source);
         self.taken_at = now;
         if let Some(list) = &sample.processes {
-            self.procs_prev = self
-                .procs_last
-                .take()
-                .map(|(t, l)| (t, l.iter().map(|p| (p.pid, p.cpu_ticks)).collect()));
-            self.procs_last = Some((sample.uptime_ms, list.clone()));
+            self.take_processes(sample.uptime_ms, list.clone(), source);
         }
         self.prev = self.last.take();
         self.last = Some(sample);
@@ -313,6 +320,19 @@ impl ResourceMonitor {
             }
             self.history.push_back(point);
         }
+    }
+
+    /// A new process list: the previous one becomes the base of the CPU %
+    /// when the same sampler read both.
+    fn take_processes(&mut self, uptime_ms: u64, list: Vec<Process>, source: Source) {
+        let same = self.procs_source == Some(source);
+        self.procs_prev = self
+            .procs_last
+            .take()
+            .filter(|_| same)
+            .map(|(t, l)| (t, l.iter().map(|p| (p.pid, p.cpu_ticks)).collect()));
+        self.procs_last = Some((uptime_ms, list));
+        self.procs_source = Some(source);
     }
 
     /// The history at an even pace, newest last (`n` points at most).
@@ -362,7 +382,7 @@ impl Session {
         self.ext::<ResourceMonitor>().filter(|m| m.last.is_some())
     }
 
-    fn clock_secs(&self) -> Option<u64> {
+    pub(crate) fn clock_secs(&self) -> Option<u64> {
         self.hal().monotonic_secs().or_else(|| self.now())
     }
 
@@ -422,7 +442,13 @@ impl Session {
                     .as_ref()
                     .is_some_and(|l| l.uptime_ms.saturating_sub(*t) <= PROCS_STALE_MS)
             });
-        if m.source == Some(Source::Service) && age.is_some_and(|a| a <= 2) && procs_recent {
+        // The service is alive: its reading stands (the next one is at most
+        // 5 s away, 1 s once someone looks); reading here would switch the
+        // source and throw its pair away (G1.6zq).
+        let alive = m.source == Some(Source::Service)
+            && m.last.is_some()
+            && age.is_some_and(|a| a <= SERVICE_ALIVE_SECS);
+        if alive && procs_recent {
             return Ok(());
         }
         let Some(sampler) = m.sampler.as_mut() else {
@@ -432,6 +458,15 @@ impl Session {
             processes,
             now_ms: now.map(|n| n.saturating_mul(1000)),
         };
+        if alive {
+            // Only the process list was missing (a one-shot CLI/MCP call):
+            // it is read here and kept apart from the service's readings.
+            let sample = sampler.sample(want);
+            if let Some(list) = sample.processes {
+                m.take_processes(sample.uptime_ms, list, Source::Inline);
+            }
+            return Ok(());
+        }
         let first = m.last.is_none() || m.source != Some(Source::Inline);
         let sample = sampler.sample(want);
         m.push(sample, Source::Inline, now);

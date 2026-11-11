@@ -37,6 +37,13 @@ CONFIG_VFAT_FS=y
 CONFIG_TMPFS=y
 CONFIG_TMPFS_POSIX_ACL=y
 CONFIG_CGROUPS=y
+# G1.6zq: pressure stall information (/proc/pressure/{cpu,memory,io}).
+# System > Resources, the health check's memory pressure and system.metrics
+# read it; without it they were always empty. Kconfig: the cost is a few
+# instructions on the scheduler's wakeup and sleep paths, "too low to affect
+# common scheduling-intense workloads", visible only in hackbench; psi=0 on
+# the kernel command line turns it off.
+CONFIG_PSI=y
 CONFIG_SERIAL_8250=y
 CONFIG_SERIAL_8250_CONSOLE=y
 # G1.6zc: the screen console after a UEFI boot. UEFI leaves no VGA text mode,

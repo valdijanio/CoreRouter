@@ -14,11 +14,23 @@ use serde_json::json;
 
 use crate::Session;
 
+/// Seconds a port may be gone before the log warns (G1.6zq). A USB
+/// adapter that switches its configuration at boot (the r8152's
+/// `r8152-cfgselector`) drops off for 2–4 s (**medido** on a notebook:
+/// two warnings and two "port is back" in 10 s); back within the grace, it
+/// is one info line ("replugged"). `interface.list` and the health check
+/// show it invalid at once all the same.
+pub const WARN_AFTER_SECS: u64 = 10;
+
 /// What the log already said, so each change is logged once.
 #[derive(Debug, Default)]
 struct Absence {
     /// Ports last seen absent.
     gone: BTreeSet<IfName>,
+    /// Since when (engine clock, s) each of `gone` is gone; `None`: no clock.
+    since: BTreeMap<IfName, Option<u64>>,
+    /// Ports whose absence was logged as a warning.
+    warned: BTreeSet<IfName>,
     /// The last failure to put a returned port's configuration back.
     error: Option<String>,
 }
@@ -120,16 +132,46 @@ impl Session {
         if absent.is_empty() && empty {
             return;
         }
+        let now = self.clock_secs();
         let present: BTreeSet<&IfName> = live.iter().map(|l| &l.name).collect();
         let gone: BTreeSet<IfName> = absent.iter().filter(|n| !present.contains(n)).cloned().collect();
         let back: Vec<IfName> = absent.iter().filter(|n| present.contains(n)).cloned().collect();
         let (went, returned, replugged) = match self.ext_mut::<Absence>() {
             Some(a) => {
-                let went: Vec<IfName> = gone.difference(&a.gone).cloned().collect();
+                for n in gone.difference(&a.gone) {
+                    a.since.insert(n.clone(), now);
+                }
                 let returned: Vec<IfName> = a.gone.difference(&gone).cloned().collect();
+                // G1.6zq: warn once a port has been gone for the grace
+                // (at once without a clock).
+                let went: Vec<IfName> = gone
+                    .iter()
+                    .filter(|n| !a.warned.contains(*n))
+                    .filter(|n| match (now, a.since.get(*n).copied().flatten()) {
+                        (Some(now), Some(at)) => now.saturating_sub(at) >= WARN_AFTER_SECS,
+                        _ => true,
+                    })
+                    .cloned()
+                    .collect();
+                a.warned.extend(went.iter().cloned());
                 // G1.3d: back without ever being seen gone: replugged
-                // between two polls (the backend saw a new link).
-                let replugged: BTreeSet<IfName> = back.iter().filter(|n| !a.gone.contains(*n)).cloned().collect();
+                // between two polls (the backend saw a new link). G1.6zq:
+                // or back within the grace, never warned about.
+                let replugged: BTreeMap<IfName, Option<u64>> = back
+                    .iter()
+                    .filter(|n| !a.warned.contains(*n))
+                    .map(|n| {
+                        let gone_for = match (now, a.since.get(n).copied().flatten()) {
+                            (Some(now), Some(at)) if a.gone.contains(n) => Some(now.saturating_sub(at)),
+                            _ => None,
+                        };
+                        (n.clone(), gone_for)
+                    })
+                    .collect();
+                for n in &returned {
+                    a.since.remove(n);
+                    a.warned.remove(n);
+                }
                 a.gone = gone;
                 (went, returned, replugged)
             }
@@ -165,8 +207,12 @@ impl Session {
                     a.error = None;
                 }
                 for n in back {
-                    let msg = if replugged.contains(&n) {
-                        format!("{n}: port was replugged (gone and back within a second); its configuration was applied again")
+                    let msg = if let Some(gone_for) = replugged.get(&n) {
+                        let within = match gone_for {
+                            Some(s) if *s > 0 => format!("gone {s} s"),
+                            _ => "gone and back within a second".to_owned(),
+                        };
+                        format!("{n}: port was replugged ({within}); its configuration was applied again")
                     } else {
                         format!("{n}: port is back; its configuration was applied")
                     };
@@ -250,8 +296,9 @@ mod tests {
     #[test]
     fn a_port_unplugged_is_invalid_and_its_configuration_comes_back() {
         use corerouter_hal::virt::{LatePort, VirtualHal};
-        // ether9 is plugged at poll 1, unplugged for polls 12..20.
-        let hal = VirtualHal::new(4).with_late_port(LatePort { name: n("ether9"), appears: 1, absent: Some(12..20) });
+        // ether9 is plugged at poll 1, unplugged for polls 12..30 (longer
+        // than the grace of the warning, G1.6zq).
+        let hal = VirtualHal::new(4).with_late_port(LatePort { name: n("ether9"), appears: 1, absent: Some(12..30) });
         let mut s = Session::new(Box::new(hal));
         for t in 0..6 {
             s.tick(1_000 + t);
@@ -275,8 +322,8 @@ mod tests {
         assert!(health.contains("interface.absent"), "{health}");
         // The rest of the config still commits.
         s.execute("ip.address.add", &json!({"address": "198.51.100.1/24", "interface": "ether1"})).unwrap();
-        // Back after poll 20.
-        while t < 24 {
+        // Back after poll 30.
+        while t < 34 {
             s.tick(1_000 + t);
             t += 1;
         }
@@ -286,6 +333,29 @@ mod tests {
         assert!(log.contains("not on this machine"), "{log}");
         assert!(log.contains("port is back; its configuration was applied"), "{log}");
         assert!(s.hal().absent_ports().is_empty(), "the reapply cleared it");
+    }
+
+    /// G1.6zq: the r8152 switching its USB configuration at boot dropped
+    /// ether2 twice for 2–4 s, and each time the log warned "not on this
+    /// machine" and then "port is back". Back within the grace: one info
+    /// line, no warning.
+    #[test]
+    fn a_port_gone_for_a_few_seconds_is_not_a_warning() {
+        use corerouter_hal::virt::{LatePort, VirtualHal};
+        let hal = VirtualHal::new(4).with_late_port(LatePort { name: n("ether9"), appears: 1, absent: Some(12..16) });
+        let mut s = Session::new(Box::new(hal));
+        for t in 0..14 {
+            s.tick(1_000 + t);
+        }
+        assert_eq!(row(&mut s, "ether9")["invalid"], true, "shown invalid at once");
+        for t in 14..24 {
+            s.tick(1_000 + t);
+        }
+        let log = s.execute("log.print", &json!({"find": "ether9"})).unwrap().to_string();
+        assert!(!log.contains("not on this machine"), "{log}");
+        assert!(!log.contains("\"warning\""), "{log}");
+        assert!(log.contains("ether9: port was replugged (gone "), "{log}");
+        assert_eq!(row(&mut s, "ether9")["invalid"], false);
     }
 
     #[test]

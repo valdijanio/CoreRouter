@@ -106,6 +106,46 @@ mod tests {
         assert!(text.contains("Saúde: NIC errors"), "{text}");
     }
 
+    /// G1.6zq: on the notebook nobody looked for two hours and the checks
+    /// that need rates (`nic.errors`, `rss`) stayed `unknown`, the CPU of
+    /// the history null: each query between two slow readings read the
+    /// machine itself, and the switch of source threw the pair away (twice:
+    /// there and on the service's next reading).
+    #[test]
+    fn slow_readings_keep_their_rates_when_someone_asks_between_them() {
+        let s = shared(Session::virtual_lab());
+        let mut sampler = lock(&s).resource_sampler().unwrap();
+        let t0 = 1_800_000_000u64;
+        let nic = |c: &serde_json::Value| {
+            c["checks"].as_array().unwrap().iter().find(|c| c["key"] == "nic.errors").unwrap()["severity"].clone()
+        };
+        for i in 0..6u64 {
+            // The service, every 5 s: nobody looks.
+            lock(&s).tick(t0 + i * 5);
+            let sample = sampler.sample(Want { processes: false, now_ms: Some(i * 5000) });
+            let mut g = lock(&s);
+            g.resource_ingest(sample);
+            g.health_alerts();
+            drop(g);
+            // 4 s later a client asks without looking (the top bar's chip,
+            // a CLI, a monitoring script).
+            lock(&s).tick(t0 + i * 5 + 4);
+            let c = lock(&s).execute("system.health.check", &json!({})).unwrap();
+            if i >= 1 {
+                assert_ne!(nic(&c), "unknown", "reading {i}: {c}");
+            }
+        }
+        // A one-shot process list in between does not cost the rates either.
+        lock(&s).execute("system.resource.process.print", &json!({})).unwrap();
+        let v = lock(&s).execute("system.resource.print", &json!({})).unwrap();
+        assert!(v["cpu_load"].as_f64().is_some(), "{v}");
+        let history = v["history"].as_array().unwrap();
+        assert!(history.len() >= 5, "{v}");
+        assert!(history.iter().skip(1).all(|p| !p["cpu"].is_null()), "{history:?}");
+        let net = lock(&s).execute("system.resource.network.print", &json!({})).unwrap();
+        assert!(net[0]["rx_bits_per_second"].as_f64().is_some(), "{net}");
+    }
+
     #[test]
     fn the_service_reads_fast_only_while_someone_looks() {
         let s = shared(Session::virtual_lab());

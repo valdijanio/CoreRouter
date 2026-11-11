@@ -131,6 +131,8 @@ const REQUIRED_KERNEL: &[&str] = &[
     "CONFIG_DRM_SIMPLEDRM",
     "CONFIG_DRM_FBDEV_EMULATION",
     "CONFIG_FRAMEBUFFER_CONSOLE",
+    // G1.6zq: /proc/pressure (Resources, the memory pressure check).
+    "CONFIG_PSI",
 ];
 /// G1.6j: drivers that must be modules. `ice` asks for its firmware while
 /// probing, which a built-in driver does before `/` is mounted; `e100` and
@@ -1369,6 +1371,8 @@ pub(crate) fn build_with(
         return Err(format!("the kernel config lost '{lost}'"));
     }
     let libs = check_needed(&d.out.join("target"))?;
+    let pci = check_pci_names(&d.out.join("target"))?;
+    eprintln!("   pci.ids: {pci} network cards named");
     let fw = firmware::verify(&d.os, &d.out.join("target"))?;
     eprintln!("   firmware: {fw} files, hashes and what the drivers declare checked");
     let images = d.out.join("images");
@@ -1468,6 +1472,50 @@ pub(crate) fn build_with(
         images.display()
     );
     Ok(())
+}
+
+/// G1.6zq: cards `/usr/share/hwdata/pci.ids` must name (vendor, device):
+/// the r8169 and rtw89 of the notebook audit, Intel's e1000e and igb, virtio.
+const PCI_NAMED: &[(&str, &str)] = &[
+    ("10ec", "8168"),
+    ("10ec", "b852"),
+    ("8086", "10d3"),
+    ("8086", "1533"),
+    ("1af4", "1041"),
+];
+/// The cut database is ~66 KB; the whole one (1.4 MB) means the cut failed.
+const PCI_IDS_MAX: usize = 256 * 1024;
+
+/// The image's `pci.ids` (post-build.sh cuts it to the network cards): it
+/// names [`PCI_NAMED`] and is small. Returns the device lines.
+fn check_pci_names(target: &Path) -> Result<usize, String> {
+    let path = target.join("usr/share/hwdata/pci.ids");
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    pci_names_ok(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn pci_names_ok(text: &str) -> Result<usize, String> {
+    if text.len() > PCI_IDS_MAX {
+        return Err(format!(
+            "{} bytes: not cut to the network cards (post-build.sh)",
+            text.len()
+        ));
+    }
+    if !text.contains("GNU General Public License") {
+        return Err("the license lines of the header were lost".into());
+    }
+    for (v, d) in PCI_NAMED {
+        let block = text
+            .split('\n')
+            .skip_while(|l| !l.starts_with(&format!("{v}  ")))
+            .skip(1)
+            .take_while(|l| l.starts_with('\t'))
+            .any(|l| l.starts_with(&format!("\t{d}  ")));
+        if !block {
+            return Err(format!("no name for {v}:{d}"));
+        }
+    }
+    Ok(text.lines().filter(|l| l.starts_with('\t')).count())
 }
 
 /// Every ELF file of the image finds each library it names (`DT_NEEDED`)
@@ -2488,6 +2536,24 @@ fn free_port() -> Result<u16, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_image_pci_ids_must_be_cut_and_name_the_cards() {
+        let head = "#\tThis file can be distributed under either the GNU General Public License\n";
+        let good = format!(
+            "{head}10ec  Realtek\n\t8168  RTL8111\n\tb852  RTL8852BE\n8086  Intel\n\t10d3  82574L\n\t1533  I210\n1af4  Red Hat\n\t1041  Virtio 1.0 network device\n"
+        );
+        assert_eq!(pci_names_ok(&good), Ok(5));
+        let lost = good.replace("\tb852  RTL8852BE\n", "");
+        assert!(pci_names_ok(&lost).unwrap_err().contains("10ec:b852"));
+        // A device of another vendor's block does not count.
+        let moved = good
+            .replace("\t8168  RTL8111\n", "")
+            .replace("\t1533  I210\n", "\t1533  I210\n\t8168  x\n");
+        assert!(pci_names_ok(&moved).unwrap_err().contains("10ec:8168"));
+        let whole = format!("{good}{}", "#\n".repeat(PCI_IDS_MAX));
+        assert!(pci_names_ok(&whole).unwrap_err().contains("not cut"));
+    }
 
     /// The real `os/` tree passes the static checks: this is how
     /// `cargo xtask ci` validates the image configuration without
