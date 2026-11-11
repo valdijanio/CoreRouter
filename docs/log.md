@@ -10972,3 +10972,309 @@ continuação indentadas).
   VM: a corrida é coberta pelos três testes novos, que falham sem a correção com a mesma mensagem.
 
   Como testar: `cargo test -p corerouter-cli upload`.
+
+- 2026-11-11 — G1.30h: País do Wi-Fi onde o operador está (pedido do usuário depois do teste no notebook com a
+  RTL8852BE, 2026-11-11: config zerada, Enable no `wifi1` dava um erro com comando de terminal e a
+  janela não tinha onde definir o país):
+
+  - **Janela "Interface <wifi1>".** A aba General ganhou a linha Country (selo âmbar "no country"
+    e Set Country…, ou o país e Change…). Na aba Wi-Fi, o estado "no country" ficou âmbar (é um
+    ajuste, não um defeito), e sem país a linha Country sobe para logo abaixo do State, com o
+    botão.
+  - **Enable sem país pede o país.** O botão Enable da janela, o ✓ da lista Interfaces e o ✓ da
+    janela Wi-Fi abrem o diálogo de país (o mesmo da janela Wi-Fi, reaproveitado) com "Also enable
+    wifi1" marcado: um OK define o país e liga o rádio. A lista reage à recusa do motor; a janela
+    e a janela Wi-Fi já sabem que falta o país e não mandam nada antes.
+  - **OK recusado vira aviso da janela.** Desmarcar Disabled e dar OK sem país mostra, sob as
+    abas, um aviso âmbar com ⓘ e Set Country…, no lugar da linha vermelha com
+    `interface.wifi.country.set country=BR`. Outros problemas da mesma recusa continuam na linha
+    vermelha. O log do roteador guarda o texto do motor, com o comando, como registro.
+  - **Campo vazio não liga nada.** OK com o campo vazio com rádios para ligar pede as duas letras,
+    em vez de tentar ligar o rádio sem país.
+  - **Disabled acompanha.** A caixa Disabled da janela segue a interface quando ela muda por fora
+    (o diálogo de país, a lista), se o operador não a mexeu.
+  - **Scan… e Connect… na aba Wi-Fi.** Scan… varre e abre Interfaces › Wi-Fi na aba Networks deste
+    rádio; Connect… abre o modal do rádio (rede, senha). Cinzas, com o motivo, sem país ou com o
+    rádio desligado.
+  - Motor sem mudança: a UI reconhece a recusa por um trecho do `NO_COUNTRY` do model, e um teste
+    quebra se o texto mudar. Explicação ⓘ nova `iface_wifi.need_country` (pt/en) e "no country"
+    na explicação do State.
+
+  Como testar:
+
+  - `cargo test -p corerouter-ui --lib iface_wifi_country`
+  - Rodando: `corerouter-daemon --control 7981` (o `wifi1` do laboratório sem país), a GUI com
+    `--connect 127.0.0.1:7981`, duplo clique em `wifi1`, Enable, digitar BR, OK.
+
+  Conferido na GUI desta branch contra o daemon virtual (Xvfb, screenshots olhados): o aviso depois
+  do OK recusado, o diálogo sobre a janela com "Also enable wifi1" marcado, um OK com país BR e o
+  `wifi1` ligado (revisão 2 → 4, Disabled desmarcado sozinho), o OK vazio pedindo as letras,
+  Scan… abrindo a aba Networks com as 7 redes do laboratório, Connect… abrindo o modal do
+  `wifi1`, e o ✓ da lista abrindo o diálogo. Não conferido: a RTL8852BE do notebook (vai na
+  próxima imagem).
+
+- 2026-11-11 — G1.30i: Scan Wi-Fi, segunda parte, com o que apareceu no notebook de verdade (RTL8852BE, imagem dev.591).
+
+  - **Auto** (opção A do usuário): uma caixa na linha do `Rescan` de Interfaces › Wi-Fi › Networks,
+    com o intervalo de 10, 30 ou 60 s.
+    - Na Lista e nos Canais, refaz o scan sozinha. No Espectro, começa o spectral scan de novo
+      quando a duração acaba.
+    - Começa desligada e só roda com a aba desenhada. Fechar a janela, trocar de aba ou clicar em
+      Stop no espectro a desliga.
+    - Com o rádio conectado a uma rede, mostra o selo âmbar `leaves the channel` e o intervalo
+      mínimo vira 30 s: cada scan tira a estação do canal, e a latência sobe.
+    - Tem o ⓘ `interface.wifi.auto` em português e em inglês.
+  - **Rótulo cortado no gráfico de canais:** uma rede a −21 dBm, ou mais forte que os −20 dBm do
+    eixo, tinha o nome desenhado acima do topo, fora do plot. Agora, quando o nome não cabe acima,
+    vai para dentro do bloco, logo abaixo do topo. Um nome que cobriria outro desce uma linha, e
+    todos ficam dentro do plot (`wifi_scan::label_rect`).
+  - **Canal do snooper ao lado de uma estação ociosa:** o `interface.wifi.snooper.print` e os
+    eventos do `tool.task.poll` diziam canal 0 ou nulo.
+    - Causa: com a estação sem rede, o kernel não informa canal nem do monitor nem da estação. O
+      `ieee80211_cfg_get_channel` do mac80211 só responde para uma estação associada ou para um
+      rádio só com monitores, e a placa fica no último canal em que esteve: 2412 MHz no notebook.
+    - Agora o canal é o que os quadros dizem (radiotap), o mais ouvido a cada segundo. O tempo por
+      canal também passou a ser contado.
+    - O `snooper.start` continua respondendo `channel: null` nesse caso: o canal só se sabe quando
+      chegam quadros.
+
+  Como testar: abra Interfaces › Wi-Fi › Networks, marque **Auto** e veja o `Rescan` disparar sozinho
+  e o selo `leaves the channel` com o rádio conectado. No modo Spectrum, marque Auto, dê Start com
+  uma duração curta e veja o scan recomeçar sozinho. Para o canal, rode
+  `interface.wifi.snooper.start {interface: wifi1}` com o rádio ativo e sem SSID, e depois o
+  `snooper.print`.
+
+- 2026-11-11 — G1.30i: Interfaces › Wi-Fi › Networks em três visões, escolhidas na segunda linha da aba
+  (`crates/ui/src/wifi_scan.rs`; o motor calcula em `wifi_air.rs`, `wifi_spectrum.rs` e
+  `cmd/wifi_scan.rs`; detalhes e pesquisa em `docs/wifi.md`):
+
+  - **Lista:**
+    - Filtro por banda em selos com contagem e `Group by channel`.
+    - Largura e geração lidas dos elementos do beacon: HT, VHT, HE com a informação de 6 GHz e
+      EHT.
+    - Carga do BSS Load e o selo `yours` na rede em uso.
+    - Coluna **Air**: `same channel`, `overlaps ch …` e `shares airtime ×N`, pela regra da CCA
+      (−82 dBm de preâmbulo no primário, −62 dBm de energia; IEEE 802.11-2020 §17.3.10.6,
+      §19.3.19.5, §21.3.18.5).
+    - O canal menos ocupado de cada banda.
+  - **Canais:**
+    - Cada rede é uma curva da largura do canal, da altura do sinal.
+    - Embaixo, a ocupação medida pelo driver (nl80211 survey), com a medida parcial dita como
+      parcial.
+  - **Espectro:**
+    - Cascata, traços de tempo real, média e pico, uso por canal e as fontes (Wi-Fi, portadora,
+      micro-ondas, Bluetooth/saltos).
+    - Só em rádio com spectral scan (Qualcomm Atheros por debugfs). Nos outros fica desligado, e
+      a dica diz o motivo.
+
+  Comandos novos, todos de consulta:
+
+  - `interface.wifi.frequency-scan`;
+  - `interface.wifi.spectral-scan` (`duration` 1–600 s, `range` current, 2ghz ou 5ghz, `stop`);
+  - `interface.wifi.spectral-data` (`since`, `limit`; `limit=0` dá só o resumo).
+
+  O `interface.wifi.networks` ganhou os campos de canal, carga, sobreposição e disputa e o
+  `suggested`.
+
+  Correção de quebra: o `BSS <n>` pede só os campos usados. Antes, uma resposta acima de 4096 bytes
+  voltava vazia e cortava a lista de redes; agora, se vier vazia, a mesma entrada é pedida de novo
+  sem os elementos.
+
+  Como testar:
+
+  - `cargo run -p corerouter-daemon -- --control 7979`;
+  - `corerouter-cli --connect 127.0.0.1:7979 run interface.wifi.country.set '{"country":"BR"}'`;
+  - conectar o `wifi1` ao `CoreRouter-Lab` (senha `corerouter-lab`) e rodar `interface.wifi.scan`;
+  - abrir a GUI em Interfaces › Wi-Fi › Networks e passar por List, Channels e Spectrum (Start);
+  - ou pela CLI: `interface.wifi.spectral-scan '{"name":"wifi1","range":"2ghz"}'` e depois
+    `interface.wifi.spectral-data`.
+
+  O `cargo xtask os wifi-test` passou a conferir as visões na imagem, com `hostapd` e
+  `mac80211_hwsim`: os elementos do ponto de acesso (20 MHz, Wi-Fi 4, BSS Load, que o `hostapd` do
+  teste agora anuncia), o survey (canal 1 com 11,3% de ocupação e ruído −92 dBm) e o spectral scan
+  recusado com o motivo. Passou em 88 s no KVM (**medido**).
+
+  O lab ganhou vizinhos (11 redes, com 40, 80 e 160 MHz e uma de 6 GHz), um survey completo e um
+  espectro sintético no formato do ath10k. O espectro tem Wi-Fi, um micro-ondas, um saltador e
+  portadoras, e o lab o lê pelo mesmo parser de um rádio real. Não foi conferido numa placa
+  Atheros: a imagem ainda não tem os drivers (G1.30b, que ganhou o critério).
+
+- 2026-11-11 — G1.30j: Wi-Fi em modo monitor, para análise de segurança (pedido do usuário depois do mockup, 2026-11-11;
+  captura tudo o que for possível, sem aviso de privacidade). Janela própria Interfaces › Wi-Fi
+  Sniffer, ao lado de Interfaces › Wi-Fi (o caminho `/interface/wifi/sniffer` do RouterOS 7), com
+  duas abas:
+
+  - **Snooper** (`interface.wifi.snooper.start`, `.print`): uma linha por rede e, embaixo, uma por
+    estação: tempo de ar (estimado pela duração dos quadros sobre o tempo escutado), quadros,
+    % de retransmissão, taxa (Mb/s com HE/VHT/HT, MCS, fluxos e largura, calculada do radiotap) e
+    sinal; a faixa de canais pintada com o tempo de ar de cada um; notas em selos: longe e lento,
+    deauth/disassoc com o motivo (Tabela 9-49), inundação de deauth, handshake 4/4, rede oculta
+    revelada por probe response ou associação, gêmeo maligno (mesmo SSID com segurança mais fraca),
+    mesmo SSID com outra segurança ou outro fabricante. Canal fixo ou pulando canais
+    (`channel_time`, padrão 200 ms), largura 20/40/80/160.
+  - **Captura** (`interface.wifi.sniffer.start`, `.packets`, `.download`): quadros inteiros num
+    pcap radiotap (link type 127), filtro por BSSID, SSID, MAC e tipo (mgmt/control/data), e "só
+    o handshake" (EAPOL e um beacon por rede, o que o Wireshark precisa para decifrar a própria
+    rede com a senha); lista ao vivo dos últimos quadros; download em pedaços.
+  - **Lockout**: o sniffer nunca tira um rádio da rede. Num rádio ativo, o monitor é uma
+    interface a mais (`wifi1mon`) ao lado da estação, que continua conectada, no canal dela;
+    canal/hop/exclusivo exigem a interface desativada (o `interface.wifi.disable` já pede Safe
+    Mode no rádio da gerência). Se o rádio volta a ser habilitado (o Safe Mode desfazendo), o
+    sniffer para no tick seguinte.
+  - **Limites**: um por rádio, dois guardados; duração padrão 300 s; arquivo padrão 16 MiB, até
+    64 MiB (cheio, para de crescer e o snooper segue); 4096 estações e 1024 redes na tabela.
+  - Linux: interface monitor por nl80211 (`NEW_INTERFACE` com `control` + `otherbss`,
+    `SET_CHANNEL` com largura e centro, `DEL_INTERFACE`), leitura por `AF_PACKET` sem `unsafe`;
+    `GET_WIPHY` diz se o driver tem monitor e se ele roda ao lado da estação.
+  - Laboratório: o ar sintético (`lab_wifi_air`) com beacons das redes do lab, estações Wi-Fi
+    4/5/6, uma impressora longe a 6 Mb/s com 45 % de retransmissão, uma TV expulsa a cada 20 s que
+    volta com o handshake, a rede oculta revelada e um gêmeo aberto da rede do lab.
+
+  Detalhes, pesquisa (MikroTik, Kismet, Cisco, Wireshark, radiotap.org, IEEE 802.11-2020) e
+  números em `docs/wifi-sniffer.md`.
+
+  Como testar:
+
+  - `cargo test -p corerouter-hal --lib ieee80211 lab_wifi_air`,
+    `cargo test -p corerouter-engine --lib wifi_sn`, `cargo test -p corerouter-ui --lib wifi_sniffer`
+  - `corerouter-daemon --backend virtual --control 7986` e a GUI com `--connect 127.0.0.1:7986`:
+    Interfaces › Wi-Fi Sniffer, Hop, Start snooper; aba Capture, Start capture, Download .pcap e
+    abrir no Wireshark.
+  - `cargo xtask os wifi-test` (QEMU com `mac80211_hwsim`).
+
+  Não conferido em placa: a RTL8852BE (`rtw89`) do notebook. No QEMU o `mac80211_hwsim` não
+  retransmite (sem `wmediumd`): retransmissões só no laboratório e nos testes.
+
+- 2026-11-11 — G1.30m: Wi-Fi no bonding, opção A (pedido do usuário, 2026-11-11): a janela New/Edit Bonding lista as
+  portas Wi-Fi abaixo das Ethernet, cinza e sem marcar, com a dica "a Wi-Fi client cannot be a
+  slave" e um ⓘ (`bonding.wifi_slave`, em português e inglês) que explica por quê: o quadro de
+  uma estação leva três endereços e o ponto de acesso só passa o MAC dela, o bonding troca o MAC
+  das portas e o kernel recusa a estação numa bridge (`IFF_DONT_BRIDGE`, `net/wireless/util.c`,
+  `net/bridge/br_if.c:597` no 6.18.59). O ⓘ aponta o `station-bridge` (Multi-AP ou WDS) como o
+  caminho entre dois CoreRouters. O motor continua recusando, agora com o motivo
+  (`corerouter_model::wifi::NO_BOND`) em vez de "only ethernet ports".
+
+  Como testar: `corerouter-cli run interface.bonding.add
+  '{"name":"b1","slaves":["ether1","wifi1"],"mode":"active-backup"}'` no laboratório virtual
+  (recusa com o motivo); na GUI, Interfaces › Bonding › + (wifi1 cinza, ⓘ abre a explicação).
+  Testes: `bonding::a_wifi_client_is_not_a_slave` (engine) e
+  `tests::bonding::wifi_ports_show_greyed_with_an_explanation` (ui).
+
+- 2026-11-11 — G1.6zn: Sistema na RAM no disco instalado e aviso de disco do sistema removido.
+
+  - `system.boot.set {to_ram: yes}` (desligado por padrão; System › Packages, "Run the system from
+    RAM"): no boot seguinte o `corerouter-init` lê o `/dev/dm-0` inteiro (conferido bloco a bloco
+    pelo dm-verity, contra o hash raiz da linha de comando) para um tmpfs, monta por loop, faz
+    `pivot_root(".", ".")` e roda de lá. Sem RAM (raiz + 256 MiB), sem verity ou com falha, segue
+    do disco e diz por quê (log e saúde `system.disk` em aviso). A escolha vai para
+    `/config/package/boot.json` pelo serviço `package`.
+  - Disco do sistema removido (com ou sem a opção): uma thread do init nas mensagens de dispositivo
+    do kernel baixa o `console_loglevel` para 1, desmonta (lazy) `/config` e a ESP e escreve uma
+    linha clara no console e no log ("system disk sda removed: … configuration changes are no
+    longer saved; reboot with the disk in place"). Com ela, todo commit é recusado antes de chegar
+    ao kernel (o Safe Mode, que não grava, continua), as tarefas de pacote também, e a saúde mostra
+    `system.disk` em erro.
+
+  Como testar: `cargo xtask os ab-test --scenario to-ram` (o disco instalado vira um pendrive
+  `usb-storage`; `device_del` pelo monitor do QEMU o tira a quente). Na mão: `system.boot.set
+  {"to_ram": true}`, reiniciar, `system.boot.print` (`running.in_ram`), tirar o pendrive.
+
+  Números (QEMU KVM, OVMF, pendrive usb-storage sobre qcow2): cópia de 86 MiB em 78–83 ms
+  (**medido**, qcow2 no cache do host); kernel → daemon pronto 1,88–1,96 s no disco e 1,90–1,94 s
+  na RAM (**medido**); `MemAvailable` 875 → 744 MiB (**medido**); 0 linhas de erro do kernel no
+  console depois do aviso (**medido**); num pendrive USB 2, ~3 s a mais no boot (**estimado**).
+
+- 2026-11-11 — G1.6zq: Diagnóstico do boot lento no handoff do USB (xHCI). No notebook Lenovo 83EU (i5-12450H, BIOS
+  LZCN41WW) com a dev.591 dando boot pelo pendrive, `quirk_usb_early_handoff` levou 20,47 s dos
+  25,1 s até o `ready` (**medido**, log do roteador; o "19992855 usecs" do kernel é `ns >> 10`), sem
+  nenhum aviso de prazo estourado. O `handshake()` de `drivers/usb/host/pci-quirks.c` conta voltas,
+  não tempo (`readl_poll_timeout_atomic` desde o commit `7349a69cf312`), e o tempo em SMM não
+  aparece: um SMI longo do BIOS, uma tempestade de SMIs, o `_PS0` da ACPI ou um CNR lento dão a
+  mesma linha. O patch `os/patches/linux/0003-usb-pci-quirks-time-the-xhci-handoff.patch`
+  cronometra cada passo e conta os SMIs (Intel, `MSR_SMI_COUNT`) e escreve
+  `xHCI handoff: <µs>, <n> SMIs; USBLEGSUP … USBLEGCTLSTS …` com uma linha por passo lento quando o
+  handoff passa de 10 ms (ou com `initcall_debug`). Explicação e tabela de hipóteses em
+  `docs/os-image.md`, "Boot lento no handoff do USB (xHCI)".
+
+  Como testar: `cargo xtask os boot-test`, `boot-test --efi` e `os install-test` (boot pelo pendrive
+  num xHCI do QEMU); no QEMU com `initcall_debug ignore_loglevel` sai
+  `xHCI handoff: 1627 us, 0 SMIs; USBLEGSUP 00000000 …` (o xHCI do QEMU não tem a capacidade de
+  legado, **medido**). No roteador: `log.os.print` e procurar `xHCI handoff`.
+
+- 2026-11-11 — G1.6zr: Defeitos que a auditoria da imagem 0.1.0-dev.591 (main 716544e1) achou num notebook real (Lenovo
+  83EU, r8169, r8152 USB, RTL8852BE). Cada um tem um teste que falha sem a correção.
+
+  - **Porta do ethtool trocada** (`hal-linux/src/ethtool.rs`): a tabela tinha 2=bnc, 3=mii, 4=fibre;
+    o kernel define `PORT_MII 2, PORT_FIBRE 3, PORT_BNC 4` (`include/uapi/linux/ethtool.h`,
+    6.18.59). O r8152 (`PORT_MII`, `drivers/net/mii.c:157`) aparecia como `bnc`. Teste valor a
+    valor.
+  - **Taxas de CPU e de NIC vazias sem ninguém olhando** (`engine/src/system_resource.rs`): com o
+    serviço `health` no ritmo lento (5 s), qualquer consulta com a leitura dele mais velha que 2 s
+    lia a máquina por conta própria; a troca de fonte (serviço ↔ comando) apaga o par de leituras,
+    e a próxima leitura do serviço apagava de novo. Um cliente que pergunta de tempos em tempos
+    (`system.health.check` não liga o modo rápido) zerava as taxas para sempre: `nic.errors`,
+    `rss` e `cpu` em `unknown`, CPU nula no histórico. Agora, com o serviço vivo (leitura de até
+    12 s), os comandos usam a leitura dele; uma lista de processos lida na hora preenche só os
+    processos. Teste no daemon: seis leituras lentas com uma consulta entre cada uma.
+  - **Erro velho no `ntp-client`** (`daemon/src/service/supervisor.rs`): o supervisor copiava o
+    erro do serviço só quando havia um; o `clear_error()` do cliente sincronizado nunca chegava ao
+    `last_error`. Um erro que o próprio serviço limpou some; o motivo de uma queda anterior fica
+    até o serviço reportar algo.
+  - **Entrada lixo no ARP** (`hal-linux/src/neigh.rs`): a entrada `NOARP` do kernel com 0.0.0.0 no
+    `lo` (e os endereços de loopback, v4 e v6) não é vizinho.
+  - **Processo `exe`** (`init/src/comm.rs`): o PID 1 roda o console de configuração como
+    `/proc/self/exe setup`, e o kernel dá ao processo o nome do arquivo. Cada modo se nomeia ao
+    entrar (`/proc/thread-self/comm`, sem `unsafe`): `cr-setup`, `cr-install`, `cr-ctl`.
+  - **Fabricante e modelo nulos em PCI**: a imagem não tinha `pci.ids`. Entra o do `hwdata` 0.412
+    (pacote do Buildroot, com hash), cortado pelo `post-build.sh` às placas que os drivers de rede
+    da imagem (e o `virtio_pci`) casam pelos aliases `pci:`: 1 622 linhas, 71 420 bytes, 13,2 KB
+    em zstd, 1 497 placas nomeadas (**medido** na imagem, contra ~1,4 MB do banco inteiro). O `os
+    build` confere que ele nomeia r8169, RTL8852BE, e1000e, igb e virtio-net e que foi cortado; o
+    `boot-test` confere o nome no `interface.hardware` da e100 do QEMU. Uma porta virtio-net mostra
+    o dispositivo virtio (`1af4:0001`, barramento virtio), não o PCI pai: sem nome ali (a lista de
+    placas, `interface.hardware-problem`, usa o PCI e tem o nome).
+  - **Kernel sem PSI**: `CONFIG_PSI=y` (`/proc/pressure`); trava no `os check`, no build e no
+    `boot-test` (pressão de memória não nula). bzImage +16 384 bytes (18 301 952 → 18 318 336);
+    memória ociosa no `boot-test` 79,0 MiB, contra 79,9 MiB na G1.6zn (**medido**, KVM, 2 CPUs).
+    O custo no escalonador fica pelo texto do Kconfig (visível só no hackbench), **estimado**.
+  - **Certificado genérico** (`control/src/tls.rs`): CN `CoreRouter <8 primeiros dígitos do node
+    id>`, O `CoreRouter`, SAN `corerouter`, `localhost`, `127.0.0.1`, `::1`, válido de 2025-01-01
+    a 9999-12-31 23:59:59 (RFC 5280 §4.1.2.5, "sem data de expiração definida"), servidor e não
+    CA. Só certificado novo muda; o já gravado continua, e o TOFU dos clientes não quebra. O SAN
+    já existia (`corerouter`, `localhost`); a identidade e os endereços ficam para a G1.6zs.
+  - **Avisos no religamento do r8152** (`engine/src/port_absent.rs`): o r8152 sumiu por 2 s e 4 s
+    ao trocar de configuração USB (**medido** no log do notebook). Agora o aviso espera 10 s; de
+    volta antes, a linha é *info* ("port was replugged (gone N s)"). `interface.list` e a saúde
+    mostram a porta inválida na hora.
+
+- 2026-11-11 — G4.6m: NTP: o primeiro acerto do relógio em cada boot dispensa a confirmação, a regra (a) que o dono
+  escolheu entre as propostas da G1.6zr (#623). O notebook da auditoria (dev.591) ficou 2 h 50 min
+  atrasado, porque o relógio da placa é acertado pelo Windows em hora local, e o cliente parou em
+  `awaiting-confirmation` até alguém olhar.
+
+  - **Regra** (`proto-ntp/src/discipline.rs`, RFC 8633 §5.2: o limite de pânico pode ser ignorado
+    "at startup"): na primeira sincronia do boot, um salto acima de 1000 s passa para frente sem
+    limite e para trás até 1 dia (`BOOT_STEP_BACK_NANOS`). Acima de 1 dia para trás, pede
+    confirmação como antes (é o que um servidor mentiroso faria para reabrir certificados ou logs
+    velhos). A primeira sincronia, salto ou slew, gasta a vez, e o limite volta. Um salto que o
+    kernel recusou não gasta. O piso de 2026-01-01 continua valendo sempre.
+  - **Uma vez por boot** (`daemon/src/service/ntp_client.rs`, `BootStep`): a marca é o `boot_id`
+    do kernel em `ntp-boot-step` na pasta de execução (tmpfs na imagem). Um daemon reiniciado no
+    mesmo boot pede confirmação; um boot novo (outro `boot_id`) abre a vez.
+  - **Log:** "relógio do sistema acertado de uma vez em +10200.000 s (primeiro acerto deste boot,
+    sem confirmação: RFC 8633 §5.2)".
+  - **Testes:** na disciplina, para frente sem limite (2 h 50 min e um ano), para trás até 1 dia,
+    além de 1 dia (pede), segundo acerto do mesmo boot (pede), slew que gasta, falha que não gasta.
+    No daemon, a thread com relógio falso e um servidor NTP 2 h 50 min adiantado: salta, grava a
+    marca e loga o motivo; o daemon de novo no mesmo boot, com 5000 s, pede `confirm-step`.
+    `docs/ntp.md` atualizado.
+
+- 2026-11-11 — fix-version-tree: A barra da GUI acusava "daemon … ≠ GUI …" entre duas builds do mesmo código: o pacote compilado
+  na branch de um PR e a imagem compilada da `main` depois do squash têm commits (e contagens
+  `dev.N`) diferentes e os mesmos arquivos. Visto no notebook: daemon `0.1.0-dev.583` (`a9c22459`,
+  o squash da G1.30g) contra a GUI `0.1.0-dev.585` (`386c56b`, a ponta da branch), com `git diff`
+  vazio entre os dois. O `corerouter-buildinfo` grava agora a árvore do git do commit (`TREE`), o
+  `server.info` a envia (`tree`) e a GUI não acusa nada quando as árvores batem e nenhum lado tem
+  `.dirty` (com alterações sem commit a árvore não diz o que foi compilado, e o aviso continua).
+  Daemon antigo, sem `tree`, segue comparado pelo commit. Teste: `same_files` no buildinfo e o caso
+  novo em `a_daemon_built_from_another_commit_is_flagged_in_the_top_bar`.
