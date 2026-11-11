@@ -1,4 +1,4 @@
-//! G1.6j: the network drivers built as modules load themselves. The image
+//! G1.6j: the drivers built as modules load themselves. The image
 //! has no udev: PID 1 reads the kernel's module index (`modules.alias`,
 //! `modules.dep`), looks at the PCI and USB devices that have no driver yet
 //! (and the auxiliary ones a driver makes while it probes)
@@ -8,11 +8,18 @@
 //! running). A card that is not in the machine costs nothing: its driver
 //! stays on the disk.
 //!
-//! Only modules under `kernel/drivers/net/` are candidates, and the files
-//! come from the root under dm-verity. A driver that fails to load, or one
-//! whose probe hangs, must not stop the router: everything runs in its own
-//! thread and PID 1 waits a bounded time ([`BOOT_WAIT`]); a port that shows
-//! up later is named by the hot-plug pass (`spawn_hotplug_names`).
+//! Only modules under `kernel/drivers/net/` and `kernel/drivers/gpu/drm/`
+//! are candidates, and the files come from the root under dm-verity. A driver
+//! that fails to load, or one whose probe hangs, must not stop the router:
+//! everything runs in its own thread and PID 1 waits a bounded time
+//! ([`BOOT_WAIT`]) for the network drivers only; a port that shows up later
+//! is named by the hot-plug pass (`spawn_hotplug_names`).
+//!
+//! G1.6zd: the screen's driver (`i915`) is a module for the same reason as
+//! `ice`: it asks for its firmware (GuC, HuC, DMC) while probing. It loads
+//! after the network drivers and the boot does not wait for it: until it
+//! takes the screen, the console is on the firmware's framebuffer
+//! (`simpledrm`, G1.6zc).
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -22,8 +29,10 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const MODULES: &str = "/lib/modules";
-/// Only these drivers load by themselves (`modules.dep` paths).
+/// Only these drivers load by themselves (`modules.dep` paths): the ports'
+/// and the screen's.
 const NET_DRIVERS: &str = "kernel/drivers/net/";
+const SCREEN_DRIVERS: &str = "kernel/drivers/gpu/drm/";
 /// `modules.alias` of every network driver is ~1 MiB.
 const MAX_INDEX: u64 = 16 << 20;
 /// The kernel's `MODALIAS` values are far shorter (USB: ~70 bytes).
@@ -105,7 +114,19 @@ fn module_name(path: &str) -> Option<String> {
     (!stem.is_empty()).then(|| stem.replace('-', "_"))
 }
 
-/// What the module index says about the network drivers.
+/// Which of the candidates a pass loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pass {
+    /// The network drivers: the boot waits for them, the ports' names
+    /// depend on what they find.
+    Ports,
+    /// The screen's driver: nothing waits for it.
+    Screen,
+    /// A device that arrived with the router running: whatever it asks for.
+    Any,
+}
+
+/// What the module index says about the drivers that load by themselves.
 #[derive(Debug, Default)]
 pub struct Index {
     /// `(bus, pattern, module)`.
@@ -123,7 +144,7 @@ impl Index {
             let Some((path, needs)) = line.split_once(':') else {
                 continue;
             };
-            if !path.starts_with(NET_DRIVERS) {
+            if !path.starts_with(NET_DRIVERS) && !path.starts_with(SCREEN_DRIVERS) {
                 continue;
             }
             let Some(name) = module_name(path) else {
@@ -179,6 +200,19 @@ impl Index {
 
     fn chain(&self, module: &str) -> &[String] {
         self.chains.get(module).map_or(&[], Vec::as_slice)
+    }
+
+    /// Is `module` one of the pass's? Its own file is the chain's last.
+    fn in_pass(&self, module: &str, pass: Pass) -> bool {
+        let net = self
+            .chain(module)
+            .last()
+            .is_some_and(|p| p.starts_with(NET_DRIVERS));
+        match pass {
+            Pass::Ports => net,
+            Pass::Screen => !net,
+            Pass::Any => true,
+        }
     }
 }
 
@@ -244,20 +278,27 @@ fn load(index: &Index, dir: &Path, module: &str) -> Option<String> {
     loaded.then(|| format!("driver {module} loaded in {} ms", t.elapsed().as_millis()))
 }
 
-/// Loads the modules the devices in `aliases` ask for, each once, one line
-/// per module. One after the other: a machine loads a handful, and the slow
-/// part (a probe) is the kernel's, in the thread that is not PID 1's.
-fn load_for(index: &Index, dir: &Path, aliases: &[String], mut log: impl FnMut(&str)) {
-    let mut seen: Vec<&str> = Vec::new();
+/// The modules of `pass` the devices in `aliases` ask for, each once, in
+/// the devices' order.
+fn wanted<'a>(index: &'a Index, aliases: &[String], pass: Pass) -> Vec<&'a str> {
+    let mut out: Vec<&str> = Vec::new();
     for alias in aliases {
         for module in index.matches(alias) {
-            if seen.contains(&module) {
-                continue;
+            if index.in_pass(module, pass) && !out.contains(&module) {
+                out.push(module);
             }
-            seen.push(module);
-            if let Some(line) = load(index, dir, module) {
-                log(&line);
-            }
+        }
+    }
+    out
+}
+
+/// Loads the modules of `pass` the devices in `aliases` ask for, one line
+/// per module. One after the other: a machine loads a handful, and the slow
+/// part (a probe) is the kernel's, in the thread that is not PID 1's.
+fn load_for(index: &Index, dir: &Path, aliases: &[String], pass: Pass, mut log: impl FnMut(&str)) {
+    for module in wanted(index, aliases, pass) {
+        if let Some(line) = load(index, dir, module) {
+            log(&line);
         }
     }
 }
@@ -306,12 +347,12 @@ fn hotplug_loop(events: &DeviceEvents, index: &Index, dir: &Path, log: &dyn Fn(&
             Ok(n) => {
                 let alias = buf.get(..n).and_then(uevent_modalias).map(str::to_owned);
                 if let Some(alias) = alias {
-                    load_for(index, dir, &[alias], log);
+                    load_for(index, dir, &[alias], Pass::Any, log);
                 }
             }
             // Lost messages: the devices themselves say what is missing.
             Err(e) if e.raw_os_error() == Some(ENOBUFS) => {
-                load_for(index, dir, &unbound_devices(), log);
+                load_for(index, dir, &unbound_devices(), Pass::Any, log);
             }
             Err(_) => std::thread::sleep(Duration::from_secs(1)),
         }
@@ -319,8 +360,9 @@ fn hotplug_loop(events: &DeviceEvents, index: &Index, dir: &Path, log: &dyn Fn(&
 }
 
 /// Loads the drivers of what is in the machine and keeps listening for what
-/// is plugged in later, in its own thread. Returns when the boot's drivers
-/// are in, or at [`BOOT_WAIT`] with the loading still going.
+/// is plugged in later, in its own thread. Returns when the boot's network
+/// drivers are in, or at [`BOOT_WAIT`] with the loading still going; the
+/// screen's driver loads after that, with the boot already going on.
 pub fn start(log: fn(&str)) {
     let dir = kernel_dir();
     let index = Index::parse(
@@ -338,13 +380,14 @@ pub fn start(log: fn(&str)) {
         .spawn(move || {
             let t = Instant::now();
             let devices = unbound_devices();
-            load_for(&index, &dir, &devices, log);
+            load_for(&index, &dir, &devices, Pass::Ports, log);
             log(&format!(
                 "drivers: {} devices without a driver looked at in {} ms",
                 devices.len(),
                 t.elapsed().as_millis()
             ));
             let _ = done.send(());
+            load_for(&index, &dir, &devices, Pass::Screen, log);
             match events {
                 Ok(events) => hotplug_loop(&events, &index, &dir, &log),
                 Err(e) => log(&format!(
@@ -373,6 +416,9 @@ kernel/drivers/net/ethernet/intel/ice/ice.ko: kernel/drivers/net/aux.ko kernel/l
 kernel/drivers/net/ethernet/intel/e100.ko:
 kernel/drivers/net/usb/ax-88179.ko.zst: kernel/drivers/net/usb/usbnet.ko
 kernel/net/netfilter/xt_mark.ko:
+kernel/drivers/gpu/drm/i915/i915.ko: kernel/drivers/gpu/drm/ttm/ttm.ko kernel/drivers/gpu/drm/drm_buddy.ko
+kernel/drivers/gpu/drm/ttm/ttm.ko:
+kernel/drivers/gpu/drm/drm_buddy.ko:
 ";
     const ALIAS: &str = "\
 # Aliases extracted from modules themselves.
@@ -380,6 +426,7 @@ alias pci:v00008086d00001592sv*sd*bc*sc*i* ice
 alias pci:v00008086d00001229sv*sd*bc02sc00i* e100
 alias usb:v0B95p1790d*dc*dsc*dp*ic*isc*ip*in* ax_88179
 alias pci:v00001234d*sv*sd*bc*sc*i* xt_mark
+alias pci:v00008086d0000A7A0sv*sd*bc03sc*i* i915
 alias cpu:type:x86,ven*fam*mod*:feature:*0073* ice
 broken line
 ";
@@ -412,7 +459,7 @@ broken line
     }
 
     #[test]
-    fn only_network_drivers_on_the_two_buses() {
+    fn only_port_and_screen_drivers_on_the_buses() {
         let i = Index::parse(DEP, ALIAS);
         assert_eq!(
             i.matches("pci:v00008086d00001592sv00008086sd00000001bc02sc00i00"),
@@ -431,7 +478,11 @@ broken line
             i.matches("usb:v0B95p1790d0100dc00dsc00dp00icFFisc00ip00in00"),
             ["ax_88179"]
         );
-        // Not under drivers/net, whatever the alias says.
+        assert_eq!(
+            i.matches("pci:v00008086d0000A7A0sv000017AAsd00003B60bc03sc00i00"),
+            ["i915"]
+        );
+        // Not a port's nor a screen's driver, whatever the alias says.
         assert!(i.matches("pci:v00001234d00000001sv0sd0bc0sc0i0").is_empty());
         // Other buses never load anything.
         assert!(
@@ -457,6 +508,31 @@ broken line
             ["kernel/drivers/net/ethernet/intel/e100.ko"]
         );
         assert!(i.chain("nothing").is_empty());
+    }
+
+    /// G1.6zd: the boot waits for the ports' drivers only; the screen's
+    /// loads in its own pass, with what it needs first.
+    #[test]
+    fn the_screen_driver_is_not_in_the_boot_wait() {
+        let i = Index::parse(DEP, ALIAS);
+        let devices = [
+            "pci:v00008086d0000A7A0sv000017AAsd00003B60bc03sc00i00".to_owned(),
+            "pci:v00008086d00001592sv00008086sd00000001bc02sc00i00".to_owned(),
+            "pci:v00008086d00001229sv00000000sd00000000bc02sc00i00".to_owned(),
+        ];
+        assert_eq!(wanted(&i, &devices, Pass::Ports), ["ice", "e100"]);
+        assert_eq!(wanted(&i, &devices, Pass::Screen), ["i915"]);
+        assert_eq!(wanted(&i, &devices, Pass::Any), ["i915", "ice", "e100"]);
+        assert_eq!(
+            i.chain("i915"),
+            [
+                "kernel/drivers/gpu/drm/drm_buddy.ko",
+                "kernel/drivers/gpu/drm/ttm/ttm.ko",
+                "kernel/drivers/gpu/drm/i915/i915.ko"
+            ]
+        );
+        // The helpers have no device of their own: nothing asks for them.
+        assert!(wanted(&i, &["pci:v1d2".to_owned()], Pass::Any).is_empty());
     }
 
     #[test]
