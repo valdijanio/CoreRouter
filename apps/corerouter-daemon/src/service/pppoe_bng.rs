@@ -536,6 +536,49 @@ impl PppBackend for Backend {
         sh.active.get(id).map(|a| a.name.clone())
     }
 
+    /// G4.2i: walks the table in place and copies only the page.
+    fn pool_page(
+        &self,
+        keep: &dyn Fn(&ActiveSession) -> bool,
+        limit: usize,
+    ) -> (usize, Vec<ActiveSession>) {
+        let sh = guard(&self.0);
+        let mut hits: Vec<&ActiveSession> = sh
+            .active
+            .values()
+            .filter(|a| a.pool.is_some() && a.address.is_some() && keep(a))
+            .collect();
+        let total = hits.len();
+        corerouter_engine::ppp::first_by(&mut hits, limit, |a| a.address);
+        (total, hits.into_iter().cloned().collect())
+    }
+
+    /// One pass, no copy of a session; a pool name is allocated once.
+    fn pool_use(&self) -> std::collections::BTreeMap<String, u64> {
+        let sh = guard(&self.0);
+        let mut m = std::collections::BTreeMap::new();
+        for p in sh
+            .active
+            .values()
+            .filter_map(|a| a.address.and(a.pool.as_ref()))
+        {
+            match m.get_mut(p) {
+                Some(n) => *n += 1,
+                None => {
+                    m.insert(p.clone(), 1);
+                }
+            }
+        }
+        m
+    }
+
+    /// By the address index (O(1)).
+    fn pool_holder(&self, ip: Ipv4Addr) -> Option<ActiveSession> {
+        let sh = guard(&self.0);
+        let id = sh.by_ip.get(&ip)?;
+        sh.active.get(id).filter(|a| a.pool.is_some()).cloned()
+    }
+
     fn who_vlan(&self, ip: Ipv4Addr) -> Option<(String, u16)> {
         let sh = guard(&self.0);
         let id = sh.by_ip.get(&ip)?;
@@ -727,7 +770,10 @@ fn acct_counters(a: &ActiveSession) -> AcctCounters {
 }
 
 /// An `/ip pool` allocator of the PPP service. The pool's addresses the
-/// DHCP server hands out are not seen here: a pool belongs to one of them.
+/// DHCP server hands out are not seen here: a pool belongs to one of them
+/// (a pool both use is the **DHCP + PPP** check, and `/ip pool used` marks
+/// an address both hold as a conflict, G4.2i; one shared allocator is
+/// G4.2k).
 #[derive(Default)]
 struct Pools {
     used: HashSet<u32>,
@@ -3082,6 +3128,8 @@ impl Bng {
             service_name: Some(sub.service_name.clone()),
             caller_id: mac.clone(),
             address: ip,
+            // G4.2i: `/ip pool used` lists it under its pool.
+            pool: ip.and(sub.pool.clone()),
             session_id: sref.sid,
             server: server.clone(),
             interface: interface.clone(),
@@ -4241,6 +4289,61 @@ mod admission_tests {
         assert_eq!(b.backlog(1), 20_000);
         b.rate = AUTO_MIN;
         assert_eq!(b.window(8), AUTO_WINDOW_MIN);
+    }
+
+    /// G4.2i: `/ip pool used` over 100 000 sessions: the page in address
+    /// order cut to the limit with the whole count, the per-pool counts in
+    /// one pass, and the holder of an address by the index; fixed
+    /// addresses (no pool) stay out.
+    #[test]
+    fn pool_used_pages_counts_and_finds_the_holder() {
+        let mut sh = Shared::default();
+        let n = 100_000u32;
+        for i in 0..n {
+            let id = format!("s{i}");
+            // Inserted from the top down: the page must sort, not trust
+            // the table's order.
+            let ip = Ipv4Addr::from(0x6440_0000 + (n - 1 - i));
+            let pool = match i % 10 {
+                0 => None,
+                1..=3 => Some("b".to_owned()),
+                _ => Some("a".to_owned()),
+            };
+            sh.active.insert(
+                id.clone(),
+                ActiveSession {
+                    id: id.clone(),
+                    name: format!("u{i}"),
+                    address: Some(ip),
+                    pool,
+                    ..ActiveSession::default()
+                },
+            );
+            sh.by_ip.insert(ip, id);
+        }
+        let b = Backend(Arc::new(Mutex::new(sh)));
+        let t = std::time::Instant::now();
+        let (total, page) = b.pool_page(&|_| true, 10_000);
+        let page_took = t.elapsed();
+        assert_eq!(total, 90_000);
+        assert_eq!(page.len(), 10_000);
+        assert!(page.windows(2).all(|w| w[0].address < w[1].address));
+        assert!(page.iter().all(|a| a.pool.is_some()));
+        let (total_b, _) = b.pool_page(&|a| a.pool.as_deref() == Some("b"), 10);
+        assert_eq!(total_b, 30_000);
+        let t = std::time::Instant::now();
+        let used = b.pool_use();
+        let use_took = t.elapsed();
+        assert_eq!(used.get("a"), Some(&60_000));
+        assert_eq!(used.get("b"), Some(&30_000));
+        // s0 has the top address and a fixed one: not a pool's.
+        assert!(b.pool_holder(Ipv4Addr::from(0x6440_0000 + n - 1)).is_none());
+        assert_eq!(
+            b.pool_holder(Ipv4Addr::from(0x6440_0000 + n - 2))
+                .map(|a| a.name),
+            Some("u1".to_owned())
+        );
+        eprintln!("100 000 sessions: page of 10 000 {page_took:?}, counts per pool {use_took:?}");
     }
 
     /// G4.3hb: a CoA naming a session by Framed-IP-Address or

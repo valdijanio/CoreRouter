@@ -295,6 +295,29 @@ fn pppoe_server_end_to_end() {
     assert_eq!(row["name"], "u0");
     assert_eq!(row["rate_limit"], "10M/50M");
     assert_eq!(row["encoding"], "mschap2");
+    // G4.2i: the address came from "clientes": /ip pool used lists it with
+    // the PPP server as owner, and the pool counts it.
+    assert_eq!(row["pool"], "clientes", "{row}");
+    let used = ok("ip.pool.used.print", json!({"pool": "clientes"}));
+    assert_eq!(used["total"], 1, "{used}");
+    let u = &used["rows"][0];
+    assert_eq!(
+        (
+            u["service"].as_str(),
+            u["user"].as_str(),
+            u["state"].as_str()
+        ),
+        (Some("ppp"), Some("u0"), Some("active")),
+        "{u}"
+    );
+    assert_eq!(u["address"], row["address"]);
+    assert_eq!(u["owner"], row["server"]);
+    let pool = ok("ip.pool.print", json!({}))[0].clone();
+    assert_eq!(
+        (pool["used"].as_u64(), pool["ppp"].as_u64()),
+        (Some(1), Some(1)),
+        "{pool}"
+    );
 
     // Traffic through the slow path: ICMP echo to wan0 and back.
     let (sid, ip) = one.up[0].unwrap();

@@ -1,10 +1,10 @@
-//! `/ip pool` (G4.2a): named sets of IPv4 addresses the DHCP server (and,
-//! later, PPPoE and hotspot) hands out, as RouterOS has them: one or more
-//! ranges and an optional `next_pool` tried when this one is full.
+//! `/ip pool` (G4.2a): named sets of IPv4 addresses the DHCP server and
+//! the PPP service hand out (later hotspot too), as RouterOS has them: one
+//! or more ranges and an optional `next_pool` tried when this one is full.
 //!
 //! Which addresses are in use is operational state of whoever hands them
-//! out (`ip.pool.used.print` asks the DHCP server); only the definition is
-//! config.
+//! out (`ip.pool.used.print` asks the DHCP server and the PPP service,
+//! G4.2i); only the definition is config.
 
 use std::fmt;
 use std::net::Ipv4Addr;

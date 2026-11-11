@@ -8,6 +8,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("Click: open where this name comes from", "Clique: abre de onde vem este nome"),
     ("DHCP Leases", "Concessões DHCP"),
     ("IP › Addresses comment", "Comentário de IP › Addresses"),
+    ("IP › Pool › Used", "IP › Pool › Em uso"),
     ("Lease host name", "Host-name da concessão"),
     ("Name", "Nome"),
     ("PPPoE login", "Login PPPoE"),

@@ -1007,6 +1007,10 @@ pub struct ActiveSession {
     /// The subscriber's MAC.
     pub caller_id: String,
     pub address: Option<Ipv4Addr>,
+    /// G4.2i: the `/ip pool` the address was taken from (`None`: a fixed
+    /// address, RADIUS Framed-IP-Address, or none), for `/ip pool used`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
     pub uptime_secs: u64,
     pub session_id: u16,
     pub server: String,

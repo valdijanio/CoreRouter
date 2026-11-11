@@ -910,6 +910,7 @@ impl Bng {
             service_name: Some(sub.service_name.clone()),
             caller_id: mac.clone(),
             address: ip,
+            pool: ip.and(sub.pool.clone()),
             session_id: sid,
             server: server.clone(),
             interface: interface.clone(),

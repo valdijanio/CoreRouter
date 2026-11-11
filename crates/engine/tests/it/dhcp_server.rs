@@ -135,9 +135,10 @@ fn the_lab_hosts_get_leases_names_and_lists() {
     assert_eq!(m["dhcp_server"]["sent"]["ack"], 4);
     let used = ok(&mut s, "ip.pool.used.print", json!({"pool": "lan"}));
     assert!(
-        used.as_array().unwrap().len() >= 5,
+        used["rows"].as_array().unwrap().len() >= 5,
         "4 bound + the conflict"
     );
+    assert_eq!(used["total"], used["rows"].as_array().unwrap().len());
     let pools = ok(&mut s, "ip.pool.print", json!({}));
     assert_eq!(pools[0]["size"], 41);
     assert_eq!(pools[0]["used"], 4);
@@ -512,5 +513,234 @@ fn add_arp_turns_leases_into_arp_entries() {
             json!({"id": "dhcp1", "add_arp": "maybe"})
         )
         .contains("add_arp")
+    );
+}
+
+/// G4.2i: PPP sessions with an address from a pool, as the daemon's PPPoE
+/// service reports them (only what `ip.pool.used.print` and
+/// `ip.pool.print` ask).
+struct PoolPpp(Vec<corerouter_model::ppp::ActiveSession>);
+
+impl corerouter_engine::ppp::PppBackend for PoolPpp {
+    fn active(&self) -> Vec<corerouter_model::ppp::ActiveSession> {
+        self.0.clone()
+    }
+    fn terminate(&self, _: &[String]) -> usize {
+        0
+    }
+    fn history(&self) -> Vec<corerouter_model::ppp::HistoryEntry> {
+        Vec::new()
+    }
+    fn why(
+        &self,
+        _: Option<&str>,
+        _: Option<corerouter_model::MacAddr>,
+    ) -> corerouter_model::ppp::Why {
+        corerouter_model::ppp::Why::default()
+    }
+    fn stats(&self) -> corerouter_model::ppp::ServiceStats {
+        corerouter_model::ppp::ServiceStats::default()
+    }
+    fn pool_page(
+        &self,
+        keep: &dyn Fn(&corerouter_model::ppp::ActiveSession) -> bool,
+        limit: usize,
+    ) -> (usize, Vec<corerouter_model::ppp::ActiveSession>) {
+        let mut hits: Vec<_> = self.0.iter().filter(|a| keep(a)).cloned().collect();
+        let total = hits.len();
+        corerouter_engine::ppp::first_by(&mut hits, limit, |a| a.address);
+        (total, hits)
+    }
+    fn pool_use(&self) -> std::collections::BTreeMap<String, u64> {
+        let mut m = std::collections::BTreeMap::new();
+        for a in &self.0 {
+            *m.entry(a.pool.clone().unwrap()).or_insert(0) += 1;
+        }
+        m
+    }
+    fn pool_holder(&self, ip: std::net::Ipv4Addr) -> Option<corerouter_model::ppp::ActiveSession> {
+        self.0.iter().find(|a| a.address == Some(ip)).cloned()
+    }
+    fn who(&self, ip: std::net::Ipv4Addr) -> Option<String> {
+        self.pool_holder(ip).map(|a| a.name)
+    }
+}
+
+fn ppp_session(i: u8, name: &str, ip: &str, pool: &str) -> corerouter_model::ppp::ActiveSession {
+    corerouter_model::ppp::ActiveSession {
+        id: format!("*1-{i}"),
+        name: name.into(),
+        caller_id: format!("02:00:00:00:00:{i:02X}"),
+        address: Some(ip.parse().unwrap()),
+        pool: Some(pool.into()),
+        server: "pppoe-ether3".into(),
+        interface: "ether3".into(),
+        vlan: Some(100),
+        ..Default::default()
+    }
+}
+
+/// G4.2i: `/ip pool used` lists the PPP sessions with the DHCP leases, in
+/// address order, filtered by pool, owner and text, cut to `limit` with
+/// the whole count; an address held by a lease and a session is a
+/// conflict on both rows; `ip.pool.print` counts the sessions.
+#[test]
+fn pool_used_lists_ppp_sessions_and_conflicts() {
+    let mut s = Session::virtual_lab();
+    lan(&mut s);
+    ok(
+        &mut s,
+        "ip.pool.add",
+        json!({"name": "assin", "ranges": "100.64.0.2-100.64.0.254"}),
+    );
+    run(&mut s, 0, 5);
+    let laptop = leases(&mut s)
+        .into_iter()
+        .find(|r| r["host_name"] == "lab-laptop")
+        .unwrap()["address"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    s.set_ppp_backend(std::sync::Arc::new(PoolPpp(vec![
+        ppp_session(1, "ana", "100.64.0.2", "assin"),
+        ppp_session(2, "joao", "100.64.0.3", "assin"),
+        // Took from "lan" what the DHCP server also gave the laptop.
+        ppp_session(3, "pedro", &laptop, "lan"),
+    ])));
+
+    let all = ok(&mut s, "ip.pool.used.print", json!({}));
+    let rows = all["rows"].as_array().unwrap();
+    assert_eq!(
+        all["total"], 8,
+        "4 bound + 1 conflict + 3 sessions: {all:#}"
+    );
+    assert_eq!(rows.len(), 8);
+    assert_eq!(rows[0]["address"], "100.64.0.2", "address order: {all:#}");
+    assert_eq!(rows[0]["service"], "ppp");
+    assert_eq!(rows[0]["owner"], "pppoe-ether3");
+    assert_eq!(rows[0]["pool"], "assin");
+    assert_eq!(rows[0]["user"], "ana");
+    assert_eq!(rows[0]["info"], "ana 02:00:00:00:00:01");
+    assert_eq!(rows[0]["state"], "active");
+    assert_eq!(rows[0]["vlan"], 100);
+    assert_eq!(rows[0]["session"], "*1-1");
+    let at_laptop: Vec<&Value> = rows
+        .iter()
+        .filter(|r| r["address"] == laptop.as_str())
+        .collect();
+    assert_eq!(at_laptop.len(), 2, "the lease and the session: {all:#}");
+    for r in &at_laptop {
+        assert_eq!(r["state"], "conflict", "{r}");
+    }
+    let lease = at_laptop.iter().find(|r| r["service"] == "dhcp").unwrap();
+    assert!(
+        lease["conflict"].as_str().unwrap().contains("pedro"),
+        "{lease}"
+    );
+    let sess = at_laptop.iter().find(|r| r["service"] == "ppp").unwrap();
+    assert!(
+        sess["conflict"].as_str().unwrap().contains("DHCP lease"),
+        "{sess}"
+    );
+
+    let only_ppp = ok(&mut s, "ip.pool.used.print", json!({"owner": "ppp"}));
+    assert_eq!(only_ppp["total"], 3);
+    let only_dhcp = ok(&mut s, "ip.pool.used.print", json!({"owner": "dhcp"}));
+    assert_eq!(only_dhcp["total"], 5);
+    assert!(
+        only_dhcp["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["service"] == "dhcp")
+    );
+    let assin = ok(&mut s, "ip.pool.used.print", json!({"pool": "assin"}));
+    assert_eq!(assin["total"], 2);
+    let ana = ok(&mut s, "ip.pool.used.print", json!({"find": "ANA"}));
+    assert_eq!(ana["total"], 1, "{ana:#}");
+    let page = ok(&mut s, "ip.pool.used.print", json!({"limit": 2}));
+    assert_eq!(page["total"], 8);
+    let addrs: Vec<&str> = page["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["address"].as_str().unwrap())
+        .collect();
+    assert_eq!(addrs, ["100.64.0.2", "100.64.0.3"]);
+
+    assert!(err(&mut s, "ip.pool.used.print", json!({"owner": "radius"})).contains("dhcp or ppp"));
+    assert!(err(&mut s, "ip.pool.used.print", json!({"limit": 0})).contains("1..=100000"));
+    assert!(err(&mut s, "ip.pool.used.print", json!({"pool": "nope"})).contains("no pool"));
+
+    let pools = ok(&mut s, "ip.pool.print", json!({}));
+    let by = |n: &str| {
+        pools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == n)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(by("assin")["used"], 2);
+    assert_eq!(by("assin")["ppp"], 2);
+    assert_eq!(by("assin")["available"], 251);
+    assert_eq!(by("assin")["percent"], 0);
+    assert_eq!(by("lan")["used"], 5, "4 leases + the session");
+    assert_eq!(by("lan")["ppp"], 1);
+}
+
+/// G4.2i: one pool for the DHCP server and a PPP profile in use is a
+/// warning on the pool; a profile only IPoE secrets name is not (IPoE's
+/// addresses are the DHCP server's).
+#[test]
+fn a_pool_shared_by_dhcp_and_ppp_is_a_warning() {
+    let mut s = Session::virtual_lab();
+    lan(&mut s);
+    let label = |s: &mut Session| -> Vec<String> {
+        ok(s, "ip.pool.print", json!({}))[0]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["label"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    ok(
+        &mut s,
+        "ppp.profile.add",
+        json!({"name": "assin", "remote_address": "lan"}),
+    );
+    assert!(
+        !label(&mut s).contains(&"DHCP + PPP".to_owned()),
+        "no PPP user yet"
+    );
+    ok(
+        &mut s,
+        "ppp.secret.add",
+        json!({"name": "olt1/3", "service": "ipoe", "profile": "assin"}),
+    );
+    assert!(
+        !label(&mut s).contains(&"DHCP + PPP".to_owned()),
+        "IPoE only"
+    );
+    ok(
+        &mut s,
+        "ppp.secret.add",
+        json!({"name": "bob", "password": "x", "service": "pppoe", "profile": "assin"}),
+    );
+    let checks = ok(&mut s, "ip.pool.print", json!({}))[0]["checks"].clone();
+    let warn = checks
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["label"] == "DHCP + PPP")
+        .unwrap_or_else(|| panic!("{checks:#}"));
+    assert_eq!(warn["level"], "warn");
+    assert!(
+        warn["text"]
+            .as_str()
+            .unwrap()
+            .contains("PPP profile 'assin'"),
+        "{warn}"
     );
 }
