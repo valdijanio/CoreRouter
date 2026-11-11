@@ -1,4 +1,4 @@
-//! G1.6zq: the name a helper process shows (`/proc/<pid>/comm`). PID 1 runs
+//! G1.6zr: the name a helper process shows (`/proc/<pid>/comm`). PID 1 runs
 //! its console setup and the live image's installer as `/proc/self/exe
 //! <mode>`, and the kernel names such a process after the file it ran:
 //! `exe`, which `system.resource.process.print` showed with no way to tell

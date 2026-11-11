@@ -15,7 +15,7 @@
 //! Readings from two samplers are never subtracted from each other: a new
 //! source starts the rates over. So while the service is alive (a reading
 //! of the last [`SERVICE_ALIVE_SECS`]) the commands serve its readings and
-//! never read the machine themselves (G1.6zq: a query between two slow
+//! never read the machine themselves (G1.6zr: a query between two slow
 //! readings threw the pair away, and with someone asking every few seconds
 //! the rates never came); a process list read on the spot fills only the
 //! processes.
@@ -444,7 +444,7 @@ impl Session {
             });
         // The service is alive: its reading stands (the next one is at most
         // 5 s away, 1 s once someone looks); reading here would switch the
-        // source and throw its pair away (G1.6zq).
+        // source and throw its pair away (G1.6zr).
         let alive = m.source == Some(Source::Service)
             && m.last.is_some()
             && age.is_some_and(|a| a <= SERVICE_ALIVE_SECS);

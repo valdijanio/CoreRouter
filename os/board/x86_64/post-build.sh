@@ -88,7 +88,7 @@ if [ -f "$T/usr/sbin/hostapd" ]; then
 	mv "$T/usr/sbin/hostapd" "$BINARIES_DIR/test-tools/hostapd"
 fi
 rm -f "$T/usr/bin/hostapd_cli" "$T/etc/hostapd.conf"
-# G1.6zq: pci.ids (hwdata) only for the PCI network cards the image's drivers
+# G1.6zr: pci.ids (hwdata) only for the PCI network cards the image's drivers
 # bind: the ids in the pci: aliases of the modules and built-ins under
 # drivers/net and of virtio_pci (a VM's virtio-net card is a PCI device of
 # its), named from the full database (vendor and device lines; the

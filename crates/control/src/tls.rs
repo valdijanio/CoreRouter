@@ -114,7 +114,7 @@ fn node_tag(dir: &Path) -> Option<String> {
     (tag.len() == 8 && tag.chars().all(|c| c.is_ascii_hexdigit())).then(|| tag.to_ascii_lowercase())
 }
 
-/// A new self-signed certificate and its key, as PEM (G1.6zq). Before, the
+/// A new self-signed certificate and its key, as PEM (G1.6zr). Before, the
 /// certificate was rcgen's sample: CN "rcgen self signed cert", valid from
 /// 1975 to 4096. Now:
 ///
@@ -125,7 +125,7 @@ fn node_tag(dir: &Path) -> Option<String> {
 ///   certificate), `localhost`, `127.0.0.1`, `::1`. The router's own
 ///   addresses and identity stay out: the certificate is pinned on first
 ///   use and an address change must not change it (a certificate made
-///   from them on demand is the gap G1.6zr);
+///   from them on demand is the gap G1.6zs);
 /// - valid from 2025-01-01 (before any CoreRouter, so a client whose clock
 ///   is behind still accepts it) to 9999-12-31 23:59:59, RFC 5280
 ///   §4.1.2.5's "no well-defined expiration date": a self-signed
@@ -422,7 +422,7 @@ mod tests {
         hay.windows(needle.len()).any(|w| w == needle)
     }
 
-    /// G1.6zq: the notebook's www-ssl and API showed rcgen's sample
+    /// G1.6zr: the notebook's www-ssl and API showed rcgen's sample
     /// certificate (CN "rcgen self signed cert", 1975–4096).
     #[test]
     fn the_certificate_says_whose_it_is_and_never_expires() {

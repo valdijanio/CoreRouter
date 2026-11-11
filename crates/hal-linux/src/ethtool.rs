@@ -792,7 +792,7 @@ pub(crate) fn bitset(set: Attrs<'_>) -> Vec<(String, bool)> {
 
 /// `PORT_*` of `include/uapi/linux/ethtool.h` (6.18: `PORT_TP 0x00`,
 /// `PORT_AUI 0x01`, `PORT_MII 0x02`, `PORT_FIBRE 0x03`, `PORT_BNC 0x04`,
-/// `PORT_DA 0x05`, `PORT_NONE 0xef`, `PORT_OTHER 0xff`). G1.6zq: BNC and
+/// `PORT_DA 0x05`, `PORT_NONE 0xef`, `PORT_OTHER 0xff`). G1.6zr: BNC and
 /// MII were swapped, so the r8152 (`mii_ethtool_get_link_ksettings`
 /// reports `PORT_MII`) showed as `bnc`.
 fn port_name(p: u8) -> String {
@@ -971,7 +971,7 @@ pub(crate) fn devlink_info(bus: &str, dev: &str, hw: &mut NicHardware) -> Result
 mod tests {
     use super::*;
 
-    /// G1.6zq: every `PORT_*` of `include/uapi/linux/ethtool.h` (6.18.59),
+    /// G1.6zr: every `PORT_*` of `include/uapi/linux/ethtool.h` (6.18.59),
     /// value by value.
     #[test]
     fn port_names_follow_the_kernel_header() {

@@ -111,7 +111,7 @@ pub fn parse(body: &[u8]) -> Option<RawNeigh> {
         }
     }
     let address = address?;
-    // G1.6zq: the kernel's own `NOARP` entries are not neighbors either:
+    // G1.6zr: the kernel's own `NOARP` entries are not neighbors either:
     // 0.0.0.0 on `lo` (and the loopback addresses) showed in `ip.arp.list`.
     if address.is_multicast() || address.is_unspecified() || address.is_loopback() {
         return None;
@@ -1014,7 +1014,7 @@ mod tests {
         assert!(parse(&body(AF_INET, 1, 0x02, 0, &[(NDA_DST, &[1, 2, 3])])).is_none());
     }
 
-    /// G1.6zq: the notebook's `ip.arp.list` had 0.0.0.0 /
+    /// G1.6zr: the notebook's `ip.arp.list` had 0.0.0.0 /
     /// 00:00:00:00:00:00 on `lo` (state NOARP), the kernel's own entry.
     #[test]
     fn the_kernels_unspecified_and_loopback_entries_are_not_neighbors() {

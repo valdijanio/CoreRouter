@@ -43,7 +43,7 @@ BR2_PACKAGE_LIBCAP=y
 BR2_PACKAGE_E2FSPROGS=y
 # BR2_PACKAGE_E2FSPROGS_FSCK is not set
 BR2_PACKAGE_E2FSPROGS_RESIZE2FS=y
-# G1.6zq: names of the PCI network cards (interface.hardware, the health
+# G1.6zr: names of the PCI network cards (interface.hardware, the health
 # check): hwdata's pci.ids, cut by post-build.sh to the cards the image's
 # network drivers bind (~66 KB of 1.4 MB). USB cards name themselves.
 BR2_PACKAGE_HWDATA=y

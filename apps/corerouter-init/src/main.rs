@@ -56,7 +56,7 @@ mod wifi_names;
 #[cfg(target_os = "linux")]
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // G1.6zq: not `exe` in the process list (PID 1 runs these through
+    // G1.6zr: not `exe` in the process list (PID 1 runs these through
     // `/proc/self/exe`).
     if let Some(name) = args.first().and_then(|m| comm::of_mode(m)) {
         let _ = comm::set(name);

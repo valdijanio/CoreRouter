@@ -131,7 +131,7 @@ const REQUIRED_KERNEL: &[&str] = &[
     "CONFIG_DRM_SIMPLEDRM",
     "CONFIG_DRM_FBDEV_EMULATION",
     "CONFIG_FRAMEBUFFER_CONSOLE",
-    // G1.6zq: /proc/pressure (Resources, the memory pressure check).
+    // G1.6zr: /proc/pressure (Resources, the memory pressure check).
     "CONFIG_PSI",
 ];
 /// G1.6j: drivers that must be modules. `ice` asks for its firmware while
@@ -1474,7 +1474,7 @@ pub(crate) fn build_with(
     Ok(())
 }
 
-/// G1.6zq: cards `/usr/share/hwdata/pci.ids` must name (vendor, device):
+/// G1.6zr: cards `/usr/share/hwdata/pci.ids` must name (vendor, device):
 /// the r8169 and rtw89 of the notebook audit, Intel's e1000e and igb, virtio.
 const PCI_NAMED: &[(&str, &str)] = &[
     ("10ec", "8168"),
@@ -1996,11 +1996,12 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
         // With --efi the guest has no address (the built-in command line).
         let seen = if b.efi {
             let skipped = "skipped: no address with --efi".to_owned();
-            (skipped.clone(), skipped)
+            (skipped.clone(), skipped.clone(), skipped)
         } else {
             (
                 cpus_check(root, &top, port, b.smp)?,
                 sensors_check(root, &top, port)?,
+                audit_check(root, &top, port)?,
             )
         };
         Ok((r, seen))
@@ -2010,7 +2011,7 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     let _ = std::fs::remove_file(&vars);
     let _ = std::fs::remove_file(&mon);
     let _ = std::fs::remove_file(&nvme);
-    let ((report, wall_ready, ping, web, hot), (cpus, sensors)) = res?;
+    let ((report, wall_ready, ping, web, hot), (cpus, sensors, audit)) = res?;
     eprintln!("\nboot-test ok ({}):", if kvm { "KVM" } else { "TCG" });
     eprintln!(
         "  kernel start → daemon answers ping: {:.3} s (corerouter-init)",
@@ -2028,6 +2029,7 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     eprintln!("  cards plugged in after boot (G1.6n, G1.6j): {hot}");
     eprintln!("  sensors (G1.6zf):                   {sensors}");
     eprintln!("  CPUs (G1.6zi):                      {cpus}");
+    eprintln!("  PSI and PCI names (G1.6zr):         {audit}");
     if let Some(kib) = report.idle_kib {
         eprintln!(
             "  idle memory in use:                 {:.1} MiB",
@@ -2040,6 +2042,17 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
 /// `corerouter-cli run` on the booted image, as `admin` over TLS (no password
 /// on a first boot).
 fn guest_cli(root: &Path, top: &Path, port: u16, id: &str) -> Result<String, String> {
+    guest_cli_with(root, top, port, id, "{}")
+}
+
+/// [`guest_cli`] with parameters.
+fn guest_cli_with(
+    root: &Path,
+    top: &Path,
+    port: u16,
+    id: &str,
+    params: &str,
+) -> Result<String, String> {
     let cli = push::cli(root)?;
     let home = top.join("boot-test-home");
     let who = install::Admin {
@@ -2047,9 +2060,41 @@ fn guest_cli(root: &Path, top: &Path, port: u16, id: &str) -> Result<String, Str
         password: "",
         strict: false,
     };
-    let out = install::cli_run(&cli, &who, port, id, "{}");
+    let out = install::cli_run(&cli, &who, port, id, params);
     let _ = std::fs::remove_dir_all(&home);
     out
+}
+
+/// G1.6zr: the kernel has PSI (`/proc/pressure`: Resources and the memory
+/// pressure check were always empty) and the image names its PCI cards
+/// (`pci.ids`, cut to the network cards): ether2 is QEMU's e100 (Intel
+/// 82557, on the PCI bus; a virtio-net port's device is the virtio one).
+fn audit_check(root: &Path, top: &Path, port: u16) -> Result<String, String> {
+    let get = |id: &str, params: &str| -> Result<serde_json::Value, String> {
+        let got = guest_cli_with(root, top, port, id, params)?;
+        serde_json::from_str(got.trim()).map_err(|e| format!("{id}: {e}: {got:.300}"))
+    };
+    let res = get("system.resource.print", "{}")?;
+    let memory = &res["pressure"]["memory"];
+    if memory.is_null() {
+        return Err(format!(
+            "G1.6zr: system.resource.print has no memory pressure (CONFIG_PSI off?): {}",
+            res["pressure"]
+        ));
+    }
+    let hw = get("interface.hardware", r#"{"name":"ether2"}"#)?;
+    let text = |k: &str| hw[k].as_str().unwrap_or_default().to_owned();
+    if text("vendor").is_empty() || text("model").is_empty() {
+        return Err(format!(
+            "G1.6zr: interface.hardware ether2 ({}:{}) has no vendor/model name (pci.ids?)",
+            hw["vendor_id"], hw["device_id"]
+        ));
+    }
+    Ok(format!(
+        "pressure memory {memory}; ether2 = {} {}",
+        text("vendor"),
+        text("model")
+    ))
 }
 
 /// G1.6zi: the router uses every CPU the machine has (`system.resource.print`

@@ -126,7 +126,7 @@ struct Slot {
     delay: Duration,
     last_event: String,
     last_error: Option<String>,
-    /// `last_error` came from the current run's own report (G1.6zq): when
+    /// `last_error` came from the current run's own report (G1.6zr): when
     /// the service clears it (`Health::clear_error`), it goes away; the
     /// supervisor's word on a past failure stays until then.
     error_from_run: bool,
@@ -580,7 +580,7 @@ impl Supervisor {
                 if let Some(e) = &report.event {
                     slot.last_event.clone_from(e);
                 }
-                // G1.6zq: the NTP client kept "no server to ask" while
+                // G1.6zr: the NTP client kept "no server to ask" while
                 // synchronized: an error the service cleared stayed.
                 if report.error.is_some() {
                     slot.last_error.clone_from(&report.error);
@@ -719,7 +719,7 @@ mod tests {
         })
     }
 
-    /// G1.6zq: `ntp-client` showed `last_error: "no server to ask"` long
+    /// G1.6zr: `ntp-client` showed `last_error: "no server to ask"` long
     /// after the DHCP server's NTP server synchronized it.
     #[test]
     fn an_error_the_service_clears_leaves_its_row() {

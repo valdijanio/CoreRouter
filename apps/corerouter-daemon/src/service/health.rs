@@ -106,7 +106,7 @@ mod tests {
         assert!(text.contains("Saúde: NIC errors"), "{text}");
     }
 
-    /// G1.6zq: on the notebook nobody looked for two hours and the checks
+    /// G1.6zr: on the notebook nobody looked for two hours and the checks
     /// that need rates (`nic.errors`, `rss`) stayed `unknown`, the CPU of
     /// the history null: each query between two slow readings read the
     /// machine itself, and the switch of source threw the pair away (twice:

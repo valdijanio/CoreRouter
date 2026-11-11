@@ -373,7 +373,7 @@ mod tests {
         s.execute("system.resource.process.print", &json!({})).unwrap();
         let m = s.ext::<crate::system_resource::ResourceMonitor>().unwrap();
         let (t, _) = m.procs_last.as_ref().unwrap();
-        // G1.6zq: read on the spot, kept apart from the service's readings
+        // G1.6zr: read on the spot, kept apart from the service's readings
         // (whose pair stays): not the list of 10 minutes ago.
         assert_ne!(*t, 1000, "fresh list");
         assert!(*t + 2000 >= m.last.as_ref().unwrap().uptime_ms, "fresh list");

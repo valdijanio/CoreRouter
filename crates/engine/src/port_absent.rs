@@ -14,7 +14,7 @@ use serde_json::json;
 
 use crate::Session;
 
-/// Seconds a port may be gone before the log warns (G1.6zq). A USB
+/// Seconds a port may be gone before the log warns (G1.6zr). A USB
 /// adapter that switches its configuration at boot (the r8152's
 /// `r8152-cfgselector`) drops off for 2–4 s (**medido** on a notebook:
 /// two warnings and two "port is back" in 10 s); back within the grace, it
@@ -142,7 +142,7 @@ impl Session {
                     a.since.insert(n.clone(), now);
                 }
                 let returned: Vec<IfName> = a.gone.difference(&gone).cloned().collect();
-                // G1.6zq: warn once a port has been gone for the grace
+                // G1.6zr: warn once a port has been gone for the grace
                 // (at once without a clock).
                 let went: Vec<IfName> = gone
                     .iter()
@@ -155,7 +155,7 @@ impl Session {
                     .collect();
                 a.warned.extend(went.iter().cloned());
                 // G1.3d: back without ever being seen gone: replugged
-                // between two polls (the backend saw a new link). G1.6zq:
+                // between two polls (the backend saw a new link). G1.6zr:
                 // or back within the grace, never warned about.
                 let replugged: BTreeMap<IfName, Option<u64>> = back
                     .iter()
@@ -297,7 +297,7 @@ mod tests {
     fn a_port_unplugged_is_invalid_and_its_configuration_comes_back() {
         use corerouter_hal::virt::{LatePort, VirtualHal};
         // ether9 is plugged at poll 1, unplugged for polls 12..30 (longer
-        // than the grace of the warning, G1.6zq).
+        // than the grace of the warning, G1.6zr).
         let hal = VirtualHal::new(4).with_late_port(LatePort { name: n("ether9"), appears: 1, absent: Some(12..30) });
         let mut s = Session::new(Box::new(hal));
         for t in 0..6 {
@@ -335,7 +335,7 @@ mod tests {
         assert!(s.hal().absent_ports().is_empty(), "the reapply cleared it");
     }
 
-    /// G1.6zq: the r8152 switching its USB configuration at boot dropped
+    /// G1.6zr: the r8152 switching its USB configuration at boot dropped
     /// ether2 twice for 2–4 s, and each time the log warned "not on this
     /// machine" and then "port is back". Back within the grace: one info
     /// line, no warning.
