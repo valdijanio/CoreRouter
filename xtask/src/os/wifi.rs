@@ -19,6 +19,13 @@
 //!   and from the kernel (an echo across the encrypted link, the regulatory
 //!   domain, no line about `regulatory.db`).
 //!
+//! - G1.30j: the radio in monitor mode, beside its station (the snooper
+//!   must see the access point's beacons, the station, a deauthentication
+//!   and the 4-way handshake that a reconnect makes, and a pcap with the
+//!   radiotap link type) and then alone, hopping (the radio disabled);
+//!   the monitor interface gone afterwards. `mac80211_hwsim` sends each
+//!   frame once (no retransmissions without `wmediumd`), so retries are
+//!   the lab's (`lab_wifi_air`) and the unit tests';
 //! - a second boot (`--only setup` runs it alone) answers the first-boot
 //!   setup on the console as a person would, on a second console: the
 //!   radio as the management port, the country, the network out of the
@@ -748,6 +755,8 @@ fn run(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(), S
         format!("the history: {h}"),
     )?;
 
+    sniffer_beside(vm, log, nums)?;
+
     // Off: the radio leaves, and the supplicant ends with its last radio.
     vm.ok(log, "interface.wifi.disable", r#"{"name":"wifi2"}"#)?;
     until(vm, log, 20, "interface.wifi.list", "{}", |v| {
@@ -763,6 +772,170 @@ fn run(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(), S
         "wpa_supplicant still runs with no radio on",
     )?;
     nums.put("radio off", "left the network; wpa_supplicant ended");
+    sniffer_alone(vm, log, nums)?;
+    Ok(())
+}
+
+/// The station's MAC (`mac80211_hwsim`'s second radio).
+const STA_MAC: &str = "02:00:00:00:01:00";
+
+/// A sniffer task until it ends; its snooper table.
+fn sniffed(
+    vm: &mut Vm,
+    log: &mut std::fs::File,
+    id: &Value,
+    secs: u64,
+) -> Result<(Value, Value), String> {
+    let poll = serde_json::json!({"id": id}).to_string();
+    let done = until(vm, log, secs, "tool.task.poll", &poll, |v| {
+        v["result"]["done"] == true
+    })?;
+    let table = vm.ok(log, "interface.wifi.snooper.print", &poll)?;
+    Ok((done["result"].clone(), table))
+}
+
+fn network<'a>(table: &'a Value, bssid: &str) -> Option<&'a Value> {
+    table["networks"]
+        .as_array()?
+        .iter()
+        .find(|n| n["bssid"] == bssid)
+}
+
+/// G1.30j, the radio connected: a monitor beside the station, which stays
+/// on; a reconnect while it listens (a deauthentication, then the whole
+/// join again); then a capture into a pcap.
+fn sniffer_beside(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(), String> {
+    monitor(vm, log, 60, |m| m["state"] == "connected")?;
+    // A channel on a radio in use: refused, with the way out.
+    let e = vm.run(
+        log,
+        "interface.wifi.snooper.start",
+        r#"{"interface":"wifi2","channel":6}"#,
+    )?;
+    check(
+        e["ok"] == false && e.to_string().contains("interface.wifi.disable"),
+        format!("a channel on the station's radio was not refused: {e}"),
+    )?;
+    let start = vm.ok(
+        log,
+        "interface.wifi.snooper.start",
+        r#"{"interface":"wifi2","duration":12}"#,
+    )?;
+    check(
+        start["mode"] == "shared",
+        format!("not beside the station: {start}"),
+    )?;
+    let up = sh(vm, log, "{ sleep 1; ls /sys/class/net; }")?;
+    check(
+        up.contains("wifi2mon"),
+        format!("no monitor interface: {up}"),
+    )?;
+    sh(vm, log, "{ sleep 3; echo .; }")?;
+    vm.ok(log, "interface.wifi.reconnect", r#"{"name":"wifi2"}"#)?;
+    let (summary, t) = sniffed(vm, log, &start["id"], 40)?;
+    let m = monitor(vm, log, 60, |m| m["state"] == "connected")?;
+    let ap = network(&t, AP_BSSID)
+        .ok_or_else(|| format!("the access point is not in the table: {t}"))?;
+    check(
+        ap["ssid"] == SSID && ap["channel"] == 1 && ap["beacons"].as_u64().is_some_and(|b| b >= 50),
+        format!("the access point: {ap}"),
+    )?;
+    let sta = ap["stations"]
+        .as_array()
+        .and_then(|a| a.iter().find(|s| s["mac"] == STA_MAC))
+        .ok_or_else(|| format!("the station is not under its network: {ap}"))?;
+    let left = sta["deauth"].as_u64().unwrap_or(0) + sta["disassoc"].as_u64().unwrap_or(0);
+    check(
+        left >= 1 && sta["handshake"] == 4 && sta["reason"].is_string(),
+        format!("no deauth/handshake from the reconnect: {sta}"),
+    )?;
+    nums.put(
+        "snooper beside the station",
+        format!(
+            "{} frames in 12 s, {} beacons of {SSID}; the station {} (deauth/disassoc ×{left}, {}, handshake 4/4); still {}",
+            summary["frames"], ap["beacons"], sta["rate"], sta["reason"].as_str().unwrap_or(""), m["state"]
+        ),
+    );
+    // A capture: whole frames in a radiotap pcap.
+    let start = vm.ok(
+        log,
+        "interface.wifi.sniffer.start",
+        r#"{"interface":"wifi2","duration":6}"#,
+    )?;
+    let (summary, _) = sniffed(vm, log, &start["id"], 30)?;
+    let d = vm.ok(
+        log,
+        "interface.wifi.sniffer.download",
+        &serde_json::json!({"id": start["id"], "length": 64}).to_string(),
+    )?;
+    let head = d["data"].as_str().unwrap_or("");
+    // The 24-byte header in base64: magic D4 C3 B2 A1 and version 2.4
+    // ("1MOyoQIABAA"), then bytes 18–20 = 00 00 7F, the link type 127
+    // ("AAB/" at 24).
+    check(
+        head.starts_with("1MOyoQIABAA")
+            && head.get(24..28) == Some("AAB/")
+            && d["total"].as_u64().is_some_and(|t| t > 2000),
+        format!("the pcap: {d}"),
+    )?;
+    let packets = vm.ok(
+        log,
+        "interface.wifi.sniffer.packets",
+        &serde_json::json!({"id": start["id"], "max": 5}).to_string(),
+    )?;
+    check(
+        packets["packets"].as_array().is_some_and(|p| !p.is_empty()),
+        format!("no live list: {packets}"),
+    )?;
+    nums.put(
+        "capture beside the station",
+        format!(
+            "{} frames, pcap {} bytes (radiotap, link type 127)",
+            summary["kept"], d["total"]
+        ),
+    );
+    Ok(())
+}
+
+/// G1.30j, the radio disabled: the sniffer has it, hops 1/6/11 and finds
+/// the access point on 1; its interface is gone afterwards.
+fn sniffer_alone(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(), String> {
+    let start = vm.ok(
+        log,
+        "interface.wifi.snooper.start",
+        r#"{"interface":"wifi2","hop":true,"channels":"1,6,11","channel_time":300,"duration":9}"#,
+    )?;
+    check(
+        start["mode"] == "exclusive",
+        format!("not exclusive: {start}"),
+    )?;
+    let (summary, t) = sniffed(vm, log, &start["id"], 40)?;
+    check(
+        summary["hopping"] == true && summary["note"].is_null(),
+        format!("did not hop: {summary}"),
+    )?;
+    let ap = network(&t, AP_BSSID)
+        .ok_or_else(|| format!("the access point is not in the table: {t}"))?;
+    let freqs: Vec<u64> = t["channels"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|c| c["frequency"].as_u64()).collect())
+        .unwrap_or_default();
+    check(
+        freqs == [2412, 2437, 2462] && ap["channel"] == 1,
+        format!("channels {freqs:?}, access point {ap}"),
+    )?;
+    let gone = sh(vm, log, "{ sleep 1; ls /sys/class/net; }")?;
+    check(
+        !gone.contains("wifi2mon"),
+        format!("the monitor interface stayed: {gone}"),
+    )?;
+    nums.put(
+        "snooper alone, hopping 1/6/11",
+        format!(
+            "{} frames, {} beacons of {SSID} on channel 1; monitor interface removed",
+            summary["frames"], ap["beacons"]
+        ),
+    );
     Ok(())
 }
 

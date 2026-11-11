@@ -159,6 +159,8 @@ impl Session {
     /// says, tell each its network once, read what happened. `now_ms`: a
     /// monotonic clock.
     pub fn wifi_service(&mut self, now_ms: u64) {
+        // G1.30j: an exclusive sniffer gives the radio back to its station.
+        crate::cmd::wifi_sniffer::watch(self);
         let want = wanted(self.store().running());
         let idle = self.wifi().is_none_or(|rt| rt.radios.is_empty());
         if want.is_empty() && idle {

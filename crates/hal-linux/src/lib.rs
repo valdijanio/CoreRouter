@@ -212,6 +212,9 @@ pub mod wifi;
 /// Which links are Wi-Fi radios (G1.30): the link dump does not say.
 #[cfg(target_os = "linux")]
 mod wifi_links;
+// G1.30j: monitor mode (a monitor interface beside or instead of the station).
+#[cfg(target_os = "linux")]
+pub mod wifi_monitor;
 
 /// MPLS label switching over rtnetlink (G3.5): the label table, static
 /// entries in batches, the `net.mpls` knobs.
@@ -1542,6 +1545,10 @@ mod linux {
 
         fn wifi_regdomain(&mut self) -> Option<String> {
             crate::wifi::regdomain()
+        }
+
+        fn wifi_monitor(&self) -> Result<corerouter_hal::wifi_monitor::SharedWifiMonitor, String> {
+            Ok(std::sync::Arc::new(crate::wifi_monitor::LinuxMonitor))
         }
 
         fn pppoe_client_port(

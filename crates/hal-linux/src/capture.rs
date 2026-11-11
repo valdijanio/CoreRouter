@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use corerouter_hal::capture::{
     CaptureError, CaptureSocket, CaptureSpec, Dir, FrameBatch, LinkTotals, MAX_DEVICES,
-    MAX_SNAPLEN, PacketCapture,
+    MAX_SNAPLEN_RADIO, PacketCapture,
 };
 use corerouter_model::IfName;
 use nix::errno::Errno;
@@ -209,7 +209,9 @@ impl PacketCapture for HostCapture {
             sides,
             name: first.name.clone(),
             opened: Instant::now(),
-            buf: vec![0u8; usize::from(spec.snaplen.clamp(14, MAX_SNAPLEN))],
+            // Up to a Wi-Fi monitor's whole frame (G1.30j); Torch and the
+            // sniffer keep to MAX_SNAPLEN themselves.
+            buf: vec![0u8; usize::from(spec.snaplen.clamp(14, MAX_SNAPLEN_RADIO))],
             next: 0,
         }))
     }

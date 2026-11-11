@@ -138,6 +138,7 @@ pub(crate) const CATALOG: &[Entry] = &[
     e("tuning", None, None, icons::GAUGE, "/system tuning", &["system.tuning"], &["sysctl", "performance", "desempenho", "irq", "rps", "governor", "boot", "kernel"]),
     e("vrf", None, None, icons::STACK, "/ip vrf", &["ip.vrf"], &["routing table", "tabela de rotas", "l3vpn"]),
     e("wifi", None, None, icons::WIFI_HIGH, "/interface wifi", &["interface.wifi"], &["wi-fi", "wireless", "wlan", "sem fio", "rede sem fio", "ssid", "wpa", "wpa2", "wpa3", "senha do wifi", "passphrase", "station", "estação", "scan", "varredura", "country", "país", "regulatory", "access point", "ap", "uplink", "notebook"]),
+    e("wifi-sniffer", None, None, icons::BROADCAST, "/interface wifi sniffer", &["interface.wifi.sniffer", "interface.wifi.snooper"], &["monitor mode", "modo monitor", "snooper", "sniffer", "airodump", "kismet", "wireshark", "pcap", "radiotap", "802.11", "airtime", "tempo de ar", "retransmissão", "retry", "deauth", "evil twin", "gêmeo", "rogue", "ap falso", "eapol", "handshake", "hidden ssid", "rede oculta", "site survey", "flat-snoop", "canal", "channel"]),
     e("xdp", None, None, icons::SHIELD_CHECK, "", &["ip.firewall.xdp"], &["ddos", "anti-ddos", "ebpf", "bpf", "raw", "rate limit", "limite de taxa", "bloquear", "blacklist", "drop"]),
 ];
 

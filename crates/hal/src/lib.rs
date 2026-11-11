@@ -16,10 +16,12 @@ pub mod dhcp_server;
 pub mod drift;
 pub mod fastpath;
 pub mod icmp_ext;
+pub mod ieee80211;
 pub mod lab_conntrack;
 pub mod lab_flow;
 pub mod lab_neigh;
 pub mod lab_wifi;
+pub mod lab_wifi_air;
 pub mod link_reader;
 pub mod lsp;
 pub mod mpls;
@@ -41,6 +43,7 @@ pub mod system_resource;
 pub mod tuning;
 pub mod virt;
 pub mod wifi;
+pub mod wifi_monitor;
 pub mod xdp;
 pub mod xdp_nat;
 
@@ -409,6 +412,12 @@ pub trait Hal: Send {
             self.describe(),
             country.unwrap_or("the world domain")
         )))
+    }
+
+    /// Monitor mode on Wi-Fi radios (G1.30j), shared with task threads;
+    /// `Err(why)` when this backend has none.
+    fn wifi_monitor(&self) -> Result<wifi_monitor::SharedWifiMonitor, String> {
+        Err(format!("{} has no Wi-Fi monitor mode", self.describe()))
     }
 
     /// What the platform knows about the radio behind `name`.
