@@ -31,7 +31,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "NTP Client",
         ["System", "NTP Client"],
         None,
-        "{enabled?: bool, servers?: [string], min_poll?: int 6..17, max_poll?: int 6..17, vrf?: string (default main), set_system_clock?: bool (default yes; no only measures)} → {enabled, servers, min_poll, max_poll, vrf, set_system_clock}",
+        "{enabled?: bool, servers?: [string] (may be empty: the client then asks the servers a DHCP client with use_peer_ntp learns), min_poll?: int 6..17, max_poll?: int 6..17, vrf?: string (default main), set_system_clock?: bool (default yes; no only measures)} → {enabled, servers, min_poll, max_poll, vrf, set_system_clock, warning?}",
         always,
         set
     ),
@@ -169,14 +169,24 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         .dhcp_clients
         .iter()
         .any(|d| d.use_peer_ntp && !d.disabled);
-    if c.enabled && c.servers.is_empty() && !dhcp_brings {
-        return Err(EngineError::bad(
-            "servers",
-            "an enabled NTP client needs at least one server (e.g. \"pool.ntp.org\"), \
-             or a DHCP client with use_peer_ntp",
-        ));
+    // G1.6zh: on with nobody to ask is a state, not an error: it is how a
+    // new router starts (the DHCP clients come after), and removing the
+    // last DHCP client got there anyway. The answer, the status and the
+    // health check say what is missing.
+    let mut out = settings_json(&c);
+    if c.enabled
+        && c.servers.is_empty()
+        && !dhcp_brings
+        && let Some(o) = out.as_object_mut()
+    {
+        o.insert(
+            "warning".into(),
+            json!(
+                "no server to ask yet: the client waits for a DHCP client with use_peer_ntp \
+                 to learn one (option 42); or set servers, e.g. [\"pool.ntp.org\"]"
+            ),
+        );
     }
-    let out = settings_json(&c);
     s.store_mut().candidate_mut().system.ntp_client = c;
     Ok(out)
 }

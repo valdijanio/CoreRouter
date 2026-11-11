@@ -20,13 +20,20 @@ pub const MAX_SERVERS: usize = 8;
 pub const POLL_RANGE: std::ops::RangeInclusive<u8> = 6..=17;
 pub const DEFAULT_MIN_POLL: u8 = 6;
 pub const DEFAULT_MAX_POLL: u8 = 10;
+/// `last_error` of a round that had nobody to ask: no server configured and
+/// none learned from a DHCP client (G1.6zh). A state, not a failure: the
+/// log and the health check tell it apart from servers that do not answer.
+pub const NO_SERVER: &str = "no server to ask";
 /// Longest server name (a DNS name is at most 253 characters).
 pub const MAX_SERVER_LEN: usize = 253;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NtpClient {
-    /// RouterOS default: off.
+    /// Off unless the config says so (RouterOS's default, and what a file
+    /// saved without this key means). A router that never saved a config
+    /// starts with it on, asking only the servers its DHCP clients learn
+    /// (G1.6zh: the daemon's `ntp-client` service, never this default).
     pub enabled: bool,
     /// IP addresses or DNS names, asked in every poll round.
     pub servers: Vec<String>,

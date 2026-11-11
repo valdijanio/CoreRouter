@@ -13,9 +13,10 @@ use crate::Session;
 pub struct Live;
 
 /// What may change something on a live image: a prefix ending in `.`, or a
-/// whole id. The port and the client side of the network, the web GUI the
-/// install is made from (`--web-factory-on` turns it on through here), a
-/// password, an install, the power.
+/// whole id. The port and the client side of the network (the NTP client
+/// too, G1.6zh: the clock of a live image is as wrong as any other), the
+/// web GUI the install is made from (`--web-factory-on` turns it on through
+/// here), a password, an install, the power.
 const ALLOWED: &[&str] = &[
     "interface.set",
     "interface.ethernet.adopt",
@@ -26,6 +27,7 @@ const ALLOWED: &[&str] = &[
     "ip.service.www-ssl.",
     "ip.service.www.",
     "user.",
+    "system.ntp.client.",
     "system.install.",
     "system.reboot",
     "system.shutdown",
@@ -68,6 +70,21 @@ mod tests {
         let mut s = Session::new(Box::new(VirtualHal::default()));
         set(&mut s);
         s
+    }
+
+    /// G1.6zh: the clock of a live image needs the NTP client as much as
+    /// an installed router's (the install log, TLS, certificates).
+    #[test]
+    fn the_ntp_client_works_on_a_live_image() {
+        let mut s = live();
+        s.execute("system.ntp.client.set", &json!({"enabled": true})).unwrap();
+        assert!(s.store().running().system.ntp_client.enabled);
+        // The server side stays refused: nothing is offered to the network.
+        let e = s
+            .execute("system.ntp.server.set", &json!({"enabled": true}))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("live image"), "{e}");
     }
 
     #[test]
