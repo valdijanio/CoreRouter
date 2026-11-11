@@ -175,6 +175,9 @@ com `security=wpa2` (o SAE precisa da frase).
   reconectar): pede Safe Mode, em que perder a conexão desfaz a mudança, ou `force=yes`.
 - **Rádio em bridge:** uma estação leva três endereços no quadro e só o próprio MAC atravessa
   o AP; o kernel também recusa (`IFF_DONT_BRIDGE`). A mensagem diz para rotear.
+- **Rádio em bonding** (G1.30m): pelo mesmo motivo, e porque o bonding troca o MAC das portas.
+  A janela New/Edit Bonding mostra as portas Wi-Fi cinza, com um ⓘ que explica e aponta o
+  `station-bridge` (quatro endereços) como o caminho entre dois CoreRouters.
 - **Rede 802.1X, OWE, WEP ou só WPA/TKIP:** aparecem na varredura com `joinable: false` e o
   motivo. Digitada à mão (`interface.wifi.set`, CLI ou MCP), uma rede que a última varredura
   ouviu só assim é aceita com um aviso que diz o motivo, e o `preview` mostra o mesmo aviso;

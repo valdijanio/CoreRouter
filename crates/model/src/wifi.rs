@@ -35,6 +35,15 @@ pub const NO_BRIDGE: &str = "a Wi-Fi station cannot be a bridge port: its frames
                              through it (with source NAT if the network behind the access point \
                              has no route back)";
 
+/// Why a station is never a bonding slave (G1.30m): the bond gives its
+/// slaves one MAC and sends other machines' frames, and the access point
+/// only passes the station's own address. Station-bridge (four addresses)
+/// is the way between two routers.
+pub const NO_BOND: &str = "a Wi-Fi station's frames carry three addresses, so the access point \
+                           only passes its own MAC, and a bond changes it. Route through it; \
+                           between two CoreRouters, station-bridge mode (G1.30m) will carry a \
+                           bond";
+
 /// Why an interface is not enabled with no country set (the validation's
 /// message: a batch may set the two in any order).
 pub const NO_COUNTRY: &str = "a Wi-Fi interface cannot be enabled before the country is set: it \

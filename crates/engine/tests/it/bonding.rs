@@ -437,3 +437,28 @@ fn config_with_bond_round_trips_through_json() {
     let back: corerouter_model::Config = serde_json::from_str(&text).unwrap();
     assert_eq!(back, cfg);
 }
+
+/// G1.30m: a Wi-Fi client is refused as a slave, with the reason (three
+/// addresses, the bond changes the MAC) and the way out (station-bridge).
+#[test]
+fn a_wifi_client_is_not_a_slave() {
+    let mut s = Session::new(Box::new(corerouter_hal::VirtualHal::new(8).with_wifi(1)));
+    for t in 0..4 {
+        s.tick(1_000 + t);
+    }
+    assert!(
+        s.store()
+            .running()
+            .interfaces
+            .contains_key(&"wifi1".parse().unwrap()),
+        "the lab's radio was adopted"
+    );
+    for needle in ["is a Wi-Fi client", "three addresses", "station-bridge"] {
+        fails(
+            &mut s,
+            "interface.bonding.add",
+            json!({"name": "bond1", "slaves": ["ether1", "wifi1"], "mode": "active-backup"}),
+            needle,
+        );
+    }
+}
