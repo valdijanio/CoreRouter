@@ -383,6 +383,7 @@ mod tests {
                 tx_dropped: 8,
             }),
             bus: Some("usb".into()),
+            wireless: false,
         };
         assert_eq!(out, [want]);
     }

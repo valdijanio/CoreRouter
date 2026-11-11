@@ -820,7 +820,7 @@ em `/sys/bus/{pci,usb,mdio_bus}/devices` e o `/dev/kmsg`, com a posição própr
 | Firmware | `Direct firmware load…` e as mensagens próprias de quem pede sem aviso (`r8169`, `r8152`, `e100`, `tg3`, `cxgb4`, PHYs), só de placa de rede | o arquivo, o erro e o que fazer |
 | `ice` em Safe Mode | a mensagem de `ice_log_pkg_init`; ou o máximo de 1 canal com mais de uma CPU (`ice_ethtool.c:3803`), que sobrevive a um log que deu a volta | o motivo: arquivo faltando, inválido, versão |
 
-**Não contam:** `regulatory.db` (pedido a todo kernel com Wi-Fi), `cxgb4/*-config.txt` (a placa usa o
+**Não contam:** `regulatory.db` (desde a G1.30 a imagem o traz; a linha só aparece em imagem anterior), `cxgb4/*-config.txt` (a placa usa o
 da flash), `ice-<serial>.pkg` (opcional), qualquer linha de outro dispositivo (vídeo, Bluetooth), Wi-Fi
 (classe `0x0280`, listada em `ignored`) e função virtual sem driver. Na ISO, firmware e Safe Mode
 são o esperado: nota, não aviso. Um cartão sem driver na ISO continua avisando, porque o operador
@@ -861,7 +861,8 @@ o que as distribuições evitam. O `r8169` e o `tg3`, embutidos, pedem o firmwar
 placa física foi testada ainda.
 
 **Fora de propósito:** Netronome, LiquidIO, Octeon EP, Mellanox Spectrum e Prestera (ASIC de switch
-ou SmartNIC, com firmware grande), Wi-Fi, LTE e tethering, PCMCIA, drivers fora da árvore do kernel.
+ou SmartNIC, com firmware grande), LTE e tethering, PCMCIA, drivers fora da árvore do kernel. As
+placas Wi-Fi têm lista própria, no fim do `nics.fragment` (G1.30, abaixo).
 
 **Sem firmware na imagem (linhas `skip` da trava):** Adaptec Starfire (o `WHENCE` não dá
 permissão), `acenic`, `cassini` e `tehuti/aqr105-tn40xx.cld` (o `linux-firmware` não tem o
@@ -898,6 +899,48 @@ da lista.
 | `BOOTX64.EFI` da ISO | 19 428 352 B | 21 447 680 B (limite da FAT: 32 MiB) |
 | Memória ociosa | 79–86 MiB | 72–76 MiB: o conjunto amplo não aumenta (a variação é entre rodadas) |
 | `ready` depois do kernel | 0,98–1,02 s | 0,98–1,07 s |
+
+### Wi-Fi (G1.30)
+
+Desde a G1.30 a imagem traz o que um rádio em modo estação precisa. O desenho, a pesquisa e a
+escolha de drivers estão em `docs/wifi.md`; aqui fica o que toca a imagem.
+
+| Peça | Como entra | Onde |
+|---|---|---|
+| Pilha (`cfg80211`, `mac80211`, `rfkill`) | módulo, carregada com o driver da placa. Embutida (como o `x86_64_defconfig` deixava), ela pedia o `regulatory.db` antes do `/` e ficava sem base para sempre | `nics.fragment`, `REQUIRED_NICS` |
+| Drivers | `iwlwifi` (+`iwlmvm`, `iwlmld`), `mt7921e`, `mt7925e`, `rtw88`, `rtw89`; `mac80211_hwsim` para teste | `nics.fragment` |
+| Firmware | na trava, com a regra do `iwlwifi` (a versão mais nova que o driver tenta, não a que ele declara) | `firmware.rs`, `iwlwifi_requests` |
+| `regulatory.db` e `.p7s` | do pacote `wireless-regdb`, instalados pelo `corerouter-firmware`, o dono de `lib/firmware` | `corerouter-firmware.mk`, `firmware::verify` |
+| `wpa_supplicant` 2.12 | nl80211, WPA3, socket de controle; sem D-Bus, `wpa_cli` nem arquivo de configuração | defconfig, `REQUIRED_BR2`, `post-build.sh` |
+| Carga | passada `Wifi` do PID 1, depois do sinal de boot pronto; o `iwlwifi` vem com as duas metades | `corerouter-init/src/modules.rs` |
+| ISO live | sem a pilha: o kernel da ISO não constrói nenhum driver de rádio | `installer.fragment`, `INSTALLER_OFF` |
+
+**Pegadinha achada no QEMU.** O `cargo xtask os build` esvazia o `lib/firmware` de todas as
+pastas por pacote a cada build (para o firmware de uma trava antiga não sobrar) e só o
+`corerouter-firmware` o enche de novo. O `wireless-regdb` instala o `regulatory.db` uma vez; no
+segundo build da mesma árvore o arquivo sumia e o kernel dizia `cfg80211: failed to load
+regulatory.db`. Por isso quem instala a base é o `corerouter-firmware`, e o `firmware::verify`
+reprova uma imagem com `cfg80211.ko` e sem a base.
+
+**Acrescentar uma família de drivers:** ligue os símbolos no `nics.fragment`, rode o build (ele
+falha no fim, dizendo o firmware que falta), rode `cargo xtask os firmware-lock --tag <tag>` e o
+build de novo. A exigência de uma família nova no `firmware::check` só entra depois da trava.
+
+**Números (medido, 2026-11-11, QEMU/KVM nesta máquina; antes = G1.6zd):**
+
+| O quê | Antes | Depois |
+|---|---|---|
+| `bzImage` | 18 371 584 B | 17 376 256 B (−0,95 MiB: a pilha saiu do kernel) |
+| `rootfs.squashfs` | 56 094 720 B | 90 030 080 B (+32,36 MiB) |
+| `corerouter.crpkg` | 74 909 271 B | 108 123 735 B (+31,68 MiB) |
+| ISO | 139 735 040 B | 171 954 176 B (+30,73 MiB) |
+| `live-modules.img` | 5 607 424 B | 5 607 424 B (igual) |
+| Kernel da ISO (`BOOTX64.EFI`) | 19 633 152 B | 18 777 088 B (−0,82 MiB) |
+| Firmware de Wi-Fi na trava | – | 61 arquivos, 62 961 222 B crus (39 do `iwlwifi`: 30 `.ucode` e 9 `.pnvm`) |
+| Módulos de Wi-Fi | – | 55 `.ko`, 23 068 224 B |
+| `wpa_supplicant` e bibliotecas | – | 9 018 784 B crus (`libcrypto` 6 082 880, `wpa_supplicant` 1 456 944, `libssl` 1 064 672) |
+| Nomes que o `iwlwifi` declara | – | 49, dos quais 30 não existem na tag (viram `skip`) |
+| Carga do `mac80211_hwsim` com a pilha, no boot | – | 114 ms (`boot-test --wifi`) |
 
 ### Pesquisa
 
@@ -1092,7 +1135,7 @@ instalador acima.
   (`mount -o loop`, `switch_root`: sem `ioctl` em Rust, que exigiria `unsafe`). Na raiz nova, o
   init roda de novo (`--live-root`), como o de um roteador. A pendrive fica até o fim da instalação:
   a carga é lida dela na hora de gravar.
-- **Se algo falha, instala igual.** Menos de 320 MiB de RAM (G1.6za, abaixo), mídia ruim ou erro na troca de raiz:
+- **Se algo falha, instala igual.** Menos de 448 MiB de RAM (G1.6za e G1.30, abaixo), mídia ruim ou erro na troca de raiz:
   fica no instalador de console, que não precisa de nada disso. O `fw_cfg` do hipervisor vai
   direto para ele.
 - **Não toca em disco nenhum.** `/config` é um tmpfs (não procura a partição `config` de um
@@ -1192,6 +1235,15 @@ senha (Argon2) leva o daemon a ~128 MiB, e o OOM o matava a cada login, levando 
 andamento: `job` e `result` voltavam a `null`, sem erro na tela. Com a raiz na RAM crescendo de 37 para 47 MiB (G1.6j), 256 MiB
 deixou de bastar. Com 288 MiB instala, com pouca folga; com 320 MiB instala e continua logando (**medido**). Abaixo disso fica no
 instalador de console.
+
+**E de 320 para 448 MiB na G1.30.** A raiz na RAM foi de 47 para 86 MiB com o firmware de Wi-Fi, e
+a mesma falha voltou no `install-test`: com 320 MiB o primeiro login com senha mata o daemon
+(`corerouter-daemon exited … terminating_signal: 9`) e a instalação em andamento some. Com 384 MiB
+instala quase sempre, mas sem folga: no pior momento 300 dos 329 MiB que a máquina mostra sob OVMF
+estavam em uso, e 1 de 11 instalações falhou (a do `install-test`). O mínimo passou a 448 MiB (`LIVE_MIN_RAM_KIB`:
+`MemTotal` de 370 MiB), que é o que o teste usa (**medido**, QEMU/KVM). Abaixo disso a ISO fica no
+instalador de console, que instala igual. O roteador instalado não paga isso: nele a raiz é lida do
+disco.
 
 **Desempenho e paralelismo.** A carga é lida e conferida uma vez, em fluxo, com custo proporcional ao
 tamanho dela (29–31 ms). No boot, o custo é o de sempre em `modules.rs`: cada dispositivo sem driver

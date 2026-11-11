@@ -621,8 +621,9 @@ fn live_two_disks(t: &mut T, name: &str, port: u16) -> Result<(Vm, PathBuf), Str
     let _ = std::fs::remove_file(&qmp);
     let mut cmd = qemu_machine(t.kvm, t.fw, &t.vars());
     // The least the live image takes: the install and a login with a password
-    // must fit too. The last `-m` wins.
-    cmd.args(["-m", "320"]);
+    // must fit too (448 MiB since G1.30: the root in RAM grew by the Wi-Fi
+    // firmware). The last `-m` wins.
+    cmd.args(["-m", "448"]);
     cmd.arg("-qmp")
         .arg(format!("unix:{},server=on,wait=off", qmp.display()));
     for (id, serial) in [("blank", "BLANK"), ("data", "DATA")] {
@@ -982,7 +983,7 @@ fn live_modules(t: &mut T) -> Result<(), String> {
     let _ = std::fs::remove_file(&mon);
     let mut cmd = qemu_machine(t.kvm, t.fw, &t.vars());
     // The least the live image takes, as in `live_two_disks`.
-    cmd.args(["-m", "320"]);
+    cmd.args(["-m", "448"]);
     cmd.arg("-monitor")
         .arg(format!("unix:{},server=on,wait=off", mon.display()));
     cmd.arg("-drive").arg(format!(

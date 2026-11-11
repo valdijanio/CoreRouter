@@ -7,9 +7,9 @@
 # what those need (docs/os-image.md tells how to refresh it for a new kernel).
 #
 # Left out on purpose: switch ASICs and SmartNICs with big firmware
-# (Netronome, LiquidIO, Octeon EP, Mellanox Spectrum, Prestera), Wi-Fi, LTE
+# (Netronome, LiquidIO, Octeon EP, Mellanox Spectrum, Prestera), LTE
 # and tethering (HSO, Sierra, QMI, MBIM, Huawei NCM, VL600, Kalmia, iPhone),
-# PCMCIA cards.
+# PCMCIA cards. Wi-Fi is the list at the end of this file (G1.30).
 #
 # DWMAC_INTEL (Intel mGbE on Atom and Core boards) needs the clock framework,
 # and the Atheros AR803x PHY the regulator one.
@@ -190,3 +190,56 @@ CONFIG_VITESSE_PHY=m
 CONFIG_VORTEX=m
 CONFIG_WINBOND_840=m
 CONFIG_YELLOWFIN=m
+# G1.30: Wi-Fi in station mode (the router joins a network as a client).
+# Not from the kernel's list above: chosen, with their firmware measured
+# (docs/os-image.md, "Wi-Fi"): the cards of the notebooks and mini PCs of
+# the last ten years. Atheros and Broadcom are out: ath11k/ath12k build the
+# firmware's name while running and half of brcmfmac's is not in
+# linux-firmware, so the lock cannot follow them.
+#
+# The stack itself was built in by the x86_64 defconfig with no card driver
+# at all, and cfg80211 then asked for regulatory.db at 0.3 s, before / is
+# mounted ("failed to load regulatory.db" at every boot), after which no
+# country can be set (net/wireless/reg.c: regdb stays ERR_PTR(-ENODATA)).
+# As modules they load with the card's driver, after / is up, and a machine
+# with no Wi-Fi card pays nothing.
+CONFIG_CFG80211=m
+CONFIG_MAC80211=m
+CONFIG_RFKILL=m
+# The Eee PC hotkey driver came with the defconfig and follows RFKILL to =m.
+# CONFIG_EEEPC_LAPTOP is not set
+# Intel: 3160/7260/8260/9260 (AC), AX200/AX201/AX210/AX211 (iwlmvm), BE200
+# and BE201 (iwlmld). Not the 2008-2012 cards (iwldvm: 1000 to 6000).
+CONFIG_IWLWIFI=m
+CONFIG_IWLMVM=m
+CONFIG_IWLMLD=m
+# CONFIG_IWLDVM is not set
+# MediaTek MT7921/MT7922 and MT7925 (PCIe).
+CONFIG_MT7921E=m
+CONFIG_MT7925E=m
+# Realtek 802.11ac (rtw88) and 802.11ax/be (rtw89), PCIe and USB.
+CONFIG_RTW88=m
+CONFIG_RTW88_8822BE=m
+CONFIG_RTW88_8822CE=m
+CONFIG_RTW88_8723DE=m
+CONFIG_RTW88_8821CE=m
+CONFIG_RTW88_8814AE=m
+CONFIG_RTW88_8822BU=m
+CONFIG_RTW88_8822CU=m
+CONFIG_RTW88_8821CU=m
+CONFIG_RTW88_8812AU=m
+CONFIG_RTW88_8821AU=m
+CONFIG_RTW89=m
+CONFIG_RTW89_8851BE=m
+CONFIG_RTW89_8852AE=m
+CONFIG_RTW89_8852BE=m
+CONFIG_RTW89_8852BTE=m
+CONFIG_RTW89_8852CE=m
+CONFIG_RTW89_8922AE=m
+CONFIG_RTW89_8851BU=m
+CONFIG_RTW89_8852BU=m
+# The kernel's simulated radios: no device asks for it, so it never loads by
+# itself. corerouter.hwsim=N on the kernel command line loads it with N
+# radios: how `cargo xtask os boot-test` checks the stack in QEMU, which
+# emulates no Wi-Fi card.
+CONFIG_MAC80211_HWSIM=m

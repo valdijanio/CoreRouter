@@ -28,8 +28,16 @@
 //! waiting, only on a real machine and unless `corerouter.sensors=off`. The
 //! sensors that bind to a device the machine lists (CPU, NVMe, SATA, chipset)
 //! are built into the kernel.
+//!
+//! G1.30: the Wi-Fi cards' drivers (`kernel/drivers/net/wireless/`) have a
+//! pass of their own, after the boot's: a radio is not one of the ports the
+//! boot names, and its driver's probe (firmware, calibration) must not be in
+//! the boot's wait. The stack (cfg80211, mac80211, rfkill) is a module too
+//! and comes with the first driver that needs it: cfg80211 then reads the
+//! regulatory database from `/`, which the built-in one could not.
 
 use std::collections::HashMap;
+use std::ffi::{CStr, CString};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -41,6 +49,20 @@ const MODULES: &str = "/lib/modules";
 /// and the screen's.
 const NET_DRIVERS: &str = "kernel/drivers/net/";
 const SCREEN_DRIVERS: &str = "kernel/drivers/gpu/drm/";
+/// Inside [`NET_DRIVERS`]: the radios, which are not the boot's ports.
+const WIFI_DRIVERS: &str = "kernel/drivers/net/wireless/";
+/// Modules no device asks for and their driver needs: loaded with it.
+/// `iwlwifi` is the bus half of Intel's driver; it finds out from the
+/// firmware which half talks to it (`iwlmvm` up to Wi-Fi 6E, `iwlmld` for
+/// Wi-Fi 7) and asks the kernel to run `/sbin/modprobe` for that one
+/// (`iwl-drv.c`, `request_module_nowait`), which nothing here answers for
+/// sure. With both already in, whichever the firmware names starts the card
+/// (`iwl_opmode_register`).
+const COMPANIONS: [(&str, &[&str]); 1] = [("iwlwifi", &["iwlmvm", "iwlmld"])];
+/// The kernel's simulated radios (`corerouter.hwsim=N`): a test's.
+const HWSIM: &str = "mac80211_hwsim";
+/// Where a radio shows up, one entry each (`phy0`).
+const RADIOS: &str = "/sys/class/ieee80211";
 /// The sensor drivers: by name, never by a device's alias.
 const SENSOR_DRIVERS: &str = "kernel/drivers/hwmon/";
 /// G1.6zf: the Super-I/O families of x86 boards, by module name: Nuvoton
@@ -135,6 +157,8 @@ pub enum Pass {
     /// The network drivers: the boot waits for them, the ports' names
     /// depend on what they find.
     Ports,
+    /// The Wi-Fi cards' drivers (G1.30): after the boot's, nothing waits.
+    Wifi,
     /// The screen's driver: nothing waits for it.
     Screen,
     /// A device that arrived with the router running: whatever it asks for.
@@ -227,12 +251,12 @@ impl Index {
 
     /// Is `module` one of the pass's? Its own file is the chain's last.
     fn in_pass(&self, module: &str, pass: Pass) -> bool {
-        let net = self
-            .chain(module)
-            .last()
-            .is_some_and(|p| p.starts_with(NET_DRIVERS));
+        let file = self.chain(module).last().map_or("", String::as_str);
+        let wifi = file.starts_with(WIFI_DRIVERS);
+        let net = file.starts_with(NET_DRIVERS);
         match pass {
-            Pass::Ports => net,
+            Pass::Ports => net && !wifi,
+            Pass::Wifi => wifi,
             Pass::Screen => !net,
             Pass::Any => true,
         }
@@ -277,9 +301,9 @@ fn unbound_devices() -> Vec<String> {
 
 /// One file of a module's chain; `true` when the kernel took it now (a
 /// module already in the kernel is not news).
-fn insert(dir: &Path, rel: &str) -> std::io::Result<bool> {
+fn insert(dir: &Path, rel: &str, params: &CStr) -> std::io::Result<bool> {
     let file = File::open(dir.join(rel))?;
-    match rustix::system::finit_module(&file, c"", 0) {
+    match rustix::system::finit_module(&file, params, 0) {
         Ok(()) => Ok(true),
         Err(rustix::io::Errno::EXIST) => Ok(false),
         Err(e) => Err(e.into()),
@@ -290,10 +314,17 @@ fn insert(dir: &Path, rel: &str) -> std::io::Result<bool> {
 /// happened. In the kernel, the driver's probe of every device it finds
 /// runs inside this call.
 fn load(index: &Index, dir: &Path, module: &str) -> Option<String> {
+    load_with(index, dir, module, c"")
+}
+
+/// [`load`], the module itself with `params` (what it needs: with none).
+fn load_with(index: &Index, dir: &Path, module: &str, params: &CStr) -> Option<String> {
     let t = Instant::now();
     let mut loaded = false;
-    for rel in index.chain(module) {
-        match insert(dir, rel) {
+    let chain = index.chain(module);
+    for (i, rel) in chain.iter().enumerate() {
+        let own = i + 1 == chain.len();
+        match insert(dir, rel, if own { params } else { c"" }) {
             Ok(now) => loaded |= now,
             Err(e) => return Some(format!("driver {module}: {rel}: {e}")),
         }
@@ -341,12 +372,12 @@ fn load_sensors(index: &Index, dir: &Path, log: impl Fn(&str)) {
         };
         if let Some((rel, e)) = needs
             .iter()
-            .find_map(|rel| insert(dir, rel).err().map(|e| (rel, e)))
+            .find_map(|rel| insert(dir, rel, c"").err().map(|e| (rel, e)))
         {
             log(&format!("sensors: {module}: {rel}: {e}"));
             continue;
         }
-        match probe_result(insert(dir, own)) {
+        match probe_result(insert(dir, own, c"")) {
             Probe::Found => found.push(module),
             Probe::Absent => {}
             Probe::Firmware => log(&format!(
@@ -367,14 +398,47 @@ fn load_sensors(index: &Index, dir: &Path, log: impl Fn(&str)) {
 /// the devices' order.
 fn wanted<'a>(index: &'a Index, aliases: &[String], pass: Pass) -> Vec<&'a str> {
     let mut out: Vec<&str> = Vec::new();
+    let mut push = |module: &'a str| {
+        if !out.contains(&module) {
+            out.push(module);
+        }
+    };
     for alias in aliases {
         for module in index.matches(alias) {
-            if index.in_pass(module, pass) && !out.contains(&module) {
-                out.push(module);
+            if !index.in_pass(module, pass) {
+                continue;
+            }
+            push(module);
+            let with = COMPANIONS.iter().find(|(m, _)| *m == module);
+            for companion in with.into_iter().flat_map(|(_, c)| c.iter()) {
+                // Only what this kernel has: the index knows.
+                if !index.chain(companion).is_empty() {
+                    push(companion);
+                }
             }
         }
     }
     out
+}
+
+/// `corerouter.hwsim=N`: the simulated radios, for a test of the image in a
+/// machine with no Wi-Fi card (QEMU emulates none). The line says how many
+/// radios the kernel has afterwards.
+fn load_hwsim(index: &Index, dir: &Path, radios: u8, log: impl Fn(&str)) {
+    if index.chain(HWSIM).is_empty() {
+        log("wifi: corerouter.hwsim: this kernel has no mac80211_hwsim");
+        return;
+    }
+    let Ok(params) = CString::new(format!("radios={radios}")) else {
+        return;
+    };
+    if let Some(line) = load_with(index, dir, HWSIM, &params) {
+        log(&line);
+    }
+    let found = fs::read_dir(RADIOS).map_or(0, |d| d.flatten().take(MAX_DEVICES).count());
+    log(&format!(
+        "wifi: {found} test radios (corerouter.hwsim={radios})"
+    ));
 }
 
 /// Loads the modules of `pass` the devices in `aliases` ask for, one line
@@ -447,9 +511,10 @@ fn hotplug_loop(events: &DeviceEvents, index: &Index, dir: &Path, log: &dyn Fn(&
 /// Loads the drivers of what is in the machine and keeps listening for what
 /// is plugged in later, in its own thread. Returns when the boot's network
 /// drivers are in, or at [`BOOT_WAIT`] with the loading still going; the
-/// screen's driver loads after that, with the boot already going on, and
-/// then, with `sensors`, the motherboard's sensor chip is looked for.
-pub fn start(log: fn(&str), sensors: bool) {
+/// Wi-Fi cards' drivers and the screen's load after that, with the boot
+/// already going on, and then, with `sensors`, the motherboard's sensor chip
+/// is looked for. `hwsim`: that many simulated radios (a test's).
+pub fn start(log: fn(&str), sensors: bool, hwsim: Option<u8>) {
     let dir = kernel_dir();
     let index = Index::parse(
         &read_limited(&dir.join("modules.dep"), MAX_INDEX),
@@ -473,6 +538,10 @@ pub fn start(log: fn(&str), sensors: bool) {
                 t.elapsed().as_millis()
             ));
             let _ = done.send(());
+            load_for(&index, &dir, &devices, Pass::Wifi, log);
+            if let Some(radios) = hwsim {
+                load_hwsim(&index, &dir, radios, log);
+            }
             load_for(&index, &dir, &devices, Pass::Screen, log);
             if sensors {
                 load_sensors(&index, &dir, log);
@@ -513,6 +582,12 @@ kernel/drivers/hwmon/nct6775-core.ko: kernel/drivers/hwmon/hwmon-vid.ko
 kernel/drivers/hwmon/hwmon-vid.ko:
 kernel/drivers/hwmon/it87.ko: kernel/drivers/hwmon/hwmon-vid.ko
 kernel/drivers/hwmon/k10temp.ko:
+kernel/drivers/net/wireless/intel/iwlwifi/iwlwifi.ko: kernel/net/wireless/cfg80211.ko kernel/net/rfkill/rfkill.ko
+kernel/drivers/net/wireless/intel/iwlwifi/mvm/iwlmvm.ko: kernel/drivers/net/wireless/intel/iwlwifi/iwlwifi.ko kernel/net/mac80211/mac80211.ko kernel/lib/crypto/libarc4.ko kernel/net/wireless/cfg80211.ko kernel/net/rfkill/rfkill.ko
+kernel/drivers/net/wireless/intel/iwlwifi/mld/iwlmld.ko: kernel/drivers/net/wireless/intel/iwlwifi/iwlwifi.ko kernel/net/mac80211/mac80211.ko kernel/lib/crypto/libarc4.ko kernel/net/wireless/cfg80211.ko kernel/net/rfkill/rfkill.ko
+kernel/drivers/net/wireless/mediatek/mt76/mt7925/mt7925e.ko: kernel/drivers/net/wireless/mediatek/mt76/mt76.ko kernel/net/mac80211/mac80211.ko kernel/net/wireless/cfg80211.ko kernel/net/rfkill/rfkill.ko
+kernel/drivers/net/wireless/mediatek/mt76/mt76.ko: kernel/net/mac80211/mac80211.ko kernel/net/wireless/cfg80211.ko kernel/net/rfkill/rfkill.ko
+kernel/drivers/net/wireless/virtual/mac80211_hwsim.ko: kernel/net/mac80211/mac80211.ko kernel/net/wireless/cfg80211.ko kernel/net/rfkill/rfkill.ko
 ";
     const ALIAS: &str = "\
 # Aliases extracted from modules themselves.
@@ -521,6 +596,8 @@ alias pci:v00008086d00001229sv*sd*bc02sc00i* e100
 alias usb:v0B95p1790d*dc*dsc*dp*ic*isc*ip*in* ax_88179
 alias pci:v00001234d*sv*sd*bc*sc*i* xt_mark
 alias pci:v00008086d0000A7A0sv*sd*bc03sc*i* i915
+alias pci:v00008086d000051F0sv*sd*bc*sc*i* iwlwifi
+alias pci:v000014C3d00000717sv*sd*bc*sc*i* mt7925e
 alias cpu:type:x86,ven*fam*mod*:feature:*0073* ice
 alias pci:v00001022d00001443sv*sd*bc*sc*i* k10temp
 broken line
@@ -674,6 +751,48 @@ broken line
         );
         // The helpers have no device of their own: nothing asks for them.
         assert!(wanted(&i, &["pci:v1d2".to_owned()], Pass::Any).is_empty());
+    }
+
+    /// G1.30: a radio's driver is not one of the boot's (nothing names a
+    /// port after it), it brings the stack with it, and Intel's comes with
+    /// both of its halves, which no device asks for.
+    #[test]
+    fn the_wifi_drivers_load_after_the_boot_with_their_halves() {
+        let i = Index::parse(DEP, ALIAS);
+        let devices = [
+            "pci:v00008086d000051F0sv00008086sd00000090bc02sc80i00".to_owned(),
+            "pci:v000014C3d00000717sv000014C3sd00000717bc02sc80i00".to_owned(),
+            "pci:v00008086d00001229sv00000000sd00000000bc02sc00i00".to_owned(),
+        ];
+        assert_eq!(wanted(&i, &devices, Pass::Ports), ["e100"]);
+        assert_eq!(
+            wanted(&i, &devices, Pass::Wifi),
+            ["iwlwifi", "iwlmvm", "iwlmld", "mt7925e"]
+        );
+        assert!(wanted(&i, &devices, Pass::Screen).is_empty());
+        // A USB radio plugged in later, or a rescan: the same, once.
+        assert_eq!(
+            wanted(&i, &devices, Pass::Any),
+            ["iwlwifi", "iwlmvm", "iwlmld", "mt7925e", "e100"]
+        );
+        // The stack first, from outside the drivers' directories.
+        assert_eq!(
+            i.chain("mt7925e"),
+            [
+                "kernel/net/rfkill/rfkill.ko",
+                "kernel/net/wireless/cfg80211.ko",
+                "kernel/net/mac80211/mac80211.ko",
+                "kernel/drivers/net/wireless/mediatek/mt76/mt76.ko",
+                "kernel/drivers/net/wireless/mediatek/mt76/mt7925/mt7925e.ko"
+            ]
+        );
+        // The simulated radios: in the index, asked for by no device.
+        assert_eq!(i.chain(HWSIM).len(), 4);
+        assert!(i.aliases.iter().all(|(_, _, m)| m != HWSIM));
+        // A kernel without one of the halves (the live image's has none).
+        let dep = "kernel/drivers/net/wireless/intel/iwlwifi/iwlwifi.ko:\n";
+        let i = Index::parse(dep, ALIAS);
+        assert_eq!(wanted(&i, &devices, Pass::Wifi), ["iwlwifi"]);
     }
 
     #[test]

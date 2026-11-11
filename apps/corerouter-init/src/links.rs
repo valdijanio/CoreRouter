@@ -48,10 +48,20 @@ pub fn settle(quiet: Duration, max: Duration) {
     }
 }
 
-/// A physical Ethernet port (`type` 1, a `device` behind it).
+/// A Wi-Fi radio's netdev (G1.30): `type` 1 and a `device` like an
+/// Ethernet port, and cfg80211's link to its radio
+/// (`net/wireless/core.c`, "phy80211").
+fn is_radio(dir: &Path) -> bool {
+    dir.join("phy80211").exists()
+}
+
+/// A physical Ethernet port (`type` 1, a `device` behind it, not a radio).
 fn port(name: &str) -> Option<Found> {
-    let dir = Path::new(SYS_NET).join(name);
-    if read(&dir.join("type")) != "1" {
+    port_at(&Path::new(SYS_NET).join(name), name)
+}
+
+fn port_at(dir: &Path, name: &str) -> Option<Found> {
+    if read(&dir.join("type")) != "1" || is_radio(dir) {
         return None;
     }
     let dev = fs::canonicalize(dir.join("device")).ok()?;
@@ -203,4 +213,36 @@ pub fn rename(from: &str, to: &str) -> std::io::Result<()> {
         setlink(i, IFF_UP, IFF_UP, None)?;
     }
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// G1.30: a radio's netdev has the type and the `device` of an Ethernet
+    /// port; taken for one, it got a port's name, a place in the console
+    /// setup's list and, in the live image, a DHCP client.
+    #[test]
+    fn a_wifi_radio_is_not_an_ethernet_port() {
+        let top = std::env::temp_dir().join(format!("cr-links-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&top);
+        let pci = top.join("devices/0000:03:00.0");
+        fs::create_dir_all(pci.join("ieee80211/phy0")).unwrap();
+        for (name, radio) in [("eth0", false), ("wlan0", true)] {
+            let dir = top.join("net").join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("type"), "1\n").unwrap();
+            fs::write(dir.join("address"), "4C:79:6E:AB:CD:EF\n").unwrap();
+            std::os::unix::fs::symlink(&pci, dir.join("device")).unwrap();
+            if radio {
+                std::os::unix::fs::symlink(pci.join("ieee80211/phy0"), dir.join("phy80211"))
+                    .unwrap();
+            }
+        }
+        let eth = port_at(&top.join("net/eth0"), "eth0").unwrap();
+        assert_eq!(eth.mac, "4c:79:6e:ab:cd:ef");
+        assert!(eth.path.ends_with("0000:03:00.0"), "{}", eth.path);
+        assert_eq!(port_at(&top.join("net/wlan0"), "wlan0"), None);
+        let _ = fs::remove_dir_all(&top);
+    }
 }

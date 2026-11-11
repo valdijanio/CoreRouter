@@ -99,7 +99,9 @@ pub(crate) fn apply_each(
 /// (sysfs shows the namespace that mounted `/sys`, not this one). Read lean
 /// (G1.3f, [`crate::link_dump`]): the poll does it every second.
 pub(crate) fn links() -> Result<Vec<KernelLink>, HalError> {
-    crate::link_dump::dump()
+    let mut links = crate::link_dump::dump()?;
+    crate::wifi_links::mark(&mut links);
+    Ok(links)
 }
 
 /// [`links`] the old way, through `rtnetlink` (the netns test checks both
@@ -119,6 +121,10 @@ pub(crate) fn links_rtnetlink() -> Result<Vec<KernelLink>, HalError> {
             out.push(kernel_link(&m));
         }
         Ok(out)
+    })
+    .map(|mut links| {
+        crate::wifi_links::mark(&mut links);
+        links
     })
 }
 

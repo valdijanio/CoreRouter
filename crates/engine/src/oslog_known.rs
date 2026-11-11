@@ -77,17 +77,21 @@ const FIREWALL: Action = Action {
 const K: Option<OsSource> = Some(OsSource::Kernel);
 
 pub const KNOWN: &[Known] = &[
-    // G1.6ja: narrow ones first: this file is asked for on every kernel with
-    // Wi-Fi support and costs nothing.
+    // G1.6ja: narrow ones first. G1.30: the image has the file since it has
+    // Wi-Fi drivers, and cfg80211 is a module that reads it after `/` is
+    // mounted: the line now means an image from before that.
     Known {
         id: "firmware-regulatory",
         source: K,
         all: &["regulatory.db"],
         any: &[],
-        title: "Base regulatória de Wi-Fi (inofensivo)",
-        meaning: "O suporte a Wi-Fi do kernel procura a base de canais permitidos por país. O \
-                  CoreRouter não usa Wi-Fi e não traz esse arquivo: pode ignorar esta linha, ela \
-                  não aponta problema em nenhuma placa de rede.",
+        title: "Base regulatória de Wi-Fi não carregou",
+        meaning: "O suporte a Wi-Fi do kernel não conseguiu ler a base de canais permitidos por \
+                  país (regulatory.db). Imagens anteriores à que trouxe os drivers de Wi-Fi não \
+                  tinham o arquivo e mostravam esta linha em todo boot, sem efeito. Numa imagem \
+                  com Wi-Fi, sem a base o rádio fica nos canais do domínio mundial (5 GHz só \
+                  escuta) e o país não pode ser definido. Não aponta problema em nenhuma porta \
+                  Ethernet.",
         actions: &[],
         alert: false,
     },

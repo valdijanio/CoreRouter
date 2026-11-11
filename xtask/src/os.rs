@@ -64,6 +64,19 @@ const REQUIRED_NICS: &[&str] = &[
     "CONFIG_AQTION",
     "CONFIG_DWMAC_INTEL",
     "CONFIG_USB_RTL8150",
+    // G1.30: Wi-Fi in station mode. The stack as a module (built in, it asks
+    // for the regulatory database before / is mounted and never gets it),
+    // one driver of each family, and the simulated radios `boot-test --wifi`
+    // loads.
+    "CONFIG_CFG80211",
+    "CONFIG_MAC80211",
+    "CONFIG_IWLMVM",
+    "CONFIG_IWLMLD",
+    "CONFIG_MT7921E",
+    "CONFIG_MT7925E",
+    "CONFIG_RTW88_8822CE",
+    "CONFIG_RTW89_8852BE",
+    "CONFIG_MAC80211_HWSIM",
 ];
 
 const DEFCONFIG: &str = "corerouter_x86_64_defconfig";
@@ -155,6 +168,11 @@ const SENSOR_MODULES: &[(&str, &str)] = &[
 /// notebook `snd_hda_intel` wrote "Cannot probe codecs, giving up" on the
 /// console at every boot (the x86_64 defconfig turns it on).
 const KERNEL_OFF: &[&str] = &["CONFIG_SOUND"];
+/// What the ISO's kernel must not have, on top of [`KERNEL_OFF`]. G1.30: no
+/// Wi-Fi stack in the live image (joining a network is the installed
+/// router's), so no card driver is built for it and its module payload does
+/// not grow by them.
+const INSTALLER_OFF: &[&str] = &["CONFIG_CFG80211", "CONFIG_WLAN"];
 /// Buildroot options the image's design rests on (docs/os-image.md).
 const REQUIRED_BR2: &[&str] = &[
     "BR2_INIT_NONE=y",
@@ -175,6 +193,12 @@ const REQUIRED_BR2: &[&str] = &[
     // G1.6v: corerouter-init grows /config with them.
     "BR2_PACKAGE_E2FSPROGS=y",
     "BR2_PACKAGE_E2FSPROGS_RESIZE2FS=y",
+    // G1.30: Wi-Fi in station mode. WPA3 is what brings SAE (and OpenSSL).
+    "BR2_PACKAGE_WPA_SUPPLICANT=y",
+    "BR2_PACKAGE_WPA_SUPPLICANT_NL80211=y",
+    "BR2_PACKAGE_WPA_SUPPLICANT_WPA3=y",
+    "BR2_PACKAGE_WPA_SUPPLICANT_CTRL_IFACE=y",
+    "BR2_PACKAGE_WIRELESS_REGDB=y",
 ];
 /// What the installer kernel's fragment must say (G1.6c).
 const INSTALLER_KERNEL: &[&str] = &[
@@ -207,7 +231,7 @@ const GUEST_TLS_PORT: u16 = 8729;
 /// G1.6o: `ip.service www-ssl`, on in a new config of the image.
 const GUEST_WEB_PORT: u16 = 443;
 
-const USAGE: &str = "usage: cargo xtask os <build [--only crpkg] [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|push --to HOST:PORT [--user U] [--no-build] [--no-wait] [--confirm manual]|release-key <init|check> [--dir D]|release --tag vX.Y.Z [--key-dir D] [--dry-run] [--no-build] [--repo OWNER/NAME]|out-dir|boot-test [--efi] [--tcg] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--firmware ovmf|seabios] [--scenario update|push|no-confirm|bad-signature|bad-param|cross|cut|controllers]|install-test [--tcg] [--firmware ovmf|seabios] [--only live-modules]|frr-test [--tcg]|forward-test [--tcg] [--no-live]|firmware-lock --tag T|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
+const USAGE: &str = "usage: cargo xtask os <build [--only crpkg] [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|push --to HOST:PORT [--user U] [--no-build] [--no-wait] [--confirm manual]|release-key <init|check> [--dir D]|release --tag vX.Y.Z [--key-dir D] [--dry-run] [--no-build] [--repo OWNER/NAME]|out-dir|boot-test [--efi] [--tcg] [--wifi] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--firmware ovmf|seabios] [--scenario update|push|no-confirm|bad-signature|bad-param|cross|cut|controllers]|install-test [--tcg] [--firmware ovmf|seabios] [--only live-modules]|frr-test [--tcg]|forward-test [--tcg] [--no-live]|firmware-lock --tag T|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
 
 pub fn main(root: &Path, args: &[String]) -> Outcome {
     let (sub, rest) = match args.split_first() {
@@ -721,6 +745,14 @@ fn check_installer(os: &Path, genimage: &str, version: &str) -> Result<usize, St
     for want in INSTALLER_KERNEL {
         if !frag.lines().any(|l| l == *want) {
             return Err(format!("installer.fragment: missing '{want}'"));
+        }
+        n += 1;
+    }
+    for off in INSTALLER_OFF {
+        if !frag.lines().any(|l| l == format!("# {off} is not set")) {
+            return Err(format!(
+                "installer.fragment: '# {off} is not set' is required"
+            ));
         }
         n += 1;
     }
@@ -1286,7 +1318,7 @@ pub(crate) fn build_with(
     if ic.lines().any(|l| l == "CONFIG_DEBUG_INFO_BTF=y") {
         return Err("the installer kernel still has BTF".into());
     }
-    if let Some(on) = kernel_on(&ic, KERNEL_OFF) {
+    if let Some(on) = kernel_on(&ic, KERNEL_OFF).or_else(|| kernel_on(&ic, INSTALLER_OFF)) {
         return Err(format!(
             "the installer kernel config has {on}, which must be off"
         ));
@@ -1583,6 +1615,9 @@ struct BootArgs {
     timeout: Duration,
     append: String,
     keep_config: bool,
+    /// G1.30: boot with two simulated radios (`corerouter.hwsim=2`) and
+    /// wait for the init to say the Wi-Fi stack took them.
+    wifi: bool,
 }
 
 fn parse_boot_args(args: &[String]) -> Result<BootArgs, String> {
@@ -1592,6 +1627,7 @@ fn parse_boot_args(args: &[String]) -> Result<BootArgs, String> {
         timeout: Duration::from_secs(120),
         append: String::new(),
         keep_config: false,
+        wifi: false,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -1599,6 +1635,7 @@ fn parse_boot_args(args: &[String]) -> Result<BootArgs, String> {
             "--efi" => b.efi = true,
             "--tcg" => b.tcg = true,
             "--keep-config" => b.keep_config = true,
+            "--wifi" => b.wifi = true,
             "--timeout" => {
                 let v = it.next().ok_or("--timeout needs seconds")?;
                 b.timeout = Duration::from_secs(
@@ -1610,8 +1647,18 @@ fn parse_boot_args(args: &[String]) -> Result<BootArgs, String> {
             other => return Err(format!("unknown argument '{other}'\n{USAGE}")),
         }
     }
+    if b.wifi && b.efi {
+        return Err(
+            "--wifi needs the kernel command line, which --efi cannot change (it is built in)"
+                .into(),
+        );
+    }
     Ok(b)
 }
+
+/// G1.30: what the init says when `corerouter.hwsim=2` gave it two radios
+/// (cfg80211, mac80211 and the simulated driver loaded from the image).
+const WIFI_RADIOS: &str = "corerouter-init: wifi: 2 test radios";
 
 /// What the serial console said, as the test reads it.
 #[derive(Default, Debug, PartialEq)]
@@ -1740,8 +1787,9 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
         // first-boot default, DHCP client on ether1 like a CHR, is G1.6d):
         // the test gives eth0 QEMU's user-network address with the kernel's
         // own `ip=`, appended to the built-in command line.
+        let hwsim = if b.wifi { " corerouter.hwsim=2" } else { "" };
         cmd.arg("-append")
-            .arg(format!("{GUEST_IP_ARG} {}", b.append).trim_end());
+            .arg(format!("{GUEST_IP_ARG} {}{hwsim}", b.append).trim_end());
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1879,6 +1927,7 @@ fn watch(
     let mut ping = None;
     let mut web = None;
     let mut boot_driver = false;
+    let wifi = std::cell::Cell::new(false);
     let deadline = started + b.timeout;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -1924,6 +1973,9 @@ fn watch(
             report.idle_kib = Some(k);
         }
         boot_driver |= hotplug::boot_driver(&line);
+        if line.contains(WIFI_RADIOS) {
+            wifi.set(true);
+        }
         if let (Some(w), Some(p), Some(_), Some(web)) = (wall_ready, &ping, report.idle_kib, &web) {
             if !boot_driver {
                 return Err(format!(
@@ -1947,6 +1999,9 @@ fn watch(
                             if line.contains("corerouter-init") {
                                 eprintln!("  | {line}");
                             }
+                            if line.contains(WIFI_RADIOS) {
+                                wifi.set(true);
+                            }
                             if want(&line) {
                                 return Ok(());
                             }
@@ -1959,6 +2014,11 @@ fn watch(
                 }
             };
             let hot = hotplug::check(mon, &mut wait_line)?;
+            if b.wifi && !wifi.get() {
+                wait_line(&|l| l.contains(WIFI_RADIOS), Duration::from_secs(20)).map_err(|e| {
+                    format!("G1.30: the simulated radios did not come up (corerouter.hwsim=2): {e}")
+                })?;
+            }
             return Ok((report, w, p.clone(), web.clone(), hot));
         }
     }
