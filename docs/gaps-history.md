@@ -355,3 +355,12 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-11-11 — G1.6zl criado e feito (assistente do primeiro boot: enlace real e DHCP no cabo)
 - 2026-11-11 — G1.6zm criado e feito (disco regravado não boota pela entrada velha da NVRAM)
 - 2026-11-11 — G1.6zn criado (sistema na RAM no disco instalado; aviso claro quando o disco do sistema some)
+- 2026-11-11 — G1.30h criado e feito (país do Wi-Fi a partir da janela Interface e do Enable)
+- 2026-11-11 — G1.30i ganhou o Auto do scan e o rótulo dentro do bloco; o snooper mostra o canal real ao lado de uma estação ociosa
+- 2026-11-11 — G1.30i criada e feita (scan Wi-Fi em três visões: lista, canais e espectro)
+- 2026-11-11 — G1.30j criado e feito (Wi-Fi em modo monitor: snooper e captura 802.11)
+- 2026-11-11 — G1.30m criado (Wi-Fi station-bridge e bonding sobre enlaces Wi-Fi)
+- 2026-11-11 — G1.6zn feito (sistema na RAM no disco instalado; aviso claro e commit recusado quando o disco do sistema some)
+- 2026-11-11 — G1.6zq criado (boot 20 s mais lento no handoff do xHCI do notebook Lenovo 83EU)
+- 2026-11-11 — G1.6zr criado e feito (defeitos da auditoria do notebook, dev.591); G1.6zs criado (certificado com identidade e endereços)
+- 2026-11-11 — G4.6m feito (NTP: primeiro acerto do boot sem confirmação, opção (a) escolhida pelo dono)
