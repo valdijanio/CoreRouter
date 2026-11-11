@@ -107,6 +107,11 @@ const REQUIRED_KERNEL: &[&str] = &[
     "CONFIG_FW_CFG_SYSFS",
     "CONFIG_ATA_PIIX",
     "CONFIG_VMXNET3",
+    // G1.6zc: the screen console after a UEFI boot (no VGA text mode there).
+    "CONFIG_SYSFB_SIMPLEFB",
+    "CONFIG_DRM_SIMPLEDRM",
+    "CONFIG_DRM_FBDEV_EMULATION",
+    "CONFIG_FRAMEBUFFER_CONSOLE",
 ];
 /// G1.6j: drivers that must be modules. `ice` asks for its firmware while
 /// probing, which a built-in driver does before `/` is mounted; `e100` and

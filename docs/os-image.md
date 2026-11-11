@@ -845,8 +845,14 @@ Saídas em `<out>/build/images/`:
   `O_EXCL` (recusado se algo o usa).
 - **Manter a configuração:** num disco com CoreRouter cuja partição `config` está no mesmo lugar,
   o instalador pergunta se mantém (como o *keep old configuration* do Netinstall).
-- **Consoles:** VGA (`tty1`) e serial (`ttyS0`, 115200) ao mesmo tempo; a resposta vale do
-  console onde foi digitada.
+- **Consoles:** a tela (`tty1`) e a serial (`ttyS0`, 115200) ao mesmo tempo; a resposta vale do
+  console onde foi digitada. A tela vale nos dois firmwares (G1.6zc): em BIOS é o modo texto VGA
+  (`vgacon`); em UEFI não existe modo texto, e o kernel desenha no framebuffer que o firmware
+  deixa (`simpledrm` + `fbcon`), até o driver da placa (i915, virtio-gpu) assumir. Antes da
+  G1.6zc, num boot UEFI a tela ficava parada no último quadro do firmware e o console só saía
+  na serial. Acima de ~2560×1440 o kernel escolhe a fonte 16×32. O custo é a cópia da tela na
+  RAM (largura × altura × 4 bytes): +6,1 MiB em repouso a 1280×800 (**medido**, QEMU com OVMF,
+  média de 3 boots, 2026-11-11); sem tela no boot (sem framebuffer do firmware) não há cópia.
 - **Endereço de gerência do primeiro boot:** o instalador lista as portas com os nomes que o
   roteador vai dar (`ether1 (link up, 52:54:…)`), pergunta (`ether1 192.0.2.10/24 192.0.2.1`,
   ou vazio; porta que não existe é recusada) e grava `corerouter.mgmt=` na entrada do slot A.

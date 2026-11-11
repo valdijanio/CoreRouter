@@ -1170,6 +1170,23 @@ fn check_installed(t: &mut T, vm: &mut Vm, port: u16, first: bool) -> Result<(),
             "yes".to_owned(),
         );
     }
+    // G1.6zc: tty1 is a console a person can read. After a UEFI boot there
+    // is no VGA text mode: the kernel must draw on the firmware's
+    // framebuffer (fbcon), or the screen stays on the firmware's last frame.
+    let con = sh(
+        vm,
+        &mut log,
+        "for c in /sys/class/vtconsole/vtcon*; do echo \"$(cat $c/name)=$(cat $c/bind)\"; done",
+    )?;
+    let want = match t.fw {
+        Firmware::Ovmf => "frame buffer device=1",
+        Firmware::SeaBios => "VGA+=1",
+    };
+    check(
+        con.contains(want),
+        format!("screen console: expected '{want}', got: {con}"),
+    )?;
+    t.n.put(&format!("{what}: screen console (tty1)"), con.clone());
     // The installer's address, applied once (the reinstall keeps the
     // configuration and the marker).
     let a = until(vm, &mut log, 30, "ip.address.list", "{}", |v| {
