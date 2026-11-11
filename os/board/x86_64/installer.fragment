@@ -37,3 +37,9 @@ CONFIG_ALX=y
 CONFIG_ATL1C=y
 CONFIG_SKY2=y
 CONFIG_8139TOO=y
+# G1.30: no Wi-Fi in the live image, for now: joining a network is a thing of
+# the installed router. Without the stack no card driver is built, so the
+# payload does not grow by them.
+# CONFIG_WLAN is not set
+# CONFIG_CFG80211 is not set
+# CONFIG_RFKILL is not set

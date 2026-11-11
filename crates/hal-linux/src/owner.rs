@@ -71,6 +71,9 @@ pub struct KernelLink {
     pub errors: Option<corerouter_hal::LinkErrors>,
     /// `IFLA_PARENT_DEV_BUS_NAME`: `pci`, `usb`, `virtio` (G1.29b).
     pub bus: Option<String>,
+    /// A Wi-Fi radio's netdev (G1.30). The link message does not tell it
+    /// from an Ethernet port; nl80211 does (`crate::wifi_links`).
+    pub wireless: bool,
 }
 
 impl KernelLink {
@@ -81,14 +84,17 @@ impl KernelLink {
         }
         match (&self.kind, self.arphrd) {
             (Some(k), _) => k.clone(),
+            (None, ARPHRD_ETHER) if self.wireless => "wifi".into(),
             (None, ARPHRD_ETHER) => "ether".into(),
             (None, ARPHRD_PPP) => "ppp".into(),
             (None, other) => format!("link type {other}"),
         }
     }
 
+    /// A physical Ethernet port. Not a Wi-Fi radio, which looks the same
+    /// in the link message (G1.30).
     fn physical(&self) -> bool {
-        self.kind.is_none() && self.arphrd == ARPHRD_ETHER
+        self.kind.is_none() && self.arphrd == ARPHRD_ETHER && !self.wireless
     }
 
     fn is(&self, kind: &str) -> bool {
@@ -219,6 +225,11 @@ fn base(link: &KernelLink, claim: Option<&InterfaceKind>, policy: &Policy) -> Ow
     if link.physical() {
         return Owner::Managed;
     }
+    // G1.30: a radio is not a port. Taken for one, it was seeded as
+    // `ether`, got the ports' settings and a place in the console setup.
+    if link.wireless {
+        return ext("a Wi-Fi radio, which this version does not configure".into());
+    }
     let listed = Policy::hit(&policy.manage, &link.name);
     if link.is("veth") {
         return if !link.peer_elsewhere || listed {
@@ -339,6 +350,10 @@ mod tests {
         lo.arphrd = ARPHRD_LOOPBACK;
         assert_eq!(lo.label(), "loopback");
         assert_eq!(link(2, "eno1", None).label(), "ether");
+        let mut radio = link(9, "wlan0", None);
+        radio.wireless = true;
+        assert_eq!(radio.label(), "wifi");
+        assert!(!radio.physical() && !radio.port_like());
         let mut ppp = link(3, "ppp0", None);
         ppp.arphrd = ARPHRD_PPP;
         assert_eq!(ppp.label(), "ppp");

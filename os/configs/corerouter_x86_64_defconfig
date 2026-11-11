@@ -43,6 +43,17 @@ BR2_PACKAGE_LIBCAP=y
 BR2_PACKAGE_E2FSPROGS=y
 # BR2_PACKAGE_E2FSPROGS_FSCK is not set
 BR2_PACKAGE_E2FSPROGS_RESIZE2FS=y
+# G1.30: Wi-Fi in station mode. wpa_supplicant does the authentication
+# (WPA2-PSK, WPA3-SAE: on every card of nics.fragment that runs in user
+# space), driven through its control socket only: no wpa_cli, no D-Bus, no
+# configuration file (post-build.sh). WPA3 brings OpenSSL (SAE's elliptic
+# curves). wireless-regdb is cfg80211's signed regulatory.db: without it no
+# country can be set and 5 GHz is listen-only.
+BR2_PACKAGE_WPA_SUPPLICANT=y
+BR2_PACKAGE_WPA_SUPPLICANT_NL80211=y
+BR2_PACKAGE_WPA_SUPPLICANT_WPA3=y
+BR2_PACKAGE_WPA_SUPPLICANT_CTRL_IFACE=y
+BR2_PACKAGE_WIRELESS_REGDB=y
 # G1.6c: the installer's kernel (the ISO, post-image.sh).
 BR2_PACKAGE_COREROUTER_INSTALLER=y
 BR2_TARGET_ROOTFS_SQUASHFS=y

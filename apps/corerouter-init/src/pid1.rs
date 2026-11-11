@@ -125,7 +125,7 @@ pub fn main() {
     // mounted the ISO kernel's modules over /lib/modules (without them, this
     // kernel's directory is not there and this finds nothing).
     if opts.modules {
-        crate::modules::start(log);
+        crate::modules::start(log, opts.hwsim);
     }
     let names = name_ports(Some(Path::new(crate::ports::MAP_FILE)));
     spawn_hotplug_names(crate::ports::MAP_FILE, live);

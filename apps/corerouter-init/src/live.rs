@@ -153,7 +153,7 @@ fn prepare(con: &Console, opts: &BootOptions) -> Result<String, String> {
     let total = plan::mem_total_kib(&meminfo).ok_or("no MemTotal in /proc/meminfo")?;
     if total < plan::LIVE_MIN_RAM_KIB {
         return Err(format!(
-            "{} MiB of RAM; the live image needs 320 MiB",
+            "{} MiB of RAM; the live image needs 448 MiB",
             total / 1024
         ));
     }

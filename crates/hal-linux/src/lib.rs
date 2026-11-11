@@ -201,6 +201,9 @@ pub mod link_dump;
 pub mod link_events;
 /// Neighbor tables over rtnetlink (G1.27d): dump, events, static entries.
 pub mod neigh;
+/// Which links are Wi-Fi radios (G1.30): the link dump does not say.
+#[cfg(target_os = "linux")]
+mod wifi_links;
 
 /// MPLS label switching over rtnetlink (G3.5): the label table, static
 /// entries in batches, the `net.mpls` knobs.

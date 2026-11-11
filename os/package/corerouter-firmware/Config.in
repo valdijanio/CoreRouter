@@ -1,7 +1,12 @@
 config BR2_PACKAGE_COREROUTER_FIRMWARE
 	bool "corerouter-firmware"
+	select BR2_PACKAGE_WIRELESS_REGDB
 	help
 	  The firmware the kernel's network drivers declare (G1.6j), from
 	  the linux-firmware files pinned in firmware.lock, with their
 	  licenses. `cargo xtask os build` downloads, checks and stages
 	  them.
+
+	  G1.30: and cfg80211's regulatory database, from the
+	  wireless-regdb package: this package is the one that fills
+	  /lib/firmware.

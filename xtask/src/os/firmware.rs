@@ -159,6 +159,20 @@ pub(super) fn check(os: &Path) -> Result<usize, String> {
     if !l.files.iter().any(|f| f.path.starts_with("i915/")) {
         return Err("firmware.lock: the i915 firmware (i915/...) is required".into());
     }
+    // G1.30: a Wi-Fi card without its firmware never shows its port. One
+    // file of each driver family of nics.fragment.
+    for (what, dir) in [
+        ("iwlwifi", "intel/iwlwifi/"),
+        ("mt7921", "mediatek/"),
+        ("rtw88", "rtw88/"),
+        ("rtw89", "rtw89/"),
+    ] {
+        if !l.files.iter().any(|f| f.path.starts_with(dir)) {
+            return Err(format!(
+                "firmware.lock: the {what} firmware ({dir}...) is required"
+            ));
+        }
+    }
     Ok(l.files.len() + l.links.len() + l.meta.len())
 }
 
@@ -550,7 +564,21 @@ pub(super) fn verify(os: &Path, target: &Path) -> Result<usize, String> {
             return Err(format!("image: {LICENSE_DIR}/{name} is missing"));
         }
     }
-    let wanted = declared(&modules_dir(target)?)?;
+    let modules = modules_dir(target)?;
+    // G1.30: with the Wi-Fi stack in the image, cfg80211 needs its signed
+    // regulatory database (it is not linux-firmware's, so not in the lock):
+    // without it no country can be set and 5 GHz is listen-only. A second
+    // build of the same tree once lost it.
+    if modules.join("kernel/net/wireless/cfg80211.ko").is_file() {
+        for f in ["regulatory.db", "regulatory.db.p7s"] {
+            if !fw.join(f).is_file() {
+                return Err(format!(
+                    "image: lib/firmware/{f} is missing (cfg80211 is in the image; package wireless-regdb)"
+                ));
+            }
+        }
+    }
+    let wanted = declared(&modules)?;
     let missing = undeclared(&wanted, &lock);
     if !missing.is_empty() {
         return Err(format!(
@@ -574,6 +602,92 @@ fn undeclared(wanted: &BTreeSet<String>, lock: &Lock) -> Vec<String> {
         .collect()
 }
 
+/// A version in an `iwlwifi` firmware's name: `-89.ucode` (the API scheme)
+/// or `-c101.ucode` (the core scheme, newer: it sorts after every API).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct IwlVersion {
+    core: bool,
+    n: u32,
+}
+
+/// The first core version, and the API version the driver goes to below it
+/// (`iwl-drv.c`, `iwl_request_firmware`: from `ENCODE_CORE_AS_API(99)` it
+/// goes to 101, "last API-scheme number below core 99").
+const IWL_FIRST_CORE: u32 = 99;
+const IWL_LAST_API: u32 = 101;
+
+/// `iwlwifi-so-a0-gf-a0-89.ucode` → (`so-a0-gf-a0`, API 89).
+fn iwl_name(name: &str) -> Option<(&str, IwlVersion)> {
+    let rest = name.strip_prefix("iwlwifi-")?.strip_suffix(".ucode")?;
+    let (prefix, v) = rest.rsplit_once('-')?;
+    let (core, digits) = match v.strip_prefix('c') {
+        Some(d) => (true, d),
+        None => (false, v),
+    };
+    if prefix.is_empty() || digits.is_empty() || digits.len() > 4 {
+        return None;
+    }
+    let n = digits.parse().ok()?;
+    Some((prefix, IwlVersion { core, n }))
+}
+
+/// G1.30: what `iwlwifi` asks for is not what it declares. `MODULE_FIRMWARE`
+/// names the newest version the driver knows (`-100.ucode`, `-c99.ucode`),
+/// for the chip steppings it lists; at run time the driver makes the name
+/// from the stepping the card has and tries from the newest version down to
+/// the oldest it accepts (`iwl-drv.c`, `iwl_request_firmware`), and then asks
+/// for `<prefix>.pnvm`, which it declares nowhere (`fw/pnvm.c`).
+/// linux-firmware has, per prefix, the versions that were published: of the
+/// names declared for Linux 6.18, 26 are not there.
+///
+/// So, for every prefix of the tree (the root links of `WHENCE`) that the
+/// built driver knows (it declares that prefix, or another stepping of the
+/// same chip: the name's first part), this gives the newest version the
+/// driver tries (not newer than what it declares) and the prefix's `.pnvm`.
+/// A card of a family that was not built (`iwldvm`) declares nothing and
+/// gets nothing.
+fn iwlwifi_requests(
+    declared: &BTreeSet<String>,
+    links: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    let mut by_prefix: BTreeMap<&str, IwlVersion> = BTreeMap::new();
+    let mut by_chip: BTreeMap<&str, IwlVersion> = BTreeMap::new();
+    for (prefix, v) in declared.iter().filter_map(|d| iwl_name(d)) {
+        let chip = prefix.split('-').next().unwrap_or(prefix);
+        for (map, key) in [(&mut by_prefix, prefix), (&mut by_chip, chip)] {
+            let e = map.entry(key).or_insert(v);
+            *e = (*e).max(v);
+        }
+    }
+    let mut newest: BTreeMap<&str, IwlVersion> = BTreeMap::new();
+    for (prefix, v) in links.keys().filter_map(|l| iwl_name(l)) {
+        let chip = prefix.split('-').next().unwrap_or(prefix);
+        let Some(bound) = by_prefix.get(prefix).or_else(|| by_chip.get(chip)) else {
+            continue;
+        };
+        let tried = match (v.core, bound.core) {
+            (true, true) => (IWL_FIRST_CORE..=bound.n).contains(&v.n),
+            (true, false) => false,
+            (false, true) => v.n <= IWL_LAST_API,
+            (false, false) => v.n <= bound.n,
+        };
+        if tried {
+            let e = newest.entry(prefix).or_insert(v);
+            *e = (*e).max(v);
+        }
+    }
+    let mut out = BTreeSet::new();
+    for (prefix, v) in newest {
+        let c = if v.core { "c" } else { "" };
+        out.insert(format!("iwlwifi-{prefix}-{c}{}.ucode", v.n));
+        let pnvm = format!("iwlwifi-{prefix}.pnvm");
+        if links.contains_key(&pnvm) {
+            out.insert(pnvm);
+        }
+    }
+    out
+}
+
 /// Builds the lock from what the drivers declare and what `WHENCE` says.
 /// `hash` gives a file's sha256 (a download, in real use).
 fn build_lock(
@@ -591,7 +705,8 @@ fn build_lock(
     };
     let mut licenses = BTreeSet::new();
     let mut to_ship = BTreeMap::new();
-    for name in wanted {
+    let requested = iwlwifi_requests(wanted, &links);
+    for name in wanted.iter().chain(requested.difference(wanted)) {
         let real = match links.get(name) {
             Some(target) => match resolve_link(name, target) {
                 Some(real) => real,
@@ -603,8 +718,13 @@ fn build_lock(
             None => name.clone(),
         };
         let Some(w) = files.get(&real) else {
-            l.skips
-                .push((name.clone(), format!("not in linux-firmware {tag}")));
+            let why = if iwl_name(name).is_some() {
+                // `iwlwifi_requests` shipped the one the driver ends up with.
+                format!("not in linux-firmware {tag}: iwlwifi declares the newest version it knows")
+            } else {
+                format!("not in linux-firmware {tag}")
+            };
+            l.skips.push((name.clone(), why));
             continue;
         };
         if !w.redistributable {
@@ -648,7 +768,8 @@ fn render(l: &Lock) -> String {
     let mut s = String::from(
         "# Generated by `cargo xtask os firmware-lock` (G1.6j, docs/os-image.md).\n\
          # What the kernel's network and screen drivers declare, from linux-firmware, with the\n\
-         # license each file's WHENCE entry names. `skip`: declared, not shipped.\n",
+         # license each file's WHENCE entry names. `skip`: declared, not shipped.\n\
+         # iwlwifi: per chip, the newest version the driver tries, and its .pnvm (G1.30).\n",
     );
     s.push_str(&format!("tag = {}\ncommit = {}\n\n", l.tag, l.commit));
     for (sha, p) in &l.meta {
@@ -864,6 +985,117 @@ Licence: Proprietary. All rights reserved.
         ] {
             assert!(parse(g).is_err(), "{g:?}");
         }
+    }
+
+    #[test]
+    fn iwlwifi_gets_the_newest_version_the_driver_tries() {
+        // What Linux 6.18 declares (the newest it knows, the steppings it
+        // lists) and what linux-firmware 20261019 has.
+        let declared: BTreeSet<String> = [
+            "iwlwifi-so-a0-gf-a0-100.ucode",
+            "iwlwifi-so-a0-gf-a0.pnvm",
+            "iwlwifi-Qu-b0-hr-b0-100.ucode",
+            "iwlwifi-cc-a0-77.ucode",
+            "iwlwifi-7265D-29.ucode",
+            "iwlwifi-bz-a0-fm-c0-c99.ucode",
+            "iwlwifi-sc-a0-fm-c0-c99.ucode",
+            "tigon/tg3.bin",
+        ]
+        .map(str::to_owned)
+        .into();
+        let links: BTreeMap<String, String> = [
+            "iwlwifi-so-a0-gf-a0-86.ucode",
+            "iwlwifi-so-a0-gf-a0-89.ucode",
+            "iwlwifi-so-a0-gf-a0.pnvm",
+            "iwlwifi-so-a0-hr-b0-89.ucode",
+            "iwlwifi-Qu-b0-hr-b0-74.ucode",
+            "iwlwifi-Qu-b0-hr-b0-77.ucode",
+            "iwlwifi-cc-a0-77.ucode",
+            "iwlwifi-7265D-22.ucode",
+            "iwlwifi-7265D-29.ucode",
+            // The card's real stepping, which the driver does not declare;
+            // c101 and later are for a newer kernel.
+            "iwlwifi-bz-b0-fm-c0-100.ucode",
+            "iwlwifi-bz-b0-fm-c0-101.ucode",
+            "iwlwifi-bz-b0-fm-c0-c101.ucode",
+            "iwlwifi-bz-b0-fm-c0.pnvm",
+            // Nothing this kernel can load.
+            "iwlwifi-sc-a0-fm-c0-c101.ucode",
+            // iwldvm is not built: not declared, not shipped.
+            "iwlwifi-6000g2a-6.ucode",
+            "iwlwifi-1000-5.ucode",
+            "intel/ice/ddp/ice.pkg",
+        ]
+        .into_iter()
+        .map(|l| (l.to_owned(), format!("intel/iwlwifi/{l}")))
+        .collect();
+        let got: Vec<String> = iwlwifi_requests(&declared, &links).into_iter().collect();
+        assert_eq!(
+            got,
+            [
+                "iwlwifi-7265D-29.ucode",
+                "iwlwifi-Qu-b0-hr-b0-77.ucode",
+                "iwlwifi-bz-b0-fm-c0-101.ucode",
+                "iwlwifi-bz-b0-fm-c0.pnvm",
+                "iwlwifi-cc-a0-77.ucode",
+                "iwlwifi-so-a0-gf-a0-89.ucode",
+                "iwlwifi-so-a0-gf-a0.pnvm",
+                "iwlwifi-so-a0-hr-b0-89.ucode",
+            ]
+        );
+        // A newer kernel that declares core 103 takes the core files.
+        let newer: BTreeSet<String> = ["iwlwifi-bz-b0-fm-c0-c103.ucode".to_owned()].into();
+        assert_eq!(
+            iwlwifi_requests(&newer, &links).into_iter().next().unwrap(),
+            "iwlwifi-bz-b0-fm-c0-c101.ucode"
+        );
+        for bad in [
+            "iwlwifi-.ucode",
+            "iwlwifi-x-.ucode",
+            "iwlwifi-x-c.ucode",
+            "iwlwifi-x-99999.ucode",
+            "x-1.ucode",
+            "iwlwifi-so-a0.pnvm",
+        ] {
+            assert_eq!(iwl_name(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_lock_follows_iwlwifi_to_the_file_it_loads() {
+        let whence = "\
+Driver: iwlwifi - Intel Wireless Wifi
+
+File: intel/iwlwifi/iwlwifi-so-a0-gf-a0-89.ucode
+Link: iwlwifi-so-a0-gf-a0-89.ucode -> intel/iwlwifi/iwlwifi-so-a0-gf-a0-89.ucode
+File: intel/iwlwifi/iwlwifi-so-a0-gf-a0.pnvm
+Link: iwlwifi-so-a0-gf-a0.pnvm -> intel/iwlwifi/iwlwifi-so-a0-gf-a0.pnvm
+
+Licence: Redistributable. See LICENCE.iwlwifi_firmware for details
+";
+        let wanted: BTreeSet<String> = ["iwlwifi-so-a0-gf-a0-100.ucode".to_owned()].into();
+        let l = build_lock("20261019", &"a".repeat(40), &wanted, whence, |_| {
+            Ok(Some(SHA.to_owned()))
+        })
+        .unwrap();
+        let files: Vec<&str> = l.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(
+            files,
+            [
+                "intel/iwlwifi/iwlwifi-so-a0-gf-a0-89.ucode",
+                "intel/iwlwifi/iwlwifi-so-a0-gf-a0.pnvm"
+            ]
+        );
+        assert_eq!(l.links.len(), 2);
+        assert_eq!(l.skips.len(), 1);
+        assert!(
+            l.skips[0].1.contains("newest version it knows"),
+            "{:?}",
+            l.skips
+        );
+        // What the build checks afterwards: the declared name is accounted for.
+        assert!(undeclared(&wanted, &l).is_empty());
+        parse(&render(&l)).unwrap();
     }
 
     #[test]
