@@ -236,6 +236,121 @@ fn pool_checks(cfg: &Config, out: &mut Out) {
     }
 }
 
+/// G4.2i: a pool handed out by the DHCP server and by the PPP service.
+/// The two allocate apart (the PPP service does not see the leases), so
+/// one address can go to a lease and to a session: `/ip pool used` marks
+/// it `conflict`. RouterOS shares one allocator; until ours do, warn.
+fn shared_pool_checks(cfg: &Config, out: &mut Out) {
+    use corerouter_model::ppp::{AddrOrPool, PppService};
+    // Every pool a root reaches through `next_pool`, with who reaches it.
+    let reach = |roots: Vec<(&str, String)>| {
+        let mut m: BTreeMap<String, String> = BTreeMap::new();
+        for (root, who) in roots {
+            for p in cfg.ip.pools.chain(root) {
+                m.entry(p.name.clone()).or_insert_with(|| who.clone());
+            }
+        }
+        m
+    };
+    let dhcp = reach(
+        cfg.ip
+            .dhcp_server
+            .servers
+            .iter()
+            .filter(|d| !d.disabled)
+            .filter_map(|d| {
+                Some((
+                    d.address_pool.as_deref()?,
+                    format!("DHCP server '{}'", d.name),
+                ))
+            })
+            .chain(
+                cfg.ip
+                    .dhcp_server
+                    .matchers
+                    .iter()
+                    .filter(|m| !m.disabled)
+                    .filter_map(|m| {
+                        Some((
+                            m.address_pool.as_deref()?,
+                            format!("DHCP matcher '{}'", m.name),
+                        ))
+                    }),
+            )
+            .collect(),
+    );
+    if dhcp.is_empty() {
+        return;
+    }
+    fn pool_of(a: &Option<AddrOrPool>) -> Option<&str> {
+        match a {
+            Some(AddrOrPool::Pool(n)) => Some(n.as_str()),
+            _ => None,
+        }
+    }
+    // Profiles that take from a pool the DHCP server also hands out: the
+    // cheap test first, so the walk of the secrets below (100 000 PPPoE
+    // secrets cost it on every commit, G0.22) runs only for a suspect.
+    let suspects: Vec<&corerouter_model::ppp::PppProfile> = cfg
+        .ppp
+        .profiles
+        .iter()
+        .filter(|pr| {
+            [&pr.local_address, &pr.remote_address]
+                .into_iter()
+                .filter_map(pool_of)
+                .any(|n| {
+                    cfg.ip
+                        .pools
+                        .chain(n)
+                        .iter()
+                        .any(|p| dhcp.contains_key(&p.name))
+                })
+        })
+        .collect();
+    if suspects.is_empty() {
+        return;
+    }
+    // A profile is PPP's when a PPPoE server defaults to it or a secret
+    // other than an IPoE one names it (IPoE's pools are the DHCP server's).
+    let in_ppp = |name: &str| {
+        cfg.ppp
+            .pppoe_servers
+            .iter()
+            .any(|v| !v.disabled && v.default_profile == name)
+            || cfg
+                .ppp
+                .secrets
+                .iter()
+                .any(|x| !x.disabled && x.service != PppService::Ipoe && x.profile == name)
+    };
+    let ppp = reach(
+        suspects
+            .into_iter()
+            .filter(|pr| in_ppp(&pr.name))
+            .flat_map(|pr| {
+                [&pr.local_address, &pr.remote_address]
+                    .into_iter()
+                    .filter_map(pool_of)
+                    .map(|n| (n, format!("PPP profile '{}'", pr.name)))
+                    .collect::<Vec<_>>()
+            })
+            .collect(),
+    );
+    for p in &cfg.ip.pools.pools {
+        if let (Some(d), Some(q)) = (dhcp.get(&p.name), ppp.get(&p.name)) {
+            out.warn(
+                format!("ip.pools[{}].name", p.id),
+                p.id,
+                "DHCP + PPP",
+                format!(
+                    "used by {d} and by {q}: they hand out addresses apart and may give one address twice (ip.pool.used.print shows it as conflict); give each its own pool"
+                ),
+            );
+        }
+    }
+}
+
 fn overlap(p: &IpPool, q: &IpPool) -> Option<(String, String)> {
     p.ranges.iter().find_map(|a| {
         q.ranges
@@ -1074,6 +1189,7 @@ pub fn checks(cfg: &Config) -> Vec<Check> {
     let mut out = Out(Vec::new());
     relay_checks(cfg, &mut out);
     pool_checks(cfg, &mut out);
+    shared_pool_checks(cfg, &mut out);
     server_checks(cfg, &mut out);
     network_checks(cfg, &mut out);
     lease_checks(cfg, &mut out);

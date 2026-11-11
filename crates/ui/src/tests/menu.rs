@@ -71,10 +71,9 @@ fn ip_groups_dhcp_and_dns_and_keeps_single_items_loose() {
             _ => None,
         })
     };
-    assert_eq!(
-        sub("DHCP").unwrap(),
-        ["Client", "Pool", "Relay", "Server"]
-    );
+    // G4.2i: Pool sits straight under IP, as in RouterOS v7 (shared by
+    // DHCP and PPP).
+    assert_eq!(sub("DHCP").unwrap(), ["Client", "Relay", "Server"]);
     let dns = sub("DNS").unwrap();
     for l in ["Settings", "Adlist", "Cache", "Forwarders", "Static", "Statistics", "TSIG Keys", "Zones"] {
         assert!(dns.contains(&l), "DNS lacks {l}: {dns:?}");
@@ -87,7 +86,7 @@ fn ip_groups_dhcp_and_dns_and_keeps_single_items_loose() {
             Node::Sub { .. } => None,
         })
         .collect();
-    assert_eq!(loose, ["Addresses", "ARP", "Fast Path", "Firewall", "Firewall XDP", "Neighbors", "Routes", "IP Services", "Subscriber Notices", "Traffic Flow", "VRF"]);
+    assert_eq!(loose, ["Addresses", "ARP", "Fast Path", "Firewall", "Firewall XDP", "Neighbors", "Pool", "Routes", "IP Services", "Subscriber Notices", "Traffic Flow", "VRF"]);
     let names: Vec<&str> = ip.nodes.iter().map(|n| match n {
         Node::Item(w) => menu::label(*w),
         Node::Sub { name, .. } => name,
@@ -100,7 +99,8 @@ fn ip_groups_dhcp_and_dns_and_keeps_single_items_loose() {
     assert!(ipv6
         .nodes
         .iter()
-        .any(|n| matches!(n, Node::Sub { name: "DHCP", items } if items.len() == 3)));
+        .any(|n| matches!(n, Node::Sub { name: "DHCP", items } if items.len() == 2)));
+    assert!(ipv6.nodes.iter().any(|n| matches!(n, Node::Item(w) if menu::label(*w) == "Pool")), "IPv6 › Pool");
 }
 
 #[test]
@@ -111,7 +111,7 @@ fn groups_open_close_and_are_remembered() {
     assert!(h.menu_row("IP/DNS").is_some(), "IP opened");
     assert!(h.has_text("DNS"));
     // Closed subgroup: its count as a chip.
-    assert!(h.has_text("4"), "DHCP shows its 4 items");
+    assert!(h.has_text("3"), "DHCP shows its 3 items");
     assert!(h.menu_row(&win_row("dns-static")).is_none());
     h.click_menu("IP/DNS");
     assert!(h.menu_row(&win_row("dns-static")).is_some(), "DNS opened");

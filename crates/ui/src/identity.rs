@@ -46,7 +46,7 @@ pub(crate) const PANEL: Panel = Panel {
 };
 
 /// The windows that can show the chip: (preference key, label).
-pub(crate) const PLACES: [(&str, &str); 7] = [
+pub(crate) const PLACES: [(&str, &str); 8] = [
     ("torch", "Torch"),
     ("arp", "ARP"),
     ("connections", "Connections"),
@@ -54,6 +54,7 @@ pub(crate) const PLACES: [(&str, &str); 7] = [
     ("cgnat", "CGNAT › Who Was"),
     ("leases", "DHCP Leases"),
     ("mtr", "MTR"),
+    ("pool-used", "IP › Pool › Used"),
 ];
 
 /// The sources, in the engine's default order: (id, label).

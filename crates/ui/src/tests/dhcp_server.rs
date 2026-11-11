@@ -132,4 +132,34 @@ fn the_pool_window_lists_pools_and_used_addresses() {
     refresh(&mut h);
     assert!(h.has_text("dhcp1"));
     assert!(h.has_text("conflict"));
+    // G4.2i: the owner chip, the count, the owner filter.
+    assert!(h.has_text("DHCP"), "owner chip");
+    assert!(h.has_text("5 addresses"), "4 bound + the conflict");
+    h.click(h.text("PPP"));
+    refresh(&mut h);
+    let p = h.app.panel_mut::<crate::ip_pool::PoolPanel>().unwrap();
+    assert_eq!(p.owner, crate::ip_pool::OwnerFilter::Ppp);
+    assert!(p.used.is_empty(), "no PPP service in the lab");
+    assert_eq!(p.used_total, 0);
+}
+
+/// G4.2i: a PPP row and a conflict row as the window draws them.
+#[test]
+fn used_rows_show_the_owner_chip_and_the_conflict() {
+    let ppp = crate::ip_pool::used_row(&json!({
+        "pool": "assin", "address": "100.64.0.2", "owner": "pppoe-ether3", "service": "ppp",
+        "info": "ana 02:00:00:00:00:01", "user": "ana", "vlan": 100, "session": "*1-1", "state": "active",
+    }));
+    assert_eq!(ppp.key, "ppp|100.64.0.2|*1-1");
+    let (owner, chips) = crate::chip::split(&ppp.cells[2]);
+    assert_eq!(owner, "pppoe-ether3");
+    assert_eq!(chips[0].1, "PPP");
+    assert_eq!(ppp.cells[3], "ana 02:00:00:00:00:01 vlan 100");
+    let c = crate::ip_pool::used_row(&json!({
+        "pool": "lan", "address": "192.168.88.12", "owner": "dhcp1", "service": "dhcp",
+        "info": "aa:bb:cc:00:00:01", "state": "conflict", "conflict": "also PPP session 'pedro'",
+    }));
+    assert!(c.cells[3].ends_with("— also PPP session 'pedro'"), "{}", c.cells[3]);
+    let (_, chips) = crate::chip::split(&c.cells[4]);
+    assert_eq!(chips[0], (crate::chip::Kind::Red, "conflict"));
 }

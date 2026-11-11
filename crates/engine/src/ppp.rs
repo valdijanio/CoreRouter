@@ -87,6 +87,43 @@ pub trait PppBackend: Send + Sync {
         let _ = (ip, at);
         None
     }
+    /// G4.2i: the sessions up holding an address taken from an `/ip pool`
+    /// (`ActiveSession::pool`) that `keep` accepts, in address order: how
+    /// many, and the first `limit` (`ip.pool.used.print`). The default is a
+    /// backend that takes no address from `/ip pool` (IPoE: its addresses
+    /// are DHCP leases, listed by the DHCP server).
+    fn pool_page(
+        &self,
+        keep: &dyn Fn(&ActiveSession) -> bool,
+        limit: usize,
+    ) -> (usize, Vec<ActiveSession>) {
+        let _ = (keep, limit);
+        (0, Vec::new())
+    }
+    /// Addresses taken per `/ip pool` name (`ip.pool.print`).
+    fn pool_use(&self) -> std::collections::BTreeMap<String, u64> {
+        std::collections::BTreeMap::new()
+    }
+    /// The session holding `ip` taken from an `/ip pool`, if any: a DHCP
+    /// lease of the same address is a conflict (G4.2i).
+    fn pool_holder(&self, ip: std::net::Ipv4Addr) -> Option<ActiveSession> {
+        let _ = ip;
+        None
+    }
+}
+
+/// The first `limit` of `rows` by `key`, sorted, without sorting the rest:
+/// O(n) (G4.3g's `active_page`, here by address for `/ip pool used`).
+pub fn first_by<T, K: Ord>(rows: &mut Vec<T>, limit: usize, key: impl Fn(&T) -> K) {
+    if limit == 0 {
+        rows.clear();
+        return;
+    }
+    if limit < rows.len() {
+        rows.select_nth_unstable_by(limit - 1, |a, b| key(a).cmp(&key(b)));
+        rows.truncate(limit);
+    }
+    rows.sort_by_key(&key);
 }
 
 #[derive(Default)]
@@ -187,6 +224,37 @@ impl PppBackend for Merged {
 
     fn who_at(&self, ip: std::net::Ipv4Addr, at: u64) -> Option<String> {
         self.0.iter().find_map(|b| b.who_at(ip, at))
+    }
+
+    /// Each half's page by address, then the union cut to `limit`.
+    fn pool_page(
+        &self,
+        keep: &dyn Fn(&ActiveSession) -> bool,
+        limit: usize,
+    ) -> (usize, Vec<ActiveSession>) {
+        let mut total = 0;
+        let mut rows = Vec::new();
+        for b in &self.0 {
+            let (n, page) = b.pool_page(keep, limit);
+            total += n;
+            rows.extend(page);
+        }
+        first_by(&mut rows, limit, |a| a.address);
+        (total, rows)
+    }
+
+    fn pool_use(&self) -> std::collections::BTreeMap<String, u64> {
+        let mut m = std::collections::BTreeMap::new();
+        for b in &self.0 {
+            for (pool, n) in b.pool_use() {
+                *m.entry(pool).or_insert(0) += n;
+            }
+        }
+        m
+    }
+
+    fn pool_holder(&self, ip: std::net::Ipv4Addr) -> Option<ActiveSession> {
+        self.0.iter().find_map(|b| b.pool_holder(ip))
     }
 }
 
@@ -411,6 +479,65 @@ mod merged_tests {
         fn stats(&self) -> ServiceStats {
             ServiceStats { sessions: self.1.len() as u64, workers: self.2, delegated: u64::from(self.2), ..ServiceStats::default() }
         }
+    }
+
+    /// G4.2i: a backend with pool sessions, ordered by address.
+    struct Pooled(Vec<(&'static str, &'static str)>);
+
+    impl PppBackend for Pooled {
+        fn active(&self) -> Vec<ActiveSession> {
+            Vec::new()
+        }
+        fn terminate(&self, _: &[String]) -> usize {
+            0
+        }
+        fn history(&self) -> Vec<HistoryEntry> {
+            Vec::new()
+        }
+        fn why(&self, _: Option<&str>, _: Option<MacAddr>) -> Why {
+            Why::default()
+        }
+        fn stats(&self) -> ServiceStats {
+            ServiceStats::default()
+        }
+        fn pool_page(&self, keep: &dyn Fn(&ActiveSession) -> bool, limit: usize) -> (usize, Vec<ActiveSession>) {
+            let mut all: Vec<ActiveSession> = self.0.iter().map(|(ip, pool)| ActiveSession { address: Some(ip.parse().unwrap()), pool: Some((*pool).into()), ..ActiveSession::default() }).filter(|a| keep(a)).collect();
+            let n = all.len();
+            super::first_by(&mut all, limit, |a| a.address);
+            (n, all)
+        }
+        fn pool_use(&self) -> std::collections::BTreeMap<String, u64> {
+            let mut m = std::collections::BTreeMap::new();
+            for (_, p) in &self.0 {
+                *m.entry((*p).to_owned()).or_insert(0) += 1;
+            }
+            m
+        }
+        fn pool_holder(&self, ip: std::net::Ipv4Addr) -> Option<ActiveSession> {
+            self.pool_page(&|a| a.address == Some(ip), 1).1.into_iter().next()
+        }
+    }
+
+    /// G4.2i: the pool page is in address order over both halves and cut;
+    /// counts add up; a backend without pools (the default) adds nothing.
+    #[test]
+    fn the_union_pages_pool_sessions_by_address() {
+        let m = Merged(vec![
+            Arc::new(Pooled(vec![("100.64.0.9", "a"), ("100.64.0.2", "a")])),
+            Arc::new(Pooled(vec![("100.64.0.5", "b")])),
+            Arc::new(Half("dhcp1", vec!["bia"], 0)),
+        ]);
+        let (total, page) = m.pool_page(&|_| true, 2);
+        assert_eq!(total, 3);
+        let ips: Vec<String> = page.iter().map(|a| a.address.unwrap().to_string()).collect();
+        assert_eq!(ips, ["100.64.0.2", "100.64.0.5"]);
+        let used = m.pool_use();
+        assert_eq!((used.get("a"), used.get("b")), (Some(&2), Some(&1)));
+        assert!(m.pool_holder("100.64.0.5".parse().unwrap()).is_some());
+        assert!(m.pool_holder("100.64.0.6".parse().unwrap()).is_none());
+        let mut v = vec![5, 1, 4, 2, 3];
+        super::first_by(&mut v, 0, |x| *x);
+        assert!(v.is_empty());
     }
 
     /// PPPoE and IPoE as one: the page is sorted over both halves and cut,

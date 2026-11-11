@@ -1,15 +1,18 @@
-//! IP › Pool (G4.2a): the address pools the DHCP server hands out, one row
-//! each with its use (amber from 80 %), and the Used tab (`/ip pool used`:
-//! which address went to whom). `ip.pool.*` decides; this only shows and
-//! sends. A panel (`panel.rs`).
+//! IP › Pool (G4.2a): the address pools the DHCP server and the PPP
+//! service hand out, one row each with its use (amber from 80 %), and the
+//! Used tab (`/ip pool used`: which address went to whom, G4.2i: leases
+//! and PPP sessions, filtered by owner, a page with the whole count).
+//! `ip.pool.*` decides; this only shows and sends. A panel (`panel.rs`).
 
-use egui::{Grid, Ui};
+use egui::{Grid, Id, Ui};
 use serde_json::{Value, json};
 
 use crate::backend::RequestId;
 use crate::chip::{self, Kind};
 use crate::dhcp_client::text;
 use crate::dialog::{self, Footer, Press, Status};
+use crate::help::{self, HelpView};
+use crate::i18n::tr_in;
 use crate::interfaces::{cascade, dialog_id};
 use crate::panel::{Panel, PanelState, PanelThen, Query, WinDef};
 use crate::table::{self, Icon, Menu, Row, Shortcut, TableState, action, col, comment, num};
@@ -19,6 +22,10 @@ const NAME: &str = "ip-pool";
 pub(crate) const WIN: &str = "ip-pool";
 const TABLE: &str = "ip-pool";
 const USED_TABLE: &str = "ip-pool-used";
+/// Translation scope (`i18n/auto/ip_pool_*.rs`).
+const SCOPE: &str = "ip_pool";
+/// The subscriber chip's place (`identity::PLACES`).
+const PLACE: &str = "pool-used";
 
 pub(crate) const PANEL: Panel = Panel {
     name: NAME,
@@ -37,23 +44,48 @@ const COLUMNS: [table::Column; 7] = [
     col("Ranges"),
     col("Next Pool"),
     num("Size"),
-    num("Used"),
+    num("Used").help("ip_pool.used"),
     col("Use"),
     comment(),
 ];
 const USED_COLUMNS: [table::Column; 5] = [
-    col("Pool"),
-    col("Address"),
-    col("Owner"),
-    col("Info"),
-    col("State"),
+    col("Pool").help("ip_pool.used.pool"),
+    col("Address").help("ip_pool.used.address"),
+    col("Owner").help("ip_pool.used.owner"),
+    col("Info").help("ip_pool.used.info"),
+    col("State").help("ip_pool.used.state"),
 ];
+
+/// Which owners the Used tab asks for (`ip.pool.used.print` `owner`).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) enum OwnerFilter {
+    #[default]
+    All,
+    Dhcp,
+    Ppp,
+}
+
+impl OwnerFilter {
+    const ALL: [(Self, &'static str); 3] = [(Self::All, "All"), (Self::Dhcp, "DHCP"), (Self::Ppp, "PPP")];
+
+    fn param(self) -> Option<&'static str> {
+        match self {
+            Self::All => None,
+            Self::Dhcp => Some("dhcp"),
+            Self::Ppp => Some("ppp"),
+        }
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct PoolPanel {
     pub(crate) pools: Vec<Value>,
     pub(crate) used: Vec<Value>,
+    /// All the addresses in use the filter matches (`used` is a page).
+    pub(crate) used_total: u64,
+    pub(crate) owner: OwnerFilter,
     pub(crate) show_used: bool,
+    help: Option<HelpView>,
     table: TableState,
     used_table: TableState,
     pub(crate) dialog: Option<PoolDialog>,
@@ -100,24 +132,86 @@ pub(crate) fn row(r: &Value) -> Row {
     }
 }
 
-fn used_row(r: &Value) -> Row {
-    let kind = match text(r, "state").as_str() {
-        "bound" => Kind::Green,
+/// The key of a Used row: one address can be a lease and a session
+/// (a conflict), so the service and the session go in too.
+fn used_key(r: &Value) -> String {
+    format!("{}|{}|{}", text(r, "service"), text(r, "address"), text(r, "session"))
+}
+
+pub(crate) fn used_row(r: &Value) -> Row {
+    let state = text(r, "state");
+    let kind = match state.as_str() {
+        "bound" | "active" => Kind::Green,
         "offered" => Kind::Blue,
         _ => Kind::Red,
     };
+    let service = match text(r, "service").as_str() {
+        "ppp" => ("PPP", Kind::Blue),
+        "ipoe" => ("IPoE", Kind::Amber),
+        _ => ("DHCP", Kind::Neutral),
+    };
+    let mut info = text(r, "info");
+    if let Some(user) = r.get("user").and_then(Value::as_str)
+        && text(r, "service") == "ipoe"
+    {
+        info = format!("{user} {info}");
+    }
+    if let Some(vlan) = r.get("vlan").and_then(Value::as_u64) {
+        info = format!("{info} vlan {vlan}");
+    }
+    if let Some(why) = r.get("conflict").and_then(Value::as_str) {
+        info = format!("{info} — {why}");
+    }
     Row {
-        key: text(r, "address"),
+        key: used_key(r),
         cells: vec![
             text(r, "pool"),
             text(r, "address"),
-            text(r, "owner"),
-            text(r, "info"),
-            chip::cell("", &[(text(r, "state").as_str(), kind)]),
+            chip::cell(&text(r, "owner"), &[service]),
+            info,
+            chip::cell("", &[(state.as_str(), kind)]),
         ],
         dimmed: false,
         section: false,
         tint: None,
+    }
+}
+
+impl PoolPanel {
+    /// The Used tab: the owner filter, the page's count, the table.
+    fn used_view(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
+        let l = app.lang.labels;
+        let mut rows: Vec<Row> = self.used.iter().map(used_row).collect();
+        for (row, r) in rows.iter_mut().zip(&self.used) {
+            crate::identity::add_chips(app, ui, PLACE, row, 1, &text(r, "address"));
+        }
+        ui.horizontal(|ui| {
+            ui.label(tr_in(SCOPE, l, "Owner"));
+            for (f, label) in OwnerFilter::ALL {
+                if ui.selectable_label(self.owner == f, tr_in(SCOPE, l, label)).clicked() && self.owner != f {
+                    self.owner = f;
+                    app.cache.refreshed_at = None;
+                }
+            }
+            if help::info_button(ui, Id::unique("ip-pool-owner-help"), tr_in(SCOPE, l, "Owner")).clicked() {
+                self.help = Some(HelpView::new("ip_pool.used.owner", tr_in(SCOPE, l, "Owner")));
+            }
+            ui.separator();
+            let shown = self.used.len() as u64;
+            if self.used_total > shown {
+                ui.label(format!("{shown} {} {}", tr_in(SCOPE, l, "of"), self.used_total))
+                    .on_hover_text(tr_in(SCOPE, l, "The first addresses, in address order: narrow with Owner or Find"));
+            } else {
+                ui.label(format!("{shown} {}", tr_in(SCOPE, l, "addresses")));
+            }
+            table::find_field(ui, USED_TABLE, &mut self.used_table);
+        });
+        let out = table::show(ui, USED_TABLE, 0.0, &mut self.used_table, &USED_COLUMNS, &rows, |_, _| {});
+        crate::identity::table_chip(app, ui, PLACE, &out, &rows, |k| k.split('|').nth(1).map(str::to_owned));
+        if let Some(key) = out.help {
+            let title = USED_COLUMNS.iter().find(|c| c.help == key).map_or("", |c| c.title);
+            self.help = Some(HelpView::new(key, title));
+        }
     }
 }
 
@@ -131,10 +225,14 @@ impl PanelState for PoolPanel {
                 params: Value::Null,
             });
             if self.show_used {
+                let params = match self.owner.param() {
+                    Some(o) => json!({ "owner": o }),
+                    None => Value::Null,
+                };
                 out.push(Query {
                     key: "used",
                     command: "ip.pool.used.print",
-                    params: Value::Null,
+                    params,
                 });
             }
         }
@@ -142,30 +240,42 @@ impl PanelState for PoolPanel {
     }
 
     fn arrived(&mut self, _app: &mut CoreRouterUi, key: &'static str, _: RequestId, value: Value) {
-        if let Value::Array(a) = value {
-            match key {
-                "pools" => self.pools = a,
-                "used" => self.used = a,
-                _ => {}
+        match (key, value) {
+            ("pools", Value::Array(a)) => self.pools = a,
+            // G4.2i: `{total, rows}`; a daemon from before it sends the
+            // list alone.
+            ("used", Value::Object(mut o)) => {
+                self.used = match o.remove("rows") {
+                    Some(Value::Array(a)) => a,
+                    _ => Vec::new(),
+                };
+                self.used_total = o.get("total").and_then(Value::as_u64).unwrap_or(self.used.len() as u64);
             }
+            ("used", Value::Array(a)) => {
+                self.used_total = a.len() as u64;
+                self.used = a;
+            }
+            _ => {}
         }
     }
 
     fn window(&mut self, app: &mut CoreRouterUi, _win: &'static str, ui: &mut Ui) {
+        let l = app.lang.labels;
         ui.horizontal(|ui| {
-            if ui.selectable_label(!self.show_used, "Pools").clicked() {
+            if ui.selectable_label(!self.show_used, tr_in(SCOPE, l, "Pools")).clicked() {
                 self.show_used = false;
             }
-            if ui.selectable_label(self.show_used, "Used Addresses").clicked() {
+            if ui.selectable_label(self.show_used, tr_in(SCOPE, l, "Used Addresses")).clicked() {
                 self.show_used = true;
                 app.cache.refreshed_at = None;
+            }
+            if help::info_button(ui, Id::unique("ip-pool-used-help"), tr_in(SCOPE, l, "Used Addresses")).clicked() {
+                self.help = Some(HelpView::new("ip_pool.used_tab", tr_in(SCOPE, l, "Used Addresses")));
             }
         });
         ui.separator();
         if self.show_used {
-            let rows: Vec<Row> = self.used.iter().map(used_row).collect();
-            ui.horizontal(|ui| table::find_field(ui, USED_TABLE, &mut self.used_table));
-            table::show(ui, USED_TABLE, 0.0, &mut self.used_table, &USED_COLUMNS, &rows, |_, _| {});
+            self.used_view(app, ui);
             return;
         }
         let rows: Vec<Row> = self.pools.iter().map(row).collect();
@@ -192,6 +302,10 @@ impl PanelState for PoolPanel {
                 new = true;
             }
         });
+        if let Some(key) = out.help {
+            let title = COLUMNS.iter().find(|c| c.help == key).map_or("", |c| c.title);
+            self.help = Some(HelpView::new(key, title));
+        }
         if matches!(out.shortcut, Some(Shortcut::Remove)) && !selection.is_empty() {
             remove = true;
         }
@@ -224,6 +338,7 @@ impl PanelState for PoolPanel {
     }
 
     fn dialogs(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
+        help::modal(ctx, app.lang, &mut self.help);
         let Some(mut d) = self.dialog.take() else {
             return;
         };
@@ -290,6 +405,9 @@ impl PanelState for PoolPanel {
     }
 
     fn escape(&mut self, _win: &'static str) -> bool {
+        if self.help.take().is_some() {
+            return true;
+        }
         if self.show_used {
             self.used_table.escape()
         } else {

@@ -97,11 +97,13 @@ pub(crate) const CATALOG: &[Entry] = &[
     e("interface-list", None, None, icons::LIST_BULLETS, "/interface list", &["interface.list"], &["lan", "wan", "lista", "member"]),
     e("interfaces", None, None, icons::PLUGS, "/interface", &["interface.print", "interface.set", "interface.ethernet", "interface.vlan", "interface.bridge"], &["ethernet", "porta", "port", "vlan", "bridge", "mtu", "link"]),
     e("ip-calc", None, None, icons::SQUARES_FOUR, "/tool ip-calc", &["tool.ip-calc"], &["subnet", "sub-rede", "calculadora", "calculator", "cidr", "máscara", "mask", "wildcard", "broadcast", "summarize", "sumarizar", "supernet", "pd", "prefix delegation", "cgnat planner", "planejar cgnat"]),
-    e("ip-pool", DHCP, Some("Pool"), icons::STACK_SIMPLE, "/ip pool", &["ip.pool"], &["faixa", "range", "address pool", "ipv4"]),
+    // G4.2i: straight under IP and IPv6, as in RouterOS v7: a pool serves
+    // DHCP, PPP and others, not DHCP alone.
+    e("ip-pool", None, Some("Pool"), icons::STACK_SIMPLE, "/ip pool", &["ip.pool"], &["faixa", "range", "address pool", "ipv4", "used", "em uso", "pppoe", "ppp", "dhcp", "conflict", "conflito"]),
     e("ip-services", None, Some("Services"), icons::PLUGS_CONNECTED, "/ip service", &["ip.service"], &["service", "serviço", "servico", "www", "www-ssl", "https", "webfig", "metrics", "prometheus", "porta", "port", "available from", "acesso web", "http server", "management"]),
     e("ipv6-nd", None, Some("ND"), icons::BROADCAST, "/ipv6 nd", &["ipv6.nd"], &["router advertisement", "anúncio de roteador", "ra", "slaac", "radvd", "router-advert", "ipv6 nd prefix", "autoconfiguração", "rdnss", "prefixo"]),
     e("ipv6-neighbors", None, Some("Neighbors"), icons::SHARE_NETWORK, "/ipv6 neighbor", &["ipv6.neighbor"], &["nd", "ndp", "vizinhos ipv6", "neighbor discovery", "show ipv6 neighbors", "ndisc"]),
-    e("ipv6-pool", DHCP, Some("Pool"), icons::STACK_SIMPLE, "/ipv6 pool", &["ipv6.pool"], &["prefix", "prefixo", "prefix delegation"]),
+    e("ipv6-pool", None, Some("Pool"), icons::STACK_SIMPLE, "/ipv6 pool", &["ipv6.pool"], &["prefix", "prefixo", "prefix delegation"]),
     e("ipv6-settings", None, Some("Settings"), icons::GEAR_SIX, "/ipv6 settings", &["ipv6.settings"], &["forward", "ra", "accept router advertisements", "slaac"]),
     e("log", None, None, icons::SCROLL, "/log", &["log"], &["eventos", "messages", "mensagens"]),
     e("logging", None, None, icons::NOTEBOOK, "/system logging", &["system.logging"], &["syslog", "remote log", "topics", "rules", "regras"]),
