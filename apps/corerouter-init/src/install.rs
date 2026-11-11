@@ -31,6 +31,7 @@ use rustix::system::RebootCommand;
 
 use crate::console::{self, Console};
 use crate::plan::{self, BootOptions, Mgmt};
+use crate::style::{self, bad, dim, good, key, title, warn};
 
 pub(crate) use corerouter_sysupdate::disks::KEYS;
 pub(crate) const AUTOINSTALL: &str =
@@ -100,7 +101,12 @@ pub(crate) fn find_medium(
     loop {
         let found = disks::find_medium(keys, &mut |name, e| {
             if said.insert(name.to_owned()) {
-                con.say(&format!("  {name}: an installer medium, but unusable: {e}"));
+                con.say(&style::block(
+                    2,
+                    &warn("WARNING"),
+                    9,
+                    &format!("{name}: an installer medium, but unusable: {e}"),
+                ));
             }
         });
         if let Some(m) = found {
@@ -116,51 +122,168 @@ pub(crate) fn find_medium(
     }
 }
 
+/// The steps the installer walks through (G1.6zg).
+const STEPS: usize = 5;
+
 /// The disks that can be the target, in the order they are numbered.
 fn offered(ds: &[Disk]) -> Vec<&Disk> {
     ds.iter().filter(|d| d.refused.is_none()).collect()
 }
 
-fn table(con: &Console, ds: &[Disk]) {
-    con.say("");
-    con.say(&format!(
-        "  {:<4}{:<10}{:<11}{:<32}{:<9}{}",
-        "#", "name", "size", "model", "bus", "holds"
-    ));
+fn or_dash(s: &str) -> String {
+    let s = style::ascii(s);
+    if s.is_empty() { "-".to_owned() } else { s }
+}
+
+fn bus(d: &Disk) -> String {
+    if d.removable && d.bus != "USB" {
+        format!("{} rem.", d.bus)
+    } else {
+        d.bus.to_owned()
+    }
+}
+
+/// The disks: the ones that can be the target numbered and bright, the
+/// others dimmed, without a number and with the reason on a line of its own.
+fn table(ds: &[Disk]) -> String {
+    let row = |num: &str, name: &str, size: &str, model: &str, bus: &str, holds: &str| {
+        format!(
+            "{num:>3}  {name:<9}{size:<11}{:<23}{bus:<10}{}",
+            style::clip(model, 22),
+            style::clip(holds, 18)
+        )
+        .trim_end()
+        .to_owned()
+    };
+    let mut out = format!(
+        "  {}",
+        title(&row("#", "NAME", "SIZE", "MODEL", "BUS", "HOLDS"))
+    );
+    let mut n = 0;
     for d in ds {
-        let num = match offered(ds).iter().position(|o| o.name == d.name) {
-            Some(n) if d.refused.is_none() => format!("{}", n + 1),
-            _ => " ".into(),
+        let line = |num: &str| {
+            row(
+                num,
+                &style::ascii(&d.name),
+                &human(d.bytes),
+                &or_dash(&d.model),
+                &bus(d),
+                &describe(&d.existing),
+            )
         };
-        let holds = match &d.refused {
-            Some(r) => format!("{} — not offered: {r}", describe(&d.existing)),
-            None => describe(&d.existing),
-        };
-        let model: String = if d.model.is_empty() {
-            "-".into()
-        } else {
-            d.model.chars().take(30).collect()
-        };
-        let bus = if d.removable && d.bus != "USB" {
-            format!("{} rem.", d.bus)
-        } else {
-            d.bus.to_owned()
-        };
-        con.say(&format!(
-            "  {num:<4}{:<10}{:<11}{model:<32}{bus:<9}{holds}",
-            d.name,
-            human(d.bytes)
+        match &d.refused {
+            None => {
+                n += 1;
+                out.push_str(&format!("\n  {}", title(&line(&n.to_string()))));
+            }
+            Some(why) => {
+                out.push_str(&format!("\n  {}", dim(&line("-"))));
+                out.push_str(&format!(
+                    "\n{}",
+                    dim(&style::block(7, "", 0, &format!("not offered: {why}")))
+                ));
+            }
+        }
+    }
+    if ds.is_empty() {
+        out.push_str("\n  no disk found");
+    }
+    out
+}
+
+/// What is about to be erased, and what goes on it: the last screen before
+/// the disk's name is typed.
+fn confirm_text(d: &Disk, version: &str, keep: bool, mgmt: Option<&Mgmt>) -> String {
+    let row = |label: &str, value: &str| style::block(2, label, 9, value);
+    let holds = match (&d.existing, keep) {
+        (Existing::CoreRouter { .. }, true) => {
+            "CoreRouter: its configuration is kept, the rest is erased".to_owned()
+        }
+        (e, _) => describe(e),
+    };
+    [
+        format!(
+            "  {}",
+            bad(&format!(
+                "!! ALL DATA ON {} WILL BE ERASED !!",
+                style::ascii(&d.name)
+            ))
+        ),
+        row(
+            "Disk",
+            &format!(
+                "{}, {} ({} bytes), {}",
+                title(&style::ascii(&d.name)),
+                human(d.bytes),
+                d.bytes,
+                bus(d)
+            ),
+        ),
+        row("Model", &or_dash(&d.model)),
+        row("Serial", &or_dash(&d.serial)),
+        row("Holds", &holds),
+        row("Install", &format!("CoreRouter {version}")),
+        row(
+            "Address",
+            &match mgmt {
+                Some(m) => format!("{} on {}{}", m.address, m.interface, gateway_note(m)),
+                None if keep => "as in the configuration that is kept".to_owned(),
+                None => "none: the console asks for it on the first boot".to_owned(),
+            },
+        ),
+    ]
+    .join("\n")
+}
+
+fn gateway_note(m: &Mgmt) -> String {
+    m.gateway
+        .as_ref()
+        .map(|g| format!(", gateway {g}"))
+        .unwrap_or_default()
+}
+
+/// What to do once the install is done, after the green line.
+fn next_text(keep: bool, mgmt: Option<&Mgmt>, attended: bool) -> String {
+    let mut out = Vec::new();
+    if attended {
+        out.push(format!(
+            "  {} remove the installation medium, then press {} to reboot.",
+            title("Next:"),
+            key("Enter")
         ));
     }
-    con.say("");
+    out.push(match mgmt {
+        Some(m) => {
+            let host = m.address.split('/').next().unwrap_or("");
+            let host = if host.contains(':') {
+                format!("[{host}]")
+            } else {
+                host.to_owned()
+            };
+            style::block(
+                2,
+                "",
+                0,
+                &format!(
+                    "Then open {} (through {}; user admin{}).",
+                    key(&format!("https://{host}/")),
+                    m.interface,
+                    if keep { "" } else { ", no password yet" }
+                ),
+            )
+        }
+        None if keep => "  The router comes up with the configuration that was kept.".to_owned(),
+        None => "  On its first boot the console asks for the management address.".to_owned(),
+    });
+    out.join("\n")
 }
 
 fn finish(con: &Console, poweroff: bool) -> ! {
     rustix::fs::sync();
     con.say(if poweroff {
-        "Powering off."
+        "  Powering off."
     } else {
-        "Rebooting."
+        "  Rebooting."
     });
     let _ = rustix::system::reboot(if poweroff {
         RebootCommand::PowerOff
@@ -170,6 +293,20 @@ fn finish(con: &Console, poweroff: bool) -> ! {
     loop {
         std::thread::sleep(Duration::from_secs(3600));
     }
+}
+
+/// What a failed install says: the cause, and what to do next.
+fn failure_text(e: &str) -> String {
+    format!(
+        "\n{}\n{}",
+        style::block(2, &bad("FAILED"), 8, &format!("The install failed: {e}")),
+        style::block(
+            10,
+            "",
+            0,
+            "If the writing had started, that disk does not boot until an install completes."
+        )
+    )
 }
 
 /// PID 1 of the installer.
@@ -183,14 +320,36 @@ pub fn run(opts: &BootOptions, cmdline: &str) -> ! {
     match flow(&con, opts, cmdline, auto) {
         Ok(poweroff) => finish(&con, poweroff),
         Err(e) => {
-            con.say(&format!("\ninstall failed: {e}"));
+            con.say(&failure_text(&e));
             if unattended {
                 finish(&con, true);
             }
-            let _ = con.ask("Press Enter to reboot. ", None);
+            let _ = con.ask(
+                &style::prompt("Press Enter to reboot and start again", None, None),
+                None,
+            );
             finish(&con, false)
         }
     }
+}
+
+/// The first lines: what this is, on what, and how it will boot.
+fn header_text(build: &str, bios: bool, consoles: &[&str]) -> String {
+    let right = match (build.is_empty(), crate::setup::machine()) {
+        (true, m) => m,
+        (false, m) if m.is_empty() => format!("build {build}"),
+        (false, m) => format!("build {build}  {m}"),
+    };
+    format!(
+        "{}\n  Firmware  {}\n  Consoles  {}",
+        style::header("CoreRouter installer", &right),
+        if bios {
+            "BIOS: the disk boots through GRUB (and by UEFI, on such a machine)"
+        } else {
+            "UEFI: the disk gets a boot entry (and boots by BIOS too, via GRUB)"
+        },
+        consoles.join(", ")
+    )
 }
 
 fn flow(
@@ -200,38 +359,48 @@ fn flow(
     auto: Option<Result<Auto, String>>,
 ) -> Result<bool, String> {
     let release = sys("/etc/os-release");
-    let pretty = release
+    let build = release
         .lines()
-        .find_map(|l| l.strip_prefix("PRETTY_NAME="))
-        .unwrap_or("CoreRouter")
-        .trim_matches('"')
-        .to_owned();
-    con.say(&format!(
-        "\n{pretty} — installer (consoles: {})",
-        con.names().join(", ")
-    ));
-    for w in &opts.warnings {
-        con.say(&format!("kernel command line: {w}"));
-    }
+        .find_map(|l| l.strip_prefix("VERSION_ID="))
+        .map(|v| style::ascii(v.trim_matches('"')))
+        .unwrap_or_default();
     let bios = !Path::new("/sys/firmware/efi").exists();
-    con.say(if bios {
-        "Booted by BIOS: the disk boots through GRUB (and by UEFI, if it moves to such a machine)."
-    } else {
-        "Booted by UEFI: the disk gets a boot entry (and boots by BIOS too, through GRUB)."
-    });
+    con.say(&header_text(&build, bios, &con.names()));
+    for w in &opts.warnings {
+        con.say(&style::block(
+            2,
+            &warn("WARNING"),
+            9,
+            &format!("kernel command line: {w}"),
+        ));
+    }
+
+    con.say(&style::step(1, STEPS, "Medium"));
     let keys = package::load_keys(Path::new(KEYS));
-    con.say("Looking for the installer medium…");
+    con.say("  Looking for the installer medium...");
     let (medium_dev, mut medium) = find_medium(con, &keys)?;
     let m = medium.header.manifest.clone();
+    let version = style::ascii(&m.version);
     con.say(&format!(
-        "Medium: {medium_dev} — CoreRouter {} (commit {}, {} channel), signed by key {}",
-        m.version, m.commit, m.channel, medium.key
+        "  {}  {medium_dev}: CoreRouter {version} ({} channel)",
+        good("OK"),
+        style::ascii(&m.channel)
     ));
+    con.say(&dim(&format!(
+        "      commit {}, signed by key {}",
+        style::ascii(&m.commit),
+        style::ascii(&medium.key)
+    )));
     let auto = match auto {
         Some(Ok(a)) => {
-            con.say(&format!(
-                "\nUNATTENDED INSTALL asked by the hypervisor (fw_cfg opt/org.corerouter/autoinstall): disk {}",
-                a.disk
+            con.say(&style::block(
+                2,
+                &warn("UNATTENDED INSTALL"),
+                20,
+                &format!(
+                    "asked by the hypervisor (fw_cfg opt/org.corerouter/autoinstall): disk {}, no questions",
+                    a.disk
+                ),
             ));
             Some(a)
         }
@@ -239,24 +408,40 @@ fn flow(
         None => None,
     };
     loop {
+        con.say(&style::step(2, STEPS, "Disk"));
         let ds = disks::list(&medium_dev, &medium.index, bios);
-        table(con, &ds);
+        con.say(&table(&ds));
         let pick = match &auto {
             Some(a) => ds
                 .iter()
                 .find(|d| d.name == a.disk)
                 .ok_or_else(|| format!("no disk named {}", a.disk))?,
             None => {
+                // One disk to offer: Enter takes it (nothing is written
+                // before its name is typed). More, or none: Enter looks again.
+                let only = match offered(&ds).as_slice() {
+                    [d] => Some(*d),
+                    _ => None,
+                };
                 let Some(line) = con.ask(
-                    "Disk to install on (number or name; r: rescan, p: power off): ",
+                    &style::prompt(
+                        "Disk to install on",
+                        only.map(|_| "1"),
+                        Some(if only.is_some() {
+                            "r = rescan, p = power off"
+                        } else {
+                            "number or name; r = rescan, p = power off"
+                        }),
+                    ),
                     None,
                 ) else {
                     return Err("console closed".into());
                 };
-                match line.as_str() {
-                    "" | "r" => continue,
-                    "p" => return Ok(true),
-                    l => {
+                match (line.as_str(), only) {
+                    ("r", _) | ("", None) => continue,
+                    ("p", _) => return Ok(true),
+                    ("", Some(d)) => d,
+                    (l, _) => {
                         let by_num = l
                             .parse::<usize>()
                             .ok()
@@ -265,7 +450,7 @@ fn flow(
                             Some(d) => d,
                             None => {
                                 con.say(&format!(
-                                    "No disk '{}'.",
+                                    "  No disk '{}'.",
                                     l.chars().take(32).collect::<String>()
                                 ));
                                 continue;
@@ -279,28 +464,14 @@ fn flow(
             if auto.is_some() {
                 return Err(format!("{} cannot be the target: {r}", pick.name));
             }
-            con.say(&format!("{} cannot be the target: {r}.", pick.name));
+            con.say(&style::block(
+                2,
+                "",
+                0,
+                &format!("{} cannot be the target: {r}.", pick.name),
+            ));
             continue;
         }
-        con.say(&format!("\nALL DATA ON {} WILL BE ERASED:", pick.name));
-        con.say(&format!(
-            "  {}  {} ({} bytes)  {}  serial {}  {}  holds: {}",
-            pick.name,
-            human(pick.bytes),
-            pick.bytes,
-            if pick.model.is_empty() {
-                "-"
-            } else {
-                &pick.model
-            },
-            if pick.serial.is_empty() {
-                "-"
-            } else {
-                &pick.serial
-            },
-            pick.bus,
-            describe(&pick.existing)
-        ));
         let keepable = pick.existing
             == Existing::CoreRouter {
                 config_keepable: true,
@@ -308,44 +479,42 @@ fn flow(
         let (keep, mgmt, append) = match &auto {
             Some(a) => (a.keep_config, a.mgmt.clone(), a.append.clone()),
             None => {
+                con.say(&format!(
+                    "  {}  {}: {}, {}",
+                    good("OK"),
+                    pick.name,
+                    human(pick.bytes),
+                    match &pick.existing {
+                        Existing::Empty => "empty".to_owned(),
+                        e => format!("holds {}", style::clip(&describe(e), 40)),
+                    }
+                ));
                 let keep = keepable
                     && con
                         .ask(
-                            "Keep the CoreRouter configuration that is on it? [y/N] ",
+                            &style::prompt(
+                                "Keep the CoreRouter configuration that is on it?",
+                                Some("y/N"),
+                                None,
+                            ),
                             None,
                         )
                         .is_some_and(|l| l.eq_ignore_ascii_case("y"));
-                // G1.6m: the names the router gives them on its first
-                // boot (bus order), with link and MAC to find the cable.
-                let ports: Vec<(String, String, bool)> = crate::links::ports_with_link()
-                    .into_iter()
-                    .map(|(f, up)| (f.kernel, f.mac, up))
-                    .collect();
-                let mgmt = loop {
-                    con.say("Management address for the first boot: <port> <address/prefix> [<gateway>]");
-                    for p in &ports {
-                        con.say(&format!("  {}", crate::setup::describe(p)));
-                    }
-                    let Some(l) = con.ask("(e.g. ether1 192.0.2.10/24 192.0.2.1; empty: none, set it on the console later): ", None) else {
-                        return Err("console closed".into());
-                    };
-                    if l.is_empty() {
-                        break None;
-                    }
-                    match Mgmt::parse(&l.split_whitespace().collect::<Vec<_>>().join(",")) {
-                        Ok(m) if !ports.is_empty() && !ports.iter().any(|p| p.0 == m.interface) => {
-                            con.say(&format!("There is no port {} here.", m.interface));
-                        }
-                        Ok(m) => break Some(m),
-                        Err(e) => con.say(&e),
-                    }
+                let Some(mgmt) = ask_mgmt(con) else {
+                    return Err("console closed".into());
                 };
+                con.say(&style::step(4, STEPS, "Confirm"));
+                con.say(&confirm_text(pick, &version, keep, mgmt.as_ref()));
                 let typed = con.ask(
-                    &format!("Type the disk name ({}) to erase it and install, anything else goes back: ", pick.name),
+                    &style::prompt(
+                        &format!("Type {} to erase it and install", pick.name),
+                        None,
+                        Some("anything else goes back"),
+                    ),
                     None,
                 );
                 if typed.as_deref() != Some(pick.name.as_str()) {
-                    con.say("Nothing was written.");
+                    con.say("  Nothing was written.");
                     continue;
                 }
                 (keep, mgmt, Vec::new())
@@ -359,38 +528,91 @@ fn flow(
             .map(|p| p.guid.clone())
             .unwrap_or_default();
         let line = slot_a_line(&rootfs_a, &m, &running, mgmt.as_ref());
+        con.say(&style::step(5, STEPS, "Write"));
         let report = write(con, &mut medium, pick, keep, bios, &line)?;
+        let ok = |text: &str| style::block(2, &good("OK"), 4, text);
         if bios {
-            con.say(&format!(
-                "BIOS boot: GRUB in the first blocks of {}, slot A{}",
-                pick.name,
-                mgmt_note(mgmt.as_ref())
-            ));
+            con.say(&ok(&format!(
+                "BIOS boot: GRUB in the first blocks of {}, slot A",
+                pick.name
+            )));
         } else {
-            match boot_entry(&report, &line, mgmt.as_ref()) {
-                Ok(line) => con.say(&line),
-                Err(e) => con.say(&format!(
-                    "boot entry: {e} — the firmware boots the disk by its removable-media path; the router makes its entries on the first boot"
+            match boot_entry(&report, &line) {
+                Ok(line) => con.say(&ok(&line)),
+                Err(e) => con.say(&style::block(
+                    2,
+                    &warn("WARNING"),
+                    9,
+                    &format!(
+                        "boot entry: {e}. The firmware boots the disk by its removable-media \
+                         path; the router makes its entries on the first boot."
+                    ),
                 )),
             }
         }
         con.say(&format!(
-            "\nINSTALLED CoreRouter {} on {} in {:.1} s ({} MiB written in {} ms, read back in {} ms){}",
-            m.version,
-            pick.name,
-            report.total_ms as f64 / 1000.0,
+            "\n  {}",
+            good(&format!(
+                "OK  INSTALLED CoreRouter {version} on {} in {:.1} s{}",
+                pick.name,
+                report.total_ms as f64 / 1000.0,
+                if report.kept_config {
+                    ", configuration kept"
+                } else {
+                    ""
+                }
+            ))
+        ));
+        con.say(&next_text(
+            report.kept_config,
+            mgmt.as_ref(),
+            auto.is_none(),
+        ));
+        con.say(&dim(&format!(
+            "  {} MiB written in {} ms, read back in {} ms, sync {} ms",
             report.bytes_written >> 20,
             report.write_ms,
             report.verify_ms,
-            if report.kept_config { ", configuration kept" } else { "" }
-        ));
+            report.sync_ms
+        )));
         if auto.is_none() {
-            let _ = con.ask(
-                "Remove the installation medium and press Enter to reboot. ",
-                None,
-            );
+            let _ = con.ask(&style::prompt("Press Enter to reboot", None, None), None);
         }
         return Ok(poweroff);
+    }
+}
+
+/// Step 3: the management address for the first boot. `Some(None)`: none
+/// (the console asks on the first boot); `None`: the console went.
+fn ask_mgmt(con: &Console) -> Option<Option<Mgmt>> {
+    con.say(&style::step(
+        3,
+        STEPS,
+        "Management address for the first boot",
+    ));
+    // G1.6m: the names the router gives them on its first boot (bus
+    // order), with link and MAC to find the cable.
+    let nics = crate::setup::nics();
+    if !nics.is_empty() {
+        con.say(&crate::setup::nic_table(&nics, false));
+    }
+    con.say("  Form: <port> <address/prefix> [<gateway>]   e.g. ether1 192.0.2.10/24 192.0.2.1");
+    con.say("  None: the console asks for it on the first boot.");
+    loop {
+        let l = con.ask(
+            &style::prompt("Management address", Some("none"), None),
+            None,
+        )?;
+        if l.is_empty() {
+            return Some(None);
+        }
+        match Mgmt::parse(&l.split_whitespace().collect::<Vec<_>>().join(",")) {
+            Ok(m) if !nics.is_empty() && !nics.iter().any(|p| p.name == m.interface) => {
+                con.say(&format!("  There is no port {} here.", m.interface));
+            }
+            Ok(m) => return Some(Some(m)),
+            Err(e) => con.say(&style::block(2, "", 0, &format!("{e}. Try again."))),
+        }
     }
 }
 
@@ -414,12 +636,15 @@ fn write(
     let size = t
         .seek(std::io::SeekFrom::End(0))
         .map_err(|e| e.to_string())?;
-    con.say(&format!("Writing {}…", d.name));
+    // The progress grows on one line, a mark every 10%: nothing is moved or
+    // erased, so it reads the same on a screen, a serial log and a test.
+    con.put(&format!("  Writing {}:", d.name));
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
     let started = Instant::now();
     let mut shown = 0u64;
+    let mut closed = false;
     let r = install::install(
         medium,
         &target,
@@ -434,22 +659,35 @@ fn write(
             bios_cmdline: Some(line.to_owned()),
         },
         &mut |done, total| {
-            let pct = done * 100 / total.max(1);
-            if pct >= shown + 10 || done == total {
-                shown = pct;
+            if closed {
+                return;
+            }
+            let mark = done * 10 / total.max(1) * 10;
+            if mark > shown {
+                shown = mark;
+                con.put(&format!(" {mark}%"));
+            }
+            if done >= total {
+                closed = true;
                 let s = started.elapsed().as_secs_f64().max(0.001);
-                con.say(&format!(
-                    "  {pct:>3}%  {} of {} MiB  {:.0} MiB/s",
-                    done >> 20,
+                con.put(&format!(
+                    "  {} MiB, {:.0} MiB/s\n",
                     total >> 20,
                     done as f64 / 1048576.0 / s
                 ));
             }
         },
-    )?;
-    con.say(&format!(
-        "Verified: ESP and /config by SHA-256, slot A by its dm-verity tree; partition table written and read back (sync {} ms)",
-        r.sync_ms
+    );
+    if !closed {
+        con.put("\n");
+    }
+    let r = r?;
+    con.say(&style::block(
+        2,
+        &good("OK"),
+        4,
+        "verified: ESP and /config by SHA-256, slot A by its dm-verity tree; partition table \
+         written and read back",
     ));
     Ok(r)
 }
@@ -467,20 +705,9 @@ fn slot_a_line(
     install::slot_a_line(rootfs_a, m, running, &tuning)
 }
 
-fn mgmt_note(mgmt: Option<&Mgmt>) -> String {
-    mgmt.map(|g| {
-        format!(
-            "; management address {} on {} at the first boot",
-            g.address, g.interface
-        )
-    })
-    .unwrap_or_default()
-}
-
 /// The boot entry for the new disk.
-fn boot_entry(r: &install::Report, line: &str, mgmt: Option<&Mgmt>) -> Result<String, String> {
-    let entry = install::boot_entry(plan::EFIVARS.target, r, line)?;
-    Ok(format!("{entry}{}", mgmt_note(mgmt)))
+fn boot_entry(r: &install::Report, line: &str) -> Result<String, String> {
+    install::boot_entry(plan::EFIVARS.target, r, line)
 }
 
 #[cfg(test)]
@@ -509,6 +736,187 @@ mod tests {
             "not json",
         ] {
             assert!(parse_auto(bad).is_err(), "{bad}");
+        }
+    }
+
+    fn disk(
+        name: &str,
+        bytes: u64,
+        model: &str,
+        existing: Existing,
+        refused: Option<&str>,
+    ) -> Disk {
+        Disk {
+            name: name.into(),
+            bytes,
+            lbs: 512,
+            model: model.into(),
+            serial: "S5GXNX0T123456".into(),
+            bus: "NVMe",
+            removable: false,
+            existing,
+            refused: refused.map(str::to_owned),
+        }
+    }
+
+    fn disks() -> Vec<Disk> {
+        vec![
+            disk(
+                "nvme0n1",
+                1000 << 30,
+                "Samsung SSD 980 PRO 1TB with a long name",
+                Existing::CoreRouter {
+                    config_keepable: true,
+                },
+                None,
+            ),
+            disk(
+                "sda",
+                7 << 30,
+                "",
+                Existing::Unknown,
+                Some("the installer medium"),
+            ),
+            disk(
+                "mmcblk0",
+                58 << 30,
+                "DA4064",
+                Existing::Gpt(vec![
+                    "efi".into(),
+                    "msr".into(),
+                    "windows".into(),
+                    "recovery".into(),
+                ]),
+                None,
+            ),
+            disk(
+                "sdb",
+                512 << 20,
+                "Flash\u{1b}[2J",
+                Existing::Empty,
+                Some(
+                    "smaller than the image needs (700 MiB) and a reason long enough to need a second line of its own on the screen",
+                ),
+            ),
+        ]
+    }
+
+    #[test]
+    fn the_disk_table_numbers_what_is_offered_and_explains_the_rest() {
+        use crate::style::{render, tests::check};
+        let t = table(&disks());
+        check("disk table", &t);
+        let plain = render(&t, false);
+        let has = |s: &str| assert!(plain.contains(s), "{s:?} not in:\n{plain}");
+        has("    #  NAME     SIZE       MODEL                  BUS       HOLDS");
+        has("    1  nvme0n1  1000.0 GiB Samsung SSD 980 PRO 1~ NVMe      CoreRouter");
+        has("    -  sda      7.0 GiB    -                      NVMe      data (MBR or a fi~");
+        has("       not offered: the installer medium");
+        has("    2  mmcblk0  58.0 GiB   DA4064                 NVMe      GPT: efi, msr, wi~");
+        has("    -  sdb      512 MiB    Flash?[2J");
+        // What is offered is bright, what is not is dimmed, reason included.
+        let lit = render(&t, true);
+        assert!(lit.contains("\u{1b}[1m  1  nvme0n1"), "{lit}");
+        assert!(lit.contains("\u{1b}[2m  -  sda"), "{lit}");
+        assert!(
+            lit.contains("\u{1b}[2m       not offered: the installer medium"),
+            "{lit}"
+        );
+        assert_eq!(offered(&disks()).len(), 2);
+        check("no disk", &table(&[]));
+    }
+
+    #[test]
+    fn the_confirmation_names_the_disk_and_what_goes_on_it() {
+        use crate::style::{render, tests::check};
+        let ds = disks();
+        let m = Mgmt::parse("ether1,192.0.2.10/24,192.0.2.1").unwrap();
+        let t = confirm_text(&ds[0], "0.1.0-dev.553", true, Some(&m));
+        check("confirm", &t);
+        let plain = render(&t, false);
+        let has = |s: &str| assert!(plain.contains(s), "{s:?} not in:\n{plain}");
+        has("  !! ALL DATA ON nvme0n1 WILL BE ERASED !!");
+        has("  Disk     nvme0n1, 1000.0 GiB (1073741824000 bytes), NVMe");
+        has("  Model    Samsung SSD 980 PRO 1TB with a long name");
+        has("  Serial   S5GXNX0T123456");
+        has("  Holds    CoreRouter: its configuration is kept, the rest is erased");
+        has("  Install  CoreRouter 0.1.0-dev.553");
+        has("  Address  192.0.2.10/24 on ether1, gateway 192.0.2.1");
+        assert!(
+            render(&t, true)
+                .contains("\u{1b}[1;31m!! ALL DATA ON nvme0n1 WILL BE ERASED !!\u{1b}[0m")
+        );
+        let t = render(&confirm_text(&ds[2], "0.1.0", false, None), false);
+        assert!(
+            t.contains("  Holds    GPT: efi, msr, windows, recovery"),
+            "{t}"
+        );
+        assert!(
+            t.contains("  Address  none: the console asks for it on the first boot"),
+            "{t}"
+        );
+        // Hostile disk strings stay text.
+        check(
+            "confirm, hostile",
+            &confirm_text(&ds[3], "0.1.0", false, None),
+        );
+    }
+
+    #[test]
+    fn the_end_says_what_to_do_next_and_a_failure_says_why() {
+        use crate::style::{render, tests::check};
+        let m = Mgmt::parse("ether1,2001:db8::10/64").unwrap();
+        let t = next_text(false, Some(&m), true);
+        check("next", &t);
+        let plain = render(&t, false);
+        assert!(
+            plain.contains("Next: remove the installation medium, then press Enter to reboot."),
+            "{plain}"
+        );
+        assert!(
+            plain.contains(
+                "  Then open https://[2001:db8::10]/ (through ether1; user admin, no password"
+            ),
+            "{plain}"
+        );
+        // An unattended install asks for nothing.
+        let t = render(&next_text(false, None, false), false);
+        assert!(
+            !t.contains("Enter") && t.contains("first boot the console asks"),
+            "{t}"
+        );
+        let t = render(&next_text(true, None, true), false);
+        assert!(t.contains("configuration that was kept"), "{t}");
+
+        let f = failure_text(&format!(
+            "/dev/sda: {}",
+            "Device or resource busy ".repeat(8)
+        ));
+        check("failure", &f);
+        let plain = render(&f, false);
+        assert!(
+            plain.contains("  FAILED  The install failed: /dev/sda: Device or resource busy"),
+            "{plain}"
+        );
+        assert!(render(&f, true).contains("\u{1b}[1;31mFAILED\u{1b}[0m"));
+
+        for bios in [false, true] {
+            let h = header_text("1c0dfc09ec04", bios, &["tty1", "ttyS0"]);
+            check("header", &h);
+            let h = render(&h, false);
+            assert!(
+                h.contains("CoreRouter installer") && h.contains("build 1c0dfc09ec04"),
+                "{h}"
+            );
+            assert!(
+                h.contains(if bios {
+                    "  Firmware  BIOS"
+                } else {
+                    "  Firmware  UEFI"
+                }),
+                "{h}"
+            );
+            assert!(h.contains("  Consoles  tty1, ttyS0"), "{h}");
         }
     }
 

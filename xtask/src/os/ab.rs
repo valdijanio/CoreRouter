@@ -24,7 +24,8 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -157,6 +158,8 @@ pub(super) struct Vm {
     rx: mpsc::Receiver<String>,
     started: Instant,
     name: String,
+    /// Console lines that came with colour (G1.6zg).
+    colored: Arc<AtomicUsize>,
 }
 
 const SHELL_APPEND: &str = "ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off corerouter.shell=ttyS0";
@@ -240,11 +243,19 @@ pub(super) fn start(log: &mut std::fs::File, name: &str, mut cmd: Command) -> Re
     let stdin = child.stdin.take().ok_or("qemu stdin")?;
     let stdout = child.stdout.take().ok_or("qemu stdout")?;
     let (tx, rx) = mpsc::channel();
+    let colored = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&colored);
     std::thread::Builder::new()
         .name("qemu-serial".into())
         .spawn(move || {
             for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
+                let Ok(raw) = line else { break };
+                // G1.6zg: the consoles are coloured; a test reads the text
+                // a person reads.
+                let line = super::console_text(&raw);
+                if line != raw {
+                    seen.fetch_add(1, Ordering::Relaxed);
+                }
                 if tx.send(line).is_err() {
                     break;
                 }
@@ -259,6 +270,7 @@ pub(super) fn start(log: &mut std::fs::File, name: &str, mut cmd: Command) -> Re
         rx,
         started: Instant::now(),
         name: name.to_owned(),
+        colored,
     })
 }
 
@@ -296,6 +308,11 @@ impl Ctx {
 }
 
 impl Vm {
+    /// How many console lines came with colour so far (G1.6zg).
+    pub(super) fn colored(&self) -> usize {
+        self.colored.load(Ordering::Relaxed)
+    }
+
     /// The next console line that contains one of `pats`; error on a
     /// timeout, on QEMU exiting, and on a kernel panic unless one of `pats`
     /// is "Kernel panic".
