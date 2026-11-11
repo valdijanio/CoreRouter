@@ -56,6 +56,23 @@ CONFIG_FRAMEBUFFER_CONSOLE=y
 CONFIG_FONTS=y
 CONFIG_FONT_8x16=y
 CONFIG_FONT_TER16x32=y
+# G1.6zd: a boot with nothing to say says nothing (the command line is
+# `quiet`: only errors reach the console). On a notebook (Lenovo LOQ 15IRH8,
+# 13th-gen Intel) two drivers of the x86_64 defconfig wrote error lines at
+# every boot:
+# - i915, built in, probed at 0.4 s, before / is mounted, and asked for its
+#   GuC firmware there: -ENOENT, "GuC initialization failed", "Failed to
+#   initialize GPU, declaring it wedged!". From Alder Lake-P on the GuC is
+#   not optional (drivers/gpu/drm/i915/gt/uc/intel_uc.c,
+#   uc_expand_default_options). Turning it off (i915.enable_guc=0) taints the
+#   kernel (i915_param_named_unsafe, kernel/params.c), so the driver is a
+#   module, like ice (G1.6j): corerouter-init loads it after / is up, after
+#   the network drivers and with the boot going on, and the firmware
+#   (GuC, HuC, DMC) is in the image (firmware.lock). Until it takes the
+#   screen the console is simpledrm's.
+# - snd_hda_intel: "Cannot probe codecs, giving up". A router plays no sound.
+CONFIG_DRM_I915=m
+# CONFIG_SOUND is not set
 CONFIG_HW_RANDOM=y
 CONFIG_HW_RANDOM_VIRTIO=y
 # ACPI power button and power-off (VMs, servers). The tiny driver signals
@@ -285,4 +302,3 @@ CONFIG_USB_NET_CDC_NCM=y
 CONFIG_USB_LAN78XX=y
 
 CONFIG_FW_CFG_SYSFS=y
-
