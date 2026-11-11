@@ -192,6 +192,13 @@ com `security=wpa2` (o SAE precisa da frase).
   configuração; cada rádio entra por `INTERFACE_ADD` e tem dois sockets, um de comandos e um de
   eventos. A senha vai num `SET_NETWORK` pelo socket, nunca para arquivo. O supplicant
   sobrevive a um restart do daemon (o rádio continua na rede) e termina com o último rádio.
+  **Nada disso espera dentro do tick.** Cada rádio tem uma thread própria (`wifi-<nome>`), que
+  é a única a falar com o supplicant: abre o rádio, recebe as ordens (`join`, `leave`, `scan`)
+  por uma fila de 8 (cheia, responde "ocupado") e deixa o estado, a varredura e os eventos
+  numa área que o tick só lê. O `INTERFACE_ADD` só responde depois que o driver sobe a
+  interface, e numa placa de verdade é aí que o firmware é carregado no chip (segundos); ele
+  tem prazo próprio de 20 s, os outros comandos 2 s. Uma resposta que não chega no prazo
+  inutiliza o socket: se chegasse depois, seria lida como resposta do comando seguinte.
   O país vai ao kernel por nl80211 (`NL80211_CMD_REQ_SET_REG`), e o domínio em vigor é lido de
   lá (`NL80211_CMD_GET_REG`).
 - **Falhas em palavras:** `wrong-key` ("provavelmente a senha": no WPA2 o AP não diz que a

@@ -430,16 +430,18 @@ pub use io::{LinuxWifiPort, radio, regdomain, set_country};
 
 #[cfg(target_os = "linux")]
 mod io {
+    use std::collections::BTreeMap;
     use std::os::unix::net::UnixDatagram;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError, mpsc};
     use std::time::{Duration, Instant};
 
     use corerouter_hal::HalError;
     use corerouter_hal::wifi::{
-        MAX_EVENTS, MAX_SCAN_RESULTS, WifiBss, WifiEvent, WifiNetwork, WifiPort, WifiRadio,
-        WifiState, WifiStatus,
+        MAX_EVENTS, MAX_SCAN_RESULTS, WifiBss, WifiEvent, WifiFailure, WifiNetwork, WifiPort,
+        WifiRadio, WifiState, WifiStatus,
     };
     use corerouter_model::IfName;
 
@@ -448,7 +450,24 @@ mod io {
 
     /// A reply slower than this is a supplicant that hangs: the radio is
     /// given up and opened again later. Local replies take 10 to 200 µs.
-    const REPLY_TIMEOUT: Duration = Duration::from_millis(300);
+    /// Nobody waits for it but the radio's own thread.
+    const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+    /// `INTERFACE_ADD` answers only after the driver brought the interface
+    /// up (wpa_supplicant 2.12: `ctrl_iface.c` `wpa_supplicant_global_iface_add`
+    /// → `wpa_supplicant_add_iface` → `wpa_supplicant_init_iface` →
+    /// `wpas_init_driver` → `driver_nl80211.c`
+    /// `wpa_driver_nl80211_finish_drv_init` → `linux_set_iface_flags(…, 1)`),
+    /// and on a card that is where the firmware is loaded into the chip
+    /// (Linux 6.18: `ieee80211_open` → `drv_start`; rtw89 `rtw89_core_start`
+    /// → `rtw89_mac_init`): hundreds of milliseconds to seconds, where the
+    /// simulated radio answers at once.
+    const ADD_TIMEOUT: Duration = Duration::from_secs(20);
+    /// How often the radio's thread looks at its socket of events.
+    const POLL: Duration = Duration::from_millis(100);
+    /// How old the status the tick reads may be.
+    const STATUS_EVERY: Duration = Duration::from_secs(1);
+    /// Orders waiting for the radio's thread; more is "busy".
+    const MAX_ORDERS: usize = 8;
     /// How long a supplicant just started gets to open its socket.
     const START_TIMEOUT: Duration = Duration::from_secs(2);
     /// The supplicant's reply buffer is 4096 bytes; a little more.
@@ -504,6 +523,9 @@ mod io {
     struct Ctrl {
         sock: UnixDatagram,
         local: PathBuf,
+        /// A reply never came: it may still come, and would be read as the
+        /// answer to the next command. The socket is not used again.
+        stale: std::cell::Cell<bool>,
     }
 
     impl Ctrl {
@@ -512,9 +534,12 @@ mod io {
             let local = dir.join(format!("c{}-{n}", std::process::id()));
             let _ = std::fs::remove_file(&local);
             let sock = UnixDatagram::bind(&local)?;
-            let made = Self { sock, local };
+            let made = Self {
+                sock,
+                local,
+                stale: std::cell::Cell::new(false),
+            };
             made.sock.connect(server)?;
-            made.sock.set_read_timeout(Some(REPLY_TIMEOUT))?;
             made.sock.set_write_timeout(Some(REPLY_TIMEOUT))?;
             Ok(made)
         }
@@ -522,24 +547,45 @@ mod io {
         /// One command, one reply. `what` names it in an error (a command
         /// with a key in it is never shown).
         fn request(&self, command: &str, what: &str) -> Result<String, HalError> {
+            self.request_within(command, what, REPLY_TIMEOUT)
+        }
+
+        /// [`request`](Self::request) with its own deadline. A reply that
+        /// does not come in time ends the socket: the next command on it
+        /// fails at once instead of reading that reply as its own.
+        fn request_within(
+            &self,
+            command: &str,
+            what: &str,
+            within: Duration,
+        ) -> Result<String, HalError> {
             if command.len() > MAX_COMMAND {
                 return Err(HalError::Rejected(format!(
                     "wpa_supplicant: {what}: too long"
                 )));
             }
-            self.sock
-                .send(command.as_bytes())
-                .map_err(|e| io_err(what, e))?;
-            let deadline = Instant::now() + REPLY_TIMEOUT;
+            if self.stale.get() {
+                return Err(io_err(what, "an earlier reply never came"));
+            }
+            let late = |e: &dyn std::fmt::Display| {
+                self.stale.set(true);
+                io_err(what, e)
+            };
+            self.sock.send(command.as_bytes()).map_err(|e| late(&e))?;
+            let deadline = Instant::now() + within;
             let mut buf = vec![0u8; MAX_REPLY];
             loop {
-                let n = self.sock.recv(&mut buf).map_err(|e| io_err(what, e))?;
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(late(&"no reply"));
+                }
+                self.sock
+                    .set_read_timeout(Some(left))
+                    .map_err(|e| late(&e))?;
+                let n = self.sock.recv(&mut buf).map_err(|e| late(&e))?;
                 let reply = String::from_utf8_lossy(buf.get(..n).unwrap_or_default());
                 // An event that slipped in (a socket that is attached).
                 if reply.starts_with('<') {
-                    if Instant::now() >= deadline {
-                        return Err(io_err(what, "no reply"));
-                    }
                     continue;
                 }
                 return Ok(reply.into_owned());
@@ -548,7 +594,11 @@ mod io {
 
         /// A command whose reply is `OK`.
         fn ok(&self, command: &str, what: &str) -> Result<(), HalError> {
-            let r = self.request(command, what)?;
+            self.ok_within(command, what, REPLY_TIMEOUT)
+        }
+
+        fn ok_within(&self, command: &str, what: &str, within: Duration) -> Result<(), HalError> {
+            let r = self.request_within(command, what, within)?;
             if r.trim() == "OK" {
                 Ok(())
             } else {
@@ -650,8 +700,10 @@ mod io {
         }
     }
 
-    /// One radio, through its own control socket.
-    pub struct LinuxWifiPort {
+    /// One radio, through its own control socket: every call here waits
+    /// for the supplicant. Only the radio's thread ([`LinuxWifiPort`]) has
+    /// one.
+    struct Direct {
         name: String,
         dir: PathBuf,
         cmd: Ctrl,
@@ -660,22 +712,19 @@ mod io {
         blocked: bool,
     }
 
-    impl LinuxWifiPort {
-        pub fn open(name: &IfName) -> Result<Self, HalError> {
-            Self::open_at(name, dir()?, &binary())
-        }
-
-        /// [`open`](Self::open) with the sockets' directory and the
-        /// supplicant's binary given.
+    impl Direct {
+        /// The supplicant started if it is not there, and the radio handed
+        /// to it; the sockets' directory and the supplicant's binary given.
         fn open_at(name: &IfName, dir: PathBuf, binary: &Path) -> Result<Self, HalError> {
             let global = global(&dir, binary)?;
             let ifaces = dir.join("if");
             let known = global.request("INTERFACES", "INTERFACES")?;
             if !known.lines().any(|l| l.trim() == name.as_str()) {
                 // <ifname> TAB <config file: none> TAB <driver> TAB <ctrl dir>
-                global.ok(
+                global.ok_within(
                     &format!("INTERFACE_ADD {name}\t\tnl80211\t{}", ifaces.display()),
                     "the radio (INTERFACE_ADD)",
+                    ADD_TIMEOUT,
                 )?;
             }
             unblock(name.as_str());
@@ -704,7 +753,7 @@ mod io {
         }
     }
 
-    impl WifiPort for LinuxWifiPort {
+    impl WifiPort for Direct {
         fn join(&mut self, net: &WifiNetwork) -> Result<(), HalError> {
             let fields = network_fields(net).ok_or_else(|| {
                 HalError::Rejected("the network cannot be written for wpa_supplicant".into())
@@ -767,8 +816,10 @@ mod io {
         fn status(&mut self) -> Result<WifiStatus, HalError> {
             let status = self.cmd.request("STATUS", "STATUS")?;
             let connected = status.lines().any(|l| l == "wpa_state=COMPLETED");
+            // A driver without the numbers answers `FAIL`; a reply that
+            // never comes is the supplicant's, not the driver's.
             let signal = if connected {
-                self.cmd.request("SIGNAL_POLL", "SIGNAL_POLL").ok()
+                Some(self.cmd.request("SIGNAL_POLL", "SIGNAL_POLL")?)
             } else {
                 None
             };
@@ -796,7 +847,7 @@ mod io {
         }
     }
 
-    impl Drop for LinuxWifiPort {
+    impl Drop for Direct {
         /// The radio leaves the supplicant, and the supplicant ends with
         /// its last radio. Not at a daemon's exit (nothing is dropped
         /// then): the radio stays on its network across a restart.
@@ -814,6 +865,203 @@ mod io {
             {
                 let _ = global.request("TERMINATE", "TERMINATE");
             }
+        }
+    }
+
+    /// What the radio's thread leaves for the tick to read.
+    #[derive(Default)]
+    struct Seen {
+        status: WifiStatus,
+        scan: Vec<WifiBss>,
+        events: Vec<WifiEvent>,
+        /// The radio could not be opened or stopped answering: the thread
+        /// ended. Said by the next `status`.
+        failed: Option<String>,
+    }
+
+    enum Order {
+        Join(Box<WifiNetwork>),
+        Leave,
+        Scan,
+    }
+
+    /// One radio as the engine holds it. Nothing here waits: the engine
+    /// calls it from its tick, with the session locked, and the supplicant
+    /// answers when it answers (seconds, when a card loads its firmware; never,
+    /// when it hangs). A thread of the radio's own ([`run`]) talks to the
+    /// supplicant; orders go to it by a bounded queue and what it learns
+    /// comes back in [`Seen`]. Measured on the image with the supplicant
+    /// stopped: a command waited up to 918 ms for the session before this,
+    /// with the sockets read from the tick.
+    pub struct LinuxWifiPort {
+        orders: mpsc::SyncSender<Order>,
+        seen: Arc<Mutex<Seen>>,
+    }
+
+    fn seen(s: &Mutex<Seen>) -> std::sync::MutexGuard<'_, Seen> {
+        s.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    impl LinuxWifiPort {
+        pub fn open(name: &IfName) -> Result<Self, HalError> {
+            Self::open_at(name, dir()?, binary())
+        }
+
+        /// [`open`](Self::open) with the sockets' directory and the
+        /// supplicant's binary given. Returns at once: the radio is opened
+        /// by its thread, and a failure there is what `status` says next.
+        fn open_at(name: &IfName, dir: PathBuf, binary: PathBuf) -> Result<Self, HalError> {
+            let (orders, rx) = mpsc::sync_channel(MAX_ORDERS);
+            let shared = Arc::new(Mutex::new(Seen::default()));
+            let (theirs, name) = (Arc::clone(&shared), name.clone());
+            std::thread::Builder::new()
+                .name(format!("wifi-{name}"))
+                .spawn(move || run(&name, dir, &binary, &rx, &theirs))
+                .map_err(|e| HalError::Io(format!("the radio's thread: {e}")))?;
+            Ok(Self {
+                orders,
+                seen: shared,
+            })
+        }
+
+        fn order(&self, o: Order, what: &str) -> Result<(), HalError> {
+            self.orders.try_send(o).map_err(|e| match e {
+                mpsc::TrySendError::Full(_) => {
+                    HalError::Io(format!("the radio is busy: {what} not taken, try again"))
+                }
+                mpsc::TrySendError::Disconnected(_) => HalError::Io(
+                    seen(&self.seen)
+                        .failed
+                        .clone()
+                        .unwrap_or_else(|| "the radio's thread ended".into()),
+                ),
+            })
+        }
+    }
+
+    impl WifiPort for LinuxWifiPort {
+        fn join(&mut self, net: &WifiNetwork) -> Result<(), HalError> {
+            // Said here, where the caller can still be told.
+            if network_fields(net).is_none() {
+                return Err(HalError::Rejected(
+                    "the network cannot be written for wpa_supplicant".into(),
+                ));
+            }
+            self.order(Order::Join(Box::new(net.clone())), "the network")
+        }
+
+        fn leave(&mut self) -> Result<(), HalError> {
+            self.order(Order::Leave, "leaving")
+        }
+
+        fn scan(&mut self) -> Result<(), HalError> {
+            self.order(Order::Scan, "the scan")
+        }
+
+        fn scan_results(&mut self) -> Result<Vec<WifiBss>, HalError> {
+            Ok(seen(&self.seen).scan.clone())
+        }
+
+        fn status(&mut self) -> Result<WifiStatus, HalError> {
+            let s = seen(&self.seen);
+            match &s.failed {
+                Some(why) => Err(HalError::Io(why.clone())),
+                None => Ok(s.status.clone()),
+            }
+        }
+
+        fn events(&mut self) -> Vec<WifiEvent> {
+            std::mem::take(&mut seen(&self.seen).events)
+        }
+    }
+
+    /// The lock a radio's thread holds while it lives, by the radio's name.
+    fn turn_of(name: &str) -> Arc<Mutex<()>> {
+        static TURNS: Mutex<BTreeMap<String, Arc<Mutex<()>>>> = Mutex::new(BTreeMap::new());
+        let mut turns = TURNS.lock().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(turns.entry(name.to_owned()).or_default())
+    }
+
+    /// The radio's thread: opens the radio, then takes the orders and keeps
+    /// [`Seen`] current, until the port is dropped (the queue closes) or
+    /// the supplicant stops answering. The radio leaves the supplicant on
+    /// the way out ([`Direct`]'s drop).
+    fn run(
+        name: &IfName,
+        dir: PathBuf,
+        binary: &Path,
+        orders: &mpsc::Receiver<Order>,
+        shared: &Mutex<Seen>,
+    ) {
+        let fail = |e: HalError| seen(shared).failed = Some(e.to_string());
+        // One thread per radio at a time: a radio turned off and on again
+        // has a thread still taking it out of the supplicant, and the new
+        // one waits for that (it would find the radio "already there", and
+        // lose it a moment later). Declared before the port: released
+        // after the port's drop.
+        let turn = turn_of(name.as_str());
+        let _mine = turn.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut port = match Direct::open_at(name, dir, binary) {
+            Ok(p) => p,
+            Err(e) => return fail(e),
+        };
+        let mut status_at: Option<Instant> = None;
+        loop {
+            let mut events = Vec::new();
+            let done = match orders.recv_timeout(POLL) {
+                Ok(Order::Join(net)) => port.join(&net).map_err(|e| ("the network", e)),
+                Ok(Order::Leave) => port.leave().map_err(|e| ("leaving", e)),
+                Ok(Order::Scan) => port.scan().map_err(|e| ("the scan", e)),
+                Err(mpsc::RecvTimeoutError::Timeout) => Ok(()),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            };
+            match done {
+                Ok(()) => {}
+                // The supplicant said no: the radio is fine.
+                Err(("the scan", HalError::Rejected(why))) => {
+                    events.push(WifiEvent::ScanFailed(why));
+                }
+                Err((_, HalError::Rejected(why))) => {
+                    events.push(WifiEvent::Failed(WifiFailure::Other(why)));
+                }
+                // It did not answer: start over.
+                Err((_, e)) => return fail(e),
+            }
+            events.extend(port.events());
+            let heard = events.contains(&WifiEvent::ScanDone);
+            let scan = if heard {
+                match port.scan_results() {
+                    Ok(s) => Some(s),
+                    Err(e) => return fail(e),
+                }
+            } else {
+                None
+            };
+            let due = status_at.is_none_or(|t| t.elapsed() >= STATUS_EVERY);
+            let status = if due || !events.is_empty() {
+                status_at = Some(Instant::now());
+                match port.status() {
+                    Ok(st) => Some(st),
+                    Err(e) => return fail(e),
+                }
+            } else {
+                None
+            };
+            // `status` may have queued one more (the radio blocked).
+            events.extend(port.events());
+            if scan.is_none() && status.is_none() && events.is_empty() {
+                continue;
+            }
+            // The state first, then the events that send the tick to read it.
+            let mut s = seen(shared);
+            if let Some(scan) = scan {
+                s.scan = scan;
+            }
+            if let Some(st) = status {
+                s.status = st;
+            }
+            let room = MAX_EVENTS.saturating_sub(s.events.len());
+            s.events.extend(events.into_iter().take(room));
         }
     }
 
@@ -894,8 +1142,6 @@ mod io {
 
     #[cfg(test)]
     mod tests {
-        use std::sync::mpsc;
-
         use corerouter_hal::wifi::{JoinSecurity, WifiFailure};
 
         use super::*;
@@ -904,6 +1150,12 @@ mod io {
         /// answering what the real one answers, and telling the test every
         /// command it got.
         fn fake(dir: &Path, radio: &str) -> mpsc::Receiver<String> {
+            fake_slow(dir, radio, Duration::ZERO)
+        }
+
+        /// [`fake`] whose `INTERFACE_ADD` takes `add` to answer, as on a
+        /// card that loads its firmware when the interface comes up.
+        fn fake_slow(dir: &Path, radio: &str, add: Duration) -> mpsc::Receiver<String> {
             std::fs::create_dir_all(dir.join("if")).unwrap();
             let global = UnixDatagram::bind(dir.join("global")).unwrap();
             let iface = UnixDatagram::bind(dir.join("if").join(radio)).unwrap();
@@ -932,8 +1184,14 @@ mod io {
                                 (true, "INTERFACES") if added => format!("{radio}\n"),
                                 (true, "INTERFACES") => String::new(),
                                 (true, "INTERFACE_ADD") => {
+                                    std::thread::sleep(add);
                                     added = true;
                                     "OK\n".into()
+                                }
+                                // A reply that comes after the asker gave up.
+                                (_, "LATE") => {
+                                    std::thread::sleep(Duration::from_millis(300));
+                                    "LATE-REPLY\n".into()
                                 }
                                 (true, "INTERFACE_REMOVE") => {
                                     added = false;
@@ -985,7 +1243,7 @@ mod io {
             let name: IfName = "wlan7".parse().unwrap();
             // The supplicant answers already: nothing is started.
             let mut port =
-                LinuxWifiPort::open_at(&name, dir.clone(), Path::new("/nonexistent/wpa")).unwrap();
+                Direct::open_at(&name, dir.clone(), Path::new("/nonexistent/wpa")).unwrap();
             let opened: Vec<String> = seen.try_iter().collect();
             assert!(
                 opened
@@ -1064,7 +1322,7 @@ mod io {
             // No socket and no binary: the error says what could not start.
             let dir = temp("absent");
             let name: IfName = "wlan7".parse().unwrap();
-            let e = LinuxWifiPort::open_at(&name, dir.clone(), Path::new("/nonexistent/wpa"))
+            let e = Direct::open_at(&name, dir.clone(), Path::new("/nonexistent/wpa"))
                 .err()
                 .unwrap()
                 .to_string();
@@ -1073,8 +1331,11 @@ mod io {
             let silent = UnixDatagram::bind(dir.join("mute")).unwrap();
             let c = Ctrl::connect(&dir, &dir.join("mute")).unwrap();
             let t = Instant::now();
-            assert!(c.request("PING", "PING").is_err());
-            assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+            assert!(
+                c.request_within("PING", "PING", Duration::from_millis(100))
+                    .is_err()
+            );
+            assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
             // A command too long for the supplicant's buffer is not sent.
             let e = c
                 .request(&"x".repeat(MAX_COMMAND + 1), "a long one")
@@ -1083,6 +1344,168 @@ mod io {
             drop(silent);
             assert!(set_country(Some("brazil")).is_err());
             assert!(set_country(Some("b1")).is_err());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        fn until(what: &str, mut ok: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !ok() {
+                assert!(Instant::now() < deadline, "never: {what}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        /// A card loads its firmware when the interface comes up, and the
+        /// supplicant answers `INTERFACE_ADD` only then: the port is there
+        /// at once, takes its orders, and nothing the tick calls waits.
+        #[test]
+        fn a_radio_slow_to_come_up_is_waited_for_by_its_thread_not_by_the_caller() {
+            let dir = temp("slow");
+            let add = Duration::from_millis(800);
+            let seen = fake_slow(&dir, "wlan7", add);
+            let name: IfName = "wlan7".parse().unwrap();
+            let t = Instant::now();
+            let mut port =
+                LinuxWifiPort::open_at(&name, dir.clone(), PathBuf::from("/nonexistent/wpa"))
+                    .unwrap();
+            let net = WifiNetwork {
+                ssid: "Casa".into(),
+                security: JoinSecurity::Auto,
+                key: "a-passphrase-nobody-sees".into(),
+                hidden: false,
+                band_mhz: None,
+                bssid: None,
+            };
+            port.join(&net).unwrap();
+            port.scan().unwrap();
+            assert_eq!(
+                port.status().unwrap().state,
+                WifiState::Idle,
+                "not there yet"
+            );
+            assert!(port.events().is_empty() && port.scan_results().unwrap().is_empty());
+            assert!(
+                t.elapsed() < Duration::from_millis(300),
+                "the caller waited: {:?}",
+                t.elapsed()
+            );
+            // The radio's thread waited, and then did what was asked, in order.
+            let mut events = Vec::new();
+            until("the link", || {
+                events.extend(port.events());
+                port.status().unwrap().state == WifiState::Connected
+            });
+            assert!(t.elapsed() >= add, "{:?}", t.elapsed());
+            until("the supplicant's word", || {
+                events.extend(port.events());
+                events.contains(&WifiEvent::Failed(WifiFailure::WrongKey))
+            });
+            let sent: Vec<String> = seen.try_iter().collect();
+            let at = |word: &str| {
+                sent.iter()
+                    .position(|c| c.starts_with(word))
+                    .unwrap_or_else(|| panic!("{word} not sent: {sent:?}"))
+            };
+            assert!(
+                at("INTERFACE_ADD") < at("SELECT_NETWORK") && at("SELECT_NETWORK") < at("SCAN")
+            );
+            // Reading what the thread saw never waits either.
+            let t = Instant::now();
+            for _ in 0..100 {
+                let _ = (port.status(), port.events(), port.scan_results());
+            }
+            assert!(
+                t.elapsed() < Duration::from_millis(100),
+                "{:?}",
+                t.elapsed()
+            );
+            // Dropped: the thread ends, and the radio leaves the supplicant.
+            drop(port);
+            let mut gone = false;
+            until("INTERFACE_REMOVE", || {
+                gone |= seen.try_iter().any(|c| c == "INTERFACE_REMOVE wlan7");
+                gone
+            });
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Off and on again at once: the new thread waits for the old one
+        /// to take the radio out of the supplicant, then puts it back.
+        #[test]
+        fn a_radio_turned_off_and_on_again_is_removed_before_it_is_added() {
+            let dir = temp("again");
+            let seen = fake(&dir, "wlan7");
+            let name: IfName = "wlan7".parse().unwrap();
+            let bin = PathBuf::from("/nonexistent/wpa");
+            let mut first = LinuxWifiPort::open_at(&name, dir.clone(), bin.clone()).unwrap();
+            until("the first link", || {
+                first.status().unwrap().state == WifiState::Connected
+            });
+            drop(first);
+            let mut second = LinuxWifiPort::open_at(&name, dir.clone(), bin).unwrap();
+            let mut sent: Vec<String> = Vec::new();
+            until("the second INTERFACE_ADD", || {
+                sent.extend(seen.try_iter());
+                sent.iter()
+                    .filter(|c| c.starts_with("INTERFACE_ADD"))
+                    .count()
+                    == 2
+            });
+            let words: Vec<&str> = sent
+                .iter()
+                .filter_map(|c| c.split([' ', '\t']).next())
+                .filter(|w| w.starts_with("INTERFACE_"))
+                .collect();
+            assert_eq!(
+                words,
+                ["INTERFACE_ADD", "INTERFACE_REMOVE", "INTERFACE_ADD"],
+                "{sent:?}"
+            );
+            until("the second link", || {
+                second.status().unwrap().state == WifiState::Connected
+            });
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A reply that comes after its deadline stays in the socket: read
+        /// as the answer to the next command, a `PONG` would pass for an
+        /// `OK`. The socket is not used again.
+        #[test]
+        fn a_late_reply_is_never_taken_for_the_next_command() {
+            let dir = temp("late");
+            let _seen = fake(&dir, "wlan7");
+            let c = Ctrl::connect(&dir, &dir.join("global")).unwrap();
+            assert!(
+                c.request_within("LATE", "LATE", Duration::from_millis(50))
+                    .is_err()
+            );
+            // The late reply is in the socket by now.
+            std::thread::sleep(Duration::from_millis(400));
+            let e = c.request("PING", "PING").unwrap_err().to_string();
+            assert!(e.contains("an earlier reply never came"), "{e}");
+            // A socket of its own is in step.
+            let fresh = Ctrl::connect(&dir, &dir.join("global")).unwrap();
+            assert_eq!(fresh.request("PING", "PING").unwrap().trim(), "PONG");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A radio that cannot be opened: the port is handed out all the
+        /// same, and its next `status` says why (the engine then drops it
+        /// and tries again later).
+        #[test]
+        fn a_radio_that_cannot_be_opened_says_so_in_its_status() {
+            let dir = temp("unopened");
+            let name: IfName = "wlan7".parse().unwrap();
+            let mut port =
+                LinuxWifiPort::open_at(&name, dir.clone(), PathBuf::from("/nonexistent/wpa"))
+                    .unwrap();
+            until("the failure", || port.status().is_err());
+            let e = port.status().unwrap_err().to_string();
+            assert!(e.contains("cannot start /nonexistent/wpa"), "{e}");
+            // Its thread is gone: an order says the same, and does not wait.
+            until("the thread's end", || port.scan().is_err());
+            let e = port.scan().unwrap_err().to_string();
+            assert!(e.contains("cannot start /nonexistent/wpa"), "{e}");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
