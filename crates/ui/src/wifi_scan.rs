@@ -109,7 +109,22 @@ pub(crate) struct ScanView {
     texture_seq: u64,
     pub(crate) range: &'static str,
     pub(crate) duration: u32,
+    /// Auto: scan again every [`Self::auto_secs`] (List, Channels), start
+    /// the spectral scan again when it ends (Spectrum). Off at first, and
+    /// off again when the tab stops being drawn (window closed, other tab).
+    pub(crate) auto: bool,
+    pub(crate) auto_secs: u32,
+    /// When Auto last scanned, and when the tab was last drawn (the UI's
+    /// clock, s).
+    auto_at: Option<f64>,
+    drawn_at: Option<f64>,
 }
+
+/// The intervals Auto offers, s.
+pub(crate) const AUTO_SECS: [u32; 3] = [10, 30, 60];
+/// The shortest one while the radio is a station on a network: each scan
+/// takes it off its channel (some 3 s for both bands, the link stalls).
+pub(crate) const AUTO_MIN_CONNECTED: u32 = 30;
 
 impl Default for ScanView {
     fn default() -> Self {
@@ -126,6 +141,10 @@ impl Default for ScanView {
             texture_seq: 0,
             range: "current",
             duration: 60,
+            auto: false,
+            auto_secs: 30,
+            auto_at: None,
+            drawn_at: None,
         }
     }
 }
@@ -299,6 +318,75 @@ fn pill(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
 }
 
 impl ScanView {
+    /// The interval Auto keeps: at least [`AUTO_MIN_CONNECTED`] with the
+    /// station on a network.
+    pub(crate) fn auto_interval(&self, connected: bool) -> u32 {
+        if connected { self.auto_secs.max(AUTO_MIN_CONNECTED) } else { self.auto_secs }
+    }
+
+    /// The tab is drawn at `now`: a gap of more than 2 s means it was not
+    /// (the window closed, another tab), and Auto went off with it.
+    pub(crate) fn drawn(&mut self, now: f64) {
+        if self.drawn_at.is_some_and(|t| now - t > 2.0) {
+            self.auto = false;
+            self.auto_at = None;
+        }
+        self.drawn_at = Some(now);
+    }
+
+    /// Is a scan of Auto due at `now` (List and Channels)? Marks it done.
+    pub(crate) fn auto_scan_due(&mut self, now: f64, connected: bool) -> bool {
+        if !self.auto || self.mode == Mode::Spectrum {
+            return false;
+        }
+        let every = f64::from(self.auto_interval(connected));
+        if self.auto_at.is_some_and(|t| now - t < every) {
+            return false;
+        }
+        self.auto_at = Some(now);
+        true
+    }
+
+    /// Auto's controls on the Rescan line: the box, the interval, the
+    /// warning when the radio is a station on a network.
+    pub(crate) fn auto_controls(&mut self, ui: &mut Ui, l: Lang, connected: bool, help: &mut Option<HelpView>) {
+        let was = self.auto;
+        ui.checkbox(&mut self.auto, tr_in(SCOPE, l, "Auto"));
+        if self.auto && !was {
+            // Now, then every interval.
+            self.auto_at = None;
+        }
+        let shown = format!("{} s", self.auto_interval(connected));
+        egui::ComboBox::from_id_salt("wifi-auto-secs").width(56.0).selected_text(shown).show_ui(ui, |ui| {
+            for s in AUTO_SECS {
+                let allowed = !connected || s >= AUTO_MIN_CONNECTED;
+                let r = ui.add_enabled(allowed, egui::Button::selectable(self.auto_secs == s, format!("{s} s")));
+                let r = if allowed {
+                    r
+                } else {
+                    r.on_disabled_hover_text(tr_in(SCOPE, l, "At least 30 s while the radio is on a network"))
+                };
+                if r.clicked() {
+                    self.auto_secs = s;
+                }
+            }
+        });
+        if help::info_button(ui, Id::unique("wifi-auto-help"), tr_in(SCOPE, l, "Auto")).clicked() {
+            *help = Some(HelpView::new("interface.wifi.auto", tr_in(SCOPE, l, "Auto")));
+        }
+        if self.auto && connected {
+            let v = ui.visuals().clone();
+            chip::chip(ui, tr_in(SCOPE, l, "leaves the channel"), chip::AMBER.tone(&v)).on_hover_text(tr_in(
+                SCOPE,
+                l,
+                "Each scan takes the radio off its network's channel for a moment: the link stalls (latency) while it does.",
+            ));
+        }
+        if self.auto {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+        }
+    }
+
     /// The networks of `heard` in the band filter.
     pub(crate) fn filter(&self, nets: &[Value]) -> Vec<Value> {
         match self.band.code() {
@@ -589,7 +677,22 @@ impl ScanView {
             app.run("interface.wifi.spectral-scan", json!({ "name": radio, "range": self.range, "duration": self.duration }));
         }
         if stop {
+            // Stopped by hand: Auto would start it again at once.
+            self.auto = false;
             app.run("interface.wifi.spectral-scan", json!({ "name": radio, "stop": true }));
+        }
+        // Auto: a scan that ended (its time up) starts again, once the
+        // reply that said so came (`spectral` is the last one).
+        let ended = d.get("realtime").is_some() && !running;
+        if self.auto && !start && !stop && ended && can.check("interface.wifi.spectral-scan").is_ok() {
+            let now = ui.input(|i| i.time);
+            if self.auto_at.is_none_or(|t| now - t >= 2.0) {
+                self.auto_at = Some(now);
+                if let Some(o) = self.spectral.as_mut().and_then(Value::as_object_mut) {
+                    o.insert("running".into(), Value::Bool(true));
+                }
+                app.run("interface.wifi.spectral-scan", json!({ "name": radio, "range": self.range, "duration": self.duration }));
+            }
         }
         let points = d.get("points").and_then(Value::as_u64).unwrap_or(0) as usize;
         if points == 0 || self.rows.is_empty() {
@@ -901,11 +1004,7 @@ fn draw_band(ui: &Ui, rect: Rect, band: &str, nets: &[Value], channels: &[Value]
         let name = if ssid.is_empty() { tr_in(SCOPE, l, "hidden").to_owned() } else { ssid };
         let label = if yours { format!("{name} · {}", tr_in(SCOPE, l, "yours")) } else { name };
         let galley = p.layout_no_wrap(label, font.clone(), tone.ink);
-        let size = galley.size();
-        let mut at = Rect::from_center_size(Pos2::new((x0 + x1) / 2.0, top - 2.0 - size.y / 2.0), size);
-        while placed.iter().any(|r| r.intersects(at)) && at.bottom() < base {
-            at = at.translate(vec2(0.0, size.y));
-        }
+        let at = label_rect(plot, (x0 + x1) / 2.0, top, galley.size(), &placed);
         placed.push(at);
         p.galley(at.min, galley, tone.ink);
     }
@@ -940,6 +1039,27 @@ fn draw_band(ui: &Ui, rect: Rect, band: &str, nets: &[Value], channels: &[Value]
         }
     }
     bp.rect_stroke(bars, 2.0, v.widgets.noninteractive.bg_stroke, egui::StrokeKind::Inside);
+}
+
+/// Where the name of a network's curve goes: centred on `x`, just above
+/// the curve's top; when that leaves the plot (a network at −21 dBm, or
+/// stronger than the axis's −20 dBm, seen on the notebook), just inside the
+/// block, under its top. A label that would cover one already `placed`
+/// goes a line lower, as far as the plot's bottom. Always inside `plot`.
+pub(crate) fn label_rect(plot: Rect, x: f32, top: f32, size: egui::Vec2, placed: &[Rect]) -> Rect {
+    let above = Rect::from_center_size(Pos2::new(x, top - 2.0 - size.y / 2.0), size);
+    let mut at = if above.top() >= plot.top() {
+        above
+    } else {
+        Rect::from_center_size(Pos2::new(x, top.max(plot.top()) + 2.0 + size.y / 2.0), size)
+    };
+    // Kept inside sideways too: a curve at the axis's edge.
+    let dx = (plot.left() - at.left()).max(0.0) - (at.right() - plot.right()).max(0.0);
+    at = at.translate(vec2(dx, 0.0));
+    while placed.iter().any(|r| r.intersects(at)) && at.bottom() + size.y <= plot.bottom() {
+        at = at.translate(vec2(0.0, size.y));
+    }
+    at
 }
 
 /// The usage of each channel of the spectrum, as bars under the traces.
@@ -980,6 +1100,7 @@ pub(crate) fn help_keys() -> Vec<&'static str> {
             "interface.wifi.spectral.trace",
             "interface.wifi.spectral.usage",
             "interface.wifi.spectral.interference",
+            "interface.wifi.auto",
         ])
         .collect()
 }
@@ -995,7 +1116,9 @@ pub(crate) fn labels() -> Vec<&'static str> {
         "counted on every channel", "the driver counts only the channel in use", "the driver does not count it",
         "Range", "Duration", "Start", "Stop", "scanning", "stopped", "noise floor", "Waterfall",
         "Real-time, average and peak", "Channel usage", "Sources", "peak", "average", "real-time",
-        "nothing stands out of the noise", "width", "on",
+        "nothing stands out of the noise", "width", "on", "Auto", "leaves the channel",
+        "At least 30 s while the radio is on a network",
+        "Each scan takes the radio off its network's channel for a moment: the link stalls (latency) while it does.",
     ]);
     out.extend(["current", "2ghz", "5ghz"].map(range_label));
     out.extend(["wifi", "cw", "mwo", "bluetooth", "fhss", "unknown"].map(kind_label));
