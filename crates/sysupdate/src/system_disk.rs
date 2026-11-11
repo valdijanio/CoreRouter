@@ -216,16 +216,26 @@ pub fn verity_root(cmdline: &str) -> Result<VerityRoot, String> {
     if root != "/dev/dm-0" {
         return Err(format!(
             "the root ({}) is not the dm-verity device: booted by the fallback path",
-            if root.is_empty() { "none" } else { root.as_str() }
+            if root.is_empty() {
+                "none"
+            } else {
+                root.as_str()
+            }
         ));
     }
     let create = cmdline_value(cmdline, "dm-mod.create").ok_or("no dm-mod.create")?;
     // name,uuid,minor,flags,table — the table has no commas.
-    let table = create.splitn(5, ',').nth(4).ok_or("dm-mod.create: no table")?;
+    let table = create
+        .splitn(5, ',')
+        .nth(4)
+        .ok_or("dm-mod.create: no table")?;
     let w: Vec<&str> = table.split_ascii_whitespace().collect();
     let word = |i: usize| w.get(i).copied().unwrap_or("");
     if word(2) != "verity" {
-        return Err(format!("dm-mod.create: '{}' is not a verity table", word(2)));
+        return Err(format!(
+            "dm-mod.create: '{}' is not a verity table",
+            word(2)
+        ));
     }
     let num = |i: usize, what: &str| -> Result<u64, String> {
         word(i)
@@ -264,7 +274,9 @@ mod tests {
 
     fn line(blocks: u64) -> String {
         let t = verity::table("PARTUUID=u-a", blocks, HASH, "00ff");
-        format!("BOOT_IMAGE=/x root=/dev/dm-0 dm-mod.waitfor=PARTUUID=u-a dm-mod.create=\"vroot,,,ro,{t}\" panic=10")
+        format!(
+            "BOOT_IMAGE=/x root=/dev/dm-0 dm-mod.waitfor=PARTUUID=u-a dm-mod.create=\"vroot,,,ro,{t}\" panic=10"
+        )
     }
 
     #[test]
@@ -286,7 +298,11 @@ mod tests {
         let e = verity_root("root=/dev/dm-0").unwrap_err();
         assert!(e.contains("no dm-mod.create"), "{e}");
         let bad = line(16).replace(" verity ", " linear ");
-        assert!(verity_root(&bad).unwrap_err().contains("not a verity table"));
+        assert!(
+            verity_root(&bad)
+                .unwrap_err()
+                .contains("not a verity table")
+        );
         // Hostile numbers: nothing overflows, nothing huge is asked for.
         let huge = line(16).replace(" 16 16 sha256", " 18446744073709551615 16 sha256");
         assert!(verity_root(&huge).unwrap_err().contains("out of range"));
@@ -299,11 +315,19 @@ mod tests {
 
     #[test]
     fn ram_left_for_the_router() {
-        let mem = |avail_mib: u64| format!("MemTotal: 1000000 kB\nMemFree: 1 kB\nMemAvailable: {} kB\n", avail_mib * 1024);
+        let mem = |avail_mib: u64| {
+            format!(
+                "MemTotal: 1000000 kB\nMemFree: 1 kB\nMemAvailable: {} kB\n",
+                avail_mib * 1024
+            )
+        };
         let root = 87 << 20;
         assert!(ram_check(&mem(400), root).is_ok());
         let e = ram_check(&mem(300), root).unwrap_err();
-        assert!(e.contains("300 MiB of RAM available, 343 MiB needed"), "{e}");
+        assert!(
+            e.contains("300 MiB of RAM available, 343 MiB needed"),
+            "{e}"
+        );
         assert!(ram_check("MemTotal: 1 kB\n", root).is_err());
     }
 
@@ -323,7 +347,13 @@ mod tests {
         assert!(load_options(&d).unwrap().to_ram);
 
         assert_eq!(read_root(&d), None);
-        let s = RootState { in_ram: true, bytes: 5, copy_ms: 7, disk: Some("sda".into()), note: None };
+        let s = RootState {
+            in_ram: true,
+            bytes: 5,
+            copy_ms: 7,
+            disk: Some("sda".into()),
+            note: None,
+        };
         write_root(&d, &s).unwrap();
         assert_eq!(read_root(&d), Some(s));
 

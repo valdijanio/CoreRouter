@@ -36,6 +36,9 @@ const IO_ERRORS: [&str; 5] = [
     "Buffer I/O",
 ];
 
+/// What the RAM holds (the root's file is in `Shmem`).
+const MEM: &str = "echo $(grep -E 'MemAvailable|Shmem:' /proc/meminfo)";
+
 /// The installed disk as a USB stick, with a monitor to pull it out.
 fn boot_usb(ctx: &mut Ctx, name: &str, mon: &Path) -> Result<Vm, String> {
     let _ = std::fs::remove_file(mon);
@@ -51,7 +54,12 @@ fn boot_usb(ctx: &mut Ctx, name: &str, mon: &Path) -> Result<Vm, String> {
         "-device",
         "usb-storage,bus=xhci.0,drive=stick,id=sysdisk,removable=on,bootindex=1",
     ]);
-    cmd.args(["-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0"]);
+    cmd.args([
+        "-netdev",
+        "user,id=n0",
+        "-device",
+        "virtio-net-pci,netdev=n0",
+    ]);
     let mut log = ctx.log.try_clone().map_err(|e| e.to_string())?;
     start(&mut log, name, cmd)
 }
@@ -62,13 +70,25 @@ fn copy_ms(line: &str) -> Option<u64> {
     head.rsplit(' ').next()?.parse().ok()
 }
 
+/// The health check `key`, once the package service reported (it says
+/// where the root is a few seconds after the daemon is up).
 fn health(vm: &mut Vm, log: &mut std::fs::File, key: &str) -> Result<Value, String> {
-    let v = vm.ok(log, "system.health.check", "{}")?;
-    let checks = v.get("checks").cloned().unwrap_or(v);
-    checks
-        .as_array()
-        .and_then(|a| a.iter().find(|c| c["key"] == key).cloned())
-        .ok_or_else(|| format!("no {key} health check: {checks}"))
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let v = vm.ok(log, "system.health.check", "{}")?;
+        let checks = v.get("checks").cloned().unwrap_or(v);
+        if let Some(c) = checks
+            .as_array()
+            .and_then(|a| a.iter().find(|c| c["key"] == key).cloned())
+        {
+            return Ok(c);
+        }
+        check(
+            Instant::now() < deadline,
+            format!("no {key} health check: {checks}"),
+        )?;
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
 pub(super) fn scenario(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
@@ -86,7 +106,12 @@ pub(super) fn scenario(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
         ready_s(r.first().map_or("", String::as_str)),
     );
     let d = health(&mut vm, &mut log, "system.disk")?;
-    check(d["severity"] == "ok", format!("system.disk on the disk: {d}"))?;
+    check(
+        d["severity"] == "ok",
+        format!("system.disk on the disk: {d}"),
+    )?;
+    let mem = shell_line(&mut vm, &mut log, MEM)?;
+    n.put("memory, root on the disk", mem);
     let v = vm.ok(&mut log, "system.boot.set", r#"{"to_ram":true}"#)?;
     check(v["next_boot"] == "ram", format!("system.boot.set: {v}"))?;
     // The package service keeps it where the init reads it.
@@ -96,7 +121,10 @@ pub(super) fn scenario(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
         if f.contains("\"to_ram\":true") {
             break;
         }
-        check(Instant::now() < deadline, format!("boot.json never said to_ram: {f}"))?;
+        check(
+            Instant::now() < deadline,
+            format!("boot.json never said to_ram: {f}"),
+        )?;
         std::thread::sleep(Duration::from_millis(500));
     }
     vm.poweroff(&mut log)?;
@@ -104,9 +132,16 @@ pub(super) fn scenario(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
 
     // 2. From RAM, and the stick pulled out.
     let mut vm = boot_usb(ctx, "to-ram/ram", &mon)?;
-    let r = vm.expect_all(&mut log, &["system in RAM:", "ready:", "maintenance shell"], 120)?;
+    let r = vm.expect_all(
+        &mut log,
+        &["system in RAM:", "ready:", "maintenance shell"],
+        120,
+    )?;
     let copied = r.first().map_or("", String::as_str);
-    check(!copied.contains("running from the disk"), format!("stayed on the disk: {copied}"))?;
+    check(
+        !copied.contains("running from the disk"),
+        format!("stayed on the disk: {copied}"),
+    )?;
     n.put(
         "root to RAM through dm-verity (USB stick in QEMU)",
         copy_ms(copied).map_or_else(|| "?".into(), |ms| format!("{ms} ms")),
@@ -115,13 +150,22 @@ pub(super) fn scenario(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
         "USB stick, root in RAM: kernel → daemon ready",
         ready_s(r.get(1).map_or("", String::as_str)),
     );
+    let d = health(&mut vm, &mut log, "system.disk")?;
+    check(d["severity"] == "ok", format!("system.disk in RAM: {d}"))?;
     let b = vm.ok(&mut log, "system.boot.print", "{}")?;
-    check(b["running"]["in_ram"] == true, format!("system.boot.print: {b}"))?;
-    let mem = shell_line(&mut vm, &mut log, "grep -E 'MemAvailable|Shmem:' /proc/meminfo | tr -s ' ' | tr '\\n' ' '")?;
+    check(
+        b["running"]["in_ram"] == true,
+        format!("system.boot.print: {b}"),
+    )?;
+    let mem = shell_line(&mut vm, &mut log, MEM)?;
     n.put("memory with the root in RAM", mem);
     let out = super::hotplug::hmp(&mon, "device_del sysdisk")?;
     let _ = writeln!(log, "monitor: device_del sysdisk → {}", out.trim());
-    let line = vm.expect(&mut log, &["removed: the router keeps running from RAM"], 30)?;
+    let line = vm.expect(
+        &mut log,
+        &["removed: the router keeps running from RAM"],
+        30,
+    )?;
     check(line.contains("system disk"), format!("the line: {line}"))?;
     // What the console shows after it: the line, and nothing of the disk.
     let after = vm.lines_for(&mut log, 8);
@@ -129,31 +173,54 @@ pub(super) fn scenario(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
         .iter()
         .filter(|l| IO_ERRORS.iter().any(|e| l.contains(e)))
         .collect();
-    check(noisy.is_empty(), format!("I/O errors on the console after the line: {noisy:?}"))?;
+    check(
+        noisy.is_empty(),
+        format!("I/O errors on the console after the line: {noisy:?}"),
+    )?;
     // The router answers, and says what happened.
     let d = health(&mut vm, &mut log, "system.disk")?;
-    check(d["severity"] == "error", format!("system.disk after the removal: {d}"))?;
+    check(
+        d["severity"] == "error",
+        format!("system.disk after the removal: {d}"),
+    )?;
     let refused = vm.run(&mut log, "system.identity.set", r#"{"name":"lost"}"#)?;
     check(
         refused["ok"] == false && refused.to_string().contains("removed"),
         format!("a commit without the disk: {refused}"),
     )?;
-    vm.ok(&mut log, "config.safe-mode.enter", "{}")?;
-    vm.ok(&mut log, "system.identity.set", r#"{"name":"for-now"}"#)?;
-    vm.ok(&mut log, "config.safe-mode.cancel", "{}")?;
+    // Safe Mode ends with its connection, and each `run` is one: the
+    // engine's own test covers it (`system_boot.rs`).
     let after = vm.lines_for(&mut log, 3);
-    let noisy = after.iter().filter(|l| IO_ERRORS.iter().any(|e| l.contains(e))).count();
-    check(noisy == 0, "I/O errors on the console while the router was used")?;
-    n.put("system disk pulled out, root in RAM", "one line; control channel answers; commit refused".to_owned());
+    let noisy = after
+        .iter()
+        .filter(|l| IO_ERRORS.iter().any(|e| l.contains(e)))
+        .count();
+    check(
+        noisy == 0,
+        "I/O errors on the console while the router was used",
+    )?;
+    n.put(
+        "system disk pulled out, root in RAM",
+        "one line; control channel answers; commit refused".to_owned(),
+    );
     drop(vm);
 
     // 3. Option off again, and the stick pulled out of a root on it.
     let mut vm = boot_usb(ctx, "to-ram/back", &mon)?;
-    vm.expect_all(&mut log, &["system in RAM:", "ready:", "maintenance shell"], 120)?;
+    vm.expect_all(
+        &mut log,
+        &["system in RAM:", "ready:", "maintenance shell"],
+        120,
+    )?;
     vm.ok(&mut log, "system.boot.set", r#"{"to_ram":false}"#)?;
     let deadline = Instant::now() + Duration::from_secs(15);
-    while !shell_line(&mut vm, &mut log, "cat /config/package/boot.json")?.contains("\"to_ram\":false") {
-        check(Instant::now() < deadline, "boot.json never said to_ram false")?;
+    while !shell_line(&mut vm, &mut log, "cat /config/package/boot.json")?
+        .contains("\"to_ram\":false")
+    {
+        check(
+            Instant::now() < deadline,
+            "boot.json never said to_ram false",
+        )?;
         std::thread::sleep(Duration::from_millis(500));
     }
     vm.poweroff(&mut log)?;

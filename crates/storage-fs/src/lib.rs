@@ -475,10 +475,16 @@ mod tests {
         let base = std::env::temp_dir().join(format!("cr-fs-gone-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         let marker = base.join("system-disk-removed");
-        let mut st = FileStorage::open(base.join("config")).unwrap().refuse_while(&marker);
+        let mut st = FileStorage::open(base.join("config"))
+            .unwrap()
+            .refuse_while(&marker);
         st.save("{}").unwrap();
         assert_eq!(st.unavailable(), None);
-        fs::write(&marker, "system disk sda removed: changes are no longer saved\n").unwrap();
+        fs::write(
+            &marker,
+            "system disk sda removed: changes are no longer saved\n",
+        )
+        .unwrap();
         let line = st.unavailable().unwrap();
         assert_eq!(line, "system disk sda removed: changes are no longer saved");
         assert!(st.save("{\"x\":1}").unwrap_err().0.contains("sda removed"));

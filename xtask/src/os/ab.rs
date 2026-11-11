@@ -541,7 +541,12 @@ pub(super) fn check(cond: bool, what: impl Into<String>) -> Result<(), String> {
 /// A fresh disk (qcow2 over disk.img) and NVRAM, booted once the factory way
 /// and once through the boot entries it created. Returns the second run,
 /// on slot A with dm-verity.
-pub(super) fn fresh(ctx: &mut Ctx, n: &mut Numbers, scenario: &str, extra: &[&Path]) -> Result<Vm, String> {
+pub(super) fn fresh(
+    ctx: &mut Ctx,
+    n: &mut Numbers,
+    scenario: &str,
+    extra: &[&Path],
+) -> Result<Vm, String> {
     new_disk(ctx)?;
     let mut log = ctx.log.try_clone().map_err(|e| e.to_string())?;
     let mut vm = ctx.boot(&format!("{scenario}/factory"), true, &[])?;
@@ -1036,7 +1041,11 @@ fn scenario_bad_param(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
 }
 
 /// A shell command's output line on the guest's console.
-pub(super) fn shell_line(vm: &mut Vm, log: &mut std::fs::File, cmd: &str) -> Result<String, String> {
+pub(super) fn shell_line(
+    vm: &mut Vm,
+    log: &mut std::fs::File,
+    cmd: &str,
+) -> Result<String, String> {
     vm.stdin_write(format!("{cmd} 2>&1 | sed \"s/^/@@$((2+1))S /\"\n").as_bytes())?;
     let got = vm.expect(log, &["@@3S "], 30)?;
     Ok(got.split("@@3S ").nth(1).unwrap_or("").trim().to_owned())

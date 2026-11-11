@@ -130,9 +130,8 @@ pub fn main() {
     };
     // G1.6zn: the root to RAM when asked, before anything else reads it
     // (with the option on, this returns only when the boot stays here).
-    let root = (!live).then(|| {
-        crate::to_ram::at_boot(&cmdline, config_dev.as_deref(), ram_stage2.as_deref())
-    });
+    let root = (!live)
+        .then(|| crate::to_ram::at_boot(&cmdline, config_dev.as_deref(), ram_stage2.as_deref()));
     // G1.6j: before the ports get their names, and only now: a driver that
     // asks for its firmware while probing needs / (the kernel's own probes
     // run before it is mounted). G1.6za: the live image too: the first stage

@@ -61,9 +61,21 @@ pub fn at_boot(cmdline: &str, config_dev: Option<&str>, stage2: Option<&[String]
             bytes >> 20,
             disk.as_deref().unwrap_or("the disk")
         ));
-        return RootState { in_ram: true, bytes, copy_ms, disk, note: None };
+        return RootState {
+            in_ram: true,
+            bytes,
+            copy_ms,
+            disk,
+            note: None,
+        };
     }
-    let on_disk = |note: Option<String>| RootState { in_ram: false, bytes: 0, copy_ms: 0, disk: disk.clone(), note };
+    let on_disk = |note: Option<String>| RootState {
+        in_ram: false,
+        bytes: 0,
+        copy_ms: 0,
+        disk: disk.clone(),
+        note,
+    };
     // A /config on tmpfs (no partition) holds no option.
     if config_dev.is_none() {
         return on_disk(None);
@@ -105,13 +117,18 @@ fn prepare(cmdline: &str) -> Result<(u64, u64), String> {
     let ms = t.elapsed().as_millis() as u64;
     fs::create_dir(NEW_ROOT).map_err(|e| format!("{NEW_ROOT}: {e}"))?;
     let st = Command::new(BUSYBOX)
-        .args(["mount", "-t", "squashfs", "-o", "loop,ro", RAM_FILE, NEW_ROOT])
+        .args([
+            "mount", "-t", "squashfs", "-o", "loop,ro", RAM_FILE, NEW_ROOT,
+        ])
         .status()
         .map_err(|e| format!("{BUSYBOX}: {e}"))?;
     if !st.success() {
         return Err(format!("mounting the root from RAM: {st}"));
     }
-    if !Path::new(NEW_ROOT).join(SELF.trim_start_matches('/')).is_file() {
+    if !Path::new(NEW_ROOT)
+        .join(SELF.trim_start_matches('/'))
+        .is_file()
+    {
         let _ = rustix::mount::unmount(NEW_ROOT, UnmountFlags::DETACH);
         return Err(format!("the copy has no {SELF}"));
     }
@@ -162,17 +179,29 @@ fn move_to_root(bytes: u64, copy_ms: u64) -> RootState {
         undo();
         let note = format!("/config: unmount: {e}");
         log(&format!("system in RAM: {note}; running from the disk"));
-        return RootState { in_ram: false, bytes: 0, copy_ms: 0, disk: None, note: Some(note) };
+        return RootState {
+            in_ram: false,
+            bytes: 0,
+            copy_ms: 0,
+            disk: None,
+            note: Some(note),
+        };
     }
-    let pivoted = rustix::process::chdir(NEW_ROOT)
-        .and_then(|()| rustix::process::pivot_root(".", "."));
+    let pivoted =
+        rustix::process::chdir(NEW_ROOT).and_then(|()| rustix::process::pivot_root(".", "."));
     if let Err(e) = pivoted {
         let _ = rustix::process::chdir("/");
         undo();
         let note = format!("pivot_root: {e}");
         log(&format!("system in RAM: {note}; running from the disk"));
         remount_config();
-        return RootState { in_ram: false, bytes: 0, copy_ms: 0, disk: None, note: Some(note) };
+        return RootState {
+            in_ram: false,
+            bytes: 0,
+            copy_ms: 0,
+            disk: None,
+            note: Some(note),
+        };
     }
     // The old root sits on top of the new one at "."; it goes with its
     // mounts (/proc, /dev, /run, the tmpfs of the file…).
@@ -187,9 +216,17 @@ fn move_to_root(bytes: u64, copy_ms: u64) -> RootState {
     for m in plan::MOUNTS {
         crate::pid1::mount_api(m);
     }
-    log(&format!("system in RAM: {SELF}: {e}; going on from RAM with the old init"));
+    log(&format!(
+        "system in RAM: {SELF}: {e}; going on from RAM with the old init"
+    ));
     remount_config();
-    RootState { in_ram: true, bytes, copy_ms, disk: None, note: Some(format!("exec: {e}")) }
+    RootState {
+        in_ram: true,
+        bytes,
+        copy_ms,
+        disk: None,
+        note: Some(format!("exec: {e}")),
+    }
 }
 
 fn remount_config() {
@@ -198,7 +235,13 @@ fn remount_config() {
     };
     let dev = format!("/dev/{name}");
     let fl = MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC | MountFlags::NOATIME;
-    if let Err(e) = rustix::mount::mount(dev.as_str(), plan::CONFIG_DIR, "ext4", fl, c"errors=remount-ro") {
+    if let Err(e) = rustix::mount::mount(
+        dev.as_str(),
+        plan::CONFIG_DIR,
+        "ext4",
+        fl,
+        c"errors=remount-ro",
+    ) {
         log(&format!("/config: mount {dev}: {e}"));
     }
 }
