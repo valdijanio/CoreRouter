@@ -963,6 +963,7 @@ fn type_icon(kind: &str) -> &'static str {
         "bonding" => crate::icons::LINK,
         "vrf" => crate::icons::FOLDERS,
         "pppoe-out" => crate::icons::LAPTOP,
+        "wifi" => crate::icons::WIFI_HIGH,
         _ => crate::icons::SQUARES_FOUR,
     }
 }

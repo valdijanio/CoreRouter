@@ -41,7 +41,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set Wi-Fi",
         ["Interfaces", "Wi-Fi"],
         None,
-        "{name: string, ssid?: string (the network's name, 1 to 32 bytes; empty: forget the network), security?: string (auto | wpa3 | wpa2 | open; auto: WPA3 if the access point offers it, else WPA2), passphrase?: string (write-only, sealed at rest: 8 to 63 characters, or the 64-digit key with security=wpa2), hidden?: bool (the network does not announce its name), band?: string (2ghz | 5ghz | 6ghz; empty or any: whichever the network is on), bssid?: string (only this access point; empty: any), disabled?: bool (default true: a radio is off until it is told to join a network), comment?: string, mtu?: int (68..=2304), force?: bool (change the network of the radio this connection comes through, outside Safe Mode)} → {name, warnings}",
+        "{name: string, ssid?: string (the network's name, 1 to 32 bytes; empty: forget the network), security?: string (auto | wpa3 | wpa2 | open; auto: WPA3 if the access point offers it, else WPA2), passphrase?: string (write-only, sealed at rest: 8 to 63 characters, or the 64-digit key with security=wpa2; another ssid needs its own), hidden?: bool (the network does not announce its name), band?: string (2ghz | 5ghz | 6ghz; empty or any: whichever the network is on), bssid?: string (only this access point; empty: any), disabled?: bool (default true: a radio is off until it is told to join a network), comment?: string, mtu?: int (68..=2304), force?: bool (change the network of the radio this connection comes through, outside Safe Mode)} → {name, warnings}",
         has_radios,
         set
     ),
@@ -110,6 +110,9 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "interface.wifi.history", "Wi-Fi History", [], None,
         "{name?: string, limit?: int (newest first, default 100)} → [{seq, time, name, event (joining | connected | disconnected | failed | blocked | unblocked | error), message}]",
         always, history),
+    cmd!(query "interface.wifi.preview", "Wi-Fi Preview", [], None,
+        "{id: string (the radio), ssid?: string, security?: string, passphrase?: string, hidden?: bool, band?: string, bssid?: string, disabled?: bool, comment?: string, mtu?: int 68..2304} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk}",
+        has_radios, preview),
 ];
 
 fn radios(cfg: &Config) -> impl Iterator<Item = (&IfName, &Interface, &WifiStation)> {
@@ -166,6 +169,12 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         } else if let Some(why) = ssid_problem(&ssid) {
             return Err(EngineError::bad("ssid", why));
         } else {
+            // Another network: the passphrase of the one before is not its
+            // own. Kept, it gave "probably a wrong passphrase" minutes
+            // later instead of "needs its passphrase" now.
+            if ssid != st.ssid {
+                st.passphrase = Sealed::default();
+            }
             st.ssid = ssid;
         }
     }
@@ -652,3 +661,133 @@ fn history(s: &mut Session, p: &Value) -> Result<Value> {
         .collect();
     Ok(Value::Array(rows))
 }
+
+/// The edit modal's preview (G0.24): `interface.wifi.set` of the radio
+/// named by `id`, tried on the candidate and undone, so the checks and the
+/// warnings are exactly the command's. On top of them: whether the last
+/// scan heard the network, and the country a radio needs before it is on
+/// (the commit would refuse it; the modal says so before).
+fn preview(s: &mut Session, p: &Value) -> Result<Value> {
+    let mut q = p.clone();
+    if let Some(o) = q.as_object_mut() {
+        if let Some(id) = o.remove("id") {
+            o.insert("name".into(), id);
+        }
+        // An empty field of the modal is "not given" where empty is not a
+        // value. (An empty ssid forgets the network; an empty band or
+        // bssid is "any".)
+        for k in ["security", "passphrase", "mtu"] {
+            if o
+                .get(k)
+                .and_then(Value::as_str)
+                .is_some_and(|t| t.trim().is_empty())
+            {
+                o.remove(k);
+            }
+        }
+        if let Some(n) = o
+            .get("mtu")
+            .and_then(Value::as_str)
+            .and_then(|t| t.trim().parse::<u64>().ok())
+        {
+            o.insert("mtu".into(), json!(n));
+        }
+    }
+    let name = q
+        .get("name")
+        .and_then(Value::as_str)
+        .and_then(|n| n.parse::<IfName>().ok());
+    let mut needs_country = false;
+    let mut out = super::ppp_common::preview(
+        s,
+        &q,
+        ("interface.wifi.set", "interface.wifi.set"),
+        (set, set),
+        |s, _| {
+            let cfg = s.store().candidate();
+            let Some((iface, st)) = name.as_ref().and_then(|n| radio_of(cfg, n).ok()) else {
+                return Vec::new();
+            };
+            let line = |label: &str, value: String| json!({"label": label, "value": value});
+            if st.ssid.is_empty() {
+                return vec![line("Network", "none: the radio joins nothing".into())];
+            }
+            let heard = name
+                .as_ref()
+                .and_then(|n| s.wifi().and_then(|rt| rt.radios.get(n)))
+                .map(|r| {
+                    let best = r
+                        .scan
+                        .iter()
+                        .filter(|b| b.ssid == st.ssid)
+                        .max_by_key(|b| b.signal_dbm);
+                    match (best, r.scanned_at) {
+                        (Some(b), _) => format!(
+                            "yes: {} dBm, {}{}",
+                            b.signal_dbm,
+                            match band_of(Some(b.frequency_mhz)) {
+                                Some("2ghz") => "2.4 GHz",
+                                Some("5ghz") => "5 GHz",
+                                Some("6ghz") => "6 GHz",
+                                _ => "?",
+                            },
+                            channel(b.frequency_mhz)
+                                .map(|c| format!(" channel {c}"))
+                                .unwrap_or_default(),
+                        ),
+                        (None, Some(_)) if st.hidden => {
+                            "a hidden network does not show in a scan".to_owned()
+                        }
+                        (None, Some(_)) => "not heard in the last scan".to_owned(),
+                        (None, None) => "no scan yet".to_owned(),
+                    }
+                })
+                .unwrap_or_else(|| "no scan yet".to_owned());
+            vec![
+                line("Network", st.ssid.clone()),
+                line(
+                    "Security",
+                    match st.security {
+                        WifiSecurity::Auto => "WPA3 if the access point offers it, else WPA2",
+                        WifiSecurity::Wpa3 => "WPA3 only",
+                        WifiSecurity::Wpa2 => "WPA2 only",
+                        WifiSecurity::Open => "none (open network)",
+                    }
+                    .to_owned(),
+                ),
+                line("In range", heard),
+                line(
+                    "Radio",
+                    if iface.disabled { "off" } else { "on" }.to_owned(),
+                ),
+            ]
+        },
+    )?;
+    if let Some(n) = &name
+        && let Ok((iface, _)) = radio_of(s.store().candidate(), n)
+    {
+        // What the candidate would be: the radio as the modal leaves it.
+        let off = q
+            .get("disabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(iface.disabled);
+        needs_country = !off && s.store().candidate().system.wifi.country.is_none();
+    }
+    let valid = out
+        .get("commands")
+        .and_then(Value::as_array)
+        .is_some_and(|c| !c.is_empty());
+    if needs_country
+        && valid
+        && let Some(checks) = out.get_mut("checks").and_then(Value::as_array_mut)
+    {
+        checks.push(json!({
+            "level": "error",
+            "check": "country",
+            "message": corerouter_model::wifi::NO_COUNTRY,
+            "param": "disabled",
+        }));
+    }
+    Ok(out)
+}
+
