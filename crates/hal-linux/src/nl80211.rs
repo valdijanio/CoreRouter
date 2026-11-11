@@ -1,8 +1,9 @@
 //! nl80211 (G1.30g): what the kernel keeps about a radio and its link —
 //! the rates and counters of the link to the access point
 //! (`NL80211_CMD_GET_STATION`), what the card can do in each band
-//! (`NL80211_CMD_GET_WIPHY`) and its transmit power
-//! (`NL80211_CMD_GET_INTERFACE`). All three are read-only.
+//! (`NL80211_CMD_GET_WIPHY`), its transmit power
+//! (`NL80211_CMD_GET_INTERFACE`) and, G1.30i, how busy each channel was
+//! (`NL80211_CMD_GET_SURVEY`). All four are read-only.
 //!
 //! The parsers are pure and walk hostile bytes: every value is read only
 //! when its attribute has exactly the kernel's size, a nest that ends early
@@ -15,7 +16,8 @@
 use std::collections::BTreeMap;
 
 use corerouter_hal::wifi::{
-    MAX_BANDS, MAX_CHAINS, MAX_CHANNELS, WifiBand, WifiChannel, WifiLink, WifiRate,
+    MAX_BANDS, MAX_CHAINS, MAX_CHANNELS, MAX_SURVEY, WifiBand, WifiChannel, WifiLink, WifiRate,
+    WifiSurvey,
 };
 
 use crate::genl::{Attr, Attrs, attrs, find};
@@ -24,6 +26,8 @@ use crate::genl::{Attr, Attrs, attrs, find};
 pub(crate) const CMD_GET_WIPHY: u8 = 1;
 pub(crate) const CMD_GET_INTERFACE: u8 = 5;
 pub(crate) const CMD_GET_STATION: u8 = 17;
+/// G1.30i (checked compiling the header: 50).
+pub(crate) const CMD_GET_SURVEY: u8 = 50;
 // G1.30j: the monitor interface (Linux 6.18.59 values, read from the
 // header by a C program: NEW_INTERFACE 7, DEL_INTERFACE 8, SET_CHANNEL 65).
 pub(crate) const CMD_NEW_INTERFACE: u8 = 7;
@@ -53,6 +57,8 @@ pub(crate) const MNTR_FLAG_OTHER_BSS: u16 = 4;
 const ATTR_MAC: u16 = 6;
 const ATTR_STA_INFO: u16 = 21;
 const ATTR_WIPHY_BANDS: u16 = 22;
+/// G1.30i: the nest of a survey reply (84).
+const ATTR_SURVEY_INFO: u16 = 84;
 /// Signed mBm (l. 2028).
 const ATTR_WIPHY_TX_POWER_LEVEL: u16 = 98;
 const ATTR_WIPHY_ANTENNA_AVAIL_TX: u16 = 113;
@@ -73,6 +79,16 @@ const STA_INFO_CONNECTED_TIME: u16 = 16;
 const STA_INFO_BEACON_LOSS: u16 = 18;
 const STA_INFO_CHAIN_SIGNAL: u16 = 25;
 const STA_INFO_BEACON_SIGNAL_AVG: u16 = 30;
+
+// `enum nl80211_survey_info` (l. 4954): frequency u32, noise a u8
+// holding a signed dBm, in-use a flag, the times u64 ms.
+const SURVEY_FREQUENCY: u16 = 1;
+const SURVEY_NOISE: u16 = 2;
+const SURVEY_IN_USE: u16 = 3;
+const SURVEY_TIME: u16 = 4;
+const SURVEY_TIME_BUSY: u16 = 5;
+const SURVEY_TIME_RX: u16 = 7;
+const SURVEY_TIME_TX: u16 = 8;
 
 // `enum nl80211_rate_info` (l. 4018).
 const RATE_INFO_BITRATE: u16 = 1;
@@ -314,6 +330,34 @@ pub(crate) fn station<'a>(
         .map(|i| link(i.nested()))
 }
 
+/// G1.30i: one channel of a survey dump; `None` without a frequency.
+/// A time of zero is no measure (the drivers leave the channels they did
+/// not count at zero), and busy beyond active is not believed.
+pub(crate) fn survey(message: &[u8]) -> Option<WifiSurvey> {
+    let info = find(attrs(message), ATTR_SURVEY_INFO)?;
+    let mut s = WifiSurvey::default();
+    for a in info.nested() {
+        let ms = || counter(&a).filter(|v| *v > 0);
+        match a.kind {
+            SURVEY_FREQUENCY => s.frequency_mhz = u32_of(&a)?,
+            SURVEY_NOISE => s.noise_dbm = dbm(&a),
+            SURVEY_IN_USE => s.in_use = true,
+            SURVEY_TIME => s.active_ms = ms(),
+            SURVEY_TIME_BUSY => s.busy_ms = ms(),
+            SURVEY_TIME_RX => s.rx_ms = ms(),
+            SURVEY_TIME_TX => s.tx_ms = ms(),
+            _ => {}
+        }
+    }
+    if s.frequency_mhz == 0 {
+        return None;
+    }
+    if s.active_ms.is_none() || s.busy_ms > s.active_ms {
+        s.busy_ms = None;
+    }
+    Some(s)
+}
+
 /// `NL80211_ATTR_WIPHY_TX_POWER_LEVEL` of a `GET_INTERFACE` reply, dBm.
 pub(crate) fn tx_power(message: &[u8]) -> Option<i32> {
     find(attrs(message), ATTR_WIPHY_TX_POWER_LEVEL)
@@ -535,11 +579,12 @@ mod io {
     use super::{
         ATTR_CENTER_FREQ1, ATTR_CHANNEL_WIDTH, ATTR_IFINDEX, ATTR_IFNAME, ATTR_IFTYPE,
         ATTR_MNTR_FLAGS, ATTR_SPLIT_WIPHY_DUMP, ATTR_WIPHY, ATTR_WIPHY_FREQ, CMD_DEL_INTERFACE,
-        CMD_GET_INTERFACE, CMD_GET_STATION, CMD_GET_WIPHY, CMD_NEW_INTERFACE, CMD_SET_CHANNEL,
-        IFTYPE_MONITOR, MAX_WIPHY_MESSAGES, MNTR_FLAG_CONTROL, MNTR_FLAG_OTHER_BSS, Wiphy, station,
-        tx_power,
+        CMD_GET_INTERFACE, CMD_GET_STATION, CMD_GET_SURVEY, CMD_GET_WIPHY, CMD_NEW_INTERFACE,
+        CMD_SET_CHANNEL, IFTYPE_MONITOR, MAX_SURVEY, MAX_WIPHY_MESSAGES, MNTR_FLAG_CONTROL,
+        MNTR_FLAG_OTHER_BSS, Wiphy, station, survey, tx_power,
     };
     use crate::genl::{Genl, GenlError, Msg, attrs, find};
+    use corerouter_hal::wifi::WifiSurvey;
 
     /// cfg80211 in the kernel (see `crate::wifi_links`: asking for the
     /// family without it makes the kernel load it).
@@ -576,6 +621,16 @@ mod io {
             m.u32(ATTR_IFINDEX, ifindex);
             let replies = self.genl.call_up_to(m.finish(), seq, MAX_STATIONS)?;
             Ok(station(replies.iter().map(|(_, a)| a.as_slice()), bssid))
+        }
+
+        /// G1.30i: the survey of the radio behind `ifindex`, a channel per
+        /// message, at most [`MAX_SURVEY`].
+        pub fn survey(&mut self, ifindex: u32) -> Result<Vec<WifiSurvey>, GenlError> {
+            let seq = self.genl.next_seq();
+            let mut m = Msg::dump(self.family, CMD_GET_SURVEY, 0, seq);
+            m.u32(ATTR_IFINDEX, ifindex);
+            let replies = self.genl.call_up_to(m.finish(), seq, MAX_SURVEY)?;
+            Ok(replies.iter().filter_map(|(_, a)| survey(a)).collect())
         }
 
         /// The transmit power of the interface, dBm.
@@ -752,6 +807,65 @@ mod tests {
             nest(ATTR_STA_INFO, info),
         ]
         .concat()
+    }
+
+    fn u64a(kind: u16, v: u64) -> Vec<u8> {
+        nla(kind, &v.to_ne_bytes())
+    }
+
+    #[test]
+    fn a_survey_with_one_channel_counted() {
+        // As mt7925e answers (measured on the host, 2026-11-11): the
+        // channel in use counted, the others at zero.
+        let used = nest(
+            ATTR_SURVEY_INFO,
+            &[
+                u32a(SURVEY_FREQUENCY, 5500),
+                s8a(SURVEY_NOISE, -92),
+                flag(SURVEY_IN_USE),
+                u64a(SURVEY_TIME, 60_000),
+                u64a(SURVEY_TIME_BUSY, 9_000),
+                u64a(SURVEY_TIME_RX, 7_000),
+                u64a(SURVEY_TIME_TX, 500),
+            ],
+        );
+        let s = survey(&[u32a(ATTR_IFINDEX, 4), used].concat()).unwrap();
+        assert_eq!(
+            s,
+            WifiSurvey {
+                frequency_mhz: 5500,
+                noise_dbm: Some(-92),
+                in_use: true,
+                active_ms: Some(60_000),
+                busy_ms: Some(9_000),
+                rx_ms: Some(7_000),
+                tx_ms: Some(500),
+            }
+        );
+        let zero = nest(
+            ATTR_SURVEY_INFO,
+            &[
+                u32a(SURVEY_FREQUENCY, 2412),
+                u64a(SURVEY_TIME, 0),
+                u64a(SURVEY_TIME_BUSY, 0),
+            ],
+        );
+        let s = survey(&zero).unwrap();
+        assert_eq!((s.active_ms, s.busy_ms, s.in_use), (None, None, false));
+        // Busy beyond active, and no frequency.
+        let odd = nest(
+            ATTR_SURVEY_INFO,
+            &[
+                u32a(SURVEY_FREQUENCY, 2412),
+                u64a(SURVEY_TIME, 10),
+                u64a(SURVEY_TIME_BUSY, 99),
+            ],
+        );
+        assert_eq!(survey(&odd).unwrap().busy_ms, None);
+        assert_eq!(
+            survey(&nest(ATTR_SURVEY_INFO, &[flag(SURVEY_IN_USE)])),
+            None
+        );
     }
 
     #[test]
@@ -1187,6 +1301,7 @@ mod tests {
         /// Whatever the kernel (or a bug) hands back: no panic, bounds kept.
         #[test]
         fn hostile_nl80211_bytes(buf in proptest::collection::vec(any::<u8>(), 0..1024)) {
+            let _ = survey(&buf);
             if let Some(l) = station([buf.as_slice()], Some("d8:47:32:aa:bb:cc")) {
                 prop_assert!(l.chain_signal_dbm.len() <= MAX_CHAINS);
             }

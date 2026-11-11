@@ -10,9 +10,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use corerouter_model::IfName;
 
 use crate::HalError;
+use crate::wifi::spectral::{SpectralSample, encode_ath10k, parse_stream};
 use crate::wifi::{
-    BssSecurity, JoinSecurity, MAX_EVENTS, WifiBand, WifiBss, WifiChannel, WifiEvent, WifiFailure,
-    WifiLink, WifiNetwork, WifiPort, WifiRadio, WifiRate, WifiState, WifiStatus,
+    BssSecurity, JoinSecurity, MAX_EVENTS, MAX_SPECTRAL_SECS, WifiBand, WifiBss, WifiChannel,
+    WifiEvent, WifiFailure, WifiLink, WifiNetwork, WifiPort, WifiRadio, WifiRate, WifiState,
+    WifiStatus, WifiSurvey,
 };
 
 /// The passphrase of the lab's main network (`CoreRouter-Lab`).
@@ -29,6 +31,119 @@ pub struct LabNetwork {
     pub key: String,
     /// Does not announce its name: a scan shows it nameless.
     pub hidden: bool,
+    /// G1.30i: the information elements its beacons carry ([`elements`]).
+    pub ies: Vec<u8>,
+}
+
+/// The lab network's channel: the width and centre of the whole channel,
+/// the generation, the BSS Load (stations, utilization 0..=255).
+#[derive(Debug, Clone, Copy)]
+pub struct LabChannel {
+    pub width_mhz: u32,
+    pub center_mhz: u32,
+    pub generation: u8,
+    pub load: Option<(u16, u8)>,
+}
+
+fn ch_of(mhz: u32) -> u8 {
+    let n = match mhz {
+        2484 => 14,
+        0..=2500 => mhz.saturating_sub(2407) / 5,
+        2501..=5925 => mhz.saturating_sub(5000) / 5,
+        _ => mhz.saturating_sub(5950) / 5,
+    };
+    u8::try_from(n).unwrap_or(0)
+}
+
+/// The elements an access point on `primary_mhz` writes for `c`, in the
+/// layouts of IEEE 802.11-2020 §9.4.2 (the same ones a real scan brings).
+pub fn elements(primary_mhz: u32, c: LabChannel) -> Vec<u8> {
+    let mut b = Vec::new();
+    let mut el = |id: u8, body: &[u8]| {
+        b.push(id);
+        b.push(u8::try_from(body.len()).unwrap_or(0));
+        b.extend_from_slice(body);
+    };
+    let six = primary_mhz > 5925;
+    let five = (5150..=5925).contains(&primary_mhz);
+    if let Some((stations, util)) = c.load {
+        let s = stations.to_le_bytes();
+        el(11, &[s[0], s[1], util, 0, 0]);
+    }
+    if c.generation >= 4 && !six {
+        el(45, &[0; 26]);
+        let mut op = [0u8; 22];
+        op[0] = ch_of(primary_mhz);
+        if c.width_mhz >= 40 {
+            op[1] = if c.center_mhz > primary_mhz {
+                0b101
+            } else {
+                0b111
+            };
+        }
+        el(61, &op);
+    }
+    if c.generation >= 5 && five {
+        el(191, &[0; 12]);
+        let center = ch_of(c.center_mhz);
+        let info = match c.width_mhz {
+            80 => [1, center, 0],
+            160 => {
+                let primary80 = if primary_mhz < c.center_mhz {
+                    c.center_mhz - 40
+                } else {
+                    c.center_mhz + 40
+                };
+                [1, ch_of(primary80), center]
+            }
+            _ => [0, 0, 0],
+        };
+        el(192, &[info[0], info[1], info[2], 0xfc, 0xff]);
+    }
+    if c.generation >= 6 {
+        el(255, &[35, 0, 0, 0, 0, 0, 0]);
+        if six {
+            let control = match c.width_mhz {
+                20 => 0,
+                40 => 1,
+                80 => 2,
+                _ => 3,
+            };
+            let (c0, c1) = if c.width_mhz == 160 {
+                let primary80 = if primary_mhz < c.center_mhz {
+                    c.center_mhz - 40
+                } else {
+                    c.center_mhz + 40
+                };
+                (ch_of(primary80), ch_of(c.center_mhz))
+            } else {
+                (ch_of(c.center_mhz), 0)
+            };
+            el(
+                255,
+                &[
+                    36,
+                    0,
+                    0,
+                    0b10,
+                    1,
+                    0xfc,
+                    0xff,
+                    ch_of(primary_mhz),
+                    control,
+                    c0,
+                    c1,
+                    6,
+                ],
+            );
+        } else {
+            el(255, &[36, 0, 0, 0, 1, 0xfc, 0xff]);
+        }
+    }
+    if c.generation >= 7 {
+        el(255, &[108, 0, 0]);
+    }
+    b
 }
 
 fn net(
@@ -47,51 +162,145 @@ fn net(
         security,
         key: key.into(),
         hidden: false,
+        ies: Vec::new(),
     }
+}
+
+/// `n` on channel `c`: its elements written.
+fn on(
+    mut n: LabNetwork,
+    width_mhz: u32,
+    center_mhz: u32,
+    generation: u8,
+    load: Option<(u16, u8)>,
+) -> LabNetwork {
+    n.ies = elements(
+        n.frequency_mhz,
+        LabChannel {
+            width_mhz,
+            center_mhz,
+            generation,
+            load,
+        },
+    );
+    n
 }
 
 /// What a lab radio hears. Two access points of one network on two bands,
 /// a WPA3-only one, a neighbour's, an open one, a hidden one and an
-/// enterprise one (which the router cannot join yet).
+/// enterprise one (which the router cannot join yet); G1.30i: the
+/// neighbours of a block of flats, so the channels have something to show
+/// (2.4 GHz on 1, 4, 6 and 11 with one 40 MHz network, 5 GHz with 80 and
+/// 160 MHz channels that overlap, one 6 GHz network).
 pub fn default_networks() -> Vec<LabNetwork> {
-    let mut hidden = net("Oculta", 6, 5180, -65, BssSecurity::Wpa2, "rede-escondida");
+    let mut hidden = on(
+        net("Oculta", 6, 5180, -65, BssSecurity::Wpa2, "rede-escondida"),
+        20,
+        5180,
+        5,
+        None,
+    );
     hidden.hidden = true;
     vec![
-        net(
-            "CoreRouter-Lab",
-            1,
-            5220,
-            -52,
-            BssSecurity::Wpa2Wpa3,
-            LAB_PASSPHRASE,
+        on(
+            net(
+                "CoreRouter-Lab",
+                1,
+                5220,
+                -52,
+                BssSecurity::Wpa2Wpa3,
+                LAB_PASSPHRASE,
+            ),
+            80,
+            5210,
+            6,
+            Some((4, 38)),
         ),
-        net(
-            "CoreRouter-Lab",
-            2,
+        on(
+            net(
+                "CoreRouter-Lab",
+                2,
+                2437,
+                -61,
+                BssSecurity::Wpa2Wpa3,
+                LAB_PASSPHRASE,
+            ),
+            20,
             2437,
-            -61,
-            BssSecurity::Wpa2Wpa3,
-            LAB_PASSPHRASE,
+            6,
+            Some((2, 51)),
         ),
-        net(
-            "Lab-WPA3",
-            3,
-            5745,
-            -58,
-            BssSecurity::Wpa3,
-            "wpa3-only-pass",
+        on(
+            net(
+                "Lab-WPA3",
+                3,
+                5745,
+                -58,
+                BssSecurity::Wpa3,
+                "wpa3-only-pass",
+            ),
+            80,
+            5775,
+            6,
+            None,
         ),
-        net(
-            "Vizinho_2G",
+        on(
+            net(
+                "Vizinho_2G",
+                4,
+                2462,
+                -78,
+                BssSecurity::Wpa2,
+                "outro-segredo",
+            ),
+            40,
+            2452,
             4,
-            2462,
-            -78,
-            BssSecurity::Wpa2,
-            "outro-segredo",
+            None,
         ),
-        net("Cafe", 5, 2412, -80, BssSecurity::Open, ""),
+        on(
+            net("Cafe", 5, 2412, -80, BssSecurity::Open, ""),
+            20,
+            2412,
+            4,
+            Some((23, 204)),
+        ),
         hidden,
-        net("Corp", 7, 5500, -70, BssSecurity::Enterprise, ""),
+        on(
+            net("Corp", 7, 5500, -70, BssSecurity::Enterprise, ""),
+            160,
+            5570,
+            6,
+            Some((31, 97)),
+        ),
+        on(
+            net("Apto-301", 8, 2427, -69, BssSecurity::Wpa2, "x"),
+            20,
+            2427,
+            4,
+            None,
+        ),
+        on(
+            net("Loja", 9, 2437, -74, BssSecurity::Wpa2, "x"),
+            20,
+            2437,
+            5,
+            Some((7, 120)),
+        ),
+        on(
+            net("Vizinho_5G", 10, 5180, -71, BssSecurity::Wpa2, "x"),
+            80,
+            5210,
+            5,
+            Some((3, 25)),
+        ),
+        on(
+            net("Lab-6E", 11, 6115, -67, BssSecurity::Wpa3, "x"),
+            160,
+            6185,
+            7,
+            Some((1, 8)),
+        ),
     ]
 }
 
@@ -106,6 +315,13 @@ struct Radio {
     scanned: Option<Vec<WifiBss>>,
     scanning: bool,
     joins: u32,
+    /// G1.30i: the survey of the last scan.
+    survey: Vec<WifiSurvey>,
+    /// A spectral scan: the band (`None`: the channel in use), the samples
+    /// left to send, where the sweep is and the random state.
+    spectral: Option<(Option<(u32, u32)>, u64)>,
+    spectral_step: u64,
+    rng: u64,
 }
 
 #[derive(Debug)]
@@ -115,6 +331,8 @@ struct Air {
     country: Option<String>,
     blocked: bool,
     country_calls: u32,
+    /// Radios without spectral scan (a test's).
+    no_spectral: Vec<IfName>,
 }
 
 /// The lab's air: shared by the HAL, its radios and a test that wants to
@@ -130,6 +348,7 @@ impl Default for LabWifi {
             country: None,
             blocked: false,
             country_calls: 0,
+            no_spectral: Vec::new(),
         })))
     }
 }
@@ -162,6 +381,129 @@ fn offers(n: &LabNetwork, want: &WifiNetwork) -> bool {
     named && band && bssid && security
 }
 
+/// The survey a driver that counts every channel (ath9k, ath10k) leaves
+/// after a scan: some 110 ms on each, busy as the networks heard there
+/// make it, plus a little noise; the channel in use with its own long
+/// count.
+fn lab_survey(seen: &[WifiBss], in_use: Option<u32>) -> Vec<WifiSurvey> {
+    let channels = (0..13).map(|i| 2412 + 5 * i).chain([
+        5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320, 5500, 5520, 5540, 5560, 5745, 5765, 5785,
+        5805,
+    ]);
+    channels
+        .map(|mhz| {
+            let busy_share: u64 = seen
+                .iter()
+                .filter(|b| {
+                    let w = b.width_mhz.unwrap_or(20);
+                    let c = b.center_mhz.unwrap_or(b.frequency_mhz);
+                    c.abs_diff(mhz) < (w + 20) / 2
+                })
+                // Stronger and busier networks fill more of the time.
+                .map(|b| {
+                    u64::from(b.utilization.unwrap_or(40)) * 20 / 255
+                        + u64::try_from(b.signal_dbm + 95).unwrap_or(0) / 8
+                })
+                .sum();
+            let active = if in_use == Some(mhz) { 60_000 } else { 110 };
+            let busy = active * (3 + busy_share).min(92) / 100;
+            WifiSurvey {
+                frequency_mhz: mhz,
+                noise_dbm: Some(if mhz < 3000 { -91 } else { -95 }),
+                in_use: in_use == Some(mhz),
+                active_ms: Some(active),
+                busy_ms: Some(busy),
+                rx_ms: Some(busy * 2 / 3),
+                tx_ms: Some(if in_use == Some(mhz) { active / 50 } else { 0 }),
+            }
+        })
+        .collect()
+}
+
+/// xorshift64: the lab's spectrum varies from sample to sample without a
+/// clock or a crate.
+fn next(state: &mut u64) -> u64 {
+    let mut x = (*state).max(1);
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+/// One FFT of the lab's air over `width` MHz around `center`: the networks
+/// that overlap it, each sending in a share of the samples as busy as it
+/// is (an OFDM block 2 MHz narrower than its channel, its signal spread
+/// over its width), and, on 2.4 GHz, a microwave oven (2450–2470 MHz, half
+/// the time), a Bluetooth-like hopper (1 MHz, anywhere, half the samples)
+/// and a continuous carrier at 2417 MHz; on 5 GHz a carrier at 5232
+/// MHz. Written in
+/// ath10k's format and read back by the parser a real radio's goes
+/// through.
+fn lab_fft(
+    networks: &[LabNetwork],
+    center: u32,
+    width: u32,
+    tsf: u64,
+    rng: &mut u64,
+) -> Option<SpectralSample> {
+    let bins = (width as usize * 64 / 20).clamp(64, 256);
+    let span = f64::from(width);
+    let lo = f64::from(center) - span / 2.0;
+    let step = span / bins as f64;
+    let noise = -95.0;
+    let mut mw = vec![0.0f64; bins];
+    let mut add = |from: f64, to: f64, dbm_per_bin: f64| {
+        for (i, p) in mw.iter_mut().enumerate() {
+            let f = lo + step * (i as f64 + 0.5);
+            if f >= from && f <= to {
+                *p += 10f64.powf(dbm_per_bin / 10.0);
+            }
+        }
+    };
+    for n in networks {
+        let op = crate::wifi::ie::parse(&n.ies, n.frequency_mhz);
+        let duty = u64::from(op.utilization.unwrap_or(60)).max(25);
+        if next(rng) % 255 > duty {
+            continue;
+        }
+        let w = f64::from(op.width_mhz);
+        let c = f64::from(op.center_mhz);
+        let per_bin = f64::from(n.signal_dbm) - 10.0 * (w / step).log10();
+        add(c - w / 2.0 + 1.0, c + w / 2.0 - 1.0, per_bin);
+    }
+    if center < 3000 {
+        if next(rng).is_multiple_of(2) {
+            let wander = (next(rng) % 6) as f64;
+            add(2450.0 + wander, 2466.0 + wander, -58.0);
+        }
+        if next(rng).is_multiple_of(2) {
+            let hop = 2402.0 + (next(rng) % 79) as f64;
+            add(hop - 0.5, hop + 0.5, -62.0);
+        }
+        add(2416.8, 2417.2, -70.0);
+    } else {
+        add(5231.8, 5232.2, -72.0);
+    }
+    let dbm: Vec<f64> = mw
+        .iter()
+        .map(|p| {
+            let jitter = (next(rng) % 40) as f64 / 10.0 - 2.0;
+            10.0 * (p + 10f64.powf((noise + jitter) / 10.0)).log10()
+        })
+        .collect();
+    let tlv = encode_ath10k(
+        u16::try_from(center).ok()?,
+        u8::try_from(width).ok()?,
+        -95,
+        tsf,
+        &dbm,
+    );
+    let mut out = Vec::new();
+    parse_stream(&tlv, &mut out, 1);
+    out.pop()
+}
+
 impl Air {
     /// One step of radio `name` towards its network.
     fn step(&mut self, name: &IfName) {
@@ -174,19 +516,24 @@ impl Air {
             r.scanning = false;
             let mut seen: Vec<WifiBss> = networks
                 .iter()
-                .map(|n| WifiBss {
-                    ssid: if n.hidden {
-                        String::new()
-                    } else {
-                        n.ssid.clone()
-                    },
-                    bssid: n.bssid.clone(),
-                    frequency_mhz: n.frequency_mhz,
-                    signal_dbm: n.signal_dbm,
-                    security: n.security,
+                .map(|n| {
+                    WifiBss {
+                        ssid: if n.hidden {
+                            String::new()
+                        } else {
+                            n.ssid.clone()
+                        },
+                        bssid: n.bssid.clone(),
+                        frequency_mhz: n.frequency_mhz,
+                        signal_dbm: n.signal_dbm,
+                        security: n.security,
+                        ..WifiBss::default()
+                    }
+                    .with_elements(&n.ies)
                 })
                 .collect();
             seen.sort_by_key(|b| std::cmp::Reverse(b.signal_dbm));
+            r.survey = lab_survey(&seen, r.on.as_ref().map(|n| n.frequency_mhz));
             r.scanned = Some(seen);
             push(&mut r.events, WifiEvent::ScanDone);
         }
@@ -303,6 +650,7 @@ impl LabWifi {
     }
 
     pub fn radio(&self, name: &IfName) -> Option<WifiRadio> {
+        let spectral = !self.air().no_spectral.contains(name);
         self.has_radio(name).then(|| {
             // G1.30g: a 2x2 Wi-Fi 6 card, the shape of the common laptop ones.
             let ch = |mhz: u32, max: i32, radar: bool| WifiChannel {
@@ -339,6 +687,12 @@ impl LabWifi {
                 antennas_rx: Some(2),
                 tx_power_dbm: Some(20),
                 blocked: None,
+                spectral_scan: spectral,
+                spectral_why_not: (!spectral).then(|| {
+                    "this lab radio has no spectral scan (like a Realtek or MediaTek card): it \
+                     needs a Qualcomm Atheros chip (ath9k, ath10k, ath11k)"
+                        .to_owned()
+                }),
                 monitor: Some(true),
                 monitor_shared: Some(true),
             }
@@ -396,6 +750,11 @@ impl LabWifi {
 
     pub fn add_network(&self, n: LabNetwork) {
         self.air().networks.push(n);
+    }
+
+    /// Radio `name` has no spectral scan (as a Realtek or MediaTek card).
+    pub fn without_spectral(&self, name: &IfName) {
+        self.air().no_spectral.push(name.clone());
     }
 
     /// Block or unblock every radio, as an airplane-mode key does.
@@ -500,14 +859,8 @@ impl WifiPort for LabPort {
             pmf: on.map(|n| matches!(n.security, BssSecurity::Wpa3 | BssSecurity::Wpa2Wpa3)),
             // G1.30g: what a 2x2 Wi-Fi 6 link reads like.
             noise_dbm: on.map(|_| -92),
-            width_mhz: on.map(|n| if n.frequency_mhz > 5000 { 80 } else { 20 }),
-            center_mhz: on.map(|n| {
-                if n.frequency_mhz > 5000 {
-                    n.frequency_mhz + 30
-                } else {
-                    n.frequency_mhz
-                }
-            }),
+            width_mhz: on.map(|n| crate::wifi::ie::parse(&n.ies, n.frequency_mhz).width_mhz),
+            center_mhz: on.map(|n| crate::wifi::ie::parse(&n.ies, n.frequency_mhz).center_mhz),
             generation: on.map(|_| 6),
             cipher: on.map(|n| {
                 if n.security == BssSecurity::Open {
@@ -551,6 +904,87 @@ impl WifiPort for LabPort {
                 }
             }),
         })
+    }
+
+    fn survey(&mut self) -> Vec<WifiSurvey> {
+        self.air
+            .air()
+            .radios
+            .get(&self.name)
+            .map(|r| r.survey.clone())
+            .unwrap_or_default()
+    }
+
+    fn spectral_start(&mut self, secs: u32, range: Option<(u32, u32)>) -> Result<(), HalError> {
+        let mut air = self.air.air();
+        if air.no_spectral.contains(&self.name) {
+            return Err(HalError::Unsupported(
+                "this lab radio has no spectral scan".into(),
+            ));
+        }
+        let Some(r) = air.radios.get_mut(&self.name) else {
+            return Err(HalError::Io(format!("radio '{}' is gone", self.name)));
+        };
+        if range.is_none() && r.on.is_none() {
+            return Err(HalError::Rejected(
+                "not on a channel: connect to a network first, or scan a band".into(),
+            ));
+        }
+        // Some 40 samples a second, as the engine reads them (4 a tick).
+        let secs = u64::from(secs.clamp(1, MAX_SPECTRAL_SECS));
+        r.spectral = Some((range, secs * 40));
+        Ok(())
+    }
+
+    fn spectral_stop(&mut self) {
+        if let Some(r) = self.air.air().radios.get_mut(&self.name) {
+            r.spectral = None;
+        }
+    }
+
+    fn spectral_samples(&mut self, max: usize) -> Vec<SpectralSample> {
+        let mut air = self.air.air();
+        let networks = air.networks.clone();
+        let Some(r) = air.radios.get_mut(&self.name) else {
+            return Vec::new();
+        };
+        let Some((range, left)) = r.spectral else {
+            return Vec::new();
+        };
+        let n = max.min(4).min(usize::try_from(left).unwrap_or(0));
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            r.spectral_step = r.spectral_step.wrapping_add(1);
+            let (center, width) = match (range, r.on.as_ref()) {
+                // A sweep: each channel of the band in turn, 20 MHz around
+                // its centre, as ath9k's `chanscan` hands them while the
+                // radio scans.
+                (Some((lo, hi)), _) => {
+                    let centers: Vec<u32> = (1..=13)
+                        .map(|c| 2407 + 5 * c)
+                        .chain((0..8).map(|k| 5180 + 20 * k))
+                        .chain((0..12).map(|k| 5500 + 20 * k))
+                        .chain((0..5).map(|k| 5745 + 20 * k))
+                        .filter(|f| (lo..=hi).contains(f))
+                        .collect();
+                    let n = centers.len().max(1) as u64;
+                    let k = usize::try_from(r.spectral_step % n).unwrap_or(0);
+                    (centers.get(k).copied().unwrap_or(lo + 10), 20)
+                }
+                (None, Some(on)) => {
+                    let op = crate::wifi::ie::parse(&on.ies, on.frequency_mhz);
+                    (op.center_mhz, op.width_mhz.min(80))
+                }
+                (None, None) => break,
+            };
+            let tsf = r.spectral_step.wrapping_mul(25_000);
+            if let Some(s) = lab_fft(&networks, center, width, tsf, &mut r.rng) {
+                out.push(s);
+            }
+        }
+        let left = left.saturating_sub(n as u64);
+        r.spectral = (left > 0).then_some((range, left));
+        out
     }
 
     fn events(&mut self) -> Vec<WifiEvent> {
@@ -670,6 +1104,21 @@ mod tests {
         assert_eq!(p.events(), [WifiEvent::ScanDone]);
         let seen = p.scan_results().unwrap();
         assert_eq!(seen.len(), default_networks().len());
+        // G1.30i: the channel from the elements, and the survey.
+        let lab5 = seen
+            .iter()
+            .find(|b| b.bssid == "02:c0:fe:00:00:01")
+            .unwrap();
+        assert_eq!(
+            (lab5.width_mhz, lab5.center_mhz, lab5.stations),
+            (Some(80), Some(5210), Some(4))
+        );
+        let six = seen.iter().find(|b| b.ssid == "Lab-6E").unwrap();
+        assert_eq!(
+            (six.width_mhz, six.center_mhz, six.generation),
+            (Some(160), Some(6185), Some(7))
+        );
+        assert!(p.survey().iter().all(|s| s.busy_ms <= s.active_ms));
         assert_eq!(seen[0].ssid, "CoreRouter-Lab");
         assert!(seen.windows(2).all(|w| w[0].signal_dbm >= w[1].signal_dbm));
         assert!(

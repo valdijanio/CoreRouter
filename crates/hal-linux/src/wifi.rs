@@ -150,14 +150,31 @@ pub(crate) fn parse_bss(reply: &str) -> Option<WifiBss> {
         .and_then(|l| l.trim().parse::<i32>().ok())
         .unwrap_or(-100)
         .clamp(-120, 0);
-    Some(WifiBss {
+    let bss = WifiBss {
         ssid: field(reply, "ssid").map(ssid_text).unwrap_or_default(),
         bssid,
         frequency_mhz,
         signal_dbm,
         security: bss_security(field(reply, "flags").unwrap_or("")),
-    })
+        ..WifiBss::default()
+    };
+    // G1.30i: the channel and the load, from the elements.
+    Some(
+        match field(reply, "ie").and_then(corerouter_hal::wifi::ie::from_hex) {
+            Some(ies) => bss.with_elements(&ies),
+            None => bss,
+        },
+    )
 }
+
+/// G1.30i: what `BSS <n>` is asked for (`wpa_ctrl.h`, `WPA_BSS_MASK_*`):
+/// bssid, freq, level, ie, flags, ssid. The default mask has the beacon's
+/// elements as well as the probe response's, and a reply over 4096 bytes
+/// (`ctrl_iface.c`, `reply_size`) comes back empty, which reads as the
+/// end of the list: an access point with many elements cut the scan short.
+pub(crate) const BSS_MASK: u32 = (1 << 1) | (1 << 2) | (1 << 7) | (1 << 10) | (1 << 11) | (1 << 12);
+/// The same without the elements: the fallback for one that does not fit.
+pub(crate) const BSS_MASK_NO_IE: u32 = BSS_MASK & !(1 << 10);
 
 /// A reply to `STATUS`, and to `SIGNAL_POLL` when there is a link.
 pub(crate) fn parse_status(status: &str, signal: Option<&str>) -> WifiStatus {
@@ -514,6 +531,8 @@ pub(crate) fn network_fields(net: &WifiNetwork) -> Option<Vec<(&'static str, Str
     Some(out)
 }
 
+mod spectral;
+
 /// The fields whose value is the key: never in a message.
 pub(crate) const SECRET_FIELDS: [&str; 2] = ["psk", "sae_password"];
 
@@ -533,14 +552,14 @@ mod io {
     use corerouter_hal::HalError;
     use corerouter_hal::oslog::OsSource;
     use corerouter_hal::wifi::{
-        MAX_EVENTS, MAX_SCAN_RESULTS, WifiBss, WifiEvent, WifiFailure, WifiLink, WifiNetwork,
-        WifiPort, WifiRadio, WifiState, WifiStatus,
+        MAX_EVENTS, MAX_SCAN_RESULTS, MAX_SPECTRAL_SECS, SpectralSample, WifiBss, WifiEvent,
+        WifiFailure, WifiLink, WifiNetwork, WifiPort, WifiRadio, WifiState, WifiStatus, WifiSurvey,
     };
     use corerouter_model::IfName;
 
     use super::{
-        MAX_COMMAND, SECRET_FIELDS, firmware_line, network_fields, parse_bss, parse_event,
-        parse_status,
+        BSS_MASK, BSS_MASK_NO_IE, MAX_COMMAND, SECRET_FIELDS, firmware_line, network_fields,
+        parse_bss, parse_event, parse_status,
     };
     use crate::genl::{Genl, Msg};
     use crate::nl80211::Nl80211;
@@ -867,6 +886,27 @@ mod io {
             }
         }
 
+        /// G1.30i: the channels' survey; empty when it cannot be read.
+        fn survey(&mut self) -> Vec<WifiSurvey> {
+            let Ok(ifindex) = nix::net::if_::if_nametoindex(self.name.as_str()) else {
+                return Vec::new();
+            };
+            if self.nl.is_none() {
+                self.nl = Nl80211::open();
+            }
+            let Some(nl) = self.nl.as_mut() else {
+                return Vec::new();
+            };
+            match nl.survey(ifindex) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::debug!("wifi {}: nl80211 survey: {e}", self.name);
+                    self.nl = None;
+                    Vec::new()
+                }
+            }
+        }
+
         fn forget_networks(&self) -> Result<(), HalError> {
             self.cmd.ok("REMOVE_NETWORK all", "REMOVE_NETWORK")
         }
@@ -922,8 +962,20 @@ mod io {
             // one `BSS <n>` per entry is not.
             let mut out = Vec::new();
             for n in 0..MAX_SCAN_RESULTS {
-                let r = self.cmd.request(&format!("BSS {n}"), "BSS")?;
-                match parse_bss(&r) {
+                let r = self
+                    .cmd
+                    .request(&format!("BSS {n} MASK=0x{BSS_MASK:x}"), "BSS")?;
+                let b = match parse_bss(&r) {
+                    Some(b) => Some(b),
+                    // Empty is the end of the list, or an entry too long
+                    // for the reply: asked again without the elements.
+                    None => parse_bss(
+                        &self
+                            .cmd
+                            .request(&format!("BSS {n} MASK=0x{BSS_MASK_NO_IE:x}"), "BSS")?,
+                    ),
+                };
+                match b {
                     Some(b) => out.push(b),
                     None => break,
                 }
@@ -995,6 +1047,8 @@ mod io {
     struct Seen {
         status: WifiStatus,
         scan: Vec<WifiBss>,
+        /// G1.30i: read with each scan's results.
+        survey: Vec<WifiSurvey>,
         events: Vec<WifiEvent>,
         /// The radio could not be opened or stopped answering: the thread
         /// ended. Said by the next `status`.
@@ -1018,6 +1072,9 @@ mod io {
     pub struct LinuxWifiPort {
         orders: mpsc::SyncSender<Order>,
         seen: Arc<Mutex<Seen>>,
+        name: IfName,
+        /// G1.30i: the spectral scan running, if one is.
+        spectral: Option<super::spectral::Run>,
     }
 
     fn seen(s: &Mutex<Seen>) -> std::sync::MutexGuard<'_, Seen> {
@@ -1035,14 +1092,16 @@ mod io {
         fn open_at(name: &IfName, dir: PathBuf, binary: PathBuf) -> Result<Self, HalError> {
             let (orders, rx) = mpsc::sync_channel(MAX_ORDERS);
             let shared = Arc::new(Mutex::new(Seen::default()));
-            let (theirs, name) = (Arc::clone(&shared), name.clone());
+            let (theirs, radio) = (Arc::clone(&shared), name.clone());
             std::thread::Builder::new()
-                .name(format!("wifi-{name}"))
-                .spawn(move || run(&name, dir, &binary, &rx, &theirs))
+                .name(format!("wifi-{radio}"))
+                .spawn(move || run(&radio, dir, &binary, &rx, &theirs))
                 .map_err(|e| HalError::Io(format!("the radio's thread: {e}")))?;
             Ok(Self {
                 orders,
                 seen: shared,
+                name: name.clone(),
+                spectral: None,
             })
         }
 
@@ -1095,6 +1154,46 @@ mod io {
         fn events(&mut self) -> Vec<WifiEvent> {
             std::mem::take(&mut seen(&self.seen).events)
         }
+
+        fn survey(&mut self) -> Vec<WifiSurvey> {
+            seen(&self.seen).survey.clone()
+        }
+
+        fn spectral_start(&mut self, secs: u32, range: Option<(u32, u32)>) -> Result<(), HalError> {
+            let r = radio(&self.name)
+                .ok_or_else(|| HalError::Io(format!("'{}' is not a Wi-Fi radio", self.name)))?;
+            let dir = spectral_dir(&r).map_err(HalError::Unsupported)?;
+            self.spectral = None;
+            let secs = secs.clamp(1, MAX_SPECTRAL_SECS);
+            self.spectral = Some(super::spectral::Run::start(
+                self.name.as_str(),
+                &dir,
+                secs,
+                range.is_some(),
+            )?);
+            Ok(())
+        }
+
+        fn spectral_stop(&mut self) {
+            self.spectral = None;
+        }
+
+        fn spectral_samples(&mut self, max: usize) -> Vec<SpectralSample> {
+            let Some(run) = &self.spectral else {
+                return Vec::new();
+            };
+            let out = run.take(max);
+            if out.is_empty() && run.finished() {
+                self.spectral = None;
+            }
+            out
+        }
+    }
+
+    /// The debugfs directory of the radio's spectral scan, or why not.
+    fn spectral_dir(r: &WifiRadio) -> Result<PathBuf, String> {
+        let phy = Path::new("/sys/kernel/debug/ieee80211").join(r.phy.as_deref().unwrap_or("phy0"));
+        super::spectral::support(r.driver.as_deref(), &phy, |p| p.exists())
     }
 
     /// The lock a radio's thread holds while it lives, by the radio's name.
@@ -1159,6 +1258,8 @@ mod io {
             } else {
                 None
             };
+            // G1.30i: what the scan counted on each channel.
+            let survey = heard.then(|| port.survey());
             let due = status_at.is_none_or(|t| t.elapsed() >= STATUS_EVERY);
             let status = if due || !events.is_empty() {
                 status_at = Some(Instant::now());
@@ -1178,6 +1279,9 @@ mod io {
             let mut s = seen(shared);
             if let Some(scan) = scan {
                 s.scan = scan;
+            }
+            if let Some(survey) = survey {
+                s.survey = survey;
             }
             if let Some(st) = status {
                 s.status = st;
@@ -1297,6 +1401,10 @@ mod io {
             .and_then(|p| rfkill(&Path::new("/sys/class/ieee80211").join(p)));
         let device = link_name(&dev.join("device"));
         r.firmware = firmware(device.as_deref(), driver.as_deref());
+        match spectral_dir(&r) {
+            Ok(_) => r.spectral_scan = true,
+            Err(why) => r.spectral_why_not = Some(why),
+        }
         Some(r)
     }
 
@@ -1446,7 +1554,11 @@ mod io {
                                 (false, "ADD_NETWORK") => "0\n".into(),
                                 (false, "STATUS") => "wpa_state=COMPLETED\nbssid=d8:47:32:aa:bb:cc\nfreq=5220\nssid=Casa\nwifi_generation=5\npairwise_cipher=CCMP\nkey_mgmt=SAE\npmf=2\n".into(),
                                 (false, "SIGNAL_POLL") => "RSSI=-52\nLINKSPEED=866\nNOISE=-91\nFREQUENCY=5220\nWIDTH=80 MHz\nCENTER_FRQ1=5210\n".into(),
-                                (false, "BSS") if cmd == "BSS 0" => "bssid=d8:47:32:aa:bb:cc\nfreq=5220\nlevel=-52\nflags=[WPA2-SAE-CCMP]\nssid=Casa\n".into(),
+                                (false, "BSS") if cmd == "BSS 0 MASK=0x1c86" => "bssid=d8:47:32:aa:bb:cc\nfreq=5220\nlevel=-52\nie=0b0503001a0000c005012a00fcff\nflags=[WPA2-SAE-CCMP]\nssid=Casa\n".into(),
+                                // G1.30i: an entry too long for the reply
+                                // comes back empty; without the elements it
+                                // fits.
+                                (false, "BSS") if cmd == "BSS 1 MASK=0x1886" => "bssid=d8:47:32:aa:bb:cd\nfreq=2412\nlevel=-70\nflags=[WPA2-PSK-CCMP]\nssid=Longo\n".into(),
                                 (false, "BSS") => String::new(),
                                 (false, "SET_NETWORK") if cmd.contains(" bssid ") => "FAIL\n".into(),
                                 (false, "SELECT_NETWORK") => {
@@ -1560,8 +1672,27 @@ mod io {
             assert_eq!(st.link, None);
             port.scan().unwrap();
             let heard = port.scan_results().unwrap();
-            assert_eq!(heard.len(), 1);
+            assert_eq!(heard.len(), 2, "{heard:?}");
             assert_eq!(heard[0].ssid, "Casa");
+            // G1.30i: the elements read (VHT 80 at ch 42, BSS Load 3
+            // stations, 26/255 busy); the one without them is 20 MHz.
+            assert_eq!(
+                (
+                    heard[0].width_mhz,
+                    heard[0].center_mhz,
+                    heard[0].stations,
+                    heard[0].utilization
+                ),
+                (Some(80), Some(5210), Some(3), Some(26))
+            );
+            assert_eq!(
+                (heard[1].ssid.as_str(), heard[1].width_mhz),
+                ("Longo", None)
+            );
+            assert!(
+                seen.try_iter().any(|c| c == "BSS 2 MASK=0x1886"),
+                "the end, asked twice"
+            );
 
             // A field the supplicant refuses: the error names the field,
             // and a refused passphrase would say "the passphrase", not it.

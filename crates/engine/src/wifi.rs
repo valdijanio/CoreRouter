@@ -14,8 +14,8 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use corerouter_hal::wifi::{
-    JoinSecurity, WifiBss, WifiEvent, WifiFailure, WifiNetwork, WifiPort, WifiRadio, WifiState,
-    WifiStatus,
+    JoinSecurity, MAX_SPECTRAL_PENDING, WifiBss, WifiEvent, WifiFailure, WifiNetwork, WifiPort,
+    WifiRadio, WifiState, WifiStatus, WifiSurvey,
 };
 use corerouter_model::wifi::{Country, WifiSecurity, WifiStation};
 use corerouter_model::{Config, IfName, InterfaceKind};
@@ -95,6 +95,10 @@ pub(crate) struct Radio {
     pub(crate) scan_started_ms: Option<u64>,
     pub(crate) scan_error: Option<String>,
     pub(crate) hardware: Option<WifiRadio>,
+    /// G1.30i: the channels' survey as of the last scan.
+    pub(crate) survey: Vec<WifiSurvey>,
+    /// G1.30i: the last spectral scan, running or not.
+    pub(crate) spectrum: Option<crate::wifi_spectrum::Spectrum>,
 }
 
 /// The session's radios.
@@ -132,6 +136,36 @@ fn wanted(cfg: &Config) -> Vec<(IfName, bool, Option<WifiStation>)> {
         })
         .take(MAX_RADIOS)
         .collect()
+}
+
+/// How often a sweep asks the radio for a scan, ms: each scan visits every
+/// channel once (some 3 s for both bands), and the spectral samples come
+/// while it does.
+const SWEEP_SCAN_MS: u64 = 4_000;
+
+/// G1.30i: one tick of a radio's spectral scan: the samples into this
+/// tick's row, the scans of a sweep, the end when its time is up.
+fn spectral_step(r: &mut Radio, now: u64) {
+    let (Some(sp), Some(p)) = (r.spectrum.as_mut(), r.port.as_mut()) else {
+        return;
+    };
+    let Some(until) = sp.until_ms else {
+        return;
+    };
+    let samples = p.spectral_samples(MAX_SPECTRAL_PENDING);
+    sp.feed(&samples);
+    sp.end_frame();
+    if now >= until {
+        p.spectral_stop();
+        sp.until_ms = None;
+        return;
+    }
+    if sp.range.band().is_some() && now >= sp.next_scan_ms && r.scan_started_ms.is_none() {
+        sp.next_scan_ms = now.saturating_add(SWEEP_SCAN_MS);
+        if p.scan().is_ok() {
+            r.scan_started_ms = Some(now);
+        }
+    }
 }
 
 /// A Wi-Fi channel number from its centre frequency.
@@ -244,6 +278,9 @@ impl Session {
                 r.connected_since_ms = None;
                 r.error = None;
                 r.scan_started_ms = None;
+                if let Some(sp) = r.spectrum.as_mut() {
+                    sp.until_ms = None;
+                }
             }
             r.port.is_some()
         };
@@ -388,6 +425,7 @@ impl Session {
                             Some(Ok(seen)) => {
                                 r.scan = seen;
                                 r.scanned_at = unix;
+                                r.survey = r.port.as_mut().map(|p| p.survey()).unwrap_or_default();
                             }
                             Some(Err(e)) => r.scan_error = Some(e.to_string()),
                             None => {}
@@ -410,6 +448,7 @@ impl Session {
                     WifiEvent::Blocked(false) => notes.push(("unblocked", "the radio is unblocked".into())),
                 }
             }
+            spectral_step(r, now);
             if r.scan_started_ms.is_some_and(|t| now.saturating_sub(t) > SCAN_TIMEOUT_MS) {
                 r.scan_started_ms = None;
                 r.scan_error = Some("the scan did not end".into());
@@ -522,6 +561,43 @@ impl Session {
         r.scan_started_ms = Some(now);
         r.scan_error = None;
         Ok(())
+    }
+
+    /// G1.30i: start a spectral scan of `range` on radio `name` for `secs`.
+    pub(crate) fn wifi_spectral_start(
+        &mut self,
+        name: &IfName,
+        range: crate::wifi_spectrum::Range,
+        secs: u32,
+    ) -> Result<(), String> {
+        let now = self.wifi().map_or(0, |rt| rt.now_ms);
+        let Some(r) = self.wifi_rt().and_then(|rt| rt.radios.get_mut(name)) else {
+            return Err(format!("'{name}' has no radio running yet"));
+        };
+        let Some(p) = r.port.as_mut() else {
+            return Err(r.error.clone().unwrap_or_else(|| {
+                format!("the radio of '{name}' is not open yet: try again in a moment")
+            }));
+        };
+        p.spectral_stop();
+        p.spectral_start(secs, range.band()).map_err(|e| e.to_string())?;
+        r.spectrum = Some(crate::wifi_spectrum::Spectrum::new(
+            range,
+            now.saturating_add(u64::from(secs) * 1000),
+        ));
+        Ok(())
+    }
+
+    /// G1.30i: stop the spectral scan of radio `name` (its data stays).
+    pub(crate) fn wifi_spectral_stop(&mut self, name: &IfName) {
+        if let Some(r) = self.wifi_rt().and_then(|rt| rt.radios.get_mut(name)) {
+            if let Some(p) = r.port.as_mut() {
+                p.spectral_stop();
+            }
+            if let Some(sp) = r.spectrum.as_mut() {
+                sp.until_ms = None;
+            }
+        }
     }
 
     /// Leave and join again, forgetting the last failure.

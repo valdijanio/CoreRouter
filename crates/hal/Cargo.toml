@@ -37,5 +37,9 @@ harness = false
 name = "mpls_icmp"
 harness = false
 
+[[bench]]
+name = "wifi_ie"
+harness = false
+
 [lints]
 workspace = true

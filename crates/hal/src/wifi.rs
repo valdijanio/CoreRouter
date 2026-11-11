@@ -13,6 +13,11 @@ use serde::Serialize;
 
 use crate::HalError;
 
+pub mod ie;
+pub mod spectral;
+
+pub use spectral::SpectralSample;
+
 /// How a network is secured, as the station is told to join it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinSecurity {
@@ -54,9 +59,10 @@ impl std::fmt::Debug for WifiNetwork {
 }
 
 /// What a network in range offers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BssSecurity {
+    #[default]
     Open,
     /// Opportunistic encryption without a passphrase (RFC 8110).
     Owe,
@@ -85,14 +91,63 @@ impl BssSecurity {
 }
 
 /// One access point a scan heard.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct WifiBss {
     /// Empty: the network hides its name.
     pub ssid: String,
     pub bssid: String,
+    /// The primary channel.
     pub frequency_mhz: u32,
     pub signal_dbm: i32,
     pub security: BssSecurity,
+    /// G1.30i, from its elements ([`ie::parse`]): the width of the whole
+    /// channel, MHz; `None` when the elements were not read.
+    pub width_mhz: Option<u32>,
+    /// Centre of the whole channel (of the first segment of 80+80), MHz.
+    pub center_mhz: Option<u32>,
+    /// The second 80 MHz segment of an 80+80 channel.
+    pub center2_mhz: Option<u32>,
+    /// 4 (802.11n), 5 (ac), 6 (ax), 7 (be).
+    pub generation: Option<u8>,
+    /// BSS Load: stations associated with it.
+    pub stations: Option<u16>,
+    /// BSS Load: share of time it found the channel busy, 0..=255.
+    pub utilization: Option<u8>,
+}
+
+impl WifiBss {
+    /// Fill the channel and load fields from the elements `ies`.
+    pub fn with_elements(mut self, ies: &[u8]) -> Self {
+        let op = ie::parse(ies, self.frequency_mhz);
+        self.width_mhz = Some(op.width_mhz);
+        self.center_mhz = Some(op.center_mhz);
+        self.center2_mhz = op.center2_mhz;
+        self.generation = op.generation;
+        self.stations = op.stations;
+        self.utilization = op.utilization;
+        self
+    }
+}
+
+/// How busy one channel was, as the driver counted it (nl80211 survey,
+/// `NL80211_CMD_GET_SURVEY`). The times add up since the driver began
+/// counting; many drivers fill only the channel in use, and leave the
+/// others at zero or out (measured on mt7925e: only the one in use).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct WifiSurvey {
+    pub frequency_mhz: u32,
+    /// The noise floor, dBm.
+    pub noise_dbm: Option<i32>,
+    /// The radio is on this channel now.
+    pub in_use: bool,
+    /// Time the radio listened here, ms.
+    pub active_ms: Option<u64>,
+    /// Of it, time the channel was busy (anybody sending, or noise above
+    /// the energy-detect level), ms.
+    pub busy_ms: Option<u64>,
+    /// Of it, receiving and sending, ms.
+    pub rx_ms: Option<u64>,
+    pub tx_ms: Option<u64>,
 }
 
 /// Where a radio is on its way to a network.
@@ -267,6 +322,13 @@ pub enum WifiEvent {
 /// Bounds on what a platform hands back (a scan in a dense place).
 pub const MAX_SCAN_RESULTS: usize = 256;
 pub const MAX_EVENTS: usize = 64;
+/// Channels of a survey at most (2.4, 5 and 6 GHz have some 100).
+pub const MAX_SURVEY: usize = 256;
+/// Spectral samples a platform keeps for the engine's next read; the
+/// older ones are dropped (a radio sends thousands a second).
+pub const MAX_SPECTRAL_PENDING: usize = 4096;
+/// The longest spectral scan, s.
+pub const MAX_SPECTRAL_SECS: u32 = 600;
 
 /// One radio. Calls return at once: joining a network takes seconds, and
 /// its outcome comes through [`events`](Self::events) and
@@ -286,6 +348,29 @@ pub trait WifiPort: Send {
     /// What happened since the last call, oldest first, at most
     /// [`MAX_EVENTS`].
     fn events(&mut self) -> Vec<WifiEvent>;
+    /// G1.30i: the channels' survey as of the last scan, at most
+    /// [`MAX_SURVEY`]. Empty: the driver gives none.
+    fn survey(&mut self) -> Vec<WifiSurvey> {
+        Vec::new()
+    }
+    /// G1.30i: start a spectral scan for `secs` seconds (at most
+    /// [`MAX_SPECTRAL_SECS`]): of the channel in use (`range` `None`), or
+    /// of the channels of `range` (MHz) the radio visits while it scans
+    /// (the engine asks for the scans). Only on radios with
+    /// [`WifiRadio::spectral_scan`].
+    fn spectral_start(&mut self, secs: u32, range: Option<(u32, u32)>) -> Result<(), HalError> {
+        let _ = (secs, range);
+        Err(HalError::Unsupported(
+            "this radio has no spectral scan".into(),
+        ))
+    }
+    /// Stop the spectral scan now.
+    fn spectral_stop(&mut self) {}
+    /// The samples since the last call, oldest first, at most `max`.
+    fn spectral_samples(&mut self, max: usize) -> Vec<SpectralSample> {
+        let _ = max;
+        Vec::new()
+    }
 }
 
 /// What a platform knows about a radio's hardware.
@@ -311,6 +396,11 @@ pub struct WifiRadio {
     /// Off by a switch or key: `soft` (rfkill in software), `hard` (a
     /// physical switch); `None`: free (or not known).
     pub blocked: Option<String>,
+    /// G1.30i: the radio hands over FFT samples (Qualcomm Atheros:
+    /// ath9k, ath10k, ath11k, through debugfs).
+    pub spectral_scan: bool,
+    /// Why not, in words, when it does not.
+    pub spectral_why_not: Option<String>,
     /// G1.30j: the driver offers monitor mode (`None`: not known).
     pub monitor: Option<bool>,
     /// G1.30j: a monitor interface runs beside the station, which stays
