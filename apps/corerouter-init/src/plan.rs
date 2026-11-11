@@ -114,25 +114,48 @@ pub fn mem_total_kib(meminfo: &str) -> Option<u64> {
         .ok()
 }
 
-/// The commands that give every port of the live image a DHCP client
-/// (G1.6y): client only, a route of low preference per port (the first one
-/// wins while it has a lease), and a name the network's operator recognizes.
-pub fn live_dhcp_commands(ports: &[String]) -> Vec<(&'static str, serde_json::Value)> {
-    ports
-        .iter()
-        .enumerate()
-        .flat_map(|(i, port)| live_dhcp_port(port, i))
-        .collect()
-}
-
-/// [`live_dhcp_commands`] for one port, the `i`-th of the machine.
-pub fn live_dhcp_port(port: &str, i: usize) -> [(&'static str, serde_json::Value); 2] {
-    [
-        (
+/// What one port of the live image still needs to get an address by DHCP
+/// (G1.6y): in the configuration, enabled, with a client (client only, a
+/// route of low preference per port, so the first one wins while it has a
+/// lease, and a name the network's operator recognizes). `i`: the port's
+/// place among the machine's.
+///
+/// G1.6ze: decided from what the daemon lists (`interface.list`,
+/// `ip.dhcp-client.list`), never by trying. A card plugged in is in the
+/// configuration only seconds later (the daemon adopts a port after it kept
+/// its name for three polls), and the `interface.set` sent meanwhile left ten
+/// error lines in the router's log; PID 1 has just named the port, so it
+/// adopts it itself. A port plugged in again has its client already.
+/// `None`: the daemon does not list the port yet.
+pub fn live_port_commands(
+    port: &str,
+    i: usize,
+    interfaces: &serde_json::Value,
+    clients: &serde_json::Value,
+) -> Option<Vec<(&'static str, serde_json::Value)>> {
+    let named = |v: &serde_json::Value, key: &str| v.get(key).and_then(|n| n.as_str()) == Some(port);
+    let row = interfaces.as_array()?.iter().find(|r| named(r, "name"))?;
+    let mut out = Vec::new();
+    // A row of the platform, not of the configuration (`managed: false`):
+    // adopted with the kernel's state, down for a card just plugged in.
+    let adopted = row.get("managed").and_then(serde_json::Value::as_bool) == Some(true);
+    if !adopted {
+        out.push((
+            "interface.ethernet.adopt",
+            serde_json::json!({"name": port}),
+        ));
+    }
+    if !adopted || row.get("disabled").and_then(serde_json::Value::as_bool) != Some(false) {
+        out.push((
             "interface.set",
             serde_json::json!({"name": port, "disabled": false}),
-        ),
-        (
+        ));
+    }
+    let has_client = clients
+        .as_array()
+        .is_some_and(|c| c.iter().any(|c| named(c, "interface")));
+    if !has_client {
+        out.push((
             "ip.dhcp-client.add",
             serde_json::json!({
                 "interface": port,
@@ -140,8 +163,9 @@ pub fn live_dhcp_port(port: &str, i: usize) -> [(&'static str, serde_json::Value
                 "default_route_distance": 200 + i.min(50),
                 "comment": "live image",
             }),
-        ),
-    ]
+        ));
+    }
+    Some(out)
 }
 
 /// `ether3` → 2, the route preference of its DHCP client.
@@ -705,16 +729,68 @@ mod tests {
         );
         assert_eq!(mem_total_kib("garbage"), None);
         assert_eq!(mem_total_kib("MemTotal: x kB"), None);
-        let c = live_dhcp_commands(&["ether1".into(), "ether2".into()]);
-        assert_eq!(c.len(), 4);
-        assert_eq!(c[0].0, "interface.set");
+        // A port seeded at boot, disabled (found down), no client yet.
+        let ifaces = serde_json::json!([
+            {"name": "lo", "managed": true, "disabled": false},
+            {"name": "ether1", "managed": true, "disabled": true},
+            {"name": "ether2", "managed": true, "disabled": true},
+        ]);
+        let none = serde_json::json!([]);
+        let c = live_port_commands("ether1", 0, &ifaces, &none).unwrap();
+        let ids: Vec<&str> = c.iter().map(|x| x.0).collect();
+        assert_eq!(ids, ["interface.set", "ip.dhcp-client.add"]);
+        assert_eq!(c[0].1, serde_json::json!({"name": "ether1", "disabled": false}));
         assert_eq!(c[1].1["interface"], "ether1");
         assert_eq!(c[1].1["default_route_distance"], 200);
-        assert_eq!(c[3].1["default_route_distance"], 201);
+        let c = live_port_commands("ether2", 1, &ifaces, &none).unwrap();
+        assert_eq!(c[1].1["default_route_distance"], 201);
         // Far more ports than a distance can tell apart: still a valid one.
-        let many: Vec<String> = (0..1024).map(|i| format!("ether{i}")).collect();
-        let last = live_dhcp_commands(&many);
-        assert_eq!(last.last().unwrap().1["default_route_distance"], 250);
+        let c = live_port_commands("ether2", 1023, &ifaces, &none).unwrap();
+        assert_eq!(c[1].1["default_route_distance"], 250);
+    }
+
+    /// G1.6ze: the notebook's log had ten `interface.set` refused ("no
+    /// interface 'ether2'") between the USB adapter's name and its adoption.
+    /// Nothing is sent that the daemon would refuse.
+    #[test]
+    fn a_port_plugged_into_the_live_image_is_adopted_before_anything_is_set() {
+        let ids = |c: &[(&'static str, serde_json::Value)]| -> Vec<&'static str> {
+            c.iter().map(|x| x.0).collect()
+        };
+        let none = serde_json::json!([]);
+        // Named by PID 1, not listed by the daemon yet: wait, send nothing.
+        let before = serde_json::json!([{"name": "ether1", "managed": true, "disabled": false}]);
+        assert!(live_port_commands("ether2", 1, &before, &none).is_none());
+        // Garbage instead of a list: the same.
+        for bad in [serde_json::json!(null), serde_json::json!({"name": "ether2"})] {
+            assert!(live_port_commands("ether2", 1, &bad, &none).is_none());
+        }
+        // Listed as the platform's (not adopted): adoption first.
+        let plugged = serde_json::json!([
+            {"name": "ether1", "managed": true, "disabled": false},
+            {"name": "ether2", "managed": false, "disabled": false,
+             "unmanaged_reason": "not in the configuration (appeared after boot)"},
+        ]);
+        let c = live_port_commands("ether2", 1, &plugged, &none).unwrap();
+        assert_eq!(
+            ids(&c),
+            ["interface.ethernet.adopt", "interface.set", "ip.dhcp-client.add"]
+        );
+        assert_eq!(c[0].1, serde_json::json!({"name": "ether2"}));
+        // The daemon adopted it first (its tick): only what is missing.
+        let adopted = serde_json::json!([{"name": "ether2", "managed": true, "disabled": true}]);
+        let c = live_port_commands("ether2", 1, &adopted, &none).unwrap();
+        assert_eq!(ids(&c), ["interface.set", "ip.dhcp-client.add"]);
+        // Plugged in again: in the configuration, enabled, its client kept.
+        let again = serde_json::json!([{"name": "ether2", "managed": true, "disabled": false}]);
+        let client = serde_json::json!([{"id": "*1", "interface": "ether2"}]);
+        assert!(live_port_commands("ether2", 1, &again, &client).unwrap().is_empty());
+        // Another port's client is not this one's.
+        let other = serde_json::json!([{"id": "*1", "interface": "ether1"}]);
+        assert_eq!(
+            ids(&live_port_commands("ether2", 1, &again, &other).unwrap()),
+            ["ip.dhcp-client.add"]
+        );
     }
 
     #[test]
@@ -877,9 +953,5 @@ mod tests {
         assert_eq!(port_index("ether0"), 0);
         assert_eq!(port_index("eth2"), 0);
         assert_eq!(port_index("ether999999999999999999999"), 0);
-        let all = live_dhcp_commands(&["ether1".to_owned(), "ether2".to_owned()]);
-        let late = live_dhcp_port("ether2", port_index("ether2"));
-        assert_eq!(all[2], late[0]);
-        assert_eq!(all[3], late[1]);
     }
 }
