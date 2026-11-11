@@ -298,6 +298,9 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
             "security=wpa2 never uses WPA3, even if the access point offers it; auto does".into(),
         );
     }
+    if let Some(w) = heard_unjoinable(s, &name, &st) {
+        warnings.push(w);
+    }
     let cfg = s.store_mut().candidate_mut();
     let Some(iface) = cfg.interfaces.get_mut(&name) else {
         return Err(EngineError::bad("name", format!("no Wi-Fi interface '{name}'")));
@@ -611,6 +614,39 @@ fn joinable(sec: BssSecurity) -> Option<&'static str> {
             Some("802.1X (a user and password, or a certificate) is not supported yet")
         }
     }
+}
+
+/// The last scan heard `st`'s network only in a form the router does not
+/// join (802.1X, OWE, WEP or TKIP): say so when it is configured. The
+/// supplicant skips such an access point, so the join itself only ends as
+/// "not found", minutes later. A warning and not a refusal: a scan is old
+/// by the time it is read, and the network may have changed since.
+fn heard_unjoinable(s: &Session, name: &IfName, st: &WifiStation) -> Option<String> {
+    if st.ssid.is_empty() {
+        return None;
+    }
+    let only = st.bssid.map(|b| b.to_string());
+    // `joinable` says `None` for an access point the router can join, and
+    // one of those is enough to say nothing: the `?` on the collection.
+    let reasons: Vec<&str> = s
+        .wifi()?
+        .radios
+        .get(name)?
+        .scan
+        .iter()
+        .filter(|b| {
+            b.ssid == st.ssid
+                && only
+                    .as_deref()
+                    .is_none_or(|o| o.eq_ignore_ascii_case(&b.bssid))
+        })
+        .map(|b| joinable(b.security))
+        .collect::<Option<_>>()?;
+    let why = reasons.first()?;
+    Some(format!(
+        "the last scan heard '{}' only as a network the router does not join: {why}",
+        st.ssid
+    ))
 }
 
 fn networks(s: &mut Session, p: &Value) -> Result<Value> {

@@ -176,7 +176,9 @@ com `security=wpa2` (o SAE precisa da frase).
 - **Rádio em bridge:** uma estação leva três endereços no quadro e só o próprio MAC atravessa
   o AP; o kernel também recusa (`IFF_DONT_BRIDGE`). A mensagem diz para rotear.
 - **Rede 802.1X, OWE, WEP ou só WPA/TKIP:** aparecem na varredura com `joinable: false` e o
-  motivo.
+  motivo. Digitada à mão (CLI, MCP, modal), o `interface.wifi.set` e o preview avisam quando a
+  última varredura só a ouviu assim (aviso, não recusa: a varredura pode estar velha). Sem o
+  aviso a entrada só terminava em `not-found`, porque o supplicant pula esse ponto de acesso.
 
 ### Como roda
 

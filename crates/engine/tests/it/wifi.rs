@@ -880,3 +880,95 @@ fn the_preview_says_what_set_would_do_and_changes_nothing() {
         "{p}"
     );
 }
+
+/// A network typed by hand (CLI, MCP) that the last scan heard only as one
+/// the router does not join: `set` and the preview say so. Without it the
+/// join only ended as "not found".
+#[test]
+fn a_network_the_router_does_not_join_is_warned_about_when_typed_by_hand() {
+    let (mut s, _air) = lab();
+    run(
+        &mut s,
+        "interface.wifi.country.set",
+        json!({"country": "BR"}),
+    );
+    let corp = json!({"name": "wifi1", "ssid": "Corp", "passphrase": "12345678"});
+    let said = |v: &Value| {
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("802.1X"))
+    };
+    // No scan yet: nothing is known about it, nothing is said.
+    let r = run(&mut s, "interface.wifi.set", corp.clone());
+    assert!(!said(&r), "{r}");
+    run(
+        &mut s,
+        "interface.wifi.set",
+        json!({"name": "wifi1", "ssid": ""}),
+    );
+
+    run(&mut s, "interface.wifi.enable", json!({"name": "wifi1"}));
+    let ms = spin(&mut s, 0);
+    run(&mut s, "interface.wifi.scan", json!({"name": "wifi1"}));
+    spin(&mut s, ms);
+    // Heard as 802.1X only: a warning with the reason, and the set still
+    // goes in (the scan may be old).
+    let r = run(&mut s, "interface.wifi.set", corp);
+    assert!(said(&r), "{r}");
+    assert!(r["warnings"][0].as_str().unwrap().contains("'Corp'"), "{r}");
+    assert_eq!(
+        run(&mut s, "interface.wifi.list", json!({}))[0]["ssid"],
+        "Corp"
+    );
+    // The preview carries it as a check.
+    let p = run(
+        &mut s,
+        "interface.wifi.preview",
+        json!({"id": "wifi1", "ssid": "Corp", "passphrase": "12345678"}),
+    );
+    assert!(
+        p["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["level"] == "warning" && c["message"].as_str().unwrap().contains("802.1X")),
+        "{p}"
+    );
+    // A network it can join, and one the scan did not hear: no such warning.
+    for ssid in ["CoreRouter-Lab", "Nao-Existe"] {
+        let r = run(
+            &mut s,
+            "interface.wifi.set",
+            json!({"name": "wifi1", "ssid": ssid, "passphrase": LAB_PASSPHRASE}),
+        );
+        assert!(
+            !r["warnings"].to_string().contains("does not join"),
+            "{ssid}: {r}"
+        );
+    }
+    // Locked to one access point: only that one counts.
+    let nets = run(&mut s, "interface.wifi.networks", json!({"name": "wifi1"}));
+    let bssid = nets["networks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["ssid"] == "Corp")
+        .unwrap()["bssid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let r = run(
+        &mut s,
+        "interface.wifi.set",
+        json!({"name": "wifi1", "ssid": "Corp", "passphrase": "12345678", "bssid": bssid}),
+    );
+    assert!(said(&r), "{r}");
+    let r = run(
+        &mut s,
+        "interface.wifi.set",
+        json!({"name": "wifi1", "ssid": "Corp", "bssid": "02:00:00:00:00:99"}),
+    );
+    assert!(!said(&r), "{r}");
+}
