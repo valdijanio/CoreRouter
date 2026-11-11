@@ -339,3 +339,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-11-10 — G4.2i criado e feito (pool em uso com PPP; Pool fora do grupo DHCP do menu)
 - 2026-11-10 — G4.7 feito (as três partes entraram; a linha guarda-chuva estava desatualizada)
 - 2026-11-10 — G1.29h criado e feito (r8152 como módulo: o firmware rtl_nic do RTL8153 carrega no boot)
+- 2026-11-11 — G1.6zc criado e feito (console de tela num boot UEFI: simpledrm + fbcon)
