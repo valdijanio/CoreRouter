@@ -680,14 +680,19 @@ pub fn describe(p: &Nic) -> String {
     format!("{} ({}, {})", p.name, p.link.phrase(), p.mac)
 }
 
+/// The first words of the setup.
+fn intro() -> String {
+    format!(
+        "\n{}\n  An empty answer cancels. Nothing changes before the last question.",
+        title("First-boot setup")
+    )
+}
+
 /// The questions, a summary, then the commands. `Ok(None)`: cancelled.
 fn ask_and_apply(con: &Console) -> Result<Option<String>, String> {
     const STEPS: usize = 4;
     let nics = nics();
-    con.say(&format!(
-        "\n{}\n  An empty answer cancels. Nothing changes before the last question.",
-        title("First-boot setup")
-    ));
+    con.say(&intro());
     con.say(&style::step(1, STEPS, "Management port"));
     if nics.is_empty() {
         con.say("  No Ethernet port found: type the port's name.");
@@ -915,7 +920,7 @@ mod tests {
         );
         let t = style::render(&nic_table(&p, false), false);
         assert!(
-            t.contains("\n  ether2           up     52:54:00:00:00:02"),
+            t.contains("\n   ether2           up     52:54:00:00:00:02"),
             "{t}"
         );
     }
@@ -1049,11 +1054,11 @@ mod tests {
         let plain: Vec<String> = lines.iter().map(|l| style::render(l, false)).collect();
         assert_eq!(
             plain[3],
-            "  Cert  SHA256:B9:4D:27:B9:93:4D:3E:08:A5:2E:52:D7:DA:7D:AB:FA:"
+            "   Cert  SHA256:B9:4D:27:B9:93:4D:3E:08:A5:2E:52:D7:DA:7D:AB:FA:"
         );
         assert_eq!(
             plain[4],
-            "        C4:84:EF:E3:7A:53:80:EE:90:88:F7:AC:E2:EF:CD:E9"
+            "         C4:84:EF:E3:7A:53:80:EE:90:88:F7:AC:E2:EF:CD:E9"
         );
     }
 
@@ -1090,6 +1095,7 @@ mod tests {
         let t = style::render(&t, false);
         assert!(t.contains("the empty one works from the network"), "{t}");
         assert!(!t.contains("refused"), "{t}");
+        check("intro", &intro());
         let t = no_password_yet();
         check("no password yet", &t);
         assert!(t.contains("empty password") && t.contains("set one"));

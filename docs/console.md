@@ -22,9 +22,11 @@ O código fica em `apps/corerouter-init/src/`: `style.rs` (estilos, cor, largura
    e o VT do Linux (`drivers/tty/vt/vt.c`, `csi_m` não tem `default:`).
 2. **Só ASCII** no texto do init. A serial pode não ser UTF-8, e a fonte do kernel é CP437. (O
    VT do 6.18 troca o glifo que falta por um parecido, `ucs_get_fallback()`; a serial não.)
-3. **No máximo 78 colunas** (`style::WIDTH`): nada quebra no meio da palavra numa tela de 80
-   colunas, e sobra a última coluna, onde alguns terminais de serial já pulam de linha. Texto
-   de fora (erro do daemon, modelo do disco) é quebrado nos espaços ou cortado com `~`.
+3. **No máximo 78 colunas, depois de uma margem de 1** (`style::WIDTH`, `style::MARGIN`): nada
+   quebra no meio da palavra numa tela de 80 colunas. A coluna 0 fica vazia (monitor com
+   overscan e alguns consoles de serial a cortam: o cabeçalho perdia a primeira letra) e a
+   última também (alguns terminais de serial já pulam de linha ao escrever nela). Texto de fora
+   (erro do daemon, modelo do disco) é quebrado nos espaços ou cortado com `~`.
 4. **Legível sem cor.** A cor repete o que a palavra já diz (`OK`, `WARNING`, `FAILED`, `up`,
    `down`, `off`). Com a cor desligada o texto é o mesmo, sem os escapes.
 5. **A tela de status cabe em 25 linhas**, com tudo ligado (live, sem senha, alerta de saúde,
@@ -87,22 +89,23 @@ conforme o terminal), sequências de escape (uma seta) e caracteres de controle 
 **Status** (com endereço; Enter mostra de novo):
 
 ```text
-CoreRouter 0.1.0-dev.553                    QEMU Standard PC (Q35 + ICH9, 2009)
-------------------------------------------------------------------------------
-  Web   https://10.0.2.15/  (user admin)
-  GUI   corerouter-gui --connect tls://10.0.2.15:8729
-  CLI   corerouter-cli --connect tls://10.0.2.15:8729 --user admin
-  Cert  SHA256:B9:4D:27:B9:93:4D:3E:08:A5:2E:52:D7:DA:7D:AB:FA:
-        C4:84:EF:E3:7A:53:80:EE:90:88:F7:AC:E2:EF:CD:E9
+ CoreRouter 0.1.0-dev.559                   QEMU Standard PC (Q35 + ICH9, 2009)
+ ------------------------------------------------------------------------------
+   Web   https://192.0.2.10/  (user admin)
+   GUI   corerouter-gui --connect tls://192.0.2.10:8729
+   CLI   corerouter-cli --connect tls://192.0.2.10:8729 --user admin
+   Cert  SHA256:06:DD:F9:7D:21:BB:BE:B4:15:B0:C6:26:81:EC:29:10:
+         D9:22:71:36:3A:C1:0F:EC:2E:59:9C:B7:DD:AA:76:37
 
-  PORT             LINK   ADDRESS
-  ether1           up     10.0.2.15/24
-  ether2           off    -
+   PORT             LINK   ADDRESS
+   ether1           up     192.0.2.10/24
+   ether2           off    -
 
-  WARNING  admin has no password: anyone who reaches the router logs in as
-           admin with an empty password. Set one from the GUI or the CLI.
+   WARNING  admin has no password: anyone who reaches the router logs in as
+            admin with an empty password. Set one from the GUI or the CLI.
+   WARNING  health: Root verity (details in the GUI)
 
-  This console has no command shell. Press Enter to show this status again.
+   This console has no command shell. Press Enter to show this status again.
 ```
 
 - `Cert` é a impressão digital SHA-256 do certificado TLS do roteador, igual à que a GUI, a CLI

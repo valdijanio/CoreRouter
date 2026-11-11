@@ -582,6 +582,11 @@ fn flow(
     }
 }
 
+/// How the management address is typed in the installer.
+const MGMT_FORM: &str = "  Form: <port> <address/prefix> [<gateway>]\n  \
+     e.g. ether1 192.0.2.10/24 192.0.2.1\n  \
+     None: the console asks for it on the first boot.";
+
 /// Step 3: the management address for the first boot. `Some(None)`: none
 /// (the console asks on the first boot); `None`: the console went.
 fn ask_mgmt(con: &Console) -> Option<Option<Mgmt>> {
@@ -596,8 +601,7 @@ fn ask_mgmt(con: &Console) -> Option<Option<Mgmt>> {
     if !nics.is_empty() {
         con.say(&crate::setup::nic_table(&nics, false));
     }
-    con.say("  Form: <port> <address/prefix> [<gateway>]   e.g. ether1 192.0.2.10/24 192.0.2.1");
-    con.say("  None: the console asks for it on the first boot.");
+    con.say(MGMT_FORM);
     loop {
         let l = con.ask(
             &style::prompt("Management address", Some("none"), None),
@@ -665,12 +669,12 @@ fn write(
             let mark = done * 10 / total.max(1) * 10;
             if mark > shown {
                 shown = mark;
-                con.put(&format!(" {mark}%"));
+                con.more(&format!(" {mark}%"));
             }
             if done >= total {
                 closed = true;
                 let s = started.elapsed().as_secs_f64().max(0.001);
-                con.put(&format!(
+                con.more(&format!(
                     "  {} MiB, {:.0} MiB/s\n",
                     total >> 20,
                     done as f64 / 1048576.0 / s
@@ -679,7 +683,7 @@ fn write(
         },
     );
     if !closed {
-        con.put("\n");
+        con.more("\n");
     }
     let r = r?;
     con.say(&style::block(
@@ -824,6 +828,8 @@ mod tests {
         );
         assert_eq!(offered(&disks()).len(), 2);
         check("no disk", &table(&[]));
+        check("management form", MGMT_FORM);
+        assert!(MGMT_FORM.contains("\n  e.g. ether1 192.0.2.10/24 192.0.2.1\n"));
     }
 
     #[test]

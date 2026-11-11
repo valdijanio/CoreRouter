@@ -488,7 +488,8 @@ Scrub) e **System › Tuning › Boot** (o que cada slot carrega, "Apply on slot
   essa chave e as de release de `os/keys/release/`; imagem de release: só as de release
   ([release.md](release.md)). Atualizar para um build mais antigo é recusado
   ("use system.package.downgrade").
-- **Parâmetros carregados:** `console=`, `ip=` e `corerouter.shell=` da linha em uso que não
+- **Parâmetros carregados:** `console=`, `ip=`, `corerouter.shell=` e `corerouter.color=`
+  (G1.6zg) da linha em uso que não
   estão na embutida passam para o slot gravado (como o `linux_append` de OEM do Flatcar): uma
   console serial noutra porta continua depois de atualizar.
 - **Fora da imagem** (PC de desenvolvimento com `--backend linux`, navegador) o serviço não
@@ -926,11 +927,14 @@ Saídas em `<out>/build/images/`:
   endereço, gateway e a senha do `admin` (sem ela o login pela rede é recusado), mostra o
   resumo e só aplica com `y`. A pergunta que espera resposta reaparece a cada 30 s (quem
   conecta o console serial depois vê o que está pendente). Com endereço, Enter no console
-  mostra os endereços e como conectar pela GUI e pela CLI.
+  mostra os endereços e como conectar pela GUI e pela CLI. O formato, as cores e como
+  desligá-las (`corerouter.color=`) estão em `docs/console.md` (G1.6zg): tela de status única
+  com as portas, o endereço de gerência e a impressão digital do certificado; assistente em
+  passos `[n/4]` e instalador em passos `[n/5]`.
 - **Instalação sem interação** só pelo hipervisor: `-fw_cfg
   name=opt/org.corerouter/autoinstall,string=<json>` do QEMU, que nenhuma máquina física tem; o
-  JSON nomeia o disco duas vezes (`disk`, `confirm`), e `append` só aceita `console=`, `ip=` e
-  `corerouter.shell=`. É a flag do `install-test`.
+  JSON nomeia o disco duas vezes (`disk`, `confirm`), e `append` só aceita `console=`, `ip=`,
+  `corerouter.shell=` e `corerouter.color=`. É a flag do `install-test`.
 - **UEFI e BIOS** (G1.6g): seção "Boot por BIOS", abaixo.
 
 ### Boot por BIOS (G1.6g)

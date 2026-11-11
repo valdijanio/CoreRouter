@@ -14,8 +14,9 @@
 //!   `drivers/tty/vt/vt.c`, `csi_m` has no `default:`).
 //! - **Only ASCII** in our own text: the serial side may not be UTF-8, and
 //!   the kernel's font is CP437.
-//! - **At most [`WIDTH`] columns**, so nothing wraps on an 80-column VGA
-//!   text screen (a BIOS boot) or a serial terminal.
+//! - **At most [`WIDTH`] columns after a [`MARGIN`] of one**, so nothing
+//!   wraps on an 80-column VGA text screen (a BIOS boot) or a serial
+//!   terminal, and nothing is lost where column 0 is cut (overscan).
 //! - **Readable without colour**: the colour repeats what a word already
 //!   says (`OK`, `WARNING`, `FAILED`); with `corerouter.color=off`, `NO_COLOR`
 //!   or `TERM=dumb` on the kernel command line the text is the same, minus
@@ -27,9 +28,18 @@
 //! console) loses its control characters: nothing but this file can make a
 //! terminal do anything.
 
-/// The widest line we write. Two short of 80: some serial terminals wrap
-/// when the last column is written, not after it.
+/// The widest line we write, after the [`MARGIN`]: column 80 stays free
+/// (some serial terminals wrap when the last column is written, not after
+/// it).
 pub const WIDTH: usize = 78;
+
+/// Columns left empty before every line: a monitor with overscan and some
+/// serial consoles cut column 0, and a heading that starts there loses its
+/// first letter. [`render`] adds it; no text of ours starts with it.
+pub const MARGIN: usize = 1;
+
+// Column 0 and column 79 of an 80-column screen stay empty.
+const _: () = assert!(MARGIN >= 1 && MARGIN + WIDTH < 80);
 
 /// Opens a styled span; the next character is the style's tag.
 const OPEN: char = '\u{1}';
@@ -213,12 +223,26 @@ fn is_screen(tty: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// What a console gets for `text`: the marks as SGR sequences (`color`) or
-/// as nothing, every styled line closed by a reset, and every other control
-/// character replaced, so foreign text cannot drive the terminal. Newlines
-/// stay; a tab becomes a space.
+/// What a console gets for `text`, which starts at the beginning of a
+/// line: the [`MARGIN`] before every line that is not empty, the marks as
+/// SGR sequences (`color`) or as nothing, every styled line closed by a
+/// reset, and every other control character replaced, so foreign text
+/// cannot drive the terminal. Newlines stay; a tab becomes a space.
 pub fn render(text: &str, color: bool) -> String {
+    lay(text, color, true)
+}
+
+/// Like [`render`] for text that goes on after what is already on the
+/// line (a progress mark, the echo of an answer): no margin before its
+/// first line.
+pub fn render_more(text: &str, color: bool) -> String {
+    lay(text, color, false)
+}
+
+fn lay(text: &str, color: bool, at_start: bool) -> String {
     let mut out = String::with_capacity(text.len() + 16);
+    // Whether the next character is the first of its line.
+    let mut at_start = at_start;
     // The span in force, and whether its SGR is out on this line.
     let mut span: Option<Style> = None;
     let mut lit = false;
@@ -245,8 +269,13 @@ pub fn render(text: &str, color: bool) -> String {
                     lit = false;
                 }
                 out.push('\n');
+                at_start = true;
             }
             _ => {
+                if at_start {
+                    out.push_str(&" ".repeat(MARGIN));
+                    at_start = false;
+                }
                 if let (Some(s), true, false) = (span, color, lit) {
                     out.push_str("\x1b[");
                     out.push_str(s.sgr());
@@ -431,8 +460,9 @@ pub(crate) mod tests {
     use super::*;
 
     /// What every text of ours must hold, with and without colour: ASCII
-    /// only, no line over [`WIDTH`], no escape with the colour off, every
-    /// coloured line closed by a reset and only SGR among the escapes.
+    /// only, no line that starts in column 0 or passes column 79 of 80, no
+    /// escape with the colour off, every coloured line closed by a reset
+    /// and only SGR among the escapes.
     pub(crate) fn check(what: &str, text: &str) {
         let plain = render(text, false);
         assert!(
@@ -445,9 +475,13 @@ pub(crate) mod tests {
                 "{what}: not plain ASCII: {line:?}"
             );
             assert!(
-                line.len() <= WIDTH,
+                line.len() <= MARGIN + WIDTH,
                 "{what}: {} columns: {line:?}",
                 line.len()
+            );
+            assert!(
+                line.is_empty() || line.starts_with(' '),
+                "{what}: starts in column 0: {line:?}"
             );
             // A prompt ends in ": " and waits there; nothing else trails.
             assert!(
@@ -507,13 +541,60 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn no_visible_line_starts_in_column_0_or_passes_column_80() {
+        // The pieces every screen is made of (the screens themselves go
+        // through `check` in `setup` and `install`): a monitor with overscan
+        // cut the "C" of the header that started in column 0.
+        let long = "word ".repeat(60);
+        let text = [
+            header("CoreRouter 0.1.0-dev.555", &"m".repeat(120)),
+            step(1, 5, "Medium"),
+            block(2, &warn("WARNING"), 9, &long),
+            block(0, "", 0, &long),
+            prompt("Disk to install on", Some("1"), Some("r = rescan")),
+        ]
+        .join("\n");
+        check("pieces", &text);
+        for color in [false, true] {
+            for line in render(&text, color).lines().filter(|l| !l.is_empty()) {
+                assert!(line.starts_with(' '), "{line:?}");
+                let visible = console_width(line);
+                assert!(visible <= 79, "{visible} columns: {line:?}");
+            }
+        }
+        // The widest we write: the rule, in columns 1 to 78.
+        assert_eq!(render(&rule(), false).len(), MARGIN + WIDTH);
+    }
+
+    /// Columns of a rendered line: its length without the SGR sequences.
+    fn console_width(line: &str) -> usize {
+        let mut n = 0;
+        let mut it = line.chars();
+        while let Some(c) = it.next() {
+            if c == '\u{1b}' {
+                for m in it.by_ref() {
+                    if m == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    #[test]
     fn spans_render_as_sgr_or_as_nothing() {
         let t = format!("{} admin has no password", warn("WARNING"));
-        assert_eq!(render(&t, false), "WARNING admin has no password");
+        assert_eq!(render(&t, false), " WARNING admin has no password");
         assert_eq!(
             render(&t, true),
-            "\u{1b}[1;33mWARNING\u{1b}[0m admin has no password"
+            " \u{1b}[1;33mWARNING\u{1b}[0m admin has no password"
         );
+        // What goes on after a line that is already there has no margin.
+        assert_eq!(render_more(" 10%", false), " 10%");
+        assert_eq!(render_more("vda\nnext", false), "vda\n next");
         check("warn", &t);
     }
 
@@ -522,7 +603,7 @@ pub(crate) mod tests {
         let t = bad("ALL DATA ON sda\nWILL BE ERASED");
         assert_eq!(
             render(&t, true),
-            "\u{1b}[1;31mALL DATA ON sda\u{1b}[0m\n\u{1b}[1;31mWILL BE ERASED\u{1b}[0m"
+            " \u{1b}[1;31mALL DATA ON sda\u{1b}[0m\n \u{1b}[1;31mWILL BE ERASED\u{1b}[0m"
         );
         // A span left open (text cut in the middle) is closed all the same.
         let cut = &title("CoreRouter")[..6];
@@ -539,10 +620,10 @@ pub(crate) mod tests {
             let r = render(&dim(evil), color);
             let body = r.replace("\u{1b}[2m", "").replace("\u{1b}[0m", "");
             assert!(!body.chars().any(char::is_control), "{body:?}");
-            assert!(body.starts_with("x?[2J?]0;t???31m?y z"), "{body:?}");
+            assert!(body.starts_with(" x?[2J?]0;t???31m?y z"), "{body:?}");
         }
         // Our own marks inside foreign text only restyle it.
-        assert_eq!(render("a\u{1}Zb\u{2}c", true), "abc");
+        assert_eq!(render("a\u{1}Zb\u{2}c", true), " abc");
         assert_eq!(
             ascii("  Sam\u{1b}sung   SSD\u{e9} 980 "),
             "Sam?sung SSD? 980"
@@ -601,11 +682,11 @@ pub(crate) mod tests {
         check("block", &b);
         let plain = render(&b, false);
         assert!(
-            plain.starts_with("  WARNING  admin has no password"),
+            plain.starts_with("   WARNING  admin has no password"),
             "{plain}"
         );
         assert!(
-            plain.lines().skip(1).all(|l| l.starts_with("           ")),
+            plain.lines().skip(1).all(|l| l.starts_with("            ")),
             "{plain}"
         );
 
@@ -614,17 +695,23 @@ pub(crate) mod tests {
                 &prompt("Disk to install on", Some("1"), Some("r = rescan")),
                 false
             ),
-            "  Disk to install on [1] (r = rescan): "
+            "   Disk to install on [1] (r = rescan): "
         );
         assert_eq!(
             render(&prompt("Apply?", Some("y/N"), None), false),
-            "  Apply? [y/N]: "
+            "   Apply? [y/N]: "
         );
         check("prompt", &prompt("Gateway", Some("none"), None));
-        assert_eq!(render(&step(2, 5, "Disk"), false), "\n[2/5] Disk");
+        // Nothing starts in column 0: not a step, not the header, not the
+        // rule under it; an empty line stays empty.
+        assert_eq!(render(&step(2, 5, "Disk"), false), "\n [2/5] Disk");
         let h = header("CoreRouter 0.1.0", "QEMU Standard PC");
         check("header", &h);
-        assert_eq!(render(&h, false).lines().count(), 3);
+        let lines: Vec<String> = render(&h, false).lines().map(str::to_owned).collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "");
+        assert!(lines[1].starts_with(" CoreRouter 0.1.0 "), "{lines:?}");
+        assert_eq!(lines[2], format!(" {}", "-".repeat(WIDTH)));
 
         assert_eq!(rule().len(), WIDTH);
         let s = spread(

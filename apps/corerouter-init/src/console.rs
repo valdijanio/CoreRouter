@@ -132,6 +132,16 @@ impl Console {
         }
     }
 
+    /// Text that goes on after what is on the line (a progress mark): like
+    /// [`Console::put`], without the margin before its first line.
+    pub fn more(&self, text: &str) {
+        for o in &self.outs {
+            let mut f = &o.file;
+            let _ = f.write_all(style::render_more(text, o.color).as_bytes());
+            let _ = f.flush();
+        }
+    }
+
     pub fn say(&self, text: &str) {
         self.put(&format!("{text}\n"));
     }
@@ -148,7 +158,7 @@ impl Console {
         let shown = if secret {
             "\n".to_owned()
         } else {
-            format!("{}\n", style::render(&line, false))
+            format!("{}\n", style::render_more(&line, false))
         };
         for (_, o) in self.outs.iter().enumerate().filter(|(i, _)| *i != from) {
             let mut f = &o.file;
