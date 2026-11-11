@@ -6,6 +6,46 @@ CLI e servidor MCP. Alvo de qualidade: um operador de ISP confia nele em produç
 
 Este arquivo é idêntico a `CLAUDE.md` (`cargo xtask agents-sync` falha se divergirem).
 
+## Regras básicas (do dono do projeto, 2026-11-11)
+
+Estas cinco regras valem para toda sessão e vêm antes das outras. O resto deste arquivo diz como
+cumpri-las aqui.
+
+1. **O projeto é seu.** Se, para fazer bem o pedido, for preciso reorganizar o que já existe
+   (o formato da config, um comando, um módulo, um serviço do daemon), reorganize. O objetivo é
+   o código mais simples no fim, e não um remendo ao lado. Isso inclui apagar o caminho antigo
+   e migrar o que ele guardava. Três coisas continuam valendo:
+   - os inegociáveis (abaixo);
+   - a config já gravada num roteador continua carregando, com migração e teste;
+   - uma reorganização que toca os pontos quentes de outras sessões em andamento ("Agentes em
+     paralelo") vai num PR próprio e pequeno, avisado no relato.
+2. **Não pare enquanto faltar algo do que foi pedido.** Terminar é ter tudo feito, testado e
+   conferido (regra 4). Numa sessão de feature, é ter o PR com o rótulo `fila` aberto e o que a
+   fila acusar corrigido na mesma branch. Pare para perguntar só nestes casos:
+   - o escopo de uma feature nova ("Todo pedido, feature ou correção");
+   - licença, publicação, segredos ou remotos novos;
+   - root ou uma ferramenta que falta ("Acesso root e testes de rede");
+   - aplicar config em kernel ou hardware real;
+   - bloco `unsafe` (revisão humana).
+3. **Erro é para resolver, não para perguntar.** Teste vermelho, build quebrado, download que
+   falha, lote vermelho na fila: descubra a causa (reproduza, meça, leia o fonte, inclusive o
+   de terceiros) e corrija onde ela está. Não contorne às cegas: nada de aumentar timeout,
+   pular teste ou pôr `#[ignore]`. Não pergunte ao usuário o que a investigação responde; leve
+   a ele só o que cai nas paradas da regra 2.
+4. **Antes de dizer que terminou, abra o sistema e confira tudo funcionando de verdade.** Teste
+   verde não basta. Rode o que mudou do jeito que o operador usa, conforme o caso ("Rodar e
+   olhar"):
+   - daemon e GUI com `--control`, com `screenshot` e o PNG aberto e olhado;
+   - CLI ou MCP contra o daemon;
+   - o laboratório: netns, `vm-lab` ou o CHR;
+   - a imagem no QEMU (`cargo xtask os boot-test`).
+
+   O que não deu para conferir (hardware real, kernel real, a rede do usuário), diga que não
+   conferiu e por quê.
+5. **No fim, comece pelo resultado, em frases curtas.** Primeiro o que ficou pronto, com o PR.
+   Depois o que foi conferido e como. Por último o que não foi conferido, o que falta e o que
+   depende do usuário. Números marcados como **medido** ou **estimado**.
+
 ## Comece toda sessão aqui
 
 1. Leia `ROADMAP.md`, `docs/gaps.md` (lista ranqueada) e a saída de `cargo xtask docs pending`
@@ -13,9 +53,8 @@ Este arquivo é idêntico a `CLAUDE.md` (`cargo xtask agents-sync` falha se dive
    item `aberto` de `docs/gaps.md` (sessões em paralelo recebem o id no brief da sessão principal).
 2. Se existir, leia `plan/STATUS.md` (pasta local, fora do git) e a tarefa em `plan/`.
 3. Leia `docs/architecture.md` antes de criar crate ou mexer em camadas.
-4. Ciclo por tarefa: orientar → **pesquisar** → planejar → implementar + testar → verificar →
-   registrar → commit. Pare e pergunte só para: licença, publicação, segredos, remotos novos,
-   aplicar config em kernel/hardware real.
+4. Ciclo por tarefa: orientar → **pesquisar** → planejar → implementar + testar → verificar
+   (regra básica 4) → registrar → commit. Pare e pergunte só nos casos da regra básica 2.
 
 ## Pesquisa antes de implementar (obrigatória em toda feature nova)
 
@@ -224,7 +263,8 @@ pergunta como o PuTTY (Cancel, Connect once, Trust and update) e a CLI/MCP sem t
 Detalhes em `docs/control-protocol.md`.
 
 Mudou UI? Rode a GUI com `--control`, tire `screenshot` e **olhe o PNG** antes de dizer que está
-pronto.
+pronto. É o caso mais comum da regra básica 4: comando, serviço e imagem também se conferem
+rodando, não só pelo teste.
 
 **Binários sempre atuais:** depois de cada lote, a fila de entrada (`scripts/land.sh`) leva o
 checkout principal para a `main` nova e recompila daemon, GUI e CLI (só se ele estiver na `main`
@@ -310,10 +350,12 @@ Sessões de feature não fazem merge nem ligam auto-merge.
    testar (comandos ou cliques), o id da gap e, em feature nova, a seção `## Pesquisa` (veja
    "Pesquisa antes de implementar").
 4. Abra o PR com o rótulo **`fila`** (`gh pr create … --label fila`): é ele que a fila contínua
-   (`scripts/land.sh --watch`) procura. Com o PR aberto, **pare** e diga no relato "pronto para a fila: #<n>" (o `cargo xtask ci --affected`
-   local já passou; não espere o CI do GitHub). Não ligue `gh pr merge --auto` nem
-   faça merge. O CI do PR roda o portão rápido (`cargo xtask ci --fast`); se ele ou a fila
-   acusarem erro, a sessão principal avisa e você corrige na mesma branch.
+   (`scripts/land.sh --watch`) procura. Com o PR aberto e o sistema conferido (regra básica 4),
+   **pare** e diga no relato "pronto para a fila: #<n>". O `cargo xtask ci --affected` local já
+   passou; não espere o CI do GitHub. Não ligue `gh pr merge --auto` nem faça merge. O CI do PR
+   roda o portão rápido (`cargo xtask ci --fast`). Se ele ou a fila acusarem erro, a sessão
+   principal avisa e você corrige na mesma branch: o pedido só termina quando o PR entra
+   (regra básica 2).
 
 ### Fila de entrada (sessão principal)
 
@@ -405,9 +447,10 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
   "esperando disco". O portão de disco do `cargo xtask ci` mede o disco do target, então passa a
   olhar o `/srv/build`; não baixe `COREROUTER_CI_MIN_FREE_GB` como contorno. Um `target-*` na
   worktree (o caminho antigo, ainda no `.gitignore`) só para quem não tem o `/srv/build`.
-- Edite só os crates da sua tarefa (a coluna "crates" de `docs/gaps.md`). Precisa mexer em
+- Edite os crates da sua tarefa (a coluna "crates" de `docs/gaps.md`). Precisa mexer em
   `crates/model` ou `crates/engine/src/session.rs`? São compartilhados: mudanças pequenas,
-  aditivas, e avise no PR.
+  aditivas, e avise no PR. Uma reorganização maior que simplifica o código (regra básica 1)
+  é bem-vinda, mas num PR próprio, para não conflitar com as sessões em andamento.
 - Branch: `stream/<id-da-gap>-<slug>`, ex. `stream/G1.2-netlink-addresses`.
 - **Ids de gap vêm do brief ou da `main`.** Nunca invente um id: confira `docs/gaps.md` na
   `origin/main` atualizada antes de registrar um item novo (já houve colisão de G1.20).
@@ -454,8 +497,9 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
     `ci/kernel-modules/<módulo>` com a variável que ele liga; **não edite** o `ci.yml`.
   Medido na rodada de 7 agentes (2026-10-22): 5 de 6 conflitos eram linha acrescentada no fim
   dessas listas; listas geradas zeraram os conflitos na simulação (`docs/perf.md`).
-- **Pontos quentes que restam** (`crates/hal/src/lib.rs`, `crates/model/src/config.rs`):
-  mudanças mínimas e aditivas; prefira arquivos novos no seu módulo.
+- **Pontos quentes que restam** (`crates/hal/src/lib.rs`, `crates/model/src/config.rs`): dentro
+  de uma feature, mudanças mínimas e aditivas, de preferência em arquivos novos no seu módulo.
+  Reorganizá-los (regra básica 1) é um PR à parte.
 
 ## Progresso
 
