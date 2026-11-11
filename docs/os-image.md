@@ -71,6 +71,34 @@ UEFI, que acrescenta o dm-verity, os parâmetros de Tuning › Boot e `coreroute
 PARTUUID bate com o `rootfs-a` do `genimage.cfg` e que o `init=` é o binário que o pacote
 instala. `panic=10`: um kernel panic reinicia o roteador em 10 s, em vez de ficar parado.
 
+**Disco regravado e entradas velhas na NVRAM (G1.6zm).** A entrada `Boot####` acha o ESP pelo
+GUID da partição (`HD(…)`, UEFI 2.10 §10.3.5.1) e leva na linha de comando o hash raiz e o
+tamanho da árvore de verity da imagem que a escreveu. Todo `disk.img` tem o mesmo GUID de ESP,
+então, ao gravar outra versão no mesmo disco (ou pendrive) e manter a NVRAM, a entrada velha
+casava com o disco novo. O kernel parava em `verity: metadata block … is corrupted` e
+`Unable to mount root fs`. Visto num notebook Lenovo e reproduzido no `ab-test --scenario
+reflash`.
+
+Agora:
+
+- o primeiro boot de uma cópia (fora de um boot de teste) dá ao ESP um GUID só dele
+  (`gpt::renew_guid`, chamado pelo `corerouter-init`, linha `boot partition: GUID … of its
+  own`), antes de o daemon escrever as entradas;
+- o instalador grava o ESP já com um GUID aleatório.
+
+Uma entrada de outra imagem então aponta para uma partição que não existe. O firmware passa
+para a próxima opção e chega ao caminho de mídia removível (`\EFI\BOOT\BOOTX64.EFI`, a linha
+embutida). Esse boot dá ao ESP outro GUID e reescreve as entradas (`provision` trata como velha
+a entrada que aponta para outro ESP). Um roteador atualizado migra sozinho no primeiro boot da
+versão nova. As PARTUUIDs dos slots continuam as da imagem, porque a linha embutida aponta para o
+`rootfs-a`.
+
+Num firmware que guardou entradas de uma versão anterior à G1.6zm, a entrada ainda casa (o GUID
+dela é o da imagem). Uma vez só, escolha o pendrive ou disco no menu de boot do firmware (F12
+etc.), não "CoreRouter A", ou apague as entradas "CoreRouter" no setup. O passo seguinte é o hash na
+linha de comando assinada do próprio kernel (UKI, gap G1.6f), o que tira da NVRAM o que pode
+envelhecer.
+
 ### `corerouter-init` (PID 1 em Rust)
 
 Faz só o que um appliance precisa, em ~450 linhas sem `unsafe` (rustix, signal-hook,
