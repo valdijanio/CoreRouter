@@ -140,6 +140,113 @@ CONFIG_SENSORS_W83627EHF=m
 # The defconfig's module nobody loaded: the package sensor coretemp shows.
 # CONFIG_X86_PKG_TEMP_THERMAL is not set
 
+# --- Every core of a big machine (G1.6zi). The defconfig stops at 64 CPUs
+# ("CPU limit of 64 reached. Ignoring further CPUs"). MAXSMP is what the
+# distributions ship: 8192 CPUs, CPU masks allocated instead of on the stack
+# (above 512 they would not fit). A mask is sized by the machine's CPUs at
+# run time, so a small router pays 1.6 MiB of RAM and nothing per packet
+# (docs/os-image.md has the numbers against 64 and 512).
+CONFIG_MAXSMP=y
+# Interrupt remapping (VT-d, AMD-Vi). Without it a real machine cannot use
+# x2APIC (arch/x86/kernel/apic/apic.c, try_to_enable_x2apic) and the CPUs
+# with an APIC id of 255 or more never start. Remapping of DMA stays as it
+# was: off on Intel unless asked (intel_iommu=on).
+CONFIG_IRQ_REMAP=y
+# CONFIG_INTEL_IOMMU_DEFAULT_ON is not set
+
+# --- Disks a router boots from, beyond the storage above (G1.6zi). Built
+# in: there is no initramfs, the root is mounted by the kernel alone.
+# eMMC and SD: the soldered disk of mini-PCs and x86 appliances (Atom,
+# Celeron, N-series), on PCI or named by ACPI.
+CONFIG_MMC=y
+CONFIG_MMC_BLOCK=y
+CONFIG_MMC_SDHCI=y
+CONFIG_MMC_SDHCI_PCI=y
+CONFIG_MMC_SDHCI_ACPI=y
+# Intel VMD: with it on in the firmware (the factory default of many Intel
+# notebooks and servers) the NVMe disks sit behind it, on a PCI domain of
+# their own, and do not exist for a kernel without this driver.
+CONFIG_VMD=y
+# HPE Smart Array of Gen10 and later (aacraid and hpsa do not drive them),
+# Broadcom MPI3 (SAS4 HBAs and RAID, Dell PERC 12).
+CONFIG_SCSI_SMARTPQI=y
+CONFIG_SCSI_MPI3MR=y
+# A USB 3 disk enclosure at its speed (without it: the slower mass-storage
+# mode).
+CONFIG_USB_UAS=y
+
+# --- Hypervisors beyond KVM and VMware (G1.6zi). Each one is found by
+# CPUID: on a real machine none of this runs. Disk and port built in: the
+# root is on them, and PID 1 loads modules for PCI and USB devices only.
+CONFIG_PARAVIRT_SPINLOCKS=y
+# A VM cloned from a template or brought back from a snapshot gets a new
+# random state (it would repeat keys and nonces).
+CONFIG_VIRT_DRIVERS=y
+CONFIG_VMGENID=y
+# Hyper-V and Azure: a Generation 2 VM has VMBus devices only (no IDE, no
+# emulated card, no i8042 keyboard).
+CONFIG_HYPERV=y
+CONFIG_HYPERV_VMBUS=y
+CONFIG_HYPERV_STORAGE=y
+CONFIG_HYPERV_NET=y
+CONFIG_HYPERV_KEYBOARD=y
+CONFIG_HYPERV_UTILS=y
+# Xen HVM with paravirtual drivers (XCP-ng, XenServer). Both front ends or
+# none: with them the kernel unplugs the emulated disk and card
+# (arch/x86/xen/platform-pci-unplug.c). No classic PV guest (PARAVIRT_XXL),
+# no balloon (a router's memory is not the host's to take), none of the
+# tool stack's devices.
+CONFIG_XEN=y
+# CONFIG_XEN_PV is not set
+CONFIG_XEN_PVHVM_GUEST=y
+CONFIG_XEN_BLKDEV_FRONTEND=y
+CONFIG_XEN_NETDEV_FRONTEND=y
+# CONFIG_XEN_BALLOON is not set
+# CONFIG_XEN_GNTDEV is not set
+# CONFIG_XEN_GRANT_DEV_ALLOC is not set
+# CONFIG_XEN_DEV_EVTCHN is not set
+# CONFIG_XENFS is not set
+# CONFIG_XEN_PRIVCMD is not set
+# CONFIG_INPUT_XEN_KBDDEV_FRONTEND is not set
+
+# --- What went wrong, said in the kernel log (G1.6zi). Reported, never
+# acted on: no panic of its own (the defaults), no page taken out of use.
+# A CPU stuck in the kernel for 20 s, one stuck with interrupts off for
+# 10 s (each CPU watches its neighbour: no PMU counter, works in a VM), a
+# task blocked for 120 s: each leaves a stack trace.
+CONFIG_SOFTLOCKUP_DETECTOR=y
+CONFIG_HARDLOCKUP_DETECTOR=y
+CONFIG_HARDLOCKUP_DETECTOR_PREFER_BUDDY=y
+CONFIG_DETECT_HUNG_TASK=y
+# The end of the log of a panic, kept across the reboot (/sys/fs/pstore):
+# in the server firmware's own store (ACPI ERST, below). In UEFI variables
+# only when asked (efi_pstore.pstore_disable=0): they share the NVRAM the
+# A/B update writes its boot entries to, and nothing clears them yet.
+CONFIG_PSTORE=y
+CONFIG_PSTORE_COMPRESS=y
+CONFIG_EFI_VARS_PSTORE=y
+CONFIG_EFI_VARS_PSTORE_DEFAULT_DISABLE=y
+# PCIe errors (a bad riser, cable or card) and their containment.
+CONFIG_PCIEAER=y
+CONFIG_PCIE_DPC=y
+# Errors the server's firmware reports (memory, PCIe), and which DIMM an
+# ECC error is on. Only the controllers whose driver says nothing where
+# there is no ECC memory (igen6 and pnd2 write an error line there).
+CONFIG_RAS=y
+CONFIG_ACPI_APEI=y
+CONFIG_ACPI_APEI_GHES=y
+CONFIG_ACPI_APEI_PCIEAER=y
+CONFIG_ACPI_EXTLOG=y
+CONFIG_EDAC=y
+CONFIG_EDAC_DECODE_MCE=y
+CONFIG_EDAC_AMD64=y
+CONFIG_EDAC_SKX=y
+CONFIG_EDAC_I10NM=y
+CONFIG_EDAC_SBRIDGE=y
+CONFIG_EDAC_IE31200=y
+# CONFIG_EDAC_LEGACY_SYSFS is not set
+# CONFIG_RAS_FMPM is not set
+
 # --- eBPF and XDP (G2.5): JIT always on, BTF for CO-RE, AF_XDP.
 CONFIG_BPF=y
 CONFIG_BPF_SYSCALL=y
