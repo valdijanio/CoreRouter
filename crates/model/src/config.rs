@@ -84,6 +84,9 @@ pub struct System {
     /// `/interface wifi` settings every radio shares (G1.30): the country.
     #[serde(skip_serializing_if = "crate::wifi::WifiSettings::is_default")]
     pub wifi: crate::wifi::WifiSettings,
+    /// `/system boot` (G1.6zn): the system in RAM.
+    #[serde(skip_serializing_if = "crate::boot::Boot::is_default")]
+    pub boot: crate::boot::Boot,
 }
 
 impl Default for System {
@@ -101,6 +104,7 @@ impl Default for System {
             web: crate::web::WebService::default(),
             usb_watchdog: crate::usb_watchdog::UsbWatchdog::default(),
             wifi: crate::wifi::WifiSettings::default(),
+            boot: crate::boot::Boot::default(),
         }
     }
 }

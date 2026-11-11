@@ -36,6 +36,10 @@ pub enum EngineError {
         step: usize,
         error: Box<EngineError>,
     },
+    /// G1.6zn: nowhere to save the change (the system disk went away); the
+    /// text says what happened and what to do.
+    #[error("{0}")]
+    NotSaved(String),
     #[error("internal error in '{0}'; state was rolled back")]
     Internal(String),
 }

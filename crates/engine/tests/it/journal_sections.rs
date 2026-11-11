@@ -48,6 +48,8 @@ fn commands() -> Vec<(&'static str, Value)> {
     vec![
         // system
         ("system.identity.set", json!({"name": "sweep"})),
+        // G1.6zn: the system in RAM (`system.boot`).
+        ("system.boot.set", json!({"to_ram": true})),
         (
             "system.ntp.client.set",
             json!({"enabled": true, "servers": ["192.0.2.123"]}),

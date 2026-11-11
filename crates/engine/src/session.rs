@@ -512,6 +512,14 @@ impl Session {
     /// In Safe Mode the revision is marked and not saved: the boot config
     /// stays the one from the entry until `config.safe-mode.exit`.
     pub(crate) fn commit_candidate(&mut self, comment: &str) -> Result<u32> {
+        // G1.6zn: Safe Mode saves nothing until its changes are kept, so it
+        // still works (the operator's way to change a router whose disk is
+        // gone, knowing it does not last).
+        if !self.safe_mode.is_active()
+            && let Some(why) = self.storage.unavailable()
+        {
+            return Err(EngineError::NotSaved(why));
+        }
         self.commit_checked(comment, true)
     }
 
