@@ -414,7 +414,7 @@ fn run(session: &Shared, port: u16, health: &super::Health, open: OpenClock<'_>)
                 _ => None,
             };
             let wait = 1u64 << poll_exp.min(17);
-            status = round.status(&status, wait);
+            status = round.status(&status, wait, !servers.is_empty());
             status.dynamic_servers = dynamic.clone();
             if let Some(d) = driver.as_ref().filter(|_| active) {
                 d.fill(&mut status);
@@ -490,7 +490,11 @@ pub struct Round {
 }
 
 impl Round {
-    fn status(&self, before: &NtpStatus, poll_secs: u64) -> NtpStatus {
+    /// `asked`: there was somebody to ask. A round that asked nobody says
+    /// [`NO_SERVER`]; one whose servers all told it to go away (kiss-o'-death,
+    /// skipped from then on) says that instead: the health check sends the
+    /// operator to the right place.
+    fn status(&self, before: &NtpStatus, poll_secs: u64, asked: bool) -> NtpStatus {
         let ms = |n: i64| n as f64 / 1e6;
         let error = (!self.errors.is_empty()).then(|| self.errors.join("; "));
         match &self.best {
@@ -512,7 +516,13 @@ impl Round {
             None => NtpStatus {
                 status: NtpState::Waiting,
                 last_sync: before.last_sync,
-                last_error: Some(error.unwrap_or_else(|| NO_SERVER.into())),
+                last_error: Some(error.unwrap_or_else(|| {
+                    if asked {
+                        "every server refused this client (kiss-o'-death DENY or RSTR)".into()
+                    } else {
+                        NO_SERVER.into()
+                    }
+                })),
                 poll_secs: Some(poll_secs),
                 ..NtpStatus::default()
             },
@@ -818,6 +828,13 @@ mod tests {
                 .errors
                 .is_empty()
         );
+
+        // G1.6zh: servers that all refused are not "nobody to ask".
+        let quiet = poll_round(&["127.0.0.1".into()], deny, MAIN_VRF, &mut denied, &literal, &|| true);
+        let refused = quiet.status(&NtpStatus::default(), 64, true).last_error.unwrap();
+        assert!(refused.contains("refused this client"), "{refused}");
+        let nobody = Round::default().status(&NtpStatus::default(), 64, false).last_error.unwrap();
+        assert_eq!(nobody, NO_SERVER);
 
         let rate = server(0, Some(b"RATE"));
         let r = poll_round(&["127.0.0.1".into()], rate, MAIN_VRF, &mut BTreeSet::new(), &literal, &|| true);
