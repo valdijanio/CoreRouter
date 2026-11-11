@@ -298,6 +298,15 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
             "security=wpa2 never uses WPA3, even if the access point offers it; auto does".into(),
         );
     }
+    // A network the last scan heard only with a security a station does
+    // not join (802.1X, OWE, WEP): typed by hand it would end in "not
+    // found", which says nothing of why. The scan knows why.
+    if let Some(why) = unjoinable(s, &name, &st.ssid) {
+        warnings.push(format!(
+            "'{}' was heard only as a network this radio cannot join: {why}",
+            st.ssid
+        ));
+    }
     let cfg = s.store_mut().candidate_mut();
     let Some(iface) = cfg.interfaces.get_mut(&name) else {
         return Err(EngineError::bad("name", format!("no Wi-Fi interface '{name}'")));
@@ -611,6 +620,21 @@ fn joinable(sec: BssSecurity) -> Option<&'static str> {
             Some("802.1X (a user and password, or a certificate) is not supported yet")
         }
     }
+}
+
+/// Why `ssid` cannot be joined, when every access point the last scan of
+/// `name` heard with that name is of a kind a station does not join.
+/// `None`: not heard (nothing to say), or at least one can be joined.
+fn unjoinable(s: &Session, name: &IfName, ssid: &str) -> Option<&'static str> {
+    if ssid.is_empty() {
+        return None;
+    }
+    let r = s.wifi()?.radios.get(name)?;
+    let mut why = None;
+    for b in r.scan.iter().filter(|b| b.ssid == ssid) {
+        why = Some(joinable(b.security)?);
+    }
+    why
 }
 
 fn networks(s: &mut Session, p: &Value) -> Result<Value> {

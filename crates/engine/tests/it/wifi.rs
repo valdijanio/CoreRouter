@@ -851,6 +851,44 @@ fn the_preview_says_what_set_would_do_and_changes_nothing() {
     );
     assert!(p["computed"].to_string().contains("not heard"), "{p}");
 
+    // A network heard only as 802.1X: `set` and the preview say why it will
+    // not be joined, instead of a "not found" later. (The scan lists it; the
+    // GUI greys it; typed by hand nothing said so.)
+    let corp = json!({"ssid": "Corp", "passphrase": "12345678"});
+    let mut id = corp.clone();
+    id["id"] = json!("wifi1");
+    let p = run(&mut s, "interface.wifi.preview", id);
+    assert!(
+        p["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["level"] == "warning" && c["message"].as_str().unwrap().contains("802.1X")),
+        "{p}"
+    );
+    assert!(p["computed"].to_string().contains("yes: -70 dBm"), "{p}");
+    let mut named = corp;
+    named["name"] = json!("wifi1");
+    let done = run(&mut s, "interface.wifi.set", named);
+    assert!(done["warnings"].to_string().contains("802.1X"), "{done}");
+    // One that can be joined says nothing of the kind; one not heard neither.
+    for ssid in ["CoreRouter-Lab", "Nao-Existe"] {
+        let p = run(
+            &mut s,
+            "interface.wifi.preview",
+            json!({"id": "wifi1", "ssid": ssid, "passphrase": "12345678"}),
+        );
+        assert!(
+            !p["checks"].to_string().contains("cannot join"),
+            "{ssid}: {p}"
+        );
+    }
+    run(
+        &mut s,
+        "interface.wifi.set",
+        json!({"name": "wifi1", "ssid": ""}),
+    );
+
     // What `set` refuses comes back as a check on its field, with no command.
     let p = run(
         &mut s,
