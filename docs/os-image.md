@@ -809,6 +809,126 @@ ISO +256 KiB. `X86_PKG_TEMP_THERMAL`, que o defconfig deixava em módulo e ningu
 `.config` e na carga do live; o `boot-test` liga um disco NVMe na VM e exige a temperatura dele
 no `system.health.print`, pedido como o operador pede (`admin` por TLS).
 
+### Cobertura de hardware: núcleos, disco de boot, hipervisores, diagnóstico (G1.6zi)
+
+O `.config` vinha do `x86_64_defconfig` mais o que o roteador usa. O primeiro boot num notebook
+real e a leitura do `.config` mostraram o que falta para **dar boot, enxergar o disco e usar
+todos os núcleos** em hardware comum, e para um defeito deixar rastro. Tudo abaixo é embutido
+(não há initramfs: o kernel monta a raiz sozinho) e vale também para o kernel da ISO.
+
+| Grupo | Símbolos | O que acontecia sem eles |
+|---|---|---|
+| Núcleos | `MAXSMP` (`NR_CPUS=8192`) | `CPU topo: CPU limit of 64 reached. Ignoring further CPUs`: um servidor de 128 threads usava 64 |
+| Interrupções | `IRQ_REMAP` | Numa máquina real o x2APIC depende do remapeamento de interrupções (`arch/x86/kernel/apic/apic.c:1823-1859`); sem ele as CPUs de APIC id ≥ 255 não sobem (`smpboot: CPU 299 has invalid APIC ID 12b. Aborting bringup`) |
+| Disco de boot | `MMC`, `MMC_BLOCK`, `MMC_SDHCI`, `MMC_SDHCI_PCI`, `MMC_SDHCI_ACPI` | eMMC soldado de mini-PC e appliance x86 (Atom, Celeron, N-series): o instalador não via disco nenhum |
+| | `VMD` | Com o Intel VMD ligado no firmware (padrão de fábrica de muitos notebooks e servidores Intel) o NVMe fica atrás dele e não existe para o kernel |
+| | `SCSI_SMARTPQI`, `SCSI_MPI3MR` | HPE Smart Array Gen10 em diante; Broadcom MPI3 (HBA/RAID SAS4, Dell PERC 12) |
+| | `USB_UAS` | Gaveta USB 3 caía no modo lento (não impede o boot) |
+| Hipervisores | `HYPERV`, `HYPERV_VMBUS`, `HYPERV_STORAGE`, `HYPERV_NET`, `HYPERV_KEYBOARD`, `HYPERV_UTILS` | Hyper-V Geração 2 e Azure só têm dispositivos VMBus: sem disco, sem rede, sem teclado |
+| | `XEN`, `XEN_PVHVM_GUEST`, `XEN_BLKDEV_FRONTEND`, `XEN_NETDEV_FRONTEND` | Xen HVM (XCP-ng, XenServer) com disco e placa paravirtuais: o kernel não achava a raiz |
+| | `PARAVIRT_SPINLOCKS`, `VMGENID` | vCPU disputada; VM clonada ou voltando de snapshot repetia o estado do gerador aleatório |
+| Diagnóstico | `SOFTLOCKUP_DETECTOR`, `HARDLOCKUP_DETECTOR` (modo vizinho), `DETECT_HUNG_TASK` | Um travamento do kernel não deixava linha no log |
+| | `PSTORE`, `EFI_VARS_PSTORE` desligado por padrão, `ACPI_APEI` (ERST) | O motivo de um pânico se perdia no reboot (`panic=10`) |
+| | `PCIEAER`, `PCIE_DPC`, `ACPI_APEI_GHES`, `EDAC` (AMD64, SKX, I10NM, SBRIDGE, IE31200) | Erro de PCIe e de memória ECC sem registro; não dava para saber qual pente trocar |
+
+**Decisões, com o motivo.**
+
+- **8192 CPUs (`MAXSMP`), não 512.** O `cpumask` tem três degraus em compilação
+  (`include/linux/cpumask.h:66-76`): até 64 CPUs as operações são de uma palavra; acima disso o
+  limite é o `nr_cpu_ids` lido em execução, igual para 512 e 8192. A diferença do `MAXSMP` é só
+  alocar as máscaras (`CPUMASK_OFFSTACK`) em vez de pô-las na pilha, em caminhos de controle
+  (afinidade, não pacote). **Medido** numa VM de 2 GiB: `NR_CPUS=512` custa 0 de RAM e 0 no
+  `bzImage` contra 64; `MAXSMP` custa 1 624 KiB de RAM e 16 KiB no `bzImage` contra 512, igual
+  com 2 ou 16 CPUs (o custo é fixo, não por CPU). 512 deixaria de fora os servidores de 2
+  soquetes com mais de 256 núcleos; 8192 é o que Debian, Ubuntu e RHEL usam (VyOS e Alpine:
+  256; OpenWrt: 64). Não medido: efeito no encaminhamento (não há instrumento aqui que resolva
+  uma diferença dessa ordem; o caminho de pacote não usa `cpumask`).
+- **`IRQ_REMAP` sem mudar o DMA.** `INTEL_IOMMU_DEFAULT_ON` segue desligado (a trava o proíbe):
+  o remapeamento de interrupção é montado à parte (`drivers/iommu/intel/irq_remapping.c`) e a
+  tradução de DMA na Intel só liga com `intel_iommu=on`. Na AMD o DMA já passava pelo IOMMU
+  (`IOMMU_DEFAULT_DMA_LAZY`), antes e depois. Saída de emergência num firmware com a tabela
+  errada: `intremap=off`.
+- **Hyper-V sem `PCI_HYPERV`.** Com ele a função virtual da rede acelerada do Azure aparece
+  como mais uma placa, que o `netvsc` escraviza; o PID 1 a nomearia `etherN` e o daemon a
+  gerenciaria. Sem ele a VM usa só a placa sintética, que é correta. Fica para um teste no
+  Azure (G1.6zw).
+- **Xen sem PV clássico, sem balão.** `XEN_PV` traz o `PARAVIRT_XXL` (chamadas indiretas pelo
+  kernel todo); o balão devolve a memória do roteador ao host. Os dois frontends entram juntos:
+  com eles o kernel desliga o disco e a placa emulados
+  (`arch/x86/xen/platform-pci-unplug.c:144-170`).
+- **Detector de travamento no modo vizinho** (`HARDLOCKUP_DETECTOR_PREFER_BUDDY`): cada CPU
+  confere a vizinha no temporizador que já existe. Não ocupa um contador do PMU por CPU nem gera
+  NMI periódica, e funciona em VM. Não pega o caso de todas as CPUs travadas, que é papel do
+  watchdog de hardware (G1.6f). **Só avisa**: `softlockup_panic`, `hardlockup_panic` e
+  `hung_task_panic` ficam em 0 (uma VM com a vCPU parada pelo host daria reinício em falso).
+- **pstore: ERST sim, variável EFI só a pedido.** `ACPI_APEI` traz o ERST, o armazenamento que
+  o firmware de servidor tem para isso. O meio EFI fica compilado e desligado
+  (`EFI_VARS_PSTORE_DEFAULT_DISABLE`; liga com `efi_pstore.pstore_disable=0`): cada pânico grava
+  variáveis na mesma NVRAM em que o atualizador A/B grava `Boot####`, e ninguém as apaga ainda.
+  Mostrar o registro no log do roteador e apagá-lo é a G1.6zx.
+- **EDAC só onde o driver fica calado sem ECC.** `igen6` (SoCs cliente) e `pnd2` (Apollo Lake)
+  escrevem uma linha de nível erro numa máquina sem ECC (`igen6_edac.c:1107`, `pnd2_edac.c:1555`),
+  que apareceria em todo boot `quiet` de um mini-PC. Ficam para a G1.6zy, junto com
+  `MEMORY_FAILURE` (mata o processo dono da página em vez de entrar em pânico: é política).
+
+**Custo** (**medido**, kernel 6.18.59 compilado à parte com o `.config` da imagem; base = depois
+da G1.6zf, `bzImage` 18 387 968 B, `text` 40 850 668, `data` 8 949 430):
+
+| Grupo sozinho | `bzImage` | `text` | `data` |
+|---|---|---|---|
+| `NR_CPUS=512` | +0 B | +33 009 | +21 412 |
+| `MAXSMP`, sobre 512 | +16 384 B | +395 681 | +887 936 |
+| `IRQ_REMAP` | +20 480 B | +31 809 | +8 452 |
+| Disco de boot | +368 640 B | +725 381 | +181 784 |
+| Hipervisores (com o que ficou de fora: `PCI_HYPERV`, balão e ferramentas do Xen) | +364 544 B | +749 200 | +173 072 |
+| Diagnóstico (com o que ficou de fora: `igen6`, `pnd2`, `MEMORY_FAILURE`) | +241 664 B | +435 816 | +119 304 |
+
+Na imagem (**medido**, antes = G1.6zf): `bzImage` 18 392 064 → 19 305 472 B (+892 KiB);
+`BOOTX64.EFI` da ISO 19 645 440 → 20 419 584 B (+756 KiB); ISO 139 997 184 → 141 873 152 B
+(+1,79 MiB); `corerouter.crpkg` +928 KiB; `rootfs.squashfs` +36 KiB. RAM (VM de 1 GiB, 2 CPUs):
+`MemTotal` 981 292 → 978 124 KiB (−3,1 MiB). Boot, kernel → daemon pronto, rodadas alternadas
+com a máquina carregada: antes 1,04 / 1,41 / 1,06 s, depois 1,12 / 1,05 s; o trecho do kernel
+até o init, 0,71–0,77 s antes e 0,71–0,76 s depois. Com 128 CPUs o boot leva 2,26 s e com 300,
+5,52 s (subir cada CPU custa).
+
+**Conferido no QEMU** (o que ele emula):
+
+- `boot-test --smp 128`: `128 of 128 in use` (o kernel anterior parava em 64);
+- `boot-test --smp 300`, com IOMMU e sem o destino estendido de MSI que só VM tem:
+  `DMAR-IR: Enabled IRQ remapping in x2apic mode`, `300 of 300 in use`. Com `NR_CPUS` alto e sem
+  `IRQ_REMAP` a mesma máquina sobe 256 CPUs e escreve `CPU 299 has invalid APIC ID 12b`. O DMA
+  continua sem tradução (nenhuma linha `DMAR: IOMMU enabled`);
+- cartão SD numa controladora SDHCI (`sdhci-pci`): a ISO live o lista (`mmcblk0`, `SD/eMMC`),
+  instala nele e o SeaBIOS dá boot por ele (`/config: /dev/mmcblk0p4`). O OVMF do teste não tem
+  driver de SD (`BdsDxe: failed to load Boot0003 "CoreRouter A" … Not Found`); nele o segundo
+  boot recebe o kernel da imagem e confere que a raiz e o `/config` são achados no cartão;
+- convidado Xen HVM (a emulação de Xen do QEMU sobre KVM, disco `xen-disk` e placa
+  `xen-net-device`): `Hypervisor detected: Xen HVM`, raiz e `/config` em `xvda`, porta `ether1`
+  pelo `netfront`, daemon pronto. O kernel anterior, na mesma VM, não acha o disco;
+- Hyper-V emulado (`-cpu …,hv-*`, `vmbus-bridge`): `Hypervisor detected: Microsoft Hyper-V`,
+  `hv_vmbus: Vmbus version:4.0`, relógio `hyperv_clocksource_tsc_page`, roteador pronto. O QEMU
+  não emula o disco nem a placa do VMBus;
+- pânico com um ERST emulado (`acpi-erst`): depois do reboot, três registros `dmesg-erst-*` em
+  `/sys/fs/pstore`; `efi_pstore.pstore_disable` em `Y`;
+- `watchdog` e `soft_watchdog` em 1, `softlockup_panic`, `hardlockup_panic` e
+  `hung_task_panic` em 0.
+
+**Não conferido** (não há emulação): eMMC de verdade e as áreas de boot dele, NVMe atrás de
+VMD, HPE Smart Array (`smartpqi`), Broadcom MPI3, Hyper-V e Azure reais (disco e rede do VMBus),
+XCP-ng real, um travamento de CPU de verdade, AER/APEI/EDAC com erro real.
+
+**O instalador e o eMMC.** Todo eMMC tem duas áreas de boot (`mmcblk0boot0`, `mmcblk0boot1`),
+que o kernel mostra como discos. `corerouter_sysupdate::disks::whole_disk` as tira da lista de
+destinos; o disco é o `mmcblk0`. Nada no instalador nem no A/B monta nome de partição: tudo é por
+rótulo de partição (`PARTLABEL`, `PARTUUID`), então `mmcblk0p3` e `xvda3` funcionam como `sda3`.
+
+**Travas.** `os check`: cada símbolo adotado `=y` no fragmento (`HARDWARE_COVERAGE`), e
+`XEN_PV`, `XEN_BALLOON` e `INTEL_IOMMU_DEFAULT_ON` desligados; o build: os mesmos no `.config`
+da imagem e no da ISO, e `NR_CPUS=8192` (o `MAXSMP` cai em silêncio sem `DEBUG_KERNEL`); o
+`boot-test` confere que o roteador usa todas as CPUs da VM, e `boot-test --smp N` dá N CPUs à
+máquina (acima de 255, com IOMMU e sem o atalho que só VM tem); o `install-test` instala num
+cartão SD numa controladora SDHCI e dá boot por ele.
+
 ### O que o roteador avisa quando a placa não sobe (G1.6ja)
 
 O serviço `nic-problems` do daemon olha a máquina a cada 10 s, fora do lock do `Session`: as placas
