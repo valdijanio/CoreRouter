@@ -9991,3 +9991,99 @@ continuação indentadas).
   de notebook só faz AP em 2,4 GHz. Escolha do dono: modo estação primeiro (G1.30), AP como gap
   futura (G1.30a). Um controlador de APs próprio (não o protocolo do CAPsMAN, decisão do G5) só
   faz sentido depois da G1.30a.
+
+- 2026-11-11 — G0.3f: O aviso "Login sem senha" não inunda mais o log, e o log não chama de "Alterado" o que não mudou
+  nada. Achado no notebook de teste (ISO live): a janela Log tinha dezenas de linhas iguais no
+  mesmo segundo (a CLI abre uma conexão por comando), e "Alterado: /system install test" a cada
+  abertura da janela Install to Disk.
+
+  **Aviso agrupado.** `Session::log_event_grouped(chave, …)` (engine, `logging.rs`) é o
+  agrupamento do motor de log para uma fonte que repete: a primeira linha de uma chave sai na
+  hora; as repetições são contadas e viram uma linha só quando a janela fecha ("Login sem senha:
+  usuário admin de 192.168.0.180 (tls); defina uma senha (user.set) — mais 29 vezes nos últimos
+  30 s"). As janelas são as do "last message repeated N times" do syslogd BSD: 30 s, depois
+  2 min, depois 10 min enquanto durar; depois de uma janela sem repetição a próxima ocorrência é
+  linha de novo, e com 10 min de silêncio o grupo recomeça. O login sem senha usa a chave conta +
+  origem (IPv4, ou o /64 no IPv6, como a contagem de falhas). O log continua só de acréscimo:
+  `log.print since`, o syslog remoto e o disco veem as mesmas linhas, e a GUI não mudou. Estado
+  limitado: 256 grupos; o que chega com a tabela cheia tira o grupo mais quieto (a contagem dele
+  sai antes). O relógio das janelas é o monotônico do HAL quando existe (um passo do NTP não fecha
+  nem estica janela). O selo "admin: no password" da barra, a linha da CLI/MCP e a verificação de
+  saúde `auth.no_password` continuam como antes. O `log::warn!` do processo segue a mesma regra.
+
+  **"Alterado" só para mudança.** O `cmd!` tinha duas formas, consulta ou mutação, e tudo que
+  pedia o grupo `write` entrava no journal como "Alterado: …". Agora:
+
+  - `cmd!(quiet …)`: pede `write`, não entra no journal nem no log. É para o que só olha ou
+    testa: `system.install.test`, `system.install.rescan`, `system.package.check`, e os dois que
+    estavam numa lista à parte (`WRITE_QUERIES`, removida): `config.mode.set` e
+    `system.package.upload.chunk`. O grupo exigido sai do `CommandSpec` (`writes`).
+  - comando com journal que não escreveu na config (reboot, flush de cache, renew, kill de
+    conexão, reset de contadores: ~60 comandos, **estimado**) aparece como "Executado: /ip dns cache flush". A
+    regra é uma só, sem marcar comando por comando: "Alterado" se o comando escreveu na config
+    (a geração do `ConfigStore` mudou ou saiu revisão) ou se o verbo é de mudança (`add`, `set`,
+    `remove`, `move`, `enable`, `disable`, `unset`: as contas ficam fora do store).
+
+  Como testar: `corerouter-daemon --config-dir <dir> --control 7941 --listen 127.0.0.1:8741`,
+  30× `COREROUTER_PASSWORD= corerouter-cli --connect tls://127.0.0.1:8741 --user admin run
+  interface.list`, e `corerouter-cli --connect 127.0.0.1:7941 run log.print`: uma linha na hora, a
+  contagem 30 s depois. Conferido assim (**medido**, 2026-11-11): 37 logins em três rajadas = 3
+  linhas (a primeira, "mais 30 vezes nos últimos 30 s", "mais 6 vezes nos últimos 2 min"); antes
+  seriam 37. Tela em `docs/changes/G0.3f-screenshots/log-agrupado.png`.
+
+- 2026-11-11 — G1.6ze: ISO live igual ao disco instalado em Interfaces, e sem linhas de erro ao ligar uma placa. Dois
+  defeitos vistos num notebook real (Lenovo LOQ 15IRH8) com a ISO live:
+
+  1. `interface.list` trazia `bond0`, `dummy0`, `erspan0`, `gre0`, `gretap0`, `ip6gre0`,
+     `ip6tnl0`, `sit0` e `tunl0` além das portas. Causa: o kernel da ISO é outro pacote do
+     Buildroot (`corerouter-installer`) e as duas correções da G1.6m não chegavam nele. O
+     `CONFIG_CMDLINE` do `installer.fragment` substitui o da imagem e não tinha
+     `bonding.max_bonds=0 dummy.numdummies=0`; e o `BR2_GLOBAL_PATCH_DIR` só entrega a um pacote
+     a pasta `patches/<nome do pacote>`, então o kernel do instalador era o tarball puro
+     (`.applied_patches_list` vazio, `sysctl_fb_tunnels_only_for_init_net = 0`).
+  2. Ao ligar um adaptador USB com o live rodando, dez linhas `Falhou: /interface set
+     disabled=false name=ether2 — parameter 'name': no interface 'ether2'` no log do roteador.
+     Causa: o daemon só adota a porta nova depois de três leituras com o mesmo nome (~3 s, G1.6t)
+     e o PID 1 repetia o `interface.set` a cada 250 ms até lá. Reproduzido no QEMU com a ISO
+     antiga: as mesmas dez linhas.
+
+  O que entrou:
+
+  - `installer.fragment` e `INSTALLER_KERNEL` (xtask) com os dois parâmetros;
+    `corerouter-installer.mk` aplica `os/patches/linux` num `POST_PATCH_HOOKS`;
+  - PID 1 (`apps/corerouter-init/src/plan.rs`, `live_port_commands`; `pid1.rs`, `live_port`): lê
+    `interface.list` e `ip.dhcp-client.list` e manda só o que falta. A porta que ele acabou de
+    nomear ele mesmo adota (`interface.ethernet.adopt`), depois liga e cria o cliente DHCP; a
+    porta plugada de novo, que já tem cliente, não recebe nada (antes: um `ip.dhcp-client.add`
+    recusado). O primeiro boot do live usa o mesmo caminho;
+  - travas: `os check` exige os dois parâmetros nas duas linhas de comando e o gancho de patches
+    no `.mk`; o build apaga uma árvore de kernel extraída sem os patches
+    (`corerouter-installer-dirclean`) e reprova se o `.applied_patches_list` de qualquer das duas
+    não tiver todos; o `install-test` reprova uma ISO live cujo `interface.list` tenha algo além
+    de `etherN` e `lo`, e qualquer linha de nível erro no log do live (no boot e depois de plugar
+    a placa).
+
+  Conferido (**medido**, QEMU/KVM q35, 2026-11-11, imagem desta branch):
+
+  - ISO antiga com as travas novas: `install-test --only live-modules` reprova com `card plugged
+    into the live image: 10 error lines in the router's log: Falhou: /interface set
+    disabled=false name=ether2 …` (o defeito do notebook, reproduzido);
+  - ISO nova, `install-test` em OVMF e em SeaBIOS: `live: interface.list: ether1 lo`; placa
+    plugada no live → endereço por DHCP em 1665 ms (OVMF) e 2263 ms (SeaBIOS), contra 4253 ms
+    na ISO antiga (a espera de ~3 s pela adoção saiu); nenhuma linha de erro no log;
+  - à mão, ISO live em BIOS com um adaptador USB (`usb-net`, driver `cdc_ether`) plugado pelo
+    monitor do QEMU, como no notebook: `interface.list` = `ether1`, `ether2`, `lo`; o log traz
+    `Alterado: /interface ethernet adopt name=ether2`, `/interface set disabled=false`,
+    `/ip dhcp-client add …` e o lease `10.0.3.15/24`; `log.print level=error` vazio. Tirado e
+    plugado de novo: volta como `ether2` com o mesmo cliente, sem linha de erro;
+  - o build apagou sozinho a árvore do kernel do instalador extraída sem os patches (`make
+    corerouter-installer-dirclean`) e aplicou os dois; `.applied_patches_list` das duas árvores
+    com `0001` e `0002`;
+  - `boot-test` e `boot-test --efi`: verdes.
+
+  Custo (**medido**): nenhum byte. `BOOTX64.EFI` do instalador 19 633 152 B, `live-modules.img`
+  5 607 424 B e ISO 139 735 040 B, iguais aos da G1.6zd; a imagem do disco não muda. O build
+  refaz o kernel do instalador uma vez (766 s o build inteiro, com a GUI recompilada).
+
+  Não conferido: o notebook real (a ISO nova não foi gravada nele); adaptador `r8152` (o QEMU não
+  emula; o caminho no PID 1 é o mesmo de qualquer placa que aparece depois do boot).
