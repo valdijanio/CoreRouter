@@ -66,15 +66,10 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         always,
         cancel
     ),
-    cmd!(
-        "system.package.check",
-        "Check Package",
-        [],
-        None,
+    // G0.3f: checking a file changes nothing on the router.
+    cmd!(quiet "system.package.check", "Check Package", [], None,
         "{path: string} → {job, kind}",
-        always,
-        check
-    ),
+        always, check),
     cmd!(
         "system.package.upload.start",
         "Upload Package",
@@ -84,7 +79,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         always,
         upload_start
     ),
-    cmd!(query "system.package.upload.chunk", "Upload Chunk", [], None,
+    cmd!(quiet "system.package.upload.chunk", "Upload Chunk", [], None,
         "{upload: u64 (the job from upload.start), offset: u64 (bytes sent before this chunk), data: string (base64, ≤ 4 MiB decoded)} → {received, size, busy}",
         always, upload_chunk),
     cmd!(

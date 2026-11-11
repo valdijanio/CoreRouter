@@ -37,6 +37,16 @@ COREROUTER_INSTALLER_FRAGMENT = $(BR2_EXTERNAL_COREROUTER_PATH)/board/x86_64/ins
 COREROUTER_INSTALLER_INIT = $(COREROUTER_OUT)/corerouter-init
 COREROUTER_INSTALLER_MODULES = $(@D)/live-modules
 
+# G1.6ze: the image's kernel patches. BR2_GLOBAL_PATCH_DIR gives a package
+# only patches/<its own name>: without this hook the ISO's kernel was the
+# plain tarball, and the live image showed the tunnels' catch-all devices
+# (`gre0`, `sit0`…) that 0002 turns off. `cargo xtask os build` checks both
+# trees' .applied_patches_list.
+define COREROUTER_INSTALLER_APPLY_LINUX_PATCHES
+	$(APPLY_PATCHES) $(@D) $(BR2_EXTERNAL_COREROUTER_PATH)/patches/linux \*.patch
+endef
+COREROUTER_INSTALLER_POST_PATCH_HOOKS += COREROUTER_INSTALLER_APPLY_LINUX_PATCHES
+
 define COREROUTER_INSTALLER_CONFIGURE_CMDS
 	cp $(LINUX_DIR)/.config $(@D)/.config
 	cd $(@D) && KCONFIG_CONFIG=.config ./scripts/kconfig/merge_config.sh -m -O $(@D) \

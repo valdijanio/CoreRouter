@@ -3026,3 +3026,19 @@ G4.2h, tempestade com vinculações, duas threads, release, fsync real, 30 s (**
   para no primeiro `cmp`. Medir as formas em execuções separadas não serviu: com a carga da
   máquina mudando (carga 52 → 33), o `range` saiu com −58% e −47% (`--baseline`); alternadas,
   a diferença é a de cima.
+
+G0.3f, agrupamento do aviso de login (`cargo bench -p corerouter-engine --bench log_grouped`,
+criterion, build release, **medido** em 2026-11-11 na máquina de desenvolvimento, 32 CPUs, com
+outras sessões compilando ao mesmo tempo):
+
+| caso | tempo |
+|---|---|
+| linha sem agrupar (o que cada login fazia) | 0,79 µs |
+| repetição contada, 1 grupo | 0,70 µs |
+| repetição contada, tabela cheia (256 grupos) | 1,09 µs |
+| origem nova com a tabela cheia (tira o mais quieto, loga) | 8,6 µs |
+| `tick` por segundo, tabela cheia | 9,9 µs (8,2 µs sem grupo nenhum: +1,7 µs) |
+
+O custo fica sob o lock do `Session` que o login já pegava para gravar a linha; não há lock
+novo. Os 30 logins por TLS da CLI levaram 0,88 s (29 ms cada, quase tudo processo novo e
+handshake TLS): o agrupamento é ~0,004 % disso.
