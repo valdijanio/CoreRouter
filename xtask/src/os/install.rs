@@ -398,6 +398,52 @@ fn live_cli(t: &T, cli: &Path, port: u16, id: &str, params: &str) -> Result<Stri
     }
 }
 
+/// G1.6ze: what `interface.list` has that is neither a port nor the loopback
+/// (the kernel's own `bond0`, `dummy0`, `gre0`, `sit0`…), and every name.
+fn kernel_made(list: &str) -> Result<(Vec<String>, Vec<String>), String> {
+    let v: serde_json::Value =
+        serde_json::from_str(list.trim()).map_err(|e| format!("interface.list: {e}: {list}"))?;
+    let names: Vec<String> = v
+        .as_array()
+        .ok_or("interface.list: not a list")?
+        .iter()
+        .filter_map(|r| r["name"].as_str().map(str::to_owned))
+        .collect();
+    let extra = names
+        .iter()
+        .filter(|n| {
+            *n != "lo"
+                && !n
+                    .strip_prefix("ether")
+                    .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .cloned()
+        .collect();
+    Ok((extra, names))
+}
+
+/// G1.6ze: the router's log has no line of level error (a command refused is
+/// one: "Falhou: /interface set … no interface 'ether2'").
+fn no_errors_logged(t: &T, cli: &Path, port: u16, when: &str) -> Result<(), String> {
+    let got = live_cli(t, cli, port, "log.print", r#"{"level":"error"}"#)?;
+    let v: serde_json::Value =
+        serde_json::from_str(got.trim()).map_err(|e| format!("log.print: {e}: {got}"))?;
+    let lines: Vec<&str> = v
+        .as_array()
+        .ok_or("log.print: not a list")?
+        .iter()
+        .filter_map(|r| r["message"].as_str())
+        .collect();
+    check(
+        lines.is_empty(),
+        format!(
+            "{when}: {} error lines in the router's log: {}",
+            lines.len(),
+            lines.join(" | ")
+        ),
+    )
+}
+
 /// G1.6y: the ISO boots live with an installed CoreRouter on the (read-only)
 /// disk: the root in RAM, `/config` a tmpfs and not that disk's, no FRR, an
 /// address by DHCP on `ether1`, the router's work refused, and nothing
@@ -456,6 +502,18 @@ fn live(t: &mut T) -> Result<(), String> {
         addresses.contains("ether1"),
         format!("address: {addresses}"),
     )?;
+    // G1.6ze: the installer's kernel creates no device of its own, as the
+    // image's does not (the same command line parameters and patches).
+    let (extra, names) = kernel_made(&live_cli(t, &cli, port, "interface.list", "{}")?)?;
+    check(
+        extra.is_empty(),
+        format!(
+            "the live image lists what the kernel made by itself: {}",
+            extra.join(" ")
+        ),
+    )?;
+    t.n.put("live: interface.list", names.join(" "));
+    no_errors_logged(t, &cli, port, "live image booted, DHCP on ether1")?;
     // The other way in: the browser's GUI.
     t.n.put("live: the web GUI answers", super::web_files(web)?);
     let e = live_cli(
@@ -1016,6 +1074,13 @@ fn live_modules(t: &mut T) -> Result<(), String> {
         "live modules: card plugged in → address by DHCP",
         format!("{} ms", t3.elapsed().as_millis()),
     );
+    // G1.6ze: PID 1 adopted the port before it set anything on it.
+    no_errors_logged(t, &cli, port, "card plugged into the live image")?;
+    let (extra, names) = kernel_made(&live_cli(t, &cli, port, "interface.list", "{}")?)?;
+    check(
+        extra.is_empty() && names.iter().any(|n| n == "ether2"),
+        format!("interface.list after the card: {}", names.join(" ")),
+    )?;
     // The install, managed through the card.
     let v = install_print(t, &cli, port)?;
     let blank = disk_named(&v, "BLANK")?.clone();
@@ -1508,4 +1573,41 @@ pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), S
         let _ = std::fs::remove_file(work.join(f));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// G1.6ze: what the notebook's live image listed, and what it must list.
+    #[test]
+    fn the_kernels_own_devices_are_told_from_ports() {
+        let row = |n: &str| format!(r#"{{"name":"{n}","managed":true}}"#);
+        let list = |names: &[&str]| {
+            format!(
+                "[{}]\n",
+                names.iter().map(|n| row(n)).collect::<Vec<_>>().join(",")
+            )
+        };
+        let (extra, names) = kernel_made(&list(&["ether1", "ether2", "lo"])).unwrap();
+        assert!(extra.is_empty(), "{extra:?}");
+        assert_eq!(names, ["ether1", "ether2", "lo"]);
+        let seen = [
+            "ether1", "ether2", "bond0", "dummy0", "erspan0", "gre0", "gretap0", "ip6gre0",
+            "ip6tnl0", "sit0", "tunl0", "lo",
+        ];
+        let (extra, _) = kernel_made(&list(&seen)).unwrap();
+        assert_eq!(
+            extra,
+            [
+                "bond0", "dummy0", "erspan0", "gre0", "gretap0", "ip6gre0", "ip6tnl0", "sit0",
+                "tunl0"
+            ]
+        );
+        // A port the init could not rename is not a port name either.
+        let (extra, _) = kernel_made(&list(&["eth0", "ether", "etherx", "lo0"])).unwrap();
+        assert_eq!(extra.len(), 4);
+        assert!(kernel_made("not json").is_err());
+        assert!(kernel_made("{}").is_err());
+    }
 }

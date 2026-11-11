@@ -1069,6 +1069,15 @@ Uma placa cujo driver só existe em módulo vira porta no live e pode gerenciar 
 - **Porta que chega depois.** O live pôs cliente DHCP só nas portas da primeira passada; agora a porta
   nomeada depois (placa plugada, sonda demorada) também recebe o seu (`live_dhcp_later`), com a
   distância da rota pelo número da porta.
+- **Sem comando recusado (G1.6ze).** O daemon só adota a porta nova depois de três leituras com o
+  mesmo nome (~3 s, G1.6t), e o PID 1 repetia o `interface.set` a cada 250 ms até lá: num notebook
+  real ficaram dez linhas `Falhou: /interface set … no interface 'ether2'` no log do roteador ao
+  ligar um adaptador USB. Agora o PID 1 lê o que o daemon lista (`interface.list`,
+  `ip.dhcp-client.list`) e manda só o que falta (`plan::live_port_commands`): a porta que ele
+  acabou de nomear ele mesmo adota (`interface.ethernet.adopt`), depois liga e cria o cliente; a
+  porta plugada de novo, que já tem cliente, não recebe nada. O primeiro boot do live usa o mesmo
+  caminho. O `install-test` reprova qualquer linha de nível erro no log do live, no boot e depois
+  de plugar a placa.
 - **`corerouter.modules=off`** vale no live: a carga nem é copiada.
 - **O build confere** (`xtask/src/os/livemods.rs`): todo `.ko` da carga tem o vermagic de
   `6.18.59-live`, `e100` e `pcnet32` estão lá, há `modules.dep` e `modules.alias`, e nenhum link sobrou.
@@ -1451,6 +1460,21 @@ Com os drivers `=y`, cada um criava a sua no namespace inicial durante os initca
   o comportamento seguro.
 - O `cargo xtask os build` reaplica os patches do kernel quando mudam (`linux-dirclean`; antes
   só o fragmento era acompanhado).
+- **O kernel da ISO também (G1.6ze).** Num notebook real a ISO live listou `bond0`, `dummy0` e
+  os sete túneis; o disco instalado, não. O kernel do instalador é outro pacote do Buildroot
+  (`corerouter-installer`), e as duas correções acima não chegavam nele:
+  - o `CONFIG_CMDLINE` do `installer.fragment` substitui o da imagem e não tinha os dois
+    parâmetros (`drivers/net/bonding/bond_main.c:102,6600` e `drivers/net/dummy.c:47,179` do
+    6.18.59: sem o parâmetro, um `bond0` e um `dummy0`);
+  - o `BR2_GLOBAL_PATCH_DIR` só entrega a um pacote a pasta `patches/<nome do pacote>`. O
+    kernel do instalador era o tarball puro (`.applied_patches_list` vazio), com
+    `sysctl_fb_tunnels_only_for_init_net = 0`. O `corerouter-installer.mk` agora aplica
+    `os/patches/linux` num `POST_PATCH_HOOKS`.
+
+  Travas: o `os check` exige os dois parâmetros nas duas linhas de comando e o gancho no `.mk`;
+  o build apaga uma árvore de kernel extraída sem os patches (`corerouter-installer-dirclean`)
+  e reprova se o `.applied_patches_list` de qualquer das duas não tiver todos; o
+  `install-test` reprova uma ISO live cujo `interface.list` tenha algo além de `etherN` e `lo`.
 
 ### Shell de manutenção que parava
 

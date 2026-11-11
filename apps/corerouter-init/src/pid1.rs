@@ -424,34 +424,53 @@ fn spawn_hotplug_names(map: &'static str, live: bool) {
     }
 }
 
+/// One port of the live image, from what the daemon says of it: adopted,
+/// enabled, a DHCP client (`plan::live_port_commands`). `Ok(false)`: the
+/// daemon does not answer or does not list the port yet; `Err`: it refused a
+/// command. One at a time: the first-boot thread and a card's own thread may
+/// look at the same port.
+fn live_port(port: &str, i: usize) -> Result<bool, String> {
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ONE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let none = serde_json::json!({});
+    let (Ok(interfaces), Ok(clients)) = (
+        crate::ctl::call("interface.list", &none),
+        crate::ctl::call("ip.dhcp-client.list", &none),
+    ) else {
+        return Ok(false);
+    };
+    let Some(commands) = plan::live_port_commands(port, i, &interfaces, &clients) else {
+        return Ok(false);
+    };
+    for (cmd, params) in &commands {
+        crate::ctl::call(cmd, params).map_err(|e| format!("{cmd}: {e}"))?;
+    }
+    Ok(true)
+}
+
+/// [`live_port`], asking again every 250 ms while the daemon does not list
+/// the port, `tries` times; what happened goes to the console.
+fn live_port_wait(port: &str, i: usize, tries: u32) {
+    for left in (0..tries).rev() {
+        match live_port(port, i) {
+            Ok(true) => return log!("live image: DHCP client on {port}"),
+            Ok(false) if left > 0 => std::thread::sleep(Duration::from_millis(250)),
+            Ok(false) => log!("live image: {port}: the daemon does not list it; no DHCP client"),
+            Err(e) => return log!("live image: {port}: {e}"),
+        }
+    }
+}
+
 /// G1.6za: a port the live image got after its first pass (a card plugged in, a
 /// driver that took its time) gets its DHCP client. In a thread of its own: the
 /// daemon sees the new name a moment later, and the names must not wait for it.
 /// Before the daemon is up this gives up, and `first_boot` covers the port.
 fn live_dhcp_later(port: String) {
-    const TRIES: u32 = 40;
     let spawned = std::thread::Builder::new()
         .name("live-dhcp".into())
-        .spawn(move || {
-            let commands = plan::live_dhcp_port(&port, plan::port_index(&port));
-            for (i, (cmd, params)) in commands.iter().enumerate() {
-                let mut tries = if i == 0 { TRIES } else { 1 };
-                loop {
-                    tries -= 1;
-                    match crate::ctl::call(cmd, params) {
-                        Ok(_) => break,
-                        Err(_) if tries > 0 => std::thread::sleep(Duration::from_millis(250)),
-                        // Plugged in again: the client it had still stands.
-                        Err(e) if e.contains("already has") => break,
-                        Err(e) => {
-                            log!("live image: {port}: {cmd}: {e}");
-                            return;
-                        }
-                    }
-                }
-            }
-            log!("live image: DHCP client on {port}");
-        });
+        .spawn(move || live_port_wait(&port, plan::port_index(&port), 40));
     if let Err(e) = spawned {
         log!("live image: DHCP thread: {e}");
     }
@@ -504,10 +523,8 @@ fn first_boot(
                         ports.push(f.kernel);
                     }
                 }
-                for (cmd, params) in plan::live_dhcp_commands(&ports) {
-                    if let Err(e) = crate::ctl::call(cmd, &params) {
-                        log!("live image: {cmd}: {e}");
-                    }
+                for (i, port) in ports.iter().enumerate() {
+                    live_port_wait(port, i, 4);
                 }
             }
             if let Some(m) = mgmt
