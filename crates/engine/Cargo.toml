@@ -50,6 +50,10 @@ name = "log_disk"
 harness = false
 
 [[bench]]
+name = "log_grouped"
+harness = false
+
+[[bench]]
 name = "ntp_sources"
 harness = false
 

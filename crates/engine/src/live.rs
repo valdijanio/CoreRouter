@@ -50,9 +50,9 @@ fn allowed(id: &str) -> bool {
 
 /// `Err(reason)` when the live image refuses this command: only commands
 /// that change something (`journal`, or the writes without a journal entry).
-pub fn permit(session: &Session, id: &str, journal: bool) -> Result<(), String> {
-    let writes = crate::auth::required_group(id, journal) != crate::auth::Group::Read;
-    if writes && is_live(session) && !allowed(id) {
+pub fn permit(session: &Session, spec: &crate::cmd::CommandSpec) -> Result<(), String> {
+    let writes = crate::auth::required_group(spec) != crate::auth::Group::Read;
+    if writes && is_live(session) && !allowed(spec.id) {
         return Err(REFUSED.to_owned());
     }
     Ok(())

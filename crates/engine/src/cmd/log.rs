@@ -113,6 +113,7 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
         usize::try_from(n).unwrap_or(MAX_PRINT).clamp(1, MAX_PRINT)
     });
     s.log_trim();
+    s.log_groups_flush();
     let Some(book) = s.ext::<LogBook>() else {
         return Ok(Value::Array(Vec::new()));
     };
@@ -180,6 +181,24 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert!(errors[0]["message"].as_str().unwrap().starts_with("Falhou: /ip address add"));
         assert!(errors[0]["detail"]["error"].is_string());
+    }
+
+    /// G0.3f: "Alterado" is for what changed the configuration (also one
+    /// still waiting for a commit); an action on the router was "Executado";
+    /// a `quiet` command (the commit mode, a test) leaves no line.
+    #[test]
+    fn only_a_change_says_alterado() {
+        let mut s = Session::virtual_lab();
+        let last = |s: &mut Session| print(s, json!({})).pop().unwrap()["message"].as_str().unwrap().to_owned();
+        s.execute("ip.dns.cache.flush", &json!({})).unwrap();
+        assert_eq!(last(&mut s), "Executado: /ip dns cache flush");
+        let seq = s.log_seq();
+        s.execute("config.mode.set", &json!({"mode": "transactional"})).unwrap();
+        assert_eq!(s.log_seq(), seq, "not journaled, not logged");
+        s.execute("interface.set", &json!({"name": "ether1", "comment": "uplink"})).unwrap();
+        assert_eq!(last(&mut s), "Alterado: /interface set comment=uplink name=ether1");
+        s.execute("config.discard", &json!({})).unwrap();
+        assert_eq!(last(&mut s), "Alterado: /config discard");
     }
 
     #[test]

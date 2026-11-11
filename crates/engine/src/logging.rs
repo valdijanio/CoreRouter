@@ -17,8 +17,16 @@
 //! [`crate::log_disk::WINDOW`] of them stay here, with what the files gave
 //! back at boot, so `log.print` reads memory and disk without touching the
 //! disk.
+//!
+//! **Lines that repeat (G0.3f).** A source that would say the same thing on
+//! every event (a login without a password, once per connection of a script
+//! that opens one per command) logs through [`Session::log_event_grouped`]
+//! with a key: the first line goes out at once, the repeats are counted, and
+//! one line says how many when the window ends ([`REPEAT_WINDOWS`]). The log
+//! stays append-only, so `log.print since`, the remote syslog and the disk
+//! all see the same lines.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use corerouter_model::config::Config;
 use corerouter_model::logging::{LogEvent, LogRule, Logging};
@@ -35,6 +43,93 @@ pub const MAX_RECENT: usize = 1024;
 const MAX_PARAMS_TEXT: usize = 200;
 /// Longest JSON kept in the technical detail of one event.
 const MAX_DETAIL_TEXT: usize = 2048;
+
+/// How long the repeats of a grouped line are counted before one line says
+/// how many: 30 s after the first line, then 2 min, then every 10 min while
+/// it goes on — the schedule of BSD syslogd's "last message repeated N
+/// times" (`repeatinterval[] = { 30, 120, 600 }`, FreeBSD `syslogd.c`). A
+/// burst shows its count half a minute later; a loop that never stops costs
+/// six lines an hour.
+pub const REPEAT_WINDOWS: [u64; 3] = [30, 120, 600];
+/// A group without a repeat for this long is forgotten: its next line
+/// starts over, with the shortest window.
+const GROUP_IDLE: u64 = 600;
+/// Most groups counted at once. One more takes the place of the one quiet
+/// for longest (its count, if any, is logged first): keys come from the
+/// network (a login's source address), so the table has a ceiling.
+pub const MAX_GROUPS: usize = 256;
+/// Longest group key kept.
+const MAX_GROUP_KEY: usize = 160;
+
+/// One grouped line being counted ([`Session::log_event_grouped`]).
+#[derive(Debug)]
+struct Group {
+    topics: Vec<String>,
+    origin: String,
+    message: String,
+    detail: Value,
+    /// [`Session::log_clock`] when this window began, and which of
+    /// [`REPEAT_WINDOWS`] it is.
+    since: u64,
+    step: usize,
+    /// Clock of the newest occurrence.
+    last: u64,
+    /// Occurrences counted, not logged, in this window.
+    repeats: u64,
+}
+
+impl Group {
+    /// Repeats are still being counted at `clock` (a clock that went back
+    /// ends the window: nothing is held longer than it should).
+    fn open(&self, clock: u64) -> bool {
+        let window = REPEAT_WINDOWS.get(self.step).copied().unwrap_or(GROUP_IDLE);
+        clock >= self.since && clock.saturating_sub(self.since) < window
+    }
+
+    /// The window ended (or the group is leaving the table): the line that
+    /// says how many repeats it had, and a new window, one step longer.
+    fn close(&mut self, clock: u64) -> Option<Counted> {
+        let began = self.since;
+        let secs = clock.saturating_sub(began).max(1);
+        let repeats = std::mem::take(&mut self.repeats);
+        self.since = clock;
+        self.step = self.step.saturating_add(1).min(REPEAT_WINDOWS.len().saturating_sub(1));
+        if repeats == 0 {
+            return None;
+        }
+        let times = if repeats == 1 { "vez" } else { "vezes" };
+        let span = if secs < 120 {
+            format!("{secs} s")
+        } else {
+            format!("{} min", secs.saturating_add(30) / 60)
+        };
+        let mut detail = self.detail.clone();
+        match detail.as_object_mut() {
+            Some(o) => {
+                o.insert("repeats".into(), json!(repeats));
+                o.insert("window_secs".into(), json!(secs));
+            }
+            None => detail = json!({ "repeats": repeats, "window_secs": secs }),
+        }
+        Some(Counted {
+            since: began,
+            topics: self.topics.clone(),
+            origin: self.origin.clone(),
+            message: format!("{} — mais {repeats} {times} nos últimos {span}", self.message),
+            detail,
+        })
+    }
+}
+
+/// The line a closed window logs.
+struct Counted {
+    /// When the window began (the order they are logged in).
+    since: u64,
+    topics: Vec<String>,
+    origin: String,
+    message: String,
+    detail: Value,
+}
 
 /// The log at run time (`Session::ext`).
 #[derive(Debug, Default)]
@@ -53,6 +148,8 @@ pub struct LogBook {
     /// `log.clear` counts here: the writer deletes the files.
     disk_clears: u64,
     pub disk: DiskLogStatus,
+    /// G0.3f: the grouped lines being counted, by key (at most [`MAX_GROUPS`]).
+    groups: HashMap<String, Group>,
 }
 
 impl LogBook {
@@ -204,9 +301,25 @@ fn safe_mode_reason(reason: &str) -> &str {
     }
 }
 
+/// A command that changes configuration by its name, whatever it wrote to
+/// the config store: the accounts (`user.set`) live outside it.
+fn changes_by_name(command: &str) -> bool {
+    let verb = command.rsplit('.').next().unwrap_or(command);
+    matches!(verb, "add" | "set" | "remove" | "move" | "enable" | "disable" | "unset")
+}
+
 /// The message of a journal entry, in Portuguese: what changed, read from
 /// the parameters and from `cfg` (the running config after the command).
-pub fn journal_message(command: &str, p: &Value, result: &Result<Value>, cfg: &Config) -> String {
+/// `changed`: the command wrote to the configuration. One that did not (a
+/// reboot, a cache flush, a lease renewed) is "Executado", not "Alterado"
+/// (G0.3f): the log must not claim a change that did not happen.
+pub fn journal_message(
+    command: &str,
+    p: &Value,
+    result: &Result<Value>,
+    cfg: &Config,
+    changed: bool,
+) -> String {
     if let Err(e) = result {
         let what = params_text(p, MAX_PARAMS_TEXT);
         let sep = if what.is_empty() { "" } else { " " };
@@ -265,7 +378,12 @@ pub fn journal_message(command: &str, p: &Value, result: &Result<Value>, cfg: &C
     specific.unwrap_or_else(|| {
         let what = params_text(p, MAX_PARAMS_TEXT);
         let sep = if what.is_empty() { "" } else { " " };
-        format!("Alterado: {}{sep}{what}", menu_path(command))
+        let did = if changed || changes_by_name(command) {
+            "Alterado"
+        } else {
+            "Executado"
+        };
+        format!("{did}: {}{sep}{what}", menu_path(command))
     })
 }
 
@@ -523,6 +641,114 @@ impl Session {
         }
     }
 
+    /// The clock of the repeat windows: the steady one when the platform
+    /// has it (an NTP step must not end or stretch a window), else the
+    /// session's; 0 before any clock (no time passes: repeats are counted
+    /// until the first tick).
+    fn log_clock(&self) -> u64 {
+        self.hal().monotonic_secs().or_else(|| self.now()).unwrap_or(0)
+    }
+
+    /// [`Session::log_event`] for a line that repeats (G0.3f): `key` names
+    /// what repeats (the source, the account). The first line of a key is
+    /// logged at once; the next ones are counted until the window ends
+    /// ([`REPEAT_WINDOWS`]), when one line says how many there were. After
+    /// a window without repeats the next one is a line again. `true`: this
+    /// one was logged; `false`: counted.
+    pub fn log_event_grouped(
+        &mut self,
+        key: &str,
+        topics: &[&str],
+        origin: &str,
+        message: String,
+        detail: Value,
+    ) -> bool {
+        let clock = self.log_clock();
+        self.log_groups_close(clock);
+        let key = cut(key, MAX_GROUP_KEY);
+        let Some(book) = self.ext_mut::<LogBook>() else {
+            return false;
+        };
+        let mut pushed_out = None;
+        if let Some(g) = book.groups.get_mut(&key) {
+            g.last = clock;
+            if g.open(clock) {
+                g.repeats = g.repeats.saturating_add(1);
+                return false;
+            }
+            // Its window ended without a repeat: a line again, and the
+            // next window is longer.
+            g.close(clock);
+        } else {
+            if book.groups.len() >= MAX_GROUPS {
+                let quietest = book
+                    .groups
+                    .iter()
+                    .min_by_key(|(_, g)| g.last)
+                    .map(|(k, _)| k.clone());
+                pushed_out = quietest
+                    .and_then(|k| book.groups.remove(&k))
+                    .and_then(|mut g| g.close(clock));
+            }
+            book.groups.insert(
+                key,
+                Group {
+                    topics: topics.iter().map(|t| (*t).to_owned()).collect(),
+                    origin: origin.to_owned(),
+                    message: one_line(&message),
+                    detail: detail.clone(),
+                    since: clock,
+                    step: 0,
+                    last: clock,
+                    repeats: 0,
+                },
+            );
+        }
+        if let Some(c) = pushed_out {
+            self.log_counted(c);
+        }
+        self.log_event(topics, origin, message, detail);
+        true
+    }
+
+    /// Log the count of every group whose window ended and forget the
+    /// groups quiet for [`GROUP_IDLE`]. Every tick and every `log.print`
+    /// call this: at most [`MAX_GROUPS`] entries, nothing when none.
+    pub(crate) fn log_groups_flush(&mut self) {
+        let clock = self.log_clock();
+        self.log_groups_close(clock);
+    }
+
+    fn log_groups_close(&mut self, clock: u64) {
+        let Some(book) = self.ext_mut::<LogBook>() else {
+            return;
+        };
+        if book.groups.is_empty() {
+            return;
+        }
+        let mut counted: Vec<Counted> = Vec::new();
+        book.groups.retain(|_, g| {
+            if g.open(clock) {
+                return true;
+            }
+            if g.repeats > 0 {
+                counted.extend(g.close(clock));
+                return true;
+            }
+            clock >= g.last && clock.saturating_sub(g.last) < GROUP_IDLE
+        });
+        // The table has no order: oldest window first.
+        counted.sort_by(|a, b| (a.since, &a.message).cmp(&(b.since, &b.message)));
+        for c in counted {
+            self.log_counted(c);
+        }
+    }
+
+    fn log_counted(&mut self, c: Counted) {
+        let topics: Vec<&str> = c.topics.iter().map(String::as_str).collect();
+        self.log_event(&topics, &c.origin, c.message, c.detail);
+    }
+
     /// Every event after `after_seq` still kept (the remote forwarder).
     pub fn log_since(&self, after_seq: u64) -> Vec<LogEvent> {
         self.ext::<LogBook>().map_or_else(Vec::new, |b| {
@@ -548,6 +774,8 @@ impl Session {
             b.disk_window.clear();
             b.disk_queue.clear();
             b.disk_clears = b.disk_clears.saturating_add(1);
+            // The counts were of lines that are gone: start over.
+            b.groups.clear();
             n
         })
     }
@@ -609,6 +837,7 @@ impl Session {
         params: &Value,
         result: &Result<Value>,
         revision: Option<u32>,
+        changed: bool,
     ) {
         let topics = journal_topics(command, result.is_ok());
         let topics: Vec<&str> = topics.iter().map(String::as_str).collect();
@@ -618,7 +847,7 @@ impl Session {
         } else {
             origin(self.caller())
         };
-        let message = journal_message(command, params, result, self.store().running());
+        let message = journal_message(command, params, result, self.store().running(), changed);
         let detail = journal_detail(seq, command, params, result, revision);
         self.log_event(&topics, &who, message, detail);
     }
@@ -648,11 +877,26 @@ mod tests {
         let cfg = Config::default();
         let p = json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.0.1"});
         assert_eq!(
-            journal_message("ip.route.add", &p, &Ok(json!({"id": "*1"})), &cfg),
+            journal_message("ip.route.add", &p, &Ok(json!({"id": "*1"})), &cfg, true),
             "Alterado: /ip route add dst-address=0.0.0.0/0 gateway=10.0.0.1"
         );
+        // G0.3f: what wrote nothing to the configuration was executed, not
+        // changed; a command that changes by its name says so either way
+        // (the accounts live outside the config store).
+        assert_eq!(
+            journal_message("ip.dns.cache.flush", &json!({}), &Ok(Value::Null), &cfg, false),
+            "Executado: /ip dns cache flush"
+        );
+        assert_eq!(
+            journal_message("ip.arp.make-static", &json!({"id": "*1"}), &Ok(Value::Null), &cfg, true),
+            "Alterado: /ip arp make-static id=*1"
+        );
+        assert_eq!(
+            journal_message("user.set", &json!({"name": "noc"}), &Ok(Value::Null), &cfg, false),
+            "Alterado: /user set name=noc"
+        );
         let err = Err(EngineError::bad("gateway", "unreachable"));
-        let m = journal_message("ip.route.add", &p, &err, &cfg);
+        let m = journal_message("ip.route.add", &p, &err, &cfg, false);
         assert!(m.starts_with("Falhou: /ip route add dst-address="), "{m}");
         assert!(m.contains("unreachable"), "{m}");
         assert_eq!(
@@ -660,7 +904,8 @@ mod tests {
                 "ip.address.add",
                 &json!({"address": "10.0.0.1/24", "interface": "ether1"}),
                 &Ok(Value::Null),
-                &cfg
+                &cfg,
+                true
             ),
             "Endereço 10.0.0.1/24 adicionado em ether1"
         );
@@ -668,7 +913,7 @@ mod tests {
         on.system.ntp_client.enabled = true;
         on.system.ntp_client.servers = vec!["pool.ntp.org".into()];
         assert_eq!(
-            journal_message("system.ntp.client.set", &json!({}), &Ok(Value::Null), &on),
+            journal_message("system.ntp.client.set", &json!({}), &Ok(Value::Null), &on, true),
             "NTP Client ligado: servidores pool.ntp.org, poll 6–10"
         );
     }
@@ -676,7 +921,7 @@ mod tests {
     #[test]
     fn long_params_are_cut_on_a_char_boundary() {
         let p = json!({ "name": "ã".repeat(600) });
-        let m = journal_message("system.note.set", &p, &Ok(Value::Null), &Config::default());
+        let m = journal_message("system.note.set", &p, &Ok(Value::Null), &Config::default(), true);
         assert!(m.len() < 300, "{}", m.len());
         assert!(m.ends_with('…'));
         let big = json!({ "x": "y".repeat(5000) });
@@ -764,5 +1009,196 @@ mod tests {
             .map(|e| e.message.as_str())
             .collect();
         assert_eq!(kept, ["3", "4"]);
+    }
+
+    /// The `memory` lines with `needle`, oldest first.
+    fn lines(s: &Session, needle: &str) -> Vec<String> {
+        s.ext::<LogBook>()
+            .unwrap()
+            .memory()
+            .filter(|e| e.message.contains(needle))
+            .map(|e| e.message.clone())
+            .collect()
+    }
+
+    fn login(s: &mut Session, key: &str, text: &str) -> bool {
+        s.log_event_grouped(
+            key,
+            &["system", "account", "warning"],
+            "auth",
+            text.to_owned(),
+            json!({"address": key}),
+        )
+    }
+
+    /// G0.3f: the first line at once, the repeats as one count when the
+    /// window ends, on BSD syslogd's schedule: 30 s, 2 min, then 10 min.
+    #[test]
+    fn a_repeated_line_is_logged_once_and_then_counted() {
+        let mut s = Session::virtual_lab();
+        s.tick(1_000);
+        assert!(login(&mut s, "a", "sem senha de A"), "the first one is a line");
+        for _ in 0..29 {
+            assert!(!login(&mut s, "a", "sem senha de A"), "a repeat is counted");
+        }
+        assert_eq!(lines(&s, "sem senha de A"), ["sem senha de A"]);
+        s.tick(1_029);
+        assert_eq!(lines(&s, "sem senha").len(), 1, "the window is still open");
+        s.tick(1_030);
+        assert_eq!(
+            lines(&s, "sem senha"),
+            ["sem senha de A", "sem senha de A — mais 29 vezes nos últimos 30 s"]
+        );
+        let counted = s.log_since(0).pop().unwrap();
+        assert_eq!(counted.topics, ["system", "account", "warning"]);
+        assert_eq!(counted.origin, "auth");
+        assert_eq!(counted.detail["repeats"], 29);
+        assert_eq!(counted.detail["window_secs"], 30);
+        assert_eq!(counted.detail["address"], "a", "the first line's detail");
+        // It goes on: the next count comes 2 min later, then every 10 min.
+        login(&mut s, "a", "sem senha de A");
+        s.tick(1_149);
+        assert_eq!(lines(&s, "sem senha").len(), 2);
+        s.tick(1_150);
+        assert_eq!(
+            lines(&s, "sem senha").last().unwrap(),
+            "sem senha de A — mais 1 vez nos últimos 2 min"
+        );
+        for t in [1_151, 1_400, 1_749] {
+            s.tick(t);
+            login(&mut s, "a", "sem senha de A");
+        }
+        assert_eq!(lines(&s, "sem senha").len(), 3);
+        s.tick(1_750);
+        assert_eq!(
+            lines(&s, "sem senha").last().unwrap(),
+            "sem senha de A — mais 3 vezes nos últimos 10 min"
+        );
+        login(&mut s, "a", "sem senha de A");
+        s.tick(2_350);
+        assert_eq!(
+            lines(&s, "sem senha").last().unwrap(),
+            "sem senha de A — mais 1 vez nos últimos 10 min",
+            "10 min is the longest window"
+        );
+    }
+
+    #[test]
+    fn groups_do_not_mix() {
+        let mut s = Session::virtual_lab();
+        s.tick(1_000);
+        assert!(login(&mut s, "a", "sem senha de A"));
+        assert!(login(&mut s, "b", "sem senha de B"), "another source: its own line");
+        for _ in 0..3 {
+            login(&mut s, "a", "sem senha de A");
+        }
+        login(&mut s, "b", "sem senha de B");
+        // An ordinary line in between is not held back nor counted.
+        s.log_event(&["system", "info"], DAEMON, "outra coisa".into(), Value::Null);
+        s.tick(1_030);
+        assert_eq!(
+            lines(&s, ""),
+            [
+                "sem senha de A",
+                "sem senha de B",
+                "outra coisa",
+                "sem senha de A — mais 3 vezes nos últimos 30 s",
+                "sem senha de B — mais 1 vez nos últimos 30 s",
+            ]
+        );
+    }
+
+    /// After a window without repeats the next one is a line again (with a
+    /// longer window, so a slow loop still ends at one line per 10 min);
+    /// after 10 min of silence the group starts over.
+    #[test]
+    fn a_quiet_group_logs_again_and_is_forgotten() {
+        let mut s = Session::virtual_lab();
+        s.tick(1_000);
+        assert!(login(&mut s, "a", "sem senha de A"));
+        s.tick(1_045);
+        assert!(login(&mut s, "a", "sem senha de A"), "45 s later, nothing in between");
+        s.tick(1_090);
+        assert!(!login(&mut s, "a", "sem senha de A"), "the second window is 2 min");
+        s.tick(1_165);
+        assert_eq!(lines(&s, "mais 1 vez nos últimos 2 min").len(), 1);
+        assert_eq!(s.ext::<LogBook>().unwrap().groups.len(), 1);
+        // Its 10 min window ends with nothing counted and 10 min of silence.
+        s.tick(1_764);
+        assert_eq!(s.ext::<LogBook>().unwrap().groups.len(), 1);
+        s.tick(1_765);
+        assert!(s.ext::<LogBook>().unwrap().groups.is_empty(), "forgotten");
+        assert!(login(&mut s, "a", "sem senha de A"));
+        s.tick(1_775);
+        assert!(!login(&mut s, "a", "sem senha de A"));
+        s.tick(1_795);
+        assert_eq!(lines(&s, "mais 1 vez nos últimos 30 s").len(), 1, "from the start");
+    }
+
+    /// Keys come from the network: the table has a ceiling, and the group
+    /// that leaves it says what it had counted.
+    #[test]
+    fn the_group_table_has_a_ceiling() {
+        let mut s = Session::virtual_lab();
+        s.execute(
+            "system.logging.action.set",
+            &json!({"name": "memory", "memory_lines": 5000}),
+        )
+        .unwrap();
+        s.tick(1_000);
+        login(&mut s, "first", "sem senha de first");
+        login(&mut s, "first", "sem senha de first");
+        s.tick(1_001);
+        for n in 0..MAX_GROUPS + 50 {
+            assert!(login(&mut s, &format!("k{n}"), &format!("sem senha de k{n}")));
+        }
+        let book = s.ext::<LogBook>().unwrap();
+        assert_eq!(book.groups.len(), MAX_GROUPS);
+        assert!(!book.groups.contains_key("first"), "the quietest one left");
+        assert_eq!(lines(&s, "sem senha de first — mais 1 vez nos últimos 1 s").len(), 1);
+        // A hostile key is cut, not kept whole.
+        login(&mut s, &"x".repeat(100_000), "sem senha de x");
+        let longest = s.ext::<LogBook>().unwrap().groups.keys().map(String::len).max();
+        assert!(longest.unwrap() <= MAX_GROUP_KEY + 4, "{longest:?}");
+    }
+
+    /// No clock yet (before the first tick): nothing is lost, the repeats
+    /// are counted and logged once there is one. A clock that goes back
+    /// ends the window instead of holding the count.
+    #[test]
+    fn grouping_survives_a_missing_or_stepped_clock() {
+        let mut s = Session::virtual_lab();
+        assert!(login(&mut s, "a", "sem senha de A"));
+        assert!(!login(&mut s, "a", "sem senha de A"));
+        s.tick(1_700_000_000);
+        assert_eq!(lines(&s, "sem senha de A — mais 1 vez").len(), 1);
+        assert!(!login(&mut s, "a", "sem senha de A"));
+        s.tick(1_000);
+        assert_eq!(lines(&s, "sem senha de A — mais 1 vez").len(), 2);
+    }
+
+    #[test]
+    fn clear_forgets_the_counts() {
+        let mut s = Session::virtual_lab();
+        s.tick(1_000);
+        login(&mut s, "a", "sem senha de A");
+        login(&mut s, "a", "sem senha de A");
+        s.execute("log.clear", &json!({})).unwrap();
+        assert!(login(&mut s, "a", "sem senha de A"), "a line again after the clear");
+        s.tick(1_030);
+        assert!(lines(&s, "mais").is_empty());
+    }
+
+    /// `log.print` shows a count whose window ended even without a tick.
+    #[test]
+    fn print_logs_the_counts_that_are_due() {
+        let mut s = Session::virtual_lab();
+        s.tick(1_000);
+        login(&mut s, "a", "sem senha de A");
+        login(&mut s, "a", "sem senha de A");
+        s.safe_mode_mut().clock = Some(1_030);
+        let rows = s.execute("log.print", &json!({"find": "sem senha"})).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 2, "{rows}");
+        assert_eq!(rows[1]["detail"]["repeats"], 1);
     }
 }

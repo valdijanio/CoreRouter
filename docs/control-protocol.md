@@ -84,8 +84,13 @@ hash de uma string vazia. Regras enquanto uma conta `full` ativa estiver sem sen
 - **G0.3d (como o RouterOS CHR):** o login dela com senha **vazia** vale de **qualquer
   endereço**, loopback ou rede (fora do loopback é sempre TLS). Manter sem senha é escolha do
   operador: nada força a troca nem limita comandos. Em troca, o aviso é constante:
-  - cada login sem senha vira uma linha de aviso no log do roteador (`log.print`, tópicos
-    `system,account,warning`, origem `auth`) com o usuário, o endereço de origem e o canal;
+  - o login sem senha vira uma linha de aviso no log do roteador (`log.print`, tópicos
+    `system,account,warning`, origem `auth`) com o usuário, o endereço de origem e o canal.
+    **G0.3f:** o aviso é agrupado por conta e origem (endereço IPv4 ou /64 IPv6): a primeira
+    linha sai na hora e as repetições viram uma contagem ("… — mais 30 vezes nos últimos
+    30 s") 30 s depois, então 2 min, então a cada 10 min enquanto durar (os intervalos do
+    "last message repeated N times" do syslogd BSD). Uma ferramenta que entra uma vez por
+    comando não esconde mais o resto do log. A tabela tem teto de 256 grupos;
   - a verificação de saúde `auth.no_password` ("Admin password") fica em `warning` (o selo
     "1 warning" da barra) até haver senha;
   - `auth.login` responde `no_password: true` e o `auth.whoami` lista as contas; GUI, CLI,

@@ -79,16 +79,13 @@ impl Principal {
     }
 }
 
-/// Commands that change state although they are not journaled.
-/// `system.package.upload.chunk` (G1.6e) is one: its data must not land in
-/// the journal, a megabyte per line.
-const WRITE_QUERIES: &[&str] = &["config.mode.set", "system.package.upload.chunk"];
-
-/// The group a command needs.
-pub fn required_group(id: &str, journal: bool) -> Group {
-    if id.starts_with("user.") {
+/// The group a command needs: `full` for user management, `write` for
+/// what changes or starts something (journaled or `cmd!(quiet …)`), `read`
+/// for the queries.
+pub fn required_group(spec: &crate::cmd::CommandSpec) -> Group {
+    if spec.id.starts_with("user.") {
         Group::Full
-    } else if journal || WRITE_QUERIES.contains(&id) {
+    } else if spec.writes {
         Group::Write
     } else {
         Group::Read
@@ -350,11 +347,21 @@ mod tests {
 
     #[test]
     fn groups_per_command() {
-        assert_eq!(required_group("interface.list", false), Group::Read);
-        assert_eq!(required_group("ip.address.add", true), Group::Write);
-        assert_eq!(required_group("config.mode.set", false), Group::Write);
-        assert_eq!(required_group("user.list", false), Group::Full);
-        assert_eq!(required_group("user.add", true), Group::Full);
+        let need = |id: &str| required_group(crate::cmd::find(id).unwrap());
+        assert_eq!(need("interface.list"), Group::Read);
+        assert_eq!(need("ip.address.add"), Group::Write);
+        // Not journaled, still a write (`cmd!(quiet …)`).
+        for id in [
+            "config.mode.set",
+            "system.package.upload.chunk",
+            "system.install.test",
+            "system.install.rescan",
+        ] {
+            assert_eq!(need(id), Group::Write, "{id}");
+            assert!(!crate::cmd::find(id).unwrap().journal, "{id}");
+        }
+        assert_eq!(need("user.list"), Group::Full);
+        assert_eq!(need("user.add"), Group::Full);
         let bob = Principal::User("bob".into());
         assert!(permit(&bob, Some(Group::Write), Group::Read).is_ok());
         assert!(
