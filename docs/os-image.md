@@ -725,7 +725,17 @@ de tela em módulo, carregado na segunda passada, tomando o console do `simpledr
 laboratório ligou `CONFIG_DRM_BOCHS=m` (a VGA padrão do QEMU): em UEFI, o log tem
 `driver bochs loaded in 23 ms` depois da linha da varredura, e a tela segue com o aviso do
 primeiro boot, no disco e na ISO (`docs/changes/G1.6zd-screenshots/`). O `bochs` não ficou na
-imagem. **O i915 de verdade só se confirma no notebook.**
+imagem. No notebook (LOQ 15IRH8, ISO live, **medido** em 2026-11-11) o log do sistema traz
+`driver i915 loaded in 1040 ms`, o GuC 70.49.4, o HuC e o DMC carregados e o `fbcon` passando
+para o `i915drmfb`, sem as linhas de erro.
+
+**Última linha do console no reboot.** O PID 1 chama `tcdrain` no console (até 1 s, numa thread
+`console-drain`, para uma serial com o fluxo segurado não travar o desligamento) antes de mandar
+o SIGHUP aos serviços e antes do `reboot(2)`. Quando o shell de manutenção (líder da sessão do
+`ttyS0`) sai, o kernel desfaz o terminal de controle e descarta o que ainda estava na fila da
+UART (`drivers/tty/tty_jobctrl.c:265-275` → `tty_ldisc.c:700` → `serial/serial_core.c:685`,
+6.18.59); o `reboot(2)` também não espera a UART. Sem a espera, a linha com o motivo do reboot
+podia sair cortada.
 
 ### O que o roteador avisa quando a placa não sobe (G1.6ja)
 
