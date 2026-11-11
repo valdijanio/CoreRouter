@@ -149,13 +149,14 @@ impl T {
 
     /// A VM image as it is (a throw-away overlay), fresh NVRAM. With
     /// `setup`, the console setup is answered on the serial console (port,
-    /// address, gateway, admin password) and the address pinged over TLS.
+    /// address — fixed with a gateway, or DHCP — admin password) and the
+    /// address pinged over TLS.
     fn boot_image(
         &mut self,
         name: &str,
         file: &Path,
         format: &str,
-        setup: bool,
+        setup: Option<Setup>,
     ) -> Result<(), String> {
         fresh_vars(&self.vars())?;
         let port = super::free_port()?;
@@ -184,33 +185,67 @@ impl T {
             ),
             ready_s(r.first().map_or("", String::as_str)),
         );
-        if !setup {
+        let Some(setup) = setup else {
             return Ok(());
-        }
+        };
         // G1.6m: no default answers; the port by number, confirmed; a
         // summary and an explicit yes.
         // G1.6zg: one screen (who, the ports, what needs attention), the
         // invitation at its end; the questions in numbered steps.
         vm.expect(&mut log, &["no port has a management address yet"], 30)?;
         answer(&mut vm, &mut log, "no command shell", "")?;
+        // G1.6zl: a first boot starts the port off; the setup turns it on
+        // and shows its link (the user-mode network has a carrier).
+        let t = Instant::now();
+        vm.expect(&mut log, &["Turning ether1 on to read the link"], 30)?;
         vm.expect(&mut log, &["[1/4] Management port"], 30)?;
         let row = answer(&mut vm, &mut log, "  1  ether1 ", "1")?;
         check(
-            row.contains("52:54:") && row.contains(" off "),
+            row.contains("52:54:") && row.contains(" up "),
             format!("port list: {row}"),
         )?;
+        self.n.put(
+            &format!("{name}: setup, port turned on and its link read"),
+            format!("{:.1} s", t.elapsed().as_secs_f64()),
+        );
         answer(&mut vm, &mut log, "Port (number or name)", "y")?;
-        answer(&mut vm, &mut log, "Use ether1", "10.0.2.15/24")?;
-        answer(&mut vm, &mut log, "Address/prefix", "10.0.2.2")?;
-        answer(
-            &mut vm,
-            &mut log,
-            "admin has no password",
-            "corerouter-test-1",
-        )?;
-        answer(&mut vm, &mut log, "New admin password", "corerouter-test-1")?;
-        answer(&mut vm, &mut log, "Admin     new password", "y")?;
-        vm.expect(&mut log, &["OK  admin password set"], 30)?;
+        match setup {
+            Setup::Fixed => {
+                answer(&mut vm, &mut log, "Use ether1 (link up", "10.0.2.15/24")?;
+                answer(&mut vm, &mut log, "Address/prefix", "10.0.2.2")?;
+                answer(
+                    &mut vm,
+                    &mut log,
+                    "admin has no password",
+                    "corerouter-test-1",
+                )?;
+                answer(&mut vm, &mut log, "New admin password", "corerouter-test-1")?;
+                answer(&mut vm, &mut log, "Admin     new password", "y")?;
+                vm.expect(&mut log, &["OK  admin password set"], 30)?;
+            }
+            Setup::Dhcp => {
+                // Enter takes the default, DHCP, on a cable's port too.
+                answer(&mut vm, &mut log, "Use ether1 (link up", "")?;
+                answer(&mut vm, &mut log, "admin has no password", "")?;
+                vm.expect(
+                    &mut log,
+                    &["Address   from DHCP, on this port's network"],
+                    30,
+                )?;
+                // The summary's last row, then the question.
+                answer(
+                    &mut vm,
+                    &mut log,
+                    "(the empty one works from the network",
+                    "y",
+                )?;
+                let l = vm.expect(&mut log, &["from DHCP"], 30)?;
+                check(
+                    l.contains("ether1: 10.0.2.15/24 from DHCP"),
+                    format!("DHCP lease: {l}"),
+                )?;
+            }
+        }
         vm.expect(
             &mut log,
             &["Done: the router has its management address"],
@@ -249,6 +284,39 @@ impl T {
             .put(&format!("{name}: console setup, then TLS ping"), ping?);
         Ok(())
     }
+}
+
+/// The qcow2 and OVA images as a hypervisor boots them, with the console
+/// setup answered: a fixed address on the qcow2, DHCP on the OVA (G1.6zl).
+fn images_setup(t: &mut T, work: &Path) -> Result<(), String> {
+    let qcow2 = t.images.join("corerouter.qcow2");
+    t.boot_image("qcow2", &qcow2, "qcow2", Some(Setup::Fixed))?;
+    let st = Command::new("tar")
+        .arg("-C")
+        .arg(work)
+        .arg("-xf")
+        .arg(t.images.join("corerouter.ova"))
+        .status()
+        .map_err(|e| format!("tar: {e}"))?;
+    check(st.success(), "tar -xf corerouter.ova failed")?;
+    // G1.6zl: the OVA answers the setup with DHCP on the cable's port.
+    t.boot_image(
+        "ova",
+        &work.join("corerouter-disk1.vmdk"),
+        "vmdk",
+        Some(Setup::Dhcp),
+    )?;
+
+    Ok(())
+}
+
+/// How [`T::boot_image`] answers the console setup's address.
+#[derive(Clone, Copy)]
+enum Setup {
+    /// `10.0.2.15/24`, gateway `10.0.2.2`, an admin password.
+    Fixed,
+    /// Enter: DHCP from the user-mode network (G1.6zl), no password.
+    Dhcp,
 }
 
 /// Types `text` once a line with `after` went by (the prompt itself has no
@@ -1642,6 +1710,7 @@ pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), S
     let mut fw = Firmware::Ovmf;
     let mut only_modules = false;
     let mut only_sd = false;
+    let mut only_images = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -1652,7 +1721,10 @@ pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), S
                 match what {
                     Some("live-modules") => only_modules = true,
                     Some("sd") => only_sd = true,
-                    _ => return Err(format!("--only {what:?}: live-modules or sd")),
+                    Some("images") => only_images = true,
+                    _ => {
+                        return Err(format!("--only {what:?}: live-modules, sd or images"));
+                    }
                 }
             }
             other => return Err(format!("unknown argument '{other}'")),
@@ -1702,6 +1774,14 @@ pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), S
         }
         return Ok(());
     }
+    if only_images {
+        images_setup(&mut t, &work)?;
+        eprintln!("\nimages ok ({}):", fw.name());
+        for (k, v) in &t.n.0 {
+            eprintln!("  {k}: {v}");
+        }
+        return Ok(());
+    }
     if only_modules {
         live_modules(&mut t)?;
         live_modules_tampered(&mut t)?;
@@ -1741,18 +1821,7 @@ pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), S
     live_modules_tampered(&mut t)?;
     live_sd(&mut t)?;
 
-    let qcow2 = images.join("corerouter.qcow2");
-    t.boot_image("qcow2", &qcow2, "qcow2", true)?;
-    let st = Command::new("tar")
-        .arg("-C")
-        .arg(&work)
-        .arg("-xf")
-        .arg(images.join("corerouter.ova"))
-        .status()
-        .map_err(|e| format!("tar: {e}"))?;
-    check(st.success(), "tar -xf corerouter.ova failed")?;
-    t.boot_image("ova", &work.join("corerouter-disk1.vmdk"), "vmdk", false)?;
-
+    images_setup(&mut t, &work)?;
     let _ = writeln!(t.log, "===== done =====");
     eprintln!(
         "\ninstall-test ok in {:.1} s ({}, {}):",
