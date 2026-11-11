@@ -51,19 +51,30 @@ pub fn human(bytes: u64) -> String {
     }
 }
 
-/// Whole disks (no partitions, loop, ram, device-mapper); optical drives
-/// only with `optical` (the medium may be a CD, a target never is).
+/// Is `/sys/block/<name>` a whole disk an install could look at? Not loop,
+/// ram, device-mapper and the like; optical drives only with `optical`.
+/// G1.6zi: nor an eMMC's boot areas (`mmcblk0boot0`, `mmcblk0boot1`): two
+/// small read-only "disks" of every eMMC, which the firmware boots from.
+pub fn whole_disk(name: &str, optical: bool) -> bool {
+    let emmc_boot = name.strip_prefix("mmcblk").is_some_and(|n| {
+        let area = n.trim_start_matches(|c: char| c.is_ascii_digit());
+        area.len() < n.len() && area.starts_with("boot")
+    });
+    (optical || !name.starts_with("sr"))
+        && !emmc_boot
+        && !["loop", "ram", "zram", "dm-", "md", "nbd", "fd"]
+            .iter()
+            .any(|p| name.starts_with(p))
+}
+
+/// Whole disks ([`whole_disk`]); optical drives only with `optical` (the
+/// medium may be a CD, a target never is).
 pub fn block_devices(optical: bool) -> Vec<String> {
     let mut out: Vec<String> = std::fs::read_dir("/sys/block")
         .map(|d| {
             d.flatten()
                 .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|n| optical || !n.starts_with("sr"))
-                .filter(|n| {
-                    !["loop", "ram", "zram", "dm-", "md", "nbd", "fd"]
-                        .iter()
-                        .any(|p| n.starts_with(p))
-                })
+                .filter(|n| whole_disk(n, optical))
                 .collect()
         })
         .unwrap_or_default();
@@ -118,6 +129,8 @@ fn bus(name: &str) -> &'static str {
         "SATA"
     } else if name.starts_with("mmcblk") {
         "SD/eMMC"
+    } else if name.starts_with("xvd") {
+        "Xen"
     } else if name.starts_with("sr") {
         "optical"
     } else {
@@ -211,5 +224,41 @@ pub fn describe(e: &Existing) -> String {
         Existing::Gpt(names) => format!("GPT: {}", names.join(", ")),
         Existing::CoreRouter { .. } => "CoreRouter".into(),
         Existing::Unknown => "data (MBR or a filesystem)".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// G1.6zi: an eMMC is a disk to install to; its two boot areas are not.
+    #[test]
+    fn an_emmc_is_a_target_and_its_boot_areas_are_not() {
+        for disk in [
+            "sda", "vda", "xvda", "nvme0n1", "mmcblk0", "mmcblk1", "mmcblk12",
+        ] {
+            assert!(whole_disk(disk, false), "{disk}");
+        }
+        for not in [
+            "mmcblk0boot0",
+            "mmcblk0boot1",
+            "mmcblk12boot0",
+            "loop0",
+            "ram0",
+            "zram0",
+            "dm-0",
+            "md127",
+            "nbd0",
+            "fd0",
+            "sr0",
+        ] {
+            assert!(!whole_disk(not, false), "{not}");
+        }
+        // The medium may be a CD; nothing else changes with it.
+        assert!(whole_disk("sr0", true));
+        assert!(!whole_disk("mmcblk0boot0", true));
+        // Only the boot areas: not a disk that merely starts the same.
+        assert!(whole_disk("mmcblkboot", false));
+        assert!(whole_disk("mmcblk0rpmb", false));
     }
 }

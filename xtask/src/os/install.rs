@@ -422,6 +422,21 @@ pub(super) fn cli_run(
     }
 }
 
+/// The pids of the zombies in the guest's answer (`Name: sh Pid: 41 PPid: 1
+/// … none`, one line).
+fn zombie_pids(answer: &str) -> Vec<&str> {
+    let mut words = answer.split_whitespace();
+    let mut out = Vec::new();
+    while let Some(w) = words.next() {
+        if w == "Pid:"
+            && let Some(pid) = words.next()
+        {
+            out.push(pid);
+        }
+    }
+    out
+}
+
 /// G1.6ze: what `interface.list` has that is neither a port nor the loopback
 /// (the kernel's own `bond0`, `dummy0`, `gre0`, `sit0`…), and every name.
 fn kernel_made(list: &str) -> Result<(Vec<String>, Vec<String>), String> {
@@ -1151,6 +1166,143 @@ fn live_modules(t: &mut T) -> Result<(), String> {
     Ok(())
 }
 
+/// The SD card of G1.6zi's test on its SDHCI controller, in a QEMU command.
+fn sd_card(cmd: &mut Command, card: &Path) {
+    cmd.args(["-device", "sdhci-pci"]);
+    cmd.arg("-drive").arg(format!(
+        "file={},if=none,id=sdcard,format=raw",
+        card.display()
+    ));
+    cmd.args(["-device", "sd-card,drive=sdcard"]);
+}
+
+/// G1.6zi: the ISO on a machine whose only disk is a card on an SDHCI
+/// controller: what the soldered eMMC of a mini-PC or an x86 appliance is to
+/// the kernel (`mmcblk0`, the same drivers). The live image lists it as a
+/// target, installs to it, and the firmware boots the router from it. The
+/// kernels had no MMC support: such a machine showed no disk at all.
+fn live_sd(t: &mut T) -> Result<(), String> {
+    let cli = super::push::cli(&t.root)?;
+    let iso = t.images.join("corerouter-install.iso");
+    let mut log = t.log.try_clone().map_err(|e| e.to_string())?;
+    fresh_vars(&t.vars())?;
+    // QEMU takes a card whose size is a power of two.
+    let card = t.work.join("sd-card.raw");
+    std::fs::File::create(&card)
+        .and_then(|f| f.set_len(2 << 30))
+        .map_err(|e| format!("{}: {e}", card.display()))?;
+    let port = super::free_port()?;
+    let mut cmd = qemu_machine(t.kvm, t.fw, &t.vars());
+    sd_card(&mut cmd, &card);
+    cmd.arg("-drive").arg(format!(
+        "file={},if=none,id=cd,format=raw,media=cdrom,readonly=on",
+        iso.display()
+    ));
+    cmd.args(["-device", "ide-cd,drive=cd,bootindex=0"]);
+    cmd.arg("-netdev").arg(format!(
+        "user,id=n0,hostfwd=tcp:127.0.0.1:{port}-:{}",
+        super::GUEST_TLS_PORT
+    ));
+    cmd.args(["-device", "virtio-net-pci,netdev=n0"]);
+    let mut vm = start(&mut log, "live/sd", cmd)?;
+    vm.expect_all(&mut log, &["ready:", "NOT INSTALLED"], 120)?;
+    let address = |t: &T, what: &str| -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let got = live_cli(t, &cli, port, "ip.address.list", "{}").unwrap_or_else(|e| e);
+            if got.contains("10.0.2.15") {
+                return Ok(());
+            }
+            check(Instant::now() < deadline, format!("{what}: {got}"))?;
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    };
+    address(t, "no DHCP address on the live image")?;
+    let v = install_print(t, &cli, port)?;
+    let disks = v["disks"].as_array().cloned().unwrap_or_default();
+    let names: Vec<&str> = disks.iter().filter_map(|d| d["name"].as_str()).collect();
+    let target = disks
+        .iter()
+        .find(|d| d["name"].as_str().is_some_and(|n| n.starts_with("mmcblk")))
+        .ok_or_else(|| {
+            format!(
+                "the card is not a disk of the live image (no MMC in the ISO's kernel?): {names:?}"
+            )
+        })?
+        .clone();
+    check(
+        target["bus"] == "SD/eMMC" && target["refused"].is_null(),
+        format!("the card as a target: {target}"),
+    )?;
+    check(
+        !names.iter().any(|n| n.contains("boot")),
+        format!("an eMMC boot area listed as a disk: {names:?}"),
+    )?;
+    let name = target["name"].as_str().unwrap_or_default().to_owned();
+    let mut p: serde_json::Value =
+        serde_json::from_str(&run_params(&target, &name, None)).map_err(|e| e.to_string())?;
+    p["mgmt_port"] = serde_json::json!("ether1");
+    p["mgmt_mode"] = serde_json::json!("dhcp");
+    let installing = Instant::now();
+    live_cli(t, &cli, port, "system.install.run", &p.to_string())?;
+    let r = install_result(t, &cli, port)?;
+    check(r["ok"] == true, format!("install to the card: {r}"))?;
+    t.n.put(
+        "sd card: installed from the live image",
+        format!("{name}, {} ms", installing.elapsed().as_millis()),
+    );
+    live_cli(t, &cli, port, "system.reboot", r#"{"confirm":true}"#)?;
+    vm.wait_exit(&mut log, 60)?;
+    // The card alone. SeaBIOS boots from it (its own SD driver), so the
+    // whole path is the firmware's. This OVMF build has no SD/MMC driver
+    // ("BdsDxe: failed to load Boot0003 "CoreRouter A" … Not Found", where a
+    // mini-PC's firmware has one for its eMMC): there QEMU hands the image's
+    // kernel over, and what is checked is that the kernel finds its root and
+    // /config on the card by itself.
+    t.strict = true;
+    let mut cmd = qemu_machine(t.kvm, t.fw, &t.vars());
+    sd_card(&mut cmd, &card);
+    let by = if t.fw == Firmware::Ovmf {
+        cmd.arg("-kernel").arg(t.images.join("bzImage"));
+        "the image's kernel finds the router on it"
+    } else {
+        "the firmware boots the router from it"
+    };
+    cmd.arg("-netdev").arg(format!(
+        "user,id=n0,hostfwd=tcp:127.0.0.1:{port}-:{}",
+        super::GUEST_TLS_PORT
+    ));
+    cmd.args(["-device", "virtio-net-pci,netdev=n0"]);
+    let booted = Instant::now();
+    let mut disk = start(&mut log, "live/sd-disk", cmd)?;
+    let r = disk.expect_all(&mut log, &["/config: /dev/mmcblk", "ready:"], 120);
+    let r = match r {
+        Ok(r) => r,
+        Err(e) => {
+            t.strict = false;
+            return Err(format!("boot from the card: {e}"));
+        }
+    };
+    let on = address(t, "no address after the install to the card");
+    t.strict = false;
+    on?;
+    drop(disk);
+    t.n.put(
+        &format!("sd card: {by}"),
+        format!(
+            "{} ({:.1} s)",
+            r.first().map_or("", |l| l
+                .split("corerouter-init: ")
+                .last()
+                .unwrap_or("")
+                .trim()),
+            booted.elapsed().as_secs_f64()
+        ),
+    );
+    let _ = std::fs::remove_file(&card);
+    Ok(())
+}
+
 /// G1.6za: a byte changed in the payload on the medium. The hash in the signed
 /// index stops it before anything is mounted, the console says so, and the
 /// live image comes up anyway: a built-in card has its port, the card that
@@ -1369,19 +1521,28 @@ fn check_installed(t: &mut T, vm: &mut Vm, port: u16, first: bool) -> Result<(),
     vm.stdin_write(b"exit\n")?;
     vm.expect(&mut log, &["maintenance shell on /dev/ttyS0"], 30)?;
     std::thread::sleep(Duration::from_millis(800));
-    let z = sh(
-        vm,
-        &mut log,
-        "grep -l '^State:.*Z' /proc/[0-9]*/status 2>/dev/null | wc -l",
-    )?;
-    check(
-        z.trim() == "0",
-        format!("zombies after the shell exit: {z}"),
-    )?;
-    t.n.put(
-        &format!("{what}: shell after exit"),
-        "started again, no zombies".to_owned(),
-    );
+    // A zombie that stays one is what this is about: a child nobody reaps.
+    // One that is gone half a second later was between its exit and its
+    // parent's wait, which is not this defect. The bare count failed the
+    // test once in seven runs, on a loaded machine, and did not say which
+    // process it was: now it is named (cause not found: G1.6zi's notes).
+    const ZOMBIES: &str = "{ for s in /proc/[0-9]*/status; do grep -q '^State:.*Z' $s 2>/dev/null && echo $(grep -h '^Name:\\|^Pid:\\|^PPid:' $s); done; echo none; }";
+    let seen = sh(vm, &mut log, ZOMBIES)?;
+    let mut said = "started again, no zombies".to_owned();
+    if !zombie_pids(&seen).is_empty() {
+        std::thread::sleep(Duration::from_millis(500));
+        let still = sh(vm, &mut log, ZOMBIES)?;
+        let stuck: Vec<&str> = zombie_pids(&seen)
+            .into_iter()
+            .filter(|p| zombie_pids(&still).contains(p))
+            .collect();
+        check(
+            stuck.is_empty(),
+            format!("zombies after the shell exit, still there 500 ms later: {still}"),
+        )?;
+        said = format!("started again; a zombie on its way out, reaped 500 ms later: {seen}");
+    }
+    t.n.put(&format!("{what}: shell after exit"), said);
     // FRR: the daemons always on (G1.6i starts the others when the config
     // uses them), the frr service attached.
     let vty = sh(vm, &mut log, "ls /var/run/frr/ | grep -c 'vty$'")?;
@@ -1480,6 +1641,7 @@ pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), S
     let mut tcg = false;
     let mut fw = Firmware::Ovmf;
     let mut only_modules = false;
+    let mut only_sd = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -1487,11 +1649,11 @@ pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), S
             "--firmware" => fw = Firmware::parse(it.next().map(String::as_str))?,
             "--only" => {
                 let what = it.next().map(String::as_str);
-                check(
-                    what == Some("live-modules"),
-                    format!("--only {what:?}: only live-modules"),
-                )?;
-                only_modules = true;
+                match what {
+                    Some("live-modules") => only_modules = true,
+                    Some("sd") => only_sd = true,
+                    _ => return Err(format!("--only {what:?}: live-modules or sd")),
+                }
             }
             other => return Err(format!("unknown argument '{other}'")),
         }
@@ -1532,6 +1694,14 @@ pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), S
         fw.name(),
         log_path.display()
     );
+    if only_sd {
+        live_sd(&mut t)?;
+        eprintln!("\nsd ok ({}):", fw.name());
+        for (k, v) in &t.n.0 {
+            eprintln!("  {k}: {v}");
+        }
+        return Ok(());
+    }
     if only_modules {
         live_modules(&mut t)?;
         live_modules_tampered(&mut t)?;
@@ -1569,6 +1739,7 @@ pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), S
     live_install(&mut t)?;
     live_modules(&mut t)?;
     live_modules_tampered(&mut t)?;
+    live_sd(&mut t)?;
 
     let qcow2 = images.join("corerouter.qcow2");
     t.boot_image("qcow2", &qcow2, "qcow2", true)?;
@@ -1603,6 +1774,19 @@ pub fn install_test(root: &Path, images: &Path, args: &[String]) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zombies_are_told_by_pid_not_by_their_parents() {
+        assert!(zombie_pids("none").is_empty());
+        assert!(zombie_pids("").is_empty());
+        assert_eq!(
+            zombie_pids("Name: nft Pid: 412 PPid: 95 Name: sh Pid: 77 PPid: 1 none"),
+            ["412", "77"]
+        );
+        // The parent's pid is not a zombie's.
+        assert_eq!(zombie_pids("Name: x Pid: 5 PPid: 5 none"), ["5"]);
+        assert!(zombie_pids("Name: x PPid: 1 none").is_empty());
+    }
 
     /// G1.6ze: what the notebook's live image listed, and what it must list.
     #[test]

@@ -167,7 +167,78 @@ const SENSOR_MODULES: &[(&str, &str)] = &[
 /// from the built `.config`). G1.6zd: a router plays no sound, and on a
 /// notebook `snd_hda_intel` wrote "Cannot probe codecs, giving up" on the
 /// console at every boot (the x86_64 defconfig turns it on).
-const KERNEL_OFF: &[&str] = &["CONFIG_SOUND"];
+/// G1.6zi: nor a classic Xen PV guest (`PARAVIRT_XXL` spreads indirect
+/// calls over the kernel), a balloon that hands the router's memory back to
+/// the host, or DMA remapping on by default on Intel (interrupt remapping is
+/// on; translating every DMA is a throughput decision to measure first).
+const KERNEL_OFF: &[&str] = &[
+    "CONFIG_SOUND",
+    "CONFIG_XEN_PV",
+    "CONFIG_XEN_BALLOON",
+    "CONFIG_INTEL_IOMMU_DEFAULT_ON",
+];
+/// G1.6zi: what lets the image boot, see its disk and use every core on
+/// common hardware, and say what went wrong: `check` wants each `=y` in the
+/// fragment, and `build` fails when the configured kernel dropped one.
+const HARDWARE_COVERAGE: &[&str] = &[
+    // Every core: 8192 CPUs (the defconfig's 64 left the rest of a server
+    // unused), and more than 255 APIC ids: x2APIC needs interrupt remapping.
+    "CONFIG_MAXSMP",
+    "CONFIG_IRQ_REMAP",
+    // The disk the router boots from: eMMC/SD, NVMe behind Intel VMD, HPE
+    // Smart Array Gen10+, Broadcom MPI3.
+    "CONFIG_MMC",
+    "CONFIG_MMC_BLOCK",
+    "CONFIG_MMC_SDHCI",
+    "CONFIG_MMC_SDHCI_PCI",
+    "CONFIG_MMC_SDHCI_ACPI",
+    "CONFIG_VMD",
+    "CONFIG_SCSI_SMARTPQI",
+    "CONFIG_SCSI_MPI3MR",
+    "CONFIG_USB_UAS",
+    // Hyper-V/Azure and Xen HVM: disk and port.
+    "CONFIG_HYPERV",
+    "CONFIG_HYPERV_VMBUS",
+    "CONFIG_HYPERV_STORAGE",
+    "CONFIG_HYPERV_NET",
+    "CONFIG_HYPERV_KEYBOARD",
+    "CONFIG_HYPERV_UTILS",
+    "CONFIG_XEN",
+    "CONFIG_XEN_PVHVM_GUEST",
+    "CONFIG_XEN_BLKDEV_FRONTEND",
+    "CONFIG_XEN_NETDEV_FRONTEND",
+    "CONFIG_PARAVIRT_SPINLOCKS",
+    "CONFIG_VIRT_DRIVERS",
+    "CONFIG_VMGENID",
+    // A hang, a panic, a PCIe or memory error leaves a trace.
+    "CONFIG_SOFTLOCKUP_DETECTOR",
+    "CONFIG_HARDLOCKUP_DETECTOR",
+    // Each CPU watches its neighbour: no PMU counter, works in a VM.
+    "CONFIG_HARDLOCKUP_DETECTOR_PREFER_BUDDY",
+    "CONFIG_DETECT_HUNG_TASK",
+    "CONFIG_PSTORE",
+    "CONFIG_PSTORE_COMPRESS",
+    "CONFIG_EFI_VARS_PSTORE",
+    // With pstore on, or panics would fill the NVRAM of the A/B boot entries.
+    "CONFIG_EFI_VARS_PSTORE_DEFAULT_DISABLE",
+    "CONFIG_PCIEAER",
+    "CONFIG_PCIE_DPC",
+    "CONFIG_RAS",
+    "CONFIG_ACPI_APEI",
+    "CONFIG_ACPI_APEI_GHES",
+    "CONFIG_ACPI_APEI_PCIEAER",
+    "CONFIG_ACPI_EXTLOG",
+    "CONFIG_EDAC",
+    "CONFIG_EDAC_DECODE_MCE",
+    "CONFIG_EDAC_AMD64",
+    "CONFIG_EDAC_SKX",
+    "CONFIG_EDAC_I10NM",
+    "CONFIG_EDAC_SBRIDGE",
+    "CONFIG_EDAC_IE31200",
+];
+/// G1.6zi: what both built `.config`s must say, as a value: `MAXSMP` took
+/// effect (it is dropped in silence without `DEBUG_KERNEL`).
+const KERNEL_VALUES: &[&str] = &["CONFIG_NR_CPUS=8192"];
 /// What the ISO's kernel must not have, on top of [`KERNEL_OFF`]. G1.30: no
 /// Wi-Fi stack in the live image (joining a network is the installed
 /// router's), so no card driver is built for it and its module payload does
@@ -231,7 +302,7 @@ const GUEST_TLS_PORT: u16 = 8729;
 /// G1.6o: `ip.service www-ssl`, on in a new config of the image.
 const GUEST_WEB_PORT: u16 = 443;
 
-const USAGE: &str = "usage: cargo xtask os <build [--only crpkg] [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|push --to HOST:PORT [--user U] [--no-build] [--no-wait] [--confirm manual]|release-key <init|check> [--dir D]|release --tag vX.Y.Z [--key-dir D] [--dry-run] [--no-build] [--repo OWNER/NAME]|out-dir|boot-test [--efi] [--tcg] [--wifi] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--firmware ovmf|seabios] [--scenario update|push|no-confirm|bad-signature|bad-param|cross|cut|controllers]|install-test [--tcg] [--firmware ovmf|seabios] [--only live-modules]|frr-test [--tcg]|forward-test [--tcg] [--no-live]|firmware-lock --tag T|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
+const USAGE: &str = "usage: cargo xtask os <build [--only crpkg] [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|push --to HOST:PORT [--user U] [--no-build] [--no-wait] [--confirm manual]|release-key <init|check> [--dir D]|release --tag vX.Y.Z [--key-dir D] [--dry-run] [--no-build] [--repo OWNER/NAME]|out-dir|boot-test [--efi] [--tcg] [--wifi] [--timeout S] [--append ARGS] [--keep-config] [--smp N]|ab-test [--tcg] [--firmware ovmf|seabios] [--scenario update|push|no-confirm|bad-signature|bad-param|cross|cut|controllers]|install-test [--tcg] [--firmware ovmf|seabios] [--only live-modules|sd]|frr-test [--tcg]|forward-test [--tcg] [--no-live]|firmware-lock --tag T|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
 
 pub fn main(root: &Path, args: &[String]) -> Outcome {
     let (sub, rest) = match args.split_first() {
@@ -527,6 +598,14 @@ pub fn check(os: &Path) -> Result<usize, String> {
     for off in KERNEL_OFF {
         if !fragment.lines().any(|l| l == format!("# {off} is not set")) {
             return Err(format!("linux.fragment: '# {off} is not set' is required"));
+        }
+        n += 1;
+    }
+    for want in HARDWARE_COVERAGE {
+        if !syms.contains(want) {
+            return Err(format!(
+                "linux.fragment: {want}=y is required (hardware coverage, docs/os-image.md)"
+            ));
         }
         n += 1;
     }
@@ -1283,6 +1362,9 @@ pub(crate) fn build_with(
     if let Some(on) = kernel_on(&kc, KERNEL_OFF) {
         return Err(format!("the kernel config has {on}, which must be off"));
     }
+    if let Some(lost) = KERNEL_VALUES.iter().find(|v| !kc.lines().any(|l| l == **v)) {
+        return Err(format!("the kernel config lost '{lost}'"));
+    }
     let libs = check_needed(&d.out.join("target"))?;
     let fw = firmware::verify(&d.os, &d.out.join("target"))?;
     eprintln!("   firmware: {fw} files, hashes and what the drivers declare checked");
@@ -1322,6 +1404,15 @@ pub(crate) fn build_with(
         return Err(format!(
             "the installer kernel config has {on}, which must be off"
         ));
+    }
+    // G1.6zi: the ISO must boot, and see the disk, where the image does.
+    if let Some(lost) = HARDWARE_COVERAGE
+        .iter()
+        .map(|s| format!("{s}=y"))
+        .chain(KERNEL_VALUES.iter().map(|v| (*v).to_owned()))
+        .find(|want| !ic.lines().any(|l| l == want))
+    {
+        return Err(format!("the installer kernel config lost '{lost}'"));
     }
     let boot = std::fs::metadata(images.join("installer/EFI/BOOT/BOOTX64.EFI"))
         .map(|m| m.len())
@@ -1615,6 +1706,9 @@ struct BootArgs {
     timeout: Duration,
     append: String,
     keep_config: bool,
+    /// G1.6zi: how many CPUs the machine has (2). Above 255 it gets an IOMMU
+    /// with interrupt remapping, as a real machine of that size has.
+    smp: u32,
     /// G1.30: boot with two simulated radios (`corerouter.hwsim=2`) and
     /// wait for the init to say the Wi-Fi stack took them.
     wifi: bool,
@@ -1627,6 +1721,7 @@ fn parse_boot_args(args: &[String]) -> Result<BootArgs, String> {
         timeout: Duration::from_secs(120),
         append: String::new(),
         keep_config: false,
+        smp: 2,
         wifi: false,
     };
     let mut it = args.iter();
@@ -1644,6 +1739,14 @@ fn parse_boot_args(args: &[String]) -> Result<BootArgs, String> {
                 );
             }
             "--append" => b.append = it.next().ok_or("--append needs kernel arguments")?.clone(),
+            "--smp" => {
+                let v = it.next().ok_or("--smp needs a number of CPUs")?;
+                b.smp = v
+                    .parse()
+                    .ok()
+                    .filter(|n| (1..=MAX_TEST_CPUS).contains(n))
+                    .ok_or_else(|| format!("--smp {v}: 1..={MAX_TEST_CPUS}"))?;
+            }
             other => return Err(format!("unknown argument '{other}'\n{USAGE}")),
         }
     }
@@ -1656,6 +1759,50 @@ fn parse_boot_args(args: &[String]) -> Result<BootArgs, String> {
     Ok(b)
 }
 
+/// The most CPUs `boot-test --smp` gives the machine (KVM's own limit on
+/// x86 is 1024; each one is a host thread while the guest boots).
+const MAX_TEST_CPUS: u32 = 1024;
+/// A machine with an APIC id of 255 or more: only x2APIC reaches it, and on
+/// real hardware x2APIC needs interrupt remapping.
+const X2APIC_ONLY_CPUS: u32 = 255;
+
+/// The machine of `boot-test`: `-machine`, `-cpu`, `-smp`, `-m` and, for a
+/// big one, the IOMMU. G1.6zi: with more than 255 CPUs the guest is told
+/// nothing a real machine would not be (`kvm-msi-ext-dest-id=off`: no
+/// extended MSI destination), so the kernel needs `IRQ_REMAP` to start the
+/// CPUs past APIC id 254, as on a real server.
+fn boot_machine(kvm: bool, smp: u32) -> Vec<String> {
+    let big = smp > X2APIC_ONLY_CPUS;
+    let accel = if kvm { "kvm" } else { "tcg" };
+    let split = if big { ",kernel-irqchip=split" } else { "" };
+    let cpu = match (kvm, big) {
+        (true, true) => "host,kvm-msi-ext-dest-id=off",
+        (true, false) => "host",
+        (false, _) => "max",
+    };
+    // 1 GiB for the usual two; a big machine's per-CPU areas need more.
+    let mem = if smp > 8 {
+        1024 + 16 * u64::from(smp)
+    } else {
+        1024
+    };
+    let mut a: Vec<String> = [
+        "-machine",
+        &format!("q35,accel={accel}{split}"),
+        "-cpu",
+        cpu,
+        "-smp",
+        &smp.to_string(),
+        "-m",
+        &mem.to_string(),
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    if big {
+        a.extend(["-device", "intel-iommu,intremap=on,eim=on"].map(str::to_owned));
+    }
+    a
+}
 /// G1.30: what the init says when `corerouter.hwsim=2` gave it two radios
 /// (cfg80211, mac80211 and the simulated driver loaded from the image).
 const WIFI_RADIOS: &str = "corerouter-init: wifi: 2 test radios";
@@ -1725,22 +1872,7 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     let mon = top.join("boot-test.monitor");
     let _ = std::fs::remove_file(&mon);
     let mut cmd = Command::new("qemu-system-x86_64");
-    cmd.args([
-        "-machine",
-        if kvm {
-            "q35,accel=kvm"
-        } else {
-            "q35,accel=tcg"
-        },
-    ]);
-    cmd.args([
-        "-cpu",
-        if kvm { "host" } else { "max" },
-        "-smp",
-        "2",
-        "-m",
-        "1024",
-    ]);
+    cmd.args(boot_machine(kvm, b.smp));
     cmd.args(["-display", "none", "-serial", "stdio", "-no-reboot"]);
     cmd.arg("-monitor")
         .arg(format!("unix:{},server=on,wait=off", mon.display()));
@@ -1811,19 +1943,23 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("qemu-system-x86_64: {e}"))?;
     let res = watch(&mut child, &b, (port, web_port), started, &log_path, &mon).and_then(|r| {
         // With --efi the guest has no address (the built-in command line).
-        let sensors = if b.efi {
-            "skipped: no address with --efi".to_owned()
+        let seen = if b.efi {
+            let skipped = "skipped: no address with --efi".to_owned();
+            (skipped.clone(), skipped)
         } else {
-            sensors_check(root, &top, port)?
+            (
+                cpus_check(root, &top, port, b.smp)?,
+                sensors_check(root, &top, port)?,
+            )
         };
-        Ok((r, sensors))
+        Ok((r, seen))
     });
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_file(&vars);
     let _ = std::fs::remove_file(&mon);
     let _ = std::fs::remove_file(&nvme);
-    let ((report, wall_ready, ping, web, hot), sensors) = res?;
+    let ((report, wall_ready, ping, web, hot), (cpus, sensors)) = res?;
     eprintln!("\nboot-test ok ({}):", if kvm { "KVM" } else { "TCG" });
     eprintln!(
         "  kernel start → daemon answers ping: {:.3} s (corerouter-init)",
@@ -1840,6 +1976,7 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     }
     eprintln!("  cards plugged in after boot (G1.6n, G1.6j): {hot}");
     eprintln!("  sensors (G1.6zf):                   {sensors}");
+    eprintln!("  CPUs (G1.6zi):                      {cpus}");
     if let Some(kib) = report.idle_kib {
         eprintln!(
             "  idle memory in use:                 {:.1} MiB",
@@ -1849,30 +1986,51 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// G1.6zf: the image reads the temperature of what the machine has. QEMU has
-/// no CPU sensor, and its NVMe disk has one: `system.health.print`, asked as
-/// an operator does (`admin` over TLS), must list it.
-fn sensors_check(root: &Path, top: &Path, port: u16) -> Result<String, String> {
+/// `corerouter-cli run` on the booted image, as `admin` over TLS (no password
+/// on a first boot).
+fn guest_cli(root: &Path, top: &Path, port: u16, id: &str) -> Result<String, String> {
     let cli = push::cli(root)?;
     let home = top.join("boot-test-home");
-    let _ = std::fs::remove_dir_all(&home);
     let who = install::Admin {
         home: &home,
         password: "",
         strict: false,
     };
+    let out = install::cli_run(&cli, &who, port, id, "{}");
+    let _ = std::fs::remove_dir_all(&home);
+    out
+}
+
+/// G1.6zi: the router uses every CPU the machine has (`system.resource.print`
+/// counts the ones the kernel brought up). 64 was the limit, and past APIC id
+/// 254 a kernel without interrupt remapping leaves the rest stopped.
+fn cpus_check(root: &Path, top: &Path, port: u16, want: u32) -> Result<String, String> {
+    let got = guest_cli(root, top, port, "system.resource.print")?;
+    let v: serde_json::Value =
+        serde_json::from_str(got.trim()).map_err(|e| format!("system.resource.print: {e}"))?;
+    match v.get("cpu_count").and_then(serde_json::Value::as_u64) {
+        Some(n) if n == u64::from(want) => Ok(format!("{n} of {want} in use")),
+        n => Err(format!(
+            "G1.6zi: the machine has {want} CPUs and the router uses {} (NR_CPUS, IRQ_REMAP?)",
+            n.map_or_else(|| "?".to_owned(), |n| n.to_string())
+        )),
+    }
+}
+
+/// G1.6zf: the image reads the temperature of what the machine has. QEMU has
+/// no CPU sensor, and its NVMe disk has one: `system.health.print`, asked as
+/// an operator does (`admin` over TLS), must list it.
+fn sensors_check(root: &Path, top: &Path, port: u16) -> Result<String, String> {
     // The first reading is the health service's, seconds after ready.
     let deadline = Instant::now() + Duration::from_secs(30);
     let got = loop {
-        let got =
-            install::cli_run(&cli, &who, port, "system.health.print", "{}").unwrap_or_else(|e| e);
+        let got = guest_cli(root, top, port, "system.health.print").unwrap_or_else(|e| e);
         let found = disk_temperatures(&got);
         if !found.is_empty() || Instant::now() >= deadline {
             break (found, got);
         }
         std::thread::sleep(Duration::from_millis(500));
     };
-    let _ = std::fs::remove_dir_all(&home);
     match got {
         (found, _) if !found.is_empty() => Ok(found.join(", ")),
         (_, text) => Err(format!(
@@ -2404,6 +2562,40 @@ mod tests {
         assert!(e.contains("no `pub const SENSOR_MODULES"), "{e}");
     }
 
+    /// G1.6zi: every option the hardware coverage adopted is in the list the
+    /// checks read, and the two EDAC drivers that write an error line on a
+    /// machine without ECC memory stay out.
+    #[test]
+    fn every_adopted_kernel_option_has_its_check() {
+        let os = Path::new(env!("CARGO_MANIFEST_DIR")).join("../os");
+        let fragment = std::fs::read_to_string(os.join("board/x86_64/linux.fragment")).unwrap();
+        let start = fragment
+            .find("# --- Every core of a big machine (G1.6zi)")
+            .unwrap();
+        let end = fragment.find("# CONFIG_RAS_FMPM is not set").unwrap();
+        let adopted = fragment_symbols(&fragment[start..end]);
+        assert!(adopted.len() > 40, "{}", adopted.len());
+        for symbol in &adopted {
+            assert!(HARDWARE_COVERAGE.contains(symbol), "{symbol} has no check");
+        }
+        for symbol in HARDWARE_COVERAGE {
+            assert!(
+                adopted.contains(symbol),
+                "{symbol} is checked and not in the section"
+            );
+        }
+        for noisy in [
+            "CONFIG_EDAC_IGEN6",
+            "CONFIG_EDAC_PND2",
+            "CONFIG_MEMORY_FAILURE",
+        ] {
+            assert!(!fragment.contains(&format!("{noisy}=")), "{noisy}");
+        }
+        for off in KERNEL_OFF {
+            assert!(fragment.contains(&format!("# {off} is not set")), "{off}");
+        }
+    }
+
     /// G1.6zf: what `boot-test` wants from `system.health.print`.
     #[test]
     fn the_nvme_disks_temperature_is_found_in_the_answer() {
@@ -2526,5 +2718,34 @@ mod tests {
             b.efi && !b.tcg && b.timeout.as_secs() == 30 && b.append == "corerouter.shell=ttyS0"
         );
         assert!(parse_boot_args(&["--bogus".into()]).is_err());
+        // G1.6zi: a machine with more CPUs than the kernel used to take.
+        assert_eq!(b.smp, 2);
+        let big = parse_boot_args(&["--smp".into(), "300".into()]).unwrap();
+        assert_eq!(big.smp, 300);
+        for bad in ["0", "1025", "many", "-1"] {
+            assert!(
+                parse_boot_args(&["--smp".into(), bad.into()]).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(parse_boot_args(&["--smp".into()]).is_err());
+        let two = boot_machine(true, 2).join(" ");
+        assert_eq!(two, "-machine q35,accel=kvm -cpu host -smp 2 -m 1024");
+        let many = boot_machine(true, 128).join(" ");
+        assert_eq!(many, "-machine q35,accel=kvm -cpu host -smp 128 -m 3072");
+        // Past APIC id 254: an IOMMU that remaps interrupts, and no shortcut
+        // a real machine does not have.
+        let huge = boot_machine(true, 300).join(" ");
+        assert!(huge.contains("kernel-irqchip=split"), "{huge}");
+        assert!(huge.contains("-cpu host,kvm-msi-ext-dest-id=off"), "{huge}");
+        assert!(
+            huge.ends_with("-device intel-iommu,intremap=on,eim=on"),
+            "{huge}"
+        );
+        assert!(
+            boot_machine(false, 2)
+                .join(" ")
+                .contains("accel=tcg -cpu max")
+        );
     }
 }
