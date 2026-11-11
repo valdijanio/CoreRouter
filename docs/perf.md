@@ -3005,3 +3005,8 @@ lock, a cada 2 s; ordenar 0,40 ms fora dele.
 | Devolver as 2000 linhas da janela na partida | 3,9 ms |
 
 G4.2h, tempestade com vinculações, duas threads, release, fsync real, 30 s (**medido**, 2026-11-09, host de 32 threads, carga ~2; laboratório, sem `nfnetlink`): `interface.list` p99 361 ms → 31 ms, máximo 445 ms → 120 ms; `ip.dhcp-server.print` p99 332 ms → 35 ms; mensagens tratadas 42,4 mil → 375 mil.
+
+- 2026-11-10 — G4.2i, `/ip pool used` com o PPP (**medido**, build release, máquina de
+  desenvolvimento com 32 threads, teste `pool_used_pages_counts_and_finds_the_holder`): 100 000 sessões
+  PPPoE no serviço, página de 10 000 em ordem de endereço em 8,1 ms, contagem por pool em 5,7 ms
+  (debug: 28 ms e 21 ms).
