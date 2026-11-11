@@ -307,6 +307,104 @@ fn commits_send_only_the_difference() {
     assert!(held().is_none());
 }
 
+/// `t` with each `range eq` as nftables < 1.1.2 and CoreRouter before
+/// fix-main-netns-nft-novo wrote it: `cmp gte` + `cmp lte`.
+fn as_cmp_pairs(mut t: corerouter_firewall::program::Table) -> corerouter_firewall::program::Table {
+    use corerouter_firewall::program::Order;
+    for r in &mut t.rules {
+        r.exprs = std::mem::take(&mut r.exprs)
+            .into_iter()
+            .flat_map(|e| match e {
+                Expr::Range {
+                    sreg,
+                    eq: true,
+                    from,
+                    to,
+                } => vec![
+                    Expr::Order {
+                        sreg,
+                        op: Order::Gte,
+                        data: from,
+                    },
+                    Expr::Order {
+                        sreg,
+                        op: Order::Lte,
+                        data: to,
+                    },
+                ],
+                e => vec![e],
+            })
+            .collect();
+    }
+    t
+}
+
+/// The kernel's bytecode of our table, as libnftnl prints it.
+fn bytecode() -> String {
+    let out = Command::new("nft")
+        .args(["--debug=netlink", "list", "table", "inet", "corerouter"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The table in the kernel was loaded by someone else in either form of
+/// a range: by `nft -f` (nftables < 1.1.2 writes `cmp gte` + `cmp lte`,
+/// ≥ 1.1.2 one `range eq`, commit 50741c52) or by a CoreRouter before
+/// this change (the pair). The next commit still reads it as what it
+/// loaded and sends only the difference: no false drift, no replace (the
+/// counters stay).
+#[test]
+fn a_table_with_either_range_form_is_diffed_not_replaced() {
+    if !ready() {
+        return;
+    }
+    let _one = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+    let a = sample();
+    let t = corerouter_firewall::nft::program(&a, &[]).unwrap();
+    assert!(
+        t.rules
+            .iter()
+            .flat_map(|r| &r.exprs)
+            .any(|e| matches!(e, Expr::Range { eq: true, .. })),
+        "the sample has a range"
+    );
+    let mut b = a.clone();
+    let mut list: Vec<FirewallRule> = b.ip.firewall.filter.iter().cloned().collect();
+    if let Some(r) = list.iter_mut().find(|r| r.id.0 == 5) {
+        r.matchers = m(&[("in_interface_list", "WAN")]).unwrap();
+    }
+    b.ip.firewall.filter = CowList::from(list);
+    for how in ["nft -f", "cmp pairs"] {
+        firewall::remove().unwrap();
+        if how == "nft -f" {
+            nft::run(&corerouter_firewall::script(&a, &[])).unwrap();
+            let code = bytecode();
+            assert!(
+                code.contains("[ cmp gte reg 1") || code.contains("[ range eq reg 1"),
+                "{code}"
+            );
+        } else {
+            nfnl::apply(nfnl::replace(&as_cmp_pairs(t.clone()), 1), "test").unwrap();
+            let code = bytecode();
+            assert!(code.contains("[ cmp gte reg 1"), "{code}");
+            assert!(!code.contains("[ range eq"), "{code}");
+        }
+        let before = handles();
+        let done = firewall::apply(&a, &b).unwrap();
+        assert!(!done.replaced, "{how}: {done:?}");
+        assert_eq!((done.rules_added, done.rules_removed), (1, 1), "{how}");
+        let after = handles();
+        let kept = before.iter().filter(|h| after.contains(h)).count();
+        assert_eq!(
+            kept,
+            before.len() - 1,
+            "{how}: the others kept their handle"
+        );
+    }
+    firewall::remove().unwrap();
+}
+
 fn dyn_entry(list: &str, addr: &str, secs: u64) -> DynamicAddress {
     DynamicAddress {
         list: list.parse().unwrap(),

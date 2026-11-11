@@ -25,9 +25,7 @@ use std::net::IpAddr;
 
 use corerouter_model::firewall::{AddrMatch, ConnState, Flags, NatState, Neg, PortRange, PortSet};
 
-use crate::program::{
-    AnonSet, Base, CtKey, Expr, FwElement, FwSet, KeyKind, MetaKey, Order, REG_1,
-};
+use crate::program::{AnonSet, Base, CtKey, Expr, FwElement, FwSet, KeyKind, MetaKey, REG_1};
 
 /// `NFPROTO_IPV4` / `NFPROTO_IPV6`.
 pub const NFPROTO_IPV4: u8 = 2;
@@ -211,28 +209,17 @@ fn prefix_mask(len: usize, prefix: usize) -> Vec<u8> {
         .collect()
 }
 
+/// `[!=] lo-hi` as one `range` expression (`nft_range`, Linux 4.9),
+/// like nftables writes it since 1.1.2 (commit 50741c52, "use range
+/// expression for OP_EQ"); before, `==` was a `cmp gte` + `cmp lte` pair,
+/// which `nft_read` (hal-linux) folds into this form on read.
 fn range_exprs(not: bool, lo: Vec<u8>, hi: Vec<u8>) -> Vec<Expr> {
-    if not {
-        vec![Expr::Range {
-            sreg: REG_1,
-            eq: false,
-            from: lo,
-            to: hi,
-        }]
-    } else {
-        vec![
-            Expr::Order {
-                sreg: REG_1,
-                op: Order::Gte,
-                data: lo,
-            },
-            Expr::Order {
-                sreg: REG_1,
-                op: Order::Lte,
-                data: hi,
-            },
-        ]
-    }
+    vec![Expr::Range {
+        sreg: REG_1,
+        eq: !not,
+        from: lo,
+        to: hi,
+    }]
 }
 
 /// `ip saddr [!=] @set`.
@@ -897,15 +884,14 @@ mod tests {
         );
     }
 
-    /// `ip saddr 10.0.0.1-10.0.0.9` is gte/lte; negated, `range neq`.
+    /// `ip saddr 10.0.0.1-10.0.0.9` is `range eq` (nftables ≥ 1.1.2);
+    /// negated, `range neq`.
     #[test]
     fn ranges_like_nft() {
         let e = addr_exprs(true, false, &a("10.0.0.1-10.0.0.9"));
+        assert_eq!(e.len(), 2, "{e:?}");
         assert!(
-            matches!(&e[1], Expr::Order { op: Order::Gte, data, .. } if hex(data) == "0a000001")
-        );
-        assert!(
-            matches!(&e[2], Expr::Order { op: Order::Lte, data, .. } if hex(data) == "0a000009")
+            matches!(&e[1], Expr::Range { eq: true, from, to, .. } if hex(from) == "0a000001" && hex(to) == "0a000009")
         );
         let e = addr_exprs(false, true, &a("2001:db8::1-2001:db8::9"));
         assert!(matches!(

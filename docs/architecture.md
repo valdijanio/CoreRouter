@@ -198,6 +198,20 @@ marca a tabela para revalidar inteira (`NFT_VALIDATE_NEED`), O(regras) a cada co
 e deriva em `crates/hal-linux/src/fw_delta.rs`.
 - O `nft` não roda mais em produção; a imagem perde o jansson (`nft -j`).
 
+**Faixas (`a-b`) num `range eq`, como o nftables ≥ 1.1.2 (fix-main-netns-nft-novo, medido).**
+O nftables 1.1.2 (commit `50741c52`, `netlink_gen_range` em `src/netlink_linearize.c`) passou a
+gravar `== a-b` como uma expressão `range` (`nft_range`, Linux 4.9) em vez do par `cmp gte` +
+`cmp lte`; a imagem embarca o 1.1.0 (Buildroot 2025.02.19), o Ubuntu 24.04 o 1.0.9 e o
+`ubuntu-26.04` do GitHub o 1.1.6. Comparado no kernel 7.0 com 500 regras `udp dport A-B` que
+nenhum quadro casa, as duas formas alternadas no mesmo processo (`netns_forward`, "500 port
+ranges"): quadro acima da faixa (o par avalia as duas metades) 72,5–77,9 kpps com `range` ×
+54,4–58,3 kpps com o par (+33%); abaixo (o par para no primeiro `cmp`) 74,6–76,1 × 75,1–78,1
+kpps (empate, −1 a −3%). Ficou o `range`: uma expressão a menos por regra, nunca mais lenta
+fora do ruído, e o mesmo bytecode do `nft` atual. O leitor (`nft_read`) junta o par antigo num
+`range eq`, como o próprio `nft` faz ao listar (`expr_may_merge_range`, desde a 0.7): uma
+tabela carregada pelo `nft` < 1.1.2 ou por um CoreRouter anterior continua sendo "a nossa" para
+o diff (sem troca inteira, sem perder contadores).
+
 #### 1.2.2 CGNAT sem portas: nfqueue só dos quase cheios (G2.7, **medido**)
 
 A RFC 6888 REQ-11b pede um ICMP ao assinante cuja conexão nova não acha porta. O kernel derruba essa

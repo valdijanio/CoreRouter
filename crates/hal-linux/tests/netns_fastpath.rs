@@ -274,8 +274,11 @@ fn established_connections_enter_the_flowtable_with_their_nat() {
     // nft reads back what we sent over netlink.
     let text = table_text().expect("the table is in the kernel");
     assert!(text.contains("flowtable ft"), "{text}");
+    // nftables ≥ 1.1.4 quotes the names (commit eb30f236, "rule: print
+    // chain and flowtable devices in quotes"); before, it did not.
+    let unquoted = text.replace('"', "");
     assert!(
-        text.contains("devices = { e0, i0 }") || text.contains("devices = { i0, e0 }"),
+        unquoted.contains("devices = { e0, i0 }") || unquoted.contains("devices = { i0, e0 }"),
         "{text}"
     );
     assert!(text.contains("flow add @ft"), "{text}");

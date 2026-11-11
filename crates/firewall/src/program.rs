@@ -448,13 +448,14 @@ pub enum Expr {
         mask: Vec<u8>,
         xor: Vec<u8>,
     },
-    /// `NFT_CMP_LT`..`NFT_CMP_GTE` (a range `a-b` is `gte a`, `lte b`).
+    /// `NFT_CMP_LT`..`NFT_CMP_GTE`. nftables < 1.1.2 wrote a range `a-b`
+    /// as `gte a`, `lte b`; we write [`Expr::Range`] and read the pair as one.
     Order {
         sreg: u32,
         op: Order,
         data: Vec<u8>,
     },
-    /// `range [n]eq reg from to` (a negated range).
+    /// `range [n]eq reg from to`: a range `a-b` (`eq`) or its negation.
     Range {
         sreg: u32,
         eq: bool,
