@@ -2075,23 +2075,52 @@ fn audit_check(root: &Path, top: &Path, port: u16) -> Result<String, String> {
         serde_json::from_str(got.trim()).map_err(|e| format!("{id}: {e}: {got:.300}"))
     };
     let res = get("system.resource.print", "{}")?;
-    let memory = &res["pressure"]["memory"];
-    if memory.is_null() {
-        return Err(format!(
-            "G1.6zr: system.resource.print has no memory pressure (CONFIG_PSI off?): {}",
-            res["pressure"]
-        ));
-    }
+    let memory = res
+        .pointer("/pressure/memory")
+        .filter(|m| !m.is_null())
+        .ok_or_else(|| {
+            format!(
+                "G1.6zr: system.resource.print has no memory pressure (CONFIG_PSI off?): {}",
+                res.get("pressure").cloned().unwrap_or_default()
+            )
+        })?
+        .to_string();
     let hw = get("interface.hardware", r#"{"name":"ether2"}"#)?;
-    let text = |k: &str| hw[k].as_str().unwrap_or_default().to_owned();
+    let text = |k: &str| {
+        hw.get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
     if text("vendor").is_empty() || text("model").is_empty() {
+        let id = |k: &str| hw.get(k).cloned().unwrap_or_default();
         return Err(format!(
             "G1.6zr: interface.hardware ether2 ({}:{}) has no vendor/model name (pci.ids?)",
-            hw["vendor_id"], hw["device_id"]
+            id("vendor_id"),
+            id("device_id")
         ));
     }
+    // The console setup runs (no address on a first boot) as
+    // `/proc/self/exe setup`: named `cr-setup`, never `exe`.
+    let procs = get("system.resource.process.print", r#"{"limit":500}"#)?;
+    let names: Vec<&str> = procs
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| p.get("name").and_then(serde_json::Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    if names.contains(&"exe") {
+        return Err("G1.6zr: a process named `exe` (a mode of corerouter-init not named)".into());
+    }
+    let setup = if names.contains(&"cr-setup") {
+        "cr-setup running"
+    } else {
+        "no console setup"
+    };
     Ok(format!(
-        "pressure memory {memory}; ether2 = {} {}",
+        "pressure memory {memory}; ether2 = {} {}; {setup}, no `exe`",
         text("vendor"),
         text("model")
     ))
