@@ -137,17 +137,20 @@ const LAB_CPU: &[(&str, i64)] = &[("governor", 1), ("hw_watchdog", 0)];
 const LAB_MEM_KIB: u64 = 32 << 20;
 
 /// A stock kernel's value of `name` on the lab's server (6.8, HZ=250),
-/// already forwarding (a router's boot scripts turn that on).
+/// forwarding as CoreRouter leaves it by default (G1.26i,
+/// `corerouter_model::tuning::DEFAULTS`).
 fn lab_sysctl_default(name: &str) -> Option<i64> {
     use corerouter_model::tuning::{INT_MAX, param};
     Some(match name {
-        "net.ipv4.ip_forward" | "net.ipv6.conf.all.forwarding" => 1,
         "net.core.netdev_budget_usecs" => 8000,
         "net.netfilter.nf_conntrack_max" | "net.netfilter.nf_conntrack_buckets" => 262_144,
         "net.ipv4.route.max_size" | "net.ipv6.route.max_size" => INT_MAX,
         "vm.min_free_kbytes" => 67_584,
         "net.ipv4.tcp_max_syn_backlog" => 1024,
-        _ => param(name)?.default?,
+        _ => match corerouter_model::tuning::default_of(name) {
+            Some(d) => d,
+            None => param(name)?.default?,
+        },
     })
 }
 

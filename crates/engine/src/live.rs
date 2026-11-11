@@ -17,6 +17,9 @@ pub struct Live;
 /// install is made from (`--web-factory-on` turns it on through here), a
 /// password, an install, the power.
 const ALLOWED: &[&str] = &[
+    // G1.26i: Safe Mode only ever undoes, and the changes above it are
+    // the ones that cut the operator off (an address, a route).
+    "config.safe-mode.",
     "interface.set",
     "interface.ethernet.adopt",
     "ip.address.",
@@ -29,6 +32,14 @@ const ALLOWED: &[&str] = &[
     "system.install.",
     "system.reboot",
     "system.shutdown",
+    // G1.26i: the kernel parameters only, so the Tuning window's diagnosis
+    // can be acted on while trying the hardware (nothing is kept: the live
+    // image has no disk). Not the ports (rings and queues flap the link
+    // the install runs over), the CPU (a hardware watchdog would reboot
+    // the live system) nor the boot parameters (there is no next boot).
+    "system.tuning.set",
+    "system.tuning.unset",
+    "system.tuning.profile.apply",
     "tool.",
 ];
 
@@ -88,6 +99,49 @@ mod tests {
         assert!(!allowed("routing.bgp.instance.add"));
         assert!(!allowed("ip.firewall.filter.add"));
         assert!(!allowed("system.package.update"));
+        // G1.26i: kernel parameters at run time, nothing else of Tuning.
+        assert!(allowed("system.tuning.set"));
+        assert!(allowed("system.tuning.profile.apply"));
+        assert!(!allowed("system.tuning.interface.set"));
+        assert!(!allowed("system.tuning.interface.apply"));
+        assert!(!allowed("system.tuning.cpu.set"));
+        assert!(!allowed("system.tuning.boot.set"));
+    }
+
+    /// G1.26i: the live image forwards like an installed router, and its
+    /// kernel parameters can be changed while it runs.
+    #[test]
+    fn the_live_image_forwards_and_takes_kernel_parameters() {
+        let mut s = live();
+        let d = s.execute("system.tuning.diagnose", &json!({})).unwrap();
+        assert!(!d.to_string().contains("forwarding"), "{d}");
+        s.execute(
+            "system.tuning.set",
+            &json!({"name": "net.core.netdev_budget", "value": 600}),
+        )
+        .unwrap();
+        s.execute("system.tuning.unset", &json!({"name": "net.core.netdev_budget"}))
+            .unwrap();
+        s.execute("system.tuning.profile.apply", &json!({"profile": "balanced"}))
+            .unwrap();
+        // With Safe Mode, as the window's "Apply with Safe Mode" does:
+        // cancelled, the kernel parameters go back.
+        s.execute("config.safe-mode.cancel", &json!({})).unwrap_err();
+        s.execute("config.safe-mode.enter", &json!({})).unwrap();
+        s.execute("system.tuning.profile.apply", &json!({"profile": "throughput"}))
+            .unwrap();
+        let before = s.execute("system.tuning.print", &json!({})).unwrap();
+        s.execute("config.safe-mode.cancel", &json!({})).unwrap();
+        let after = s.execute("system.tuning.print", &json!({})).unwrap();
+        assert_ne!(before, after, "the profile went back with Safe Mode");
+        for (id, p) in [
+            ("system.tuning.interface.set", json!({"name": "ether1", "key": "txqueuelen", "value": 2000})),
+            ("system.tuning.cpu.set", json!({"key": "governor", "value": 0})),
+            ("system.tuning.boot.set", json!({"key": "pcie_aspm", "value": "off"})),
+        ] {
+            let e = s.execute(id, &p).unwrap_err().to_string();
+            assert!(e.contains("live image"), "{id}: {e}");
+        }
     }
 
     #[test]

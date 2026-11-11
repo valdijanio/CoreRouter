@@ -188,6 +188,9 @@ pub(crate) struct Param {
     pub section: String,
     pub current: Option<i64>,
     pub configured: Option<i64>,
+    /// What CoreRouter keeps while the config does not set it (G1.26i:
+    /// forwarding).
+    pub router_default: Option<i64>,
     pub recommended: Option<i64>,
     pub why: String,
     pub why_id: String,
@@ -216,6 +219,7 @@ impl Param {
             section: text("section"),
             current: int("current"),
             configured: int("configured"),
+            router_default: int("router_default"),
             recommended: int("recommended"),
             why: text("why"),
             why_id: text("why_id"),
@@ -654,11 +658,23 @@ impl TuningPanel {
             .iter()
             .find(|(id, ..)| *id == self.profile())
             .map_or("", |(_, label, _)| *label);
-        ui.label(format!(
-            "{}: {n} {}",
-            tr(l, label),
-            tr(l, "parameters differ from this profile.")
-        ));
+        // G1.26i: a router nobody tuned yet is not "off" the profile, it
+        // runs on the kernel's own values: say so, and what applying does.
+        let untouched = n > 0 && rows.iter().all(|p| p.configured.is_none());
+        ui.label(if untouched {
+            format!(
+                "{}: {} {n} {}",
+                tr(l, label),
+                tr(l, "nothing is configured yet, the kernel's own values are in use."),
+                tr(l, "parameters change when this profile is applied.")
+            )
+        } else {
+            format!(
+                "{}: {n} {}",
+                tr(l, label),
+                tr(l, "parameters differ from this profile.")
+            )
+        });
         ui.horizontal(|ui| {
             let can = app.can();
             if action(ui, tr(l, "Show differences"), can.check(DIFF)) {
@@ -1122,9 +1138,19 @@ impl TuningPanel {
                     chip(ui, tr(l, "differs"), AMBER.tone(&v));
                 }
             }
-            None => {
-                ui.weak("–");
-            }
+            None => match p.router_default {
+                // G1.26i: not the operator's, yet not the kernel's either.
+                Some(d) => {
+                    ui.weak(p.value_text(d));
+                    chip(ui, tr(l, "router default"), neutral_tone(&v)).on_hover_text(tr(
+                        l,
+                        "CoreRouter keeps this value while the configuration does not set it: a router forwards. Set it to 0 to turn it off.",
+                    ));
+                }
+                None => {
+                    ui.weak("–");
+                }
+            },
         });
         let why = p.why_text(app.lang.help);
         cell(ui, 3, &mut |ui| match p.recommended {
@@ -1215,6 +1241,8 @@ impl TuningPanel {
             let unset_ok = busy.clone().and_then(|()| {
                 if p.configured.is_some() {
                     can.check(scope.unset(&p.name).0)
+                } else if *scope == Scope::Kernel && p.router_default.is_some() {
+                    Err(tr(l, "Not set: CoreRouter's default is in use").to_owned())
                 } else if *scope == Scope::Kernel {
                     Err(tr(l, "Not set: the kernel's own value is in use").to_owned())
                 } else if *scope == Scope::Cpu {
