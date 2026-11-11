@@ -23,6 +23,7 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::io::{BufRead, BufReader};
 use std::net::IpAddr;
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
@@ -34,6 +35,19 @@ use corerouter_hal::probe::{
 use corerouter_hal_linux::icmp::{HostProber, Kind};
 
 const ENV: &str = "COREROUTER_NETNS_TESTS";
+
+/// No duplicate address detection in the lab's namespaces, set before their
+/// links exist (a new link takes `default`). `nodad` on the global addresses
+/// is not enough: the link-local address is the source of the Neighbor
+/// Solicitation a router sends for a packet it forwards, and while that
+/// address is tentative (RFC 4862 §5.4: a random delay under 1 s, then 1 s
+/// for the probe) no solicitation goes out, so the first IPv6 echo through
+/// the router took 1 to 2 s. The kernel skips DAD when `accept_dad` is below
+/// 1 on both `all` and the device (`addrconf_dad_begin`).
+const NO_DAD: [&str; 2] = [
+    "net/ipv6/conf/all/accept_dad",
+    "net/ipv6/conf/default/accept_dad",
+];
 
 fn in_netns() -> bool {
     if std::env::var_os(ENV).is_none_or(|v| v != "1") {
@@ -65,6 +79,10 @@ fn in_netns() -> bool {
         // Only gid 0 is mapped in this user namespace.
         std::fs::write("/proc/sys/net/ipv4/ping_group_range", "0 0")
             .map_err(|e| format!("cannot open ping sockets in this namespace: {e}"))?;
+        for path in NO_DAD {
+            std::fs::write(format!("/proc/sys/{path}"), "0")
+                .map_err(|e| format!("cannot turn DAD off in this namespace: {e}"))?;
+        }
         Ok(())
     });
     if let Err(e) = fresh {
@@ -106,6 +124,9 @@ impl Ns {
             std::thread::sleep(Duration::from_millis(10));
         }
         ns.ip(&["link", "set", "lo", "up"]);
+        for path in NO_DAD {
+            ns.sysctl(path, "0");
+        }
         ns
     }
 
@@ -474,14 +495,21 @@ fn udp_and_tcp_probes_walk_the_path() {
     let pid = lab._host.pid();
     let mut listener = Command::new("nsenter")
         .args(["-t", pid.as_str(), "-n", "python3", "-c",
-            "import socket,time\ns=socket.socket(socket.AF_INET6)\ns.setsockopt(socket.IPPROTO_IPV6,socket.IPV6_V6ONLY,0)\ns.bind(('::',8080))\ns.listen(64)\ntime.sleep(60)"])
+            "import socket,time\ns=socket.socket(socket.AF_INET6)\ns.setsockopt(socket.IPPROTO_IPV6,socket.IPV6_V6ONLY,0)\ns.bind(('::',8080))\ns.listen(64)\nprint('ready',flush=True)\ntime.sleep(60)"])
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    std::thread::sleep(Duration::from_millis(500));
+    // The listener says when it listens. A fixed wait is a race: on a loaded
+    // machine python starts later than that, and the SYN gets an RST.
+    let mut ready = String::new();
+    BufReader::new(listener.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert_eq!(ready.trim(), "ready", "the listener on the far host");
     let prober = HostProber::with_kind(Kind::Ping);
-    // Neighbor discovery on the fresh links takes a second once: not the
-    // probes' RTT.
+    // ARP and neighbor discovery on the fresh links happen once, here: not
+    // in the probes' RTT.
     let mut warm = prober.open(&SocketOptions::default()).unwrap();
     for far in [&lab.far, &lab.far6] {
         ask_retry(warm.as_mut(), far, 1, None, 64);
