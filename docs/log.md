@@ -10720,3 +10720,255 @@ continuação indentadas).
   com erro; com a repetição, 0 de 200, e o ref fica no commit novo em todas.
 
   Vale só depois de religar a fila (ela roda o script com que começou).
+
+- 2026-11-11 — G1.30: Wi-Fi em modo estação: rede que a última varredura ouviu só como 802.1X, OWE ou WEP, digitada
+  à mão (CLI, MCP, terminal). O `interface.wifi.set` devolve um aviso com o motivo
+  (`'Corp' was heard only as a network this radio cannot join: 802.1X … is not supported yet`) e
+  o `interface.wifi.preview` mostra o mesmo como check `warning`. Antes os dois respondiam
+  `ready` e a falha virava `not-found`, sem dizer por quê. A GUI já barrava (linha esmaecida,
+  `Connect…` desligado). Achado ao conferir o #601 pela CLI.
+
+  Como testar:
+
+  ```sh
+  cargo test -p corerouter-engine --test it wifi
+  cargo run -p corerouter-daemon -- --control 7979
+  cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run interface.wifi.country.set '{"country":"BR"}'
+  cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run interface.wifi.enable '{"name":"wifi1"}'
+  cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run interface.wifi.scan '{"name":"wifi1"}'
+  cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run interface.wifi.set '{"name":"wifi1","ssid":"Corp","passphrase":"12345678"}'
+  ```
+
+- 2026-11-11 — G1.30: Wi-Fi em modo estação: a conversa com o `wpa_supplicant` saiu do tick (revisão do #599).
+
+  - **Thread por rádio** (`crates/hal-linux/src/wifi.rs`, `wifi-<nome>`): só ela fala com o
+    supplicant. O tick, que roda com a sessão travada, manda ordens por uma fila de 8 (cheia:
+    "ocupado") e lê estado, varredura e eventos de uma área compartilhada. Antes, a partida do
+    supplicant, o `INTERFACE_ADD` e cada pergunta esperavam com a sessão travada.
+  - **Prazo próprio do `INTERFACE_ADD`: 20 s** (era 300 ms, o de todo comando). Ele só responde
+    depois que o driver sobe a interface, e numa placa de verdade é aí que o firmware é carregado
+    no chip. Com 300 ms o primeiro `open` no notebook tendia a estourar e só entrar na reabertura,
+    5 s depois. Os outros comandos passam a 2 s: ninguém mais espera por eles com a sessão
+    travada.
+  - **Resposta atrasada não vira resposta do comando seguinte:** um prazo estourado inutiliza o
+    socket. O `SIGNAL_POLL` engolia o erro e seguia usando o mesmo socket.
+  - **Desligar e ligar em seguida:** a thread nova espera a antiga tirar o rádio do supplicant.
+  - **Rádio sem rede configurada não aparece mais como `searching`:** as varreduras do próprio
+    supplicant (depois de uma troca de país) deixavam o estado assim para sempre. Visto na imagem.
+  - `cargo xtask os wifi-test` mede o tempo de resposta de um comando com o rádio sendo ligado e
+    com o supplicant travado (`SIGSTOP`), e mata o supplicant para ver o roteador subir outro.
+
+  Como testar:
+
+  ```sh
+  cargo test -p corerouter-hal-linux --lib wifi
+  cargo xtask os build && cargo xtask os wifi-test --only commands
+  ```
+
+  Medido na imagem (`cargo xtask os wifi-test --only commands`, QEMU/KVM, 2026-11-11): o tempo de
+  resposta de um comando que não faz E/S (`interface.wifi.list`), pedido sem parar pelo shell de
+  manutenção. O comando espera a trava da sessão, então um tick que a segura aparece no pior caso.
+
+  | Situação | Antes (#599) | Depois (duas rodadas) |
+  |---|---|---|
+  | Sem rádio ligado: mediana / pior | 13 / 25 ms | 10 / 12 ms e 26 / 46 ms |
+  | Pior caso enquanto o rádio é ligado (4 s) | 23 ms | 12 ms e 72 ms |
+  | Supplicant travado por 12 s (`SIGSTOP`): mediana / pior | 12 / **918 ms** | 10 / **13 ms** e 11 / **28 ms** |
+  | Supplicant morto: outro sobe e o rádio volta | 11,4 s | 12,1 s e 12,8 s |
+
+  A rodada de 26 / 46 ms veio logo depois da VM do assistente e é ruído da medição (o pior caso
+  sem rádio já era 46 ms nela). Ligar o rádio não pesa no `mac80211_hwsim`, que sobe na hora; o
+  ganho desse caso é numa placa que carrega firmware, e isso **não foi medido** (não há placa).
+
+  Não conferido: o tempo do `INTERFACE_ADD` numa placa de verdade (o prazo de 20 s é folga
+  **estimada** sobre os tempos de carga de firmware dos drivers; no notebook dá para ver no log
+  do rádio quanto leva).
+
+- 2026-11-11 — G1.30g: Janela "Interface <nome>" (pedido do usuário depois do teste no notebook, 2026-11-11):
+
+  - **Porta Wi-Fi com abas próprias.** Ficam General, Wi-Fi, Radio, Hardware, Traffic e
+    Statistics; saem Ethernet, Status e SFP.
+    - Wi-Fi: estado, rede e segurança, AP, sinal com selo de qualidade, sinal por antena, ruído
+      e SNR, faixa e padrão, canal e largura, taxas de TX/RX com MCS, fluxos e GI,
+      retransmissões, beacons perdidos, endereços, país e última falha.
+    - Radio: driver, firmware, padrões, faixas com canais/DFS/potência, antenas, potência em uso
+      e máximo no canal, país e chave rfkill, a lista de canais.
+  - **SFP só numa porta com gaiola** (o monitor leu um módulo, presente ou não).
+  - **A janela redimensiona pelo mouse** (antes todo diálogo era fixo em 470×380); as abas
+    ocupam o espaço.
+  - **Hardware sem linhas vazias.** O que o driver não informa vira uma linha "Not reported by
+    this driver: …".
+  - Motor: `interface.wifi.monitor` ganhou o enlace em detalhe (o `params` mudou) e há um comando
+    novo `interface.wifi.radio`. HAL: `WifiStatus` ganhou ruído, largura, centro, geração, cifra e
+    `link` (`WifiLink`/`WifiRate`); `WifiRadio` ganhou phy, firmware, faixas
+    (`WifiBand`/`WifiChannel`), antenas, potência e rfkill.
+  - Linux: `crates/hal-linux/src/nl80211.rs` (novo), com `GET_STATION`, `GET_WIPHY` dividido e
+    `GET_INTERFACE`, mais os campos novos do `wpa_supplicant`, rfkill e firmware pelo `/dev/kmsg`.
+    O laboratório virtual imita uma placa 2×2 Wi-Fi 6.
+  - Explicações ⓘ de cada rótulo em `i18n/auto/iface_wifi_{pt,en}.rs`.
+
+  Como testar:
+
+  - `cargo test -p corerouter-ui --lib iface_wifi`
+  - `cargo test -p corerouter-engine --test it wifi`
+  - `cargo test -p corerouter-hal-linux --lib nl80211 wifi`
+  - Rodando: `corerouter-daemon --control 7980`, conectar o `wifi1` à `CoreRouter-Lab`, a GUI com
+    `--connect`, abrir Interface <wifi1>.
+
+  Conferido na GUI desta branch contra o laboratório virtual (Xvfb, screenshots olhados): as abas
+  certas para Wi-Fi e para cobre, Wi-Fi e Radio preenchidas, e a janela arrastada pelo canto de
+  934×624 para 1207×763 com o conteúdo acompanhando. Contra o rádio real desta máquina (mt7925e,
+  só consultas): EHT-MCS 13, 2 fluxos, 160 MHz, 2882 Mbit/s; 3 faixas; 2/2 antenas (**medido**).
+  Não conferido aqui: a RTL8852BE do notebook (vai no pendrive).
+
+- 2026-11-11 — G1.6zl: Assistente do primeiro boot (console), visto no notebook Lenovo 83EU em 2026-11-11: as duas
+  portas de cabo apareciam `off` com o cabo ligado, e escolher uma pedia endereço fixo (Enter
+  cancelava). O operador não tinha como saber qual porta tinha cabo nem como pegar o endereço da
+  rede de casa ou do escritório.
+
+  - **Enlace lido de verdade.** Num primeiro boot as portas começam desligadas na configuração, e
+    porta desligada não tem portadora para ler. Ao abrir o assistente, ele liga as portas
+    desligadas da configuração (`interface.set disabled=no`, só as adotadas pelo daemon, G1.6ze),
+    espera até 5 s pelo enlace (sai antes se todas subirem) e mostra a tabela com `up`/`down`.
+    Cancelado ou com erro, todas voltam a desligadas; aplicado, só a porta de gerência fica.
+  - **DHCP em qualquer porta.** `Address/prefix [dhcp]` aceita Enter (ou `dhcp`) também numa
+    porta de cabo, como já aceitava no Wi-Fi; sem pergunta de gateway. Aplicado:
+    `interface.set`, `ip.dhcp-client.add` (pula se a porta já tem cliente) e a espera pelo
+    endereço, que a tela mostra. O `Apply? [y/N]` continua antes de qualquer mudança, então um
+    Enter perdido no endereço não aplica nada (a regra da G1.6m).
+  - O texto do começo diz que Enter aceita o `[padrão]` mostrado ou cancela onde não há.
+  - `cargo xtask os install-test --only images` roda só o qcow2 (endereço fixo) e o OVA (agora
+    com o assistente respondido por DHCP); os dois conferem a porta `up` na tabela.
+
+  Como testar: `cargo test -p corerouter-init setup`; `cargo xtask os build` e `cargo xtask os
+  install-test --only images`.
+
+  Pesquisa: o MikroTik não tem assistente de console; recomenda desligar as portas sem uso
+  ("First Time Configuration") e põe cliente DHCP em `ether1` pela configuração padrão. O pfSense
+  acha a porta pelo evento de enlace ("detect the link-up event", na atribuição de interfaces do
+  console), e o "Set interface IP address" do pfSense/OPNsense pergunta por DHCP. O enlace só vale
+  com a porta ligada (`IFF_UP`; kernel, `Documentation/networking/operstates.rst`).
+
+- 2026-11-11 — G1.6zm: Disco regravado com outra versão e a NVRAM mantida não bootava, visto no notebook Lenovo 83EU em
+  2026-11-11: um pendrive regravado parou em `device-mapper: verity: 8:2: metadata block 22096 is
+  corrupted`. A entrada `Boot####` acha o ESP pelo GUID da partição, que era o mesmo em todo
+  `disk.img` (`4f9a520b…`), e leva na linha de comando o hash e o tamanho da árvore de verity da
+  imagem que a escreveu. A imagem nova casava com a entrada velha.
+
+  - O primeiro boot de uma cópia da imagem, fora de boot de teste, dá ao ESP um GUID aleatório
+    antes de o daemon escrever as entradas (`corerouter-init`, `gpt::renew_guid`: só a entrada
+    `efi` muda; primário, depois o reserva; o código de boot BIOS do bloco 0 fica).
+  - O instalador grava o ESP com GUID aleatório.
+  - O `provision` reescreve, no mesmo `Boot####`, a entrada de slot que aponta para outro ESP.
+  - `system.package.print` mostra `esp_guid`.
+  - Com isso, a entrada de outra imagem aponta para uma partição que não existe: o firmware segue
+    para o `\EFI\BOOT\BOOTX64.EFI` do disco, e esse boot refaz as entradas. Roteadores atualizados
+    migram sozinhos.
+  - `cargo xtask os ab-test --scenario reflash`: sobe o disco, desliga, grava por cima uma imagem
+    com a árvore de verity diferente mantendo a NVRAM e exige `ready`.
+
+  **Medido** (KVM, OVMF, 2026-11-11): com a imagem anterior o cenário falha exatamente como o
+  notebook (`verity: 253:2: metadata block 22122 is corrupted`, `Kernel panic: Unable to mount root
+  fs`). Com esta, passa.
+
+  Como testar: `cargo test -p corerouter-sysupdate`; `cargo xtask os build && cargo xtask os
+  ab-test --scenario reflash`.
+
+  Não conferido em hardware: o notebook ainda tem entradas de antes desta correção, que apontam
+  para o GUID da imagem. Ele precisa uma vez do item do pendrive no F12; depois disso, regravar não
+  trava mais.
+
+- 2026-11-11 — G1.6zn: Gap registrada a pedido do usuário depois do teste no notebook: com o sistema rodando de um
+  pendrive, tirar o pendrive com o roteador ligado enche o console de `SQUASHFS error` e `EXT4-fs
+  … I/O error`, porque o root é lido do disco sob demanda. A ISO live já copia o root para a RAM e
+  o confere (`apps/corerouter-init/src/live.rs`, G1.6y); falta o mesmo no disco instalado. Custo:
+  o `rootfs.squashfs` tem 87 MiB (**medido**, build G1.6zd); o boot fica 1–3 s mais lento num
+  pendrive (**estimado**). Quem faz assim: VMware ESXi, Alpine (modo "diskless" com `lbu commit`),
+  SmartOS, Cisco IOS clássico, `toram` dos live do Ubuntu/Debian.
+
+- 2026-11-11 — fix-flaky-netns-icmp: Teste instável `netns_icmp` no lote 600 da fila (run 43011148844,
+  `udp_and_tcp_probes_walk_the_path`: `left: Reached("rst")`, `right: Reached("syn-ack")` na
+  sonda TCP para a porta 8080; passou sozinho na repetição). Correção no teste; o produto não
+  mudou.
+
+  Causa: o teste abre um ouvinte na porta 8080 com um `python3` e esperava 500 ms fixos por ele.
+  O que dava folga era outra espera, por acaso: o primeiro eco IPv6 pelo roteador levava de 1 a
+  2 s, porque o link-local dos enlaces ficava `tentative` (DAD, RFC 4862 §5.4) e o roteador não
+  envia Neighbor Solicitation a partir de endereço tentativo (a mesma causa do
+  `netns_mpls_too_big`, #600). Numa máquina carregada o `python3` demora mais que 500 ms + esse
+  aquecimento, o SYN chega antes do `listen` e o kernel responde RST.
+
+  Agora o ouvinte avisa quando está ouvindo (escreve `ready`) e o teste espera por isso. O
+  laboratório também desliga o DAD nos namespaces (`accept_dad = 0` em `all` e `default`, antes
+  de criar os enlaces), o que tira a espera de 1–2 s.
+
+  **Medido** (máquina de desenvolvimento, kernel 7.0, 2026-11-11), com o ouvinte atrasado em 2 s
+  de propósito: o teste antigo falhou em 2 de 6 rodadas, com a mesma mensagem do CI (nas duas, o
+  aquecimento IPv6 levou 1,03–1,06 s; nas quatro que passaram, 2,06–2,08 s); o corrigido passou
+  em 6 de 6. Primeiro eco IPv6 pelo roteador: 1,03–2,08 s antes, ~0,1 ms depois. O binário
+  inteiro passou 6 de 6 vezes depois da correção; o tempo dele não mudou (3,1–4,2 s antes e
+  depois: outras esperas dominam).
+
+  Como testar:
+  `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-hal-linux --test netns_icmp`
+  (ou `cargo xtask netns`).
+
+- 2026-11-11 — fix-health-root-untrusted: A checagem de saúde "Root verity" mandava reiniciar ("Reinicie uma vez…") num caso em que
+  reiniciar não resolve: o slot rodando veio de um pacote assinado por uma chave que a imagem
+  instalada não traz. O status do slot fica `verified: false`, `signed_by: null`, `verity: false`,
+  e o outro slot (assinado pela chave antiga) aparece como `invalid`.
+
+  Agora, quando o slot rodando não tem o cabeçalho conferido, o motivo diz isso (chave em que a
+  imagem não confia, ou cabeçalho danificado) e a ação é instalar um pacote assinado por uma das
+  chaves aceitas, com "Reiniciar não resolve". O caso antigo (cabeçalho conferido, raiz pelo
+  caminho reserva no primeiro boot) continua com o conselho de reiniciar. O texto do ⓘ da checagem
+  ganhou o segundo motivo.
+
+  Visto na VM `corerouter-teste` em 2026-11-11, ao trocar a chave de dev da VM com um pacote-ponte
+  (mesma imagem, assinada pela chave antiga): o aviso apareceu com o conselho errado. Saiu ao
+  instalar o pacote assinado pela chave nova nos dois slots. **Não conferido** numa imagem real
+  depois da correção (seria preciso degradar a VM de novo); o teste usa o status que a VM mostrou.
+
+  Como testar: `cargo test -p corerouter-engine --lib root_`.
+
+- 2026-11-11 — fix-main-policer-lower-bound: `main` vermelha em 008a72cc (issue 605): o proptest `shaper_props::policer_exact_under_races`
+  (`crates/dataplane-ebpf-common`) falhou duas vezes seguidas com `rate_k = 256, cpus = 13,
+  size = 801, secs = 2` (`45657 < 50116`). O defeito era do teste, não do policer: ele oferece
+  `cpus` pacotes no mesmo instante, a cada `step`, e cobrava a taxa cheia. Com taxa baixa e
+  rajada grande os instantes ficam mais afastados que o tempo do balde (108 ms contra os 100 ms
+  do `bucket-size` padrão): o balde transborda entre um instante e outro e o policer passa um
+  balde por instante (3 de cada 13 pacotes), que é o que um policer deve a uma rajada.
+
+  O que mudou (só o teste): o corpo da propriedade virou a função `races`; o piso passa a ser a
+  taxa enquanto a recarga de um instante cabe no balde (como antes) e, quando não cabe, um balde
+  menos um pacote por instante. A entrada que quebrou a `main` e as bordas (recarga que cabe por
+  pouco e que não cabe) viraram o teste fixo
+  `policer_owes_a_bucket_per_instant_when_the_refill_overflows_it`.
+
+  Números (**medido**, 2026-11-11, máquina de desenvolvimento, build dev): o teste antigo
+  falhava em 5 de 200 execuções (2,5% por execução, 256 casos cada); o novo, 0 de 200. O piso
+  novo passou 40 000 casos sorteados só na faixa de taxa baixa (256–1500 kbit/s) e 6 000 na
+  faixa inteira; as outras duas propriedades do arquivo (`shaper_bounds`,
+  `routeros_burst_long_run_average`) passaram 6 000 casos cada sem falha.
+
+  Como testar: `cargo test -p corerouter-dataplane-ebpf-common --test it shaper_props`.
+
+- 2026-11-11 — fix-upload-wait-starting: `corerouter-cli upload … --wait` (e o `cargo xtask os push`, que o chama) dizia que a atualização
+  falhou quando ela tinha dado certo: `slot b was not kept (): see system.package.print`, saída 1,
+  enquanto o roteador seguia no período de teste e confirmava o slot.
+
+  Causa: depois do reboot, o daemon responde antes de o serviço de pacotes ler os slots. Nesse
+  intervalo o `system.package.print` devolve `{supported: false, reason: "the package service has
+  not reported…"}`, sem `trial` e sem `last`. O `wait` lia isso como "o período de teste acabou e o
+  resultado não é confirmed".
+
+  Agora o `wait` continua esperando enquanto a resposta não tem `supported: true`. Se o roteador
+  responde assim por mais de 60 s, o comando falha com o motivo que o roteador deu
+  (`the router answers but has no package status: …`), em vez de esperar os 15 minutos.
+
+  **Medido** na VM `corerouter-teste` (QEMU/KVM, 2026-11-11), atualizando para a 0.1.0-dev.579: o
+  falso erro saiu em 1 de 3 instalações (7,6 s depois do início; o slot foi confirmado aos 18 s);
+  nas outras duas o comando levou 17,9 s e 18,3 s. Depois da correção não repeti a instalação na
+  VM: a corrida é coberta pelos três testes novos, que falham sem a correção com a mesma mensagem.
+
+  Como testar: `cargo test -p corerouter-cli upload`.
