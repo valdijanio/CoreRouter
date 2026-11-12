@@ -24,7 +24,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use corerouter_engine::crash_log::{
-    Crash, EfiStore, Found, MAX_FILE_BYTES, MAX_FILES, MAX_KEPT, PstoreFile, efi_store_ok, parse,
+    AbBoot, Crash, EfiStore, Found, MAX_FILE_BYTES, MAX_FILES, MAX_KEPT, PstoreFile, attribute,
+    efi_store_ok, parse,
 };
 use corerouter_engine::crash_log::EFI_MIN_FREE;
 use corerouter_engine::{Shared, lock};
@@ -54,6 +55,9 @@ struct Paths {
     module: PathBuf,
     efivars: PathBuf,
     crash: Option<PathBuf>,
+    /// The A/B state (`<config-dir>/package`) and the kernel's command line.
+    ab_state: Option<PathBuf>,
+    cmdline: PathBuf,
 }
 
 impl Paths {
@@ -63,6 +67,8 @@ impl Paths {
             module: "/sys/module".into(),
             efivars: "/sys/firmware/efi/efivars".into(),
             crash: config_dir.map(|d| d.join(DIR)),
+            ab_state: config_dir.map(|d| d.join(corerouter_sysupdate::state::DIR)),
+            cmdline: "/proc/cmdline".into(),
         }
     }
 }
@@ -115,6 +121,7 @@ fn collect(p: &Paths, live: bool) -> Found {
     let mut problems = Vec::new();
     let files = read_store(&p.pstore);
     let mut new = parse(&files);
+    attribute(&mut new, &ab_boot(p));
     match (&p.crash, live) {
         (_, true) => {
             if !new.is_empty() {
@@ -160,6 +167,23 @@ fn collect(p: &Paths, live: bool) -> Found {
         efi: efi(p, live),
         problems,
     }
+}
+
+/// The slot running now and a fall-back of this boot, from the A/B state.
+fn ab_boot(p: &Paths) -> AbBoot {
+    let running = read_small_n(&p.cmdline, 4096).and_then(|c| {
+        c.split_ascii_whitespace()
+            .find_map(|w| w.strip_prefix("corerouter.slot="))
+            .filter(|s| s.len() <= 8 && s.bytes().all(|b| b.is_ascii_alphanumeric()))
+            .map(str::to_owned)
+    });
+    let rolled_back = p.ab_state.as_deref().and_then(|d| {
+        let (st, _) = corerouter_sysupdate::state::State::load(d);
+        st.last
+            .filter(|o| o.result == "rolled-back")
+            .map(|o| (o.slot.as_str().to_owned(), o.version.chars().take(64).collect(), o.at_unix))
+    });
+    AbBoot { running, rolled_back }
 }
 
 fn read_store(dir: &Path) -> Vec<PstoreFile> {
@@ -258,8 +282,12 @@ fn load_saved(dir: &Path, new: &[Crash]) -> Vec<Crash> {
 }
 
 fn read_small(p: &Path) -> Option<String> {
+    read_small_n(p, 256)
+}
+
+fn read_small_n(p: &Path, max: u64) -> Option<String> {
     let mut s = String::new();
-    fs::File::open(p).ok()?.take(256).read_to_string(&mut s).ok()?;
+    fs::File::open(p).ok()?.take(max).read_to_string(&mut s).ok()?;
     Some(s.trim().to_owned())
 }
 
@@ -333,7 +361,10 @@ mod tests {
             module: root.join("module"),
             efivars: root.join("efivars"),
             crash: Some(root.join("config/crash")),
+            ab_state: Some(root.join("config/package")),
+            cmdline: root.join("cmdline"),
         };
+        fs::write(&p.cmdline, "root=/dev/dm-0 corerouter.slot=a panic=10\n").unwrap();
         fs::create_dir_all(&p.pstore).unwrap();
         fs::create_dir_all(p.module.join("pstore/parameters")).unwrap();
         fs::create_dir_all(p.module.join("efi_pstore/parameters")).unwrap();

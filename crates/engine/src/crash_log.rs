@@ -61,9 +61,13 @@ pub struct Crash {
     pub uptime_s: Option<f64>,
     /// When that boot started (`time` − `uptime_s`).
     pub boot_start: Option<u64>,
-    /// The A/B slot of that boot, when the dump reaches back to the
-    /// kernel's command line (`corerouter.slot=`): a boot that died early.
+    /// The A/B slot of that boot: from the kernel's command line
+    /// (`corerouter.slot=`) when the dump reaches back to it, else from the
+    /// A/B state ([`attribute`]).
     pub slot: Option<String>,
+    /// The image version of that slot, when the A/B state says it.
+    #[serde(default)]
+    pub version: Option<String>,
     /// The kernel release of the `CPU: … Not tainted 6.18.59 #1` line.
     pub kernel: Option<String>,
     /// The line that says what happened (`Kernel panic - not syncing: …`).
@@ -182,7 +186,8 @@ fn kernel_of(lines: &[String]) -> Option<String> {
 /// `corerouter.slot=b` of the kernel's `Command line:` (only in a dump that
 /// reaches back to the start of the boot).
 fn slot_of(lines: &[String]) -> Option<String> {
-    lines.iter().find(|l| l.contains("Command line:")).and_then(|l| {
+    // `Command line:` (the boot loader's) and `Kernel command line:`.
+    lines.iter().find(|l| l.contains("ommand line:")).and_then(|l| {
         l.split_ascii_whitespace()
             .find_map(|w| w.strip_prefix("corerouter.slot="))
             .filter(|s| !s.is_empty() && s.len() <= 8 && s.bytes().all(|b| b.is_ascii_alphanumeric()))
@@ -290,6 +295,7 @@ fn assemble(mut g: Vec<Part>) -> Crash {
         summary: summary_of(&lines),
         kernel: kernel_of(&lines),
         slot: slot_of(&lines),
+        version: None,
         reason,
         backend,
         uptime_s,
@@ -298,6 +304,36 @@ fn assemble(mut g: Vec<Part>) -> Crash {
         complete,
         files,
         lines,
+    }
+}
+
+/// What the A/B state says about the boot before this one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AbBoot {
+    /// The slot running now (`corerouter.slot=` of `/proc/cmdline`).
+    pub running: Option<String>,
+    /// The last outcome, when it is a trial that failed and fell back:
+    /// (slot, version, Unix time it was found, at this boot's start).
+    pub rolled_back: Option<(String, String, u64)>,
+}
+
+/// Fill the slot of dumps whose text does not say it (G1.6zx): a dump
+/// written before the fall-back of a failed trial is the trial slot's
+/// (the trial boot is the one that died: slot B "did not come up"); any
+/// other is the slot that boots now, since a panic reboots into the same
+/// slot. Measured on OVMF: a dump of 10 KiB compressed holds the last
+/// ~26 KB of text and does not reach the command line even for a panic at
+/// 0.8 s.
+pub fn attribute(crashes: &mut [Crash], ab: &AbBoot) {
+    for c in crashes.iter_mut().filter(|c| c.slot.is_none()) {
+        let trial = ab.rolled_back.as_ref().filter(|(_, _, at)| c.time.is_some_and(|t| t <= *at));
+        match trial {
+            Some((slot, version, _)) => {
+                c.slot = Some(slot.clone());
+                c.version = (!version.is_empty()).then(|| version.clone());
+            }
+            None => c.slot.clone_from(&ab.running),
+        }
     }
 }
 
@@ -343,7 +379,10 @@ pub fn log_lines(c: &Crash) -> Vec<(&'static str, String)> {
         boot.push(format!("boot started {}", utc(s)));
     }
     if let Some(s) = &c.slot {
-        boot.push(format!("slot {s}"));
+        boot.push(match &c.version {
+            Some(v) => format!("slot {s} ({v})"),
+            None => format!("slot {s}"),
+        });
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     if let Some(u) = c.uptime_s {
@@ -376,9 +415,11 @@ pub fn log_lines(c: &Crash) -> Vec<(&'static str, String)> {
 /// on (G1.6zx, docs/os-image.md: room for [`DUMPS_KEPT_ROOM`] full dumps,
 /// the A/B update's boot entries and the firmware's own reserve).
 pub const EFI_MIN_FREE: u64 = DUMP_BYTES * DUMPS_KEPT_ROOM + BOOT_ENTRIES_BYTES + KERNEL_RESERVE;
-/// One dump in UEFI variables, at most (**medido**, OVMF, `kmsg_bytes`
-/// 10240: 10 variables of 1 KiB plus their names and headers).
-pub const DUMP_BYTES: u64 = 12 << 10;
+/// One dump in UEFI variables (**medido**, OVMF 2024.02, kernel 6.18.59,
+/// `kmsg_bytes` 10240, `echo c > /proc/sysrq-trigger`: 16 variables of
+/// 487–841 B compressed, NVRAM free 235 → 219 KiB). pstore counts the
+/// compressed bytes against `kmsg_bytes`, so the size holds for any log.
+pub const DUMP_BYTES: u64 = 16 << 10;
 pub const DUMPS_KEPT_ROOM: u64 = 2;
 /// The A/B update's `Boot####` entries, `BootOrder` and `BootNext`, with
 /// room to spare (each entry ~200 B).
@@ -437,6 +478,7 @@ impl CrashLog {
                     "uptime_s": c.uptime_s,
                     "boot_start": c.boot_start,
                     "slot": c.slot,
+                    "version": c.version,
                     "kernel": c.kernel,
                     "summary": c.summary,
                     "parts": c.parts,
@@ -618,6 +660,23 @@ mod tests {
         assert!(got.iter().any(|c| c.reason == "mce" && c.summary.contains("Machine Check")));
         // Not decompressed: kept as a record of its own, never lost.
         assert!(got.iter().any(|c| c.files == ["dmesg-efi_pstore-1.enc.z"]));
+    }
+
+    #[test]
+    fn the_slot_from_the_ab_state() {
+        let t = 1_763_000_000;
+        let mut late = parse(&[file("dmesg-erst-1", t, "Panic#1 Part1\n<0>[ 9000.0] Kernel panic - not syncing: x\n")]);
+        let ab = AbBoot { running: Some("a".into()), rolled_back: Some(("b".into(), "1.2.3".into(), t + 30)) };
+        attribute(&mut late, &ab);
+        assert_eq!((late[0].slot.as_deref(), late[0].version.as_deref()), (Some("b"), Some("1.2.3")), "the trial that fell back");
+        let mut other = parse(&[file("dmesg-erst-2", t + 100, "Panic#1 Part1\n<0>[ 9000.0] Kernel panic - not syncing: x\n")]);
+        attribute(&mut other, &ab);
+        assert_eq!(other[0].slot.as_deref(), Some("a"), "after the fall-back: the slot running now");
+        // The text wins.
+        let mut early = parse(&sysrq_panic(t));
+        attribute(&mut early, &ab);
+        assert_eq!(early[0].slot.as_deref(), Some("b"));
+        assert!(log_lines(&late[0])[0].1.contains("slot b (1.2.3)"));
     }
 
     #[test]

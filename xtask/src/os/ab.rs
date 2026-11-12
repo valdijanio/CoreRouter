@@ -1094,17 +1094,19 @@ fn crash_of_previous_boot(vm: &mut Vm, log: &mut std::fs::File) -> Result<Value,
 
 /// Free bytes of the UEFI variable store (`statfs` of efivarfs).
 fn nvram_free(vm: &mut Vm, log: &mut std::fs::File) -> Result<u64, String> {
-    let l = shell_line(vm, log, "df -B1 /sys/firmware/efi/efivars | tail -1")?;
+    let l = shell_line(vm, log, "df -k /sys/firmware/efi/efivars | tail -1")?;
+    // BusyBox `df` counts KiB.
     l.split_whitespace()
         .nth(3)
-        .and_then(|w| w.parse().ok())
+        .and_then(|w| w.parse::<u64>().ok())
+        .map(|k| k * 1024)
         .ok_or_else(|| format!("df of efivarfs: {l}"))
 }
 
 /// A GUID of no one's: the variables that fill the NVRAM in the test.
 const FILL_GUID: &str = "6b1c0f41-2b5e-4f59-9c4b-1f0d3a0b7e21";
 /// What the filled NVRAM keeps free: less than the daemon's
-/// `EFI_MIN_FREE` (33 KiB), more than the A/B update's entries and the
+/// `EFI_MIN_FREE` (41 KiB), more than the A/B update's entries and the
 /// kernel's reserve (9 KiB).
 const FILL_LEAVES: u64 = 16 << 10;
 
