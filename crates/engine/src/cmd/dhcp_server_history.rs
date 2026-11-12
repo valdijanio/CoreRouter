@@ -95,6 +95,7 @@ fn row(e: &Entry) -> Value {
 fn print(s: &mut Session, p: &Value) -> Result<Value> {
     let (q, limit) = query(p)?;
     let retention = s.store().running().ip.dhcp_server.config.history_retention;
+    s.dhcp_history_ensure();
     let Some(h) = s.dhcp_lease_history() else {
         return Ok(json!({"rows": [], "total": 0, "retention": secs_text(retention)}));
     };
@@ -107,6 +108,7 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
     let limit = opt_u32(p, "limit")?
         .map_or(history::MAX_ROWS, |l| usize::try_from(l).unwrap_or(usize::MAX))
         .min(history::MAX_ROWS);
+    s.dhcp_history_ensure();
     let Some(h) = s.dhcp_lease_history() else {
         return Ok(json!({"csv": csv(&[]), "rows": 0}));
     };
@@ -115,6 +117,7 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn config_print(s: &mut Session, _: &Value) -> Result<Value> {
+    s.dhcp_history_ensure();
     let r = s.store().candidate().ip.dhcp_server.config.history_retention;
     let mut v = json!({
         "history_retention": secs_text(r),

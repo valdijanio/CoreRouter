@@ -25,6 +25,7 @@ mod cow_sections;
 mod dhcp6_client;
 mod dhcp6_server;
 mod dhcp_client;
+mod dhcp_history_restart;
 mod dhcp_lease_index;
 mod dhcp_lock;
 mod dhcp_relay;
