@@ -642,10 +642,14 @@ impl ResourcesPanel {
             num("UE").help("resources.col.ue"),
             col("State"),
         ];
-        let out = table::show(ui, T_DIMMS, 0.0, &mut self.dimm_table, &cols, &rows, |_, _| {});
-        if let Some(k) = out.help {
-            self.help = Some(HelpView::new(k, col_title(&cols, k, l)));
-        }
+        // Its own height (as Overview's ports): the largest processes stay below.
+        let h = (rows.len().min(12) as f32 + 2.6) * ui.spacing().interact_size.y;
+        ui.allocate_ui(vec2(ui.available_width(), h), |ui| {
+            let out = table::show(ui, T_DIMMS, 0.0, &mut self.dimm_table, &cols, &rows, |_, _| {});
+            if let Some(k) = out.help {
+                self.help = Some(HelpView::new(k, col_title(&cols, k, l)));
+            }
+        });
         let lost = m.get("hardware_corrupted_kib").and_then(Value::as_u64).unwrap_or(0);
         let noinfo = m.get("ce_noinfo").and_then(Value::as_u64).unwrap_or(0) + m.get("ue_noinfo").and_then(Value::as_u64).unwrap_or(0);
         if lost > 0 || noinfo > 0 {
