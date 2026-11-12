@@ -52,13 +52,9 @@ pub(super) fn verify(
         }
     }
     for want in required {
-        let file = format!("{want}.ko");
-        if !kos
-            .iter()
-            .any(|k| k.file_name().is_some_and(|n| *n == *file))
-        {
+        if !kos.iter().any(|k| is_module(k, want)) {
             return Err(format!(
-                "{}: no {file} (the ISO's kernel built it in?)",
+                "{}: no {want}.ko (the ISO's kernel built it in?)",
                 top.display()
             ));
         }
@@ -79,9 +75,26 @@ pub(super) fn verify(
     Ok((kos.len(), size))
 }
 
+/// Is `ko` the file of module `name`? The kernel names a module after its
+/// file with `-` read as `_` (G4.8g: `i2c-piix4.ko` is `i2c_piix4`).
+fn is_module(ko: &Path, name: &str) -> bool {
+    ko.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(".ko"))
+        .is_some_and(|stem| stem.replace('-', "_") == name.replace('-', "_"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn module_files_by_the_kernel_s_name() {
+        assert!(is_module(Path::new("/x/i2c-piix4.ko"), "i2c_piix4"));
+        assert!(is_module(Path::new("/x/e100.ko"), "e100"));
+        assert!(!is_module(Path::new("/x/e1000.ko"), "e100"));
+        assert!(!is_module(Path::new("/x/e100.ko.zst"), "e100"));
+    }
 
     #[test]
     fn a_module_of_another_release_is_told_apart() {
