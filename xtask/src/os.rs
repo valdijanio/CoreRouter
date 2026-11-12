@@ -2148,13 +2148,18 @@ fn crash_check(root: &Path, top: &Path, port: u16) -> Result<String, String> {
         let got = guest_cli(root, top, port, "system.crash.print")?;
         let v: serde_json::Value = serde_json::from_str(got.trim())
             .map_err(|e| format!("system.crash.print: {e}: {got:.300}"))?;
-        if v["fed"] == true {
-            if v["crashes"].as_array().is_some_and(|a| !a.is_empty()) {
+        if v.get("fed") == Some(&serde_json::Value::Bool(true)) {
+            if v.get("crashes")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|a| !a.is_empty())
+            {
                 return Err(format!("G1.6zx: a fresh boot reports a crash: {v}"));
             }
             return Ok(format!(
                 "crash log fed, backend {}",
-                v["backend"].as_str().unwrap_or("none")
+                v.get("backend")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("none")
             ));
         }
         if Instant::now() >= deadline {
