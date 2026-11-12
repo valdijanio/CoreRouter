@@ -71,12 +71,16 @@ impl Session {
         matches!(self.ext::<RoutingBackend>(), Some(RoutingBackend(Some(_))))
     }
 
-    /// What the routing reader saw last (set by the daemon's thread).
-    pub fn set_routing_status(&mut self, status: RoutingStatus) {
+    /// What the routing reader saw last (set by the daemon's thread). The
+    /// previous sample comes back, for the caller to free after it lets go
+    /// of the lock (G3.4n: freeing 4 000 interfaces and 500 neighbors was
+    /// most of the time the lock was held for a store, **medido**).
+    pub fn set_routing_status(&mut self, status: RoutingStatus) -> RoutingStatus {
         // G3.3: downs and ups, from sample to sample.
         self.record_bgp_history(&status.bgp_sessions);
-        if let Some(slot) = self.ext_mut::<RoutingStatus>() {
-            *slot = status;
+        match self.ext_mut::<RoutingStatus>() {
+            Some(slot) => std::mem::replace(slot, status),
+            None => status,
         }
     }
 

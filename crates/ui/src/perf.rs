@@ -208,6 +208,44 @@ impl Frames {
         me
     }
 
+    /// G3.4n: Routing › OSPF on a large network (`engine::perf::ospf_scale`:
+    /// 4 000 OSPF interfaces, 500 neighbors, an LSDB of 100 000 LSAs from
+    /// 2 000 routers, 200 000 routes) with tab `tab` open: `neighbors`,
+    /// `lsdb`, `routes` or `topology`.
+    pub fn ospf(tab: &str) -> Self {
+        use crate::ospf::{OspfPanel, Tab, WIN};
+        let s = corerouter_engine::perf::ospf_scale(4_000, 500, 2_000, 100_000, 200_000);
+        let mut me = Self::with(s, Some(Win::Panel(WIN)));
+        if let Some(p) = me.app.panel_mut::<OspfPanel>() {
+            p.instance = "v2".into();
+            p.tab = match tab {
+                "lsdb" => Tab::Lsdb,
+                "routes" => Tab::Routes,
+                "topology" => Tab::Topology,
+                _ => Tab::Neighbors,
+            };
+        }
+        me.app.cache.refreshed_at = None;
+        me.time += 2.0;
+        me.frame();
+        me.frame();
+        me
+    }
+
+    /// Rows (or map nodes) the OSPF window holds now.
+    pub fn ospf_shown(&mut self) -> usize {
+        let Some(p) = self.app.panel_mut::<crate::ospf::OspfPanel>() else {
+            return 0;
+        };
+        let rows = |v: &Value| v.get("rows").and_then(Value::as_array).map_or(0, Vec::len);
+        match p.tab {
+            crate::ospf::Tab::Lsdb => rows(&p.lsas),
+            crate::ospf::Tab::Routes => rows(&p.routes),
+            crate::ospf::Tab::Topology => p.topo.nodes.len(),
+            _ => rows(&p.neighbors),
+        }
+    }
+
     /// Draw one frame of a 1400×900 screen.
     pub fn frame(&mut self) {
         let raw = egui::RawInput {

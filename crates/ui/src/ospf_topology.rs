@@ -48,12 +48,20 @@ pub(crate) struct View {
     pub pan: Vec2,
     pub source: String,
     pub layout_ms: f64,
+    /// G3.4n: the token of the map held, sent back with each refresh (the
+    /// router answers `unchanged` instead of the map again).
+    pub token: String,
 }
 
 impl View {
     /// Turn `routing.ospf.topology`'s answer into the flat vectors.
     pub(crate) fn arrived(&mut self, v: &Value) {
         let get = |o: &Value, k: &str| o.get(k).map(value_text).unwrap_or_default();
+        // The map held is the one asked about: nothing to redo.
+        if v.get("unchanged").and_then(Value::as_bool) == Some(true) {
+            return;
+        }
+        self.token = get(v, "token");
         self.source = get(v, "source");
         self.layout_ms = v.get("layout_ms").and_then(Value::as_f64).unwrap_or(0.0);
         self.areas = v

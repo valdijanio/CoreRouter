@@ -547,20 +547,13 @@ fn hash_region(f: &File, at: u64, len: u64, zeros: u64) -> Result<(String, bool)
 }
 
 /// Re-reads slot A and recomputes its verity tree (like
-/// `Platform::check_slot` after an update).
+/// `Platform::check_slot` after an update): every byte of the slot, a
+/// piece at a time (G0.30j).
 fn check_rootfs(f: &File, at: u64, m: &Manifest, threads: usize) -> Result<(), String> {
-    let mut data = vec![0u8; m.rootfs.size as usize];
-    f.read_exact_at(&mut data, at)
-        .map_err(|e| format!("read back slot A: {e}"))?;
-    if package::sha256_hex(&data) != m.rootfs.sha256 {
-        return Err("slot A: what was read back is not the signed rootfs".into());
-    }
-    let split = (m.rootfs.data_blocks as usize) * verity::BLOCK;
-    let (d, on_disk) = data.split_at(split.min(data.len()));
     let salt = verity::unhex(&m.rootfs.salt).ok_or("salt")?;
-    let tree = verity::tree(d, &salt, threads)?;
-    if verity::hex(&tree.root) != m.rootfs.root_hash || tree.bytes != on_disk {
-        return Err("slot A: the verity tree read back does not match the signed root hash".into());
+    let r = &m.rootfs;
+    if !verity::check_at(f, at, r.size, r.data_blocks, &salt, &r.root_hash, threads)? {
+        return Err("slot A: what was read back does not match the signed root hash".into());
     }
     Ok(())
 }

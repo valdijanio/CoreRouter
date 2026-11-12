@@ -34,6 +34,12 @@ fn frames(c: &mut Criterion) {
     g.bench_function("queue_view_traffic_900", |b| b.iter(|| f.frame()));
     let mut f = Frames::queue_view(Some(false));
     g.bench_function("queue_view_statistics", |b| b.iter(|| f.frame()));
+    // G3.4n: Routing › OSPF on a large network.
+    for tab in ["neighbors", "lsdb", "routes", "topology"] {
+        let mut f = Frames::ospf(tab);
+        eprintln!("ospf {tab}: {} rows or nodes held", f.ospf_shown());
+        g.bench_function(format!("ospf_{tab}"), |b| b.iter(|| f.frame()));
+    }
     g.finish();
 }
 

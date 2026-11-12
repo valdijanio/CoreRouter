@@ -54,5 +54,10 @@ harness = false
 name = "frr_sr"
 harness = false
 
+# G3.4n: the FRR poll's cost on our side at scale.
+[[bench]]
+name = "frr_ospf_poll"
+harness = false
+
 [lints]
 workspace = true

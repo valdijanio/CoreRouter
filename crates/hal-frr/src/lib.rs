@@ -21,6 +21,7 @@
 pub mod conf;
 pub mod fast_reroute;
 pub mod ldp;
+pub mod loose;
 pub mod on_demand;
 pub mod ospf;
 pub mod render;
@@ -69,6 +70,39 @@ pub struct Frr {
     /// G1.6i: the protocol daemons are started by the image's init when
     /// the config needs them.
     on_demand: Option<on_demand::OnDemand>,
+    /// G3.4n: the state readers' connections, kept between polls.
+    pool: Pool,
+}
+
+/// Connections kept for the state reads (G3.4n): the poll every 2 s used
+/// to open one per daemon and instance and type `enable` on each. FRR
+/// keeps a vtysh connection open without a timeout (10.7.1
+/// `lib/vty.c`: `vtysh_accept` sets no `v_timeout`), as `vtysh` itself
+/// does. A copy of [`Frr`] starts with none of its own (the reader
+/// thread's copy owns its connections; a commit never uses them).
+#[derive(Default)]
+struct Pool(std::sync::Mutex<Vec<(Daemon, Vty)>>);
+
+impl Clone for Pool {
+    fn clone(&self) -> Self {
+        Pool::default()
+    }
+}
+
+impl Pool {
+    fn take(&self, d: Daemon) -> Option<Vty> {
+        let mut kept = self.0.lock().ok()?;
+        let i = kept.iter().position(|(k, _)| *k == d)?;
+        Some(kept.swap_remove(i).1)
+    }
+
+    fn put(&self, d: Daemon, vty: Vty) {
+        if let Ok(mut kept) = self.0.lock()
+            && kept.len() < Daemon::ALL.len()
+        {
+            kept.push((d, vty));
+        }
+    }
 }
 
 impl std::fmt::Debug for Frr {
@@ -105,7 +139,33 @@ impl Frr {
             owned: render::OWNED,
             secrets: None,
             on_demand: None,
+            pool: Pool::default(),
         }
+    }
+
+    /// Run the read `f` on a kept connection to `d` and keep it again
+    /// (G3.4n). When the kept one fails to talk (the daemon restarted), `f`
+    /// runs once more on a new connection. A connection whose read failed
+    /// in any way is closed: it may hold the rest of an answer.
+    fn with_vty<T>(
+        &self,
+        d: Daemon,
+        mut f: impl FnMut(&mut Vty) -> Result<T, HalError>,
+    ) -> Result<T, HalError> {
+        if let Some(mut vty) = self.pool.take(d) {
+            match f(&mut vty) {
+                Ok(t) => {
+                    self.pool.put(d, vty);
+                    return Ok(t);
+                }
+                Err(HalError::Io(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let mut vty = self.connect(d)?;
+        let t = f(&mut vty)?;
+        self.pool.put(d, vty);
+        Ok(t)
     }
 
     /// G1.6i: asks for bgpd, ospfd, ospf6d, ldpd and bfdd through `file`
@@ -381,10 +441,7 @@ impl Frr {
     pub fn version(&self) -> Result<String, HalError> {
         let mut last = HalError::Io("no FRR daemon answers".into());
         for d in [Daemon::Zebra, Daemon::Bgpd] {
-            match self
-                .connect(d)
-                .and_then(|mut v| v.run("show version").map_err(|e| io_err(d, e)))
-            {
+            match self.with_vty(d, |v| v.run("show version").map_err(|e| io_err(d, e))) {
                 Ok(r) => return Ok(version_line(&String::from_utf8_lossy(&r.output))),
                 Err(e) => last = e,
             }
@@ -428,26 +485,27 @@ impl Frr {
             .map(String::as_str)
             .filter(|n| *n != corerouter_proto_bgp::DEFAULT_INSTANCE)
             .collect();
-        let mut vty = match self.connect(Daemon::Bgpd) {
-            Ok(v) => v,
-            // No bgpd and no instance: nothing to read, not an error.
-            Err(_) if cfg.routing.bgp.is_empty() => return Ok(Vec::new()),
-            Err(e) => return Err(e),
-        };
-        let mut read = |cmd: String, vrf: Option<&str>| -> Result<Vec<BgpSession>, HalError> {
-            let r = vty.run(&cmd).map_err(|e| io_err(Daemon::Bgpd, e))?;
-            let text = String::from_utf8_lossy(&r.output);
-            // An instance that does not exist yet answers a warning, not JSON.
-            if !r.ok() || text.trim().is_empty() {
-                return Ok(Vec::new());
+        let got = self.with_vty(Daemon::Bgpd, |vty| {
+            let mut read = |cmd: String, vrf: Option<&str>| -> Result<Vec<BgpSession>, HalError> {
+                let r = vty.run(&cmd).map_err(|e| io_err(Daemon::Bgpd, e))?;
+                let text = String::from_utf8_lossy(&r.output);
+                // An instance that does not exist yet answers a warning, not JSON.
+                if !r.ok() || text.trim().is_empty() {
+                    return Ok(Vec::new());
+                }
+                state::bgp_sessions(&text, vrf, &instance_of).map_err(HalError::Rejected)
+            };
+            let mut out = read("show bgp vrf all neighbors json".into(), None)?;
+            for v in &views {
+                out.extend(read(format!("show bgp view {v} neighbors json"), Some(v))?);
             }
-            state::bgp_sessions(&text, vrf, &instance_of).map_err(HalError::Rejected)
-        };
-        let mut out = read("show bgp vrf all neighbors json".into(), None)?;
-        for v in views {
-            out.extend(read(format!("show bgp view {v} neighbors json"), Some(v))?);
+            Ok(out)
+        });
+        match got {
+            // No bgpd and no instance: nothing to read, not an error.
+            Err(_) if cfg.routing.bgp.is_empty() => Ok(Vec::new()),
+            got => got,
         }
-        Ok(out)
     }
 }
 
@@ -461,25 +519,28 @@ impl Frr {
         let Some(ldp) = cfg.routing.mpls.ldp_running() else {
             return Ok(None);
         };
-        let mut vty = self.connect(Daemon::Ldpd)?;
         let show = |vty: &mut Vty, d: Daemon, cmd: &str| -> Result<Option<String>, HalError> {
             let r = vty.run(cmd).map_err(|e| io_err(d, e))?;
             let text = String::from_utf8_lossy(&r.output).into_owned();
             Ok((r.ok() && !text.trim().is_empty()).then_some(text))
         };
-        let mut st = corerouter_model::mpls_state::LdpState::default();
-        if let Some(t) = show(&mut vty, Daemon::Ldpd, "show mpls ldp neighbor json")? {
-            st.neighbors = ldp::neighbors(&t).map_err(HalError::Rejected)?;
-        }
-        if let Some(t) = show(&mut vty, Daemon::Ldpd, "show mpls ldp binding json")? {
-            st.bindings = ldp::bindings(&t).map_err(HalError::Rejected)?;
-        }
-        if let Some(t) = show(&mut vty, Daemon::Ldpd, "show mpls ldp interface json")? {
-            st.interfaces = ldp::interfaces(&t).map_err(HalError::Rejected)?;
-        }
+        let mut st = self.with_vty(Daemon::Ldpd, |vty| {
+            let mut st = corerouter_model::mpls_state::LdpState::default();
+            if let Some(t) = show(vty, Daemon::Ldpd, "show mpls ldp neighbor json")? {
+                st.neighbors = ldp::neighbors(&t).map_err(HalError::Rejected)?;
+            }
+            if let Some(t) = show(vty, Daemon::Ldpd, "show mpls ldp binding json")? {
+                st.bindings = ldp::bindings(&t).map_err(HalError::Rejected)?;
+            }
+            if let Some(t) = show(vty, Daemon::Ldpd, "show mpls ldp interface json")? {
+                st.interfaces = ldp::interfaces(&t).map_err(HalError::Rejected)?;
+            }
+            Ok(st)
+        })?;
         if ldp.igp_sync
-            && let Ok(mut o) = self.connect(Daemon::Ospfd)
-            && let Ok(Some(t)) = show(&mut o, Daemon::Ospfd, "show ip ospf mpls ldp-sync json")
+            && let Ok(Some(t)) = self.with_vty(Daemon::Ospfd, |o| {
+                show(o, Daemon::Ospfd, "show ip ospf mpls ldp-sync json")
+            })
         {
             st.igp_sync = ldp::ospf_sync(&t).unwrap_or_default();
         }
@@ -502,16 +563,14 @@ impl Frr {
                 Version::V2 => (Daemon::Ospfd, "show ip ospf json"),
                 Version::V3 => (Daemon::Ospf6d, "show ipv6 ospf6 json"),
             };
-            let mut vty = self.connect(d)?;
-            let r = vty.run(cmd).map_err(|e| io_err(d, e))?;
-            let t = String::from_utf8_lossy(&r.output).into_owned();
+            let r = self.with_vty(d, |vty| vty.run(cmd).map_err(|e| io_err(d, e)))?;
             // Not running yet: a warning, not JSON.
-            if !r.ok() || !t.trim_start().starts_with('{') {
+            if !r.ok() || !loose::is_object(&r.output) {
                 continue;
             }
             let st = match inst.version {
-                Version::V2 => ospf::stub_v2(&t, &inst.name),
-                Version::V3 => ospf::stub_v3(&t, &inst.name),
+                Version::V2 => ospf::stub_v2(&r.output, &inst.name),
+                Version::V3 => ospf::stub_v3(&r.output, &inst.name),
             };
             out.push(st.map_err(HalError::Rejected)?);
         }
@@ -542,31 +601,32 @@ impl Frr {
                 Version::V2 => Daemon::Ospfd,
                 Version::V3 => Daemon::Ospf6d,
             };
-            let mut vty = self.connect(d)?;
-            let mut read = |cmd: &str| -> Result<Option<String>, HalError> {
-                let r = vty.run(cmd).map_err(|e| io_err(d, e))?;
-                let text = String::from_utf8_lossy(&r.output).into_owned();
-                // Not running yet: a warning, not JSON.
-                Ok((r.ok() && text.trim_start().starts_with('{')).then_some(text))
+            let cmds: &[&str] = match inst.version {
+                Version::V2 => &["show ip ospf neighbor json", "show ip ospf interface json"],
+                Version::V3 => &["show ipv6 ospf6 neighbor json"],
             };
-            match inst.version {
-                Version::V2 => {
-                    if let Some(t) = read("show ip ospf neighbor json")? {
-                        nbrs.extend(
-                            ospf::neighbors_v2(&t, &inst.name).map_err(HalError::Rejected)?,
-                        );
-                    }
-                    if let Some(t) = read("show ip ospf interface json")? {
-                        ifs.extend(
-                            ospf::interfaces_v2(&t, &inst.name).map_err(HalError::Rejected)?,
-                        );
-                    }
+            // Only the reads on the connection; the answers' bytes are
+            // parsed as they are after it (G3.4n: no copy into a `String`).
+            let got = self.with_vty(d, |vty| {
+                cmds.iter()
+                    .map(|c| vty.run(c).map_err(|e| io_err(d, e)))
+                    .collect::<Result<Vec<_>, _>>()
+            })?;
+            for (cmd, r) in cmds.iter().zip(got) {
+                // Not running yet: a warning, not JSON.
+                if !r.ok() || !loose::is_object(&r.output) {
+                    continue;
                 }
-                Version::V3 => {
-                    if let Some(t) = read("show ipv6 ospf6 neighbor json")? {
-                        nbrs.extend(
-                            ospf::neighbors_v3(&t, &inst.name).map_err(HalError::Rejected)?,
-                        );
+                let t = &r.output;
+                match *cmd {
+                    "show ip ospf neighbor json" => {
+                        nbrs.extend(ospf::neighbors_v2(t, &inst.name).map_err(HalError::Rejected)?)
+                    }
+                    "show ip ospf interface json" => {
+                        ifs.extend(ospf::interfaces_v2(t, &inst.name).map_err(HalError::Rejected)?)
+                    }
+                    _ => {
+                        nbrs.extend(ospf::neighbors_v3(t, &inst.name).map_err(HalError::Rejected)?)
                     }
                 }
             }
@@ -624,12 +684,30 @@ impl Frr {
             ospf::read_lsdb(chained, &mut db).map_err(HalError::Rejected)?;
             let _ = stream.finish().map_err(io)?;
         }
-        let r = vty.run("show ip ospf route json").map_err(io)?;
-        let text = String::from_utf8_lossy(&r.output);
-        let mut routes = if r.ok() && text.trim_start().starts_with('{') {
-            ospf::routes_v2(&text, instance).map_err(HalError::Rejected)?
-        } else {
-            Vec::new()
+        // G3.4n: streamed like the LSDB (200 000 routes are ~43 MiB of
+        // JSON; held whole they also ran into `MAX_REPLY`).
+        let mut routes = {
+            let mut stream = vty
+                .run_stream("show ip ospf route json", MAX_TABLE)
+                .map_err(io)?;
+            let mut first = [0u8; 1];
+            let mut n = std::io::Read::read(&mut stream, &mut first).map_err(io)?;
+            while n == 1 && first[0].is_ascii_whitespace() {
+                n = std::io::Read::read(&mut stream, &mut first).map_err(io)?;
+            }
+            let got = if n == 1 && first[0] == b'{' {
+                let chained = std::io::Read::chain(&first[..], &mut stream);
+                Some(ospf::read_routes(chained, instance))
+            } else {
+                None
+            };
+            let code = stream.finish().map_err(io)?;
+            match got {
+                Some(r) if matches!(code, vty::CMD_SUCCESS | vty::CMD_SUCCESS_DAEMON) => {
+                    r.map_err(HalError::Rejected)?
+                }
+                _ => Vec::new(),
+            }
         };
         // G3.4f: the SR database, when this instance runs SR.
         if corerouter_model::ospf_sr::active(&cfg.routing.ospf)
@@ -1103,6 +1181,82 @@ mod tests {
         std::fs::write(dir.join("bgpd.pid"), "201\n").unwrap();
         let b = frr.incarnation();
         assert!(b.is_some() && b != a && b != down, "{b:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// G3.4n: the reads keep their connection between polls, and a kept
+    /// connection the daemon closed (a restart) is replaced without an
+    /// error.
+    #[cfg(unix)]
+    #[test]
+    fn reads_keep_the_connection_and_survive_a_restart() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = std::env::temp_dir().join(format!("cr-pool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = UnixListener::bind(dir.join("zebra.vty")).unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        // Answers `per_conn` commands on each connection, then closes it.
+        let per_conn = Arc::new(AtomicUsize::new(usize::MAX));
+        let (acc, per) = (Arc::clone(&accepted), Arc::clone(&per_conn));
+        std::thread::spawn(move || {
+            for c in listener.incoming() {
+                let Ok(mut c) = c else { return };
+                acc.fetch_add(1, Ordering::SeqCst);
+                let mut left = per.load(Ordering::SeqCst);
+                let mut b = [0u8; 256];
+                let mut pending = Vec::new();
+                'conn: while left > 0 {
+                    let Ok(n) = c.read(&mut b) else { break };
+                    if n == 0 {
+                        break;
+                    }
+                    pending.extend_from_slice(&b[..n]);
+                    while let Some(end) = pending.iter().position(|&x| x == 0) {
+                        let cmd = String::from_utf8_lossy(&pending[..end]).into_owned();
+                        pending.drain(..=end);
+                        let out: &[u8] = if cmd == "show version" {
+                            b"FRRouting 10.7.1 (t).\n"
+                        } else {
+                            b""
+                        };
+                        if c.write_all(out)
+                            .and_then(|()| c.write_all(&[0, 0, 0, 0]))
+                            .is_err()
+                        {
+                            break 'conn;
+                        }
+                        left -= 1;
+                        if left == 0 {
+                            break 'conn;
+                        }
+                    }
+                }
+            }
+        });
+        let frr = Frr::new(&dir);
+        for _ in 0..5 {
+            assert_eq!(frr.version().unwrap(), "frr 10.7.1");
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "one connection for five polls"
+        );
+        // From now on the daemon drops every connection after `enable`
+        // and one command: each poll finds the kept one dead.
+        per_conn.store(2, Ordering::SeqCst);
+        frr.pool.0.lock().unwrap().clear();
+        for _ in 0..3 {
+            assert_eq!(frr.version().unwrap(), "frr 10.7.1");
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 4);
+        // A copy (the reader thread's) starts with none of the kept ones.
+        assert!(frr.clone().pool.0.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
