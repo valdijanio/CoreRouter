@@ -181,6 +181,38 @@ fn profiles_tab_compares_the_four() {
     assert!(h.has_text("Recommended"));
 }
 
+/// G1.26k: the Profiles tab says picking only compares, and applies the
+/// picked profile with Safe Mode, as Summary does.
+#[test]
+fn profiles_tab_applies_the_picked_profile_with_safe_mode() {
+    let mut h = open(Tab::Profiles);
+    assert!(h.has_text("Picking a profile at the top only compares it: nothing changes until you apply it."));
+    assert!(h.has_text("compare only"));
+    // Balanced is picked until the operator picks another one.
+    assert!(h.has_text("picked"));
+    panel(&mut h).profile = "throughput";
+    refresh(&mut h);
+    assert!(h.has_text_containing("High throughput: nothing is configured yet"));
+    // Picking changed nothing on the router.
+    assert!(lock(&h.session).store().running().system.tuning.sysctl.is_empty());
+    h.click(h.text("Apply with Safe Mode"));
+    refresh(&mut h);
+    let s = lock(&h.session);
+    assert!(s.in_safe_mode(), "{:?}", h.app.log());
+    let sysctl = &s.store().running().system.tuning.sysctl;
+    assert_eq!(sysctl.get("net.core.netdev_budget"), Some(&1200), "throughput's budget");
+    assert_eq!(
+        sysctl.get("net.netfilter.nf_conntrack_tcp_timeout_established"),
+        Some(&7440)
+    );
+    drop(s);
+    assert!(h.has_text_containing("High throughput: 0 parameters differ from this profile."));
+    // Portuguese labels and explanations: the line is translated.
+    h.app.lang = Langs { labels: Lang::Pt, help: Lang::Pt };
+    refresh(&mut h);
+    assert!(h.has_text("Escolher um perfil no alto só o compara: nada muda até você aplicá-lo."));
+}
+
 #[test]
 fn numbers_read_well() {
     use crate::tuning::grouped;

@@ -1606,10 +1606,13 @@ impl TuningPanel {
 
     fn profiles(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
         let l = app.lang.labels;
+        ui.label(tr(l, "The four profiles for this machine, side by side."));
+        // G1.26k: picking a profile at the top looked like saving it.
         ui.horizontal(|ui| {
+            chip(ui, tr(l, "compare only"), AMBER.tone(ui.visuals()));
             ui.label(tr(
                 l,
-                "The four profiles for this machine, side by side. The profile picked at the top is the one Summary applies.",
+                "Picking a profile at the top only compares it: nothing changes until you apply it.",
             ));
             if help::info_button(ui, Id::unique("tuning-profiles-help-2"), tr(l, "Profiles"))
                 .clicked()
@@ -1617,6 +1620,9 @@ impl TuningPanel {
                 self.help = Some(HelpView::new("tuning.profiles", tr(l, "Profiles")));
             }
         });
+        self.profile_actions(app, ui);
+        ui.add_space(4.0);
+        let picked = self.profile();
         let by: Vec<(&str, Vec<Param>)> = PROFILES
             .iter()
             .map(|(_, label, key)| {
@@ -1645,8 +1651,15 @@ impl TuningPanel {
                     .show(ui, |ui| {
                         ui.strong(tr(l, "Parameter"));
                         ui.strong(tr(l, "Current"));
-                        for (label, _) in &by {
-                            ui.strong(tr(l, label));
+                        for (id, label, _) in PROFILES {
+                            if id == picked {
+                                ui.horizontal(|ui| {
+                                    ui.strong(tr(l, label));
+                                    chip(ui, tr(l, "picked"), BLUE.tone(ui.visuals()));
+                                });
+                            } else {
+                                ui.strong(tr(l, label));
+                            }
                         }
                         ui.end_row();
                         for section in SECTIONS {
