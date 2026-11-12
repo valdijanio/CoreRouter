@@ -467,6 +467,16 @@ pub trait Hal: Send {
         )))
     }
 
+    /// The board's battery clock (RTC) in seconds since 1970, read as UTC,
+    /// for `system.clock.print` (G4.6p). Only a backend on a real machine
+    /// has one; reading never changes it.
+    fn hardware_clock(&self) -> Result<i64, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no hardware clock",
+            self.describe()
+        )))
+    }
+
     /// The lab's simulated BNG (see [`Hal::offer_dhcp_lab_server`]).
     fn offer_pppoe_lab_server(&mut self, server: pppoe_client::SharedPppoeLab) {
         let _ = server;

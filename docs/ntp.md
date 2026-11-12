@@ -3,6 +3,9 @@
 `/system ntp client` (G4.6, G4.6b). Comandos: `system.ntp.client.set`, `.get` e `.confirm-step`.
 Janela: System › NTP Client.
 
+`/system clock` (G4.6p). Comando: `system.clock.print`. Janela: System › Clock, e a linha
+"Clock" no alto da NTP Client. Veja "A hora do roteador", abaixo.
+
 `/system ntp server` (G4.6c). Comandos: `system.ntp.server.set` e `.get`. Janela: System › NTP
 Server. Veja "Servidor NTP", abaixo.
 
@@ -61,6 +64,35 @@ appliance).
 - **`clock: "not-set"` não quer dizer "relógio sem hora":** quer dizer que o cliente NTP não está
   mexendo no relógio (desligado, só medindo, ou ainda sem resposta). Com o cliente desligado o
   status inteiro vem zerado, inclusive `dynamic_servers`.
+
+## A hora do roteador: `/system clock` (G4.6p)
+
+`system.clock.print` mostra a hora e a data do roteador e de onde vieram. Antes não havia como ver
+a hora: `system.ntp.client.get` mostra o que o cliente NTP faz, e `clock: not-set` era lido como
+"relógio sem hora".
+
+| Campo | O que é |
+|---|---|
+| `time`, `date` | `HH:MM:SS` e `AAAA-MM-DD`, em UTC (o formato do RouterOS 7) |
+| `time_zone_name`, `gmt_offset`, `dst_active` | por enquanto sempre `UTC`, `+00:00`, `false`: não há fuso configurável (gap G4.6q) |
+| `source` | `ntp` (o cliente NTP acertou o relógio nesta execução; vale mesmo depois de desligado), `rtc` (a hora do boot, lida do relógio da placa), `host` (laboratório virtual: o relógio do computador), `not-set` (antes de 2026), `unknown` |
+| `ntp_server`, `last_sync` | com `source: ntp`, de quem e quando |
+| `hardware_clock` | o relógio da placa (RTC), lido de `/sys/class/rtc/rtc0/since_epoch`: data, hora, `offset_secs` (RTC − sistema) e `written` |
+| `hardware_clock.written` | `follows-system` (instalado e sincronizado: o kernel regrava a cada ~11 min), `left-alone` (ISO live, G4.6o), `not-written`, `none` (sem RTC) |
+| `hardware_clock.local_time_offset`, `drift_secs` | quando a diferença fica a até 12 min de um fuso inteiro (meia hora, UTC−12 a UTC+14): o RTC parece estar em hora local, como o Windows o guarda, e `drift_secs` é o que sobra |
+
+O caso que motivou: o notebook da auditoria tinha o RTC 2 h 50 min atrás (hora de Brasília, −3 h,
+e 10 min de deriva). O computador de desenvolvimento, também com Windows, mostrou
+`offset_secs: -10504`, `local_time_offset: "−03:00"`, `drift_secs: 296` (**medido**, backend
+linux num namespace, 2026-11-12).
+
+Como os outros fazem: o RouterOS 7 mostra `time`, `date`, `time-zone-name`, `gmt-offset` e
+`dst-active`, sem a origem. O Cisco `show clock detail` diz "Time source is NTP / hardware
+calendar". O Junos `show system uptime` diz "Time Source: NTP CLOCK / LOCAL CLOCK". Daqui saíram
+`source` e o RTC ao lado.
+
+Fica para gaps: o fuso (`time-zone-name`, `manual`, DST, G4.6q) e acertar a hora à mão
+(`system.clock.set`, G4.6r).
 
 ## Como o relógio é acertado (G4.6b)
 
