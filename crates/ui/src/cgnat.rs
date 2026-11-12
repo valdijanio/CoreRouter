@@ -806,6 +806,60 @@ impl Cgnat {
         }
     }
 
+    /// G2.3h: the kernel's conntrack table against every pool's
+    /// subscribers × connections each; too small, the Tuning profile that
+    /// holds it, opened on its Profiles tab with that profile picked.
+    fn conntrack_line(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, l: Lang, d: &Value) {
+        let Some(ct) = d.get("conntrack").filter(|c| c.is_object()) else { return };
+        let n = |k: &str| ct.get(k).and_then(Value::as_u64).unwrap_or(0);
+        let fits = ct.get("fits").and_then(Value::as_bool) == Some(true);
+        let grouped = |v: u64| crate::tuning::grouped(i64::try_from(v).unwrap_or(i64::MAX));
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(tr(l, "Conntrack"));
+            self.info(ui, l, "cgnat.capacity.conntrack", "Conntrack");
+            let (label, tone) = if fits {
+                ("fits", chip::GREEN.tone(ui.visuals()))
+            } else {
+                ("too small", chip::AMBER.tone(ui.visuals()))
+            };
+            chip::chip(ui, tr(l, label), tone);
+            ui.label(format!(
+                "{} {} × {} {} = {} · nf_conntrack_max {}",
+                grouped(n("subscribers")),
+                tr(l, "subscribers"),
+                n("per_subscriber"),
+                tr(l, "connections"),
+                grouped(n("needed")),
+                grouped(n("max"))
+            ));
+            if fits {
+                return;
+            }
+            let profile = match ct.get("profile").and_then(Value::as_str) {
+                Some("balanced") => Some(("balanced", "Balanced")),
+                Some("throughput") => Some(("throughput", "High throughput")),
+                _ => None,
+            };
+            match profile {
+                Some((id, name)) => {
+                    let text = format!("{} {}", tr(l, "Open System › Tuning:"), tr(l, name));
+                    if ui.button(text).clicked() {
+                        app.open(Win::Panel(crate::tuning::WIN));
+                        if let Some(t) = app.panel_mut::<crate::tuning::TuningPanel>() {
+                            t.tab = crate::tuning::Tab::Profiles;
+                            t.profile = id;
+                        }
+                        app.cache.refreshed_at = None;
+                    }
+                }
+                None => {
+                    ui.weak(format!("max_entries ≥ {}", grouped(n("max_entries"))));
+                }
+            }
+        });
+    }
+
     fn capacity_tab(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, l: Lang) {
         let pool = self.capacity_pool();
         if pool.is_empty() {
@@ -901,6 +955,7 @@ impl Cgnat {
                 card(self, ui, "cgnat.capacity.no_block", "No free block, 24 h", none.to_string(), small, Some(tone));
             }
         });
+        self.conntrack_line(app, ui, l, &d);
         ui.add_space(6.0);
         // The distribution of the 7-day peaks.
         ui.horizontal(|ui| {

@@ -192,3 +192,46 @@ fn the_capacity_tab_shows_a_pool_out_of_blocks() {
     assert!(h.has_text_containing("2/2 blocks in use"));
     assert!(h.has_text("the pool ran out of blocks: fewer ports per block fit everyone"));
 }
+
+/// G2.3h: 1280 subscribers × 300 connections against the lab kernel's
+/// 262 144: the Capacity tab says the table is small and opens System ›
+/// Tuning on Profiles with the profile that holds it picked; applied, it
+/// fits.
+#[test]
+fn the_capacity_tab_says_the_conntrack_is_small_and_opens_tuning() {
+    use crate::tuning::{Tab as TuningTab, TuningPanel, WIN as TUNING};
+    let mut s = Session::virtual_lab();
+    s.tick(1_780_000_000);
+    s.execute(
+        "ip.firewall.cgnat.pool.add",
+        &json!({"name": "teste", "inside": ["100.64.0.0/22", "100.64.4.0/24"], "outside": "203.0.113.0/27"}),
+    )
+    .unwrap();
+    let mut h = Harness::with_session(s);
+    h.app.open.clear();
+    h.app.open(Win::Panel(WIN));
+    refresh(&mut h);
+    h.app.panel_mut::<Cgnat>().unwrap().tab = Tab::Capacity;
+    refresh(&mut h);
+    assert!(h.has_text("too small"));
+    assert!(h.has_text("1280 subscribers × 300 connections = 384 000 · nf_conntrack_max 262 144"));
+    // The pool's row carries the chip too.
+    h.app.panel_mut::<Cgnat>().unwrap().tab = Tab::Pools;
+    refresh(&mut h);
+    assert!(h.has_text_containing("conntrack"));
+    h.app.panel_mut::<Cgnat>().unwrap().tab = Tab::Capacity;
+    refresh(&mut h);
+    h.click(h.text("Open System › Tuning: Balanced"));
+    refresh(&mut h);
+    assert!(h.app.open.contains(&Win::Panel(TUNING)));
+    let t = h.app.panel_mut::<TuningPanel>().unwrap();
+    assert_eq!((t.tab, t.profile), (TuningTab::Profiles, "balanced"));
+    // Apply it there (G1.26k), with Safe Mode: the table fits.
+    h.click(h.text("Apply with Safe Mode"));
+    refresh(&mut h);
+    let max = lock(&h.session).store().running().system.tuning.sysctl.get("net.netfilter.nf_conntrack_max").copied();
+    assert_eq!(max, Some(6_684_672), "{:?}", h.app.log());
+    refresh(&mut h);
+    assert!(h.has_text("fits"));
+    assert!(h.has_text_containing("nf_conntrack_max 6 684 672"));
+}

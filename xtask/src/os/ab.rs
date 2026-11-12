@@ -1103,6 +1103,40 @@ fn nvram_free(vm: &mut Vm, log: &mut std::fs::File) -> Result<u64, String> {
         .ok_or_else(|| format!("df of efivarfs: {l}"))
 }
 
+/// Writes 1 KiB variables of [`FILL_GUID`] until about [`FILL_LEAVES`] is
+/// left; `free` is updated. efivarfs answers `statfs` from a cache for a
+/// while (rate limited): the variables go in steps, the space is read after
+/// a pause. Returns how many were written.
+fn fill_nvram(
+    vm: &mut Vm,
+    log: &mut std::fs::File,
+    free: &mut u64,
+    first: u64,
+) -> Result<u64, String> {
+    let mut written: u64 = 0;
+    for _ in 0..40 {
+        if *free <= FILL_LEAVES + 2048 {
+            break;
+        }
+        let step = ((*free - FILL_LEAVES) / 1200).clamp(1, 64);
+        let n = first + written;
+        let got = shell_line(
+            vm,
+            log,
+            &format!(
+                "cd /sys/firmware/efi/efivars; k=0; while [ $k -lt {step} ] && printf '\\007\\000\\000\\000%01024d' 0 > fill{n}-$k-{FILL_GUID} 2>/dev/null; do k=$((k+1)); done; cd /; sleep 3; echo $k"
+            ),
+        )?;
+        written += got.parse::<u64>().unwrap_or(0);
+        *free = nvram_free(vm, log)?;
+    }
+    Ok(written)
+}
+
+/// The daemon's `EFI_MIN_FREE` (`corerouter_engine::crash_log`: two dumps
+/// of 16 KiB, 4 KiB of boot entries, the kernel's 5 KiB; the xtask uses no
+/// workspace crate).
+const EFI_MIN_FREE: u64 = 41 << 10;
 /// A GUID of no one's: the variables that fill the NVRAM in the test.
 const FILL_GUID: &str = "6b1c0f41-2b5e-4f59-9c4b-1f0d3a0b7e21";
 /// What the filled NVRAM keeps free: less than the daemon's
@@ -1140,49 +1174,68 @@ fn scenario_crash(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
             .is_some_and(|s| s.contains("sysrq triggered crash")),
         format!("{c}"),
     )?;
-    let free1 = nvram_free(&mut vm, &mut log)?;
-    check(
-        free1 + 1024 >= free0,
-        format!("the record was not erased: {free0} B free before the panic, {free1} after"),
-    )?;
-    n.put(
-        "panic recorded in UEFI variables, logged and erased at the next boot",
-        format!("{} part(s), NVRAM free {free0} → {free1} B", c["parts"]),
-    );
-    // Fill the NVRAM with 1 KiB variables until the kernel refuses (its
-    // 5 KiB reserve), then give back what leaves FILL_LEAVES free.
-    let filled = shell_line(
+    // Erased: no dump variable can be read. efivarfs keeps the names it
+    // listed at mount (pstore erases in the firmware, not through it), so a
+    // name may still be listed until the next boot; reading it gives no
+    // bytes (**medido**: 0 against 828 for one not erased). The room they took comes back only when the
+    // firmware reclaims its store at a boot (EDK2 does not reclaim at run
+    // time), so the free space is not compared here.
+    let dumps = shell_line(
         &mut vm,
         &mut log,
-        &format!(
-            "cd /sys/firmware/efi/efivars; i=0; while printf '\\007\\000\\000\\000%01024d' 0 > fill$i-{FILL_GUID} 2>/dev/null; do i=$((i+1)); done; rm -f fill$i-{FILL_GUID}; cd /; echo $i"
-        ),
+        "n=0; for f in /sys/firmware/efi/efivars/dump-type*; do [ \"$(cat \"$f\" 2>/dev/null | wc -c)\" -gt 0 ] && n=$((n+1)); done; echo $n",
     )?;
-    let mut free = nvram_free(&mut vm, &mut log)?;
-    let mut k: u32 = 0;
-    while free < FILL_LEAVES {
-        shell_line(
-            &mut vm,
-            &mut log,
-            &format!("rm -f /sys/firmware/efi/efivars/fill{k}-{FILL_GUID}"),
-        )?;
-        k += 1;
-        free = nvram_free(&mut vm, &mut log)?;
-        check(k < 256, "the NVRAM did not give room back")?;
-    }
+    check(
+        dumps == "0",
+        format!("{dumps} dump variable(s) still readable in the NVRAM"),
+    )?;
+    let free1 = nvram_free(&mut vm, &mut log)?;
+    n.put(
+        "panic recorded in UEFI variables, logged and erased at the next boot",
+        format!(
+            "{} part(s), NVRAM free {free0} B before, {free1} B after (the firmware reclaims later)",
+            c["parts"]
+        ),
+    );
+    // Fill the NVRAM with 1 KiB variables of another GUID until about
+    // FILL_LEAVES is left, and boot again. The firmware reclaims its store
+    // at a boot when it runs short (the erased dumps' room comes back:
+    // 17 408 → 43 196 B free, **medido**), so it is filled again until a
+    // boot starts with less than EFI_MIN_FREE.
+    let mut written: u64 = 0;
+    let mut rounds = Vec::new();
+    let v = loop {
+        let mut free = nvram_free(&mut vm, &mut log)?;
+        written += fill_nvram(&mut vm, &mut log, &mut free, written)?;
+        vm.poweroff(&mut log)?;
+        drop(vm);
+        vm = ctx.boot("crash/nvram-full", false, &[&pkg])?;
+        vm.expect_all(&mut log, &["ready:", "maintenance shell"], 120)?;
+        let v = vm.ok(&mut log, "system.crash.print", "{}")?;
+        let at_boot = v["efi"]["free"].as_u64().unwrap_or(0);
+        rounds.push(format!("{free} B left, {at_boot} B at the next boot"));
+        if at_boot < EFI_MIN_FREE || rounds.len() >= 3 {
+            break v;
+        }
+    };
     n.put(
         "NVRAM filled by another GUID (1 KiB variables)",
-        format!("{filled} written, {k} given back, {free} B free"),
+        format!("{written} written; {}", rounds.join("; ")),
     );
-    vm.poweroff(&mut log)?;
-    drop(vm);
-    let mut vm = ctx.boot("crash/nvram-full", false, &[&pkg])?;
-    vm.expect_all(&mut log, &["ready:", "maintenance shell"], 120)?;
-    let v = vm.ok(&mut log, "system.crash.print", "{}")?;
+    let listed = shell_line(
+        &mut vm,
+        &mut log,
+        "ls /sys/firmware/efi/efivars | grep -c '^dump-type'",
+    )?;
+    check(
+        listed == "0",
+        format!("{listed} dump variable(s) listed after a reboot"),
+    )?;
     check(
         v["efi"]["turned_off"] == true && v["efi"]["enabled"] == false,
-        format!("efi_pstore stayed on with {free} B free: {v}"),
+        format!("efi_pstore stayed on with the NVRAM short: {v}"),
     )?;
+    let free = v["efi"]["free"].as_u64().unwrap_or(0);
     let h = vm.ok(&mut log, "system.health.check", "{}")?;
     check(
         h["checks"].as_array().is_some_and(|a| {
@@ -1208,6 +1261,7 @@ fn scenario_crash(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
         format!("{free} → {free2} B"),
     );
     // The A/B update still has room for its boot entries.
+    vm.print_until(&mut log, 60, |v| v["running"] == "a")?;
     update_and_confirm(ctx, &mut log, vm, "b", "crash/trial-b")?;
     Ok(())
 }

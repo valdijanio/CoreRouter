@@ -25,24 +25,29 @@
 //! frame is 0x8100 there, not 0x8863. The filter keeps the two PPPoE
 //! EtherTypes and drops what the host sends.
 //!
-//! **Slow path.** Upstream, a subscriber's IPv4 or IPv6 packet (already
-//! decapsulated and checked by the service) is sent through a raw socket
-//! of its family (`IPPROTO_RAW`: the kernel routes it as the host's own, so
-//! `forward` rules do not see it; the output and postrouting chains,
-//! CGNAT included, do). Downstream, every subscriber address gets a /32
-//! route (and every /64 and delegated IPv6 prefix, G4.3l) through a
-//! `dummy` device (`bng0`, created if missing); the
-//! service reads what the kernel sends there with a packet socket (the
-//! dummy drops the frame, the tap sees it first) and encapsulates it to
-//! the subscriber. The production path is XDP plus G4.3ca (a tc program
-//! on `bng0`); this one is correct, not fast.
+//! **Slow path.** `bng0` is one end of a veth pair (G4.3y; a `dummy`
+//! before). Upstream, a subscriber's IPv4 or IPv6 packet (already
+//! decapsulated and checked by the service) is written, in an Ethernet
+//! frame, into the other end (`bng0p`): the kernel receives it on `bng0`,
+//! as a router receives from a port. The input and forward chains see
+//! `iif bng0` (`all-ppp`, and the lists of the PPPoE servers' access
+//! ports), the TTL drops, rp_filter applies. Until G4.3y it went out a raw
+//! socket as the router's own output: it came in by `lo`, which the safe
+//! defaults accept whole, and never crossed the forward chain.
+//! Downstream, every subscriber address gets a /32 route (and every /64
+//! and delegated IPv6 prefix, G4.3l) through `bng0` (NOARP); the service
+//! reads what the kernel sends there with a packet socket and encapsulates
+//! it to the subscriber. What reaches `bng0p` is dropped before IP: the
+//! peer is a port of a bridge kept down (`bng0br`), a disabled port. The
+//! production path is XDP plus G4.3ca (a tc program on `bng0`); this one
+//! is correct, not fast.
 
 mod routes;
 
 pub use routes::{Applied, RouteBatch, RouteOp};
 
 use std::io::{self, IoSliceMut};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 
 use corerouter_model::IfName;
@@ -440,12 +445,66 @@ impl PortSender {
 }
 
 /// Name of the slow path's device.
-pub const SLOW_DEVICE: &str = "bng0";
+pub const SLOW_DEVICE: &str = corerouter_model::ppp::SUBSCRIBER_DEVICE;
+
+/// G4.3y: the upstream side: a packet socket on `bng0p` and the Ethernet
+/// header of what it writes (to `bng0`'s address, from `bng0p`'s).
+struct Ingress {
+    sock: Socket,
+    /// Destination and source addresses of the header.
+    macs: [u8; 12],
+}
+
+impl Ingress {
+    fn open() -> io::Result<Self> {
+        let parse = |n: &str| {
+            n.parse::<IfName>()
+                .map_err(|e| io::Error::other(format!("{e}")))
+        };
+        let dev = if_info(&parse(SLOW_DEVICE)?)?;
+        let peer = if_info(&parse(corerouter_model::ppp::SUBSCRIBER_PEER)?)?;
+        // Protocol 0: this socket only sends, it receives nothing.
+        let sock = Socket::new(Domain::PACKET, Type::RAW, Some(Protocol::from(0)))?;
+        sock.set_nonblocking(true)?;
+        bind(sock.as_raw_fd(), &peer.link).map_err(io_err)?;
+        let mut macs = [0u8; 12];
+        macs[..6].copy_from_slice(&dev.mac);
+        macs[6..].copy_from_slice(&peer.mac);
+        Ok(Self { sock, macs })
+    }
+
+    fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            sock: self.sock.try_clone()?,
+            macs: self.macs,
+        })
+    }
+
+    /// A subscriber's IPv4 or IPv6 packet (header included), received by
+    /// the kernel on `bng0`. No copy: header and packet go as two slices.
+    fn send(&self, packet: &[u8]) -> io::Result<()> {
+        let ethertype: [u8; 2] = match packet.first().map(|b| b >> 4) {
+            Some(4) => [0x08, 0x00],
+            Some(6) => [0x86, 0xdd],
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "not an IPv4 or IPv6 packet",
+                ));
+            }
+        };
+        let bufs = [
+            std::io::IoSlice::new(&self.macs),
+            std::io::IoSlice::new(&ethertype),
+            std::io::IoSlice::new(packet),
+        ];
+        self.sock.send_vectored(&bufs).map(|_| ())
+    }
+}
 
 /// The slow path (see the module docs).
 pub struct SlowPath {
-    raw: Socket,
-    raw6: Socket,
+    ingress: Ingress,
     tap: Socket,
     ifindex: u32,
     buf: Vec<u8>,
@@ -457,13 +516,9 @@ impl SlowPath {
         let name: IfName = SLOW_DEVICE
             .parse()
             .map_err(|e| io::Error::other(format!("{e}")))?;
-        let ifindex = ensure_dummy(SLOW_DEVICE)?;
+        let ifindex = ensure_bng(SLOW_DEVICE)?;
         let info = if_info(&name)?;
-        let raw = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::from(255)))?;
-        raw.set_nonblocking(true)?;
-        // IPPROTO_RAW on IPv6 sends the header as given (IPV6_HDRINCL).
-        let raw6 = Socket::new(Domain::IPV6, Type::RAW, Some(Protocol::from(255)))?;
-        raw6.set_nonblocking(true)?;
+        let ingress = Ingress::open()?;
         let proto = Protocol::from(i32::from(ETH_P_ALL.to_be()));
         let tap = Socket::new(Domain::PACKET, Type::RAW, Some(proto))?;
         tap.set_nonblocking(true)?;
@@ -472,8 +527,7 @@ impl SlowPath {
         bind(tap.as_raw_fd(), &info.link).map_err(io_err)?;
         drop_queued(&tap);
         Ok(Self {
-            raw,
-            raw6,
+            ingress,
             tap,
             ifindex,
             buf: vec![0u8; FRAME_MAX],
@@ -485,9 +539,9 @@ impl SlowPath {
     }
 
     /// Send a subscriber's IPv4 or IPv6 packet (header included) into the
-    /// stack.
+    /// stack, received on `bng0`.
     pub fn inject(&self, packet: &[u8]) -> io::Result<()> {
-        inject(&self.raw, &self.raw6, packet)
+        self.ingress.send(packet)
     }
 
     /// IPv4 and IPv6 packets the kernel routed to a subscriber (`bng0`),
@@ -541,8 +595,7 @@ impl SlowPath {
             Ok::<_, io::Error>(handle)
         })?;
         Ok(SlowTx {
-            raw: self.raw.try_clone()?,
-            raw6: self.raw6.try_clone()?,
+            ingress: self.ingress.try_clone()?,
             ifindex: self.ifindex,
             rt,
             handle,
@@ -554,8 +607,7 @@ impl SlowPath {
 /// The send side of a [`SlowPath`]: inject upstream packets and keep the
 /// `/32` routes to `bng0`.
 pub struct SlowTx {
-    raw: Socket,
-    raw6: Socket,
+    ingress: Ingress,
     ifindex: u32,
     rt: tokio::runtime::Runtime,
     handle: rtnetlink::Handle,
@@ -592,7 +644,7 @@ impl SlowTx {
     }
 
     pub fn inject(&self, packet: &[u8]) -> io::Result<()> {
-        inject(&self.raw, &self.raw6, packet)
+        self.ingress.send(packet)
     }
 
     /// Add (`true`) or remove these IPv6 routes to `bng0` (a session's /64
@@ -678,32 +730,6 @@ impl SlowTx {
     }
 }
 
-/// A subscriber's IPv4 or IPv6 packet (header included) into the stack.
-fn inject(raw: &Socket, raw6: &Socket, packet: &[u8]) -> io::Result<()> {
-    if packet.first().is_some_and(|b| b >> 4 == 6) {
-        let dst = packet
-            .get(24..40)
-            .and_then(|d| <[u8; 16]>::try_from(d).ok())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "short IPv6 packet"))?;
-        let to = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(dst), 0, 0, 0));
-        return raw6.send_to(packet, &to.into()).map(|_| ());
-    }
-    let Some(dst) = packet.get(16..20) else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "short IPv4 packet",
-        ));
-    };
-    let dst = Ipv4Addr::new(
-        dst.first().copied().unwrap_or(0),
-        dst.get(1).copied().unwrap_or(0),
-        dst.get(2).copied().unwrap_or(0),
-        dst.get(3).copied().unwrap_or(0),
-    );
-    let to = SocketAddr::V4(SocketAddrV4::new(dst, 0));
-    raw.send_to(packet, &to.into()).map(|_| ())
-}
-
 fn runtime() -> io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_io()
@@ -724,7 +750,7 @@ pub fn set_local_addresses(
     use futures_util::TryStreamExt;
     use rtnetlink::AddressMessageBuilder;
     use rtnetlink::packet_route::address::AddressAttribute;
-    let ifindex = ensure_dummy(SLOW_DEVICE)?;
+    let ifindex = ensure_bng(SLOW_DEVICE)?;
     let rt = runtime()?;
     rt.block_on(async {
         let (conn, handle, _) = rtnetlink::new_connection()?;
@@ -787,16 +813,23 @@ pub fn set_local_addresses(
     })
 }
 
-/// The index of dummy device `name`, created and set up if missing.
-pub(crate) fn ensure_dummy(name: &str) -> io::Result<u32> {
+/// G4.3y: the index of the subscribers' device `name` (`bng0`): one end
+/// of a veth pair, NOARP and up (its routes need no neighbour), whose peer
+/// (`<name>p`) is a port of a bridge kept down (`<name>br`), so the kernel
+/// drops what reaches the peer before IP (`br_handle_frame`: a disabled
+/// port). A `dummy` of that name (before G4.3y) or a veth without its peer
+/// is made again. Its transmit offloads are off ([`plain_tx`]).
+pub(crate) fn ensure_bng(name: &str) -> io::Result<u32> {
     use futures_util::TryStreamExt;
-    use rtnetlink::{LinkDummy, LinkMessageBuilder, LinkUnspec};
+    use rtnetlink::{LinkBridge, LinkMessageBuilder, LinkUnspec, LinkVeth};
+    let peer = corerouter_model::ppp::SUBSCRIBER_PEER;
+    let sink = corerouter_model::ppp::SUBSCRIBER_SINK;
     let rt = runtime()?;
     rt.block_on(async {
         let (conn, handle, _) = rtnetlink::new_connection()?;
         let task = tokio::spawn(conn);
-        let find = |h: rtnetlink::Handle| async move {
-            let mut links = h.link().get().match_name(name.to_owned()).execute();
+        let find = |h: rtnetlink::Handle, n: &'static str| async move {
+            let mut links = h.link().get().match_name(n.to_owned()).execute();
             links
                 .try_next()
                 .await
@@ -804,29 +837,121 @@ pub(crate) fn ensure_dummy(name: &str) -> io::Result<u32> {
                 .flatten()
                 .map(|l| l.header.index)
         };
-        let index = match find(handle.clone()).await {
+        let fail = |what: &str, e: rtnetlink::Error| io::Error::other(format!("{what}: {e}"));
+        let name: &'static str = SLOW_DEVICE;
+        let (have, have_peer) = (
+            find(handle.clone(), name).await,
+            find(handle.clone(), peer).await,
+        );
+        if let (Some(old), None) = (have, have_peer) {
+            handle
+                .link()
+                .del(old)
+                .execute()
+                .await
+                .map_err(|e| fail(&format!("removing the old {name}"), e))?;
+        }
+        if have_peer.is_none() || have.is_none() {
+            handle
+                .link()
+                .add(LinkMessageBuilder::<LinkVeth>::new(name, peer).build())
+                .execute()
+                .await
+                .map_err(|e| fail(&format!("creating {name} and {peer}"), e))?;
+        }
+        let index = find(handle.clone(), name)
+            .await
+            .ok_or_else(|| io::Error::other(format!("{name} vanished after creation")))?;
+        let peer_index = find(handle.clone(), peer)
+            .await
+            .ok_or_else(|| io::Error::other(format!("{peer} vanished after creation")))?;
+        let sink_index = match find(handle.clone(), sink).await {
             Some(i) => i,
             None => {
                 handle
                     .link()
-                    .add(LinkMessageBuilder::<LinkDummy>::new(name).build())
+                    .add(LinkMessageBuilder::<LinkBridge>::new(sink).build())
                     .execute()
                     .await
-                    .map_err(|e| io::Error::other(format!("creating {name}: {e}")))?;
-                find(handle.clone())
+                    .map_err(|e| fail(&format!("creating {sink}"), e))?;
+                find(handle.clone(), sink)
                     .await
-                    .ok_or_else(|| io::Error::other(format!("{name} vanished after creation")))?
+                    .ok_or_else(|| io::Error::other(format!("{sink} vanished after creation")))?
             }
         };
+        // No IPv6 of its own on the peer (no link-local, DAD nor RS
+        // toward bng0), before it comes up.
+        let _ = std::fs::write(format!("/proc/sys/net/ipv6/conf/{peer}/disable_ipv6"), "1");
         handle
             .link()
-            .set(LinkUnspec::new_with_index(index).up().build())
+            .set(LinkUnspec::new_with_index(sink_index).down().build())
             .execute()
             .await
-            .map_err(|e| io::Error::other(format!("setting {name} up: {e}")))?;
+            .map_err(|e| fail(&format!("keeping {sink} down"), e))?;
+        handle
+            .link()
+            .set(
+                LinkUnspec::new_with_index(peer_index)
+                    .controller(sink_index)
+                    .arp(false)
+                    .up()
+                    .build(),
+            )
+            .execute()
+            .await
+            .map_err(|e| fail(&format!("setting {peer} up in {sink}"), e))?;
+        handle
+            .link()
+            .set(LinkUnspec::new_with_index(index).arp(false).up().build())
+            .execute()
+            .await
+            .map_err(|e| fail(&format!("setting {name} up"), e))?;
         task.abort();
+        Ok::<_, io::Error>(index)
+    })
+    .and_then(|index| {
+        plain_tx(name)?;
         Ok(index)
     })
+}
+
+/// G4.3x: what the kernel sends to the dummy is whole: no checksum offload
+/// (a dummy has `NETIF_F_HW_CSUM`, so a TCP or UDP packet the router itself
+/// answered left with `CHECKSUM_PARTIAL`, its checksum never filled in: the
+/// slow path encapsulated it as it was and the subscriber's stack dropped
+/// it; ping worked, DNS and TCP to the gateway did not, on a notebook,
+/// dev.607) and no scatter-gather, so no TSO either (`netdev_fix_features`
+/// drops it with them): a 64 KB TCP super-packet would not fit a PPPoE
+/// frame. The tc program of the XDP delivery (`bng_egress`) gets the same
+/// finished packets.
+pub(crate) fn plain_tx(name: &str) -> io::Result<()> {
+    let set = |names: &[&str]| -> io::Result<()> {
+        let off: std::collections::BTreeMap<String, bool> =
+            names.iter().map(|f| ((*f).to_owned(), false)).collect();
+        let mut e = crate::ethtool::Ethtool::open(name)
+            .map_err(|e| io::Error::other(format!("{name}: ethtool: {e}")))?;
+        e.set_features(&off)
+            .map_err(|e| io::Error::other(format!("{name}: turning the TX offloads off: {e}")))
+    };
+    set(&[
+        "tx-checksum-ip-generic",
+        "tx-scatter-gather",
+        "tx-tcp-segmentation",
+    ])?;
+    // Segmentation offloads a kernel may lack (AccECN is 7.0's): each on
+    // its own, a name the kernel does not know is no failure.
+    for f in [
+        "tx-scatter-gather-fraglist",
+        "tx-tcp6-segmentation",
+        "tx-tcp-ecn-segmentation",
+        "tx-tcp-mangleid-segmentation",
+        "tx-tcp-accecn-segmentation",
+        "tx-udp-segmentation",
+        "tx-gso-partial",
+    ] {
+        let _ = set(&[f]);
+    }
+    Ok(())
 }
 
 fn route(ifindex: u32, ip: Ipv4Addr, add: bool) -> io::Result<()> {

@@ -31,7 +31,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "NTP Client",
         ["System", "NTP Client"],
         None,
-        "{enabled?: bool, servers?: [string] (may be empty: the client then asks the servers a DHCP client with use_peer_ntp learns), min_poll?: int 6..17, max_poll?: int 6..17, vrf?: string (default main), set_system_clock?: bool (default yes; no only measures)} → {enabled, servers, min_poll, max_poll, vrf, set_system_clock, warning?}",
+        "{enabled?: bool, servers?: [string] (may be empty: the client then asks the servers a DHCPv4 or DHCPv6 client with use_peer_ntp learns), min_poll?: int 6..17, max_poll?: int 6..17, vrf?: string (default main), set_system_clock?: bool (default yes; no only measures)} → {enabled, servers, min_poll, max_poll, vrf, set_system_clock, warning?}",
         always,
         set
     ),
@@ -161,14 +161,9 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(v) = set_system_clock {
         c.set_system_clock = v;
     }
-    // A DHCP client with use_peer_ntp may bring the servers (G4.6b).
-    let dhcp_brings = s
-        .store()
-        .candidate()
-        .ip
-        .dhcp_clients
-        .iter()
-        .any(|d| d.use_peer_ntp && !d.disabled);
+    // A DHCP client with use_peer_ntp may bring the servers (G4.6b; the
+    // DHCPv6 one too, G4.6n).
+    let dhcp_brings = s.ntp_dhcp_may_bring();
     // G1.6zh: on with nobody to ask is a state, not an error: it is how a
     // new router starts (the DHCP clients come after), and removing the
     // last DHCP client got there anyway. The answer, the status and the
@@ -183,7 +178,8 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
             "warning".into(),
             json!(
                 "no server to ask yet: the client waits for a DHCP client with use_peer_ntp \
-                 to learn one (option 42); or set servers, e.g. [\"pool.ntp.org\"]"
+                 to learn one (DHCPv4 option 42, DHCPv6 option 56); or set servers, e.g. \
+                 [\"pool.ntp.org\"]"
             ),
         );
     }

@@ -13,7 +13,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use corerouter_hal::clock::{ClockError, SystemClock};
+use corerouter_hal::clock::{ClockError, HardwareClock, SystemClock};
 use corerouter_hal_linux::clock::LinuxClock;
 
 #[test]
@@ -44,7 +44,7 @@ fn a_user_namespace_cannot_touch_the_clock() {
     );
     assert_eq!(clock.frequency_ppm(), Ok(frequency));
     assert_eq!(
-        clock.synchronized(1_000, 1_000),
+        clock.synchronized(1_000, 1_000, HardwareClock::Follow),
         Err(ClockError::NoPermission)
     );
     assert_eq!(clock.take_over(), Err(ClockError::NoPermission));

@@ -190,6 +190,9 @@ pub struct Inputs {
     /// G2.7d: subscribers refused lately because their blocks-mode pool had
     /// no free block (the pool is out, not the subscriber).
     pub cgnat_pool_full: usize,
+    /// G2.3h: `nf_conntrack_max` (the kernel's, now) against the running
+    /// pools' subscribers × connections each; `None` without CGNAT.
+    pub cgnat_conntrack: Option<crate::cgnat_conntrack::Fit>,
     /// OOM kills seen in the last [`OOM_WINDOW`] seconds.
     pub oom_recent: Option<u64>,
     /// NTP client enabled and its state.
@@ -544,6 +547,27 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
         }
     }
 
+    // G2.3h: the conntrack table against the CGNAT pools (only with pools).
+    if let Some(f) = &i.cgnat_conntrack {
+        let value = Some(format!("{}/{}", f.needed, f.max));
+        if f.fits() {
+            push("cgnat.conntrack", "CGNAT conntrack", Severity::Ok, value,
+                format!("o conntrack comporta os assinantes do CGNAT ({} de {} entradas)", f.needed, f.max), None);
+        } else {
+            let action = match f.profile {
+                Some((p, v)) => format!(
+                    "Aplique o perfil {} em System › Tuning (nf_conntrack_max {v}) ou aumente o max_entries: ip.firewall.connection.tracking.set max_entries={}.",
+                    p.id(), f.max_entries),
+                None if f.ram_ok => format!("Aumente o max_entries: ip.firewall.connection.tracking.set max_entries={}.", f.max_entries),
+                None => "A RAM desta máquina não comporta a tabela: menos assinantes por roteador ou menos conexões por assinante (ip.firewall.cgnat.set connections_per_subscriber).".into(),
+            };
+            push("cgnat.conntrack", "CGNAT conntrack", Severity::Warning, value,
+                format!("conntrack pequeno para o CGNAT: {} assinantes × {} conexões = {} entradas, acima do nf_conntrack_max {}; com a tabela cheia, conexões novas são descartadas",
+                    f.subscribers, f.per_subscriber, f.needed, f.max),
+                Some(action.as_str()));
+        }
+    }
+
     // OOM kills.
     match i.oom_recent {
         None => push("oom", "OOM kills", Severity::Unknown, None, no_data(), None),
@@ -590,8 +614,8 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
             "sem resposta dos servidores: o servidor NTP está dando a hora do relógio local".into(),
             Some("Confira os servidores do cliente; o relógio local deriva sem correção.")),
         Some((true, NtpState::Waiting)) if c.no_server => push("ntp", "NTP", Severity::Warning, Some("no-server".into()),
-            format!("{unset}: o cliente NTP não tem a quem perguntar (nenhum servidor configurado e nenhum cliente DHCP entregou um, opção 42)"),
-            Some("Defina um servidor: system.ntp.client.set servers=… (System › NTP Client), ou use um cliente DHCP com use_peer_ntp numa rede que entregue a opção 42.")),
+            format!("{unset}: o cliente NTP não tem a quem perguntar (nenhum servidor configurado e nenhum cliente DHCP entregou um: opção 42 do DHCPv4, 56 do DHCPv6)"),
+            Some("Defina um servidor: system.ntp.client.set servers=… (System › NTP Client), ou use um cliente DHCP (IPv4 ou IPv6) com use_peer_ntp numa rede que entregue a opção 42 ou a 56.")),
         Some((true, NtpState::Waiting)) => push("ntp", "NTP", Severity::Warning, Some("waiting".into()),
             format!("{unset}: cliente NTP sem resposta dos servidores"),
             Some("Confira os servidores e se a porta UDP 123 sai (System › NTP Client mostra o último erro).")),
@@ -1138,6 +1162,9 @@ impl Session {
                 corrupted_kib: corrupted,
             });
         }
+        let demand = crate::cgnat_conntrack::demand(self.store().running());
+        // The kernel's limit: what holds the connections now.
+        i.cgnat_conntrack = crate::cgnat_conntrack::fit(self, (demand.0, demand.1, None));
         if self.cgnat_has_blocks() {
             i.cgnat = self.ext::<CgnatRuntime>().map(|c| (c.alerts().values().filter(|a| a.above).count(), c.insert_failed()));
             let now = self.now().unwrap_or(0);
@@ -1293,6 +1320,7 @@ mod tests {
             conntrack: Some((1000, 262_144)),
             cgnat: None,
             cgnat_pool_full: 0,
+            cgnat_conntrack: None,
             oom_recent: Some(0),
             ntp: Some((true, NtpState::Synchronized)),
             ntp_needed: false,

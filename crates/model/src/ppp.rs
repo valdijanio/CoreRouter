@@ -146,6 +146,30 @@ pub const PPPOE_WORKERS_MAX: u16 = 64;
 /// `workers=auto` on a machine of `cpus` CPUs: all but two (the reader
 /// thread and the rest of the router, including the data plane's softirqs),
 /// at most 8 (past that the reader is the limit, measured in G4.3g).
+/// G4.3y: the device the PPPoE subscribers' traffic crosses the kernel by,
+/// all sessions on one (RouterOS makes a `<pppoe-…>` per session): their
+/// packets arrive on it (the slow path writes them into its veth peer), the
+/// routes to them leave by it. Firewall rules match it as `all-ppp` and as
+/// a member of the interface lists of the PPPoE servers' access ports.
+pub const SUBSCRIBER_DEVICE: &str = "bng0";
+/// The other end of [`SUBSCRIBER_DEVICE`]'s veth pair.
+pub const SUBSCRIBER_PEER: &str = "bng0p";
+/// The bridge, down, that the peer is a port of: what reaches the peer is
+/// dropped before IP (a disabled port), never routed back.
+pub const SUBSCRIBER_SINK: &str = "bng0br";
+/// RouterOS `in-interface=all-ppp`: every PPP subscriber.
+pub const ALL_PPP: &str = "all-ppp";
+
+/// G4.3x/G4.3y: whether the PPPoE subscribers belong to interface list
+/// `list`: an enabled PPPoE server on one of its interfaces (RouterOS puts
+/// the sessions' dynamic interfaces in the profile's `interface-list`).
+pub fn subscribers_in_list(lists: &crate::interface_list::InterfaceLists, ppp: &Ppp, list: &str) -> bool {
+    let members: Vec<&IfName> = lists.interfaces_of(list).collect();
+    ppp.pppoe_servers
+        .iter()
+        .any(|s| !s.disabled && members.iter().any(|m| **m == s.interface))
+}
+
 pub fn pppoe_workers_auto(cpus: usize) -> u16 {
     u16::try_from(cpus.saturating_sub(2).clamp(1, 8)).unwrap_or(1)
 }

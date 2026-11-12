@@ -298,7 +298,7 @@ fn refused_connections_reach_the_alerts_and_the_log() {
     );
     assert_eq!(
         set,
-        json!({"history_days": 365, "icmp_unreachable": false, "icmp_rate": 7})
+        json!({"history_days": 365, "icmp_unreachable": false, "icmp_rate": 7, "connections_per_subscriber": 300})
     );
     s.tick(T0 + 40);
     let a = ok(&mut s, "ip.firewall.cgnat.alert.list", json!({}));

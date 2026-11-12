@@ -39,6 +39,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("No free block, 24 h", "Sem bloco livre, 24 h"),
     ("No pool yet.", "Nenhum pool ainda."),
     ("No suggestion: no readings yet.", "Sem sugestão: ainda sem leituras."),
+    ("Open System › Tuning:", "Abrir System › Tuning:"),
     ("Out. Interface", "Interface de saída"),
     ("Outside", "Públicos"),
     ("Peak", "Pico"),
@@ -88,6 +89,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("suggested", "sugerido"),
     ("the pool ran out of blocks: fewer ports per block fit everyone", "o pool ficou sem blocos: com menos portas por bloco cabem todos"),
     ("the pool ran out of blocks: more public addresses", "o pool ficou sem blocos: mais endereços públicos"),
+    ("too small", "pequeno"),
 ];
 
 /// Explanations: (key, Markdown).
@@ -149,6 +151,16 @@ Os blocos de portas em uso (modo blocos): de quem, em que IP, desde quando, qual
 Quantos assinantes têm o pico de 7 dias em cada faixa do limite: até 25 %, 25–50 %, 50–75 %, 75–90 %, 90–100 % e **100 %** (encostaram no limite).
 
 Um pool bem dimensionado tem quase todos nas primeiras faixas e poucos acima de 90 %.",
+    ),
+    (
+        "cgnat.capacity.conntrack",
+        "## Conntrack
+
+Cada conexão traduzida pelo CGNAT ocupa uma entrada da tabela de conexões do kernel (conntrack). Com a tabela cheia, o kernel **descarta conexões novas** (\"nf_conntrack: table full, dropping packet\" no log), mesmo com portas sobrando no pool.
+
+A conta: os assinantes de **todos** os pools ligados × as conexões que cada um mantém abertas ao mesmo tempo (300 por padrão, **estimado**: uma casa com celulares, TV e computador; mude com `ip.firewall.cgnat.set connections_per_subscriber=…`), contra o `nf_conntrack_max` (o configurado em System › Tuning, ou o do kernel). O padrão do kernel numa máquina com mais de 4 GB é 262 144: pouco para 1280 assinantes (384 000).
+
+**pequeno**: o botão abre System › Tuning › Profiles com o perfil que comporta a conta já escolhido; aplique com \"Apply with Safe Mode\". Sem perfil que caiba, aumente o limite à mão: `ip.firewall.connection.tracking.set max_entries=…`. O limite não reserva memória: cada entrada (~320 B) só existe enquanto a conexão vive (System › Resources › Memory › Kernel).",
     ),
     (
         "cgnat.capacity.hit",

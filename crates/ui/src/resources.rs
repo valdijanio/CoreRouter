@@ -583,6 +583,7 @@ impl ResourcesPanel {
                 });
                 ui.end_row();
             }
+            self.kernel_memory(ui, l, &p);
         });
         ui.add_space(8.0);
         self.ecc_modules(ui, l);
@@ -654,6 +655,84 @@ impl ResourcesPanel {
         let noinfo = m.get("ce_noinfo").and_then(Value::as_u64).unwrap_or(0) + m.get("ue_noinfo").and_then(Value::as_u64).unwrap_or(0);
         if lost > 0 || noinfo > 0 {
             ui.weak(format!("{}: {lost} KiB · {}: {noinfo}", tr_in(SCOPE, l, "Taken out of use"), tr_in(SCOPE, l, "Errors without a module")));
+        }
+    }
+
+    /// G1.6ql: what the kernel uses for itself, rows of the memory grid.
+    /// The conntrack limit reserves nothing, so raising it changes nothing
+    /// above: here are the entries now, what a full table would take and
+    /// the lookup table.
+    fn kernel_memory(&mut self, ui: &mut Ui, l: Lang, p: &Value) {
+        let Some(k) = p.get("kernel").filter(|k| k.is_object()) else { return };
+        let n = |v: &Value, key: &str| v.get(key).and_then(Value::as_u64);
+        ui.vertical(|ui| {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.strong(tr_in(SCOPE, l, "Kernel"));
+                self.info(ui, l, "mem.kernel", "Kernel");
+            });
+        });
+        ui.end_row();
+        {
+            match k.get("conntrack").filter(|c| c.is_object()) {
+                Some(ct) => {
+                    let (count, max) = (n(ct, "count").unwrap_or(0), n(ct, "max").unwrap_or(0));
+                    ui.horizontal(|ui| self.label(ui, l, "mem.ct", "Connections"));
+                    ui.label(format!(
+                        "{} / {}  ({})",
+                        crate::tuning::grouped(i64::try_from(count).unwrap_or(i64::MAX)),
+                        crate::tuning::grouped(i64::try_from(max).unwrap_or(i64::MAX)),
+                        pct((max > 0).then(|| count as f64 * 100.0 / max as f64))
+                    ));
+                    ui.end_row();
+                    ui.horizontal(|ui| self.label(ui, l, "mem.ct_memory", "Conntrack memory"));
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "{} {} · {} {}",
+                            human_bytes(n(ct, "used_bytes").unwrap_or(0)),
+                            tr_in(SCOPE, l, "now"),
+                            human_bytes(n(ct, "full_bytes").unwrap_or(0)),
+                            tr_in(SCOPE, l, "when full")
+                        ));
+                        let how = if s(ct, "entry_source") == "slab" { "measured" } else { "estimate" };
+                        ui.weak(format!(
+                            "({} B {}, {})",
+                            n(ct, "entry_bytes").unwrap_or(0),
+                            tr_in(SCOPE, l, "per entry"),
+                            tr_in(SCOPE, l, how)
+                        ));
+                    });
+                    ui.end_row();
+                    ui.horizontal(|ui| self.label(ui, l, "mem.ct_table", "Lookup table"));
+                    ui.label(match (n(ct, "table_bytes"), n(ct, "buckets")) {
+                        (Some(bytes), Some(buckets)) => format!(
+                            "{}  ({} {})",
+                            human_bytes(bytes),
+                            crate::tuning::grouped(i64::try_from(buckets).unwrap_or(i64::MAX)),
+                            tr_in(SCOPE, l, "buckets")
+                        ),
+                        _ => "–".into(),
+                    });
+                    ui.end_row();
+                }
+                None => {
+                    ui.horizontal(|ui| self.label(ui, l, "mem.ct", "Connections"));
+                    ui.weak(tr_in(SCOPE, l, "conntrack is not loaded"));
+                    ui.end_row();
+                }
+            }
+            ui.horizontal(|ui| self.label(ui, l, "mem.slab", "Slab"));
+            ui.label(format!(
+                "{} {} · {} {}",
+                human_bytes(n(k, "slab_reclaimable").unwrap_or(0)),
+                tr_in(SCOPE, l, "reclaimable"),
+                human_bytes(n(k, "slab_unreclaimable").unwrap_or(0)),
+                tr_in(SCOPE, l, "unreclaimable")
+            ));
+            ui.end_row();
+            ui.horizontal(|ui| self.label(ui, l, "mem.page_cache", "Page cache"));
+            ui.label(human_bytes(n(k, "page_cache").unwrap_or(0)));
+            ui.end_row();
         }
     }
 

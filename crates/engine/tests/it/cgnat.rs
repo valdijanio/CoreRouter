@@ -37,7 +37,16 @@ fn a_pool_maps_subscribers_and_answers_who_was() {
     assert_eq!(r["subscribers"], 1024);
     assert_eq!(r["per_address"], 64);
     assert_eq!(r["public_used"], 16);
-    assert_eq!(r["warnings"], json!([]));
+    // G2.3h: 1024 × 300 connections outgrow the lab kernel's 262 144
+    // conntrack entries; nothing else to say about the pool.
+    let w = r["warnings"].as_array().unwrap();
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(
+        w[0].as_str()
+            .unwrap()
+            .starts_with("conntrack too small: 1024 subscribers"),
+        "{w:?}"
+    );
     let row = &ok(&mut s, "ip.firewall.cgnat.pool.list", json!({}))[0];
     assert_eq!(row["mode"], "deterministic");
     assert_eq!(row["capacity"], 1024);

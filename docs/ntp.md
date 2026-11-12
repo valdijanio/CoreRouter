@@ -11,7 +11,7 @@ Server. Veja "Servidor NTP", abaixo.
 Um roteador cuja config nunca foi gravada (o primeiro boot do disco instalado, e todo boot da ISO
 live) nasce com o cliente NTP **ligado e sem servidor configurado**. Ele pergunta só aos
 servidores que os clientes DHCP aprendem (`use_peer_ntp`, ligado por padrão; opção 42, RFC 2132
-§8.3) e a mais ninguém: nenhum pool público vem embutido, o roteador não fala com terceiros que o
+§8.3, e no DHCPv6 a opção 56, RFC 5908) e a mais ninguém: nenhum pool público vem embutido, o roteador não fala com terceiros que o
 operador não indicou (RFC 8633 §6.2, RFC 4085; o NTP Pool proíbe `pool.ntp.org` como padrão de
 appliance).
 
@@ -47,10 +47,17 @@ appliance).
   registra. O CMOS é lido como UTC.
 - **Sem bateria no RTC:** o relógio começa em 1970 (ou na data de fábrica da placa). Abaixo de
   2026-01-01 o cliente acerta sem pedir confirmação (tabela abaixo).
-- **Sincronizado, o kernel regrava o CMOS em UTC a cada ~11 min** (`sync_hw_clock`,
-  `kernel/time/ntp.c`; o cliente limpa `STA_UNSYNC`). Num disco instalado é o que se quer: o
-  próximo boot já nasce certo. Na ISO live, numa máquina que também tem Windows (RTC em hora
-  local), o Windows mostra a hora deslocada pelo fuso até ressincronizar (G4.6o).
+- **Instalado: sincronizado, o kernel regrava o CMOS em UTC a cada ~11 min** (`sync_hw_clock`,
+  `kernel/time/ntp.c`; o cliente limpa `STA_UNSYNC`). É o que se quer num disco instalado: o
+  próximo boot já nasce certo.
+- **ISO live: o relógio da placa fica como está (G4.6o).** O live acerta o relógio do sistema
+  (salto e slew, como sempre) mas deixa `STA_UNSYNC` ligado, e o kernel 6.18 só grava o RTC com
+  ele desligado (`sync_hw_clock`, linha 643, e `ntp_notify_cmos_timer`, linha 683, de
+  `kernel/time/ntp.c`, pelos dois caminhos: `update_persistent_clock64` e `update_rtc`). Motivo:
+  quem bootou a ISO para testar uma máquina que também tem Windows (RTC em hora local) voltaria ao
+  Windows com a hora deslocada pelo fuso. O log diz uma vez "imagem live: o relógio da placa
+  (RTC) fica como está". Efeito colateral: o `adjtimex` do live diz "não sincronizado"
+  (`TIME_ERROR`); nada no sistema lê isso, e o servidor NTP do roteador segue o estado do cliente.
 - **`clock: "not-set"` não quer dizer "relógio sem hora":** quer dizer que o cliente NTP não está
   mexendo no relógio (desligado, só medindo, ou ainda sem resposta). Com o cliente desligado o
   status inteiro vem zerado, inclusive `dynamic_servers`.
@@ -112,12 +119,40 @@ Limites conhecidos:
 
 - `servers`: até 8. A lista pode ficar vazia: o cliente usa os que um cliente DHCP com
   `use_peer_ntp` aprender (é assim que um roteador novo nasce, veja "Primeiro boot").
-- `dynamic_servers`: os recebidos por DHCP (opção 42), depois dos configurados, sem repetir e com
-  o total limitado a 8, porque a resposta DHCP é entrada hostil. Mudar a lista nunca faz perguntar
+- `dynamic_servers`: os recebidos por DHCP, depois dos configurados, sem repetir e com o total
+  limitado a 8, porque a resposta DHCP é entrada hostil. Primeiro os do DHCPv4 (opção 42), depois
+  os do DHCPv6 (opção 56, abaixo). Mudar a lista nunca faz perguntar
   mais de uma vez a cada 64 s (RFC 4330 §5); a rodada que não tinha a quem perguntar não conta.
 - `vrf`: o socket fica preso ao VRF por `SO_BINDTODEVICE`. Nomes DNS são resolvidos pelo resolvedor
   do roteador, na tabela principal.
 - Porta: uma nova por troca, escolhida pelo kernel, com `connect` (RFC 9109 §4).
+
+### Servidores do DHCPv6: opção 56 (G4.6n)
+
+Numa rede só IPv6 o roteador novo aprende o servidor pelo DHCPv6. O cliente DHCPv6
+(`ipv6.dhcp-client`) pede a opção 56 (NTP Server, RFC 5908) e a 31 (SNTP, RFC 4075) no Option
+Request, e com `use_peer_ntp` (padrão sim, como no DHCPv4; o RouterOS 7.25 não tem a chave no
+DHCPv6) entrega ao cliente NTP o que veio. `ipv6.dhcp-client.list` mostra `ntp_servers`; a janela
+IPv6 › DHCPv6 Client tem "Use Peer NTP" e a linha "NTP Servers" no Status.
+
+| Subopção (RFC 5908) | O que o cliente NTP faz |
+|---|---|
+| 1, endereço do servidor (§4.1) | pergunta; precisa ser unicast (multicast, `::` e `::1` são descartados) |
+| 2, grupo multicast (§4.2) | mostra em `ntp_servers`, não usa: o cliente não ouve multicast (G4.6l) |
+| 3, FQDN (§4.3) | resolve pelo DNS do roteador, como um nome configurado; um nome só, sem IDN |
+| link-local (`fe80::`) | mostra, não usa: o cliente pergunta só por endereço, e o link-local precisa da interface ao lado |
+
+- **Uma subopção por opção, ou várias:** a §4 manda uma só ("one, and only one") e a opção se
+  repete; o dnsmasq manda todas numa opção, e o systemd-networkd e o odhcp6c leem assim. Lemos as
+  duas formas. Subopção quebrada ou desconhecida é pulada; uma opção quebrada nunca derruba a
+  concessão.
+- **A 31 só sozinha:** a RFC 5908 §7 deprecia a opção SNTP. Os endereços dela valem só quando
+  não veio nenhuma opção 56, como no systemd-networkd.
+- **Limite:** no máximo 8 por mensagem e 8 servidores ao todo no cliente NTP.
+- **Segurança (RFC 5908 §6):** o servidor que o DHCPv6 indica não é autenticado, igual ao da
+  opção 42. Depois do primeiro acerto do boot (G4.6m), o limite de 1000 s e o piso de 2026 seguem
+  valendo.
+- **Laboratório:** o servidor DHCPv6 simulado entrega `2001:db8:0:N::1` na opção 56.
 
 ## Servidor NTP (G4.6c)
 
@@ -206,6 +241,7 @@ COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- \
 COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- \
     cargo test -p corerouter-daemon --test netns_ntp_first_boot   # G1.6zh: DHCP entrega o NTP
 cargo xtask vm-lab run -- scripts/routeros-interop-l2.sh ntp
+# clock_root confere também o RTC (G4.6o): LeaveAlone não grava, Follow grava
 cargo xtask vm-lab run -- 'systemctl stop systemd-timesyncd chrony; COREROUTER_CLOCK_ROOT=1 cargo test -p corerouter-hal-linux --test clock_root -- --test-threads=1 --nocapture; COREROUTER_CLOCK_ROOT=1 cargo test -p corerouter-daemon --test ntp_clock_root -- --nocapture; systemctl start systemd-timesyncd'
 ```
 
