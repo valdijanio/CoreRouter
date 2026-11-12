@@ -42,13 +42,19 @@ fn in_netns() -> bool {
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    // `ip -o link` prints a veth as `bng0@bng0p`: the name is before the `@`.
     let names: Vec<&str> = text
         .lines()
         .filter_map(|l| l.split(':').nth(1))
-        .map(str::trim)
+        .map(|n| n.trim().split('@').next().unwrap_or(""))
         .collect();
+    // What the slow path itself leaves behind (`pppoe_io`, G4.3y): the
+    // `bng0` ↔ `bng0p` veth pair and the bridge `bng0br` that holds the peer
+    // down. Another test of this file may have made them first.
     assert!(
-        names.iter().all(|n| *n == "lo" || *n == "bng0"),
+        names
+            .iter()
+            .all(|n| matches!(*n, "lo" | "bng0" | "bng0p" | "bng0br")),
         "{ENV}=1 but this namespace has {names:?}; refusing to touch it"
     );
     true
