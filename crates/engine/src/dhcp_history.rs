@@ -31,6 +31,10 @@ pub struct HistoryRuntime {
     retry_at: u64,
     /// The cap kept the journal from being compacted (logged once).
     held: bool,
+    /// G4.2l: loaded before any server ran (none enabled yet, or a command
+    /// asked first): what ended while the router was down is closed once a
+    /// server has its leases.
+    unsettled: bool,
 }
 
 /// A failed compaction is tried again after this.
@@ -41,41 +45,61 @@ impl Session {
         u64::from(self.store().running().ip.dhcp_server.config.history_retention)
     }
 
-    /// Load the journal once (after the leases, to close what ended while
-    /// the daemon was down).
+    /// Load the journal once, and close what ended while the daemon was
+    /// down once a server has its leases. G4.2l: the runtime is made here
+    /// (it was looked up, and only a binding made it, so a router restarted
+    /// with no client showed an empty history: the legal record, on disk,
+    /// out of sight), and the journal loads without a server too.
     pub(crate) fn dhcp_history_load(&mut self, now: Now) {
-        if self.ext::<HistoryRuntime>().is_none_or(|h| h.loaded) {
+        if self
+            .ext_mut::<HistoryRuntime>()
+            .is_none_or(|h| h.loaded && !h.unsettled)
+        {
             return;
         }
-        let Some(bound) = self.dhcp_server().map(|c| {
+        let bound = self.dhcp_server().map(|c| {
             c.leases()
                 .iter()
                 .filter(|l| l.state == State::Bound)
                 .map(|l| (l.address, l.mac))
                 .collect::<Vec<_>>()
-        }) else {
-            return;
-        };
-        let text = self.storage_mut().load_journal(JOURNAL);
+        });
+        let loaded = self.ext::<HistoryRuntime>().is_some_and(|h| h.loaded);
+        let text = if loaded { Ok(None) } else { self.storage_mut().load_journal(JOURNAL) };
         let mut settled = Vec::new();
         if let Some(rt) = self.ext_mut::<HistoryRuntime>() {
-            rt.loaded = true;
-            rt.compacted_at = now.unix;
-            match text {
-                Ok(Some(t)) => {
-                    rt.appended = t.lines().count() as u64;
-                    let bad = rt.history.replay(t.lines());
-                    if bad > 0 {
-                        log::warn!("dhcp history: {bad} unreadable journal lines skipped");
+            if !loaded {
+                rt.loaded = true;
+                rt.compacted_at = now.unix;
+                match text {
+                    Ok(Some(t)) => {
+                        rt.appended = t.lines().count() as u64;
+                        let bad = rt.history.replay(t.lines());
+                        if bad > 0 {
+                            log::warn!("dhcp history: {bad} unreadable journal lines skipped");
+                        }
                     }
+                    Ok(None) => {}
+                    Err(e) => rt.error = Some(e.to_string()),
                 }
-                Ok(None) => {}
-                Err(e) => rt.error = Some(e.to_string()),
             }
-            settled = rt.history.settle(|a, m| bound.contains(&(a, m)));
+            match &bound {
+                Some(b) => {
+                    settled = rt.history.settle(|a, m| b.contains(&(a, m)));
+                    rt.unsettled = false;
+                }
+                None => rt.unsettled = true,
+            }
         }
         self.history_write(&settled);
         self.dhcp_history_flush();
+    }
+
+    /// G4.2l: the history for a command (print, export, config): loaded
+    /// from its journal if no server round did yet.
+    pub(crate) fn dhcp_history_ensure(&mut self) {
+        let unix = self.now().unwrap_or(0);
+        self.dhcp_history_load(Now { ms: 0, unix });
     }
 
     /// Lines for the journal, written by [`Session::dhcp_history_flush`]
