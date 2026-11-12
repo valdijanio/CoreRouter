@@ -576,7 +576,10 @@ fn echo_through(one: &mut Cpes, sid: u16, ip: Ipv4Addr, dst: Ipv4Addr) -> bool {
 
 /// `ip <args>` in this namespace, its output.
 fn ip_text(args: &[&str]) -> String {
-    let out = std::process::Command::new("ip").args(args).output().unwrap();
+    let out = std::process::Command::new("ip")
+        .args(args)
+        .output()
+        .unwrap();
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
