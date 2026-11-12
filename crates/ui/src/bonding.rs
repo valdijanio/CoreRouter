@@ -869,7 +869,7 @@ fn dialog_body(
                         egui::RichText::new(tr_in(
                             SCOPE,
                             lang.labels,
-                            "Wi-Fi links have different, changing rates: balance-rr reorders TCP and a flow goes no faster than the slowest. 802.3ad or active-backup suit Wi-Fi better.",
+                            "Wi-Fi links have different, changing rates: balance-rr reorders TCP and a flow goes no faster than the slowest. balance-xor (one link per flow) or active-backup suit Wi-Fi better.",
                         ))
                         .color(crate::chip::AMBER.tone(&v).ink),
                     )

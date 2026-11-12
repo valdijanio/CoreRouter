@@ -1236,8 +1236,7 @@ pub(crate) fn build_with(
             if built {
                 make(&[&format!("{pkg}-dirclean")], &[])?;
             }
-            std::fs::write(&pstamp, &ppatches)
-                .map_err(|e| format!("{}: {e}", pstamp.display()))?;
+            std::fs::write(&pstamp, &ppatches).map_err(|e| format!("{}: {e}", pstamp.display()))?;
         }
     }
     // Buildroot reads the kernel fragment only when it configures the

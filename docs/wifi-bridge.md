@@ -145,6 +145,18 @@ corerouter-cli run interface.bonding.add '{"name":"bond1","slaves":["peer1","pee
     LACP nunca achou parceiro.
   - LACP sobre Wi-Fi pede um patch no mac80211: gap G1.30o.
 
+**Recepção em todos os membros.** Num enlace ponto a ponto, cada ponta escolhe o seu membro
+ativo sozinha. No active-backup, uma ponta mandava pelo primeiro enlace e a outra ouvia pelo
+segundo, e o bond descartava o que chegava pelo reserva (medido no laboratório). A thread do
+rádio liga `all_slaves_active` no bond de que um enlace Wi-Fi é membro. Nos bonds Ethernet não,
+porque lá o switch inunda as portas.
+
+**A estação que entra no bond.** O bond desliga a porta para tomá-la, e uma varredura em curso é
+abortada. O wpa_supplicant 2.12 não pedia outra varredura (`events.c:2649`) e a estação ficava
+em SCANNING para sempre. O patch `os/patches/wpa_supplicant/0001-rescan-after-an-aborted-scan.patch`
+pede uma nova um segundo depois. O texto para o projeto de origem está no cabeçalho do patch; o
+envio é do dono do projeto.
+
 **Diagnóstico por par.** A tabela de pares mostra, para cada enlace:
 
 - sinal, taxas com MCS, tempo conectado e retransmissões (% e falhas);

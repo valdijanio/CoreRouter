@@ -54,6 +54,7 @@ fail() { say "FAIL $*"; FAILED=1; }
 
 cleanup() {
 	set +e
+	jobs -p | xargs -r kill 2>/dev/null
 	for ns in crwa crwb; do
 		ip netns pids "$ns" 2>/dev/null | xargs -r kill 2>/dev/null
 	done

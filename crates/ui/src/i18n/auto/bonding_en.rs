@@ -13,8 +13,9 @@ A plain Wi-Fi client (mode `station`) does not join a bond or a bridge.
 
 **Between two CoreRouters**, use **station-bridge** (G1.30m): the link carries four addresses (Multi-AP, or WDS for OpenWrt). A radio in `station-bridge` mode, and on the other router its peer's link (Interfaces › Wi-Fi › Peers), show among the slaves above like ports.
 
-- **802.3ad** (LACP; the other end too) or **active-backup** suit Wi-Fi; **balance-rr** reorders TCP over links whose rates differ.
-- The bond gives its slaves one MAC: on the station side, register the bond's MAC as the peers' MAC on the access point; on the access point side, the access points of one bond's peers share a MAC (the first's).
+- **active-backup** or **balance-xor** (each flow on one link) suit Wi-Fi; **balance-rr** reorders TCP over links whose rates differ.
+- **802.3ad** (LACP), **balance-tlb** and **balance-alb** are refused: the kernel needs each slave's speed and duplex, which a Wi-Fi link does not report.
+- The bond gives its slaves its own MAC: on the station side, register the bond's MAC as the peers' MAC on the access points at the other end.
 
 A plain Wi-Fi client: route through it (with source NAT if the network behind the access point has no route back).",
 )];
