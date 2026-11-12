@@ -93,10 +93,11 @@ DUT_CPUS=0-$((NCPU / 2 - 1))
 GEN_CPUS=$((NCPU / 2))-$((NCPU - 1))
 DUT_CPUS_LIST=""
 HOT=10000 STATICS=1000 ZONE_N=10000
-# Zones hold at most 50 000 records each (model::dns_zone::MAX_RECORDS,
-# the SOA, NS and its address included): two of ~50 000, 100 000 in all,
-# the case of G4.1p.
-FILL=1000000 ADLIST_N=1000000 ZONE_RECORDS=49990 DHCP_N=20000
+# The zones hold at most 50 000 records in all (model::dns_zone::
+# MAX_RECORDS, the SOA, NS and glue included): test ddns fills them, the
+# zone that changes with --zone-records and a second one with the rest
+# (G4.1p: every change rebuilds every primary zone).
+FILL=1000000 ADLIST_N=1000000 ZONE_RECORDS=40000 DHCP_N=20000
 SOAK_SECS=7200
 OUT=""
 while [ $# -gt 0 ]; do
@@ -1496,16 +1497,20 @@ PY
 }
 test_ddns() {
 	say ""
-	say "## 7. Duas zonas de $ZONE_RECORDS registros, UPDATE e tempestade de DHCP"
+	local other_n=$((50000 - ZONE_RECORDS - 20))
+	say "## 7. Zonas com $((ZONE_RECORDS + other_n)) registros (o teto), UPDATE e tempestade de DHCP"
 	say ""
 	dns_set
 	mcp_open
-	zone_load other.lab "$ZONE_RECORDS" o || { mcp_close; return 0; }
+	# The zones of earlier tests count in the cap.
+	cr ip.dns.zone.remove '{"id":"zn.lab"}' >/dev/null 2>&1 || true
+	zone_load other.lab "$other_n" o || { mcp_close; return 0; }
 	local other_ms=$ZONE_LOAD_MS
 	zone_load dyn.lab "$ZONE_RECORDS" d || { mcp_close; return 0; }
 	mcp_close
 	awk -v n="$ZONE_RECORDS" 'BEGIN {srand(3); for (i = 0; i < 20000; i++) printf "d%d.dyn.lab A\n", int(rand() * n)}' >"$QF/dyn"
-	say "Carga de cada zona (ip.dns.zone.file.load por MCP): other.lab $other_ms ms, dyn.lab $ZONE_LOAD_MS ms."
+	say "Carga de cada zona (ip.dns.zone.file.load por MCP): other.lab ($other_n registros) $other_ms ms,"
+	say "dyn.lab ($ZONE_RECORDS) $ZONE_LOAD_MS ms."
 	say "Os UPDATEs e as concessões vão para dyn.lab; other.lab só está lá (G4.1p: toda mudança reconstrói"
 	say "todas as primárias)."
 	sleep 2
