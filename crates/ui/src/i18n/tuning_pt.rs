@@ -148,15 +148,6 @@ Deixe 0 num roteador: se é o daemon que lê a página, o init o reinicia, e nad
 Só faz algo com memória ECC (System › Health › Memory)."##,
     ),
     (
-        "tuning.vm.memory_failure_recovery",
-        r##"## O que faz
-1 (o padrão do kernel): um erro de memória sem correção na página de um processo mata esse processo; 0: o kernel entra em pânico em qualquer erro desses.
-## Quando mudar
-Mantenha 1 num roteador: um processo morto volta em segundos, um pânico derruba a máquina inteira. 0 só onde um byte errado é pior que um reinício.
-## Cuidado
-Só faz algo com memória ECC (System › Health › Memory)."##,
-    ),
-    (
         "tuning.kernel.softlockup_panic",
         r##"## O que faz
 Entra em pânico (e o `kernel.panic` reinicia) quando uma CPU fica 20 s rodando no kernel sem deixar mais nada rodar: o travamento mole (soft lockup). Desligado, só escreve o rastro no log.
@@ -696,6 +687,15 @@ Cada perfil é calculado para esta máquina (RAM, CPUs, velocidade das portas), 
 As opções de TCP (buffers de socket, SYN cookies) só afetam as conexões do próprio roteador (BGP, a API), nunca o tráfego encaminhado.
 ## Aplicar
 "Aplicar com Safe Mode" entra em Safe Mode antes: se a conexão com o roteador cair, toda mudança volta."##,
+    ),
+    (
+        "tuning.vm.memory_failure_recovery",
+        r##"## O que faz
+1 (o padrão do kernel): um erro de memória sem correção na página de um processo mata esse processo; 0: o kernel entra em pânico em qualquer erro desses.
+## Quando mudar
+Mantenha 1 num roteador: um processo morto volta em segundos, um pânico derruba a máquina inteira. 0 só onde um byte errado é pior que um reinício.
+## Cuidado
+Só faz algo com memória ECC (System › Health › Memory)."##,
     ),
     (
         "tuning.vm.min_free_kbytes",

@@ -147,15 +147,6 @@ Leave 0 on a router: the daemon is restarted by the init if it is the one that r
 Only does something on ECC memory (System › Health › Memory)."##,
     ),
     (
-        "tuning.vm.memory_failure_recovery",
-        r##"## What it does
-1 (the kernel's default): an uncorrectable memory error in a process's page kills that process; 0: the kernel panics on any such error.
-## When to change
-Keep 1 on a router: a dead process comes back in seconds, a panic takes the whole box down. 0 only where a wrong byte is worse than a reboot.
-## Careful
-Only does something on ECC memory (System › Health › Memory)."##,
-    ),
-    (
         "tuning.kernel.softlockup_panic",
         r##"## What it does
 Panics (and `kernel.panic` reboots) when a CPU runs in the kernel for 20 s without letting anything else run: a soft lockup. Off, it only writes a trace to the log.
@@ -695,6 +686,15 @@ Each profile is calculated from this machine (RAM, CPUs, port speeds), not copie
 TCP settings (socket buffers, SYN cookies) only affect the router's own connections (BGP, the API), never forwarded traffic.
 ## Applying
 "Apply with Safe Mode" enters Safe Mode first: if the connection to the router drops, every change goes back."##,
+    ),
+    (
+        "tuning.vm.memory_failure_recovery",
+        r##"## What it does
+1 (the kernel's default): an uncorrectable memory error in a process's page kills that process; 0: the kernel panics on any such error.
+## When to change
+Keep 1 on a router: a dead process comes back in seconds, a panic takes the whole box down. 0 only where a wrong byte is worse than a reboot.
+## Careful
+Only does something on ECC memory (System › Health › Memory)."##,
     ),
     (
         "tuning.vm.min_free_kbytes",
