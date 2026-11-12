@@ -332,6 +332,11 @@ fn physical(cfg: &Config, name: &IfName, depth: u8, out: &mut BTreeSet<IfName>) 
         InterfaceKind::Ethernet | InterfaceKind::Wifi(_) => {
             out.insert(name.clone());
         }
+        // G1.30m: a peer's link rides its access point's radio.
+        InterfaceKind::WifiPeer(p) => {
+            out.insert(name.clone());
+            physical(cfg, &p.radio, depth + 1, out);
+        }
         InterfaceKind::Vlan { parent, .. } => physical(cfg, parent, depth + 1, out),
         InterfaceKind::PppoeClient(c) => physical(cfg, &c.interface, depth + 1, out),
         InterfaceKind::Bridge => {

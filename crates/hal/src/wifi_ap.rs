@@ -56,6 +56,25 @@ pub struct WifiAp {
     pub he: bool,
     /// Radar detection is needed before sending (a DFS channel).
     pub radar: bool,
+    /// G1.30m: takes station-bridges (`None`: clients only).
+    pub backhaul: Option<ApBackhaul>,
+}
+
+/// G1.30m: an access point that takes station-bridges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApBackhaul {
+    /// The registered peers only (no plain clients).
+    pub only: bool,
+    /// Who gets four addresses; any other station that asks is sent away.
+    pub peers: Vec<ApPeer>,
+}
+
+/// G1.30m: a registered peer: its MAC (`aa:bb:cc:dd:ee:ff`) and the name
+/// its link gets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApPeer {
+    pub mac: String,
+    pub name: String,
 }
 
 /// Never the key: a `{:?}` goes to logs.
@@ -75,6 +94,7 @@ impl std::fmt::Debug for WifiAp {
             .field("vht", &self.vht)
             .field("he", &self.he)
             .field("radar", &self.radar)
+            .field("backhaul", &self.backhaul)
             .finish()
     }
 }
@@ -122,6 +142,9 @@ pub struct WifiClient {
     pub authorized: bool,
     /// What it joined with: `wpa3`, `wpa2`, `open`.
     pub security: Option<String>,
+    /// G1.30m: a registered peer's name, when it is one with its
+    /// four-address link up.
+    pub peer: Option<String>,
     /// The Wi-Fi generation it speaks with the access point: 4 (n), 5
     /// (ac), 6 (ax), 7 (be).
     pub generation: Option<u8>,
@@ -176,6 +199,16 @@ pub enum WifiApEvent {
     },
     /// It would not start.
     Failed(String),
+    /// G1.30m: a registered peer's four-address link is up, as `name`.
+    PeerUp {
+        mac: String,
+        name: String,
+    },
+    /// G1.30m: and gone.
+    PeerDown {
+        mac: String,
+        name: String,
+    },
 }
 
 /// Stations reported at most (a crowded access point).
@@ -332,6 +365,7 @@ mod tests {
             vht: true,
             he: true,
             radar: false,
+            backhaul: None,
         };
         assert!(!format!("{ap:?}").contains("segredo"));
     }

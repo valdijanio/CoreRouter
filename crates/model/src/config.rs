@@ -266,6 +266,10 @@ pub enum InterfaceKind {
     /// because the card is, like an Ethernet port; the network it joins in
     /// [`crate::wifi`].
     Wifi(Box<crate::wifi::WifiConfig>),
+    /// G1.30m: the four-address link of a station-bridge peer on one of
+    /// this router's access points (RouterOS has no such type; ours is
+    /// `wifi-peer`): there while the peer is associated.
+    WifiPeer(Box<crate::wifi::WifiPeer>),
 }
 
 impl InterfaceKind {
@@ -279,6 +283,7 @@ impl InterfaceKind {
             Self::Bonding { .. } => "bonding",
             Self::PppoeClient(_) => "pppoe-out",
             Self::Wifi(_) => "wifi",
+            Self::WifiPeer(_) => "wifi-peer",
         }
     }
 }

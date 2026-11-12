@@ -43,12 +43,18 @@ pub(crate) fn invalid(cfg: &Config, absent: &[IfName], live: &[LinkState]) -> BT
         .iter()
         .filter(|n| !present.contains(n))
         // G1.30: a radio is hardware too (a USB adapter pulled out).
-        .filter(|n| {
-            cfg.interfaces
-                .get(*n)
-                .is_some_and(|i| matches!(i.kind, InterfaceKind::Ethernet | InterfaceKind::Wifi(_)))
+        .filter_map(|n| match cfg.interfaces.get(n).map(|i| &i.kind) {
+            Some(InterfaceKind::Ethernet | InterfaceKind::Wifi(_)) => Some((
+                n.clone(),
+                "port not on this machine (unplugged or failed): its configuration waits for it".to_owned(),
+            )),
+            // G1.30m: a peer's link is there while the peer is associated.
+            Some(InterfaceKind::WifiPeer(p)) => Some((
+                n.clone(),
+                format!("peer not associated with '{}': its configuration waits for it", p.radio),
+            )),
+            _ => None,
         })
-        .map(|n| (n.clone(), "port not on this machine (unplugged or failed): its configuration waits for it".to_owned()))
         .collect();
     if out.is_empty() {
         return out;
@@ -102,7 +108,7 @@ impl Session {
                 n.parse::<IfName>()
                     .ok()
                     .and_then(|n| running.interfaces.get(&n))
-                    .is_some_and(|i| i.kind == InterfaceKind::Ethernet)
+                    .is_some_and(|i| matches!(i.kind, InterfaceKind::Ethernet | InterfaceKind::WifiPeer(_)))
             })
         })
     }

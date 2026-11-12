@@ -14,10 +14,10 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use corerouter_hal::wifi::{
-    JoinSecurity, MAX_SPECTRAL_PENDING, WifiBss, WifiEvent, WifiFailure, WifiNetwork, WifiPort,
+    FourAddr, JoinSecurity, MAX_SPECTRAL_PENDING, WifiBss, WifiEvent, WifiFailure, WifiNetwork, WifiPort,
     WifiRadio, WifiState, WifiStatus, WifiSurvey,
 };
-use corerouter_model::wifi::{Country, WifiConfig, WifiMode, WifiSecurity};
+use corerouter_model::wifi::{BridgeProtocol, Country, WifiConfig, WifiMode, WifiSecurity};
 use corerouter_model::{Config, IfName, InterfaceKind};
 use serde_json::{Value, json};
 
@@ -54,9 +54,21 @@ struct Told {
     hidden: bool,
     band: Option<(u32, u32)>,
     bssid: Option<String>,
+    /// G1.30m: a station-bridge's four addresses, and its bridge.
+    four_addr: Option<FourAddr>,
+    bridge: Option<String>,
 }
 
-fn told(st: &WifiConfig) -> Told {
+/// G1.30m: the four addresses `st` asks for (`None`: a plain station).
+fn four_addr(st: &WifiConfig) -> Option<FourAddr> {
+    (st.mode == WifiMode::StationBridge).then_some(match st.bridge_protocol {
+        BridgeProtocol::MultiAp => FourAddr::MultiAp,
+        BridgeProtocol::Wds => FourAddr::Wds,
+    })
+}
+
+fn told(st: &WifiConfig, bridge: Option<&IfName>) -> Told {
+    let fa = four_addr(st);
     Told {
         ssid: st.ssid.clone(),
         security: st.security,
@@ -64,6 +76,9 @@ fn told(st: &WifiConfig) -> Told {
         hidden: st.hidden,
         band: st.band.map(|b| b.range_mhz()),
         bssid: st.bssid.map(|m| m.to_string().to_ascii_lowercase()),
+        four_addr: fa,
+        // Only a station-bridge is a bridge port.
+        bridge: fa.and(bridge).map(ToString::to_string),
     }
 }
 
@@ -230,7 +245,9 @@ impl Session {
         }
         for (name, off, net, mode) in want {
             match mode {
-                WifiMode::Station => {
+                // G1.30m: a station-bridge is a station that asks for four
+                // addresses (`wifi_network`).
+                WifiMode::Station | WifiMode::StationBridge => {
                     self.wifi_ap_step(&name, None, now_ms);
                     self.wifi_step(&name, off, net.as_ref(), now_ms);
                 }
@@ -338,7 +355,13 @@ impl Session {
             }
         }
         // 3. Tell it its network, once per change.
-        let want = net.map(told);
+        let bridge = self
+            .store()
+            .running()
+            .interfaces
+            .get(name)
+            .and_then(|i| i.bridge.clone());
+        let want = net.map(|st| told(st, bridge.as_ref()));
         let order = self
             .wifi()
             .and_then(|rt| rt.radios.get(name))
@@ -506,14 +529,28 @@ impl Session {
         } else {
             String::new()
         };
-        let t = told(st);
+        let bridge = self
+            .store()
+            .running()
+            .interfaces
+            .get(name)
+            .and_then(|i| i.bridge.clone());
+        let t = told(st, bridge.as_ref());
+        // G1.30m: a backhaul is WPA3 only (`auto` means WPA3 there).
+        let security = if t.four_addr.is_some() && st.security == WifiSecurity::Auto {
+            JoinSecurity::Wpa3
+        } else {
+            join_security(st.security)
+        };
         Ok(WifiNetwork {
             ssid: t.ssid,
-            security: join_security(st.security),
+            security,
             key,
             hidden: t.hidden,
             band_mhz: t.band,
             bssid: t.bssid,
+            four_addr: t.four_addr,
+            bridge: t.bridge,
         })
     }
 

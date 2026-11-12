@@ -76,6 +76,17 @@ fn hostapd_conf() -> String {
     )
 }
 
+/// G1.30m: the test's access point for a station-bridge: WPA3 (SAE) on
+/// channel 1, Multi-AP backhaul and fronthaul (`multi_ap=3`) and a
+/// four-address interface per station that asks (`wds_sta=1`).
+fn hostapd_backhaul_conf() -> String {
+    format!(
+        "interface=wifi1\nctrl_interface=/tmp/hapd\ndriver=nl80211\nssid={BH_SSID}\nhw_mode=g\nchannel=1\n\
+         ieee80211n=1\nwpa=2\nwpa_key_mgmt=SAE\nrsn_pairwise=CCMP\nwpa_passphrase={BH_PASS}\n\
+         ieee80211w=2\nsae_pwe=2\nwds_sta=1\nmulti_ap=3\n"
+    )
+}
+
 /// A small ext4 image with hostapd and its configuration (`mke2fs -d`, the
 /// build's own: no root, no loop device).
 fn tools_disk(images: &Path, work: &Path) -> Result<std::path::PathBuf, String> {
@@ -91,6 +102,7 @@ fn tools_disk(images: &Path, work: &Path) -> Result<std::path::PathBuf, String> 
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     std::fs::copy(&hostapd, dir.join("hostapd")).map_err(|e| format!("hostapd: {e}"))?;
     std::fs::write(dir.join("ap.conf"), hostapd_conf()).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("ap-bh.conf"), hostapd_backhaul_conf()).map_err(|e| e.to_string())?;
     let img = work.join("tools.img");
     let _ = std::fs::remove_file(&img);
     let mke2fs = images
@@ -1024,6 +1036,185 @@ fn ap_mode(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(
     Ok(())
 }
 
+/// G1.30m: the backhaul's network, test values on a disposable VM.
+const BH_SSID: &str = "CoreRouter-Backhaul";
+const BH_PASS: &str = "senha-do-backhaul";
+
+/// G1.30m: a Multi-AP backhaul station on the test's radio (`wifi1`): the
+/// image's `wpa_supplicant`, its own file.
+fn backhaul_client(vm: &mut Vm, log: &mut std::fs::File) -> Result<(), String> {
+    let conf = [
+        "ctrl_interface=/tmp/sta".to_owned(),
+        "sae_pwe=2".to_owned(),
+        "network={".to_owned(),
+        format!(" ssid=\"{BH_SSID}\""),
+        " key_mgmt=SAE".to_owned(),
+        " ieee80211w=2".to_owned(),
+        format!(" sae_password=\"{BH_PASS}\""),
+        " multi_ap_backhaul_sta=1".to_owned(),
+        "}".to_owned(),
+    ]
+    .join("\\n");
+    let out = sh(
+        vm,
+        log,
+        &format!(
+            "{{ kill $(cat /tmp/sta.pid 2>/dev/null) 2>/dev/null; sleep 0.3; printf '{conf}\\n' > /tmp/sta.conf && wpa_supplicant -B -i wifi1 -c /tmp/sta.conf -P /tmp/sta.pid && echo STA-UP; }}"
+        ),
+    )?;
+    check(
+        out.contains("STA-UP"),
+        format!("the backhaul client did not start: {out}"),
+    )
+}
+
+/// G1.30m: station-bridge end to end, both ends.
+fn bridge_mode(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(), String> {
+    until(vm, log, 30, "interface.wifi.list", "{}", |v| {
+        v["result"]
+            .as_array()
+            .is_some_and(|a| a.len() == 1 && a[0]["name"] == "wifi2")
+    })?;
+    vm.ok(log, "interface.wifi.country.set", r#"{"country":"BR"}"#)?;
+    vm.ok(log, "interface.bridge.add", r#"{"name":"bridge1"}"#)?;
+    let out = sh(
+        vm,
+        log,
+        &format!("{{ mkdir -p {TOOLS} && mount -t ext4 -o ro /dev/vdb {TOOLS} && ls {TOOLS}; }}"),
+    )?;
+    check(out.contains("ap-bh.conf"), format!("tools disk: {out}"))?;
+
+    // A: the router's access point takes the test's radio as a peer.
+    set(
+        vm,
+        log,
+        &serde_json::json!({"name": "wifi2", "mode": "ap", "ssid": BH_SSID, "passphrase": BH_PASS,
+                            "station_bridge": "yes", "frequency": "1", "disabled": false}),
+    )?;
+    vm.ok(
+        log,
+        "interface.wifi.peer.add",
+        &serde_json::json!({"radio": "wifi2", "name": "peer1", "mac_address": CLIENT_MAC})
+            .to_string(),
+    )?;
+    for i in ["wifi2", "peer1"] {
+        vm.ok(
+            log,
+            "interface.bridge.port.add",
+            &serde_json::json!({"bridge": "bridge1", "interface": i}).to_string(),
+        )?;
+    }
+    monitor(vm, log, 40, |m| m["state"] == "running")?;
+    let t = Instant::now();
+    backhaul_client(vm, log)?;
+    until(vm, log, 40, "interface.wifi.peer.print", "{}", |v| {
+        v["result"][0]["state"] == "up"
+    })?;
+    let up_s = t.elapsed().as_secs_f64();
+    // The peer's link is `peer1`, in the bridge; hostapd's name is gone.
+    let links = sh(
+        vm,
+        log,
+        "{ i=0; while [ $i -lt 50 ] && [ \"$(readlink /sys/class/net/peer1/master)\" = \"\" ]; do sleep 0.2; i=$((i+1)); done; readlink /sys/class/net/peer1/master; ls /sys/class/net; cat /sys/class/net/peer1/operstate; }",
+    )?;
+    check(
+        links.contains("bridge1") && !links.contains("wifi2.sta"),
+        format!("the peer's link: {links}"),
+    )?;
+    nums.put(
+        "peer of the access point",
+        format!("Multi-AP backhaul station up as peer1 in {up_s:.1} s, in bridge1 ({links})"),
+    );
+    // A station that is not registered is sent away.
+    sh(vm, log, "{ kill $(cat /tmp/sta.pid); echo .; }")?;
+    vm.ok(
+        log,
+        "interface.bridge.port.remove",
+        r#"{"bridge":"bridge1","interface":"peer1"}"#,
+    )?;
+    vm.ok(log, "interface.wifi.peer.remove", r#"{"name":"peer1"}"#)?;
+    vm.ok(
+        log,
+        "interface.wifi.peer.add",
+        r#"{"radio":"wifi2","name":"peer9","mac_address":"02:00:00:00:09:00"}"#,
+    )?;
+    backhaul_client(vm, log)?;
+    until(
+        vm,
+        log,
+        40,
+        "interface.wifi.history",
+        r#"{"name":"wifi2"}"#,
+        |v| v.to_string().contains("is not a registered peer"),
+    )?;
+    sh(vm, log, "{ kill $(cat /tmp/sta.pid); echo .; }")?;
+    nums.put(
+        "unregistered station",
+        "asked for four addresses, sent away",
+    );
+
+    // B: the router's radio as a station-bridge, the test's hostapd as the
+    // access point (Multi-AP, then WDS).
+    vm.ok(log, "interface.wifi.peer.remove", r#"{"name":"peer9"}"#)?;
+    vm.ok(
+        log,
+        "interface.bridge.port.remove",
+        r#"{"bridge":"bridge1","interface":"wifi2"}"#,
+    )?;
+    set(
+        vm,
+        log,
+        &serde_json::json!({"name": "wifi2", "mode": "station", "ssid": ""}),
+    )?;
+    let out = sh(
+        vm,
+        log,
+        &format!(
+            "{{ i=0; while [ $i -lt 50 ] && pidof hostapd >/dev/null; do sleep 0.2; i=$((i+1)); done; mkdir -p /tmp/hapd; {TOOLS}/hostapd -B {TOOLS}/ap-bh.conf; sleep 1; pidof hostapd >/dev/null && echo AP-UP; }}"
+        ),
+    )?;
+    check(
+        out.contains("AP-UP"),
+        format!("the test's backhaul access point: {out}"),
+    )?;
+    for proto in ["multi-ap", "wds"] {
+        let t = Instant::now();
+        set(
+            vm,
+            log,
+            &serde_json::json!({"name": "wifi2", "mode": "station-bridge", "bridge_protocol": proto,
+                                "ssid": BH_SSID, "passphrase": BH_PASS, "disabled": false}),
+        )?;
+        if proto == "multi-ap" {
+            vm.ok(
+                log,
+                "interface.bridge.port.add",
+                r#"{"bridge":"bridge1","interface":"wifi2"}"#,
+            )?;
+        }
+        let m = monitor(vm, log, 40, |m| m["state"] == "connected")?;
+        let secs = t.elapsed().as_secs_f64();
+        let links = sh(
+            vm,
+            log,
+            "{ i=0; while [ $i -lt 50 ] && [ \"$(readlink /sys/class/net/wifi2/master)\" = \"\" ]; do sleep 0.2; i=$((i+1)); done; readlink /sys/class/net/wifi2/master; j=0; while [ $j -lt 50 ] && ! ls /sys/class/net | grep -q wifi1.sta; do sleep 0.2; j=$((j+1)); done; ls /sys/class/net | grep wifi1.sta; }",
+        )?;
+        check(
+            links.contains("bridge1") && links.contains("wifi1.sta"),
+            format!("station-bridge ({proto}): {links}"),
+        )?;
+        nums.put(
+            &format!("station-bridge ({proto})"),
+            format!(
+                "connected in {secs:.1} s ({}), in bridge1; the access point made its four-address link ({links})",
+                m["security"]
+            ),
+        );
+    }
+    sh(vm, log, "{ kill $(pidof hostapd); echo .; }")?;
+    Ok(())
+}
+
 /// The station's MAC (`mac80211_hwsim`'s second radio).
 const STA_MAC: &str = "02:00:00:00:01:00";
 
@@ -1195,8 +1386,8 @@ pub fn wifi_test(root: &Path, images: &Path, args: &[String]) -> Result<(), Stri
         match a.as_str() {
             "--tcg" => tcg = true,
             "--only" => match it.next().map(String::as_str) {
-                Some(s @ ("commands" | "setup" | "ap")) => only = Some(s.to_owned()),
-                _ => return Err("--only takes commands, setup or ap".into()),
+                Some(s @ ("commands" | "setup" | "ap" | "bridge")) => only = Some(s.to_owned()),
+                _ => return Err("--only takes commands, setup, ap or bridge".into()),
             },
             other => return Err(format!("unknown argument '{other}'")),
         }
@@ -1262,6 +1453,24 @@ pub fn wifi_test(root: &Path, images: &Path, args: &[String]) -> Result<(), Stri
                 &mut vm,
                 &mut log,
                 "{ ls /sys/class/net; pidof hostapd wpa_supplicant; grep -iE 'wifi|hostapd|wireless' /var/log/corerouter-daemon.log | tail -n 20; dmesg | tail -n 15; }",
+            )
+            .unwrap_or_default();
+            let h = vm
+                .run(&mut log, "interface.wifi.history", "{}")
+                .unwrap_or_default();
+            eprintln!("   DIAG {diag}\n   HISTORY {h}");
+            return Err(e);
+        }
+        vm.poweroff(&mut log)?;
+    }
+    if wants("bridge") {
+        let mut vm = boot(&work, images, &tools, kvm, &mut log)?;
+        vm.expect_all(&mut log, &booted, 120)?;
+        if let Err(e) = bridge_mode(&mut vm, &mut log, &mut nums) {
+            let diag = sh(
+                &mut vm,
+                &mut log,
+                "{ ls /sys/class/net; pidof hostapd wpa_supplicant; grep -iE 'wifi|hostapd|wireless|peer' /var/log/corerouter-daemon.log | tail -n 25; dmesg | tail -n 15; }",
             )
             .unwrap_or_default();
             let h = vm

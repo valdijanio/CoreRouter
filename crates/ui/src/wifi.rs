@@ -13,6 +13,8 @@
 //!   three views of it (list, channel graph, spectrum), `wifi_scan.rs`.
 //! - **Registration** (G1.30a): the clients of the access points,
 //!   `wifi_clients.rs`.
+//! - **Peers** (G1.30m): the station-bridges the access points take,
+//!   `wifi_peers.rs`.
 //!
 //! The country every radio follows is on the first line, with its dialog.
 //! G1.30h: the same dialog opens from "Interface <wifi1>" and from Enable
@@ -72,12 +74,21 @@ const FIELDS: &[Field] = &[
     Field { param: "hidden", label: "Hidden Network", help: "interface.wifi.hidden", input: Input::Check, edit: true },
     Field { param: "band", label: "Band", help: "interface.wifi.band", input: Input::Choice, edit: true },
     Field { param: "bssid", label: "Lock to BSSID", help: "interface.wifi.bssid", input: Input::Text("any access point"), edit: true },
+    Field { param: "bridge_protocol", label: "Bridge Protocol", help: "interface.wifi.bridge_protocol", input: Input::Choice, edit: true },
+    Field { param: "station_bridge", label: "Station Bridge", help: "interface.wifi.station_bridge", input: Input::Choice, edit: true },
     Field { param: "frequency", label: "Frequency", help: "interface.wifi.frequency", input: Input::Text("auto, a channel (36) or MHz"), edit: true },
     Field { param: "width", label: "Width", help: "interface.wifi.width", input: Input::Choice, edit: true },
     Field { param: "mtu", label: "MTU", help: "interface.wifi.mtu", input: Input::Text("1500"), edit: true },
     Field { param: "comment", label: "Comment", help: "", input: Input::Text(""), edit: true },
     Field { param: "disabled", label: "Disabled", help: "interface.wifi.disabled", input: Input::Check, edit: true },
 ];
+
+/// G1.30m: the modal's pages. General: what the radio is and the network;
+/// Channel: where it runs and the link's details.
+const GENERAL_PAGE: &[&str] = &[
+    "mode", "ssid", "security", "passphrase", "hidden", "bridge_protocol", "station_bridge", "disabled", "comment",
+];
+const CHANNEL_PAGE: &[&str] = &["band", "frequency", "width", "bssid", "mtu"];
 
 pub(crate) const SPEC: Spec = Spec {
     panel: NAME,
@@ -109,6 +120,8 @@ pub(crate) enum Tab {
     Networks,
     /// G1.30a: the clients of the access points.
     Registration,
+    /// G1.30m: the station-bridges the access points take.
+    Peers,
 }
 
 /// The country dialog: one field, and the radios to enable after it.
@@ -236,6 +249,10 @@ pub(crate) struct WifiPanel {
     pub(crate) scan: crate::wifi_scan::ScanView,
     /// G1.30a: the Registration tab.
     pub(crate) clients: crate::wifi_clients::ClientsView,
+    /// G1.30m: the Peers tab.
+    pub(crate) peers: crate::wifi_peers::PeersView,
+    /// G1.30m: the page of the radio's modal (General, Channel).
+    pub(crate) modal_page: usize,
     help: Option<HelpView>,
 }
 
@@ -376,6 +393,10 @@ pub(crate) fn row(r: &Value, l: Lang) -> Row {
     if s(r, "mode") == "ap" {
         chips.insert(0, (tr_in(SCOPE, l, "AP").to_owned(), Kind::Blue));
     }
+    // G1.30m: a station-bridge.
+    if s(r, "mode") == "station-bridge" {
+        chips.insert(0, (tr_in(SCOPE, l, "bridge").to_owned(), Kind::Blue));
+    }
     if state != "connected"
         && state != "disabled"
         && let Some(f) = r.get("failure").and_then(Value::as_str)
@@ -418,6 +439,8 @@ fn values_of(r: &Value) -> BTreeMap<&'static str, String> {
     BTreeMap::from([
         ("mode", if s(r, "mode").is_empty() { "station".to_owned() } else { s(r, "mode") }),
         ("frequency", auto("configured_frequency")),
+        ("bridge_protocol", if s(r, "bridge_protocol").is_empty() { "multi-ap".to_owned() } else { s(r, "bridge_protocol") }),
+        ("station_bridge", if s(r, "station_bridge").is_empty() { "no".to_owned() } else { s(r, "station_bridge") }),
         ("width", auto("configured_width")),
         ("ssid", s(r, "ssid")),
         ("security", s(r, "security")),
@@ -460,6 +483,7 @@ impl WifiPanel {
             return;
         };
         let mut m = Modal::open(app, Some((name.to_owned(), name.to_owned())), values_of(r));
+        self.modal_page = 0;
         for (k, v) in over {
             m.values.insert(k, v.clone());
         }
@@ -533,6 +557,7 @@ impl WifiPanel {
                 (Tab::Radios, "Radios"),
                 (Tab::Networks, "Networks"),
                 (Tab::Registration, "Registration"),
+                (Tab::Peers, "Peers"),
             ] {
                 if ui.selectable_label(self.tab == tab, tr_in(SCOPE, l, label)).clicked() {
                     self.tab = tab;
@@ -1108,6 +1133,7 @@ impl PanelState for WifiPanel {
                 out.extend(self.scan.queries(&self.radio, app));
             }
             Tab::Registration => out.extend(self.clients.queries(app)),
+            Tab::Peers => out.extend(self.peers.queries(app)),
         }
         out
     }
@@ -1127,6 +1153,7 @@ impl PanelState for WifiPanel {
             "monitor" => self.monitor = Some(value),
             "networks" => self.heard = Some(value),
             crate::wifi_clients::KEY => self.clients.arrived(value),
+            crate::wifi_peers::KEY => self.peers.arrived(value),
             list_modal::PREVIEW => {
                 if let Some(m) = &mut self.modal {
                     m.arrived(value);
@@ -1150,23 +1177,45 @@ impl PanelState for WifiPanel {
                     self.help = Some(h);
                 }
             }
+            Tab::Peers => {
+                let rows = self.rows.clone();
+                if let Some(h) = self.peers.show(app, ui, l, &rows) {
+                    self.help = Some(h);
+                }
+            }
         }
     }
 
     fn dialogs(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
         if let Some(m) = &mut self.modal {
-            let open = m.show(app, ctx, area, &SPEC, &|p| match p {
+            let l = app.lang.labels;
+            let page = &mut self.modal_page;
+            let open = m.show_paged(app, ctx, area, &SPEC, &|p| match p {
                 "security" => ["auto", "wpa3", "wpa2", "open"].map(str::to_owned).to_vec(),
                 "band" => ["2ghz", "5ghz", "6ghz"].map(str::to_owned).to_vec(),
-                "mode" => ["station", "ap"].map(str::to_owned).to_vec(),
+                "mode" => ["station", "ap", "station-bridge"].map(str::to_owned).to_vec(),
+                "bridge_protocol" => ["multi-ap", "wds"].map(str::to_owned).to_vec(),
+                "station_bridge" => ["no", "yes", "only"].map(str::to_owned).to_vec(),
                 "width" => ["auto", "20", "40", "80", "160"].map(str::to_owned).to_vec(),
                 _ => Vec::new(),
+            }, &mut |ui| {
+                ui.horizontal(|ui| {
+                    for (i, label) in ["General", "Channel"].iter().enumerate() {
+                        if ui.selectable_label(*page == i, tr_in(SCOPE, l, label)).clicked() {
+                            *page = i;
+                        }
+                    }
+                });
+                ui.separator();
+                Some(if *page == 1 { CHANNEL_PAGE } else { GENERAL_PAGE })
             });
             if !open {
                 self.modal = None;
             }
         }
         self.country_dialog(app, ctx, area);
+        let rows = self.rows.clone();
+        self.peers.dialog(app, ctx, area, &rows);
         help::modal(ctx, app.lang, &mut self.help);
     }
 
@@ -1213,6 +1262,8 @@ impl PanelState for WifiPanel {
         {
             app.floats.forget(dialog_id(d.id));
             self.country_dialog = None;
+        } else if let Some(p) = then.downcast_ref::<crate::wifi_peers::PeerAdded>() {
+            self.peers.replied(app, p.0, result);
         } else if let Some(e) = then.downcast_ref::<EnableTried>()
             && let Err(error) = result
             && is_no_country(error)
@@ -1227,6 +1278,7 @@ impl PanelState for WifiPanel {
             Tab::Radios => self.table.escape(),
             Tab::Networks => self.heard_table.escape(),
             Tab::Registration => self.clients.table.escape(),
+            Tab::Peers => self.peers.table.escape(),
         }
     }
 
@@ -1235,6 +1287,7 @@ impl PanelState for WifiPanel {
             (TABLE, &self.table),
             (HEARD, &self.heard_table),
             (crate::wifi_clients::TABLE, &self.clients.table),
+            (crate::wifi_peers::TABLE, &self.peers.table),
         ]
     }
 
@@ -1243,6 +1296,7 @@ impl PanelState for WifiPanel {
             (TABLE, &mut self.table),
             (HEARD, &mut self.heard_table),
             (crate::wifi_clients::TABLE, &mut self.clients.table),
+            (crate::wifi_peers::TABLE, &mut self.peers.table),
         ]
     }
 }
@@ -1255,6 +1309,7 @@ pub(crate) fn help_keys() -> Vec<&'static str> {
         .iter()
         .chain(&crate::wifi_scan::COLUMNS)
         .chain(&crate::wifi_clients::COLUMNS)
+        .chain(&crate::wifi_peers::COLUMNS)
         .map(|c| c.help)
         .chain(FIELDS.iter().map(|f| f.help))
         .filter(|k| !k.is_empty())

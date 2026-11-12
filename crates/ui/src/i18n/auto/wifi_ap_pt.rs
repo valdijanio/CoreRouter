@@ -50,6 +50,7 @@ Estação ignora este campo."##,
         "interface.wifi.mode",
         r##"## Modo
 - **station**: o roteador entra na rede de alguém (uplink, gerência).
+- **station-bridge** (G1.30m): um cliente com quadros de quatro endereços, o enlace entre dois roteadores: pode ser porta de bridge ou membro de bonding. Só WPA3.
 - **ap**: o roteador anuncia a rede e os clientes entram nela. Ponha numa bridge para dar a LAN aos clientes, ou dê um endereço e um servidor DHCP para roteá-los.
 
 O rádio faz um de cada vez. Trocar o modo do rádio por onde esta conexão chega pede Safe Mode (ou force)."##,

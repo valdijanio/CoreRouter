@@ -736,6 +736,11 @@ impl LabWifi {
             || air.aps.get(name).is_some_and(crate::lab_wifi_ap::LabAp::up)
     }
 
+    /// G1.30a: the radios that have been access points.
+    pub(crate) fn ap_radios(&self) -> Vec<IfName> {
+        self.air().aps.keys().cloned().collect()
+    }
+
     /// G1.30a: the radio's access point, made if it is not there.
     pub(crate) fn with_ap<R>(
         &self,
@@ -756,6 +761,11 @@ impl LabWifi {
             air: self.clone(),
             name: name.clone(),
         }))
+    }
+
+    /// G1.30m: the network radio `name` was last told to join (a test's).
+    pub fn wanted(&self, name: &IfName) -> Option<WifiNetwork> {
+        self.air().radios.get(name).and_then(|r| r.want.clone())
     }
 
     /// Times radio `name` was told to join (a test's: no rejoin on a tick).
@@ -1048,6 +1058,8 @@ mod tests {
             hidden: false,
             band_mhz: None,
             bssid: None,
+            four_addr: None,
+            bridge: None,
         }
     }
 

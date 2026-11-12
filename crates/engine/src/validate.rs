@@ -316,6 +316,23 @@ fn interface_checks(cfg: &Config) -> Vec<Issue> {
             }
         }
         os_loopback_checks(name, iface, &mut out);
+        // G1.30m: a peer belongs to an access point.
+        if let InterfaceKind::WifiPeer(p) = &iface.kind {
+            let ap = matches!(
+                cfg.interfaces.get(&p.radio).map(|r| &r.kind),
+                Some(InterfaceKind::Wifi(w)) if w.mode == corerouter_model::wifi::WifiMode::Ap
+            );
+            if !ap {
+                out.push(Issue::new(
+                    format!("interfaces.{name}.kind.radio"),
+                    format!(
+                        "peer {name} belongs to '{}', which is not an access point: set it back to \
+                         mode=ap, or remove the peer (interface.wifi.peer.remove)",
+                        p.radio
+                    ),
+                ));
+            }
+        }
         // G1.30: a radio on needs the country; its network, if it has
         // one, a name that can be one and its passphrase.
         if let InterfaceKind::Wifi(st) = &iface.kind {
