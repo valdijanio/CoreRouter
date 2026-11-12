@@ -272,7 +272,7 @@ impl Sysctl {
             let Some(now) = self.root.sysctl(name) else {
                 continue;
             };
-            if now == *value {
+            if corerouter_model::tuning::default_holds(name, *value, now) {
                 self.refused.remove(name);
                 continue;
             }
@@ -280,7 +280,8 @@ impl Sysctl {
                 Ok(()) => {
                     self.refused.remove(name);
                     log::info!(
-                        "tuning: {name} = {value} (CoreRouter's default: a router forwards)"
+                        "tuning: {name} = {value} (CoreRouter's default: {})",
+                        corerouter_model::tuning::default_reason(name)
                     );
                 }
                 Err(e) => {
@@ -534,6 +535,35 @@ mod tests {
             s.transition(&to, &to).unwrap();
             assert_eq!(s.refused.len(), 1, "said once");
         }
+    }
+
+    /// G3.4m: the multicast group limits are raised to CoreRouter's
+    /// floor, a bigger value stays, and the operator's own value wins.
+    #[test]
+    fn keeps_the_multicast_floors() {
+        use corerouter_model::tuning::{IGMP_MAX_MEMBERSHIPS, OPTMEM_MAX, default_of};
+        let (_s, r) = scratch("floors");
+        let igmp = r.proc.join("sys/net/ipv4/igmp_max_memberships");
+        let optmem = r.proc.join("sys/net/core/optmem_max");
+        put(&igmp, "20\n");
+        put(&optmem, "131072\n");
+        let mut s = Sysctl::new(r.clone());
+        let none = BTreeMap::new();
+        s.transition(&none, &none).unwrap();
+        assert_eq!(r.sysctl(IGMP_MAX_MEMBERSHIPS), default_of(IGMP_MAX_MEMBERSHIPS));
+        assert_eq!(r.sysctl(OPTMEM_MAX), Some(1 << 20));
+        // Bigger than the floor: left alone.
+        put(&igmp, "100000\n");
+        s.transition(&none, &none).unwrap();
+        assert_eq!(r.sysctl(IGMP_MAX_MEMBERSHIPS), Some(100_000));
+        // The operator's value, even below the floor, wins; taken out, the
+        // floor comes back.
+        let mut low = BTreeMap::new();
+        low.insert(IGMP_MAX_MEMBERSHIPS.to_owned(), 64);
+        s.transition(&none, &low).unwrap();
+        assert_eq!(r.sysctl(IGMP_MAX_MEMBERSHIPS), Some(64));
+        s.transition(&low, &none).unwrap();
+        assert_eq!(r.sysctl(IGMP_MAX_MEMBERSHIPS), default_of(IGMP_MAX_MEMBERSHIPS));
     }
 
     #[test]

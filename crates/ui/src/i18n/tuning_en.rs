@@ -202,6 +202,24 @@ Rarely: 4096 is the kernel's default since 5.4.
 It does not affect forwarded traffic."##,
     ),
     (
+        "tuning.net.ipv4.igmp_max_memberships",
+        r##"## What it does
+How many multicast groups one socket of the router may join. **Control plane only.**
+## Why CoreRouter raises it
+OSPF joins one group per interface (two where it is DR) through a single socket. With the kernel's 20, the 21st OSPF interface gets no adjacency. CoreRouter keeps at least 16384 unless you set it.
+## Careful
+A ceiling: memory is used only by the groups actually joined."##,
+    ),
+    (
+        "tuning.net.core.optmem_max",
+        r##"## What it does
+The most option memory one socket may hold: multicast groups (48 B each), filters, ancillary data. **Control plane only.**
+## Why CoreRouter raises it
+With 128 KiB, one OSPF socket fits about 2700 groups: thousands of OSPF interfaces need more. CoreRouter keeps at least 1 MiB unless you set it.
+## Careful
+A ceiling per socket, not memory taken."##,
+    ),
+    (
         "tuning.net.core.wmem_max",
         r##"## What it does
 The largest send buffer a socket of the router itself may ask for. **Control plane only**: forwarded packets never touch socket buffers.

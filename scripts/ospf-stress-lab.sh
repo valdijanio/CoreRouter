@@ -300,6 +300,13 @@ cli_mcp() {
 
 # --- FRR's own view (vtysh on the DUT's vty sockets), local DUT only.
 vty() { vtysh --vty_socket "$W/dut/run/frr" -c "$1" 2>/dev/null; }
+# Active OSPF interfaces that did not join AllSPFRouters (ospfd could not:
+# the socket's multicast limits, docs/ospf-stress.md), local DUT.
+dut_mcast_missing() {
+	vty 'show ip ospf interface json' | jq '[.interfaces | to_entries[] | .value |
+		select(.ospfEnabled == true and (.timerPassiveIface // false) != true and .mcastMemberOspfAllRouters != true)] | length'
+}
+mcast_errors() { grep -c 'IP_ADD_MEMBERSHIP' "$W/dut/frr-ospfd.log" 2>/dev/null || true; }
 
 # --- The generator: BNG Blaster in crgen.
 gen_ns_up() {
@@ -995,7 +1002,9 @@ test_neighbors() {
 		if t_full=$(wait_for "$n neighbors Full" 600 ge "$((n + 1))" dut_neighbors_full); then
 			t_full=$(since "$t0")
 		else
-			t_full=- verdict="FAIL (only $(dut_neighbors_full) of $((n + 1)) Full)"
+			t_full=- verdict="FAIL (only $(dut_neighbors_full) of $((n + 1)) Full"
+			[ $DUT = local ] && verdict+="; $(dut_mcast_missing) interfaces without the OSPF multicast group, ospfd: $(mcast_errors) IP_ADD_MEMBERSHIP errors"
+			verdict+=")"
 			[ $DUT = local ] && vty 'show ip ospf neighbor' | grep -v Full | head -n 20 >&2
 			if [ "$HOLD" -gt 0 ]; then
 				log "neighbors $n: holding for $HOLD s with the failure up"
@@ -1038,15 +1047,17 @@ test_neighbors() {
 # answer to `show ip ospf interface json` (which the daemon reads every
 # 2 s) and the daemon's CPU while it keeps reading.
 IFACES=${IFACES:-1000,4000}
-interfaces_steps() { # add|remove <n>: like neighbors_steps, the template passive
+interfaces_steps() { # add|remove <n>: like neighbors_steps, default hello (10 s)
 	neighbors_steps "$1" "$2" | jq -c '.steps |= map(if .command == "routing.ospf.interface-template.add"
-		then .params.passive = true | .params.comment = "ospf-stress ifaces" else . end)'
+		then .params |= (del(.hello_interval, .dead_interval) | .comment = "ospf-stress ifaces") else . end)'
 }
 test_interfaces() {
-	say "## 3b. Many OSPF interfaces (passive VLANs on $DUT_IFACE, no neighbors)"
+	say "## 3b. Many OSPF interfaces (VLANs on $DUT_IFACE, point-to-point, hello 10 s, no neighbor)"
 	say ""
-	say "| interfaces | commit (s) | in ospfd | \`show ip ospf interface json\` p50/max (ms) | its size (KiB) | \`routing.ospf.interface.list\` p50/max (ms) | daemon CPU idle avg/max (%) | ospfd CPU avg/max | removal (s) | result |"
-	say "|---|---|---|---|---|---|---|---|---|---|"
+	say "Each active OSPF interface must join AllSPFRouters (224.0.0.5) on ospfd's one socket; \"no group\" counts the ones that could not."
+	say ""
+	say "| interfaces | commit (s) | in ospfd | no group | \`show ip ospf interface json\` p50/max (ms) | its size (KiB) | \`routing.ospf.interface.list\` p50/max (ms) | daemon CPU idle avg/max (%) | ospfd CPU avg/max | removal (s) | result |"
+	say "|---|---|---|---|---|---|---|---|---|---|---|"
 	local n
 	for n in ${IFACES//,/ }; do
 		local t0 t_commit verdict=ok csv=$OUT/ifaces-$n.csv
@@ -1079,7 +1090,12 @@ test_interfaces() {
 			cr routing.ospf.interface.list "{\"instance\":\"$INSTANCE\"}" >/dev/null 2>&1 || true
 			since "$t0" >>"$f2"
 		done
-		[ $DUT = local ] && size=$(($(stat -c %s "$W/ifaces.json") / 1024))
+		local nogroup=-
+		if [ $DUT = local ]; then
+			size=$(($(stat -c %s "$W/ifaces.json") / 1024))
+			nogroup=$(dut_mcast_missing)
+			[ "$nogroup" -gt 0 ] && verdict="FAIL ($nogroup interfaces without the OSPF multicast group; ospfd: $(mcast_errors) IP_ADD_MEMBERSHIP errors)"
+		fi
 		# The daemon reading with nothing else going on: 30 s.
 		sampler_start "$csv"
 		sleep 30
@@ -1099,7 +1115,7 @@ test_interfaces() {
 		local vp="-"
 		[ -s "$f" ] && vp="$(pct "$f" 50)/$(pct "$f" 100)"
 		[ "$verdict" = ok ] || FAILED=1
-		say "| $n | $(ms2s "$t_commit") | $inospf | $vp | $size | $(pct "$f2" 50)/$(pct "$f2" 100) | $(csv_avg "$csv" daemon_cpu)/$(csv_max "$csv" daemon_cpu) | $(csv_avg "$csv" ospfd_cpu)/$(csv_max "$csv" ospfd_cpu) | $(ms2s "$t_rm") | $verdict |"
+		say "| $n | $(ms2s "$t_commit") | $inospf | $nogroup | $vp | $size | $(pct "$f2" 50)/$(pct "$f2" 100) | $(csv_avg "$csv" daemon_cpu)/$(csv_max "$csv" daemon_cpu) | $(csv_avg "$csv" ospfd_cpu)/$(csv_max "$csv" ospfd_cpu) | $(ms2s "$t_rm") | $verdict |"
 		[ "$verdict" = ok ] || break
 	done
 	say ""
@@ -1511,7 +1527,10 @@ dut_config
 say "# OSPF stress ($(date -u +%FT%TZ), DUT $DUT${TARGET:+ $TARGET}, daemon $DAEMON)"
 say ""
 say "$(cr system.resource.print | jq -r '"DUT: \(.board_name // "?"), \(.cpu_model // "?"), \(.cpu_count) CPU, \(.total_memory / 1048576 | floor) MiB, CoreRouter \(.version)"')"
-[ $DUT = local ] && say "FRR: $(vty 'show version' | head -n 1)"
+if [ $DUT = local ]; then
+	say "FRR: $(vty 'show version' | head -n 1)"
+	say "DUT kernel limits: net.ipv4.igmp_max_memberships $(ip netns exec crdut cat /proc/sys/net/ipv4/igmp_max_memberships), net.core.optmem_max $(ip netns exec crdut cat /proc/sys/net/core/optmem_max)"
+fi
 say ""
 
 has_test lsdb && test_lsdb
