@@ -444,10 +444,10 @@ mod tests {
         .unwrap();
         let p = json!({"interface": "ether1", "group": ["vlan"]});
         let g = group(&p).unwrap();
-        let (_, devs) = devices(&s, &p, g.vlan).unwrap();
+        let (_, devs) = devices(&mut s, &p, g.vlan).unwrap();
         assert_eq!(devs.len(), 2);
         assert_eq!(devs[1].vlan, Some(100));
-        let (_, devs) = devices(&s, &json!({"interface": "vlan100"}), false).unwrap();
+        let (_, devs) = devices(&mut s, &json!({"interface": "vlan100"}), false).unwrap();
         assert_eq!((devs.len(), devs[0].vlan), (1, Some(100)));
     }
 
