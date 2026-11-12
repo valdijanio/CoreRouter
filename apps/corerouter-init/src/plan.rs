@@ -832,8 +832,14 @@ mod tests {
     #[test]
     fn open_files_are_raised_never_lowered() {
         // The kernel's default for PID 1.
-        assert_eq!(nofile_limits(Some(1024), Some(4096)), (Some(NOFILE), Some(NOFILE)));
-        assert_eq!(nofile_limits(Some(100_000), Some(200_000)), (Some(100_000), Some(200_000)));
+        assert_eq!(
+            nofile_limits(Some(1024), Some(4096)),
+            (Some(NOFILE), Some(NOFILE))
+        );
+        assert_eq!(
+            nofile_limits(Some(100_000), Some(200_000)),
+            (Some(100_000), Some(200_000))
+        );
         assert_eq!(nofile_limits(Some(1024), None), (Some(NOFILE), None));
         assert_eq!(nofile_limits(None, None), (None, None));
     }

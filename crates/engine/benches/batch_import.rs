@@ -72,8 +72,10 @@ fn vlans_add(n: usize) -> Value {
             "address": format!("10.100.{}.{}/30", (i - 1) / 64, ((i - 1) % 64) * 4 + 1),
             "interface": format!("crs{vid}")}}));
     }
-    steps.push(json!({"command": "routing.ospf.interface-template.add", "params": {
-        "area": "bb", "networks": ["10.100.0.0/16"], "type": "ptp"}}));
+    steps.push(
+        json!({"command": "routing.ospf.interface-template.add", "params": {
+        "area": "bb", "networks": ["10.100.0.0/16"], "type": "ptp"}}),
+    );
     Value::Array(steps)
 }
 
@@ -87,7 +89,9 @@ fn vlans_remove(s: &mut Session, n: usize) -> Value {
         .map(|a| json!({"command": "ip.address.remove", "params": {"id": a["id"]}}))
         .collect();
     for i in 1..=n {
-        steps.push(json!({"command": "interface.remove", "params": {"name": format!("crs{}", 10 + i)}}));
+        steps.push(
+            json!({"command": "interface.remove", "params": {"name": format!("crs{}", 10 + i)}}),
+        );
     }
     Value::Array(steps)
 }
@@ -102,7 +106,10 @@ fn bench(c: &mut Criterion) {
         let rm = vlans_remove(&mut s, n);
         let t = std::time::Instant::now();
         s.batch(&rm, true).unwrap();
-        line.push_str(&format!(" {n}: add {add:.2} s, remove {:.2} s;", t.elapsed().as_secs_f64()));
+        line.push_str(&format!(
+            " {n}: add {add:.2} s, remove {:.2} s;",
+            t.elapsed().as_secs_f64()
+        ));
     }
     eprintln!("batch_import: VLANs with an address and OSPF:{line}");
     // G4.3g: 100 000 secrets in batches of 10 000 (the batch limit) on one

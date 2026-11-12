@@ -550,7 +550,10 @@ mod tests {
         let mut s = Sysctl::new(r.clone());
         let none = BTreeMap::new();
         s.transition(&none, &none).unwrap();
-        assert_eq!(r.sysctl(IGMP_MAX_MEMBERSHIPS), default_of(IGMP_MAX_MEMBERSHIPS));
+        assert_eq!(
+            r.sysctl(IGMP_MAX_MEMBERSHIPS),
+            default_of(IGMP_MAX_MEMBERSHIPS)
+        );
         assert_eq!(r.sysctl(OPTMEM_MAX), Some(1 << 20));
         // Bigger than the floor: left alone.
         put(&igmp, "100000\n");
@@ -563,7 +566,10 @@ mod tests {
         s.transition(&none, &low).unwrap();
         assert_eq!(r.sysctl(IGMP_MAX_MEMBERSHIPS), Some(64));
         s.transition(&low, &none).unwrap();
-        assert_eq!(r.sysctl(IGMP_MAX_MEMBERSHIPS), default_of(IGMP_MAX_MEMBERSHIPS));
+        assert_eq!(
+            r.sysctl(IGMP_MAX_MEMBERSHIPS),
+            default_of(IGMP_MAX_MEMBERSHIPS)
+        );
     }
 
     #[test]
