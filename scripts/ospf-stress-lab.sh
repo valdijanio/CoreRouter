@@ -831,6 +831,7 @@ lsdb_load() {
 # 1.2 s: an LSA changed again in less than MinLSArrival (1 s, RFC 2328
 # §13 (5a)) would be dropped by the receiver, so k = rate × 1.2.
 CHURN_PERIOD_MS=1200
+PROBE_WINDOW_MS=20000
 churn_prepare() { # <kind> <k> → dir
 	local kind=$1 k=$2 d=$W/churn/$1-$2
 	rm -rf "$d"
@@ -893,14 +894,30 @@ churn_run() {
 		fi
 		churn_tick "$d" "$kind" "$m"
 		if [ $((i % 5)) = 4 ]; then
-			local lag_cr=- lag_z=- lag_l=- c
-			while [ $(($(now) - t_tick)) -lt 10000 ]; do
+			# CoreRouter's view is right when it shows what zebra shows now
+			# (local; the cost of an intra-area route, the type-2 cost of an
+			# external one) or, remote, the tick's metric (external) or any
+			# change (router). Its OSPF database is reread on demand, at
+			# most every FRESH_SECS (10 s) + the 2 s tick (G3.4n): 20 s.
+			local lag_cr=- lag_z=- lag_l=- c z=""
+			while [ $(($(now) - t_tick)) -lt "$PROBE_WINDOW_MS" ]; do
 				if [ "$lag_l" = - ] && [ $DUT = local ] && [ "$(seq_lsdb)" != "$sq" ]; then lag_l=$(since "$t_tick"); fi
-				if [ "$lag_z" = - ] && [ $DUT = local ] && [ "$(cost_zebra)" != "$zb" ]; then lag_z=$(since "$t_tick"); fi
+				if [ "$lag_z" = - ] && [ $DUT = local ]; then
+					z=$(cost_zebra)
+					[ "$z" != "$zb" ] && lag_z=$(since "$t_tick")
+				fi
 				c=$(cost_cr)
-				if [ "$lag_cr" = - ] && [ "$c" != "$before" ]; then lag_cr=$(since "$t_tick"); fi
+				if [ "$lag_cr" = - ]; then
+					if [ $DUT = local ]; then
+						[ "$lag_z" != - ] && { [ "${c%/*}" = "$z" ] || [ "${c#*/}" = "$z" ]; } && lag_cr=$(since "$t_tick")
+					elif [ "$kind" = external ]; then
+						[ "${c#*/}" = "$m" ] && lag_cr=$(since "$t_tick")
+					else
+						[ "$c" != "$before" ] && lag_cr=$(since "$t_tick")
+					fi
+				fi
 				[ "$lag_cr" != - ] && { [ $DUT = remote ] || [ "$lag_z" != - ]; } && break
-				sleep 0.1
+				sleep 0.2
 			done
 			echo "$i $m $lag_z $lag_cr $lag_l" >>"$lags"
 		fi
@@ -912,11 +929,11 @@ churn_run() {
 }
 
 test_churn() {
-	say "## 2. Churn (base LSDB $CHURN_BASE LSAs, ${CHURN_SECS} s per rate, one tick every ${CHURN_PERIOD_MS} ms)"
+	say "## 2. Churn (base LSDB $CHURN_BASE LSAs, ${CHURN_SECS} s per rate)"
 	say ""
-	say "Lag: from the tick (lspgen hands the LSAs to BNG Blaster) to the new LSA in the DUT's LSDB, the new cost in zebra, and in CoreRouter's \`routing.ospf.route.list\`; every 5th tick."
+	say "Lag: from the tick (lspgen starts; it takes ~3 s to hand the LSAs to BNG Blaster and close) to the new LSA in the DUT's LSDB, the new cost in zebra, and the same cost in CoreRouter's \`routing.ospf.route.list\`; every 5th tick, with no other tick until it is seen (or 20 s). The rate counts the ticks actually sent."
 	say ""
-	say "| kind | LSAs/s | probe | ticks | ospfd CPU avg/max (%) | zebra CPU | daemon CPU | SPF runs | lag LSDB p50/max (ms) | lag zebra p50/max | lag CoreRouter p50/max | stale probes (> 10 s) | Full kept | result |"
+	say "| kind | LSAs/s | probe | ticks | ospfd CPU avg/max (%) | zebra CPU | daemon CPU | SPF runs | lag LSDB p50/max (ms) | lag zebra p50/max | lag CoreRouter p50/max | stale probes (> 20 s) | Full kept | result |"
 	say "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
 	dut_fresh churn
 	if ! lsdb_load "$CHURN_BASE"; then
@@ -924,11 +941,21 @@ test_churn() {
 		gen_stop
 		return
 	fi
+	# One tick of lspgen takes ~3 s (it waits before it closes the
+	# socket): the period is that, and k = rate × period LSAs per tick.
+	local d0 t0
+	d0=$(churn_prepare external 1)
+	t0=$(now)
+	churn_tick "$d0" external 100
+	CHURN_PERIOD_MS=$(($(since "$t0") + 100))
+	(cd "$d0" && lspgen -r tick.json -S "$BBL_SOCK" -I 1 -Q -G >/dev/null 2>&1) || true
+	[ "$CHURN_PERIOD_MS" -lt 1200 ] && CHURN_PERIOD_MS=1200
+	log "churn: one tick takes $CHURN_PERIOD_MS ms"
 	local kind rate
 	for kind in external router; do
 		for rate in ${CHURN_RATES//,/ }; do
 			local k=$(((rate * CHURN_PERIOD_MS + 999) / 1000)) d csv=$OUT/churn-$kind-$rate.csv lags=$OUT/churn-$kind-$rate-lag.txt
-			[ "$kind" = router ] && [ "$k" -gt 50 ] && k=50
+			[ "$kind" = router ] && [ "$k" -gt 400 ] && k=400
 			d=$(churn_prepare "$kind" "$k")
 			churn_probe "$d" "$kind"
 			: >"$lags"
@@ -967,7 +994,7 @@ test_churn() {
 			# Out with the extra node: its LSAs purged (MaxAge).
 			(cd "$d" && lspgen -r tick.json -S "$BBL_SOCK" -I 1 -Q -G >>lspgen-ticks.log 2>&1) || true
 			[ "$verdict" = ok ] || FAILED=1
-			say "| $kind | $(awk -v k=$k -v p=$CHURN_PERIOD_MS 'BEGIN {printf "%.1f", k * 1000 / p}') | $PROBE | $ticks | $(csv_avg "$csv" ospfd_cpu)/$(csv_max "$csv" ospfd_cpu) | $(csv_avg "$csv" zebra_cpu)/$(csv_max "$csv" zebra_cpu) | $(csv_avg "$csv" daemon_cpu)/$(csv_max "$csv" daemon_cpu) | ${spf0%% *} → ${spf%% *} | $ll | $lz | $lc | $stale | $full | $verdict |"
+			say "| $kind | $(awk -v k=$k -v t="$ticks" -v s="$CHURN_SECS" 'BEGIN {printf "%.1f", k * t / s}') | $PROBE | $ticks | $(csv_avg "$csv" ospfd_cpu)/$(csv_max "$csv" ospfd_cpu) | $(csv_avg "$csv" zebra_cpu)/$(csv_max "$csv" zebra_cpu) | $(csv_avg "$csv" daemon_cpu)/$(csv_max "$csv" daemon_cpu) | ${spf0%% *} → ${spf%% *} | $ll | $lz | $lc | $stale | $full | $verdict |"
 		done
 	done
 	gen_stop
