@@ -1135,7 +1135,8 @@ test_interfaces() {
 		if [ "${PERF:-0}" = 1 ] && [ $DUT = local ]; then
 			local perf=/usr/lib/linux-tools-6.8.0-147/perf
 			[ -x "$perf" ] || perf=perf
-			"$perf" record -F 499 -g -p "$(dut_pid corerouter-daemon)" -o "$OUT/perf-removal-$n.data" >/dev/null 2>&1 &
+			# PERF_PROC: whose (corerouter-daemon by default; ospfd, zebra).
+			"$perf" record -F 499 -g -p "$(dut_pid "${PERF_PROC:-corerouter-daemon}")" -o "$OUT/perf-removal-$n.data" >/dev/null 2>&1 &
 			perfpid=$!
 			sleep 0.5
 		fi
@@ -1156,7 +1157,7 @@ test_interfaces() {
 		if [ -n "$perfpid" ]; then
 			kill -INT "$perfpid" 2>/dev/null
 			wait "$perfpid" 2>/dev/null || true
-			"${perf:-perf}" report -i "$OUT/perf-removal-$n.data" --stdio --no-children --sort comm,dso,symbol \
+			"${perf:-perf}" report -i "$OUT/perf-removal-$n.data" --stdio --no-children --sort comm,dso,symbol -g none \
 				--percent-limit 1 2>/dev/null | grep -v '^$' | head -n 120 >"$OUT/perf-removal-$n.txt" || true
 			log "perf: $OUT/perf-removal-$n.txt"
 			head -n 60 "$OUT/perf-removal-$n.txt" >&2
