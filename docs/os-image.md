@@ -910,7 +910,7 @@ todos os núcleos** em hardware comum, e para um defeito deixar rastro. Tudo aba
 | | `XEN`, `XEN_PVHVM_GUEST`, `XEN_BLKDEV_FRONTEND`, `XEN_NETDEV_FRONTEND` | Xen HVM (XCP-ng, XenServer) com disco e placa paravirtuais: o kernel não achava a raiz |
 | | `PARAVIRT_SPINLOCKS`, `VMGENID` | vCPU disputada; VM clonada ou voltando de snapshot repetia o estado do gerador aleatório |
 | Diagnóstico | `SOFTLOCKUP_DETECTOR`, `HARDLOCKUP_DETECTOR` (modo vizinho), `DETECT_HUNG_TASK` | Um travamento do kernel não deixava linha no log |
-| | `PSTORE`, `EFI_VARS_PSTORE` desligado por padrão, `ACPI_APEI` (ERST) | O motivo de um pânico se perdia no reboot (`panic=10`) |
+| | `PSTORE`, `EFI_VARS_PSTORE` (ligado por padrão desde a G1.6zx), `ACPI_APEI` (ERST) | O motivo de um pânico se perdia no reboot (`panic=10`) |
 | | `PCIEAER`, `PCIE_DPC`, `ACPI_APEI_GHES`, `EDAC` (AMD64, SKX, I10NM, SBRIDGE, IE31200) | Erro de PCIe e de memória ECC sem registro; não dava para saber qual pente trocar |
 
 **Decisões, com o motivo.**
@@ -947,7 +947,8 @@ todos os núcleos** em hardware comum, e para um defeito deixar rastro. Tudo aba
   o firmware de servidor tem para isso. O meio EFI fica compilado e desligado
   (`EFI_VARS_PSTORE_DEFAULT_DISABLE`; liga com `efi_pstore.pstore_disable=0`): cada pânico grava
   variáveis na mesma NVRAM em que o atualizador A/B grava `Boot####`, e ninguém as apaga ainda.
-  Mostrar o registro no log do roteador e apagá-lo é a G1.6zx.
+  Mostrar o registro no log do roteador e apagá-lo é a G1.6zx (que ligou o meio EFI por padrão:
+  seção seguinte).
 - **EDAC só onde o driver fica calado sem ECC.** `igen6` (SoCs cliente) e `pnd2` (Apollo Lake)
   escrevem uma linha de nível erro numa máquina sem ECC (`igen6_edac.c:1107`, `pnd2_edac.c:1555`),
   que apareceria em todo boot `quiet` de um mini-PC. Ficam para a G1.6zy, junto com
@@ -1010,6 +1011,101 @@ da imagem e no da ISO, e `NR_CPUS=8192` (o `MAXSMP` cai em silêncio sem `DEBUG_
 `boot-test` confere que o roteador usa todas as CPUs da VM, e `boot-test --smp N` dá N CPUs à
 máquina (acima de 255, com IOMMU e sem o atalho que só VM tem); o `install-test` instala num
 cartão SD numa controladora SDHCI e dá boot por ele.
+
+### Registro de pânico e de travamento no boot seguinte (G1.6zx)
+
+No notebook, um slot B que "não subiu" voltou para o A sem deixar rastro: o kernel do B entrou em
+pânico, o `panic=10` reiniciou e o fim do log se perdeu. Agora o pânico fica registrado e o boot
+seguinte diz o que foi, em que boot e em que slot.
+
+**Como funciona.**
+
+1. **Kernel.** No pânico (e no oops) o kernel entrega o fim do log ao pstore
+   (`fs/pstore/platform.c`, `pstore_dump`), que grava no ERST do firmware de servidor ou, numa
+   máquina UEFI, em variáveis UEFI (`efi_pstore`). O meio EFI passou a ligar por padrão
+   (`# CONFIG_EFI_VARS_PSTORE_DEFAULT_DISABLE is not set`): é ele que pega o pânico de um kernel
+   que nem chegou ao PID 1, o caso do notebook.
+2. **PID 1** monta `/sys/fs/pstore` (só se o kernel tem o pstore: o do instalador não tem) e,
+   numa máquina real, liga `kernel.softlockup_panic` e `kernel.hardlockup_panic` (abaixo).
+3. **Daemon, serviço `crash-log`** (`apps/corerouter-daemon/src/service/crash_log.rs`), uma vez
+   no boot: lê os registros (até 256 arquivos de 64 KiB), junta as partes de cada dump (a parte 1
+   é o texto mais novo), grava cada dump em `/config/crash/<hora>-<motivo>-<id>.json` (arquivo
+   temporário, `fsync`, `rename`, `fsync` da pasta), **só então** apaga o registro (apagar o
+   arquivo do pstore apaga a variável) e guarda os 8 mais novos. Gravar falhou: o registro fica no
+   firmware e o problema vai para o log.
+4. **Log do roteador**: uma linha `system,critical` e o rastro em `system,error` (até 24 linhas a
+   partir da que diz o que houve), como a RouterOS faz com "kernel failure in previous boot", mas
+   com a causa: `previous boot ended in a kernel panic (boot started 2026-11-12 03:36:01 UTC,
+   slot b (1.4.0), 41 s after start, at 2026-11-12 03:36:42 UTC, kernel 6.18.59, efi_pstore
+   record): Kernel panic - not syncing: …`.
+5. **`system.crash.print`** (`{lines?, limit?}`) lista os dumps guardados com o texto inteiro, a
+   hora, o tempo desde o boot, o slot e a versão, e o estado do armazenamento (`backend`,
+   `efi.free`). Verificação de saúde `kernel.crash`: aviso enquanto dura o boot que veio depois
+   de um pânico; `kernel.crash-store`: aviso quando a NVRAM está curta (abaixo).
+
+**O slot do dump.** O texto não basta: o dump de 10 KiB comprimidos guarda os ~26 KB finais do
+log, e num pânico a 0,8 s do boot ele já não chega à linha `Command line:` (**medido**: a parte
+16, a mais velha, começa em 0,042 s). O slot sai então do estado do A/B
+(`corerouter_engine::crash_log::attribute`): um dump gravado antes da volta de um teste que falhou
+(`last.result = rolled-back`) é do slot testado, com a versão dele; qualquer outro é do slot que
+roda agora (um pânico reinicia no mesmo slot). Quando o texto chega à linha de comando, o
+`corerouter.slot=` dela vale.
+
+**O custo na NVRAM e a política** (**medido**, OVMF 2024.02 do Ubuntu, kernel 6.18.59 compilado
+fora da imagem com o `.config` dela, `kmsg_bytes` 10240, `echo c > /proc/sysrq-trigger`):
+
+| Medida | Valor |
+|---|---|
+| NVRAM do OVMF (`statfs` do efivarfs) | 256 KiB, 235 KiB livres |
+| Um pânico | 16 variáveis `dump-type0-<parte>-1-<hora>-C` de 487 a 841 B (comprimidas, deflate), ~1,65 KB de texto cada |
+| NVRAM livre depois do pânico | 219 KiB (**16 KiB por pânico**) |
+| NVRAM desta máquina de desenvolvimento (firmware de placa-mãe, Ubuntu com `efi_pstore` ligado) | 128 KiB, 77 KiB livres |
+
+O pstore conta os bytes **comprimidos** contra o `kmsg_bytes` (`total += record.size`), então um
+pânico custa ~16 KiB qualquer que seja o log. O risco é o de 2013 (notebooks Samsung que não davam
+boot com a NVRAM cheia de dumps; Arch FS#70140): ninguém apagava. A política:
+
+- o daemon apaga a cada boot o que o boot anterior gravou, depois de salvar (como o
+  `systemd-pstore` com `Unlink=yes`, padrão do Ubuntu);
+- depois de apagar, mede a NVRAM (`statfs` do efivarfs, que é o `QueryVariableInfo`,
+  `fs/efivarfs/super.c`) e, com menos de **41 KiB** livres (`EFI_MIN_FREE`: dois pânicos de
+  16 KiB, 4 KiB para as entradas `Boot####`, `BootOrder` e `BootNext` do A/B e os 5 KiB que o
+  Linux nunca usa, `EFI_MIN_RESERVE` de `arch/x86/platform/efi/quirks.c`), desliga o
+  `efi_pstore` naquele boot (`pstore_disable` aceita escrita em execução,
+  `drivers/firmware/efi/efi-pstore.c`), com aviso no log e na saúde; o boot seguinte mede de
+  novo;
+- a medida se repete a cada 60 s enquanto o meio está ligado: um oops grava um dump sem
+  reiniciar, e uma série deles no mesmo boot não pode tomar o lugar das entradas de boot;
+- a imagem live só lê: os registros são do sistema instalado.
+
+O que fica de fora: um surto de oops que grave mais de dois dumps dentro de 60 s ainda chega ao
+limite do kernel (5 KiB) antes da medida seguinte; com `kernel.panic_on_oops` (recomendado em
+todos os perfis do Tuning) o primeiro oops já reinicia. ramoops (RAM reservada) não foi adotado:
+num PC x86 a memória não sobrevive a um reset a frio e o endereço muda de máquina para máquina.
+
+**Pânico em travamento.** O detector da G1.6zi só escrevia o rastro. Numa máquina real o PID 1
+liga `kernel.softlockup_panic` (CPU presa no kernel por 20 s) e `kernel.hardlockup_panic` (presa
+com as interrupções desligadas por 10 s): o `panic=10` reinicia e o boot seguinte mostra o
+rastro. Em máquina virtual (flag `hypervisor` da CPU) fica desligado: o host pode parar uma vCPU
+por esse tempo. Um `softlockup_panic=`/`hardlockup_panic=` na linha de comando
+(`system.tuning.boot`) vale sobre o padrão; os dois aparecem no Tuning (aba Kernel, seção de
+estabilidade), recomendados em 1 numa máquina real e em 0 numa VM. `hung_task_panic` fica em 0:
+uma tarefa presa 120 s esperando um disco USB não é motivo para derrubar o encaminhamento.
+
+**OS Log.** Entradas novas no catálogo (`crates/engine/src/oslog_known.rs`): erro de PCIe (AER,
+DPC), erro de memória ECC (EDAC), falha dentro do kernel (oops, BUG), registro de pânico não
+gravado (pstore), e o travamento passou a reconhecer `detected stalls on CPUs` (RCU).
+
+**Conferido no QEMU** (`cargo xtask os ab-test --scenario crash` e `--scenario bad-param`, OVMF):
+o pânico de um teste de slot B que não sobe aparece no slot A com `slot b`; um pânico por sysrq
+é salvo, logado e apagado; com a NVRAM cheia por outro GUID até sobrarem 16 KiB, o daemon desliga
+o `efi_pstore` (aviso `kernel.crash-store`), um pânico não grava nada e a atualização A/B ainda
+grava as entradas de boot e sobe no B.
+
+**Não conferido**: ERST de servidor real (só o emulado da G1.6zi), firmware que não implementa
+`QueryVariableInfo` (o daemon então não desliga nada e fica o limite do kernel), NVRAM de
+notebook e placa reais (a do notebook Lenovo 83EU fica para a sessão principal), um travamento
+de CPU de verdade.
 
 ### Boot lento no handoff do USB (xHCI) (G1.6zq)
 
