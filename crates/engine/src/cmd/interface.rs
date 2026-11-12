@@ -586,7 +586,7 @@ fn port_add(s: &mut Session, p: &Value) -> Result<Value> {
                 ),
             ));
         }
-        InterfaceKind::Wifi(_) => {
+        InterfaceKind::Wifi(ref w) if w.mode == corerouter_model::wifi::WifiMode::Station => {
             return Err(EngineError::bad(
                 "interface",
                 format!("'{port}': {}", corerouter_model::wifi::NO_BRIDGE),

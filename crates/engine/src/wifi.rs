@@ -17,7 +17,7 @@ use corerouter_hal::wifi::{
     JoinSecurity, MAX_SPECTRAL_PENDING, WifiBss, WifiEvent, WifiFailure, WifiNetwork, WifiPort,
     WifiRadio, WifiState, WifiStatus, WifiSurvey,
 };
-use corerouter_model::wifi::{Country, WifiSecurity, WifiStation};
+use corerouter_model::wifi::{Country, WifiConfig, WifiMode, WifiSecurity};
 use corerouter_model::{Config, IfName, InterfaceKind};
 use serde_json::{Value, json};
 
@@ -56,7 +56,7 @@ struct Told {
     bssid: Option<String>,
 }
 
-fn told(st: &WifiStation) -> Told {
+fn told(st: &WifiConfig) -> Told {
     Told {
         ssid: st.ssid.clone(),
         security: st.security,
@@ -112,6 +112,8 @@ pub struct WifiRuntime {
     country_asked: Option<Option<Country>>,
     pub(crate) country_error: Option<String>,
     pub(crate) now_ms: u64,
+    /// G1.30a: the radios in access point mode.
+    pub(crate) aps: BTreeMap<IfName, crate::wifi_ap::ApRadio>,
 }
 
 impl WifiRuntime {
@@ -120,9 +122,9 @@ impl WifiRuntime {
     }
 }
 
-/// The Wi-Fi interfaces of `cfg`: name, off (disabled, or no country), and
-/// the network to be on.
-fn wanted(cfg: &Config) -> Vec<(IfName, bool, Option<WifiStation>)> {
+/// The Wi-Fi interfaces of `cfg`: name, off (disabled, or no country), the
+/// network to be on (or, G1.30a, to announce) and the mode.
+fn wanted(cfg: &Config) -> Vec<(IfName, bool, Option<WifiConfig>, WifiMode)> {
     let no_country = cfg.system.wifi.country.is_none();
     cfg.interfaces
         .values()
@@ -130,7 +132,7 @@ fn wanted(cfg: &Config) -> Vec<(IfName, bool, Option<WifiStation>)> {
             InterfaceKind::Wifi(st) => {
                 let off = i.disabled || no_country;
                 let net = (!off && !st.ssid.is_empty()).then(|| (**st).clone());
-                Some((i.name.clone(), off, net))
+                Some((i.name.clone(), off, net, st.mode))
             }
             _ => None,
         })
@@ -180,7 +182,7 @@ pub fn channel(mhz: u32) -> Option<u32> {
 }
 
 impl Session {
-    fn wifi_rt(&mut self) -> Option<&mut WifiRuntime> {
+    pub(crate) fn wifi_rt(&mut self) -> Option<&mut WifiRuntime> {
         self.ext_mut::<WifiRuntime>()
     }
 
@@ -196,7 +198,9 @@ impl Session {
         // G1.30j: an exclusive sniffer gives the radio back to its station.
         crate::cmd::wifi_sniffer::watch(self);
         let want = wanted(self.store().running());
-        let idle = self.wifi().is_none_or(|rt| rt.radios.is_empty());
+        let idle = self
+            .wifi()
+            .is_none_or(|rt| rt.radios.is_empty() && rt.aps.is_empty());
         if want.is_empty() && idle {
             return;
         }
@@ -210,7 +214,8 @@ impl Session {
             .map(|rt| {
                 rt.radios
                     .keys()
-                    .filter(|n| !want.iter().any(|(w, _, _)| w == *n))
+                    .chain(rt.aps.keys())
+                    .filter(|n| !want.iter().any(|(w, _, _, _)| w == *n))
                     .cloned()
                     .collect()
             })
@@ -221,9 +226,20 @@ impl Session {
             {
                 let _ = p.leave();
             }
+            self.wifi_ap_step(&name, None, now_ms);
         }
-        for (name, off, net) in want {
-            self.wifi_step(&name, off, net.as_ref(), now_ms);
+        for (name, off, net, mode) in want {
+            match mode {
+                WifiMode::Station => {
+                    self.wifi_ap_step(&name, None, now_ms);
+                    self.wifi_step(&name, off, net.as_ref(), now_ms);
+                }
+                // G1.30a: the station lets go of the radio first.
+                WifiMode::Ap => {
+                    self.wifi_step(&name, true, None, now_ms);
+                    self.wifi_ap_step(&name, net.as_ref(), now_ms);
+                }
+            }
         }
     }
 
@@ -257,7 +273,7 @@ impl Session {
         }
     }
 
-    fn wifi_step(&mut self, name: &IfName, off: bool, net: Option<&WifiStation>, now: u64) {
+    fn wifi_step(&mut self, name: &IfName, off: bool, net: Option<&WifiConfig>, now: u64) {
         let unix = self.now();
         let mut notes: Vec<(&'static str, String)> = Vec::new();
         // 1. A radio that is off has no port.
@@ -478,7 +494,7 @@ impl Session {
     }
 
     /// The network of `st` as the platform takes it, the passphrase opened.
-    fn wifi_network(&mut self, name: &IfName, st: &WifiStation) -> Result<WifiNetwork, String> {
+    fn wifi_network(&mut self, name: &IfName, st: &WifiConfig) -> Result<WifiNetwork, String> {
         let key = if st.security.keyed() {
             let k = crate::sealing::key(self)?;
             k.open(&st.passphrase).ok_or_else(|| {
@@ -501,7 +517,7 @@ impl Session {
         })
     }
 
-    fn wifi_notes(&mut self, name: &IfName, notes: Vec<(&'static str, String)>) {
+    pub(crate) fn wifi_notes(&mut self, name: &IfName, notes: Vec<(&'static str, String)>) {
         for (event, message) in notes {
             self.wifi_note(name, event, message);
         }

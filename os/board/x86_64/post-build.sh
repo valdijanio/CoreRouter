@@ -80,12 +80,13 @@ rm -f "$T"/usr/lib/libnl-route-3.so* "$T"/usr/lib/libnl-nf-3.so* \
 	"$T"/usr/lib/libnl-idiag-3.so* "$T"/usr/lib/libnl-xfrm-3.so*
 rm -rf "$T/etc/libnl" "$T/etc/ssl/misc"
 rm -f "$T"/etc/ssl/*.dist "$T/etc/ssl/ct_log_list.cnf"
-# G1.30: hostapd is a test's tool (the access point `cargo xtask os wifi-test`
-# puts in front of the image's station), not the image's: out of the root,
-# into the images directory, from where the test puts it on a disk of its own.
+# G1.30a: hostapd is the image's access point (the router in `mode=ap`,
+# driven through its control socket, no configuration file). A copy is also
+# the test's tool: the access point `cargo xtask os wifi-test` puts in front
+# of the image's station runs from a disk of its own, with its own file.
 if [ -f "$T/usr/sbin/hostapd" ]; then
 	mkdir -p "$BINARIES_DIR/test-tools"
-	mv "$T/usr/sbin/hostapd" "$BINARIES_DIR/test-tools/hostapd"
+	cp "$T/usr/sbin/hostapd" "$BINARIES_DIR/test-tools/hostapd"
 fi
 rm -f "$T/usr/bin/hostapd_cli" "$T/etc/hostapd.conf"
 # G1.6zr: pci.ids (hwdata) only for the PCI network cards the image's drivers

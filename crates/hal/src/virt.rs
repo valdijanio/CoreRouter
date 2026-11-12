@@ -1624,6 +1624,13 @@ impl Hal for VirtualHal {
         self.wifi.port(name)
     }
 
+    fn wifi_ap_port(
+        &mut self,
+        name: &IfName,
+    ) -> Result<Box<dyn crate::wifi_ap::WifiApPort>, HalError> {
+        self.wifi.ap_port(name)
+    }
+
     fn wifi_country(&mut self, country: Option<&str>) -> Result<(), HalError> {
         self.wifi.set_country(country);
         Ok(())

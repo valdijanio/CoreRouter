@@ -786,7 +786,9 @@ fn bridge_port_checks(
             other.label()
         )),
     }
-    if matches!(iface.kind, InterfaceKind::Wifi(_)) {
+    // G1.30a: an access point is a bridge port (hostapd puts it there); a
+    // station is not.
+    if matches!(&iface.kind, InterfaceKind::Wifi(w) if w.mode == corerouter_model::wifi::WifiMode::Station) {
         problems.push(format!("'{name}': {}", corerouter_model::wifi::NO_BRIDGE));
     }
     if matches!(

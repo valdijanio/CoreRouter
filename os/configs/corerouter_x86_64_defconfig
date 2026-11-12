@@ -60,9 +60,9 @@ BR2_PACKAGE_WPA_SUPPLICANT_NL80211=y
 BR2_PACKAGE_WPA_SUPPLICANT_WPA3=y
 BR2_PACKAGE_WPA_SUPPLICANT_CTRL_IFACE=y
 BR2_PACKAGE_WIRELESS_REGDB=y
-# hostapd is the access point of `cargo xtask os wifi-test`, built against the
-# image's libraries (libnl, OpenSSL) and kept OUT of the image: post-build.sh
-# moves it to images/test-tools/. The router as an access point is G1.30a.
+# G1.30a: hostapd is the router's access point (`interface.wifi.set mode=ap`),
+# built against the image's libraries (libnl, OpenSSL); post-build.sh also
+# copies it to images/test-tools/ for the access point of `os wifi-test`.
 BR2_PACKAGE_HOSTAPD=y
 BR2_PACKAGE_HOSTAPD_WPA3=y
 # BR2_PACKAGE_HOSTAPD_ACS is not set

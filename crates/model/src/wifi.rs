@@ -1,7 +1,8 @@
 //! `/interface wifi` (G1.30): a Wi-Fi radio in station mode, the router as a
-//! client of somebody's network (management, or an uplink). An interface of
-//! type `wifi` ([`crate::InterfaceKind::Wifi`]) exists because the card
-//! does, like an Ethernet port; what is stored here is the network it joins.
+//! client of somebody's network (management, or an uplink), or (G1.30a) an
+//! access point. An interface of type `wifi` ([`crate::InterfaceKind::Wifi`])
+//! exists because the card does, like an Ethernet port; what is stored here
+//! is the network it joins or announces.
 //! Names follow RouterOS v7's `/interface/wifi` (`mode`, `ssid`,
 //! `passphrase`, `country`); one network per interface, as there.
 //!
@@ -50,22 +51,34 @@ pub const NO_COUNTRY: &str = "a Wi-Fi interface cannot be enabled before the cou
                               decides the channels and the power the radio may use. Set it: \
                               interface.wifi.country.set country=BR (your country's two letters)";
 
-/// What the radio does. Only `station` for now (the AP is G1.30a); the
-/// field is here so that a config written today reads the same then.
+/// What the radio does (RouterOS 7 `configuration.mode`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WifiMode {
+    /// A client of somebody's network.
     #[default]
     Station,
+    /// G1.30a: announces a network that clients join.
+    Ap,
 }
 
 impl WifiMode {
+    pub const ALL: [Self; 2] = [Self::Station, Self::Ap];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Station => "station",
+            Self::Ap => "ap",
         }
     }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.as_str() == s)
+    }
 }
+
+/// G1.30a: the channel widths an access point may use, MHz.
+pub const AP_WIDTHS: [u32; 4] = [20, 40, 80, 160];
 
 /// How the station proves itself to the network.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,10 +164,13 @@ impl WifiBand {
     }
 }
 
-/// The settings of one Wi-Fi interface: `interface.wifi.set`.
+/// The settings of one Wi-Fi interface: `interface.wifi.set`. In station
+/// mode the network it joins; in access point mode (G1.30a) the network it
+/// announces, with `hidden` for a hidden SSID, `band` for the band of an
+/// automatic channel, and the channel itself.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct WifiStation {
+pub struct WifiConfig {
     #[serde(skip_serializing_if = "is_station")]
     pub mode: WifiMode,
     /// The network's name; empty: none chosen yet, the radio stays idle.
@@ -173,6 +189,16 @@ pub struct WifiStation {
     /// Only this access point (its BSSID).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bssid: Option<MacAddr>,
+    /// G1.30a, access point: the primary channel's centre, MHz; `None`:
+    /// chosen when it starts (the quietest channel of `band` the radio may
+    /// start a network on).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency: Option<u32>,
+    /// G1.30a, access point: the channel's width, MHz ([`AP_WIDTHS`]);
+    /// `None`: 20 MHz on 2.4 GHz, the widest up to 80 MHz the radio and
+    /// the country allow on 5 GHz.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
 }
 
 fn is_station(m: &WifiMode) -> bool {
@@ -313,14 +339,14 @@ mod tests {
         assert_eq!(serde_json::from_str::<Interface>(&text).unwrap(), idle);
         assert_eq!(idle.kind.label(), "wifi");
 
-        let st = WifiStation {
+        let st = WifiConfig {
             ssid: "Casa".into(),
             security: WifiSecurity::Wpa3,
             passphrase: Sealed::from_box("$cr1$abc".into()),
             hidden: true,
             band: Some(WifiBand::Band5),
             bssid: Some("d8:47:32:aa:bb:cc".parse().unwrap()),
-            ..WifiStation::default()
+            ..WifiConfig::default()
         };
         let i = Interface::new("wifi1".parse().unwrap(), InterfaceKind::Wifi(Box::new(st)));
         let text = serde_json::to_string(&i).unwrap();
@@ -338,6 +364,26 @@ mod tests {
         // A field this version does not know is refused, not dropped.
         let bad = text.replace(r#""hidden":true"#, r#""hiden":true"#);
         assert!(serde_json::from_str::<Interface>(&bad).is_err());
+    }
+
+    #[test]
+    fn an_access_point_round_trips() {
+        let st = WifiConfig {
+            mode: WifiMode::Ap,
+            ssid: "Loja".into(),
+            frequency: Some(5180),
+            width: Some(80),
+            ..WifiConfig::default()
+        };
+        let text = serde_json::to_string(&st).unwrap();
+        assert_eq!(text, r#"{"mode":"ap","ssid":"Loja","frequency":5180,"width":80}"#);
+        assert_eq!(serde_json::from_str::<WifiConfig>(&text).unwrap(), st);
+        // A station's config from before G1.30a reads the same.
+        let old: WifiConfig = serde_json::from_str(r#"{"ssid":"Casa"}"#).unwrap();
+        assert_eq!((old.mode, old.frequency, old.width), (WifiMode::Station, None, None));
+        for m in WifiMode::ALL {
+            assert_eq!(WifiMode::parse(m.as_str()), Some(m));
+        }
     }
 
     #[test]

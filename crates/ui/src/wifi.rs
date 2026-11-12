@@ -1,6 +1,7 @@
-//! Interfaces › Wi-Fi (G1.30), RouterOS `/interface wifi` in station mode:
-//! the router's radios and the network each one joins. The list window
-//! pattern (G0.24, `docs/ui-style.md`) with two tabs:
+//! Interfaces › Wi-Fi (G1.30), RouterOS `/interface wifi`: the router's
+//! radios and the network each one joins (station) or announces (G1.30a,
+//! access point). The list window pattern (G0.24, `docs/ui-style.md`) with
+//! three tabs:
 //!
 //! - **Radios:** one row per radio with its state chip (and why the last
 //!   attempt failed), the network by key colour, signal, channel and rate;
@@ -10,6 +11,8 @@
 //! - **Networks:** what the last scan of one radio heard, strongest first;
 //!   Connect… opens the radio's modal with the network filled in. G1.30i:
 //!   three views of it (list, channel graph, spectrum), `wifi_scan.rs`.
+//! - **Registration** (G1.30a): the clients of the access points,
+//!   `wifi_clients.rs`.
 //!
 //! The country every radio follows is on the first line, with its dialog.
 //! G1.30h: the same dialog opens from "Interface <wifi1>" and from Enable
@@ -62,12 +65,15 @@ pub(crate) const PANEL: Panel = Panel {
 };
 
 const FIELDS: &[Field] = &[
+    Field { param: "mode", label: "Mode", help: "interface.wifi.mode", input: Input::Choice, edit: true },
     Field { param: "ssid", label: "SSID", help: "interface.wifi.ssid", input: Input::Text("the network's name"), edit: true },
     Field { param: "security", label: "Security", help: "interface.wifi.security", input: Input::Choice, edit: true },
     Field { param: "passphrase", label: "Passphrase", help: "interface.wifi.passphrase", input: Input::Secret("8 to 63 characters"), edit: true },
     Field { param: "hidden", label: "Hidden Network", help: "interface.wifi.hidden", input: Input::Check, edit: true },
     Field { param: "band", label: "Band", help: "interface.wifi.band", input: Input::Choice, edit: true },
     Field { param: "bssid", label: "Lock to BSSID", help: "interface.wifi.bssid", input: Input::Text("any access point"), edit: true },
+    Field { param: "frequency", label: "Frequency", help: "interface.wifi.frequency", input: Input::Text("auto, a channel (36) or MHz"), edit: true },
+    Field { param: "width", label: "Width", help: "interface.wifi.width", input: Input::Choice, edit: true },
     Field { param: "mtu", label: "MTU", help: "interface.wifi.mtu", input: Input::Text("1500"), edit: true },
     Field { param: "comment", label: "Comment", help: "", input: Input::Text(""), edit: true },
     Field { param: "disabled", label: "Disabled", help: "interface.wifi.disabled", input: Input::Check, edit: true },
@@ -101,6 +107,8 @@ pub(crate) enum Tab {
     #[default]
     Radios,
     Networks,
+    /// G1.30a: the clients of the access points.
+    Registration,
 }
 
 /// The country dialog: one field, and the radios to enable after it.
@@ -226,6 +234,8 @@ pub(crate) struct WifiPanel {
     pub(crate) heard_table: TableState,
     /// G1.30i: the views of the Networks tab.
     pub(crate) scan: crate::wifi_scan::ScanView,
+    /// G1.30a: the Registration tab.
+    pub(crate) clients: crate::wifi_clients::ClientsView,
     help: Option<HelpView>,
 }
 
@@ -239,10 +249,10 @@ fn flag(r: &Value, k: &str) -> bool {
 
 fn state_kind(state: &str) -> Kind {
     match state {
-        "connected" => Kind::Green,
-        "searching" | "connecting" => Kind::Blue,
-        "no-country" | "blocked" | "absent" => Kind::Amber,
-        "error" => Kind::Red,
+        "connected" | "running" => Kind::Green,
+        "searching" | "connecting" | "starting" | "radar-check" => Kind::Blue,
+        "no-country" | "blocked" | "absent" | "no-ir" => Kind::Amber,
+        "error" | "failed" => Kind::Red,
         _ => Kind::Neutral,
     }
 }
@@ -258,6 +268,12 @@ pub(crate) fn state_label(code: &str) -> &'static str {
         "blocked" => "blocked",
         "absent" => "absent",
         "error" => "error",
+        // G1.30a: an access point's.
+        "running" => "running",
+        "starting" => "starting",
+        "radar-check" => "radar check",
+        "no-ir" => "passive channel",
+        "failed" => "failed",
         _ => "disabled",
     }
 }
@@ -300,7 +316,16 @@ pub(crate) fn signal_kind(dbm: i64) -> Kind {
     }
 }
 
-fn signal_cell(r: &Value) -> String {
+fn signal_cell(r: &Value, l: Lang) -> String {
+    // G1.30a: an access point has clients, not a signal.
+    if s(r, "mode") == "ap" {
+        let n = r.get("clients").and_then(Value::as_u64).unwrap_or(0);
+        return if n == 0 && s(r, "state") != "running" {
+            String::new()
+        } else {
+            cell("", &[(&format!("{n} {}", tr_in(SCOPE, l, "clients")), Kind::Neutral)])
+        };
+    }
     match r.get("signal").and_then(Value::as_i64) {
         Some(dbm) => cell("", &[(&format!("{dbm} dBm"), signal_kind(dbm))]),
         None => String::new(),
@@ -347,6 +372,10 @@ pub(crate) fn uptime_text(secs: u64) -> String {
 pub(crate) fn row(r: &Value, l: Lang) -> Row {
     let state = s(r, "state");
     let mut chips = vec![(tr_in(SCOPE, l, state_label(&state)).to_owned(), state_kind(&state))];
+    // G1.30a: the mode, when it is not the usual one.
+    if s(r, "mode") == "ap" {
+        chips.insert(0, (tr_in(SCOPE, l, "AP").to_owned(), Kind::Blue));
+    }
     if state != "connected"
         && state != "disabled"
         && let Some(f) = r.get("failure").and_then(Value::as_str)
@@ -367,7 +396,7 @@ pub(crate) fn row(r: &Value, l: Lang) -> Row {
             } else {
                 cell("", &[(tr_in(SCOPE, l, security), if security == "open" { Kind::Amber } else { Kind::Neutral })])
             },
-            signal_cell(r),
+            signal_cell(r, l),
             channel_text(r),
             r.get("rate").and_then(Value::as_u64).map(|m| format!("{m} Mbps")).unwrap_or_default(),
             s(r, "driver"),
@@ -382,7 +411,14 @@ pub(crate) fn row(r: &Value, l: Lang) -> Row {
 /// The modal's fields for radio `r`.
 fn values_of(r: &Value) -> BTreeMap<&'static str, String> {
     let yes = |k: &str| if flag(r, k) { "yes" } else { "no" }.to_owned();
+    let auto = |k: &str| {
+        let v = s(r, k);
+        if v.is_empty() { "auto".to_owned() } else { v }
+    };
     BTreeMap::from([
+        ("mode", if s(r, "mode").is_empty() { "station".to_owned() } else { s(r, "mode") }),
+        ("frequency", auto("configured_frequency")),
+        ("width", auto("configured_width")),
         ("ssid", s(r, "ssid")),
         ("security", s(r, "security")),
         ("hidden", yes("hidden")),
@@ -493,7 +529,11 @@ impl WifiPanel {
     /// The first line: the tabs, and the country every radio follows.
     fn head(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, l: Lang) {
         ui.horizontal(|ui| {
-            for (tab, label) in [(Tab::Radios, "Radios"), (Tab::Networks, "Networks")] {
+            for (tab, label) in [
+                (Tab::Radios, "Radios"),
+                (Tab::Networks, "Networks"),
+                (Tab::Registration, "Registration"),
+            ] {
                 if ui.selectable_label(self.tab == tab, tr_in(SCOPE, l, label)).clicked() {
                     self.tab = tab;
                 }
@@ -657,6 +697,7 @@ impl WifiPanel {
             &[
                 (all.len(), "radios", chip::neutral_tone(&v)),
                 (list::count(&all, "state", "connected"), "connected", chip::GREEN.tone(&v)),
+                (list::count(&all, "state", "running"), "running", chip::GREEN.tone(&v)),
                 (list::count(&all, "state", "searching"), "searching", chip::BLUE.tone(&v)),
                 (list::count(&all, "state", "disabled"), "disabled", chip::neutral_tone(&v)),
             ],
@@ -703,11 +744,14 @@ impl WifiPanel {
             value(ui, s(&m, "ssid"));
             label(ui, "BSSID", "interface.wifi.bssid");
             value(ui, s(&m, "bssid"));
+            let ap = s(&m, "mode") == "ap";
             label(ui, "Security", "interface.wifi.security");
             let negotiated = match s(&m, "security").as_str() {
                 "wpa3" => "WPA3 (SAE)",
                 "wpa2" => "WPA2",
                 "open" => "open",
+                // G1.30a: an access point's setting.
+                "auto" if ap => "WPA2 + WPA3",
                 _ => "",
             };
             value(
@@ -726,26 +770,45 @@ impl WifiPanel {
                     (c, _) => c,
                 },
             );
-            label(ui, "Signal", "interface.wifi.signal");
-            match m.get("signal").and_then(Value::as_i64) {
-                Some(dbm) => {
-                    chip::chip(ui, &format!("{dbm} dBm"), signal_kind(dbm).tone(&v));
-                    ui.end_row();
+            if ap {
+                // G1.30a: an access point's width, radar check and clients.
+                label(ui, "Width", "interface.wifi.width");
+                value(
+                    ui,
+                    match (m.get("width").and_then(Value::as_u64), flag(&m, "auto_channel")) {
+                        (Some(w), true) => format!("{w} MHz · {}", tr_in(SCOPE, l, "channel chosen automatically")),
+                        (Some(w), false) => format!("{w} MHz"),
+                        (None, _) => String::new(),
+                    },
+                );
+                if let Some(secs) = m.get("radar_check_secs").and_then(Value::as_u64) {
+                    label(ui, "Radar Check", "interface.wifi.radar");
+                    value(ui, format!("{secs} s"));
                 }
-                None => value(ui, String::new()),
-            }
-            label(ui, "Rate", "interface.wifi.rate");
-            value(ui, m.get("rate").and_then(Value::as_u64).map(|r| format!("{r} Mbps")).unwrap_or_default());
-            label(ui, "Last Failure", "interface.wifi.failure");
-            match m.pointer("/failure/code").and_then(Value::as_str) {
-                Some(code) => {
-                    chip::chip(ui, tr_in(SCOPE, l, failure_label(code)), failure_kind(code).tone(&v));
-                    ui.end_row();
+                label(ui, "Clients", "interface.wifi.clients");
+                value(ui, s(&m, "clients"));
+            } else {
+                label(ui, "Signal", "interface.wifi.signal");
+                match m.get("signal").and_then(Value::as_i64) {
+                    Some(dbm) => {
+                        chip::chip(ui, &format!("{dbm} dBm"), signal_kind(dbm).tone(&v));
+                        ui.end_row();
+                    }
+                    None => value(ui, String::new()),
                 }
-                None => value(ui, tr_in(SCOPE, l, "none").to_owned()),
+                label(ui, "Rate", "interface.wifi.rate");
+                value(ui, m.get("rate").and_then(Value::as_u64).map(|r| format!("{r} Mbps")).unwrap_or_default());
+                label(ui, "Last Failure", "interface.wifi.failure");
+                match m.pointer("/failure/code").and_then(Value::as_str) {
+                    Some(code) => {
+                        chip::chip(ui, tr_in(SCOPE, l, failure_label(code)), failure_kind(code).tone(&v));
+                        ui.end_row();
+                    }
+                    None => value(ui, tr_in(SCOPE, l, "none").to_owned()),
+                }
+                label(ui, "Reconnects", "interface.wifi.reconnects");
+                value(ui, s(&m, "reconnects"));
             }
-            label(ui, "Reconnects", "interface.wifi.reconnects");
-            value(ui, s(&m, "reconnects"));
             label(ui, "Country", "interface.wifi.country");
             let asked = s(&m, "country");
             let in_force = s(&m, "country_in_force");
@@ -1044,6 +1107,7 @@ impl PanelState for WifiPanel {
                 }
                 out.extend(self.scan.queries(&self.radio, app));
             }
+            Tab::Registration => out.extend(self.clients.queries(app)),
         }
         out
     }
@@ -1062,6 +1126,7 @@ impl PanelState for WifiPanel {
             "country" => self.country = Some(value),
             "monitor" => self.monitor = Some(value),
             "networks" => self.heard = Some(value),
+            crate::wifi_clients::KEY => self.clients.arrived(value),
             list_modal::PREVIEW => {
                 if let Some(m) = &mut self.modal {
                     m.arrived(value);
@@ -1080,6 +1145,11 @@ impl PanelState for WifiPanel {
         match self.tab {
             Tab::Radios => self.radios_tab(app, ui, l),
             Tab::Networks => self.networks_tab(app, ui, l),
+            Tab::Registration => {
+                if let Some(h) = self.clients.show(ui, l, &self.rows) {
+                    self.help = Some(h);
+                }
+            }
         }
     }
 
@@ -1088,6 +1158,8 @@ impl PanelState for WifiPanel {
             let open = m.show(app, ctx, area, &SPEC, &|p| match p {
                 "security" => ["auto", "wpa3", "wpa2", "open"].map(str::to_owned).to_vec(),
                 "band" => ["2ghz", "5ghz", "6ghz"].map(str::to_owned).to_vec(),
+                "mode" => ["station", "ap"].map(str::to_owned).to_vec(),
+                "width" => ["auto", "20", "40", "80", "160"].map(str::to_owned).to_vec(),
                 _ => Vec::new(),
             });
             if !open {
@@ -1154,15 +1226,24 @@ impl PanelState for WifiPanel {
         match self.tab {
             Tab::Radios => self.table.escape(),
             Tab::Networks => self.heard_table.escape(),
+            Tab::Registration => self.clients.table.escape(),
         }
     }
 
     fn tables(&self) -> Vec<(&'static str, &TableState)> {
-        vec![(TABLE, &self.table), (HEARD, &self.heard_table)]
+        vec![
+            (TABLE, &self.table),
+            (HEARD, &self.heard_table),
+            (crate::wifi_clients::TABLE, &self.clients.table),
+        ]
     }
 
     fn tables_mut(&mut self) -> Vec<(&'static str, &mut TableState)> {
-        vec![(TABLE, &mut self.table), (HEARD, &mut self.heard_table)]
+        vec![
+            (TABLE, &mut self.table),
+            (HEARD, &mut self.heard_table),
+            (crate::wifi_clients::TABLE, &mut self.clients.table),
+        ]
     }
 }
 
@@ -1173,6 +1254,7 @@ pub(crate) fn help_keys() -> Vec<&'static str> {
     COLUMNS
         .iter()
         .chain(&crate::wifi_scan::COLUMNS)
+        .chain(&crate::wifi_clients::COLUMNS)
         .map(|c| c.help)
         .chain(FIELDS.iter().map(|f| f.help))
         .filter(|k| !k.is_empty())
@@ -1183,7 +1265,10 @@ pub(crate) fn help_keys() -> Vec<&'static str> {
 /// each is in the Portuguese catalog).
 #[cfg(test)]
 pub(crate) fn labels() -> Vec<&'static str> {
-    let states = ["connected", "searching", "connecting", "idle", "no-country", "blocked", "absent", "error", "disabled"];
+    let states = [
+        "connected", "searching", "connecting", "idle", "no-country", "blocked", "absent", "error", "disabled",
+        "running", "starting", "radar-check", "no-ir", "failed",
+    ];
     let failures = ["wrong-key", "not-found", "rejected", "no-answer", "other"];
     COLUMNS
         .iter()

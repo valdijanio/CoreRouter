@@ -209,6 +209,9 @@ mod nl80211;
 /// control socket; the parsers of what it says are pure.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub mod wifi;
+/// G1.30a: a Wi-Fi radio as an access point (hostapd).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub mod wifi_ap;
 /// Which links are Wi-Fi radios (G1.30): the link dump does not say.
 #[cfg(target_os = "linux")]
 mod wifi_links;
@@ -1537,6 +1540,14 @@ mod linux {
 
         fn wifi_country(&mut self, country: Option<&str>) -> Result<(), HalError> {
             crate::wifi::set_country(country)
+        }
+
+        fn wifi_ap_port(
+            &mut self,
+            name: &IfName,
+        ) -> Result<Box<dyn corerouter_hal::wifi_ap::WifiApPort>, HalError> {
+            crate::wifi_ap::LinuxWifiApPort::open(name)
+                .map(|p| Box::new(p) as Box<dyn corerouter_hal::wifi_ap::WifiApPort>)
         }
 
         fn wifi_radio(&mut self, name: &IfName) -> Option<corerouter_hal::wifi::WifiRadio> {

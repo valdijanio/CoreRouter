@@ -1,7 +1,8 @@
 # Wi-Fi em modo estação (G1.30)
 
 O roteador entra numa rede Wi-Fi como cliente, para a gerência ou como uplink. É o caso do PC
-ou notebook que vira roteador e só tem cabo para os clientes. Modo AP é outra gap (G1.30a).
+ou notebook que vira roteador e só tem cabo para os clientes. O modo AP (G1.30a) está em
+`docs/wifi-ap.md`.
 
 A G1.30 entra em três partes:
 
@@ -173,7 +174,7 @@ com `security=wpa2` (o SAE precisa da frase).
   transmite onde não pode. A mensagem traz o comando a rodar.
 - **Mudar a rede do rádio por onde a sessão chega** (`ssid`, senha, segurança, desligar,
   reconectar): pede Safe Mode, em que perder a conexão desfaz a mudança, ou `force=yes`.
-- **Rádio em bridge:** uma estação leva três endereços no quadro e só o próprio MAC atravessa
+- **Estação em bridge** (um AP entra, G1.30a): uma estação leva três endereços no quadro e só o próprio MAC atravessa
   o AP; o kernel também recusa (`IFF_DONT_BRIDGE`). A mensagem diz para rotear.
 - **Rádio em bonding** (G1.30m): pelo mesmo motivo, e porque o bonding troca o MAC das portas.
   A janela New/Edit Bonding mostra as portas Wi-Fi cinza, com um ⓘ que explica e aponta o
@@ -223,8 +224,8 @@ cargo xtask os wifi-test
 
 Sobe a imagem no QEMU com dois rádios simulados (`mac80211_hwsim`: cfg80211 e mac80211 de
 verdade, quadros entre os rádios em software). No primeiro roda um `hostapd` com WPA2 e WPA3; o
-segundo é o do roteador, dirigido só por comandos. O `hostapd` não está na imagem: o build o
-deixa em `images/test-tools/` e o teste o entrega num disco próprio. `corerouter.unmanaged=wifi1`
+segundo é o do roteador, dirigido só por comandos. O AP de teste é uma cópia do `hostapd` da
+imagem que o build deixa em `images/test-tools/`, com arquivo próprio, num disco só dele. `corerouter.unmanaged=wifi1`
 na linha de comando do kernel mantém o roteador longe do rádio do AP.
 
 ## Telas (parte 3)
@@ -532,7 +533,7 @@ existe com OpenSSL ou wolfSSL) e um processo C a mais, supervisionado pelo PID 1
 
 ### O que ficou de fora e por quê
 
-- **Modo AP:** G1.30a.
+- **Modo AP:** G1.30a, `docs/wifi-ap.md`.
 - **Wi-Fi na ISO live:** o kernel da ISO fica sem a pilha (`installer.fragment`). Entrar numa
   rede é coisa do roteador instalado (G1.30c). A raiz do live é a da imagem e vai para a RAM,
   então o firmware de Wi-Fi custa RAM ali mesmo sem uso: o mínimo do live subiu de 320 para

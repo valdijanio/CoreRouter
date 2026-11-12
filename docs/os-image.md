@@ -17,7 +17,7 @@ cargo xtask os install-test          # G1.6c: instalador (CD, USB, interativo), 
 cargo xtask os install-test --firmware seabios   # G1.6g: o mesmo por BIOS, pelo GRUB
 cargo xtask os ab-test --firmware seabios        # G1.6g: o A/B por BIOS, cruzado, cortes e controladoras
 cargo xtask os frr-test              # G1.6k: dois roteadores da imagem com OSPF, SR, LDP e BFD entre eles
-cargo xtask os wifi-test             # G1.30: a imagem como estação Wi-Fi contra um AP de teste (mac80211_hwsim + hostapd)
+cargo xtask os wifi-test             # G1.30: a imagem como estação Wi-Fi contra um AP de teste (mac80211_hwsim + hostapd); --only ap: a imagem como AP (G1.30a)
 cargo xtask os package --out b.crpkg --version 0.1.1 --build 1800000000  # outro pacote deste build
 cargo xtask os build --only crpkg    # G1.6e: só o pacote de atualização (sem disk.img, ISO, qcow2, OVA)
 cargo xtask os push --to 127.0.0.1:7990   # G1.6e: --only crpkg, envia pela rede, espera o slot novo confirmar
@@ -1180,9 +1180,10 @@ reprova uma imagem com `cfg80211.ko` e sem a base.
 - **`corerouter.unmanaged=<nomes>`** na linha de comando do kernel passa `--unmanaged` ao
   daemon: ele não toca nessas interfaces. Existe para o teste (o rádio do AP) e não é levada
   para o slot gravado.
-- **`hostapd` é ferramenta de teste, fora da imagem.** O Buildroot o compila (mesma árvore
-  hostap do `wpa_supplicant`) e o `post-build.sh` o tira da raiz para `images/test-tools/`. O
-  `cargo xtask os wifi-test` o entrega à VM num disco só de leitura.
+- **`hostapd` está na imagem desde a G1.30a** (o roteador como ponto de acesso,
+  `docs/wifi-ap.md`). O Buildroot o compila (mesma árvore hostap do `wpa_supplicant`) e o
+  `post-build.sh` também o copia para `images/test-tools/`: o `cargo xtask os wifi-test` entrega
+  essa cópia à VM num disco só de leitura, para o AP de teste com arquivo próprio.
 
 **Acrescentar uma família de drivers:** ligue os símbolos no `nics.fragment`, rode o build (ele
 falha no fim, dizendo o firmware que falta), rode `cargo xtask os firmware-lock --tag <tag>` e o
