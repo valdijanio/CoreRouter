@@ -255,6 +255,18 @@ CONFIG_EDAC_SBRIDGE=y
 CONFIG_EDAC_IE31200=y
 # CONFIG_EDAC_LEGACY_SYSFS is not set
 # CONFIG_RAS_FMPM is not set
+# Memory errors (G1.6zy). The two controllers whose driver writes an error
+# line where there is no ECC: modules, loaded by PID 1 only when the
+# firmware says the memory has ECC (SMBIOS type 16) or with
+# corerouter.edac=on (apps/corerouter-init/src/modules.rs, EDAC_MODULES).
+CONFIG_EDAC_IGEN6=m
+CONFIG_EDAC_PND2=m
+# An uncorrectable error in a page of a process kills that process (the init
+# restarts the daemon) instead of a kernel panic; a page that keeps giving
+# corrected errors is taken out of use before it fails (RAS_CEC, quiet
+# without ECC). Kernel defaults: recovery on, early kill off.
+CONFIG_MEMORY_FAILURE=y
+CONFIG_RAS_CEC=y
 
 # --- eBPF and XDP (G2.5): JIT always on, BTF for CO-RE, AF_XDP.
 CONFIG_BPF=y

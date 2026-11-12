@@ -15,6 +15,9 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "system.health.print", "Health", [], None,
         "{} → [{name, chip, label, type: temperature|fan|voltage|power, value, unit, max, crit, state: ok|warning|error, board: bool (read by the motherboard's sensor chip: an input the board does not wire reads anything, so it has no limits and is not the router's temperature)}]",
         always, print),
+    cmd!(query "system.health.memory.print", "Memory Errors", [], None,
+        "{} → {ecc: bool (an EDAC driver watches the memory controllers: ECC memory), controllers, ce, ue (corrected and uncorrected errors since boot, all modules), ce_noinfo, ue_noinfo (counted without knowing the module), hardware_corrupted_kib: int|null (memory the kernel took out of use for errors), dimms: [{controller, controller_name, name, label, location, size_mb, type, edac_mode, ce, ue, state: ok|warning|error}]}",
+        always, memory),
     cmd!(query "system.health.check", "Health Checks", [], None,
         "{} → {status: ok|warning|error, warnings, errors, checks: [{key, name, severity: ok|warning|error|unknown, value, reason, action}]}",
         always, check),
@@ -58,6 +61,36 @@ fn print(s: &mut Session, _: &Value) -> Result<Value> {
     ))
 }
 
+/// G1.6zy: the ECC modules and their errors (empty without ECC).
+fn memory(s: &mut Session, _: &Value) -> Result<Value> {
+    let m = monitor(s, false)?;
+    let e = m.last.as_ref().map(|l| l.memory_errors.clone()).unwrap_or_default();
+    let ce: u64 = e.dimms.iter().map(|d| d.ce).sum::<u64>().saturating_add(e.ce_noinfo);
+    let ue: u64 = e.dimms.iter().map(|d| d.ue).sum::<u64>().saturating_add(e.ue_noinfo);
+    Ok(json!({
+        "ecc": e.controllers > 0,
+        "controllers": e.controllers,
+        "ce": ce,
+        "ue": ue,
+        "ce_noinfo": e.ce_noinfo,
+        "ue_noinfo": e.ue_noinfo,
+        "hardware_corrupted_kib": e.hardware_corrupted_kib,
+        "dimms": e.dimms.iter().map(|d| json!({
+            "controller": d.controller,
+            "controller_name": d.controller_name,
+            "name": d.name,
+            "label": d.label,
+            "location": d.location,
+            "size_mb": d.size_mb,
+            "type": d.mem_type,
+            "edac_mode": d.edac_mode,
+            "ce": d.ce,
+            "ue": d.ue,
+            "state": if d.ue > 0 { "error" } else if d.ce > 0 { "warning" } else { "ok" },
+        })).collect::<Vec<_>>(),
+    }))
+}
+
 /// The checks now. Does not mark the readings as watched (the top bar's
 /// chip asks every 5 s) and never logs: the alerts are the service's.
 fn check(s: &mut Session, _: &Value) -> Result<Value> {
@@ -93,12 +126,25 @@ mod tests {
         assert!(s.execute("system.health.print", &json!({"x": 1})).is_err());
     }
 
+    /// G1.6zy: the lab's two ECC modules, without errors.
+    #[test]
+    fn memory_modules_of_the_lab() {
+        let mut s = Session::virtual_lab();
+        let v = s.execute("system.health.memory.print", &json!({})).unwrap();
+        assert_eq!(v["ecc"], true);
+        assert_eq!(v["dimms"].as_array().unwrap().len(), 2);
+        assert_eq!(v["dimms"][0]["state"], "ok");
+        assert_eq!(v["dimms"][1]["location"], "channel 1 slot 0");
+        assert_eq!(v["ue"], 0);
+        assert!(s.execute("system.health.memory.print", &json!({"all": 1})).is_err());
+    }
+
     #[test]
     fn checks_on_the_lab() {
         let mut s = Session::virtual_lab();
         let v = s.execute("system.health.check", &json!({})).unwrap();
         let checks = v["checks"].as_array().unwrap();
-        assert_eq!(checks.len(), 22);
+        assert_eq!(checks.len(), 23);
         let by = |k: &str| checks.iter().find(|c| c["key"] == k).unwrap().clone();
         assert_eq!(by("root.verity")["severity"], "unknown", "no A/B image in the lab");
         assert_eq!(by("routes.ecmp")["severity"], "ok", "the lab has no ECMP (G1.27j)");
@@ -110,6 +156,7 @@ mod tests {
         assert_eq!(by("bgp.end-of-rib")["severity"], "unknown", "no routing daemon in the lab (G3.9fj)");
         assert_eq!(by("bgp.gr-bfd")["severity"], "unknown");
         assert_eq!(by("temperature")["severity"], "ok");
+        assert_eq!(by("memory.ecc")["severity"], "ok", "G1.6zy: two ECC modules, no error");
         // G1.29b: ether6 is a USB 3 adapter on a USB 2.0 port.
         assert_eq!(by("interface.usb")["severity"], "warning");
         assert!(by("interface.usb")["reason"].as_str().unwrap().contains("ether6: USB 3.0 adapter negotiated USB 2.0"));

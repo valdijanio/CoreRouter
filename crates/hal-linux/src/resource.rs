@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use corerouter_hal::system_resource::{
     CpuIrqs, CpuTimes, DAEMON_PROCESS, Disk, DiskIo, LoadAvg, MAX_CPUS, MAX_DISKS, MAX_NET,
     MAX_PROCESSES, MAX_SENSORS, MAX_TASKS, Memory, NetDev, Pressure, Process, Psi,
+    Dimm, MAX_DIMMS, MemoryErrors,
     ROUTER_PROCESSES, ResourceSampler, Sample, Sensor, SensorKind, Task, Want, cut_name,
 };
 
@@ -555,6 +556,8 @@ pub struct Collector {
     fixed: Option<(Option<String>, Option<String>)>,
     /// The last sensor reading and when (uptime ms).
     sensors: Option<(u64, Vec<Sensor>)>,
+    /// G1.6zy: the EDAC counters, read with the sensors.
+    edac: Option<(u64, MemoryErrors)>,
     /// This process (the daemon): first of [`Sample::router`].
     own_pid: u32,
     /// Pids of the router's other processes and when (uptime ms) all of
@@ -594,6 +597,52 @@ fn files_of(dir: &Path) -> Vec<(String, String)> {
             Some((name, text))
         })
         .collect()
+}
+
+/// The small text files of an EDAC directory: (name, contents).
+fn edac_files(dir: &Path) -> Vec<(String, String)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .take(64)
+        .filter_map(|e| {
+            let name = e.file_name().to_str()?.to_owned();
+            if !e.file_type().ok()?.is_file() {
+                return None;
+            }
+            let mut text = String::new();
+            std::fs::File::open(e.path()).ok()?.take(256).read_to_string(&mut text).ok()?;
+            Some((name, text.trim().to_owned()))
+        })
+        .collect()
+}
+
+/// G1.6zy: one module from its directory's files (`dimm_label`,
+/// `dimm_location`, `size`, `dimm_mem_type`, `dimm_edac_mode`,
+/// `dimm_ce_count`, `dimm_ue_count`; Documentation/ABI/testing/sysfs-devices-edac).
+pub fn parse_edac_dimm(controller: &str, controller_name: &str, name: &str, files: &[(String, String)]) -> Dimm {
+    let text = |k: &str| {
+        files
+            .iter()
+            .find(|(f, _)| f == k)
+            .map(|(_, v)| cut_name(v.trim()))
+            .unwrap_or_default()
+    };
+    let n = |k: &str| text(k).parse::<u64>().unwrap_or(0);
+    Dimm {
+        controller: cut_name(controller),
+        controller_name: cut_name(controller_name),
+        name: cut_name(name),
+        label: text("dimm_label"),
+        location: text("dimm_location"),
+        size_mb: n("size"),
+        mem_type: text("dimm_mem_type"),
+        edac_mode: text("dimm_edac_mode"),
+        ce: n("dimm_ce_count"),
+        ue: n("dimm_ue_count"),
+    }
 }
 
 /// A hwmon chip's name with what tells it from another of the same driver
@@ -672,6 +721,7 @@ impl Collector {
             page_size: u64::try_from(rustix::param::page_size()).unwrap_or(4096),
             fixed: None,
             sensors: None,
+            edac: None,
             own_pid: std::process::id(),
             router_pids: None,
         }
@@ -723,6 +773,51 @@ impl Collector {
                 list
             }
         }
+    }
+
+    /// G1.6zy: the EDAC controllers, read again once [`SENSORS_EVERY_MS`]
+    /// passed (a few small files per module; nothing without ECC).
+    fn edac_cached(&mut self, now_ms: u64, meminfo: Option<&str>) -> MemoryErrors {
+        let corrupted = meminfo.and_then(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("HardwareCorrupted:"))
+                .and_then(|v| v.split_whitespace().next()?.parse().ok())
+        });
+        let mut m = match &self.edac {
+            Some((at, m)) if now_ms >= *at && now_ms - at < SENSORS_EVERY_MS => m.clone(),
+            _ => {
+                let m = self.edac();
+                self.edac = Some((now_ms, m.clone()));
+                m
+            }
+        };
+        m.hardware_corrupted_kib = corrupted;
+        m
+    }
+
+    /// G1.6zy: every EDAC memory controller and its modules, read now.
+    pub fn edac(&self) -> MemoryErrors {
+        let mut out = MemoryErrors::default();
+        for mc in sorted_dir(&self.sys.join("devices/system/edac/mc"), "mc") {
+            let files = edac_files(&mc);
+            let get = |k: &str| files.iter().find(|(f, _)| f == k).map(|(_, v)| v.as_str());
+            let mc_id = mc.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let mc_name = get("mc_name").unwrap_or("");
+            out.controllers = out.controllers.saturating_add(1);
+            let n = |k: &str| get(k).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            out.ce_noinfo = out.ce_noinfo.saturating_add(n("ce_noinfo_count"));
+            out.ue_noinfo = out.ue_noinfo.saturating_add(n("ue_noinfo_count"));
+            let mut dimms = sorted_dir(&mc, "dimm");
+            dimms.extend(sorted_dir(&mc, "rank"));
+            for d in dimms {
+                if out.dimms.len() >= MAX_DIMMS {
+                    break;
+                }
+                let name = d.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                out.dimms.push(parse_edac_dimm(&mc_id, mc_name, &name, &edac_files(&d)));
+            }
+        }
+        out
     }
 
     /// Every sensor, read now.
@@ -932,6 +1027,8 @@ impl ResourceSampler for Collector {
             .or(want.now_ms)
             .unwrap_or(0);
         let sensors = self.sensors_cached(uptime_ms);
+        let meminfo = self.proc("meminfo");
+        let memory_errors = self.edac_cached(uptime_ms, meminfo.as_deref());
         let (cpu, cores) = self
             .proc("stat")
             .map(|t| parse_stat(&t))
@@ -976,10 +1073,7 @@ impl ResourceSampler for Collector {
             cpu_model,
             board,
             load: self.proc("loadavg").and_then(|t| parse_loadavg(&t)),
-            memory: self
-                .proc("meminfo")
-                .map(|t| parse_meminfo(&t))
-                .unwrap_or_default(),
+            memory: meminfo.as_deref().map(parse_meminfo).unwrap_or_default(),
             pressure: Pressure {
                 cpu: psi("cpu"),
                 memory: psi("memory"),
@@ -989,6 +1083,7 @@ impl ResourceSampler for Collector {
             disks: self.disks(),
             disk_io,
             sensors,
+            memory_errors,
             net: self.net(),
             oom_kills,
             swap_in,

@@ -139,6 +139,8 @@ pub const WHY: &[(&str, &str)] = &[
     ("lockup", "A CPU stuck in the kernel (20 s, or 10 s with interrupts off) does not come back: reboot, and the next boot shows the trace (system.crash.print)."),
     ("lockup_vm", "In a virtual machine the host may stop a vCPU for that long: a reboot would be a false alarm."),
     ("lro", "LRO rewrites headers and cannot be undone: a router must not forward what it built (the kernel turns it off with forwarding)."),
+    ("mf_late", "Only the process that reads the bad page dies (the init restarts the daemon); the others keep their memory."),
+    ("mf_recover", "A bad memory page kills its process instead of panicking the kernel: the router keeps forwarding."),
     ("min_free", "A reserve for allocations in interrupts (NIC rings): {share} of the RAM."),
     ("neigh", "{entries} neighbors for {mem} of RAM; the other thresholds at 1/2 and 1/8 of it."),
     ("oops", "An oops leaves the kernel unsure of itself: treat it as a panic and reboot."),
@@ -238,6 +240,8 @@ pub fn recommend(profile: Profile, m: &Machine) -> BTreeMap<&'static str, Rec> {
             }
             "kernel.panic" => Some(rec("panic", 10, &[])),
             "kernel.panic_on_oops" => Some(rec("oops", 1, &[])),
+            "vm.memory_failure_early_kill" => Some(rec("mf_late", 0, &[])),
+            "vm.memory_failure_recovery" => Some(rec("mf_recover", 1, &[])),
             "kernel.softlockup_panic" | "kernel.hardlockup_panic" if m.sys.virtual_machine => {
                 Some(rec("lockup_vm", 0, &[]))
             }

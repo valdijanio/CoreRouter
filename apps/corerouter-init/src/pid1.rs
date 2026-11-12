@@ -157,7 +157,8 @@ pub fn main() {
     // chip (`corerouter.sensors=`).
     if opts.modules {
         let cpuinfo = read_proc("/proc/cpuinfo").unwrap_or_default();
-        crate::modules::start(log, opts.sensors.wanted(&cpuinfo), opts.hwsim);
+        let edac = opts.edac.edac_wanted(&cpuinfo, plan::smbios_ecc(&smbios(16)));
+        crate::modules::start(log, opts.sensors.wanted(&cpuinfo), edac, opts.hwsim);
     }
     let names = name_ports(Some(Path::new(crate::ports::MAP_FILE)));
     spawn_hotplug_names(crate::ports::MAP_FILE, live);
@@ -1040,6 +1041,22 @@ fn supervise(
         }
         std::thread::sleep(TICK);
     }
+}
+
+/// G1.6zy: the `raw` SMBIOS structures of type `t`
+/// (`/sys/firmware/dmi/entries/<t>-<n>/raw`, a few hundred bytes each).
+fn smbios(t: u8) -> Vec<Vec<u8>> {
+    (0..16)
+        .map_while(|n| {
+            let mut buf = Vec::new();
+            File::open(format!("/sys/firmware/dmi/entries/{t}-{n}/raw"))
+                .ok()?
+                .take(4096)
+                .read_to_end(&mut buf)
+                .ok()?;
+            Some(buf)
+        })
+        .collect()
 }
 
 fn read_proc(path: &str) -> Option<String> {

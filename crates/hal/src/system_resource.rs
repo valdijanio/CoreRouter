@@ -284,6 +284,49 @@ pub struct Task {
     pub cpu_ticks: u64,
 }
 
+/// G1.6zy: one memory module, as the EDAC driver of its controller knows it
+/// (`/sys/devices/system/edac/mc/mc<N>/dimm<M>`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Dimm {
+    /// `mc0`.
+    pub controller: String,
+    /// The driver's name of the controller (`Skylake Socket#0 IMC#1`).
+    pub controller_name: String,
+    /// `dimm0` (or `rank0`, for a controller counted by chip select).
+    pub name: String,
+    /// The board's slot name when the driver knows it
+    /// (`CPU_SrcID#0_MC#1_Chan#0_DIMM#0`).
+    pub label: String,
+    /// `channel 0 slot 0`.
+    pub location: String,
+    pub size_mb: u64,
+    /// `Registered-DDR4`, `Unbuffered-DDR5`.
+    pub mem_type: String,
+    /// `SECDED`, `S4ECD4ED`…
+    pub edac_mode: String,
+    /// Corrected and uncorrected errors since boot.
+    pub ce: u64,
+    pub ue: u64,
+}
+
+/// G1.6zy: the memory controllers with an EDAC driver, their modules and
+/// errors. Empty on a machine without ECC (no driver binds).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct MemoryErrors {
+    /// Controllers registered (`mc0`, `mc1`…).
+    pub controllers: u32,
+    pub dimms: Vec<Dimm>,
+    /// Errors the controllers counted without knowing the module.
+    pub ce_noinfo: u64,
+    pub ue_noinfo: u64,
+    /// Memory the kernel took out of use for errors (`HardwareCorrupted`
+    /// of `/proc/meminfo`, KiB).
+    pub hardware_corrupted_kib: Option<u64>,
+}
+
+/// Modules listed at most (two sockets of 12 channels × 2 slots: 48).
+pub const MAX_DIMMS: usize = 128;
+
 /// One reading of the machine. Fields the platform does not have are
 /// `None` or empty.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -310,6 +353,8 @@ pub struct Sample {
     pub disks: Vec<Disk>,
     pub disk_io: Vec<DiskIo>,
     pub sensors: Vec<Sensor>,
+    /// G1.6zy: ECC memory and its errors.
+    pub memory_errors: MemoryErrors,
     pub net: Vec<NetDev>,
     /// Processes killed for lack of memory since boot (`oom_kill`).
     pub oom_kills: Option<u64>,
@@ -650,6 +695,26 @@ impl ResourceSampler for LabSampler {
                     board: true,
                 },
             ],
+            // G1.6zy: two ECC modules, no error.
+            memory_errors: MemoryErrors {
+                controllers: 1,
+                dimms: (0..2)
+                    .map(|n| Dimm {
+                        controller: "mc0".into(),
+                        controller_name: "Lab IMC".into(),
+                        name: format!("dimm{n}"),
+                        label: format!("CPU_SrcID#0_MC#0_Chan#{n}_DIMM#0"),
+                        location: format!("channel {n} slot 0"),
+                        size_mb: 16_384,
+                        mem_type: "Registered-DDR5".into(),
+                        edac_mode: "SECDED".into(),
+                        ce: 0,
+                        ue: 0,
+                    })
+                    .collect(),
+                hardware_corrupted_kib: Some(0),
+                ..MemoryErrors::default()
+            },
             net: self.net.clone(),
             oom_kills: Some(0),
             swap_in: Some(310),

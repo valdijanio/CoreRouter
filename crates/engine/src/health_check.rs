@@ -260,8 +260,21 @@ pub struct Inputs {
     /// G1.6zx: what the crash-log service found (`None`: no service, the
     /// lab or the browser).
     pub crash: Option<CrashInput>,
+    /// G1.6zy: (module, corrected, uncorrected) of each ECC module, the
+    /// errors of no known module, the memory taken out of use (KiB).
+    /// `None`: no EDAC driver and nothing taken out (no ECC: no check).
+    pub memory: Option<MemoryInput>,
     /// Whether any reading exists at all.
     pub readings: bool,
+}
+
+/// G1.6zy: what the memory check looks at.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MemoryInput {
+    pub dimms: Vec<(String, u64, u64)>,
+    pub ce_noinfo: u64,
+    pub ue_noinfo: u64,
+    pub corrupted_kib: u64,
 }
 
 /// G1.6zx: the previous boot's end and where the next dump would go.
@@ -869,6 +882,36 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
                 action: Some("Apague no setup do firmware as entradas de boot que sobraram de outros sistemas, ou restaure os padrões da NVRAM; no boot seguinte o registro volta a ligar sozinho.".into()) });
         }
     }
+    // G1.6zy: ECC memory: an uncorrected error, or a module that corrects
+    // errors (it is wearing out), or pages the kernel took out of use.
+    if let Some(m) = &i.memory {
+        let (key, name) = ("memory.ecc", "Memory errors");
+        let ue: u64 = m.dimms.iter().map(|d| d.2).sum::<u64>().saturating_add(m.ue_noinfo);
+        let ce: u64 = m.dimms.iter().map(|d| d.1).sum::<u64>().saturating_add(m.ce_noinfo);
+        let worst = |pick: fn(&(String, u64, u64)) -> u64| {
+            m.dimms.iter().filter(|d| pick(d) > 0).take(3).map(|d| format!("{} ({})", d.0, pick(d))).collect::<Vec<_>>().join(", ")
+        };
+        let action = "Programe a troca do pente indicado (o rótulo é o da placa, ou canal e slot); System › Health › Memory mostra a contagem por pente, e system.health.memory.print o mesmo pelo terminal e pelo MCP.";
+        if ue > 0 {
+            out.push(Check { key, name, severity: Severity::Error, value: Some(format!("{ue} UE")),
+                reason: format!("{ue} erro(s) de memória que o ECC não corrigiu desde o boot{}: um processo ou o kernel pode ter lido dado errado", if worst(|d| d.2).is_empty() { String::new() } else { format!(", em {}", worst(|d| d.2)) }),
+                action: Some(action.into()) });
+        } else if ce > 0 || m.corrupted_kib > 0 {
+            let mut why = Vec::new();
+            if ce > 0 {
+                why.push(format!("{ce} erro(s) corrigido(s) pelo ECC desde o boot{}", if worst(|d| d.1).is_empty() { String::new() } else { format!(", em {}", worst(|d| d.1)) }));
+            }
+            if m.corrupted_kib > 0 {
+                why.push(format!("{} KiB de memória retirados de uso pelo kernel por erro", m.corrupted_kib));
+            }
+            out.push(Check { key, name, severity: Severity::Warning, value: Some(format!("{ce} CE")),
+                reason: format!("{}: o pente está se desgastando", why.join("; ")),
+                action: Some(action.into()) });
+        } else {
+            out.push(Check { key, name, severity: Severity::Ok, value: Some(format!("{} pente(s)", m.dimms.len())),
+                reason: format!("{} pente(s) com ECC vigiado(s), nenhum erro desde o boot", m.dimms.len()), action: None });
+        }
+    }
     // G1.29b: a USB adapter behind a port slower than itself caps the
     // traffic with no error anywhere. Only on routers that have one.
     if !i.usb.is_empty() {
@@ -1082,6 +1125,18 @@ impl Session {
                 }
             }
             i.conntrack = l.conntrack.zip(l.conntrack_max);
+            let e = &l.memory_errors;
+            let corrupted = e.hardware_corrupted_kib.unwrap_or(0);
+            i.memory = (e.controllers > 0 || corrupted > 0).then(|| MemoryInput {
+                dimms: e
+                    .dimms
+                    .iter()
+                    .map(|d| (if d.label.is_empty() { format!("{} {}", d.controller, d.name) } else { d.label.clone() }, d.ce, d.ue))
+                    .collect(),
+                ce_noinfo: e.ce_noinfo,
+                ue_noinfo: e.ue_noinfo,
+                corrupted_kib: corrupted,
+            });
         }
         if self.cgnat_has_blocks() {
             i.cgnat = self.ext::<CgnatRuntime>().map(|c| (c.alerts().values().filter(|a| a.above).count(), c.insert_failed()));
@@ -1260,7 +1315,30 @@ mod tests {
             absent_ports: Vec::new(),
             boot_apply: Vec::new(),
             crash: None,
+            memory: None,
         }
+    }
+
+    /// G1.6zy: no ECC, no check; a module that corrects errors; one that
+    /// does not.
+    #[test]
+    fn memory_errors_by_module() {
+        let mut i = Inputs::default();
+        let by = |i: &Inputs| evaluate(i).into_iter().find(|c| c.key == "memory.ecc");
+        assert!(by(&i).is_none());
+        let dimm = |ce, ue| ("CPU_SrcID#0_MC#0_Chan#1_DIMM#0".to_owned(), ce, ue);
+        i.memory = Some(MemoryInput { dimms: vec![dimm(0, 0), dimm(0, 0)], ..MemoryInput::default() });
+        assert_eq!(by(&i).unwrap().severity, Severity::Ok);
+        i.memory = Some(MemoryInput { dimms: vec![dimm(0, 0), dimm(7, 0)], ..MemoryInput::default() });
+        let c = by(&i).unwrap();
+        assert_eq!(c.severity, Severity::Warning);
+        assert!(c.reason.contains("7 erro(s) corrigido(s)") && c.reason.contains("Chan#1_DIMM#0 (7)"), "{}", c.reason);
+        i.memory = Some(MemoryInput { dimms: vec![dimm(7, 1)], ..MemoryInput::default() });
+        assert_eq!(by(&i).unwrap().severity, Severity::Error);
+        i.memory = Some(MemoryInput { corrupted_kib: 4, ..MemoryInput::default() });
+        let c = by(&i).unwrap();
+        assert_eq!(c.severity, Severity::Warning);
+        assert!(c.reason.contains("4 KiB"), "{}", c.reason);
     }
 
     /// G1.6zx: the previous boot's panic, and a NVRAM too short for the next.

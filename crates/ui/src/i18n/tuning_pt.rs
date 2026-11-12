@@ -139,6 +139,24 @@ Num roteador um reinício limpo é melhor que encaminhar com o kernel danificado
 Um driver que dá oops na partida cria um ciclo de reinícios; a imagem A/B volta para a anterior."##,
     ),
     (
+        "tuning.vm.memory_failure_early_kill",
+        r##"## O que faz
+Num erro de memória que o ECC não corrige, 1 mata na hora todo processo que mapeia a página; 0 (o padrão do kernel) tira a página de uso e só mata o processo que tocar nela.
+## Quando mudar
+Deixe 0 num roteador: se é o daemon que lê a página, o init o reinicia, e nada mais morre por uma página que nunca seria lida de novo.
+## Cuidado
+Só faz algo com memória ECC (System › Health › Memory)."##,
+    ),
+    (
+        "tuning.vm.memory_failure_recovery",
+        r##"## O que faz
+1 (o padrão do kernel): um erro de memória sem correção na página de um processo mata esse processo; 0: o kernel entra em pânico em qualquer erro desses.
+## Quando mudar
+Mantenha 1 num roteador: um processo morto volta em segundos, um pânico derruba a máquina inteira. 0 só onde um byte errado é pior que um reinício.
+## Cuidado
+Só faz algo com memória ECC (System › Health › Memory)."##,
+    ),
+    (
         "tuning.kernel.softlockup_panic",
         r##"## O que faz
 Entra em pânico (e o `kernel.panic` reinicia) quando uma CPU fica 20 s rodando no kernel sem deixar mais nada rodar: o travamento mole (soft lockup). Desligado, só escreve o rastro no log.
@@ -1244,6 +1262,14 @@ pub(super) const TEMPLATES: &[(&str, &str)] = &[
     (
         "why.lro",
         r##"O LRO reescreve cabeçalhos sem volta: um roteador não pode encaminhar o que ele montou (o kernel o desliga junto com o forwarding)."##,
+    ),
+    (
+        "why.mf_late",
+        r##"Só o processo que lê a página ruim morre (o init reinicia o daemon); os outros ficam com a memória deles."##,
+    ),
+    (
+        "why.mf_recover",
+        r##"Uma página de memória com defeito mata o processo dela em vez de derrubar o kernel: o roteador segue encaminhando."##,
     ),
     (
         "why.min_free",

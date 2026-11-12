@@ -29,6 +29,16 @@
 //! sensors that bind to a device the machine lists (CPU, NVMe, SATA, chipset)
 //! are built into the kernel.
 //!
+//! G1.6zy: two memory controllers' EDAC drivers are modules too: `igen6_edac`
+//! (Intel client SoCs with in-band ECC) and `pnd2_edac` (Apollo Lake,
+//! Denverton) write an error line at every boot of a machine without ECC
+//! ("MC0 In-Band ECC is disabled", `igen6_edac.c` `igen6_get_dimm_config`;
+//! "Failed to register device", `pnd2_edac.c` `pnd2_init`). They load by name
+//! ([`EDAC_MODULES`]) only when the firmware says the memory has ECC
+//! (SMBIOS type 16, `plan::smbios_ecc`) or `corerouter.edac=on`. The other
+//! EDAC drivers (AMD64, SKX, I10NM, SBRIDGE, IE31200) are built in: quiet
+//! without ECC.
+//!
 //! G1.30: the Wi-Fi cards' drivers (`kernel/drivers/net/wireless/`) have a
 //! pass of their own, after the boot's: a radio is not one of the ports the
 //! boot names, and its driver's probe (firmware, calibration) must not be in
@@ -70,6 +80,11 @@ const SENSOR_DRIVERS: &str = "kernel/drivers/hwmon/";
 /// (F718xx/F818xx), Winbond (W83627EHF/DHG, W83667HG). `cargo xtask os check`
 /// keeps this list and the kernel's (`linux.fragment`) the same.
 pub const SENSOR_MODULES: [&str; 5] = ["nct6775", "nct6683", "it87", "f71882fg", "w83627ehf"];
+/// G1.6zy: the EDAC drivers that need ECC to be quiet, by module name.
+/// `cargo xtask os check` keeps this list and the kernel's the same.
+pub const EDAC_MODULES: [&str; 2] = ["igen6_edac", "pnd2_edac"];
+/// Where they are (`modules.dep` paths). Never loaded by a device's alias.
+const EDAC_DRIVERS: &str = "kernel/drivers/edac/";
 /// `modules.alias` of every network driver is ~1 MiB.
 const MAX_INDEX: u64 = 16 << 20;
 /// The kernel's `MODALIAS` values are far shorter (USB: ~70 bytes).
@@ -183,7 +198,7 @@ impl Index {
             let Some((path, needs)) = line.split_once(':') else {
                 continue;
             };
-            if ![NET_DRIVERS, SCREEN_DRIVERS, SENSOR_DRIVERS]
+            if ![NET_DRIVERS, SCREEN_DRIVERS, SENSOR_DRIVERS, EDAC_DRIVERS]
                 .iter()
                 .any(|d| path.starts_with(d))
             {
@@ -216,7 +231,7 @@ impl Index {
             let by_alias = chains
                 .get(&module)
                 .and_then(|c: &Vec<String>| c.last())
-                .is_some_and(|p| !p.starts_with(SENSOR_DRIVERS));
+                .is_some_and(|p| !p.starts_with(SENSOR_DRIVERS) && !p.starts_with(EDAC_DRIVERS));
             if by_alias && BUSES.iter().any(|(b, _)| *b == bus) {
                 aliases.push((bus.to_owned(), pattern.to_owned(), module));
             }
@@ -394,6 +409,33 @@ fn load_sensors(index: &Index, dir: &Path, log: impl Fn(&str)) {
     log(&format!("sensors: {what} ({} ms)", t.elapsed().as_millis()));
 }
 
+/// G1.6zy: the EDAC drivers of [`EDAC_MODULES`], on a machine whose memory
+/// has ECC. The one of another controller fails with `ENODEV` (silent).
+fn load_edac(index: &Index, dir: &Path, log: impl Fn(&str)) {
+    let mut found = Vec::new();
+    for module in EDAC_MODULES {
+        let Some((own, needs)) = index.chain(module).split_last() else {
+            continue;
+        };
+        if let Some((rel, e)) = needs
+            .iter()
+            .find_map(|rel| insert(dir, rel, c"").err().map(|e| (rel, e)))
+        {
+            log(&format!("memory errors: {module}: {rel}: {e}"));
+            continue;
+        }
+        match probe_result(insert(dir, own, c"")) {
+            Probe::Found => found.push(module),
+            Probe::Absent => {}
+            Probe::Firmware => log(&format!("memory errors: {module}: the firmware reports the errors itself (GHES)")),
+            Probe::Failed(e) => log(&format!("memory errors: {module}: {own}: {e}")),
+        }
+    }
+    if !found.is_empty() {
+        log(&format!("memory errors: {} watches the memory controller", found.join(", ")));
+    }
+}
+
 /// The modules of `pass` the devices in `aliases` ask for, each once, in
 /// the devices' order.
 fn wanted<'a>(index: &'a Index, aliases: &[String], pass: Pass) -> Vec<&'a str> {
@@ -513,8 +555,9 @@ fn hotplug_loop(events: &DeviceEvents, index: &Index, dir: &Path, log: &dyn Fn(&
 /// drivers are in, or at [`BOOT_WAIT`] with the loading still going; the
 /// Wi-Fi cards' drivers and the screen's load after that, with the boot
 /// already going on, and then, with `sensors`, the motherboard's sensor chip
-/// is looked for. `hwsim`: that many simulated radios (a test's).
-pub fn start(log: fn(&str), sensors: bool, hwsim: Option<u8>) {
+/// is looked for; with `edac`, the EDAC drivers of [`EDAC_MODULES`] load.
+/// `hwsim`: that many simulated radios (a test's).
+pub fn start(log: fn(&str), sensors: bool, edac: bool, hwsim: Option<u8>) {
     let dir = kernel_dir();
     let index = Index::parse(
         &read_limited(&dir.join("modules.dep"), MAX_INDEX),
@@ -545,6 +588,9 @@ pub fn start(log: fn(&str), sensors: bool, hwsim: Option<u8>) {
             load_for(&index, &dir, &devices, Pass::Screen, log);
             if sensors {
                 load_sensors(&index, &dir, log);
+            }
+            if edac {
+                load_edac(&index, &dir, log);
             }
             match events {
                 Ok(events) => hotplug_loop(&events, &index, &dir, &log),

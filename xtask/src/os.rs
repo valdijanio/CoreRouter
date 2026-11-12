@@ -172,6 +172,16 @@ const SENSOR_MODULES: &[(&str, &str)] = &[
     ("CONFIG_SENSORS_F71882FG", "f71882fg"),
     ("CONFIG_SENSORS_W83627EHF", "w83627ehf"),
 ];
+/// G1.6zy: the EDAC drivers that write an error line on a machine without
+/// ECC, (kernel symbol, module): modules, loaded by PID 1 when the memory has
+/// ECC. The names are `EDAC_MODULES` of `corerouter-init`.
+const EDAC_MODULES: &[(&str, &str)] = &[
+    ("CONFIG_EDAC_IGEN6", "igen6_edac"),
+    ("CONFIG_EDAC_PND2", "pnd2_edac"),
+];
+/// G1.6zy: an uncorrectable memory error kills the process that owns the
+/// page, and pages with repeated corrected errors leave use.
+const MEMORY_ERRORS: &[&str] = &["CONFIG_MEMORY_FAILURE", "CONFIG_RAS_CEC"];
 /// What the kernel must not have (`# … is not set` in the fragment, absent
 /// from the built `.config`). G1.6zd: a router plays no sound, and on a
 /// notebook `snd_hda_intel` wrote "Cannot probe codecs, giving up" on the
@@ -623,6 +633,7 @@ pub fn check(os: &Path) -> Result<usize, String> {
     let init = std::fs::read_to_string(os.join("../apps/corerouter-init/src/modules.rs"))
         .map_err(|e| format!("apps/corerouter-init/src/modules.rs: {e}"))?;
     n += check_sensors(&fragment, &init)?;
+    n += check_edac(&fragment, &init)?;
     let nics = read("board/x86_64/nics.fragment")?;
     let wide = module_symbols(&nics);
     for want in REQUIRED_NICS {
@@ -792,6 +803,36 @@ fn check_sensors(fragment: &str, init: &str) -> Result<usize, String> {
         ));
     }
     Ok(SENSORS_BUILT_IN.len() + SENSOR_MODULES.len() + 1)
+}
+
+/// G1.6zy: the EDAC modules in the kernel and in PID 1's list, the memory
+/// failure handling built in.
+fn check_edac(fragment: &str, init: &str) -> Result<usize, String> {
+    let built_in = fragment_symbols(fragment);
+    if let Some(want) = MEMORY_ERRORS.iter().find(|s| !built_in.contains(s)) {
+        return Err(format!("linux.fragment: {want}=y is required (G1.6zy, memory errors)"));
+    }
+    let modules = module_symbols(fragment);
+    if let Some((symbol, _)) = EDAC_MODULES.iter().find(|(s, _)| !modules.contains(s)) {
+        return Err(format!(
+            "linux.fragment: {symbol}=m is required (built in, it writes an error line on every machine without ECC)"
+        ));
+    }
+    let list = init
+        .lines()
+        .find_map(|l| l.strip_prefix("pub const EDAC_MODULES: ["))
+        .and_then(|l| l.split_once("] = [")?.1.strip_suffix("];"))
+        .ok_or("corerouter-init modules.rs: no `pub const EDAC_MODULES: [&str; N] = [...];` on one line")?;
+    let mut loaded: Vec<&str> = list.split(',').map(|m| m.trim().trim_matches('"')).collect();
+    let mut built: Vec<&str> = EDAC_MODULES.iter().map(|(_, m)| *m).collect();
+    loaded.sort_unstable();
+    built.sort_unstable();
+    if loaded != built {
+        return Err(format!(
+            "corerouter-init loads the EDAC modules {loaded:?}, the kernel builds {built:?}"
+        ));
+    }
+    Ok(MEMORY_ERRORS.len() + EDAC_MODULES.len() + 1)
 }
 
 /// G1.6m, G1.6ze: the command line of `what` keeps the built-in drivers from
@@ -1361,6 +1402,7 @@ pub(crate) fn build_with(
     let lost: Vec<&str> = REQUIRED_MODULES
         .iter()
         .chain(SENSOR_MODULES.iter().map(|(symbol, _)| symbol))
+        .chain(EDAC_MODULES.iter().map(|(symbol, _)| symbol))
         .filter(|s| !kc.lines().any(|l| l == format!("{s}=m")))
         .copied()
         .collect();
@@ -1372,6 +1414,12 @@ pub(crate) fn build_with(
     }
     if let Some(on) = kernel_on(&kc, KERNEL_OFF) {
         return Err(format!("the kernel config has {on}, which must be off"));
+    }
+    if let Some(lost) = MEMORY_ERRORS
+        .iter()
+        .find(|s| !kc.lines().any(|l| l == format!("{s}=y")))
+    {
+        return Err(format!("the kernel config lost {lost}=y (G1.6zy)"));
     }
     if let Some(lost) = KERNEL_VALUES.iter().find(|v| !kc.lines().any(|l| l == **v)) {
         return Err(format!("the kernel config lost '{lost}'"));
@@ -1440,6 +1488,7 @@ pub(crate) fn build_with(
         .iter()
         .copied()
         .chain(SENSOR_MODULES.iter().map(|(_, module)| *module))
+        .chain(EDAC_MODULES.iter().map(|(_, module)| *module))
         .collect();
     let (mods, mods_size) = livemods::verify(&installer_dir, &version, &live_required)?;
     eprintln!(
@@ -2755,6 +2804,14 @@ mod tests {
         let init =
             std::fs::read_to_string(os.join("../apps/corerouter-init/src/modules.rs")).unwrap();
         assert_eq!(check_sensors(&fragment, &init).unwrap(), 10);
+        // G1.6zy.
+        assert_eq!(check_edac(&fragment, &init).unwrap(), 5);
+        let e = check_edac(&fragment.replace("CONFIG_EDAC_IGEN6=m", "CONFIG_EDAC_IGEN6=y"), &init).unwrap_err();
+        assert!(e.contains("CONFIG_EDAC_IGEN6=m is required"), "{e}");
+        let e = check_edac(&fragment, &init.replace("\"pnd2_edac\"", "\"x\"")).unwrap_err();
+        assert!(e.contains("loads the EDAC modules"), "{e}");
+        let e = check_edac(&fragment.replace("CONFIG_RAS_CEC=y", ""), &init).unwrap_err();
+        assert!(e.contains("CONFIG_RAS_CEC=y is required"), "{e}");
         let e = check_sensors(&fragment.replace("CONFIG_NVME_HWMON=y", ""), &init).unwrap_err();
         assert!(e.contains("CONFIG_NVME_HWMON=y is required"), "{e}");
         // Built in, a Super-I/O driver would probe on every machine and VM.
@@ -2789,12 +2846,9 @@ mod tests {
                 "{symbol} is checked and not in the section"
             );
         }
-        for noisy in [
-            "CONFIG_EDAC_IGEN6",
-            "CONFIG_EDAC_PND2",
-            "CONFIG_MEMORY_FAILURE",
-        ] {
-            assert!(!fragment.contains(&format!("{noisy}=")), "{noisy}");
+        // G1.6zy: never built in.
+        for (noisy, _) in EDAC_MODULES {
+            assert!(!fragment.contains(&format!("{noisy}=y")), "{noisy}");
         }
         for off in KERNEL_OFF {
             assert!(fragment.contains(&format!("# {off} is not set")), "{off}");
