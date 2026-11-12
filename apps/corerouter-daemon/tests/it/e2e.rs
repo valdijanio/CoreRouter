@@ -242,6 +242,23 @@ fn build(c: &mut Client) {
     }
 }
 
+/// Until the tick adopted the lab's radio (`wifi1`): it is not seeded at
+/// the first boot but joins ~2 s later, after holding its name for three
+/// polls (`port_adopt`, G1.30), as a commit of its own. A test that compares
+/// the configuration across a restart waits for it first. Without this the
+/// first daemon's snapshot came before the adoption (0.3 s, **medido**) and,
+/// on a slow runner, the restarted daemon's snapshot came after its own
+/// adoption: one interface and one commit more, read as "SIGTERM lost config
+/// or history" (CI of 2026-11-12; reproduced with a 2 s wait after the
+/// restart).
+fn radio_adopted(c: &mut Client) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while inspect(c, "running")["interfaces"]["wifi1"].is_null() {
+        assert!(Instant::now() < deadline, "wifi1 was not adopted");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Every configured item, by area, and the history: what must survive.
 fn snapshot(c: &mut Client) -> (Value, Value) {
     (inspect(c, "running"), ok(c, "config.history", json!({})))
@@ -252,6 +269,7 @@ fn config_and_history_survive_sigterm_and_kill_9() {
     let dir = temp_dir("restart");
     let mut d = Daemon::start(&dir);
     let mut c = d.client().unwrap();
+    radio_adopted(&mut c);
     build(&mut c);
     // Transactional: a commit, a discarded edit and a rollback.
     ok(&mut c, "config.mode.set", json!({"mode": "transactional"}));
