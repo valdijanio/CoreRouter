@@ -891,6 +891,49 @@ ISO +256 KiB. `X86_PKG_TEMP_THERMAL`, que o defconfig deixava em módulo e ningu
 `.config` e na carga do live; o `boot-test` liga um disco NVMe na VM e exige a temperatura dele
 no `system.health.print`, pedido como o operador pede (`admin` por TLS).
 
+### Temperatura dos pentes de memória (G4.8g)
+
+System › Health passa a mostrar a temperatura de cada pente que tem sensor: o hub do SPD dos
+pentes DDR5 (`spd5118`) e o sensor JC42.4 dos DDR3/DDR4 de servidor (`jc42`). Lido no fonte
+(6.18.59):
+
+- **Quem lista os pentes.** O driver do SMBus (`i2c-i801` da Intel, embutido; `i2c-piix4` da
+  AMD) chama `i2c_register_spd` (`drivers/i2c/i2c-smbus.c`), que lê os dispositivos de memória
+  do SMBIOS (tipo 17) e, para DDR5/LPDDR5, instancia um `spd5118` em `0x50 + n`; para DDR4,
+  um `ee1004` (só a EEPROM, sem temperatura); tipos misturados ou desconhecidos (o QEMU diz
+  `RAM`) não instanciam nada. É um dispositivo enumerado: o `spd5118` fica **embutido**, como os
+  outros sensores enumerados (G1.6zf).
+- **O `spd5118` não grava no probe** a não ser que o hub esteja numa página diferente de 0
+  (`spd5118_i2c_init`): só aí escreve o registrador de página, e uma falha vira `ENODEV`
+  calado. Com o "SPD Write Disable" que o firmware Intel costuma ligar (`SMBHSTCFG_SPD_WD`,
+  `i2c-i801.c`), a temperatura (registradores voláteis da página 0) continua legível; o que
+  quebra é ler a EEPROM pelo `nvmem` (ninguém aqui lê) e o resume de suspensão (um roteador não
+  suspende). Os patches da Canonical para não instanciar sob o Write Disable deixaram em
+  `i2c-smbus.c` as duas funções, mas o i801 do 6.18.59 chama a que instancia sempre.
+- **O `jc42` sonda às cegas**: lê os endereços `0x18`–`0x1f` de todo adaptador de classe HWMON
+  (`jc42_detect`, só leituras de identificação). Fica em **módulo**, carregado pelo PID 1 junto
+  com os Super-I/O (`SENSOR_MODULES`): só em máquina real e sem `corerouter.sensors=off`; o PID 1
+  só o diz achado quando um cliente se liga a ele (`/sys/bus/i2c/drivers/jc42/<bus>-<end>`).
+- **O SMBus da AMD** (`i2c-piix4`) em **módulo**, carregado antes dos sensores e só quando há uma
+  função PCI de classe `0x0c05` da AMD, ATI ou ServerWorks: embutido, ele se ligaria ao PIIX4
+  virtual do VMware e escreveria `SMBus Host Controller not enabled!` a cada boot.
+
+**Nomes e limites.** O sensor de um pente vira `spd5118 dimmN`/`jc42 dimmN`, N pelo endereço
+(o slot na ordem do SMBIOS), e sai sem o `max`: o limite alto do chip é um alarme que o
+firmware (ou o valor de fábrica, 55 °C em muitos) programa, não um limite da peça, e acenderia a
+verificação `temperature` à toa; o `crit` fica.
+
+**Custo** (**medido**, kernel compilado fora da imagem sobre o da G1.6zy): `bzImage` +0 B
+(arredondado a página), `text` +8 229 B, `data` +4 096 B; `jc42` 7 024 B e `i2c-piix4`
+17 446 B de `text+data+bss` em módulo.
+
+**Conferido no QEMU** (q35 com o i801, e `pc` com o PIIX4 e `corerouter.sensors=on`): nenhuma
+linha de erro no boot com os drivers novos; nenhum pente listado (o SMBIOS do QEMU diz `RAM`).
+
+**Não conferido** (sem emulação): um pente DDR5 de verdade (o notebook Lenovo 83EU da sessão
+principal), um RDIMM DDR4 com JC42.4, SMBus com multiplexador (placas AMD com várias portas:
+`i2c_register_spd` só roda na porta 0), e o SPD Write Disable ligado.
+
 ### Cobertura de hardware: núcleos, disco de boot, hipervisores, diagnóstico (G1.6zi)
 
 O `.config` vinha do `x86_64_defconfig` mais o que o roteador usa. O primeiro boot num notebook

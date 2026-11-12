@@ -81,14 +81,8 @@ const SENSOR_DRIVERS: &str = "kernel/drivers/hwmon/";
 /// keeps this list and the kernel's (`linux.fragment`) the same.
 /// G4.8g: and `jc42`, the JC42.4 temperature sensor of DDR3/DDR4 modules,
 /// found by reading SMBus addresses 0x18–0x1f (`jc42_detect`).
-pub const SENSOR_MODULES: [&str; 6] = [
-    "nct6775",
-    "nct6683",
-    "it87",
-    "f71882fg",
-    "w83627ehf",
-    "jc42",
-];
+#[rustfmt::skip]
+pub const SENSOR_MODULES: [&str; 6] = ["nct6775", "nct6683", "it87", "f71882fg", "w83627ehf", "jc42"];
 /// G4.8g: the SMBus controller of AMD chipsets (and ATI, ServerWorks):
 /// with it the kernel lists the DDR5 modules' SPD hubs (`spd5118`, built in)
 /// from the SMBIOS, and `jc42` has a bus to look at. A module, loaded with
