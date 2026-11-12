@@ -432,7 +432,11 @@ fn row(c: &Conn, pools: &[(String, Vec<corerouter_model::cgnat::Range>)]) -> Val
         if c.has(status::SRC_NAT) {
             o.insert("nat".into(), json!(nat_text(c)));
         }
+        // G2.3g: only what the pool translated. A subscriber's flow to the
+        // router itself (its DNS on port 53) is not NATed and belongs to
+        // no pool; nor does the router's own address inside one.
         if let IpAddr::V4(a) = c.orig.src
+            && c.has(status::SRC_NAT)
             && let Some((name, _)) = pools.iter().find(|(_, r)| r.iter().any(|r| r.contains(a)))
         {
             o.insert("pool".into(), json!(name));
@@ -829,5 +833,37 @@ mod tests {
             assert!(matches!(reply, Reply::Later(_)), "{id}: {reply:?}");
             assert_eq!(reply.finish().unwrap(), now, "{id}");
         }
+    }
+
+    /// G2.3g: a subscriber's DNS query to the router (100.64.0.1:53) is not
+    /// translated: no pool, as a translated one has (seen on a notebook,
+    /// dev.591: `pool: teste` on flows to port 53 of the router).
+    #[test]
+    fn only_translated_flows_name_their_pool() {
+        let pools = vec![("teste".to_owned(), vec!["100.64.0.0/24".parse().unwrap()])];
+        let t = |dst: [u8; 4]| corerouter_hal::conntrack::Tuple {
+            src: IpAddr::from([100, 64, 0, 100]),
+            dst: IpAddr::from(dst),
+            src_port: 40000,
+            dst_port: 53,
+        };
+        let conn = |dst, status| Conn {
+            id: 1,
+            protocol: 17,
+            orig: t(dst),
+            reply: t(dst),
+            status,
+            timeout: 30,
+            tcp_state: None,
+            mark: 0,
+            orig_packets: 1,
+            orig_bytes: 64,
+            reply_packets: 1,
+            reply_bytes: 64,
+        };
+        let to_router = row(&conn([100, 64, 0, 1], status::CONFIRMED), &pools);
+        assert!(to_router.get("pool").is_none(), "{to_router}");
+        let out = row(&conn([8, 8, 8, 8], status::CONFIRMED | status::SRC_NAT), &pools);
+        assert_eq!(out["pool"], "teste");
     }
 }

@@ -692,6 +692,75 @@ fn blocks_mode_holds_the_first_packet_until_a_block_is_given() {
     hal.lock().unwrap().apply(&c2, &Config::default()).unwrap();
 }
 
+/// G2.3g: the router's own packets never wait in the blocks queue. Its
+/// address on the subscribers' side (100.64.0.254, inside the pool) got a
+/// block on a notebook (dev.591) for its DHCP and DNS answers; with nobody
+/// serving the queue they would be dropped. Both what it sends to a
+/// subscriber and what it sends to the internet from that address go out
+/// at once, untranslated (no block, no mapping).
+#[test]
+fn the_routers_own_packets_skip_the_blocks_queue() {
+    if !ready() {
+        return;
+    }
+    let _one = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = lab();
+    let mut p = pool(1000);
+    p.mode = corerouter_model::cgnat::Mode::Blocks;
+    p.endpoint_independent_mapping = false;
+    let mut buf = [0u8; 8];
+    // The internet side takes untranslated shared space for this test only
+    // (its reverse-path check drops a source it has no route to): a packet
+    // let out untranslated would then show here.
+    lab.net
+        .ip(&["route", "add", "100.64.0.0/24", "via", "192.0.2.1"]);
+    for out in [None, Some("e0")] {
+        p.out_interface = out.map(|o| o.parse().unwrap());
+        let c = cfg(p.clone(), vec![]);
+        let mut hal = LinuxHal::new();
+        hal.apply(&Config::default(), &c).unwrap();
+        // To a subscriber, from the router's address beside it.
+        let sub = lab
+            .subs
+            .within(|| UdpSocket::bind("100.64.0.65:7701").unwrap());
+        sub.set_read_timeout(Some(Duration::from_millis(800)))
+            .unwrap();
+        UdpSocket::bind("100.64.0.254:0")
+            .unwrap()
+            .send_to(b"dns", "100.64.0.65:7701")
+            .unwrap();
+        let (_, from) = sub
+            .recv_from(&mut buf)
+            .unwrap_or_else(|e| panic!("out_interface {out:?}: the router's answer was held: {e}"));
+        assert_eq!(from.ip(), std::net::IpAddr::from([100, 64, 0, 254]));
+        // To the internet, from that address: as it is.
+        let server = lab
+            .net
+            .within(|| UdpSocket::bind("192.0.2.2:7702").unwrap());
+        server
+            .set_read_timeout(Some(Duration::from_millis(800)))
+            .unwrap();
+        UdpSocket::bind("100.64.0.254:0")
+            .unwrap()
+            .send_to(b"ntp", "192.0.2.2:7702")
+            .unwrap();
+        let (_, from) = server
+            .recv_from(&mut buf)
+            .unwrap_or_else(|e| panic!("out_interface {out:?}: the router's packet was held: {e}"));
+        assert_eq!(from.ip(), std::net::IpAddr::from([100, 64, 0, 254]));
+        // A subscriber still waits for its block (nobody serves: dropped).
+        lab.subs.within(|| {
+            UdpSocket::bind("100.64.0.65:43010")
+                .unwrap()
+                .send_to(b"x", "192.0.2.2:7702")
+                .unwrap();
+        });
+        assert!(server.recv_from(&mut buf).is_err(), "out_interface {out:?}");
+        hal.apply(&c, &Config::default()).unwrap();
+    }
+    lab.net.ip(&["route", "del", "100.64.0.0/24"]);
+}
+
 /// Port exhaustion (RFC 6888 REQ-3, REQ-11): a subscriber with 64 ports
 /// that opens 80 flows to the same server gets at most 64 through, every
 /// one inside its own slot — it never borrows a neighbour's port — and the
