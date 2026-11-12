@@ -692,8 +692,11 @@ thr_group() {
 CLK=$(getconf CLK_TCK)
 thr_cpu() {
 	if ! local_dut; then
+		# The router's own view, now (not the run's average): the DNS
+		# threads by name, the rest together.
 		cr system.resource.process.print '{"threads":true,"sort":"cpu","limit":5}' 2>/dev/null |
-			jq -r '[.[] | select(.name == "corerouter-daemon") | .tasks[]?] | group_by(.name) |
+			jq -r '[.[] | select(.name == "corerouter-daemon") | .tasks[]? |
+				.name |= (if startswith("dns-") then . else "other" end)] | group_by(.name) |
 				map("\(.[0].name) \(map(.cpu) | add | floor) %") | join(", ")' 2>/dev/null || echo "-"
 		return
 	fi
@@ -835,13 +838,18 @@ test_qps() {
 			daemon_start "$cpus"
 			DPID=$(dut_pid corerouter-daemon)
 			dut_config
-			mcp_open
-			statics_load
-			zone_load zn.lab "$ZONE_N" z
-			mcp_close
 		fi
-		local readers=-
-		local_dut && readers=$(ls /proc/"$DPID"/task | while read -r t; do cat "/proc/$DPID/task/$t/comm"; done | grep -c '^dns-udp' || true)
+		mcp_open
+		statics_load
+		zone_load zn.lab "$ZONE_N" z
+		mcp_close
+		local readers
+		if local_dut; then
+			readers=$(ls /proc/"$DPID"/task | while read -r t; do cat "/proc/$DPID/task/$t/comm"; done | grep -c '^dns-udp' || true)
+		else
+			readers=$(cr system.resource.process.print '{"threads":true,"limit":100}' |
+				jq '[.[] | select(.name == "corerouter-daemon") | .tasks[]? | select(.name == "dns-udp")] | length')
+		fi
 		say ""
 		say "### DUT em CPUs $cpus: $readers threads dns-udp"
 		say ""
@@ -1842,7 +1850,7 @@ cleanup() {
 	set +e
 	mcp_close 2>/dev/null
 	dut_unconfig 2>/dev/null
-	[ $DUT = local ] && daemon_stop
+	{ [ $DUT = local ] || [ $SELFTEST = 1 ]; } && daemon_stop
 	net_down
 	[ "$DAEMON" = image ] && umount_image
 	[ -d "$W/dut" ] && cp "$W/dut/daemon.log" "$OUT/daemon.log" 2>/dev/null
@@ -1858,12 +1866,14 @@ main() {
 	net_up
 	knot_start
 	qfiles
-	if [ $DUT = local ]; then
+	if [ $DUT = local ] || [ $SELFTEST = 1 ]; then
 		daemon_start
 		DPID=$(dut_pid corerouter-daemon)
 	fi
 	if [ $SELFTEST = 1 ]; then
-		ip -n crgen addr add "$DUT_IP/32" dev lo 2>/dev/null || true
+		# The address TLS reaches it on, by the local token (the cable's
+		# address is already there on a real remote router).
+		cr_local ip.address.add "{\"address\":\"$DUT_IP/24\",\"interface\":\"$DUT_IFACE\"}" >/dev/null
 	fi
 	dut_config
 	{
