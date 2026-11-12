@@ -35,6 +35,9 @@ use crate::nat_log::Limit;
 
 /// The journal's name (`journal-cgnat-blocks.log`).
 pub const JOURNAL: &str = "cgnat-blocks";
+/// G2.3g: what [`Session::cgnat_block_for`] says about one of the router's
+/// own addresses (the queue lets the packet go on untranslated).
+pub const ROUTER_ADDRESS: &str = "is an address of the router, not a subscriber";
 /// RFC 6888 REQ-8: a released port is not handed out again for 120 s.
 pub const HOLD_SECS: u64 = 120;
 /// A subscriber's current block this full gets it a new one.
@@ -632,6 +635,15 @@ impl Session {
         let cgnat = self.store().running().ip.cgnat.clone();
         if cgnat.exception_of(subscriber).is_some() {
             return Err(format!("{subscriber} has a 1:1 exception"));
+        }
+        // G2.3g: the router's own address in `inside` (its address on the
+        // access port) is no subscriber; its packets go on untranslated.
+        // The kernel's rule already skips them (`fib saddr type local`):
+        // this covers a packet queued before the address was configured.
+        if self.store().running().ip.addresses.iter().any(|a| {
+            !a.disabled && a.address.addr() == std::net::IpAddr::V4(subscriber)
+        }) {
+            return Err(format!("{subscriber} {ROUTER_ADDRESS}"));
         }
         let pool = cgnat
             .pool_of(subscriber)

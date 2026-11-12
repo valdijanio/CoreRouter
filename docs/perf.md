@@ -3095,3 +3095,31 @@ Tempo de resposta de `interface.wifi.list` pedido sem parar (o comando espera a 
   firmware no `/dev/kmsg`), host com mt7925e, build de teste: 13 ms na primeira chamada (log do
   kernel inteiro + família genl), 0,4 ms nas seguintes (**medido**). A GUI pede a cada 10 s, e o
   `GET_STATION` a cada leitura de estado do rádio.
+
+### G1.30i — scan Wi-Fi: elementos e espectro (2026-11-11)
+
+**Medido** num AMD Ryzen AI MAX+ 395 (32 threads), build `bench` (release), com outro `os build` rodando
+(load 30–47): os números são um teto.
+
+- Elementos de um ponto de acesso (`corerouter-hal`, bench `wifi_ie`, 500 bytes):
+  - hex + parse: 1,6 µs;
+  - só o parse: 57 ns.
+
+  Uma varredura de 256 pontos de acesso custa ~0,4 ms, na thread do rádio, fora da trava da
+  sessão.
+- Um tick do espectro (`corerouter-engine`, bench `wifi_spectrum`, a cada 250 ms, com a
+  sessão travada):
+  - 1000 amostras de 64 bins (um ath9k em background manda 250 a 1000 por tick): de 1,67 ms
+    para **0,47 ms** com a tabela de dBm→mW (um `powf` por bin era 90% do tick);
+  - 250 amostras: de 0,44 para 0,18 ms.
+- A classificação dos últimos 10 s (400 pontos × 40 linhas) leva 0,12 ms. O uso por canal e o
+  piso de ruído levam 21 µs. Os dois só correm quando uma janela pede.
+- Memória: até 1024 pontos × 240 linhas × 1 byte = 240 KiB por varredura, mais três traços; um
+  por rádio. A fila do HAL guarda no máximo 4096 amostras (~2 MiB com 512 bins) e descarta a
+  mais velha.
+
+- 2026-11-11 — G1.30j, snooper do Wi-Fi por quadro (`cargo bench -p corerouter-engine --bench
+  wifi_snoop`, release, 32 núcleos, ~2 570 quadros do ar do laboratório no canal 44), **medido**:
+  parser radiotap + 802.11 37 ns/quadro; parser + tabela 74 ns/quadro; com 4096 estações já na
+  tabela 72 ns/quadro (não cresce com o total); a tabela em JSON uma vez por segundo, 15 µs (lab)
+  e 216 µs (4096 estações).
