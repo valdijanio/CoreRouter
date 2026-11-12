@@ -13,6 +13,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use corerouter_engine::cgnat_blocks::ROUTER_ADDRESS;
 use corerouter_engine::{Shared, lock};
 
 /// How long `recv` waits before the loop looks at the config again.
@@ -100,12 +101,15 @@ fn run(session: &Shared, health: &super::Health) {
             let subs: Vec<_> = batch.iter().map(|p| p.subscriber).collect();
             let got = lock(session).cgnat_blocks_for(&subs, unix_now());
             for (p, got) in batch.iter().zip(got) {
-                // A 1:1 subscriber is translated by its exception rule; one
-                // without a block left is refused, with the ICMP of RFC 6888
-                // REQ-11b (G2.7).
+                // A 1:1 subscriber is translated by its exception rule, and
+                // the router's own address is none (G2.3g); one without a
+                // block left is refused, with the ICMP of RFC 6888 REQ-11b
+                // (G2.7).
                 let done = match &got {
                     Ok(_) => q.verdict(p.id, true),
-                    Err(e) if e.contains("1:1 exception") => q.verdict(p.id, true),
+                    Err(e) if e.contains("1:1 exception") || e.contains(ROUTER_ADDRESS) => {
+                        q.verdict(p.id, true)
+                    }
                     Err(e) => {
                         log::debug!("cgnat: {}: {e}", p.subscriber);
                         q.refuse(p.id).map(|_| ())

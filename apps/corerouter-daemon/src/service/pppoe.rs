@@ -82,7 +82,8 @@ fn run(
 /// The driver (Linux: `AF_PACKET`, `poll`, the slow path's netlink).
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
+    use std::net::Ipv4Addr;
 
     use std::os::fd::BorrowedFd;
     use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
@@ -157,6 +158,19 @@ mod linux {
     /// The sockets a server's port needs (G4.3l): untagged, one per 802.1Q
     /// VLAN id, or one per S-tag in stacked mode (the C-tag stays in the frame
     /// and `proto-pppoe` checks it).
+    /// G4.3v: what IPCP gives as the router's side of each enabled
+    /// server's sessions: the `local_address` of its default profile (an
+    /// address; a pool is not supported there). These are put on `bng0`.
+    pub(super) fn local_addresses(ppp: &corerouter_model::ppp::Ppp, wanted: &[PppoeServer]) -> BTreeSet<Ipv4Addr> {
+        wanted
+            .iter()
+            .filter_map(|w| match ppp.profile(&w.default_profile)?.local_address {
+                Some(corerouter_model::ppp::AddrOrPool::Address(ip)) => Some(ip),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn listens(v: &PppoeServer) -> Vec<Listen> {
         let ids = |r: &[corerouter_model::ppp::VlanRange]| -> Vec<u16> {
             r.iter().flat_map(|x| x.first..=x.last).collect()
@@ -212,6 +226,9 @@ mod linux {
         /// `lost`: since the start).
         dropped: u64,
         lost: u64,
+        /// G4.3v: the profiles' local addresses put on `bng0` (`None`: not
+        /// yet, or the last try failed).
+        locals: Option<BTreeSet<Ipv4Addr>>,
     }
 
     pub(super) fn run(
@@ -255,6 +272,7 @@ mod linux {
             workers: Vec::new(),
             dropped: 0,
             lost: 0,
+            locals: None,
         };
         let mut handles = Vec::new();
         for (lane, bng) in bngs.into_iter().enumerate() {
@@ -329,6 +347,7 @@ mod linux {
                     ifaces.sort();
                     d.choose_plane(session, &shared, ifaces);
                 }
+                d.set_locals(session, local_addresses(&ppp, &wanted));
                 let snap = Snapshot {
                     ppp,
                     pools,
@@ -377,6 +396,8 @@ mod linux {
         for h in handles {
             let _ = h.join();
         }
+        // G4.3v: no server, no gateway address.
+        d.set_locals(session, BTreeSet::new());
         Ok(())
     }
 
@@ -714,6 +735,33 @@ mod linux {
             }
         }
 
+        /// G4.3v: the gateway addresses on `bng0`, when they change (and
+        /// again after a failure).
+        fn set_locals(&mut self, session: &Shared, want: BTreeSet<Ipv4Addr>) {
+            if self.locals.as_ref() == Some(&want) {
+                return;
+            }
+            if want.is_empty() && self.locals.is_none() {
+                // Nothing put there by this run: leave `bng0` alone.
+                self.locals = Some(want);
+                return;
+            }
+            match corerouter_hal_linux::pppoe_io::set_local_addresses(&want) {
+                Ok((added, removed)) => {
+                    if added + removed > 0 {
+                        let list: Vec<String> = want.iter().map(ToString::to_string).collect();
+                        let text = if list.is_empty() { "nenhum".to_owned() } else { list.join(", ") };
+                        lock(session).log_event(&["ppp", "info"], "pppoe", format!("PPPoE: endereço local dos perfis em {}: {text}", corerouter_hal_linux::pppoe_io::SLOW_DEVICE), json!({}));
+                    }
+                    self.locals = Some(want);
+                }
+                Err(e) => {
+                    self.errors.push(format!("local addresses on bng0: {e}"));
+                    self.locals = None;
+                }
+            }
+        }
+
         /// XDP when the HAL has it, else the slow path (once).
         fn choose_plane(&mut self, session: &Shared, shared: &Arc<Mutex<super::super::pppoe_bng::Shared>>, ifaces: Vec<corerouter_model::IfName>) {
             if self.plane.is_some() && self.plane_for == ifaces {
@@ -721,8 +769,12 @@ mod linux {
             }
             let r = lock(session).pppoe_dataplane(true, &ifaces);
             self.plane_for = ifaces;
-            // `interface.pppoe-server.monitor` shows it.
-            guard(shared).stats.dataplane = r.is_ok();
+            // `interface.pppoe-server.monitor` shows it, and why not (G4.3v).
+            {
+                let mut sh = guard(shared);
+                sh.stats.dataplane = r.is_ok();
+                sh.stats.dataplane_reason = r.as_ref().err().map(|why| format!("no XDP: {why}"));
+            }
             match r {
                 Ok(()) => self.plane = Some(true),
                 Err(why) => {
