@@ -2007,7 +2007,11 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
             (
                 cpus_check(root, &top, port, b.smp)?,
                 sensors_check(root, &top, port)?,
-                audit_check(root, &top, port)?,
+                format!(
+                    "{}; {}",
+                    audit_check(root, &top, port)?,
+                    crash_check(root, &top, port)?
+                ),
                 // Last: it leaves a pool in the (snapshot) config.
                 cgnat_check(root, &top, port)?,
             )
@@ -2037,7 +2041,7 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     eprintln!("  cards plugged in after boot (G1.6n, G1.6j): {hot}");
     eprintln!("  sensors (G1.6zf):                   {sensors}");
     eprintln!("  CPUs (G1.6zi):                      {cpus}");
-    eprintln!("  PSI and PCI names (G1.6zr):         {audit}");
+    eprintln!("  PSI, PCI names, crash log (G1.6zr, G1.6zx): {audit}");
     eprintln!("  CGNAT queues (G2.7c):               {cgnat}");
     if let Some(kib) = report.idle_kib {
         eprintln!(
@@ -2133,6 +2137,33 @@ fn audit_check(root: &Path, top: &Path, port: u16) -> Result<String, String> {
         text("vendor"),
         text("model")
     ))
+}
+
+/// G1.6zx: the crash-log service ran on the image (pstore mounted by PID 1)
+/// and no previous boot left a dump; on this firmware (SeaBIOS, no ERST) the
+/// kernel has nowhere to write one.
+fn crash_check(root: &Path, top: &Path, port: u16) -> Result<String, String> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let got = guest_cli(root, top, port, "system.crash.print")?;
+        let v: serde_json::Value = serde_json::from_str(got.trim())
+            .map_err(|e| format!("system.crash.print: {e}: {got:.300}"))?;
+        if v["fed"] == true {
+            if v["crashes"].as_array().is_some_and(|a| !a.is_empty()) {
+                return Err(format!("G1.6zx: a fresh boot reports a crash: {v}"));
+            }
+            return Ok(format!(
+                "crash log fed, backend {}",
+                v["backend"].as_str().unwrap_or("none")
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "G1.6zx: the crash-log service never reported (pstore not mounted?): {v}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 /// G2.7c: a blocks-mode CGNAT pool brings up both of its queue services
