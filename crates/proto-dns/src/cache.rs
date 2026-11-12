@@ -65,6 +65,13 @@ pub struct Cache {
     stale_ms: u64,
 }
 
+/// What [`Cache::take`] took out; dropping it frees the entries.
+#[must_use]
+pub struct Flushed {
+    _map: BTreeMap<Key, Entry>,
+    _by_expiry: BTreeSet<(u64, Key)>,
+}
+
 fn key(name: &str, rtype: RecordType) -> Key {
     (name.to_owned(), u16::from(rtype))
 }
@@ -101,9 +108,19 @@ impl Cache {
     }
 
     pub fn flush(&mut self) {
-        self.map.clear();
-        self.by_expiry.clear();
+        drop(self.take());
+    }
+
+    /// Empties the cache and hands back what it held, for the caller to
+    /// drop outside its lock: freeing a million entries took ~0,45 s, and
+    /// every lookup waited for it (G4.1r, `docs/dns-stress.md`).
+    #[must_use]
+    pub fn take(&mut self) -> Flushed {
         self.used = 0;
+        Flushed {
+            _map: std::mem::take(&mut self.map),
+            _by_expiry: std::mem::take(&mut self.by_expiry),
+        }
     }
 
     /// The fresh answer for `name`/`rtype`, counted as a hit. An expired

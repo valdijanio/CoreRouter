@@ -93,7 +93,9 @@ DUT_CPUS=0-$((NCPU / 2 - 1))
 GEN_CPUS=$((NCPU / 2))-$((NCPU - 1))
 DUT_CPUS_LIST=""
 HOT=10000 STATICS=1000 ZONE_N=10000
-FILL=1000000 ADLIST_N=1000000 ZONE_RECORDS=100000 DHCP_N=20000
+# Zones hold at most 50 000 records each (model::dns_zone::MAX_RECORDS):
+# two of them, 100 000 in all, the case of G4.1p.
+FILL=1000000 ADLIST_N=1000000 ZONE_RECORDS=50000 DHCP_N=20000
 SOAK_SECS=7200
 OUT=""
 while [ $# -gt 0 ]; do
@@ -334,9 +336,16 @@ knot_start() {
 	done
 }
 
+# Unbound's files: where Ubuntu's AppArmor profile for /usr/sbin/unbound
+# lets it read (/etc/unbound/**) when we can write there (the VM), else
+# in $W (a user namespace on a host: no profile applies to the unpacked
+# binary).
+ub_dir() { # <name>
+	if [ -w /etc/unbound ]; then echo "/etc/unbound/crlab-$1"; else echo "$W/$1"; fi
+}
 # Unbound in crgen: DoT (853) and DoH (443) in front of Knot, a
 # self-signed certificate (the DUT runs verify_doh_cert=no).
-SEC=$W/secure
+SEC=$(ub_dir secure)
 secure_start() {
 	mkdir -p "$SEC"
 	rm -f "$SEC/unbound.log"
@@ -350,7 +359,7 @@ server:
   directory: "$SEC"
   pidfile: ""
   use-syslog: no
-  logfile: "$SEC/unbound.log"
+  logfile: ""
   verbosity: 0
   do-daemonize: no
   num-threads: 2
@@ -375,7 +384,7 @@ EOF
 	in_gen "${TENV[@]}" unbound -c "$SEC/unbound.conf" >>"$SEC/unbound.out" 2>&1 &
 	local end=$((SECONDS + 20))
 	until in_gen "${TENV[@]}" kdig +short +tls +timeout=1 +retry=0 @"$SECURE" h1.up.lab A 2>/dev/null | grep -q .; do
-		[ $SECONDS -lt $end ] || { log "Unbound (DoT origin) did not answer: $(tail -n 3 "$SEC/unbound.out" "$SEC/unbound.log" | tr '\n' ' ')"; return 1; }
+		[ $SECONDS -lt $end ] || { log "Unbound (DoT origin) did not answer: $(tail -n 3 "$SEC/unbound.out" | tr '\n' ' ')"; return 1; }
 		sleep 0.3
 	done
 }
@@ -1486,14 +1495,18 @@ PY
 }
 test_ddns() {
 	say ""
-	say "## 7. Zona de $ZONE_RECORDS registros, UPDATE e tempestade de DHCP"
+	say "## 7. Duas zonas de $ZONE_RECORDS registros, UPDATE e tempestade de DHCP"
 	say ""
 	dns_set
 	mcp_open
+	zone_load other.lab "$ZONE_RECORDS" o || { mcp_close; return 0; }
+	local other_ms=$ZONE_LOAD_MS
 	zone_load dyn.lab "$ZONE_RECORDS" d || { mcp_close; return 0; }
 	mcp_close
 	awk -v n="$ZONE_RECORDS" 'BEGIN {srand(3); for (i = 0; i < 20000; i++) printf "d%d.dyn.lab A\n", int(rand() * n)}' >"$QF/dyn"
-	say "Carga da zona (ip.dns.zone.file.load por MCP): $ZONE_LOAD_MS ms."
+	say "Carga de cada zona (ip.dns.zone.file.load por MCP): other.lab $other_ms ms, dyn.lab $ZONE_LOAD_MS ms."
+	say "Os UPDATEs e as concessões vão para dyn.lab; other.lab só está lá (G4.1p: toda mudança reconstrói"
+	say "todas as primárias)."
 	sleep 2
 	say ""
 	say "| carga | $DP_HEAD | UPDATEs/s | escrita em disco por UPDATE | CPU |"
@@ -1593,14 +1606,25 @@ test_hostile() {
 	dns_set
 	junk_py
 	warm hot
-	local res
-	thr_snap "$W/t0"
-	legit_bg hostile-legit 2000
-	res=$(in_gen python3 -I "$W/junk.py" "$DUT_IP" "${CLIENTS[3]}" "$DUR")
-	legit_wait hostile-legit
-	thr_snap "$W/t1"
-	say "Lixo: $(echo "$res" | cut -d' ' -f1) mensagens malformadas em $DUR s ($(echo "$res" | cut -d' ' -f2)/s) de ${CLIENTS[3]}; cliente"
-	say "legítimo ao lado (cache, 2000/s): $(dp_row). CPU: $(thr_cpu "$W/t0" "$W/t1" "$DUR")."
+	local res lim
+	say "Lixo a toda velocidade de ${CLIENTS[3]} (bytes ao acaso, cabeçalho só, contagens falsas, laço de"
+	say "compressão, resposta no lugar de pergunta, 127 rótulos, OPT com versão errada); ao lado, um cliente"
+	say "legítimo (cache, 150/s, abaixo do limite por cliente) de outro endereço."
+	say ""
+	say "| max_queries_per_client | mensagens enviadas | por s | cliente legítimo: $DP_HEAD | CPU |"
+	say "|---|---|---|$DP_SEP|---|"
+	for lim in 200 0; do
+		dns_set "{\"max_queries_per_client\":$lim}"
+		thr_snap "$W/t0"
+		# Under the default per-client limit (200/s), so only the attacker
+		# meets it.
+		legit_bg "hostile-legit-$lim" 150
+		res=$(in_gen python3 -I "$W/junk.py" "$DUT_IP" "${CLIENTS[3]}" "$DUR")
+		legit_wait "hostile-legit-$lim"
+		thr_snap "$W/t1"
+		say "| $lim$([ "$lim" = 200 ] && echo " (padrão)" || echo " (desligado)") | $(echo "$res" | cut -d' ' -f1) | $(echo "$res" | cut -d' ' -f2) | $(dp_row) | $(thr_cpu "$W/t0" "$W/t1" "$DUR") |"
+	done
+	dns_set
 	say ""
 	say "| pergunta | de | EDNS | rcode | bytes da resposta | respostas | fator (resposta/pergunta) |"
 	say "|---|---|---|---|---|---|---|"
@@ -1698,7 +1722,9 @@ test_ops() {
 # 10. Unbound and dnsmasq, same machine, same origin.
 ###########################################################################
 alt_start() { # unbound|dnsmasq
-	local d=$W/alt-$1 ncpu
+	local d ncpu
+	d=$(ub_dir "alt-$1")
+	rm -rf "$d"
 	mkdir -p "$d"
 	ncpu=$(taskset -c "$DUT_CPUS" nproc)
 	case $1 in
@@ -1710,7 +1736,7 @@ server:
   directory: "$d"
   pidfile: ""
   use-syslog: no
-  logfile: "$d/unbound.log"
+  logfile: ""
   verbosity: 0
   do-daemonize: no
   num-threads: $ncpu
@@ -1750,9 +1776,19 @@ alt_stop() {
 	done
 	sleep 1
 }
-compare_one() { # <server label> <flush command>
+compare_one() { # <server label>
 	local who=$1 o0 o1 r0 r1
 	origin_delay 0
+	# Memory first, on a fresh process: after a storm of misses the
+	# allocator keeps freed memory and RSS no longer moves. 10 000 names:
+	# dnsmasq holds no more (its hard limit).
+	sleep 1
+	r0=$(awk '/^VmRSS/ {print $2}' "/proc/$DPID/status")
+	uniq_file "$W/u-cmpfill" 10000 "cf$who"
+	dp "cmp-$who-fill" "$W/u-cmpfill" 600 -n 1 -c 4 -q 50
+	sleep 1
+	r1=$(awk '/^VmRSS/ {print $2}' "/proc/$DPID/status")
+	say "| $who | +10 000 nomes no cache | $(dp_row) | RSS +$(((r1 - r0) / 1024)) MiB ($(awk -v a="$r0" -v b="$r1" 'BEGIN {printf "%.0f", (b - a) * 1024 / 10000}') bytes/entrada) |"
 	warm hot
 	dp "cmp-$who-hot" "$QF/hot" "$DUR" "${SAT_OPTS[@]}"
 	say "| $who | cache quente, saturação | $(dp_row) | |"
@@ -1762,17 +1798,13 @@ compare_one() { # <server label> <flush command>
 	uniq_file "$W/u-cmp" 3000000 "cmp$who"
 	dp "cmp-$who-miss" "$W/u-cmp" "$DUR" -c 8 -T 2 -q 5000
 	say "| $who | miss com origem a 20 ms, saturação | $(dp_row) | |"
+	dp "cmp-$who-miss5k" "$W/u-cmp" "$DUR" -c 8 -T 2 -q 5000 -Q 5000
+	say "| $who | miss com origem a 20 ms, 5000/s | $(dp_row) | |"
 	o0=$(origin_count)
 	dp "cmp-$who-ttl0" "$QF/ttl0" "$DUR" -c 8 -T 2 -q 2000 -Q 2000
 	o1=$(origin_count)
 	say "| $who | o mesmo nome TTL 0 a 2000/s | $(dp_row) | $((o1 - o0)) à origem ($(awk -v o=$((o1 - o0)) -v a="$(dpf 2)" 'BEGIN {if (a > 0) printf "%.2f", o / a}') por resposta) |"
 	origin_delay 0
-	r0=$(awk '/^VmRSS/ {print $2}' "/proc/$DPID/status")
-	uniq_file "$W/u-cmpfill" 100000 "cf$who"
-	dp "cmp-$who-fill" "$W/u-cmpfill" 600 -n 1 -c 8 -T 2 -q 1000
-	sleep 1
-	r1=$(awk '/^VmRSS/ {print $2}' "/proc/$DPID/status")
-	say "| $who | +100 000 nomes no cache | $(dp_row) | RSS +$(((r1 - r0) / 1024)) MiB ($(awk -v a="$r0" -v b="$r1" 'BEGIN {printf "%.0f", (b - a) * 1024 / 100000}') bytes/entrada) |"
 }
 test_compare() {
 	local_dut || { say ""; say "## 10. Comparação: só com --dut local"; return 0; }
@@ -1785,6 +1817,11 @@ test_compare() {
 	say ""
 	say "| servidor | carga | $DP_HEAD | origem / memória |"
 	say "|---|---|$DP_SEP|---|"
+	# A fresh daemon: its RSS is not inflated by what earlier tests freed.
+	daemon_stop
+	daemon_start
+	DPID=$(dut_pid corerouter-daemon)
+	dut_config
 	dns_set '{"max_concurrent_queries":1000,"cache_size":1048576}'
 	flush
 	compare_one CoreRouter

@@ -364,10 +364,15 @@ impl Resolver {
         self.state().cache.used_bytes()
     }
 
+    /// Empties the cache and the failure holds. The entries are freed
+    /// after the lock is let go: lookups do not wait for it (G4.1r).
     pub fn flush(&self) {
-        let mut st = self.state();
-        st.cache.flush();
-        st.failures.clear();
+        let old = {
+            let mut st = self.state();
+            st.failures.clear();
+            st.cache.take()
+        };
+        drop(old);
     }
 
     /// Names and types held after a failure now (RFC 9520).
