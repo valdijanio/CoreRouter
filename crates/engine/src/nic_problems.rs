@@ -246,13 +246,29 @@ pub struct NicState {
     ignored: Vec<Ignored>,
     /// (kind, device) already in the log.
     logged: BTreeSet<(String, String)>,
+    /// Devices the last reading saw without a driver: one look is not
+    /// enough to say so (see [`Session::nic_reading_feed`]).
+    unbound: BTreeSet<String>,
 }
 
 impl Session {
     /// A new reading, from the daemon's service. Only arithmetic and the log
     /// line of what changed: the reads were outside the lock.
+    ///
+    /// A card without a driver counts from the second look in a row on: the
+    /// daemon's first look comes while PID 1 still loads the modules, and a
+    /// USB card is claimed a moment after it shows up on the bus (r8152 on
+    /// the notebook: looked at 1 s before its module loaded, a warning in the
+    /// log, the health and the update's confirmation, gone 7 s later —
+    /// **medido** on dev.616, 2026-11-12). The daemon looks every 10 s
+    /// (`service::nic_problems`). Firmware and Safe Mode come from the
+    /// kernel's log and count at once.
     pub fn nic_reading_feed(&mut self, reading: NicReading) {
-        let (problems, ignored) = evaluate(&reading);
+        let (mut problems, ignored) = evaluate(&reading);
+        let unbound: BTreeSet<String> =
+            problems.iter().filter(|p| p.kind == "no-driver").map(|p| p.device.clone()).collect();
+        let before = self.ext::<NicState>().map(|s| s.unbound.clone()).unwrap_or_default();
+        problems.retain(|p| p.kind != "no-driver" || before.contains(&p.device));
         let now: BTreeSet<(String, String)> = problems.iter().map(|p| (p.kind.to_owned(), p.device.clone())).collect();
         let was = self.ext::<NicState>().map(|s| s.logged.clone()).unwrap_or_default();
         for p in problems.iter().filter(|p| !was.contains(&(p.kind.to_owned(), p.device.clone()))) {
@@ -267,6 +283,7 @@ impl Session {
             s.problems = problems;
             s.ignored = ignored;
             s.logged = now;
+            s.unbound = unbound;
         }
     }
 
@@ -545,6 +562,25 @@ mod tests {
         assert_eq!(got.len(), 2, "{got:?}");
         assert!(got[1].contains("gone"), "{got:?}");
         assert!(s.nic_problem_lines().is_empty());
+    }
+
+    #[test]
+    fn a_card_bound_by_the_next_look_never_warns() {
+        let mut s = Session::virtual_lab();
+        // First look: the module is still loading.
+        s.nic_reading_feed(reading(vec![dev("0000:05:00.0", None, None)], &[]));
+        assert!(s.nic_problem_lines().is_empty());
+        assert!(s.nic_health().is_none_or(|h| h.warn.is_empty()));
+        // Next look: bound. Nothing was said, nothing goes.
+        s.nic_reading_feed(reading(vec![dev("0000:05:00.0", Some("r8152"), Some("ether2"))], &[]));
+        let nic = s.execute("log.print", &json!({})).unwrap();
+        assert!(!nic.as_array().unwrap().iter().any(|l| l["origin"] == "nic"), "{nic}");
+        // Missing firmware is the kernel's word: at once.
+        s.nic_reading_feed(reading(
+            vec![dev("0000:02:00.0", Some("r8169"), Some("ether1"))],
+            &["r8169 0000:02:00.0: Unable to load firmware rtl_nic/rtl8168h-2.fw (-2)"],
+        ));
+        assert_eq!(s.nic_problem_lines().len(), 1);
     }
 
     #[test]
