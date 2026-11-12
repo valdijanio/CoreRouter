@@ -59,6 +59,46 @@ fn meminfo_in_bytes() {
     assert_eq!(parse_meminfo("MemTotalX: 5 kB\n").total, 0);
 }
 
+/// G1.6ql: the nf_conntrack slab from SLUB's files or `/proc/slabinfo`.
+#[test]
+fn slab_cache_of_conntrack() {
+    assert_eq!(parse_slab_count("1873 N0=1000 N1=873\n"), Some(1873));
+    assert_eq!(
+        parse_slab_cache("320\n", "10 N0=10\n", "64\n"),
+        Some(SlabCache {
+            object_bytes: 320,
+            objects: 10,
+            total_objects: 64
+        })
+    );
+    // Total below in use (read between two updates) is not less than in use.
+    assert_eq!(
+        parse_slab_cache("256", "70", "64").map(|c| c.total_objects),
+        Some(70)
+    );
+    assert_eq!(parse_slab_cache("0", "1", "1"), None);
+    assert_eq!(parse_slab_cache("x", "1", "1"), None);
+    // `/proc/slabinfo` 2.1, as Linux 6.x prints it.
+    let info = "slabinfo - version: 2.1\n\
+        # name            <active_objs> <num_objs> <objsize> <objperslab> <pagesperslab> : tunables <limit> <batchcount> <sharedfactor> : slabdata <active_slabs> <num_slabs> <sharedavail>\n\
+        nf_conntrack_expect      0      0    256   16    1 : tunables    0    0    0 : slabdata      0      0      0\n\
+        nf_conntrack        4096   4160    320   25    2 : tunables    0    0    0 : slabdata    166    166      0\n";
+    assert_eq!(
+        parse_slabinfo(info, "nf_conntrack"),
+        Some(SlabCache {
+            object_bytes: 320,
+            objects: 4096,
+            total_objects: 4160
+        })
+    );
+    assert_eq!(parse_slabinfo(info, "nf_conntrack_e"), None);
+    assert_eq!(
+        parse_slabinfo("nf_conntrack 1 2\n", "nf_conntrack"),
+        None,
+        "cut line"
+    );
+}
+
 #[test]
 fn loadavg_uptime_and_pressure() {
     let l = parse_loadavg(&fixture("proc/loadavg")).unwrap();
@@ -255,6 +295,18 @@ fn the_whole_machine_from_the_fixture_tree() {
     assert_eq!(wifi.speed_mbps, None);
     assert!(!s.net.iter().find(|n| n.name == "lo").unwrap().up);
     assert_eq!((s.conntrack, s.conntrack_max), (Some(1873), Some(262_144)));
+    // G1.6ql: the lookup table and the nf_conntrack slab (SLUB's sysfs).
+    assert_eq!(s.conntrack_buckets, Some(262_144));
+    assert_eq!(
+        s.conntrack_slab,
+        Some(SlabCache {
+            object_bytes: 256,
+            objects: 1873,
+            total_objects: 1952
+        })
+    );
+    assert_eq!(s.memory.slab_reclaimable, 2_288_388 * 1024);
+    assert_eq!(s.memory.slab_unreclaimable, 898_176 * 1024);
     let procs = s.processes.unwrap();
     assert_eq!(procs.len(), 3);
     assert!(procs.iter().any(|p| p.name == "cp"));
@@ -499,6 +551,8 @@ proptest! {
         let _ = parse_uptime(&text);
         let _ = parse_cpu_model(&text);
         let _ = unescape(&text);
+        let _ = parse_slabinfo(&text, "nf_conntrack");
+        let _ = parse_slab_cache(&text, &text, &text);
     }
 
     #[test]

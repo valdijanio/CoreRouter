@@ -45,6 +45,12 @@ Preview counts the subscribers remapped and the live connections that would be d
 Subscribers per band of their 7-day peak, as a share of the limit.",
     ),
     (
+        "cgnat.capacity.conntrack",
+        "## Conntrack
+
+Every translated connection takes a conntrack entry; with the table full the kernel drops new connections whatever ports the pool has. The check: subscribers of every enabled pool × connections each (300 by default, `ip.firewall.cgnat.set connections_per_subscriber`) against `nf_conntrack_max`. Too small: the button opens System › Tuning › Profiles with the profile that holds it picked.",
+    ),
+    (
         "cgnat.capacity.hit",
         "## Hit the limit, 24 h
 

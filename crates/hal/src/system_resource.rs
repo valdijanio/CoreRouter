@@ -120,6 +120,23 @@ pub struct Memory {
     pub cached: u64,
     pub swap_total: u64,
     pub swap_free: u64,
+    /// The kernel's slab caches (G1.6ql): what it can give back under
+    /// pressure (`SReclaimable`) and what it cannot (`SUnreclaim`).
+    pub slab_reclaimable: u64,
+    pub slab_unreclaimable: u64,
+}
+
+/// One slab cache of the kernel (G1.6ql: `nf_conntrack`), from SLUB's
+/// `/sys/kernel/slab/<name>` (only root reads it).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct SlabCache {
+    /// Bytes one object takes in the slab, alignment and metadata
+    /// included (`slab_size`).
+    pub object_bytes: u64,
+    /// Objects in use (`objects`).
+    pub objects: u64,
+    /// Objects the cache's slabs hold, in use or not (`total_objects`).
+    pub total_objects: u64,
 }
 
 /// One line pair of `/proc/pressure/<resource>` (PSI): the share of time,
@@ -318,6 +335,11 @@ pub struct Sample {
     pub swap_out: Option<u64>,
     pub conntrack: Option<u64>,
     pub conntrack_max: Option<u64>,
+    /// `nf_conntrack_buckets`: the lookup table, allocated whole (G1.6ql).
+    pub conntrack_buckets: Option<u64>,
+    /// The `nf_conntrack` slab cache; `None` when it cannot be read (not
+    /// root, conntrack not loaded, not SLUB).
+    pub conntrack_slab: Option<SlabCache>,
     /// `Some` only when [`Want::processes`].
     pub processes: Option<Vec<Process>>,
     /// The router's own processes, on every reading (G1.6qd): this one
@@ -575,6 +597,8 @@ impl ResourceSampler for LabSampler {
                 cached: 6 << 30,
                 swap_total: 4 << 30,
                 swap_free: (4 << 30) - (64 << 20),
+                slab_reclaimable: 900 << 20,
+                slab_unreclaimable: 420 << 20,
             },
             pressure: Pressure {
                 cpu: Some(Psi {
@@ -656,6 +680,16 @@ impl ResourceSampler for LabSampler {
             swap_out: Some(1_024),
             conntrack: Some(200_000 + wave(t, 900, 80_000)),
             conntrack_max: Some(1 << 20),
+            conntrack_buckets: Some(1 << 18),
+            // SLUB keeps whole slabs: room for a few more than in use.
+            conntrack_slab: Some({
+                let objects = 200_000 + wave(t, 900, 80_000);
+                SlabCache {
+                    object_bytes: 256,
+                    objects,
+                    total_objects: objects.div_ceil(16) * 16 + 32,
+                }
+            }),
             processes,
             router,
         }

@@ -11,7 +11,7 @@
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use corerouter_hal::clock::SystemClock;
+use corerouter_hal::clock::{HardwareClock, SystemClock};
 use corerouter_hal_linux::clock::LinuxClock;
 use rustix::time::{ClockId, clock_gettime};
 
@@ -87,5 +87,73 @@ fn frequency_makes_the_clock_run_fast_and_slow() {
     clock.set_frequency_ppm(5000.0).unwrap();
     assert!(clock.frequency_ppm().unwrap() <= 500.0);
     clock.set_frequency_ppm(0.0).unwrap();
-    clock.synchronized(1_000_000, 10_000_000).unwrap();
+    clock
+        .synchronized(1_000_000, 10_000_000, HardwareClock::Follow)
+        .unwrap();
+}
+
+/// The RTC, in seconds since 1970 as the kernel reads it (as UTC).
+fn rtc() -> i64 {
+    std::fs::read_to_string("/sys/class/rtc/rtc0/since_epoch")
+        .expect("the lab VM has an RTC")
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+fn wall_secs() -> i64 {
+    i64::try_from(wall() / 1_000_000_000).unwrap()
+}
+
+/// Waits until the kernel's RTC write would have run: `ntp_notify_cmos_timer`
+/// queues `sync_hw_clock` at once, which waits for the right half second
+/// (kernel 6.18 `kernel/time/ntp.c`); 3 s covers it.
+fn rtc_after_sync() -> i64 {
+    sleep(Duration::from_secs(3));
+    rtc() - wall_secs()
+}
+
+/// G4.6o: `LeaveAlone` sets the clock and never the RTC; `Follow` lets the
+/// kernel write it (the installed router, as before).
+#[test]
+fn leave_alone_keeps_the_rtc_and_follow_writes_it() {
+    if !enabled() {
+        return;
+    }
+    let mut clock = LinuxClock::realtime();
+    clock.take_over().unwrap();
+    clock.set_frequency_ppm(0.0).unwrap();
+    // Start from an RTC that agrees with the system clock.
+    clock
+        .synchronized(1_000_000, 10_000_000, HardwareClock::Follow)
+        .unwrap();
+    let start = rtc_after_sync();
+    eprintln!("RTC − system at the start: {start} s");
+    assert!(start.abs() <= 2, "the RTC should follow: {start} s");
+
+    // 100 s forward, as the live image's first sync of a 2 h 50 min RTC.
+    clock.step(100_000_000_000).unwrap();
+    clock
+        .synchronized(1_000_000, 10_000_000, HardwareClock::LeaveAlone)
+        .unwrap();
+    let left = rtc_after_sync();
+    eprintln!("LeaveAlone after +100 s: RTC − system = {left} s");
+    assert!((left + 100).abs() <= 2, "the RTC moved: {left} s");
+
+    // Follow: the kernel writes it.
+    clock
+        .synchronized(1_000_000, 10_000_000, HardwareClock::Follow)
+        .unwrap();
+    let followed = rtc_after_sync();
+    eprintln!("Follow: RTC − system = {followed} s");
+    assert!(followed.abs() <= 2, "the RTC did not follow: {followed} s");
+
+    // Put the clock and the RTC back.
+    clock.step(-100_000_000_000).unwrap();
+    clock
+        .synchronized(1_000_000, 10_000_000, HardwareClock::Follow)
+        .unwrap();
+    let back = rtc_after_sync();
+    eprintln!("back: RTC − system = {back} s");
+    assert!(back.abs() <= 2, "{back} s");
 }
