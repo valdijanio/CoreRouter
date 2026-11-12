@@ -878,7 +878,7 @@ mod io {
         fn open_at(name: &IfName, dir: PathBuf, binary: &Path) -> Result<Self, HalError> {
             // G1.30a: an access point on this radio lets go first (a daemon
             // restarted after the mode changed).
-            if let Ok(hdir) = runtime_dir("hostapd")
+            if let Ok(hdir) = crate::wifi_ap::radio_dir(name)
                 && hdir.join("global").exists()
                 && let Ok(h) = Ctrl::connect_as("hostapd", &hdir, &hdir.join("global"))
             {

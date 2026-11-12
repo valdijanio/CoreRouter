@@ -1,8 +1,9 @@
 //! A Wi-Fi radio as an access point on Linux (G1.30a): `hostapd` 2.12,
 //! driven through its control sockets, with nothing written to a file.
 //!
-//! One `hostapd` serves every radio of the router, started with only its
-//! global socket (`-g <runtime>/hostapd/global`). A radio joins it by a
+//! Each radio has a `hostapd` of its own (G1.30m: `radio_dir`), started
+//! with only its global socket (`-g <runtime>/hostapd/<radio>/global`). The
+//! radio joins it by a
 //! dynamic `ADD <ifname> <ctrl dir> nl80211` (hostapd 2.12
 //! `src/ap/hostapd.c` `hostapd_add_iface`: an interface with the defaults
 //! and no configuration file), gets its settings one `SET` at a time on its
@@ -348,6 +349,8 @@ fn push(events: &mut Vec<WifiApEvent>, e: WifiApEvent) {
 
 #[cfg(target_os = "linux")]
 pub use io::LinuxWifiApPort;
+#[cfg(target_os = "linux")]
+pub(crate) use io::radio_dir;
 
 #[cfg(target_os = "linux")]
 mod io {
@@ -419,6 +422,23 @@ mod io {
             );
             let _ = std::fs::remove_file(dir.join("global"));
         }
+    }
+
+    /// G1.30m: the radio's own hostapd: `<runtime>/hostapd/<radio>`, with
+    /// its global socket, pid file and `if/`. One process per radio, not
+    /// one for all: hostapd takes a station that associates with one of its
+    /// BSSes out of every other BSS it runs (`src/ap/utils.c`,
+    /// `prune_associations`), right for a phone roaming between them and
+    /// wrong for a bond's station-bridges, which share the bond's MAC on
+    /// two links. Measured in the lab: the two peers of a bond took turns,
+    /// each association dropping the other. A radio's hostapd failing also
+    /// leaves the others up.
+    pub(crate) fn radio_dir(name: &IfName) -> Result<PathBuf, HalError> {
+        let dir = runtime_dir("hostapd")?.join(name.as_str());
+        std::fs::create_dir_all(dir.join("if")).map_err(|e| io_err("runtime directory", e))?;
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        Ok(dir)
     }
 
     fn io_err(what: &str, e: impl std::fmt::Display) -> HalError {
@@ -833,7 +853,7 @@ mod io {
 
     impl LinuxWifiApPort {
         pub fn open(name: &IfName) -> Result<Self, HalError> {
-            let dir = runtime_dir("hostapd")?;
+            let dir = radio_dir(name)?;
             let (orders, rx) = mpsc::sync_channel(MAX_ORDERS);
             let shared = Arc::new(Mutex::new(Seen::default()));
             let (theirs, radio, bin) = (Arc::clone(&shared), name.clone(), binary());
