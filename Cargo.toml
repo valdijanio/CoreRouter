@@ -70,6 +70,9 @@ tungstenite = { version = "0.30.0", default-features = false, features = ["hands
 # SIGINT/SIGTERM for the daemon's graceful shutdown: `flag::register` (safe API, unix and
 # Windows; the iterator is unix-only).
 signal-hook = { version = "0.3.18", default-features = false }
+# G1.31: WireGuard keys in the engine (it compiles for wasm32): Curve25519 to derive a public
+# key from a private one, pure Rust (dalek, BSD-3). The data plane is the kernel's.
+x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets", "zeroize"] }
 # Line editor of `corerouter-cli shell` (history file, completion, colors, key handlers).
 rustyline = { version = "19.0.0", default-features = false, features = ["custom-bindings", "with-file-history"] }
 # G0.3: password hashes (Argon2id, pure Rust; salt from the OS, not from `rand`).

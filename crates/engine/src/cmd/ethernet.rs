@@ -366,7 +366,9 @@ fn physical(cfg: &Config, name: &IfName, depth: u8, out: &mut BTreeSet<IfName>) 
                 physical(cfg, &m.name, depth + 1, out);
             }
         }
-        InterfaceKind::Loopback => {}
+        // G1.31: the encrypted packets leave by whatever route reaches each
+        // peer, not by a port of its own.
+        InterfaceKind::Loopback | InterfaceKind::Wireguard(_) => {}
     }
 }
 

@@ -78,6 +78,8 @@ pub struct VirtualHal {
     dhcp6: Option<SharedResponder6>,
     /// Simulated BNG answering the lab's PPPoE clients (G3.9ga).
     pppoe: Option<crate::pppoe_client::SharedPppoeLab>,
+    /// WireGuard interfaces as the engine set them (G1.31).
+    wireguard: crate::wireguard::LabWireguard,
     /// Simulated hosts asking the router's DHCP server (G4.2a).
     dhcp_hosts: Option<crate::dhcp_server::SharedLabClients>,
     /// Simulated DHCPv6 clients (G4.2c).
@@ -274,6 +276,7 @@ impl VirtualHal {
             dhcp: None,
             dhcp6: None,
             pppoe: None,
+            wireguard: crate::wireguard::LabWireguard::default(),
             dhcp_hosts: None,
             dhcp6_hosts: None,
             reenabled: BTreeMap::new(),
@@ -1690,6 +1693,35 @@ impl Hal for VirtualHal {
         self.wifi.country()
     }
 
+    fn wireguard_set(
+        &mut self,
+        name: &IfName,
+        dev: &crate::wireguard::WgDevice,
+        public: &crate::wireguard::Key,
+    ) -> Result<(), HalError> {
+        let applied = &self.applied;
+        self.wireguard.retain(|n| is_wireguard(applied, n));
+        if !is_wireguard(applied, name) {
+            return Err(HalError::Rejected(format!(
+                "no WireGuard interface '{name}' in the lab"
+            )));
+        }
+        self.wireguard.set(name, dev, *public);
+        Ok(())
+    }
+
+    fn wireguard_status(
+        &mut self,
+        name: &IfName,
+        now_unix: u64,
+    ) -> Result<crate::wireguard::WgStatus, HalError> {
+        let applied = &self.applied;
+        self.wireguard.retain(|n| is_wireguard(applied, n));
+        self.wireguard.status(name, now_unix).ok_or_else(|| {
+            HalError::Rejected(format!("no WireGuard interface '{name}' in the lab"))
+        })
+    }
+
     fn pppoe_client_port(
         &mut self,
         client: &IfName,
@@ -2036,6 +2068,13 @@ impl CableTest for LabCableTest {
         }
         Ok(self.0.clone())
     }
+}
+
+/// G1.31: `name` is an enabled WireGuard interface of `cfg`.
+fn is_wireguard(cfg: &Config, name: &IfName) -> bool {
+    cfg.interfaces
+        .get(name)
+        .is_some_and(|i| !i.disabled && matches!(i.kind, InterfaceKind::Wireguard(_)))
 }
 
 #[cfg(test)]

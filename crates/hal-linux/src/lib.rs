@@ -48,6 +48,10 @@ pub mod plan;
 /// Generic netlink codec (pure) and socket (Linux) for G1.19.
 mod genl;
 
+/// WireGuard over generic netlink (G1.31).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod wireguard;
+
 /// `interface.ethernet.set` targets over the port's own settings (G1.20).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod ether;
@@ -314,6 +318,10 @@ mod linux {
         /// link dump per tick instead of two. Taken by the first reader,
         /// dropped by `apply`.
         managed: Option<BTreeMap<u32, IfName>>,
+        /// G1.31: what each WireGuard link was last told, for the endpoints
+        /// (sent again only when the configured one changes: the kernel
+        /// follows a roaming peer).
+        wireguard: BTreeMap<IfName, corerouter_hal::wireguard::WgDevice>,
     }
 
     impl LinuxHal {
@@ -1564,6 +1572,35 @@ mod linux {
 
         fn wifi_monitor(&self) -> Result<corerouter_hal::wifi_monitor::SharedWifiMonitor, String> {
             Ok(std::sync::Arc::new(crate::wifi_monitor::LinuxMonitor))
+        }
+
+        fn wireguard_set(
+            &mut self,
+            name: &IfName,
+            dev: &corerouter_hal::wireguard::WgDevice,
+            public: &corerouter_hal::wireguard::Key,
+        ) -> Result<(), HalError> {
+            let _ = public;
+            if !matches!(self.claims.get(name), Some(InterfaceKind::Wireguard(_))) {
+                return Err(HalError::Rejected(format!(
+                    "'{name}' is not a WireGuard interface of this router"
+                )));
+            }
+            let changed = crate::wireguard::write(name.as_str(), dev, self.wireguard.get(name))
+                .map_err(HalError::Io)?;
+            if changed > 0 {
+                log::info!("wireguard: {name}: {changed} peer(s) changed");
+            }
+            self.wireguard.insert(name.clone(), dev.clone());
+            Ok(())
+        }
+
+        fn wireguard_status(
+            &mut self,
+            name: &IfName,
+            _now_unix: u64,
+        ) -> Result<corerouter_hal::wireguard::WgStatus, HalError> {
+            crate::wireguard::read(name.as_str()).map_err(HalError::Io)
         }
 
         fn pppoe_client_port(
