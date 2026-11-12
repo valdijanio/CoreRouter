@@ -409,9 +409,28 @@ fn load_sensors(index: &Index, dir: &Path, log: impl Fn(&str)) {
     log(&format!("sensors: {what} ({} ms)", t.elapsed().as_millis()));
 }
 
+/// G1.6zy: the memory controllers EDAC registered (`mc0`, `mc1`…).
+fn edac_controllers(mc: &Path) -> usize {
+    fs::read_dir(mc).map_or(0, |rd| {
+        rd.flatten()
+            .take(64)
+            .filter(|e| {
+                e.file_name().to_str().is_some_and(|n| {
+                    n.strip_prefix("mc")
+                        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+                })
+            })
+            .count()
+    })
+}
+
 /// G1.6zy: the EDAC drivers of [`EDAC_MODULES`], on a machine whose memory
-/// has ECC. The one of another controller fails with `ENODEV` (silent).
+/// has ECC. `pnd2_edac` fails with `ENODEV` where its controller is not;
+/// `igen6_edac` is a PCI driver and loads either way, so a driver counts as
+/// found only when a controller registered (**medido** in QEMU: loaded,
+/// no `mc0`).
 fn load_edac(index: &Index, dir: &Path, log: impl Fn(&str)) {
+    let mc = Path::new("/sys/devices/system/edac/mc");
     let mut found = Vec::new();
     for module in EDAC_MODULES {
         let Some((own, needs)) = index.chain(module).split_last() else {
@@ -424,21 +443,24 @@ fn load_edac(index: &Index, dir: &Path, log: impl Fn(&str)) {
             log(&format!("memory errors: {module}: {rel}: {e}"));
             continue;
         }
+        let before = edac_controllers(mc);
         match probe_result(insert(dir, own, c"")) {
-            Probe::Found => found.push(module),
-            Probe::Absent => {}
+            Probe::Found if edac_controllers(mc) > before => found.push(module),
+            Probe::Found | Probe::Absent => {}
             Probe::Firmware => log(&format!(
                 "memory errors: {module}: the firmware reports the errors itself (GHES)"
             )),
             Probe::Failed(e) => log(&format!("memory errors: {module}: {own}: {e}")),
         }
     }
-    if !found.is_empty() {
-        log(&format!(
+    log(&if found.is_empty() {
+        "memory errors: no memory controller of igen6_edac or pnd2_edac answered".to_owned()
+    } else {
+        format!(
             "memory errors: {} watches the memory controller",
             found.join(", ")
-        ));
-    }
+        )
+    });
 }
 
 /// The modules of `pass` the devices in `aliases` ask for, each once, in
@@ -619,6 +641,20 @@ pub fn start(log: fn(&str), sensors: bool, edac: bool, hwsim: Option<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G1.6zy: the controllers EDAC registered, by directory name.
+    #[test]
+    fn edac_controllers_by_name() {
+        let dir = std::env::temp_dir().join(format!("cr-init-edac-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        for d in ["power", "subsystem", "mc0", "mc1", "mcx"] {
+            fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        fs::write(dir.join("uevent"), "").unwrap();
+        assert_eq!(edac_controllers(&dir), 2);
+        assert_eq!(edac_controllers(&dir.join("none")), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     const DEP: &str = "\
 kernel/drivers/net/ethernet/intel/ice/ice.ko: kernel/drivers/net/aux.ko kernel/lib/base.ko
