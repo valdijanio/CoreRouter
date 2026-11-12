@@ -46,6 +46,8 @@ pub(crate) const PANEL: Panel = Panel {
 pub(crate) struct NtpPanel {
     /// `system.ntp.client.get`, while the window is open.
     pub(crate) state: Option<Value>,
+    /// `system.clock.print` (G4.6p): the router's time, the first line.
+    pub(crate) clock: Option<Value>,
     pub(crate) form: NtpForm,
     /// The settings as the engine last reported them.
     base: NtpForm,
@@ -133,18 +135,32 @@ struct Reply(NtpForm);
 impl PanelState for NtpPanel {
     fn queries(&self, app: &CoreRouterUi) -> Vec<Query> {
         if app.open.contains(&Win::Panel(WIN)) {
-            vec![Query {
-                key: "get",
-                command: GET,
-                params: Value::Null,
-            }]
+            vec![
+                Query {
+                    key: "get",
+                    command: GET,
+                    params: Value::Null,
+                },
+                Query {
+                    key: "clock",
+                    command: crate::system_clock::PRINT,
+                    params: Value::Null,
+                },
+            ]
         } else {
             Vec::new()
         }
     }
 
     fn arrived(&mut self, _app: &mut CoreRouterUi, key: &'static str, _: RequestId, value: Value) {
-        if key != "get" || !value.is_object() {
+        if !value.is_object() {
+            return;
+        }
+        if key == "clock" {
+            self.clock = Some(value);
+            return;
+        }
+        if key != "get" {
             return;
         }
         let now = NtpForm::of(&value);
@@ -196,6 +212,13 @@ impl NtpPanel {
         let l = app.lang.labels;
         let dirty = self.form.set_params(&self.base).is_some();
         let help = &mut self.help;
+        if let Some(c) = &self.clock {
+            ui.horizontal(|ui| {
+                label(ui, help, l, "clock_now", "Clock");
+                crate::system_clock::line(ui, c);
+            });
+            ui.separator();
+        }
         Grid::new("ntp-settings")
             .num_columns(2)
             .spacing([12.0, 6.0])

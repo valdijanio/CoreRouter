@@ -89,6 +89,14 @@ if [ -f "$T/usr/sbin/hostapd" ]; then
 	cp "$T/usr/sbin/hostapd" "$BINARIES_DIR/test-tools/hostapd"
 fi
 rm -f "$T/usr/bin/hostapd_cli" "$T/etc/hostapd.conf"
+# G1.30m: iw is the bonding lab's tool (scripts/wifi-bond-lab.sh), not the
+# image's.
+for d in usr/sbin sbin usr/bin; do
+	if [ -f "$T/$d/iw" ]; then
+		mkdir -p "$BINARIES_DIR/test-tools"
+		mv "$T/$d/iw" "$BINARIES_DIR/test-tools/iw"
+	fi
+done
 # G1.6zr: pci.ids (hwdata) only for the PCI network cards the image's drivers
 # bind: the ids in the pci: aliases of the modules and built-ins under
 # drivers/net and of virtio_pci (a VM's virtio-net card is a PCI device of

@@ -48,7 +48,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     )
     .positional("name"),
     cmd!(query "interface.wifi.peer.print", "Wi-Fi Peers", [], None,
-        "{radio?: string} → [{name, radio, mac_address, comment, disabled, state (up | away | disabled), bridge, bond, signal, tx_rate, rx_rate, uptime_secs, retry_percent}]",
+        "{radio?: string} → [{name, radio, mac_address, comment, disabled, state (up | away | disabled), bridge, bond, signal, tx_rate, rx_rate, uptime_secs, retry_percent, tx_failed, airtime_percent (share of the air the link took between the last two reads, 2 s apart; null: the driver does not count airtime)}]",
         always, print),
 ];
 
@@ -168,6 +168,9 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
                 .and_then(|a| a.status.clients.iter().find(|c| c.mac == mac));
             let up = client.is_some_and(|c| c.peer.is_some());
             let l = client.map(|c| &c.link);
+            let airtime = rt
+                .and_then(|rt| rt.aps.get(&p.radio))
+                .and_then(|a| a.airtime_percent.get(&mac).copied());
             json!({
                 "name": i.name,
                 "radio": p.radio,
@@ -182,6 +185,8 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
                 "rx_rate": l.and_then(|l| l.rx.as_ref()).map(super::wifi::rate_json),
                 "uptime_secs": l.and_then(|l| l.connected_secs),
                 "retry_percent": l.and_then(|l| super::wifi::retry_percent(l.tx_retries, l.tx_packets)),
+                "tx_failed": l.and_then(|l| l.tx_failed),
+                "airtime_percent": airtime,
             })
         })
         .collect();

@@ -68,14 +68,17 @@ AP vai usar, ou o motivo de não poder, no próprio campo.
   `status` com os clientes, `events`). O laboratório virtual (`lab_wifi_ap.rs`) sobe o AP, passa
   dois polls em checagem de radar num canal DFS e recebe dois clientes inventados (um celular
   WPA3 Wi-Fi 6 e um notebook WPA2 Wi-Fi 5, que não entra numa rede só WPA3).
-- **Linux** (`crates/hal-linux/src/wifi_ap.rs`): um `hostapd` 2.12 para todos os rádios,
-  iniciado só com o socket global (`-B -g <runtime>/hostapd/global`), **sem arquivo de
+- **Linux** (`crates/hal-linux/src/wifi_ap.rs`): um `hostapd` 2.12 **por rádio** (G1.30m: o
+  hostapd tira uma estação que associa a um BSS de todos os outros BSS do mesmo processo,
+  `src/ap/utils.c` `prune_associations`; os station-bridges de um bond têm o mesmo MAC em dois
+  enlaces e se derrubavam), iniciado só com o socket global
+  (`-B -g <runtime>/hostapd/<rádio>/global`), **sem arquivo de
   configuração e sem log** (`-d`, `-f`, `-s` levariam os valores do `SET`). Cada rádio entra
   por um `ADD <ifname> <dir> nl80211` dinâmico (`hostapd_add_iface`: interface com os padrões e
   sem arquivo), recebe os campos um `SET` por vez no socket dele (`hostapd_set_iface` →
   `hostapd_config_fill`, o mesmo leitor do arquivo) e sobe com `ENABLE`. O SSID vai em hex
   (`ssid2`); a senha vai num `SET` e em nenhum outro lugar. Mudou a configuração: `REMOVE` e
-  um `ADD` novo, sem resto da anterior. O `hostapd` termina com o último AP (o `hostapd` não tem
+  um `ADD` novo, sem resto da anterior. O `hostapd` do rádio termina quando o AP sai (ele não tem
   `INTERFACES` nem `TERMINATE` no socket global: a pasta `if/` vazia diz que acabou, e ele leva
   `SIGTERM` pelo pid, conferido no `/proc/<pid>/comm`). Sobrevive a um restart do daemon, com
   os clientes conectados.

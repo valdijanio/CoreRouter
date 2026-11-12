@@ -942,6 +942,8 @@ impl WifiPort for LabPort {
                     beacon_loss: Some(0),
                     connected_secs: None,
                     inactive_ms: Some(40),
+                    tx_airtime_us: None,
+                    rx_airtime_us: None,
                 }
             }),
         })

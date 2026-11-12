@@ -849,9 +849,17 @@ fn bond_slave_checks(
         )),
         Some(_) => {}
     }
-    if !matches!(iface.kind, InterfaceKind::Ethernet) {
+    // G1.30m: a mode the kernel cannot run over a Wi-Fi slave.
+    if matches!(iface.kind, InterfaceKind::Wifi(_) | InterfaceKind::WifiPeer(_))
+        && let Some(InterfaceKind::Bonding { mode, .. }) = cfg.interfaces.get(bond).map(|b| &b.kind)
+        && let Some(why) = corerouter_model::wifi::bond_mode_problem(*mode)
+    {
+        problems.push(format!("'{name}' is a Wi-Fi link in bond '{bond}': {why}"));
+    }
+    if !corerouter_model::wifi::bondable(&iface.kind) {
         problems.push(format!(
-            "'{name}' is a {}; only ethernet ports can be bond slaves",
+            "'{name}' is a {}; only ethernet ports and Wi-Fi backhaul links (station-bridge, \
+             peers) can be bond slaves",
             iface.kind.label()
         ));
     }

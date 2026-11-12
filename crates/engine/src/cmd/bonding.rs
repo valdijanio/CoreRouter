@@ -26,7 +26,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add Bonding",
         ["Interfaces"],
         None,
-        "{name: string, slaves: [string] | string (comma-separated ethernet ports), mode: string (802.3ad | active-backup | balance-rr | balance-xor | broadcast | balance-tlb | balance-alb), primary?: string (a slave; active-backup, balance-tlb/alb), transmit_hash_policy?: string (layer-2 | layer-2-and-3 | layer-3-and-4 | encap-2-and-3 | encap-3-and-4; 802.3ad, balance-xor/tlb), lacp_rate?: string (30secs | 1sec; 802.3ad), mii_interval?: u32 (ms, 0..=60000, 0 = no link monitoring, default 100), min_links?: u32 (up slaves needed for carrier, at most the slave count), mtu?: u32 (68..=9216, default: the first slave's), comment?: string} → {name}",
+        "{name: string, slaves: [string] | string (comma-separated ethernet ports and Wi-Fi backhaul links: station-bridge radios, wifi-peer links), mode: string (802.3ad | active-backup | balance-rr | balance-xor | broadcast | balance-tlb | balance-alb), primary?: string (a slave; active-backup, balance-tlb/alb), transmit_hash_policy?: string (layer-2 | layer-2-and-3 | layer-3-and-4 | encap-2-and-3 | encap-3-and-4; 802.3ad, balance-xor/tlb), lacp_rate?: string (30secs | 1sec; 802.3ad), mii_interval?: u32 (ms, 0..=60000, 0 = no link monitoring, default 100), min_links?: u32 (up slaves needed for carrier, at most the slave count), mtu?: u32 (68..=9216, default: the first slave's), comment?: string} → {name, warnings}",
         always,
         add
     ),
@@ -35,7 +35,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set Bonding",
         [],
         None,
-        "{name: string, slaves?: [string] | string (replaces the slaves), mode?: string, primary?: string (\"\" = none), transmit_hash_policy?: string, lacp_rate?: string, mii_interval?: u32, min_links?: u32, mtu?: u32 (also the slaves'), disabled?: bool, comment?: string} → {name}",
+        "{name: string, slaves?: [string] | string (replaces the slaves), mode?: string, primary?: string (\"\" = none), transmit_hash_policy?: string, lacp_rate?: string, mii_interval?: u32, min_links?: u32, mtu?: u32 (also the slaves'), disabled?: bool, comment?: string} → {name, warnings}",
         always,
         set
     ),
@@ -176,15 +176,21 @@ fn slave_problem(cfg: &Config, bond: &IfName, port: &IfName) -> Option<String> {
     let Some(iface) = cfg.interfaces.get(port) else {
         return Some(format!("no interface '{port}' (see interface.list)"));
     };
-    if matches!(iface.kind, InterfaceKind::Wifi(_)) {
-        return Some(format!(
-            "'{port}' is a Wi-Fi client; it cannot be a slave: {}",
-            corerouter_model::wifi::NO_BOND
-        ));
+    match &iface.kind {
+        InterfaceKind::Wifi(w) if w.mode == corerouter_model::wifi::WifiMode::Station => {
+            return Some(format!(
+                "'{port}' is a Wi-Fi client; it cannot be a slave: {}",
+                corerouter_model::wifi::NO_BOND
+            ));
+        }
+        InterfaceKind::Wifi(w) if w.mode == corerouter_model::wifi::WifiMode::Ap => {
+            return Some(format!("'{port}': {}", corerouter_model::wifi::NO_BOND_AP));
+        }
+        _ => {}
     }
-    if !matches!(iface.kind, InterfaceKind::Ethernet) {
+    if !corerouter_model::wifi::bondable(&iface.kind) {
         return Some(format!(
-            "'{port}' is a {}; only ethernet ports can be slaves",
+            "'{port}' is a {}; only ethernet ports and Wi-Fi backhaul links can be slaves",
             iface.kind.label()
         ));
     }
@@ -298,6 +304,7 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
         min_links: 0,
     };
     let settings = start.update(p, &slaves)?;
+    wifi_mode_problem(cfg, mode, &slaves)?;
     let mtu = match mtu {
         Some(m) => m,
         None => slaves
@@ -310,7 +317,57 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
     bond.comment = comment;
     cfg.interfaces.insert(name.clone(), bond);
     set_slaves(cfg, &name, &slaves, mtu)?;
-    Ok(json!({ "name": name }))
+    let warnings = wifi_warnings(cfg, mode, &slaves);
+    Ok(json!({ "name": name, "warnings": warnings }))
+}
+
+/// G1.30m: what to know about a bond over Wi-Fi links.
+fn wifi_warnings(cfg: &Config, mode: BondMode, slaves: &[IfName]) -> Vec<String> {
+    let wifi: Vec<&IfName> = slaves
+        .iter()
+        .filter(|n| {
+            cfg.interfaces
+                .get(*n)
+                .is_some_and(|i| matches!(i.kind, InterfaceKind::Wifi(_) | InterfaceKind::WifiPeer(_)))
+        })
+        .collect();
+    let mut out = Vec::new();
+    if wifi.is_empty() {
+        return out;
+    }
+    if mode == BondMode::BalanceRr {
+        out.push(
+            "balance-rr over Wi-Fi links: their rates differ and change with the air, so TCP \
+             segments arrive out of order and a flow goes no faster than the slowest link. \
+             balance-xor (each flow on one link) or active-backup suit Wi-Fi better"
+                .to_owned(),
+        );
+    }
+    let stations = wifi
+        .iter()
+        .any(|n| matches!(cfg.interfaces.get(*n).map(|i| &i.kind), Some(InterfaceKind::Wifi(_))));
+    if stations {
+        out.push(
+            "the bond gives its slaves its own MAC: the station-bridges join with it, so it is \
+             the MAC to register for each of them on the access points at the other end \
+             (interface.wifi.peer.add mac_address=…)"
+                .to_owned(),
+        );
+    }
+    out
+}
+
+/// G1.30m: a Wi-Fi slave in a mode that needs speed and duplex.
+fn wifi_mode_problem(cfg: &Config, mode: BondMode, slaves: &[IfName]) -> Result<()> {
+    let wifi = slaves.iter().any(|n| {
+        cfg.interfaces
+            .get(n)
+            .is_some_and(|i| matches!(i.kind, InterfaceKind::Wifi(_) | InterfaceKind::WifiPeer(_)))
+    });
+    match corerouter_model::wifi::bond_mode_problem(mode).filter(|_| wifi) {
+        Some(why) => Err(EngineError::bad("mode", why)),
+        None => Ok(()),
+    }
 }
 
 fn set(s: &mut Session, p: &Value) -> Result<Value> {
@@ -336,6 +393,8 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         None => slaves_of(cfg, &name).into_iter().cloned().collect(),
     };
     let settings = current.update(p, &slaves)?;
+    let mode = settings.mode;
+    wifi_mode_problem(cfg, mode, &slaves)?;
     let mtu = mtu.unwrap_or(old_mtu);
     set_slaves(cfg, &name, &slaves, mtu)?;
     if let Some(bond) = cfg.interfaces.get_mut(&name) {
@@ -348,7 +407,8 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
             bond.comment = c;
         }
     }
-    Ok(json!({ "name": name }))
+    let warnings = wifi_warnings(cfg, mode, &slaves);
+    Ok(json!({ "name": name, "warnings": warnings }))
 }
 
 fn list(s: &mut Session, _: &Value) -> Result<Value> {
