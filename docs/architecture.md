@@ -1042,6 +1042,29 @@ sem parsear saída. **Risco aceito:** o Hickory é menos testado em escala de IS
 Unbound/Knot/PowerDNS. Ele será medido com benchmarks (consultas/s, latência com cache quente e
 frio, memória por entrada) na G4.1c, e a decisão pode ser revista com esses números.
 
+**Revisão com números (G4.1g, pela bateria da G4.1r, `docs/dns-stress.md`).** Mesma VM, 4 vCPUs para
+o servidor, a mesma origem (Knot atrás de netem) e o mesmo gerador (`dnsperf`), **medido** em
+2026-11-12:
+
+| | CoreRouter (esta branch) | Unbound 1.19.2 | dnsmasq 2.91 |
+|---|---|---|---|
+| Cache quente, saturação | 193–198 mil/s | 280–344 mil/s | 87–127 mil/s |
+| Cache quente a 50 000/s: p50 / p99 | 40 / 60 µs | 38–42 / 60–67 µs | 39–367 µs / 0,1–4,2 ms |
+| Misses, origem a 20 ms, saturação | 29–45 mil/s (o resto SERVFAIL no teto de 1000) | 42–45 mil/s | 3,5–4,5 mil/s |
+| Misses a 5000/s: p50 / p99 | 65 µs / 20 ms | 57–81 µs / 20 ms | 55 / 68 ms |
+| O mesmo nome TTL 0 a 2000/s: consultas à origem por resposta | 0,02 | 0,07–0,09 | 0,05 |
+| Memória por resposta no cache | ~700 B (1 M de entradas) | ~700 B | pré-alocado (teto de 10 000 nomes) |
+
+Leitura: no acerto de cache o Unbound faz 1,4–1,8× mais com as mesmas CPUs porque usa uma thread
+por CPU com `SO_REUSEPORT` e nós paramos em metade das CPUs (as outras ficam para o resto do
+roteador, G0.31); por leitor ficamos perto (~85–95 mil/s contra ~70–85 mil/s por thread do
+Unbound). No miss, depois dos workers reaproveitados e da junção de iguais, ficamos no nível do
+Unbound até o teto de `max_concurrent_queries`; o que falta é o laço de eventos (G4.1t) e o
+prazo adaptativo (G4.1u). O dnsmasq (uma thread) fica bem atrás em tudo menos memória.
+**Decisão: o Hickory fica** (só o `hickory-proto`, com a nossa cadeia): o desempenho está na
+mesma ordem do Unbound, sem processo externo, com tudo em comandos e transações; as diferenças
+que sobram são de arquitetura nossa (gaps com número), não da biblioteca.
+
 ```
 ping/MTR/MTU ─► Session::tool_prober ─► RouterResolver::resolve ─┐
 cliente NTP ─► service::dns::resolve ────────────────────────────┤ (sem lock do Session)

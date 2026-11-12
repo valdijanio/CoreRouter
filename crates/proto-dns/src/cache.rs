@@ -114,7 +114,6 @@ impl Cache {
     /// Empties the cache and hands back what it held, for the caller to
     /// drop outside its lock: freeing a million entries took ~0,45 s, and
     /// every lookup waited for it (G4.1r, `docs/dns-stress.md`).
-    #[must_use]
     pub fn take(&mut self) -> Flushed {
         self.used = 0;
         Flushed {
