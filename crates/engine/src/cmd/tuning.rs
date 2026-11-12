@@ -149,7 +149,7 @@ fn read_machine(s: &mut Session) -> Option<Machine> {
 
 /// The machine, read again after [`MACHINE_TTL_SECS`]; `None`: the
 /// backend cannot describe it (ranges then come from the catalog only).
-pub(super) fn machine(s: &mut Session) -> Option<Machine> {
+pub(crate) fn machine(s: &mut Session) -> Option<Machine> {
     let now = s.hal_now();
     if let Some(c) = s.ext::<MachineCache>()
         && let (Some(at), Some(now), Some(m)) = (c.at, now, &c.machine)

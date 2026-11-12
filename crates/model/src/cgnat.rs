@@ -359,7 +359,31 @@ pub struct Settings {
     /// burst), so a full subscriber's storm of SYNs is never amplified.
     #[serde(default = "default_icmp_rate")]
     pub icmp_rate: u16,
+    /// G2.3h: connections one subscriber keeps open at once, for the check
+    /// that `nf_conntrack_max` holds the pools (subscribers × this). Left
+    /// out of the file at the default, so a config saved now still loads
+    /// in an older router.
+    #[serde(
+        default = "default_connections",
+        skip_serializing_if = "is_default_connections"
+    )]
+    pub connections_per_subscriber: u32,
 }
+
+fn default_connections() -> u32 {
+    DEFAULT_CONNECTIONS_PER_SUBSCRIBER
+}
+
+fn is_default_connections(n: &u32) -> bool {
+    *n == DEFAULT_CONNECTIONS_PER_SUBSCRIBER
+}
+
+/// Default of [`Settings::connections_per_subscriber`] (**estimado**: a
+/// home with a few phones, a TV and a computer; the 6WIND CG-NAT
+/// dimensioning plans between 100 and 1500).
+pub const DEFAULT_CONNECTIONS_PER_SUBSCRIBER: u32 = 300;
+/// Upper bound of [`Settings::connections_per_subscriber`].
+pub const MAX_CONNECTIONS_PER_SUBSCRIBER: u32 = 100_000;
 
 fn yes() -> bool {
     true
@@ -382,6 +406,7 @@ impl Default for Settings {
             history_days: default_retention(),
             icmp_unreachable: true,
             icmp_rate: DEFAULT_ICMP_RATE,
+            connections_per_subscriber: DEFAULT_CONNECTIONS_PER_SUBSCRIBER,
         }
     }
 }
@@ -762,6 +787,21 @@ mod tests {
 
     fn ports(first: u16, last: u16) -> PortRange {
         PortRange { first, last }
+    }
+
+    /// G2.3h: a config saved before the setting loads with 300, and the
+    /// default stays out of the file (an older router still loads it).
+    #[test]
+    fn connections_per_subscriber_is_optional_in_the_file() {
+        let old: Settings =
+            serde_json::from_str(r#"{"history_days": 365, "icmp_unreachable": true, "icmp_rate": 2}"#).unwrap();
+        assert_eq!(old.connections_per_subscriber, 300);
+        assert_eq!(old, Settings::default());
+        let text = serde_json::to_string(&Settings::default()).unwrap();
+        assert!(!text.contains("connections_per_subscriber"), "{text}");
+        let set = Settings { connections_per_subscriber: 500, ..Settings::default() };
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
+        assert_eq!(back.connections_per_subscriber, 500);
     }
 
     #[test]

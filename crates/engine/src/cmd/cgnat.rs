@@ -18,6 +18,7 @@ use super::args::{opt_bool, opt_parse, opt_str, opt_text, opt_u32, req_parse, re
 use super::dhcp_client::opt_list;
 use super::dhcp_server::{find, opt_secs};
 use super::{CommandSpec, always};
+use crate::cgnat_conntrack as conntrack;
 use crate::{EngineError, Result, Session};
 
 /// Rows of one `mapping.list` page.
@@ -29,7 +30,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add CGNAT Pool",
         ["IP", "Firewall"],
         None,
-        "{name: string, inside: [string] | string (subscriber ranges in mapping order: 100.64.0.0/22, 100.64.4.0-100.64.4.99 or one address; comma-separated), outside: [string] | string (public ranges in mapping order), mode?: deterministic | blocks (deterministic: RFC 7422 formula, nothing logged; blocks: port blocks on demand, one log line each), ports_per_subscriber?: u16 (64..; ports of each subscriber or block; default 1000), port_range?: string (ports handed out on each public address; default 1024-65535), max_blocks?: u8 (blocks mode: 1..32 per subscriber; default 4), block_timeout?: duration (blocks mode: idle block kept this long; default 2m), out_interface?: string (translate only leaving here; empty: any), endpoint_independent_mapping?: bool (RFC 4787 REQ-1, UDP; default true), endpoint_independent_filtering?: bool (RFC 4787 REQ-8, full cone; default false), hairpin?: bool (RFC 4787 REQ-9; default true), alert_percent?: u8 (0..100: share of a subscriber's ports in use that raises the alert; 0 never; default 90), disabled?: bool, comment?: string} → {id, name, subscribers, per_address, public_used, warnings}",
+        "{name: string, inside: [string] | string (subscriber ranges in mapping order: 100.64.0.0/22, 100.64.4.0-100.64.4.99 or one address; comma-separated), outside: [string] | string (public ranges in mapping order), mode?: deterministic | blocks (deterministic: RFC 7422 formula, nothing logged; blocks: port blocks on demand, one log line each), ports_per_subscriber?: u16 (64..; ports of each subscriber or block; default 1000), port_range?: string (ports handed out on each public address; default 1024-65535), max_blocks?: u8 (blocks mode: 1..32 per subscriber; default 4), block_timeout?: duration (blocks mode: idle block kept this long; default 2m), out_interface?: string (translate only leaving here; empty: any), endpoint_independent_mapping?: bool (RFC 4787 REQ-1, UDP; default true), endpoint_independent_filtering?: bool (RFC 4787 REQ-8, full cone; default false), hairpin?: bool (RFC 4787 REQ-9; default true), alert_percent?: u8 (0..100: share of a subscriber's ports in use that raises the alert; 0 never; default 90), disabled?: bool, comment?: string} → {id, name, subscribers, per_address, public_used, warnings (G2.3h: also when nf_conntrack_max is below subscribers × connections_per_subscriber)}",
         always,
         pool_add
     ),
@@ -38,7 +39,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set CGNAT Pool",
         [],
         None,
-        "{id: *hex | name, name?: string, inside?: [string] | string, outside?: [string] | string, mode?: string, ports_per_subscriber?: u16, port_range?: string, max_blocks?: u8, block_timeout?: duration, out_interface?: string, endpoint_independent_mapping?: bool, endpoint_independent_filtering?: bool, hairpin?: bool, alert_percent?: u8, disabled?: bool, comment?: string} → {id, name, subscribers, per_address, public_used, remapped (subscribers whose public address or ports change), warnings}",
+        "{id: *hex | name, name?: string, inside?: [string] | string, outside?: [string] | string, mode?: string, ports_per_subscriber?: u16, port_range?: string, max_blocks?: u8, block_timeout?: duration, out_interface?: string, endpoint_independent_mapping?: bool, endpoint_independent_filtering?: bool, hairpin?: bool, alert_percent?: u8, disabled?: bool, comment?: string} → {id, name, subscribers, per_address, public_used, remapped (subscribers whose public address or ports change), warnings (G2.3h: also a conntrack too small for the pools)}",
         has_pools,
         pool_set
     ),
@@ -55,7 +56,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{id?: *hex | name (the pool being edited), name?: string, inside?: [string] | string, outside?: [string] | string, mode?: string, ports_per_subscriber?: u16, port_range?: string, max_blocks?: u8, block_timeout?: duration, out_interface?: string, endpoint_independent_mapping?: bool, endpoint_independent_filtering?: bool, hairpin?: bool, alert_percent?: u8, disabled?: bool, comment?: string} → {computed: [{label, value}], checks: [{level (ok, warning, error), check, message, param?}], commands: [{command, params}]} (what add/set would do; bad input is an error check, never a failure)",
         always, pool_preview),
     cmd!(query "ip.firewall.cgnat.pool.list", "CGNAT Pools", ["IP", "Firewall"], None,
-        "{} → [{id, name, mode, disabled, inside: [string], outside: [string], ports_per_subscriber, port_range, max_blocks, block_timeout, out_interface?, endpoint_independent_mapping, endpoint_independent_filtering, hairpin, alert_percent, comment?, subscribers, public_addresses, per_address (subscribers or blocks per public address), capacity, public_used, checks: [{label, level, text}]}]",
+        "{} → [{id, name, mode, disabled, inside: [string], outside: [string], ports_per_subscriber, port_range, max_blocks, block_timeout, out_interface?, endpoint_independent_mapping, endpoint_independent_filtering, hairpin, alert_percent, comment?, subscribers, public_addresses, per_address (subscribers or blocks per public address), capacity, public_used, checks: [{label, level, text}] (G2.3h: label conntrack when nf_conntrack_max is small for the pools)}]",
         always, pool_list),
     cmd!(
         "ip.firewall.cgnat.exception.add",
@@ -95,12 +96,12 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "CGNAT Settings",
         [],
         None,
-        "{history_days?: u32 (1..3650: days the mapping history and block log are kept; Marco Civil asks 365), icmp_unreachable?: bool (RFC 6888 REQ-11b: a new connection without a free port gets an ICMP host unreachable; default yes), icmp_rate?: u32 (1..100: those ICMP per second and subscriber, also the burst; default 2)} → {history_days, icmp_unreachable, icmp_rate}",
+        "{history_days?: u32 (1..3650: days the mapping history and block log are kept; Marco Civil asks 365), icmp_unreachable?: bool (RFC 6888 REQ-11b: a new connection without a free port gets an ICMP host unreachable; default yes), icmp_rate?: u32 (1..100: those ICMP per second and subscriber, also the burst; default 2), connections_per_subscriber?: u32 (1..100000: connections a subscriber keeps open at once; nf_conntrack_max must hold the pools' subscribers × this; default 300)} → {history_days, icmp_unreachable, icmp_rate, connections_per_subscriber}",
         always,
         settings_set
     ),
     cmd!(query "ip.firewall.cgnat.get", "CGNAT Settings", [], None,
-        "{} → {history_days, icmp_unreachable, icmp_rate, pools, exceptions, subscribers, history: {epochs, since?, error?}}",
+        "{} → {history_days, icmp_unreachable, icmp_rate, connections_per_subscriber, pools, exceptions, subscribers, history: {epochs, since?, error?}, conntrack: {subscribers, per_subscriber, needed, max, configured, fits, profile?, profile_max?, max_entries, ram_ok, warning?}|null (G2.3h: nf_conntrack_max against the enabled pools)}",
         always, settings_get),
     cmd!(query "ip.firewall.cgnat.lookup", "CGNAT Lookup", [], None,
         "{subscriber: ipv4} → {subscriber, via (pool name or exception), mode, public, first_port, last_port, ports} (the running config)",
@@ -257,8 +258,13 @@ fn check_rows(all: &[Check], kind: &str, id: ItemId) -> Vec<Value> {
         .collect()
 }
 
-fn pool_reply(s: &Session, id: ItemId, extra: Option<u64>) -> Result<Value> {
-    let warnings = verdict(s, "pools", id)?;
+fn pool_reply(s: &mut Session, id: ItemId, extra: Option<u64>) -> Result<Value> {
+    let mut warnings = verdict(s, "pools", id)?;
+    // G2.3h: the kernel's table must hold every pool's subscribers.
+    let demand = conntrack::demand(s.store().candidate());
+    if let Some(w) = conntrack::fit(s, demand).and_then(|f| f.warning()) {
+        warnings.push(w);
+    }
     let c = &s.store().candidate().ip.cgnat;
     let pool = c
         .pools
@@ -456,6 +462,11 @@ fn pool_preview(s: &mut Session, p: &Value) -> Result<Value> {
     }
     if checks_out.is_empty() {
         checks_out.extend(preview_checks(&cfg, "pools", pool.id));
+        if !pool.disabled
+            && let Some(w) = conntrack::fit(s, conntrack::demand(&cfg)).and_then(|f| f.warning())
+        {
+            checks_out.push(preview_check("warning", conntrack::LABEL, &w, None));
+        }
     }
     let mut computed = Vec::new();
     if let Ok(l) = pool.layout() {
@@ -538,6 +549,9 @@ fn exception_preview(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn pool_list(s: &mut Session, _: &Value) -> Result<Value> {
+    // G2.3h: a conntrack too small is every enabled pool's warning.
+    let demand = conntrack::demand(s.store().candidate());
+    let small = conntrack::fit(s, demand).and_then(|f| f.warning());
     let cand = s.store().candidate();
     let all = checks::checks(cand);
     let rows: Vec<Value> = cand
@@ -569,6 +583,9 @@ fn pool_list(s: &mut Session, _: &Value) -> Result<Value> {
                 "public_used": layout.as_ref().map(|l| l.public_used()),
                 "checks": check_rows(&all, "pools", p.id),
             });
+            if let (Some(w), false, Some(c)) = (&small, p.disabled, v.get_mut("checks").and_then(Value::as_array_mut)) {
+                c.push(json!({"label": conntrack::LABEL, "level": "warn", "text": w}));
+            }
             if let Some(o) = v.as_object_mut() {
                 if let Some(i) = &p.out_interface {
                     o.insert("out_interface".into(), json!(i));
@@ -674,6 +691,7 @@ fn settings_set(s: &mut Session, p: &Value) -> Result<Value> {
     let days = opt_small(p, "history_days", 1, 3650)?;
     let icmp = opt_bool(p, "icmp_unreachable")?;
     let rate = opt_small(p, "icmp_rate", 1, u32::from(corerouter_model::cgnat::MAX_ICMP_RATE))?;
+    let conns = opt_small(p, "connections_per_subscriber", 1, corerouter_model::cgnat::MAX_CONNECTIONS_PER_SUBSCRIBER)?;
     let set = &mut s.store_mut().candidate_mut().ip.cgnat.settings;
     if let Some(d) = days {
         set.history_days = d;
@@ -684,7 +702,13 @@ fn settings_set(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(r) = rate.and_then(|r| u16::try_from(r).ok()) {
         set.icmp_rate = r;
     }
-    Ok(json!({"history_days": set.history_days, "icmp_unreachable": set.icmp_unreachable, "icmp_rate": set.icmp_rate}))
+    if let Some(n) = conns {
+        set.connections_per_subscriber = n;
+    }
+    Ok(json!({
+        "history_days": set.history_days, "icmp_unreachable": set.icmp_unreachable, "icmp_rate": set.icmp_rate,
+        "connections_per_subscriber": set.connections_per_subscriber,
+    }))
 }
 
 fn settings_get(s: &mut Session, _: &Value) -> Result<Value> {
@@ -706,11 +730,19 @@ fn settings_get(s: &mut Session, _: &Value) -> Result<Value> {
         "history_days": c.settings.history_days,
         "icmp_unreachable": c.settings.icmp_unreachable,
         "icmp_rate": c.settings.icmp_rate,
+        "connections_per_subscriber": c.settings.connections_per_subscriber,
         "pools": c.pools.len(),
         "exceptions": c.exceptions.len(),
         "subscribers": subscribers,
         "history": history,
+        "conntrack": conntrack_json(s),
     }))
+}
+
+/// G2.3h: the conntrack check of the candidate's pools, as JSON.
+fn conntrack_json(s: &mut Session) -> Value {
+    let demand = conntrack::demand(s.store().candidate());
+    conntrack::fit(s, demand).map_or(Value::Null, |f| f.to_json())
 }
 
 fn lookup(s: &mut Session, p: &Value) -> Result<Value> {
