@@ -11278,3 +11278,290 @@ continuação indentadas).
   `.dirty` (com alterações sem commit a árvore não diz o que foi compilado, e o aviso continua).
   Daemon antigo, sem `tree`, segue comparado pelo commit. Teste: `same_files` no buildinfo e o caso
   novo em `a_daemon_built_from_another_commit_is_flagged_in_the_top_bar`.
+
+- 2026-11-11 — G1.26k: Registra três gaps vistas no notebook real (dev.595, 2026-11-12).
+
+  - **Tuning, aba Profiles:** o operador escolheu "High throughput" no seletor da aba Profiles,
+    esperou que gravasse e nada mudou. O seletor só escolhe o perfil que o Summary compara e
+    aplica (`crates/ui/src/tuning.rs:536`); o botão "Apply with Safe Mode" mora só no Summary.
+    Aplicado pelo Summary, o `nf_conntrack_max` foi de 262 144 para 3 080 192 (**medido**, 8 GB
+    de RAM).
+  - **CGNAT × conntrack:** o padrão do kernel nesta máquina é 262 144 conexões
+    (`net/netfilter/nf_conntrack_core.c`, `nf_conntrack_init_start`: mais de 4 GB de RAM dá
+    262 144 baldes e `max_factor` 1). Um pool de 1280 assinantes com 200–300 conexões cada passa
+    disso, e o kernel descarta conexões novas quando a tabela enche.
+  - **Resources › Memory:** depois de subir o limite, o operador procurou o aumento na aba Memory e
+    não achou nada. O limite não reserva memória (só a tabela de busca, ~4 MiB com 524 288 baldes;
+    cada conexão ~320 B, **estimado**); a memória do conntrack é do kernel e não aparece em
+    "Largest processes". A aba não mostra o que o kernel gasta.
+
+- 2026-11-11 — G1.30a: Wi-Fi como ponto de acesso, parte 1 (o "AP mínimo" que o dono aprovou em 2026-11-11;
+  `docs/wifi-ap.md`). `interface.wifi.set mode=ap` com `ssid`, `security` (`auto`: WPA2 e WPA3
+  juntos; `wpa3`; `wpa2`; `open`), `passphrase`, `hidden`, `frequency` (canal, MHz ou `auto`: o
+  canal mais quieto da última varredura sem radar) e `width` (20/40/80/160 ou `auto`). O comando
+  recusa, com o motivo, o canal que o país não permite, o passivo (no-IR), o que o rádio não tem,
+  a largura maior que a do rádio e o bloco com um canal proibido; o modal da GUI mostra o canal
+  previsto ou o motivo no próprio campo. O AP entra em bridge (pelo `bridge=` do hostapd, depois
+  de virar AP); a estação continua recusada. Comando novo `interface.wifi.registration-table.print`
+  (cliente, WPA3/WPA2, geração, sinal, taxas, tempo, retransmissões); `list` e `monitor` mostram o
+  AP. GUI: campo Mode, Frequency e Width no modal do rádio, selo `AP` e clientes na aba Radios,
+  aba Registration nova.
+
+  Plataforma: o `hostapd` 2.12 entra na imagem (`/usr/sbin`; a cópia de `test-tools` continua
+  para o AP de teste). Um hostapd para todos os rádios, só com o socket global; cada rádio entra
+  por `ADD` dinâmico, recebe os campos por `SET` (a senha nunca vai a arquivo nem a log) e sobe
+  com `ENABLE`; termina com o último AP. Estação e AP do mesmo rádio se revezam pela mesma trava.
+  O `plan` do `hal-linux` deixa a bridge de uma porta Wi-Fi com o hostapd (o kernel recusa a
+  interface antes de ela virar AP).
+
+  Como testar: `cargo xtask os wifi-test --only ap` (QEMU, `mac80211_hwsim`: o rádio do roteador
+  como AP, o do teste como cliente com o `wpa_supplicant` da imagem); no laboratório virtual,
+  `interface.wifi.set '{"name":"wifi1","mode":"ap","ssid":"Loja","passphrase":"…","disabled":false}'`
+  e Interfaces › Wi-Fi › Registration. Testes: `wifi_ap::*` (engine, 6 de integração e 3 do plano
+  de canal), `wifi_ap::tests` (hal e hal-linux: campos do hostapd, eventos, STATUS, STA, blocos de
+  canal), `plan::an_access_point_joins_its_bridge_through_hostapd`, `tests::wifi_ap::*` (ui).
+
+  Não conferido: uma placa de verdade (a RTL8852BE do notebook declara AP no `rtw89`; pôr o rádio
+  dele em AP pede o OK do dono) e tráfego de dados entre AP e cliente no QEMU (os dois rádios no
+  mesmo kernel; a G1.30m leva o teste para namespaces).
+
+- 2026-11-11 — G1.30m: Wi-Fi station-bridge, parte 1 (`docs/wifi-bridge.md`): um enlace entre dois roteadores que leva a
+  LAN. `interface.wifi.set mode=station-bridge` com `bridge_protocol` `multi-ap` (padrão:
+  `multi_ap_backhaul_sta=1` no wpa_supplicant) ou `wds` (quatro endereços ligados por nl80211, para
+  o OpenWrt); a interface vira porta de bridge depois de conectar. No AP, `station_bridge` `no`
+  (padrão), `yes` ou `only` (hostapd `wds_sta=1`, `multi_ap=3` ou `1`), e
+  `interface.wifi.peer.add {radio, name, mac_address, comment}`: cada par é uma interface `wifi-peer`
+  de nome fixo (o `<rádio>.sta<aid>` do hostapd renomeado), presente enquanto o par está
+  associado, porta de bridge como qualquer outra; a configuração dela espera por ele como a de
+  uma porta desconectada. Só os pares cadastrados ganham quatro endereços: outra estação que pede
+  é desligada, com o motivo no histórico. Backhaul só WPA3 (`wpa2`/`open` recusados; `auto` vira
+  WPA3); dois enlaces de backhaul na mesma bridge dão aviso de laço (as bridges não rodam spanning
+  tree). `interface.wifi.peer.print`/`.remove`; a tabela de clientes marca o par. GUI: modal do
+  rádio em duas abas (General, Channel) com Bridge Protocol e Station Bridge, selo `bridge`, aba
+  **Peers** com "Add Peer…".
+
+  Como testar: `cargo xtask os wifi-test --only bridge` (QEMU, `mac80211_hwsim`: o roteador como AP
+  com um par Multi-AP, uma estação não cadastrada desligada, o roteador como station-bridge
+  Multi-AP e WDS contra um hostapd com `wds_sta`). Testes: `wifi_bridge::*` (engine), `wifi_ap`
+  (hal-linux: `station_bridges_and_their_links`), `link_set`, `tests::wifi_bridge::*` (ui).
+
+  Não conferido: tráfego de dados entre os dois lados no QEMU (os dois rádios no mesmo kernel) e
+  hardware real (falta um segundo aparelho com Wi-Fi; fica para quando houver um segundo rádio).
+
+- 2026-11-11 — G2.3g: CGNAT em blocos: o endereço do próprio roteador não ganha bloco. No teste por cabo do notebook
+  (dev.591, main 716544e1, `inside` 100.64.0.0/24, `out_interface` ether1), o
+  `ip.firewall.cgnat.block.list` mostrou um bloco para 100.64.0.1, o endereço do roteador no
+  ether2, no mesmo segundo do bloco do cliente 100.64.0.100. A causa: a regra da cadeia `blocks`
+  (filtro em postrouting, `firewall/src/cgnat.rs`) era só `ip saddr @in ip saddr != @d queue`. Ela
+  não conferia a interface de saída e via também os pacotes gerados pelo roteador (postrouting
+  recebe a saída local): as respostas de DHCP e DNS de 100.64.0.1 para o ether2 iam para a fila e
+  ganhavam bloco. Sem ninguém servindo a fila, eram descartadas.
+
+  - **Regra:** `oifname "<out_interface>"` quando o pool tem um, e
+    `fib saddr type != local` (o kernel aceita esse `fib` em postrouting,
+    `nft_fib_validate`). A consulta vem depois dos conjuntos, então só um pacote ainda sem bloco
+    paga por ela.
+  - **Motor:** `cgnat_block_for` recusa um endereço do roteador ("is an address of the router"),
+    e o serviço `cgnat` deixa o pacote seguir sem tradução, como faz com a exceção 1:1.
+  - **Checagem:** endereço do roteador dentro do `inside` vira aviso ("router address": nunca terá
+    bloco nem slot, e os pacotes dele saem como estão), como já valia para o `outside`.
+  - **`ip.firewall.connection.list`:** a coluna `pool` só aparece numa conexão com SNAT. O fluxo do
+    assinante ao DNS do roteador (porta 53) não é traduzido e não é de pool nenhum.
+
+  Testes (falham sem a correção):
+  - `netns_cgnat::the_routers_own_packets_skip_the_blocks_queue` (namespace, sem root): sem a
+    regra nova, a resposta do roteador ao assinante fica presa na fila;
+  - `cgnat::tests::the_blocks_queue_skips_the_router_and_other_ports`;
+  - `cgnat_blocks::the_routers_own_address_gets_no_block`;
+  - `checks::tests::the_routers_address_inside_a_pool_is_a_warning`;
+  - `firewall_connection::tests::only_translated_flows_name_their_pool`.
+
+- 2026-11-11 — G2.7c: CGNAT: o ICMP de portas esgotadas (RFC 6888 REQ-11b, G2.7) funciona na imagem. No notebook
+  (dev.591, main 716544e1), o serviço `cgnat-icmp` ficava com `last_error: "no exhaustion queues:
+  backend rejected the change: netfilter queue 7423: Operation not supported (os error 95)"`.
+
+  **Alcance:** a fila que falhava é a de esgotamento (7423–7426, `cgnat-icmp`). Ela atende o
+  assinante que tem slot (determinístico) ou bloco (blocos) e esgotou as próprias portas, nos dois
+  modos. A recusa por pool sem bloco livre (modo blocos) passa pela fila 7422 e já mandava o ICMP:
+  o teste de carga no notebook, com 1100 assinantes do BNG Blaster, mostrou 675 ICMP por ela.
+
+  **Causa, no fonte do kernel 6.18.59:** a fila pede `NFQA_CFG_F_CONNTRACK`
+  (`hal-linux/src/nfqueue.rs`). O `nfnetlink_queue.c` (`nfqnl_recv_config`) devolve EOPNOTSUPP
+  quando o `nfnl_ct_hook` não existe, e esse gancho só é registrado com
+  `CONFIG_NETFILTER_NETLINK_GLUE_CT` (bool, `default n`, depende de `NETFILTER_NETLINK_QUEUE` e
+  `NF_CT_NETLINK`). O `.config` da imagem dizia `# CONFIG_NETFILTER_NETLINK_GLUE_CT is not set`.
+
+  **Por que o CI não pegou:** os testes em namespace (`netns_cgnat`, o
+  `a_subscriber_out_of_ports_gets_icmp_host_unreachable`) rodam no kernel do host, um Ubuntu que
+  tem a opção. Só a imagem a perdia, e o `boot-test` não ligava o CGNAT.
+
+  - `os/board/x86_64/linux.fragment`: `CONFIG_NETFILTER_NETLINK_GLUE_CT=y`. O kernel do instalador
+    parte do `.config` final da imagem e herda a opção.
+  - `REQUIRED_KERNEL` (`xtask/src/os.rs`): o `cargo xtask os check` reprova um fragmento sem ela, e
+    o `os build` reprova um kernel configurado que a perca.
+  - `boot-test`: cria um pool em blocos e exige `cgnat` e `cgnat-icmp` em `running`, sem
+    `last_error`. Na imagem nova: `cgnat running (1 threads), cgnat-icmp running (5 threads)`
+    (**medido**, KVM).
+  - Erro: com `F_CONNTRACK` recusado por EOPNOTSUPP, a mensagem diz que a opção do kernel falta.
+
+  Testes que falham sem a correção: `cargo xtask os check` ("linux.fragment:
+  CONFIG_NETFILTER_NETLINK_GLUE_CT=y is required"), `os::tests::cgnat_services_want_both_running_without_error`
+  (a resposta do notebook reprova) e `nfqueue::tests::a_conntrack_refusal_names_the_kernel_option`.
+
+- 2026-11-11 — G2.7d: CGNAT em blocos: o diagnóstico separa o pool sem blocos do assinante sem portas. Vem do teste de
+  carga no notebook (dev.591): 1100 assinantes do BNG Blaster na CGNAT `teste`, blocos de 64
+  portas, 4 por assinante, um endereço público (1008 blocos). O roteador deu 1008 blocos e recusou
+  91 assinantes (1350 conexões, 675 ICMP).
+
+  - **Alertas errados:** os 91 apareciam no `ip.firewall.cgnat.alert.list` com `used 256, peak
+    256, percent 100`, sem bloco nenhum, e o `system.health.check` dizia "15 assinante(s) acima do
+    alerta de portas". O `cgnat_blocks::exhaustion_drain` tratava toda recusa da fila dos blocos
+    (7422) como esgotamento do assinante.
+  - **Sem sugestão:** o `ip.firewall.cgnat.capacity.get` voltava `suggestion: null` no modo blocos.
+
+  O que mudou:
+  - **Recusa de assinante sem bloco** (modo blocos): é o pool que acabou, não o assinante.
+    - não vira alerta de assinante;
+    - fica num registro próprio (`CgnatRuntime::pool_full`);
+    - sai no log como "no free block: pool … has none left for …";
+    - é contada à parte no armazém de capacidade (linhas `f`/`n` do journal, as antigas continuam
+      lidas);
+    - não chama o `nat_limit` por assinante (o pool esgotado já é registrado ao alocar, RFC 8158
+      §4.6.5).
+  - **`system.health.check` › CGNAT ports:** erro próprio, "N assinante(s) recusado(s): o pool não
+    tem bloco livre", nos últimos 10 min, com o que fazer.
+  - **`ip.firewall.cgnat.capacity.get` (modo blocos):**
+    - campos novos: `blocks`, `blocks_in_use`, `no_block_24h`, `no_block_refused_24h`,
+      `no_block_icmp_24h`;
+    - sugestão nova (`suggest_blocks`): se o pool ficou sem blocos, menos portas por bloco nos
+      mesmos endereços quando o uso (p99 + 25 %) ainda cabe, senão mais endereços públicos
+      (`public_needed`, `fits: false`); sem recusas, as portas por bloco que o uso pede.
+  - **Aba Capacity:** quarto card "No free block, 24 h", com os blocos em uso, e os dois motivos
+    novos traduzidos.
+  - **Laboratório (`VirtualHal`):** o assinante "online" que ficou sem bloco é recusado, como a fila
+    7422 faz no kernel.
+
+  No caso do notebook a conta dá 2 endereços públicos (`suggest_blocks(64, 4, 1, 64512, 1099, 91,
+  …)`): com menos de 64 portas por bloco não há bloco.
+
+  Testes: `cgnat_blocks::a_pool_out_of_blocks_is_not_a_subscriber_out_of_ports` (laboratório:
+  alertas só para quem tem bloco, o health check, o log e a capacidade),
+  `cgnat_capacity::tests::a_pool_out_of_blocks_asks_for_addresses_or_smaller_blocks` (o caso do
+  notebook e os outros dois ramos), `a_full_pool_is_counted_apart_and_round_trips` (journal),
+  `health_check` "cgnat pool out of blocks" e `the_capacity_tab_shows_a_pool_out_of_blocks` (UI).
+
+- 2026-11-11 — G4.2l: Servidor DHCP: dois defeitos do teste de carga no notebook (dev.591). O BNG Blaster rodou duas
+  vezes, com os mesmos MACs, contra o `dhcp-teste` do ether2 (`conflict_detection` ligado).
+
+  - **Conflito falso.** Na segunda rodada, 50 leases ficaram em `conflict` (100.64.0.201–.250), com
+    "ARP reply from 02:00:00:00:00:65 before the offer": quem respondia era o cliente que tinha o
+    endereço da rodada anterior e ainda o usava.
+    - **Causa:** o endereço liberado de um cliente C (que continuava a usá-lo) era escolhido para
+      outro cliente A e sondado. C respondia, o endereço ficava em `conflict` com o MAC de C, e
+      quando C pedia, o `free_for` recusava o próprio endereço, por estar em `conflict`. O mesmo
+      acontecia com duas ofertas esperando o mesmo endereço: o `probe_reply` casava a resposta de
+      C com a oferta de A, a primeira da lista.
+    - **Correção:**
+      - o `probe_reply` olha todas as ofertas que esperam aquele endereço; se o MAC que respondeu
+        é o de uma delas, essa recebe o endereço, e as outras procuram outro sem registrar conflito
+        (o ocupante é cliente nosso);
+      - o endereço em `conflict` cujo ocupante é o próprio cliente que pede volta para ele, sem
+        sonda (`choose` e `free_for`).
+    - A RFC 2131 §3.1 (passo 2) e §4.4.1 pedem que servidor e cliente confiram se o endereço está
+      em uso. Aqui o "uso" é do próprio cliente (um host RFC 5227 responde pelo endereço dele). O
+      RouterOS marca o endereço como ocupado diante de qualquer resposta (help.mikrotik.com, DHCP,
+      `conflict-detection`); o nosso distingue o próprio cliente.
+  - **RELEASE repetido contado como problema.**
+    - **Sintoma:** o BNG Blaster manda três DHCPRELEASE por cliente, e o
+      `ip.dhcp-server.statistics.print` contou 5250 em `dropped: unexpected` com `problem: true`.
+    - **Correção:** o RELEASE de um lease que o mesmo cliente já liberou vira o motivo `repeated`,
+      com `problem: false`. Pela RFC 2131 §4.4.6, o RELEASE não tem resposta e o cliente pode
+      repeti-lo. O RELEASE de outro cliente continua `unexpected`.
+
+  Números do servidor no notebook, **medido** pela sessão principal com o BNG Blaster:
+  - 1000 clientes em 1,44 s, com pico de 500 ACKs/s;
+  - latência p50 ≤ 25,6 ms e p99 ≤ 51,2 ms;
+  - thread `svc-dhcp-server` usando 2–4 % de um núcleo.
+
+  Testes (falham sem a correção):
+  - `a_client_that_answered_the_probe_gets_its_address_back` (o cenário do notebook: sem a
+    correção, nenhuma oferta);
+  - `the_holders_answer_goes_to_the_holders_offer` (sem a correção, um conflito);
+  - `a_repeated_release_is_not_a_problem`.
+
+- 2026-11-11 — G4.2m: Servidor DHCP: o histórico de concessões sobrevive ao reinício. No notebook (dev.595), depois de
+  quatro reinícios e uma atualização, `ip.dhcp-server.history.print` voltou `rows: []` com
+  `retention: 365d`, mesmo com ~3000 vínculos no journal (`journal-dhcp-history.log`). É o
+  registro de quem tinha cada endereço (Marco Civil, Lei 12.965/2014, art. 13).
+
+  **Causa:** `dhcp_history_load` procurava o estado da feature com `ext()`, que devolve nada até
+  alguém criá-lo. Quem o criava era o primeiro vínculo. Ele também exigia um servidor rodando.
+  Depois de um reinício sem cliente pedindo, ou com o servidor desligado, o journal nunca era lido,
+  e as consultas respondiam vazio. O disco tinha o registro; o roteador não o mostrava.
+
+  **Correção:**
+  - A carga cria o estado (`ext_mut`) e lê o journal mesmo sem servidor.
+  - O que terminou enquanto o roteador estava desligado é fechado quando um servidor tem os leases
+    dele (`unsettled`).
+  - `history.print`, `history.export` e `config.print` carregam o journal se nenhuma rodada o fez.
+  - O vínculo terminado por RELEASE continua fechado no histórico, e o teste o confere depois do
+    reinício.
+
+  Teste (falha sem a correção, `left: 0`):
+  `dhcp_history_restart::the_history_survives_a_restart_with_no_client`. Ele faz vínculos e um
+  RELEASE, reinicia com o mesmo armazenamento e consulta antes de qualquer cliente; depois
+  reinicia com o servidor desligado.
+
+- 2026-11-11 — G4.3v: PPPoE: o assinante alcança o gateway. No teste por cabo do notebook (dev.591, main 716544e1), o
+  perfil com `local_address` 100.65.0.1 e o pool 100.65.0.10–50 autenticou (MS-CHAPv2, 3 s), mas
+  ping, DNS (UDP e TCP) e bandwidth-test até 100.65.0.1 deram timeout (`rx_packets 12, tx_packets
+  0`). Com `local_address` 100.64.0.1, que existe no ether2, o ping funcionava.
+
+  A causa: o endereço local do perfil não estava em interface nenhuma do roteador. No caminho
+  lento, o `inject` pelo `IPPROTO_RAW` roteia o pacote do assinante como saída do próprio host, e
+  o destino 100.65.0.1, que não é local, ia para a rota default. Com XDP também: o `fib_lookup`
+  devolve o pacote ao kernel, que o encaminharia.
+
+  - **Correção:** o serviço `pppoe` mantém em `bng0` (o dummy que as sessões já compartilham para a
+    descida) exatamente os `local_address` dos perfis padrão dos servidores ligados, como `/32`
+    (`pppoe_io::set_local_addresses`). Ele acrescenta e tira a cada mudança, tira todos ao parar e
+    registra no log. O RouterOS põe o endereço em cada interface dinâmica `<pppoe-…>`; aqui as
+    sessões dividem o `bng0`, e um endereço ali é do roteador para o kernel inteiro.
+  - **Diagnóstico:** `interface.pppoe-server.monitor` ganha `dataplane_reason` ("no XDP: …", o erro
+    do HAL), que a aba Interface mostra ao lado do selo "slow path".
+
+  Teste (falha sem a correção): `netns_pppoe` (namespace, sem root, caminho lento), com o perfil
+  em 100.65.0.1, fora de qualquer interface. O eco do assinante ao gateway volta pela sessão; sem
+  a correção, "the gateway (the profile's local_address) answered the subscriber" falha. Tirar o
+  `local_address` tira o endereço do `bng0`.
+
+- 2026-11-11 — G4.3w: PPPoE: `one-session-per-host` não deixa mais um MAC copiado derrubar o assinante. No teste por
+  cabo do notebook (dev.591, main 716544e1), cada tentativa nova do mesmo MAC (o cliente `vvs` da
+  VM, usuário `vv123`, recusado com "no such user") derrubou a sessão autenticada `teste`
+  ("desconectado (replaced) … one-session-per-host"), várias vezes seguidas. O servidor
+  (`proto-pppoe`) substituía a sessão antiga já na PADR, antes de qualquer senha: bastava copiar o
+  MAC.
+
+  - **Servidor:** a sessão nova de um host com uma sessão estabelecida fica esperando
+    (`pending`), com `replaces` apontando para a antiga. A antiga recebe PADT e
+    `Down { Replaced }` só quando a nova entra na fase Network: autenticada, ou com o LCP aberto
+    quando não se pede autenticação. Uma sessão antiga que ainda não autenticou continua sendo
+    trocada na hora (o host recomeçou). No máximo uma espera por host, e a tentativa mais nova
+    substitui a que esperava. `Event::Authenticate` traz o `replaces`, e `Server::replace_now`
+    encerra a antiga antes do veredito.
+  - **Daemon:** com a senha conferida (local, agora antes do `only-one`) ou o Access-Accept do
+    RADIUS, `replace_old` encerra a sessão antiga primeiro: endereço, login, contabilização e
+    rotas. Assim o endereço fixo do secret e o `only-one` do perfil a veem fora, e o CPE que
+    reiniciou volta.
+  - **RouterOS** (help.mikrotik.com, *PPPoE*, `one-session-per-host`, padrão `no`): "If a host
+    tries to establish a new session, the old one will be closed", sem dizer quando. A RFC 2516
+    não define a regra; o §8 trata DoS na Discovery (AC-Cookie), que não protege de um MAC copiado.
+  - **Limite conhecido:** com a VLAN no `max_sessions_per_vlan` ou sem SESSION_ID livre, a tentativa
+    nova é recusada enquanto a antiga vive (antes, a antiga saía na PADR). O CPE que reiniciou
+    entra depois que o keepalive derruba a sessão antiga.
+
+  Testes (falham sem a correção): `server::tests::one_session_per_host_replaces_only_after_the_new_one_authenticates`
+  (PAP e MS-CHAPv2: três tentativas com senha errada não derrubam a sessão, e a senha certa a
+  substitui), `server::tests::a_waiting_attempt_gives_way_to_a_newer_one_and_replace_now_ends_the_old`
+  e `pppoe_bng_tests::a_copied_mac_without_the_password_does_not_end_the_session` (o cenário do
+  notebook, com endereço fixo e `only-one` na volta). Sem o `replace_old`, a volta é recusada.
