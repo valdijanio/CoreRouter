@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use super::args::{opt_bool, opt_str, opt_u32};
 use super::{CommandSpec, always};
 use crate::system_resource::{ResourceMonitor, hottest, load, memory_used, percent};
+use crate::tuning::CONNTRACK_ENTRY_BYTES;
 use crate::{EngineError, Result, Session};
 
 /// Points of history `print` returns (5 s apart: 5 min).
@@ -18,7 +19,7 @@ const DEFAULT_PROCESSES: u32 = 100;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "system.resource.print", "Resources", ["System", "Resources"], None,
-        "{} → {uptime_secs, version, architecture, board_name, cpu_model, cpu_count, cpu_frequency_mhz, cpu_max_mhz, cpu_load, load_avg: {one, five, fifteen, running, tasks}|null, total_memory, free_memory, memory_used_percent, memory: {total, free, available, buffers, cached, swap_total, swap_free}, pressure: {cpu, memory, io: {some10, some60, some300, full10, full60, full300}|null}, total_hdd_space, free_hdd_space, disks: [{mount, device, fs, total, free, available, used_percent}], disk_io: [{name, read_rate, write_rate}], write_sect_since_reboot, temperature: {value, crit, sensor}|null, fan_rpm, conntrack: {count, max}|null, oom_kills, history: [{t, cpu, memory, temperature}]}",
+        "{} → {uptime_secs, version, architecture, board_name, cpu_model, cpu_count, cpu_frequency_mhz, cpu_max_mhz, cpu_load, load_avg: {one, five, fifteen, running, tasks}|null, total_memory, free_memory, memory_used_percent, memory: {total, free, available, buffers, cached, swap_total, swap_free, slab_reclaimable, slab_unreclaimable}, pressure: {cpu, memory, io: {some10, some60, some300, full10, full60, full300}|null}, total_hdd_space, free_hdd_space, disks: [{mount, device, fs, total, free, available, used_percent}], disk_io: [{name, read_rate, write_rate}], write_sect_since_reboot, temperature: {value, crit, sensor}|null, fan_rpm, conntrack: {count, max}|null, kernel: {conntrack: {count, max, buckets, entry_bytes (one entry: its nf_conntrack slab object + ~64 B of extensions), entry_source (slab: the object size read from the kernel; estimate: 320 B), used_bytes (the entries now: the slab's objects + their extensions), full_bytes (max × entry_bytes: nothing is reserved, it grows up to this), table_bytes (the lookup table, allocated whole: buckets × 8 B)}|null, slab_reclaimable, slab_unreclaimable, page_cache} (G1.6ql: what the kernel itself uses), oom_kills, history: [{t, cpu, memory, temperature}]}",
         always, print),
     cmd!(query "system.resource.cpu.print", "Resources CPU", [], None,
         "{} → [{cpu, load, user, system, irq, softirq, iowait, steal, frequency_mhz, irq_rate, softirq_rate, net_rx_rate, net_tx_rate}]",
@@ -134,9 +135,53 @@ fn print(s: &mut Session, _: &Value) -> Result<Value> {
         "temperature": hottest(l).map(|(v, crit, sensor)| json!({"value": r1(v), "crit": crit.map(r1), "sensor": sensor})),
         "fan_rpm": fan.map(|f| f.round()),
         "conntrack": l.conntrack.map(|c| json!({"count": c, "max": l.conntrack_max})),
+        "kernel": kernel_memory(l),
         "oom_kills": l.oom_kills,
         "history": m.recent(HISTORY_POINTS),
     }))
+}
+
+/// Bytes a conntrack entry takes beyond its slab object: the extensions
+/// (NAT, accounting, timestamps, labels) the kernel allocates apart in
+/// kmalloc caches. **Estimated**: [`CONNTRACK_ENTRY_BYTES`] (320) is a
+/// 256 B object (Linux 6.x/7.0: `struct nf_conn` of 248 B, cache-line
+/// aligned) plus these.
+pub const CONNTRACK_EXT_BYTES: u64 = 64;
+/// One bucket of the conntrack lookup table: an `hlist_nulls_head`, one
+/// pointer.
+pub const CONNTRACK_BUCKET_BYTES: u64 = 8;
+
+/// G1.6ql: what the kernel uses for itself. The conntrack limit reserves
+/// nothing: entries come from the `nf_conntrack` slab one by one, so its
+/// memory is the entries in use, up to `max × entry` when the table is
+/// full; only the lookup table is allocated whole.
+fn kernel_memory(l: &Sample) -> Value {
+    let mem = &l.memory;
+    let conntrack = l.conntrack_max.filter(|m| *m > 0).map(|max| {
+        let count = l.conntrack.unwrap_or(0);
+        let (entry, source, used) = match l.conntrack_slab {
+            Some(c) => (
+                c.object_bytes.saturating_add(CONNTRACK_EXT_BYTES),
+                "slab",
+                c.total_objects
+                    .saturating_mul(c.object_bytes)
+                    .saturating_add(c.objects.saturating_mul(CONNTRACK_EXT_BYTES)),
+            ),
+            None => (CONNTRACK_ENTRY_BYTES, "estimate", count.saturating_mul(CONNTRACK_ENTRY_BYTES)),
+        };
+        json!({
+            "count": count, "max": max, "buckets": l.conntrack_buckets,
+            "entry_bytes": entry, "entry_source": source, "used_bytes": used,
+            "full_bytes": max.saturating_mul(entry),
+            "table_bytes": l.conntrack_buckets.map(|b| b.saturating_mul(CONNTRACK_BUCKET_BYTES)),
+        })
+    });
+    json!({
+        "conntrack": conntrack,
+        "slab_reclaimable": mem.slab_reclaimable,
+        "slab_unreclaimable": mem.slab_unreclaimable,
+        "page_cache": mem.cached.saturating_add(mem.buffers),
+    })
 }
 
 fn cpu_print(s: &mut Session, _: &Value) -> Result<Value> {
@@ -306,6 +351,10 @@ mod tests {
         assert!(v["temperature"]["crit"].as_f64().is_some());
         assert!(v["disk_io"][0]["write_rate"].as_f64().is_some());
         assert_eq!(v["history"].as_array().unwrap().len(), 1);
+        // G1.6ql: the lab's slab and lookup table.
+        assert_eq!(v["kernel"]["conntrack"]["entry_source"], "slab", "{}", v["kernel"]);
+        assert_eq!(v["kernel"]["conntrack"]["table_bytes"], (1u64 << 18) * 8);
+        assert!(v["kernel"]["slab_unreclaimable"].as_u64().unwrap() > 0);
         let cores = s.execute("system.resource.cpu.print", &json!({})).unwrap();
         let cores = cores.as_array().unwrap();
         assert_eq!(cores.len(), 16);
@@ -316,6 +365,38 @@ mod tests {
 
     /// G1.6qe: `threads: true` gives the router's processes and each of
     /// the daemon's threads, its CPU in % of one core, busiest first.
+    /// G1.6ql: the kernel's memory, from the slab when it is readable,
+    /// else estimated from the count.
+    #[test]
+    fn kernel_memory_from_the_slab_or_estimated() {
+        use corerouter_hal::system_resource::{Memory, SlabCache};
+        let mut l = Sample {
+            memory: Memory { cached: 1000, buffers: 24, slab_reclaimable: 7, slab_unreclaimable: 3, ..Memory::default() },
+            conntrack: Some(240_000),
+            conntrack_max: Some(3_080_192),
+            conntrack_buckets: Some(262_144),
+            ..Sample::default()
+        };
+        let v = kernel_memory(&l);
+        assert_eq!((v["page_cache"].as_u64(), v["slab_reclaimable"].as_u64(), v["slab_unreclaimable"].as_u64()), (Some(1024), Some(7), Some(3)));
+        let ct = &v["conntrack"];
+        assert_eq!(ct["entry_source"], "estimate");
+        assert_eq!(ct["entry_bytes"], 320);
+        assert_eq!(ct["used_bytes"], 240_000u64 * 320);
+        // The notebook's throughput limit (dev.595): ~940 MiB when full.
+        assert_eq!(ct["full_bytes"], 3_080_192u64 * 320);
+        assert_eq!(ct["table_bytes"], 262_144u64 * 8);
+        // Root reads the slab: whole slabs held, extensions per entry in use.
+        l.conntrack_slab = Some(SlabCache { object_bytes: 256, objects: 240_000, total_objects: 240_032 });
+        let ct = kernel_memory(&l)["conntrack"].clone();
+        assert_eq!(ct["entry_source"], "slab");
+        assert_eq!(ct["entry_bytes"], 320);
+        assert_eq!(ct["used_bytes"], 240_032u64 * 256 + 240_000 * 64);
+        // No conntrack in this kernel.
+        l.conntrack_max = None;
+        assert!(kernel_memory(&l)["conntrack"].is_null());
+    }
+
     #[test]
     fn threads_of_the_router_processes() {
         let mut s = Session::virtual_lab();

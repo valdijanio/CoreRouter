@@ -24,13 +24,14 @@
 //! boot asks again.
 //!
 //! Servers: the configured ones, then those of DHCP clients with
-//! `use_peer_ntp` (G4.7a), at most [`MAX_SERVERS`] (a DHCP answer is hostile
+//! `use_peer_ntp` (G4.7a; DHCPv6 option 56 too, G4.6n), at most [`MAX_SERVERS`] (a DHCP answer is hostile
 //! input). Sockets: a new one per exchange, on a port the kernel picks
 //! (RFC 9109 §4), bound to the client's VRF.
 //!
 //! First boot (G1.6zh): a router whose config was never saved starts with
 //! the client on and no server configured ([`factory_default`]), so it asks
-//! only what the network's DHCP server names (RFC 2132 §8.3, option 42) and
+//! only what the network's DHCP server names (RFC 2132 §8.3, option 42;
+//! RFC 5908, DHCPv6 option 56) and
 //! nobody else: no public pool is built in (RFC 8633 §6.2, RFC 4085). A
 //! round with nobody to ask sends nothing and waits for nothing: the lease
 //! that brings a server is asked at once.
@@ -399,14 +400,13 @@ impl ClockDriver {
 
 /// Servers to ask: the configured, then the dynamic, without repeats, at
 /// most [`MAX_SERVERS`]. Returns also the dynamic ones actually used.
-fn merged_servers(cfg: &NtpClient, dynamic: &[std::net::Ipv4Addr]) -> (Vec<String>, Vec<String>) {
+fn merged_servers(cfg: &NtpClient, dynamic: &[String]) -> (Vec<String>, Vec<String>) {
     let mut all: Vec<String> = cfg.servers.iter().take(MAX_SERVERS).cloned().collect();
     let mut extra = Vec::new();
-    for ip in dynamic {
-        let name = ip.to_string();
-        if all.len() < MAX_SERVERS && !all.contains(&name) {
+    for name in dynamic {
+        if all.len() < MAX_SERVERS && !all.contains(name) {
             all.push(name.clone());
-            extra.push(name);
+            extra.push(name.clone());
         }
     }
     (all, extra)
@@ -447,7 +447,7 @@ fn run(session: &Shared, port: u16, health: &super::Health, open: OpenClock<'_>,
             let mut s = lock(session);
             (
                 s.store().running().system.ntp_client.clone(),
-                s.dhcp_peer_ntp(),
+                s.ntp_peer_servers(),
                 s.take_ntp_step_confirmation(),
             )
         };
@@ -839,7 +839,7 @@ fn factory_default(session: &Shared) {
     }
     match s.execute("system.ntp.client.set", &serde_json::json!({"enabled": true})) {
         Ok(_) => log::info!(
-            "new config: NTP client on, asking the servers the DHCP clients learn (option 42)"
+            "new config: NTP client on, asking the servers the DHCP clients learn (options 42 and 56)"
         ),
         Err(e) => log::warn!("new config: NTP client not turned on: {e}"),
     }
@@ -867,7 +867,11 @@ mod tests {
     /// A one-socket SNTP server whose clock is `skew_ms` ahead, or that
     /// answers with a kiss code.
     fn server(skew_ms: i128, kiss: Option<&'static [u8; 4]>) -> u16 {
-        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server_on("127.0.0.1:0", skew_ms, kiss)
+    }
+
+    fn server_on(bind: &str, skew_ms: i128, kiss: Option<&'static [u8; 4]>) -> u16 {
+        let sock = UdpSocket::bind(bind).unwrap();
         let port = sock.local_addr().unwrap().port();
         thread::spawn(move || {
             let mut buf = [0u8; 128];
@@ -903,6 +907,20 @@ mod tests {
         let off_ms = s.offset_nanos / 1_000_000;
         assert!((1_900..=2_100).contains(&off_ms), "{off_ms} ms");
         assert!(s.delay_nanos < 500_000_000);
+    }
+
+    /// G4.6n: a server from DHCPv6 option 56 is an IPv6 address; the round
+    /// asks it on an IPv6 socket.
+    #[test]
+    fn an_ipv6_server_is_asked() {
+        let port = server_on("[::1]:0", 1_000, None);
+        let servers = ["::1".to_owned()];
+        let mut denied = BTreeSet::new();
+        let round = poll_round(&servers, port, MAIN_VRF, &mut denied, &literal, &|| true);
+        let (name, addr, _, s) = round.best.unwrap();
+        assert_eq!((name.as_str(), addr.is_ipv6()), ("::1", true));
+        let off_ms = s.offset_nanos / 1_000_000;
+        assert!((900..=1_100).contains(&off_ms), "{off_ms} ms");
     }
 
     #[test]
@@ -1222,7 +1240,7 @@ mod tests {
             servers: vec!["192.0.2.1".into(), "pool.ntp.org".into()],
             ..NtpClient::default()
         };
-        let ip = |i: u8| std::net::Ipv4Addr::new(192, 0, 2, i);
+        let ip = |i: u8| std::net::Ipv4Addr::new(192, 0, 2, i).to_string();
         let (all, extra) = merged_servers(&cfg, &[ip(1), ip(2)]);
         assert_eq!(all, ["192.0.2.1", "pool.ntp.org", "192.0.2.2"]);
         assert_eq!(extra, ["192.0.2.2"], "the static one is not repeated");
@@ -1471,7 +1489,7 @@ mod tests {
             assert!(c.enabled && c.servers.is_empty(), "{c:?}");
             let log = s.log_since(0);
             assert!(
-                log.iter().any(|e| e.message == "NTP Client ligado: servidores do DHCP (opção 42), poll 6–10"),
+                log.iter().any(|e| e.message == "NTP Client ligado: servidores do DHCP (opções 42 e 56), poll 6–10"),
                 "{log:?}"
             );
         }

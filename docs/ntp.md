@@ -14,7 +14,7 @@ Server. Veja "Servidor NTP", abaixo.
 Um roteador cuja config nunca foi gravada (o primeiro boot do disco instalado, e todo boot da ISO
 live) nasce com o cliente NTP **ligado e sem servidor configurado**. Ele pergunta só aos
 servidores que os clientes DHCP aprendem (`use_peer_ntp`, ligado por padrão; opção 42, RFC 2132
-§8.3) e a mais ninguém: nenhum pool público vem embutido, o roteador não fala com terceiros que o
+§8.3, e no DHCPv6 a opção 56, RFC 5908) e a mais ninguém: nenhum pool público vem embutido, o roteador não fala com terceiros que o
 operador não indicou (RFC 8633 §6.2, RFC 4085; o NTP Pool proíbe `pool.ntp.org` como padrão de
 appliance).
 
@@ -151,12 +151,40 @@ Limites conhecidos:
 
 - `servers`: até 8. A lista pode ficar vazia: o cliente usa os que um cliente DHCP com
   `use_peer_ntp` aprender (é assim que um roteador novo nasce, veja "Primeiro boot").
-- `dynamic_servers`: os recebidos por DHCP (opção 42), depois dos configurados, sem repetir e com
-  o total limitado a 8, porque a resposta DHCP é entrada hostil. Mudar a lista nunca faz perguntar
+- `dynamic_servers`: os recebidos por DHCP, depois dos configurados, sem repetir e com o total
+  limitado a 8, porque a resposta DHCP é entrada hostil. Primeiro os do DHCPv4 (opção 42), depois
+  os do DHCPv6 (opção 56, abaixo). Mudar a lista nunca faz perguntar
   mais de uma vez a cada 64 s (RFC 4330 §5); a rodada que não tinha a quem perguntar não conta.
 - `vrf`: o socket fica preso ao VRF por `SO_BINDTODEVICE`. Nomes DNS são resolvidos pelo resolvedor
   do roteador, na tabela principal.
 - Porta: uma nova por troca, escolhida pelo kernel, com `connect` (RFC 9109 §4).
+
+### Servidores do DHCPv6: opção 56 (G4.6n)
+
+Numa rede só IPv6 o roteador novo aprende o servidor pelo DHCPv6. O cliente DHCPv6
+(`ipv6.dhcp-client`) pede a opção 56 (NTP Server, RFC 5908) e a 31 (SNTP, RFC 4075) no Option
+Request, e com `use_peer_ntp` (padrão sim, como no DHCPv4; o RouterOS 7.25 não tem a chave no
+DHCPv6) entrega ao cliente NTP o que veio. `ipv6.dhcp-client.list` mostra `ntp_servers`; a janela
+IPv6 › DHCPv6 Client tem "Use Peer NTP" e a linha "NTP Servers" no Status.
+
+| Subopção (RFC 5908) | O que o cliente NTP faz |
+|---|---|
+| 1, endereço do servidor (§4.1) | pergunta; precisa ser unicast (multicast, `::` e `::1` são descartados) |
+| 2, grupo multicast (§4.2) | mostra em `ntp_servers`, não usa: o cliente não ouve multicast (G4.6l) |
+| 3, FQDN (§4.3) | resolve pelo DNS do roteador, como um nome configurado; um nome só, sem IDN |
+| link-local (`fe80::`) | mostra, não usa: o cliente pergunta só por endereço, e o link-local precisa da interface ao lado |
+
+- **Uma subopção por opção, ou várias:** a §4 manda uma só ("one, and only one") e a opção se
+  repete; o dnsmasq manda todas numa opção, e o systemd-networkd e o odhcp6c leem assim. Lemos as
+  duas formas. Subopção quebrada ou desconhecida é pulada; uma opção quebrada nunca derruba a
+  concessão.
+- **A 31 só sozinha:** a RFC 5908 §7 deprecia a opção SNTP. Os endereços dela valem só quando
+  não veio nenhuma opção 56, como no systemd-networkd.
+- **Limite:** no máximo 8 por mensagem e 8 servidores ao todo no cliente NTP.
+- **Segurança (RFC 5908 §6):** o servidor que o DHCPv6 indica não é autenticado, igual ao da
+  opção 42. Depois do primeiro acerto do boot (G4.6m), o limite de 1000 s e o piso de 2026 seguem
+  valendo.
+- **Laboratório:** o servidor DHCPv6 simulado entrega `2001:db8:0:N::1` na opção 56.
 
 ## Servidor NTP (G4.6c)
 
