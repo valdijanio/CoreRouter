@@ -386,7 +386,8 @@ pub fn log_lines(c: &Crash) -> Vec<(&'static str, String)> {
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     if let Some(u) = c.uptime_s {
-        boot.push(format!("{} after start", span(u as u64)));
+        // A boot that died early: the tenths say how early.
+        boot.push(if u < 60.0 { format!("{u:.1} s after start") } else { format!("{} after start", span(u as u64)) });
     }
     if let Some(t) = c.time {
         boot.push(format!("at {}", utc(t)));
@@ -614,7 +615,7 @@ mod tests {
         let lines = log_lines(c);
         assert_eq!(lines[0].0, "critical");
         assert!(lines[0].1.starts_with("previous boot ended in a kernel panic (boot started"), "{}", lines[0].1);
-        assert!(lines[0].1.contains("slot b") && lines[0].1.contains("41 s after start"), "{}", lines[0].1);
+        assert!(lines[0].1.contains("slot b") && lines[0].1.contains("41.1 s after start"), "{}", lines[0].1);
         assert!(lines[0].1.ends_with(": Kernel panic - not syncing: sysrq triggered crash"));
         assert!(lines.iter().any(|(_, l)| l == "kernel: panic+0x118/0x2e0"), "{lines:?}");
         assert!(lines.len() <= 1 + LOG_TRACE_LINES);
