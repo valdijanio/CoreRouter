@@ -644,8 +644,8 @@ dp_parse() {
 			s = $0; sub(/.*Response codes: */, "", s); n = split(s, parts, ",")
 			for (i = 1; i <= n; i++) {split(parts[i], f, " "); rc[f[1]] = f[2]}
 		}
-		/Average Latency/ {m = $NF; sub(/\)/, "", m); max = m * 1e6}
-		/Connection Statistics|Connection latency/ {conn = 1}
+		/Connection Statistics/ {conn = 1}
+		!conn && /Average Latency/ {m = $NF; sub(/\)/, "", m); max = m * 1e6}
 		!conn && /^ *[0-9.]+ - [0-9.]+: +[0-9]+/ {k++; hi[k] = $3; sub(/:/, "", hi[k]); c[k] = $4; tot += $4}
 		END {
 			p50 = p99 = p999 = 0; acc = 0
