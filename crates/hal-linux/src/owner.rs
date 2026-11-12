@@ -286,7 +286,9 @@ pub fn classify(
             {
                 (
                     l.index,
-                    Owner::External("the PPPoE subscribers' device (interface.pppoe-server)".into()),
+                    Owner::External(
+                        "the PPPoE subscribers' device (interface.pppoe-server)".into(),
+                    ),
                 )
             }
             Some(client) if l.is("veth") => (
@@ -568,6 +570,30 @@ mod tests {
         }
         let v = verdicts(&links, &[], &Policy::default());
         assert!(reason(&v, "lo").contains("add a loopback named 'lo'"));
+    }
+
+    /// G4.3y: the PPPoE subscribers' veth pair and its sink bridge are the
+    /// service's: never seeded as ports, never changed by `apply`.
+    #[test]
+    fn the_subscribers_device_is_the_services() {
+        let links = [
+            link(2, "ether1", None),
+            link(3, "bng0", Some("veth")),
+            link(4, "bng0p", Some("veth")),
+            link(5, "bng0br", Some("bridge")),
+        ];
+        let v = verdicts(
+            &links,
+            &[("ether1", InterfaceKind::Ethernet)],
+            &Policy::default(),
+        );
+        for name in ["bng0", "bng0p", "bng0br"] {
+            assert!(
+                reason(&v, name).contains("PPPoE subscribers"),
+                "{name}: {v:?}"
+            );
+        }
+        assert!(managed(&v, "ether1"));
     }
 
     /// G3.9ga: the client's netdev is ours; the relay end of its veth is

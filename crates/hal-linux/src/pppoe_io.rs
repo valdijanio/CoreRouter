@@ -839,7 +839,10 @@ pub(crate) fn ensure_bng(name: &str) -> io::Result<u32> {
         };
         let fail = |what: &str, e: rtnetlink::Error| io::Error::other(format!("{what}: {e}"));
         let name: &'static str = SLOW_DEVICE;
-        let (have, have_peer) = (find(handle.clone(), name).await, find(handle.clone(), peer).await);
+        let (have, have_peer) = (
+            find(handle.clone(), name).await,
+            find(handle.clone(), peer).await,
+        );
         if let (Some(old), None) = (have, have_peer) {
             handle
                 .link()
@@ -887,7 +890,13 @@ pub(crate) fn ensure_bng(name: &str) -> io::Result<u32> {
             .map_err(|e| fail(&format!("keeping {sink} down"), e))?;
         handle
             .link()
-            .set(LinkUnspec::new_with_index(peer_index).controller(sink_index).arp(false).up().build())
+            .set(
+                LinkUnspec::new_with_index(peer_index)
+                    .controller(sink_index)
+                    .arp(false)
+                    .up()
+                    .build(),
+            )
             .execute()
             .await
             .map_err(|e| fail(&format!("setting {peer} up in {sink}"), e))?;

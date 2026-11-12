@@ -877,7 +877,11 @@ pub fn build(cfg: &Config, dynamic: &[DynamicAddress]) -> Option<(String, progra
             .collect();
         // G4.3y: the PPPoE subscribers are of the lists of their servers'
         // access ports (`in_interface_list=LAN` takes them in or out).
-        if corerouter_model::ppp::subscribers_in_list(&cfg.interface_lists, &cfg.ppp, list.name.as_str()) {
+        if corerouter_model::ppp::subscribers_in_list(
+            &cfg.interface_lists,
+            &cfg.ppp,
+            list.name.as_str(),
+        ) {
             names.insert(corerouter_model::ppp::SUBSCRIBER_DEVICE);
         }
         let items: Vec<String> = names.iter().map(|n| quoted(n)).collect();
@@ -1147,6 +1151,48 @@ pub fn script(cfg: &Config, dynamic: &[DynamicAddress]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G4.3y: `all-ppp` is the subscribers' device, and the subscribers are
+    /// of the lists of their PPPoE servers' access ports: a server on
+    /// ether2 (LAN) puts `bng0` in the LAN set, and that change re-renders.
+    #[test]
+    fn subscribers_are_all_ppp_and_in_their_ports_lists() {
+        let mut cfg = crate::sample::sample();
+        let rule = crate::sample::rule(
+            50,
+            "input",
+            crate::sample::m(&[("in_interface", "all-ppp"), ("protocol", "icmp")]).unwrap(),
+            corerouter_model::firewall::Action::Drop,
+        )
+        .unwrap();
+        let mut rules = cfg.ip.firewall.filter.to_vec();
+        rules.push(rule);
+        cfg.ip.firewall.filter = corerouter_model::cow_list::CowList::from(rules);
+        let text = render(&cfg, &[]).unwrap();
+        assert!(text.contains("iifname \"bng0\" "), "{text}");
+        assert!(!text.contains("all-ppp"), "{text}");
+        let lan = |t: &str| {
+            let at = t
+                .find(&format!("set {} {{", set_if(&"LAN".parse().unwrap())))
+                .unwrap();
+            t[at..t[at..].find("}\n").map_or(t.len(), |e| at + e)].to_owned()
+        };
+        assert!(!lan(&text).contains("bng0"), "{}", lan(&text));
+        let before = cfg.clone();
+        cfg.ppp.pppoe_servers.push(
+            serde_json::from_value(serde_json::json!({"id": "*1", "interface": "ether2"})).unwrap(),
+        );
+        assert!(
+            inputs_changed(&before, &cfg),
+            "a PPPoE server on a LAN port re-renders"
+        );
+        let text = render(&cfg, &[]).unwrap();
+        assert!(lan(&text).contains("\"bng0\""), "{}", lan(&text));
+        assert_eq!(
+            subscriber_lists(&cfg).into_iter().collect::<Vec<_>>(),
+            ["LAN"]
+        );
+    }
 
     /// The per-rule pieces of a commit (G0.31f) add up to what `build`
     /// makes of the whole config: chains, port sets, list sets and rules.

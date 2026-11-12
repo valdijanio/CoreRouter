@@ -621,7 +621,12 @@ fn subscriber_firewall(one: &mut Cpes, sid: u16, ip: Ipv4Addr, lan_member: &Valu
     std::fs::write("/proc/sys/net/ipv4/ip_forward", "1").unwrap();
     let b = namespace_b();
     let (bp, bs) = (Some(b.0.id()), b.0.id().to_string());
-    common::ip(None, &["link", "add", "fwd0", "type", "veth", "peer", "name", "fwd1"]);
+    common::ip(
+        None,
+        &[
+            "link", "add", "fwd0", "type", "veth", "peer", "name", "fwd1",
+        ],
+    );
     common::ip(None, &["link", "set", "fwd1", "netns", &bs]);
     common::ip(None, &["addr", "add", "203.0.113.1/24", "dev", "fwd0"]);
     common::ip(None, &["link", "set", "fwd0", "up"]);
@@ -636,12 +641,17 @@ fn subscriber_firewall(one: &mut Cpes, sid: u16, ip: Ipv4Addr, lan_member: &Valu
     });
     let rule = |p: Value| ok("ip.firewall.filter.add", p)["id"].clone();
     let remove = |id: &Value| {
-        ok("ip.firewall.filter.remove", json!({"id": id, "force": true}));
+        ok(
+            "ip.firewall.filter.remove",
+            json!({"id": id, "force": true}),
+        );
     };
 
     // Input, by `all-ppp`: the subscriber's ping to the gateway is dropped;
     // the router's own ping of that address (by lo) is not.
-    let r = rule(json!({"chain": "input", "action": "drop", "in_interface": "all-ppp", "protocol": "icmp"}));
+    let r = rule(
+        json!({"chain": "input", "action": "drop", "in_interface": "all-ppp", "protocol": "icmp"}),
+    );
     assert!(
         !echo_through(one, sid, ip, gw),
         "input in_interface=all-ppp drops the subscriber"
@@ -650,12 +660,17 @@ fn subscriber_firewall(one: &mut Cpes, sid: u16, ip: Ipv4Addr, lan_member: &Valu
         .args(["-c", "1", "-W", "2", "100.65.0.1"])
         .output()
         .unwrap();
-    assert!(own.status.success(), "the router's own traffic by lo: {own:?}");
+    assert!(
+        own.status.success(),
+        "the router's own traffic by lo: {own:?}"
+    );
     remove(&r);
     assert!(echo_through(one, sid, ip, gw));
 
     // Forward: what the subscriber sends past the router.
-    let r = rule(json!({"chain": "forward", "action": "drop", "in_interface": "all-ppp", "dst_address": "203.0.113.2"}));
+    let r = rule(
+        json!({"chain": "forward", "action": "drop", "in_interface": "all-ppp", "dst_address": "203.0.113.2"}),
+    );
     assert!(
         !echo_through(one, sid, ip, far),
         "forward in_interface=all-ppp drops the subscriber"
@@ -674,17 +689,30 @@ fn subscriber_firewall(one: &mut Cpes, sid: u16, ip: Ipv4Addr, lan_member: &Valu
         })
         .is_some()
     };
-    assert!(dns(one, 40055), "LAN subscribers ask the router's DNS under the safe defaults");
-    ok("interface.list.member.remove", json!({"id": lan_member, "force": true}));
+    assert!(
+        dns(one, 40055),
+        "LAN subscribers ask the router's DNS under the safe defaults"
+    );
+    ok(
+        "interface.list.member.remove",
+        json!({"id": lan_member, "force": true}),
+    );
     assert!(
         !dns(one, 40056),
         "not LAN: dropped by the safe defaults' input rule, not let in as lo"
     );
-    ok("interface.list.member.add", json!({"list": "LAN", "interface": "acc0"}));
+    ok(
+        "interface.list.member.add",
+        json!({"list": "LAN", "interface": "acc0"}),
+    );
     // Last first: the drop rules go before the "accept lo" this channel uses.
     // (The ids are of every table: a NAT one is not a filter rule.)
     for id in d["rules"].as_array().unwrap().iter().rev() {
-        let _ = call(None, "ip.firewall.filter.remove", json!({"id": id, "force": true}));
+        let _ = call(
+            None,
+            "ip.firewall.filter.remove",
+            json!({"id": id, "force": true}),
+        );
     }
     // The veth goes with B's namespace.
     drop(b);

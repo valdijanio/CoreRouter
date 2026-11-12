@@ -35,7 +35,10 @@ fn main() {
         );
         return;
     }
-    let out = Command::new("ip").args(["-o", "link", "show"]).output().unwrap();
+    let out = Command::new("ip")
+        .args(["-o", "link", "show"])
+        .output()
+        .unwrap();
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let names: Vec<&str> = text
         .lines()
@@ -43,10 +46,14 @@ fn main() {
         .map(|n| n.trim().split('@').next().unwrap_or(""))
         .collect();
     assert!(
-        names.iter().all(|n| ["lo", "bng0", "bng0p", "bng0br"].contains(n)),
+        names
+            .iter()
+            .all(|n| ["lo", "bng0", "bng0p", "bng0br"].contains(n)),
         "{ENV}=1 but this namespace is not fresh ({names:?}); refusing to touch it"
     );
-    let _ = Command::new("ip").args(["link", "set", "lo", "up"]).status();
+    let _ = Command::new("ip")
+        .args(["link", "set", "lo", "up"])
+        .status();
     let mut c = criterion::Criterion::default().configure_from_args();
     linux::echo(&mut c);
     c.final_summary();
