@@ -849,9 +849,10 @@ fn bond_slave_checks(
         )),
         Some(_) => {}
     }
-    if !matches!(iface.kind, InterfaceKind::Ethernet) {
+    if !corerouter_model::wifi::bondable(&iface.kind) {
         problems.push(format!(
-            "'{name}' is a {}; only ethernet ports can be bond slaves",
+            "'{name}' is a {}; only ethernet ports and Wi-Fi backhaul links (station-bridge, \
+             peers) can be bond slaves",
             iface.kind.label()
         ));
     }

@@ -42,8 +42,23 @@ pub const NO_BRIDGE: &str = "a Wi-Fi station cannot be a bridge port: its frames
 /// is the way between two routers.
 pub const NO_BOND: &str = "a Wi-Fi station's frames carry three addresses, so the access point \
                            only passes its own MAC, and a bond changes it. Route through it; \
-                           between two CoreRouters, station-bridge mode (G1.30m) will carry a \
-                           bond";
+                           between two CoreRouters, use mode=station-bridge here and its peer \
+                           on the access point (interface.wifi.peer.add): both can be slaves";
+
+/// G1.30m: an access point is not a slave; its peers' links are.
+pub const NO_BOND_AP: &str = "an access point is not a bond slave: its clients are many. The \
+                              four-address links of its peers are (interface.wifi.peer.add), \
+                              one per peer";
+
+/// G1.30m: what a bond takes: an Ethernet port, and a Wi-Fi backhaul link
+/// (a station-bridge, or a peer's link on an access point).
+pub fn bondable(kind: &crate::InterfaceKind) -> bool {
+    match kind {
+        crate::InterfaceKind::Ethernet | crate::InterfaceKind::WifiPeer(_) => true,
+        crate::InterfaceKind::Wifi(w) => w.mode == WifiMode::StationBridge,
+        _ => false,
+    }
+}
 
 /// G1.30m: the backhaul between routers is WPA3 only (SAE with protected
 /// management frames): it carries the whole LAN.

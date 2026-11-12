@@ -2,8 +2,10 @@
 //! style: one row per bond with its mode, slaves and settings, the toolbar,
 //! menus and keys of the G1.9 table, and "New Bonding" / "Bonding <name>"
 //! windows. The slaves are picked among the ethernet ports; which one may
-//! join is the engine's call (it says why not). Wi-Fi ports are listed
-//! too, greyed, with an ⓘ that says why a Wi-Fi client cannot join (G1.30m). Removing a bond is
+//! join is the engine's call (it says why not). G1.30m: the Wi-Fi backhaul
+//! links (station-bridge radios, peers' links) are picked like ports; the
+//! other Wi-Fi radios (clients, access points) are listed greyed, with an
+//! ⓘ that says why. Removing a bond is
 //! `interface.remove`, which releases its slaves.
 //!
 //! A panel (`panel.rs`): its state lives here, not in `CoreRouterUi`.
@@ -84,6 +86,9 @@ pub(crate) struct BondPanel {
     pub(crate) table: TableState,
     /// The ⓘ modal open, if any.
     pub(crate) help: Option<HelpView>,
+    /// G1.30m: `interface.wifi.list` (the radios' modes), while a dialog
+    /// is open.
+    wifi: Vec<Value>,
 }
 
 /// The editable fields of a bond, as typed.
@@ -329,11 +334,19 @@ fn bond_row(r: &Value) -> Row {
 impl PanelState for BondPanel {
     fn queries(&self, app: &CoreRouterUi) -> Vec<Query> {
         if app.open.contains(&Win::Panel(WIN)) || !self.dialogs.is_empty() {
-            vec![Query {
+            let mut out = vec![Query {
                 key: "list",
                 command: "interface.bonding.list",
                 params: Value::Null,
-            }]
+            }];
+            if !self.dialogs.is_empty() && app.has_command("interface.wifi.list") {
+                out.push(Query {
+                    key: "wifi",
+                    command: "interface.wifi.list",
+                    params: Value::Null,
+                });
+            }
+            out
         } else {
             Vec::new()
         }
@@ -346,11 +359,14 @@ impl PanelState for BondPanel {
         _id: crate::backend::RequestId,
         value: Value,
     ) {
-        if key == "list" {
-            self.bonds = match value {
-                Value::Array(a) => a,
-                _ => Vec::new(),
-            };
+        let rows = match value {
+            Value::Array(a) => a,
+            _ => Vec::new(),
+        };
+        match key {
+            "wifi" => self.wifi = rows,
+            "list" => self.bonds = rows,
+            _ => {}
         }
     }
 
@@ -605,8 +621,25 @@ impl BondPanel {
 
     fn draw_dialogs(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
         let bonds = self.bonds.clone();
-        let ports = app.interface_names(Some("ether"));
-        let wifi = app.interface_names(Some("wifi"));
+        // G1.30m: the Wi-Fi backhaul links are picked like ports: the
+        // station-bridge radios and the peers' links; the other radios are
+        // greyed.
+        let bridging: Vec<String> = self
+            .wifi
+            .iter()
+            .filter(|r| r.get("mode").and_then(Value::as_str) == Some("station-bridge"))
+            .filter_map(|r| r.get("name").and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        let mut ports = app.interface_names(Some("ether"));
+        ports.extend(bridging.iter().cloned());
+        ports.extend(app.interface_names(Some("wifi-peer")));
+        let mut backhaul = bridging.clone();
+        backhaul.extend(app.interface_names(Some("wifi-peer")));
+        let wifi: Vec<String> = app
+            .interface_names(Some("wifi"))
+            .into_iter()
+            .filter(|n| !bridging.contains(n))
+            .collect();
         let lang = app.lang;
         let mut help = None;
         let mut dialogs = std::mem::take(&mut self.dialogs);
@@ -641,6 +674,7 @@ impl BondPanel {
                     let ports = Ports {
                         ether: &ports,
                         wifi: &wifi,
+                        backhaul: &backhaul,
                     };
                     dialog_body(ui, f, &mut d.dialog, row.as_ref(), ports, &can, lang, &mut help)
                 });
@@ -738,6 +772,8 @@ impl BondPanel {
 struct Ports<'a> {
     ether: &'a [String],
     wifi: &'a [String],
+    /// G1.30m: the Wi-Fi backhaul links among `ether` (for the warning).
+    backhaul: &'a [String],
 }
 
 /// The Wi-Fi ports, greyed: a Wi-Fi client is never a slave (the engine
@@ -824,6 +860,23 @@ fn dialog_body(
                     }
                 });
             ui.end_row();
+            // G1.30m: balance-rr over links whose rates differ.
+            if form.mode == "balance-rr" && form.slaves.iter().any(|s| ports.backhaul.contains(s)) {
+                ui.label("");
+                let v = ui.visuals().clone();
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(tr_in(
+                            SCOPE,
+                            lang.labels,
+                            "Wi-Fi links have different, changing rates: balance-rr reorders TCP and a flow goes no faster than the slowest. 802.3ad or active-backup suit Wi-Fi better.",
+                        ))
+                        .color(crate::chip::AMBER.tone(&v).ink),
+                    )
+                    .wrap(),
+                );
+                ui.end_row();
+            }
             if form.has_primary() {
                 ui.label("Primary");
                 let mut options = vec![String::new()];

@@ -16,6 +16,8 @@
 //! grows with traffic, and the clients are at most
 //! [`corerouter_hal::wifi_ap::MAX_CLIENTS`] per radio.
 
+use std::collections::BTreeMap;
+
 use corerouter_hal::wifi::WifiRadio;
 use corerouter_hal::wifi_ap::{
     ApBackhaul, ApPeer, ApSecurity, ApState, WifiAp, WifiApEvent, WifiApPort, WifiApStatus,
@@ -254,6 +256,29 @@ struct Told {
     country: String,
     bridge: Option<IfName>,
     backhaul: Option<ApBackhaul>,
+    mac_from: Option<IfName>,
+}
+
+/// G1.30m: the access point whose MAC `name` takes: the first (by name)
+/// of the access points whose peers are slaves of a bond one of `name`'s
+/// peers is in, when it is not `name` itself (`WifiAp::mac_from`).
+pub(crate) fn mac_source(cfg: &Config, name: &IfName) -> Option<IfName> {
+    let peer_of = |i: &corerouter_model::Interface| match &i.kind {
+        InterfaceKind::WifiPeer(p) => Some(p.radio.clone()),
+        _ => None,
+    };
+    let bonds: Vec<&IfName> = cfg
+        .interfaces
+        .values()
+        .filter(|i| peer_of(i).as_ref() == Some(name))
+        .filter_map(|i| i.bond.as_ref())
+        .collect();
+    cfg.interfaces
+        .values()
+        .filter(|i| i.bond.as_ref().is_some_and(|b| bonds.contains(&b)))
+        .filter_map(peer_of)
+        .min()
+        .filter(|first| first != name)
 }
 
 /// G1.30m: the station-bridges access point `name` takes: its registered
@@ -295,6 +320,11 @@ pub(crate) struct ApRadio {
     /// What it runs on now (or would, when it starts).
     pub(crate) plan: Option<Plan>,
     pub(crate) up_since_ms: Option<u64>,
+    /// G1.30m: per client, the airtime counter (µs) at the last read and
+    /// when (ms); and the share of the air it took since the read before,
+    /// percent.
+    airtime_seen: BTreeMap<String, (u64, u64)>,
+    pub(crate) airtime_percent: BTreeMap<String, f64>,
 }
 
 /// The suggestion of the last scan of radio `name`, per band.
@@ -304,6 +334,38 @@ pub(crate) fn suggestion(s: &Session, name: &IfName, band: &'static str, allowed
         return None;
     }
     crate::wifi_air::suggest(band, &r.scan, &r.survey, allowed).map(|g| g.frequency_mhz)
+}
+
+/// G1.30m: the share of the air each client took since the last read:
+/// the growth of its airtime counters (sent and received, µs) over the
+/// time between the reads.
+fn airtime(r: &mut ApRadio, st: &WifiApStatus, now: u64) {
+    let mut seen = BTreeMap::new();
+    let mut pct = BTreeMap::new();
+    for c in &st.clients {
+        let Some(us) = c
+            .link
+            .tx_airtime_us
+            .zip(c.link.rx_airtime_us)
+            .map(|(t, x)| t.saturating_add(x))
+        else {
+            continue;
+        };
+        if let Some((at, before)) = r.airtime_seen.get(&c.mac)
+            && now > *at
+            && us >= *before
+        {
+            let used_us = us - before;
+            let span_us = (now - at).saturating_mul(1000);
+            pct.insert(
+                c.mac.clone(),
+                ((used_us as f64 / span_us as f64) * 1000.0).round().min(1000.0) / 10.0,
+            );
+        }
+        seen.insert(c.mac.clone(), (now, us));
+    }
+    r.airtime_seen = seen;
+    r.airtime_percent = pct;
 }
 
 impl Session {
@@ -334,6 +396,7 @@ impl Session {
         let country = cfg.system.wifi.country.map(|c| c.to_string());
         let bridge = cfg.interfaces.get(name).and_then(|i| i.bridge.clone());
         let backhaul = want.and_then(|st| backhaul_of(cfg, name, st));
+        let mac_from = backhaul.as_ref().and_then(|_| mac_source(cfg, name));
         let mut notes: Vec<(&'static str, String)> = Vec::new();
         let Some(st) = want else {
             if let Some(mut r) = self.wifi_rt().and_then(|rt| rt.aps.remove(name))
@@ -397,6 +460,7 @@ impl Session {
                     && t.country == country
                     && t.bridge == bridge
                     && t.backhaul == backhaul
+                    && t.mac_from == mac_from
                     && (st.frequency.is_none() || st.frequency == Some(t.plan.frequency_mhz))
                     && st.width.is_none_or(|w| w == t.plan.width_mhz)
             });
@@ -452,6 +516,7 @@ impl Session {
                 he: plan.he,
                 radar: plan.radar,
                 backhaul: backhaul.clone(),
+                mac_from: mac_from.as_ref().map(ToString::to_string),
             };
             let Some(p) = r.port.as_mut() else { return };
             match p.start(&ap) {
@@ -477,6 +542,7 @@ impl Session {
                         country,
                         bridge,
                         backhaul,
+                        mac_from,
                     });
                     r.plan = Some(plan);
                     r.error = None;
@@ -544,6 +610,7 @@ impl Session {
                         if st.state == ApState::Running && r.up_since_ms.is_none() {
                             r.up_since_ms = Some(now);
                         }
+                        airtime(r, &st, now);
                         r.status = st;
                     }
                     Err(e) => {

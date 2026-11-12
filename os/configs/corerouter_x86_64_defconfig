@@ -65,6 +65,10 @@ BR2_PACKAGE_WIRELESS_REGDB=y
 # copies it to images/test-tools/ for the access point of `os wifi-test`.
 BR2_PACKAGE_HOSTAPD=y
 BR2_PACKAGE_HOSTAPD_WPA3=y
+# G1.30m: iw moves the simulated radios into the namespaces of the bonding
+# lab (scripts/wifi-bond-lab.sh); a test's tool, out of the image
+# (post-build.sh moves it to images/test-tools/).
+BR2_PACKAGE_IW=y
 # BR2_PACKAGE_HOSTAPD_ACS is not set
 # BR2_PACKAGE_HOSTAPD_VLAN is not set
 # G1.6c: the installer's kernel (the ISO, post-image.sh).

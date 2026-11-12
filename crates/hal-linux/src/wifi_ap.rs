@@ -551,6 +551,15 @@ mod io {
             self.error = None;
             leave_supplicant(&self.name);
             unblock(&self.name);
+            // G1.30m: the MAC of the bond's other access point (see
+            // `WifiAp::mac_from`).
+            if let Some(from) = &ap.mac_from
+                && let Some(mac) = crate::link_set::mac_of(from)
+                && crate::link_set::mac_of(&self.name) != Some(mac)
+            {
+                crate::link_set::set_mac(&self.name, mac)
+                    .map_err(|e| io_err(&format!("the MAC of {from}"), e))?;
+            }
             let ifaces = self.dir.join("if");
             {
                 let _one = HOSTAPD.lock().unwrap_or_else(PoisonError::into_inner);
@@ -608,7 +617,12 @@ mod io {
                 .and_then(|b| b.peers.iter().find(|p| p.mac == mac))
                 .cloned();
             match (added, peer) {
-                (true, Some(p)) => match crate::link_set::rename(ifname, &p.name) {
+                // Out of the bridge hostapd put it in (`bridge=`), then
+                // named: where it goes (a bridge, a bond) is the
+                // configuration's, applied when the link shows up.
+                (true, Some(p)) => match crate::link_set::set_master(ifname, None)
+                    .and_then(|()| crate::link_set::rename(ifname, &p.name))
+                {
                     Ok(()) => {
                         self.peers_up.push((p.mac.clone(), p.name.clone()));
                         Some(WifiApEvent::PeerUp {
@@ -930,6 +944,7 @@ mod tests {
             he: true,
             radar: false,
             backhaul: None,
+            mac_from: None,
         }
     }
 

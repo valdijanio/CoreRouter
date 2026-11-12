@@ -58,6 +58,12 @@ pub struct WifiAp {
     pub radar: bool,
     /// G1.30m: takes station-bridges (`None`: clients only).
     pub backhaul: Option<ApBackhaul>,
+    /// G1.30m: take the MAC (the BSSID) of this other access point. Two
+    /// access points whose peers are slaves of one bond share a MAC: the
+    /// bond gives its slaves one address, and a peer's four-address link
+    /// sends with its own as the transmitter (mac80211 `tx.c`, AP_VLAN),
+    /// so a different one is a frame its station drops.
+    pub mac_from: Option<String>,
 }
 
 /// G1.30m: an access point that takes station-bridges.
@@ -95,6 +101,7 @@ impl std::fmt::Debug for WifiAp {
             .field("he", &self.he)
             .field("radar", &self.radar)
             .field("backhaul", &self.backhaul)
+            .field("mac_from", &self.mac_from)
             .finish()
     }
 }
@@ -366,6 +373,7 @@ mod tests {
             he: true,
             radar: false,
             backhaul: None,
+            mac_from: None,
         };
         assert!(!format!("{ap:?}").contains("segredo"));
     }

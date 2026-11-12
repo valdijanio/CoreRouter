@@ -125,6 +125,36 @@ pub(crate) fn set_master(name: &str, master: Option<&str>) -> io::Result<()> {
     r
 }
 
+/// `IFLA_ADDRESS`.
+const IFLA_ADDRESS: u16 = 1;
+
+/// The MAC of `name` now (`/sys/class/net/<name>/address`).
+pub(crate) fn mac_of(name: &str) -> Option<[u8; 6]> {
+    let text = std::fs::read_to_string(
+        std::path::Path::new("/sys/class/net")
+            .join(name)
+            .join("address"),
+    )
+    .ok()?;
+    let mut out = [0u8; 6];
+    let mut parts = text.trim().split(':');
+    for b in &mut out {
+        *b = u8::from_str_radix(parts.next()?, 16).ok()?;
+    }
+    parts.next().is_none().then_some(out)
+}
+
+/// Give `name` the MAC `mac`, leaving it down (mac80211 takes a new
+/// address only on an interface that is down: `iface.c`,
+/// `_ieee80211_change_mac`); whoever brings it up next (hostapd) does.
+pub(crate) fn set_mac(name: &str, mac: [u8; 6]) -> io::Result<()> {
+    let i = index(name)?;
+    set_up(i, false)?;
+    let mut a = Vec::new();
+    attr(&mut a, IFLA_ADDRESS, &mac);
+    request(RTM_NEWLINK, i, 0, 0, &a)
+}
+
 /// Delete link `name`.
 pub(crate) fn delete(name: &str) -> io::Result<()> {
     request(RTM_DELLINK, index(name)?, 0, 0, &[])
