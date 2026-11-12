@@ -1255,6 +1255,45 @@ fn spoofed_release_is_dropped() {
     assert_eq!(lab.srv.leases().get(a).unwrap().state, State::Released);
 }
 
+/// G4.2l: the BNG Blaster sends each DHCPRELEASE three times (RELEASE gets
+/// no answer, RFC 2131 §4.4.6). The repeats of the same client for its
+/// released lease are `repeated`, not a problem; on the notebook (dev.591)
+/// 1750 clients made 5250 `unexpected` problems.
+#[test]
+fn a_repeated_release_is_not_a_problem() {
+    let mut lab = Lab::new(&cfg());
+    let a = lab.dora(mac(1));
+    let release = msg(
+        MessageType::Release,
+        mac(1),
+        None,
+        Some(ip("192.168.88.1")),
+        a,
+    );
+    for _ in 0..3 {
+        let fx = lab.send(release.clone(), ip("192.168.88.1"));
+        assert!(
+            fx.iter().all(|e| !matches!(e, Effect::Send { .. })),
+            "{fx:?}"
+        );
+    }
+    assert_eq!(lab.srv.leases().get(a).unwrap().state, State::Released);
+    let st = lab.srv.stats();
+    assert_eq!(st.dropped_of(Drop::Repeated), 2);
+    assert_eq!(st.dropped_of(Drop::Unexpected), 0);
+    assert!(!Drop::Repeated.is_problem());
+    // Another client's RELEASE for that address is still unexpected.
+    let other = msg(
+        MessageType::Release,
+        mac(2),
+        None,
+        Some(ip("192.168.88.1")),
+        a,
+    );
+    lab.send_from(other, ip("192.168.88.1"), mac(2));
+    assert_eq!(lab.srv.stats().dropped_of(Drop::Unexpected), 1);
+}
+
 /// A full pool under a random-MAC flood: one warning a minute, not one per
 /// DISCOVER (the log is not flooded).
 #[test]
@@ -1682,4 +1721,106 @@ fn capport_uri_is_option_114() {
         super::plan::OptValue::Bytes(b"https://aviso.provedor.com.br/api".to_vec())
     );
     assert!(!o.force, "only to clients that ask (option 55)");
+}
+
+/// G4.2l: the notebook's second load test (dev.591). A client released its
+/// lease and kept using the address; the server picked that address for
+/// another client, and the ARP probe was answered by its old holder: held
+/// as conflict, with the holder's MAC. Then the holder asked: before, its
+/// own address was a conflict it could not get, and the pool was out.
+/// Now it gets it back, without a probe.
+#[test]
+fn a_client_that_answered_the_probe_gets_its_address_back() {
+    let mut lab = Lab::new(&cfg());
+    let x = lab.dora(mac(1));
+    let release = msg(
+        MessageType::Release,
+        mac(1),
+        None,
+        Some(ip("192.168.88.1")),
+        x,
+    );
+    lab.send(release, ip("192.168.88.1"));
+    // The other ten addresses of the pool go to others.
+    for n in 2..=11 {
+        lab.dora(mac(n));
+    }
+    // A new client: the only free address is mac(1)'s released one (its
+    // last clean probe is old enough to probe again).
+    lab.later(61_000);
+    let fx = lab.discover(mac(12));
+    assert_eq!(probes(&fx), [x]);
+    // mac(1) still uses it and answers.
+    lab.srv
+        .probe_reply(lab.now, &"ether2".parse().unwrap(), x, mac(1));
+    let held = lab.srv.leases().get(x).unwrap();
+    assert_eq!((held.state, held.mac), (State::Conflict, mac(1)));
+    // mac(1) asks: its own address, offered at once, then bound.
+    let fx = lab.discover(mac(1));
+    assert!(
+        probes(&fx).is_empty(),
+        "no probe: it answered for it a moment ago"
+    );
+    let (offer, _) = sent(&fx, Kind::Offer).unwrap_or_else(|| panic!("no offer: {fx:?}"));
+    assert_eq!(v4::decode(&offer).unwrap().yiaddr, x);
+    let fx = lab.select(mac(1), x);
+    assert!(sent(&fx, Kind::Ack).is_some(), "{fx:?}");
+    assert_eq!(lab.srv.leases().get(x).unwrap().state, State::Bound);
+}
+
+/// G4.2l: two offers waiting on one address (one client's released address
+/// picked for another while the first asks for it back): the holder's
+/// answer gives it to the holder, and the other client looks further,
+/// with no conflict recorded.
+#[test]
+fn the_holders_answer_goes_to_the_holders_offer() {
+    let mut lab = Lab::new(&cfg());
+    let x = lab.dora(mac(1));
+    let release = msg(
+        MessageType::Release,
+        mac(1),
+        None,
+        Some(ip("192.168.88.1")),
+        x,
+    );
+    lab.send(release, ip("192.168.88.1"));
+    for n in 2..=11 {
+        lab.dora(mac(n));
+    }
+    // Only mac(1)'s released address is free; a minute passes, so it is
+    // probed again for whoever asks.
+    lab.later(61_000);
+    let a = lab.discover(mac(12));
+    let b = lab.discover(mac(1));
+    assert_eq!(
+        (probes(&a), probes(&b)),
+        (vec![x], vec![x]),
+        "both wait on it"
+    );
+    let fx = lab
+        .srv
+        .probe_reply(lab.now, &"ether2".parse().unwrap(), x, mac(1));
+    assert_eq!(
+        lab.srv.stats().conflicts,
+        0,
+        "the holder answered: no conflict"
+    );
+    let mut fx = fx;
+    fx.extend(lab.later(PROBE_WAIT_MS));
+    let offers: Vec<(Ipv4Addr, [u8; 6])> = fx
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Send {
+                payload,
+                kind: Kind::Offer,
+                ..
+            } => v4::decode(payload).ok().map(|m| (m.yiaddr, m.chaddr)),
+            _ => None,
+        })
+        .collect();
+    assert!(offers.contains(&(x, mac(1))), "{offers:?}");
+    assert!(
+        offers.iter().all(|(ip, m)| *ip != x || *m == mac(1)),
+        "{offers:?}"
+    );
 }

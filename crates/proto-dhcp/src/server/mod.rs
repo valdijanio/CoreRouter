@@ -17,7 +17,11 @@
 //!   when `conflict_detection` is on: the OFFER waits [`PROBE_WAIT_MS`]
 //!   (as Kea's ping-check parks it); an address someone answers for is
 //!   marked `conflict` for the lease time and another is tried. Static
-//!   leases and a client's own address are not probed (RouterOS).
+//!   leases and a client's own address are not probed (RouterOS). G4.2l:
+//!   an answer from the requesting client itself is no conflict (it still
+//!   holds the address, RFC 5227); with two offers waiting on one address,
+//!   the one whose client answered gets it; and an address held as
+//!   `conflict` because a client answered for it goes back to that client.
 //! - §4.3.2: REQUEST in SELECTING (ours: ACK or NAK; another server's: the
 //!   offer is freed), INIT-REBOOT and RENEWING/REBINDING; `authoritative`
 //!   decides between NAK and silence for addresses the server does not
@@ -25,7 +29,9 @@
 //!   address it has no record of (dnsmasq's `dhcp-authoritative`): the
 //!   clients rebuild a lost lease table without renumbering.
 //! - §4.3.3 DECLINE (the address is held `declined`), §4.3.4 RELEASE (the
-//!   record stays, so the client gets the address back), §4.3.5 INFORM.
+//!   record stays, so the client gets the address back; a repeat of the
+//!   same client's RELEASE is `repeated`, not a problem: §4.4.6, no answer
+//!   comes, so clients send it again), §4.3.5 INFORM.
 //! - §4.1: where replies go; §4.4.5: T1 = 0.5 × lease, T2 = 0.875 × lease.
 //! - RFC 6842 §3: option 61 echoed; RFC 3046 §2.2: option 82 echoed, last;
 //!   RFC 4702 §4: option 81 answered with the S/O/N flags; the DNS is
@@ -620,6 +626,9 @@ impl Server {
         }
         match self.leases.get(ip) {
             None => true,
+            // G4.2l: held as conflict because this client answered for it:
+            // the client is the one using it.
+            Some(l) if l.state == State::Conflict && l.mac == mac && l.server == srv.name => true,
             Some(l) if l.client_key() == key && l.server == srv.name => {
                 !matches!(l.state, State::Conflict | State::Declined)
             }
@@ -728,6 +737,20 @@ impl Server {
             l.state.active()
                 && !skip.contains(&l.address)
                 && self.free_for(srv, chain, l.address, &key, mac)
+        }) {
+            return Some((l.address, false));
+        }
+        // G4.2l: an address held as `conflict` because this very client
+        // answered our ARP probe for it (it still used it, e.g. a CPE that
+        // released its lease and kept the address, or our probe for another
+        // client hit it): it is the client's, given back without a probe.
+        if let Some(l) = self.leases.of_mac(mac).find(|l| {
+            l.state == State::Conflict
+                && l.mac == mac
+                && l.server == srv.name
+                && !skip.contains(&l.address)
+                && self.plan.static_of(&srv.name, l.address).is_none()
+                && self.usable(chain, l.address)
         }) {
             return Some((l.address, false));
         }
@@ -1509,12 +1532,19 @@ impl Server {
     fn release_msg(&mut self, now: Now, srv: &ServerPlan, req: &Request, out: &mut Vec<Effect>) {
         let key = req.client_key();
         let ip = req.ciaddr;
-        let mine = self.leases.get(ip).is_some_and(|l| {
-            l.client_key() == key && l.server == srv.name && l.state == State::Bound
-        });
-        if !mine {
-            self.stats.drop(Drop::Unexpected);
-            return;
+        let ours = |l: &&Lease| l.client_key() == key && l.server == srv.name;
+        match self.leases.get(ip).filter(ours).map(|l| l.state) {
+            Some(State::Bound) => {}
+            // G4.2l: the same client's RELEASE again (RFC 2131 §4.4.6: no
+            // answer, so clients repeat it): nothing to do, and no problem.
+            Some(s) if s.free() => {
+                self.stats.drop(Drop::Repeated);
+                return;
+            }
+            _ => {
+                self.stats.drop(Drop::Unexpected);
+                return;
+            }
         }
         self.end(ip, State::Released, now, "released by the client", out);
     }
@@ -1591,29 +1621,56 @@ impl Server {
                 text: format!("{}: {ip} is still in use: {}", l.server, l.reason),
             });
         }
-        let Some(pos) = self
-            .parked
-            .iter()
-            .position(|p| p.ip == ip && p.interface == *iface)
-        else {
+        // G4.2l: every offer waiting on this address (two clients can: an
+        // address released by one, still in use by it, picked for another
+        // while the first asks for it back). The one whose client answered
+        // gets it; the others try another address.
+        let (mut mine, rest): (Vec<Parked>, Vec<Parked>) = std::mem::take(&mut self.parked)
+            .into_iter()
+            .partition(|p| p.ip == ip && p.interface == *iface);
+        self.parked = rest;
+        if mine.is_empty() {
+            return out;
+        }
+        for p in &mine {
+            self.parked_keys
+                .remove(&(p.server.clone(), p.req.client_key()));
+        }
+        let own = |p: &Parked| p.req.htype == 1 && p.req.hlen == 6 && mac == p.req.mac();
+        if let Some(at) = mine.iter().position(own) {
+            let p = mine.remove(at);
+            if let Some(srv) = self.server(&p.server).cloned() {
+                // The client itself still holds the address (RFC 5227 hosts
+                // answer for theirs): not a conflict, offer it now.
+                self.probed_ok.insert(p.ip, now.ms);
+                self.set_agent(&srv.name, &p.req);
+                let key = p.req.client_key();
+                if self.free_for(&srv, p.matcher_pool.as_deref(), p.ip, &key, mac) {
+                    self.offer(now, &p.interface, &srv, &p.req, p.ip, &mut out);
+                }
+            }
+            // The address is its holder's: the others look further, and no
+            // conflict is recorded (the holder is our own client).
+            for p in mine {
+                if let Some(srv) = self.server(&p.server).cloned() {
+                    let iface = p.interface.clone();
+                    self.discover(now, &iface, &srv, p.req, Some(p.tried), &mut out);
+                }
+            }
+            return out;
+        }
+        let mut others = mine.split_off(1);
+        let Some(p) = mine.pop() else {
             return out;
         };
-        let p = self.parked.remove(pos);
-        self.parked_keys
-            .remove(&(p.server.clone(), p.req.client_key()));
         let Some(srv) = self.server(&p.server).cloned() else {
             return out;
         };
-        if p.req.htype == 1 && p.req.hlen == 6 && mac == p.req.mac() {
-            // The client itself still holds the address (RFC 5227 hosts
-            // answer for theirs): not a conflict, offer it now.
-            self.probed_ok.insert(p.ip, now.ms);
-            self.set_agent(&srv.name, &p.req);
-            let key = p.req.client_key();
-            if self.free_for(&srv, p.matcher_pool.as_deref(), p.ip, &key, mac) {
-                self.offer(now, &p.interface, &srv, &p.req, p.ip, &mut out);
+        for o in others.drain(..) {
+            if let Some(osrv) = self.server(&o.server).cloned() {
+                let iface = o.interface.clone();
+                self.discover(now, &iface, &osrv, o.req, Some(o.tried), &mut out);
             }
-            return out;
         }
         self.stats.conflicts = self.stats.conflicts.saturating_add(1);
         self.set_agent(&srv.name, &p.req);
