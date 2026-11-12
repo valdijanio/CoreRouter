@@ -361,7 +361,12 @@ mod io {
     /// End hostapd when it has no interface left (as the supplicant ends
     /// with its last radio): each interface has its socket in `if/`.
     fn end_if_idle(dir: &Path) {
-        let busy = std::fs::read_dir(dir.join("if")).map_or(true, |mut d| d.next().is_some());
+        // hostapd removes the directory with its last socket
+        // (`hostapd_ctrl_iface_deinit` → `rmdir`): gone is idle too.
+        let busy = match std::fs::read_dir(dir.join("if")) {
+            Ok(mut d) => d.next().is_some(),
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        };
         if busy {
             return;
         }

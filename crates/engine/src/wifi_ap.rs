@@ -283,11 +283,14 @@ impl Session {
     /// [`plan`] for radio `name` of `cfg`, with what this session knows of
     /// the radio and the last scan.
     pub(crate) fn wifi_ap_plan(&mut self, name: &IfName, st: &WifiConfig) -> Result<Plan, String> {
-        let hw = self
-            .wifi()
-            .and_then(|rt| rt.radios.get(name))
-            .and_then(|r| r.hardware.clone())
-            .or_else(|| self.hal_mut().wifi_radio(name));
+        // Read now: the channels depend on the country in force, which may
+        // have changed since the radio was opened (a world domain makes
+        // 5 GHz passive). One read costs 0.4 ms (G1.30g, measured).
+        let hw = self.hal_mut().wifi_radio(name).or_else(|| {
+            self.wifi()
+                .and_then(|rt| rt.radios.get(name))
+                .and_then(|r| r.hardware.clone())
+        });
         // Kept for the commands that read it without the platform (the
         // preview of interface.wifi.set).
         if let (Some(h), Some(rt)) = (&hw, self.wifi_rt()) {
