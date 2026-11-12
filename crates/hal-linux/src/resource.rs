@@ -699,6 +699,13 @@ pub fn parse_edac_dimm(
 /// the device's own numbered name (`nvme0`).
 fn chip_instance(dir: &Path, name: &str) -> String {
     let device = dir.join("device");
+    // G4.8g: a memory module's sensor is an SMBus client named
+    // `<bus>-<address>`; the address is the slot, in the order the SMBIOS
+    // lists them (i2c_register_spd, drivers/i2c/i2c-smbus.c: 0x50 + n; the
+    // JC42.4 sensor sits at 0x18 + n).
+    if let Some(slot) = dimm_slot(name, &device) {
+        return cut_name(&format!("{name} dimm{slot}"));
+    }
     let first = |sub: &str| -> Option<String> {
         std::fs::read_dir(device.join(sub))
             .ok()?
@@ -718,6 +725,22 @@ fn chip_instance(dir: &Path, name: &str) -> String {
                 .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
         })
         .unwrap_or_else(|| name.to_owned())
+}
+
+/// G4.8g: the memory modules' temperature drivers.
+const DIMM_DRIVERS: [&str; 2] = ["spd5118", "jc42"];
+
+/// The slot of a memory module's sensor, from its SMBus address.
+fn dimm_slot(name: &str, device: &Path) -> Option<u16> {
+    let base = match name {
+        "spd5118" => 0x50,
+        "jc42" => 0x18,
+        _ => return None,
+    };
+    let link = std::fs::read_link(device).ok()?;
+    let (_, addr) = link.file_name()?.to_str()?.rsplit_once('-')?;
+    let addr = u16::from_str_radix(addr, 16).ok()?;
+    addr.checked_sub(base).filter(|n| *n < 8)
 }
 
 /// The platform drivers of the motherboard's Super-I/O chips (the modules
@@ -910,10 +933,17 @@ impl Collector {
                 None => seen.push((chip.clone(), 1)),
             }
             let board = board_chip(&dir);
+            let dimm = DIMM_DRIVERS.contains(&name.as_str());
             out.extend(parse_hwmon(&chip, &files).into_iter().map(|mut s| {
                 if board {
                     // The firmware's alarm settings, not what the part stands.
                     (s.board, s.max, s.crit) = (true, None, None);
+                }
+                if dimm {
+                    // G4.8g: the module's high limit is an alarm the firmware
+                    // (or the chip's reset value, 55 °C on many) programs, not
+                    // a limit of the part; its critical one stays.
+                    s.max = None;
                 }
                 s
             }));

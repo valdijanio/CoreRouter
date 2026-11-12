@@ -79,7 +79,21 @@ const SENSOR_DRIVERS: &str = "kernel/drivers/hwmon/";
 /// (NCT6775…NCT6799, NCT6683/6686/6687), ITE (IT87xx/IT86xx), Fintek
 /// (F718xx/F818xx), Winbond (W83627EHF/DHG, W83667HG). `cargo xtask os check`
 /// keeps this list and the kernel's (`linux.fragment`) the same.
-pub const SENSOR_MODULES: [&str; 5] = ["nct6775", "nct6683", "it87", "f71882fg", "w83627ehf"];
+/// G4.8g: and `jc42`, the JC42.4 temperature sensor of DDR3/DDR4 modules,
+/// found by reading SMBus addresses 0x18–0x1f (`jc42_detect`).
+#[rustfmt::skip]
+pub const SENSOR_MODULES: [&str; 6] = ["nct6775", "nct6683", "it87", "f71882fg", "w83627ehf", "jc42"];
+/// G4.8g: the SMBus controller of AMD chipsets (and ATI, ServerWorks):
+/// with it the kernel lists the DDR5 modules' SPD hubs (`spd5118`, built in)
+/// from the SMBIOS, and `jc42` has a bus to look at. A module, loaded with
+/// the sensors only where such a controller is (VMware's virtual PIIX4
+/// writes "SMBus Host Controller not enabled!" at every boot).
+pub const SMBUS_MODULES: [&str; 1] = ["i2c_piix4"];
+const SMBUS_DRIVERS: &str = "kernel/drivers/i2c/busses/";
+/// PCI vendors of [`SMBUS_MODULES`]' controllers: AMD, ATI, ServerWorks.
+const PIIX4_VENDORS: [&str; 3] = ["0x1022", "0x1002", "0x1166"];
+/// I2C drivers load whether or not their chip is there: found = a client bound.
+const I2C_SENSORS: [&str; 1] = ["jc42"];
 /// G1.6zy: the EDAC drivers that need ECC to be quiet, by module name.
 /// `cargo xtask os check` keeps this list and the kernel's the same.
 pub const EDAC_MODULES: [&str; 2] = ["igen6_edac", "pnd2_edac"];
@@ -198,9 +212,15 @@ impl Index {
             let Some((path, needs)) = line.split_once(':') else {
                 continue;
             };
-            if ![NET_DRIVERS, SCREEN_DRIVERS, SENSOR_DRIVERS, EDAC_DRIVERS]
-                .iter()
-                .any(|d| path.starts_with(d))
+            if ![
+                NET_DRIVERS,
+                SCREEN_DRIVERS,
+                SENSOR_DRIVERS,
+                EDAC_DRIVERS,
+                SMBUS_DRIVERS,
+            ]
+            .iter()
+            .any(|d| path.starts_with(d))
             {
                 continue;
             }
@@ -231,7 +251,11 @@ impl Index {
             let by_alias = chains
                 .get(&module)
                 .and_then(|c: &Vec<String>| c.last())
-                .is_some_and(|p| !p.starts_with(SENSOR_DRIVERS) && !p.starts_with(EDAC_DRIVERS));
+                .is_some_and(|p| {
+                    ![SENSOR_DRIVERS, EDAC_DRIVERS, SMBUS_DRIVERS]
+                        .iter()
+                        .any(|d| p.starts_with(d))
+                });
             if by_alias && BUSES.iter().any(|(b, _)| *b == bus) {
                 aliases.push((bus.to_owned(), pattern.to_owned(), module));
             }
@@ -381,6 +405,14 @@ fn probe_result(r: std::io::Result<bool>) -> Probe {
 fn load_sensors(index: &Index, dir: &Path, log: impl Fn(&str)) {
     let t = Instant::now();
     let mut found = Vec::new();
+    // G4.8g: the AMD SMBus first: the memory modules' sensors sit on it.
+    if amd_smbus(Path::new("/sys/bus/pci/devices")) {
+        for module in SMBUS_MODULES {
+            if let Some(e) = load(index, dir, module).filter(|m| !m.contains(" loaded in ")) {
+                log(&format!("sensors: {e}"));
+            }
+        }
+    }
     for module in SENSOR_MODULES {
         let Some((own, needs)) = index.chain(module).split_last() else {
             continue;
@@ -393,6 +425,9 @@ fn load_sensors(index: &Index, dir: &Path, log: impl Fn(&str)) {
             continue;
         }
         match probe_result(insert(dir, own, c"")) {
+            Probe::Found
+                if I2C_SENSORS.contains(&module)
+                    && !i2c_bound(Path::new("/sys/bus/i2c/drivers"), module) => {}
             Probe::Found => found.push(module),
             Probe::Absent => {}
             Probe::Firmware => log(&format!(
@@ -407,6 +442,34 @@ fn load_sensors(index: &Index, dir: &Path, log: impl Fn(&str)) {
         format!("motherboard sensor chip: {}", found.join(", "))
     };
     log(&format!("sensors: {what} ({} ms)", t.elapsed().as_millis()));
+}
+
+/// G4.8g: an SMBus controller of [`SMBUS_MODULES`] is in the machine (PCI
+/// class 0x0c05, an AMD, ATI or ServerWorks function).
+fn amd_smbus(pci: &Path) -> bool {
+    let Ok(rd) = fs::read_dir(pci) else {
+        return false;
+    };
+    rd.flatten().take(MAX_DEVICES).any(|e| {
+        let read = |f: &str| fs::read_to_string(e.path().join(f)).unwrap_or_default();
+        read("class").trim().starts_with("0x0c05") && PIIX4_VENDORS.contains(&read("vendor").trim())
+    })
+}
+
+/// G4.8g: the I2C driver `module` has a client (`0-0018`): its chip answered.
+fn i2c_bound(drivers: &Path, module: &str) -> bool {
+    fs::read_dir(drivers.join(module)).is_ok_and(|rd| {
+        rd.flatten().take(64).any(|e| {
+            e.file_name().to_str().is_some_and(|n| {
+                n.split_once('-').is_some_and(|(bus, addr)| {
+                    !bus.is_empty()
+                        && bus.bytes().all(|b| b.is_ascii_digit())
+                        && addr.len() == 4
+                        && addr.bytes().all(|b| b.is_ascii_hexdigit())
+                })
+            })
+        })
+    })
 }
 
 /// G1.6zy: the memory controllers EDAC registered (`mc0`, `mc1`…).
@@ -641,6 +704,33 @@ pub fn start(log: fn(&str), sensors: bool, edac: bool, hwsim: Option<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G4.8g: the AMD SMBus by class and vendor; a JC42 client by its name.
+    #[test]
+    fn amd_smbus_and_jc42_clients() {
+        let dir = std::env::temp_dir().join(format!("cr-init-smbus-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let dev = |name: &str, class: &str, vendor: &str| {
+            let d = dir.join("pci").join(name);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("class"), format!("{class}\n")).unwrap();
+            fs::write(d.join("vendor"), format!("{vendor}\n")).unwrap();
+        };
+        dev("0000:00:1f.4", "0x0c0500", "0x8086");
+        assert!(!amd_smbus(&dir.join("pci")), "Intel's is i801, built in");
+        dev("0000:00:14.0", "0x0c0500", "0x1022");
+        assert!(amd_smbus(&dir.join("pci")));
+        assert!(!amd_smbus(&dir.join("none")));
+        let drv = dir.join("drivers/jc42");
+        fs::create_dir_all(&drv).unwrap();
+        for f in ["bind", "unbind", "uevent", "module"] {
+            fs::write(drv.join(f), "").unwrap();
+        }
+        assert!(!i2c_bound(&dir.join("drivers"), "jc42"));
+        fs::create_dir_all(drv.join("0-0018")).unwrap();
+        assert!(i2c_bound(&dir.join("drivers"), "jc42"));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// G1.6zy: the controllers EDAC registered, by directory name.
     #[test]

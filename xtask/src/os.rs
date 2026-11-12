@@ -160,6 +160,8 @@ const SENSORS_BUILT_IN: &[&str] = &[
     "CONFIG_SENSORS_K10TEMP",
     "CONFIG_NVME_HWMON",
     "CONFIG_SENSORS_DRIVETEMP",
+    // G4.8g: DDR5 modules (enumerated from the SMBIOS by the SMBus driver).
+    "CONFIG_SENSORS_SPD5118",
 ];
 /// G1.6zf: the motherboard's Super-I/O drivers, (kernel symbol, module).
 /// Modules, never built in: each writes to I/O ports 0x2e/0x4e to find its
@@ -171,7 +173,12 @@ const SENSOR_MODULES: &[(&str, &str)] = &[
     ("CONFIG_SENSORS_IT87", "it87"),
     ("CONFIG_SENSORS_F71882FG", "f71882fg"),
     ("CONFIG_SENSORS_W83627EHF", "w83627ehf"),
+    // G4.8g: DDR3/DDR4 modules' JC42.4 (it reads SMBus addresses to find it).
+    ("CONFIG_SENSORS_JC42", "jc42"),
 ];
+/// G4.8g: the AMD SMBus controller, loaded by PID 1 before the sensors and
+/// only where it is (`SMBUS_MODULES` of `corerouter-init`).
+const SMBUS_MODULES: &[(&str, &str)] = &[("CONFIG_I2C_PIIX4", "i2c_piix4")];
 /// G1.6zy: the EDAC drivers that write an error line on a machine without
 /// ECC, (kernel symbol, module): modules, loaded by PID 1 when the memory has
 /// ECC. The names are `EDAC_MODULES` of `corerouter-init`.
@@ -802,7 +809,29 @@ fn check_sensors(fragment: &str, init: &str) -> Result<usize, String> {
             "corerouter-init loads the sensor modules {loaded:?}, the kernel builds {built:?}"
         ));
     }
-    Ok(SENSORS_BUILT_IN.len() + SENSOR_MODULES.len() + 1)
+    let list = init
+        .lines()
+        .find_map(|l| l.strip_prefix("pub const SMBUS_MODULES: ["))
+        .and_then(|l| l.split_once("] = [")?.1.strip_suffix("];"))
+        .ok_or("corerouter-init modules.rs: no `pub const SMBUS_MODULES: [&str; N] = [...];` on one line")?;
+    let loaded: Vec<&str> = list
+        .split(',')
+        .map(|m| m.trim().trim_matches('"'))
+        .collect();
+    let built: Vec<&str> = SMBUS_MODULES.iter().map(|(_, m)| *m).collect();
+    for (symbol, _) in SMBUS_MODULES {
+        if !modules.contains(symbol) {
+            return Err(format!(
+                "linux.fragment: {symbol}=m is required (G4.8g: PID 1 loads it where the controller is)"
+            ));
+        }
+    }
+    if loaded != built {
+        return Err(format!(
+            "corerouter-init loads the SMBus modules {loaded:?}, the kernel builds {built:?}"
+        ));
+    }
+    Ok(SENSORS_BUILT_IN.len() + SENSOR_MODULES.len() + SMBUS_MODULES.len() + 1)
 }
 
 /// G1.6zy: the EDAC modules in the kernel and in PID 1's list, the memory
@@ -1412,6 +1441,7 @@ pub(crate) fn build_with(
         .iter()
         .chain(SENSOR_MODULES.iter().map(|(symbol, _)| symbol))
         .chain(EDAC_MODULES.iter().map(|(symbol, _)| symbol))
+        .chain(SMBUS_MODULES.iter().map(|(symbol, _)| symbol))
         .filter(|s| !kc.lines().any(|l| l == format!("{s}=m")))
         .copied()
         .collect();
@@ -1498,6 +1528,7 @@ pub(crate) fn build_with(
         .copied()
         .chain(SENSOR_MODULES.iter().map(|(_, module)| *module))
         .chain(EDAC_MODULES.iter().map(|(_, module)| *module))
+        .chain(SMBUS_MODULES.iter().map(|(_, module)| *module))
         .collect();
     let (mods, mods_size) = livemods::verify(&installer_dir, &version, &live_required)?;
     eprintln!(
@@ -2848,7 +2879,14 @@ mod tests {
         let fragment = std::fs::read_to_string(os.join("board/x86_64/linux.fragment")).unwrap();
         let init =
             std::fs::read_to_string(os.join("../apps/corerouter-init/src/modules.rs")).unwrap();
-        assert_eq!(check_sensors(&fragment, &init).unwrap(), 10);
+        assert_eq!(check_sensors(&fragment, &init).unwrap(), 13);
+        // G4.8g.
+        let e = check_sensors(
+            &fragment.replace("CONFIG_I2C_PIIX4=m", "CONFIG_I2C_PIIX4=y"),
+            &init,
+        )
+        .unwrap_err();
+        assert!(e.contains("CONFIG_I2C_PIIX4=m is required"), "{e}");
         // G1.6zy.
         assert_eq!(check_edac(&fragment, &init).unwrap(), 5);
         let e = check_edac(
