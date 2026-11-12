@@ -850,22 +850,14 @@ churn_prepare() { # <kind> <k> → dir
 # external: the first prefix; router: the /32 of a node that is not the
 # root (its cost goes through links whose metric flips). PROBE_LSA: the LSA
 # that carries it, for the LSDB's lag.
-# router: the farthest link (172.30.0.0/16: lspgen gives OSPFv2 node
-# prefixes only in SR's extended prefix LSAs, off here) as the DUT has it
-# (its cost has to move when every link does); lspgen's node ids are not
-# the LSA ids, so no LSDB lag for this kind. Called after the first tick.
+# router: lspgen's OSPFv2 router-LSAs (no SR) carry unnumbered
+# point-to-point links only, so no prefix of the churn node depends on
+# them: no probe (the test counts the SPF runs and the CPU).
 churn_probe() { # <dir> <kind>: sets PROBE and PROBE_LSA
 	if [ "$2" = external ]; then
 		PROBE=198.18.0.0/28 PROBE_LSA="external 198.18.0.0"
 	else
-		PROBE_LSA=""
-		if [ $DUT = local ]; then
-			PROBE=$(vty 'show ip route ospf json' | jq -r '[to_entries[] | select(.key | startswith("172.30.")) |
-				{k: .key, m: .value[0].metric}] | max_by(.m) | .k // empty')
-		else
-			PROBE=$(cr routing.ospf.route.list "{\"instance\":\"$INSTANCE\",\"find\":\"172.30.\",\"limit\":1000}" |
-				jq -r '[.rows[] | {k: .prefix, m: .cost}] | max_by(.m) | .k // empty')
-		fi
+		PROBE="" PROBE_LSA=""
 	fi
 }
 # The probe LSA's sequence number in the DUT's LSDB (local).
@@ -899,12 +891,12 @@ churn_run() {
 		t_tick=$(now)
 		m=$((i % 2 ? 200 : 100))
 		local sq=""
-		if [ $((i % 5)) = 4 ]; then
+		if [ $((i % 5)) = 4 ] && [ -n "$PROBE" ]; then
 			before=$(cost_cr)
 			[ $DUT = local ] && zb=$(cost_zebra) && sq=$(seq_lsdb)
 		fi
 		churn_tick "$d" "$kind" "$m"
-		if [ $((i % 5)) = 4 ]; then
+		if [ $((i % 5)) = 4 ] && [ -n "$PROBE" ]; then
 			# CoreRouter's view is right when it shows what zebra shows now
 			# (local; the cost of an intra-area route, the type-2 cost of an
 			# external one) or, remote, the tick's metric (external) or any
@@ -973,7 +965,7 @@ test_churn() {
 			churn_tick "$d" "$kind" 200
 			sleep 5
 			churn_probe "$d" "$kind"
-			if [ "$(cost_cr)" = "-/-" ]; then
+			if [ -n "$PROBE" ] && [ "$(cost_cr)" = "-/-" ]; then
 				log "churn $kind: no route to the probe $PROBE: $(cr routing.ospf.route.list "{\"instance\":\"$INSTANCE\",\"find\":\"${PROBE%/*}\"}" | head -c 300)"
 			fi
 			local spf0
@@ -995,6 +987,9 @@ test_churn() {
 			lc="-"
 			[ -s "$lags.c" ] && lc="$(pct "$lags.c" 50)/$(pct "$lags.c" 100)"
 			[ "$stale" -gt 0 ] && verdict="FAIL ($stale probes stale)"
+			if [ "$kind" = router ] && [ $DUT = local ] && [ "${spf%% *}" -le "${spf0%% *}" ]; then
+				verdict="FAIL (no SPF ran)"
+			fi
 			[ "$full" -lt 1 ] && verdict="FAIL (adjacency lost)"
 			local dead
 			if dead=$(procs_dead); then verdict="FAIL ($dead died)"; fi
@@ -1005,7 +1000,7 @@ test_churn() {
 			# Out with the extra node: its LSAs purged (MaxAge).
 			(cd "$d" && lspgen -r tick.json -S "$BBL_SOCK" -I 1 -Q -G >>lspgen-ticks.log 2>&1) || true
 			[ "$verdict" = ok ] || FAILED=1
-			say "| $kind | $(awk -v k=$k -v t="$ticks" -v s="$CHURN_SECS" 'BEGIN {printf "%.1f", k * t / s}') | $PROBE | $ticks | $(csv_avg "$csv" ospfd_cpu)/$(csv_max "$csv" ospfd_cpu) | $(csv_avg "$csv" zebra_cpu)/$(csv_max "$csv" zebra_cpu) | $(csv_avg "$csv" daemon_cpu)/$(csv_max "$csv" daemon_cpu) | ${spf0%% *} → ${spf%% *} | $ll | $lz | $lc | $stale | $full | $verdict |"
+			say "| $kind | $(awk -v k=$k -v t="$ticks" -v s="$CHURN_SECS" 'BEGIN {printf "%.1f", k * t / s}') | ${PROBE:--} | $ticks | $(csv_avg "$csv" ospfd_cpu)/$(csv_max "$csv" ospfd_cpu) | $(csv_avg "$csv" zebra_cpu)/$(csv_max "$csv" zebra_cpu) | $(csv_avg "$csv" daemon_cpu)/$(csv_max "$csv" daemon_cpu) | ${spf0%% *} → ${spf%% *} | $ll | $lz | $lc | $stale | $full | $verdict |"
 		done
 	done
 	gen_stop
