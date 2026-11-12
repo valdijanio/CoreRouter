@@ -169,9 +169,16 @@ ip -n crwa -o link | grep -q wifi2 && ip -n crwb -o link | grep -q wifi2 ||
 	{ echo "radios not in the namespaces"; ip -n crwa link; ip -n crwb link; exit 1; }
 
 # --- Two routers.
+# WPA_DEBUG=1: B's wpa_supplicant logs at debug level to $W/b/tmp/wpa.log.
 for side in a b; do
 	mkdir -p "$W/$side/run/corerouter" "$W/$side/tmp/cfg"
-	in_ns "crw$side" /usr/bin/corerouter-daemon --backend linux --config-dir /tmp/cfg \
+	extra=()
+	if [ "${WPA_DEBUG:-0}" = 1 ] && [ $side = b ]; then
+		printf '#!/bin/sh\nexec /usr/sbin/wpa_supplicant -dd -t -f /tmp/wpa.log "$@"\n' >"$W/b/tmp/wpa.sh"
+		chmod +x "$W/b/tmp/wpa.sh"
+		extra=(env COREROUTER_WPA_SUPPLICANT=/tmp/wpa.sh)
+	fi
+	in_ns "crw$side" "${extra[@]}" /usr/bin/corerouter-daemon --backend linux --config-dir /tmp/cfg \
 		--control 7979 >"$W/$side/daemon.log" 2>&1 &
 done
 for ns in crwa crwb; do
@@ -280,6 +287,10 @@ for mode in "${MODES[@]}"; do
 			echo "--- B $r: $(cr crwb interface.wifi.monitor "{\"name\":\"$r\"}" | grep -oE '"(state|ssid|error|reconnects|uptime_secs|failure)":("[^"]*"|[^,}]*)' | paste -sd ' ')"
 		done
 		ip -n crwb -br link
+		if [ -f "$W/b/tmp/wpa.log" ]; then
+			echo "--- B wpa_supplicant (last lines on the radio that is not connected)"
+			grep -E 'wifi[12]: (State|CTRL-EVENT|SME|Trying|SAE|scan|Radio work|Removed|Added|Setting|Failed|Disconnect|nl80211: (Scan|Connect|Authen|Associat))' "$W/b/tmp/wpa.log" | tail -n 60
+		fi
 		ip netns exec crwb ls /run/corerouter/wpa/if 2>/dev/null
 		in_ns crwb /bin/sh -c 'ls /run/corerouter/wpa/if; ps | grep -E "wpa|hostapd" | grep -v grep'
 		continue
