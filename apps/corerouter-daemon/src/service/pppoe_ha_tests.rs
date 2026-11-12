@@ -149,10 +149,10 @@ fn the_class_of_a_radius_session_survives_a_takeover() {
     let n = 3;
     let mut lab = Lab::new(n, radius_snap(&a_aaa), |i| (format!("r{i}"), "x".into()));
     no_takeover_pending(&mut lab.bng, 0);
-    for i in 0..n {
-        let mut cfg = lab.clients[i].config().clone();
+    for (i, client) in lab.clients.iter_mut().enumerate().take(n) {
+        let mut cfg = client.config().clone();
         cfg.auth = corerouter_proto_pppoe::layers::AuthSet::new(&[corerouter_proto_pppoe::lcp::AuthProto::Pap]);
-        lab.clients[i] = corerouter_proto_pppoe::client::Client::new(cfg, [5 + i as u8; 32]);
+        *client = corerouter_proto_pppoe::client::Client::new(cfg, [5 + i as u8; 32]);
     }
     lab.start(0..n);
     lab.run(400, 50);
@@ -313,10 +313,10 @@ fn a_session_that_ends_before_its_bookkeeping_keeps_its_counters() {
     let n = 3;
     let mut lab = Lab::new(n, radius_snap(&a_aaa), |i| (format!("r{i}"), "x".into()));
     no_takeover_pending(&mut lab.bng, 0);
-    for i in 0..n {
-        let mut cfg = lab.clients[i].config().clone();
+    for (i, client) in lab.clients.iter_mut().enumerate().take(n) {
+        let mut cfg = client.config().clone();
         cfg.auth = corerouter_proto_pppoe::layers::AuthSet::new(&[corerouter_proto_pppoe::lcp::AuthProto::Pap]);
-        lab.clients[i] = corerouter_proto_pppoe::client::Client::new(cfg, [5 + i as u8; 32]);
+        *client = corerouter_proto_pppoe::client::Client::new(cfg, [5 + i as u8; 32]);
     }
     lab.start(0..n);
     lab.run(400, 50);
