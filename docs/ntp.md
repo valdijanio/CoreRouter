@@ -47,10 +47,17 @@ appliance).
   registra. O CMOS é lido como UTC.
 - **Sem bateria no RTC:** o relógio começa em 1970 (ou na data de fábrica da placa). Abaixo de
   2026-01-01 o cliente acerta sem pedir confirmação (tabela abaixo).
-- **Sincronizado, o kernel regrava o CMOS em UTC a cada ~11 min** (`sync_hw_clock`,
-  `kernel/time/ntp.c`; o cliente limpa `STA_UNSYNC`). Num disco instalado é o que se quer: o
-  próximo boot já nasce certo. Na ISO live, numa máquina que também tem Windows (RTC em hora
-  local), o Windows mostra a hora deslocada pelo fuso até ressincronizar (G4.6o).
+- **Instalado: sincronizado, o kernel regrava o CMOS em UTC a cada ~11 min** (`sync_hw_clock`,
+  `kernel/time/ntp.c`; o cliente limpa `STA_UNSYNC`). É o que se quer num disco instalado: o
+  próximo boot já nasce certo.
+- **ISO live: o relógio da placa fica como está (G4.6o).** O live acerta o relógio do sistema
+  (salto e slew, como sempre) mas deixa `STA_UNSYNC` ligado, e o kernel 6.18 só grava o RTC com
+  ele desligado (`sync_hw_clock`, linha 643, e `ntp_notify_cmos_timer`, linha 683, de
+  `kernel/time/ntp.c`, pelos dois caminhos: `update_persistent_clock64` e `update_rtc`). Motivo:
+  quem bootou a ISO para testar uma máquina que também tem Windows (RTC em hora local) voltaria ao
+  Windows com a hora deslocada pelo fuso. O log diz uma vez "imagem live: o relógio da placa
+  (RTC) fica como está". Efeito colateral: o `adjtimex` do live diz "não sincronizado"
+  (`TIME_ERROR`); nada no sistema lê isso, e o servidor NTP do roteador segue o estado do cliente.
 - **`clock: "not-set"` não quer dizer "relógio sem hora":** quer dizer que o cliente NTP não está
   mexendo no relógio (desligado, só medindo, ou ainda sem resposta). Com o cliente desligado o
   status inteiro vem zerado, inclusive `dynamic_servers`.
@@ -234,6 +241,7 @@ COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- \
 COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- \
     cargo test -p corerouter-daemon --test netns_ntp_first_boot   # G1.6zh: DHCP entrega o NTP
 cargo xtask vm-lab run -- scripts/routeros-interop-l2.sh ntp
+# clock_root confere também o RTC (G4.6o): LeaveAlone não grava, Follow grava
 cargo xtask vm-lab run -- 'systemctl stop systemd-timesyncd chrony; COREROUTER_CLOCK_ROOT=1 cargo test -p corerouter-hal-linux --test clock_root -- --test-threads=1 --nocapture; COREROUTER_CLOCK_ROOT=1 cargo test -p corerouter-daemon --test ntp_clock_root -- --nocapture; systemctl start systemd-timesyncd'
 ```
 
