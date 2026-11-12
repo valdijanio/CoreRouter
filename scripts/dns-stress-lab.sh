@@ -93,9 +93,10 @@ DUT_CPUS=0-$((NCPU / 2 - 1))
 GEN_CPUS=$((NCPU / 2))-$((NCPU - 1))
 DUT_CPUS_LIST=""
 HOT=10000 STATICS=1000 ZONE_N=10000
-# Zones hold at most 50 000 records each (model::dns_zone::MAX_RECORDS):
-# two of them, 100 000 in all, the case of G4.1p.
-FILL=1000000 ADLIST_N=1000000 ZONE_RECORDS=50000 DHCP_N=20000
+# Zones hold at most 50 000 records each (model::dns_zone::MAX_RECORDS,
+# the SOA, NS and its address included): two of ~50 000, 100 000 in all,
+# the case of G4.1p.
+FILL=1000000 ADLIST_N=1000000 ZONE_RECORDS=49990 DHCP_N=20000
 SOAK_SECS=7200
 OUT=""
 while [ $# -gt 0 ]; do
@@ -1769,12 +1770,21 @@ EOF
 	done
 	for p in $(ip netns pids crdut); do [ "$(cat "/proc/$p/comm")" = "$1" ] && DPID=$p; done
 }
+# alt_stop <name>: until it is gone (Unbound's threads take a while to
+# let port 53 go, and the next server would find it taken).
 alt_stop() {
-	local p
-	for p in $(ip netns pids crdut 2>/dev/null); do
-		[ "$(cat "/proc/$p/comm" 2>/dev/null)" = "$1" ] && kill "$p" 2>/dev/null
+	local p left i
+	for i in $(seq 100); do
+		left=0
+		for p in $(ip netns pids crdut 2>/dev/null); do
+			if [ "$(cat "/proc/$p/comm" 2>/dev/null)" = "$1" ]; then
+				left=1
+				kill "$([ "$i" -gt 50 ] && echo -9 || echo -TERM)" "$p" 2>/dev/null || true
+			fi
+		done
+		[ $left = 0 ] && return 0
+		sleep 0.1
 	done
-	sleep 1
 }
 compare_one() { # <server label>
 	local who=$1 o0 o1 r0 r1

@@ -53,3 +53,19 @@ remoto não há CPU por thread nem `perf` (só o `system.resource.process.print 
 comparação com Unbound/dnsmasq. `--selftest-remote` roda o modo remoto contra um DUT local.
 
 ## O que cada teste mede
+
+| Teste | O que faz | O que mede |
+|---|---|---|
+| `qps` | 10 000 nomes quentes (cache), 1000 estáticos, uma zona de 10 000 registros, nomes únicos com a origem a 0 e a 20 ms, e uma mistura (85 % cache, 5 % estático, 5 % zona, 5 % miss); o cache padrão (2 MiB) à parte | consultas/s na saturação (8 sockets, 500 em voo cada) e p50/p99/p99,9 na metade dela (sem fila); CPU por grupo de threads (`dns-udp`, `dns-query`, as que terminaram) |
+| `torture` | nomes únicos a 1000, 5000, 20 000/s e sem limite, com `max_concurrent_queries` 100 e 1000; um cliente legítimo do cache ao lado | respostas e SERVFAIL, consultas/s à origem, pico de threads e de RSS, o p99 e os SERVFAIL do cliente legítimo |
+| `torture` (G4.1o) | o mesmo nome com TTL 0 a 500/2000/5000 por segundo, origem a 20 ms | consultas à origem por resposta (1,00 = nenhuma junção) |
+| `torture` (flush) | `ip.dns.cache.flush` no meio de 20 000/s de nomes quentes | SERVFAIL e consultas à origem quando todo o cache vira miss junto |
+| `origin` | o primeiro servidor some (descarte, sem ICMP); as duas origens somem; perda de 30 %; origem a 200 ms | o tempo da troca de servidor, serve-stale (RFC 8767) e cache de falhas (RFC 9520), pico de threads com tudo fora, a taxa de acerto com perda |
+| `tcp` | `dnsperf -m tcp` com 4, 16 e 64 conexões de um endereço; slowloris de 4 endereços que reconecta; DoT e DoH de origem (Unbound) a 100/1000/5000 por segundo | perdas por conexão recusada, o cliente TCP legítimo durante o ataque, descritores; handshakes/s e latência do DoT/DoH |
+| `cache` | encher até 1 M de entradas (cache de 1 GiB); `cache.print`, `statistics.print` e `cache.flush` com 20 000/s de nomes quentes ao lado; descarte num cache de 64 MiB cheio | memória por entrada (RSS de um daemon novo), tempo de cada comando e quanto ele segura o lock (p99,9 e máximo da carga ao lado), custo do descarte |
+| `adlist` | uma lista de 1 M de nomes por HTTP; consultas quentes e bloqueadas; `ip.dns.adlist.reload` com carga | tempo até `loaded`, memória por nome, custo por consulta, efeito da recarga |
+| `ddns` | duas zonas de 50 000 registros; RFC 2136 UPDATE (`dnsperf -u`) a 20/100/500 por segundo para uma delas; 20 000 clientes DHCP com nome (opção 12) a 1000/s; consultas à zona a 5000/s ao lado | UPDATEs/s e p99, bytes gravados em disco por UPDATE e por concessão (`/proc/<pid>/io`), latência das consultas à zona durante as mudanças (G4.1p, G4.1q) |
+| `hostile` | lixo a toda velocidade de um endereço, com e sem o limite por cliente; ANY, TXT grande, A com 60 registros; um cliente fora do `allowed_from` | sem queda nem panic, o cliente legítimo ao lado, tamanho e TC das respostas (fator de amplificação), REFUSED sem consulta à origem |
+| `ops` | 50 vezes cada: `ip.dns.set`, estático add+remove, `cache.flush`, `statistics.print`, um lote atômico, `ip.dns.get`, por uma conexão MCP aberta, com 20 000/s de nomes quentes ao lado | p50/p99 do comando (alvo < 50 ms) e o efeito na carga |
+| `compare` | as mesmas medidas contra Unbound e dnsmasq, nas mesmas CPUs e com a mesma origem | consultas/s, latência, consultas à origem por resposta, memória por entrada |
+| `soak` | a mistura a 10 000/s mais 50 nomes únicos/s por `--soak-secs` | por minuto: consultas/s, p99, RSS, threads, descritores, `cache_used` (`soak.csv`) |
