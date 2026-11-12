@@ -9,7 +9,7 @@ bonding). É o "PTP bridge" de um provedor, a ligação até um prédio do outro
 |---|---|
 | 0 | portas Wi-Fi cinza com ⓘ na janela de bonding (#625) |
 | 1 | `mode=station-bridge`, `bridge_protocol`, `station_bridge` no AP, pares (`interface.wifi.peer.*`), bridge |
-| 2 | bonding sobre os enlaces (qualquer modo), MAC comum dos APs de um bond, tempo de ar por par, aviso do balance-rr, laboratório com tráfego |
+| 2 | bonding sobre os enlaces (active-backup, balance-xor, balance-rr; o 802.3ad é recusado), o link do par como veth (o AP_VLAN nunca desce), um hostapd por rádio, tempo de ar por par, aviso do balance-rr, laboratório com tráfego |
 
 ## Por que quatro endereços
 
@@ -63,14 +63,24 @@ existe enquanto o par está associado e pode ser porta de bridge ou membro de bo
 ausente, a configuração dela espera, como a de uma porta desconectada (`corerouter_hal::absent`;
 `interface.list` a mostra inválida com "peer not associated").
 
-- O hostapd cria a interface do par (`wds_sta=1`: `<rádio>.sta<AID>`, `driver_nl80211.c`
-  `i802_set_wds_sta`) e avisa no socket (`WDS-STA-INTERFACE-ADDED ifname=… sta_addr=…`). A thread
-  do AP a renomeia para o nome do par (desce, renomeia, sobe) e o motor a põe onde a
-  configuração diz.
+- O hostapd cria a interface de quatro endereços da estação (`wds_sta=1`: um AP_VLAN
+  `<rádio>.sta<AID>`, `driver_nl80211.c` `i802_set_wds_sta`) e avisa no socket
+  (`WDS-STA-INTERFACE-ADDED ifname=… sta_addr=…`).
+- **O AP_VLAN nunca desce.** Desligado, ele perde a estação: `net/mac80211/iface.c:530`,
+  `ieee80211_do_stop` → `sta_info_flush`. Renomear e entrar num bond exigem a interface
+  desligada.
+- Por isso a thread do AP deixa o AP_VLAN como está e faz um par de veth: a ponta com o nome do
+  par é a interface da configuração; a outra (`wpv<idx>`) vai, junto do AP_VLAN, numa bridge
+  privada (`wpb<idx>`). O motor põe a ponta do par onde a configuração diz (bridge ou bond), e
+  ela pode descer e subir à vontade.
+- O custo são dois saltos a mais por quadro, nas taxas do Wi-Fi.
+- O AP_VLAN, a bridge e o veth privados ficam fora da configuração (`owner.rs`).
 - **Só os pares cadastrados ganham quatro endereços.** Uma estação que pede e não está cadastrada
   é desligada (`DEAUTHENTICATE`), e o histórico diz por quê.
-- O hostapd procura a interface pelo nome antigo para apagá-la quando o par sai; a thread do AP
-  apaga a renomeada.
+- Quando o par sai, o hostapd apaga o AP_VLAN dele, e a thread do AP apaga o veth e a bridge
+  privada.
+- **O primeiro desenho renomeava o AP_VLAN** (no #635). O par associava, mas nenhum quadro
+  passava, porque o rename o desligava. Foi o laboratório com tráfego que mostrou.
 
 `station_bridge`: `no` (o padrão: ninguém ganha quatro endereços), `yes` (clientes e pares),
 `only` (só pares: um AP de backhaul, só estações Multi-AP).
@@ -98,37 +108,42 @@ ausente, a configuração dela espera, como a de uma porta desconectada (`corero
 
 Vários enlaces entre os mesmos dois roteadores (dois rádios de cada lado, em canais diferentes)
 vão num **bonding**, não os dois numa bridge (não há spanning tree: seria um laço). O motor
-aceita como membros um rádio em `station-bridge` e o enlace de um par (`wifi-peer`), em
-qualquer modo; recusa o cliente comum (`NO_BOND`) e o ponto de acesso (`NO_BOND_AP`: os
+aceita como membros um rádio em `station-bridge` e o enlace de um par (`wifi-peer`), nos modos
+que o kernel roda sobre Wi-Fi (abaixo); recusa o cliente comum (`NO_BOND`) e o ponto de acesso (`NO_BOND_AP`: os
 clientes dele são muitos; os enlaces dos pares é que entram).
 
 ```sh
 # B (estações)
-corerouter-cli run interface.bonding.add '{"name":"bond1","slaves":["wifi1","wifi2"],"mode":"802.3ad"}'
+corerouter-cli run interface.bonding.add '{"name":"bond1","slaves":["wifi1","wifi2"],"mode":"balance-xor"}'
 # A (pontos de acesso): os pares com o MAC do bond1 de B
 corerouter-cli run interface.wifi.peer.add '{"radio":"wifi1","name":"peer1","mac_address":"<MAC do bond1 de B>"}'
 corerouter-cli run interface.wifi.peer.add '{"radio":"wifi2","name":"peer2","mac_address":"<MAC do bond1 de B>"}'
-corerouter-cli run interface.bonding.add '{"name":"bond1","slaves":["peer1","peer2"],"mode":"802.3ad"}'
+corerouter-cli run interface.bonding.add '{"name":"bond1","slaves":["peer1","peer2"],"mode":"balance-xor"}'
 ```
 
-**O MAC.** O bonding dá às portas um MAC só (o do bond; `bond_main.c:2043`, kernel 6.18.59).
+**O MAC.** O bonding dá às portas um MAC só, o do bond (`bond_main.c:2043`, kernel 6.18.59).
 
-- **Lado das estações:** as duas estações de B associam com o MAC do bond de B, e é esse o MAC
-  a cadastrar nos dois pares em A.
-- **Lado do AP:** o enlace de um par é uma interface AP_VLAN, que transmite com o próprio
-  endereço como TA (`net/mac80211/tx.c`, AP_VLAN com 4 endereços). Se o bond o trocasse por um
-  MAC diferente do BSSID, a estação descartaria os quadros. Por isso os pontos de acesso dos
-  pares de um mesmo bond usam o mesmo MAC, o do primeiro deles pelo nome
-  (`crate::wifi_ap::mac_source`, `WifiAp::mac_from`). A thread do AP o põe na interface, com
-  ela desligada (`iface.c`, `_ieee80211_change_mac`), antes do `ADD` no hostapd. Dois APs com o
-  mesmo BSSID em canais diferentes é legítimo.
+- **Lado das estações:** as duas estações de B associam com o MAC do bond de B, e é esse o MAC a
+  cadastrar nos dois pares em A.
+- **Lado do AP:** o bond troca o MAC dos veth, não o dos APs, e os quadros saem do AP com o MAC
+  dele.
+- **Um hostapd por rádio.** Com um hostapd só, as duas estações de B (o mesmo MAC) se
+  derrubavam: o hostapd tira uma estação que associa de todos os outros BSS do mesmo processo
+  (`src/ap/utils.c`, `prune_associations`). Com um hostapd por rádio, isso deixou de acontecer.
 
 **Os modos.**
 
-- **802.3ad** (LACP): cada fluxo num enlace; a outra ponta também em 802.3ad.
 - **active-backup:** um enlace por vez; a troca quando o ativo cai.
+- **balance-xor:** cada fluxo num enlace, pelo hash; é o "LACP estático".
 - **balance-rr:** soma os enlaces num fluxo, mas reordena o TCP quando as taxas diferem (e no
   Wi-Fi elas mudam com o ar). A janela de bonding avisa em âmbar, e o comando também.
+- **802.3ad (LACP), balance-tlb e balance-alb são recusados** sobre Wi-Fi, no comando e no
+  commit. O bonding exige a velocidade e o duplex de cada porta (`bond_main.c:2769`,
+  `bond_needs_speed_duplex`), e o mac80211 não os informa (`net/mac80211/ethtool.c` não tem
+  `get_link_ksettings`).
+  - No laboratório, as portas ficaram desligadas, com "failed to get link speed/duplex", e o
+    LACP nunca achou parceiro.
+  - LACP sobre Wi-Fi pede um patch no mac80211: gap G1.30o.
 
 **Diagnóstico por par.** A tabela de pares mostra, para cada enlace:
 
@@ -175,10 +190,9 @@ teste, fora da imagem) move os rádios.
 - **B:** dois station-bridges.
 - **Os dois lados:** um bond1 sobre os enlaces, dentro da bridge1.
 
-Por modo (802.3ad, active-backup, balance-rr), o teste confere:
+Primeiro confere a recusa do 802.3ad. Depois, por modo (active-backup, balance-xor, balance-rr):
 
 - os dois pares de pé;
-- o LACP com parceiro dos dois lados;
 - o ping pela bridge;
 - a vazão do iperf3;
 - no active-backup, a queda do enlace ativo, com os pings perdidos.

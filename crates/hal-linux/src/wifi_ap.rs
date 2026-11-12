@@ -531,6 +531,9 @@ mod io {
         told: Option<WifiAp>,
         /// G1.30m: the peers whose link is up: MAC, name, private bridge.
         peers_up: Vec<(String, String, String)>,
+        /// G1.30m: each peer's AP_VLAN (hostapd's name), by MAC: its
+        /// station is dumped there, not on the access point.
+        vlans: Vec<(String, String)>,
     }
 
     impl Direct {
@@ -545,6 +548,7 @@ mod io {
                 error: None,
                 told: None,
                 peers_up: Vec::new(),
+                vlans: Vec::new(),
             }
         }
 
@@ -552,6 +556,7 @@ mod io {
         fn remove(&mut self) -> Result<(), HalError> {
             self.socks = None;
             // G1.30m: the peers' renamed links (hostapd cannot find them).
+            self.vlans.clear();
             for (_, name, br) in std::mem::take(&mut self.peers_up) {
                 let _ = crate::link_set::delete(&name);
                 let _ = crate::link_set::delete(&br);
@@ -677,6 +682,8 @@ mod io {
                 (true, Some(p)) => match self.peer_link(ifname, &p.name) {
                     Ok(br) => {
                         self.peers_up.push((p.mac.clone(), p.name.clone(), br));
+                        self.vlans.retain(|(m, _)| *m != p.mac);
+                        self.vlans.push((p.mac.clone(), ifname.to_owned()));
                         Some(WifiApEvent::PeerUp {
                             mac: p.mac,
                             name: p.name,
@@ -705,6 +712,7 @@ mod io {
                 (false, _) => {
                     let pos = self.peers_up.iter().position(|(m, _, _)| m == mac)?;
                     let (mac, name, br) = self.peers_up.remove(pos);
+                    self.vlans.retain(|(m, _)| *m != mac);
                     let _ = crate::link_set::delete(&name);
                     let _ = crate::link_set::delete(&br);
                     Some(WifiApEvent::PeerDown { mac, name })
@@ -739,15 +747,26 @@ mod io {
                 if self.nl.is_none() {
                     self.nl = Nl80211::open();
                 }
-                let links = match self.nl.as_mut().map(|nl| nl.stations(ifindex)) {
-                    Some(Ok(l)) => l,
-                    Some(Err(e)) => {
-                        log::debug!("wifi {}: nl80211 stations: {e}", self.name);
-                        self.nl = None;
-                        Vec::new()
+                // The access point's stations, then each peer's AP_VLAN's
+                // (a four-address station is dumped on its AP_VLAN).
+                let mut indexes = vec![ifindex];
+                indexes.extend(
+                    self.vlans
+                        .iter()
+                        .filter_map(|(_, v)| nix::net::if_::if_nametoindex(v.as_str()).ok()),
+                );
+                let mut links = Vec::new();
+                for i in indexes {
+                    match self.nl.as_mut().map(|nl| nl.stations(i)) {
+                        Some(Ok(l)) => links.extend(l),
+                        Some(Err(e)) => {
+                            log::debug!("wifi {}: nl80211 stations: {e}", self.name);
+                            self.nl = None;
+                            break;
+                        }
+                        None => break,
                     }
-                    None => Vec::new(),
-                };
+                }
                 for c in &mut out {
                     if let Some((_, l)) = links.iter().find(|(m, _)| *m == c.mac) {
                         c.link = l.clone();
