@@ -39,60 +39,77 @@ fn digest(salt: &[u8], block: &[u8]) -> [u8; DIGEST] {
     out
 }
 
-/// One level: `blocks` (each `BLOCK` long, the last zero-padded by the
-/// caller) hashed into hash blocks.
-fn level(salt: &[u8], data: &[u8], threads: usize) -> Vec<u8> {
-    let n = data.len() / BLOCK;
+/// One level: `n` blocks hashed into hash blocks. `hash(first, count, dst)`
+/// writes the digests of blocks `first..first + count` into `dst` (32 bytes
+/// each); with `threads` > 1 and at least [`PARALLEL_MIN`] of data, each
+/// thread owns a run of whole hash blocks and the data blocks they cover.
+fn level_by<H>(n: usize, threads: usize, hash: H) -> Result<Vec<u8>, String>
+where
+    H: Fn(usize, usize, &mut [u8]) -> Result<(), String> + Sync,
+{
     let hash_blocks = n.div_ceil(PER_BLOCK);
     let mut out = vec![0u8; hash_blocks * BLOCK];
-    let hash_into = |src: &[u8], dst: &mut [u8]| {
-        for (blk, slot) in src.chunks(BLOCK).zip(dst.chunks_mut(DIGEST)) {
-            slot.copy_from_slice(&digest(salt, blk));
-        }
-    };
-    if threads <= 1 || data.len() < PARALLEL_MIN {
+    if threads <= 1 || n.saturating_mul(BLOCK) < PARALLEL_MIN {
         // Digests are contiguous across hash blocks (128 per block, no gap).
-        hash_into(data, &mut out);
-        return out;
+        hash(0, n, &mut out)?;
+        return Ok(out);
     }
-    // Split by whole hash blocks: thread i owns hash blocks [a, b) and the
-    // data blocks they cover.
     let per = hash_blocks.div_ceil(threads);
-    std::thread::scope(|s| {
+    std::thread::scope(|s| -> Result<(), String> {
+        let hash = &hash;
         let mut rest: &mut [u8] = &mut out;
         let mut first = 0usize;
+        let mut handles = Vec::new();
         while first < hash_blocks {
             let count = per.min(hash_blocks - first);
             let (mine, tail) = std::mem::take(&mut rest).split_at_mut(count * BLOCK);
             rest = tail;
-            let start = first * PER_BLOCK * BLOCK;
-            let end = ((first + count) * PER_BLOCK * BLOCK).min(data.len());
-            let src = data.get(start..end).unwrap_or(&[]);
-            s.spawn(move || hash_into(src, mine));
+            let start = first * PER_BLOCK;
+            let end = ((first + count) * PER_BLOCK).min(n);
+            let h = std::thread::Builder::new()
+                .name(format!("verity-{}", handles.len()))
+                .spawn_scoped(s, move || hash(start, end - start, mine))
+                .map_err(|e| format!("verity: thread: {e}"))?;
+            handles.push(h);
             first += count;
         }
-    });
-    out
+        for h in handles {
+            h.join()
+                .map_err(|_| "verity: a thread panicked".to_string())??;
+        }
+        Ok(())
+    })?;
+    Ok(out)
 }
 
-/// The tree of `data` (a multiple of [`BLOCK`], at least two blocks).
-/// `threads`: level 0 is split over this many when `data` is large.
-pub fn tree(data: &[u8], salt: &[u8], threads: usize) -> Result<Tree, String> {
-    if !data.len().is_multiple_of(BLOCK) || data.len() < 2 * BLOCK {
-        return Err(format!(
-            "verity: {} bytes is not a multiple of {BLOCK} of at least two blocks",
-            data.len()
-        ));
+fn hash_into(salt: &[u8], src: &[u8], dst: &mut [u8]) {
+    for (blk, slot) in src.chunks(BLOCK).zip(dst.chunks_mut(DIGEST)) {
+        slot.copy_from_slice(&digest(salt, blk));
     }
+}
+
+/// One level of `data` (whole blocks, the last zero-padded by the caller).
+fn level(salt: &[u8], data: &[u8], threads: usize) -> Result<Vec<u8>, String> {
+    level_by(data.len() / BLOCK, threads, |first, count, dst| {
+        let src = data
+            .get(first * BLOCK..(first + count) * BLOCK)
+            .ok_or("verity: past the data")?;
+        hash_into(salt, src, dst);
+        Ok(())
+    })
+}
+
+/// The levels over level 0, the root and the tree as stored.
+fn above(level0: Vec<u8>, salt: &[u8], data_blocks: usize) -> Result<Tree, String> {
     let mut levels: Vec<Vec<u8>> = Vec::new();
-    let mut cur = level(salt, data, threads);
+    let mut cur = level0;
     loop {
         let blocks = cur.len() / BLOCK;
         if blocks <= 1 {
             levels.push(cur);
             break;
         }
-        let next = level(salt, &cur, 1);
+        let next = level(salt, &cur, 1)?;
         levels.push(cur);
         cur = next;
     }
@@ -103,11 +120,97 @@ pub fn tree(data: &[u8], salt: &[u8], threads: usize) -> Result<Tree, String> {
         bytes.extend_from_slice(l);
     }
     Ok(Tree {
-        data_blocks: (data.len() / BLOCK) as u64,
+        data_blocks: data_blocks as u64,
         hash_blocks: (bytes.len() / BLOCK) as u64,
         root,
         bytes,
     })
+}
+
+fn check_size(data_len: u64) -> Result<(), String> {
+    if !data_len.is_multiple_of(BLOCK as u64) || data_len < 2 * BLOCK as u64 {
+        return Err(format!(
+            "verity: {data_len} bytes is not a multiple of {BLOCK} of at least two blocks"
+        ));
+    }
+    Ok(())
+}
+
+/// The tree of `data` (a multiple of [`BLOCK`], at least two blocks).
+/// `threads`: level 0 is split over this many when `data` is large.
+pub fn tree(data: &[u8], salt: &[u8], threads: usize) -> Result<Tree, String> {
+    check_size(data.len() as u64)?;
+    above(level(salt, data, threads)?, salt, data.len() / BLOCK)
+}
+
+/// What [`check_at`] reads at a time, per thread: 256 data blocks.
+pub const READ: usize = 1 << 20;
+/// At most this many threads read a slot back, whatever the machine has: a
+/// buffer each, and the disk is the limit (**medido**: 128 MiB in 10.5 ms on
+/// 8 threads from the page cache, `benches/sysupdate.rs`).
+const CHECK_THREADS: usize = 8;
+
+/// Where [`check_at`] reads a slot from: a disk, a partition, a file.
+pub trait ReadAt: Sync {
+    fn read_exact_at(&self, buf: &mut [u8], at: u64) -> std::io::Result<()>;
+}
+
+impl ReadAt for std::fs::File {
+    fn read_exact_at(&self, buf: &mut [u8], at: u64) -> std::io::Result<()> {
+        std::os::unix::fs::FileExt::read_exact_at(self, buf, at)
+    }
+}
+
+/// Whether the `size` bytes at `at` in `f` are a slot of `data_blocks`
+/// blocks followed by their tree, with root `root_hex`: level 0 is computed
+/// from the blocks as read, the levels above it from level 0, and the tree
+/// stored after the data must be the computed one. That covers every byte.
+///
+/// It reads [`READ`] bytes at a time on each of at most [`CHECK_THREADS`]
+/// threads and holds the tree (1/128 of the data), never the slot: G0.30j, reading a 150 MiB rootfs whole to
+/// check it got the daemon of a 448 MiB live image killed by the kernel in
+/// the middle of an install.
+pub fn check_at<F: ReadAt + ?Sized>(
+    f: &F,
+    at: u64,
+    size: u64,
+    data_blocks: u64,
+    salt: &[u8],
+    root_hex: &str,
+    threads: usize,
+) -> Result<bool, String> {
+    let data_len = data_blocks.saturating_mul(BLOCK as u64);
+    check_size(data_len)?;
+    let n = usize::try_from(data_blocks).map_err(|_| "verity: too many blocks".to_string())?;
+    let read = |off: u64, buf: &mut [u8]| {
+        f.read_exact_at(buf, at + off)
+            .map_err(|e| format!("read back at {}: {e}", at + off))
+    };
+    let level0 = level_by(n, threads.min(CHECK_THREADS), |first, count, dst| {
+        let mut buf = vec![0u8; READ.min(count * BLOCK)];
+        let mut slots = dst.chunks_mut(DIGEST);
+        let mut done = 0usize;
+        while done < count {
+            let blocks = (READ / BLOCK).min(count - done);
+            let b = buf.get_mut(..blocks * BLOCK).ok_or("verity: buffer")?;
+            read(((first + done) * BLOCK) as u64, b)?;
+            for blk in b.chunks(BLOCK) {
+                slots
+                    .next()
+                    .ok_or("verity: level 0")?
+                    .copy_from_slice(&digest(salt, blk));
+            }
+            done += blocks;
+        }
+        Ok(())
+    })?;
+    let tree = above(level0, salt, n)?;
+    if hex(&tree.root) != root_hex || size.checked_sub(data_len) != Some(tree.bytes.len() as u64) {
+        return Ok(false);
+    }
+    let mut stored = vec![0u8; tree.bytes.len()];
+    read(data_len, &mut stored)?;
+    Ok(stored == tree.bytes)
 }
 
 /// `data` padded with zeros to a whole number of blocks.
@@ -183,6 +286,122 @@ mod tests {
         assert_eq!(pad(vec![1; 5]).len(), BLOCK);
         assert_eq!(unhex("0aff"), Some(vec![10, 255]));
         assert_eq!(unhex("0g"), None);
+    }
+
+    /// A slot in memory that remembers the largest read it was asked for.
+    struct Slot {
+        bytes: Vec<u8>,
+        largest: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ReadAt for Slot {
+        fn read_exact_at(&self, buf: &mut [u8], at: u64) -> std::io::Result<()> {
+            self.largest
+                .fetch_max(buf.len(), std::sync::atomic::Ordering::Relaxed);
+            let src = usize::try_from(at)
+                .ok()
+                .and_then(|a| self.bytes.get(a..a + buf.len()))
+                .ok_or(std::io::ErrorKind::UnexpectedEof)?;
+            buf.copy_from_slice(src);
+            Ok(())
+        }
+    }
+
+    /// `blocks` of data and their tree, as a slot holds them, at `at`.
+    fn slot(blocks: usize, at: usize) -> (Slot, Tree) {
+        let d = data(blocks);
+        let t = tree(&d, b"salt", 1).unwrap();
+        let mut bytes = vec![0xA5; at];
+        bytes.extend_from_slice(&d);
+        bytes.extend_from_slice(&t.bytes);
+        let s = Slot {
+            bytes,
+            largest: Default::default(),
+        };
+        (s, t)
+    }
+
+    fn check(s: &Slot, at: usize, t: &Tree, threads: usize) -> Result<bool, String> {
+        let size = (t.data_blocks as usize * BLOCK + t.bytes.len()) as u64;
+        check_at(
+            s,
+            at as u64,
+            size,
+            t.data_blocks,
+            b"salt",
+            &hex(&t.root),
+            threads,
+        )
+    }
+
+    /// G0.30j: the read-back check of a slot (install, update, scrub) read
+    /// the whole slot (150 MiB) into memory at once; the kernel killed the
+    /// daemon of the 448 MiB live image for it, in the middle of an install.
+    /// Now no read is larger than `READ`, whatever the slot's size.
+    #[test]
+    fn a_slot_is_checked_a_piece_at_a_time() {
+        let (s, t) = slot(5 * READ / BLOCK + 77, 8192);
+        assert_eq!(check(&s, 8192, &t, 1), Ok(true));
+        let largest = s.largest.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(largest <= READ, "a read of {largest} bytes");
+    }
+
+    #[test]
+    fn every_byte_of_the_slot_counts() {
+        let at = 4096;
+        let (good, t) = slot(300, at);
+        assert_eq!(check(&good, at, &t, 1), Ok(true));
+        let data_len = 300 * BLOCK;
+        // A byte of data, of the tree, of its padding.
+        for i in [
+            0,
+            123_457,
+            data_len - 1,
+            data_len,
+            data_len + t.bytes.len() - 1,
+        ] {
+            let mut bad = Slot {
+                bytes: good.bytes.clone(),
+                largest: Default::default(),
+            };
+            bad.bytes[at + i] ^= 1;
+            assert_eq!(check(&bad, at, &t, 1), Ok(false), "byte {i}");
+        }
+        let size = (data_len + t.bytes.len()) as u64;
+        let root = hex(&t.root);
+        assert_eq!(
+            check_at(&good, at as u64, size + 1, 300, b"salt", &root, 1),
+            Ok(false)
+        );
+        assert_eq!(
+            check_at(&good, at as u64, size, 300, b"other", &root, 1),
+            Ok(false)
+        );
+        assert_eq!(
+            check_at(&good, at as u64, size, 300, b"salt", &hex(&[0; 32]), 1),
+            Ok(false)
+        );
+        // Shorter than it says: an error, not a pass.
+        let mut short = Slot {
+            bytes: good.bytes.clone(),
+            largest: Default::default(),
+        };
+        short.bytes.pop();
+        assert!(check(&short, at, &t, 1).is_err());
+        assert!(check_at(&good, 0, size, 1, b"salt", &root, 1).is_err());
+    }
+
+    #[test]
+    fn threads_check_the_same_slot() {
+        let blocks = PARALLEL_MIN / BLOCK + 300;
+        let (good, t) = slot(blocks, 0);
+        assert_eq!(check(&good, 0, &t, 7), Ok(true));
+        let mut bad = Slot {
+            bytes: good.bytes,
+            largest: Default::default(),
+        };
+        bad.bytes[blocks * BLOCK - 5] ^= 1;
+        assert_eq!(check(&bad, 0, &t, 7), Ok(false));
     }
 
     /// Same root hash and tree bytes as `veritysetup format` (cryptsetup),

@@ -1075,16 +1075,12 @@ impl Platform {
     pub fn check_slot(&self, s: SlotId, m: &Manifest, threads: usize) -> Result<u64, String> {
         let t = Instant::now();
         let dev = self.dev(s)?;
-        let mut f = File::open(&dev.path).map_err(|e| format!("{}: {e}", dev.path.display()))?;
+        let f = File::open(&dev.path).map_err(|e| format!("{}: {e}", dev.path.display()))?;
         drop_cache(&f);
-        let mut data = vec![0u8; m.rootfs.size as usize];
-        f.read_exact(&mut data)
-            .map_err(|e| format!("read back slot {}: {e}", s.as_str()))?;
-        let split = (m.rootfs.data_blocks as usize) * verity::BLOCK;
-        let (d, on_disk) = data.split_at(split.min(data.len()));
         let salt = verity::unhex(&m.rootfs.salt).ok_or("salt")?;
-        let tree = verity::tree(d, &salt, threads)?;
-        if verity::hex(&tree.root) != m.rootfs.root_hash || tree.bytes != on_disk {
+        let r = &m.rootfs;
+        // A piece at a time: the slot whole in RAM got a daemon killed (G0.30j).
+        if !verity::check_at(&f, 0, r.size, r.data_blocks, &salt, &r.root_hash, threads)? {
             return Err(format!(
                 "slot {}: what was read back does not match the signed root hash",
                 s.as_str()
