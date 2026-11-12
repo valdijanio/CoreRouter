@@ -387,10 +387,12 @@ dut_lsas() {
 		cr routing.ospf.lsa.list "{\"instance\":\"$INSTANCE\",\"limit\":1}" | jq '.total // 0'
 	fi
 }
-# Routes in the kernel's main table (local) or OSPF's routes (remote).
+# OSPF routes in the kernel: zebra's FIB count, the routes the kernel
+# acknowledged (local; a counter, cheap at 200 000 routes), or OSPF's
+# routes as CoreRouter lists them (remote).
 dut_routes() {
 	if [ $DUT = local ]; then
-		ip netns exec crdut sh -c 'ip -4 route show proto ospf | wc -l'
+		vty 'show ip route summary json' | jq '[.routes[]? | select(.type == "ospf") | .fib] | add // 0'
 	else
 		cr routing.ospf.route.list "{\"instance\":\"$INSTANCE\"}" | jq '.rows | length'
 	fi
@@ -477,7 +479,9 @@ sampler_start() {
 	echo "t_ms lsas routes ospfd_rss ospfd_cpu zebra_rss zebra_cpu daemon_rss daemon_cpu mem_used_mib" >"$csv"
 	(
 		while :; do
-			echo "$(since "$t0") $(dut_lsas 2>/dev/null || echo -) $(dut_routes 2>/dev/null || echo -) $(proc_sample)" >>"$csv"
+			printf '%s %s %s ' "$(since "$t0")" "$(dut_lsas 2>/dev/null || echo -)" "$(dut_routes 2>/dev/null || echo -)" >>"$csv"
+			# Not in $( ): the CPU % needs the previous sample's ticks.
+			proc_sample >>"$csv"
 			sleep 1
 		done
 	) &
@@ -623,15 +627,51 @@ lsdb_mrt() { # <lsas> → path of the MRT file
 }
 
 BIGGEST=0
+# load_watch <csv> <want_lsas> <base_routes>: every 200 ms the LSAs and
+# the routes, until the LSAs reach <want> and the routes have not moved
+# for 5 s (or 20 min); then prints "t_lsdb t_first_route t_routes routes".
+load_watch() {
+	local csv=$1 want=$2 base=$3 t0 l r last=-1 same=0
+	t0=$(now)
+	echo "t_ms lsas routes" >"$csv"
+	while [ $(($(now) - t0)) -lt 1200000 ]; do
+		l=$(dut_lsas 2>/dev/null || echo 0)
+		r=$(dut_routes 2>/dev/null || echo 0)
+		echo "$(since "$t0") $l $r" >>"$csv"
+		if [ "$l" -ge "$want" ] && [ "$r" = "$last" ] && [ "$r" -gt "$base" ]; then
+			same=$((same + 1))
+			[ $same -ge 25 ] && break
+		else
+			same=0
+		fi
+		last=$r
+		sleep 0.2
+	done
+	awk -v want="$want" -v base="$base" 'NR == 1 {next} {t[NR] = $1; l[NR] = $2; r[NR] = $3; n = NR}
+		END {
+			fin = r[n]; tl = "-"; tf = "-"; tr = "-"
+			for (i = 2; i <= n; i++) {
+				if (tl == "-" && l[i] >= want) tl = t[i]
+				if (tf == "-" && r[i] > base) tf = t[i]
+				if (tr == "-" && r[i] == fin) tr = t[i]
+			}
+			if (l[n] < want) tl = "-"
+			print tl, tf, tr, fin
+		}' "$csv"
+}
+ms2s() { awk -v a="$1" 'BEGIN {if (a == "" || a == "-") print "-"; else printf "%.1f", a / 1000}'; }
+
 # --- 1. LSDB size steps.
 test_lsdb() {
 	say "## 1. LSDB size"
 	say ""
-	say "| LSAs (target) | in LSDB | LSDB full (s) | kernel routes | install (routes/s) | SPF runs / last (ms) | ospfd RSS peak (MiB) | zebra peak | daemon peak | ospfd CPU avg/max (%) | zebra CPU | daemon CPU | RAM used peak (MiB) | purge (s) | result |"
-	say "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+	say "Times from the LSDB's load in the generator (BNG Blaster \`ospf-load-mrt\`, one neighbor). Routes: zebra's FIB count of OSPF routes (what the kernel acknowledged). Peaks: VmHWM of each process during the step; RAM: the VM's used memory."
+	say ""
+	say "| LSAs (target) | in LSDB | LSDB full (s) | first route (s) | all routes (s) | routes | install (routes/s) | SPF runs / last (ms) | ospfd RSS peak (MiB) | zebra peak | daemon peak | ospfd CPU avg/max (%) | zebra CPU | daemon CPU | RAM used peak (MiB) | routes out (s) | LSAs flushed (s) | result |"
+	say "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
 	local n
 	for n in ${STEPS//,/ }; do
-		local mrt csv=$OUT/lsdb-$n.csv t_lsdb t_routes lsas routes base_lsas base_routes
+		local mrt csv=$OUT/lsdb-$n.csv fast=$OUT/lsdb-$n-load.csv base_lsas base_routes
 		mrt=$(lsdb_mrt "$n")
 		gen_config "$W/gen/conf.json"
 		gen_start "$W/gen/conf.json"
@@ -642,43 +682,34 @@ test_lsdb() {
 		base_routes=$(dut_routes)
 		proc_peak_reset
 		sampler_start "$csv"
-		local t0 spf0
+		local spf0 res
 		spf0=$(dut_spf)
-		t0=$(now)
 		bbl ospf-load-mrt file "$mrt" instance 1 >/dev/null
-		# Full when the count reaches the target and stays 5 s.
-		local want=$((base_lsas + n - 5))
-		if t_lsdb=$(wait_for "lsdb $n" 1200 ge "$want" dut_lsas); then
-			lsas=$(stable dut_lsas 5)
-			routes=$(stable dut_routes 5)
-			t_routes=$(since "$t0")
-		else
-			lsas=$(dut_lsas) routes=$(dut_routes) t_routes=-
-		fi
+		res=$(load_watch "$fast" "$((base_lsas + n - 5))" "$base_routes")
+		local t_lsdb t_first t_routes routes lsas
+		read -r t_lsdb t_first t_routes routes <<<"$res"
+		lsas=$(dut_lsas)
 		sampler_stop
 		local spf peak mem rate
 		spf=$(dut_spf)
 		peak=$(proc_peak)
 		mem=$(csv_max "$csv" mem_used_mib)
-		# Install rate: routes over the time from the first to the last
-		# change in the samples.
-		rate=$(awk 'NR > 1 && $3 != "-" {if (!s && $3 > b) s = $1; if ($3 != l) {e = $1; l = $3}} NR == 2 {b = $3}
-			END {if (e > s && s) printf "%d", (l - b) * 1000 / (e - s); else print "-"}' "$csv")
-		# Withdraw: the generator leaves (its LSAs purged); back to the base.
-		local t1 t_purge
+		rate=$(awk -v a="$t_first" -v b="$t_routes" -v n="$((routes - base_routes))" \
+			'BEGIN {if (a == "-" || b == "-" || b <= a) print "-"; else printf "%d", n * 1000 / (b - a)}')
+		# Withdraw: the generator leaves (teardown: its LSAs purged with
+		# MaxAge); the routes go, then the LSAs leave the LSDB (FRR keeps
+		# a MaxAge LSA up to 60 s, maxage-delay, before removing it).
+		local t1 t_out t_flush
 		t1=$(now)
 		gen_stop
-		if wait_for "purge $n" 600 le "$((base_lsas + 2))" dut_lsas >/dev/null; then
-			t_purge=$(awk -v ms="$(since "$t1")" 'BEGIN {printf "%.1f", ms / 1000}')
-		else
-			t_purge=timeout
-		fi
-		local verdict=ok
-		if [ "$t_routes" = - ]; then verdict="FAIL (LSDB incomplete: $lsas)"; fi
+		if wait_for "routes out $n" 600 le "$base_routes" dut_routes >/dev/null; then t_out=$(since "$t1"); else t_out=-; fi
+		if wait_for "flush $n" 600 le "$((base_lsas + 2))" dut_lsas >/dev/null; then t_flush=$(since "$t1"); else t_flush=-; fi
+		local verdict=ok dead
+		if [ "$t_lsdb" = - ]; then verdict="FAIL (LSDB incomplete: $lsas)"; fi
+		if [ "$t_out" = - ]; then verdict="FAIL (routes not withdrawn)"; fi
 		if oom_seen; then verdict="FAIL (OOM)"; fi
-		local dead
 		if dead=$(procs_dead); then verdict="FAIL ($dead died)"; fi
-		say "| $n | $lsas | $(awk -v a="${t_lsdb:-0}" 'BEGIN {printf "%.1f", a / 1000}') | $((routes - base_routes)) | $rate | $spf0 → $spf | ${peak// / | }$(csv_avg "$csv" ospfd_cpu)/$(csv_max "$csv" ospfd_cpu) | $(csv_avg "$csv" zebra_cpu)/$(csv_max "$csv" zebra_cpu) | $(csv_avg "$csv" daemon_cpu)/$(csv_max "$csv" daemon_cpu) | $mem | $t_purge | $verdict |"
+		say "| $n | $lsas | $(ms2s "$t_lsdb") | $(ms2s "$t_first") | $(ms2s "$t_routes") | $((routes - base_routes)) | $rate | $spf0 → $spf | ${peak// / | }$(csv_avg "$csv" ospfd_cpu)/$(csv_max "$csv" ospfd_cpu) | $(csv_avg "$csv" zebra_cpu)/$(csv_max "$csv" zebra_cpu) | $(csv_avg "$csv" daemon_cpu)/$(csv_max "$csv" daemon_cpu) | $mem | $(ms2s "$t_out") | $(ms2s "$t_flush") | $verdict |"
 		if [ "$verdict" != ok ]; then
 			FAILED=1
 			break
