@@ -37,10 +37,14 @@ pub enum Drop {
     Authorizing,
     /// The client was refused (RADIUS reject, no secret) a moment ago.
     Rejected,
+    /// G4.2l: a RELEASE for a lease the same client already released (a
+    /// client sends it more than once: RELEASE has no answer, RFC 2131
+    /// §4.4.6; the BNG Blaster sends three).
+    Repeated,
 }
 
 impl Drop {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Malformed,
         Self::Bootp,
         Self::NoServer,
@@ -54,6 +58,7 @@ impl Drop {
         Self::Unexpected,
         Self::Authorizing,
         Self::Rejected,
+        Self::Repeated,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -71,13 +76,17 @@ impl Drop {
             Self::Unexpected => "unexpected",
             Self::Authorizing => "authorizing",
             Self::Rejected => "rejected",
+            Self::Repeated => "repeated",
         }
     }
 
     /// Whether the drop points at a problem (and not at normal life: a
     /// client picking another server, a retransmission while probing).
     pub fn is_problem(self) -> bool {
-        !matches!(self, Self::OtherServer | Self::Probing | Self::Authorizing)
+        !matches!(
+            self,
+            Self::OtherServer | Self::Probing | Self::Authorizing | Self::Repeated
+        )
     }
 
     fn index(self) -> usize {

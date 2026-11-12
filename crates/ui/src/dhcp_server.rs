@@ -1298,6 +1298,7 @@ fn drop_help(reason: &str) -> &'static str {
         "not-authoritative" => "An address it cannot have, and the server is not authoritative (yet)",
         "other-server" => "The client chose another server's offer (normal with two servers)",
         "probing" => "A retransmission while its address was being probed",
+        "repeated" => "The same client's RELEASE again (normal: RELEASE gets no answer, so clients repeat it)",
         _ => "A message type a server never answers",
     }
 }
