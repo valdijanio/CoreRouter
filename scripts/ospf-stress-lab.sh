@@ -874,7 +874,9 @@ churn_tick() {
 		jq --argjson m "$m" '(.["area0.0.0.0"][].ipv4_prefix_list[]? | select(.external_flag == true) | .metric) = $m' \
 			"$d/churn.json" >"$d/tick.json"
 	else
-		jq --argjson m "$m" '(.["area0.0.0.0"][] | select(.is_root != true) | .neighbor_list[]?.metric) = $m' \
+		# Every link but the one back to gen: the cost of every node moves.
+		jq --argjson m "$m" --arg gen "$GEN_RID" \
+			'(.["area0.0.0.0"][].neighbor_list[]? | select(.remote_node_id != $gen) | .metric) = $m' \
 			"$d/churn.json" >"$d/tick.json"
 	fi
 	(cd "$d" && lspgen -r tick.json -S "$BBL_SOCK" -I 1 -Q >>lspgen-ticks.log 2>&1)
