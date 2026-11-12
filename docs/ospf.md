@@ -335,6 +335,68 @@ Medido em 2026-10-27, 32 núcleos (carga ~10 de outras sessões), build de bench
   Limite de 8 threads; no WASM, um. O layout roda uma vez por LSDB nova e fica guardado, não a
   cada quadro.
 
+### Custo do nosso lado com escala (G3.4n)
+
+Medido em 2026-11-12, 32 núcleos, build de bench, antes (a `main`) e depois rodados em seguida na
+mesma janela de carga (`CRITERION_HOME` comum). JSON no formato do FRR 10.7.1 (campos de
+`ospfd/ospf_vty.c`: `show_ip_ospf_neighbour_brief`, `show_ip_ospf_interface_sub`,
+`show_ip_ospf_route_network`). Benches: `hal-frr/benches/frr_ospf_poll.rs` (a volta do poll
+contra um `ospfd`/`zebra` falso em socket Unix), `engine/benches/ospf_queries.rs`
+(`perf::ospf_scale`: 4 000 interfaces, 500 vizinhos, LSDB de 100 000 LSAs de 2 000 roteadores,
+200 000 rotas) e `ui/benches/frames.rs` (`ospf_*`).
+
+| Medida | Antes | Depois |
+|---|---|---|
+| leitura de 500 vizinhos | 0,72 ms | 0,34 ms |
+| leitura de 4 000 interfaces (3,2 MiB) | 15,0 ms | 4,4 ms |
+| leitura de 200 000 rotas (43 MiB) | 566 ms | 128 ms (em fluxo, sem o teto de 64 MiB) |
+| volta do poll, 500 interfaces e 50 vizinhos | 2,79 ms | 0,89 ms |
+| idem, 4 000 interfaces e 500 vizinhos | 29,0 ms | 6,7 ms |
+| a mesma volta com conexões novas (o pool desligado) | — | 1,03 ms / 6,9 ms |
+| cópia da config de roteamento por volta (`CowArc`) | 1,0 µs | 1,1 µs (sem mudança: não vale mexer) |
+| tempo sob o lock para guardar a amostra (4 000 interfaces) | 508 µs | 0,2 µs (a anterior é solta fora) |
+| `routing.ospf.neighbor.list` (500) | 2,1 ms | 1,3 ms |
+| `routing.ospf.interface.list` (4 000) | 40,4 ms, 1,1 MiB | 6,1 ms, página de 1 000 (284 KiB) |
+| `routing.ospf.lsa.list` busca em 100 000 LSAs | 14,5 ms | 5,8 ms |
+| `routing.ospf.route.list` (200 000 rotas) | 36,5 ms, 10 000 linhas, 1,9 MiB | 4,0 ms, página de 200 (38 KiB) |
+| `routing.ospf.topology`, 2 000 roteadores já dispostos | 72,8 ms, 1 MiB | 18,0 ms |
+| idem, a janela já com o mapa (`known`) | 72,8 ms, 1 MiB | 0,77 ms, 113 B |
+| `routing.ospf.neighbor.diagnose` | 2,9 ms | 2,1 ms |
+| quadro da GUI, Routing › OSPF › Routes (10 000 rotas → página de 200) | 53,4 ms | 6,6 ms |
+| idem, Neighbors (500) | 9,6 ms | 7,1 ms |
+| idem, LSDB (página de 200 de 100 000) | 7,8 ms | 6,8 ms |
+| idem, Topology (2 000 roteadores, 2 500 nós) | 7,6 ms | 7,0 ms (≈6,5 ms é o quadro base da GUI inteira) |
+
+- **Onde está o trabalho por item:** no poll, cada vizinho e interface era uma árvore JSON
+  inteira (todas as chaves e textos alocados) e a resposta ainda era copiada para um `String`;
+  agora só os campos guardados, com o texto emprestado do buffer. Nas consultas havia três custos
+  O(n) por item escondidos: o template de cada interface achado por varredura (O(n²)), o vizinho
+  de cada nó do mapa achado por varredura com um `String` por comparação, e dois `String` por LSA
+  na busca. A cópia de 4 000 interfaces a cada consulta (`ospf_live`) virou empréstimo.
+- **O que ficou como estava, com o número:** `routing.ospf.path` (10–12 ms com 200 000 rotas:
+  o prefixo de cada rota é lido a cada clique; um índice guardado por cópia da LSDB pagaria só no
+  segundo clique da mesma cópia) e a busca de rotas (15–17 ms: um `contains` por rota). As duas
+  correm sob o lock, mas só a pedido do operador, não a cada atualização. Nas rodadas completas
+  elas saíram 40–70 % mais lentas depois; medidas isoladas e alternadas (antes, depois, antes,
+  depois) dão igual ou melhor (`path` 10,9–14,2 → 10,4–12,0 ms, busca 16,3–18,7 → 15,1–17,0 ms):
+  efeito da ordem dos casos no heap, não do código.
+- **Pular o que não mudou no poll:** não serve. As respostas de vizinhos e interfaces mudam a
+  cada leitura (`upTimeInMsec`, `routerDeadIntervalTimerDueMsec`, `timerHelloInMsecs` contam o
+  tempo), então nem o hash dos bytes nem o resultado repetem. O que dá para pular é ler as
+  interfaces sem ninguém olhar (só `interface.list` e o Diagnose as usam): depende do custo no
+  `ospfd`, a medir no laboratório da G3.4m (G3.4p). Na topologia, o `token` faz exatamente isso
+  do lado da janela.
+- **Threads:** não ajudam no poll: 6,7 ms a cada 2 s com 4 000 interfaces é 0,3 % de um núcleo, e
+  o `ospfd` responde um comando por vez numa thread só (dividir por instância cairia no mesmo
+  daemon). Ler `ospfd` e `bgpd` em paralelo economizaria a soma menor das duas leituras, abaixo
+  de 1 ms. As consultas rodam com o lock do `Session`; dividi-las não encurta o lock tanto quanto
+  não fazer o trabalho (índice, página, `unchanged`). O quadro da GUI é de uma thread (egui); o
+  ganho veio de não refazer as linhas a cada quadro. O layout do mapa já usa até 8 threads
+  (G3.4b) e roda uma vez por LSDB.
+- **Tamanho das respostas:** o canal de controle aceita até 256 MiB por linha, mas o MCP não corta
+  nada: 4 000 interfaces (1,1 MiB) ou 10 000 rotas (1,9 MiB) numa resposta enchem o contexto de
+  um cliente. As listas grandes agora têm página e `total`.
+
 ## Pesquisa
 
 - **MikroTik RouterOS v7** ([OSPF](https://help.mikrotik.com/docs/spaces/ROS/pages/9863229/OSPF),
