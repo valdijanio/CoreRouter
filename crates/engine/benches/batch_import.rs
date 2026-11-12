@@ -56,7 +56,55 @@ fn leases(n: usize) -> Value {
     Value::Array(steps)
 }
 
+/// G3.4m: n 802.1Q sub-interfaces of ether1, an address each and one OSPF
+/// template that matches them all, as the OSPF stress lab commits them
+/// (docs/ospf-stress.md); and the batch that takes them out.
+fn vlans_add(n: usize) -> Value {
+    let mut steps: Vec<Value> = vec![
+        json!({"command": "routing.ospf.instance.add", "params": {"name": "s", "router_id": "10.255.0.1"}}),
+        json!({"command": "routing.ospf.area.add", "params": {"name": "bb", "instance": "s", "area_id": "0.0.0.0"}}),
+    ];
+    for i in 1..=n {
+        let vid = 10 + i;
+        steps.push(json!({"command": "interface.vlan.add", "params": {
+            "name": format!("crs{vid}"), "parent": "ether1", "vlan_id": vid}}));
+        steps.push(json!({"command": "ip.address.add", "params": {
+            "address": format!("10.100.{}.{}/30", (i - 1) / 64, ((i - 1) % 64) * 4 + 1),
+            "interface": format!("crs{vid}")}}));
+    }
+    steps.push(json!({"command": "routing.ospf.interface-template.add", "params": {
+        "area": "bb", "networks": ["10.100.0.0/16"], "type": "ptp"}}));
+    Value::Array(steps)
+}
+
+fn vlans_remove(s: &mut Session, n: usize) -> Value {
+    let addrs = s.execute("ip.address.list", &json!({})).unwrap();
+    let mut steps: Vec<Value> = addrs
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| a["interface"].as_str().unwrap_or("").starts_with("crs"))
+        .map(|a| json!({"command": "ip.address.remove", "params": {"id": a["id"]}}))
+        .collect();
+    for i in 1..=n {
+        steps.push(json!({"command": "interface.remove", "params": {"name": format!("crs{}", 10 + i)}}));
+    }
+    Value::Array(steps)
+}
+
 fn bench(c: &mut Criterion) {
+    let mut line = String::new();
+    for n in [500usize, 1000, 2000, 4000] {
+        let mut s = Session::virtual_lab();
+        let t = std::time::Instant::now();
+        s.batch(&vlans_add(n), true).unwrap();
+        let add = t.elapsed().as_secs_f64();
+        let rm = vlans_remove(&mut s, n);
+        let t = std::time::Instant::now();
+        s.batch(&rm, true).unwrap();
+        line.push_str(&format!(" {n}: add {add:.2} s, remove {:.2} s;", t.elapsed().as_secs_f64()));
+    }
+    eprintln!("batch_import: VLANs with an address and OSPF:{line}");
     // G4.3g: 100 000 secrets in batches of 10 000 (the batch limit) on one
     // session. The steps cost the same; the commit at the end of each batch
     // grows with the whole config.

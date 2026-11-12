@@ -477,6 +477,26 @@ proc_sample() { # → "ospfd_rss ospfd_cpu zebra_rss zebra_cpu daemon_rss daemon
 	fi
 	echo "$line"
 }
+# CPU seconds (user + system) of the DUT's processes so far, local DUT:
+# "daemon ospfd zebra mgmtd" in centiseconds; cpu_spent <before> <after>
+# prints the difference in seconds.
+CPU_PROCS="corerouter-daemon ospfd zebra mgmtd"
+cpu_now() {
+	local n p out=""
+	for n in $CPU_PROCS; do
+		if [ $DUT = local ] && p=$(dut_pid "$n"); then
+			out+="$(awk '{print $14 + $15}' "/proc/$p/stat") "
+		else
+			out+="0 "
+		fi
+	done
+	echo "$out"
+}
+cpu_spent() {
+	awk -v a="$1" -v b="$2" -v c="$CLK" 'BEGIN {n = split(a, x, " "); split(b, y, " ");
+		split("daemon ospfd zebra mgmtd", k, " ");
+		for (i = 1; i <= n; i++) printf "%s %.1f%s", k[i], (y[i] - x[i]) / c, (i < n ? ", " : "")}'
+}
 # Peak RSS (MiB) of each process since the last reset (local: VmHWM).
 proc_peak_reset() {
 	[ $DUT = local ] || return 0
@@ -1065,6 +1085,8 @@ test_interfaces() {
 	for n in ${IFACES//,/ }; do
 		local t0 t_commit verdict=ok csv=$OUT/ifaces-$n.csv
 		mcp_open || { fail "interfaces: MCP"; return; }
+		local c0 c1 c2
+		c0=$(cpu_now)
 		t0=$(now)
 		if ! mcp_tool command_batch "$(interfaces_steps add "$n")" >"$W/batch.out"; then
 			fail "interfaces $n: the batch was refused: $(head -c 400 "$W/batch.out")"
@@ -1079,6 +1101,7 @@ test_interfaces() {
 			wait_for "$n interfaces in ospfd" 300 ge "$((n + 1))" inospf_now >/dev/null || verdict="FAIL (not all in ospfd)"
 			inospf=$(inospf_now)
 		fi
+		c1=$(cpu_now)
 		sleep 5
 		local i f=$W/ifaces-vty f2=$W/ifaces-cr size=-
 		: >"$f"
@@ -1106,6 +1129,8 @@ test_interfaces() {
 		local dead
 		if dead=$(procs_dead); then verdict="FAIL ($dead died)"; fi
 		mcp_open || true
+		local c2b
+		c2b=$(cpu_now)
 		t0=$(now)
 		local id
 		id=$(cr routing.ospf.interface-template.list | jq -r '[.[] | select(.comment == "ospf-stress ifaces")][0].id // empty')
@@ -1115,6 +1140,12 @@ test_interfaces() {
 		local t_rm
 		t_rm=$(since "$t0")
 		mcp_close
+		if [ $DUT = local ]; then
+			wait_for "interfaces out of ospfd" 300 le 1 inospf_now >/dev/null || true
+			t_rm=$(since "$t0")
+		fi
+		c2=$(cpu_now)
+		CPU_NOTES+="| $n | $(ms2s "$t_commit") | $(cpu_spent "$c0" "$c1") | $(ms2s "$t_rm") | $(cpu_spent "$c2b" "$c2") |"$'\n'
 		local vp="-"
 		[ -s "$f" ] && vp="$(pct "$f" 50)/$(pct "$f" 100)"
 		[ "$verdict" = ok ] || FAILED=1
@@ -1122,7 +1153,16 @@ test_interfaces() {
 		[ "$verdict" = ok ] || break
 	done
 	say ""
+	if [ $DUT = local ] && [ -n "$CPU_NOTES" ]; then
+		say "Where the commit and the removal spend CPU (seconds of user + system time per process):"
+		say ""
+		say "| interfaces | commit (s) | CPU during the commit | removal (s) | CPU during the removal |"
+		say "|---|---|---|---|---|"
+		printf '%s' "$CPU_NOTES" | tee -a "$RESULTS"
+		say ""
+	fi
 }
+CPU_NOTES=""
 
 # --- 4. Operations with the biggest LSDB that passed loaded.
 # recovered <secs>: Full, the LSDB and the routes back to what was
