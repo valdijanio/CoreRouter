@@ -74,6 +74,11 @@ pub struct KernelLink {
     /// A Wi-Fi radio's netdev (G1.30). The link message does not tell it
     /// from an Ethernet port; nl80211 does (`crate::wifi_links`).
     pub wireless: bool,
+    /// G1.30m: a wireless netdev that is not a radio but a station's
+    /// four-address link on an access point (`NL80211_IFTYPE_AP_VLAN`, made
+    /// by hostapd's `wds_sta`): a peer's link once named, hostapd's until
+    /// then.
+    pub wifi_vlan: bool,
 }
 
 impl KernelLink {
@@ -84,6 +89,7 @@ impl KernelLink {
         }
         match (&self.kind, self.arphrd) {
             (Some(k), _) => k.clone(),
+            (None, ARPHRD_ETHER) if self.wifi_vlan => "wifi-peer".into(),
             (None, ARPHRD_ETHER) if self.wireless => "wifi".into(),
             (None, ARPHRD_ETHER) => "ether".into(),
             (None, ARPHRD_PPP) => "ppp".into(),
@@ -178,9 +184,9 @@ fn claim_fits(claim: &InterfaceKind, link: &KernelLink) -> bool {
     match claim {
         InterfaceKind::Ethernet => link.port_like(),
         // G1.30: a radio's netdev, and nothing else.
-        InterfaceKind::Wifi(_) => link.wireless && link.kind.is_none(),
+        InterfaceKind::Wifi(_) => link.wireless && !link.wifi_vlan && link.kind.is_none(),
         // G1.30m: a peer's four-address link (an AP_VLAN netdev of the radio).
-        InterfaceKind::WifiPeer(_) => link.wireless && link.kind.is_none(),
+        InterfaceKind::WifiPeer(_) => link.wifi_vlan && link.kind.is_none(),
         InterfaceKind::Vlan { .. } => link.is("vlan"),
         InterfaceKind::Bridge => link.is("bridge"),
         InterfaceKind::Loopback => link.is("dummy"),
@@ -233,6 +239,16 @@ fn base(link: &KernelLink, claim: Option<&InterfaceKind>, policy: &Policy) -> Ow
     // seeded and adopted as an interface of type `wifi` (`label`). Taken
     // for a port, it got the ports' settings and a place in the console
     // setup's list.
+    // G1.30m: a station's four-address link that no peer of the
+    // configuration names: hostapd's (just made, or a station that is not a
+    // registered peer and is being sent away). Never adopted as a radio.
+    if link.wifi_vlan {
+        return ext(
+            "a station's four-address link that hostapd made; it is named after the \
+                    peer once registered (interface.wifi.peer.add)"
+                .into(),
+        );
+    }
     if link.wireless && link.kind.is_none() {
         return Owner::Managed;
     }
@@ -360,6 +376,29 @@ mod tests {
         radio.wireless = true;
         assert_eq!(radio.label(), "wifi");
         assert!(!radio.physical() && !radio.port_like());
+        // G1.30m: a station's four-address link on an access point.
+        let mut vlan = link(10, "wifi1.sta1", None);
+        vlan.wireless = true;
+        vlan.wifi_vlan = true;
+        assert_eq!(vlan.label(), "wifi-peer");
+        assert!(!vlan.physical() && !vlan.port_like());
+        let p = Policy::default();
+        assert!(
+            matches!(base(&vlan, None, &p), Owner::External(_)),
+            "hostapd's, until named"
+        );
+        let peer = InterfaceKind::WifiPeer(Box::new(corerouter_model::wifi::WifiPeer {
+            radio: "wifi1".parse().unwrap(),
+            mac: "02:00:00:00:00:01".parse().unwrap(),
+        }));
+        let mut named = vlan.clone();
+        named.name = "peer1".into();
+        assert_eq!(base(&named, Some(&peer), &p), Owner::Managed);
+        let radio_claim = InterfaceKind::Wifi(Box::default());
+        assert!(matches!(
+            base(&named, Some(&radio_claim), &p),
+            Owner::Conflict(_)
+        ));
         let mut ppp = link(3, "ppp0", None);
         ppp.arphrd = ARPHRD_PPP;
         assert_eq!(ppp.label(), "ppp");

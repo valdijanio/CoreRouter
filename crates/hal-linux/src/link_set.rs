@@ -1,7 +1,9 @@
 //! G1.30m: small, synchronous link changes for the Wi-Fi radios' threads,
 //! which are not in the async runtime of the configuration's apply
 //! (`netlink.rs`): rename a link, give it a master (a bridge or a bond) or
-//! none, delete it. One `RTM_NEWLINK`/`RTM_DELLINK` with an ack each.
+//! none, give it a MAC. One `RTM_NEWLINK` with an ack each. (A wireless
+//! netdev is deleted by nl80211, not here: cfg80211 registers no
+//! `rtnl_link_ops`.)
 //!
 //! Used where a link comes and goes on its own, outside a commit: a
 //! station-bridge joins its bridge once its frames carry four addresses,
@@ -13,7 +15,6 @@ use std::io;
 use netlink_sys::{Socket, SocketAddr as NlAddr, protocols::NETLINK_ROUTE};
 
 const RTM_NEWLINK: u16 = 16;
-const RTM_DELLINK: u16 = 17;
 const NLM_F_REQUEST: u16 = 1;
 const NLM_F_ACK: u16 = 4;
 const NLMSG_ERROR: u16 = 2;
@@ -153,11 +154,6 @@ pub(crate) fn set_mac(name: &str, mac: [u8; 6]) -> io::Result<()> {
     let mut a = Vec::new();
     attr(&mut a, IFLA_ADDRESS, &mac);
     request(RTM_NEWLINK, i, 0, 0, &a)
-}
-
-/// Delete link `name`.
-pub(crate) fn delete(name: &str) -> io::Result<()> {
-    request(RTM_DELLINK, index(name)?, 0, 0, &[])
 }
 
 /// The master of `name` now, by name; `None`: none (or no such link).

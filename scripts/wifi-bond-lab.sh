@@ -28,6 +28,9 @@ set -euo pipefail
 
 if [ "${1:-}" = "--host" ]; then
 	IMAGES=${2:?usage: $0 --host <images dir>}
+	# A round first: an unhealthy VM goes back to its snapshot there, which
+	# would drop what `put` copied.
+	cargo xtask vm-lab run -- true
 	cargo xtask vm-lab put "$IMAGES/rootfs.squashfs" "$IMAGES/test-tools/iw"
 	exec cargo xtask vm-lab run -- scripts/wifi-bond-lab.sh
 fi
@@ -71,12 +74,17 @@ rm -rf "$W"
 mkdir -p "$W"/{lower,rw,root,a,b}
 : > "$RESULTS"
 
-# The image's root, writable on top (iw goes in it).
-mount -t squashfs -o loop,ro "$INBOX/rootfs.squashfs" "$W/lower"
+# The image's root, writable on top.
+for f in rootfs.squashfs iw; do
+	[ -s "$INBOX/$f" ] || { echo "$INBOX/$f missing: run with --host <images> from the host"; exit 1; }
+done
+modprobe loop 2>/dev/null || true
+mount -t squashfs -o loop,ro "$INBOX/rootfs.squashfs" "$W/lower" || { echo "cannot mount the image's root"; exit 1; }
 mount -t tmpfs tmpfs "$W/rw"
-mkdir -p "$W/rw/upper" "$W/rw/work" "$W/rw/upper/usr/sbin"
-install -m 0755 "$INBOX/iw" "$W/rw/upper/usr/sbin/iw"
-mount -t overlay overlay -o "lowerdir=$W/lower,upperdir=$W/rw/upper,workdir=$W/rw/work" "$R"
+mkdir -p "$W/rw/upper" "$W/rw/work"
+install -m 0755 "$INBOX/iw" "$W/iw"
+mount -t overlay overlay -o "lowerdir=$W/lower,upperdir=$W/rw/upper,workdir=$W/rw/work" "$R" ||
+	{ echo "cannot mount the overlay"; exit 1; }
 
 # In namespace $1, with $1's own /run and /tmp, the image's root: `$2…`.
 in_ns() {
@@ -97,7 +105,7 @@ in_ns() {
 cr() {
 	local ns=$1
 	shift
-	in_ns "$ns" /usr/bin/corerouter-init run "$@"
+	in_ns "$ns" /usr/sbin/corerouter-init run "$@"
 }
 
 # The reply's `ok` must be true.
@@ -133,7 +141,7 @@ ip netns add crwb
 mapfile -t WLANS < <(for d in /sys/class/net/*/phy80211; do basename "$(dirname "$d")"; done | sort)
 [ ${#WLANS[@]} -ge 4 ] || { echo "hwsim gave ${#WLANS[@]} radios"; exit 1; }
 # iw moves a wiphy into the namespace of a process: one that waits in
-# each (the chroot does not see /var/run/netns for `set netns name`).
+# each.
 declare -A HOLDER
 for ns in crwa crwb; do
 	ip netns exec "$ns" sleep 100000 &
@@ -144,7 +152,9 @@ i=0
 for wl in "${WLANS[@]:0:4}"; do
 	phy=$(basename "$(readlink "/sys/class/net/$wl/phy80211")")
 	if [ $i -lt 2 ]; then ns=crwa; else ns=crwb; fi
-	chroot "$R" /usr/sbin/iw phy "$phy" set netns "${HOLDER[$ns]}"
+	# iw reads the phy's index from /sys: run it outside the chroot (its
+	# libraries, libnl, are the VM's too).
+	"$W/iw" phy "$phy" set netns "${HOLDER[$ns]}" 2>/dev/null
 	i=$((i + 1))
 done
 for ns in crwa crwb; do
@@ -165,7 +175,8 @@ for side in a b; do
 		--control 7979 >"$W/$side/daemon.log" 2>&1 &
 done
 for ns in crwa crwb; do
-	until_s "$ns daemon up" 60 "cr $ns interface.wifi.list '{}' | grep -q wifi2"
+	until_s "$ns daemon up" 60 "cr $ns interface.wifi.list '{}' | grep -q wifi2" ||
+		{ tail -n 30 "$W/${ns#crw}/daemon.log"; exit 1; }
 done
 say "radios: wifi1 and wifi2 in each namespace, adopted by its router"
 
@@ -191,7 +202,9 @@ setup_bonds() {
 		cr "$ns" interface.bridge.port.remove '{"bridge":"bridge1","interface":"bond1"}' >/dev/null || true
 		cr "$ns" interface.remove '{"name":"bond1"}' >/dev/null || true
 	done
-	ok crwb interface.bonding.add "{\"name\":\"bond1\",\"slaves\":[\"wifi1\",\"wifi2\"],\"mode\":\"$mode\",\"lacp_rate\":\"1sec\"}" >/dev/null
+	local lacp=""
+	[ "$mode" = 802.3ad ] && lacp=',"lacp_rate":"1sec"'
+	ok crwb interface.bonding.add "{\"name\":\"bond1\",\"slaves\":[\"wifi1\",\"wifi2\"],\"mode\":\"$mode\"$lacp}" >/dev/null
 	ok crwb interface.bridge.port.add '{"bridge":"bridge1","interface":"bond1"}' >/dev/null
 	# The peers' MAC: B's bond's (it gave its slaves its own).
 	local mac
@@ -202,7 +215,7 @@ setup_bonds() {
 	done
 	ok crwa interface.wifi.peer.add "{\"radio\":\"wifi1\",\"name\":\"peer1\",\"mac_address\":\"$mac\"}" >/dev/null
 	ok crwa interface.wifi.peer.add "{\"radio\":\"wifi2\",\"name\":\"peer2\",\"mac_address\":\"$mac\"}" >/dev/null
-	ok crwa interface.bonding.add "{\"name\":\"bond1\",\"slaves\":[\"peer1\",\"peer2\"],\"mode\":\"$mode\",\"lacp_rate\":\"1sec\"}" >/dev/null
+	ok crwa interface.bonding.add "{\"name\":\"bond1\",\"slaves\":[\"peer1\",\"peer2\"],\"mode\":\"$mode\"$lacp}" >/dev/null
 	ok crwa interface.bridge.port.add '{"bridge":"bridge1","interface":"bond1"}' >/dev/null
 }
 

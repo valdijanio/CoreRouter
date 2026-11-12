@@ -524,7 +524,7 @@ mod io {
             self.socks = None;
             // G1.30m: the peers' renamed links (hostapd cannot find them).
             for (_, name) in std::mem::take(&mut self.peers_up) {
-                let _ = crate::link_set::delete(&name);
+                self.delete_link(&name);
             }
             if !self.dir.join("global").exists() {
                 return Ok(());
@@ -604,6 +604,26 @@ mod io {
             Ok(())
         }
 
+        /// G1.30m: delete a wireless netdev (a peer's renamed link). Not
+        /// by `RTM_DELLINK`: cfg80211's netdevs have no `rtnl_link_ops`,
+        /// so it is `NL80211_CMD_DEL_INTERFACE`.
+        fn delete_link(&mut self, name: &str) {
+            let Ok(ifindex) = nix::net::if_::if_nametoindex(name) else {
+                return;
+            };
+            if self.nl.is_none() {
+                self.nl = Nl80211::open();
+            }
+            match self.nl.as_mut().map(|nl| nl.del_interface(ifindex)) {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
+                    log::warn!("wifi {}: deleting peer link {name}: {e}", self.name);
+                    self.nl = None;
+                }
+                None => log::warn!("wifi {}: deleting peer link {name}: no nl80211", self.name),
+            }
+        }
+
         /// G1.30m: a four-address station's interface came (`added`) or
         /// went. A registered peer's gets the peer's name (down, renamed,
         /// up); any other station that asks for four addresses is sent
@@ -620,21 +640,28 @@ mod io {
                 // Out of the bridge hostapd put it in (`bridge=`), then
                 // named: where it goes (a bridge, a bond) is the
                 // configuration's, applied when the link shows up.
-                (true, Some(p)) => match crate::link_set::set_master(ifname, None)
-                    .and_then(|()| crate::link_set::rename(ifname, &p.name))
-                {
-                    Ok(()) => {
-                        self.peers_up.push((p.mac.clone(), p.name.clone()));
-                        Some(WifiApEvent::PeerUp {
-                            mac: p.mac,
-                            name: p.name,
-                        })
+                (true, Some(p)) => {
+                    // A link of that name left from before (a peer that
+                    // came back before its old link went) goes first.
+                    if crate::link_set::mac_of(&p.name).is_some() {
+                        self.delete_link(&p.name);
                     }
-                    Err(e) => Some(WifiApEvent::Failed(format!(
-                        "peer {}: its link {ifname} could not be named: {e}",
-                        p.name
-                    ))),
-                },
+                    let named = crate::link_set::set_master(ifname, None)
+                        .and_then(|()| crate::link_set::rename(ifname, &p.name));
+                    match named {
+                        Ok(()) => {
+                            self.peers_up.push((p.mac.clone(), p.name.clone()));
+                            Some(WifiApEvent::PeerUp {
+                                mac: p.mac,
+                                name: p.name,
+                            })
+                        }
+                        Err(e) => Some(WifiApEvent::Failed(format!(
+                            "peer {}: its link {ifname} could not be named: {e}",
+                            p.name
+                        ))),
+                    }
+                }
                 (true, None) => {
                     if let Some((cmd, _)) = &self.socks {
                         // Reason 1: unspecified (IEEE 802.11-2020 Table 9-49).
@@ -651,9 +678,7 @@ mod io {
                 (false, _) => {
                     let pos = self.peers_up.iter().position(|(m, _)| m == mac)?;
                     let (mac, name) = self.peers_up.remove(pos);
-                    if let Err(e) = crate::link_set::delete(&name) {
-                        log::debug!("wifi {}: deleting peer link {name}: {e}", self.name);
-                    }
+                    self.delete_link(&name);
                     Some(WifiApEvent::PeerDown { mac, name })
                 }
             }
