@@ -1111,14 +1111,15 @@ fn bridge_mode(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Resu
         v["result"][0]["state"] == "up"
     })?;
     let up_s = t.elapsed().as_secs_f64();
-    // The peer's link is `peer1`, in the bridge; hostapd's name is gone.
+    // The peer's link is `peer1` (a veth end) in the bridge; hostapd's
+    // AP_VLAN stays as it is, in the peer's private bridge (`wpb<idx>`).
     let links = sh(
         vm,
         log,
-        "{ i=0; while [ $i -lt 50 ] && [ \"$(readlink /sys/class/net/peer1/master)\" = \"\" ]; do sleep 0.2; i=$((i+1)); done; readlink /sys/class/net/peer1/master; ls /sys/class/net; cat /sys/class/net/peer1/operstate; }",
+        "{ i=0; while [ $i -lt 50 ] && [ \"$(readlink /sys/class/net/peer1/master)\" = \"\" ]; do sleep 0.2; i=$((i+1)); done; readlink /sys/class/net/peer1/master; ls /sys/class/net; readlink /sys/class/net/wifi2.sta1/master; }",
     )?;
     check(
-        links.contains("bridge1") && !links.contains("wifi2.sta"),
+        links.contains("bridge1") && links.contains("wifi2.sta1") && links.contains("wpb"),
         format!("the peer's link: {links}"),
     )?;
     nums.put(

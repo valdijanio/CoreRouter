@@ -24,7 +24,7 @@ pub(crate) const KEY: &str = "peers";
 pub(crate) const TABLE: &str = "wifi-peers";
 const SCOPE: &str = "wifi";
 
-pub(crate) const COLUMNS: [table::Column; 9] = [
+pub(crate) const COLUMNS: [table::Column; 11] = [
     col("Name").help("interface.wifi.peer.name"),
     col("Radio").help("interface.wifi.peer.radio"),
     col("MAC Address").help("interface.wifi.peer.mac"),
@@ -32,6 +32,8 @@ pub(crate) const COLUMNS: [table::Column; 9] = [
     col("Signal").help("interface.wifi.signal"),
     col("Rate").help("interface.wifi.registration.rate"),
     col("Uptime").help("interface.wifi.registration.uptime"),
+    col("Retries").help("interface.wifi.registration.retries"),
+    col("Airtime").help("interface.wifi.peer.airtime"),
     col("Link").help("interface.wifi.peer.link"),
     col("Comment"),
 ];
@@ -59,6 +61,23 @@ pub(crate) struct PeersView {
 
 fn s(r: &Value, k: &str) -> String {
     r.get(k).filter(|v| !v.is_null()).map(crate::value_text).unwrap_or_default()
+}
+
+/// A percent as a chip: amber from `amber`, red from `red`.
+fn pct(r: &Value, k: &str, amber: f64, red: f64) -> String {
+    r.get(k)
+        .and_then(Value::as_f64)
+        .map(|p| {
+            let kind = if p >= red {
+                Kind::Red
+            } else if p >= amber {
+                Kind::Amber
+            } else {
+                Kind::Neutral
+            };
+            cell("", &[(&format!("{p:.1} %"), kind)])
+        })
+        .unwrap_or_default()
 }
 
 fn row(r: &Value, l: Lang) -> Row {
@@ -97,6 +116,8 @@ fn row(r: &Value, l: Lang) -> Row {
                 .and_then(Value::as_u64)
                 .map(crate::wifi::uptime_text)
                 .unwrap_or_default(),
+            pct(r, "retry_percent", 10.0, 20.0),
+            pct(r, "airtime_percent", 60.0, 85.0),
             link,
             s(r, "comment"),
         ],

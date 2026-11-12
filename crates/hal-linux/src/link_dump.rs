@@ -384,6 +384,7 @@ mod tests {
             }),
             bus: Some("usb".into()),
             wireless: false,
+            wifi_vlan: false,
         };
         assert_eq!(out, [want]);
     }

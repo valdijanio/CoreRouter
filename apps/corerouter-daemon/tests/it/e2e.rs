@@ -23,7 +23,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -289,10 +289,15 @@ fn config_and_history_survive_sigterm_and_kill_9() {
     assert_eq!(snapshot(&mut c), before, "SIGTERM lost config or history");
 
     // A commit storm cut by kill -9: every acknowledged change is there.
+    // The kill waits for the storm to be under way (a few acks), not for a
+    // fixed time: each add is a journaled commit with an fsync, and with
+    // the disk shared by several CIs the first one took more than the 400
+    // ms the test used to sleep (no ack at all, 2026-11-12).
     let stop = Arc::new(AtomicBool::new(false));
+    let count = Arc::new(AtomicUsize::new(0));
     let storm = {
         let mut c = d.client().unwrap();
-        let stop = stop.clone();
+        let (stop, count) = (stop.clone(), count.clone());
         thread::spawn(move || {
             let mut acked = Vec::new();
             for i in 0u32.. {
@@ -305,18 +310,36 @@ fn config_and_history_survive_sigterm_and_kill_9() {
                     "ip.firewall.address-list.add",
                     json!({"list": "storm", "address": addr}),
                 ) {
-                    Ok(_) => acked.push(addr),
+                    Ok(_) => {
+                        acked.push(addr);
+                        count.fetch_add(1, Ordering::SeqCst);
+                    }
                     Err(_) => break,
                 }
             }
             acked
         })
     };
-    thread::sleep(Duration::from_millis(400));
+    let started = Instant::now();
+    while count.load(Ordering::SeqCst) < 5 && started.elapsed() < Duration::from_secs(30) {
+        thread::sleep(Duration::from_millis(10));
+    }
+    // Then cut it mid-flight, with commits still coming.
+    thread::sleep(Duration::from_millis(100));
+    let before_kill = (count.load(Ordering::SeqCst), started.elapsed());
+    eprintln!(
+        "storm: {} acks in {:?}, then kill -9",
+        before_kill.0, before_kill.1
+    );
     d.signal("-KILL");
     stop.store(true, Ordering::SeqCst);
     let acked = storm.join().unwrap();
-    assert!(!acked.is_empty());
+    assert!(
+        before_kill.0 >= 5,
+        "the storm never got going: {} acks in {:?}",
+        before_kill.0,
+        before_kill.1
+    );
     let d = Daemon::start(&dir);
     let mut c = d.client().unwrap();
     let storage = c.call("state.inspect", json!({})).unwrap()["storage"].clone();

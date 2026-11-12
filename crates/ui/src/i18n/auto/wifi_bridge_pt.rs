@@ -5,6 +5,7 @@
 pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Add Peer"##, r##"Adicionar par"##),
     (r##"Add Peer…"##, r##"Adicionar par…"##),
+    (r##"Airtime"##, r##"Tempo de ar"##),
     (r##"Bridge Protocol"##, r##"Protocolo de bridge"##),
     (r##"General"##, r##"Geral"##),
     (r##"Link"##, r##"Ligação"##),
@@ -30,6 +31,11 @@ Como o station-bridge combina os quadros de quatro endereços com o ponto de ace
 - **wds**: quatro endereços desde o início, sem negociação. Para o OpenWrt (`option wds 1`) e outros que falam WDS.
 
 Nenhum dos dois fala com o `station-bridge` do MikroTik, que é próprio e só funciona entre RouterOS."##,
+    ),
+    (
+        "interface.wifi.peer.airtime",
+        r##"## Tempo de ar
+A parte do ar que o enlace do par ocupou entre as duas últimas leituras (2 s de intervalo): quadros enviados e recebidos, pelos contadores de tempo de ar do driver. Âmbar a partir de 60 %, vermelho a partir de 85 %: o canal está quase cheio e o enlace não passa disso ali (outro canal, ou outro enlace no bonding)."##,
     ),
     (
         "interface.wifi.peer.link",

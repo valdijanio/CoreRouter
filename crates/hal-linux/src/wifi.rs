@@ -791,6 +791,14 @@ mod io {
     /// The global control socket, with the supplicant started if it is not
     /// there (or does not answer).
     fn global(dir: &Path, bin: &Path) -> Result<Ctrl, HalError> {
+        // G1.30m: one radio's thread at a time. Two radios turned on
+        // together raced here: while the first one's supplicant was still
+        // opening its socket, the second took the socket for a dead one's,
+        // removed it and started another supplicant, which failed (exit
+        // 255) and left the first radio talking to nobody (seen in the
+        // bonding lab: one of the two station-bridges never joined).
+        static START: Mutex<()> = Mutex::new(());
+        let _one = START.lock().unwrap_or_else(PoisonError::into_inner);
         let sock = dir.join("global");
         let ping = |c: &Ctrl| c.request("PING", "PING").is_ok_and(|r| r.trim() == "PONG");
         if let Ok(c) = Ctrl::connect(dir, &sock)
@@ -878,7 +886,7 @@ mod io {
         fn open_at(name: &IfName, dir: PathBuf, binary: &Path) -> Result<Self, HalError> {
             // G1.30a: an access point on this radio lets go first (a daemon
             // restarted after the mode changed).
-            if let Ok(hdir) = runtime_dir("hostapd")
+            if let Ok(hdir) = crate::wifi_ap::radio_dir(name)
                 && hdir.join("global").exists()
                 && let Ok(h) = Ctrl::connect_as("hostapd", &hdir, &hdir.join("global"))
             {
@@ -1104,6 +1112,10 @@ mod io {
                 st.link = self.link(st.bssid.as_deref());
             }
             self.bridge_sync(connected);
+            // G1.30m: a station-bridge in a bond.
+            if self.wds || self.bridge.is_some() || st.state == WifiState::Connected {
+                crate::link_set::bond_takes_all(&self.name);
+            }
             let blocked = st.state == WifiState::Blocked;
             if blocked != self.blocked {
                 self.blocked = blocked;

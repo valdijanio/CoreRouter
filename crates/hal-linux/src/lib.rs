@@ -927,7 +927,8 @@ mod linux {
                         mtu: u16::try_from(l.mtu).ok()?,
                         mac: l.mac,
                         up: l.up,
-                        wifi: l.wireless,
+                        // G1.30m: a peer's link is not a radio to adopt.
+                        wifi: l.wireless && !l.wifi_vlan,
                     })
                 })
                 .collect())
@@ -1580,6 +1581,10 @@ mod linux {
             &mut self,
         ) -> Result<Box<dyn corerouter_hal::clock::SystemClock>, HalError> {
             Ok(Box::new(crate::clock::LinuxClock::realtime()))
+        }
+
+        fn hardware_clock(&self) -> Result<i64, HalError> {
+            crate::clock::read_rtc(std::path::Path::new(crate::clock::RTC_SINCE_EPOCH))
         }
 
         fn dhcp_server_port(

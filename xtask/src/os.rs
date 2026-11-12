@@ -1294,22 +1294,26 @@ pub(crate) fn build_with(
     if changed {
         std::fs::write(&kstamp, &kpatches).map_err(|e| format!("{}: {e}", kstamp.display()))?;
     }
-    // G3.4l: the same for `os/patches/frr/*.patch` (the ospfd TI-LFA fix):
-    // a changed patch needs `frr-dirclean`.
-    let (_, fpatches) = patches_in(&d.os.join("patches/frr"))?;
-    let fstamp = d.out.join(".corerouter-frr-patches.sha256");
-    if std::fs::read_to_string(&fstamp).ok().as_deref() != Some(fpatches.as_str()) {
-        let built = std::fs::read_dir(d.out.join("build")).is_ok_and(|rd| {
-            rd.flatten().any(|e| {
-                e.file_name()
-                    .to_str()
-                    .is_some_and(|n| n.starts_with("frr-"))
-            })
-        });
-        if built {
-            make(&["frr-dirclean"], &[])?;
+    // G3.4l: the same for `os/patches/frr/*.patch` (the ospfd TI-LFA fix),
+    // and G1.30m for `os/patches/wpa_supplicant/*.patch` (a new scan after
+    // an aborted one): a changed patch needs `<package>-dirclean`.
+    for pkg in ["frr", "wpa_supplicant"] {
+        let (_, ppatches) = patches_in(&d.os.join("patches").join(pkg))?;
+        let pstamp = d.out.join(format!(".corerouter-{pkg}-patches.sha256"));
+        if std::fs::read_to_string(&pstamp).ok().as_deref() != Some(ppatches.as_str()) {
+            let prefix = format!("{pkg}-");
+            let built = std::fs::read_dir(d.out.join("build")).is_ok_and(|rd| {
+                rd.flatten().any(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with(&prefix))
+                })
+            });
+            if built {
+                make(&[&format!("{pkg}-dirclean")], &[])?;
+            }
+            std::fs::write(&pstamp, &ppatches).map_err(|e| format!("{}: {e}", pstamp.display()))?;
         }
-        std::fs::write(&fstamp, &fpatches).map_err(|e| format!("{}: {e}", fstamp.display()))?;
     }
     // Buildroot reads the kernel fragment only when it configures the
     // kernel: a changed fragment needs `linux-reconfigure` (the kernel's

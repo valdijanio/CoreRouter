@@ -74,6 +74,11 @@ pub struct KernelLink {
     /// A Wi-Fi radio's netdev (G1.30). The link message does not tell it
     /// from an Ethernet port; nl80211 does (`crate::wifi_links`).
     pub wireless: bool,
+    /// G1.30m: a wireless netdev that is not a radio but a station's
+    /// four-address link on an access point (`NL80211_IFTYPE_AP_VLAN`, made
+    /// by hostapd's `wds_sta`): a peer's link once named, hostapd's until
+    /// then.
+    pub wifi_vlan: bool,
 }
 
 impl KernelLink {
@@ -84,6 +89,7 @@ impl KernelLink {
         }
         match (&self.kind, self.arphrd) {
             (Some(k), _) => k.clone(),
+            (None, ARPHRD_ETHER) if self.wifi_vlan => "wifi-vlan".into(),
             (None, ARPHRD_ETHER) if self.wireless => "wifi".into(),
             (None, ARPHRD_ETHER) => "ether".into(),
             (None, ARPHRD_PPP) => "ppp".into(),
@@ -178,9 +184,10 @@ fn claim_fits(claim: &InterfaceKind, link: &KernelLink) -> bool {
     match claim {
         InterfaceKind::Ethernet => link.port_like(),
         // G1.30: a radio's netdev, and nothing else.
-        InterfaceKind::Wifi(_) => link.wireless && link.kind.is_none(),
-        // G1.30m: a peer's four-address link (an AP_VLAN netdev of the radio).
-        InterfaceKind::WifiPeer(_) => link.wireless && link.kind.is_none(),
+        InterfaceKind::Wifi(_) => link.wireless && !link.wifi_vlan && link.kind.is_none(),
+        // G1.30m: a peer's link is one end of a veth pair whose other end
+        // is bridged with the station's AP_VLAN (`crate::wifi_ap`).
+        InterfaceKind::WifiPeer(_) => link.is("veth"),
         InterfaceKind::Vlan { .. } => link.is("vlan"),
         InterfaceKind::Bridge => link.is("bridge"),
         InterfaceKind::Loopback => link.is("dummy"),
@@ -233,6 +240,21 @@ fn base(link: &KernelLink, claim: Option<&InterfaceKind>, policy: &Policy) -> Ow
     // seeded and adopted as an interface of type `wifi` (`label`). Taken
     // for a port, it got the ports' settings and a place in the console
     // setup's list.
+    // G1.30m: a station's four-address link (hostapd's AP_VLAN) and the
+    // bridge and veth end that carry a peer's link to it (`crate::wifi_ap`):
+    // the radio's thread keeps them, never the configuration's apply.
+    if link.wifi_vlan {
+        return ext(
+            "a station's four-address link that hostapd made; a registered peer's \
+                    traffic reaches it through the peer's interface (interface.wifi.peer.add)"
+                .into(),
+        );
+    }
+    if crate::wifi_ap::internal_link(&link.name) {
+        return ext(
+            "a Wi-Fi peer's internal bridge or veth end (the radio's thread keeps it)".into(),
+        );
+    }
     if link.wireless && link.kind.is_none() {
         return Owner::Managed;
     }
@@ -377,6 +399,39 @@ mod tests {
         radio.wireless = true;
         assert_eq!(radio.label(), "wifi");
         assert!(!radio.physical() && !radio.port_like());
+        // G1.30m: a station's four-address link on an access point.
+        let mut vlan = link(10, "wifi1.sta1", None);
+        vlan.wireless = true;
+        vlan.wifi_vlan = true;
+        assert_eq!(vlan.label(), "wifi-vlan");
+        assert!(!vlan.physical() && !vlan.port_like());
+        let p = Policy::default();
+        assert!(
+            matches!(base(&vlan, None, &p), Owner::External(_)),
+            "hostapd's, until named"
+        );
+        let peer = InterfaceKind::WifiPeer(Box::new(corerouter_model::wifi::WifiPeer {
+            radio: "wifi1".parse().unwrap(),
+            mac: "02:00:00:00:00:01".parse().unwrap(),
+        }));
+        // The peer's interface is the veth end; the private bridge and the
+        // other end are the radio thread's.
+        let veth = link(11, "peer1", Some("veth"));
+        assert_eq!(base(&veth, Some(&peer), &p), Owner::Managed);
+        let radio_claim = InterfaceKind::Wifi(Box::default());
+        assert!(matches!(
+            base(&vlan, Some(&radio_claim), &p),
+            Owner::Conflict(_)
+        ));
+        for internal in [
+            link(12, "wpb10", Some("bridge")),
+            link(13, "wpv10", Some("veth")),
+        ] {
+            assert!(
+                matches!(base(&internal, None, &p), Owner::External(_)),
+                "{internal:?}"
+            );
+        }
         let mut ppp = link(3, "ppp0", None);
         ppp.arphrd = ARPHRD_PPP;
         assert_eq!(ppp.label(), "ppp");

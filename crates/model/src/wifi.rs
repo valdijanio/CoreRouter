@@ -42,8 +42,39 @@ pub const NO_BRIDGE: &str = "a Wi-Fi station cannot be a bridge port: its frames
 /// is the way between two routers.
 pub const NO_BOND: &str = "a Wi-Fi station's frames carry three addresses, so the access point \
                            only passes its own MAC, and a bond changes it. Route through it; \
-                           between two CoreRouters, station-bridge mode (G1.30m) will carry a \
-                           bond";
+                           between two CoreRouters, use mode=station-bridge here and its peer \
+                           on the access point (interface.wifi.peer.add): both can be slaves";
+
+/// G1.30m: an access point is not a slave; its peers' links are.
+pub const NO_BOND_AP: &str = "an access point is not a bond slave: its clients are many. The \
+                              four-address links of its peers are (interface.wifi.peer.add), \
+                              one per peer";
+
+/// G1.30m: why a bond with a Wi-Fi link cannot be in `mode`, if it cannot.
+/// 802.3ad and balance-tlb/alb need each slave's speed and duplex: the
+/// bonding driver drops a slave that has none (Linux 6.18.59
+/// `drivers/net/bonding/bond_main.c:2769`, `bond_needs_speed_duplex`),
+/// and mac80211 reports none (`net/mac80211/ethtool.c` has no
+/// `get_link_ksettings`). Measured in the lab: the slaves stayed down,
+/// "failed to get link speed/duplex", and LACP never had a partner.
+pub fn bond_mode_problem(mode: crate::BondMode) -> Option<&'static str> {
+    use crate::BondMode::{BalanceAlb, BalanceTlb, Lacp};
+    matches!(mode, Lacp | BalanceTlb | BalanceAlb).then_some(
+        "802.3ad (LACP), balance-tlb and balance-alb need each slave's speed and duplex, and a \
+         Wi-Fi interface reports none (the kernel keeps such a slave down). Over Wi-Fi links use \
+         active-backup, balance-xor (each flow on one link, like LACP but static) or balance-rr",
+    )
+}
+
+/// G1.30m: what a bond takes: an Ethernet port, and a Wi-Fi backhaul link
+/// (a station-bridge, or a peer's link on an access point).
+pub fn bondable(kind: &crate::InterfaceKind) -> bool {
+    match kind {
+        crate::InterfaceKind::Ethernet | crate::InterfaceKind::WifiPeer(_) => true,
+        crate::InterfaceKind::Wifi(w) => w.mode == WifiMode::StationBridge,
+        _ => false,
+    }
+}
 
 /// G1.30m: the backhaul between routers is WPA3 only (SAE with protected
 /// management frames): it carries the whole LAN.

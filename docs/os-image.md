@@ -1206,8 +1206,14 @@ Nada roda por pacote: o custo é a contagem nos raros erros de memória.
 
 **Não conferido** (não há emulação): uma máquina com ECC de verdade, um erro corrigido ou não
 corrigido real, o `igen6` numa máquina com ECC em banda ligado. O QEMU não emula controlador de
-memória com EDAC; o boot do QEMU confere que nada é carregado sem ECC no SMBIOS e o laboratório
-virtual mostra a tabela com dois pentes.
+memória com EDAC.
+
+**Conferido no QEMU** (q35 e `pc`, a imagem desta branch): sem ECC no SMBIOS nada é carregado
+(`lsmod` sem `igen6_edac`); com `corerouter.edac=on`, o `igen6_edac` carrega (é um driver PCI:
+o módulo fica mesmo sem controlador) sem nenhuma linha de nível erro, e o PID 1 diz
+`memory errors: no memory controller of igen6_edac or pnd2_edac answered`. Por isso um driver só
+conta como achado quando aparece um `mc<N>` novo em `/sys/devices/system/edac/mc`. A tabela de
+pentes foi conferida na GUI com o laboratório virtual (dois pentes, tema claro e escuro).
 
 ### Boot lento no handoff do USB (xHCI) (G1.6zq)
 

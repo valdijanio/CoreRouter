@@ -66,6 +66,16 @@ impl LabAp {
             return;
         };
         self.polls = self.polls.saturating_add(1);
+        // G1.30m: a peer's link keeps the air busy (some 12 % at one read
+        // a second) and its counters grow.
+        for c in self.clients.iter_mut().filter(|c| c.peer.is_some()) {
+            let l = &mut c.link;
+            l.tx_airtime_us = Some(l.tx_airtime_us.unwrap_or(0).saturating_add(80_000));
+            l.rx_airtime_us = Some(l.rx_airtime_us.unwrap_or(0).saturating_add(40_000));
+            l.tx_packets = Some(l.tx_packets.unwrap_or(0).saturating_add(1_000));
+            l.tx_retries = Some(l.tx_retries.unwrap_or(0).saturating_add(30));
+            l.connected_secs = Some(u64::from(self.polls));
+        }
         let checking = ap.radar && self.polls <= 2;
         match self.state {
             ApState::Starting if checking => {
