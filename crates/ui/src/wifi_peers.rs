@@ -74,8 +74,8 @@ fn row(r: &Value, l: Lang) -> Row {
         _ => "disabled",
     };
     let link = match (s(r, "bridge"), s(r, "bond")) {
-        (b, _) if !b.is_empty() => format!("bridge {b}"),
-        (_, b) if !b.is_empty() => format!("bond {b}"),
+        (b, _) if !b.is_empty() => b,
+        (_, b) if !b.is_empty() => format!("{b} (bond)"),
         _ => String::new(),
     };
     Row {

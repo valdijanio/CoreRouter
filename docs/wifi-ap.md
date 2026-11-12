@@ -4,7 +4,7 @@ O rádio anuncia uma rede e os clientes entram nela: o roteador de uma loja, de 
 pequeno, de uma casa. É a parte 1 da G1.30a, o **AP mínimo** que o dono aprovou em 2026-11-11:
 SSID, WPA2/WPA3, canal e largura, país obrigatório, porta de bridge, tabela de clientes e a
 recusa do que o rádio não permite. O resto da G1.30a (lista de acesso, RADIUS, vários SSIDs por
-rádio) vem depois; o station-bridge entre dois CoreRouters é a G1.30m.
+rádio) vem depois; o station-bridge entre dois CoreRouters é a G1.30m (`docs/wifi-bridge.md`).
 
 ## Como se usa
 

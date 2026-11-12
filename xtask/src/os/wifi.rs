@@ -1178,6 +1178,22 @@ fn bridge_mode(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Resu
         format!("the test's backhaul access point: {out}"),
     )?;
     for proto in ["multi-ap", "wds"] {
+        // From scratch each time: off, and the access point's link gone.
+        set(
+            vm,
+            log,
+            &serde_json::json!({"name": "wifi2", "disabled": true}),
+        )?;
+        monitor(vm, log, 20, |m| m["state"] == "disabled")?;
+        let gone = sh(
+            vm,
+            log,
+            "{ i=0; while [ $i -lt 50 ] && ls /sys/class/net | grep -q wifi1.sta; do sleep 0.2; i=$((i+1)); done; ls /sys/class/net | grep -q wifi1.sta || echo gone; echo .; }",
+        )?;
+        check(
+            gone.contains("gone"),
+            "the access point's four-address link stayed",
+        )?;
         let t = Instant::now();
         set(
             vm,
