@@ -1144,17 +1144,20 @@ fn scenario_crash(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
             .is_some_and(|s| s.contains("sysrq triggered crash")),
         format!("{c}"),
     )?;
-    // Erased: no dump variable left. The room they took comes back only
-    // when the firmware reclaims its store at a boot (EDK2 does not reclaim
-    // at run time), so the free space is not compared here.
+    // Erased: no dump variable can be read. efivarfs keeps the names it
+    // listed at mount (pstore erases in the firmware, not through it), so a
+    // name may still be listed until the next boot; reading it says the
+    // variable is gone. The room they took comes back only when the
+    // firmware reclaims its store at a boot (EDK2 does not reclaim at run
+    // time), so the free space is not compared here.
     let dumps = shell_line(
         &mut vm,
         &mut log,
-        "ls /sys/firmware/efi/efivars | grep -c '^dump-type'",
+        "n=0; for f in /sys/firmware/efi/efivars/dump-type*; do [ -e \"$f\" ] && cat \"$f\" >/dev/null 2>&1 && n=$((n+1)); done; echo $n",
     )?;
     check(
         dumps == "0",
-        format!("{dumps} dump variable(s) left in the NVRAM"),
+        format!("{dumps} dump variable(s) still readable in the NVRAM"),
     )?;
     let free1 = nvram_free(&mut vm, &mut log)?;
     n.put(
@@ -1197,6 +1200,15 @@ fn scenario_crash(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
     drop(vm);
     let mut vm = ctx.boot("crash/nvram-full", false, &[&pkg])?;
     vm.expect_all(&mut log, &["ready:", "maintenance shell"], 120)?;
+    let listed = shell_line(
+        &mut vm,
+        &mut log,
+        "ls /sys/firmware/efi/efivars | grep -c '^dump-type'",
+    )?;
+    check(
+        listed == "0",
+        format!("{listed} dump variable(s) listed after a reboot"),
+    )?;
     let v = vm.ok(&mut log, "system.crash.print", "{}")?;
     check(
         v["efi"]["turned_off"] == true && v["efi"]["enabled"] == false,
