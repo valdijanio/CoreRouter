@@ -89,7 +89,7 @@ impl KernelLink {
         }
         match (&self.kind, self.arphrd) {
             (Some(k), _) => k.clone(),
-            (None, ARPHRD_ETHER) if self.wifi_vlan => "wifi-peer".into(),
+            (None, ARPHRD_ETHER) if self.wifi_vlan => "wifi-vlan".into(),
             (None, ARPHRD_ETHER) if self.wireless => "wifi".into(),
             (None, ARPHRD_ETHER) => "ether".into(),
             (None, ARPHRD_PPP) => "ppp".into(),
@@ -185,8 +185,9 @@ fn claim_fits(claim: &InterfaceKind, link: &KernelLink) -> bool {
         InterfaceKind::Ethernet => link.port_like(),
         // G1.30: a radio's netdev, and nothing else.
         InterfaceKind::Wifi(_) => link.wireless && !link.wifi_vlan && link.kind.is_none(),
-        // G1.30m: a peer's four-address link (an AP_VLAN netdev of the radio).
-        InterfaceKind::WifiPeer(_) => link.wifi_vlan && link.kind.is_none(),
+        // G1.30m: a peer's link is one end of a veth pair whose other end
+        // is bridged with the station's AP_VLAN (`crate::wifi_ap`).
+        InterfaceKind::WifiPeer(_) => link.is("veth"),
         InterfaceKind::Vlan { .. } => link.is("vlan"),
         InterfaceKind::Bridge => link.is("bridge"),
         InterfaceKind::Loopback => link.is("dummy"),
@@ -239,14 +240,19 @@ fn base(link: &KernelLink, claim: Option<&InterfaceKind>, policy: &Policy) -> Ow
     // seeded and adopted as an interface of type `wifi` (`label`). Taken
     // for a port, it got the ports' settings and a place in the console
     // setup's list.
-    // G1.30m: a station's four-address link that no peer of the
-    // configuration names: hostapd's (just made, or a station that is not a
-    // registered peer and is being sent away). Never adopted as a radio.
+    // G1.30m: a station's four-address link (hostapd's AP_VLAN) and the
+    // bridge and veth end that carry a peer's link to it (`crate::wifi_ap`):
+    // the radio's thread keeps them, never the configuration's apply.
     if link.wifi_vlan {
         return ext(
-            "a station's four-address link that hostapd made; it is named after the \
-                    peer once registered (interface.wifi.peer.add)"
+            "a station's four-address link that hostapd made; a registered peer's \
+                    traffic reaches it through the peer's interface (interface.wifi.peer.add)"
                 .into(),
+        );
+    }
+    if crate::wifi_ap::internal_link(&link.name) {
+        return ext(
+            "a Wi-Fi peer's internal bridge or veth end (the radio's thread keeps it)".into(),
         );
     }
     if link.wireless && link.kind.is_none() {
@@ -380,7 +386,7 @@ mod tests {
         let mut vlan = link(10, "wifi1.sta1", None);
         vlan.wireless = true;
         vlan.wifi_vlan = true;
-        assert_eq!(vlan.label(), "wifi-peer");
+        assert_eq!(vlan.label(), "wifi-vlan");
         assert!(!vlan.physical() && !vlan.port_like());
         let p = Policy::default();
         assert!(
@@ -391,14 +397,24 @@ mod tests {
             radio: "wifi1".parse().unwrap(),
             mac: "02:00:00:00:00:01".parse().unwrap(),
         }));
-        let mut named = vlan.clone();
-        named.name = "peer1".into();
-        assert_eq!(base(&named, Some(&peer), &p), Owner::Managed);
+        // The peer's interface is the veth end; the private bridge and the
+        // other end are the radio thread's.
+        let veth = link(11, "peer1", Some("veth"));
+        assert_eq!(base(&veth, Some(&peer), &p), Owner::Managed);
         let radio_claim = InterfaceKind::Wifi(Box::default());
         assert!(matches!(
-            base(&named, Some(&radio_claim), &p),
+            base(&vlan, Some(&radio_claim), &p),
             Owner::Conflict(_)
         ));
+        for internal in [
+            link(12, "wpb10", Some("bridge")),
+            link(13, "wpv10", Some("veth")),
+        ] {
+            assert!(
+                matches!(base(&internal, None, &p), Owner::External(_)),
+                "{internal:?}"
+            );
+        }
         let mut ppp = link(3, "ppp0", None);
         ppp.arphrd = ARPHRD_PPP;
         assert_eq!(ppp.label(), "ppp");

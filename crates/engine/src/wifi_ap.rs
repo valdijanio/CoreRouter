@@ -256,29 +256,6 @@ struct Told {
     country: String,
     bridge: Option<IfName>,
     backhaul: Option<ApBackhaul>,
-    mac_from: Option<IfName>,
-}
-
-/// G1.30m: the access point whose MAC `name` takes: the first (by name)
-/// of the access points whose peers are slaves of a bond one of `name`'s
-/// peers is in, when it is not `name` itself (`WifiAp::mac_from`).
-pub(crate) fn mac_source(cfg: &Config, name: &IfName) -> Option<IfName> {
-    let peer_of = |i: &corerouter_model::Interface| match &i.kind {
-        InterfaceKind::WifiPeer(p) => Some(p.radio.clone()),
-        _ => None,
-    };
-    let bonds: Vec<&IfName> = cfg
-        .interfaces
-        .values()
-        .filter(|i| peer_of(i).as_ref() == Some(name))
-        .filter_map(|i| i.bond.as_ref())
-        .collect();
-    cfg.interfaces
-        .values()
-        .filter(|i| i.bond.as_ref().is_some_and(|b| bonds.contains(&b)))
-        .filter_map(peer_of)
-        .min()
-        .filter(|first| first != name)
 }
 
 /// G1.30m: the station-bridges access point `name` takes: its registered
@@ -396,7 +373,6 @@ impl Session {
         let country = cfg.system.wifi.country.map(|c| c.to_string());
         let bridge = cfg.interfaces.get(name).and_then(|i| i.bridge.clone());
         let backhaul = want.and_then(|st| backhaul_of(cfg, name, st));
-        let mac_from = backhaul.as_ref().and_then(|_| mac_source(cfg, name));
         let mut notes: Vec<(&'static str, String)> = Vec::new();
         let Some(st) = want else {
             if let Some(mut r) = self.wifi_rt().and_then(|rt| rt.aps.remove(name))
@@ -460,7 +436,6 @@ impl Session {
                     && t.country == country
                     && t.bridge == bridge
                     && t.backhaul == backhaul
-                    && t.mac_from == mac_from
                     && (st.frequency.is_none() || st.frequency == Some(t.plan.frequency_mhz))
                     && st.width.is_none_or(|w| w == t.plan.width_mhz)
             });
@@ -516,7 +491,6 @@ impl Session {
                 he: plan.he,
                 radar: plan.radar,
                 backhaul: backhaul.clone(),
-                mac_from: mac_from.as_ref().map(ToString::to_string),
             };
             let Some(p) = r.port.as_mut() else { return };
             match p.start(&ap) {
@@ -542,7 +516,6 @@ impl Session {
                         country,
                         bridge,
                         backhaul,
-                        mac_from,
                     });
                     r.plan = Some(plan);
                     r.error = None;

@@ -304,6 +304,7 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
         min_links: 0,
     };
     let settings = start.update(p, &slaves)?;
+    wifi_mode_problem(cfg, mode, &slaves)?;
     let mtu = match mtu {
         Some(m) => m,
         None => slaves
@@ -334,32 +335,39 @@ fn wifi_warnings(cfg: &Config, mode: BondMode, slaves: &[IfName]) -> Vec<String>
     if wifi.is_empty() {
         return out;
     }
-    match mode {
-        BondMode::BalanceRr => out.push(
+    if mode == BondMode::BalanceRr {
+        out.push(
             "balance-rr over Wi-Fi links: their rates differ and change with the air, so TCP \
              segments arrive out of order and a flow goes no faster than the slowest link. \
-             802.3ad (LACP, each flow on one link) or active-backup suit Wi-Fi better"
+             balance-xor (each flow on one link) or active-backup suit Wi-Fi better"
                 .to_owned(),
-        ),
-        BondMode::Lacp => out.push(
-            "802.3ad: the bond at the other end must be 802.3ad too (LACP); each flow stays on \
-             one link, so a single download goes no faster than one link"
-                .to_owned(),
-        ),
-        _ => {}
+        );
     }
-    let peers = wifi
+    let stations = wifi
         .iter()
-        .any(|n| matches!(cfg.interfaces.get(*n).map(|i| &i.kind), Some(InterfaceKind::WifiPeer(_))));
-    if peers {
+        .any(|n| matches!(cfg.interfaces.get(*n).map(|i| &i.kind), Some(InterfaceKind::Wifi(_))));
+    if stations {
         out.push(
-            "the bond gives its slaves one MAC: the access points of these peers take the MAC \
-             of the first of them, and the station-bridges at the other end, the MAC of their \
-             own bond, which is what to register as the peers' mac_address there"
+            "the bond gives its slaves its own MAC: the station-bridges join with it, so it is \
+             the MAC to register for each of them on the access points at the other end \
+             (interface.wifi.peer.add mac_address=…)"
                 .to_owned(),
         );
     }
     out
+}
+
+/// G1.30m: a Wi-Fi slave in a mode that needs speed and duplex.
+fn wifi_mode_problem(cfg: &Config, mode: BondMode, slaves: &[IfName]) -> Result<()> {
+    let wifi = slaves.iter().any(|n| {
+        cfg.interfaces
+            .get(n)
+            .is_some_and(|i| matches!(i.kind, InterfaceKind::Wifi(_) | InterfaceKind::WifiPeer(_)))
+    });
+    match corerouter_model::wifi::bond_mode_problem(mode).filter(|_| wifi) {
+        Some(why) => Err(EngineError::bad("mode", why)),
+        None => Ok(()),
+    }
 }
 
 fn set(s: &mut Session, p: &Value) -> Result<Value> {
@@ -386,6 +394,7 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let settings = current.update(p, &slaves)?;
     let mode = settings.mode;
+    wifi_mode_problem(cfg, mode, &slaves)?;
     let mtu = mtu.unwrap_or(old_mtu);
     set_slaves(cfg, &name, &slaves, mtu)?;
     if let Some(bond) = cfg.interfaces.get_mut(&name) {

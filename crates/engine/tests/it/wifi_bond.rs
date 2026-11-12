@@ -1,7 +1,7 @@
 //! G1.30m part 2 — bonding over Wi-Fi backhaul links: station-bridge
-//! radios and peers' links as slaves in any mode, the warnings, the access
-//! points of one bond's peers sharing a MAC, the airtime per peer; success,
-//! validation and rollback.
+//! radios and peers' links as slaves, the warnings, the airtime per peer; success,
+//! validation and rollback. (802.3ad and balance-tlb/alb are refused: the
+//! kernel needs a slave's speed and duplex, which Wi-Fi does not report.)
 // Shared helpers are not `#[test]` fns, so clippy's in-tests allowances skip them.
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
@@ -71,12 +71,27 @@ fn station_bridges_are_slaves_in_any_mode_with_the_warnings() {
                    "passphrase": LAB_PASSPHRASE, "disabled": false}),
         );
     }
+    // LACP needs the slaves' speed and duplex; Wi-Fi reports none.
+    for mode in ["802.3ad", "balance-tlb", "balance-alb"] {
+        fails(
+            &mut s,
+            "interface.bonding.add",
+            json!({"name": "bond1", "slaves": ["wifi1", "wifi2"], "mode": mode}),
+            "speed and duplex",
+        );
+    }
     let r = run(
         &mut s,
         "interface.bonding.add",
-        json!({"name": "bond1", "slaves": ["wifi1", "wifi2"], "mode": "802.3ad"}),
+        json!({"name": "bond1", "slaves": ["wifi1", "wifi2"], "mode": "balance-xor"}),
     );
-    assert!(r["warnings"].to_string().contains("802.3ad too"), "{r}");
+    assert!(r["warnings"].to_string().contains("MAC to register"), "{r}");
+    fails(
+        &mut s,
+        "interface.bonding.set",
+        json!({"name": "bond1", "mode": "802.3ad"}),
+        "speed and duplex",
+    );
     let r = run(
         &mut s,
         "interface.bonding.set",
@@ -88,7 +103,7 @@ fn station_bridges_are_slaves_in_any_mode_with_the_warnings() {
         "interface.bonding.set",
         json!({"name": "bond1", "mode": "active-backup", "primary": "wifi1"}),
     );
-    assert_eq!(r["warnings"], json!([]), "{r}");
+    assert!(!r["warnings"].to_string().contains("out of order"), "{r}");
     let list = run(&mut s, "interface.bonding.list", json!({}));
     assert_eq!(list[0]["slaves"], json!(["wifi1", "wifi2"]), "{list}");
     // A slave's radio cannot go back to a plain station (the commit says so).
@@ -129,7 +144,7 @@ fn a_plain_station_and_an_access_point_are_refused_with_the_reason() {
 }
 
 #[test]
-fn the_access_points_of_one_bonds_peers_share_a_mac() {
+fn the_peers_of_two_access_points_are_a_bond_with_their_airtime() {
     let (mut s, air) = lab();
     for (r, freq) in [("wifi1", "36"), ("wifi2", "149")] {
         run(
@@ -149,23 +164,18 @@ fn the_access_points_of_one_bonds_peers_share_a_mac() {
         );
     }
     let before = s.store().current_revision();
-    let r = run(
+    run(
         &mut s,
         "interface.bonding.add",
-        json!({"name": "bond1", "slaves": ["peer1", "peer2"], "mode": "802.3ad"}),
+        json!({"name": "bond1", "slaves": ["peer1", "peer2"], "mode": "active-backup"}),
     );
-    assert!(r["warnings"].to_string().contains("one MAC"), "{r}");
     run(
         &mut s,
         "ip.address.add",
         json!({"address": "10.9.0.1/30", "interface": "bond1"}),
     );
     spin(&mut s, 10_000, 12);
-    assert_eq!(air.ap_told(&n("wifi1")).unwrap().mac_from, None);
-    assert_eq!(
-        air.ap_told(&n("wifi2")).unwrap().mac_from.as_deref(),
-        Some("wifi1")
-    );
+    assert!(air.ap_told(&n("wifi2")).unwrap().backhaul.unwrap().only);
     let peers = run(&mut s, "interface.wifi.peer.print", json!({}));
     for p in peers.as_array().unwrap() {
         assert_eq!(p["state"], "up", "{peers}");
@@ -176,12 +186,11 @@ fn the_access_points_of_one_bonds_peers_share_a_mac() {
             "{peers}"
         );
     }
-    // Rollback: no bond, and the access points keep their own MACs.
+    // Rollback: no bond.
     run(&mut s, "config.rollback", json!({"revision": before}));
     if s.store().is_dirty() {
         run(&mut s, "config.commit", json!({}));
     }
     spin(&mut s, 30_000, 4);
     assert!(!s.store().running().interfaces.contains_key(&n("bond1")));
-    assert_eq!(air.ap_told(&n("wifi2")).unwrap().mac_from, None);
 }

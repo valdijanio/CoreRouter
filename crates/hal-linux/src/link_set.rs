@@ -1,25 +1,33 @@
 //! G1.30m: small, synchronous link changes for the Wi-Fi radios' threads,
 //! which are not in the async runtime of the configuration's apply
-//! (`netlink.rs`): rename a link, give it a master (a bridge or a bond) or
-//! none, give it a MAC. One `RTM_NEWLINK` with an ack each. (A wireless
-//! netdev is deleted by nl80211, not here: cfg80211 registers no
-//! `rtnl_link_ops`.)
+//! (`netlink.rs`): give a link a master (a bridge or a bond) or none, bring
+//! it up, make a bridge or a veth pair, delete one. One `RTM_NEWLINK` or
+//! `RTM_DELLINK` with an ack each.
 //!
-//! Used where a link comes and goes on its own, outside a commit: a
+//! Used where links come and go on their own, outside a commit: a
 //! station-bridge joins its bridge once its frames carry four addresses,
-//! and the four-address link of a peer (`<radio>.sta<aid>`, made by
-//! hostapd) gets the peer's name and master when the peer associates.
+//! and a peer's link is made when the peer associates (`crate::wifi_ap`).
 
 use std::io;
 
 use netlink_sys::{Socket, SocketAddr as NlAddr, protocols::NETLINK_ROUTE};
 
 const RTM_NEWLINK: u16 = 16;
+const RTM_DELLINK: u16 = 17;
 const NLM_F_REQUEST: u16 = 1;
 const NLM_F_ACK: u16 = 4;
+const NLM_F_EXCL: u16 = 0x200;
+const NLM_F_CREATE: u16 = 0x400;
 const NLMSG_ERROR: u16 = 2;
 const IFLA_IFNAME: u16 = 3;
 const IFLA_MASTER: u16 = 10;
+const IFLA_LINKINFO: u16 = 18;
+const IFLA_INFO_KIND: u16 = 1;
+const IFLA_INFO_DATA: u16 = 2;
+/// `VETH_INFO_PEER` (`include/uapi/linux/veth.h`).
+const VETH_INFO_PEER: u16 = 1;
+/// `NLA_F_NESTED`.
+const NESTED: u16 = 0x8000;
 const IFF_UP: u32 = 1;
 /// `IFNAMSIZ` − 1.
 const MAX_NAME: usize = 15;
@@ -28,6 +36,13 @@ fn index(name: &str) -> io::Result<i32> {
     let i = nix::net::if_::if_nametoindex(name)
         .map_err(|e| io::Error::other(format!("{name}: {e}")))?;
     i32::try_from(i).map_err(|_| io::Error::other("ifindex out of range"))
+}
+
+fn checked(name: &str) -> io::Result<()> {
+    if name.is_empty() || name.len() > MAX_NAME {
+        return Err(io::Error::other("bad interface name"));
+    }
+    Ok(())
 }
 
 fn attr(out: &mut Vec<u8>, kind: u16, value: &[u8]) {
@@ -40,20 +55,41 @@ fn attr(out: &mut Vec<u8>, kind: u16, value: &[u8]) {
     }
 }
 
+fn name_attr(out: &mut Vec<u8>, name: &str) {
+    let mut n = name.as_bytes().to_vec();
+    n.push(0);
+    attr(out, IFLA_IFNAME, &n);
+}
+
+/// An `ifinfomsg` (16 bytes): family, type, index, flags, change.
+fn ifinfo(index: i32, flags: u32, change: u32) -> Vec<u8> {
+    let mut m = Vec::with_capacity(16);
+    m.extend_from_slice(&[0, 0]); // ifi_family, pad
+    m.extend_from_slice(&0u16.to_ne_bytes()); // ifi_type
+    m.extend_from_slice(&index.to_ne_bytes());
+    m.extend_from_slice(&flags.to_ne_bytes());
+    m.extend_from_slice(&change.to_ne_bytes());
+    m
+}
+
 /// One link request and its ack.
-fn request(kind: u16, index: i32, flags: u32, change: u32, attrs: &[u8]) -> io::Result<()> {
-    let total = 32 + attrs.len();
+fn request(
+    kind: u16,
+    extra: u16,
+    index: i32,
+    flags: u32,
+    change: u32,
+    attrs: &[u8],
+) -> io::Result<()> {
+    let body = ifinfo(index, flags, change);
+    let total = 16 + body.len() + attrs.len();
     let mut msg = Vec::with_capacity(total);
     msg.extend_from_slice(&u32::try_from(total).unwrap_or(0).to_ne_bytes());
     msg.extend_from_slice(&kind.to_ne_bytes());
-    msg.extend_from_slice(&(NLM_F_REQUEST | NLM_F_ACK).to_ne_bytes());
+    msg.extend_from_slice(&(NLM_F_REQUEST | NLM_F_ACK | extra).to_ne_bytes());
     msg.extend_from_slice(&1u32.to_ne_bytes()); // seq
     msg.extend_from_slice(&0u32.to_ne_bytes()); // pid
-    msg.extend_from_slice(&[0, 0]); // ifi_family, pad
-    msg.extend_from_slice(&0u16.to_ne_bytes()); // ifi_type
-    msg.extend_from_slice(&index.to_ne_bytes());
-    msg.extend_from_slice(&flags.to_ne_bytes());
-    msg.extend_from_slice(&change.to_ne_bytes());
+    msg.extend_from_slice(&body);
     msg.extend_from_slice(attrs);
     let mut sock = Socket::new(NETLINK_ROUTE)?;
     sock.bind_auto()?;
@@ -78,30 +114,15 @@ fn request(kind: u16, index: i32, flags: u32, change: u32, attrs: &[u8]) -> io::
     }
 }
 
-fn set_up(index: i32, up: bool) -> io::Result<()> {
-    request(RTM_NEWLINK, index, if up { IFF_UP } else { 0 }, IFF_UP, &[])
-}
-
-/// Rename `from` to `to`: down, renamed, up again (the kernel refuses to
-/// rename a link that is up).
-pub(crate) fn rename(from: &str, to: &str) -> io::Result<()> {
-    if to.is_empty() || to.len() > MAX_NAME {
-        return Err(io::Error::other("bad interface name"));
-    }
-    let i = index(from)?;
-    set_up(i, false)?;
-    let mut name = to.as_bytes().to_vec();
-    name.push(0);
-    let mut a = Vec::new();
-    attr(&mut a, IFLA_IFNAME, &name);
-    let r = request(RTM_NEWLINK, i, 0, 0, &a);
-    set_up(i, true)?;
-    r
+/// Bring `name` up.
+pub(crate) fn up(name: &str) -> io::Result<()> {
+    request(RTM_NEWLINK, 0, index(name)?, IFF_UP, IFF_UP, &[])
 }
 
 /// Give `name` the master `master` (a bridge or a bond), or none. A bond
 /// takes a slave only while it is down: it goes down first and comes up
-/// after.
+/// after. (Never call it with a bond on an AP_VLAN: down, it loses its
+/// station, `net/mac80211/iface.c` `ieee80211_do_stop`.)
 pub(crate) fn set_master(name: &str, master: Option<&str>) -> io::Result<()> {
     let i = index(name)?;
     let m = match master {
@@ -117,43 +138,54 @@ pub(crate) fn set_master(name: &str, master: Option<&str>) -> io::Result<()> {
             .exists()
     });
     if bond {
-        set_up(i, false)?;
+        request(RTM_NEWLINK, 0, i, 0, IFF_UP, &[])?;
     }
-    let r = request(RTM_NEWLINK, i, 0, 0, &a);
+    let r = request(RTM_NEWLINK, 0, i, 0, 0, &a);
     if bond {
-        set_up(i, true)?;
+        request(RTM_NEWLINK, 0, i, IFF_UP, IFF_UP, &[])?;
     }
     r
 }
 
-/// `IFLA_ADDRESS`.
-const IFLA_ADDRESS: u16 = 1;
-
-/// The MAC of `name` now (`/sys/class/net/<name>/address`).
-pub(crate) fn mac_of(name: &str) -> Option<[u8; 6]> {
-    let text = std::fs::read_to_string(
-        std::path::Path::new("/sys/class/net")
-            .join(name)
-            .join("address"),
+/// A bridge `name`, up.
+pub(crate) fn add_bridge(name: &str) -> io::Result<()> {
+    checked(name)?;
+    let mut info = Vec::new();
+    attr(&mut info, IFLA_INFO_KIND, b"bridge");
+    let mut a = Vec::new();
+    name_attr(&mut a, name);
+    attr(&mut a, IFLA_LINKINFO | NESTED, &info);
+    request(
+        RTM_NEWLINK,
+        NLM_F_CREATE | NLM_F_EXCL,
+        0,
+        IFF_UP,
+        IFF_UP,
+        &a,
     )
-    .ok()?;
-    let mut out = [0u8; 6];
-    let mut parts = text.trim().split(':');
-    for b in &mut out {
-        *b = u8::from_str_radix(parts.next()?, 16).ok()?;
-    }
-    parts.next().is_none().then_some(out)
 }
 
-/// Give `name` the MAC `mac`, leaving it down (mac80211 takes a new
-/// address only on an interface that is down: `iface.c`,
-/// `_ieee80211_change_mac`); whoever brings it up next (hostapd) does.
-pub(crate) fn set_mac(name: &str, mac: [u8; 6]) -> io::Result<()> {
-    let i = index(name)?;
-    set_up(i, false)?;
+/// A veth pair `name` ↔ `peer`, both down.
+pub(crate) fn add_veth(name: &str, peer: &str) -> io::Result<()> {
+    checked(name)?;
+    checked(peer)?;
+    let mut peer_msg = ifinfo(0, 0, 0);
+    name_attr(&mut peer_msg, peer);
+    let mut data = Vec::new();
+    attr(&mut data, VETH_INFO_PEER | NESTED, &peer_msg);
+    let mut info = Vec::new();
+    attr(&mut info, IFLA_INFO_KIND, b"veth");
+    attr(&mut info, IFLA_INFO_DATA | NESTED, &data);
     let mut a = Vec::new();
-    attr(&mut a, IFLA_ADDRESS, &mac);
-    request(RTM_NEWLINK, i, 0, 0, &a)
+    name_attr(&mut a, name);
+    attr(&mut a, IFLA_LINKINFO | NESTED, &info);
+    request(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, 0, 0, 0, &a)
+}
+
+/// Delete link `name` (a bridge or a veth this made; a wireless netdev is
+/// not deleted this way: cfg80211 registers no `rtnl_link_ops`).
+pub(crate) fn delete(name: &str) -> io::Result<()> {
+    request(RTM_DELLINK, 0, index(name)?, 0, 0, &[])
 }
 
 /// The master of `name` now, by name; `None`: none (or no such link).
@@ -173,10 +205,11 @@ mod tests {
     #[test]
     fn attributes_are_padded_and_names_checked() {
         let mut a = Vec::new();
-        attr(&mut a, IFLA_IFNAME, b"peer1\0");
+        name_attr(&mut a, "peer1");
         assert_eq!(a.len(), 12);
         assert_eq!(a.get(0..2), Some(&10u16.to_ne_bytes()[..]));
-        assert!(rename("x", "").is_err());
-        assert!(rename("x", "a-name-too-long-x").is_err());
+        assert_eq!(ifinfo(7, 1, 1).len(), 16);
+        assert!(add_bridge("").is_err());
+        assert!(add_veth("peer1", "a-name-too-long-x").is_err());
     }
 }
