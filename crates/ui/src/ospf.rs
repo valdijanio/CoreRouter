@@ -23,6 +23,8 @@ use crate::{CoreRouterUi, Then, Win, value_text};
 
 pub(crate) const NAME: &str = "ospf";
 pub(crate) const WIN: &str = "ospf";
+/// Rows per page of LSDB and Routes.
+const PAGE: u32 = 200;
 /// Labels' scope (`i18n/auto/ospf_*.rs`).
 pub(crate) const SCOPE: &str = "ospf";
 
@@ -263,6 +265,16 @@ pub(crate) struct OspfPanel {
     pub(crate) instance: String,
     pub(crate) lsa_type: String,
     pub(crate) lsa_page: u32,
+    /// G3.4n: the page of Routes, and the search sent with it (the search
+    /// of prefixes runs on the router, over every route).
+    pub(crate) route_page: u32,
+    pub(crate) route_find: String,
+    /// G3.4n: the rows of Neighbors, LSDB and Routes, built when the answer
+    /// arrives instead of each frame (10 000 routes cost 58 ms a frame,
+    /// **medido**).
+    nbr_rows: Vec<Row>,
+    lsa_rows: Vec<Row>,
+    route_rows: Vec<Row>,
     /// "Why this path?" destination (typed, or a click in the topology).
     pub(crate) path_to: String,
     pub(crate) path_asked: Option<String>,
@@ -292,7 +304,7 @@ pub(crate) struct OspfPanel {
     tpl_table: TableState,
     kc_table: TableState,
     lsa_table: TableState,
-    route_table: TableState,
+    pub(crate) route_table: TableState,
     pub(crate) modal: Option<(What, Modal)>,
     pub(crate) help: Option<HelpView>,
 }
@@ -323,8 +335,32 @@ fn list_of(r: &Value, k: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn rows_of(v: &Value) -> Vec<Value> {
-    v.get("rows").and_then(Value::as_array).cloned().unwrap_or_default()
+/// "1–200 of 3000" with `<` `>` under a paged list (the BGP › Routes
+/// pager); nothing when it all fits one page.
+fn pager(ui: &mut Ui, app: &mut CoreRouterUi, page: &mut u32, total: u64) {
+    let size = u64::from(PAGE);
+    let first = u64::from(*page) * size;
+    if total <= size && *page == 0 {
+        return;
+    }
+    let l = app.lang.labels;
+    ui.horizontal(|ui| {
+        let last = (first + size).min(total);
+        ui.weak(format!("{}–{last} {} {total}", first + 1, tr_in(SCOPE, l, "of")));
+        if ui.add_enabled(*page > 0, egui::Button::new("<")).clicked() {
+            *page -= 1;
+            app.cache.refreshed_at = None;
+        }
+        if ui.add_enabled(last < total, egui::Button::new(">")).clicked() {
+            *page += 1;
+            app.cache.refreshed_at = None;
+        }
+    });
+}
+
+/// The `rows` of an answer, borrowed.
+fn rows_of(v: &Value) -> &[Value] {
+    v.get("rows").and_then(Value::as_array).map_or(&[], Vec::as_slice)
 }
 
 /// The area id as a selo colored by the id (the same area, the same color
@@ -732,7 +768,7 @@ impl OspfPanel {
         });
     }
 
-    fn source_note(&self, app: &CoreRouterUi, ui: &mut Ui, v: &Value) {
+    fn source_note(app: &CoreRouterUi, ui: &mut Ui, v: &Value) {
         let l = app.lang.labels;
         if flag(v, "pending") {
             ui.weak(tr_in(SCOPE, l, "Reading the database from the routing daemon…"));
@@ -748,31 +784,32 @@ impl OspfPanel {
     fn neighbors_tab(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
         let l = app.lang.labels;
         let data = rows_of(&self.neighbors);
-        let rows: Vec<Row> = data.iter().map(nbr_row).collect();
-        let selection = self.nbr_table.selection(&rows);
+        let rows = &self.nbr_rows;
+        let selection = self.nbr_table.selection(rows);
         ui.horizontal(|ui| {
-            self.source_note(app, ui, &self.neighbors.clone());
+            Self::source_note(app, ui, &self.neighbors);
             table::find_field(ui, NBR, &mut self.nbr_table);
         });
         ui.separator();
-        let picked = selection.as_slice().first().and_then(|k| data.iter().zip(&rows).find(|(_, r)| &r.key == k)).map(|(d, _)| d.clone());
+        let picked = selection.as_slice().first().and_then(|k| data.iter().zip(rows).find(|(_, r)| &r.key == k)).map(|(d, _)| d.clone());
         let detail_h = if picked.is_some() { 190.0 } else { 0.0 };
         let footer_h = ui.spacing().interact_size.y + 6.0 + detail_h;
         self.nbr_table.empty = tr_in(SCOPE, l, "No neighbor: add an instance, an area and an interface template.").to_owned();
-        let out = table::show(ui, NBR, footer_h, &mut self.nbr_table, &NBR_COLUMNS, &rows, |_, _| {});
+        let out = table::show(ui, NBR, footer_h, &mut self.nbr_table, &NBR_COLUMNS, rows, |_, _| {});
+        let full = data.iter().filter(|r| r.get("state").and_then(Value::as_str) == Some("Full")).count();
+        let count = data.len();
         self.column_help(app, out.help, &NBR_COLUMNS);
         if let Some(r) = picked {
             ui.separator();
             self.neighbor_detail(app, ui, &r);
         }
         let v = ui.visuals().clone();
-        let full = data.iter().filter(|r| s(r, "state") == "Full").count();
         list::footer(
             ui,
             &[
-                (data.len(), "neighbors", chip::neutral_tone(&v)),
+                (count, "neighbors", chip::neutral_tone(&v)),
                 (full, "full", chip::GREEN.tone(&v)),
-                (data.len() - full, "not full", chip::AMBER.tone(&v)),
+                (count - full, "not full", chip::AMBER.tone(&v)),
             ],
             l,
         );
@@ -1033,26 +1070,13 @@ impl OspfPanel {
             }
             table::find_field(ui, LSDB, &mut self.lsa_table);
         });
-        ui.horizontal(|ui| self.source_note(app, ui, &self.lsas.clone()));
+        ui.horizontal(|ui| Self::source_note(app, ui, &self.lsas));
         ui.separator();
-        let data = rows_of(&self.lsas);
-        let rows: Vec<Row> = data.iter().map(lsa_row).collect();
         let footer_h = ui.spacing().interact_size.y * 2.0 + 8.0;
-        let out = table::show(ui, LSDB, footer_h, &mut self.lsa_table, &LSA_COLUMNS, &rows, |_, _| {});
+        let out = table::show(ui, LSDB, footer_h, &mut self.lsa_table, &LSA_COLUMNS, &self.lsa_rows, |_, _| {});
         self.column_help(app, out.help, &LSA_COLUMNS);
         let total = self.lsas.get("total").and_then(Value::as_u64).unwrap_or(0);
-        ui.horizontal(|ui| {
-            let pages = total.div_ceil(200).max(1);
-            if ui.add_enabled(self.lsa_page > 0, egui::Button::new("◀")).clicked() {
-                self.lsa_page -= 1;
-                app.cache.refreshed_at = None;
-            }
-            ui.label(format!("{} / {pages}", self.lsa_page + 1));
-            if ui.add_enabled(u64::from(self.lsa_page + 1) < pages, egui::Button::new("▶")).clicked() {
-                self.lsa_page += 1;
-                app.cache.refreshed_at = None;
-            }
-        });
+        pager(ui, app, &mut self.lsa_page, total);
         let v = ui.visuals().clone();
         let by = self.lsas.get("by_type").cloned().unwrap_or(Value::Null);
         let n = |k: &str| by.get(k).and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -1075,15 +1099,19 @@ impl OspfPanel {
             ui.separator();
             table::find_field(ui, ROUTES, &mut self.route_table);
         });
-        ui.horizontal(|ui| self.source_note(app, ui, &self.routes.clone()));
+        ui.horizontal(|ui| Self::source_note(app, ui, &self.routes));
+        // A new search starts at the first page.
+        if self.route_table.filter.trim() != self.route_find {
+            self.route_find = self.route_table.filter.trim().to_owned();
+            self.route_page = 0;
+            app.cache.refreshed_at = None;
+        }
         self.path_bar(app, ui);
         ui.separator();
-        let data = rows_of(&self.routes);
-        let rows: Vec<Row> = data.iter().map(route_row).collect();
-        let selection = self.route_table.selection(&rows);
+        let selection = self.route_table.selection(&self.route_rows);
         let path_h = if self.path.get("hops").is_some() { 130.0 } else { 0.0 };
-        let footer_h = ui.spacing().interact_size.y + 6.0 + path_h;
-        let out = table::show(ui, ROUTES, footer_h, &mut self.route_table, &ROUTE_COLUMNS, &rows, |_, _| {});
+        let footer_h = ui.spacing().interact_size.y * 2.0 + 8.0 + path_h;
+        let out = table::show(ui, ROUTES, footer_h, &mut self.route_table, &ROUTE_COLUMNS, &self.route_rows, |_, _| {});
         self.column_help(app, out.help, &ROUTE_COLUMNS);
         if let Some(k) = selection.as_slice().first()
             && k.as_str() != self.path_asked.as_deref().unwrap_or("")
@@ -1098,14 +1126,18 @@ impl OspfPanel {
             ui.separator();
             self.path_view(app, ui);
         }
+        let total = self.routes.get("total").and_then(Value::as_u64).unwrap_or(self.route_rows.len() as u64);
+        pager(ui, app, &mut self.route_page, total);
         let v = ui.visuals().clone();
+        let by = self.routes.get("by_kind");
+        let n = |k: &str| by.and_then(|b| b.get(k)).and_then(Value::as_u64).unwrap_or(0) as usize;
         list::footer(
             ui,
             &[
-                (data.len(), "routes", chip::neutral_tone(&v)),
-                (list::count(&data, "kind", "intra-area"), "intra-area", chip::neutral_tone(&v)),
-                (list::count(&data, "kind", "inter-area"), "inter-area", chip::BLUE.tone(&v)),
-                (data.iter().filter(|r| s(r, "kind").starts_with("ext")).count(), "external", chip::AMBER.tone(&v)),
+                (total as usize, "routes", chip::neutral_tone(&v)),
+                (n("intra-area"), "intra-area", chip::neutral_tone(&v)),
+                (n("inter-area"), "inter-area", chip::BLUE.tone(&v)),
+                (n("external"), "external", chip::AMBER.tone(&v)),
             ],
             l,
         );
@@ -1219,7 +1251,7 @@ impl PanelState for OspfPanel {
                 }
             }
             Tab::Lsdb if !self.instance.is_empty() => {
-                let mut p = json!({"instance": self.instance, "offset": self.lsa_page * 200, "limit": 200});
+                let mut p = json!({"instance": self.instance, "offset": self.lsa_page * PAGE, "limit": PAGE});
                 if !self.lsa_type.is_empty()
                     && let Some(o) = p.as_object_mut()
                 {
@@ -1229,13 +1261,23 @@ impl PanelState for OspfPanel {
             }
             Tab::Routes | Tab::Topology if !self.instance.is_empty() => {
                 if self.tab == Tab::Routes {
-                    q("routes", "routing.ospf.route.list", json!({"instance": self.instance}));
-                } else {
-                    let mut p = json!({"instance": self.instance});
-                    if !self.topo.area.is_empty()
+                    let mut p = json!({"instance": self.instance, "offset": self.route_page * PAGE, "limit": PAGE});
+                    if !self.route_find.is_empty()
                         && let Some(o) = p.as_object_mut()
                     {
-                        o.insert("area".into(), json!(self.topo.area));
+                        o.insert("find".into(), json!(self.route_find));
+                    }
+                    q("routes", "routing.ospf.route.list", p);
+                } else {
+                    let mut p = json!({"instance": self.instance});
+                    if let Some(o) = p.as_object_mut() {
+                        if !self.topo.area.is_empty() {
+                            o.insert("area".into(), json!(self.topo.area));
+                        }
+                        // G3.4n: the map held is not sent again.
+                        if !self.topo.token.is_empty() && !self.topo.nodes.is_empty() {
+                            o.insert("known".into(), json!(self.topo.token));
+                        }
                     }
                     q("topology", "routing.ospf.topology", p);
                     q("neighbors", "routing.ospf.neighbor.list", json!({}));
@@ -1266,13 +1308,24 @@ impl PanelState for OspfPanel {
             "areas" => self.areas = arr(value),
             "templates" => self.templates = arr(value),
             "keychains" => self.keychains = arr(value),
-            "neighbors" => self.neighbors = value,
+            "neighbors" => {
+                self.nbr_rows = rows_of(&value).iter().map(nbr_row).collect();
+                self.neighbors = value;
+            }
             "diagnose" => self.diagnose = value,
-            "lsas" => self.lsas = value,
-            "routes" => self.routes = value,
+            "lsas" => {
+                self.lsa_rows = rows_of(&value).iter().map(lsa_row).collect();
+                self.lsas = value;
+            }
+            "routes" => {
+                self.route_rows = rows_of(&value).iter().map(route_row).collect();
+                self.routes = value;
+            }
             "topology" => {
                 self.topo.arrived(&value);
-                self.topology = value;
+                if value.get("unchanged").and_then(Value::as_bool) != Some(true) {
+                    self.topology = value;
+                }
             }
             "path" => self.path = value,
             "sr" => self.sr = value,

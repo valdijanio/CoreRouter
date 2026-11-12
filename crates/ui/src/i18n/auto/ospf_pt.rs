@@ -150,6 +150,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"differs"##, r##"difere"##),
     (r##"error"##, r##"erro"##),
     (r##"layout"##, r##"layout"##),
+    (r##"of"##, r##"de"##),
     (r##"priority"##, r##"prioridade"##),
     (r##"protected"##, r##"protegidos"##),
     (r##"retransmit"##, r##"retransmissão"##),

@@ -11,6 +11,7 @@
 //! Without a routing backend (the virtual lab) everything comes from
 //! `proto_ospf::sample`, made up from the config.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -72,8 +73,7 @@ impl Session {
     /// The LSDB and routes of OSPF instance `instance`.
     pub fn ospf_db(&mut self, instance: &str) -> DbView {
         if !self.has_routing() {
-            let cfg = self.store().running().clone();
-            let (_, _, db, routes) = corerouter_proto_ospf::sample::lab(&cfg, instance);
+            let (_, _, db, routes) = corerouter_proto_ospf::sample::lab(self.store().running(), instance);
             return DbView::Sample(Arc::new((db, routes)));
         }
         let now = self.hal_now().unwrap_or(0);
@@ -131,13 +131,15 @@ impl Session {
         (rows, "virtual lab sample")
     }
 
-    /// The neighbors and interfaces: the last poll, or the lab's.
-    pub fn ospf_live(&self) -> (Vec<OspfNeighbor>, Vec<OspfIfState>, &'static str) {
+    /// The neighbors and interfaces: the last poll (borrowed, G3.4n: a
+    /// query used to copy 4 000 interfaces and 500 neighbors under the
+    /// lock to read a few), or the lab's.
+    pub fn ospf_live(&self) -> (Cow<'_, [OspfNeighbor]>, Cow<'_, [OspfIfState]>, &'static str) {
         if self.has_routing() {
             let st = self.routing_status();
             return (
-                st.map(|s| s.ospf_neighbors.clone()).unwrap_or_default(),
-                st.map(|s| s.ospf_interfaces.clone()).unwrap_or_default(),
+                st.map_or(Cow::Borrowed(&[][..]), |s| Cow::Borrowed(&s.ospf_neighbors[..])),
+                st.map_or(Cow::Borrowed(&[][..]), |s| Cow::Borrowed(&s.ospf_interfaces[..])),
                 "frr",
             );
         }
@@ -149,7 +151,7 @@ impl Session {
             n.extend(a);
             i.extend(b);
         }
-        (n, i, "virtual lab sample")
+        (Cow::Owned(n), Cow::Owned(i), "virtual lab sample")
     }
 }
 

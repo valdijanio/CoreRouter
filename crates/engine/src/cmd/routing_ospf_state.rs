@@ -34,16 +34,16 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{instance?: string} → {source, rows: [{instance, version, router_id, address, interface, area, state (RFC 2328 §10.1: Down … Full), role (DR, Backup, DROther, ptp), label (\"Full · DR\"), priority, state_secs, dead_secs, bfd, retransmit, request, summary}]}",
         always, neighbor_list),
     cmd!(query "routing.ospf.interface.list", "OSPF Interfaces", ["Routing", "OSPF"], None,
-        "{instance?: string} → {source, rows: [{instance, version, interface, area, template, network_type, state, address, cost, mtu, hello, dead, dr, bdr, passive, neighbors, adjacent, auth}]}",
+        "{instance?: string, find?: string (part of the interface name, or the area), offset?: u32, limit?: u32 (default 1000, at most 1000)} → {source, total, rows: [{instance, version, interface, area, template, network_type, state, address, cost, mtu, hello, dead, dr, bdr, passive, neighbors, adjacent, auth}]}",
         always, interface_list),
     cmd!(query "routing.ospf.lsa.list", "OSPF LSAs", ["Routing", "OSPF"], None,
         "{instance: string, type?: string (router, network, summary, asbr-summary, external, nssa-external), area?: string, find?: string (id or originator), offset?: u32, limit?: u32 (default 200, at most 1000)} → {source, pending, error?, total, by_type: {type: n}, rows: [{type, area, id, originator, age, sequence, self, links?, metric?, prefix?}]}",
         always, lsa_list),
     cmd!(query "routing.ospf.route.list", "OSPF Routes", ["Routing", "OSPF"], None,
-        "{instance: string, find?: string} → {source, pending, error?, rows: [{prefix, kind (intra-area, inter-area, ext-1, ext-2), cost, type2_cost?, area?, nexthops: [{address?, interface}]}]}",
+        "{instance: string, find?: string, offset?: u32, limit?: u32 (default 200, at most 1000)} → {source, pending, error?, total, by_kind: {intra-area, inter-area, external}, rows: [{prefix, kind (intra-area, inter-area, ext-1, ext-2), cost, type2_cost?, area?, nexthops: [{address?, interface}]}]}",
         always, route_list),
     cmd!(query "routing.ospf.topology", "OSPF Topology", ["Routing", "OSPF"], None,
-        "{instance: string, area?: string (default: the first)} → {source, pending, area, areas: [string], nodes: [{key, kind (router | network), id, label, x, y (0..1), abr, asbr, self, neighbor?}], edges: [{a, b, cost, back_cost?}], layout_ms, threads}",
+        "{instance: string, area?: string (default: the first), known?: string (the token of the map the caller holds)} → {source, pending, area, areas: [string], token, unchanged?: bool (true: the map is the one of `known`, nodes and edges left out), nodes: [{key, kind (router | network), id, label, x, y (0..1), abr, asbr, self, neighbor?}], edges: [{a, b, cost, back_cost?}], layout_ms, threads}",
         always, topology_cmd),
     cmd!(query "routing.ospf.path", "Why This Path (OSPF)", ["Routing", "OSPF"], None,
         "{instance: string, to: ipv4 (an address or a router id)} → {source, pending, area?, hops: [{key, kind, id, cost, total}], total?, route?: {prefix, kind, cost, nexthops}, agrees?: bool (our SPF over the LSDB gives the daemon's cost)}",
@@ -95,14 +95,31 @@ fn neighbor_list(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn interface_list(s: &mut Session, p: &Value) -> Result<Value> {
     let only = opt_str(p, "instance")?.map(str::to_owned);
+    let find = opt_str(p, "find")?.map(|f| f.trim().to_owned()).filter(|f| !f.is_empty());
+    // G3.4n: a page (4 000 interfaces are 1.1 MiB of JSON, too much for an
+    // MCP client's context); the default holds every interface of a box
+    // up to MAX_PAGE, as before.
+    let offset = opt_u32(p, "offset")?.unwrap_or(0) as usize;
+    let limit = opt_u32(p, "limit")?.unwrap_or(MAX_PAGE).clamp(1, MAX_PAGE) as usize;
     let (_, ifs, source) = s.ospf_live();
     let cfg = s.store().running();
     let binds = bind::bindings(cfg);
+    // G3.4n: one lookup per interface (a scan of the bindings for each
+    // was O(n²): 39 ms for 4 000 interfaces, **medido**).
+    let by_iface: HashMap<(&str, &str), &bind::Binding<'_>> =
+        binds.iter().map(|b| ((b.instance.name.as_str(), b.interface.as_str()), b)).collect();
+    let matching = |i: &&corerouter_model::ospf_state::OspfIfState| {
+        only.as_deref().is_none_or(|x| x == i.instance)
+            && find.as_deref().is_none_or(|f| i.interface.contains(f) || i.area.as_deref() == Some(f))
+    };
+    let total = ifs.iter().filter(matching).count();
     let rows: Vec<Value> = ifs
         .iter()
-        .filter(|i| only.as_deref().is_none_or(|x| x == i.instance))
+        .filter(matching)
+        .skip(offset)
+        .take(limit)
         .map(|i| {
-            let b = binds.iter().find(|b| b.instance.name == i.instance && b.interface.as_str() == i.interface);
+            let b = by_iface.get(&(i.instance.as_str(), i.interface.as_str())).copied();
             json!({
                 "instance": i.instance,
                 "version": i.version,
@@ -125,7 +142,7 @@ fn interface_list(s: &mut Session, p: &Value) -> Result<Value> {
             })
         })
         .collect();
-    Ok(json!({"source": source, "rows": rows}))
+    Ok(json!({"source": source, "total": total, "rows": rows}))
 }
 
 fn kind_name(k: u8) -> &'static str {
@@ -172,8 +189,7 @@ fn lsa_list(s: &mut Session, p: &Value) -> Result<Value> {
         Some(a) => Some(a.parse::<corerouter_model::ospf::AreaId>().map_err(|e| EngineError::bad("area", e))?.0),
     };
     let find = opt_str(p, "find")?.map(|f| f.trim().to_owned()).filter(|f| !f.is_empty());
-    let offset = opt_u32(p, "offset")?.unwrap_or(0) as usize;
-    let limit = opt_u32(p, "limit")?.unwrap_or(200).clamp(1, MAX_PAGE) as usize;
+    let (offset, limit) = page(p)?;
     let view = s.ospf_db(&instance);
     if let Some(v) = not_ready(&view) {
         return Ok(v);
@@ -181,20 +197,29 @@ fn lsa_list(s: &mut Session, p: &Value) -> Result<Value> {
     let Some(db) = view.db() else { return Ok(json!({"rows": []})) };
     let (lsdb, _) = db.as_ref();
     let me = lsdb.router_id;
-    let keep = |l: &&Lsa| {
+    // G3.4n: the dotted text of each LSA is written into a stack buffer
+    // (two `String`s per LSA made a search of 100 000 LSAs take 13.7 ms).
+    let mut buf = [0u8; 15];
+    let mut has = |a: u32, f: &str| dotted(a, &mut buf).contains(f);
+    let mut keep = |l: &Lsa| {
         want_type.is_none_or(|t| l.kind == t)
             && area.is_none_or(|a| l.area == a)
-            && find.as_deref().is_none_or(|f| ip(l.id).to_string().contains(f) || ip(l.adv).to_string().contains(f))
+            && find.as_deref().is_none_or(|f| has(l.id, f) || has(l.adv, f))
     };
     let mut by_type: HashMap<&str, usize> = HashMap::new();
+    let mut total = 0usize;
+    let mut picked: Vec<&Lsa> = Vec::with_capacity(limit);
     for l in &lsdb.lsas {
         *by_type.entry(kind_name(l.kind)).or_default() += 1;
+        if keep(l) {
+            if total >= offset && picked.len() < limit {
+                picked.push(l);
+            }
+            total += 1;
+        }
     }
-    let matching: Vec<&Lsa> = lsdb.lsas.iter().filter(keep).collect();
-    let rows: Vec<Value> = matching
+    let rows: Vec<Value> = picked
         .iter()
-        .skip(offset)
-        .take(limit)
         .map(|l| {
             let mut v = json!({
                 "type": kind_name(l.kind),
@@ -231,7 +256,7 @@ fn lsa_list(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({
         "source": view.source(),
         "pending": matches!(view, DbView::Daemon { stale: true, .. }),
-        "total": matching.len(),
+        "total": total,
         "by_type": by_type,
         "rows": rows,
     }))
@@ -244,12 +269,27 @@ fn route_list(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(v) = not_ready(&view) {
         return Ok(v);
     }
+    let (offset, limit) = page(p)?;
     let Some(db) = view.db() else { return Ok(json!({"rows": []})) };
-    let rows: Vec<Value> = db
-        .1
+    // G3.4n: a page, with the total and the count of each kind (all
+    // 10 000 rows a call, 1.9 MiB, took 34.5 ms under the lock with
+    // 200 000 routes, **medido**).
+    let (mut total, mut intra, mut inter, mut ext) = (0usize, 0usize, 0usize, 0usize);
+    let mut picked = Vec::with_capacity(limit);
+    for r in db.1.iter().filter(|r| find.as_deref().is_none_or(|f| r.prefix.contains(f))) {
+        match r.kind.as_str() {
+            "intra-area" => intra += 1,
+            "inter-area" => inter += 1,
+            k if k.starts_with("ext") || k.starts_with("nssa") => ext += 1,
+            _ => {}
+        }
+        if total >= offset && picked.len() < limit {
+            picked.push(r);
+        }
+        total += 1;
+    }
+    let rows: Vec<Value> = picked
         .iter()
-        .filter(|r| find.as_deref().is_none_or(|f| r.prefix.contains(f)))
-        .take(MAX_PAGE as usize * 10)
         .map(|r| {
             json!({
                 "prefix": r.prefix,
@@ -261,7 +301,43 @@ fn route_list(s: &mut Session, p: &Value) -> Result<Value> {
             })
         })
         .collect();
-    Ok(json!({"source": view.source(), "pending": false, "rows": rows}))
+    Ok(json!({
+        "source": view.source(),
+        "pending": false,
+        "total": total,
+        "by_kind": {"intra-area": intra, "inter-area": inter, "external": ext},
+        "rows": rows,
+    }))
+}
+
+/// `a` as dotted decimal, written into `buf` (what `Ipv4Addr`'s
+/// `Display` prints, without the formatting machinery).
+fn dotted(a: u32, buf: &mut [u8; 15]) -> &str {
+    let mut n = 0;
+    for (i, octet) in a.to_be_bytes().into_iter().enumerate() {
+        if i > 0 {
+            if let Some(b) = buf.get_mut(n) {
+                *b = b'.';
+            }
+            n += 1;
+        }
+        let digits = [octet / 100, octet / 10 % 10, octet % 10];
+        let skip = if octet >= 100 { 0 } else if octet >= 10 { 1 } else { 2 };
+        for d in digits.iter().skip(skip) {
+            if let Some(b) = buf.get_mut(n) {
+                *b = b'0' + d;
+            }
+            n += 1;
+        }
+    }
+    buf.get(..n).and_then(|b| std::str::from_utf8(b).ok()).unwrap_or_default()
+}
+
+/// `offset` and `limit` (default 200, at most [`MAX_PAGE`]).
+fn page(p: &Value) -> Result<(usize, usize)> {
+    let offset = opt_u32(p, "offset")?.unwrap_or(0) as usize;
+    let limit = opt_u32(p, "limit")?.unwrap_or(200).clamp(1, MAX_PAGE) as usize;
+    Ok((offset, limit))
 }
 
 fn node_key(n: Node) -> String {
@@ -323,6 +399,38 @@ fn topology_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let layout_ms = started.elapsed().as_secs_f64() * 1000.0;
     let (nbrs, _, _) = s.ospf_live();
+    // G3.4n: our neighbors by router id, looked up once per node (a scan
+    // of the neighbors per node, with a `String` per comparison, took most
+    // of the 58 ms of a laid-out map of 2 000 routers, **medido**).
+    let mut nbr_of: HashMap<u32, String> = HashMap::with_capacity(nbrs.len());
+    for n in nbrs.iter() {
+        if let Ok(r) = n.router_id.parse::<Ipv4Addr>() {
+            nbr_of.entry(u32::from(r)).or_insert_with(|| label(n));
+        }
+    }
+    // G3.4n: the map is the same while the LSDB copy, its layout and our
+    // neighbors' states are: a caller that holds it gets `unchanged`
+    // instead of ~1 MiB built again (2 000 routers; the window asks at
+    // every refresh).
+    let token = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        (ptr, Arc::as_ptr(&pos) as usize, area).hash(&mut h);
+        for n in nbrs.iter() {
+            (&n.router_id, &n.state, &n.role).hash(&mut h);
+        }
+        format!("{:016x}", h.finish())
+    };
+    if opt_str(p, "known")? == Some(token.as_str()) {
+        return Ok(json!({
+            "source": view.source(),
+            "pending": false,
+            "area": ip(area).to_string(),
+            "areas": areas,
+            "token": token,
+            "unchanged": true,
+        }));
+    }
     let me = lsdb.router_id;
     let nodes: Vec<Value> = g
         .nodes
@@ -336,7 +444,7 @@ fn topology_cmd(s: &mut Session, p: &Value) -> Result<Value> {
                 Node::Network(x) => ("network", format!("{}/{}", ip(*x), flags)),
             };
             let nb = match n {
-                Node::Router(r) => nbrs.iter().find(|x| x.router_id == ip(*r).to_string()).map(label),
+                Node::Router(r) => nbr_of.get(r).cloned(),
                 Node::Network(_) => None,
             };
             json!({
@@ -368,6 +476,7 @@ fn topology_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         "edges": edge_rows,
         "layout_ms": (layout_ms * 100.0).round() / 100.0,
         "threads": threads,
+        "token": token,
     }))
 }
 
@@ -445,6 +554,7 @@ fn diagnose_cmd(s: &mut Session, p: &Value) -> Result<Value> {
             "findings": [{"level": "error", "check": "not-in-ospf", "message": msg, "rfc": ""}],
         }));
     };
+    let now = s.hal_mut().now_unix().unwrap_or(0);
     let (nbrs, ifs, source) = s.ospf_live();
     let st = ifs.iter().find(|i| i.interface == iface && i.instance == b.instance.name);
     let t = b.template;
@@ -458,7 +568,6 @@ fn diagnose_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         });
     let key_id = match &t.keychain {
         Some(k) => {
-            let now = s.hal_mut().now_unix().unwrap_or(0);
             cfg.routing.ospf.keychains.get(k).and_then(|kc| kc.keys.iter().find(|k| k.sends_at(now)).map(|k| k.id))
         }
         None => t.auth.filter(|a| a.is_crypto()).map(|_| t.auth_id.unwrap_or(1)),
@@ -543,6 +652,64 @@ mod tests {
         assert_eq!(p["agrees"], true, "{p}");
         let e = s.execute("routing.ospf.lsa.list", &json!({"instance": "nope"})).unwrap_err();
         assert!(e.to_string().contains("no OSPF instance"));
+    }
+
+    #[test]
+    fn dotted_is_what_ipv4addr_prints() {
+        let mut buf = [0u8; 15];
+        for a in [0u32, 1, 9, 10, 99, 100, 255, 0x0A01_0007, 0xFFFF_FFFF, 0x7F00_0001, 0xC0A8_640A] {
+            assert_eq!(super::dotted(a, &mut buf), std::net::Ipv4Addr::from(a).to_string());
+        }
+    }
+
+    /// G3.4n: the pages, totals and lookups that replaced the scans, on a
+    /// network read from the daemon (`perf::ospf_scale`, small).
+    #[test]
+    fn pages_totals_and_lookups_on_a_daemon_network() {
+        let mut s = crate::perf::ospf_scale(200, 50, 100, 1_000, 3_000);
+        let r = s.execute("routing.ospf.route.list", &json!({"instance": "v2"})).unwrap();
+        assert_eq!((r["total"].as_u64(), r["rows"].as_array().unwrap().len()), (Some(3_000), 200), "{}", r["total"]);
+        assert_eq!(r["by_kind"], json!({"intra-area": 2_000, "inter-area": 0, "external": 1_000}));
+        let r = s.execute("routing.ospf.route.list", &json!({"instance": "v2", "offset": 2_900, "limit": 5_000})).unwrap();
+        assert_eq!(r["rows"].as_array().unwrap().len(), 100);
+        assert_eq!(r["rows"][99]["prefix"], format!("{}/24", std::net::Ipv4Addr::from(0x1400_0000u32 + 2_999 * 256)));
+        let r = s.execute("routing.ospf.route.list", &json!({"instance": "v2", "find": "20.0.1.", "limit": 1})).unwrap();
+        assert_eq!((r["total"].as_u64(), r["rows"].as_array().unwrap().len()), (Some(1), 1));
+        // The search of LSAs counts what a scan of the dotted text counts.
+        let l = s.execute("routing.ospf.lsa.list", &json!({"instance": "v2", "find": "10.1.0.7", "limit": 1000})).unwrap();
+        let rows = l["rows"].as_array().unwrap();
+        assert!(!rows.is_empty());
+        assert_eq!(l["total"].as_u64(), Some(rows.len() as u64));
+        assert!(rows.iter().all(|r| r["id"].as_str().unwrap().contains("10.1.0.7") || r["originator"].as_str().unwrap().contains("10.1.0.7")));
+        let l = s.execute("routing.ospf.lsa.list", &json!({"instance": "v2", "offset": 990, "limit": 0})).unwrap();
+        assert_eq!((l["total"].as_u64(), l["rows"].as_array().unwrap().len()), (Some(1_000), 1));
+        // Each interface finds its template.
+        let i = s.execute("routing.ospf.interface.list", &json!({})).unwrap();
+        let rows = i["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 200);
+        assert!(rows.iter().all(|r| r["template"].is_string()), "{}", rows[0]);
+        assert_ne!(rows[0]["template"], rows[199]["template"]);
+        assert_eq!(i["total"], 200);
+        let i = s.execute("routing.ospf.interface.list", &json!({"find": "vlan19", "offset": 1, "limit": 5})).unwrap();
+        // vlan19 and vlan190..vlan199: 11, the page after the first.
+        assert_eq!((i["total"].as_u64(), i["rows"].as_array().unwrap().len()), (Some(11), 5));
+        assert_eq!(i["rows"][0]["interface"], "vlan190");
+        // The map marks the routers that are our neighbors.
+        let t = s.execute("routing.ospf.topology", &json!({"instance": "v2"})).unwrap();
+        let nodes = t["nodes"].as_array().unwrap();
+        let marked = nodes.iter().filter(|n| n["neighbor"] == "Full · DR").count();
+        assert_eq!(marked, 50, "{}", nodes[1]);
+        // The map the window holds is not sent again; a neighbor that
+        // changes state changes it.
+        let token = t["token"].as_str().unwrap().to_owned();
+        let u = s.execute("routing.ospf.topology", &json!({"instance": "v2", "known": token})).unwrap();
+        assert_eq!((u["unchanged"].as_bool(), u.get("nodes")), (Some(true), None), "{u}");
+        let mut st = s.routing_status().cloned().unwrap();
+        st.ospf_neighbors[3].state = "ExStart".into();
+        let _ = s.set_routing_status(st);
+        let c = s.execute("routing.ospf.topology", &json!({"instance": "v2", "known": token})).unwrap();
+        assert!(c["unchanged"].is_null() && c["token"] != token);
+        assert_eq!(c["nodes"].as_array().unwrap().iter().filter(|n| n["neighbor"] == "ExStart").count(), 1);
     }
 
     #[test]

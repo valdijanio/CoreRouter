@@ -18,28 +18,16 @@ use std::net::Ipv4Addr;
 use corerouter_model::ospf_state::{
     Link, Lsa, Lsdb, OspfIfState, OspfNeighbor, OspfRoute, OspfStubState,
 };
+use serde::Deserialize;
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
-use serde_json::{Map, Value};
+
+use crate::loose::{self, Dict, List, Loose, Obj, bool_of, text, u32_of, u64_of};
 
 /// Most LSAs kept from one database (a large single area is ~10 000,
 /// **estimado**; past this they are counted in `dropped`).
 pub const MAX_LSAS: usize = 500_000;
 /// Most links of one router LSA (RFC 2328: 16-bit count).
 const MAX_LINKS: usize = 65_535;
-
-fn s(m: &Map<String, Value>, k: &str) -> Option<String> {
-    m.get(k)
-        .and_then(Value::as_str)
-        .filter(|v| !v.is_empty())
-        .map(|v| v.chars().take(128).collect())
-}
-
-fn n(m: &Map<String, Value>, k: &str) -> Option<u64> {
-    m.get(k).and_then(|v| {
-        v.as_u64()
-            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-    })
-}
 
 /// FRR's `timerstring`/`ospf_timeval_dump` durations: `00:01:23`,
 /// `1d02h03m`, `5w2d03h`, `12.345s`.
@@ -76,45 +64,82 @@ pub fn secs(text: &str) -> Option<u64> {
     num.is_empty().then_some(total)
 }
 
+// G3.4n: the answers are read into the few fields kept (`crate::loose`),
+// not into a `serde_json::Value` tree: 4 000 interfaces in 15.2 → see
+// docs/ospf.md (**medido**).
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct NbrsV2<'a> {
+    #[serde(borrow)]
+    neighbors: Dict<'a, List<NbrV2<'a>>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct NbrV2<'a> {
+    #[serde(borrow)]
+    nbr_state: Option<Loose<'a>>,
+    #[serde(borrow)]
+    role: Option<Loose<'a>>,
+    #[serde(borrow)]
+    iface_name: Option<Loose<'a>>,
+    #[serde(borrow)]
+    iface_address: Option<Loose<'a>>,
+    #[serde(borrow)]
+    area_id: Option<Loose<'a>>,
+    #[serde(borrow)]
+    area: Option<Loose<'a>>,
+    #[serde(borrow)]
+    converged: Option<Loose<'a>>,
+    #[serde(borrow)]
+    nbr_priority: Option<Loose<'a>>,
+    #[serde(borrow)]
+    up_time_in_msec: Option<Loose<'a>>,
+    #[serde(borrow)]
+    router_dead_interval_timer_due_msec: Option<Loose<'a>>,
+    #[serde(borrow)]
+    link_state_retransmission_list_counter: Option<Loose<'a>>,
+    #[serde(borrow)]
+    link_state_request_list_counter: Option<Loose<'a>>,
+    #[serde(borrow)]
+    database_summary_list_counter: Option<Loose<'a>>,
+}
+
 /// `show ip ospf neighbor json` of instance `instance`.
-pub fn neighbors_v2(json: &str, instance: &str) -> Result<Vec<OspfNeighbor>, String> {
-    let v: Value =
-        serde_json::from_str(json).map_err(|e| format!("ospfd answered bad JSON: {e}"))?;
+pub fn neighbors_v2(json: impl AsRef<[u8]>, instance: &str) -> Result<Vec<OspfNeighbor>, String> {
+    let top: Obj<NbrsV2<'_>> = loose::parse(json.as_ref(), "ospfd")?;
     let mut out = Vec::new();
-    let Some(Value::Object(by_id)) = v.get("neighbors") else {
-        return Ok(out);
-    };
-    for (id, list) in by_id {
-        let Value::Array(list) = list else { continue };
-        for nb in list {
-            let Value::Object(m) = nb else { continue };
-            let full = s(m, "nbrState").unwrap_or_default();
+    let Some(top) = top.0 else { return Ok(out) };
+    for (id, list) in &top.neighbors.0 {
+        for m in &list.0 {
+            let full = text(&m.nbr_state).unwrap_or_default();
             let (state, role) = match full.split_once('/') {
                 Some((a, b)) => (a.to_owned(), b.to_owned()),
-                None => (full.clone(), s(m, "role").unwrap_or_default()),
+                None => (full.clone(), text(&m.role).unwrap_or_default()),
             };
-            let iface = s(m, "ifaceName").unwrap_or_default();
+            let iface = text(&m.iface_name).unwrap_or_default();
             out.push(OspfNeighbor {
                 instance: instance.to_owned(),
                 version: 2,
                 router_id: if id == "neighbor" {
                     String::new()
                 } else {
-                    id.clone()
+                    id.chars().take(128).collect()
                 },
-                address: s(m, "ifaceAddress").unwrap_or_default(),
+                address: text(&m.iface_address).unwrap_or_default(),
                 // `eth0:10.0.0.1` in older daemons.
                 interface: iface.split(':').next().unwrap_or_default().to_owned(),
-                area: s(m, "areaId").or_else(|| s(m, "area")),
-                state: s(m, "converged").unwrap_or(state),
+                area: text(&m.area_id).or_else(|| text(&m.area)),
+                state: text(&m.converged).unwrap_or(state),
                 role,
-                priority: n(m, "nbrPriority").and_then(|p| u32::try_from(p).ok()),
-                state_secs: n(m, "upTimeInMsec").map(|ms| ms / 1000),
-                dead_secs: n(m, "routerDeadIntervalTimerDueMsec").map(|ms| ms / 1000),
+                priority: u32_of(&m.nbr_priority),
+                state_secs: u64_of(&m.up_time_in_msec).map(|ms| ms / 1000),
+                dead_secs: u64_of(&m.router_dead_interval_timer_due_msec).map(|ms| ms / 1000),
                 bfd: None,
-                retransmit: n(m, "linkStateRetransmissionListCounter").unwrap_or(0),
-                request: n(m, "linkStateRequestListCounter").unwrap_or(0),
-                summary: n(m, "databaseSummaryListCounter").unwrap_or(0),
+                retransmit: u64_of(&m.link_state_retransmission_list_counter).unwrap_or(0),
+                request: u64_of(&m.link_state_request_list_counter).unwrap_or(0),
+                summary: u64_of(&m.database_summary_list_counter).unwrap_or(0),
             });
         }
     }
@@ -122,107 +147,189 @@ pub fn neighbors_v2(json: &str, instance: &str) -> Result<Vec<OspfNeighbor>, Str
     Ok(out)
 }
 
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct NbrsV3<'a> {
+    #[serde(borrow)]
+    neighbors: List<NbrV3<'a>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct NbrV3<'a> {
+    #[serde(borrow)]
+    neighbor_id: Option<Loose<'a>>,
+    #[serde(borrow)]
+    link_local_address: Option<Loose<'a>>,
+    #[serde(borrow)]
+    interface_name: Option<Loose<'a>>,
+    #[serde(borrow)]
+    area: Option<Loose<'a>>,
+    #[serde(borrow)]
+    state: Option<Loose<'a>>,
+    #[serde(borrow)]
+    if_state: Option<Loose<'a>>,
+    #[serde(borrow)]
+    priority: Option<Loose<'a>>,
+    #[serde(borrow)]
+    duration: Option<Loose<'a>>,
+    #[serde(borrow)]
+    dead_time: Option<Loose<'a>>,
+}
+
 /// `show ipv6 ospf6 neighbor json`.
-pub fn neighbors_v3(json: &str, instance: &str) -> Result<Vec<OspfNeighbor>, String> {
-    let v: Value =
-        serde_json::from_str(json).map_err(|e| format!("ospf6d answered bad JSON: {e}"))?;
-    let mut out = Vec::new();
-    let Some(Value::Array(list)) = v.get("neighbors") else {
-        return Ok(out);
+pub fn neighbors_v3(json: impl AsRef<[u8]>, instance: &str) -> Result<Vec<OspfNeighbor>, String> {
+    let top: Obj<NbrsV3<'_>> = loose::parse(json.as_ref(), "ospf6d")?;
+    let Some(top) = top.0 else {
+        return Ok(Vec::new());
     };
-    for nb in list {
-        let Value::Object(m) = nb else { continue };
-        out.push(OspfNeighbor {
+    let mut out: Vec<OspfNeighbor> = top
+        .neighbors
+        .0
+        .iter()
+        .map(|m| OspfNeighbor {
             instance: instance.to_owned(),
             version: 3,
-            router_id: s(m, "neighborId").unwrap_or_default(),
-            address: s(m, "linkLocalAddress").unwrap_or_default(),
-            interface: s(m, "interfaceName").unwrap_or_default(),
-            area: s(m, "area"),
-            state: s(m, "state").unwrap_or_default(),
-            role: s(m, "ifState").unwrap_or_default(),
-            priority: n(m, "priority").and_then(|p| u32::try_from(p).ok()),
-            state_secs: s(m, "duration").and_then(|d| secs(&d)),
-            dead_secs: s(m, "deadTime").and_then(|d| secs(&d)),
+            router_id: text(&m.neighbor_id).unwrap_or_default(),
+            address: text(&m.link_local_address).unwrap_or_default(),
+            interface: text(&m.interface_name).unwrap_or_default(),
+            area: text(&m.area),
+            state: text(&m.state).unwrap_or_default(),
+            role: text(&m.if_state).unwrap_or_default(),
+            priority: u32_of(&m.priority),
+            state_secs: text(&m.duration).and_then(|d| secs(&d)),
+            dead_secs: text(&m.dead_time).and_then(|d| secs(&d)),
             bfd: None,
             retransmit: 0,
             request: 0,
             summary: 0,
-        });
-    }
+        })
+        .collect();
     out.sort_by(|a, b| (&a.interface, &a.router_id).cmp(&(&b.interface, &b.router_id)));
     Ok(out)
 }
 
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Ifs<'a> {
+    #[serde(borrow)]
+    interfaces: Dict<'a, Obj<IfV2<'a>>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct IfV2<'a> {
+    #[serde(borrow)]
+    ospf_enabled: Option<Loose<'a>>,
+    #[serde(borrow)]
+    area: Option<Loose<'a>>,
+    #[serde(borrow)]
+    network_type: Option<Loose<'a>>,
+    #[serde(borrow)]
+    state: Option<Loose<'a>>,
+    #[serde(borrow)]
+    ip_address: Option<Loose<'a>>,
+    #[serde(borrow)]
+    ip_address_prefixlen: Option<Loose<'a>>,
+    #[serde(borrow)]
+    cost: Option<Loose<'a>>,
+    #[serde(borrow)]
+    mtu_bytes: Option<Loose<'a>>,
+    #[serde(borrow)]
+    mtu_mismatch_detect: Option<Loose<'a>>,
+    #[serde(borrow)]
+    timer_hello_in_msecs: Option<Loose<'a>>,
+    #[serde(borrow)]
+    timer_dead_secs: Option<Loose<'a>>,
+    #[serde(borrow)]
+    dr_id: Option<Loose<'a>>,
+    #[serde(borrow)]
+    bdr_id: Option<Loose<'a>>,
+    #[serde(borrow)]
+    timer_passive_iface: Option<Loose<'a>>,
+    #[serde(borrow)]
+    nbr_count: Option<Loose<'a>>,
+    #[serde(borrow)]
+    nbr_adjacent_count: Option<Loose<'a>>,
+}
+
 /// `show ip ospf interface json`.
-pub fn interfaces_v2(json: &str, instance: &str) -> Result<Vec<OspfIfState>, String> {
-    let v: Value =
-        serde_json::from_str(json).map_err(|e| format!("ospfd answered bad JSON: {e}"))?;
-    let mut out = Vec::new();
-    let Some(Value::Object(by_name)) = v.get("interfaces") else {
-        return Ok(out);
+pub fn interfaces_v2(json: impl AsRef<[u8]>, instance: &str) -> Result<Vec<OspfIfState>, String> {
+    let top: Obj<Ifs<'_>> = loose::parse(json.as_ref(), "ospfd")?;
+    let Some(top) = top.0 else {
+        return Ok(Vec::new());
     };
-    for (name, i) in by_name {
-        let Value::Object(m) = i else { continue };
-        if m.get("ospfEnabled").and_then(Value::as_bool) == Some(false) {
+    let mut out = Vec::with_capacity(top.interfaces.0.len());
+    for (name, m) in &top.interfaces.0 {
+        let Some(m) = &m.0 else { continue };
+        if bool_of(&m.ospf_enabled) == Some(false) {
             continue;
         }
         out.push(OspfIfState {
             instance: instance.to_owned(),
             version: 2,
-            interface: name.clone(),
-            area: s(m, "area").map(|a| a.split(' ').next().unwrap_or_default().to_owned()),
-            network_type: s(m, "networkType"),
-            state: s(m, "state"),
-            address: match (s(m, "ipAddress"), n(m, "ipAddressPrefixlen")) {
+            interface: name.chars().take(128).collect(),
+            area: text(&m.area).map(|a| a.split(' ').next().unwrap_or_default().to_owned()),
+            network_type: text(&m.network_type),
+            state: text(&m.state),
+            address: match (text(&m.ip_address), u64_of(&m.ip_address_prefixlen)) {
                 (Some(a), Some(l)) => Some(format!("{a}/{l}")),
                 (a, _) => a,
             },
-            cost: n(m, "cost").and_then(|c| u32::try_from(c).ok()),
-            mtu: n(m, "mtuBytes").and_then(|c| u32::try_from(c).ok()),
-            mtu_mismatch_detection: m.get("mtuMismatchDetect").and_then(Value::as_bool),
-            hello: n(m, "timerHelloInMsecs").map(|ms| u32::try_from(ms / 1000).unwrap_or(0)),
-            dead: n(m, "timerDeadSecs").and_then(|c| u32::try_from(c).ok()),
-            dr: s(m, "drId"),
-            bdr: s(m, "bdrId"),
-            passive: m
-                .get("timerPassiveIface")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            neighbors: n(m, "nbrCount")
-                .and_then(|c| u32::try_from(c).ok())
-                .unwrap_or(0),
-            adjacent: n(m, "nbrAdjacentCount")
-                .and_then(|c| u32::try_from(c).ok())
-                .unwrap_or(0),
+            cost: u32_of(&m.cost),
+            mtu: u32_of(&m.mtu_bytes),
+            mtu_mismatch_detection: bool_of(&m.mtu_mismatch_detect),
+            hello: u64_of(&m.timer_hello_in_msecs).map(|ms| u32::try_from(ms / 1000).unwrap_or(0)),
+            dead: u32_of(&m.timer_dead_secs),
+            dr: text(&m.dr_id),
+            bdr: text(&m.bdr_id),
+            passive: bool_of(&m.timer_passive_iface).unwrap_or(false),
+            neighbors: u32_of(&m.nbr_count).unwrap_or(0),
+            adjacent: u32_of(&m.nbr_adjacent_count).unwrap_or(0),
         });
     }
     Ok(out)
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct OspfTop<'a> {
+    #[serde(borrow)]
+    areas: Dict<'a, Obj<AreaStub<'a>>>,
+    #[serde(borrow, rename = "routerIsStubRouter")]
+    router_is_stub_router: Option<Loose<'a>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct AreaStub<'a> {
+    #[serde(borrow)]
+    origin_stub_max_dist_router_lsa: Option<Loose<'a>>,
+    #[serde(borrow)]
+    indefinite_active_admin: Option<Loose<'a>>,
+    #[serde(borrow)]
+    active_startup_remainder_msecs: Option<Loose<'a>>,
 }
 
 /// G3.9c: `show ip ospf json`: the areas that originate a stub router-LSA
 /// now (`originStubMaxDistRouterLsa`), administratively
 /// (`indefiniteActiveAdmin`) or on startup (`activeStartupRemainderMsecs`;
 /// FRR 10.7.1 `ospfd/ospf_vty.c`, `show_ip_ospf_area`).
-pub fn stub_v2(json: &str, instance: &str) -> Result<OspfStubState, String> {
-    let v: Value =
-        serde_json::from_str(json).map_err(|e| format!("ospfd answered bad JSON: {e}"))?;
+pub fn stub_v2(json: impl AsRef<[u8]>, instance: &str) -> Result<OspfStubState, String> {
+    let top: Obj<OspfTop<'_>> = loose::parse(json.as_ref(), "ospfd")?;
     let mut out = OspfStubState {
         instance: instance.to_owned(),
         ..OspfStubState::default()
     };
-    let Some(Value::Object(areas)) = v.get("areas") else {
-        return Ok(out);
-    };
-    for (id, a) in areas.iter().take(1_000) {
-        let Value::Object(m) = a else { continue };
-        let flag = |k: &str| m.get(k).and_then(Value::as_bool) == Some(true);
-        if !flag("originStubMaxDistRouterLsa") {
+    let Some(top) = top.0 else { return Ok(out) };
+    for (id, a) in top.areas.0.iter().take(1_000) {
+        let Some(m) = &a.0 else { continue };
+        if bool_of(&m.origin_stub_max_dist_router_lsa) != Some(true) {
             continue;
         }
         out.areas.push(id.chars().take(32).collect());
-        out.admin |= flag("indefiniteActiveAdmin");
-        if let Some(ms) = n(m, "activeStartupRemainderMsecs") {
+        out.admin |= bool_of(&m.indefinite_active_admin) == Some(true);
+        if let Some(ms) = u64_of(&m.active_startup_remainder_msecs) {
             let secs = ms.div_ceil(1000);
             out.startup_remaining_secs =
                 Some(out.startup_remaining_secs.map_or(secs, |o| o.max(secs)));
@@ -234,12 +341,13 @@ pub fn stub_v2(json: &str, instance: &str) -> Result<OspfStubState, String> {
 
 /// G3.9c: `show ipv6 ospf6 json`: `routerIsStubRouter` (FRR 10.7.1
 /// `ospf6d/ospf6_top.c`); ospf6d has the administrative form only.
-pub fn stub_v3(json: &str, instance: &str) -> Result<OspfStubState, String> {
-    let v: Value =
-        serde_json::from_str(json).map_err(|e| format!("ospf6d answered bad JSON: {e}"))?;
+pub fn stub_v3(json: impl AsRef<[u8]>, instance: &str) -> Result<OspfStubState, String> {
+    let top: Obj<OspfTop<'_>> = loose::parse(json.as_ref(), "ospf6d")?;
     Ok(OspfStubState {
         instance: instance.to_owned(),
-        admin: v.get("routerIsStubRouter").and_then(Value::as_bool) == Some(true),
+        admin: top
+            .0
+            .is_some_and(|t| bool_of(&t.router_is_stub_router) == Some(true)),
         ..OspfStubState::default()
     })
 }
@@ -247,54 +355,143 @@ pub fn stub_v3(json: &str, instance: &str) -> Result<OspfStubState, String> {
 /// Most routes kept from `show ip ospf route json`.
 pub const MAX_ROUTES: usize = 200_000;
 
-/// `show ip ospf route json`: the network routes (keys with a `/`); the
-/// router routes (to ABRs/ASBRs) are left out.
-pub fn routes_v2(json: &str, instance: &str) -> Result<Vec<OspfRoute>, String> {
-    let v: Value =
-        serde_json::from_str(json).map_err(|e| format!("ospfd answered bad JSON: {e}"))?;
-    let Value::Object(top) = v else {
-        return Ok(Vec::new());
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct RouteJson<'a> {
+    #[serde(borrow)]
+    route_type: Option<Loose<'a>>,
+    #[serde(borrow)]
+    cost: Option<Loose<'a>>,
+    #[serde(borrow, rename = "type2cost")]
+    type2cost: Option<Loose<'a>>,
+    #[serde(borrow)]
+    area: Option<Loose<'a>>,
+    #[serde(borrow)]
+    nexthops: List<HopJson<'a>, 64>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct HopJson<'a> {
+    #[serde(borrow)]
+    ip: Option<Loose<'a>>,
+    #[serde(borrow)]
+    via: Option<Loose<'a>>,
+    #[serde(borrow)]
+    directly_attached_to: Option<Loose<'a>>,
+}
+
+fn route_of(key: &str, m: &RouteJson<'_>, instance: &str) -> OspfRoute {
+    let kind = match m.route_type.as_ref().and_then(Loose::str).map(str::trim) {
+        Some("N") => "intra-area",
+        Some("N IA") => "inter-area",
+        Some("N E1") => "ext-1",
+        Some("N E2") => "ext-2",
+        Some("N N1") => "nssa-1",
+        Some("N N2") => "nssa-2",
+        _ => "other",
     };
-    let mut out = Vec::new();
-    for (key, r) in &top {
-        let Value::Object(m) = r else { continue };
-        if !key.contains('/') || out.len() >= MAX_ROUTES {
-            continue;
-        }
-        let kind = match s(m, "routeType").as_deref().map(str::trim) {
-            Some("N") => "intra-area",
-            Some("N IA") => "inter-area",
-            Some("N E1") => "ext-1",
-            Some("N E2") => "ext-2",
-            Some("N N1") => "nssa-1",
-            Some("N N2") => "nssa-2",
-            _ => "other",
-        };
-        let mut nexthops = Vec::new();
-        if let Some(Value::Array(hops)) = m.get("nexthops") {
-            for h in hops.iter().take(64) {
-                let Value::Object(h) = h else { continue };
-                let via = s(h, "ip").filter(|i| !i.trim().is_empty());
-                let dev = s(h, "via")
-                    .or_else(|| s(h, "directlyAttachedTo"))
-                    .unwrap_or_default();
-                nexthops.push((via, dev));
+    let nexthops = m
+        .nexthops
+        .0
+        .iter()
+        .map(|h| {
+            let via = text(&h.ip).filter(|i| !i.trim().is_empty());
+            let dev = text(&h.via)
+                .or_else(|| text(&h.directly_attached_to))
+                .unwrap_or_default();
+            (via, dev)
+        })
+        .collect();
+    OspfRoute {
+        instance: instance.to_owned(),
+        prefix: key.chars().take(64).collect(),
+        kind: kind.to_owned(),
+        cost: u32_of(&m.cost).unwrap_or(0),
+        type2_cost: u32_of(&m.type2cost),
+        area: text(&m.area),
+        nexthops,
+        fast_reroute: None,
+    }
+}
+
+/// The top object of `show ip ospf route json`, read entry by entry: the
+/// network routes (keys with a `/`) become rows as they are read; the
+/// router routes (to ABRs/ASBRs) and entries past [`MAX_ROUTES`] are
+/// skipped without being built.
+struct RoutesSeed<'i> {
+    instance: &'i str,
+}
+
+impl<'de> DeserializeSeed<'de> for RoutesSeed<'_> {
+    type Value = Vec<OspfRoute>;
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Vec<OspfRoute>, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for RoutesSeed<'_> {
+    type Value = Vec<OspfRoute>;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OSPF routes")
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Vec<OspfRoute>, A::Error> {
+        let mut out = Vec::new();
+        while let Some(k) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+            if !k.contains('/') || out.len() >= MAX_ROUTES {
+                map.next_value::<IgnoredAny>()?;
+                continue;
+            }
+            if let Obj(Some(m)) = map.next_value::<Obj<RouteJson<'_>>>()? {
+                out.push(route_of(&k, &m, self.instance));
             }
         }
-        out.push(OspfRoute {
-            instance: instance.to_owned(),
-            prefix: key.chars().take(64).collect(),
-            kind: kind.to_owned(),
-            cost: n(m, "cost")
-                .and_then(|c| u32::try_from(c).ok())
-                .unwrap_or(0),
-            type2_cost: n(m, "type2cost").and_then(|c| u32::try_from(c).ok()),
-            area: s(m, "area"),
-            nexthops,
-            fast_reroute: None,
-        });
+        Ok(out)
     }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<OspfRoute>, A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(Vec::new())
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<Vec<OspfRoute>, E> {
+        Ok(Vec::new())
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<Vec<OspfRoute>, E> {
+        Ok(Vec::new())
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<Vec<OspfRoute>, E> {
+        Ok(Vec::new())
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<Vec<OspfRoute>, E> {
+        Ok(Vec::new())
+    }
+    fn visit_str<E>(self, _: &str) -> Result<Vec<OspfRoute>, E> {
+        Ok(Vec::new())
+    }
+    fn visit_unit<E>(self) -> Result<Vec<OspfRoute>, E> {
+        Ok(Vec::new())
+    }
+}
+
+/// `show ip ospf route json`: the network routes (keys with a `/`); the
+/// router routes (to ABRs/ASBRs) are left out.
+pub fn routes_v2(json: impl AsRef<[u8]>, instance: &str) -> Result<Vec<OspfRoute>, String> {
+    let mut de = serde_json::Deserializer::from_slice(json.as_ref());
+    let out = RoutesSeed { instance }
+        .deserialize(&mut de)
+        .and_then(|v| de.end().map(|()| v))
+        .map_err(|e| format!("ospfd answered bad JSON: {e}"))?;
     Ok(out)
+}
+
+/// [`routes_v2`] as the answer streams from the socket (G3.4n: 200 000
+/// routes are ~43 MiB of JSON, which no longer sit in one buffer, nor
+/// count against the vty's reply limit).
+pub fn read_routes(input: impl Read, instance: &str) -> Result<Vec<OspfRoute>, String> {
+    let mut de =
+        serde_json::Deserializer::from_reader(std::io::BufReader::with_capacity(64 * 1024, input));
+    RoutesSeed { instance }
+        .deserialize(&mut de)
+        .map_err(|e| format!("ospfd answered bad JSON: {e}"))
 }
 
 // ---- the LSDB, streamed ----
@@ -429,12 +626,16 @@ impl<'de> Visitor<'de> for LinksSeed<'_> {
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
         let mut count = 0usize;
         while map.next_key::<IgnoredAny>()?.is_some() {
-            let l: Map<String, Value> = map.next_value()?;
+            let Obj(l) = map.next_value::<Obj<LinkJson<'de>>>()?;
             count += 1;
-            if count > MAX_LINKS {
+            let Some(l) = l.filter(|_| count <= MAX_LINKS) else {
                 continue;
-            }
-            let t = s(&l, "linkType").unwrap_or_default();
+            };
+            let t = l
+                .link_type
+                .as_ref()
+                .and_then(Loose::str)
+                .unwrap_or_default();
             let kind = if t.contains("point-to-point") {
                 1
             } else if t.contains("Transit") {
@@ -446,21 +647,15 @@ impl<'de> Visitor<'de> for LinksSeed<'_> {
             } else {
                 0
             };
-            let id = [
-                "neighborRouterId",
-                "designatedRouterAddress",
-                "networkAddress",
-            ]
-            .iter()
-            .find_map(|k| s(&l, k))
-            .and_then(|v| ip_u32(&v))
-            .unwrap_or(0);
-            let data = ["routerInterfaceAddress", "networkMask"]
-                .iter()
-                .find_map(|k| s(&l, k))
-                .and_then(|v| ip_u32(&v))
+            let addr = |v: &Option<Loose<'_>>| v.as_ref().and_then(Loose::str).and_then(ip_u32);
+            let id = addr(&l.neighbor_router_id)
+                .or_else(|| addr(&l.designated_router_address))
+                .or_else(|| addr(&l.network_address))
                 .unwrap_or(0);
-            let metric = n(&l, "tos0Metric")
+            let data = addr(&l.router_interface_address)
+                .or_else(|| addr(&l.network_mask))
+                .unwrap_or(0);
+            let metric = u64_of(&l.tos0_metric)
                 .and_then(|m| u16::try_from(m).ok())
                 .unwrap_or(0);
             self.0.links.push(Link {
@@ -472,6 +667,27 @@ impl<'de> Visitor<'de> for LinksSeed<'_> {
         }
         Ok(())
     }
+}
+
+/// One router link: only the fields kept (G3.4n: it was a JSON map per
+/// link, every key and value allocated).
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct LinkJson<'a> {
+    #[serde(borrow)]
+    link_type: Option<Loose<'a>>,
+    #[serde(borrow)]
+    neighbor_router_id: Option<Loose<'a>>,
+    #[serde(borrow)]
+    designated_router_address: Option<Loose<'a>>,
+    #[serde(borrow)]
+    network_address: Option<Loose<'a>>,
+    #[serde(borrow)]
+    router_interface_address: Option<Loose<'a>>,
+    #[serde(borrow)]
+    network_mask: Option<Loose<'a>>,
+    #[serde(borrow, rename = "tos0Metric")]
+    tos0_metric: Option<Loose<'a>>,
 }
 
 /// `attchedRouters: {"10.0.0.1": {"attachedRouterId": "10.0.0.1"}, ...}`
@@ -732,6 +948,27 @@ mod tests {
         assert_eq!(c.nexthops, vec![(None, "ether1".to_owned())]);
     }
 
+    /// G3.4n: the streamed reader gives what the buffer reader gives, the
+    /// cap holds, and odd shapes are skipped, not errors.
+    #[test]
+    fn routes_stream_like_the_buffer_and_odd_shapes_are_skipped() {
+        let j = r#"{"10.0.3.0/24":{"routeType":"N","cost":"20","area":"0.0.0.0","nexthops":[{"ip":"10.0.12.2","via":"ether1"},7]},
+                    "10.0.4.0/24":[1,2],"10.0.5.0/24":{"routeType":5,"nexthops":{"x":1}},"10.0.0.2":{"routeType":"R "}}"#;
+        let a = routes_v2(j, "v2").unwrap();
+        let b = read_routes(j.as_bytes(), "v2").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 2);
+        assert_eq!((a[0].cost, a[0].nexthops.len()), (20, 1));
+        assert_eq!((a[1].kind.as_str(), a[1].nexthops.len()), ("other", 0));
+        assert!(routes_v2("[1]", "v2").unwrap().is_empty());
+        assert!(read_routes(&b"{\"x/1\": "[..], "v2").is_err());
+        // A link that is not an object is skipped; the LSA stays.
+        let mut db = Lsdb::default();
+        read_lsdb_slice(br#"{"routerLinkStates":{"areas":{"0.0.0.0":[{"linkStateId":"1.1.1.1","advertisingRouter":"1.1.1.1","routerLinks":{"link0":5,"link1":{"linkType":"Stub Network","networkAddress":"10.0.0.0","networkMask":"255.0.0.0","tos0Metric":1}}}]}}}"#, &mut db).unwrap();
+        assert_eq!((db.lsas.len(), db.links.len()), (1, 1));
+        assert_eq!(db.links[0].kind, 3);
+    }
+
     pub(crate) const LSDB: &str = r#"{"routerId":"10.0.0.1","routerLinkStates":{"areas":{"0.0.0.0":[
         {"lsaAge":10,"options":"*|-|-|-|-|-|E|-","lsaFlags":6,"flags":3,"abr":true,"asbr":true,"lsaType":"router-LSA","linkStateId":"10.0.0.1","advertisingRouter":"10.0.0.1","lsaSeqNumber":"80000003","checksum":"1a2b","length":48,"numOfLinks":2,
          "routerLinks":{"link0":{"linkType":"another Router (point-to-point)","neighborRouterId":"10.0.0.2","routerInterfaceAddress":"10.0.12.1","numOfTosMetrics":0,"tos0Metric":10},
@@ -799,6 +1036,8 @@ mod tests {
                 let _ = neighbors_v3(&s, "x");
                 let _ = interfaces_v2(&s, "x");
                 let _ = routes_v2(&s, "x");
+                let _ = read_routes(s.as_bytes(), "x");
+                let _ = stub_v2(&s, "x");
                 let _ = secs(&s);
             }
         }
