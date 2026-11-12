@@ -204,3 +204,39 @@ fn drain_and_undrain_an_instance() {
     assert!(!lock(&h.session).store().running().routing.ospf.instances["v2"].stub_router);
     assert!(h.has_text("Drain"));
 }
+
+/// G3.4n: on a network read from the daemon (`engine::perf::ospf_scale`),
+/// Routes comes a page at a time with the total and the counts, the search
+/// runs on the router over every route, and the map held is kept when the
+/// router answers `unchanged`.
+#[test]
+fn routes_page_on_the_router_and_the_map_is_not_sent_again() {
+    let mut h = open(corerouter_engine::perf::ospf_scale(200, 50, 100, 1_000, 3_000));
+    panel(&mut h).instance = "v2".into();
+    tab(&mut h, Tab::Routes);
+    assert_eq!(panel(&mut h).routes["rows"].as_array().unwrap().len(), 200);
+    for t in ["3000 routes", "2000 intra-area", "1000 external", "1 / 15"] {
+        assert!(h.has_text(t), "{t}");
+    }
+    h.click(h.text("▶"));
+    refresh(&mut h);
+    assert!(h.has_text("2 / 15"));
+    let second = panel(&mut h).routes["rows"][0]["prefix"].clone();
+    assert_eq!(second, format!("{}/24", std::net::Ipv4Addr::from(0x1400_0000u32 + 200 * 256)));
+    // A search goes to the router and starts at the first page.
+    panel(&mut h).route_table.filter = "20.0.1.".into();
+    refresh(&mut h);
+    refresh(&mut h);
+    assert_eq!(panel(&mut h).route_page, 0);
+    assert_eq!(panel(&mut h).routes["total"], 1);
+    assert!(h.has_text("1 / 1"));
+    tab(&mut h, Tab::Topology);
+    let nodes = panel(&mut h).topo.nodes.len();
+    assert!(nodes >= 100, "{nodes}");
+    let token = panel(&mut h).topo.token.clone();
+    assert!(!token.is_empty());
+    refresh(&mut h);
+    // The second answer was `unchanged`: the map and its token stay.
+    assert_eq!((panel(&mut h).topo.nodes.len(), panel(&mut h).topo.token.clone()), (nodes, token));
+    assert!(panel(&mut h).topology["nodes"].as_array().is_some_and(|n| n.len() == nodes));
+}

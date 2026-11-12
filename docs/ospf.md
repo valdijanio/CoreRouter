@@ -81,14 +81,15 @@ mesmo commit (~0,12 s, **medido**, G3.9fe).
 | Comando | O que é |
 |---|---|
 | `routing.ospf.neighbor.list` | `/routing ospf neighbor`: estado (RFC 2328 §10.1), papel, selo "Full · DR", tempo no estado, BFD |
-| `routing.ospf.interface.list` | As interfaces como o daemon as roda (tipo, estado, MTU, hello/dead, DR/BDR), com o template |
+| `routing.ospf.interface.list` | As interfaces como o daemon as roda (tipo, estado, MTU, hello/dead, DR/BDR), com o template; busca por nome ou área e página de até 1 000 com o `total` (G3.4n) |
 | `routing.ospf.lsa.list` | `/routing ospf lsa`, paginado, por tipo, área e originador |
-| `routing.ospf.route.list` | As rotas que o `ospfd` calculou (intra, inter-área, E1/E2) |
-| `routing.ospf.topology` | Roteadores e redes de trânsito da LSDB com posição (layout por forças) e custo de cada ponta |
+| `routing.ospf.route.list` | As rotas que o `ospfd` calculou (intra, inter-área, E1/E2), paginadas (200 por padrão, até 1 000) com o `total` e a contagem por tipo (G3.4n) |
+| `routing.ospf.topology` | Roteadores e redes de trânsito da LSDB com posição (layout por forças) e custo de cada ponta; com `known` (o `token` do mapa que o chamador tem) responde `unchanged` sem refazer nem reenviar o mapa (G3.4n) |
 | `routing.ospf.path` | "Por que esse caminho?": o caminho mais curto até um endereço ou router id, custo somado salto a salto, conferido com a rota do daemon (`agrees`) |
 | `routing.ospf.neighbor.diagnose` | Por que um vizinho não chega a Full, com a seção da RFC |
 
-- **Vizinhos e interfaces** vêm em toda leitura do serviço `frr` (a cada 2 s, fora do lock).
+- **Vizinhos e interfaces** vêm em toda leitura do serviço `frr` (a cada 2 s, fora do lock), por
+  uma conexão vty mantida entre as leituras (G3.4n).
 - **A LSDB e as rotas** são lidas sob demanda, fora do lock: o comando pede (`crate::ospf_state`),
   a thread do FRR lê em fluxo direto do socket (`show ip ospf database <tipo> json`) para a tabela
   compacta `Lsdb` (uma linha fixa por LSA, links num vetor só) e devolve; a primeira resposta pode
@@ -126,7 +127,9 @@ engine: interfaces que entram, tipo e `passive` sugeridos, autenticação ausent
 caem com Safe Mode), **LSDB** (paginada por tipo), **Routes** (selecionar uma rota mostra "Por que
 esse caminho?") e **Topology** (o mapa desenhado da LSDB; clique num roteador para o caminho; arraste
 e role para mover e aproximar). A resposta da topologia vira vetores planos ao chegar: 500
-roteadores pintam e tesselam em 3,2 ms por quadro em debug (**medido**).
+roteadores pintam e tesselam em 3,2 ms por quadro em debug (**medido**). Neighbors, LSDB e Routes
+montam as linhas quando a resposta chega, não a cada quadro; Routes vem em páginas de 200, e a
+busca de prefixo roda no roteador, sobre todas as rotas (G3.4n).
 
 ## Segment Routing (G3.4f)
 

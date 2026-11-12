@@ -130,7 +130,8 @@ fn run(session: &Shared, mut reader: Box<dyn RoutingReader>, synced: bool, healt
                     }
                 }
                 // G3.4b: OSPF neighbors and interfaces, every poll (two
-                // small JSON answers per instance).
+                // JSON answers per instance, on a kept connection; 4 000
+                // interfaces and 500 neighbors: see docs/ospf.md, G3.4n).
                 if !cfg.routing.ospf.instances.is_empty() {
                     match reader.ospf_state(&cfg) {
                         Ok((n, i)) => {
@@ -178,11 +179,13 @@ fn run(session: &Shared, mut reader: Box<dyn RoutingReader>, synced: bool, healt
         // Copied before the lock is taken (126 µs for 1 000 sessions,
         // **medido**): under it only the move.
         let sample = status.clone();
-        let (wanted, ospf_wanted) = {
+        let (wanted, ospf_wanted, old) = {
             let mut s = lock(session);
-            s.set_routing_status(sample);
-            (s.bgp_routes_wanted(), s.ospf_db_wanted())
+            let old = s.set_routing_status(sample);
+            (s.bgp_routes_wanted(), s.ospf_db_wanted(), old)
         };
+        // Freed out of the lock (G3.4n).
+        drop(old);
         // G3.4b: the OSPF databases a window asked for, streamed here
         // (10 000 LSAs: see docs/ospf.md) and handed back under the lock.
         if !ospf_wanted.is_empty() {
@@ -208,7 +211,8 @@ fn run(session: &Shared, mut reader: Box<dyn RoutingReader>, synced: bool, healt
 }
 
 /// The running config's routing part (all the reader needs), copied under
-/// the lock so the read itself runs outside it.
+/// the lock so the read itself runs outside it. The sections are shared
+/// (`CowArc`): ~1 µs whatever the size of the config (G3.4n, **medido**).
 fn routing_only(session: &Shared) -> Config {
     let routing = lock(session).store().running().routing.clone();
     Config {
