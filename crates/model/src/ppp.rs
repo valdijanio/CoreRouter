@@ -1157,6 +1157,10 @@ pub struct ServiceStats {
     pub auth_reject: u64,
     pub throttled: u64,
     pub dataplane: bool,
+    /// G4.3v: why the subscribers' traffic is not in XDP (`dataplane`
+    /// false): the slow path through `bng0` carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataplane_reason: Option<String>,
     /// Control-plane workers of the service (G4.3g; 1 = one thread).
     #[serde(default)]
     pub workers: u32,

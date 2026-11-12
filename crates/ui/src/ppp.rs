@@ -1186,6 +1186,11 @@ impl PppPanel {
                 chip::chip(ui, "XDP", chip::GREEN.tone(&v));
             } else {
                 chip::chip(ui, tr_in(SCOPE, l, "slow path"), chip::AMBER.tone(&v));
+                // G4.3v: why not XDP.
+                let why = text(&m, "dataplane_reason");
+                if !why.is_empty() {
+                    ui.weak(why);
+                }
             }
             let err = text(&m, "last_error");
             if !err.is_empty() {
