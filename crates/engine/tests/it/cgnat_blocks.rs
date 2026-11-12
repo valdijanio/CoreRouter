@@ -475,3 +475,93 @@ fn the_routers_own_address_gets_no_block() {
             .is_ok()
     );
 }
+
+/// G2.7d: the notebook's load test (dev.591), small. A pool with fewer
+/// blocks than online subscribers: those left without a block are refused
+/// (the blocks queue's ICMP), and that is the pool out of blocks, not a
+/// subscriber out of ports. No port alert for them (it said "used 256,
+/// 100 %" with no block), the health check says the pool is out, the log
+/// says "no free block", and the capacity suggests smaller blocks.
+#[test]
+fn a_pool_out_of_blocks_is_not_a_subscriber_out_of_ports() {
+    let mut s = Session::virtual_lab();
+    s.tick(T0);
+    // One public address, 64-port blocks with the full range: 1008 blocks
+    // would be plenty; 2 blocks of 32256 are not, for 40 online.
+    ok(
+        &mut s,
+        "ip.firewall.cgnat.pool.add",
+        json!({"name": "tiny", "mode": "blocks", "inside": "100.64.0.0/24", "outside": "203.0.113.9", "ports_per_subscriber": 32256, "max_blocks": 1}),
+    );
+    for t in 1..=30 {
+        s.tick(T0 + t);
+    }
+    assert_eq!(blocks(&mut s).len(), 2);
+    let with_block: Vec<String> = blocks(&mut s)
+        .iter()
+        .map(|r| r["subscriber"].as_str().unwrap().to_owned())
+        .collect();
+    let alerts = ok(&mut s, "ip.firewall.cgnat.alert.list", json!({}));
+    let alerts = alerts
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| alerts["rows"].as_array().cloned().unwrap_or_default());
+    assert!(
+        alerts
+            .iter()
+            .all(|a| with_block.iter().any(|b| a["subscriber"] == b.as_str())),
+        "only subscribers holding a block may be out of their ports: {alerts:?}"
+    );
+    let health = ok(&mut s, "system.health.check", json!({}));
+    let row = health["checks"]
+        .as_array()
+        .or_else(|| health.as_array())
+        .unwrap()
+        .iter()
+        .find(|c| c["key"] == "cgnat.ports")
+        .cloned()
+        .unwrap();
+    assert!(
+        row["reason"]
+            .as_str()
+            .unwrap()
+            .contains("não tem bloco livre"),
+        "{row}"
+    );
+    let cap = ok(
+        &mut s,
+        "ip.firewall.cgnat.capacity.get",
+        json!({"pool": "tiny"}),
+    );
+    assert_eq!(cap["blocks"], 2, "{cap}");
+    assert_eq!(cap["blocks_in_use"], 2, "{cap}");
+    assert!(cap["no_block_24h"].as_u64().unwrap() >= 30, "{cap}");
+    assert!(cap["no_block_icmp_24h"].as_u64().unwrap() > 0, "{cap}");
+    assert_eq!(cap["hit_24h"], 0, "nobody ran out of its own ports: {cap}");
+    // The lab's subscribers use few ports: smaller blocks fit all 40 on the
+    // one address (the unit tests cover "more public addresses").
+    let sug = &cap["suggestion"];
+    assert_eq!(sug["fits"], true, "{cap}");
+    assert_eq!(sug["public_needed"], 1, "{cap}");
+    assert!(
+        sug["ports_per_subscriber"].as_u64().unwrap() < 32256,
+        "{cap}"
+    );
+    assert!(sug["per_address"].as_u64().unwrap() >= 40, "{cap}");
+    assert!(
+        sug["reason"]
+            .as_str()
+            .unwrap()
+            .contains("ran out of blocks"),
+        "{cap}"
+    );
+    let log = ok(
+        &mut s,
+        "log.print",
+        json!({"topics": ["cgnat"], "find": "no free block", "limit": 2000}),
+    );
+    assert!(
+        log.to_string().contains("no free block: pool tiny"),
+        "{log}"
+    );
+}

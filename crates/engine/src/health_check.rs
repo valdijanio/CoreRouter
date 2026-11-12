@@ -187,6 +187,9 @@ pub struct Inputs {
     /// CGNAT: subscribers above their pool's alert percent, and new
     /// connections that found no free port since the start.
     pub cgnat: Option<(usize, u64)>,
+    /// G2.7d: subscribers refused lately because their blocks-mode pool had
+    /// no free block (the pool is out, not the subscriber).
+    pub cgnat_pool_full: usize,
     /// OOM kills seen in the last [`OOM_WINDOW`] seconds.
     pub oom_recent: Option<u64>,
     /// NTP client enabled and its state.
@@ -494,6 +497,14 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
     // CGNAT ports.
     match i.cgnat {
         None => push("cgnat.ports", "CGNAT ports", Severity::Ok, None, "sem CGNAT por blocos".into(), None),
+        // G2.7d: the pool without a free block first: more public addresses
+        // (or fewer ports per block) is the cure, not more ports.
+        Some(_) if i.cgnat_pool_full > 0 => {
+            let n = i.cgnat_pool_full;
+            push("cgnat.ports", "CGNAT ports", Severity::Error, Some(format!("{n} sem bloco")),
+                format!("{n} assinante(s) recusado(s): o pool não tem bloco livre"),
+                Some("O pool em blocos esgotou: mais endereços públicos no outside, ou menos portas por bloco (IP › Firewall › CGNAT › Capacity sugere)."));
+        }
         Some((above, failed)) => {
             let s = if failed > 0 { Severity::Error } else if above > 0 { Severity::Warning } else { Severity::Ok };
             let reason = match s {
@@ -1038,6 +1049,8 @@ impl Session {
         }
         if self.cgnat_has_blocks() {
             i.cgnat = self.ext::<CgnatRuntime>().map(|c| (c.alerts().values().filter(|a| a.above).count(), c.insert_failed()));
+            let now = self.now().unwrap_or(0);
+            i.cgnat_pool_full = self.ext::<CgnatRuntime>().map_or(0, |c| c.pool_full_recent(now));
         }
         let ntp = &self.store().running().system.ntp_client;
         let enabled = ntp.enabled;
@@ -1179,6 +1192,7 @@ mod tests {
             nics: vec![("ether1".into(), 0.0, 0.0)],
             conntrack: Some((1000, 262_144)),
             cgnat: None,
+            cgnat_pool_full: 0,
             oom_recent: Some(0),
             ntp: Some((true, NtpState::Synchronized)),
             ntp_needed: false,
@@ -1327,6 +1341,7 @@ mod tests {
             ("conntrack 99", |i| i.conntrack = Some((99, 100)), "conntrack", Severity::Error),
             ("cgnat above", |i| i.cgnat = Some((3, 0)), "cgnat.ports", Severity::Warning),
             ("cgnat failures", |i| i.cgnat = Some((0, 12)), "cgnat.ports", Severity::Error),
+            ("cgnat pool out of blocks", |i| { i.cgnat = Some((0, 0)); i.cgnat_pool_full = 15 }, "cgnat.ports", Severity::Error),
             ("oom", |i| i.oom_recent = Some(1), "oom", Severity::Error),
             ("ntp off, nothing needs it", |i| i.ntp = Some((false, NtpState::Stopped)), "ntp", Severity::Ok),
             ("ntp off, radius needs it", |i| { i.ntp = Some((false, NtpState::Stopped)); i.ntp_needed = true }, "ntp", Severity::Warning),

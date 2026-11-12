@@ -98,6 +98,23 @@ pub struct Record {
     pub until: Option<u64>,
 }
 
+/// G2.7d: a subscriber refused because its blocks-mode pool had no free
+/// block left: the pool is out, not the subscriber (it held no ports).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PoolFull {
+    pub subscriber: Ipv4Addr,
+    pub pool: String,
+    /// New connections refused, and the ICMP host unreachable sent.
+    pub refused: u64,
+    pub icmp: u64,
+    pub first: u64,
+    pub last: u64,
+}
+
+/// G2.7d: how recent a refusal for lack of a free block still counts in
+/// the health check.
+pub const POOL_FULL_RECENT_SECS: u64 = 600;
+
 /// A subscriber that ran out of ports (or close to it).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Alert {
@@ -145,6 +162,9 @@ pub struct CgnatRuntime {
     exhaustion: corerouter_hal::cgnat::ExhaustionStats,
     records: Vec<Record>,
     alerts: BTreeMap<Ipv4Addr, Alert>,
+    /// G2.7d: subscribers refused for lack of a free block (not alerts:
+    /// they used none of their ports).
+    pool_full: BTreeMap<Ipv4Addr, PoolFull>,
     last_scan: Option<u64>,
     /// The running pools at the last tick: a change releases the blocks
     /// whose geometry left at once, not at the next scan.
@@ -171,6 +191,19 @@ impl CgnatRuntime {
 
     pub fn alerts(&self) -> &BTreeMap<Ipv4Addr, Alert> {
         &self.alerts
+    }
+
+    pub fn pool_full(&self) -> &BTreeMap<Ipv4Addr, PoolFull> {
+        &self.pool_full
+    }
+
+    /// G2.7d: subscribers refused for lack of a free block in the
+    /// [`POOL_FULL_RECENT_SECS`] before `now`.
+    pub fn pool_full_recent(&self, now: u64) -> usize {
+        self.pool_full
+            .values()
+            .filter(|f| f.last.saturating_add(POOL_FULL_RECENT_SECS) > now)
+            .count()
     }
 
     pub fn insert_failed(&self) -> u64 {
@@ -1060,7 +1093,10 @@ impl Session {
         }
         let cgnat = self.store().running().ip.cgnat.clone();
         let mut lines = Vec::new();
-        let counted: Vec<(Ipv4Addr, corerouter_hal::cgnat::Hit)> = hits.clone();
+        // G2.7d: (subscriber, hit, the pool had no free block). A blocks-mode
+        // subscriber without a block was refused by the blocks queue for the
+        // pool's lack of blocks, not for running out of its own ports.
+        let mut counted: Vec<(Ipv4Addr, corerouter_hal::cgnat::Hit, bool)> = Vec::with_capacity(hits.len());
         if let Some(rt) = self.ext_mut::<CgnatRuntime>() {
             let t = &mut rt.exhaustion;
             t.seen = t.seen.saturating_add(stats.seen);
@@ -1070,11 +1106,38 @@ impl Session {
             t.untracked = t.untracked.saturating_add(stats.untracked);
             t.overrun = t.overrun.saturating_add(stats.overrun);
             for (sub, hit) in hits {
+                let pool = cgnat.pool_of(sub);
+                let no_block = pool.is_some_and(|p| p.mode == Mode::Blocks)
+                    && rt.active.get(&sub).is_none_or(Vec::is_empty);
+                counted.push((sub, hit, no_block));
+                let pool = pool.map(|p| (p.name.clone(), u64::from(p.ports_per_subscriber) * u64::from(if p.mode == Mode::Blocks { p.max_blocks } else { 1 })));
+                let (pool, ports) = pool.unwrap_or_default();
+                if no_block {
+                    if rt.pool_full.len() >= MAX_ALERTS && !rt.pool_full.contains_key(&sub) {
+                        rt.pool_full.retain(|_, f| f.last.saturating_add(86_400) > now);
+                        if rt.pool_full.len() >= MAX_ALERTS {
+                            continue;
+                        }
+                    }
+                    let f = rt.pool_full.entry(sub).or_insert_with(|| PoolFull {
+                        subscriber: sub,
+                        pool: pool.clone(),
+                        refused: 0,
+                        icmp: 0,
+                        first: now,
+                        last: 0,
+                    });
+                    if now.saturating_sub(f.last) >= REFUSED_LOG_SECS {
+                        lines.push((sub, pool, hit, true));
+                    }
+                    f.refused = f.refused.saturating_add(hit.refused);
+                    f.icmp = f.icmp.saturating_add(hit.icmp);
+                    f.last = now;
+                    continue;
+                }
                 if rt.alerts.len() >= MAX_ALERTS && !rt.alerts.contains_key(&sub) {
                     continue;
                 }
-                let pool = cgnat.pool_of(sub).map(|p| (p.name.clone(), u64::from(p.ports_per_subscriber) * u64::from(if p.mode == Mode::Blocks { p.max_blocks } else { 1 })));
-                let (pool, ports) = pool.unwrap_or_default();
                 let a = rt.alerts.entry(sub).or_insert_with(|| Alert {
                     subscriber: sub,
                     pool,
@@ -1092,7 +1155,7 @@ impl Session {
                     last_refused: None,
                 });
                 if a.last_refused.is_none_or(|t| now.saturating_sub(t) >= REFUSED_LOG_SECS) {
-                    lines.push((sub, a.pool.clone(), hit));
+                    lines.push((sub, a.pool.clone(), hit, false));
                 }
                 a.refused = a.refused.saturating_add(hit.refused);
                 a.icmp = a.icmp.saturating_add(hit.icmp);
@@ -1101,9 +1164,10 @@ impl Session {
             }
         }
         // RFC 8158 §4.6.7.3: refused for having every port it may have
-        // (`nat_limit` keeps it to one per subscriber a minute, §5.2).
-        for (sub, hit) in &counted {
-            if hit.refused == 0 {
+        // (`nat_limit` keeps it to one per subscriber a minute, §5.2). The
+        // pool without a free block is §4.6.5, logged when allocating.
+        for (sub, hit, no_block) in &counted {
+            if hit.refused == 0 || *no_block {
                 continue;
             }
             if let Some(p) = cgnat.pool_of(*sub) {
@@ -1113,20 +1177,30 @@ impl Session {
             }
         }
         if let Some(store) = self.cgnat_capacity() {
-            for (sub, hit) in &counted {
+            for (sub, hit, no_block) in &counted {
                 let pool = cgnat.pool_of(*sub).map(|p| p.name.clone()).unwrap_or_default();
-                store.refused(now, &pool, *sub, hit.refused, hit.icmp);
+                if *no_block {
+                    store.pool_full(now, &pool, *sub, hit.refused, hit.icmp);
+                } else {
+                    store.refused(now, &pool, *sub, hit.refused, hit.icmp);
+                }
             }
         }
-        for (sub, pool, hit) in lines {
+        for (sub, pool, hit, no_block) in lines {
+            // G2.7d: the pool out of blocks is not the subscriber out of ports.
+            let what = if no_block {
+                format!("no free block: pool {pool} has none left for {sub}")
+            } else {
+                format!("no free port: {sub} in pool {pool}")
+            };
             self.log_event(
                 &["cgnat", "warning"],
                 "cgnat",
                 format!(
-                    "no free port: {sub} in pool {pool}: {} new connections refused, {} ICMP host unreachable sent",
+                    "{what}: {} new connections refused, {} ICMP host unreachable sent",
                     hit.refused, hit.icmp
                 ),
-                json!({"subscriber": sub, "pool": pool, "refused": hit.refused, "icmp": hit.icmp}),
+                json!({"subscriber": sub, "pool": pool, "refused": hit.refused, "icmp": hit.icmp, "pool_full": no_block}),
             );
         }
     }
