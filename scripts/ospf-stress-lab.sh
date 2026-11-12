@@ -89,6 +89,7 @@ while [ $# -gt 0 ]; do
 	--selftest-remote) SELFTEST=1; shift ;;
 	--out) OUT=$2; shift 2 ;;
 	--hold) HOLD=$2; shift 2 ;;
+	--load) LOAD=$2; shift 2 ;;
 	-h | --help) usage ;;
 	*) echo "unknown option $1"; usage ;;
 	esac
@@ -996,7 +997,10 @@ test_neighbors() {
 		else
 			t_full=- verdict="FAIL (only $(dut_neighbors_full) of $((n + 1)) Full)"
 			[ $DUT = local ] && vty 'show ip ospf neighbor' | grep -v Full | head -n 20 >&2
-			[ $DUT = local ] && vty 'show ip ospf interface brief' | head -n 30 >&2
+			if [ "$HOLD" -gt 0 ]; then
+				log "neighbors $n: holding for $HOLD s with the failure up"
+				sleep "$HOLD"
+			fi
 		fi
 		local min=999999 below=0 end=$((SECONDS + STABLE_SECS)) f
 		if [ "$t_full" != - ]; then
@@ -1241,8 +1245,8 @@ LAT_CMDS=(
 test_latency() {
 	say "## 5. Command latency with load ($LOADED_LSAS LSAs, $LOADED_ROUTES routes; $LAT_N calls each)"
 	say ""
-	say "| command | reply (KiB) | CLI p50 (ms) | CLI p99 | MCP p50 (ms) | MCP p99 |"
-	say "|---|---|---|---|---|---|"
+	say "| command | reply (bytes) | reply | CLI p50 (ms) | CLI p99 | MCP p50 (ms) | MCP p99 |"
+	say "|---|---|---|---|---|---|---|"
 	local e id params f t0 size
 	for e in "${LAT_CMDS[@]}" "inspect|"; do
 		id=${e%%|*} params=${e#*|}
@@ -1263,7 +1267,10 @@ test_latency() {
 			fi
 			since "$t0" >>"$f.cli"
 		done
-		size=$(($(stat -c %s "$f.out") / 1024))
+		size=$(stat -c %s "$f.out")
+		# What the command answered (a "pending" read is a fast empty one).
+		local note
+		note=$(jq -r 'if type == "object" then [(if .pending then "pending" else empty end), (if .rows then "\(.rows | length) rows" else empty end), (if .total then "total \(.total)" else empty end)] | join(", ") elif type == "array" then "\(length) rows" else "" end' "$f.out" 2>/dev/null || echo "?")
 		mcp_open || { fail "latency: MCP"; return; }
 		for i in $(seq "$LAT_N"); do
 			MCP_ID=$((MCP_ID + 1))
@@ -1280,7 +1287,7 @@ test_latency() {
 			since "$t0" >>"$f.mcp"
 		done
 		mcp_close
-		say "| \`$id\` | $size | $(pct "$f.cli" 50) | $(pct "$f.cli" 99) | $(pct "$f.mcp" 50) | $(pct "$f.mcp" 99) |"
+		say "| \`$id\` | $size | $note | $(pct "$f.cli" 50) | $(pct "$f.cli" 99) | $(pct "$f.mcp" 50) | $(pct "$f.mcp" 99) |"
 	done
 	say ""
 }
@@ -1522,7 +1529,8 @@ if has_test ops || has_test latency; then
 	gen_stop
 fi
 has_test convergence && test_convergence
-if [ "$HOLD" -gt 0 ]; then
+if [ "$HOLD" -gt 0 ] && [ "$TESTS" = none ]; then
+	[ -n "${LOAD:-}" ] && lsdb_load "$LOAD"
 	log "holding for $HOLD s (cargo xtask vm-lab ssh; vtysh --vty_socket $W/dut/run/frr)"
 	sleep "$HOLD"
 fi
