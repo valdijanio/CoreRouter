@@ -335,6 +335,29 @@ fn list_of(r: &Value, k: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// "1–200 of 3000" with `<` `>` under a paged list (the BGP › Routes
+/// pager); nothing when it all fits one page.
+fn pager(ui: &mut Ui, app: &mut CoreRouterUi, page: &mut u32, total: u64) {
+    let size = u64::from(PAGE);
+    let first = u64::from(*page) * size;
+    if total <= size && *page == 0 {
+        return;
+    }
+    let l = app.lang.labels;
+    ui.horizontal(|ui| {
+        let last = (first + size).min(total);
+        ui.weak(format!("{}–{last} {} {total}", first + 1, tr_in(SCOPE, l, "of")));
+        if ui.add_enabled(*page > 0, egui::Button::new("<")).clicked() {
+            *page -= 1;
+            app.cache.refreshed_at = None;
+        }
+        if ui.add_enabled(last < total, egui::Button::new(">")).clicked() {
+            *page += 1;
+            app.cache.refreshed_at = None;
+        }
+    });
+}
+
 /// The `rows` of an answer, borrowed.
 fn rows_of(v: &Value) -> &[Value] {
     v.get("rows").and_then(Value::as_array).map_or(&[], Vec::as_slice)
@@ -1053,18 +1076,7 @@ impl OspfPanel {
         let out = table::show(ui, LSDB, footer_h, &mut self.lsa_table, &LSA_COLUMNS, &self.lsa_rows, |_, _| {});
         self.column_help(app, out.help, &LSA_COLUMNS);
         let total = self.lsas.get("total").and_then(Value::as_u64).unwrap_or(0);
-        ui.horizontal(|ui| {
-            let pages = total.div_ceil(u64::from(PAGE)).max(1);
-            if ui.add_enabled(self.lsa_page > 0, egui::Button::new("◀")).clicked() {
-                self.lsa_page -= 1;
-                app.cache.refreshed_at = None;
-            }
-            ui.label(format!("{} / {pages}", self.lsa_page + 1));
-            if ui.add_enabled(u64::from(self.lsa_page + 1) < pages, egui::Button::new("▶")).clicked() {
-                self.lsa_page += 1;
-                app.cache.refreshed_at = None;
-            }
-        });
+        pager(ui, app, &mut self.lsa_page, total);
         let v = ui.visuals().clone();
         let by = self.lsas.get("by_type").cloned().unwrap_or(Value::Null);
         let n = |k: &str| by.get(k).and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -1115,18 +1127,7 @@ impl OspfPanel {
             self.path_view(app, ui);
         }
         let total = self.routes.get("total").and_then(Value::as_u64).unwrap_or(self.route_rows.len() as u64);
-        ui.horizontal(|ui| {
-            let pages = total.div_ceil(u64::from(PAGE)).max(1);
-            if ui.add_enabled(self.route_page > 0, egui::Button::new("◀")).clicked() {
-                self.route_page -= 1;
-                app.cache.refreshed_at = None;
-            }
-            ui.label(format!("{} / {pages}", self.route_page + 1));
-            if ui.add_enabled(u64::from(self.route_page + 1) < pages, egui::Button::new("▶")).clicked() {
-                self.route_page += 1;
-                app.cache.refreshed_at = None;
-            }
-        });
+        pager(ui, app, &mut self.route_page, total);
         let v = ui.visuals().clone();
         let by = self.routes.get("by_kind");
         let n = |k: &str| by.and_then(|b| b.get(k)).and_then(Value::as_u64).unwrap_or(0) as usize;

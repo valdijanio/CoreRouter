@@ -215,12 +215,12 @@ fn routes_page_on_the_router_and_the_map_is_not_sent_again() {
     panel(&mut h).instance = "v2".into();
     tab(&mut h, Tab::Routes);
     assert_eq!(panel(&mut h).routes["rows"].as_array().unwrap().len(), 200);
-    for t in ["3000 routes", "2000 intra-area", "1000 external", "1 / 15"] {
+    for t in ["3000 routes", "2000 intra-area", "1000 external", "1–200 of 3000"] {
         assert!(h.has_text(t), "{t}");
     }
-    h.click(h.text("▶"));
+    h.click(h.text(">"));
     refresh(&mut h);
-    assert!(h.has_text("2 / 15"));
+    assert!(h.has_text("201–400 of 3000"));
     let second = panel(&mut h).routes["rows"][0]["prefix"].clone();
     assert_eq!(second, format!("{}/24", std::net::Ipv4Addr::from(0x1400_0000u32 + 200 * 256)));
     // A search goes to the router and starts at the first page.
@@ -229,7 +229,7 @@ fn routes_page_on_the_router_and_the_map_is_not_sent_again() {
     refresh(&mut h);
     assert_eq!(panel(&mut h).route_page, 0);
     assert_eq!(panel(&mut h).routes["total"], 1);
-    assert!(h.has_text("1 / 1"));
+    assert!(!h.has_text("of 1"), "one page: no pager");
     tab(&mut h, Tab::Topology);
     let nodes = panel(&mut h).topo.nodes.len();
     assert!(nodes >= 100, "{nodes}");
