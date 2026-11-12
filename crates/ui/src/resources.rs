@@ -43,6 +43,8 @@ const CPU: &str = "system.resource.cpu.print";
 const PROCS: &str = "system.resource.process.print";
 const NET: &str = "system.resource.network.print";
 const SENSORS: &str = "system.health.print";
+/// G1.6zy: the ECC modules and their errors.
+const MEMORY: &str = "system.health.memory.print";
 pub(crate) const CHECK: &str = "system.health.check";
 /// Refreshes (1 s) between two health checks for the top bar's chip.
 const CHIP_EVERY: u32 = 5;
@@ -102,6 +104,7 @@ const T_IFACES: &str = "resources-ifaces";
 const T_DISK: &str = "resources-disk";
 const T_NET: &str = "resources-net";
 const T_SENSORS: &str = "resources-sensors";
+const T_DIMMS: &str = "resources-dimms";
 const T_PROCS: &str = "resources-procs";
 const T_THREADS: &str = "resources-threads";
 
@@ -115,6 +118,8 @@ pub(crate) struct ResourcesPanel {
     pub(crate) threads: Option<Value>,
     pub(crate) net: Option<Value>,
     pub(crate) sensors: Option<Value>,
+    /// G1.6zy: `system.health.memory.print`.
+    pub(crate) memory: Option<Value>,
     pub(crate) check: Option<Value>,
     /// The last refusal (an old daemon, a backend without readings).
     pub(crate) error: Option<String>,
@@ -129,6 +134,7 @@ pub(crate) struct ResourcesPanel {
     disks: TableState,
     links: TableState,
     sensor_table: TableState,
+    dimm_table: TableState,
     proc_table: TableState,
     thread_table: TableState,
 }
@@ -224,7 +230,12 @@ impl PanelState for ResourcesPanel {
                 json!({"sort": if self.sort.is_empty() { "cpu" } else { self.sort }, "limit": PROC_LIMIT}),
             )),
             Tab::Threads => out.push(q("threads", PROCS, json!({"threads": true}))),
-            Tab::Memory => out.push(q("procs", PROCS, json!({"sort": "memory", "limit": 8}))),
+            Tab::Memory => {
+                out.push(q("procs", PROCS, json!({"sort": "memory", "limit": 8})));
+                if app.has_command(MEMORY) {
+                    out.push(q("memory", MEMORY, Value::Null));
+                }
+            }
             Tab::Disk | Tab::OsLog => {}
         }
         if self.tab == Tab::Overview {
@@ -245,6 +256,7 @@ impl PanelState for ResourcesPanel {
             "threads" => &mut self.threads,
             "net" => &mut self.net,
             "sensors" => &mut self.sensors,
+            "memory" => &mut self.memory,
             "check" => &mut self.check,
             _ => return,
         };
@@ -574,6 +586,8 @@ impl ResourcesPanel {
             self.kernel_memory(ui, l, &p);
         });
         ui.add_space(8.0);
+        self.ecc_modules(ui, l);
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.strong(tr_in(SCOPE, l, "Largest processes"));
             self.info(ui, l, "mem.top", "Largest processes");
@@ -583,6 +597,64 @@ impl ResourcesPanel {
                 ui.monospace(format!("{:>8}", human_bytes(x.get("memory").and_then(Value::as_u64).unwrap_or(0))));
                 ui.label(s(x, "name"));
             });
+        }
+    }
+
+    /// G1.6zy: one row per ECC module, its errors since boot.
+    fn ecc_modules(&mut self, ui: &mut Ui, l: Lang) {
+        let Some(m) = self.memory.clone() else { return };
+        ui.horizontal(|ui| {
+            ui.strong(tr_in(SCOPE, l, "ECC modules"));
+            self.info(ui, l, "mem.ecc", "ECC modules");
+        });
+        if m.get("ecc").and_then(Value::as_bool) != Some(true) {
+            ui.weak(tr_in(SCOPE, l, "No memory controller reports ECC: errors are not counted on this machine."));
+            return;
+        }
+        let rows: Vec<Row> = arr(m.get("dimms"))
+            .iter()
+            .map(|d| {
+                let st = s(d, "state");
+                let n = |k: &str| d.get(k).and_then(Value::as_u64).unwrap_or(0).to_string();
+                let name = if s(d, "label").is_empty() { format!("{} {}", s(d, "controller"), s(d, "name")) } else { s(d, "label").to_owned() };
+                Row {
+                    key: format!("{}/{}", s(d, "controller"), s(d, "name")),
+                    cells: vec![
+                        name,
+                        s(d, "location").to_owned(),
+                        human_bytes(d.get("size_mb").and_then(Value::as_u64).unwrap_or(0).saturating_mul(1 << 20)),
+                        s(d, "type").to_owned(),
+                        n("ce"),
+                        n("ue"),
+                        crate::chip::cell("", &[(st, level_kind(st))]),
+                    ],
+                    dimmed: false,
+                    section: false,
+                    tint: None,
+                }
+            })
+            .collect();
+        let cols = [
+            col("Module").help("resources.col.dimm"),
+            col("Location"),
+            num("Size"),
+            col("Type"),
+            num("CE").help("resources.col.ce"),
+            num("UE").help("resources.col.ue"),
+            col("State"),
+        ];
+        // Its own height (as Overview's ports): the largest processes stay below.
+        let h = (rows.len().min(12) as f32 + 2.6) * ui.spacing().interact_size.y;
+        ui.allocate_ui(vec2(ui.available_width(), h), |ui| {
+            let out = table::show(ui, T_DIMMS, 0.0, &mut self.dimm_table, &cols, &rows, |_, _| {});
+            if let Some(k) = out.help {
+                self.help = Some(HelpView::new(k, col_title(&cols, k, l)));
+            }
+        });
+        let lost = m.get("hardware_corrupted_kib").and_then(Value::as_u64).unwrap_or(0);
+        let noinfo = m.get("ce_noinfo").and_then(Value::as_u64).unwrap_or(0) + m.get("ue_noinfo").and_then(Value::as_u64).unwrap_or(0);
+        if lost > 0 || noinfo > 0 {
+            ui.weak(format!("{}: {lost} KiB · {}: {noinfo}", tr_in(SCOPE, l, "Taken out of use"), tr_in(SCOPE, l, "Errors without a module")));
         }
     }
 
@@ -931,6 +1003,7 @@ fn static_name(name: &str) -> &'static str {
         "BGP GR without BFD",
         "Previous boot",
         "Crash store",
+        "Memory errors",
     ]
     .into_iter()
     .find(|n| *n == name)

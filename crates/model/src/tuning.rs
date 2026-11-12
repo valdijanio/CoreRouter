@@ -350,6 +350,9 @@ pub const PARAMS: &[Param] = &[
     )),
     init_ns(p("kernel.panic", SEC_STABILITY, (0, 3600), "s", Some(0))),
     init_ns(choice("kernel.panic_on_oops", SEC_STABILITY, OFF_ON, 0)),
+    // G1.6zy: an uncorrectable memory error in a process's page.
+    init_ns(choice("vm.memory_failure_early_kill", SEC_STABILITY, OFF_ON, 0)),
+    init_ns(choice("vm.memory_failure_recovery", SEC_STABILITY, OFF_ON, 1)),
     // G1.6zx: PID 1 turns both on at boot on a real machine (not in a VM).
     init_ns(choice("kernel.softlockup_panic", SEC_STABILITY, OFF_ON, 0)),
     init_ns(choice("kernel.hardlockup_panic", SEC_STABILITY, OFF_ON, 0)),

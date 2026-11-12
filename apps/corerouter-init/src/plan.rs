@@ -469,6 +469,9 @@ pub struct BootOptions {
     pub modules: bool,
     /// G1.6zf: look for the motherboard's sensor chip (`corerouter.sensors=`).
     pub sensors: Sensors,
+    /// G1.6zy: load the memory controllers' EDAC drivers that write an error
+    /// line where there is no ECC (`corerouter.edac=`).
+    pub edac: Sensors,
     /// G1.30: that many simulated Wi-Fi radios (`corerouter.hwsim=2`,
     /// `mac80211_hwsim`), for a test of the image where there is no card.
     pub hwsim: Option<u8>,
@@ -505,6 +508,32 @@ impl Sensors {
     }
 }
 
+/// G1.6zy: the firmware says the system memory has ECC: an SMBIOS type 16
+/// structure (Physical Memory Array, DSP0134 §7.17) of use "System memory"
+/// (byte 5 = 0x03) whose "Memory Error Correction" (byte 6) is single-bit
+/// ECC (0x05), multi-bit ECC (0x06) or CRC (0x07). `raws`: the `raw` files
+/// of `/sys/firmware/dmi/entries/16-*`.
+pub fn smbios_ecc(raws: &[Vec<u8>]) -> bool {
+    raws.iter().any(|r| {
+        r.first() == Some(&16)
+            && r.get(1).is_some_and(|len| *len >= 7)
+            && r.get(5) == Some(&0x03)
+            && matches!(r.get(6), Some(0x05..=0x07))
+    })
+}
+
+impl Sensors {
+    /// G1.6zy: load the EDAC drivers that need ECC to be quiet? `auto`: on
+    /// a real machine whose firmware says the memory has ECC.
+    pub fn edac_wanted(self, cpuinfo: &str, ecc: bool) -> bool {
+        match self {
+            Sensors::On => true,
+            Sensors::Off => false,
+            Sensors::Auto => ecc && !virtual_machine(cpuinfo),
+        }
+    }
+}
+
 /// The CPU says it runs under a hypervisor (CPUID.1:ECX[31], the
 /// `hypervisor` flag of `/proc/cpuinfo`: KVM, VMware, Hyper-V, Xen HVM,
 /// VirtualBox, bhyve all set it).
@@ -530,6 +559,7 @@ impl BootOptions {
             mgmt: None,
             modules: true,
             sensors: Sensors::Auto,
+            edac: Sensors::Auto,
             hwsim: None,
             unmanaged: None,
             warnings: Vec::new(),
@@ -608,6 +638,15 @@ impl BootOptions {
                     "off" => out.sensors = Sensors::Off,
                     _ => out.warnings.push(format!(
                         "corerouter.sensors={}: use auto, on or off",
+                        clip(value)
+                    )),
+                },
+                "edac" => match value {
+                    "auto" => out.edac = Sensors::Auto,
+                    "on" => out.edac = Sensors::On,
+                    "off" => out.edac = Sensors::Off,
+                    _ => out.warnings.push(format!(
+                        "corerouter.edac={}: use auto, on or off",
                         clip(value)
                     )),
                 },
@@ -828,6 +867,7 @@ mod tests {
                 mgmt: None,
                 modules: true,
                 sensors: Sensors::Auto,
+                edac: Sensors::Auto,
                 hwsim: None,
                 unmanaged: None,
                 warnings: vec![]
@@ -1126,6 +1166,36 @@ mod tests {
         assert_eq!(
             lockup_panic(real, "softlockup_panic=0 quiet"),
             [("/proc/sys/kernel/hardlockup_panic", "1")]
+        );
+    }
+
+    #[test]
+    fn ecc_from_smbios_type_16() {
+        // Type 16, length 23, handle, location 3 (board), use 3 (system), ECC.
+        let arr = |use_: u8, ecc: u8| vec![16, 23, 0x10, 0, 3, use_, ecc, 0, 0, 0, 0x80];
+        assert!(smbios_ecc(&[arr(3, 0x06)]));
+        assert!(
+            smbios_ecc(&[arr(3, 0x03), arr(3, 0x05)]),
+            "one array with ECC is enough"
+        );
+        assert!(!smbios_ecc(&[arr(3, 0x03)]), "None");
+        assert!(!smbios_ecc(&[arr(3, 0x02)]), "Unknown");
+        assert!(!smbios_ecc(&[arr(4, 0x06)]), "video memory");
+        assert!(!smbios_ecc(&[vec![16, 4, 0, 0]]), "too short");
+        assert!(!smbios_ecc(&[vec![17, 23, 0, 0, 3, 3, 6]]), "not type 16");
+        assert!(!smbios_ecc(&[]));
+        let real = "flags\t\t: fpu\n";
+        let vm = "flags\t\t: fpu hypervisor\n";
+        assert!(Sensors::Auto.edac_wanted(real, true));
+        assert!(!Sensors::Auto.edac_wanted(real, false));
+        assert!(!Sensors::Auto.edac_wanted(vm, true));
+        assert!(Sensors::On.edac_wanted(vm, false));
+        assert!(!Sensors::Off.edac_wanted(real, true));
+        assert_eq!(BootOptions::parse("corerouter.edac=on").edac, Sensors::On);
+        assert!(
+            !BootOptions::parse("corerouter.edac=yes")
+                .warnings
+                .is_empty()
         );
     }
 

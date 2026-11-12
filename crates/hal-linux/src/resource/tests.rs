@@ -583,3 +583,65 @@ proptest! {
         }
     }
 }
+
+/// G1.6zy: a Skylake-SP controller with two modules, one with corrected
+/// errors (the sysfs of `skx_edac`, Documentation/ABI/testing/sysfs-devices-edac).
+#[test]
+fn edac_modules_and_their_errors() {
+    let dir = std::env::temp_dir().join(format!("cr-res-edac-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mc = dir.join("sys/devices/system/edac/mc/mc0");
+    std::fs::create_dir_all(&mc).unwrap();
+    for (f, v) in [
+        ("mc_name", "Skylake Socket#0 IMC#0\n"),
+        ("ce_count", "3\n"),
+        ("ue_count", "0\n"),
+        ("ce_noinfo_count", "1\n"),
+        ("ue_noinfo_count", "0\n"),
+    ] {
+        std::fs::write(mc.join(f), v).unwrap();
+    }
+    for (n, ce) in [(0, "2"), (1, "0")] {
+        let d = mc.join(format!("dimm{n}"));
+        std::fs::create_dir_all(&d).unwrap();
+        for (f, v) in [
+            ("dimm_label", format!("CPU_SrcID#0_MC#0_Chan#{n}_DIMM#0\n")),
+            ("dimm_location", format!("channel {n} slot 0 \n")),
+            ("size", "32768\n".into()),
+            ("dimm_mem_type", "Registered-DDR4\n".into()),
+            ("dimm_edac_mode", "SECDED\n".into()),
+            ("dimm_ce_count", format!("{ce}\n")),
+            ("dimm_ue_count", "0\n".into()),
+        ] {
+            std::fs::write(d.join(f), v).unwrap();
+        }
+    }
+    let proc = dir.join("proc");
+    std::fs::create_dir_all(&proc).unwrap();
+    std::fs::write(
+        proc.join("meminfo"),
+        "MemTotal: 1000 kB\nHardwareCorrupted:     4 kB\n",
+    )
+    .unwrap();
+    let mut c = Collector::at(&proc, &dir.join("sys"));
+    let m = c.edac_cached(
+        0,
+        std::fs::read_to_string(proc.join("meminfo"))
+            .ok()
+            .as_deref(),
+    );
+    assert_eq!((m.controllers, m.dimms.len(), m.ce_noinfo), (1, 2, 1));
+    let d0 = &m.dimms[0];
+    assert_eq!(
+        (d0.controller.as_str(), d0.name.as_str(), d0.ce, d0.size_mb),
+        ("mc0", "dimm0", 2, 32768)
+    );
+    assert_eq!(d0.label, "CPU_SrcID#0_MC#0_Chan#0_DIMM#0");
+    assert_eq!(d0.location, "channel 0 slot 0");
+    assert_eq!(d0.controller_name, "Skylake Socket#0 IMC#0");
+    assert_eq!(m.hardware_corrupted_kib, Some(4));
+    // No EDAC at all: nothing, and the reading goes on.
+    let none = Collector::at(&proc, &dir.join("nothing")).edac();
+    assert_eq!(none, MemoryErrors::default());
+    let _ = std::fs::remove_dir_all(&dir);
+}

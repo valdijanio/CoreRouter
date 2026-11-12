@@ -951,8 +951,8 @@ todos os núcleos** em hardware comum, e para um defeito deixar rastro. Tudo aba
   seção seguinte).
 - **EDAC só onde o driver fica calado sem ECC.** `igen6` (SoCs cliente) e `pnd2` (Apollo Lake)
   escrevem uma linha de nível erro numa máquina sem ECC (`igen6_edac.c:1107`, `pnd2_edac.c:1555`),
-  que apareceria em todo boot `quiet` de um mini-PC. Ficam para a G1.6zy, junto com
-  `MEMORY_FAILURE` (mata o processo dono da página em vez de entrar em pânico: é política).
+  que apareceria em todo boot `quiet` de um mini-PC. A G1.6zy os trouxe como módulo, junto com
+  `MEMORY_FAILURE` e `RAS_CEC` (seção "Erros de memória").
 
 **Custo** (**medido**, kernel 6.18.59 compilado à parte com o `.config` da imagem; base = depois
 da G1.6zf, `bzImage` 18 387 968 B, `text` 40 850 668, `data` 8 949 430):
@@ -1101,25 +1101,76 @@ uma tarefa presa 120 s esperando um disco USB não é motivo para derrubar o enc
 DPC), erro de memória ECC (EDAC), falha dentro do kernel (oops, BUG), registro de pânico não
 gravado (pstore), e o travamento passou a reconhecer `detected stalls on CPUs` (RCU).
 
-**Conferido no QEMU** (`cargo xtask os ab-test`, OVMF e SeaBIOS, todos os cenários):
-
-- `bad-param`: o slot B de teste que não sobe deixa o pânico, e o slot A diz
-  `previous boot ended in a kernel panic (… slot b (0.1.0-dev.613) …): Kernel panic - not
-  syncing: Requested init /corerouter-rollback-drill failed (error -2).`;
-- `crash`: um pânico por sysrq vira 16 partes, salvas em `/config/crash`, ditas no log e
-  apagadas (nenhuma variável `dump-*` lê bytes; o efivarfs ainda lista os nomes até o boot
-  seguinte, porque o pstore apaga direto no firmware). Depois a NVRAM é cheia por outro GUID: com
-  17 408 B livres o firmware recolheu no boot e voltou a 43 196 B (o daemon manteve o meio
-  ligado, certo); cheia de novo, o boot começou com 18 860 B e o daemon desligou o
-  `efi_pstore` (aviso `kernel.crash-store`); um pânico então não gravou nada
-  (18 860 → 18 432 B, sem registro) e a atualização A/B gravou as entradas de boot e subiu no B;
-- `boot-test`: o serviço roda (`crash log fed, backend none`: sem OVMF nem ERST não há onde
-  gravar).
+**Conferido no QEMU** (`cargo xtask os ab-test --scenario crash` e `--scenario bad-param`, OVMF):
+o pânico de um teste de slot B que não sobe aparece no slot A com `slot b`; um pânico por sysrq
+é salvo, logado e apagado; com a NVRAM cheia por outro GUID até sobrarem 16 KiB, o daemon desliga
+o `efi_pstore` (aviso `kernel.crash-store`), um pânico não grava nada e a atualização A/B ainda
+grava as entradas de boot e sobe no B.
 
 **Não conferido**: ERST de servidor real (só o emulado da G1.6zi), firmware que não implementa
 `QueryVariableInfo` (o daemon então não desliga nada e fica o limite do kernel), NVRAM de
 notebook e placa reais (a do notebook Lenovo 83EU fica para a sessão principal), um travamento
 de CPU de verdade.
+
+### Erros de memória: controladores que faltavam e a política (G1.6zy)
+
+A G1.6zi deixou de fora dois controladores e a política para um erro de memória. Agora:
+
+**Os dois controladores que falam sem ECC entram como módulo.** `igen6_edac` (SoCs Intel cliente
+com ECC em banda: Elkhart Lake, Alder Lake-N, Raptor Lake-P e outros) e `pnd2_edac` (Apollo
+Lake, Denverton) escrevem uma linha de nível erro em todo boot de uma máquina sem ECC. Lido no
+fonte (6.18.59): o `igen6` só se cala quando o fusível diz que não há ECC em banda
+(`ibecc_available`, `edac_dbg`); com o ECC disponível e desligado pelo firmware ele escreve
+`MC%d In-Band ECC is disabled` (`igen6_get_dimm_config`, `KERN_ERR`) e sai com `ENODEV`. O
+`pnd2` escreve `Failed to register device with error %d` (`pnd2_init`). O PID 1 os carrega por
+nome (`EDAC_MODULES`), depois dos sensores, só quando o firmware diz que a memória tem ECC: uma
+estrutura SMBIOS tipo 16 (Physical Memory Array, DSP0134 §7.17) de uso "memória do sistema" com
+correção single-bit, multi-bit ou CRC (`plan::smbios_ecc`), e nunca em VM.
+`corerouter.edac=on` força, `off` impede. Um driver de outro controlador sai com `ENODEV` em
+silêncio; um que acha o firmware tratando os erros (GHES) sai com `EBUSY` e fica dito no log.
+Os outros (AMD64, SKX, I10NM, SBRIDGE, IE31200) continuam embutidos: calados sem ECC.
+
+**A política para um erro que o ECC não corrige** (`MEMORY_FAILURE`, `RAS_CEC`):
+
+- com `MEMORY_FAILURE` o kernel tira de uso a página com o erro e encerra (SIGBUS) só o processo
+  que a usa, em vez de entrar em pânico (sem ele, um erro desses numa página de processo era
+  pânico e reinício). Se é o daemon, o PID 1 o reinicia em 2 s; o encaminhamento, que está no
+  kernel, não para. Os padrões do kernel ficam: `vm.memory_failure_recovery = 1` (recuperar em
+  vez de pânico) e `vm.memory_failure_early_kill = 0` (matar só quem tocar na página), os dois
+  agora no Tuning, aba Kernel, com a explicação;
+- `RAS_CEC` conta os erros corrigidos por página e tira de uso a que passa do limite antes que
+  ela vire erro não corrigido; sem ECC não faz nada. É o que Ubuntu faz (o `.config` do kernel
+  7.0.0-42-generic desta máquina: `MEMORY_FAILURE=y`, `RAS_CEC=y`, `EDAC_IGEN6=m`,
+  `EDAC_PND2=m`; **medido**).
+
+**Contagem por pente em System › Health.** O coletor lê
+`/sys/devices/system/edac/mc/mc*/dimm*` (rótulo, local, tamanho, tipo, modo ECC, erros
+corrigidos e não corrigidos) e o `HardwareCorrupted` do `/proc/meminfo`, a cada 10 s (junto com
+os sensores; nada sem ECC). `system.health.memory.print` devolve os pentes; a janela Resources,
+aba Memory, mostra a tabela "Pentes com ECC" (selo de estado por pente, ⓘ nas colunas). A
+verificação `memory.ecc` só existe com ECC: erro com qualquer erro não corrigido, aviso com
+erros corrigidos ou memória retirada de uso, ok com a contagem. O catálogo do OS Log ganhou
+"Página de memória com defeito retirada" (`Memory failure:`, `soft offline:`).
+
+**Custo** (**medido**, kernel 6.18.59 compilado fora da imagem com o `.config` dela):
+
+| Variante | `bzImage` | `text` | `data` | Módulos |
+|---|---|---|---|---|
+| base | 18 314 240 B | 40 697 744 | 9 888 786 | — |
+| com `IGEN6=m`, `PND2=m`, `MEMORY_FAILURE`, `RAS_CEC` | +28 672 B | +41 981 | +14 780 | `igen6_edac` 22 022 B, `pnd2_edac` 17 403 B de `text+data+bss` |
+
+Nada roda por pacote: o custo é a contagem nos raros erros de memória.
+
+**Não conferido** (não há emulação): uma máquina com ECC de verdade, um erro corrigido ou não
+corrigido real, o `igen6` numa máquina com ECC em banda ligado. O QEMU não emula controlador de
+memória com EDAC.
+
+**Conferido no QEMU** (q35 e `pc`, a imagem desta branch): sem ECC no SMBIOS nada é carregado
+(`lsmod` sem `igen6_edac`); com `corerouter.edac=on`, o `igen6_edac` carrega (é um driver PCI:
+o módulo fica mesmo sem controlador) sem nenhuma linha de nível erro, e o PID 1 diz
+`memory errors: no memory controller of igen6_edac or pnd2_edac answered`. Por isso um driver só
+conta como achado quando aparece um `mc<N>` novo em `/sys/devices/system/edac/mc`. A tabela de
+pentes foi conferida na GUI com o laboratório virtual (dois pentes, tema claro e escuro).
 
 ### Boot lento no handoff do USB (xHCI) (G1.6zq)
 

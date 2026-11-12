@@ -261,6 +261,20 @@ pub const KNOWN: &[Known] = &[
         alert: true,
     },
     Known {
+        id: "memory-failure",
+        source: K,
+        all: &[],
+        any: &["memory failure:", "soft offline:", "soft_offline:"],
+        title: "Página de memória com defeito retirada",
+        meaning: "O kernel achou uma página de memória com erro que o ECC não corrige (ou que \
+                  corrigiu vezes demais) e a tirou de uso. Se um processo usava a página, ele foi \
+                  encerrado (SIGBUS) em vez de o kernel entrar em pânico; o supervisor reinicia o \
+                  serviço do roteador. O pente está falhando: veja a contagem por pente em System \
+                  › Health e programe a troca.",
+        actions: &[RESOURCES],
+        alert: true,
+    },
+    Known {
         id: "memory-ecc",
         source: K,
         all: &["edac"],
@@ -476,6 +490,9 @@ mod tests {
             (Kernel, "pcieport 0000:00:1d.0: DPC: containment event, status:0x1f01 source:0x0000", Some("pcie-aer")),
             (Kernel, "EDAC MC0: 1 UE memory read error on CPU_SrcID#0_Ha#0_Chan#0_DIMM#1 (uncorrected error)", Some("memory-ecc")),
             (Kernel, "EDAC skx MC1: HANDLING MCE MEMORY ERROR", Some("memory-ecc")),
+            (Kernel, "Memory failure: 0x12a45f: recovery action for dirty LRU page: Recovered", Some("memory-failure")),
+            (Kernel, "Memory failure: 0x12a45f: Sending SIGBUS to corerouter-daem:412 due to hardware memory corruption", Some("memory-failure")),
+            (Kernel, "soft offline: 0x7fd21: page migration succeeded", Some("memory-failure")),
             (Kernel, "Oops: general protection fault, probably for non-canonical address 0xdead000000000100: 0000 [#1] SMP NOPTI", Some("kernel-oops")),
             (Kernel, "BUG: kernel NULL pointer dereference, address: 0000000000000008", Some("kernel-oops")),
             (Kernel, "rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:", Some("lockup")),
