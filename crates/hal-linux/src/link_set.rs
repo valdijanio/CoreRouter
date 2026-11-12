@@ -188,6 +188,28 @@ pub(crate) fn delete(name: &str) -> io::Result<()> {
     request(RTM_DELLINK, 0, index(name)?, 0, 0, &[])
 }
 
+/// G1.30m: a bond with `name` (a Wi-Fi backhaul link) among its slaves
+/// takes frames on every slave, active or not (`all_slaves_active`). Over
+/// a point-to-point link each end picks its active slave on its own: in
+/// active-backup one end sent on the first link while the other listened
+/// on the second, and the bond dropped what came on the backup (measured
+/// in the lab). Not for Ethernet bonds, where a switch floods to every
+/// port and the backups would deliver duplicates.
+pub(crate) fn bond_takes_all(name: &str) {
+    let Some(master) = master_of(name) else {
+        return;
+    };
+    let knob = std::path::Path::new("/sys/class/net")
+        .join(&master)
+        .join("bonding")
+        .join("all_slaves_active");
+    if std::fs::read_to_string(&knob).is_ok_and(|v| v.trim() == "0")
+        && let Err(e) = std::fs::write(&knob, "1")
+    {
+        log::warn!("bond {master} of {name}: all_slaves_active: {e}");
+    }
+}
+
 /// The master of `name` now, by name; `None`: none (or no such link).
 pub(crate) fn master_of(name: &str) -> Option<String> {
     let p = std::path::Path::new("/sys/class/net")

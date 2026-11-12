@@ -276,6 +276,12 @@ for mode in "${MODES[@]}"; do
 		"[ \$(cr crwa interface.wifi.peer.print '{}' | grep -o '\"state\":\"up\"' | wc -l) -ge 2 ]"; then
 		cr crwa interface.wifi.history '{}' | tail -n 40
 		cr crwb interface.wifi.history '{}' | tail -n 40
+		for r in wifi1 wifi2; do
+			echo "--- B $r: $(cr crwb interface.wifi.monitor "{\"name\":\"$r\"}" | cut -c1-400)"
+		done
+		ip -n crwb -br link
+		ip netns exec crwb ls /run/corerouter/wpa/if 2>/dev/null
+		in_ns crwb /bin/sh -c 'ls /run/corerouter/wpa/if; ps | grep -E "wpa|hostapd" | grep -v grep'
 		continue
 	fi
 	say "$mode: both links up in $((SECONDS - t0)) s"

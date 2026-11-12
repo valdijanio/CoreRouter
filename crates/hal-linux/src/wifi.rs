@@ -1112,6 +1112,10 @@ mod io {
                 st.link = self.link(st.bssid.as_deref());
             }
             self.bridge_sync(connected);
+            // G1.30m: a station-bridge in a bond.
+            if self.wds || self.bridge.is_some() || st.state == WifiState::Connected {
+                crate::link_set::bond_takes_all(&self.name);
+            }
             let blocked = st.state == WifiState::Blocked;
             if blocked != self.blocked {
                 self.blocked = blocked;

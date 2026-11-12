@@ -14,6 +14,11 @@ How the station-bridge agrees on four-address frames with the access point.
 Neither talks to MikroTik's `station-bridge`, which is its own and only between RouterOS."##,
     ),
     (
+        "interface.wifi.peer.airtime",
+        r##"## Airtime
+The share of the air the peer's link took between the last two reads (2 s apart): frames sent and received, from the driver's airtime counters. Amber from 60 %, red from 85 %: the channel is close to full, and the link will not go faster there (another channel, or another link in the bond)."##,
+    ),
+    (
         "interface.wifi.peer.link",
         r##"## Link
 Where the peer's link goes: a bridge (the LAN reaches the other router) or a bond (several links between the same two routers, G1.30m part 2)."##,

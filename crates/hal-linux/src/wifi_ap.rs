@@ -805,6 +805,10 @@ mod io {
             } else {
                 Vec::new()
             };
+            // G1.30m: the peers' links in a bond.
+            for (_, name, _) in &self.peers_up {
+                crate::link_set::bond_takes_all(name);
+            }
             Ok(WifiApStatus {
                 state,
                 frequency_mhz: freq,
