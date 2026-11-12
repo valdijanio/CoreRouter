@@ -523,6 +523,13 @@ pub(crate) fn network_fields(net: &WifiNetwork) -> Option<Vec<(&'static str, Str
     if let Some(b) = net.bssid.as_deref().and_then(mac) {
         out.push(("bssid", b));
     }
+    // G1.30m: a Multi-AP backhaul station (wpa_supplicant.conf
+    // `multi_ap_backhaul_sta`): the association carries the Multi-AP
+    // element, and the supplicant turns four addresses on once the access
+    // point agrees (it fails the association if it does not).
+    if net.four_addr == Some(corerouter_hal::wifi::FourAddr::MultiAp) {
+        out.push(("multi_ap_backhaul_sta", "1".into()));
+    }
     if let Some(band) = net.band_mhz {
         let list = freq_list(band);
         out.push(("scan_freq", list.clone()));
@@ -859,6 +866,10 @@ mod io {
         /// nl80211, for the link's rates and counters (G1.30g); opened when
         /// first connected, dropped after a failure and opened again.
         nl: Option<Nl80211>,
+        /// G1.30m: the bridge a station-bridge joins once connected.
+        bridge: Option<String>,
+        /// G1.30m: four addresses turned on by hand (WDS).
+        wds: bool,
     }
 
     impl Direct {
@@ -903,6 +914,8 @@ mod io {
                 queued: Vec::new(),
                 blocked: false,
                 nl: None,
+                bridge: None,
+                wds: false,
             })
         }
 
@@ -945,6 +958,57 @@ mod io {
             }
         }
 
+        /// G1.30m: four-address frames on or off by hand (a WDS
+        /// station-bridge). The interface is taken down for it and the
+        /// supplicant brings it up again.
+        fn set_4addr(&mut self, on: bool) -> Result<(), HalError> {
+            if on == self.wds {
+                return Ok(());
+            }
+            let ifindex = nix::net::if_::if_nametoindex(self.name.as_str())
+                .map_err(|e| io_err("the radio's index", e))?;
+            if self.nl.is_none() {
+                self.nl = Nl80211::open();
+            }
+            let nl = self
+                .nl
+                .as_mut()
+                .ok_or_else(|| HalError::Io("nl80211 is not there".into()))?;
+            nl.set_4addr(ifindex, on).map_err(|e| {
+                HalError::Rejected(format!(
+                    "the driver refused four-address frames on {} ({e}): this card cannot be a \
+                     WDS station-bridge; try bridge_protocol=multi-ap",
+                    self.name
+                ))
+            })?;
+            self.wds = on;
+            Ok(())
+        }
+
+        /// G1.30m: a station-bridge in its bridge once its frames carry
+        /// four addresses (before that the kernel refuses it:
+        /// `IFF_DONT_BRIDGE`), and out of a bridge it is not a port of any
+        /// more. A bond's slave is left alone.
+        fn bridge_sync(&mut self, connected: bool) {
+            let now = crate::link_set::master_of(&self.name);
+            let is_bridge = |m: &str| Path::new("/sys/class/net").join(m).join("bridge").exists();
+            let want = self.bridge.clone().filter(|_| connected);
+            match (&want, &now) {
+                (Some(w), Some(n)) if w == n => {}
+                (Some(w), _) => {
+                    if let Err(e) = crate::link_set::set_master(&self.name, Some(w)) {
+                        log::warn!("wifi {}: into bridge {w}: {e}", self.name);
+                    }
+                }
+                (None, Some(n)) if is_bridge(n) && self.bridge.is_none() => {
+                    if let Err(e) = crate::link_set::set_master(&self.name, None) {
+                        log::warn!("wifi {}: out of bridge {n}: {e}", self.name);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         fn forget_networks(&self) -> Result<(), HalError> {
             self.cmd.ok("REMOVE_NETWORK all", "REMOVE_NETWORK")
         }
@@ -956,6 +1020,8 @@ mod io {
                 HalError::Rejected("the network cannot be written for wpa_supplicant".into())
             })?;
             self.forget_networks()?;
+            self.set_4addr(net.four_addr == Some(corerouter_hal::wifi::FourAddr::Wds))?;
+            self.bridge = net.bridge.clone();
             let id = self.cmd.request("ADD_NETWORK", "ADD_NETWORK")?;
             let id: u32 = id
                 .trim()
@@ -978,6 +1044,7 @@ mod io {
 
         fn leave(&mut self) -> Result<(), HalError> {
             self.forget_networks()?;
+            self.bridge = None;
             // `FAIL` when it is not connected: nothing to leave.
             let _ = self.cmd.request("DISCONNECT", "DISCONNECT")?;
             Ok(())
@@ -1036,6 +1103,7 @@ mod io {
             if connected {
                 st.link = self.link(st.bssid.as_deref());
             }
+            self.bridge_sync(connected);
             let blocked = st.state == WifiState::Blocked;
             if blocked != self.blocked {
                 self.blocked = blocked;
@@ -1064,6 +1132,8 @@ mod io {
         /// its last radio. Not at a daemon's exit (nothing is dropped
         /// then): the radio stays on its network across a restart.
         fn drop(&mut self) {
+            // G1.30m: a WDS station-bridge's four addresses go with it.
+            let _ = self.set_4addr(false);
             let Ok(global) = Ctrl::connect(&self.dir, &self.dir.join("global")) else {
                 return;
             };
@@ -1678,6 +1748,8 @@ mod io {
                 hidden: true,
                 band_mhz: Some((5150, 5895)),
                 bssid: None,
+                four_addr: None,
+                bridge: None,
             };
             port.join(&net).unwrap();
             let sent: Vec<String> = seen.try_iter().collect();
@@ -1817,6 +1889,8 @@ mod io {
                 hidden: false,
                 band_mhz: None,
                 bssid: None,
+                four_addr: None,
+                bridge: None,
             };
             port.join(&net).unwrap();
             port.scan().unwrap();
@@ -1966,6 +2040,8 @@ mod tests {
             hidden: false,
             band_mhz: None,
             bssid: None,
+            four_addr: None,
+            bridge: None,
         }
     }
 

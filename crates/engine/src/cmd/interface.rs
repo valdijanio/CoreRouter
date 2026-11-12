@@ -63,7 +63,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add Bridge Port",
         ["Interfaces"],
         None,
-        "{bridge: string, interface: string} → {bridge, interface}",
+        "{bridge: string, interface: string} → {bridge, interface, warnings}",
         always,
         port_add
     ),
@@ -625,10 +625,32 @@ fn port_add(s: &mut Session, p: &Value) -> Result<Value> {
             format!("'{port}' runs on top of '{bridge}'; adding it as a port would loop"),
         ));
     }
+    // G1.30m: two Wi-Fi backhaul links in one bridge loop (bridges run no
+    // spanning tree here): two links between the same routers belong in a
+    // bond.
+    let backhaul = |i: &corerouter_model::Interface| match &i.kind {
+        InterfaceKind::WifiPeer(_) => true,
+        InterfaceKind::Wifi(w) => w.mode == corerouter_model::wifi::WifiMode::StationBridge,
+        _ => false,
+    };
+    let mut warnings = Vec::new();
+    if backhaul(iface)
+        && let Some(other) = cfg
+            .interfaces
+            .values()
+            .find(|i| i.bridge.as_ref() == Some(&bridge) && backhaul(i))
+    {
+        warnings.push(format!(
+            "'{bridge}' has another Wi-Fi backhaul link ('{}'): bridges here run no spanning tree, \
+             so two links between the same routers make a loop. Bond them (interface.bonding.add) \
+             and put the bond in the bridge",
+            other.name
+        ));
+    }
     if let Some(i) = s.store_mut().candidate_mut().interfaces.get_mut(&port) {
         i.bridge = Some(bridge.clone());
     }
-    Ok(json!({ "bridge": bridge, "interface": port }))
+    Ok(json!({ "bridge": bridge, "interface": port, "warnings": warnings }))
 }
 
 fn port_remove(s: &mut Session, p: &Value) -> Result<Value> {

@@ -45,6 +45,12 @@ pub const NO_BOND: &str = "a Wi-Fi station's frames carry three addresses, so th
                            between two CoreRouters, station-bridge mode (G1.30m) will carry a \
                            bond";
 
+/// G1.30m: the backhaul between routers is WPA3 only (SAE with protected
+/// management frames): it carries the whole LAN.
+pub const BACKHAUL_WPA3: &str = "a station-bridge link carries the whole LAN: it is WPA3 (SAE) \
+                                 only. Use security=wpa3 (or auto, which means WPA3 on a \
+                                 backhaul)";
+
 /// Why an interface is not enabled with no country set (the validation's
 /// message: a batch may set the two in any order).
 pub const NO_COUNTRY: &str = "a Wi-Fi interface cannot be enabled before the country is set: it \
@@ -60,21 +66,103 @@ pub enum WifiMode {
     Station,
     /// G1.30a: announces a network that clients join.
     Ap,
+    /// G1.30m: a client whose frames carry four addresses, so that it is a
+    /// bridge port (and a bonding slave): the link between two routers.
+    StationBridge,
 }
 
 impl WifiMode {
-    pub const ALL: [Self; 2] = [Self::Station, Self::Ap];
+    pub const ALL: [Self; 3] = [Self::Station, Self::Ap, Self::StationBridge];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Station => "station",
             Self::Ap => "ap",
+            Self::StationBridge => "station-bridge",
+        }
+    }
+
+    /// A client of an access point (plain or four-address).
+    pub fn is_client(self) -> bool {
+        self != Self::Ap
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.as_str() == s)
+    }
+}
+
+/// G1.30m: how a station-bridge agrees on four addresses with its access
+/// point.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BridgeProtocol {
+    /// Wi-Fi Alliance Multi-AP (EasyMesh) backhaul: the station says so in
+    /// its association (the Multi-AP element) and the access point gives
+    /// it four addresses. The standard way, between CoreRouters and with
+    /// any EasyMesh access point.
+    #[default]
+    MultiAp,
+    /// Plain four-address frames (WDS), turned on at both ends by hand: what
+    /// OpenWrt (`option wds 1`) and others speak. No negotiation.
+    Wds,
+}
+
+impl BridgeProtocol {
+    pub const ALL: [Self; 2] = [Self::MultiAp, Self::Wds];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MultiAp => "multi-ap",
+            Self::Wds => "wds",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|v| v.as_str() == s)
     }
+}
+
+/// G1.30m: whether an access point takes station-bridges (its peers).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StationBridge {
+    /// Clients only (the default: nothing gets four addresses).
+    #[default]
+    No,
+    /// Clients and the registered peers.
+    Yes,
+    /// The registered peers only (a backhaul access point).
+    Only,
+}
+
+impl StationBridge {
+    pub const ALL: [Self; 3] = [Self::No, Self::Yes, Self::Only];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::No => "no",
+            Self::Yes => "yes",
+            Self::Only => "only",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.as_str() == s)
+    }
+}
+
+/// G1.30m: a station-bridge of another router, as seen from this access
+/// point (`interface.wifi.peer.add`). Its link is an interface of its own,
+/// with the peer's name, that is there while the peer is associated: a
+/// bridge port or a bonding slave like any other.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WifiPeer {
+    /// The access point it joins (a `wifi` interface in `ap` mode).
+    pub radio: crate::IfName,
+    /// The peer station's MAC.
+    pub mac: MacAddr,
 }
 
 /// G1.30a: the channel widths an access point may use, MHz.
@@ -199,6 +287,20 @@ pub struct WifiConfig {
     /// the country allow on 5 GHz.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub width: Option<u32>,
+    /// G1.30m, station-bridge: how four addresses are agreed on.
+    #[serde(skip_serializing_if = "is_multi_ap")]
+    pub bridge_protocol: BridgeProtocol,
+    /// G1.30m, access point: whether it takes its registered peers.
+    #[serde(skip_serializing_if = "is_no")]
+    pub station_bridge: StationBridge,
+}
+
+fn is_multi_ap(p: &BridgeProtocol) -> bool {
+    *p == BridgeProtocol::MultiAp
+}
+
+fn is_no(s: &StationBridge) -> bool {
+    *s == StationBridge::No
 }
 
 fn is_station(m: &WifiMode) -> bool {

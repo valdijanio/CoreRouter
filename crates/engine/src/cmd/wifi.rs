@@ -17,7 +17,8 @@
 use corerouter_hal::wifi::{BssSecurity, WifiState};
 use corerouter_model::sealed::Sealed;
 use corerouter_model::wifi::{
-    Country, WifiBand, WifiConfig, WifiMode, WifiSecurity, passphrase_problem, ssid_problem,
+    BridgeProtocol, Country, StationBridge, WifiBand, WifiConfig, WifiMode, WifiSecurity,
+    passphrase_problem, ssid_problem,
 };
 use corerouter_model::{Config, IfName, Interface, InterfaceKind, MacAddr};
 use serde_json::{Value, json};
@@ -41,7 +42,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set Wi-Fi",
         ["Interfaces", "Wi-Fi"],
         None,
-        "{name: string, mode?: string (station | ap; ap: announce the network instead of joining it, G1.30a), ssid?: string (the network's name, 1 to 32 bytes; empty: forget the network), security?: string (auto | wpa3 | wpa2 | open; auto: WPA3 if the access point offers it, else WPA2; as an access point, both at once), passphrase?: string (write-only, sealed at rest: 8 to 63 characters, or the 64-digit key with security=wpa2; another ssid needs its own), hidden?: bool (the network does not announce its name), band?: string (2ghz | 5ghz | 6ghz; empty or any: whichever the network is on; as an access point, the band of an automatic channel), bssid?: string (only this access point; empty: any; station only), frequency?: string (access point: MHz (5180), a channel (36) or auto: the quietest channel without radar detection), width?: string (access point: 20 | 40 | 80 | 160 MHz or auto: 20 on 2.4 GHz, up to 80 on 5 GHz), disabled?: bool (default true: a radio is off until it is told to join a network), comment?: string, mtu?: int (68..=2304), force?: bool (change the network or the mode of the radio this connection comes through, outside Safe Mode)} → {name, warnings}",
+        "{name: string, mode?: string (station | ap | station-bridge; ap: announce the network instead of joining it, G1.30a; station-bridge: a client with four-address frames, a bridge port and bonding slave, G1.30m), bridge_protocol?: string (station-bridge: multi-ap | wds; multi-ap: Wi-Fi EasyMesh backhaul, between CoreRouters; wds: plain four addresses, for OpenWrt), station_bridge?: string (access point: no | yes | only; takes the registered peers, interface.wifi.peer.add; only: no plain clients), ssid?: string (the network's name, 1 to 32 bytes; empty: forget the network), security?: string (auto | wpa3 | wpa2 | open; auto: WPA3 if the access point offers it, else WPA2; as an access point, both at once), passphrase?: string (write-only, sealed at rest: 8 to 63 characters, or the 64-digit key with security=wpa2; another ssid needs its own), hidden?: bool (the network does not announce its name), band?: string (2ghz | 5ghz | 6ghz; empty or any: whichever the network is on; as an access point, the band of an automatic channel), bssid?: string (only this access point; empty: any; station only), frequency?: string (access point: MHz (5180), a channel (36) or auto: the quietest channel without radar detection), width?: string (access point: 20 | 40 | 80 | 160 MHz or auto: 20 on 2.4 GHz, up to 80 on 5 GHz), disabled?: bool (default true: a radio is off until it is told to join a network), comment?: string, mtu?: int (68..=2304), force?: bool (change the network or the mode of the radio this connection comes through, outside Safe Mode)} → {name, warnings}",
         has_radios,
         set
     ),
@@ -96,7 +97,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{} → {country, in_force (what the kernel applies now; 00: the world domain), error, enabled (Wi-Fi interfaces that need it)}",
         always, country_get),
     cmd!(query "interface.wifi.list", "Wi-Fi", ["Interfaces", "Wi-Fi"], None,
-        "{show_sensitive?: bool (the passphrases in clear; group full)} → [{name, mode (station | ap), ssid, security, passphrase, hidden, band, bssid, mtu, mac_address, disabled, comment, running, state (disabled | no-country | idle | searching | connecting | connected | blocked | error | absent; access point: starting | radar-check | no-ir | running | failed), connected_bssid, frequency, channel, signal, rate, failure, driver, configured_frequency, configured_width, width (access point), clients (access point)}]",
+        "{show_sensitive?: bool (the passphrases in clear; group full)} → [{name, mode (station | ap), ssid, security, passphrase, hidden, band, bssid, mtu, mac_address, disabled, comment, running, state (disabled | no-country | idle | searching | connecting | connected | blocked | error | absent; access point: starting | radar-check | no-ir | running | failed), connected_bssid, frequency, channel, signal, rate, failure, driver, bridge_protocol (G1.30m), station_bridge (G1.30m), configured_frequency, configured_width, width (access point), clients (access point)}]",
         always, list),
     cmd!(query "interface.wifi.monitor", "Wi-Fi Monitor", [], None,
         "{name: string} → {name, mode (ap: an access point's own fields: width, center_frequency, auto_channel, radar, radar_check_secs, standard, uptime_secs, clients, error), state, ssid, bssid, frequency, band, channel, signal, rate, security, pmf, uptime_secs, reconnects, failure: {code (wrong-key | not-found | rejected | no-answer | error), text, time}, error, country, country_in_force, country_error, driver, self_managed, quality (excellent | good | fair | poor), noise, snr, width, center_frequency, generation, standard, cipher, tx_rate: {mbps, mode, mcs, nss, width, guard_ns, text}, rx_rate: {mbps, mode, mcs, nss, width, guard_ns, text}, signal_avg, beacon_signal, chain_signal: [int], tx_packets, rx_packets, tx_retries, tx_failed, retry_percent, beacon_loss, inactive_ms, addresses: [{address, dynamic}]}",
@@ -114,7 +115,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{name?: string, limit?: int (newest first, default 100)} → [{seq, time, name, event (joining | connected | disconnected | failed | blocked | unblocked | error), message}]",
         always, history),
     cmd!(query "interface.wifi.preview", "Wi-Fi Preview", [], None,
-        "{id: string (the radio), mode?: string, frequency?: string, width?: string, ssid?: string, security?: string, passphrase?: string, hidden?: bool, band?: string, bssid?: string, disabled?: bool, comment?: string, mtu?: int 68..2304} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk}",
+        "{id: string (the radio), mode?: string, frequency?: string, width?: string, bridge_protocol?: string, station_bridge?: string, ssid?: string, security?: string, passphrase?: string, hidden?: bool, band?: string, bssid?: string, disabled?: bool, comment?: string, mtu?: int 68..2304} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk}",
         has_radios, preview),
 ];
 
@@ -225,8 +226,31 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
             EngineError::bad(
                 "mode",
                 format!(
-                    "'{}' is not a mode: use station or ap",
+                    "'{}' is not a mode: use station, ap or station-bridge",
                     m.chars().take(16).collect::<String>()
+                ),
+            )
+        })?;
+    }
+    // G1.30m: a station-bridge's protocol, an access point's peers.
+    if let Some(b) = opt_str(p, "bridge_protocol")? {
+        st.bridge_protocol = BridgeProtocol::parse(b.trim()).ok_or_else(|| {
+            EngineError::bad(
+                "bridge_protocol",
+                format!(
+                    "'{}' is not a bridge protocol: use multi-ap or wds",
+                    b.chars().take(16).collect::<String>()
+                ),
+            )
+        })?;
+    }
+    if let Some(b) = opt_str(p, "station_bridge")? {
+        st.station_bridge = StationBridge::parse(b.trim()).ok_or_else(|| {
+            EngineError::bad(
+                "station_bridge",
+                format!(
+                    "'{}' is not a choice: use no, yes or only",
+                    b.chars().take(16).collect::<String>()
                 ),
             )
         })?;
@@ -567,6 +591,8 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                 "rate": status.and_then(|st| st.rate_mbps),
                 "failure": r.and_then(|r| r.failure.as_ref()).map(|(f, _)| f.code()),
                 "driver": r.and_then(|r| r.hardware.as_ref()).and_then(|h| h.driver.clone()),
+                "bridge_protocol": st.bridge_protocol.as_str(),
+                "station_bridge": st.station_bridge.as_str(),
                 "configured_frequency": st.frequency,
                 "configured_width": st.width,
                 "width": Value::Null,

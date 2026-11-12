@@ -1184,6 +1184,13 @@ impl Hal for VirtualHal {
             .interfaces
             .keys()
             .filter(|n| self.late_present(n) != Some(false))
+            // G1.30m: a Wi-Fi peer's link is there while the peer is.
+            .filter(|n| {
+                !matches!(
+                    self.applied.interfaces.get(*n).map(|i| &i.kind),
+                    Some(InterfaceKind::WifiPeer(_))
+                ) || self.wifi.peer_up(n.as_str())
+            })
             .filter_map(|n| self.sample(n))
             .map(|mut l| {
                 // G1.30: a radio has carrier while it is on a network.

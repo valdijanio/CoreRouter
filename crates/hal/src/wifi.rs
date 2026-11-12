@@ -28,6 +28,17 @@ pub enum JoinSecurity {
     Open,
 }
 
+/// G1.30m: four-address frames for a station-bridge, and how they are
+/// agreed on with the access point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FourAddr {
+    /// Multi-AP backhaul station: the association says so, the access
+    /// point gives four addresses (wpa_supplicant `multi_ap_backhaul_sta`).
+    MultiAp,
+    /// Plain WDS: four addresses on from the start (`NL80211_ATTR_4ADDR`).
+    Wds,
+}
+
 /// The network a radio is told to join.
 #[derive(Clone, PartialEq, Eq)]
 pub struct WifiNetwork {
@@ -42,6 +53,11 @@ pub struct WifiNetwork {
     pub band_mhz: Option<(u32, u32)>,
     /// Only this access point, `aa:bb:cc:dd:ee:ff`.
     pub bssid: Option<String>,
+    /// G1.30m: a station-bridge (`None`: a plain station).
+    pub four_addr: Option<FourAddr>,
+    /// G1.30m: the bridge the station-bridge is a port of (it is put there
+    /// once its frames carry four addresses).
+    pub bridge: Option<String>,
 }
 
 /// Never the key: a `{:?}` goes to logs.
@@ -54,6 +70,8 @@ impl std::fmt::Debug for WifiNetwork {
             .field("hidden", &self.hidden)
             .field("band_mhz", &self.band_mhz)
             .field("bssid", &self.bssid)
+            .field("four_addr", &self.four_addr)
+            .field("bridge", &self.bridge)
             .finish()
     }
 }
@@ -456,6 +474,8 @@ mod tests {
             hidden: false,
             band_mhz: None,
             bssid: None,
+            four_addr: None,
+            bridge: None,
         };
         let text = format!("{n:?}");
         assert!(text.contains("Casa") && text.contains("***"), "{text}");

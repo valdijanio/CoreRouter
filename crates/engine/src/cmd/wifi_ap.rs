@@ -28,7 +28,7 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "interface.wifi.registration-table.print", "Wi-Fi Registration Table", [], None,
-        "{interface?: string (one access point; default all)} → [{interface, mac_address, authorized, security (wpa3 | wpa2 | open), generation, standard, signal, tx_rate: {mbps, mode, mcs, nss, width, guard_ns, text}, rx_rate: {…}, uptime_secs, inactive_ms, tx_packets, rx_packets, tx_retries, tx_failed, retry_percent}]",
+        "{interface?: string (one access point; default all)} → [{interface, mac_address, peer (G1.30m: the registered peer's name, when its four-address link is up), authorized, security (wpa3 | wpa2 | open), generation, standard, signal, tx_rate: {mbps, mode, mcs, nss, width, guard_ns, text}, rx_rate: {…}, uptime_secs, inactive_ms, tx_packets, rx_packets, tx_retries, tx_failed, retry_percent}]",
         has_radios, registration_table),
 ];
 
@@ -112,8 +112,36 @@ pub(super) fn check(
     old: WifiMode,
 ) -> Result<Vec<String>> {
     let mut warnings = Vec::new();
+    let backhaul_security = || -> Result<()> {
+        match st.security {
+            WifiSecurity::Auto | WifiSecurity::Wpa3 => Ok(()),
+            _ => Err(EngineError::bad(
+                "security",
+                corerouter_model::wifi::BACKHAUL_WPA3,
+            )),
+        }
+    };
+    // G1.30m: a station-bridge is a station with four addresses, WPA3 only.
+    if st.mode == WifiMode::StationBridge {
+        backhaul_security()?;
+        if old != WifiMode::StationBridge && iface.bridge.is_none() {
+            warnings.push(format!(
+                "'{name}' is a station-bridge: put it in a bridge (interface.bridge.port.add) or \
+                 a bond to carry the LAN; the access point must take it as a peer \
+                 (interface.wifi.peer.add on the other router)"
+            ));
+        }
+        if st.bridge_protocol == corerouter_model::wifi::BridgeProtocol::Wds {
+            warnings.push(
+                "bridge_protocol=wds is plain four-address frames with no negotiation: the access \
+                 point must have WDS on for this station (OpenWrt: option wds 1)"
+                    .into(),
+            );
+        }
+        return Ok(warnings);
+    }
     if st.mode == WifiMode::Station {
-        if let Some(b) = iface.bridge.as_ref().filter(|_| old == WifiMode::Ap) {
+        if let Some(b) = iface.bridge.as_ref().filter(|_| old != WifiMode::Station) {
             return Err(EngineError::bad(
                 "mode",
                 format!(
@@ -123,6 +151,22 @@ pub(super) fn check(
             ));
         }
         return Ok(warnings);
+    }
+    if st.station_bridge != corerouter_model::wifi::StationBridge::No {
+        backhaul_security()?;
+        let peers = s
+            .store()
+            .candidate()
+            .interfaces
+            .values()
+            .filter(|i| matches!(&i.kind, InterfaceKind::WifiPeer(p) if p.radio == *name))
+            .count();
+        if peers == 0 {
+            warnings.push(format!(
+                "no peer registered on '{name}': station-bridges are sent away until one is \
+                 (interface.wifi.peer.add radio={name} name=… mac_address=…)"
+            ));
+        }
     }
     if st.bssid.is_some() {
         return Err(EngineError::bad(
@@ -306,6 +350,7 @@ fn registration_table(s: &mut Session, p: &Value) -> Result<Value> {
             out.push(json!({
                 "interface": name,
                 "mac_address": c.mac,
+                "peer": c.peer,
                 "authorized": c.authorized,
                 "security": c.security,
                 "generation": c.generation,

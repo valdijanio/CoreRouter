@@ -30,7 +30,11 @@ pub(crate) const CMD_GET_STATION: u8 = 17;
 pub(crate) const CMD_GET_SURVEY: u8 = 50;
 // G1.30j: the monitor interface (Linux 6.18.59 values, read from the
 // header by a C program: NEW_INTERFACE 7, DEL_INTERFACE 8, SET_CHANNEL 65).
+/// G1.30m: `NL80211_CMD_SET_INTERFACE` (l. 1371 of `enum nl80211_commands`).
+pub(crate) const CMD_SET_INTERFACE: u8 = 6;
 pub(crate) const CMD_NEW_INTERFACE: u8 = 7;
+/// G1.30m: `NL80211_ATTR_4ADDR`, u8 (`enum nl80211_attrs`, l. 3204).
+pub(crate) const ATTR_4ADDR: u16 = 83;
 pub(crate) const CMD_DEL_INTERFACE: u8 = 8;
 pub(crate) const CMD_SET_CHANNEL: u8 = 65;
 
@@ -603,11 +607,11 @@ mod io {
     use corerouter_hal::wifi::WifiLink;
 
     use super::{
-        ATTR_CENTER_FREQ1, ATTR_CHANNEL_WIDTH, ATTR_IFINDEX, ATTR_IFNAME, ATTR_IFTYPE,
+        ATTR_4ADDR, ATTR_CENTER_FREQ1, ATTR_CHANNEL_WIDTH, ATTR_IFINDEX, ATTR_IFNAME, ATTR_IFTYPE,
         ATTR_MNTR_FLAGS, ATTR_SPLIT_WIPHY_DUMP, ATTR_WIPHY, ATTR_WIPHY_FREQ, CMD_DEL_INTERFACE,
         CMD_GET_INTERFACE, CMD_GET_STATION, CMD_GET_SURVEY, CMD_GET_WIPHY, CMD_NEW_INTERFACE,
-        CMD_SET_CHANNEL, IFTYPE_MONITOR, MAX_SURVEY, MAX_WIPHY_MESSAGES, MNTR_FLAG_CONTROL,
-        MNTR_FLAG_OTHER_BSS, Wiphy, station, stations, survey, tx_power,
+        CMD_SET_CHANNEL, CMD_SET_INTERFACE, IFTYPE_MONITOR, MAX_SURVEY, MAX_WIPHY_MESSAGES,
+        MNTR_FLAG_CONTROL, MNTR_FLAG_OTHER_BSS, Wiphy, station, stations, survey, tx_power,
     };
     use crate::genl::{Genl, GenlError, Msg, attrs, find};
     use corerouter_hal::wifi::WifiSurvey;
@@ -730,6 +734,15 @@ mod io {
             Ok(replies
                 .iter()
                 .find_map(|(_, a)| find(attrs(a), ATTR_IFINDEX)?.u32()))
+        }
+
+        /// G1.30m: four-address frames on or off on station `ifindex` (a
+        /// WDS station-bridge; `iw dev <name> set 4addr on`).
+        pub fn set_4addr(&mut self, ifindex: u32, on: bool) -> Result<(), GenlError> {
+            let seq = self.genl.next_seq();
+            let mut m = Msg::new(self.family, CMD_SET_INTERFACE, 0, seq);
+            m.u32(ATTR_IFINDEX, ifindex).u8(ATTR_4ADDR, u8::from(on));
+            self.genl.call(m.finish(), seq).map(|_| ())
         }
 
         /// G1.30j: remove interface `ifindex` (a monitor this made).

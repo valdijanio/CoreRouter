@@ -18,10 +18,11 @@
 
 use corerouter_hal::wifi::WifiRadio;
 use corerouter_hal::wifi_ap::{
-    ApSecurity, ApState, WifiAp, WifiApEvent, WifiApPort, WifiApStatus, channel_block,
+    ApBackhaul, ApPeer, ApSecurity, ApState, WifiAp, WifiApEvent, WifiApPort, WifiApStatus,
+    channel_block,
 };
-use corerouter_model::wifi::{AP_WIDTHS, WifiBand, WifiConfig, WifiSecurity};
-use corerouter_model::{Config, IfName};
+use corerouter_model::wifi::{AP_WIDTHS, StationBridge, WifiBand, WifiConfig, WifiSecurity};
+use corerouter_model::{Config, IfName, InterfaceKind};
 
 use crate::Session;
 use crate::wifi::channel;
@@ -252,6 +253,32 @@ struct Told {
     plan: Plan,
     country: String,
     bridge: Option<IfName>,
+    backhaul: Option<ApBackhaul>,
+}
+
+/// G1.30m: the station-bridges access point `name` takes: its registered
+/// peers (enabled `wifi-peer` interfaces on it), when `station_bridge` is
+/// `yes` or `only`.
+pub(crate) fn backhaul_of(cfg: &Config, name: &IfName, st: &WifiConfig) -> Option<ApBackhaul> {
+    let only = match st.station_bridge {
+        StationBridge::No => return None,
+        StationBridge::Yes => false,
+        StationBridge::Only => true,
+    };
+    let peers = cfg
+        .interfaces
+        .values()
+        .filter(|i| !i.disabled)
+        .filter_map(|i| match &i.kind {
+            InterfaceKind::WifiPeer(p) if p.radio == *name => Some(ApPeer {
+                mac: p.mac.to_string().to_ascii_lowercase(),
+                name: i.name.to_string(),
+            }),
+            _ => None,
+        })
+        .take(corerouter_hal::wifi_ap::MAX_CLIENTS)
+        .collect();
+    Some(ApBackhaul { only, peers })
 }
 
 /// One access point at run time.
@@ -306,6 +333,7 @@ impl Session {
         let cfg: &Config = self.store().running();
         let country = cfg.system.wifi.country.map(|c| c.to_string());
         let bridge = cfg.interfaces.get(name).and_then(|i| i.bridge.clone());
+        let backhaul = want.and_then(|st| backhaul_of(cfg, name, st));
         let mut notes: Vec<(&'static str, String)> = Vec::new();
         let Some(st) = want else {
             if let Some(mut r) = self.wifi_rt().and_then(|rt| rt.aps.remove(name))
@@ -368,6 +396,7 @@ impl Session {
                     && t.hidden == st.hidden
                     && t.country == country
                     && t.bridge == bridge
+                    && t.backhaul == backhaul
                     && (st.frequency.is_none() || st.frequency == Some(t.plan.frequency_mhz))
                     && st.width.is_none_or(|w| w == t.plan.width_mhz)
             });
@@ -406,7 +435,11 @@ impl Session {
             };
             let ap = WifiAp {
                 ssid: st.ssid.clone(),
-                security: ap_security(st.security),
+                // G1.30m: a backhaul-only access point is WPA3 only.
+                security: match (&backhaul, st.security) {
+                    (Some(b), WifiSecurity::Auto) if b.only => ApSecurity::Wpa3,
+                    _ => ap_security(st.security),
+                },
                 key,
                 hidden: st.hidden,
                 frequency_mhz: plan.frequency_mhz,
@@ -418,6 +451,7 @@ impl Session {
                 vht: plan.vht,
                 he: plan.he,
                 radar: plan.radar,
+                backhaul: backhaul.clone(),
             };
             let Some(p) = r.port.as_mut() else { return };
             match p.start(&ap) {
@@ -442,6 +476,7 @@ impl Session {
                         plan: plan.clone(),
                         country,
                         bridge,
+                        backhaul,
                     });
                     r.plan = Some(plan);
                     r.error = None;
@@ -492,6 +527,12 @@ impl Session {
                     WifiApEvent::Failed(why) => {
                         r.error = Some(why.clone());
                         notes.push(("failed", why));
+                    }
+                    WifiApEvent::PeerUp { mac, name } => {
+                        notes.push(("connected", format!("peer {name} ({mac}): four-address link up")));
+                    }
+                    WifiApEvent::PeerDown { mac, name } => {
+                        notes.push(("disconnected", format!("peer {name} ({mac}): link down")));
                     }
                 }
             }

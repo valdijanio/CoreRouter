@@ -178,6 +178,20 @@ pub(crate) fn ap_fields(ap: &WifiAp) -> Option<Vec<(&'static str, String)>> {
         }
         f.push(("bridge", b.clone()));
     }
+    // G1.30m: station-bridges. `wds_sta`: a four-address station gets an
+    // interface of its own (`<ifname>.sta<aid>`, driver_nl80211.c
+    // `i802_set_wds_sta`); `multi_ap` 1 is a backhaul BSS (only Multi-AP
+    // stations), 3 backhaul and fronthaul (hostapd.conf `multi_ap`).
+    if let Some(b) = &ap.backhaul {
+        if b.peers
+            .iter()
+            .any(|p| mac_of(&p.mac).is_none() || !ifname_ok(&p.name))
+        {
+            return None;
+        }
+        f.push(("wds_sta", "1".into()));
+        f.push(("multi_ap", if b.only { "1" } else { "3" }.into()));
+    }
     let fits = f
         .iter()
         .all(|(k, v)| k.len() + v.len() + 8 < MAX_COMMAND && !v.contains(['\n', '\r', '\0']));
@@ -234,6 +248,10 @@ pub(crate) fn parse_event(line: &str) -> Option<WifiApEvent> {
                 .and_then(|v| v.trim_end_matches('s').parse().ok())
                 .unwrap_or(60),
         }),
+        // G1.30m: a four-address station's interface came or went
+        // (`drv_callbacks.c`, `hostapd_event_wds_sta_interface_status`);
+        // `Wds` is the port's, which turns it into PeerUp/PeerDown.
+        "WDS-STA-INTERFACE-ADDED" | "WDS-STA-INTERFACE-REMOVED" => None,
         "DFS-RADAR-DETECTED" => Some(WifiApEvent::Radar {
             frequency_mhz: kv(rest, "freq").and_then(|v| v.parse().ok()).unwrap_or(0),
         }),
@@ -307,6 +325,21 @@ pub(crate) fn parse_sta(reply: &str) -> Option<(String, bool, Option<String>, Op
     Some((mac, authorized, security, generation))
 }
 
+/// G1.30m: a `WDS-STA-INTERFACE-ADDED`/`-REMOVED` line: added, the
+/// interface and the station's MAC.
+pub(crate) fn parse_wds(line: &str) -> Option<(bool, String, String)> {
+    let body = line.trim().split_once('>').map_or(line.trim(), |(_, b)| b);
+    let (name, rest) = body.split_once(' ')?;
+    let added = match name {
+        "WDS-STA-INTERFACE-ADDED" => true,
+        "WDS-STA-INTERFACE-REMOVED" => false,
+        _ => return None,
+    };
+    let ifname = kv(rest, "ifname").filter(|n| ifname_ok(n))?;
+    let mac = mac_of(kv(rest, "sta_addr")?)?;
+    Some((added, ifname.to_owned(), mac))
+}
+
 fn push(events: &mut Vec<WifiApEvent>, e: WifiApEvent) {
     if events.len() < MAX_AP_EVENTS {
         events.push(e);
@@ -331,7 +364,7 @@ mod io {
     };
     use corerouter_model::IfName;
 
-    use super::{SECRET_FIELDS, ap_fields, parse_event, parse_sta, parse_status, push};
+    use super::{SECRET_FIELDS, ap_fields, parse_event, parse_sta, parse_status, parse_wds, push};
     use crate::nl80211::Nl80211;
     use crate::wifi::{Ctrl, runtime_dir, turn_of, unblock};
 
@@ -467,6 +500,8 @@ mod io {
         nl: Option<Nl80211>,
         error: Option<String>,
         told: Option<WifiAp>,
+        /// G1.30m: the peers whose link is up, (MAC, name).
+        peers_up: Vec<(String, String)>,
     }
 
     impl Direct {
@@ -480,12 +515,17 @@ mod io {
                 nl: None,
                 error: None,
                 told: None,
+                peers_up: Vec::new(),
             }
         }
 
         /// Take the interface out of hostapd (its clients leave).
         fn remove(&mut self) -> Result<(), HalError> {
             self.socks = None;
+            // G1.30m: the peers' renamed links (hostapd cannot find them).
+            for (_, name) in std::mem::take(&mut self.peers_up) {
+                let _ = crate::link_set::delete(&name);
+            }
             if !self.dir.join("global").exists() {
                 return Ok(());
             }
@@ -555,6 +595,56 @@ mod io {
             Ok(())
         }
 
+        /// G1.30m: a four-address station's interface came (`added`) or
+        /// went. A registered peer's gets the peer's name (down, renamed,
+        /// up); any other station that asks for four addresses is sent
+        /// away. hostapd looks the interface up by its old name to delete
+        /// it (`i802_set_wds_sta`), so a renamed one is deleted here.
+        fn wds(&mut self, added: bool, ifname: &str, mac: &str) -> Option<WifiApEvent> {
+            let peer = self
+                .told
+                .as_ref()
+                .and_then(|t| t.backhaul.as_ref())
+                .and_then(|b| b.peers.iter().find(|p| p.mac == mac))
+                .cloned();
+            match (added, peer) {
+                (true, Some(p)) => match crate::link_set::rename(ifname, &p.name) {
+                    Ok(()) => {
+                        self.peers_up.push((p.mac.clone(), p.name.clone()));
+                        Some(WifiApEvent::PeerUp {
+                            mac: p.mac,
+                            name: p.name,
+                        })
+                    }
+                    Err(e) => Some(WifiApEvent::Failed(format!(
+                        "peer {}: its link {ifname} could not be named: {e}",
+                        p.name
+                    ))),
+                },
+                (true, None) => {
+                    if let Some((cmd, _)) = &self.socks {
+                        // Reason 1: unspecified (IEEE 802.11-2020 Table 9-49).
+                        let _ = cmd
+                            .request(&format!("DEAUTHENTICATE {mac} reason=1"), "DEAUTHENTICATE");
+                    }
+                    Some(WifiApEvent::Refused {
+                        mac: mac.to_owned(),
+                        reason: "asked for four addresses and is not a registered peer \
+                                 (interface.wifi.peer.add)"
+                            .into(),
+                    })
+                }
+                (false, _) => {
+                    let pos = self.peers_up.iter().position(|(m, _)| m == mac)?;
+                    let (mac, name) = self.peers_up.remove(pos);
+                    if let Err(e) = crate::link_set::delete(&name) {
+                        log::debug!("wifi {}: deleting peer link {name}: {e}", self.name);
+                    }
+                    Some(WifiApEvent::PeerDown { mac, name })
+                }
+            }
+        }
+
         /// The clients: who is there from hostapd, the link from nl80211.
         fn clients(&mut self) -> Result<Vec<WifiClient>, HalError> {
             let Some((cmd, _)) = &self.socks else {
@@ -571,6 +661,7 @@ mod io {
                     mac,
                     authorized,
                     security,
+                    peer: None,
                     generation,
                     link: WifiLink::default(),
                 });
@@ -595,6 +686,13 @@ mod io {
                         c.link = l.clone();
                     }
                 }
+            }
+            for c in &mut out {
+                c.peer = self
+                    .peers_up
+                    .iter()
+                    .find(|(m, _)| *m == c.mac)
+                    .map(|(_, n)| n.clone());
             }
             out.sort_by_key(|c| std::cmp::Reverse(c.link.signal_avg_dbm.unwrap_or(-200)));
             Ok(out)
@@ -633,9 +731,18 @@ mod io {
 
         fn events(&mut self) -> Vec<WifiApEvent> {
             let mut out = std::mem::take(&mut self.queued);
-            if let Some((_, ev)) = &self.socks {
-                let room = MAX_AP_EVENTS.saturating_sub(out.len());
-                out.extend(ev.pending(room).iter().filter_map(|l| parse_event(l)));
+            let lines = match &self.socks {
+                Some((_, ev)) => ev.pending(MAX_AP_EVENTS.saturating_sub(out.len())),
+                None => Vec::new(),
+            };
+            for l in &lines {
+                if let Some((added, ifname, mac)) = parse_wds(l) {
+                    if let Some(e) = self.wds(added, &ifname, &mac) {
+                        out.push(e);
+                    }
+                } else if let Some(e) = parse_event(l) {
+                    out.push(e);
+                }
             }
             for e in &out {
                 if let WifiApEvent::Up = e {
@@ -822,6 +929,7 @@ mod tests {
             vht: true,
             he: true,
             radar: false,
+            backhaul: None,
         }
     }
 
@@ -932,6 +1040,45 @@ mod tests {
         );
         assert_eq!(parse_event("<3>AP-STA-CONNECTED garbage"), None);
         assert_eq!(parse_event("<2>WPS-SOMETHING"), None);
+    }
+
+    #[test]
+    fn station_bridges_and_their_links() {
+        let mut a = ap(ApSecurity::Wpa3, "senha-boa-123", 5180, 80);
+        a.backhaul = Some(corerouter_hal::wifi_ap::ApBackhaul {
+            only: false,
+            peers: vec![corerouter_hal::wifi_ap::ApPeer {
+                mac: "02:00:00:00:00:00".into(),
+                name: "peer1".into(),
+            }],
+        });
+        let f = ap_fields(&a).unwrap();
+        assert_eq!(value(&f, "wds_sta"), Some("1"));
+        assert_eq!(value(&f, "multi_ap"), Some("3"));
+        if let Some(b) = a.backhaul.as_mut() {
+            b.only = true;
+        }
+        assert_eq!(value(&ap_fields(&a).unwrap(), "multi_ap"), Some("1"));
+        if let Some(b) = a.backhaul.as_mut() {
+            b.peers[0].name = "bad name".into();
+        }
+        assert!(ap_fields(&a).is_none());
+        assert_eq!(
+            parse_wds("<3>WDS-STA-INTERFACE-ADDED ifname=wifi2.sta1 sta_addr=02:00:00:00:00:00"),
+            Some((true, "wifi2.sta1".into(), "02:00:00:00:00:00".into()))
+        );
+        assert_eq!(
+            parse_wds("<3>WDS-STA-INTERFACE-REMOVED ifname=wifi2.sta1 sta_addr=02:00:00:00:00:0A"),
+            Some((false, "wifi2.sta1".into(), "02:00:00:00:00:0a".into()))
+        );
+        assert_eq!(
+            parse_wds("<3>WDS-STA-INTERFACE-ADDED ifname=x;y sta_addr=02:00:00:00:00:00"),
+            None
+        );
+        assert_eq!(
+            parse_event("<3>WDS-STA-INTERFACE-ADDED ifname=wifi2.sta1 sta_addr=02:00:00:00:00:00"),
+            None
+        );
     }
 
     #[test]

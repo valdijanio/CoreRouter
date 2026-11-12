@@ -199,6 +199,9 @@ pub mod oslog;
 pub mod link_dump;
 /// Link events (G1.3d): ports replugged between two polls.
 pub mod link_events;
+/// G1.30m: rename, master and delete a link, synchronously (the radios' threads).
+#[cfg(target_os = "linux")]
+mod link_set;
 /// Neighbor tables over rtnetlink (G1.27d): dump, events, static entries.
 pub mod neigh;
 /// A radio and its link as nl80211 reports them (G1.30g); the parsers are

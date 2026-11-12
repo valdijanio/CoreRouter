@@ -332,7 +332,7 @@ fn bridge_port_add_and_list() {
             "interface.bridge.port.add",
             port("bridge1", "ether2")
         ),
-        port("bridge1", "ether2")
+        json!({"bridge": "bridge1", "interface": "ether2", "warnings": []})
     );
     ok(
         &mut s,

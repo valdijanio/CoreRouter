@@ -26,7 +26,11 @@ pub fn missing(cfg: &Config, present: impl Fn(&IfName) -> bool) -> BTreeSet<IfNa
         .values()
         // G1.30: a radio is hardware as well (a USB adapter pulled out).
         .filter(|i| {
-            matches!(i.kind, InterfaceKind::Ethernet | InterfaceKind::Wifi(_)) && !present(&i.name)
+            // G1.30m: a Wi-Fi peer's link is there while the peer is.
+            matches!(
+                i.kind,
+                InterfaceKind::Ethernet | InterfaceKind::Wifi(_) | InterfaceKind::WifiPeer(_)
+            ) && !present(&i.name)
         })
         .map(|i| i.name.clone())
         .collect()

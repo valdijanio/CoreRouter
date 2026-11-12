@@ -35,6 +35,25 @@ impl LabAp {
         self.state == ApState::Running
     }
 
+    /// G1.30m: is peer `name`'s link up?
+    pub(crate) fn peer_up(&self, name: &str) -> bool {
+        self.up() && self.clients.iter().any(|c| c.peer.as_deref() == Some(name))
+    }
+
+    fn peers_up(&self) -> usize {
+        self.clients.iter().filter(|c| c.peer.is_some()).count()
+    }
+
+    /// The next registered peer not associated yet.
+    fn peer_waiting(&self, ap: &WifiAp) -> Option<crate::wifi_ap::ApPeer> {
+        ap.backhaul
+            .as_ref()?
+            .peers
+            .iter()
+            .find(|p| !self.clients.iter().any(|c| c.mac == p.mac))
+            .cloned()
+    }
+
     fn push(&mut self, e: WifiApEvent) {
         if self.events.len() < MAX_AP_EVENTS {
             self.events.push(e);
@@ -57,9 +76,46 @@ impl LabAp {
                 self.state = ApState::Running;
                 self.push(WifiApEvent::Up);
             }
-            ApState::Running if self.clients.len() < CLIENTS.len() => {
-                if let Some((mac, signal, generation, wpa3, kbps)) =
-                    CLIENTS.get(self.clients.len()).copied()
+            // G1.30m: the registered peers come up first, one per poll
+            // (a CoreRouter's station-bridge, WPA3, Wi-Fi 6).
+            ApState::Running if self.peer_waiting(&ap).is_some() => {
+                if let Some(p) = self.peer_waiting(&ap) {
+                    let rate = crate::wifi::WifiRate {
+                        kbps: Some(1_201_000),
+                        ..crate::wifi::WifiRate::default()
+                    };
+                    self.clients.push(WifiClient {
+                        mac: p.mac.clone(),
+                        authorized: true,
+                        security: Some("wpa3".into()),
+                        peer: Some(p.name.clone()),
+                        generation: Some(6),
+                        link: WifiLink {
+                            tx: Some(rate.clone()),
+                            rx: Some(rate),
+                            signal_avg_dbm: Some(-55),
+                            tx_packets: Some(5_000),
+                            rx_packets: Some(5_200),
+                            tx_retries: Some(150),
+                            tx_failed: Some(1),
+                            connected_secs: Some(u64::from(self.polls)),
+                            inactive_ms: Some(10),
+                            ..WifiLink::default()
+                        },
+                    });
+                    self.push(WifiApEvent::PeerUp {
+                        mac: p.mac,
+                        name: p.name,
+                    });
+                }
+            }
+            ApState::Running
+                if self.clients.len() < CLIENTS.len() + self.peers_up()
+                    && !ap.backhaul.as_ref().is_some_and(|b| b.only) =>
+            {
+                if let Some((mac, signal, generation, wpa3, kbps)) = CLIENTS
+                    .get(self.clients.len().saturating_sub(self.peers_up()))
+                    .copied()
                 {
                     let security = match ap.security {
                         ApSecurity::Open => "open",
@@ -80,6 +136,7 @@ impl LabAp {
                         mac: mac.into(),
                         authorized: true,
                         security: Some(security.into()),
+                        peer: None,
                         generation: Some(generation),
                         link: WifiLink {
                             tx: Some(rate.clone()),
@@ -109,6 +166,14 @@ pub struct LabApPort {
 }
 
 impl LabWifi {
+    /// G1.30m: is the link of peer `name` up on any of the lab's access
+    /// points?
+    pub fn peer_up(&self, name: &str) -> bool {
+        self.ap_radios()
+            .iter()
+            .any(|r| self.with_ap(r, |a| a.peer_up(name)))
+    }
+
     /// G1.30a: times radio `name`'s access point was started (a test's: no
     /// restart on a tick).
     pub fn ap_starts(&self, name: &IfName) -> u32 {
@@ -128,6 +193,12 @@ impl WifiApPort for LabApPort {
         }
         self.air.with_ap(&self.name, |a| {
             for c in std::mem::take(&mut a.clients) {
+                if let Some(name) = c.peer {
+                    a.push(WifiApEvent::PeerDown {
+                        mac: c.mac.clone(),
+                        name,
+                    });
+                }
                 a.push(WifiApEvent::Left { mac: c.mac });
             }
             a.told = Some(ap.clone());

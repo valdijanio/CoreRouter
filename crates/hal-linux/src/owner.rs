@@ -179,6 +179,8 @@ fn claim_fits(claim: &InterfaceKind, link: &KernelLink) -> bool {
         InterfaceKind::Ethernet => link.port_like(),
         // G1.30: a radio's netdev, and nothing else.
         InterfaceKind::Wifi(_) => link.wireless && link.kind.is_none(),
+        // G1.30m: a peer's four-address link (an AP_VLAN netdev of the radio).
+        InterfaceKind::WifiPeer(_) => link.wireless && link.kind.is_none(),
         InterfaceKind::Vlan { .. } => link.is("vlan"),
         InterfaceKind::Bridge => link.is("bridge"),
         InterfaceKind::Loopback => link.is("dummy"),

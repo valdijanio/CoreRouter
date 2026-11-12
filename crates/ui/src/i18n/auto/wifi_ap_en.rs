@@ -23,6 +23,7 @@ Ignored by a station."##,
         "interface.wifi.mode",
         r##"## Mode
 - **station**: the router joins somebody's network (an uplink, management).
+- **station-bridge** (G1.30m): a client with four-address frames, the link between two routers: it can be a bridge port or a bonding slave. WPA3 only.
 - **ap**: the router announces the network; clients join it. Put it in a bridge to give the clients the LAN, or give it an address and a DHCP server to route them.
 
 The radio does one at a time. Changing the mode of the radio this connection comes through needs Safe Mode (or force)."##,
