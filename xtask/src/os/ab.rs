@@ -1146,14 +1146,14 @@ fn scenario_crash(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
     )?;
     // Erased: no dump variable can be read. efivarfs keeps the names it
     // listed at mount (pstore erases in the firmware, not through it), so a
-    // name may still be listed until the next boot; reading it says the
-    // variable is gone. The room they took comes back only when the
+    // name may still be listed until the next boot; reading it gives no
+    // bytes (**medido**: 0 against 828 for one not erased). The room they took comes back only when the
     // firmware reclaims its store at a boot (EDK2 does not reclaim at run
     // time), so the free space is not compared here.
     let dumps = shell_line(
         &mut vm,
         &mut log,
-        "n=0; for f in /sys/firmware/efi/efivars/dump-type*; do [ -e \"$f\" ] && cat \"$f\" >/dev/null 2>&1 && n=$((n+1)); done; echo $n",
+        "n=0; for f in /sys/firmware/efi/efivars/dump-type*; do [ \"$(cat \"$f\" 2>/dev/null | wc -c)\" -gt 0 ] && n=$((n+1)); done; echo $n",
     )?;
     check(
         dumps == "0",
