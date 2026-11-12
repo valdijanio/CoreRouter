@@ -353,10 +353,11 @@ fn pppoe_server_end_to_end() {
     // TCP connect to 100.65.0.1 timed out).
     // The access port in LAN (`allowed_from` is LAN by default): its PPPoE
     // subscribers may ask too, not only the port's own network.
-    ok(
+    let lan_member = ok(
         "interface.list.member.add",
         json!({"list": "LAN", "interface": "acc0"}),
-    );
+    )["id"]
+        .clone();
     ok("ip.dns.set", json!({"allow_remote_requests": true}));
     wait_for("the DNS server", || {
         ok("system.service.print", json!({}))
@@ -422,6 +423,7 @@ fn pppoe_server_end_to_end() {
     assert!(cap["id"].as_u64().is_some(), "{cap}");
     let e = call(None, "tool.sniffer.start", json!({"interface": "nope0"})).unwrap_err();
     assert!(e.contains("no interface 'nope0'"), "{e}");
+    subscriber_firewall(&mut one, sid, ip, &lan_member);
     ok(
         "ppp.profile.set",
         json!({"id": "default", "local_address": ""}),
@@ -607,6 +609,113 @@ fn pppoe_server_end_to_end() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = srv_thread.join();
     drop(daemon);
+}
+
+/// G4.3y: the slow path's subscriber traffic is filtered as a router's
+/// port's: it arrives on `bng0` (`all-ppp`), crosses the forward chain on
+/// its way out, and is LAN only while its server's port is. Before, it went
+/// out a raw socket as the router's own: in by `lo` (the safe defaults
+/// accept that whole), never through forward.
+fn subscriber_firewall(one: &mut Cpes, sid: u16, ip: Ipv4Addr, lan_member: &Value) {
+    // A host past the router, in namespace B, on the other end of a veth.
+    std::fs::write("/proc/sys/net/ipv4/ip_forward", "1").unwrap();
+    let b = namespace_b();
+    let (bp, bs) = (Some(b.0.id()), b.0.id().to_string());
+    common::ip(
+        None,
+        &[
+            "link", "add", "fwd0", "type", "veth", "peer", "name", "fwd1",
+        ],
+    );
+    common::ip(None, &["link", "set", "fwd1", "netns", &bs]);
+    common::ip(None, &["addr", "add", "203.0.113.1/24", "dev", "fwd0"]);
+    common::ip(None, &["link", "set", "fwd0", "up"]);
+    common::ip(bp, &["link", "set", "lo", "up"]);
+    common::ip(bp, &["addr", "add", "203.0.113.2/24", "dev", "fwd1"]);
+    common::ip(bp, &["link", "set", "fwd1", "up"]);
+    common::ip(bp, &["route", "add", "100.64.0.0/16", "via", "203.0.113.1"]);
+    let far = Ipv4Addr::new(203, 0, 113, 2);
+    let gw = Ipv4Addr::new(100, 65, 0, 1);
+    wait_for("the subscriber reaching the far host", || {
+        echo_through(one, sid, ip, far)
+    });
+    let rule = |p: Value| ok("ip.firewall.filter.add", p)["id"].clone();
+    let remove = |id: &Value| {
+        ok(
+            "ip.firewall.filter.remove",
+            json!({"id": id, "force": true}),
+        );
+    };
+
+    // Input, by `all-ppp`: the subscriber's ping to the gateway is dropped;
+    // the router's own ping of that address (by lo) is not.
+    let r = rule(
+        json!({"chain": "input", "action": "drop", "in_interface": "all-ppp", "protocol": "icmp"}),
+    );
+    assert!(
+        !echo_through(one, sid, ip, gw),
+        "input in_interface=all-ppp drops the subscriber"
+    );
+    let own = std::process::Command::new("ping")
+        .args(["-c", "1", "-W", "2", "100.65.0.1"])
+        .output()
+        .unwrap();
+    assert!(
+        own.status.success(),
+        "the router's own traffic by lo: {own:?}"
+    );
+    remove(&r);
+    assert!(echo_through(one, sid, ip, gw));
+
+    // Forward: what the subscriber sends past the router.
+    let r = rule(
+        json!({"chain": "forward", "action": "drop", "in_interface": "all-ppp", "dst_address": "203.0.113.2"}),
+    );
+    assert!(
+        !echo_through(one, sid, ip, far),
+        "forward in_interface=all-ppp drops the subscriber"
+    );
+    remove(&r);
+    assert!(echo_through(one, sid, ip, far));
+
+    // The safe defaults: LAN while the server's port (acc0) is LAN; out of
+    // LAN, its DNS query to the router is dropped ("descarta o resto que
+    // não vem da LAN"). Before G4.3y it came in by lo and was accepted.
+    let d = ok("ip.firewall.defaults.apply", json!({"force": true}));
+    // A new source port each time: an answered query is `established`.
+    let dns = |one: &mut Cpes, sport: u16| {
+        through(one, sid, &udp_dns(ip, gw, sport), |r| {
+            r[9] == 17 && r[12..16] == gw.octets()
+        })
+        .is_some()
+    };
+    assert!(
+        dns(one, 40055),
+        "LAN subscribers ask the router's DNS under the safe defaults"
+    );
+    ok(
+        "interface.list.member.remove",
+        json!({"id": lan_member, "force": true}),
+    );
+    assert!(
+        !dns(one, 40056),
+        "not LAN: dropped by the safe defaults' input rule, not let in as lo"
+    );
+    ok(
+        "interface.list.member.add",
+        json!({"list": "LAN", "interface": "acc0"}),
+    );
+    // Last first: the drop rules go before the "accept lo" this channel uses.
+    // (The ids are of every table: a NAT one is not a filter rule.)
+    for id in d["rules"].as_array().unwrap().iter().rev() {
+        let _ = call(
+            None,
+            "ip.firewall.filter.remove",
+            json!({"id": id, "force": true}),
+        );
+    }
+    // The veth goes with B's namespace.
+    drop(b);
 }
 
 /// An ICMP echo from session `sid` (address `ip`) to `dst`, sent through
