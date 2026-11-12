@@ -1,0 +1,174 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: CoreRouter <noreply@corerouter.invalid>
+Date: Thu, 12 Nov 2026 11:07:31 -0300
+Subject: [PATCH] wpa_supplicant: Request a new scan after a scan aborted by
+ someone else
+
+Since commit cb5bb8168 ("Do not use aborted scan results for new
+operations"), the results of an aborted scan are not used for network
+selection. That is right when wpa_supplicant aborted the scan itself
+(ABORT_SCAN, a disconnection request), but a scan for a connection can
+also be aborted by something else, e.g., when the interface is taken
+down and up while it scans, as when it is added to a bond (bonding takes
+its slaves down). Nothing requests another scan in that case: wpa_state
+stays WPA_SCANNING and the station does not connect again until
+something else happens to the interface.
+
+Seen with two mac80211_hwsim stations added to a bond while scanning:
+one of them logged "nl80211: Scan aborted" and then stayed in SCANNING
+for more than 90 seconds.
+
+Remember when wpas_abort_ongoing_scan() asked the driver to abort the
+scan, and request a new scan a second later only for an abort that did
+not come from wpa_supplicant. An abort wpa_supplicant requested keeps the
+current behavior, so scan_aborted_on_connect_no_reselect still passes.
+
+The new test case aborts the scan with "iw dev <ifname> scan abort" while
+connecting and expects the connection to complete.
+---
+ tests/hwsim/test_scan.py          | 35 +++++++++++++++++++++++++++++++
+ wpa_supplicant/events.c           | 16 ++++++++++++++
+ wpa_supplicant/p2p_supplicant.c   |  4 +++-
+ wpa_supplicant/scan.c             |  9 ++++++--
+ wpa_supplicant/wpa_supplicant_i.h |  6 ++++++
+ 5 files changed, 67 insertions(+), 3 deletions(-)
+
+diff --git a/tests/hwsim/test_scan.py b/tests/hwsim/test_scan.py
+index 6255259d2..6a8111559 100644
+--- a/tests/hwsim/test_scan.py
++++ b/tests/hwsim/test_scan.py
+@@ -1132,6 +1132,41 @@ def test_scan_aborted_on_connect_no_reselect(dev, apdev):
+     finally:
+         dev[0].request("REMOVE_NETWORK all")
+ 
++def test_scan_aborted_externally_on_connect(dev, apdev):
++    """Scan for a connection aborted outside wpa_supplicant is retried"""
++    # A scan can also be aborted by something else than wpa_supplicant,
++    # e.g., when the interface is taken down and up while it scans (as when
++    # it is added to a bond). The aborted results must still not be used,
++    # but a new scan has to be requested, or wpa_state stays at
++    # WPA_SCANNING and the station never connects.
++    hostapd.add_ap(apdev[0], {"ssid": "test-scan"})
++    dev[0].flush_scan_cache()
++    try:
++        dev[0].dump_monitor()
++        # Three channels: long enough for the abort to land in the scan,
++        # short enough that the new scan does not depend on the
++        # regulatory state the earlier test cases left.
++        dev[0].connect("test-scan", key_mgmt="NONE",
++                       scan_freq="2412 2437 2462", wait_connect=False)
++        ev = dev[0].wait_event(["CTRL-EVENT-SCAN-STARTED"], timeout=5)
++        if ev is None:
++            raise Exception("Scan did not start")
++
++        # Abort the scan through nl80211 from outside wpa_supplicant.
++        if subprocess.call(['iw', 'dev', dev[0].ifname, 'scan', 'abort']) != 0:
++            raise Exception("iw scan abort failed")
++        ev = dev[0].wait_event(["CTRL-EVENT-SCAN-RESULTS",
++                                "CTRL-EVENT-CONNECTED"], timeout=5)
++        if ev is None:
++            raise Exception("Aborted scan did not terminate")
++        if "CTRL-EVENT-CONNECTED" in ev:
++            raise HwsimSkip("Scan completed before it could be aborted")
++
++        dev[0].wait_connected(timeout=5,
++                              error="No connection after an external scan abort")
++    finally:
++        dev[0].request("REMOVE_NETWORK all")
++
+ @remote_compatible
+ def test_scan_ext(dev, apdev):
+     """Custom IE in Probe Request frame"""
+diff --git a/wpa_supplicant/events.c b/wpa_supplicant/events.c
+index e1664714b..cc24ef845 100644
+--- a/wpa_supplicant/events.c
++++ b/wpa_supplicant/events.c
+@@ -2837,8 +2837,24 @@ static int _wpa_supplicant_event_scan_results(struct wpa_supplicant *wpa_s,
+ 	}
+ 
+ 	if (data && data->scan_info.aborted) {
++		bool requested = wpa_s->scan_abort_requested;
++
++		wpa_s->scan_abort_requested = false;
+ 		wpa_dbg(wpa_s, MSG_DEBUG,
+ 			"Scan was aborted - do not use the incomplete scan results to trigger new operations");
++		/*
++		 * A scan for a connection that was aborted by something else
++		 * than wpa_supplicant (e.g., the interface was taken down and up
++		 * while it was scanning) would otherwise leave wpa_state at
++		 * WPA_SCANNING with nothing to request another scan.
++		 */
++		if (!requested && own_request &&
++		    wpa_s->wpa_state == WPA_SCANNING &&
++		    !wpa_s->scan_res_handler) {
++			wpa_dbg(wpa_s, MSG_DEBUG,
++				"Scan was not aborted by wpa_supplicant - request a new scan");
++			wpa_supplicant_req_new_scan(wpa_s, 1, 0);
++		}
+ 		goto scan_work_done;
+ 	}
+ 
+diff --git a/wpa_supplicant/p2p_supplicant.c b/wpa_supplicant/p2p_supplicant.c
+index 2b9e7f890..40747c004 100644
+--- a/wpa_supplicant/p2p_supplicant.c
++++ b/wpa_supplicant/p2p_supplicant.c
+@@ -387,8 +387,10 @@ static void wpas_p2p_trigger_scan_cb(struct wpa_radio_work *work, int deinit)
+ 		wpas_p2p_scan_freqs(wpa_s, params, params->p2p_include_6ghz);
+ 
+ 	ret = wpa_drv_scan(wpa_s, params);
+-	if (ret == 0)
++	if (ret == 0) {
+ 		wpa_s->curr_scan_cookie = params->scan_cookie;
++		wpa_s->scan_abort_requested = false;
++	}
+ 	wpa_scan_free_params(params);
+ 	work->ctx = NULL;
+ 	if (ret) {
+diff --git a/wpa_supplicant/scan.c b/wpa_supplicant/scan.c
+index f02d8cbcd..107a540dc 100644
+--- a/wpa_supplicant/scan.c
++++ b/wpa_supplicant/scan.c
+@@ -239,8 +239,10 @@ static void wpas_trigger_scan_cb(struct wpa_radio_work *work, int deinit)
+ 	 * Revisit this logic if concurrent scan operations per interface
+ 	 * is supported.
+ 	 */
+-	if (ret == 0)
++	if (ret == 0) {
+ 		wpa_s->curr_scan_cookie = params->scan_cookie;
++		wpa_s->scan_abort_requested = false;
++	}
+ 	wpa_scan_free_params(params);
+ 	work->ctx = NULL;
+ 	if (ret) {
+@@ -4192,7 +4194,10 @@ int wpas_abort_ongoing_scan(struct wpa_supplicant *wpa_s)
+ 		     os_strcmp(work->type, "p2p-scan") != 0))
+ 			continue;
+ 		wpa_dbg(wpa_s, MSG_DEBUG, "Abort an ongoing scan");
+-		return wpa_drv_abort_scan(wpa_s, wpa_s->curr_scan_cookie);
++		if (wpa_drv_abort_scan(wpa_s, wpa_s->curr_scan_cookie) < 0)
++			return -1;
++		wpa_s->scan_abort_requested = true;
++		return 0;
+ 	}
+ 
+ 	wpa_dbg(wpa_s, MSG_DEBUG, "No ongoing scan/p2p-scan found to abort");
+diff --git a/wpa_supplicant/wpa_supplicant_i.h b/wpa_supplicant/wpa_supplicant_i.h
+index a1d8029b6..004ec4fa2 100644
+--- a/wpa_supplicant/wpa_supplicant_i.h
++++ b/wpa_supplicant/wpa_supplicant_i.h
+@@ -1015,6 +1015,12 @@ struct wpa_supplicant {
+ 	 * pending vendor scan request.
+ 	 */
+ 	u64 curr_scan_cookie;
++	/*
++	 * Whether wpa_supplicant itself asked the driver to abort the ongoing
++	 * scan (ABORT_SCAN, a disconnection request). Cleared when a new scan
++	 * is started.
++	 */
++	bool scan_abort_requested;
+ #define MAX_SCAN_ID 16
+ 	int scan_id[MAX_SCAN_ID];
+ 	unsigned int scan_id_count;
+-- 
+2.43.0
+

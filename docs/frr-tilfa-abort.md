@@ -121,6 +121,12 @@ Reportado ao FRR, a pedido do usuário e pela conta dele: issue
 [FRRouting/frr#24092](https://github.com/FRRouting/frr/pull/24092). O texto e os dois patches
 ficam em `docs/frr-upstream/`.
 
+O PR foi aceito: entrou no `master` do FRR em 2026-11-11 (commit `6e1c5cbad3a8`, revisado por um
+mantenedor depois de ajustes de estilo e da linha `Signed-off-by`), e a issue fechou junto. Ele
+ainda não está em nenhuma versão (a última é a 10.7.1) nem no `stable/10.7`; o `master` é a
+10.9.0-dev. Até a imagem passar para uma versão do FRR que o traga, o patch
+`os/patches/frr/0001-ospfd-ti-lfa-missing-router-lsa.patch` continua.
+
 ## O que muda para a produção
 
 - O FRR da imagem passa a levar a correção. O `.deb` 10.7.1 da VM do laboratório **não** a tem:
