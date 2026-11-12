@@ -850,6 +850,8 @@ fn static_name(name: &str) -> &'static str {
         "Root verity",
         "BGP End-of-RIB",
         "BGP GR without BFD",
+        "Previous boot",
+        "Crash store",
     ]
     .into_iter()
     .find(|n| *n == name)
