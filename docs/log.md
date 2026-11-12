@@ -11899,3 +11899,176 @@ continuação indentadas).
   --affected` (2026-11-12, carga 35–60). Agora o teste espera 5 confirmações (até 30 s) e corta 100
   ms depois. A mensagem diz quantas confirmações houve e em quanto tempo. Sem carga: 10 confirmações
   em ~200 ms, com 12 cópias em paralelo (**medido**).
+
+- 2026-11-12 — G0.30j: `install-test` instável na instalação pelo código do console (imagem 3d695b37, 1 falha em 3
+  rodadas): o `system.install.run` era aceito e o `system.install.print` ficava 300 s com `job`,
+  `result` e `network` nulos. **Causa:** a conferência do disco gravado lia o rootfs inteiro
+  (~100 MiB) num só `Vec` (`check_rootfs`, `crates/sysupdate/src/install.rs`) para recalcular a
+  árvore dm-verity; o daemon ocioso da live já usa ~80 MiB e a VM de 448 MiB tem ~230 MiB
+  disponíveis, então o kernel matava o daemon por falta de memória (`Out of memory: Killed process
+  93 (corerouter-daem) … anon-rss:265732kB`), o PID 1 o reiniciava em 0,5 s e o daemon novo subia
+  com o estado do instalador zerado. O teste só lia a serial dentro de `expect`, por isso o
+  reinício não aparecia no relato. A mesma leitura inteira estava em `Platform::check_slot`
+  (`crates/sysupdate/src/ab.rs`: atualização A/B e scrub no roteador instalado).
+
+  **Correção:** `verity::check_at` confere um slot a partir do disco, 1 MiB por vez por thread
+  (a mesma divisão por blocos de hash de antes), e guarda só a árvore (1/128 dos dados): o nível 0
+  vem dos blocos lidos, os de cima do nível 0, e a árvore gravada depois dos dados tem de ser a
+  calculada, o que cobre todos os bytes do slot. A instalação e o `check_slot` usam essa função; a
+  passada extra de SHA-256 do rootfs inteiro na instalação saiu (a árvore conferida contra a raiz
+  assinada já prova cada byte). O `install-test` agora passa a VM ao `install_result`: se a
+  instalação não termina, o erro traz as linhas da serial sobre processo morto (OOM, daemon que
+  saiu); se termina, `system.resource.print` tem de dizer `oom_kills: 0`.
+
+  Testes novos: `verity::tests::a_slot_is_checked_a_piece_at_a_time` (nenhuma leitura passa de
+  1 MiB; o código antigo lia o slot inteiro de uma vez), `every_byte_of_the_slot_counts` (um byte
+  trocado nos dados, na árvore ou no preenchimento, tamanho, sal ou raiz errados recusam; slot
+  curto dá erro) e `threads_check_the_same_slot`.
+
+  Como conferir: `cargo xtask os install-test`; ou subir a ISO live com `-m 448`, definir a senha
+  do admin e instalar pela CLI consultando `system.resource.print` (o roteiro usado está nas notas
+  da sessão).
+
+  Números (**medido**, 2026-11-12, QEMU/KVM q35 OVMF `-m 448` — o mínimo que a live aceita para
+  subir o daemon —, a instalação pela CLI com a senha definida e consultas a cada 0,2 s):
+
+  | | ISO antiga (main 2e7dec38) | ISO com a correção |
+  |---|---|---|
+  | instalações que terminaram | 0 de 3 (daemon morto por OOM) | 3 de 3 |
+  | `oom_kills` depois | 1 | 0 |
+  | menor memória disponível | 147 MiB, depois o OOM | 138–209 MiB |
+  | maior RSS do daemon amostrado | 117 MiB (265 MiB no OOM) | 78–133 MiB |
+  | `verify_ms` | — | 52–60 ms |
+
+  `cargo xtask os install-test` com a ISO corrigida (**medido**, 2026-11-12, máquina de
+  desenvolvimento de 32 threads): 10 de 10 passaram, cada uma com o `oom_kills: 0` conferido.
+  5 seguidas com a máquina normal (carga 6–10): 182–188 s cada. 5 seguidas com 32 laços ocupando
+  todos os núcleos (carga 37–45): 329–398 s cada. A instalação pelo código do console levou
+  252–1502 ms.
+
+- 2026-11-12 — G1.6zy: Erros de memória. `igen6_edac` e `pnd2_edac` (que escrevem uma linha de erro em todo boot sem
+  ECC) viraram módulo, que o PID 1 carrega só quando o SMBIOS tipo 16 diz que a memória tem ECC
+  (`corerouter.edac=on|off` força). `MEMORY_FAILURE` (um erro sem correção mata o processo dono da
+  página, não o kernel; o init reinicia o daemon) e `RAS_CEC` (tira de uso a página que corrige
+  erros demais) embutidos, com `vm.memory_failure_recovery` e `vm.memory_failure_early_kill` no
+  Tuning. Contagem por pente: `system.health.memory.print`, tabela "Pentes com ECC" em Resources ›
+  Memory, verificação `memory.ecc` (erro com UE, aviso com CE ou memória retirada). Custo
+  **medido**: `bzImage` +28 672 B, dois módulos de 22 KB e 17 KB.
+
+  Testar: `cargo xtask os check`; na GUI do laboratório (`--backend virtual`), Resources › Memory
+  mostra dois pentes; no roteador, `system.health.memory.print`.
+
+- 2026-11-12 — G3.4n: Custo do OSPF do nosso lado com escala: o laço de leitura do FRR no daemon, os leitores de estado
+  do `hal-frr`, os comandos de consulta e a janela Routing › OSPF, medidos com 500–4 000 interfaces,
+  50–500 vizinhos, LSDB de 100 000 LSAs (2 000 roteadores) e 10 000–200 000 rotas.
+
+  - **Leitura tipada do JSON do FRR** (`hal-frr/src/loose.rs`): vizinhos, interfaces, stub router,
+    rotas e os links da LSDB eram lidos numa árvore `serde_json::Value` (cada chave e texto alocados
+    e soltos a cada leitura); agora só os campos guardados, com o resto pulado na leitura e o texto
+    emprestado do buffer. A leniência fica (campo de tipo estranho é `None`, entrada que não é
+    objeto é pulada). Os bytes da resposta vão direto ao leitor, sem cópia para `String`.
+  - **Rotas do `ospfd` em fluxo** (`ospf::read_routes`), como a LSDB: 200 000 rotas são 43 MiB de
+    JSON e passavam do limite de 64 MiB de uma resposta inteira a partir de ~300 000.
+  - **Conexões vty mantidas** entre as leituras (`Frr::with_vty`): o laço abria uma por daemon e
+    instância a cada 2 s e digitava `enable` em cada. O FRR 10.7.1 não aplica `exec-timeout` a
+    conexão vtysh (`lib/vty.c`, `vtysh_accept`); se o daemon reinicia, a conexão guardada falha e a
+    leitura refaz numa nova, sem erro (teste).
+  - **Lock do `Session`**: `set_routing_status` devolve a amostra anterior, solta fora do lock.
+    `ospf_live` empresta os vizinhos e interfaces em vez de copiar a cada consulta.
+  - **Consultas**: `interface.list` achava o template de cada interface varrendo todos (O(n²)); a
+    topologia procurava o vizinho de cada nó varrendo os vizinhos com um `String` por comparação;
+    a busca de LSAs criava dois `String` por LSA. Agora índices e um buffer na pilha.
+    `routing.ospf.route.list` ganhou `offset`/`limit` (200 por padrão, até 1 000), `total` e
+    `by_kind` (devolvia até 10 000 linhas, 1,9 MiB); `interface.list` ganhou `find`, `offset`,
+    `limit` (1 000 por padrão) e `total` (4 000 interfaces eram 1,1 MiB numa resposta MCP);
+    `routing.ospf.topology` ganhou `known`: com o `token` do mapa que a janela tem, responde
+    `unchanged` em vez de montar e mandar de novo ~1 MiB a cada atualização.
+  - **Janela**: Neighbors, LSDB e Routes montam as linhas quando a resposta chega, não a cada
+    quadro; Routes vem em páginas de 200 com a busca de prefixo no roteador; o pager do LSDB e de
+    Routes segue o do BGP › Routes (as setas ◀ ▶ saíam como caixa vazia, sem glifo na fonte).
+
+  Como testar: `cargo bench -p corerouter-hal-frr --bench frr_ospf_poll`, `cargo bench -p
+  corerouter-engine --bench ospf_queries`, `cargo bench -p corerouter-ui --bench frames -- ospf`;
+  na GUI, Routing › OSPF › Routes com mais de 200 rotas mostra "1–200 of N" e a busca filtra no
+  roteador.
+
+- 2026-11-12 — G4.8g: Temperatura dos pentes de memória em System › Health: `spd5118` (DDR5, instanciado pelo SMBus a
+  partir do SMBIOS, embutido), `jc42` (DDR3/DDR4 de servidor, sonda os endereços 0x18–0x1f:
+  módulo carregado com os Super-I/O, só em máquina real) e `i2c_piix4` (o SMBus da AMD: módulo
+  carregado antes dos sensores e só onde ele existe; o PIIX4 virtual do VMware escreve erro no
+  boot). Os sensores se chamam `spd5118 dimmN`/`jc42 dimmN` pelo endereço e saem sem o `max` (um
+  alarme do firmware, 55 °C de fábrica em muitos), com o `crit`. Custo **medido**: `bzImage` +0 B,
+  `jc42` 7 KB e `i2c_piix4` 17 KB em módulo.
+
+  Testar: `cargo xtask os check`; `cargo xtask os boot-test`; num roteador com DDR5,
+  `system.health.print` lista `spd5118 dimm0`.
+
+- 2026-11-12 — docs-upstream-envio: Novo guia `docs/upstream.md`: como preparar e enviar a correção de um pacote de terceiros ao
+  projeto de origem. Ele cobre:
+  - o que conferir antes (código atual do projeto, o commit que trouxe o defeito e o teste dele,
+    teste novo que falha sem a correção, compilação do zero, o mesmo patch na imagem);
+  - a assinatura (`Signed-off-by` com nome real e e-mail válido);
+  - o caminho de cada projeto: FRR por PR no GitHub, hostap por e-mail com `git send-email`,
+    inscrição na lista por `hostap-join@` e senha de app do Gmail;
+  - uma tabela dos envios.
+
+  Novo `scripts/hostap-hwsim.sh` (o usado no `fix-wpa-rescan-upstream`): roda a suíte hwsim do
+  hostap num clone, dentro da VM do laboratório. Instala as dependências e a política de D-Bus,
+  compila do zero e, com `--diff`, roda de novo sem a correção para ver o teste novo falhar. No fim,
+  faz `vm-lab reset`, porque a suíte deixa o `cfg80211` e o país para trás. O `CLAUDE.md` e o
+  `AGENTS.md` apontam o guia no item "Corrija onde está o defeito".
+
+- 2026-11-12 — fix-e2e-wifi-adopt: O teste `e2e::config_and_history_survive_sigterm_and_kill_9` falhava no runner lento com
+  "SIGTERM lost config or history". Não era perda de config: o rádio `wifi1` do laboratório entra
+  pela adoção do tick (~2 s depois do início, **medido**), e o retrato antes do SIGTERM saía antes
+  dela (0,3 s), enquanto o do daemon reiniciado, no runner lento, saía depois — uma interface e um
+  commit `interface.wifi.adopt` a mais. O teste agora espera a adoção antes de montar a config.
+  Reproduzido com 2 s de espera depois do reinício (falha 1/1 sem a correção, passa com ela).
+
+- 2026-11-12 — fix-netns-routes-batch-guard: `netns_routes_batch` (teste e benchmark do `hal-linux`) deixou de reprovar ao acaso. A checagem
+  "namespace limpo" só aceitava `lo` e `bng0`. Desde o G4.3y, o caminho lento do PPPoE cria o par
+  veth `bng0` ↔ `bng0p` e a bridge `bng0br`, e o `ip -o link` mostra o veth como `bng0@bng0p`. O
+  primeiro teste do arquivo que montava o `SlowPath` deixava essas interfaces, e os seguintes se
+  recusavam a rodar. Isso dependia da ordem: em sequência, 3 de 4 testes falhavam; o lote do #662
+  caiu assim no runner. A checagem agora tira o sufixo `@par` e aceita as três interfaces do
+  próprio caminho lento. Teste:
+  `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-hal-linux --test netns_routes_batch -- --test-threads 1`
+  (antes, 1 de 4 passava; agora 4 de 4, **medido**).
+
+- 2026-11-12 — fix-nic-no-driver-boot: "Placa sem driver" só depois de duas leituras seguidas. No notebook (dev.616), a cada boot o
+  daemon olhava as placas 1 s antes de o PID 1 carregar o `r8152`: aviso no log, item de saúde e
+  linha na saída do `upload --wait`, normalizado 7 s depois (**medido**). Agora o `no-driver` só
+  entra na segunda leitura (10 s depois); firmware e Safe Mode, que vêm do log do kernel, contam na
+  hora. Teste: `cargo test -p corerouter-engine --lib nic_problems`.
+
+- 2026-11-12 — fix-vm-lab-sync-os-out: O `vm-lab run` não manda mais as árvores do Buildroot para a VM. A cópia da worktree (rsync)
+  deixava de fora `target*`, `.git`, `.claude/` e `plan/`, mas levava `os/dl/` (681 MB) e qualquer
+  `os/out*/`. Um `os/out.old/` parado no checkout principal (18 GB, **medido**) encheu o disco de
+  20 GiB da VM no meio da cópia ("rsync error: error in file IO", 2026-11-12), e a rodada falhou
+  antes de começar. As exclusões viraram a constante `SYNC_EXCLUDES`, agora com `/os/dl/` e
+  `/os/out*/`. A imagem continua chegando à VM pelo `vm-lab put`. Teste:
+  `cargo test -p xtask sync_leaves_build_trees_out` roda o rsync de verdade numa pasta temporária;
+  sem as duas linhas novas, ele mostra `os/dl`, `os/out` e `os/out.old` copiados.
+
+- 2026-11-12 — fix-wpa-rescan-upstream: O patch do wpa_supplicant da imagem (o scan abortado que deixava a estação em SCANNING, achado no
+  bonding sobre Wi-Fi) passou a só pedir um scan novo quando quem abortou não foi o próprio
+  wpa_supplicant. A versão anterior pedia sempre e quebraria o teste `scan_aborted_on_connect_no_reselect`
+  do hostap, que exige o contrário depois de um `ABORT_SCAN`. Agora `wpas_abort_ongoing_scan()` marca
+  `scan_abort_requested`, e o scan novo, um segundo depois, sai só para um abort de fora (a interface
+  que desce e sobe ao entrar no bond).
+
+  A mesma mudança, contra o `main` do hostap e com o teste hwsim `scan_aborted_externally_on_connect`
+  (aborta o scan com `iw dev <if> scan abort` e espera a conexão), ficou pronta para a lista
+  `hostap@lists.infradead.org` em `docs/wpa_supplicant-upstream/`; o envio é do dono do projeto.
+  O defeito veio do commit `cb5bb8168` do hostap e continua no `main` (6d3d77845, 2026-11-06).
+
+  Conferido (**medido**, 2026-11-12):
+  - hwsim do hostap na VM do laboratório, `main` + patch: o teste novo passa 5 de 5 (conecta em 1,46 s),
+    o `scan_aborted_on_connect_no_reselect` passa 5 de 5, e todos os `scan*` mais `ap_open`,
+    `ap_wpa2_psk` e `sae` passam (55, 2 pulados); sem o patch o teste novo falha 2 de 2;
+  - imagem com o patch (aplicado ao 2.12): `cargo xtask os wifi-test` verde (179 s);
+    `scripts/wifi-bond-lab.sh` verde: active-backup, balance-xor e balance-rr de pé em 7–8 s,
+    20/20 pings, 1142–1673 Mbit/s, failover do active-backup com 2 de 150 pings perdidos.
+
+  O PR do FRR (G3.4l, FRRouting/frr#24092) entrou no `master` do FRR em 2026-11-11; o
+  `docs/frr-tilfa-abort.md` registra isso. O patch da imagem continua até uma versão do FRR que o traga.

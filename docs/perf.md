@@ -3123,3 +3123,31 @@ Tempo de resposta de `interface.wifi.list` pedido sem parar (o comando espera a 
   parser radiotap + 802.11 37 ns/quadro; parser + tabela 74 ns/quadro; com 4096 estações já na
   tabela 72 ns/quadro (não cresce com o total); a tabela em JSON uma vez por segundo, 15 µs (lab)
   e 216 µs (4096 estações).
+
+### G0.30j: conferência dm-verity de um slot lido de volta (**medido**, 2026-11-12)
+
+Máquina de desenvolvimento (32 threads, carga média 13–20 durante a medição), `cargo bench -p
+corerouter-sysupdate --bench sysupdate -- verity_check`, build release, slot de 128 MiB num
+arquivo (no page cache: mede o hash e a cópia, não o disco). "Inteiro" é o algoritmo de antes
+(lê o slot num `Vec` e recalcula a árvore); "em pedaços" é o `verity::check_at`.
+
+| threads | inteiro | em pedaços | memória além da árvore |
+|---|---|---|---|
+| 1 | 163,7 ms | 69,2 ms | 128 MiB → 1 MiB |
+| 4 | 57,3 ms | 18,5 ms | 128 MiB → 4 MiB |
+| 8 | 50,1 ms | 10,5 ms | 128 MiB → 8 MiB |
+
+G3.4n, custo do OSPF do nosso lado (**medido**, 2026-11-12, 32 núcleos, build de bench; antes =
+a `main` 9519530e, depois = a branch, rodados em seguida na mesma janela de carga; detalhes em
+`docs/ospf.md`, "Custo do nosso lado com escala").
+
+| Medida | Antes | Depois |
+|---|---|---|
+| poll do FRR, 4 000 interfaces e 500 vizinhos (`frr_ospf_poll`) | 29,0 ms | 6,7 ms |
+| poll do FRR, 500 interfaces e 50 vizinhos | 2,79 ms | 0,89 ms |
+| leitura de 200 000 rotas do `ospfd` (43 MiB) | 566 ms | 128 ms |
+| amostra guardada sob o lock (4 000 interfaces) | 508 µs | 0,2 µs |
+| `routing.ospf.interface.list` (4 000) | 40,4 ms | 6,1 ms |
+| `routing.ospf.route.list` (200 000 rotas) | 36,5 ms, 1,9 MiB | 4,0 ms, 38 KiB |
+| `routing.ospf.topology` (2 000 roteadores) | 72,8 ms, 1 MiB | 18,0 ms; 0,77 ms e 113 B com `known` |
+| quadro da GUI em OSPF › Routes | 53,4 ms | 6,6 ms |
