@@ -34,7 +34,7 @@ fn attr(out: &mut Vec<u8>, kind: u16, value: &[u8]) {
     out.extend_from_slice(&u16::try_from(len).unwrap_or(0).to_ne_bytes());
     out.extend_from_slice(&kind.to_ne_bytes());
     out.extend_from_slice(value);
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push(0);
     }
 }
