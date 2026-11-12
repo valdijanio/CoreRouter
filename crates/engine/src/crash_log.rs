@@ -262,14 +262,14 @@ pub fn parse(files: &[PstoreFile]) -> Vec<Crash> {
     }
     let mut out: Vec<Crash> = groups.into_iter().map(assemble).collect();
     out.extend(other);
-    out.sort_by(|a, b| b.time.cmp(&a.time));
+    out.sort_by_key(|c| std::cmp::Reverse(c.time));
     out.truncate(MAX_KEPT);
     out
 }
 
 /// Parts of one dump → the dump: the highest part is the oldest text.
 fn assemble(mut g: Vec<Part>) -> Crash {
-    g.sort_by(|a, b| b.part.cmp(&a.part));
+    g.sort_by_key(|p| std::cmp::Reverse(p.part));
     let n = g.len();
     let max = g.first().map_or(0, |p| p.part);
     let complete = usize::try_from(max).is_ok_and(|m| m == n);
