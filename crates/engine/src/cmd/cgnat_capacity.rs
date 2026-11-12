@@ -35,7 +35,7 @@ pub const REFUSED_PER_MILLE: u64 = 10;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "ip.firewall.cgnat.capacity.get", "CGNAT Capacity", [], None,
-        "{pool: string (name or *id)} → {pool, mode, ports (each subscriber's limit: ports_per_subscriber, × max_blocks in blocks mode), ports_per_subscriber, subscribers, seen (subscribers with readings in 7 days), days, per_address, public_addresses, p99 (ports at the 99th percentile of the 7-day peaks), p99_percent, max, hit_24h (subscribers refused for running out of their own ports in 24 h), refused_24h, icmp_24h, bands: [{band, count}], blocks? (blocks mode: blocks the public addresses hold), blocks_in_use?, no_block_24h? (subscribers refused because the pool had no free block), no_block_refused_24h?, no_block_icmp_24h?, suggestion?: {ports_per_subscriber, per_address, gain_per_address (subscribers per public address, + more), public_needed, fits, reason}}",
+        "{pool: string (name or *id)} → {pool, mode, ports (each subscriber's limit: ports_per_subscriber, × max_blocks in blocks mode), ports_per_subscriber, subscribers, seen (subscribers with readings in 7 days), days, per_address, public_addresses, p99 (ports at the 99th percentile of the 7-day peaks), p99_percent, max, hit_24h (subscribers refused for running out of their own ports in 24 h), refused_24h, icmp_24h, bands: [{band, count}], conntrack: {subscribers (of every enabled pool), per_subscriber, needed, max, configured, fits, profile?, profile_max?, max_entries, ram_ok, warning?}|null (G2.3h: nf_conntrack_max against all the pools), blocks? (blocks mode: blocks the public addresses hold), blocks_in_use?, no_block_24h? (subscribers refused because the pool had no free block), no_block_refused_24h?, no_block_icmp_24h?, suggestion?: {ports_per_subscriber, per_address, gain_per_address (subscribers per public address, + more), public_needed, fits, reason}}",
         always, capacity),
     cmd!(query "ip.firewall.cgnat.capacity.preview", "Preview CGNAT Capacity Change", [], None,
         "{pool: string, ports_per_subscriber: u16} → {remapped (subscribers whose address or ports change), connections (live connections that would be killed), per_address, per_address_now, fits, error?, command: {command, params}} (nothing changes)",
@@ -185,6 +185,12 @@ fn capacity(s: &mut Session, p: &Value) -> Result<Value> {
         "p99": p99, "p99_percent": pct(p99), "max": max,
         "hit_24h": hit, "refused_24h": refused_24h, "icmp_24h": icmp_24h, "bands": bands,
     });
+    // G2.3h: the kernel's table against every pool, not just this one.
+    let demand = crate::cgnat_conntrack::demand(s.store().running());
+    if let Some(o) = out.as_object_mut() {
+        let fit = crate::cgnat_conntrack::fit(s, demand);
+        o.insert("conntrack".into(), fit.map_or(Value::Null, |f| f.to_json()));
+    }
     if pool.mode == Mode::Blocks
         && let Some(o) = out.as_object_mut()
     {

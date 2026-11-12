@@ -416,6 +416,27 @@ os do `/ip traffic-flow` (um exportador só, um socket por coletor; `docs/traffi
 - **Determinístico:** não há bloco a registrar; a fórmula e o histórico das pools (seção 1.5) são o
   registro (RFC 7422). Os limites (13, 18) valem nos dois modos.
 
+### 1.12 O conntrack comporta os pools? (G2.3h)
+
+Cada conexão traduzida é uma entrada do conntrack do kernel. Com a tabela cheia, o kernel descarta
+conexões novas ("nf_conntrack: table full, dropping packet"), sobre portas que o pool ainda tem.
+O padrão do kernel numa máquina com mais de 4 GB é 262 144 entradas: no notebook do dev.595, um
+pool de 1280 assinantes precisava de 384 000.
+
+- **A conta:** assinantes de todos os pools ligados × `connections_per_subscriber` (`ip.firewall.cgnat.set`,
+  padrão 300, **estimado**; a tabela de dimensionamento do 6WIND vai de 100 a 1500 por CPE),
+  contra o `nf_conntrack_max` configurado em System › Tuning ou, sem ele, o do kernel.
+- **Onde aparece:** `pool.add`/`set` (`warnings`), `pool.preview` (check `conntrack`), `pool.list`
+  (selo `conntrack` em cada pool ligado), `capacity.get` e `ip.firewall.cgnat.get` (objeto
+  `conntrack`), `system.health.check` (item "CGNAT conntrack", aviso) e a aba Capacity.
+- **A sugestão:** o primeiro perfil do Tuning (balanced, depois throughput) cujo
+  `nf_conntrack_max` comporta a conta nesta máquina; a aba Capacity abre System › Tuning ›
+  Profiles com ele escolhido. Sem perfil que caiba, `max_entries` = a conta arredondada a
+  65 536 (`ip.firewall.connection.tracking.set`), se a RAM aguenta (o Tuning limita a tabela a um
+  quarto dela); senão, o aviso diz que a RAM não comporta.
+- **Custo:** a soma dos assinantes é O(pools) e uma leitura do `nf_conntrack_max`; a saúde faz
+  isso a cada avaliação, sem crescer com os assinantes.
+
 ## 2. Comandos
 
 | Comando | O que faz |
@@ -432,7 +453,7 @@ os do `/ip traffic-flow` (um exportador só, um socket por coletor; `docs/traffi
 | `ip.firewall.cgnat.block.history {subscriber?, public?, port?, from?, to?}` | o log de blocos (alocação e liberação) |
 | `ip.firewall.cgnat.alert.list` / `alert.clear` | assinantes no limite de portas e o `insert_failed` do kernel; recusados e ICMP enviados (G2.7) |
 | `ip.firewall.cgnat.capacity.get {pool}` / `capacity.preview {pool, ports_per_subscriber}` | uso real (pico p99 de 7 dias, distribuição, quem bateu no limite em 24 h), sugestão de portas por assinante e a prévia do que mudar derruba (G2.7b) |
-| `ip.firewall.cgnat.set {history_days?, icmp_unreachable?, icmp_rate?}` | retenção do histórico; ICMP quando as portas acabam e o limite por assinante (G2.7) |
+| `ip.firewall.cgnat.set {history_days?, icmp_unreachable?, icmp_rate?, connections_per_subscriber?}` | retenção do histórico; ICMP quando as portas acabam e o limite por assinante (G2.7); conexões por assinante para a conta do conntrack (G2.3h) |
 | `ip.traffic-flow.set {nat_port_blocks?, nat_limits?, nat_events?, flows?}` / `ip.traffic-flow.target.*` | o log de NAT em IPFIX (aba Logging, seção 1.11; G4.4j) |
 | `tool.ip-calc.cgnat.plan {inside, outside, ports_per_subscriber?, port_range?, mode?, preview?}` | o planner (Tools › IP Calculator): números, checagens, sugestões, prévia e os parâmetros do `pool.add`; aceita quantidades (`"4096"`) |
 | `tool.ip-calc.cgnat.export {…, format: csv \| text \| routeros \| nft}` | a tabela do plano em CSV, texto imprimível, script RouterOS ou o nftables |
