@@ -107,7 +107,9 @@ nftables, crates. Não decida por suposição, documentação ou tentativa e err
    No PR, cite-os na seção `## Pesquisa` ou `## Desempenho e paralelismo`.
 4. **Corrija onde está o defeito**: um patch no pacote da imagem (no buildroot, em `os/`) e o
    texto do PR/relato para o projeto de origem, que o usuário revisa e publica (publicar é
-   decisão dele). Contorno do nosso lado só com o motivo escrito.
+   decisão dele). Contorno do nosso lado só com o motivo escrito. Como preparar e enviar (testes
+   do próprio projeto, assinatura, PR no GitHub ou patch por e-mail, hwsim do hostap):
+   `docs/upstream.md`.
 
 Os builds e fontes de terceiros ficam em `/srv/build`, nunca no `/home`.
 

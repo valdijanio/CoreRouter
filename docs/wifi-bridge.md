@@ -152,10 +152,15 @@ rádio liga `all_slaves_active` no bond de que um enlace Wi-Fi é membro. Nos bo
 porque lá o switch inunda as portas.
 
 **A estação que entra no bond.** O bond desliga a porta para tomá-la, e uma varredura em curso é
-abortada. O wpa_supplicant 2.12 não pedia outra varredura (`events.c:2649`) e a estação ficava
-em SCANNING para sempre. O patch `os/patches/wpa_supplicant/0001-rescan-after-an-aborted-scan.patch`
-pede uma nova um segundo depois. O texto para o projeto de origem está no cabeçalho do patch; o
-envio é do dono do projeto.
+abortada. Desde o commit `cb5bb8168` do hostap ("Do not use aborted scan results for new
+operations", na 2.12), o resultado de uma varredura abortada não serve para escolher a rede, e
+nada pede outra (`events.c:2649`): a estação ficava em SCANNING para sempre. O patch
+`os/patches/wpa_supplicant/0001-rescan-after-an-aborted-scan.patch` pede uma nova um segundo
+depois, mas só quando quem abortou não foi o próprio wpa_supplicant (`ABORT_SCAN`, desconexão:
+`wpas_abort_ongoing_scan()` marca `scan_abort_requested`). O abort pedido por ele continua sem
+varredura nova, como o upstream quer (teste `scan_aborted_on_connect_no_reselect`). A mesma
+mudança, contra o `main` do hostap e com um teste hwsim, está em `docs/wpa_supplicant-upstream/`;
+o envio é do dono do projeto.
 
 **Diagnóstico por par.** A tabela de pares mostra, para cada enlace:
 
