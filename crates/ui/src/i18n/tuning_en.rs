@@ -111,6 +111,15 @@ On for a router nobody can reach in person. Combined with `kernel.panic` it brin
 Turning it off sends the magic close, which stops the timer. A driver without magic close keeps counting after CoreRouter lets go: it reboots unless something else feeds it."##,
     ),
     (
+        "tuning.kernel.hardlockup_panic",
+        r##"## What it does
+Panics (and `kernel.panic` reboots) when a CPU stays stuck with interrupts off for 10 s: the hard lockup the watchdog sees from the neighbouring CPU. Off, it only writes a trace to the log.
+## When to change
+CoreRouter turns it on at boot on a real machine: a router with a frozen CPU forwards nothing, and the next boot shows the trace (`system.crash.print`). Off in a virtual machine (the host may stop a vCPU for that long).
+## Careful
+A driver that locks up on start makes a reboot loop; the A/B image falls back to the previous one."##,
+    ),
+    (
         "tuning.kernel.panic",
         r##"## What it does
 Seconds after a kernel panic before the machine reboots by itself; 0 waits forever on the panic screen.
@@ -127,6 +136,15 @@ Turns a kernel oops (a bug the kernel survived, maybe half broken) into a panic,
 On a router a clean reboot is better than forwarding with a damaged kernel.
 ## Careful
 A driver that oopses on start makes a reboot loop; the A/B image falls back to the previous one."##,
+    ),
+    (
+        "tuning.kernel.softlockup_panic",
+        r##"## What it does
+Panics (and `kernel.panic` reboots) when a CPU runs in the kernel for 20 s without letting anything else run: a soft lockup. Off, it only writes a trace to the log.
+## When to change
+CoreRouter turns it on at boot on a real machine: the CPU does not come back by itself, and the next boot shows the trace (`system.crash.print`). Off in a virtual machine, where the host may pause a vCPU.
+## Careful
+A soft lockup under a flood of interrupts can clear by itself; on a box that sees them often, look at Tuning › CPU before leaving it on."##,
     ),
     (
         "tuning.net.core.dev_weight",

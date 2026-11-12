@@ -257,8 +257,22 @@ pub struct Inputs {
     /// G1.3e: (section, why) of the restored config the data plane refused
     /// at boot. Empty: everything is in (no check then).
     pub boot_apply: Vec<(String, String)>,
+    /// G1.6zx: what the crash-log service found (`None`: no service, the
+    /// lab or the browser).
+    pub crash: Option<CrashInput>,
     /// Whether any reading exists at all.
     pub readings: bool,
+}
+
+/// G1.6zx: the previous boot's end and where the next dump would go.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CrashInput {
+    /// (reason, summary, time) of the dump the previous boot left.
+    pub last_boot: Option<(String, String, Option<u64>)>,
+    /// The kernel's backend now (`erst`, `efi_pstore`; `None`: nowhere).
+    pub backend: Option<String>,
+    /// Free NVRAM, when the service turned `efi_pstore` off for lack of it.
+    pub efi_low: Option<u64>,
 }
 
 /// How long an established session may go without End-of-RIB before the
@@ -833,6 +847,28 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
                 "Corrija ou tire o item recusado (o motivo é o erro do kernel acima) e faça commit, ou carregue o que falta no kernel (módulo, recurso); um commit que mexe na seção a aplica inteira, menos a regra ou rota recusada que ele não muda."
             }.into()) });
     }
+    // G1.6zx: the previous boot ended in a kernel panic or oops (the dump
+    // pstore kept), and whether the next one has somewhere to go.
+    if let Some(c) = &i.crash {
+        let (key, name) = ("kernel.crash", "Previous boot");
+        match &c.last_boot {
+            Some((reason, summary, time)) => out.push(Check { key, name, severity: Severity::Warning,
+                value: Some(format!("{reason}{}", time.map(|t| format!(" {}", crate::crash_log::utc(t))).unwrap_or_default())),
+                reason: format!("o boot anterior terminou num {} do kernel: {}", if reason == "oops" { "oops" } else { "pânico" }, summary.chars().take(300).collect::<String>()),
+                action: Some("O registro inteiro (o fim do log do kernel daquele boot) está em system.crash.print {\"lines\": true} e em /config/crash/. Repetindo, mande o registro para o suporte; depois de uma atualização, compare com o slot anterior.".into()) }),
+            None => out.push(Check { key, name, severity: Severity::Ok, value: c.backend.clone(),
+                reason: match &c.backend {
+                    Some(b) => format!("o boot anterior não terminou em pânico; um pânico agora fica registrado ({b})"),
+                    None => "o boot anterior não deixou registro de pânico; esta máquina não tem onde guardar um (nem ERST nem variáveis UEFI)".into(),
+                }, action: None }),
+        }
+        if let Some(free) = c.efi_low {
+            out.push(Check { key: "kernel.crash-store", name: "Crash store", severity: Severity::Warning,
+                value: Some(format!("{free} B livres")),
+                reason: format!("a NVRAM do UEFI tem {free} bytes livres, menos que os {} que um registro de pânico e as entradas de boot do A/B precisam: o registro de pânico nas variáveis UEFI foi desligado", crate::crash_log::EFI_MIN_FREE),
+                action: Some("Apague no setup do firmware as entradas de boot que sobraram de outros sistemas, ou restaure os padrões da NVRAM; no boot seguinte o registro volta a ligar sozinho.".into()) });
+        }
+    }
     // G1.29b: a USB adapter behind a port slower than itself caps the
     // traffic with no error anywhere. Only on routers that have one.
     if !i.usb.is_empty() {
@@ -1122,6 +1158,15 @@ impl Session {
         i.system_disk = pkg.and_then(system_disk);
         i.config_snapshots = pkg.map(config_snapshots).unwrap_or_default();
         i.config_disk = self.config_disk_usage();
+        i.crash = self.ext::<crate::crash_log::CrashLog>().filter(|l| l.fed).map(|l| CrashInput {
+            last_boot: l
+                .crashes
+                .first()
+                .filter(|_| l.new_this_boot > 0)
+                .map(|c| (c.reason.clone(), c.summary.clone(), c.time)),
+            backend: l.backend.clone(),
+            efi_low: l.efi.as_ref().filter(|e| e.turned_off).map(|e| e.free.unwrap_or(0)),
+        });
         i
     }
 
@@ -1214,7 +1259,31 @@ mod tests {
             usb_watchdog: Vec::new(),
             absent_ports: Vec::new(),
             boot_apply: Vec::new(),
+            crash: None,
         }
+    }
+
+    /// G1.6zx: the previous boot's panic, and a NVRAM too short for the next.
+    #[test]
+    fn crash_of_the_previous_boot_and_the_store() {
+        let mut i = Inputs::default();
+        let by = |i: &Inputs, k: &str| evaluate(i).into_iter().find(|c| c.key == k);
+        assert!(by(&i, "kernel.crash").is_none(), "no service, no check");
+        i.crash = Some(CrashInput { backend: Some("efi_pstore".into()), ..CrashInput::default() });
+        assert_eq!(by(&i, "kernel.crash").unwrap().severity, Severity::Ok);
+        assert!(by(&i, "kernel.crash-store").is_none());
+        i.crash = Some(CrashInput {
+            last_boot: Some(("panic".into(), "Kernel panic - not syncing: x".into(), Some(1_763_000_000))),
+            backend: Some("efi_pstore".into()),
+            efi_low: Some(9000),
+        });
+        let c = by(&i, "kernel.crash").unwrap();
+        assert_eq!(c.severity, Severity::Warning);
+        assert!(c.reason.contains("pânico do kernel: Kernel panic - not syncing: x"), "{}", c.reason);
+        assert_eq!(c.value.as_deref(), Some("panic 2025-11-13 02:13:20 UTC"));
+        let st = by(&i, "kernel.crash-store").unwrap();
+        assert_eq!(st.severity, Severity::Warning);
+        assert!(st.reason.contains("9000 bytes"));
     }
 
     /// The kernel's count since boot, read by a daemon that just started

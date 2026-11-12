@@ -1036,7 +1036,177 @@ fn scenario_bad_param(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
             .contains("intel_idle"),
         "the running slot's command line changed",
     )?;
+    // G1.6zx: the slot B that did not come up left its panic in the UEFI
+    // variables; slot A says it, with the boot it happened in.
+    if ctx.fw == Firmware::Ovmf {
+        let c = crash_of_previous_boot(&mut vm, &mut log)?;
+        check(
+            c["slot"] == "b",
+            format!("the trial's panic does not name slot b: {c}"),
+        )?;
+        n.put(
+            "trial slot that panicked, seen from slot A (G1.6zx)",
+            c["summary"].as_str().unwrap_or("?").to_owned(),
+        );
+    }
     vm.poweroff(&mut log)?;
+    Ok(())
+}
+
+/// G1.6zx: the dump this boot found (the previous boot's panic), checked as
+/// the operator sees it: `system.crash.print`, the router's log, nothing
+/// left in pstore, the copy in `/config/crash`.
+fn crash_of_previous_boot(vm: &mut Vm, log: &mut std::fs::File) -> Result<Value, String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let c = loop {
+        let v = vm.ok(log, "system.crash.print", "{}")?;
+        let first = v["crashes"][0].clone();
+        if first["this_boot"] == true {
+            break first;
+        }
+        check(
+            Instant::now() < deadline,
+            format!("no crash from the previous boot: {v}"),
+        )?;
+        std::thread::sleep(Duration::from_millis(700));
+    };
+    check(
+        c["reason"] == "panic"
+            && c["summary"]
+                .as_str()
+                .is_some_and(|s| s.contains("Kernel panic")),
+        format!("crash: {c}"),
+    )?;
+    let lines = vm.ok(log, "log.print", r#"{"find":"previous boot ended"}"#)?;
+    check(
+        lines.as_array().is_some_and(|a| !a.is_empty()),
+        format!("not in the router's log: {lines}"),
+    )?;
+    let left = shell_line(vm, log, "ls /sys/fs/pstore | wc -l")?;
+    check(left == "0", format!("{left} record(s) left in pstore"))?;
+    let saved = shell_line(vm, log, "ls /config/crash | wc -l")?;
+    check(
+        saved.parse::<u32>().is_ok_and(|n| n >= 1),
+        format!("/config/crash: {saved}"),
+    )?;
+    Ok(c)
+}
+
+/// Free bytes of the UEFI variable store (`statfs` of efivarfs).
+fn nvram_free(vm: &mut Vm, log: &mut std::fs::File) -> Result<u64, String> {
+    let l = shell_line(vm, log, "df -B1 /sys/firmware/efi/efivars | tail -1")?;
+    l.split_whitespace()
+        .nth(3)
+        .and_then(|w| w.parse().ok())
+        .ok_or_else(|| format!("df of efivarfs: {l}"))
+}
+
+/// A GUID of no one's: the variables that fill the NVRAM in the test.
+const FILL_GUID: &str = "6b1c0f41-2b5e-4f59-9c4b-1f0d3a0b7e21";
+/// What the filled NVRAM keeps free: less than the daemon's
+/// `EFI_MIN_FREE` (33 KiB), more than the A/B update's entries and the
+/// kernel's reserve (9 KiB).
+const FILL_LEAVES: u64 = 16 << 10;
+
+/// G1.6zx: a panic's record goes to the UEFI variables and the next boot
+/// takes it out (`system.crash.print`, the log, `/config/crash`); then the
+/// NVRAM is filled, as other systems' entries do: the daemon turns
+/// `efi_pstore` off at boot (health warning), a panic takes no NVRAM, and
+/// the A/B update still writes its boot entries and comes up on B.
+fn scenario_crash(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
+    let pkg = ctx.work.join("crash-b.crpkg");
+    package(ctx, &pkg, "-b", None, None)?;
+    let mut log = ctx.log.try_clone().map_err(|e| e.to_string())?;
+    let mut vm = fresh(ctx, n, "crash", &[&pkg])?;
+    let free0 = nvram_free(&mut vm, &mut log)?;
+    let v = vm.ok(&mut log, "system.crash.print", "{}")?;
+    check(
+        v["backend"] == "efi_pstore" && v["efi"]["enabled"] == true,
+        format!("efi_pstore is not armed: {v}"),
+    )?;
+    vm.stdin_write(b"echo c > /proc/sysrq-trigger\n")?;
+    vm.expect(&mut log, &["Kernel panic"], 60)?;
+    let t = vm.wait_exit(&mut log, 60)?;
+    drop(vm);
+    let _ = t;
+    let mut vm = ctx.boot("crash/after-panic", false, &[&pkg])?;
+    vm.expect_all(&mut log, &["ready:", "maintenance shell"], 120)?;
+    let c = crash_of_previous_boot(&mut vm, &mut log)?;
+    check(
+        c["summary"]
+            .as_str()
+            .is_some_and(|s| s.contains("sysrq triggered crash")),
+        format!("{c}"),
+    )?;
+    let free1 = nvram_free(&mut vm, &mut log)?;
+    check(
+        free1 + 1024 >= free0,
+        format!("the record was not erased: {free0} B free before the panic, {free1} after"),
+    )?;
+    n.put(
+        "panic recorded in UEFI variables, logged and erased at the next boot",
+        format!("{} part(s), NVRAM free {free0} → {free1} B", c["parts"]),
+    );
+    // Fill the NVRAM with 1 KiB variables until the kernel refuses (its
+    // 5 KiB reserve), then give back what leaves FILL_LEAVES free.
+    let filled = shell_line(
+        &mut vm,
+        &mut log,
+        &format!(
+            "cd /sys/firmware/efi/efivars; i=0; while printf '\\007\\000\\000\\000%01024d' 0 > fill$i-{FILL_GUID} 2>/dev/null; do i=$((i+1)); done; rm -f fill$i-{FILL_GUID}; cd /; echo $i"
+        ),
+    )?;
+    let mut free = nvram_free(&mut vm, &mut log)?;
+    let mut k: u32 = 0;
+    while free < FILL_LEAVES {
+        shell_line(
+            &mut vm,
+            &mut log,
+            &format!("rm -f /sys/firmware/efi/efivars/fill{k}-{FILL_GUID}"),
+        )?;
+        k += 1;
+        free = nvram_free(&mut vm, &mut log)?;
+        check(k < 256, "the NVRAM did not give room back")?;
+    }
+    n.put(
+        "NVRAM filled by another GUID (1 KiB variables)",
+        format!("{filled} written, {k} given back, {free} B free"),
+    );
+    vm.poweroff(&mut log)?;
+    drop(vm);
+    let mut vm = ctx.boot("crash/nvram-full", false, &[&pkg])?;
+    vm.expect_all(&mut log, &["ready:", "maintenance shell"], 120)?;
+    let v = vm.ok(&mut log, "system.crash.print", "{}")?;
+    check(
+        v["efi"]["turned_off"] == true && v["efi"]["enabled"] == false,
+        format!("efi_pstore stayed on with {free} B free: {v}"),
+    )?;
+    let h = vm.ok(&mut log, "system.health.check", "{}")?;
+    check(
+        h["checks"].as_array().is_some_and(|a| {
+            a.iter()
+                .any(|c| c["key"] == "kernel.crash-store" && c["severity"] == "warning")
+        }),
+        format!("no crash-store warning: {h}"),
+    )?;
+    vm.stdin_write(b"echo c > /proc/sysrq-trigger\n")?;
+    vm.expect(&mut log, &["Kernel panic"], 60)?;
+    vm.wait_exit(&mut log, 60)?;
+    drop(vm);
+    let mut vm = ctx.boot("crash/full-after-panic", false, &[&pkg])?;
+    vm.expect_all(&mut log, &["ready:", "maintenance shell"], 120)?;
+    let free2 = nvram_free(&mut vm, &mut log)?;
+    let v = vm.ok(&mut log, "system.crash.print", "{}")?;
+    check(
+        v["crashes"][0]["this_boot"] != true,
+        format!("a panic with efi_pstore off left a record: {v}"),
+    )?;
+    n.put(
+        "panic with the NVRAM short: no record, NVRAM free",
+        format!("{free} → {free2} B"),
+    );
+    // The A/B update still has room for its boot entries.
+    update_and_confirm(ctx, &mut log, vm, "b", "crash/trial-b")?;
     Ok(())
 }
 
@@ -1419,13 +1589,15 @@ pub fn ab_test(root: &Path, images: &Path, args: &[String]) -> Result<(), String
     };
     let mut n = Numbers(Vec::new());
     type Scenario = fn(&mut Ctx, &mut Numbers) -> Result<(), String>;
-    let all: [(&str, Scenario); 10] = [
+    let all: [(&str, Scenario); 11] = [
         ("update", scenario_update),
         ("reflash", scenario_reflash),
         ("push", scenario_push),
         ("no-confirm", scenario_no_confirm),
         ("bad-signature", scenario_bad_signature),
         ("bad-param", scenario_bad_param),
+        // G1.6zx: panics in UEFI variables, and a full NVRAM.
+        ("crash", scenario_crash),
         ("cross", scenario_cross),
         ("cut", scenario_cut),
         ("controllers", scenario_controllers),
@@ -1443,7 +1615,7 @@ pub fn ab_test(root: &Path, images: &Path, args: &[String]) -> Result<(), String
             continue;
         }
         // Boot entries in NVRAM are UEFI's.
-        if fw == Firmware::SeaBios && name == "reflash" {
+        if fw == Firmware::SeaBios && matches!(name, "reflash" | "crash") {
             continue;
         }
         eprintln!(

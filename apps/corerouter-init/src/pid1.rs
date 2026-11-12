@@ -76,6 +76,22 @@ pub fn main() {
     }
     let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
     let opts = BootOptions::parse(&cmdline);
+    // G1.6zx: what the previous boot's panic left, and a lockup that
+    // reboots on a real machine.
+    if plan::has_fs(
+        &read_proc("/proc/filesystems").unwrap_or_default(),
+        "pstore",
+    ) {
+        mount_api(&plan::PSTORE);
+    }
+    if opts.mode != Mode::Install {
+        let cpuinfo = read_proc("/proc/cpuinfo").unwrap_or_default();
+        for (path, v) in plan::lockup_panic(&cpuinfo, &cmdline) {
+            if let Err(e) = fs::write(path, v) {
+                log!("{path}: {e}");
+            }
+        }
+    }
     // G1.6y: the first stage of the live ISO moves to the image's root and
     // comes back here with LIVE_STAGE2; it stays on the console installer
     // when that cannot be done.

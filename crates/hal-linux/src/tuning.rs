@@ -118,7 +118,13 @@ impl Root {
         let online = read(&cpu.join("online"))
             .map(|t| parse_cpu_list(&t))
             .unwrap_or_default();
-        let cpu_model = read(&self.proc.join("cpuinfo")).and_then(|t| {
+        let cpuinfo = read(&self.proc.join("cpuinfo"));
+        let virtual_machine = cpuinfo.as_deref().is_some_and(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("flags"))
+                .is_some_and(|f| f.split_ascii_whitespace().any(|w| w == "hypervisor"))
+        });
+        let cpu_model = cpuinfo.and_then(|t| {
             t.lines()
                 .find(|l| l.starts_with("model name"))
                 .and_then(|l| l.split_once(':'))
@@ -157,6 +163,7 @@ impl Root {
             kernel: read(&self.proc.join("sys/kernel/osrelease"))
                 .map(|t| t.trim().chars().take(64).collect())
                 .unwrap_or_default(),
+            virtual_machine,
         }
     }
 

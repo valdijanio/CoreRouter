@@ -185,6 +185,9 @@ const KERNEL_OFF: &[&str] = &[
     "CONFIG_XEN_PV",
     "CONFIG_XEN_BALLOON",
     "CONFIG_INTEL_IOMMU_DEFAULT_ON",
+    // G1.6zx: the panic's record goes to UEFI variables by default; the
+    // daemon erases them once saved (crash-log service).
+    "CONFIG_EFI_VARS_PSTORE_DEFAULT_DISABLE",
 ];
 /// G1.6zi: what lets the image boot, see its disk and use every core on
 /// common hardware, and say what went wrong: `check` wants each `=y` in the
@@ -228,8 +231,6 @@ const HARDWARE_COVERAGE: &[&str] = &[
     "CONFIG_PSTORE",
     "CONFIG_PSTORE_COMPRESS",
     "CONFIG_EFI_VARS_PSTORE",
-    // With pstore on, or panics would fill the NVRAM of the A/B boot entries.
-    "CONFIG_EFI_VARS_PSTORE_DEFAULT_DISABLE",
     "CONFIG_PCIEAER",
     "CONFIG_PCIE_DPC",
     "CONFIG_RAS",

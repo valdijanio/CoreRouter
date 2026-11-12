@@ -945,6 +945,8 @@ impl Hal for VirtualHal {
             numa: vec![node(0), node(1)],
             mem_kib: LAB_MEM_KIB,
             kernel: "6.8.0-corerouter-lab".into(),
+            // The lab stands for a router's own machine.
+            virtual_machine: false,
         })
     }
 
