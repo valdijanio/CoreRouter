@@ -161,7 +161,13 @@ fn int(b: &[u8], n: u8) -> Result<(usize, &[u8]), HpackError> {
     loop {
         let (&byte, r) = rest.split_first().ok_or(HpackError("truncated integer"))?;
         rest = r;
-        v = v.saturating_add(usize::from(byte & 0x7f) << shift);
+        // Zero continuation bytes do not make the value grow: the shift
+        // has its own cap (a 2^24 value needs 4 bytes of 7 bits).
+        let add = usize::from(byte & 0x7f)
+            .checked_shl(shift)
+            .filter(|_| shift <= 28)
+            .ok_or(HpackError("integer too large"))?;
+        v = v.saturating_add(add);
         if v > CAP {
             return Err(HpackError("integer too large"));
         }
@@ -214,12 +220,30 @@ pub(super) fn huffman_decode(b: &[u8]) -> Result<Vec<u8>, HpackError> {
     Ok(out)
 }
 
-/// The symbol whose code is `code` of `len` bits, if any.
+/// The symbol whose code is `code` of `len` bits, if any: a binary search
+/// among the codes of that length (a linear scan of the 257 codes at every
+/// bit cost tens of µs per answer).
 fn symbol(code: u32, len: u8) -> Option<usize> {
-    if len < 5 {
-        return None;
-    }
-    HUFFMAN.iter().position(|&(c, l)| l == len && c == code)
+    let by_len = by_length().get(usize::from(len))?;
+    let i = by_len.binary_search_by_key(&code, |&(c, _)| c).ok()?;
+    by_len.get(i).map(|&(_, sym)| usize::from(sym))
+}
+
+/// The codes of each length (1..=30), sorted, with their symbols.
+fn by_length() -> &'static [Vec<(u32, u16)>] {
+    static TABLE: std::sync::OnceLock<Vec<Vec<(u32, u16)>>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut t = vec![Vec::new(); 31];
+        for (sym, &(code, len)) in HUFFMAN.iter().enumerate() {
+            if let (Some(v), Ok(sym)) = (t.get_mut(usize::from(len)), u16::try_from(sym)) {
+                v.push((code, sym));
+            }
+        }
+        for v in &mut t {
+            v.sort_unstable();
+        }
+        t
+    })
 }
 
 /// What a client sends: an indexed field when the static table has the

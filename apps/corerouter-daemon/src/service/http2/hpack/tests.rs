@@ -130,6 +130,8 @@ fn hostile_blocks_fail_cleanly() {
         (vec![0x3f, 0xe2, 0x1f], "table size update above"),
         (vec![0x82, 0x20], "table size update after"),
         (vec![0xff, 0xff, 0xff, 0xff, 0xff, 0x7f], "integer too large"),
+        // Zero continuation bytes: the shift grows, the value does not.
+        ([vec![0xff], vec![0x80; 20], vec![0x01]].concat(), "integer too large"),
         // A Huffman string of 1 byte 0x00: bits that never finish a code.
         (vec![0x00, 0x81, 0x00, 0x00], "Huffman"),
     ] {
