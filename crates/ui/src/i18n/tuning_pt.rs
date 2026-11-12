@@ -185,6 +185,15 @@ Quando o `softnet_stat` conta descartes (a aba Resumo avisa) ou as portas são d
 Uma fila enorme só esconde uma CPU que não dá conta e acrescenta atraso (bufferbloat). Aumente o budget antes."##,
     ),
     (
+        "tuning.net.core.optmem_max",
+        r##"## O que faz
+A maior memória de opções de um socket: grupos multicast (48 B cada), filtros, dados auxiliares. **Só plano de controle.**
+## Por que o CoreRouter aumenta
+Com 128 KiB, um socket do OSPF cabe cerca de 2700 grupos: milhares de interfaces OSPF precisam de mais. O CoreRouter mantém pelo menos 1 MiB, a menos que você defina outro valor.
+## Cuidado
+É um teto por socket, não memória ocupada."##,
+    ),
+    (
         "tuning.net.core.rmem_max",
         r##"## O que faz
 O maior buffer de recepção que um socket do próprio roteador pode pedir. **Só plano de controle**: pacotes encaminhados nunca passam por buffers de socket.
@@ -201,24 +210,6 @@ A maior fila de conexões esperando um serviço do roteador (API, BGP, web) acei
 Raramente: 4096 é o padrão do kernel desde o 5.4.
 ## Cuidado
 Não afeta o tráfego encaminhado."##,
-    ),
-    (
-        "tuning.net.ipv4.igmp_max_memberships",
-        r##"## O que faz
-Quantos grupos multicast um socket do roteador pode assinar. **Só plano de controle.**
-## Por que o CoreRouter aumenta
-O OSPF assina um grupo por interface (dois onde é DR) por um socket só. Com os 20 do kernel, a 21ª interface OSPF fica sem adjacência. O CoreRouter mantém pelo menos 16384, a menos que você defina outro valor.
-## Cuidado
-É um teto: só gasta memória o grupo de fato assinado."##,
-    ),
-    (
-        "tuning.net.core.optmem_max",
-        r##"## O que faz
-A maior memória de opções de um socket: grupos multicast (48 B cada), filtros, dados auxiliares. **Só plano de controle.**
-## Por que o CoreRouter aumenta
-Com 128 KiB, um socket do OSPF cabe cerca de 2700 grupos: milhares de interfaces OSPF precisam de mais. O CoreRouter mantém pelo menos 1 MiB, a menos que você defina outro valor.
-## Cuidado
-É um teto por socket, não memória ocupada."##,
     ),
     (
         "tuning.net.core.wmem_max",
@@ -257,6 +248,15 @@ Como o tráfego IPv4 é dividido entre rotas de mesmo custo (ECMP): camada 3 usa
 Camada 4 espalha muitos fluxos entre os mesmos dois hosts (um pool de CGNAT falando com uma CDN) por todos os caminhos; camada 3 manda todos por um só.
 ## Cuidado
 Os pacotes de um mesmo fluxo seguem sempre pelo mesmo caminho nos dois casos; só fragmentos podem divergir com camada 4."##,
+    ),
+    (
+        "tuning.net.ipv4.igmp_max_memberships",
+        r##"## O que faz
+Quantos grupos multicast um socket do roteador pode assinar. **Só plano de controle.**
+## Por que o CoreRouter aumenta
+O OSPF assina um grupo por interface (dois onde é DR) por um socket só. Com os 20 do kernel, a 21ª interface OSPF fica sem adjacência. O CoreRouter mantém pelo menos 16384, a menos que você defina outro valor.
+## Cuidado
+É um teto: só gasta memória o grupo de fato assinado."##,
     ),
     (
         "tuning.net.ipv4.ip_forward",
