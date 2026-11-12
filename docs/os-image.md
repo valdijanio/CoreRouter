@@ -1101,11 +1101,20 @@ uma tarefa presa 120 s esperando um disco USB não é motivo para derrubar o enc
 DPC), erro de memória ECC (EDAC), falha dentro do kernel (oops, BUG), registro de pânico não
 gravado (pstore), e o travamento passou a reconhecer `detected stalls on CPUs` (RCU).
 
-**Conferido no QEMU** (`cargo xtask os ab-test --scenario crash` e `--scenario bad-param`, OVMF):
-o pânico de um teste de slot B que não sobe aparece no slot A com `slot b`; um pânico por sysrq
-é salvo, logado e apagado; com a NVRAM cheia por outro GUID até sobrarem 16 KiB, o daemon desliga
-o `efi_pstore` (aviso `kernel.crash-store`), um pânico não grava nada e a atualização A/B ainda
-grava as entradas de boot e sobe no B.
+**Conferido no QEMU** (`cargo xtask os ab-test`, OVMF e SeaBIOS, todos os cenários):
+
+- `bad-param`: o slot B de teste que não sobe deixa o pânico, e o slot A diz
+  `previous boot ended in a kernel panic (… slot b (0.1.0-dev.613) …): Kernel panic - not
+  syncing: Requested init /corerouter-rollback-drill failed (error -2).`;
+- `crash`: um pânico por sysrq vira 16 partes, salvas em `/config/crash`, ditas no log e
+  apagadas (nenhuma variável `dump-*` lê bytes; o efivarfs ainda lista os nomes até o boot
+  seguinte, porque o pstore apaga direto no firmware). Depois a NVRAM é cheia por outro GUID: com
+  17 408 B livres o firmware recolheu no boot e voltou a 43 196 B (o daemon manteve o meio
+  ligado, certo); cheia de novo, o boot começou com 18 860 B e o daemon desligou o
+  `efi_pstore` (aviso `kernel.crash-store`); um pânico então não gravou nada
+  (18 860 → 18 432 B, sem registro) e a atualização A/B gravou as entradas de boot e subiu no B;
+- `boot-test`: o serviço roda (`crash log fed, backend none`: sem OVMF nem ERST não há onde
+  gravar).
 
 **Não conferido**: ERST de servidor real (só o emulado da G1.6zi), firmware que não implementa
 `QueryVariableInfo` (o daemon então não desliga nada e fica o limite do kernel), NVRAM de
