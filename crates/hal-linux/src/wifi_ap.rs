@@ -1,8 +1,9 @@
 //! A Wi-Fi radio as an access point on Linux (G1.30a): `hostapd` 2.12,
 //! driven through its control sockets, with nothing written to a file.
 //!
-//! One `hostapd` serves every radio of the router, started with only its
-//! global socket (`-g <runtime>/hostapd/global`). A radio joins it by a
+//! Each radio has a `hostapd` of its own (G1.30m: `radio_dir`), started
+//! with only its global socket (`-g <runtime>/hostapd/<radio>/global`). The
+//! radio joins it by a
 //! dynamic `ADD <ifname> <ctrl dir> nl80211` (hostapd 2.12
 //! `src/ap/hostapd.c` `hostapd_add_iface`: an interface with the defaults
 //! and no configuration file), gets its settings one `SET` at a time on its
@@ -340,6 +341,15 @@ pub(crate) fn parse_wds(line: &str) -> Option<(bool, String, String)> {
     Some((added, ifname.to_owned(), mac))
 }
 
+/// G1.30m: the bridge (`wpb<ifindex>`) and veth end (`wpv<ifindex>`) that
+/// carry a peer's link to its AP_VLAN (`peer_link`).
+pub(crate) fn internal_link(name: &str) -> bool {
+    ["wpb", "wpv"].iter().any(|p| {
+        name.strip_prefix(p)
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
 fn push(events: &mut Vec<WifiApEvent>, e: WifiApEvent) {
     if events.len() < MAX_AP_EVENTS {
         events.push(e);
@@ -348,6 +358,8 @@ fn push(events: &mut Vec<WifiApEvent>, e: WifiApEvent) {
 
 #[cfg(target_os = "linux")]
 pub use io::LinuxWifiApPort;
+#[cfg(target_os = "linux")]
+pub(crate) use io::radio_dir;
 
 #[cfg(target_os = "linux")]
 mod io {
@@ -419,6 +431,23 @@ mod io {
             );
             let _ = std::fs::remove_file(dir.join("global"));
         }
+    }
+
+    /// G1.30m: the radio's own hostapd: `<runtime>/hostapd/<radio>`, with
+    /// its global socket, pid file and `if/`. One process per radio, not
+    /// one for all: hostapd takes a station that associates with one of its
+    /// BSSes out of every other BSS it runs (`src/ap/utils.c`,
+    /// `prune_associations`), right for a phone roaming between them and
+    /// wrong for a bond's station-bridges, which share the bond's MAC on
+    /// two links. Measured in the lab: the two peers of a bond took turns,
+    /// each association dropping the other. A radio's hostapd failing also
+    /// leaves the others up.
+    pub(crate) fn radio_dir(name: &IfName) -> Result<PathBuf, HalError> {
+        let dir = runtime_dir("hostapd")?.join(name.as_str());
+        std::fs::create_dir_all(dir.join("if")).map_err(|e| io_err("runtime directory", e))?;
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        Ok(dir)
     }
 
     fn io_err(what: &str, e: impl std::fmt::Display) -> HalError {
@@ -500,8 +529,11 @@ mod io {
         nl: Option<Nl80211>,
         error: Option<String>,
         told: Option<WifiAp>,
-        /// G1.30m: the peers whose link is up, (MAC, name).
-        peers_up: Vec<(String, String)>,
+        /// G1.30m: the peers whose link is up: MAC, name, private bridge.
+        peers_up: Vec<(String, String, String)>,
+        /// G1.30m: each peer's AP_VLAN (hostapd's name), by MAC: its
+        /// station is dumped there, not on the access point.
+        vlans: Vec<(String, String)>,
     }
 
     impl Direct {
@@ -516,6 +548,7 @@ mod io {
                 error: None,
                 told: None,
                 peers_up: Vec::new(),
+                vlans: Vec::new(),
             }
         }
 
@@ -523,8 +556,10 @@ mod io {
         fn remove(&mut self) -> Result<(), HalError> {
             self.socks = None;
             // G1.30m: the peers' renamed links (hostapd cannot find them).
-            for (_, name) in std::mem::take(&mut self.peers_up) {
+            self.vlans.clear();
+            for (_, name, br) in std::mem::take(&mut self.peers_up) {
                 let _ = crate::link_set::delete(&name);
+                let _ = crate::link_set::delete(&br);
             }
             if !self.dir.join("global").exists() {
                 return Ok(());
@@ -547,6 +582,19 @@ mod io {
             let fields = ap_fields(ap).ok_or_else(|| {
                 HalError::Rejected("the access point cannot be written for hostapd".into())
             })?;
+            // G1.30m: only the registered peers changed. hostapd does not
+            // know them (this thread decides who gets a link), so the
+            // access point stays up: restarting it on every peer.add threw
+            // the other end's SAE into its back-off (seen in the lab: a
+            // station-bridge that took minutes to come back).
+            if self.socks.is_some()
+                && self.error.is_none()
+                && let Some(old) = &self.told
+                && ap_fields(old) == Some(fields.clone())
+            {
+                self.told = Some(ap.clone());
+                return Ok(());
+            }
             self.told = Some(ap.clone());
             self.error = None;
             leave_supplicant(&self.name);
@@ -595,11 +643,47 @@ mod io {
             Ok(())
         }
 
+        /// G1.30m: a peer's link, made when the peer associates. hostapd
+        /// gives the four-address station an AP_VLAN netdev of its own
+        /// (`ifname`, `<radio>.sta<aid>`); that netdev must never go down,
+        /// because down it loses its station (`net/mac80211/iface.c`,
+        /// `ieee80211_do_stop` → `sta_info_flush`), and both a rename and
+        /// a bond need it down. So it is left as it is, in a bridge of its
+        /// own (`wpb<ifindex>`), with one end of a veth pair (`wpv<ifindex>`);
+        /// the other end has the peer's name and is what the configuration
+        /// puts in a bridge or a bond (down and up as much as they like).
+        /// Two hops more per frame, at Wi-Fi rates.
+        fn peer_link(&mut self, ifname: &str, name: &str) -> std::io::Result<String> {
+            use crate::link_set::{add_bridge, add_veth, delete, set_master, up};
+            let idx = nix::net::if_::if_nametoindex(ifname)
+                .map_err(|e| std::io::Error::other(format!("{ifname}: {e}")))?;
+            let (br, vp) = (format!("wpb{idx}"), format!("wpv{idx}"));
+            // Leftovers of a link before (a peer back before its old link
+            // went): a veth takes its pair with it.
+            for old in [name, br.as_str()] {
+                if std::path::Path::new("/sys/class/net").join(old).exists() {
+                    let _ = delete(old);
+                }
+            }
+            // Out of the bridge hostapd put it in (`bridge=`): no down.
+            set_master(ifname, None)?;
+            add_bridge(&br)?;
+            let made = add_veth(name, &vp)
+                .and_then(|()| set_master(&vp, Some(&br)))
+                .and_then(|()| up(&vp))
+                .and_then(|()| set_master(ifname, Some(&br)))
+                .and_then(|()| up(name));
+            if let Err(e) = made {
+                let _ = delete(name);
+                let _ = delete(&br);
+                return Err(e);
+            }
+            Ok(br)
+        }
+
         /// G1.30m: a four-address station's interface came (`added`) or
-        /// went. A registered peer's gets the peer's name (down, renamed,
-        /// up); any other station that asks for four addresses is sent
-        /// away. hostapd looks the interface up by its old name to delete
-        /// it (`i802_set_wds_sta`), so a renamed one is deleted here.
+        /// went. A registered peer gets its link ([`Self::peer_link`]);
+        /// any other station that asks for four addresses is sent away.
         fn wds(&mut self, added: bool, ifname: &str, mac: &str) -> Option<WifiApEvent> {
             let peer = self
                 .told
@@ -608,16 +692,18 @@ mod io {
                 .and_then(|b| b.peers.iter().find(|p| p.mac == mac))
                 .cloned();
             match (added, peer) {
-                (true, Some(p)) => match crate::link_set::rename(ifname, &p.name) {
-                    Ok(()) => {
-                        self.peers_up.push((p.mac.clone(), p.name.clone()));
+                (true, Some(p)) => match self.peer_link(ifname, &p.name) {
+                    Ok(br) => {
+                        self.peers_up.push((p.mac.clone(), p.name.clone(), br));
+                        self.vlans.retain(|(m, _)| *m != p.mac);
+                        self.vlans.push((p.mac.clone(), ifname.to_owned()));
                         Some(WifiApEvent::PeerUp {
                             mac: p.mac,
                             name: p.name,
                         })
                     }
                     Err(e) => Some(WifiApEvent::Failed(format!(
-                        "peer {}: its link {ifname} could not be named: {e}",
+                        "peer {}: its link on {ifname} could not be made: {e}",
                         p.name
                     ))),
                 },
@@ -634,12 +720,14 @@ mod io {
                             .into(),
                     })
                 }
+                // hostapd deletes its AP_VLAN; the veth and the bridge are
+                // this one's.
                 (false, _) => {
-                    let pos = self.peers_up.iter().position(|(m, _)| m == mac)?;
-                    let (mac, name) = self.peers_up.remove(pos);
-                    if let Err(e) = crate::link_set::delete(&name) {
-                        log::debug!("wifi {}: deleting peer link {name}: {e}", self.name);
-                    }
+                    let pos = self.peers_up.iter().position(|(m, _, _)| m == mac)?;
+                    let (mac, name, br) = self.peers_up.remove(pos);
+                    self.vlans.retain(|(m, _)| *m != mac);
+                    let _ = crate::link_set::delete(&name);
+                    let _ = crate::link_set::delete(&br);
                     Some(WifiApEvent::PeerDown { mac, name })
                 }
             }
@@ -672,15 +760,26 @@ mod io {
                 if self.nl.is_none() {
                     self.nl = Nl80211::open();
                 }
-                let links = match self.nl.as_mut().map(|nl| nl.stations(ifindex)) {
-                    Some(Ok(l)) => l,
-                    Some(Err(e)) => {
-                        log::debug!("wifi {}: nl80211 stations: {e}", self.name);
-                        self.nl = None;
-                        Vec::new()
+                // The access point's stations, then each peer's AP_VLAN's
+                // (a four-address station is dumped on its AP_VLAN).
+                let mut indexes = vec![ifindex];
+                indexes.extend(
+                    self.vlans
+                        .iter()
+                        .filter_map(|(_, v)| nix::net::if_::if_nametoindex(v.as_str()).ok()),
+                );
+                let mut links = Vec::new();
+                for i in indexes {
+                    match self.nl.as_mut().map(|nl| nl.stations(i)) {
+                        Some(Ok(l)) => links.extend(l),
+                        Some(Err(e)) => {
+                            log::debug!("wifi {}: nl80211 stations: {e}", self.name);
+                            self.nl = None;
+                            break;
+                        }
+                        None => break,
                     }
-                    None => Vec::new(),
-                };
+                }
                 for c in &mut out {
                     if let Some((_, l)) = links.iter().find(|(m, _)| *m == c.mac) {
                         c.link = l.clone();
@@ -691,8 +790,8 @@ mod io {
                 c.peer = self
                     .peers_up
                     .iter()
-                    .find(|(m, _)| *m == c.mac)
-                    .map(|(_, n)| n.clone());
+                    .find(|(m, _, _)| *m == c.mac)
+                    .map(|(_, n, _)| n.clone());
             }
             out.sort_by_key(|c| std::cmp::Reverse(c.link.signal_avg_dbm.unwrap_or(-200)));
             Ok(out)
@@ -719,6 +818,10 @@ mod io {
             } else {
                 Vec::new()
             };
+            // G1.30m: the peers' links in a bond.
+            for (_, name, _) in &self.peers_up {
+                crate::link_set::bond_takes_all(name);
+            }
             Ok(WifiApStatus {
                 state,
                 frequency_mhz: freq,
@@ -794,7 +897,7 @@ mod io {
 
     impl LinuxWifiApPort {
         pub fn open(name: &IfName) -> Result<Self, HalError> {
-            let dir = runtime_dir("hostapd")?;
+            let dir = radio_dir(name)?;
             let (orders, rx) = mpsc::sync_channel(MAX_ORDERS);
             let shared = Arc::new(Mutex::new(Seen::default()));
             let (theirs, radio, bin) = (Arc::clone(&shared), name.clone(), binary());

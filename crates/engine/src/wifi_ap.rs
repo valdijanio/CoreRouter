@@ -16,6 +16,8 @@
 //! grows with traffic, and the clients are at most
 //! [`corerouter_hal::wifi_ap::MAX_CLIENTS`] per radio.
 
+use std::collections::BTreeMap;
+
 use corerouter_hal::wifi::WifiRadio;
 use corerouter_hal::wifi_ap::{
     ApBackhaul, ApPeer, ApSecurity, ApState, WifiAp, WifiApEvent, WifiApPort, WifiApStatus,
@@ -295,6 +297,11 @@ pub(crate) struct ApRadio {
     /// What it runs on now (or would, when it starts).
     pub(crate) plan: Option<Plan>,
     pub(crate) up_since_ms: Option<u64>,
+    /// G1.30m: per client, the airtime counter (µs) at the last read and
+    /// when (ms); and the share of the air it took since the read before,
+    /// percent.
+    airtime_seen: BTreeMap<String, (u64, u64)>,
+    pub(crate) airtime_percent: BTreeMap<String, f64>,
 }
 
 /// The suggestion of the last scan of radio `name`, per band.
@@ -304,6 +311,38 @@ pub(crate) fn suggestion(s: &Session, name: &IfName, band: &'static str, allowed
         return None;
     }
     crate::wifi_air::suggest(band, &r.scan, &r.survey, allowed).map(|g| g.frequency_mhz)
+}
+
+/// G1.30m: the share of the air each client took since the last read:
+/// the growth of its airtime counters (sent and received, µs) over the
+/// time between the reads.
+fn airtime(r: &mut ApRadio, st: &WifiApStatus, now: u64) {
+    let mut seen = BTreeMap::new();
+    let mut pct = BTreeMap::new();
+    for c in &st.clients {
+        let Some(us) = c
+            .link
+            .tx_airtime_us
+            .zip(c.link.rx_airtime_us)
+            .map(|(t, x)| t.saturating_add(x))
+        else {
+            continue;
+        };
+        if let Some((at, before)) = r.airtime_seen.get(&c.mac)
+            && now > *at
+            && us >= *before
+        {
+            let used_us = us - before;
+            let span_us = (now - at).saturating_mul(1000);
+            pct.insert(
+                c.mac.clone(),
+                ((used_us as f64 / span_us as f64) * 1000.0).round().min(1000.0) / 10.0,
+            );
+        }
+        seen.insert(c.mac.clone(), (now, us));
+    }
+    r.airtime_seen = seen;
+    r.airtime_percent = pct;
 }
 
 impl Session {
@@ -544,6 +583,7 @@ impl Session {
                         if st.state == ApState::Running && r.up_since_ms.is_none() {
                             r.up_since_ms = Some(now);
                         }
+                        airtime(r, &st, now);
                         r.status = st;
                     }
                     Err(e) => {

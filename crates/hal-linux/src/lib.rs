@@ -927,7 +927,8 @@ mod linux {
                         mtu: u16::try_from(l.mtu).ok()?,
                         mac: l.mac,
                         up: l.up,
-                        wifi: l.wireless,
+                        // G1.30m: a peer's link is not a radio to adopt.
+                        wifi: l.wireless && !l.wifi_vlan,
                     })
                 })
                 .collect())

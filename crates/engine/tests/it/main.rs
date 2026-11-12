@@ -80,6 +80,7 @@ mod unmanaged;
 mod users;
 mod wifi;
 mod wifi_ap;
+mod wifi_bond;
 mod wifi_bridge;
 mod wifi_scan;
 mod xdp;

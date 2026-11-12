@@ -1,0 +1,37 @@
+From: CoreRouter <noreply@corerouter.invalid>
+Subject: [PATCH] wpa_supplicant: ask for a new scan after an aborted one
+
+A scan for a network to connect to that the kernel aborts (the interface
+went down and up again under it, as when it is enslaved to a bond, which
+takes its slaves down) reaches _wpa_supplicant_event_scan_results() with
+scan_info.aborted set. The results are rightly not used, but nothing asks
+for another scan either: wpa_state stays WPA_SCANNING and the station never
+connects again until something else happens to the interface.
+
+Seen in the CoreRouter bonding lab (two mac80211_hwsim station-bridges
+enslaved to a bond while scanning): one of the two stayed in SCANNING for
+good ("nl80211: Scan aborted", then nothing for 90 s), the other only came
+back because it also saw INTERFACE_DISABLED/ENABLED.
+
+Ask for a new scan in that case, a second later.
+
+Upstream: to be sent to hostap@lists.infradead.org (not sent yet).
+---
+--- a/wpa_supplicant/events.c
++++ b/wpa_supplicant/events.c
+@@ -2649,6 +2649,15 @@
+ 	if (data && data->scan_info.aborted) {
+ 		wpa_dbg(wpa_s, MSG_DEBUG,
+ 			"Scan was aborted - do not use the incomplete scan results to trigger new operations");
++		/*
++		 * A scan for a network to connect to that was aborted (the
++		 * interface went down and up again under it, as when it joins
++		 * a bond) left the state at SCANNING with nothing to end it:
++		 * no new scan was ever asked for. Ask for one.
++		 */
++		if (own_request && wpa_s->wpa_state == WPA_SCANNING &&
++		    !wpa_s->scan_res_handler)
++			wpa_supplicant_req_new_scan(wpa_s, 1, 0);
+ 		goto scan_work_done;
+ 	}
+ 

@@ -315,6 +315,11 @@ pub struct WifiLink {
     pub connected_secs: Option<u64>,
     /// Milliseconds since anything was heard from the access point.
     pub inactive_ms: Option<u64>,
+    /// G1.30m: airtime of the frames sent to and received from the peer,
+    /// µs since it associated (the drivers that count it: mac80211's
+    /// airtime accounting).
+    pub tx_airtime_us: Option<u64>,
+    pub rx_airtime_us: Option<u64>,
 }
 
 /// Something that happened to a radio since the last [`WifiPort::events`].

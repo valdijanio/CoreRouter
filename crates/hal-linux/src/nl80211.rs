@@ -83,6 +83,10 @@ const STA_INFO_CONNECTED_TIME: u16 = 16;
 const STA_INFO_BEACON_LOSS: u16 = 18;
 const STA_INFO_CHAIN_SIGNAL: u16 = 25;
 const STA_INFO_BEACON_SIGNAL_AVG: u16 = 30;
+/// G1.30m: airtime of the frames received from / sent to the station, µs
+/// (u64; `enum nl80211_sta_info`, l. 4204 and 4211).
+const STA_INFO_RX_DURATION: u16 = 32;
+const STA_INFO_TX_DURATION: u16 = 39;
 
 // `enum nl80211_survey_info` (l. 4954): frequency u32, noise a u8
 // holding a signed dBm, in-use a flag, the times u64 ms.
@@ -296,6 +300,8 @@ pub(crate) fn link(info: Attrs<'_>) -> WifiLink {
             STA_INFO_BEACON_LOSS => l.beacon_loss = counter(&a),
             STA_INFO_CONNECTED_TIME => l.connected_secs = counter(&a),
             STA_INFO_INACTIVE_TIME => l.inactive_ms = counter(&a),
+            STA_INFO_RX_DURATION => l.rx_airtime_us = counter(&a),
+            STA_INFO_TX_DURATION => l.tx_airtime_us = counter(&a),
             _ => {}
         }
     }
