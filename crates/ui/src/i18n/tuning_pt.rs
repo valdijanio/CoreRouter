@@ -1314,6 +1314,10 @@ pub(super) const TEMPLATES: &[(&str, &str)] = &[
         r##"Um oops deixa o kernel em dúvida sobre si mesmo: trate como panic e reinicie."##,
     ),
     (
+        "why.ospf_groups",
+        r##"Piso do CoreRouter: o OSPF assina um grupo multicast por interface num socket só (G3.4m)."##,
+    ),
+    (
         "why.panic",
         r##"Reiniciar 10 s depois de um kernel panic em vez de ficar parado."##,
     ),

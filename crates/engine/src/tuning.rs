@@ -10,7 +10,9 @@
 use std::collections::BTreeMap;
 
 use corerouter_hal::tuning::{KernelStats, SystemInfo, Sysctls};
-use corerouter_model::tuning::{IP_FORWARD, IPV6_FORWARDING, PARAMS, Param};
+use corerouter_model::tuning::{
+    IGMP_MAX_MEMBERSHIPS, IP_FORWARD, IPV6_FORWARDING, OPTMEM_MAX, PARAMS, Param,
+};
 use serde::Serialize;
 
 /// Estimated memory per conntrack entry (struct `nf_conn` with its
@@ -131,6 +133,10 @@ pub const WHY: &[(&str, &str)] = &[
     ("ct_timeout_rfc", "{value} s ({profile}): dead connections leave the table sooner, within {rfc}."),
     ("default", "The kernel's default."),
     ("forward", "A router forwards packets."),
+    (
+        "ospf_groups",
+        "CoreRouter's floor: OSPF joins a multicast group per interface on one socket (G3.4m).",
+    ),
     ("gro", "GRO merges a flow's packets on receive and the kernel splits them again on send: fewer per-packet costs, safe for forwarding."),
     ("governor", "performance: the CPUs stay at full clock; ramping up on a burst costs latency and drops."),
     ("hash_l4", "Spreads flows over equal-cost routes by port too, not only by address."),
@@ -235,6 +241,10 @@ pub fn recommend(profile: Profile, m: &Machine) -> BTreeMap<&'static str, Rec> {
         let n = p.name;
         let r = match n {
             IP_FORWARD | IPV6_FORWARDING => Some(rec("forward", 1, &[])),
+            // G3.4m: never the kernel's 20, which leaves the 21st OSPF
+            // interface without an adjacency.
+            IGMP_MAX_MEMBERSHIPS | OPTMEM_MAX => corerouter_model::tuning::default_of(n)
+                .map(|v| rec("ospf_groups", v, &[])),
             "net.ipv4.fib_multipath_hash_policy" | "net.ipv6.fib_multipath_hash_policy" => {
                 Some(rec("hash_l4", 1, &[]))
             }
@@ -677,6 +687,10 @@ mod tests {
         let c = recommend(Profile::Conservative, &big);
         assert!(!c.contains_key("net.core.netdev_budget"));
         assert_eq!(c["net.ipv4.ip_forward"].value, 1);
+        // G3.4m: the multicast group limits are never brought down to the
+        // kernel's 20 by a profile.
+        assert_eq!(c[IGMP_MAX_MEMBERSHIPS].value, 16_384);
+        assert_eq!(c[OPTMEM_MAX].value, 1 << 20);
         // IPv6 max_size only matters before Linux 6.3; v4's never.
         let mut old = small.clone();
         old.sys.kernel = "5.15.0-100-generic".into();
