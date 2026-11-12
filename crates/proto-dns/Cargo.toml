@@ -27,6 +27,7 @@ base64 = { workspace = true, optional = true }
 dnssec = ["hickory-proto/dnssec-ring", "dep:rustls-pki-types", "dep:base64"]
 
 [dev-dependencies]
+serde_json.workspace = true
 proptest.workspace = true
 criterion.workspace = true
 

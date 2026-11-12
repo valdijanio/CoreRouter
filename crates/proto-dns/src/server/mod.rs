@@ -238,16 +238,31 @@ pub fn allowed_networks(cfg: &Config) -> Vec<IpNet> {
         match AllowedFrom::parse(item) {
             Ok(AllowedFrom::Net(n)) => out.push(n),
             Ok(AllowedFrom::List(list)) => {
-                for iface in cfg.interface_lists.interfaces_of(&list) {
+                let members: Vec<_> = cfg.interface_lists.interfaces_of(&list).collect();
+                for iface in &members {
                     out.extend(
                         cfg.ip
                             .addresses
                             .iter()
                             .filter(|a| {
-                                !a.disabled && a.from_pool.is_none() && a.interface == *iface
+                                !a.disabled && a.from_pool.is_none() && a.interface == **iface
                             })
                             .map(|a| a.address.trunc()),
                     );
+                }
+                // G4.3x: the subscribers of a PPPoE server on one of the
+                // list's interfaces are of the list (RouterOS puts their
+                // dynamic interfaces in the profile's `interface-list`):
+                // the pools the PPP profiles hand out, `next_pool`s
+                // included. Without it, a profile whose `dns_server` is the
+                // router got REFUSED (a notebook, dev.607).
+                if cfg
+                    .ppp
+                    .pppoe_servers
+                    .iter()
+                    .any(|s| !s.disabled && members.iter().any(|m| **m == s.interface))
+                {
+                    out.extend(ppp_pool_networks(cfg));
                 }
             }
             Err(_) => {}
@@ -255,6 +270,47 @@ pub fn allowed_networks(cfg: &Config) -> Vec<IpNet> {
     }
     out.sort();
     out.dedup();
+    out
+}
+
+/// The networks of the pools the PPP profiles give subscribers
+/// (`remote_address` a pool, and its `next_pool` chain), as prefixes.
+fn ppp_pool_networks(cfg: &Config) -> Vec<IpNet> {
+    use corerouter_model::ppp::AddrOrPool;
+    let mut out = Vec::new();
+    for prof in &cfg.ppp.profiles {
+        let Some(AddrOrPool::Pool(name)) = &prof.remote_address else {
+            continue;
+        };
+        for pool in cfg.ip.pools.chain(name) {
+            for r in &pool.ranges {
+                out.extend(range_prefixes(u32::from(r.start), u32::from(r.end)));
+            }
+        }
+    }
+    out
+}
+
+/// The fewest prefixes that cover `start..=end` exactly (at most 62).
+fn range_prefixes(start: u32, end: u32) -> Vec<IpNet> {
+    let mut out = Vec::new();
+    let mut at = u64::from(start);
+    let end = u64::from(end);
+    while at <= end && out.len() < 64 {
+        // The largest block aligned at `at` that ends inside the range.
+        let mut bits = at.trailing_zeros().min(32);
+        while bits > 0 && at + (1u64 << bits) - 1 > end {
+            bits -= 1;
+        }
+        let len = u8::try_from(32 - bits).unwrap_or(32);
+        if let Ok(n) = ipnet::Ipv4Net::new(
+            std::net::Ipv4Addr::from(u32::try_from(at).unwrap_or(0)),
+            len,
+        ) {
+            out.push(IpNet::V4(n));
+        }
+        at += 1u64 << bits;
+    }
     out
 }
 

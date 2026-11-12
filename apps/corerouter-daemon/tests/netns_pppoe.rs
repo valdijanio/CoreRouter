@@ -351,6 +351,12 @@ fn pppoe_server_end_to_end() {
     // G4.3x: not only ICMP: the router's DNS over UDP and a TCP port of the
     // router answer too (on the notebook, dev.607, ping worked and dig and a
     // TCP connect to 100.65.0.1 timed out).
+    // The access port in LAN (`allowed_from` is LAN by default): its PPPoE
+    // subscribers may ask too, not only the port's own network.
+    ok(
+        "interface.list.member.add",
+        json!({"list": "LAN", "interface": "acc0"}),
+    );
     ok("ip.dns.set", json!({"allow_remote_requests": true}));
     wait_for("the DNS server", || {
         ok("system.service.print", json!({}))
@@ -363,15 +369,56 @@ fn pppoe_server_end_to_end() {
     let dns = through(&mut one, sid, &udp_dns(ip, gw, 40053), |r| {
         r[9] == 17 && r[12..16] == gw.octets() && r[20..22] == 53u16.to_be_bytes()
     });
-    assert!(dns.is_some(), "the router's DNS answered over UDP through the slow path");
+    let dns = dns.expect("the router's DNS answered over UDP through the slow path");
+    // The notebook (dev.607): the answer left with the checksum the kernel
+    // leaves to the device (bng0 is a dummy with HW_CSUM): the subscriber's
+    // stack dropped it. What reaches the subscriber is whole.
+    assert!(
+        l4_checksum_ok(&dns),
+        "UDP checksum of the DNS answer: {dns:x?}"
+    );
+    assert_ne!(
+        dns[31] & 0x0f,
+        5,
+        "a subscriber of a LAN port is not REFUSED: {dns:x?}"
+    );
     let syn = through(&mut one, sid, &tcp_syn(ip, gw, 40054, 53), |r| {
         r[9] == 6 && r[12..16] == gw.octets() && r[20..22] == 53u16.to_be_bytes()
     });
     let syn = syn.expect("the router answered the TCP SYN through the slow path");
-    assert_eq!(syn[33] & 0x12, 0x12, "SYN-ACK from the DNS TCP listener: {syn:x?}");
+    assert_eq!(
+        syn[33] & 0x12,
+        0x12,
+        "SYN-ACK from the DNS TCP listener: {syn:x?}"
+    );
+    assert!(
+        l4_checksum_ok(&syn),
+        "TCP checksum of the SYN-ACK: {syn:x?}"
+    );
+    // G4.3x: bng0 hands out whole packets: no checksum offload, no
+    // segmentation offload (a 64 KB TCP packet of the router's own would
+    // not fit a PPPoE frame: the bandwidth test to the gateway).
+    let feats = std::process::Command::new("ethtool")
+        .args(["-k", "bng0"])
+        .output();
+    if let Some(o) = feats.ok().filter(|o| o.status.success()) {
+        let text = String::from_utf8_lossy(&o.stdout).into_owned();
+        for f in ["tx-checksum-ip-generic: off", "scatter-gather: off"] {
+            assert!(text.contains(f), "{f} in:\n{text}");
+        }
+        let segmenting: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| (l.starts_with("tx-tcp") || l.starts_with("tx-udp-")) && l.contains(": on"))
+            .collect();
+        assert!(segmenting.is_empty(), "{segmenting:?} in:\n{text}");
+    }
     // G4.3x: the slow path's device can be captured (it is not in the
     // config: the notebook refused it), a name the kernel has not cannot.
-    let cap = ok("tool.sniffer.start", json!({"interface": "bng0", "duration": 1}));
+    let cap = ok(
+        "tool.sniffer.start",
+        json!({"interface": "bng0", "duration": 1}),
+    );
     assert!(cap["id"].as_u64().is_some(), "{cap}");
     let e = call(None, "tool.sniffer.start", json!({"interface": "nope0"})).unwrap_err();
     assert!(e.contains("no interface 'nope0'"), "{e}");
@@ -628,6 +675,20 @@ fn l4_csum(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, l4: &[u8]) -> u16 {
     b.extend_from_slice(&(l4.len() as u16).to_be_bytes());
     b.extend_from_slice(l4);
     csum(&b)
+}
+
+/// Whether the TCP or UDP checksum of IPv4 packet `ip` is right (UDP 0:
+/// none, RFC 768).
+fn l4_checksum_ok(ip: &[u8]) -> bool {
+    let hl = usize::from(ip[0] & 0x0f) * 4;
+    let total = usize::from(u16::from_be_bytes([ip[2], ip[3]])).min(ip.len());
+    let l4 = &ip[hl..total];
+    if ip[9] == 17 && l4[6..8] == [0, 0] {
+        return true;
+    }
+    let src = Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]);
+    let dst = Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]);
+    l4_csum(src, dst, ip[9], l4) == 0
 }
 
 /// A DNS query (A of `teste.lan`) over UDP to `dst`:53.
