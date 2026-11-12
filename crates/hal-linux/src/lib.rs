@@ -319,8 +319,11 @@ mod linux {
         /// a batch of 4 000 `interface.remove` read the whole link list
         /// 4 000 times (51 s of CPU with 4 000 VLANs, **medido**,
         /// docs/ospf-stress.md). Kept until an apply or [`UNMANAGED_TTL`].
-        unmanaged_memo: Option<(u64, std::time::Instant, Vec<(IfName, String)>)>,
+        unmanaged_memo: Option<UnmanagedMemo>,
     }
+
+    /// `Hal::unmanaged`'s answer with the `epoch` and the moment it was read.
+    type UnmanagedMemo = (u64, std::time::Instant, Vec<(IfName, String)>);
 
     /// How long an `Hal::unmanaged` answer is reused. The commands'
     /// check is an early refusal: `apply` classifies the links again and
