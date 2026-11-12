@@ -270,6 +270,9 @@ pub enum InterfaceKind {
     /// this router's access points (RouterOS has no such type; ours is
     /// `wifi-peer`): there while the peer is associated.
     WifiPeer(Box<crate::wifi::WifiPeer>),
+    /// G1.31: a WireGuard tunnel (RouterOS type `wireguard`); its keys,
+    /// port and peers in [`crate::wireguard`].
+    Wireguard(Box<crate::wireguard::Wireguard>),
 }
 
 impl InterfaceKind {
@@ -284,6 +287,7 @@ impl InterfaceKind {
             Self::PppoeClient(_) => "pppoe-out",
             Self::Wifi(_) => "wifi",
             Self::WifiPeer(_) => "wifi-peer",
+            Self::Wireguard(_) => "wireguard",
         }
     }
 }
