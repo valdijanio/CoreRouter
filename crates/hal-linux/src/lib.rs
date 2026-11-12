@@ -1582,6 +1582,10 @@ mod linux {
             Ok(Box::new(crate::clock::LinuxClock::realtime()))
         }
 
+        fn hardware_clock(&self) -> Result<i64, HalError> {
+            crate::clock::read_rtc(std::path::Path::new(crate::clock::RTC_SINCE_EPOCH))
+        }
+
         fn dhcp_server_port(
             &mut self,
             name: &IfName,

@@ -4,11 +4,20 @@
 
 use corerouter_hal::clock::SystemClock;
 use corerouter_model::firewall::AddrMatch;
-use corerouter_model::ntp::{NtpServerStats, NtpState, NtpStatus};
+use corerouter_model::ntp::{ClockState, NtpServerStats, NtpState, NtpStatus};
 use corerouter_model::source_set::SourceEntry;
 use serde_json::Value;
 
 use crate::Session;
+
+/// G4.6p: the last time the NTP client moved the system clock (a step or
+/// a slew), and from whom; kept after the client is turned off, so
+/// `system.clock.print` still says where the time came from.
+#[derive(Default, Clone)]
+pub(crate) struct ClockSetByNtp {
+    pub(crate) at: Option<u64>,
+    pub(crate) server: Option<String>,
+}
 
 /// The operator accepted the pending step; the next round looks at it.
 #[derive(Default)]
@@ -23,6 +32,15 @@ impl Session {
         }
         if let Some((level, message)) = crate::logging::ntp_event(&self.ntp, &status) {
             self.log_event(&["ntp", level], crate::logging::DAEMON, message, Value::Null);
+        }
+        if matches!(status.clock, ClockState::Slewing | ClockState::Stepped)
+            && let Some(set) = self.ext_mut::<ClockSetByNtp>()
+        {
+            set.at = status.last_sync.or(set.at);
+            set.server = status
+                .synced_server
+                .clone()
+                .or_else(|| set.server.take());
         }
         self.ntp = status;
     }

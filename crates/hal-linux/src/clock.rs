@@ -30,6 +30,22 @@ use clock_steering::unix::{Error, UnixClock};
 use clock_steering::{Clock, LeapIndicator, TimeOffset};
 use corerouter_hal::clock::{ClockError, HardwareClock, SystemClock};
 
+/// The first RTC's time as the kernel reads it (`rtc_cmos` and the rest
+/// take the chip as UTC), world-readable, never written here (G4.6p).
+pub const RTC_SINCE_EPOCH: &str = "/sys/class/rtc/rtc0/since_epoch";
+
+/// Seconds since 1970 in an RTC's `since_epoch` (a few bytes, read whole).
+pub fn read_rtc(path: &std::path::Path) -> Result<i64, corerouter_hal::HalError> {
+    use corerouter_hal::HalError;
+    let text = std::fs::read_to_string(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => HalError::Unsupported("this machine has no RTC".into()),
+        _ => HalError::Io(format!("{}: {e}", path.display())),
+    })?;
+    let t = text.trim();
+    t.parse()
+        .map_err(|_| HalError::Io(format!("{}: not a number: {:.32}", path.display(), t)))
+}
+
 /// `CLOCK_REALTIME`.
 pub struct LinuxClock(UnixClock);
 
@@ -102,6 +118,22 @@ impl SystemClock for LinuxClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_rtc_reads_whole_seconds_and_says_why_not() {
+        let dir = std::env::temp_dir().join(format!("cr-rtc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("since_epoch");
+        std::fs::write(&f, "1794450000\n").unwrap();
+        assert_eq!(read_rtc(&f), Ok(1_794_450_000));
+        std::fs::write(&f, "garbage").unwrap();
+        assert!(matches!(read_rtc(&f), Err(corerouter_hal::HalError::Io(_))));
+        assert!(matches!(
+            read_rtc(&dir.join("absent")),
+            Err(corerouter_hal::HalError::Unsupported(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn negative_offsets_have_a_positive_fraction() {
