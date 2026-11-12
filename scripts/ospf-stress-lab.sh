@@ -559,6 +559,7 @@ cleanup() {
 		ip netns del "$ns" 2>/dev/null
 	done
 	ip link del crlink0 2>/dev/null
+	conv_routers_stop 2>/dev/null
 	umount -l "$R" "$W/lower" "$W/rw" 2>/dev/null
 }
 trap cleanup EXIT
@@ -1195,6 +1196,184 @@ test_latency() {
 	say ""
 }
 
+# --- 6. Convergence with traffic (local DUT): BNG Blaster sends 10 000
+# pps from gen1 through the DUT to gen2, behind R4; the DUT reaches R4 by
+# R2 (cost 10 + 10) or R3 (20 + 10). The DUT–R2 link is cut silently
+# (netem in R2's namespace: no carrier change), and the loss is counted.
+#
+#   gen1 ─ DUT ether2 ─ R2 ─┐
+#          DUT ether3 ─ R3 ─ R4 ─ gen2 (10.250.0.2)
+CONV_PPS=10000 CONV_RUNS=${CONV_RUNS:-3}
+conv_links() {
+	local ns
+	for ns in crconv1 crconv2 crconv3; do
+		ip netns add $ns
+		ip -n $ns link set lo up
+		ip netns exec $ns sysctl -qw net.ipv4.ip_forward=1 net.mpls.platform_labels=1048575 2>/dev/null || true
+	done
+	ip link add ether2 netns crdut type veth peer name c1-dut netns crconv1
+	ip link add ether3 netns crdut type veth peer name c2-dut netns crconv2
+	ip link add c1-r4 netns crconv1 type veth peer name c4-r2 netns crconv3
+	ip link add c2-r4 netns crconv2 type veth peer name c4-r3 netns crconv3
+	ip link add c4-sink netns crconv3 type veth peer name gen2 netns crgen
+	ip -n crdut link set ether2 up
+	ip -n crdut link set ether3 up
+	ip -n crgen link set gen2 up
+	ip netns exec crgen ethtool -K gen2 tx off rx off >/dev/null 2>&1 || true
+	local a
+	for a in "crconv1 c1-dut 10.0.2.2/30" "crconv1 c1-r4 10.0.24.1/30" "crconv2 c2-dut 10.0.3.2/30" \
+		"crconv2 c2-r4 10.0.34.1/30" "crconv3 c4-r2 10.0.24.2/30" "crconv3 c4-r3 10.0.34.2/30" \
+		"crconv3 c4-sink 10.250.0.1/24"; do
+		set -- $a
+		ip -n "$1" addr add "$3" dev "$2"
+		ip -n "$1" link set "$2" up
+		ip netns exec "$1" sysctl -qw "net.mpls.conf.$2.input=1" 2>/dev/null || true
+	done
+	set --
+}
+# conv_router <ns> <n> <if:cost…>: the VM's FRR (zebra, ospfd, bfdd) as R<n>,
+# SR on (TI-LFA needs it everywhere), BFD 3 × 10 ms towards the DUT.
+conv_router() {
+	local ns=$1 n=$2 d=/etc/frr/$1
+	shift 2
+	install -d -o frr -g frr "$d" "/var/run/frr/$ns"
+	: >"$d/vtysh.conf"
+	: >"$d/zebra.conf"
+	ip -n "$ns" addr add "10.255.0.$n/32" dev lo
+	{
+		local ic
+		for ic in "$@"; do
+			printf 'interface %s\n ip ospf network point-to-point\n ip ospf hello-interval 1\n' "${ic%%:*}"
+			printf ' ip ospf dead-interval 4\n ip ospf cost %s\n ip ospf area 0.0.0.0\n' "${ic##*:}"
+			case ${ic%%:*} in *-dut) printf ' ip ospf bfd\n ip ospf bfd profile crfast\n' ;; esac
+			printf 'exit\n'
+		done
+		[ "$ns" = crconv3 ] && printf 'interface c4-sink\n ip ospf area 0.0.0.0\n ip ospf passive\nexit\n'
+		printf 'interface lo\n ip ospf area 0.0.0.0\n ip ospf passive\nexit\n'
+		printf 'router ospf\n ospf router-id 10.255.0.%s\n capability opaque\n router-info area\n' "$n"
+		printf ' segment-routing on\n segment-routing prefix 10.255.0.%s/32 index %s\nexit\n' "$n" "$n"
+	} >"$d/ospfd.conf"
+	printf 'bfd\n profile crfast\n  detect-multiplier 3\n  receive-interval 10\n  transmit-interval 10\n exit\nexit\n' >"$d/bfdd.conf"
+	chown -R frr:frr "$d"
+	ip netns exec "$ns" /usr/lib/frr/zebra -N "$ns" -d -f "$d/zebra.conf" --log "file:$d/zebra.log" </dev/null >/dev/null 2>&1
+	for _ in $(seq 50); do [ -S "/var/run/frr/$ns/zserv.api" ] && break; sleep 0.1; done
+	ip netns exec "$ns" /usr/lib/frr/ospfd -N "$ns" -d -f "$d/ospfd.conf" --log "file:$d/ospfd.log" </dev/null >/dev/null 2>&1
+	ip netns exec "$ns" /usr/lib/frr/bfdd -N "$ns" -d -f "$d/bfdd.conf" --log "file:$d/bfdd.log" </dev/null >/dev/null 2>&1
+}
+conv_routers_stop() {
+	pkill -f -- "-N crconv" 2>/dev/null || true
+	for _ in $(seq 30); do pgrep -f -- "-N crconv" >/dev/null || break; sleep 0.1; done
+	pkill -9 -f -- "-N crconv" 2>/dev/null || true
+	rm -rf /etc/frr/crconv1 /etc/frr/crconv2 /etc/frr/crconv3 /var/run/frr/crconv1 /var/run/frr/crconv2 /var/run/frr/crconv3
+}
+# The DUT's way to the sink now: the interface of its FIB route.
+conv_via() { vty 'show ip route 10.250.0.0/24 json' | jq -r '.["10.250.0.0/24"][]? | select(.selected) | .nexthops[]? | select(.fib) | .interfaceName' | head -n 1; }
+conv_backup() { vty 'show ip route 10.250.0.0/24 json' | jq -r '[.["10.250.0.0/24"][]? | select(.selected) | .backupNexthops[]?] | length'; }
+conv_cut() { # on|off: the DUT–R2 link, silently (both directions)
+	if [ "$1" = on ]; then
+		ip netns exec crconv1 tc qdisc add dev c1-dut root netem loss 100%
+		ip netns exec crconv1 tc qdisc add dev c1-dut ingress
+		ip netns exec crconv1 tc filter add dev c1-dut parent ffff: matchall action drop
+	else
+		ip netns exec crconv1 tc qdisc del dev c1-dut root 2>/dev/null || true
+		ip netns exec crconv1 tc qdisc del dev c1-dut ingress 2>/dev/null || true
+	fi
+}
+conv_counters() { bbl stream-info flow-id 1 | jq -r '.["stream-info"] | "\(.["tx-packets"] // 0) \(.["rx-packets"] // 0)"'; }
+via_is() { [ "$(conv_via)" = "$1" ]; }
+
+test_convergence() {
+	say "## 6. Convergence with traffic ($CONV_PPS pps, DUT–R2 cut silently, $CONV_RUNS runs each)"
+	say ""
+	if [ $DUT = remote ]; then
+		say "Not run: the remote mode has no R2/R3/R4 behind the router (phase C wires its own)."
+		say ""
+		return
+	fi
+	modprobe mpls_router 2>/dev/null || true
+	modprobe mpls_iptunnel 2>/dev/null || true
+	ip netns exec crdut sysctl -qw net.mpls.platform_labels=1048575 2>/dev/null || true
+	conv_links
+	ok ip.address.add '{"address":"10.0.2.1/30","interface":"ether2"}' >/dev/null
+	ok ip.address.add '{"address":"10.0.3.1/30","interface":"ether3"}' >/dev/null
+	local t2 t3
+	t2=$(ok routing.ospf.interface-template.add '{"area":"stress-bb","networks":["10.0.2.0/30"],"type":"ptp","cost":10,"hello_interval":1,"dead_interval":4,"comment":"conv R2"}' | jq -r .id)
+	t3=$(ok routing.ospf.interface-template.add '{"area":"stress-bb","networks":["10.0.3.0/30"],"type":"ptp","cost":20,"hello_interval":1,"dead_interval":4,"comment":"conv R3"}' | jq -r .id)
+	conv_router crconv1 2 c1-dut:10 c1-r4:10
+	conv_router crconv2 3 c2-dut:20 c2-r4:10
+	conv_router crconv3 4 c4-r2:10 c4-r3:10
+	cat >"$W/gen/conv.json" <<EOF
+{
+  "interfaces": {
+    "network": [
+      {"interface": "gen1", "address": "$LINK_GEN/30", "gateway": "$LINK_DUT", "ospfv2-instance-id": 1, "ospfv2-type": "p2p"},
+      {"interface": "gen2", "address": "10.250.0.2/24", "gateway": "10.250.0.1"}
+    ]
+  },
+  "ospf": [{"instance-id": 1, "version": 2, "router-id": "$GEN_RID", "hello-interval": 1, "dead-interval": 4}],
+  "streams": [{"name": "conv", "type": "ipv4", "direction": "downstream", "pps": $CONV_PPS,
+    "network-interface": "gen1", "destination-ipv4-address": "10.250.0.2", "length": 128}]
+}
+EOF
+	gen_start "$W/gen/conv.json"
+	if ! wait_for "R2, R3 and gen Full" 120 ge 3 dut_neighbors_full >/dev/null ||
+		! wait_for "route via R2" 60 via_is ether2 >/dev/null; then
+		fail "convergence: the topology did not come up ($(dut_neighbors_full) Full, via $(conv_via))"
+		vty 'show ip ospf neighbor'
+		gen_stop
+		return
+	fi
+	say "| protection | detection | loss per run (ms) | median (ms) | backup in zebra | result |"
+	say "|---|---|---|---|---|---|"
+	local mode
+	for mode in none bfd ti-lfa; do
+		case $mode in
+		bfd)
+			ok routing.bfd.profile.add '{"name":"crfast","min_tx":10,"min_rx":10,"multiplier":3}' >/dev/null
+			ok routing.ospf.interface-template.set "{\"id\":\"$t2\",\"bfd\":\"crfast\"}" >/dev/null
+			ok routing.ospf.interface-template.set "{\"id\":\"$t3\",\"bfd\":\"crfast\"}" >/dev/null
+			;;
+		ti-lfa)
+			cr interface.loopback.add '{"name":"lo"}' >/dev/null 2>&1 || true
+			ok ip.address.add '{"address":"10.255.0.1/32","interface":"lo"}' >/dev/null
+			ok routing.ospf.interface-template.add '{"area":"stress-bb","interfaces":["lo"],"passive":true,"comment":"conv lo"}' >/dev/null
+			if ! ok routing.ospf.segment-routing.set "{\"instance\":\"$INSTANCE\",\"ti_lfa\":\"link\",\"force\":true}" >"$W/sr.out"; then
+				say "| TI-LFA | - | - | - | - | FAIL (segment-routing.set refused: $(head -c 300 "$W/cr.err")) |"
+				FAILED=1
+				break
+			fi
+			wait_for "TI-LFA backup" 120 ge 1 conv_backup >/dev/null || log "no backup next hop in zebra"
+			;;
+		esac
+		sleep 5
+		local runs="" r lost verdict=ok
+		for r in $(seq "$CONV_RUNS"); do
+			wait_for "via R2" 120 via_is ether2 >/dev/null || { verdict="FAIL (not back on R2)"; break; }
+			sleep 3
+			local a b
+			a=$(conv_counters)
+			conv_cut on
+			wait_for "via R3" 30 via_is ether3 >/dev/null || verdict="FAIL (no switch to R3)"
+			sleep 2
+			b=$(conv_counters)
+			conv_cut off
+			lost=$(awk -v a="$a" -v b="$b" -v pps=$CONV_PPS 'BEGIN {split(a, x, " "); split(b, y, " ");
+				printf "%.1f", ((y[1] - x[1]) - (y[2] - x[2])) * 1000 / pps}')
+			runs+="$lost "
+			wait_for "R2 Full again" 60 ge 3 dut_neighbors_full >/dev/null || true
+		done
+		local med
+		med=$(printf '%s\n' $runs | sort -n | awk '{a[NR] = $1} END {print a[int((NR + 1) / 2)]}')
+		local det
+		case $mode in none) det="dead interval 4 s" ;; bfd) det="BFD 3 × 10 ms" ;; ti-lfa) det="BFD 3 × 10 ms" ;; esac
+		[ "$verdict" = ok ] || FAILED=1
+		say "| $mode | $det | ${runs% } | $med | $(conv_backup) | $verdict |"
+	done
+	gen_stop
+	conv_routers_stop
+	say ""
+}
+
 has_test lsdb && test_lsdb
 [ "$BIGGEST" = 0 ] && BIGGEST=${LOAD:-10000}
 has_test churn && test_churn
@@ -1208,6 +1387,7 @@ if has_test ops || has_test latency; then
 	fi
 	gen_stop
 fi
+has_test convergence && test_convergence
 if [ "${TESTS}" = none ]; then
 	say "up: $(dut_neighbors_full) full, LSAs $(dut_lsas), routes $(dut_routes), spf $(dut_spf), procs $(proc_sample)"
 	vty 'show ip ospf json' | head -c 3000
