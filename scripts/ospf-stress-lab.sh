@@ -328,8 +328,10 @@ gen_stop() {
 	local p
 	p=$(cat "$W/gen/bbl.pid" 2>/dev/null) || return 0
 	kill -INT "$p" 2>/dev/null || return 0
-	# Teardown: the external LSAs go out with MaxAge (purge) first.
-	for _ in $(seq 150); do kill -0 "$p" 2>/dev/null || break; sleep 0.1; done
+	# Teardown: the external LSAs go out with MaxAge (purge) first; 200 000
+	# of them take BNG Blaster longer than its 5 s teardown-time.
+	for _ in $(seq 3000); do kill -0 "$p" 2>/dev/null || break; sleep 0.1; done
+	kill -0 "$p" 2>/dev/null && log "BNG Blaster still up 300 s after SIGINT: killed (its LSAs age out)"
 	kill -9 "$p" 2>/dev/null || true
 	rm -f "$W/gen/bbl.pid"
 }
