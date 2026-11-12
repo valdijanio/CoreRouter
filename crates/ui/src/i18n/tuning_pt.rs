@@ -659,7 +659,7 @@ Cada perfil é calculado para esta máquina (RAM, CPUs, velocidade das portas), 
 ## Plano de controle
 As opções de TCP (buffers de socket, SYN cookies) só afetam as conexões do próprio roteador (BGP, a API), nunca o tráfego encaminhado.
 ## Aplicar
-"Aplicar com Safe Mode" entra em Safe Mode antes: se a conexão com o roteador cair, toda mudança volta."##,
+Escolher um perfil no seletor do alto só o compara: a aba Profiles o marca como "picked" e nada muda no roteador. "Apply with Safe Mode" (no Summary e em Profiles) grava o perfil escolhido: entra em Safe Mode antes e, se a conexão com o roteador cair, toda mudança volta."##,
     ),
     (
         "tuning.vm.min_free_kbytes",
@@ -835,6 +835,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
         r##"Parâmetro"##,
     ),
     (
+        "Picking a profile at the top only compares it: nothing changes until you apply it.",
+        r##"Escolher um perfil no alto só o compara: nada muda até você aplicá-lo."##,
+    ),
+    (
         "Port",
         r##"Porta"##,
     ),
@@ -943,8 +947,8 @@ pub(super) const LABELS: &[(&str, &str)] = &[
         r##"O driver não deixa mudar."##,
     ),
     (
-        "The four profiles for this machine, side by side. The profile picked at the top is the one Summary applies.",
-        r##"Os quatro perfis para esta máquina, lado a lado. O perfil escolhido no alto é o que o Resumo aplica."##,
+        "The four profiles for this machine, side by side.",
+        r##"Os quatro perfis para esta máquina, lado a lado."##,
     ),
     (
         "This backend does not describe the machine: ranges come from the kernel only.",
@@ -1007,6 +1011,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
         r##"e reiniciar"##,
     ),
     (
+        "compare only",
+        r##"só compara"##,
+    ),
+    (
         "control plane",
         r##"plano de controle"##,
     ),
@@ -1065,6 +1073,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (
         "parameters differ from this profile.",
         r##"parâmetros diferem deste perfil."##,
+    ),
+    (
+        "picked",
+        r##"escolhido"##,
     ),
     (
         "router default",
