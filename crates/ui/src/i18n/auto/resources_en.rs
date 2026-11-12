@@ -14,6 +14,8 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("resources.check.conntrack", "## Conntrack\n\nConnection table fill: 80/95 %."),
     ("resources.check.cpu", "## CPU\n\nAverage CPU load over 5 minutes: warning at 80 %, error at 95 %."),
     ("resources.check.disk", "## Disk\n\nFree space of the fullest disk: warning below 15 %, error below 5 %."),
+    ("resources.check.kernel.crash", "## Previous boot\n\nWhether the previous boot ended in a kernel panic or oops: the record the kernel left in the firmware (ERST or UEFI variables) was saved to `/config/crash/` and erased. A warning for the whole boot after the panic, with the reason; the whole text in `system.crash.print {\"lines\": true}`. Ok says where a panic would be recorded now."),
+    ("resources.check.kernel.crash-store", "## Crash store\n\nThe UEFI NVRAM has less free space than two panic records (16 KiB each), the A/B boot entries and the kernel's reserve: the router turned the panic record in UEFI variables off for this boot, so it never takes the boot entries' room. Free space in the firmware setup; the next boot checks again."),
     ("resources.check.memory.pressure", "## Memory pressure\n\nMemory pressure (PSI some avg60): warning at 10 %, error at 40 % or any sustained full stall."),
     ("resources.check.nic.errors", "## NIC errors\n\nErrors or drops rising on a link."),
     ("resources.check.ntp", "## NTP\n\nClock synchronized?"),

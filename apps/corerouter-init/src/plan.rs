@@ -404,6 +404,43 @@ pub const MOUNTS: &[Mount] = &[
     m("tracefs", "/sys/kernel/tracing", "tracefs", "", true),
 ];
 
+/// G1.6zx: the records the previous boot's panic left (ERST, UEFI
+/// variables), which the daemon's `crash-log` service saves and erases.
+/// Mounted when the kernel has it ([`has_fs`]): the installer's has not.
+pub const PSTORE: Mount = m("pstore", "/sys/fs/pstore", "pstore", "", true);
+
+/// The kernel knows filesystem `fs` (`/proc/filesystems`: `nodev\tpstore`).
+pub fn has_fs(proc_filesystems: &str, fs: &str) -> bool {
+    proc_filesystems
+        .lines()
+        .any(|l| l.split_ascii_whitespace().last() == Some(fs))
+}
+
+/// G1.6zx: on a real machine a CPU stuck in the kernel (soft lockup, 20 s)
+/// or with its interrupts off (hard lockup, 10 s) panics, and `panic=10`
+/// reboots: the router comes back and the next boot shows the trace. Not in
+/// a virtual machine, where the host may stop a vCPU for that long; not
+/// over what the command line set (`system.tuning.boot`). The operator
+/// changes them at run time in `/system tuning`.
+pub fn lockup_panic(cpuinfo: &str, cmdline: &str) -> Vec<(&'static str, &'static str)> {
+    if virtual_machine(cpuinfo) {
+        return Vec::new();
+    }
+    let given = |k: &str| {
+        cmdline
+            .split_ascii_whitespace()
+            .any(|w| w.split_once('=').is_some_and(|(n, _)| n == k))
+    };
+    [
+        ("softlockup_panic", "/proc/sys/kernel/softlockup_panic"),
+        ("hardlockup_panic", "/proc/sys/kernel/hardlockup_panic"),
+    ]
+    .into_iter()
+    .filter(|(k, _)| !given(k))
+    .map(|(_, p)| (p, "1"))
+    .collect()
+}
+
 /// efivarfs, mounted only on a UEFI boot (the A/B image's boot variables,
 /// G1.6b).
 pub const EFIVARS: Mount = m(
@@ -1069,6 +1106,27 @@ mod tests {
         assert_eq!(mem_used_kib("MemTotal: 10 kB\n"), None);
         assert!(is_pong(r#"{"id":1,"ok":true,"result":{"pong":true}}"#));
         assert!(!is_pong(r#"{"id":1,"ok":false,"error":"x"}"#));
+    }
+
+    #[test]
+    fn pstore_and_lockup_panic() {
+        let fs = "nodev\tsysfs\nnodev\tpstore\n\text4\n";
+        assert!(has_fs(fs, "pstore") && has_fs(fs, "ext4"));
+        assert!(!has_fs("nodev\tpstorex\n", "pstore"));
+        let real = "flags\t\t: fpu vme lahf_lm\n";
+        let vm = "flags\t\t: fpu hypervisor\n";
+        assert_eq!(
+            lockup_panic(real, "panic=10 quiet"),
+            [
+                ("/proc/sys/kernel/softlockup_panic", "1"),
+                ("/proc/sys/kernel/hardlockup_panic", "1")
+            ]
+        );
+        assert!(lockup_panic(vm, "panic=10").is_empty());
+        assert_eq!(
+            lockup_panic(real, "softlockup_panic=0 quiet"),
+            [("/proc/sys/kernel/hardlockup_panic", "1")]
+        );
     }
 
     #[test]

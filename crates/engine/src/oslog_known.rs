@@ -243,6 +243,61 @@ pub const KNOWN: &[Known] = &[
         actions: &[RESOURCES, SERVICES],
         alert: true,
     },
+    // G1.6zx: before `disk-io-error` and `mce`, whose words they share
+    // ("uncorrectable", "corrected error").
+    Known {
+        id: "pcie-aer",
+        source: K,
+        all: &[],
+        any: &["pcie bus error", "aer: corrected error", "aer: uncorrected", "aer: uncorrectable", "aer: multiple", "dpc: containment event"],
+        title: "Erro no barramento PCIe",
+        meaning: "Uma placa PCIe (rede, disco NVMe) ou o slot dela teve erro de transmissão, \
+                  avisado pelo AER. Corrigido de vez em quando é normal; muitos por minuto, ou \
+                  não corrigido (Uncorrected, Fatal), apontam para placa, riser ou cabo com \
+                  defeito, mau contato no slot ou economia de energia do PCIe (ASPM). Com DPC o \
+                  slot é isolado e a placa some até ser religada. Reencaixe a placa, troque o \
+                  riser ou o slot.",
+        actions: &[INTERFACES, RESOURCES],
+        alert: true,
+    },
+    Known {
+        id: "memory-ecc",
+        source: K,
+        all: &["edac"],
+        any: &[" ce ", " ue ", "corrected error", "uncorrected error", "memory read error", "memory error"],
+        title: "Erro de memória (ECC)",
+        meaning: "O controlador de memória achou um bit errado num pente e o ECC o corrigiu (CE) \
+                  ou não conseguiu corrigir (UE). Um erro corrigido isolado acontece; vários no \
+                  mesmo pente anunciam que ele vai falhar. Um não corrigido pode derrubar um \
+                  processo ou o kernel. A linha diz o pente (DIMM, canal): programe a troca.",
+        actions: &[RESOURCES],
+        alert: true,
+    },
+    Known {
+        id: "kernel-oops",
+        source: K,
+        all: &[],
+        any: &["oops:", "bug: unable to handle", "bug: kernel null pointer", "kernel bug at", "bug: scheduling while atomic"],
+        title: "Falha dentro do kernel",
+        meaning: "O kernel encontrou um erro dele mesmo (oops, BUG). O roteador pode seguir, mas instável: o que estava no meio \
+                  (um driver, uma tarefa) parou. Se o kernel entrou em pânico, o registro aparece \
+                  no próximo boot em system.crash.print. Guarde as linhas seguintes (Call \
+                  Trace) para o relatório.",
+        actions: &[SERVICES],
+        alert: true,
+    },
+    Known {
+        id: "pstore-write",
+        source: K,
+        all: &["pstore"],
+        any: &["writing error", "dump skipped"],
+        title: "Registro de pânico não gravado",
+        meaning: "O kernel não conseguiu gravar o fim do log no armazenamento do firmware (ERST \
+                  ou variáveis UEFI): o armazenamento está cheio ou o firmware recusou. O próximo \
+                  pânico não deixará registro. Veja system.crash.print (efi.free).",
+        actions: &[RESOURCES],
+        alert: true,
+    },
     Known {
         id: "disk-io-error",
         source: K,
@@ -285,7 +340,7 @@ pub const KNOWN: &[Known] = &[
         id: "lockup",
         source: K,
         all: &[],
-        any: &["soft lockup", "hard lockup", "self-detected stall", "blocked for more than"],
+        any: &["soft lockup", "hard lockup", "self-detected stall", "blocked for more than", "detected stalls on cpus"],
         title: "CPU ou tarefa travada",
         meaning: "Um núcleo ficou preso sem ceder a vez (lockup), ou uma tarefa esperou mais de \
                   dois minutos por disco ou rede (hung task). Pode ser driver com defeito, disco \
@@ -409,9 +464,22 @@ mod tests {
             (Kernel, "EXT4-fs error (device sda1): ext4_find_entry:1455: inode #2: comm ls: reading directory lblock 0", Some("disk-io-error")),
             (Kernel, "nvme nvme0: I/O 18 QID 3 timeout, aborting", Some("disk-io-error")),
             (Kernel, "mce: [Hardware Error]: Machine check events logged", Some("mce")),
-            (Kernel, "EDAC MC0: 1 CE memory read error on CPU_SrcID#0_Ha#0_Chan#1_DIMM#0 (corrected error)", Some("mce")),
+            (Kernel, "EDAC MC0: 1 CE memory read error on CPU_SrcID#0_Ha#0_Chan#1_DIMM#0 (corrected error)", Some("memory-ecc")),
+            (Kernel, "mce: [Hardware Error]: CPU 0: Machine Check: 0 Bank 5: be00000000800400", Some("mce")),
             (Kernel, "CPU3: Core temperature above threshold, cpu clock throttled (total events = 1)", Some("thermal")),
             (Kernel, "watchdog: BUG: soft lockup - CPU#2 stuck for 22s! [ksoftirqd/2:22]", Some("lockup")),
+            (Kernel, "Watchdog detected hard LOCKUP on cpu 3", Some("lockup")),
+            (Kernel, "rcu: INFO: rcu_preempt self-detected stall on CPU", Some("lockup")),
+            (Kernel, "pcieport 0000:00:1c.0: AER: Corrected error message received from 0000:01:00.0", Some("pcie-aer")),
+            (Kernel, "nvme 0000:01:00.0: PCIe Bus Error: severity=Corrected, type=Physical Layer, (Receiver ID)", Some("pcie-aer")),
+            (Kernel, "pcieport 0000:00:01.0: AER: Uncorrected (Fatal) error message received from 0000:02:00.0", Some("pcie-aer")),
+            (Kernel, "pcieport 0000:00:1d.0: DPC: containment event, status:0x1f01 source:0x0000", Some("pcie-aer")),
+            (Kernel, "EDAC MC0: 1 UE memory read error on CPU_SrcID#0_Ha#0_Chan#0_DIMM#1 (uncorrected error)", Some("memory-ecc")),
+            (Kernel, "EDAC skx MC1: HANDLING MCE MEMORY ERROR", Some("memory-ecc")),
+            (Kernel, "Oops: general protection fault, probably for non-canonical address 0xdead000000000100: 0000 [#1] SMP NOPTI", Some("kernel-oops")),
+            (Kernel, "BUG: kernel NULL pointer dereference, address: 0000000000000008", Some("kernel-oops")),
+            (Kernel, "rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:", Some("lockup")),
+            (Kernel, "pstore: backend (efi_pstore) writing error (-28)", Some("pstore-write")),
             (Kernel, "INFO: task jbd2/sda1-8:312 blocked for more than 120 seconds.", Some("lockup")),
             (Kernel, "dnsmasq[4242]: segfault at 0 ip 00005581c3a1b2c4 sp 00007ffd0a321178 error 4", Some("segfault")),
             (Auth, "Failed password for invalid user admin from 203.0.113.77 port 41234 ssh2", Some("login-failed")),
@@ -420,6 +488,9 @@ mod tests {
             // Look alike, mean nothing.
             (Kernel, "OOM killer enabled.", None),
             (Kernel, "MCE: In-kernel MCE decoding enabled.", None),
+            (Kernel, "EDAC MC: Ver: 3.0.0", None),
+            (Kernel, "pstore: Using crash dump compression: deflate", None),
+            (Kernel, "pcieport 0000:00:1c.0: AER: enabled with IRQ 122", None),
             (Kernel, "ACPI: thermal: Thermal Zone [TZ01] (76 C)", None),
             (Kernel, "thermal_sys: Registered thermal governor 'step_wise'", None),
             (Services, "Failed password for x", None),

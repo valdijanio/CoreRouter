@@ -32,6 +32,9 @@ pub struct SystemInfo {
     pub mem_kib: u64,
     /// Kernel release (`6.8.0-45-generic`).
     pub kernel: String,
+    /// G1.6zx: the CPU says it runs under a hypervisor (`hypervisor` in the
+    /// flags of `/proc/cpuinfo`).
+    pub virtual_machine: bool,
 }
 
 impl SystemInfo {

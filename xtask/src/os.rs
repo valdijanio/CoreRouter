@@ -185,6 +185,9 @@ const KERNEL_OFF: &[&str] = &[
     "CONFIG_XEN_PV",
     "CONFIG_XEN_BALLOON",
     "CONFIG_INTEL_IOMMU_DEFAULT_ON",
+    // G1.6zx: the panic's record goes to UEFI variables by default; the
+    // daemon erases them once saved (crash-log service).
+    "CONFIG_EFI_VARS_PSTORE_DEFAULT_DISABLE",
 ];
 /// G1.6zi: what lets the image boot, see its disk and use every core on
 /// common hardware, and say what went wrong: `check` wants each `=y` in the
@@ -228,8 +231,6 @@ const HARDWARE_COVERAGE: &[&str] = &[
     "CONFIG_PSTORE",
     "CONFIG_PSTORE_COMPRESS",
     "CONFIG_EFI_VARS_PSTORE",
-    // With pstore on, or panics would fill the NVRAM of the A/B boot entries.
-    "CONFIG_EFI_VARS_PSTORE_DEFAULT_DISABLE",
     "CONFIG_PCIEAER",
     "CONFIG_PCIE_DPC",
     "CONFIG_RAS",
@@ -2010,7 +2011,11 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
             (
                 cpus_check(root, &top, port, b.smp)?,
                 sensors_check(root, &top, port)?,
-                audit_check(root, &top, port)?,
+                format!(
+                    "{}; {}",
+                    audit_check(root, &top, port)?,
+                    crash_check(root, &top, port)?
+                ),
                 // Last: it leaves a pool in the (snapshot) config.
                 cgnat_check(root, &top, port)?,
             )
@@ -2040,7 +2045,7 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     eprintln!("  cards plugged in after boot (G1.6n, G1.6j): {hot}");
     eprintln!("  sensors (G1.6zf):                   {sensors}");
     eprintln!("  CPUs (G1.6zi):                      {cpus}");
-    eprintln!("  PSI and PCI names (G1.6zr):         {audit}");
+    eprintln!("  PSI, PCI names, crash log (G1.6zr, G1.6zx): {audit}");
     eprintln!("  CGNAT queues (G2.7c):               {cgnat}");
     if let Some(kib) = report.idle_kib {
         eprintln!(
@@ -2136,6 +2141,38 @@ fn audit_check(root: &Path, top: &Path, port: u16) -> Result<String, String> {
         text("vendor"),
         text("model")
     ))
+}
+
+/// G1.6zx: the crash-log service ran on the image (pstore mounted by PID 1)
+/// and no previous boot left a dump; on this firmware (SeaBIOS, no ERST) the
+/// kernel has nowhere to write one.
+fn crash_check(root: &Path, top: &Path, port: u16) -> Result<String, String> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let got = guest_cli(root, top, port, "system.crash.print")?;
+        let v: serde_json::Value = serde_json::from_str(got.trim())
+            .map_err(|e| format!("system.crash.print: {e}: {got:.300}"))?;
+        if v.get("fed") == Some(&serde_json::Value::Bool(true)) {
+            if v.get("crashes")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|a| !a.is_empty())
+            {
+                return Err(format!("G1.6zx: a fresh boot reports a crash: {v}"));
+            }
+            return Ok(format!(
+                "crash log fed, backend {}",
+                v.get("backend")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("none")
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "G1.6zx: the crash-log service never reported (pstore not mounted?): {v}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 /// G2.7c: a blocks-mode CGNAT pool brings up both of its queue services

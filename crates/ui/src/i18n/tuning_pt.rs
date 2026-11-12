@@ -112,6 +112,15 @@ Ligado num roteador onde ninguém chega em pessoa. Junto com o `kernel.panic` el
 Desligar envia o fechamento mágico, que para o temporizador. Um driver sem fechamento mágico continua contando depois que o CoreRouter solta: reinicia, a menos que outra coisa o alimente."##,
     ),
     (
+        "tuning.kernel.hardlockup_panic",
+        r##"## O que faz
+Entra em pânico (e o `kernel.panic` reinicia) quando uma CPU fica 10 s presa com as interrupções desligadas: o travamento duro que o watchdog vê da CPU vizinha. Desligado, só escreve o rastro no log.
+## Quando mudar
+O CoreRouter liga no boot numa máquina real: um roteador com uma CPU congelada não encaminha nada, e o boot seguinte mostra o rastro (`system.crash.print`). Desligado em máquina virtual (o host pode parar uma vCPU por esse tempo).
+## Cuidado
+Um driver que trava na partida cria um ciclo de reinícios; a imagem A/B volta para a anterior."##,
+    ),
+    (
         "tuning.kernel.panic",
         r##"## O que faz
 Segundos depois de um kernel panic até a máquina reiniciar sozinha; 0 espera para sempre na tela do panic.
@@ -128,6 +137,15 @@ Transforma um oops do kernel (um bug do qual o kernel sobreviveu, talvez meio qu
 Num roteador um reinício limpo é melhor que encaminhar com o kernel danificado.
 ## Cuidado
 Um driver que dá oops na partida cria um ciclo de reinícios; a imagem A/B volta para a anterior."##,
+    ),
+    (
+        "tuning.kernel.softlockup_panic",
+        r##"## O que faz
+Entra em pânico (e o `kernel.panic` reinicia) quando uma CPU fica 20 s rodando no kernel sem deixar mais nada rodar: o travamento mole (soft lockup). Desligado, só escreve o rastro no log.
+## Quando mudar
+O CoreRouter liga no boot numa máquina real: a CPU não volta sozinha, e o boot seguinte mostra o rastro (`system.crash.print`). Desligado em máquina virtual, onde o host pode pausar uma vCPU.
+## Cuidado
+Um soft lockup sob uma enxurrada de interrupções pode passar sozinho; numa máquina que os vê com frequência, olhe Tuning › CPU antes de deixar ligado."##,
     ),
     (
         "tuning.net.core.dev_weight",
@@ -1226,6 +1244,14 @@ pub(super) const TEMPLATES: &[(&str, &str)] = &[
     (
         "why.keep",
         r##"O perfil {profile} mantém o valor do kernel."##,
+    ),
+    (
+        "why.lockup",
+        r##"Uma CPU presa no kernel (20 s, ou 10 s com as interrupções desligadas) não volta: reinicie, e o boot seguinte mostra o rastro (system.crash.print)."##,
+    ),
+    (
+        "why.lockup_vm",
+        r##"Numa máquina virtual o host pode parar uma vCPU por esse tempo: o reinício seria alarme falso."##,
     ),
     (
         "why.lro",

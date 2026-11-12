@@ -136,6 +136,8 @@ pub const WHY: &[(&str, &str)] = &[
     ("hash_l4", "Spreads flows over equal-cost routes by port too, not only by address."),
     ("irq_local", "One queue IRQ per CPU of the port's NUMA node ({cpus} CPUs), fixed: no cross-node memory traffic."),
     ("keep", "{profile} keeps the kernel's value."),
+    ("lockup", "A CPU stuck in the kernel (20 s, or 10 s with interrupts off) does not come back: reboot, and the next boot shows the trace (system.crash.print)."),
+    ("lockup_vm", "In a virtual machine the host may stop a vCPU for that long: a reboot would be a false alarm."),
     ("lro", "LRO rewrites headers and cannot be undone: a router must not forward what it built (the kernel turns it off with forwarding)."),
     ("min_free", "A reserve for allocations in interrupts (NIC rings): {share} of the RAM."),
     ("neigh", "{entries} neighbors for {mem} of RAM; the other thresholds at 1/2 and 1/8 of it."),
@@ -236,6 +238,10 @@ pub fn recommend(profile: Profile, m: &Machine) -> BTreeMap<&'static str, Rec> {
             }
             "kernel.panic" => Some(rec("panic", 10, &[])),
             "kernel.panic_on_oops" => Some(rec("oops", 1, &[])),
+            "kernel.softlockup_panic" | "kernel.hardlockup_panic" if m.sys.virtual_machine => {
+                Some(rec("lockup_vm", 0, &[]))
+            }
+            "kernel.softlockup_panic" | "kernel.hardlockup_panic" => Some(rec("lockup", 1, &[])),
             "net.ipv4.tcp_syncookies" => Some(rec("default", 1, &[])),
             "net.ipv6.route.max_size" => match m.sys.kernel_version() {
                 Some(v) if v < (6, 3) => Some(rec(

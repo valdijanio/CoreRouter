@@ -226,13 +226,15 @@ CONFIG_HARDLOCKUP_DETECTOR=y
 CONFIG_HARDLOCKUP_DETECTOR_PREFER_BUDDY=y
 CONFIG_DETECT_HUNG_TASK=y
 # The end of the log of a panic, kept across the reboot (/sys/fs/pstore):
-# in the server firmware's own store (ACPI ERST, below). In UEFI variables
-# only when asked (efi_pstore.pstore_disable=0): they share the NVRAM the
-# A/B update writes its boot entries to, and nothing clears them yet.
+# in the server firmware's own store (ACPI ERST, below), else in UEFI
+# variables (G1.6zx). Those share the NVRAM the A/B update writes its boot
+# entries to: the daemon saves each record to /config/crash and erases it
+# at the next boot, and turns efi_pstore off for the boot when the NVRAM is
+# short (apps/corerouter-daemon/src/service/crash_log.rs, docs/os-image.md).
 CONFIG_PSTORE=y
 CONFIG_PSTORE_COMPRESS=y
 CONFIG_EFI_VARS_PSTORE=y
-CONFIG_EFI_VARS_PSTORE_DEFAULT_DISABLE=y
+# CONFIG_EFI_VARS_PSTORE_DEFAULT_DISABLE is not set
 # PCIe errors (a bad riser, cable or card) and their containment.
 CONFIG_PCIEAER=y
 CONFIG_PCIE_DPC=y
