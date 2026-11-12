@@ -842,8 +842,11 @@ impl Cgnat {
             return;
         }
         ui.add_space(4.0);
-        // Three cards: the limit, the p99 peak, who hit the limit.
-        let width = ((ui.available_width() - 16.0) / 3.0).max(180.0);
+        // Three cards: the limit, the p99 peak, who hit the limit; G2.7d: a
+        // blocks-mode pool, a fourth, who found no free block.
+        let blocks_mode = text(&d, "mode") == "blocks";
+        let cards = if blocks_mode { 4.0 } else { 3.0 };
+        let width = ((ui.available_width() - 16.0) / cards).max(180.0);
         ui.horizontal(|ui| {
             let card = |me: &mut Self, ui: &mut Ui, key: &'static str, title: &'static str, big: String, small: String, tone: Option<chip::Tone>| {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -884,6 +887,19 @@ impl Cgnat {
             );
             let tone = if hit > 0 { chip::RED.tone(ui.visuals()) } else { chip::GREEN.tone(ui.visuals()) };
             card(self, ui, "cgnat.capacity.hit", "Hit the limit, 24 h", hit.to_string(), small, Some(tone));
+            if blocks_mode {
+                let none = d.get("no_block_24h").and_then(Value::as_u64).unwrap_or(0);
+                // Short: the card is a quarter of the window.
+                let small = format!(
+                    "{}/{} {} · ICMP {}",
+                    text(&d, "blocks_in_use"),
+                    text(&d, "blocks"),
+                    tr(l, "blocks in use"),
+                    text(&d, "no_block_icmp_24h")
+                );
+                let tone = if none > 0 { chip::RED.tone(ui.visuals()) } else { chip::GREEN.tone(ui.visuals()) };
+                card(self, ui, "cgnat.capacity.no_block", "No free block, 24 h", none.to_string(), small, Some(tone));
+            }
         });
         ui.add_space(6.0);
         // The distribution of the 7-day peaks.
@@ -923,7 +939,7 @@ impl Cgnat {
             self.info(ui, l, "cgnat.capacity.suggestion", "Suggestion");
         });
         let Some(sug) = d.get("suggestion").cloned() else {
-            ui.weak(tr(l, "No suggestion: no readings yet, or a blocks-mode pool (grow max_blocks instead)."));
+            ui.weak(tr(l, "No suggestion: no readings yet."));
             return;
         };
         let now = text(&d, "ports_per_subscriber");
@@ -1277,6 +1293,8 @@ fn static_reason(r: &str) -> &'static str {
     match r {
         "already right" => "already right",
         "more than 1 % of the subscribers ran out of ports in 24 h" => "more than 1 % of the subscribers ran out of ports in 24 h",
+        "the pool ran out of blocks: fewer ports per block fit everyone" => "the pool ran out of blocks: fewer ports per block fit everyone",
+        "the pool ran out of blocks: more public addresses" => "the pool ran out of blocks: more public addresses",
         _ => "p99 of the 7-day peaks plus 25 %",
     }
 }

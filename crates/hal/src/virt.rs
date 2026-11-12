@@ -93,6 +93,10 @@ pub struct VirtualHal {
     /// refusals the lab makes up for it.
     cgnat_full: Vec<std::net::Ipv4Addr>,
     exhausted_polls: u64,
+    /// G2.7d: the subscribers last handed out as waiting for a block: the
+    /// ones still without one were refused by the blocks queue (the pool
+    /// had none), as the kernel does.
+    cgnat_waited: Vec<crate::cgnat::Waiting>,
     /// The lab's "kernel" (G1.3): what each apply left, which a test (or
     /// a lab script) can change behind CoreRouter's back to make drift.
     kernel: LabKernel,
@@ -277,6 +281,7 @@ impl VirtualHal {
             blocks: BTreeMap::new(),
             cgnat_full: Vec::new(),
             exhausted_polls: 0,
+            cgnat_waited: Vec::new(),
             kernel: Arc::new(Mutex::new(kernel)),
             oslog: crate::oslog::LabOsLog::default(),
             neigh: crate::lab_neigh::LabNeigh::default(),
@@ -731,18 +736,40 @@ impl Hal for VirtualHal {
 
     /// The lab's exhaustion: every 10th poll, one in three of the nearly
     /// full subscribers (the same ones each time) had 4 new connections
-    /// refused and got 2 ICMP (the rate limit held back the rest).
+    /// refused and got 2 ICMP (the rate limit held back the rest). G2.7d:
+    /// every poll, a subscriber that waited for a block and got none was
+    /// refused once, with an ICMP (the blocks queue's refusal).
     fn cgnat_exhausted(
         &mut self,
     ) -> (
         Vec<(std::net::Ipv4Addr, crate::cgnat::Hit)>,
         crate::cgnat::ExhaustionStats,
     ) {
+        let waited = std::mem::take(&mut self.cgnat_waited);
+        let mut hits: Vec<_> = waited
+            .iter()
+            .filter(|w| !self.blocks.contains_key(&(w.pool, w.subscriber)))
+            .map(|w| {
+                (
+                    w.subscriber,
+                    crate::cgnat::Hit {
+                        refused: 1,
+                        icmp: 1,
+                    },
+                )
+            })
+            .collect();
+        let no_block = hits.len() as u64;
         self.exhausted_polls = self.exhausted_polls.wrapping_add(1);
         if !self.exhausted_polls.is_multiple_of(10) {
-            return (Vec::new(), crate::cgnat::ExhaustionStats::default());
+            let stats = crate::cgnat::ExhaustionStats {
+                refused: no_block,
+                icmp: no_block,
+                ..crate::cgnat::ExhaustionStats::default()
+            };
+            return (hits, stats);
         }
-        let hits: Vec<_> = self
+        let full: Vec<_> = self
             .cgnat_full
             .iter()
             .filter(|a| u32::from(**a).is_multiple_of(3))
@@ -756,13 +783,14 @@ impl Hal for VirtualHal {
                 )
             })
             .collect();
-        let n = hits.len() as u64;
+        let n = full.len() as u64;
+        hits.extend(full);
         (
             hits,
             crate::cgnat::ExhaustionStats {
                 seen: n * 6,
-                refused: n * 4,
-                icmp: n * 2,
+                refused: n * 4 + no_block,
+                icmp: n * 2 + no_block,
                 limited: n * 2,
                 untracked: 0,
                 overrun: 0,
@@ -771,7 +799,9 @@ impl Hal for VirtualHal {
     }
 
     fn cgnat_waiting(&mut self) -> Vec<crate::cgnat::Waiting> {
-        crate::lab_conntrack::waiting(&self.applied, &self.blocks)
+        let w = crate::lab_conntrack::waiting(&self.applied, &self.blocks);
+        self.cgnat_waited.clone_from(&w);
+        w
     }
 
     fn connections(&mut self) -> Result<Vec<crate::conntrack::Conn>, HalError> {

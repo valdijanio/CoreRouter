@@ -31,6 +31,9 @@ pub const MAX_SUBSCRIBERS: usize = 262_144;
 /// **estimado**).
 pub const SAVE_SECS: u64 = 600;
 const MAX_LINE: usize = 256;
+/// Pools whose hourly rings a journal may bring back (the config has at
+/// most a few dozen; a hostile journal cannot grow the map).
+const MAX_POOL_RINGS: usize = 1024;
 
 /// One subscriber's daily peaks: `v[d % DAYS]` is day `d`'s, for the
 /// [`DAYS`] days up to `last` (day numbers since the Unix epoch).
@@ -88,8 +91,23 @@ pub struct CapacityStore {
     hours: BTreeMap<String, [Hour; 24]>,
     /// Subscribers refused, with the time of the last refusal.
     refused: HashMap<Ipv4Addr, u64>,
+    /// G2.7d: refusals because the pool had no free block (blocks mode),
+    /// per pool and hour, apart from a subscriber out of its own ports.
+    full_hours: BTreeMap<String, [Hour; 24]>,
+    /// G2.7d: subscribers refused for lack of a free block, with the time.
+    no_block: HashMap<Ipv4Addr, u64>,
     saved: Option<u64>,
     pub untracked: u64,
+}
+
+/// The refusals and ICMP of the 24 h before `now` in an hourly ring.
+fn day_of_ring(ring: Option<&[Hour; 24]>, now: u64) -> (u64, u64) {
+    let hour = now / 3600;
+    ring.map_or((0, 0), |ring| {
+        ring.iter()
+            .filter(|h| h.hour + 24 > hour && h.hour <= hour)
+            .fold((0, 0), |(r, i), h| (r + h.refused, i + h.icmp))
+    })
 }
 
 pub fn day_of(t: u64) -> u32 {
@@ -130,6 +148,34 @@ impl CapacityStore {
         }
     }
 
+    /// G2.7d: refusals of `subscriber` at `now` because blocks-mode `pool`
+    /// had no free block (it never had ports of its own to run out of).
+    pub fn pool_full(&mut self, now: u64, pool: &str, subscriber: Ipv4Addr, refused: u64, icmp: u64) {
+        let hour = now / 3600;
+        let ring = self.full_hours.entry(pool.to_owned()).or_default();
+        if let Some(h) = ring.get_mut((hour % 24) as usize) {
+            if h.hour != hour {
+                *h = Hour { hour, ..Hour::default() };
+            }
+            h.refused = h.refused.saturating_add(refused);
+            h.icmp = h.icmp.saturating_add(icmp);
+        }
+        if self.no_block.len() < MAX_SUBSCRIBERS || self.no_block.contains_key(&subscriber) {
+            self.no_block.insert(subscriber, now);
+        }
+    }
+
+    /// G2.7d: whether `subscriber` found no free block in the 24 h before
+    /// `now`.
+    pub fn no_block_since(&self, subscriber: Ipv4Addr, since: u64) -> bool {
+        self.no_block.get(&subscriber).is_some_and(|t| *t >= since)
+    }
+
+    /// G2.7d: refusals and ICMP of `pool` for lack of a free block, 24 h.
+    pub fn pool_full_day(&self, pool: &str, now: u64) -> (u64, u64) {
+        day_of_ring(self.full_hours.get(pool), now)
+    }
+
     /// The 7-day peak of `subscriber`, if it was ever seen.
     pub fn peak(&self, subscriber: Ipv4Addr, now: u64) -> Option<u16> {
         self.peaks.get(&subscriber).map(|p| p.peak(day_of(now)))
@@ -142,12 +188,7 @@ impl CapacityStore {
 
     /// Refusals and ICMP of `pool` in the 24 h before `now`.
     pub fn pool_day(&self, pool: &str, now: u64) -> (u64, u64) {
-        let hour = now / 3600;
-        self.hours.get(pool).map_or((0, 0), |ring| {
-            ring.iter()
-                .filter(|h| h.hour + 24 > hour && h.hour <= hour)
-                .fold((0, 0), |(r, i), h| (r + h.refused, i + h.icmp))
-        })
+        day_of_ring(self.hours.get(pool), now)
     }
 
     pub fn subscribers(&self) -> usize {
@@ -161,7 +202,8 @@ impl CapacityStore {
     }
 
     /// The journal text: `p <ip> <last> <v0> … <v6>`, `h <hour> <refused>
-    /// <icmp> <pool>`, `r <ip> <time>`.
+    /// <icmp> <pool>`, `r <ip> <time>`; G2.7d: `f <hour> <refused> <icmp>
+    /// <pool>` and `n <ip> <time>` for the pool without a free block.
     fn text(&self, now: u64) -> String {
         let mut out = String::with_capacity(self.peaks.len() * 48);
         let today = day_of(now);
@@ -182,6 +224,14 @@ impl CapacityStore {
         }
         for (ip, t) in self.refused.iter().filter(|(_, t)| **t + 86_400 > now) {
             let _ = writeln!(out, "r {ip} {t}");
+        }
+        for (pool, ring) in &self.full_hours {
+            for h in ring.iter().filter(|h| h.hour + 24 > now / 3600) {
+                let _ = writeln!(out, "f {} {} {} {pool}", h.hour, h.refused, h.icmp);
+            }
+        }
+        for (ip, t) in self.no_block.iter().filter(|(_, t)| **t + 86_400 > now) {
+            let _ = writeln!(out, "n {ip} {t}");
         }
         out
     }
@@ -211,7 +261,7 @@ impl CapacityStore {
                     self.peaks.insert(ip, Peaks { last, v });
                 }
             }
-            "h" => {
+            kind @ ("h" | "f") => {
                 let hour: u64 = w.next()?.parse().ok()?;
                 let refused: u64 = w.next()?.parse().ok()?;
                 let icmp: u64 = w.next()?.parse().ok()?;
@@ -219,15 +269,20 @@ impl CapacityStore {
                 if pool.is_empty() || pool.len() > 64 {
                     return None;
                 }
-                if let Some(h) = self.hours.entry(pool).or_default().get_mut((hour % 24) as usize) {
+                let rings = if kind == "h" { &mut self.hours } else { &mut self.full_hours };
+                if rings.len() >= MAX_POOL_RINGS && !rings.contains_key(&pool) {
+                    return None;
+                }
+                if let Some(h) = rings.entry(pool).or_default().get_mut((hour % 24) as usize) {
                     *h = Hour { hour, refused, icmp };
                 }
             }
-            "r" => {
+            kind @ ("r" | "n") => {
                 let ip: Ipv4Addr = w.next()?.parse().ok()?;
                 let t: u64 = w.next()?.parse().ok()?;
-                if self.refused.len() < MAX_SUBSCRIBERS {
-                    self.refused.insert(ip, t);
+                let map = if kind == "r" { &mut self.refused } else { &mut self.no_block };
+                if map.len() < MAX_SUBSCRIBERS {
+                    map.insert(ip, t);
                 }
             }
             _ => return None,
@@ -307,6 +362,23 @@ mod tests {
         assert_eq!(back.pool_day("c1", t), (4, 2));
         assert!(back.refused_since(a, t - 10));
         assert_eq!(back.pool_day("c1", t + 25 * 3600), (0, 0), "a day later, gone");
+    }
+
+    /// G2.7d: a refusal for lack of a free block is counted apart from a
+    /// subscriber out of its own ports, and survives the journal.
+    #[test]
+    fn a_full_pool_is_counted_apart_and_round_trips() {
+        let t = 1_780_000_000;
+        let mut s = CapacityStore::default();
+        let a: Ipv4Addr = "100.64.7.236".parse().unwrap();
+        s.pool_full(t, "teste", a, 3, 1);
+        assert_eq!(s.pool_day("teste", t), (0, 0));
+        assert!(!s.refused_since(a, t - 10));
+        let mut back = CapacityStore::default();
+        assert_eq!(back.replay(&s.text(t)), 0);
+        assert_eq!(back.pool_full_day("teste", t), (3, 1));
+        assert!(back.no_block_since(a, t - 10));
+        assert_eq!(back.pool_full_day("teste", t + 25 * 3600), (0, 0));
     }
 
     proptest! {

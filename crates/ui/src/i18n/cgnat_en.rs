@@ -51,6 +51,12 @@ Subscribers per band of their 7-day peak, as a share of the limit.",
 Subscribers with new connections refused for lack of a port in 24 h, the refusals and the ICMP sent (RFC 6888 REQ-11).",
     ),
     (
+        "cgnat.capacity.no_block",
+        "## No free block, 24 h
+
+Blocks-mode subscribers that got no block at all in 24 h because the pool had none free, the connections refused for it and the ICMP sent (RFC 6888 REQ-11); below, the blocks in use of those the public addresses hold. The pool ran out, not the subscriber: more public addresses or fewer ports per block.",
+    ),
+    (
         "cgnat.capacity.p99",
         "## Peak p99, 7 days
 
