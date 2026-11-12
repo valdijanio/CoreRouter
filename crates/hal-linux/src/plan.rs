@@ -39,7 +39,20 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use corerouter_hal::HalError;
-use corerouter_hal::drift::{self, Snapshot, active_addresses, master};
+use corerouter_hal::drift::{self, Snapshot, active_addresses};
+
+/// The master a link gets from this plan. A Wi-Fi bridge port (G1.30a: an
+/// access point) is put in its bridge by hostapd (`bridge=`), after it
+/// turned the interface into an access point: before that the kernel
+/// refuses a station in a bridge (`IFF_DONT_BRIDGE`), and the commit would
+/// fail on a radio that is about to be one.
+fn master<'a>(cfg: &'a Config, name: &IfName) -> Option<&'a IfName> {
+    let i = cfg.interfaces.get(name)?;
+    if matches!(i.kind, InterfaceKind::Wifi(_)) && i.bridge.is_some() {
+        return None;
+    }
+    drift::master(cfg, name)
+}
 pub use corerouter_hal::drift::{KernelDiscard, KernelRoute, kernel_routes};
 use corerouter_model::os_loopback::{is_os_address, is_os_loopback};
 use corerouter_model::routes::Dst;
@@ -1242,6 +1255,32 @@ mod tests {
                     master: Some(n("br1"))
                 },
             ]
+        );
+    }
+
+    /// G1.30a: hostapd puts an access point in its bridge, not the plan
+    /// (a station is refused by the kernel until hostapd changes its type).
+    #[test]
+    fn an_access_point_joins_its_bridge_through_hostapd() {
+        let mut from = base();
+        add(&mut from, "br0", InterfaceKind::Bridge);
+        let ap = corerouter_model::wifi::WifiConfig {
+            mode: corerouter_model::wifi::WifiMode::Ap,
+            ..Default::default()
+        };
+        add(&mut from, "wifi1", InterfaceKind::Wifi(Box::new(ap)));
+        let mut to = from.clone();
+        to.interfaces.get_mut(&n("wifi1")).unwrap().bridge = Some(n("br0"));
+        let ops = plan(&from, &to).unwrap();
+        assert!(
+            !ops.iter().any(|o| matches!(o, Op::SetMaster { .. })),
+            "{ops:?}"
+        );
+        assert!(
+            !plan(&to, &from)
+                .unwrap()
+                .iter()
+                .any(|o| matches!(o, Op::SetMaster { .. }))
         );
     }
 

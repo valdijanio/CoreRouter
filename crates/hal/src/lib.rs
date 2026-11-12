@@ -22,6 +22,7 @@ pub mod lab_flow;
 pub mod lab_neigh;
 pub mod lab_wifi;
 pub mod lab_wifi_air;
+pub mod lab_wifi_ap;
 pub mod link_reader;
 pub mod lsp;
 pub mod mpls;
@@ -43,6 +44,7 @@ pub mod system_resource;
 pub mod tuning;
 pub mod virt;
 pub mod wifi;
+pub mod wifi_ap;
 pub mod wifi_monitor;
 pub mod xdp;
 pub mod xdp_nat;
@@ -398,6 +400,15 @@ pub trait Hal: Send {
     fn wifi_port(&mut self, name: &IfName) -> Result<Box<dyn wifi::WifiPort>, HalError> {
         Err(HalError::Unsupported(format!(
             "{} has no Wi-Fi (asked for '{name}')",
+            self.describe()
+        )))
+    }
+
+    /// Open the radio of Wi-Fi interface `name` as an access point
+    /// (G1.30a): announce a network, read its clients.
+    fn wifi_ap_port(&mut self, name: &IfName) -> Result<Box<dyn wifi_ap::WifiApPort>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no Wi-Fi access point (asked for '{name}')",
             self.describe()
         )))
     }

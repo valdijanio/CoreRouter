@@ -333,6 +333,8 @@ struct Air {
     country_calls: u32,
     /// Radios without spectral scan (a test's).
     no_spectral: Vec<IfName>,
+    /// G1.30a: the radios that are access points.
+    pub(crate) aps: BTreeMap<IfName, crate::lab_wifi_ap::LabAp>,
 }
 
 /// The lab's air: shared by the HAL, its radios and a test that wants to
@@ -349,6 +351,7 @@ impl Default for LabWifi {
             blocked: false,
             country_calls: 0,
             no_spectral: Vec::new(),
+            aps: BTreeMap::new(),
         })))
     }
 }
@@ -658,6 +661,9 @@ impl LabWifi {
                 max_power_dbm: Some(max),
                 radar,
                 disabled: false,
+                // G1.30a: channels 12 and 13 only answer here (a country
+                // that lets no access point start on them).
+                no_ir: (2467..=2472).contains(&mhz),
             };
             WifiRadio {
                 driver: Some("lab_wifi".into()),
@@ -695,6 +701,7 @@ impl LabWifi {
                 }),
                 monitor: Some(true),
                 monitor_shared: Some(true),
+                ap: Some(true),
             }
         })
     }
@@ -719,12 +726,36 @@ impl LabWifi {
         self.air().country_calls
     }
 
-    /// Is radio `name` on a network now?
+    /// Is radio `name` on a network now (or, G1.30a, an access point that
+    /// is up)?
     pub fn connected(&self, name: &IfName) -> bool {
-        self.air()
-            .radios
+        let air = self.air();
+        air.radios
             .get(name)
             .is_some_and(|r| r.state == WifiState::Connected)
+            || air.aps.get(name).is_some_and(crate::lab_wifi_ap::LabAp::up)
+    }
+
+    /// G1.30a: the radio's access point, made if it is not there.
+    pub(crate) fn with_ap<R>(
+        &self,
+        name: &IfName,
+        f: impl FnOnce(&mut crate::lab_wifi_ap::LabAp) -> R,
+    ) -> R {
+        f(self.air().aps.entry(name.clone()).or_default())
+    }
+
+    /// G1.30a: radio `name` as an access point.
+    pub fn ap_port(&self, name: &IfName) -> Result<Box<dyn crate::wifi_ap::WifiApPort>, HalError> {
+        if !self.has_radio(name) {
+            return Err(HalError::Unsupported(format!(
+                "'{name}' is not a Wi-Fi radio of the lab"
+            )));
+        }
+        Ok(Box::new(crate::lab_wifi_ap::LabApPort {
+            air: self.clone(),
+            name: name.clone(),
+        }))
     }
 
     /// Times radio `name` was told to join (a test's: no rejoin on a tick).

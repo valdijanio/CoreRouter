@@ -537,6 +537,8 @@ mod spectral;
 pub(crate) const SECRET_FIELDS: [&str; 2] = ["psk", "sae_password"];
 
 #[cfg(target_os = "linux")]
+pub(crate) use io::{Ctrl, runtime_dir, turn_of, unblock};
+#[cfg(target_os = "linux")]
 pub use io::{LinuxWifiPort, radio, regdomain, set_country};
 
 #[cfg(target_os = "linux")]
@@ -607,6 +609,12 @@ mod io {
 
     /// Where the supplicant's sockets live: `<runtime>/wpa`, ours alone.
     fn dir() -> Result<PathBuf, HalError> {
+        runtime_dir("wpa")
+    }
+
+    /// `<runtime>/<sub>`, ours alone, with `if/` in it: the sockets of a
+    /// daemon of ours (`wpa`, `hostapd`).
+    pub(crate) fn runtime_dir(sub: &str) -> Result<PathBuf, HalError> {
         let base = std::env::var_os("COREROUTER_RUNTIME_DIR")
             .filter(|d| !d.is_empty())
             .map(PathBuf::from)
@@ -616,7 +624,7 @@ mod io {
                     .map(|d| PathBuf::from(d).join("corerouter"))
             })
             .unwrap_or_else(|| PathBuf::from("/run/corerouter"));
-        let dir = base.join("wpa");
+        let dir = base.join(sub);
         if dir.as_os_str().len() > MAX_SOCKET_PATH - 32 {
             return Err(HalError::Io(format!(
                 "the runtime directory {} is too long for a socket path",
@@ -635,8 +643,11 @@ mod io {
             .map_or_else(|| PathBuf::from(DEFAULT_BINARY), PathBuf::from)
     }
 
-    /// One client socket of a control interface.
-    struct Ctrl {
+    /// One client socket of a control interface (wpa_supplicant's, and
+    /// hostapd's: the same protocol, G1.30a).
+    pub(crate) struct Ctrl {
+        /// Whose socket it is, for the errors.
+        who: &'static str,
         sock: UnixDatagram,
         local: PathBuf,
         /// A reply never came: it may still come, and would be read as the
@@ -646,11 +657,21 @@ mod io {
 
     impl Ctrl {
         fn connect(dir: &Path, server: &Path) -> std::io::Result<Self> {
+            Self::connect_as("wpa_supplicant", dir, server)
+        }
+
+        /// A client of `who`'s socket `server`, bound in `dir`.
+        pub(crate) fn connect_as(
+            who: &'static str,
+            dir: &Path,
+            server: &Path,
+        ) -> std::io::Result<Self> {
             let n = CLIENT.fetch_add(1, Ordering::Relaxed);
             let local = dir.join(format!("c{}-{n}", std::process::id()));
             let _ = std::fs::remove_file(&local);
             let sock = UnixDatagram::bind(&local)?;
             let made = Self {
+                who,
                 sock,
                 local,
                 stale: std::cell::Cell::new(false),
@@ -662,14 +683,14 @@ mod io {
 
         /// One command, one reply. `what` names it in an error (a command
         /// with a key in it is never shown).
-        fn request(&self, command: &str, what: &str) -> Result<String, HalError> {
+        pub(crate) fn request(&self, command: &str, what: &str) -> Result<String, HalError> {
             self.request_within(command, what, REPLY_TIMEOUT)
         }
 
         /// [`request`](Self::request) with its own deadline. A reply that
         /// does not come in time ends the socket: the next command on it
         /// fails at once instead of reading that reply as its own.
-        fn request_within(
+        pub(crate) fn request_within(
             &self,
             command: &str,
             what: &str,
@@ -677,15 +698,18 @@ mod io {
         ) -> Result<String, HalError> {
             if command.len() > MAX_COMMAND {
                 return Err(HalError::Rejected(format!(
-                    "wpa_supplicant: {what}: too long"
+                    "{}: {what}: too long",
+                    self.who
                 )));
             }
+            let err =
+                |e: &dyn std::fmt::Display| HalError::Io(format!("{}: {what}: {e}", self.who));
             if self.stale.get() {
-                return Err(io_err(what, "an earlier reply never came"));
+                return Err(err(&"an earlier reply never came"));
             }
             let late = |e: &dyn std::fmt::Display| {
                 self.stale.set(true);
-                io_err(what, e)
+                err(e)
             };
             self.sock.send(command.as_bytes()).map_err(|e| late(&e))?;
             let deadline = Instant::now() + within;
@@ -709,24 +733,30 @@ mod io {
         }
 
         /// A command whose reply is `OK`.
-        fn ok(&self, command: &str, what: &str) -> Result<(), HalError> {
+        pub(crate) fn ok(&self, command: &str, what: &str) -> Result<(), HalError> {
             self.ok_within(command, what, REPLY_TIMEOUT)
         }
 
-        fn ok_within(&self, command: &str, what: &str, within: Duration) -> Result<(), HalError> {
+        pub(crate) fn ok_within(
+            &self,
+            command: &str,
+            what: &str,
+            within: Duration,
+        ) -> Result<(), HalError> {
             let r = self.request_within(command, what, within)?;
             if r.trim() == "OK" {
                 Ok(())
             } else {
                 Err(HalError::Rejected(format!(
-                    "wpa_supplicant refused {what} ({})",
+                    "{} refused {what} ({})",
+                    self.who,
                     r.trim().chars().take(32).collect::<String>()
                 )))
             }
         }
 
         /// What arrived without being asked for, without waiting.
-        fn pending(&self, max: usize) -> Vec<String> {
+        pub(crate) fn pending(&self, max: usize) -> Vec<String> {
             let mut out = Vec::new();
             if self.sock.set_nonblocking(true).is_err() {
                 return out;
@@ -804,7 +834,7 @@ mod io {
     /// Lift the soft block of the radio behind `name` (the airplane-mode
     /// key, a state the firmware kept): an interface the configuration has
     /// enabled is meant to be on. A hard block (a switch) cannot be lifted.
-    fn unblock(name: &str) {
+    pub(crate) fn unblock(name: &str) {
         let phy = Path::new("/sys/class/net").join(name).join("phy80211");
         let Ok(dir) = std::fs::read_dir(&phy) else {
             return;
@@ -835,6 +865,14 @@ mod io {
         /// The supplicant started if it is not there, and the radio handed
         /// to it; the sockets' directory and the supplicant's binary given.
         fn open_at(name: &IfName, dir: PathBuf, binary: &Path) -> Result<Self, HalError> {
+            // G1.30a: an access point on this radio lets go first (a daemon
+            // restarted after the mode changed).
+            if let Ok(hdir) = runtime_dir("hostapd")
+                && hdir.join("global").exists()
+                && let Ok(h) = Ctrl::connect_as("hostapd", &hdir, &hdir.join("global"))
+            {
+                let _ = h.request(&format!("REMOVE {name}"), "REMOVE");
+            }
             let global = global(&dir, binary)?;
             let ifaces = dir.join("if");
             let known = global.request("INTERFACES", "INTERFACES")?;
@@ -1197,7 +1235,7 @@ mod io {
     }
 
     /// The lock a radio's thread holds while it lives, by the radio's name.
-    fn turn_of(name: &str) -> Arc<Mutex<()>> {
+    pub(crate) fn turn_of(name: &str) -> Arc<Mutex<()>> {
         static TURNS: Mutex<BTreeMap<String, Arc<Mutex<()>>>> = Mutex::new(BTreeMap::new());
         let mut turns = TURNS.lock().unwrap_or_else(PoisonError::into_inner);
         Arc::clone(turns.entry(name.to_owned()).or_default())
@@ -1390,6 +1428,7 @@ mod io {
                     r.antennas_rx = w.antennas_rx;
                     r.monitor = w.monitor;
                     r.monitor_shared = w.monitor_shared;
+                    r.ap = w.ap;
                     r.phy = w.name.or(r.phy);
                 }
                 Err(e) => log::debug!("wifi {name}: nl80211 wiphy: {e}"),

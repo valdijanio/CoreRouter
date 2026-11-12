@@ -17,7 +17,7 @@
 use corerouter_hal::wifi::{BssSecurity, WifiState};
 use corerouter_model::sealed::Sealed;
 use corerouter_model::wifi::{
-    Country, WifiBand, WifiSecurity, WifiStation, passphrase_problem, ssid_problem,
+    Country, WifiBand, WifiConfig, WifiMode, WifiSecurity, passphrase_problem, ssid_problem,
 };
 use corerouter_model::{Config, IfName, Interface, InterfaceKind, MacAddr};
 use serde_json::{Value, json};
@@ -41,7 +41,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set Wi-Fi",
         ["Interfaces", "Wi-Fi"],
         None,
-        "{name: string, ssid?: string (the network's name, 1 to 32 bytes; empty: forget the network), security?: string (auto | wpa3 | wpa2 | open; auto: WPA3 if the access point offers it, else WPA2), passphrase?: string (write-only, sealed at rest: 8 to 63 characters, or the 64-digit key with security=wpa2; another ssid needs its own), hidden?: bool (the network does not announce its name), band?: string (2ghz | 5ghz | 6ghz; empty or any: whichever the network is on), bssid?: string (only this access point; empty: any), disabled?: bool (default true: a radio is off until it is told to join a network), comment?: string, mtu?: int (68..=2304), force?: bool (change the network of the radio this connection comes through, outside Safe Mode)} → {name, warnings}",
+        "{name: string, mode?: string (station | ap; ap: announce the network instead of joining it, G1.30a), ssid?: string (the network's name, 1 to 32 bytes; empty: forget the network), security?: string (auto | wpa3 | wpa2 | open; auto: WPA3 if the access point offers it, else WPA2; as an access point, both at once), passphrase?: string (write-only, sealed at rest: 8 to 63 characters, or the 64-digit key with security=wpa2; another ssid needs its own), hidden?: bool (the network does not announce its name), band?: string (2ghz | 5ghz | 6ghz; empty or any: whichever the network is on; as an access point, the band of an automatic channel), bssid?: string (only this access point; empty: any; station only), frequency?: string (access point: MHz (5180), a channel (36) or auto: the quietest channel without radar detection), width?: string (access point: 20 | 40 | 80 | 160 MHz or auto: 20 on 2.4 GHz, up to 80 on 5 GHz), disabled?: bool (default true: a radio is off until it is told to join a network), comment?: string, mtu?: int (68..=2304), force?: bool (change the network or the mode of the radio this connection comes through, outside Safe Mode)} → {name, warnings}",
         has_radios,
         set
     ),
@@ -96,10 +96,10 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{} → {country, in_force (what the kernel applies now; 00: the world domain), error, enabled (Wi-Fi interfaces that need it)}",
         always, country_get),
     cmd!(query "interface.wifi.list", "Wi-Fi", ["Interfaces", "Wi-Fi"], None,
-        "{show_sensitive?: bool (the passphrases in clear; group full)} → [{name, mode, ssid, security, passphrase, hidden, band, bssid, mtu, mac_address, disabled, comment, running, state (disabled | no-country | idle | searching | connecting | connected | blocked | error | absent), connected_bssid, frequency, channel, signal, rate, failure, driver}]",
+        "{show_sensitive?: bool (the passphrases in clear; group full)} → [{name, mode (station | ap), ssid, security, passphrase, hidden, band, bssid, mtu, mac_address, disabled, comment, running, state (disabled | no-country | idle | searching | connecting | connected | blocked | error | absent; access point: starting | radar-check | no-ir | running | failed), connected_bssid, frequency, channel, signal, rate, failure, driver, configured_frequency, configured_width, width (access point), clients (access point)}]",
         always, list),
     cmd!(query "interface.wifi.monitor", "Wi-Fi Monitor", [], None,
-        "{name: string} → {name, state, ssid, bssid, frequency, band, channel, signal, rate, security, pmf, uptime_secs, reconnects, failure: {code (wrong-key | not-found | rejected | no-answer | error), text, time}, error, country, country_in_force, country_error, driver, self_managed, quality (excellent | good | fair | poor), noise, snr, width, center_frequency, generation, standard, cipher, tx_rate: {mbps, mode, mcs, nss, width, guard_ns, text}, rx_rate: {mbps, mode, mcs, nss, width, guard_ns, text}, signal_avg, beacon_signal, chain_signal: [int], tx_packets, rx_packets, tx_retries, tx_failed, retry_percent, beacon_loss, inactive_ms, addresses: [{address, dynamic}]}",
+        "{name: string} → {name, mode (ap: an access point's own fields: width, center_frequency, auto_channel, radar, radar_check_secs, standard, uptime_secs, clients, error), state, ssid, bssid, frequency, band, channel, signal, rate, security, pmf, uptime_secs, reconnects, failure: {code (wrong-key | not-found | rejected | no-answer | error), text, time}, error, country, country_in_force, country_error, driver, self_managed, quality (excellent | good | fair | poor), noise, snr, width, center_frequency, generation, standard, cipher, tx_rate: {mbps, mode, mcs, nss, width, guard_ns, text}, rx_rate: {mbps, mode, mcs, nss, width, guard_ns, text}, signal_avg, beacon_signal, chain_signal: [int], tx_packets, rx_packets, tx_retries, tx_failed, retry_percent, beacon_loss, inactive_ms, addresses: [{address, dynamic}]}",
         has_radios, monitor),
     cmd!(query "interface.wifi.radio", "Wi-Fi Radio", [], None,
         "{name: string} → {name, phy, driver, firmware, self_managed, blocked (soft | hard | null), standards: [string], bands: [{band (2ghz | 5ghz | 6ghz), standards: [string], max_width, allowed, dfs, max_power, channels: [{mhz, channel, max_power, radar, disabled}]}], antennas_tx, antennas_rx, tx_power, max_tx_power (here, on the channel in use), frequency, country, country_in_force}",
@@ -114,11 +114,11 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{name?: string, limit?: int (newest first, default 100)} → [{seq, time, name, event (joining | connected | disconnected | failed | blocked | unblocked | error), message}]",
         always, history),
     cmd!(query "interface.wifi.preview", "Wi-Fi Preview", [], None,
-        "{id: string (the radio), ssid?: string, security?: string, passphrase?: string, hidden?: bool, band?: string, bssid?: string, disabled?: bool, comment?: string, mtu?: int 68..2304} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk}",
+        "{id: string (the radio), mode?: string, frequency?: string, width?: string, ssid?: string, security?: string, passphrase?: string, hidden?: bool, band?: string, bssid?: string, disabled?: bool, comment?: string, mtu?: int 68..2304} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk}",
         has_radios, preview),
 ];
 
-fn radios(cfg: &Config) -> impl Iterator<Item = (&IfName, &Interface, &WifiStation)> {
+fn radios(cfg: &Config) -> impl Iterator<Item = (&IfName, &Interface, &WifiConfig)> {
     cfg.interfaces.iter().filter_map(|(n, i)| match &i.kind {
         InterfaceKind::Wifi(st) => Some((n, i, &**st)),
         _ => None,
@@ -133,7 +133,7 @@ pub(super) fn has_radios(s: &Session) -> std::result::Result<(), String> {
     }
 }
 
-pub(super) fn radio_of<'a>(cfg: &'a Config, name: &IfName) -> Result<(&'a Interface, &'a WifiStation)> {
+pub(super) fn radio_of<'a>(cfg: &'a Config, name: &IfName) -> Result<(&'a Interface, &'a WifiConfig)> {
     match cfg.interfaces.get(name) {
         Some(i) => match &i.kind {
             InterfaceKind::Wifi(st) => Ok((i, st)),
@@ -219,6 +219,24 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
             Some(b.parse::<MacAddr>().map_err(|e| EngineError::bad("bssid", e.to_string()))?)
         };
     }
+    // G1.30a: the mode and an access point's channel.
+    if let Some(m) = opt_str(p, "mode")? {
+        st.mode = WifiMode::parse(m.trim()).ok_or_else(|| {
+            EngineError::bad(
+                "mode",
+                format!(
+                    "'{}' is not a mode: use station or ap",
+                    m.chars().take(16).collect::<String>()
+                ),
+            )
+        })?;
+    }
+    if let Some(f) = super::wifi_ap::parse_frequency(p)? {
+        st.frequency = f;
+    }
+    if let Some(w) = super::wifi_ap::parse_width(p)? {
+        st.width = w;
+    }
     let mtu = match opt_u32(p, "mtu")? {
         Some(m) if (MIN_MTU..=MAX_MTU).contains(&m) => u16::try_from(m).ok(),
         Some(m) => {
@@ -275,8 +293,11 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     // a batch (an import) may set the two in any order.
     let off = disabled.unwrap_or(was_off);
 
+    // G1.30a: what the radio can do as an access point, and what changing
+    // the mode means.
+    let iface_now = iface_of(s, &name)?;
+    let mut warnings = super::wifi_ap::check(s, &name, &iface_now, &st, old.mode)?;
     // Losing the network this connection comes through.
-    let mut warnings = Vec::new();
     let cuts = (!was_off && off) || (!was_off && st != old);
     if cuts
         && let Some(w) = guard_link(
@@ -323,6 +344,10 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     }
     iface.kind = InterfaceKind::Wifi(Box::new(st));
     Ok(json!({ "name": name, "warnings": warnings }))
+}
+
+fn iface_of(s: &Session, name: &IfName) -> Result<Interface> {
+    radio_of(s.store().candidate(), name).map(|(i, _)| i.clone())
 }
 
 fn enable(s: &mut Session, p: &Value) -> Result<Value> {
@@ -464,6 +489,9 @@ fn state_of(s: &Session, cfg: &Config, name: &IfName, iface: &Interface, present
     if cfg.system.wifi.country.is_none() {
         return "no-country";
     }
+    if matches!(&iface.kind, InterfaceKind::Wifi(st) if st.mode == WifiMode::Ap) {
+        return super::wifi_ap::ap_state(s, name);
+    }
     match s.wifi().and_then(|rt| rt.radios.get(name)) {
         Some(r) if r.error.is_some() => "error",
         // With no network to look for, the supplicant's own scans (after a
@@ -517,7 +545,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                 .and_then(|l| l.mac.clone())
                 .or_else(|| i.mac.map(|m| m.to_string()));
             let frequency = status.and_then(|st| st.frequency_mhz);
-            Some(json!({
+            let mut row = json!({
                 "name": i.name,
                 "mode": st.mode.as_str(),
                 "ssid": st.ssid,
@@ -539,7 +567,19 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                 "rate": status.and_then(|st| st.rate_mbps),
                 "failure": r.and_then(|r| r.failure.as_ref()).map(|(f, _)| f.code()),
                 "driver": r.and_then(|r| r.hardware.as_ref()).and_then(|h| h.driver.clone()),
-            }))
+                "configured_frequency": st.frequency,
+                "configured_width": st.width,
+                "width": Value::Null,
+                "clients": Value::Null,
+            });
+            // G1.30a: an access point's channel and clients.
+            if st.mode == WifiMode::Ap
+                && let (Value::Object(o), Value::Object(ap)) =
+                    (&mut row, super::wifi_ap::list_fields(s, &i.name))
+            {
+                o.extend(ap);
+            }
+            Some(row)
         })
         .collect();
     Ok(Value::Array(out))
@@ -552,6 +592,31 @@ fn monitor(s: &mut Session, p: &Value) -> Result<Value> {
     let in_force = s.hal_mut().wifi_regdomain();
     let cfg = s.store().candidate();
     let (iface, st) = radio_of(cfg, &name)?;
+    // G1.30a: an access point has its own.
+    if st.mode == WifiMode::Ap {
+        let mut out = super::wifi_ap::monitor(s, &name, st);
+        let mac = live
+            .iter()
+            .find(|l| l.name == name)
+            .and_then(|l| l.mac.clone())
+            .or_else(|| iface.mac.map(|m| m.to_string()));
+        let driver = s
+            .wifi()
+            .and_then(|rt| rt.radios.get(&name))
+            .and_then(|r| r.hardware.as_ref())
+            .and_then(|h| h.driver.clone());
+        if let Value::Object(o) = &mut out {
+            // An access point's BSSID is its radio's MAC.
+            o.insert("bssid".into(), json!(mac));
+            o.insert("driver".into(), json!(driver));
+            o.insert("name".into(), json!(name));
+            o.insert("state".into(), json!(state_of(s, cfg, &name, iface, present)));
+            o.insert("country".into(), json!(cfg.system.wifi.country.map(|c| c.to_string())));
+            o.insert("country_in_force".into(), json!(in_force));
+            o.insert("addresses".into(), addresses_on(s, &name));
+        }
+        return Ok(out);
+    }
     let rt = s.wifi();
     let now = rt.map_or(0, |rt| rt.now_ms);
     let r = rt.and_then(|rt| rt.radios.get(&name));
@@ -635,7 +700,7 @@ fn quality(dbm: i32) -> &'static str {
 }
 
 /// `6` → `802.11ax`.
-fn standard_of(generation: u8) -> Option<&'static str> {
+pub(super) fn standard_of(generation: u8) -> Option<&'static str> {
     match generation {
         4 => Some("802.11n"),
         5 => Some("802.11ac"),
@@ -646,14 +711,14 @@ fn standard_of(generation: u8) -> Option<&'static str> {
 }
 
 /// Retries per hundred frames sent, one decimal; `None` before the first.
-fn retry_percent(retries: Option<u64>, packets: Option<u64>) -> Option<f64> {
+pub(super) fn retry_percent(retries: Option<u64>, packets: Option<u64>) -> Option<f64> {
     let (r, p) = (retries?, packets?);
     (p > 0).then(|| ((r as f64 / p as f64) * 1000.0).round() / 10.0)
 }
 
 /// A rate as JSON, with the line the GUI shows: `576.5 Mbit/s, HE-MCS 11,
 /// 2 streams, 80 MHz, GI 0.8 µs`.
-fn rate_json(r: &corerouter_hal::wifi::WifiRate) -> Value {
+pub(super) fn rate_json(r: &corerouter_hal::wifi::WifiRate) -> Value {
     let mbps = r.kbps.map(|k| (f64::from(k) / 100.0).round() / 10.0);
     let mut parts = Vec::new();
     if let Some(m) = mbps {
@@ -879,7 +944,7 @@ fn preview(s: &mut Session, p: &Value) -> Result<Value> {
         // An empty field of the modal is "not given" where empty is not a
         // value. (An empty ssid forgets the network; an empty band or
         // bssid is "any".)
-        for k in ["security", "passphrase", "mtu"] {
+        for k in ["security", "passphrase", "mtu", "mode"] {
             if o
                 .get(k)
                 .and_then(Value::as_str)
@@ -911,6 +976,11 @@ fn preview(s: &mut Session, p: &Value) -> Result<Value> {
             let Some((iface, st)) = name.as_ref().and_then(|n| radio_of(cfg, n).ok()) else {
                 return Vec::new();
             };
+            if st.mode == WifiMode::Ap
+                && let Some(n) = name.as_ref()
+            {
+                return super::wifi_ap::computed(s, n, iface, st);
+            }
             let line = |label: &str, value: String| json!({"label": label, "value": value});
             if st.ssid.is_empty() {
                 return vec![line("Network", "none: the radio joins nothing".into())];

@@ -265,7 +265,7 @@ pub enum InterfaceKind {
     /// A Wi-Fi radio in station mode (G1.30, RouterOS type `wifi`): there
     /// because the card is, like an Ethernet port; the network it joins in
     /// [`crate::wifi`].
-    Wifi(Box<crate::wifi::WifiStation>),
+    Wifi(Box<crate::wifi::WifiConfig>),
 }
 
 impl InterfaceKind {

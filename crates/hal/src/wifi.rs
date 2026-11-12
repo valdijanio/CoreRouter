@@ -406,6 +406,8 @@ pub struct WifiRadio {
     /// G1.30j: a monitor interface runs beside the station, which stays
     /// connected (mac80211 drivers: monitor is a software interface type).
     pub monitor_shared: Option<bool>,
+    /// G1.30a: the driver offers access point mode (`None`: not known).
+    pub ap: Option<bool>,
 }
 
 /// One band of a radio (nl80211 wiphy bands).
@@ -431,6 +433,9 @@ pub struct WifiChannel {
     pub radar: bool,
     /// Not allowed in the domain in force.
     pub disabled: bool,
+    /// G1.30a: no initiating radiation here (`NO_IR`): a station may
+    /// answer an access point, but no access point may start on it.
+    pub no_ir: bool,
 }
 
 /// Bounds on what a platform reports about one radio.

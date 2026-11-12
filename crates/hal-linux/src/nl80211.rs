@@ -131,10 +131,14 @@ const BAND_IFTYPE_ATTR_HE_CAP_PHY: u16 = 3;
 const BAND_IFTYPE_ATTR_EHT_CAP_PHY: u16 = 9;
 /// `enum nl80211_iftype` (l. 3758).
 const IFTYPE_STATION: u16 = 2;
+/// G1.30a: `NL80211_IFTYPE_AP` (l. 3762).
+const IFTYPE_AP: u32 = 3;
 
 // `enum nl80211_frequency_attr` (l. 4590).
 const FREQUENCY_ATTR_FREQ: u16 = 1;
 const FREQUENCY_ATTR_DISABLED: u16 = 2;
+/// G1.30a: no initiating radiation (l. 4594).
+const FREQUENCY_ATTR_NO_IR: u16 = 3;
 const FREQUENCY_ATTR_RADAR: u16 = 5;
 /// u32, mBm.
 const FREQUENCY_ATTR_MAX_TX_POWER: u16 = 6;
@@ -330,6 +334,23 @@ pub(crate) fn station<'a>(
         .map(|i| link(i.nested()))
 }
 
+/// G1.30a: every station of a dump (an access point's clients), with its
+/// MAC; at most `max`.
+pub(crate) fn stations<'a>(
+    messages: impl IntoIterator<Item = &'a [u8]>,
+    max: usize,
+) -> Vec<(String, WifiLink)> {
+    messages
+        .into_iter()
+        .filter_map(|m| {
+            let info = find(attrs(m), ATTR_STA_INFO)?;
+            let mac = find(attrs(m), ATTR_MAC).and_then(|a| mac_text(&a))?;
+            Some((mac, link(info.nested())))
+        })
+        .take(max)
+        .collect()
+}
+
 /// G1.30i: one channel of a survey dump; `None` without a frequency.
 /// A time of zero is no measure (the drivers leave the channels they did
 /// not count at zero), and busy beyond active is not believed.
@@ -422,6 +443,7 @@ impl Band {
                 FREQUENCY_ATTR_FREQ => ch.mhz = u32_of(&a).unwrap_or(0),
                 FREQUENCY_ATTR_DISABLED => ch.disabled = true,
                 FREQUENCY_ATTR_RADAR => ch.radar = true,
+                FREQUENCY_ATTR_NO_IR => ch.no_ir = true,
                 FREQUENCY_ATTR_MAX_TX_POWER => ch.max_power_dbm = u32_of(&a).map(mbm),
                 _ => {}
             }
@@ -490,6 +512,8 @@ pub(crate) struct Wiphy {
     /// G1.30j: monitor among its software types (mac80211's: they need no
     /// interface combination, so a monitor runs beside the station).
     pub monitor_shared: Option<bool>,
+    /// G1.30a: access point among the interface types the wiphy offers.
+    pub ap: Option<bool>,
 }
 
 impl Wiphy {
@@ -527,6 +551,8 @@ impl Wiphy {
                 ATTR_SUPPORTED_IFTYPES => {
                     let has = a.nested().any(|t| u32::from(t.kind) == IFTYPE_MONITOR);
                     self.monitor = Some(has || self.monitor == Some(true));
+                    let ap = a.nested().any(|t| u32::from(t.kind) == IFTYPE_AP);
+                    self.ap = Some(ap || self.ap == Some(true));
                 }
                 ATTR_SOFTWARE_IFTYPES => {
                     if a.nested().any(|t| u32::from(t.kind) == IFTYPE_MONITOR) {
@@ -581,7 +607,7 @@ mod io {
         ATTR_MNTR_FLAGS, ATTR_SPLIT_WIPHY_DUMP, ATTR_WIPHY, ATTR_WIPHY_FREQ, CMD_DEL_INTERFACE,
         CMD_GET_INTERFACE, CMD_GET_STATION, CMD_GET_SURVEY, CMD_GET_WIPHY, CMD_NEW_INTERFACE,
         CMD_SET_CHANNEL, IFTYPE_MONITOR, MAX_SURVEY, MAX_WIPHY_MESSAGES, MNTR_FLAG_CONTROL,
-        MNTR_FLAG_OTHER_BSS, Wiphy, station, survey, tx_power,
+        MNTR_FLAG_OTHER_BSS, Wiphy, station, stations, survey, tx_power,
     };
     use crate::genl::{Genl, GenlError, Msg, attrs, find};
     use corerouter_hal::wifi::WifiSurvey;
@@ -592,6 +618,8 @@ mod io {
     /// Stations of a station dump taken at most (one: the access point;
     /// a few with MLO).
     const MAX_STATIONS: usize = 16;
+    /// G1.30a: an access point's clients read at most.
+    const MAX_AP_STATIONS: usize = corerouter_hal::wifi_ap::MAX_CLIENTS;
 
     /// A generic netlink socket with the nl80211 family looked up.
     pub(crate) struct Nl80211 {
@@ -621,6 +649,19 @@ mod io {
             m.u32(ATTR_IFINDEX, ifindex);
             let replies = self.genl.call_up_to(m.finish(), seq, MAX_STATIONS)?;
             Ok(station(replies.iter().map(|(_, a)| a.as_slice()), bssid))
+        }
+
+        /// G1.30a: the stations of the access point behind `ifindex`, at
+        /// most [`MAX_AP_STATIONS`].
+        pub fn stations(&mut self, ifindex: u32) -> Result<Vec<(String, WifiLink)>, GenlError> {
+            let seq = self.genl.next_seq();
+            let mut m = Msg::dump(self.family, CMD_GET_STATION, 0, seq);
+            m.u32(ATTR_IFINDEX, ifindex);
+            let replies = self.genl.call_up_to(m.finish(), seq, MAX_AP_STATIONS)?;
+            Ok(stations(
+                replies.iter().map(|(_, a)| a.as_slice()),
+                MAX_AP_STATIONS,
+            ))
         }
 
         /// G1.30i: the survey of the radio behind `ifindex`, a channel per
@@ -1195,12 +1236,14 @@ mod tests {
                     max_power_dbm: Some(20),
                     radar: false,
                     disabled: false,
+                    no_ir: false,
                 },
                 WifiChannel {
                     mhz: 2484,
                     max_power_dbm: Some(20),
                     radar: false,
                     disabled: true,
+                    no_ir: false,
                 },
             ]
         );

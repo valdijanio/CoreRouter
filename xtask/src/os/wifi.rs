@@ -31,6 +31,14 @@
 //!   radio as the management port, the country, the network out of the
 //!   scan, a passphrase that is wrong first, a fixed address;
 //!
+//! - G1.30a (`--only ap` runs it alone): the router's radio as an access
+//!   point and the test's radio as its client (the image's own
+//!   `wpa_supplicant`, with a file on `/tmp`): the channel the router
+//!   chooses, hostapd up with nothing on disk, the client in the
+//!   registration table with WPA3 and then WPA2, a wrong passphrase said
+//!   in words, the access point in a bridge (hostapd's `bridge=`), and
+//!   hostapd ended when the radio goes back to station.
+//!
 //! What it cannot show: a card. Firmware loading, a driver's quirks and the
 //! airplane-mode key are the notebook's.
 
@@ -839,6 +847,183 @@ fn run(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(), S
     Ok(())
 }
 
+/// G1.30a: the access point's passphrase, a test value on a disposable VM.
+const AP_PASS: &str = "senha-do-ap-teste";
+const AP_SSID: &str = "CoreRouter-AP";
+/// The test's radio, as the access point's client.
+const CLIENT_MAC: &str = "02:00:00:00:00:00";
+
+/// A client on the test's radio (`wifi1`): the image's `wpa_supplicant`
+/// with its own file and socket directory on `/tmp`, nothing of the
+/// router's.
+fn client(vm: &mut Vm, log: &mut std::fs::File, key_mgmt: &str, pass: &str) -> Result<(), String> {
+    let pmf = if key_mgmt == "SAE" { 2 } else { 1 };
+    // One line for the console: `printf` turns each `\n` into a newline,
+    // and `'` keeps the shell's hands off the quotes.
+    let conf = [
+        "ctrl_interface=/tmp/sta".to_owned(),
+        "sae_pwe=2".to_owned(),
+        "network={".to_owned(),
+        format!(" ssid=\"{AP_SSID}\""),
+        format!(" key_mgmt={key_mgmt}"),
+        format!(" ieee80211w={pmf}"),
+        format!(" psk=\"{pass}\""),
+        format!(" sae_password=\"{pass}\""),
+        "}".to_owned(),
+    ]
+    .join("\\n");
+    let out = sh(
+        vm,
+        log,
+        &format!(
+            "{{ kill $(cat /tmp/sta.pid 2>/dev/null) 2>/dev/null; sleep 0.3; printf '{conf}\\n' > /tmp/sta.conf && wpa_supplicant -B -i wifi1 -c /tmp/sta.conf -P /tmp/sta.pid && echo STA-UP; }}"
+        ),
+    )?;
+    check(
+        out.contains("STA-UP"),
+        format!("the client did not start: {out}"),
+    )
+}
+
+/// The registration table's row of the test's client, once it is there
+/// and through the handshake.
+fn registered(vm: &mut Vm, log: &mut std::fs::File, security: &str) -> Result<Value, String> {
+    let v = until(
+        vm,
+        log,
+        30,
+        "interface.wifi.registration-table.print",
+        r#"{"interface":"wifi2"}"#,
+        |v| {
+            v["result"].as_array().is_some_and(|a| {
+                a.iter().any(|c| {
+                    c["mac_address"] == CLIENT_MAC
+                        && c["authorized"] == true
+                        && c["security"] == security
+                })
+            })
+        },
+    )?;
+    Ok(v["result"]
+        .as_array()
+        .and_then(|a| a.iter().find(|c| c["mac_address"] == CLIENT_MAC))
+        .cloned()
+        .unwrap_or(Value::Null))
+}
+
+/// G1.30a: the router as an access point, end to end.
+fn ap_mode(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(), String> {
+    until(vm, log, 30, "interface.wifi.list", "{}", |v| {
+        v["result"]
+            .as_array()
+            .is_some_and(|a| a.len() == 1 && a[0]["name"] == "wifi2")
+    })?;
+    vm.ok(log, "interface.wifi.country.set", r#"{"country":"BR"}"#)?;
+    // Refused before anything starts, with the reason.
+    for (params, needle) in [
+        (
+            r#"{"name":"wifi2","mode":"ap","ssid":"x","passphrase":"senha-do-ap-teste","frequency":"6115"}"#,
+            "6 GHz",
+        ),
+        (
+            r#"{"name":"wifi2","mode":"ap","ssid":"x","passphrase":"senha-do-ap-teste","bssid":"02:00:00:00:09:00"}"#,
+            "bssid",
+        ),
+    ] {
+        let e = vm.run(log, "interface.wifi.set", params)?;
+        check(
+            e["ok"] == false && e.to_string().contains(needle),
+            format!("{params} must be refused with '{needle}': {e}"),
+        )?;
+    }
+    // A bridge for the clients, the radio in it.
+    vm.ok(log, "interface.bridge.add", r#"{"name":"bridge1"}"#)?;
+    let t = Instant::now();
+    let r = set(
+        vm,
+        log,
+        &serde_json::json!({"name": "wifi2", "mode": "ap", "ssid": AP_SSID, "passphrase": AP_PASS,
+                            "disabled": false}),
+    )?;
+    vm.ok(
+        log,
+        "interface.bridge.port.add",
+        r#"{"bridge":"bridge1","interface":"wifi2"}"#,
+    )?;
+    let m = monitor(vm, log, 40, |m| m["state"] == "running")?;
+    let up_s = t.elapsed().as_secs_f64();
+    nums.put(
+        "access point",
+        format!(
+            "up in {up_s:.1} s on channel {} ({} MHz wide, chosen: {}); warnings {}",
+            m["channel"], m["width"], m["auto_channel"], r["warnings"]
+        ),
+    );
+    // hostapd from the image, the passphrase on no disk and no command line.
+    let out = sh(
+        vm,
+        log,
+        &format!(
+            "{{ for p in $(pidof hostapd); do tr '\\0' ' ' < /proc/$p/cmdline; echo; done; grep -rl '{AP_PASS}' /run /config /tmp/tt 2>/dev/null; readlink /sys/class/net/wifi2/master; echo .; }}"
+        ),
+    )?;
+    check(
+        out.contains("/usr/sbin/hostapd") && !out.contains(AP_PASS) && out.contains("bridge1"),
+        format!("hostapd, the passphrase and the bridge: {out}"),
+    )?;
+    // The test's radio joins with WPA3, then WPA2.
+    let t = Instant::now();
+    client(vm, log, "SAE", AP_PASS)?;
+    let c = registered(vm, log, "wpa3")?;
+    let sae_s = t.elapsed().as_secs_f64();
+    client(vm, log, "WPA-PSK", AP_PASS)?;
+    registered(vm, log, "wpa2")?;
+    nums.put(
+        "client of the access point",
+        format!(
+            "WPA3 in {sae_s:.1} s ({}, signal {}), then WPA2",
+            c["standard"], c["signal"]
+        ),
+    );
+    // A wrong passphrase, in words.
+    client(vm, log, "WPA-PSK", "esta-nao-e-a-senha")?;
+    until(
+        vm,
+        log,
+        30,
+        "interface.wifi.history",
+        r#"{"name":"wifi2"}"#,
+        |v| v.to_string().contains("wrong passphrase on the client"),
+    )?;
+    sh(vm, log, "{ kill $(cat /tmp/sta.pid); echo .; }")?;
+    // Back to a station: out of the bridge first, then hostapd ends.
+    vm.ok(
+        log,
+        "interface.bridge.port.remove",
+        r#"{"bridge":"bridge1","interface":"wifi2"}"#,
+    )?;
+    set(
+        vm,
+        log,
+        &serde_json::json!({"name": "wifi2", "mode": "station", "ssid": ""}),
+    )?;
+    let gone = sh(
+        vm,
+        log,
+        "{ i=0; while [ $i -lt 50 ] && pidof hostapd >/dev/null; do sleep 0.2; i=$((i+1)); done; pidof hostapd >/dev/null || echo gone; echo .; }",
+    )?;
+    check(
+        gone.contains("gone"),
+        "hostapd still runs with no access point",
+    )?;
+    monitor(vm, log, 20, |m| m["mode"] != "ap" && m["state"] == "idle")?;
+    nums.put(
+        "back to station",
+        "out of the bridge, hostapd ended, the radio idle",
+    );
+    Ok(())
+}
+
 /// The station's MAC (`mac80211_hwsim`'s second radio).
 const STA_MAC: &str = "02:00:00:00:01:00";
 
@@ -1010,8 +1195,8 @@ pub fn wifi_test(root: &Path, images: &Path, args: &[String]) -> Result<(), Stri
         match a.as_str() {
             "--tcg" => tcg = true,
             "--only" => match it.next().map(String::as_str) {
-                Some(s @ ("commands" | "setup")) => only = Some(s.to_owned()),
-                _ => return Err("--only takes commands or setup".into()),
+                Some(s @ ("commands" | "setup" | "ap")) => only = Some(s.to_owned()),
+                _ => return Err("--only takes commands, setup or ap".into()),
             },
             other => return Err(format!("unknown argument '{other}'")),
         }
@@ -1065,6 +1250,24 @@ pub fn wifi_test(root: &Path, images: &Path, args: &[String]) -> Result<(), Stri
             )
             .unwrap_or_default();
             eprintln!("   MONITOR {m}\n   CONSOLES {diag}");
+            return Err(e);
+        }
+        vm.poweroff(&mut log)?;
+    }
+    if wants("ap") {
+        let mut vm = boot(&work, images, &tools, kvm, &mut log)?;
+        vm.expect_all(&mut log, &booted, 120)?;
+        if let Err(e) = ap_mode(&mut vm, &mut log, &mut nums) {
+            let diag = sh(
+                &mut vm,
+                &mut log,
+                "{ ls /sys/class/net; pidof hostapd wpa_supplicant; grep -iE 'wifi|hostapd|wireless' /var/log/corerouter-daemon.log | tail -n 20; dmesg | tail -n 15; }",
+            )
+            .unwrap_or_default();
+            let h = vm
+                .run(&mut log, "interface.wifi.history", "{}")
+                .unwrap_or_default();
+            eprintln!("   DIAG {diag}\n   HISTORY {h}");
             return Err(e);
         }
         vm.poweroff(&mut log)?;
