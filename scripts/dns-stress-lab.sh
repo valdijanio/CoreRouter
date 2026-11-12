@@ -1867,6 +1867,12 @@ test_soak() {
 	origin_delay 5
 	flush
 	warm hot
+	# The mix asks statics and a zone (test qps loads them; soak may run
+	# alone).
+	mcp_open
+	statics_load
+	cr ip.dns.zone.print '{"name":"zn.lab"}' | jq -e 'length > 0' >/dev/null || zone_load zn.lab "$ZONE_N" z
+	mcp_close
 	local rate=${SOAK_RATE:-10000} t=0 end=$((SECONDS + SOAK_SECS)) row first="" last=""
 	say "A mistura (85 % cache, 5 % estáticos, 5 % zona, 5 % miss) a $rate/s, mais nomes únicos a 50/s;"
 	say "uma linha por minuto em soak.csv."

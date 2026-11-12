@@ -1093,7 +1093,7 @@ consultas/s por núcleo sem contar o socket.
 **Faltas de cache sob carga (G4.1r).** A bateria `scripts/dns-stress-lab.sh` (`docs/dns-stress.md`)
 mostrou duas coisas no caminho do miss, corrigidas no mesmo trabalho:
 
-- *Uma thread criada por miss* custava ~240 µs de CPU por resposta com a origem rápida; o perfil
+- *Uma thread criada por miss* custava ~210 µs de CPU por resposta com a origem rápida (VM; ~67 µs depois); o perfil
   dava ~60 % em `pthread_create`, pilha e guarda (`mmap`/`mprotect`/`munmap`) e arena do malloc,
   ~13 % na troca com o servidor. Agora os workers ficam para o próximo miss
   (`dns_server/pool.rs`: fila sem teto próprio porque o portão `max_concurrent_queries` já limita

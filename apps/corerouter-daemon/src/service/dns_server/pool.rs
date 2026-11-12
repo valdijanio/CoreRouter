@@ -3,8 +3,8 @@
 //! before; the threads now stay for the next miss instead of being created
 //! and torn down for each one.
 //!
-//! Why: with a fast upstream a thread per miss cost ~240 µs of CPU per
-//! answer and capped the misses at ~13 000/s on 4 CPUs; `pthread_create`,
+//! Why: with a fast upstream a thread per miss cost ~210 µs of CPU per
+//! answer (lab VM; ~67 µs with the pool) and capped the misses at ~13 000/s on 4 CPUs; `pthread_create`,
 //! the guard page and stack (`mmap`/`mprotect`/`munmap`) and the thread's
 //! malloc arena were ~60 % of the profile, the exchange with the server
 //! ~13 % (`docs/dns-stress.md`, **medido**).

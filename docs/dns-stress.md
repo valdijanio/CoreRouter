@@ -94,8 +94,8 @@ com 2 vCPUs, 1.
 | Acerto com o cache padrão de 2 MiB | 10,5 mil | 28,9 mil | 12,7 mil | 50,6 mil | 10 mil nomes quentes não cabem: viram miss |
 
 - **O acerto de cache escala com os leitores** (~85 mil/s por leitor na VM; CPU das `dns-udp`
-  perto de 100 % cada). O miss era o gargalo: **~240 µs de CPU por miss** com uma thread criada
-  por consulta (perfil: ~60 % em `pthread_create`, pilha, `mprotect`/`munmap` e arena do malloc,
+  perto de 100 % cada). O miss era o gargalo: **~210 µs de CPU por miss** (CPU do daemon / misses por segundo, VM) com uma
+  thread criada por consulta; depois, ~67 µs (perfil: ~60 % em `pthread_create`, pilha, `mprotect`/`munmap` e arena do malloc,
   ~13 % na troca com o servidor). Com os workers reaproveitados: 12,2 → 47,3 mil misses/s.
 - **O cache padrão de 2 MiB guarda 3 192 respostas** (o `cache_size` do RouterOS é em KiB; a conta
   é ~690 B por resposta). Um roteador de ISP precisa de dezenas a centenas de MiB.
