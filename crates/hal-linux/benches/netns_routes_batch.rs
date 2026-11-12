@@ -39,13 +39,18 @@ fn main() {
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    // `ip -o link` prints a veth as `bng0@bng0p`: the name is before the `@`.
     let names: Vec<&str> = text
         .lines()
         .filter_map(|l| l.split(':').nth(1))
-        .map(str::trim)
+        .map(|n| n.trim().split('@').next().unwrap_or(""))
         .collect();
+    // The slow path's own `bng0` ↔ `bng0p` veth pair and bridge `bng0br`
+    // (`pppoe_io`, G4.3y), from an earlier run in the same namespace.
     assert!(
-        names.iter().all(|n| *n == "lo" || *n == "bng0"),
+        names
+            .iter()
+            .all(|n| matches!(*n, "lo" | "bng0" | "bng0p" | "bng0br")),
         "{ENV}=1 but this namespace is not fresh ({names:?}); refusing to touch it"
     );
     let mut c = criterion::Criterion::default().configure_from_args();

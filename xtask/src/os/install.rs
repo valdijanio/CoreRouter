@@ -767,21 +767,60 @@ fn run_params(d: &serde_json::Value, typed: &str, code: Option<&str>) -> String 
     p.to_string()
 }
 
-/// `system.install.print` until the job ended; its result.
-fn install_result(t: &T, cli: &Path, port: u16) -> Result<serde_json::Value, String> {
+/// `system.install.print` until the job ended; its result. G0.30j: a daemon
+/// killed in the middle (by the kernel, out of memory) comes back with a
+/// new, empty install state: the console says so, and the failure shows it;
+/// and an install that ended must have cost no process its life.
+fn install_result(
+    t: &T,
+    cli: &Path,
+    port: u16,
+    vm: &mut Vm,
+    log: &mut std::fs::File,
+) -> Result<serde_json::Value, String> {
     let deadline = Instant::now() + Duration::from_secs(300);
-    loop {
+    let r = loop {
         let v = install_print(t, cli, port)?;
         if v["job"].is_null() && !v["result"].is_null() {
-            return Ok(v["result"].clone());
+            break v["result"].clone();
         }
-        check(
-            Instant::now() < deadline,
-            format!("install did not end: {v}"),
-        )?;
+        if Instant::now() >= deadline {
+            let said: Vec<String> = vm
+                .drain(log)
+                .into_iter()
+                .filter(|l| DIED.iter().any(|p| l.contains(p)))
+                .collect();
+            return Err(format!(
+                "install did not end: {v}; the console: {}",
+                if said.is_empty() {
+                    "nothing about a process that died".to_owned()
+                } else {
+                    said.join(" | ")
+                }
+            ));
+        }
         std::thread::sleep(Duration::from_millis(300));
+    };
+    let res = live_cli(t, cli, port, "system.resource.print", "{}")?;
+    let oom = serde_json::from_str::<serde_json::Value>(res.trim())
+        .ok()
+        .and_then(|v| v["oom_kills"].as_u64());
+    if oom != Some(0) {
+        let said: Vec<String> = vm
+            .drain(log)
+            .into_iter()
+            .filter(|l| DIED.iter().any(|p| l.contains(p)))
+            .collect();
+        return Err(format!(
+            "the kernel killed {oom:?} processes for memory during the install: {}",
+            said.join(" | ")
+        ));
     }
+    Ok(r)
 }
+
+/// What the console says when a process dies.
+const DIED: [&str; 4] = ["Out of memory", "Killed process", "exited", "panicked"];
 
 /// What the install wrote, alone, with the ISO still in the drive; `nic` is
 /// the QEMU card.
@@ -904,7 +943,7 @@ fn live_install(t: &mut T) -> Result<(), String> {
     p["mgmt_port"] = serde_json::json!("ether1");
     p["mgmt_mode"] = serde_json::json!("dhcp");
     live_cli(t, &cli, port, "system.install.run", &p.to_string())?;
-    let r = install_result(t, &cli, port)?;
+    let r = install_result(t, &cli, port, &mut vm, &mut log)?;
     check(r["ok"] == true, format!("install: {r}"))?;
     check(r["boot_entry"].is_string(), format!("boot entry: {r}"))?;
     check(
@@ -995,7 +1034,7 @@ fn live_install(t: &mut T) -> Result<(), String> {
     p["mgmt_gateway"] = serde_json::json!("10.0.2.2");
     p["mgmt_dns"] = serde_json::json!(["10.0.2.3"]);
     live_cli(t, &cli, port, "system.install.run", &p.to_string())?;
-    let r = install_result(t, &cli, port)?;
+    let r = install_result(t, &cli, port, &mut vm, &mut log)?;
     check(r["ok"] == true, format!("install: {r}"))?;
     check(
         r["first_boot_error"].is_null(),
@@ -1198,7 +1237,7 @@ fn live_modules(t: &mut T) -> Result<(), String> {
     p["mgmt_port"] = serde_json::json!("ether1");
     p["mgmt_mode"] = serde_json::json!("dhcp");
     live_cli(t, &cli, port, "system.install.run", &p.to_string())?;
-    let r = install_result(t, &cli, port)?;
+    let r = install_result(t, &cli, port, &mut vm, &mut log)?;
     check(r["ok"] == true, format!("install: {r}"))?;
     live_cli(t, &cli, port, "system.reboot", r#"{"confirm":true}"#)?;
     vm.wait_exit(&mut log, 60)?;
@@ -1313,7 +1352,7 @@ fn live_sd(t: &mut T) -> Result<(), String> {
     p["mgmt_mode"] = serde_json::json!("dhcp");
     let installing = Instant::now();
     live_cli(t, &cli, port, "system.install.run", &p.to_string())?;
-    let r = install_result(t, &cli, port)?;
+    let r = install_result(t, &cli, port, &mut vm, &mut log)?;
     check(r["ok"] == true, format!("install to the card: {r}"))?;
     t.n.put(
         "sd card: installed from the live image",
