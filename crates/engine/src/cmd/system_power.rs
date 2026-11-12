@@ -131,6 +131,23 @@ fn preview(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(out)
 }
 
+/// G4.3x: what refuses a restart unless forced, for every command that
+/// restarts the router (`system.reboot`, an update's reboot): Safe Mode,
+/// which the boot undoes, and uncommitted changes, which are lost. `what`
+/// names the restart in the message.
+pub(super) fn restart_guard(s: &Session, what: &str, force: bool) -> Result<()> {
+    if force {
+        return Ok(());
+    }
+    if s.in_safe_mode() {
+        return Err(EngineError::bad("force", safe_mode_message(what)));
+    }
+    if s.store().is_dirty() {
+        return Err(EngineError::bad("force", uncommitted_message(what)));
+    }
+    Ok(())
+}
+
 fn request(s: &mut Session, p: &Value, action: Action) -> Result<Value> {
     let what = action.as_str();
     // G1.6y: PID 1 counts the power-off signal as the power button while a
@@ -148,14 +165,9 @@ fn request(s: &mut Session, p: &Value, action: Action) -> Result<Value> {
         ));
     }
     let force = opt_bool(p, "force")?.unwrap_or(false);
+    restart_guard(s, what, force)?;
     let safe_mode = s.in_safe_mode();
-    if safe_mode && !force {
-        return Err(EngineError::bad("force", safe_mode_message(what)));
-    }
     let dirty = s.store().is_dirty();
-    if dirty && !force {
-        return Err(EngineError::bad("force", uncommitted_message(what)));
-    }
     let by = s.caller().name.clone();
     let p = s
         .ext_mut::<Power>()

@@ -35,7 +35,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Install and Reboot",
         [],
         None,
-        "{path: string (package file on the router), confirm?: auto|manual, timeout?: u32 (30..3600 s, default 300), reboot?: bool (default yes)} → {job, kind}",
+        "{path: string (package file on the router), confirm?: auto|manual, timeout?: u32 (30..3600 s, default 300), reboot?: bool (default yes), force?: bool (reboot even in Safe Mode, which the reboot undoes, or with uncommitted changes, which are lost)} → {job, kind}",
         always,
         update
     ),
@@ -44,7 +44,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Downgrade",
         [],
         None,
-        "{path?: string (older package; without it the other slot boots), confirm?: auto|manual, timeout?: u32 (30..3600 s), reboot?: bool} → {job, kind}",
+        "{path?: string (older package; without it the other slot boots), confirm?: auto|manual, timeout?: u32 (30..3600 s), reboot?: bool, force?: bool (reboot even in Safe Mode, which the reboot undoes, or with uncommitted changes, which are lost)} → {job, kind}",
         always,
         downgrade
     ),
@@ -75,7 +75,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Upload Package",
         [],
         None,
-        "{size: u64 (bytes of the .crpkg), check?: bool (only check it, default no), downgrade?: bool (an older package), confirm?: auto|manual, timeout?: u32 (30..3600 s, default 300), reboot?: bool (default yes)} → {job, kind, upload, chunk}",
+        "{size: u64 (bytes of the .crpkg), check?: bool (only check it, default no), downgrade?: bool (an older package), confirm?: auto|manual, timeout?: u32 (30..3600 s, default 300), reboot?: bool (default yes), force?: bool (reboot even in Safe Mode, which the reboot undoes, or with uncommitted changes, which are lost)} → {job, kind, upload, chunk}",
         always,
         upload_start
     ),
@@ -96,7 +96,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Download Package",
         [],
         None,
-        "{url: string (http:// or https:// of a .crpkg), check?: bool (only check it), downgrade?: bool, ssl_verify?: bool (default yes), confirm?: auto|manual, timeout?: u32 (30..3600 s), reboot?: bool} → {job, kind}",
+        "{url: string (http:// or https:// of a .crpkg), check?: bool (only check it), downgrade?: bool, ssl_verify?: bool (default yes), confirm?: auto|manual, timeout?: u32 (30..3600 s), reboot?: bool, force?: bool (reboot even in Safe Mode, which the reboot undoes, or with uncommitted changes, which are lost)} → {job, kind}",
         always,
         download
     ),
@@ -257,6 +257,14 @@ pub(crate) fn queue(s: &mut Session, kind: JobKind, p: &Value) -> Result<Value> 
             "a trial boot of slot {} is pending: confirm or cancel it first",
             t.get("slot").and_then(Value::as_str).unwrap_or("?")
         )));
+    }
+    // G4.3x: a job that reboots refuses Safe Mode and uncommitted changes
+    // as `system.reboot` does (on a notebook, dev.607, an update rebooted
+    // with Safe Mode on and the tuning profile applied under it was gone in
+    // silence).
+    if kind.arms_trial() && reboot {
+        let force = opt_bool(p, "force")?.unwrap_or(false);
+        super::system_power::restart_guard(s, "reboot of the update", force)?;
     }
     let mgmt = if kind.arms_trial() { mgmt(s) } else { Vec::new() };
     let tuning: Vec<(String, String)> = s
@@ -625,6 +633,51 @@ mod tests {
             take_job(&mut s).unwrap().kind,
             JobKind::SnapshotRemove { names: vec!["config-a".into()] }
         );
+    }
+
+    /// G4.3x: an update reboots, so it refuses Safe Mode and uncommitted
+    /// changes as `system.reboot` does (on a notebook, dev.607, a tuning
+    /// profile applied under Safe Mode was undone in silence by an upload);
+    /// `force` passes, and a job that does not reboot never asks.
+    #[test]
+    fn a_rebooting_job_refuses_safe_mode_and_uncommitted_changes() {
+        let mut s = Session::virtual_lab();
+        ab(&mut s);
+        s.execute("config.safe-mode.enter", &json!({})).unwrap();
+        for (id, p) in [
+            ("system.package.update", json!({"path": "/tmp/x.crpkg"})),
+            ("system.package.upload.start", json!({"size": 1000})),
+            ("system.package.download", json!({"url": "https://x/y.crpkg"})),
+            ("system.package.downgrade", json!({})),
+            ("system.tuning.boot.apply", json!({})),
+        ] {
+            let e = s.execute(id, &p).unwrap_err().to_string();
+            assert!(e.contains("Safe Mode is on") && e.contains("force=true"), "{id}: {e}");
+        }
+        assert!(take_job(&mut s).is_none());
+        // Only checking, or not rebooting: no question.
+        s.execute("system.package.upload.start", &json!({"size": 1000, "check": true}))
+            .unwrap();
+        let job = take_job(&mut s).unwrap();
+        finish(&mut s, job.id, "upload", Ok(json!({})));
+        s.execute("system.package.update", &json!({"path": "/tmp/x.crpkg", "reboot": false}))
+            .unwrap();
+        let job = take_job(&mut s).unwrap();
+        finish(&mut s, job.id, "update", Ok(json!({})));
+        // Forced: queued.
+        s.execute("system.package.update", &json!({"path": "/tmp/x.crpkg", "force": true}))
+            .unwrap();
+        let job = take_job(&mut s).unwrap();
+        finish(&mut s, job.id, "update", Ok(json!({})));
+        s.execute("config.safe-mode.exit", &json!({})).unwrap();
+        // Uncommitted changes of a transaction.
+        s.execute("config.mode.set", &json!({"mode": "transactional"})).unwrap();
+        s.execute("system.identity.set", &json!({"name": "pending"})).unwrap();
+        let e = s
+            .execute("system.package.update", &json!({"path": "/tmp/x.crpkg"}))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("uncommitted changes"), "{e}");
     }
 
     #[test]
