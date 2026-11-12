@@ -582,6 +582,19 @@ mod io {
             let fields = ap_fields(ap).ok_or_else(|| {
                 HalError::Rejected("the access point cannot be written for hostapd".into())
             })?;
+            // G1.30m: only the registered peers changed. hostapd does not
+            // know them (this thread decides who gets a link), so the
+            // access point stays up: restarting it on every peer.add threw
+            // the other end's SAE into its back-off (seen in the lab: a
+            // station-bridge that took minutes to come back).
+            if self.socks.is_some()
+                && self.error.is_none()
+                && let Some(old) = &self.told
+                && ap_fields(old) == Some(fields.clone())
+            {
+                self.told = Some(ap.clone());
+                return Ok(());
+            }
             self.told = Some(ap.clone());
             self.error = None;
             leave_supplicant(&self.name);

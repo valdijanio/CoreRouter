@@ -277,7 +277,7 @@ for mode in "${MODES[@]}"; do
 		cr crwa interface.wifi.history '{}' | tail -n 40
 		cr crwb interface.wifi.history '{}' | tail -n 40
 		for r in wifi1 wifi2; do
-			echo "--- B $r: $(cr crwb interface.wifi.monitor "{\"name\":\"$r\"}" | cut -c1-400)"
+			echo "--- B $r: $(cr crwb interface.wifi.monitor "{\"name\":\"$r\"}" | grep -oE '"(state|ssid|error|reconnects|uptime_secs|failure)":("[^"]*"|[^,}]*)' | paste -sd ' ')"
 		done
 		ip -n crwb -br link
 		ip netns exec crwb ls /run/corerouter/wpa/if 2>/dev/null
