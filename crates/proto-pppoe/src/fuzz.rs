@@ -161,7 +161,9 @@ pub fn server_stats(data: &[u8]) -> Result<crate::server::Stats, String> {
         let evs = std::mem::take(&mut out.events);
         for e in evs {
             match e {
-                Event::Authenticate { session, request } => {
+                Event::Authenticate {
+                    session, request, ..
+                } => {
                     let v = match request.verify_local("pass0") {
                         Some(sha) => AuthVerdict::Accept(Authorization {
                             mschap2_success: sha,

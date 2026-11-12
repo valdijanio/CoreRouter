@@ -667,7 +667,9 @@ impl Pair {
         let evs = std::mem::take(&mut self.so.events);
         for e in evs {
             match e {
-                Event::Authenticate { session, request } => {
+                Event::Authenticate {
+                    session, request, ..
+                } => {
                     let ok = request.verify_local("p");
                     let v = match ok {
                         Some(sha) => AuthVerdict::Accept(Authorization {
@@ -1653,4 +1655,173 @@ fn rfc2516_5_5_padt_of_a_stale_session() {
     crate::client::padt(HOST, AC, Vlans::NONE, 0, 1, &mut out);
     crate::client::padt(HOST, Mac::BROADCAST, Vlans::NONE, 7, 1, &mut out);
     assert!(out.frames.is_empty());
+}
+
+// -------------------------------------------- one-session-per-host (G4.3w)
+
+/// The sessions of the server, by SID, and how each ended.
+fn downs(out: &ServerOutput) -> Vec<(u16, DownReason)> {
+    out.events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Down {
+                session, reason, ..
+            } => Some((session.sid, *reason)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// G4.3w: a frame with a copied MAC and no password must not end the
+/// subscriber's session. On the notebook (dev.591) a CPE with the same MAC
+/// and an unknown login ("no such user") ended the authenticated session
+/// ("replaced … one-session-per-host") every time it tried. Now the old
+/// session goes only when the new one authenticates: a CPE that really
+/// rebooted still gets in.
+#[test]
+fn one_session_per_host_replaces_only_after_the_new_one_authenticates() {
+    for auth in [AuthProto::Pap, AuthProto::MsChapV2] {
+        let mut p = Pair::new(auth);
+        // No keepalive: the swapped-out client's session must stay by itself.
+        p.s.reconfigure(ServerConfig {
+            keepalive_interval_ms: 0,
+            ..p.s.config().clone()
+        });
+        p.c.start(0, &mut p.co);
+        p.run(3_000, |_, _| false);
+        assert_eq!(p.c.phase(), ClientPhase::Up, "{auth:?}");
+        let good = p.c.session_id();
+        assert_eq!(p.s.active(), 1);
+
+        // Same MAC, wrong password, three times.
+        for n in 0..3 {
+            p.c = client_with(|c| {
+                c.password = "wrong".into();
+                c.auth = AuthSet::new(&[auth]);
+                c.host_uniq = Some(vec![n]);
+            });
+            p.c.start(p.now, &mut p.co);
+            p.run(5_000, |_, _| false);
+            assert_eq!(
+                p.c.phase(),
+                ClientPhase::Closed(crate::client::ClientDown::AuthFailed),
+                "{auth:?}"
+            );
+            assert!(
+                p.s.session(good).is_some(),
+                "{auth:?}: attempt {n} ended the good session"
+            );
+            assert_eq!(p.s.active(), 1, "{auth:?}");
+            assert!(
+                !downs(&p.so)
+                    .iter()
+                    .any(|(sid, r)| *sid == good || *r == DownReason::Replaced),
+                "{auth:?}: {:?}",
+                downs(&p.so)
+            );
+            p.s.check_invariants().unwrap();
+        }
+
+        // The CPE really rebooted: the right password takes over.
+        p.c = client_with(|c| {
+            c.auth = AuthSet::new(&[auth]);
+            c.host_uniq = Some(b"back".to_vec());
+        });
+        p.c.start(p.now, &mut p.co);
+        p.run(3_000, |_, _| false);
+        assert_eq!(p.c.phase(), ClientPhase::Up, "{auth:?}");
+        assert_ne!(p.c.session_id(), good);
+        assert!(p.s.session(good).is_none(), "{auth:?}");
+        assert_eq!(p.s.active(), 1);
+        assert!(
+            downs(&p.so).contains(&(good, DownReason::Replaced)),
+            "{auth:?}: {:?}",
+            downs(&p.so)
+        );
+        p.s.check_invariants().unwrap();
+    }
+}
+
+/// G4.3w: the host's newest attempt replaces an older one still waiting
+/// (at most one waits), and `Authenticate` names the session it would take
+/// over; `replace_now` ends that one before the verdict.
+#[test]
+fn a_waiting_attempt_gives_way_to_a_newer_one_and_replace_now_ends_the_old() {
+    let mut p = Pair::new(AuthProto::Pap);
+    p.s.reconfigure(ServerConfig {
+        keepalive_interval_ms: 0,
+        ..p.s.config().clone()
+    });
+    p.c.start(0, &mut p.co);
+    p.run(3_000, |_, _| false);
+    let good = p.s.session(p.c.session_id()).unwrap();
+    let good_sid = p.c.session_id();
+    // Two attempts of the same host (new Host-Uniq each), never authenticating.
+    let mut out = ServerOutput::new();
+    let attempt = |s: &mut Server, out: &mut ServerOutput, now, uniq: &[u8]| {
+        let f = padi(HOST, |w| {
+            w.tag(tag::SERVICE_NAME, b"");
+            w.tag(tag::HOST_UNIQ, uniq);
+        });
+        s.handle_frame(now, 1, &f, out);
+        let padr = padr_from(replies(out).last().unwrap(), HOST, |_| {});
+        s.handle_frame(now, 1, &padr, out);
+        pads(out).map(|d| d.session_id).unwrap()
+    };
+    let a = attempt(&mut p.s, &mut out, p.now, b"a");
+    assert_eq!(p.s.active(), 2);
+    out.clear();
+    let b = attempt(&mut p.s, &mut out, p.now + 10, b"b");
+    assert_ne!(b, 0);
+    assert_eq!(p.s.active(), 2, "the older waiting one went");
+    assert!(
+        downs(&out).contains(&(a, DownReason::Replaced)),
+        "{:?}",
+        downs(&out)
+    );
+    assert!(p.s.session(good_sid).is_some());
+    assert!(!downs(&out).iter().any(|(sid, _)| *sid == good_sid));
+    p.s.check_invariants().unwrap();
+    let _ = good;
+    // A third one that authenticates: Authenticate names the old session.
+    p.c = client_with(|c| {
+        c.auth = AuthSet::new(&[AuthProto::Pap]);
+        c.host_uniq = Some(b"third".to_vec());
+    });
+    p.c.start(p.now, &mut p.co);
+    let mut asked = None;
+    for _ in 0..50 {
+        let sf: Vec<Vec<u8>> = p.so.frames().map(|(_, f)| f.to_vec()).collect();
+        let cf: Vec<Vec<u8>> = p.co.frames().map(|(_, f)| f.to_vec()).collect();
+        p.so.buf.clear();
+        p.so.frames.clear();
+        p.co.clear();
+        for f in sf {
+            p.c.handle_frame(p.now, &f, &mut p.co);
+        }
+        for f in cf {
+            p.s.handle_frame(p.now, 1, &f, &mut p.so);
+        }
+        if let Some(e) = p.so.events.iter().find_map(|e| match e {
+            Event::Authenticate {
+                session, replaces, ..
+            } => Some((*session, *replaces)),
+            _ => None,
+        }) {
+            asked = Some(e);
+            break;
+        }
+    }
+    let (new, replaces) = asked.expect("an Authenticate");
+    assert_eq!(replaces.map(|r| r.sid), Some(good_sid));
+    let mut o = ServerOutput::new();
+    assert!(p.s.replace_now(p.now, new, &mut o));
+    assert!(
+        downs(&o).contains(&(good_sid, DownReason::Replaced)),
+        "{:?}",
+        downs(&o)
+    );
+    assert!(p.s.session(good_sid).is_none());
+    assert!(!p.s.replace_now(p.now, new, &mut o), "only once");
+    p.s.check_invariants().unwrap();
 }
