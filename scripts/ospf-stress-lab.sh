@@ -518,6 +518,15 @@ stable() {
 }
 
 oom_seen() { dmesg | grep -q -i 'out of memory\|oom-kill'; }
+# The DUT's processes that are gone (local DUT), on stdout; false if none.
+procs_dead() {
+	[ $DUT = local ] || return 1
+	local p out=""
+	for p in $PROCS; do
+		if ! dut_pid "$p" >/dev/null; then out+="$p "; fi
+	done
+	[ -n "$out" ] && echo "$out"
+}
 
 # --- Setup and teardown.
 cleanup() {
@@ -652,7 +661,8 @@ test_lsdb() {
 		local verdict=ok
 		if [ "$t_routes" = - ]; then verdict="FAIL (LSDB incomplete: $lsas)"; fi
 		if oom_seen; then verdict="FAIL (OOM)"; fi
-		for p in $PROCS; do [ $DUT = local ] && ! dut_pid "$p" >/dev/null && verdict="FAIL ($p died)"; done
+		local dead
+		if dead=$(procs_dead); then verdict="FAIL ($dead died)"; fi
 		say "| $n | $lsas | $(awk -v a="${t_lsdb:-0}" 'BEGIN {printf "%.1f", a / 1000}') | $((routes - base_routes)) | $rate | $spf0 → $spf | ${peak// / | }$(csv_avg "$csv" ospfd_cpu)/$(csv_max "$csv" ospfd_cpu) | $(csv_avg "$csv" zebra_cpu)/$(csv_max "$csv" zebra_cpu) | $(csv_avg "$csv" daemon_cpu)/$(csv_max "$csv" daemon_cpu) | $mem | $t_purge | $verdict |"
 		if [ "$verdict" != ok ]; then
 			FAILED=1
@@ -663,7 +673,495 @@ test_lsdb() {
 	say ""
 }
 
+# --- The CLI's MCP server as a coprocess: one connection for many
+# commands (Safe Mode, batches, the latency of a warm connection).
+MCP_PID="" MCP_ID=0
+mcp_open() {
+	coproc MCP { cli_mcp 2>>"$W/mcp.err"; }
+	MCP_PID=$MCP_PID
+	exec 3>&"${MCP[1]}" 4<&"${MCP[0]}"
+	mcp_send '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ospf-stress","version":"1"}}}'
+	mcp_recv >/dev/null || { log "MCP: no answer: $(tail -n 5 "$W/mcp.err")"; return 1; }
+	mcp_send '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+}
+mcp_send() { printf '%s\n' "$1" >&3; }
+# One reply line (head, not read: read takes a byte per syscall and a
+# reply of 20 MB would take seconds in the shell).
+mcp_recv() { timeout 900 head -n 1 <&4; }
+mcp_close() {
+	exec 3>&- 4<&-
+	[ -n "$MCP_PID" ] && kill "$MCP_PID" 2>/dev/null
+	wait "$MCP_PID" 2>/dev/null || true
+	MCP_PID=""
+}
+# mcp_tool <tool> <arguments json> → the tool's text on stdout; false if
+# it says isError.
+mcp_tool() {
+	MCP_ID=$((MCP_ID + 1))
+	local reply
+	mcp_send "$(jq -cn --arg t "$1" --argjson a "$2" --argjson id $MCP_ID \
+		'{jsonrpc: "2.0", id: $id, method: "tools/call", params: {name: $t, arguments: $a}}')"
+	reply=$(mcp_recv) || return 1
+	printf '%s' "$reply" | jq -r '.result.content[0].text // .error.message // "no reply"'
+	[ "$(printf '%s' "$reply" | jq -r '.result.isError // (.error != null)')" = false ]
+}
+mcp_run() { # <command> [params]
+	mcp_tool run_command "$(jq -cn --arg c "$1" --argjson p "${2:-$NOPARAMS}" '{command: $c, params: $p}')"
+}
+
+# --- Percentiles of the numbers in a file (nearest rank).
+pct() { sort -n "$1" | awk -v p="$2" '{a[NR] = $1} END {i = int((NR * p + 99) / 100); if (i < 1) i = 1; print a[i] + 0}'; }
+
+# --- Loading the LSDB of a step and waiting until it is all in.
+# lsdb_load <lsas>: gen up and Full, the MRT loaded, LSDB and routes
+# stable. Sets LOADED_LSAS and LOADED_ROUTES.
+LOADED_LSAS=0 LOADED_ROUTES=0
+lsdb_load() {
+	local n=$1 mrt base
+	mrt=$(lsdb_mrt "$n")
+	gen_config "$W/gen/conf.json"
+	gen_start "$W/gen/conf.json"
+	wait_for "gen Full" 60 ge 1 dut_neighbors_full >/dev/null || return 1
+	base=$(stable dut_lsas 3)
+	bbl ospf-load-mrt file "$mrt" instance 1 >/dev/null
+	wait_for "lsdb $n" 1200 ge "$((base + n - 5))" dut_lsas >/dev/null || return 1
+	LOADED_LSAS=$(stable dut_lsas 5)
+	LOADED_ROUTES=$(stable dut_routes 5)
+}
+
+# --- 2. Churn: an extra node behind gen whose LSAs change every tick.
+# external: k AS-external LSAs whose metric flips 100 ↔ 200 (the routes
+# change, ospfd recomputes the externals only); router: k router-LSAs
+# whose link metrics flip (each tick is a full SPF). One tick every
+# 1.2 s: an LSA changed again in less than MinLSArrival (1 s, RFC 2328
+# §13 (5a)) would be dropped by the receiver, so k = rate × 1.2.
+CHURN_PERIOD_MS=1200
+churn_prepare() { # <kind> <k> → dir
+	local kind=$1 k=$2 d=$W/churn/$1-$2
+	rm -rf "$d"
+	mkdir -p "$d"
+	if [ "$kind" = external ]; then
+		(cd "$d" && lspgen -P ospf2 -y -c 1 -e "$k" -n "$CHURN_ROOT/32" -x 198.18.0.0/28 \
+			-l 172.30.0.0/31 -C "$GEN_RID:$LINK_GEN" -w churn.json >lspgen.log 2>&1)
+	else
+		(cd "$d" && lspgen -P ospf2 -y -c "$((k + 1))" -e 0 -n "$CHURN_ROOT/32" \
+			-l 172.30.0.0/31 -C "$GEN_RID:$LINK_GEN" -w churn.json >lspgen.log 2>&1)
+	fi
+	echo "$d"
+}
+# The probe: the prefix whose cost each tick changes, and its cost now
+# in CoreRouter (routing.ospf.route.list) and in zebra (local).
+churn_probe_prefix() { if [ "$1" = external ]; then echo 198.18.0.0/28; else echo 10.200.0.1/32; fi; }
+cost_cr() {
+	cr routing.ospf.route.list "{\"instance\":\"$INSTANCE\",\"find\":\"$PROBE\"}" |
+		jq -r --arg p "$PROBE" '[.rows[] | select(.prefix == $p)][0] | "\(.cost // "-")/\(.type2_cost // "-")"'
+}
+cost_zebra() { vty "show ip route $PROBE json" | jq -r --arg p "$PROBE" '.[$p][0].metric // "-"'; }
+# churn_tick <dir> <kind> <metric>: the topology with every changing
+# metric set, sent to gen (which floods it to the DUT).
+churn_tick() {
+	local d=$1 kind=$2 m=$3
+	if [ "$kind" = external ]; then
+		jq --argjson m "$m" '(.["area0.0.0.0"][].ipv4_prefix_list[]? | select(.external_flag == true) | .metric) = $m' \
+			"$d/churn.json" >"$d/tick.json"
+	else
+		jq --argjson m "$m" '(.["area0.0.0.0"][] | select(.is_root != true) | .neighbor_list[]?.metric) = $m' \
+			"$d/churn.json" >"$d/tick.json"
+	fi
+	(cd "$d" && lspgen -r tick.json -S "$BBL_SOCK" -I 1 -Q >>lspgen-ticks.log 2>&1)
+}
+# churn_run <dir> <kind> <secs> <lagfile>: ticks for <secs>; every 5th
+# tick, the time until CoreRouter (and zebra, local) show the new cost.
+churn_run() {
+	local d=$1 kind=$2 secs=$3 lags=$4 i=0 t_end t_tick m before zb
+	t_end=$(($(now) + secs * 1000))
+	while [ "$(now)" -lt "$t_end" ]; do
+		t_tick=$(now)
+		m=$((i % 2 ? 200 : 100))
+		if [ $((i % 5)) = 4 ]; then
+			before=$(cost_cr)
+			[ $DUT = local ] && zb=$(cost_zebra)
+		fi
+		churn_tick "$d" "$kind" "$m"
+		if [ $((i % 5)) = 4 ]; then
+			local lag_cr=- lag_z=- c
+			while [ $(($(now) - t_tick)) -lt 10000 ]; do
+				if [ "$lag_z" = - ] && [ $DUT = local ] && [ "$(cost_zebra)" != "$zb" ]; then lag_z=$(since "$t_tick"); fi
+				c=$(cost_cr)
+				if [ "$lag_cr" = - ] && [ "$c" != "$before" ]; then lag_cr=$(since "$t_tick"); fi
+				[ "$lag_cr" != - ] && { [ $DUT = remote ] || [ "$lag_z" != - ]; } && break
+				sleep 0.1
+			done
+			echo "$i $m $lag_z $lag_cr" >>"$lags"
+		fi
+		i=$((i + 1))
+		local rest=$((CHURN_PERIOD_MS - $(since "$t_tick")))
+		[ $rest -gt 0 ] && sleep "$(awk -v r=$rest 'BEGIN {printf "%.3f", r / 1000}')"
+	done
+	echo "$i" >"$d/ticks"
+}
+
+test_churn() {
+	say "## 2. Churn (base LSDB $CHURN_BASE LSAs, ${CHURN_SECS} s per rate, one tick every ${CHURN_PERIOD_MS} ms)"
+	say ""
+	say "| kind | LSAs/s | ticks | ospfd CPU avg/max (%) | zebra CPU | daemon CPU | SPF runs | lag zebra p50/max (ms) | lag CoreRouter p50/max (ms) | stale probes (> 10 s) | Full kept | result |"
+	say "|---|---|---|---|---|---|---|---|---|---|---|---|"
+	if ! lsdb_load "$CHURN_BASE"; then
+		fail "churn: the base LSDB did not load"
+		gen_stop
+		return
+	fi
+	local kind rate
+	for kind in external router; do
+		for rate in ${CHURN_RATES//,/ }; do
+			local k=$(((rate * CHURN_PERIOD_MS + 999) / 1000)) d csv=$OUT/churn-$kind-$rate.csv lags=$OUT/churn-$kind-$rate-lag.txt
+			[ "$kind" = router ] && [ "$k" -gt 50 ] && k=50
+			d=$(churn_prepare "$kind" "$k")
+			PROBE=$(churn_probe_prefix "$kind")
+			: >"$lags"
+			# The first tick brings the extra node in; the routes settle first.
+			churn_tick "$d" "$kind" 200
+			sleep 5
+			local spf0
+			spf0=$(dut_spf)
+			sampler_start "$csv"
+			churn_run "$d" "$kind" "$CHURN_SECS" "$lags"
+			sampler_stop
+			local full ticks spf stale lz lc verdict=ok
+			full=$(dut_neighbors_full)
+			ticks=$(cat "$d/ticks")
+			spf=$(dut_spf)
+			awk '{print $3}' "$lags" | grep -v -- - >"$lags.z" || true
+			awk '{print $4}' "$lags" | grep -v -- - >"$lags.c" || true
+			stale=$(awk '$4 == "-"' "$lags" | wc -l)
+			lz="-"
+			[ -s "$lags.z" ] && lz="$(pct "$lags.z" 50)/$(pct "$lags.z" 100)"
+			lc="-"
+			[ -s "$lags.c" ] && lc="$(pct "$lags.c" 50)/$(pct "$lags.c" 100)"
+			[ "$stale" -gt 0 ] && verdict="FAIL ($stale probes stale)"
+			[ "$full" -lt 1 ] && verdict="FAIL (adjacency lost)"
+			local dead
+			if dead=$(procs_dead); then verdict="FAIL ($dead died)"; fi
+			[ "$verdict" = ok ] || FAILED=1
+			say "| $kind | $(awk -v k=$k -v p=$CHURN_PERIOD_MS 'BEGIN {printf "%.1f", k * 1000 / p}') | $ticks | $(csv_avg "$csv" ospfd_cpu)/$(csv_max "$csv" ospfd_cpu) | $(csv_avg "$csv" zebra_cpu)/$(csv_max "$csv" zebra_cpu) | $(csv_avg "$csv" daemon_cpu)/$(csv_max "$csv" daemon_cpu) | ${spf0%% *} → ${spf%% *} | $lz | $lc | $stale | $full | $verdict |"
+		done
+	done
+	gen_stop
+	wait_for "churn purge" 600 le 3 dut_lsas >/dev/null || true
+	say ""
+}
+
+# --- 3. Many neighbors: n 802.1Q sub-interfaces of the DUT's port, one
+# adjacency each (gen instances 2..n+1); gen instance 1 on the untagged
+# link carries a base LSDB ($NEIGH_LSDB LSAs) that the DUT floods to all.
+NEIGH_LSDB=${NEIGH_LSDB:-10000}
+vlan_net() { # <i> (1-based) → "a.b.c" and the last octet base
+	echo "10.100.$((($1 - 1) / 64)) $(((($1 - 1) % 64) * 4))"
+}
+neighbors_gen_config() { # <file> <n>
+	local f=$1 n=$2 i
+	{
+		printf '{\n  "interfaces": {\n    "network": [\n'
+		printf '      {"interface": "%s", "address": "%s/30", "gateway": "%s", "ospfv2-instance-id": 1, "ospfv2-type": "p2p"}' \
+			"$GEN_IF" "$LINK_GEN" "$LINK_DUT"
+		for i in $(seq "$n"); do
+			read -r net b <<<"$(vlan_net "$i")"
+			printf ',\n      {"interface": "%s", "vlan": %d, "address": "%s.%d/30", "gateway": "%s.%d", "ospfv2-instance-id": %d, "ospfv2-type": "p2p"}' \
+				"$GEN_IF" $((100 + i)) "$net" $((b + 2)) "$net" $((b + 1)) $((i + 1))
+		done
+		printf '\n    ]\n  },\n  "ospf": [\n'
+		printf '    {"instance-id": 1, "version": 2, "router-id": "%s", "hello-interval": 1, "dead-interval": 4,\n' "$GEN_RID"
+		printf '      "external": {"purge": true, "connections": [{"router-id": "%s", "local-ipv4-address": "%s", "metric": 10}]}}' "$BIG_ROOT" "$LINK_GEN"
+		for i in $(seq "$n"); do
+			printf ',\n    {"instance-id": %d, "version": 2, "router-id": "10.1.%d.%d", "hello-interval": 1, "dead-interval": 4}' \
+				$((i + 1)) $((i / 256)) $((i % 256))
+		done
+		printf '\n  ]\n}\n'
+	} >"$f"
+}
+# The steps that add (or remove) the n VLANs, their addresses and one
+# template for them, as one atomic batch.
+neighbors_steps() { # add|remove <n>
+	local op=$1 n=$2 i
+	{
+		for i in $(seq "$n"); do
+			read -r net b <<<"$(vlan_net "$i")"
+			if [ "$op" = add ]; then
+				printf '{"command":"interface.vlan.add","params":{"name":"crs%d","parent":"%s","vlan_id":%d}}\n' $((100 + i)) "$DUT_IFACE" $((100 + i))
+				printf '{"command":"ip.address.add","params":{"address":"%s.%d/30","interface":"crs%d"}}\n' "$net" $((b + 1)) $((100 + i))
+			else
+				printf '{"command":"ip.address.remove","params":{"address":"%s.%d/30"}}\n' "$net" $((b + 1))
+				printf '{"command":"interface.remove","params":{"name":"crs%d"}}\n' $((100 + i))
+			fi
+		done
+		if [ "$op" = add ]; then
+			printf '{"command":"routing.ospf.interface-template.add","params":{"area":"stress-bb","networks":["10.100.0.0/16"],"type":"ptp","hello_interval":1,"dead_interval":4,"comment":"ospf-stress vlans"}}\n'
+		fi
+	} | jq -cs '{steps: ., atomic: true}'
+}
+neighbors_template_remove() {
+	local id
+	id=$(cr routing.ospf.interface-template.list | jq -r '[.[] | select(.comment == "ospf-stress vlans")][0].id // empty')
+	[ -n "$id" ] && cr routing.ospf.interface-template.remove "{\"id\":\"$id\"}" >/dev/null
+	return 0
+}
+
+test_neighbors() {
+	say "## 3. Many neighbors (802.1Q on $DUT_IFACE, hello 1 s / dead 4 s, base LSDB $NEIGH_LSDB LSAs flooded to all)"
+	say ""
+	say "| neighbors | commit of the VLANs (s) | all Full (s) | min Full in ${STABLE_SECS} s | samples below | ospfd RSS (MiB) | ospfd CPU avg/max (%) | zebra CPU | daemon CPU | removal (s) | result |"
+	say "|---|---|---|---|---|---|---|---|---|---|---|"
+	local n
+	for n in ${NEIGHBORS//,/ }; do
+		local csv=$OUT/neighbors-$n.csv t0 t_commit t_full verdict=ok
+		mcp_open || { fail "neighbors: MCP"; return; }
+		t0=$(now)
+		if ! mcp_tool command_batch "$(neighbors_steps add "$n")" >"$W/batch.out"; then
+			fail "neighbors $n: the batch was refused: $(head -c 400 "$W/batch.out")"
+			mcp_close
+			break
+		fi
+		t_commit=$(since "$t0")
+		mcp_close
+		neighbors_gen_config "$W/gen/neigh.json" "$n"
+		t0=$(now)
+		gen_start "$W/gen/neigh.json"
+		if [ "$NEIGH_LSDB" -gt 0 ]; then
+			wait_for "gen Full" 60 ge 1 dut_neighbors_full >/dev/null || true
+			bbl ospf-load-mrt file "$(lsdb_mrt "$NEIGH_LSDB")" instance 1 >/dev/null
+		fi
+		sampler_start "$csv"
+		if t_full=$(wait_for "$n neighbors Full" 600 ge "$((n + 1))" dut_neighbors_full); then
+			t_full=$(since "$t0")
+		else
+			t_full=- verdict="FAIL (only $(dut_neighbors_full) of $((n + 1)) Full)"
+		fi
+		local min=999999 below=0 end=$((SECONDS + STABLE_SECS)) f
+		if [ "$t_full" != - ]; then
+			while [ $SECONDS -lt $end ]; do
+				f=$(dut_neighbors_full || echo 0)
+				[ "$f" -lt "$min" ] && min=$f
+				[ "$f" -lt $((n + 1)) ] && below=$((below + 1))
+				sleep 5
+			done
+			[ "$below" -gt 0 ] && verdict="FAIL (adjacencies dropped: $below samples below $((n + 1)))"
+		fi
+		sampler_stop
+		local dead
+		if dead=$(procs_dead); then verdict="FAIL ($dead died)"; fi
+		gen_stop
+		neighbors_template_remove
+		mcp_open || true
+		t0=$(now)
+		mcp_tool command_batch "$(neighbors_steps remove "$n")" >"$W/batch.out" ||
+			log "neighbors $n: removal: $(head -c 400 "$W/batch.out")"
+		local t_rm
+		t_rm=$(since "$t0")
+		mcp_close
+		wait_for "neighbors purge" 600 le 3 dut_lsas >/dev/null || true
+		[ "$verdict" = ok ] || FAILED=1
+		say "| $n | $(awk -v a="$t_commit" 'BEGIN {printf "%.1f", a / 1000}') | $(awk -v a="$t_full" 'BEGIN {if (a == "-") print "-"; else printf "%.1f", a / 1000}') | $([ "$min" = 999999 ] && echo - || echo "$min") | $below | $(csv_max "$csv" ospfd_rss) | $(csv_avg "$csv" ospfd_cpu)/$(csv_max "$csv" ospfd_cpu) | $(csv_avg "$csv" zebra_cpu)/$(csv_max "$csv" zebra_cpu) | $(csv_avg "$csv" daemon_cpu)/$(csv_max "$csv" daemon_cpu) | $(awk -v a="$t_rm" 'BEGIN {printf "%.1f", a / 1000}') | $verdict |"
+		[ "$verdict" = ok ] || break
+	done
+	say ""
+}
+
+# --- 4. Operations with the biggest LSDB that passed loaded.
+# recovered <secs>: Full, the LSDB and the routes back to what was
+# loaded; prints the ms it took.
+recovered_now() {
+	[ "$(dut_neighbors_full)" -ge 1 ] && [ "$(dut_lsas)" -ge "$LOADED_LSAS" ] &&
+		[ "$(dut_routes)" -ge "$LOADED_ROUTES" ]
+}
+recovered() { wait_for "recovery" "$1" recovered_now; }
+secs() { awk -v a="$1" 'BEGIN {if (a == "" || a == "-") print "-"; else printf "%.1f", a / 1000}'; }
+# The minimum of a column while the sampler ran (did anything drop?).
+csv_min() {
+	awk -v c="$2" 'NR == 1 {for (i = 1; i <= NF; i++) if ($i == c) k = i; next}
+		$k != "-" && (m == "" || $k + 0 < m) {m = $k + 0} END {print m + 0}' "$1"
+}
+template_json() { cr routing.ospf.interface-template.list | jq -cS '[.[] | del(.matched, .interfaces_now, .state)]'; }
+
+test_ops() {
+	say "## 4. Operations with load ($LOADED_LSAS LSAs, $LOADED_ROUTES routes)"
+	say ""
+	say "| operation | command (ms) | back to normal (s) | min LSAs / routes during | nothing lost | result |"
+	say "|---|---|---|---|---|---|"
+	local before t0 t_cmd t_back csv verdict
+	before=$(template_json)
+
+	# a) An OSPF commit: the template's cost (no adjacency reset).
+	csv=$OUT/ops-commit.csv
+	sampler_start "$csv"
+	t0=$(now)
+	ok routing.ospf.interface-template.set "{\"id\":\"$TEMPLATE_ID\",\"cost\":20}" >/dev/null
+	t_cmd=$(since "$t0")
+	local applied
+	if [ $DUT = local ]; then
+		applied=$(wait_for "cost 20" 60 sh -c "vtysh --vty_socket '$W/dut/run/frr' -c 'show ip ospf interface $DUT_IFACE json' | grep -q '\"cost\":20'") || applied=-
+	else
+		applied=$(wait_for "cost 20" 60 sh -c "true") || applied=-
+	fi
+	sleep 3
+	sampler_stop
+	verdict=ok
+	[ "$applied" = - ] && verdict="FAIL (cost not applied)"
+	recovered_now || verdict="FAIL (not recovered)"
+	say "| commit (template cost 10 → 20) | $t_cmd | $(secs "$applied") | $(csv_min "$csv" lsas) / $(csv_min "$csv" routes) | $(recovered_now && echo yes || echo NO) | $verdict |"
+	[ "$verdict" = ok ] || FAILED=1
+	ok routing.ospf.interface-template.set "{\"id\":\"$TEMPLATE_ID\",\"cost\":null}" >/dev/null
+	sleep 3
+
+	# b) Safe Mode, undone by hand: the template disabled (the adjacency
+	# and all the routes go), then config.safe-mode.cancel.
+	# c) Safe Mode, undone by the connection's loss (RouterOS: the session
+	# ends, the changes go back).
+	local how
+	for how in cancel drop; do
+		csv=$OUT/ops-safe-$how.csv
+		verdict=ok
+		mcp_open || { fail "ops: MCP"; return; }
+		mcp_run config.safe-mode.enter >/dev/null || verdict="FAIL (enter)"
+		mcp_run routing.ospf.interface-template.set "{\"id\":\"$TEMPLATE_ID\",\"disabled\":true}" >/dev/null || verdict="FAIL (set)"
+		wait_for "adjacency down" 60 le 0 dut_neighbors_full >/dev/null || verdict="FAIL (did not go down)"
+		sampler_start "$csv"
+		t0=$(now)
+		if [ $how = cancel ]; then
+			mcp_run config.safe-mode.cancel >/dev/null || verdict="FAIL (cancel)"
+			t_cmd=$(since "$t0")
+			mcp_close
+		else
+			mcp_close
+			t_cmd=-
+		fi
+		if t_back=$(recovered 900); then t_back=$(since "$t0"); else t_back=- verdict="FAIL (not back)"; fi
+		sampler_stop
+		local same=yes
+		[ "$(template_json)" = "$before" ] || { same=NO; verdict="FAIL (config differs)"; }
+		say "| Safe Mode, $([ $how = cancel ] && echo cancel || echo connection lost) (template disabled) | $t_cmd | $(secs "$t_back") | $(csv_min "$csv" lsas) / $(csv_min "$csv" routes) | $same | $verdict |"
+		[ "$verdict" = ok ] || FAILED=1
+	done
+
+	if [ $DUT = remote ]; then
+		say "| FRR restart | - | - | - | - | not run (remote: needs the router's console) |"
+		say "| daemon restart | - | - | - | - | not run (remote: needs the router's console) |"
+		say ""
+		return
+	fi
+	# d) FRR killed (a crash: SIGKILL) and started again, as the init does;
+	# the daemon sees it come back and installs the config (routing_resync).
+	csv=$OUT/ops-frr-restart.csv
+	verdict=ok
+	sampler_start "$csv"
+	t0=$(now)
+	frr_stop KILL
+	sleep 1
+	frr_start
+	if t_back=$(recovered 1200); then t_back=$(since "$t0"); else t_back=- verdict="FAIL (not back)"; fi
+	sampler_stop
+	local resync
+	resync=$(grep -c -i 'resync\|installed again\|attached to FRR' "$W/dut/daemon.log" || true)
+	say "| FRR killed and started (routing_resync; daemon log lines: $resync) | - | $(secs "$t_back") | $(csv_min "$csv" lsas) / $(csv_min "$csv" routes) | $(recovered_now && echo yes || echo NO) | $verdict |"
+	[ "$verdict" = ok ] || FAILED=1
+
+	# e) The daemon restarted (SIGTERM, start): FRR and the kernel keep
+	# forwarding; the time until the daemon answers and reads OSPF again.
+	csv=$OUT/ops-daemon-restart.csv
+	verdict=ok
+	sampler_start "$csv"
+	t0=$(now)
+	daemon_stop
+	daemon_start
+	local t_answer t_state
+	t_answer=$(since "$t0")
+	if t_state=$(wait_for "daemon reads OSPF" 300 sh -c "$(declare -f cr cr_local); DUT=$DUT W=$W CLI=$CLI NOPARAMS='{}'; cr routing.ospf.neighbor.list '{\"instance\":\"$INSTANCE\"}' | grep -q '\"state\":\"Full\"'"); then
+		t_state=$(since "$t0")
+	else
+		t_state=- verdict="FAIL (no OSPF state after the restart)"
+	fi
+	sleep 3
+	sampler_stop
+	local minr
+	minr=$(csv_min "$csv" routes)
+	[ "$minr" -lt "$LOADED_ROUTES" ] && verdict="FAIL (routes dropped to $minr during the restart)"
+	recovered_now || verdict="FAIL (not recovered)"
+	say "| daemon restarted (answers after $(secs "$t_answer") s) | - | $(secs "$t_state") | $(csv_min "$csv" lsas) / $minr | $(recovered_now && echo yes || echo NO) | $verdict |"
+	[ "$verdict" = ok ] || FAILED=1
+	say ""
+}
+
+# --- 5. Latency of the commands with load: one CLI process per call
+# (connection and all, what a script pays) and a warm MCP connection.
+LAT_CMDS=(
+	"routing.ospf.neighbor.list|{\"instance\":\"$INSTANCE\"}"
+	"routing.ospf.interface.list|{\"instance\":\"$INSTANCE\"}"
+	"routing.ospf.instance.list|{}"
+	"routing.ospf.lsa.list|{\"instance\":\"$INSTANCE\",\"limit\":200}"
+	"routing.ospf.route.list|{\"instance\":\"$INSTANCE\"}"
+	"ip.route.list|{}"
+	"ip.route.page|{\"limit\":500}"
+	"system.resource.print|{}"
+)
+test_latency() {
+	say "## 5. Command latency with load ($LOADED_LSAS LSAs, $LOADED_ROUTES routes; $LAT_N calls each)"
+	say ""
+	say "| command | reply (KiB) | CLI p50 (ms) | CLI p99 | MCP p50 (ms) | MCP p99 |"
+	say "|---|---|---|---|---|---|"
+	local e id params f t0 size
+	for e in "${LAT_CMDS[@]}" "inspect|"; do
+		id=${e%%|*} params=${e#*|}
+		f=$W/lat-$id
+		: >"$f.cli"
+		: >"$f.mcp"
+		local i
+		for i in $(seq "$LAT_N"); do
+			t0=$(now)
+			if [ "$id" = inspect ]; then
+				if [ $DUT = local ]; then
+					ip netns exec crdut env COREROUTER_RUNTIME_DIR="$W/dut/run/corerouter" "$CLI" --connect 127.0.0.1:7979 inspect >"$f.out" 2>&1 || true
+				else
+					cli_remote inspect >"$f.out" 2>&1 || true
+				fi
+			else
+				cr "$id" "$params" >"$f.out" 2>&1 || true
+			fi
+			since "$t0" >>"$f.cli"
+		done
+		size=$(($(stat -c %s "$f.out") / 1024))
+		mcp_open || { fail "latency: MCP"; return; }
+		for i in $(seq "$LAT_N"); do
+			MCP_ID=$((MCP_ID + 1))
+			local req
+			if [ "$id" = inspect ]; then
+				req=$(jq -cn --argjson id $MCP_ID '{jsonrpc: "2.0", id: $id, method: "tools/call", params: {name: "inspect_state", arguments: {}}}')
+			else
+				req=$(jq -cn --arg c "$id" --argjson p "$params" --argjson id $MCP_ID \
+					'{jsonrpc: "2.0", id: $id, method: "tools/call", params: {name: "run_command", arguments: {command: $c, params: $p}}}')
+			fi
+			t0=$(now)
+			mcp_send "$req"
+			mcp_recv >"$f.mcpout" || true
+			since "$t0" >>"$f.mcp"
+		done
+		mcp_close
+		say "| \`$id\` | $size | $(pct "$f.cli" 50) | $(pct "$f.cli" 99) | $(pct "$f.mcp" 50) | $(pct "$f.mcp" 99) |"
+	done
+	say ""
+}
+
 has_test lsdb && test_lsdb
+[ "$BIGGEST" = 0 ] && BIGGEST=${LOAD:-10000}
+has_test churn && test_churn
+has_test neighbors && test_neighbors
+if has_test ops || has_test latency; then
+	if lsdb_load "$BIGGEST"; then
+		has_test ops && test_ops
+		has_test latency && test_latency
+	else
+		fail "ops/latency: the LSDB of $BIGGEST LSAs did not load"
+	fi
+	gen_stop
+fi
 if [ "${TESTS}" = none ]; then
 	say "up: $(dut_neighbors_full) full, LSAs $(dut_lsas), routes $(dut_routes), spf $(dut_spf), procs $(proc_sample)"
 	vty 'show ip ospf json' | head -c 3000
