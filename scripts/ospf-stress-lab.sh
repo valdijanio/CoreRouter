@@ -39,7 +39,9 @@
 #
 # Results: $OUT/results.md (a table per test) and $OUT/*.csv (samples);
 # exit 1 if a check failed.
-set -euo pipefail
+# No pipefail: a `… | grep -q` or `| head` that stops reading early makes
+# the writer's SIGPIPE the pipeline's status (and set -e ends the run).
+set -eu
 
 usage() { sed -n '2,40p' "$0"; exit 2; }
 
@@ -394,8 +396,19 @@ addr_remove() {
 	done
 	return 0
 }
-dut_config() {
+# The lab's OSPF out of the DUT, in the order the commands ask: Segment
+# Routing, the templates of its area, the area, the instance.
+ospf_teardown() {
+	cr routing.ospf.segment-routing.unset >/dev/null 2>&1 || true
+	local id
+	for id in $(cr routing.ospf.interface-template.list 2>/dev/null | jq -r '.[] | select(.area == "stress-bb") | .id'); do
+		cr routing.ospf.interface-template.remove "{\"id\":\"$id\"}" >/dev/null 2>&1 || true
+	done
+	cr routing.ospf.area.remove '{"id":"stress-bb"}' >/dev/null 2>&1 || true
 	cr routing.ospf.instance.remove "{\"id\":\"$INSTANCE\"}" >/dev/null 2>&1 || true
+}
+dut_config() {
+	ospf_teardown
 	addr_remove "$LINK_DUT/30"
 	ok ip.address.add "{\"address\":\"$LINK_DUT/30\",\"interface\":\"$DUT_IFACE\"}" >/dev/null
 	ok routing.ospf.instance.add "{\"name\":\"$INSTANCE\",\"router_id\":\"$DUT_RID\"}" >/dev/null
@@ -404,8 +417,21 @@ dut_config() {
 		"{\"area\":\"stress-bb\",\"networks\":[\"10.0.1.0/30\"],\"type\":\"ptp\",\"hello_interval\":1,\"dead_interval\":4,\"comment\":\"ospf-stress\"}" |
 		jq -r '.id // empty')
 }
+# A clean start for a test: the instance removed and added again (ospfd
+# drops its LSDB), so what an earlier test left (LSAs the generator did
+# not purge before it left: they age out only in an hour) does not count.
+LEFTOVER_NOTES=""
+dut_fresh() {
+	local left
+	left=$(dut_lsas 2>/dev/null || echo 0)
+	if [ "${left:-0}" -gt 3 ]; then
+		LEFTOVER_NOTES+="before $1: $left LSAs left in the LSDB; "
+	fi
+	dut_config
+	wait_for "fresh instance" 30 le 1 dut_lsas >/dev/null || true
+}
 dut_unconfig() {
-	cr routing.ospf.instance.remove "{\"id\":\"$INSTANCE\"}" >/dev/null 2>&1 || true
+	ospf_teardown
 	addr_remove "$LINK_DUT/30"
 }
 
@@ -689,6 +715,7 @@ test_lsdb() {
 	for n in ${STEPS//,/ }; do
 		local mrt csv=$OUT/lsdb-$n.csv fast=$OUT/lsdb-$n-load.csv base_lsas base_routes
 		mrt=$(lsdb_mrt "$n")
+		dut_fresh "lsdb $n"
 		gen_config "$W/gen/conf.json"
 		gen_start "$W/gen/conf.json"
 		if ! wait_for "gen Full" 60 ge 1 dut_neighbors_full >/dev/null; then
@@ -891,6 +918,7 @@ test_churn() {
 	say ""
 	say "| kind | LSAs/s | probe | ticks | ospfd CPU avg/max (%) | zebra CPU | daemon CPU | SPF runs | lag LSDB p50/max (ms) | lag zebra p50/max | lag CoreRouter p50/max | stale probes (> 10 s) | Full kept | result |"
 	say "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+	dut_fresh churn
 	if ! lsdb_load "$CHURN_BASE"; then
 		fail "churn: the base LSDB did not load"
 		gen_stop
@@ -932,6 +960,10 @@ test_churn() {
 			[ "$full" -lt 1 ] && verdict="FAIL (adjacency lost)"
 			local dead
 			if dead=$(procs_dead); then verdict="FAIL ($dead died)"; fi
+			if [ "$verdict" != ok ] && [ "$HOLD" -gt 0 ]; then
+				log "churn $kind $rate: holding for $HOLD s with the failure up (probe $PROBE, LSA $PROBE_LSA, dir $d)"
+				sleep "$HOLD"
+			fi
 			# Out with the extra node: its LSAs purged (MaxAge).
 			(cd "$d" && lspgen -r tick.json -S "$BBL_SOCK" -I 1 -Q -G >>lspgen-ticks.log 2>&1) || true
 			[ "$verdict" = ok ] || FAILED=1
@@ -947,6 +979,9 @@ test_churn() {
 # adjacency each (gen instances 2..n+1); gen instance 1 on the untagged
 # link carries a base LSDB ($NEIGH_LSDB LSAs) that the DUT floods to all.
 NEIGH_LSDB=${NEIGH_LSDB:-10000}
+# Hello and dead of the neighbor test (RouterOS's and FRR's defaults are
+# 10/40; 1/4 is the aggressive case).
+NEIGH_HELLO=${NEIGH_HELLO:-1} NEIGH_DEAD=${NEIGH_DEAD:-4}
 # VLAN id of neighbor/interface i: 10 + i (up to 4 000 fits under 4094).
 vlan_net() { # <i> (1-based) → "a.b.c" and the last octet base
 	echo "10.100.$((($1 - 1) / 64)) $(((($1 - 1) % 64) * 4))"
@@ -966,8 +1001,8 @@ neighbors_gen_config() { # <file> <n>
 		printf '    {"instance-id": 1, "version": 2, "router-id": "%s", "hello-interval": 1, "dead-interval": 4,\n' "$GEN_RID"
 		printf '      "external": {"purge": true, "connections": [{"router-id": "%s", "local-ipv4-address": "%s", "metric": 10}]}}' "$BIG_ROOT" "$LINK_GEN"
 		for i in $(seq "$n"); do
-			printf ',\n    {"instance-id": %d, "version": 2, "router-id": "10.1.%d.%d", "hello-interval": 1, "dead-interval": 4}' \
-				$((i + 1)) $((i / 256)) $((i % 256))
+			printf ',\n    {"instance-id": %d, "version": 2, "router-id": "10.1.%d.%d", "hello-interval": %d, "dead-interval": %d}' \
+				$((i + 1)) $((i / 256)) $((i % 256)) "$NEIGH_HELLO" "$NEIGH_DEAD"
 		done
 		printf '\n  ]\n}\n'
 	} >"$f"
@@ -987,7 +1022,7 @@ neighbors_steps() { # add|remove <n>
 			fi
 		done
 		if [ "$op" = add ]; then
-			printf '{"command":"routing.ospf.interface-template.add","params":{"area":"stress-bb","networks":["10.100.0.0/16"],"type":"ptp","hello_interval":1,"dead_interval":4,"comment":"ospf-stress vlans"}}\n'
+			printf '{"command":"routing.ospf.interface-template.add","params":{"area":"stress-bb","networks":["10.100.0.0/16"],"type":"ptp","hello_interval":%d,"dead_interval":%d,"comment":"ospf-stress vlans"}}\n' "$NEIGH_HELLO" "$NEIGH_DEAD"
 		fi
 	} >"$W/steps.jsonl"
 	if [ "$op" = remove ]; then
@@ -1007,13 +1042,14 @@ neighbors_template_remove() {
 }
 
 test_neighbors() {
-	say "## 3. Many neighbors (802.1Q on $DUT_IFACE, hello 1 s / dead 4 s, base LSDB $NEIGH_LSDB LSAs flooded to all)"
+	say "## 3. Many neighbors (802.1Q on $DUT_IFACE, hello $NEIGH_HELLO s / dead $NEIGH_DEAD s, base LSDB $NEIGH_LSDB LSAs flooded to all)"
 	say ""
 	say "| neighbors | commit of the VLANs (s) | all Full (s) | min Full in ${STABLE_SECS} s | samples below | ospfd RSS (MiB) | ospfd CPU avg/max (%) | zebra CPU | daemon CPU | removal (s) | result |"
 	say "|---|---|---|---|---|---|---|---|---|---|---|"
 	local n
 	for n in ${NEIGHBORS//,/ }; do
 		local csv=$OUT/neighbors-$n.csv t0 t_commit t_full verdict=ok
+		dut_fresh "neighbors $n"
 		mcp_open || { fail "neighbors: MCP"; return; }
 		t0=$(now)
 		if ! mcp_tool command_batch "$(neighbors_steps add "$n")" >"$W/batch.out"; then
@@ -1037,7 +1073,7 @@ test_neighbors() {
 			t_full=- verdict="FAIL (only $(dut_neighbors_full) of $((n + 1)) Full"
 			[ $DUT = local ] && verdict+="; $(dut_mcast_missing) interfaces without the OSPF multicast group, ospfd: $(mcast_errors) IP_ADD_MEMBERSHIP errors"
 			verdict+=")"
-			[ $DUT = local ] && vty 'show ip ospf neighbor' | grep -v Full | head -n 20 >&2
+			if [ $DUT = local ]; then vty 'show ip ospf neighbor' | grep -v Full | head -n 20 >&2 || true; fi
 			if [ "$HOLD" -gt 0 ]; then
 				log "neighbors $n: holding for $HOLD s with the failure up"
 				sleep "$HOLD"
@@ -1093,6 +1129,7 @@ test_interfaces() {
 	local n
 	for n in ${IFACES//,/ }; do
 		local t0 t_commit verdict=ok csv=$OUT/ifaces-$n.csv
+		dut_fresh "interfaces $n"
 		mcp_open || { fail "interfaces: MCP"; return; }
 		local c0 c1 c2
 		c0=$(cpu_now)
@@ -1478,6 +1515,7 @@ test_convergence() {
 		return
 	fi
 	ip netns exec crdut sysctl -qw net.mpls.platform_labels=1048575 2>/dev/null || true
+	dut_fresh convergence
 	ok ip.address.add '{"address":"10.0.2.1/30","interface":"ether2"}' >/dev/null
 	ok ip.address.add '{"address":"10.0.3.1/30","interface":"ether3"}' >/dev/null
 	local t2 t3
@@ -1632,6 +1670,7 @@ has_test churn && test_churn
 has_test neighbors && test_neighbors
 has_test interfaces && test_interfaces
 if has_test ops || has_test latency; then
+	dut_fresh ops
 	if lsdb_load "$BIGGEST"; then
 		has_test ops && test_ops
 		has_test latency && test_latency
@@ -1650,6 +1689,7 @@ if [ "${TESTS}" = none ]; then
 	say "up: $(dut_neighbors_full) full, LSAs $(dut_lsas), routes $(dut_routes), spf $(dut_spf), procs $(proc_sample)"
 	vty 'show ip ospf json' | head -c 3000
 fi
+[ -n "$LEFTOVER_NOTES" ] && say "" && say "Leftovers: $LEFTOVER_NOTES"
 [ -s "$OUT/log-guard.txt" ] && say "" && say "Log guard: $(wc -l <"$OUT/log-guard.txt") cut(s) of a DUT log over 256 MiB (log-guard.txt)."
 say ""
 say "results: $RESULTS"
