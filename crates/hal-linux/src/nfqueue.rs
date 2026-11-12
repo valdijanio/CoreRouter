@@ -125,6 +125,22 @@ pub fn params_request_with(num: u16, seq: u32, copy: u32) -> Vec<u8> {
 }
 
 /// Set `flags` (and the queue's length) on queue `num`.
+/// G2.7c: what a refused flags request means. The kernel answers
+/// EOPNOTSUPP to [`F_CONNTRACK`] when it was built without
+/// `CONFIG_NETFILTER_NETLINK_GLUE_CT` (`nfnetlink_queue.c`, `nfnl_ct_hook`
+/// unset): say so, so the operator does not hunt for a missing module.
+pub fn flags_refusal(message: String, flags: u32) -> String {
+    let unsupported = std::io::Error::from_raw_os_error(95).to_string();
+    if flags & F_CONNTRACK != 0 && message.contains(&unsupported) {
+        format!(
+            "{message} (the kernel cannot hand the conntrack of a queued packet: \
+             CONFIG_NETFILTER_NETLINK_GLUE_CT is off)"
+        )
+    } else {
+        message
+    }
+}
+
 pub fn flags_request(num: u16, seq: u32, flags: u32, maxlen: u32) -> Vec<u8> {
     msg(
         NFQNL_MSG_CONFIG,
@@ -311,7 +327,12 @@ mod io {
             reqs.push((3, super::flags_request(num, 3, flags, super::MAXLEN)));
             for (seq, req) in reqs {
                 q.sock.send(&req, 0).map_err(io)?;
-                q.ack(seq)?;
+                q.ack(seq).map_err(|e| match e {
+                    HalError::Rejected(m) if seq == 3 => {
+                        HalError::Rejected(super::flags_refusal(m, flags))
+                    }
+                    other => other,
+                })?;
             }
             Ok(q)
         }
@@ -613,6 +634,18 @@ mod tests {
         // The flags request names the flags twice (value and mask).
         let f = flags_request(7423, 3, F_CONNTRACK | F_FAIL_OPEN, MAXLEN);
         assert_eq!(&f[f.len() - 4..], &3u32.to_be_bytes());
+    }
+
+    #[test]
+    fn a_conntrack_refusal_names_the_kernel_option() {
+        let m = format!(
+            "netfilter queue 7423: {}",
+            std::io::Error::from_raw_os_error(95)
+        );
+        assert!(flags_refusal(m.clone(), F_CONNTRACK).contains("NETLINK_GLUE_CT"));
+        assert_eq!(flags_refusal(m.clone(), F_FAIL_OPEN), m);
+        let busy = "netfilter queue 7423: Device or resource busy".to_owned();
+        assert_eq!(flags_refusal(busy.clone(), F_CONNTRACK), busy);
     }
 
     proptest! {
