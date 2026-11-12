@@ -75,7 +75,7 @@ impl PppBackend for Fake {
         }
     }
     fn stats(&self) -> ServiceStats {
-        ServiceStats { sessions: self.up.lock().unwrap().len() as u64, padi: 40, pado: 38, padr: 30, pads: 30, auth_accept: 26, auth_reject: 4, throttled: 2, ..ServiceStats::default() }
+        ServiceStats { sessions: self.up.lock().unwrap().len() as u64, padi: 40, pado: 38, padr: 30, pads: 30, auth_accept: 26, auth_reject: 4, throttled: 2, dataplane_reason: Some("no XDP: XDP is not attached to ether2".into()), ..ServiceStats::default() }
     }
 }
 
@@ -160,6 +160,8 @@ fn every_tab_draws() {
     let mut h = open(s);
     tab(&mut h, Tab::Interface);
     assert!(h.has_text_containing("slow path") || h.has_text_containing("XDP"));
+    // G4.3v: why there is no XDP, beside the slow path chip.
+    assert!(h.has_text_containing("no XDP: XDP is not attached to ether2"));
     tab(&mut h, Tab::Servers);
     assert!(h.has_text_containing("pppoe-ether2"));
     assert!(h.has_text_containing("100-115"));

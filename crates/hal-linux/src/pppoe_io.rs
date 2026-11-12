@@ -710,6 +710,83 @@ fn runtime() -> io::Result<tokio::runtime::Runtime> {
         .build()
 }
 
+/// G4.3v: the PPP profiles' `local_address` (the router's side of every
+/// session, what IPCP tells the subscriber) as `/32` addresses of `bng0`,
+/// exactly `want`: missing ones added, others removed. RouterOS puts it on
+/// each session's dynamic `<pppoe-…>` interface; here the sessions share
+/// `bng0`, and an address there is the router's for the whole kernel. Without
+/// it a subscriber's packet to the gateway (ping, DNS, a bandwidth test) was
+/// routed as the host's own output to the default route and lost, slow path
+/// and XDP alike. `bng0` is created if missing. Returns what was changed.
+pub fn set_local_addresses(
+    want: &std::collections::BTreeSet<Ipv4Addr>,
+) -> io::Result<(usize, usize)> {
+    use futures_util::TryStreamExt;
+    use rtnetlink::AddressMessageBuilder;
+    use rtnetlink::packet_route::address::AddressAttribute;
+    let ifindex = ensure_dummy(SLOW_DEVICE)?;
+    let rt = runtime()?;
+    rt.block_on(async {
+        let (conn, handle, _) = rtnetlink::new_connection()?;
+        let task = tokio::spawn(conn);
+        let mut have = std::collections::BTreeSet::new();
+        let mut dump = handle
+            .address()
+            .get()
+            .set_link_index_filter(ifindex)
+            .execute();
+        while let Some(m) = dump
+            .try_next()
+            .await
+            .map_err(|e| io::Error::other(format!("addresses of {SLOW_DEVICE}: {e}")))?
+        {
+            if m.header.index != ifindex || m.header.prefix_len != 32 {
+                continue;
+            }
+            for a in &m.attributes {
+                if let AddressAttribute::Local(std::net::IpAddr::V4(ip)) = a {
+                    have.insert(*ip);
+                }
+            }
+        }
+        let (mut added, mut removed) = (0, 0);
+        for ip in want.difference(&have) {
+            match handle
+                .address()
+                .add(ifindex, std::net::IpAddr::V4(*ip), 32)
+                .execute()
+                .await
+            {
+                Ok(()) => added += 1,
+                Err(rtnetlink::Error::NetlinkError(e)) if e.raw_code() == -17 => {}
+                Err(e) => {
+                    task.abort();
+                    return Err(io::Error::other(format!("{ip}/32 on {SLOW_DEVICE}: {e}")));
+                }
+            }
+        }
+        for ip in have.difference(want) {
+            let msg = AddressMessageBuilder::<Ipv4Addr>::new()
+                .index(ifindex)
+                .address(*ip, 32)
+                .build();
+            match handle.address().del(msg).execute().await {
+                Ok(()) => removed += 1,
+                // EADDRNOTAVAIL: gone already.
+                Err(rtnetlink::Error::NetlinkError(e)) if e.raw_code() == -99 => {}
+                Err(e) => {
+                    task.abort();
+                    return Err(io::Error::other(format!(
+                        "removing {ip}/32 from {SLOW_DEVICE}: {e}"
+                    )));
+                }
+            }
+        }
+        task.abort();
+        Ok((added, removed))
+    })
+}
+
 /// The index of dummy device `name`, created and set up if missing.
 pub(crate) fn ensure_dummy(name: &str) -> io::Result<u32> {
     use futures_util::TryStreamExt;

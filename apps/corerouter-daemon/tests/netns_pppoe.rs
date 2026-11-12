@@ -321,43 +321,40 @@ fn pppoe_server_end_to_end() {
 
     // Traffic through the slow path: ICMP echo to wan0 and back.
     let (sid, ip) = one.up[0].unwrap();
-    let echo = icmp_echo(ip, Ipv4Addr::new(198, 51, 100, 1));
-    let mut f = Vec::new();
-    f.extend_from_slice(&row_mac(&one));
-    f.extend_from_slice(&[0x02, 0x20, 0, 0, 0, 0x01]);
-    f.extend_from_slice(&[0x88, 0x64, 0x11, 0x00]);
-    f.extend_from_slice(&sid.to_be_bytes());
-    f.extend_from_slice(&((echo.len() + 2) as u16).to_be_bytes());
-    f.extend_from_slice(&[0x00, 0x21]);
-    f.extend_from_slice(&echo);
-    let mut reply = None;
-    for _ in 0..20 {
-        one.port.send(&f).unwrap();
-        let t = Instant::now();
-        while t.elapsed() < Duration::from_millis(250) && reply.is_none() {
-            one.port
-                .recv(|fr| {
-                    // PPPoE session, IPv4, ICMP echo reply (type 0).
-                    if fr.len() > 42
-                        && fr[12..14] == [0x88, 0x64]
-                        && fr[20..22] == [0x00, 0x21]
-                        && fr[31] == 1
-                        && fr[42] == 0
-                    {
-                        reply = Some(fr.to_vec());
-                    }
-                })
-                .unwrap();
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        if reply.is_some() {
-            break;
-        }
-    }
     assert!(
-        reply.is_some(),
+        echo_through(&mut one, sid, ip, Ipv4Addr::new(198, 51, 100, 1)),
         "the echo reply came back through bng0 and the PPPoE encapsulation"
     );
+    // G4.3v: the monitor says why there is no XDP (no root here).
+    let m = ok("interface.pppoe-server.monitor", json!({}));
+    assert_eq!(m["dataplane"], false, "{m}");
+    assert!(
+        m["dataplane_reason"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("no XDP")),
+        "{m}"
+    );
+    // G4.3v: the profile's local address, on no interface of the router
+    // (100.65.0.1, as on the notebook, dev.591): the gateway answers. Before,
+    // the slow path sent the echo to the default route (here: nowhere).
+    ok(
+        "ppp.profile.set",
+        json!({"id": "default", "local_address": "100.65.0.1"}),
+    );
+    wait_for("the local address on bng0", || {
+        ip_text(&["-4", "-o", "addr", "show", "dev", "bng0"]).contains("100.65.0.1/32")
+    });
+    assert!(
+        echo_through(&mut one, sid, ip, Ipv4Addr::new(100, 65, 0, 1)),
+        "the gateway (the profile's local_address) answered the subscriber"
+    );
+    ok(
+        "ppp.profile.set",
+        json!({"id": "default", "local_address": ""}),
+    );
+    wait_for("the local address gone from bng0", || {
+        !ip_text(&["-4", "-o", "addr", "show", "dev", "bng0"]).contains("100.65.0.1")
+    });
     wait_for("the counters", || {
         let r = ok("ppp.active.list", json!({}))["rows"][0].clone();
         r["rx_packets"].as_u64().unwrap_or(0) >= 1 && r["tx_packets"].as_u64().unwrap_or(0) >= 1
@@ -536,6 +533,54 @@ fn pppoe_server_end_to_end() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = srv_thread.join();
     drop(daemon);
+}
+
+/// An ICMP echo from session `sid` (address `ip`) to `dst`, sent through
+/// the PPPoE session until its reply comes back encapsulated (5 s at most).
+fn echo_through(one: &mut Cpes, sid: u16, ip: Ipv4Addr, dst: Ipv4Addr) -> bool {
+    let echo = icmp_echo(ip, dst);
+    let mut f = Vec::new();
+    f.extend_from_slice(&row_mac(one));
+    f.extend_from_slice(&[0x02, 0x20, 0, 0, 0, 0x01]);
+    f.extend_from_slice(&[0x88, 0x64, 0x11, 0x00]);
+    f.extend_from_slice(&sid.to_be_bytes());
+    f.extend_from_slice(&((echo.len() + 2) as u16).to_be_bytes());
+    f.extend_from_slice(&[0x00, 0x21]);
+    f.extend_from_slice(&echo);
+    let mut reply = None;
+    for _ in 0..20 {
+        one.port.send(&f).unwrap();
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_millis(250) && reply.is_none() {
+            one.port
+                .recv(|fr| {
+                    // PPPoE session, IPv4, ICMP echo reply (type 0).
+                    if fr.len() > 42
+                        && fr[12..14] == [0x88, 0x64]
+                        && fr[20..22] == [0x00, 0x21]
+                        && fr[31] == 1
+                        && fr[42] == 0
+                    {
+                        reply = Some(fr.to_vec());
+                    }
+                })
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if reply.is_some() {
+            break;
+        }
+    }
+    reply.is_some()
+}
+
+/// `ip <args>` in this namespace, its output.
+fn ip_text(args: &[&str]) -> String {
+    let out = std::process::Command::new("ip")
+        .args(args)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 fn row_mac(c: &Cpes) -> [u8; 6] {
