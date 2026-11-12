@@ -138,15 +138,6 @@ On a router a clean reboot is better than forwarding with a damaged kernel.
 A driver that oopses on start makes a reboot loop; the A/B image falls back to the previous one."##,
     ),
     (
-        "tuning.vm.memory_failure_early_kill",
-        r##"## What it does
-On an uncorrectable memory error in a page, 1 kills at once every process that maps it; 0 (the kernel's default) takes the page out and kills a process only when it touches the page.
-## When to change
-Leave 0 on a router: the daemon is restarted by the init if it is the one that reads the page, and nothing else dies for a page it would never read again.
-## Careful
-Only does something on ECC memory (System › Health › Memory)."##,
-    ),
-    (
         "tuning.kernel.softlockup_panic",
         r##"## What it does
 Panics (and `kernel.panic` reboots) when a CPU runs in the kernel for 20 s without letting anything else run: a soft lockup. Off, it only writes a trace to the log.
@@ -686,6 +677,15 @@ Each profile is calculated from this machine (RAM, CPUs, port speeds), not copie
 TCP settings (socket buffers, SYN cookies) only affect the router's own connections (BGP, the API), never forwarded traffic.
 ## Applying
 "Apply with Safe Mode" enters Safe Mode first: if the connection to the router drops, every change goes back."##,
+    ),
+    (
+        "tuning.vm.memory_failure_early_kill",
+        r##"## What it does
+On an uncorrectable memory error in a page, 1 kills at once every process that maps it; 0 (the kernel's default) takes the page out and kills a process only when it touches the page.
+## When to change
+Leave 0 on a router: the daemon is restarted by the init if it is the one that reads the page, and nothing else dies for a page it would never read again.
+## Careful
+Only does something on ECC memory (System › Health › Memory)."##,
     ),
     (
         "tuning.vm.memory_failure_recovery",

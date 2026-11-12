@@ -139,15 +139,6 @@ Num roteador um reinício limpo é melhor que encaminhar com o kernel danificado
 Um driver que dá oops na partida cria um ciclo de reinícios; a imagem A/B volta para a anterior."##,
     ),
     (
-        "tuning.vm.memory_failure_early_kill",
-        r##"## O que faz
-Num erro de memória que o ECC não corrige, 1 mata na hora todo processo que mapeia a página; 0 (o padrão do kernel) tira a página de uso e só mata o processo que tocar nela.
-## Quando mudar
-Deixe 0 num roteador: se é o daemon que lê a página, o init o reinicia, e nada mais morre por uma página que nunca seria lida de novo.
-## Cuidado
-Só faz algo com memória ECC (System › Health › Memory)."##,
-    ),
-    (
         "tuning.kernel.softlockup_panic",
         r##"## O que faz
 Entra em pânico (e o `kernel.panic` reinicia) quando uma CPU fica 20 s rodando no kernel sem deixar mais nada rodar: o travamento mole (soft lockup). Desligado, só escreve o rastro no log.
@@ -687,6 +678,15 @@ Cada perfil é calculado para esta máquina (RAM, CPUs, velocidade das portas), 
 As opções de TCP (buffers de socket, SYN cookies) só afetam as conexões do próprio roteador (BGP, a API), nunca o tráfego encaminhado.
 ## Aplicar
 "Aplicar com Safe Mode" entra em Safe Mode antes: se a conexão com o roteador cair, toda mudança volta."##,
+    ),
+    (
+        "tuning.vm.memory_failure_early_kill",
+        r##"## O que faz
+Num erro de memória que o ECC não corrige, 1 mata na hora todo processo que mapeia a página; 0 (o padrão do kernel) tira a página de uso e só mata o processo que tocar nela.
+## Quando mudar
+Deixe 0 num roteador: se é o daemon que lê a página, o init o reinicia, e nada mais morre por uma página que nunca seria lida de novo.
+## Cuidado
+Só faz algo com memória ECC (System › Health › Memory)."##,
     ),
     (
         "tuning.vm.memory_failure_recovery",
