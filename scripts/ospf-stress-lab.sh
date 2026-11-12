@@ -593,8 +593,13 @@ procs_dead() {
 }
 
 # --- Setup and teardown.
+GUARD=""
 cleanup() {
 	set +e
+	if [ -n "$GUARD" ]; then
+		pkill -P "$GUARD" 2>/dev/null
+		kill "$GUARD" 2>/dev/null
+	fi
 	sampler_stop
 	exec 3>&- 4<&-
 	gen_stop
@@ -1583,7 +1588,7 @@ fi
 # A runaway log (ospfd logged EMFILE in a loop: 10 GB) must not fill the
 # VM's disk: past 256 MiB a log of the DUT is cut, and that is said.
 (
-	while sleep 10; do
+	while sleep 10 && kill -0 $$ 2>/dev/null; do
 		for f in "$W"/dut/*.log; do
 			[ -f "$f" ] || continue
 			if [ "$(stat -c %s "$f")" -gt $((256 << 20)) ]; then
@@ -1593,6 +1598,7 @@ fi
 		done
 	done
 ) &
+GUARD=$!
 if [ $SELFTEST = 1 ]; then
 	# The management address that the remote mode reaches it by.
 	cr_local ip.address.add '{"address":"10.99.0.1/24","interface":"ether1"}' >/dev/null
