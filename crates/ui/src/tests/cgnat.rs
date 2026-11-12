@@ -165,3 +165,30 @@ fn the_capacity_tab_previews_and_applies_under_safe_mode() {
     assert_eq!(pools[0]["ports_per_subscriber"], 1536);
     assert!(h.has_text("Applied under Safe Mode: confirm with the Safe Mode button, or it rolls back."));
 }
+
+/// G2.7d: a blocks-mode pool out of blocks: the Capacity tab says how many
+/// found no free block (apart from who hit its own limit) and suggests what
+/// fits.
+#[test]
+fn the_capacity_tab_shows_a_pool_out_of_blocks() {
+    let mut s = Session::virtual_lab();
+    s.tick(1_780_000_000);
+    s.execute(
+        "ip.firewall.cgnat.pool.add",
+        &json!({"name": "tiny", "mode": "blocks", "inside": "100.64.0.0/24", "outside": "203.0.113.9", "ports_per_subscriber": 32256, "max_blocks": 1}),
+    )
+    .unwrap();
+    for t in 1..=30 {
+        s.tick(1_780_000_000 + t);
+    }
+    let mut h = Harness::with_session(s);
+    h.app.open.clear();
+    h.app.open(Win::Panel(WIN));
+    refresh(&mut h);
+    h.app.panel_mut::<Cgnat>().unwrap().tab = Tab::Capacity;
+    refresh(&mut h);
+    assert!(h.has_text("No free block, 24 h"));
+    assert!(h.has_text("38"), "the 38 online subscribers without a block");
+    assert!(h.has_text_containing("2/2 blocks in use"));
+    assert!(h.has_text("the pool ran out of blocks: fewer ports per block fit everyone"));
+}
