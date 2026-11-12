@@ -14,13 +14,21 @@
 //! - clearing `STA_UNSYNC` turns on the kernel's 11-minute write to the
 //!   hardware clock (`sync_hw_clock`, with `CONFIG_RTC_SYSTOHC`), and
 //!   `time_maxerror` puts it back by itself after 16 s of accumulated error
-//!   (`NTP_PHASE_LIMIT`), so a client that went silent stops claiming sync.
+//!   (`NTP_PHASE_LIMIT`), so a client that went silent stops claiming sync;
+//! - G4.6o: kernel 6.18.59 `kernel/time/ntp.c`, `sync_hw_clock` (line 643)
+//!   and `ntp_notify_cmos_timer` (line 683) write the RTC only when
+//!   `ntp_synced()`, both through `update_persistent_clock64` (x86 CMOS,
+//!   `CONFIG_GENERIC_CMOS_UPDATE`) and `update_rtc` (`CONFIG_RTC_SYSTOHC`).
+//!   So [`HardwareClock::LeaveAlone`] keeps `STA_UNSYNC` set: the system
+//!   clock is still stepped and slewed, the RTC is never written. A step
+//!   (`ADJ_SETOFFSET`) sets `STA_UNSYNC` by itself (`ntp_clear`, through
+//!   `TK_CLEAR_NTP` in `timekeeping.c`), so nothing else clears it.
 
 use std::time::Duration;
 
 use clock_steering::unix::{Error, UnixClock};
 use clock_steering::{Clock, LeapIndicator, TimeOffset};
-use corerouter_hal::clock::{ClockError, SystemClock};
+use corerouter_hal::clock::{ClockError, HardwareClock, SystemClock};
 
 /// `CLOCK_REALTIME`.
 pub struct LinuxClock(UnixClock);
@@ -68,10 +76,20 @@ impl SystemClock for LinuxClock {
             .map_err(error)
     }
 
-    fn synchronized(&mut self, estimated_nanos: u64, maximum_nanos: u64) -> Result<(), ClockError> {
-        self.0
-            .set_leap_seconds(LeapIndicator::NoWarning)
-            .map_err(error)?;
+    fn synchronized(
+        &mut self,
+        estimated_nanos: u64,
+        maximum_nanos: u64,
+        hardware: HardwareClock,
+    ) -> Result<(), ClockError> {
+        // `set_leap_seconds` writes the status bits: `NoWarning` clears
+        // STA_UNSYNC (the RTC follows), `Unknown` sets it (left alone); both
+        // clear the leap bits (clock-steering 0.2.1, `unix.rs` line 440).
+        let leap = match hardware {
+            HardwareClock::Follow => LeapIndicator::NoWarning,
+            HardwareClock::LeaveAlone => LeapIndicator::Unknown,
+        };
+        self.0.set_leap_seconds(leap).map_err(error)?;
         self.0
             .error_estimate_update(
                 Duration::from_nanos(estimated_nanos),

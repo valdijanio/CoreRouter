@@ -44,7 +44,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use corerouter_engine::{Shared, lock};
-use corerouter_hal::clock::{ClockError, SystemClock};
+use corerouter_hal::clock::{ClockError, HardwareClock, SystemClock};
 use corerouter_model::ntp::{
     ClockState, MAIN_VRF, MAX_SERVERS, NO_SERVER, NtpClient, NtpState, NtpStatus, POLL_RANGE,
 };
@@ -147,6 +147,10 @@ struct ClockDriver {
     asked: Option<i64>,
     /// G4.6m: where this boot's first step is marked (`None`: never open).
     boot: Option<BootStep>,
+    /// G4.6o: whether the board's clock follows (`LeaveAlone` on the live
+    /// image), and whether the log already said it is left alone.
+    hardware: HardwareClock,
+    told_hardware: bool,
 }
 
 impl ClockDriver {
@@ -167,7 +171,15 @@ impl ClockDriver {
             complained: false,
             asked: None,
             boot: None,
+            hardware: HardwareClock::Follow,
+            told_hardware: false,
         }
+    }
+
+    /// G4.6o: the live image leaves the RTC alone.
+    fn with_hardware_clock(mut self, hardware: HardwareClock) -> Self {
+        self.hardware = hardware;
+        self
     }
 
     /// G4.6m: with the boot's first step, when this boot has not spent it.
@@ -354,7 +366,16 @@ impl ClockDriver {
         let estimated = u64::try_from(delay_nanos / 2).unwrap_or(0);
         let maximum = estimated.saturating_add(self.discipline_error());
         if moves && let Some(clock) = &mut self.clock {
-            clock.synchronized(estimated, maximum)?;
+            clock.synchronized(estimated, maximum, self.hardware)?;
+            if self.hardware == HardwareClock::LeaveAlone && !self.told_hardware {
+                self.told_hardware = true;
+                const LIVE: &str = "imagem live: o relógio da placa (RTC) fica como está, para não \
+                                    mudar a hora que outro sistema da máquina lê";
+                said = Some(match said {
+                    Some((level, text)) => (level, format!("{text}; {LIVE}")),
+                    None => ("info", format!("NTP: relógio do sistema acertado; {LIVE}")),
+                });
+            }
         }
         Ok(said)
     }
@@ -394,11 +415,18 @@ fn merged_servers(cfg: &NtpClient, dynamic: &[std::net::Ipv4Addr]) -> (Vec<Strin
 type OpenClock<'a> = Option<&'a dyn Fn() -> Result<Box<dyn SystemClock>, String>>;
 
 fn open_clock(session: &Shared, open: OpenClock<'_>, boot: &BootStep) -> ClockDriver {
+    // G4.6o: on the live image (`--live`) the RTC is left as it is.
+    let hardware = if corerouter_engine::live::is_live(&lock(session)) {
+        HardwareClock::LeaveAlone
+    } else {
+        HardwareClock::Follow
+    };
     ClockDriver::new(match open {
         Some(f) => f(),
         None => lock(session).open_system_clock(),
     })
     .with_boot_step(boot)
+    .with_hardware_clock(hardware)
 }
 
 fn run(session: &Shared, port: u16, health: &super::Health, open: OpenClock<'_>, boot: &BootStep) {
@@ -1062,6 +1090,8 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeClock {
         ops: std::sync::Arc<std::sync::Mutex<Vec<Op>>>,
+        /// What each `synchronized` said about the RTC (G4.6o).
+        hardware: std::sync::Arc<std::sync::Mutex<Vec<HardwareClock>>>,
         frequency: std::sync::Arc<std::sync::Mutex<f64>>,
         refuse: bool,
     }
@@ -1096,8 +1126,10 @@ mod tests {
         fn step(&mut self, offset_nanos: i64) -> Result<(), ClockError> {
             self.did(Op::Step(offset_nanos))
         }
-        fn synchronized(&mut self, _: u64, _: u64) -> Result<(), ClockError> {
-            self.did(Op::Synchronized)
+        fn synchronized(&mut self, _: u64, _: u64, hardware: HardwareClock) -> Result<(), ClockError> {
+            self.did(Op::Synchronized)?;
+            self.hardware.lock().unwrap().push(hardware);
+            Ok(())
         }
     }
 
@@ -1299,6 +1331,74 @@ mod tests {
         assert!(!fake.ops().iter().any(|o| matches!(o, Op::Step(_))));
         assert!(log.contains("confirm-step"), "{log}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// G4.6o: the driver passes its RTC choice to every `synchronized` and,
+    /// leaving the RTC alone, says so in the log once.
+    #[test]
+    fn the_driver_tells_the_clock_whether_the_rtc_follows() {
+        let fake = FakeClock::default();
+        let mut d = ClockDriver::new(fake.boxed());
+        assert_eq!(d.apply(1_600_000, 2 * MS, WALL, false), None, "installed: nothing to say");
+        assert_eq!(*fake.hardware.lock().unwrap(), [HardwareClock::Follow]);
+
+        let fake = FakeClock::default();
+        let mut d = ClockDriver::new(fake.boxed()).with_hardware_clock(HardwareClock::LeaveAlone);
+        let (level, text) = d.apply(1_600_000, 2 * MS, WALL, false).unwrap();
+        assert_eq!(level, "info");
+        assert!(text.contains("relógio da placa (RTC) fica como está"), "{text}");
+        // Said once: the next slew is silent, and still leaves it alone.
+        assert_eq!(d.apply(2 * MS, 2 * MS, WALL, false), None);
+        assert_eq!(
+            *fake.hardware.lock().unwrap(),
+            [HardwareClock::LeaveAlone, HardwareClock::LeaveAlone]
+        );
+        // The first word is joined to a step's line.
+        let fake = FakeClock::default();
+        let mut d = ClockDriver::new(fake.boxed()).with_hardware_clock(HardwareClock::LeaveAlone);
+        let (level, text) = d.apply(300 * MS, 2 * MS, WALL, false).unwrap();
+        assert_eq!(level, "warning");
+        assert!(text.contains("acertado de uma vez") && text.contains("(RTC) fica como está"), "{text}");
+    }
+
+    /// G4.6o, the service: on the live image (`--live`) the clock is set
+    /// and the RTC left alone; installed, the RTC follows.
+    #[test]
+    fn the_live_image_leaves_the_board_clock_alone() {
+        let start = |live: bool| {
+            let port = server(400, None);
+            let session = shared(Session::virtual_lab());
+            lock(&session)
+                .execute("system.ntp.client.set", &json!({"enabled": true, "servers": ["127.0.0.1"]}))
+                .unwrap();
+            if live {
+                corerouter_engine::live::set(&mut lock(&session));
+            }
+            let fake = FakeClock::default();
+            let opener = fake.clone();
+            let (s2, health) = (
+                session.clone(),
+                super::super::Health::new(corerouter_control::Shutdown::default()),
+            );
+            thread::spawn(move || {
+                let open = move || opener.boxed();
+                run(&s2, port, &health, Some(&open), &BootStep::default());
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while fake.hardware.lock().unwrap().is_empty() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(50));
+            }
+            thread::sleep(Duration::from_millis(100));
+            let log = lock(&session).execute("log.print", &json!({"find": "NTP"})).unwrap().to_string();
+            let hardware = fake.hardware.lock().unwrap().clone();
+            (hardware, log)
+        };
+        let (hardware, log) = start(true);
+        assert_eq!(hardware, [HardwareClock::LeaveAlone], "{log}");
+        assert!(log.contains("relógio da placa (RTC) fica como está"), "{log}");
+        let (hardware, log) = start(false);
+        assert_eq!(hardware, [HardwareClock::Follow], "{log}");
+        assert!(!log.contains("RTC"), "{log}");
     }
 
     /// `set_system_clock=no`: measures, never opens the clock.
