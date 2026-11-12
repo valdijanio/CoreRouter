@@ -151,11 +151,37 @@ fn group(p: &Value) -> Result<Group> {
 }
 
 /// The interface to capture and, when VLANs matter, its VLAN interfaces.
-fn devices(s: &Session, p: &Value, vlans: bool) -> Result<(IfName, Vec<CaptureDevice>)> {
+/// G4.3x: also a link the kernel has outside the config (`bng0`, the PPPoE
+/// slow path's device; a tunnel of another program), as `interface.list`
+/// shows it ("not managed"). The loopback only for group full: the local
+/// control channel crosses it in clear, with its token.
+fn devices(s: &mut Session, p: &Value, vlans: bool) -> Result<(IfName, Vec<CaptureDevice>)> {
     let name: IfName = req_str(p, "interface")?
         .trim()
         .parse()
         .map_err(|e| EngineError::bad("interface", format!("{e}")))?;
+    if !s.store().running().interfaces.contains_key(&name) {
+        let live = s.live_links(None);
+        let Some(link) = live.iter().find(|l| l.name == name) else {
+            return Err(EngineError::bad(
+                "interface",
+                format!("no interface '{name}' (see interface.list)"),
+            ));
+        };
+        if link.kind == "loopback" {
+            s.permit(crate::auth::Group::Full).map_err(|reason| EngineError::Denied {
+                id: "capture on the loopback".into(),
+                reason,
+            })?;
+        }
+        return Ok((
+            name.clone(),
+            vec![CaptureDevice {
+                name: name.to_string(),
+                vlan: None,
+            }],
+        ));
+    }
     let cfg = s.store().running();
     let Some(iface) = cfg.interfaces.get(&name) else {
         return Err(EngineError::bad(
