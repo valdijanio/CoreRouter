@@ -884,17 +884,7 @@ impl Lab {
         run_ok(
             rsync
                 .args(["-a", "--delete", "--info=stats0"])
-                .args(["--exclude=/target", "--exclude=/target-*", "--exclude=/vm/"])
-                .args([
-                    "--exclude=/.git",
-                    // The app copies `.claude/` into each worktree, parked
-                    // Buildroot trees included (4.2 GB, measured): never
-                    // send it to the VM's 20 GiB disk.
-                    "--exclude=/.claude/",
-                    "--exclude=/plan/",
-                    "--exclude=/fuzz/target/",
-                ])
-                .args(["--exclude=/apps/corerouter-gui/dist/", "--exclude=/dist/"])
+                .args(SYNC_EXCLUDES)
                 .arg(format!("{}/", self.root.display()))
                 .arg(to),
         )?;
@@ -1865,9 +1855,79 @@ pub(crate) fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// What `vm-lab run` leaves out of the copy of the worktree it sends to the
+/// VM (rsync patterns, anchored at the worktree's root). The VM's disk is
+/// 20 GiB: build trees never go there.
+const SYNC_EXCLUDES: &[&str] = &[
+    "--exclude=/target",
+    "--exclude=/target-*",
+    "--exclude=/vm/",
+    "--exclude=/.git",
+    // The app copies `.claude/` into each worktree, parked Buildroot trees
+    // included (4.2 GB, measured).
+    "--exclude=/.claude/",
+    "--exclude=/plan/",
+    "--exclude=/fuzz/target/",
+    // Buildroot's downloads and output trees, a parked one (`os/out.old`,
+    // 18 GB, measured) included: the image reaches the VM by `vm-lab put`,
+    // never by the sync, and such a tree filled the VM's disk in the middle
+    // of the rsync ("error in file IO", 2026-11-12).
+    "--exclude=/os/dl/",
+    "--exclude=/os/out*/",
+    "--exclude=/apps/corerouter-gui/dist/",
+    "--exclude=/dist/",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The real rsync with [`SYNC_EXCLUDES`]: sources go, build trees stay.
+    #[test]
+    fn sync_leaves_build_trees_out() {
+        if Command::new("rsync").arg("--version").output().is_err() {
+            eprintln!("rsync not installed: skipped");
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("vmlab-sync-{}", std::process::id()));
+        let (src, dst) = (tmp.join("src"), tmp.join("dst"));
+        let files = [
+            "crates/a.rs",
+            "os/configs/x_defconfig",
+            "os/patches/p.patch",
+            "os/dl/pkg/pkg.tar.gz",
+            "os/out/build/big",
+            "os/out.old/build/big",
+            "target/debug/x",
+            "target-img/x",
+            ".git/HEAD",
+        ];
+        for f in files {
+            let p = src.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "x").unwrap();
+        }
+        std::fs::create_dir_all(&dst).unwrap();
+        let ok = Command::new("rsync")
+            .arg("-a")
+            .args(SYNC_EXCLUDES)
+            .arg(format!("{}/", src.display()))
+            .arg(&dst)
+            .status()
+            .unwrap()
+            .success();
+        let sent: Vec<&str> = files.into_iter().filter(|f| dst.join(f).exists()).collect();
+        std::fs::remove_dir_all(&tmp).unwrap();
+        assert!(ok);
+        assert_eq!(
+            sent,
+            [
+                "crates/a.rs",
+                "os/configs/x_defconfig",
+                "os/patches/p.patch"
+            ]
+        );
+    }
 
     #[test]
     fn wires_pair_up_and_never_reuse_a_mac() {
