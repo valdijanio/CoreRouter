@@ -346,6 +346,23 @@ fn pool_checks(cfg: &Config, p: &Pool, router: &[Ipv4Addr], out: &mut Out) {
             ),
         );
     }
+    // G2.3g: the gateway of the subscribers' network (100.64.0.1 of
+    // 100.64.0.0/24) inside the pool, the usual setup. Fine, but say what
+    // it means: never a block or a slot, and its own packets leave as they are.
+    if let Some(a) = router
+        .iter()
+        .find(|a| p.inside.iter().any(|r| r.contains(**a)))
+    {
+        warn(
+            out,
+            "inside",
+            "router address",
+            format!(
+                "{a} is an address of the router: it is no subscriber (never a block or a \
+                 slot) and its own packets are not translated"
+            ),
+        );
+    }
     match p.layout() {
         Ok(l) => {
             if p.mode == Mode::Blocks && l.subscribers() > l.capacity() {
@@ -676,5 +693,31 @@ mod tests {
             from_pool: None,
         });
         assert_eq!(labels(&c, Level::Warn), ["router address"]);
+    }
+
+    /// G2.3g: the router's address on the access port inside the pool.
+    #[test]
+    fn the_routers_address_inside_a_pool_is_a_warning() {
+        let mut c = cfg(
+            vec![pool(1, "a", "100.64.0.0/24", "203.0.113.0/29", 1000)],
+            vec![],
+        );
+        c.ip.addresses.push(corerouter_model::AddressEntry {
+            id: ItemId(1),
+            address: "100.64.0.1/24".parse().unwrap(),
+            interface: "ether2".parse().unwrap(),
+            disabled: false,
+            comment: String::new(),
+            from_pool: None,
+        });
+        let w: Vec<_> = checks(&c)
+            .into_iter()
+            .filter(|x| x.level == Level::Warn)
+            .collect();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].path.ends_with(".inside") && w[0].text.contains("100.64.0.1"),
+            "{w:?}"
+        );
     }
 }
