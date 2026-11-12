@@ -21,7 +21,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add DHCPv6 Client",
         ["IPv6", "DHCP Client"],
         None,
-        "{interface: string, request: string (address | prefix | address,prefix), disabled?: bool, comment?: string, pool_name?: string (where the delegated prefix goes; required with prefix), prefix_hint?: string (::/56 asks for a /56; a whole prefix asks for it; ::/0 = none), accept_prefix_without_address?: bool (default true), add_default_route?: bool (default false: ::/0 via the server's link-local), default_route_distance?: u32 (1..=255, default 254: a backup behind any static, OSPF or BGP route), use_peer_dns?: bool (default true), rapid_commit?: bool (default true), custom_duid?: string (0x…; empty = DUID-LL of the interface MAC), allowed_servers?: [string (IPv6 address, DUID 0x… or MAC; empty = any server)] | string} → {id}",
+        "{interface: string, request: string (address | prefix | address,prefix), disabled?: bool, comment?: string, pool_name?: string (where the delegated prefix goes; required with prefix), prefix_hint?: string (::/56 asks for a /56; a whole prefix asks for it; ::/0 = none), accept_prefix_without_address?: bool (default true), add_default_route?: bool (default false: ::/0 via the server's link-local), default_route_distance?: u32 (1..=255, default 254: a backup behind any static, OSPF or BGP route), use_peer_dns?: bool (default true), use_peer_ntp?: bool (default true: the NTP servers of the lease, option 56, go to the NTP client), rapid_commit?: bool (default true), custom_duid?: string (0x…; empty = DUID-LL of the interface MAC), allowed_servers?: [string (IPv6 address, DUID 0x… or MAC; empty = any server)] | string} → {id}",
         always,
         add
     ),
@@ -30,7 +30,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set DHCPv6 Client",
         [],
         None,
-        "{id: *hex, interface?: string, request?: string (address | prefix | address,prefix), disabled?: bool, comment?: string, pool_name?: string (where the delegated prefix goes; required with prefix), prefix_hint?: string (::/56 asks for a /56; a whole prefix asks for it; ::/0 = none), accept_prefix_without_address?: bool (default true), add_default_route?: bool (default false: ::/0 via the server's link-local), default_route_distance?: u32 (1..=255, default 254: a backup behind any static, OSPF or BGP route), use_peer_dns?: bool (default true), rapid_commit?: bool (default true), custom_duid?: string (0x…; empty = DUID-LL of the interface MAC), allowed_servers?: [string (IPv6 address, DUID 0x… or MAC; empty = any server)] | string} → {id}",
+        "{id: *hex, interface?: string, request?: string (address | prefix | address,prefix), disabled?: bool, comment?: string, pool_name?: string (where the delegated prefix goes; required with prefix), prefix_hint?: string (::/56 asks for a /56; a whole prefix asks for it; ::/0 = none), accept_prefix_without_address?: bool (default true), add_default_route?: bool (default false: ::/0 via the server's link-local), default_route_distance?: u32 (1..=255, default 254: a backup behind any static, OSPF or BGP route), use_peer_dns?: bool (default true), use_peer_ntp?: bool (default true: the NTP servers of the lease, option 56, go to the NTP client), rapid_commit?: bool (default true), custom_duid?: string (0x…; empty = DUID-LL of the interface MAC), allowed_servers?: [string (IPv6 address, DUID 0x… or MAC; empty = any server)] | string} → {id}",
         has_clients,
         set
     ),
@@ -62,7 +62,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         release
     ),
     cmd!(query "ipv6.dhcp-client.list", "DHCPv6 Client", ["IPv6", "DHCP Client"], None,
-        "{interface?: string} → [{id, flags (X disabled, I invalid), interface, request, pool_name, status (stopped | searching | requesting | bound | renewing | rebinding | error), address, prefix, expires_after, address_expires_after, prefix_expires_after, dhcp_server, server_duid, duid, primary_dns, secondary_dns, domains, missing, routes, route_states (each route of the lease in the routing table: [{route, state (active | standby | inactive), ecmp, reason, notice (null | info | warning: ECMP mixing origins or on the default route)}]), notes (why a route of the lease is not the one in use), t1_after, t2_after, error, invalid, disabled, comment, prefix_hint, accept_prefix_without_address, add_default_route, default_route_distance, use_peer_dns, rapid_commit, custom_duid, allowed_servers}]",
+        "{interface?: string} → [{id, flags (X disabled, I invalid), interface, request, pool_name, status (stopped | searching | requesting | bound | renewing | rebinding | error), address, prefix, expires_after, address_expires_after, prefix_expires_after, dhcp_server, server_duid, duid, primary_dns, secondary_dns, domains, ntp_servers (option 56, RFC 5908: addresses, names and multicast groups), missing, routes, route_states (each route of the lease in the routing table: [{route, state (active | standby | inactive), ecmp, reason, notice (null | info | warning: ECMP mixing origins or on the default route)}]), notes (why a route of the lease is not the one in use), t1_after, t2_after, error, invalid, disabled, comment, prefix_hint, accept_prefix_without_address, add_default_route, default_route_distance, use_peer_dns, use_peer_ntp, rapid_commit, custom_duid, allowed_servers}]",
         always, list),
     cmd!(query "ipv6.dhcp-client.options", "Received Options", [], None,
         "{id: *hex} → {id, interface, dhcp_server, options: [{code, name, value, hex}]}",
@@ -176,6 +176,9 @@ fn edit(c: &mut Dhcp6Client, p: &Value) -> Result<()> {
     }
     if let Some(v) = opt_bool(p, "use_peer_dns")? {
         c.use_peer_dns = v;
+    }
+    if let Some(v) = opt_bool(p, "use_peer_ntp")? {
+        c.use_peer_ntp = v;
     }
     if let Some(v) = opt_bool(p, "rapid_commit")? {
         c.rapid_commit = v;
@@ -385,6 +388,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
             "primary_dns": ip(0),
             "secondary_dns": ip(1),
             "domains": lease.map(|l| l.domains.clone()).unwrap_or_default(),
+            "ntp_servers": lease.map(|l| l.ntp.iter().map(ToString::to_string).collect::<Vec<_>>()).unwrap_or_default(),
             "missing": lease.map(|l| l.missing.clone()).unwrap_or_default(),
             "routes": runner.map(|r| r.routes.iter().map(|rt| format!("{} via {}", rt.dst_address, rt.gateway)).collect::<Vec<_>>()).unwrap_or_default(),
             "route_states": states,
@@ -400,6 +404,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
             "add_default_route": c.add_default_route,
             "default_route_distance": c.default_route_distance,
             "use_peer_dns": c.use_peer_dns,
+            "use_peer_ntp": c.use_peer_ntp,
             "rapid_commit": c.rapid_commit,
             "custom_duid": c.custom_duid,
             "allowed_servers": c.allowed_servers.iter().map(ToString::to_string).collect::<Vec<_>>(),
@@ -562,7 +567,7 @@ pub(super) fn pool_view(
 mod tests {
     use super::*;
 
-    const SET_KEYS: &str = "disabled?: bool, comment?: string, pool_name?: string (where the delegated prefix goes; required with prefix), prefix_hint?: string (::/56 asks for a /56; a whole prefix asks for it; ::/0 = none), accept_prefix_without_address?: bool (default true), add_default_route?: bool (default false: ::/0 via the server's link-local), default_route_distance?: u32 (1..=255, default 254: a backup behind any static, OSPF or BGP route), use_peer_dns?: bool (default true), rapid_commit?: bool (default true), custom_duid?: string (0x…; empty = DUID-LL of the interface MAC), allowed_servers?: [string (IPv6 address, DUID 0x… or MAC; empty = any server)] | string";
+    const SET_KEYS: &str = "disabled?: bool, comment?: string, pool_name?: string (where the delegated prefix goes; required with prefix), prefix_hint?: string (::/56 asks for a /56; a whole prefix asks for it; ::/0 = none), accept_prefix_without_address?: bool (default true), add_default_route?: bool (default false: ::/0 via the server's link-local), default_route_distance?: u32 (1..=255, default 254: a backup behind any static, OSPF or BGP route), use_peer_dns?: bool (default true), use_peer_ntp?: bool (default true: the NTP servers of the lease, option 56, go to the NTP client), rapid_commit?: bool (default true), custom_duid?: string (0x…; empty = DUID-LL of the interface MAC), allowed_servers?: [string (IPv6 address, DUID 0x… or MAC; empty = any server)] | string";
 
     #[test]
     fn add_and_set_document_the_same_keys() {

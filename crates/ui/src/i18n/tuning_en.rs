@@ -676,7 +676,7 @@ Each profile is calculated from this machine (RAM, CPUs, port speeds), not copie
 ## Control plane
 TCP settings (socket buffers, SYN cookies) only affect the router's own connections (BGP, the API), never forwarded traffic.
 ## Applying
-"Apply with Safe Mode" enters Safe Mode first: if the connection to the router drops, every change goes back."##,
+Picking a profile in the selector at the top only compares it: the Profiles tab marks it "picked" and nothing changes on the router. "Apply with Safe Mode" (on Summary and on Profiles) writes the picked profile: it enters Safe Mode first, and if the connection to the router drops, every change goes back."##,
     ),
     (
         "tuning.vm.memory_failure_early_kill",

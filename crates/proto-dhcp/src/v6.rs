@@ -320,11 +320,79 @@ pub struct Incoming {
     pub ia_pd: Vec<Ia>,
     pub dns: Vec<Ipv6Addr>,
     pub domains: Vec<String>,
+    /// Time sources of the NTP Server options (RFC 5908 §4); with none, the
+    /// addresses of the deprecated SNTP option (RFC 4075, RFC 5908 §7).
+    pub ntp: Vec<NtpSource>,
     /// SOL_MAX_RT (§21.24), seconds, when in 60..=86400.
     pub sol_max_rt: Option<u32>,
     /// The server asked us to reconfigure: never accepted (we send no
     /// Reconfigure Accept, §18.2.1), only noted.
     pub reconfigure: bool,
+}
+
+/// Time sources kept from one message (hostile-input bound; the NTP client
+/// asks at most 8 servers anyway).
+pub const MAX_NTP: usize = 8;
+
+/// One time source of an NTP Server option (RFC 5908 §4.1–§4.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NtpSource {
+    /// NTP_SUBOPTION_SRV_ADDR (1): a unicast server.
+    Server(Ipv6Addr),
+    /// NTP_SUBOPTION_MC_ADDR (2): the multicast group NTP uses on the link.
+    Multicast(Ipv6Addr),
+    /// NTP_SUBOPTION_SRV_FQDN (3): a server by name.
+    Name(String),
+}
+
+impl std::fmt::Display for NtpSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Server(a) | Self::Multicast(a) => write!(f, "{a}"),
+            Self::Name(n) => f.write_str(n),
+        }
+    }
+}
+
+/// The time sources of one NTP Server option, appended to `out`.
+///
+/// RFC 5908 §4 says each option holds "one, and only one" suboption, and the
+/// option repeats; dnsmasq sends all of them in one option, and systemd and
+/// odhcp6c read that, so every suboption counts. A suboption that does not
+/// parse is skipped and the rest kept; an unknown one too (IANA may add
+/// codes, §8). A server address must be unicast and a group address
+/// multicast (§4.1, §4.2); an FQDN is one RFC 9915 §10 name (ex-8415), no IDN (§4.3).
+/// A broken option is ignored: it never costs the lease.
+fn ntp_sources(data: &[u8], budget: &mut usize, out: &mut Vec<NtpSource>) {
+    let Ok(subs) = split(data, budget) else {
+        return;
+    };
+    for (code, body) in subs {
+        if out.len() >= MAX_NTP {
+            break;
+        }
+        let addr = (body.len() == 16).then(|| v6_at(body, 0)).flatten();
+        let source = match code {
+            1 => addr.filter(is_unicast).map(NtpSource::Server),
+            2 => addr
+                .filter(Ipv6Addr::is_multicast)
+                .map(NtpSource::Multicast),
+            3 => domain_list(body)
+                .filter(|names| names.len() == 1)
+                .and_then(|names| names.into_iter().next())
+                .map(NtpSource::Name),
+            _ => None,
+        };
+        if let Some(s) = source
+            && !out.contains(&s)
+        {
+            out.push(s);
+        }
+    }
+}
+
+fn is_unicast(a: &Ipv6Addr) -> bool {
+    !a.is_multicast() && !a.is_unspecified() && !a.is_loopback()
 }
 
 impl Incoming {
@@ -437,6 +505,8 @@ pub fn decode(bytes: &[u8]) -> Result<Incoming, CodecError> {
         ..Incoming::default()
     };
     let mut budget = MAX_OPTIONS.saturating_sub(raw.options.len());
+    let mut saw_ntp = false;
+    let mut sntp = Vec::new();
     for (code, data) in raw.options {
         match code {
             opt::CLIENTID if data.len() <= MAX_DUID => m.client_id = Some(data.to_vec()),
@@ -460,12 +530,26 @@ pub fn decode(bytes: &[u8]) -> Result<Incoming, CodecError> {
             }
             opt::DNS_SERVERS => m.dns = ip_list(data),
             opt::DOMAIN_LIST => m.domains = domain_list(data).unwrap_or_default(),
+            opt::NTP_SERVER => {
+                saw_ntp = true;
+                ntp_sources(data, &mut budget, &mut m.ntp);
+            }
+            opt::SNTP_SERVERS => sntp = ip_list(data),
             opt::SOL_MAX_RT => {
                 // §21.24: values outside 60..=86400 are ignored.
                 m.sol_max_rt = u32_at(data, 0).filter(|v| (60..=86_400).contains(v));
             }
             _ => {}
         }
+    }
+    // RFC 5908 §7: the SNTP option (RFC 4075) is deprecated; its servers
+    // count only when no NTP Server option came (as systemd-networkd).
+    if !saw_ntp {
+        m.ntp = sntp
+            .into_iter()
+            .filter(is_unicast)
+            .map(NtpSource::Server)
+            .collect();
     }
     Ok(m)
 }

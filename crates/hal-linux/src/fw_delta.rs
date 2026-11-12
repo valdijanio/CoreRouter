@@ -145,6 +145,8 @@ impl Census {
 pub(crate) struct Loaded {
     fw: CowArc<Firewall>,
     interface_lists: InterfaceLists,
+    /// G4.3y: the lists the PPPoE subscribers' device is in.
+    subscriber_lists: BTreeSet<String>,
     notice: SubscriberNotices,
     /// `nfnl::stamp(TABLE)` right after it was loaded.
     stamp: (u64, u64),
@@ -205,6 +207,7 @@ impl Loaded {
         Some(Box::new(Self {
             fw: fw.clone(),
             interface_lists: cfg.interface_lists.clone(),
+            subscriber_lists: fwnft::subscriber_lists(cfg),
             notice: cfg.ip.subscriber_notice.clone(),
             stamp,
             handles,
@@ -291,6 +294,7 @@ pub(crate) fn apply(mut l: Box<Loaded>, from: &Config, to: &Config) -> Outcome {
     if nfnl::stamp(TABLE) != l.stamp
         || l.fw != from.ip.firewall
         || l.interface_lists != from.interface_lists
+        || l.subscriber_lists != fwnft::subscriber_lists(from)
         || l.notice != from.ip.subscriber_notice
     {
         return Outcome::Slow;
@@ -298,6 +302,7 @@ pub(crate) fn apply(mut l: Box<Loaded>, from: &Config, to: &Config) -> Outcome {
     // Only rules may differ; a table that goes away is the slow path's.
     let (ofw, nfw) = (&l.fw, &to.ip.firewall);
     if l.interface_lists != to.interface_lists
+        || l.subscriber_lists != fwnft::subscriber_lists(to)
         || l.notice != to.ip.subscriber_notice
         || ofw.address_lists != nfw.address_lists
         || (nfw.is_empty() && !corerouter_firewall::notice::on(to))

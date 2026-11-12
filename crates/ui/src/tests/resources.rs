@@ -112,3 +112,38 @@ fn the_threads_tab_shows_the_daemon_threads() {
         assert!(h.has_text("No thread fills a core"));
     }
 }
+
+/// G1.6ql: the Memory tab says what the kernel uses: conntrack now and
+/// full, its lookup table, the slab and the page cache, each with ⓘ.
+#[test]
+fn the_memory_tab_shows_what_the_kernel_uses() {
+    use crate::i18n::{self, Lang, Langs};
+    let mut h = open();
+    tab(&mut h, Tab::Memory);
+    for text in ["Kernel", "Connections", "Conntrack memory", "Lookup table", "Slab", "Page cache"] {
+        assert!(h.has_text(text), "{text}");
+    }
+    // The lab's slab: 256 B objects + 64 B of extensions, measured.
+    assert!(h.has_text_containing("(320 B per entry, measured)"));
+    assert!(h.has_text_containing("when full"));
+    assert!(h.has_text_containing("(262 144 buckets)"));
+    assert!(h.has_text_containing("/ 1 048 576"), "the limit");
+    assert!(h.has_text_containing("unreclaimable"));
+    for key in ["kernel", "ct", "ct_memory", "ct_table", "slab", "page_cache"] {
+        for l in [Lang::En, Lang::Pt] {
+            let got = i18n::explain(Langs { labels: l, help: l }, &format!("resources.mem.{key}"));
+            assert_eq!(got.map(|(l, _)| l), Some(l), "{key} in {l:?}");
+        }
+    }
+    h.app.lang.labels = Lang::Pt;
+    h.idle();
+    h.idle();
+    assert!(h.has_text("Memória do conntrack"));
+    assert!(h.has_text_containing("com a tabela cheia"));
+    // A kernel without conntrack loaded.
+    h.app.lang.labels = Lang::En;
+    let p = h.app.panel_mut::<ResourcesPanel>().unwrap();
+    p.print.as_mut().unwrap()["kernel"]["conntrack"] = serde_json::Value::Null;
+    h.idle();
+    assert!(h.has_text("conntrack is not loaded"));
+}

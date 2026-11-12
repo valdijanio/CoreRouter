@@ -32,8 +32,8 @@ use std::path::{Path, PathBuf};
 use corerouter_hal::system_resource::{
     CpuIrqs, CpuTimes, DAEMON_PROCESS, Dimm, Disk, DiskIo, LoadAvg, MAX_CPUS, MAX_DIMMS, MAX_DISKS,
     MAX_NET, MAX_PROCESSES, MAX_SENSORS, MAX_TASKS, Memory, MemoryErrors, NetDev, Pressure,
-    Process, Psi, ROUTER_PROCESSES, ResourceSampler, Sample, Sensor, SensorKind, Task, Want,
-    cut_name,
+    Process, Psi, ROUTER_PROCESSES, ResourceSampler, Sample, Sensor, SensorKind, SlabCache, Task,
+    Want, cut_name,
 };
 
 /// Most descriptors counted per process (a reading of the processes lists
@@ -140,7 +140,45 @@ pub fn parse_meminfo(text: &str) -> Memory {
         cached,
         swap_total: field("SwapTotal").unwrap_or(0),
         swap_free: field("SwapFree").unwrap_or(0),
+        slab_reclaimable: field("SReclaimable").unwrap_or(0),
+        slab_unreclaimable: field("SUnreclaim").unwrap_or(0),
     }
+}
+
+/// The first number of a SLUB counter file (`objects`: `1873 N0=1873`).
+pub fn parse_slab_count(text: &str) -> Option<u64> {
+    text.split_whitespace().next()?.parse().ok()
+}
+
+/// SLUB's `/sys/kernel/slab/<name>` files: object size with alignment
+/// and metadata (`slab_size`), objects in use and objects held.
+pub fn parse_slab_cache(slab_size: &str, objects: &str, total: &str) -> Option<SlabCache> {
+    let object_bytes = parse_slab_count(slab_size)?;
+    let objects = parse_slab_count(objects)?;
+    let total_objects = parse_slab_count(total)?.max(objects);
+    (object_bytes > 0).then_some(SlabCache {
+        object_bytes,
+        objects,
+        total_objects,
+    })
+}
+
+/// The line of cache `name` in `/proc/slabinfo` (version 2.1: `name
+/// <active_objs> <num_objs> <objsize> …`), for kernels without SLUB's
+/// sysfs.
+pub fn parse_slabinfo(text: &str, name: &str) -> Option<SlabCache> {
+    let line = text
+        .lines()
+        .find(|l| l.split_whitespace().next() == Some(name))?;
+    let mut f = line.split_whitespace().skip(1).map(str::parse::<u64>);
+    let objects = f.next()?.ok()?;
+    let total_objects = f.next()?.ok()?.max(objects);
+    let object_bytes = f.next()?.ok()?;
+    (object_bytes > 0).then_some(SlabCache {
+        object_bytes,
+        objects,
+        total_objects,
+    })
 }
 
 fn finite(v: f32) -> Option<f32> {
@@ -756,6 +794,20 @@ impl Collector {
         read(&self.sys.join(rel))
     }
 
+    /// G1.6ql: the `nf_conntrack` slab, from SLUB's sysfs (three small
+    /// files of this one cache); `/proc/slabinfo` (every cache) only
+    /// when that is missing. Both are root's.
+    fn conntrack_slab(&self) -> Option<SlabCache> {
+        let f = |n: &str| self.sys(&format!("kernel/slab/nf_conntrack/{n}"));
+        match (f("slab_size"), f("objects"), f("total_objects")) {
+            (Some(a), Some(b), Some(c)) => parse_slab_cache(&a, &b, &c),
+            _ if !self.sys.join("kernel/slab").exists() => self
+                .proc("slabinfo")
+                .and_then(|t| parse_slabinfo(&t, "nf_conntrack")),
+            _ => None,
+        }
+    }
+
     fn fixed(&mut self) -> (Option<String>, Option<String>) {
         if let Some(f) = &self.fixed {
             return f.clone();
@@ -1106,6 +1158,8 @@ impl ResourceSampler for Collector {
             swap_out,
             conntrack: ct("nf_conntrack_count"),
             conntrack_max: ct("nf_conntrack_max"),
+            conntrack_buckets: ct("nf_conntrack_buckets"),
+            conntrack_slab: self.conntrack_slab(),
             processes: want.processes.then(|| self.processes()),
             router: self.router(uptime_ms),
         }

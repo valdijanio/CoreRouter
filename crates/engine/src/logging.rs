@@ -340,7 +340,7 @@ pub fn journal_message(
             let c = &cfg.system.ntp_client;
             Some(if c.enabled {
                 let servers = if c.servers.is_empty() {
-                    "servidores do DHCP (opção 42)".to_owned()
+                    "servidores do DHCP (opções 42 e 56)".to_owned()
                 } else {
                     format!("servidores {}", c.servers.join(", "))
                 };
@@ -485,7 +485,7 @@ pub fn ntp_error(raw: &str) -> String {
             } else if lower.contains("unreachable") {
                 Some("rede inalcançável para")
             } else if lower.contains(corerouter_model::ntp::NO_SERVER) {
-                return "sem servidor: nenhum configurado e nenhum cliente DHCP entregou um (opção 42)".to_owned();
+                return "sem servidor: nenhum configurado e nenhum cliente DHCP entregou um (opção 42 do DHCPv4, 56 do DHCPv6)".to_owned();
             } else {
                 None
             };
@@ -976,7 +976,7 @@ mod tests {
         };
         let (level, m) = ntp_event(&waiting, &nobody).unwrap();
         assert_eq!(level, "info");
-        assert!(m.contains("nenhum cliente DHCP entregou um (opção 42)"), "{m}");
+        assert!(m.contains("nenhum cliente DHCP entregou um (opção 42 do DHCPv4, 56 do DHCPv6)"), "{m}");
         assert_eq!(ntp_event(&nobody, &nobody.clone()), None);
     }
 

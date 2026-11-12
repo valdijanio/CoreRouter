@@ -11,6 +11,7 @@
 //! | delegated prefix (IA_PD) | `2001:db8:N:100::/56`, or the hinted length 56..=64 |
 //! | lifetimes | preferred 1800 s, valid 3600 s, T1 900 s, T2 1440 s |
 //! | DNS, domain | `2001:db8:0:N::1`, `lab.test` |
+//! | NTP server (option 56, RFC 5908) | `2001:db8:0:N::1` |
 //!
 //! It honours Rapid Commit. The Router Advertisements of the same lab
 //! router (prefix `2001:db8:0:N::/64`, default route) are the `VirtualHal`'s.
@@ -214,6 +215,10 @@ impl Dhcp6Responder for LabServer6 {
             let mut domain = Vec::new();
             v6::encode_name("lab.test", &mut domain);
             b = b.opt(opt::DOMAIN_LIST, &domain);
+            // RFC 5908 §4.1: one NTP_SUBOPTION_SRV_ADDR.
+            let mut ntp = Vec::new();
+            v6::put(&mut ntp, 1, &dns.octets());
+            b = b.opt(opt::NTP_SERVER, &ntp);
         }
         vec![Datagram6 {
             payload: b.bytes(),

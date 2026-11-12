@@ -504,6 +504,73 @@ proptest::proptest! {
     }
 }
 
+/// G4.3x: the notebook (dev.607): `allowed_from: [LAN]`, ether2 in LAN
+/// with 100.64.0.1/24 and a PPPoE server, profile pool 100.65.0.10–50 (its
+/// `next_pool` .60–.61): the subscribers ask the router's DNS too. Without
+/// the PPPoE server on a LAN interface, they do not.
+#[test]
+fn pppoe_subscribers_of_a_list_interface_are_allowed() {
+    use corerouter_model::config::AddressEntry;
+    use corerouter_model::interface_list::InterfaceListMember;
+    let mut cfg = Config::default();
+    cfg.ip.addresses.push(AddressEntry {
+        id: ItemId(1),
+        address: "100.64.0.1/24".parse().unwrap(),
+        interface: "ether2".parse().unwrap(),
+        disabled: false,
+        comment: String::new(),
+        from_pool: None,
+    });
+    cfg.interface_lists.members.push(InterfaceListMember {
+        id: ItemId(1),
+        list: "LAN".parse().unwrap(),
+        interface: "ether2".parse().unwrap(),
+        disabled: false,
+        comment: String::new(),
+    });
+    cfg.ip.dns.allowed_from = vec!["LAN".into()];
+    cfg.ip.pools = serde_json::from_value(serde_json::json!({"pools": [
+        {"id": "*1", "name": "ppp", "ranges": ["100.65.0.10-100.65.0.50"], "next_pool": "more"},
+        {"id": "*2", "name": "more", "ranges": ["100.65.0.60-100.65.0.61"]}
+    ]}))
+    .unwrap();
+    cfg.ppp.profiles.push(
+        serde_json::from_value(serde_json::json!({"id": "*1", "name": "teste", "remote_address": "ppp", "local_address": "100.65.0.1"}))
+            .unwrap(),
+    );
+    let nets = |cfg: &Config| -> Vec<String> {
+        allowed_networks(cfg)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    };
+    assert_eq!(nets(&cfg), ["100.64.0.0/24"], "no PPPoE server yet");
+    cfg.ppp.pppoe_servers.push(
+        serde_json::from_value(serde_json::json!({"id": "*1", "interface": "ether2"})).unwrap(),
+    );
+    let got = nets(&cfg);
+    for want in [
+        "100.64.0.0/24",
+        "100.65.0.10/31",
+        "100.65.0.12/30",
+        "100.65.0.16/28",
+        "100.65.0.32/28",
+        "100.65.0.48/31",
+        "100.65.0.50/32",
+        "100.65.0.60/31",
+    ] {
+        assert!(got.iter().any(|g| g == want), "{want} not in {got:?}");
+    }
+    let allowed = allowed_networks(&cfg);
+    let inside = |ip: &str| {
+        allowed
+            .iter()
+            .any(|n| n.contains(&ip.parse::<std::net::IpAddr>().unwrap()))
+    };
+    assert!(inside("100.65.0.10") && inside("100.65.0.50") && inside("100.65.0.61"));
+    assert!(!inside("100.65.0.9") && !inside("100.65.0.51") && !inside("100.65.0.62"));
+}
+
 #[test]
 fn allowed_networks_and_validation() {
     use corerouter_model::config::AddressEntry;
