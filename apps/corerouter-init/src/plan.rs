@@ -54,6 +54,30 @@ pub const FRR_SBIN: &str = "/usr/sbin";
 /// applied once, so a later boot does not add it again.
 pub const MGMT_DONE: &str = "/config/.installer-mgmt-applied";
 
+/// G3.4m: open files of the init and so of everything it starts (FRR, the
+/// daemon). `ospfd` opens a write socket per OSPF interface
+/// (`ospf_ifp_sock_init`, ospfd/ospf_network.c, FRR 10.7.1) and its event
+/// loop takes `RLIMIT_NOFILE` as its ceiling (lib/event.c). With the
+/// kernel's 1024 for PID 1, past ~1 000 OSPF interfaces it could not accept
+/// a vty connection any more (the daemon lost FRR) and logged it in a loop
+/// (10 GB in minutes, **medido**, docs/ospf-stress.md). 16 384 matches the
+/// multicast groups CoreRouter allows a socket (`tuning::DEFAULTS`); FRR's
+/// loop keeps two tables of this size, 256 KiB a daemon.
+pub const NOFILE: u64 = 16_384;
+
+/// The `RLIMIT_NOFILE` (soft, hard) to set from the current one: at least
+/// [`NOFILE`], never lower than now (`None` is unlimited).
+pub fn nofile_limits(soft: Option<u64>, hard: Option<u64>) -> (Option<u64>, Option<u64>) {
+    let up = |v: Option<u64>| v.map(|v| v.max(NOFILE));
+    let soft = up(soft);
+    let hard = match (hard, soft) {
+        (None, _) => None,
+        (Some(h), Some(s)) => Some(h.max(s)),
+        (Some(_), None) => None,
+    };
+    (soft, hard)
+}
+
 /// The arguments of one FRR daemon: no TCP vty (`-P 0`: the sockets in
 /// [`FRR_DIR`] only), logs on stdout (the init's log file), a 90 MB netlink
 /// receive buffer for zebra (FRR's recommendation for full tables).
@@ -804,6 +828,15 @@ pub fn kmsg_record(msg: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_files_are_raised_never_lowered() {
+        // The kernel's default for PID 1.
+        assert_eq!(nofile_limits(Some(1024), Some(4096)), (Some(NOFILE), Some(NOFILE)));
+        assert_eq!(nofile_limits(Some(100_000), Some(200_000)), (Some(100_000), Some(200_000)));
+        assert_eq!(nofile_limits(Some(1024), None), (Some(NOFILE), None));
+        assert_eq!(nofile_limits(None, None), (None, None));
+    }
 
     #[test]
     fn unmanaged_option() {

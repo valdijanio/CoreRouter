@@ -97,6 +97,10 @@ done
 
 # vm-lab run holds its lock on fd 9: the daemons started here must not.
 exec 9>&-
+# The open files the image's init gives FRR and the daemon (plan::NOFILE,
+# G3.4m); DUT_NOFILE=1024 is an image from before it (ospfd runs out past
+# ~1 000 OSPF interfaces).
+ulimit -n "${DUT_NOFILE:-16384}"
 [ "$(id -u)" = 0 ] || { echo "run inside the lab VM (cargo xtask vm-lab run)"; exit 1; }
 for t in bngblaster bngblaster-cli lspgen jq vtysh; do
 	command -v "$t" >/dev/null || { echo "$t missing in the VM: cargo xtask vm-lab tools --check"; exit 1; }
@@ -1079,8 +1083,8 @@ test_interfaces() {
 	say ""
 	say "Each active OSPF interface must join AllSPFRouters (224.0.0.5) on ospfd's one socket; \"no group\" counts the ones that could not."
 	say ""
-	say "| interfaces | commit (s) | in ospfd | no group | \`show ip ospf interface json\` p50/max (ms) | its size (KiB) | \`routing.ospf.interface.list\` p50/max (ms) | daemon CPU idle avg/max (%) | ospfd CPU avg/max | removal (s) | result |"
-	say "|---|---|---|---|---|---|---|---|---|---|---|"
+	say "| interfaces | commit (s) | in ospfd | no group | ospfd open files | \`show ip ospf interface json\` p50/max (ms) | its size (KiB) | \`routing.ospf.interface.list\` p50/max (ms) | daemon CPU idle avg/max (%) | ospfd CPU avg/max | removal (s) | result |"
+	say "|---|---|---|---|---|---|---|---|---|---|---|---|"
 	local n
 	for n in ${IFACES//,/ }; do
 		local t0 t_commit verdict=ok csv=$OUT/ifaces-$n.csv
@@ -1116,11 +1120,15 @@ test_interfaces() {
 			cr routing.ospf.interface.list "{\"instance\":\"$INSTANCE\"}" >/dev/null 2>&1 || true
 			since "$t0" >>"$f2"
 		done
-		local nogroup=-
+		local nogroup=- fds=-
 		if [ $DUT = local ]; then
+			fds=$(ls "/proc/$(dut_pid ospfd)/fd" 2>/dev/null | wc -l)
+			if ! vty 'show version' | grep -q FRRouting; then
+				verdict="FAIL (ospfd does not take a vty connection: $fds open files of $(awk '/Max open files/ {print $4}' "/proc/$(dut_pid ospfd)/limits"))"
+			fi
 			size=$(($(stat -c %s "$W/ifaces.json") / 1024))
 			nogroup=$(dut_mcast_missing)
-			[ "$nogroup" -gt 0 ] && verdict="FAIL ($nogroup interfaces without the OSPF multicast group; ospfd: $(mcast_errors) IP_ADD_MEMBERSHIP errors)"
+			[ "$nogroup" -gt 0 ] && [ "$verdict" = ok ] && verdict="FAIL ($nogroup interfaces without the OSPF multicast group; ospfd: $(mcast_errors) IP_ADD_MEMBERSHIP errors)"
 		fi
 		# The daemon reading with nothing else going on: 30 s.
 		sampler_start "$csv"
@@ -1166,7 +1174,7 @@ test_interfaces() {
 		local vp="-"
 		[ -s "$f" ] && vp="$(pct "$f" 50)/$(pct "$f" 100)"
 		[ "$verdict" = ok ] || FAILED=1
-		say "| $n | $(ms2s "$t_commit") | $inospf | $nogroup | $vp | $size | $(pct "$f2" 50)/$(pct "$f2" 100) | $(csv_avg "$csv" daemon_cpu)/$(csv_max "$csv" daemon_cpu) | $(csv_avg "$csv" ospfd_cpu)/$(csv_max "$csv" ospfd_cpu) | $(ms2s "$t_rm") | $verdict |"
+		say "| $n | $(ms2s "$t_commit") | $inospf | $nogroup | $fds | $vp | $size | $(pct "$f2" 50)/$(pct "$f2" 100) | $(csv_avg "$csv" daemon_cpu)/$(csv_max "$csv" daemon_cpu) | $(csv_avg "$csv" ospfd_cpu)/$(csv_max "$csv" ospfd_cpu) | $(ms2s "$t_rm") | $verdict |"
 		[ "$verdict" = ok ] || break
 	done
 	say ""
@@ -1572,6 +1580,19 @@ if [ $DUT = local ] || [ $SELFTEST = 1 ]; then
 	mount_image
 	dut_up
 fi
+# A runaway log (ospfd logged EMFILE in a loop: 10 GB) must not fill the
+# VM's disk: past 256 MiB a log of the DUT is cut, and that is said.
+(
+	while sleep 10; do
+		for f in "$W"/dut/*.log; do
+			[ -f "$f" ] || continue
+			if [ "$(stat -c %s "$f")" -gt $((256 << 20)) ]; then
+				echo "$(date +%T) $(basename "$f") over 256 MiB: last lines kept" >>"$OUT/log-guard.txt"
+				tail -c 1048576 "$f" >"$f.tail" && cp "$f.tail" "$f" && rm -f "$f.tail"
+			fi
+		done
+	done
+) &
 if [ $SELFTEST = 1 ]; then
 	# The management address that the remote mode reaches it by.
 	cr_local ip.address.add '{"address":"10.99.0.1/24","interface":"ether1"}' >/dev/null
@@ -1588,7 +1609,7 @@ say "# OSPF stress ($(date -u +%FT%TZ), DUT $DUT${TARGET:+ $TARGET}, daemon $DAE
 say ""
 say "$(cr system.resource.print | jq -r '"DUT: \(.board_name // "?"), \(.cpu_model // "?"), \(.cpu_count) CPU, \(.total_memory / 1048576 | floor) MiB, CoreRouter \(.version)"')"
 if [ $DUT = local ]; then
-	say "FRR: $(vty 'show version' | head -n 1)"
+	say "FRR: $(vty 'show version' | head -n 1); open files of ospfd: $(awk '/Max open files/ {print $4}' "/proc/$(dut_pid ospfd)/limits")"
 	say "DUT kernel limits: net.ipv4.igmp_max_memberships $(ip netns exec crdut cat /proc/sys/net/ipv4/igmp_max_memberships), net.core.optmem_max $(ip netns exec crdut cat /proc/sys/net/core/optmem_max)"
 else
 	# An image from before G3.4m has neither in its catalog nor raises
@@ -1623,6 +1644,7 @@ if [ "${TESTS}" = none ]; then
 	say "up: $(dut_neighbors_full) full, LSAs $(dut_lsas), routes $(dut_routes), spf $(dut_spf), procs $(proc_sample)"
 	vty 'show ip ospf json' | head -c 3000
 fi
+[ -s "$OUT/log-guard.txt" ] && say "" && say "Log guard: $(wc -l <"$OUT/log-guard.txt") cut(s) of a DUT log over 256 MiB (log-guard.txt)."
 say ""
 say "results: $RESULTS"
 exit $FAILED
