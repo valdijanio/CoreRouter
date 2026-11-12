@@ -1147,7 +1147,7 @@ impl PppoeLab for LabBng {
             out.clear();
             for ev in events {
                 match ev {
-                    Event::Authenticate { session, request } => {
+                    Event::Authenticate { session, request, .. } => {
                         let ok = match &request.method {
                             AuthMethod::Pap { password } => {
                                 !password.is_empty() && password.as_ref() != b"wrong"
