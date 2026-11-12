@@ -47,8 +47,10 @@ if [ "${1:-}" = "--host" ]; then
 	# A round first: an unhealthy VM goes back to its snapshot there, which
 	# would drop what `put` copies.
 	cargo xtask vm-lab run -- true
+	# Under the name this lab reads (vm-lab put copies regular files only:
+	# a symbolic link is skipped).
 	tmp=$(mktemp -d)
-	ln -s "$(realpath "$IMAGES/rootfs.squashfs")" "$tmp/ospf-stress-rootfs.squashfs"
+	cp --reflink=auto "$IMAGES/rootfs.squashfs" "$tmp/ospf-stress-rootfs.squashfs"
 	cargo xtask vm-lab put "$tmp/ospf-stress-rootfs.squashfs"
 	rm -rf "$tmp"
 	exec cargo xtask vm-lab run -- scripts/ospf-stress-lab.sh "$@"
@@ -142,6 +144,12 @@ mount_image() {
 	mount -t tmpfs tmpfs "$W/rw"
 	mkdir -p "$W/rw/upper" "$W/rw/work"
 	mount -t overlay overlay -o "lowerdir=$W/lower,upperdir=$W/rw/upper,workdir=$W/rw/work" "$R"
+	# What the image's init does at boot (pid1.rs): /var is a tmpfs with
+	# log, lib and tmp, and /var/run a link to /run (FRR's state directory
+	# is /var/run/frr).
+	rm -rf "$R/var/run"
+	ln -s /run "$R/var/run"
+	mkdir -p "$R/var/log" "$R/var/lib" "$R/var/tmp"
 }
 
 # In the DUT's namespace, with its own /run and /tmp, the image's root: `$@`.
@@ -195,11 +203,11 @@ daemon_start() {
 		ip netns exec crdut env COREROUTER_RUNTIME_DIR="$W/dut/run/corerouter" \
 			"$CARGO_TARGET_DIR/release/corerouter-daemon" --backend linux --config-dir "$W/dut/tmp/cfg" \
 			--control 7979 --frr "$W/dut/run/frr" --frr-daemons "$W/dut/run/corerouter/frr-daemons" \
-			"${extra[@]}" >>"$W/dut/daemon.log" 2>&1 &
+			--manage 'ether*' "${extra[@]}" >>"$W/dut/daemon.log" 2>&1 &
 	else
 		in_dut /usr/bin/corerouter-daemon --backend linux --config-dir /tmp/cfg --control 7979 \
 			--frr /var/run/frr --frr-daemons /run/corerouter/frr-daemons \
-			"${extra[@]}" >>"$W/dut/daemon.log" 2>&1 &
+			--manage 'ether*' "${extra[@]}" >>"$W/dut/daemon.log" 2>&1 &
 	fi
 	local end=$((SECONDS + 60))
 	until cr_local system.resource.print >/dev/null 2>&1; do
@@ -227,9 +235,9 @@ dut_pid() {
 	return 1
 }
 
+# The DUT's veth ends are its ports: --manage adopts them (a veth whose
+# peer is in another namespace is a container's otherwise, owner.rs).
 dut_up() {
-	ip netns add crdut
-	ip -n crdut link set lo up
 	mkdir -p "$W/dut/run/frr" "$W/dut/run/corerouter" "$W/dut/tmp/cfg"
 	# FRR drops to the image's frr user: its state directory is that user's.
 	local ids
@@ -239,6 +247,9 @@ dut_up() {
 	frr_start
 	daemon_start
 }
+
+# The CLI warns on stderr that admin has no password, on every call.
+export RUST_LOG=error
 
 # --- Commands to the DUT. Local: the local token, from inside crdut.
 # Remote: TLS from inside crgen (where the cable is).
@@ -262,8 +273,8 @@ cr() { # <id> [params]: the reply's JSON on stdout
 }
 ok() { # like cr, but a refusal fails the step
 	local out
-	if ! out=$(cr "$@" 2>&1); then
-		log "command failed: $* → $(printf '%s' "$out" | head -c 400)"
+	if ! out=$(cr "$@" 2>"$W/cr.err"); then
+		log "command failed: $* → $(head -c 400 "$W/cr.err")"
 		return 1
 	fi
 	printf '%s\n' "$out"
@@ -283,8 +294,6 @@ vty() { vtysh --vty_socket "$W/dut/run/frr" -c "$1" 2>/dev/null; }
 
 # --- The generator: BNG Blaster in crgen.
 gen_ns_up() {
-	ip netns add crgen
-	ip -n crgen link set lo up
 	if [ $DUT = local ]; then
 		ip link add ether1 netns crdut type veth peer name gen1 netns crgen
 		ip -n crdut link set ether1 up
@@ -396,7 +405,7 @@ dut_neighbors_full() {
 # SPF runs and the last one's duration (FRR's `show ip ospf json`).
 dut_spf() {
 	[ $DUT = local ] || { echo "- -"; return; }
-	vty 'show ip ospf json' | jq -r '"\(.spfCount // .spfRuns // "-") \(.spfLastDurationMsecs // .spfLastDurationMicroSecs // "-")"'
+	vty 'show ip ospf json' | jq -r '"\([.areas[]?.spfExecutedCounter] | add // 0) \(.spfLastDurationMsecs // "-")"'
 }
 
 # --- Process cost: RSS (MiB) and CPU (% of one core since the previous
@@ -532,7 +541,7 @@ procs_dead() {
 cleanup() {
 	set +e
 	sampler_stop
-	exec 3>&- 4<&- 2>/dev/null
+	exec 3>&- 4<&-
 	gen_stop
 	jobs -p | xargs -r kill 2>/dev/null
 	if [ $DUT = remote ] && [ $SELFTEST = 0 ]; then
@@ -550,7 +559,7 @@ cleanup() {
 }
 trap cleanup EXIT
 cleanup
-trap cleanup EXIT
+set -e
 rm -rf "$W"
 mkdir -p "$W/gen" "$W/lsp"
 dmesg -C 2>/dev/null || true
@@ -564,18 +573,24 @@ log "building ${pkgs[*]} (release)"
 cargo build --release --quiet "${pkgs[@]}"
 CLI=$CARGO_TARGET_DIR/release/corerouter-cli
 
+for ns in crdut crgen; do
+	ip netns add $ns
+	ip -n $ns link set lo up
+done
+if [ $SELFTEST = 1 ]; then
+	# The DUT's port on the "cable": ether1 in crdut, crlink0 here.
+	ip link add ether1 netns crdut type veth peer name crlink0
+	ip -n crdut link set ether1 up
+fi
+gen_ns_up
 if [ $DUT = local ] || [ $SELFTEST = 1 ]; then
 	mount_image
 	dut_up
 fi
 if [ $SELFTEST = 1 ]; then
-	# The DUT's port on the "cable": ether1 in crdut, crlink0 here; the
-	# management address that the remote mode reaches it by.
-	ip link add ether1 netns crdut type veth peer name crlink0
-	ip -n crdut link set ether1 up
+	# The management address that the remote mode reaches it by.
 	cr_local ip.address.add '{"address":"10.99.0.1/24","interface":"ether1"}' >/dev/null
 fi
-gen_ns_up
 if [ $DUT = remote ]; then
 	end=$((SECONDS + 30))
 	until cli_remote run system.resource.print >/dev/null 2>"$W/remote.err"; do
