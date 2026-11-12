@@ -155,9 +155,31 @@ pub trait ReadAt: Sync {
     fn read_exact_at(&self, buf: &mut [u8], at: u64) -> std::io::Result<()>;
 }
 
+#[cfg(unix)]
 impl ReadAt for std::fs::File {
     fn read_exact_at(&self, buf: &mut [u8], at: u64) -> std::io::Result<()> {
         std::os::unix::fs::FileExt::read_exact_at(self, buf, at)
+    }
+}
+
+/// Windows has no `read_exact_at`: `seek_read` reads at an offset but may
+/// return fewer bytes, so it is repeated until the buffer is full.
+#[cfg(windows)]
+impl ReadAt for std::fs::File {
+    fn read_exact_at(&self, mut buf: &mut [u8], mut at: u64) -> std::io::Result<()> {
+        use std::os::windows::fs::FileExt;
+        while !buf.is_empty() {
+            match self.seek_read(buf, at) {
+                Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                Ok(n) => {
+                    buf = buf.get_mut(n..).unwrap_or_default();
+                    at += n as u64;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 }
 
