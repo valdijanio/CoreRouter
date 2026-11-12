@@ -947,12 +947,16 @@ test_churn() {
 	# One tick of lspgen takes ~3 s (it waits before it closes the
 	# socket): the period is that, and k = rate × period LSAs per tick.
 	local d0 t0
+	# The second of two ticks (the first can wait for gen's flooding of the
+	# base LSDB), kept within 1.2..5 s.
 	d0=$(churn_prepare external 1)
-	t0=$(now)
 	churn_tick "$d0" external 100
+	t0=$(now)
+	churn_tick "$d0" external 200
 	CHURN_PERIOD_MS=$(($(since "$t0") + 100))
 	(cd "$d0" && lspgen -r tick.json -S "$BBL_SOCK" -I 1 -Q -G >/dev/null 2>&1) || true
 	[ "$CHURN_PERIOD_MS" -lt 1200 ] && CHURN_PERIOD_MS=1200
+	[ "$CHURN_PERIOD_MS" -gt 5000 ] && CHURN_PERIOD_MS=5000
 	log "churn: one tick takes $CHURN_PERIOD_MS ms"
 	local kind rate
 	for kind in external router; do
