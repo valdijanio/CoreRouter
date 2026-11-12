@@ -34,6 +34,7 @@ use std::net::Ipv4Addr;
 use corerouter_model::ItemId;
 use corerouter_model::cgnat::{Cgnat, Mode, Pool};
 
+use crate::bytecode::fib_saddr_not_local;
 use crate::program::{
     Chain, ChainType, CtKey, Dir, Element, Expr, Hook, NatKind, REG_1, REG32_1, REG32_2, REG32_3,
     Rule, Set, Table, Type, Value, ct_bits, ip_addr, l4_port, l4proto_is, merge, oifname_is,
@@ -496,8 +497,18 @@ pub fn table(c: &Cgnat) -> Option<Table> {
 
     // Blocks mode (G2.3c): a subscriber without a block waits in the queue
     // until the daemon allocates one; then its packet goes on to srcnat.
+    // G2.3g: only what leaves where the pool translates (`out_interface`),
+    // and never what the router sends itself: this chain sees locally
+    // generated packets too, and an `inside` with the router's own address
+    // on the access port (100.64.0.1 of 100.64.0.0/24) gave that address a
+    // block for its DHCP and DNS answers to the subscribers. The address
+    // type is looked up last, so only a packet still without a block pays it.
     for p in pools.iter().filter(|p| p.mode == Mode::Blocks) {
-        let mut exprs = vec![
+        let (mut exprs, mut text): (Vec<Expr>, String) = match &p.out_interface {
+            Some(i) => (oifname_is(i.as_str()).to_vec(), format!("oifname \"{i}\" ")),
+            None => (Vec::new(), String::new()),
+        };
+        exprs.extend([
             ip_addr(true, REG_1),
             Expr::Lookup {
                 set: name("in", p),
@@ -511,8 +522,12 @@ pub fn table(c: &Cgnat) -> Option<Table> {
                 dreg: None,
                 inv: true,
             },
-        ];
-        let mut text = format!("ip saddr @{} ip saddr != @{}", name("in", p), name("d", p));
+        ]);
+        text.push_str(&format!(
+            "ip saddr @{} ip saddr != @{}",
+            name("in", p),
+            name("d", p)
+        ));
         if !exceptions.is_empty() {
             exprs.push(Expr::Lookup {
                 set: "x_1to1".into(),
@@ -522,6 +537,8 @@ pub fn table(c: &Cgnat) -> Option<Table> {
             });
             text.push_str(" ip saddr != @x_1to1");
         }
+        exprs.extend(fib_saddr_not_local());
+        text.push_str(" fib saddr type != local");
         exprs.push(Expr::Queue {
             num: QUEUE_NUM,
             total: 1,
@@ -828,6 +845,56 @@ mod tests {
             "{}",
             r.script
         );
+    }
+
+    /// G2.3g: the blocks queue takes only what leaves through the pool's
+    /// `out_interface`, and never what the router sends itself (its own
+    /// address on the access port inside the pool got a block for its DHCP
+    /// and DNS answers, on a notebook, dev.591).
+    #[test]
+    fn the_blocks_queue_skips_the_router_and_other_ports() {
+        let mut c = Cgnat::default();
+        let mut p = pool(1, "100.64.0.0/24", "203.0.113.0/30", 1000);
+        p.mode = Mode::Blocks;
+        p.out_interface = Some("ether1".parse().unwrap());
+        c.pools.push(p.clone());
+        let t = table(&c).unwrap();
+        let q = t.rules.iter().find(|r| r.chain == "blocks").unwrap();
+        assert_eq!(
+            q.text,
+            "oifname \"ether1\" ip saddr @in_1 ip saddr != @d_1 fib saddr type != local queue num 7422"
+        );
+        assert_eq!(&q.exprs[..2], &oifname_is("ether1")[..]);
+        let fib = q
+            .exprs
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    Expr::Fib {
+                        flags: 1,
+                        result: 3,
+                        ..
+                    }
+                )
+            })
+            .expect("fib saddr type");
+        // After the set lookups: only a packet without a block pays it.
+        let last_lookup = q
+            .exprs
+            .iter()
+            .rposition(|e| matches!(e, Expr::Lookup { .. }))
+            .unwrap();
+        assert!(fib > last_lookup, "{:?}", q.exprs);
+        // No out_interface: any port, still never the router's own.
+        p.out_interface = None;
+        let t = table(&Cgnat {
+            pools: vec![p],
+            ..Cgnat::default()
+        })
+        .unwrap();
+        let q = t.rules.iter().find(|r| r.chain == "blocks").unwrap();
+        assert!(q.text.starts_with("ip saddr @in_1") && q.text.contains("fib saddr type != local"));
     }
 
     #[test]

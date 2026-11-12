@@ -36,7 +36,8 @@ pub const REG_3: u32 = 3;
 pub const REG_4: u32 = 4;
 /// `NF_NAT_RANGE_PROTO_SPECIFIED`.
 pub const NAT_PROTO_SPECIFIED: u32 = 0x2;
-/// `NFT_FIB_F_DADDR` and `NFT_FIB_RESULT_ADDRTYPE`; `RTN_LOCAL`.
+/// `NFT_FIB_F_SADDR`, `NFT_FIB_F_DADDR` and `NFT_FIB_RESULT_ADDRTYPE`; `RTN_LOCAL`.
+pub const FIB_F_SADDR: u32 = 0x1;
 pub const FIB_F_DADDR: u32 = 0x2;
 pub const FIB_RESULT_ADDRTYPE: u32 = 3;
 pub const RTN_LOCAL: u32 = 2;
@@ -699,6 +700,24 @@ pub fn fib_not_local() -> Vec<Expr> {
     vec![
         Expr::Fib {
             flags: FIB_F_DADDR,
+            result: FIB_RESULT_ADDRTYPE,
+            dreg: REG_1,
+        },
+        Expr::Cmp {
+            sreg: REG_1,
+            eq: false,
+            data: RTN_LOCAL.to_ne_bytes().to_vec(),
+        },
+    ]
+}
+
+/// `fib saddr type != local`: the packet was not sent by the router itself
+/// (the kernel's address type of the source, in any hook, postrouting
+/// included: `nft_fib_validate`, no `iif`/`oif` flag).
+pub fn fib_saddr_not_local() -> Vec<Expr> {
+    vec![
+        Expr::Fib {
+            flags: FIB_F_SADDR,
             result: FIB_RESULT_ADDRTYPE,
             dreg: REG_1,
         },
