@@ -30,6 +30,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Mutex, MutexGuard};
 
+mod flight;
+use flight::{Flights, Role};
+
 use corerouter_model::Config;
 use corerouter_model::dns::{CacheRow, Dns, ServerSelection};
 use hickory_proto::rr::RecordType;
@@ -74,7 +77,7 @@ pub trait Transport {
 
 /// Where a lookup goes instead of the configured servers: a static FWD
 /// entry's servers, or a `/ip dns forwarders` group.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Upstreams {
     pub servers: Vec<IpAddr>,
     pub secure: Vec<SecureServer>,
@@ -121,6 +124,9 @@ impl Target {
 /// An encrypted exchange waits at least this long: a TLS handshake is two
 /// round trips more (RouterOS `doh-timeout` 5 s).
 pub const SECURE_TIMEOUT_MS: u64 = 5000;
+/// A lookup waiting for an equal one in flight (G4.1o) gives up this long
+/// after the leader's own deadline.
+const FOLLOW_SLACK_MS: u64 = 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TransportError {
@@ -288,6 +294,8 @@ pub const MAX_FAILURES: usize = 4096;
 #[derive(Debug, Default)]
 pub struct Resolver {
     state: Mutex<State>,
+    /// G4.1o: lookups in flight.
+    flights: Flights,
 }
 
 impl Resolver {
@@ -302,6 +310,7 @@ impl Resolver {
                 stats: BTreeMap::new(),
                 failures: HashMap::new(),
             }),
+            flights: Flights::default(),
         }
     }
 
@@ -473,10 +482,50 @@ impl Resolver {
             };
             (st.settings.clone(), plain, secure)
         };
+        // G4.1o: one lookup per name, type and upstreams in flight; the
+        // equal ones wait for its result (`resolver/flight.rs`).
+        let lead = match self.flights.join((qn.key.clone(), rtype, via.cloned())) {
+            Role::Lead(lead) => lead,
+            Role::Follow(flight) => {
+                let wait =
+                    u64::from(settings.total_timeout_ms).max(SECURE_TIMEOUT_MS) + FOLLOW_SLACK_MS;
+                let until = t.now_ms().saturating_add(wait);
+                return flight.wait(until, &|| t.now_ms()).unwrap_or_else(|| {
+                    Err(ResolveError::Failed {
+                        name: qn.key.clone(),
+                        why: format!(
+                            "no answer in {wait} ms (waiting for the same lookup in flight)"
+                        ),
+                    })
+                });
+            }
+        };
+        // No second look at the cache here: a lookup that missed it just
+        // before the previous leader filled it and joins just after that
+        // leader left asks again (one extra query, rare); the look cost
+        // ~110 ns on every miss (`benches/forwarder.rs`, G4.1r).
+        let r = self.ask(t, qn, rtype, via, &settings, plain, secure);
+        lead.finish(&r);
+        r
+    }
+
+    /// The servers asked for `qn`/`rtype` (the leader of its flight), the
+    /// cache, the failure hold and the server statistics updated.
+    #[allow(clippy::too_many_arguments)]
+    fn ask(
+        &self,
+        t: &mut dyn Transport,
+        qn: &QName,
+        rtype: RecordType,
+        via: Option<&Upstreams>,
+        settings: &Settings,
+        plain: Vec<IpAddr>,
+        secure: Vec<SecureServer>,
+    ) -> Result<Resolved, ResolveError> {
         let mut servers: Vec<Target> = plain.into_iter().map(Target::Plain).collect();
         let mut unresolved: Vec<String> = Vec::new();
         for s in secure {
-            match self.secure_addrs(t, &settings, &s) {
+            match self.secure_addrs(t, settings, &s) {
                 // Two addresses at most: a dead one, then a live one.
                 Ok(ips) => servers.extend(
                     ips.into_iter()
@@ -489,7 +538,7 @@ impl Resolver {
         if servers.is_empty() && !unresolved.is_empty() {
             return Err(failed(qn, &unresolved));
         }
-        let fetched = fetch(t, &settings, &servers, qn, rtype);
+        let fetched = fetch(t, settings, &servers, qn, rtype);
         let asked: Vec<IpAddr> = servers.iter().map(Target::ip).collect();
         let mut st = self.state();
         let now = t.now_ms();
