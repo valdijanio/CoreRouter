@@ -133,6 +133,11 @@ const REQUIRED_KERNEL: &[&str] = &[
     "CONFIG_FRAMEBUFFER_CONSOLE",
     // G1.6zr: /proc/pressure (Resources, the memory pressure check).
     "CONFIG_PSI",
+    // G2.7c: the conntrack of a queued packet, which the CGNAT exhaustion
+    // queues (`cgnat-icmp`) ask for; without it the queue's config is
+    // refused with EOPNOTSUPP. The CI's namespace tests run on the host's
+    // kernel, which has it: only the image could lose it.
+    "CONFIG_NETFILTER_NETLINK_GLUE_CT",
 ];
 /// G1.6j: drivers that must be modules. `ice` asks for its firmware while
 /// probing, which a built-in driver does before `/` is mounted; `e100` and
@@ -1996,12 +2001,14 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
         // With --efi the guest has no address (the built-in command line).
         let seen = if b.efi {
             let skipped = "skipped: no address with --efi".to_owned();
-            (skipped.clone(), skipped.clone(), skipped)
+            (skipped.clone(), skipped.clone(), skipped.clone(), skipped)
         } else {
             (
                 cpus_check(root, &top, port, b.smp)?,
                 sensors_check(root, &top, port)?,
                 audit_check(root, &top, port)?,
+                // Last: it leaves a pool in the (snapshot) config.
+                cgnat_check(root, &top, port)?,
             )
         };
         Ok((r, seen))
@@ -2011,7 +2018,7 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     let _ = std::fs::remove_file(&vars);
     let _ = std::fs::remove_file(&mon);
     let _ = std::fs::remove_file(&nvme);
-    let ((report, wall_ready, ping, web, hot), (cpus, sensors, audit)) = res?;
+    let ((report, wall_ready, ping, web, hot), (cpus, sensors, audit, cgnat)) = res?;
     eprintln!("\nboot-test ok ({}):", if kvm { "KVM" } else { "TCG" });
     eprintln!(
         "  kernel start → daemon answers ping: {:.3} s (corerouter-init)",
@@ -2030,6 +2037,7 @@ fn boot_test(root: &Path, args: &[String]) -> Result<(), String> {
     eprintln!("  sensors (G1.6zf):                   {sensors}");
     eprintln!("  CPUs (G1.6zi):                      {cpus}");
     eprintln!("  PSI and PCI names (G1.6zr):         {audit}");
+    eprintln!("  CGNAT queues (G2.7c):               {cgnat}");
     if let Some(kib) = report.idle_kib {
         eprintln!(
             "  idle memory in use:                 {:.1} MiB",
@@ -2124,6 +2132,59 @@ fn audit_check(root: &Path, top: &Path, port: u16) -> Result<String, String> {
         text("vendor"),
         text("model")
     ))
+}
+
+/// G2.7c: a blocks-mode CGNAT pool brings up both of its queue services
+/// on the image's kernel: `cgnat` (a subscriber's first packet waits for its
+/// block) and `cgnat-icmp` (RFC 6888 REQ-11b, the ICMP to a subscriber out
+/// of ports), each running with no error. The second asks for the
+/// conntrack of queued packets, which a kernel without
+/// `CONFIG_NETFILTER_NETLINK_GLUE_CT` refuses (EOPNOTSUPP): seen on a
+/// notebook (dev.591), never in CI, whose namespace tests use the host's
+/// kernel.
+fn cgnat_check(root: &Path, top: &Path, port: u16) -> Result<String, String> {
+    guest_cli_with(
+        root,
+        top,
+        port,
+        "ip.firewall.cgnat.pool.add",
+        r#"{"name":"boot-test","inside":"100.64.0.0/24","outside":"203.0.113.0/30","mode":"blocks"}"#,
+    )?;
+    // The services look at the config every 2 s.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let got = guest_cli(root, top, port, "system.service.print").unwrap_or_else(|e| e);
+        match cgnat_services(&got) {
+            Ok(seen) => return Ok(seen),
+            Err(why) if Instant::now() >= deadline => {
+                return Err(format!("G2.7c: with a blocks-mode CGNAT pool, {why}"));
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(500)),
+        }
+    }
+}
+
+/// Both CGNAT queue services running without an error in a
+/// `system.service.print` answer, or what is wrong.
+fn cgnat_services(answer: &str) -> Result<String, String> {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(answer.trim())
+        .map_err(|e| format!("system.service.print: {e}: {answer:.300}"))?;
+    let mut seen = Vec::new();
+    for name in ["cgnat", "cgnat-icmp"] {
+        let row = rows
+            .iter()
+            .find(|r| r["name"] == name)
+            .ok_or_else(|| format!("no service {name}"))?;
+        let state = row["state"].as_str().unwrap_or_default();
+        if let Some(e) = row["last_error"].as_str() {
+            return Err(format!("{name} is {state}: {e}"));
+        }
+        if state != "running" {
+            return Err(format!("{name} is {state}"));
+        }
+        seen.push(format!("{name} running ({} threads)", row["threads"]));
+    }
+    Ok(seen.join(", "))
 }
 
 /// G1.6zi: the router uses every CPU the machine has (`system.resource.print`
@@ -2737,6 +2798,23 @@ mod tests {
         for off in KERNEL_OFF {
             assert!(fragment.contains(&format!("# {off} is not set")), "{off}");
         }
+    }
+
+    /// G2.7c: the notebook's answer (dev.591) fails, a good one passes.
+    #[test]
+    fn cgnat_services_want_both_running_without_error() {
+        let bad = r#"[{"name":"cgnat","state":"running","threads":1,"last_error":null},
+            {"name":"cgnat-icmp","state":"running","threads":0,"last_error":"no exhaustion queues: backend rejected the change: netfilter queue 7423: Operation not supported (os error 95)"}]"#;
+        let e = cgnat_services(bad).unwrap_err();
+        assert!(e.contains("cgnat-icmp") && e.contains("os error 95"), "{e}");
+        let good = r#"[{"name":"cgnat","state":"running","threads":1,"last_error":null},
+            {"name":"cgnat-icmp","state":"running","threads":4,"last_error":null}]"#;
+        assert_eq!(
+            cgnat_services(good).unwrap(),
+            "cgnat running (1 threads), cgnat-icmp running (4 threads)"
+        );
+        let off = r#"[{"name":"cgnat","state":"disabled","last_error":null}]"#;
+        assert!(cgnat_services(off).unwrap_err().contains("disabled"));
     }
 
     /// G1.6zf: what `boot-test` wants from `system.health.print`.

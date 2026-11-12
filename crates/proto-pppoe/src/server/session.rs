@@ -76,6 +76,10 @@ pub(crate) struct Session {
     pub vlans: Vlans,
     pub client_mac: Mac,
     pub uniq: u64,
+    /// G4.3w: one-session-per-host, the host's established session this
+    /// one takes over once it authenticates (or reaches the Network phase
+    /// without authentication); until then both live.
+    pub replaces: Option<SessionRef>,
     /// The PADR's Service-Name and its row (G4.3k).
     pub service: Box<[u8]>,
     pub svc: ServiceSlot,
@@ -193,6 +197,7 @@ impl Session {
             vlans: i.vlans,
             client_mac: i.client_mac,
             uniq: i.uniq,
+            replaces: None,
             service: i.service,
             svc: i.svc,
             started_at: Some(now),
@@ -269,6 +274,13 @@ impl Session {
     /// PADS sent, nothing heard from the peer on LCP yet.
     pub fn in_discovery(&self) -> bool {
         !self.heard
+    }
+
+    /// G4.3w: past authentication (or with none asked), not ending: what
+    /// one-session-per-host keeps until the host's next session proves
+    /// itself.
+    pub fn established(&self) -> bool {
+        self.phase == Phase::Network
     }
 
     fn tx<'a>(&self, out: &'a mut Output<Event>) -> SessTx<'a> {
@@ -670,6 +682,7 @@ impl Session {
         self.username = username.clone();
         env.out.events.push(Event::Authenticate {
             session: self.reference(),
+            replaces: self.replaces,
             request: Box::new(AuthRequest {
                 username,
                 method,

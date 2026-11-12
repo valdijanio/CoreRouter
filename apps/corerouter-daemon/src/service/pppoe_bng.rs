@@ -1195,6 +1195,9 @@ struct Sub {
     /// G4.3h: counters carried over from the other node of the pair
     /// (rx bytes, tx bytes, rx packets, tx packets), under the data plane's.
     base: [u64; 4],
+    /// G4.3w: one-session-per-host, the host's session this one takes
+    /// over once its credentials are good (ended in [`Bng::replace_old`]).
+    replaces: Option<SessionRef>,
 }
 
 /// What the hot paths look up in [`Bng::subs`] without walking it
@@ -2468,9 +2471,11 @@ impl Bng {
 
     fn event(&mut self, now: Millis, i: usize, ev: Event) {
         match ev {
-            Event::Authenticate { session, request } => {
-                self.authenticate(now, i, session, &request)
-            }
+            Event::Authenticate {
+                session,
+                replaces,
+                request,
+            } => self.authenticate(now, i, session, replaces, &request),
             Event::NeedAddress { session } => {
                 let a = self.subs.get_mut(&(i, session.sid)).and_then(|sub| {
                     let pool =
@@ -2584,6 +2589,7 @@ impl Bng {
         now: Millis,
         i: usize,
         sref: SessionRef,
+        replaces: Option<SessionRef>,
         req: &corerouter_proto_pppoe::server::AuthRequest,
     ) {
         let user = String::from_utf8_lossy(&req.username).into_owned();
@@ -2645,6 +2651,7 @@ impl Bng {
             want_refused: Vec::new(),
             routes: Vec::new(),
             base: [0; 4],
+            replaces,
         };
         self.index.add((i, sref.sid), &fresh);
         if let Some(old) = self.subs.insert((i, sref.sid), fresh) {
@@ -2661,7 +2668,7 @@ impl Bng {
                     Some(p) if sec.profile == DEFAULT_PROFILE => p.clone(),
                     _ => sec.profile.clone(),
                 };
-                self.local(i, sref, req, &sec, &first, &default_profile)
+                self.local(now, i, sref, req, &sec, &first, &default_profile)
             }
             None => match self.cfg.aaa.clone().filter(|_| self.cfg.ppp.aaa.use_radius) {
                 Some(aaa) => self.ask_radius(now, i, sref, req, &user, &aaa),
@@ -2670,8 +2677,10 @@ impl Bng {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn local(
         &mut self,
+        now: Millis,
         i: usize,
         sref: SessionRef,
         req: &corerouter_proto_pppoe::server::AuthRequest,
@@ -2686,9 +2695,6 @@ impl Bng {
             return self.reject(i, sref, "caller-id mismatch");
         }
         let e = self.cfg.ppp.effective(Some(sec), profile, default_profile);
-        if e.only_one && self.index.users_up.contains_key(&sec.name) {
-            return self.reject(i, sref, "only-one: the user is already connected");
-        }
         // G4.3n: sealed in the config; opened per login (0.5 µs, measured).
         let Some(password) =
             corerouter_engine::sealing::open_with(self.cfg.seal.as_deref(), &sec.password)
@@ -2702,6 +2708,14 @@ impl Bng {
         let Some(mschap2) = req.verify_local(&password) else {
             return self.reject(i, sref, "wrong password");
         };
+        // G4.3w: the password is good, so the host's old session goes now
+        // (one-session-per-host), before `only-one` counts the user's
+        // sessions: a CPE that rebooted is let back in. Checked after the
+        // password, so an unauthenticated try learns nothing either.
+        self.replace_old(now, i, sref);
+        if e.only_one && self.index.users_up.contains_key(&sec.name) {
+            return self.reject(i, sref, "only-one: the user is already connected");
+        }
         let (limit_in, limit_out) = (sec.limit_bytes_in, sec.limit_bytes_out);
         let fixed = match &e.remote_address {
             Some(AddrOrPool::Address(ip)) => Some(*ip),
@@ -2724,6 +2738,25 @@ impl Bng {
                 .collect();
         }
         self.accept(i, sref, mschap2, fixed, pool, rate, timeout, false, None);
+    }
+
+    /// G4.3w: one-session-per-host. Session `sref` proved its credentials:
+    /// the host's old session ends now (PADT, its `Down` handled here: the
+    /// address, the login and the accounting go first), so that a fixed
+    /// address or `only-one` sees it gone. The server would end it anyway
+    /// when the verdict is applied; this only puts it first.
+    fn replace_old(&mut self, now: Millis, i: usize, sref: SessionRef) {
+        let Some(sub) = self.subs.get_mut(&(i, sref.sid)).filter(|s| s.sref == sref) else {
+            return;
+        };
+        if sub.replaces.take().is_none() {
+            return;
+        }
+        let mut out = ServerOutput::new();
+        if let Some(slot) = self.slots.get_mut(i) {
+            slot.server.replace_now(now, sref, &mut out);
+        }
+        self.absorb(now, i, &mut out);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3018,6 +3051,10 @@ impl Bng {
                             sub.effective.address_list = list;
                         }
                     }
+                    // G4.3w: RADIUS accepted the login: the host's old
+                    // session (one-session-per-host) goes before its address
+                    // is reserved again.
+                    self.replace_old(now, i, sref);
                     self.accept(i, sref, mschap2, fixed, pool, rate, timeout, true, interim);
                 }
                 AuthOutcome::Reject | AuthOutcome::Challenge => {

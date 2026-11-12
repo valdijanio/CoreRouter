@@ -1820,3 +1820,67 @@ fn the_vlan_limit_is_the_servers_with_several_workers() {
     assert!(dial(&mut w1, 6));
 }
 
+
+/// G4.3w: on the notebook (dev.591) a CPE with the subscriber's MAC and an
+/// unknown login ("no such user") ended the authenticated session
+/// ("replaced … one-session-per-host") at every try. Now the old session
+/// stays until the new one's credentials are good; a CPE that really
+/// rebooted still comes back, also with a fixed address and `only-one`
+/// (the old session's address and login are freed first).
+#[test]
+fn a_copied_mac_without_the_password_does_not_end_the_session() {
+    // No keepalive: the lab swaps the CPE out, and nothing would answer the
+    // old session's echoes (a real one still does while the copy tries).
+    let mut srv = server(serde_json::json!({}));
+    srv.keepalive_timeout = None;
+    let mut s = snap(1, srv, 100);
+    s.ppp.profiles[0].only_one = corerouter_model::ppp::Tri::Yes;
+    let mut secrets: Vec<PppSecret> = s.ppp.secrets.to_vec();
+    secrets[0].remote_address = Some(Ipv4Addr::new(100, 64, 9, 9));
+    s.ppp.secrets = corerouter_model::ppp_secrets::Secrets::new(secrets);
+    let mut lab = Lab::new(1, s, |i| (format!("u{i}"), format!("p{i}")));
+    lab.start(0..1);
+    lab.run(100, 50);
+    assert_eq!(lab.ups(), 1);
+    let first = lab.backend().active().pop().unwrap();
+    assert_eq!(first.address, Some(Ipv4Addr::new(100, 64, 9, 9)));
+    let good = lab.clients[0].config().clone();
+    // A fresh client with the same MAC: as on the notebook, an unknown login.
+    let reboot = |lab: &mut Lab, cfg: ClientConfig, n: u8| {
+        lab.clients[0] = Client::new(cfg, [n; 32]);
+        lab.up[0] = false;
+        let mut out = ClientOutput::new();
+        lab.clients[0].start(lab.now, &mut out);
+        lab.feed(&mut out);
+        lab.run(200, 50);
+    };
+    for n in 0..3 {
+        let mut bad = good.clone();
+        bad.username = b"vv123".to_vec();
+        bad.password = "x".into();
+        reboot(&mut lab, bad, 10 + n);
+        let active = lab.backend().active();
+        assert_eq!(active.len(), 1, "try {n}: {:?}", lab.backend().history());
+        assert_eq!((active[0].name.as_str(), active[0].id.as_str()), ("u0", first.id.as_str()), "try {n}");
+        assert!(
+            lab.backend().history().iter().all(|h| h.reason != "replaced"),
+            "try {n}: {:?}",
+            lab.backend().history()
+        );
+        lab.bng.check().unwrap();
+    }
+    // The wrong password of the right login: the same.
+    let mut wrong = good.clone();
+    wrong.password = "nope".into();
+    reboot(&mut lab, wrong, 20);
+    assert_eq!(lab.backend().active().pop().map(|a| a.id), Some(first.id.clone()));
+    // The CPE really rebooted: back, with its fixed address, despite only-one.
+    reboot(&mut lab, good, 30);
+    assert_eq!(lab.ups(), 1);
+    let back = lab.backend().active().pop().unwrap();
+    assert_ne!(back.id, first.id);
+    assert_eq!(back.address, Some(Ipv4Addr::new(100, 64, 9, 9)));
+    let replaced = lab.backend().history().iter().filter(|h| h.reason == "replaced").count();
+    assert_eq!(replaced, 1, "{:?}", lab.backend().history());
+    lab.bng.check().unwrap();
+}

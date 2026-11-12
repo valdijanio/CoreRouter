@@ -322,6 +322,12 @@ CONFIG_NF_CONNTRACK_EVENTS=y
 CONFIG_NF_CONNTRACK_TIMEOUT=y
 CONFIG_NF_CONNTRACK_FTP=y
 CONFIG_NF_CT_NETLINK=y
+# G2.7c: the conntrack of a queued packet (NFQA_CFG_F_CONNTRACK, NFQA_CT).
+# The CGNAT exhaustion queues (cgnat-icmp, RFC 6888 REQ-11b) ask for it;
+# without this option nfnetlink_queue refuses the flag with EOPNOTSUPP
+# (net/netfilter/nfnetlink_queue.c, `nfnl_ct_hook` is never set) and no
+# subscriber out of ports gets the ICMP. A bool, `default n`.
+CONFIG_NETFILTER_NETLINK_GLUE_CT=y
 CONFIG_NF_NAT=y
 CONFIG_NF_TABLES=y
 CONFIG_NF_TABLES_INET=y

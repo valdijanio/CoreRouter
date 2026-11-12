@@ -432,7 +432,9 @@ impl Lab {
 
     fn server_event(&mut self, shard: usize, ev: &Event) {
         match ev {
-            Event::Authenticate { session, request } => {
+            Event::Authenticate {
+                session, request, ..
+            } => {
                 self.auth_services.push(request.service.to_vec());
                 let i = self
                     .by_mac
