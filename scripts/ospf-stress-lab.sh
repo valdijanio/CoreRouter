@@ -1358,7 +1358,7 @@ test_ops() {
 	if t_back=$(recovered 1200); then t_back=$(since "$t0"); else t_back=- verdict="FAIL (not back)"; fi
 	sampler_stop
 	local resync
-	resync=$(grep -c -i 'resync\|installed again\|attached to FRR' "$W/dut/daemon.log" || true)
+	resync=$(grep -c 'FRR restarted\|running config installed' "$W/dut/daemon.log" || true)
 	say "| FRR killed and started (routing_resync; daemon log lines: $resync) | - | $(secs "$t_back") | $(csv_min "$csv" lsas) / $(csv_min "$csv" routes) | $(recovered_now && echo yes || echo NO) | $verdict |"
 	[ "$verdict" = ok ] || FAILED=1
 
@@ -1404,12 +1404,20 @@ LAT_CMDS=(
 test_latency() {
 	say "## 5. Command latency with load ($LOADED_LSAS LSAs, $LOADED_ROUTES routes; $LAT_N calls each)"
 	say ""
-	say "| command | reply (bytes) | reply | CLI p50 (ms) | CLI p99 | MCP p50 (ms) | MCP p99 |"
-	say "|---|---|---|---|---|---|---|"
+	say "The LSDB and the route list are read on demand (G3.4n): the first call says \`pending\` and asks the FRR thread; \"first full\" is how long until a call answers with the rows. The percentiles are of full answers."
+	say ""
+	say "| command | first full (s) | reply (bytes) | reply | CLI p50 (ms) | CLI p99 | MCP p50 (ms) | MCP p99 |"
+	say "|---|---|---|---|---|---|---|---|"
 	local e id params f t0 size
 	for e in "${LAT_CMDS[@]}" "inspect|"; do
 		id=${e%%|*} params=${e#*|}
 		f=$W/lat-$id
+		# Until the answer is not `pending` (an on-demand read is done).
+		local first="-"
+		if [ "$id" != inspect ]; then
+			first_full() { cr "$id" "$params" 2>/dev/null | jq -e 'type != "object" or (.pending // false) == false' >/dev/null; }
+			first=$(wait_for "$id full" 60 first_full) && first=$(ms2s "$first") || first="> 60"
+		fi
 		: >"$f.cli"
 		: >"$f.mcp"
 		local i
@@ -1446,7 +1454,7 @@ test_latency() {
 			since "$t0" >>"$f.mcp"
 		done
 		mcp_close
-		say "| \`$id\` | $size | $note | $(pct "$f.cli" 50) | $(pct "$f.cli" 99) | $(pct "$f.mcp" 50) | $(pct "$f.mcp" 99) |"
+		say "| \`$id\` | $first | $size | $note | $(pct "$f.cli" 50) | $(pct "$f.cli" 99) | $(pct "$f.mcp" 50) | $(pct "$f.mcp" 99) |"
 	done
 	say ""
 }
