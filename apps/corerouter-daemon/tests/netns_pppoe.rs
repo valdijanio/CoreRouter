@@ -348,6 +348,80 @@ fn pppoe_server_end_to_end() {
         echo_through(&mut one, sid, ip, Ipv4Addr::new(100, 65, 0, 1)),
         "the gateway (the profile's local_address) answered the subscriber"
     );
+    // G4.3x: not only ICMP: the router's DNS over UDP and a TCP port of the
+    // router answer too (on the notebook, dev.607, ping worked and dig and a
+    // TCP connect to 100.65.0.1 timed out).
+    // The access port in LAN (`allowed_from` is LAN by default): its PPPoE
+    // subscribers may ask too, not only the port's own network.
+    ok(
+        "interface.list.member.add",
+        json!({"list": "LAN", "interface": "acc0"}),
+    );
+    ok("ip.dns.set", json!({"allow_remote_requests": true}));
+    wait_for("the DNS server", || {
+        ok("system.service.print", json!({}))
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["name"] == "dns-server" && r["state"] == "running")
+    });
+    let gw = Ipv4Addr::new(100, 65, 0, 1);
+    let dns = through(&mut one, sid, &udp_dns(ip, gw, 40053), |r| {
+        r[9] == 17 && r[12..16] == gw.octets() && r[20..22] == 53u16.to_be_bytes()
+    });
+    let dns = dns.expect("the router's DNS answered over UDP through the slow path");
+    // The notebook (dev.607): the answer left with the checksum the kernel
+    // leaves to the device (bng0 is a dummy with HW_CSUM): the subscriber's
+    // stack dropped it. What reaches the subscriber is whole.
+    assert!(
+        l4_checksum_ok(&dns),
+        "UDP checksum of the DNS answer: {dns:x?}"
+    );
+    assert_ne!(
+        dns[31] & 0x0f,
+        5,
+        "a subscriber of a LAN port is not REFUSED: {dns:x?}"
+    );
+    let syn = through(&mut one, sid, &tcp_syn(ip, gw, 40054, 53), |r| {
+        r[9] == 6 && r[12..16] == gw.octets() && r[20..22] == 53u16.to_be_bytes()
+    });
+    let syn = syn.expect("the router answered the TCP SYN through the slow path");
+    assert_eq!(
+        syn[33] & 0x12,
+        0x12,
+        "SYN-ACK from the DNS TCP listener: {syn:x?}"
+    );
+    assert!(
+        l4_checksum_ok(&syn),
+        "TCP checksum of the SYN-ACK: {syn:x?}"
+    );
+    // G4.3x: bng0 hands out whole packets: no checksum offload, no
+    // segmentation offload (a 64 KB TCP packet of the router's own would
+    // not fit a PPPoE frame: the bandwidth test to the gateway).
+    let feats = std::process::Command::new("ethtool")
+        .args(["-k", "bng0"])
+        .output();
+    if let Some(o) = feats.ok().filter(|o| o.status.success()) {
+        let text = String::from_utf8_lossy(&o.stdout).into_owned();
+        for f in ["tx-checksum-ip-generic: off", "scatter-gather: off"] {
+            assert!(text.contains(f), "{f} in:\n{text}");
+        }
+        let segmenting: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| (l.starts_with("tx-tcp") || l.starts_with("tx-udp-")) && l.contains(": on"))
+            .collect();
+        assert!(segmenting.is_empty(), "{segmenting:?} in:\n{text}");
+    }
+    // G4.3x: the slow path's device can be captured (it is not in the
+    // config: the notebook refused it), a name the kernel has not cannot.
+    let cap = ok(
+        "tool.sniffer.start",
+        json!({"interface": "bng0", "duration": 1}),
+    );
+    assert!(cap["id"].as_u64().is_some(), "{cap}");
+    let e = call(None, "tool.sniffer.start", json!({"interface": "nope0"})).unwrap_err();
+    assert!(e.contains("no interface 'nope0'"), "{e}");
     ok(
         "ppp.profile.set",
         json!({"id": "default", "local_address": ""}),
@@ -538,15 +612,21 @@ fn pppoe_server_end_to_end() {
 /// An ICMP echo from session `sid` (address `ip`) to `dst`, sent through
 /// the PPPoE session until its reply comes back encapsulated (5 s at most).
 fn echo_through(one: &mut Cpes, sid: u16, ip: Ipv4Addr, dst: Ipv4Addr) -> bool {
-    let echo = icmp_echo(ip, dst);
+    through(one, sid, &icmp_echo(ip, dst), |r| r[9] == 1 && r[20] == 0).is_some()
+}
+
+/// IPv4 packet `pkt` from session `sid`, sent through the PPPoE session
+/// until a reply (an IPv4 packet `want` accepts) comes back encapsulated;
+/// the reply (5 s at most).
+fn through(one: &mut Cpes, sid: u16, pkt: &[u8], want: impl Fn(&[u8]) -> bool) -> Option<Vec<u8>> {
     let mut f = Vec::new();
     f.extend_from_slice(&row_mac(one));
     f.extend_from_slice(&[0x02, 0x20, 0, 0, 0, 0x01]);
     f.extend_from_slice(&[0x88, 0x64, 0x11, 0x00]);
     f.extend_from_slice(&sid.to_be_bytes());
-    f.extend_from_slice(&((echo.len() + 2) as u16).to_be_bytes());
+    f.extend_from_slice(&((pkt.len() + 2) as u16).to_be_bytes());
     f.extend_from_slice(&[0x00, 0x21]);
-    f.extend_from_slice(&echo);
+    f.extend_from_slice(pkt);
     let mut reply = None;
     for _ in 0..20 {
         one.port.send(&f).unwrap();
@@ -554,14 +634,13 @@ fn echo_through(one: &mut Cpes, sid: u16, ip: Ipv4Addr, dst: Ipv4Addr) -> bool {
         while t.elapsed() < Duration::from_millis(250) && reply.is_none() {
             one.port
                 .recv(|fr| {
-                    // PPPoE session, IPv4, ICMP echo reply (type 0).
+                    // PPPoE session, IPv4.
                     if fr.len() > 42
                         && fr[12..14] == [0x88, 0x64]
                         && fr[20..22] == [0x00, 0x21]
-                        && fr[31] == 1
-                        && fr[42] == 0
+                        && want(&fr[22..])
                     {
-                        reply = Some(fr.to_vec());
+                        reply = Some(fr[22..].to_vec());
                     }
                 })
                 .unwrap();
@@ -571,7 +650,75 @@ fn echo_through(one: &mut Cpes, sid: u16, ip: Ipv4Addr, dst: Ipv4Addr) -> bool {
             break;
         }
     }
-    reply.is_some()
+    reply
+}
+
+/// An IPv4 header for `len` bytes of protocol `proto`, then `l4`.
+fn ipv4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, l4: &[u8]) -> Vec<u8> {
+    let total = (20 + l4.len()) as u16;
+    let mut ip = vec![0x45, 0, 0, 0, 0, 2, 0, 0, 64, proto, 0, 0];
+    ip[2..4].copy_from_slice(&total.to_be_bytes());
+    ip.extend_from_slice(&src.octets());
+    ip.extend_from_slice(&dst.octets());
+    let c = csum(&ip);
+    ip[10..12].copy_from_slice(&c.to_be_bytes());
+    ip.extend_from_slice(l4);
+    ip
+}
+
+/// The TCP/UDP checksum over the pseudo-header (RFC 793 §3.1, RFC 768).
+fn l4_csum(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, l4: &[u8]) -> u16 {
+    let mut b = Vec::new();
+    b.extend_from_slice(&src.octets());
+    b.extend_from_slice(&dst.octets());
+    b.extend_from_slice(&[0, proto]);
+    b.extend_from_slice(&(l4.len() as u16).to_be_bytes());
+    b.extend_from_slice(l4);
+    csum(&b)
+}
+
+/// Whether the TCP or UDP checksum of IPv4 packet `ip` is right (UDP 0:
+/// none, RFC 768).
+fn l4_checksum_ok(ip: &[u8]) -> bool {
+    let hl = usize::from(ip[0] & 0x0f) * 4;
+    let total = usize::from(u16::from_be_bytes([ip[2], ip[3]])).min(ip.len());
+    let l4 = &ip[hl..total];
+    if ip[9] == 17 && l4[6..8] == [0, 0] {
+        return true;
+    }
+    let src = Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]);
+    let dst = Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]);
+    l4_csum(src, dst, ip[9], l4) == 0
+}
+
+/// A DNS query (A of `teste.lan`) over UDP to `dst`:53.
+fn udp_dns(src: Ipv4Addr, dst: Ipv4Addr, sport: u16) -> Vec<u8> {
+    let mut q = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+    q.extend_from_slice(b"\x05teste\x03lan\x00");
+    q.extend_from_slice(&[0, 1, 0, 1]);
+    let mut udp = Vec::new();
+    udp.extend_from_slice(&sport.to_be_bytes());
+    udp.extend_from_slice(&53u16.to_be_bytes());
+    udp.extend_from_slice(&((8 + q.len()) as u16).to_be_bytes());
+    udp.extend_from_slice(&[0, 0]);
+    udp.extend_from_slice(&q);
+    let c = l4_csum(src, dst, 17, &udp);
+    udp[6..8].copy_from_slice(&c.to_be_bytes());
+    ipv4(src, dst, 17, &udp)
+}
+
+/// A TCP SYN to `dst`:`dport`.
+fn tcp_syn(src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16) -> Vec<u8> {
+    let mut tcp = Vec::new();
+    tcp.extend_from_slice(&sport.to_be_bytes());
+    tcp.extend_from_slice(&dport.to_be_bytes());
+    tcp.extend_from_slice(&0x0102_0304u32.to_be_bytes());
+    tcp.extend_from_slice(&[0, 0, 0, 0]);
+    // Header 20 bytes, SYN; window 64240; checksum; urgent.
+    tcp.extend_from_slice(&[0x50, 0x02, 0xfa, 0xf0, 0, 0, 0, 0]);
+    let c = l4_csum(src, dst, 6, &tcp);
+    tcp[16..18].copy_from_slice(&c.to_be_bytes());
+    ipv4(src, dst, 6, &tcp)
 }
 
 /// `ip <args>` in this namespace, its output.

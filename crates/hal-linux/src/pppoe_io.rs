@@ -825,8 +825,51 @@ pub(crate) fn ensure_dummy(name: &str) -> io::Result<u32> {
             .await
             .map_err(|e| io::Error::other(format!("setting {name} up: {e}")))?;
         task.abort();
+        Ok::<_, io::Error>(index)
+    })
+    .and_then(|index| {
+        plain_tx(name)?;
         Ok(index)
     })
+}
+
+/// G4.3x: what the kernel sends to the dummy is whole: no checksum offload
+/// (a dummy has `NETIF_F_HW_CSUM`, so a TCP or UDP packet the router itself
+/// answered left with `CHECKSUM_PARTIAL`, its checksum never filled in: the
+/// slow path encapsulated it as it was and the subscriber's stack dropped
+/// it; ping worked, DNS and TCP to the gateway did not, on a notebook,
+/// dev.607) and no scatter-gather, so no TSO either (`netdev_fix_features`
+/// drops it with them): a 64 KB TCP super-packet would not fit a PPPoE
+/// frame. The tc program of the XDP delivery (`bng_egress`) gets the same
+/// finished packets.
+pub(crate) fn plain_tx(name: &str) -> io::Result<()> {
+    let set = |names: &[&str]| -> io::Result<()> {
+        let off: std::collections::BTreeMap<String, bool> =
+            names.iter().map(|f| ((*f).to_owned(), false)).collect();
+        let mut e = crate::ethtool::Ethtool::open(name)
+            .map_err(|e| io::Error::other(format!("{name}: ethtool: {e}")))?;
+        e.set_features(&off)
+            .map_err(|e| io::Error::other(format!("{name}: turning the TX offloads off: {e}")))
+    };
+    set(&[
+        "tx-checksum-ip-generic",
+        "tx-scatter-gather",
+        "tx-tcp-segmentation",
+    ])?;
+    // Segmentation offloads a kernel may lack (AccECN is 7.0's): each on
+    // its own, a name the kernel does not know is no failure.
+    for f in [
+        "tx-scatter-gather-fraglist",
+        "tx-tcp6-segmentation",
+        "tx-tcp-ecn-segmentation",
+        "tx-tcp-mangleid-segmentation",
+        "tx-tcp-accecn-segmentation",
+        "tx-udp-segmentation",
+        "tx-gso-partial",
+    ] {
+        let _ = set(&[f]);
+    }
+    Ok(())
 }
 
 fn route(ifindex: u32, ip: Ipv4Addr, add: bool) -> io::Result<()> {
