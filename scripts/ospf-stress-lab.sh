@@ -850,7 +850,8 @@ churn_prepare() { # <kind> <k> → dir
 # external: the first prefix; router: the /32 of a node that is not the
 # root (its cost goes through links whose metric flips). PROBE_LSA: the LSA
 # that carries it, for the LSDB's lag.
-# router: the farthest route of the churn node's topology as the DUT has it
+# router: the farthest link (172.30.0.0/16: lspgen gives OSPFv2 node
+# prefixes only in SR's extended prefix LSAs, off here) as the DUT has it
 # (its cost has to move when every link does); lspgen's node ids are not
 # the LSA ids, so no LSDB lag for this kind. Called after the first tick.
 churn_probe() { # <dir> <kind>: sets PROBE and PROBE_LSA
@@ -859,10 +860,10 @@ churn_probe() { # <dir> <kind>: sets PROBE and PROBE_LSA
 	else
 		PROBE_LSA=""
 		if [ $DUT = local ]; then
-			PROBE=$(vty 'show ip route ospf json' | jq -r '[to_entries[] | select(.key | startswith("10.200.")) |
+			PROBE=$(vty 'show ip route ospf json' | jq -r '[to_entries[] | select(.key | startswith("172.30.")) |
 				{k: .key, m: .value[0].metric}] | max_by(.m) | .k // empty')
 		else
-			PROBE=$(cr routing.ospf.route.list "{\"instance\":\"$INSTANCE\",\"find\":\"10.200.\",\"limit\":1000}" |
+			PROBE=$(cr routing.ospf.route.list "{\"instance\":\"$INSTANCE\",\"find\":\"172.30.\",\"limit\":1000}" |
 				jq -r '[.rows[] | {k: .prefix, m: .cost}] | max_by(.m) | .k // empty')
 		fi
 	fi
