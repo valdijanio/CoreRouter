@@ -815,8 +815,8 @@ fn periodic_ras_are_spread_between_min_and_max() {
     // 20 minutes later every session has had its 3 initial RAs (≤ 16 s
     // apart, RFC 4861 §6.2.4) and one or two more (200–600 s).
     lab.run(1200, 1000);
-    for c in 0..n {
-        let ras = lab.v6[c].iter().filter(|p| nd::parse_ra(p).is_ok()).count();
+    for (c, v6) in lab.v6.iter().enumerate().take(n) {
+        let ras = v6.iter().filter(|p| nd::parse_ra(p).is_ok()).count();
         assert!((3..=8).contains(&ras), "client {c}: {ras} RAs");
     }
 }
@@ -869,10 +869,10 @@ fn radius_prefixes_win_and_reach_the_accounting() {
     s.aaa = Some(aaa.clone());
     let mut lab = Lab::new(2, s, |i| (format!("r{i}"), "x".into()));
     v6_clients(&mut lab);
-    for i in 0..2 {
-        let mut cfg = lab.clients[i].config().clone();
+    for (i, client) in lab.clients.iter_mut().enumerate().take(2) {
+        let mut cfg = client.config().clone();
         cfg.auth = corerouter_proto_pppoe::layers::AuthSet::new(&[corerouter_proto_pppoe::lcp::AuthProto::Pap]);
-        lab.clients[i] = Client::new(cfg, [9 + i as u8; 32]);
+        *client = Client::new(cfg, [9 + i as u8; 32]);
     }
     lab.start(0..2);
     lab.run(200, 50);
