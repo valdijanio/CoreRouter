@@ -431,3 +431,47 @@ fn blocks_and_an_exhausted_pool_reach_the_ipfix_queue() {
     assert_eq!(exhausted.len(), 1, "rate-limited: {out:?}");
     assert!(s.nat_log().unwrap().suppressed >= 49);
 }
+
+/// G2.3g: the router's own address inside a blocks-mode pool (its gateway
+/// on the access port) never gets a block, and the pool says so.
+#[test]
+fn the_routers_own_address_gets_no_block() {
+    let mut s = Session::virtual_lab();
+    s.tick(T0);
+    ok(
+        &mut s,
+        "ip.address.add",
+        json!({"address": "100.64.0.1/22", "interface": "ether2"}),
+    );
+    let mut p = json!({"name": "pba", "mode": "blocks", "inside": "100.64.0.0/22", "outside": "203.0.113.0/30"});
+    p["out_interface"] = json!("ether1");
+    let added = ok(&mut s, "ip.firewall.cgnat.pool.add", p);
+    let warnings = added["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| w
+            .as_str()
+            .unwrap()
+            .contains("100.64.0.1 is an address of the router")),
+        "{added}"
+    );
+    let why = s
+        .cgnat_block_for("100.64.0.1".parse().unwrap(), T0 + 2)
+        .unwrap_err();
+    assert!(
+        why.contains(corerouter_engine::cgnat_blocks::ROUTER_ADDRESS),
+        "{why}"
+    );
+    s.tick(T0 + 3);
+    assert!(
+        blocks(&mut s)
+            .iter()
+            .all(|r| r["subscriber"] != "100.64.0.1"),
+        "{:?}",
+        blocks(&mut s)
+    );
+    // A subscriber still gets one.
+    assert!(
+        s.cgnat_block_for("100.64.0.100".parse().unwrap(), T0 + 4)
+            .is_ok()
+    );
+}
