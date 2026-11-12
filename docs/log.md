@@ -11565,3 +11565,227 @@ continuação indentadas).
   substitui), `server::tests::a_waiting_attempt_gives_way_to_a_newer_one_and_replace_now_ends_the_old`
   e `pppoe_bng_tests::a_copied_mac_without_the_password_does_not_end_the_session` (o cenário do
   notebook, com endereço fixo e `only-one` na volta). Sem o `replace_old`, a volta é recusada.
+
+- 2026-11-12 — G1.26k: System › Tuning › Profiles: aplicar o perfil sem ir ao Summary. No notebook (dev.595), o operador
+  escolheu "High throughput" no seletor do alto, na aba Profiles, e achou que tinha gravado. O
+  seletor só troca o perfil comparado; o botão de aplicar morava só no Summary.
+
+  Agora a aba Profiles mostra:
+  - a linha "Picking a profile at the top only compares it: nothing changes until you apply it."
+    com o selo âmbar "compare only" e o ⓘ dos perfis (em português: "Escolher um perfil no alto só
+    o compara…");
+  - as mesmas ações do Summary para o perfil escolhido: quantos parâmetros mudam, "Show
+    differences" e "Apply with Safe Mode" (entra em Safe Mode e roda
+    `system.tuning.profile.apply`), com a lembrança de confirmar no botão Safe Mode da barra;
+  - o selo azul "picked" no cabeçalho da coluna do perfil escolhido.
+
+  A explicação ⓘ "Profiles" diz que escolher só compara e que o botão aplica, nos dois lugares.
+
+  Como testar:
+  - `cargo test -p corerouter-ui --lib profiles_tab_applies_the_picked_profile_with_safe_mode`
+    (escolhe throughput, confere que nada mudou, clica o botão da aba Profiles, confere o Safe Mode
+    e os valores do throughput gravados);
+  - GUI: System › Tuning › Profiles, escolher "High throughput" no seletor, "Apply with Safe Mode".
+
+- 2026-11-12 — G1.6ql: System › Resources › Memory: o que o próprio kernel usa. No notebook (dev.595), o operador aplicou
+  o perfil throughput (`nf_conntrack_max` 3 080 192, **medido**) e procurou o aumento na aba Memory.
+  Não achou nada, porque o limite não reserva memória: cada conexão é um objeto do slab
+  `nf_conntrack`, alocado quando chega.
+
+  A aba ganhou a seção "Kernel", com ⓘ em cada linha (português e inglês):
+  - **Connections**: em uso / limite e a porcentagem;
+  - **Conntrack memory**: as entradas agora e a tabela cheia (limite × entrada), com o tamanho de
+    uma entrada e se ele foi **medido** (objeto do slab lido do kernel) ou **estimado** (320 B);
+  - **Lookup table**: `nf_conntrack_buckets × 8 B`, a única parte alocada inteira;
+  - **Slab**: recuperável (`SReclaimable`) e não recuperável (`SUnreclaim`);
+  - **Page cache**: `Cached + Buffers`.
+
+  O `system.resource.print` traz os mesmos números no objeto `kernel: {conntrack: {count, max,
+  buckets, entry_bytes, entry_source, used_bytes, full_bytes, table_bytes}, slab_reclaimable,
+  slab_unreclaimable, page_cache}`. O `memory` ganhou `slab_reclaimable`/`slab_unreclaimable`.
+
+  Leitura no Linux (`hal-linux`):
+  - o slab vem dos três arquivos do SLUB em `/sys/kernel/slab/nf_conntrack` (`slab_size`,
+    `objects`, `total_objects`), só deste cache;
+  - sem esse diretório, de `/proc/slabinfo`;
+  - os dois só o root lê. O daemon do roteador roda como root; fora dele, o tamanho é estimado.
+
+  Tamanho de uma entrada:
+  - o objeto tem 256 B: `struct nf_conn` de 248 B no Linux 7.0.0-42 (BTF, **medido**), alinhado
+    à linha de cache;
+  - as extensões (NAT, contadores, horários) vêm à parte do kmalloc: uns 64 B, **estimado**;
+  - a soma (320 B) é a mesma constante que o Tuning usa para limitar o `nf_conntrack_max` à RAM.
+
+  Como testar:
+  - `cargo test -p corerouter-hal-linux --lib resource::tests`
+  - `cargo test -p corerouter-engine --lib cmd::system_resource`
+  - `cargo test -p corerouter-ui --lib the_memory_tab_shows_what_the_kernel_uses`
+  - GUI: System › Resources › Memory.
+
+- 2026-11-12 — G1.6zt: Atualização: não reinicia mais por cima do Safe Mode. No notebook (dev.607), o usuário aplicou o
+  perfil throughput do Tuning pela GUI com "Apply with Safe Mode" e não confirmou; o
+  `system.package.upload` reiniciou o roteador e o perfil sumiu sem aviso. O `nf_conntrack_max`
+  voltou de 3 080 192 para 262 144, e não ficou revisão no `config.history`.
+
+  O `system.reboot` já recusava esse caso (`force`). Agora a mesma trava (`restart_guard`, com as
+  mesmas mensagens) vale para todo job que reinicia o roteador: `system.package.update`,
+  `upload.start`, `download`, `downgrade` e `system.tuning.boot.apply`. Ele recusa:
+  - o Safe Mode ligado: o boot desfaz o que foi feito desde a entrada (sair com
+    `config.safe-mode.exit` guarda as mudanças);
+  - as mudanças não confirmadas de uma transação, que se perderiam (`config.commit`).
+
+  Para passar por cima, `force=true`. Só conferir (`check`) ou instalar sem reiniciar (`reboot:
+  false`) não pede nada. A CLI `upload` mostra a recusa, e `'{"force":true}'` nos parâmetros passa
+  por cima.
+
+  Teste (falha sem a correção): `package::tests::a_rebooting_job_refuses_safe_mode_and_uncommitted_changes`.
+
+- 2026-11-12 — G2.3h: CGNAT: avisa quando o conntrack do kernel não comporta os pools. Cada conexão traduzida é uma
+  entrada do conntrack; com a tabela cheia, o kernel descarta conexões novas, mesmo com portas
+  sobrando no pool. No notebook (dev.595), o pool `teste` tinha 1280 assinantes contra o padrão do
+  kernel de 262 144 entradas (máquina com mais de 4 GB). Com 300 conexões por assinante, eles
+  precisam de 384 000.
+
+  A conta é feita assim:
+  - assinantes de todos os pools ligados × `connections_per_subscriber`, configurável em
+    `ip.firewall.cgnat.set` (padrão 300, **estimado**; 1..100 000; fica fora do arquivo de config
+    quando é o padrão, então o arquivo continua igual para um roteador antigo);
+  - contra o `nf_conntrack_max` configurado em System › Tuning, ou, sem ele, o do kernel.
+
+  O aviso aparece em:
+  - `pool.add`/`set` (`warnings`), `pool.preview` (check `conntrack`) e `pool.list` (selo
+    `conntrack` em cada pool ligado);
+  - `capacity.get` e `ip.firewall.cgnat.get` (objeto `conntrack`);
+  - `system.health.check` (item "CGNAT conntrack", aviso em português com o que fazer).
+
+  A sugestão é o primeiro perfil do Tuning (balanced, depois throughput) que comporta a conta nesta
+  máquina. Sem perfil que caiba, um `max_entries` (`ip.firewall.connection.tracking.set`), se a RAM
+  aguenta. Se a RAM também não aguenta, o aviso diz que ela não comporta.
+
+  Na aba Capacity, a linha "Conntrack" (com ⓘ) mostra a conta com o selo "fits" ou "too small". O
+  botão "Open System › Tuning: Balanced" abre o Tuning na aba Profiles com o perfil escolhido, onde
+  "Apply with Safe Mode" (G1.26k) o aplica.
+
+  Como testar:
+  - `cargo test -p corerouter-engine --test it cgnat_conntrack` (1280 assinantes contra 262 144 do
+    lab; o configurado conta antes de chegar ao kernel; pool desligado não conta; validação e
+    rollback do `connections_per_subscriber`)
+  - `cargo test -p corerouter-model --lib connections_per_subscriber_is_optional_in_the_file`
+  - `cargo test -p corerouter-ui --lib the_capacity_tab_says_the_conntrack_is_small_and_opens_tuning`
+  - CLI: `ip.firewall.cgnat.pool.add '{"name":"teste","inside":["100.64.0.0/22","100.64.4.0/24"],"outside":"203.0.113.0/27"}'`
+    e `system.health.check`.
+
+- 2026-11-12 — G4.3x: PPPoE, caminho lento: o assinante fala UDP e TCP com o roteador. No notebook (dev.607, sem XDP),
+  com a sessão `teste` (100.65.0.10, gateway 100.65.0.1 no `bng0` desde o G4.3v), o ping ao gateway
+  funcionava, mas `dig @100.65.0.1` e um TCP a 100.65.0.1 davam timeout. O DNS contava a consulta e
+  respondia, o conntrack via o UDP `established` e o TCP parado em `syn-received`: as respostas
+  saíam e o assinante as descartava.
+
+  - **Checksum.** O `bng0` é um `dummy`, que liga `NETIF_F_HW_CSUM`, SG e TSO
+    (`drivers/net/dummy.c`, 6.18.59). Um pacote TCP/UDP que o próprio roteador responde chegava a
+    ele com `CHECKSUM_PARTIAL`, sem o checksum L4 preenchido. O caminho lento o encapsulava assim, e
+    o assinante descartava. O ICMP é sempre calculado em software, por isso o ping passava.
+    Agora `pppoe_io::plain_tx` desliga no `bng0` o checksum de transmissão, o scatter-gather e as
+    segmentações TCP/UDP (as que o kernel tiver; AccECN é do 7.0). Os pacotes chegam inteiros e já
+    segmentados ao leitor do caminho lento e ao `bng_egress` do XDP. Um segmento TCP de 64 KB não
+    caberia num quadro PPPoE: é o bandwidth-test até o gateway.
+  - **DNS.** O `allowed_from: [LAN]` só cobria as redes dos endereços das interfaces da lista, e o
+    assinante PPPoE de uma porta LAN levava REFUSED, mesmo com o perfil entregando o roteador como
+    DNS. Agora, quando um servidor PPPoE ligado está numa interface da lista, entram também os pools
+    que os perfis PPP entregam (com o `next_pool`), em prefixos. Os endereços fixos de secrets ficam
+    de fora: podem ser 100 mil /32 numa lista conferida em sequência. É o que o RouterOS faz ao pôr
+    a interface dinâmica da sessão na `interface-list` do perfil.
+  - **Sniffer.** `tool.sniffer.start` e `tool.torch.start` aceitam uma interface que o kernel tem
+    fora da config (o `bng0`, como o `interface.list` mostra). A `lo` fica só para o grupo `full`,
+    porque o canal de controle local passa por ela sem cifra, com o token.
+
+  Testes (`netns_pppoe`, caminho lento, sem root), que falham sem a correção:
+  - a resposta do DNS do roteador e o SYN-ACK de 100.65.0.1:53 chegam ao assinante com o checksum
+    L4 certo (antes: checksum errado, o sintoma do notebook);
+  - não é REFUSED com a porta de acesso na lista LAN (antes: rcode 5);
+  - `ethtool -k bng0` sem checksum nem segmentação TCP/UDP ligados;
+  - `tool.sniffer.start` no `bng0`;
+  - e, no `proto-dns`, `pppoe_subscribers_of_a_list_interface_are_allowed`.
+
+- 2026-11-12 — G4.3y: PPPoE, caminho lento: o assinante passa pelo firewall como numa porta. Antes, o pacote dele saía
+  por um raw socket como saída do próprio roteador. Para o roteador, entrava pela `lo`: o "aceita lo"
+  do `defconf` aceitava tudo, e uma regra de input para o assinante só valia se viesse antes dele.
+  Para a internet, nunca passava pela chain forward. O caminho lento é o padrão sem XDP, e a sessão
+  principal pediu a correção como furo de segurança.
+
+  - **Entrada pelo `bng0`.** O `bng0` virou um par veth (`bng0` ↔ `bng0p`, NOARP). O pacote do
+    assinante é escrito, num quadro Ethernet, no `bng0p` (packet socket, `send_vectored`, sem cópia),
+    e o kernel o recebe no `bng0`: prerouting, input ou forward, TTL, rp_filter, como de uma porta.
+    O que o kernel manda ao assinante sai pelo `bng0` e é lido como antes. O que chega ao `bng0p` é
+    descartado antes do IP: o peer é porta de uma bridge mantida desligada (`bng0br`, porta
+    `BR_STATE_DISABLED`, `br_handle_frame`), sem conntrack nem ICMP, e o `BRIDGE_NETFILTER` está
+    desligado na imagem. Um `bng0` dummy de antes é recriado. O XDP (G4.3ca) usa o mesmo `bng0` e o
+    mesmo `ensure_bng`.
+  - **Regras.**
+    - `in_interface=all-ppp` / `out_interface=all-ppp` (o nome do RouterOS) casam com o `bng0`.
+    - O `bng0` entra no conjunto de cada lista de interfaces que tem a porta de um servidor PPPoE
+      ligado (a mesma regra do DNS no G4.3x). Com o `defconf`, um assinante de porta LAN continua LAN;
+      fora da LAN, cai no "descarta o resto que não vem da LAN".
+    - A troca de servidor PPPoE refaz o firewall (`inputs_changed` e `fw_delta`).
+    - A GUI oferece `all-ppp` no seletor de interface das regras e esconde o `bng0` e seus pares.
+    - O `owner.rs` marca o par e a bridge como do serviço: nunca semeados como portas.
+
+  **Desempenho, medido** (`netns_pppoe_slow`, novo; release, netns, AMD Ryzen AI Max+ 395, máquina
+  compartilhada com outras sessões, 2026-11-12): eco do assinante ao gateway, injetado e lido de
+  volta pelo `SlowPath`, por ida e volta:
+
+  | Pacote | Antes (raw socket, pela `lo`) | Depois (pelo `bng0p`) |
+  |---|---|---|
+  | 64 B | 2,26 µs | 1,55 µs |
+  | 1400 B | 2,45 µs | 1,65 µs |
+
+  Cerca de 31 % menos. Mantém-se uma thread por worker; nada novo é compartilhado.
+
+  Testes, que falham sem a correção (conferido com a injeção antiga: "input in_interface=all-ppp
+  drops the subscriber"):
+  - `netns_pppoe` (sem root):
+    - um drop de input `in_interface=all-ppp protocol=icmp` barra o eco do assinante ao gateway, e o
+      ping do próprio roteador (pela `lo`) passa;
+    - um drop de forward `in_interface=all-ppp` barra o eco a um host atrás de uma veth;
+    - com o `defconf`, a consulta DNS do assinante passa com a porta na LAN e é barrada fora dela;
+  - unitários: `nft::tests::subscribers_are_all_ppp_and_in_their_ports_lists`,
+    `owner::tests::the_subscribers_device_is_the_services` e
+    `firewall::all_ppp_is_an_interface_of_the_rules`.
+
+- 2026-11-12 — G4.6n: NTP pelo DHCPv6 (opção 56, RFC 5908). O cliente DHCPv6 lê as três subopções (endereço, grupo
+  multicast, FQDN; §4.1–§4.3), uma por opção ou várias numa só (dnsmasq), pula a quebrada sem
+  perder a concessão e guarda no máximo 8. A opção 31 (SNTP, RFC 4075) vale só quando não veio a 56
+  (§7). Com `use_peer_ntp` (chave nova do `ipv6.dhcp-client`, padrão sim; o RouterOS não a tem no
+  DHCPv6), endereços unicast e nomes vão para `dynamic_servers` do cliente NTP, depois dos do
+  DHCPv4. Ficam de fora o multicast (o cliente não ouve multicast) e o link-local (sem a
+  interface). O aviso "sem servidor" do `system.ntp.client.set`, a saúde e o log contam o DHCPv6. A
+  janela IPv6 › DHCPv6 Client ganhou "Use Peer NTP" e a linha "NTP Servers". O servidor DHCPv6 do
+  laboratório entrega `2001:db8:0:N::1`.
+
+  Como testar: `cargo test -p corerouter-proto-dhcp v6`, `cargo test -p corerouter-engine --test it
+  dhcp6_client`, `cargo test -p corerouter-daemon --bin corerouter-daemon an_ipv6_server_is_asked`;
+  no daemon do laboratório, `ipv6.dhcp-client.add {"interface":"ether1","request":"address"}` e
+  `system.ntp.client.get` mostra `dynamic_servers: ["2001:db8:0:1::1"]` (**medido**, 2026-11-12).
+
+- 2026-11-12 — G4.6o: ISO live não regrava o relógio da placa (RTC). `SystemClock::synchronized` recebe
+  `HardwareClock::Follow` (instalado: o kernel grava o RTC a cada ~11 min, como antes) ou
+  `LeaveAlone` (o daemon com `--live`). No Linux, `LeaveAlone` deixa `STA_UNSYNC` ligado: o kernel
+  6.18 só grava o CMOS com ele desligado (`kernel/time/ntp.c`, `sync_hw_clock` linha 643 e
+  `ntp_notify_cmos_timer` linha 683). O relógio do sistema continua sendo acertado. O log diz uma vez
+  "imagem live: o relógio da placa (RTC) fica como está". Quem testa a ISO numa máquina com Windows
+  (RTC em hora local) não volta ao Windows com a hora deslocada.
+
+  Como testar: `cargo test -p corerouter-daemon --bin corerouter-daemon ntp_client` (o serviço com
+  `--live` passa `LeaveAlone`, sem `--live` passa `Follow`); na VM do laboratório, como root:
+  `cargo xtask vm-lab run -- 'systemctl stop systemd-timesyncd chrony; COREROUTER_CLOCK_ROOT=1
+  cargo test -p corerouter-hal-linux --test clock_root -- --test-threads=1 --nocapture'`. Lá, com o
+  relógio 100 s à frente e `LeaveAlone`, o RTC ficou 100 s atrás depois de 3 s; com `Follow`, igual
+  ao relógio do sistema (**medido**, VM `corerouter-lab`, 2026-11-12).
+
+- 2026-11-12 — fix-e2e-kill9: Teste instável: `config_and_history_survive_sigterm_and_kill_9` (daemon, `tests/it/e2e.rs`)
+  dormia 400 ms e mandava `kill -9` no meio da tempestade de commits. Com o disco disputado por
+  vários CIs, o primeiro commit (journal com fsync) passava desse tempo, e a asserção "algum commit
+  confirmado" falhou nas duas tentativas do nextest em duas rodadas seguidas do `cargo xtask ci
+  --affected` (2026-11-12, carga 35–60). Agora o teste espera 5 confirmações (até 30 s) e corta 100
+  ms depois. A mensagem diz quantas confirmações houve e em quanto tempo. Sem carga: 10 confirmações
+  em ~200 ms, com 12 cópias em paralelo (**medido**).
