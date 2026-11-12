@@ -850,17 +850,25 @@ churn_prepare() { # <kind> <k> → dir
 # external: the first prefix; router: the /32 of a node that is not the
 # root (its cost goes through links whose metric flips). PROBE_LSA: the LSA
 # that carries it, for the LSDB's lag.
+# router: the farthest route of the churn node's topology as the DUT has it
+# (its cost has to move when every link does); lspgen's node ids are not
+# the LSA ids, so no LSDB lag for this kind. Called after the first tick.
 churn_probe() { # <dir> <kind>: sets PROBE and PROBE_LSA
 	if [ "$2" = external ]; then
 		PROBE=198.18.0.0/28 PROBE_LSA="external 198.18.0.0"
 	else
-		read -r PROBE node <<<"$(jq -r '[.["area0.0.0.0"][] | select(.is_root != true) |
-			{n: .node_id, p: (.ipv4_prefix_list[]? | select(.ipv4_prefix | endswith("/32")) | .ipv4_prefix)}][0] | "\(.p) \(.n)"' "$1/churn.json")"
-		PROBE_LSA="router $node"
+		PROBE_LSA=""
+		if [ $DUT = local ]; then
+			PROBE=$(vty 'show ip route ospf json' | jq -r '[to_entries[] | select(.key | startswith("10.200.")) |
+				{k: .key, m: .value[0].metric}] | max_by(.m) | .k // empty')
+		else
+			PROBE=$(cr routing.ospf.route.list "{\"instance\":\"$INSTANCE\",\"find\":\"10.200.\",\"limit\":1000}" |
+				jq -r '[.rows[] | {k: .prefix, m: .cost}] | max_by(.m) | .k // empty')
+		fi
 	fi
 }
 # The probe LSA's sequence number in the DUT's LSDB (local).
-seq_lsdb() { vty "show ip ospf database $PROBE_LSA json" | grep -o -E '"(sequenceNumber|lsaSeqNumber|seqNumber)": *"?[0-9a-fx]+' | head -n 1; }
+seq_lsdb() { [ -n "$PROBE_LSA" ] || return 0; vty "show ip ospf database $PROBE_LSA json" | grep -o -E '"(sequenceNumber|lsaSeqNumber|seqNumber)": *"?[0-9a-fx]+' | head -n 1; }
 cost_cr() {
 	cr routing.ospf.route.list "{\"instance\":\"$INSTANCE\",\"find\":\"$PROBE\"}" |
 		jq -r --arg p "$PROBE" '[.rows[] | select(.prefix == $p)][0] | "\(.cost // "-")/\(.type2_cost // "-")"'
@@ -959,11 +967,11 @@ test_churn() {
 			local k=$(((rate * CHURN_PERIOD_MS + 999) / 1000)) d csv=$OUT/churn-$kind-$rate.csv lags=$OUT/churn-$kind-$rate-lag.txt
 			[ "$kind" = router ] && [ "$k" -gt 400 ] && k=400
 			d=$(churn_prepare "$kind" "$k")
-			churn_probe "$d" "$kind"
 			: >"$lags"
 			# The first tick brings the extra node in; the routes settle first.
 			churn_tick "$d" "$kind" 200
 			sleep 5
+			churn_probe "$d" "$kind"
 			if [ "$(cost_cr)" = "-/-" ]; then
 				log "churn $kind: no route to the probe $PROBE: $(cr routing.ospf.route.list "{\"instance\":\"$INSTANCE\",\"find\":\"${PROBE%/*}\"}" | head -c 300)"
 			fi
