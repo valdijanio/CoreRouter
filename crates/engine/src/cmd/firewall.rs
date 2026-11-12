@@ -559,9 +559,11 @@ fn check_interfaces(cfg: &Config, before: &Matchers, after: &Matchers) -> Result
         ("in_interface", &before.in_interface, &after.in_interface),
         ("out_interface", &before.out_interface, &after.out_interface),
     ] {
-        // `lo` (loopback) is never in the config but always exists.
+        // `lo` (loopback) is never in the config but always exists, and
+        // `all-ppp` is every PPPoE subscriber (RouterOS; G4.3y).
         if let Some(n) = a.as_ref().filter(|n| Some(*n) != b.as_ref())
             && n.value.as_str() != "lo"
+            && n.value.as_str() != corerouter_model::ppp::ALL_PPP
             && !cfg.interfaces.contains_key(&n.value)
         {
             return Err(EngineError::bad(

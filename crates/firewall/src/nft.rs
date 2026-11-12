@@ -293,9 +293,14 @@ fn statements(
             MetaKey::IifName
         };
         if let Some(i) = name {
+            // G4.3y: RouterOS `all-ppp` is the subscribers' device.
+            let dev = match i.value.as_str() {
+                corerouter_model::ppp::ALL_PPP => corerouter_model::ppp::SUBSCRIBER_DEVICE,
+                other => other,
+            };
             b.push(
-                format!("{kw} {}{}", op(i), quoted(i.value.as_str())),
-                bc::meta_cmp(key, !i.not, bc::ifname_bytes(i.value.as_str())),
+                format!("{kw} {}{}", op(i), quoted(dev)),
+                bc::meta_cmp(key, !i.not, bc::ifname_bytes(dev)),
             );
         }
         if let Some(l) = list {
@@ -865,11 +870,16 @@ pub fn build(cfg: &Config, dynamic: &[DynamicAddress]) -> Option<(String, progra
         }
     }
     for list in &cfg.interface_lists.lists {
-        let names: BTreeSet<&str> = cfg
+        let mut names: BTreeSet<&str> = cfg
             .interface_lists
             .interfaces_of(list.name.as_str())
             .map(|i: &IfName| i.as_str())
             .collect();
+        // G4.3y: the PPPoE subscribers are of the lists of their servers'
+        // access ports (`in_interface_list=LAN` takes them in or out).
+        if corerouter_model::ppp::subscribers_in_list(&cfg.interface_lists, &cfg.ppp, list.name.as_str()) {
+            names.insert(corerouter_model::ppp::SUBSCRIBER_DEVICE);
+        }
         let items: Vec<String> = names.iter().map(|n| quoted(n)).collect();
         let _ = write!(
             out,
@@ -1108,6 +1118,19 @@ pub fn inputs_changed(from: &Config, to: &Config) -> bool {
     from.ip.firewall != to.ip.firewall
         || from.interface_lists != to.interface_lists
         || from.ip.subscriber_notice != to.ip.subscriber_notice
+        || subscriber_lists(from) != subscriber_lists(to)
+}
+
+/// G4.3y: the interface lists the PPPoE subscribers are in (their device
+/// joins each list's set), which a PPPoE server's change moves.
+pub fn subscriber_lists(cfg: &Config) -> BTreeSet<String> {
+    cfg.interface_lists
+        .lists
+        .iter()
+        .map(|l| l.name.as_str())
+        .filter(|l| corerouter_model::ppp::subscribers_in_list(&cfg.interface_lists, &cfg.ppp, l))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The text `nft -f -` applies as one transaction: our table is replaced

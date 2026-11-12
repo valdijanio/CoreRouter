@@ -256,12 +256,7 @@ pub fn allowed_networks(cfg: &Config) -> Vec<IpNet> {
                 // the pools the PPP profiles hand out, `next_pool`s
                 // included. Without it, a profile whose `dns_server` is the
                 // router got REFUSED (a notebook, dev.607).
-                if cfg
-                    .ppp
-                    .pppoe_servers
-                    .iter()
-                    .any(|s| !s.disabled && members.iter().any(|m| **m == s.interface))
-                {
+                if corerouter_model::ppp::subscribers_in_list(&cfg.interface_lists, &cfg.ppp, &list) {
                     out.extend(ppp_pool_networks(cfg));
                 }
             }

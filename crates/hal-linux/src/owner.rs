@@ -274,6 +274,21 @@ pub fn classify(
     let mut out: BTreeMap<u32, Owner> = links
         .iter()
         .map(|l| match relay_ends.get(&l.name) {
+            // G4.3y: the PPPoE subscribers' veth pair and its sink bridge:
+            // the service's, never a port of the config.
+            _ if [
+                corerouter_model::ppp::SUBSCRIBER_DEVICE,
+                corerouter_model::ppp::SUBSCRIBER_PEER,
+                corerouter_model::ppp::SUBSCRIBER_SINK,
+            ]
+            .contains(&l.name.as_str())
+                && claim(l).is_none() =>
+            {
+                (
+                    l.index,
+                    Owner::External("the PPPoE subscribers' device (interface.pppoe-server)".into()),
+                )
+            }
             Some(client) if l.is("veth") => (
                 l.index,
                 Owner::External(format!("the relay end of PPPoE client '{client}'")),
