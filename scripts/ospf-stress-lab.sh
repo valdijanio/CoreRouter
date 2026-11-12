@@ -735,8 +735,11 @@ mcp_close() {
 mcp_tool() {
 	MCP_ID=$((MCP_ID + 1))
 	local reply
-	mcp_send "$(jq -cn --arg t "$1" --argjson a "$2" --argjson id $MCP_ID \
-		'{jsonrpc: "2.0", id: $id, method: "tools/call", params: {name: $t, arguments: $a}}')"
+	# The arguments through a file: a batch of 8 000 steps is over the
+	# kernel's limit for one argument.
+	printf '%s' "$2" >"$W/mcp-args.json"
+	mcp_send "$(jq -cn --arg t "$1" --slurpfile a "$W/mcp-args.json" --argjson id $MCP_ID \
+		'{jsonrpc: "2.0", id: $id, method: "tools/call", params: {name: $t, arguments: $a[0]}}')"
 	reply=$(mcp_recv) || return 1
 	printf '%s' "$reply" | jq -r '.result.content[0].text // .error.message // "no reply"'
 	[ "$(printf '%s' "$reply" | jq -r '.result.isError // (.error != null)')" = false ]
@@ -1530,6 +1533,12 @@ say "$(cr system.resource.print | jq -r '"DUT: \(.board_name // "?"), \(.cpu_mod
 if [ $DUT = local ]; then
 	say "FRR: $(vty 'show version' | head -n 1)"
 	say "DUT kernel limits: net.ipv4.igmp_max_memberships $(ip netns exec crdut cat /proc/sys/net/ipv4/igmp_max_memberships), net.core.optmem_max $(ip netns exec crdut cat /proc/sys/net/core/optmem_max)"
+else
+	# An image from before G3.4m has neither in its catalog nor raises
+	# them: more than 20 OSPF interfaces lose adjacencies there.
+	limits=$(cr system.tuning.parameter.print '{"tab":"kernel"}' 2>/dev/null | jq -r '[.params[] |
+		select(.name == "net.ipv4.igmp_max_memberships" or .name == "net.core.optmem_max") | "\(.name) \(.current)"] | join(", ")')
+	say "DUT kernel limits: ${limits:-not in the catalog of this image (one from before G3.4m: at most 20 OSPF interfaces join the OSPF group)}"
 fi
 say ""
 
