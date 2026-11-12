@@ -34,6 +34,7 @@ fn reply(xid: u32) -> Vec<u8> {
             &"2001:db8::53".parse::<Ipv6Addr>().unwrap().octets(),
         )
         .opt(opt::DOMAIN_LIST, &dom)
+        .opt(opt::NTP_SERVER, &sub(1, &ip6("2001:db8::123").octets()))
         .opt(opt::SOL_MAX_RT, &120u32.to_be_bytes())
         .bytes()
 }
@@ -57,6 +58,7 @@ fn a_reply_decodes() {
     );
     assert_eq!(m.dns, vec!["2001:db8::53".parse::<Ipv6Addr>().unwrap()]);
     assert_eq!(m.domains, vec!["lab.test"]);
+    assert_eq!(m.ntp, vec![NtpSource::Server(ip6("2001:db8::123"))]);
     assert_eq!(m.sol_max_rt, Some(120));
     assert_eq!(m.status_code(), status::SUCCESS);
 }
@@ -211,6 +213,113 @@ fn options_are_described() {
     assert_eq!(describe(9999, &[1, 2]), ("", "0x0102".into()));
 }
 
+fn sub(code: u16, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put(&mut out, code, body);
+    out
+}
+
+fn ip6(s: &str) -> Ipv6Addr {
+    s.parse().unwrap()
+}
+
+fn with(options: &[(u16, Vec<u8>)]) -> Incoming {
+    let mut b = Builder::new(msg::REPLY, 1).opt(opt::SERVERID, &duid_ll([2, 0, 0, 0, 0, 1]));
+    for (code, data) in options {
+        b = b.opt(*code, data);
+    }
+    decode(&b.bytes()).unwrap()
+}
+
+/// RFC 5908 §4: one time source per option, the option repeated; §4.1
+/// address, §4.2 multicast group, §4.3 FQDN in RFC 9915 §10 form.
+#[test]
+fn ntp_server_options_give_every_time_source() {
+    let mut fqdn = Vec::new();
+    encode_name("ntp.example.net", &mut fqdn);
+    let m = with(&[
+        (opt::NTP_SERVER, sub(1, &ip6("2001:db8::123").octets())),
+        (opt::NTP_SERVER, sub(2, &ip6("ff02::101").octets())),
+        (opt::NTP_SERVER, sub(3, &fqdn)),
+    ]);
+    assert_eq!(
+        m.ntp,
+        vec![
+            NtpSource::Server(ip6("2001:db8::123")),
+            NtpSource::Multicast(ip6("ff02::101")),
+            NtpSource::Name("ntp.example.net".into()),
+        ]
+    );
+}
+
+/// dnsmasq puts every server in one option, against RFC 5908 §4's "one, and
+/// only one"; systemd and odhcp6c read it, so do we. Repeats count once.
+#[test]
+fn several_suboptions_in_one_option_are_read() {
+    let mut body = sub(1, &ip6("2001:db8::1").octets());
+    body.extend(sub(1, &ip6("2001:db8::2").octets()));
+    body.extend(sub(1, &ip6("2001:db8::1").octets()));
+    let m = with(&[(opt::NTP_SERVER, body)]);
+    assert_eq!(
+        m.ntp,
+        vec![
+            NtpSource::Server(ip6("2001:db8::1")),
+            NtpSource::Server(ip6("2001:db8::2"))
+        ]
+    );
+}
+
+/// §4.1 a unicast server, §4.2 a multicast group: the wrong kind, a wrong
+/// length, a broken FQDN or an unknown suboption are skipped, the rest kept.
+#[test]
+fn bad_suboptions_are_skipped() {
+    let mut body = sub(1, &ip6("ff05::101").octets()); // multicast as server
+    body.extend(sub(2, &ip6("2001:db8::9").octets())); // unicast as group
+    body.extend(sub(1, &[0; 15])); // short
+    body.extend(sub(1, &Ipv6Addr::LOCALHOST.octets()));
+    body.extend(sub(3, &[3, b'a', b' ', b'b', 0])); // not a host name
+    body.extend(sub(9, &[1, 2, 3])); // unknown (IANA may add, §8)
+    body.extend(sub(1, &ip6("2001:db8::7").octets()));
+    let m = with(&[(opt::NTP_SERVER, body)]);
+    assert_eq!(m.ntp, vec![NtpSource::Server(ip6("2001:db8::7"))]);
+}
+
+/// A truncated suboption breaks only its option, never the lease.
+#[test]
+fn a_broken_ntp_option_keeps_the_lease() {
+    let m = with(&[
+        (opt::NTP_SERVER, vec![0, 1, 0, 16, 1, 2]),
+        (opt::DNS_SERVERS, ip6("2001:db8::53").octets().to_vec()),
+    ]);
+    assert!(m.ntp.is_empty());
+    assert_eq!(m.dns, vec![ip6("2001:db8::53")]);
+}
+
+/// RFC 5908 §7 deprecates the SNTP option (RFC 4075): it counts only alone.
+#[test]
+fn the_sntp_option_counts_only_without_an_ntp_option() {
+    let sntp = ip6("2001:db8::31").octets().to_vec();
+    let m = with(&[(opt::SNTP_SERVERS, sntp.clone())]);
+    assert_eq!(m.ntp, vec![NtpSource::Server(ip6("2001:db8::31"))]);
+    let m = with(&[
+        (opt::SNTP_SERVERS, sntp),
+        (opt::NTP_SERVER, sub(1, &ip6("2001:db8::56").octets())),
+    ]);
+    assert_eq!(m.ntp, vec![NtpSource::Server(ip6("2001:db8::56"))]);
+}
+
+/// Hostile input: at most MAX_NTP sources, however many come.
+#[test]
+fn time_sources_are_bounded() {
+    let options: Vec<(u16, Vec<u8>)> = (1..=40u16)
+        .map(|i| {
+            let a = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i);
+            (opt::NTP_SERVER, sub(1, &a.octets()))
+        })
+        .collect();
+    assert_eq!(with(&options).ntp.len(), MAX_NTP);
+}
+
 proptest! {
     #[test]
     fn decode_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..600)) {
@@ -232,6 +341,7 @@ proptest! {
         }
         if let Ok(m) = decode(&b) {
             prop_assert!(m.ia_na.len() <= MAX_IA_ENTRIES);
+            prop_assert!(m.ntp.len() <= MAX_NTP);
             for ia in m.ia_na.iter().chain(&m.ia_pd) {
                 for a in &ia.addrs {
                     prop_assert!(a.preferred <= a.valid);

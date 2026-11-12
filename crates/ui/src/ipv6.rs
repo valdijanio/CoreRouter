@@ -217,6 +217,7 @@ pub(crate) struct Dhcp6Form {
     pub pool_name: String,
     pub prefix_hint: String,
     pub use_peer_dns: bool,
+    pub use_peer_ntp: bool,
     pub add_default_route: bool,
     pub distance: String,
     pub comment: String,
@@ -235,6 +236,7 @@ impl Dhcp6Form {
             pool_name: String::new(),
             prefix_hint: String::new(),
             use_peer_dns: true,
+            use_peer_ntp: true,
             add_default_route: false,
             distance: "254".into(),
             comment: String::new(),
@@ -253,6 +255,7 @@ impl Dhcp6Form {
             pool_name: text(row, "pool_name"),
             prefix_hint: text(row, "prefix_hint"),
             use_peer_dns: flag(row, "use_peer_dns"),
+            use_peer_ntp: flag(row, "use_peer_ntp"),
             add_default_route: flag(row, "add_default_route"),
             distance: text(row, "default_route_distance"),
             comment: text(row, "comment"),
@@ -299,6 +302,7 @@ impl Dhcp6Form {
         }
         for (k, now, was) in [
             ("use_peer_dns", self.use_peer_dns, base.use_peer_dns),
+            ("use_peer_ntp", self.use_peer_ntp, base.use_peer_ntp),
             (
                 "add_default_route",
                 self.add_default_route,
@@ -1225,6 +1229,11 @@ fn dhcp_tab(ui: &mut Ui, f: &Form, form: &mut Dhcp6Form, names: &[String], props
             ui.label("Use Peer DNS");
             ui.checkbox(&mut form.use_peer_dns, "");
             ui.end_row();
+            ui.label("Use Peer NTP");
+            ui.checkbox(&mut form.use_peer_ntp, "").on_hover_text(
+                "the NTP servers of the lease (option 56) go to System › NTP Client",
+            );
+            ui.end_row();
             ui.label("Add Default Route");
             ui.checkbox(&mut form.add_default_route, "").on_hover_text(
                 "::/0 via the server's link-local; usually the RA gives the default route",
@@ -1295,6 +1304,7 @@ fn status_tab(ui: &mut Ui, row: Option<&Value>) {
                 ("Primary DNS", "primary_dns"),
                 ("Secondary DNS", "secondary_dns"),
                 ("Domains", "domains"),
+                ("NTP Servers", "ntp_servers"),
                 ("Renew After (T1)", "t1_after"),
                 ("Rebind After (T2)", "t2_after"),
             ] {
@@ -1393,8 +1403,13 @@ mod tests {
         );
         let row = json!({"id": "*1", "interface": "ether1", "request": "prefix", "pool_name": "pd",
             "default_route_distance": 1, "allowed_servers": ["fe80::1", "0x0003"],
-            "use_peer_dns": true, "rapid_commit": true, "accept_prefix_without_address": true});
+            "use_peer_dns": true, "use_peer_ntp": false, "rapid_commit": true, "accept_prefix_without_address": true});
         let of = Dhcp6Form::of(&row);
+        assert!(!of.use_peer_ntp);
+        assert_eq!(
+            of.set_params("*1", &Dhcp6Form::of(&json!({"use_peer_ntp": true}))).and_then(|p| p.get("use_peer_ntp").cloned()),
+            Some(json!(false))
+        );
         assert_eq!(of.allowed_servers, "fe80::1, 0x0003");
         assert_eq!(of.request, "prefix");
     }
