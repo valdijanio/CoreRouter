@@ -286,10 +286,11 @@ for mode in "${MODES[@]}"; do
 	fi
 	ip netns exec crwa iperf3 -s -1 -D -I "$W/iperf.pid" >/dev/null 2>&1
 	sleep 0.5
-	bps=$(ip netns exec crwb iperf3 -c 10.30.0.1 -t 5 -P 4 -J 2>/dev/null |
-		sed -n 's/.*"bits_per_second": *\([0-9.e+]*\).*/\1/p' | tail -n 1)
-	if [ -n "$bps" ]; then
-		say "$mode: iperf3 B→A, 4 streams, 5 s: $(awk -v b="$bps" 'BEGIN{printf "%.1f Mbit/s", b/1e6}')"
+	# The receiver's total: the last "receiver" line (SUM with -P).
+	rate=$(ip netns exec crwb iperf3 -c 10.30.0.1 -t 5 -P 4 -f m 2>&1 |
+		awk '/receiver/ {r = $(NF - 2) " " $(NF - 1)} END {print r}')
+	if [ -n "$rate" ]; then
+		say "$mode: iperf3 B→A, 4 streams, 5 s: $rate"
 	else
 		fail "$mode: iperf3 gave no number"
 	fi
@@ -309,7 +310,8 @@ for mode in "${MODES[@]}"; do
 		fi
 		ok crwb interface.wifi.enable "{\"name\":\"$active\"}" >/dev/null
 	fi
-	say "$mode: peers on A: $(cr crwa interface.wifi.peer.print '{}' | tr -d ' \n' | grep -o '"name":"peer[12]"[^}]*"airtime_percent":[^,}]*' | sed 's/"tx_rate.*"uptime_secs"/ … "uptime_secs"/' | tr '\n' ' ')"
+	peers=$(cr crwa interface.wifi.peer.print '{}')
+	say "$mode: peers on A: airtime % $(printf '%s' "$peers" | grep -o '"airtime_percent":[^,}]*' | cut -d: -f2 | paste -sd/), retries % $(printf '%s' "$peers" | grep -o '"retry_percent":[^,}]*' | cut -d: -f2 | paste -sd/), signal $(printf '%s' "$peers" | grep -o '"signal":[^,}]*' | cut -d: -f2 | paste -sd/) dBm"
 done
 
 say ""

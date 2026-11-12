@@ -791,6 +791,14 @@ mod io {
     /// The global control socket, with the supplicant started if it is not
     /// there (or does not answer).
     fn global(dir: &Path, bin: &Path) -> Result<Ctrl, HalError> {
+        // G1.30m: one radio's thread at a time. Two radios turned on
+        // together raced here: while the first one's supplicant was still
+        // opening its socket, the second took the socket for a dead one's,
+        // removed it and started another supplicant, which failed (exit
+        // 255) and left the first radio talking to nobody (seen in the
+        // bonding lab: one of the two station-bridges never joined).
+        static START: Mutex<()> = Mutex::new(());
+        let _one = START.lock().unwrap_or_else(PoisonError::into_inner);
         let sock = dir.join("global");
         let ping = |c: &Ctrl| c.request("PING", "PING").is_ok_and(|r| r.trim() == "PONG");
         if let Ok(c) = Ctrl::connect(dir, &sock)
