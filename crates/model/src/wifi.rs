@@ -82,6 +82,12 @@ pub const BACKHAUL_WPA3: &str = "a station-bridge link carries the whole LAN: it
                                  only. Use security=wpa3 (or auto, which means WPA3 on a \
                                  backhaul)";
 
+/// G1.30m: the backhaul between routers is WPA3 only (SAE with protected
+/// management frames): it carries the whole LAN.
+pub const BACKHAUL_WPA3: &str = "a station-bridge link carries the whole LAN: it is WPA3 (SAE) \
+                                 only. Use security=wpa3 (or auto, which means WPA3 on a \
+                                 backhaul)";
+
 /// Why an interface is not enabled with no country set (the validation's
 /// message: a batch may set the two in any order).
 pub const NO_COUNTRY: &str = "a Wi-Fi interface cannot be enabled before the country is set: it \

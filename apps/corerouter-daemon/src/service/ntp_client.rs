@@ -24,13 +24,14 @@
 //! boot asks again.
 //!
 //! Servers: the configured ones, then those of DHCP clients with
-//! `use_peer_ntp` (G4.7a), at most [`MAX_SERVERS`] (a DHCP answer is hostile
+//! `use_peer_ntp` (G4.7a; DHCPv6 option 56 too, G4.6n), at most [`MAX_SERVERS`] (a DHCP answer is hostile
 //! input). Sockets: a new one per exchange, on a port the kernel picks
 //! (RFC 9109 §4), bound to the client's VRF.
 //!
 //! First boot (G1.6zh): a router whose config was never saved starts with
 //! the client on and no server configured ([`factory_default`]), so it asks
-//! only what the network's DHCP server names (RFC 2132 §8.3, option 42) and
+//! only what the network's DHCP server names (RFC 2132 §8.3, option 42;
+//! RFC 5908, DHCPv6 option 56) and
 //! nobody else: no public pool is built in (RFC 8633 §6.2, RFC 4085). A
 //! round with nobody to ask sends nothing and waits for nothing: the lease
 //! that brings a server is asked at once.
@@ -44,7 +45,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use corerouter_engine::{Shared, lock};
-use corerouter_hal::clock::{ClockError, SystemClock};
+use corerouter_hal::clock::{ClockError, HardwareClock, SystemClock};
 use corerouter_model::ntp::{
     ClockState, MAIN_VRF, MAX_SERVERS, NO_SERVER, NtpClient, NtpState, NtpStatus, POLL_RANGE,
 };
@@ -147,6 +148,10 @@ struct ClockDriver {
     asked: Option<i64>,
     /// G4.6m: where this boot's first step is marked (`None`: never open).
     boot: Option<BootStep>,
+    /// G4.6o: whether the board's clock follows (`LeaveAlone` on the live
+    /// image), and whether the log already said it is left alone.
+    hardware: HardwareClock,
+    told_hardware: bool,
 }
 
 impl ClockDriver {
@@ -167,7 +172,15 @@ impl ClockDriver {
             complained: false,
             asked: None,
             boot: None,
+            hardware: HardwareClock::Follow,
+            told_hardware: false,
         }
+    }
+
+    /// G4.6o: the live image leaves the RTC alone.
+    fn with_hardware_clock(mut self, hardware: HardwareClock) -> Self {
+        self.hardware = hardware;
+        self
     }
 
     /// G4.6m: with the boot's first step, when this boot has not spent it.
@@ -354,7 +367,16 @@ impl ClockDriver {
         let estimated = u64::try_from(delay_nanos / 2).unwrap_or(0);
         let maximum = estimated.saturating_add(self.discipline_error());
         if moves && let Some(clock) = &mut self.clock {
-            clock.synchronized(estimated, maximum)?;
+            clock.synchronized(estimated, maximum, self.hardware)?;
+            if self.hardware == HardwareClock::LeaveAlone && !self.told_hardware {
+                self.told_hardware = true;
+                const LIVE: &str = "imagem live: o relógio da placa (RTC) fica como está, para não \
+                                    mudar a hora que outro sistema da máquina lê";
+                said = Some(match said {
+                    Some((level, text)) => (level, format!("{text}; {LIVE}")),
+                    None => ("info", format!("NTP: relógio do sistema acertado; {LIVE}")),
+                });
+            }
         }
         Ok(said)
     }
@@ -378,14 +400,13 @@ impl ClockDriver {
 
 /// Servers to ask: the configured, then the dynamic, without repeats, at
 /// most [`MAX_SERVERS`]. Returns also the dynamic ones actually used.
-fn merged_servers(cfg: &NtpClient, dynamic: &[std::net::Ipv4Addr]) -> (Vec<String>, Vec<String>) {
+fn merged_servers(cfg: &NtpClient, dynamic: &[String]) -> (Vec<String>, Vec<String>) {
     let mut all: Vec<String> = cfg.servers.iter().take(MAX_SERVERS).cloned().collect();
     let mut extra = Vec::new();
-    for ip in dynamic {
-        let name = ip.to_string();
-        if all.len() < MAX_SERVERS && !all.contains(&name) {
+    for name in dynamic {
+        if all.len() < MAX_SERVERS && !all.contains(name) {
             all.push(name.clone());
-            extra.push(name);
+            extra.push(name.clone());
         }
     }
     (all, extra)
@@ -394,11 +415,18 @@ fn merged_servers(cfg: &NtpClient, dynamic: &[std::net::Ipv4Addr]) -> (Vec<Strin
 type OpenClock<'a> = Option<&'a dyn Fn() -> Result<Box<dyn SystemClock>, String>>;
 
 fn open_clock(session: &Shared, open: OpenClock<'_>, boot: &BootStep) -> ClockDriver {
+    // G4.6o: on the live image (`--live`) the RTC is left as it is.
+    let hardware = if corerouter_engine::live::is_live(&lock(session)) {
+        HardwareClock::LeaveAlone
+    } else {
+        HardwareClock::Follow
+    };
     ClockDriver::new(match open {
         Some(f) => f(),
         None => lock(session).open_system_clock(),
     })
     .with_boot_step(boot)
+    .with_hardware_clock(hardware)
 }
 
 fn run(session: &Shared, port: u16, health: &super::Health, open: OpenClock<'_>, boot: &BootStep) {
@@ -419,7 +447,7 @@ fn run(session: &Shared, port: u16, health: &super::Health, open: OpenClock<'_>,
             let mut s = lock(session);
             (
                 s.store().running().system.ntp_client.clone(),
-                s.dhcp_peer_ntp(),
+                s.ntp_peer_servers(),
                 s.take_ntp_step_confirmation(),
             )
         };
@@ -811,7 +839,7 @@ fn factory_default(session: &Shared) {
     }
     match s.execute("system.ntp.client.set", &serde_json::json!({"enabled": true})) {
         Ok(_) => log::info!(
-            "new config: NTP client on, asking the servers the DHCP clients learn (option 42)"
+            "new config: NTP client on, asking the servers the DHCP clients learn (options 42 and 56)"
         ),
         Err(e) => log::warn!("new config: NTP client not turned on: {e}"),
     }
@@ -839,7 +867,11 @@ mod tests {
     /// A one-socket SNTP server whose clock is `skew_ms` ahead, or that
     /// answers with a kiss code.
     fn server(skew_ms: i128, kiss: Option<&'static [u8; 4]>) -> u16 {
-        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server_on("127.0.0.1:0", skew_ms, kiss)
+    }
+
+    fn server_on(bind: &str, skew_ms: i128, kiss: Option<&'static [u8; 4]>) -> u16 {
+        let sock = UdpSocket::bind(bind).unwrap();
         let port = sock.local_addr().unwrap().port();
         thread::spawn(move || {
             let mut buf = [0u8; 128];
@@ -875,6 +907,20 @@ mod tests {
         let off_ms = s.offset_nanos / 1_000_000;
         assert!((1_900..=2_100).contains(&off_ms), "{off_ms} ms");
         assert!(s.delay_nanos < 500_000_000);
+    }
+
+    /// G4.6n: a server from DHCPv6 option 56 is an IPv6 address; the round
+    /// asks it on an IPv6 socket.
+    #[test]
+    fn an_ipv6_server_is_asked() {
+        let port = server_on("[::1]:0", 1_000, None);
+        let servers = ["::1".to_owned()];
+        let mut denied = BTreeSet::new();
+        let round = poll_round(&servers, port, MAIN_VRF, &mut denied, &literal, &|| true);
+        let (name, addr, _, s) = round.best.unwrap();
+        assert_eq!((name.as_str(), addr.is_ipv6()), ("::1", true));
+        let off_ms = s.offset_nanos / 1_000_000;
+        assert!((900..=1_100).contains(&off_ms), "{off_ms} ms");
     }
 
     #[test]
@@ -1062,6 +1108,8 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeClock {
         ops: std::sync::Arc<std::sync::Mutex<Vec<Op>>>,
+        /// What each `synchronized` said about the RTC (G4.6o).
+        hardware: std::sync::Arc<std::sync::Mutex<Vec<HardwareClock>>>,
         frequency: std::sync::Arc<std::sync::Mutex<f64>>,
         refuse: bool,
     }
@@ -1096,8 +1144,10 @@ mod tests {
         fn step(&mut self, offset_nanos: i64) -> Result<(), ClockError> {
             self.did(Op::Step(offset_nanos))
         }
-        fn synchronized(&mut self, _: u64, _: u64) -> Result<(), ClockError> {
-            self.did(Op::Synchronized)
+        fn synchronized(&mut self, _: u64, _: u64, hardware: HardwareClock) -> Result<(), ClockError> {
+            self.did(Op::Synchronized)?;
+            self.hardware.lock().unwrap().push(hardware);
+            Ok(())
         }
     }
 
@@ -1190,7 +1240,7 @@ mod tests {
             servers: vec!["192.0.2.1".into(), "pool.ntp.org".into()],
             ..NtpClient::default()
         };
-        let ip = |i: u8| std::net::Ipv4Addr::new(192, 0, 2, i);
+        let ip = |i: u8| std::net::Ipv4Addr::new(192, 0, 2, i).to_string();
         let (all, extra) = merged_servers(&cfg, &[ip(1), ip(2)]);
         assert_eq!(all, ["192.0.2.1", "pool.ntp.org", "192.0.2.2"]);
         assert_eq!(extra, ["192.0.2.2"], "the static one is not repeated");
@@ -1301,6 +1351,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// G4.6o: the driver passes its RTC choice to every `synchronized` and,
+    /// leaving the RTC alone, says so in the log once.
+    #[test]
+    fn the_driver_tells_the_clock_whether_the_rtc_follows() {
+        let fake = FakeClock::default();
+        let mut d = ClockDriver::new(fake.boxed());
+        assert_eq!(d.apply(1_600_000, 2 * MS, WALL, false), None, "installed: nothing to say");
+        assert_eq!(*fake.hardware.lock().unwrap(), [HardwareClock::Follow]);
+
+        let fake = FakeClock::default();
+        let mut d = ClockDriver::new(fake.boxed()).with_hardware_clock(HardwareClock::LeaveAlone);
+        let (level, text) = d.apply(1_600_000, 2 * MS, WALL, false).unwrap();
+        assert_eq!(level, "info");
+        assert!(text.contains("relógio da placa (RTC) fica como está"), "{text}");
+        // Said once: the next slew is silent, and still leaves it alone.
+        assert_eq!(d.apply(2 * MS, 2 * MS, WALL, false), None);
+        assert_eq!(
+            *fake.hardware.lock().unwrap(),
+            [HardwareClock::LeaveAlone, HardwareClock::LeaveAlone]
+        );
+        // The first word is joined to a step's line.
+        let fake = FakeClock::default();
+        let mut d = ClockDriver::new(fake.boxed()).with_hardware_clock(HardwareClock::LeaveAlone);
+        let (level, text) = d.apply(300 * MS, 2 * MS, WALL, false).unwrap();
+        assert_eq!(level, "warning");
+        assert!(text.contains("acertado de uma vez") && text.contains("(RTC) fica como está"), "{text}");
+    }
+
+    /// G4.6o, the service: on the live image (`--live`) the clock is set
+    /// and the RTC left alone; installed, the RTC follows.
+    #[test]
+    fn the_live_image_leaves_the_board_clock_alone() {
+        let start = |live: bool| {
+            let port = server(400, None);
+            let session = shared(Session::virtual_lab());
+            lock(&session)
+                .execute("system.ntp.client.set", &json!({"enabled": true, "servers": ["127.0.0.1"]}))
+                .unwrap();
+            if live {
+                corerouter_engine::live::set(&mut lock(&session));
+            }
+            let fake = FakeClock::default();
+            let opener = fake.clone();
+            let (s2, health) = (
+                session.clone(),
+                super::super::Health::new(corerouter_control::Shutdown::default()),
+            );
+            thread::spawn(move || {
+                let open = move || opener.boxed();
+                run(&s2, port, &health, Some(&open), &BootStep::default());
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while fake.hardware.lock().unwrap().is_empty() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(50));
+            }
+            thread::sleep(Duration::from_millis(100));
+            let log = lock(&session).execute("log.print", &json!({"find": "NTP"})).unwrap().to_string();
+            let hardware = fake.hardware.lock().unwrap().clone();
+            (hardware, log)
+        };
+        let (hardware, log) = start(true);
+        assert_eq!(hardware, [HardwareClock::LeaveAlone], "{log}");
+        assert!(log.contains("relógio da placa (RTC) fica como está"), "{log}");
+        let (hardware, log) = start(false);
+        assert_eq!(hardware, [HardwareClock::Follow], "{log}");
+        assert!(!log.contains("RTC"), "{log}");
+    }
+
     /// `set_system_clock=no`: measures, never opens the clock.
     #[test]
     fn measuring_only_leaves_the_clock_alone() {
@@ -1371,7 +1489,7 @@ mod tests {
             assert!(c.enabled && c.servers.is_empty(), "{c:?}");
             let log = s.log_since(0);
             assert!(
-                log.iter().any(|e| e.message == "NTP Client ligado: servidores do DHCP (opção 42), poll 6–10"),
+                log.iter().any(|e| e.message == "NTP Client ligado: servidores do DHCP (opções 42 e 56), poll 6–10"),
                 "{log:?}"
             );
         }

@@ -446,3 +446,26 @@ fn dynamic_entries_reach_the_data_plane_and_expire() {
     );
     assert_eq!(param, "timeout");
 }
+
+/// G4.3y: `all-ppp` (RouterOS) names every PPPoE subscriber in
+/// `in_interface`/`out_interface`; another unknown name is still refused.
+#[test]
+fn all_ppp_is_an_interface_of_the_rules() {
+    let mut s = corerouter_engine::Session::virtual_lab();
+    let id = s
+        .execute(
+            "ip.firewall.filter.add",
+            &serde_json::json!({"chain": "forward", "action": "drop", "in_interface": "all-ppp"}),
+        )
+        .unwrap()["id"]
+        .clone();
+    assert!(id.is_string());
+    let e = s
+        .execute(
+            "ip.firewall.filter.add",
+            &serde_json::json!({"chain": "forward", "action": "drop", "in_interface": "ppp-all"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("does not exist"), "{e}");
+}

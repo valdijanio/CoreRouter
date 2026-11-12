@@ -563,7 +563,7 @@ impl ShaperState {
         self.ready = false;
         // bng0 first (its program goes on below).
         if pppoe && self.bng.is_none() {
-            let idx = crate::pppoe_io::ensure_dummy(crate::pppoe_io::SLOW_DEVICE)
+            let idx = crate::pppoe_io::ensure_bng(crate::pppoe_io::SLOW_DEVICE)
                 .map_err(|e| HalError::Rejected(format!("shaper: {e}")))?;
             self.bng = Some(idx);
         }

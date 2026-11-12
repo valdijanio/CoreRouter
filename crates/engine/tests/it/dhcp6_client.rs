@@ -261,6 +261,53 @@ fn a_wan_client_gets_an_address_and_a_prefix() {
     );
 }
 
+/// G4.6n: the lab server sends one NTP_SUBOPTION_SRV_ADDR (RFC 5908 §4.1);
+/// with `use_peer_ntp` (on by default) it goes to the NTP client, after the
+/// DHCPv4 ones, and the list shows it; off, it stays in the lease only.
+#[test]
+fn ntp_servers_of_option_56_reach_the_ntp_client() {
+    let mut l = Lab::new(Knobs::default());
+    let id = l.add(json!({"interface": "ether1", "request": "address"}));
+    l.run(2_000);
+    let c = l.client(&id);
+    assert_eq!(c["status"], "bound", "{c}");
+    assert_eq!(c["use_peer_ntp"], true);
+    assert_eq!(c["ntp_servers"], json!(["2001:db8:0:1::1"]));
+    let opts = l.ok("ipv6.dhcp-client.options", json!({"id": id}));
+    assert!(
+        opts["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["name"] == "ntp-server" && o["value"] == "2001:db8:0:1::1")
+    );
+    assert_eq!(l.s.dhcp6_peer_ntp(), ["2001:db8:0:1::1"]);
+    assert_eq!(l.s.ntp_peer_servers(), ["2001:db8:0:1::1"]);
+
+    // On with no server: a DHCPv6 client that may bring one is enough.
+    let set = l.ok("system.ntp.client.set", json!({"enabled": true}));
+    assert!(set.get("warning").is_none(), "{set}");
+
+    l.ok(
+        "ipv6.dhcp-client.set",
+        json!({"id": id, "use_peer_ntp": false}),
+    );
+    l.run(500);
+    let c = l.client(&id);
+    assert_eq!(c["use_peer_ntp"], false);
+    assert_eq!(
+        c["ntp_servers"],
+        json!(["2001:db8:0:1::1"]),
+        "still in the lease"
+    );
+    assert!(l.s.ntp_peer_servers().is_empty());
+    let set = l.ok("system.ntp.client.set", json!({"enabled": true}));
+    assert!(
+        set["warning"].as_str().unwrap().contains("option 56"),
+        "{set}"
+    );
+}
+
 #[test]
 fn lan_addresses_come_from_the_pool_and_follow_it() {
     let mut l = Lab::new(Knobs::default());

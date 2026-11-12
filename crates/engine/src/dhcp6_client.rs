@@ -21,6 +21,7 @@ use corerouter_model::ipv6::{self, AllowedServer6};
 use corerouter_model::route;
 use corerouter_model::{AddressEntry, Config, Dhcp6Client, Gateway, IfName, ItemId, RouteEntry};
 use corerouter_proto_dhcp::client6::{Action, Client, Event, Held, Lease, State};
+use corerouter_proto_dhcp::v6::NtpSource;
 use ipnet::{IpNet, Ipv6Net};
 use serde_json::{Value, json};
 
@@ -584,6 +585,25 @@ impl Session {
         out
     }
 
+    /// NTP servers learned by DHCPv6 clients with `use_peer_ntp` (G4.6n):
+    /// the addresses and names of option 56 (RFC 5908 §4.1, §4.3), in client
+    /// order, without repeats. Left out: a multicast group (§4.2; the client
+    /// does not listen to one, G4.6l) and a link-local address, which needs
+    /// the interface beside it and the client asks by address alone.
+    pub fn dhcp6_peer_ntp(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for r in self.dhcp6.runners.values().filter(|r| r.cfg.use_peer_ntp) {
+            for source in r.lease().map(|l| &l.ntp).into_iter().flatten() {
+                if let Some(name) = ntp_server_name(source)
+                    && !out.contains(&name)
+                {
+                    out.push(name);
+                }
+            }
+        }
+        out
+    }
+
     pub(crate) fn dhcp6_history(&self, client: Option<ItemId>, after_seq: u64) -> Value {
         let events: Vec<&HistoryEntry> = self
             .dhcp6
@@ -592,6 +612,15 @@ impl Session {
             .filter(|h| h.seq > after_seq && client.is_none_or(|c| c == h.client))
             .collect();
         json!({ "events": events, "last_seq": self.dhcp6.seq })
+    }
+}
+
+/// What the NTP client can ask, of one time source (G4.6n).
+fn ntp_server_name(source: &NtpSource) -> Option<String> {
+    match source {
+        NtpSource::Server(a) if !a.is_unicast_link_local() => Some(a.to_string()),
+        NtpSource::Name(n) => Some(n.clone()),
+        NtpSource::Server(_) | NtpSource::Multicast(_) => None,
     }
 }
 
@@ -610,4 +639,27 @@ fn resolve(pools: &[Pool], pool: &str, address: IpNet) -> Result<Ipv6Net, String
         )
     })?;
     ipv6::from_pool(entry, prefix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RFC 5908 §4.1 and §4.3 go to the client; §4.2 (a multicast group)
+    /// and a link-local server (no zone to reach it with) do not.
+    #[test]
+    fn only_reachable_unicast_servers_and_names_are_asked() {
+        let ip = |s: &str| s.parse::<Ipv6Addr>().unwrap();
+        let name = |s: NtpSource| ntp_server_name(&s);
+        assert_eq!(
+            name(NtpSource::Server(ip("2001:db8::123"))).as_deref(),
+            Some("2001:db8::123")
+        );
+        assert_eq!(
+            name(NtpSource::Name("ntp.example.net".into())).as_deref(),
+            Some("ntp.example.net")
+        );
+        assert_eq!(name(NtpSource::Server(ip("fe80::1"))), None);
+        assert_eq!(name(NtpSource::Multicast(ip("ff02::101"))), None);
+    }
 }

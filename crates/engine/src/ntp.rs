@@ -33,6 +33,38 @@ impl Session {
         self.hal_mut().system_clock().map_err(|e| e.to_string())
     }
 
+    /// The servers DHCP brought for the NTP client: DHCPv4 option 42 first,
+    /// then DHCPv6 option 56 (G4.6n), each from the clients with
+    /// `use_peer_ntp`, without repeats. The daemon bounds the total.
+    pub fn ntp_peer_servers(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .dhcp_peer_ntp()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        for name in self.dhcp6_peer_ntp() {
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        out
+    }
+
+    /// Whether a DHCP client that is on may bring NTP servers (`use_peer_ntp`
+    /// on a DHCPv4 or DHCPv6 client), in the candidate config.
+    pub(crate) fn ntp_dhcp_may_bring(&self) -> bool {
+        let cfg = self.store().candidate();
+        cfg.ip
+            .dhcp_clients
+            .iter()
+            .any(|d| d.use_peer_ntp && !d.disabled)
+            || cfg
+                .ipv6
+                .dhcp_clients
+                .iter()
+                .any(|d| d.use_peer_ntp && !d.disabled)
+    }
+
     /// `system.ntp.client.confirm-step` ran: true once, for the daemon's client.
     pub fn take_ntp_step_confirmation(&mut self) -> bool {
         self.ext_mut::<StepConfirmation>()

@@ -221,6 +221,7 @@ rota padrão vem, como manda a RFC 7084 (W-3), do Router Advertisement do proved
 | `add_default_route` | `false` | `::/0` via o link-local do servidor (ou do relay) com `default_route_distance` |
 | `default_route_distance` | `254` | como no cliente DHCPv4 (G1.27j): reserva atrás de qualquer outra rota; a rota de RA continua em 255, atrás dela |
 | `use_peer_dns` | `true` | DNS recebidos em `Session::dhcp6_peer_dns()` para o G4.1 |
+| `use_peer_ntp` | `true` | servidores NTP da opção 56 (RFC 5908) para o cliente NTP (G4.6n); o RouterOS não tem esta chave no DHCPv6 |
 | `rapid_commit` | `true` | Solicit com Rapid Commit (2 mensagens quando o servidor aceita) |
 | `custom_duid` | vazio | `0x…`; vazio = DUID-LL do MAC da interface |
 | `allowed_servers` | `[]` | DUID (`0x…`), endereço IPv6 de origem ou MAC (dentro do DUID-LL/LLT) |

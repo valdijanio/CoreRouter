@@ -37,7 +37,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Apply Boot Parameters",
         [],
         None,
-        "{confirm?: auto|manual, timeout?: u32 (30..3600 s, default 300), reboot?: bool (default yes), drill?: bool (a rollback drill: the trial slot gets a parameter that does not boot)} → {job, kind}",
+        "{confirm?: auto|manual, timeout?: u32 (30..3600 s, default 300), reboot?: bool (default yes), drill?: bool (a rollback drill: the trial slot gets a parameter that does not boot), force?: bool (reboot even in Safe Mode, which the reboot undoes, or with uncommitted changes, which are lost)} → {job, kind}",
         always,
         apply
     ),

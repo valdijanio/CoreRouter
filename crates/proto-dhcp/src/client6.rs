@@ -114,6 +114,8 @@ pub struct Lease {
     pub prefix: Option<Held<Ipv6Net>>,
     pub dns: Vec<Ipv6Addr>,
     pub domains: Vec<String>,
+    /// NTP time sources (RFC 5908; the SNTP option when it came alone).
+    pub ntp: Vec<v6::NtpSource>,
     pub granted_ms: u64,
     /// `u64::MAX`: never.
     pub t1_ms: u64,
@@ -978,6 +980,7 @@ impl Client {
             prefix,
             dns: m.dns.clone(),
             domains: m.domains.clone(),
+            ntp: m.ntp.clone(),
             granted_ms: now,
             t1_ms: t1,
             t2_ms: t2,

@@ -1961,7 +1961,12 @@ impl CoreRouterUi {
         let mut dialogs = std::mem::take(&mut self.fw.dialogs);
         let lists = self.list_names();
         let addr_lists = self.address_list_names();
-        let ifaces = self.interface_names(None);
+        let mut ifaces = self.interface_names(None);
+        // G4.3y: every PPPoE subscriber (RouterOS `all-ppp`); their device
+        // itself is the service's, not an interface of the rules.
+        // (`corerouter_model::ppp::{SUBSCRIBER_*, ALL_PPP}`.)
+        ifaces.retain(|n| !["bng0", "bng0p", "bng0br"].contains(&n.as_str()));
+        ifaces.push("all-ppp".into());
         dialogs.retain_mut(|d| {
             let id = dialog_id(d.id);
             let feed = d.edit.feed();
