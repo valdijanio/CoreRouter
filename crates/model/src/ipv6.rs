@@ -385,6 +385,11 @@ pub struct Dhcp6Client {
     pub default_route_distance: u8,
     #[serde(default = "yes")]
     pub use_peer_dns: bool,
+    /// The NTP servers of the lease (option 56, RFC 5908) go to the NTP
+    /// client, like `use-peer-ntp` of the DHCPv4 client (G4.6n; RouterOS
+    /// has no such switch on its DHCPv6 client).
+    #[serde(default = "yes")]
+    pub use_peer_ntp: bool,
     #[serde(default = "yes")]
     pub rapid_commit: bool,
     /// Our DUID as `0x…`; empty: DUID-LL of the interface's MAC.
@@ -419,6 +424,7 @@ impl Dhcp6Client {
             add_default_route: false,
             default_route_distance: crate::dhcp_client::DEFAULT_ROUTE_DISTANCE,
             use_peer_dns: true,
+            use_peer_ntp: true,
             rapid_commit: true,
             custom_duid: String::new(),
             allowed_servers: Vec::new(),
