@@ -36,8 +36,9 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("New CGNAT Pool", "Novo pool CGNAT"),
     ("New connections dropped for lack of a port (RFC 6888 REQ-11)", "Conexões novas descartadas por falta de porta (RFC 6888 REQ-11)"),
     ("New connections the kernel could not translate: no free port", "Conexões novas que o kernel não traduziu: sem porta livre"),
+    ("No free block, 24 h", "Sem bloco livre, 24 h"),
     ("No pool yet.", "Nenhum pool ainda."),
-    ("No suggestion: no readings yet, or a blocks-mode pool (grow max_blocks instead).", "Sem sugestão: ainda sem leituras, ou pool no modo blocos (aumente max_blocks)."),
+    ("No suggestion: no readings yet.", "Sem sugestão: ainda sem leituras."),
     ("Out. Interface", "Interface de saída"),
     ("Outside", "Públicos"),
     ("Peak", "Pico"),
@@ -85,6 +86,8 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("subscribers remapped", "assinantes remapeados"),
     ("subscribers seen", "assinantes vistos"),
     ("suggested", "sugerido"),
+    ("the pool ran out of blocks: fewer ports per block fit everyone", "o pool ficou sem blocos: com menos portas por bloco cabem todos"),
+    ("the pool ran out of blocks: more public addresses", "o pool ficou sem blocos: mais endereços públicos"),
 ];
 
 /// Explanations: (key, Markdown).
@@ -154,6 +157,14 @@ Um pool bem dimensionado tem quase todos nas primeiras faixas e poucos acima de 
 Assinantes que tiveram **conexão nova recusada por falta de porta** nas últimas 24 h (RFC 6888 REQ-11), quantas conexões foram recusadas e quantos **ICMP host unreachable** o roteador mandou a eles (com o limite de taxa por assinante).
 
 Zero é o normal. Muitos aqui pedem mais portas por assinante; um só costuma ser P2P ou máquina infectada: veja a aba Alerts e as Connections do Firewall.",
+    ),
+    (
+        "cgnat.capacity.no_block",
+        "## Sem bloco livre, 24 h
+
+Assinantes (modo blocos) que **não ganharam bloco nenhum** nas últimas 24 h porque **o pool não tinha bloco livre**, quantas conexões foram recusadas por isso e quantos ICMP host unreachable o roteador mandou (RFC 6888 REQ-11). Embaixo, os blocos em uso agora do total que os endereços públicos comportam.
+
+Não é o assinante que gastou as portas dele (esse aparece em \"Bateram no limite\"): é o pool que acabou. O remédio é **mais endereços públicos** no outside ou **menos portas por bloco**; a Sugestão abaixo diz qual cabe.",
     ),
     (
         "cgnat.capacity.p99",

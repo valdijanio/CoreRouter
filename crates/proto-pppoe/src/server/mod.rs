@@ -362,6 +362,11 @@ pub enum Event {
     /// Verify these credentials; answer with [`Server::auth_reply`].
     Authenticate {
         session: SessionRef,
+        /// G4.3w: the host's established session this one takes over if
+        /// it is accepted (one-session-per-host). It goes on its own when
+        /// the verdict is applied; [`Server::replace_now`] ends it sooner,
+        /// for a caller that must free its address or login first.
+        replaces: Option<SessionRef>,
         request: Box<AuthRequest>,
     },
     /// Give the subscriber an IPv4 address; answer with
@@ -501,6 +506,9 @@ pub struct Server {
     padt_limiter: PadiLimiter,
     rng: Rng,
     by_host: HashMap<HostKey, u16>,
+    /// G4.3w: a host's newer session waiting to prove itself before it
+    /// takes over the one in `by_host` (one-session-per-host): at most one.
+    pending: HashMap<HostKey, u16>,
     by_uniq: HashMap<(HostKey, u64), u16>,
     delayed: BinaryHeap<Reverse<Delayed>>,
     delayed_seq: u64,
@@ -553,6 +561,7 @@ impl Server {
             padt_limiter: PadiLimiter::new(100, 0, 0),
             rng,
             by_host: HashMap::new(),
+            pending: HashMap::new(),
             by_uniq: HashMap::new(),
             delayed: BinaryHeap::new(),
             delayed_seq: 0,
@@ -741,6 +750,13 @@ impl Server {
         let dead = s.dead;
         let next = s.next_deadline(&self.cfg);
         let gen_ = s.gen_;
+        // G4.3w: proved itself (authenticated, or no authentication asked):
+        // it takes over the host's old session now.
+        let takeover = if dead.is_none() && s.established() {
+            s.replaces.take().map(|old| (old, s.host_key()))
+        } else {
+            None
+        };
         if let Some(reason) = dead {
             self.free_session(now, sid, reason, out);
         } else if let Some(d) = next
@@ -752,7 +768,64 @@ impl Server {
                 gen_,
             });
         }
+        if let Some((old, host)) = takeover {
+            self.take_over(now, sid, host, old, out);
+        }
         true
+    }
+
+    /// G4.3w: session `sid` of `host` replaces the host's `old` one
+    /// (one-session-per-host): PADT and `Down { Replaced }` for `old`, if it
+    /// is still that session, and `sid` becomes the host's.
+    fn take_over(
+        &mut self,
+        now: Millis,
+        sid: u16,
+        host: HostKey,
+        old: SessionRef,
+        out: &mut ServerOutput,
+    ) {
+        if self.pending.get(&host) == Some(&sid) {
+            self.pending.remove(&host);
+        }
+        if self
+            .slot(old.sid)
+            .is_some_and(|s| s.gen_ == old.gen_ && s.host_key() == host)
+        {
+            self.with_session(now, old.sid, Some(old.gen_), out, |s, env| s.replace(env));
+        }
+        if self.slot(sid).is_some() {
+            self.by_host.insert(host, sid);
+        }
+    }
+
+    /// G4.3w: end the session `session` will take over (one-session-per-host)
+    /// now, before its verdict: the caller frees the old one's address and
+    /// login first (a fixed address, `only-one`). `false` when it replaces
+    /// nothing (any more).
+    pub fn replace_now(
+        &mut self,
+        now: Millis,
+        session: SessionRef,
+        out: &mut ServerOutput,
+    ) -> bool {
+        let Some(s) = self
+            .sessions
+            .get_mut(usize::from(session.sid))
+            .and_then(Option::as_mut)
+            .filter(|s| s.gen_ == session.gen_)
+        else {
+            return false;
+        };
+        let Some(old) = s.replaces.take() else {
+            return false;
+        };
+        let host = s.host_key();
+        let alive = self
+            .slot(old.sid)
+            .is_some_and(|o| o.gen_ == old.gen_ && o.host_key() == host);
+        self.take_over(now, session.sid, host, old, out);
+        alive
     }
 
     fn free_session(&mut self, now: Millis, sid: u16, reason: DownReason, out: &mut ServerOutput) {
@@ -768,8 +841,16 @@ impl Server {
         self.count_session(s.ifindex, s.vlans, s.client_mac, false);
         let hk = s.host_key();
         self.short_cycle_end(now, hk, &s, reason, out);
+        if self.pending.get(&hk) == Some(&sid) {
+            self.pending.remove(&hk);
+        }
         if self.by_host.get(&hk) == Some(&sid) {
             self.by_host.remove(&hk);
+            // G4.3w: the old one ended by itself while a newer one waited:
+            // that one is the host's now (it replaces nothing any more).
+            if let Some(next) = self.pending.remove(&hk) {
+                self.by_host.insert(hk, next);
+            }
         }
         let uk = (hk, s.uniq);
         if self.by_uniq.get(&uk) == Some(&sid) {
@@ -1309,10 +1390,25 @@ impl Server {
             self.pads_error(ifindex, d, tag::AC_SYSTEM_ERROR, b"MAC session limit", out);
             return;
         }
-        if self.cfg.one_session_per_host
-            && let Some(&old) = self.by_host.get(&host)
-        {
-            self.with_session(now, old, None, out, |s, env| s.replace(env));
+        // G4.3w: one-session-per-host. A host's session that has not proved
+        // itself (no authentication yet) goes at once: the host started
+        // over. An established one stays until the new one authenticates
+        // (`take_over`): a frame with a copied MAC and no password must not
+        // end a subscriber's session. At most one waits per host: an older
+        // waiting attempt goes, the newest wins.
+        let mut replaces = None;
+        if self.cfg.one_session_per_host {
+            if let Some(&p) = self.pending.get(&host) {
+                self.with_session(now, p, None, out, |s, env| s.replace(env));
+            }
+            if let Some(&old) = self.by_host.get(&host) {
+                match self.slot(old) {
+                    Some(s) if s.established() => replaces = Some(s.reference()),
+                    _ => {
+                        self.with_session(now, old, None, out, |s, env| s.replace(env));
+                    }
+                }
+            }
         }
         if self.free.is_empty() {
             // §5.4: AC-System-Error, "insufficient resources".
@@ -1352,6 +1448,8 @@ impl Server {
             },
             now,
         );
+        let mut s = s;
+        s.replaces = replaces;
         if let Some(slot) = self.sessions.get_mut(usize::from(sid)) {
             *slot = Some(Box::new(s));
         }
@@ -1359,7 +1457,11 @@ impl Server {
         self.svc.add(slot);
         self.count_session(ifindex, d.vlans, d.src, true);
         self.stats.sessions_created += 1;
-        self.by_host.insert(host, sid);
+        if replaces.is_some() {
+            self.pending.insert(host, sid);
+        } else {
+            self.by_host.insert(host, sid);
+        }
         self.by_uniq.insert((host, uniq), sid);
         self.send_pads(ifindex, d, sid, out);
         self.with_session(now, sid, None, out, |s, env| s.start(env));
@@ -1536,10 +1638,25 @@ impl Server {
             ));
         }
         if self.cfg.one_session_per_host {
+            // G4.3w: one per host, plus at most one waiting to take over.
             let mut hosts = std::collections::HashSet::new();
             for s in self.sessions.iter().flatten() {
-                if !hosts.insert(s.host_key()) {
+                let hk = s.host_key();
+                if self.pending.get(&hk) == Some(&s.sid) {
+                    continue;
+                }
+                if !hosts.insert(hk) {
                     return Err(format!("two sessions for host {}", s.client_mac));
+                }
+            }
+        }
+        for (k, sid) in &self.pending {
+            match self.slot(*sid) {
+                Some(s) if s.host_key() == *k && s.replaces.is_some() => {}
+                _ => {
+                    return Err(format!(
+                        "pending points at SID {sid}, not a waiting session of its host"
+                    ));
                 }
             }
         }

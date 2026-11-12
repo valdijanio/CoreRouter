@@ -751,6 +751,7 @@ impl Bng {
                 r.counters.rx_packets,
                 r.counters.tx_packets,
             ],
+            replaces: None,
         };
         let id = session_id(i, &self.slots, sref.sid);
         self.index.add((i, sref.sid), &sub);
