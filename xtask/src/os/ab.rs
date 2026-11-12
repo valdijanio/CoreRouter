@@ -1261,6 +1261,7 @@ fn scenario_crash(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
         format!("{free} → {free2} B"),
     );
     // The A/B update still has room for its boot entries.
+    vm.print_until(&mut log, 60, |v| v["running"] == "a")?;
     update_and_confirm(ctx, &mut log, vm, "b", "crash/trial-b")?;
     Ok(())
 }
