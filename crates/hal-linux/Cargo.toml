@@ -106,6 +106,10 @@ name = "netns_routes_batch"
 harness = false
 
 [[bench]]
+name = "netns_pppoe_slow"
+harness = false
+
+[[bench]]
 name = "netns_mpls_ttl"
 harness = false
 
