@@ -1103,6 +1103,10 @@ fn nvram_free(vm: &mut Vm, log: &mut std::fs::File) -> Result<u64, String> {
         .ok_or_else(|| format!("df of efivarfs: {l}"))
 }
 
+/// The daemon's `EFI_MIN_FREE` (`corerouter_engine::crash_log`: two dumps
+/// of 16 KiB, 4 KiB of boot entries, the kernel's 5 KiB; the xtask uses no
+/// workspace crate).
+const EFI_MIN_FREE: u64 = 41 << 10;
 /// A GUID of no one's: the variables that fill the NVRAM in the test.
 const FILL_GUID: &str = "6b1c0f41-2b5e-4f59-9c4b-1f0d3a0b7e21";
 /// What the filled NVRAM keeps free: less than the daemon's
@@ -1140,39 +1144,54 @@ fn scenario_crash(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
             .is_some_and(|s| s.contains("sysrq triggered crash")),
         format!("{c}"),
     )?;
-    let free1 = nvram_free(&mut vm, &mut log)?;
-    check(
-        free1 + 1024 >= free0,
-        format!("the record was not erased: {free0} B free before the panic, {free1} after"),
-    )?;
-    n.put(
-        "panic recorded in UEFI variables, logged and erased at the next boot",
-        format!("{} part(s), NVRAM free {free0} → {free1} B", c["parts"]),
-    );
-    // Fill the NVRAM with 1 KiB variables until the kernel refuses (its
-    // 5 KiB reserve), then give back what leaves FILL_LEAVES free.
-    let filled = shell_line(
+    // Erased: no dump variable left. The room they took comes back only
+    // when the firmware reclaims its store at a boot (EDK2 does not reclaim
+    // at run time), so the free space is not compared here.
+    let dumps = shell_line(
         &mut vm,
         &mut log,
-        &format!(
-            "cd /sys/firmware/efi/efivars; i=0; while printf '\\007\\000\\000\\000%01024d' 0 > fill$i-{FILL_GUID} 2>/dev/null; do i=$((i+1)); done; rm -f fill$i-{FILL_GUID}; cd /; echo $i"
-        ),
+        "ls /sys/firmware/efi/efivars | grep -c '^dump-type'",
     )?;
-    let mut free = nvram_free(&mut vm, &mut log)?;
-    let mut k: u32 = 0;
-    while free < FILL_LEAVES {
-        shell_line(
+    check(
+        dumps == "0",
+        format!("{dumps} dump variable(s) left in the NVRAM"),
+    )?;
+    let free1 = nvram_free(&mut vm, &mut log)?;
+    n.put(
+        "panic recorded in UEFI variables, logged and erased at the next boot",
+        format!(
+            "{} part(s), NVRAM free {free0} B before, {free1} B after (the firmware reclaims later)",
+            c["parts"]
+        ),
+    );
+    // Fill the NVRAM with 1 KiB variables of another GUID until about
+    // FILL_LEAVES is left. efivarfs answers `statfs` from a cache for a
+    // while (rate limited), so the variables go in steps and the space is
+    // read after a pause.
+    let mut free = free1;
+    let mut written: u64 = 0;
+    for _ in 0..40 {
+        if free <= FILL_LEAVES + 2048 {
+            break;
+        }
+        let step = ((free - FILL_LEAVES) / 1200).clamp(1, 64);
+        let got = shell_line(
             &mut vm,
             &mut log,
-            &format!("rm -f /sys/firmware/efi/efivars/fill{k}-{FILL_GUID}"),
+            &format!(
+                "cd /sys/firmware/efi/efivars; k=0; while [ $k -lt {step} ] && printf '\\007\\000\\000\\000%01024d' 0 > fill{written}-$k-{FILL_GUID} 2>/dev/null; do k=$((k+1)); done; cd /; sleep 3; echo $k"
+            ),
         )?;
-        k += 1;
+        written += got.parse::<u64>().unwrap_or(0);
         free = nvram_free(&mut vm, &mut log)?;
-        check(k < 256, "the NVRAM did not give room back")?;
     }
+    check(
+        free < EFI_MIN_FREE,
+        format!("the NVRAM still has {free} B free after {written} variables"),
+    )?;
     n.put(
         "NVRAM filled by another GUID (1 KiB variables)",
-        format!("{filled} written, {k} given back, {free} B free"),
+        format!("{written} written, {free} B free"),
     );
     vm.poweroff(&mut log)?;
     drop(vm);

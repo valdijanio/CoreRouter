@@ -1076,6 +1076,11 @@ boot com a NVRAM cheia de dumps; Arch FS#70140): ninguém apagava. A política:
   novo;
 - a medida se repete a cada 60 s enquanto o meio está ligado: um oops grava um dump sem
   reiniciar, e uma série deles no mesmo boot não pode tomar o lugar das entradas de boot;
+- o espaço de um dump apagado só volta quando o firmware recolhe a NVRAM, num boot (**medido**
+  no OVMF: 233 472 B livres antes do pânico, 217 088 B depois de apagado, no mesmo boot; o EDK2
+  não recolhe em tempo de execução e só o faz no boot quando o espaço livre fica curto). O
+  `QueryVariableInfo` conta só o que uma escrita agora consegue usar, que é o que a atualização
+  A/B precisa: a medida do daemon é a certa, e erra para o lado seguro;
 - a imagem live só lê: os registros são do sistema instalado.
 
 O que fica de fora: um surto de oops que grave mais de dois dumps dentro de 60 s ainda chega ao
