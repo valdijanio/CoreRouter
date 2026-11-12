@@ -591,3 +591,46 @@ fn edac_modules_and_their_errors() {
     assert_eq!(none, MemoryErrors::default());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// G4.8g: two DDR5 modules (spd5118 at 0x50 and 0x52: slots 0 and 2) and a
+/// DDR4 one's JC42.4 sensor (0x19: slot 1), named by slot; the high limit
+/// the firmware programs is not a limit.
+#[test]
+fn memory_module_sensors_by_slot() {
+    let dir = std::env::temp_dir().join(format!("cr-res-dimm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let hwmon = dir.join("sys/class/hwmon");
+    let chip = |n: u32, name: &str, client: &str| {
+        let d = hwmon.join(format!("hwmon{n}"));
+        std::fs::create_dir_all(&d).unwrap();
+        for (f, v) in [
+            ("name", format!("{name}\n")),
+            ("temp1_input", "41250\n".into()),
+            ("temp1_max", "55000\n".into()),
+            ("temp1_crit", "85000\n".into()),
+        ] {
+            std::fs::write(d.join(f), v).unwrap();
+        }
+        let c = dir
+            .join("sys/devices/pci0000:00/0000:00:1f.4/i2c-0")
+            .join(client);
+        std::fs::create_dir_all(&c).unwrap();
+        std::os::unix::fs::symlink(&c, d.join("device")).unwrap();
+    };
+    chip(0, "spd5118", "0-0050");
+    chip(1, "spd5118", "0-0052");
+    chip(2, "jc42", "0-0019");
+    // Not a module's address: the plain name.
+    chip(3, "jc42", "3-0030");
+    let all = Collector::at(&dir.join("proc"), &dir.join("sys")).sensors();
+    let chips: Vec<&str> = all.iter().map(|s| s.chip.as_str()).collect();
+    assert_eq!(
+        chips,
+        ["spd5118 dimm0", "spd5118 dimm2", "jc42 dimm1", "jc42"]
+    );
+    assert!(
+        all.iter()
+            .all(|s| s.max.is_none() && s.crit == Some(85.0) && !s.board && s.value == 41.25)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

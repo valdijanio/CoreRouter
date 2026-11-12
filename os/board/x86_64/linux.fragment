@@ -134,6 +134,11 @@ CONFIG_NVME_HWMON=y
 CONFIG_SENSORS_DRIVETEMP=y
 CONFIG_INTEL_PCH_THERMAL=y
 CONFIG_REALTEK_PHY_HWMON=y
+# G4.8g: the SPD hub of DDR5 modules (temperature). The SMBus driver lists
+# it from the SMBIOS memory devices (i2c_register_spd, i2c-smbus.c): an
+# enumerated device. Its probe only reads (it writes the page register only
+# when a page other than 0 is selected, spd5118_i2c_init).
+CONFIG_SENSORS_SPD5118=y
 # The motherboard's Super-I/O (fans, voltages, board temperatures): modules.
 # These chips are not enumerated: each driver writes its unlock key to ports
 # 0x2e/0x4e to see who answers. PID 1 loads them after the ports and the
@@ -144,6 +149,12 @@ CONFIG_SENSORS_NCT6683=m
 CONFIG_SENSORS_IT87=m
 CONFIG_SENSORS_F71882FG=m
 CONFIG_SENSORS_W83627EHF=m
+# G4.8g: the JC42.4 sensor of DDR3/DDR4 modules (servers' RDIMMs): found by
+# reading SMBus addresses 0x18-0x1f, so it loads with the Super-I/O ones.
+# The AMD chipsets' SMBus (Intel's, i801, is built in): loaded with them
+# where it is (VMware's virtual one writes an error line at boot).
+CONFIG_SENSORS_JC42=m
+CONFIG_I2C_PIIX4=m
 # The defconfig's module nobody loaded: the package sensor coretemp shows.
 # CONFIG_X86_PKG_TEMP_THERMAL is not set
 
