@@ -407,6 +407,15 @@ impl Vm {
         }
     }
 
+    /// The console lines that came and were not read yet, without waiting.
+    pub(super) fn drain(&mut self, log: &mut std::fs::File) -> Vec<String> {
+        let out: Vec<String> = self.rx.try_iter().collect();
+        for line in &out {
+            let _ = writeln!(log, "{line}");
+        }
+        out
+    }
+
     /// Types `b` on the guest's serial console.
     pub(super) fn stdin_write(&mut self, b: &[u8]) -> Result<(), String> {
         self.stdin

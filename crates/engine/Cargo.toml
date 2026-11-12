@@ -171,3 +171,8 @@ workspace = true
 [[bench]]
 name = "wifi_snoop"
 harness = false
+
+# G3.4n: the OSPF query commands on a large network.
+[[bench]]
+name = "ospf_queries"
+harness = false

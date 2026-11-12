@@ -384,3 +384,7 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-11-12 — G4.6n feito (servidores NTP do DHCPv6, opção 56)
 - 2026-11-12 — G4.6o feito (ISO live não regrava o relógio da placa)
 - 2026-11-12 — G4.6p feito (`/system clock`); G4.6q e G4.6r criados (fuso horário; acertar a hora à mão)
+- 2026-11-12 — G0.30j criada e feita (install-test: o kernel matava o daemon da live por memória ao conferir o rootfs gravado)
+- 2026-11-12 — G1.6zy feito (erros de memória: controladores e política)
+- 2026-11-12 — G3.4n criada e feita (custo do OSPF do nosso lado com escala); G3.4o e G3.4p criadas
+- 2026-11-12 — G4.8g feito no QEMU (temperatura dos pentes de memória)

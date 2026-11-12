@@ -105,7 +105,7 @@ fn ctx(s: &mut Session, p: &Value) -> Result<Ctx> {
     let instance = instance(s, p)?;
     let ti_lfa = corerouter_model::ospf_sr::active(&s.store().running().routing.ospf).filter(|sr| sr.instance == instance).map_or(TiLfa::Off, |sr| sr.ti_lfa);
     let view = s.ospf_db(&instance);
-    let nbrs = s.ospf_live().0.into_iter().filter(|n| n.instance == instance).collect();
+    let nbrs = s.ospf_live().0.iter().filter(|n| n.instance == instance).cloned().collect();
     Ok(Ctx { instance, ti_lfa, view, nbrs })
 }
 

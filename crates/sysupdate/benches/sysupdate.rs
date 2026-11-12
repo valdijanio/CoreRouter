@@ -47,6 +47,47 @@ fn tree(c: &mut Criterion) {
     g.finish();
 }
 
+/// G0.30j: the read-back check of a slot from a file (in the page cache: the
+/// hashing, not the disk), a piece at a time, against the whole slot read
+/// into memory and hashed (what install, update and scrub did before).
+fn check(c: &mut Criterion) {
+    use std::os::unix::fs::FileExt;
+    let mut g = c.benchmark_group("verity_check");
+    g.sample_size(10);
+    let dir = std::env::temp_dir().join(format!("verity-bench-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    // 128 MiB: today's rootfs is ~100 MiB.
+    let d = data(128 * MIB);
+    let t = verity::tree(&d, &[0], 1).unwrap();
+    let path = dir.join("slot");
+    let mut slot = d.clone();
+    slot.extend_from_slice(&t.bytes);
+    std::fs::write(&path, &slot).unwrap();
+    drop(slot);
+    let f = std::fs::File::open(&path).unwrap();
+    let size = (d.len() + t.bytes.len()) as u64;
+    let root = verity::hex(&t.root);
+    g.throughput(Throughput::Bytes(d.len() as u64));
+    for threads in [1usize, 4, 8] {
+        g.bench_function(format!("128MiB_whole_{threads}t"), |b| {
+            b.iter(|| {
+                let mut all = vec![0u8; size as usize];
+                f.read_exact_at(&mut all, 0).unwrap();
+                let (data, stored) = all.split_at(d.len());
+                let t2 = verity::tree(data, &[0], threads).unwrap();
+                assert!(t2.root == t.root && t2.bytes == stored);
+            })
+        });
+        g.bench_function(format!("128MiB_pieces_{threads}t"), |b| {
+            b.iter(|| {
+                assert!(verity::check_at(&f, 0, size, t.data_blocks, &[0], &root, threads).unwrap())
+            })
+        });
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    g.finish();
+}
+
 fn copy(c: &mut Criterion) {
     let mut g = c.benchmark_group("package_copy");
     g.sample_size(10);
@@ -292,5 +333,5 @@ fn config_snapshot(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, tree, copy, install_disk, config_snapshot);
+criterion_group!(benches, tree, check, copy, install_disk, config_snapshot);
 criterion_main!(benches);
