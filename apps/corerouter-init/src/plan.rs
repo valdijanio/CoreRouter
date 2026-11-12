@@ -867,6 +867,7 @@ mod tests {
                 mgmt: None,
                 modules: true,
                 sensors: Sensors::Auto,
+                edac: Sensors::Auto,
                 hwsim: None,
                 unmanaged: None,
                 warnings: vec![]
@@ -1173,7 +1174,10 @@ mod tests {
         // Type 16, length 23, handle, location 3 (board), use 3 (system), ECC.
         let arr = |use_: u8, ecc: u8| vec![16, 23, 0x10, 0, 3, use_, ecc, 0, 0, 0, 0x80];
         assert!(smbios_ecc(&[arr(3, 0x06)]));
-        assert!(smbios_ecc(&[arr(3, 0x03), arr(3, 0x05)]), "one array with ECC is enough");
+        assert!(
+            smbios_ecc(&[arr(3, 0x03), arr(3, 0x05)]),
+            "one array with ECC is enough"
+        );
         assert!(!smbios_ecc(&[arr(3, 0x03)]), "None");
         assert!(!smbios_ecc(&[arr(3, 0x02)]), "Unknown");
         assert!(!smbios_ecc(&[arr(4, 0x06)]), "video memory");
@@ -1188,7 +1192,11 @@ mod tests {
         assert!(Sensors::On.edac_wanted(vm, false));
         assert!(!Sensors::Off.edac_wanted(real, true));
         assert_eq!(BootOptions::parse("corerouter.edac=on").edac, Sensors::On);
-        assert!(!BootOptions::parse("corerouter.edac=yes").warnings.is_empty());
+        assert!(
+            !BootOptions::parse("corerouter.edac=yes")
+                .warnings
+                .is_empty()
+        );
     }
 
     #[test]

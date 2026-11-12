@@ -810,7 +810,9 @@ fn check_sensors(fragment: &str, init: &str) -> Result<usize, String> {
 fn check_edac(fragment: &str, init: &str) -> Result<usize, String> {
     let built_in = fragment_symbols(fragment);
     if let Some(want) = MEMORY_ERRORS.iter().find(|s| !built_in.contains(s)) {
-        return Err(format!("linux.fragment: {want}=y is required (G1.6zy, memory errors)"));
+        return Err(format!(
+            "linux.fragment: {want}=y is required (G1.6zy, memory errors)"
+        ));
     }
     let modules = module_symbols(fragment);
     if let Some((symbol, _)) = EDAC_MODULES.iter().find(|(s, _)| !modules.contains(s)) {
@@ -823,7 +825,10 @@ fn check_edac(fragment: &str, init: &str) -> Result<usize, String> {
         .find_map(|l| l.strip_prefix("pub const EDAC_MODULES: ["))
         .and_then(|l| l.split_once("] = [")?.1.strip_suffix("];"))
         .ok_or("corerouter-init modules.rs: no `pub const EDAC_MODULES: [&str; N] = [...];` on one line")?;
-    let mut loaded: Vec<&str> = list.split(',').map(|m| m.trim().trim_matches('"')).collect();
+    let mut loaded: Vec<&str> = list
+        .split(',')
+        .map(|m| m.trim().trim_matches('"'))
+        .collect();
     let mut built: Vec<&str> = EDAC_MODULES.iter().map(|(_, m)| *m).collect();
     loaded.sort_unstable();
     built.sort_unstable();
@@ -2806,7 +2811,11 @@ mod tests {
         assert_eq!(check_sensors(&fragment, &init).unwrap(), 10);
         // G1.6zy.
         assert_eq!(check_edac(&fragment, &init).unwrap(), 5);
-        let e = check_edac(&fragment.replace("CONFIG_EDAC_IGEN6=m", "CONFIG_EDAC_IGEN6=y"), &init).unwrap_err();
+        let e = check_edac(
+            &fragment.replace("CONFIG_EDAC_IGEN6=m", "CONFIG_EDAC_IGEN6=y"),
+            &init,
+        )
+        .unwrap_err();
         assert!(e.contains("CONFIG_EDAC_IGEN6=m is required"), "{e}");
         let e = check_edac(&fragment, &init.replace("\"pnd2_edac\"", "\"x\"")).unwrap_err();
         assert!(e.contains("loads the EDAC modules"), "{e}");

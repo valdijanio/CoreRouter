@@ -157,7 +157,9 @@ pub fn main() {
     // chip (`corerouter.sensors=`).
     if opts.modules {
         let cpuinfo = read_proc("/proc/cpuinfo").unwrap_or_default();
-        let edac = opts.edac.edac_wanted(&cpuinfo, plan::smbios_ecc(&smbios(16)));
+        let edac = opts
+            .edac
+            .edac_wanted(&cpuinfo, plan::smbios_ecc(&smbios(16)));
         crate::modules::start(log, opts.sensors.wanted(&cpuinfo), edac, opts.hwsim);
     }
     let names = name_ports(Some(Path::new(crate::ports::MAP_FILE)));

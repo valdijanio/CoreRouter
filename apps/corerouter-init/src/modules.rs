@@ -427,12 +427,17 @@ fn load_edac(index: &Index, dir: &Path, log: impl Fn(&str)) {
         match probe_result(insert(dir, own, c"")) {
             Probe::Found => found.push(module),
             Probe::Absent => {}
-            Probe::Firmware => log(&format!("memory errors: {module}: the firmware reports the errors itself (GHES)")),
+            Probe::Firmware => log(&format!(
+                "memory errors: {module}: the firmware reports the errors itself (GHES)"
+            )),
             Probe::Failed(e) => log(&format!("memory errors: {module}: {own}: {e}")),
         }
     }
     if !found.is_empty() {
-        log(&format!("memory errors: {} watches the memory controller", found.join(", ")));
+        log(&format!(
+            "memory errors: {} watches the memory controller",
+            found.join(", ")
+        ));
     }
 }
 

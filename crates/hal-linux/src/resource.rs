@@ -30,10 +30,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use corerouter_hal::system_resource::{
-    CpuIrqs, CpuTimes, DAEMON_PROCESS, Disk, DiskIo, LoadAvg, MAX_CPUS, MAX_DISKS, MAX_NET,
-    MAX_PROCESSES, MAX_SENSORS, MAX_TASKS, Memory, NetDev, Pressure, Process, Psi,
-    Dimm, MAX_DIMMS, MemoryErrors,
-    ROUTER_PROCESSES, ResourceSampler, Sample, Sensor, SensorKind, Task, Want, cut_name,
+    CpuIrqs, CpuTimes, DAEMON_PROCESS, Dimm, Disk, DiskIo, LoadAvg, MAX_CPUS, MAX_DIMMS, MAX_DISKS,
+    MAX_NET, MAX_PROCESSES, MAX_SENSORS, MAX_TASKS, Memory, MemoryErrors, NetDev, Pressure,
+    Process, Psi, ROUTER_PROCESSES, ResourceSampler, Sample, Sensor, SensorKind, Task, Want,
+    cut_name,
 };
 
 /// Most descriptors counted per process (a reading of the processes lists
@@ -613,7 +613,11 @@ fn edac_files(dir: &Path) -> Vec<(String, String)> {
                 return None;
             }
             let mut text = String::new();
-            std::fs::File::open(e.path()).ok()?.take(256).read_to_string(&mut text).ok()?;
+            std::fs::File::open(e.path())
+                .ok()?
+                .take(256)
+                .read_to_string(&mut text)
+                .ok()?;
             Some((name, text.trim().to_owned()))
         })
         .collect()
@@ -622,7 +626,12 @@ fn edac_files(dir: &Path) -> Vec<(String, String)> {
 /// G1.6zy: one module from its directory's files (`dimm_label`,
 /// `dimm_location`, `size`, `dimm_mem_type`, `dimm_edac_mode`,
 /// `dimm_ce_count`, `dimm_ue_count`; Documentation/ABI/testing/sysfs-devices-edac).
-pub fn parse_edac_dimm(controller: &str, controller_name: &str, name: &str, files: &[(String, String)]) -> Dimm {
+pub fn parse_edac_dimm(
+    controller: &str,
+    controller_name: &str,
+    name: &str,
+    files: &[(String, String)],
+) -> Dimm {
     let text = |k: &str| {
         files
             .iter()
@@ -801,7 +810,10 @@ impl Collector {
         for mc in sorted_dir(&self.sys.join("devices/system/edac/mc"), "mc") {
             let files = edac_files(&mc);
             let get = |k: &str| files.iter().find(|(f, _)| f == k).map(|(_, v)| v.as_str());
-            let mc_id = mc.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let mc_id = mc
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             let mc_name = get("mc_name").unwrap_or("");
             out.controllers = out.controllers.saturating_add(1);
             let n = |k: &str| get(k).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
@@ -813,8 +825,12 @@ impl Collector {
                 if out.dimms.len() >= MAX_DIMMS {
                     break;
                 }
-                let name = d.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                out.dimms.push(parse_edac_dimm(&mc_id, mc_name, &name, &edac_files(&d)));
+                let name = d
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                out.dimms
+                    .push(parse_edac_dimm(&mc_id, mc_name, &name, &edac_files(&d)));
             }
         }
         out

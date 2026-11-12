@@ -538,7 +538,13 @@ fn edac_modules_and_their_errors() {
     let _ = std::fs::remove_dir_all(&dir);
     let mc = dir.join("sys/devices/system/edac/mc/mc0");
     std::fs::create_dir_all(&mc).unwrap();
-    for (f, v) in [("mc_name", "Skylake Socket#0 IMC#0\n"), ("ce_count", "3\n"), ("ue_count", "0\n"), ("ce_noinfo_count", "1\n"), ("ue_noinfo_count", "0\n")] {
+    for (f, v) in [
+        ("mc_name", "Skylake Socket#0 IMC#0\n"),
+        ("ce_count", "3\n"),
+        ("ue_count", "0\n"),
+        ("ce_noinfo_count", "1\n"),
+        ("ue_noinfo_count", "0\n"),
+    ] {
         std::fs::write(mc.join(f), v).unwrap();
     }
     for (n, ce) in [(0, "2"), (1, "0")] {
@@ -558,12 +564,24 @@ fn edac_modules_and_their_errors() {
     }
     let proc = dir.join("proc");
     std::fs::create_dir_all(&proc).unwrap();
-    std::fs::write(proc.join("meminfo"), "MemTotal: 1000 kB\nHardwareCorrupted:     4 kB\n").unwrap();
+    std::fs::write(
+        proc.join("meminfo"),
+        "MemTotal: 1000 kB\nHardwareCorrupted:     4 kB\n",
+    )
+    .unwrap();
     let mut c = Collector::at(&proc, &dir.join("sys"));
-    let m = c.edac_cached(0, std::fs::read_to_string(proc.join("meminfo")).ok().as_deref());
+    let m = c.edac_cached(
+        0,
+        std::fs::read_to_string(proc.join("meminfo"))
+            .ok()
+            .as_deref(),
+    );
     assert_eq!((m.controllers, m.dimms.len(), m.ce_noinfo), (1, 2, 1));
     let d0 = &m.dimms[0];
-    assert_eq!((d0.controller.as_str(), d0.name.as_str(), d0.ce, d0.size_mb), ("mc0", "dimm0", 2, 32768));
+    assert_eq!(
+        (d0.controller.as_str(), d0.name.as_str(), d0.ce, d0.size_mb),
+        ("mc0", "dimm0", 2, 32768)
+    );
     assert_eq!(d0.label, "CPU_SrcID#0_MC#0_Chan#0_DIMM#0");
     assert_eq!(d0.location, "channel 0 slot 0");
     assert_eq!(d0.controller_name, "Skylake Socket#0 IMC#0");
