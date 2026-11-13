@@ -640,6 +640,34 @@ fn parse_expr(elem: &Attr<'_>) -> Option<Expr> {
             result: u(2)?,
             flags: u(3)?,
         },
+        "rt" => Expr::Rt {
+            key: u(2)?,
+            dreg: u(1)?,
+        },
+        "byteorder" => Expr::Byteorder {
+            sreg: u(1)?,
+            dreg: u(2)?,
+            hton: match u(3)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            },
+            len: u(4)?,
+            size: u(5)?,
+        },
+        // Only the TCP-option write (G1.31d); a load or another header
+        // is someone else's.
+        "exthdr" => {
+            if u(6)? != 1 || u(5).is_some_and(|fl| fl != 0) || u(1).is_some() {
+                return None;
+            }
+            Expr::TcpOptSet {
+                kind: f.get(&2)?.u8()?,
+                offset: u(3)?,
+                len: u(4)?,
+                sreg: u(7)?,
+            }
+        }
         "dynset" => {
             let set = f.get(&1)?.str()?;
             match u(3)? {

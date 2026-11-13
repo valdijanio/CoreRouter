@@ -174,7 +174,7 @@ fn nft_and_netlink_load_the_same_table() {
         added_by_rule: false,
     }];
     let h = same_both_ways(&sample(), &dynamic);
-    assert_eq!(h.rules.len(), 31);
+    assert_eq!(h.rules.len(), 33);
     // Subscriber notices (fib, redirect, an l4proto set, reject).
     let mut c = notice_config();
     same_both_ways(&c, &[]);
@@ -282,7 +282,7 @@ fn commits_send_only_the_difference() {
     // Back and forth: the diff in reverse.
     let done = firewall::apply(&c, &a).unwrap();
     assert!(!done.replaced, "{done:?}");
-    assert_eq!(held().unwrap().rules.len(), 31);
+    assert_eq!(held().unwrap().rules.len(), 33);
 
     // Someone else changed our table: the diff sees it and replaces.
     assert!(

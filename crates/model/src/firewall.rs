@@ -682,6 +682,147 @@ impl fmt::Display for IcmpOptions {
 }
 text_serde!(IcmpOptions);
 
+/// `tcp-flags` (RouterOS): flags that must be set and, with `!`, flags that
+/// must be clear (`syn,!ack` is the first packet of a handshake). Bits of
+/// byte 13 of the TCP header (RFC 9293 §3.1; `ece`/`cwr` RFC 3168 §23.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub struct TcpFlags {
+    pub set: u8,
+    pub clear: u8,
+}
+
+impl TcpFlags {
+    pub const FIN: u8 = 0x01;
+    pub const SYN: u8 = 0x02;
+    pub const RST: u8 = 0x04;
+    pub const PSH: u8 = 0x08;
+    pub const ACK: u8 = 0x10;
+    pub const URG: u8 = 0x20;
+    pub const ECE: u8 = 0x40;
+    pub const CWR: u8 = 0x80;
+    /// RouterOS names, in its (alphabetical) order.
+    pub const NAMES: [(&'static str, u8); 8] = [
+        ("ack", Self::ACK),
+        ("cwr", Self::CWR),
+        ("ece", Self::ECE),
+        ("fin", Self::FIN),
+        ("psh", Self::PSH),
+        ("rst", Self::RST),
+        ("syn", Self::SYN),
+        ("urg", Self::URG),
+    ];
+
+    /// The bits the rule looks at.
+    pub fn mask(self) -> u8 {
+        self.set | self.clear
+    }
+
+    /// Whether a packet with header flags `flags` matches.
+    pub fn matches(self, flags: u8) -> bool {
+        flags & self.mask() == self.set
+    }
+
+    /// Only a SYN or SYN-ACK can match (the packets that carry the MSS
+    /// option, RFC 9293 §3.7.1).
+    pub fn requires_syn(self) -> bool {
+        self.set & Self::SYN != 0
+    }
+}
+
+impl FromStr for TcpFlags {
+    type Err = ParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bad = |why: &'static str| ParseError::new("tcp-flags", s, why);
+        let mut out = TcpFlags::default();
+        for item in s.split(',').map(str::trim) {
+            let (not, name) = match item.strip_prefix('!') {
+                Some(n) => (true, n.trim()),
+                None => (false, item),
+            };
+            let bit = TcpFlags::NAMES
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, b)| *b)
+                .ok_or_else(|| bad("expected ack, cwr, ece, fin, psh, rst, syn, urg, each optionally with !"))?;
+            let other = if not { out.set } else { out.clear };
+            if other & bit != 0 {
+                return Err(bad("a flag cannot be both set and negated"));
+            }
+            if not {
+                out.clear |= bit;
+            } else {
+                out.set |= bit;
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl fmt::Display for TcpFlags {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
+        for (name, bit) in TcpFlags::NAMES {
+            let not = if self.set & bit != 0 {
+                ""
+            } else if self.clear & bit != 0 {
+                "!"
+            } else {
+                continue;
+            };
+            if !first {
+                f.write_str(",")?;
+            }
+            first = false;
+            write!(f, "{not}{name}")?;
+        }
+        Ok(())
+    }
+}
+text_serde!(TcpFlags);
+
+/// `new-mss` of `change-mss`: a fixed value or the route's MTU minus the
+/// IP and TCP headers (`clamp-to-pmtu`). Never raises the MSS: the kernel
+/// writes the option only when the new value is lower (`nft_exthdr`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NewMss {
+    Value(u16),
+    ClampToPmtu,
+}
+
+impl NewMss {
+    /// Linux's `TCP_MIN_MSS`: below it the stack refuses the segment size.
+    pub const MIN: u16 = 88;
+    pub const CLAMP: &'static str = "clamp-to-pmtu";
+}
+
+impl FromStr for NewMss {
+    type Err = ParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let t = s.trim();
+        if t == NewMss::CLAMP {
+            return Ok(NewMss::ClampToPmtu);
+        }
+        match t.parse::<u16>() {
+            Ok(v) if v >= NewMss::MIN => Ok(NewMss::Value(v)),
+            _ => Err(ParseError::new(
+                "new-mss",
+                s,
+                "expected 88..65535 or clamp-to-pmtu",
+            )),
+        }
+    }
+}
+
+impl fmt::Display for NewMss {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NewMss::Value(v) => write!(f, "{v}"),
+            NewMss::ClampToPmtu => f.write_str(NewMss::CLAMP),
+        }
+    }
+}
+text_serde!(NewMss);
+
 /// The unit of a [`Limit`] (the ones nftables has).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LimitPeriod {
@@ -894,6 +1035,8 @@ pub struct Matchers {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icmp_options: Option<IcmpOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub tcp_flags: Option<TcpFlags>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub connection_mark: Option<Neg<Name>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub packet_mark: Option<Neg<Name>>,
@@ -1079,11 +1222,18 @@ pub enum Action {
     /// Raw table only: the packet skips connection tracking (filter sees
     /// it as `untracked`) and leaves the raw chain, like accept.
     Notrack,
+    /// Mangle only (G1.31d): lower the MSS option of a TCP SYN to
+    /// `new_mss`; the rule needs `protocol=tcp` and `tcp-flags=syn`.
+    ChangeMss {
+        new_mss: NewMss,
+        #[serde(default = "yes", skip_serializing_if = "is_true")]
+        passthrough: bool,
+    },
 }
 
 impl Action {
     /// RouterOS action names, in menu order.
-    pub const NAMES: [&'static str; 16] = [
+    pub const NAMES: [&'static str; 17] = [
         "accept",
         "drop",
         "reject",
@@ -1097,6 +1247,7 @@ impl Action {
         "mark-connection",
         "mark-packet",
         "mark-routing",
+        "change-mss",
         "add-src-to-address-list",
         "add-dst-to-address-list",
         "notrack",
@@ -1120,6 +1271,7 @@ impl Action {
             Action::AddSrcToAddressList { .. } => "add-src-to-address-list",
             Action::AddDstToAddressList { .. } => "add-dst-to-address-list",
             Action::Notrack => "notrack",
+            Action::ChangeMss { .. } => "change-mss",
         }
     }
 
@@ -1141,7 +1293,8 @@ impl Action {
             | Action::AddDstToAddressList { .. } => true,
             Action::MarkConnection { passthrough, .. }
             | Action::MarkPacket { passthrough, .. }
-            | Action::MarkRouting { passthrough, .. } => *passthrough,
+            | Action::MarkRouting { passthrough, .. }
+            | Action::ChangeMss { passthrough, .. } => *passthrough,
             _ => false,
         }
     }
@@ -1440,5 +1593,39 @@ mod tests {
         assert!(!host.covers(&net));
         assert!(net.contains("10.200.0.1".parse().unwrap()));
         assert!(!net.contains("::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn tcp_flags_parse_negation_and_print_in_routeros_order() {
+        let f: TcpFlags = "syn, !ack".parse().unwrap();
+        assert_eq!(f.set, TcpFlags::SYN);
+        assert_eq!(f.clear, TcpFlags::ACK);
+        assert_eq!(f.to_string(), "!ack,syn");
+        assert!(f.matches(TcpFlags::SYN));
+        assert!(!f.matches(TcpFlags::SYN | TcpFlags::ACK));
+        assert!(f.requires_syn());
+        assert!(!"!syn".parse::<TcpFlags>().unwrap().requires_syn());
+        assert!("syn,!syn".parse::<TcpFlags>().is_err());
+        assert!("bogus".parse::<TcpFlags>().is_err());
+        assert!("".parse::<TcpFlags>().is_err());
+    }
+
+    #[test]
+    fn new_mss_is_a_value_or_clamp_to_pmtu() {
+        assert_eq!("1360".parse::<NewMss>().unwrap(), NewMss::Value(1360));
+        assert_eq!(
+            "clamp-to-pmtu".parse::<NewMss>().unwrap(),
+            NewMss::ClampToPmtu
+        );
+        assert!("87".parse::<NewMss>().is_err());
+        assert!("70000".parse::<NewMss>().is_err());
+        let a: Action =
+            serde_json::from_str(r#"{"type":"change-mss","new_mss":"clamp-to-pmtu"}"#).unwrap();
+        assert_eq!(a.name(), "change-mss");
+        assert!(a.continues(), "passthrough=yes by default, as RouterOS");
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            r#"{"type":"change-mss","new_mss":"clamp-to-pmtu"}"#
+        );
     }
 }

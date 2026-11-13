@@ -53,13 +53,15 @@ apontar o parâmetro):
 
 - ação existe na tabela: filter `accept drop reject jump return log passthrough`; nat
   `accept masquerade src-nat dst-nat jump return log passthrough`; mangle `accept mark-connection
-  mark-packet mark-routing jump return log passthrough`; nas três, `add-src-to-address-list` e
+  mark-packet mark-routing change-mss jump return log passthrough`; nas três, `add-src-to-address-list` e
   `add-dst-to-address-list` (`address_list`, `address_list_timeout` opcional; o pacote segue para
   a próxima regra, como no RouterOS);
 - `masquerade`/`src-nat` só em `srcnat`, `dst-nat` só em `dstnat`, `mark-routing` só em
   `prerouting`/`output` — numa chain própria, toda chain nativa que pula para ela precisa permitir;
 - `src_port`/`dst_port`/`to_ports` exigem `protocol` tcp, udp, sctp ou udp-lite (não negado);
-  `icmp_options` exige icmp/icmpv6; `reject_with=tcp-reset` exige tcp;
+  `icmp_options` exige icmp/icmpv6; `reject_with=tcp-reset` e `tcp_flags` exigem tcp;
+- `change-mss` (G1.31d, §3.1) exige `protocol=tcp` e `tcp_flags` com `syn`; `new_mss=clamp-to-pmtu`
+  só em `forward`/`output`/`postrouting` (o `rt mtu` precisa da rota);
 - interface de entrada na `output` e de saída em `input`/`prerouting`/`dstnat` nunca casam: erro;
 - `src-nat`/`dst-nat` exigem `to_addresses` (um endereço ou faixa `A-B`, não prefixo);
 - `jump` para chain nativa ou para a própria chain, laços de `jump` (`a → b → a`): erro;
@@ -132,6 +134,33 @@ Golden: `crates/firewall/tests/golden/full.nft` (uma config que usa todo matcher
 O mesmo ruleset é carregado num kernel real em `crates/hal-linux/tests/netns_nft.rs` (namespace
 descartável, sem root; `cargo xtask netns`): aplica, preserva tabela de outro dono, troca, recusa
 um ruleset inválido sem mudar nada (dnat em postrouting) e remove.
+
+### 3.1 Clamp de MSS (`change-mss`, G1.31d)
+
+Como o `action=change-mss` do mangle do RouterOS: baixa a opção MSS dos SYN para que conexões
+que atravessam um túnel de MTU menor (WireGuard, PPPoE, GRE) não mandem segmentos que não cabem.
+
+```sh
+corerouter-cli run ip.firewall.mangle.add '{"chain":"forward","action":"change-mss","new_mss":"clamp-to-pmtu","protocol":"tcp","tcp_flags":"syn","out_interface":"wg0"}'
+```
+
+| RouterOS | nftables |
+|---|---|
+| `tcp-flags=syn,!ack` | `tcp flags & (ack\|syn) == syn` (byte 13 do TCP, `&` máscara, `==` as ligadas) |
+| `new-mss=1360` | `tcp option maxseg size set 1360` (`immediate` + `exthdr write tcpopt`) |
+| `new-mss=clamp-to-pmtu` | `tcp option maxseg size set rt mtu` (`rt load tcpmss` + `byteorder hton`) |
+
+- O kernel **só baixa** o MSS (`nft_exthdr_tcp_set_eval`, `linux-6.18.59/net/netfilter/nft_exthdr.c`:
+  "increase can cause connection to stall"): não precisa do matcher `tcp-mss` que o RouterOS
+  recomenda.
+- `rt mtu` é o MTU da rota menos 40 (IPv4) ou 60 (IPv6) (`NFT_RT_TCPMSS`, `nft_rt.c`), e o
+  kernel recusa a expressão antes do roteamento (`nft_rt_validate`: forward, output, postrouting):
+  o validador recusa antes, com o motivo, inclusive numa chain própria alcançada de `prerouting`.
+- `add`/`set` do mangle devolvem `warnings` quando a regra não muda nada: `new-mss` ≥ MTU − 40 da
+  `out-interface`, ≥ 1460 sem `out-interface`, abaixo de 536, `clamp-to-pmtu` numa interface de
+  MTU 1500, e chain `input` (só as conexões ao próprio roteador).
+- Testado num kernel real: `crates/hal-linux/tests/netns_change_mss.rs` (um SYN encaminhado sai
+  com 1360/1340, o SYN-ACK também, um SYN de 1200 fica 1200, um ACK não muda, o checksum confere).
 
 ## 4. Entradas dinâmicas de address-list
 

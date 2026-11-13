@@ -38,6 +38,7 @@ mod ethernet;
 mod fastpath;
 mod features;
 mod firewall;
+mod firewall_change_mss;
 mod firewall_diag;
 mod firewall_raw;
 mod firewall_safety;
