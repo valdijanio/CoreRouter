@@ -633,8 +633,12 @@ DP=""
 dp() {
 	local name=$1 file=$2 secs=$3
 	shift 3
+	# A profile of this run unless the caller records one around it.
+	local outer=$PERF_PID
+	[ -n "$outer" ] || perf_start "$name"
 	in_gen "${TENV[@]}" dnsperf -s "$DUT_IP" -d "$file" -l "$secs" -t 5 -O latency-histogram \
 		-O suppress=timeout,unexpected "$@" >"$OUT/raw/$name.txt" 2>&1 || true
+	[ -n "$outer" ] || perf_wait
 	DP=$(dp_parse "$OUT/raw/$name.txt")
 }
 # → "qps completed lost noerror servfail refused other p50 p99 p999 max"
@@ -784,7 +788,8 @@ warm() { dp "warm-$1" "$QF/$1" 120 -n 1 -c 4 -q 50; }
 flush() { ok ip.dns.cache.flush >/dev/null; }
 
 # PERF=<regex>: a profile of the DUT during the runs whose name matches
-# (perf record -g for $DUR s; $OUT/perf-<run>.data), local DUT only.
+# (perf record -g for $DUR s; $OUT/perf-<run>.data), local DUT only. Every
+# dnsperf run (`dp`) is one (G4.1z: the adlist runs had none).
 PERF_PID=""
 perf_start() { # <run name>
 	PERF_PID=""
@@ -793,7 +798,10 @@ perf_start() { # <run name>
 		PERF_PID=$!
 	fi
 }
-perf_wait() { [ -z "$PERF_PID" ] || wait "$PERF_PID" 2>/dev/null || true; }
+perf_wait() {
+	[ -z "$PERF_PID" ] || wait "$PERF_PID" 2>/dev/null || true
+	PERF_PID=""
+}
 
 # Saturation: as much as the DUT takes with 500 queries in flight from 8
 # client sockets; then the latency at half that rate (no queueing).
@@ -1443,6 +1451,12 @@ test_adlist() {
 	bg_wait adlist-reload
 	say "| cache quente a 20 000/s durante ip.dns.adlist.reload | $(dp_row) |"
 	cr ip.dns.adlist.remove "{\"id\":\"$id\"}" >/dev/null || true
+	# G4.1z: the same load again without the list, so the difference is the
+	# list's and not the drift between two runs (one run of vm1 lost 14 %
+	# with the list, another of vm6 gained 2 %, same code).
+	sleep 2
+	dp adlist-after "$QF/hot" "$DUR" "${SAT_OPTS[@]}"
+	say "| cache quente, sem adlist (depois de remover) | $(dp_row) |"
 	alive_check adlist
 }
 
