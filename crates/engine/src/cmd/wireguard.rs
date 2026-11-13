@@ -55,7 +55,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set WireGuard",
         [],
         None,
-        "{name: string, listen_port?: int 1..65535, mtu?: int 1280..9216, private_key?: string (base64, or auto: a new key pair; every peer must then get the new public key), disabled?: bool, comment?: string} → {name, public_key, warnings}",
+        "{name: string, listen_port?: int 1..65535, mtu?: int 1280..9216, private_key?: string (base64, or auto: a new key pair; every peer must then get the new public key), disabled?: bool, comment?: string, force?: bool (apply even if it cuts this session, which comes through this tunnel)} → {name, public_key, warnings}",
         has_interfaces,
         set
     ),
@@ -64,7 +64,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Remove WireGuard",
         [],
         None,
-        "{name: string} → {name}",
+        "{name: string, force?: bool (apply even if it cuts this session, which comes through this tunnel)} → {name}",
         has_interfaces,
         remove
     ),
@@ -73,7 +73,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Enable WireGuard",
         [],
         None,
-        "{name: string} → {name}",
+        "{name: string, force?: bool (apply even if it cuts this session, which comes through this tunnel)} → {name}",
         has_interfaces,
         enable
     ),
@@ -82,7 +82,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Disable WireGuard",
         [],
         None,
-        "{name: string} → {name}",
+        "{name: string, force?: bool (apply even if it cuts this session, which comes through this tunnel)} → {name}",
         has_interfaces,
         disable
     ),
@@ -269,6 +269,7 @@ pub(super) fn add_on(cfg: &mut Config, seal: &SealKey, p: &Value) -> Result<Valu
 }
 
 fn set(s: &mut Session, p: &Value) -> Result<Value> {
+    crate::lockout::take_force(s, p)?;
     let name: IfName = req_parse(p, "name")?;
     wireguard_of(s.store().candidate(), "name", &name)?;
     let seal = crate::sealing::key(s).map_err(EngineError::Internal)?;
@@ -322,12 +323,14 @@ pub(super) fn set_on(cfg: &mut Config, seal: &SealKey, p: &Value) -> Result<Valu
 }
 
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {
+    crate::lockout::take_force(s, p)?;
     let name: IfName = req_parse(p, "name")?;
     wireguard_of(s.store().candidate(), "name", &name)?;
     super::interface::remove(s, &json!({ "name": name }))
 }
 
 fn toggle(s: &mut Session, p: &Value, off: bool) -> Result<Value> {
+    crate::lockout::take_force(s, p)?;
     let name: IfName = req_parse(p, "name")?;
     wireguard_of(s.store().candidate(), "name", &name)?;
     if let Some(i) = s.store_mut().candidate_mut().interfaces.get_mut(&name) {

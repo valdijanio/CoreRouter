@@ -84,4 +84,5 @@ mod wifi_ap;
 mod wifi_bond;
 mod wifi_bridge;
 mod wifi_scan;
+mod wireguard_extras;
 mod xdp;
