@@ -163,15 +163,24 @@ pub fn generate_for(tag: Option<&str>) -> Result<(String, String), String> {
 }
 
 /// Server identity from PEM bytes.
+///
+/// `cert_pem` may hold the chain after the certificate (an imported one,
+/// G1.6zs): all of it is sent, so a client needs nothing else to build the
+/// path (RFC 8446 §4.4.2; RFC 8484 erratum 6708: no fetch during the
+/// handshake). The fingerprint is the certificate's.
 pub fn identity_from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<ServerIdentity, String> {
-    let cert = CertificateDer::from_pem_slice(cert_pem).map_err(|e| format!("certificate: {e}"))?;
+    let chain = CertificateDer::pem_slice_iter(cert_pem)
+        .take(16)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("certificate: {e}"))?;
+    let cert = chain.first().ok_or("certificate: no CERTIFICATE block")?;
     let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| format!("private key: {e}"))?;
     let fingerprint = fingerprint(cert.as_ref());
     let config = ServerConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .map_err(|e| e.to_string())?
         .with_no_client_auth()
-        .with_single_cert(vec![cert], key)
+        .with_single_cert(chain, key)
         .map_err(|e| format!("certificate/key: {e}"))?;
     Ok(ServerIdentity {
         config: Arc::new(config),
