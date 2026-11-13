@@ -343,9 +343,30 @@ pub(crate) fn steps_text(app: &CoreRouterUi, steps: &[Value]) -> Vec<String> {
             let id = s.get("command").and_then(Value::as_str).unwrap_or("");
             // A secret the modal sends never shows on screen.
             let p = crate::redact::redacted(&s.get("params").cloned().unwrap_or(Value::Null));
+            // A long value (a pasted PEM, G1.6zs) is cut on screen only: the
+            // command sent is whole. Unbroken, it pushed the modal's buttons
+            // off the screen.
+            let p = shortened(&p);
             command_text(&reg, id, &p, Syntax::RouterOs)
         })
         .collect()
+}
+
+/// Longest parameter value shown in a command's preview.
+const SHOWN_VALUE: usize = 48;
+
+/// `v` with each string over [`SHOWN_VALUE`] characters cut to its start
+/// and `…`.
+fn shortened(v: &Value) -> Value {
+    match v {
+        Value::Object(o) => Value::Object(o.iter().map(|(k, x)| (k.clone(), shortened(x))).collect()),
+        Value::Array(a) => Value::Array(a.iter().map(shortened).collect()),
+        Value::String(t) if t.chars().count() > SHOWN_VALUE => {
+            let head: String = t.chars().take(SHOWN_VALUE).collect();
+            Value::String(format!("{}…", head.replace('\n', " ")))
+        }
+        other => other.clone(),
+    }
 }
 
 impl CoreRouterUi {

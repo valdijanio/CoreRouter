@@ -694,7 +694,17 @@ impl DnsStatsPanel {
                             ui.end_row();
                         }
                         label(ui, help, l, "dns_statistics.encrypted_in", "DoT / DoH in");
-                        ui.weak(tr_in(SCOPE, l, "not served"));
+                        let enc = s.get("encrypted_in").cloned().unwrap_or(Value::Null);
+                        if enc.get("dot").and_then(Value::as_bool) == Some(true) {
+                            ui.label(format!(
+                                "{} ({} {})",
+                                n(&enc, "queries"),
+                                n(&enc, "sessions"),
+                                tr_in(SCOPE, l, "sessions")
+                            ));
+                        } else {
+                            ui.weak(tr_in(SCOPE, l, "off"));
+                        }
                         ui.end_row();
                     });
                 });

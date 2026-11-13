@@ -83,6 +83,7 @@ pub(crate) const CATALOG: &[Entry] = &[
     e("dns", DNS, Some("Settings"), icons::GEAR_SIX, "/ip dns", &["ip.dns.get", "ip.dns.set"], &["resolver", "servers", "doh", "dot", "dns server", "allow remote requests"]),
     e("dns-adlist", DNS, Some("Adlist"), icons::PROHIBIT, "/ip dns adlist", &["ip.dns.adlist"], &["adblock", "blacklist", "bloqueio", "pi-hole", "ads", "propaganda"]),
     e("dns-cache", DNS, Some("Cache"), icons::DATABASE, "/ip dns cache", &["ip.dns.cache"], &["flush", "limpar cache"]),
+    e("dns-encrypted", DNS, Some("Encrypted Service"), icons::LOCK_SIMPLE, "", &["ip.dns.encrypted-service"], &["dot", "dns over tls", "rfc 7858", "853", "private dns", "dns privado", "android", "ddr", "resolver.arpa", "tls", "dns cifrado", "encrypted dns", "doh server", "servidor dot"]),
     e("dns-forwarders", DNS, Some("Forwarders"), icons::ARROW_BEND_UP_RIGHT, "/ip dns forwarders", &["ip.dns.forwarders"], &["forward", "encaminhar", "conditional forwarding", "doh"]),
     e("dns-lookup", None, None, icons::MAGNIFYING_GLASS, "/tool dns-lookup", &["tool.dns", "ip.dns.resolve"], &["nslookup", "dig", "resolve", "host", "resolver nome"]),
     e("dns-static", DNS, Some("Static"), icons::PUSH_PIN, "/ip dns static", &["ip.dns.static"], &["hosts", "a record", "registro", "fwd", "cname", "estático"]),

@@ -497,7 +497,7 @@ fn servfail(query: &[u8]) -> Option<Vec<u8>> {
 /// Where the forwarder listens: every address of the host, or only its
 /// loopback when the daemon runs the virtual lab (its interfaces are not
 /// the host's, so the host's LAN must not reach it; as CRDP, G5.4).
-fn listen_ips(lab: bool) -> [IpAddr; 2] {
+pub(crate) fn listen_ips(lab: bool) -> [IpAddr; 2] {
     if lab {
         [IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)]
     } else {
@@ -506,7 +506,7 @@ fn listen_ips(lab: bool) -> [IpAddr; 2] {
 }
 
 /// Whether the session runs the virtual lab (`--backend virtual`).
-fn is_lab(session: &Shared) -> bool {
+pub(crate) fn is_lab(session: &Shared) -> bool {
     lock(session).backend().starts_with("virtual lab")
 }
 
@@ -515,7 +515,7 @@ fn is_lab(session: &Shared) -> bool {
 /// cores free; the chain's locks (statistics, per-client limit, cache) let
 /// several scale: 2 threads 577 000/s, 4 threads 964 000/s (G0.31,
 /// **medido**). The kernel hands each datagram to one waiting reader.
-fn udp_threads() -> usize {
+pub(crate) fn udp_threads() -> usize {
     let cores = thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     (cores / 2).clamp(1, 4)
 }
@@ -828,6 +828,71 @@ impl Server {
         }
         done
     }
+}
+
+/// G4.1zf: what [`Answer::ask`] did with a query from another transport.
+pub(crate) enum Answer {
+    /// Answered on this thread (cache, static, refused…); `None`: no reply
+    /// (junk, or the per-client limit), the connection should end.
+    Now(Option<Vec<u8>>),
+    /// A cache miss went to a worker; the reply goes to the callback.
+    Later,
+}
+
+/// A reply of [`Answer::ask`] that came later, on the worker's thread
+/// (`None`: none, as [`Answer::Now`]).
+pub(crate) type Then = Box<dyn FnOnce(Option<Vec<u8>>) + Send>;
+
+impl Answer {
+    /// One query that came over DNS over TLS (G4.1zf) from `client`: the
+    /// chain as for TCP 53 (`tcp`: no truncation), up to the cache on the
+    /// caller's thread; a miss waits on a worker, at most
+    /// `max_concurrent_queries` of them (more: SERVFAIL now, as UDP), and
+    /// `then` gets its reply. Zone transfers are not served over TLS here
+    /// (RFC 9103 XoT is another feature).
+    pub(crate) fn ask(srv: &Arc<Server>, msg: &[u8], client: IpAddr, read_at: Instant, then: Then) -> Self {
+        match srv.fwd.start(msg, client, true, srv.dns.now_ms()) {
+            Start::Done(mut d) => {
+                srv.effects(&mut d);
+                if d.reply.is_some() {
+                    srv.answered(read_at);
+                }
+                Self::Now(d.reply)
+            }
+            Start::Pending(p) => {
+                let Some(pass) = Pass::enter(srv, Which::Query, srv.max_queries()) else {
+                    return Self::Now(srv.fwd.fail(*p).reply);
+                };
+                let worker = move || {
+                    let mut d = pass.srv.finish(*p);
+                    pass.srv.effects(&mut d);
+                    if d.reply.is_some() {
+                        pass.srv.answered(read_at);
+                    }
+                    then(d.reply);
+                };
+                match thread::Builder::new().name("dns-query".into()).spawn(worker) {
+                    Ok(_) => Self::Later,
+                    Err(e) => {
+                        log::warn!("DNS: no thread for a query: {e}");
+                        Self::Now(servfail(msg))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The forwarder's server, once the `dns-server` service made it (G4.1zf:
+/// DNS over TLS answers through it).
+pub(crate) fn server() -> Option<Arc<Server>> {
+    SERVER.get().cloned()
+}
+
+/// Who may open a connection at all (G4.1zf: before any TLS): the router,
+/// `allowed_from`, a peer a zone names (as TCP 53).
+pub(crate) fn may_connect(srv: &Server, peer: IpAddr) -> bool {
+    zone::xfr::may_connect(&srv.fwd, peer)
 }
 
 /// The block lists the forwarder matches (G4.1d), once it started.
