@@ -69,8 +69,10 @@ struct Try {
     /// When this server was asked (UDP, before a TCP retry): its RTT.
     since_ms: u64,
     until_ms: u64,
-    /// How long it was given (the server's RTO then, G4.1u).
-    wait_ms: u64,
+    /// The server's RTO it was sent with (G4.1u): what a timeout backs
+    /// off from. The last try waits longer (`query_server_timeout`), but
+    /// its timeout must not push the RTO of the next lookups to that.
+    rto_ms: u64,
     /// Past its wait: counted as a timeout and another server asked, but
     /// a late answer to it is still taken (G4.1u).
     expired: bool,
@@ -244,7 +246,7 @@ impl Lookup {
                     via(&t.way),
                     super::Outcome::Answered(rtt),
                     tcp,
-                    t.wait_ms,
+                    t.rto_ms,
                 ));
                 self.tries.clear();
                 self.result = Some(Ok((
@@ -258,7 +260,7 @@ impl Lookup {
             Err(ReplyError::Truncated) if t.way == Way::Udp => {
                 self.tries.remove(i);
                 let per = u64::from(self.settings.server_timeout_ms);
-                match self.send(t.target, Way::Tcp, t.since_ms, per, now_ms) {
+                match self.send(t.target, Way::Tcp, t.since_ms, (per, per), now_ms) {
                     Some(x) => vec![x],
                     None => self.advance(now_ms),
                 }
@@ -321,7 +323,7 @@ impl Lookup {
             via(&t.way),
             super::Outcome::Timeout,
             t.way == Way::Tcp,
-            t.wait_ms,
+            t.rto_ms,
         ));
         self.errors
             .push(describe(t, &Ask::Transport(TransportError::Timeout)));
@@ -349,7 +351,7 @@ impl Lookup {
             via(&t.way),
             outcome,
             t.way == Way::Tcp,
-            t.wait_ms,
+            t.rto_ms,
         ));
         self.errors.push(describe(t, &e));
         self.advance(now_ms)
@@ -385,21 +387,23 @@ impl Lookup {
                 break;
             };
             let per = u64::from(self.settings.server_timeout_ms);
-            let (way, wait) = match target {
+            let (way, wait, rto) = match target {
                 Target::Plain(_) => {
                     // The last query (no other send left) waits it all.
                     let last = self.sends >= budget || !self.another_after();
-                    let rto = self.per.get(i).map_or(per, |p| p.rto_ms);
-                    let wait = if last {
-                        per
-                    } else {
-                        rto.clamp(super::RTO_MIN_MS, per.max(super::RTO_MIN_MS))
-                    };
-                    (Way::Udp, wait)
+                    let rto = self
+                        .per
+                        .get(i)
+                        .map_or(per, |p| p.rto_ms)
+                        .clamp(super::RTO_MIN_MS, per.max(super::RTO_MIN_MS));
+                    (Way::Udp, if last { per } else { rto }, rto)
                 }
-                Target::Secure(_, s) => (Way::Secure(s), per.max(SECURE_TIMEOUT_MS)),
+                Target::Secure(_, s) => {
+                    let w = per.max(SECURE_TIMEOUT_MS);
+                    (Way::Secure(s), w, w)
+                }
             };
-            if let Some(x) = self.send(i, way, now_ms, wait, now_ms) {
+            if let Some(x) = self.send(i, way, now_ms, (wait, rto), now_ms) {
                 return vec![x];
             }
             if let Some(p) = self.per.get_mut(i) {
@@ -429,14 +433,15 @@ impl Lookup {
     }
 
     /// One exchange with target `i`, waiting `wait` at most (and never
-    /// past the total deadline), or none if no time is left or the query
-    /// cannot be built (the error is noted; the caller moves on).
+    /// past the total deadline; `rto`: the RTO it goes with), or none if
+    /// no time is left or the query cannot be built (the error is noted;
+    /// the caller moves on).
     fn send(
         &mut self,
         i: usize,
         way: Way,
         since_ms: u64,
-        wait: u64,
+        (wait, rto): (u64, u64),
         now_ms: u64,
     ) -> Option<Exchange> {
         let ip = self.targets.get(i)?.ip();
@@ -474,7 +479,7 @@ impl Lookup {
             id,
             since_ms,
             until_ms: now_ms.saturating_add(wait),
-            wait_ms: wait,
+            rto_ms: rto,
             expired: false,
         });
         Some(Exchange {
