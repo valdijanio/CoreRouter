@@ -176,6 +176,29 @@ Carga em 0,7–1,1 s, **55–57 B por nome**; a recarga (`ip.dns.adlist.reload`)
 não muda nada (p99,9 107 µs). Custo: o acerto de cache cai **14 %** com a lista (194 → 166 mil/s em
 4 vCPUs), mais do que os 80–110 ns medidos na busca (gap G4.1z). Nomes bloqueados: 196 mil/s.
 
+### Zonas, UPDATE e DHCP com nome (`ddns`, G4.1p e G4.1q)
+
+As zonas têm no máximo 50 000 registros no total (`model::dns_zone::MAX_RECORDS`): `dyn.lab` com
+40 000 (a que muda) e `other.lab` com 9 980 (só está lá). Depois (esta branch; o caminho das zonas
+não mudou):
+
+| Carga | Consultas à zona a 5000/s: p50 / p99 / máx. | UPDATEs aceitos/s, p99 | Escrita por UPDATE |
+|---|---|---|---|
+| Sem UPDATE (saturação) | 188 mil/s; p50 2,7 ms na fila | - | - |
+| UPDATE a 20/s | **88 ms / 225 ms / 534 ms** | 6/s, 4,3 s | 10 KiB |
+| UPDATE a 100/s | 92 / 180 / 192 ms | 6/s, 4,1 s | 26 KiB |
+| UPDATE a 500/s | 92 / 180 / 196 ms | 6/s, 4,1 s | 41 KiB |
+
+Tempestade de DHCP (20 000 clientes com nome a 1000/s, a zona recebendo o A de cada concessão):
+**9 447 concessões em 55 s** (~170/s) e as consultas à zona com p99 de 221 ms; ~3 KiB gravados
+por concessão. Sem nome na zona, o servidor DHCP faz milhares por segundo (G3.9h). Uma mudança
+nas zonas custa uma reconstrução de todas elas (G4.1p) e a regravação de todos os registros
+dinâmicos (G4.1q), numa thread só, e as consultas à zona esperam por isso. **É o maior limite que
+a bateria achou**: um ISP que publica o nome de cada concessão não aguenta uma volta de energia
+(todos os clientes renovando juntos). As duas gaps ganharam esses números.
+
+Carga das zonas por `ip.dns.zone.file.load`: 311 ms para 9 980 registros e 1,07 s para 40 000.
+
 ### Entrada hostil (`hostile`)
 
 - Lixo a 60 mil/s (limite padrão de 200 consultas/s por cliente) e a 185 mil/s (sem limite) de um
