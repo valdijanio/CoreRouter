@@ -307,7 +307,8 @@ fn get(s: &mut Session, _: &Value) -> Result<Value> {
 }
 
 /// `ip.dns.cache.print` rows by default, and at most: the cache can hold
-/// millions of entries, all formatted under the resolver's lock.
+/// millions of entries (the daemon copies them in pieces, letting the
+/// resolver's lock go between them, G4.1y; the reply is still built whole).
 const CACHE_PRINT_DEFAULT: u32 = 1000;
 const CACHE_PRINT_MAX: u32 = 100_000;
 

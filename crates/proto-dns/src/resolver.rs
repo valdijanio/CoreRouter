@@ -28,6 +28,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 mod flight;
@@ -323,12 +324,26 @@ pub const FAILURE_HOLD_MS: u64 = 5_000;
 pub const FAILURE_MAX_HOLD_MS: u64 = 300_000;
 /// Failures remembered at most (§3.2: the cache SHOULD be bounded).
 pub const MAX_FAILURES: usize = 4096;
+/// A piece of a cache listing (G4.1y): slots looked at, and entries
+/// copied, per hold of the lock. On a million entries a piece holds it
+/// ~61 µs scanning and ~29 µs copying (`benches/resolver.rs`, release,
+/// host, 2026-11-13, **medido**); the whole scan under the lock took
+/// 190 ms.
+pub const PRINT_SLOTS: usize = 4096;
+pub const PRINT_COPIES: usize = 256;
+/// At most this many yields between two pieces while lookups wait.
+const PRINT_YIELDS: u32 = 256;
 
 /// Resolver shared by every thread of the router (tools, NTP, the LAN
 /// forwarder).
 #[derive(Debug, Default)]
 pub struct Resolver {
     state: Mutex<State>,
+    /// Threads waiting for `state` (G4.1y): a cache listing lets them in
+    /// between its pieces. The std mutex is not fair: the listing, taking
+    /// it again right after letting it go, kept the woken lookups out for
+    /// the whole listing (31 ms of 31 ms on a million entries, host).
+    waiting: AtomicUsize,
     /// G4.1o: lookups in flight.
     flights: Flights,
 }
@@ -345,15 +360,26 @@ impl Resolver {
                 stats: BTreeMap::new(),
                 failures: HashMap::new(),
             }),
+            waiting: AtomicUsize::new(0),
             flights: Flights::default(),
         }
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
+        // Free: no counting (the common case pays nothing more).
+        match self.state.try_lock() {
+            Ok(st) => return st,
+            Err(std::sync::TryLockError::Poisoned(p)) => return p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        self.waiting.fetch_add(1, Ordering::Relaxed);
         // A panic elsewhere never makes the resolver unusable.
-        self.state
+        let st = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.waiting.fetch_sub(1, Ordering::Relaxed);
+        st
     }
 
     /// New settings (config change or a DHCP lease). The cache stays,
@@ -377,10 +403,15 @@ impl Resolver {
     }
 
     pub fn cache_rows(&self, now_ms: u64) -> Vec<CacheRow> {
-        self.state().cache.rows(now_ms)
+        self.cache_rows_matching(now_ms, None, None, usize::MAX)
     }
 
-    /// See [`Cache::rows_matching`].
+    /// At most `limit` cache entries whose name contains `name` and whose
+    /// type is `qtype`, sorted by name (`ip.dns.cache.print`). Copied in
+    /// pieces of [`PRINT_SLOTS`] slots or [`PRINT_COPIES`] entries, the
+    /// lock let go between them, and formatted after (G4.1y): with a
+    /// million entries the whole scan under the lock stopped every lookup
+    /// for up to 160 ms (`docs/dns-stress.md`).
     pub fn cache_rows_matching(
         &self,
         now_ms: u64,
@@ -388,7 +419,28 @@ impl Resolver {
         qtype: Option<&str>,
         limit: usize,
     ) -> Vec<CacheRow> {
-        self.state().cache.rows_matching(now_ms, name, qtype, limit)
+        let filter = crate::cache::Filter::new(now_ms, name, qtype);
+        let mut copies = Vec::new();
+        let mut from = Some(0);
+        while let Some(f) = from {
+            if copies.len() >= limit {
+                break;
+            }
+            let room = limit.min(copies.len().saturating_add(PRINT_COPIES));
+            from = self
+                .state()
+                .cache
+                .copy_matching(&filter, f, PRINT_SLOTS, room, &mut copies);
+            // The lookups waiting for the lock go first (a bounded wait:
+            // a waiter the scheduler does not run never stalls the
+            // listing for long).
+            let mut turns = 0;
+            while self.waiting.load(Ordering::Relaxed) > 0 && turns < PRINT_YIELDS {
+                std::thread::yield_now();
+                turns += 1;
+            }
+        }
+        crate::cache::rows_of(&copies, now_ms)
     }
 
     pub fn cache_len(&self) -> usize {
@@ -1026,6 +1078,36 @@ mod tests {
     use crate::message::tests::{a, reply};
     use hickory_proto::op::{Message, ResponseCode};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn the_cache_listing_goes_in_pieces() {
+        // G4.1y: more entries than a piece holds; the filtered listing
+        // still finds its rows, sorted, and stops at the limit.
+        let r = Resolver::new(Settings {
+            cache_bytes: 64 << 20,
+            ..Settings::default()
+        });
+        {
+            let mut st = r.state();
+            for i in 0..3 * PRINT_SLOTS {
+                let name = format!("host{i}.example");
+                let ans = Answer::local(
+                    crate::message::Rcode::NoError,
+                    vec![a(&name, 600, [192, 0, 2, 1])],
+                );
+                st.cache
+                    .put(&name, RecordType::A, &ans, None, 0, 604_800, 40);
+            }
+        }
+        let rows = r.cache_rows_matching(0, Some("host1"), Some("A"), usize::MAX);
+        let want = (0..3 * PRINT_SLOTS)
+            .filter(|i| i.to_string().starts_with('1'))
+            .count();
+        assert_eq!(rows.len(), want);
+        assert!(rows.windows(2).all(|w| w[0].name <= w[1].name), "sorted");
+        assert_eq!(r.cache_rows_matching(0, None, None, 1000).len(), 1000);
+        assert_eq!(r.cache_rows(0).len(), 3 * PRINT_SLOTS);
+    }
 
     #[derive(Clone, Copy)]
     enum Behave {
