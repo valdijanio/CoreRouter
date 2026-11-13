@@ -1001,6 +1001,7 @@ fn static_name(name: &str) -> &'static str {
         "Root verity",
         "BGP End-of-RIB",
         "BGP GR without BFD",
+        "OSPF LSDB",
         "Previous boot",
         "Crash store",
         "Memory errors",
