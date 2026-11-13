@@ -3151,3 +3151,55 @@ a `main` 9519530e, depois = a branch, rodados em seguida na mesma janela de carg
 | `routing.ospf.route.list` (200 000 rotas) | 36,5 ms, 1,9 MiB | 4,0 ms, 38 KiB |
 | `routing.ospf.topology` (2 000 roteadores) | 72,8 ms, 1 MiB | 18,0 ms; 0,77 ms e 113 B com `known` |
 | quadro da GUI em OSPF › Routes | 53,4 ms | 6,6 ms |
+
+- 2026-11-12, G1.31a (bench `wireguard_list`, release, AMD Ryzen AI Max+ 395, `VirtualHal`,
+  20 000 pares numa interface): `interface.wireguard.peers.list` 413 → 51 ms e
+  `interface.wireguard.list` 362 → 5,3 ms (**medido**). O PR 1 andava o relatório do kernel
+  inteiro para cada par (O(n²)); agora um mapa por chave. O "antes" foi medido com a busca
+  linear de volta na mesma árvore.
+
+### G4.1h — custo das estatísticas do encaminhador por consulta (**medido**, 2026-11-12)
+
+AMD Ryzen AI MAX+ 395 (32 threads), build release, `benches/statistics.rs` (resposta estática, a
+mais barata da cadeia). Antes e depois rodados alternados duas vezes na mesma carga da máquina
+(load 15–19, outras sessões compilando); tempo de parede por consulta com N threads contando juntas.
+
+| Caso | Antes | Depois | Mudança |
+|---|---|---|---|
+| 1 cliente | 1,36 / 1,56 µs | 1,95 / 1,20 µs | ruído (sem diferença) |
+| 4096 clientes (CGNAT, todo cliente é novo) | 2,89 / 2,99 µs | 1,50 / 1,28 µs | −52 % (O(n) → O(log n)) |
+| 4 threads | 3,13 / 3,34 µs | 0,57 / 0,51 µs | 5,5–6,6× |
+| 16 threads | 3,48 / 3,22 µs | 0,52 / 0,74 µs | 4,3–6,7× |
+
+Antes, 4 threads eram mais lentas que 1 (o `Mutex` único serializava todas e a varredura O(n) do
+Space-Saving rodava dentro dele). Depois, com 16 threads, `perf record -g` mostra 1,7 % do tempo
+em locks disputados (0,6 % no `Forwarder::compiled` dos estáticos, o resto no `state` da adlist):
+o custo restante é decodificar e codificar a mensagem (hickory) e alocação.
+
+### G4.1za/zb — custo das abas Names e Clients por consulta (**medido**, 2026-11-12)
+
+AMD Ryzen AI MAX+ 395 (32 threads), build release, `benches/statistics.rs`, 2026-11-12. "Antes" é a `origin/main` (b789595d, G4.1h) com o mesmo arquivo de bench, numa worktree à parte e no mesmo `CARGO_TARGET_DIR`; "depois" é esta branch. Duas rodadas alternadas, laboratório parado, load 15–17 de outras sessões. Tempo de parede por consulta.
+
+| Caso | Antes (r2 / r3) | Depois (r2 / r3) | Mudança |
+|---|---|---|---|
+| 1 cliente, nome estático | 1,19 / 1,21 µs | 1,21 / 1,22 µs | +1 % (≈ 15 ns: hash do nome e tabela de nomes) |
+| 4096 clientes (CGNAT) | 1,23 / 1,23 µs | 1,25 / 1,26 µs | +2–3 % (≈ 30 ns) |
+| 4 threads | 0,50 / 0,51 µs | 0,50 / 0,50 µs | ruído (p > 0,05) |
+| 16 threads | 0,50 / 0,49 µs | 0,48 / 0,43 µs | sem piora |
+| subdomínio aleatório (todo nome e cliente novos, NXDOMAIN) | 0,91 / 1,09 µs | 1,01 / 1,00 µs | +12 % na r2 (≈ 0,1 µs: domínio, segundo hash, HyperLogLog); r3 ruidosa |
+| subdomínio aleatório, 16 threads | 0,49 / 0,51 µs | 0,47 / 0,42 µs | sem piora |
+
+O trabalho por consulta não cresce com o número de clientes, nomes ou domínios. São dois ou três hashes SipHash, três buscas e no máximo 8 trocas de heap por tabela (256 entradas). A pior consulta é a do ataque, com tudo novo, e custa só ≈ 0,1 µs a mais que um nome conhecido. A leitura (`snapshot`, uma vez por segundo com a janela aberta) soma as 16 faixas: ≈ 9 mil entradas, fora do caminho das consultas.
+
+### G4.1zc/ze — custo do EDE e da soma da latência por consulta (**medido**, 2026-11-12)
+
+AMD Ryzen AI MAX+ 395 (32 threads), build release, `benches/statistics.rs`, 2026-11-12, load 7–38 de outras sessões. O EDE só pesa nas respostas de erro com EDNS, e o bench (estático, sem EDNS) não passa por ele. O que este PR põe no caminho de toda consulta é mover a `Message` para `fit` e somar a latência no `answered_in`, chamado pelo daemon e não pelo bench.
+
+| Caso | `main` (antes3) | G4.1za (r3) | este PR | Leitura |
+|---|---|---|---|---|
+| 1 cliente | 1,21 µs | 1,22 µs | 1,74 / 1,35 / 1,39 / 1,26 µs (a última com 20 s de medida) | ruído: a carga subiu de 7 para 38 durante as rodadas, e o mesmo código com 4096 clientes não mudou |
+| 4096 clientes | 1,23 µs | 1,26 µs | 1,28 / 1,28 / 1,28 µs | +2 ns sobre o G4.1za |
+| subdomínio aleatório | 1,09 µs | 1,00 µs | 1,02 / 1,02 / 1,05 µs | sem diferença (p > 0,05) |
+| 16 threads | 0,49 µs | 0,43 µs | 0,51 µs | carga alta; sem lock novo |
+
+O `/metrics` lê os contadores uma vez por scrape com `Statistics::totals` (16 faixas, sem copiar clientes nem nomes) e escreve cerca de 70 linhas a mais.
