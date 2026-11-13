@@ -8,7 +8,9 @@
 use corerouter_model::web::{WebListener, WebListenerStatus, WebService, WebStatus};
 use serde_json::{Value, json};
 
-use super::args::{opt_bool, opt_parse, opt_u32};
+use corerouter_model::certificate::Certificates;
+
+use super::args::{opt_bool, opt_parse, opt_str, opt_u32};
 use super::metrics_service::available_from;
 use super::{CommandSpec, always};
 use crate::{EngineError, Result, Session};
@@ -19,12 +21,12 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Web Access (HTTPS)",
         [],
         None,
-        "{enabled?: bool, address?: ip, port?: int 1..65535, available_from?: [prefix], force?: bool (even if the next login of this session could not come back through it)} → {enabled, address, port, available_from, warning?}",
+        "{enabled?: bool, address?: ip, port?: int 1..65535, available_from?: [prefix], certificate?: string (a /certificate with its key; none: the router's own), force?: bool (even if the next login of this session could not come back through it)} → {enabled, address, port, available_from, certificate, warning?}",
         always,
         set_ssl
     ),
     cmd!(query "ip.service.www-ssl.get", "Web Access (HTTPS)", [], None,
-        "{} → {enabled, address, port, available_from, status: stopped|listening|error, listening, last_error, refused, gui_files}",
+        "{} → {enabled, address, port, available_from, certificate, status: stopped|listening|error, listening, last_error, refused, gui_files}",
         always, get_ssl),
     cmd!(
         "ip.service.www.set",
@@ -53,18 +55,25 @@ fn row(w: &mut WebService, r: Row) -> &mut WebListener {
     }
 }
 
-fn settings_json(c: &WebListener) -> Value {
-    json!({
+fn settings_json(c: &WebListener, r: Row) -> Value {
+    let mut v = json!({
         "enabled": c.enabled,
         "address": c.address,
         "port": c.port,
         "available_from": c.available_from,
-    })
+    });
+    // G1.6zs: only HTTPS has a certificate (`none` is the router's own).
+    if let (Row::Ssl, Some(o)) = (r, v.as_object_mut()) {
+        let name = if c.certificate.is_empty() { "none" } else { c.certificate.as_str() };
+        o.insert("certificate".into(), json!(name));
+    }
+    v
 }
 
 /// Applies `p` to row `r` of `web`: the rules of `set`, also for the preview
-/// (`ip.service.check`, on a copy).
-pub(super) fn apply(web: &mut WebService, p: &Value, r: Row) -> Result<Value> {
+/// (`ip.service.check`, on a copy). `certs` is `/certificate`, for
+/// `certificate`.
+pub(super) fn apply(web: &mut WebService, certs: &Certificates, p: &Value, r: Row) -> Result<Value> {
     let enabled = opt_bool(p, "enabled")?;
     let address = opt_parse::<std::net::IpAddr>(p, "address")?;
     let port = opt_u32(p, "port")?
@@ -76,7 +85,25 @@ pub(super) fn apply(web: &mut WebService, p: &Value, r: Row) -> Result<Value> {
         })
         .transpose()?;
     let from = available_from(p)?;
+    let certificate = match opt_str(p, "certificate")? {
+        Some(_) if r == Row::Plain => {
+            return Err(EngineError::bad("certificate", "www only redirects to www-ssl: set the certificate there"));
+        }
+        Some(name) => Some(super::certificate::pick(certs, name)?),
+        None => None,
+    };
     let c = row(web, r);
+    let mut warnings: Vec<String> = Vec::new();
+    if let Some(name) = certificate
+        && name != c.certificate
+    {
+        warnings.push(
+            "browsers will see the new certificate, and clients that pinned the old one (a GUI or CLI \
+             connected through www-ssl) will be asked to trust it"
+                .to_owned(),
+        );
+        c.certificate = name;
+    }
     if let Some(e) = enabled {
         c.enabled = e;
     }
@@ -92,7 +119,7 @@ pub(super) fn apply(web: &mut WebService, p: &Value, r: Row) -> Result<Value> {
     if let Some(list) = from {
         c.available_from = list;
     }
-    let mut out = settings_json(c);
+    let mut out = settings_json(c, r);
     let other = match r {
         Row::Ssl => &web.www,
         Row::Plain => &web.www_ssl,
@@ -110,14 +137,11 @@ pub(super) fn apply(web: &mut WebService, p: &Value, r: Row) -> Result<Value> {
             format!("www-ssl and www cannot both listen on port {}", ssl.port),
         ));
     }
-    let warning = match r {
-        Row::Plain if plain.enabled && !other.enabled => {
-            Some("www only redirects to www-ssl, which is disabled: browsers will find nothing there")
-        }
-        _ => None,
-    };
-    if let (Some(w), Some(o)) = (warning, out.as_object_mut()) {
-        o.insert("warning".into(), json!(w));
+    if r == Row::Plain && plain.enabled && !other.enabled {
+        warnings.push("www only redirects to www-ssl, which is disabled: browsers will find nothing there".to_owned());
+    }
+    if let (false, Some(o)) = (warnings.is_empty(), out.as_object_mut()) {
+        o.insert("warning".into(), json!(warnings.join("; ")));
     }
     Ok(out)
 }
@@ -127,14 +151,14 @@ fn set(s: &mut Session, p: &Value, r: Row) -> Result<Value> {
         crate::lockout::take_force(s, p)?;
     }
     let mut web = s.store().candidate().system.web.clone();
-    let out = apply(&mut web, p, r)?;
+    let out = apply(&mut web, &s.store().candidate().system.certificates, p, r)?;
     s.store_mut().candidate_mut().system.web = web;
     Ok(out)
 }
 
 pub(super) fn get(s: &mut Session, r: Row) -> Result<Value> {
     let mut cfg = s.store().candidate().system.web.clone();
-    let mut out = settings_json(row(&mut cfg, r));
+    let mut out = settings_json(row(&mut cfg, r), r);
     let mut running = s.store().running().system.web.clone();
     let on = row(&mut running, r).enabled;
     let all = s.ext::<WebStatus>().cloned().unwrap_or_default();

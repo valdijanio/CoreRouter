@@ -20,12 +20,12 @@
 //! the base64 we keep is the one `wg` would show.
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use base64::Engine as _;
 pub use corerouter_hal::wireguard::Key;
-use corerouter_hal::wireguard::{WgDevice, WgPeerSpec, WgStatus};
-use corerouter_model::wireguard::{WgKey, WgPeer, Wireguard};
+use corerouter_hal::wireguard::{WgDevice, WgPeerSpec, WgPeerStatus, WgStatus};
+use corerouter_model::wireguard::{PeerState, REJECT_AFTER_SECS, WgKey, WgPeer, Wireguard};
 use corerouter_model::{Config, IfName, InterfaceKind};
 
 use crate::Session;
@@ -34,6 +34,13 @@ const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STA
 
 /// How often the service compares each link with what it should hold.
 pub const REPAIR_MS: u64 = 30_000;
+/// A name endpoint is asked again at most this often (and after a
+/// failure), only while its peer has no fresh handshake (G1.31b).
+pub const RESOLVE_AGAIN_MS: u64 = 30_000;
+/// A peer the router tries and that has not answered this long is a
+/// health warning (G1.31b): past `REJECT_AFTER_TIME` (180 s) and two
+/// minutes of retries.
+pub const NO_HANDSHAKE_ALERT_SECS: u64 = 300;
 
 /// A fresh private key, clamped (RFC 7748 §5, as `wg genkey`).
 pub fn generate_private() -> Result<Key, String> {
@@ -114,10 +121,54 @@ pub fn peers(cfg: &Config) -> impl Iterator<Item = (&IfName, &WgPeer)> {
     interfaces(cfg).flat_map(|(n, _, w)| w.peers.iter().map(move |p| (n, p)))
 }
 
+/// The data plane's peers of one interface by public key: a listing looks
+/// each configured peer up here, once. A walk of the status per peer was
+/// O(peers²): 20 000 peers took 4·10⁸ key compares on every refresh of the
+/// window (G1.31a).
+pub fn status_by_key(status: Option<&WgStatus>) -> BTreeMap<Key, &WgPeerStatus> {
+    status
+        .map(|st| st.peers.iter().map(|p| (p.public_key, p)).collect())
+        .unwrap_or_default()
+}
+
+/// What a listing says of one peer: its state, the seconds since its last
+/// handshake, and what the data plane reports (`None`: not running).
+pub fn peer_view<'a>(
+    peer: &WgPeer,
+    iface_disabled: bool,
+    by_key: &BTreeMap<Key, &'a WgPeerStatus>,
+    now: u64,
+) -> (PeerState, Option<u64>, Option<&'a WgPeerStatus>) {
+    let st = decode(peer.public_key.as_str()).and_then(|k| by_key.get(&k).copied());
+    let age = st
+        .and_then(|x| x.last_handshake_unix)
+        .map(|t| now.saturating_sub(t));
+    let state = PeerState::of(peer, iface_disabled, age, st.is_some_and(|x| x.tx_bytes > 0));
+    (state, age, st)
+}
+
 /// The run-time state: what each link was last given.
 #[derive(Default)]
 pub struct WgRuntime {
     pushed: BTreeMap<IfName, Pushed>,
+    /// Name endpoints as the resolver last answered, by name.
+    resolved: BTreeMap<String, Resolved>,
+    /// When each peer (by name) was first seen trying without an answer
+    /// and never having had a handshake (Unix seconds).
+    trying_since: BTreeMap<String, u64>,
+}
+
+/// What the resolver said of a name endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    /// The address in use (kept from an earlier answer when the last one
+    /// failed: an old address beats none).
+    pub ip: Option<IpAddr>,
+    /// Monotonic ms of the last answer (the service's clock).
+    pub at_ms: u64,
+    /// Unix seconds of the last answer, to show.
+    pub at_unix: u64,
+    pub error: Option<String>,
 }
 
 struct Pushed {
@@ -131,12 +182,75 @@ impl WgRuntime {
     pub fn error(&self, name: &IfName) -> Option<&str> {
         self.pushed.get(name).and_then(|p| p.error.as_deref())
     }
+
+    /// The resolver's last answer for name endpoint `host`.
+    pub fn resolved(&self, host: &str) -> Option<&Resolved> {
+        self.resolved.get(host)
+    }
+}
+
+/// Where the handshake of `p` goes: its address, or what the resolver
+/// gave for its name (`None`: no endpoint, or a name not resolved yet).
+pub fn endpoint_of(p: &WgPeer, resolved: &BTreeMap<String, Resolved>) -> Option<SocketAddr> {
+    let host = p.endpoint_address.as_ref().filter(|_| p.endpoint_port != 0)?;
+    let ip = host.ip().or_else(|| resolved.get(host.as_str()).and_then(|r| r.ip))?;
+    Some(SocketAddr::new(ip, p.endpoint_port))
+}
+
+/// G1.31b, Safe Mode: why going from `before` to `after` would cut a
+/// session that comes in through WireGuard interface `wg` from `caller`
+/// (the peer whose allowed address holds it): a new key pair or port on
+/// the interface, or that peer removed, disabled, rekeyed or no longer
+/// holding the caller's address. `None`: the tunnel stays.
+pub(crate) fn tunnel_cut(before: &Config, after: &Config, wg: &IfName, caller: IpAddr) -> Option<String> {
+    let of = |cfg: &Config| match cfg.interfaces.get(wg).map(|i| &i.kind) {
+        Some(InterfaceKind::Wireguard(w)) => Some(w.clone()),
+        _ => None,
+    };
+    let was = of(before)?;
+    let Some(now) = of(after) else {
+        return Some(format!("would remove {wg}, the WireGuard tunnel this connection comes through"));
+    };
+    // The peer the caller is behind: the longest allowed prefix holding it.
+    let behind = |w: &Wireguard| {
+        w.peers
+            .iter()
+            .filter(|p| !p.disabled)
+            .filter_map(|p| p.allowed_address.iter().filter(|n| n.contains(&caller)).map(|n| n.prefix_len()).max().map(|l| (l, p)))
+            .max_by_key(|(l, _)| *l)
+            .map(|(_, p)| p.clone())
+    };
+    let peer = behind(&was)?;
+    if now.public_key != was.public_key {
+        return Some(format!(
+            "would give {wg} a new key pair: peer '{}', which this connection comes through, keeps the old public key and the tunnel drops",
+            peer.name
+        ));
+    }
+    if now.listen_port != was.listen_port {
+        return Some(format!(
+            "would move {wg} from UDP {} to {}: peer '{}', which this connection comes through, keeps sending to the old port",
+            was.listen_port, now.listen_port, peer.name
+        ));
+    }
+    match behind(&now) {
+        None => Some(format!(
+            "would remove or disable peer '{}' of {wg}, or take {caller} out of its allowed address: this connection comes through it",
+            peer.name
+        )),
+        Some(p) if p.public_key != peer.public_key => Some(format!(
+            "would send {caller} to peer '{}' instead of '{}' of {wg}, which this connection comes through",
+            p.name, peer.name
+        )),
+        Some(_) => None,
+    }
 }
 
 impl Session {
     /// What WireGuard interface `name` of `cfg` must hold, keys opened.
     /// `Err`: why it cannot be built (a key that does not open).
     fn wireguard_device(&mut self, w: &Wireguard) -> Result<(WgDevice, Key), String> {
+        let resolved = self.ext::<WgRuntime>().map(|rt| rt.resolved.clone()).unwrap_or_default();
         let key = crate::sealing::key(self)?;
         let private = key
             .open(&w.private_key)
@@ -156,10 +270,7 @@ impl Session {
                 Some(WgPeerSpec {
                     public_key,
                     preshared_key,
-                    endpoint: p
-                        .endpoint_address
-                        .filter(|_| p.endpoint_port != 0)
-                        .map(|a| SocketAddr::new(a, p.endpoint_port)),
+                    endpoint: endpoint_of(p, &resolved),
                     persistent_keepalive: p.persistent_keepalive,
                     allowed: p.allowed_address.clone(),
                 })
@@ -256,6 +367,113 @@ impl Session {
             return;
         }
         self.wireguard_push(now_ms, true);
+    }
+
+    /// The name endpoints to ask the resolver now (G1.31b): never
+    /// answered, or whose peer has no handshake for `REJECT_AFTER_TIME`
+    /// (180 s) and was asked [`RESOLVE_AGAIN_MS`] ago or more — the rule
+    /// of OpenWrt's `wireguard_watchdog` and RouterOS (a peer that moved
+    /// its name to a new address is found again). A failed answer is
+    /// asked again on the same clock.
+    pub fn wireguard_names_due(&mut self, now_ms: u64) -> Vec<String> {
+        let running = self.store().running().clone();
+        let now = self.now().unwrap_or(0);
+        let mut due: Vec<String> = Vec::new();
+        for (iface, off, w) in interfaces(&running) {
+            let named: Vec<&WgPeer> = w
+                .peers
+                .iter()
+                .filter(|p| !p.disabled && p.endpoint_address.as_ref().is_some_and(|h| h.ip().is_none()))
+                .collect();
+            if off || named.is_empty() {
+                continue;
+            }
+            let status = self.wireguard_status(iface).0;
+            let by_key = status_by_key(status.as_ref());
+            for p in named {
+                let Some(host) = p.endpoint_address.as_ref().map(|h| h.as_str().to_owned()) else {
+                    continue;
+                };
+                let (_, age, _) = peer_view(p, false, &by_key, now);
+                let fresh = age.is_some_and(|a| a <= REJECT_AFTER_SECS);
+                let last = self.ext::<WgRuntime>().and_then(|rt| rt.resolved.get(&host).cloned());
+                let ask = match last {
+                    None => true,
+                    Some(r) => now_ms.saturating_sub(r.at_ms) >= RESOLVE_AGAIN_MS && (r.error.is_some() || !fresh),
+                };
+                if ask && !due.contains(&host) {
+                    due.push(host);
+                }
+            }
+        }
+        due
+    }
+
+    /// The resolver's answer for name endpoint `host`: kept (an address
+    /// that changed goes to the kernel now), the old address kept when it
+    /// failed.
+    pub fn wireguard_resolved(&mut self, host: &str, answer: Result<Vec<IpAddr>, String>, now_ms: u64) {
+        let at_unix = self.now().unwrap_or(0);
+        let Some(rt) = self.ext_mut::<WgRuntime>() else {
+            return;
+        };
+        let old = rt.resolved.get(host).and_then(|r| r.ip);
+        let (ip, error) = match answer {
+            Ok(ips) => (ips.first().copied().or(old), ips.is_empty().then(|| "no address".to_owned())),
+            Err(e) => (old, Some(e)),
+        };
+        if let Some(e) = &error
+            && rt.resolved.get(host).is_none_or(|r| r.error.as_ref() != Some(e))
+        {
+            log::warn!("wireguard: endpoint {host}: {e}");
+        }
+        rt.resolved.insert(host.to_owned(), Resolved { ip, at_ms: now_ms, at_unix, error });
+        if ip != old {
+            self.wireguard_push(now_ms, false);
+        }
+    }
+
+    /// Peers the router tries and that have not answered for
+    /// [`NO_HANDSHAKE_ALERT_SECS`] or more: (peer, interface, seconds, had
+    /// a handshake once). Only `no-handshake` peers (an endpoint and a
+    /// keepalive, or traffic to send): one that waits or idles is fine.
+    pub(crate) fn wireguard_stale(&mut self) -> Vec<(String, String, u64, bool)> {
+        let running = self.store().running().clone();
+        let now = self.now().unwrap_or(0);
+        let mut out = Vec::new();
+        let mut trying: BTreeMap<String, u64> = BTreeMap::new();
+        let before = self.ext::<WgRuntime>().map(|rt| rt.trying_since.clone()).unwrap_or_default();
+        for (iface, off, w) in interfaces(&running) {
+            if off || w.peers.is_empty() {
+                continue;
+            }
+            let status = self.wireguard_status(iface).0;
+            if status.is_none() {
+                continue;
+            }
+            let by_key = status_by_key(status.as_ref());
+            for p in &w.peers {
+                let (state, age, _) = peer_view(p, false, &by_key, now);
+                if state != PeerState::NoHandshake {
+                    continue;
+                }
+                let secs = match age {
+                    Some(a) => a,
+                    None => {
+                        let since = before.get(&p.name).copied().unwrap_or(now);
+                        trying.insert(p.name.clone(), since);
+                        now.saturating_sub(since)
+                    }
+                };
+                if secs >= NO_HANDSHAKE_ALERT_SECS {
+                    out.push((p.name.clone(), iface.to_string(), secs, age.is_some()));
+                }
+            }
+        }
+        if let Some(rt) = self.ext_mut::<WgRuntime>() {
+            rt.trying_since = trying;
+        }
+        out
     }
 
     /// What the data plane says about `name` (`None`: not running, or the

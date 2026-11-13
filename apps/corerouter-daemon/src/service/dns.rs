@@ -187,6 +187,14 @@ impl DnsBackend for RouterDns {
         self.resolver.cache_used_bytes()
     }
 
+    fn cache_stats(&self) -> Option<corerouter_proto_dns::cache::CacheStats> {
+        Some(self.resolver.cache_stats())
+    }
+
+    fn clock_ms(&self) -> Option<u64> {
+        Some(self.now_ms())
+    }
+
     fn configure(&self, settings: Settings) {
         self.sync(settings);
     }
@@ -483,7 +491,7 @@ pub(crate) fn spawn(session: Shared) -> std::io::Result<Arc<RouterDns>> {
     Ok(dns)
 }
 
-fn register(session: &Shared, dns: &Arc<RouterDns>) {
+pub(crate) fn register(session: &Shared, dns: &Arc<RouterDns>) {
     let mut s = lock(session);
     dns.sync(s.dns_settings());
     s.set_dns_backend(dns.clone());

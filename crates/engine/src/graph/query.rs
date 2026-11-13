@@ -107,7 +107,7 @@ pub fn resolve(db: &GraphDb, names: &[String]) -> Result<Vec<String>, String> {
     for n in names {
         let wanted: Vec<String> = if n == "interface:*" {
             db.keys().filter(|k| k.starts_with(INTERFACE)).map(str::to_owned).collect()
-        } else if n == SYSTEM || n.starts_with(INTERFACE) || n.starts_with(super::QUEUE) {
+        } else if n == SYSTEM || n == super::DNS || n.starts_with(INTERFACE) || n.starts_with(super::QUEUE) {
             vec![n.clone()]
         } else {
             vec![format!("{INTERFACE}{n}")]
@@ -256,7 +256,8 @@ fn stats(
     let mut p95_by: Map<String, Value> = Map::new();
     for (i, src) in picked {
         let (mut sum, mut n, mut peak, mut total) = (0.0f64, 0u64, f32::NAN, 0.0f64);
-        for (_, a, m) in slots(rrd, tier, start, end) {
+        let mut peak_at: Option<u64> = None;
+        for (k, a, m) in slots(rrd, tier, start, end) {
             let v = a.get(*i).copied().unwrap_or(f32::NAN);
             if v.is_finite() {
                 sum += f64::from(v);
@@ -266,6 +267,7 @@ fn stats(
             let top = m.and_then(|m| m.get(*i).copied()).unwrap_or(v);
             if top.is_finite() && (peak.is_nan() || top > peak) {
                 peak = top;
+                peak_at = Some(k * spec.step);
             }
         }
         // The newest second may be past the last closed slot: a maximum
@@ -274,6 +276,7 @@ fn stats(
             && (peak.is_nan() || *c > peak)
         {
             peak = *c;
+            peak_at = Some(newest);
         }
         known = known.max(n);
         let mut samples: Vec<f32> = slots(rrd, p95_tier, start, end)
@@ -287,6 +290,7 @@ fn stats(
                 "current": current_row.and_then(|r| r.get(*i)).map_or(Value::Null, |v| num(f64::from(*v))),
                 "avg": if n > 0 { num(sum / n as f64) } else { Value::Null },
                 "max": num(f64::from(peak)),
+                "max_at": peak_at.filter(|_| peak.is_finite()),
                 "p95": p.map_or(Value::Null, |v| num(f64::from(v))),
             }),
         );

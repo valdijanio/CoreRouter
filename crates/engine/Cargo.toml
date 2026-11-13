@@ -36,9 +36,17 @@ argon2.workspace = true
 aes-gcm.workspace = true
 # G1.31: WireGuard keys (pure Rust, builds for wasm32 too).
 x25519-dalek.workspace = true
+# G1.6zs: `/certificate` reads certificates (pure Rust, builds for wasm32).
+x509-parser = { version = "0.18.1", default-features = false }
+sha2 = { version = "0.11.0", default-features = false }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 getrandom.workspace = true
+# G1.6zs: make self-signed certificates and check a key against its
+# certificate the way the TLS servers will load it (ring: not in the
+# browser lab, which makes no keys).
+rcgen.workspace = true
+rustls.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
@@ -65,6 +73,10 @@ harness = false
 
 [[bench]]
 name = "mpls_page"
+harness = false
+
+[[bench]]
+name = "wireguard_list"
 harness = false
 
 [[bench]]

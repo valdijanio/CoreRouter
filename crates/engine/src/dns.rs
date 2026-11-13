@@ -11,6 +11,7 @@ use std::sync::Arc;
 use corerouter_hal::probe::{AsInfo, Lookup, ProbeError, ProbeSocket, Prober, SocketOptions};
 use corerouter_hal::SharedProber;
 use corerouter_model::dns::CacheRow;
+use corerouter_proto_dns::cache::CacheStats;
 use corerouter_proto_dns::resolver::{ResolveError, ServerStats, Settings};
 
 use crate::Session;
@@ -49,6 +50,16 @@ pub trait DnsBackend: Send + Sync {
     /// What the resolver measured of each upstream server.
     fn server_stats(&self) -> Vec<(IpAddr, ServerStats)> {
         Vec::new()
+    }
+
+    /// The cache's entries, bytes, evictions and types (G4.1h).
+    fn cache_stats(&self) -> Option<CacheStats> {
+        None
+    }
+
+    /// The resolver's clock, ms (the one of [`ServerStats`]' times).
+    fn clock_ms(&self) -> Option<u64> {
+        None
     }
 
     /// The PTR name of `ip`, without waiting (G6.3b): the lookup runs on

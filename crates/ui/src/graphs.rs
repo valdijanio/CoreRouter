@@ -84,7 +84,7 @@ impl Range {
         }
     }
 
-    fn param(self) -> &'static str {
+    pub(crate) fn param(self) -> &'static str {
         match self {
             Range::Hour => "hour",
             Range::Day => "day",
@@ -95,7 +95,7 @@ impl Range {
     }
 
     /// UI refreshes (one a second) between two queries: about a point.
-    fn every(self) -> u32 {
+    pub(crate) fn every(self) -> u32 {
         match self {
             Range::Hour => 2,
             Range::Day => 30,
@@ -150,6 +150,25 @@ const SYSTEM_FIELDS: [(&str, &str, &str); 3] = [
     ("memory", "Memory", "B"),
     ("conntrack", "Conntrack", "entries"),
 ];
+
+/// The LAN DNS forwarder's series (G4.1h): (field, label, unit).
+pub(crate) const DNS_FIELDS: [(&str, &str, &str); 6] = [
+    ("queries", "Queries", "/s"),
+    ("cache_hit", "Cache Hits", "%"),
+    ("servfail", "SERVFAIL", "%"),
+    ("latency_p50", "Latency p50", "ms"),
+    ("latency_p99", "Latency p99", "ms"),
+    ("in_flight", "In Flight", "entries"),
+];
+
+/// A series' name in the list: `System`, `DNS`, or the interface.
+fn series_name(l: crate::i18n::Lang, name: &str) -> String {
+    match name {
+        "system" => tr(l, "System").to_owned(),
+        "dns" => "DNS".to_owned(),
+        _ => name.to_owned(),
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct Graphs {
@@ -265,8 +284,15 @@ pub(crate) fn short(key: &str) -> &str {
 }
 
 impl Graphs {
+    /// The router's own series (`system`, `dns`): one small chart per
+    /// field, nothing to compare.
     fn is_system(&self) -> bool {
-        self.series == "system"
+        self.series == "system" || self.series == "dns"
+    }
+
+    /// The fields of an own series.
+    fn own_fields(&self) -> &'static [(&'static str, &'static str, &'static str)] {
+        if self.series == "dns" { &DNS_FIELDS } else { &SYSTEM_FIELDS }
     }
 
     /// The series asked for: the shown one and the compared ones.
@@ -722,11 +748,11 @@ impl Graphs {
             self.info(app, ui, "series", "Series");
             let before = self.series.clone();
             ComboBox::from_id_salt("graphs-series")
-                .selected_text(if self.series == "system" { tr(l, "System").to_owned() } else { self.series.clone() })
+                .selected_text(series_name(l, &self.series))
                 .show_ui(ui, |ui| {
                     for k in &self.kept {
                         let name = short(k).to_owned();
-                        let text = if name == "system" { tr(l, "System").to_owned() } else { name.clone() };
+                        let text = series_name(l, &name);
                         ui.selectable_value(&mut self.series, name, text);
                     }
                 });
@@ -1016,7 +1042,7 @@ impl Graphs {
                 });
             }
             ui.end_row();
-            for (field, label, unit) in SYSTEM_FIELDS {
+            for &(field, label, unit) in self.own_fields() {
                 let st = s.get("stats").and_then(|x| x.get(field));
                 let n = |k: &str| st.and_then(|x| x.get(k)).and_then(Value::as_f64);
                 ui.horizontal(|ui| {
@@ -1032,7 +1058,9 @@ impl Graphs {
         let range = self.range;
         let (x0, x1) = span(data);
         let h = ((ui.available_height() - ui.spacing().interact_size.y - 24.0) / 3.0).max(90.0);
-        for (i, (field, label, unit)) in SYSTEM_FIELDS.iter().enumerate() {
+        // Six DNS charts get the room of three: each one shorter.
+        let h = if self.series == "dns" { (h / 2.0).max(70.0) } else { h };
+        for (i, (field, label, unit)) in self.own_fields().iter().enumerate() {
             let unit: &'static str = unit;
             let color = chip::palette_tone(ui.visuals(), i * 3).ink;
             Plot::new(("graphs-system", *field))
@@ -1144,7 +1172,7 @@ impl Graphs {
 }
 
 /// The label next to the pointer: the line, the time and the value.
-fn hover(h: &egui_plot::HoverPosition<'_>, unit: &str) -> Option<String> {
+pub(crate) fn hover(h: &egui_plot::HoverPosition<'_>, unit: &str) -> Option<String> {
     match h {
         egui_plot::HoverPosition::NearDataPoint { plot_name, position, .. } => Some(format!(
             "{plot_name}\n{}\n{}",
@@ -1162,14 +1190,14 @@ fn line_color(ui: &Ui, name: &str) -> Color32 {
 
 /// The whole range on the time axis (an hour of which one minute is known
 /// still reads as an hour).
-fn span(data: &Value) -> (f64, f64) {
+pub(crate) fn span(data: &Value) -> (f64, f64) {
     let n = |k: &str| data.get(k).and_then(Value::as_f64).unwrap_or(0.0);
     (n("start"), n("end"))
 }
 
 /// The known points of `field`, split where values are unknown (a hole in
 /// the line, not a dive to zero).
-fn runs(s: &Value, data: &Value, field: &str) -> Vec<Vec<[f64; 2]>> {
+pub(crate) fn runs(s: &Value, data: &Value, field: &str) -> Vec<Vec<[f64; 2]>> {
     let start = data.get("start").and_then(Value::as_f64).unwrap_or(0.0);
     let step = data.get("step").and_then(Value::as_f64).unwrap_or(1.0);
     let mut out: Vec<Vec<[f64; 2]>> = Vec::new();
@@ -1190,7 +1218,7 @@ fn runs(s: &Value, data: &Value, field: &str) -> Vec<Vec<[f64; 2]>> {
 }
 
 /// `12:30` for an hour or a day, `10-21 12h` for a week, `10-21` beyond.
-fn time_label(x: f64, range: Range) -> String {
+pub(crate) fn time_label(x: f64, range: Range) -> String {
     if x < 0.0 {
         return String::new();
     }
@@ -1234,6 +1262,14 @@ pub(crate) fn rate(v: f64, unit: &str) -> String {
     }
     if unit == "B" {
         return bytes(v);
+    }
+    // A time: `0.25 ms`, `850 ms`, `1.60 s` (never `1.6 kms`).
+    if unit == "ms" {
+        return match v.abs() {
+            a if a >= 1000.0 => format!("{:.2} s", v / 1000.0),
+            a if a >= 10.0 || a == 0.0 => format!("{v:.0} ms"),
+            _ => format!("{v:.2} ms"),
+        };
     }
     // A count: `227.9 k`, not `227.9 kentries`.
     let unit = if unit == "entries" { "" } else { unit };

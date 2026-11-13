@@ -149,8 +149,9 @@ Gaps G4.1u (prazo por servidor adaptativo e nova tentativa) e G4.1v (serve-stale
 - **Slowloris**: 4 endereços × 5 conexões que mandam um byte e param (reabertas quando o roteador
   fecha) ocupam as 20 vagas: **o cliente TCP legítimo teve 0–1 resposta em 108 tentativas** em 30 s
   (antes e depois). O processo não sofre (40 descritores, 87 threads). Gap G4.1w.
-- **DoT de origem** (Unbound): 5000/s com p99 de 0,77 ms; 22 handshakes/s (o pool guarda 4
-  conexões; com mais consultas em voo, abre outras).
+- **DoT de origem** (Unbound) a 5000/s: **antes** 26 607 SERVFAIL em 15 s, p99 492 ms e 930
+  handshakes/s (com uma thread por miss, as consultas em voo passavam das 4 conexões guardadas);
+  **depois** p99 0,77 ms e 22 handshakes/s.
 - **DoH de origem**: **antes, 0 % respondido** (o DoH do Unbound só fala HTTP/2; o nosso HTTP/1.1
   levava um handshake por consulta e nenhuma resposta); **depois** (G4.1s, HTTP/2), 5000/s, p99
   0,70 ms, 1 handshake/s.

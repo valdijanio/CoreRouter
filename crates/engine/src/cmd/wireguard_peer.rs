@@ -18,6 +18,8 @@
 use std::collections::BTreeSet;
 use std::net::IpAddr;
 
+use corerouter_model::wireguard::{ClientConfig, WgHost};
+
 use corerouter_model::wireguard::{MAX_ALLOWED, MAX_NAME, MAX_PEERS, PeerState, WgKey, WgPeer, Wireguard};
 use corerouter_model::{Config, IfName, InterfaceKind};
 use ipnet::IpNet;
@@ -26,6 +28,7 @@ use serde_json::{Value, json};
 use super::args::{opt_bool, opt_str, opt_text, opt_u32, req_parse, req_str};
 use super::wireguard::{sensitive, shown, wireguard_mut, wireguard_of};
 use super::{CommandSpec, always};
+use crate::sealing::SealKey;
 use crate::wireguard as wg;
 use crate::{EngineError, Result, Session};
 
@@ -38,7 +41,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add WireGuard Peer",
         ["Interfaces", "WireGuard"],
         None,
-        "{interface: string, name?: string (unique on the router; default the first free peerN), public_key?: string (the peer's key, base64; or leave it out and use private_key), private_key?: string (auto: the router makes the peer's key pair, to hand it the client config; or the peer's private key in base64), preshared_key?: string (auto | a key in base64 | none; an extra symmetric key, whitepaper §5.2), endpoint_address?: string (IP address the first handshake goes to; empty = wait for the peer), endpoint_port?: int 1..65535, allowed_address: [string] | string (prefixes the peer may send from and that are sent to it, \"10.9.0.2/32,fd00::2/128\"; no route is added), persistent_keepalive?: int 0..65535 | off (seconds; 25 behind NAT), responder?: bool (never start a handshake), disabled?: bool, comment?: string} → {name, public_key, warnings}",
+        "{interface: string, name?: string (unique on the router; default the first free peerN), public_key?: string (the peer's key, base64; or leave it out and use private_key), private_key?: string (auto: the router makes the peer's key pair, to hand it the client config; or the peer's private key in base64), preshared_key?: string (auto | a key in base64 | none; an extra symmetric key, whitepaper §5.2), endpoint_address?: string (IP address or DNS name the first handshake goes to; a name is resolved by the router and again when the handshake is older than 180 s; empty = wait for the peer), endpoint_port?: int 1..65535, allowed_address: [string] | string (prefixes the peer may send from and that are sent to it, \"10.9.0.2/32,fd00::2/128\"; no route is added), persistent_keepalive?: int 0..65535 | off (seconds; 25 behind NAT), responder?: bool (never start a handshake), disabled?: bool, comment?: string, client_address?: [string] | string (client config: its own address; default the allowed address), client_dns?: [ip] | string (client config: DNS servers), client_endpoint?: string (client config: where the client finds this router, name or address[:port]; default the router's WAN address and the interface's port), client_allowed_address?: [string] | string (client config: what it sends into the tunnel; default 0.0.0.0/0, ::/0), client_keepalive?: int 0..65535 (client config), client_mtu?: int 0 | 1280..9216 (client config; 0 = its default), force?: bool (apply even if it cuts this session, which comes through this tunnel)} → {name, public_key, warnings}",
         always,
         add
     ),
@@ -47,7 +50,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set WireGuard Peer",
         [],
         None,
-        "{name: string, new_name?: string, public_key?: string (the peer's key, base64; or leave it out and use private_key), private_key?: string (auto: the router makes the peer's key pair, to hand it the client config; or the peer's private key in base64), preshared_key?: string (auto | a key in base64 | none; an extra symmetric key, whitepaper §5.2), endpoint_address?: string (IP address the first handshake goes to; empty = wait for the peer), endpoint_port?: int 1..65535, allowed_address?: [string] | string (prefixes the peer may send from and that are sent to it, \"10.9.0.2/32,fd00::2/128\"; no route is added), persistent_keepalive?: int 0..65535 | off (seconds; 25 behind NAT), responder?: bool (never start a handshake), disabled?: bool, comment?: string} → {name, public_key, warnings}",
+        "{name: string, new_name?: string, public_key?: string (the peer's key, base64; or leave it out and use private_key), private_key?: string (auto: the router makes the peer's key pair, to hand it the client config; or the peer's private key in base64), preshared_key?: string (auto | a key in base64 | none; an extra symmetric key, whitepaper §5.2), endpoint_address?: string (IP address or DNS name the first handshake goes to; a name is resolved by the router and again when the handshake is older than 180 s; empty = wait for the peer), endpoint_port?: int 1..65535, allowed_address?: [string] | string (prefixes the peer may send from and that are sent to it, \"10.9.0.2/32,fd00::2/128\"; no route is added), persistent_keepalive?: int 0..65535 | off (seconds; 25 behind NAT), responder?: bool (never start a handshake), disabled?: bool, comment?: string, client_address?: [string] | string (client config: its own address; default the allowed address), client_dns?: [ip] | string (client config: DNS servers), client_endpoint?: string (client config: where the client finds this router, name or address[:port]; default the router's WAN address and the interface's port), client_allowed_address?: [string] | string (client config: what it sends into the tunnel; default 0.0.0.0/0, ::/0), client_keepalive?: int 0..65535 (client config), client_mtu?: int 0 | 1280..9216 (client config; 0 = its default), force?: bool (apply even if it cuts this session, which comes through this tunnel)} → {name, public_key, warnings}",
         has_peers,
         set
     ),
@@ -56,7 +59,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Remove WireGuard Peer",
         [],
         None,
-        "{name: string} → {name}",
+        "{name: string, force?: bool (apply even if it cuts this session, which comes through this peer)} → {name}",
         has_peers,
         remove
     ),
@@ -65,7 +68,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Enable WireGuard Peer",
         [],
         None,
-        "{name: string} → {name}",
+        "{name: string, force?: bool (apply even if it cuts this session, which comes through this peer)} → {name}",
         has_peers,
         enable
     ),
@@ -74,12 +77,12 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Disable WireGuard Peer",
         [],
         None,
-        "{name: string} → {name}",
+        "{name: string, force?: bool (apply even if it cuts this session, which comes through this peer)} → {name}",
         has_peers,
         disable
     ),
     cmd!(query "interface.wireguard.peers.list", "WireGuard Peers", ["Interfaces", "WireGuard"], None,
-        "{interface?: string (only its peers), show_sensitive?: bool (private and preshared keys in clear; group full)} → [{name, interface, public_key, private_key, preshared_key, endpoint_address, endpoint_port, current_endpoint_address, current_endpoint_port, roamed, allowed_address, persistent_keepalive, responder, disabled, comment, state (up | idle | no-handshake | never | disabled), last_handshake_secs, rx, tx, hint}]",
+        "{interface?: string (only its peers), show_sensitive?: bool (private and preshared keys in clear; group full)} → [{name, interface, public_key, private_key, preshared_key, endpoint_address, endpoint_port, endpoint_resolved (the address a DNS name gave, null for an address), resolved_secs (seconds since it was resolved), resolve_error, current_endpoint_address, current_endpoint_port, roamed, allowed_address, persistent_keepalive, responder, disabled, comment, client_address, client_dns, client_endpoint, client_allowed_address, client_keepalive, client_mtu, state (up | idle | no-handshake | never | disabled), last_handshake_secs, rx, tx, hint}]",
         always, list),
 ];
 
@@ -187,20 +190,76 @@ fn keepalive_of(p: &Value) -> Result<Option<u16>> {
     }
 }
 
-fn endpoint_address_of(p: &Value) -> Result<Option<Option<IpAddr>>> {
+fn endpoint_address_of(p: &Value) -> Result<Option<Option<WgHost>>> {
     match opt_str(p, "endpoint_address")?.map(str::trim) {
         None => Ok(None),
         Some("") => Ok(Some(None)),
-        Some(t) => t.parse::<IpAddr>().map(|a| Some(Some(a))).map_err(|_| {
+        Some(t) => WgHost::parse(t).map(|h| Some(Some(h))).ok_or_else(|| {
             EngineError::bad(
                 "endpoint_address",
                 format!(
-                    "'{}' is not an IP address (a DNS name comes with G1.31 PR 3)",
+                    "'{}' is neither an IP address nor a DNS name (vpn.example.com)",
                     t.chars().take(64).collect::<String>()
                 ),
             )
         }),
     }
+}
+
+/// A list of prefixes (`[..]` or `"a,b"`), bare addresses as host
+/// prefixes; `None`: absent.
+fn nets_of(p: &Value, key: &str) -> Result<Option<Vec<IpNet>>> {
+    let raw: Vec<String> = match p.get(key) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(s)) => s.split(',').map(|x| x.trim().to_owned()).filter(|x| !x.is_empty()).collect(),
+        Some(Value::Array(a)) => a.iter().take(MAX_ALLOWED.saturating_add(1)).filter_map(|v| v.as_str().map(|t| t.trim().to_owned())).collect(),
+        Some(_) => return Err(EngineError::bad(key, "must be a list of prefixes or \"a,b\"")),
+    };
+    if raw.len() > MAX_ALLOWED {
+        return Err(EngineError::bad(key, format!("at most {MAX_ALLOWED} prefixes")));
+    }
+    raw.iter()
+        .map(|r| {
+            r.parse::<IpNet>()
+                .or_else(|_| r.parse::<IpAddr>().map(IpNet::from))
+                .map_err(|_| EngineError::bad(key, format!("'{}' is not a prefix", r.chars().take(48).collect::<String>())))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+/// The `client_*` parameters onto `c`.
+fn client_of(c: &mut ClientConfig, p: &Value) -> Result<()> {
+    if let Some(v) = nets_of(p, "client_address")? {
+        c.address = v;
+    }
+    if let Some(v) = nets_of(p, "client_allowed_address")? {
+        c.allowed_address = v;
+    }
+    if let Some(v) = nets_of(p, "client_dns")? {
+        const MAX_DNS: usize = 8;
+        if v.len() > MAX_DNS || v.iter().any(|n| n.prefix_len() != n.max_prefix_len()) {
+            return Err(EngineError::bad("client_dns", format!("at most {MAX_DNS} addresses (10.9.0.1, 2001:db8::53)")));
+        }
+        c.dns = v.iter().map(IpNet::addr).collect();
+    }
+    if let Some(t) = opt_text(p, "client_endpoint", 260)? {
+        let t = t.trim();
+        if !t.is_empty() && corerouter_model::wireguard_conf::parse_endpoint(t).is_none() && WgHost::parse(t).is_none() {
+            return Err(EngineError::bad("client_endpoint", "a name or an address, with :port or not (vpn.example.com:13231)"));
+        }
+        c.endpoint = t.to_owned();
+    }
+    if let Some(k) = opt_u32(p, "client_keepalive")? {
+        c.keepalive = u16::try_from(k).map_err(|_| EngineError::bad("client_keepalive", "seconds 0..=65535"))?;
+    }
+    if let Some(m) = opt_u32(p, "client_mtu")? {
+        if m != 0 && !(1280..=9216).contains(&m) {
+            return Err(EngineError::bad("client_mtu", "0 (the client's default) or 1280..=9216"));
+        }
+        c.mtu = u16::try_from(m).unwrap_or(0);
+    }
+    Ok(())
 }
 
 fn port_of(p: &Value) -> Result<Option<u16>> {
@@ -218,8 +277,9 @@ fn port_of(p: &Value) -> Result<Option<u16>> {
 /// `warnings`.
 fn update(peer: &mut WgPeer, p: &Value, warnings: &mut Vec<String>) -> Result<()> {
     if let Some(a) = endpoint_address_of(p)? {
+        let none = a.is_none();
         peer.endpoint_address = a;
-        if a.is_none() {
+        if none {
             peer.endpoint_port = 0;
         }
     }
@@ -242,11 +302,36 @@ fn update(peer: &mut WgPeer, p: &Value, warnings: &mut Vec<String>) -> Result<()
     if let Some(c) = opt_text(p, "comment", 256)? {
         peer.comment = c;
     }
-    Ok(())
+    client_of(&mut peer.client, p)
+}
+
+/// Whether `p` brings a key to seal (a private key or a preshared key):
+/// only then does the command need the sealing key.
+pub(super) fn seals(p: &Value) -> bool {
+    // Any private_key (empty = auto) is sealed; a preshared key unless it
+    // clears it.
+    p.get("private_key").and_then(Value::as_str).is_some()
+        || p.get("preshared_key")
+            .and_then(Value::as_str)
+            .is_some_and(|t| !matches!(t.trim(), "" | "none"))
+}
+
+/// The sealing key, when `p` needs one.
+pub(super) fn seal_for(s: &mut Session, p: &Value) -> Result<Option<std::sync::Arc<SealKey>>> {
+    if seals(p) {
+        crate::sealing::key(s).map(Some).map_err(EngineError::Internal)
+    } else {
+        Ok(None)
+    }
+}
+
+fn sealed(seal: Option<&SealKey>, k: &wg::Key) -> Result<corerouter_model::sealed::Sealed> {
+    let seal = seal.ok_or_else(|| EngineError::Internal("no sealing key for a WireGuard key".into()))?;
+    seal.seal(&wg::encode(k)).map_err(EngineError::Internal)
 }
 
 /// Keys: `public_key`, `private_key` (auto or a key), `preshared_key`.
-fn keys(s: &mut Session, peer: &mut WgPeer, p: &Value, new: bool) -> Result<()> {
+fn keys(seal: Option<&SealKey>, peer: &mut WgPeer, p: &Value, new: bool) -> Result<()> {
     let public = key_param(p, "public_key")?;
     let private = key_param(p, "private_key")?;
     if public.is_some() && private.is_some() {
@@ -270,8 +355,7 @@ fn keys(s: &mut Session, peer: &mut WgPeer, p: &Value, new: bool) -> Result<()> 
                 EngineError::bad("private_key", "must be auto or a WireGuard key (44 characters of base64)")
             })?
         };
-        let seal = crate::sealing::key(s).map_err(EngineError::Internal)?;
-        peer.private_key = seal.seal(&wg::encode(&k)).map_err(EngineError::Internal)?;
+        peer.private_key = sealed(seal, &k)?;
         peer.public_key = wg::wg_key(&wg::public_of(&k));
     }
     if new && peer.public_key.is_empty() {
@@ -291,8 +375,7 @@ fn keys(s: &mut Session, peer: &mut WgPeer, p: &Value, new: bool) -> Result<()> 
                     EngineError::bad("preshared_key", "must be auto, none or a key of 44 characters of base64 (wg genpsk)")
                 })?
             };
-            let seal = crate::sealing::key(s).map_err(EngineError::Internal)?;
-            peer.preshared_key = seal.seal(&wg::encode(&k)).map_err(EngineError::Internal)?;
+            peer.preshared_key = sealed(seal, &k)?;
         }
     }
     Ok(())
@@ -349,7 +432,7 @@ fn check(iface: &IfName, w: &Wireguard, peer: &WgPeer, warnings: &mut Vec<String
                 .join(" and ")
         ));
     }
-    if let Some(e) = peer.endpoint_address
+    if let Some(e) = peer.endpoint_address.as_ref().and_then(WgHost::ip)
         && let Some(n) = peer.allowed_address.iter().find(|n| n.contains(&e))
     {
         warnings.push(format!(
@@ -364,8 +447,15 @@ fn check(iface: &IfName, w: &Wireguard, peer: &WgPeer, warnings: &mut Vec<String
 }
 
 fn add(s: &mut Session, p: &Value) -> Result<Value> {
+    crate::lockout::take_force(s, p)?;
+    let seal = seal_for(s, p)?;
+    add_on(s.store_mut().candidate_mut(), seal.as_deref(), p)
+}
+
+/// `interface.wireguard.peers.add` on `cfg` (the candidate, or a copy for
+/// the preview). `seal`: needed when `p` brings a key ([`seal_for`]).
+pub(super) fn add_on(cfg: &mut Config, seal: Option<&SealKey>, p: &Value) -> Result<Value> {
     let iface: IfName = req_parse(p, "interface")?;
-    let cfg = s.store().candidate();
     let w = wireguard_of(cfg, "interface", &iface)?;
     if w.peers.len() >= MAX_PEERS {
         return Err(EngineError::bad("interface", format!("{iface} has {MAX_PEERS} peers, the most one interface takes")));
@@ -382,19 +472,25 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
     let mut peer = WgPeer::new(name.clone(), WgKey::default());
     let mut warnings = Vec::new();
     update(&mut peer, p, &mut warnings)?;
-    keys(s, &mut peer, p, true)?;
-    let w = wireguard_of(s.store().candidate(), "interface", &iface)?;
+    keys(seal, &mut peer, p, true)?;
+    let w = wireguard_of(cfg, "interface", &iface)?;
     check(&iface, w, &peer, &mut warnings)?;
     let public = peer.public_key.to_string();
-    if let Some(w) = wireguard_mut(s, &iface) {
+    if let Some(w) = wireguard_mut(cfg, &iface) {
         w.peers.push(peer);
     }
     Ok(json!({ "name": name, "public_key": public, "warnings": warnings }))
 }
 
 fn set(s: &mut Session, p: &Value) -> Result<Value> {
+    crate::lockout::take_force(s, p)?;
+    let seal = seal_for(s, p)?;
+    set_on(s.store_mut().candidate_mut(), seal.as_deref(), p)
+}
+
+/// `interface.wireguard.peers.set` on `cfg`.
+pub(super) fn set_on(cfg: &mut Config, seal: Option<&SealKey>, p: &Value) -> Result<Value> {
     let name = req_str(p, "name")?.trim().to_owned();
-    let cfg = s.store().candidate();
     let (iface, at) = find(cfg, &name)?;
     let mut w = wireguard_of(cfg, "name", &iface)?.clone();
     let mut peer = w.peers.remove(at);
@@ -408,20 +504,21 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let mut warnings = Vec::new();
     update(&mut peer, p, &mut warnings)?;
-    keys(s, &mut peer, p, false)?;
+    keys(seal, &mut peer, p, false)?;
     check(&iface, &w, &peer, &mut warnings)?;
     let out = json!({ "name": peer.name, "public_key": peer.public_key, "warnings": warnings });
     w.peers.insert(at, peer);
-    if let Some(slot) = wireguard_mut(s, &iface) {
+    if let Some(slot) = wireguard_mut(cfg, &iface) {
         *slot = w;
     }
     Ok(out)
 }
 
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {
+    crate::lockout::take_force(s, p)?;
     let name = req_str(p, "name")?.trim().to_owned();
     let (iface, at) = find(s.store().candidate(), &name)?;
-    if let Some(w) = wireguard_mut(s, &iface)
+    if let Some(w) = wireguard_mut(s.store_mut().candidate_mut(), &iface)
         && at < w.peers.len()
     {
         w.peers.remove(at);
@@ -430,9 +527,10 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn toggle(s: &mut Session, p: &Value, off: bool) -> Result<Value> {
+    crate::lockout::take_force(s, p)?;
     let name = req_str(p, "name")?.trim().to_owned();
     let (iface, at) = find(s.store().candidate(), &name)?;
-    if let Some(peer) = wireguard_mut(s, &iface).and_then(|w| w.peers.get_mut(at)) {
+    if let Some(peer) = wireguard_mut(s.store_mut().candidate_mut(), &iface).and_then(|w| w.peers.get_mut(at)) {
         peer.disabled = off;
     }
     Ok(json!({ "name": name }))
@@ -465,6 +563,10 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
         wireguard_of(&cfg, "interface", i)?;
     }
     let now = s.now().unwrap_or(0);
+    let resolved: std::collections::BTreeMap<String, wg::Resolved> = wg::peers(&cfg)
+        .filter_map(|(_, p)| p.endpoint_address.as_ref().filter(|h| h.ip().is_none()))
+        .filter_map(|h| s.ext::<wg::WgRuntime>().and_then(|rt| rt.resolved(h.as_str()).cloned()).map(|r| (h.to_string(), r)))
+        .collect();
     let mut rows = Vec::new();
     for (iface, i) in cfg.interfaces.iter() {
         let InterfaceKind::Wireguard(w) = &i.kind else {
@@ -475,17 +577,13 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
         }
         let committed = s.store().running().interfaces.contains_key(iface);
         let status = if i.disabled || !committed { None } else { s.wireguard_status(iface).0 };
+        let by_key = wg::status_by_key(status.as_ref());
         for peer in &w.peers {
-            let st = status.as_ref().and_then(|st| {
-                let k = wg::decode(peer.public_key.as_str())?;
-                st.peers.iter().find(|x| x.public_key == k)
-            });
-            let age = st.and_then(|x| x.last_handshake_unix).map(|t| now.saturating_sub(t));
-            let state = PeerState::of(peer, i.disabled, age, st.is_some_and(|x| x.tx_bytes > 0));
+            let (state, age, st) = wg::peer_view(peer, i.disabled, &by_key, now);
             let current = st.and_then(|x| x.endpoint);
-            let configured = peer
-                .endpoint_address
-                .map(|a| std::net::SocketAddr::new(a, peer.endpoint_port));
+            let configured = wg::endpoint_of(peer, &resolved);
+            let name = peer.endpoint_address.as_ref().filter(|h| h.ip().is_none());
+            let res = name.and_then(|h| resolved.get(h.as_str()));
             rows.push(json!({
                 "name": peer.name,
                 "interface": iface,
@@ -494,6 +592,9 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                 "preshared_key": shown(key.as_deref(), &peer.preshared_key),
                 "endpoint_address": peer.endpoint_address,
                 "endpoint_port": (peer.endpoint_port != 0).then_some(peer.endpoint_port),
+                "endpoint_resolved": res.and_then(|r| r.ip),
+                "resolved_secs": res.map(|r| now.saturating_sub(r.at_unix)),
+                "resolve_error": res.and_then(|r| r.error.clone()),
                 "current_endpoint_address": current.map(|e| e.ip()),
                 "current_endpoint_port": current.map(|e| e.port()),
                 "roamed": current.is_some() && configured.is_some() && current != configured,
@@ -502,6 +603,12 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                 "responder": peer.responder,
                 "disabled": peer.disabled,
                 "comment": peer.comment,
+                "client_address": peer.client.address,
+                "client_dns": peer.client.dns,
+                "client_endpoint": peer.client.endpoint,
+                "client_allowed_address": peer.client.allowed_address,
+                "client_keepalive": peer.client.keepalive,
+                "client_mtu": peer.client.mtu,
                 "state": state.as_str(),
                 "last_handshake_secs": age,
                 "rx": st.map_or(0, |x| x.rx_bytes),
@@ -571,7 +678,7 @@ mod tests {
             (json!({"interface": "wg0", "public_key": "nope", "allowed_address": "10.9.1.0/24"}), "public_key"),
             (json!({"interface": "wg0", "allowed_address": "10.9.1.0/24"}), "public_key"),
             (json!({"interface": "wg0", "public_key": K2, "allowed_address": "10.9.1.0/24", "endpoint_address": "198.51.100.7"}), "go together"),
-            (json!({"interface": "wg0", "public_key": K2, "allowed_address": "10.9.1.0/24", "endpoint_address": "vpn.example.com", "endpoint_port": 1}), "not an IP"),
+            (json!({"interface": "wg0", "public_key": K2, "allowed_address": "10.9.1.0/24", "endpoint_address": "vpn example", "endpoint_port": 1}), "neither an IP"),
             (json!({"interface": "wg0", "name": "a", "public_key": K2, "allowed_address": "10.9.1.0/24"}), "already exists"),
             (json!({"interface": "ether1", "public_key": K2, "allowed_address": "10.9.1.0/24"}), "not a WireGuard"),
         ] {

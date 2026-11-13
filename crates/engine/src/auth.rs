@@ -41,6 +41,8 @@ pub const SECRET_KEYS: &[&str] = &[
     "secret",
     "psk",
     "private_key",
+    // WireGuard preshared key (G1.31b; the parameter of the peers).
+    "preshared_key",
     "passphrase",
     // BGP TCP MD5 key (G3.2a).
     "tcp_md5_key",
@@ -220,8 +222,23 @@ pub fn mask_secrets(v: &Value) -> Value {
                 .collect(),
         ),
         Value::Array(a) => Value::Array(a.iter().map(mask_secrets).collect()),
+        Value::String(t) if WG_KEY_LINES.iter().any(|k| t.contains(k)) => Value::String(mask_key_lines(t)),
         other => other.clone(),
     }
+}
+
+/// Lines of a `wg-quick` text (`interface.wireguard.wg-import`'s `text`)
+/// that carry a key (G1.31b).
+const WG_KEY_LINES: [&str; 2] = ["PrivateKey", "PresharedKey"];
+
+fn mask_key_lines(t: &str) -> String {
+    t.split('\n')
+        .map(|l| match l.split_once('=') {
+            Some((k, _)) if WG_KEY_LINES.contains(&k.trim()) => format!("{} = ***", k.trim()),
+            _ => l.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The answer to `auth.whoami` (control channel, and the UI's in-process

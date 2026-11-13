@@ -37,6 +37,10 @@ pub struct WebListener {
     /// who reaches the port. Others are disconnected without an answer.
     #[serde(default)]
     pub available_from: Vec<IpNet>,
+    /// G1.6zs: the `/certificate` it serves with (RouterOS `certificate`);
+    /// empty is the router's own (the control port's). Only `www_ssl`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub certificate: String,
 }
 
 fn any_address() -> IpAddr {
@@ -50,6 +54,7 @@ impl WebListener {
             address: any_address(),
             port,
             available_from: Vec::new(),
+            certificate: String::new(),
         }
     }
 

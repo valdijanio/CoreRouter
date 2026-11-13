@@ -34,19 +34,46 @@ enum Then {
     DropRequest,
 }
 
+/// A fake router: its address, every request line it read (with the
+/// connection number), and a signal for each connection it closed (its
+/// number) and, last, `0` once the listener is gone too.
+struct Fake {
+    addr: String,
+    seen: mpsc::Receiver<(usize, Value)>,
+    closed: mpsc::Receiver<usize>,
+}
+
+impl Fake {
+    /// Waits until the router closed connection `n` (0: its listener).
+    /// A fixed sleep here made the next call race the close on a loaded
+    /// machine: the request went out on the old connection and got a reset.
+    fn wait_closed(&self, n: usize) {
+        loop {
+            let got = self.closed.recv_timeout(Duration::from_secs(30)).unwrap();
+            if got == n {
+                return;
+            }
+        }
+    }
+}
+
 /// Serves one connection per entry of `plan`; each reply carries the
-/// connection number. Every request line is sent to the returned channel.
-fn fake_router(plan: Vec<Then>) -> (String, mpsc::Receiver<(usize, Value)>) {
+/// connection number. Every request line is sent to `seen`.
+fn fake_router(plan: Vec<Then>) -> Fake {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = l.local_addr().unwrap().to_string();
-    let (tx, rx) = mpsc::channel();
+    let (tx, seen) = mpsc::channel();
+    let (closed_tx, closed) = mpsc::channel();
     thread::spawn(move || {
         for (n, then) in plan.into_iter().enumerate() {
             let (s, _) = l.accept().unwrap();
             serve(s, n + 1, then, &tx);
+            let _ = closed_tx.send(n + 1);
         }
+        drop(l);
+        let _ = closed_tx.send(0);
     });
-    (addr, rx)
+    Fake { addr, seen, closed }
 }
 
 fn serve(s: TcpStream, conn: usize, then: Then, tx: &mpsc::Sender<(usize, Value)>) {
@@ -95,34 +122,34 @@ fn run(r: &mut Remote) -> Result<Value, String> {
 
 #[test]
 fn a_restarted_router_is_redialled_on_the_next_call() {
-    let (addr, seen) = fake_router(vec![Then::AnswerThenClose(1), Then::AnswerThenClose(9)]);
-    let mut r = remote(&addr);
+    let fake = fake_router(vec![Then::AnswerThenClose(1), Then::AnswerThenClose(9)]);
+    let mut r = remote(&fake.addr);
     assert_eq!(run(&mut r).unwrap()["conn"], 1);
     // The router went away between two calls (restart, upgrade).
-    thread::sleep(Duration::from_millis(100));
+    fake.wait_closed(1);
     assert_eq!(run(&mut r).unwrap()["conn"], 2);
     assert_eq!(run(&mut r).unwrap()["conn"], 2);
     // Each request reached a router exactly once.
-    let got: Vec<usize> = seen.try_iter().map(|(c, _)| c).collect();
+    let got: Vec<usize> = fake.seen.try_iter().map(|(c, _)| c).collect();
     assert_eq!(got, [1, 2, 2]);
 }
 
 #[test]
 fn a_lost_reply_is_not_sent_again() {
-    let (addr, seen) = fake_router(vec![Then::DropRequest, Then::AnswerThenClose(9)]);
-    let mut r = remote(&addr);
+    let fake = fake_router(vec![Then::DropRequest, Then::AnswerThenClose(9)]);
+    let mut r = remote(&fake.addr);
     let e = run(&mut r).unwrap_err();
     assert!(e.contains("may or may not have run"), "{e}");
-    assert_eq!(seen.try_iter().count(), 1, "sent twice");
+    assert_eq!(fake.seen.try_iter().count(), 1, "sent twice");
     assert_eq!(run(&mut r).unwrap()["conn"], 2);
 }
 
 #[test]
 fn an_unreachable_router_is_a_clear_error_and_the_next_call_retries() {
-    let (addr, _seen) = fake_router(vec![Then::AnswerThenClose(1)]);
-    let mut r = remote(&addr);
+    let fake = fake_router(vec![Then::AnswerThenClose(1)]);
+    let mut r = remote(&fake.addr);
     run(&mut r).unwrap();
-    thread::sleep(Duration::from_millis(100));
+    fake.wait_closed(0);
     // Nothing listens any more (the fake router served its one connection
     // and the listener is gone with its thread).
     let e = run(&mut r).unwrap_err();

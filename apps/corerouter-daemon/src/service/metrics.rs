@@ -15,6 +15,15 @@
 //! (summed by name; no `pid` label, which changes on every FRR restart),
 //! and the health checks as numbers (0 ok, 1 warning, 2 error).
 //!
+//! G4.1zc: the LAN DNS forwarder (`ip.dns.statistics`) as
+//! `corerouter_dns_*`, named like CoreDNS (`coredns_dns_requests_total`,
+//! `coredns_dns_responses_total{rcode}`, `..._duration_seconds`):
+//! queries by who answered, by rcode and by transport, the extended
+//! errors (RFC 8914), the time to answer as a histogram in seconds on the
+//! G4.1h buckets, the queries in flight, each upstream and the cache.
+//! Names and clients stay out (their label sets are unbounded, and a
+//! client is personal data: LGPD).
+//!
 //! The endpoint has no login, like node_exporter: it binds to 127.0.0.1
 //! unless an address is given, and a non-loopback address is logged as a
 //! warning. It answers `GET`/`HEAD` of `/metrics` (and a small page at
@@ -217,6 +226,9 @@ pub fn render(m: &Value, scrape_seconds: f64) -> String {
     }
     if let Some(d) = m.get("dhcp_server").filter(|d| d.is_object()) {
         dhcp_server(&mut out, d);
+    }
+    if let Some(d) = m.get("dns").filter(|d| d.is_object()) {
+        dns(&mut out, d);
     }
     machine(&mut out, m);
     if let Some(v) = m.get("revision").and_then(Value::as_u64) {
@@ -445,6 +457,125 @@ fn dhcp_server(out: &mut String, d: &Value) {
         let count = lat.and_then(|l| l.get("count")).and_then(Value::as_u64).unwrap_or(0);
         let _ = writeln!(out, "{name}_sum {}", sum as f64 / 1e6);
         let _ = writeln!(out, "{name}_count {count}");
+    }
+}
+
+/// G4.1zc: the forwarder's counters (`system.metrics.dns`).
+fn dns(out: &mut String, d: &Value) {
+    let num = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64);
+    for (key, metric, lbl, help) in [
+        ("answered", "corerouter_dns_queries_total", "answered_by", "DNS queries from clients, by who answered (cache, upstream, static, refused, limit, busy…)."),
+        ("rcodes", "corerouter_dns_responses_total", "rcode", "DNS replies to clients, by response code (dropped: no reply)."),
+    ] {
+        // A family with no sample is left out (nothing counted yet).
+        if let Some(by) = d.get(key).and_then(Value::as_object).filter(|o| !o.is_empty()) {
+            family(out, metric, "counter", help);
+            for (k, n) in by {
+                if let Some(n) = n.as_u64() {
+                    let _ = writeln!(out, "{metric}{{{lbl}=\"{}\"}} {n}", label(k));
+                }
+            }
+        }
+    }
+    if let Some(t) = d.get("transport") {
+        let name = "corerouter_dns_transport_queries_total";
+        family(out, name, "counter", "DNS queries from clients, by transport and address family.");
+        for (k, proto, fam) in [("udp4", "udp", "ipv4"), ("udp6", "udp", "ipv6"), ("tcp4", "tcp", "ipv4"), ("tcp6", "tcp", "ipv6")] {
+            if let Some(n) = num(t, k) {
+                let _ = writeln!(out, "{name}{{proto=\"{proto}\",family=\"{fam}\"}} {n}");
+            }
+        }
+    }
+    for (key, metric, help) in [
+        ("truncated", "corerouter_dns_truncated_total", "UDP replies sent without records and with TC (too large for the client)."),
+        ("malformed", "corerouter_dns_malformed_total", "Client messages refused before the chain (malformed, another opcode or class)."),
+        ("socket_drops", "corerouter_dns_socket_drops_total", "Datagrams the kernel dropped on the forwarder's UDP sockets (queue full)."),
+    ] {
+        if let Some(n) = num(d, key) {
+            family(out, metric, "counter", help);
+            let _ = writeln!(out, "{metric} {n}");
+        }
+    }
+    if let Some(ede) = d.get("ede").and_then(Value::as_array).filter(|a| !a.is_empty()) {
+        let name = "corerouter_dns_extended_errors_total";
+        family(out, name, "counter", "Replies by the RFC 8914 extended error they stand for.");
+        for e in ede {
+            let ename = label(e.get("name").and_then(Value::as_str).unwrap_or(""));
+            if let (Some(code), Some(n)) = (num(e, "code"), num(e, "replies")) {
+                let _ = writeln!(out, "{name}{{code=\"{code}\",name=\"{ename}\"}} {n}");
+            }
+        }
+    }
+    let lat = d.get("latency_us");
+    if let Some(buckets) = lat.and_then(|l| l.get("buckets")).and_then(Value::as_array) {
+        let name = "corerouter_dns_response_duration_seconds";
+        family(out, name, "histogram", "Time from a client's query read to its reply sent.");
+        for b in buckets {
+            let le = match b.get(0).and_then(Value::as_u64) {
+                Some(us) => format!("{}", us as f64 / 1e6),
+                None => "+Inf".into(),
+            };
+            let n = b.get(1).and_then(Value::as_u64).unwrap_or(0);
+            let _ = writeln!(out, "{name}_bucket{{le=\"{le}\"}} {n}");
+        }
+        let sum = lat.and_then(|l| num(l, "sum")).unwrap_or(0);
+        let count = lat.and_then(|l| num(l, "count")).unwrap_or(0);
+        let _ = writeln!(out, "{name}_sum {}", sum as f64 / 1e6);
+        let _ = writeln!(out, "{name}_count {count}");
+    }
+    for (key, metric, help) in [
+        ("in_flight", "corerouter_dns_in_flight", "Client queries waiting for an upstream now."),
+        ("in_flight_peak", "corerouter_dns_in_flight_peak", "Most client queries waiting at once since the start or the last reset."),
+        ("max_concurrent_queries", "corerouter_dns_max_concurrent_queries", "The limit of queries waiting at once (ip.dns max-concurrent-queries)."),
+    ] {
+        if let Some(n) = num(d, key) {
+            family(out, metric, "gauge", help);
+            let _ = writeln!(out, "{metric} {n}");
+        }
+    }
+    let ups = d.get("upstreams").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    if !ups.is_empty() {
+        let server = |u: &Value| label(u.get("server").and_then(Value::as_str).unwrap_or(""));
+        for (key, metric, help) in [
+            ("answers", "corerouter_dns_upstream_answers_total", "Answers from the upstream server since the daemon started."),
+            ("failures", "corerouter_dns_upstream_failures_total", "Queries to the upstream server that failed (timeout, error, SERVFAIL)."),
+            ("timeouts", "corerouter_dns_upstream_timeouts_total", "Queries to the upstream server that timed out."),
+            ("servfails", "corerouter_dns_upstream_servfails_total", "SERVFAIL answers from the upstream server."),
+            ("truncated", "corerouter_dns_upstream_truncated_total", "Truncated UDP answers from the upstream server, asked again over TCP."),
+        ] {
+            family(out, metric, "counter", help);
+            for u in ups {
+                if let Some(n) = num(u, key) {
+                    let via = label(u.get("via").and_then(Value::as_str).unwrap_or(""));
+                    let _ = writeln!(out, "{metric}{{server=\"{}\",via=\"{via}\"}} {n}", server(u));
+                }
+            }
+        }
+        family(out, "corerouter_dns_upstream_up", "gauge", "1 while the upstream server answers; 0 while it is down (asked last).");
+        for u in ups {
+            let down = u.get("down").and_then(Value::as_bool).unwrap_or(false);
+            let _ = writeln!(out, "corerouter_dns_upstream_up{{server=\"{}\"}} {}", server(u), u8::from(!down));
+        }
+        family(out, "corerouter_dns_upstream_srtt_seconds", "gauge", "Smoothed round-trip time to the upstream server.");
+        for u in ups {
+            if let Some(ms) = num(u, "srtt_ms") {
+                let _ = writeln!(out, "corerouter_dns_upstream_srtt_seconds{{server=\"{}\"}} {}", server(u), ms as f64 / 1e3);
+            }
+        }
+    }
+    if let Some(c) = d.get("cache").filter(|c| c.is_object()) {
+        for (key, metric, kind, help) in [
+            ("entries", "corerouter_dns_cache_entries", "gauge", "Answers in the DNS cache."),
+            ("used_bytes", "corerouter_dns_cache_bytes", "gauge", "Memory the DNS cache uses."),
+            ("max_bytes", "corerouter_dns_cache_max_bytes", "gauge", "The DNS cache's budget (ip.dns cache-size)."),
+            ("evicted", "corerouter_dns_cache_evictions_total", "counter", "Valid answers pushed out of the cache to make room."),
+            ("expired", "corerouter_dns_cache_expired_total", "counter", "Answers dropped from the cache after their TTL and stale window."),
+        ] {
+            if let Some(n) = num(c, key) {
+                family(out, metric, kind, help);
+                let _ = writeln!(out, "{metric} {n}");
+            }
+        }
     }
 }
 
@@ -891,6 +1022,18 @@ mod tests {
                 {"name": "zebra", "pid": 902, "rss_bytes": 9_000_000, "threads": 4,
                  "fds": null, "cpu_seconds": 0.5},
             ],
+            "dns": {
+                "answered": {"cache": 40, "upstream": 9, "refused": 1},
+                "rcodes": {"noerror": 45, "nxdomain": 4, "refused": 1},
+                "transport": {"udp4": 48, "udp6": 1, "tcp4": 1, "tcp6": 0},
+                "truncated": 1, "malformed": 0, "socket_drops": 2,
+                "ede": [{"code": 18, "name": "Prohibited", "replies": 1}],
+                "latency_us": {"buckets": [[100, 30], [250, 40], [null, 50]], "sum": 2_500_000, "count": 50},
+                "in_flight": 3, "in_flight_peak": 7, "max_concurrent_queries": 100,
+                "upstreams": [{"server": "1.1.1.1", "via": "dot", "answers": 9, "failures": 2,
+                    "timeouts": 1, "servfails": 1, "truncated": 0, "srtt_ms": 12, "down": false}],
+                "cache": {"entries": 30, "used_bytes": 4096, "max_bytes": 2_097_152, "evicted": 0, "expired": 5},
+            },
             "health": {"status": "warning", "checks": [
                 {"key": "cpu", "severity": "ok"},
                 {"key": "disk", "severity": "warning"},
@@ -940,6 +1083,40 @@ mod tests {
         let t = render(&m, 0.0);
         assert!(t.contains("corerouter_process_threads{process=\"bgpd\"} 6"), "{t}");
         assert!(t.contains("corerouter_health_status "));
+    }
+
+    /// G4.1zc: the forwarder as CoreDNS-like families; the histogram's
+    /// buckets in seconds, `+Inf` equal to `_count`.
+    #[test]
+    fn renders_the_dns_forwarder() {
+        let t = render(&sample(), 0.0);
+        for line in [
+            "corerouter_dns_queries_total{answered_by=\"cache\"} 40",
+            "corerouter_dns_responses_total{rcode=\"nxdomain\"} 4",
+            "corerouter_dns_transport_queries_total{proto=\"udp\",family=\"ipv6\"} 1",
+            "corerouter_dns_truncated_total 1",
+            "corerouter_dns_socket_drops_total 2",
+            "corerouter_dns_extended_errors_total{code=\"18\",name=\"Prohibited\"} 1",
+            "corerouter_dns_response_duration_seconds_bucket{le=\"0.0001\"} 30",
+            "corerouter_dns_response_duration_seconds_bucket{le=\"0.00025\"} 40",
+            "corerouter_dns_response_duration_seconds_bucket{le=\"+Inf\"} 50",
+            "corerouter_dns_response_duration_seconds_sum 2.5",
+            "corerouter_dns_response_duration_seconds_count 50",
+            "corerouter_dns_in_flight 3",
+            "corerouter_dns_max_concurrent_queries 100",
+            "corerouter_dns_upstream_answers_total{server=\"1.1.1.1\",via=\"dot\"} 9",
+            "corerouter_dns_upstream_timeouts_total{server=\"1.1.1.1\",via=\"dot\"} 1",
+            "corerouter_dns_upstream_up{server=\"1.1.1.1\"} 1",
+            "corerouter_dns_upstream_srtt_seconds{server=\"1.1.1.1\"} 0.012",
+            "corerouter_dns_cache_entries 30",
+            "corerouter_dns_cache_expired_total 5",
+        ] {
+            assert!(t.lines().any(|l| l == line), "no `{line}` in:\n{t}");
+        }
+        // The lab has no forwarder: no DNS family at all.
+        let mut s = corerouter_engine::Session::virtual_lab();
+        let m = s.execute("system.metrics", &json!({})).unwrap();
+        assert!(!render(&m, 0.0).contains("corerouter_dns_"));
     }
 
     #[test]
@@ -998,9 +1175,17 @@ mod tests {
                     && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
                 "bad name {name}"
             );
+            // A histogram's samples carry `_bucket`, `_sum` and `_count`.
+            let family = match typed.last() {
+                Some((_, kind)) if kind == "histogram" => ["_bucket", "_sum", "_count"]
+                    .iter()
+                    .find_map(|sfx| name.strip_suffix(sfx))
+                    .unwrap_or(name),
+                _ => name,
+            };
             assert_eq!(
                 typed.last().map(|(n, _)| n.as_str()),
-                Some(name),
+                Some(family),
                 "sample of {name} outside its family"
             );
             let (series, value) = line.rsplit_once(' ').unwrap();
