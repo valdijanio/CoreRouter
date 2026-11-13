@@ -205,3 +205,94 @@ não muda nada (p99,9 107 µs). Custo: o acerto de cache cai **14 %** com a list
 A carga ao lado não sente nenhum (p99,9 ≤ 17 ms; o flush e o statistics.print repetidos 50 vezes
 trocam os acertos por misses, que é o esperado). O alvo de 50 ms (G4.2h) passa no p50 de todos;
 os dois comandos que mudam a config tiveram uma amostra acima (130–147 ms) em 50, nas duas rodadas.
+
+### Comparação com Unbound e dnsmasq (`compare`, G4.1g)
+
+Mesmas 4 vCPUs, mesma origem e mesmo gerador; CoreRouter desta branch com `max_concurrent_queries`
+1000 e cache de 1 GiB; Unbound 1.19.2 com `num-threads` 4 e `so-reuseport`; dnsmasq 2.91 (uma
+thread) com `cache-size` 10 000 (o teto dele) e `dns-forward-max` 1000. Duas rodadas (faixa).
+
+| Medida | CoreRouter | Unbound | dnsmasq |
+|---|---|---|---|
+| Cache quente, saturação | 193–198 mil/s | 280–344 mil/s | 87–127 mil/s |
+| Cache quente a 50 000/s: p50 / p99 | 40 / 59–60 µs | 38–42 / 60–67 µs | 39–367 µs / 0,1–4,2 ms |
+| Misses, origem a 20 ms, saturação | 29–45 mil/s (+ SERVFAIL no teto) | 42–45 mil/s | 3,5–4,5 mil/s (17–21 % perdidas) |
+| Misses a 5000/s: p50 / p99 | 63–65 µs / 20 ms | 57–81 µs / 20 ms | 55 / 68 ms |
+| O mesmo nome TTL 0 a 2000/s: à origem por resposta | **0,02** | 0,07–0,09 | 0,05 |
+| Memória por resposta (10 000 nomes, RSS) | ~1,3 KB (inclui pilhas dos workers; ~700 B com 1 M) | ~700 B | pré-alocado |
+
+Antes desta branch (rodada 1, daemon da imagem), o miss na saturação era 10,2 mil/s com p50 de
+492 ms e o TTL 0 ia 1,00 à origem por resposta. A decisão do Hickory, revista com esses números,
+está em `docs/architecture.md` ("DNS (G4.1)").
+
+## Fase C: o notebook
+
+O roteiro já roda contra um roteador remoto (`--dut remote`); quem o roda é a sessão principal,
+depois da fase C do OSPF. Checklist:
+
+1. O cabo do `eno1` do host é macvtap da VM do laboratório; dentro da VM ele aparece como uma
+   interface (`ip -br link` na VM); essa é a `--iface`. Do lado do notebook, a porta do cabo é a
+   `--dut-iface` (**nunca** o `ether1`, que está na rede de casa e só pode ser cliente: a carga
+   nunca entra por ele).
+2. O notebook precisa de um endereço de gerência alcançável pelo cabo (`--target`, TLS na 8729) e
+   a VM de um endereço na mesma rede (`--mgmt <cidr>`). O roteiro põe `10.53.0.1/24` na porta do
+   cabo e a config de DNS do laboratório; anota a revisão antes (`config.history`) e faz
+   `config.rollback` para ela no fim, mesmo com falha.
+3. O firewall do notebook precisa aceitar UDP/TCP 53 vindo de `10.53.0.0/24` na porta do cabo
+   (o `allowed_from` do laboratório é `10.53.0.0/25`).
+4. Sugestão de rodada: `--tests qps,torture,origin,tcp,cache,hostile,ops` e depois
+   `--tests soak --soak-secs 43200` (12 h). `compare` não roda remoto (só local).
+5. Sem CPU por thread pelo `/proc` no remoto: o roteiro usa `system.resource.process.print
+   threads=yes` (o instantâneo no fim de cada medição) e o RSS/threads/descritores dele.
+
+Conferido: `--selftest-remote` (o modo remoto contra um DUT local, por TLS) rodou `qps` e `hostile`
+inteiros com o rollback no fim.
+
+## Pesquisa
+
+- **MikroTik RouterOS v7** (`/ip dns`, help.mikrotik.com/docs/spaces/ROS/pages/37748767/DNS):
+  `max-concurrent-queries` 100, `max-concurrent-tcp-sessions` 20, `cache-size` 2048 **KiB**,
+  `query-server-timeout` 2 s, `query-total-timeout` 10 s; a documentação não diz o que acontece ao
+  passar dos limites (nós respondemos SERVFAIL na hora e contamos, `busy`). Relato de campo: Chrome
+  com 3 conexões TCP/53 simultâneas falhava no 7.19.1 (forum.mikrotik.com, tópico 183935): o nosso
+  teto por endereço (5) aceita.
+- **Unbound** (unbound.docs.nlnetlabs.nl): consultas iguais juntadas no "mesh" (uma por nome, tipo,
+  classe e flags; só no código, `services/mesh.c`); `num-queries-per-thread` 2048 por thread (laço
+  de eventos, não thread por consulta); serve-expired no modo da RFC 8767 só é padrão a partir do
+  1.23 (`serve-expired-client-timeout` 1800 ms); memória real ~2–2,5× o configurado. O DoH dele só
+  fala HTTP/2.
+- **dnsmasq** (thekelleys.org.uk): junta consultas iguais desde o 2.83 (CVE-2020-25686, DNSpooq);
+  `dns-forward-max` 150; `cache-size` com teto rígido de 10 000 nomes; uma thread.
+- **Knot/NSD/BIND como origem**: Knot e NSD passam de 1 M consultas/s em 16 núcleos, o BIND fica
+  ~10× abaixo (Lencse, IEEE Access 2020); Knot 3.3 tem pacote no Ubuntu 24.04 e zona curinga.
+- **RFCs**: 5452 §5 (consultas iguais pendentes e o ataque do aniversário; a norma está em §9.2:
+  porta e id imprevisíveis), 8767 §5 (serve-stale: 1,8 s para responder o vencido, 30 s de TTL),
+  9520 §3 (cache de falhas: 1 s a 5 min, não perguntar enquanto guardada, até 3 tentativas), 7766
+  §6.2 (TCP: vários pedidos por conexão, idle de segundos, timeout zero sob carga), 9210 (TCP
+  obrigatório; §4.5: 25 conexões por endereço, idle 10 s), 8906 §3.1.1 (nunca deixar sem
+  resposta), 5358 (não ser resolvedor aberto), 8482 (ANY mínimo), 8484 §5.2 (DoH: HTTP/2
+  recomendado), 9113 (HTTP/2) e 7541 (HPACK; os exemplos do Apêndice C viraram testes).
+- **Gerador**: dnsperf 2.14.0 (sem saída JSON, que veio no 2.15; o histograma de conexões do 2.14
+  repete o de respostas, e o roteiro só lê o primeiro).
+
+O que adotamos: os nomes e padrões do RouterOS ficam; o que o Unbound faz melhor virou correção
+(junção de iguais, workers sem criar thread, HTTP/2) ou gap com número (laço de eventos, prazo
+adaptativo, serve-stale em 1,8 s, cache protegido, TCP contra slowloris).
+
+## Desempenho e paralelismo
+
+- **Trabalho por item.** Por consulta respondida do cache: ~1 µs na cadeia (G4.1b) mais o socket;
+  na VM, ~85–95 mil/s por leitor `dns-udp`, com a CPU de cada leitor perto de 100 %. Por miss:
+  antes ~210 µs de CPU na VM (a thread criada e destruída), depois ~67 µs (troca com o servidor, socket
+  por consulta para porta imprevisível, RFC 5452). Nada cresce com o total por item, exceto o que
+  virou gap: o filtro por nome do `cache.print` (varre o cache inteiro, G4.1y) e a reconstrução de
+  todas as zonas a cada UPDATE (G4.1p).
+- **Paralelismo.** Os leitores UDP já são vários por socket (o kernel entrega cada datagrama a um
+  leitor que espera); o acerto de cache escalou de 1 para 2 leitores (56 → 174 mil/s, 2 → 4
+  vCPUs). O lock do resolvedor (cache) é curto e não apareceu como gargalo até 200 mil/s; o
+  Unbound faz 1,4–1,8× mais no acerto porque usa todas as CPUs (`SO_REUSEPORT`, uma thread por
+  CPU), e nós metade por escolha (G0.31). Os misses esperam a rede em workers paralelos até
+  `max_concurrent_queries`; o teto real é esse número sobre o RTT (G4.1t). A junção de iguais tira
+  trabalho repetido; o mapa dela tem um lock próprio, tomado duas vezes por miss (+0,24 µs).
+- **Filas.** O pool de workers não tem fila sem teto: o portão `max_concurrent_queries` limita os
+  jobs (acima dele, SERVFAIL na hora, contado como `busy`); um worker ocioso por 10 s termina.
