@@ -255,6 +255,26 @@ Antes desta branch (rodada 1, daemon da imagem), o miss na saturação era 10,2 
 492 ms e o TTL 0 ia 1,00 à origem por resposta. A decisão do Hickory, revista com esses números,
 está em `docs/architecture.md` ("DNS (G4.1)").
 
+### Estabilidade (`soak`)
+
+A mistura a 10 000/s (85 % cache, 5 % estáticos, 5 % zona, 5 % nomes que expiram em 5 min) mais
+50 nomes únicos por segundo, origem a 5 ms, cache de 64 MiB, 2 h, uma medida por minuto.
+
+| | VM, 4 vCPUs (esta branch) | Host, namespace de usuário, 4 CPUs |
+|---|---|---|
+| Minutos | 120 | 120 |
+| SERVFAIL / perdidas | 0 / 0 | 0 / 0 |
+| p50 / p99 (cada minuto) | 43–131 µs / 5,2–6,4 ms | 10–335 µs / 5,1–7,6 ms (um minuto com 72 ms: outra rodada minha disputando o host) |
+| RSS | 111 MiB → 161 MiB quando o cache encheu (30 min) → **166 MiB** no fim | 104 → 158 MiB (cheio) → 97–111 MiB |
+| Threads | 120 → 129 (um pico de misses; ficam) | 125 → 163 (idem) |
+| Descritores | 20–21 | 20–22 |
+
+O p99 é o dos misses (a origem a 5 ms) e não deriva. O RSS para de crescer com o cache cheio, mas
+na VM subiu mais 4 MiB em 90 min (~2,7 MiB/h, **medido**): provavelmente o alocador com o despejo
+contínuo; **a observar nas 12 h da fase C** (uma reta de 2,7 MiB/h daria ~32 MiB em 12 h). As threads
+a mais são workers criados num pico de misses: com carga contínua cada um é acordado antes de 10 s
+ocioso e não termina; o teto é `max_concurrent_queries`.
+
 ## Fase C: o notebook
 
 O roteiro já roda contra um roteador remoto (`--dut remote`); quem o roda é a sessão principal,
