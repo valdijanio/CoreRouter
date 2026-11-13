@@ -163,6 +163,12 @@ fn package_args(keep: impl Fn(&affected::Package) -> bool) -> Option<Vec<String>
     (!args.is_empty()).then_some(args)
 }
 
+/// The `--affected` scope's packages (none without a scope: the whole
+/// workspace unifies every feature).
+fn scope_packages() -> &'static [affected::Package] {
+    SCOPE.get().map_or(&[], Vec::as_slice)
+}
+
 /// Did the diff change `package` itself (always true without a scope)?
 fn changed_in_scope(package: &str) -> bool {
     SCOPE

@@ -275,9 +275,22 @@ pub fn check(root: &Path) -> Outcome {
     let Some(pkgs) = crate::package_args(|p| p.has_benches && p.changed) else {
         return Outcome::Skip("no package with benches in scope".into());
     };
+    // A bench with `required-features` stops `--bench '*'` when its
+    // package is built alone (no dependent unifies the feature in).
+    let features: Vec<String> = crate::scope_packages()
+        .iter()
+        .filter(|p| p.has_benches && p.changed)
+        .flat_map(|p| p.bench_features.clone())
+        .collect();
+    let feature_args = if features.is_empty() {
+        Vec::new()
+    } else {
+        vec!["--features".to_owned(), features.join(",")]
+    };
     let out = cargo()
         .arg("test")
         .args(pkgs)
+        .args(feature_args)
         .args([
             "--bench",
             "*",
