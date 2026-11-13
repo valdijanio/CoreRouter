@@ -852,7 +852,7 @@ pub(crate) type Then = Box<dyn FnOnce(Option<Vec<u8>>) + Send>;
 impl Answer {
     /// One query that came over DNS over TLS (G4.1zf) from `client`: the
     /// chain as for TCP 53 (`tcp`: no truncation), up to the cache on the
-    /// caller's thread; a miss waits on a worker, at most
+    /// caller's thread; a miss waits on a pooled worker, at most
     /// `max_concurrent_queries` of them (more: SERVFAIL now, as UDP), and
     /// `then` gets its reply. Zone transfers are not served over TLS here
     /// (RFC 9103 XoT is another feature).
@@ -877,12 +877,10 @@ impl Answer {
                     }
                     then(d.reply);
                 };
-                match thread::Builder::new().name("dns-query".into()).spawn(worker) {
-                    Ok(_) => Self::Later,
-                    Err(e) => {
-                        log::warn!("DNS: no thread for a query: {e}");
-                        Self::Now(servfail(msg))
-                    }
+                // The misses' workers (G4.1r), as UDP's.
+                match srv.misses.submit(Box::new(worker)) {
+                    Ok(()) => Self::Later,
+                    Err(()) => Self::Now(servfail(msg)),
                 }
             }
         }

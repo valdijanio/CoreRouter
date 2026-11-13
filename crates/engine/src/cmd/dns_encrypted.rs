@@ -1,9 +1,10 @@
-//! `/ip dns encrypted-service` (G4.1zf): DNS over TLS for the LAN (RFC
-//! 7858), answered by the same forwarder, cache and `allowed_from` as UDP
-//! and TCP 53. The daemon's `dns-tls` service listens; this area keeps its
-//! settings, says what it is doing and what the operator should know.
+//! `/ip dns encrypted-service` (G4.1zf): DNS over TLS (RFC 7858) and DNS
+//! over HTTPS (RFC 8484) for the LAN, answered by the same forwarder, cache
+//! and `allowed_from` as UDP and TCP 53. The daemon's `dns-tls` service
+//! listens; this area keeps its settings, says what it is doing and what
+//! the operator should know.
 //!
-//! - `dot=yes` without a certificate makes `/certificate` `dns-server`
+//! - `dot=yes` or `doh=yes` without a certificate makes `/certificate` `dns-server`
 //!   (self-signed, the router's names and addresses) in the same change:
 //!   Android's automatic Private DNS does not check it, and a certificate
 //!   the operator imports replaces it with `certificate=<name>`.
@@ -31,19 +32,34 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "DNS Encrypted Service",
         ["IP", "DNS"],
         None,
-        "{dot?: bool (DNS over TLS, RFC 7858; needs allow_remote_requests), dot_port?: int 1..65535 (default 853; never 53), certificate?: string (a /certificate with its key; empty with dot=yes: makes dns-server), idle_timeout_secs?: int 1..3600 (default 30), max_sessions?: int 1..100000 (default 1000; a quarter per address), announce_ddr?: bool (answer _dns.resolver.arpa, RFC 9462; default yes)} → {dot, dot_port, certificate, idle_timeout_secs, max_sessions, announce_ddr, notes: [string]}",
+        "{dot?: bool (DNS over TLS, RFC 7858; needs allow_remote_requests), dot_port?: int 1..65535 (default 853; never 53), doh?: bool (DNS over HTTPS, RFC 8484: HTTP/2 and HTTP/1.1), doh_port?: int 1..65535 (default 443; not www-ssl's), doh_path?: string (default /dns-query), certificate?: string (a /certificate with its key; empty with dot or doh on: makes dns-server), idle_timeout_secs?: int 1..3600 (default 30), max_sessions?: int 1..100000 (default 1000; a quarter per address), announce_ddr?: bool (answer _dns.resolver.arpa, RFC 9462; default yes)} → {dot, dot_port, doh, doh_port, doh_path, url, certificate, idle_timeout_secs, max_sessions, announce_ddr, notes: [string]}",
         always,
         set
     ),
     cmd!(query "ip.dns.encrypted-service.get", "DNS Encrypted Service", [], None,
-        "{} → {dot, dot_port, certificate, idle_timeout_secs, max_sessions, announce_ddr, allow_remote_requests, status: stopped|listening|error, listening, last_error, fingerprint, sessions, accepted, handshakes, resumed, handshake_failures, queries, refused, over_limit, checks: [{level: ok|info|warning|error, check, message}]}",
+        "{} → {dot, dot_port, doh, doh_port, doh_path, url (the DoH URI template for clients), certificate, idle_timeout_secs, max_sessions, announce_ddr, allow_remote_requests, status: stopped|listening|error, listening, last_error, fingerprint, sessions, accepted, handshakes, resumed, handshake_failures, queries, doh_queries, doh_errors, http2, refused, over_limit, checks: [{level: ok|info|warning|error, check, message}]}",
         always, get),
 ];
+
+/// The URI template a client is given (RFC 8484 §3), with the router's
+/// first LAN address or `router`.
+fn url(e: &EncryptedService, host: Option<std::net::IpAddr>) -> String {
+    let host = match host {
+        Some(std::net::IpAddr::V6(a)) => format!("[{a}]"),
+        Some(a) => a.to_string(),
+        None => "router".into(),
+    };
+    let port = if e.doh_port == corerouter_model::dns_encrypted::DEFAULT_DOH_PORT { String::new() } else { format!(":{}", e.doh_port) };
+    format!("https://{host}{port}{}{{?dns}}", e.doh_path)
+}
 
 fn settings(e: &EncryptedService) -> Value {
     json!({
         "dot": e.dot,
         "dot_port": e.dot_port,
+        "doh": e.doh,
+        "doh_port": e.doh_port,
+        "doh_path": e.doh_path,
         "certificate": e.certificate,
         "idle_timeout_secs": e.idle_timeout_secs,
         "max_sessions": e.max_sessions,
@@ -71,6 +87,23 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
             .ok_or_else(|| EngineError::bad("dot_port", "1..65535 and never 53 (RFC 7858 §3.1: 853 unless agreed)"))?;
         e.dot_port = port;
     }
+    if let Some(v) = opt_bool(p, "doh")? {
+        e.doh = v;
+    }
+    if let Some(port) = opt_u32(p, "doh_port")? {
+        let port = u16::try_from(port)
+            .ok()
+            .filter(|p| *p != 0 && *p != 53)
+            .ok_or_else(|| EngineError::bad("doh_port", "1..65535 and not 53 (443 is what clients expect)"))?;
+        e.doh_port = port;
+    }
+    if let Some(path) = opt_str(p, "doh_path")? {
+        let path = path.trim();
+        if let Some(why) = corerouter_model::dns_encrypted::doh_path_problem(path) {
+            return Err(EngineError::bad("doh_path", format!("{why} (/dns-query)")));
+        }
+        path.clone_into(&mut e.doh_path);
+    }
     if let Some(v) = ranged(p, "idle_timeout_secs", IDLE_SECS)? {
         e.idle_timeout_secs = v;
     }
@@ -83,10 +116,15 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(name) = opt_str(p, "certificate")? {
         e.certificate = super::certificate::pick(&s.store().candidate().system.certificates, name)?;
     }
-    if e.dot && e.dot_port == s.store().candidate().system.web.www_ssl.port && s.store().candidate().system.web.www_ssl.enabled {
-        return Err(EngineError::bad("dot_port", format!("www-ssl already listens on {}", e.dot_port)));
+    let web = s.store().candidate().system.web.clone();
+    for (on, port, key) in [(e.dot, e.dot_port, "dot_port"), (e.doh, e.doh_port, "doh_port")] {
+        let clash = [(&web.www_ssl, "www-ssl"), (&web.www, "www")].into_iter().find(|(l, _)| l.enabled && l.port == port);
+        if let (true, Some((_, name))) = (on, clash) {
+            let hint = if key == "doh_port" { format!(": pick doh_port=8443, or move {name} (ip.service.{name}.set port=8443)") } else { String::new() };
+            return Err(EngineError::bad(key, format!("{name} already listens on {port}{hint}")));
+        }
     }
-    if e.dot && e.certificate.is_empty() {
+    if e.any() && e.certificate.is_empty() {
         // The router's own names and addresses, self-signed: what Android
         // takes; a certificate the operator imports replaces it.
         if s.store().candidate().system.certificates.get(AUTO_CERTIFICATE).is_none() {
@@ -99,15 +137,17 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         }
         e.certificate = super::certificate::pick(&s.store().candidate().system.certificates, AUTO_CERTIFICATE)?;
     }
-    if e.dot && !s.store().candidate().ip.dns.allow_remote_requests {
-        notes.push("allow_remote_requests is off: nothing answers until it is on (DNS over TLS uses the LAN forwarder)".to_owned());
+    if e.any() && !s.store().candidate().ip.dns.allow_remote_requests {
+        notes.push("allow_remote_requests is off: nothing answers until it is on (DNS over TLS and HTTPS use the LAN forwarder)".to_owned());
     }
     if let Some(why) = e.problem() {
         return Err(EngineError::bad("dot", why));
     }
     let mut out = settings(&e);
-    s.store_mut().candidate_mut().ip.dns.encrypted_service = e;
+    let first = lan_addresses(s).first().copied();
+    s.store_mut().candidate_mut().ip.dns.encrypted_service = e.clone();
     if let Some(o) = out.as_object_mut() {
+        o.insert("url".into(), json!(url(&e, first)));
         o.insert("notes".into(), json!(notes));
     }
     Ok(out)
@@ -117,27 +157,32 @@ fn check(level: &str, check: &str, message: impl Into<String>) -> Value {
     json!({"level": level, "check": check, "message": message.into()})
 }
 
+/// The router's own addresses on the networks that may ask: where the
+/// LAN's clients reach it (and what DHCP hands them as their DNS).
+fn lan_addresses(s: &Session) -> Vec<std::net::IpAddr> {
+    let cfg = s.store().candidate();
+    let nets = s.dns_allowed_networks(cfg);
+    cfg.ip
+        .addresses
+        .iter()
+        .filter(|a| !a.disabled && nets.iter().any(|n| n.contains(&a.address.addr())))
+        .map(|a| a.address.addr())
+        .collect()
+}
+
 /// What the operator should know about the service as configured.
 fn checks(s: &mut Session) -> Vec<Value> {
     let cfg = s.store().candidate().clone();
     let e = &cfg.ip.dns.encrypted_service;
     let mut out = Vec::new();
-    if !e.dot {
+    if !e.any() {
         return out;
     }
     if !cfg.ip.dns.allow_remote_requests {
-        out.push(check("error", "forwarder", "allow_remote_requests is off: DNS over TLS answers nothing (it is the LAN forwarder, encrypted)"));
+        out.push(check("error", "forwarder", "allow_remote_requests is off: DNS over TLS and HTTPS answer nothing (they are the LAN forwarder, encrypted)"));
     }
     let nets = s.dns_allowed_networks(&cfg);
-    // The router's own addresses on the networks that may ask: where the
-    // LAN's clients reach it (and what DHCP hands them as their DNS).
-    let mine: Vec<std::net::IpAddr> = cfg
-        .ip
-        .addresses
-        .iter()
-        .filter(|a| !a.disabled && nets.iter().any(|n| n.contains(&a.address.addr())))
-        .map(|a| a.address.addr())
-        .collect();
+    let mine = lan_addresses(s);
     if nets.is_empty() {
         out.push(check("warning", "allowed_from", "allowed_from stands for no network yet: only the router itself may ask"));
     }
@@ -176,10 +221,17 @@ fn checks(s: &mut Session) -> Vec<Value> {
             Err(err) => out.push(check("error", "certificate", err)),
         }
     }
-    // The input firewall, as a TCP packet to the port: from the LAN it
+    // The input firewall, as a TCP packet to each port: from the LAN it
     // must pass; from the Internet it should not (allowed_from still
     // closes it before any TLS, but the router is then a target).
-    let port = e.dot_port;
+    let ports: Vec<u16> = [(e.dot, e.dot_port), (e.doh, e.doh_port)].into_iter().filter(|(on, _)| *on).map(|(_, p)| p).collect();
+    for port in ports {
+        firewall(s, &cfg, &nets, &mine, port, &mut out);
+    }
+    out
+}
+
+fn firewall(s: &mut Session, cfg: &corerouter_model::Config, nets: &[ipnet::IpNet], mine: &[std::net::IpAddr], port: u16, out: &mut Vec<Value>) {
     if let Some(dst) = mine.first().copied() {
         let lan_host = nets.iter().find(|n| n.contains(&dst)).and_then(|n| n.hosts().find(|h| *h != dst));
         let in_if = cfg.ip.addresses.iter().find(|a| a.address.addr() == dst).map(|a| a.interface.to_string());
@@ -195,7 +247,7 @@ fn checks(s: &mut Session) -> Vec<Value> {
             }
         }
     }
-    if let Some((wan, Some(dst))) = super::wireguard_preview::wan_of(&cfg, INTERNET, &RoutingTable::Main) {
+    if let Some((wan, Some(dst))) = super::wireguard_preview::wan_of(cfg, INTERNET, &RoutingTable::Main) {
         let packet = json!({"src": INTERNET, "dst": dst, "protocol": "tcp", "dst_port": port, "in_interface": wan.to_string()});
         if let Ok(v) = super::firewall_diag::test(s, &packet)
             && v.get("fate").and_then(Value::as_str) == Some("delivered")
@@ -209,14 +261,13 @@ fn checks(s: &mut Session) -> Vec<Value> {
             ));
         }
     }
-    out
 }
 
 fn get(s: &mut Session, _: &Value) -> Result<Value> {
     let cfg = s.store().candidate();
     let e = cfg.ip.dns.encrypted_service.clone();
     let remote = cfg.ip.dns.allow_remote_requests;
-    let running_on = s.store().running().ip.dns.encrypted_service.dot && s.store().running().ip.dns.allow_remote_requests;
+    let running_on = s.store().running().ip.dns.encrypted_service.any() && s.store().running().ip.dns.allow_remote_requests;
     let status = if running_on {
         s.ext::<EncryptedStatus>().cloned().unwrap_or_default()
     } else {
@@ -229,8 +280,10 @@ fn get(s: &mut Session, _: &Value) -> Result<Value> {
         o.insert("allow_remote_requests".into(), json!(remote));
     }
     let checks = checks(s);
+    let first = lan_addresses(s).first().copied();
     if let Some(o) = out.as_object_mut() {
         o.insert("checks".into(), json!(checks));
+        o.insert("url".into(), json!(url(&e, first)));
     }
     Ok(out)
 }
@@ -281,6 +334,21 @@ mod tests {
         // Renaming the certificate follows into the service.
         s.execute("certificate.set", &json!({"id": "lan", "name": "lan2"})).unwrap();
         assert_eq!(s.store().candidate().ip.dns.encrypted_service.certificate, "lan2");
+    }
+
+    #[test]
+    fn doh_takes_its_own_port_and_shares_the_certificate() {
+        let mut s = lab();
+        s.execute("ip.service.www-ssl.set", &json!({"enabled": true})).unwrap();
+        let e = s.execute("ip.dns.encrypted-service.set", &json!({"doh": true})).unwrap_err().to_string();
+        assert!(e.contains("www-ssl already listens on 443") && e.contains("doh_port=8443"), "{e}");
+        let r = s.execute("ip.dns.encrypted-service.set", &json!({"doh": true, "doh_port": 8443, "dot": true})).unwrap();
+        assert_eq!(r["certificate"], AUTO_CERTIFICATE);
+        assert_eq!(r["url"], "https://192.168.88.1:8443/dns-query{?dns}");
+        assert!(s.execute("ip.dns.encrypted-service.set", &json!({"doh_path": "dns"})).is_err());
+        assert!(s.execute("ip.dns.encrypted-service.set", &json!({"doh_port": 853})).is_err(), "DoT's port");
+        s.execute("ip.dns.encrypted-service.set", &json!({"doh_path": "/q"})).unwrap();
+        assert_eq!(s.store().candidate().ip.dns.encrypted_service.doh_path, "/q");
     }
 
     #[test]

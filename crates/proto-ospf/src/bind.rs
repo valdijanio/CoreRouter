@@ -26,6 +26,16 @@ pub struct Binding<'a> {
     pub template: &'a OspfTemplate,
     /// Why it matched: `interface`, `list <name>` or `network <prefix>`.
     pub why: String,
+    /// G3.4m: the addresses OSPFv2 runs on for a match by network: those
+    /// inside the template's networks (RouterOS v7 matches networks per
+    /// address). Empty: every address of the interface (a match by name,
+    /// or OSPFv3, which runs per link). FRR's interface-wide `ip ospf
+    /// area` ran OSPF on a management address next to the OSPF link too:
+    /// advertised, and a second adjacency on the same link that flapped
+    /// with SeqNumberMismatch (stress lab, docs/ospf-stress.md). Always
+    /// per address, so adding or removing an address outside the networks
+    /// changes no line of FRR's and drops no adjacency.
+    pub addresses: Vec<IpNet>,
 }
 
 /// The instance and area of a template, when both exist and are enabled.
@@ -134,6 +144,7 @@ pub fn bindings(cfg: &Config) -> Vec<Binding<'_>> {
             if taken.contains(&inst.name.as_str()) {
                 continue;
             }
+            let mut some = Vec::new();
             let why = match why {
                 Some(w) => w.clone(),
                 None => {
@@ -142,14 +153,22 @@ pub fn bindings(cfg: &Config) -> Vec<Binding<'_>> {
                         Version::V3 => v6.get(&iface.name),
                     }
                     .map_or(&[][..], Vec::as_slice);
-                    match t
+                    let Some(n) = t
                         .networks
                         .iter()
                         .find(|n| addrs.iter().any(|a| n.contains(&a.addr())))
-                    {
-                        Some(n) => format!("network {n}"),
-                        None => continue,
+                    else {
+                        continue;
+                    };
+                    // OSPFv3 runs per link, not per address.
+                    if inst.version == Version::V2 {
+                        some = addrs
+                            .iter()
+                            .filter(|a| t.networks.iter().any(|n| n.contains(&a.addr())))
+                            .copied()
+                            .collect();
                     }
+                    format!("network {n}")
                 }
             };
             taken.push(inst.name.as_str());
@@ -159,6 +178,7 @@ pub fn bindings(cfg: &Config) -> Vec<Binding<'_>> {
                 area,
                 template: t,
                 why,
+                addresses: some,
             });
         }
     }
@@ -248,6 +268,27 @@ mod tests {
         );
         // ether1 matches the second template too: the first one wins.
         assert_eq!(got.iter().filter(|g| g.0 == "ether1").count(), 1);
+    }
+
+    /// G3.4m: a network match runs OSPF only on the addresses inside the
+    /// networks, the same with or without other addresses on the
+    /// interface (adding one changes nothing for OSPF).
+    #[test]
+    fn a_network_match_takes_only_the_addresses_inside() {
+        let mut cfg = sample();
+        let b = bindings(&cfg);
+        let e2 = b.iter().find(|b| b.interface.as_str() == "ether2").unwrap();
+        assert_eq!(e2.addresses, vec!["10.0.2.1/30".parse::<IpNet>().unwrap()]);
+        let mut mgmt = cfg.ip.addresses.iter().nth(1).unwrap().clone();
+        mgmt.id = corerouter_model::ItemId(99);
+        mgmt.address = "10.99.0.1/24".parse().unwrap();
+        cfg.ip.addresses.push(mgmt);
+        let b = bindings(&cfg);
+        let e2 = b.iter().find(|b| b.interface.as_str() == "ether2").unwrap();
+        assert_eq!(e2.addresses, vec!["10.0.2.1/30".parse::<IpNet>().unwrap()]);
+        // A match by name keeps every address.
+        let e1 = b.iter().find(|b| b.interface.as_str() == "ether1").unwrap();
+        assert!(e1.addresses.is_empty());
     }
 
     #[test]
