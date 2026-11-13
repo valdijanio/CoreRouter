@@ -52,6 +52,20 @@ const LOCK_TIMEOUT_DEFAULT: u64 = 30 * 60;
 const HOST_LOCK: &str = "root.lock";
 /// Snapshot with the third-party tools in (`tools`); `reset` prefers it.
 const TOOLS_SNAPSHOT: &str = "tools";
+/// `run`'s health check: below these the VM counts as unhealthy (MiB free
+/// in `LAB_ROOT`, MiB of `MemAvailable`).
+const MIN_DISK_MIB: u64 = 2048;
+const MIN_MEM_MIB: u64 = 1024;
+/// What the disk cleanup frees up to: room for a release build of the
+/// daemon and the CLI (~4 GiB, **estimated**) above the health limit.
+const CLEAN_GOAL_MIB: u64 = 6144;
+/// How often a `run` that found the VM unhealthy under a live round looks
+/// again.
+const RECHECK_EVERY: Duration = Duration::from_secs(30);
+/// Held on the host by a `run` from its health check until its round's ssh
+/// has started (or the run gives up): one check, cleanup or reset at a time,
+/// and none while another run is between its check and its round.
+const HEALTH_LOCK: &str = "health.lock";
 const PACKAGES: &[&str] = &[
     "build-essential",
     "clang",
@@ -78,14 +92,16 @@ const HELP: &str = "usage: cargo xtask vm-lab <subcommand>
   create [--cpus N] [--memory MiB] [--disk GiB] [--wires N]
                     download + verify the Ubuntu 24.04 image, make the VM, provision
                     it (packages, rustup) and take the `clean` snapshot
-                    (defaults: 8 vCPUs, 16384 MiB, 20 GiB thin, 1 wire = 2 test NICs)
+                    (defaults: 8 vCPUs, 16384 MiB, 40 GiB thin, 1 wire = 2 test NICs)
   up | down         start (and wait for SSH) | shut down
   ssh [cmd...]      shell (or one command) as user `lab`; `sudo` works inside
   sync              rsync this worktree to /srv/lab/<worktree>/src (no target*, .git)
   put <file...>     copy host files into /srv/lab/inbox/ (a .deb, a capture)
   status            state, address, who holds the VM lock and for how long
   run [--no-sync] [--shared] [--lock-timeout 30m] -- <cmd...>
-                    health check (reset to `clean` if the VM is broken), sync, then run
+                    health check (short disk: drop the build caches no round uses; broken:
+                    reset to `tools`/`clean`, but only with no other round in the VM, else
+                    wait and check again within --lock-timeout), sync, then run
                     <cmd> as root in /srv/lab/<worktree>/src with
                     CARGO_TARGET_DIR=/srv/lab/<worktree>/target (kept: incremental);
                     one run at a time unless --shared (builds only, no namespaces).
@@ -602,16 +618,17 @@ impl Lab {
     /// the VM is held. A snapshot or reset would cut that round off.
     fn idle(&self) -> Result<(), String> {
         let host = self.path(HOST_LOCK);
-        let free = Command::new("flock")
-            .args(["-n", "-E", "75"])
-            .arg(&host)
-            .arg("true")
-            .status()
-            .map_err(|e| format!("flock: {e}"))?;
-        if free.code() == Some(75) && !held_by_ancestor(&host) {
+        if host_lock_held(&host) {
             return Err(format!(
                 "{} is held (a round the user runs by hand); try again when it ends, or --force",
                 host.display()
+            ));
+        }
+        let live = live_rounds(&own_round(), &host);
+        if !live.is_empty() {
+            return Err(format!(
+                "a `vm-lab run` is in the VM; try again when it ends, or --force\n{}",
+                live_list(&live)
             ));
         }
         if self.state()?.as_deref() == Some("running")
@@ -631,26 +648,173 @@ impl Lab {
 
     /// Before each `run`: root works, a handful of processes start, and
     /// there is room on the disk and in memory. Two tries, a few seconds
-    /// apart, so one busy moment does not trigger a reset.
-    fn healthy(&self) -> Result<(), String> {
-        let check = format!(
-            "sudo -n bash -c 'for i in 1 2 3 4 5; do /bin/true || exit 11; done; \
-             disk=$(df --output=avail -k {LAB_ROOT} | tail -1); \
-             mem=$(awk \"/MemAvailable/{{print \\$2}}\" /proc/meminfo); \
-             [ \"$disk\" -gt 2097152 ] || {{ echo \"disk: $((disk / 1024)) MiB free\" >&2; exit 12; }}; \
-             [ \"$mem\" -gt 1048576 ] || {{ echo \"memory: $((mem / 1024)) MiB available\" >&2; exit 13; }}'"
-        );
-        let mut last = String::new();
+    /// apart, so one busy moment does not count. `patient` (a round is
+    /// alive, the VM may be loaded): longer SSH timeouts, so a slow answer
+    /// is not taken for a dead VM.
+    fn check(&self, patient: bool) -> Health {
+        if let Err(e) = self.up() {
+            return Health::Unreachable(e);
+        }
+        let (connect_s, limit) = if patient {
+            (30, Duration::from_secs(180))
+        } else {
+            (10, Duration::from_secs(60))
+        };
+        let mut last = Health::Ok;
         for attempt in 0..2 {
             if attempt > 0 {
                 std::thread::sleep(Duration::from_secs(3));
             }
-            match self.ssh_output(&check) {
-                Ok(_) => return Ok(()),
-                Err(e) => last = e,
+            last = self.probe(connect_s, limit);
+            if last == Health::Ok {
+                break;
             }
         }
-        Err(last)
+        last
+    }
+
+    fn probe(&self, connect_s: u32, limit: Duration) -> Health {
+        let ip = match self.address() {
+            Ok(Some(ip)) => ip,
+            Ok(None) => return Health::Unreachable("no address yet".into()),
+            Err(e) => return Health::Unreachable(e),
+        };
+        let mut c = self.ssh_base_with(&ip, connect_s);
+        c.arg(format!("sudo -n bash -c {}", shell_quote(&health_script())));
+        match output_within(&mut c, limit) {
+            Err(e) => Health::Unreachable(e),
+            Ok(None) => Health::Unreachable(format!("no answer by SSH in {} s", limit.as_secs())),
+            Ok(Some(out)) => classify(
+                out.status.code(),
+                &String::from_utf8_lossy(&out.stdout),
+                &String::from_utf8_lossy(&out.stderr),
+            ),
+        }
+    }
+
+    /// Removes the build caches (`/srv/lab/<worktree>/target`) of the
+    /// worktrees no live round uses, least recently built first, until
+    /// `CLEAN_GOAL_MIB` are free. `keep`: worktree names left alone (the
+    /// live rounds' and this run's own). Sources stay: the next `run` of
+    /// that worktree syncs and rebuilds.
+    fn clean_disk(&self, keep: &[String]) -> Result<String, String> {
+        let mut cmd = format!(
+            "sudo -n bash -c {} clean {CLEAN_GOAL_MIB}",
+            shell_quote(&format!("root={LAB_ROOT}\n{CLEAN_SH}"))
+        );
+        for k in keep {
+            cmd.push(' ');
+            cmd.push_str(&shell_quote(k));
+        }
+        self.ssh_output(&cmd)
+    }
+
+    /// `vm/health.lock`, taken (blocking) for the health check of a `run`.
+    fn health_lock(&self) -> Result<std::fs::File, String> {
+        let path = self.path(HEALTH_LOCK);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                eprintln!("vm-lab: another `vm-lab run` is checking the VM; waiting for it");
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(format!("{}: {e}", path.display()));
+            }
+        }
+        file.lock()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(file)
+    }
+
+    /// The health check of `run`, with what follows from it (`verdict`):
+    /// clean the disk, reset a VM nobody is using, or wait while a round is
+    /// alive. `Ok` holds `vm/health.lock` (drop it once the round's ssh has
+    /// started) and says how long it waited.
+    fn ready(&self, timeout: Duration) -> Result<(std::fs::File, Duration), String> {
+        let started = Instant::now();
+        let own = own_round();
+        let own_dir = self.remote_dir()?;
+        let mut cleaned = false;
+        let mut reset_done = false;
+        let mut said_wait = false;
+        let mut last_live: Vec<String> = Vec::new();
+        loop {
+            let guard = self.health_lock()?;
+            let live = live_rounds(&own, &self.path(HOST_LOCK));
+            let who: Vec<String> = live.iter().map(|r| r.who.clone()).collect();
+            if who != last_live {
+                // A round ended (or came): its cache may be removable now.
+                cleaned = false;
+                last_live = who;
+            }
+            let health = self.check(!live.is_empty());
+            let situation = Situation {
+                health: &health,
+                live: !live.is_empty(),
+                cleaned,
+                reset_done,
+                out_of_time: started.elapsed() >= timeout,
+            };
+            match verdict(&situation) {
+                Verdict::Go => return Ok((guard, started.elapsed())),
+                Verdict::CleanDisk => {
+                    cleaned = true;
+                    let mut keep: Vec<String> = live.iter().filter_map(|r| r.name()).collect();
+                    keep.extend(dir_name(&own_dir));
+                    eprintln!(
+                        "vm-lab: {NAME}: {health}; removing the build caches of worktrees no round uses"
+                    );
+                    match self.clean_disk(&keep) {
+                        Ok(report) => eprint!("{report}"),
+                        Err(e) => eprintln!("vm-lab: disk cleanup failed: {e}"),
+                    }
+                }
+                Verdict::Reset => {
+                    reset_done = true;
+                    let base = self.base_snapshot()?;
+                    eprintln!(
+                        "vm-lab: {NAME} is unhealthy ({health}) and no round is alive; `reset` to `{base}`"
+                    );
+                    self.reset(base)?;
+                }
+                Verdict::Wait => {
+                    if !said_wait {
+                        said_wait = true;
+                        eprintln!(
+                            "vm-lab: {NAME} looks unhealthy ({health}), but a round is alive in it:\n{}\n\
+                             vm-lab: no reset (it would cut that round off); checking again every {} s \
+                             for up to {} (--lock-timeout)",
+                            live_list(&live),
+                            RECHECK_EVERY.as_secs(),
+                            human_secs(timeout.as_secs())
+                        );
+                    }
+                    drop(guard);
+                    let left = timeout.saturating_sub(started.elapsed());
+                    std::thread::sleep(RECHECK_EVERY.min(left).max(Duration::from_secs(1)));
+                }
+                Verdict::GiveUp if reset_done && live.is_empty() => {
+                    return Err(format!("{NAME} still unhealthy after reset: {health}"));
+                }
+                Verdict::GiveUp => {
+                    return Err(format!(
+                        "{NAME} is unhealthy ({health}) and still in use after {}:\n{}\n\
+                         Not reset: that would cut those rounds off. Run again when they end (the \
+                         reset is automatic then), raise --lock-timeout, or, only if those rounds \
+                         are stuck, `cargo xtask vm-lab reset --force`",
+                        human_secs(started.elapsed().as_secs()),
+                        live_list(&live)
+                    ));
+                }
+            }
+        }
     }
 
     fn status(&self) -> Result<(), String> {
@@ -740,6 +904,12 @@ impl Lab {
     }
 
     fn ssh_base(&self, ip: &str) -> Command {
+        self.ssh_base_with(ip, 5)
+    }
+
+    /// `connect_s`: ssh's `ConnectTimeout` (the first value given wins in
+    /// ssh, so it cannot be appended later).
+    fn ssh_base_with(&self, ip: &str, connect_s: u32) -> Command {
         let mut c = Command::new("ssh");
         c.args(["-F", "/dev/null", "-i"])
             .arg(self.path("id_ed25519"))
@@ -758,8 +928,6 @@ impl Lab {
                 "-o",
                 "BatchMode=yes",
                 "-o",
-                "ConnectTimeout=5",
-                "-o",
                 "ServerAliveInterval=15",
                 "-o",
                 "LogLevel=ERROR",
@@ -768,6 +936,8 @@ impl Lab {
                 "-o",
                 "ControlPersist=300",
             ])
+            .arg("-o")
+            .arg(format!("ConnectTimeout={connect_s}"))
             .arg("-o")
             .arg(format!("ControlPath={}/cm-%C", self.dir.display()))
             .arg(format!("{USER}@{ip}"));
@@ -1047,14 +1217,10 @@ impl Lab {
             return Err(format!("nothing to run\n{HELP}"));
         }
         let started = Instant::now();
-        // Unreachable counts as unhealthy too (sshd was among the victims).
-        if let Err(why) = self.up().and_then(|()| self.healthy()) {
-            let base = self.base_snapshot()?;
-            eprintln!("vm-lab: {NAME} is unhealthy ({why}); `reset` to `{base}`");
-            self.reset(base)?;
-            self.healthy()
-                .map_err(|e| format!("{NAME} still unhealthy after reset: {e}"))?;
-        }
+        // Unreachable counts as unhealthy too (sshd was among the victims),
+        // but nothing is reset under a live round (2026-11-13): see `verdict`.
+        let (health_lock, waited) = self.ready(Duration::from_secs(timeout))?;
+        let timeout = timeout.saturating_sub(waited.as_secs()).max(1);
         let dir = self.remote_dir()?;
         if sync {
             // The sync writes `<dir>/src` before the round waits for the
@@ -1091,13 +1257,16 @@ impl Lab {
         // `bash -c` (not a heredoc on stdin), so the command keeps a
         // terminal-less stdin of its own and `-t` is not needed. `env` puts
         // the round mark in the environment every process of it inherits.
-        let status = self
+        let mut child = self
             .ssh()?
             .args(["sudo", "env", &format!("{ROUND_VAR}={round}"), "bash", "-c"])
             .arg(shell_quote(&script))
             .stdin(Stdio::null())
-            .status()
+            .spawn()
             .map_err(|e| format!("ssh: {e}"))?;
+        // From here the round is visible to the others (`live_rounds`).
+        drop(health_lock);
+        let status = child.wait().map_err(|e| format!("ssh: {e}"))?;
         eprintln!(
             "vm-lab: round (sync + command) {:.1} s, {status}",
             started.elapsed().as_secs_f64()
@@ -1189,6 +1358,290 @@ impl Lab {
             Ok(())
         }
     }
+}
+
+/// What the health check of `run` found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Health {
+    Ok,
+    /// MiB free in `LAB_ROOT`, under `MIN_DISK_MIB`.
+    LowDisk(u64),
+    /// MiB of `MemAvailable`, under `MIN_MEM_MIB`.
+    LowMemory(u64),
+    /// Root or a new process fails (the 2026-10-25 shadow-stack breakage).
+    Broken(String),
+    /// No SSH answer in time (VM down, sshd dead, or very slow).
+    Unreachable(String),
+}
+
+impl std::fmt::Display for Health {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Health::Ok => write!(f, "healthy"),
+            Health::LowDisk(m) => {
+                write!(f, "disk: {m} MiB free in {LAB_ROOT}, under {MIN_DISK_MIB}")
+            }
+            Health::LowMemory(m) => write!(f, "memory: {m} MiB available, under {MIN_MEM_MIB}"),
+            Health::Broken(why) => write!(f, "{why}"),
+            Health::Unreachable(why) => write!(f, "unreachable: {why}"),
+        }
+    }
+}
+
+/// Root runs, five processes start, then one line `disk=<MiB> mem=<MiB>`.
+fn health_script() -> String {
+    format!(
+        "for i in 1 2 3 4 5; do /bin/true || exit 11; done; \
+         echo \"disk=$(df --output=avail -m {LAB_ROOT} | tail -1 | tr -d ' ') \
+         mem=$(awk '/MemAvailable/{{print int($2 / 1024)}}' /proc/meminfo)\""
+    )
+}
+
+/// The answer of `health_script` over ssh: exit code (`None`: killed by a
+/// signal), stdout, stderr. 255 is ssh's own failure.
+fn classify(code: Option<i32>, out: &str, err: &str) -> Health {
+    let err: String = err.trim().chars().take(300).collect();
+    match code {
+        Some(0) => {
+            let field = |k: &str| {
+                out.split_whitespace()
+                    .find_map(|w| w.strip_prefix(k)?.strip_prefix('='))
+                    .and_then(|v| v.parse::<u64>().ok())
+            };
+            match (field("disk"), field("mem")) {
+                (Some(d), _) if d < MIN_DISK_MIB => Health::LowDisk(d),
+                (Some(_), Some(m)) if m < MIN_MEM_MIB => Health::LowMemory(m),
+                (Some(_), Some(_)) => Health::Ok,
+                _ => Health::Broken(format!(
+                    "unexpected health answer: {:?}",
+                    out.trim().chars().take(200).collect::<String>()
+                )),
+            }
+        }
+        Some(255) => Health::Unreachable(if err.is_empty() {
+            "ssh failed".into()
+        } else {
+            err
+        }),
+        Some(c) => Health::Broken(format!("root or a new process failed (exit {c}): {err}")),
+        None => Health::Broken(format!("the check was killed by a signal: {err}")),
+    }
+}
+
+/// What `run` knows when it decides (`verdict`).
+struct Situation<'a> {
+    health: &'a Health,
+    /// Another round is in the VM (holds the lock, waits for it, or runs
+    /// `--shared`), or the user holds `vm/root.lock`.
+    live: bool,
+    /// The disk cleanup already ran since the set of live rounds last changed.
+    cleaned: bool,
+    /// This run already reset the VM.
+    reset_done: bool,
+    /// The `--lock-timeout` budget is spent.
+    out_of_time: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    /// Healthy: sync and queue for the lock.
+    Go,
+    /// Short of disk: remove the build caches no round uses, then check again.
+    CleanDisk,
+    /// Unhealthy and nobody else in the VM: back to the base snapshot.
+    Reset,
+    /// Unhealthy, but a round is alive: never reset under it (2026-11-13: a
+    /// reset killed two rounds midway, both exit 255). Check again later:
+    /// load and memory pass when it ends, a slow SSH answers.
+    Wait,
+    /// Out of time with a round still alive, or unhealthy after a reset.
+    GiveUp,
+}
+
+/// Reset or wait: the reset only when no round is alive.
+fn verdict(s: &Situation) -> Verdict {
+    if *s.health == Health::Ok {
+        return Verdict::Go;
+    }
+    if matches!(s.health, Health::LowDisk(_)) && !s.cleaned {
+        return Verdict::CleanDisk;
+    }
+    if s.live {
+        return if s.out_of_time {
+            Verdict::GiveUp
+        } else {
+            Verdict::Wait
+        };
+    }
+    if s.reset_done {
+        return Verdict::GiveUp;
+    }
+    Verdict::Reset
+}
+
+/// Removes `$root/<worktree>/target` of the worktrees not named after the
+/// goal, least recently built first, until `$1` MiB are free; one line per
+/// removal, then `vm-lab: <n> MiB free`.
+const CLEAN_SH: &str = r#"goal=$1; shift; keep=" $* "
+avail() { df --output=avail -m "$root" | tail -1 | tr -d ' '; }
+for d in "$root"/*/target; do
+  [ -d "$d" ] || continue
+  n=${d#"$root"/}; n=${n%/target}
+  case "$keep" in *" $n "*) continue ;; esac
+  t=$(find "$d" -maxdepth 2 -printf '%T@\n' 2>/dev/null | sort -n | tail -1)
+  echo "${t%.*} $d"
+done | sort -n | while read -r t d; do
+  [ "$(avail)" -ge "$goal" ] && break
+  mib=$(du -sm "$d" 2>/dev/null | cut -f1)
+  rm -rf "$d" && echo "vm-lab: removed $d (${mib:-?} MiB, last built $(( ($(date +%s) - ${t:-0}) / 60 )) min ago)"
+done
+echo "vm-lab: $(avail) MiB free in $root"
+"#;
+
+/// A round in the VM, seen from this host.
+#[derive(Debug, PartialEq, Eq)]
+struct LiveRound {
+    /// For messages: `/srv/lab/wt (host pid 123, round 123.456)`.
+    who: String,
+    /// `/srv/lab/<worktree>` (none for the user's `vm/root.lock`).
+    dir: Option<String>,
+}
+
+impl LiveRound {
+    /// The worktree name, what the disk cleanup must leave alone.
+    fn name(&self) -> Option<String> {
+        self.dir.as_deref().and_then(dir_name)
+    }
+}
+
+/// `/srv/lab/wt` → `wt`.
+fn dir_name(dir: &str) -> Option<String> {
+    dir.rsplit('/')
+        .next()
+        .filter(|n| !n.is_empty())
+        .map(str::to_owned)
+}
+
+/// The `ssh … sudo env COREROUTER_LAB_ROUND=<round> bash -c <script>` that
+/// `run` starts for its round: `(round, /srv/lab/<worktree>)`. The mux
+/// master renames itself (`ssh: <path> [mux]`) and rsync's ssh carries no
+/// round, so neither counts.
+fn round_of_ssh(args: &[String]) -> Option<(String, String)> {
+    let prog = args.first()?;
+    if prog.rsplit('/').next() != Some("ssh") {
+        return None;
+    }
+    let round = args
+        .iter()
+        .find_map(|a| a.strip_prefix(ROUND_VAR)?.strip_prefix('='))?;
+    let dir = args
+        .iter()
+        .find_map(|a| {
+            let (_, rest) = a.split_once("CARGO_TARGET_DIR=")?;
+            let path = rest.split_whitespace().next()?;
+            path.strip_suffix("/target").map(str::to_owned)
+        })
+        .unwrap_or_default();
+    Some((round.to_owned(), dir))
+}
+
+/// Rounds in the VM started by a live `vm-lab run` of this host (their ssh
+/// carries the round mark; `round_alive` rules out a reused pid), other
+/// than `own`; plus the user's hand-held `vm/root.lock`. Works with the VM
+/// unreachable: it only reads this host's `/proc`.
+fn live_rounds(own: &str, host_lock: &Path) -> Vec<LiveRound> {
+    let mut live = Vec::new();
+    if host_lock_held(host_lock) {
+        live.push(LiveRound {
+            who: format!("{} (a round the user runs by hand)", host_lock.display()),
+            dir: None,
+        });
+    }
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return live;
+    };
+    let mut seen = Vec::new();
+    for e in entries.flatten() {
+        let Ok(cmdline) = std::fs::read(e.path().join("cmdline")) else {
+            continue;
+        };
+        let args: Vec<String> = cmdline
+            .split(|b| *b == 0)
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        let Some((round, dir)) = round_of_ssh(&args) else {
+            continue;
+        };
+        if round == own || seen.contains(&round) || !round_alive(&round) {
+            continue;
+        }
+        let pid = round.split('.').next().unwrap_or("?");
+        let where_ = if dir.is_empty() { "?" } else { dir.as_str() };
+        live.push(LiveRound {
+            who: format!("{where_} (host pid {pid}, round {round})"),
+            dir: (!dir.is_empty()).then(|| dir.clone()),
+        });
+        seen.push(round);
+    }
+    live
+}
+
+fn live_list(live: &[LiveRound]) -> String {
+    live.iter()
+        .map(|r| format!("  {}", r.who))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `vm/root.lock` is held by someone other than an ancestor of this process.
+fn host_lock_held(host_lock: &Path) -> bool {
+    let held = Command::new("flock")
+        .args(["-n", "-E", "75"])
+        .arg(host_lock)
+        .arg("true")
+        .stdin(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.code() == Some(75));
+    held && !held_by_ancestor(host_lock)
+}
+
+/// `cmd`'s output, or `Ok(None)` when it does not end within `limit` (then
+/// it is killed). For short answers: the pipes are read after the exit.
+fn output_within(
+    cmd: &mut Command,
+    limit: Duration,
+) -> Result<Option<std::process::Output>, String> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{:?}: {e}", cmd.get_program()))?;
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        if let Some(st) = child.try_wait().map_err(|e| format!("wait: {e}"))? {
+            break st;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut o) = child.stdout.take() {
+        let _ = o.read_to_end(&mut stdout);
+    }
+    if let Some(mut e) = child.stderr.take() {
+        let _ = e.read_to_end(&mut stderr);
+    }
+    Ok(Some(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }))
 }
 
 /// A shell line printing the pids of live rounds whose command runs in
@@ -1590,7 +2043,7 @@ fn parse_spec(args: &[String]) -> Result<Spec, String> {
     let mut spec = Spec {
         cpus: 8,
         memory_mib: 16_384,
-        disk_gib: 20,
+        disk_gib: 40,
         wires: 1,
     };
     let mut it = args.iter();
@@ -1857,7 +2310,7 @@ pub(crate) fn unix_now() -> u64 {
 
 /// What `vm-lab run` leaves out of the copy of the worktree it sends to the
 /// VM (rsync patterns, anchored at the worktree's root). The VM's disk is
-/// 20 GiB: build trees never go there.
+/// small (20 GiB until 2026-11-13): build trees never go there.
 const SYNC_EXCLUDES: &[&str] = &[
     "--exclude=/target",
     "--exclude=/target-*",
@@ -2144,6 +2597,179 @@ mod tests {
         assert_eq!(human_secs(3720), "1h02m");
     }
 
+    fn every_situation() -> Vec<(Health, bool, bool, bool, bool)> {
+        let healths = [
+            Health::Ok,
+            Health::LowDisk(1500),
+            Health::LowMemory(700),
+            Health::Broken("exit 11".into()),
+            Health::Unreachable("timeout".into()),
+        ];
+        let mut all = Vec::new();
+        for h in healths {
+            for bits in 0..16u8 {
+                all.push((
+                    h.clone(),
+                    bits & 1 != 0,
+                    bits & 2 != 0,
+                    bits & 4 != 0,
+                    bits & 8 != 0,
+                ));
+            }
+        }
+        all
+    }
+
+    fn decide(h: &Health, live: bool, cleaned: bool, reset_done: bool, late: bool) -> Verdict {
+        verdict(&Situation {
+            health: h,
+            live,
+            cleaned,
+            reset_done,
+            out_of_time: late,
+        })
+    }
+
+    /// 2026-11-13: a `run` found the disk short while another round was
+    /// building and reset the VM under it (both rounds exit 255).
+    #[test]
+    fn a_live_round_is_never_reset() {
+        for (h, live, cleaned, reset_done, late) in every_situation() {
+            let v = decide(&h, live, cleaned, reset_done, late);
+            if live {
+                assert_ne!(v, Verdict::Reset, "{h:?} cleaned={cleaned} late={late}");
+            }
+            if h == Health::Ok {
+                assert_eq!(v, Verdict::Go);
+            }
+        }
+    }
+
+    #[test]
+    fn unhealthy_under_a_live_round_waits_then_gives_up() {
+        for h in [
+            Health::LowMemory(700),
+            Health::Broken("exit 11".into()),
+            Health::Unreachable("no answer by SSH in 180 s".into()),
+            Health::LowDisk(1500),
+        ] {
+            assert_eq!(decide(&h, true, true, false, false), Verdict::Wait, "{h:?}");
+            assert_eq!(
+                decide(&h, true, true, false, true),
+                Verdict::GiveUp,
+                "{h:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unhealthy_and_alone_resets_once() {
+        for h in [
+            Health::LowMemory(700),
+            Health::Broken("exit 11".into()),
+            Health::Unreachable("x".into()),
+        ] {
+            assert_eq!(
+                decide(&h, false, false, false, false),
+                Verdict::Reset,
+                "{h:?}"
+            );
+            assert_eq!(
+                decide(&h, false, false, true, false),
+                Verdict::GiveUp,
+                "{h:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn short_disk_cleans_before_anything_else() {
+        let low = Health::LowDisk(1500);
+        for live in [false, true] {
+            assert_eq!(decide(&low, live, false, false, false), Verdict::CleanDisk);
+        }
+        // Cleaned and still short: reset alone, wait under a round.
+        assert_eq!(decide(&low, false, true, false, false), Verdict::Reset);
+        assert_eq!(decide(&low, true, true, false, false), Verdict::Wait);
+    }
+
+    #[test]
+    fn health_answers_are_classified() {
+        assert_eq!(classify(Some(0), "disk=9000 mem=12000\n", ""), Health::Ok);
+        assert_eq!(
+            classify(Some(0), "disk=181 mem=12000", ""),
+            Health::LowDisk(181)
+        );
+        assert_eq!(
+            classify(Some(0), "disk=9000 mem=512", ""),
+            Health::LowMemory(512)
+        );
+        assert!(matches!(classify(Some(0), "", ""), Health::Broken(_)));
+        assert!(matches!(
+            classify(Some(255), "", "Connection timed out during banner exchange"),
+            Health::Unreachable(w) if w.contains("banner")
+        ));
+        assert!(matches!(classify(Some(11), "", ""), Health::Broken(w) if w.contains("exit 11")));
+        assert!(
+            matches!(classify(Some(1), "", "sudo: a password is required"), Health::Broken(w) if w.contains("sudo"))
+        );
+        assert!(matches!(classify(None, "", ""), Health::Broken(_)));
+        assert!(Health::LowDisk(181).to_string().contains("181 MiB free"));
+    }
+
+    #[test]
+    fn health_script_answers_on_this_machine() {
+        let dir = std::env::temp_dir();
+        let script = health_script().replace(LAB_ROOT, &dir.to_string_lossy());
+        let out = Command::new("bash").args(["-c", &script]).output().unwrap();
+        let h = classify(
+            out.status.code(),
+            &String::from_utf8_lossy(&out.stdout),
+            &String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(
+            matches!(h, Health::Ok | Health::LowDisk(_) | Health::LowMemory(_)),
+            "{h:?}"
+        );
+    }
+
+    #[test]
+    fn rounds_are_read_from_their_ssh_command_line() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let round = a(&[
+            "ssh",
+            "-F",
+            "/dev/null",
+            "lab@192.168.122.46",
+            "sudo",
+            "env",
+            "COREROUTER_LAB_ROUND=1194199.9140753",
+            "bash",
+            "-c",
+            "'if [ ! -r x ]; then exit 1; fi . x export CARGO_TARGET_DIR=/srv/lab/img-443646f1/target CARGO_TERM_COLOR=always'",
+        ]);
+        assert_eq!(
+            round_of_ssh(&round),
+            Some(("1194199.9140753".into(), "/srv/lab/img-443646f1".into()))
+        );
+        // The ControlPersist master, rsync's ssh, and the shell that started
+        // `vm-lab run` (its text mentions the variable) are not rounds.
+        let mux = a(&["ssh: /home/oem/code/CoreRouter/vm/cm-fc97 [mux]"]);
+        let rsync = a(&[
+            "ssh",
+            "-F",
+            "/dev/null",
+            "lab@192.168.122.46",
+            "rsync",
+            "--server",
+        ]);
+        let shell = a(&["/bin/bash", "-c", "env COREROUTER_LAB_ROUND=1.2 ssh x"]);
+        for other in [mux, rsync, shell] {
+            assert_eq!(round_of_ssh(&other), None, "{other:?}");
+        }
+        assert_eq!(dir_name("/srv/lab/wt").as_deref(), Some("wt"));
+    }
+
     /// The real script, run by bash on this machine with a lock file in a
     /// temporary folder (what the VM does as root, minus the root).
     #[cfg(target_os = "linux")]
@@ -2197,6 +2823,105 @@ mod tests {
                 .filter_map(|l| l.trim().strip_prefix("pid "))
                 .filter_map(|l| l.split_whitespace().next()?.parse().ok())
                 .collect()
+        }
+
+        /// `CLEAN_SH` on a fake `/srv/lab`: the oldest caches go first, the
+        /// kept ones and the sources stay.
+        #[test]
+        fn disk_cleanup_spares_live_rounds_and_sources() {
+            let root = scratch("clean");
+            for (name, age_min) in [("old", 300), ("mid", 100), ("live", 500), ("own", 400)] {
+                let t = root.join(name).join("target/debug");
+                std::fs::create_dir_all(&t).unwrap();
+                std::fs::create_dir_all(root.join(name).join("src")).unwrap();
+                std::fs::write(t.join("bin"), b"x").unwrap();
+                let when = format!("@{}", unix_now() - age_min * 60);
+                for p in [t.join("bin"), t.clone(), root.join(name).join("target")] {
+                    assert!(
+                        Command::new("touch")
+                            .arg("-d")
+                            .arg(&when)
+                            .arg(&p)
+                            .status()
+                            .unwrap()
+                            .success()
+                    );
+                }
+            }
+            let run = |goal: &str| {
+                let out = Command::new("bash")
+                    .arg("-c")
+                    .arg(format!("root={}\n{CLEAN_SH}", root.display()))
+                    .args(["clean", goal, "live", "own"])
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "{out:?}");
+                String::from_utf8_lossy(&out.stdout).into_owned()
+            };
+            // Room enough: nothing goes.
+            let out = run("0");
+            assert!(!out.contains("removed"), "{out}");
+            assert!(out.contains("MiB free in"), "{out}");
+            // Never enough: every cache but the kept ones, oldest first.
+            let out = run("999999999");
+            let removed: Vec<&str> = out.lines().filter(|l| l.contains("removed")).collect();
+            assert_eq!(removed.len(), 2, "{out}");
+            assert!(removed[0].contains("/old/target"), "{out}");
+            assert!(removed[1].contains("/mid/target"), "{out}");
+            for name in ["old", "mid"] {
+                assert!(!root.join(name).join("target").exists());
+                assert!(root.join(name).join("src").exists());
+            }
+            for name in ["live", "own"] {
+                assert!(root.join(name).join("target/debug/bin").exists());
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// A process shaped like a round's ssh (bash renamed `ssh`) whose
+        /// round mark is this test's own, live, process.
+        #[test]
+        fn live_rounds_finds_a_round_ssh_on_this_host() {
+            if !have_tools() {
+                eprintln!("skip: no bash/flock");
+                return;
+            }
+            let d = scratch("live");
+            let ssh = d.join("ssh");
+            let bash = Command::new("bash")
+                .args(["-c", "command -v bash"])
+                .output()
+                .unwrap();
+            std::os::unix::fs::symlink(String::from_utf8_lossy(&bash.stdout).trim(), &ssh).unwrap();
+            let me = own_round();
+            let mut fake = Command::new(&ssh)
+                // Two commands: a single one would be exec'd, losing the argv.
+                .args(["-c", "sleep 30; true", "x"])
+                .arg(format!("{ROUND_VAR}={me}"))
+                .arg("export CARGO_TARGET_DIR=/srv/lab/fake-wt/target CARGO_TERM_COLOR=always")
+                .spawn()
+                .unwrap();
+            let host_lock = d.join("root.lock");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut found = Vec::new();
+            while Instant::now() < deadline {
+                found = live_rounds("someone-else", &host_lock);
+                if found.iter().any(|r| r.name().as_deref() == Some("fake-wt")) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // Its own round is never "another" round.
+            let own = live_rounds(&me, &host_lock);
+            let _ = fake.kill();
+            let _ = fake.wait();
+            let _ = std::fs::remove_dir_all(&d);
+            let ours = found
+                .iter()
+                .find(|r| r.name().as_deref() == Some("fake-wt"));
+            let ours = ours.unwrap_or_else(|| panic!("not found: {found:?}"));
+            assert!(ours.who.contains(&format!("round {me}")), "{ours:?}");
+            assert!(!own.iter().any(|r| r.name().as_deref() == Some("fake-wt")));
         }
 
         #[test]
