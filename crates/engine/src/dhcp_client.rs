@@ -451,6 +451,8 @@ impl Session {
         self.pppoe_client_service(now_ms);
         // And the Wi-Fi radios (G1.30).
         self.wifi_service(now_ms);
+        // And the WireGuard interfaces (G1.31): retries and repairs.
+        self.wireguard_service(now_ms);
     }
 
     /// Apply what a state machine asked for (bind, unbind, log).

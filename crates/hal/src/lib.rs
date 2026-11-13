@@ -46,6 +46,7 @@ pub mod virt;
 pub mod wifi;
 pub mod wifi_ap;
 pub mod wifi_monitor;
+pub mod wireguard;
 pub mod xdp;
 pub mod xdp_nat;
 
@@ -453,6 +454,37 @@ pub trait Hal: Send {
     ) -> Result<Box<dyn pppoe_client::PppoeClientPort>, HalError> {
         Err(HalError::Unsupported(format!(
             "{} has no PPPoE client transport (asked for '{client}' on '{uplink}')",
+            self.describe()
+        )))
+    }
+
+    /// G1.31: make WireGuard link `name` (created by [`apply`](Self::apply))
+    /// hold `dev`: its key, port and peers. Incremental: only what differs
+    /// from what the link holds changes, so the sessions of the other peers
+    /// stay up. `public`: the public key of `dev.private_key`.
+    fn wireguard_set(
+        &mut self,
+        name: &IfName,
+        dev: &wireguard::WgDevice,
+        public: &wireguard::Key,
+    ) -> Result<(), HalError> {
+        let _ = (dev, public);
+        Err(HalError::Unsupported(format!(
+            "{} has no WireGuard (asked for '{name}')",
+            self.describe()
+        )))
+    }
+
+    /// G1.31: what WireGuard link `name` holds and its peers' handshakes and
+    /// counters (`wg show`). `now_unix`: for a backend that simulates time.
+    fn wireguard_status(
+        &mut self,
+        name: &IfName,
+        now_unix: u64,
+    ) -> Result<wireguard::WgStatus, HalError> {
+        let _ = now_unix;
+        Err(HalError::Unsupported(format!(
+            "{} has no WireGuard (asked for '{name}')",
             self.describe()
         )))
     }

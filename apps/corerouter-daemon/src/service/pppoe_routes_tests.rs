@@ -70,10 +70,10 @@ fn radius_lab(replies: Vec<(String, Vec<Attribute>)>, xdp: bool) -> (Lab, Arc<Ro
     s.ppp.aaa.use_radius = true;
     s.aaa = Some(aaa.clone());
     let mut lab = Lab::new(n, s, |i| (format!("r{i}"), "x".into()));
-    for i in 0..n {
-        let mut cfg = lab.clients[i].config().clone();
+    for (i, client) in lab.clients.iter_mut().enumerate().take(n) {
+        let mut cfg = client.config().clone();
         cfg.auth = corerouter_proto_pppoe::layers::AuthSet::new(&[corerouter_proto_pppoe::lcp::AuthProto::Pap]);
-        lab.clients[i] = Client::new(cfg, [i as u8 + 9; 32]);
+        *client = Client::new(cfg, [i as u8 + 9; 32]);
     }
     lab.bng.xdp = xdp;
     (lab, aaa)

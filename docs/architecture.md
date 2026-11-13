@@ -1541,6 +1541,50 @@ respostas/s, ~0,004 % de um núcleo.
 **Revisar se:** o filtro BPF por pacote IP nas interfaces MPLS aparecer num perfil do caminho de
 dados (passar o respondedor para o XDP da G3.5f).
 
+### WireGuard: caminho de dados no kernel, config por generic netlink (G1.31)
+
+**Comparado** (`docs/wireguard.md`, "Medição"):
+
+- **A:** o módulo do kernel (`drivers/net/wireguard`), já na imagem (`CONFIG_WIREGUARD=y`).
+- **C1:** BoringTun, WireGuard em Rust em espaço de usuário, sobre TUN.
+- **C2:** wireguard-go, com os lotes GSO/GRO que a Tailscale pôs nele em 2022–23.
+- Para configurar o kernel: a ferramenta `wg` (processo e texto) ou generic netlink próprio,
+  sobre o `genl.rs` que o ethtool, o devlink e o nl80211 já usam. **Ficou o netlink próprio.**
+
+**Números** (bare metal, Zen 5, 32 threads, kernel 7.0, encaminhando cliente → A → túnel → B →
+servidor em namespaces, **medido** em 2026-11-12):
+
+| | A: kernel | C1: BoringTun | C2: wireguard-go |
+|---|---|---|---|
+| TCP, 1 fluxo | 7,3 Gb/s | 2,6 Gb/s | 16,8 Gb/s |
+| UDP 64 B, 4 fluxos | 631 kpps | 389 kpps | 338 kpps |
+| UDP 1400 B, 1 fluxo | 444 kpps, 2 % de perda | 410 kpps, 55 % | 316 kpps, 63 % |
+
+- O kernel ganha em pacotes por segundo (1,6–1,9×) e quase não descarta. É isso que limita um
+  roteador (pacote pequeno, muitos assinantes).
+- O wireguard-go ganha em TCP de massa num túnel (2,3×), pelos lotes: o kernel corta o
+  super-pacote antes de cifrar (`device.c`, `skb_gso_segment`).
+- Na VM do laboratório o kernel cai para 1,5 Gb/s. O despacho em rodízio por núcleo
+  (`queueing.h`, `wg_cpumask_next_online` + `queue_work_on`) vira uma IPI por lote, e na VM cada
+  IPI sai para o hipervisor. A cifra usa AVX-512 e é ~5 % do perfil.
+- Aplicar pelo netlink: 1 par em 3–6 ms com até 50 000 existentes; dump de 50 000 em 63 ms.
+
+**Por quê:**
+
+- pps e perda;
+- nenhum processo a supervisionar, nem runtime Go (+5 MB), nem cópia pela TUN;
+- a cifra do kernel é madura e já está na imagem.
+
+Escrever o WireGuard em Rust (BoringTun, GotaTun ou próprio) perde no medido e aumenta o risco de
+cripto. As chaves vêm seladas do engine, que as abre e entrega ao `Hal::wireguard_set`. O
+`hal-linux` manda só a diferença por par: mudar um par não derruba as sessões dos outros.
+
+**Revisar se:**
+
+- o WireGuard do kernel ganhar GSO/GRO;
+- um CoreRouter em VM (como o CHR) precisar de vazão TCP alta num túnel: medir a imagem em
+  QEMU/Proxmox e reavaliar o wireguard-go nesse caso.
+
 ## Histórico de revisão
 
 - 2026-10-21 — versão inicial (esqueleto v0.1.0).

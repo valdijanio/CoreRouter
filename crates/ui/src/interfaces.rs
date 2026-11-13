@@ -1055,6 +1055,8 @@ fn type_icon(kind: &str) -> &'static str {
         "vrf" => crate::icons::FOLDERS,
         "pppoe-out" => crate::icons::LAPTOP,
         "wifi" => crate::icons::WIFI_HIGH,
+        // G1.31: an encrypted tunnel.
+        "wireguard" => crate::icons::LOCK_SIMPLE,
         _ => crate::icons::SQUARES_FOUR,
     }
 }

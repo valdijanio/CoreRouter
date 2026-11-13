@@ -17,6 +17,8 @@ egui_plot.workspace = true
 serde_json.workspace = true
 # G6.4a: the sniffer's capture file arrives base64-encoded.
 base64.workspace = true
+# G1.31b: the WireGuard client config as a QR code.
+qrcode.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

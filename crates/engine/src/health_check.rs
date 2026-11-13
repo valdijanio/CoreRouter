@@ -267,6 +267,10 @@ pub struct Inputs {
     /// errors of no known module, the memory taken out of use (KiB).
     /// `None`: no EDAC driver and nothing taken out (no ECC: no check).
     pub memory: Option<MemoryInput>,
+    /// G1.31b: WireGuard peers the router tries that have not answered
+    /// for `NO_HANDSHAKE_ALERT_SECS` or more: (peer, interface, seconds,
+    /// had a handshake once). A peer that only waits or idles is not here.
+    pub wireguard_stale: Vec<(String, String, u64, bool)>,
     /// Whether any reading exists at all.
     pub readings: bool,
 }
@@ -835,6 +839,27 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
             reason: format!("interface(s) da configuração sem a placa nesta máquina (flag I): {list}; o resto da configuração está aplicado e a delas volta sozinha quando a placa voltar"),
             action: Some("Confira o cabo/adaptador USB ou a placa; se ela saiu de vez, tire a configuração dela (ou troque a interface dos itens que a usam).".into()) });
     }
+    // G1.31b: a WireGuard peer the router keeps calling without an answer.
+    if !i.wireguard_stale.is_empty() {
+        let list = i
+            .wireguard_stale
+            .iter()
+            .take(5)
+            .map(|(p, w, secs, once)| {
+                let min = secs / 60;
+                if *once {
+                    format!("{p} ({w}) sem handshake há {min} min")
+                } else {
+                    format!("{p} ({w}) nunca respondeu, tentando há {min} min")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        out.push(Check { key: "wireguard.handshake", name: "WireGuard peers", severity: Severity::Warning,
+            value: Some(i.wireguard_stale.len().to_string()),
+            reason: format!("o roteador chama e o par não responde: {list}"),
+            action: Some("Confira as chaves públicas dos dois lados e se o UDP chega ao par (firewall dele, NAT no caminho); em Interfaces › WireGuard › Peers a linha do par diz o que falta. Par que só espera ou fica ocioso não entra aqui.".into()) });
+    }
     // G1.6ja: a card the kernel could not bring up in full.
     if let Some(n) = &i.nic_hardware {
         let (key, name) = ("interface.hardware", "Network card drivers");
@@ -1208,6 +1233,7 @@ impl Session {
             .collect();
         i.usb_watchdog = self.usb_watchdog_health();
         i.absent_ports = self.invalid_interfaces(&live).into_keys().map(|n| n.to_string()).collect();
+        i.wireguard_stale = self.wireguard_stale();
         i.nic_hardware = self.nic_health();
         i.boot_apply = self.boot_failures().into_iter().map(|f| (f.label(), f.error)).collect();
         i.bgp_no_eor = self.routing_status().map(|st| {
@@ -1341,6 +1367,7 @@ mod tests {
             usb: Vec::new(),
             usb_watchdog: Vec::new(),
             absent_ports: Vec::new(),
+            wireguard_stale: Vec::new(),
             boot_apply: Vec::new(),
             crash: None,
             memory: None,
@@ -1436,6 +1463,18 @@ mod tests {
         assert!(c.reason.contains("firewall: nft refused rule 3"), "{}", c.reason);
         assert!(c.reason.contains("gerência"), "{}", c.reason);
         assert!(c.action.is_some());
+    }
+
+    #[test]
+    fn a_wireguard_peer_without_answer_warns() {
+        assert!(evaluate(&healthy()).iter().all(|c| c.key != "wireguard.handshake"));
+        let mut i = healthy();
+        i.wireguard_stale = vec![("filial".into(), "wg0".into(), 420, true), ("loja".into(), "wg0".into(), 360, false)];
+        let checks = evaluate(&i);
+        let c = checks.iter().find(|c| c.key == "wireguard.handshake").unwrap();
+        assert_eq!(c.severity, Severity::Warning);
+        assert!(c.reason.contains("filial (wg0) sem handshake há 7 min"), "{}", c.reason);
+        assert!(c.reason.contains("loja (wg0) nunca respondeu, tentando há 6 min"), "{}", c.reason);
     }
 
     #[test]

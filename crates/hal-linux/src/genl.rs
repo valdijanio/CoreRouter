@@ -216,6 +216,21 @@ impl Msg {
         self.put(kind, &v.to_ne_bytes())
     }
 
+    /// G1.31 (WireGuard's port and keepalive).
+    pub fn u16(&mut self, kind: u16, v: u16) -> &mut Self {
+        self.put(kind, &v.to_ne_bytes())
+    }
+
+    /// Raw bytes (G1.31: keys, `sockaddr`, an address).
+    pub fn bytes(&mut self, kind: u16, data: &[u8]) -> &mut Self {
+        self.put(kind, data)
+    }
+
+    /// Bytes so far (G1.31: to split a long request in several).
+    pub fn size(&self) -> usize {
+        self.buf.len()
+    }
+
     pub fn flag(&mut self, kind: u16) -> &mut Self {
         self.put(kind, &[])
     }
@@ -388,7 +403,11 @@ mod io {
         }
 
         /// Send `req` and collect the data messages until the ACK.
-        pub fn call(&mut self, req: Vec<u8>, seq: u32) -> Result<Vec<(u8, Vec<u8>)>, GenlError> {
+        pub fn call(
+            &mut self,
+            req: impl AsRef<[u8]>,
+            seq: u32,
+        ) -> Result<Vec<(u8, Vec<u8>)>, GenlError> {
             self.call_up_to(req, seq, MAX_REPLIES)
         }
 
@@ -396,12 +415,12 @@ mod io {
         /// split dump of a radio is one message per channel).
         pub fn call_up_to(
             &mut self,
-            req: Vec<u8>,
+            req: impl AsRef<[u8]>,
             seq: u32,
             max: usize,
         ) -> Result<Vec<(u8, Vec<u8>)>, GenlError> {
             self.sock
-                .send(&req, 0)
+                .send(req.as_ref(), 0)
                 .map_err(|e| GenlError::Io(format!("netlink send: {e}")))?;
             let mut out = Vec::new();
             // One deadline for the whole answer: unrelated notifications

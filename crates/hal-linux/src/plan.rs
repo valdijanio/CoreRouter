@@ -92,6 +92,10 @@ pub enum LinkSpec {
     PppoeOut {
         peer: String,
     },
+    /// G1.31: a kernel WireGuard link. Keys, port and peers are not part of
+    /// the spec (changing a peer must never recreate the link): the engine
+    /// hands them to `Hal::wireguard_set` after the apply.
+    Wireguard,
 }
 
 impl LinkSpec {
@@ -127,6 +131,7 @@ impl LinkSpec {
             }),
             InterfaceKind::Bridge => Some(Self::Bridge),
             InterfaceKind::Loopback => Some(Self::Dummy),
+            InterfaceKind::Wireguard(_) => Some(Self::Wireguard),
             InterfaceKind::Vrf { table } => Some(Self::Vrf { table: *table }),
             InterfaceKind::Bonding {
                 mode,
@@ -155,6 +160,7 @@ impl LinkSpec {
             Self::Vrf { .. } => "vrf",
             Self::Bond { .. } => "bond",
             Self::PppoeOut { .. } => "veth",
+            Self::Wireguard => "wireguard",
         }
     }
 }
@@ -177,6 +183,7 @@ impl fmt::Display for LinkSpec {
             Self::Vrf { table } => write!(f, "vrf (table {table})"),
             Self::Bond { mode, .. } => write!(f, "bonding ({mode})"),
             Self::PppoeOut { peer } => write!(f, "pppoe-out (veth, relay end '{peer}')"),
+            Self::Wireguard => f.write_str("wireguard"),
         }
     }
 }
