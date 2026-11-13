@@ -459,7 +459,8 @@ dut_routes() {
 	if [ $DUT = local ]; then
 		vty 'show ip route summary json' | jq '[.routes[]? | select(.type == "ospf") | .fib] | add // 0'
 	else
-		cr routing.ospf.route.list "{\"instance\":\"$INSTANCE\"}" | jq '.rows | length'
+		# A page of rows (G3.4n): the total counts them all.
+		cr routing.ospf.route.list "{\"instance\":\"$INSTANCE\",\"limit\":1}" | jq '.total // (.rows | length)'
 	fi
 }
 dut_neighbors_full() {
