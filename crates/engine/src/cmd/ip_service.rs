@@ -14,10 +14,10 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "ip.service.print", "IP Services", [], None,
-        "{} → [{name, enabled, disabled, address, port, available_from, status: stopped|listening|error, listening, last_error, refused, requests?, this_session: bool (this connection comes through it)}]",
+        "{} → [{name, enabled, disabled, address, port, available_from, certificate? (www-ssl), status: stopped|listening|error, listening, last_error, refused, requests?, this_session: bool (this connection comes through it)}]",
         always, print),
     cmd!(query "ip.service.check", "Check IP Service", [], None,
-        "{id?: string (www-ssl, www or metrics), enabled?: bool, address?: string, port?: string, available_from?: string (comma-separated; empty is everyone)} → {computed: [{label, value}], checks: [{level, check, message, param?}], commands: [{command, params}], risk?}",
+        "{id?: string (www-ssl, www or metrics), enabled?: bool, address?: string, port?: string, available_from?: string (comma-separated; empty is everyone), certificate?: string (www-ssl: a /certificate or none)} → {computed: [{label, value}], checks: [{level, check, message, param?}], commands: [{command, params}], risk?}",
         always, check),
 ];
 
@@ -75,6 +75,9 @@ fn typed(p: &Value) -> std::result::Result<Value, Value> {
     };
     out.insert("port".into(), json!(port));
     out.insert("available_from".into(), json!(text("available_from")));
+    if p.get("certificate").is_some() {
+        out.insert("certificate".into(), json!(text("certificate")));
+    }
     Ok(Value::Object(out))
 }
 
@@ -93,9 +96,10 @@ fn check(s: &mut Session, p: &Value) -> Result<Value> {
     let cand = &s.store().candidate().system;
     let before = cand.web.www_ssl.clone();
     let (mut web, mut metrics) = (cand.web.clone(), cand.metrics.clone());
+    let certs = cand.certificates.clone();
     let (now, was) = match name {
-        "www-ssl" => (web_service::apply(&mut web, &params, Row::Ssl), get(s, name)?),
-        "www" => (web_service::apply(&mut web, &params, Row::Plain), get(s, name)?),
+        "www-ssl" => (web_service::apply(&mut web, &certs, &params, Row::Ssl), get(s, name)?),
+        "www" => (web_service::apply(&mut web, &certs, &params, Row::Plain), get(s, name)?),
         _ => (metrics_service::apply(&mut metrics, &params), get(s, name)?),
     };
     let now = match now {
@@ -111,7 +115,7 @@ fn check(s: &mut Session, p: &Value) -> Result<Value> {
     }
     // Only what changes goes out (`set` takes each key on its own).
     let mut changed = Map::new();
-    for key in ["enabled", "address", "port", "available_from"] {
+    for key in ["enabled", "address", "port", "available_from", "certificate"] {
         if let Some(v) = now.get(key).filter(|v| was.get(key) != Some(*v)) {
             changed.insert(key.into(), v.clone());
         }
