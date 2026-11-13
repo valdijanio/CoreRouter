@@ -388,3 +388,13 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-11-12 — G1.6zy feito (erros de memória: controladores e política)
 - 2026-11-12 — G3.4n criada e feita (custo do OSPF do nosso lado com escala); G3.4o e G3.4p criadas
 - 2026-11-12 — G4.8g feito no QEMU (temperatura dos pentes de memória)
+- 2026-11-13 — G1.31 criada (interfaces WireGuard; escopo escolhido pelo usuário: janela opção A, 10 extras, rotas pelo modal do par) e PR 1 (motor) feito
+- 2026-11-13 — G1.31a feito (janela Interfaces › WireGuard, opção A do mockup)
+- 2026-11-13 — G1.31b feito (extras do WireGuard: os 10 extras e a opção 2 de rotas)
+- 2026-11-13 — G1.31d feito (clamp de MSS como ação de firewall)
+- 2026-11-13 — G1.6zs feito (`/certificate` e `www-ssl certificate=`); G1.6zu e G1.6zv criados
+- 2026-11-13 — G4.1h redefinida e feita (abas Overview, Upstreams e Cache; contadores por thread)
+- 2026-11-13 — G4.1za feita (aba Names da DNS Statistics; Clients na G4.1zb, no mesmo PR)
+- 2026-11-13 — G4.1zb feita (aba Clients da DNS Statistics, junto com a G4.1za)
+- 2026-11-13 — G4.1zc feita (contadores do encaminhador DNS no `/metrics`)
+- 2026-11-13 — G4.1ze feita (o encaminhador envia o EDE)

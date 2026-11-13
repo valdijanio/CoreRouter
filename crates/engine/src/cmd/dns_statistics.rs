@@ -422,6 +422,57 @@ fn render(snap: &Snapshot) -> Value {
     })
 }
 
+/// G4.1zc: the forwarder as `system.metrics` gives it to `/metrics`:
+/// what it counted (since the daemon started or the last
+/// `ip.dns.statistics.reset`: Prometheus reads a counter going down as a
+/// reset), the time to answer as cumulative buckets with their sum, the
+/// queries in flight, each upstream as the resolver counts it (since the
+/// daemon started) and the cache now. `null` without a forwarder (the
+/// virtual lab).
+pub(super) fn metrics(s: &Session) -> Value {
+    let Some((st, _)) = s.dns_statistics() else {
+        return Value::Null;
+    };
+    let c = st.totals();
+    let backend = s.dns_backend();
+    let mut running = 0u64;
+    let mut buckets: Vec<Value> = Vec::with_capacity(c.latency.0.len());
+    for (i, n) in c.latency.0.iter().enumerate() {
+        running = running.saturating_add(*n);
+        buckets.push(json!([EDGES_US.get(i), running]));
+    }
+    let upstreams: Vec<Value> = backend
+        .as_ref()
+        .map(|b| b.server_stats())
+        .unwrap_or_default()
+        .iter()
+        .map(|(ip, u)| {
+            json!({"server": ip, "via": u.via.as_str(), "answers": u.answers, "failures": u.failures,
+                "timeouts": u.timeouts, "servfails": u.servfails, "truncated": u.truncated,
+                "srtt_ms": u.srtt_ms, "down": u.down_until_ms > 0})
+        })
+        .collect();
+    let cache = backend.as_ref().and_then(|b| b.cache_stats()).map_or(Value::Null, |k| {
+        json!({"entries": k.entries, "used_bytes": k.used_bytes, "max_bytes": k.budget_bytes,
+            "evicted": k.evicted, "expired": k.expired})
+    });
+    json!({
+        "answered": c.answered,
+        "rcodes": c.rcodes,
+        "transport": {"udp4": c.udp4, "udp6": c.udp6, "tcp4": c.tcp4, "tcp6": c.tcp6},
+        "truncated": c.truncated,
+        "malformed": c.malformed,
+        "socket_drops": c.socket_drops,
+        "ede": c.ede.iter().map(|(code, n)| json!({"code": code, "name": ede_name(*code).unwrap_or("other"), "replies": n})).collect::<Vec<_>>(),
+        "latency_us": {"buckets": buckets, "sum": c.latency_sum_us, "count": c.latency.total()},
+        "in_flight": c.in_flight,
+        "in_flight_peak": c.in_flight_peak,
+        "max_concurrent_queries": s.store().running().ip.dns.max_concurrent_queries,
+        "upstreams": upstreams,
+        "cache": cache,
+    })
+}
+
 fn reset(s: &mut Session, _: &Value) -> Result<Value> {
     Ok(json!({"reset": s.dns_statistics_reset()}))
 }
@@ -544,6 +595,32 @@ mod tests {
         s.execute("ip.dns.statistics.reset", &json!({})).unwrap();
         let out = s.execute("ip.dns.statistics.print", &json!({})).unwrap();
         assert_eq!((out["names"].clone(), out["failing_domains"].clone()), (json!([]), json!([])));
+    }
+
+    #[test]
+    fn metrics_of_the_forwarder() {
+        let mut s = Session::virtual_lab();
+        assert_eq!(s.execute("system.metrics", &json!({})).unwrap()["dns"], Value::Null, "no daemon");
+        let f = wired(&mut s);
+        send(&f, [192, 168, 88, 10], "nas.lan.", A);
+        send(&f, [203, 0, 113, 9], "nas.lan.", A);
+        f.statistics().answered_in(300);
+        f.statistics().answered_in(20_000);
+        let m = s.execute("system.metrics", &json!({})).unwrap();
+        let d = &m["dns"];
+        assert_eq!(d["answered"]["static"], 1);
+        assert_eq!(d["answered"]["refused"], 1);
+        assert_eq!(d["rcodes"]["refused"], 1);
+        assert_eq!(d["transport"]["udp4"], 2);
+        assert_eq!(d["ede"][0]["code"], 18);
+        let lat = &d["latency_us"];
+        assert_eq!((lat["sum"].clone(), lat["count"].clone()), (json!(20_300), json!(2)));
+        let b = lat["buckets"].as_array().unwrap();
+        assert_eq!(b.last().unwrap(), &json!([null, 2]), "the open bucket holds the total");
+        assert_eq!(b[1], json!([250, 0]), "cumulative: nothing under 250 µs");
+        assert_eq!(b[2], json!([500, 1]));
+        assert!(b.windows(2).all(|w| w[0][1].as_u64() <= w[1][1].as_u64()));
+        assert_eq!(d["cache"], Value::Null, "no resolver backend");
     }
 
     #[test]

@@ -27,7 +27,7 @@ use crate::health_check::{evaluate, overall};
 use crate::{Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[cmd!(query "system.metrics", "Metrics", [], None,
-    "{} → {revision, mode (immediate | transactional), safe_mode, engine: {changes_ok, changes_failed, queries_ok, queries_failed, unknown, commits_ok, commits_failed}, interfaces: [{name, type, managed, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, rx_errors, tx_errors, rx_dropped, tx_dropped, link_downs}], services: [{name, state, up, restarts}], dhcp_server (null until a DHCP server ran; else as ip.dhcp-server.statistics.print), memory: {total, available, free, swap_total, swap_free}|null, filesystems: [{mount, device, fs, total, free, available}], processes: [{name, pid, rss_bytes, threads, fds, cpu_seconds}] (the daemon, the init and FRR), health: {status, checks: [{key, severity}]}}",
+    "{} → {revision, mode (immediate | transactional), safe_mode, engine: {changes_ok, changes_failed, queries_ok, queries_failed, unknown, commits_ok, commits_failed}, interfaces: [{name, type, managed, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, rx_errors, tx_errors, rx_dropped, tx_dropped, link_downs}], services: [{name, state, up, restarts}], dhcp_server (null until a DHCP server ran; else as ip.dhcp-server.statistics.print), dns: {answered: {category: n}, rcodes: {rcode: n}, transport: {udp4, udp6, tcp4, tcp6}, truncated, malformed, socket_drops, ede: [{code, name, replies}], latency_us: {buckets: [[upper edge µs|null, cumulative count]], sum, count}, in_flight, in_flight_peak, max_concurrent_queries, upstreams: [{server, via, answers, failures, timeouts, servfails, truncated, srtt_ms, down}], cache: {entries, used_bytes, max_bytes, evicted, expired}|null}|null (null without the daemon's forwarder), memory: {total, available, free, swap_total, swap_free}|null, filesystems: [{mount, device, fs, total, free, available}], processes: [{name, pid, rss_bytes, threads, fds, cpu_seconds}] (the daemon, the init and FRR), health: {status, checks: [{key, severity}]}}",
     always, metrics)];
 
 fn metrics(s: &mut Session, _: &Value) -> Result<Value> {
@@ -80,6 +80,7 @@ fn metrics(s: &mut Session, _: &Value) -> Result<Value> {
         "interfaces": rows,
         "services": services(s),
         "dhcp_server": super::dhcp_server_stats::snapshot(s),
+        "dns": super::dns_statistics::metrics(s),
         "memory": machine.memory,
         "filesystems": machine.filesystems,
         "processes": machine.processes,

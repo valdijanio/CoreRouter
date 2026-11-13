@@ -35,7 +35,7 @@ use std::fmt::Write as _;
 
 use corerouter_model::firewall::{
     Action, AddrMatch, AddressListEntry, ConnState, DynamicAddress, Family, FirewallRule, Flags,
-    Name, NatState, NatTarget, Neg, PortRange, PortSet, Protocol, RejectWith, Table,
+    Name, NatState, NatTarget, Neg, PortRange, PortSet, Protocol, RejectWith, Table, TcpFlags,
 };
 use corerouter_model::{Config, IfName, ItemId};
 
@@ -190,6 +190,24 @@ fn proto_text(p: Protocol) -> String {
         136 => "udplite".into(),
         n => n.to_string(),
     }
+}
+
+/// `tcp flags & (syn|ack) == syn`: the flags looked at, then the ones
+/// that must be set (G1.31d).
+fn tcp_flags_text(f: TcpFlags) -> String {
+    let names = |bits: u8| {
+        let v: Vec<&str> = TcpFlags::NAMES
+            .iter()
+            .filter(|(_, b)| bits & b != 0)
+            .map(|(n, _)| *n)
+            .collect();
+        match v.as_slice() {
+            [] => "0x0".to_owned(),
+            [one] => (*one).to_owned(),
+            more => format!("({})", more.join("|")),
+        }
+    };
+    format!("tcp flags & {} == {}", names(f.mask()), names(f.set))
 }
 
 fn state_name(s: ConnState) -> &'static str {
@@ -400,6 +418,10 @@ fn statements(
         }
         b.push(text, bc::icmp_exprs(i.kind, i.code));
     }
+    if let Some(f) = &m.tcp_flags {
+        b.need_l4proto(6);
+        b.push(tcp_flags_text(*f), bc::tcp_flags_exprs(*f));
+    }
     if let Some(f) = &m.connection_state {
         b.push(states_text(f), bc::ct_state_exprs(f));
     }
@@ -584,6 +606,22 @@ fn statements(
                 format!("meta mark set meta mark & 0x0000ffff | 0x{v:08x}{t}"),
                 exprs,
             )
+        }
+        Action::ChangeMss {
+            new_mss,
+            passthrough,
+        } => {
+            b.need_l4proto(6);
+            let (value, mut exprs) = bc::mss_value(*new_mss);
+            exprs.push(Expr::TcpOptSet {
+                kind: crate::program::TCPOPT_MAXSEG,
+                offset: 2,
+                len: 2,
+                sreg: crate::program::REG_1,
+            });
+            let (t, mut e) = then_accept(*passthrough);
+            exprs.append(&mut e);
+            (format!("tcp option maxseg size set {value}{t}"), exprs)
         }
         Action::AddSrcToAddressList {
             address_list,

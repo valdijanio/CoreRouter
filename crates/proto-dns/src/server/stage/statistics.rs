@@ -115,6 +115,31 @@ const SERVFAIL: usize = 2;
 const NXDOMAIN: usize = 3;
 const OTHER_RCODE: usize = RCODES.len() + 1;
 
+/// The RFC 8914 code a reply stands for: what a stage set (`q.ede`), or
+/// the one its category implies (§4.19 Prohibited for the ACL, §4.4 Stale
+/// Answer, §4.16 Blocked for the adlist).
+pub(crate) fn extended_error(q: &Query) -> Option<u16> {
+    q.ede.or(match category(q.answered_by, q.source.as_ref()) {
+        "refused" => Some(EDE_PROHIBITED),
+        "stale" => Some(EDE_STALE),
+        "adlist" => Some(EDE_BLOCKED),
+        _ => None,
+    })
+}
+
+/// RFC 8914 §2: the short EXTRA-TEXT sent with code `code` (§3: SHOULD be
+/// short; §6: nothing about the client or the list that matched).
+pub fn ede_text(code: u16) -> &'static str {
+    match code {
+        EDE_STALE => "no upstream answered; stale answer served (RFC 8767)",
+        EDE_CACHED_ERROR => "recent upstream failure, held (RFC 9520)",
+        EDE_BLOCKED => "blocked by the router's adlist",
+        EDE_PROHIBITED => "client not allowed by this resolver",
+        EDE_NO_REACHABLE_AUTHORITY => "no upstream server answered",
+        _ => "",
+    }
+}
+
 /// RFC 8914 §4: the extended errors the forwarder can stand for.
 pub const EDE_PROHIBITED: u16 = 18;
 pub const EDE_STALE: u16 = 3;
@@ -187,12 +212,14 @@ pub struct Counters {
     pub types: BTreeMap<u16, u64>,
     /// Queries of types past the ones counted one by one.
     pub types_other: u64,
-    /// Replies per RFC 8914 extended error they stand for (counted, not
-    /// sent: the forwarder does not add the EDNS option yet).
+    /// Replies per RFC 8914 extended error they stand for (sent too, as
+    /// EDNS option 15, to the clients that used EDNS: G4.1ze).
     pub ede: BTreeMap<u16, u64>,
     /// Time from the query read to the reply sent, as the daemon measured
     /// it ([`Statistics::answered_in`]).
     pub latency: Hist,
+    /// The sum of those times, µs (a Prometheus histogram's `_sum`).
+    pub latency_sum_us: u64,
     /// Client answers per upstream server.
     pub upstreams: BTreeMap<IpAddr, u64>,
     /// Clients, names and failing domains that had to replace another (a
@@ -259,6 +286,7 @@ struct Shard {
     types_other: u64,
     ede: [u64; EDE_CODES + 1],
     latency: Hist,
+    latency_sum_us: u64,
     upstreams: BTreeMap<IpAddr, u64>,
     clients: TopK<IpAddr, ClientSlot, CLIENTS_PER_STRIPE>,
     names: TopK<String, Rate, NAMES_PER_STRIPE>,
@@ -298,6 +326,7 @@ impl Default for Shard {
             types_other: 0,
             ede: [0; EDE_CODES + 1],
             latency: Hist::default(),
+            latency_sum_us: 0,
             upstreams: BTreeMap::new(),
             clients: TopK::default(),
             names: TopK::default(),
@@ -448,6 +477,7 @@ impl Statistics {
             c.malformed += g.malformed;
             c.types_other += g.types_other;
             c.latency.merge(&g.latency);
+            c.latency_sum_us = c.latency_sum_us.saturating_add(g.latency_sum_us);
             for (ip, n) in &g.upstreams {
                 *c.upstreams.entry(*ip).or_default() += n;
             }
@@ -602,7 +632,9 @@ impl Statistics {
     /// A reply went out `us` microseconds after its query was read (the
     /// daemon measures it: the chain has no clock of its own).
     pub fn answered_in(&self, us: u64) {
-        self.shard().latency.add_us(us);
+        let mut s = self.shard();
+        s.latency.add_us(us);
+        s.latency_sum_us = s.latency_sum_us.saturating_add(us);
     }
 
     /// Queries waiting for an upstream now (the daemon's gate).
@@ -651,12 +683,7 @@ impl Statistics {
     fn record(&self, q: &Query, r: &Reply) {
         let what = category(q.answered_by, q.source.as_ref());
         let refused = q.dropped() || r.rcode == ResponseCode::Refused;
-        let ede = q.ede.or(match what {
-            "refused" => Some(EDE_PROHIBITED),
-            "stale" => Some(EDE_STALE),
-            "adlist" => Some(EDE_BLOCKED),
-            _ => None,
-        });
+        let ede = extended_error(q);
         let upstream = match q.source {
             Some(Source::Server(ip)) if what == "upstream" => Some(ip),
             _ => None,
@@ -964,7 +991,7 @@ mod tests {
         s.set_in_flight(2);
         s.set_socket_drops(10);
         let c = s.snapshot(1).counters;
-        assert_eq!(c.latency.total(), 2);
+        assert_eq!((c.latency.total(), c.latency_sum_us), (2, 40_080));
         assert_eq!((c.in_flight, c.in_flight_peak), (2, 7));
         assert_eq!(c.socket_drops, 10);
         s.reset();

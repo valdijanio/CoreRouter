@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use corerouter_model::cow_list::CowList;
 use corerouter_model::firewall::{
-    Action, Family, FirewallRule, Name, Protocol, RejectWith, Table, Zone,
+    Action, Family, FirewallRule, Name, NewMss, Protocol, RejectWith, Table, Zone,
 };
 use corerouter_model::interface_list::RESERVED;
 use corerouter_model::{Config, Issue};
@@ -59,6 +59,7 @@ fn table_allows(table: Table, action: &Action) -> bool {
                 Action::MarkConnection { .. }
                     | Action::MarkPacket { .. }
                     | Action::MarkRouting { .. }
+                    | Action::ChangeMss { .. }
             ),
             Table::Raw => matches!(action, Action::Drop | Action::Notrack),
         }
@@ -71,6 +72,13 @@ fn chain_limit(action: &Action) -> Option<&'static [&'static str]> {
         Action::DstNat { .. } => Some(&["dstnat"]),
         // The kernel routes again after a mark only there.
         Action::MarkRouting { .. } => Some(&["prerouting", "output"]),
+        // `rt mtu` needs the route: the kernel refuses it before routing
+        // (`nft_rt_validate`: forward, output, postrouting), as iptables'
+        // `TCPMSS --clamp-mss-to-pmtu`.
+        Action::ChangeMss {
+            new_mss: NewMss::ClampToPmtu,
+            ..
+        } => Some(&["forward", "output", "postrouting"]),
         _ => None,
     }
 }
@@ -89,6 +97,14 @@ fn needs_ports(field: &'static str, r: &FirewallRule) -> Option<(&'static str, S
             "needs protocol tcp, udp, sctp or udp-lite (only they have ports)".into(),
         )),
     }
+}
+
+/// The rule matches `protocol=tcp` (not negated).
+fn is_tcp(r: &FirewallRule) -> bool {
+    r.matchers
+        .protocol
+        .as_ref()
+        .is_some_and(|p| !p.not && p.value == Protocol::TCP)
 }
 
 /// The families a rule can match, or the field that rules out every family.
@@ -268,13 +284,21 @@ fn issues_in(
         Action::Reject {
             reject_with: RejectWith::TcpReset,
         } => {
-            let tcp = r
-                .matchers
-                .protocol
-                .as_ref()
-                .is_some_and(|p| !p.not && p.value == Protocol::TCP);
-            if !tcp {
+            if !is_tcp(r) {
                 out.push(("reject_with", "tcp-reset needs protocol=tcp".into()));
+            }
+        }
+        // RouterOS asks for both: only a SYN carries the MSS option
+        // (RFC 9293 §3.7.1), and the option is TCP's.
+        Action::ChangeMss { .. } => {
+            if !is_tcp(r) {
+                out.push(("protocol", "change-mss needs protocol=tcp".into()));
+            }
+            if !r.matchers.tcp_flags.is_some_and(|f| f.requires_syn()) {
+                out.push((
+                    "tcp_flags",
+                    "change-mss needs tcp-flags=syn (only a SYN carries the MSS option)".into(),
+                ));
             }
         }
         Action::Masquerade { to_ports: Some(_) }
@@ -298,6 +322,9 @@ fn issues_in(
     }
     if m.dst_port.is_some() {
         out.extend(needs_ports("dst_port", r));
+    }
+    if m.tcp_flags.is_some() && !is_tcp(r) {
+        out.push(("tcp_flags", "needs protocol=tcp".into()));
     }
     if m.icmp_options.is_some() {
         let icmp = m
