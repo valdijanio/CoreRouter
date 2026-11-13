@@ -619,28 +619,47 @@ mod tests {
         let quiet = silent.clone();
         let udp = StdUdp::bind("127.0.0.1:0").unwrap();
         let port = udp.local_addr().unwrap().port();
-        udp.set_read_timeout(Some(Duration::from_millis(5))).unwrap();
         let count = Arc::new(AtomicUsize::new(0));
         let c = count.clone();
+        // A thread that only drains the socket: a burst of 400 queries is
+        // ~400 KiB of kernel buffer (truesize), twice the default 208 KiB,
+        // and parsing between reads (a debug build on a 4-CPU runner) lost
+        // up to 40 % of them before they were counted.
+        let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, SocketAddr)>();
+        let reader = udp.try_clone().unwrap();
+        thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, from)) = reader.recv_from(&mut buf) {
+                if tx.send((buf[..n].to_vec(), from)).is_err() {
+                    return;
+                }
+            }
+        });
         thread::spawn(move || {
             let mut due: VecDeque<(Instant, Vec<u8>, SocketAddr)> = VecDeque::new();
-            let mut buf = [0u8; 1500];
             loop {
-                if let Ok((n, from)) = udp.recv_from(&mut buf) {
-                    c.fetch_add(1, Ordering::Relaxed);
-                    if quiet.load(Ordering::Relaxed) {
-                        continue;
+                let wait = due
+                    .front()
+                    .map_or(Duration::from_millis(50), |d| d.0.saturating_duration_since(Instant::now()));
+                match rx.recv_timeout(wait) {
+                    Ok((q, from)) => {
+                        c.fetch_add(1, Ordering::Relaxed);
+                        if quiet.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        let q = Message::from_vec(&q).unwrap();
+                        let mut m = Message::response(q.metadata.id, OpCode::Query);
+                        m.metadata.response_code = ResponseCode::NoError;
+                        m.add_queries(q.queries.clone());
+                        m.add_answer(Record::from_rdata(
+                            q.queries[0].name().clone(),
+                            ttl,
+                            RData::A(A(Ipv4Addr::new(198, 51, 100, 9))),
+                        ));
+                        due.push_back((Instant::now() + delay, m.to_vec().unwrap(), from));
                     }
-                    let q = Message::from_vec(&buf[..n]).unwrap();
-                    let mut m = Message::response(q.metadata.id, OpCode::Query);
-                    m.metadata.response_code = ResponseCode::NoError;
-                    m.add_queries(q.queries.clone());
-                    m.add_answer(Record::from_rdata(
-                        q.queries[0].name().clone(),
-                        ttl,
-                        RData::A(A(Ipv4Addr::new(198, 51, 100, 9))),
-                    ));
-                    due.push_back((Instant::now() + delay, m.to_vec().unwrap(), from));
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                 }
                 while due.front().is_some_and(|d| d.0 <= Instant::now()) {
                     let (_, b, to) = due.pop_front().unwrap();
@@ -703,10 +722,10 @@ mod tests {
 
     /// Sends `names` from one socket at once and collects the answers.
     fn ask_all(port: u16, names: &[String], within: Duration) -> HashSet<u16> {
-        let c = StdUdp::bind("127.0.0.1:0").unwrap();
-        c.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         let end = Instant::now() + within;
         // The listener may not be up yet: the first name until it answers.
+        let c = StdUdp::bind("127.0.0.1:0").unwrap();
+        c.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         let mut got = HashSet::new();
         while Instant::now() < end && got.is_empty() {
             c.send_to(&query(0, &names[0]), ("127.0.0.1", port)).unwrap();
@@ -715,18 +734,50 @@ mod tests {
                 got.insert(Message::from_vec(&buf[..n]).unwrap().metadata.id);
             }
         }
-        for (i, n) in names.iter().enumerate().skip(1) {
-            c.send_to(&query(u16::try_from(i).unwrap(), n), ("127.0.0.1", port))
-                .unwrap();
-        }
-        let mut buf = [0u8; 1500];
-        while Instant::now() < end && got.len() < names.len() {
-            if let Ok(n) = c.recv(&mut buf) {
-                let m = Message::from_vec(&buf[..n]).unwrap();
-                if m.metadata.response_code == ResponseCode::NoError && !m.answers.is_empty() {
-                    got.insert(m.metadata.id);
-                }
-            }
+        // The rest from 8 sockets at once, each reading only its own
+        // answers, one query every 2 ms per socket (~100 ms for 400, all
+        // still in flight together against a 300 ms upstream). Sent in one
+        // go, the burst overflowed the default 208 KiB buffers of the
+        // fake upstream and of a single client socket on a 4-CPU runner
+        // (~250 of 400 arrived, measured): the kernel's, not the loop's.
+        let rest: Vec<(u16, &String)> = names
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(i, n)| (u16::try_from(i).unwrap(), n))
+            .collect();
+        let chunks: Vec<&[(u16, &String)]> = rest.chunks(rest.len().div_ceil(8).max(1)).collect();
+        let sets: Vec<HashSet<u16>> = thread::scope(|s| {
+            let handles: Vec<_> = chunks
+                .iter()
+                .map(|chunk| {
+                    s.spawn(move || {
+                        let c = StdUdp::bind("127.0.0.1:0").unwrap();
+                        c.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+                        for (id, n) in chunk.iter() {
+                            c.send_to(&query(*id, n), ("127.0.0.1", port)).unwrap();
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        let mut got = HashSet::new();
+                        let mut buf = [0u8; 1500];
+                        while Instant::now() < end && got.len() < chunk.len() {
+                            if let Ok(n) = c.recv(&mut buf) {
+                                let m = Message::from_vec(&buf[..n]).unwrap();
+                                if m.metadata.response_code == ResponseCode::NoError
+                                    && !m.answers.is_empty()
+                                {
+                                    got.insert(m.metadata.id);
+                                }
+                            }
+                        }
+                        got
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for set in sets {
+            got.extend(set);
         }
         got
     }
