@@ -171,7 +171,7 @@ Com **200 000 LSAs e 204 003 rotas** (rodadas 29 e 31):
 | Safe Mode, conexão perdida | – | 10,9 – 14,0 | 198 000 / 0 | sim | sim |
 | FRR morto e iniciado de novo | – | 21,1 – 34,7 | 0 / 0 | sim | sim |
 | daemon reiniciado (responde em 0,6 s) | – | 0,6 | 200 002 / 204 003 | sim | sim |
-| segundo endereço na porta, fora das redes (rodada 34, 10 000 LSAs) | SECOND | – | – | – | – |
+| segundo endereço na porta, fora das redes (rodada 35, 10 000 LSAs) | 12 | – | 10 002 / 11 001 | sim | sim |
 
 - A faixa do commit é a espera pelo `ospfd` (ver "Achados sem correção").
 
@@ -306,12 +306,17 @@ CoreRouter (até 10 s de cache).
   também virou interface OSPF ponto a ponto no mesmo enlace (`show ip ospf interface`: duas), com
   dois Hellos de origens diferentes para o mesmo vizinho, e a sub-rede de gerência anunciada sem
   ninguém pedir. O RouterOS v7 casa `networks` por endereço.
-- **Correção:** quando o template casou por rede e a interface tem endereços IPv4 fora das redes
-  dele, o render usa a forma por endereço do FRR, `ip ospf area <área> <endereço>`, só para os de
-  dentro (`bind::Binding::addresses`); nos outros casos (a maioria) o texto não muda, nada é
-  reaplicado na atualização. Testes: `a_network_match_takes_only_the_addresses_inside` e
-  `a_second_address_outside_the_networks_stays_out`; no laboratório, a operação "segundo endereço
-  na porta" (tabela 4) e o modo remoto.
+- **Correção:** um template casado por rede vira a forma por endereço do FRR, `ip ospf area <área>
+  <endereço>`, só para os endereços dentro das redes dele (`bind::Binding::addresses`); casado
+  por nome, continua valendo para a interface inteira (como no RouterOS). Sempre por endereço, e
+  não só quando há outro endereço: a primeira versão trocava de forma quando o operador
+  acrescentava um endereço de gerência, e a troca recriava a interface OSPF (rotas a zero por
+  mais de 8 s, **medido** na rodada 34); agora acrescentar ou tirar um endereço fora das redes não
+  muda nenhuma linha do FRR (rodada 35: nada caiu). A mudança de forma de uma config antiga só
+  aparece na atualização da imagem, quando o FRR sobe vazio e recebe a config inteira. Testes:
+  `a_network_match_takes_only_the_addresses_inside` e
+  `a_second_address_outside_the_networks_stays_out` (o render igual com e sem o endereço novo);
+  no laboratório, a operação "segundo endereço na porta" (tabela 4) e o modo remoto.
 
 ## Achados sem correção neste PR
 
