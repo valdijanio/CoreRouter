@@ -762,6 +762,9 @@ dut_now() { # → "threads rss_mib fds"
 			jq -r '[.[] | select(.name == "corerouter-daemon")][0] // {} | "\(.threads // 0) \((.memory // 0) / 1048576 | floor) \(.fds // 0)"'
 	fi
 }
+daemon_cpu() { # CPU seconds of the DUT so far (exited threads included); remote: 0
+	if local_dut; then awk -v clk="$CLK" '{printf "%.2f", ($14 + $15) / clk}' "/proc/$DPID/stat"; else echo 0; fi
+}
 rss_kib() { # exact RSS of the DUT (local) in KiB; remote: process.print
 	if local_dut; then awk '/^VmRSS/ {print $2}' "/proc/$DPID/status"; else
 		cr system.resource.process.print '{"sort":"memory","limit":100}' |
@@ -1223,8 +1226,8 @@ test_tcp() {
 	say ""
 	say "### Clientes TCP"
 	say ""
-	say "Nomes quentes por TCP (dnsperf -m tcp), de um endereço só. max_concurrent_tcp_sessions 20 (um"
-	say "endereço ocupa no máximo um quarto: 5)."
+	say "Nomes quentes por TCP (dnsperf -m tcp), de um endereço só. max_concurrent_tcp_sessions: o padrão"
+	say "(G4.1w: 100, 25 por endereço; antes 20, um quarto por endereço: 5)."
 	say ""
 	say "| clientes TCP | $DP_HEAD | fds (pico) |"
 	say "|---|$DP_SEP|---|"
@@ -1238,24 +1241,28 @@ test_tcp() {
 	say ""
 	say "### Conexões paradas (slowloris)"
 	say ""
-	say "Conexões que mandam um byte e param, de 4 endereços (${CLIENTS[2]}…${CLIENTS[5]}), 10 por endereço, por"
+	say "Conexões que mandam um byte e param, de 4 endereços (${CLIENTS[2]}…${CLIENTS[5]}), N por endereço, por"
 	say "30 s, reabertas assim que o roteador as fecha; ao lado, um cliente TCP legítimo (${CLIENTS[6]})"
-	say "pergunta a cada 250 ms."
+	say "pergunta a cada 250 ms (uma conexão nova por pergunta). max_concurrent_tcp_sessions: o padrão."
 	say ""
-	in_gen python3 -I "$W/slow.py" "$DUT_IP" 30 "${CLIENTS[2]},${CLIENTS[3]},${CLIENTS[4]},${CLIENTS[5]}" 10 >"$W/slow.out" 2>&1 &
-	local sp=$!
-	samp_start
-	sleep 1
-	in_gen python3 -I "$W/tcpprobe.py" "$DUT_IP" "${CLIENTS[6]}" 28 "$W/tcpprobe" || true
-	peak=$(samp_stop)
-	wait $sp 2>/dev/null || true
-	local n okc
-	n=$(wc -l <"$W/tcpprobe")
-	okc=$(grep -c ' ok$' "$W/tcpprobe" || true)
-	say "| conexões abertas (reabertas) | consultas legítimas | respondidas | p50 ms | máx. ms | fds (pico) | threads (pico) |"
-	say "|---|---|---|---|---|---|---|"
-	say "| $(awk '/held/ {print $2}' "$W/slow.out") ($(awk '/reopened/ {print $2}' "$W/slow.out")) | $n | $okc | $(awk '$3 == "ok" {print $2}' "$W/tcpprobe" | sort -n | awk '{a[NR] = $1} END {print a[int(NR / 2) + (NR > 0)] + 0}') | $(awk '{print $2}' "$W/tcpprobe" | sort -n | tail -n 1) | $(echo "$peak" | cut -d' ' -f3) | $(echo "$peak" | cut -d' ' -f1) |"
-	cp "$W/tcpprobe" "$OUT/tcp-slowloris-probe.txt"
+	say "| por endereço | conexões abertas (reabertas) | consultas legítimas | respondidas | p50 ms | máx. ms | fds (pico) | threads (pico) | CPU do daemon (s) |"
+	say "|---|---|---|---|---|---|---|---|---|"
+	local per n okc cpu0 cpu1
+	for per in ${SLOW_PER:-10 30}; do
+		in_gen python3 -I "$W/slow.py" "$DUT_IP" 30 "${CLIENTS[2]},${CLIENTS[3]},${CLIENTS[4]},${CLIENTS[5]}" "$per" >"$W/slow.out" 2>&1 &
+		local sp=$!
+		cpu0=$(daemon_cpu)
+		samp_start
+		sleep 1
+		in_gen python3 -I "$W/tcpprobe.py" "$DUT_IP" "${CLIENTS[6]}" 28 "$W/tcpprobe" || true
+		peak=$(samp_stop)
+		wait $sp 2>/dev/null || true
+		cpu1=$(daemon_cpu)
+		n=$(wc -l <"$W/tcpprobe")
+		okc=$(grep -c ' ok$' "$W/tcpprobe" || true)
+		say "| $per | $(awk '/held/ {print $2}' "$W/slow.out") ($(awk '/reopened/ {print $2}' "$W/slow.out")) | $n | $okc | $(awk '$3 == "ok" {print $2}' "$W/tcpprobe" | sort -n | awk '{a[NR] = $1} END {print a[int(NR / 2) + (NR > 0)] + 0}') | $(awk '{print $2}' "$W/tcpprobe" | sort -n | tail -n 1) | $(echo "$peak" | cut -d' ' -f3) | $(echo "$peak" | cut -d' ' -f1) | $(awk -v a="$cpu0" -v b="$cpu1" 'BEGIN {printf "%.1f", b - a}') |"
+		cp "$W/tcpprobe" "$OUT/tcp-slowloris-probe-$per.txt"
+	done
 	alive_check tcp
 
 	say ""

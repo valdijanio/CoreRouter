@@ -835,7 +835,9 @@ impl DnsPanel {
         field(
             ui,
             "Max Concurrent TCP Sessions",
-            "",
+            "TCP 53 connections at once; 25 per address at most (half when lower). \
+             When full, a new connection takes the place of the one idle the longest \
+             from the address holding the most.",
             &mut f.max_concurrent_tcp_sessions,
             80.0,
         );

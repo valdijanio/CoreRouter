@@ -44,9 +44,13 @@ pub const QUERIES_PER_CLIENT: std::ops::RangeInclusive<u32> = 0..=100_000;
 /// RFC 8767 §5: serve stale for "1 to 3 days" after the TTL; 1 day here.
 pub const DEFAULT_SERVE_STALE_SECS: u32 = 86_400;
 pub const SERVE_STALE_SECS: std::ops::RangeInclusive<u32> = 0..=604_800;
-/// RouterOS defaults.
+/// RouterOS default.
 pub const DEFAULT_MAX_CONCURRENT_QUERIES: u32 = 100;
-pub const DEFAULT_MAX_CONCURRENT_TCP_SESSIONS: u32 = 20;
+/// RouterOS has 20; RFC 9210 §4.5 finds 20 to 150 in the servers it
+/// surveyed and 25 per address a "reasonable starting point". With 100,
+/// four addresses fill it at 25 each, and a full server takes the place of
+/// a stalled connection (G4.1w). A config saved with 20 keeps it.
+pub const DEFAULT_MAX_CONCURRENT_TCP_SESSIONS: u32 = 100;
 /// Each concurrent query or TCP session is a thread of the daemon.
 pub const CONCURRENCY: std::ops::RangeInclusive<u32> = 1..=1000;
 
@@ -101,6 +105,9 @@ pub struct Dns {
     pub serve_stale_secs: u32,
     /// Upstream lookups in flight for the LAN; more get SERVFAIL.
     pub max_concurrent_queries: u32,
+    /// TCP 53 connections at once (each a thread); 25 per address (RFC
+    /// 9210 §4.5), at most half. Full: a new one takes the place of the
+    /// longest idle connection of the address holding the most (G4.1w).
     pub max_concurrent_tcp_sessions: u32,
     /// Added to the TTL of an address put in a firewall address list by a
     /// static entry's `address_list` (RouterOS `address-list-extra-time`).
