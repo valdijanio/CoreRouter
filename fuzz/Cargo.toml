@@ -18,6 +18,7 @@ corerouter-control = { path = "../crates/control" }
 corerouter-mcp = { path = "../crates/mcp" }
 corerouter-proto-radius = { path = "../crates/proto-radius" }
 corerouter-hal = { path = "../crates/hal" }
+corerouter-proto-dns = { path = "../crates/proto-dns" }
 
 [workspace]
 members = ["."]
@@ -73,3 +74,10 @@ name = "routeros_export"
 path = "fuzz_targets/routeros_export.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "dns_query_log"
+path = "fuzz_targets/dns_query_log.rs"
+test = false
+doc = false
+bench = false

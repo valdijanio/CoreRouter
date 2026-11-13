@@ -17,6 +17,11 @@ thiserror.workspace = true
 ipnet.workspace = true
 # `/ip dns static` regexp: linear time, no backtracking (hostile patterns
 # cannot stall the forwarder).
+# G4.1zd query log: block compression (pure Rust, as the daemon's), its
+# checksum, and the keyed hash of `client_address=hashed`.
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
+crc32fast = "1.5.3"
+siphasher = "1.0.4"
 regex = { version = "1.13.1", default-features = false, features = ["std", "perf", "unicode-case", "unicode-perl"] }
 # DNSSEC signing (G4.1c-2): ring, so only the daemon turns it on (the
 # engine, the GUI and wasm builds never link it).
@@ -54,6 +59,10 @@ harness = false
 
 [[bench]]
 name = "statistics"
+harness = false
+
+[[bench]]
+name = "querylog"
 harness = false
 
 [lints]
