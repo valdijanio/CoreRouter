@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 56f24f8860559138fda77b0b642a4288f90395ab2dab893c045812648873a91c # shrinks to rs = [Record { at_ms: 1700000003493, client: None, name: "", qtype: 0, rcode: 0, flags: 0, by: 0, ede: None, latency_us: 0 }, Record { at_ms: 1700000000000, client: None, name: "", qtype: 0, rcode: 0, flags: 0, by: 0, ede: None, latency_us: 0 }]

@@ -328,6 +328,9 @@ mod linux {
         /// (sent again only when the configured one changes: the kernel
         /// follows a roaming peer).
         wireguard: BTreeMap<IfName, corerouter_hal::wireguard::WgDevice>,
+        /// G1.31c: `net.ipv4.udp_l3mdev_accept` before a WireGuard socket
+        /// needed it (`None`: not changed by us).
+        l3mdev_orig: Option<i64>,
     }
 
     /// `Hal::unmanaged`'s answer with the `epoch` and the moment it was read.
@@ -847,6 +850,7 @@ mod linux {
         /// written. The first time, even an empty one: a restart may have
         /// left rules of ours in the kernel.
         fn sync_rules(&mut self, cfg: &Config) -> Result<(), HalError> {
+            self.sync_l3mdev_accept(cfg)?;
             let want = corerouter_hal::policy::expected_rules(cfg);
             if self.rules.as_ref() == Some(&want) {
                 return Ok(());
@@ -854,6 +858,49 @@ mod linux {
             crate::rules::sync(&want)?;
             self.rules = Some(want);
             Ok(())
+        }
+
+        /// G1.31c: a WireGuard socket that sends by a VRF must also hear
+        /// on its ports. The kernel's socket is bound to no device, and a
+        /// datagram that came in on a VRF member (`sdif`) only reaches an
+        /// unbound socket with `net.ipv4.udp_l3mdev_accept=1`
+        /// (`inet_bound_dev_eq`, include/net/inet_sock.h; one switch for
+        /// IPv4 and IPv6, `udp_sk_bound_dev_eq`, include/net/udp.h). On
+        /// while any enabled interface has a `vrf`, back to what it was
+        /// when none has.
+        fn sync_l3mdev_accept(&mut self, cfg: &Config) -> Result<(), HalError> {
+            const NAME: &str = "net.ipv4.udp_l3mdev_accept";
+            let want = corerouter_hal::policy::wireguard_vrfs(cfg).next().is_some();
+            let path = self.sysctl.root.proc.join("sys/net/ipv4/udp_l3mdev_accept");
+            let now = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| t.trim().parse::<i64>().ok());
+            let write = |v: i64| {
+                std::fs::write(&path, format!("{v}\n"))
+                    .map_err(|e| HalError::Rejected(format!("{NAME} = {v}: {e}")))
+            };
+            match (want, now) {
+                (true, None) => Err(HalError::Rejected(format!(
+                    "{NAME}: this kernel has no VRF (CONFIG_NET_L3_MASTER_DEV); \
+                     WireGuard cannot send by a VRF"
+                ))),
+                (true, Some(1)) | (false, None) => Ok(()),
+                (true, Some(was)) => {
+                    write(1)?;
+                    self.l3mdev_orig.get_or_insert(was);
+                    log::info!("{NAME} = 1 (WireGuard sends by a VRF)");
+                    Ok(())
+                }
+                (false, Some(_)) => {
+                    let Some(was) = self.l3mdev_orig else {
+                        return Ok(());
+                    };
+                    write(was)?;
+                    self.l3mdev_orig = None;
+                    log::info!("{NAME} = {was} (no WireGuard sends by a VRF now)");
+                    Ok(())
+                }
+            }
         }
 
         /// Every link name of the kernel with its index (one dump).
