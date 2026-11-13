@@ -722,9 +722,13 @@ impl Resolver {
                     // RFC 6298 §5.5: back off. From the RTO this query
                     // waited, not the current one: many queries timing out
                     // together double it once (Unbound's `rtt_lost`).
-                    let now_rto = if s.rto_ms == 0 { UNKNOWN_RTT_MS } else { s.rto_ms };
+                    let now_rto = if s.rto_ms == 0 {
+                        UNKNOWN_RTT_MS
+                    } else {
+                        s.rto_ms
+                    };
                     s.rto_ms = now_rto
-                        .max(tr.wait_ms.saturating_mul(2))
+                        .max(tr.rto_ms.saturating_mul(2))
                         .clamp(RTO_MIN_MS, RTO_MAX_MS);
                     s.timeouts_in_row = s.timeouts_in_row.saturating_add(1);
                     if s.timeouts_in_row >= DOWN_AFTER_TIMEOUTS {
@@ -1004,8 +1008,9 @@ pub struct Tried {
     pub outcome: Outcome,
     /// Its UDP answer was truncated and it was asked again over TCP.
     pub truncated: bool,
-    /// How long the query was given (its RTO then, G4.1u).
-    pub wait_ms: u64,
+    /// The server's RTO the query went with (G4.1u; a timeout backs off
+    /// from it).
+    pub rto_ms: u64,
 }
 
 /// How a server did.
@@ -1019,13 +1024,13 @@ pub enum Outcome {
     Failed,
 }
 
-fn tried(ip: IpAddr, via: Via, outcome: Outcome, truncated: bool, wait_ms: u64) -> Tried {
+fn tried(ip: IpAddr, via: Via, outcome: Outcome, truncated: bool, rto_ms: u64) -> Tried {
     Tried {
         ip,
         via,
         outcome,
         truncated,
-        wait_ms,
+        rto_ms,
     }
 }
 

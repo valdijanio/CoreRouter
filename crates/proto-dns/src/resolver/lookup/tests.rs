@@ -62,7 +62,10 @@ fn a_silent_server_times_out_on_tick_and_the_next_answers() {
     assert_eq!(second[0].server.ip(), ip("192.0.2.2"));
     assert_ne!(second[0].token, first[0].token);
     assert_eq!(second[0].wait_ms, 376);
-    assert!(l.reply(second[0].token, &answer(&second[0], [192, 0, 2, 80]), 386).is_empty());
+    assert!(
+        l.reply(second[0].token, &answer(&second[0], [192, 0, 2, 80]), 386)
+            .is_empty()
+    );
     assert!(l.done());
     let got = r.complete(*l, 386).unwrap();
     assert_eq!(got.source, Source::Server(ip("192.0.2.2")));
@@ -86,7 +89,10 @@ fn a_late_answer_to_an_expired_query_is_taken() {
     let first = l.start(0).remove(0);
     let second = l.tick(376).remove(0);
     assert!(l.waiting().any(|t| t == first.token), "still listening");
-    assert!(l.reply(first.token, &answer(&first, [192, 0, 2, 1]), 500).is_empty());
+    assert!(
+        l.reply(first.token, &answer(&first, [192, 0, 2, 1]), 500)
+            .is_empty()
+    );
     assert!(l.done());
     assert!(l.waiting().next().is_none());
     let got = r.complete(*l, 500).unwrap();
