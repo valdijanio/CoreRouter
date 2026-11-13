@@ -433,6 +433,14 @@ build_tools() {
 	fi
 	CLI=$(readlink -f "$CLI")
 	[ -z "$DAEMON_BIN" ] || DAEMON_BIN=$(readlink -f "$DAEMON_BIN")
+	# The DUT is found by its name (dut_pid): a daemon kept under another
+	# name (an older build, for a before/after) runs through a link named
+	# as the build's.
+	if [ -n "$DAEMON_BIN" ] && [ "$(basename "$DAEMON_BIN")" != corerouter-daemon ]; then
+		mkdir -p "$W/bin"
+		ln -sf "$DAEMON_BIN" "$W/bin/corerouter-daemon"
+		DAEMON_BIN=$W/bin/corerouter-daemon
+	fi
 }
 
 daemon_start() { # [cpus]
