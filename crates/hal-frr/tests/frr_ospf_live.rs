@@ -66,6 +66,7 @@ fn config(keys: Vec<OspfKey>) -> Config {
             subscriber_pools: false,
             stub_router: false,
             stub_router_on_startup: None,
+            max_lsa: None,
             disabled: false,
             comment: String::new(),
         },

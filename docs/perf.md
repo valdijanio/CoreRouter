@@ -3203,3 +3203,228 @@ AMD Ryzen AI MAX+ 395 (32 threads), build release, `benches/statistics.rs`, 2026
 | 16 threads | 0,49 µs | 0,43 µs | 0,51 µs | carga alta; sem lock novo |
 
 O `/metrics` lê os contadores uma vez por scrape com `Statistics::totals` (16 faixas, sem copiar clientes nem nomes) e escreve cerca de 70 linhas a mais.
+
+### G3.4q — FRR com milhares de interfaces OSPF (**medido**, 2026-11-12/13)
+
+Máquina: host de desenvolvimento (8 núcleos usados pela VM do laboratório e por outras sessões;
+carga anotada), FRR compilado com `-O2 -g -fno-omit-frame-pointer`, `mgmtd`+`zebra`+`ospfd` num
+namespace sem root (`scripts/frr-ospf-many-ifaces.sh`). Tempo de parede (CPU do `ospfd`), s.
+
+| versão | interfaces | config OSPF, subida | remoção | um SPF (ms) |
+|---|---|---|---|---|
+| 10.7.1 | 4 000 | 17,8 (15,9) → 0,6 (0,4) | 35,7 (27,9) → 1,3 (1,1) | 48 → 3 |
+| 10.7.1 | 10 000 | 307 (298) → 1,1 (0,9) | 604 (553) → 5,1 (4,7) | 121 → 4 |
+| `master` | 10 000 | 237 (229) → 1,1 (0,9) | 686 (566) → 4,4 (4,1) | 136 → 4 |
+| 10.7.1, `vtysh -f`, carga ~2 | 4 000 | 9,8–11,3 (8,2) → 0,4 (0,3) | 13,0 (12,8) → 0,8 (0,7) | 40–48 → 1–2 |
+
+- Log com 10 000 interfaces: 21 794 886 linhas, 2,53 GB → 1 linha, 2,5 MB.
+- `zebra` criando 4 000 VLANs (mediana de 3): 5,3 → 3,9 s (10.7.1); 10 000 no `master`: 28,2 →
+  21,4 s.
+- Imagem no laboratório (`ospf-stress-lab.sh --tests interfaces`, 4 000): commit 34,3 → 6,1 s,
+  `ospfd` 28,2 → 1,6 s de CPU no commit e 28,6 → 2,5 s na remoção; remoção 101,3 → 71,1 s (o
+  kernel: 80,6 s para apagar 4 000 VLANs uma a uma, 1,4 s por grupo; G3.4s).
+- Paralelismo: o `ospfd` e o `zebra` têm uma thread de controle cada; o custo que crescia ao
+  quadrado era trabalho repetido por interface (commit do northbound, router-LSA, busca por
+  `lsa_pos`, fila early), e a correção o tira em vez de dividi-lo. O que sobra por interface é O(1)
+  ou O(links da router-LSA) uma vez por lote.
+
+### G4.1r — DNS sob carga (**medido**, 2026-11-12, VM do laboratório: 8 vCPUs AMD EPYC-Genoa, 16 GiB, kernel 7.0; DUT em 4 vCPUs, gerador e origem nas outras 4; release)
+
+Antes = daemon da imagem G1.6zd (main d2a454d2); depois = `stream/G4.1r-dns-stress-lab`.
+Saturação com `dnsperf` (8 sockets, 500 em voo cada, 15 s). Tabelas completas em
+`docs/dns-stress.md`.
+
+| Medida (4 vCPUs para o DUT) | Antes | Depois |
+|---|---|---|
+| Acerto de cache, saturação | 169 mil/s | 174 mil/s |
+| Miss com a origem a 0 ms, saturação | 12,2 mil/s (CPU ~210 µs por miss) | 47,3 mil/s (~67 µs) |
+| Mistura (85 % cache, 5 % miss), saturação | 170 mil/s | 193 mil/s |
+| Nomes únicos a 20 000/s com `max_concurrent_queries` 1000 | 8,7 mil/s, p50 573 ms | 20 mil/s, p50 20 ms |
+| O mesmo nome TTL 0 a 2000/s, origem a 20 ms: consultas à origem por resposta | 1,00 | 0,02 |
+| `ip.dns.cache.flush` de 1 M de entradas: p99,9 da carga ao lado (20 000/s) | 516 ms | 21 ms |
+| DoH de origem (Unbound, só HTTP/2) a 5000/s | 0 % respondido | 100 %, p99 0,70 ms |
+| `dns_forward_cache_miss` (criterion, host Ryzen AI MAX+ 395) | 2,58 µs | 2,82 µs (+0,24 µs: a junção) |
+
+Comparação na mesma VM (G4.1g): acerto de cache 193–198 mil/s (Unbound 280–344, dnsmasq 87–127);
+misses com a origem a 20 ms 29–45 mil/s (Unbound 42–45, dnsmasq 3,5–4,5); o mesmo nome TTL 0, 0,02
+consulta à origem por resposta (Unbound 0,07–0,09, dnsmasq 0,05).
+
+### G4.1t — laço de eventos no upstream do DNS (**medido**, 2026-11-13)
+
+VM do laboratório (8 vCPUs EPYC-Genoa, o roteador em 4), release, `scripts/dns-stress-lab.sh
+--daemon build`; antes = `main` 4b5b9861, depois = `stream/G4.1t-dns-upstream-loop`. A VM era
+disputada por outras sessões nas duas rodadas: os números servem para a ordem de grandeza.
+
+| Medida | Antes | Depois |
+|---|---|---|
+| Miss, origem a 0 ms, `max_concurrent_queries` 100: NOERROR/s | 11,9 mil | 34,8 mil |
+| Cache padrão de 2 MiB (quase tudo miss), saturação: NOERROR/s | 12,8 mil | 66,1 mil |
+| Nomes únicos a 20 000/s, limite 1000: NOERROR em 15 s / p50 / threads | 167 mil / 401 ms / 1116 | 298 mil / 20 ms / 71 |
+| Nomes únicos sem limite de taxa, limite 1000: NOERROR em 15 s / threads | 150 mil / 1119 | 620 mil / 71 |
+| Nomes únicos sem limite, limite 100: cliente legítimo p99 | 213 ms | 51 ms |
+| Origens fora do ar, limite 1000: threads (pico) / RSS | 1071 / 290 MiB | 71 / 221 MiB |
+| Mistura (85 % cache), saturação | 90,5 mil/s | 212 mil/s |
+
+DoT/DoH de origem e TCP 53, host (`--userns`, 4 CPUs, uma rodada atrás da outra, release):
+
+| Medida | Antes | Depois |
+|---|---|---|
+| DoT a 1000/s: handshakes/s / SERVFAIL em 15 s | 197 / 185 | 2 / 0 |
+| DoT a 5000/s: handshakes/s / SERVFAIL em 15 s | 611 / 43 305 | 3 / 823 |
+| DoH a 5000/s: handshakes/s / p99 | 787 / 68 ms | 4 / 4,0 ms |
+| TCP 53, 4 conexões, nomes quentes: consultas/s / p50 | 3,2 mil / 2,0 ms | 13,3 mil / 57 µs |
+
+O TCP 53 com nomes quentes não passa pelo upstream: a linha confere que a queda vista na VM
+(27 mil → 7,1 mil/s) foi a disputa da VM, não o código; a diferença no host também é ruído.
+
+### G4.1u — prazo adaptativo e nova tentativa no upstream do DNS (**medido**, 2026-11-13)
+
+Host (AMD Ryzen AI Max+ 395, 32 CPUs), `scripts/dns-stress-lab.sh --userns --tests origin`,
+release; antes = G4.1t (`stream/G4.1t-dns-upstream-loop`), depois = esta branch.
+
+| Caso | Antes | Depois |
+|---|---|---|
+| 30 % de perda, 500/s: respondidas / p99 | 1945 de 7500 (26 %) / 4063 ms | 7299 de 7500 (97 %) / 2163 ms |
+| Queda do primeiro servidor: consulta mais lenta / última acima de 100 ms | 2006 ms / 1980 ms depois | 106 ms / 223 ms depois |
+| Nome nunca visto, origens fora: SERVFAIL p50 / máx. | 3195 / 4003 ms | 1795 / 2602 ms |
+| Vencido, origens fora (1ª vez) | 4001 ms | 2250 ms |
+| Origens fora com carga, limite 1000: o mais lento | 4010 ms | 491 ms |
+
+### G4.1v — serve-stale com o prazo do cliente (**medido**, 2026-11-13)
+
+Host (AMD Ryzen AI Max+ 395, 32 CPUs), `scripts/dns-stress-lab.sh --userns --tests origin`,
+release, uma rodada atrás da outra.
+
+| Caso | G4.1t | G4.1u | G4.1v |
+|---|---|---|---|
+| Vencido, origens fora (1ª vez): p50 / máx. | 4001 / 4005 ms | 2250 / 2252 ms | 1800 / 1801 ms |
+| Vencido, de novo (falha guardada) | 0 ms | 0 ms | 0 ms |
+
+### G4.1w — DNS TCP 53 contra conexões paradas (2026-11-13, **medido**)
+
+VM do laboratório (`corerouter-lab`), build release, `scripts/dns-stress-lab.sh --tests tcp
+--duration 10`, o mesmo roteiro com o daemon da `main` (4b5b9861) e o da branch. Slowloris: 4
+endereços × N conexões que mandam um byte e param, reabertas quando o roteador fecha; um cliente
+legítimo pergunta a cada 250 ms numa conexão nova, por 28 s.
+
+| Vagas | Por endereço | Respondidas, antes | Respondidas, depois | Reaberturas em 30 s, depois | CPU do daemon em 30 s, depois | Threads (pico), depois |
+|---|---|---|---|---|---|---|
+| 20 | 10 | 0 de 107 | 107 de 107 | 5 312 | 1,2 s | 109 |
+| 20 | 30 | 1 de 106 | 107 de 107 | 29 095 | 1,2 s | 89 |
+| 100 | 10 | 107 de 107 | 108 de 108 | 100 | 0,9 s | 111 |
+| 100 | 30 | 0 de 107 | 107 de 107 | 6 119 | 1,0 s | 169 |
+
+Um endereço, nomes quentes por TCP (`dnsperf -m tcp`), perdidas:
+
+| Vagas | Conexões | Antes | Depois |
+|---|---|---|---|
+| 20 | 4 | 1,3 % | 0,7 % |
+| 20 | 16 | 54,5 % | 0,8 % (12,1 mil/s) |
+| 20 | 64 | 91,3 % | 81,3 % (teto de 10; o `dnsperf` não reabre) |
+| 100 | 16 | 0,4 % (vagas maiores só) | 0,2 % (50,9 mil/s) |
+| 100 | 64 | 35,7 % | 35,7 % (teto de 25) |
+
+O despejo custa uma varredura das conexões abertas (até `max_concurrent_tcp_sessions`, 1000 no
+máximo) só quando as vagas estão cheias, sob o mutex das vagas; o caminho de cada consulta só faz
+duas trocas atômicas na conexão.
+
+### G4.1z — custo da adlist por consulta (**medido**, 2026-11-13)
+
+AMD Ryzen AI MAX+ 395 (32 threads, L2 16 MiB, L3 64 MiB), build release, host com carga 20–60 de
+outras sessões: os números de tempo são o **mínimo** de 30–40 rodadas alternadas no mesmo processo
+(interferência só soma tempo); o criterion variou ±30–100 % entre execuções e fica só como
+referência. Lista de hosts de 1 M de nomes (`ads<i>.tracker<n>.example`), 10 mil nomes em sequência.
+
+Busca isolada (`Loaded::matches`), quente / com o cache da CPU varrido antes:
+
+| Nomes | Antes | Depois |
+|---|---|---|
+| depois de todos na ordem (os do laboratório) | 69–72 / 73–75 ns | 25–27 / 33–108 ns |
+| intercalados com os da lista, fora dela | 517–635 / 568–760 ns | 26–27 / 70–123 ns |
+| na lista | 219–433 / 266–739 ns | 41–42 / 58–60 ns |
+| intercalados, lista como regras Adblock (`||nome^`) | 441–598 / 602–654 ns | 69–70 / 87–93 ns |
+
+A cadeia inteira em acerto de cache (`Forwarder::start`, 10 mil nomes, uma thread), quanto a lista
+soma por consulta:
+
+| Nomes | Antes | Depois |
+|---|---|---|
+| depois de todos na ordem | +104 ns | +162 ns |
+| intercalados com os da lista | +883–919 ns | +163 ns |
+| intercalados, regras Adblock | +1132–1154 ns | +147–262 ns |
+
+Disputa entre threads, por consulta (`state::<Adlists>()` + `find` antes, `with_state` + `find`
+depois; nomes intercalados):
+
+| Threads | Antes | Depois |
+|---|---|---|
+| 1 | 52 ns | 28 ns |
+| 4 | 493 ns | 34 ns |
+| 8 | 1060 ns | 47 ns |
+
+`Forwarder::state()` sozinho (ainda usado por `limit` e zonas, gap G4.1zl): 1 thread 23–28 → 24 ns;
+4 threads 300–317 → 119 ns; 8 threads 730–926 → 258 ns.
+
+Daemon de verdade (`scripts/dns-stress-lab.sh --userns --tests adlist`, 4 CPUs para o roteador,
+duas rodadas de cada): parte da CPU no caminho da adlist (`perf record -g` de 15 s durante a carga
+de saturação):
+
+| Carga | Antes | Depois |
+|---|---|---|
+| sem lista | 1,5–2,0 % | 1,1–1,2 % |
+| lista de 1 M, nomes intercalados | 7,2–7,7 % | 3,5–4,7 % |
+| lista de 1 M, nomes do laboratório | 4,1–4,5 % | 3,8–4,5 % |
+
+Montar o conjunto de 1 M (`dns_adlist/parse_and_build_1m`): 304 → 406 ms no criterion (o índice
+custa um hash por nome; a carga no laboratório ficou em 0,5–1,3 s nos dois).
+
+### G4.1zd — log de consultas DNS: formato, fila e escritor (**medido**, 2026-11-12)
+
+AMD Ryzen AI MAX+ 395 (32 threads), release, máquina compartilhada (load 11–36). Carga sintética: 200 mil nomes Zipf s=1,0, 4096 clientes (70 % CGNAT IPv4, 30 % IPv6), A/AAAA/HTTPS, 75 % cache; blocos de 65 536 consultas.
+
+| Formato | Cru | deflate-1 | deflate-6 | zstd-fast |
+|---|---|---|---|---|
+| texto (Unbound) | 85 B | 28,7 B | 21,7 B | 27,4 B |
+| JSON (AdGuard) | 183 B | 33,4 B | 24,3 B | 33,6 B |
+| binário com tabelas por bloco | 16,7 B | 12,3 B | 11,4 B | 13,9 B |
+
+| Fila por consulta | 1 thread | 4 threads | 16 threads |
+|---|---|---|---|
+| `Mutex<Vec>` | 37 ns | 517 ns | 4 767 ns |
+| `sync_channel` | 47 ns | 866 ns | 4 454 ns |
+| buffer por faixa + canal de buffers | 64 ns | 70 ns | 71 ns |
+
+Escritor (`benches/querylog.rs`, `dns_log_writer_65536`): 11,4 ms por bloco de 65 536 consultas = 174 ns/consulta (~5,7 M consultas/s numa thread). Busca (deflate-1, decodificando tudo e filtrando por cliente): 12 M consultas/s com 1 thread, 77 M/s com 8.
+
+Instruções por consulta na cadeia real (`perf stat -e instructions:u`, laço fixo de consultas estáticas, perfil release do workspace; exato entre execuções, ao contrário do tempo de parede, que variou ±30% com load 11–36): `main` 14 011; branch com o log desligado 14 058 (+47, +0,34%). A primeira versão, com `ip.dns_log` inline no `Ip`, dava 14 314 (+2,2%). Pela bisseção, o `Ip` ~100 bytes maior junto com a etapa a mais mudava o código gerado. A seção foi para um `CowArc`. Log ligado: +860 instruções na thread que responde (+5,6%) e +1 300 no escritor, em outra thread.
+
+### G4.1zf — DNS over TLS no servidor (**medido**, 2026-11-13)
+
+AMD Ryzen AI MAX+ 395 (32 threads), máquina carregada (load 22–33, outras sessões compilando),
+daemon release no laboratório virtual (loopback), `dnsperf` 2.14 com 16 clientes, 500 em voo,
+8 s, um nome estático (o caminho do acerto). Duas rodadas cada, alternadas.
+
+| Transporte | Consultas/s | Perdidas | Latência média |
+|---|---|---|---|
+| UDP 53 | 217–258 mil | 0 | 0,17–0,40 ms |
+| TCP 53, padrão (20 sessões, 5 por endereço) | 57 | 69 % | — |
+| TCP 53 com `max_concurrent_tcp_sessions=1000` | 148–167 mil | 0,06 % | 0,23–0,28 ms |
+| DoT (este PR, laço de eventos) | 177–191 mil | 0 | 1,2–1,9 ms |
+
+- 2000 conexões DoT paradas: +16,7 MB no processo (~8 KB por conexão) e **nenhuma thread a mais**
+  (79 antes e depois); 2000 handshakes em 1,2 s (limitado pelo cliente Python).
+- Custo do TLS por consulta (programa à parte, rustls 0.23.46 + ring): 0,4–0,6 µs; handshake
+  completo ECDSA P-256 92–142 µs, RSA-2048 490–820 µs; retomada 70–143 µs.
+
+### G4.1zf — DNS over HTTPS no servidor (**medido**, 2026-11-13)
+
+AMD Ryzen AI MAX+ 395 (32 threads), load 13–25, daemon release no laboratório virtual (loopback),
+`dnsperf` 2.14 com 16 clientes, 500 em voo, 8 s, um nome estático; duas rodadas alternadas.
+
+| Transporte | Consultas/s | Perdidas | Latência média |
+|---|---|---|---|
+| DoT | 197–210 mil | 0 | 1,2–1,4 ms |
+| DoH (HTTP/2) | 196–230 mil | 0 | 1,7–1,9 ms |
+
+O DoH em HTTP/2 rende o mesmo que o DoT: o custo é o encaminhador e o TLS, não o HTTP/2 (HPACK
+literal na resposta, um quadro HEADERS e um DATA).

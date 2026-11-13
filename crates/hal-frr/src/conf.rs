@@ -173,6 +173,9 @@ pub fn overwrite_key(line: &str) -> Option<String> {
         "description",
         "router-id",
         "ospf router-id",
+        // G3.4r: ospfd sets every max-lsa value from one line; `no max-lsa`
+        // first would leave the ignore state and forget the periods.
+        "max-lsa",
         // G3.4: OSPF interface values and keys, one each.
         "ospf6 router-id",
         "ip ospf network",

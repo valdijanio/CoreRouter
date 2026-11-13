@@ -9,7 +9,7 @@
 //! download keeps the names it had and is tried again after [`RETRY`].
 //!
 //! Hostile input: the body is capped at [`MAX_BYTES`], all lists together
-//! at [`MAX_NAMES`] names (about 30 bytes each in memory), and the text is
+//! at [`MAX_NAMES`] names (about 45 bytes each in memory), and the text is
 //! parsed line by line with every name checked (`proto-dns`, `adlist.rs`).
 //! A `file` list is read from `--adlist-dir` only (a file name, never a
 //! path: the config checks it).
@@ -32,7 +32,7 @@ pub(crate) const REFRESH: Duration = Duration::from_secs(4 * 3600);
 pub(crate) const RETRY: Duration = Duration::from_secs(600);
 /// Largest list downloaded or read (the biggest public lists are ~30 MB).
 pub(crate) const MAX_BYTES: usize = 64 * 1024 * 1024;
-/// Names of all lists together (~60 MB of memory).
+/// Names of all lists together (~90 MB of memory).
 pub(crate) const MAX_NAMES: usize = 2_000_000;
 /// One download, redirects included.
 const TIMEOUT: Duration = Duration::from_secs(120);

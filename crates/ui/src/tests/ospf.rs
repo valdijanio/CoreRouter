@@ -240,3 +240,41 @@ fn routes_page_on_the_router_and_the_map_is_not_sent_again() {
     assert_eq!((panel(&mut h).topo.nodes.len(), panel(&mut h).topo.token.clone()), (nodes, token));
     assert!(panel(&mut h).topology["nodes"].as_array().is_some_and(|n| n.len() == nodes));
 }
+
+/// G3.4r: the LSDB column (the count against the limit), the modal's LSDB
+/// Protection page (its fields and what the database holds now) and
+/// Clear LSDB Protection, greyed while nothing is held down.
+#[test]
+fn lsdb_protection_column_page_and_clear() {
+    let mut h = open(lab());
+    tab(&mut h, Tab::Instances);
+    assert!(h.has_text("LSDB"));
+    lock(&h.session).execute("routing.ospf.instance.set", &json!({"id": "v2", "max_lsa": 50_000})).unwrap();
+    refresh(&mut h);
+    assert!(h.has_text_containing("0 / 50 000"), "{:?}", panel(&mut h).instances);
+    assert!(h.has_text("Clear LSDB Protection"));
+    // Selected, it stays greyed: the lab's protection is normal.
+    h.click(h.text("10.255.0.1"));
+    h.idle();
+    h.click(h.text("Clear LSDB Protection"));
+    settle(&mut h);
+    assert!(!h.app.log().iter().any(|l| l.command.contains("clear-lsdb-protection")), "{:?}", h.app.log());
+    // The edit modal: General first; LSDB Protection shows the fields.
+    h.click(h.text("10.255.0.1"));
+    h.click(h.text("10.255.0.1"));
+    settle(&mut h);
+    assert!(panel(&mut h).modal.is_some());
+    assert!(h.has_text("Router ID") && !h.has_text("Ignore Count"));
+    h.click(h.text("LSDB Protection"));
+    settle(&mut h);
+    assert!(h.has_text("Ignore Count") && h.has_text("Warning Threshold"));
+    assert!(h.has_text_containing("Now: 0 LSAs of other routers"), "{:?}", panel(&mut h).instances);
+    let (_, m) = panel(&mut h).modal.as_mut().unwrap();
+    assert_eq!(m.values["max_lsa"], "50000");
+    m.values.insert("max_lsa_ignore_time", "60".into());
+    settle(&mut h);
+    h.click(h.text("OK"));
+    settle(&mut h);
+    let m = lock(&h.session).store().running().routing.ospf.instances["v2"].max_lsa.unwrap();
+    assert_eq!((m.limit, m.ignore_time), (50_000, 60), "{:?}", h.app.log());
+}
