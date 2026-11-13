@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use super::args::{opt_bool, opt_str, opt_text, opt_u32, req_parse};
 use super::interface::{new_name, refuse_unmanaged};
 use super::{CommandSpec, always};
+use crate::sealing::SealKey;
 use crate::wireguard as wg;
 use crate::{EngineError, Result, Session};
 
@@ -115,8 +116,8 @@ pub(super) fn wireguard_of<'a>(cfg: &'a Config, key: &str, name: &IfName) -> Res
 
 /// Mutable access for a command that already checked `name` with
 /// [`wireguard_of`].
-pub(super) fn wireguard_mut<'a>(s: &'a mut Session, name: &IfName) -> Option<&'a mut Wireguard> {
-    match s.store_mut().candidate_mut().interfaces.get_mut(name).map(|i| &mut i.kind) {
+pub(super) fn wireguard_mut<'a>(cfg: &'a mut Config, name: &IfName) -> Option<&'a mut Wireguard> {
+    match cfg.interfaces.get_mut(name).map(|i| &mut i.kind) {
         Some(InterfaceKind::Wireguard(w)) => Some(w),
         _ => None,
     }
@@ -199,8 +200,7 @@ fn private_of(p: &Value) -> Result<Option<(wg::Key, bool)>> {
 }
 
 /// Seal `key` and store it with its public key on `w`.
-fn store_key(s: &mut Session, w: &mut Wireguard, key: &wg::Key) -> Result<()> {
-    let seal = crate::sealing::key(s).map_err(EngineError::Internal)?;
+fn store_key(seal: &SealKey, w: &mut Wireguard, key: &wg::Key) -> Result<()> {
     w.private_key = seal.seal(&wg::encode(key)).map_err(EngineError::Internal)?;
     w.public_key = wg::wg_key(&wg::public_of(key));
     Ok(())
@@ -224,9 +224,15 @@ fn check_own_key(w: &Wireguard) -> Result<()> {
 
 fn add(s: &mut Session, p: &Value) -> Result<Value> {
     refuse_unmanaged(s, p, &["name"])?;
+    let seal = crate::sealing::key(s).map_err(EngineError::Internal)?;
+    add_on(s.store_mut().candidate_mut(), &seal, p)
+}
+
+/// `interface.wireguard.add` on `cfg` (the candidate, or a copy for the
+/// preview).
+pub(super) fn add_on(cfg: &mut Config, seal: &SealKey, p: &Value) -> Result<Value> {
     let comment = opt_text(p, "comment", 256)?.unwrap_or_default();
     let disabled = opt_bool(p, "disabled")?.unwrap_or(false);
-    let cfg = s.store().candidate();
     let mut named = p.clone();
     if p.get("name").is_none_or(|v| v.as_str().is_some_and(|t| t.trim().is_empty()))
         && let Some(o) = named.as_object_mut()
@@ -248,7 +254,7 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
         None => (wg::generate_private().map_err(EngineError::Internal)?, true),
     };
     let mut w = Wireguard::new(port);
-    store_key(s, &mut w, &key)?;
+    store_key(seal, &mut w, &key)?;
     let public = w.public_key.to_string();
     warnings.push(format!(
         "next: give {name} an address (ip.address.add) and add its peers \
@@ -258,13 +264,20 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
     iface.mtu = mtu;
     iface.disabled = disabled;
     iface.comment = comment;
-    s.store_mut().candidate_mut().interfaces.insert(name.clone(), iface);
+    cfg.interfaces.insert(name.clone(), iface);
     Ok(json!({ "name": name, "public_key": public, "warnings": warnings }))
 }
 
 fn set(s: &mut Session, p: &Value) -> Result<Value> {
     let name: IfName = req_parse(p, "name")?;
-    let cfg = s.store().candidate();
+    wireguard_of(s.store().candidate(), "name", &name)?;
+    let seal = crate::sealing::key(s).map_err(EngineError::Internal)?;
+    set_on(s.store_mut().candidate_mut(), &seal, p)
+}
+
+/// `interface.wireguard.set` on `cfg`.
+pub(super) fn set_on(cfg: &mut Config, seal: &SealKey, p: &Value) -> Result<Value> {
+    let name: IfName = req_parse(p, "name")?;
     wireguard_of(cfg, "name", &name)?;
     let port = port_of(p)?;
     let mtu = mtu_of(p)?;
@@ -275,13 +288,13 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         check_port(cfg, &name, port, &mut warnings)?;
     }
     let key = private_of(p)?;
-    let mut w = wireguard_of(s.store().candidate(), "name", &name)?.clone();
+    let mut w = wireguard_of(cfg, "name", &name)?.clone();
     if let Some(port) = port {
         w.listen_port = port;
     }
     if let Some((k, _)) = &key {
         let before = w.public_key.clone();
-        store_key(s, &mut w, k)?;
+        store_key(seal, &mut w, k)?;
         check_own_key(&w)?;
         if w.public_key != before && !w.peers.is_empty() {
             warnings.push(format!(
@@ -293,7 +306,7 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     let public = w.public_key.to_string();
-    if let Some(i) = s.store_mut().candidate_mut().interfaces.get_mut(&name) {
+    if let Some(i) = cfg.interfaces.get_mut(&name) {
         i.kind = InterfaceKind::Wireguard(Box::new(w));
         if let Some(m) = mtu {
             i.mtu = m;
@@ -368,17 +381,11 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
         } else {
             s.wireguard_status(name)
         };
+        let by_key = wg::status_by_key(status.as_ref());
         let up = w
             .peers
             .iter()
-            .filter(|peer| {
-                let st = status.as_ref().and_then(|st| {
-                    let k = wg::decode(peer.public_key.as_str())?;
-                    st.peers.iter().find(|x| x.public_key == k)
-                });
-                let age = st.and_then(|x| x.last_handshake_unix).map(|t| now.saturating_sub(t));
-                PeerState::of(peer, iface.disabled, age, st.is_some_and(|x| x.tx_bytes > 0)) == PeerState::Up
-            })
+            .filter(|peer| wg::peer_view(peer, iface.disabled, &by_key, now).0 == PeerState::Up)
             .count();
         rows.push(json!({
             "name": name,

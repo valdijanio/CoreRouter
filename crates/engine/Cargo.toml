@@ -68,6 +68,10 @@ name = "mpls_page"
 harness = false
 
 [[bench]]
+name = "wireguard_list"
+harness = false
+
+[[bench]]
 name = "execute"
 harness = false
 

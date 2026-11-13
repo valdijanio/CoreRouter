@@ -133,7 +133,7 @@ fn test_packet(s: &Session, p: &Value) -> Result<Packet> {
     })
 }
 
-fn test(s: &mut Session, p: &Value) -> Result<Value> {
+pub(super) fn test(s: &mut Session, p: &Value) -> Result<Value> {
     let packet = test_packet(s, p)?;
     let running = super::args::opt_bool(p, "running")?.unwrap_or(false);
     let cfg = if running {
