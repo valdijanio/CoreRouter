@@ -1110,6 +1110,31 @@ andamento limita os misses a `max_concurrent_queries` / RTT (100 / 20 ms = 5 mil
 threads e o cliente do cache sofrendo); o próximo passo é um laço de eventos no upstream (um socket
 para muitas consultas), como o Unbound.
 
+**Quem fica no cache cheio (G4.1x): W-TinyLFU.** O cache despejava pela expiração, que com TTLs
+iguais é a ordem de chegada: uma tempestade de nomes únicos (20 000/s) virava o cache de 64 MiB em
+~5 s e levava os nomes quentes (15 399 SERVFAIL em 15 s para o cliente legítimo, VM). Comparamos
+seis políticas numa simulação com os parâmetros da bateria (10 000 nomes quentes a 2000/s, cache
+de ~95 000 respostas; Zipf para tráfego normal; rajadas de um nome novo pedido 3 vezes), acerto
+do cliente legítimo, **medido**:
+
+| Política | Ataque 5 mil/s | 20 mil/s | 50 mil/s | Zipf 0,9 | Zipf + ataque | Rajadas (máx. 66,7 %) |
+|---|---|---|---|---|---|---|
+| Expiração (antes) | 81,0 % | 48,1 % | 27,0 % | 45,6 % | 29,9 % | 66,7 % |
+| LRU (Unbound, PowerDNS) | 97,4 % | 59,5 % | 30,9 % | 49,1 % | 33,1 % | 66,7 % |
+| SIEVE (BIND 9.21) | 99,5 % | 89,9 % | 75,4 % | 55,7 % | 48,3 % | 66,7 % |
+| SLRU 20/80 | 99,5 % | 89,9 % | 75,4 % | 55,7 % | 48,3 % | 66,7 % |
+| TinyLFU + SLRU, sem janela | 100 % | 98,6 % | 91,0 % | 57,3 % | 49,6 % | **11,3 %** |
+| **W-TinyLFU, janela de 1 %** | 100 % | 98,5 % | 91,0 % | 57,3 % | 49,6 % | 66,7 % |
+
+Ficou o W-TinyLFU (o do Caffeine): a admissão por frequência é o que segura a tempestade, e a
+janela evita o custo do TinyLFU puro com nomes novos pedidos em rajada. Sem a subida de colina
+do Caffeine (janela fixa em 1 %): na troca do conjunto quente ele perdeu 1,7 ponto para o LRU
+(94,6 % × 96,3 %), pouco para o código que custaria. O mapa virou `HashMap` com hash com chave e
+slots ligados em listas (O(1) por consulta): o acerto num cache cheio de 64 MiB caiu de 369 para
+85 ns (criterion) e de 1676 para 1132 instruções; o miss de um nome único que vai ao cache gasta
+4440 → 3202 instruções, mas ~+100 ns de relógio (mais faltas de cache de CPU no `HashMap` e no
+sketch), ~0,15 % do custo de um miss no daemon (~67 µs).
+
 **Zonas autoritativas (G4.1c-1): a busca é nossa, numa etapa da cadeia.** O plano era servir as
 zonas pelo `hickory-server`. A versão 0.26.3 não tem IXFR, NOTIFY (enviado ou recebido), zona
 secundária nem ACL de IP para AXFR, e a busca dela é async (tokio), fora da cadeia síncrona que

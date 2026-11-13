@@ -63,7 +63,7 @@ const RANDOM_NAMES: u64 = 200;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "ip.dns.statistics.print", "DNS Statistics", [], None,
-        "{top?: int 1..100 (clients, names and failing domains listed, default 10)} → {resolver: router|simulated, allow_remote_requests, since (unix time counting started), elapsed_secs, queries, udp, tcp, transport: {udp4, udp6, tcp4, tcp6, truncated, socket_drops}, malformed, answered: {cache, static, upstream, stale, refused, limit, busy, malformed, …}, cache_hit_percent, rcodes: {noerror, nxdomain, servfail, refused, formerr, notimp, dropped, …}, ede: [{code, name, replies}] (RFC 8914, most first), types: [{type, queries}], latency: {p50_ms, p90_ms, p99_ms, buckets: [{below_us (null: the last, open), replies}], ranges: [{range (ms), replies}]} (since the reset), in_flight, in_flight_peak, max_concurrent_queries, encrypted_in: {on, dot, doh, queries, dot_queries, doh_queries, sessions} (DNS over TLS and HTTPS, G4.1zf; also counted as tcp), limit_hits, now: {window_secs, queries_per_sec, cache_hit_percent, servfail_percent, latency_p50_ms, latency_p99_ms, evictions}|null (the last minute; null before the first readings), cache: {entries, used_bytes, max_bytes, evicted, expired, stale_served, types: [{type, entries}]}|null, clients: [{address (IPv6: its /56), queries, queries_per_sec, nxdomain, nxdomain_percent, refused, limited, error, seen_secs}], clients_tracked, clients_replaced, names: [{name, queries, queries_per_sec, error}], names_tracked, names_replaced, failing_domains: [{domain, nxdomain, servfail, failures_per_sec, names (different names failed, ±6.5 %), error, random}], domains_tracked, domains_replaced, upstreams: [{server, via (udp|dot|doh), answers, answers_per_sec, srtt_ms, rtt_p50_ms, rtt_p95_ms, timeouts, timeouts_percent, servfails, servfail_percent, truncated, failures, down, state (up|slow|down), state_secs, rtt_ranges: [6 counts, ms ranges as latency.ranges]}], rtt_ranges: [{range, replies}] (all upstreams), warnings: [{key (upstream_down|upstream_timeouts|servfail_high|limit_reached|cache_evicting|socket_drops|random_subdomain), severity (warning|error), text, args}]}",
+        "{top?: int 1..100 (clients, names and failing domains listed, default 10)} → {resolver: router|simulated, allow_remote_requests, since (unix time counting started), elapsed_secs, queries, udp, tcp, transport: {udp4, udp6, tcp4, tcp6, truncated, socket_drops}, malformed, answered: {cache, static, upstream, stale, refused, limit, busy, malformed, …}, cache_hit_percent, rcodes: {noerror, nxdomain, servfail, refused, formerr, notimp, dropped, …}, ede: [{code, name, replies}] (RFC 8914, most first), types: [{type, queries}], latency: {p50_ms, p90_ms, p99_ms, buckets: [{below_us (null: the last, open), replies}], ranges: [{range (ms), replies}]} (since the reset), in_flight, in_flight_peak, max_concurrent_queries, encrypted_in: {on, dot, doh, queries, dot_queries, doh_queries, sessions} (DNS over TLS and HTTPS, G4.1zf; also counted as tcp), limit_hits, now: {window_secs, queries_per_sec, cache_hit_percent, servfail_percent, latency_p50_ms, latency_p99_ms, evictions}|null (the last minute; null before the first readings), cache: {entries, used_bytes, max_bytes, evicted, expired, rejected (new answers not kept: the cache was full of names asked more often, G4.1x), stale_served, types: [{type, entries}]}|null, clients: [{address (IPv6: its /56), queries, queries_per_sec, nxdomain, nxdomain_percent, refused, limited, error, seen_secs}], clients_tracked, clients_replaced, names: [{name, queries, queries_per_sec, error}], names_tracked, names_replaced, failing_domains: [{domain, nxdomain, servfail, failures_per_sec, names (different names failed, ±6.5 %), error, random}], domains_tracked, domains_replaced, upstreams: [{server, via (udp|dot|doh), answers, answers_per_sec, srtt_ms, rtt_p50_ms, rtt_p95_ms, timeouts, timeouts_percent, servfails, servfail_percent, truncated, failures, down, state (up|slow|down), state_secs, rtt_ranges: [6 counts, ms ranges as latency.ranges]}], rtt_ranges: [{range, replies}] (all upstreams), warnings: [{key (upstream_down|upstream_timeouts|servfail_high|limit_reached|cache_evicting|socket_drops|random_subdomain), severity (warning|error), text, args}]}",
         always, print),
     cmd!(
         "ip.dns.statistics.reset",
@@ -94,7 +94,7 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
     let mut out = render(&snap);
     let servers = backend.as_ref().map(|b| b.server_stats()).unwrap_or_default();
     let cache = backend.as_ref().and_then(|b| b.cache_stats());
-    let (bases, (evicted_base, expired_base)) = s.dns_bases();
+    let (bases, (evicted_base, expired_base, rejected_base)) = s.dns_bases();
     let readings = s.dns_readings();
     let minute = last(&readings, 60);
     let dns = &s.store().running().ip.dns;
@@ -128,6 +128,7 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
                 "max_bytes": c.budget_bytes,
                 "evicted": c.evicted.saturating_sub(evicted_base),
                 "expired": c.expired.saturating_sub(expired_base),
+                "rejected": c.rejected.saturating_sub(rejected_base),
                 "stale_served": stale,
                 "types": c.by_type.iter().map(|(t, n)| json!({"type": type_name(*t), "entries": n})).collect::<Vec<_>>(),
             })
@@ -456,7 +457,7 @@ pub(super) fn metrics(s: &Session) -> Value {
         .collect();
     let cache = backend.as_ref().and_then(|b| b.cache_stats()).map_or(Value::Null, |k| {
         json!({"entries": k.entries, "used_bytes": k.used_bytes, "max_bytes": k.budget_bytes,
-            "evicted": k.evicted, "expired": k.expired})
+            "evicted": k.evicted, "expired": k.expired, "rejected": k.rejected})
     });
     json!({
         "answered": c.answered,
@@ -672,6 +673,7 @@ mod tests {
                 budget_bytes: 2048,
                 evicted: *self.evicted.lock().unwrap(),
                 expired: 1,
+                rejected: 3,
                 by_type: vec![(1, 2)],
             })
         }
@@ -734,6 +736,7 @@ mod tests {
         assert_eq!(now["evictions"], 40);
         let cache = &out["cache"];
         assert_eq!(cache["evicted"], 40, "5 were before the reset");
+        assert_eq!(cache["rejected"], 0, "the 3 were before the reset");
         assert_eq!(cache["types"][0], json!({"type": "A", "entries": 2}));
         let up = &out["upstreams"][0];
         assert_eq!(up["server"], "192.0.2.53");

@@ -570,6 +570,7 @@ fn dns(out: &mut String, d: &Value) {
             ("max_bytes", "corerouter_dns_cache_max_bytes", "gauge", "The DNS cache's budget (ip.dns cache-size)."),
             ("evicted", "corerouter_dns_cache_evictions_total", "counter", "Valid answers pushed out of the cache to make room."),
             ("expired", "corerouter_dns_cache_expired_total", "counter", "Answers dropped from the cache after their TTL and stale window."),
+            ("rejected", "corerouter_dns_cache_rejected_total", "counter", "New answers not kept: the cache was full of names asked more often."),
         ] {
             if let Some(n) = num(c, key) {
                 family(out, metric, kind, help);
@@ -1032,7 +1033,7 @@ mod tests {
                 "in_flight": 3, "in_flight_peak": 7, "max_concurrent_queries": 100,
                 "upstreams": [{"server": "1.1.1.1", "via": "dot", "answers": 9, "failures": 2,
                     "timeouts": 1, "servfails": 1, "truncated": 0, "srtt_ms": 12, "down": false}],
-                "cache": {"entries": 30, "used_bytes": 4096, "max_bytes": 2_097_152, "evicted": 0, "expired": 5},
+                "cache": {"entries": 30, "used_bytes": 4096, "max_bytes": 2_097_152, "evicted": 0, "expired": 5, "rejected": 7},
             },
             "health": {"status": "warning", "checks": [
                 {"key": "cpu", "severity": "ok"},
@@ -1110,6 +1111,7 @@ mod tests {
             "corerouter_dns_upstream_srtt_seconds{server=\"1.1.1.1\"} 0.012",
             "corerouter_dns_cache_entries 30",
             "corerouter_dns_cache_expired_total 5",
+            "corerouter_dns_cache_rejected_total 7",
         ] {
             assert!(t.lines().any(|l| l == line), "no `{line}` in:\n{t}");
         }

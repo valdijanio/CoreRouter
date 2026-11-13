@@ -203,6 +203,7 @@ pub(crate) const HELP_KEYS: &[&str] = &[
     "dns_statistics.encrypted_in",
     "dns_statistics.evicted",
     "dns_statistics.expired",
+    "dns_statistics.rejected",
     "dns_statistics.in_flight",
     "dns_statistics.latency",
     "dns_statistics.malformed",
@@ -919,6 +920,9 @@ impl DnsStatsPanel {
             ui.end_row();
             label(ui, help, l, "dns_statistics.expired", "Expired");
             ui.label(n(&c, "expired").to_string());
+            ui.end_row();
+            label(ui, help, l, "dns_statistics.rejected", "Not admitted");
+            ui.label(n(&c, "rejected").to_string());
             ui.end_row();
             label(ui, help, l, "dns_statistics.stale_served", "Stale served");
             ui.label(n(&c, "stale_served").to_string());

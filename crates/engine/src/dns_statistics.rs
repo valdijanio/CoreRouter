@@ -134,7 +134,8 @@ struct DnsStatsRuntime {
     /// What the resolver had counted at the last reset: per server, and
     /// the cache's evictions and expiries.
     upstream_base: Vec<(IpAddr, ServerStats)>,
-    cache_base: (u64, u64),
+    /// The cache's (evicted, expired, rejected) at the reset.
+    cache_base: (u64, u64, u64),
 }
 
 impl Session {
@@ -166,7 +167,7 @@ impl Session {
 
     /// What the resolver had counted at the last reset (servers, and the
     /// cache's evictions and expiries).
-    pub fn dns_bases(&self) -> (Vec<(IpAddr, ServerStats)>, (u64, u64)) {
+    pub fn dns_bases(&self) -> (Vec<(IpAddr, ServerStats)>, (u64, u64, u64)) {
         self.ext::<DnsStatsRuntime>()
             .map(|rt| (rt.upstream_base.clone(), rt.cache_base))
             .unwrap_or_default()
@@ -190,12 +191,12 @@ impl Session {
     }
 
     /// The resolver's counts now: per server, and the cache's (evicted,
-    /// expired).
-    fn dns_resolver_counts(&self) -> (Vec<(IpAddr, ServerStats)>, (u64, u64)) {
+    /// expired, rejected).
+    fn dns_resolver_counts(&self) -> (Vec<(IpAddr, ServerStats)>, (u64, u64, u64)) {
         let Some(b) = self.dns_backend() else {
-            return (Vec::new(), (0, 0));
+            return (Vec::new(), (0, 0, 0));
         };
-        let cache = b.cache_stats().map_or((0, 0), |c| (c.evicted, c.expired));
+        let cache = b.cache_stats().map_or((0, 0, 0), |c| (c.evicted, c.expired, c.rejected));
         (b.server_stats(), cache)
     }
 

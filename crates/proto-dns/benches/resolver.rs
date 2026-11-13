@@ -1,10 +1,16 @@
 //! G4.1a — the router's resolver: encode a query, check and read a reply
-//! (CNAME + two A records + SOA), and a cache hit among 10 000 entries.
+//! (CNAME + two A records + SOA), a cache hit among 10 000 entries, and a
+//! full 64 MiB cache: a hit and a unique name's miss + store (G4.1x).
 //!
 //! `cargo xtask bench` runs it; alone: `cargo bench -p corerouter-proto-dns --bench resolver`.
 
 // A benchmark is test code: fixtures may unwrap (clippy.toml only covers #[test]).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::hint::black_box;
 use std::net::Ipv4Addr;
@@ -109,6 +115,46 @@ fn bench(c: &mut Criterion) {
         })
     });
     assert!(full.len() >= filled / 2);
+
+    // G4.1x: the lab's 64 MiB cache, full (~95 000 answers), its first
+    // 10 000 names asked again (the hot ones). A hit on them, and the
+    // path of a unique name (the miss's lookup, then its answer stored:
+    // something is evicted, or it is refused).
+    let mut big = Cache::new(64 << 20);
+    let mut j = 0u32;
+    while big.used_bytes() + 1024 < 64 << 20 {
+        j += 1;
+        let name = format!("h{j}.example");
+        big.get(&name, RecordType::A, 0);
+        big.put(&name, RecordType::A, &rec(j), None, 0, 604_800, 60);
+    }
+    let hot: Vec<String> = (1..=10_000).map(|i| format!("h{i}.example")).collect();
+    for name in &hot {
+        big.get(name, RecordType::A, 1);
+    }
+    let mut k = 0usize;
+    c.bench_function("dns_cache_hit_64mib", |b| {
+        b.iter(|| {
+            k = (k + 1) % hot.len();
+            big.get(black_box(&hot[k]), RecordType::A, 1000)
+        })
+    });
+    // Random names, like an attack's (sequential ones would favour an
+    // ordered map by locality).
+    let names: Vec<String> = (0..1_000_000u64)
+        .map(|i| format!("{:016x}.wt.example", i.wrapping_mul(0x9e37_79b9_7f4a_7c15)))
+        .collect();
+    let answer = rec(7);
+    let mut u = 0usize;
+    c.bench_function("dns_cache_flood_64mib", |b| {
+        b.iter(|| {
+            u = (u + 1) % names.len();
+            let name = &names[u];
+            if big.get(black_box(name), RecordType::A, 2000).is_none() {
+                big.put(name, RecordType::A, &answer, None, 2000, 604_800, 60);
+            }
+        })
+    });
 }
 
 criterion_group!(benches, bench);
