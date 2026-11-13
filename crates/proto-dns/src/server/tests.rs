@@ -471,6 +471,144 @@ fn big_udp_answers_are_truncated() {
     );
 }
 
+/// `packet` with EDNS (payload 1232), as a client that understands it.
+fn with_edns(packet: &[u8]) -> Vec<u8> {
+    let mut q = Message::from_vec(packet).unwrap();
+    let mut e = Edns::new();
+    e.set_max_payload(1232);
+    q.set_edns(e);
+    q.to_vec().unwrap()
+}
+
+/// The RFC 8914 options of a reply: (INFO-CODE, EXTRA-TEXT).
+fn ede_of(m: &Message) -> Vec<(u16, String)> {
+    let Some(e) = m.edns.as_ref() else {
+        return Vec::new();
+    };
+    e.options()
+        .options
+        .iter()
+        .filter_map(|(_, o)| match o {
+            hickory_proto::rr::rdata::opt::EdnsOption::Unknown(EDE_OPTION, data) => Some((
+                u16::from_be_bytes([data[0], data[1]]),
+                String::from_utf8(data[2..].to_vec()).unwrap(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// G4.1ze, RFC 8914: the extended error goes to a client that sent an OPT
+/// (§2), never to one that did not; one option, code and short text.
+#[test]
+fn extended_errors_are_sent_with_edns() {
+    let f = forwarder(|c| {
+        c.ip.dns_static
+            .entries
+            .push(entry(1, "ads.lan", StaticType::Nxdomain, |_| {}));
+    });
+    let mut up = Up::new();
+    // §4.19 Prohibited: outside allowed_from.
+    let q = ask("www.example.com.", RecordType::A);
+    let m = run(&f, &mut up, [203, 0, 113, 9], &with_edns(&q)).unwrap();
+    assert_eq!(m.metadata.response_code, ResponseCode::Refused);
+    assert_eq!(
+        ede_of(&m),
+        [(18, "client not allowed by this resolver".to_owned())]
+    );
+    let m = run(&f, &mut up, [203, 0, 113, 9], &q).unwrap();
+    assert!(
+        m.edns.is_none(),
+        "no OPT in the query: none in the reply (§2)"
+    );
+    // §4.4 Stale Answer, §4.23 No Reachable Authority.
+    run(&f, &mut up, LAN, &q).unwrap();
+    up.now += 301_000;
+    up.down = true;
+    let m = run(&f, &mut up, LAN, &with_edns(&q)).unwrap();
+    assert_eq!(m.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(ede_of(&m).first().map(|e| e.0), Some(3), "RFC 8767 stale");
+    let m = run(
+        &f,
+        &mut up,
+        LAN,
+        &with_edns(&ask("other.example.", RecordType::A)),
+    )
+    .unwrap();
+    assert_eq!(m.metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(ede_of(&m).first().map(|e| e.0), Some(22));
+    // A plain answer has none.
+    let m = run(
+        &f,
+        &mut up,
+        LAN,
+        &with_edns(&ask("ads.lan.", RecordType::A)),
+    )
+    .unwrap();
+    assert_eq!(m.metadata.response_code, ResponseCode::NXDomain);
+    assert!(
+        ede_of(&m).is_empty(),
+        "a static NXDOMAIN is the operator's answer, not an error"
+    );
+}
+
+/// RFC 8914 §2: the option on the wire, code 15, INFO-CODE in network
+/// order, EXTRA-TEXT without a NUL.
+#[test]
+fn ede_option_wire_format() {
+    let mut e = Edns::new();
+    e.options_mut().insert(ede_option(22));
+    let mut m = Message::response(1, OpCode::Query);
+    m.set_edns(e);
+    let bytes = m.to_vec().unwrap();
+    let text = b"no upstream server answered";
+    let mut want = vec![0, 15];
+    want.extend_from_slice(&u16::try_from(2 + text.len()).unwrap().to_be_bytes());
+    want.extend_from_slice(&[0, 22]);
+    want.extend_from_slice(text);
+    assert!(
+        bytes.windows(want.len()).any(|w| w == want.as_slice()),
+        "{bytes:02x?}"
+    );
+}
+
+/// RFC 8914 §3: a UDP reply too large drops its EDE first and sets TC,
+/// keeping the records; only if still too large, the records go.
+#[test]
+fn ede_is_dropped_first_when_the_reply_is_too_large() {
+    let mut m = Message::response(1, OpCode::Query);
+    for i in 0..20u8 {
+        m.add_answer(Record::from_rdata(
+            Name::from_ascii("a.lan.").unwrap(),
+            60,
+            RData::A(A::new(10, 0, 0, i)),
+        ));
+    }
+    let mut e = Edns::new();
+    e.options_mut().insert(ede_option(3));
+    m.set_edns(e);
+    let whole = m.to_vec().unwrap().len();
+    let mut bare = m.clone();
+    bare.edns
+        .as_mut()
+        .unwrap()
+        .options_mut()
+        .remove(EdnsCode::from(EDE_OPTION));
+    let without = bare.to_vec().unwrap().len();
+    assert!(without < whole);
+    let (b, tc) = fit(m.clone(), whole).unwrap();
+    assert!(!tc && b.len() == whole, "fits: as it is");
+    let (b, tc) = fit(m.clone(), without).unwrap();
+    let r = Message::from_vec(&b).unwrap();
+    assert!(
+        tc && r.metadata.truncation && r.answers.len() == 20 && ede_of(&r).is_empty(),
+        "EDE dropped, TC set"
+    );
+    let (b, tc) = fit(m, without - 1).unwrap();
+    let r = Message::from_vec(&b).unwrap();
+    assert!(tc && r.answers.is_empty(), "then the records");
+}
+
 #[test]
 fn negative_answers_carry_the_soa() {
     let f = forwarder(|_| {});
