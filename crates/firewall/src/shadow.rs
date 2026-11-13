@@ -175,6 +175,10 @@ fn covers_as(
         && field(&ma.icmp_options, &mb.icmp_options, |x, y| {
             x.kind == y.kind && x.code.is_none_or(|c| Some(c) == y.code)
         })
+        // `a` looks at fewer flags, and `b` wants the same of them.
+        && field(&ma.tcp_flags, &mb.tcp_flags, |x, y| {
+            x.mask() & !y.mask() == 0 && y.set & x.mask() == x.set
+        })
         && field(&ma.connection_mark, &mb.connection_mark, eq_covers)
         && field(&ma.packet_mark, &mb.packet_mark, eq_covers)
         && field(&ma.routing_mark, &mb.routing_mark, eq_covers)

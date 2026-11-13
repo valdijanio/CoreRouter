@@ -27,6 +27,7 @@
 //!   [`GraphDb::export`] for code in the daemon).
 
 pub mod alert;
+pub mod dns;
 pub mod query;
 pub mod rrd;
 
@@ -60,6 +61,8 @@ pub const INTERFACE: &str = "interface:";
 /// Prefix of a queue's series key (`queue:camera`, `queue:<pppoe-ana>`,
 /// G4.9g).
 pub const QUEUE: &str = "queue:";
+/// The key of the LAN DNS forwarder's series (G4.1h, [`dns`]).
+pub const DNS: &str = "dns";
 
 /// What one value of a series means: its key, unit and whether it is a
 /// rate that adds up to a total.
@@ -111,6 +114,8 @@ pub const QUEUE_SOURCES: [Source; 4] = [
 pub fn sources(key: &str) -> &'static [Source] {
     if key == SYSTEM {
         &SYSTEM_SOURCES
+    } else if key == DNS {
+        &dns::DNS_SOURCES
     } else if key.starts_with(QUEUE) {
         &QUEUE_SOURCES
     } else {
@@ -159,8 +164,8 @@ fn unescape(text: &str) -> Option<String> {
 /// File name of series `key`: `system.rrd`, `interface-ether1.rrd`
 /// (interface names are already safe in a file name).
 pub fn file_name(key: &str) -> Option<String> {
-    if key == SYSTEM {
-        return Some("system.rrd".into());
+    if key == SYSTEM || key == DNS {
+        return Some(format!("{key}.rrd"));
     }
     if let Some(q) = key.strip_prefix(QUEUE) {
         return queue_key(q).map(|_| format!("queue-{}.rrd", escape(q)));
@@ -172,8 +177,8 @@ pub fn file_name(key: &str) -> Option<String> {
 /// The series key a file holds (the inverse of [`file_name`]).
 pub fn key_of_file(file: &str) -> Option<String> {
     let stem = file.strip_suffix(".rrd")?;
-    if stem == SYSTEM {
-        return Some(SYSTEM.into());
+    if stem == SYSTEM || stem == DNS {
+        return Some(stem.into());
     }
     if let Some(q) = stem.strip_prefix("queue-") {
         return queue_key(&unescape(q)?);
@@ -449,8 +454,8 @@ impl GraphDb {
         let polled = links.iter().any(|l| l.live.is_some());
         let mut drop = Vec::new();
         for (key, kept) in &mut self.series {
-            if key.starts_with(QUEUE) {
-                // `sample_queues` keeps those.
+            if key.starts_with(QUEUE) || key == DNS {
+                // `sample_queues` and `sample_dns` keep those.
                 continue;
             }
             if kept_now.contains(key) {
@@ -730,6 +735,9 @@ fn rate(prev: Option<u64>, now: Option<u64>, dt: u64, scale: f64) -> f32 {
 impl Session {
     /// One second of graph history from the tick's link poll (`live`).
     pub(crate) fn graph_sample(&mut self, live: &[LinkState]) {
+        // G4.1h: the DNS forwarder's readings (its window's "now" values),
+        // kept whether or not graphing is on.
+        self.dns_tick();
         let cfg = &self.store().running().system.graphing;
         if !cfg.enabled {
             return;

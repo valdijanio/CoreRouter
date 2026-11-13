@@ -135,6 +135,10 @@ fn numbers_read_well() {
     assert_eq!(rate(5.0, "entries"), "5.00");
     assert_eq!(rate(41.26, "%"), "41.3 %");
     assert_eq!(rate(f64::NAN, "bps"), "–");
+    // Times stay in ms or s (G4.1h: the DNS latency, the queues' delay).
+    assert_eq!(rate(1600.0, "ms"), "1.60 s");
+    assert_eq!(rate(250.0, "ms"), "250 ms");
+    assert_eq!(rate(0.25, "ms"), "0.25 ms");
 }
 
 #[test]

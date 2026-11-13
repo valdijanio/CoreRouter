@@ -13,3 +13,4 @@ mod package_upload;
 mod radius;
 mod shutdown;
 mod shutdown_checkpoint;
+mod web_certificate;

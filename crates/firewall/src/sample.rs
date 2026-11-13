@@ -232,6 +232,23 @@ fn build() -> Option<Config> {
             m(&[("packet_mark", "!bulk"), ("routing_mark", "isp2")])?,
             act(r#"{"type": "mark-packet", "new_packet_mark": "bulk"}"#)?,
         )?,
+        // G1.31d: MSS clamping, both forms.
+        rule(
+            25,
+            "forward",
+            m(&[
+                ("out_interface", "ether1"),
+                ("protocol", "tcp"),
+                ("tcp_flags", "syn,!rst"),
+            ])?,
+            act(r#"{"type": "change-mss", "new_mss": "clamp-to-pmtu"}"#)?,
+        )?,
+        rule(
+            26,
+            "prerouting",
+            m(&[("protocol", "tcp"), ("tcp_flags", "syn")])?,
+            act(r#"{"type": "change-mss", "new_mss": "1360", "passthrough": false}"#)?,
+        )?,
     ]);
     fw.raw = CowList::from(vec![
         rule(
@@ -256,7 +273,7 @@ fn build() -> Option<Config> {
             act(r#"{"type": "notrack"}"#)?,
         )?,
     ]);
-    fw.next_rule_id = 25;
+    fw.next_rule_id = 27;
     fw.next_address_list_id = 4;
     Some(cfg)
 }
