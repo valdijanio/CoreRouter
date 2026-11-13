@@ -1397,9 +1397,7 @@ test_ops() {
 	frr_start
 	if t_back=$(recovered 1200); then t_back=$(since "$t0"); else t_back=- verdict="FAIL (not back)"; fi
 	sampler_stop
-	local resync
-	resync=$(grep -c 'FRR restarted\|running config installed' "$W/dut/daemon.log" || true)
-	say "| FRR killed and started (routing_resync; daemon log lines: $resync) | - | $(secs "$t_back") | $(csv_min "$csv" lsas) / $(csv_min "$csv" routes) | $(recovered_now && echo yes || echo NO) | $verdict |"
+	say "| FRR killed and started (the daemon installs the config again: routing_resync) | - | $(secs "$t_back") | $(csv_min "$csv" lsas) / $(csv_min "$csv" routes) | $(recovered_now && echo yes || echo NO) | $verdict |"
 	[ "$verdict" = ok ] || FAILED=1
 
 	# e) The daemon restarted (SIGTERM, start): FRR and the kernel keep
