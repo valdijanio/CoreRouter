@@ -623,10 +623,12 @@ mod tests {
             )
             .unwrap();
         let dns = Arc::new(super::super::RouterDns::new());
-        let mut s = Settings::default();
-        s.servers = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
-        s.port = upstream;
-        s.max_queries = max;
+        let s = Settings {
+            servers: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            port: upstream,
+            max_queries: max,
+            ..Settings::default()
+        };
         dns.resolver.configure(s, 0);
         let port = loop {
             let u = StdUdp::bind("127.0.0.1:0").unwrap();
