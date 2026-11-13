@@ -89,7 +89,7 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
     o.insert("resolver".into(), json!(resolver));
     o.insert("allow_remote_requests".into(), json!(dns.allow_remote_requests));
     o.insert("since".into(), json!(since));
-    let elapsed = since.zip(s.hal_now()).map(|(a, b)| b.saturating_sub(a));
+    let elapsed = since.zip(s.now()).map(|(a, b)| b.saturating_sub(a));
     o.insert("elapsed_secs".into(), json!(elapsed));
     o.insert("max_concurrent_queries".into(), json!(max_queries));
     o.insert("now".into(), now(&readings, minute.as_ref()));
@@ -193,7 +193,9 @@ fn upstream(
     let p95 = rtt.quantile_us(0.95);
     let recent_asked = recent.map_or(0, |r| r.answers + r.failures);
     let recent_timeouts = recent.map_or(0, |r| r.timeouts);
-    let down = st.down_until_ms > 0;
+    // Down: failing now (asked last for a minute), or never answered
+    // since the reset (the minute ran out without a query to retry it).
+    let down = st.down_until_ms > 0 || (d.answers == 0 && d.failures > 0);
     let slow = p95.is_some_and(|us| us >= SLOW_MS * 1000)
         || percent(recent_timeouts, recent_asked).is_some_and(|p| p >= TIMEOUT_WARN_PERCENT * 2.0);
     let state = if down {
@@ -531,6 +533,7 @@ mod tests {
         s.tick(t0 + 2);
         let out = s.execute("ip.dns.statistics.print", &json!({})).unwrap();
         assert!(out["since"].is_u64(), "counting has a start: {}", out["since"]);
+        assert!(out["elapsed_secs"].as_u64().is_some_and(|e| e <= 2), "{}", out["elapsed_secs"]);
         assert_eq!(out["queries"], 32);
         assert_eq!(out["transport"]["udp4"], 32);
         assert_eq!(out["limit_hits"], 1);
@@ -575,6 +578,17 @@ mod tests {
         assert_eq!(out["upstreams"][0]["state_secs"], 60);
         assert_eq!(out["warnings"][0]["key"], "upstream_down");
         assert_eq!(out["warnings"][0]["severity"], "error");
+    }
+
+    #[test]
+    fn a_server_that_never_answered_stays_down() {
+        let failed = ServerStats { failures: 3, timeouts: 3, ..ServerStats::default() };
+        let row = upstream([192, 0, 2, 9].into(), &failed, &failed, None, 0, None, &Snapshot::default());
+        assert_eq!(row["state"], "down", "its minute last in the queue ran out: {row}");
+        let ok = ServerStats { answers: 5, ..ServerStats::default() };
+        let row = upstream([192, 0, 2, 9].into(), &ok, &ok, None, 0, None, &Snapshot::default());
+        assert_eq!(row["state"], "up");
+        assert_eq!(row["state_secs"], Value::Null, "never changed");
     }
 
     #[test]

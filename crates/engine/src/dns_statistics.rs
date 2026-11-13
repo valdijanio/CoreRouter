@@ -140,7 +140,7 @@ struct DnsStatsRuntime {
 impl Session {
     /// The daemon's forwarder counts into `stats`.
     pub fn set_dns_statistics(&mut self, stats: Arc<Statistics>) {
-        let now = self.hal_now();
+        let now = self.now();
         let base = self.dns_resolver_counts();
         if let Some(rt) = self.ext_mut::<DnsStatsRuntime>() {
             rt.stats = Some(stats);
@@ -174,7 +174,7 @@ impl Session {
 
     /// Back to zero; false without a forwarder.
     pub(crate) fn dns_statistics_reset(&mut self) -> bool {
-        let now = self.hal_now();
+        let now = self.now();
         let base = self.dns_resolver_counts();
         let Some(rt) = self.ext_mut::<DnsStatsRuntime>() else {
             return false;
