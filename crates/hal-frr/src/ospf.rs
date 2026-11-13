@@ -1012,7 +1012,11 @@ mod tests {
         let plain = r#"{"routerId":"10.255.0.1","lsaExternalCounter":194881,"lsaAsopaqueCounter":0,
             "areas":{"0.0.0.0":{"lsaNumber":2}}}"#;
         let st = stub_v2(plain, "v2").unwrap();
-        assert_eq!((st.lsas, st.lsas_other, st.max_lsa.clone()), (Some(194_883), None, None), "{st:?}");
+        assert_eq!(
+            (st.lsas, st.lsas_other, st.max_lsa.clone()),
+            (Some(194_883), None, None),
+            "{st:?}"
+        );
         let patched = r#"{"routerId":"10.255.0.1","lsaOtherRoutersCounter":0,
             "maxLsa":{"limit":50000,"threshold":80,"warningOnly":false,"ignoreTimeSecs":30,"ignoreCount":2,
                       "resetTimeSecs":60,"state":"ignore","ignoreEntries":1,"ignoreRemainingMsecs":29854},
@@ -1020,7 +1024,16 @@ mod tests {
         let st = stub_v2(patched, "v2").unwrap();
         let m = st.max_lsa.clone().unwrap();
         assert_eq!((st.lsas, st.lsas_other), (Some(0), Some(0)));
-        assert_eq!((m.limit, m.state.as_str(), m.ignore_entries, m.ignore_count, m.ignore_remaining_secs), (50_000, "ignore", 1, 2, Some(30)));
+        assert_eq!(
+            (
+                m.limit,
+                m.state.as_str(),
+                m.ignore_entries,
+                m.ignore_count,
+                m.ignore_remaining_secs
+            ),
+            (50_000, "ignore", 1, 2, Some(30))
+        );
         assert!(m.down());
         let v3 = r#"{"routerId":"1.1.1.1","numberOfAsScopedLsa":7,"areas":{"0.0.0.0":{"numberOfAreaScopedLsa":5}}}"#;
         assert_eq!(stub_v3(v3, "v3").unwrap().lsas, Some(12));
