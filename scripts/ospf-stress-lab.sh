@@ -399,13 +399,21 @@ addr_remove() {
 # The lab's OSPF out of the DUT, in the order the commands ask: Segment
 # Routing, the templates of its area, the area, the instance.
 ospf_teardown() {
-	cr routing.ospf.segment-routing.unset >/dev/null 2>&1 || true
-	local id
-	for id in $(cr routing.ospf.interface-template.list 2>/dev/null | jq -r '.[] | select(.area == "stress-bb") | .id'); do
-		cr routing.ospf.interface-template.remove "{\"id\":\"$id\"}" >/dev/null 2>&1 || true
+	local try id err
+	for try in 1 2 3 4 5; do
+		cr routing.ospf.segment-routing.unset >/dev/null 2>&1 || true
+		for id in $(cr routing.ospf.interface-template.list 2>/dev/null | jq -r '(.rows? // .)[] | select(.area == "stress-bb") | .id'); do
+			cr routing.ospf.interface-template.remove "{\"id\":\"$id\"}" >/dev/null 2>&1 || true
+		done
+		cr routing.ospf.area.remove '{"id":"stress-bb"}' >/dev/null 2>&1 || true
+		err=$(cr routing.ospf.instance.remove "{\"id\":\"$INSTANCE\"}" 2>&1 >/dev/null) && return 0
+		# Gone already, or refused (a template the list did not give, the
+		# daemon busy after a big commit): try again.
+		case $err in *"no OSPF instance"*) return 0 ;; esac
+		log "teardown $try: $err"
+		sleep 2
 	done
-	cr routing.ospf.area.remove '{"id":"stress-bb"}' >/dev/null 2>&1 || true
-	cr routing.ospf.instance.remove "{\"id\":\"$INSTANCE\"}" >/dev/null 2>&1 || true
+	return 1
 }
 dut_config() {
 	ospf_teardown
