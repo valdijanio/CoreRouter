@@ -115,7 +115,9 @@ com 2 vCPUs, 1.
 
 - Com o teto padrão (100), a tempestade nunca passa de 5 mil/s à origem e o roteador segura; o
   preço é o cliente legítimo: **os nomes únicos despejam os quentes do cache** (25 045 SERVFAIL
-  em 15 s para o cliente legítimo a 20 000/s de ataque, antes; 15 399 depois). Gap G4.1x.
+  em 15 s para o cliente legítimo a 20 000/s de ataque, antes; 15 399 depois). **Corrigido na
+  G4.1x** (W-TinyLFU no cache): 0 SERVFAIL em todas as linhas, contra 14 544–22 239 na `main`
+  da mesma rodada (`docs/changes/G4.1x.md`).
 - Com 1000, antes o roteador desabava (mil threads criadas e destruídas: 8,7 mil/s e p50 de
   573 ms); depois responde os 20 mil/s com p50 de 20 ms (a própria origem).
 
@@ -323,7 +325,7 @@ ocioso e não termina; o teto é `max_concurrent_queries`.
 | 30 % de perda: 24 % respondidas; troca de servidor custa 2 s por nome novo | gap G4.1u |
 | Serve-stale só em 4,1 s (a RFC 8767 sugere 1,8 s) | gap G4.1v |
 | Slowloris de 4 endereços derruba o TCP (0–1 de 108); 16 conexões de um endereço perdem 54 % | **corrigido** (G4.1w): 107 de 107; 0,8 % |
-| Nomes únicos despejam os quentes: até 25 mil SERVFAIL em 15 s para o cliente legítimo | gap G4.1x |
+| Nomes únicos despejam os quentes: até 25 mil SERVFAIL em 15 s para o cliente legítimo | **corrigido** (G4.1x, W-TinyLFU): 0 |
 | `cache.print name=…` com 1 M de entradas para as consultas por 160 ms | gap G4.1y |
 | A adlist de 1 M custa 14 % no acerto de cache | não se repete (vm6: +2 %); o custo real era a busca binária com nomes intercalados e a disputa entre threads, corrigidos na G4.1z |
 | O cache padrão de 2 MiB guarda 3 192 respostas | o padrão do RouterOS; vale dizer no ⓘ do `cache_size` |
