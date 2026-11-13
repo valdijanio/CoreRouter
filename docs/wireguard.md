@@ -9,9 +9,9 @@ Partes:
 - **PR 1:** modelo, comandos, chaves, push para o kernel, estado por par, testes.
 - **PR 2 (G1.31a):** janela Interfaces › WireGuard (abas Interfaces e Peers, modais com
   checagens e prévia dos comandos), abaixo em "Janela".
-- **PR 3:** config do cliente com QR, `wg-import`/`wg-export`, saúde "sem handshake", endpoint
-  por nome DNS, checagem de firewall, Safe Mode na `wg` de gerência, e a opção de criar rotas
-  estáticas para os allowed addresses no modal do par.
+- **PR 3 (G1.31b):** config do cliente com QR, `wg-import`/`wg-export`, saúde "sem handshake",
+  endpoint por nome DNS, assistente de firewall, MTU pela rota até o endpoint, Safe Mode na `wg`
+  de gerência e a caixa "Create Routes" no modal do par, abaixo em "Extras".
 
 ## Comandos
 
@@ -28,6 +28,15 @@ Partes:
 
 | `interface.wireguard.preview {id?, name?, listen_port?, mtu?, private_key?, …}` | A prévia do modal da interface: roda o `add`/`set` numa cópia da config e diz a porta, o firewall `input` (UDP da WAN chega?), o MTU contra o da WAN − 80 e os comandos que o OK manda. Nunca falha por entrada ruim (vira checagem). |
 | `interface.wireguard.peers.preview {id?, interface?, name?, public_key?, preshared_key?: bool, allowed_address?, …}` | A prévia do modal do par: prefixo de outro par (erro), o próximo endereço livre da rede da interface, laço da rota até o endpoint, keepalive atrás de NAT; num par novo sem chave, `private_key=auto`; ao editar, mantém as chaves (a pública sem mudança não vai). |
+
+| `interface.wireguard.peers.show-client-config {name}` | O arquivo `wg-quick` do cliente (grupo `full`: leva a chave privada dele): `Address` = `client_address` ou o allowed address, `DNS`, `AllowedIPs` = `client_allowed_address` ou tudo, `Endpoint` = `client_endpoint` ou o endereço do roteador na WAN e a porta (aviso se for privado), a PSK. Par com a pública colada: o lugar da privada fica marcado, com aviso. A GUI mostra o QR. |
+| `interface.wireguard.wg-export {name, show_sensitive?}` | A interface inteira como `wg-quick` (chave, porta, endereços, MTU, pares com `# Name =`); as chaves só com `show_sensitive` (grupo `full`). |
+| `interface.wireguard.wg-import {text, name?}` | Lê um `wg-quick` e cria a interface, os endereços e os pares numa transação (tudo ou nada); prefixo repetido, chave repetida ou a chave da própria interface recusam o arquivo inteiro; `PostUp`, `DNS` etc. viram aviso. |
+
+Os pares aceitam também `client_address`, `client_dns`, `client_endpoint`,
+`client_allowed_address`, `client_keepalive` e `client_mtu` (os `client-*` do RouterOS 7.12), e
+`endpoint_address` aceita nome DNS. Os comandos que mudam interface ou par aceitam `force`
+(Safe Mode, abaixo).
 
 Como interface comum, uma `wg` também aceita `interface.set` (renomear, MTU), `ip.address.add`,
 rotas, firewall e interface lists.
@@ -56,6 +65,37 @@ do G0.24:
   comandos; o par novo cai na interface filtrada, senão na do par selecionado;
 - as `wg` continuam em Interfaces (tipo `wireguard`, cadeado).
 
+## Extras (G1.31b)
+
+- **Endpoint por nome DNS:** `endpoint_address=vpn.exemplo.com.br`. O serviço `wireguard-dns` do
+  daemon pergunta ao resolvedor do próprio roteador, fora do lock da sessão, o nome que nunca foi
+  resolvido ou cujo par está sem handshake há mais de 180 s (`REJECT_AFTER_TIME`) e foi
+  perguntado há 30 s ou mais — a regra do `wireguard_watchdog` do OpenWrt e do RouterOS. O
+  endereço novo vai para o kernel na hora; uma falha mantém o anterior e aparece na lista
+  (`resolve_error`) e na janela (selo `not resolved`). A config antiga, com IP, carrega igual (o
+  campo continua texto).
+- **Saúde:** `wireguard.handshake` avisa o par que o roteador chama (endpoint e keepalive, ou
+  tráfego) e que não responde há 5 min ou mais ("nunca respondeu, tentando há 6 min" ou "sem
+  handshake há 7 min"). Par que só espera (road warrior) ou fica ocioso não entra.
+- **Assistente de firewall:** no modal da interface, "Accept in Firewall" acrescenta à transação
+  um `ip.firewall.filter.add` `accept` de UDP na porta, logo antes da regra que derruba
+  (`place_before`), quando o `ip.firewall.test` diz que o `input` derruba.
+- **MTU pela rota:** a checagem usa a rota até cada endpoint e o overhead da família (60 bytes
+  para IPv4, 80 para IPv6; 80 quando não há endpoint). A menor folga decide.
+- **Safe Mode:** quando a sessão de gerência chega pelo túnel (a rota de volta ao operador sai pela
+  `wg`), o lockout (`lockout.rs`) recusa sem `force` o que a derrubaria: chave nova ou porta nova
+  na interface, e remover, desativar, trocar a chave ou tirar o endereço do operador do par por
+  onde ele chega. O modal mostra o risco com "I understand" e o botão Safe Mode; os botões da lista
+  passam pela janela de lockout da GUI.
+- **Create Routes** (a "opção 2" escolhida pelo usuário): caixa no modal do par que acrescenta à
+  mesma transação um `ip.route.add gateway=<wg>` por prefixo do par que ainda não tem rota para a
+  `wg` (a rede da própria interface fica de fora). `0.0.0.0/0` pede um sim explícito e cita a rota
+  padrão que já existe (as duas na distância 1 dividiriam o tráfego). As rotas são estáticas
+  comuns: remover o par não as remove.
+- **Segredos:** `preshared_key` entrou em `SECRET_KEYS` (um PSK colado ia para o journal em claro
+  desde o PR 1), e as linhas `PrivateKey`/`PresharedKey` de um texto `wg-quick` são mascaradas no
+  journal, no log e na barra de status da GUI.
+
 ## Validações (mais fortes que os avisos do RouterOS)
 
 O kernel esconde três erros; o engine os recusa antes do commit:
@@ -77,7 +117,8 @@ Também:
 - avisos: `0.0.0.0/0` num par que divide a interface com outros; endpoint dentro do próprio
   allowed address (laço se uma rota mandar o endpoint para dentro do túnel).
 
-`allowed_address` não cria rota, como no RouterOS, no VyOS e no pfSense.
+`allowed_address` não cria rota, como no RouterOS, no VyOS e no pfSense; a caixa "Create Routes"
+do modal (G1.31b) cria, quando pedido.
 
 ## Estado de um par
 
@@ -199,9 +240,8 @@ Os scripts ficaram fora do repositório (pasta de notas da sessão): `wg-host.sh
 - aplicação incremental do OpenWrt;
 - estado do par pronto (nenhum dos outros o calcula).
 
-**O que fica para depois** (gaps no `docs/changes/G1.31.md`):
+**O que fica para depois** (gaps no `docs/changes/G1.31-motor.md`):
 
-- rota automática opcional;
 - VRF do socket cifrado;
 - clamp de MSS;
 - fila na `wg`;

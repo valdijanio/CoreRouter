@@ -45,7 +45,7 @@ fn has_addresses(s: &Session) -> std::result::Result<(), String> {
     }
 }
 
-fn add(s: &mut Session, p: &Value) -> Result<Value> {
+pub(super) fn add(s: &mut Session, p: &Value) -> Result<Value> {
     let address: IpNet = req_parse(p, "address")?;
     let interface: IfName = req_parse(p, "interface")?;
     super::interface::refuse_unmanaged(s, p, &["interface"])?;

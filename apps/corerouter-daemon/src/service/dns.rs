@@ -483,7 +483,7 @@ pub(crate) fn spawn(session: Shared) -> std::io::Result<Arc<RouterDns>> {
     Ok(dns)
 }
 
-fn register(session: &Shared, dns: &Arc<RouterDns>) {
+pub(crate) fn register(session: &Shared, dns: &Arc<RouterDns>) {
     let mut s = lock(session);
     dns.sync(s.dns_settings());
     s.set_dns_backend(dns.clone());

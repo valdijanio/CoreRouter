@@ -88,6 +88,7 @@ const IF_FIELDS: &[Field] = &[
     field("listen_port", "Listen Port", "wireguard.listen_port", Input::Text("13231 (empty: the first free)"), true),
     field("mtu", "MTU", "wireguard.mtu", Input::Text("1420"), true),
     field("private_key", "Private Key", "wireguard.private_key", Input::Secret("empty: made on the router, or kept"), true),
+    field("accept_firewall", "Accept in Firewall", "wireguard.accept_firewall", Input::Check, true),
     field("disabled", "Disabled", "wireguard.disabled", Input::Check, true),
     field("comment", "Comment", "", Input::Text(""), true),
 ];
@@ -102,6 +103,10 @@ const PEER_FIELDS: &[Field] = &[
     field("endpoint_port", "Endpoint Port", "wireguard.peer.endpoint_port", Input::Text("13231"), true),
     field("persistent_keepalive", "Persistent Keepalive", "wireguard.peer.persistent_keepalive", Input::Text("25 s behind NAT (empty: off)"), true),
     field("responder", "Responder", "wireguard.peer.responder", Input::Check, true),
+    field("create_routes", "Create Routes", "wireguard.peer.create_routes", Input::Check, true),
+    field("client_dns", "Client DNS", "wireguard.peer.client_dns", Input::Text("10.9.0.1 (empty: none)"), true),
+    field("client_allowed_address", "Client Allowed Address", "wireguard.peer.client_allowed_address", Input::Text("empty: all traffic (0.0.0.0/0, ::/0)"), true),
+    field("client_endpoint", "Client Endpoint", "wireguard.peer.client_endpoint", Input::Text("vpn.example.com (empty: the WAN address)"), true),
     field("disabled", "Disabled", "wireguard.disabled", Input::Check, true),
     field("comment", "Comment", "", Input::Text(""), true),
 ];
@@ -179,7 +184,76 @@ pub(crate) struct WireguardPanel {
     pub(crate) if_modal: Option<Modal>,
     pub(crate) peer_modal: Option<Modal>,
     pub(crate) confirm: Option<Confirm>,
+    /// G1.31b: a text the router made (client config, export).
+    pub(crate) text: Option<TextView>,
+    pub(crate) import: Option<ImportDialog>,
     help: Option<HelpView>,
+}
+
+/// A text the router made: the client configuration (with its QR code) or
+/// an export, copied with a button.
+pub(crate) struct TextView {
+    pub(crate) id: u64,
+    title: String,
+    pub(crate) text: Option<String>,
+    pub(crate) warnings: Vec<String>,
+    pub(crate) error: Option<String>,
+    /// Draw the QR code (the client config).
+    qr: bool,
+    /// The QR modules, made once: (width, dark).
+    modules: Option<(usize, Vec<bool>)>,
+    /// The key lines in clear (hidden by default: someone may look).
+    show_keys: bool,
+    status: Status,
+}
+
+/// G1.31b: paste a wg-quick file to make an interface of it.
+pub(crate) struct ImportDialog {
+    pub(crate) id: u64,
+    pub(crate) text: String,
+    pub(crate) name: String,
+    status: Status,
+}
+
+struct TextReply(u64);
+struct Imported(u64);
+
+/// The key lines of a wg-quick text, masked unless shown.
+fn masked(text: &str, show: bool) -> String {
+    text.lines()
+        .map(|l| {
+            let key = l.split('=').next().map(str::trim).unwrap_or("");
+            let secret = matches!(key, "PrivateKey" | "PresharedKey") && !l.contains("<hidden>") && !l.contains("<the client");
+            if secret && !show { format!("{key} = ••••••••") } else { l.to_owned() }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The QR code of `text`: (modules per side, dark or not); `None` when too
+/// long for a QR code (about 2 900 bytes).
+pub(crate) fn qr_modules(text: &str) -> Option<(usize, Vec<bool>)> {
+    let code = qrcode::QrCode::new(text.as_bytes()).ok()?;
+    let dark = code.to_colors().into_iter().map(|c| c == qrcode::Color::Dark).collect();
+    Some((code.width(), dark))
+}
+
+/// Paint a QR code, black on white with a 4-module quiet zone (ISO/IEC
+/// 18004 §6.3.8), `px` points a module.
+fn paint_qr(ui: &mut Ui, width: usize, dark: &[bool], px: f32) {
+    const QUIET: usize = 4;
+    let side = (width + 2 * QUIET) as f32 * px;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, egui::Color32::WHITE);
+    for (i, d) in dark.iter().enumerate() {
+        if !*d || width == 0 {
+            continue;
+        }
+        let (x, y) = ((i % width + QUIET) as f32, (i / width + QUIET) as f32);
+        let min = rect.min + egui::vec2(x * px, y * px);
+        painter.rect_filled(egui::Rect::from_min_size(min, egui::vec2(px, px)), 0.0, egui::Color32::BLACK);
+    }
 }
 
 fn s(r: &Value, k: &str) -> String {
@@ -278,10 +352,16 @@ fn endpoint(r: &Value) -> String {
     };
     let now = at("current_endpoint_address", "current_endpoint_port");
     let conf = at("endpoint_address", "endpoint_port");
+    let resolved = s(r, "endpoint_resolved");
     if yes(r, "roamed") {
         cell(&now, &[("roamed", Kind::Blue)])
-    } else if !now.is_empty() {
+    } else if !now.is_empty() && (resolved.is_empty() || s(r, "current_endpoint_address") != resolved) {
         now
+    } else if !s(r, "resolve_error").is_empty() && s(r, "endpoint_resolved").is_empty() {
+        cell(&conf, &[("not resolved", Kind::Red)])
+    } else if !resolved.is_empty() {
+        // G1.31b: a DNS name, and what it gave in a chip.
+        cell(&conf, &[(resolved.as_str(), Kind::Blue)])
     } else {
         conf
     }
@@ -326,6 +406,7 @@ fn if_values(r: &Value) -> BTreeMap<&'static str, String> {
         ("listen_port", s(r, "listen_port")),
         ("mtu", s(r, "mtu")),
         ("private_key", String::new()),
+        ("accept_firewall", "no".to_owned()),
         ("disabled", if yes(r, "disabled") { "yes" } else { "no" }.to_owned()),
         ("comment", s(r, "comment")),
     ])
@@ -345,6 +426,10 @@ fn peer_values(r: &Value) -> BTreeMap<&'static str, String> {
         ("endpoint_port", s(r, "endpoint_port")),
         ("persistent_keepalive", if keepalive == 0 { String::new() } else { keepalive.to_string() }),
         ("responder", flag(yes(r, "responder"))),
+        ("create_routes", flag(false)),
+        ("client_dns", list_text(r, "client_dns")),
+        ("client_allowed_address", list_text(r, "client_allowed_address")),
+        ("client_endpoint", s(r, "client_endpoint")),
         ("disabled", flag(yes(r, "disabled"))),
         ("comment", s(r, "comment")),
     ])
@@ -414,10 +499,18 @@ impl WireguardPanel {
         let tools = Tools::new(&app.can(), &IF_CMDS, &picked);
         let mut act = None;
         let mut extra: Option<Extra> = None;
+        let mut import = false;
+        let can_import = app.can().check("interface.wireguard.wg-import");
         ui.horizontal(|ui| {
             act = list::toolbar(ui, IFACES, &tools, &selection, l);
+            ui.separator();
+            import = table::action(ui, tr_in(SCOPE, l, "Import…"), can_import);
             table::find_field(ui, IFACES, &mut self.if_table);
         });
+        if import && self.import.is_none() {
+            app.next_dialog = app.next_dialog.wrapping_add(1);
+            self.import = Some(ImportDialog { id: app.next_dialog, text: String::new(), name: String::new(), status: Status::default() });
+        }
         ui.separator();
         let known = !app.cache.commands.is_empty();
         let footer_h = ui.spacing().interact_size.y * 2.0 + 12.0;
@@ -429,6 +522,7 @@ impl WireguardPanel {
         .to_owned();
         let add_peer = app.can().check(PEER_CMDS.add);
         let set = app.can().check("interface.wireguard.set");
+        let export = app.can().check("interface.wireguard.wg-export");
         let out = table::show(ui, IFACES, footer_h, &mut self.if_table, &IF_COLUMNS, &rows, |ui, menu| match menu {
             Menu::Rows(sel) => {
                 if let [one] = sel.as_slice() {
@@ -441,6 +535,9 @@ impl WireguardPanel {
                     }
                     if table::action(ui, tr_in(SCOPE, l, "Regenerate Keys…"), set.clone()) {
                         extra = Some(Extra::NewKeys(one.clone()));
+                    }
+                    if table::action(ui, tr_in(SCOPE, l, "Export…"), export.clone()) {
+                        extra = Some(Extra::Export(one.clone()));
                     }
                     ui.separator();
                 }
@@ -504,8 +601,17 @@ impl WireguardPanel {
         let tools = Tools::new(&app.can(), &PEER_CMDS, &picked);
         let mut act = None;
         let mut extra: Option<Extra> = None;
+        let client = match selection.as_slice() {
+            [_] => app.can().check("interface.wireguard.peers.show-client-config"),
+            _ => Err("Select one peer first".to_owned()),
+        };
         ui.horizontal(|ui| {
             act = list::toolbar(ui, PEERS, &tools, &selection, l);
+            if table::action(ui, tr_in(SCOPE, l, "Client Config…"), client.clone())
+                && let [one] = selection.as_slice()
+            {
+                extra = Some(Extra::ClientConfig(one.clone()));
+            }
             ui.separator();
             // The interfaces, then the states seen (or switched on).
             let names: Vec<String> = self.interfaces.iter().map(|r| s(r, "name")).collect();
@@ -539,6 +645,9 @@ impl WireguardPanel {
                     if ui.button(tr_in(SCOPE, l, "Copy Public Key")).clicked() {
                         extra = Some(Extra::CopyPeerKey(one.clone()));
                         ui.close();
+                    }
+                    if table::action(ui, tr_in(SCOPE, l, "Client Config…"), client.clone()) {
+                        extra = Some(Extra::ClientConfig(one.clone()));
                     }
                     ui.separator();
                 }
@@ -574,6 +683,15 @@ impl WireguardPanel {
                 } else {
                     ui.label(hint);
                 }
+                // G1.31b: a DNS name, when it was resolved and what failed.
+                if let Some(secs) = r.get("resolved_secs").and_then(Value::as_u64) {
+                    let when = if secs < 3 { "now".to_owned() } else { format!("{} ago", crate::firewall::ago(secs)) };
+                    ui.weak(format!("· {} {} {when}", s(r, "endpoint_address"), tr_in(SCOPE, l, "resolved")));
+                }
+                let err = s(r, "resolve_error");
+                if !err.is_empty() {
+                    ui.colored_label(v.error_fg_color, err);
+                }
             });
         }
         if let Some(e) = extra {
@@ -601,6 +719,14 @@ impl WireguardPanel {
                     self.tab = Tab::Peers;
                     self.peer_modal = Some(Modal::open(app, None, new_peer_values(&iface)));
                 }
+            }
+            Extra::ClientConfig(name) => {
+                let title = format!("{} <{name}>", tr_in(SCOPE, app.lang.labels, "Client Config"));
+                self.open_text(app, title, "interface.wireguard.peers.show-client-config", json!({"name": name}), true);
+            }
+            Extra::Export(name) => {
+                let title = format!("{} <{name}>", tr_in(SCOPE, app.lang.labels, "Export"));
+                self.open_text(app, title, "interface.wireguard.wg-export", json!({"name": name}), false);
             }
             Extra::NewKeys(name) => {
                 if self.confirm.is_none() {
@@ -673,6 +799,115 @@ impl WireguardPanel {
         }
     }
 
+    /// Ask the router for a text and show it when it comes.
+    fn open_text(&mut self, app: &mut CoreRouterUi, title: String, command: &str, params: Value, qr: bool) {
+        if let Some(old) = self.text.take() {
+            app.floats.forget(dialog_id(old.id));
+        }
+        app.next_dialog = app.next_dialog.wrapping_add(1);
+        let id = app.next_dialog;
+        self.text = Some(TextView { id, title, text: None, warnings: Vec::new(), error: None, qr, modules: None, show_keys: false, status: Status::default() });
+        app.run_then(command, params, crate::panel::then(NAME, TextReply(id)));
+    }
+
+    fn text_dialog(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
+        let Some(mut t) = self.text.take() else { return };
+        let wid = dialog_id(t.id);
+        let l = app.lang.labels;
+        let head = dialog::Head { id: wid, title: &t.title.clone(), dirty: false, pos: cascade(area, t.id), parent: Some(crate::win_id(Win::Panel(WIN))) };
+        if t.qr && t.modules.is_none() {
+            t.modules = t.text.as_deref().and_then(qr_modules);
+        }
+        let mut copy = false;
+        let pressed = dialog::show(&mut app.floats, ctx, area, head, &mut t.status, |ui, _| {
+            match (&t.text, &t.error) {
+                (_, Some(e)) => {
+                    ui.colored_label(ui.visuals().error_fg_color, e);
+                }
+                (None, None) => {
+                    ui.weak(tr_in(SCOPE, l, "Asking the router…"));
+                }
+                (Some(text), None) => {
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_min_width(380.0);
+                            ui.monospace(masked(text, t.show_keys));
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut t.show_keys, tr_in(SCOPE, l, "Show keys"));
+                                copy = ui.button(tr_in(SCOPE, l, "Copy")).clicked();
+                            });
+                        });
+                        if let Some((w, dark)) = &t.modules {
+                            ui.add_space(12.0);
+                            paint_qr(ui, *w, dark, 4.0);
+                        }
+                    });
+                    for w in &t.warnings {
+                        ui.horizontal_wrapped(|ui| {
+                            chip::chip(ui, tr_in(SCOPE, l, "warning"), chip::AMBER.tone(ui.visuals()));
+                            ui.label(w);
+                        });
+                    }
+                    if t.qr {
+                        ui.weak(tr_in(SCOPE, l, "The text and the QR code carry the client's private key: only group full sees them."));
+                    }
+                }
+            }
+            Footer::<()> { buttons: dialog::Buttons::View, ok: Ok(()), extra: Vec::new(), pressed: None }
+        });
+        if copy && let Some(text) = &t.text {
+            ctx.copy_text(text.clone());
+        }
+        if matches!(pressed, Some(Press::Ok | Press::Cancel)) {
+            app.floats.forget(wid);
+            return;
+        }
+        self.text = Some(t);
+    }
+
+    fn import_dialog(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
+        let Some(mut d) = self.import.take() else { return };
+        let wid = dialog_id(d.id);
+        let l = app.lang.labels;
+        let title = tr_in(SCOPE, l, "Import WireGuard");
+        let head = dialog::Head { id: wid, title, dirty: !d.text.is_empty(), pos: cascade(area, d.id), parent: Some(crate::win_id(Win::Panel(WIN))) };
+        let can = if d.text.trim().is_empty() { Err("paste a wg-quick file first".to_owned()) } else { app.can().check("interface.wireguard.wg-import") };
+        let (mut text, mut name) = (d.text.clone(), d.name.clone());
+        let pressed = dialog::show(&mut app.floats, ctx, area, head, &mut d.status, |ui, f| {
+            ui.set_min_width(520.0);
+            ui.weak(tr_in(SCOPE, l, "Paste a wg-quick file ([Interface] and [Peer] sections): one transaction makes the interface, its addresses and peers."));
+            egui::Grid::new("wireguard-import").num_columns(2).show(ui, |ui| {
+                ui.label(tr_in(SCOPE, l, "Name"));
+                ui.add(egui::TextEdit::singleline(&mut name).id(dialog::field_id(f.window(), "name")).hint_text("wireguard1 (empty: the first free)"));
+                ui.end_row();
+            });
+            ui.add(egui::TextEdit::multiline(&mut text).id(dialog::field_id(f.window(), "text")).code_editor().desired_rows(14).desired_width(f32::INFINITY));
+            Footer::<()>::edit(false, can)
+        });
+        d.text = text;
+        d.name = name;
+        match pressed {
+            Some(Press::Cancel) => {
+                app.floats.forget(wid);
+                return;
+            }
+            Some(Press::Ok | Press::Apply) => {
+                d.status.close_on_success = true;
+                d.status.sent();
+                let mut p = json!({"text": d.text});
+                if !d.name.trim().is_empty()
+                    && let Some(o) = p.as_object_mut()
+                {
+                    o.insert("name".into(), json!(d.name.trim()));
+                }
+                app.run_then("interface.wireguard.wg-import", p, crate::panel::then(NAME, Imported(d.id)));
+            }
+            _ => {}
+        }
+        self.import = Some(d);
+    }
+
     fn confirm_dialog(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
         let Some(mut c) = self.confirm.take() else { return };
         let wid = dialog_id(c.id);
@@ -722,6 +957,8 @@ enum Extra {
     CopyPeerKey(String),
     AddPeer(String),
     NewKeys(String),
+    ClientConfig(String),
+    Export(String),
 }
 
 /// A new peer's fields on interface `iface`.
@@ -730,6 +967,7 @@ fn new_peer_values(iface: &str) -> BTreeMap<&'static str, String> {
         ("interface", iface.to_owned()),
         ("preshared_key", "no".to_owned()),
         ("responder", "no".to_owned()),
+        ("create_routes", "no".to_owned()),
         ("disabled", "no".to_owned()),
     ])
 }
@@ -789,10 +1027,31 @@ impl PanelState for WireguardPanel {
             self.peer_modal = None;
         }
         self.confirm_dialog(app, ctx, area);
+        self.text_dialog(app, ctx, area);
+        self.import_dialog(app, ctx, area);
         help::modal(ctx, app.lang, &mut self.help);
     }
 
     fn reply(&mut self, app: &mut CoreRouterUi, then: PanelThen, result: &Result<Value, String>) {
+        if let Some(r) = then.downcast_ref::<TextReply>()
+            && let Some(t) = self.text.as_mut().filter(|t| t.id == r.0)
+        {
+            match result {
+                Ok(v) => {
+                    t.text = v.get("text").and_then(Value::as_str).map(str::to_owned);
+                    t.warnings = v.get("warnings").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
+                }
+                Err(e) => t.error = Some(e.clone()),
+            }
+            return;
+        }
+        if let Some(r) = then.downcast_ref::<Imported>()
+            && let Some(d) = self.import.as_mut().filter(|d| d.id == r.0)
+            && d.status.replied(result)
+        {
+            app.floats.forget(dialog_id(d.id));
+            self.import = None;
+        }
         if let Some(d) = then.downcast_ref::<Done>()
             && let Some(c) = self.confirm.as_mut().filter(|c| c.id == d.0)
             && c.status.replied(result)
@@ -850,5 +1109,16 @@ impl WireguardPanel {
 
     pub(crate) fn add_peer_for_test(&mut self, app: &mut CoreRouterUi, ui: &Ui, iface: &str) {
         self.extra(app, ui, Extra::AddPeer(iface.to_owned()));
+    }
+
+    /// Tests: "Client Config…" on peer `name`.
+    pub(crate) fn client_config_for_test(&mut self, app: &mut CoreRouterUi, ui: &Ui, name: &str) {
+        self.extra(app, ui, Extra::ClientConfig(name.to_owned()));
+    }
+
+    /// Tests: "Import…" with `text` pasted.
+    pub(crate) fn import_for_test(&mut self, app: &mut CoreRouterUi, text: &str) {
+        app.next_dialog = app.next_dialog.wrapping_add(1);
+        self.import = Some(ImportDialog { id: app.next_dialog, text: text.to_owned(), name: String::new(), status: Status::default() });
     }
 }

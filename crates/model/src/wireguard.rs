@@ -125,6 +125,65 @@ fn b64_value(c: u8) -> Option<u8> {
     }
 }
 
+/// Longest DNS name (RFC 1035 §2.3.4) and label.
+const MAX_HOST: usize = 253;
+const MAX_LABEL: usize = 63;
+
+/// Where a peer is: an IP address or a DNS name (RouterOS takes both in
+/// `endpoint-address`). A name is resolved by the router's resolver and
+/// again when the handshake gets old (G1.31b). As text in the config, so a
+/// config that held an IP address before loads unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WgHost(String);
+
+impl WgHost {
+    /// An IP address, or a host name (RFC 1123 §2.1: labels of letters,
+    /// digits and `-`, not at either end; the last label not all digits,
+    /// so `10.1.2` is not taken for a name), lowercased.
+    pub fn parse(text: &str) -> Option<Self> {
+        let t = text.trim().trim_end_matches('.');
+        if let Ok(ip) = t.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
+            return Some(Self(ip.to_string()));
+        }
+        if t.is_empty() || t.len() > MAX_HOST {
+            return None;
+        }
+        let ok_label = |l: &str| {
+            !l.is_empty()
+                && l.len() <= MAX_LABEL
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        };
+        if !t.split('.').all(ok_label) || t.rsplit('.').next().is_none_or(|l| l.bytes().all(|b| b.is_ascii_digit())) {
+            return None;
+        }
+        Some(Self(t.to_ascii_lowercase()))
+    }
+
+    /// The address, when it is one (a name needs the resolver).
+    pub fn ip(&self) -> Option<IpAddr> {
+        self.0.parse().ok()
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<IpAddr> for WgHost {
+    fn from(ip: IpAddr) -> Self {
+        Self(ip.to_string())
+    }
+}
+
+impl std::fmt::Display for WgHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// One WireGuard interface: what `interface.wireguard.add` stores.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -179,7 +238,7 @@ pub struct WgPeer {
     /// warrior). The kernel follows the peer when it moves (roaming), so
     /// this is only where the first packet goes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub endpoint_address: Option<IpAddr>,
+    pub endpoint_address: Option<WgHost>,
     /// 0 = none (only with no `endpoint_address`).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub endpoint_port: u16,
@@ -197,6 +256,45 @@ pub struct WgPeer {
     pub disabled: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub comment: String,
+    /// What the client configuration (`show-client-config`) says, as
+    /// RouterOS 7.12's `client-*`; empty = the default.
+    #[serde(default, skip_serializing_if = "ClientConfig::is_default")]
+    pub client: ClientConfig,
+}
+
+/// The `client-*` settings of a peer: what the router hands the client
+/// in its configuration file and QR code (RouterOS 7.12+).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientConfig {
+    /// The client's own address (`Address =`); default: the peer's
+    /// allowed address.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub address: Vec<IpNet>,
+    /// DNS servers for the client (`DNS =`); default none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns: Vec<IpAddr>,
+    /// Where the client finds this router (`Endpoint =`, a name or an
+    /// address, with or without the port); default: the router's address
+    /// on the WAN and the interface's port.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub endpoint: String,
+    /// What the client sends into the tunnel (`AllowedIPs =`); default
+    /// everything (`0.0.0.0/0, ::/0`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_address: Vec<IpNet>,
+    /// `PersistentKeepalive =` on the client; 0 = none.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub keepalive: u16,
+    /// `MTU =` on the client; 0 = its default.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub mtu: u16,
+}
+
+impl ClientConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl WgPeer {
@@ -213,6 +311,7 @@ impl WgPeer {
             responder: false,
             disabled: false,
             comment: String::new(),
+            client: ClientConfig::default(),
         }
     }
 
@@ -314,6 +413,27 @@ mod tests {
     }
 
     #[test]
+    fn hosts_are_addresses_or_names() {
+        assert_eq!(WgHost::parse(" 198.51.100.7 ").map(|h| h.ip()), Some("198.51.100.7".parse().ok()));
+        assert_eq!(WgHost::parse("[2001:db8::1]").map(|h| h.to_string()), Some("2001:db8::1".into()));
+        assert_eq!(WgHost::parse("VPN.Exemplo.com.br.").map(|h| h.to_string()), Some("vpn.exemplo.com.br".into()));
+        assert!(WgHost::parse("vpn.exemplo.com.br").is_some_and(|h| h.ip().is_none()));
+        for bad in ["", "-a.com", "a-.com", "a..com", "a b.com", "10.1.2", "a.123", "x".repeat(64).as_str(), "a/b"] {
+            assert!(WgHost::parse(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_config_of_part_1_loads_with_its_ip_endpoint() {
+        let j = serde_json::json!({"name": "site", "public_key": K, "endpoint_address": "198.51.100.7",
+                                   "endpoint_port": 13231, "allowed_address": ["10.20.0.0/16"]});
+        let p: WgPeer = serde_json::from_value(j.clone()).unwrap_or_else(|_| WgPeer::new(String::new(), WgKey::default()));
+        assert_eq!(p.endpoint_address.and_then(|h| h.ip()), "198.51.100.7".parse().ok());
+        let back = serde_json::to_value(serde_json::from_value::<WgPeer>(j.clone()).ok()).unwrap_or_default();
+        assert_eq!(back, j, "the client settings stay out until set");
+    }
+
+    #[test]
     fn state_follows_the_protocol_timers() {
         let key = WgKey::parse(K).unwrap_or_default();
         let mut road = WgPeer::new("road".into(), key.clone());
@@ -324,7 +444,7 @@ mod tests {
         assert_eq!(PeerState::of(&road, false, Some(1), true), PeerState::Disabled);
 
         let mut site = WgPeer::new("site".into(), key);
-        site.endpoint_address = "198.51.100.7".parse().ok();
+        site.endpoint_address = WgHost::parse("198.51.100.7");
         site.endpoint_port = 13231;
         assert_eq!(PeerState::of(&site, false, None, false), PeerState::Never);
         assert_eq!(PeerState::of(&site, false, None, true), PeerState::NoHandshake);

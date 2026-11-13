@@ -22,7 +22,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use corerouter_model::route::table_of;
-use corerouter_model::wireguard::{OVERHEAD_V6, WgPeer};
+use corerouter_model::wireguard::{OVERHEAD_V4, OVERHEAD_V6, WgPeer};
 use corerouter_model::{Config, IfName, InterfaceKind};
 use ipnet::IpNet;
 use serde_json::{Value, json};
@@ -35,17 +35,17 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "interface.wireguard.preview", "Check WireGuard", [], None,
-        "{id?: string (the interface being edited), name?: string, listen_port?: u16 | string, mtu?: u16 | string, private_key?: string, disabled?: bool | yes | no, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]} (form texts accepted; never an error: bad input is a check)",
+        "{id?: string (the interface being edited), name?: string, listen_port?: u16 | string, mtu?: u16 | string, private_key?: string, disabled?: bool | yes | no, comment?: string, accept_firewall?: bool | yes | no (when the input firewall drops the port: add an accept rule before the rule that drops it)} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk?: string (why OK may cut this session: Safe Mode or force)} (form texts accepted; never an error: bad input is a check)",
         always, interface_preview),
     cmd!(query "interface.wireguard.peers.preview", "Check WireGuard Peer", [], None,
-        "{id?: string (the peer being edited), interface?: string, name?: string, public_key?: string (empty on a new peer: the router makes the key pair), preshared_key?: bool | yes | no (a preshared key: made on the router, kept when editing), allowed_address?: string, endpoint_address?: string, endpoint_port?: u16 | string, persistent_keepalive?: u16 | string, responder?: bool | yes | no, disabled?: bool | yes | no, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]} (form texts accepted; never an error: bad input is a check)",
+        "{id?: string (the peer being edited), interface?: string, name?: string, public_key?: string (empty on a new peer: the router makes the key pair), preshared_key?: bool | yes | no (a preshared key: made on the router, kept when editing), allowed_address?: string, endpoint_address?: string, endpoint_port?: u16 | string, persistent_keepalive?: u16 | string, responder?: bool | yes | no, disabled?: bool | yes | no, comment?: string, client_dns?: string, client_endpoint?: string, client_allowed_address?: string, client_address?: string, client_keepalive?: u16 | string, client_mtu?: u16 | string, create_routes?: bool | yes | no (a static route through the interface for each of its prefixes not routed yet; a default route asks for a yes)} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk?: string (why OK may cut this session, or a default route into the tunnel)} (form texts accepted; never an error: bad input is a check)",
         always, peer_preview),
 ];
 
 /// A host on the Internet: the route to it names the WAN side the peers
 /// come in through, and the firewall is tested from it when no peer of the
 /// interface has an endpoint.
-const INTERNET: IpAddr = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+pub(super) const INTERNET: IpAddr = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
 
 fn check(level: &str, name: &str, message: impl Into<String>, param: &str) -> Value {
     json!({"level": level, "check": name, "message": message.into(), "param": param})
@@ -60,6 +60,9 @@ struct Preview {
     computed: Vec<Value>,
     checks: Vec<Value>,
     commands: Vec<Value>,
+    /// Why OK may cut this session (Safe Mode), or other news worth an
+    /// explicit yes (a default route into the tunnel).
+    risk: Vec<String>,
 }
 
 impl Preview {
@@ -91,6 +94,7 @@ impl Preview {
             "computed": self.computed,
             "checks": self.checks,
             "commands": if ok { self.commands } else { Vec::new() },
+            "risk": (ok && !self.risk.is_empty()).then(|| self.risk.join(" ")),
         })
     }
 }
@@ -101,7 +105,7 @@ fn text<'a>(p: &'a Value, k: &str) -> Option<&'a str> {
 
 /// The interface and gateway side of the route to `dst` in `cfg`'s main
 /// table, with the router's address there.
-fn wan_of(cfg: &Config, dst: IpAddr) -> Option<(IfName, Option<IpAddr>)> {
+pub(super) fn wan_of(cfg: &Config, dst: IpAddr) -> Option<(IfName, Option<IpAddr>)> {
     let out = crate::lockout::route_out(cfg, dst, &corerouter_model::RoutingTable::Main)?;
     let link: IfName = out.parse().ok()?;
     let mine = cfg
@@ -115,7 +119,7 @@ fn wan_of(cfg: &Config, dst: IpAddr) -> Option<(IfName, Option<IpAddr>)> {
 
 /// Does UDP to `port` reach the router from the WAN? Tested as a packet
 /// from `from` (a peer's endpoint, or a host on the Internet).
-fn firewall_check(s: &mut Session, cfg: &Config, me: Option<&IfName>, port: u16, from: IpAddr, out: &mut Preview) {
+fn firewall_check(s: &mut Session, cfg: &Config, me: Option<&IfName>, port: u16, from: IpAddr, accept: Option<&str>, out: &mut Preview) {
     let Some((wan, Some(dst))) = wan_of(cfg, from) else {
         out.checks.push(check(
             "info",
@@ -145,46 +149,92 @@ fn firewall_check(s: &mut Session, cfg: &Config, me: Option<&IfName>, port: u16,
             format!("the input firewall lets UDP {port} in from {wan}{by}"),
             "listen_port",
         ));
+    } else if let Some(iface) = accept {
+        // G1.31b, the firewall assistant: an accept rule for the port,
+        // before the rule that drops it, in the same transaction.
+        let rule = v
+            .pointer("/decided_by/id")
+            .filter(|_| v.pointer("/decided_by/table").and_then(Value::as_str) == Some("filter"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let mut params = json!({"chain": "input", "protocol": "udp", "dst_port": port.to_string(), "action": "accept",
+                                "comment": format!("WireGuard {iface}")});
+        if let (Some(r), Some(o)) = (&rule, params.as_object_mut()) {
+            o.insert("place_before".into(), json!(r));
+        }
+        let place = rule.map(|r| format!(", before rule {r}")).unwrap_or_default();
+        out.checks.push(check(
+            "ok",
+            "firewall",
+            format!("the input firewall drops UDP {port} coming in on {wan}{by}: an accept rule for it goes in{place}"),
+            "accept_firewall",
+        ));
+        out.commands.push(json!({"command": "ip.firewall.filter.add", "params": params}));
     } else {
         out.checks.push(check(
             "warning",
             "firewall",
             format!(
                 "the input firewall drops UDP {port} coming in on {wan}{by}: peers cannot reach \
-                 this interface; accept it before the drop (IP › Firewall)"
+                 this interface; tick Accept in Firewall to add an accept rule before it"
             ),
-            "listen_port",
+            "accept_firewall",
         ));
     }
 }
 
-/// The tunnel's MTU against the WAN's minus the WireGuard overhead.
-fn mtu_check(cfg: &Config, mtu: u16, toward: IpAddr, out: &mut Preview) {
-    let Some((wan, _)) = wan_of(cfg, toward) else {
+/// The tunnel's MTU against the way out to each of `toward` minus the
+/// WireGuard overhead (G1.31b: 60 bytes to an IPv4 endpoint, 80 to an
+/// IPv6 one; 80 when the peers' family is not known, `known` false). The
+/// narrowest way decides.
+fn mtu_check(cfg: &Config, mtu: u16, toward: &[IpAddr], known: bool, param: &str, out: &mut Preview) {
+    let worst = toward
+        .iter()
+        .filter_map(|d| {
+            let (wan, _) = wan_of(cfg, *d)?;
+            let under = cfg.interfaces.get(&wan).map(|i| i.mtu)?;
+            let overhead = if known && d.is_ipv4() { OVERHEAD_V4 } else { OVERHEAD_V6 };
+            Some((under.saturating_sub(overhead), under, overhead, wan, *d))
+        })
+        .min_by_key(|w| w.0);
+    let Some((fits, under, overhead, wan, d)) = worst else {
         return;
     };
-    let Some(under) = cfg.interfaces.get(&wan).map(|i| i.mtu) else {
-        return;
-    };
-    let fits = under.saturating_sub(OVERHEAD_V6);
+    let toward = if known { format!(" (the way to {d})") } else { String::new() };
     if mtu <= fits {
         out.checks.push(check(
             "ok",
             "mtu",
-            format!("MTU {mtu} fits {under} on {wan} minus the {OVERHEAD_V6} bytes of WireGuard"),
-            "mtu",
+            format!("MTU {mtu} fits {under} on {wan}{toward} minus the {overhead} bytes of WireGuard"),
+            param,
         ));
     } else {
         out.checks.push(check(
             "warning",
             "mtu",
             format!(
-                "MTU {mtu} is more than {under} on {wan} minus the {OVERHEAD_V6} bytes of WireGuard: \
+                "MTU {mtu} is more than {under} on {wan}{toward} minus the {overhead} bytes of WireGuard: \
                  full-size packets get fragmented or lost (TCP stalls); use {fits}"
             ),
-            "mtu",
+            param,
         ));
     }
+}
+
+/// Why the change from the candidate to `cfg` would cut this session (it
+/// comes through the tunnel, G1.31b): Safe Mode or an explicit yes.
+fn access_risk(s: &Session, cfg: &Config, out: &mut Preview) {
+    let dynamic = s.dynamic_now();
+    if let Some(why) = s.lockout_reason(s.store().candidate(), cfg, &dynamic, &dynamic) {
+        out.risk.push(why);
+    }
+}
+
+/// Where the handshake of `p` goes: its address, or what the resolver
+/// last gave for its name.
+fn endpoint_ip(s: &Session, p: &WgPeer) -> Option<IpAddr> {
+    let h = p.endpoint_address.as_ref()?;
+    h.ip().or_else(|| s.ext::<crate::wireguard::WgRuntime>().and_then(|rt| rt.resolved(h.as_str())).and_then(|r| r.ip))
 }
 
 fn wireguard_on<'a>(cfg: &'a Config, name: &IfName) -> Option<&'a corerouter_model::wireguard::Wireguard> {
@@ -196,6 +246,7 @@ fn wireguard_on<'a>(cfg: &'a Config, name: &IfName) -> Option<&'a corerouter_mod
 
 fn interface_preview(s: &mut Session, raw: &Value) -> Result<Value> {
     let mut p = normalize(raw, &["listen_port", "mtu"], &[]);
+    let accept = p.as_object_mut().and_then(|o| o.remove("accept_firewall")).and_then(|v| v.as_bool()).unwrap_or(false);
     let mut out = Preview::default();
     let editing = text(raw, "id").map(str::to_owned);
     let generated = text(&p, "private_key").is_none_or(|k| k == "auto");
@@ -254,14 +305,25 @@ fn interface_preview(s: &mut Session, raw: &Value) -> Result<Value> {
     }
     // The firewall and the MTU from where the peers are (their endpoints),
     // else from the Internet.
-    let from = w
+    let ends: Vec<IpAddr> = w
         .peers
         .iter()
-        .filter_map(|p| p.endpoint_address)
-        .find(|a| !a.is_loopback() && !a.is_unspecified())
-        .unwrap_or(INTERNET);
-    firewall_check(s, &cfg, Some(&name), w.listen_port, from, &mut out);
-    mtu_check(&cfg, iface.mtu, from, &mut out);
+        .filter(|p| !p.disabled)
+        .filter_map(|p| endpoint_ip(s, p))
+        .filter(|a| !a.is_loopback() && !a.is_unspecified())
+        .collect();
+    let from = ends.first().copied().unwrap_or(INTERNET);
+    // The accept rule goes first in the transaction's list once the
+    // interface command is in (below), so add it after.
+    let mut assist = Preview::default();
+    firewall_check(s, &cfg, Some(&name), w.listen_port, from, accept.then_some(name.as_str()), &mut assist);
+    out.checks.append(&mut assist.checks);
+    if ends.is_empty() {
+        mtu_check(&cfg, iface.mtu, &[INTERNET], false, "mtu", &mut out);
+    } else {
+        mtu_check(&cfg, iface.mtu, &ends, true, "mtu", &mut out);
+    }
+    access_risk(s, &cfg, &mut out);
     if !cfg.ip.addresses.iter().any(|a| a.interface == name) {
         out.checks.push(check(
             "info",
@@ -271,6 +333,7 @@ fn interface_preview(s: &mut Session, raw: &Value) -> Result<Value> {
         ));
     }
     out.commands.push(json!({"command": command, "params": p}));
+    out.commands.append(&mut assist.commands);
     Ok(out.done())
 }
 
@@ -299,7 +362,8 @@ fn next_free(cfg: &Config, iface: &IfName, peers: &[WgPeer]) -> Option<(IpNet, I
 }
 
 fn peer_preview(s: &mut Session, raw: &Value) -> Result<Value> {
-    let mut p = normalize(raw, &["endpoint_port", "persistent_keepalive"], &[]);
+    let mut p = normalize(raw, &["endpoint_port", "persistent_keepalive", "client_keepalive", "client_mtu"], &[]);
+    let routes = p.as_object_mut().and_then(|o| o.remove("create_routes")).and_then(|v| v.as_bool()).unwrap_or(false);
     let mut out = Preview::default();
     let editing = text(raw, "id").map(str::to_owned);
     let cand = s.store().candidate();
@@ -410,7 +474,7 @@ fn peer_preview(s: &mut Session, raw: &Value) -> Result<Value> {
                 "allowed_address",
             ));
         }
-        if let Some(e) = peer.endpoint_address {
+        if let Some(e) = endpoint_ip(s, &peer) {
             let table = table_of(&cfg, &iface);
             if crate::lockout::route_out(&cfg, e, &table).as_deref() == Some(iface.as_str()) {
                 out.checks.push(check(
@@ -432,10 +496,65 @@ fn peer_preview(s: &mut Session, raw: &Value) -> Result<Value> {
                     "persistent_keepalive",
                 ));
             }
+            // G1.31b: the MTU by the route to this endpoint.
+            if let Some(mtu) = cfg.interfaces.get(&iface).map(|i| i.mtu) {
+                mtu_check(&cfg, mtu, &[e], true, "endpoint_address", &mut out);
+            }
         }
+        out.commands.push(json!({"command": command, "params": p}));
+        if routes {
+            route_steps(&cfg, &iface, &peer, &mut out);
+        }
+        access_risk(s, &cfg, &mut out);
+        return Ok(out.done());
     }
     out.commands.push(json!({"command": command, "params": p}));
     Ok(out.done())
+}
+
+/// G1.31b, "Create Routes" (the user's option 2): a static route through
+/// the interface for each prefix of the peer that nothing routes there
+/// yet, in the same transaction. A default route asks for a yes.
+fn route_steps(cfg: &Config, iface: &IfName, peer: &WgPeer, out: &mut Preview) {
+    let table = table_of(cfg, iface);
+    let mut made = Vec::new();
+    for net in &peer.allowed_address {
+        let connected = cfg
+            .ip
+            .addresses
+            .iter()
+            .any(|a| a.interface == *iface && !a.disabled && a.address.trunc().contains(net));
+        let same = |r: &&corerouter_model::RouteEntry| r.dst_address == *net && r.routing_table == table && !r.disabled;
+        let routed = cfg.ip.routes.iter().filter(same).any(|r| r.gateway.to_string() == iface.as_str());
+        if connected || routed {
+            continue;
+        }
+        if net.prefix_len() == 0 {
+            let other: Vec<String> = cfg.ip.routes.iter().filter(same).map(|r| format!("{} (distance {})", r.gateway, r.distance)).collect();
+            let other = if other.is_empty() { String::new() } else { format!(" The route there now goes via {}: both at distance 1 share the traffic; give one a higher distance.", other.join(", ")) };
+            out.risk.push(format!(
+                "{net} through {iface} sends all the router's traffic without a narrower route into the tunnel: confirm it is meant.{other}"
+            ));
+        }
+        let mut params = json!({"dst_address": net, "gateway": iface, "comment": format!("WireGuard {}", peer.name)});
+        if table != corerouter_model::RoutingTable::Main
+            && let Some(o) = params.as_object_mut()
+        {
+            o.insert("routing_table".into(), json!(table.to_string()));
+        }
+        out.commands.push(json!({"command": "ip.route.add", "params": params}));
+        made.push(net.to_string());
+    }
+    out.checks.push(check(
+        "info",
+        "routes",
+        if made.is_empty() {
+            format!("no route to add: {iface}'s own network or an existing route covers every prefix")
+        } else {
+            format!("routes through {iface}: {}", made.join(", "))
+        },
+        "create_routes",
+    ));
 }
 
 #[cfg(test)]
