@@ -1415,11 +1415,19 @@ test_adlist() {
 	web_start
 	awk -v n="$ADLIST_N" 'BEGIN {print "# lab"; for (i = 0; i < n; i++) printf "0.0.0.0 ad%d.block%d.lab\n", i, i % 997}' >"$W/web/big.txt"
 	awk -v n="$ADLIST_N" 'BEGIN {for (i = 0; i < 10000; i++) {j = (i * 97) % n; printf "ad%d.block%d.lab A\n", j, j % 997}}' >"$QF/blocked"
+	# G4.1z: hot names that fall between the listed ones in the list's
+	# order (`ad<j>x` after `ad<j>.block…`), as a LAN's names do; the hot
+	# set (`h<i>.up.lab`) sorts after every listed name, so a search of the
+	# list follows one path for all of them.
+	awk -v n="$ADLIST_N" 'BEGIN {for (i = 0; i < 10000; i++) {j = (i * 97) % n; printf "ad%dx.wt.up.lab A\n", j}}' >"$QF/between"
 	local r0 r1 t0 id st load_ms
 	flush
 	warm hot
+	warm between
 	dp adlist-before "$QF/hot" "$DUR" "${SAT_OPTS[@]}"
 	local before=$DP
+	dp adlist-between-before "$QF/between" "$DUR" "${SAT_OPTS[@]}"
+	local between_before=$DP
 	r0=$(rss_kib)
 	t0=$(now)
 	id=$(ok ip.dns.adlist.add "{\"url\":\"http://$WEB:8080/big.txt\"}" | jq -r .id)
@@ -1443,6 +1451,10 @@ test_adlist() {
 	say "| cache quente, sem adlist | $(dp_row) |"
 	dp adlist-hot "$QF/hot" "$DUR" "${SAT_OPTS[@]}"
 	say "| cache quente, com a adlist | $(dp_row) |"
+	DP=$between_before
+	say "| cache quente, nomes entre os da lista, sem adlist | $(dp_row) |"
+	dp adlist-between "$QF/between" "$DUR" "${SAT_OPTS[@]}"
+	say "| cache quente, nomes entre os da lista, com a adlist | $(dp_row) |"
 	dp adlist-blocked "$QF/blocked" "$DUR" "${SAT_OPTS[@]}"
 	say "| nomes bloqueados | $(dp_row) |"
 	bg_hot adlist-reload 20000 "$DUR"
@@ -1457,6 +1469,8 @@ test_adlist() {
 	sleep 2
 	dp adlist-after "$QF/hot" "$DUR" "${SAT_OPTS[@]}"
 	say "| cache quente, sem adlist (depois de remover) | $(dp_row) |"
+	dp adlist-between-after "$QF/between" "$DUR" "${SAT_OPTS[@]}"
+	say "| cache quente, nomes entre os da lista, sem adlist (depois de remover) | $(dp_row) |"
 	alive_check adlist
 }
 
