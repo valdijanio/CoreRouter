@@ -94,7 +94,7 @@ reaproveita. O ⓘ "Apagar" diz isso.
   ~1,9 TB.
 - **Prévia antes de ligar**: GB por dia na taxa atual, horas que o teto guarda e desgaste do disco
   por ano.
-- **Tudo é comando**: transação, Safe Mode, journal, MCP (`ip.dns.log.print` responde "o que o
+- **Tudo é comando**: transação, Safe Mode, journal, MCP (`ip.dns.log.search` responde "o que o
   cliente X perguntou e por que falhou").
 
 ### Ficou de fora, e por quê
@@ -119,7 +119,7 @@ thread "dns-log" (a cada 200 ms): drena ─► anonimiza ─► bloco (65 536 co
        segmento: 1 h (ou max_age/4), ou 1/8 do teto; fdatasync a cada 60 s
        antes de gravar: teto e reserva livre da config (keep_free); senão, sai o segmento
        mais velho; sem espaço: descarta e conta
-busca (ip.dns.log.print/export): cópia do índice sob o lock, leitura sem ele,
+busca (ip.dns.log.search/export): cópia do índice sob o lock, leitura sem ele,
    até 8 blocos decodificados em paralelo, das mais novas para as mais antigas, com cursor
 ```
 
@@ -154,9 +154,14 @@ A especificação está em `crates/proto-dns/src/querylog/format.rs`.
 |---|---|
 | `ip.dns.log.set {enabled?, acknowledge?, client_address?, ipv4_prefix?, ipv6_prefix?, salt_rotation_hours?, max_size_mib?, max_age_hours?, exclude?, only_from?, except_from?}` | ajustes (journal) |
 | `ip.dns.log.get` | ajustes, `writer` (arquivos, bytes, mais velha e mais nova, gravadas, descartadas, teto), `estimate` e `warnings` |
-| `ip.dns.log.print {last_secs?, from?, to?, client?, name?, type?, rcode?, answered_by?, limit?, cursor?}` | uma página, das mais novas para as mais antigas, sem o lock do roteador; `next` continua |
+| `ip.dns.log.search {last_secs?, from?, to?, client?, name?, type?, rcode?, answered_by?, limit?, cursor?}` | uma página, das mais novas para as mais antigas, sem o lock do roteador; `next` continua |
 | `ip.dns.log.export {format?: csv \| jsonl, …os mesmos filtros…, limit? ≤ 100 000}` | o texto; fica no journal |
 | `ip.dns.log.clear {all? \| before? \| older_than_secs? \| client?}` | apaga e reescreve os segmentos (journal) |
+
+No terminal, `/ip dns log print` mostra os ajustes (o `get`), como no RouterOS. A busca é
+`search`, e não `print`, porque o `/export` monta o script a partir de todo `print`. O script leva
+`/ip dns log set … acknowledge=marco-civil-art14` quando o log está ligado: importar liga de novo,
+com a ciência que o operador deu, no journal de quem importou.
 
 Filtros:
 
@@ -171,7 +176,7 @@ cargo run -p corerouter-daemon -- --config-dir /tmp/cr --control 7979 --dns-port
 corerouter-cli --connect 127.0.0.1:7979 run ip.dns.set '{"allow_remote_requests":true,"servers":["1.1.1.1"]}'
 corerouter-cli --connect 127.0.0.1:7979 run ip.dns.log.set '{"enabled":true,"acknowledge":"marco-civil-art14"}'
 dig @127.0.0.1 -p 5353 www.example.com           # várias; o bloco fecha em 10 s
-corerouter-cli --connect 127.0.0.1:7979 run ip.dns.log.print '{"limit":5}'
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.log.search '{"limit":5}'
 corerouter-cli --connect 127.0.0.1:7979 run ip.dns.log.export '{"format":"csv","answered_by":"upstream"}'
 corerouter-cli --connect 127.0.0.1:7979 run ip.dns.log.clear '{"client":"127.0.0.1"}'
 cargo run -p corerouter-gui -- --connect 127.0.0.1:7979   # IP › DNS › Query Log

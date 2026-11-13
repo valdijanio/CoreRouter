@@ -21,7 +21,7 @@
 //! free ([`corerouter_engine::config_disk::keep_free`]). When deleting old
 //! segments does not make room, the block is dropped and counted.
 //!
-//! Reading (`ip.dns.log.print`, `export`) happens on the caller's thread
+//! Reading (`ip.dns.log.search`, `export`) happens on the caller's thread
 //! with only a copy of the index taken under the store's lock: the files
 //! are append-only, and a block is in the index only once it is whole on
 //! disk. Blocks are decoded a few at a time in parallel ([`READERS`]).

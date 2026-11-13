@@ -18,7 +18,7 @@ pub mod format;
 use std::cell::Cell;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use corerouter_model::dns_log::{ClientAddress, DnsLog};
@@ -195,8 +195,11 @@ impl Sink {
                 },
             );
             drop(g);
-            if let Err(TrySendError::Full(b) | TrySendError::Disconnected(b)) = self.tx.try_send(full) {
-                self.dropped.fetch_add(u64::from(b.entries), Ordering::Relaxed);
+            if let Err(TrySendError::Full(b) | TrySendError::Disconnected(b)) =
+                self.tx.try_send(full)
+            {
+                self.dropped
+                    .fetch_add(u64::from(b.entries), Ordering::Relaxed);
             }
         }
     }
@@ -207,11 +210,8 @@ impl Sink {
         let mut out = Vec::new();
         {
             let rx = locked(&self.rx);
-            loop {
-                match rx.try_recv() {
-                    Ok(b) => out.push(b),
-                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-                }
+            while let Ok(b) = rx.try_recv() {
+                out.push(b);
             }
         }
         for s in &self.stripes {
@@ -243,7 +243,9 @@ fn encode_entry(o: &mut Vec<u8>, e: &Entry, latency_us: u32) {
     o.push(e.by);
     o.extend_from_slice(&e.ede.map_or(u32::MAX, u32::from).to_le_bytes());
     let name = e.name.as_bytes();
-    let name = name.get(..name.len().min(format::MAX_NAME)).unwrap_or_default();
+    let name = name
+        .get(..name.len().min(format::MAX_NAME))
+        .unwrap_or_default();
     o.push(name.len() as u8);
     o.extend_from_slice(name);
 }
@@ -304,7 +306,9 @@ pub struct Anon {
 impl std::fmt::Debug for Anon {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The key never goes into a log line.
-        f.debug_struct("Anon").field("mode", &self.mode).finish_non_exhaustive()
+        f.debug_struct("Anon")
+            .field("mode", &self.mode)
+            .finish_non_exhaustive()
     }
 }
 
@@ -349,11 +353,15 @@ impl Anon {
 pub fn truncate(ip: IpAddr, v4: u8, v6: u8) -> IpAddr {
     match ip {
         IpAddr::V4(a) => {
-            let mask = u32::MAX.checked_shl(32 - u32::from(v4.min(32))).unwrap_or(0);
+            let mask = u32::MAX
+                .checked_shl(32 - u32::from(v4.min(32)))
+                .unwrap_or(0);
             IpAddr::V4(Ipv4Addr::from(u32::from(a) & mask))
         }
         IpAddr::V6(a) => {
-            let mask = u128::MAX.checked_shl(128 - u32::from(v6.min(128))).unwrap_or(0);
+            let mask = u128::MAX
+                .checked_shl(128 - u32::from(v6.min(128)))
+                .unwrap_or(0);
             IpAddr::V6(Ipv6Addr::from(u128::from(a) & mask))
         }
     }
@@ -453,7 +461,9 @@ impl Filter {
                 return false;
             }
         }
-        self.client.as_ref().is_none_or(|c| c.matches(&r.client, mode))
+        self.client
+            .as_ref()
+            .is_none_or(|c| c.matches(&r.client, mode))
     }
 }
 
@@ -471,7 +481,7 @@ mod tests {
             rcode: 3,
             flags: format::TCP,
             by: by_code("upstream"),
-            ede: if i % 2 == 0 { Some(22) } else { None },
+            ede: if i.is_multiple_of(2) { Some(22) } else { None },
         }
     }
 
@@ -490,7 +500,11 @@ mod tests {
         for i in 0..1000 {
             s.push(&entry(i), i);
         }
-        let got: Vec<(Entry, u32)> = s.drain().iter().flat_map(|b| decode_batch(&b.bytes)).collect();
+        let got: Vec<(Entry, u32)> = s
+            .drain()
+            .iter()
+            .flat_map(|b| decode_batch(&b.bytes))
+            .collect();
         assert_eq!(got.len(), 1000);
         for (i, (e, lat)) in got.iter().enumerate() {
             assert_eq!(*e, entry(i as u32));
@@ -525,21 +539,37 @@ mod tests {
     fn anonymisation() {
         let cfg = DnsLog::default();
         let a = Anon::new(&cfg, [7; 16]);
-        assert_eq!(a.client("100.64.12.34".parse().unwrap()), Client::Addr("100.64.12.0".parse().unwrap()));
+        assert_eq!(
+            a.client("100.64.12.34".parse().unwrap()),
+            Client::Addr("100.64.12.0".parse().unwrap())
+        );
         assert_eq!(
             a.client("2804:f00:1234:5678:9abc::1".parse().unwrap()),
             Client::Addr("2804:f00:1234:5600::".parse().unwrap())
         );
         let h = |key, ip: &str| {
-            let cfg = DnsLog { client_address: ClientAddress::Hashed, ..DnsLog::default() };
+            let cfg = DnsLog {
+                client_address: ClientAddress::Hashed,
+                ..DnsLog::default()
+            };
             Anon::new(&cfg, key).client(ip.parse().unwrap())
         };
         assert_eq!(h([1; 16], "10.0.0.1"), h([1; 16], "10.0.0.1"));
-        assert_ne!(h([1; 16], "10.0.0.1"), h([2; 16], "10.0.0.1"), "a new key unlinks");
+        assert_ne!(
+            h([1; 16], "10.0.0.1"),
+            h([2; 16], "10.0.0.1"),
+            "a new key unlinks"
+        );
         assert_ne!(h([1; 16], "10.0.0.1"), h([1; 16], "10.0.0.2"));
         assert!(!format!("{:?}", Anon::new(&cfg, [9; 16])).contains('9'));
-        assert_eq!(truncate("1.2.3.4".parse().unwrap(), 32, 128), "1.2.3.4".parse::<IpAddr>().unwrap());
-        assert_eq!(truncate("1.2.3.4".parse().unwrap(), 0, 0), "0.0.0.0".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            truncate("1.2.3.4".parse().unwrap(), 32, 128),
+            "1.2.3.4".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            truncate("1.2.3.4".parse().unwrap(), 0, 0),
+            "0.0.0.0".parse::<IpAddr>().unwrap()
+        );
     }
 
     #[test]
@@ -558,20 +588,50 @@ mod tests {
         };
         let f = |f: Filter| f.matches(&r, mode);
         assert!(f(Filter::default()));
-        let client = |s| Filter { client: Some(ClientMatch::parse(s).unwrap()), ..Filter::default() };
-        assert!(f(client("100.64.12.34")), "a host inside the truncated network");
+        let client = |s| Filter {
+            client: Some(ClientMatch::parse(s).unwrap()),
+            ..Filter::default()
+        };
+        assert!(
+            f(client("100.64.12.34")),
+            "a host inside the truncated network"
+        );
         assert!(f(client("100.64.0.0/10")));
         assert!(!f(client("100.64.13.1")));
         assert!(!f(client("h:0000000000000001")));
-        let name = |s: &str| Filter { name: Some(s.into()), ..Filter::default() };
+        let name = |s: &str| Filter {
+            name: Some(s.into()),
+            ..Filter::default()
+        };
         assert!(f(name("*.example.com")) && f(name("example")) && !f(name("*.example.org")));
-        assert!(f(Filter { rcode: Some(3), ..Filter::default() }));
-        assert!(!f(Filter { rcode: Some(RCODE_DROPPED), ..Filter::default() }));
-        assert!(!f(Filter { from_ms: Some(1001), ..Filter::default() }));
-        assert!(f(Filter { by: Some(by_code("cache")), qtype: Some(1), ..Filter::default() }));
+        assert!(f(Filter {
+            rcode: Some(3),
+            ..Filter::default()
+        }));
+        assert!(!f(Filter {
+            rcode: Some(RCODE_DROPPED),
+            ..Filter::default()
+        }));
+        assert!(!f(Filter {
+            from_ms: Some(1001),
+            ..Filter::default()
+        }));
+        assert!(f(Filter {
+            by: Some(by_code("cache")),
+            qtype: Some(1),
+            ..Filter::default()
+        }));
         assert!(ClientMatch::parse("nope").is_err());
         assert_eq!(by_name(by_code("adlist")), "adlist");
         assert_eq!(by_code("a stage to come"), 11);
-        assert_eq!((type_code("aaaa"), type_code("HTTPS"), type_code("TYPE65534"), type_code("nope")), (Some(28), Some(65), Some(65534), None));
+        assert_eq!(
+            (
+                type_code("aaaa"),
+                type_code("HTTPS"),
+                type_code("TYPE65534"),
+                type_code("nope")
+            ),
+            (Some(28), Some(65), Some(65534), None)
+        );
     }
 }

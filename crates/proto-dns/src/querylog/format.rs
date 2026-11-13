@@ -124,8 +124,12 @@ impl Client {
         match (self, mode) {
             (Self::None, _) => String::new(),
             (Self::Hash(h), _) => format!("h:{h:016x}"),
-            (Self::Addr(IpAddr::V4(a)), Mode::Truncated { v4, .. }) if v4 < 32 => format!("{a}/{v4}"),
-            (Self::Addr(IpAddr::V6(a)), Mode::Truncated { v6, .. }) if v6 < 128 => format!("{a}/{v6}"),
+            (Self::Addr(IpAddr::V4(a)), Mode::Truncated { v4, .. }) if v4 < 32 => {
+                format!("{a}/{v4}")
+            }
+            (Self::Addr(IpAddr::V6(a)), Mode::Truncated { v6, .. }) if v6 < 128 => {
+                format!("{a}/{v6}")
+            }
             (Self::Addr(a), _) => a.to_string(),
         }
     }
@@ -540,7 +544,8 @@ impl BlockBuilder {
         if self.count == 0 {
             return None;
         }
-        let mut enc = DeflateEncoder::new(Vec::with_capacity(self.raw.len() / 2), Compression::fast());
+        let mut enc =
+            DeflateEncoder::new(Vec::with_capacity(self.raw.len() / 2), Compression::fast());
         std::io::Write::write_all(&mut enc, &self.raw).ok()?;
         let body = enc.finish().ok()?;
         let mut out = Vec::with_capacity(HEADER + body.len());
@@ -557,6 +562,28 @@ impl BlockBuilder {
         *self = Self::new(self.mode);
         Some(out)
     }
+}
+
+/// The fuzz oracle (`fuzz/fuzz_targets/dns_query_log.rs`): `b` as a segment
+/// file never panics, and what is accepted stays within the limits.
+pub fn fuzz_check(b: &[u8]) -> Result<(), String> {
+    let (blocks, _) = decode_all(b);
+    for (h, rs) in &blocks {
+        if h.count > MAX_QUERIES || rs.len() != h.count as usize {
+            return Err(format!("block of {} queries read as {}", h.count, rs.len()));
+        }
+        for r in rs {
+            if !name_ok(r.name.as_bytes())
+                || r.rcode > 15
+                || r.at_ms < h.first_ms
+                || r.at_ms > h.last_ms
+            {
+                return Err(format!("record out of bounds: {r:?}"));
+            }
+        }
+    }
+    let _ = index(b);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -599,7 +626,10 @@ mod tests {
         assert!(w.is_empty());
         let (h, got) = decode_block(&block).unwrap();
         assert_eq!(got, rs);
-        assert_eq!((h.first_ms, h.last_ms, h.count), (1_763_000_000_000, 1_763_000_000_009, 4));
+        assert_eq!(
+            (h.first_ms, h.last_ms, h.count),
+            (1_763_000_000_000, 1_763_000_000_009, 4)
+        );
         assert_eq!(h.mode, Mode::Truncated { v4: 24, v6: 56 });
         assert_eq!(a.show(h.mode), "100.64.12.0/24");
         assert_eq!(b.show(h.mode), "2804:f00::/56");
@@ -647,17 +677,19 @@ mod tests {
             proptest::option::of(any::<u16>()),
             any::<u32>(),
         )
-            .prop_map(|(t, client, name, qtype, rcode, flags, by, ede, latency_us)| Record {
-                at_ms: 1_700_000_000_000 + t,
-                client,
-                name,
-                qtype,
-                rcode,
-                flags,
-                by,
-                ede,
-                latency_us,
-            })
+            .prop_map(
+                |(t, client, name, qtype, rcode, flags, by, ede, latency_us)| Record {
+                    at_ms: 1_700_000_000_000 + t,
+                    client,
+                    name,
+                    qtype,
+                    rcode,
+                    flags,
+                    by,
+                    ede,
+                    latency_us,
+                },
+            )
     }
 
     proptest! {
@@ -716,7 +748,11 @@ mod tests {
             let mut file = Vec::new();
             for b in 0..2u64 {
                 for i in 0..20u64 {
-                    let mut r = rec(1_763_000_000_000 + b * 100 + i, Client::Addr(IpAddr::from([100, 64, (i % 3) as u8, 0])), &format!("n{}.example.com", i % 5));
+                    let mut r = rec(
+                        1_763_000_000_000 + b * 100 + i,
+                        Client::Addr(IpAddr::from([100, 64, (i % 3) as u8, 0])),
+                        &format!("n{}.example.com", i % 5),
+                    );
                     r.ede = (i % 4 == 0).then_some(18);
                     w.push(&r);
                 }
@@ -750,22 +786,4 @@ mod tests {
         b[28..32].copy_from_slice(&(raw - 1).to_le_bytes());
         assert_eq!(decode_block(&b).err(), Some(FormatError::Inflate));
     }
-}
-
-/// The fuzz oracle (`fuzz/fuzz_targets/dns_query_log.rs`): `b` as a segment
-/// file never panics, and what is accepted stays within the limits.
-pub fn fuzz_check(b: &[u8]) -> Result<(), String> {
-    let (blocks, _) = decode_all(b);
-    for (h, rs) in &blocks {
-        if h.count > MAX_QUERIES || rs.len() != h.count as usize {
-            return Err(format!("block of {} queries read as {}", h.count, rs.len()));
-        }
-        for r in rs {
-            if !name_ok(r.name.as_bytes()) || r.rcode > 15 || r.at_ms < h.first_ms || r.at_ms > h.last_ms {
-                return Err(format!("record out of bounds: {r:?}"));
-            }
-        }
-    }
-    let _ = index(b);
-    Ok(())
 }

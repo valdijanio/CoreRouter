@@ -1,6 +1,6 @@
 //! The DNS query log (G4.1zd) as the engine sees it. The daemon writes the
 //! files (`service/dns_log.rs`: a thread, the disk) and registers itself
-//! here with [`Session::set_dns_log_backend`]; `ip.dns.log.print`,
+//! here with [`Session::set_dns_log_backend`]; `ip.dns.log.search`,
 //! `export` and `clear` reach the files through it, outside the session
 //! lock. Without a daemon (headless lab, WASM, tests) nothing is written
 //! and the commands say so.

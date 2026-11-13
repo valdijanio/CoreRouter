@@ -8,7 +8,7 @@
 //!   connection provider, what Marco Civil art. 14 forbids keeping), the
 //!   writer's numbers and an estimate (GB a day at the current rate, the
 //!   retention the ceiling gives, disk wear a year).
-//! - `ip.dns.log.print`: a page of queries, newest first, filtered.
+//! - `ip.dns.log.search`: a page of queries, newest first, filtered.
 //! - `ip.dns.log.export`: the same as CSV or JSON lines (journaled: who
 //!   exported what).
 //! - `ip.dns.log.clear`: deletes, everything, before a time or one client
@@ -45,7 +45,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "ip.dns.log.get", "DNS Query Log", ["IP", "DNS"], None,
         "{} → {enabled, client_address, ipv4_prefix, ipv6_prefix, salt_rotation_hours, max_size_mib, max_age_hours, exclude, only_from, except_from, acknowledge (the text set needs), writer: {writing, reason, files, bytes, oldest (unix ms), newest, written, written_bytes, dropped_queue, dropped_disk, budget_bytes, rotated} | null (no daemon), budget_bytes, estimate: {queries_per_sec (the forwarder, last minute), bytes_per_query, gb_per_day, retention_hours, limited_by: size|age, wear_tb_per_year}, warnings: [{key, severity, text}]}",
         always, get),
-    cmd!(query "ip.dns.log.print", "DNS Query Log", [], None,
+    cmd!(query "ip.dns.log.search", "DNS Query Log", [], None,
         "{last_secs?: int 1..31536000 (the last N seconds; instead of from), from?: int (unix seconds), to?: int (unix seconds), client?: string (address, network or h:<hash>), name?: string (*.example.com: it and the names under it; else contained in the name), type?: string (A, AAAA, HTTPS…), rcode?: noerror | formerr | servfail | nxdomain | notimp | refused | dropped, answered_by?: cache | upstream | stale | static | adlist | zones | special | refused | limit | busy, limit?: int 1..1000 (default 100), cursor?: string (next of the previous page)} → {rows: [{time (unix ms), client, name, type, rcode, answered_by, ede?, ede_name?, latency_ms, tcp, truncated}], next: string|null, scanned, partial (the scan budget ended before limit rows: next goes on), anonymization}",
         has_backend, print),
     cmd!(
@@ -633,7 +633,7 @@ mod tests {
         }
         assert!(s.store().running().ip.dns_log.is_default());
         // No daemon: the file commands are disabled with the reason.
-        let e = s.execute("ip.dns.log.print", &json!({})).unwrap_err().to_string();
+        let e = s.execute("ip.dns.log.search", &json!({})).unwrap_err().to_string();
         assert!(e.contains("router daemon"), "{e}");
     }
 
@@ -658,7 +658,7 @@ mod tests {
         let fake = Arc::new(Fake::default());
         s.set_dns_log_backend(fake.clone());
         let out = s
-            .execute("ip.dns.log.print", &json!({"client": "100.64.12.34", "name": "*.Example.com.", "type": "aaaa", "rcode": "nxdomain", "answered_by": "upstream", "limit": 5, "cursor": "9:8:7"}))
+            .execute("ip.dns.log.search", &json!({"client": "100.64.12.34", "name": "*.Example.com.", "type": "aaaa", "rcode": "nxdomain", "answered_by": "upstream", "limit": 5, "cursor": "9:8:7"}))
             .unwrap();
         let r = &out["rows"][0];
         assert_eq!(r["client"], "100.64.12.0/24");
@@ -672,7 +672,7 @@ mod tests {
         assert_eq!(f.name.as_deref(), Some("*.example.com"));
         assert_eq!((f.qtype, f.rcode, f.by), (Some(28), Some(3), Some(1)));
         for bad in [json!({"type": "NOPE"}), json!({"rcode": "x"}), json!({"answered_by": "x"}), json!({"cursor": "a;b"}), json!({"limit": 0}), json!({"client": "x"})] {
-            assert!(s.execute("ip.dns.log.print", &bad).is_err(), "{bad}");
+            assert!(s.execute("ip.dns.log.search", &bad).is_err(), "{bad}");
         }
         let csv = s.execute("ip.dns.log.export", &json!({"format": "csv"})).unwrap();
         let text = csv["text"].as_str().unwrap();

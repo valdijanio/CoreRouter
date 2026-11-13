@@ -54,7 +54,10 @@ fn forwarder(log: bool) -> Forwarder {
     let f = Forwarder::new(resolver);
     f.configure(
         Arc::new(cfg),
-        vec!["100.64.0.0/10".parse().unwrap(), "192.168.88.0/24".parse().unwrap()],
+        vec![
+            "100.64.0.0/10".parse().unwrap(),
+            "192.168.88.0/24".parse().unwrap(),
+        ],
     );
     f
 }
@@ -133,7 +136,9 @@ fn bench(c: &mut Criterion) {
         sink.set_on(log);
         let stop = Arc::new(AtomicBool::new(false));
         let w = writer(sink.clone(), stop.clone());
-        c.bench_function(&format!("dns_log_{tag}_one_client"), |b| b.iter(|| one(&f, &sink, &q, lan)));
+        c.bench_function(&format!("dns_log_{tag}_one_client"), |b| {
+            b.iter(|| one(&f, &sink, &q, lan))
+        });
         let mut i = 0u32;
         c.bench_function(&format!("dns_log_{tag}_cgnat_4096"), |b| {
             b.iter(|| {
@@ -153,7 +158,9 @@ fn bench(c: &mut Criterion) {
     // The writer's share: one query from raw entry to compressed block.
     let sink = Sink::default();
     sink.set_on(true);
-    let names: Vec<String> = (0..20_000).map(|i| format!("host{}.example{}.com", i % 3000, i % 97)).collect();
+    let names: Vec<String> = (0..20_000)
+        .map(|i| format!("host{}.example{}.com", i % 3000, i % 97))
+        .collect();
     let mut k = 0usize;
     for i in 0..65_536u32 {
         k = (k + 7919) % names.len();

@@ -38,7 +38,7 @@ pub(crate) const WIN: &str = "dns-query-log";
 const TABLE: &str = "dns-query-log";
 const SCOPE: &str = "dns_query_log";
 const GET: &str = "ip.dns.log.get";
-const PRINT: &str = "ip.dns.log.print";
+const PRINT: &str = "ip.dns.log.search";
 const SET: &str = "ip.dns.log.set";
 const EXPORT: &str = "ip.dns.log.export";
 const CLEAR: &str = "ip.dns.log.clear";
@@ -119,7 +119,7 @@ pub(crate) const HELP_KEYS: &[&str] = &[
 pub(crate) struct QueryLogPanel {
     /// `ip.dns.log.get`.
     pub(crate) get: Option<Value>,
-    /// The page shown (`ip.dns.log.print`).
+    /// The page shown (`ip.dns.log.search`).
     pub(crate) page: Option<Value>,
     pub(crate) error: Option<String>,
     pub(crate) period: usize,
@@ -421,7 +421,7 @@ pub(crate) fn row(r: &Value, i: usize) -> Row {
 }
 
 impl QueryLogPanel {
-    /// The filters as `ip.dns.log.print` / `export` take them.
+    /// The filters as `ip.dns.log.search` / `export` take them.
     pub(crate) fn params(&self, cursor: Option<String>, limit: u32) -> Value {
         let mut p = Map::new();
         if let Some((_, secs)) = PERIODS.get(self.period)
