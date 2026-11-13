@@ -40,8 +40,8 @@ pub mod explain;
 use explain::{Decision, Note, Outcome};
 
 pub use statistics::{
-    CATEGORIES, ClientStats, Counters, MAX_CLIENTS, STRIPES, Snapshot, Statistics, ede_name,
-    type_name,
+    CATEGORIES, CLIENT_V6_PREFIX, ClientStats, Counters, DomainStats, MAX_CLIENTS, NameStats,
+    STRIPES, Snapshot, Statistics, client_key, ede_name, type_name,
 };
 
 /// The smallest message a client must accept (RFC 1035 §4.2.1).
@@ -431,7 +431,7 @@ impl Forwarder {
             Ok(m) => m,
             Err(reply) => {
                 if !how.simulated {
-                    self.stats.malformed(client, tcp, reply.as_deref());
+                    self.stats.malformed(client, tcp, reply.as_deref(), now_ms);
                 }
                 return Start::Done(Done {
                     reply,
@@ -452,7 +452,7 @@ impl Forwarder {
             }
             Err(reply) => {
                 if !how.simulated {
-                    self.stats.malformed(client, tcp, Some(&reply));
+                    self.stats.malformed(client, tcp, Some(&reply), now_ms);
                 }
                 return Start::Done(Done {
                     reply: Some(reply),
