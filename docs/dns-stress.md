@@ -191,7 +191,8 @@ não mudou):
 
 Tempestade de DHCP (20 000 clientes com nome a 1000/s, a zona recebendo o A de cada concessão):
 **9 447 concessões em 55 s** (~170/s) e as consultas à zona com p99 de 221 ms; ~3 KiB gravados
-por concessão. Sem nome na zona, o servidor DHCP faz milhares por segundo (G3.9h). Uma mudança
+por concessão. Sem nome na zona, o mesmo servidor ligou 20 000 clientes a 10 000/s em 2 s (G3.9h,
+`docs/perf.md`): ~60× mais. Uma mudança
 nas zonas custa uma reconstrução de todas elas (G4.1p) e a regravação de todos os registros
 dinâmicos (G4.1q), numa thread só, e as consultas à zona esperam por isso. **É o maior limite que
 a bateria achou**: um ISP que publica o nome de cada concessão não aguenta uma volta de energia
