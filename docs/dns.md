@@ -1305,3 +1305,35 @@ ocupavam uma vaga e uma thread cada (**medido**, `docs/dns-stress.md`).
 **Fica de fora:** DoT com várias consultas por conexão (RFC 7858 §3.3) e HTTP/2 com vários
 fluxos no laço, sem thread por consulta cifrada; o TCP 53 de entrada (G4.1w) ainda responde o
 miss na thread da conexão.
+
+## G4.1u — prazo por servidor adaptativo e nova tentativa
+
+**Antes.** Cada servidor esperava o `query_server_timeout` inteiro (2 s) e era perguntado uma
+vez. Com 30 % de perda nas respostas só ~24 % das consultas eram respondidas (p99 4,1 s); na queda
+de um servidor, cada nome novo esperava 2 s até ele ir para o fim da fila (**medido**,
+`docs/dns-stress.md`).
+
+**Agora** (`proto-dns/src/resolver/lookup.rs`, `resolver.rs`):
+
+- Cada servidor tem um RTO (RFC 6298): `SRTT + 4·RTTVAR`, α = 1/8, β = 1/4 (§2.2, §2.3), entre 50 ms
+  e 120 s (`RTT_MIN_TIMEOUT`/`RTT_MAX_TIMEOUT` do Unbound; o mínimo de 1 s do §2.4 é para segmento
+  TCP). Nunca medido: 376 ms (o `UNKNOWN_SERVER_NICENESS` do Unbound; o Knot Resolver usa 400).
+  Um estouro dobra o RTO (§5.5), a partir do RTO usado naquela consulta, não do atual (como o
+  `rtt_lost` do Unbound: cem consultas que estouram juntas dobram uma vez só).
+- Uma busca pergunta os servidores em turno: cada consulta espera o RTO do servidor, e a última
+  espera o `query_server_timeout` inteiro. No máximo três envios por servidor (RFC 9520 §3.1:
+  "three queries in total") e três no total, ou um por servidor quando há mais de três. Um
+  servidor que deu falha definitiva (SERVFAIL, REFUSED, resposta malformada, ICMP de porta
+  fechada) não é perguntado de novo na mesma busca.
+- A consulta que estourou continua ouvindo: uma resposta atrasada dela vale (id próprio por
+  consulta, então a amostra de RTT não é ambígua, RFC 6298 §3).
+- Um estouro só não derruba o servidor: ele fica `down` depois de três seguidos (o Knot usa
+  quatro); uma falha definitiva conta na hora, como antes.
+- `ip.dns.statistics.print` mostra o `rto_ms` de cada servidor.
+
+| Regra | Onde |
+|---|---|
+| RFC 9520 §3.1: no máximo três consultas por servidor e transporte | `MAX_SENDS_PER_SERVER`, `Lookup::advance` |
+| RFC 6298 §2.2–2.3: SRTT, RTTVAR, RTO | `Resolver::record` |
+| RFC 6298 §5.5: dobrar o RTO no estouro | `Lookup::timed_out`, `Resolver::record` |
+| RFC 6298 §3 (Karn): amostra só de resposta sem ambiguidade | id novo por envio (`message::query`) |
