@@ -63,6 +63,28 @@ pub struct Cache {
     used: usize,
     budget: usize,
     stale_ms: u64,
+    /// G4.1h: entries by record type (cleared when the map is found
+    /// empty: a flush empties the map only).
+    by_type: BTreeMap<u16, usize>,
+    /// Entries pushed out to stay under the budget while still usable,
+    /// and those dropped once past their stale window.
+    evicted: u64,
+    expired: u64,
+}
+
+/// What the cache holds and has thrown away (G4.1h).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CacheStats {
+    pub entries: usize,
+    pub used_bytes: usize,
+    pub budget_bytes: usize,
+    /// Pushed out by newer answers while still fresh or stale-servable
+    /// (the budget is too small for what the clients ask).
+    pub evicted: u64,
+    /// Dropped after their TTL and stale window.
+    pub expired: u64,
+    /// Entries per record type, most first.
+    pub by_type: Vec<(u16, usize)>,
 }
 
 fn key(name: &str, rtype: RecordType) -> Key {
@@ -80,7 +102,29 @@ impl Cache {
     /// A new budget (config change); evicts down to it.
     pub fn set_budget(&mut self, budget_bytes: usize) {
         self.budget = budget_bytes;
-        self.shrink();
+        self.shrink(None);
+    }
+
+    /// Entries, bytes and what was thrown away (G4.1h); O(types).
+    pub fn stats(&self) -> CacheStats {
+        let mut by_type: Vec<(u16, usize)> = if self.map.is_empty() {
+            Vec::new()
+        } else {
+            self.by_type
+                .iter()
+                .filter(|(_, n)| **n > 0)
+                .map(|(t, n)| (*t, *n))
+                .collect()
+        };
+        by_type.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        CacheStats {
+            entries: self.map.len(),
+            used_bytes: self.used,
+            budget_bytes: self.budget,
+            evicted: self.evicted,
+            expired: self.expired,
+            by_type,
+        }
     }
 
     /// How long past its TTL an answer is kept for serve-stale (0: not).
@@ -115,6 +159,7 @@ impl Cache {
         if e.expires_ms <= now_ms {
             if e.expires_ms.saturating_add(stale_ms) <= now_ms {
                 self.remove(&k);
+                self.expired += 1;
             }
             return None;
         }
@@ -181,6 +226,11 @@ impl Cache {
         }
         let k = key(name, rtype);
         self.remove(&k);
+        if self.map.is_empty() {
+            // Flushed since: the counts by type start again.
+            self.by_type.clear();
+        }
+        *self.by_type.entry(k.1).or_default() += 1;
         self.used = self.used.saturating_add(size);
         let expires_ms = now_ms.saturating_add(u64::from(ttl) * 1000);
         self.by_expiry.insert((expires_ms, k.clone()));
@@ -194,28 +244,43 @@ impl Cache {
                 size,
             },
         );
-        self.shrink();
+        self.shrink(Some(now_ms));
     }
 
     fn remove(&mut self, k: &Key) {
         if let Some(old) = self.map.remove(k) {
             self.used = self.used.saturating_sub(old.size);
             self.by_expiry.remove(&(old.expires_ms, k.clone()));
+            self.untype(k.1);
+        }
+    }
+
+    fn untype(&mut self, t: u16) {
+        if let Some(n) = self.by_type.get_mut(&t) {
+            *n = n.saturating_sub(1);
         }
     }
 
     /// Evicts until under budget, those that expire soonest first:
     /// answers past their stale window, then stale ones, then the rest.
-    /// O(log n) per entry evicted.
-    fn shrink(&mut self) {
+    /// O(log n) per entry evicted. With `now_ms`, the ones already past
+    /// their stale window count as expired, not evicted.
+    fn shrink(&mut self, now_ms: Option<u64>) {
         while self.used > self.budget {
-            let Some((_, k)) = self.by_expiry.pop_first() else {
+            let Some((expires, k)) = self.by_expiry.pop_first() else {
                 self.map.clear();
+                self.by_type.clear();
                 self.used = 0;
                 break;
             };
             if let Some(old) = self.map.remove(&k) {
                 self.used = self.used.saturating_sub(old.size);
+                self.untype(k.1);
+                if now_ms.is_some_and(|n| expires.saturating_add(self.stale_ms) <= n) {
+                    self.expired += 1;
+                } else {
+                    self.evicted += 1;
+                }
             }
         }
     }
@@ -418,6 +483,47 @@ mod tests {
         assert!(c.get("99", A, 0).is_none() && c.get("91", A, 0).is_none());
         assert!(c.get("90", A, 0).is_some() && c.get("01", A, 0).is_some());
         assert!(c.get("n9", A, 0).is_some());
+    }
+
+    #[test]
+    fn evictions_expiries_and_types_are_counted() {
+        let mut c = Cache::new(4 * 1024);
+        let one = addrs([192, 0, 2, 1], 60);
+        let size = {
+            let mut probe = Cache::new(usize::MAX);
+            probe.put("a0", A, &one, None, 0, 86_400, 40);
+            probe.used_bytes()
+        };
+        c.set_budget(size * 3);
+        for i in 0..5 {
+            c.put(&format!("a{i}"), A, &one, None, 0, 86_400, 40);
+        }
+        c.put(
+            "t",
+            RecordType::TXT,
+            &addrs([192, 0, 2, 9], 600),
+            None,
+            0,
+            86_400,
+            40,
+        );
+        let s = c.stats();
+        assert_eq!(s.entries, 3);
+        assert_eq!(s.evicted, 3, "pushed out while fresh");
+        assert_eq!(s.expired, 0);
+        assert_eq!(
+            s.by_type,
+            [(u16::from(A), 2), (u16::from(RecordType::TXT), 1)]
+        );
+        // Read past TTL and stale window (none here): expired.
+        assert!(c.get("a4", A, 61_000).is_none());
+        assert_eq!(c.stats().expired, 1);
+        assert_eq!(c.stats().by_type.first(), Some(&(u16::from(A), 1)));
+        // A flush empties the map; the next answer starts the types again.
+        c.flush();
+        assert!(c.stats().by_type.is_empty());
+        c.put("x", A, &one, None, 0, 86_400, 40);
+        assert_eq!(c.stats().by_type, [(u16::from(A), 1)]);
     }
 
     #[test]

@@ -52,5 +52,9 @@ required-features = ["dnssec"]
 name = "adlist"
 harness = false
 
+[[bench]]
+name = "statistics"
+harness = false
+
 [lints]
 workspace = true

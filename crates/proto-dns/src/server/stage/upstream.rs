@@ -41,6 +41,16 @@ fn handle(f: &Forwarder, q: &mut Query, t: Option<&mut dyn Transport>) -> Step {
             Step::Reply(Reply::from_answer(&r.answer))
         }
         Err(e) => {
+            // RFC 8914: a failure held by RFC 9520 (no server asked) is a
+            // Cached Error (13); every server failing, No Reachable
+            // Authority (22).
+            let cached = held.is_some()
+                || matches!(&e, crate::resolver::ResolveError::Failed { why, .. } if why.contains("RFC 9520"));
+            q.ede = Some(if cached {
+                super::statistics::EDE_CACHED_ERROR
+            } else {
+                super::statistics::EDE_NO_REACHABLE_AUTHORITY
+            });
             q.note(|| match held {
                 Some(secs) => Note::new("upstream.held").arg("secs", secs),
                 None => {

@@ -39,7 +39,10 @@ pub mod explain;
 
 use explain::{Decision, Note, Outcome};
 
-pub use statistics::{ClientStats, Counters, Snapshot, Statistics};
+pub use statistics::{
+    CATEGORIES, ClientStats, Counters, MAX_CLIENTS, STRIPES, Snapshot, Statistics, ede_name,
+    type_name,
+};
 
 /// The smallest message a client must accept (RFC 1035 §4.2.1).
 pub const MIN_UDP: usize = 512;
@@ -159,6 +162,9 @@ pub struct Query {
     /// Where the upstream stage got its answer.
     pub source: Option<Source>,
     pub effects: Vec<Effect>,
+    /// The RFC 8914 extended error the reply stands for, when a stage
+    /// knows one (counted by the statistics; not sent yet).
+    pub ede: Option<u16>,
     /// `explain` (G6.8): each stage's decision so far.
     explain: Option<Vec<Decision>>,
     /// What the running stage said about itself ([`Query::note`]).
@@ -173,6 +179,8 @@ pub struct Query {
     udp_limit: usize,
     reply: Option<Reply>,
     dropped: bool,
+    /// The UDP reply went without records and with TC (too large).
+    truncated: bool,
 }
 
 /// A query waiting for a worker (it needs the network).
@@ -216,6 +224,9 @@ type AnyArc = Arc<dyn Any + Send + Sync>;
 pub struct Forwarder {
     pub resolver: Arc<Resolver>,
     config: RwLock<Arc<ServerConfig>>,
+    /// Also in `states`; kept here so counting a reply takes no lock of
+    /// the map (G4.1h).
+    stats: Arc<statistics::Statistics>,
     states: Mutex<HashMap<TypeId, AnyArc>>,
     compiled: Mutex<HashMap<TypeId, (u64, AnyArc)>>,
 }
@@ -322,14 +333,21 @@ pub fn stages() -> &'static [&'static Stage] {
 
 impl Forwarder {
     pub fn new(resolver: Arc<Resolver>) -> Self {
+        let stats = Arc::new(statistics::Statistics::default());
+        let mut states: HashMap<TypeId, AnyArc> = HashMap::new();
+        states.insert(
+            TypeId::of::<statistics::Statistics>(),
+            stats.clone() as AnyArc,
+        );
         Self {
             resolver,
+            stats,
             config: RwLock::new(Arc::new(ServerConfig {
                 generation: 0,
                 config: Arc::new(Config::default()),
                 allowed: Vec::new(),
             })),
-            states: Mutex::new(HashMap::new()),
+            states: Mutex::new(states),
             compiled: Mutex::new(HashMap::new()),
         }
     }
@@ -369,6 +387,12 @@ impl Forwarder {
         }
     }
 
+    /// The statistics (the same as `state::<Statistics>()`, without its
+    /// lock).
+    pub fn statistics(&self) -> &statistics::Statistics {
+        &self.stats
+    }
+
     /// `build(config)`, made once per config generation (compiled regexps,
     /// lookup tables).
     pub fn compiled<T: Send + Sync + 'static>(
@@ -406,6 +430,9 @@ impl Forwarder {
         let request = match parse_request(packet) {
             Ok(m) => m,
             Err(reply) => {
+                if !how.simulated {
+                    self.stats.malformed(client, tcp, reply.as_deref());
+                }
                 return Start::Done(Done {
                     reply,
                     effects: Vec::new(),
@@ -424,6 +451,9 @@ impl Forwarder {
                 q
             }
             Err(reply) => {
+                if !how.simulated {
+                    self.stats.malformed(client, tcp, Some(&reply));
+                }
                 return Start::Done(Done {
                     reply: Some(reply),
                     effects: Vec::new(),
@@ -512,6 +542,15 @@ impl Forwarder {
             .reply
             .take()
             .unwrap_or_else(|| Reply::code(ResponseCode::ServFail));
+        // Encoded first: the statistics count the truncated ones.
+        let bytes = if q.dropped {
+            None
+        } else {
+            encode(&q, &reply).map(|(b, tc)| {
+                q.truncated = tc;
+                b
+            })
+        };
         // A simulated client sent nothing: nothing to count or act on.
         if !q.simulated {
             for stage in stages() {
@@ -530,7 +569,7 @@ impl Forwarder {
             };
         }
         Done {
-            reply: encode(&q, &reply),
+            reply: bytes,
             effects: std::mem::take(&mut q.effects),
             answered_by: q.answered_by,
             explain,
@@ -584,6 +623,7 @@ impl Query {
             answered_by: "",
             source: None,
             effects: Vec::new(),
+            ede: None,
             explain: None,
             pending: None,
             simulated: false,
@@ -591,6 +631,7 @@ impl Query {
             udp_limit,
             reply: None,
             dropped: false,
+            truncated: false,
         })
     }
 
@@ -638,6 +679,11 @@ impl Query {
     /// A stage dropped it: no reply goes out.
     pub fn dropped(&self) -> bool {
         self.dropped
+    }
+
+    /// The reply went over UDP without records and with TC set.
+    pub fn truncated(&self) -> bool {
+        self.truncated
     }
 
     /// The client's question was sent with EDNS(0).
@@ -706,8 +752,8 @@ fn error(m: &Message, rcode: ResponseCode) -> Vec<u8> {
 /// §2.3.3 case kept) and RD, our RA; EDNS only if the client used it
 /// (RFC 6891 §7). Over UDP, a reply larger than the client takes goes
 /// without records and with TC set, so it asks again over TCP (RFC 1035
-/// §4.2.1, RFC 6891 §7).
-fn encode(q: &Query, r: &Reply) -> Option<Vec<u8>> {
+/// §4.2.1, RFC 6891 §7); `true` with it.
+fn encode(q: &Query, r: &Reply) -> Option<(Vec<u8>, bool)> {
     let req = &q.request;
     let mut m = Message::response(req.metadata.id, OpCode::Query);
     m.metadata.recursion_desired = req.metadata.recursion_desired;
@@ -728,13 +774,13 @@ fn encode(q: &Query, r: &Reply) -> Option<Vec<u8>> {
     }
     let bytes = m.to_vec().ok()?;
     if q.tcp || bytes.len() <= q.udp_limit {
-        return Some(bytes);
+        return Some((bytes, false));
     }
     m.answers.clear();
     m.authorities.clear();
     m.additionals.clear();
     m.metadata.truncation = true;
-    m.to_vec().ok()
+    m.to_vec().ok().map(|b| (b, true))
 }
 
 #[cfg(test)]

@@ -187,6 +187,14 @@ impl DnsBackend for RouterDns {
         self.resolver.cache_used_bytes()
     }
 
+    fn cache_stats(&self) -> Option<corerouter_proto_dns::cache::CacheStats> {
+        Some(self.resolver.cache_stats())
+    }
+
+    fn clock_ms(&self) -> Option<u64> {
+        Some(self.now_ms())
+    }
+
     fn configure(&self, settings: Settings) {
         self.sync(settings);
     }
