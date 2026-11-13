@@ -78,6 +78,9 @@ if [ "${1:-}" = "--userns" ]; then
 	shift
 	# Root of a user namespace, with its own mounts (a /run for `ip netns`)
 	# and network: nothing reaches the host.
+	# A work directory of its own: two rounds on one host (a soak and a
+	# profile) must not share the token, the query files or the logs.
+	export DNS_LAB_DIR=/tmp/crdnsstress-$$
 	exec unshare --user --map-root-user --mount --net --pid --fork --mount-proc \
 		bash -c 'mount -t tmpfs tmpfs /run && mkdir -p /run/netns && exec "$0" --in-userns "$@"' "$0" "$@"
 fi
@@ -158,7 +161,7 @@ done
 tool() { "${TENV[@]}" "$@"; }
 
 INBOX=/srv/lab/inbox
-W=/tmp/crdnsstress
+W=${DNS_LAB_DIR:-/tmp/crdnsstress}
 R=$W/root
 if [ -z "$OUT" ]; then
 	if [ -d /srv/lab ]; then OUT=/srv/lab/dns-stress/$(date +%Y%m%d-%H%M%S); else OUT=$W/out; fi
