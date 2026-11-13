@@ -425,6 +425,12 @@ dut_config() {
 	ok ip.address.add "{\"address\":\"$LINK_DUT/30\",\"interface\":\"$DUT_IFACE\"}" >/dev/null
 	ok routing.ospf.instance.add "{\"name\":\"$INSTANCE\",\"router_id\":\"$DUT_RID\"}" >/dev/null
 	ok routing.ospf.area.add "{\"name\":\"stress-bb\",\"instance\":\"$INSTANCE\",\"area_id\":\"0.0.0.0\"}" >/dev/null
+	# Every adjacency change in ospfd's log (local DUT; the daemon does not
+	# write this line, so it stays).
+	if [ -S "$W/dut/run/frr/ospfd.vty" ]; then
+		vtysh --vty_socket "$W/dut/run/frr" -c 'configure terminal' -c 'router ospf' \
+			-c 'log-adjacency-changes detail' >/dev/null 2>&1 || true
+	fi
 	TEMPLATE_ID=$(ok routing.ospf.interface-template.add \
 		"{\"area\":\"stress-bb\",\"networks\":[\"10.0.1.0/30\"],\"type\":\"ptp\",\"hello_interval\":1,\"dead_interval\":4,\"comment\":\"ospf-stress\"}" |
 		jq -r '.id // empty')
@@ -463,7 +469,8 @@ dut_routes() {
 	if [ $DUT = local ]; then
 		vty 'show ip route summary json' | jq '[.routes[]? | select(.type == "ospf") | .fib] | add // 0'
 	else
-		cr routing.ospf.route.list "{\"instance\":\"$INSTANCE\"}" | jq '.rows | length'
+		# A page of rows (G3.4n): the total counts them all.
+		cr routing.ospf.route.list "{\"instance\":\"$INSTANCE\",\"limit\":1}" | jq '.total // (.rows | length)'
 	fi
 }
 dut_neighbors_full() {
@@ -1137,6 +1144,10 @@ test_neighbors() {
 				sleep 5
 			done
 			[ "$below" -gt 0 ] && verdict="FAIL (adjacencies dropped: $below samples below $((n + 1)))"
+			if [ "$below" -gt 0 ] && [ "$HOLD" -gt 0 ]; then
+				log "neighbors $n: holding for $HOLD s after the drops"
+				sleep "$HOLD"
+			fi
 		fi
 		sampler_stop
 		local dead
@@ -1307,9 +1318,26 @@ test_ops() {
 	# a) An OSPF commit: the template's cost (no adjacency reset).
 	csv=$OUT/ops-commit.csv
 	sampler_start "$csv"
+	# PERF_COMMIT=1: the daemon's profile around the commit (with 200 000
+	# LSAs the command took 1.2 s against 20 ms with 10 000).
+	local perfpid="" perf=/usr/lib/linux-tools-6.8.0-147/perf
+	[ -x "$perf" ] || perf=perf
+	if [ "${PERF_COMMIT:-0}" = 1 ] && [ $DUT = local ]; then
+		"$perf" record -F 999 -g -p "$(dut_pid corerouter-daemon)" -o "$OUT/perf-commit.data" >/dev/null 2>&1 &
+		perfpid=$!
+		sleep 0.5
+	fi
 	t0=$(now)
 	ok routing.ospf.interface-template.set "{\"id\":\"$TEMPLATE_ID\",\"cost\":20}" >/dev/null
 	t_cmd=$(since "$t0")
+	if [ -n "$perfpid" ]; then
+		kill -INT "$perfpid" 2>/dev/null
+		wait "$perfpid" 2>/dev/null || true
+		"$perf" report -i "$OUT/perf-commit.data" --stdio --no-children --sort comm,dso,symbol -g none \
+			--percent-limit 1 2>/dev/null | grep -v '^$' | head -n 60 >"$OUT/perf-commit.txt" || true
+		log "perf: $OUT/perf-commit.txt"
+		head -n 45 "$OUT/perf-commit.txt" >&2
+	fi
 	local applied
 	if [ $DUT = local ]; then
 		applied=$(wait_for "cost 20" 60 sh -c "vtysh --vty_socket '$W/dut/run/frr' -c 'show ip ospf interface $DUT_IFACE json' | grep -q '\"cost\":20'") || applied=-
@@ -1324,6 +1352,27 @@ test_ops() {
 	say "| commit (template cost 10 → 20) | $t_cmd | $(secs "$applied") | $(csv_min "$csv" lsas) / $(csv_min "$csv" routes) | $(recovered_now && echo yes || echo NO) | $verdict |"
 	[ "$verdict" = ok ] || FAILED=1
 	ok routing.ospf.interface-template.set "{\"id\":\"$TEMPLATE_ID\",\"cost\":null}" >/dev/null
+	sleep 3
+
+	# a2) A second address on the OSPF port, outside the template's
+	# networks (a management address): OSPF must not run on it (it ran
+	# there and the adjacency flapped, G3.4m), and nothing drops.
+	csv=$OUT/ops-second-address.csv
+	sampler_start "$csv"
+	t0=$(now)
+	ok ip.address.add "{\"address\":\"10.98.0.1/24\",\"interface\":\"$DUT_IFACE\"}" >/dev/null
+	t_cmd=$(since "$t0")
+	sleep 8
+	sampler_stop
+	verdict=ok
+	if [ $DUT = local ] && vty "show ip ospf interface $DUT_IFACE" | grep -q '10.98.0.1'; then
+		verdict="FAIL (OSPF runs on 10.98.0.1)"
+	fi
+	recovered_now || verdict="FAIL (not recovered)"
+	[ "$(csv_min "$csv" lsas)" -lt "$LOADED_LSAS" ] && verdict="FAIL (LSAs dropped)"
+	say "| second address on the port, outside the networks (10.98.0.1/24) | $t_cmd | - | $(csv_min "$csv" lsas) / $(csv_min "$csv" routes) | $(recovered_now && echo yes || echo NO) | $verdict |"
+	[ "$verdict" = ok ] || FAILED=1
+	addr_remove 10.98.0.1/24
 	sleep 3
 
 	# b) Safe Mode, undone by hand: the template disabled (the adjacency
@@ -1373,9 +1422,7 @@ test_ops() {
 	frr_start
 	if t_back=$(recovered 1200); then t_back=$(since "$t0"); else t_back=- verdict="FAIL (not back)"; fi
 	sampler_stop
-	local resync
-	resync=$(grep -c 'FRR restarted\|running config installed' "$W/dut/daemon.log" || true)
-	say "| FRR killed and started (routing_resync; daemon log lines: $resync) | - | $(secs "$t_back") | $(csv_min "$csv" lsas) / $(csv_min "$csv" routes) | $(recovered_now && echo yes || echo NO) | $verdict |"
+	say "| FRR killed and started (the daemon installs the config again: routing_resync) | - | $(secs "$t_back") | $(csv_min "$csv" lsas) / $(csv_min "$csv" routes) | $(recovered_now && echo yes || echo NO) | $verdict |"
 	[ "$verdict" = ok ] || FAILED=1
 
 	# e) The daemon restarted (SIGTERM, start): FRR and the kernel keep
