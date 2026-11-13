@@ -1,0 +1,11 @@
+id: fase-c
+
+Gaps achadas na fase C no hardware real (notebook i5-12450H, `dev.650` = `443646f1`, carga pelo
+cabo de 1 Gb a partir da VM do laboratório, 2026-11-13, **medido**). Cada linha traz o número
+medido que a motivou.
+
+| G3.4z | Gerência protegida contra rota aprendida | engine, ui | Uma rota dinâmica (OSPF, BGP) mais específica que a rede conectada cobriu o endereço da sessão de gerência e cortou o acesso ao notebook até o fim do teste (os `/32` do gerador em 192.168.0.0 contra a `ether1` 192.168.0.0/24); avisar na saúde e na barra quando uma rota aprendida passa a cobrir o par de uma sessão de gerência aberta (CLI, GUI, MCP) e oferecer um filtro de entrada que recusa prefixos sobre as redes conectadas da gerência | 6 h | aberto |
+| G4.1zn | DNS: comandos de configuração rápidos com carga | engine, daemon | No notebook, com 20 000 consultas/s ao lado, o p99 de `ip.dns.static.add` + `remove` foi 404 ms, o do lote atômico 381 ms e o de `ip.dns.set` 90 ms (alvo 50 ms, G4.2h); na VM ficaram abaixo do alvo. Achar o custo com `perf` no notebook (gravação do journal no SSD USB, recarga do encaminhador) e baixar abaixo de 50 ms | 4 h | aberto |
+| G4.1zo | DNS: um cliente não ocupa a thread UDP sozinho | proto-dns, daemon | Com `max_queries_per_client=0`, um endereço mandando lixo a 27 000/s deixou a thread `dns-udp` a 98 % e o cliente legítimo a p99 de 1,5 s (com o limite padrão de 200, 377 ms). Repartir a recepção entre threads (SO_REUSEPORT com BPF por hash do cliente, ou fila por cliente) para um cliente não parar os outros; medir com `--tests hostile` | 4 h | aberto |
+| G0.33 | Rollback para antes de um trabalho longo | engine | O notebook guarda 64 revisões; o teste de comandos fez ~270 e o `config.rollback` para a revisão de antes do teste falhou ("revision not found"). Um ponto de volta com nome (`config.checkpoint`) que não sai pelo limite do histórico até ser usado ou apagado, e os roteiros de laboratório usando ele | 3 h | aberto |
+| G4.1zp | `dns-stress-lab.sh` no modo remoto: memória, threads e descritores | scripts | No modo remoto (fase C) as colunas RSS, threads e fds saem 0 e a tabela de serve-stale conta 0 NOERROR/SERVFAIL; ler de `system.resource.process.print` do roteador e conferir a contagem com `kdig` remoto | 2 h | aberto |
