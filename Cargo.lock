@@ -1497,13 +1497,16 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "corerouter-model",
+ "crc32fast",
  "criterion",
+ "flate2",
  "hickory-proto",
  "ipnet",
  "proptest",
  "regex",
  "rustls-pki-types",
  "serde_json",
+ "siphasher",
  "thiserror 2.0.21",
 ]
 

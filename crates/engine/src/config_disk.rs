@@ -31,6 +31,18 @@ pub const LOG_PERCENT: u64 = 5;
 /// Their ceiling whatever the disk, and without a disk measured.
 pub const LOG_MAX_BYTES: u64 = 64 << 20;
 pub const LOG_DEFAULT_BYTES: u64 = 16 << 20;
+/// The DNS query log (G4.1zd), at most this much of `/config` (and at most
+/// its `max_size_mib`).
+pub const DNS_LOG_PERCENT: u64 = 20;
+/// Its ceiling without a disk measured.
+pub const DNS_LOG_DEFAULT_BYTES: u64 = 64 << 20;
+
+/// The DNS query log's ceiling: `max_size_mib`, within its share.
+pub fn dns_log_budget(capacity: Option<u64>, max_size_mib: u32) -> u64 {
+    let wanted = u64::from(max_size_mib) << 20;
+    wanted.min(capacity.map_or(DNS_LOG_DEFAULT_BYTES, |c| share(c, DNS_LOG_PERCENT)))
+}
+
 /// What the log leaves free of `/config`: this much of it, ...
 pub const KEEP_FREE_PERCENT: u64 = 10;
 /// ... and this many times the slot of the running config (the next save

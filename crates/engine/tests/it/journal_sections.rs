@@ -148,6 +148,10 @@ fn commands() -> Vec<(&'static str, Value)> {
         ("ip.dns.zone.add", json!({"name": "example.com"})),
         ("ip.dns.tsig-key.add", json!({"name": "k"})),
         (
+            "ip.dns.log.set",
+            json!({"enabled": true, "acknowledge": "marco-civil-art14", "max_age_hours": 12}),
+        ),
+        (
             "ip.pool.add",
             json!({"name": "p", "ranges": "10.0.0.100-10.0.0.200"}),
         ),

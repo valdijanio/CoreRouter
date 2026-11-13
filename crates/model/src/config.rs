@@ -334,6 +334,12 @@ pub struct Ip {
     /// `/ip dns tsig-key` (G4.1c-3): TSIG keys for RFC 2136 UPDATE.
     #[serde(skip_serializing_if = "crate::dns_tsig::DnsTsig::is_empty")]
     pub dns_tsig: crate::dns_tsig::DnsTsig,
+    /// `/ip dns log` (G4.1zd): the forwarder's query log on disk (off).
+    /// Behind a `CowArc` like the other DNS sections: inline it grew `Ip`
+    /// ~100 bytes, and the LAN forwarder ran ~250 more instructions per
+    /// query with the log off (**medido**, `perf stat`; docs/dns-query-log.md).
+    #[serde(skip_serializing_if = "crate::dns_log::DnsLog::is_default")]
+    pub dns_log: CowArc<crate::dns_log::DnsLog>,
     /// `/ip pool` (G4.2a): address pools of the DHCP server.
     #[serde(skip_serializing_if = "crate::ip_pool::IpPools::is_empty")]
     pub pools: crate::ip_pool::IpPools,

@@ -181,6 +181,8 @@ pub struct Query {
     dropped: bool,
     /// The UDP reply went without records and with TC (too large).
     truncated: bool,
+    /// G4.1zd: set by the `querylog` stage's `after`.
+    pub log: Option<Box<crate::querylog::Entry>>,
 }
 
 /// A query waiting for a worker (it needs the network).
@@ -198,6 +200,12 @@ pub struct Done {
     pub answered_by: &'static str,
     /// Each stage's decision, when asked with [`How::explain`].
     pub explain: Vec<Decision>,
+    /// G4.1zd: the query for the log (`ip.dns.log` on, the client not
+    /// excluded); the daemon adds the time to answer and hands it to the
+    /// [`crate::querylog::Sink`]. Boxed: `Query` and `Done` move several
+    /// times per query, and an inline entry made every query ~2 % more
+    /// instructions with the log off (**medido**, `perf stat`).
+    pub log: Option<Box<crate::querylog::Entry>>,
 }
 
 /// How a query the router asks itself (DNS Lookup, G6.8) goes down the
@@ -211,7 +219,7 @@ pub struct How {
 }
 
 /// Stages that only count (they never decide): left out of `explain`.
-const NOT_EXPLAINED: [&str; 1] = ["statistics"];
+const NOT_EXPLAINED: [&str; 2] = ["statistics", "querylog"];
 
 pub enum Start {
     Done(Done),
@@ -438,6 +446,7 @@ impl Forwarder {
                     effects: Vec::new(),
                     answered_by: "parse",
                     explain: Vec::new(),
+                    log: None,
                 });
             }
         };
@@ -459,6 +468,7 @@ impl Forwarder {
                     effects: Vec::new(),
                     answered_by: "parse",
                     explain: Vec::new(),
+                    log: None,
                 });
             }
         };
@@ -566,6 +576,7 @@ impl Forwarder {
                 effects: q.effects,
                 answered_by: q.answered_by,
                 explain,
+                log: q.log,
             };
         }
         Done {
@@ -573,6 +584,7 @@ impl Forwarder {
             effects: std::mem::take(&mut q.effects),
             answered_by: q.answered_by,
             explain,
+            log: q.log.take(),
         }
     }
 }
@@ -632,6 +644,7 @@ impl Query {
             reply: None,
             dropped: false,
             truncated: false,
+            log: None,
         })
     }
 

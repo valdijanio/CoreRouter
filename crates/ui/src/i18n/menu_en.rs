@@ -22,6 +22,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.dns-cache", "## What it does\nWhat the resolver has in its cache now: names, records, TTL and hits. Flush empties it."),
     ("menu.dns-forwarders", "## What it does\nNamed groups of DNS servers (plain or DoH/DoT) that static FWD entries send some names to: conditional forwarding of an internal domain, for example."),
     ("menu.dns-lookup", "## What it does\nAsks a name (or the PTR of an address) to the router's resolver or to a server you choose, and shows the records and how long it took. Like nslookup or dig."),
+    ("menu.dns-query-log", "## What it does\nThe queries the LAN forwarder answered, from the log on the router's disk (off by default): who asked which name, when, the answer and how long it took, with filters, export and delete. At a connection provider this is the record Marco Civil art. 14 forbids keeping: read the explanation of the window before turning it on."),
     ("menu.dns-static", "## What it does\nNames the router answers itself (A, AAAA, CNAME, MX, TXT…), forwards elsewhere (FWD) or blocks (NXDOMAIN); a regexp matches many names at once."),
     ("menu.dns-statistics", "## What it does\nCounters of the resolver: queries by protocol and type, where the answers came from (cache, static, upstream), response codes, top clients and the upstream servers' latency."),
     ("menu.dns-tsig", "## What it does\nTSIG keys (RFC 8945): shared secrets that sign zone transfers and dynamic updates between DNS servers."),

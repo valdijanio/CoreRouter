@@ -217,6 +217,15 @@ impl Server {
         self.fwd.statistics().answered_in(us);
     }
 
+    /// G4.1zd: the query to the log (`ip.dns.log`), answered or dropped,
+    /// with the time since it was read. Off, the chain built no entry.
+    fn log(&self, read_at: Instant, entry: Option<Box<corerouter_proto_dns::querylog::Entry>>) {
+        let Some(mut e) = entry else { return };
+        let us = u32::try_from(read_at.elapsed().as_micros()).unwrap_or(u32::MAX);
+        e.at_ms = super::dns_log::unix_ms();
+        super::dns_log::sink().push(&e, us);
+    }
+
     fn alive(&self, epoch: u64) -> bool {
         !self.shutdown.is_closed() && self.epoch.load(Ordering::Acquire) == epoch
     }
@@ -295,6 +304,7 @@ fn udp_loop(srv: Arc<Server>, sock: Arc<Udp>, epoch: u64) {
                     sock.send(r, from, local);
                     srv.answered(read_at);
                 }
+                srv.log(read_at, d.log.take());
                 srv.effects(&mut d);
             }
             Start::Pending(p) => {
@@ -306,6 +316,7 @@ fn udp_loop(srv: Arc<Server>, sock: Arc<Udp>, epoch: u64) {
                         sock.send(r, from, local);
                         srv.answered(read_at);
                     }
+                    srv.log(read_at, d.log);
                     continue;
                 };
                 let sock_w = sock.clone();
@@ -315,6 +326,7 @@ fn udp_loop(srv: Arc<Server>, sock: Arc<Udp>, epoch: u64) {
                         sock_w.send(r, from, local);
                         pass.srv.answered(read_at);
                     }
+                    pass.srv.log(read_at, d.log.take());
                     pass.srv.effects(&mut d);
                 };
                 if let Err(e) = thread::Builder::new().name("dns-query".into()).spawn(worker) {
@@ -462,6 +474,7 @@ fn tcp_session(srv: &Arc<Server>, mut s: TcpStream, epoch: u64) {
         srv.effects(&mut done);
         let Some(reply) = done.reply else {
             // Refused by the limit or junk: the connection ends.
+            srv.log(read_at, done.log);
             return;
         };
         // An answer over 64 KiB cannot be framed: SERVFAIL, not silence.
@@ -479,9 +492,11 @@ fn tcp_session(srv: &Arc<Server>, mut s: TcpStream, epoch: u64) {
         let mut framed = len.to_be_bytes().to_vec();
         framed.extend(reply);
         if s.write_all(&framed).is_err() {
+            srv.log(read_at, done.log);
             return;
         }
         srv.answered(read_at);
+        srv.log(read_at, done.log);
     }
 }
 
@@ -1350,6 +1365,7 @@ mod tests {
                 .collect(),
             answered_by: "test",
             explain: Vec::new(),
+            log: None,
         };
         srv.effects(&mut d);
         let dropped = srv.effects_dropped.load(Ordering::Relaxed);
