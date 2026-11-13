@@ -413,9 +413,14 @@ ospf_teardown() {
 	local try id err
 	for try in 1 2 3 4 5; do
 		cr routing.ospf.segment-routing.unset >/dev/null 2>&1 || true
-		for id in $(cr routing.ospf.interface-template.list 2>/dev/null | jq -r '(.rows? // .)[] | select(.area == "stress-bb") | .id'); do
+		# Ids look like `*E`: an unquoted `for id in $(…)` globs them
+		# (`*E` became `LICENSE` in the source tree, 2026-11-13, and the
+		# template stayed on the notebook), so read them line by line.
+		while read -r id; do
+			[ -n "$id" ] || continue
 			cr routing.ospf.interface-template.remove "{\"id\":\"$id\"}" >/dev/null 2>&1 || true
-		done
+		done < <(cr routing.ospf.interface-template.list 2>/dev/null |
+			jq -r '(.rows? // .)[] | select(.area == "stress-bb") | .id')
 		cr routing.ospf.area.remove '{"id":"stress-bb"}' >/dev/null 2>&1 || true
 		err=$(cr routing.ospf.instance.remove "{\"id\":\"$INSTANCE\"}" 2>&1 >/dev/null) && return 0
 		# Gone already, or refused (a template the list did not give, the
