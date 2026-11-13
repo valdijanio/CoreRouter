@@ -33,9 +33,10 @@ pub(crate) const STAGE: Stage = Stage {
 pub const BLOCKED_TTL: u32 = 10;
 
 fn handle(f: &Forwarder, q: &mut Query, _: Option<&mut dyn Transport>) -> Step {
-    let lists = f.state::<Adlists>();
-    let Some(list) = lists.find(&q.name.key) else {
-        q.note(|| match lists.lists().len() {
+    // Borrowed and through this thread's stripe (G4.1z): a name on no list
+    // changes nothing other threads read.
+    let Some(list) = f.with_state(|lists: &Adlists| lists.find(&q.name.key)) else {
+        q.note(|| match f.with_state(|lists: &Adlists| lists.lists().len()) {
             0 => Note::new("adlist.off"),
             n => Note::new("adlist.none").arg("count", n),
         });

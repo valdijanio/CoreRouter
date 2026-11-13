@@ -23,6 +23,7 @@
 //! them the same way: hosts lists name each subdomain they mean, and some
 //! list a parent whose other subdomains must keep working).
 
+use std::hash::{BuildHasher, RandomState};
 use std::net::IpAddr;
 
 use crate::message::MAX_NAME_LEN;
@@ -245,10 +246,20 @@ fn host(word: &str) -> Option<String> {
     (ok && !numeric).then_some(n)
 }
 
-/// A set of names, compact: one string arena, sorted, with offsets. About
-/// 30 bytes per name (a `HashSet<String>` takes about 70), and a lookup is
-/// a binary search per label of the name asked.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// A set of names, compact: one string arena, sorted, with offsets, and an
+/// open-addressing index over it. About 44 bytes per name with its line
+/// (37 of them without the index; a `HashSet<String>` takes about 70).
+///
+/// G4.1z: the lookup runs for every query of the LAN, against whatever
+/// names the LAN asks at that moment, so its cost is cache and TLB misses,
+/// not instructions. The binary search it replaced touched two or three
+/// lines per level, twenty levels for a million names, most of them out of
+/// the CPU cache when the names asked are spread over the list (~550 ns,
+/// **medido**). The index looks at one byte per slot first: a name on no
+/// list (nearly every query) reads one line of `fingerprints`, 1.5 bytes
+/// per name, small enough to stay in the CPU's cache and TLB, and never
+/// the slots or the names.
+#[derive(Debug, Clone, Default)]
 pub struct NameSet {
     arena: String,
     /// Start of each name in `arena`; the next start (or the end) ends it.
@@ -257,7 +268,29 @@ pub struct NameSet {
     /// from `forms` so a name costs 5 bytes more, not 8.
     lines: Vec<u32>,
     forms: Vec<u8>,
+    /// Linear probing over the names, 1.5 slots per name: a byte of the
+    /// name's hash (never 0; 0 is an empty slot), so a slot of another
+    /// name is passed over without reading anything else (1 in 255 is not).
+    fingerprints: Vec<u8>,
+    /// The name's position in the same slot.
+    slots: Vec<u32>,
+    /// Keyed per set: the list is written by whoever serves its URL, and
+    /// names chosen to collide under a known hash would make every lookup
+    /// walk a long run of slots.
+    hasher: RandomState,
 }
+
+/// The index is derived from the names.
+impl PartialEq for NameSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.arena == other.arena
+            && self.starts == other.starts
+            && self.lines == other.lines
+            && self.forms == other.forms
+    }
+}
+
+impl Eq for NameSet {}
 
 impl NameSet {
     /// From names (lowercase, no final dot), deduplicated.
@@ -282,6 +315,7 @@ impl NameSet {
             starts: Vec::with_capacity(all.len()),
             lines: Vec::with_capacity(if keep { all.len() } else { 0 }),
             forms: Vec::with_capacity(if keep { all.len() } else { 0 }),
+            ..Self::default()
         };
         for (n, o) in &all {
             let Ok(start) = u32::try_from(set.arena.len()) else {
@@ -294,7 +328,38 @@ impl NameSet {
                 set.forms.push(o.form);
             }
         }
+        drop(all);
+        set.index();
         set
+    }
+
+    /// Builds the index over the names.
+    fn index(&mut self) {
+        let n = self.starts.len();
+        let cap = n + n / 2 + 1;
+        let mut fingerprints = vec![0u8; cap];
+        let mut slots = vec![0u32; cap];
+        for i in 0..n {
+            // Positions fit in u32: each name took a u32 offset.
+            let Ok(pos) = u32::try_from(i) else {
+                break;
+            };
+            let h = self.hasher.hash_one(self.get(i));
+            let mut at = home(h, cap);
+            // There are more slots than names: an empty one comes.
+            while let Some(f) = fingerprints.get_mut(at) {
+                if *f == 0 {
+                    *f = fingerprint(h);
+                    if let Some(s) = slots.get_mut(at) {
+                        *s = pos;
+                    }
+                    break;
+                }
+                at = if at + 1 == cap { 0 } else { at + 1 };
+            }
+        }
+        self.fingerprints = fingerprints;
+        self.slots = slots;
     }
 
     pub fn len(&self) -> usize {
@@ -307,7 +372,12 @@ impl NameSet {
 
     /// Bytes held (for the status shown to the operator).
     pub fn bytes(&self) -> usize {
-        self.arena.len() + self.starts.len() * 4 + self.lines.len() * 4 + self.forms.len()
+        self.arena.len()
+            + self.starts.len() * 4
+            + self.lines.len() * 4
+            + self.forms.len()
+            + self.fingerprints.len()
+            + self.slots.len() * 4
     }
 
     fn get(&self, i: usize) -> &str {
@@ -321,14 +391,26 @@ impl NameSet {
 
     /// Where `name` (lowercase, no final dot) is in the set.
     fn position(&self, name: &str) -> Option<usize> {
-        let (mut lo, mut hi) = (0usize, self.starts.len());
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            match self.get(mid).cmp(name) {
-                std::cmp::Ordering::Equal => return Some(mid),
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
+        if self.is_empty() {
+            return None;
+        }
+        let cap = self.fingerprints.len();
+        let h = self.hasher.hash_one(name);
+        let fp = fingerprint(h);
+        let mut at = home(h, cap);
+        // At most every slot once (one is always empty: never all of them).
+        for _ in 0..cap {
+            let f = *self.fingerprints.get(at)?;
+            if f == 0 {
+                return None;
             }
+            if f == fp {
+                let i = *self.slots.get(at)? as usize;
+                if self.get(i) == name {
+                    return Some(i);
+                }
+            }
+            at = if at + 1 == cap { 0 } else { at + 1 };
         }
         None
     }
@@ -340,7 +422,7 @@ impl NameSet {
 
     /// Whether `name` or a name above it is in the set.
     pub fn covers(&self, name: &str) -> bool {
-        self.has(name) || parents(name).any(|p| self.has(p))
+        !self.is_empty() && (self.has(name) || parents(name).any(|p| self.has(p)))
     }
 
     /// The listed name that covers `name` (itself or the nearest above),
@@ -362,6 +444,19 @@ impl NameSet {
             form: self.forms.get(i).copied().unwrap_or(NO_FORM),
         }
     }
+}
+
+/// The first slot to look at for hash `h` in `cap` slots: the high bits of
+/// `h` scaled to `cap` (Lemire's multiply-shift; no division, any `cap`).
+/// The fingerprint takes the low bits, so the two do not repeat each other.
+fn home(h: u64, cap: usize) -> usize {
+    ((u128::from(h) * cap as u128) >> 64) as usize
+}
+
+/// The byte of `h` kept in the slot: its low byte, 0 taken as 1 (0 is an
+/// empty slot).
+fn fingerprint(h: u64) -> u8 {
+    (h as u8).max(1)
 }
 
 /// The names above `name`, nearest first, down to two labels
@@ -452,23 +547,58 @@ impl Loaded {
 
 /// The lists in use: the daemon's loader swaps them in whole, the
 /// forwarder reads them without waiting on a download.
-#[derive(Debug, Default)]
+///
+/// G4.1z: every query of the LAN reads them, from every listener thread at
+/// once. One lock and one shared reference count made the threads take
+/// turns on their cache line (36 ns a lookup alone, 186 ns each with four
+/// threads, **medido**); each stripe of threads reads its own copy of the
+/// list of lists, and only a blocked name clones a list's `Arc`.
+#[derive(Debug)]
 pub struct Adlists {
-    lists: std::sync::RwLock<std::sync::Arc<Vec<std::sync::Arc<Loaded>>>>,
+    lists: std::sync::RwLock<Lists>,
+    stripes: Box<[ListsStripe]>,
+}
+
+type Lists = std::sync::Arc<Vec<std::sync::Arc<Loaded>>>;
+
+/// One stripe's copy, on cache lines of its own.
+#[derive(Debug, Default)]
+#[repr(align(128))]
+struct ListsStripe(std::sync::Mutex<Lists>);
+
+impl Default for Adlists {
+    fn default() -> Self {
+        Self {
+            lists: std::sync::RwLock::default(),
+            stripes: (0..crate::server::STRIPES)
+                .map(|_| ListsStripe::default())
+                .collect(),
+        }
+    }
 }
 
 impl Adlists {
     pub fn set(&self, lists: Vec<std::sync::Arc<Loaded>>) {
-        *self.lists.write().unwrap_or_else(|e| e.into_inner()) = std::sync::Arc::new(lists);
+        let lists = std::sync::Arc::new(lists);
+        let mut all = self.lists.write().unwrap_or_else(|e| e.into_inner());
+        // Under the write lock: two loaders never leave stripes apart.
+        for s in &self.stripes {
+            *s.0.lock().unwrap_or_else(|e| e.into_inner()) = lists.clone();
+        }
+        *all = lists;
     }
 
-    pub fn lists(&self) -> std::sync::Arc<Vec<std::sync::Arc<Loaded>>> {
+    pub fn lists(&self) -> Lists {
         self.lists.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The first list that blocks `name`.
     pub fn find(&self, name: &str) -> Option<std::sync::Arc<Loaded>> {
-        self.lists().iter().find(|l| l.matches(name)).cloned()
+        let find = |lists: &Lists| lists.iter().find(|l| l.matches(name)).cloned();
+        match self.stripes.get(crate::server::my_stripe()) {
+            Some(s) => find(&s.0.lock().unwrap_or_else(|e| e.into_inner())),
+            None => find(&self.lists()),
+        }
     }
 }
 
@@ -582,6 +712,87 @@ mod tests {
         assert!(!set.covers("notads.example"));
         assert!(!set.covers("ads.example.org"));
         assert!(!NameSet::default().covers("ads.example"));
+    }
+
+    /// G4.1z: the index finds every name of a big set, and nothing else,
+    /// whatever the hash key of the set.
+    #[test]
+    fn the_index_finds_every_name_and_only_them() {
+        let names: Vec<String> = (0..5000).map(|i| format!("n{i}.l{}.example", i % 7)).collect();
+        let set = NameSet::new(names.clone());
+        let other = NameSet::new(names.clone());
+        assert_eq!(set, other, "equal names, equal sets (the keys differ)");
+        assert_eq!(set.len(), 5000);
+        for n in &names {
+            assert!(set.has(n), "{n}");
+            assert!(other.has(n), "{n}");
+        }
+        for i in 5000..10_000 {
+            assert!(!set.has(&format!("n{i}.l{}.example", i % 7)));
+        }
+        assert!(!set.has("") && !set.has("example"));
+        // One name, and the empty name (NameSet::new takes any string).
+        let one = NameSet::new(vec!["a.example".into(), String::new()]);
+        assert!(one.has("a.example") && one.has("") && !one.has("b.example"));
+        assert!(!NameSet::default().has(""));
+        assert_eq!(set.bytes() - set.arena.len() - 4 * 5000, 5 * set.slots.len());
+        assert_eq!(set.slots.len(), 7501, "1.5 slots per name");
+    }
+
+    /// G4.1z: each stripe of threads reads its own copy; a new set of
+    /// lists reaches every thread, also the ones that read the old one.
+    #[test]
+    fn a_new_set_reaches_every_stripe() {
+        let lists = Adlists::default();
+        let one = std::sync::Arc::new(Loaded::new(1, parse("0.0.0.0 ads.example\n", 10)));
+        let two = std::sync::Arc::new(Loaded::new(2, parse("0.0.0.0 track.example\n", 10)));
+        let threads = 2 * crate::server::STRIPES;
+        let asked = |name: &str| {
+            std::thread::scope(|s| {
+                let all: Vec<_> = (0..threads)
+                    .map(|_| s.spawn(|| lists.find(name).map(|l| l.id)))
+                    .collect();
+                all.into_iter().map(|t| t.join().unwrap()).collect::<Vec<_>>()
+            })
+        };
+        assert!(asked("ads.example").iter().all(Option::is_none));
+        lists.set(vec![one]);
+        assert!(asked("ads.example").iter().all(|id| *id == Some(1)));
+        lists.set(vec![two]);
+        assert!(asked("ads.example").iter().all(Option::is_none));
+        assert!(asked("track.example").iter().all(|id| *id == Some(2)));
+        assert_eq!(lists.lists().len(), 1);
+    }
+
+    /// G4.1z: the forwarder's state through the stripes is one state,
+    /// whichever thread made it and whether borrowed or cloned.
+    #[test]
+    fn the_forwarder_state_is_one_for_all_threads() {
+        let f = crate::server::tests::forwarder(|_| {});
+        let list = std::sync::Arc::new(Loaded::new(7, parse("0.0.0.0 ads.example\n", 10)));
+        std::thread::scope(|s| {
+            s.spawn(|| f.state::<Adlists>().set(vec![list.clone()]));
+        });
+        let seen: Vec<Option<u32>> = std::thread::scope(|s| {
+            let all: Vec<_> = (0..2 * crate::server::STRIPES)
+                .map(|i| {
+                    let f = &f;
+                    s.spawn(move || {
+                        if i % 2 == 0 {
+                            f.with_state(|l: &Adlists| l.find("ads.example").map(|l| l.id))
+                        } else {
+                            f.state::<Adlists>().find("ads.example").map(|l| l.id)
+                        }
+                    })
+                })
+                .collect();
+            all.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        assert!(seen.iter().all(|id| *id == Some(7)), "{seen:?}");
+        assert!(std::sync::Arc::ptr_eq(
+            &f.state::<Adlists>(),
+            &std::thread::scope(|s| s.spawn(|| f.state::<Adlists>()).join().unwrap())
+        ));
     }
 
     proptest! {

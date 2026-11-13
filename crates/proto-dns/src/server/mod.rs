@@ -40,6 +40,9 @@ pub mod explain;
 
 use explain::{Decision, Note, Outcome};
 
+/// The stripe of the calling thread (statistics, states, adlists).
+pub(crate) use statistics::my_stripe;
+
 pub use statistics::{
     CATEGORIES, CLIENT_V6_PREFIX, ClientStats, Counters, DomainStats, MAX_CLIENTS, NameStats,
     STRIPES, Snapshot, Statistics, client_key, ede_name, ede_text, type_name,
@@ -230,8 +233,18 @@ pub struct Forwarder {
     /// the map (G4.1h).
     stats: Arc<statistics::Statistics>,
     states: Mutex<HashMap<TypeId, AnyArc>>,
+    /// Copies of `states`, one per stripe of threads (G4.1z): a stage
+    /// reaches its state through the stripe of its thread, a lock no other
+    /// thread takes while there are no more threads than stripes.
+    state_stripes: Box<[StateStripe]>,
     compiled: Mutex<HashMap<TypeId, (u64, AnyArc)>>,
 }
+
+/// The states a stripe of threads has reached, on cache lines of its own.
+/// A short list: a forwarder keeps a handful of states.
+#[derive(Default)]
+#[repr(align(128))]
+struct StateStripe(Mutex<Vec<(TypeId, AnyArc)>>);
 
 /// A static entry's `regexp`, compiled as the forwarder matches it.
 pub(crate) fn stage_statics_compile(pattern: &str) -> Result<regex::Regex, String> {
@@ -350,6 +363,7 @@ impl Forwarder {
                 allowed: Vec::new(),
             })),
             states: Mutex::new(states),
+            state_stripes: (0..STRIPES).map(|_| StateStripe::default()).collect(),
             compiled: Mutex::new(HashMap::new()),
         }
     }
@@ -375,18 +389,52 @@ impl Forwarder {
     /// The state of type `T` a stage keeps across queries (made on first
     /// use). Stages own their state: nothing to add here for a new one.
     pub fn state<T: Default + Send + Sync + 'static>(&self) -> Arc<T> {
-        let mut map = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = map
-            .entry(TypeId::of::<T>())
-            .or_insert_with(|| Arc::new(T::default()) as AnyArc)
-            .clone();
-        drop(map);
-        match entry.downcast::<T>() {
-            Ok(t) => t,
-            // Unreachable by construction (keyed by the type); a fresh one
-            // keeps the forwarder going.
-            Err(_) => Arc::new(T::default()),
+        self.stripe_state::<T, _>(|any| {
+            any.clone()
+                .downcast::<T>()
+                // Unreachable by construction (keyed by the type); a fresh
+                // one keeps the forwarder going.
+                .unwrap_or_else(|_| Arc::new(T::default()))
+        })
+    }
+
+    /// `f` on the state of type `T`, borrowed (G4.1z): no reference count
+    /// shared by every thread changes, so the stages that run for every
+    /// query use this rather than [`Forwarder::state`]. `f` runs under the
+    /// lock of the thread's stripe: it must not reach a state itself.
+    pub fn with_state<T: Default + Send + Sync + 'static, R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        self.stripe_state::<T, _>(|any| match any.downcast_ref::<T>() {
+            Some(t) => f(t),
+            // Unreachable, as in `state`.
+            None => f(&T::default()),
+        })
+    }
+
+    /// `look` on the state of type `T` as this thread's stripe holds it,
+    /// copied from `states` (made there if new) on first use.
+    fn stripe_state<T: Default + Send + Sync + 'static, R>(
+        &self,
+        look: impl FnOnce(&AnyArc) -> R,
+    ) -> R {
+        let id = TypeId::of::<T>();
+        let Some(stripe) = self.state_stripes.get(my_stripe()) else {
+            return look(&self.shared_state::<T>());
+        };
+        let mut list = stripe.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, any)) = list.iter().find(|(t, _)| *t == id) {
+            return look(any);
         }
+        let any = self.shared_state::<T>();
+        list.push((id, any.clone()));
+        look(&any)
+    }
+
+    /// The one state of type `T` all stripes copy.
+    fn shared_state<T: Default + Send + Sync + 'static>(&self) -> AnyArc {
+        let mut map = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(TypeId::of::<T>())
+            .or_insert_with(|| Arc::new(T::default()) as AnyArc)
+            .clone()
     }
 
     /// The statistics (the same as `state::<Statistics>()`, without its

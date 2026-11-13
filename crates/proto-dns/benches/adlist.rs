@@ -7,7 +7,9 @@
 //! different names in turn (the lab's hot set, `h<i>.up.lab`), and
 //! `forward_hit_10k` runs them through the forwarder's whole chain as cache
 //! hits, without a list and with the 1 M-name one: the loss the lab measured
-//! (`docs/dns-stress.md`, "Adlist de 1 M de nomes").
+//! (`docs/dns-stress.md`, "Adlist de 1 M de nomes"). `domains` is the same
+//! million as Adblock rules (`||name^`, the format of the big curated
+//! lists), where every label of the name asked is one more lookup.
 //!
 //! `cargo xtask bench` runs it; alone: `cargo bench -p corerouter-proto-dns --bench adlist`.
 
@@ -110,6 +112,13 @@ fn bench(c: &mut Criterion) {
     g.finish();
     let mut parsed = parse(&text, NAMES);
     drop(text);
+    let rules = Arc::new(Loaded::new(
+        2,
+        corerouter_proto_dns::adlist::Parsed {
+            domains: parsed.names.clone(),
+            ..Default::default()
+        },
+    ));
     parsed.domains.push("blocked-domain.example".into());
     let list = Arc::new(Loaded::new(1, parsed));
     eprintln!("adlist: {} names, {} bytes", list.len(), list.names.bytes());
@@ -132,12 +141,24 @@ fn bench(c: &mut Criterion) {
         })
         .collect();
     let mut g = c.benchmark_group("dns_adlist_lookup_10k");
-    for (what, names) in [("miss", &hot), ("hit", &listed)] {
+    // Names between the listed ones: the search cannot reuse a path.
+    let spread: Vec<String> = (0..HOT)
+        .map(|i| {
+            let j = (i * 97) % NAMES;
+            format!("ads{j}x.tracker{}.example", j % 997)
+        })
+        .collect();
+    for (what, set, names) in [
+        ("miss", &list, &hot),
+        ("hit", &list, &listed),
+        ("spread", &list, &spread),
+        ("domains_spread", &rules, &spread),
+    ] {
         let mut i = 0usize;
         g.bench_function(what, |b| {
             b.iter(|| {
                 i = (i + 1) % HOT;
-                list.matches(black_box(&names[i]))
+                set.matches(black_box(&names[i]))
             })
         });
     }
@@ -147,7 +168,11 @@ fn bench(c: &mut Criterion) {
     let queries: Vec<Vec<u8>> = hot.iter().map(|n| ask(&format!("{n}."))).collect();
     let f = warm_forwarder(client, &queries);
     let mut g = c.benchmark_group("dns_adlist_forward_hit_10k");
-    for (what, lists) in [("none", Vec::new()), ("1m", vec![list.clone()])] {
+    for (what, lists) in [
+        ("none", Vec::new()),
+        ("1m", vec![list.clone()]),
+        ("1m_domains", vec![rules.clone()]),
+    ] {
         f.state::<Adlists>().set(lists);
         let mut i = 0usize;
         g.bench_function(what, |b| {
