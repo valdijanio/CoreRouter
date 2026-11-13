@@ -1314,9 +1314,26 @@ test_ops() {
 	# a) An OSPF commit: the template's cost (no adjacency reset).
 	csv=$OUT/ops-commit.csv
 	sampler_start "$csv"
+	# PERF_COMMIT=1: the daemon's profile around the commit (with 200 000
+	# LSAs the command took 1.2 s against 20 ms with 10 000).
+	local perfpid="" perf=/usr/lib/linux-tools-6.8.0-147/perf
+	[ -x "$perf" ] || perf=perf
+	if [ "${PERF_COMMIT:-0}" = 1 ] && [ $DUT = local ]; then
+		"$perf" record -F 999 -g -p "$(dut_pid corerouter-daemon)" -o "$OUT/perf-commit.data" >/dev/null 2>&1 &
+		perfpid=$!
+		sleep 0.5
+	fi
 	t0=$(now)
 	ok routing.ospf.interface-template.set "{\"id\":\"$TEMPLATE_ID\",\"cost\":20}" >/dev/null
 	t_cmd=$(since "$t0")
+	if [ -n "$perfpid" ]; then
+		kill -INT "$perfpid" 2>/dev/null
+		wait "$perfpid" 2>/dev/null || true
+		"$perf" report -i "$OUT/perf-commit.data" --stdio --no-children --sort comm,dso,symbol -g none \
+			--percent-limit 1 2>/dev/null | grep -v '^$' | head -n 60 >"$OUT/perf-commit.txt" || true
+		log "perf: $OUT/perf-commit.txt"
+		head -n 45 "$OUT/perf-commit.txt" >&2
+	fi
 	local applied
 	if [ $DUT = local ]; then
 		applied=$(wait_for "cost 20" 60 sh -c "vtysh --vty_socket '$W/dut/run/frr' -c 'show ip ospf interface $DUT_IFACE json' | grep -q '\"cost\":20'") || applied=-
