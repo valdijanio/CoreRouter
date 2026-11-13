@@ -10,7 +10,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use hickory_proto::op::ResponseCode;
-use hickory_proto::rr::rdata::svcb::{Alpn, IpHint, SVCB, SvcParamKey, SvcParamValue};
+use hickory_proto::rr::rdata::svcb::{Alpn, IpHint, SVCB, SvcParamKey, SvcParamValue, Unknown};
 use hickory_proto::rr::rdata::{A, AAAA, HINFO};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 
@@ -76,6 +76,9 @@ fn handle(_: &Forwarder, q: &mut Query, _: Option<&mut dyn Transport>) -> Step {
 /// it; §4.2 suppresses a failed one for as long).
 const DDR_TTL: u32 = 300;
 
+/// RFC 9461 §9: the SvcParamKey of `dohpath`.
+const DOHPATH: u16 = 7;
+
 /// `resolver.arpa` is answered here, never forwarded (RFC 9462 §6.1, §6.4).
 fn resolver_arpa(q: &mut Query, owner: Name) -> Step {
     let k = q.name.key.clone();
@@ -100,17 +103,19 @@ fn resolver_arpa(q: &mut Query, owner: Name) -> Step {
 }
 
 /// The router's encrypted services as SVCB ServiceMode records (RFC 9462 §4,
-/// RFC 9461): `alpn` always, `port` only off the default (it is mandatory
-/// for the client, §4.2), the router's addresses on the networks that may
-/// ask as hints and in the additional section (§4: the client then needs no
-/// other query; opportunistic discovery, §4.3, takes only the address it
-/// asked). Keys in ascending order (RFC 9460 §2.2). The target is the
-/// router's identity as a name, the one `/certificate` puts in the SAN of
-/// the certificate it makes.
+/// RFC 9461): DoH first (priority 1; Windows only takes DoH), then DoT;
+/// `alpn` always, `port` only off the default (it is mandatory for the
+/// client, §4.2), DoH's `dohpath` (§5, key 7: hickory has no name for it),
+/// the router's addresses on the networks that may ask as hints and in the
+/// additional section (§4: the client then needs no other query;
+/// opportunistic discovery, §4.3, takes only the address it asked). Keys in
+/// ascending order (RFC 9460 §2.2). The target is the router's identity as
+/// a name, the one `/certificate` puts in the SAN of the certificate it
+/// makes.
 fn designations(q: &Query, owner: &Name) -> (Vec<Record>, Vec<Record>) {
     let cfg = &q.config.config;
     let e = &cfg.ip.dns.encrypted_service;
-    if !(e.dot && e.announce_ddr && cfg.ip.dns.allow_remote_requests) {
+    if !(e.any() && e.announce_ddr && cfg.ip.dns.allow_remote_requests) {
         return (Vec::new(), Vec::new());
     }
     let host: String = cfg
@@ -138,18 +143,29 @@ fn designations(q: &Query, owner: &Name) -> (Vec<Record>, Vec<Record>) {
         .collect();
     let v4: Vec<A> = mine.iter().filter_map(|a| match a { IpAddr::V4(v) => Some(A(*v)), IpAddr::V6(_) => None }).collect();
     let v6: Vec<AAAA> = mine.iter().filter_map(|a| match a { IpAddr::V6(v) => Some(AAAA(*v)), IpAddr::V4(_) => None }).collect();
-    let mut params = vec![(SvcParamKey::Alpn, SvcParamValue::Alpn(Alpn(vec!["dot".to_owned()])))];
-    if e.dot_port != corerouter_model::dns_encrypted::DEFAULT_DOT_PORT {
-        params.push((SvcParamKey::Port, SvcParamValue::Port(e.dot_port)));
+    use corerouter_model::dns_encrypted::{DEFAULT_DOH_PORT, DEFAULT_DOT_PORT};
+    let services = [
+        (e.doh, "h2", e.doh_port, DEFAULT_DOH_PORT, Some(format!("{}{{?dns}}", e.doh_path))),
+        (e.dot, "dot", e.dot_port, DEFAULT_DOT_PORT, None),
+    ];
+    let mut answers = Vec::new();
+    for (alpn, port, default, dohpath) in services.into_iter().filter(|s| s.0).map(|s| (s.1, s.2, s.3, s.4)) {
+        let mut params = vec![(SvcParamKey::Alpn, SvcParamValue::Alpn(Alpn(vec![alpn.to_owned()])))];
+        if port != default {
+            params.push((SvcParamKey::Port, SvcParamValue::Port(port)));
+        }
+        if !v4.is_empty() {
+            params.push((SvcParamKey::Ipv4Hint, SvcParamValue::Ipv4Hint(IpHint(v4.clone()))));
+        }
+        if !v6.is_empty() {
+            params.push((SvcParamKey::Ipv6Hint, SvcParamValue::Ipv6Hint(IpHint(v6.clone()))));
+        }
+        if let Some(path) = dohpath {
+            params.push((SvcParamKey::from(DOHPATH), SvcParamValue::Unknown(Unknown(path.into_bytes()))));
+        }
+        let priority = u16::try_from(answers.len() + 1).unwrap_or(u16::MAX);
+        answers.push(Record::from_rdata(owner.clone(), DDR_TTL, RData::SVCB(SVCB::new(priority, target.clone(), params))));
     }
-    if !v4.is_empty() {
-        params.push((SvcParamKey::Ipv4Hint, SvcParamValue::Ipv4Hint(IpHint(v4.clone()))));
-    }
-    if !v6.is_empty() {
-        params.push((SvcParamKey::Ipv6Hint, SvcParamValue::Ipv6Hint(IpHint(v6.clone()))));
-    }
-    let svcb = SVCB::new(1, target.clone(), params);
-    let answers = vec![Record::from_rdata(owner.clone(), DDR_TTL, RData::SVCB(svcb))];
     let additional = v4
         .into_iter()
         .map(RData::A)

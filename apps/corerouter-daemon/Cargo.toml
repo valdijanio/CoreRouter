@@ -78,6 +78,8 @@ rustix = { version = "1.1.5", default-features = false, features = ["std", "proc
 
 [dev-dependencies]
 serde_json.workspace = true
+# dns_doh.rs (G4.1zf): hostile HTTP and DoH input never panics.
+proptest.workspace = true
 # package_upload.rs (G1.6e): chunks go base64 over the control channel.
 base64.workspace = true
 # service/https.rs: a local TLS server with a self-signed certificate.
