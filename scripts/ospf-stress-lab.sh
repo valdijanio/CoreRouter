@@ -421,6 +421,12 @@ dut_config() {
 	ok ip.address.add "{\"address\":\"$LINK_DUT/30\",\"interface\":\"$DUT_IFACE\"}" >/dev/null
 	ok routing.ospf.instance.add "{\"name\":\"$INSTANCE\",\"router_id\":\"$DUT_RID\"}" >/dev/null
 	ok routing.ospf.area.add "{\"name\":\"stress-bb\",\"instance\":\"$INSTANCE\",\"area_id\":\"0.0.0.0\"}" >/dev/null
+	# Every adjacency change in ospfd's log (local DUT; the daemon does not
+	# write this line, so it stays).
+	if [ -S "$W/dut/run/frr/ospfd.vty" ]; then
+		vtysh --vty_socket "$W/dut/run/frr" -c 'configure terminal' -c 'router ospf' \
+			-c 'log-adjacency-changes detail' >/dev/null 2>&1 || true
+	fi
 	TEMPLATE_ID=$(ok routing.ospf.interface-template.add \
 		"{\"area\":\"stress-bb\",\"networks\":[\"10.0.1.0/30\"],\"type\":\"ptp\",\"hello_interval\":1,\"dead_interval\":4,\"comment\":\"ospf-stress\"}" |
 		jq -r '.id // empty')
@@ -1134,6 +1140,10 @@ test_neighbors() {
 				sleep 5
 			done
 			[ "$below" -gt 0 ] && verdict="FAIL (adjacencies dropped: $below samples below $((n + 1)))"
+			if [ "$below" -gt 0 ] && [ "$HOLD" -gt 0 ]; then
+				log "neighbors $n: holding for $HOLD s after the drops"
+				sleep "$HOLD"
+			fi
 		fi
 		sampler_stop
 		local dead
