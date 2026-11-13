@@ -747,3 +747,73 @@ fn allowed_networks_and_validation() {
     let issues = crate::validate(&cfg);
     assert_eq!(issues.len(), 2, "{issues:?}");
 }
+
+/// G4.1zf: `resolver.arpa` is the router's (RFC 9462 §6.4, erratum 8278)
+/// and `_dns.resolver.arpa` SVCB names its DNS over TLS service (DDR).
+#[test]
+fn resolver_arpa_is_answered_here_with_the_ddr_designation() {
+    use hickory_proto::rr::rdata::svcb::{SvcParamKey, SvcParamValue};
+    let f = forwarder(|c| {
+        c.system.identity = "Lab Router".into();
+        c.ip.addresses.push(corerouter_model::config::AddressEntry {
+            id: corerouter_model::ItemId(1),
+            address: "192.168.88.1/24".parse().unwrap(),
+            interface: "ether2".parse().unwrap(),
+            disabled: false,
+            comment: String::new(),
+            from_pool: None,
+        });
+    });
+    let mut up = Up::new();
+    // Off: NODATA, never forwarded.
+    let m = run(
+        &f,
+        &mut up,
+        LAN,
+        &ask("_dns.resolver.arpa.", RecordType::SVCB),
+    )
+    .unwrap();
+    assert_eq!(m.metadata.response_code, ResponseCode::NoError);
+    assert!(m.answers.is_empty());
+    let m = run(&f, &mut up, LAN, &ask("x.resolver.arpa.", RecordType::A)).unwrap();
+    assert_eq!(
+        m.metadata.response_code,
+        ResponseCode::NXDomain,
+        "erratum 8278"
+    );
+    let m = run(&f, &mut up, LAN, &ask("_dns.resolver.arpa.", RecordType::A)).unwrap();
+    assert_eq!(
+        (m.metadata.response_code, m.answers.len()),
+        (ResponseCode::NoError, 0)
+    );
+    // On, on port 8853: alpn, port, the LAN address as hint and in additional.
+    let cfg = f.config();
+    let mut c = (*cfg.config).clone();
+    c.ip.dns.encrypted_service.dot = true;
+    c.ip.dns.encrypted_service.dot_port = 8853;
+    c.ip.dns.encrypted_service.certificate = "dns-server".into();
+    f.configure(Arc::new(c), cfg.allowed.clone());
+    let m = run(
+        &f,
+        &mut up,
+        LAN,
+        &ask("_dns.resolver.arpa.", RecordType::SVCB),
+    )
+    .unwrap();
+    assert!(m.metadata.authoritative);
+    let RData::SVCB(svcb) = &m.answers[0].data else {
+        panic!("{m:?}")
+    };
+    assert_eq!(svcb.svc_priority, 1);
+    assert_eq!(svcb.target_name.to_string(), "lab-router.");
+    let keys: Vec<SvcParamKey> = svcb.svc_params.iter().map(|(k, _)| *k).collect();
+    assert_eq!(
+        keys,
+        [SvcParamKey::Alpn, SvcParamKey::Port, SvcParamKey::Ipv4Hint],
+        "ascending, RFC 9460 §2.2"
+    );
+    assert!(matches!(&svcb.svc_params[1].1, SvcParamValue::Port(8853)));
+    assert_eq!(m.additionals.len(), 1);
+    assert_eq!(m.additionals[0].name.to_string(), "lab-router.");
+    assert!(up.asked.is_empty(), "resolver.arpa never leaves");
+}

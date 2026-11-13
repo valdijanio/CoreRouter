@@ -121,6 +121,9 @@ pub struct Dns {
     /// Check the encrypted server's certificate (RFC 8310 strict profile).
     /// RouterOS defaults to no; the Mozilla roots are built in here.
     pub verify_doh_cert: bool,
+    /// G4.1zf: DNS over TLS for the LAN (`/ip dns encrypted-service`).
+    #[serde(skip_serializing_if = "crate::dns_encrypted::EncryptedService::is_default")]
+    pub encrypted_service: crate::dns_encrypted::EncryptedService,
 }
 
 impl Default for Dns {
@@ -142,6 +145,7 @@ impl Default for Dns {
             max_udp_packet_size: DEFAULT_MAX_UDP_PACKET_SIZE,
             use_doh_server: String::new(),
             verify_doh_cert: true,
+            encrypted_service: crate::dns_encrypted::EncryptedService::default(),
         }
     }
 }
@@ -183,6 +187,9 @@ impl Dns {
                  not even the first server would get its full wait",
                 self.query_total_timeout_ms, self.query_server_timeout_ms
             ));
+        }
+        if let Some(why) = self.encrypted_service.problem() {
+            return Some(format!("encrypted-service: {why}"));
         }
         if let Some(why) = secure_url_problem(&self.use_doh_server) {
             return Some(format!("use_doh_server: {why}"));

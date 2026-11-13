@@ -35,6 +35,9 @@ corerouter-proto-bfd.workspace = true
 # stream sockets that share the server port (SO_REUSEADDR/SO_REUSEPORT).
 corerouter-proto-iperf.workspace = true
 socket2 = { version = "0.6.5", features = ["all"] }
+# G4.1zf: DNS over TLS, one event loop per core instead of a thread per
+# connection (already in the graph through tokio).
+mio = { version = "1.2.4", features = ["os-poll", "net"] }
 corerouter-proto-syslog.workspace = true
 corerouter-proto-flow.workspace = true
 # service/radius.rs (G4.3j): the AAA service drives the RADIUS client.

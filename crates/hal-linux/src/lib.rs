@@ -318,6 +318,12 @@ mod linux {
         /// link dump per tick instead of two. Taken by the first reader,
         /// dropped by `apply`.
         managed: Option<BTreeMap<u32, IfName>>,
+        /// G3.4m: the last `Hal::unmanaged` answer, its `epoch` and when
+        /// it was read. Commands ask before touching a name (30 of them);
+        /// a batch of 4 000 `interface.remove` read the whole link list
+        /// 4 000 times (51 s of CPU with 4 000 VLANs, **medido**,
+        /// docs/ospf-stress.md). Kept until an apply or [`UNMANAGED_TTL`].
+        unmanaged_memo: Option<UnmanagedMemo>,
         /// G1.31: what each WireGuard link was last told, for the endpoints
         /// (sent again only when the configured one changes: the kernel
         /// follows a roaming peer).
@@ -326,6 +332,15 @@ mod linux {
         /// needed it (`None`: not changed by us).
         l3mdev_orig: Option<i64>,
     }
+
+    /// `Hal::unmanaged`'s answer with the `epoch` and the moment it was read.
+    type UnmanagedMemo = (u64, std::time::Instant, Vec<(IfName, String)>);
+
+    /// How long an `Hal::unmanaged` answer is reused. The commands'
+    /// check is an early refusal: `apply` classifies the links again and
+    /// never touches another program's, so a link that appeared less than
+    /// this ago is at worst refused a moment later, by the apply.
+    pub const UNMANAGED_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 
     impl LinuxHal {
         pub fn new() -> Self {
@@ -1513,11 +1528,22 @@ mod linux {
         }
 
         fn unmanaged(&mut self) -> Vec<(IfName, String)> {
+            if let Some((epoch, at, list)) = &self.unmanaged_memo
+                && *epoch == self.epoch
+                && at.elapsed() < UNMANAGED_TTL
+            {
+                return list.clone();
+            }
             match self.view(&self.claims) {
-                Ok(v) => v
-                    .into_iter()
-                    .filter_map(|(l, o)| Some((l.name.parse().ok()?, o.reason()?.to_owned())))
-                    .collect(),
+                Ok(v) => {
+                    let list: Vec<(IfName, String)> = v
+                        .into_iter()
+                        .filter_map(|(l, o)| Some((l.name.parse().ok()?, o.reason()?.to_owned())))
+                        .collect();
+                    self.unmanaged_memo =
+                        Some((self.epoch, std::time::Instant::now(), list.clone()));
+                    list
+                }
                 Err(e) => {
                     log::warn!("link dump failed: {e}");
                     Vec::new()
@@ -1777,6 +1803,6 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::LinuxHal;
+pub use linux::{LinuxHal, UNMANAGED_TTL};
 
 pub use owner::Policy;

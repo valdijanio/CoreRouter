@@ -131,6 +131,9 @@ pub(crate) fn used_by(cfg: &corerouter_model::Config, name: &str) -> Vec<&'stati
     if cfg.system.web.www_ssl.certificate == name {
         out.push("www-ssl");
     }
+    if cfg.ip.dns.encrypted_service.certificate == name {
+        out.push("dns-encrypted-service");
+    }
     out
 }
 
@@ -264,7 +267,7 @@ fn push(s: &mut Session, mut c: Certificate) -> Result<ItemId> {
     Ok(id)
 }
 
-fn add(s: &mut Session, p: &Value) -> Result<Value> {
+pub(super) fn add(s: &mut Session, p: &Value) -> Result<Value> {
     let name = new_name(s, opt_str(p, "name")?.unwrap_or_default(), None)?;
     let comment = opt_text(p, "comment", 256)?.unwrap_or_default();
     let n = new_cert(s, p)?;
@@ -327,6 +330,9 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     }
     if name != old && cfg.system.web.www_ssl.certificate == old {
         cfg.system.web.www_ssl.certificate.clone_from(&name);
+    }
+    if name != old && cfg.ip.dns.encrypted_service.certificate == old {
+        cfg.ip.dns.encrypted_service.certificate.clone_from(&name);
     }
     Ok(json!({"id": id, "name": name}))
 }

@@ -3,10 +3,11 @@
 //!
 //! - DoT: a TLS stream to port 853, each message with its 2-byte length
 //!   (RFC 7858 §3.3, as RFC 1035 §4.2.2 over TCP).
-//! - DoH: `POST <path>` with `application/dns-message` (RFC 8484 §4.1),
-//!   HTTP/1.1 over our client (`https.rs`). RFC 8484 §5.2 recommends
-//!   HTTP/2; the public servers answer HTTP/1.1, and keeping the
-//!   connection open (below) removes most of the difference.
+//! - DoH: `POST <path>` with `application/dns-message` (RFC 8484 §4.1).
+//!   TLS offers ALPN `h2` and `http/1.1` (RFC 7301): HTTP/2 when the
+//!   server picks it (`http2.rs`; RFC 8484 §5.2 recommends it, and some
+//!   servers, such as Unbound, speak nothing else), else HTTP/1.1 over our
+//!   client (`https.rs`).
 //! - Connections are reused (RFC 7858 §3.4 SHOULD): a few idle ones per
 //!   server, dropped after [`IDLE`]. A reused one the server closed in the
 //!   meantime is retried once on a fresh connection (§3.4: both sides MUST
@@ -18,12 +19,15 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use corerouter_proto_dns::encrypted::{Proto, SecureServer};
 use corerouter_proto_dns::resolver::TransportError;
 
+use rustls::ClientConfig;
+
+use super::http2;
 use super::https::{self, Stream, Url};
 
 /// An idle connection older than this is closed, not reused (servers
@@ -42,21 +46,29 @@ struct Key {
     verify: bool,
 }
 
-type Pool = Mutex<HashMap<Key, Vec<(Stream, Instant)>>>;
+/// A connection kept for the next query.
+enum Conn {
+    /// DoT, or DoH over HTTP/1.1.
+    Plain(Stream),
+    /// DoH over HTTP/2.
+    H2(Box<http2::Conn>),
+}
+
+type Pool = Mutex<HashMap<Key, Vec<(Conn, Instant)>>>;
 
 fn pool() -> &'static Pool {
     static POOL: OnceLock<Pool> = OnceLock::new();
     POOL.get_or_init(Pool::default)
 }
 
-fn take(key: &Key) -> Option<Stream> {
+fn take(key: &Key) -> Option<Conn> {
     let mut p = pool().lock().unwrap_or_else(|e| e.into_inner());
     let list = p.get_mut(key)?;
     list.retain(|(_, at)| at.elapsed() < IDLE);
     list.pop().map(|(s, _)| s)
 }
 
-fn give_back(key: Key, s: Stream) {
+fn give_back(key: Key, s: Conn) {
     let mut p = pool().lock().unwrap_or_else(|e| e.into_inner());
     // Servers gone from the config leave no sockets behind for long.
     p.retain(|_, list| {
@@ -99,25 +111,67 @@ pub(crate) fn exchange(
             Err(_) => {}
         }
     }
-    let s = https::connect(addr, true, &via.auth_name, via.verify, deadline).map_err(|e| io(&e))?;
+    let s = connect(addr, via, deadline)?;
     once(s, &key, via, query, deadline)
 }
 
+/// The TLS client config of DoH: the usual one, plus ALPN `h2` then
+/// `http/1.1` (RFC 8484 §5.2). Built once each.
+fn doh_config(verify: bool) -> Result<Arc<ClientConfig>, String> {
+    static CHECKED: OnceLock<Result<Arc<ClientConfig>, String>> = OnceLock::new();
+    static ANY: OnceLock<Result<Arc<ClientConfig>, String>> = OnceLock::new();
+    let make = || -> Result<Arc<ClientConfig>, String> {
+        let mut c = (*https::tls_config(verify)?).clone();
+        c.alpn_protocols = vec![http2::ALPN.to_vec(), b"http/1.1".to_vec()];
+        Ok(Arc::new(c))
+    };
+    let cell = if verify { &CHECKED } else { &ANY };
+    cell.get_or_init(make).clone()
+}
+
+/// A fresh connection: TLS, and for DoH the HTTP/2 preface when the
+/// server chose `h2`.
+fn connect(addr: SocketAddr, via: &SecureServer, deadline: Instant) -> Result<Conn, TransportError> {
+    if via.proto == Proto::Tls {
+        let s = https::connect(addr, true, &via.auth_name, via.verify, deadline).map_err(|e| io(&e))?;
+        return Ok(Conn::Plain(s));
+    }
+    let config = doh_config(via.verify).map_err(|e| io(&e))?;
+    let s = https::connect_with(addr, Some(config), &via.auth_name, deadline).map_err(|e| io(&e))?;
+    if s.alpn() == Some(http2::ALPN) {
+        let c = http2::Conn::start(s, deadline).map_err(|e| io(&e))?;
+        Ok(Conn::H2(Box::new(c)))
+    } else {
+        Ok(Conn::Plain(s))
+    }
+}
+
 fn once(
-    mut s: Stream,
+    conn: Conn,
     key: &Key,
     via: &SecureServer,
     query: &[u8],
     deadline: Instant,
 ) -> Result<Vec<u8>, TransportError> {
-    let (reply, reuse) = match via.proto {
-        Proto::Tls => (dot(&mut s, query, deadline)?, true),
-        Proto::Https => doh(&mut s, via, query, deadline)?,
-    };
-    if reuse {
-        give_back(key.clone(), s);
+    match conn {
+        Conn::Plain(mut s) => {
+            let (reply, reuse) = match via.proto {
+                Proto::Tls => (dot(&mut s, query, deadline)?, true),
+                Proto::Https => doh(&mut s, via, query, deadline)?,
+            };
+            if reuse {
+                give_back(key.clone(), Conn::Plain(s));
+            }
+            Ok(reply)
+        }
+        Conn::H2(mut c) => {
+            let reply = doh2(&mut c, via, query, deadline)?;
+            if c.reusable() {
+                give_back(key.clone(), Conn::H2(c));
+            }
+            Ok(reply)
+        }
     }
-    Ok(reply)
 }
 
 /// RFC 7858 §3.3: the 2-byte length, then the message.
@@ -161,21 +215,61 @@ fn doh(
         deadline,
     )
     .map_err(|e| io(&e))?;
-    if r.status != 200 {
-        return Err(TransportError::Io(format!("HTTP {}", r.status)));
+    let keep = r.keep_alive;
+    Ok((check(r.status, r.content_type, r.body)?, keep))
+}
+
+/// RFC 8484 §4.1 over HTTP/2: the same POST, the authority as the URL
+/// has it.
+fn doh2(
+    c: &mut http2::Conn,
+    via: &SecureServer,
+    query: &[u8],
+    deadline: Instant,
+) -> Result<Vec<u8>, TransportError> {
+    let authority = if via.port == corerouter_proto_dns::encrypted::HTTPS_PORT {
+        host_for_url(&via.host)
+    } else {
+        format!("{}:{}", host_for_url(&via.host), via.port)
+    };
+    let req = http2::Request {
+        method: "POST",
+        authority: &authority,
+        path: &via.path,
+        headers: &[
+            ("content-type", "application/dns-message"),
+            ("accept", "application/dns-message"),
+        ],
+        body: query,
+    };
+    let r = c.request(&req, MAX_MESSAGE, deadline).map_err(|f| io(&f.why))?;
+    check(r.status, r.content_type, r.body)
+}
+
+/// An IPv6 literal goes in brackets in an authority (RFC 3986 §3.2.2).
+fn host_for_url(host: &str) -> String {
+    if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
     }
-    // RFC 8484 §4.2: anything else is not a DNS answer.
-    let ok = r
-        .content_type
+}
+
+/// RFC 8484 §4.2: 200 and `application/dns-message`, or not an answer.
+fn check(status: u16, content_type: Option<String>, body: Vec<u8>) -> Result<Vec<u8>, TransportError> {
+    if status != 200 {
+        return Err(TransportError::Io(format!("HTTP {status}")));
+    }
+    let ok = content_type
         .as_deref()
         .is_some_and(|t| t.to_ascii_lowercase().starts_with("application/dns-message"));
     if !ok {
         return Err(TransportError::Io(format!(
             "not application/dns-message: {}",
-            r.content_type.unwrap_or_default()
+            content_type.unwrap_or_default()
         )));
     }
-    Ok((r.body, r.keep_alive))
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -316,6 +410,84 @@ pub(crate) mod tests {
             // One refused handshake, then one connection for three queries.
             assert_eq!(conns.load(Ordering::SeqCst), 2, "{url}");
         }
+    }
+
+    /// A DoH server that speaks HTTP/2 only (ALPN `h2`, like Unbound's
+    /// `https-port`): prior frames, a HEADERS + DATA answer per request.
+    fn h2_server() -> (u16, Arc<AtomicUsize>) {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let cert = CertificateDer::from(ck.cert.der().to_vec());
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()));
+        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let config = Arc::new(config);
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let conns = Arc::new(AtomicUsize::new(0));
+        let count = conns.clone();
+        thread::spawn(move || {
+            for tcp in l.incoming() {
+                let Ok(tcp) = tcp else { return };
+                count.fetch_add(1, Ordering::SeqCst);
+                let config = config.clone();
+                thread::spawn(move || {
+                    let conn = rustls::ServerConnection::new(config).unwrap();
+                    let mut s = StreamOwned::new(conn, tcp);
+                    let mut pre = [0u8; 24];
+                    if s.read_exact(&mut pre).is_err() {
+                        return;
+                    }
+                    assert_eq!(&pre, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+                    let frame = |kind: u8, flags: u8, id: u32, p: &[u8]| {
+                        let mut f = u32::try_from(p.len()).unwrap().to_be_bytes()[1..].to_vec();
+                        f.extend([kind, flags]);
+                        f.extend(id.to_be_bytes());
+                        f.extend_from_slice(p);
+                        f
+                    };
+                    let _ = s.write_all(&frame(4, 0, 0, &[]));
+                    loop {
+                        let mut h = [0u8; 9];
+                        if s.read_exact(&mut h).is_err() {
+                            return;
+                        }
+                        let len = usize::from(h[0]) << 16 | usize::from(h[1]) << 8 | usize::from(h[2]);
+                        let mut p = vec![0u8; len];
+                        s.read_exact(&mut p).unwrap();
+                        let id = u32::from_be_bytes([h[5], h[6], h[7], h[8]]);
+                        // DATA with END_STREAM: the query; answer it.
+                        if h[3] == 0 && h[4] & 1 != 0 {
+                            let a = answer(&p);
+                            // :status 200, content-type (literal, static name 31).
+                            let mut block = vec![0x88, 0x0f, 0x10, 23];
+                            block.extend_from_slice(b"application/dns-message");
+                            let mut out = frame(1, 4, id, &block);
+                            out.extend(frame(0, 1, id, &a));
+                            if s.write_all(&out).is_err() || s.flush().is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (port, conns)
+    }
+
+    #[test]
+    fn doh_speaks_http2_when_the_server_picks_h2() {
+        let (port, conns) = h2_server();
+        let url = format!("https://localhost:{port}/dns-query");
+        for _ in 0..3 {
+            let m = ask(&url, port, false).unwrap();
+            assert_eq!(m.answers[0].data.to_string(), "192.0.2.99");
+        }
+        assert_eq!(conns.load(Ordering::SeqCst), 1, "one HTTP/2 connection for three queries");
     }
 
     #[test]

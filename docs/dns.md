@@ -540,7 +540,9 @@ grupo).
   depois de `#` é o que o certificado tem de trazer (RFC 8310 §6.6, o `ip@853#nome` do Unbound);
   sem `#`, o próprio host.
 - **DoH** (RFC 8484): `POST` com `application/dns-message` (§4.1), resposta conferida pelo tipo
-  (§4.2), HTTP/1.1. Caminho padrão `/dns-query` (o exemplo da RFC).
+  (§4.2). Caminho padrão `/dns-query` (o exemplo da RFC). O TLS oferece ALPN `h2` e `http/1.1`:
+  HTTP/2 quando o servidor escolhe (§5.2 o recomenda; G4.1s, `service/http2.rs`), HTTP/1.1 nos
+  outros. O DoH do Unbound só fala HTTP/2 e não respondia ao nosso HTTP/1.1 (achado da G4.1r).
 - A consulta cifrada vai com id 0 (RFC 8484 §4.1) e é preenchida até múltiplo de 128 bytes com a
   opção Padding do EDNS(0) (RFC 7830, RFC 8467 §4.1): o tamanho não entrega o nome.
 - **Conexões reaproveitadas** (RFC 7858 §3.4): até 4 ociosas por servidor, por 20 s; uma que o
@@ -565,8 +567,8 @@ no Quad9 (`tls://9.9.9.9#dns.quad9.net`) por um grupo, com certificado verificad
 ~48 ms): UDP 48–51 ms, DoT 47–49 ms, DoH 49–53 ms por consulta. Com a conexão reaproveitada, o
 TLS não acrescenta tempo perceptível.
 
-**Fica para depois:** HTTP/2 no DoH (só se algum servidor recusar HTTP/1.1), várias consultas em
-voo numa mesma conexão (pipelining, RFC 7858 §3.3), `dns_servers` de grupo por nome, e a coluna de
+**Fica para depois:** várias consultas em voo numa mesma conexão (pipelining do DoT, RFC 7858
+§3.3; streams simultâneos do HTTP/2), `dns_servers` de grupo por nome, e a coluna de
 protocolo na tabela `upstream` do `ip.dns.get` (hoje o servidor cifrado aparece pelo endereço).
 
 ### `:resolve` e cache de falhas (G4.1d-3)
@@ -1229,3 +1231,31 @@ aparece no log, no `print` comum nem no export; o UPDATE de uma zona assinada sa
 
 **Fica de fora, e por quê.** DHCID/RFC 4703 e `update-policy` por nome (G4.1n); repassar UPDATE
 de secundária ao primário (RFC 2136 §6, pouco usado); SIG(0) (quase ninguém usa).
+
+## G4.1o — consultas iguais em andamento, e os workers dos misses (G4.1r)
+
+**Antes.** N clientes perguntando o mesmo nome fora do cache (um nome popular cujo TTL acabou, um
+flush, um nome com TTL 0) mandavam N consultas iguais à origem, cada uma ocupando uma vaga de
+`max_concurrent_queries`. **Medido** (`scripts/dns-stress-lab.sh --tests torture`): uma consulta à
+origem por resposta. E cada miss criava uma thread nova e a destruía no fim.
+
+**Agora.**
+
+- `proto-dns/src/resolver/flight.rs`: a primeira busca de um (nome, tipo, upstreams) que perde o
+  cache **lidera**; as iguais que chegam enquanto ela está na rede **seguem**: esperam o resultado
+  dela (resposta ou falha) até o próprio prazo (`query_total_timeout` + 1 s), sem mandar nada. O
+  líder sempre publica, até quando desenrola (`Drop`). O mapa só tem as buscas em andamento.
+- `service/dns_server/pool.rs`: os workers "dns-query" ficam para o próximo miss; um ocioso por
+  10 s termina. O limite continua sendo `max_concurrent_queries` (o portão que já existia).
+
+| Regra | Onde |
+|---|---|
+| RFC 5452 §5: várias consultas iguais pendentes facilitam a falsificação (ataque do aniversário); juntá-las é a defesa prática (Unbound: mesh; dnsmasq ≥ 2.83, CVE-2020-25686) | `resolver/flight.rs` |
+| RFC 9520 §3.2: a falha do líder vale para os seguidores e entra no cache de falhas uma vez | `Resolver::ask` |
+
+**Medido** (host, 4 CPUs, origem a 20 ms; `docs/dns-stress.md` tem os números da VM): o mesmo nome
+com TTL 0 a 2000/s, 1,00 → 0,02 consulta à origem por resposta; misses com a origem a 0 ms, 46,7
+mil → ~122 mil/s sem SERVFAIL. Custo da junção: +0,24 µs por miss no `dns_forward_cache_miss`.
+
+**Fica de fora** (gaps G4.1t em diante): os seguidores ainda ocupam uma vaga e uma thread cada; um
+laço de eventos no upstream resolveria as duas coisas.

@@ -144,6 +144,41 @@ fn dumps() -> u64 {
     link_dump::DUMPS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// G3.4m: the commands' "is this link ours?" check reads the links once
+/// for a whole batch, not once per step; an apply or a second later it
+/// reads again (and sees a link another program made).
+#[test]
+fn unmanaged_reads_the_links_once_per_batch() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    use corerouter_hal::Hal;
+    use corerouter_hal_linux::LinuxHal;
+    use corerouter_model::Config;
+    if !in_netns() {
+        return;
+    }
+    ip_batch(&["link add um1 type dummy".to_owned()]);
+    let mut hal = LinuxHal::new();
+    hal.apply(&Config::default(), &Config::default()).unwrap();
+    let before = dumps();
+    for _ in 0..1000 {
+        let u = hal.unmanaged();
+        assert!(u.iter().any(|(n, _)| n.as_str() == "um1"), "{u:?}");
+    }
+    assert_eq!(dumps() - before, 1, "one dump for 1000 checks");
+    // An apply moves the epoch: read again.
+    hal.apply(&Config::default(), &Config::default()).unwrap();
+    let before = dumps();
+    hal.unmanaged();
+    assert_eq!(dumps() - before, 1);
+    // A link made since, seen once the answer is older than the TTL.
+    ip_batch(&["link add um2 type dummy".to_owned()]);
+    std::thread::sleep(corerouter_hal_linux::UNMANAGED_TTL + std::time::Duration::from_millis(100));
+    assert!(hal.unmanaged().iter().any(|(n, _)| n.as_str() == "um2"));
+    ip_batch(&["link del um1".to_owned(), "link del um2".to_owned()]);
+}
+
 /// One link dump per tick: the route and address reads after the poll use
 /// the index map it read; an apply drops it. A sample read before an apply
 /// is refused; one read after it is folded in.
