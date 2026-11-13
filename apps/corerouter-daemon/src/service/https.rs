@@ -256,6 +256,14 @@ impl Stream {
         }
     }
 
+    /// The protocol TLS agreed on by ALPN (RFC 7301), if any.
+    pub(crate) fn alpn(&self) -> Option<&[u8]> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Tls(s) => s.conn.alpn_protocol(),
+        }
+    }
+
     /// Read and write wait at most until `deadline`.
     pub(crate) fn deadline(&self, deadline: Instant) -> Result<(), String> {
         let left = deadline.saturating_duration_since(Instant::now());

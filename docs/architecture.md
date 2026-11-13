@@ -1042,6 +1042,29 @@ sem parsear saída. **Risco aceito:** o Hickory é menos testado em escala de IS
 Unbound/Knot/PowerDNS. Ele será medido com benchmarks (consultas/s, latência com cache quente e
 frio, memória por entrada) na G4.1c, e a decisão pode ser revista com esses números.
 
+**Revisão com números (G4.1g, pela bateria da G4.1r, `docs/dns-stress.md`).** Mesma VM, 4 vCPUs para
+o servidor, a mesma origem (Knot atrás de netem) e o mesmo gerador (`dnsperf`), **medido** em
+2026-11-12:
+
+| | CoreRouter (esta branch) | Unbound 1.19.2 | dnsmasq 2.91 |
+|---|---|---|---|
+| Cache quente, saturação | 193–198 mil/s | 280–344 mil/s | 87–127 mil/s |
+| Cache quente a 50 000/s: p50 / p99 | 40 / 60 µs | 38–42 / 60–67 µs | 39–367 µs / 0,1–4,2 ms |
+| Misses, origem a 20 ms, saturação | 29–45 mil/s (o resto SERVFAIL no teto de 1000) | 42–45 mil/s | 3,5–4,5 mil/s |
+| Misses a 5000/s: p50 / p99 | 65 µs / 20 ms | 57–81 µs / 20 ms | 55 / 68 ms |
+| O mesmo nome TTL 0 a 2000/s: consultas à origem por resposta | 0,02 | 0,07–0,09 | 0,05 |
+| Memória por resposta no cache | ~700 B (1 M de entradas) | ~700 B | pré-alocado (teto de 10 000 nomes) |
+
+Leitura: no acerto de cache o Unbound faz 1,4–1,8× mais com as mesmas CPUs porque usa uma thread
+por CPU com `SO_REUSEPORT` e nós paramos em metade das CPUs (as outras ficam para o resto do
+roteador, G0.31); por leitor ficamos perto (~85–95 mil/s contra ~70–85 mil/s por thread do
+Unbound). No miss, depois dos workers reaproveitados e da junção de iguais, ficamos no nível do
+Unbound até o teto de `max_concurrent_queries`; o que falta é o laço de eventos (G4.1t) e o
+prazo adaptativo (G4.1u). O dnsmasq (uma thread) fica bem atrás em tudo menos memória.
+**Decisão: o Hickory fica** (só o `hickory-proto`, com a nossa cadeia): o desempenho está na
+mesma ordem do Unbound, sem processo externo, com tudo em comandos e transações; as diferenças
+que sobram são de arquitetura nossa (gaps com número), não da biblioteca.
+
 ```
 ping/MTR/MTU ─► Session::tool_prober ─► RouterResolver::resolve ─┐
 cliente NTP ─► service::dns::resolve ────────────────────────────┤ (sem lock do Session)
@@ -1063,9 +1086,29 @@ RouterOS (e o README ainda diz "not recommended in production"). Por isso o enca
 (`proto-dns/src/server/stage/*.rs`, achadas pelo `build.rs`, ordenadas pelo `order` de cada uma):
 `acl → limit → special → adlist → static → zones → cache → upstream`. Sem runtime async: no
 daemon (`service/dns_server.rs`) uma thread por socket responde o que a cadeia resolve sem rede
-(cache, estáticos) na hora, e cada falta de cache ganha uma thread, no máximo
+(cache, estáticos) na hora, e cada falta de cache vai para um worker "dns-query", no máximo
 `max_concurrent_queries`. Medido: 0,8 µs por consulta respondida do cache (bytes a bytes), ~1,2 M
 consultas/s por núcleo sem contar o socket.
+
+**Faltas de cache sob carga (G4.1r).** A bateria `scripts/dns-stress-lab.sh` (`docs/dns-stress.md`)
+mostrou duas coisas no caminho do miss, corrigidas no mesmo trabalho:
+
+- *Uma thread criada por miss* custava ~210 µs de CPU por resposta com a origem rápida (VM; ~67 µs depois); o perfil
+  dava ~60 % em `pthread_create`, pilha e guarda (`mmap`/`mprotect`/`munmap`) e arena do malloc,
+  ~13 % na troca com o servidor. Agora os workers ficam para o próximo miss
+  (`dns_server/pool.rs`: fila sem teto próprio porque o portão `max_concurrent_queries` já limita
+  os jobs; worker ocioso por 10 s termina). **Medido** no host, 4 CPUs: 46,7 mil → ~122 mil
+  misses/s sem SERVFAIL; cache, estáticos e zonas iguais.
+- *Consultas iguais em andamento* iam todas à origem (G4.1o): agora a primeira lidera e as iguais
+  esperam o resultado dela (`proto-dns/src/resolver/flight.rs`, como o mesh do Unbound e o
+  dnsmasq ≥ 2.83; RFC 5452 §5). **Medido:** o mesmo nome com TTL 0 a 2000/s com a origem a 20 ms,
+  1,00 → 0,02 consulta à origem por resposta. Custo: +0,24 µs por miss no `dns_forward_cache_miss`
+  (mapa, `Arc` e a chave), ~1 % do custo real de um miss.
+
+O que ficou de fora, com número (gaps G4.1t em diante): uma thread bloqueada por consulta em
+andamento limita os misses a `max_concurrent_queries` / RTT (100 / 20 ms = 5 mil/s; com 1000, mil
+threads e o cliente do cache sofrendo); o próximo passo é um laço de eventos no upstream (um socket
+para muitas consultas), como o Unbound.
 
 **Zonas autoritativas (G4.1c-1): a busca é nossa, numa etapa da cadeia.** O plano era servir as
 zonas pelo `hickory-server`. A versão 0.26.3 não tem IXFR, NOTIFY (enviado ou recebido), zona
@@ -1107,10 +1150,22 @@ mesmo cliente serve o DoH da G4.1d-2.
 clientes DoT/DoH, mas só sobre tokio; o daemon é por threads. O `proto-dns` monta a consulta (id 0,
 padding de 128 bytes) e o resolvedor escolhe o servidor; o daemon (`service/dns_secure.rs`) fala
 TLS (RFC 7858) ou `POST application/dns-message` (RFC 8484) e guarda até 4 conexões ociosas por
-servidor por 20 s. HTTP/1.1 em vez de HTTP/2 (que a RFC 8484 §5.2 recomenda): com a conexão
-reaproveitada a diferença some. **Medido** (2026-10-22, release, cache vazio, 15 nomes populares
-pelo 1.1.1.1 a ~48 ms de RTT): UDP 48–51 ms, DoT 47–49 ms, DoH 49–53 ms por consulta. Revisar se um
-servidor exigir HTTP/2 ou se o pipelining (várias consultas na mesma conexão) fizer falta.
+servidor por 20 s. **Medido** (2026-10-22, release, cache vazio, 15 nomes populares pelo 1.1.1.1 a
+~48 ms de RTT): UDP 48–51 ms, DoT 47–49 ms, DoH 49–53 ms por consulta.
+
+**HTTP/2 no DoH (G4.1s).** O TLS do DoH oferece ALPN `h2` e `http/1.1` (RFC 7301) e fala HTTP/2
+quando o servidor escolhe `h2` (RFC 8484 §5.2 o recomenda). A G4.1r achou servidores que só falam
+HTTP/2: o DoH do Unbound (`https-port`) não respondia nada ao nosso POST HTTP/1.1 (100 % SERVFAIL,
+um handshake por consulta). O cliente é nosso e síncrono (`service/http2.rs`, RFC 9113), como o
+HTTP/1.1: o crate `h2` exige tokio, e o daemon é por threads. Ele faz só o que um cliente de uma
+requisição por vez precisa: preface e SETTINGS, PING, HEADERS/CONTINUATION com HPACK completo na
+leitura (`http2/hpack.rs`, tabelas geradas do texto da RFC 7541 e conferidas com os vetores do
+Apêndice C), DATA com a janela devolvida (WINDOW_UPDATE), RST_STREAM e GOAWAY (o pedido não
+processado pode ir de novo), quadros desconhecidos ignorados; na escrita, literais sem indexação
+(a tabela dinâmica do servidor fica vazia). Uma consulta por stream, conexão reaproveitada pelo
+mesmo pool. **Medido** contra o Unbound 1.19.2 no laboratório: 0 SERVFAIL a 5000 consultas/s, p99
+0,6 ms, 16 handshakes/s. Multiplexar várias consultas por conexão fica para quando fizer falta
+(hoje cada consulta em andamento tem a sua thread e a sua conexão).
 
 Detalhes, regras de RFC e pesquisa: `docs/dns.md`.
 

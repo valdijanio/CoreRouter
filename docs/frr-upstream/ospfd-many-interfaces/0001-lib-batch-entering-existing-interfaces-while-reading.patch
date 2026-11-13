@@ -1,0 +1,213 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: CoreRouter <noreply@corerouter>
+Date: Fri, 13 Nov 2026 00:00:00 -0300
+Subject: [PATCH 1/6] lib: batch entering existing interfaces while reading a
+ configuration
+
+The "interface IFNAME" command commits its change to the northbound at
+once, together with anything pending
+(nb_cli_apply_changes_clear_pending()), because the commands typed after
+it may need the interface object; and a
+classic (non-YANG) command commits whatever is pending before it runs
+(cmd_execute_command_real()). Each commit validates and diffs the whole
+candidate configuration, so reading a configuration with thousands of
+interface stanzas is quadratic even inside a configuration batch
+(XFRR_start_configuration, as "vtysh -f" and frr-reload.py send it).
+
+Measured in ospfd with 4000 VLANs, each "interface X / ip ospf network
+point-to-point / ip ospf area 0": the "interface" lines took 8.7 s of the
+12.4 s to type the batch, and 12.0 s of the 16.4 s to type the one that
+takes OSPF off them again.
+
+When the interface already exists, the object the following commands need
+is there; the commit only adds its northbound entry
+(lib_interface_create() marks it configured). While a batch is read and
+nothing else is pending, let that change wait for the end of the batch,
+also across the classic commands that follow, which do not depend on it.
+Anything else pending keeps the current behavior: it is committed before
+the next classic command, and an "interface" command commits it all.
+
+With this, typing those two batches takes 0.2 s for the "interface"
+lines, and the whole batch is no longer quadratic in this part.
+---
+ lib/command.c        |  5 +++--
+ lib/if.c             | 35 ++++++++++++++++++++++++-----------
+ lib/northbound_cli.c | 27 +++++++++++++++++++++++++++
+ lib/northbound_cli.h | 13 +++++++++++++
+ lib/vty.h            |  2 ++
+ 5 files changed, 69 insertions(+), 13 deletions(-)
+
+diff --git a/lib/command.c b/lib/command.c
+index 6b02d1517b..bfc3825585 100644
+--- a/lib/command.c
++++ b/lib/command.c
+@@ -995,9 +995,10 @@ static int cmd_execute_command_real(vector vline, struct vty *vty,
+ 
+ 			/*
+ 			 * Perform pending commit (if any) before executing
+-			 * non-YANG command.
++			 * non-YANG command, unless what is pending can wait
++			 * (nb_cli_apply_changes_classic_safe()).
+ 			 */
+-			if (!(matched_element->attr & CMD_ATTR_YANG))
++			if (!(matched_element->attr & CMD_ATTR_YANG) && !vty->pending_classic_safe)
+ 				(void)nb_cli_pending_commit_check(vty);
+ 		}
+ 
+diff --git a/lib/if.c b/lib/if.c
+index 04570114bc..a791e90a76 100644
+--- a/lib/if.c
++++ b/lib/if.c
+@@ -1278,6 +1278,18 @@ static int vrfname_by_ifname(const char *ifname, const char **vrfname)
+ /*
+  * XPath: /frr-interface:lib/interface
+  */
++/* The interface that "interface IFNAME [vrf NAME]" configures, if it exists. */
++static struct interface *interface_cmd_lookup(const char *ifname, const char *vrf_name)
++{
++	struct vrf *vrf;
++
++	if (!vrf_is_backend_netns())
++		return if_lookup_by_name_all_vrf(ifname);
++
++	vrf = vrf_lookup_by_name(vrf_name);
++	return vrf ? if_lookup_by_name_vrf(ifname, vrf) : NULL;
++}
++
+ DEFPY_YANG_NOSH (interface,
+        interface_cmd,
+        "interface IFNAME [vrf NAME$vrf_name]",
+@@ -1287,7 +1299,6 @@ DEFPY_YANG_NOSH (interface,
+ {
+ 	char xpath_list[XPATH_MAXLEN];
+ 	struct interface *ifp;
+-	struct vrf *vrf;
+ 	int ret, count;
+ 
+ 	if (vrf_is_backend_netns()) {
+@@ -1310,8 +1321,17 @@ DEFPY_YANG_NOSH (interface,
+ 			 "/frr-interface:lib/interface[name='%s']", ifname);
+ 	}
+ 
++	/*
++	 * The commands that follow need the interface object: when it does
++	 * not exist yet, the commit creates it.
++	 */
++	ifp = interface_cmd_lookup(ifname, vrf_name);
++
+ 	nb_cli_enqueue_change(vty, ".", NB_OP_CREATE, NULL);
+-	ret = nb_cli_apply_changes_clear_pending(vty, "%s", xpath_list);
++	if (ifp)
++		ret = nb_cli_apply_changes_classic_safe(vty, "%s", xpath_list);
++	else
++		ret = nb_cli_apply_changes_clear_pending(vty, "%s", xpath_list);
+ 	if (ret == CMD_SUCCESS) {
+ 		VTY_PUSH_XPATH(INTERFACE_NODE, xpath_list);
+ 
+@@ -1321,15 +1341,8 @@ DEFPY_YANG_NOSH (interface,
+ 		 * all interface-level commands are converted to the new
+ 		 * northbound model.
+ 		 */
+-		if (vrf_is_backend_netns()) {
+-			vrf = vrf_lookup_by_name(vrf_name);
+-			if (vrf)
+-				ifp = if_lookup_by_name_vrf(ifname, vrf);
+-			else
+-				ifp = NULL;
+-		} else {
+-			ifp = if_lookup_by_name_all_vrf(ifname);
+-		}
++		if (!ifp)
++			ifp = interface_cmd_lookup(ifname, vrf_name);
+ 		if (ifp)
+ 			VTY_PUSH_CONTEXT(INTERFACE_NODE, ifp);
+ 	}
+diff --git a/lib/northbound_cli.c b/lib/northbound_cli.c
+index b8ff194e07..89f294ab5a 100644
+--- a/lib/northbound_cli.c
++++ b/lib/northbound_cli.c
+@@ -85,6 +85,7 @@ static int nb_cli_classic_commit(struct vty *vty)
+ static void nb_cli_pending_commit_clear(struct vty *vty)
+ {
+ 	vty->pending_commit = 0;
++	vty->pending_classic_safe = false;
+ 	vty->buffer_cmd_count = 0;
+ 	XFREE(MTYPE_NB_CMDS, vty->pending_cmds_buf);
+ 	vty->pending_cmds_buflen = 0;
+@@ -131,6 +132,7 @@ static int nb_cli_schedule_command(struct vty *vty)
+ 
+ 	/* Schedule the commit operation. */
+ 	vty->pending_commit = 1;
++	vty->pending_classic_safe = false;
+ 	vty->buffer_cmd_count++;
+ 	if (vty->buffer_cmd_count == NB_CMD_BATCH_SIZE)
+ 		nb_cli_pending_commit_check(vty);
+@@ -246,6 +248,31 @@ int nb_cli_apply_changes(struct vty *vty, const char *xpath_base_fmt, ...)
+ 	return _nb_cli_apply_changes(vty, xpath_base, false);
+ }
+ 
++int nb_cli_apply_changes_classic_safe(struct vty *vty, const char *xpath_base_fmt, ...)
++{
++	char xpath_base[XPATH_MAXLEN] = {};
++	int ret;
++
++	/* Parse the base XPath format string. */
++	if (xpath_base_fmt) {
++		va_list ap;
++
++		va_start(ap, xpath_base_fmt);
++		vsnprintf(xpath_base, sizeof(xpath_base), xpath_base_fmt, ap);
++		va_end(ap);
++	}
++
++	/* Something else is pending: commit it all now, as before. */
++	if (vty->pending_commit && !vty->pending_classic_safe)
++		return _nb_cli_apply_changes(vty, xpath_base, true);
++
++	ret = _nb_cli_apply_changes(vty, xpath_base, false);
++	if (ret == CMD_SUCCESS && vty->pending_commit)
++		vty->pending_classic_safe = true;
++
++	return ret;
++}
++
+ int nb_cli_apply_changes_clear_pending(struct vty *vty, const char *xpath_base_fmt, ...)
+ {
+ 	char xpath_base[XPATH_MAXLEN] = {};
+diff --git a/lib/northbound_cli.h b/lib/northbound_cli.h
+index dcd7722a27..a2762561d3 100644
+--- a/lib/northbound_cli.h
++++ b/lib/northbound_cli.h
+@@ -67,6 +67,19 @@ extern int nb_cli_apply_changes_clear_pending(struct vty *vty,
+ 					      const char *xpath_base_fmt, ...)
+ 	PRINTFRR(2, 3);
+ 
++/*
++ * Like nb_cli_apply_changes_clear_pending(), for a change that the classic
++ * (non-YANG) commands typed after it do not need committed, such as
++ * entering an interface that already exists. While the configuration is
++ * read in a batch (between XFRR_start_configuration and
++ * XFRR_end_configuration, as "vtysh -f" does) and nothing else is
++ * pending, the change waits for the end of the batch, even across classic
++ * commands. A commit validates and diffs the whole configuration, so one
++ * commit per change is quadratic with thousands of them.
++ */
++extern int nb_cli_apply_changes_classic_safe(struct vty *vty, const char *xpath_base_fmt, ...)
++	PRINTFRR(2, 3);
++
+ /*
+  * Apply enqueued changes to the candidate configuration, this function
+  * may not immediately apply the changes, instead adding them to a pending
+diff --git a/lib/vty.h b/lib/vty.h
+index 6f5cdb677c..85c611eda0 100644
+--- a/lib/vty.h
++++ b/lib/vty.h
+@@ -152,6 +152,8 @@ struct vty {
+ 	size_t buffer_cmd_count;
+ 	bool pending_allowed;
+ 	bool pending_commit;
++	/* All pending changes can wait across classic (non-YANG) commands. */
++	bool pending_classic_safe;
+ 	char *pending_cmds_buf;
+ 	size_t pending_cmds_buflen;
+ 	size_t pending_cmds_bufpos;

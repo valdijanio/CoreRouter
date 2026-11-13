@@ -144,6 +144,17 @@ lê `show ip ospf interface json` a cada 2 s.
   é a leitura das 4 000 interfaces a cada 2 s, que dura o tempo de parede da remoção), `ospfd`
   28,6–73,7, `zebra` 18,1–38,6. O tempo varia entre rodadas (a VM divide o host com outras
   sessões); a forma (o `ospfd` quase ao quadrado) é a mesma.
+- **Com os patches do FRR da G3.4q** (`docs/frr-many-interfaces.md`; imagem nova, `--daemon
+  build`, 2026-11-13, **medido**):
+
+  | interfaces | commit (s) | `show ip ospf interface json` p50/máx (ms) | `routing.ospf.interface.list` p50/máx (ms) | remoção (s) | CPU no commit | CPU na remoção |
+  |---|---|---|---|---|---|---|
+  | 1 000 | 1,4 | 18/23 | 15/17 | 14,4 | daemon 0,9, `ospfd` 0,3, `zebra` 1,1 | daemon 0,8, `ospfd` 0,3, `zebra` 1,3 |
+  | 4 000 | 6,1 | 69/177 | 18/35 | 71,1 | daemon 3,9, `ospfd` 1,6, `zebra` 6,0 | daemon 9,5, `ospfd` 2,5, `zebra` 15,6 |
+
+  O `ospfd` saiu de 28 s de CPU para 1,6 s no commit e 2,5 s na remoção. A remoção continua em
+  ~70 s por causa do kernel: o `hal-linux` apaga uma VLAN por `RTM_DELLINK`, e cada uma espera um
+  período de graça do RCU (só o kernel, 4 000 VLANs: 80,6 s uma a uma, 1,4 s por grupo; G3.4s).
 
 ### 4. Operação com carga
 
@@ -322,7 +333,8 @@ CoreRouter (até 10 s de cache).
 
 - **`ip.route.list` não mostra rotas do OSPF** (só conectadas, estáticas, DHCP e RA): virou a
   G3.4o (registrada pela G3.4n).
-- **`ospfd` com milhares de interfaces numa área (FRR):** commit de 4 000 interfaces em 15–34 s,
+- **`ospfd` com milhares de interfaces numa área (FRR), corrigido depois pela G3.4q** (patches no
+  FRR da imagem; números na seção 3b): antes, commit de 4 000 interfaces em 15–34 s,
   remoção em ~90–100 s; o `ospfd` cresce quase ao quadrado (CPU no commit: 0,7 s → 3,2 s → 11,8 s
   para 1 000, 2 000 e 4 000). Perfil: `route_top`/`route_next` (8 %), `ospf_if_lookup_by_lsa_pos`
   (busca linear nas interfaces da área, `ospfd/ospf_interface.c:426`, chamada por link da

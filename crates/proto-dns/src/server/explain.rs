@@ -124,12 +124,24 @@ pub const TEXTS: &[(&str, &str)] = &[
     ("limit.within", "{client} is within {rate} queries/s"),
     ("not-reached", "not reached: {stage} answered first"),
     ("special.any", "ANY gets one HINFO (RFC 8482 §4.2)"),
+    (
+        "special.ddr",
+        "_dns.resolver.arpa: the router's encrypted service (DDR, RFC 9462)",
+    ),
+    (
+        "special.ddr-none",
+        "_dns.resolver.arpa: no encrypted service to announce (NODATA, RFC 9462 §4)",
+    ),
     ("special.invalid", "invalid. never exists (RFC 6761 §6.4)"),
     (
         "special.localhost",
         "localhost is the loopback (RFC 6761 §6.3)",
     ),
     ("special.none", "not a special-use name"),
+    (
+        "special.resolver-arpa",
+        "resolver.arpa is the router's own, never forwarded (RFC 9462 §6.4)",
+    ),
     (
         "static.answered",
         "static entry {id} ({match}) answers {type}",

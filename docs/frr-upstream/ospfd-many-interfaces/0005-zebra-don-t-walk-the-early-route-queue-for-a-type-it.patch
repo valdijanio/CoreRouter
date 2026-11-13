@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: CoreRouter <noreply@corerouter>
+Date: Fri, 13 Nov 2026 00:00:00 -0300
+Subject: [PATCH 5/6] zebra: don't walk the early route queue for a type it
+ does not hold
+
+Each connected address added walks the whole early route subqueue
+(rib_meta_queue_early_route_cleanup(), called from
+connected_remove_kernel_for_connected()) looking for a kernel route to the
+same prefix. When thousands of interfaces come up together the queue
+holds the connected and local routes of all of them, so the walk is
+quadratic: with 4000 VLANs created in one "ip -batch" on 10.7.1,
+prefix_same() and the walk were 39% of zebra's samples.
+
+Count the queued early routes by route type, and skip the walk when no
+route of the type looked for is queued.
+
+zebra CPU to create the VLANs, median of 3: 10.7.1 with 4000, 5.3 s ->
+3.9 s; master with 10000, 28.2 s -> 21.4 s (master keeps the queue
+shorter, so the walk is a smaller share there).
+---
+ zebra/rib.h       |  2 ++
+ zebra/zebra_rib.c | 13 +++++++++++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/zebra/rib.h b/zebra/rib.h
+index 5a4b7dd43a..0b8b26873d 100644
+--- a/zebra/rib.h
++++ b/zebra/rib.h
+@@ -215,6 +215,8 @@ struct meta_queue {
+ 	_Atomic uint32_t total_metaq;	       /* Total MetaQ events */
+ 	_Atomic uint32_t re_subq[MQ_SIZE];     /* current RE count sub queue */
+ 	_Atomic uint32_t max_re_subq[MQ_SIZE]; /* Max RE in sub queue */
++	/* Early route subqueue entries by route type. */
++	uint32_t early_route_type[ZEBRA_ROUTE_MAX];
+ };
+ 
+ /*
+diff --git a/zebra/zebra_rib.c b/zebra/zebra_rib.c
+index 453c507bbe..98695ab806 100644
+--- a/zebra/zebra_rib.c
++++ b/zebra/zebra_rib.c
+@@ -3165,6 +3165,8 @@ static void process_subq_early_route(struct listnode *lnode)
+ {
+ 	struct zebra_early_route *ere = listgetdata(lnode);
+ 
++	zrouter.mq->early_route_type[ere->re->type]--;
++
+ 	if (ere->deletion)
+ 		process_subq_early_route_delete(ere);
+ 	else
+@@ -3962,6 +3964,7 @@ static void early_route_meta_queue_free(struct meta_queue *mq, struct list *l,
+ 		    (proto != ere->re->type || instance != ere->re->instance))
+ 			continue;
+ 
++		mq->early_route_type[ere->re->type]--;
+ 		early_route_memory_free(ere);
+ 		node->data = NULL;
+ 		list_delete_node(l, node);
+@@ -4365,6 +4368,7 @@ static int rib_meta_queue_early_route_add(struct meta_queue *mq, void *data)
+ 	uint64_t curr, high;
+ 
+ 	listnode_add(mq->subq[META_QUEUE_EARLY_ROUTE], data);
++	mq->early_route_type[ere->re->type]++;
+ 	mq->size++;
+ 	atomic_fetch_add_explicit(&mq->total_metaq, 1, memory_order_relaxed);
+ 	atomic_fetch_add_explicit(&mq->total_subq[META_QUEUE_EARLY_ROUTE], 1, memory_order_relaxed);
+@@ -4395,6 +4399,14 @@ void rib_meta_queue_early_route_cleanup(const struct prefix *p, afi_t afi, safi_
+ 	struct listnode *node, *nnode;
+ 	struct zebra_early_route *ere;
+ 
++	/*
++	 * Nothing of this type is queued: do not walk the queue. Each address
++	 * added walks it, and it holds the routes of all the addresses added
++	 * in a burst, quadratic with thousands of interfaces.
++	 */
++	if (!zrouter.mq->early_route_type[route_type])
++		return;
++
+ 	/* Iterate through the early route subqueue */
+ 	for (ALL_LIST_ELEMENTS(zrouter.mq->subq[META_QUEUE_EARLY_ROUTE], node, nnode, ere)) {
+ 		/* Check if this entry matches the prefix and route type */
+@@ -4402,6 +4414,7 @@ void rib_meta_queue_early_route_cleanup(const struct prefix *p, afi_t afi, safi_
+ 		    ere->safi == safi && ere->re->vrf_id == vrf_id && ere->re->table == table) {
+ 			/* Remove from the list */
+ 			list_delete_node(zrouter.mq->subq[META_QUEUE_EARLY_ROUTE], node);
++			zrouter.mq->early_route_type[route_type]--;
+ 
+ 			/* Update counters */
+ 			zrouter.mq->size--;
