@@ -14,10 +14,13 @@ pub mod asn;
 pub mod cache;
 pub mod dig;
 pub mod encrypted;
+pub mod histogram;
 pub mod message;
 pub mod resolver;
 pub mod reverse;
 pub mod server;
+pub mod sketch;
+pub mod suffix;
 pub mod zone;
 
 use corerouter_model::dns::AllowedFrom;

@@ -2,6 +2,10 @@
 
 pub(super) const HELP: &[(&str, &str)] = &[
     (
+        "firewall.action.change-mss",
+        "## change-mss\n\nLowers the **MSS** option of TCP SYNs (RouterOS `action=change-mss`), so that connections through a tunnel with a smaller MTU (WireGuard, PPPoE, GRE) never send segments that do not fit and get dropped where path MTU discovery is broken.\n\n- Needs `protocol=tcp` and `tcp-flags=syn`: only a SYN carries the option (RFC 9293 §3.7.1).\n- The kernel only ever **lowers** it: a value above what the SYN carries changes nothing (no `tcp-mss` matcher needed, unlike RouterOS).\n- The usual rule: chain `forward`, `out-interface` the tunnel, `new-mss=clamp-to-pmtu`.\n- `passthrough` (default on): the packet goes on to the next mangle rule.",
+    ),
+    (
         "firewall.col.bytes",
         "## Bytes\n\nBytes the rule matched, read from the kernel's `counter` while this window is open (every 2 s). Not saved: they restart with the router; a commit does not reset them.",
     ),
@@ -16,6 +20,14 @@ pub(super) const HELP: &[(&str, &str)] = &[
     (
         "firewall.col.rate",
         "## Rate\n\nPackets per second over the last read interval (2 s).",
+    ),
+    (
+        "firewall.rule.new_mss",
+        "## New MSS\n\nWhat `change-mss` writes in the SYN's MSS option.\n\n- `clamp-to-pmtu`: the MTU of the route the packet takes minus the IP and TCP headers (IPv4 40 bytes, IPv6 60): 1380 for a 1420-byte WireGuard tunnel. Only in chains `forward`, `output` and `postrouting` (the route is known only after routing).\n- A number (88..65535): that value, for every family. For PPPoE, 1452 (MTU 1492); for WireGuard over IPv4, 1380.\n\nThe kernel never raises the MSS: a SYN that already asks for less keeps its own.",
+    ),
+    (
+        "firewall.rule.tcp_flags",
+        "## TCP Flags\n\nThe TCP header flags the packet must have (`ack`, `cwr`, `ece`, `fin`, `psh`, `rst`, `syn`, `urg`), comma-separated; `!` before a flag: it must be clear. `syn` matches the SYN and the SYN-ACK; `syn,!ack` only the first packet of a connection. Needs `protocol=tcp`.",
     ),
     (
         "firewall.tab.address-list",
@@ -35,7 +47,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ),
     (
         "firewall.tab.mangle",
-        "## Mangle\n\nMarks connections, packets and routing (policy routing, queues). It decides nothing by itself unless `passthrough=no`.",
+        "## Mangle\n\nMarks connections, packets and routing (policy routing, queues) and clamps the TCP MSS (`change-mss`, for tunnels). It decides nothing by itself unless `passthrough=no`.",
     ),
     (
         "firewall.tab.nat",

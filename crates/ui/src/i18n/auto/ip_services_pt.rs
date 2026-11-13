@@ -4,6 +4,7 @@
 pub(super) const LABELS: &[(&str, &str)] = &[
     ("Address", "Endereço"),
     ("Available From", "Disponível de"),
+    ("Certificate", "Certificado"),
     ("IP Services", "Serviços IP"),
     ("Last Error", "Último erro"),
     ("Name", "Nome"),
@@ -13,6 +14,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("This window reaches the router through", "Esta janela chega ao roteador por"),
     ("Turning it off, moving it or leaving your address out of Available From blocks your next login.", "Desligá-lo, movê-lo ou deixar o seu endereço fora de Disponível de bloqueia o seu próximo login."),
     ("everyone", "todos"),
+    ("router's own", "do roteador"),
     ("this session", "esta sessão"),
 ];
 
@@ -20,6 +22,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
 pub(super) const HELP: &[(&str, &str)] = &[
     ("ip_services.address", "## Endereço\n\nO endereço em que o serviço escuta. `::` é todo endereço IPv6 e IPv4; `0.0.0.0`, todo IPv4. Precisa ser um endereço do roteador. Para limitar **quem** pode conectar, use **Disponível de**; este campo limita **onde** o serviço responde.\n\n## Cuidado\nNo `www-ssl`, sair do endereço que esta janela usa bloqueia o seu próximo login."),
     ("ip_services.available_from", "## Disponível de\n\nAs redes que podem conectar (o `address` do RouterOS), separadas por vírgula; um endereço sozinho é um host. Vazio é todo mundo que alcança a porta. Os outros são desconectados sem resposta e contados em **Recusadas**.\n\n## Recomendado\nNo `metrics`, que não tem login, indique o servidor Prometheus. Em redes não confiáveis, uma regra de firewall protege melhor: o pacote nem chega ao serviço.\n\n## Cuidado\nNo `www-ssl`, deixar o seu endereço de fora bloqueia o seu próximo login."),
+    ("ip_services.certificate", "## Certificado\n\nSó no `www-ssl`: o `/certificate` com que ele atende (System › Certificates); `none` é o do próprio roteador, feito no primeiro boot. Só aparecem os certificados com a chave privada.\n\n## Cuidado\nOs navegadores veem o certificado novo na hora; uma GUI ou CLI que fixou o antigo por esta porta pede para confiar no novo. As conexões já abertas continuam."),
     ("ip_services.enabled", "## Ativado\n\nSe o serviço escuta. O roteador abre ou fecha o socket na hora, sem reiniciar; as conexões já abertas continuam."),
     ("ip_services.last_error", "## Último erro\n\nPor que o socket não abriu, como uma porta já em uso. O roteador tenta de novo a cada poucos segundos."),
     ("ip_services.name", "## Nome\n\n**www-ssl**: a GUI no navegador e o canal de controle por WebSocket, em HTTPS com o certificado do roteador. **www**: HTTP puro que só redireciona para o `www-ssl`, para a senha nunca trafegar em claro. **metrics**: o endpoint `/metrics` do Prometheus, sem login.\n\nO selo **esta sessão** marca o serviço por onde esta janela chegou."),

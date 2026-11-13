@@ -166,6 +166,14 @@ fn identity(env: &Env) -> Result<ServerIdentity, String> {
     }
 }
 
+/// G1.6zs: the `/certificate` `www-ssl` names, with its chain and key.
+fn chosen(env: &Env, name: &str) -> Result<ServerIdentity, String> {
+    let pair = corerouter_engine::x509::served(&mut lock(&env.session), name)?;
+    let (cert, key) = pair.ok_or("no certificate named")?;
+    corerouter_control::tls::identity_from_pem(cert.as_bytes(), key.as_bytes())
+        .map_err(|e| format!("certificate {name}: {e}"))
+}
+
 fn open_ssl(env: &Env, l: &WebListener, id: &ServerIdentity) -> Result<Open, String> {
     let addr = SocketAddr::new(l.address, l.port);
     let listener = TcpListener::bind(addr).map_err(|e| bind_error(addr, &e))?;
@@ -232,7 +240,9 @@ fn bind_error(addr: SocketAddr, e: &std::io::Error) -> String {
 }
 
 fn run(env: &Env, health: &super::Health) {
-    let mut cfg: Option<WebService> = None;
+    // The settings and the PEM of the certificate they name: a rollback can
+    // bring back another certificate under the same name.
+    let mut cfg: Option<(WebService, Option<String>)> = None;
     let (mut ssl, mut plain): (Option<Open>, Option<Open>) = (None, None);
     let mut status = WebStatus {
         gui_files: env.files.is_some(),
@@ -241,11 +251,17 @@ fn run(env: &Env, health: &super::Health) {
     let mut id: Option<ServerIdentity> = None;
     while !health.stopping() {
         health.beat();
-        let now = lock(&env.session).store().running().system.web.clone();
+        let (now, pem) = {
+            let s = lock(&env.session);
+            let running = s.store().running();
+            let web = running.system.web.clone();
+            let pem = running.system.certificates.get(&web.www_ssl.certificate).map(|c| c.certificate.clone());
+            (web, pem)
+        };
         health.disabled(
             (!now.www_ssl.enabled && !now.www.enabled).then_some("ip.service www-ssl and www enabled=no"),
         );
-        let changed = cfg.as_ref() != Some(&now);
+        let changed = cfg.as_ref().is_none_or(|(w, p)| *w != now || *p != pem);
         if changed {
             if let Some(o) = ssl.take() {
                 o.close();
@@ -257,9 +273,13 @@ fn run(env: &Env, health: &super::Health) {
             status.www = WebListenerStatus::default();
         }
         if now.www_ssl.enabled && ssl.is_none() {
-            let opened = match &id {
-                Some(i) => Ok(i.clone()),
-                None => identity(env).inspect(|i| id = Some(i.clone())),
+            let opened = if now.www_ssl.certificate.is_empty() {
+                match &id {
+                    Some(i) => Ok(i.clone()),
+                    None => identity(env).inspect(|i| id = Some(i.clone())),
+                }
+            } else {
+                chosen(env, &now.www_ssl.certificate)
             }
             .and_then(|i| retry(changed, || open_ssl(env, &now.www_ssl, &i)));
             ssl = note(opened, &mut status.www_ssl, "www-ssl");
@@ -283,7 +303,7 @@ fn run(env: &Env, health: &super::Health) {
             None => health.clear_error(),
         }
         publish(&env.session, &status);
-        cfg = Some(now);
+        cfg = Some((now, pem));
         health.sleep(TICK);
     }
     for o in [ssl, plain].into_iter().flatten() {

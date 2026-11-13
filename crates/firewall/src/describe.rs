@@ -81,6 +81,14 @@ fn verb(a: &Action) -> String {
                 .unwrap_or_default()
         ),
         Action::Notrack => "Não rastreia (sem conntrack)".into(),
+        Action::ChangeMss { new_mss, .. } => match new_mss {
+            corerouter_model::firewall::NewMss::ClampToPmtu => {
+                "Baixa o MSS ao MTU da rota de saída (clamp-to-pmtu) nos".into()
+            }
+            corerouter_model::firewall::NewMss::Value(v) => {
+                format!("Baixa o MSS para {v} (nunca aumenta) nos")
+            }
+        },
     }
 }
 
@@ -245,6 +253,9 @@ pub fn describe(table: Table, r: &FirewallRule) -> String {
     }
     if let Some(p) = &m.dst_port {
         conds.push(ports(p, false));
+    }
+    if let Some(f) = &m.tcp_flags {
+        conds.push(format!("com as flags TCP {f}"));
     }
     if let Some(i) = &m.in_interface {
         conds.push(format!("que {}entram pela {}", not(i.not), i.value));

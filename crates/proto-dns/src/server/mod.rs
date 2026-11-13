@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use corerouter_model::Config;
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::rr::rdata::opt::{EdnsCode, EdnsOption};
 use hickory_proto::rr::{DNSClass, Record, RecordType};
 use ipnet::IpNet;
 
@@ -39,7 +40,10 @@ pub mod explain;
 
 use explain::{Decision, Note, Outcome};
 
-pub use statistics::{ClientStats, Counters, Snapshot, Statistics};
+pub use statistics::{
+    CATEGORIES, CLIENT_V6_PREFIX, ClientStats, Counters, DomainStats, MAX_CLIENTS, NameStats,
+    STRIPES, Snapshot, Statistics, client_key, ede_name, ede_text, type_name,
+};
 
 /// The smallest message a client must accept (RFC 1035 §4.2.1).
 pub const MIN_UDP: usize = 512;
@@ -159,6 +163,10 @@ pub struct Query {
     /// Where the upstream stage got its answer.
     pub source: Option<Source>,
     pub effects: Vec<Effect>,
+    /// The RFC 8914 extended error the reply stands for, when a stage
+    /// knows one (counted by the statistics, and sent to a client that
+    /// used EDNS, G4.1ze).
+    pub ede: Option<u16>,
     /// `explain` (G6.8): each stage's decision so far.
     explain: Option<Vec<Decision>>,
     /// What the running stage said about itself ([`Query::note`]).
@@ -173,6 +181,8 @@ pub struct Query {
     udp_limit: usize,
     reply: Option<Reply>,
     dropped: bool,
+    /// The UDP reply went without records and with TC (too large).
+    truncated: bool,
 }
 
 /// A query waiting for a worker (it needs the network).
@@ -216,6 +226,9 @@ type AnyArc = Arc<dyn Any + Send + Sync>;
 pub struct Forwarder {
     pub resolver: Arc<Resolver>,
     config: RwLock<Arc<ServerConfig>>,
+    /// Also in `states`; kept here so counting a reply takes no lock of
+    /// the map (G4.1h).
+    stats: Arc<statistics::Statistics>,
     states: Mutex<HashMap<TypeId, AnyArc>>,
     compiled: Mutex<HashMap<TypeId, (u64, AnyArc)>>,
 }
@@ -322,14 +335,21 @@ pub fn stages() -> &'static [&'static Stage] {
 
 impl Forwarder {
     pub fn new(resolver: Arc<Resolver>) -> Self {
+        let stats = Arc::new(statistics::Statistics::default());
+        let mut states: HashMap<TypeId, AnyArc> = HashMap::new();
+        states.insert(
+            TypeId::of::<statistics::Statistics>(),
+            stats.clone() as AnyArc,
+        );
         Self {
             resolver,
+            stats,
             config: RwLock::new(Arc::new(ServerConfig {
                 generation: 0,
                 config: Arc::new(Config::default()),
                 allowed: Vec::new(),
             })),
-            states: Mutex::new(HashMap::new()),
+            states: Mutex::new(states),
             compiled: Mutex::new(HashMap::new()),
         }
     }
@@ -369,6 +389,12 @@ impl Forwarder {
         }
     }
 
+    /// The statistics (the same as `state::<Statistics>()`, without its
+    /// lock).
+    pub fn statistics(&self) -> &statistics::Statistics {
+        &self.stats
+    }
+
     /// `build(config)`, made once per config generation (compiled regexps,
     /// lookup tables).
     pub fn compiled<T: Send + Sync + 'static>(
@@ -406,6 +432,9 @@ impl Forwarder {
         let request = match parse_request(packet) {
             Ok(m) => m,
             Err(reply) => {
+                if !how.simulated {
+                    self.stats.malformed(client, tcp, reply.as_deref(), now_ms);
+                }
                 return Start::Done(Done {
                     reply,
                     effects: Vec::new(),
@@ -424,6 +453,9 @@ impl Forwarder {
                 q
             }
             Err(reply) => {
+                if !how.simulated {
+                    self.stats.malformed(client, tcp, Some(&reply), now_ms);
+                }
                 return Start::Done(Done {
                     reply: Some(reply),
                     effects: Vec::new(),
@@ -512,6 +544,15 @@ impl Forwarder {
             .reply
             .take()
             .unwrap_or_else(|| Reply::code(ResponseCode::ServFail));
+        // Encoded first: the statistics count the truncated ones.
+        let bytes = if q.dropped {
+            None
+        } else {
+            encode(&q, &reply).map(|(b, tc)| {
+                q.truncated = tc;
+                b
+            })
+        };
         // A simulated client sent nothing: nothing to count or act on.
         if !q.simulated {
             for stage in stages() {
@@ -530,7 +571,7 @@ impl Forwarder {
             };
         }
         Done {
-            reply: encode(&q, &reply),
+            reply: bytes,
             effects: std::mem::take(&mut q.effects),
             answered_by: q.answered_by,
             explain,
@@ -584,6 +625,7 @@ impl Query {
             answered_by: "",
             source: None,
             effects: Vec::new(),
+            ede: None,
             explain: None,
             pending: None,
             simulated: false,
@@ -591,6 +633,7 @@ impl Query {
             udp_limit,
             reply: None,
             dropped: false,
+            truncated: false,
         })
     }
 
@@ -638,6 +681,11 @@ impl Query {
     /// A stage dropped it: no reply goes out.
     pub fn dropped(&self) -> bool {
         self.dropped
+    }
+
+    /// The reply went over UDP without records and with TC set.
+    pub fn truncated(&self) -> bool {
+        self.truncated
     }
 
     /// The client's question was sent with EDNS(0).
@@ -702,12 +750,29 @@ fn error(m: &Message, rcode: ResponseCode) -> Vec<u8> {
     r.to_vec().unwrap_or_default()
 }
 
+/// RFC 8914 §2: OPTION-CODE of an Extended DNS Error.
+pub const EDE_OPTION: u16 = 15;
+
+/// RFC 8914 §2: the option's data, INFO-CODE (16 bits, network order) and
+/// EXTRA-TEXT (UTF-8, no terminating NUL: its length is the option's).
+pub fn ede_option(code: u16) -> EdnsOption {
+    let mut data = code.to_be_bytes().to_vec();
+    data.extend_from_slice(ede_text(code).as_bytes());
+    EdnsOption::Unknown(EDE_OPTION, data)
+}
+
 /// The reply's bytes: the client's id, question (as sent: RFC 1035
 /// §2.3.3 case kept) and RD, our RA; EDNS only if the client used it
 /// (RFC 6891 §7). Over UDP, a reply larger than the client takes goes
 /// without records and with TC set, so it asks again over TCP (RFC 1035
-/// §4.2.1, RFC 6891 §7).
-fn encode(q: &Query, r: &Reply) -> Option<Vec<u8>> {
+/// §4.2.1, RFC 6891 §7); `true` with it.
+///
+/// G4.1ze: with EDNS, the RFC 8914 extended error the reply stands for
+/// goes in an option 15 (§2: only to a query that carried an OPT). When it
+/// would make the UDP reply too large, it is the first thing dropped and
+/// TC is set (§3: "SHOULD truncate messages by dropping EDE options before
+/// dropping other data", "SHOULD set the truncation bit").
+fn encode(q: &Query, r: &Reply) -> Option<(Vec<u8>, bool)> {
     let req = &q.request;
     let mut m = Message::response(req.metadata.id, OpCode::Query);
     m.metadata.recursion_desired = req.metadata.recursion_desired;
@@ -724,17 +789,35 @@ fn encode(q: &Query, r: &Reply) -> Option<Vec<u8>> {
         e.set_max_payload(q.config.config.ip.dns.max_udp_packet_size.max(512));
         // RFC 3225 §3: DO is copied into the response.
         e.set_dnssec_ok(q.dnssec_ok());
+        if let Some(code) = statistics::extended_error(q) {
+            e.options_mut().insert(ede_option(code));
+        }
         m.set_edns(e);
     }
+    fit(m, if q.tcp { usize::MAX } else { q.udp_limit })
+}
+
+/// `m` in at most `limit` bytes: whole; without its EDE options and with
+/// TC (RFC 8914 §3); else without records and with TC (RFC 1035 §4.2.1).
+/// `true` when TC was set.
+fn fit(mut m: Message, limit: usize) -> Option<(Vec<u8>, bool)> {
     let bytes = m.to_vec().ok()?;
-    if q.tcp || bytes.len() <= q.udp_limit {
-        return Some(bytes);
+    if bytes.len() <= limit {
+        return Some((bytes, false));
+    }
+    m.metadata.truncation = true;
+    let ede = EdnsCode::from(EDE_OPTION);
+    if let Some(e) = m.edns.as_mut().filter(|e| e.options().get(ede).is_some()) {
+        e.options_mut().remove(ede);
+        let bytes = m.to_vec().ok()?;
+        if bytes.len() <= limit {
+            return Some((bytes, true));
+        }
     }
     m.answers.clear();
     m.authorities.clear();
     m.additionals.clear();
-    m.metadata.truncation = true;
-    m.to_vec().ok()
+    m.to_vec().ok().map(|b| (b, true))
 }
 
 #[cfg(test)]
