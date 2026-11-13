@@ -198,6 +198,12 @@ dinâmicos (G4.1q), numa thread só, e as consultas à zona esperam por isso. **
 a bateria achou**: um ISP que publica o nome de cada concessão não aguenta uma volta de energia
 (todos os clientes renovando juntos). As duas gaps ganharam esses números.
 
+Onde vai o tempo (`PERF=update-100 scripts/dns-stress-lab.sh --tests ddns`, perfil do daemon durante
+os UPDATEs): reconstruir e comparar a zona inteira a cada mudança (hash de `String` ~12 %,
+codificação dos registros no Hickory ~11 %, ordenação canônica de todos os nomes ~11 %,
+`zone::diff` ~4 %). A gravação do JSON dos registros dinâmicos (G4.1q) quase não aparece na CPU:
+a correção que muda o quadro é a G4.1p (reconstruir só o que mudou, fora do caminho da consulta).
+
 Carga das zonas por `ip.dns.zone.file.load`: 311 ms para 9 980 registros e 1,07 s para 40 000.
 
 ### Entrada hostil (`hostile`)

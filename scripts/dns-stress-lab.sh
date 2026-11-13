@@ -780,6 +780,18 @@ alive_check() { # <what>: the daemon is still the same process and answers
 warm() { dp "warm-$1" "$QF/$1" 120 -n 1 -c 4 -q 50; }
 flush() { ok ip.dns.cache.flush >/dev/null; }
 
+# PERF=<regex>: a profile of the DUT during the runs whose name matches
+# (perf record -g for $DUR s; $OUT/perf-<run>.data), local DUT only.
+PERF_PID=""
+perf_start() { # <run name>
+	PERF_PID=""
+	if [ -n "${PERF:-}" ] && local_dut && [[ $1 =~ $PERF ]] && command -v perf >/dev/null; then
+		perf record -q -g -p "$DPID" -o "$OUT/perf-$1.data" -- sleep "$DUR" >/dev/null 2>&1 &
+		PERF_PID=$!
+	fi
+}
+perf_wait() { [ -z "$PERF_PID" ] || wait "$PERF_PID" 2>/dev/null || true; }
+
 # Saturation: as much as the DUT takes with 500 queries in flight from 8
 # client sockets; then the latency at half that rate (no queueing).
 SAT_OPTS=(-c 8 -T 2 -q 500)
@@ -788,15 +800,9 @@ sat_and_half() { # <label> <query file> [setup command before each run]
 	tag=$(printf '%s' "$label" | tr -c 'a-zA-Z0-9-' _)
 	[ -n "${3:-}" ] && eval "$3"
 	thr_snap "$W/t0"
-	# PERF=<regex>: a profile of the DUT during the matching runs
-	# (perf record -g; $OUT/perf-<run>.data).
-	local perf=""
-	if [ -n "${PERF:-}" ] && local_dut && [[ $tag =~ $PERF ]] && command -v perf >/dev/null; then
-		perf record -q -g -p "$DPID" -o "$OUT/perf-$tag.data" -- sleep "$DUR" >/dev/null 2>&1 &
-		perf=$!
-	fi
+	perf_start "$tag"
 	dp "$tag-sat" "$file" "$DUR" "${SAT_OPTS[@]}"
-	[ -n "$perf" ] && wait "$perf"
+	perf_wait
 	thr_snap "$W/t1"
 	local sat=$DP cpu
 	cpu=$(thr_cpu "$W/t0" "$W/t1" "$DUR")
@@ -1527,7 +1533,9 @@ test_ddns() {
 		in_gen "${TENV[@]}" dnsperf -u -s "$DUT_IP" -a "${CLIENTS[5]}" -d "$W/upd" -l "$DUR" -t 5 -c 1 -q 20 -Q "$rate" \
 			-O latency-histogram -O suppress=timeout,unexpected >"$OUT/raw/update-$rate.txt" 2>&1 &
 		local up=$!
+		perf_start "update-$rate"
 		dp "zone-under-update-$rate" "$QF/dyn" "$DUR" -c 4 -T 2 -q 500 -Q 5000
+		perf_wait
 		local zrow
 		zrow=$(dp_row)
 		wait $up || true
