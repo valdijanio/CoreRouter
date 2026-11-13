@@ -72,11 +72,50 @@ pub const IPV6_FORWARDING: &str = "net.ipv6.conf.all.forwarding";
 /// MUST default to off), so a new install, and the live image, would not
 /// route before a profile was applied. `system.tuning.set` with 0 still
 /// turns either family off.
-pub const DEFAULTS: &[(&str, i64)] = &[(IP_FORWARD, 1), (IPV6_FORWARDING, 1)];
+///
+/// G3.4m: the routing daemons' multicast groups. `ospfd` joins
+/// AllSPFRouters (and AllDRouters as DR/BDR) on every OSPF interface
+/// through **one** socket, and Linux caps a socket at
+/// `igmp_max_memberships` groups (20 by default, net/ipv4/af_inet.c) and
+/// at `optmem_max` bytes of option memory (128 KiB, 48 B a group:
+/// net/ipv4/igmp.c `ip_mc_join_group`, net/core/sock.c `sock_kmalloc`).
+/// The 21st OSPF interface failed with ENOBUFS and stayed without an
+/// adjacency (ospfd retries only on a state change; measured in the lab
+/// of docs/ospf-stress.md). FRR's own advice is at least 1000
+/// (doc/user/Useful_Sysctl_Settings.md); 16 384 groups and 1 MiB cover
+/// 8 192 OSPF interfaces that are DR, IPv6 (ospf6d) included. These two
+/// are floors ([`AT_LEAST`]): a bigger value in the kernel is left alone.
+pub const DEFAULTS: &[(&str, i64)] = &[
+    (IP_FORWARD, 1),
+    (IPV6_FORWARDING, 1),
+    (IGMP_MAX_MEMBERSHIPS, 16_384),
+    (OPTMEM_MAX, 1 << 20),
+];
+
+pub const IGMP_MAX_MEMBERSHIPS: &str = "net.ipv4.igmp_max_memberships";
+pub const OPTMEM_MAX: &str = "net.core.optmem_max";
+
+/// The [`DEFAULTS`] that are a least value: the kernel keeps a bigger one.
+pub const AT_LEAST: &[&str] = &[IGMP_MAX_MEMBERSHIPS, OPTMEM_MAX];
 
 /// CoreRouter's own default of `name` (see [`DEFAULTS`]).
 pub fn default_of(name: &str) -> Option<i64> {
     DEFAULTS.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
+}
+
+/// Whether the kernel's `now` already satisfies CoreRouter's default
+/// `value` of `name`: equal, or at least it for an [`AT_LEAST`] one.
+pub fn default_holds(name: &str, value: i64, now: i64) -> bool {
+    now == value || (AT_LEAST.contains(&name) && now >= value)
+}
+
+/// Why CoreRouter keeps `name` (for the log).
+pub fn default_reason(name: &str) -> &'static str {
+    if AT_LEAST.contains(&name) {
+        "one multicast group per OSPF interface"
+    } else {
+        "a router forwards"
+    }
 }
 
 /// Tab of the Tuning window a parameter belongs to.
@@ -378,6 +417,15 @@ pub const PARAMS: &[Param] = &[
         Some(4 << 20),
     ))),
     control(p("net.core.somaxconn", SEC_CONTROL, (128, 65_535), "", Some(4096))),
+    // G3.4m: kept at least at CoreRouter's default (DEFAULTS).
+    control(p(
+        IGMP_MAX_MEMBERSHIPS,
+        SEC_CONTROL,
+        (20, 1 << 20),
+        "",
+        Some(20),
+    )),
+    control(p(OPTMEM_MAX, SEC_CONTROL, (10_240, 1 << 26), "B", None)),
     control(choice("net.ipv4.tcp_syncookies", SEC_CONTROL, SYNCOOKIES, 1)),
     control(p(
         "net.ipv4.tcp_max_syn_backlog",

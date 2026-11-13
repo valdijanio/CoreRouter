@@ -67,6 +67,16 @@ tire a errada primeiro (`git log -1 --format=%B | grep -v '^Signed-off-by:' > ms
   estável (`stable/10.7`), é preciso pedir backport a um mantenedor no PR.
 - Exemplo: [FRRouting/frr#24092](https://github.com/FRRouting/frr/pull/24092), aceito em
   2026-11-11 (`docs/frr-tilfa-abort.md`).
+- **Testes do FRR:** os unitários (`tests/lib`, `tests/ospfd`, `tests/zebra`) rodam sem root no
+  container de build (`cd tests && python3 runtests.py …`, o que o `make check` faz; o
+  `make check` sozinho só compila). Os topotests precisam de root: `scripts/frr-topotests.sh
+  --host --tests <árvore do FRR> --build base=<DESTDIR> --build fix=<DESTDIR> <teste>…` os roda na
+  VM do laboratório, cada build num namespace de montagem próprio, sem tocar no FRR do `.deb` da VM
+  (que outros laboratórios usam). O build tem de ter os caminhos padrão (`--prefix=/usr
+  --sysconfdir=/etc --localstatedir=/var --sbindir=/usr/lib/frr`).
+- **Estilo antes do envio:** `perl tools/checkpatch.pl --no-tree --no-signoff <patch>`, `git
+  clang-format` com o `.clang-format` do FRR (o binário 18 do PyPI, num venv em `/srv/build`) e
+  `black` nos topotests.
 
 ### hostap (wpa_supplicant e hostapd) — patch por e-mail
 
@@ -141,3 +151,4 @@ scripts/hostap-hwsim.sh --host /srv/build/hostap --diff <correção.diff> --repe
 |---|---|---|---|---|
 | 2026-10-29 | FRR | ospfd: TI-LFA não aborta sem a router-LSA (G3.4l) | [FRRouting/frr#24092](https://github.com/FRRouting/frr/pull/24092) | no `master` em 2026-11-11; fora de versão e do `stable/10.7` |
 | 2026-11-12 | hostap | wpa_supplicant: scan novo depois de um abort de fora (`fix-wpa-rescan-upstream`) | lista `hostap@lists.infradead.org`; `docs/wpa_supplicant-upstream/` | enviado (`Result: 250`); esperando moderação e revisão |
+| 2026-11-13 | FRR | lib/ospfd/zebra: milhares de interfaces OSPF sem crescer ao quadrado (G3.4q) | `docs/frr-upstream/ospfd-many-interfaces/` (três PRs) | preparado; a enviar pelo usuário |

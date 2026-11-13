@@ -196,6 +196,7 @@ pub fn main() {
     if let Err(e) = std::os::unix::fs::symlink("/run", "/var/run") {
         log!("/var/run: {e}");
     }
+    raise_open_files();
     // G1.6y: no routing in the live image, and 28 MiB less in use.
     let frr = if live { Vec::new() } else { prepare_frr() };
     let action = Arc::new(AtomicUsize::new(RUN));
@@ -211,6 +212,21 @@ pub fn main() {
     }
     log!("early boot done in {} ms", started.elapsed().as_millis());
     supervise(&opts, &action, started, trial, frr, names);
+}
+
+/// G3.4m: [`plan::NOFILE`] open files for the init and so for FRR and the
+/// daemon, which inherit it (ospfd needs one per OSPF interface).
+fn raise_open_files() {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    let now = getrlimit(Resource::Nofile);
+    let (current, maximum) = plan::nofile_limits(now.current, now.maximum);
+    if (current, maximum) == (now.current, now.maximum) {
+        return;
+    }
+    match setrlimit(Resource::Nofile, Rlimit { current, maximum }) {
+        Ok(()) => log!("open files: {current:?} (was {:?})", now.current),
+        Err(e) => log!("open files: cannot raise to {current:?}: {e}"),
+    }
 }
 
 /// FRR's daemons, when the image has them (G1.6c): their state directory
