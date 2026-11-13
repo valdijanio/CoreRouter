@@ -1031,6 +1031,10 @@ impl RoutingDaemon for Frr {
     fn bgp_clear(&mut self, instance: &str, neighbor: &str, how: BgpClear) -> Result<(), HalError> {
         self.clear(instance, neighbor, how)
     }
+
+    fn ospf_max_lsa_clear(&mut self, _instance: &str, vrf: &str) -> Result<(), HalError> {
+        self.max_lsa_clear(vrf)
+    }
 }
 
 impl Frr {
@@ -1064,6 +1068,34 @@ impl Frr {
         // bgpd answers a warning with success for an unknown neighbor.
         if !r.ok() || text.contains("%") {
             return Err(HalError::Rejected(format!("FRR bgpd: {cmd}: {text}")));
+        }
+        Ok(())
+    }
+}
+
+impl Frr {
+    /// G3.4r: `clear ip ospf [vrf V] max-lsa` on ospfd (the patched one,
+    /// `os/patches/frr`): out of the ignore or isolated state now. ospfd
+    /// runs one OSPFv2 instance per VRF, so the VRF names it.
+    pub fn max_lsa_clear(&self, vrf: &str) -> Result<(), HalError> {
+        let scope = if vrf == corerouter_model::ospf::MAIN_VRF {
+            String::new()
+        } else if !vrf.is_empty()
+            && vrf.len() <= 64
+            && vrf
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
+            format!("vrf {vrf} ")
+        } else {
+            return Err(HalError::Rejected(format!("bad VRF name {vrf:?}")));
+        };
+        let cmd = format!("clear ip ospf {scope}max-lsa");
+        let mut vty = self.connect(Daemon::Ospfd)?;
+        let r = vty.run(&cmd).map_err(|e| io_err(Daemon::Ospfd, e))?;
+        let text = r.text(MAX_ERROR);
+        if !r.ok() || text.contains('%') {
+            return Err(HalError::Rejected(format!("FRR ospfd: {cmd}: {text}")));
         }
         Ok(())
     }

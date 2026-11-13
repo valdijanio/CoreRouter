@@ -36,6 +36,10 @@
 #   latency     p50/p99 of the state commands, inspect and MCP, with load
 #   convergence traffic across the DUT and a cut link: without BFD, with BFD,
 #               with BFD and TI-LFA (local only)
+#   maxlsa      G3.4r: the LSDB protection (max_lsa, --maxlsa-limit 50000)
+#               under a flood of --maxlsa-load (200000) LSAs: the instance
+#               down at the limit (peak, time), the list, the health check,
+#               ignore → isolated, the clear (local only; not in the default)
 #
 # Results: $OUT/results.md (a table per test) and $OUT/*.csv (samples);
 # exit 1 if a check failed.
@@ -69,6 +73,7 @@ TESTS=lsdb,churn,neighbors,interfaces,ops,latency,convergence
 STEPS=1000,10000,50000,100000,200000
 CHURN_RATES=1,10,100 CHURN_SECS=120 CHURN_BASE=10000
 NEIGHBORS=50,100,250 STABLE_SECS=600
+MAXLSA_LIMIT=50000 MAXLSA_LOAD=200000
 LAT_N=50
 DAEMON=image
 SELFTEST=0
@@ -95,6 +100,8 @@ while [ $# -gt 0 ]; do
 	--selftest-remote) SELFTEST=1; shift ;;
 	--out) OUT=$2; shift 2 ;;
 	--hold) HOLD=$2; shift 2 ;;
+	--maxlsa-limit) MAXLSA_LIMIT=$2; shift 2 ;;
+	--maxlsa-load) MAXLSA_LOAD=$2; shift 2 ;;
 	--load) LOAD=$2; shift 2 ;;
 	-h | --help) usage ;;
 	*) echo "unknown option $1"; usage ;;
@@ -778,6 +785,76 @@ test_lsdb() {
 		fi
 		BIGGEST=$n
 	done
+	say ""
+}
+
+# --- G3.4r: the LSDB protection. The instance has max_lsa (ignore-time
+# 30 s, ignore-count 1); the generator floods MAXLSA_LOAD externals. The
+# patched ospfd takes the instance down at the limit; it comes back after
+# 30 s, the flood comes again, and the second time it stays down
+# (isolated) until routing.ospf.instance.clear-lsdb-protection.
+# max_lsa's state as ospfd says it (local) and as the daemon lists it.
+dut_maxlsa() { vty 'show ip ospf json' | jq -r '.maxLsa.state // "none"'; }
+cr_maxlsa() { cr routing.ospf.instance.list | jq -r --arg i "$INSTANCE" '.[] | select(.name == $i) | .lsdb.protection.state // "none"'; }
+is_state() { [ "$("$2")" = "$1" ]; } # is_state <state> <fn>
+test_maxlsa() {
+	say "## 8. LSDB protection (max_lsa)"
+	say ""
+	if [ $DUT != local ]; then
+		say "skipped: local DUT only (ospfd's own counters)"; say ""; return
+	fi
+	local mrt t0 t_ignore peak_lsas=0 l peak health listed verdict=ok
+	mrt=$(lsdb_mrt "$MAXLSA_LOAD")
+	dut_fresh maxlsa
+	ok routing.ospf.instance.set "{\"id\":\"$INSTANCE\",\"max_lsa\":$MAXLSA_LIMIT,\"max_lsa_ignore_time\":30,\"max_lsa_ignore_count\":1}" >/dev/null ||
+		{ fail "maxlsa: the image refused max_lsa (an ospfd without os/patches/frr/0007?)"; return; }
+	say "running-config: \`$(vty 'show running-config' | grep 'max-lsa' | xargs)\`"
+	gen_config "$W/gen/conf.json"
+	gen_start "$W/gen/conf.json"
+	if ! wait_for "gen Full" 60 ge 1 dut_neighbors_full >/dev/null; then
+		fail "maxlsa: no adjacency"; gen_stop; return
+	fi
+	proc_peak_reset
+	t0=$(now)
+	bbl ospf-load-mrt file "$mrt" instance 1 >/dev/null
+	t_ignore=-
+	while [ "$(since "$t0")" -lt 120000 ]; do
+		l=$(dut_lsas 2>/dev/null || echo 0)
+		[ "${l:-0}" -gt "$peak_lsas" ] && peak_lsas=$l
+		if [ "$(dut_maxlsa)" = ignore ]; then t_ignore=$(since "$t0"); break; fi
+		sleep 0.05
+	done
+	peak=$(proc_peak)
+	say ""
+	say "| limit | flood (LSAs) | down after (s) | LSDB peak sampled | ospfd / zebra / daemon peak (MiB) | listed (daemon) | health ospf.lsdb | isolated after (s) | clear → Full (s) | result |"
+	say "|---|---|---|---|---|---|---|---|---|---|"
+	[ "$t_ignore" = - ] && verdict="FAIL (never went down)"
+	# The daemon reads it within its 2 s poll.
+	wait_for "listed ignore" 10 is_state ignore cr_maxlsa >/dev/null || verdict="FAIL (the list does not say ignore)"
+	listed=$(cr_maxlsa)
+	health=$(cr system.health.check | jq -r '.checks[] | select(.key == "ospf.lsdb") | .severity')
+	[ "$health" = error ] || verdict="FAIL (health ospf.lsdb $health)"
+	# Back after 30 s, flooded again: isolated.
+	local t1 t_iso t_clear
+	t1=$(now)
+	if wait_for "isolated" 150 is_state isolated dut_maxlsa >/dev/null; then t_iso=$(since "$t1"); else t_iso=-; verdict="FAIL (not isolated)"; fi
+	gen_stop
+	# The cause gone: the clear brings the adjacency back.
+	gen_config "$W/gen/conf.json"
+	gen_start "$W/gen/conf.json"
+	t1=$(now)
+	ok routing.ospf.instance.clear-lsdb-protection "{\"id\":\"$INSTANCE\"}" >/dev/null || verdict="FAIL (clear refused)"
+	if wait_for "Full after clear" 60 ge 1 dut_neighbors_full >/dev/null; then t_clear=$(since "$t1"); else t_clear=-; verdict="FAIL (no adjacency after the clear)"; fi
+	wait_for "listed normal" 10 is_state normal cr_maxlsa >/dev/null || verdict="FAIL (the list does not say normal after the clear)"
+	gen_stop
+	ok routing.ospf.instance.set "{\"id\":\"$INSTANCE\",\"max_lsa\":null}" >/dev/null || true
+	oom_seen && verdict="FAIL (OOM)"
+	local dead
+	if dead=$(procs_dead); then verdict="FAIL ($dead died)"; fi
+	[ "$verdict" = ok ] || FAILED=1
+	say "| $MAXLSA_LIMIT | $MAXLSA_LOAD | $(ms2s "$t_ignore") | $peak_lsas | ${peak// / / }| $listed | $health | $(ms2s "$t_iso") | $(ms2s "$t_clear") | $verdict |"
+	say ""
+	grep -h 'max-lsa' "$W/dut/frr-ospfd.log" 2>/dev/null | tail -n 6 | sed 's/^/    /' | tee -a "$RESULTS" >/dev/null
 	say ""
 }
 
@@ -1784,6 +1861,7 @@ if has_test ops || has_test latency; then
 	gen_stop
 fi
 has_test convergence && test_convergence
+has_test maxlsa && test_maxlsa
 if [ "$HOLD" -gt 0 ] && [ "$TESTS" = none ]; then
 	[ -n "${LOAD:-}" ] && lsdb_load "$LOAD"
 	log "holding for $HOLD s (cargo xtask vm-lab ssh; vtysh --vty_socket $W/dut/run/frr)"

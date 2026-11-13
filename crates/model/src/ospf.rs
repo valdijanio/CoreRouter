@@ -226,10 +226,97 @@ pub struct OspfInstance {
     /// first router-LSA); OSPFv2 only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stub_router_on_startup: Option<u32>,
+    /// G3.4r: LSDB protection, a limit on the LSAs of other routers in the
+    /// link-state database (Cisco `max-lsa`, Junos `database-protection`;
+    /// ospfd `max-lsa`, patched into the image). OSPFv2 only. `None`: no
+    /// limit, as RouterOS, Junos and FRR (a default limit dropped Cisco
+    /// adjacencies on upgrade, FN74009).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lsa: Option<MaxLsa>,
     #[serde(default)]
     pub disabled: bool,
     #[serde(default)]
     pub comment: String,
+}
+
+/// G3.4r: the LSDB protection of an instance. Above `limit` LSAs of other
+/// routers the instance goes down for `ignore_time` (every adjacency and
+/// the learned LSAs go: the area's databases stay consistent, RFC 2328
+/// §13, as nothing routes through this router), then comes back; after
+/// `ignore_count` such periods it stays down (isolated) until
+/// `routing.ospf.instance.clear-lsdb-protection`. `reset_time` up without
+/// going down again forgets the periods. Warns at `threshold` %.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaxLsa {
+    pub limit: u32,
+    #[serde(default = "max_lsa_threshold", skip_serializing_if = "is_max_lsa_threshold")]
+    pub threshold: u8,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub warning_only: bool,
+    #[serde(default = "max_lsa_ignore_time", skip_serializing_if = "is_max_lsa_ignore_time")]
+    pub ignore_time: u32,
+    #[serde(default = "max_lsa_ignore_count", skip_serializing_if = "is_max_lsa_ignore_count")]
+    pub ignore_count: u32,
+    #[serde(default = "max_lsa_reset_time", skip_serializing_if = "is_max_lsa_reset_time")]
+    pub reset_time: u32,
+}
+
+/// G3.4r: the ranges of [`MaxLsa`], as ospfd takes them (Junos's for the
+/// times and the count).
+pub const MAX_LSA_LIMIT: std::ops::RangeInclusive<u32> = 1..=4_294_967_294;
+pub const MAX_LSA_THRESHOLD: std::ops::RangeInclusive<u8> = 1..=100;
+pub const MAX_LSA_IGNORE_TIME: std::ops::RangeInclusive<u32> = 30..=3600;
+pub const MAX_LSA_IGNORE_COUNT: std::ops::RangeInclusive<u32> = 1..=32;
+pub const MAX_LSA_RESET_TIME: std::ops::RangeInclusive<u32> = 60..=86_400;
+
+impl MaxLsa {
+    pub const THRESHOLD: u8 = 75;
+    pub const IGNORE_TIME: u32 = 300;
+    pub const IGNORE_COUNT: u32 = 5;
+    pub const RESET_TIME: u32 = 600;
+
+    /// A limit with the defaults (Cisco's and Junos's).
+    pub fn new(limit: u32) -> Self {
+        MaxLsa {
+            limit,
+            threshold: Self::THRESHOLD,
+            warning_only: false,
+            ignore_time: Self::IGNORE_TIME,
+            ignore_count: Self::IGNORE_COUNT,
+            reset_time: Self::RESET_TIME,
+        }
+    }
+
+    /// The count at which the warning starts.
+    pub fn warn_at(&self) -> u64 {
+        u64::from(self.limit) * u64::from(self.threshold) / 100
+    }
+}
+
+fn max_lsa_threshold() -> u8 {
+    MaxLsa::THRESHOLD
+}
+fn is_max_lsa_threshold(v: &u8) -> bool {
+    *v == MaxLsa::THRESHOLD
+}
+fn max_lsa_ignore_time() -> u32 {
+    MaxLsa::IGNORE_TIME
+}
+fn is_max_lsa_ignore_time(v: &u32) -> bool {
+    *v == MaxLsa::IGNORE_TIME
+}
+fn max_lsa_ignore_count() -> u32 {
+    MaxLsa::IGNORE_COUNT
+}
+fn is_max_lsa_ignore_count(v: &u32) -> bool {
+    *v == MaxLsa::IGNORE_COUNT
+}
+fn max_lsa_reset_time() -> u32 {
+    MaxLsa::RESET_TIME
+}
+fn is_max_lsa_reset_time(v: &u32) -> bool {
+    *v == MaxLsa::RESET_TIME
 }
 
 /// G3.9c: the range of `stub_router_on_startup`, in seconds (FRR's).
@@ -674,6 +761,7 @@ mod tests {
                 subscriber_pools: false,
                 stub_router: false,
                 stub_router_on_startup: None,
+                max_lsa: None,
                 disabled: false,
                 comment: String::new(),
             },
