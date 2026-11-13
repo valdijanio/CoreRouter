@@ -21,15 +21,15 @@ cargo xtask vm-lab reset           # volta o disco ao snapshot `tools` (ou `clea
 
 | Subcomando | O que faz |
 |---|---|
-| `create [--cpus N] [--memory MiB] [--disk GiB] [--wires N]` | Baixa a imagem Ubuntu 24.04 cloud uma vez e confere com o `SHA256SUMS` publicado (recusa e apaga se não bate), cria um overlay qcow2 fino, o seed do cloud-init, define e liga a VM, espera o cloud-init, instala o Rust e tira o snapshot `clean`. Padrão: 8 vCPUs, 16384 MiB, 20 GiB, 1 fio. |
+| `create [--cpus N] [--memory MiB] [--disk GiB] [--wires N]` | Baixa a imagem Ubuntu 24.04 cloud uma vez e confere com o `SHA256SUMS` publicado (recusa e apaga se não bate), cria um overlay qcow2 fino, o seed do cloud-init, define e liga a VM, espera o cloud-init, instala o Rust e tira o snapshot `clean`. Padrão: 8 vCPUs, 16384 MiB, 40 GiB (20 GiB até 2026-11-13; veja "Disco"), 1 fio. |
 | `up` / `down` | Liga e espera o SSH / desliga (ACPI; força depois de 90 s). |
 | `ssh [cmd…]` | Shell ou um comando como `lab`. |
 | `sync` | `rsync` da worktree para `/srv/lab/<worktree>/src` (sem `target*`, `.git`, `.claude/`, `vm/`, `plan/`; o app copia o `.claude/` para cada worktree, com o que estiver estacionado lá). |
 | `put <arquivo…>` | Copia arquivos do host para `/srv/lab/inbox/` na VM (uma captura, um arquivo de config). |
 | `tools [--check]` | Instala as ferramentas de terceiros declaradas em `xtask/src/vm_tools.rs` que faltam, imprime o que está instalado e tira o snapshot `tools`; `--check` só confere e diz o que falta. Idempotente. Veja "Ferramentas de terceiros". |
-| `run [--no-sync] [--shared] [--lock-timeout 30m] -- <cmd…>` | Confere a saúde da VM (root, processos novos, disco > 2 GiB e memória > 1 GiB livres; se falhar duas vezes, `reset` para `clean` sozinho), `sync`, pega a trava `/run/corerouter-lab.lock` (uma rodada por vez; `--shared` pula, só para compilar) e roda o comando **como root** em `/srv/lab/<worktree>/src`, com `CARGO_TARGET_DIR=/srv/lab/<worktree>/target`; saída ao vivo, código de saída repassado, tempo da rodada no fim. Um argumento só é uma linha de shell (`run -- 'a && b'`); vários são citados um a um. Espera a trava até `--lock-timeout` (ou `$COREROUTER_VM_LOCK_TIMEOUT`; padrão 30 min; `900`, `90s`, `30m`, `1h`) e então falha com código 75 dizendo quem a segura; o prazo vale só para a espera, nunca para a rodada. No fim avisa dos processos que o comando deixou vivos na VM. Uma rodada por worktree: se já há uma rodada da mesma worktree esperando ou rodando na VM, o `run` recusa antes do `sync` (ele sobrescreveria o código dela em `src`); `--no-sync` roda sobre o código que está lá. |
+| `run [--no-sync] [--shared] [--lock-timeout 30m] -- <cmd…>` | Confere a saúde da VM (root, processos novos, disco > 2 GiB e memória > 1 GiB livres; o que faz quando falha está em "Saúde da VM: reiniciar ou esperar": disco curto apaga os `target` que nenhuma rodada usa, e o `reset` sozinho só acontece sem outra rodada na VM), `sync`, pega a trava `/run/corerouter-lab.lock` (uma rodada por vez; `--shared` pula, só para compilar) e roda o comando **como root** em `/srv/lab/<worktree>/src`, com `CARGO_TARGET_DIR=/srv/lab/<worktree>/target`; saída ao vivo, código de saída repassado, tempo da rodada no fim. Um argumento só é uma linha de shell (`run -- 'a && b'`); vários são citados um a um. Espera a trava até `--lock-timeout` (ou `$COREROUTER_VM_LOCK_TIMEOUT`; padrão 30 min; `900`, `90s`, `30m`, `1h`) e então falha com código 75 dizendo quem a segura; o prazo vale só para a espera, nunca para a rodada. No fim avisa dos processos que o comando deixou vivos na VM. Uma rodada por worktree: se já há uma rodada da mesma worktree esperando ou rodando na VM, o `run` recusa antes do `sync` (ele sobrescreveria o código dela em `src`); `--no-sync` roda sobre o código que está lá. |
 | `unlock [--force]` | Mostra a trava: dono (worktree, PID do `run` no host, round), há quanto tempo, e os processos que a seguram, esperam por ela ou sobraram de rodadas. Com `--force`, encerra (TERM, KILL depois de 5 s) os processos de rodadas cujo `vm-lab run` já não existe no host, o que solta a trava. Nunca mexe numa rodada viva nem em quem só espera. |
-| `snapshot [nome] [--force]` / `reset [nome] [--force]` | Snapshot interno do disco (com a VM desligada; sem imagem de RAM) / volta o disco a ele e liga, mantendo a definição atual da VM (CPU, memória). Padrão `tools` (ou `clean`, se não houver `tools`). Recusa enquanto alguém está numa rodada: a trava do `run` na VM ou `vm/root.lock` no host (rodada à mão do usuário); `--force` passa por cima. Veja "Travas: regras e como destravar". |
+| `snapshot [nome] [--force]` / `reset [nome] [--force]` | Snapshot interno do disco (com a VM desligada; sem imagem de RAM) / volta o disco a ele e liga, mantendo a definição atual da VM (CPU, memória). Padrão `tools` (ou `clean`, se não houver `tools`). Recusa enquanto alguém está numa rodada: um `vm-lab run` vivo deste host com rodada na VM (segurando a trava, esperando por ela ou `--shared`), a trava do `run` na VM ou `vm/root.lock` no host (rodada à mão do usuário); `--force` passa por cima. Veja "Travas: regras e como destravar". |
 | `destroy` | Apaga a VM, o overlay e o seed; a imagem baixada e a chave ficam. |
 
 ## Travas: regras e como destravar (G0.26b)
@@ -101,6 +101,49 @@ aquele `vm-lab run` (Ctrl-C) e rode de novo. Um dono gravado por um `vm_lab.rs` 
 host. Se o `unlock` não puder decidir, ele diz o PID para encerrar à mão
 (`cargo xtask vm-lab ssh sudo kill <pid>`). `vm/root.lock` no host é do usuário: quem o segura é
 um `flock` visível no `pgrep -ax flock`.
+
+## Saúde da VM: reiniciar ou esperar (2026-11-13)
+
+Antes de cada rodada o `run` confere a VM: `sudo` funciona, cinco processos novos sobem, e há mais
+de 2 GiB livres em `/srv/lab` e mais de 1 GiB de `MemAvailable`. Até 2026-11-13, qualquer falha
+virava `reset` (`virsh destroy` + `snapshot-revert`) **mesmo com outra rodada no meio**. Às 15:16
+daquele dia isso matou a fase C de DNS contra o notebook e uma rodada da G4.1w (as duas saíram com
+255): o disco estava abaixo de 2 GiB porque uma rodada compilava em release. Os logs das sessões
+mostram o mesmo motivo em outras rodadas (181, 1734 e 2007 MiB livres).
+
+**Regra:** o `reset` automático só acontece com a VM sem rodada viva. A decisão é a função pura
+`verdict` (`xtask/src/vm_lab.rs`, testes `a_live_round_is_never_reset` e vizinhos):
+
+| Saúde | Sem rodada viva | Com rodada viva |
+|---|---|---|
+| boa | segue | segue (espera a trava na VM, como sempre) |
+| disco curto, limpeza ainda não tentada | limpa os caches de build | limpa os caches de build |
+| disco curto depois da limpeza, memória curta, root ou processos falhando, SSH sem resposta | `reset` para `tools` (ou `clean`); falhou de novo depois dele: erro | **espera**: confere de novo a cada 30 s; dentro do `--lock-timeout` |
+| ainda ruim quando o `--lock-timeout` acaba | — | erro dizendo quem está na VM; nada é reiniciado |
+
+- **Rodada viva** é um `vm-lab run` deste host cuja rodada já está na VM: o `ssh … sudo env
+  COREROUTER_LAB_ROUND=<round> bash -c …` dele aparece no `/proc` do host, e o `vm-lab run` dono do
+  round ainda existe (o mesmo teste do `unlock`). Vale para quem segura a trava, quem espera por
+  ela e quem roda com `--shared`. Funciona com a VM sem responder ao SSH, porque só lê o host. O
+  `vm/root.lock` segurado pelo usuário também conta. O `snapshot` e o `reset` à mão usam a mesma
+  conta e recusam sem `--force`.
+- **SSH lento sob carga não é VM morta.** Com rodada viva a conferência usa `ConnectTimeout=30` e
+  até 180 s de resposta (sem rodada: 10 s e 60 s), e uma falha só leva a esperar e conferir de
+  novo. Quando a rodada acaba e a VM ainda não responde, aí sim é `reset`.
+- **Disco curto:** antes de declarar a VM doente, o `run` apaga os `/srv/lab/<worktree>/target`
+  das worktrees sem rodada viva, do menos recente para o mais (data mais nova até dois níveis
+  dentro do `target`), até ter 6 GiB livres. Ficam o `target` de toda rodada viva e o do próprio
+  `run`, e todos os `src` (o próximo `run` daquela worktree só recompila). A saída lista o que
+  saiu, o tamanho e a idade.
+- **Uma conferência por vez:** a conferência, a limpeza e o `reset` rodam com `vm/health.lock`
+  (trava de arquivo no host), que o `run` só solta quando o `ssh` da rodada dele já começou (e
+  passou a contar como rodada viva para os outros). Assim dois `run` não reiniciam a VM juntos,
+  e nenhum reinicia entre a conferência de outro e o começo da rodada dele.
+- O tempo esperado na conferência sai do `--lock-timeout`: a espera pela trava dentro da VM fica
+  com o que sobrou.
+
+Uma worktree com um `vm_lab.rs` anterior a esta regra ainda reinicia por cima das outras: faça
+`git merge origin/main` antes de usar o laboratório.
 
 ## Ferramentas de terceiros
 
@@ -190,7 +233,27 @@ instala os três pacotes do Ubuntu se faltarem). Veja `docs/producao-core.md`, "
 - O snapshot é interno ao qcow2 e só com a VM desligada (`snapshot` desliga e religa).
 - Desempenho medido na VM é de virtio, não de placa física: serve para comparar antes/depois,
   não como número de produção.
-- Disco: a imagem tem ~600 MB; o overlay cresce com o uso (o teto é `--disk`).
+- **Disco** (revisto em 2026-11-13). A imagem tem ~600 MB e o overlay cresce com o uso, até o
+  `--disk`. Com 20 GiB, o sistema do snapshot `tools` (Rust, FRR, BNG Blaster, QEMU para o CHR)
+  ocupa 7,1 GiB dos 19 GiB da raiz (**medido**): sobram ~12 GiB para os `target` de todas as
+  worktrees, e duas compilações em release já chegam perto do limite de 2 GiB. Por isso o
+  `create` passou a 40 GiB (o overlay é fino: o host só gasta o que a VM escreve; o `/home`,
+  onde fica o `vm/`, tinha 69 GiB livres em 2026-11-13). Para crescer a VM que já existe, sem
+  rodada nenhuma (`cargo xtask vm-lab status`):
+
+  ```sh
+  cargo xtask vm-lab reset tools        # o disco que vai virar o novo `tools`
+  cargo xtask vm-lab down
+  qemu-img resize vm/corerouter-lab.qcow2 40G
+  cargo xtask vm-lab up                 # o cloud-init (growpart + resizefs) cresce a raiz no boot
+  cargo xtask vm-lab ssh df -h /        # confira: ~39G
+  cargo xtask vm-lab snapshot tools     # obrigatório: senão o próximo reset volta a 20 GiB
+  ```
+
+  O `qemu-img resize` aceita qcow2 com snapshots internos (QEMU 8.2), mas cada snapshot guarda o
+  próprio tamanho e voltar a ele devolve o disco a esse tamanho (**medido** com uma imagem de
+  teste: 1 GiB → `resize` 2 GiB → `snapshot -a` → 1 GiB). Por isso o `tools` é tirado de novo; o
+  `clean` fica com 20 GiB (só serve se o `tools` sumir).
 - Se algum dia faltar permissão do libvirt (polkit), a alternativa sem root é
   `qemu:///session` com rede de usuário e encaminhamento de porta SSH; não foi preciso.
 
