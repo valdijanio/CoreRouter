@@ -4,7 +4,7 @@
 
 use std::net::IpAddr;
 
-use corerouter_hal::policy::{KernelRule, KernelRuleRow, RuleOwner, mangle_marks, rule_pref};
+use corerouter_hal::policy::{KernelRule, KernelRuleRow, RuleOwner, routing_marks, rule_pref};
 use corerouter_model::firewall::Name;
 use corerouter_model::policy_rule::{MAX_RULES, RoutingRule, RuleAction};
 use corerouter_model::route;
@@ -485,7 +485,7 @@ fn row(cfg: &Config, k: &KernelRuleRow) -> Value {
 
 fn kernel(s: &mut Session, _: &Value) -> Result<Value> {
     let cfg = s.store().running().clone();
-    let marks: Vec<String> = mangle_marks(&cfg)
+    let marks: Vec<String> = routing_marks(&cfg)
         .into_iter()
         .filter(|(_, t)| t.is_none())
         .map(|(n, _)| n.as_str().to_owned())
