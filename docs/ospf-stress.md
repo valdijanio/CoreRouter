@@ -140,6 +140,17 @@ lê `show ip ospf interface json` a cada 2 s.
 - Onde vai a CPU no commit e na remoção (s de CPU por processo, 4 000 interfaces): commit — daemon
   4,9, `ospfd` 28,2, `zebra` 9,6; remoção — daemon 12,1 (era 43,3 antes da correção 3), `ospfd`
   28,6, `zebra` 18,1.
+- **Com os patches do FRR da G3.4q** (`docs/frr-many-interfaces.md`; imagem nova, `--daemon
+  build`, 2026-11-13, **medido**):
+
+  | interfaces | commit (s) | `show ip ospf interface json` p50/máx (ms) | `routing.ospf.interface.list` p50/máx (ms) | remoção (s) | CPU no commit | CPU na remoção |
+  |---|---|---|---|---|---|---|
+  | 1 000 | 1,4 | 18/23 | 15/17 | 14,4 | daemon 0,9, `ospfd` 0,3, `zebra` 1,1 | daemon 0,8, `ospfd` 0,3, `zebra` 1,3 |
+  | 4 000 | 6,1 | 69/177 | 18/35 | 71,1 | daemon 3,9, `ospfd` 1,6, `zebra` 6,0 | daemon 9,5, `ospfd` 2,5, `zebra` 15,6 |
+
+  O `ospfd` saiu de 28 s de CPU para 1,6 s no commit e 2,5 s na remoção. A remoção continua em
+  ~70 s por causa do kernel: o `hal-linux` apaga uma VLAN por `RTM_DELLINK`, e cada uma espera um
+  período de graça do RCU (só o kernel, 4 000 VLANs: 80,6 s uma a uma, 1,4 s por grupo; G3.4s).
 
 ### 4. Operação com carga
 

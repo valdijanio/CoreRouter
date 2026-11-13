@@ -45,6 +45,10 @@ set -eu
 
 usage() { sed -n '2,40p' "$0"; exit 2; }
 
+# The image's name in the VM's inbox: another one (OSPF_STRESS_ROOTFS=x.squashfs)
+# keeps a round of another worktree, which reads the default, on its own image.
+ROOTFS=${OSPF_STRESS_ROOTFS:-ospf-stress-rootfs.squashfs}
+case $ROOTFS in *[!A-Za-z0-9._-]* | "" | .*) echo "OSPF_STRESS_ROOTFS: a file name" >&2; exit 2 ;; esac
 if [ "${1:-}" = "--host" ]; then
 	IMAGES=${2:?usage: $0 --host <images dir> [options]}
 	shift 2
@@ -54,10 +58,10 @@ if [ "${1:-}" = "--host" ]; then
 	# Under the name this lab reads (vm-lab put copies regular files only:
 	# a symbolic link is skipped).
 	tmp=$(mktemp -d)
-	cp --reflink=auto "$IMAGES/rootfs.squashfs" "$tmp/ospf-stress-rootfs.squashfs"
-	cargo xtask vm-lab put "$tmp/ospf-stress-rootfs.squashfs"
+	cp --reflink=auto "$IMAGES/rootfs.squashfs" "$tmp/$ROOTFS"
+	cargo xtask vm-lab put "$tmp/$ROOTFS"
 	rm -rf "$tmp"
-	exec cargo xtask vm-lab run -- scripts/ospf-stress-lab.sh "$@"
+	exec cargo xtask vm-lab run -- env OSPF_STRESS_ROOTFS="$ROOTFS" scripts/ospf-stress-lab.sh "$@"
 fi
 
 DUT=local IFACE="" TARGET="" RUSER=${RUSER:-admin} MGMT="" DUT_IFACE=ether1
@@ -148,11 +152,11 @@ since() { echo $(($(now) - $1)); }                          # ms since $1
 # daemon with --frr.
 
 mount_image() {
-	[ -s "$INBOX/ospf-stress-rootfs.squashfs" ] ||
-		{ echo "$INBOX/ospf-stress-rootfs.squashfs missing: run with --host <images> from the host"; exit 1; }
+	[ -s "$INBOX/$ROOTFS" ] ||
+		{ echo "$INBOX/$ROOTFS missing: run with --host <images> from the host"; exit 1; }
 	mkdir -p "$W"/{lower,rw,root}
 	modprobe loop 2>/dev/null || true
-	mount -t squashfs -o loop,ro "$INBOX/ospf-stress-rootfs.squashfs" "$W/lower"
+	mount -t squashfs -o loop,ro "$INBOX/$ROOTFS" "$W/lower"
 	mount -t tmpfs tmpfs "$W/rw"
 	mkdir -p "$W/rw/upper" "$W/rw/work"
 	mount -t overlay overlay -o "lowerdir=$W/lower,upperdir=$W/rw/upper,workdir=$W/rw/work" "$R"

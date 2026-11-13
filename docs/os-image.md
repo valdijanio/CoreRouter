@@ -1795,6 +1795,13 @@ minutos sem resposta, manda olhar o console.
   sai do LSDB (`docs/frr-tilfa-abort.md`). O `cargo xtask os build` faz `frr-dirclean` quando os
   patches de `os/patches/frr/` mudam (carimbo `.corerouter-frr-patches.sha256`, como o do
   kernel). **Saída:** apagar o patch quando o FRR da imagem trouxer a correção.
+- **Patches no FRR (G3.4q):** `0002`–`0006` de `os/patches/frr/` tiram o crescimento quadrático com
+  milhares de interfaces OSPF: o commit do northbound por `interface` no lote (`lib`), a busca
+  linear por `lsa_pos` no SPF, uma router-LSA por interface no lote, o aviso de router-LSA cheia
+  por link (2,5 GB de log com 10 000 interfaces) e a fila early do `zebra`
+  (`docs/frr-many-interfaces.md`). Os mesmos foram preparados para o FRR
+  (`docs/frr-upstream/ospfd-many-interfaces/`). **Saída:** apagar cada um quando o FRR da imagem
+  o trouxer.
 - **O que o `frr-test` prova** (`cargo xtask os frr-test`, `xtask/src/os/frr.rs`): dois
   roteadores da imagem no QEMU, sem root, com os `ether1` ligados por um par de sockets UDP do
   QEMU no loopback do host. Cada um é configurado só por comandos (13, os mesmos de CLI/MCP):
