@@ -271,6 +271,119 @@ rotas perdidas com o motivo).
   correção (`os/patches/frr/`); o `.deb` da VM do laboratório não. O TI-LFA segue desligado em
   produção pela G3.4k.
 
+## Proteção da LSDB (G3.4r)
+
+O `ospfd` aceitava LSAs sem limite: uma redistribuição errada em outro roteador (a tabela BGP
+inteira no OSPF) levava cada roteador da área à falta de memória. Cada LSA custa ~1,5 KiB no
+`ospfd` e cada rota ~0,6 KiB no `zebra` (**medido**). No laboratório, 175 436 LSAs chegaram em
+1 s e 192 721 em 5,2 s, com o `ospfd` em 293 MiB e o `zebra` em 120 MiB.
+
+**Como funciona.** Os parâmetros `max_lsa*` de `routing.ospf.instance.add/set` viram o
+`max-lsa` do `ospfd`. Como o FRR não tem limite, ele vem de um patch na imagem
+(`os/patches/frr/0007-ospfd-max-lsa.patch`), o mesmo enviado ao FRR
+(`docs/frr-upstream/ospfd-max-lsa/`). O modelo é o do Cisco `max-lsa` e do Junos
+`database-protection`:
+
+- só contam as LSAs de **outros** roteadores;
+- avisa no limiar (`max_lsa_threshold`, 75 %);
+- acima do limite, a instância cai por `max_lsa_ignore_time` (300 s): todas as interfaces
+  descem, as adjacências caem e a LSDB aprendida sai;
+- depois volta; após `max_lsa_ignore_count` (5) períodos seguidos, fica isolada até
+  `routing.ospf.instance.clear-lsdb-protection`;
+- `max_lsa_reset_time` (600 s) de pé zera a contagem;
+- `max_lsa_warning_only` só avisa.
+
+A checagem roda dentro do `ospfd`, num evento depois do pacote que trouxe a LSA: O(áreas) por
+passagem do laço. Por isso segura o pico. Uma leitura nossa a cada 2 s chegaria depois da
+enxurrada inteira.
+
+Cair inteira, em vez de recusar só as LSAs acima do limite (como faz o PR
+[FRRouting/frr#23897](https://github.com/FRRouting/frr/pull/23897)), mantém as bases da área
+iguais (RFC 2328 §13). Sem adjacência, ninguém calcula caminho por este roteador. Um roteador que
+fica com adjacências e base parcial calcula caminhos que os vizinhos não calculam.
+
+O estado é próprio (`ospf->max_lsa.state`), não a flag `shutdown`: o running-config não muda, e
+o resync do daemon não desfaz o ignore. Só OSPFv2; o `ospf6d` é a G3.4x.
+
+**Comandos e janela.**
+
+- `routing.ospf.instance.list` traz `lsdb`: `lsas`, `lsas_other`, `memory_mib` estimado e
+  `protection` (`state`, `limit`, `ignore_entries`, `ignore_count`, `remaining_secs`). Vem do
+  mesmo `show ip ospf json` que o serviço `frr` já lê a cada 2 s (`lsaOtherRoutersCounter` e
+  `maxLsa`, campos do patch).
+- A aba Instances ganha a coluna **LSDB**:
+  - `12 340 / 50 000`;
+  - âmbar a partir do limiar (`41 200 / 50 000 · 82 %`) e acima do limite com warning-only;
+  - vermelho em `ignore 4m12s · 2/5` e `isolated`.
+- O botão **Clear LSDB Protection** só fica ativo em ignore ou isolated.
+- O modal da instância tem duas páginas, General e **LSDB Protection**. A segunda mostra os seis
+  campos e o que a base tem agora.
+
+**Prévia do commit** (`routing.ospf.instance.check`):
+
+- o que o limite faz e a memória no limite (estimada);
+- **risco**, com Safe Mode oferecido, se o limite está abaixo das LSAs de outros roteadores de
+  agora: a instância cai assim que o commit aplica;
+- aviso se a folga é menor que 20 %;
+- aviso se o `ospfd` não tem o patch (o commit seria recusado);
+- extra: aviso quando a edição liga `redistribute bgp`, `static` ou `kernel` com 10 240 rotas ou
+  mais (o padrão do `redistribute maximum-prefix` do Cisco), com quantas LSAs e quantos MiB isso
+  põe em cada roteador do domínio.
+
+**Saúde** (`ospf.lsdb`, System › Health):
+
+- erro em ignore ou isolated, ou com as bases estimadas em metade da RAM;
+- aviso no limiar, acima do limite com warning-only, ou com 25 % da RAM;
+- vale **mesmo sem limite**: é o alerta que teria pego o caso da gap sem nada configurado.
+
+**Medido**, laboratório no host (FRR 10.7.1 com os patches 0001–0007, dois `ospfd` em
+namespaces de usuário, Ryzen AI Max+ 395, 13/11/2026). A enxurrada é de ~190 000 externas de um
+vizinho; o limite, 50 000 (`/srv/build/G3.4r/hostlab/maxlsa-2`).
+
+| | sem limite | `max-lsa 50000` |
+|---|---|---|
+| LSAs na base no pico | 192 721 | 50 008 (8 acima do limite) |
+| tempo até cair | — | 817 ms |
+| pico do `ospfd` / `zebra` | 293 / 120 MiB | 84 / 42 MiB |
+| depois de 2 períodos e isolado | — | `ospfd` 124 MiB (a glibc não devolve, reaproveita) |
+| `clear` → Full | — | 0,7–1,5 s |
+| limite abaixo da contagem → ignore | — | 0,4 s |
+
+O teste `maxlsa` de `scripts/ospf-stress-lab.sh` faz o mesmo de ponta a ponta, com a imagem e o
+daemon (`docs/ospf-stress.md`, seção 8).
+
+### Pesquisa
+
+- **MikroTik RouterOS 7.25** (`/routing ospf instance`): nenhum limite de LSA nem de
+  redistribuição. VyOS usa o FRR: também nada.
+- **Cisco IOS/IOS XE** `max-lsa N [threshold] [warning-only] [ignore-time] [ignore-count]
+  [reset-time]`: a semântica adotada. O IOS XE 17.11 ligou `max-lsa 50000` por padrão, e isso
+  derrubou adjacências na atualização
+  ([FN74009](https://www.cisco.com/c/en/us/support/docs/field-notices/740/fn74009.html)): por
+  isso aqui o padrão é sem limite.
+- **Junos** `database-protection` (maximum-lsa, warning-threshold 30–100, ignore-time
+  30–3600 s, ignore-count 1–32, reset-time 60–86 400 s, `clear ospf database-protection`): os
+  intervalos adotados.
+- **Arista EOS** `max-lsa`: igual ao Cisco.
+- **Nokia SR OS**: `rtr-adv-lsa-limit` põe o roteador em overload, que desvia o trânsito mas
+  não contém a memória; `export-limit` limita a redistribuição (G3.4w).
+- **RFC 1765** (Database Overflow, Experimental, sem atualização nem errata): exige o mesmo
+  limite em todos os roteadores e cobre só as type-5. Não adotada.
+- **Stub router (RFC 6987) e "isolar o vizinho"** não protegem: a LSDB cresce igual, e o
+  culpado é quem origina, não quem repassa.
+- **FRR**:
+  - 10.7.1 e `master` (c9fe9ca040) sem limite; `ospf_snmp.c` responde `ospfExtLsdbLimit = -1`;
+  - [#23897](https://github.com/FRRouting/frr/pull/23897) recusa a LSA acima do limite em
+    silêncio. A base fica diferente da dos vizinhos, e o padrão de 100 000 quebraria a rodada de
+    200 000 da G3.4m.
+
+Fora agora (gaps):
+
+- G3.4w: limite de redistribuição;
+- G3.4x: OSPFv3;
+- G3.4y: os roteadores anunciantes com mais LSAs, na janela;
+- G1.6zz: `oom_score_adj` do daemon.
+
 ## Seguro por padrão
 
 - `routing.ospf.interface-template.check` (o modal) mostra antes de aplicar: **quais interfaces

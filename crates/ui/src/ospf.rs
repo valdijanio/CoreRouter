@@ -592,7 +592,10 @@ fn lsdb_summary(r: Option<&Value>) -> String {
     let state = st
         .and_then(|v| v.get("protection"))
         .filter(|v| !v.is_null())
-        .map(|p| format!("; protection {}", s(p, "state")))
+        .map(|p| match p.get("remaining_secs").and_then(Value::as_u64) {
+            Some(t) => format!("; protection {} ({t} s left)", s(p, "state")),
+            None => format!("; protection {}", s(p, "state")),
+        })
         .unwrap_or_else(|| "; no limit".into());
     format!("{now}{mib}{state}.")
 }

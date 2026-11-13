@@ -1,4 +1,4 @@
-From 26c190c910c28a99c56b06ea21dc3bdb4822efdc Mon Sep 17 00:00:00 2001
+From 66a2eb2b9d5afce8a54a3b93b622129a61cb176b Mon Sep 17 00:00:00 2001
 From: CoreRouter <noreply@corerouter>
 Date: Fri, 13 Nov 2026 14:10:41 -0300
 Subject: [PATCH] ospfd: max-lsa, a limit on the LSAs of other routers
@@ -38,16 +38,15 @@ which covers both. "show ip ospf" shows the count of LSAs of other
 routers always, and the limit, the state, the ignore periods and the
 time left when a limit is set (JSON: lsaOtherRoutersCounter, maxLsa).
 
-Signed-off-by: CoreRouter <noreply@corerouter>
 ---
  doc/user/ospfd.rst     |  34 ++++++
  ospfd/ospf_interface.c |   2 +-
  ospfd/ospf_lsa.c       |   4 +
- ospfd/ospf_vty.c       | 181 ++++++++++++++++++++++++++++++
- ospfd/ospf_zebra.c     |   2 +-
- ospfd/ospfd.c          | 242 +++++++++++++++++++++++++++++++++++++----
- ospfd/ospfd.h          |  59 ++++++++++
- 7 files changed, 502 insertions(+), 22 deletions(-)
+ ospfd/ospf_vty.c       | 158 +++++++++++++++++++++++++++
+ ospfd/ospf_zebra.c     |   3 +-
+ ospfd/ospfd.c          | 240 +++++++++++++++++++++++++++++++++++++----
+ ospfd/ospfd.h          |  57 ++++++++++
+ 7 files changed, 475 insertions(+), 23 deletions(-)
 
 diff --git a/doc/user/ospfd.rst b/doc/user/ospfd.rst
 index 04d0c85d58..7df6e82046 100644
@@ -130,10 +129,10 @@ index c28cf6b595..02e05daed4 100644
  	if (IS_DEBUG_OSPF(lsa, LSA_INSTALL)) {
  		switch (lsa->data->type) {
 diff --git a/ospfd/ospf_vty.c b/ospfd/ospf_vty.c
-index 42f577e921..eabfd4ce36 100644
+index 42f577e921..73741de86f 100644
 --- a/ospfd/ospf_vty.c
 +++ b/ospfd/ospf_vty.c
-@@ -3153,6 +3153,74 @@ static int show_ip_ospf_common(struct vty *vty, struct ospf *ospf,
+@@ -3153,6 +3153,57 @@ static int show_ip_ospf_common(struct vty *vty, struct ospf *ospf,
  		}
  	}
  
@@ -144,55 +143,38 @@ index 42f577e921..eabfd4ce36 100644
 +		const char *state = ospf_max_lsa_state_str(ospf, others);
 +
 +		if (json) {
-+			json_object_int_add(json_vrf, "lsaOtherRoutersCounter",
-+					    others);
++			json_object_int_add(json_vrf, "lsaOtherRoutersCounter", others);
 +			if (m->limit || m->state != OSPF_MAX_LSA_NORMAL) {
 +				json_object *json_max = json_object_new_object();
 +
 +				json_object_int_add(json_max, "limit", m->limit);
-+				json_object_int_add(json_max, "threshold",
-+						    m->threshold);
-+				json_object_boolean_add(json_max, "warningOnly",
-+							m->warning_only);
-+				json_object_int_add(json_max, "ignoreTimeSecs",
-+						    m->ignore_time);
-+				json_object_int_add(json_max, "ignoreCount",
-+						    m->ignore_count);
-+				json_object_int_add(json_max, "resetTimeSecs",
-+						    m->reset_time);
++				json_object_int_add(json_max, "threshold", m->threshold);
++				json_object_boolean_add(json_max, "warningOnly", m->warning_only);
++				json_object_int_add(json_max, "ignoreTimeSecs", m->ignore_time);
++				json_object_int_add(json_max, "ignoreCount", m->ignore_count);
++				json_object_int_add(json_max, "resetTimeSecs", m->reset_time);
 +				json_object_string_add(json_max, "state", state);
-+				json_object_int_add(json_max, "ignoreEntries",
-+						    m->ignore_entries);
++				json_object_int_add(json_max, "ignoreEntries", m->ignore_entries);
 +				if (event_is_scheduled(m->t_ignore))
-+					json_object_int_add(
-+						json_max, "ignoreRemainingMsecs",
-+						event_timer_remain_msec(
-+							m->t_ignore));
++					json_object_int_add(json_max, "ignoreRemainingMsecs",
++							    event_timer_remain_msec(m->t_ignore));
 +				if (event_is_scheduled(m->t_reset))
-+					json_object_int_add(
-+						json_max, "resetRemainingMsecs",
-+						event_timer_remain_msec(
-+							m->t_reset));
-+				json_object_object_add(json_vrf, "maxLsa",
-+						       json_max);
++					json_object_int_add(json_max, "resetRemainingMsecs",
++							    event_timer_remain_msec(m->t_reset));
++				json_object_object_add(json_vrf, "maxLsa", json_max);
 +			}
 +		} else {
-+			vty_out(vty, " Number of LSAs of other routers %lu\n",
-+				others);
++			vty_out(vty, " Number of LSAs of other routers %lu\n", others);
 +			if (m->limit || m->state != OSPF_MAX_LSA_NORMAL) {
 +				vty_out(vty,
 +					" Maximum number of LSAs of other routers %u, warning at %u%%%s\n",
 +					m->limit, m->threshold,
-+					m->warning_only ? " (warning-only)"
-+							: "");
++					m->warning_only ? " (warning-only)" : "");
 +				vty_out(vty,
 +					"   Ignore time %us, ignore count %u, reset time %us\n",
-+					m->ignore_time, m->ignore_count,
-+					m->reset_time);
-+				vty_out(vty,
-+					"   State %s, ignore periods %u of %u\n",
-+					state, m->ignore_entries,
-+					m->ignore_count);
++					m->ignore_time, m->ignore_count, m->reset_time);
++				vty_out(vty, "   State %s, ignore periods %u of %u\n", state,
++					m->ignore_entries, m->ignore_count);
 +				if (event_is_scheduled(m->t_ignore))
 +					vty_out(vty, "   Ignore state for another %s\n",
 +						ospf_timer_dump(m->t_ignore, timebuf,
@@ -208,7 +190,7 @@ index 42f577e921..eabfd4ce36 100644
  	/* Show SPF timers. */
  	if (json) {
  		json_object_int_add(json_vrf, "spfScheduleDelayMsecs",
-@@ -10197,6 +10265,61 @@ DEFUN (no_ospf_max_metric_router_lsa_startup,
+@@ -10197,6 +10248,55 @@ DEFUN (no_ospf_max_metric_router_lsa_startup,
  }
  
  
@@ -229,16 +211,11 @@ index 42f577e921..eabfd4ce36 100644
 +{
 +	VTY_DECLVAR_INSTANCE_CONTEXT(ospf, ospf);
 +
-+	ospf_max_lsa_set(ospf, limit,
-+			 threshold_str ? threshold
-+				       : OSPF_MAX_LSA_THRESHOLD_DEFAULT,
++	ospf_max_lsa_set(ospf, limit, threshold_str ? threshold : OSPF_MAX_LSA_THRESHOLD_DEFAULT,
 +			 !!warning_only,
-+			 ignore_time_str ? ignore_time
-+					 : OSPF_MAX_LSA_IGNORE_TIME_DEFAULT,
-+			 ignore_count_str ? ignore_count
-+					  : OSPF_MAX_LSA_IGNORE_COUNT_DEFAULT,
-+			 reset_time_str ? reset_time
-+					: OSPF_MAX_LSA_RESET_TIME_DEFAULT);
++			 ignore_time_str ? ignore_time : OSPF_MAX_LSA_IGNORE_TIME_DEFAULT,
++			 ignore_count_str ? ignore_count : OSPF_MAX_LSA_IGNORE_COUNT_DEFAULT,
++			 reset_time_str ? reset_time : OSPF_MAX_LSA_RESET_TIME_DEFAULT);
 +	return CMD_SUCCESS;
 +}
 +
@@ -261,8 +238,7 @@ index 42f577e921..eabfd4ce36 100644
 +	VTY_DECLVAR_INSTANCE_CONTEXT(ospf, ospf);
 +
 +	ospf_max_lsa_set(ospf, 0, OSPF_MAX_LSA_THRESHOLD_DEFAULT, false,
-+			 OSPF_MAX_LSA_IGNORE_TIME_DEFAULT,
-+			 OSPF_MAX_LSA_IGNORE_COUNT_DEFAULT,
++			 OSPF_MAX_LSA_IGNORE_TIME_DEFAULT, OSPF_MAX_LSA_IGNORE_COUNT_DEFAULT,
 +			 OSPF_MAX_LSA_RESET_TIME_DEFAULT);
 +	return CMD_SUCCESS;
 +}
@@ -270,7 +246,7 @@ index 42f577e921..eabfd4ce36 100644
  DEFUN (ospf_max_metric_router_lsa_shutdown,
         ospf_max_metric_router_lsa_shutdown_cmd,
         "max-metric router-lsa on-shutdown (5-100)",
-@@ -10945,6 +11068,26 @@ static void config_write_stub_router(struct vty *vty, struct ospf *ospf)
+@@ -10945,6 +11045,26 @@ static void config_write_stub_router(struct vty *vty, struct ospf *ospf)
  	return;
  }
  
@@ -297,7 +273,7 @@ index 42f577e921..eabfd4ce36 100644
  static void show_ip_ospf_route_network(struct vty *vty, struct ospf *ospf,
  				       struct route_table *rt,
  				       json_object *json, bool detail)
-@@ -12014,6 +12157,38 @@ DEFPY(clear_ip_ospf_process, clear_ip_ospf_process_cmd,
+@@ -12014,6 +12134,38 @@ DEFPY(clear_ip_ospf_process, clear_ip_ospf_process_cmd,
  	return CMD_SUCCESS;
  }
  
@@ -336,7 +312,7 @@ index 42f577e921..eabfd4ce36 100644
  static const char *const ospf_abr_type_str[] = {
  	"unknown", "standard", "ibm", "cisco", "shortcut"
  };
-@@ -13168,6 +13343,9 @@ static int ospf_config_write_one(struct vty *vty, struct ospf *ospf)
+@@ -13168,6 +13320,9 @@ static int ospf_config_write_one(struct vty *vty, struct ospf *ospf)
  	/* Max-metric router-lsa print */
  	config_write_stub_router(vty, ospf);
  
@@ -346,7 +322,7 @@ index 42f577e921..eabfd4ce36 100644
  	/* SPF refresh parameters print. */
  	if (ospf->lsa_refresh_interval != OSPF_LSA_REFRESH_INTERVAL_DEFAULT)
  		vty_out(vty, " refresh timer %d\n", ospf->lsa_refresh_interval);
-@@ -13848,6 +14026,7 @@ void ospf_vty_clear_init(void)
+@@ -13848,6 +14003,7 @@ void ospf_vty_clear_init(void)
  {
  	install_element(ENABLE_NODE, &clear_ip_ospf_interface_cmd);
  	install_element(ENABLE_NODE, &clear_ip_ospf_process_cmd);
@@ -354,7 +330,7 @@ index 42f577e921..eabfd4ce36 100644
  	install_element(ENABLE_NODE, &clear_ip_ospf_neighbor_cmd);
  }
  
-@@ -13966,6 +14145,8 @@ void ospf_vty_init(void)
+@@ -13966,6 +14122,8 @@ void ospf_vty_init(void)
  	install_element(OSPF_NODE, &ospf_max_metric_router_lsa_startup_cmd);
  	install_element(OSPF_NODE, &no_ospf_max_metric_router_lsa_startup_cmd);
  	install_element(OSPF_NODE, &ospf_max_metric_router_lsa_shutdown_cmd);
@@ -364,20 +340,21 @@ index 42f577e921..eabfd4ce36 100644
  
  	/* reference bandwidth commands */
 diff --git a/ospfd/ospf_zebra.c b/ospfd/ospf_zebra.c
-index 90ee8dc85a..7cf464a2e7 100644
+index 90ee8dc85a..87cea12fc9 100644
 --- a/ospfd/ospf_zebra.c
 +++ b/ospfd/ospf_zebra.c
-@@ -1391,7 +1391,7 @@ static int ospf_zebra_read_route(ZAPI_CALLBACK_ARGS)
+@@ -1390,8 +1390,7 @@ static int ospf_zebra_read_route(ZAPI_CALLBACK_ARGS)
+ 			/* Nothing has changed, so nothing to do; return */
  			return 0;
  		}
- 		if (ospf->router_id.s_addr != INADDR_ANY &&
+-		if (ospf->router_id.s_addr != INADDR_ANY &&
 -		    !CHECK_FLAG(ospf->config, OSPF_SHUTDOWN)) {
-+		    !ospf_is_down(ospf)) {
++		if (ospf->router_id.s_addr != INADDR_ANY && !ospf_is_down(ospf)) {
  			if (is_default_prefix4(&p)) {
  				if (ei)
  					ei->default_always = false;
 diff --git a/ospfd/ospfd.c b/ospfd/ospfd.c
-index bb51796abe..5f1d07c375 100644
+index bb51796abe..e7874cf978 100644
 --- a/ospfd/ospfd.c
 +++ b/ospfd/ospfd.c
 @@ -375,6 +375,11 @@ struct ospf *ospf_new_alloc(unsigned short instance, const char *name)
@@ -402,18 +379,19 @@ index bb51796abe..5f1d07c375 100644
  	event_cancel(&ospf->t_abr_task);
  	event_cancel(&ospf->t_abr_fr);
  	event_cancel(&ospf->t_asbr_check);
-@@ -2406,7 +2414,9 @@ const char *ospf_get_name(const struct ospf *ospf)
+@@ -2406,7 +2414,10 @@ const char *ospf_get_name(const struct ospf *ospf)
  		return VRF_DEFAULT_NAME;
  }
  
 -void ospf_shutdown(struct ospf *ospf, bool shutdown)
 +/* Take the instance down: all interfaces (and so all adjacencies) and the
-+ * link-state databases. */
++ * link-state databases.
++ */
 +static void ospf_instance_down(struct ospf *ospf)
  {
  	struct ospf_interface *oi;
  	struct route_node *rnode;
-@@ -2414,36 +2424,228 @@ void ospf_shutdown(struct ospf *ospf, bool shutdown)
+@@ -2414,36 +2425,225 @@ void ospf_shutdown(struct ospf *ospf, bool shutdown)
  	struct listnode *node;
  	struct ospf_lsa *lsa;
  
@@ -460,13 +438,19 @@ index bb51796abe..5f1d07c375 100644
  		SET_FLAG(ospf->config, OSPF_SHUTDOWN);
 +	else
 +		UNSET_FLAG(ospf->config, OSPF_SHUTDOWN);
++
++	/* max-lsa may hold the instance down already, or still. */
++	if (ospf_is_down(ospf) == was_down)
++		return;
  
 -		/* Shutdown all interfaces */
 -		for (ALL_LIST_ELEMENTS_RO(ospf->oiflist, node, oi))
 -			ospf_if_down(oi);
-+	/* max-lsa may hold the instance down already, or still. */
-+	if (ospf_is_down(ospf) == was_down)
-+		return;
++	if (shutdown)
++		ospf_instance_down(ospf);
++	else
++		ospf_instance_up(ospf);
++}
  
 -		/* Clear all link state databases */
 -		for (ALL_LIST_ELEMENTS_RO(ospf->areas, node, area)) {
@@ -477,22 +461,16 @@ index bb51796abe..5f1d07c375 100644
 -			ospf_discard_from_db(ospf, ospf->lsdb, lsa);
 -		LSDB_LOOP (EXTERNAL_LSDB(ospf), rnode, lsa)
 -			ospf_discard_from_db(ospf, ospf->lsdb, lsa);
-+	if (shutdown)
-+		ospf_instance_down(ospf);
-+	else
-+		ospf_instance_up(ospf);
-+}
-+
 +/* max-lsa */
-+
+ 
+-		ospf_lsdb_delete_all(ospf->lsdb);
 +static void ospf_max_lsa_reset_timer(struct event *t)
 +{
 +	struct ospf *ospf = EVENT_ARG(t);
 +
 +	ospf->max_lsa.ignore_entries = 0;
 +}
- 
--		ospf_lsdb_delete_all(ospf->lsdb);
++
 +static void ospf_max_lsa_ignore_end(struct event *t)
 +{
 +	struct ospf *ospf = EVENT_ARG(t);
@@ -503,8 +481,7 @@ index bb51796abe..5f1d07c375 100644
 +	m->exceeded = false;
 +	zlog_notice("OSPF[%s]: max-lsa: ignore state over, interfaces come up again (%u of %u ignore periods)",
 +		    ospf_get_name(ospf), m->ignore_entries, m->ignore_count);
-+	event_add_timer(master, ospf_max_lsa_reset_timer, ospf, m->reset_time,
-+			&m->t_reset);
++	event_add_timer(master, ospf_max_lsa_reset_timer, ospf, m->reset_time, &m->t_reset);
 +	if (!ospf_is_down(ospf))
 +		ospf_instance_up(ospf);
 +}
@@ -517,23 +494,23 @@ index bb51796abe..5f1d07c375 100644
 +	if (m->ignore_entries >= m->ignore_count) {
 +		m->state = OSPF_MAX_LSA_ISOLATED;
 +		zlog_warn("OSPF[%s]: max-lsa: %lu LSAs of other routers, above the limit of %u: down after %u ignore periods, until \"clear ip ospf max-lsa\"",
-+			  ospf_get_name(ospf), count, m->limit,
-+			  m->ignore_count);
++			  ospf_get_name(ospf), count, m->limit, m->ignore_count);
  	} else {
 -		UNSET_FLAG(ospf->config, OSPF_SHUTDOWN);
 +		m->ignore_entries++;
 +		m->state = OSPF_MAX_LSA_IGNORE;
-+		event_add_timer(master, ospf_max_lsa_ignore_end, ospf,
-+				m->ignore_time, &m->t_ignore);
++		event_add_timer(master, ospf_max_lsa_ignore_end, ospf, m->ignore_time,
++				&m->t_ignore);
 +		zlog_warn("OSPF[%s]: max-lsa: %lu LSAs of other routers, above the limit of %u: down for %u s (ignore period %u of %u)",
-+			  ospf_get_name(ospf), count, m->limit, m->ignore_time,
-+			  m->ignore_entries, m->ignore_count);
++			  ospf_get_name(ospf), count, m->limit, m->ignore_time, m->ignore_entries,
++			  m->ignore_count);
 +	}
 +	ospf_instance_down(ospf);
 +}
 +
 +/* The LSAs of other routers in all the databases of the instance:
-+ * O(areas), run at most once per event loop pass. */
++ * O(areas), run at most once per event loop pass.
++ */
 +unsigned long ospf_max_lsa_count(struct ospf *ospf)
 +{
 +	struct ospf_area *area;
@@ -580,20 +557,19 @@ index bb51796abe..5f1d07c375 100644
 +	if (count >= warn) {
 +		if (!m->warned)
 +			zlog_warn("OSPF[%s]: max-lsa: %lu LSAs of other routers, %u%% of the limit of %u reached",
-+				  ospf_get_name(ospf), count, m->threshold,
-+				  m->limit);
++				  ospf_get_name(ospf), count, m->threshold, m->limit);
 +		m->warned = true;
 +	} else
 +		m->warned = false;
 +}
 +
 +/* Called for each LSA of another router added to a database: one check
-+ * after the packet that brought it (the event runs once per pass). */
++ * after the packet that brought it (the event runs once per pass).
++ */
 +void ospf_max_lsa_check_schedule(struct ospf *ospf)
 +{
 +	if (ospf->max_lsa.limit)
-+		event_add_event(master, ospf_max_lsa_check, ospf, 0,
-+				&ospf->max_lsa.t_check);
++		event_add_event(master, ospf_max_lsa_check, ospf, 0, &ospf->max_lsa.t_check);
 +}
 +
 +/* Leave the ignore or isolated state now and forget the ignore periods. */
@@ -616,9 +592,8 @@ index bb51796abe..5f1d07c375 100644
 +	ospf_max_lsa_check_schedule(ospf);
 +}
 +
-+void ospf_max_lsa_set(struct ospf *ospf, uint32_t limit, uint8_t threshold,
-+		      bool warning_only, uint32_t ignore_time,
-+		      uint32_t ignore_count, uint32_t reset_time)
++void ospf_max_lsa_set(struct ospf *ospf, uint32_t limit, uint8_t threshold, bool warning_only,
++		      uint32_t ignore_time, uint32_t ignore_count, uint32_t reset_time)
 +{
 +	struct ospf_max_lsa *m = &ospf->max_lsa;
  
@@ -662,7 +637,7 @@ index bb51796abe..5f1d07c375 100644
 +	return "normal";
  }
 diff --git a/ospfd/ospfd.h b/ospfd/ospfd.h
-index 5e739f5938..a305c0aab8 100644
+index 5e739f5938..a934f74611 100644
 --- a/ospfd/ospfd.h
 +++ b/ospfd/ospfd.h
 @@ -135,6 +135,45 @@ enum {
@@ -721,7 +696,7 @@ index 5e739f5938..a305c0aab8 100644
  #define OSPF_PROACTIVE_ARP_DEFAULT true
  
  	/* Redistributed external information. */
-@@ -833,4 +875,21 @@ extern int q_spaces_compare_func(const struct q_space *a,
+@@ -833,4 +875,19 @@ extern int q_spaces_compare_func(const struct q_space *a,
  
  extern void ospf_shutdown(struct ospf *ospf, bool shutdown);
  
@@ -734,13 +709,11 @@ index 5e739f5938..a305c0aab8 100644
 +
 +extern unsigned long ospf_max_lsa_count(struct ospf *ospf);
 +extern void ospf_max_lsa_check_schedule(struct ospf *ospf);
-+extern void ospf_max_lsa_set(struct ospf *ospf, uint32_t limit,
-+			     uint8_t threshold, bool warning_only,
-+			     uint32_t ignore_time, uint32_t ignore_count,
++extern void ospf_max_lsa_set(struct ospf *ospf, uint32_t limit, uint8_t threshold,
++			     bool warning_only, uint32_t ignore_time, uint32_t ignore_count,
 +			     uint32_t reset_time);
 +extern void ospf_max_lsa_clear(struct ospf *ospf);
-+extern const char *ospf_max_lsa_state_str(struct ospf *ospf,
-+					  unsigned long count);
++extern const char *ospf_max_lsa_state_str(struct ospf *ospf, unsigned long count);
 +
  #endif /* _ZEBRA_OSPFD_H */
 -- 

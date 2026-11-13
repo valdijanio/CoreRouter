@@ -1,0 +1,384 @@
+From 7ba2dfab1dceed2b70c87ce8c092d7d965cb5234 Mon Sep 17 00:00:00 2001
+From: CoreRouter <noreply@corerouter>
+Date: Fri, 13 Nov 2026 14:14:48 -0300
+Subject: [PATCH 2/2] tests: ospfd max-lsa
+
+A neighbor redistributes 120 statics against max-lsa 100: ignore, the
+adjacency and the learned LSAs gone, back after ignore-time, isolated
+after ignore-count, clear ip ospf max-lsa, warning-only, threshold and
+no max-lsa.
+---
+ tests/topotests/ospf_max_lsa/__init__.py      |   0
+ tests/topotests/ospf_max_lsa/r1/frr.conf      |  15 ++
+ tests/topotests/ospf_max_lsa/r2/frr.conf      | 135 +++++++++++++
+ .../ospf_max_lsa/test_ospf_max_lsa.py         | 190 ++++++++++++++++++
+ 4 files changed, 340 insertions(+)
+ create mode 100644 tests/topotests/ospf_max_lsa/__init__.py
+ create mode 100644 tests/topotests/ospf_max_lsa/r1/frr.conf
+ create mode 100644 tests/topotests/ospf_max_lsa/r2/frr.conf
+ create mode 100644 tests/topotests/ospf_max_lsa/test_ospf_max_lsa.py
+
+diff --git a/tests/topotests/ospf_max_lsa/__init__.py b/tests/topotests/ospf_max_lsa/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/topotests/ospf_max_lsa/r1/frr.conf b/tests/topotests/ospf_max_lsa/r1/frr.conf
+new file mode 100644
+index 0000000000..0933526660
+--- /dev/null
++++ b/tests/topotests/ospf_max_lsa/r1/frr.conf
+@@ -0,0 +1,15 @@
++interface r1-eth0
++ ip address 192.168.1.1/24
++ ip ospf area 0
++ ip ospf hello-interval 1
++ ip ospf dead-interval 4
++exit
++!
++interface lo
++ ip address 10.254.254.1/32
++exit
++!
++router ospf
++ ospf router-id 10.254.254.1
++ max-lsa 100 ignore-time 30 ignore-count 1
++exit
+diff --git a/tests/topotests/ospf_max_lsa/r2/frr.conf b/tests/topotests/ospf_max_lsa/r2/frr.conf
+new file mode 100644
+index 0000000000..125ddead6d
+--- /dev/null
++++ b/tests/topotests/ospf_max_lsa/r2/frr.conf
+@@ -0,0 +1,135 @@
++interface r2-eth0
++ ip address 192.168.1.2/24
++ ip ospf area 0
++ ip ospf hello-interval 1
++ ip ospf dead-interval 4
++exit
++!
++interface lo
++ ip address 10.254.254.2/32
++exit
++!
++ip route 10.100.0.0/24 Null0
++ip route 10.100.1.0/24 Null0
++ip route 10.100.2.0/24 Null0
++ip route 10.100.3.0/24 Null0
++ip route 10.100.4.0/24 Null0
++ip route 10.100.5.0/24 Null0
++ip route 10.100.6.0/24 Null0
++ip route 10.100.7.0/24 Null0
++ip route 10.100.8.0/24 Null0
++ip route 10.100.9.0/24 Null0
++ip route 10.100.10.0/24 Null0
++ip route 10.100.11.0/24 Null0
++ip route 10.100.12.0/24 Null0
++ip route 10.100.13.0/24 Null0
++ip route 10.100.14.0/24 Null0
++ip route 10.100.15.0/24 Null0
++ip route 10.100.16.0/24 Null0
++ip route 10.100.17.0/24 Null0
++ip route 10.100.18.0/24 Null0
++ip route 10.100.19.0/24 Null0
++ip route 10.100.20.0/24 Null0
++ip route 10.100.21.0/24 Null0
++ip route 10.100.22.0/24 Null0
++ip route 10.100.23.0/24 Null0
++ip route 10.100.24.0/24 Null0
++ip route 10.100.25.0/24 Null0
++ip route 10.100.26.0/24 Null0
++ip route 10.100.27.0/24 Null0
++ip route 10.100.28.0/24 Null0
++ip route 10.100.29.0/24 Null0
++ip route 10.100.30.0/24 Null0
++ip route 10.100.31.0/24 Null0
++ip route 10.100.32.0/24 Null0
++ip route 10.100.33.0/24 Null0
++ip route 10.100.34.0/24 Null0
++ip route 10.100.35.0/24 Null0
++ip route 10.100.36.0/24 Null0
++ip route 10.100.37.0/24 Null0
++ip route 10.100.38.0/24 Null0
++ip route 10.100.39.0/24 Null0
++ip route 10.100.40.0/24 Null0
++ip route 10.100.41.0/24 Null0
++ip route 10.100.42.0/24 Null0
++ip route 10.100.43.0/24 Null0
++ip route 10.100.44.0/24 Null0
++ip route 10.100.45.0/24 Null0
++ip route 10.100.46.0/24 Null0
++ip route 10.100.47.0/24 Null0
++ip route 10.100.48.0/24 Null0
++ip route 10.100.49.0/24 Null0
++ip route 10.100.50.0/24 Null0
++ip route 10.100.51.0/24 Null0
++ip route 10.100.52.0/24 Null0
++ip route 10.100.53.0/24 Null0
++ip route 10.100.54.0/24 Null0
++ip route 10.100.55.0/24 Null0
++ip route 10.100.56.0/24 Null0
++ip route 10.100.57.0/24 Null0
++ip route 10.100.58.0/24 Null0
++ip route 10.100.59.0/24 Null0
++ip route 10.100.60.0/24 Null0
++ip route 10.100.61.0/24 Null0
++ip route 10.100.62.0/24 Null0
++ip route 10.100.63.0/24 Null0
++ip route 10.100.64.0/24 Null0
++ip route 10.100.65.0/24 Null0
++ip route 10.100.66.0/24 Null0
++ip route 10.100.67.0/24 Null0
++ip route 10.100.68.0/24 Null0
++ip route 10.100.69.0/24 Null0
++ip route 10.100.70.0/24 Null0
++ip route 10.100.71.0/24 Null0
++ip route 10.100.72.0/24 Null0
++ip route 10.100.73.0/24 Null0
++ip route 10.100.74.0/24 Null0
++ip route 10.100.75.0/24 Null0
++ip route 10.100.76.0/24 Null0
++ip route 10.100.77.0/24 Null0
++ip route 10.100.78.0/24 Null0
++ip route 10.100.79.0/24 Null0
++ip route 10.100.80.0/24 Null0
++ip route 10.100.81.0/24 Null0
++ip route 10.100.82.0/24 Null0
++ip route 10.100.83.0/24 Null0
++ip route 10.100.84.0/24 Null0
++ip route 10.100.85.0/24 Null0
++ip route 10.100.86.0/24 Null0
++ip route 10.100.87.0/24 Null0
++ip route 10.100.88.0/24 Null0
++ip route 10.100.89.0/24 Null0
++ip route 10.100.90.0/24 Null0
++ip route 10.100.91.0/24 Null0
++ip route 10.100.92.0/24 Null0
++ip route 10.100.93.0/24 Null0
++ip route 10.100.94.0/24 Null0
++ip route 10.100.95.0/24 Null0
++ip route 10.100.96.0/24 Null0
++ip route 10.100.97.0/24 Null0
++ip route 10.100.98.0/24 Null0
++ip route 10.100.99.0/24 Null0
++ip route 10.100.100.0/24 Null0
++ip route 10.100.101.0/24 Null0
++ip route 10.100.102.0/24 Null0
++ip route 10.100.103.0/24 Null0
++ip route 10.100.104.0/24 Null0
++ip route 10.100.105.0/24 Null0
++ip route 10.100.106.0/24 Null0
++ip route 10.100.107.0/24 Null0
++ip route 10.100.108.0/24 Null0
++ip route 10.100.109.0/24 Null0
++ip route 10.100.110.0/24 Null0
++ip route 10.100.111.0/24 Null0
++ip route 10.100.112.0/24 Null0
++ip route 10.100.113.0/24 Null0
++ip route 10.100.114.0/24 Null0
++ip route 10.100.115.0/24 Null0
++ip route 10.100.116.0/24 Null0
++ip route 10.100.117.0/24 Null0
++ip route 10.100.118.0/24 Null0
++ip route 10.100.119.0/24 Null0
++!
++router ospf
++ ospf router-id 10.254.254.2
++exit
+diff --git a/tests/topotests/ospf_max_lsa/test_ospf_max_lsa.py b/tests/topotests/ospf_max_lsa/test_ospf_max_lsa.py
+new file mode 100644
+index 0000000000..8f9d559926
+--- /dev/null
++++ b/tests/topotests/ospf_max_lsa/test_ospf_max_lsa.py
+@@ -0,0 +1,190 @@
++#!/usr/bin/env python
++# SPDX-License-Identifier: ISC
++
++#
++# test_ospf_max_lsa.py
++# Part of NetDEF Topology Tests
++#
++
++"""
++test_ospf_max_lsa.py: the max-lsa limit on the LSAs of other routers.
++
++r2 redistributes 120 static routes into OSPF; r1 has "max-lsa 100
++ignore-time 30 ignore-count 1". r1 goes down (ignore) at the limit,
++comes back after the ignore time, goes down again and stays down
++(isolated) until "clear ip ospf max-lsa". With warning-only it only
++reports the limit, and "no max-lsa" removes it.
++"""
++
++import os
++import sys
++from functools import partial
++import pytest
++
++CWD = os.path.dirname(os.path.realpath(__file__))
++sys.path.append(os.path.join(CWD, "../"))
++
++# pylint: disable=C0413
++from lib import topotest
++from lib.topogen import Topogen, get_topogen
++
++pytestmark = [pytest.mark.ospfd]
++
++
++def setup_module(mod):
++    tgen = Topogen({"s1": ("r1", "r2")}, mod.__name__)
++    tgen.start_topology()
++    for router in tgen.routers().values():
++        router.load_frr_config()
++    tgen.start_router()
++
++
++def teardown_module():
++    get_topogen().stop_topology()
++
++
++def expect_json(router, cmd, expected, count=60):
++    tgen = get_topogen()
++    test_func = partial(topotest.router_json_cmp, tgen.gears[router], cmd, expected)
++    _, result = topotest.run_and_expect(test_func, None, count=count, wait=1)
++    assert result is None, f"{router}: '{cmd}' is not {expected}: {result}"
++
++
++def expect_max_lsa(state, count=60, **more):
++    expected = {"maxLsa": {"limit": 100, "state": state}}
++    expected["maxLsa"].update(more)
++    expect_json("r1", "show ip ospf json", expected, count)
++
++
++def expect_full():
++    expect_json(
++        "r1",
++        "show ip ospf neighbor json",
++        {"neighbors": {"10.254.254.2": [{"nbrState": "Full/-"}]}},
++    )
++
++
++def redistribute(on):
++    get_topogen().gears["r2"].vtysh_cmd(f"""
++        configure terminal
++        router ospf
++         {"" if on else "no "}redistribute static
++        """)
++
++
++def test_ospf_convergence():
++    tgen = get_topogen()
++    if tgen.routers_have_failure():
++        pytest.skip(tgen.errors)
++    tgen.gears["r1"].expect_ospfv2_neighbor("10.254.254.2")
++    expect_max_lsa("normal", ignoreEntries=0, threshold=75, warningOnly=False)
++    output = tgen.gears["r1"].vtysh_cmd("show running-config")
++    assert "max-lsa 100 ignore-time 30 ignore-count 1" in output
++
++
++def test_ospf_max_lsa_ignore():
++    tgen = get_topogen()
++    if tgen.routers_have_failure():
++        pytest.skip(tgen.errors)
++
++    # 120 type-5 LSAs from r2: r1 goes down, its database empties.
++    redistribute(True)
++    expect_max_lsa("ignore", ignoreEntries=1)
++    expect_json(
++        "r1",
++        "show ip ospf neighbor json",
++        {"neighbors": {"10.254.254.2": None}},
++    )
++    expect_json("r1", "show ip ospf json", {"lsaOtherRoutersCounter": 0})
++    # The configuration does not change: no "shutdown".
++    output = tgen.gears["r1"].vtysh_cmd("show running-config")
++    assert "shutdown" not in output
++
++
++def test_ospf_max_lsa_isolated():
++    tgen = get_topogen()
++    if tgen.routers_have_failure():
++        pytest.skip(tgen.errors)
++
++    # After the 30 s of ignore-time r1 comes back, gets the same LSAs and,
++    # with ignore-count 1, stays down.
++    expect_max_lsa("isolated", count=90, ignoreEntries=1)
++    expect_json(
++        "r1",
++        "show ip ospf neighbor json",
++        {"neighbors": {"10.254.254.2": None}},
++    )
++
++
++def test_ospf_max_lsa_clear():
++    tgen = get_topogen()
++    if tgen.routers_have_failure():
++        pytest.skip(tgen.errors)
++
++    redistribute(False)
++    tgen.gears["r1"].vtysh_cmd("clear ip ospf max-lsa")
++    expect_max_lsa("normal", ignoreEntries=0)
++    expect_full()
++
++
++def test_ospf_max_lsa_warning_only():
++    tgen = get_topogen()
++    if tgen.routers_have_failure():
++        pytest.skip(tgen.errors)
++
++    tgen.gears["r1"].vtysh_cmd("""
++        configure terminal
++        router ospf
++         max-lsa 100 warning-only
++        """)
++    redistribute(True)
++    expect_max_lsa("exceeded", warningOnly=True)
++    expect_full()
++
++
++def test_ospf_max_lsa_threshold():
++    tgen = get_topogen()
++    if tgen.routers_have_failure():
++        pytest.skip(tgen.errors)
++
++    # 120 of 200 is past 50 %.
++    tgen.gears["r1"].vtysh_cmd("""
++        configure terminal
++        router ospf
++         max-lsa 200 threshold 50
++        """)
++    expect_json(
++        "r1",
++        "show ip ospf json",
++        {"maxLsa": {"limit": 200, "threshold": 50, "state": "warning"}},
++    )
++    expect_full()
++
++
++def test_ospf_no_max_lsa():
++    tgen = get_topogen()
++    if tgen.routers_have_failure():
++        pytest.skip(tgen.errors)
++
++    tgen.gears["r1"].vtysh_cmd("""
++        configure terminal
++        router ospf
++         no max-lsa
++        """)
++    expect_json("r1", "show ip ospf json", {"maxLsa": None})
++    output = tgen.gears["r1"].vtysh_cmd("show running-config")
++    assert "max-lsa" not in output
++    expect_full()
++
++
++def test_memory_leak():
++    "Run the memory leak test and report results."
++    tgen = get_topogen()
++    if not tgen.is_memleak_enabled():
++        pytest.skip("Memory leak test/report is disabled")
++    tgen.report_memory_leaks()
++
++
++if __name__ == "__main__":
++    args = ["-s"] + sys.argv[1:]
++    sys.exit(pytest.main(args))
+-- 
+2.43.0
+

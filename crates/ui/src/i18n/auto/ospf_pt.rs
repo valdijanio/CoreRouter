@@ -224,7 +224,7 @@ Uma instância OSPF (`/routing ospf instance`). A prévia mostra em quais interf
 Tira a instância selecionada do estado `ignore` ou `isolated` da proteção da LSDB agora e zera os períodos: as adjacências sobem de novo (`routing.ospf.instance.clear-lsdb-protection`, como o `clear ospf database-protection` do Junos). Só ativo enquanto a proteção segura a instância.
 
 ## Antes
-Ache quem injeta as LSAs (aba LSDB, agrupada por Adv. Router) e corrija a redistribuição dele; senão a instância cai de novo assim que a base passar do limite."##),
+Ache quem injeta as LSAs (coluna Originator da aba LSDB, num vizinho: aqui a base está vazia enquanto a instância está fora) e corrija a redistribuição dele; senão a instância cai de novo assim que a base passar do limite."##),
     (r##"ospf.instance.drain"##, r##"## O que é
 Liga (Drenar) ou desliga (Desfazer drenagem) o stub router da instância selecionada: `routing.ospf.instance.set {stub_router}`. Drenado, todo enlace de trânsito da router-LSA vai a custo 65535 e o tráfego contorna este roteador; as redes dele continuam alcançáveis (RFC 6987).
 

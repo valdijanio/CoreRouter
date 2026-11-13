@@ -49,7 +49,7 @@ An OSPF instance (RouterOS `/routing ospf instance`). The preview shows the inte
 Takes the selected instance out of the LSDB protection's `ignore` or `isolated` state now and resets the periods: the adjacencies come up again (`routing.ospf.instance.clear-lsdb-protection`, as Junos `clear ospf database-protection`). Active only while the protection holds the instance down.
 
 ## Before
-Find who injects the LSAs (the LSDB tab, grouped by Adv. Router) and fix its redistribution; otherwise the instance goes down again as soon as the database passes the limit."##),
+Find who injects the LSAs (the Originator column of the LSDB tab, on a neighbor: here the database is empty while the instance is down) and fix its redistribution; otherwise the instance goes down again as soon as the database passes the limit."##),
     (r##"ospf.instance.drain"##, r##"## What it is
 Turns the selected instance's stub router on (Drain) or off (Undrain): `routing.ospf.instance.set {stub_router}`. Drained, every transit link of the router-LSA goes to cost 65535 and traffic goes around this router; its own networks stay reachable (RFC 6987).
 

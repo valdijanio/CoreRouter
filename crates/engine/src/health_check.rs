@@ -1160,7 +1160,7 @@ fn ospf_lsdb(i: &Inputs, out: &mut Vec<Check>) {
         out.push(Check { key, name, severity: Severity::Ok, value: None, reason: "nenhuma instância OSPF rodando".into(), action: None });
         return;
     }
-    let find = "Ache quem injeta: Routing › OSPF › LSDB agrupada por Adv. Router (ou routing.ospf.lsdb.print), corrija a redistribuição dele";
+    let find = "Ache quem injeta: a coluna Originator de Routing › OSPF › LSDB (routing.ospf.lsa.list), aqui fora do ignore ou num vizinho, e corrija a redistribuição dele";
     // The worst instance speaks; the rest are counted.
     let mut worst: Option<Check> = None;
     let mut keep = |c: Check| {

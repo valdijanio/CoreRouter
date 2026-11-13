@@ -237,15 +237,21 @@ fn lsdb_checks(
     let others = now.and_then(|st| st.lsas_other);
     if let Some(m) = &i.max_lsa {
         computed.push(json!({"label": "LSDB protection", "value": if m.warning_only {
-            format!("warns at {} and past {} LSAs of other routers; never goes down (warning-only)", m.warn_at(), m.limit)
+            format!("warns at {} and past {} LSAs; never goes down", m.warn_at(), m.limit)
         } else {
-            format!("warns at {} LSAs of other routers; past {} the instance goes down for {} s (every adjacency); isolated after {} such periods until cleared", m.warn_at(), m.limit, m.ignore_time, m.ignore_count)
+            format!("warns at {}; past {} down {} s, isolated after {}", m.warn_at(), m.limit, m.ignore_time, m.ignore_count)
         }}));
-        computed.push(json!({"label": "Memory at the limit", "value": format!("~{} MiB in ospfd + zebra (estimated, 2.1 KiB per LSA)", mib(u64::from(m.limit)))}));
+        computed.push(json!({"label": "Memory at the limit", "value": format!("~{} MiB in ospfd + zebra (estimated)", mib(u64::from(m.limit)))}));
+        let down = now.and_then(|st| st.max_lsa.as_ref()).filter(|p| p.down());
+        if let Some(p) = down {
+            let left = p.ignore_remaining_secs.map(|t| format!(", back in {t} s")).unwrap_or_default();
+            checks.push(check("warning", "max-lsa", format!("the instance is down by its LSDB protection ({}{left}): editing does not bring it back; Clear LSDB Protection does, once the flood is fixed", p.state), "max_lsa"));
+        }
         if now.is_some_and(|st| st.lsas.is_some() && st.lsas_other.is_none()) {
             checks.push(check("warning", "ospfd", "this ospfd has no max-lsa (FRR without the CoreRouter patch, os/patches/frr): the commit will be refused".into(), "max_lsa"));
         }
-        if let Some(n) = others {
+        // Down, the database is empty: its count says nothing.
+        if let Some(n) = others.filter(|_| down.is_none()) {
             let limit = u64::from(m.limit);
             if n > limit && !m.warning_only {
                 *risk = Some(format!("the limit {limit} is below the {n} LSAs of other routers now: the instance goes down (every adjacency) as soon as the commit applies, for {} s at a time. Use Safe Mode to roll back on its own if this cuts the session", m.ignore_time));
@@ -486,5 +492,8 @@ mod tests {
         assert_eq!(l[0]["lsdb"]["protection"]["state"], "ignore", "{l}");
         assert_eq!(l[0]["lsdb"]["protection"]["remaining_secs"], 280, "{l}");
         assert_eq!(l[0]["lsdb"]["source"], "frr", "{l}");
+        // Editing it while it is down says what brings it back.
+        let c = s.execute("routing.ospf.instance.check", &json!({"id": "v2", "max_lsa": "60000"})).unwrap();
+        assert!(c.to_string().contains("(ignore, back in 280 s): editing does not bring it back"), "{c}");
     }
 }
