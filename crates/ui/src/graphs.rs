@@ -1263,6 +1263,14 @@ pub(crate) fn rate(v: f64, unit: &str) -> String {
     if unit == "B" {
         return bytes(v);
     }
+    // A time: `0.25 ms`, `850 ms`, `1.60 s` (never `1.6 kms`).
+    if unit == "ms" {
+        return match v.abs() {
+            a if a >= 1000.0 => format!("{:.2} s", v / 1000.0),
+            a if a >= 10.0 || a == 0.0 => format!("{v:.0} ms"),
+            _ => format!("{v:.2} ms"),
+        };
+    }
     // A count: `227.9 k`, not `227.9 kentries`.
     let unit = if unit == "entries" { "" } else { unit };
     let a = v.abs();
