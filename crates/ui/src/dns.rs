@@ -669,6 +669,7 @@ impl DnsPanel {
                 ("Static", WIN_STATIC),
                 ("Cache", WIN_CACHE),
                 ("Statistics", crate::dns_statistics::WIN),
+                ("Query Log", crate::dns_query_log::WIN),
             ] {
                 if ui.button(label).clicked() {
                     open_window(app, win);

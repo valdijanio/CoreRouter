@@ -920,7 +920,7 @@ mod tests {
         for s in crate::server::stages() {
             let c = category(s.name, None);
             assert!(
-                s.name == "statistics" || CATEGORIES.contains(&c),
+                matches!(s.name, "statistics" | "querylog") || CATEGORIES.contains(&c),
                 "stage {} has no category",
                 s.name
             );

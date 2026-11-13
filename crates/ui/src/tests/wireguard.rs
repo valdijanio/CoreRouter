@@ -320,3 +320,30 @@ fn every_label_explains_itself_in_both_languages() {
         }
     }
 }
+
+/// G1.31c: the VRF of the encrypted packets, picked in the modal and shown
+/// as a chip in the table.
+#[test]
+fn the_interface_modal_picks_the_vrf_of_the_encrypted_packets() {
+    let mut s = lab();
+    s.execute("ip.vrf.add", &json!({"name": "wan2", "interfaces": "ether2"})).unwrap();
+    s.execute("ip.address.add", &json!({"address": "198.51.100.2/24", "interface": "ether2"})).unwrap();
+    s.execute("ip.route.add", &json!({"dst_address": "0.0.0.0/0", "gateway": "198.51.100.1", "routing_table": "wan2"})).unwrap();
+    let mut h = open(s);
+    assert!(h.has_text("VRF") && h.has_text("main"));
+    on_panel(&mut h, |p, app, ui| p.act_for_test(app, Act::Add, ui, false));
+    settle(&mut h);
+    let m = panel(&mut h).if_modal.as_mut().unwrap();
+    m.values.insert("name", "wg9".into());
+    m.values.insert("vrf", "wan2".into());
+    settle(&mut h);
+    assert!(shows(&h, "the encrypted packets go by VRF wan2"), "the preview says what it costs");
+    assert!(shows(&h, "lets UDP 13233 in from ether2"), "the firewall check looks in the VRF");
+    h.click(h.text("OK"));
+    settle(&mut h);
+    let l = lock(&h.session).execute("interface.wireguard.list", &json!({})).unwrap();
+    let wg9 = l.as_array().unwrap().iter().find(|r| r["name"] == "wg9").cloned();
+    assert_eq!(wg9.map(|r| r["vrf"].clone()), Some(json!("wan2")), "{:?}", h.app.log());
+    refresh(&mut h);
+    assert!(h.has_text("wan2"));
+}

@@ -5,6 +5,7 @@
 //! the logger).
 
 mod cgnat_export;
+mod dns_log_export;
 mod dns_lookup;
 mod ppp_export;
 mod submenu_print;
