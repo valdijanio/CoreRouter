@@ -275,6 +275,26 @@ contínuo; **a observar nas 12 h da fase C** (uma reta de 2,7 MiB/h daria ~32 Mi
 a mais são workers criados num pico de misses: com carga contínua cada um é acordado antes de 10 s
 ocioso e não termina; o teto é `max_concurrent_queries`.
 
+## Defeitos e limites achados
+
+| Achado (**medido**) | Estado |
+|---|---|
+| Uma thread criada e destruída por miss: ~210 µs de CPU por miss, 12,2 mil misses/s em 4 vCPUs | **corrigido** (workers reaproveitados): 47,3 mil/s |
+| Consultas iguais fora do cache: uma consulta à origem por resposta (G4.1o) | **corrigido**: 0,02 |
+| `ip.dns.cache.flush` com 1 M de entradas parava toda consulta por ~0,5 s | **corrigido**: p99,9 ao lado 21 ms |
+| DoH contra servidor que só fala HTTP/2 (Unbound): 0 % respondido | **corrigido** (G4.1s): 100 %, p99 0,7 ms a 5000/s |
+| UPDATE e DHCP com nome reconstroem todas as zonas: 6 UPDATEs/s, ~170 concessões/s, consultas à zona com p50 ~90 ms | gap G4.1p (com o perfil) e G4.1q |
+| Misses limitados a `max_concurrent_queries` / RTT; com 1000, mil threads | gap G4.1t |
+| 30 % de perda: 24 % respondidas; troca de servidor custa 2 s por nome novo | gap G4.1u |
+| Serve-stale só em 4,1 s (a RFC 8767 sugere 1,8 s) | gap G4.1v |
+| Slowloris de 4 endereços derruba o TCP (0–1 de 108); 16 conexões de um endereço perdem 54 % | gap G4.1w |
+| Nomes únicos despejam os quentes: até 25 mil SERVFAIL em 15 s para o cliente legítimo | gap G4.1x |
+| `cache.print name=…` com 1 M de entradas para as consultas por 160 ms | gap G4.1y |
+| A adlist de 1 M custa 14 % no acerto de cache | gap G4.1z |
+| O cache padrão de 2 MiB guarda 3 192 respostas | o padrão do RouterOS; vale dizer no ⓘ do `cache_size` |
+| RSS +2,7 MiB/h com o cache cheio (2 h na VM) | a observar nas 12 h da fase C |
+| Defeitos do próprio roteiro achados no caminho: `kdig` com opções do `dig`, Unbound barrado pelo AppArmor fora de `/etc/unbound`, teto de 50 000 registros no total das zonas, `$EPOCHREALTIME` com vírgula em pt_BR | corrigidos no roteiro |
+
 ## Fase C: o notebook
 
 O roteiro já roda contra um roteador remoto (`--dut remote`); quem o roda é a sessão principal,
