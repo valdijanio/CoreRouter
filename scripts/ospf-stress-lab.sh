@@ -1350,6 +1350,27 @@ test_ops() {
 	ok routing.ospf.interface-template.set "{\"id\":\"$TEMPLATE_ID\",\"cost\":null}" >/dev/null
 	sleep 3
 
+	# a2) A second address on the OSPF port, outside the template's
+	# networks (a management address): OSPF must not run on it (it ran
+	# there and the adjacency flapped, G3.4m), and nothing drops.
+	csv=$OUT/ops-second-address.csv
+	sampler_start "$csv"
+	t0=$(now)
+	ok ip.address.add "{\"address\":\"10.98.0.1/24\",\"interface\":\"$DUT_IFACE\"}" >/dev/null
+	t_cmd=$(since "$t0")
+	sleep 8
+	sampler_stop
+	verdict=ok
+	if [ $DUT = local ] && vty "show ip ospf interface $DUT_IFACE" | grep -q '10.98.0.1'; then
+		verdict="FAIL (OSPF runs on 10.98.0.1)"
+	fi
+	recovered_now || verdict="FAIL (not recovered)"
+	[ "$(csv_min "$csv" lsas)" -lt "$LOADED_LSAS" ] && verdict="FAIL (LSAs dropped)"
+	say "| second address on the port, outside the networks (10.98.0.1/24) | $t_cmd | - | $(csv_min "$csv" lsas) / $(csv_min "$csv" routes) | $(recovered_now && echo yes || echo NO) | $verdict |"
+	[ "$verdict" = ok ] || FAILED=1
+	addr_remove 10.98.0.1/24
+	sleep 3
+
 	# b) Safe Mode, undone by hand: the template disabled (the adjacency
 	# and all the routes go), then config.safe-mode.cancel.
 	# c) Safe Mode, undone by the connection's loss (RouterOS: the session
