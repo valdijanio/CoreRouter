@@ -36,6 +36,10 @@
 #   latency     p50/p99 of the state commands, inspect and MCP, with load
 #   convergence traffic across the DUT and a cut link: without BFD, with BFD,
 #               with BFD and TI-LFA (local only)
+#   maxlsa      G3.4r: the LSDB protection (max_lsa, --maxlsa-limit 50000)
+#               under a flood of --maxlsa-load (200000) LSAs: the instance
+#               down at the limit (peak, time), the list, the health check,
+#               ignore → isolated, the clear (local only; not in the default)
 #
 # Results: $OUT/results.md (a table per test) and $OUT/*.csv (samples);
 # exit 1 if a check failed.
@@ -69,6 +73,7 @@ TESTS=lsdb,churn,neighbors,interfaces,ops,latency,convergence
 STEPS=1000,10000,50000,100000,200000
 CHURN_RATES=1,10,100 CHURN_SECS=120 CHURN_BASE=10000
 NEIGHBORS=50,100,250 STABLE_SECS=600
+MAXLSA_LIMIT=50000 MAXLSA_LOAD=200000
 LAT_N=50
 DAEMON=image
 SELFTEST=0
@@ -95,6 +100,8 @@ while [ $# -gt 0 ]; do
 	--selftest-remote) SELFTEST=1; shift ;;
 	--out) OUT=$2; shift 2 ;;
 	--hold) HOLD=$2; shift 2 ;;
+	--maxlsa-limit) MAXLSA_LIMIT=$2; shift 2 ;;
+	--maxlsa-load) MAXLSA_LOAD=$2; shift 2 ;;
 	--load) LOAD=$2; shift 2 ;;
 	-h | --help) usage ;;
 	*) echo "unknown option $1"; usage ;;
@@ -121,7 +128,15 @@ SRC=$(pwd)
 FAILED=0
 GEN_RID=10.0.0.11 DUT_RID=10.255.0.1
 LINK_DUT=10.0.1.1 LINK_GEN=10.0.1.2
-BIG_ROOT=192.168.0.0 CHURN_ROOT=10.200.0.0
+# What the generator advertises. Phase C (2026-11-13) used 192.168.0.0 for
+# the nodes' /32s and 100.64.0.0/28 for the externals: on the notebook they
+# covered its home network (ether1) and LAN (ether2), its replies left by
+# the lab cable and its management was cut until the test ended. Now ranges
+# no real network uses (RFC 2544 benchmarking 198.18.0.0/15, and 10.128/9
+# for the up to 200 000 /28 externals); remote_overlap_check refuses a DUT
+# with an address in them.
+BIG_ROOT=198.19.0.0 CHURN_ROOT=10.200.0.0 EXT_BASE=10.128.0.0
+GEN_RANGES="198.18.0.0/15 10.128.0.0/9 10.200.0.0/16"
 INSTANCE=stress
 TLS_PORT=8729
 
@@ -406,9 +421,14 @@ ospf_teardown() {
 	local try id err
 	for try in 1 2 3 4 5; do
 		cr routing.ospf.segment-routing.unset >/dev/null 2>&1 || true
-		for id in $(cr routing.ospf.interface-template.list 2>/dev/null | jq -r '(.rows? // .)[] | select(.area == "stress-bb") | .id'); do
+		# Ids look like `*E`: an unquoted `for id in $(…)` globs them
+		# (`*E` became `LICENSE` in the source tree, 2026-11-13, and the
+		# template stayed on the notebook), so read them line by line.
+		while read -r id; do
+			[ -n "$id" ] || continue
 			cr routing.ospf.interface-template.remove "{\"id\":\"$id\"}" >/dev/null 2>&1 || true
-		done
+		done < <(cr routing.ospf.interface-template.list 2>/dev/null |
+			jq -r '(.rows? // .)[] | select(.area == "stress-bb") | .id')
 		cr routing.ospf.area.remove '{"id":"stress-bb"}' >/dev/null 2>&1 || true
 		err=$(cr routing.ospf.instance.remove "{\"id\":\"$INSTANCE\"}" 2>&1 >/dev/null) && return 0
 		# Gone already, or refused (a template the list did not give, the
@@ -681,7 +701,7 @@ lsdb_mrt() { # <lsas> → path of the MRT file
 	ext=$((n - nodes))
 	if [ ! -s "$d/lsdb.mrt" ]; then
 		mkdir -p "$d"
-		(cd "$d" && lspgen -P ospf2 -y -c "$nodes" -e "$ext" -n "$BIG_ROOT/32" -x 100.64.0.0/28 \
+		(cd "$d" && lspgen -P ospf2 -y -c "$nodes" -e "$ext" -n "$BIG_ROOT/32" -x "$EXT_BASE/28" \
 			-C "$GEN_RID:$LINK_GEN" -m lsdb.mrt >lspgen.log 2>&1)
 	fi
 	echo "$d/lsdb.mrt"
@@ -778,6 +798,76 @@ test_lsdb() {
 		fi
 		BIGGEST=$n
 	done
+	say ""
+}
+
+# --- G3.4r: the LSDB protection. The instance has max_lsa (ignore-time
+# 30 s, ignore-count 1); the generator floods MAXLSA_LOAD externals. The
+# patched ospfd takes the instance down at the limit; it comes back after
+# 30 s, the flood comes again, and the second time it stays down
+# (isolated) until routing.ospf.instance.clear-lsdb-protection.
+# max_lsa's state as ospfd says it (local) and as the daemon lists it.
+dut_maxlsa() { vty 'show ip ospf json' | jq -r '.maxLsa.state // "none"'; }
+cr_maxlsa() { cr routing.ospf.instance.list | jq -r --arg i "$INSTANCE" '.[] | select(.name == $i) | .lsdb.protection.state // "none"'; }
+is_state() { [ "$("$2")" = "$1" ]; } # is_state <state> <fn>
+test_maxlsa() {
+	say "## 8. LSDB protection (max_lsa)"
+	say ""
+	if [ $DUT != local ]; then
+		say "skipped: local DUT only (ospfd's own counters)"; say ""; return
+	fi
+	local mrt t0 t_ignore peak_lsas=0 l peak health listed verdict=ok
+	mrt=$(lsdb_mrt "$MAXLSA_LOAD")
+	dut_fresh maxlsa
+	ok routing.ospf.instance.set "{\"id\":\"$INSTANCE\",\"max_lsa\":$MAXLSA_LIMIT,\"max_lsa_ignore_time\":30,\"max_lsa_ignore_count\":1}" >/dev/null ||
+		{ fail "maxlsa: the image refused max_lsa (an ospfd without os/patches/frr/0007?)"; return; }
+	say "running-config: \`$(vty 'show running-config' | grep 'max-lsa' | xargs)\`"
+	gen_config "$W/gen/conf.json"
+	gen_start "$W/gen/conf.json"
+	if ! wait_for "gen Full" 60 ge 1 dut_neighbors_full >/dev/null; then
+		fail "maxlsa: no adjacency"; gen_stop; return
+	fi
+	proc_peak_reset
+	t0=$(now)
+	bbl ospf-load-mrt file "$mrt" instance 1 >/dev/null
+	t_ignore=-
+	while [ "$(since "$t0")" -lt 120000 ]; do
+		l=$(dut_lsas 2>/dev/null || echo 0)
+		[ "${l:-0}" -gt "$peak_lsas" ] && peak_lsas=$l
+		if [ "$(dut_maxlsa)" = ignore ]; then t_ignore=$(since "$t0"); break; fi
+		sleep 0.05
+	done
+	peak=$(proc_peak)
+	say ""
+	say "| limit | flood (LSAs) | down after (s) | LSDB peak sampled | ospfd / zebra / daemon peak (MiB) | listed (daemon) | health ospf.lsdb | isolated after (s) | clear → Full (s) | result |"
+	say "|---|---|---|---|---|---|---|---|---|---|"
+	[ "$t_ignore" = - ] && verdict="FAIL (never went down)"
+	# The daemon reads it within its 2 s poll.
+	wait_for "listed ignore" 10 is_state ignore cr_maxlsa >/dev/null || verdict="FAIL (the list does not say ignore)"
+	listed=$(cr_maxlsa)
+	health=$(cr system.health.check | jq -r '.checks[] | select(.key == "ospf.lsdb") | .severity')
+	[ "$health" = error ] || verdict="FAIL (health ospf.lsdb $health)"
+	# Back after 30 s, flooded again: isolated.
+	local t1 t_iso t_clear
+	t1=$(now)
+	if wait_for "isolated" 150 is_state isolated dut_maxlsa >/dev/null; then t_iso=$(since "$t1"); else t_iso=-; verdict="FAIL (not isolated)"; fi
+	gen_stop
+	# The cause gone: the clear brings the adjacency back.
+	gen_config "$W/gen/conf.json"
+	gen_start "$W/gen/conf.json"
+	t1=$(now)
+	ok routing.ospf.instance.clear-lsdb-protection "{\"id\":\"$INSTANCE\"}" >/dev/null || verdict="FAIL (clear refused)"
+	if wait_for "Full after clear" 60 ge 1 dut_neighbors_full >/dev/null; then t_clear=$(since "$t1"); else t_clear=-; verdict="FAIL (no adjacency after the clear)"; fi
+	wait_for "listed normal" 10 is_state normal cr_maxlsa >/dev/null || verdict="FAIL (the list does not say normal after the clear)"
+	gen_stop
+	ok routing.ospf.instance.set "{\"id\":\"$INSTANCE\",\"max_lsa\":null}" >/dev/null || true
+	oom_seen && verdict="FAIL (OOM)"
+	local dead
+	if dead=$(procs_dead); then verdict="FAIL ($dead died)"; fi
+	[ "$verdict" = ok ] || FAILED=1
+	say "| $MAXLSA_LIMIT | $MAXLSA_LOAD | $(ms2s "$t_ignore") | $peak_lsas | ${peak// / / }| $listed | $health | $(ms2s "$t_iso") | $(ms2s "$t_clear") | $verdict |"
+	say ""
+	grep -h 'max-lsa' "$W/dut/frr-ospfd.log" 2>/dev/null | tail -n 6 | sed 's/^/    /' | tee -a "$RESULTS" >/dev/null
 	say ""
 }
 
@@ -1752,6 +1842,29 @@ if [ $DUT = remote ]; then
 		sleep 1
 	done
 fi
+# A remote DUT has real networks: the routes the generator advertises must
+# not cover any of them (a /32 beats the connected /24 and the DUT answers
+# its management by the lab cable).
+remote_overlap_check() {
+	[ $DUT = remote ] && [ $SELFTEST = 0 ] || return 0
+	local bad
+	bad=$(cr ip.address.list | jq -r '.[].address' | python3 -I -c '
+import ipaddress, sys
+gen = [ipaddress.ip_network(r) for r in sys.argv[1].split()]
+for line in sys.stdin:
+    a = line.strip()
+    if not a or ":" in a:
+        continue
+    net = ipaddress.ip_interface(a).network
+    hit = " ".join(str(g) for g in gen if net.overlaps(g))
+    if hit:
+        print(a + " overlaps " + hit)
+' "$GEN_RANGES")
+	[ -z "$bad" ] && return 0
+	fail "the DUT has addresses inside the ranges the generator advertises ($GEN_RANGES): $bad"
+	exit 1
+}
+remote_overlap_check
 dut_config
 say "# OSPF stress ($(date -u +%FT%TZ), DUT $DUT${TARGET:+ $TARGET}, daemon $DAEMON)"
 say ""
@@ -1784,6 +1897,7 @@ if has_test ops || has_test latency; then
 	gen_stop
 fi
 has_test convergence && test_convergence
+has_test maxlsa && test_maxlsa
 if [ "$HOLD" -gt 0 ] && [ "$TESTS" = none ]; then
 	[ -n "${LOAD:-}" ] && lsdb_load "$LOAD"
 	log "holding for $HOLD s (cargo xtask vm-lab ssh; vtysh --vty_socket $W/dut/run/frr)"

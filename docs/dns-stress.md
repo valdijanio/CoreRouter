@@ -63,7 +63,7 @@ comparação com Unbound/dnsmasq. `--selftest-remote` roda o modo remoto contra 
 | `origin` | o primeiro servidor some (descarte, sem ICMP); as duas origens somem; perda de 30 %; origem a 200 ms | o tempo da troca de servidor, serve-stale (RFC 8767) e cache de falhas (RFC 9520), pico de threads com tudo fora, a taxa de acerto com perda |
 | `tcp` | `dnsperf -m tcp` com 4, 16 e 64 conexões de um endereço; slowloris de 4 endereços que reconecta; DoT e DoH de origem (Unbound) a 100/1000/5000 por segundo | perdas por conexão recusada, o cliente TCP legítimo durante o ataque, descritores; handshakes/s e latência do DoT/DoH |
 | `cache` | encher até 1 M de entradas (cache de 1 GiB); `cache.print`, `statistics.print` e `cache.flush` com 20 000/s de nomes quentes ao lado; descarte num cache de 64 MiB cheio | memória por entrada (RSS de um daemon novo), tempo de cada comando e quanto ele segura o lock (p99,9 e máximo da carga ao lado), custo do descarte |
-| `adlist` | uma lista de 1 M de nomes por HTTP; consultas quentes e bloqueadas; `ip.dns.adlist.reload` com carga | tempo até `loaded`, memória por nome, custo por consulta, efeito da recarga |
+| `adlist` | uma lista de 1 M de nomes por HTTP; consultas quentes (as do `qps` e outras intercaladas com os nomes da lista), sem, com e de novo sem a lista; bloqueadas; `ip.dns.adlist.reload` com carga | tempo até `loaded`, memória por nome, custo por consulta, efeito da recarga |
 | `ddns` | duas zonas de 50 000 registros; RFC 2136 UPDATE (`dnsperf -u`) a 20/100/500 por segundo para uma delas; 20 000 clientes DHCP com nome (opção 12) a 1000/s; consultas à zona a 5000/s ao lado | UPDATEs/s e p99, bytes gravados em disco por UPDATE e por concessão (`/proc/<pid>/io`), latência das consultas à zona durante as mudanças (G4.1p, G4.1q) |
 | `hostile` | lixo a toda velocidade de um endereço, com e sem o limite por cliente; ANY, TXT grande, A com 60 registros; um cliente fora do `allowed_from` | sem queda nem panic, o cliente legítimo ao lado, tamanho e TC das respostas (fator de amplificação), REFUSED sem consulta à origem |
 | `ops` | 50 vezes cada: `ip.dns.set`, estático add+remove, `cache.flush`, `statistics.print`, um lote atômico, `ip.dns.get`, por uma conexão MCP aberta, com 20 000/s de nomes quentes ao lado | p50/p99 do comando (alvo < 50 ms) e o efeito na carga |
@@ -144,11 +144,24 @@ Gaps G4.1u (prazo por servidor adaptativo e nova tentativa) e G4.1v (serve-stale
 
 ### TCP e DoT/DoH (`tcp`)
 
-- **TCP**: 4 conexões de um endereço, 30 mil/s; 16 conexões, **54 % perdidas**; 64, 91 %: um
-  endereço ocupa no máximo um quarto das 20 vagas (5). A RFC 9210 §4.5 fala em 25 por endereço.
-- **Slowloris**: 4 endereços × 5 conexões que mandam um byte e param (reabertas quando o roteador
-  fecha) ocupam as 20 vagas: **o cliente TCP legítimo teve 0–1 resposta em 108 tentativas** em 30 s
-  (antes e depois). O processo não sofre (40 descritores, 87 threads). Gap G4.1w.
+- **TCP** (G4.1w, **medido** na VM, 10 s cada): um endereço com 16 conexões perdia **54 %** e com
+  64, 91 % (um quarto das 20 vagas: 5). Depois, com as mesmas 20 vagas, 16 conexões perdem 0,8 %
+  (metade por endereço: 10); com o padrão novo de 100 (25 por endereço, RFC 9210 §4.5), 0,2 % e
+  51 mil/s. 64 conexões de um endereço passam do teto de 25 e o roteador fecha as que sobram: o
+  `dnsperf` não reabre e a janela trava (36 % perdidas com 100 vagas, 81 % com 20; antes 91 %).
+- **Slowloris** (4 endereços × N conexões que mandam um byte e param, reabertas quando o roteador
+  fecha; um cliente legítimo pergunta a cada 250 ms numa conexão nova):
+
+  | Vagas | Por endereço | Antes: respondidas | Depois (G4.1w) | Reaberturas em 30 s, depois | CPU do daemon, depois |
+  |---|---|---|---|---|---|
+  | 20 | 10 | 0 de 107 | **107 de 107** | 5 312 | 1,2 s em 30 s |
+  | 20 | 30 | 1 de 106 | **107 de 107** | 29 095 | 1,2 s |
+  | 100 | 10 | 107 de 107 (não enche) | 108 de 108 | 100 | 0,9 s |
+  | 100 | 30 | 0 de 107 | **107 de 107** | 6 119 | 1,0 s |
+
+  Cheio, a conexão nova toma a vaga da mais ociosa do endereço com mais vagas (`dns_server/slots.rs`).
+  As reaberturas são quase todas conexões recusadas no aceite (o endereço no teto), sem thread: o
+  daemon gasta 3–4 % de um núcleo. Pico de 169 threads e 220 descritores com 100 vagas.
 - **DoT de origem** (Unbound) a 5000/s: **antes** 26 607 SERVFAIL em 15 s, p99 492 ms e 930
   handshakes/s (com uma thread por miss, as consultas em voo passavam das 4 conexões guardadas);
   **depois** p99 0,77 ms e 22 handshakes/s.
@@ -175,9 +188,28 @@ por resposta).
 
 ### Adlist de 1 M de nomes (`adlist`)
 
-Carga em 0,7–1,1 s, **55–57 B por nome**; a recarga (`ip.dns.adlist.reload`) com 20 000/s ao lado
-não muda nada (p99,9 107 µs). Custo: o acerto de cache cai **14 %** com a lista (194 → 166 mil/s em
-4 vCPUs), mais do que os 80–110 ns medidos na busca (gap G4.1z). Nomes bloqueados: 196 mil/s.
+Carga em 0,5–1,3 s, **55–66 B por nome** (RSS); a recarga (`ip.dns.adlist.reload`) com 20 000/s ao
+lado não muda nada (p99,9 107 µs). Nomes bloqueados: 196 mil/s.
+
+**Custo por consulta (G4.1z).** A primeira bateria viu o acerto de cache cair 14 % com a lista
+(194 → 166 mil/s em 4 vCPUs). Não se repete: a vm6, com o mesmo código, ganhou 2 % com a lista, e
+o teste agora mede de novo depois de remover a lista (a diferença entre duas rodadas de 15 s chega
+a ±30 % num host com outras sessões). O que mede é o perfil do daemon (`PERF=adlist`, agora em
+toda medição do `dp`): a parte da CPU no caminho da adlist com a lista carregada.
+
+| Carga, 4 CPUs, lista de 1 M (namespaces no host, duas rodadas) | Antes | Depois |
+|---|---|---|
+| sem lista (o `state()` da etapa) | 1,5–2,0 % | 1,1–1,2 % |
+| nomes quentes intercalados com os da lista (`ad<j>x.wt.up.lab`) | 7,2–7,7 % | 3,5–4,7 % |
+| nomes quentes do laboratório (`h<i>.up.lab`, depois de todos na ordem) | 4,1–4,5 % | 3,8–4,5 % |
+
+Os nomes quentes do laboratório ficam depois de todos os da lista na ordem: a busca binária
+antiga seguia o mesmo caminho para todos e ele ficava no cache da CPU, daí os 80–110 ns do
+benchmark e do laboratório. Os nomes de uma LAN se intercalam com os de uma lista real, e aí cada
+busca custava 500–900 ns (vinte níveis, quase todos fora do cache), e uma por rótulo nas listas
+Adblock (`||nome^`). O índice de hash da G4.1z custa 26–120 ns por busca; a leitura por faixa de
+threads tirou a disputa da trava e do contador de referência comuns a todas as consultas (detalhes
+e números em `docs/changes/G4.1z.md`, que vão para o `docs/perf.md`).
 
 ### Zonas, UPDATE e DHCP com nome (`ddns`, G4.1p e G4.1q)
 
@@ -290,10 +322,10 @@ ocioso e não termina; o teto é `max_concurrent_queries`.
 | Misses limitados a `max_concurrent_queries` / RTT; com 1000, mil threads | gap G4.1t |
 | 30 % de perda: 24 % respondidas; troca de servidor custa 2 s por nome novo | gap G4.1u |
 | Serve-stale só em 4,1 s (a RFC 8767 sugere 1,8 s) | gap G4.1v |
-| Slowloris de 4 endereços derruba o TCP (0–1 de 108); 16 conexões de um endereço perdem 54 % | gap G4.1w |
+| Slowloris de 4 endereços derruba o TCP (0–1 de 108); 16 conexões de um endereço perdem 54 % | **corrigido** (G4.1w): 107 de 107; 0,8 % |
 | Nomes únicos despejam os quentes: até 25 mil SERVFAIL em 15 s para o cliente legítimo | gap G4.1x |
 | `cache.print name=…` com 1 M de entradas para as consultas por 160 ms | gap G4.1y |
-| A adlist de 1 M custa 14 % no acerto de cache | gap G4.1z |
+| A adlist de 1 M custa 14 % no acerto de cache | não se repete (vm6: +2 %); o custo real era a busca binária com nomes intercalados e a disputa entre threads, corrigidos na G4.1z |
 | O cache padrão de 2 MiB guarda 3 192 respostas | o padrão do RouterOS; vale dizer no ⓘ do `cache_size` |
 | RSS +2,7 MiB/h com o cache cheio (2 h na VM) | a observar nas 12 h da fase C |
 | Defeitos do próprio roteiro achados no caminho: `kdig` com opções do `dig`, Unbound barrado pelo AppArmor fora de `/etc/unbound`, teto de 50 000 registros no total das zonas, `$EPOCHREALTIME` com vírgula em pt_BR | corrigidos no roteiro |

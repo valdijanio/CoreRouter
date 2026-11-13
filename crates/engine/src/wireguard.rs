@@ -233,6 +233,16 @@ pub(crate) fn tunnel_cut(before: &Config, after: &Config, wg: &IfName, caller: I
             was.listen_port, now.listen_port, peer.name
         ));
     }
+    // G1.31c: the encrypted packets would leave by another table.
+    if now.vrf != was.vrf {
+        let name = |v: &Option<IfName>| v.as_ref().map_or_else(|| "main".to_owned(), ToString::to_string);
+        return Some(format!(
+            "would send the encrypted packets of {wg} by VRF {} instead of {}: peer '{}', which this connection comes through, may no longer be reachable",
+            name(&now.vrf),
+            name(&was.vrf),
+            peer.name
+        ));
+    }
     match behind(&now) {
         None => Some(format!(
             "would remove or disable peer '{}' of {wg}, or take {caller} out of its allowed address: this connection comes through it",
@@ -279,6 +289,7 @@ impl Session {
         let dev = WgDevice {
             private_key: private,
             listen_port: w.listen_port,
+            fwmark: corerouter_hal::policy::wireguard_fwmark(w),
             peers,
         };
         Ok((dev, public_of(&private)))

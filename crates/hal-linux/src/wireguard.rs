@@ -39,6 +39,7 @@ const D_IFNAME: u16 = 2;
 const D_PRIVATE_KEY: u16 = 3;
 const D_PUBLIC_KEY: u16 = 4;
 const D_LISTEN_PORT: u16 = 6;
+const D_FWMARK: u16 = 7;
 const D_PEERS: u16 = 8;
 
 const P_PUBLIC_KEY: u16 = 1;
@@ -75,6 +76,7 @@ pub(crate) struct KernelDevice {
     pub private_key: Option<Key>,
     pub public_key: Key,
     pub listen_port: u16,
+    pub fwmark: u32,
     pub peers: Vec<KernelPeer>,
 }
 
@@ -111,12 +113,17 @@ pub(crate) enum PeerChange {
 pub(crate) struct SetPlan {
     pub private_key: Option<Key>,
     pub listen_port: Option<u16>,
+    /// G1.31c: the mark of the encrypted packets (0 clears it).
+    pub fwmark: Option<u32>,
     pub peers: Vec<PeerChange>,
 }
 
 impl SetPlan {
     pub fn is_empty(&self) -> bool {
-        self.private_key.is_none() && self.listen_port.is_none() && self.peers.is_empty()
+        self.private_key.is_none()
+            && self.listen_port.is_none()
+            && self.fwmark.is_none()
+            && self.peers.is_empty()
     }
 }
 
@@ -136,6 +143,7 @@ pub(crate) fn plan(want: &WgDevice, have: &KernelDevice, last: Option<&WgDevice>
     let mut p = SetPlan {
         private_key: (have.private_key != Some(want.private_key)).then_some(want.private_key),
         listen_port: (have.listen_port != want.listen_port).then_some(want.listen_port),
+        fwmark: (have.fwmark != want.fwmark).then_some(want.fwmark),
         peers: Vec::new(),
     };
     let wanted: BTreeMap<Key, &WgPeerSpec> = want.peers.iter().map(|w| (w.public_key, w)).collect();
@@ -301,6 +309,9 @@ pub(crate) fn encode(family: u16, seq: u32, ifname: &str, plan: &SetPlan) -> Vec
     if let Some(p) = plan.listen_port {
         m.u16(D_LISTEN_PORT, p);
     }
+    if let Some(mark) = plan.fwmark {
+        m.u32(D_FWMARK, mark);
+    }
     let mut open = false;
     for c in &plan.peers {
         if open && m.size() + peer_size(c) > MAX_REQUEST {
@@ -371,6 +382,7 @@ pub(crate) fn parse<'a>(msgs: impl IntoIterator<Item = &'a [u8]>) -> KernelDevic
                 }
                 D_PUBLIC_KEY => dev.public_key = key_of(&a).unwrap_or_default(),
                 D_LISTEN_PORT => dev.listen_port = a.u16().unwrap_or(0),
+                D_FWMARK => dev.fwmark = a.u32().unwrap_or(0),
                 D_PEERS => {
                     for pa in a.nested() {
                         let Some(pk) = pa
@@ -554,6 +566,7 @@ mod tests {
             private_key: Some(dev.private_key),
             public_key: key(0xEE),
             listen_port: dev.listen_port,
+            fwmark: dev.fwmark,
             peers: dev
                 .peers
                 .iter()
@@ -585,6 +598,7 @@ mod tests {
         let want = WgDevice {
             private_key: key(7),
             listen_port: 13231,
+            fwmark: 0,
             peers: vec![
                 peer(1, &["10.9.0.2/32"], Some("198.51.100.7:13231")),
                 peer(2, &["10.20.0.0/16"], None),
@@ -617,6 +631,7 @@ mod tests {
         let want = WgDevice {
             private_key: key(7),
             listen_port: 13231,
+            fwmark: 0,
             peers: vec![peer(
                 1,
                 &["10.9.0.2/32", "fd00::2/128"],
@@ -633,6 +648,7 @@ mod tests {
         let before = WgDevice {
             private_key: key(7),
             listen_port: 13231,
+            fwmark: 0,
             peers: vec![
                 peer(1, &["10.9.0.2/32"], None),
                 peer(2, &["10.9.0.3/32"], None),
@@ -675,6 +691,7 @@ mod tests {
         let want = WgDevice {
             private_key: key(7),
             listen_port: 13231,
+            fwmark: 0,
             peers: vec![peer(1, &["10.9.0.2/32"], Some("198.51.100.7:13231"))],
         };
         // The peer moved: the kernel follows it; we do not pull it back.
@@ -700,6 +717,7 @@ mod tests {
         let before = WgDevice {
             private_key: key(7),
             listen_port: 13231,
+            fwmark: 0,
             peers: vec![peer(1, &["10.9.0.2/32"], None)],
         };
         let mut want = before.clone();
@@ -726,10 +744,43 @@ mod tests {
     }
 
     #[test]
+    fn the_fwmark_is_sent_when_it_changes_and_read_back() {
+        let mut want = WgDevice {
+            private_key: key(7),
+            listen_port: 13231,
+            fwmark: 0x57e5_0000,
+            peers: Vec::new(),
+        };
+        let have = kernel_of(&WgDevice {
+            fwmark: 0,
+            ..want.clone()
+        });
+        let p = plan(&want, &have, None);
+        assert_eq!(p.fwmark, Some(0x57e5_0000));
+        assert!(p.private_key.is_none() && p.listen_port.is_none());
+        let reqs = encode(0x15, 1, "wg0", &p);
+        // WGDEVICE_A_FWMARK (7), NLA_U32 in host order, after the name.
+        let body = bodies(&reqs);
+        let mark = 0x57e5_0000u32.to_ne_bytes();
+        assert!(
+            body[0]
+                .windows(8)
+                .any(|w| w[..4] == [8, 0, 7, 0] && w[4..] == mark),
+            "{body:?}"
+        );
+        // Read back, nothing to send; and a VRF taken out clears it.
+        let held = kernel_of(&want);
+        assert!(plan(&want, &held, Some(&want)).is_empty());
+        want.fwmark = 0;
+        assert_eq!(plan(&want, &held, Some(&want)).fwmark, Some(0));
+    }
+
+    #[test]
     fn many_peers_split_into_requests_under_the_nest_limit() {
         let want = WgDevice {
             private_key: key(7),
             listen_port: 13231,
+            fwmark: 0,
             peers: (0..2000u32)
                 .map(|i| {
                     let mut k = [0u8; 32];

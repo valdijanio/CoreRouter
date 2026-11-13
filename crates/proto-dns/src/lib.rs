@@ -16,6 +16,7 @@ pub mod dig;
 pub mod encrypted;
 pub mod histogram;
 pub mod message;
+pub mod querylog;
 pub mod resolver;
 pub mod reverse;
 pub mod server;
@@ -47,6 +48,9 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
     }
     if let Err(why) = check_secure(&cfg.ip.dns.use_doh_server) {
         out.push(Issue::new("ip.dns", format!("use_doh_server: {why}")));
+    }
+    if let Some(m) = cfg.ip.dns_log.problem() {
+        out.push(Issue::new("ip.dns.log", m));
     }
     if let Some(m) = cfg.ip.dns_forwarders.problem() {
         out.push(Issue::new("ip.dns.forwarders", m));

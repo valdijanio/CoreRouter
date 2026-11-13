@@ -353,6 +353,17 @@ backend.**
   (`proto-ospf` → `proto-bgp`, lateral permitido) com listas renomeadas `CR-O2-`/`CR-O3-`, porque
   o `ospfd` recusa as linhas BGP dos route-maps do `bgpd`. Índice de templates por nome: 4 000
   interfaces × 1 000 templates em 10,9 ms (era 145,7 ms, **medido**).
+- **Proteção da LSDB: patch no `ospfd`, não controle nosso (G3.4r, `docs/ospf.md`).** O FRR
+  não limita as LSAs. Duas opções foram comparadas no laboratório, com 192 721 externas de um
+  vizinho (**medido**):
+  - **controle nosso** (ler o `show ip ospf json` a cada 2 s e desligar a instância): chega
+    depois da enxurrada inteira, porque 175 436 LSAs entram no primeiro segundo. O pico fica
+    em 293 MiB no `ospfd` e 120 MiB no `zebra`, e a memória não volta depois.
+  - **o `max-lsa` dentro do `ospfd`** (`os/patches/frr/0007`, enviado ao FRR): para em 50 008
+    LSAs com limite de 50 000, com pico de 84 + 42 MiB.
+
+  Ficamos com o patch. A leitura, a janela, a saúde e a prévia continuam nossas, no mesmo
+  `show ip ospf json` que o serviço `frr` já lê.
 - **holo** (suíte de roteamento em Rust, modelo YANG) é o candidato a backend Rust-nativo do
   mesmo trait (G3.8) — sem mudar UI, comandos ou MCP.
 - FSMs próprias só para o **simulador** (sessões BGP/OSPF entre roteadores virtuais no lab, G3.7)
@@ -1069,9 +1080,10 @@ que sobram são de arquitetura nossa (gaps com número), não da biblioteca.
 ping/MTR/MTU ─► Session::tool_prober ─► RouterResolver::resolve ─┐
 cliente NTP ─► service::dns::resolve ────────────────────────────┤ (sem lock do Session)
                                                                  ▼
-               proto-dns::Resolver: cache (lock curto) ─► fetch: servidores um a um
-                                                                 │ Transport
+               proto-dns::Resolver: cache (lock curto) ─► Lookup (máquina de estados)
+                                                                 │ Transport (bloqueante)
                service/dns.rs: UDP (+TCP no TC) ◄────────────────┘
+encaminhador da LAN: dns-udp ─► Resolver::begin ─► laço dns-upstream (mio) ─► Resolver::complete
 thread "dns" (1 s): Session::dns_settings (running ip.dns + DHCP use_peer_dns) ─► configure
 ```
 
@@ -1163,9 +1175,18 @@ efeitos (address-list) ─► thread "dns-effects" ─► Session::dns_address_l
 **Adlist e HTTPS do daemon (G4.1d).** As listas de bloqueio ficam fora da config e fora do lock
 do `Session`: o serviço `service/dns_adlist.rs` baixa, lê e ordena cada lista numa thread própria
 e troca o conjunto da etapa `adlist` de uma vez (`proto-dns::adlist::Adlists`). O conjunto é uma
-arena de texto ordenada com deslocamentos (busca binária por rótulo), não um `HashSet<String>`:
-**medido** 31,8 MB para 1 M nomes (~32 B/nome, contra ~70 B estimados no `HashSet`), 230 ms para
-ler e montar, 80–110 ns por consulta. O download usa um cliente HTTP/1.1 nosso
+arena de texto ordenada com deslocamentos, não um `HashSet<String>`: **medido** 31,8 MB para 1 M
+nomes (~32 B/nome, contra ~70 B estimados no `HashSet`), 230 ms para ler e montar. A busca era
+binária (80–110 ns com o mesmo nome em laço); a G4.1z mediu 500–900 ns com nomes intercalados aos
+da lista (a busca não reaproveita caminho e cada nível falta no cache) e uma busca por rótulo nas
+listas Adblock (`||nome^`), e trocou por um índice de endereçamento aberto sobre a arena: 1,5 vaga
+por nome, um byte de impressão digital por vaga (1,5 MB por milhão, cabe no cache e no TLB) e a
+posição do nome (`u32`), com a chave SipHash aleatória por conjunto (a lista é escrita por quem
+serve a URL; uma chave conhecida deixaria montar colisões). +7,5 B por nome; 26–120 ns por busca.
+Leitura por faixa de threads: cada faixa (a mesma da estatística, G4.1h) tem sua cópia da lista
+de listas e do mapa de estados do `Forwarder` (`with_state` empresta sem clonar o `Arc`), porque
+uma trava e um contador de referência comuns a todas as consultas custavam 493 ns por consulta
+com 4 threads (34 ns depois). O download usa um cliente HTTP/1.1 nosso
 (`service/https.rs`, rustls + raízes Mozilla do `webpki-roots`) e não o `ureq`/`reqwest`: o
 roteador não tem resolvedor do sistema nem loja de CAs, então o nome do servidor passa pelo
 resolvedor do roteador, e todos os limites (cabeçalho, corpo, redirecionamentos) são nossos. O
@@ -1192,7 +1213,28 @@ mesmo pool. **Medido** contra o Unbound 1.19.2 no laboratório: 0 SERVFAIL a 500
 0,6 ms, 16 handshakes/s. Multiplexar várias consultas por conexão fica para quando fizer falta
 (hoje cada consulta em andamento tem a sua thread e a sua conexão).
 
-Detalhes, regras de RFC e pesquisa: `docs/dns.md`.
+**Log de consultas (G4.1zd): formato binário próprio em Rust, sem SQLite nem texto.** Uma etapa
+`querylog` (só `after`, a última da cadeia) entrega cada consulta ao daemon. O daemon a põe num
+buffer por faixa de thread, como as estatísticas do G4.1h: ~70 ns por consulta, sem lock
+disputado, fila limitada que descarta e conta. Um escritor (`service/dns_log.rs`) grava blocos
+deflate com tabelas de nomes e clientes por bloco em `/config/dns-log/`.
+
+Comparados com a mesma carga (Zipf, 4096 clientes CGNAT; **medido** em `docs/dns-query-log.md`):
+
+| Formato | Bytes por consulta | Custo |
+|---|---|---|
+| texto no estilo Unbound | 85 (29 com deflate) | |
+| JSON do AdGuard | 183 (33) | |
+| nosso binário | 17 (12,3 com deflate) | ~200 ns por consulta para codificar e comprimir |
+
+- **Por que não SQLite (Pi-hole):** é C, tem custo de B-tree e WAL por inserção e não tem teto em
+  bytes.
+- **Por que não texto:** custa 2,3× o binário no disco, e o desgaste do SSD e o teto é que limitam
+  a retenção num provedor (21 GB/dia a 20 mil consultas/s).
+- **Rever se** a busca por cliente num período longo ficar lenta. Hoje ela decodifica 12 milhões
+  de consultas/s por núcleo, e com CGNAT um índice por cliente não pula blocos.
+
+Detalhes, regras de RFC e pesquisa: `docs/dns.md` e `docs/dns-query-log.md`.
 
 ### Supervisor de serviços do daemon (G0.10)
 

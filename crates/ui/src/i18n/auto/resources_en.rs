@@ -21,6 +21,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("resources.check.nic.errors", "## NIC errors\n\nErrors or drops rising on a link."),
     ("resources.check.ntp", "## NTP\n\nClock synchronized?"),
     ("resources.check.oom", "## OOM kills\n\nProcesses killed for lack of memory in the last hour."),
+    ("resources.check.ospf.lsdb", "## OSPF LSDB\n\nThe OSPF databases of each instance. An error when the LSDB protection (Max LSA) holds an instance down (`ignore` or `isolated`) or when the databases would take half the RAM; a warning from the Max LSA threshold on, past it with Warning Only, or at 25 % of the RAM (estimated: 2.1 KiB per LSA in `ospfd` + `zebra`, **measured**). It holds with no limit configured too: the alert of a wrong redistribution elsewhere. A flood's memory does not go back to the system afterwards."),
     ("resources.check.root.verity", "## Root verity\n\nWhether the running slot's root file system is the dm-verity device of its signed root hash. The first boot of a qcow2/OVA image takes the fallback path without verity: reboot once. A slot installed from a package signed by a key the installed image does not carry also shows here: rebooting does not help, install a package signed by a key the image trusts."),
     ("resources.check.rss", "## RSS balance\n\nOne CPU taking most of the receive softirqs."),
     ("resources.check.services", "## Services\n\nSupervised services failed or down."),

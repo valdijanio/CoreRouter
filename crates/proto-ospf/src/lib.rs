@@ -76,6 +76,72 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
     out
 }
 
+/// G3.4r: the LSDB protection within ospfd's ranges (a config file can
+/// carry anything), and only where it exists (ospfd, not ospf6d).
+fn max_lsa(path: &str, version: Version, m: &corerouter_model::ospf::MaxLsa, out: &mut Vec<Issue>) {
+    use corerouter_model::ospf::{
+        MAX_LSA_IGNORE_COUNT, MAX_LSA_IGNORE_TIME, MAX_LSA_LIMIT, MAX_LSA_RESET_TIME,
+        MAX_LSA_THRESHOLD,
+    };
+    if version == Version::V3 {
+        out.push(Issue::new(
+            format!("{path}.max_lsa"),
+            "OSPFv3 (ospf6d) has no LSDB protection yet: only OSPFv2",
+        ));
+    }
+    let checks: [(bool, &str, String); 5] = [
+        (
+            MAX_LSA_LIMIT.contains(&m.limit),
+            "limit",
+            format!("{}..={}", MAX_LSA_LIMIT.start(), MAX_LSA_LIMIT.end()),
+        ),
+        (
+            MAX_LSA_THRESHOLD.contains(&m.threshold),
+            "threshold",
+            format!(
+                "{}..={} %",
+                MAX_LSA_THRESHOLD.start(),
+                MAX_LSA_THRESHOLD.end()
+            ),
+        ),
+        (
+            MAX_LSA_IGNORE_TIME.contains(&m.ignore_time),
+            "ignore_time",
+            format!(
+                "{}..={} s",
+                MAX_LSA_IGNORE_TIME.start(),
+                MAX_LSA_IGNORE_TIME.end()
+            ),
+        ),
+        (
+            MAX_LSA_IGNORE_COUNT.contains(&m.ignore_count),
+            "ignore_count",
+            format!(
+                "{}..={}",
+                MAX_LSA_IGNORE_COUNT.start(),
+                MAX_LSA_IGNORE_COUNT.end()
+            ),
+        ),
+        (
+            MAX_LSA_RESET_TIME.contains(&m.reset_time),
+            "reset_time",
+            format!(
+                "{}..={} s",
+                MAX_LSA_RESET_TIME.start(),
+                MAX_LSA_RESET_TIME.end()
+            ),
+        ),
+    ];
+    for (ok, what, range) in checks {
+        if !ok {
+            out.push(Issue::new(
+                format!("{path}.max_lsa.{what}"),
+                format!("{what} must be {range}"),
+            ));
+        }
+    }
+}
+
 fn instances(cfg: &Config, out: &mut Vec<Issue>) {
     let ospf = &cfg.routing.ospf;
     let mut per_vrf: HashMap<(Version, &str), &str> = HashMap::new();
@@ -94,6 +160,9 @@ fn instances(cfg: &Config, out: &mut Vec<Issue>) {
                 format!("{path}.router_id"),
                 "router-id must not be 0.0.0.0 or 255.255.255.255",
             ));
+        }
+        if let Some(m) = &inst.max_lsa {
+            max_lsa(&path, inst.version, m, out);
         }
         if inst.vrf != MAIN_VRF {
             let is_vrf = inst
@@ -597,6 +666,7 @@ pub(crate) mod tests {
                 subscriber_pools: false,
                 stub_router: false,
                 stub_router_on_startup: None,
+                max_lsa: None,
                 disabled: false,
                 comment: String::new(),
             },
@@ -645,6 +715,47 @@ pub(crate) mod tests {
     #[test]
     fn the_sample_is_valid() {
         assert_eq!(validate(&sample()), Vec::new());
+    }
+
+    /// G3.4r: a config file's LSDB protection within ospfd's ranges, and
+    /// only on OSPFv2.
+    #[test]
+    fn lsdb_protection_ranges_and_version() {
+        use corerouter_model::ospf::MaxLsa;
+        let mut cfg = sample();
+        for i in cfg.routing.ospf.instances.values_mut() {
+            i.max_lsa = Some(MaxLsa::new(50_000));
+        }
+        assert_eq!(validate(&cfg), Vec::new());
+        for i in cfg.routing.ospf.instances.values_mut() {
+            i.max_lsa = Some(MaxLsa {
+                threshold: 0,
+                ignore_time: 10,
+                ignore_count: 33,
+                reset_time: 59,
+                ..MaxLsa::new(0)
+            });
+        }
+        let v = validate(&cfg);
+        for what in [
+            "limit",
+            "threshold",
+            "ignore_time",
+            "ignore_count",
+            "reset_time",
+        ] {
+            assert!(
+                v.iter()
+                    .any(|i| i.path.ends_with(&format!("max_lsa.{what}"))),
+                "{what}: {v:?}"
+            );
+        }
+        for i in cfg.routing.ospf.instances.values_mut() {
+            i.max_lsa = Some(MaxLsa::new(1));
+            i.version = Version::V3;
+        }
+        let v = validate(&cfg);
+        assert!(v.iter().any(|i| i.message.contains("OSPFv3")), "{v:?}");
     }
 
     #[test]
