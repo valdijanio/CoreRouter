@@ -90,10 +90,12 @@ table inet corerouter {
 		type filter hook prerouting priority mangle; policy accept;
 		iifname "ether1" ct state new counter ct mark set 0x90a7963e comment "cr:*12"
 		ct mark 0x90a7963e counter meta mark set meta mark & 0x0000ffff | 0x57e50000 accept comment "cr:*13"
+		meta l4proto tcp tcp flags & syn == syn counter tcp option maxseg size set 1360 accept comment "cr:*1A"
 	}
 	chain mangle_forward {
 		type filter hook forward priority mangle; policy accept;
 		meta mark & 0x0000ffff != 0x00008514 meta mark & 0xffff0000 == 0x57e50000 counter meta mark set meta mark & 0xffff0000 | 0x00008514 comment "cr:*14"
+		oifname "ether1" meta l4proto tcp tcp flags & (rst|syn) == syn counter tcp option maxseg size set rt mtu comment "cr:*19"
 	}
 	chain raw_prerouting {
 		type filter hook prerouting priority raw; policy accept;

@@ -156,6 +156,19 @@ const NFTA_REDIR_REG_PROTO_MIN: u16 = 1;
 const NFTA_REDIR_REG_PROTO_MAX: u16 = 2;
 const NFTA_REDIR_FLAGS: u16 = 3;
 const NFTA_NAT_FLAGS: u16 = 7;
+const NFTA_RT_DREG: u16 = 1;
+const NFTA_RT_KEY: u16 = 2;
+const NFTA_BYTEORDER_SREG: u16 = 1;
+const NFTA_BYTEORDER_DREG: u16 = 2;
+const NFTA_BYTEORDER_OP: u16 = 3;
+const NFTA_BYTEORDER_LEN: u16 = 4;
+const NFTA_BYTEORDER_SIZE: u16 = 5;
+const NFTA_EXTHDR_TYPE: u16 = 2;
+const NFTA_EXTHDR_OFFSET: u16 = 3;
+const NFTA_EXTHDR_LEN: u16 = 4;
+const NFTA_EXTHDR_OP: u16 = 6;
+const NFTA_EXTHDR_SREG: u16 = 7;
+const NFT_EXTHDR_OP_TCPOPT: u32 = 1;
 const NFTA_FIB_DREG: u16 = 1;
 const NFTA_FIB_RESULT: u16 = 2;
 const NFTA_FIB_FLAGS: u16 = 3;
@@ -739,6 +752,9 @@ impl Batch {
             Expr::NatRange { .. } => "nat",
             Expr::Fib { .. } => "fib",
             Expr::DynsetAdd { .. } => "dynset",
+            Expr::Rt { .. } => "rt",
+            Expr::Byteorder { .. } => "byteorder",
+            Expr::TcpOptSet { .. } => "exthdr",
         };
         self.str(NFTA_EXPR_NAME, name);
         self.begin(NFTA_EXPR_DATA);
@@ -992,6 +1008,35 @@ impl Batch {
                 self.be32(NFTA_FIB_DREG, *dreg);
                 self.be32(NFTA_FIB_RESULT, *result);
                 self.be32(NFTA_FIB_FLAGS, *flags);
+            }
+            Expr::Rt { key, dreg } => {
+                self.be32(NFTA_RT_DREG, *dreg);
+                self.be32(NFTA_RT_KEY, *key);
+            }
+            Expr::Byteorder {
+                sreg,
+                dreg,
+                hton,
+                len,
+                size,
+            } => {
+                self.be32(NFTA_BYTEORDER_SREG, *sreg);
+                self.be32(NFTA_BYTEORDER_DREG, *dreg);
+                self.be32(NFTA_BYTEORDER_OP, u32::from(*hton));
+                self.be32(NFTA_BYTEORDER_LEN, *len);
+                self.be32(NFTA_BYTEORDER_SIZE, *size);
+            }
+            Expr::TcpOptSet {
+                kind,
+                offset,
+                len,
+                sreg,
+            } => {
+                self.be32(NFTA_EXTHDR_SREG, *sreg);
+                self.put(NFTA_EXTHDR_TYPE, &[*kind]);
+                self.be32(NFTA_EXTHDR_OFFSET, *offset);
+                self.be32(NFTA_EXTHDR_LEN, *len);
+                self.be32(NFTA_EXTHDR_OP, NFT_EXTHDR_OP_TCPOPT);
             }
             Expr::DynsetAdd {
                 set,

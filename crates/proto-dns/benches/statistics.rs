@@ -5,6 +5,11 @@
 //! threads at once (the four UDP threads per family and the workers of the
 //! daemon count into the same statistics).
 //!
+//! G4.1za/zb: a random-subdomain attack (`r<n>.victim.lan`, a static
+//! NXDOMAIN with `match_subdomain`): every name new to the names table,
+//! every answer a failure counted under `victim.lan` with its names'
+//! HyperLogLog, every client new (CGNAT), alone and from 16 threads.
+//!
 //! `cargo xtask bench dns_stats`; alone:
 //! `cargo bench -p corerouter-proto-dns --bench statistics`.
 
@@ -47,6 +52,11 @@ fn forwarder() -> Forwarder {
     e.rtype = StaticType::A;
     e.address = Some(IpAddr::from([10, 0, 0, 1]));
     cfg.ip.dns_static.entries.push(e);
+    let mut nx = StaticEntry::new(ItemId(2));
+    nx.name = "victim.lan".into();
+    nx.rtype = StaticType::Nxdomain;
+    nx.match_subdomain = true;
+    cfg.ip.dns_static.entries.push(nx);
     let resolver = Arc::new(Resolver::new(Settings::new(&cfg.ip.dns, &[])));
     let f = Forwarder::new(resolver);
     f.configure(
@@ -90,6 +100,35 @@ fn parallel(f: &Forwarder, q: &[u8], threads: u32, iters: u64) -> Duration {
     start.elapsed()
 }
 
+/// 4096 random names under `victim.lan` (built before the clock runs).
+fn random_names() -> Vec<Vec<u8>> {
+    (0..4096u32)
+        .map(|i| {
+            ask(&format!(
+                "r{:08x}.victim.lan.",
+                i.wrapping_mul(2_654_435_761)
+            ))
+        })
+        .collect()
+}
+
+/// [`parallel`] with a new random name each query.
+fn parallel_random(f: &Forwarder, names: &[Vec<u8>], threads: u32, iters: u64) -> Duration {
+    let per = iters.div_ceil(u64::from(threads));
+    let start = Instant::now();
+    std::thread::scope(|s| {
+        for t in 0..threads {
+            s.spawn(move || {
+                for i in 0..per {
+                    let k = usize::try_from((u64::from(t) * 512 + i) % 4096).unwrap();
+                    black_box(one(f, &names[k], cgnat(u32::try_from(k).unwrap())));
+                }
+            });
+        }
+    });
+    start.elapsed()
+}
+
 fn bench(c: &mut Criterion) {
     let f = forwarder();
     let q = ask("nas.lan.");
@@ -111,6 +150,18 @@ fn bench(c: &mut Criterion) {
             b.iter_custom(|iters| parallel(&f, &q, threads, iters))
         });
     }
+
+    let names = random_names();
+    let mut i = 0usize;
+    c.bench_function("dns_stats_random_subdomain", |b| {
+        b.iter(|| {
+            i = (i + 1) % names.len();
+            one(&f, &names[i], cgnat(u32::try_from(i).unwrap()))
+        })
+    });
+    c.bench_function("dns_stats_random_subdomain_16_threads", |b| {
+        b.iter_custom(|iters| parallel_random(&f, &names, 16, iters))
+    });
 }
 
 criterion_group!(benches, bench);

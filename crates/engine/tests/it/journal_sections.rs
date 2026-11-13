@@ -48,6 +48,20 @@ fn commands() -> Vec<(&'static str, Value)> {
     vec![
         // system
         ("system.identity.set", json!({"name": "sweep"})),
+        // G1.6zs: `/certificate` (imported: this session has no clock to
+        // date a new one).
+        ("certificate.import", {
+            let (cert, key) =
+                corerouter_engine::x509::generate(&corerouter_engine::x509::NewCert {
+                    common_name: "sweep".into(),
+                    subject_alt_names: vec!["DNS:sweep.lan".into()],
+                    key_type: "ecdsa-p256".into(),
+                    days_valid: 90,
+                    now: 1_794_441_600,
+                })
+                .unwrap();
+            json!({"name": "sweep", "certificate": cert, "private_key": key})
+        }),
         // G1.6zn: the system in RAM (`system.boot`).
         ("system.boot.set", json!({"to_ram": true})),
         (

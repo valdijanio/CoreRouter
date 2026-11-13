@@ -57,11 +57,19 @@ fn statistics_window_shows_the_forwarder_and_resets() {
     assert!(h.has_text("Static / Adlist") && h.has_text("Refused / Limit"));
     assert!(h.has_text("UDP IPv4") && h.has_text("Truncated (TC)"), "transport group");
     assert!(h.has_text("counting"), "state chip");
-    assert!(h.has_text("192.168.88.10"), "top client");
     assert!(h.has_text("NOERROR") && h.has_text("REFUSED"));
     assert!(!h.has_text("lab") && !h.has_text("forwarder off"), "counting");
 
     // The other tabs.
+    h.click(h.text("Names"));
+    refresh(&mut h);
+    assert!(h.has_text("Top names") && h.has_text("nas.lan"), "the name asked");
+    assert!(h.has_text("Failing domains (NXDOMAIN / SERVFAIL)"));
+    h.click(h.text("Clients"));
+    refresh(&mut h);
+    assert!(h.has_text("192.168.88.10"), "the client");
+    assert!(h.has_text("live") && h.has_text("NXDOMAIN %") && h.has_text("Last seen"));
+    assert!(!h.has_text("nas.lan"), "no name next to a client");
     h.click(h.text("Upstreams"));
     refresh(&mut h);
     assert!(h.has_text_containing("No upstream server asked yet"));
@@ -100,7 +108,7 @@ fn every_explanation_label_and_warning_has_its_text() {
     }
     for key in crate::dns_statistics::WARNINGS {
         let w = json!({"key": key, "text": "english", "args": {"server": "192.0.2.53", "percent": "12",
-            "count": "7", "max": "100"}});
+            "count": "7", "max": "100", "domain": "victim.com.br", "names": "900", "rate": "41"}});
         let pt = crate::dns_statistics::warning_text(Lang::Pt, &w);
         assert_ne!(pt, "english", "{key} has a Portuguese template");
         assert!(!pt.contains('{'), "{key}: every argument filled: {pt}");
@@ -135,4 +143,31 @@ fn warnings_of_the_engine_show_in_the_overview() {
     h.idle();
     assert!(h.has_text("DOH"));
     assert!(h.has_text("all servers"));
+}
+
+#[test]
+fn a_random_subdomain_attack_shows_in_the_names_tab() {
+    let mut h = Harness::new();
+    h.app.open.clear();
+    h.app.open(Win::Panel(WIN));
+    refresh(&mut h);
+    let p = h.app.panel_mut::<DnsStatsPanel>().unwrap();
+    p.tab = crate::dns_statistics::Tab::Names;
+    p.stats = Some(json!({"queries": 1000, "resolver": "router", "allow_remote_requests": true,
+        "names": [{"name": "www.example.com", "queries": 40, "queries_per_sec": 2.0, "error": 0}],
+        "names_tracked": 1,
+        "failing_domains": [{"domain": "victim.com.br", "nxdomain": 950, "servfail": 0, "failures_per_sec": 95.0,
+            "names": 930, "error": 0, "random": true}],
+        "domains_tracked": 1,
+        "warnings": [
+            {"key": "random_subdomain", "severity": "warning", "text": "Domain victim.com.br: about 930 different names failed",
+                "args": {"domain": "victim.com.br", "names": "930", "rate": "95"}},
+            {"key": "socket_drops", "severity": "warning", "text": "drops", "args": {"count": "3"}}]}));
+    h.idle();
+    h.idle();
+    assert!(h.has_text("www.example.com"));
+    assert!(h.has_text("random names"), "chip on the domain");
+    assert!(h.has_text("≈930"));
+    assert!(h.has_text_containing("Domínio victim.com.br: cerca de 930 nomes diferentes"), "footer warning");
+    assert!(!h.has_text_containing("descartou"), "only the Names tab's warnings");
 }

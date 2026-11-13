@@ -9,6 +9,8 @@
 //! - the connection was not NATed (`connection_nat_state` sees none),
 //!   unless the packet says so (`Packet::nat`, the tester after a dst-nat);
 //! - a `limit` is not exceeded (the rule matches);
+//! - a TCP packet of a `new` connection is its SYN, any other one a plain
+//!   ACK (what `tcp-flags` sees, G1.31d);
 //! - address lists hold their static entries plus the dynamic ones the
 //!   caller passes; entries that rules added inside the kernel are unknown
 //!   (not in the list).
@@ -17,7 +19,7 @@ use std::net::IpAddr;
 
 use corerouter_model::firewall::{
     Action, AddrMatch, ConnState, DynamicAddress, Family, FirewallRule, Flag, Flags, Name,
-    NatState, Neg, Protocol, Table,
+    NatState, Neg, Protocol, Table, TcpFlags,
 };
 use corerouter_model::{Config, ItemId};
 
@@ -134,6 +136,15 @@ pub fn matches(cfg: &Config, dynamic: &[DynamicAddress], r: &FirewallRule, p: &P
         p.icmp
             .is_some_and(|(t, c)| t == o.kind && o.code.is_none_or(|oc| oc == c))
     });
+    // A new connection's packet is its SYN, the others ACKs (module docs).
+    let tcp_flags = m.tcp_flags.is_none_or(|f| {
+        let seen = if p.state == ConnState::New {
+            TcpFlags::SYN
+        } else {
+            TcpFlags::ACK
+        };
+        p.protocol == Protocol::TCP && f.matches(seen)
+    });
     // No marks, no NAT on the connection (module docs).
     let unmarked = |m: &Option<Neg<Name>>| m.as_ref().is_none_or(|n| n.not);
     fam_ok
@@ -153,6 +164,7 @@ pub fn matches(cfg: &Config, dynamic: &[DynamicAddress], r: &FirewallRule, p: &P
         && flags(&m.connection_state, Some(p.state))
         && flags(&m.connection_nat_state, p.nat)
         && icmp
+        && tcp_flags
         && unmarked(&m.connection_mark)
         && unmarked(&m.packet_mark)
         && unmarked(&m.routing_mark)

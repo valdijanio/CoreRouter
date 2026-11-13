@@ -12072,3 +12072,272 @@ continuação indentadas).
 
   O PR do FRR (G3.4l, FRRouting/frr#24092) entrou no `master` do FRR em 2026-11-11; o
   `docs/frr-tilfa-abort.md` registra isso. O patch da imagem continua até uma versão do FRR que o traga.
+
+- 2026-11-13 — G1.31: Interfaces WireGuard, parte 1 de 3 (motor): `interface.wireguard.{add,set,remove,enable,disable,list}`
+  e `interface.wireguard.peers.{add,set,remove,enable,disable,list}` com os nomes e padrões do
+  RouterOS 7.25 (porta 13231 ou a primeira livre, MTU 1420, `peerN`, `responder`). Chave privada
+  gerada no roteador (X25519, `x25519-dalek`, conferida com a RFC 7748 §6.1) e selada, como a do
+  par (`private_key=auto`) e a PSK. O engine recusa o que o kernel esconderia: prefixo repetido
+  entre pares (o kernel o move em silêncio), par com a chave da própria interface, chave repetida.
+  Estado por par calculado no engine (`up`/`idle`/`no-handshake`/`never`/`disabled`) com dica.
+  Caminho de dados no kernel; o `hal-linux` cria o link e manda só a diferença por generic netlink
+  próprio (sem `wg`), sem derrubar as sessões dos outros pares e sem puxar de volta um par que
+  mudou de IP. Laboratório virtual: duas interfaces que se conhecem ficam `up`. Teste em namespace
+  sem root: dois links fazem handshake de verdade pelo loopback e uma mudança de par mantém a
+  sessão do outro (0,47 s, **medido**). Decisão kernel × userspace em `docs/architecture.md`, com
+  a medição: encaminhando em bare metal, o kernel faz 631 kpps (64 B) contra 389 do BoringTun e
+  338 do wireguard-go, e o wireguard-go faz 16,8 Gb/s em TCP contra 7,3 do kernel (**medido**).
+  Detalhes em `docs/wireguard.md`.
+
+- 2026-11-13 — G1.31a: Interfaces WireGuard, parte 2 de 3 (janela): Interfaces › WireGuard, a opção A do mockup, no
+  padrão de lista do G0.24. Aba Interfaces com estado, porta, MTU, chave pública e pares `up`;
+  clique direito copia a chave pública, abre "Add Peer…" na interface e "Regenerate Keys…" (com
+  confirmação). Aba Peers com o selo do estado do handshake que o engine calcula (`up`, `idle`,
+  `no-handshake`, `never`, `disabled`), último handshake, endpoint atual (`roamed`), prefixos,
+  rx/tx, filtros por interface e estado, rodapé com contagens e a dica do engine para o par
+  selecionado. Modais com ⓘ em português e a prévia de dois comandos novos,
+  `interface.wireguard.preview` e `interface.wireguard.peers.preview`: rodam o `add`/`set` numa
+  cópia da config e dizem a porta, o firewall `input` (UDP da WAN chega?), o MTU contra o da WAN
+  − 80 (1412 sobre PPPoE), o prefixo de outro par (erro: o kernel o moveria em silêncio), o
+  próximo endereço livre, o laço da rota até o endpoint e os comandos do OK. Editar um par mantém
+  as chaves que o roteador gerou para o cliente. As `wg` continuam em Interfaces.
+
+  Como testar: `cargo run -p corerouter-daemon -- --control 7979`, crie `wg0` e pares pela CLI
+  (`docs/wireguard.md`), abra a GUI com `--connect 127.0.0.1:7979` e Interfaces › WireGuard.
+  Prints em `docs/changes/G1.31a-screenshots/`. Testes: `cargo test -p corerouter-ui wireguard`,
+  `cargo test -p corerouter-engine wireguard`.
+
+- 2026-11-13 — G1.31b: Interfaces WireGuard, parte 3 de 3 (extras): `interface.wireguard.peers.show-client-config`
+  (o `wg-quick` do cliente, grupo `full`, e o QR na janela), `interface.wireguard.wg-export` e
+  `wg-import` (interface, endereços e pares numa transação), os `client_*` do par (RouterOS 7.12),
+  o endpoint por nome DNS (serviço `wireguard-dns` do daemon: resolvedor do roteador, de novo quando
+  o handshake passa de 180 s), o aviso de saúde `wireguard.handshake` (par que o roteador chama e não
+  responde há 5 min), o assistente de firewall no modal da interface ("Accept in Firewall": regra
+  `accept` antes da que derruba), o MTU pela rota até cada endpoint (60/80 bytes por família), o
+  Safe Mode quando a sessão chega pelo túnel (lockout para chave, porta e o par do operador; modal
+  com o risco; `force` nos comandos) e a caixa "Create Routes" no modal do par (rotas estáticas na
+  mesma transação; `0.0.0.0/0` pede confirmação). Corrige também um vazamento do PR 1:
+  `preshared_key` não estava em `SECRET_KEYS`, e as linhas de chave de um texto `wg-quick` agora
+  são mascaradas no journal, no log e na barra de status da GUI.
+
+  Como testar: `docs/wireguard.md`, "Extras". Conferido pela CLI contra o daemon `--backend virtual`
+  (nome `localhost` resolvido, config do cliente, export/import, regra `accept` antes do `drop`,
+  rotas com confirmação, aviso de saúde depois de 5 min) e na GUI (prints em
+  `docs/changes/G1.31b-screenshots/`; o QR do print decodifica para o arquivo do cliente).
+
+- 2026-11-13 — G1.31d: Clamp de MSS como ação de firewall, como o `action=change-mss` do mangle do RouterOS 7:
+  `ip.firewall.mangle.add {action: change-mss, new_mss: 1360 | clamp-to-pmtu, protocol: tcp,
+  tcp_flags: syn}` vira `tcp option maxseg size set 1360` ou `… set rt mtu` na tabela `inet
+  corerouter`. Entra também o matcher `tcp_flags` (`syn,!ack`; todas as tabelas). O engine recusa,
+  como o RouterOS, a regra sem `protocol=tcp` ou sem `syn` em `tcp_flags`, e o `clamp-to-pmtu`
+  antes do roteamento (o kernel recusa `rt mtu` em prerouting/input). `add`/`set` do mangle
+  devolvem `warnings` quando a regra não muda nada (valor ≥ MTU − 40 da interface de saída, ≥ 1460
+  sem ela, < 536, clamp numa interface de 1500, chain `input`). O kernel só baixa o MSS: não
+  precisa do `tcp-mss` que o RouterOS recomenda. Novas expressões do programa: `rt`, `byteorder` e
+  `exthdr write tcpopt` (encoder e leitor de nfnetlink; o `nft -f` do nosso texto e o nosso lote
+  leem igual). A janela de regras ganha "TCP Flags" (aba Advanced) e "New MSS" (aba Action), com
+  ⓘ, e a ação no combo do mangle.
+
+  Como testar: `docs/firewall.md` §3.1. Kernel real: `cargo xtask netns` roda
+  `crates/hal-linux/tests/netns_change_mss.rs` (SYN injetado numa veth, encaminhado, lido na outra:
+  1460 → 1360 IPv4, 1440 → 1340 IPv6, SYN-ACK idem, 1200 fica 1200, ACK não muda, checksum certo;
+  **medido** no kernel 7.0 do host, namespace sem root). CLI contra o daemon `--backend virtual`
+  (regra, aviso de 1460, erros de chain e de `tcp-flags`) e GUI no Xvfb (prints em
+  `docs/changes/G1.31d-screenshots/`).
+
+  Desempenho: uma regra a mais por SYN, só no mangle; o custo por pacote é o do `nft_exthdr` (lê
+  as opções do TCP só quando o resto da regra casa), sem estado nem lock. Nada a dividir.
+
+- 2026-11-13 — G1.6zs: `/certificate` (RouterOS): os certificados com que o roteador atende TLS, base do servidor DoT/DoH
+  da G4.1zf.
+
+  - `certificate.add` faz um certificado autoassinado na hora (o RouterOS separa `add` e `sign`):
+    ECDSA P-256 (ou P-384), CN = identidade e, sem `subject_alt_name`, SAN = a identidade e todo
+    endereço do roteador (os clientes conferem o SAN, nunca o CN: RFC 8310 §8.1, RFC 9462 §4.2);
+    válido desde ontem por 825 dias (o limite da Apple para certificado de servidor TLS; o RouterOS
+    usa 365); número de série aleatório de 128 bits (o Firefox recusa dois certificados com o mesmo
+    emissor e série). Nada é refeito sozinho quando um endereço muda.
+  - `certificate.import` recebe o PEM (o certificado e a cadeia) e a chave (PKCS#8, RSA ou EC),
+    conferida contra o certificado do jeito que o rustls do servidor a carrega (`keys_match`).
+    Sem chave ele fica guardado, com aviso, e nenhum serviço o usa.
+  - A chave fica **selada** na config (como as chaves do WireGuard): nenhuma revisão, diff ou
+    export a mostra; `certificate.export private_key=yes` só para o grupo `full`.
+  - `certificate.print` lê cada certificado (x509-parser, também no WASM): nomes, emissor,
+    autoassinado, tipo de chave, validade, `state` (valid, expiring < 30 dias, expired,
+    not-yet-valid), impressão digital SHA-256, o pin SPKI da RFC 7858 §4.2, cadeia, `used_by` e
+    avisos (autoassinado, sem chave, sem SAN, CA, RSA < 2048, mais de 825 dias).
+  - `ip.service.www-ssl.set certificate=<nome|none>`: o daemon passa a atender com ele (e com a
+    cadeia: `identity_from_pem` agora manda a cadeia inteira); a troca avisa que quem fixou o
+    antigo vai perguntar. Um certificado em uso não se remove; renomear leva o nome aos serviços.
+  - GUI: System › Certificates (tabela com selos de estado, origem e autoassinado; + gera, Import…
+    cola PEM, Copy PEM; detalhe com impressão digital, pin e avisos; ⓘ em português e inglês) e o
+    campo Certificate no modal do www-ssl em IP › Services.
+
+  Como testar: `cargo run -p corerouter-daemon -- --control 7979`, `certificate.add name=web`,
+  `ip.service.www-ssl.set enabled=yes port=8443 certificate=web` e
+  `openssl s_client -connect 127.0.0.1:8443` mostra o certificado novo; a GUI em System ›
+  Certificates. Testes: `cargo nextest run -p corerouter-engine -E 'test(certificate) | test(x509)'`,
+  `-p corerouter-ui -E 'test(certificates)'` e `-p corerouter-daemon -E 'test(web_certificate)'`.
+
+  Custo (**medido**, rustls 0.23.46 + ring, release, Ryzen AI MAX+ 395 carregada): handshake TLS 1.3
+  completo no servidor 92–142 µs com ECDSA P-256 e 490–820 µs com RSA-2048; por isso o padrão é
+  P-256.
+
+- 2026-11-13 — G4.1h: DNS Statistics em abas (opção A aprovada). **Overview**: cartões de consultas/s (média de 10 s, com o pico do período e a hora), acertos do cache e SERVFAIL na média do período (com o EDE mais comum, RFC 8914), latência p50/p99 até o cliente no último minuto e consultas em voo contra `max_concurrent_queries` (com o pico e as vezes que o limite bateu); gráfico de consultas/s e acertos do cache em 1h/24h/7d, da série `dns` nova do Graphing (G4.5), que também aparece na janela Graphs (seis campos: consultas/s, acertos, SERVFAIL %, p50, p99, em voo); grupos Respondido por, Códigos de resposta (agora com as malformadas, que voltavam antes da cadeia sem contar) e Transporte (UDP/TCP × IPv4/IPv6, respostas truncadas, descartes do kernel no socket UDP lidos do `/proc/net/udp`); avisos decididos pelo engine (upstream fora ou com timeouts, SERVFAIL alto, limite de simultâneas, cache despejando, descartes no socket). **Upstreams**: tabela por servidor (via UDP/DoT/DoH, respostas/s, RTT p50/p95, timeouts %, SERVFAIL %, TC→TCP, selo up/slow/down com o tempo) e histograma do RTT em <1, 1–10, 10–100, 100–500, 500–1600 e >1600 ms. **Cache**: entradas, usado/máximo, despejos (as que expiram primeiro saem para caber a nova; antes não contados), expiradas, vencidas servidas (RFC 8767) e tipos no cache e perguntados. ⓘ em todo rótulo, coluna e aba (explicações em português e inglês; avisos com modelo em português).
+
+  `ip.dns.statistics.print` ganhou `transport`, `malformed`, `ede`, `latency` (p50/p90/p99, 16 faixas e as 6 faixas de leitura), `in_flight`, `in_flight_peak`, `max_concurrent_queries`, `limit_hits`, `now` (último minuto), `cache`, os campos novos de cada upstream, `rtt_ranges` e `warnings`; `system.graph.query` dá `max_at` (a hora do máximo) e aceita `series: "dns"`. O resolvedor conta por servidor timeouts, SERVFAIL, TC→TCP, histograma do RTT, via e quando mudou de estado; o cache conta despejos, expiradas e entradas por tipo; o daemon mede a latência do recv ao send, expõe o `Gate` das simultâneas e lê os descartes do socket.
+
+  Desempenho: o `Mutex<Counters>` único e os mapas com chave string viraram 16 faixas alinhadas a 128 bytes com arrays fixos (categoria, rcode, tipo, EDE, histograma); cada thread conta na sua faixa (`try_lock`, a seguinte se ocupada), a leitura soma. O Space-Saving dos clientes passou de varredura O(n) por cliente novo para heap mínimo indexado, O(log n). Antes/depois em `benches/statistics.rs` (abaixo). Os contadores das abas Names e Clients ficam para a segunda etapa.
+
+  Como testar: `cargo run -p corerouter-daemon -- --control 7979 --dns-port 5353`, `ip.dns.set allow_remote_requests=yes servers=…`, consultas com `dig @127.0.0.1 -p 5353`, e a GUI (`--connect 127.0.0.1:7979`) em IP › DNS › Statistics; `cargo nextest run -p corerouter-proto-dns -p corerouter-engine -E 'test(statistics) | test(dns_statistics) | test(histogram)'`.
+
+- 2026-11-13 — G4.1za: DNS Statistics ganhou as abas **Names** e **Clients** (G4.1zb). **Names** tem duas partes:
+
+  - os nomes mais perguntados, de todos os clientes juntos, com consultas, fração e consultas/s;
+  - os domínios cujos nomes receberam NXDOMAIN ou SERVFAIL, com as duas contagens, falhas/s e
+    quantos nomes diferentes falharam (HyperLogLog de 256 bytes, ±6,5 %).
+
+  Um ataque de subdomínio aleatório aparece como um domínio com milhares de nomes. O motor marca o
+  domínio ("random names") e levanta o aviso `random_subdomain` (Overview e rodapé da aba) quando
+  ele falha a ≥ 20/s com ≥ 200 nomes diferentes. Referências: o `top-queries` do PowerDNS, o
+  `topResponses` do dnsdist e o `stats.frequent` do Knot.
+
+  Domínio de um nome:
+
+  - os dois últimos rótulos;
+  - três sob um ccTLD com segundo nível genérico (`com.br`, `co.uk`, `gov.au`);
+  - reversos por /16 (IPv4) e /32 (IPv6).
+
+  Sem a Public Suffix List. Contra a PSL (parte ICANN, **medido**), a lista própria cobre:
+
+  - 35 % das 3381 regras de dois rótulos sob ccTLD;
+  - 36 % do `.br`, que inclui com/net/org/gov/edu e as profissões;
+  - 100 % do `.mx`.
+
+  A cauda que falta são cidades e prefeituras do `.jp`. Embutir a PSL depende de decisão sobre a
+  licença MPL-2.0 (gap abaixo).
+
+  `ip.dns.statistics.print` ganhou:
+
+  - `names` (`name`, `queries`, `queries_per_sec`, `error`), `names_tracked` e `names_replaced`;
+  - `failing_domains` (`domain`, `nxdomain`, `servfail`, `failures_per_sec`, `names`, `error`,
+    `random`), `domains_tracked` e `domains_replaced`;
+  - por cliente, os campos `queries_per_sec`, `nxdomain`, `nxdomain_percent`, `limited` e
+    `seen_secs`;
+  - o aviso `random_subdomain`.
+
+  O `top` vale para as três listas. As listas ordenam pelo piso garantido do Space-Saving
+  (contagem − erro) e escondem as entradas cuja contagem é mais herdada que própria. Assim os
+  recém-chegados de uma enxurrada não aparecem entre os nomes de verdade.
+
+  Por dentro (`proto-dns`):
+
+  - `sketch.rs`: `TopK` (Space-Saving genérico sobre heap mínimo indexado, chave por hash SipHash
+    com chave aleatória), `Rate` (janela deslizante de 10 s) e `Hll`;
+  - `suffix.rs`: `domain_of`.
+
+  Cada faixa por thread do G4.1h ganhou 256 nomes e 64 domínios ao lado dos 256 clientes. A
+  memória é fixa, cerca de 1 MB nas 16 faixas (**estimado**).
+
+  Como testar:
+
+  - `cargo run -p corerouter-daemon -- --control 7979 --dns-port 5353`, com
+    `ip.dns.set allow_remote_requests=yes allowed_from=127.0.0.0/8` e um estático
+    `name=victim.lan type=nxdomain match_subdomain=yes`;
+  - `dig @127.0.0.1 -p 5353 -b 127.0.0.66 -f <arquivo com milhares de nomes aleatórios sob victim.lan>`;
+  - na GUI (`--connect 127.0.0.1:7979`), IP › DNS › Statistics › Names e Clients.
+
+  Testes: `cargo nextest run -p corerouter-proto-dns -p corerouter-engine -p corerouter-ui -E
+  'test(statistics) | test(sketch) | test(suffix)'`. Inclui proptests da garantia do Space-Saving,
+  da união do HyperLogLog e do domínio como sufixo.
+
+  Correção de passagem no `xtask`: o `bench-check` do `ci --affected` falhava em todo diff que tocasse só o `proto-dns`. O bench `dnssec` tem `required-features`, e com o pacote compilado sozinho nenhum dependente liga a feature. Agora o passo liga as `required-features` dos benches dos pacotes escolhidos (teste `bench_required_features`).
+
+- 2026-11-13 — G4.1zb: Aba **Clients** da DNS Statistics (mesmo PR da G4.1za, onde estão a pesquisa, os números e os
+  prints): cada cliente com consultas/s nos últimos 10 s, consultas desde o reset (com "≤" quando o
+  Space-Saving herdou parte da contagem), fração do total, % de NXDOMAIN, limitadas pelo
+  `max-queries-per-client`, recusadas e "visto há" (cinza depois de um minuto). IPv6 conta por /56,
+  o prefixo que um provedor delega a uma casa (RIPE-690; o fórum BCOP do NIC.br de 2025 propõe o
+  mesmo): uma casa, não cada endereço temporário dos aparelhos (RFC 8981). Só em memória, nunca
+  gravado, e o slot de um cliente não guarda nome nenhum (LGPD, Marco Civil art. 14). Um teste
+  confere que nenhuma chave de nome aparece junto de um cliente. A tabela "Top clients" saiu da
+  Overview e foi para esta aba.
+
+- 2026-11-13 — G4.1zc: O `/metrics` (G4.4) ganhou o encaminhador DNS. Os nomes seguem o CoreDNS
+  (`coredns_dns_requests_total`, `coredns_dns_responses_total{rcode}`,
+  `coredns_dns_request_duration_seconds`) com o prefixo `corerouter_`.
+
+  Contadores do encaminhador:
+
+  - `corerouter_dns_queries_total{answered_by}`;
+  - `corerouter_dns_responses_total{rcode}`;
+  - `corerouter_dns_transport_queries_total{proto,family}`;
+  - `corerouter_dns_truncated_total`, `corerouter_dns_malformed_total` e
+    `corerouter_dns_socket_drops_total`;
+  - `corerouter_dns_extended_errors_total{code,name}` (RFC 8914).
+
+  Latência e consultas em voo:
+
+  - o histograma `corerouter_dns_response_duration_seconds` nas 16 faixas do G4.1h, em segundos,
+    com `_sum` (soma nova no `Statistics`) e `_count`;
+  - os gauges `corerouter_dns_in_flight`, `corerouter_dns_in_flight_peak` e
+    `corerouter_dns_max_concurrent_queries`.
+
+  Upstreams e cache:
+
+  - por servidor: `corerouter_dns_upstream_{answers,failures,timeouts,servfails,truncated}_total{server,via}`,
+    `corerouter_dns_upstream_up` e `corerouter_dns_upstream_srtt_seconds`;
+  - no cache: `corerouter_dns_cache_entries`, `_bytes` e `_max_bytes`, e
+    `corerouter_dns_cache_{evictions,expired}_total`.
+
+  Nomes e clientes ficam fora do `/metrics`: o conjunto de rótulos não tem limite, e o cliente é
+  dado pessoal (LGPD). O `system.metrics` ganhou a chave `dns`, que é `null` sem o encaminhador do
+  daemon. Os contadores do encaminhador zeram com `ip.dns.statistics.reset`, e o Prometheus lê a
+  queda como um reset do contador. Os do resolvedor e do cache contam desde que o daemon subiu.
+
+  O teste de formato do `/metrics` passou a conhecer as séries `_bucket`, `_sum` e `_count` de um
+  histograma.
+
+  Como testar: `cargo run -p corerouter-daemon -- --dns-port 5353 --metrics 9100`, algumas
+  consultas com `dig @127.0.0.1 -p 5353` e depois `curl -s 127.0.0.1:9100/metrics | grep corerouter_dns_`.
+
+- 2026-11-13 — G4.1ze: O encaminhador DNS agora envia o erro estendido (RFC 8914) que cada resposta representa. Antes
+  ele só contava o código. Os códigos e o EXTRA-TEXT (curto, sem nada do cliente nem da lista que
+  casou, §6):
+
+  | Código | Situação | EXTRA-TEXT |
+  |---|---|---|
+  | 18 Prohibited | fora do `allowed_from` | "client not allowed by this resolver" |
+  | 15 Blocked | adlist | "blocked by the router's adlist" |
+  | 3 Stale Answer | RFC 8767 | "no upstream answered; stale answer served (RFC 8767)" |
+  | 13 Cached Error | RFC 9520 | "recent upstream failure, held (RFC 9520)" |
+  | 22 No Reachable Authority | nenhum servidor respondeu | "no upstream server answered" |
+
+  Regras da RFC 8914, conferidas: a RFC não tem errata nem atualização (rfc-editor.org/errata e
+  Datatracker, 2026-11-12).
+
+  - §2: formato OPTION-CODE 15, INFO-CODE de 16 bits em ordem de rede, EXTRA-TEXT UTF-8 sem
+    terminador. Só vai na resposta a uma consulta que trouxe OPT.
+  - §3: quando a resposta UDP passa do tamanho do cliente, o EDE é a primeira coisa descartada e o
+    TC é ligado. Os registros só saem se ainda não couber.
+
+  Um NXDOMAIN estático é resposta do operador e não leva EDE. A estatística conta o mesmo código
+  que vai na resposta (`extended_error` único).
+
+  Testes:
+
+  - `extended_errors_are_sent_with_edns`: 18, 3 e 22, e nada sem OPT;
+  - `ede_option_wire_format`: os bytes da §2;
+  - `ede_is_dropped_first_when_the_reply_is_too_large`: a ordem da §3.
+
+  Conferido com `dig` 9.18 contra o daemon:
+  `; EDE: 22 (No Reachable Authority): (no upstream server answered)`.
+
+- 2026-11-13 — fix-main-clippy-1-100: O Rust 1.100.0 (stable de 2026-11-12) chegou ao CI, que segue o `stable` do `rust-toolchain.toml`,
+  e o clippy novo passou a reprovar `needless_range_loop` em cinco laços de testes do PPPoE do
+  daemon (`pppoe_bng_tests.rs`, `pppoe_ha_tests.rs`, `pppoe_routes_tests.rs`). Isso reprovava o
+  `lint` de todo PR e ia reprovar a `main`. Os laços passam a usar `iter().enumerate()`. Sai
+  também a dependência `thiserror` do `proto-syslog`, sem uso, que o cargo 1.100 passou a avisar.
+  Conferido com `RUSTUP_TOOLCHAIN=1.100.0 cargo xtask ci --only fmt,clippy,wasm` e com os 40
+  testes de PPPoE alterados. Nas máquinas ainda com o 1.99, o `--affected` local não via o erro:
+  quem atualizar o `stable` (`rustup update stable`) passa a ver o mesmo que o CI.

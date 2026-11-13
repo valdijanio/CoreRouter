@@ -54,6 +54,10 @@ pub struct Package {
     /// Workspace packages it depends on (any kind).
     pub deps: Vec<String>,
     pub has_benches: bool,
+    /// Features its bench targets require (`required-features`, as
+    /// `package/feature`): turned on when only some packages are built,
+    /// where the workspace no longer unifies them in.
+    pub bench_features: Vec<String>,
     /// Has a `tests/netns*.rs` (the `netns` step runs it).
     pub has_netns: bool,
     /// Changed by the diff itself (not only a dependent of a changed one).
@@ -197,16 +201,38 @@ pub fn parse_metadata(json: &serde_json::Value, root: &Path) -> Vec<Package> {
                         && tname.is_some_and(|n| n.starts_with(prefix))
                 })
             };
+            let bench_features = bench_features(name, targets.map_or(&[][..], Vec::as_slice));
             Some(Package {
                 name: name.to_owned(),
                 dir: format!("{}/", dir.display()),
                 deps,
                 has_benches: has_kind("bench", ""),
+                bench_features,
                 has_netns: has_kind("test", "netns"),
                 changed: false,
             })
         })
         .collect()
+}
+
+/// The `required-features` of a package's bench targets, as
+/// `package/feature`, sorted and without repeats.
+fn bench_features(package: &str, targets: &[serde_json::Value]) -> Vec<String> {
+    let mut out: Vec<String> = targets
+        .iter()
+        .filter(|t| {
+            t.get("kind")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|k| k.iter().any(|k| k == "bench"))
+        })
+        .filter_map(|t| t.get("required-features")?.as_array())
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(|f| format!("{package}/{f}"))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Files changed since the merge base of `HEAD` and `base`, including
@@ -247,9 +273,28 @@ mod tests {
             dir: dir.into(),
             deps: deps.iter().map(|d| (*d).into()).collect(),
             has_benches: false,
+            bench_features: Vec::new(),
             has_netns: false,
             changed: false,
         }
+    }
+
+    /// A bench that needs a feature (`proto-dns`'s `dnssec`): `ci
+    /// --affected` builds the package alone, without the dependent that
+    /// turns the feature on, so it has to ask for it.
+    #[test]
+    fn bench_required_features() {
+        let targets: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"kind": ["lib"], "name": "x"},
+                {"kind": ["bench"], "name": "dnssec", "required-features": ["dnssec"]},
+                {"kind": ["bench"], "name": "zones"},
+                {"kind": ["test"], "name": "t", "required-features": ["other"]}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            bench_features("corerouter-proto-dns", &targets),
+            ["corerouter-proto-dns/dnssec"]
+        );
     }
 
     /// model ← hal ← engine ← ui ← gui; hal ← hal-linux (benches, netns)

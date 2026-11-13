@@ -21,17 +21,28 @@
 //! (`try_lock`). Reading sums the stripes. Before, one `Mutex` for all made
 //! four threads slower than one (`benches/statistics.rs`).
 //!
-//! Bounded memory under a flood from spoofed sources: each stripe keeps at
-//! most [`CLIENTS_PER_STRIPE`] clients. Past that, the client with the
-//! fewest queries makes room (Space-Saving, Metwally et al. 2005): the
-//! newcomer starts from that count, so the top of the list is right and
-//! each count is off by at most its `error`. The smallest is the root of a
-//! min-heap: O(log n) per query, where the scan it replaces was O(n) for
-//! every new client (CGNAT: thousands of them).
+//! Bounded memory under a flood from spoofed sources or random names
+//! (G4.1za, G4.1zb): each stripe keeps at most [`CLIENTS_PER_STRIPE`]
+//! clients, [`NAMES_PER_STRIPE`] names and [`DOMAINS_PER_STRIPE`] failing
+//! domains in a [`TopK`] (Space-Saving): past that, the key with the lowest
+//! count makes room and the newcomer starts from it, so the top of each
+//! list is right and each count is off by at most its `error`. The cost of
+//! a query is a keyed hash of its name (and of its domain when it failed),
+//! three table lookups and at most 8 heap swaps each: bounded by the table
+//! sizes, never by how many clients or names there are.
+//!
+//! Privacy (LGPD, Marco Civil art. 14): a client's slot keeps counts only
+//! (queries, NXDOMAIN, refused, limited, when last seen), never a name;
+//! names and domains are counted for all clients together. Nothing is
+//! written anywhere: the counts live in memory until the reset or a
+//! restart. IPv6 clients count per /56 ([`CLIENT_V6_PREFIX`]), what an
+//! operator delegates to a subscriber: one home, not each temporary
+//! address of its devices (RFC 8981).
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
-use std::net::IpAddr;
+use std::hash::{BuildHasher, RandomState};
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
@@ -41,6 +52,8 @@ use hickory_proto::rr::RecordType;
 use crate::histogram::Hist;
 use crate::resolver::{Source, Transport};
 use crate::server::{Forwarder, Query, Reply, Stage, Step};
+use crate::sketch::{Hll, Rate, TopK};
+use crate::suffix::domain_of;
 
 pub(crate) const STAGE: Stage = Stage {
     name: "statistics",
@@ -55,6 +68,13 @@ pub const STRIPES: usize = 16;
 pub const CLIENTS_PER_STRIPE: usize = 256;
 /// Clients counted at most, all stripes.
 pub const MAX_CLIENTS: usize = STRIPES * CLIENTS_PER_STRIPE;
+/// Names asked counted one by one in each stripe.
+pub const NAMES_PER_STRIPE: usize = 256;
+/// Domains with NXDOMAIN or SERVFAIL counted in each stripe (each holds a
+/// 256-byte [`Hll`] of its names).
+pub const DOMAINS_PER_STRIPE: usize = 64;
+/// IPv6 clients count per prefix of this length.
+pub const CLIENT_V6_PREFIX: u8 = 56;
 /// Record types counted one by one (`0..TYPES`, CAA = 257 included); the
 /// rest go under `other`.
 const TYPES: usize = 260;
@@ -81,6 +101,7 @@ pub const CATEGORIES: [&str; 14] = [
     "other",
 ];
 const OTHER_CATEGORY: usize = CATEGORIES.len() - 1;
+const LIMIT: usize = 5;
 const MALFORMED: usize = 10;
 
 /// Response codes by their number (RFC 6895 §2.3, the 4 header bits).
@@ -90,7 +111,34 @@ const RCODES: [&str; 16] = [
 ];
 /// Index of a dropped query (no reply) and of a code past 15.
 const DROPPED: usize = RCODES.len();
+const SERVFAIL: usize = 2;
+const NXDOMAIN: usize = 3;
 const OTHER_RCODE: usize = RCODES.len() + 1;
+
+/// The RFC 8914 code a reply stands for: what a stage set (`q.ede`), or
+/// the one its category implies (§4.19 Prohibited for the ACL, §4.4 Stale
+/// Answer, §4.16 Blocked for the adlist).
+pub(crate) fn extended_error(q: &Query) -> Option<u16> {
+    q.ede.or(match category(q.answered_by, q.source.as_ref()) {
+        "refused" => Some(EDE_PROHIBITED),
+        "stale" => Some(EDE_STALE),
+        "adlist" => Some(EDE_BLOCKED),
+        _ => None,
+    })
+}
+
+/// RFC 8914 §2: the short EXTRA-TEXT sent with code `code` (§3: SHOULD be
+/// short; §6: nothing about the client or the list that matched).
+pub fn ede_text(code: u16) -> &'static str {
+    match code {
+        EDE_STALE => "no upstream answered; stale answer served (RFC 8767)",
+        EDE_CACHED_ERROR => "recent upstream failure, held (RFC 9520)",
+        EDE_BLOCKED => "blocked by the router's adlist",
+        EDE_PROHIBITED => "client not allowed by this resolver",
+        EDE_NO_REACHABLE_AUTHORITY => "no upstream server answered",
+        _ => "",
+    }
+}
 
 /// RFC 8914 §4: the extended errors the forwarder can stand for.
 pub const EDE_PROHIBITED: u16 = 18;
@@ -99,15 +147,43 @@ pub const EDE_BLOCKED: u16 = 15;
 pub const EDE_CACHED_ERROR: u16 = 13;
 pub const EDE_NO_REACHABLE_AUTHORITY: u16 = 22;
 
-/// One client's counts.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// One client's counts (never a name: see the module).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ClientStats {
     pub queries: u64,
     /// Refused (ACL, limit over TCP) or dropped (limit over UDP).
     pub refused: u64,
+    /// Of them, over `max_queries_per_client`.
+    pub limited: u64,
+    pub nxdomain: u64,
     /// Space-Saving: how many of `queries` may belong to clients it
     /// replaced (0 while the table never filled up).
     pub error: u64,
+    /// The forwarder's clock (ms) at its last query.
+    pub last_ms: u64,
+    /// Queries per second over the last 10 s.
+    pub per_sec: f64,
+}
+
+/// A name asked, all clients together.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct NameStats {
+    pub queries: u64,
+    pub error: u64,
+    pub per_sec: f64,
+}
+
+/// A domain whose names got NXDOMAIN or SERVFAIL ([`domain_of`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DomainStats {
+    pub nxdomain: u64,
+    pub servfail: u64,
+    /// Space-Saving's error on `nxdomain + servfail`.
+    pub error: u64,
+    /// Failures per second over the last 10 s.
+    pub per_sec: f64,
+    /// Different names that failed (HyperLogLog, ±6.5 %).
+    pub names: u64,
 }
 
 /// The counts since the last reset, all stripes summed.
@@ -136,16 +212,21 @@ pub struct Counters {
     pub types: BTreeMap<u16, u64>,
     /// Queries of types past the ones counted one by one.
     pub types_other: u64,
-    /// Replies per RFC 8914 extended error they stand for (counted, not
-    /// sent: the forwarder does not add the EDNS option yet).
+    /// Replies per RFC 8914 extended error they stand for (sent too, as
+    /// EDNS option 15, to the clients that used EDNS: G4.1ze).
     pub ede: BTreeMap<u16, u64>,
     /// Time from the query read to the reply sent, as the daemon measured
     /// it ([`Statistics::answered_in`]).
     pub latency: Hist,
+    /// The sum of those times, µs (a Prometheus histogram's `_sum`).
+    pub latency_sum_us: u64,
     /// Client answers per upstream server.
     pub upstreams: BTreeMap<IpAddr, u64>,
-    /// Clients that had to replace another (a stripe's table was full).
+    /// Clients, names and failing domains that had to replace another (a
+    /// stripe's table was full).
     pub clients_replaced: u64,
+    pub names_replaced: u64,
+    pub domains_replaced: u64,
     /// Queries waiting for an upstream now and the most at once
     /// (`max_concurrent_queries`; the daemon reports them).
     pub in_flight: u64,
@@ -155,14 +236,23 @@ pub struct Counters {
     pub socket_drops: u64,
 }
 
-/// A copy to show: the counters and the `top` clients.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// A copy to show: the counters and the `top` clients, names and failing
+/// domains.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
     pub counters: Counters,
     /// Clients tracked now.
     pub clients_tracked: usize,
-    /// Most queries first.
+    /// Most queries first; an IPv6 client is its /56 ([`CLIENT_V6_PREFIX`]).
     pub top_clients: Vec<(IpAddr, ClientStats)>,
+    pub names_tracked: usize,
+    /// Most queries first.
+    pub top_names: Vec<(String, NameStats)>,
+    pub domains_tracked: usize,
+    /// Most failures (NXDOMAIN + SERVFAIL) first.
+    pub failing_domains: Vec<(String, DomainStats)>,
+    /// The clock (ms) the rates were taken at.
+    pub now_ms: u64,
 }
 
 impl Snapshot {
@@ -196,8 +286,32 @@ struct Shard {
     types_other: u64,
     ede: [u64; EDE_CODES + 1],
     latency: Hist,
+    latency_sum_us: u64,
     upstreams: BTreeMap<IpAddr, u64>,
-    clients: Clients,
+    clients: TopK<IpAddr, ClientSlot, CLIENTS_PER_STRIPE>,
+    names: TopK<String, Rate, NAMES_PER_STRIPE>,
+    domains: TopK<String, DomainSlot, DOMAINS_PER_STRIPE>,
+    /// The latest clock seen (the rates' "now" when the caller has none).
+    last_ms: u64,
+}
+
+/// What a client's slot counts besides its queries.
+#[derive(Debug, Clone, Copy, Default)]
+struct ClientSlot {
+    refused: u64,
+    limited: u64,
+    nxdomain: u64,
+    last_ms: u64,
+    rate: Rate,
+}
+
+/// What a failing domain's slot counts.
+#[derive(Debug, Clone, Default)]
+struct DomainSlot {
+    nxdomain: u64,
+    servfail: u64,
+    rate: Rate,
+    names: Hll,
 }
 
 impl Default for Shard {
@@ -212,8 +326,12 @@ impl Default for Shard {
             types_other: 0,
             ede: [0; EDE_CODES + 1],
             latency: Hist::default(),
+            latency_sum_us: 0,
             upstreams: BTreeMap::new(),
-            clients: Clients::default(),
+            clients: TopK::default(),
+            names: TopK::default(),
+            domains: TopK::default(),
+            last_ms: 0,
         }
     }
 }
@@ -224,22 +342,28 @@ impl Default for Shard {
 struct Stripe(Mutex<Shard>);
 
 /// What one reply counts.
-struct Event {
+struct Event<'a> {
     category: usize,
     rcode: usize,
     qtype: Option<u16>,
+    /// The name asked (lowercase, no final dot); none for a malformed one.
+    name: Option<&'a str>,
     client: IpAddr,
     tcp: bool,
     refused: bool,
     truncated: bool,
     ede: Option<u16>,
     upstream: Option<IpAddr>,
+    now_ms: u64,
 }
 
 /// The forwarder's statistics (`f.state::<Statistics>()`).
 #[derive(Debug)]
 pub struct Statistics {
     stripes: Box<[Stripe]>,
+    /// Keys the hash of names, domains and clients (one for all stripes:
+    /// their tables are summed by key).
+    hasher: RandomState,
     in_flight: AtomicU64,
     in_flight_peak: AtomicU64,
     /// The kernel's count, what it was at the last reset, and what was
@@ -253,6 +377,7 @@ impl Default for Statistics {
     fn default() -> Self {
         Self {
             stripes: (0..STRIPES).map(|_| Stripe::default()).collect(),
+            hasher: RandomState::new(),
             in_flight: AtomicU64::new(0),
             in_flight_peak: AtomicU64::new(0),
             socket_drops: AtomicU64::new(0),
@@ -310,18 +435,25 @@ impl Statistics {
         }
     }
 
-    /// The counters and the `top` clients, all stripes summed.
+    /// The counters and the `top` clients, names and failing domains, all
+    /// stripes summed, with the rates at the latest query counted.
     pub fn snapshot(&self, top: usize) -> Snapshot {
-        self.gather(Some(top))
+        self.gather(Some(top), None)
+    }
+
+    /// [`Self::snapshot`] with the rates and "last seen" taken at `now_ms`
+    /// (the forwarder's clock: the daemon's `clock_ms`).
+    pub fn snapshot_at(&self, top: usize, now_ms: Option<u64>) -> Snapshot {
+        self.gather(Some(top), now_ms)
     }
 
     /// The counters only (no client is copied): what the engine reads
     /// every second for the graph and the window's "now" values.
     pub fn totals(&self) -> Counters {
-        self.gather(None).counters
+        self.gather(None, None).counters
     }
 
-    fn gather(&self, top: Option<usize>) -> Snapshot {
+    fn gather(&self, top: Option<usize>, now_ms: Option<u64>) -> Snapshot {
         let mut c = Counters::default();
         let mut transport = [0u64; 4];
         let mut answered = [0u64; CATEGORIES.len()];
@@ -329,6 +461,11 @@ impl Statistics {
         let mut types = [0u64; TYPES];
         let mut ede = [0u64; EDE_CODES + 1];
         let mut clients: HashMap<IpAddr, ClientStats> = HashMap::new();
+        let mut names: HashMap<String, (NameStats, Vec<Rate>)> = HashMap::new();
+        let mut domains: HashMap<String, (DomainStats, Vec<Rate>, Hll)> = HashMap::new();
+        let mut latest = 0u64;
+        // Rates are read per stripe at the end (each stripe's own buckets).
+        let mut client_rates: Vec<(IpAddr, Rate)> = Vec::new();
         for s in self.stripes.iter() {
             let g = locked(&s.0);
             add(&mut transport, &g.transport);
@@ -340,18 +477,46 @@ impl Statistics {
             c.malformed += g.malformed;
             c.types_other += g.types_other;
             c.latency.merge(&g.latency);
+            c.latency_sum_us = c.latency_sum_us.saturating_add(g.latency_sum_us);
             for (ip, n) in &g.upstreams {
                 *c.upstreams.entry(*ip).or_default() += n;
             }
-            c.clients_replaced += g.clients.replaced;
+            c.clients_replaced += g.clients.replaced();
+            c.names_replaced += g.names.replaced();
+            c.domains_replaced += g.domains.replaced();
+            latest = latest.max(g.last_ms);
             if top.is_none() {
                 continue;
             }
-            for slot in &g.clients.slots {
-                let e = clients.entry(slot.ip).or_default();
-                e.queries += slot.stats.queries;
-                e.refused += slot.stats.refused;
-                e.error += slot.stats.error;
+            for e in g.clients.iter() {
+                let st = clients.entry(e.key).or_default();
+                st.queries += e.count;
+                st.error += e.error;
+                st.refused += e.value.refused;
+                st.limited += e.value.limited;
+                st.nxdomain += e.value.nxdomain;
+                st.last_ms = st.last_ms.max(e.value.last_ms);
+                client_rates.push((e.key, e.value.rate));
+            }
+            for e in g.names.iter() {
+                let (st, rates) = names.entry(e.key.clone()).or_default();
+                st.queries += e.count;
+                st.error += e.error;
+                rates.push(e.value);
+            }
+            for e in g.domains.iter() {
+                let (st, rates, hll) = domains.entry(e.key.clone()).or_default();
+                st.nxdomain += e.value.nxdomain;
+                st.servfail += e.value.servfail;
+                st.error += e.error;
+                rates.push(e.value.rate);
+                hll.merge(&e.value.names);
+            }
+        }
+        let now = now_ms.unwrap_or(latest).max(latest);
+        for (ip, r) in client_rates {
+            if let Some(st) = clients.get_mut(&ip) {
+                st.per_sec += r.per_sec(now);
             }
         }
         let [udp4, udp6, tcp4, tcp6] = transport;
@@ -396,14 +561,58 @@ impl Statistics {
                 .load(Ordering::Relaxed)
                 .saturating_sub(self.socket_drops_base.load(Ordering::Relaxed)),
         );
+        let top = top.unwrap_or(0);
         let clients_tracked = clients.len();
-        let mut top_clients: Vec<(IpAddr, ClientStats)> = clients.into_iter().collect();
-        top_clients.sort_by(|a, b| b.1.queries.cmp(&a.1.queries).then(a.0.cmp(&b.0)));
-        top_clients.truncate(top.unwrap_or(0));
+        let mut top_clients: Vec<(IpAddr, ClientStats)> = clients
+            .into_iter()
+            .filter(|(_, c)| own(c.queries, c.error))
+            .collect();
+        top_clients.sort_by(|a, b| {
+            floor(b.1.queries, b.1.error)
+                .cmp(&floor(a.1.queries, a.1.error))
+                .then(a.0.cmp(&b.0))
+        });
+        top_clients.truncate(top);
+        let names_tracked = names.len();
+        let mut top_names: Vec<(String, NameStats)> = names
+            .into_iter()
+            .map(|(k, (mut st, rates))| {
+                st.per_sec = rates.iter().map(|r| r.per_sec(now)).sum();
+                (k, st)
+            })
+            .filter(|(_, n)| own(n.queries, n.error))
+            .collect();
+        top_names.sort_by(|a, b| {
+            floor(b.1.queries, b.1.error)
+                .cmp(&floor(a.1.queries, a.1.error))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        top_names.truncate(top);
+        let domains_tracked = domains.len();
+        let mut failing_domains: Vec<(String, DomainStats)> = domains
+            .into_iter()
+            .map(|(k, (mut st, rates, hll))| {
+                st.per_sec = rates.iter().map(|r| r.per_sec(now)).sum();
+                // Never more names than failures (the estimate's error).
+                st.names = hll.estimate().min(st.nxdomain + st.servfail);
+                (k, st)
+            })
+            .filter(|(_, d)| own(d.nxdomain + d.servfail, d.error))
+            .collect();
+        failing_domains.sort_by(|a, b| {
+            let fails = |d: &DomainStats| floor(d.nxdomain + d.servfail, d.error);
+            fails(&b.1).cmp(&fails(&a.1)).then_with(|| a.0.cmp(&b.0))
+        });
+        failing_domains.truncate(top);
         Snapshot {
             counters: c,
             clients_tracked,
             top_clients,
+            names_tracked,
+            top_names,
+            domains_tracked,
+            failing_domains,
+            now_ms: now,
         }
     }
 
@@ -423,7 +632,9 @@ impl Statistics {
     /// A reply went out `us` microseconds after its query was read (the
     /// daemon measures it: the chain has no clock of its own).
     pub fn answered_in(&self, us: u64) {
-        self.shard().latency.add_us(us);
+        let mut s = self.shard();
+        s.latency.add_us(us);
+        s.latency_sum_us = s.latency_sum_us.saturating_add(us);
     }
 
     /// Queries waiting for an upstream now (the daemon's gate).
@@ -448,7 +659,7 @@ impl Statistics {
 
     /// A message refused before the chain (`reply`: the bytes sent back,
     /// `None`: dropped).
-    pub(crate) fn malformed(&self, client: IpAddr, tcp: bool, reply: Option<&[u8]>) {
+    pub(crate) fn malformed(&self, client: IpAddr, tcp: bool, reply: Option<&[u8]>, now_ms: u64) {
         // The reply's RCODE: the low 4 bits of byte 3 (RFC 1035 §4.1.1).
         let rcode = match reply {
             Some(r) => r.get(3).map_or(OTHER_RCODE, |b| usize::from(b & 0x0f)),
@@ -458,24 +669,21 @@ impl Statistics {
             category: MALFORMED,
             rcode,
             qtype: None,
+            name: None,
             client: client.to_canonical(),
             tcp,
             refused: true,
             truncated: false,
             ede: None,
             upstream: None,
+            now_ms,
         });
     }
 
     fn record(&self, q: &Query, r: &Reply) {
         let what = category(q.answered_by, q.source.as_ref());
         let refused = q.dropped() || r.rcode == ResponseCode::Refused;
-        let ede = q.ede.or(match what {
-            "refused" => Some(EDE_PROHIBITED),
-            "stale" => Some(EDE_STALE),
-            "adlist" => Some(EDE_BLOCKED),
-            _ => None,
-        });
+        let ede = extended_error(q);
         let upstream = match q.source {
             Some(Source::Server(ip)) if what == "upstream" => Some(ip),
             _ => None,
@@ -484,16 +692,27 @@ impl Statistics {
             category: index(what),
             rcode: if q.dropped() { DROPPED } else { rcode(r.rcode) },
             qtype: Some(u16::from(q.qtype)),
+            name: Some(q.asked.key.as_str()),
             client: q.client,
             tcp: q.tcp,
             refused,
             truncated: q.truncated(),
             ede,
             upstream,
+            now_ms: q.now_ms,
         });
     }
 
-    fn count(&self, e: &Event) {
+    fn count(&self, e: &Event<'_>) {
+        // Hashed before the lock (the stripe is held for the counting only).
+        let client = client_key(e.client);
+        let client_hash = self.hasher.hash_one(client);
+        let name = e.name.map(|n| (n, self.hasher.hash_one(n)));
+        let failed = e.rcode == NXDOMAIN || e.rcode == SERVFAIL;
+        let domain = name
+            .filter(|_| failed)
+            .map(|(n, _)| domain_of(n))
+            .map(|d| (d, self.hasher.hash_one(d)));
         let mut s = self.shard();
         let t = usize::from(e.tcp) * 2 + usize::from(e.client.is_ipv6());
         bump(s.transport.get_mut(t));
@@ -518,8 +737,59 @@ impl Statistics {
         {
             *s.upstreams.entry(ip).or_default() += 1;
         }
-        s.clients.touch(e.client, e.refused);
+        s.last_ms = s.last_ms.max(e.now_ms);
+        let nx = e.rcode == NXDOMAIN;
+        if let Some(c) = s.clients.add(client_hash, &client, 1) {
+            let v = &mut c.value;
+            v.refused += u64::from(e.refused);
+            v.limited += u64::from(e.category == LIMIT);
+            v.nxdomain += u64::from(nx);
+            v.last_ms = v.last_ms.max(e.now_ms);
+            v.rate.add(e.now_ms, 1);
+        }
+        if let Some((n, h)) = name
+            && let Some(slot) = s.names.add(h, n, 1)
+        {
+            slot.value.add(e.now_ms, 1);
+        }
+        if let (Some((d, dh)), Some((_, nh))) = (domain, name)
+            && let Some(slot) = s.domains.add(dh, d, 1)
+        {
+            let v = &mut slot.value;
+            if nx {
+                v.nxdomain += 1;
+            } else {
+                v.servfail += 1;
+            }
+            v.rate.add(e.now_ms, 1);
+            v.names.add(nh);
+        }
     }
+}
+
+/// The key a client counts under: itself, or its /56 for IPv6.
+pub fn client_key(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => {
+            let keep = u128::MAX << (128 - u32::from(CLIENT_V6_PREFIX));
+            IpAddr::V6(Ipv6Addr::from(u128::from(v6) & keep))
+        }
+        v4 => v4,
+    }
+}
+
+/// Space-Saving's guaranteed part of a count: at least this many events
+/// were the key's own. Lists sort by it, so a newcomer that took over a
+/// slot's count does not sit among keys that earned theirs.
+fn floor(count: u64, error: u64) -> u64 {
+    count.saturating_sub(error)
+}
+
+/// Whether most of a count is the key's own (more than its inherited
+/// `error`): a newcomer of a flood (count ≈ error) is tracked but not
+/// listed.
+fn own(count: u64, error: u64) -> bool {
+    error == 0 || floor(count, error) > error
 }
 
 #[cold]
@@ -557,124 +827,6 @@ fn index(name: &str) -> usize {
         "none" => 11,
         "parse" => 12,
         _ => OTHER_CATEGORY,
-    }
-}
-
-/// One client in a stripe's table.
-#[derive(Debug, Clone, Copy)]
-struct Slot {
-    ip: IpAddr,
-    stats: ClientStats,
-}
-
-/// Space-Saving over a min-heap of the slots by `queries`: the root is
-/// the client a newcomer replaces.
-#[derive(Debug, Default)]
-struct Clients {
-    slots: Vec<Slot>,
-    /// Slot numbers, a min-heap by their `queries`.
-    heap: Vec<usize>,
-    /// Where each slot sits in `heap`.
-    pos: Vec<usize>,
-    index: HashMap<IpAddr, usize>,
-    /// Newcomers that replaced someone.
-    replaced: u64,
-}
-
-impl Clients {
-    fn queries(&self, h: usize) -> u64 {
-        self.heap
-            .get(h)
-            .and_then(|s| self.slots.get(*s))
-            .map_or(u64::MAX, |s| s.stats.queries)
-    }
-
-    fn swap(&mut self, a: usize, b: usize) {
-        self.heap.swap(a, b);
-        for h in [a, b] {
-            if let Some(&slot) = self.heap.get(h)
-                && let Some(p) = self.pos.get_mut(slot)
-            {
-                *p = h;
-            }
-        }
-    }
-
-    /// The count at heap position `h` grew: down to its place.
-    fn sift_down(&mut self, mut h: usize) {
-        loop {
-            let (l, r) = (2 * h + 1, 2 * h + 2);
-            let mut least = h;
-            if self.queries(l) < self.queries(least) {
-                least = l;
-            }
-            if self.queries(r) < self.queries(least) {
-                least = r;
-            }
-            if least == h {
-                return;
-            }
-            self.swap(h, least);
-            h = least;
-        }
-    }
-
-    fn sift_up(&mut self, mut h: usize) {
-        while h > 0 {
-            let parent = (h - 1) / 2;
-            if self.queries(parent) <= self.queries(h) {
-                return;
-            }
-            self.swap(h, parent);
-            h = parent;
-        }
-    }
-
-    /// One query from `ip`.
-    fn touch(&mut self, ip: IpAddr, refused: bool) {
-        let slot = match self.index.get(&ip) {
-            Some(s) => *s,
-            None if self.slots.len() < CLIENTS_PER_STRIPE => {
-                let s = self.slots.len();
-                self.slots.push(Slot {
-                    ip,
-                    stats: ClientStats::default(),
-                });
-                self.heap.push(s);
-                self.pos.push(s);
-                self.index.insert(ip, s);
-                self.sift_up(s);
-                s
-            }
-            None => {
-                // Space-Saving: the smallest count makes room.
-                let Some(&s) = self.heap.first() else { return };
-                let Some(old) = self.slots.get_mut(s) else {
-                    return;
-                };
-                let min = old.stats.queries;
-                let gone = old.ip;
-                *old = Slot {
-                    ip,
-                    stats: ClientStats {
-                        queries: min,
-                        refused: 0,
-                        error: min,
-                    },
-                };
-                self.index.remove(&gone);
-                self.index.insert(ip, s);
-                self.replaced += 1;
-                s
-            }
-        };
-        if let Some(st) = self.slots.get_mut(slot) {
-            st.stats.queries += 1;
-            st.stats.refused += u64::from(refused);
-        }
-        if let Some(h) = self.pos.get(slot).copied() {
-            self.sift_down(h);
-        }
     }
 }
 
@@ -839,7 +991,7 @@ mod tests {
         s.set_in_flight(2);
         s.set_socket_drops(10);
         let c = s.snapshot(1).counters;
-        assert_eq!(c.latency.total(), 2);
+        assert_eq!((c.latency.total(), c.latency_sum_us), (2, 40_080));
         assert_eq!((c.in_flight, c.in_flight_peak), (2, 7));
         assert_eq!(c.socket_drops, 10);
         s.reset();
@@ -863,53 +1015,106 @@ mod tests {
                             category: index("cache"),
                             rcode: 0,
                             qtype: Some(1),
+                            name: Some("www.example.com"),
                             client: IpAddr::from([10, t, (i % 7) as u8, 1]),
                             tcp: false,
                             refused: false,
                             truncated: i % 10 == 0,
                             ede: None,
                             upstream: None,
+                            now_ms: 1000 + u64::from(i),
                         });
                     }
                 });
             }
         });
-        let c = s.snapshot(1).counters;
+        let snap = s.snapshot(1);
+        let c = &snap.counters;
         let n = (STRIPES as u64 + 4) * 1000;
         assert_eq!((c.queries, c.udp4, c.truncated), (n, n, n / 10));
         assert_eq!(c.types.get(&1), Some(&n));
+        assert_eq!(snap.top_names[0].0, "www.example.com");
+        assert_eq!(snap.top_names[0].1.queries, n, "every stripe's count summed");
     }
 
     #[test]
-    fn space_saving_keeps_the_heavy_client() {
-        let mut c = Clients::default();
-        let heavy: IpAddr = [10, 0, 0, 1].into();
-        for _ in 0..50 {
-            c.touch(heavy, false);
+    fn names_domains_and_clients() {
+        use crate::server::tests::{LAN, Up, ask, forwarder, run};
+        let f = forwarder(|c| c.ip.dns.max_queries_per_client = 0);
+        let mut up = Up::new();
+        for _ in 0..3 {
+            run(&f, &mut up, LAN, &ask("www.example.com.", RecordType::A));
         }
-        // A flood from as many sources as the table holds, and more.
-        for i in 0..(CLIENTS_PER_STRIPE as u32 * 3) {
-            c.touch(IpAddr::from((0x0a01_0000 + i).to_be_bytes()), true);
+        // A random-subdomain attack: every name new, every answer NXDOMAIN.
+        for i in 0..300 {
+            let name = format!("nope.r{i}.victim.com.br.");
+            run(&f, &mut up, [192, 168, 88, 20], &ask(&name, RecordType::A));
         }
-        assert_eq!(c.slots.len(), CLIENTS_PER_STRIPE, "bounded");
-        assert_eq!(c.index.len(), CLIENTS_PER_STRIPE);
-        let h = c.slots.iter().find(|s| s.ip == heavy).unwrap().stats;
-        assert_eq!((h.queries, h.error), (50, 0), "never replaced");
-        assert!(c.replaced >= CLIENTS_PER_STRIPE as u64 * 2 - 1);
-        // Every count is at least the truth and at most truth + error.
-        assert!(c.slots.iter().all(|s| s.stats.queries > s.stats.error));
-        // The heap holds the smallest at its root, every slot once.
-        let min = c.slots.iter().map(|s| s.stats.queries).min().unwrap();
-        assert_eq!(c.queries(0), min);
-        let mut seen: Vec<usize> = c.heap.clone();
-        seen.sort_unstable();
-        assert_eq!(seen, (0..CLIENTS_PER_STRIPE).collect::<Vec<_>>());
-        for (h, slot) in c.heap.iter().enumerate() {
-            assert_eq!(c.pos[*slot], h);
-            for child in [2 * h + 1, 2 * h + 2] {
-                assert!(c.queries(h) <= c.queries(child), "heap order at {h}");
-            }
-        }
+        let s = f.statistics().snapshot_at(5, Some(up.now));
+        assert_eq!(s.top_names.len(), 5);
+        assert_eq!(s.top_names[0].0, "www.example.com");
+        assert_eq!(s.top_names[0].1.queries, 3);
+        assert!(s.names_tracked <= NAMES_PER_STRIPE, "bounded: {}", s.names_tracked);
+        assert!(
+            s.top_names.iter().all(|(_, n)| n.error == 0 || n.queries - n.error > n.error),
+            "no flood newcomer listed among the names: {:?}",
+            s.top_names
+        );
+        let (d, st) = s.failing_domains.first().cloned().unwrap();
+        assert_eq!(d, "victim.com.br", "every name under its domain");
+        assert_eq!((st.nxdomain, st.servfail), (300, 0));
+        assert!((260..=300).contains(&st.names), "≈300 different names: {}", st.names);
+        assert!(st.per_sec > 0.0);
+        // The clients: counts only, the attacker's NXDOMAIN share.
+        let attacker = s.top_clients.iter().find(|(ip, _)| *ip == IpAddr::from([192, 168, 88, 20])).unwrap().1;
+        assert_eq!((attacker.queries, attacker.nxdomain), (300, 300));
+        assert!(attacker.last_ms > 0 && attacker.last_ms <= up.now, "seen at {}", attacker.last_ms);
+        let lan = s.top_clients.iter().find(|(ip, _)| *ip == IpAddr::from(LAN)).unwrap().1;
+        assert_eq!((lan.queries, lan.nxdomain, lan.limited), (3, 0, 0));
+        f.statistics().reset();
+        let s = f.statistics().snapshot(5);
+        assert!(s.top_names.is_empty() && s.failing_domains.is_empty());
+    }
+
+    #[test]
+    fn the_limit_and_ipv6_per_56() {
+        let s = Statistics::default();
+        let ev = |client: IpAddr, category: usize, rcode: usize| Event {
+            category,
+            rcode,
+            qtype: Some(1),
+            name: Some("a.example"),
+            client,
+            tcp: false,
+            refused: category == LIMIT,
+            truncated: false,
+            ede: None,
+            upstream: None,
+            now_ms: 5_000,
+        };
+        let home: IpAddr = "2001:db8:1:ab12::1".parse().unwrap();
+        let laptop: IpAddr = "2001:db8:1:abff:1234::9".parse().unwrap();
+        let neighbour: IpAddr = "2001:db8:1:ac00::1".parse().unwrap();
+        s.count(&ev(home, 0, 0));
+        s.count(&ev(laptop, LIMIT, DROPPED));
+        s.count(&ev(neighbour, 0, NXDOMAIN));
+        let snap = s.snapshot(10);
+        let prefix: IpAddr = "2001:db8:1:ab00::".parse().unwrap();
+        let c = snap.top_clients.iter().find(|(ip, _)| *ip == prefix).unwrap().1;
+        assert_eq!((c.queries, c.limited, c.refused), (2, 1, 1), "one /56, one home");
+        assert_eq!(snap.clients_tracked, 2);
+        assert_eq!(client_key("::ffff:10.0.0.1".parse().unwrap()), IpAddr::from([10, 0, 0, 1]));
+        // A SERVFAIL counts for the domain too; a NOERROR does not.
+        assert_eq!(snap.failing_domains.len(), 1);
+        assert_eq!(snap.failing_domains[0].1.nxdomain, 1);
+        s.count(&ev(home, 2, SERVFAIL));
+        assert_eq!(s.snapshot(10).failing_domains[0].1.servfail, 1);
+        // The rates: 4 queries at 5 s, read at 10 s (half of the window
+        // still holds them).
+        let at = s.snapshot_at(10, Some(10_000));
+        let total: f64 = at.top_clients.iter().map(|(_, c)| c.per_sec).sum();
+        assert!((total - 0.4).abs() < 1e-9, "{total}");
+        assert_eq!(at.now_ms, 10_000);
     }
 
     #[test]
