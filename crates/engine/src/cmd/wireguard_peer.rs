@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 use super::args::{opt_bool, opt_str, opt_text, opt_u32, req_parse, req_str};
 use super::wireguard::{sensitive, shown, wireguard_mut, wireguard_of};
 use super::{CommandSpec, always};
+use crate::sealing::SealKey;
 use crate::wireguard as wg;
 use crate::{EngineError, Result, Session};
 
@@ -245,8 +246,33 @@ fn update(peer: &mut WgPeer, p: &Value, warnings: &mut Vec<String>) -> Result<()
     Ok(())
 }
 
+/// Whether `p` brings a key to seal (a private key or a preshared key):
+/// only then does the command need the sealing key.
+pub(super) fn seals(p: &Value) -> bool {
+    // Any private_key (empty = auto) is sealed; a preshared key unless it
+    // clears it.
+    p.get("private_key").and_then(Value::as_str).is_some()
+        || p.get("preshared_key")
+            .and_then(Value::as_str)
+            .is_some_and(|t| !matches!(t.trim(), "" | "none"))
+}
+
+/// The sealing key, when `p` needs one.
+pub(super) fn seal_for(s: &mut Session, p: &Value) -> Result<Option<std::sync::Arc<SealKey>>> {
+    if seals(p) {
+        crate::sealing::key(s).map(Some).map_err(EngineError::Internal)
+    } else {
+        Ok(None)
+    }
+}
+
+fn sealed(seal: Option<&SealKey>, k: &wg::Key) -> Result<corerouter_model::sealed::Sealed> {
+    let seal = seal.ok_or_else(|| EngineError::Internal("no sealing key for a WireGuard key".into()))?;
+    seal.seal(&wg::encode(k)).map_err(EngineError::Internal)
+}
+
 /// Keys: `public_key`, `private_key` (auto or a key), `preshared_key`.
-fn keys(s: &mut Session, peer: &mut WgPeer, p: &Value, new: bool) -> Result<()> {
+fn keys(seal: Option<&SealKey>, peer: &mut WgPeer, p: &Value, new: bool) -> Result<()> {
     let public = key_param(p, "public_key")?;
     let private = key_param(p, "private_key")?;
     if public.is_some() && private.is_some() {
@@ -270,8 +296,7 @@ fn keys(s: &mut Session, peer: &mut WgPeer, p: &Value, new: bool) -> Result<()> 
                 EngineError::bad("private_key", "must be auto or a WireGuard key (44 characters of base64)")
             })?
         };
-        let seal = crate::sealing::key(s).map_err(EngineError::Internal)?;
-        peer.private_key = seal.seal(&wg::encode(&k)).map_err(EngineError::Internal)?;
+        peer.private_key = sealed(seal, &k)?;
         peer.public_key = wg::wg_key(&wg::public_of(&k));
     }
     if new && peer.public_key.is_empty() {
@@ -291,8 +316,7 @@ fn keys(s: &mut Session, peer: &mut WgPeer, p: &Value, new: bool) -> Result<()> 
                     EngineError::bad("preshared_key", "must be auto, none or a key of 44 characters of base64 (wg genpsk)")
                 })?
             };
-            let seal = crate::sealing::key(s).map_err(EngineError::Internal)?;
-            peer.preshared_key = seal.seal(&wg::encode(&k)).map_err(EngineError::Internal)?;
+            peer.preshared_key = sealed(seal, &k)?;
         }
     }
     Ok(())
@@ -364,8 +388,14 @@ fn check(iface: &IfName, w: &Wireguard, peer: &WgPeer, warnings: &mut Vec<String
 }
 
 fn add(s: &mut Session, p: &Value) -> Result<Value> {
+    let seal = seal_for(s, p)?;
+    add_on(s.store_mut().candidate_mut(), seal.as_deref(), p)
+}
+
+/// `interface.wireguard.peers.add` on `cfg` (the candidate, or a copy for
+/// the preview). `seal`: needed when `p` brings a key ([`seal_for`]).
+pub(super) fn add_on(cfg: &mut Config, seal: Option<&SealKey>, p: &Value) -> Result<Value> {
     let iface: IfName = req_parse(p, "interface")?;
-    let cfg = s.store().candidate();
     let w = wireguard_of(cfg, "interface", &iface)?;
     if w.peers.len() >= MAX_PEERS {
         return Err(EngineError::bad("interface", format!("{iface} has {MAX_PEERS} peers, the most one interface takes")));
@@ -382,19 +412,24 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
     let mut peer = WgPeer::new(name.clone(), WgKey::default());
     let mut warnings = Vec::new();
     update(&mut peer, p, &mut warnings)?;
-    keys(s, &mut peer, p, true)?;
-    let w = wireguard_of(s.store().candidate(), "interface", &iface)?;
+    keys(seal, &mut peer, p, true)?;
+    let w = wireguard_of(cfg, "interface", &iface)?;
     check(&iface, w, &peer, &mut warnings)?;
     let public = peer.public_key.to_string();
-    if let Some(w) = wireguard_mut(s, &iface) {
+    if let Some(w) = wireguard_mut(cfg, &iface) {
         w.peers.push(peer);
     }
     Ok(json!({ "name": name, "public_key": public, "warnings": warnings }))
 }
 
 fn set(s: &mut Session, p: &Value) -> Result<Value> {
+    let seal = seal_for(s, p)?;
+    set_on(s.store_mut().candidate_mut(), seal.as_deref(), p)
+}
+
+/// `interface.wireguard.peers.set` on `cfg`.
+pub(super) fn set_on(cfg: &mut Config, seal: Option<&SealKey>, p: &Value) -> Result<Value> {
     let name = req_str(p, "name")?.trim().to_owned();
-    let cfg = s.store().candidate();
     let (iface, at) = find(cfg, &name)?;
     let mut w = wireguard_of(cfg, "name", &iface)?.clone();
     let mut peer = w.peers.remove(at);
@@ -408,11 +443,11 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let mut warnings = Vec::new();
     update(&mut peer, p, &mut warnings)?;
-    keys(s, &mut peer, p, false)?;
+    keys(seal, &mut peer, p, false)?;
     check(&iface, &w, &peer, &mut warnings)?;
     let out = json!({ "name": peer.name, "public_key": peer.public_key, "warnings": warnings });
     w.peers.insert(at, peer);
-    if let Some(slot) = wireguard_mut(s, &iface) {
+    if let Some(slot) = wireguard_mut(cfg, &iface) {
         *slot = w;
     }
     Ok(out)
@@ -421,7 +456,7 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     let name = req_str(p, "name")?.trim().to_owned();
     let (iface, at) = find(s.store().candidate(), &name)?;
-    if let Some(w) = wireguard_mut(s, &iface)
+    if let Some(w) = wireguard_mut(s.store_mut().candidate_mut(), &iface)
         && at < w.peers.len()
     {
         w.peers.remove(at);
@@ -432,7 +467,7 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
 fn toggle(s: &mut Session, p: &Value, off: bool) -> Result<Value> {
     let name = req_str(p, "name")?.trim().to_owned();
     let (iface, at) = find(s.store().candidate(), &name)?;
-    if let Some(peer) = wireguard_mut(s, &iface).and_then(|w| w.peers.get_mut(at)) {
+    if let Some(peer) = wireguard_mut(s.store_mut().candidate_mut(), &iface).and_then(|w| w.peers.get_mut(at)) {
         peer.disabled = off;
     }
     Ok(json!({ "name": name }))
@@ -475,13 +510,9 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
         }
         let committed = s.store().running().interfaces.contains_key(iface);
         let status = if i.disabled || !committed { None } else { s.wireguard_status(iface).0 };
+        let by_key = wg::status_by_key(status.as_ref());
         for peer in &w.peers {
-            let st = status.as_ref().and_then(|st| {
-                let k = wg::decode(peer.public_key.as_str())?;
-                st.peers.iter().find(|x| x.public_key == k)
-            });
-            let age = st.and_then(|x| x.last_handshake_unix).map(|t| now.saturating_sub(t));
-            let state = PeerState::of(peer, i.disabled, age, st.is_some_and(|x| x.tx_bytes > 0));
+            let (state, age, st) = wg::peer_view(peer, i.disabled, &by_key, now);
             let current = st.and_then(|x| x.endpoint);
             let configured = peer
                 .endpoint_address
