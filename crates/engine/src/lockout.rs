@@ -442,6 +442,14 @@ impl Session {
                 link.peer, link.local
             ));
         }
+        // G1.31b: the session comes through a WireGuard tunnel whose key,
+        // port or peer changes.
+        if !local.is_loopback()
+            && let Some(wg) = way_back(before, peer, local).and_then(|w| w.parse::<IfName>().ok())
+            && let Some(why) = crate::wireguard::tunnel_cut(before, after, &wg, peer)
+        {
+            return Some(format!("{why} (tcp {} -> {}). {HOW_TO_PROCEED}", link.peer, link.local));
+        }
         // G2.5a: the XDP filter drops in the driver, before any rule.
         let ingress = ingress_interface(after, peer, local);
         if let Some(list) = crate::xdp::blocks(after, dyn_after, ingress.as_deref(), peer) {

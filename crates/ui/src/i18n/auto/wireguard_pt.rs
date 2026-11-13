@@ -3,13 +3,26 @@
 
 /// Labels: (English, Portuguese).
 pub(super) const LABELS: &[(&str, &str)] = &[
+    (r##"Accept in Firewall"##, r##"Aceitar no firewall"##),
     (r##"Add Peer…"##, r##"Adicionar par…"##),
     (r##"Allowed Address"##, r##"Endereço permitido"##),
+    (r##"Asking the router…"##, r##"Perguntando ao roteador…"##),
+    (r##"Client Allowed Address"##, r##"Endereço permitido do cliente"##),
+    (r##"Client Config"##, r##"Config do cliente"##),
+    (r##"Client Config…"##, r##"Config do cliente…"##),
+    (r##"Client DNS"##, r##"DNS do cliente"##),
+    (r##"Client Endpoint"##, r##"Endpoint do cliente"##),
     (r##"Comment"##, r##"Comentário"##),
+    (r##"Copy"##, r##"Copiar"##),
     (r##"Copy Public Key"##, r##"Copiar chave pública"##),
+    (r##"Create Routes"##, r##"Criar rotas"##),
     (r##"Disabled"##, r##"Desativado"##),
     (r##"Endpoint"##, r##"Endpoint"##),
     (r##"Endpoint Port"##, r##"Porta do endpoint"##),
+    (r##"Export"##, r##"Exportar"##),
+    (r##"Export…"##, r##"Exportar…"##),
+    (r##"Import WireGuard"##, r##"Importar WireGuard"##),
+    (r##"Import…"##, r##"Importar…"##),
     (r##"Interface"##, r##"Interface"##),
     (r##"Interfaces"##, r##"Interfaces"##),
     (r##"Last Handshake"##, r##"Último handshake"##),
@@ -23,6 +36,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"No WireGuard interface yet: add one in the Interfaces tab first."##, r##"Nenhuma interface WireGuard ainda: crie uma na aba Interfaces primeiro."##),
     (r##"No WireGuard interface. + adds one: the router makes its key pair; then give it an address (IP › Addresses) and add its peers."##, r##"Nenhuma interface WireGuard. + cria uma: o roteador gera o par de chaves; depois dê a ela um endereço (IP › Addresses) e adicione os pares."##),
     (r##"No peers. + adds one: paste the peer's public key, or leave it empty and the router makes the pair (for the client config)."##, r##"Nenhum par. + adiciona um: cole a chave pública do par, ou deixe vazia e o roteador gera o par de chaves (para a config do cliente)."##),
+    (r##"Paste a wg-quick file ([Interface] and [Peer] sections): one transaction makes the interface, its addresses and peers."##, r##"Cole um arquivo do wg-quick (seções [Interface] e [Peer]): uma transação só cria a interface, os endereços e os pares."##),
     (r##"Peers"##, r##"Pares"##),
     (r##"Persistent Keepalive"##, r##"Keepalive persistente"##),
     (r##"Preshared Key"##, r##"Chave pré-compartilhada"##),
@@ -32,14 +46,18 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Regenerate Keys…"##, r##"Gerar chaves novas…"##),
     (r##"Responder"##, r##"Só responde"##),
     (r##"Rx"##, r##"Rx"##),
+    (r##"Show keys"##, r##"Mostrar chaves"##),
     (r##"State"##, r##"Estado"##),
     (r##"The router makes a new key pair for this interface. Every peer must then get the new public key, and every tunnel handshakes again."##, r##"O roteador gera um par de chaves novo para esta interface. Todos os pares precisarão receber a chave pública nova, e todos os túneis refazem o handshake."##),
+    (r##"The text and the QR code carry the client's private key: only group full sees them."##, r##"O texto e o QR levam a chave privada do cliente: só o grupo full os vê."##),
     (r##"Tx"##, r##"Tx"##),
     (r##"WireGuard"##, r##"WireGuard"##),
     (r##"WireGuard Interface"##, r##"Interface WireGuard"##),
     (r##"WireGuard Peer"##, r##"Par WireGuard"##),
     (r##"peers"##, r##"pares"##),
+    (r##"resolved"##, r##"resolvido"##),
     (r##"roamed"##, r##"mudou de IP"##),
+    (r##"warning"##, r##"aviso"##),
 ];
 
 /// Explanations: (key, Markdown).
@@ -54,6 +72,11 @@ O `/interface wireguard` do RouterOS: túneis cifrados para outros roteadores (s
 - As chaves nascem no roteador e ficam seladas na configuração.
 - Erros que o kernel esconderia são recusados: um prefixo em dois pares, um par com a chave da própria interface.
 - Cada par tem um estado calculado pelos tempos do protocolo: `up`, `idle`, `no-handshake`, `never`."##,
+    ),
+    (
+        "wireguard.accept_firewall",
+        r##"## O que é
+Quando o firewall `input` derruba o UDP da porta da interface (a checagem avisa), marque: a mesma transação cria uma regra `accept` para a porta logo antes da regra que derruba (o assistente de firewall). Sem ela, os pares não alcançam esta interface."##,
     ),
     (
         "wireguard.disabled",
@@ -114,9 +137,32 @@ Os prefixos de onde este par pode enviar, e que a interface envia para ele (rote
 - `0.0.0.0/0` manda a este par tudo o que nenhum outro par casa."##,
     ),
     (
+        "wireguard.peer.client_allowed_address",
+        r##"## O que é
+O que o cliente manda pelo túnel (`AllowedIPs` do arquivo dele). Vazio: tudo (`0.0.0.0/0, ::/0`), todo o tráfego dele passa por este roteador. Só algumas redes (`10.9.0.0/24, 192.168.88.0/24`): túnel dividido."##,
+    ),
+    (
+        "wireguard.peer.client_dns",
+        r##"## O que é
+Servidores DNS escritos no arquivo do cliente (`DNS =`), por exemplo o endereço deste roteador no túnel. Vazio: nenhum (o cliente fica com o dele)."##,
+    ),
+    (
+        "wireguard.peer.client_endpoint",
+        r##"## O que é
+Onde o cliente encontra este roteador (`Endpoint =` do arquivo dele): um nome (`vpn.exemplo.com.br`) ou um endereço, com `:porta` ou não (aí vale a porta da interface). Vazio: o endereço do roteador na WAN; atrás de NAT esse endereço é privado, então ponha aqui o nome público."##,
+    ),
+    (
+        "wireguard.peer.create_routes",
+        r##"## O que é
+Uma rota estática por esta interface para cada prefixo do par que ainda não tem rota para cá (`ip.route.add gateway=<wg>`), na mesma transação. A rede da própria interface e uma rota que já aponta para cá ficam de fora.
+
+## Cuidado
+`0.0.0.0/0` mandaria todo o tráfego do roteador sem rota mais específica para o túnel: a janela pede um sim explícito. As rotas são estáticas comuns: remover o par não as remove."##,
+    ),
+    (
         "wireguard.peer.endpoint_address",
         r##"## O que é
-Para onde vai o primeiro handshake: o endereço público do par. Vazio: este roteador espera o par chamar (um notebook ou celular atrás de NAT). Depois que o par fala, o kernel o segue quando o endereço muda (roaming): a tabela mostra onde ele está agora, com o selo `roamed`.
+Para onde vai o primeiro handshake: o endereço público do par, ou um nome DNS (`vpn.exemplo.com.br`) que o roteador resolve, e resolve de novo quando o handshake passa de 3 minutos (o par pode ter mudado de endereço). Vazio: este roteador espera o par chamar (um notebook ou celular atrás de NAT). Depois que o par fala, o kernel o segue quando o endereço muda (roaming): a tabela mostra onde ele está agora, com o selo `roamed`.
 
 ## Cuidado
 Se uma rota manda o endpoint para dentro desta mesma interface (uma rota padrão pelo túnel), o handshake não chega: crie uma rota de host até o endpoint pelo gateway da WAN."##,

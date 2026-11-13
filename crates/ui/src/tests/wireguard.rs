@@ -227,6 +227,70 @@ fn add_peer_from_an_interface_opens_the_modal_on_it() {
 }
 
 #[test]
+fn client_config_shows_the_file_masked_and_its_qr_code() {
+    let mut h = open(lab());
+    peers_tab(&mut h);
+    on_panel(&mut h, |p, app, ui| p.client_config_for_test(app, ui, "escritorio"));
+    settle(&mut h);
+    assert!(h.has_text("Client Config <escritorio>"));
+    let t = panel(&mut h).text.as_ref().unwrap();
+    let text = t.text.clone().unwrap();
+    assert!(text.contains("[Interface]") && text.contains("Address = 10.9.0.8/29"), "{text}");
+    assert!(crate::wireguard::qr_modules(&text).is_some_and(|(w, _)| w >= 21), "a QR code");
+    assert!(shows(&h, "PrivateKey = ••••••••"), "the key masked until Show keys");
+    let key = text.lines().find(|l| l.starts_with("PrivateKey")).unwrap().to_owned();
+    fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(t) => out.push(t.galley.text().to_owned()),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+            _ => {}
+        }
+    }
+    let mut all = Vec::new();
+    h.shapes.iter().for_each(|s| walk(&s.shape, &mut all));
+    let leak: Vec<&String> = all.iter().filter(|t| t.contains(&key)).collect();
+    assert!(leak.is_empty(), "{key} on screen: {leak:?}");
+    // A peer whose key was pasted: the file says where the key goes.
+    on_panel(&mut h, |p, app, ui| p.client_config_for_test(app, ui, "notebook"));
+    settle(&mut h);
+    assert!(shows(&h, "the router does not hold this client's private key"));
+}
+
+#[test]
+fn import_makes_an_interface_from_a_pasted_file() {
+    let mut h = open(lab());
+    let text = format!("[Interface]\nPrivateKey = dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo=\nAddress = 10.50.0.1/24\n\n# Name = loja\n[Peer]\nPublicKey = {K1}\nAllowedIPs = 10.50.0.2/32\nEndpoint = loja.example.com:51820\n");
+    on_panel(&mut h, |p, app, _| p.import_for_test(app, &text));
+    settle(&mut h);
+    assert!(shows(&h, "Import WireGuard"));
+    h.click(h.text("OK"));
+    settle(&mut h);
+    assert!(panel(&mut h).import.is_none(), "{:?}", h.app.log());
+    let l = lock(&h.session).execute("interface.wireguard.peers.list", &json!({})).unwrap();
+    let loja = l.as_array().unwrap().iter().find(|r| r["name"] == "loja").unwrap().clone();
+    assert_eq!(loja["endpoint_address"], "loja.example.com");
+}
+
+#[test]
+fn create_routes_goes_with_the_peer() {
+    let mut h = open(lab());
+    peers_tab(&mut h);
+    panel(&mut h).filters.toggle("interface", "wg0");
+    on_panel(&mut h, |p, app, ui| p.act_for_test(app, Act::Add, ui, true));
+    settle(&mut h);
+    let m = panel(&mut h).peer_modal.as_mut().unwrap();
+    m.values.insert("name", "loja2".into());
+    m.values.insert("allowed_address", "10.60.0.0/16".into());
+    m.values.insert("create_routes", "yes".into());
+    settle(&mut h);
+    assert!(shows(&h, "routes through wg0: 10.60.0.0/16"));
+    h.click(h.text("OK"));
+    settle(&mut h);
+    let r = lock(&h.session).execute("ip.route.list", &json!({})).unwrap();
+    assert!(r.to_string().contains("10.60.0.0/16"), "{:?}", h.app.log());
+}
+
+#[test]
 fn wireguard_interfaces_are_in_interfaces_too() {
     let mut h = Harness::with_session(lab());
     h.app.open.clear();

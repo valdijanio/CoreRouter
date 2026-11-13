@@ -15,6 +15,11 @@ RouterOS `/interface wireguard`: encrypted tunnels to other routers (site to sit
 - Each peer has a state worked out from the protocol's timers: `up`, `idle`, `no-handshake`, `never`."##,
     ),
     (
+        "wireguard.accept_firewall",
+        r##"## What it is
+When the input firewall drops UDP to the interface's port (the check says so), tick it: the same transaction adds an accept rule for the port right before the rule that drops it (the firewall assistant). Without it, peers cannot reach this interface."##,
+    ),
+    (
         "wireguard.disabled",
         r##"## What it is
 Kept in the configuration, out of the kernel: a disabled interface takes its tunnels down; a disabled peer stops only that tunnel."##,
@@ -73,9 +78,32 @@ Prefixes this peer may send from, and that the interface sends to it (cryptokey 
 - `0.0.0.0/0` sends this peer everything no other peer matches."##,
     ),
     (
+        "wireguard.peer.client_allowed_address",
+        r##"## What it is
+What the client sends into the tunnel (`AllowedIPs` of its file). Empty: everything (`0.0.0.0/0, ::/0`), so all of its traffic goes through this router. Only some networks (`10.9.0.0/24, 192.168.88.0/24`): a split tunnel."##,
+    ),
+    (
+        "wireguard.peer.client_dns",
+        r##"## What it is
+DNS servers written in the client's file (`DNS =`), for example this router's tunnel address. Empty: none (the client keeps its own)."##,
+    ),
+    (
+        "wireguard.peer.client_endpoint",
+        r##"## What it is
+Where the client finds this router (`Endpoint =` of its file): a name (`vpn.example.com`) or an address, with `:port` or not (the interface's port then). Empty: the router's address on the WAN; behind a NAT that is a private address, so set the public name here."##,
+    ),
+    (
+        "wireguard.peer.create_routes",
+        r##"## What it is
+A static route through this interface for each of the peer's prefixes that nothing routes there yet (`ip.route.add gateway=<wg>`), in the same transaction. The interface's own network and a route that already points here are skipped.
+
+## Careful
+`0.0.0.0/0` would send all the router's traffic without a narrower route into the tunnel: the window asks for an explicit yes. The routes are ordinary static routes: removing the peer does not remove them."##,
+    ),
+    (
         "wireguard.peer.endpoint_address",
         r##"## What it is
-Where the first handshake goes: the peer's public address. Empty: this router waits for the peer to call (a notebook or phone behind NAT). Once the peer talks, the kernel follows it when its address changes (roaming): the table then shows where it is now with the `roamed` chip.
+Where the first handshake goes: the peer's public address, or a DNS name (`vpn.example.com`) the router resolves, and resolves again when the handshake gets older than 3 minutes (the peer may have a new address). Empty: this router waits for the peer to call (a notebook or phone behind NAT). Once the peer talks, the kernel follows it when its address changes (roaming): the table then shows where it is now with the `roamed` chip.
 
 ## Careful
 If a route sends the endpoint into this same interface (a default route through the tunnel), the handshake goes nowhere: add a host route to the endpoint through the WAN gateway."##,
