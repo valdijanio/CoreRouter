@@ -12,9 +12,10 @@
 //!   `allow_remote_requests` says.
 //! - up to four UDP threads per family on one socket ([`udp_threads`]):
 //!   each reads a query and runs the chain up to the cache; a cache hit is
-//!   answered at once. A miss gets a thread of its
-//!   own, at most `max_concurrent_queries` of them (more: SERVFAIL), so
-//!   one slow upstream never holds the cache hits back.
+//!   answered at once. A miss goes to a "dns-query" worker of its own
+//!   ([`pool`]: kept for the next miss, not created per query), at most
+//!   `max_concurrent_queries` of them (more: SERVFAIL), so one slow
+//!   upstream never holds the cache hits back.
 //! - one TCP thread per family; a thread per connection, at most
 //!   `max_concurrent_tcp_sessions` (a quarter of them per source), closed
 //!   after 10 s idle (RFC 7766 §6.2.3). A peer that may not ask anything
@@ -51,6 +52,9 @@ use corerouter_proto_dns::zone;
 use super::dns::RouterDns;
 use corerouter_model::service::Listen;
 use sock::{Udp, bind_tcp};
+
+#[path = "dns_server/pool.rs"]
+mod pool;
 
 /// RFC 1035 §4.2.1.
 const DEFAULT_PORT: u16 = 53;
@@ -190,6 +194,8 @@ pub(crate) struct Server {
     /// Effects dropped because the queue was full.
     effects_dropped: AtomicU64,
     updates: SyncSender<UdpUpdate>,
+    /// The workers of the misses (G4.1r).
+    misses: Arc<pool::Pool>,
     /// Socket threads of an older epoch stop (the config turned the
     /// forwarder off, or the daemon is closing).
     epoch: AtomicU64,
@@ -317,10 +323,9 @@ fn udp_loop(srv: Arc<Server>, sock: Arc<Udp>, epoch: u64) {
                     }
                     pass.srv.effects(&mut d);
                 };
-                if let Err(e) = thread::Builder::new().name("dns-query".into()).spawn(worker) {
-                    // The query went down with the closure: SERVFAIL from
-                    // its bytes, so the client tries elsewhere at once.
-                    log::warn!("DNS: no thread for a query: {e}");
+                if srv.misses.submit(Box::new(worker)).is_err() {
+                    // No worker: SERVFAIL from its bytes, so the client
+                    // tries elsewhere at once.
                     if let Some(r) = servfail(packet) {
                         sock.send(&r, from, local);
                     }
@@ -627,6 +632,7 @@ fn prepare(
         effects: tx,
         effects_dropped: AtomicU64::new(0),
         updates: utx,
+        misses: Arc::new(pool::Pool::default()),
         epoch: AtomicU64::new(0),
         shutdown,
     });
