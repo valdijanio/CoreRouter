@@ -144,7 +144,7 @@ mod tests {
         let mut s = Session::virtual_lab();
         let v = s.execute("system.health.check", &json!({})).unwrap();
         let checks = v["checks"].as_array().unwrap();
-        assert_eq!(checks.len(), 23);
+        assert_eq!(checks.len(), 24);
         let by = |k: &str| checks.iter().find(|c| c["key"] == k).unwrap().clone();
         assert_eq!(by("root.verity")["severity"], "unknown", "no A/B image in the lab");
         assert_eq!(by("routes.ecmp")["severity"], "ok", "the lab has no ECMP (G1.27j)");
@@ -155,6 +155,7 @@ mod tests {
         assert_eq!(by("services")["severity"], "unknown", "no supervisor in the lab");
         assert_eq!(by("bgp.end-of-rib")["severity"], "unknown", "no routing daemon in the lab (G3.9fj)");
         assert_eq!(by("bgp.gr-bfd")["severity"], "unknown");
+        assert_eq!(by("ospf.lsdb")["severity"], "unknown", "no routing daemon in the lab (G3.4r)");
         assert_eq!(by("temperature")["severity"], "ok");
         assert_eq!(by("memory.ecc")["severity"], "ok", "G1.6zy: two ECC modules, no error");
         // G1.29b: ether6 is a USB 3 adapter on a USB 2.0 port.

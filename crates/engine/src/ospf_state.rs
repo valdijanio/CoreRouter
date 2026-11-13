@@ -125,6 +125,19 @@ impl Session {
             .map(|i| corerouter_model::ospf_state::OspfStubState {
                 instance: i.name.clone(),
                 admin: i.stub_router && !i.disabled,
+                // G3.4r: the lab floods nothing: an empty database.
+                lsas: (!i.disabled).then_some(0),
+                lsas_other: (!i.disabled && i.version == corerouter_model::ospf::Version::V2).then_some(0),
+                max_lsa: i
+                    .max_lsa
+                    .filter(|_| !i.disabled && i.version == corerouter_model::ospf::Version::V2)
+                    .map(|m| corerouter_model::ospf_state::MaxLsaState {
+                        limit: u64::from(m.limit),
+                        state: "normal".into(),
+                        ignore_entries: 0,
+                        ignore_count: u64::from(m.ignore_count),
+                        ignore_remaining_secs: None,
+                    }),
                 ..Default::default()
             })
             .collect();
