@@ -367,7 +367,15 @@ fn iface_v2(s: &mut String, b: &Binding<'_>, open: Opener<'_>) -> Result<(), Str
     if let Some(d) = t.transmit_delay {
         let _ = writeln!(s, " ip ospf transmit-delay {d}");
     }
-    let _ = writeln!(s, " ip ospf area {}", b.area.area_id);
+    if b.addresses.is_empty() {
+        let _ = writeln!(s, " ip ospf area {}", b.area.area_id);
+    } else {
+        // G3.4m: only the addresses inside the template's networks
+        // (`bind::Binding::addresses`).
+        for a in &b.addresses {
+            let _ = writeln!(s, " ip ospf area {} {}", b.area.area_id, a.addr());
+        }
+    }
     if t.mtu_ignore {
         let _ = writeln!(s, " ip ospf mtu-ignore");
     }
@@ -776,6 +784,23 @@ mod tests {
             lifetime(Some(0), None).unwrap(),
             "00:00:00 Jan  1 1970 infinite"
         );
+    }
+
+    /// G3.4m: a management address next to the OSPF link stays out of
+    /// OSPF.
+    #[test]
+    fn a_second_address_outside_the_networks_stays_out() {
+        let mut cfg = sample();
+        let mut mgmt = cfg.ip.addresses.iter().nth(1).unwrap().clone();
+        mgmt.id = corerouter_model::ItemId(99);
+        mgmt.address = "10.99.0.1/24".parse().unwrap();
+        cfg.ip.addresses.push(mgmt);
+        let text = render(&cfg, &|s| Some(s.stored().to_owned())).unwrap();
+        let e2 = text.split("interface ether2\n").nth(1).unwrap();
+        let e2 = &e2[..e2.find("exit\n").unwrap()];
+        assert!(e2.contains(" ip ospf area 0.0.0.0 10.0.2.1\n"), "{e2}");
+        assert!(!e2.contains(" ip ospf area 0.0.0.0\n"), "{e2}");
+        assert!(!e2.contains("10.99.0.1"), "{e2}");
     }
 
     #[test]
