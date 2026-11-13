@@ -530,6 +530,7 @@ mod tests {
         // The next second closes the graph's slot of the first.
         s.tick(t0 + 2);
         let out = s.execute("ip.dns.statistics.print", &json!({})).unwrap();
+        assert!(out["since"].is_u64(), "counting has a start: {}", out["since"]);
         assert_eq!(out["queries"], 32);
         assert_eq!(out["transport"]["udp4"], 32);
         assert_eq!(out["limit_hits"], 1);

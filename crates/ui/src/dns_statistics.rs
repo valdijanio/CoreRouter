@@ -57,7 +57,7 @@ pub(crate) const PANEL: Panel = Panel {
         id: WIN,
         group: "IP",
         title: "DNS Statistics",
-        size: [820.0, 640.0],
+        size: [860.0, 800.0],
         escape: true,
     }],
     new: || Box::new(DnsStatsPanel::default()),

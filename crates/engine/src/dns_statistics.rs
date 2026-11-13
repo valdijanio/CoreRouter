@@ -222,6 +222,9 @@ impl Session {
             .filter(|prev| now > prev.t && now - prev.t <= crate::graph::HEARTBEAT)
             .map(|prev| point(&window(prev, &reading), reading.in_flight));
         if let Some(rt) = self.ext_mut::<DnsStatsRuntime>() {
+            // Registered before the clock had a time (the daemon's first
+            // second): counting started at the first tick.
+            rt.since.get_or_insert(now);
             if rt.ring.back().is_some_and(|p| p.t >= now) {
                 // Two ticks in one second: the first stays.
                 return;
