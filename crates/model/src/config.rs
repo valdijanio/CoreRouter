@@ -87,6 +87,9 @@ pub struct System {
     /// `/system boot` (G1.6zn): the system in RAM.
     #[serde(skip_serializing_if = "crate::boot::Boot::is_default")]
     pub boot: crate::boot::Boot,
+    /// `/certificate` (G1.6zs): the certificates services serve with.
+    #[serde(skip_serializing_if = "crate::certificate::Certificates::is_default")]
+    pub certificates: crate::certificate::Certificates,
 }
 
 impl Default for System {
@@ -105,6 +108,7 @@ impl Default for System {
             usb_watchdog: crate::usb_watchdog::UsbWatchdog::default(),
             wifi: crate::wifi::WifiSettings::default(),
             boot: crate::boot::Boot::default(),
+            certificates: crate::certificate::Certificates::default(),
         }
     }
 }

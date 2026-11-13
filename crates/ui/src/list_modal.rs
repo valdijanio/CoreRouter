@@ -58,6 +58,9 @@ pub(crate) enum Input {
     Check,
     /// A write-only secret: typed hidden; when editing, empty keeps it.
     Secret(&'static str),
+    /// Several lines in a fixed-width font (a pasted PEM, G1.6zs); the
+    /// hint shows while empty.
+    Multiline(&'static str),
 }
 
 /// One field: the parameter it fills, its label (English, through `tr`)
@@ -459,6 +462,18 @@ fn field_input(ui: &mut Ui, form: &dialog::Form, f: &Field, v: &mut String, opti
         }
         Input::Secret(hint) => {
             ui.add(TextEdit::singleline(v).password(true).id(id).hint_text(hint).desired_width(220.0));
+        }
+        Input::Multiline(hint) => {
+            egui::ScrollArea::vertical().id_salt(id).max_height(72.0).show(ui, |ui| {
+                ui.add(
+                    TextEdit::multiline(v)
+                        .id(id)
+                        .hint_text(hint)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_rows(3)
+                        .desired_width(360.0),
+                );
+            });
         }
         Input::Check => {
             let mut on = v == "yes";

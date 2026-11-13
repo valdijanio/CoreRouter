@@ -46,6 +46,17 @@ const FIELDS: &[Field] = &[
     Field { param: "available_from", label: "Available From", help: "ip_services.available_from", input: Input::Text("192.0.2.0/24, 2001:db8::/32"), edit: true },
 ];
 
+/// `www-ssl` also picks its certificate (G1.6zs).
+const FIELDS_SSL: &[Field] = &[
+    Field { param: "enabled", label: "Enabled", help: "ip_services.enabled", input: Input::Check, edit: true },
+    Field { param: "address", label: "Address", help: "ip_services.address", input: Input::Text(":: (every address)"), edit: true },
+    Field { param: "port", label: "Port", help: "ip_services.port", input: Input::Text("443"), edit: true },
+    Field { param: "available_from", label: "Available From", help: "ip_services.available_from", input: Input::Text("192.0.2.0/24, 2001:db8::/32"), edit: true },
+    Field { param: "certificate", label: "Certificate", help: "ip_services.certificate", input: Input::Choice, edit: true },
+];
+
+const SPEC_SSL: Spec = Spec { fields: FIELDS_SSL, ..SPEC };
+
 const SPEC: Spec = Spec {
     panel: NAME,
     parent: Win::Panel(WIN),
@@ -56,12 +67,13 @@ const SPEC: Spec = Spec {
     preview: "ip.service.check",
 };
 
-const COLUMNS: [table::Column; 7] = [
+const COLUMNS: [table::Column; 8] = [
     col("Name").help("ip_services.name"),
     col("Status").help("ip_services.status"),
     col("Address").help("ip_services.address"),
     num("Port").help("ip_services.port"),
     col("Available From").help("ip_services.available_from"),
+    col("Certificate").help("ip_services.certificate"),
     num("Refused").help("ip_services.refused"),
     col("Last Error").help("ip_services.last_error"),
 ];
@@ -71,6 +83,8 @@ pub(crate) struct ServicesPanel {
     pub(crate) rows: Vec<Value>,
     table: TableState,
     pub(crate) modal: Option<Modal>,
+    /// `/certificate` names with a key, for www-ssl's Certificate (G1.6zs).
+    pub(crate) certificates: Vec<String>,
     help: Option<HelpView>,
     notice: Option<String>,
     error: Option<String>,
@@ -122,6 +136,12 @@ pub(crate) fn row(r: &Value, l: crate::i18n::Lang) -> Row {
             address_text(r),
             s(r, "port"),
             if from.is_empty() { tr_in(SCOPE, l, "everyone").to_owned() } else { from },
+            // G1.6zs: only `www-ssl` has one; `none` is the router's own.
+            match r.get("certificate").and_then(Value::as_str) {
+                None => "–".to_owned(),
+                Some("none") => tr_in(SCOPE, l, "router's own").to_owned(),
+                Some(c) => c.to_owned(),
+            },
             s(r, "refused"),
             dash(r.get("last_error").and_then(Value::as_str).unwrap_or("").to_owned()),
         ],
@@ -132,12 +152,16 @@ pub(crate) fn row(r: &Value, l: crate::i18n::Lang) -> Row {
 }
 
 fn values_of(r: &Value) -> BTreeMap<&'static str, String> {
-    BTreeMap::from([
+    let mut v = BTreeMap::from([
         ("enabled", if flag(r, "enabled") { "yes" } else { "no" }.to_owned()),
         ("address", s(r, "address")),
         ("port", s(r, "port")),
         ("available_from", from_list(r)),
-    ])
+    ]);
+    if r.get("certificate").is_some() {
+        v.insert("certificate", s(r, "certificate"));
+    }
+    v
 }
 
 fn set_of(name: &str) -> String {
@@ -199,11 +223,14 @@ impl ServicesPanel {
 
 impl PanelState for ServicesPanel {
     fn queries(&self, app: &CoreRouterUi) -> Vec<Query> {
+        let mut q = Vec::new();
         if app.open.contains(&Win::Panel(WIN)) && app.has_command(PRINT) {
-            vec![Query { key: "print", command: PRINT, params: json!({}) }]
-        } else {
-            Vec::new()
+            q.push(Query { key: "print", command: PRINT, params: json!({}) });
         }
+        if self.modal.is_some() && app.has_command("certificate.print") {
+            q.push(Query { key: "certificates", command: "certificate.print", params: json!({}) });
+        }
+        q
     }
 
     fn arrived(&mut self, _app: &mut CoreRouterUi, key: &'static str, _: RequestId, value: Value) {
@@ -215,6 +242,12 @@ impl PanelState for ServicesPanel {
             && let Some(rows) = value.as_array()
         {
             self.rows = rows.clone();
+        } else if key == "certificates"
+            && let Some(rows) = value.as_array()
+        {
+            self.certificates = std::iter::once("none".to_owned())
+                .chain(rows.iter().filter(|r| flag(r, "private_key")).map(|r| s(r, "name")))
+                .collect();
         }
     }
 
@@ -295,10 +328,13 @@ impl PanelState for ServicesPanel {
     }
 
     fn dialogs(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
-        if let Some(m) = &mut self.modal
-            && !m.show(app, ctx, area, &SPEC, &|_| Vec::new())
-        {
-            self.modal = None;
+        let certs = self.certificates.clone();
+        let options = move |param: &str| if param == "certificate" { certs.clone() } else { Vec::new() };
+        if let Some(m) = &mut self.modal {
+            let spec = if m.item.as_deref() == Some("www-ssl") { &SPEC_SSL } else { &SPEC };
+            if !m.show(app, ctx, area, spec, &options) {
+                self.modal = None;
+            }
         }
         help::modal(ctx, app.lang, &mut self.help);
     }
