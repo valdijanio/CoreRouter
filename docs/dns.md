@@ -145,7 +145,7 @@ aparecem desabilitados com a parte que os traz), IP › DNS Static e IP › DNS 
 | 40 | `static` | `/ip dns static` (abaixo). |
 | 50 | `zones` | Vazia; a G4.1c entra aqui. |
 | 60 | `cache` | O cache compartilhado com o resolvedor do roteador; responde na thread do socket. |
-| 90 | `upstream` | O resolvedor da G4.1a (troca de servidor, TCP no truncamento, serve-stale); a única etapa que espera a rede: roda numa thread de trabalho. |
+| 90 | `upstream` | O resolvedor da G4.1a (troca de servidor, TCP no truncamento, serve-stale); a única etapa que espera a rede: a busca vai para um laço de eventos `dns-upstream` (G4.1t) e a resposta volta por `Forwarder::resume`. |
 
 **Uma etapa nova** (Statistics, Adlist, Zones…) é só um arquivo `stage/<nome>.rs`:
 
@@ -160,7 +160,8 @@ pub(crate) const STAGE: Stage = Stage {
 
 - `handle` olha a `Query` (cliente, nome, tipo, a config em execução inteira em
   `q.config.config`) e devolve `Step::Next`, `Step::Reply(..)`, `Step::Drop` ou, se precisa da
-  rede, `Step::Wait` (é chamada de novo numa thread de trabalho, com o transporte).
+  rede, `Step::Wait` (só a `upstream`: o daemon leva a busca ao laço de eventos e devolve o
+  resultado; quem chama `Forwarder::finish` com um transporte a roda bloqueando).
 - Estado entre consultas: `f.state::<MeuTipo>()` (criado no primeiro uso). Config compilada
   (regexps, tabelas): `f.compiled(&q.config, MeuTipo::build)`, refeita a cada mudança de config.
 - Efeitos fora do DNS (address list do firewall): `q.effects.push(Effect::…)`; o daemon aplica.

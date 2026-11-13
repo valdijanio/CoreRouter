@@ -8,10 +8,13 @@
 //!   server picks it (`http2.rs`; RFC 8484 §5.2 recommends it, and some
 //!   servers, such as Unbound, speak nothing else), else HTTP/1.1 over our
 //!   client (`https.rs`).
-//! - Connections are reused (RFC 7858 §3.4 SHOULD): a few idle ones per
-//!   server, dropped after [`IDLE`]. A reused one the server closed in the
-//!   meantime is retried once on a fresh connection (§3.4: both sides MUST
-//!   handle a close).
+//! - Connections are reused (RFC 7858 §3.4 SHOULD): each carries one
+//!   query at a time, and every one given back is kept (up to [`KEEP`] per
+//!   server), so the pool holds as many as there were queries in flight
+//!   (G4.1t: with 4 kept, 5 000/s cost 82–168 handshakes/s, **medido**);
+//!   an idle one is dropped after [`IDLE`]. A reused one the server closed
+//!   in the meantime is retried once on a fresh connection (§3.4: both
+//!   sides MUST handle a close).
 //! - The certificate is checked unless `verify` is off (RFC 8310 §8.1:
 //!   the chain and the name in subjectAltName); there is no fall back to
 //!   plain DNS either way (§5: strict never falls back).
@@ -33,8 +36,10 @@ use super::https::{self, Stream, Url};
 /// An idle connection older than this is closed, not reused (servers
 /// close theirs after 10–30 s; RFC 7766 §6.2.3 suggests seconds).
 const IDLE: Duration = Duration::from_secs(20);
-/// Idle connections kept per server.
-const KEEP: usize = 4;
+/// Idle connections kept per server, at most: as many as queries were in
+/// flight to it (they are bounded by `max_concurrent_queries`), and never
+/// more than this many descriptors.
+const KEEP: usize = 256;
 /// Largest DNS message (RFC 8484 §6, RFC 1035 §4.2.2).
 const MAX_MESSAGE: usize = 65_535;
 

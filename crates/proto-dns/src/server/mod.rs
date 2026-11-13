@@ -32,7 +32,7 @@ use hickory_proto::rr::{DNSClass, Record, RecordType};
 use ipnet::IpNet;
 
 use crate::message::{Answer, QName};
-use crate::resolver::{Resolver, Source, Transport};
+use crate::resolver::{Begin, ResolveError, Resolved, Resolver, Source, Transport};
 
 include!(concat!(env!("OUT_DIR"), "/stages.rs"));
 
@@ -167,6 +167,10 @@ pub struct Query {
     /// knows one (counted by the statistics, and sent to a client that
     /// used EDNS, G4.1ze).
     pub ede: Option<u16>,
+    /// G4.1t: the upstream lookup's result, brought by [`Forwarder::resume`].
+    upstream: Option<Result<Resolved, ResolveError>>,
+    /// Refused for `max_concurrent_queries` (answered as "busy").
+    busy: bool,
     /// `explain` (G6.8): each stage's decision so far.
     explain: Option<Vec<Decision>>,
     /// What the running stage said about itself ([`Query::note`]).
@@ -481,13 +485,44 @@ impl Forwarder {
         self.done(query)
     }
 
-    /// No room for it (`max_concurrent_queries`): SERVFAIL, so the client
-    /// tries its other server instead of waiting.
+    /// No room for it (no worker): SERVFAIL, so the client tries its other
+    /// server instead of waiting.
     pub fn fail(&self, p: Pending) -> Done {
         let mut query = p.query;
         query.answered_by = "busy";
         query.reply = Some(Reply::code(ResponseCode::ServFail));
         self.done(query)
+    }
+
+    /// G4.1t: the upstream lookup of `p` without waiting: an answer now
+    /// (the cache filled meanwhile, a held failure, busy), the same lookup
+    /// in flight to follow, or a lookup to lead. Whatever it is, the result
+    /// goes back through [`Self::resume`].
+    pub fn upstream(&self, p: &Pending, now_ms: u64) -> Begin {
+        let q = &p.query;
+        let b = self
+            .resolver
+            .begin(&q.name, q.qtype, q.forward_to.as_ref(), now_ms);
+        self.count_in_flight();
+        b
+    }
+
+    /// The rest of the chain of `p` with its upstream result `got`.
+    pub fn resume(&self, p: Pending, got: Result<Resolved, ResolveError>, now_ms: u64) -> Done {
+        let Pending { mut query, next } = p;
+        query.now_ms = now_ms;
+        query.upstream = Some(got);
+        if self.run(&mut query, next, None).is_some() {
+            query.reply = Some(Reply::code(ResponseCode::ServFail));
+        }
+        self.done(query)
+    }
+
+    /// G4.1h: lookups in flight upstream and the equal ones waiting for
+    /// them, for `ip.dns.statistics.print`.
+    pub fn count_in_flight(&self) {
+        let (leading, following) = self.resolver.in_flight();
+        self.stats.set_in_flight(leading.saturating_add(following));
     }
 
     /// Stages from `from`; `Some(i)`: stage `i` must wait for a worker.
@@ -522,7 +557,7 @@ impl Forwarder {
                 }
                 Step::Reply(mut r) => {
                     q.decided(stage, Outcome::Answered);
-                    q.answered_by = stage.name;
+                    q.answered_by = if q.busy { "busy" } else { stage.name };
                     if !q.prefix.is_empty() {
                         let mut all = q.prefix.clone();
                         all.append(&mut r.answers);
@@ -626,6 +661,8 @@ impl Query {
             source: None,
             effects: Vec::new(),
             ede: None,
+            upstream: None,
+            busy: false,
             explain: None,
             pending: None,
             simulated: false,

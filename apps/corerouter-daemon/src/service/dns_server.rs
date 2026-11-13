@@ -12,10 +12,12 @@
 //!   `allow_remote_requests` says.
 //! - up to four UDP threads per family on one socket ([`udp_threads`]):
 //!   each reads a query and runs the chain up to the cache; a cache hit is
-//!   answered at once. A miss goes to a "dns-query" worker of its own
-//!   ([`pool`]: kept for the next miss, not created per query), at most
-//!   `max_concurrent_queries` of them (more: SERVFAIL), so one slow
-//!   upstream never holds the cache hits back.
+//!   answered at once. A miss goes to a "dns-upstream" event loop
+//!   ([`upstream`], G4.1t: no thread per query), at most
+//!   `max_concurrent_queries` lookups in flight (more: SERVFAIL), so one
+//!   slow upstream never holds the cache hits back. What still blocks (TCP
+//!   after truncation, DoT/DoH upstreams) runs on "dns-query" workers
+//!   ([`pool`]: kept for the next job).
 //! - one TCP thread per family; a thread per connection, at most
 //!   `max_concurrent_tcp_sessions` (a quarter of them per source), closed
 //!   after 10 s idle (RFC 7766 §6.2.3). A peer that may not ask anything
@@ -47,6 +49,7 @@ use std::time::{Duration, Instant};
 use corerouter_control::Shutdown;
 use corerouter_engine::{Shared, lock};
 use corerouter_model::Config;
+use corerouter_proto_dns::resolver::Begin;
 use corerouter_proto_dns::server::{Done, Effect, Forwarder, MAX_QUERY, Pending, Start, Statistics};
 use corerouter_proto_dns::zone;
 use super::dns::RouterDns;
@@ -55,6 +58,8 @@ use sock::{Udp, bind_tcp};
 
 #[path = "dns_server/pool.rs"]
 mod pool;
+#[path = "dns_server/upstream.rs"]
+mod upstream;
 
 /// RFC 1035 §4.2.1.
 const DEFAULT_PORT: u16 = 53;
@@ -111,7 +116,6 @@ impl Gate {
 
 #[derive(Clone, Copy)]
 enum Which {
-    Query,
     Tcp,
 }
 
@@ -170,7 +174,6 @@ impl Pass {
             srv: srv.clone(),
             which,
         })?;
-        srv.in_flight(which);
         Some(pass)
     }
 }
@@ -178,7 +181,6 @@ impl Pass {
 impl Drop for Pass {
     fn drop(&mut self) {
         self.srv.gate(self.which).0.fetch_sub(1, Ordering::AcqRel);
-        self.srv.in_flight(self.which);
     }
 }
 
@@ -186,7 +188,6 @@ impl Drop for Pass {
 pub(crate) struct Server {
     fwd: Forwarder,
     dns: Arc<RouterDns>,
-    queries: Gate,
     tcp: Gate,
     /// TCP sessions per source address.
     tcp_sources: Mutex<HashMap<IpAddr, u32>>,
@@ -194,8 +195,10 @@ pub(crate) struct Server {
     /// Effects dropped because the queue was full.
     effects_dropped: AtomicU64,
     updates: SyncSender<UdpUpdate>,
-    /// The workers of the misses (G4.1r).
+    /// Threads for what blocks (G4.1r): TCP retries, DoT/DoH upstreams.
     misses: Arc<pool::Pool>,
+    /// The event loops of the misses (G4.1t).
+    loops: upstream::Loops,
     /// Socket threads of an older epoch stop (the config turned the
     /// forwarder off, or the daemon is closing).
     epoch: AtomicU64,
@@ -205,15 +208,7 @@ pub(crate) struct Server {
 impl Server {
     fn gate(&self, which: Which) -> &Gate {
         match which {
-            Which::Query => &self.queries,
             Which::Tcp => &self.tcp,
-        }
-    }
-
-    /// G4.1h: the queries waiting for an upstream, for the statistics.
-    fn in_flight(&self, which: Which) {
-        if let Which::Query = which {
-            self.fwd.statistics().set_in_flight(self.queries.0.load(Ordering::Relaxed));
         }
     }
 
@@ -225,10 +220,6 @@ impl Server {
 
     fn alive(&self, epoch: u64) -> bool {
         !self.shutdown.is_closed() && self.epoch.load(Ordering::Acquire) == epoch
-    }
-
-    fn max_queries(&self) -> u32 {
-        self.fwd.config().config.ip.dns.max_concurrent_queries
     }
 
     fn effects(&self, done: &mut Done) {
@@ -247,10 +238,60 @@ impl Server {
         &self.fwd
     }
 
-    /// The rest of the chain, on this (worker) thread.
+    /// The rest of the chain, on this thread (it may wait on the network).
     fn finish(&self, p: Pending) -> Done {
         let mut t = self.dns.transport();
         self.fwd.finish(p, &mut t)
+    }
+
+    /// G4.1t: the rest of the chain of a miss without waiting here: the
+    /// answer now, after the equal lookup in flight (G4.1o), or after a
+    /// lookup an event loop carries; `reply` gets it on whichever thread
+    /// has it.
+    fn upstream(self: &Arc<Self>, p: Pending, reply: Reply) {
+        let begin = self.fwd.upstream(&p, self.dns.now_ms());
+        let srv = self.clone();
+        let done: corerouter_proto_dns::resolver::Waiter = Box::new(move |got| {
+            let mut d = srv.fwd.resume(p, got, srv.dns.now_ms());
+            srv.effects(&mut d);
+            reply.send(&srv, d.reply);
+        });
+        match begin {
+            Begin::Now(got) => done(got),
+            Begin::Follow(f) => f.then(done),
+            Begin::Lead(lookup) => self.loops.lead(self, lookup, done),
+        }
+    }
+}
+
+/// Where the reply of a miss goes.
+enum Reply {
+    Udp {
+        sock: Arc<Udp>,
+        to: SocketAddr,
+        local: Option<IpAddr>,
+        read_at: Instant,
+    },
+    /// DoT/DoH (G4.1zf): the connection's loop.
+    Then(Then, Instant),
+}
+
+impl Reply {
+    fn send(self, srv: &Server, reply: Option<Vec<u8>>) {
+        match self {
+            Self::Udp { sock, to, local, read_at } => {
+                if let Some(r) = &reply {
+                    sock.send(r, to, local);
+                    srv.answered(read_at);
+                }
+            }
+            Self::Then(then, read_at) => {
+                if reply.is_some() {
+                    srv.answered(read_at);
+                }
+                then(reply);
+            }
+        }
     }
 }
 
@@ -303,34 +344,17 @@ fn udp_loop(srv: Arc<Server>, sock: Arc<Udp>, epoch: u64) {
                 }
                 srv.effects(&mut d);
             }
-            Start::Pending(p) => {
-                // RouterOS `max-concurrent-queries`: past it, SERVFAIL now
-                // (the client tries its other server) instead of a queue.
-                let Some(pass) = Pass::enter(&srv, Which::Query, srv.max_queries()) else {
-                    let d = srv.fwd.fail(*p);
-                    if let Some(r) = &d.reply {
-                        sock.send(r, from, local);
-                        srv.answered(read_at);
-                    }
-                    continue;
-                };
-                let sock_w = sock.clone();
-                let worker = move || {
-                    let mut d = pass.srv.finish(*p);
-                    if let Some(r) = &d.reply {
-                        sock_w.send(r, from, local);
-                        pass.srv.answered(read_at);
-                    }
-                    pass.srv.effects(&mut d);
-                };
-                if srv.misses.submit(Box::new(worker)).is_err() {
-                    // No worker: SERVFAIL from its bytes, so the client
-                    // tries elsewhere at once.
-                    if let Some(r) = servfail(packet) {
-                        sock.send(&r, from, local);
-                    }
-                }
-            }
+            // RouterOS `max-concurrent-queries`: past it the resolver says
+            // busy, SERVFAIL now (the client tries its other server).
+            Start::Pending(p) => srv.upstream(
+                *p,
+                Reply::Udp {
+                    sock: sock.clone(),
+                    to: from,
+                    local,
+                    read_at,
+                },
+            ),
         }
     }
 }
@@ -459,10 +483,9 @@ fn tcp_session(srv: &Arc<Server>, mut s: TcpStream, epoch: u64) {
         }
         let mut done = match srv.fwd.start(&msg, peer.ip(), true, srv.dns.now_ms()) {
             Start::Done(d) => d,
-            Start::Pending(p) => match Pass::enter(srv, Which::Query, srv.max_queries()) {
-                Some(_pass) => srv.finish(*p),
-                None => srv.fwd.fail(*p),
-            },
+            // The connection's own thread waits (the resolver bounds the
+            // lookups in flight, G4.1t).
+            Start::Pending(p) => srv.finish(*p),
         };
         srv.effects(&mut done);
         let Some(reply) = done.reply else {
@@ -626,13 +649,13 @@ fn prepare(
     let srv = Arc::new(Server {
         fwd: Forwarder::new(dns.resolver.clone()),
         dns,
-        queries: Gate::default(),
         tcp: Gate::default(),
         tcp_sources: Mutex::new(HashMap::new()),
         effects: tx,
         effects_dropped: AtomicU64::new(0),
         updates: utx,
         misses: Arc::new(pool::Pool::default()),
+        loops: upstream::Loops::default(),
         epoch: AtomicU64::new(0),
         shutdown,
     });
@@ -852,9 +875,9 @@ pub(crate) type Then = Box<dyn FnOnce(Option<Vec<u8>>) + Send>;
 impl Answer {
     /// One query that came over DNS over TLS (G4.1zf) from `client`: the
     /// chain as for TCP 53 (`tcp`: no truncation), up to the cache on the
-    /// caller's thread; a miss waits on a pooled worker, at most
-    /// `max_concurrent_queries` of them (more: SERVFAIL now, as UDP), and
-    /// `then` gets its reply. Zone transfers are not served over TLS here
+    /// caller's thread; a miss goes upstream as UDP's (G4.1t: an event
+    /// loop, at most `max_concurrent_queries` in flight, more: SERVFAIL),
+    /// and `then` gets its reply. Zone transfers are not served over TLS here
     /// (RFC 9103 XoT is another feature).
     pub(crate) fn ask(srv: &Arc<Server>, msg: &[u8], client: IpAddr, read_at: Instant, then: Then) -> Self {
         match srv.fwd.start(msg, client, true, srv.dns.now_ms()) {
@@ -866,22 +889,8 @@ impl Answer {
                 Self::Now(d.reply)
             }
             Start::Pending(p) => {
-                let Some(pass) = Pass::enter(srv, Which::Query, srv.max_queries()) else {
-                    return Self::Now(srv.fwd.fail(*p).reply);
-                };
-                let worker = move || {
-                    let mut d = pass.srv.finish(*p);
-                    pass.srv.effects(&mut d);
-                    if d.reply.is_some() {
-                        pass.srv.answered(read_at);
-                    }
-                    then(d.reply);
-                };
-                // The misses' workers (G4.1r), as UDP's.
-                match srv.misses.submit(Box::new(worker)) {
-                    Ok(()) => Self::Later,
-                    Err(()) => Self::Now(servfail(msg)),
-                }
+                srv.upstream(*p, Reply::Then(then, read_at));
+                Self::Later
             }
         }
     }

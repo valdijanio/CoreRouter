@@ -223,7 +223,7 @@ impl DnsBackend for RouterDns {
         server: Option<IpAddr>,
     ) -> Result<Resolution, String> {
         use corerouter_proto_dns::message::{Rcode, parse_name};
-        use corerouter_proto_dns::resolver::{Source, Target, fetch};
+        use corerouter_proto_dns::resolver::Source;
         let qn = parse_name(name).map_err(|e| e.to_string())?;
         let rt: RecordType = rtype
             .parse()
@@ -244,9 +244,10 @@ impl DnsBackend for RouterDns {
             }
             // One server, past the cache (RouterOS `:resolve server=`).
             Some(ip) => {
-                let settings = self.resolver.settings();
-                let f = fetch(&mut t, &settings, &[Target::Plain(ip)], &qn, rt);
-                let (answer, from, _) = f.result.map_err(|e| e.to_string())?;
+                let (answer, from) = self
+                    .resolver
+                    .ask_server(&mut t, &qn, rt, ip)
+                    .map_err(|e| e.to_string())?;
                 (answer, from.to_string())
             }
         };

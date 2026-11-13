@@ -22,25 +22,33 @@
 //! the lookups in between fail at once (or get the stale answer), so a
 //! dead domain asked by every client does not keep every server busy.
 //!
-//! No sockets here: the caller brings a [`Transport`] (UDP/TCP in the
-//! daemon, a fake in tests). The lock is held only around the cache, never
-//! across the network, so one slow lookup does not stall the others.
+//! No sockets here. A lookup is a state machine ([`Lookup`], G4.1t):
+//! [`Resolver::begin`] answers from the cache or starts one, the caller
+//! moves its messages, [`Resolver::complete`] keeps the result. The
+//! daemon's event loop carries thousands of them on a few sockets; the
+//! blocking [`Resolver::resolve`] runs one over a [`Transport`] (the
+//! router's tools; a fake in tests). The lock is held only around the
+//! cache, never across the network, so one slow lookup does not stall the
+//! others.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 mod flight;
+mod lookup;
 use flight::{Flights, Role};
+pub use flight::{Follow, MAX_WAITING, Waiter};
+pub use lookup::{Exchange, Lookup, Way};
 
 use corerouter_model::Config;
 use corerouter_model::dns::{CacheRow, Dns, ServerSelection};
 use hickory_proto::rr::RecordType;
 
 use crate::cache::{Cache, Hit};
-use crate::encrypted::{Proto, SecureServer};
+use crate::encrypted::SecureServer;
 use crate::histogram::Hist;
-use crate::message::{Answer, NameError, QName, Rcode, ReplyError, check_reply, parse_name, query};
+use crate::message::{Answer, NameError, QName, Rcode, parse_name};
 
 /// Moves bytes to a server and back.
 pub trait Transport {
@@ -149,6 +157,9 @@ pub struct Settings {
     pub cache_bytes: usize,
     pub selection: ServerSelection,
     pub stale_secs: u32,
+    /// `max_concurrent_queries`: lookups in flight upstream at most
+    /// (G4.1t; equal ones waiting for them do not count).
+    pub max_queries: u32,
     /// `use_doh_server`: asked instead of `servers` (G4.1d).
     pub secure: Vec<SecureServer>,
     /// Static A/AAAA names, for an encrypted server's host name.
@@ -176,6 +187,7 @@ impl Settings {
                 .saturating_mul(1024),
             selection: dns.server_selection,
             stale_secs: dns.serve_stale_secs,
+            max_queries: dns.max_concurrent_queries,
             secure: SecureServer::parse(&dns.use_doh_server, dns.verify_doh_cert)
                 .ok()
                 .into_iter()
@@ -227,6 +239,9 @@ pub enum ResolveError {
     NotFound(String),
     #[error("name '{name}' could not be resolved: {why}")]
     Failed { name: String, why: String },
+    /// `max_concurrent_queries` lookups in flight already (G4.1t).
+    #[error("too many lookups in flight (max_concurrent_queries)")]
+    Busy,
 }
 
 /// Where an answer came from.
@@ -297,7 +312,7 @@ impl Via {
 
 #[derive(Debug, Default)]
 struct State {
-    settings: Settings,
+    settings: Arc<Settings>,
     cache: Cache,
     /// The last server that answered (RouterOS keeps using it).
     preferred: Option<IpAddr>,
@@ -330,7 +345,7 @@ pub const MAX_FAILURES: usize = 4096;
 pub struct Resolver {
     state: Mutex<State>,
     /// G4.1o: lookups in flight.
-    flights: Flights,
+    flights: Arc<Flights>,
 }
 
 impl Resolver {
@@ -339,13 +354,13 @@ impl Resolver {
         cache.set_stale(settings.stale_secs);
         Self {
             state: Mutex::new(State {
-                settings,
+                settings: Arc::new(settings),
                 cache,
                 preferred: None,
                 stats: BTreeMap::new(),
                 failures: HashMap::new(),
             }),
-            flights: Flights::default(),
+            flights: Arc::default(),
         }
     }
 
@@ -361,7 +376,7 @@ impl Resolver {
     /// preferred.
     pub fn configure(&self, settings: Settings, _now_ms: u64) {
         let mut st = self.state();
-        if st.settings == settings {
+        if *st.settings == settings {
             return;
         }
         st.cache.set_budget(settings.cache_bytes);
@@ -369,11 +384,11 @@ impl Resolver {
         if st.preferred.is_some_and(|p| !settings.servers.contains(&p)) {
             st.preferred = None;
         }
-        st.settings = settings;
+        st.settings = Arc::new(settings);
     }
 
     pub fn settings(&self) -> Settings {
-        self.state().settings.clone()
+        (*self.state().settings).clone()
     }
 
     pub fn cache_rows(&self, now_ms: u64) -> Vec<CacheRow> {
@@ -487,15 +502,43 @@ impl Resolver {
         rtype: RecordType,
         via: Option<&Upstreams>,
     ) -> Result<Resolved, ResolveError> {
+        match self.begin(qn, rtype, via, t.now_ms()) {
+            Begin::Now(r) => r,
+            Begin::Follow(flight) => {
+                let settings = self.state().settings.clone();
+                let wait =
+                    u64::from(settings.total_timeout_ms).max(SECURE_TIMEOUT_MS) + FOLLOW_SLACK_MS;
+                let until = t.now_ms().saturating_add(wait);
+                flight.wait(until, &|| t.now_ms()).unwrap_or_else(|| {
+                    Err(ResolveError::Failed {
+                        name: qn.key.clone(),
+                        why: format!(
+                            "no answer in {wait} ms (waiting for the same lookup in flight)"
+                        ),
+                    })
+                })
+            }
+            Begin::Lead(mut lookup) => {
+                self.drive(t, &mut lookup);
+                self.complete(*lookup, t.now_ms())
+            }
+        }
+    }
+
+    /// The part of a lookup that needs no network (G4.1t): the cache, a
+    /// held failure (RFC 9520), the equal lookup in flight to follow
+    /// (G4.1o), or a new [`Lookup`] to lead, which the caller runs and
+    /// hands to [`Self::complete`]. Past `max_concurrent_queries` lookups
+    /// in flight: [`ResolveError::Busy`].
+    pub fn begin(&self, qn: &QName, rtype: RecordType, via: Option<&Upstreams>, now: u64) -> Begin {
         let (settings, plain, secure) = {
             let mut st = self.state();
-            if let Some(hit) = st.cache.get(&qn.key, rtype, t.now_ms()) {
-                return Ok(Resolved {
+            if let Some(hit) = st.cache.get(&qn.key, rtype, now) {
+                return Begin::Now(Ok(Resolved {
                     answer: hit.answer,
                     source: Source::Cache,
-                });
+                }));
             }
-            let now = t.now_ms();
             // RFC 9520 §3.2: no query while a failure is held; the stale
             // answer (RFC 8767) still serves.
             let failed_key = (qn.key.clone(), rtype);
@@ -506,19 +549,19 @@ impl Resolver {
                 .cloned()
             {
                 if let Some(hit) = st.cache.get_stale(&qn.key, rtype, now) {
-                    return Ok(Resolved {
+                    return Begin::Now(Ok(Resolved {
                         answer: hit.answer,
                         source: Source::Stale,
-                    });
+                    }));
                 }
-                return Err(ResolveError::Failed {
+                return Begin::Now(Err(ResolveError::Failed {
                     name: qn.key.clone(),
                     why: format!(
                         "{} (failed recently; asked again in {} s, RFC 9520)",
                         f.why,
                         f.until_ms.saturating_sub(now).div_ceil(1000)
                     ),
-                });
+                }));
             }
             let (plain, secure) = match via {
                 Some(u) => (sorted(&st, &u.servers, now), u.secure.clone()),
@@ -528,66 +571,98 @@ impl Resolver {
             (st.settings.clone(), plain, secure)
         };
         // G4.1o: one lookup per name, type and upstreams in flight; the
-        // equal ones wait for its result (`resolver/flight.rs`).
-        let lead = match self.flights.join((qn.key.clone(), rtype, via.cloned())) {
+        // equal ones wait for its result (`resolver/flight.rs`). No second
+        // look at the cache here: a lookup that missed it just before the
+        // previous leader filled it and joins just after that leader left
+        // asks again (one extra query, rare); the look cost ~110 ns on
+        // every miss (`benches/forwarder.rs`, G4.1r).
+        let max = usize::try_from(settings.max_queries).unwrap_or(usize::MAX);
+        let lead = match self
+            .flights
+            .join((qn.key.clone(), rtype, via.cloned()), max)
+        {
             Role::Lead(lead) => lead,
-            Role::Follow(flight) => {
-                let wait =
-                    u64::from(settings.total_timeout_ms).max(SECURE_TIMEOUT_MS) + FOLLOW_SLACK_MS;
-                let until = t.now_ms().saturating_add(wait);
-                return flight.wait(until, &|| t.now_ms()).unwrap_or_else(|| {
-                    Err(ResolveError::Failed {
-                        name: qn.key.clone(),
-                        why: format!(
-                            "no answer in {wait} ms (waiting for the same lookup in flight)"
-                        ),
-                    })
-                });
-            }
+            Role::Follow(f) => return Begin::Follow(f),
+            Role::Busy => return Begin::Now(Err(ResolveError::Busy)),
         };
-        // No second look at the cache here: a lookup that missed it just
-        // before the previous leader filled it and joins just after that
-        // leader left asks again (one extra query, rare); the look cost
-        // ~110 ns on every miss (`benches/forwarder.rs`, G4.1r).
-        let r = self.ask(t, qn, rtype, via, &settings, plain, secure);
-        lead.finish(&r);
-        r
-    }
-
-    /// The servers asked for `qn`/`rtype` (the leader of its flight), the
-    /// cache, the failure hold and the server statistics updated.
-    #[allow(clippy::too_many_arguments)]
-    fn ask(
-        &self,
-        t: &mut dyn Transport,
-        qn: &QName,
-        rtype: RecordType,
-        via: Option<&Upstreams>,
-        settings: &Settings,
-        plain: Vec<IpAddr>,
-        secure: Vec<SecureServer>,
-    ) -> Result<Resolved, ResolveError> {
-        let mut servers: Vec<Target> = plain.into_iter().map(Target::Plain).collect();
-        let mut unresolved: Vec<String> = Vec::new();
+        let mut targets: Vec<Target> = plain.into_iter().map(Target::Plain).collect();
+        let mut unresolved = Vec::new();
         for s in secure {
-            match self.secure_addrs(t, settings, &s) {
+            match pinned_addrs(&settings, &s) {
                 // Two addresses at most: a dead one, then a live one.
-                Ok(ips) => servers.extend(
+                Some(ips) => targets.extend(
                     ips.into_iter()
                         .take(2)
                         .map(|ip| Target::Secure(ip, s.clone())),
                 ),
-                Err(why) => unresolved.push(why),
+                None => unresolved.push(s),
             }
         }
-        if servers.is_empty() && !unresolved.is_empty() {
-            return Err(failed(qn, &unresolved));
+        Begin::Lead(Box::new(Lookup::new(
+            qn.clone(),
+            rtype,
+            via.cloned(),
+            settings,
+            targets,
+            unresolved,
+            Some(lead),
+        )))
+    }
+
+    /// Runs `lookup` to the end with blocking exchanges (the router's own
+    /// tools, the tests; the daemon's threads for encrypted servers).
+    pub fn drive(&self, t: &mut dyn Transport, lookup: &mut Lookup) {
+        // An encrypted server named by host: its address first (asked of
+        // the plain servers, never of itself: RouterOS).
+        for s in std::mem::take(&mut lookup.unresolved) {
+            match self.secure_addrs(t, &lookup.settings, &s) {
+                Ok(ips) => lookup.targets.extend(
+                    ips.into_iter()
+                        .take(2)
+                        .map(|ip| Target::Secure(ip, s.clone())),
+                ),
+                Err(why) => lookup.errors.push(why),
+            }
         }
-        let fetched = fetch(t, settings, &servers, qn, rtype);
-        let asked: Vec<IpAddr> = servers.iter().map(Target::ip).collect();
+        let mut next = lookup.start(t.now_ms());
+        while let Some(x) = next.pop() {
+            let got = match &x.way {
+                Way::Secure(s) => t.exchange_secure(x.server, s, &x.query, x.wait_ms),
+                way => {
+                    let l = &*lookup;
+                    t.exchange(x.server, &x.query, *way == Way::Tcp, x.wait_ms, &mut |b| {
+                        l.accepts(x.token, b)
+                    })
+                }
+            };
+            let now = t.now_ms();
+            next.extend(match got {
+                Ok(b) => lookup.reply(x.token, &b, now),
+                Err(e) => lookup.failed(x.token, e, now),
+            });
+        }
+    }
+
+    /// The end of a lookup this resolver led ([`Self::begin`]): the server
+    /// statistics, the failure hold and the cache updated, the result
+    /// given to the equal lookups that waited (G4.1o) and returned. A
+    /// lookup that failed everywhere serves the stale answer (RFC 8767).
+    pub fn complete(&self, mut lookup: Lookup, now_ms: u64) -> Result<Resolved, ResolveError> {
+        let result = self.record(&mut lookup, now_ms);
+        if let Some(lead) = lookup.lead.take() {
+            lead.finish(&result);
+        }
+        result
+    }
+
+    fn record(&self, lookup: &mut Lookup, now: u64) -> Result<Resolved, ResolveError> {
+        let fetched = lookup.take_result();
+        let qn = &lookup.qn;
+        let rtype = lookup.rtype;
+        let settings = lookup.settings.clone();
+        let asked: Vec<IpAddr> = lookup.targets.iter().map(Target::ip).collect();
         let mut st = self.state();
-        let now = t.now_ms();
-        for tr in &fetched.tried {
+        for tr in &lookup.tried {
             let s = st.stats.entry(tr.ip).or_default();
             let was_down = s.down_until_ms > now;
             s.via = tr.via;
@@ -621,7 +696,7 @@ impl Resolver {
                 .retain(|ip, _| keep.contains(ip) || asked.contains(ip));
         }
         let key = (qn.key.clone(), rtype);
-        match &fetched.result {
+        match &fetched {
             Ok(_) => {
                 st.failures.remove(&key);
             }
@@ -647,9 +722,9 @@ impl Resolver {
             }
             Err(_) => {}
         }
-        match fetched.result {
+        match fetched {
             Ok((answer, server, wire)) => {
-                if via.is_none() && settings.secure.is_empty() {
+                if lookup.via.is_none() && settings.secure.is_empty() {
                     st.preferred = Some(server);
                 }
                 st.cache.put(
@@ -675,6 +750,61 @@ impl Resolver {
             },
         }
     }
+
+    /// `qn`/`rtype` asked of `server` alone, past the cache, the equal
+    /// lookups in flight and the statistics (RouterOS `:resolve server=`).
+    pub fn ask_server(
+        &self,
+        t: &mut dyn Transport,
+        qn: &QName,
+        rtype: RecordType,
+        server: IpAddr,
+    ) -> Result<(Answer, IpAddr), ResolveError> {
+        let settings = self.state().settings.clone();
+        let mut lookup = Lookup::new(
+            qn.clone(),
+            rtype,
+            None,
+            settings,
+            vec![Target::Plain(server)],
+            Vec::new(),
+            None,
+        );
+        self.drive(t, &mut lookup);
+        lookup.take_result().map(|(answer, from, _)| (answer, from))
+    }
+
+    /// Lookups in flight upstream (G4.1t: at most `max_concurrent_queries`)
+    /// and equal ones waiting for them (G4.1o).
+    pub fn in_flight(&self) -> (usize, usize) {
+        self.flights.counts()
+    }
+}
+
+/// What [`Resolver::begin`] found.
+#[derive(Debug)]
+pub enum Begin {
+    /// Answered without the network (cache, held failure, busy).
+    Now(Result<Resolved, ResolveError>),
+    /// The same lookup is in flight: wait for its result.
+    Follow(Follow),
+    /// Ask the servers: run it, then [`Resolver::complete`].
+    Lead(Box<Lookup>),
+}
+
+/// An encrypted server's address without asking anyone: its literal or a
+/// static entry (`None`: it must be looked up).
+fn pinned_addrs(settings: &Settings, s: &SecureServer) -> Option<Vec<IpAddr>> {
+    if let Some(ip) = s.ip() {
+        return Some(vec![ip]);
+    }
+    let pinned: Vec<IpAddr> = settings
+        .hosts
+        .iter()
+        .filter(|(n, _)| *n == s.host)
+        .map(|(_, ip)| *ip)
+        .collect();
+    (!pinned.is_empty()).then_some(pinned)
 }
 
 impl Resolver {
@@ -686,17 +816,8 @@ impl Resolver {
         settings: &Settings,
         s: &SecureServer,
     ) -> Result<Vec<IpAddr>, String> {
-        if let Some(ip) = s.ip() {
-            return Ok(vec![ip]);
-        }
-        let pinned: Vec<IpAddr> = settings
-            .hosts
-            .iter()
-            .filter(|(n, _)| *n == s.host)
-            .map(|(_, ip)| *ip)
-            .collect();
-        if !pinned.is_empty() {
-            return Ok(pinned);
+        if let Some(ips) = pinned_addrs(settings, s) {
+            return Ok(ips);
         }
         let why = |e: String| format!("{}: cannot resolve {}: {e}", s.url(), s.host);
         if settings.servers.is_empty() {
@@ -818,12 +939,6 @@ fn order(st: &State, now_ms: u64) -> Vec<IpAddr> {
     }
 }
 
-/// The result of asking the servers, and how each one did.
-pub struct Fetched {
-    pub result: Result<(Answer, IpAddr, usize), ResolveError>,
-    pub tried: Vec<Tried>,
-}
-
 /// One server asked for a lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tried {
@@ -845,110 +960,12 @@ pub enum Outcome {
     Failed,
 }
 
-impl Outcome {
-    fn of(e: &Ask) -> Self {
-        match e {
-            Ask::Transport(TransportError::Timeout) => Self::Timeout,
-            Ask::Reply(ReplyError::ServFail) => Self::ServFail,
-            _ => Self::Failed,
-        }
-    }
-}
-
 fn tried(ip: IpAddr, via: Via, outcome: Outcome, truncated: bool) -> Tried {
     Tried {
         ip,
         via,
         outcome,
         truncated,
-    }
-}
-
-/// Asks `servers` in order until one gives a definite answer.
-pub fn fetch(
-    t: &mut dyn Transport,
-    settings: &Settings,
-    servers: &[Target],
-    qn: &QName,
-    rtype: RecordType,
-) -> Fetched {
-    let mut tried = Vec::new();
-    if servers.is_empty() {
-        return Fetched {
-            result: Err(ResolveError::NoServers),
-            tried,
-        };
-    }
-    let deadline = t
-        .now_ms()
-        .saturating_add(u64::from(settings.total_timeout_ms));
-    let mut errors: Vec<String> = Vec::new();
-    for target in servers {
-        let ip = &target.ip();
-        if let Target::Secure(_, via) = target {
-            let left = deadline.saturating_sub(t.now_ms());
-            if left == 0 {
-                errors.push("query_total_timeout reached".into());
-                break;
-            }
-            let wait = left.min(u64::from(settings.server_timeout_ms).max(SECURE_TIMEOUT_MS));
-            let started = t.now_ms();
-            let server = SocketAddr::new(*ip, via.port);
-            let how = match via.proto {
-                Proto::Tls => Via::Tls,
-                Proto::Https => Via::Https,
-            };
-            match ask_secure(t, server, via, settings.udp_payload, qn, rtype, wait) {
-                Ok((answer, wire)) => {
-                    let rtt = t.now_ms().saturating_sub(started);
-                    tried.push(self::tried(*ip, how, Outcome::Answered(rtt), false));
-                    return Fetched {
-                        result: Ok((answer, *ip, wire)),
-                        tried,
-                    };
-                }
-                Err(e) => {
-                    tried.push(self::tried(*ip, how, Outcome::of(&e), false));
-                    errors.push(format!("{} ({ip}): {e}", via.url()));
-                    continue;
-                }
-            }
-        }
-        let server = SocketAddr::new(*ip, settings.port);
-        let mut tcp = false;
-        let started = t.now_ms();
-        loop {
-            let left = deadline.saturating_sub(t.now_ms());
-            if left == 0 {
-                errors.push("query_total_timeout reached".into());
-                return Fetched {
-                    result: Err(failed(qn, &errors)),
-                    tried,
-                };
-            }
-            let wait = left.min(u64::from(settings.server_timeout_ms));
-            match ask(t, server, settings.udp_payload, qn, rtype, tcp, wait) {
-                Ok((answer, wire)) => {
-                    let rtt = t.now_ms().saturating_sub(started);
-                    tried.push(self::tried(*ip, Via::Plain, Outcome::Answered(rtt), tcp));
-                    return Fetched {
-                        result: Ok((answer, *ip, wire)),
-                        tried,
-                    };
-                }
-                // RFC 7766 §5: a truncated UDP answer is retried over TCP.
-                Err(Ask::Reply(ReplyError::Truncated)) if !tcp => tcp = true,
-                Err(e) => {
-                    tried.push(self::tried(*ip, Via::Plain, Outcome::of(&e), tcp));
-                    errors.push(format!("{ip}: {e}"));
-                    break;
-                }
-            }
-        }
-    }
-    Fetched {
-        result: Err(failed(qn, &errors)),
-        tried,
     }
 }
 
@@ -966,58 +983,6 @@ fn failed(qn: &QName, errors: &[String]) -> ResolveError {
         name: qn.key.clone(),
         why,
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-enum Ask {
-    #[error("{0}")]
-    Transport(TransportError),
-    #[error("{0}")]
-    Reply(ReplyError),
-}
-
-/// One query to an encrypted server: id 0 and padded (RFC 8484 §4.1,
-/// RFC 8467 §4.1); no truncation to retry, it is a stream.
-fn ask_secure(
-    t: &mut dyn Transport,
-    server: SocketAddr,
-    via: &SecureServer,
-    payload: u16,
-    qn: &QName,
-    rtype: RecordType,
-    wait: u64,
-) -> Result<(Answer, usize), Ask> {
-    let bytes = crate::encrypted::query(&qn.name, rtype, payload)
-        .map_err(|e| Ask::Transport(TransportError::Io(e)))?;
-    let reply = t
-        .exchange_secure(server, via, &bytes, wait)
-        .map_err(Ask::Transport)?;
-    let m = check_reply(0, &qn.name, rtype, &reply).map_err(Ask::Reply)?;
-    Ok((Answer::from_reply(&qn.name, rtype, &m), reply.len()))
-}
-
-fn ask(
-    t: &mut dyn Transport,
-    server: SocketAddr,
-    payload: u16,
-    qn: &QName,
-    rtype: RecordType,
-    tcp: bool,
-    wait: u64,
-) -> Result<(Answer, usize), Ask> {
-    let (id, bytes) =
-        query(&qn.name, rtype, payload).map_err(|e| Ask::Transport(TransportError::Io(e)))?;
-    let mut accept = |b: &[u8]| {
-        !matches!(
-            check_reply(id, &qn.name, rtype, b),
-            Err(ReplyError::Mismatch)
-        )
-    };
-    let reply = t
-        .exchange(server, &bytes, tcp, wait, &mut accept)
-        .map_err(Ask::Transport)?;
-    let m = check_reply(id, &qn.name, rtype, &reply).map_err(Ask::Reply)?;
-    Ok((Answer::from_reply(&qn.name, rtype, &m), reply.len()))
 }
 
 #[cfg(test)]

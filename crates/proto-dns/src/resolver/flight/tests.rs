@@ -12,7 +12,7 @@ use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::RecordType;
 
 use super::super::{ResolveError, Resolver, Settings, Source, Transport, TransportError};
-use super::{Flight, Flights, Role};
+use super::{Flights, Role};
 use crate::message::parse_name;
 use crate::message::tests::{a, reply};
 
@@ -141,7 +141,14 @@ fn other_names_and_types_are_their_own_flights() {
 
 #[test]
 fn a_follower_gives_up_at_its_deadline() {
-    let f = Flight::default();
+    let flights = Arc::new(Flights::default());
+    let key = || ("x.example".to_owned(), RecordType::A, None);
+    let Role::Lead(_lead) = flights.join(key(), 10) else {
+        panic!("first one leads");
+    };
+    let Role::Follow(f) = flights.join(key(), 10) else {
+        panic!("second one follows");
+    };
     let t = std::cell::Cell::new(0u64);
     // The clock moves 40 ms per look; the leader never answers.
     let now = || {
@@ -153,12 +160,12 @@ fn a_follower_gives_up_at_its_deadline() {
 
 #[test]
 fn a_leader_that_unwinds_frees_its_followers() {
-    let flights = Flights::default();
+    let flights = Arc::new(Flights::default());
     let key = || ("x.example".to_owned(), RecordType::A, None);
-    let Role::Lead(lead) = flights.join(key()) else {
+    let Role::Lead(lead) = flights.join(key(), 10) else {
         panic!("first one leads");
     };
-    let Role::Follow(f) = flights.join(key()) else {
+    let Role::Follow(f) = flights.join(key(), 10) else {
         panic!("second one follows");
     };
     drop(lead);
@@ -166,5 +173,56 @@ fn a_leader_that_unwinds_frees_its_followers() {
     assert!(matches!(got, Err(ResolveError::Failed { .. })), "{got:?}");
     assert_eq!(flights.len(), 0);
     // A new lookup leads a new flight.
-    assert!(matches!(flights.join(key()), Role::Lead(_)));
+    assert!(matches!(flights.join(key(), 10), Role::Lead(_)));
+}
+
+/// G4.1t: a follower leaves a callback instead of a blocked thread; it
+/// takes no slot, and the leaders are bounded.
+#[test]
+fn callbacks_take_no_slot_and_leaders_are_bounded() {
+    let flights = Arc::new(Flights::default());
+    let key = |n: &str| (n.to_owned(), RecordType::A, None);
+    let Role::Lead(lead) = flights.join(key("a.example"), 2) else {
+        panic!("leads");
+    };
+    let got = Arc::new(std::sync::Mutex::new(Vec::new()));
+    for _ in 0..100 {
+        let Role::Follow(f) = flights.join(key("a.example"), 2) else {
+            panic!("follows: no slot needed");
+        };
+        let got = got.clone();
+        f.then(Box::new(move |r| got.lock().unwrap().push(r.is_err())));
+    }
+    assert_eq!(flights.counts(), (1, 100));
+    let Role::Lead(_b) = flights.join(key("b.example"), 2) else {
+        panic!("a second leader fits");
+    };
+    assert!(
+        matches!(flights.join(key("c.example"), 2), Role::Busy),
+        "max 2 leaders"
+    );
+    lead.finish(&Err(ResolveError::NoServers));
+    assert_eq!(got.lock().unwrap().len(), 100, "every callback ran once");
+    assert_eq!(flights.counts(), (1, 0));
+}
+
+/// A follower that comes after the result is out gets it at once.
+#[test]
+fn a_late_callback_runs_now() {
+    let flights = Arc::new(Flights::default());
+    let key = || ("x.example".to_owned(), RecordType::A, None);
+    let Role::Lead(lead) = flights.join(key(), 10) else {
+        panic!()
+    };
+    let Role::Follow(f) = flights.join(key(), 10) else {
+        panic!()
+    };
+    lead.finish(&Err(ResolveError::NoServers));
+    let ran = Arc::new(AtomicUsize::new(0));
+    let r2 = ran.clone();
+    f.then(Box::new(move |_| {
+        r2.fetch_add(1, Ordering::SeqCst);
+    }));
+    assert_eq!(ran.load(Ordering::SeqCst), 1);
+    assert_eq!(flights.counts(), (0, 0));
 }
