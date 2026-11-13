@@ -184,8 +184,9 @@ Gaps G4.1u (prazo por servidor adaptativo e nova tentativa) e G4.1v (serve-stale
 | `ip.dns.cache.print` (padrão, 1000 linhas) e `statistics.print` | 9–14 ms, nada ao lado | igual |
 
 O flush parava toda consulta enquanto liberava 1 M de entradas sob o lock do resolvedor; agora o
-mapa sai sob o lock (troca O(1)) e é liberado depois. O filtro por nome do `cache.print` ainda
-varre tudo sob o lock (gap G4.1y). A conta do motor (`cache_size`) bate com a memória real (~690 B
+mapa sai sob o lock (troca O(1)) e é liberado depois. O filtro por nome do `cache.print` varria
+tudo sob o lock; **corrigido na G4.1y**: a listagem vai em pedaços e dorme depois de cada um o
+tempo em que segurou o lock (p99,9 ao lado 201 ms → 0,28 ms na VM; `docs/changes/G4.1y.md`). A conta do motor (`cache_size`) bate com a memória real (~690 B
 por resposta).
 
 ### Adlist de 1 M de nomes (`adlist`)
@@ -326,7 +327,7 @@ ocioso e não termina; o teto é `max_concurrent_queries`.
 | Serve-stale só em 4,1 s (a RFC 8767 sugere 1,8 s) | gap G4.1v |
 | Slowloris de 4 endereços derruba o TCP (0–1 de 108); 16 conexões de um endereço perdem 54 % | **corrigido** (G4.1w): 107 de 107; 0,8 % |
 | Nomes únicos despejam os quentes: até 25 mil SERVFAIL em 15 s para o cliente legítimo | **corrigido** (G4.1x, W-TinyLFU): 0 |
-| `cache.print name=…` com 1 M de entradas para as consultas por 160 ms | gap G4.1y |
+| `cache.print name=…` com 1 M de entradas para as consultas por 160 ms | **corrigido** (G4.1y, em pedaços com pausa): p99,9 ao lado 0,28 ms |
 | A adlist de 1 M custa 14 % no acerto de cache | não se repete (vm6: +2 %); o custo real era a busca binária com nomes intercalados e a disputa entre threads, corrigidos na G4.1z |
 | O cache padrão de 2 MiB guarda 3 192 respostas | o padrão do RouterOS; vale dizer no ⓘ do `cache_size` |
 | RSS +2,7 MiB/h com o cache cheio (2 h na VM) | a observar nas 12 h da fase C |
