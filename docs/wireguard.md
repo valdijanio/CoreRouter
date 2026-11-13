@@ -6,8 +6,9 @@ são nossos, em Rust, por generic netlink (decisão e números em `docs/architec
 
 Partes:
 
-- **PR 1 (este):** modelo, comandos, chaves, push para o kernel, estado por par, testes.
-- **PR 2:** janela Interfaces › WireGuard (abas Interfaces e Peers, modais).
+- **PR 1:** modelo, comandos, chaves, push para o kernel, estado por par, testes.
+- **PR 2 (G1.31a):** janela Interfaces › WireGuard (abas Interfaces e Peers, modais com
+  checagens e prévia dos comandos), abaixo em "Janela".
 - **PR 3:** config do cliente com QR, `wg-import`/`wg-export`, saúde "sem handshake", endpoint
   por nome DNS, checagem de firewall, Safe Mode na `wg` de gerência, e a opção de criar rotas
   estáticas para os allowed addresses no modal do par.
@@ -25,6 +26,9 @@ Partes:
 | `interface.wireguard.peers.remove/enable/disable {name}` | |
 | `interface.wireguard.peers.list {interface?, show_sensitive?}` | Estado (`up`, `idle`, `no-handshake`, `never`, `disabled`), segundos desde o último handshake, rx/tx, endpoint atual e `roamed`, e uma dica quando não há handshake. |
 
+| `interface.wireguard.preview {id?, name?, listen_port?, mtu?, private_key?, …}` | A prévia do modal da interface: roda o `add`/`set` numa cópia da config e diz a porta, o firewall `input` (UDP da WAN chega?), o MTU contra o da WAN − 80 e os comandos que o OK manda. Nunca falha por entrada ruim (vira checagem). |
+| `interface.wireguard.peers.preview {id?, interface?, name?, public_key?, preshared_key?: bool, allowed_address?, …}` | A prévia do modal do par: prefixo de outro par (erro), o próximo endereço livre da rede da interface, laço da rota até o endpoint, keepalive atrás de NAT; num par novo sem chave, `private_key=auto`; ao editar, mantém as chaves (a pública sem mudança não vai). |
+
 Como interface comum, uma `wg` também aceita `interface.set` (renomear, MTU), `ip.address.add`,
 rotas, firewall e interface lists.
 
@@ -34,6 +38,23 @@ corerouter-cli run ip.address.add '{"address":"10.9.0.1/24","interface":"wg0"}'
 corerouter-cli run interface.wireguard.peers.add '{"interface":"wg0","name":"notebook","public_key":"<chave do cliente>","allowed_address":"10.9.0.2/32"}'
 corerouter-cli run interface.wireguard.peers.list
 ```
+
+## Janela (G1.31a)
+
+Interfaces › WireGuard (`crates/ui/src/wireguard.rs`), a opção A do mockup, no padrão de lista
+do G0.24:
+
+- **aba Interfaces:** estado (`running`, `disabled`, `error` com o motivo embaixo,
+  `not running`), nome em selo por hash, porta, MTU, chave pública curta, pares e quantos `up`;
+  clique direito: copiar a chave pública, "Add Peer…" (abre o modal do par já nessa interface),
+  "Regenerate Keys…" (pergunta antes: todos os pares precisarão da pública nova);
+- **aba Peers:** selo de estado (`up`, `idle`, `no-handshake`, `never`, `disabled`, mais
+  `responder`), último handshake ("7 s ago"), endpoint atual com selo `roamed`, prefixos, rx/tx,
+  chave curta; filtros por interface e por estado; rodapé com as contagens; a linha embaixo da
+  tabela dá a dica do engine para o par selecionado;
+- **modais:** ⓘ em português em cada campo; a prévia do engine (acima) com as checagens e os
+  comandos; o par novo cai na interface filtrada, senão na do par selecionado;
+- as `wg` continuam em Interfaces (tipo `wireguard`, cadeado).
 
 ## Validações (mais fortes que os avisos do RouterOS)
 
@@ -90,9 +111,13 @@ Regra única no engine (`corerouter_model::wireguard::PeerState`), pelos timers 
 ## Desempenho e paralelismo
 
 - **Por item:** aplicar é O(pares que mudaram), não O(total). Ler o estado é um dump por
-  interface: 5 ms com 1 000 pares e 63 ms com 50 000 (**medido**, VM do laboratório). Cada
-  `peers.list` faz um dump por interface; com dezenas de milhares de pares isso pesa, e um cache
-  por tick fica para quando houver medição na GUI (PR 2).
+  interface: 5 ms com 1 000 pares e 63 ms com 50 000 (**medido**, VM do laboratório).
+- **A janela (G1.31a):** a GUI pede `interface.wireguard.list` a cada refresh com a janela
+  aberta, e `peers.list` só na aba Peers. O PR 1 casava cada par com o relatório do kernel
+  andando a lista inteira (O(pares²)): com 20 000 pares, `peers.list` levava 413 ms e `list`
+  362 ms. Agora um mapa por chave pública: 51 ms e 5,3 ms (**medido**, release, bench
+  `wireguard_list`, Ryzen AI Max+ 395, `VirtualHal`, 2026-11-12). Os 51 ms que sobram são a
+  montagem do JSON de 20 000 linhas; um cache por tick do dump não muda isso e fica de fora.
 - **Núcleos:** a cifra é do kernel, que espalha os lotes por todos os núcleos online (decifra em
   paralelo e entrega em ordem por par). No caminho de dados não há trabalho nosso.
 - **Plano de controle:** o push roda sob o lock da sessão, como o resto do commit. Uma mudança de

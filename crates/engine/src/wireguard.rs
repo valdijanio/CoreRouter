@@ -24,8 +24,8 @@ use std::net::SocketAddr;
 
 use base64::Engine as _;
 pub use corerouter_hal::wireguard::Key;
-use corerouter_hal::wireguard::{WgDevice, WgPeerSpec, WgStatus};
-use corerouter_model::wireguard::{WgKey, WgPeer, Wireguard};
+use corerouter_hal::wireguard::{WgDevice, WgPeerSpec, WgPeerStatus, WgStatus};
+use corerouter_model::wireguard::{PeerState, WgKey, WgPeer, Wireguard};
 use corerouter_model::{Config, IfName, InterfaceKind};
 
 use crate::Session;
@@ -112,6 +112,32 @@ pub fn interfaces(cfg: &Config) -> impl Iterator<Item = (&IfName, bool, &Wiregua
 /// Every peer of `cfg` with its interface.
 pub fn peers(cfg: &Config) -> impl Iterator<Item = (&IfName, &WgPeer)> {
     interfaces(cfg).flat_map(|(n, _, w)| w.peers.iter().map(move |p| (n, p)))
+}
+
+/// The data plane's peers of one interface by public key: a listing looks
+/// each configured peer up here, once. A walk of the status per peer was
+/// O(peers²): 20 000 peers took 4·10⁸ key compares on every refresh of the
+/// window (G1.31a).
+pub fn status_by_key(status: Option<&WgStatus>) -> BTreeMap<Key, &WgPeerStatus> {
+    status
+        .map(|st| st.peers.iter().map(|p| (p.public_key, p)).collect())
+        .unwrap_or_default()
+}
+
+/// What a listing says of one peer: its state, the seconds since its last
+/// handshake, and what the data plane reports (`None`: not running).
+pub fn peer_view<'a>(
+    peer: &WgPeer,
+    iface_disabled: bool,
+    by_key: &BTreeMap<Key, &'a WgPeerStatus>,
+    now: u64,
+) -> (PeerState, Option<u64>, Option<&'a WgPeerStatus>) {
+    let st = decode(peer.public_key.as_str()).and_then(|k| by_key.get(&k).copied());
+    let age = st
+        .and_then(|x| x.last_handshake_unix)
+        .map(|t| now.saturating_sub(t));
+    let state = PeerState::of(peer, iface_disabled, age, st.is_some_and(|x| x.tx_bytes > 0));
+    (state, age, st)
 }
 
 /// The run-time state: what each link was last given.
