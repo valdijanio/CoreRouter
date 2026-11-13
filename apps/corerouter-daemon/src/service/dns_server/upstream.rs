@@ -26,6 +26,10 @@
 //!   (the resolver refuses more: SERVFAIL "busy"); equal ones waiting for
 //!   them (G4.1o) take no slot and are at most `MAX_WAITING`; the inbox
 //!   holds at most those, so it needs no bound of its own.
+//! - **Serve-stale** (G4.1v, RFC 8767 §5): a lookup still out
+//!   [`STALE_CLIENT_MS`] (1.8 s) after it began answers its client, and
+//!   every equal one waiting, with the expired entry when the cache has one
+//!   inside `serve_stale`; the lookup goes on and only refreshes the cache.
 //! - **Threads**: as many loops as UDP readers per family (half the CPUs,
 //!   1–4); a lookup goes to the next loop in turn and stays there. Nothing
 //!   is shared between loops but the resolver (its lock is held only
@@ -39,7 +43,9 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use corerouter_proto_dns::resolver::{Exchange, Lookup, TransportError, Waiter, Way};
+use corerouter_proto_dns::resolver::{
+    Exchange, Lookup, STALE_CLIENT_MS, TransportError, Waiter, Way,
+};
 use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Token, Waker};
 
@@ -173,7 +179,11 @@ fn start(srv: &Arc<Server>) -> Vec<Arc<Inbox>> {
 struct Entry {
     era: u32,
     lookup: Box<Lookup>,
-    done: Waiter,
+    /// `None` once its client got the stale answer (G4.1v).
+    done: Option<Waiter>,
+    /// When its client gets the stale answer, if the lookup is still out
+    /// and the cache has one (RFC 8767 §5, G4.1v).
+    stale_at: Option<u64>,
     /// Its UDP exchanges outstanding: token, socket, id.
     sent: Vec<(u32, usize, u16)>,
     /// The timer queued for it (no duplicates in the heap).
@@ -263,7 +273,9 @@ impl Run {
         for i in 0..self.slots.len() {
             if let Some(e) = self.slots.get_mut(i).and_then(Option::take) {
                 let r = self.srv.fwd.resolver.complete(*e.lookup, self.now());
-                (e.done)(r);
+                if let Some(done) = e.done {
+                    done(r);
+                }
             }
         }
     }
@@ -273,6 +285,9 @@ impl Run {
             Mail::Lead(mut lookup, done) => {
                 let now = self.now();
                 let out = lookup.start(now);
+                let stale_at = lookup
+                    .serves_stale()
+                    .then_some(now.saturating_add(STALE_CLIENT_MS));
                 let slot = self.free.pop().unwrap_or_else(|| {
                     self.slots.push(None);
                     self.eras.push(0);
@@ -283,7 +298,8 @@ impl Run {
                     *s = Some(Entry {
                         era,
                         lookup,
-                        done,
+                        done: Some(done),
+                        stale_at,
                         sent: Vec::new(),
                         timer: None,
                     });
@@ -470,6 +486,7 @@ impl Run {
 
     fn timers_due(&mut self) {
         let now = self.now();
+        let srv = self.srv.clone();
         while let Some(&Reverse((at, slot, era))) = self.timers.peek() {
             if at > now {
                 break;
@@ -480,6 +497,16 @@ impl Run {
                 continue;
             }
             e.timer = None;
+            // RFC 8767 §5: the client response timer.
+            if e.stale_at.is_some_and(|t| t <= now) {
+                e.stale_at = None;
+                if let Some(r) = srv.fwd.resolver.answer_stale(&e.lookup, now)
+                    && let Some(done) = e.done.take()
+                {
+                    done(Ok(r));
+                }
+            }
+            let Some(e) = self.entry(slot, era) else { continue };
             let out = e.lookup.tick(now);
             self.send(slot, out);
             self.settle(slot);
@@ -503,7 +530,10 @@ impl Run {
             keep
         });
         let finished = e.lookup.done();
-        let next = e.lookup.wake_at();
+        let next = match (e.lookup.wake_at(), e.stale_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         let era = e.era;
         if !finished && next.is_some() && e.timer != next {
             e.timer = next;
@@ -530,7 +560,11 @@ impl Run {
         self.free.push(slot);
         let r = self.srv.fwd.resolver.complete(*e.lookup, self.now());
         self.srv.fwd.count_in_flight();
-        (e.done)(r);
+        // Its client already has the stale answer: this one only filled
+        // the cache.
+        if let Some(done) = e.done {
+            done(r);
+        }
     }
 
     /// Retired sockets with nothing waiting are closed (looked at every
@@ -574,6 +608,15 @@ mod tests {
     /// An upstream that answers every query `delay` after it came, from one
     /// thread (no thread per query on its side either); counts the queries.
     fn slow_server(delay: Duration) -> (u16, Arc<AtomicUsize>) {
+        let (port, count, _) = server(delay, 300);
+        (port, count)
+    }
+
+    /// [`slow_server`] with answers of `ttl` seconds, silent while the
+    /// flag says so.
+    fn server(delay: Duration, ttl: u32) -> (u16, Arc<AtomicUsize>, Arc<std::sync::atomic::AtomicBool>) {
+        let silent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let quiet = silent.clone();
         let udp = StdUdp::bind("127.0.0.1:0").unwrap();
         let port = udp.local_addr().unwrap().port();
         udp.set_read_timeout(Some(Duration::from_millis(5))).unwrap();
@@ -585,13 +628,16 @@ mod tests {
             loop {
                 if let Ok((n, from)) = udp.recv_from(&mut buf) {
                     c.fetch_add(1, Ordering::Relaxed);
+                    if quiet.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     let q = Message::from_vec(&buf[..n]).unwrap();
                     let mut m = Message::response(q.metadata.id, OpCode::Query);
                     m.metadata.response_code = ResponseCode::NoError;
                     m.add_queries(q.queries.clone());
                     m.add_answer(Record::from_rdata(
                         q.queries[0].name().clone(),
-                        300,
+                        ttl,
                         RData::A(A(Ipv4Addr::new(198, 51, 100, 9))),
                     ));
                     due.push_back((Instant::now() + delay, m.to_vec().unwrap(), from));
@@ -602,7 +648,7 @@ mod tests {
                 }
             }
         });
-        (port, count)
+        (port, count, silent)
     }
 
     fn query(id: u16, name: &str) -> Vec<u8> {
@@ -615,6 +661,15 @@ mod tests {
 
     /// A forwarder on a free port whose resolver asks `upstream`.
     fn forwarder(upstream: u16, max: u32) -> (Arc<Server>, u16, corerouter_control::Shutdown) {
+        forwarder_stale(upstream, max, 0)
+    }
+
+    /// [`forwarder`] with `serve_stale_secs`.
+    fn forwarder_stale(
+        upstream: u16,
+        max: u32,
+        stale_secs: u32,
+    ) -> (Arc<Server>, u16, corerouter_control::Shutdown) {
         let session = shared(Session::virtual_lab());
         lock(&session)
             .execute(
@@ -627,6 +682,7 @@ mod tests {
             servers: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
             port: upstream,
             max_queries: max,
+            stale_secs,
             ..Settings::default()
         };
         dns.resolver.configure(s, 0);
@@ -755,6 +811,34 @@ mod tests {
         assert_eq!(names_seen.len(), 64);
         let want = 64 / usize::try_from(USES).unwrap();
         assert!(ports.len() >= want, "{} ports for 64 queries", ports.len());
+        shutdown.close();
+    }
+
+    /// G4.1v (RFC 8767 §5): the upstream went silent after the answer
+    /// expired; the client gets the stale answer in about 1.8 s, not after
+    /// every try failed (4.1 s measured before).
+    #[test]
+    fn a_dead_upstream_serves_stale_in_1_8_s() {
+        let (up, _asked, silent) = server(Duration::ZERO, 1);
+        let (_srv, port, shutdown) = forwarder_stale(up, 100, 86_400);
+        let name = vec!["stale.example.".to_owned()];
+        assert_eq!(ask_all(port, &name, Duration::from_secs(3)).len(), 1);
+        thread::sleep(Duration::from_millis(1100));
+        silent.store(true, Ordering::Relaxed);
+        let c = StdUdp::bind("127.0.0.1:0").unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let t0 = Instant::now();
+        c.send_to(&query(7, "stale.example."), ("127.0.0.1", port)).unwrap();
+        let mut buf = [0u8; 1500];
+        let n = c.recv(&mut buf).unwrap();
+        let took = t0.elapsed();
+        let m = Message::from_vec(&buf[..n]).unwrap();
+        assert_eq!(m.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(m.answers[0].ttl, 30, "RFC 8767 §4");
+        assert!(
+            took >= Duration::from_millis(1700) && took < Duration::from_millis(2500),
+            "{took:?}"
+        );
         shutdown.close();
     }
 }

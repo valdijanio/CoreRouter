@@ -143,6 +143,27 @@ impl Lead {
         self.publish(outcome.clone());
     }
 
+    /// G4.1v (RFC 8767 §5): `outcome` (the stale answer) to every lookup
+    /// waiting now, and to the ones that join from now on, while the
+    /// lookup itself goes on: it stays in the map, so the equal ones still
+    /// follow it instead of asking again, and its own result, when it
+    /// comes, only fills the cache.
+    pub(super) fn early(&self, outcome: &Outcome) {
+        let waiters = {
+            let mut st = lock(&self.flight.state);
+            if st.result.is_some() {
+                return;
+            }
+            st.result = Some(outcome.clone());
+            std::mem::take(&mut st.waiters)
+        };
+        self.flight.done.notify_all();
+        for w in waiters {
+            self.flights.waiting.fetch_sub(1, Ordering::Relaxed);
+            w(outcome.clone());
+        }
+    }
+
     fn publish(&mut self, outcome: Outcome) {
         let Some(key) = self.key.take() else { return };
         // Out of the map first: a lookup that comes now leads a new flight

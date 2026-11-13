@@ -62,7 +62,10 @@ fn a_silent_server_times_out_on_tick_and_the_next_answers() {
     assert_eq!(second[0].server.ip(), ip("192.0.2.2"));
     assert_ne!(second[0].token, first[0].token);
     assert_eq!(second[0].wait_ms, 376);
-    assert!(l.reply(second[0].token, &answer(&second[0], [192, 0, 2, 80]), 386).is_empty());
+    assert!(
+        l.reply(second[0].token, &answer(&second[0], [192, 0, 2, 80]), 386)
+            .is_empty()
+    );
     assert!(l.done());
     let got = r.complete(*l, 386).unwrap();
     assert_eq!(got.source, Source::Server(ip("192.0.2.2")));
@@ -86,7 +89,10 @@ fn a_late_answer_to_an_expired_query_is_taken() {
     let first = l.start(0).remove(0);
     let second = l.tick(376).remove(0);
     assert!(l.waiting().any(|t| t == first.token), "still listening");
-    assert!(l.reply(first.token, &answer(&first, [192, 0, 2, 1]), 500).is_empty());
+    assert!(
+        l.reply(first.token, &answer(&first, [192, 0, 2, 1]), 500)
+            .is_empty()
+    );
     assert!(l.done());
     assert!(l.waiting().next().is_none());
     let got = r.complete(*l, 500).unwrap();
@@ -265,4 +271,87 @@ fn a_dropped_lookup_fails_its_followers() {
     drop(l);
     assert!(f.wait(u64::MAX, &|| 0).unwrap().is_err());
     assert_eq!(r.in_flight(), (0, 0));
+}
+
+/// G4.1v (RFC 8767 §5): the client response timer. A lookup still out
+/// answers with the stale entry; the equal lookups waiting and the ones
+/// that join later get it at once, no new lookup starts, and the lookup's
+/// own result later only refreshes the cache.
+#[test]
+fn stale_goes_out_early_and_the_lookup_goes_on() {
+    let dns = Dns {
+        servers: vec![ip("192.0.2.1")],
+        serve_stale_secs: 86_400,
+        ..Dns::default()
+    };
+    let r = Resolver::new(Settings::new(&dns, &[]));
+    // Cached with TTL 1 s, then expired.
+    let mut l = lead(&r, "old.example");
+    let x = l.start(0).remove(0);
+    let owner = Message::from_vec(&x.query).unwrap().queries[0]
+        .name()
+        .to_ascii();
+    let one = reply(
+        &x.query,
+        ResponseCode::NoError,
+        vec![a(&owner, 1, [192, 0, 2, 1])],
+        None,
+    );
+    l.reply(x.token, &one, 5);
+    r.complete(*l, 5).unwrap();
+    let qn = parse_name("old.example").unwrap();
+    let Begin::Lead(mut l) = r.begin(&qn, RecordType::A, None, 10_000) else {
+        panic!("expired: a new lookup")
+    };
+    assert!(l.serves_stale());
+    let x = l.start(10_000).remove(0);
+    let Begin::Follow(before) = r.begin(&qn, RecordType::A, None, 10_100) else {
+        panic!()
+    };
+    let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let g = got.clone();
+    before.then(Box::new(move |res| g.lock().unwrap().push(res)));
+    let stale = r
+        .answer_stale(&l, 10_000 + super::super::STALE_CLIENT_MS)
+        .unwrap();
+    assert_eq!(stale.source, Source::Stale);
+    assert_eq!(stale.answer.ttl, Some(30), "RFC 8767 §4: TTL 30 s");
+    assert_eq!(got.lock().unwrap().len(), 1, "the follower got it too");
+    // A lookup now still follows the one in flight, and gets stale at once.
+    let Begin::Follow(after) = r.begin(&qn, RecordType::A, None, 11_900) else {
+        panic!("no second lookup upstream")
+    };
+    assert_eq!(after.wait(0, &|| 0).unwrap().unwrap().source, Source::Stale);
+    // The server answers at last: the cache is fresh again.
+    let fresh = reply(
+        &x.query,
+        ResponseCode::NoError,
+        vec![a(&owner, 300, [192, 0, 2, 2])],
+        None,
+    );
+    l.reply(x.token, &fresh, 12_000);
+    r.complete(*l, 12_000).unwrap();
+    assert_eq!(r.in_flight(), (0, 0));
+    match r.begin(&qn, RecordType::A, None, 12_001) {
+        Begin::Now(Ok(hit)) => {
+            assert_eq!(hit.source, Source::Cache);
+            assert_eq!(hit.answer.addresses(), vec![ip("192.0.2.2")]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Nothing stale in the cache: the client keeps waiting.
+#[test]
+fn no_stale_entry_no_early_answer() {
+    let dns = Dns {
+        servers: vec![ip("192.0.2.1")],
+        serve_stale_secs: 86_400,
+        ..Dns::default()
+    };
+    let r = Resolver::new(Settings::new(&dns, &[]));
+    let mut l = lead(&r, "never.example");
+    l.start(0);
+    assert!(r.answer_stale(&l, 1800).is_none());
+    assert!(!l.done());
 }

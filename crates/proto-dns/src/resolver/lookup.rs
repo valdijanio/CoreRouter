@@ -160,11 +160,12 @@ impl Lookup {
     /// blocking streams in the daemon), or one whose address must be
     /// looked up first.
     pub fn needs_thread(&self) -> bool {
-        !self.unresolved.is_empty()
-            || self
-                .targets
-                .iter()
-                .any(|t| matches!(t, Target::Secure(..)))
+        !self.unresolved.is_empty() || self.targets.iter().any(|t| matches!(t, Target::Secure(..)))
+    }
+
+    /// Whether an expired answer may be served (`serve_stale` on, G4.1v).
+    pub fn serves_stale(&self) -> bool {
+        self.settings.stale_secs > 0
     }
 
     /// The first exchange; the lookup's clock starts now.

@@ -133,6 +133,11 @@ impl Target {
 /// An encrypted exchange waits at least this long: a TLS handshake is two
 /// round trips more (RouterOS `doh-timeout` 5 s).
 pub const SECURE_TIMEOUT_MS: u64 = 5000;
+/// RFC 8767 §5: a client gets the stale answer when the lookup has not
+/// finished after this long ("a recommended value of 1.8 seconds", just
+/// under the common 2 s client timeout; Unbound's
+/// `serve-expired-client-timeout` since 1.23) (G4.1v).
+pub const STALE_CLIENT_MS: u64 = 1800;
 /// A lookup waiting for an equal one in flight (G4.1o) gives up this long
 /// after the leader's own deadline.
 const FOLLOW_SLACK_MS: u64 = 1000;
@@ -722,7 +727,11 @@ impl Resolver {
                     // RFC 6298 §5.5: back off. From the RTO this query
                     // waited, not the current one: many queries timing out
                     // together double it once (Unbound's `rtt_lost`).
-                    let now_rto = if s.rto_ms == 0 { UNKNOWN_RTT_MS } else { s.rto_ms };
+                    let now_rto = if s.rto_ms == 0 {
+                        UNKNOWN_RTT_MS
+                    } else {
+                        s.rto_ms
+                    };
                     s.rto_ms = now_rto
                         .max(tr.wait_ms.saturating_mul(2))
                         .clamp(RTO_MIN_MS, RTO_MAX_MS);
@@ -829,6 +838,27 @@ impl Resolver {
         );
         self.drive(t, &mut lookup);
         lookup.take_result().map(|(answer, from, _)| (answer, from))
+    }
+
+    /// G4.1v (RFC 8767 §5, the "client response timer"): a lookup still
+    /// out [`STALE_CLIENT_MS`] after it began answers with the expired
+    /// entry, if the cache still has one inside `serve_stale`: the stale
+    /// answer goes to every equal lookup waiting (and joining), and the
+    /// lookup goes on to refresh the cache. `None`: nothing stale (keep
+    /// waiting).
+    pub fn answer_stale(&self, lookup: &Lookup, now_ms: u64) -> Option<Resolved> {
+        let hit = self
+            .state()
+            .cache
+            .get_stale(&lookup.qn.key, lookup.rtype, now_ms)?;
+        let r = Resolved {
+            answer: hit.answer,
+            source: Source::Stale,
+        };
+        if let Some(lead) = &lookup.lead {
+            lead.early(&Ok(r.clone()));
+        }
+        Some(r)
     }
 
     /// Lookups in flight upstream (G4.1t: at most `max_concurrent_queries`)
