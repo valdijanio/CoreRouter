@@ -41,7 +41,156 @@ perfil do processo na remoção das interfaces.
   pelos comandos do CoreRouter (sem `vtysh`). O roteador remoto não é reiniciado pelo roteiro:
   os passos de reinício do FRR e do daemon ficam de fora.
 
-RESULTS
+## Resultados
+
+**Medido** em 2026-11-12 na VM do laboratório (8 vCPUs EPYC-Genoa `host-model`, 15,6 GiB, kernel
+7.0 do Ubuntu; o roteador em chroot da imagem `d2a454d2` com o FRR 10.7.1 dela; o daemon desta
+branch, `--daemon build`, release). O host tinha outras sessões rodando: os tempos servem para
+comparar, não como número de produção. Rodadas: `/srv/build/G3.4m/run2*.log`.
+
+### 1. Tamanho da LSDB
+
+LSDB carregada de uma vez no gerador (`ospf-load-mrt`, um vizinho, hello 1 s / dead 4 s);
+`nodes` = LSAs/20 (até 2 000 roteadores), o resto AS-external. Rotas: o FIB do `zebra` (o que o
+kernel confirmou). Picos: VmHWM de cada processo no degrau; RAM: a usada na VM inteira (com o
+BNG Blaster, que guarda a mesma LSDB).
+
+| LSAs | LSDB completa (s) | 1ª rota (s) | todas (s) | rotas | instalação (rotas/s) | SPF (execuções / última ms) | `ospfd` RSS (MiB) | `zebra` | daemon | `ospfd` CPU méd/máx (%) | `zebra` CPU | daemon CPU | RAM da VM (MiB) | rotas saem (s) | passa? |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 000 | 0,0 | 1,9 | 2,9 | 1 101 | 1 163 | 4 / 0 | 12 | 17 | 66 | 0/1 | 0/0 | 1/3 | 877 | 6,2 | sim |
+| 10 000 | 0,0 | 1,8 | 2,9 | 11 001 | 9 822 | 5 / 3 | 26 | 23 | 69 | 0/1 | 2/13 | 1/2 | 903 | 6,1 | sim |
+| 50 000 | 0,3 | 1,8 | 3,4 | 54 003 | 34 006 | 5 / 21 | 88 | 47 | 73 | 2/8 | 11/37 | 0/1 | 1 025 | 6,2 | sim |
+| 100 000 | 0,2 | 1,8 | 4,2 | 104 003 | 44 407 | 5 / 16 | 163 | 74 | 75 | 3/16 | 21/126 | 1/2 | 1 204 | 6,2 | sim |
+| 200 000 | 6,1 | 1,8 | 6,4 | 204 003 | 44 865 | 5 / 16 | 308 | 128 | 77 | 6/27 | 33/137 | 1/2 | 1 491 | 6,3 | sim |
+
+- **Limite:** nenhum até 200 000 LSAs. Memória por item: ~1,5 KiB por LSA no `ospfd` e ~0,6 KiB
+  por rota no `zebra`; o daemon fica em 66–77 MiB (lê a LSDB só sob demanda). Projeção para o
+  notebook de 8 GiB (**estimado**, linear): ~2,1 KiB por LSA com rota, ~2,5 milhões de LSAs antes
+  de faltar memória para o resto do sistema, longe de uma rede real.
+- **Instalação:** ~45 000 rotas/s no kernel (o `zebra` em um núcleo, 137 % de pico com o
+  dataplane em outra thread); o SPF de 200 000 LSAs leva 16 ms (os prefixos externos não entram no
+  SPF, só na tabela de rotas).
+- **Retirada:** as rotas saem em ~6 s quando o gerador cai (5 s são o `teardown-time` do BNG
+  Blaster); as LSAs ficam na LSDB até o purge chegar (60 s de `maxage-delay` do FRR depois) ou,
+  sem purge, até o MaxAge (1 h, RFC 2328 §14). O BNG Blaster não termina o purge de 200 000 LSAs
+  em 300 s: elas ficam, sem rota, até envelhecer — por isso cada teste recria a instância.
+
+### 2. Churn
+
+Base de 10 000 LSAs; um nó extra do `lspgen` reinjetado a cada passo (~3,1 s: o `lspgen` espera
+antes de fechar o socket), com a métrica trocada (100 ↔ 200). *external*: as LSAs AS-external do
+nó; *router*: os links das router-LSAs (SPF completo a cada passo). Atraso medido a cada 5º passo,
+sem outro passo até ser visto.
+
+| tipo | LSAs/s | passos | `ospfd` CPU méd/máx (%) | `zebra` | daemon | SPF | atraso LSDB p50/máx (ms) | `zebra` | CoreRouter | sondas > 20 s | passa? |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| external | 1,0 | 10 | 1/15 | 0/0 | 1/7 | 8 → 10 | 3 040/3 041 | 3 051/3 051 | 3 058/12 610 | 0 | sim |
+| external | 85,5 | 11 | 1/13 | 0/1 | 2/7 | 11 → 12 | 3 042/3 047 | 3 053/3 059 | 3 059/10 996 | 0 | sim |
+| external (120 s) | 6,7 | 25 | 1/13 | 0/0 | 1/7 | 11 → 14 | 3 044/3 054 | 3 054/3 064 | 10 531/11 366 | 2 | **não** |
+| external (120 s) | 64,8 | 25 | 1/24 | 0/1 | 2/12 | 16 → 18 | 3 077/5 089 | 3 096/3 096 | 10 719/11 196 | 2 | **não** |
+| router | 1,3 | 39 | 0/3 | 0/1 | 2/5 | 19 → 44 | – | – | – | – | sim |
+| router | 10,4 | 39 | 0/3 | 0/1 | 1/4 | 47 → 88 | – | – | – | – | sim |
+| router | 101,1 | 39 | 0/3 | 0/1 | 1/2 | 91 → 171 | – | – | – | – | sim |
+
+- O roteador acompanha: a LSA chega à LSDB quando o `lspgen` termina de entregá-la (os ~3 s são
+  do gerador) e o `zebra` instala ~10 ms depois; até ~100 LSAs/s o `ospfd` fica abaixo de 25 % de
+  um núcleo e o daemon abaixo de 12 %.
+- **O CoreRouter atrasa:** `routing.ospf.route.list` mostra o custo novo com p50 de 3,1 s numa
+  rodada curta e de **10,5 s** nas de 120 s, e em 2 de 5 sondas passou de 20 s. A LSDB e as rotas
+  são lidas sob demanda e guardadas por `FRESH_SECS` = 10 s (`crates/engine/src/ospf_state.rs`,
+  G3.4n) + o tick de 2 s do laço do FRR; acima de 20 s a leitura atrasa além desse desenho. Para a
+  G3.4n (anotado sem editar, como pedido): sob churn, a lista de rotas do CoreRouter fica até
+  dezenas de segundos atrás do `ospfd`.
+- As router-LSAs do `lspgen` (OSPFv2, sem SR) só têm links ponto a ponto sem número: não há
+  prefixo para seguir; o tipo *router* mede o SPF (até 80 execuções em 120 s) e a CPU.
+
+### 3. Muitos vizinhos
+
+VLANs 802.1Q no `ether1` (uma adjacência por VLAN, gen instâncias 2..n+1), hello 1 s / dead 4 s,
+base de 10 000 LSAs inundada a todos; 10 min de estabilidade.
+
+| vizinhos | commit das VLANs (s) | todos Full (s) | mín. Full em 600 s | amostras abaixo | `ospfd` RSS (MiB) | `ospfd` CPU méd/máx (%) | `zebra` | daemon | remoção (s) | passa? |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 50 | 0,1 | 6,1 | 51 | 0 | 280 | 0/48 | 0/14 | 1/5 | 0,8 | sim |
+| 100 | 0,2 | 7,8 | 101 | 0 | 418 | 0/59 | 0/14 | 1/6 | 1,5 | sim |
+| 250 | 0,5 | 7,8 | 251 | 0 | 652 | 2/98 | 0/11 | 2/52 | 3,5 | sim |
+| 250, base de ~65 000 LSAs | – | nunca (10 min) | – | – | > 2 200 | 100 | – | – | – | **não** |
+
+- **Limite:** com 250 vizinhos e ~65 000 LSAs (uma rodada em que a LSDB anterior não tinha saído),
+  hello 1 s / dead 4 s, todas as adjacências ficaram presas em Exchange e reiniciavam a cada poucos
+  segundos (lista de resumo de ~9 400 LSAs por vizinho): o `ospfd`, de uma thread, não termina a
+  troca de LSDB com todos dentro do dead interval e os Hello se perdem atrás dela (é o caso da
+  RFC 4222). Com 100 vizinhos e a mesma LSDB grande, o `ospfd` chegou a 2,2 GiB (~22 MiB por
+  vizinho, as listas de retransmissão e de resumo).
+- Antes da correção 1 (abaixo), só 20 vizinhos formavam adjacência, sempre: a 21ª VLAN ficava em
+  Init.
+
+### 3b. Muitas interfaces OSPF (G3.4p)
+
+VLANs ponto a ponto, hello 10 s, sem vizinho: o custo do `ospfd` por interface e o do daemon que
+lê `show ip ospf interface json` a cada 2 s.
+
+| interfaces | commit (s) | no `ospfd` | sem o grupo OSPF | arquivos do `ospfd` | `show ip ospf interface json` p50/máx (ms) | tamanho (KiB) | `routing.ospf.interface.list` p50/máx (ms) | daemon CPU parado méd/máx (%) | `ospfd` CPU | remoção (s) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 000 | 2,1 | 1 001 | 0 | 1 015 | 22/35 | 922 | 16/34 | 2/6 | 0/2 | 15,0 |
+| 4 000 | 34,3 | 4 001 | 0 | 4 015 | 108/136 | 3 697 | 51/57 | 10/18 | 4/14 | 101,3 |
+
+- A leitura das interfaces a cada 2 s custa ao `ospfd` ~55–110 ms por vez com 4 000 interfaces
+  (3,7 MiB de JSON) e ao daemon 7–10 % de um núcleo parado: dado para a G3.4p.
+- Onde vai a CPU no commit e na remoção (s de CPU por processo, 4 000 interfaces): commit — daemon
+  4,9, `ospfd` 28,2, `zebra` 9,6; remoção — daemon 12,1 (era 43,3 antes da correção 3), `ospfd`
+  28,6, `zebra` 18,1.
+
+### 4. Operação com carga
+
+LSDB de 10 000 LSAs e 11 001 rotas carregada (rodada 26).
+
+| operação | comando (ms) | de volta ao normal (s) | mín. LSAs / rotas durante | nada perdido | passa? |
+|---|---|---|---|---|---|
+| commit (custo do template 10 → 20) | 20 | 0,0 | 10 002 / 11 001 | sim | sim |
+| Safe Mode, cancelado (template desligado: a adjacência e as rotas saem) | 35 | 11,1 | 9 501 / 0 | sim | sim |
+| Safe Mode, conexão perdida (o mesmo, e o cliente morto) | – | 12,0 | 9 501 / 0 | sim | sim |
+| FRR morto (SIGKILL) e iniciado de novo (o daemon reinstala a config) | – | 14,0 | 0 / 0 | sim | sim |
+| daemon reiniciado (responde em 0,5 s) | – | 0,5 | 10 002 / 11 001 | sim | sim |
+
+- O Safe Mode desfaz pelo fim da conexão (`hang_up` do canal de controle) em 12 s até tudo voltar;
+  a configuração fica igual à de antes (conferida pelos templates).
+- Reiniciar o daemon não mexe no encaminhamento: as rotas no kernel nunca caíram.
+- Os 11–14 s de volta são o OSPF (adjacência, troca da LSDB de 10 000 LSAs, SPF e instalação).
+
+### 5. Latência dos comandos com carga
+
+Rodada 26 (10 000 LSAs; 10 chamadas cada). CLI: um processo e uma conexão por chamada; MCP: uma
+conexão quente. `lsa.list` e `route.list` respondem `pending` na primeira chamada (leitura sob
+demanda da G3.4n); a coluna "1ª completa" (o tempo até a resposta com as linhas) entra na
+repetição com 200 000.
+
+| comando | resposta (bytes) | CLI p50/p99 (ms) | MCP p50/p99 (ms) |
+|---|---|---|---|
+| `routing.ospf.neighbor.list` | 383 | 3/4 | 3/6 |
+| `routing.ospf.interface.list` | 490 | 4/4 | 2/3 |
+| `routing.ospf.instance.list` | 498 | 4/7 | 2/3 |
+| `ip.route.list` | 803 | 4/10 | 3/3 |
+| `ip.route.page` | 1 181 | 4/8 | 2/3 |
+| `system.resource.print` | 2 439 | 4/4 | 2/3 |
+| `inspect` | 674 | 4/5 | 2/3 |
+
+### 6. Convergência com tráfego (local)
+
+BNG Blaster manda 10 000 pps de `gen1` através do roteador até `gen2`, atrás de R4; o roteador
+chega a R4 por R2 (10 + 10) ou R3 (20 + 10), FRR da VM nos três. O enlace roteador–R2 é cortado
+em silêncio (netem 100 % e descarte na entrada, sem queda de portadora); perda = pacotes que
+faltaram / pps. Três cortes por modo.
+
+| proteção | detecção | perda por corte (ms) | mediana (ms) | reserva no `zebra` | passa? |
+|---|---|---|---|---|---|
+| nenhuma | dead interval 4 s | 3 707 · 3 744 · 3 778 | 3 744 | – | sim |
+| BFD | 3 × 10 ms (perfil `crfast` no template) | 35 · 32 · 25 | 32 | – | sim |
+| BFD + TI-LFA | 3 × 10 ms, SR e `ti_lfa: link` | 29 · 35 · 26 | 29 | sim | sim |
+
+- O TI-LFA põe o caminho de reserva no `zebra`, mas a perda quase não cai: no Linux a troca
+  espera o `ospfd` (aviso do BFD, SPF, instalação), como a G3.4k já mediu; o ganho real é a G3.4k
+  (reserva pré-programado no plano de dados).
 
 ## Defeitos achados e corrigidos
 
@@ -111,7 +260,31 @@ RESULTS
   redistribuição errada num vizinho leva o roteador à falta de memória. Cisco (`max-lsa`) e Junos
   (`database-protection`) protegem. Gap G3.4r.
 
-FASEC
+## Fase C: o que rodar no notebook
+
+O notebook (i5-12450H, 8 GiB) roda a imagem `dev.628`, **anterior às três correções**: com ela,
+mais de 20 interfaces OSPF ficam sem adjacência e ~1 000 esgotam os arquivos do `ospfd`. Antes da
+fase C, instale uma imagem com este PR (ou, só para o teste de vizinhos, `system.tuning.set`
+não serve: a imagem antiga não tem os dois parâmetros no catálogo; o roteiro avisa no cabeçalho).
+
+1. Mover o cabo para a VM (macvtap do `eno1`, sessão principal) e dar ao notebook um endereço de
+   gerência no `ether1` (ex. `10.99.0.1/24`).
+2. Bateria, do jeito que o operador usa (TLS, `admin`):
+
+   ```sh
+   cargo xtask vm-lab run -- env COREROUTER_PASSWORD=<senha> scripts/ospf-stress-lab.sh \
+     --dut remote --iface <placa do cabo na VM> --target 10.99.0.1 --mgmt 10.99.0.2/24 \
+     --tests lsdb,churn,neighbors,interfaces,ops,latency
+   ```
+
+   Os degraus padrão vão a 200 000 LSAs (~1,5 GiB no roteador, **estimado** pela tabela 1); o
+   notebook tem folga. Vizinhos: 50/100/250 com 1/4 e, à parte, `NEIGH_HELLO=10 NEIGH_DEAD=40`.
+3. No remoto, CPU e RSS vêm de `system.resource.process.print`; SPF e camada `zebra` ficam de fora
+   (sem `vtysh`); os reinícios do FRR e do daemon pedem o console do notebook (anotar à mão:
+   `kill -9` do `ospfd` e do daemon, e o tempo até `routing.ospf.neighbor.list` voltar a Full).
+4. Convergência (item 6) no notebook pede R2/R3/R4 atrás dele; o laboratório local já mediu
+   (tabela 6). Com dois cabos, dá para repetir com o BNG Blaster como R2/R3.
+5. Comparar com as tabelas acima: o que muda é CPU de verdade (sem virtio, sem as outras sessões).
 
 ## Desempenho e paralelismo
 
