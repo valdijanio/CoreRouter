@@ -398,3 +398,14 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-11-13 — G4.1zb feita (aba Clients da DNS Statistics, junto com a G4.1za)
 - 2026-11-13 — G4.1zc feita (contadores do encaminhador DNS no `/metrics`)
 - 2026-11-13 — G4.1ze feita (o encaminhador envia o EDE)
+- 2026-11-13 — G1.31c feito (VRF do socket cifrado do WireGuard)
+- 2026-11-13 — G3.4m criado e feito (laboratório de carga e estabilidade do OSPF)
+- 2026-11-13 — G3.4q feito (FRR com milhares de interfaces OSPF); G3.4s, G3.4t, G3.4u e G3.4v criados
+- 2026-11-13 — G3.4r feito (proteção da LSDB do OSPF); G3.4w, G3.4x, G3.4y e G1.6zz criados
+- 2026-11-13 — G4.1g feito (comparação com Unbound e dnsmasq pela bateria da G4.1r)
+- 2026-11-13 — G4.1o feito (consultas iguais em andamento juntadas, achado e medido pela G4.1r)
+- 2026-11-13 — G4.1r criado e feito (bateria de carga do DNS; G4.1s criado e feito; G4.1t a G4.1z criados)
+- 2026-11-13 — G4.1w feito (DNS TCP contra conexões paradas); G4.1zk criado
+- 2026-11-13 — G4.1zd parte 1 feita (log persistente); dnstap fica na parte 2
+- 2026-11-13 — G4.1zf parte 1 (DoT) feita; G4.1zh e G4.1zi criados
+- 2026-11-13 — G4.1zf feito (DoT e DoH para a LAN)

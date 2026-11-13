@@ -12341,3 +12341,274 @@ continuação indentadas).
   Conferido com `RUSTUP_TOOLCHAIN=1.100.0 cargo xtask ci --only fmt,clippy,wasm` e com os 40
   testes de PPPoE alterados. Nas máquinas ainda com o 1.99, o `--affected` local não via o erro:
   quem atualizar o `stable` (`rustup update stable`) passa a ver o mesmo que o CI.
+
+- 2026-11-13 — G1.31c: VRF do socket cifrado do WireGuard: `interface.wireguard.add/set {vrf}` (padrão `main`), como o
+  `vrf` da interface no RouterOS 7.21. O socket do kernel não se prende a interface (`socket.c` do
+  linux-6.18.59: rota com `fwmark`, sem `oif`). Por isso o mesmo commit faz três coisas:
+
+  - o `fwmark` do link passa a ser a marca de roteamento da VRF (`WGDEVICE_A_FWMARK`);
+  - entra a regra `fwmark … iif lo lookup <tabela>` na faixa das marcas (`hal::policy`);
+  - o `net.ipv4.udp_l3mdev_accept` fica em 1 enquanto alguma `wg` tiver `vrf`, para ouvir nas
+    portas da VRF.
+
+  Desfazer (`vrf=main`, desativar, remover, rollback) tira os três.
+
+  O `iif lo` veio do teste: num veth do mesmo namespace o pacote recebido mantém a marca e, sem
+  ele, casava a regra antes do `l3mdev` e entrava em laço até o TTL (**medido**: `IpForwDatagrams`
+  63, ICMP time exceeded).
+
+  Também entram:
+
+  - `ip.vrf.remove` recusa uma VRF em uso por uma `wg`;
+  - Safe Mode na troca de `vrf` do túnel por onde a sessão chega;
+  - a prévia do modal procura o endpoint, o firewall e o MTU na tabela da VRF, e avisa sem rota;
+  - a descrição da regra em `routing.rule.kernel`;
+  - colisão de marca recusada;
+  - coluna VRF (selo por hash) e campo VRF com ⓘ na janela WireGuard.
+
+  Como testar: `docs/wireguard.md`, "VRF do socket cifrado". Kernel real:
+  `crates/hal-linux/tests/netns_wireguard_vrf.rs` (`cargo xtask netns`; 2,1 s, **medido**).
+  Duas VRFs ligadas por um veth, onde a tabela principal não alcança o outro lado:
+
+  - com `vrf` o handshake fecha;
+  - sem `vrf` não fecha;
+  - pondo o `vrf` fecha;
+  - tirando, as regras saem e o sysctl volta.
+
+  Conferido pela CLI contra o daemon `--backend virtual` (regra 100 `iif lo` com a marca da
+  `wan2`, erros de VRF inexistente e de VRF em uso) e na GUI (prints em
+  `docs/changes/G1.31c-screenshots/`). Não conferido: hardware real e a imagem no QEMU.
+
+  Junto, uma correção na prévia dos modais (`crates/ui/src/list_modal.rs`): a lista
+  "Commands" passa a rolar a partir de 160 px. Antes, um valor longo (o PEM de
+  `/certificate import`, e mais ainda uma cadeia) quebrava em dezenas de linhas, e o
+  modal empurrava OK e Cancel para baixo da barra de status. O teste
+  `import_checks_the_pem_and_the_key` (G1.6zs) falhava de forma intermitente por isso.
+  O certificado gerado no teste muda de tamanho em 1–2 bytes com a chave aleatória (a
+  assinatura ECDSA tem de 70 a 72 bytes), então o número de linhas variava. Teste novo:
+  `a_long_chain_keeps_ok_on_screen`, que falha sem a correção (**medido**).
+
+- 2026-11-13 — G3.4m: Laboratório de carga e estabilidade do OSPF: `scripts/ospf-stress-lab.sh` põe o `ospfd`/`zebra`
+  do FRR 10.7.1 da imagem e o `corerouter-daemon` sob LSDB de 1 000 a 200 000 LSAs (BNG Blaster +
+  `lspgen`), churn, 50–250 vizinhos em 802.1Q, 1 000–4 000 interfaces, commit, Safe Mode, reinício
+  do FRR e do daemon, latência dos comandos e convergência com tráfego; `--dut local` (a raiz da
+  imagem em chroot num namespace da VM) ou `--dut remote` (o notebook da fase C, por TLS). Relatório
+  em `docs/ospf-stress.md`. Defeitos achados e corrigidos, com teste:
+
+  - o `ospfd` não entrava em AllSPFRouters a partir da 21ª interface OSPF (`igmp_max_memberships`
+    20 por socket no kernel): a interface ficava sem adjacência. Pisos de 16 384 grupos e 1 MiB de
+    `optmem_max` nos padrões do roteador (catálogo de Tuning com ⓘ). **Medido:** 30 interfaces →
+    11 sem o grupo antes; 4 000 com o grupo depois;
+  - o init iniciava o FRR com 1 024 arquivos abertos; o `ospfd` abre um socket por interface e,
+    com ~1 000, parava de aceitar vty (e logou 10 GB em minutos, **medido**). O init sobe para
+    16 384. O laço do FRR em EMFILE vai como relato em `docs/frr-upstream/`;
+  - `interface.remove` (e outros 29 comandos) liam todos os links do kernel a cada passo: remover
+    4 000 VLANs num lote custava 43,3 s de CPU do daemon; agora 8,0 s (**medido**).
+  - um template OSPF casado por rede ligava o OSPF em todos os endereços da interface (o de gerência
+    também): a adjacência caía a cada ~1 s com SeqNumberMismatch. Agora só os endereços dentro das
+    redes do template (`ip ospf area <área> <endereço>`), como o RouterOS faz; acrescentar um
+    endereço fora das redes não derruba nada (**medido**).
+
+  Como testar: `scripts/ospf-stress-lab.sh --host /srv/build/os-out/<id>/build/images` (ou
+  `cargo xtask vm-lab run -- scripts/ospf-stress-lab.sh --dut remote --iface <if> --target <ip>`).
+
+- 2026-11-13 — G3.4q: O `ospfd`/`zebra` do FRR com milhares de interfaces OSPF (`docs/frr-many-interfaces.md`). Lido no
+  fonte da 10.7.1 da imagem e do `master` de 2026-11-12 (`622c8322d2`), medido com `perf` (FRR com
+  `-O2 -g -fno-omit-frame-pointer`), corrigido no FRR e conferido na imagem:
+
+  - **northbound (`lib`):** o comando `interface X` fazia um commit da config candidata inteira por
+    interface, mesmo dentro do lote do `XFRR_start_configuration` que o `hal-frr` usa: 8,7 s dos
+    12,4 s da subida de 4 000 interfaces. Agora, com a interface já existente e nada mais pendente,
+    ele espera o fim do lote (`0002`);
+  - **SPF (`ospfd`):** `ospf_if_lookup_by_lsa_pos` percorria todas as interfaces para cada link da
+    raiz; cada SPF era O(n²) em operação normal: 45–50 ms com 4 000 interfaces, 99–171 ms com
+    10 000 (**medido**). Índice por posição (`0003`);
+  - **log (`ospfd`):** acima de ~5 330 links a router-LSA enche e o `ospfd` logava uma linha por link
+    e por instância: **2,5 GB em ~2 min** com 10 000 interfaces (**medido**). Agora uma linha quando
+    enche e outra quando volta a caber (`0004`);
+  - **router-LSA (`ospfd`):** uma instância nova por interface que sobe ou desce, cada uma
+    percorrendo a área; agora uma por lote de config, no máximo 1 s depois (`0005`);
+  - **`zebra`:** cada endereço novo varria a fila early inteira (`0006`).
+
+  Testes: unitários do FRR (`tests/lib`, `tests/ospfd`, `tests/zebra`) 119/119 no `master` e 68/68
+  na 10.7.1, com e sem os patches; 8 topotests de OSPF na VM (43 passed, 8 skipped, com e sem); o
+  topotest novo `ospf_many_interfaces` (vai no envio) passa com os patches e falha sem eles;
+  `checkpatch` 0/0, `clang-format` e `black` sem diferenças; na imagem, o `os build` aplica
+  `0002`–`0006` e a bateria `--tests interfaces` passa (`docs/ospf-stress.md`, 3b).
+
+  Como testar: `scripts/frr-ospf-many-ifaces.sh --frr <DESTDIR do FRR> --n 4000` (sem root) e
+  `scripts/ospf-stress-lab.sh --host <images> --tests interfaces --daemon build`.
+
+- 2026-11-13 — G3.4r: Proteção da LSDB do OSPF. O FRR aceitava LSAs sem limite: no laboratório, 175 436 externas de
+  um vizinho entraram em 1 s, com o `ospfd` em 293 MiB e o `zebra` em 120 MiB (**medido**).
+
+  - **FRR** (`os/patches/frr/0007-ospfd-max-lsa.patch`):
+    - `max-lsa N [threshold P] [warning-only] [ignore-time S] [ignore-count C] [reset-time S]`
+      em `router ospf`, mais `clear ip ospf max-lsa`;
+    - só as LSAs de outros roteadores contam; acima do limite a instância cai por ignore-time (as
+      adjacências e a LSDB aprendida saem), volta, e fica isolada depois de C períodos;
+    - estado próprio, não a flag `shutdown`: o running-config não muda;
+    - `show ip ospf json` ganha `lsaOtherRoutersCounter` e `maxLsa`;
+    - o mesmo patch, com topotest, está pronto para o usuário enviar ao FRR
+      (`docs/frr-upstream/ospfd-max-lsa/`, `checkpatch` 0/0, `clang-format` e `black` limpos).
+  - **CoreRouter**:
+    - `max_lsa`, `max_lsa_threshold`, `max_lsa_warning_only`, `max_lsa_ignore_time`,
+      `max_lsa_ignore_count` e `max_lsa_reset_time` em `routing.ospf.instance.add/set` (só v2,
+      sem limite por padrão, faixas do Junos);
+    - `routing.ospf.instance.clear-lsdb-protection`;
+    - `routing.ospf.instance.list` com `lsdb` (contagem, memória estimada, estado da proteção),
+      lido no `show ip ospf json` que o serviço `frr` já lia a cada 2 s;
+    - janela: coluna **LSDB** (`12 340 / 50 000`, âmbar no limiar, vermelho em ignore e isolated),
+      botão **Clear LSDB Protection** e a página **LSDB Protection** no modal da instância;
+    - prévia: o limite abaixo da contagem de agora é um risco (Safe Mode); folga menor que 20 % e
+      um `ospfd` sem o patch são avisos; a memória no limite é estimada;
+    - extra: a prévia avisa quando a edição liga `redistribute bgp`, `static` ou `kernel` com
+      10 240 rotas ou mais;
+    - saúde `ospf.lsdb`: erro em ignore ou isolated; aviso no limiar; e, **mesmo sem limite**,
+      aviso a 25 % e erro a 50 % da RAM pela memória estimada das bases.
+
+  Como testar:
+
+  - `routing.ospf.instance.set {"id":"v2","max_lsa":50000}` e a coluna LSDB em Routing › OSPF ›
+    Instances;
+  - `scripts/ospf-stress-lab.sh --host <images> --tests maxlsa` (seção 8 de
+    `docs/ospf-stress.md`);
+  - `scripts/frr-ospf-max-lsa.sh` (laboratório no host, sem root).
+
+  Medido no laboratório do host (FRR 10.7.1 com os patches 0001–0007, 13/11/2026), com ~190 000
+  externas e `max-lsa 50000`:
+
+  - a instância caiu com 50 008 LSAs, 817 ms depois do início;
+  - pico de 84 MiB no `ospfd` e 42 MiB no `zebra`, contra 293 e 120 MiB sem limite;
+  - `clear` → Full em 0,7–1,5 s.
+
+- 2026-11-13 — G4.1g: DNS: o encaminhador medido contra o Unbound e o dnsmasq na mesma máquina, com a mesma origem e o
+  mesmo gerador (`dnsperf`), pela bateria da G4.1r (`scripts/dns-stress-lab.sh --tests compare`):
+  cache quente na saturação e a 50 000/s, misses com a origem a 20 ms, o mesmo nome TTL 0 (consultas à
+  origem por resposta) e memória por entrada no cache. Números e leitura em `docs/dns-stress.md`; a
+  decisão de manter o Hickory, com os números, em `docs/architecture.md`.
+
+- 2026-11-13 — G4.1o: DNS: consultas iguais em andamento viram uma só consulta à origem (RFC 5452 §5; como o mesh do
+  Unbound e o dnsmasq ≥ 2.83). A primeira busca de um (nome, tipo, upstreams) que perde o cache lidera;
+  as que chegam enquanto ela está na rede esperam o resultado dela (resposta ou falha, que entra uma
+  vez no cache de falhas da RFC 9520) até o próprio prazo. Testes com threads reais e um servidor que
+  demora: 10 buscas iguais, 1 consulta; falha compartilhada; nomes e tipos diferentes separados; o
+  seguidor desiste no prazo; um líder que desenrola libera os seguidores. Custo **medido**: +0,24 µs
+  por miss no `dns_forward_cache_miss` (2,58 → 2,82 µs). Números da bateria em `docs/dns-stress.md`.
+
+- 2026-11-13 — G4.1r: DNS sob carga: `scripts/dns-stress-lab.sh` põe o encaminhador, o cache, estáticos, zonas, DNS
+  dinâmico, adlist e DoT/DoH de origem sob carga com o `dnsperf` (DNS-OARC) contra uma origem Knot
+  própria do laboratório atrás de `tc netem`, na VM do laboratório (`--host <images>`: a raiz da
+  imagem num chroot; `--daemon build`: o daemon da worktree), num host sem root (`--userns`) ou
+  contra um roteador ligado por cabo (`--dut remote`, a fase C no notebook, com a config de teste
+  entrando com a revisão anotada e saindo por `config.rollback`). Onze testes (`qps`, `torture`,
+  `origin`, `tcp`, `cache`, `adlist`, `ddns`, `hostile`, `ops`, `compare`, `soak`), resultados em
+  tabelas e CSV. Números, limites e defeitos em `docs/dns-stress.md`.
+
+  Corrigido no mesmo trabalho, com antes e depois **medidos** (VM do laboratório, 8 vCPUs EPYC-Genoa,
+  DUT em 4 CPUs, release; imagem G1.6zd contra a worktree):
+
+  - **Um worker por miss reaproveitado** em vez de uma thread criada e destruída por consulta
+    (`dns_server/pool.rs`): o perfil dava ~60 % do miss em `pthread_create`, pilha e arena. Misses
+    com a origem a 0 ms: 12,2 mil → 47,3 mil/s na saturação.
+  - **G4.1o**: consultas iguais em andamento viram uma consulta à origem (`docs/changes/G4.1o.md`).
+  - **Flush fora do lock**: `ip.dns.cache.flush` com 1 M de entradas parava toda consulta por
+    ~0,5 s (p99,9 de 516 ms ao lado); o mapa agora sai sob o lock em O(1) e é liberado depois.
+  - **G4.1s, DoH em HTTP/2**: o DoH do Unbound só fala HTTP/2 e respondia 0 % ao nosso HTTP/1.1;
+    ALPN `h2`/`http/1.1` e um cliente HTTP/2 síncrono (RFC 9113, HPACK da RFC 7541 com os vetores
+    do Apêndice C como teste): 0 SERVFAIL a 5000 consultas/s, p99 0,6 ms.
+
+- 2026-11-13 — G4.1w: DNS TCP 53 contra conexões paradas. Quando as `max_concurrent_tcp_sessions` vagas estão tomadas, a
+  conexão nova não é mais fechada no aceite: ela toma a vaga de uma conexão que espera consulta (nunca
+  de uma cuja consulta está sendo respondida), a mais ociosa (desde a última mensagem inteira ou desde
+  o aceite) do endereço que tem mais vagas, e só se esse endereço tiver pelo menos duas vagas a mais
+  que o da conexão nova (com uma a mais, a troca exige 1 s de ociosidade; sem essa regra um atacante
+  que reabre o que foi fechado provoca uma cadeia de despejos sem fim). RFC 7766 §6.2.3 (tempo zero
+  sob ataque), §6.2.4, RFC 9210 §4.2 ("the oldest idle connections first"), RFC 7858 §3.4. Um endereço
+  fica com no máximo 25 vagas (RFC 9210 §4.5) e nunca mais que a metade; o padrão sobe de 20 (o do
+  RouterOS) para 100, dentro da faixa 20–150 da RFC 9210 §4.5; uma config gravada com 20 continua 20.
+  O DoT/DoH da LAN (vagas próprias, `encrypted-service max_sessions`) passa a escolher a vítima do
+  mesmo jeito. O daemon avisa no log, no máximo uma vez por minuto, quantas conexões despejou e
+  recusou. Código: `apps/corerouter-daemon/src/service/dns_server/slots.rs`. O roteiro
+  `scripts/dns-stress-lab.sh --tests tcp` mede agora com 20 e 100 vagas e 10 e 30 conexões paradas por
+  endereço, com a CPU do daemon, e aceita um daemon guardado com outro nome (`--daemon <caminho>`,
+  para antes/depois).
+
+  Como testar: `cargo test -p corerouter-daemon -- dns_server` (despejo, recusa por endereço, vaga
+  ocupada intocável, cliente legítimo respondido com as vagas tomadas por conexões paradas);
+  `cargo xtask vm-lab run -- scripts/dns-stress-lab.sh --daemon build --tests tcp`.
+
+  Slowloris na VM (**medido**): o cliente legítimo teve 107 de 107 respostas em 30 s com 20 e com 100
+  vagas (antes 0 de 107 e 1 de 106 com 20 vagas, 0 de 107 com 100 vagas e 30 conexões por endereço);
+  16 conexões TCP de um endereço perdiam 54 %, agora 0,8 % (20 vagas) e 0,2 % (100 vagas).
+
+- 2026-11-13 — G4.1zd: Log de consultas DNS persistente, parte 1 (escopo escolhido pelo usuário: log primeiro, dnstap depois). Uma etapa `querylog` nova (só `after`, a última da cadeia) entrega cada consulta respondida ou descartada ao daemon, que acrescenta a hora e a latência e a põe num buffer por faixa de thread (sem lock disputado; fila limitada que descarta e conta). O serviço `dns-log` grava blocos deflate com tabelas de nomes e clientes por bloco (formato `CRQL` v1, CRC-32 por bloco, índice pelos cabeçalhos) em segmentos de até 1 h em `/config/dns-log/`, com teto (`max_size_mib`, dentro de 20 % do `/config`), idade (`max_age_hours`), a reserva livre da config antes de cada gravação e `fdatasync` a cada 60 s. A retenção vale também com o log desligado.
+
+  Segurança por padrão: desligado; ligar exige `acknowledge=marco-civil-art14` (a GUI pede a caixa "I read this…"), com journal e uma linha `dns,warning` no log do roteador; cliente `truncated` por padrão (/24 e /56, prefixos ajustáveis), `hashed` (SipHash com chave só na RAM, trocada a cada `salt_rotation_hours`) ou `none`; `exclude`, `only_from`, `except_from`; arquivos `0600`. `ip.dns.log.search` busca fora do lock do roteador (cursor, até 8 blocos decodificados em paralelo, orçamento de 20 milhões de consultas por página), `export` dá CSV ou JSON por linha (journal), `clear` apaga tudo, antes de um tempo ou um cliente (LGPD art. 18), reescrevendo os segmentos. `ip.dns.log.get` traz o uso, os descartes e a estimativa (GB/dia na taxa do último minuto, retenção que o teto dá, desgaste em TB/ano). Janela IP › DNS › Query Log (botão na janela DNS e menu): selo de estado, aviso da lei com ⓘ, filtros (período, cliente, nome, tipo, rcode, quem respondeu), páginas Older/Newer, exportar, Settings (com a estimativa e a prévia do comando) e Clear; ⓘ em português e inglês. No terminal, `/ip dns log print` mostra os ajustes e o `/export` os leva, a ciência incluída quando o log está ligado (teste de ida e volta no shell); a busca é `search`, fora do script. Leitor do formato com proptest e alvo de fuzz `dns_query_log` (sementes reexecutadas no CI). Pesquisa, desenho e números em `docs/dns-query-log.md`; decisão de formato em `docs/architecture.md`.
+
+  Como testar: `cargo run -p corerouter-daemon -- --config-dir /tmp/cr --control 7979 --dns-port 5353`, `ip.dns.set allow_remote_requests=yes servers=1.1.1.1`, `ip.dns.log.set enabled=yes acknowledge=marco-civil-art14`, consultas com `dig @127.0.0.1 -p 5353`, depois `ip.dns.log.search`/`export`/`clear` e a GUI (`--connect 127.0.0.1:7979`) em IP › DNS › Query Log. Conferido no laboratório: 607 consultas reais (UDP e TCP) gravadas em 1 737 bytes, filtros, exportação CSV, apagamento por cliente pela GUI (36 607 consultas, segmento removido) e o journal (**medido**).
+
+- 2026-11-13 — G4.1zf: DNS over TLS para a LAN (RFC 7858), parte 2 de 3 da G4.1zf (o `/certificate`, G1.6zs, foi a 1ª).
+
+  - `ip.dns.encrypted-service.set/get`: `dot`, `dot_port` (853; nunca 53), `certificate`,
+    `idle_timeout_secs` (30, acima dos 20 s do Android), `max_sessions` (1000; um quarto por
+    endereço), `announce_ddr`. `dot=yes` sem certificado faz o `/certificate` `dns-server`
+    (autoassinado, identidade e endereços do roteador) na mesma mudança. O `get` traz o estado
+    (sessões, handshakes, retomadas, falhas, consultas, recusadas, acima do limite, impressão
+    digital) e as checagens: encaminhador ligado, certificado (vencimento, autoassinado, endereços
+    da LAN fora do SAN para a descoberta verificada) e o firewall `input` simulado da LAN e da
+    Internet (`firewall_diag`).
+  - Serviço `dns-tls` no daemon: até quatro laços de eventos (`mio`), um deles aceita e reparte as
+    conexões. Quem não está no `allowed_from` é fechado antes de qualquer TLS. Mensagens com os 2
+    bytes de tamanho (RFC 7858 §3.3), em pipeline: até 64 por conexão, acerto de cache na hora e
+    miss quando o worker volta, respostas fora de ordem (RFC 7766 §7); ocioso renovado só com
+    mensagem inteira (§6.2.3); handshake em 10 s; cheio, a conexão parada há mais tempo cede o
+    lugar. TLS 1.2/1.3, ALPN `dot`, tickets sem estado (RFC 8310 §9), sem 0-RTT (RFC 9325 §3.10),
+    cadeia inteira, `close_notify`. DNS em claro na porta TLS nunca recebe resposta (§3.1).
+  - `resolver.arpa` é local e nunca vai para fora (RFC 9462 §6.1/§6.4, errata 8278: outros nomes
+    sob ele dão NXDOMAIN); `_dns.resolver.arpa` SVCB anuncia o DoT (`alpn=dot`, `port` fora da 853,
+    `ipv4hint`/`ipv6hint` e A/AAAA na seção adicional, chaves em ordem crescente, RFC 9460 §2.2).
+    Antes, essa consulta ia para o upstream.
+  - DNS Statistics: a linha "DoT / DoH in" mostra as consultas e as sessões (ou `off`).
+  - GUI: IP › DNS › Encrypted Service (formulário com Apply, estado, contadores e checagens com selos;
+    ⓘ em português e inglês); a prévia de comandos dos modais corta valores longos (o PEM do import
+    empurrava o OK para fora da tela, e o teste oscilava).
+
+  Como testar: `cargo run -p corerouter-daemon -- --control 7979 --dns-port 5353`, `ip.dns.set
+  allow_remote_requests=yes`, `ip.dns.encrypted-service.set dot=yes dot_port=8853`, e
+  `kdig +tls @127.0.0.1 -p 8853 router.lan` ou `dnsperf -m dot`; a GUI em IP › DNS › Encrypted
+  Service. Testes: `cargo nextest run -p corerouter-daemon -E 'test(dns_tls)'` (daemon real: pipeline,
+  fora de ordem, DNS em claro sem resposta, DDR, ocioso e teto por endereço),
+  `-p corerouter-engine -E 'test(dns_encrypted)'`, `-p corerouter-proto-dns -E 'test(resolver_arpa)'`,
+  `-p corerouter-ui -E 'test(dns_encrypted)'`.
+
+- 2026-11-13 — G4.1zf: DNS over HTTPS para a LAN (RFC 8484), parte 3 de 3 da G4.1zf (1: `/certificate`, G1.6zs; 2: DoT).
+
+  - `ip.dns.encrypted-service`: `doh`, `doh_port` (443; listener próprio, recusa a porta de um
+    www-ssl ou www ligado e sugere `doh_port=8443`), `doh_path` (`/dns-query`); o `get` dá a `url`
+    pronta para o cliente (`https://<endereço da LAN>[:porta]/dns-query{?dns}`), `doh_queries`,
+    `doh_errors`, `http2`, e checa o firewall da porta do DoH como a do DoT.
+  - Servidor HTTP/2 (`http2/server.rs`, sem E/S, sobre o HPACK do #669): SETTINGS dos dois lados
+    (MAX_CONCURRENT_STREAMS 100, lista de cabeçalhos 16 KiB), HEADERS/CONTINUATION, DATA com
+    WINDOW_UPDATE devolvido na hora, respostas esperando a janela do cliente, PING, GOAWAY, streams
+    respondidos em qualquer ordem. Contra cliente hostil: GOAWAY para quadro > 16 KiB, bloco de
+    cabeçalho > 16 KiB (enxurrada de CONTINUATION, CVE-2024-27316), mais de 1000 resets, PINGs ou
+    SETTINGS (rapid reset, CVE-2023-44487: ENHANCE_YOUR_CALM), push do cliente, id de stream que
+    desce; stream acima de 100: REFUSED_STREAM (o HPACK continua decodificado).
+  - `dns_doh.rs`: GET com `dns=` base64url e POST com `application/dns-message` (os dois MUST,
+    §4.1); 404, 405 (com `Allow`), 413, 414, 415 e 400; toda resposta DNS é 200 (§4.2.1), com
+    `cache-control: max-age` = menor TTL ou o mínimo do SOA (§5.1). HTTP/1.1 (ALPN `http/1.1` ou
+    nenhum): um pedido por vez, `Connection: close`, sem chunked (411).
+  - O mesmo laço de eventos do DoT: o ALPN decide (`h2` → HTTP/2, o resto HTTP/1.1); o miss volta
+    com o número do stream. O `Answer::ask` passou a usar o pool de workers do #669.
+  - DDR: `_dns.resolver.arpa` SVCB anuncia o DoH primeiro (prioridade 1, `alpn=h2`, `dohpath`
+    `/dns-query{?dns}` como chave 7, `port` fora da 443) e o DoT depois.
+  - GUI: campos DNS over HTTPS, HTTPS Port e Path, a URL com Copy e os contadores do DoH; a linha
+    "DoT / DoH in" da DNS Statistics soma os dois.
+
+  Como testar: `ip.dns.encrypted-service.set doh=yes doh_port=8443`, então
+  `kdig +https @127.0.0.1 -p 8443 router.lan`, `curl -k --http1.1
+  'https://127.0.0.1:8443/dns-query?dns=<base64url>'` ou `dnsperf -m doh`. Testes: `cargo nextest
+  run -p corerouter-daemon -E 'test(dns_doh) | test(http2::server) | test(dns_tls)'` (daemon real:
+  HTTP/1.1 GET e POST, HTTP/2 com dois streams, 404 e 415, DDR; HTTP/2 em memória: ordem, janelas,
+  rapid reset, CONTINUATION, limite de streams, proptest).
