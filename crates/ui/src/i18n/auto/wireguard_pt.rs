@@ -51,6 +51,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"The router makes a new key pair for this interface. Every peer must then get the new public key, and every tunnel handshakes again."##, r##"O roteador gera um par de chaves novo para esta interface. Todos os pares precisarão receber a chave pública nova, e todos os túneis refazem o handshake."##),
     (r##"The text and the QR code carry the client's private key: only group full sees them."##, r##"O texto e o QR levam a chave privada do cliente: só o grupo full os vê."##),
     (r##"Tx"##, r##"Tx"##),
+    (r##"VRF"##, r##"VRF"##),
     (r##"WireGuard"##, r##"WireGuard"##),
     (r##"WireGuard Interface"##, r##"Interface WireGuard"##),
     (r##"WireGuard Peer"##, r##"Par WireGuard"##),
@@ -273,5 +274,16 @@ As interfaces WireGuard: porta, MTU, chave pública e quantos pares estão ativo
         "wireguard.tab.peers",
         r##"## O que é
 Todos os pares de todas as interfaces WireGuard, com o estado do handshake, onde estão, os prefixos e o tráfego. Os selos filtram por interface e por estado; a linha embaixo da tabela diz por que o par selecionado está naquele estado."##,
+    ),
+    (
+        "wireguard.vrf",
+        r##"## O que é
+A VRF por onde saem e chegam os pacotes **cifrados** (o `vrf` do RouterOS 7.21; `main` = a tabela principal): os handshakes e o UDP do túnel. Não é a VRF da própria interface do túnel (essa é a VRF da interface, em IP › VRF).
+
+## Como
+O socket do WireGuard no kernel não se prende a uma interface, então o roteador marca os pacotes dele com a marca de roteamento da VRF e uma regra procura essa marca na tabela da VRF; as duas entram e saem no mesmo commit. Para ouvir nas portas da VRF, o roteador liga o `net.ipv4.udp_l3mdev_accept`.
+
+## Cuidado
+Com ele ligado, os serviços UDP do roteador que escutam em todos os endereços (DNS, NTP...) também ouvem nas portas da VRF: filtre-os em IP › Firewall (input). A VRF precisa de rota até os endpoints dos pares."##,
     ),
 ];

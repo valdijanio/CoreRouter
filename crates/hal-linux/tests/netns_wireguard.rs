@@ -208,11 +208,13 @@ fn two_links_shake_hands_and_a_peer_change_keeps_the_session() {
     let mut a = WgDevice {
         private_key: a_priv,
         listen_port: 51820,
+        fwmark: 0,
         peers: vec![peer(b_pub, Some(51821), "10.77.1.0/24", 1)],
     };
     let b = WgDevice {
         private_key: b_priv,
         listen_port: 51821,
+        fwmark: 0,
         peers: vec![peer(a_pub, None, "10.77.0.0/24", 0)],
     };
     hal.wireguard_set(&n("wgt1"), &b, &b_pub).unwrap();
@@ -295,6 +297,7 @@ fn a_link_that_is_not_ours_is_refused() {
     let dev = WgDevice {
         private_key: a_priv,
         listen_port: 51900,
+        fwmark: 0,
         peers: Vec::new(),
     };
     // Made by someone else, absent from the config.
