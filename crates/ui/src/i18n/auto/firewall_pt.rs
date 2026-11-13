@@ -43,6 +43,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
 /// Explanations: (key, Markdown).
 pub(super) const HELP: &[(&str, &str)] = &[
     (
+        "firewall.action.change-mss",
+        "## change-mss\n\nBaixa a opção **MSS** dos SYN de TCP (`action=change-mss` do RouterOS), para que as conexões que passam por um túnel de MTU menor (WireGuard, PPPoE, GRE) nunca mandem segmentos que não cabem e somem onde a descoberta de MTU do caminho está quebrada.\n\n- Precisa de `protocol=tcp` e `tcp-flags=syn`: só o SYN leva a opção (RFC 9293 §3.7.1).\n- O kernel só **baixa**: um valor acima do que o SYN traz não muda nada (não precisa do `tcp-mss`, ao contrário do RouterOS).\n- A regra de sempre: chain `forward`, `out-interface` o túnel, `new-mss=clamp-to-pmtu`.\n- `passthrough` (ligado por padrão): o pacote segue para a próxima regra do mangle.",
+    ),
+    (
         "firewall.col.bytes",
         "## Bytes\n\nBytes que a regra casou, lidos do `counter` do kernel enquanto esta janela está aberta (a cada 2 s). Não ficam salvos: recomeçam quando o roteador reinicia; um commit não os zera.",
     ),
@@ -57,6 +61,14 @@ pub(super) const HELP: &[(&str, &str)] = &[
     (
         "firewall.col.rate",
         "## Rate\n\nPacotes por segundo no último intervalo de leitura (2 s).",
+    ),
+    (
+        "firewall.rule.new_mss",
+        "## New MSS\n\nO que o `change-mss` escreve na opção MSS do SYN.\n\n- `clamp-to-pmtu`: o MTU da rota que o pacote toma menos os cabeçalhos IP e TCP (IPv4 40 bytes, IPv6 60): 1380 num túnel WireGuard de 1420. Só nas chains `forward`, `output` e `postrouting` (a rota só se conhece depois do roteamento).\n- Um número (88..65535): esse valor, para as duas famílias. PPPoE: 1452 (MTU 1492); WireGuard sobre IPv4: 1380.\n\nO kernel nunca aumenta o MSS: um SYN que já pede menos fica com o dele.",
+    ),
+    (
+        "firewall.rule.tcp_flags",
+        "## TCP Flags\n\nAs flags do cabeçalho TCP que o pacote precisa ter (`ack`, `cwr`, `ece`, `fin`, `psh`, `rst`, `syn`, `urg`), separadas por vírgula; `!` antes da flag: ela precisa estar desligada. `syn` pega o SYN e o SYN-ACK; `syn,!ack` só o primeiro pacote da conexão. Precisa de `protocol=tcp`.",
     ),
     (
         "firewall.tab.address-list",
@@ -76,7 +88,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ),
     (
         "firewall.tab.mangle",
-        "## Mangle\n\nMarca conexões, pacotes e roteamento (roteamento por política, filas). Não decide nada sozinha, a não ser com `passthrough=no`.",
+        "## Mangle\n\nMarca conexões, pacotes e roteamento (roteamento por política, filas) e baixa o MSS do TCP (`change-mss`, para túneis). Não decide nada sozinha, a não ser com `passthrough=no`.",
     ),
     (
         "firewall.tab.nat",

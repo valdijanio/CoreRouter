@@ -23,7 +23,9 @@
 
 use std::net::IpAddr;
 
-use corerouter_model::firewall::{AddrMatch, ConnState, Flags, NatState, Neg, PortRange, PortSet};
+use corerouter_model::firewall::{
+    AddrMatch, ConnState, Flags, NatState, Neg, NewMss, PortRange, PortSet, TcpFlags,
+};
 
 use crate::program::{AnonSet, Base, CtKey, Expr, FwElement, FwSet, KeyKind, MetaKey, REG_1};
 
@@ -453,6 +455,60 @@ pub fn icmp_exprs(kind: u8, code: Option<u8>) -> Vec<Expr> {
             data,
         },
     ]
+}
+
+/// `tcp flags & mask == set` (byte 13 of the TCP header). The `l4proto`
+/// dependency is the caller's.
+pub fn tcp_flags_exprs(f: TcpFlags) -> Vec<Expr> {
+    vec![
+        Expr::Payload {
+            base: Base::Transport,
+            offset: 13,
+            len: 1,
+            dreg: REG_1,
+        },
+        Expr::And {
+            sreg: REG_1,
+            dreg: REG_1,
+            mask: vec![f.mask()],
+        },
+        Expr::Cmp {
+            sreg: REG_1,
+            eq: true,
+            data: vec![f.set],
+        },
+    ]
+}
+
+/// The new MSS into `REG_1`, as nft loads it, and its text: a constant
+/// (network order), or `rt mtu` (`NFT_RT_TCPMSS`, host order, so nft
+/// adds a `byteorder hton`).
+pub fn mss_value(m: NewMss) -> (String, Vec<Expr>) {
+    match m {
+        NewMss::Value(v) => (
+            v.to_string(),
+            vec![Expr::Immediate {
+                dreg: REG_1,
+                data: v.to_be_bytes().to_vec(),
+            }],
+        ),
+        NewMss::ClampToPmtu => (
+            "rt mtu".to_owned(),
+            vec![
+                Expr::Rt {
+                    key: crate::program::RT_TCPMSS,
+                    dreg: REG_1,
+                },
+                Expr::Byteorder {
+                    sreg: REG_1,
+                    dreg: REG_1,
+                    hton: true,
+                    len: 2,
+                    size: 2,
+                },
+            ],
+        ),
+    }
 }
 
 /// The kernel's `ct state` bit of `s` (`NF_CT_STATE_BIT`).

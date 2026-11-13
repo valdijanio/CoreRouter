@@ -24,7 +24,7 @@ use crate::lockout::take_force;
 use crate::{EngineError, Result, Session};
 
 /// Matcher parameters, in the order the GUI and `summary` show them.
-pub const MATCHERS: [&str; 18] = [
+pub const MATCHERS: [&str; 19] = [
     "src_address",
     "dst_address",
     "src_address_list",
@@ -39,6 +39,7 @@ pub const MATCHERS: [&str; 18] = [
     "connection_state",
     "connection_nat_state",
     "icmp_options",
+    "tcp_flags",
     "connection_mark",
     "packet_mark",
     "routing_mark",
@@ -46,7 +47,7 @@ pub const MATCHERS: [&str; 18] = [
 ];
 
 /// Action parameters and the actions each one belongs to.
-const ACTION_FIELDS: [(&str, &[&str]); 11] = [
+const ACTION_FIELDS: [(&str, &[&str]); 12] = [
     ("reject_with", &["reject"]),
     ("jump_target", &["jump"]),
     ("log_prefix", &["log"]),
@@ -55,9 +56,10 @@ const ACTION_FIELDS: [(&str, &[&str]); 11] = [
     ("new_connection_mark", &["mark-connection"]),
     ("new_packet_mark", &["mark-packet"]),
     ("new_routing_mark", &["mark-routing"]),
+    ("new_mss", &["change-mss"]),
     (
         "passthrough",
-        &["mark-connection", "mark-packet", "mark-routing"],
+        &["mark-connection", "mark-packet", "mark-routing", "change-mss"],
     ),
     (
         "address_list",
@@ -135,7 +137,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add Filter Rule",
         ["IP", "Firewall"],
         None,
-        "{chain?: input | forward | output | <custom>, action?: accept | drop | reject | jump | return | log | passthrough | add-src-to-address-list | add-dst-to-address-list (default accept), family?: both | ipv4 | ipv6, src_address?: [!]ip | cidr | ip-ip, dst_address?: [!]ip | cidr | ip-ip, src_address_list?: [!]name, dst_address_list?: [!]name, protocol?: [!]tcp | udp | icmp | icmpv6 | 0..255, src_port?: [!]ports (22 or 80-90 or a comma-separated list), dst_port?: [!]ports, in_interface?: [!]interface (all-ppp: every PPPoE subscriber), out_interface?: [!]interface (all-ppp too), in_interface_list?: [!]list, out_interface_list?: [!]list, connection_state?: [!]list of established | related | new | invalid | untracked (comma-separated), connection_nat_state?: [!]srcnat | dstnat (comma-separated), icmp_options?: type[:code], connection_mark?: [!]name, packet_mark?: [!]name, routing_mark?: [!]name, limit?: count/time[,burst] (5/1s,10; time 1s 1m 1h 1d), reject_with?: icmp-no-route | icmp-admin-prohibited | icmp-address-unreachable | icmp-port-unreachable | tcp-reset, jump_target?: chain, log_prefix?: string, address_list?: name (add-*-to-address-list), address_list_timeout?: duration (30s, 1h, 1d; absent = until restart), disabled?: bool, comment?: string, section?: string (a section header with this title instead of a rule), place_before?: *hex, force?: bool (apply even if it would cut your management connection)} → {id}",
+        "{chain?: input | forward | output | <custom>, action?: accept | drop | reject | jump | return | log | passthrough | add-src-to-address-list | add-dst-to-address-list (default accept), family?: both | ipv4 | ipv6, src_address?: [!]ip | cidr | ip-ip, dst_address?: [!]ip | cidr | ip-ip, src_address_list?: [!]name, dst_address_list?: [!]name, protocol?: [!]tcp | udp | icmp | icmpv6 | 0..255, src_port?: [!]ports (22 or 80-90 or a comma-separated list), dst_port?: [!]ports, in_interface?: [!]interface (all-ppp: every PPPoE subscriber), out_interface?: [!]interface (all-ppp too), in_interface_list?: [!]list, out_interface_list?: [!]list, connection_state?: [!]list of established | related | new | invalid | untracked (comma-separated), connection_nat_state?: [!]srcnat | dstnat (comma-separated), icmp_options?: type[:code], tcp_flags?: [!]flag list of ack | cwr | ece | fin | psh | rst | syn | urg (comma-separated; ! per flag: syn,!ack; needs protocol=tcp), connection_mark?: [!]name, packet_mark?: [!]name, routing_mark?: [!]name, limit?: count/time[,burst] (5/1s,10; time 1s 1m 1h 1d), reject_with?: icmp-no-route | icmp-admin-prohibited | icmp-address-unreachable | icmp-port-unreachable | tcp-reset, jump_target?: chain, log_prefix?: string, address_list?: name (add-*-to-address-list), address_list_timeout?: duration (30s, 1h, 1d; absent = until restart), disabled?: bool, comment?: string, section?: string (a section header with this title instead of a rule), place_before?: *hex, force?: bool (apply even if it would cut your management connection)} → {id}",
         always,
         filter_add
     ),
@@ -144,7 +146,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set Filter Rule",
         [],
         None,
-        "{id: *hex, chain?, action?, family?, src_address?, dst_address?, src_address_list?, dst_address_list?, protocol?, src_port?, dst_port?, in_interface?, out_interface?, in_interface_list?, out_interface_list?, connection_state?, connection_nat_state?, icmp_options?, connection_mark?, packet_mark?, routing_mark?, limit?, reject_with?, jump_target?, log_prefix?, address_list?, address_list_timeout?, disabled?: bool, comment?: string, section?: string (title of a section header), force?: bool} → {id} (same syntax as add; \"\" clears a matcher)",
+        "{id: *hex, chain?, action?, family?, src_address?, dst_address?, src_address_list?, dst_address_list?, protocol?, src_port?, dst_port?, in_interface?, out_interface?, in_interface_list?, out_interface_list?, connection_state?, connection_nat_state?, icmp_options?, tcp_flags?, connection_mark?, packet_mark?, routing_mark?, limit?, reject_with?, jump_target?, log_prefix?, address_list?, address_list_timeout?, disabled?: bool, comment?: string, section?: string (title of a section header), force?: bool} → {id} (same syntax as add; \"\" clears a matcher)",
         has_filter,
         filter_set
     ),
@@ -174,7 +176,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add NAT Rule",
         ["IP", "Firewall"],
         None,
-        "{chain?: srcnat | dstnat | <custom>, action?: accept | masquerade | src-nat | dst-nat | jump | return | log | passthrough | add-src-to-address-list | add-dst-to-address-list (default accept), family?: both | ipv4 | ipv6, src_address?: [!]ip | cidr | ip-ip, dst_address?: [!]ip | cidr | ip-ip, src_address_list?: [!]name, dst_address_list?: [!]name, protocol?: [!]tcp | udp | icmp | icmpv6 | 0..255, src_port?: [!]ports, dst_port?: [!]ports, in_interface?: [!]interface (all-ppp: every PPPoE subscriber), out_interface?: [!]interface (all-ppp too), in_interface_list?: [!]list, out_interface_list?: [!]list, connection_state?: [!]states, connection_nat_state?: [!]srcnat | dstnat (comma-separated), icmp_options?: type[:code], connection_mark?: [!]name, packet_mark?: [!]name, routing_mark?: [!]name, limit?: count/time[,burst], to_addresses?: ip | ip-ip (src-nat, dst-nat), to_ports?: port | port-port, jump_target?: chain, log_prefix?: string, address_list?: name, address_list_timeout?: duration, disabled?: bool, comment?: string, section?: string, place_before?: *hex, force?: bool} → {id}",
+        "{chain?: srcnat | dstnat | <custom>, action?: accept | masquerade | src-nat | dst-nat | jump | return | log | passthrough | add-src-to-address-list | add-dst-to-address-list (default accept), family?: both | ipv4 | ipv6, src_address?: [!]ip | cidr | ip-ip, dst_address?: [!]ip | cidr | ip-ip, src_address_list?: [!]name, dst_address_list?: [!]name, protocol?: [!]tcp | udp | icmp | icmpv6 | 0..255, src_port?: [!]ports, dst_port?: [!]ports, in_interface?: [!]interface (all-ppp: every PPPoE subscriber), out_interface?: [!]interface (all-ppp too), in_interface_list?: [!]list, out_interface_list?: [!]list, connection_state?: [!]states, connection_nat_state?: [!]srcnat | dstnat (comma-separated), icmp_options?: type[:code], tcp_flags?: [!]flag list of ack | cwr | ece | fin | psh | rst | syn | urg (comma-separated; ! per flag: syn,!ack; needs protocol=tcp), connection_mark?: [!]name, packet_mark?: [!]name, routing_mark?: [!]name, limit?: count/time[,burst], to_addresses?: ip | ip-ip (src-nat, dst-nat), to_ports?: port | port-port, jump_target?: chain, log_prefix?: string, address_list?: name, address_list_timeout?: duration, disabled?: bool, comment?: string, section?: string, place_before?: *hex, force?: bool} → {id}",
         always,
         nat_add
     ),
@@ -183,7 +185,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set NAT Rule",
         [],
         None,
-        "{id: *hex, chain?, action?, family?, src_address?, dst_address?, src_address_list?, dst_address_list?, protocol?, src_port?, dst_port?, in_interface?, out_interface?, in_interface_list?, out_interface_list?, connection_state?, connection_nat_state?, icmp_options?, connection_mark?, packet_mark?, routing_mark?, limit?, to_addresses?, to_ports?, jump_target?, log_prefix?, address_list?, address_list_timeout?, disabled?: bool, comment?: string, section?: string, force?: bool} → {id} (same syntax as add; \"\" clears a matcher)",
+        "{id: *hex, chain?, action?, family?, src_address?, dst_address?, src_address_list?, dst_address_list?, protocol?, src_port?, dst_port?, in_interface?, out_interface?, in_interface_list?, out_interface_list?, connection_state?, connection_nat_state?, icmp_options?, tcp_flags?, connection_mark?, packet_mark?, routing_mark?, limit?, to_addresses?, to_ports?, jump_target?, log_prefix?, address_list?, address_list_timeout?, disabled?: bool, comment?: string, section?: string, force?: bool} → {id} (same syntax as add; \"\" clears a matcher)",
         has_nat,
         nat_set
     ),
@@ -213,7 +215,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add Mangle Rule",
         ["IP", "Firewall"],
         None,
-        "{chain?: prerouting | input | forward | output | postrouting | <custom>, action?: accept | mark-connection | mark-packet | mark-routing | jump | return | log | passthrough | add-src-to-address-list | add-dst-to-address-list (default accept), family?: both | ipv4 | ipv6, src_address?: [!]ip | cidr | ip-ip, dst_address?: [!]ip | cidr | ip-ip, src_address_list?: [!]name, dst_address_list?: [!]name, protocol?: [!]tcp | udp | icmp | icmpv6 | 0..255, src_port?: [!]ports, dst_port?: [!]ports, in_interface?: [!]interface (all-ppp: every PPPoE subscriber), out_interface?: [!]interface (all-ppp too), in_interface_list?: [!]list, out_interface_list?: [!]list, connection_state?: [!]states, connection_nat_state?: [!]srcnat | dstnat (comma-separated), icmp_options?: type[:code], connection_mark?: [!]name, packet_mark?: [!]name, routing_mark?: [!]name, limit?: count/time[,burst], new_connection_mark?: name, new_packet_mark?: name, new_routing_mark?: name, passthrough?: bool (default true), jump_target?: chain, log_prefix?: string, address_list?: name, address_list_timeout?: duration, disabled?: bool, comment?: string, section?: string, place_before?: *hex, force?: bool} → {id}",
+        "{chain?: prerouting | input | forward | output | postrouting | <custom>, action?: accept | mark-connection | mark-packet | mark-routing | change-mss | jump | return | log | passthrough | add-src-to-address-list | add-dst-to-address-list (default accept), family?: both | ipv4 | ipv6, src_address?: [!]ip | cidr | ip-ip, dst_address?: [!]ip | cidr | ip-ip, src_address_list?: [!]name, dst_address_list?: [!]name, protocol?: [!]tcp | udp | icmp | icmpv6 | 0..255, src_port?: [!]ports, dst_port?: [!]ports, in_interface?: [!]interface (all-ppp: every PPPoE subscriber), out_interface?: [!]interface (all-ppp too), in_interface_list?: [!]list, out_interface_list?: [!]list, connection_state?: [!]states, connection_nat_state?: [!]srcnat | dstnat (comma-separated), icmp_options?: type[:code], tcp_flags?: [!]flag list of ack | cwr | ece | fin | psh | rst | syn | urg (comma-separated; ! per flag: syn,!ack; needs protocol=tcp), connection_mark?: [!]name, packet_mark?: [!]name, routing_mark?: [!]name, limit?: count/time[,burst], new_connection_mark?: name, new_packet_mark?: name, new_routing_mark?: name, new_mss?: 88..65535 | clamp-to-pmtu (change-mss: lowers the MSS of TCP SYNs, never raises it; needs protocol=tcp tcp_flags=syn; clamp-to-pmtu only in forward, output or postrouting), passthrough?: bool (default true), jump_target?: chain, log_prefix?: string, address_list?: name, address_list_timeout?: duration, disabled?: bool, comment?: string, section?: string, place_before?: *hex, force?: bool} → {id, warnings (what makes the rule do nothing)}",
         always,
         mangle_add
     ),
@@ -222,7 +224,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set Mangle Rule",
         [],
         None,
-        "{id: *hex, chain?, action?, family?, src_address?, dst_address?, src_address_list?, dst_address_list?, protocol?, src_port?, dst_port?, in_interface?, out_interface?, in_interface_list?, out_interface_list?, connection_state?, connection_nat_state?, icmp_options?, connection_mark?, packet_mark?, routing_mark?, limit?, new_connection_mark?, new_packet_mark?, new_routing_mark?, passthrough?: bool, jump_target?, log_prefix?, address_list?, address_list_timeout?, disabled?: bool, comment?: string, section?: string, force?: bool} → {id} (same syntax as add; \"\" clears a matcher)",
+        "{id: *hex, chain?, action?, family?, src_address?, dst_address?, src_address_list?, dst_address_list?, protocol?, src_port?, dst_port?, in_interface?, out_interface?, in_interface_list?, out_interface_list?, connection_state?, connection_nat_state?, icmp_options?, tcp_flags?, connection_mark?, packet_mark?, routing_mark?, limit?, new_connection_mark?, new_packet_mark?, new_routing_mark?, new_mss?, passthrough?: bool, jump_target?, log_prefix?, address_list?, address_list_timeout?, disabled?: bool, comment?: string, section?: string, force?: bool} → {id, warnings} (same syntax as add; \"\" clears a matcher)",
         has_mangle,
         mangle_set
     ),
@@ -252,7 +254,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add Raw Rule",
         ["IP", "Firewall"],
         None,
-        "{chain?: prerouting | output | <custom>, action?: accept | drop | notrack | jump | return | log | passthrough | add-src-to-address-list | add-dst-to-address-list (default accept), family?: both | ipv4 | ipv6, src_address?: [!]ip | cidr | ip-ip, dst_address?: [!]ip | cidr | ip-ip, src_address_list?: [!]name, dst_address_list?: [!]name, protocol?: [!]tcp | udp | icmp | icmpv6 | 0..255, src_port?: [!]ports, dst_port?: [!]ports, in_interface?: [!]interface (all-ppp: every PPPoE subscriber), out_interface?: [!]interface (all-ppp too), in_interface_list?: [!]list, out_interface_list?: [!]list, icmp_options?: type[:code], packet_mark?: [!]name, limit?: count/time[,burst], jump_target?: chain, log_prefix?: string, address_list?: name, address_list_timeout?: duration, disabled?: bool, comment?: string, section?: string, place_before?: *hex, force?: bool} → {id} (before connection tracking: no connection_* matchers)",
+        "{chain?: prerouting | output | <custom>, action?: accept | drop | notrack | jump | return | log | passthrough | add-src-to-address-list | add-dst-to-address-list (default accept), family?: both | ipv4 | ipv6, src_address?: [!]ip | cidr | ip-ip, dst_address?: [!]ip | cidr | ip-ip, src_address_list?: [!]name, dst_address_list?: [!]name, protocol?: [!]tcp | udp | icmp | icmpv6 | 0..255, src_port?: [!]ports, dst_port?: [!]ports, in_interface?: [!]interface (all-ppp: every PPPoE subscriber), out_interface?: [!]interface (all-ppp too), in_interface_list?: [!]list, out_interface_list?: [!]list, icmp_options?: type[:code], tcp_flags?: [!]flag list of ack | cwr | ece | fin | psh | rst | syn | urg (comma-separated; ! per flag: syn,!ack; needs protocol=tcp), packet_mark?: [!]name, limit?: count/time[,burst], jump_target?: chain, log_prefix?: string, address_list?: name, address_list_timeout?: duration, disabled?: bool, comment?: string, section?: string, place_before?: *hex, force?: bool} → {id} (before connection tracking: no connection_* matchers)",
         always,
         raw_add
     ),
@@ -261,7 +263,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set Raw Rule",
         [],
         None,
-        "{id: *hex, chain?, action?, family?, src_address?, dst_address?, src_address_list?, dst_address_list?, protocol?, src_port?, dst_port?, in_interface?, out_interface?, in_interface_list?, out_interface_list?, icmp_options?, packet_mark?, limit?, jump_target?, log_prefix?, address_list?, address_list_timeout?, disabled?: bool, comment?: string, section?: string, force?: bool} → {id} (same syntax as add; \"\" clears a matcher)",
+        "{id: *hex, chain?, action?, family?, src_address?, dst_address?, src_address_list?, dst_address_list?, protocol?, src_port?, dst_port?, in_interface?, out_interface?, in_interface_list?, out_interface_list?, icmp_options?, tcp_flags?, packet_mark?, limit?, jump_target?, log_prefix?, address_list?, address_list_timeout?, disabled?: bool, comment?: string, section?: string, force?: bool} → {id} (same syntax as add; \"\" clears a matcher)",
         has_raw,
         raw_set
     ),
@@ -655,8 +657,18 @@ pub(super) fn add(s: &mut Session, table: Table, p: &Value) -> Result<Value> {
     rule.id = cfg.ip.firewall.next_rule_id();
     check_rule(cfg, table, &rule)?;
     let id = rule.id;
+    let warnings = super::firewall_mss::warnings(cfg, &rule);
     cfg.ip.firewall.rules_mut(table).insert(at, rule);
-    Ok(json!({ "id": id }))
+    Ok(result(table, id, warnings))
+}
+
+/// `{id}`; the mangle also says what makes the rule useless (G1.31d).
+fn result(table: Table, id: ItemId, warnings: Vec<String>) -> Value {
+    if table == Table::Mangle {
+        json!({ "id": id, "warnings": warnings })
+    } else {
+        json!({ "id": id })
+    }
 }
 
 fn set(s: &mut Session, table: Table, p: &Value) -> Result<Value> {
@@ -715,10 +727,11 @@ fn set(s: &mut Session, table: Table, p: &Value) -> Result<Value> {
     }
     check_interfaces(cfg, &old.matchers, &rule.matchers)?;
     check_rule(cfg, table, &rule)?;
+    let warnings = super::firewall_mss::warnings(cfg, &rule);
     if let Some(slot) = cfg.ip.firewall.rules_mut(table).get_mut(pos) {
         *slot = rule;
     }
-    Ok(json!({ "id": id }))
+    Ok(result(table, id, warnings))
 }
 
 fn remove(s: &mut Session, table: Table, p: &Value) -> Result<Value> {

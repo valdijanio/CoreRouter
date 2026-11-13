@@ -524,7 +524,35 @@ pub enum Expr {
         sreg_key: u32,
         timeout_ms: Option<u64>,
     },
+    /// `rt <key> => dreg` (`NFT_RT_*`; G1.31d: `NFT_RT_TCPMSS`, the
+    /// route's MTU minus the IP and TCP headers, in host order).
+    Rt {
+        key: u32,
+        dreg: u32,
+    },
+    /// `byteorder dreg = hton|ntoh(sreg, len, size)`.
+    Byteorder {
+        sreg: u32,
+        dreg: u32,
+        hton: bool,
+        len: u32,
+        size: u32,
+    },
+    /// `exthdr write tcpopt sreg => len @ kind + offset` (`tcp option
+    /// maxseg size set …`, G1.31d). The kernel writes the MSS only when
+    /// it lowers it (`nft_exthdr_tcp_set_eval`).
+    TcpOptSet {
+        kind: u8,
+        offset: u32,
+        len: u32,
+        sreg: u32,
+    },
 }
+
+/// `NFT_RT_TCPMSS`.
+pub const RT_TCPMSS: u32 = 3;
+/// TCP option kind of the MSS (RFC 9293 §3.2).
+pub const TCPOPT_MAXSEG: u8 = 2;
 
 /// `NFT_CMP_*` orderings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

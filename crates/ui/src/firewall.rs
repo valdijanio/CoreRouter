@@ -107,6 +107,7 @@ impl FwTable {
                 "mark-connection",
                 "mark-packet",
                 "mark-routing",
+                "change-mss",
                 "jump",
                 "return",
                 "log",
@@ -302,8 +303,8 @@ pub(crate) struct State {
     pub dialogs: Vec<FwDialogWin>,
     /// Items to open once a list sent after this request arrives.
     open_after: Vec<(RequestId, Feed, String)>,
-    /// The ⓘ of the open tab (G2.1c).
-    help: Option<crate::help::HelpView>,
+    /// The explanation open: of a tab (G2.1c) or a rule field (G1.31d).
+    pub(crate) help: Option<crate::help::HelpView>,
 }
 
 fn feed_index(f: Feed) -> usize {
@@ -413,11 +414,13 @@ const RULE_FIELDS: [&str; 27] = [
     "new_packet_mark",
 ];
 /// The fields that do not fit the array above.
-const RULE_FIELDS_TAIL: [&str; 4] = [
+const RULE_FIELDS_TAIL: [&str; 6] = [
     "new_routing_mark",
     "limit",
     "address_list",
     "address_list_timeout",
+    "tcp_flags",
+    "new_mss",
 ];
 
 /// Fields only sent with these actions (so switching action does not send
@@ -432,6 +435,7 @@ fn action_field_owner(field: &str) -> Option<&'static [&'static str]> {
         "new_connection_mark" => &["mark-connection"],
         "new_packet_mark" => &["mark-packet"],
         "new_routing_mark" => &["mark-routing"],
+        "new_mss" => &["change-mss"],
         "address_list" | "address_list_timeout" => {
             &["add-src-to-address-list", "add-dst-to-address-list"]
         }
@@ -490,7 +494,8 @@ impl RuleForm {
     }
 
     fn has_passthrough(&self) -> bool {
-        self.get("action").starts_with("mark-")
+        let a = self.get("action");
+        a.starts_with("mark-") || a == "change-mss"
     }
 
     /// `add` params: every filled field that applies.
@@ -1992,6 +1997,7 @@ impl CoreRouterUi {
                 ifaces: &ifaces,
             };
             let item = d.item.clone();
+            let mut help = None;
             let pressed =
                 dialog::show(&mut self.floats, ctx, area, head, &mut d.status, |ui, f| {
                     body(
@@ -2002,8 +2008,12 @@ impl CoreRouterUi {
                         row.as_ref(),
                         &pick,
                         &can,
+                        &mut help,
                     )
                 });
+            if help.is_some() {
+                self.fw.help = help;
+            }
             let keep = pressed.is_none_or(|b| self.fw_button(d, b, row.as_ref()));
             if !keep {
                 self.floats.forget(id);
@@ -2195,6 +2205,19 @@ fn combo_text(
     hint: &str,
 ) {
     ui.label(label);
+    combo_field(ui, f, param, value, options, hint);
+}
+
+/// The text field and its pick list of [`combo_text`], after a label the
+/// caller drew.
+fn combo_field(
+    ui: &mut Ui,
+    f: &Form,
+    param: &str,
+    value: &mut String,
+    options: &[String],
+    hint: &str,
+) {
     ui.horizontal(|ui| {
         ui.add(
             TextEdit::singleline(value)
@@ -2225,6 +2248,39 @@ fn rule_field(ui: &mut Ui, f: &Form, form: &mut RuleForm, label: &str, param: &s
     }
 }
 
+/// [`rule_field`] whose label has an ⓘ opening explanation `key`.
+#[allow(clippy::too_many_arguments)]
+fn rule_field_help(
+    ui: &mut Ui,
+    f: &Form,
+    form: &mut RuleForm,
+    label: &str,
+    param: &str,
+    hint: &str,
+    key: &'static str,
+    help: &mut Option<crate::help::HelpView>,
+) {
+    let Some(v) = form.slot(param) else { return };
+    help_label(ui, f, label, key, help);
+    f.field(ui, param, v, hint);
+}
+
+/// A grid label with an ⓘ after it.
+fn help_label(
+    ui: &mut Ui,
+    f: &Form,
+    label: &str,
+    key: &'static str,
+    help: &mut Option<crate::help::HelpView>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        if crate::help::info_button(ui, f.window().with(("help", key)), label).clicked() {
+            *help = Some(crate::help::HelpView::new(key, label));
+        }
+    });
+}
+
 fn rule_combo(
     ui: &mut Ui,
     f: &Form,
@@ -2243,6 +2299,7 @@ fn strings(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| (*s).to_owned()).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn body(
     ui: &mut Ui,
     f: &Form,
@@ -2251,6 +2308,7 @@ fn body(
     row: Option<&Value>,
     pick: &Picks<'_>,
     can: &Avail,
+    help: &mut Option<crate::help::HelpView>,
 ) -> Footer<Button> {
     if let Edit::Wizard { kind, form } = e {
         return crate::firewall_assist::body(ui, f, *kind, form, can);
@@ -2402,6 +2460,16 @@ fn body(
                             "icmp_options",
                             "8:0 (type:code)",
                         );
+                        rule_field_help(
+                            ui,
+                            f,
+                            form,
+                            "TCP Flags",
+                            "tcp_flags",
+                            "syn or syn,!ack",
+                            "firewall.rule.tcp_flags",
+                            help,
+                        );
                         if t != FwTable::Raw {
                             rule_field(ui, f, form, "Connection Mark", "connection_mark", "name");
                         }
@@ -2413,7 +2481,11 @@ fn body(
                     }
                     RuleTab::Action => {
                         let actions = strings(t.actions());
-                        ui.label("Action");
+                        if form.get("action") == "change-mss" {
+                            help_label(ui, f, "Action", "firewall.action.change-mss", help);
+                        } else {
+                            ui.label("Action");
+                        }
                         let mut a = form.get("action").to_owned();
                         crate::windows::combo(ui, "rule-action", "accept", &mut a, &actions);
                         ui.end_row();
@@ -2431,6 +2503,7 @@ fn body(
                             ("new_connection_mark", "New Connection Mark", "name"),
                             ("new_packet_mark", "New Packet Mark", "name"),
                             ("new_routing_mark", "New Routing Mark", "name"),
+                            ("new_mss", "New MSS", "1360 or clamp-to-pmtu"),
                             ("address_list", "Address List", "name"),
                             (
                                 "address_list_timeout",
@@ -2460,6 +2533,18 @@ fn body(
                                 );
                             } else if *param == "address_list" {
                                 rule_combo(ui, f, form, label, param, pick.addr_lists, hint);
+                            } else if *param == "new_mss" {
+                                if let Some(v) = form.slot(param) {
+                                    help_label(ui, f, label, "firewall.rule.new_mss", help);
+                                    combo_field(
+                                        ui,
+                                        f,
+                                        param,
+                                        v,
+                                        &strings(&["clamp-to-pmtu", "1452", "1420", "1380", "1360"]),
+                                        hint,
+                                    );
+                                }
                             } else {
                                 rule_field(ui, f, form, label, param, hint);
                             }
