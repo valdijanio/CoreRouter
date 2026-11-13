@@ -128,7 +128,15 @@ SRC=$(pwd)
 FAILED=0
 GEN_RID=10.0.0.11 DUT_RID=10.255.0.1
 LINK_DUT=10.0.1.1 LINK_GEN=10.0.1.2
-BIG_ROOT=192.168.0.0 CHURN_ROOT=10.200.0.0
+# What the generator advertises. Phase C (2026-11-13) used 192.168.0.0 for
+# the nodes' /32s and 100.64.0.0/28 for the externals: on the notebook they
+# covered its home network (ether1) and LAN (ether2), its replies left by
+# the lab cable and its management was cut until the test ended. Now ranges
+# no real network uses (RFC 2544 benchmarking 198.18.0.0/15, and 10.128/9
+# for the up to 200 000 /28 externals); remote_overlap_check refuses a DUT
+# with an address in them.
+BIG_ROOT=198.19.0.0 CHURN_ROOT=10.200.0.0 EXT_BASE=10.128.0.0
+GEN_RANGES="198.18.0.0/15 10.128.0.0/9 10.200.0.0/16"
 INSTANCE=stress
 TLS_PORT=8729
 
@@ -693,7 +701,7 @@ lsdb_mrt() { # <lsas> → path of the MRT file
 	ext=$((n - nodes))
 	if [ ! -s "$d/lsdb.mrt" ]; then
 		mkdir -p "$d"
-		(cd "$d" && lspgen -P ospf2 -y -c "$nodes" -e "$ext" -n "$BIG_ROOT/32" -x 100.64.0.0/28 \
+		(cd "$d" && lspgen -P ospf2 -y -c "$nodes" -e "$ext" -n "$BIG_ROOT/32" -x "$EXT_BASE/28" \
 			-C "$GEN_RID:$LINK_GEN" -m lsdb.mrt >lspgen.log 2>&1)
 	fi
 	echo "$d/lsdb.mrt"
@@ -1834,6 +1842,29 @@ if [ $DUT = remote ]; then
 		sleep 1
 	done
 fi
+# A remote DUT has real networks: the routes the generator advertises must
+# not cover any of them (a /32 beats the connected /24 and the DUT answers
+# its management by the lab cable).
+remote_overlap_check() {
+	[ $DUT = remote ] && [ $SELFTEST = 0 ] || return 0
+	local bad
+	bad=$(cr ip.address.list | jq -r '.[].address' | python3 -I -c '
+import ipaddress, sys
+gen = [ipaddress.ip_network(r) for r in sys.argv[1].split()]
+for line in sys.stdin:
+    a = line.strip()
+    if not a or ":" in a:
+        continue
+    net = ipaddress.ip_interface(a).network
+    hit = " ".join(str(g) for g in gen if net.overlaps(g))
+    if hit:
+        print(a + " overlaps " + hit)
+' "$GEN_RANGES")
+	[ -z "$bad" ] && return 0
+	fail "the DUT has addresses inside the ranges the generator advertises ($GEN_RANGES): $bad"
+	exit 1
+}
+remote_overlap_check
 dut_config
 say "# OSPF stress ($(date -u +%FT%TZ), DUT $DUT${TARGET:+ $TARGET}, daemon $DAEMON)"
 say ""
