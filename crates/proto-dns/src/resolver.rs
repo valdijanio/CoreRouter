@@ -35,7 +35,8 @@ use corerouter_model::dns::{CacheRow, Dns, ServerSelection};
 use hickory_proto::rr::RecordType;
 
 use crate::cache::{Cache, Hit};
-use crate::encrypted::SecureServer;
+use crate::encrypted::{Proto, SecureServer};
+use crate::histogram::Hist;
 use crate::message::{Answer, NameError, QName, Rcode, ReplyError, check_reply, parse_name, query};
 
 /// Moves bytes to a server and back.
@@ -252,6 +253,40 @@ pub struct ServerStats {
     pub down_until_ms: u64,
     pub answers: u64,
     pub failures: u64,
+    /// G4.1h: of the failures, no answer in time and SERVFAIL from it.
+    pub timeouts: u64,
+    pub servfails: u64,
+    /// UDP answers with TC asked again over TCP (RFC 7766 §5).
+    pub truncated: u64,
+    /// Round-trip times of its answers.
+    pub rtt: Hist,
+    /// How it was asked the last time.
+    pub via: Via,
+    /// When it last went down or came back (the transport's clock, ms;
+    /// 0: never changed).
+    pub changed_ms: u64,
+}
+
+/// How a server is asked (G4.1h).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Via {
+    /// UDP, TCP when truncated.
+    #[default]
+    Plain,
+    /// DNS over TLS (RFC 7858).
+    Tls,
+    /// DNS over HTTPS (RFC 8484).
+    Https,
+}
+
+impl Via {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Plain => "udp",
+            Self::Tls => "dot",
+            Self::Https => "doh",
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -353,6 +388,11 @@ impl Resolver {
 
     pub fn cache_used_bytes(&self) -> usize {
         self.state().cache.used_bytes()
+    }
+
+    /// Entries, bytes, evictions and types of the cache (G4.1h).
+    pub fn cache_stats(&self) -> crate::cache::CacheStats {
+        self.state().cache.stats()
     }
 
     pub fn flush(&self) {
@@ -493,18 +533,30 @@ impl Resolver {
         let asked: Vec<IpAddr> = servers.iter().map(Target::ip).collect();
         let mut st = self.state();
         let now = t.now_ms();
-        for (ip, rtt) in &fetched.tried {
-            let s = st.stats.entry(*ip).or_default();
-            match rtt {
-                Some(ms) => {
-                    s.srtt_ms = Some(s.srtt_ms.map_or(*ms, |old| (old * 7 + ms) / 8));
+        for tr in &fetched.tried {
+            let s = st.stats.entry(tr.ip).or_default();
+            let was_down = s.down_until_ms > now;
+            s.via = tr.via;
+            s.truncated = s.truncated.saturating_add(u64::from(tr.truncated));
+            match tr.outcome {
+                Outcome::Answered(ms) => {
+                    s.srtt_ms = Some(s.srtt_ms.map_or(ms, |old| (old * 7 + ms) / 8));
                     s.down_until_ms = 0;
                     s.answers = s.answers.saturating_add(1);
+                    s.rtt.add_ms(ms);
                 }
-                None => {
+                failed => {
                     s.down_until_ms = now.saturating_add(DOWN_MS);
                     s.failures = s.failures.saturating_add(1);
+                    match failed {
+                        Outcome::Timeout => s.timeouts = s.timeouts.saturating_add(1),
+                        Outcome::ServFail => s.servfails = s.servfails.saturating_add(1),
+                        _ => {}
+                    }
                 }
+            }
+            if was_down != (s.down_until_ms > now) {
+                s.changed_ms = now;
             }
         }
         // Forget servers no longer configured (the map stays small); a
@@ -712,11 +764,50 @@ fn order(st: &State, now_ms: u64) -> Vec<IpAddr> {
     }
 }
 
-/// The result of asking the servers, and how each one did (round-trip
-/// time, or `None` for a failure).
+/// The result of asking the servers, and how each one did.
 pub struct Fetched {
     pub result: Result<(Answer, IpAddr, usize), ResolveError>,
-    pub tried: Vec<(IpAddr, Option<u64>)>,
+    pub tried: Vec<Tried>,
+}
+
+/// One server asked for a lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tried {
+    pub ip: IpAddr,
+    pub via: Via,
+    pub outcome: Outcome,
+    /// Its UDP answer was truncated and it was asked again over TCP.
+    pub truncated: bool,
+}
+
+/// How a server did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Answered, in this many milliseconds.
+    Answered(u64),
+    Timeout,
+    ServFail,
+    /// Refused, malformed, a network error.
+    Failed,
+}
+
+impl Outcome {
+    fn of(e: &Ask) -> Self {
+        match e {
+            Ask::Transport(TransportError::Timeout) => Self::Timeout,
+            Ask::Reply(ReplyError::ServFail) => Self::ServFail,
+            _ => Self::Failed,
+        }
+    }
+}
+
+fn tried(ip: IpAddr, via: Via, outcome: Outcome, truncated: bool) -> Tried {
+    Tried {
+        ip,
+        via,
+        outcome,
+        truncated,
+    }
 }
 
 /// Asks `servers` in order until one gives a definite answer.
@@ -749,16 +840,21 @@ pub fn fetch(
             let wait = left.min(u64::from(settings.server_timeout_ms).max(SECURE_TIMEOUT_MS));
             let started = t.now_ms();
             let server = SocketAddr::new(*ip, via.port);
+            let how = match via.proto {
+                Proto::Tls => Via::Tls,
+                Proto::Https => Via::Https,
+            };
             match ask_secure(t, server, via, settings.udp_payload, qn, rtype, wait) {
                 Ok((answer, wire)) => {
-                    tried.push((*ip, Some(t.now_ms().saturating_sub(started))));
+                    let rtt = t.now_ms().saturating_sub(started);
+                    tried.push(self::tried(*ip, how, Outcome::Answered(rtt), false));
                     return Fetched {
                         result: Ok((answer, *ip, wire)),
                         tried,
                     };
                 }
                 Err(e) => {
-                    tried.push((*ip, None));
+                    tried.push(self::tried(*ip, how, Outcome::of(&e), false));
                     errors.push(format!("{} ({ip}): {e}", via.url()));
                     continue;
                 }
@@ -779,7 +875,8 @@ pub fn fetch(
             let wait = left.min(u64::from(settings.server_timeout_ms));
             match ask(t, server, settings.udp_payload, qn, rtype, tcp, wait) {
                 Ok((answer, wire)) => {
-                    tried.push((*ip, Some(t.now_ms().saturating_sub(started))));
+                    let rtt = t.now_ms().saturating_sub(started);
+                    tried.push(self::tried(*ip, Via::Plain, Outcome::Answered(rtt), tcp));
                     return Fetched {
                         result: Ok((answer, *ip, wire)),
                         tried,
@@ -788,7 +885,7 @@ pub fn fetch(
                 // RFC 7766 §5: a truncated UDP answer is retried over TCP.
                 Err(Ask::Reply(ReplyError::Truncated)) if !tcp => tcp = true,
                 Err(e) => {
-                    tried.push((*ip, None));
+                    tried.push(self::tried(*ip, Via::Plain, Outcome::of(&e), tcp));
                     errors.push(format!("{ip}: {e}"));
                     break;
                 }

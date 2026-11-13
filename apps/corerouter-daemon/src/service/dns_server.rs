@@ -162,16 +162,19 @@ struct Pass {
 
 impl Pass {
     fn enter(srv: &Arc<Server>, which: Which, max: u32) -> Option<Self> {
-        srv.gate(which).try_enter(max).then(|| Self {
+        let pass = srv.gate(which).try_enter(max).then(|| Self {
             srv: srv.clone(),
             which,
-        })
+        })?;
+        srv.in_flight(which);
+        Some(pass)
     }
 }
 
 impl Drop for Pass {
     fn drop(&mut self) {
         self.srv.gate(self.which).0.fetch_sub(1, Ordering::AcqRel);
+        self.srv.in_flight(self.which);
     }
 }
 
@@ -199,6 +202,19 @@ impl Server {
             Which::Query => &self.queries,
             Which::Tcp => &self.tcp,
         }
+    }
+
+    /// G4.1h: the queries waiting for an upstream, for the statistics.
+    fn in_flight(&self, which: Which) {
+        if let Which::Query = which {
+            self.fwd.statistics().set_in_flight(self.queries.0.load(Ordering::Relaxed));
+        }
+    }
+
+    /// G4.1h: a reply went out; the time since its query was read.
+    fn answered(&self, read_at: Instant) {
+        let us = u64::try_from(read_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.fwd.statistics().answered_in(us);
     }
 
     fn alive(&self, epoch: u64) -> bool {
@@ -250,6 +266,7 @@ fn udp_loop(srv: Arc<Server>, sock: Arc<Udp>, epoch: u64) {
                 continue;
             }
         };
+        let read_at = Instant::now();
         let packet = buf.get(..n).unwrap_or_default();
         // RFC 2136 UPDATE: applied on its own thread (it waits for the
         // session lock and a disk write; queries must not).
@@ -276,6 +293,7 @@ fn udp_loop(srv: Arc<Server>, sock: Arc<Udp>, epoch: u64) {
             Start::Done(mut d) => {
                 if let Some(r) = &d.reply {
                     sock.send(r, from, local);
+                    srv.answered(read_at);
                 }
                 srv.effects(&mut d);
             }
@@ -286,6 +304,7 @@ fn udp_loop(srv: Arc<Server>, sock: Arc<Udp>, epoch: u64) {
                     let d = srv.fwd.fail(*p);
                     if let Some(r) = &d.reply {
                         sock.send(r, from, local);
+                        srv.answered(read_at);
                     }
                     continue;
                 };
@@ -294,6 +313,7 @@ fn udp_loop(srv: Arc<Server>, sock: Arc<Udp>, epoch: u64) {
                     let mut d = pass.srv.finish(*p);
                     if let Some(r) = &d.reply {
                         sock_w.send(r, from, local);
+                        pass.srv.answered(read_at);
                     }
                     pass.srv.effects(&mut d);
                 };
@@ -417,6 +437,7 @@ fn tcp_session(srv: &Arc<Server>, mut s: TcpStream, epoch: u64) {
         let Some(msg) = read_message(&mut s, session_end) else {
             return;
         };
+        let read_at = Instant::now();
         // AXFR/IXFR (several messages) and NOTIFY (G4.1c), before the chain.
         if let Some(replies) = zone::xfr::intercept(&srv.fwd, &msg, peer.ip(), true) {
             for r in replies {
@@ -460,6 +481,7 @@ fn tcp_session(srv: &Arc<Server>, mut s: TcpStream, epoch: u64) {
         if s.write_all(&framed).is_err() {
             return;
         }
+        srv.answered(read_at);
     }
 }
 
@@ -638,6 +660,8 @@ fn follow(session: &Shared, srv: &Arc<Server>, port: u16, any: bool, health: &su
     let mut last: Option<Config> = None;
     let mut last_allowed = Vec::new();
     let mut listening = false;
+    // Where the UDP sockets are bound (their kernel drops, G4.1h).
+    let mut bound: Vec<SocketAddr> = Vec::new();
     let mut retry_at = 0u64;
     let lab = !any && is_lab(session);
     loop {
@@ -672,6 +696,7 @@ fn follow(session: &Shared, srv: &Arc<Server>, port: u16, any: bool, health: &su
             match open(srv, port, lab, epoch, health) {
                 Ok(at) => {
                     health.listen(at.iter().flat_map(|a| [Listen::new("udp", *a), Listen::new("tcp", *a)]).collect());
+                    bound.clone_from(&at);
                     health.clear_error();
                     health.event(format!("answering the LAN on port {port}"));
                     listening = true;
@@ -692,6 +717,9 @@ fn follow(session: &Shared, srv: &Arc<Server>, port: u16, any: bool, health: &su
             log::info!("DNS: no longer answering the LAN (allow_remote_requests off)");
         }
         health.disabled((!want).then_some("ip.dns allow_remote_requests=no"));
+        if listening {
+            srv.fwd.statistics().set_socket_drops(drops::udp_drops(&bound));
+        }
         health.sleep(TICK);
     }
 }
@@ -806,6 +834,9 @@ impl Server {
 pub(crate) fn adlists() -> Option<Arc<corerouter_proto_dns::adlist::Adlists>> {
     SERVER.get().map(|s| s.fwd.state())
 }
+
+#[path = "dns_server/drops.rs"]
+mod drops;
 
 /// Linux: the destination address of each query (IP_PKTINFO /
 /// IPV6_RECVPKTINFO), through `nix`.
@@ -1159,6 +1190,16 @@ mod tests {
         assert!(st["answered"]["upstream"].as_u64().unwrap() >= 1, "{st}");
         assert_eq!(st["answered"]["cache"], 1, "{st}");
         assert_eq!(st["clients"][0]["address"], "127.0.0.1");
+        // G4.1h: the time to every reply sent, the transport, the gate.
+        let replies = st["queries"].as_u64().unwrap();
+        let timed: u64 = st["latency"]["ranges"].as_array().unwrap().iter().map(|r| r["replies"].as_u64().unwrap()).sum();
+        assert_eq!(timed, replies, "{st}");
+        assert!(st["latency"]["p99_ms"].as_f64().is_some(), "{st}");
+        assert_eq!(st["transport"]["tcp4"], 1, "{st}");
+        assert_eq!(st["transport"]["udp4"].as_u64().unwrap() + 1, replies, "{st}");
+        assert!(st["in_flight_peak"].as_u64().unwrap() >= 1, "the upstream query took the gate: {st}");
+        assert_eq!(st["in_flight"], 0, "{st}");
+        assert_eq!(st["transport"]["socket_drops"], 0, "{st}");
 
         lock(&session)
             .execute("ip.dns.set", &json!({"allow_remote_requests": false}))
