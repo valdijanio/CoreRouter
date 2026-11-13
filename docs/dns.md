@@ -1337,3 +1337,26 @@ de um servidor, cada nome novo esperava 2 s até ele ir para o fim da fila (**me
 | RFC 6298 §2.2–2.3: SRTT, RTTVAR, RTO | `Resolver::record` |
 | RFC 6298 §5.5: dobrar o RTO no estouro | `Lookup::timed_out`, `Resolver::record` |
 | RFC 6298 §3 (Karn): amostra só de resposta sem ambiguidade | id novo por envio (`message::query`) |
+
+## G4.1v — serve-stale com o prazo do cliente
+
+**Antes.** A resposta vencida (RFC 8767, `serve_stale_secs`) só saía depois de todos os
+servidores falharem: 4,1 s com as duas origens fora (**medido**, `docs/dns-stress.md`). O cliente
+comum desiste antes (o Windows repete em 1 s, o glibc em 5 s).
+
+**Agora** (`service/dns_server/upstream.rs`, `Resolver::answer_stale`): o "client response
+timer" da RFC 8767 §5. Uma busca ainda fora 1,8 s depois de começar (`STALE_CLIENT_MS`; o
+`serve-expired-client-timeout` do Unbound desde o 1.23) responde com a entrada vencida, se o cache
+ainda a tem dentro do `serve_stale_secs`, com TTL 30 s (§4). A resposta vai para o cliente que
+começou a busca e para todas as iguais que esperam ou que chegarem depois (G4.1o): a busca
+continua no mapa, então nenhuma outra sai para a origem. Ela segue até o fim e, quando a origem
+responde, só renova o cache; se falha, a falha fica guardada (RFC 9520) e o vencido sai na hora
+até lá. Sem entrada vencida, o cliente continua esperando a busca.
+
+| Regra | Onde |
+|---|---|
+| RFC 8767 §5: client response timer de 1,8 s, a busca segue ao fundo | `STALE_CLIENT_MS`, `Run::timers_due` |
+| RFC 8767 §4: TTL do vencido > 0, recomendado 30 s | `cache::STALE_TTL` |
+
+**Fica de fora:** o caminho bloqueante (ferramentas do roteador, TCP 53 de entrada, buscas com
+servidor cifrado nas threads) ainda dá o vencido só quando todos falham.
