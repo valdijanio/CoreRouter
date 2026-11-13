@@ -34,6 +34,9 @@ use super::https::Stream;
 mod hpack;
 #[path = "http2/tables.rs"]
 mod tables;
+/// G4.1zf: the server side, for DNS over HTTPS.
+#[path = "http2/server.rs"]
+pub(crate) mod server;
 
 /// §3.4: the client connection preface.
 const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";

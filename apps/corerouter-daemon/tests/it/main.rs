@@ -5,6 +5,7 @@
 //! the logger).
 
 mod auth;
+mod dns_doh;
 mod dns_tls;
 mod e2e;
 mod health;

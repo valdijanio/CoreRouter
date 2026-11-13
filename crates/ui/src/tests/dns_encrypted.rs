@@ -46,6 +46,16 @@ fn apply_turns_dot_on_with_a_certificate_and_shows_the_checks() {
 }
 
 #[test]
+fn doh_shows_its_url_once_on() {
+    let mut s = lab();
+    s.execute("ip.dns.encrypted-service.set", &json!({"doh": true, "doh_port": 8443})).unwrap();
+    let mut h = open(s);
+    assert!(h.has_text("DNS over HTTPS"));
+    assert!(h.has_text_containing("/dns-query{?dns}"), "the URL to give clients");
+    assert!(h.has_text("Copy"));
+}
+
+#[test]
 fn statistics_say_dot_is_off_until_it_is_on() {
     let mut s = lab();
     s.execute("ip.dns.set", &json!({"allow_remote_requests": true})).unwrap();
@@ -68,10 +78,16 @@ fn every_explanation_exists_in_both_languages() {
         "dns_encrypted.announce_ddr",
         "dns_encrypted.certificate",
         "dns_encrypted.dot",
+        "dns_encrypted.doh",
+        "dns_encrypted.doh_errors",
+        "dns_encrypted.doh_path",
+        "dns_encrypted.doh_port",
+        "dns_encrypted.doh_queries",
         "dns_encrypted.dot_port",
         "dns_encrypted.fingerprint",
         "dns_encrypted.handshake_failures",
         "dns_encrypted.handshakes",
+        "dns_encrypted.http2",
         "dns_encrypted.idle_timeout_secs",
         "dns_encrypted.last_error",
         "dns_encrypted.max_sessions",
@@ -81,6 +97,7 @@ fn every_explanation_exists_in_both_languages() {
         "dns_encrypted.resumed",
         "dns_encrypted.sessions",
         "dns_encrypted.status",
+        "dns_encrypted.url",
     ] {
         for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Pt] {
             let langs = crate::i18n::Langs { labels: lang, help: lang };

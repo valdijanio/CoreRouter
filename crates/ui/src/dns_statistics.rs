@@ -695,7 +695,7 @@ impl DnsStatsPanel {
                         }
                         label(ui, help, l, "dns_statistics.encrypted_in", "DoT / DoH in");
                         let enc = s.get("encrypted_in").cloned().unwrap_or(Value::Null);
-                        if enc.get("dot").and_then(Value::as_bool) == Some(true) {
+                        if enc.get("on").and_then(Value::as_bool) == Some(true) {
                             ui.label(format!(
                                 "{} ({} {})",
                                 n(&enc, "queries"),

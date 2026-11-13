@@ -815,5 +815,32 @@ fn resolver_arpa_is_answered_here_with_the_ddr_designation() {
     assert!(matches!(&svcb.svc_params[1].1, SvcParamValue::Port(8853)));
     assert_eq!(m.additionals.len(), 1);
     assert_eq!(m.additionals[0].name.to_string(), "lab-router.");
+    // DoH too: first, with its dohpath (key 7, last), port 443 left out.
+    let cfg = f.config();
+    let mut c = (*cfg.config).clone();
+    c.ip.dns.encrypted_service.doh = true;
+    f.configure(Arc::new(c), cfg.allowed.clone());
+    let m = run(
+        &f,
+        &mut up,
+        LAN,
+        &ask("_dns.resolver.arpa.", RecordType::SVCB),
+    )
+    .unwrap();
+    assert_eq!(m.answers.len(), 2);
+    let RData::SVCB(doh) = &m.answers[0].data else {
+        panic!("{m:?}")
+    };
+    assert_eq!(doh.svc_priority, 1);
+    let keys: Vec<u16> = doh.svc_params.iter().map(|(k, _)| u16::from(*k)).collect();
+    assert_eq!(keys, [1, 4, 7]);
+    let SvcParamValue::Unknown(path) = &doh.svc_params[2].1 else {
+        panic!()
+    };
+    assert_eq!(path.0, b"/dns-query{?dns}");
+    let RData::SVCB(dot) = &m.answers[1].data else {
+        panic!()
+    };
+    assert_eq!(dot.svc_priority, 2);
     assert!(up.asked.is_empty(), "resolver.arpa never leaves");
 }

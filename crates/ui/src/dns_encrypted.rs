@@ -1,6 +1,7 @@
-//! IP › DNS › Encrypted Service (G4.1zf): DNS over TLS for the LAN. One
-//! settings form with Apply (DoT, port, certificate, idle time, sessions,
-//! DDR), and under it the service's state, refreshed live: listening,
+//! IP › DNS › Encrypted Service (G4.1zf): DNS over TLS and DNS over HTTPS
+//! for the LAN. One settings form with Apply (DoT and its port, DoH with its
+//! port and path, certificate, idle time, sessions, DDR), the URL a client
+//! is given, and under it the service's state, refreshed live: listening,
 //! the certificate served, sessions and counters, and the engine's checks
 //! (forwarder on, certificate, input firewall from the LAN and from the
 //! Internet) with an ok/info/warning/error chip each.
@@ -49,6 +50,9 @@ pub(crate) struct EncryptedPanel {
 pub(crate) struct Form {
     pub dot: bool,
     pub dot_port: String,
+    pub doh: bool,
+    pub doh_port: String,
+    pub doh_path: String,
     pub certificate: String,
     pub idle_timeout_secs: String,
     pub max_sessions: String,
@@ -60,6 +64,9 @@ impl Form {
         Self {
             dot: flag(v, "dot"),
             dot_port: text(v, "dot_port"),
+            doh: flag(v, "doh"),
+            doh_port: text(v, "doh_port"),
+            doh_path: text(v, "doh_path"),
             certificate: text(v, "certificate"),
             idle_timeout_secs: text(v, "idle_timeout_secs"),
             max_sessions: text(v, "max_sessions"),
@@ -70,19 +77,23 @@ impl Form {
     /// `ip.dns.encrypted-service.set` params for what differs from `base`.
     pub(crate) fn set_params(&self, base: &Form) -> Option<Value> {
         let mut p = Map::new();
-        for (k, now, was) in [("dot", self.dot, base.dot), ("announce_ddr", self.announce_ddr, base.announce_ddr)] {
+        for (k, now, was) in [("dot", self.dot, base.dot), ("doh", self.doh, base.doh), ("announce_ddr", self.announce_ddr, base.announce_ddr)] {
             if now != was {
                 p.insert(k.into(), json!(now));
             }
         }
         for (k, now, was) in [
             ("dot_port", &self.dot_port, &base.dot_port),
+            ("doh_port", &self.doh_port, &base.doh_port),
             ("idle_timeout_secs", &self.idle_timeout_secs, &base.idle_timeout_secs),
             ("max_sessions", &self.max_sessions, &base.max_sessions),
         ] {
             if now.trim() != was.trim() {
                 p.insert(k.into(), form_number(now));
             }
+        }
+        if self.doh_path.trim() != base.doh_path.trim() {
+            p.insert("doh_path".into(), json!(self.doh_path.trim()));
         }
         if self.certificate.trim() != base.certificate.trim() {
             p.insert("certificate".into(), json!(self.certificate.trim()));
@@ -173,7 +184,7 @@ impl EncryptedPanel {
             if help::info_button(ui, Id::unique("dns-encrypted-title"), title).clicked() {
                 self.help = Some(HelpView::new("menu.dns-encrypted", title));
             }
-            ui.weak(tr_in(SCOPE, l, "DNS over TLS (RFC 7858) for the LAN, answered by the same forwarder as UDP/TCP 53"));
+            ui.weak(tr_in(SCOPE, l, "DNS over TLS and HTTPS for the LAN, answered by the same forwarder as UDP/TCP 53"));
         });
         ui.add_space(4.0);
         let dirty = self.form.set_params(&self.base).is_some();
@@ -186,6 +197,15 @@ impl EncryptedPanel {
             ui.end_row();
             label(ui, help, l, "dot_port", "Port");
             ui.add(TextEdit::singleline(&mut form.dot_port).hint_text("853").desired_width(80.0));
+            ui.end_row();
+            label(ui, help, l, "doh", "DNS over HTTPS");
+            ui.checkbox(&mut form.doh, "");
+            ui.end_row();
+            label(ui, help, l, "doh_port", "HTTPS Port");
+            ui.add(TextEdit::singleline(&mut form.doh_port).hint_text("443").desired_width(80.0));
+            ui.end_row();
+            label(ui, help, l, "doh_path", "Path");
+            ui.add(TextEdit::singleline(&mut form.doh_path).hint_text("/dns-query").desired_width(160.0));
             ui.end_row();
             label(ui, help, l, "certificate", "Certificate");
             let shown = if form.certificate.is_empty() { tr_in(SCOPE, l, "(made at the first Apply)").to_owned() } else { form.certificate.clone() };
@@ -265,15 +285,29 @@ fn status(ui: &mut Ui, s: &Value, help: &mut Option<HelpView>, l: Lang) {
             ui.weak(at);
         });
         ui.end_row();
+        if flag(s, "doh") {
+            let url = text(s, "url");
+            label(ui, help, l, "url", "DoH URL");
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&url).monospace());
+                if ui.small_button(tr_in(SCOPE, l, "Copy")).clicked() {
+                    ui.ctx().copy_text(url.clone());
+                }
+            });
+            ui.end_row();
+        }
         let fp = text(s, "fingerprint");
         if !fp.is_empty() {
             label(ui, help, l, "fingerprint", "Fingerprint");
             ui.label(RichText::new(fp).monospace().small());
             ui.end_row();
         }
-        let rows: [(&str, &'static str); 8] = [
+        let rows: [(&str, &'static str); 11] = [
             ("sessions", "Sessions"),
-            ("queries", "Queries"),
+            ("queries", "DoT Queries"),
+            ("doh_queries", "DoH Queries"),
+            ("doh_errors", "DoH Errors"),
+            ("http2", "HTTP/2 Connections"),
             ("handshakes", "Handshakes"),
             ("resumed", "Resumed"),
             ("handshake_failures", "Handshake Failures"),
