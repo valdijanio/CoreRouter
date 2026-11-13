@@ -395,7 +395,8 @@ thread_local! {
     static MY_STRIPE: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
-fn my_stripe() -> usize {
+/// This thread's stripe (also the forwarder's states', G4.1z).
+pub(crate) fn my_stripe() -> usize {
     MY_STRIPE.with(|s| {
         let mine = s.get();
         if mine != usize::MAX {
