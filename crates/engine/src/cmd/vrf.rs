@@ -189,6 +189,19 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
             rules.join(", ")
         ));
     }
+    // G1.31c: a WireGuard interface sends its encrypted packets by it.
+    let tunnels: Vec<String> = cfg
+        .interfaces
+        .values()
+        .filter(|i| matches!(&i.kind, InterfaceKind::Wireguard(w) if w.vrf.as_ref() == Some(&name)))
+        .map(|i| i.name.to_string())
+        .collect();
+    if !tunnels.is_empty() {
+        blockers.push(format!(
+            "WireGuard {} sends its encrypted packets by it (interface.wireguard.set vrf=main)",
+            tunnels.join(", ")
+        ));
+    }
     let addrs: Vec<String> = cfg
         .ip
         .addresses

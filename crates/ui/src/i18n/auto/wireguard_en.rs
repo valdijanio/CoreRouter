@@ -215,4 +215,15 @@ The WireGuard interfaces: port, MTU, public key and how many peers are up. Doubl
         r##"## What it is
 Every peer of every WireGuard interface, with its handshake state, where it is, its prefixes and traffic. The chips filter by interface and by state; the line under the table says why the selected peer is in its state."##,
     ),
+    (
+        "wireguard.vrf",
+        r##"## What it is
+The VRF the **encrypted** packets go by (RouterOS 7.21 `vrf`; `main` = the main table): where the handshakes and the tunnel's UDP leave and arrive. It is not the VRF of the tunnel interface itself (that is the interface's own VRF, set in IP › VRF).
+
+## How
+The kernel's WireGuard socket cannot be bound to a device, so the router marks its packets with the VRF's routing mark and a rule looks that mark up in the VRF's table; both are made and removed in the same commit. To hear on the VRF's ports the router turns on `net.ipv4.udp_l3mdev_accept`.
+
+## Careful
+With it on, the router's UDP services that listen on every address (DNS, NTP...) also hear on the VRF's ports: filter them in IP › Firewall (input). The VRF needs a route to the peers' endpoints."##,
+    ),
 ];

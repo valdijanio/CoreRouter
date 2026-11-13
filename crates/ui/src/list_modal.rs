@@ -45,6 +45,10 @@ use crate::{CoreRouterUi, Pending, Win};
 const ASK_EVERY_SECS: f64 = 0.4;
 /// Commands shown in the preview; the rest are counted.
 const SHOWN_COMMANDS: usize = 12;
+/// The most height the preview's commands take; past it they scroll. A
+/// long value (a PEM chain in `/certificate import`) wraps into many lines
+/// and pushed OK and Cancel out of the window.
+const COMMANDS_MAX_HEIGHT: f32 = 160.0;
 
 /// How a field is typed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -554,9 +558,14 @@ fn preview_body(
             .id_salt("list-modal-commands")
             .default_open(true)
             .show(ui, |ui| {
-                for line in steps.iter().take(SHOWN_COMMANDS) {
-                    ui.monospace(line);
-                }
+                egui::ScrollArea::vertical()
+                    .id_salt("list-modal-commands-scroll")
+                    .max_height(COMMANDS_MAX_HEIGHT)
+                    .show(ui, |ui| {
+                        for line in steps.iter().take(SHOWN_COMMANDS) {
+                            ui.monospace(line);
+                        }
+                    });
                 if steps.len() > SHOWN_COMMANDS {
                     ui.weak(format!("… {} {}", steps.len() - SHOWN_COMMANDS, tr(l, "more")));
                 }

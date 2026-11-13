@@ -13,6 +13,7 @@
 //!   addresses in its SAN for verified discovery, RFC 9462 §4.2), and the
 //!   input firewall from the LAN and from the Internet (`firewall_diag`).
 
+use corerouter_model::RoutingTable;
 use corerouter_model::dns_encrypted::{EncryptedService, EncryptedStatus, IDLE_SECS, MAX_SESSIONS};
 use serde_json::{Value, json};
 
@@ -246,7 +247,7 @@ fn firewall(s: &mut Session, cfg: &corerouter_model::Config, nets: &[ipnet::IpNe
             }
         }
     }
-    if let Some((wan, Some(dst))) = super::wireguard_preview::wan_of(cfg, INTERNET) {
+    if let Some((wan, Some(dst))) = super::wireguard_preview::wan_of(cfg, INTERNET, &RoutingTable::Main) {
         let packet = json!({"src": INTERNET, "dst": dst, "protocol": "tcp", "dst_port": port, "in_interface": wan.to_string()});
         if let Ok(v) = super::firewall_diag::test(s, &packet)
             && v.get("fate").and_then(Value::as_str) == Some("delivered")
