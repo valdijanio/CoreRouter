@@ -246,6 +246,24 @@ faltaram / pps. Três cortes por modo.
   (1 000 perguntas, um dump). Depois: CPU do daemon na remoção de 4 000: **43,3 s → 8,0 s**;
   2 000: 7,5 s → 1,8 s; 1 000: 2,0 s → 0,8 s (**medido**).
 
+### 4. O OSPF rodava em todos os endereços da interface (render do `proto-ospf`)
+
+- **Sintoma** (modo remoto, onde o `ether1` do roteador tem o endereço de gerência e o do enlace
+  OSPF): a adjacência com o gerador caía a cada ~1 s (`Full -> ExStart (SeqNumberMismatch)` no
+  log do `ospfd`), as rotas da LSDB não se instalavam (2 rotas com 10 000 LSAs) e 30 vizinhos
+  tinham quedas em 2 minutos.
+- **Causa:** um template casado por rede (`networks 10.0.1.0/30`) virava `ip ospf area 0.0.0.0`
+  na interface, e o `ospfd` liga o OSPF em **todos** os endereços dela: o 10.99.0.1/24 de gerência
+  também virou interface OSPF ponto a ponto no mesmo enlace (`show ip ospf interface`: duas), com
+  dois Hellos de origens diferentes para o mesmo vizinho, e a sub-rede de gerência anunciada sem
+  ninguém pedir. O RouterOS v7 casa `networks` por endereço.
+- **Correção:** quando o template casou por rede e a interface tem endereços IPv4 fora das redes
+  dele, o render usa a forma por endereço do FRR, `ip ospf area <área> <endereço>`, só para os de
+  dentro (`bind::Binding::addresses`); nos outros casos (a maioria) o texto não muda, nada é
+  reaplicado na atualização. Testes: `a_network_match_takes_only_the_addresses_inside` e
+  `a_second_address_outside_the_networks_stays_out`; no laboratório, a operação "segundo endereço
+  na porta" (tabela 4) e o modo remoto.
+
 ## Achados sem correção neste PR
 
 - **`ip.route.list` não mostra rotas do OSPF** (só conectadas, estáticas, DHCP e RA): virou a
@@ -256,6 +274,19 @@ faltaram / pps. Três cortes por modo.
   (busca linear nas interfaces da área, `ospfd/ospf_interface.c:426`, chamada por link da
   router-LSA no SPF e na instalação de rotas: `ospf_spf.c:832`, `ospf_route.c:691` e `:876`),
   `ospf_router_lsa_body_set` e o `libyang` do northbound. Gap G3.4q.
+- **Para a G3.4n (os leitores e o laço do FRR, anotados sem editar):**
+  - sob churn, `routing.ospf.route.list` fica de ~10 s a mais de 20 s atrás do `ospfd` (cache
+    `FRESH_SECS` = 10 s em `crates/engine/src/ospf_state.rs` + o tick de 2 s; tabela 2);
+  - com 204 003 rotas no `ospfd`, a lista mostra `total` 200 000: o leitor guarda no máximo
+    `MAX_ROUTES` = 200 000 (`crates/hal-frr/src/ospf.rs`) e a resposta não diz que cortou;
+  - a primeira resposta completa de `lsa.list` com 200 000 LSAs levou 16,1 s numa rodada e ~6 s
+    em outra (leitura sob demanda); numa rodada a lista de rotas respondeu `total 1` uma vez (não
+    se repetiu);
+  - com 200 000 LSAs, até os comandos pequenos (`neighbor.list`, 384 bytes) passam de 3 ms para
+    12–17 ms de p50 (tabela 5).
+- **Commit com a LSDB grande:** com 200 000 LSAs o comando de commit levou de 88 ms a 1,2 s; o
+  perfil do daemon no commit mostra só threads paradas: a espera é o `ospfd`, de uma thread,
+  ocupado com o SPF e as 200 000 rotas externas antes de responder ao vty.
 - **Sem proteção de LSDB:** o `ospfd` aceita qualquer número de LSAs (nenhum `max-lsa`); uma
   redistribuição errada num vizinho leva o roteador à falta de memória. Cisco (`max-lsa`) e Junos
   (`database-protection`) protegem. Gap G3.4r.
