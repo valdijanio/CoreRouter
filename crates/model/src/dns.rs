@@ -341,6 +341,12 @@ mod tests {
         assert_eq!(d.problem(), None);
         let back: Dns = serde_json::from_str("{}").unwrap();
         assert_eq!(back, d);
+        // G4.1w: 100 TCP sessions for a new config; one saved with
+        // RouterOS's 20 (every save writes the field) keeps it.
+        assert_eq!(d.max_concurrent_tcp_sessions, 100);
+        let saved: Dns = serde_json::from_str(r#"{"max_concurrent_tcp_sessions": 20}"#).unwrap();
+        assert_eq!(saved.max_concurrent_tcp_sessions, 20);
+        assert_eq!(saved.problem(), None);
     }
 
     #[test]

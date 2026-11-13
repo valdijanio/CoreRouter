@@ -687,8 +687,8 @@ fn follow(session: &Shared, srv: &Arc<Server>, port: u16, any: bool, health: &su
             if (evicted, refused) != tcp_told {
                 let max = last.as_ref().map_or(0, |c| c.ip.dns.max_concurrent_tcp_sessions);
                 log::warn!(
-                    "DNS: TCP 53 full: {} idle connections closed for new ones, {} new ones refused \
-                     since the last report ({} of {max} places taken now)",
+                    "DNS: TCP 53 full: idle connections closed for new ones: {}, new ones refused: {} \
+                     (since the last report; {} of {max} places taken now)",
                     evicted.saturating_sub(tcp_told.0),
                     refused.saturating_sub(tcp_told.1),
                     srv.tcp.open()
