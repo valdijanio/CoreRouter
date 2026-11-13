@@ -261,16 +261,35 @@ pub struct Resolved {
 
 /// Latency a server is assumed to have before it answered once (Unbound's
 /// `UNKNOWN_SERVER_NICENESS`): a known fast server goes first, an unknown
-/// one before a slow one.
+/// one before a slow one. Also its first retransmission timeout (G4.1u;
+/// Knot Resolver starts at 400 ms).
 const UNKNOWN_RTT_MS: u64 = 376;
+/// G4.1u: the shortest retransmission timeout (Unbound's `RTT_MIN_TIMEOUT`;
+/// RFC 6298 §2.4's 1 s is for TCP segments, not a 50-byte query)…
+pub const RTO_MIN_MS: u64 = 50;
+/// …and the longest kept (Unbound's `RTT_MAX_TIMEOUT`; RFC 6298 §2.5: at
+/// least 60 s). A query never waits more than `query_server_timeout`.
+pub const RTO_MAX_MS: u64 = 120_000;
+/// Timeouts in a row before a server counts as down (one lost datagram
+/// does not; Knot Resolver: 4). A definite failure (SERVFAIL, refused,
+/// unreachable) counts at once.
+const DOWN_AFTER_TIMEOUTS: u32 = 3;
 /// A server that failed goes last for this long (`fastest`).
 const DOWN_MS: u64 = 60_000;
 
 /// What the resolver knows of one server.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ServerStats {
-    /// Smoothed round-trip time (RFC 6298 style, 7/8 old + 1/8 new).
+    /// Smoothed round-trip time (RFC 6298 §2.3: 7/8 old + 1/8 new).
     pub srtt_ms: Option<u64>,
+    /// Its variation (RFC 6298 §2.3: 3/4 old + 1/4 new) (G4.1u).
+    pub rttvar_ms: u64,
+    /// Retransmission timeout: SRTT + 4·RTTVAR, doubled after a timeout
+    /// (RFC 6298 §2.2, §5.5), within [`RTO_MIN_MS`]..[`RTO_MAX_MS`]; 0:
+    /// never measured ([`UNKNOWN_RTT_MS`]) (G4.1u).
+    pub rto_ms: u64,
+    /// Timeouts since its last answer.
+    pub timeouts_in_row: u32,
     pub down_until_ms: u64,
     pub answers: u64,
     pub failures: u64,
@@ -531,7 +550,7 @@ impl Resolver {
     /// hands to [`Self::complete`]. Past `max_concurrent_queries` lookups
     /// in flight: [`ResolveError::Busy`].
     pub fn begin(&self, qn: &QName, rtype: RecordType, via: Option<&Upstreams>, now: u64) -> Begin {
-        let (settings, plain, secure) = {
+        let (settings, plain, secure, rtos) = {
             let mut st = self.state();
             if let Some(hit) = st.cache.get(&qn.key, rtype, now) {
                 return Begin::Now(Ok(Resolved {
@@ -568,7 +587,15 @@ impl Resolver {
                 None if !st.settings.secure.is_empty() => (Vec::new(), st.settings.secure.clone()),
                 None => (order(&st, now), Vec::new()),
             };
-            (st.settings.clone(), plain, secure)
+            // G4.1u: each server's retransmission timeout as it stands.
+            let rtos: Vec<(IpAddr, u64)> = plain
+                .iter()
+                .map(|ip| {
+                    let rto = st.stats.get(ip).map_or(0, |s| s.rto_ms);
+                    (*ip, if rto == 0 { UNKNOWN_RTT_MS } else { rto })
+                })
+                .collect();
+            (st.settings.clone(), plain, secure, rtos)
         };
         // G4.1o: one lookup per name, type and upstreams in flight; the
         // equal ones wait for its result (`resolver/flight.rs`). No second
@@ -598,7 +625,7 @@ impl Resolver {
                 None => unresolved.push(s),
             }
         }
-        Begin::Lead(Box::new(Lookup::new(
+        let mut lookup = Lookup::new(
             qn.clone(),
             rtype,
             via.cloned(),
@@ -606,7 +633,9 @@ impl Resolver {
             targets,
             unresolved,
             Some(lead),
-        )))
+        );
+        lookup.rtos = rtos;
+        Begin::Lead(Box::new(lookup))
     }
 
     /// Runs `lookup` to the end with blocking exchanges (the router's own
@@ -669,18 +698,46 @@ impl Resolver {
             s.truncated = s.truncated.saturating_add(u64::from(tr.truncated));
             match tr.outcome {
                 Outcome::Answered(ms) => {
-                    s.srtt_ms = Some(s.srtt_ms.map_or(ms, |old| (old * 7 + ms) / 8));
+                    // RFC 6298 §2.2 (first sample) and §2.3.
+                    match s.srtt_ms {
+                        None => {
+                            s.srtt_ms = Some(ms);
+                            s.rttvar_ms = ms / 2;
+                        }
+                        Some(old) => {
+                            s.rttvar_ms = (s.rttvar_ms * 3 + old.abs_diff(ms)) / 4;
+                            s.srtt_ms = Some((old * 7 + ms) / 8);
+                        }
+                    }
+                    let srtt = s.srtt_ms.unwrap_or(ms);
+                    s.rto_ms = srtt
+                        .saturating_add(s.rttvar_ms.saturating_mul(4))
+                        .clamp(RTO_MIN_MS, RTO_MAX_MS);
+                    s.timeouts_in_row = 0;
                     s.down_until_ms = 0;
                     s.answers = s.answers.saturating_add(1);
                     s.rtt.add_ms(ms);
                 }
+                Outcome::Timeout => {
+                    // RFC 6298 §5.5: back off. From the RTO this query
+                    // waited, not the current one: many queries timing out
+                    // together double it once (Unbound's `rtt_lost`).
+                    let now_rto = if s.rto_ms == 0 { UNKNOWN_RTT_MS } else { s.rto_ms };
+                    s.rto_ms = now_rto
+                        .max(tr.wait_ms.saturating_mul(2))
+                        .clamp(RTO_MIN_MS, RTO_MAX_MS);
+                    s.timeouts_in_row = s.timeouts_in_row.saturating_add(1);
+                    if s.timeouts_in_row >= DOWN_AFTER_TIMEOUTS {
+                        s.down_until_ms = now.saturating_add(DOWN_MS);
+                    }
+                    s.failures = s.failures.saturating_add(1);
+                    s.timeouts = s.timeouts.saturating_add(1);
+                }
                 failed => {
                     s.down_until_ms = now.saturating_add(DOWN_MS);
                     s.failures = s.failures.saturating_add(1);
-                    match failed {
-                        Outcome::Timeout => s.timeouts = s.timeouts.saturating_add(1),
-                        Outcome::ServFail => s.servfails = s.servfails.saturating_add(1),
-                        _ => {}
+                    if failed == Outcome::ServFail {
+                        s.servfails = s.servfails.saturating_add(1);
                     }
                 }
             }
@@ -947,6 +1004,8 @@ pub struct Tried {
     pub outcome: Outcome,
     /// Its UDP answer was truncated and it was asked again over TCP.
     pub truncated: bool,
+    /// How long the query was given (its RTO then, G4.1u).
+    pub wait_ms: u64,
 }
 
 /// How a server did.
@@ -960,12 +1019,13 @@ pub enum Outcome {
     Failed,
 }
 
-fn tried(ip: IpAddr, via: Via, outcome: Outcome, truncated: bool) -> Tried {
+fn tried(ip: IpAddr, via: Via, outcome: Outcome, truncated: bool, wait_ms: u64) -> Tried {
     Tried {
         ip,
         via,
         outcome,
         truncated,
+        wait_ms,
     }
 }
 
@@ -1187,9 +1247,12 @@ mod tests {
             first,
             vec![ip("192.0.2.1"), ip("192.0.2.2"), ip("192.0.2.3")]
         );
+        // G4.1u: the silent one gets its RTO (never measured: 376 ms), not
+        // the whole query_server_timeout.
         assert!(
-            t.now >= 2000,
-            "waited query_server_timeout on the silent one"
+            (376..1000).contains(&t.now),
+            "{} ms on the silent one",
+            t.now
         );
         t.log.clear();
         r.lookup(&mut t, "b.example").unwrap();
@@ -1205,7 +1268,7 @@ mod tests {
         let dns = Dns {
             servers: vec![ip("192.0.2.1"), ip("192.0.2.2"), ip("192.0.2.3")],
             query_server_timeout_ms: 2000,
-            query_total_timeout_ms: 3000,
+            query_total_timeout_ms: 1000,
             ..Dns::default()
         };
         let r = Resolver::new(Settings::new(&dns, &[]));
@@ -1213,12 +1276,10 @@ mod tests {
         let err = r.lookup(&mut t, "slow.example").unwrap_err();
         assert!(matches!(err, ResolveError::Failed { .. }), "{err}");
         assert!(err.to_string().contains("query_total_timeout"), "{err}");
-        assert!(t.now <= 3100, "{} ms", t.now);
-        assert_eq!(
-            t.log.len(),
-            2,
-            "third server never asked; no AAAA after a failed A"
-        );
+        assert!(t.now <= 1100, "{} ms", t.now);
+        // 376 ms each for the first two (G4.1u), the rest of the second
+        // for the third; no AAAA after a failed A.
+        assert_eq!(t.log.len(), 3);
     }
 
     #[test]

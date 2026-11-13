@@ -54,31 +54,88 @@ fn a_silent_server_times_out_on_tick_and_the_next_answers() {
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].server.ip(), ip("192.0.2.1"));
     assert_eq!(first[0].way, Way::Udp);
-    assert_eq!(l.wake_at(), Some(2000), "query_server_timeout");
-    // Nothing before the wait is over.
-    assert!(l.tick(1999).is_empty());
-    let second = l.tick(2000);
+    // G4.1u: never measured, so Unbound's 376 ms, not query_server_timeout.
+    assert_eq!(l.wake_at(), Some(376));
+    assert!(l.tick(375).is_empty());
+    let second = l.tick(376);
     assert_eq!(second.len(), 1);
     assert_eq!(second[0].server.ip(), ip("192.0.2.2"));
     assert_ne!(second[0].token, first[0].token);
-    // A reply for the first exchange now is too late: it moved on.
-    assert!(
-        l.reply(first[0].token, &answer(&first[0], [6, 6, 6, 6]), 2001)
-            .is_empty()
-    );
-    assert!(!l.done());
-    assert!(
-        l.reply(second[0].token, &answer(&second[0], [192, 0, 2, 80]), 2010)
-            .is_empty()
-    );
+    assert_eq!(second[0].wait_ms, 376);
+    assert!(l.reply(second[0].token, &answer(&second[0], [192, 0, 2, 80]), 386).is_empty());
     assert!(l.done());
-    let got = r.complete(*l, 2010).unwrap();
+    let got = r.complete(*l, 386).unwrap();
     assert_eq!(got.source, Source::Server(ip("192.0.2.2")));
     assert_eq!(got.answer.addresses(), vec![ip("192.0.2.80")]);
-    // The first server is counted as a timeout, the second answered in 10 ms.
     let stats: std::collections::BTreeMap<_, _> = r.server_stats().into_iter().collect();
-    assert_eq!(stats[&ip("192.0.2.1")].timeouts, 1);
-    assert_eq!(stats[&ip("192.0.2.2")].srtt_ms, Some(10));
+    let a = stats[&ip("192.0.2.1")];
+    assert_eq!(a.timeouts, 1);
+    assert_eq!(a.rto_ms, 752, "RFC 6298 §5.5: doubled");
+    assert_eq!(a.down_until_ms, 0, "one lost datagram is not down");
+    let b = stats[&ip("192.0.2.2")];
+    // RFC 6298 §2.2: SRTT = R, RTTVAR = R/2, RTO = SRTT + 4·RTTVAR (≥ 50).
+    assert_eq!((b.srtt_ms, b.rttvar_ms, b.rto_ms), (Some(10), 5, 50));
+}
+
+/// G4.1u: an answer to a query past its wait still counts (it was only
+/// slow); the lookup ends there.
+#[test]
+fn a_late_answer_to_an_expired_query_is_taken() {
+    let r = resolver(&["192.0.2.1", "192.0.2.2"], 10_000);
+    let mut l = lead(&r, "late.example");
+    let first = l.start(0).remove(0);
+    let second = l.tick(376).remove(0);
+    assert!(l.waiting().any(|t| t == first.token), "still listening");
+    assert!(l.reply(first.token, &answer(&first, [192, 0, 2, 1]), 500).is_empty());
+    assert!(l.done());
+    assert!(l.waiting().next().is_none());
+    let got = r.complete(*l, 500).unwrap();
+    assert_eq!(got.source, Source::Server(ip("192.0.2.1")));
+    let _ = second;
+}
+
+/// G4.1u: one server that loses datagrams is asked three times (RFC 9520
+/// §3.1: no more), at its RTO, twice that, then the whole
+/// query_server_timeout.
+#[test]
+fn three_tries_to_one_server_with_backoff_rfc9520() {
+    let r = resolver(&["192.0.2.1"], 10_000);
+    let mut l = lead(&r, "lossy.example");
+    let a = l.start(0).remove(0);
+    assert_eq!(a.wait_ms, 376);
+    let b = l.tick(376).remove(0);
+    assert_eq!(b.server, a.server);
+    assert_ne!(b.id, a.id, "a fresh id for each try");
+    assert_eq!(b.wait_ms, 752);
+    let c = l.tick(376 + 752).remove(0);
+    assert_eq!(c.wait_ms, 2000, "the last try waits it all");
+    assert!(l.tick(376 + 752 + 1999).is_empty());
+    assert!(!l.done());
+    assert!(l.tick(376 + 752 + 2000).is_empty());
+    assert!(l.done(), "no fourth query");
+    let err = r.complete(*l, 3128).unwrap_err();
+    assert!(matches!(err, ResolveError::Failed { .. }));
+    let s = r.server_stats()[0].1;
+    assert_eq!(s.timeouts, 3);
+    assert!(s.down_until_ms > 0, "three timeouts in a row: down");
+}
+
+/// G4.1u: the RTO comes from what the server measured.
+#[test]
+fn the_rto_follows_the_server() {
+    let r = resolver(&["192.0.2.1"], 10_000);
+    for i in 0..8u64 {
+        let mut l = lead(&r, &format!("n{i}.example"));
+        let x = l.start(i * 1000).remove(0);
+        l.reply(x.token, &answer(&x, [192, 0, 2, 1]), i * 1000 + 20);
+        r.complete(*l, i * 1000 + 20).unwrap();
+    }
+    let s = r.server_stats()[0].1;
+    assert_eq!(s.srtt_ms, Some(20));
+    assert!(s.rto_ms >= 50 && s.rto_ms < 100, "{}", s.rto_ms);
+    let mut l = lead(&r, "next.example");
+    let x = l.start(10_000).remove(0);
+    assert_eq!(x.wait_ms, s.rto_ms, "a server known to answer in 20 ms");
 }
 
 #[test]
@@ -135,7 +192,8 @@ fn servfail_moves_on_and_the_total_timeout_ends_it() {
         10,
     );
     assert_eq!(next[0].server.ip(), ip("192.0.2.2"));
-    // The second waits 2 s, the third only what is left of the 3 s.
+    // Looked at late (2010 ms): the second expired long ago (its RTO); the
+    // third, the last try, gets only what is left of the 3 s.
     let third = l.tick(2010);
     assert_eq!(third[0].server.ip(), ip("192.0.2.3"));
     assert_eq!(third[0].wait_ms, 990);

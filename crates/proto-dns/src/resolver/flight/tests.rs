@@ -119,7 +119,9 @@ fn ten_equal_lookups_make_one_query() {
 fn a_failure_is_shared_and_held_once() {
     let r = resolver();
     let (asked, out) = ask_together(&r, 8, &[("dead.example", RecordType::A)], true);
-    assert_eq!(asked, 1, "the followers do not ask again");
+    // One lookup: its three queries to the one server (RFC 9520 §3.1,
+    // G4.1u); the seven followers add none.
+    assert_eq!(asked, 3, "the followers do not ask again");
     for o in out {
         assert!(matches!(o, Err(ResolveError::Failed { .. })), "{o:?}");
     }
