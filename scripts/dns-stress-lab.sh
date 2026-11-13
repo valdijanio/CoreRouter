@@ -929,6 +929,8 @@ legit_bg() {
 		-O latency-histogram -O suppress=timeout,unexpected >"$OUT/raw/$1.txt" 2>&1 &
 	LEGIT_PID=$!
 }
+# cache_churn → "<evicted> <rejected>" so far (G4.1x; 0 before it).
+cache_churn() { cr ip.dns.statistics.print | jq -r '"\(.cache.evicted // 0) \(.cache.rejected // 0)"' 2>/dev/null || echo "0 0"; }
 legit_wait() { # <name> → sets DP to the legit client's numbers
 	wait "$LEGIT_PID" 2>/dev/null || true
 	DP=$(dp_parse "$OUT/raw/$1.txt")
@@ -944,9 +946,12 @@ test_torture() {
 	say "Nomes únicos *.wt.up.lab (o Knot responde todos), origem a 20 ms. Ao lado, um cliente legítimo"
 	say "pede os nomes quentes (cache) a 2000/s de outro endereço. Origem/s: consultas que o Knot recebeu."
 	say ""
-	say "| max_concurrent_queries | ataque (-Q) | $DP_HEAD | origem/s | threads (pico) | RSS pico MiB | legítimo p99 | legítimo máx. | legítimo SERVFAIL |"
-	say "|---|---|$DP_SEP|---|---|---|---|---|---|"
-	local mcq rate o0 o1 peak row
+	say "Despejadas / não admitidas: entradas do cache que saíram para dar lugar a outra, e respostas novas"
+	say "que o cache cheio recusou por serem menos pedidas que a que sairia (G4.1x, \`statistics.print\`)."
+	say ""
+	say "| max_concurrent_queries | ataque (-Q) | $DP_HEAD | origem/s | threads (pico) | RSS pico MiB | legítimo p99 | legítimo máx. | legítimo SERVFAIL | despejadas | não admitidas |"
+	say "|---|---|$DP_SEP|---|---|---|---|---|---|---|---|"
+	local mcq rate o0 o1 peak row c0 c1
 	for mcq in 100 1000; do
 		dns_set "{\"max_concurrent_queries\":$mcq}"
 		for rate in 1000 5000 20000 max; do
@@ -954,6 +959,7 @@ test_torture() {
 			local q=()
 			[ "$rate" != max ] && q=(-Q "$rate")
 			o0=$(origin_count)
+			c0=$(cache_churn)
 			samp_start
 			legit_bg "legit-$mcq-$rate" 2000
 			dp "torture-$mcq-$rate" "$W/u-wt" "$DUR" -c 8 -T 2 -q 5000 "${q[@]}"
@@ -961,7 +967,8 @@ test_torture() {
 			peak=$(samp_stop)
 			o1=$(origin_count)
 			legit_wait "legit-$mcq-$rate"
-			say "| $mcq | $rate | $row | $(((o1 - o0) / DUR)) | $(echo "$peak" | cut -d' ' -f1) | $(echo "$peak" | cut -d' ' -f2) | $(us "$(dpf 9)") | $(us "$(dpf 11)") | $(dpf 5) |"
+			c1=$(cache_churn)
+			say "| $mcq | $rate | $row | $(((o1 - o0) / DUR)) | $(echo "$peak" | cut -d' ' -f1) | $(echo "$peak" | cut -d' ' -f2) | $(us "$(dpf 9)") | $(us "$(dpf 11)") | $(dpf 5) | $(($(echo "$c1" | cut -d' ' -f1) - $(echo "$c0" | cut -d' ' -f1))) | $(($(echo "$c1" | cut -d' ' -f2) - $(echo "$c0" | cut -d' ' -f2))) |"
 		done
 	done
 	dns_set
