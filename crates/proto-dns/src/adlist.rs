@@ -718,7 +718,9 @@ mod tests {
     /// whatever the hash key of the set.
     #[test]
     fn the_index_finds_every_name_and_only_them() {
-        let names: Vec<String> = (0..5000).map(|i| format!("n{i}.l{}.example", i % 7)).collect();
+        let names: Vec<String> = (0..5000)
+            .map(|i| format!("n{i}.l{}.example", i % 7))
+            .collect();
         let set = NameSet::new(names.clone());
         let other = NameSet::new(names.clone());
         assert_eq!(set, other, "equal names, equal sets (the keys differ)");
@@ -735,7 +737,10 @@ mod tests {
         let one = NameSet::new(vec!["a.example".into(), String::new()]);
         assert!(one.has("a.example") && one.has("") && !one.has("b.example"));
         assert!(!NameSet::default().has(""));
-        assert_eq!(set.bytes() - set.arena.len() - 4 * 5000, 5 * set.slots.len());
+        assert_eq!(
+            set.bytes() - set.arena.len() - 4 * 5000,
+            5 * set.slots.len()
+        );
         assert_eq!(set.slots.len(), 7501, "1.5 slots per name");
     }
 
@@ -752,7 +757,9 @@ mod tests {
                 let all: Vec<_> = (0..threads)
                     .map(|_| s.spawn(|| lists.find(name).map(|l| l.id)))
                     .collect();
-                all.into_iter().map(|t| t.join().unwrap()).collect::<Vec<_>>()
+                all.into_iter()
+                    .map(|t| t.join().unwrap())
+                    .collect::<Vec<_>>()
             })
         };
         assert!(asked("ads.example").iter().all(Option::is_none));
