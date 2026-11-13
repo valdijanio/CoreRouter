@@ -1,4 +1,4 @@
-From 7ba2dfab1dceed2b70c87ce8c092d7d965cb5234 Mon Sep 17 00:00:00 2001
+From 1bed27b055baad5ad725b78f3d7a105f6c54352e Mon Sep 17 00:00:00 2001
 From: CoreRouter <noreply@corerouter>
 Date: Fri, 13 Nov 2026 14:14:48 -0300
 Subject: [PATCH 2/2] tests: ospfd max-lsa
@@ -11,8 +11,8 @@ no max-lsa.
  tests/topotests/ospf_max_lsa/__init__.py      |   0
  tests/topotests/ospf_max_lsa/r1/frr.conf      |  15 ++
  tests/topotests/ospf_max_lsa/r2/frr.conf      | 135 +++++++++++++
- .../ospf_max_lsa/test_ospf_max_lsa.py         | 190 ++++++++++++++++++
- 4 files changed, 340 insertions(+)
+ .../ospf_max_lsa/test_ospf_max_lsa.py         | 186 ++++++++++++++++++
+ 4 files changed, 336 insertions(+)
  create mode 100644 tests/topotests/ospf_max_lsa/__init__.py
  create mode 100644 tests/topotests/ospf_max_lsa/r1/frr.conf
  create mode 100644 tests/topotests/ospf_max_lsa/r2/frr.conf
@@ -185,10 +185,10 @@ index 0000000000..125ddead6d
 +exit
 diff --git a/tests/topotests/ospf_max_lsa/test_ospf_max_lsa.py b/tests/topotests/ospf_max_lsa/test_ospf_max_lsa.py
 new file mode 100644
-index 0000000000..8f9d559926
+index 0000000000..c0c2519982
 --- /dev/null
 +++ b/tests/topotests/ospf_max_lsa/test_ospf_max_lsa.py
-@@ -0,0 +1,190 @@
+@@ -0,0 +1,186 @@
 +#!/usr/bin/env python
 +# SPDX-License-Identifier: ISC
 +
@@ -248,11 +248,7 @@ index 0000000000..8f9d559926
 +
 +
 +def expect_full():
-+    expect_json(
-+        "r1",
-+        "show ip ospf neighbor json",
-+        {"neighbors": {"10.254.254.2": [{"nbrState": "Full/-"}]}},
-+    )
++    get_topogen().gears["r1"].expect_ospfv2_neighbor("10.254.254.2")
 +
 +
 +def redistribute(on):

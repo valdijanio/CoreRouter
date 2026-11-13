@@ -15,8 +15,14 @@ Conferido antes do envio:
 - `checkpatch` 0/0;
 - `git clang-format` (18) e `black` sem diferenças;
 - compila sem avisos na 10.7.1 e no `master`;
-- topotests na VM do laboratório: o `ospf_max_lsa` novo, `ospf_shutdown` e `ospf_topo1`, com e
-  sem o patch (resultado no corpo do PR do CoreRouter);
+- topotests na VM do laboratório (`scripts/frr-topotests.sh`, base `622c8322d2` sem e com o
+  patch, 13/11/2026):
+  - `ospf_shutdown` e `ospf_topo1` passam nos dois builds;
+  - o `ospf_max_lsa` novo falha sem o patch (o comando não existe);
+  - com o patch, passaram convergência, ignore e isolated; o passo do `clear` esperava `Full/-`
+    num enlace broadcast (falha do teste, não do `ospfd`) e agora usa `expect_ospfv2_neighbor`;
+  - **falta repetir a rodada inteira com o teste corrigido antes do envio** (a VM estava
+    reservada);
 - bateria no laboratório do host com 190 000 LSAs.
 
 ## Comandos (o usuário roda)
