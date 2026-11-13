@@ -201,6 +201,14 @@ pub struct Wireguard {
     /// `/interface wireguard peers` of this interface, in the order added.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<WgPeer>,
+    /// VRF the encrypted packets go by (RouterOS 7.21 `vrf`; `None` =
+    /// main), not the VRF of the tunnel interface itself (that is the
+    /// interface's own `vrf`). The kernel's socket cannot be bound to a
+    /// device (`drivers/net/wireguard/socket.c`): it is marked with the
+    /// VRF's routing mark and a rule sends that mark to the VRF's table
+    /// (G1.31c, `docs/wireguard.md`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vrf: Option<crate::IfName>,
 }
 
 impl Wireguard {
@@ -210,6 +218,7 @@ impl Wireguard {
             private_key: Sealed::default(),
             public_key: WgKey::default(),
             peers: Vec::new(),
+            vrf: None,
         }
     }
 

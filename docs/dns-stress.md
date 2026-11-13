@@ -144,11 +144,24 @@ Gaps G4.1u (prazo por servidor adaptativo e nova tentativa) e G4.1v (serve-stale
 
 ### TCP e DoT/DoH (`tcp`)
 
-- **TCP**: 4 conexões de um endereço, 30 mil/s; 16 conexões, **54 % perdidas**; 64, 91 %: um
-  endereço ocupa no máximo um quarto das 20 vagas (5). A RFC 9210 §4.5 fala em 25 por endereço.
-- **Slowloris**: 4 endereços × 5 conexões que mandam um byte e param (reabertas quando o roteador
-  fecha) ocupam as 20 vagas: **o cliente TCP legítimo teve 0–1 resposta em 108 tentativas** em 30 s
-  (antes e depois). O processo não sofre (40 descritores, 87 threads). Gap G4.1w.
+- **TCP** (G4.1w, **medido** na VM, 10 s cada): um endereço com 16 conexões perdia **54 %** e com
+  64, 91 % (um quarto das 20 vagas: 5). Depois, com as mesmas 20 vagas, 16 conexões perdem 0,8 %
+  (metade por endereço: 10); com o padrão novo de 100 (25 por endereço, RFC 9210 §4.5), 0,2 % e
+  51 mil/s. 64 conexões de um endereço passam do teto de 25 e o roteador fecha as que sobram: o
+  `dnsperf` não reabre e a janela trava (36 % perdidas com 100 vagas, 81 % com 20; antes 91 %).
+- **Slowloris** (4 endereços × N conexões que mandam um byte e param, reabertas quando o roteador
+  fecha; um cliente legítimo pergunta a cada 250 ms numa conexão nova):
+
+  | Vagas | Por endereço | Antes: respondidas | Depois (G4.1w) | Reaberturas em 30 s, depois | CPU do daemon, depois |
+  |---|---|---|---|---|---|
+  | 20 | 10 | 0 de 107 | **107 de 107** | 5 312 | 1,2 s em 30 s |
+  | 20 | 30 | 1 de 106 | **107 de 107** | 29 095 | 1,2 s |
+  | 100 | 10 | 107 de 107 (não enche) | 108 de 108 | 100 | 0,9 s |
+  | 100 | 30 | 0 de 107 | **107 de 107** | 6 119 | 1,0 s |
+
+  Cheio, a conexão nova toma a vaga da mais ociosa do endereço com mais vagas (`dns_server/slots.rs`).
+  As reaberturas são quase todas conexões recusadas no aceite (o endereço no teto), sem thread: o
+  daemon gasta 3–4 % de um núcleo. Pico de 169 threads e 220 descritores com 100 vagas.
 - **DoT de origem** (Unbound) a 5000/s: **antes** 26 607 SERVFAIL em 15 s, p99 492 ms e 930
   handshakes/s (com uma thread por miss, as consultas em voo passavam das 4 conexões guardadas);
   **depois** p99 0,77 ms e 22 handshakes/s.
@@ -309,7 +322,7 @@ ocioso e não termina; o teto é `max_concurrent_queries`.
 | Misses limitados a `max_concurrent_queries` / RTT; com 1000, mil threads | gap G4.1t |
 | 30 % de perda: 24 % respondidas; troca de servidor custa 2 s por nome novo | gap G4.1u |
 | Serve-stale só em 4,1 s (a RFC 8767 sugere 1,8 s) | gap G4.1v |
-| Slowloris de 4 endereços derruba o TCP (0–1 de 108); 16 conexões de um endereço perdem 54 % | gap G4.1w |
+| Slowloris de 4 endereços derruba o TCP (0–1 de 108); 16 conexões de um endereço perdem 54 % | **corrigido** (G4.1w): 107 de 107; 0,8 % |
 | Nomes únicos despejam os quentes: até 25 mil SERVFAIL em 15 s para o cliente legítimo | gap G4.1x |
 | `cache.print name=…` com 1 M de entradas para as consultas por 160 ms | gap G4.1y |
 | A adlist de 1 M custa 14 % no acerto de cache | não se repete (vm6: +2 %); o custo real era a busca binária com nomes intercalados e a disputa entre threads, corrigidos na G4.1z |

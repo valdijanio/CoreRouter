@@ -87,6 +87,7 @@ const IF_FIELDS: &[Field] = &[
     field("name", "Name", "wireguard.name", Input::Text("wireguard1 (empty: the first free)"), false),
     field("listen_port", "Listen Port", "wireguard.listen_port", Input::Text("13231 (empty: the first free)"), true),
     field("mtu", "MTU", "wireguard.mtu", Input::Text("1420"), true),
+    field("vrf", "VRF", "wireguard.vrf", Input::Choice, true),
     field("private_key", "Private Key", "wireguard.private_key", Input::Secret("empty: made on the router, or kept"), true),
     field("accept_firewall", "Accept in Firewall", "wireguard.accept_firewall", Input::Check, true),
     field("disabled", "Disabled", "wireguard.disabled", Input::Check, true),
@@ -131,11 +132,12 @@ const PEER_SPEC: Spec = Spec {
     preview: "interface.wireguard.peers.preview",
 };
 
-const IF_COLUMNS: [table::Column; 7] = [
+const IF_COLUMNS: [table::Column; 8] = [
     col("State").help("wireguard.state"),
     col("Name").help("wireguard.name"),
     num("Listen Port").help("wireguard.listen_port"),
     num("MTU").help("wireguard.mtu"),
+    col("VRF").help("wireguard.vrf"),
     col("Public Key").help("wireguard.public_key"),
     col("Peers").help("wireguard.peers"),
     comment(),
@@ -300,6 +302,16 @@ fn if_state(r: &Value) -> (&'static str, Kind) {
     }
 }
 
+/// The VRF of the encrypted packets: a chip coloured by its name, or
+/// `main` as plain text (G1.31c).
+fn vrf_cell(vrf: &str) -> String {
+    if vrf.is_empty() || vrf == "main" {
+        "main".to_owned()
+    } else {
+        cell("", &[(vrf, hashed(vrf))])
+    }
+}
+
 pub(crate) fn if_row(r: &Value) -> Row {
     let name = s(r, "name");
     let (state, kind) = if_state(r);
@@ -319,6 +331,7 @@ pub(crate) fn if_row(r: &Value) -> Row {
             cell("", &[(name.as_str(), hashed(&name))]),
             s(r, "listen_port"),
             s(r, "mtu"),
+            vrf_cell(&s(r, "vrf")),
             short_key(&s(r, "public_key")),
             peers_cell,
             s(r, "comment"),
@@ -405,6 +418,7 @@ fn if_values(r: &Value) -> BTreeMap<&'static str, String> {
         ("name", s(r, "name")),
         ("listen_port", s(r, "listen_port")),
         ("mtu", s(r, "mtu")),
+        ("vrf", s(r, "vrf")),
         ("private_key", String::new()),
         ("accept_firewall", "no".to_owned()),
         ("disabled", if yes(r, "disabled") { "yes" } else { "no" }.to_owned()),
@@ -441,7 +455,7 @@ fn add_params(r: &Value, peer: bool) -> Value {
     let keys: &[&str] = if peer {
         &["interface", "name", "public_key", "allowed_address", "endpoint_address", "endpoint_port", "persistent_keepalive", "responder", "disabled", "comment"]
     } else {
-        &["name", "listen_port", "mtu", "disabled", "comment"]
+        &["name", "listen_port", "mtu", "vrf", "disabled", "comment"]
     };
     let mut p = serde_json::Map::new();
     for k in keys {
@@ -1014,8 +1028,18 @@ impl PanelState for WireguardPanel {
     }
 
     fn dialogs(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
+        let app_vrfs: Vec<String> = app.cache.vrfs.iter().map(|r| s(r, "name")).collect();
         if let Some(m) = &mut self.if_modal
-            && !m.show(app, ctx, area, &IF_SPEC, &|_| Vec::new())
+            && !m.show(app, ctx, area, &IF_SPEC, &|p: &str| {
+                // G1.31c: the VRF the encrypted packets go by.
+                if p == "vrf" {
+                    std::iter::once("main".to_owned())
+                        .chain(app_vrfs.iter().cloned())
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            })
         {
             self.if_modal = None;
         }

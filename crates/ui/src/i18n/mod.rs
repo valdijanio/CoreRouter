@@ -373,7 +373,7 @@ mod tests {
 
     /// Glyphs the GUI's default fonts lack: they would show as boxes
     /// (found on the G1.26 screenshots).
-    const MISSING_GLYPHS: [char; 5] = ['→', '⚠', 'ⓘ', '▸', '▾'];
+    const MISSING_GLYPHS: [char; 7] = ['→', '⚠', 'ⓘ', '▸', '▾', '◀', '▶'];
 
     #[test]
     fn catalogs_use_only_glyphs_the_font_has() {

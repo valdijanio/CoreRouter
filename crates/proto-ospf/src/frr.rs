@@ -572,6 +572,28 @@ fn redistribution_maps(
     }
 }
 
+/// G3.4r: the ospfd line of an LSDB protection.
+pub fn max_lsa_line(m: &corerouter_model::ospf::MaxLsa) -> String {
+    use corerouter_model::ospf::MaxLsa;
+    let mut l = format!(" max-lsa {}", m.limit);
+    if m.threshold != MaxLsa::THRESHOLD {
+        let _ = write!(l, " threshold {}", m.threshold);
+    }
+    if m.warning_only {
+        l.push_str(" warning-only");
+    }
+    if m.ignore_time != MaxLsa::IGNORE_TIME {
+        let _ = write!(l, " ignore-time {}", m.ignore_time);
+    }
+    if m.ignore_count != MaxLsa::IGNORE_COUNT {
+        let _ = write!(l, " ignore-count {}", m.ignore_count);
+    }
+    if m.reset_time != MaxLsa::RESET_TIME {
+        let _ = write!(l, " reset-time {}", m.reset_time);
+    }
+    l
+}
+
 fn router(
     s: &mut String,
     cfg: &Config,
@@ -602,6 +624,11 @@ fn router(
     } else if inst.stub_router {
         // RFC 6987 §2.1: ospf6d clears the R-bit and V6-bit.
         let _ = writeln!(s, " stub-router administrative");
+    }
+    // G3.4r: LSDB protection (ospfd `max-lsa`, patched into the image), in
+    // the form `config_write_max_lsa` prints: defaults left out.
+    if let Some(m) = inst.max_lsa.as_ref().filter(|_| v2) {
+        let _ = writeln!(s, "{}", max_lsa_line(m));
     }
     for kind in kinds(inst, pools) {
         let mut l = format!(" redistribute {}", kind.name());
@@ -869,6 +896,41 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("max-metric"), "{text}");
+    }
+
+    /// G3.4r: the max-lsa line, as the patched ospfd prints it (defaults
+    /// left out); none for OSPFv3.
+    #[test]
+    fn renders_the_lsdb_protection() {
+        use corerouter_model::ospf::MaxLsa;
+        let mut cfg = sample();
+        let text = render(&cfg, &|s| Some(s.stored().to_owned())).unwrap();
+        assert!(!text.contains("max-lsa"), "{text}");
+        for i in cfg.routing.ospf.instances.values_mut() {
+            i.max_lsa = Some(MaxLsa::new(50_000));
+        }
+        let text = render(&cfg, &|s| Some(s.stored().to_owned())).unwrap();
+        assert!(
+            text.contains("router ospf\n ospf router-id 10.255.0.1\n max-lsa 50000\n"),
+            "{text}"
+        );
+        let m = MaxLsa {
+            threshold: 80,
+            warning_only: true,
+            ignore_time: 30,
+            ignore_count: 2,
+            reset_time: 60,
+            ..MaxLsa::new(10)
+        };
+        assert_eq!(
+            max_lsa_line(&m),
+            " max-lsa 10 threshold 80 warning-only ignore-time 30 ignore-count 2 reset-time 60"
+        );
+        for i in cfg.routing.ospf.instances.values_mut() {
+            i.version = Version::V3;
+        }
+        let text = render(&cfg, &|s| Some(s.stored().to_owned())).unwrap();
+        assert!(!text.contains("max-lsa"), "{text}");
     }
 
     /// G3.9fe: `redistribute=static` goes through `kernel` (the linux

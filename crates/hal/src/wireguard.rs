@@ -28,6 +28,9 @@ pub type Key = [u8; 32];
 pub struct WgDevice {
     pub private_key: Key,
     pub listen_port: u16,
+    /// Mark of the encrypted packets (`WGDEVICE_A_FWMARK`): the routing
+    /// mark of the VRF they go by (G1.31c), 0 = none (main table).
+    pub fwmark: u32,
     /// Enabled peers only, in config order.
     pub peers: Vec<WgPeerSpec>,
 }
@@ -49,6 +52,7 @@ impl fmt::Debug for WgDevice {
         f.debug_struct("WgDevice")
             .field("private_key", &"<hidden>")
             .field("listen_port", &self.listen_port)
+            .field("fwmark", &self.fwmark)
             .field("peers", &self.peers)
             .finish()
     }
@@ -177,6 +181,7 @@ mod tests {
         let dev = WgDevice {
             private_key: [7; 32],
             listen_port: 13231,
+            fwmark: 0,
             peers: vec![WgPeerSpec {
                 public_key: [1; 32],
                 preshared_key: [9; 32],

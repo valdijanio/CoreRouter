@@ -669,6 +669,7 @@ impl DnsPanel {
                 ("Static", WIN_STATIC),
                 ("Cache", WIN_CACHE),
                 ("Statistics", crate::dns_statistics::WIN),
+                ("Query Log", crate::dns_query_log::WIN),
             ] {
                 if ui.button(label).clicked() {
                     open_window(app, win);
@@ -835,7 +836,9 @@ impl DnsPanel {
         field(
             ui,
             "Max Concurrent TCP Sessions",
-            "",
+            "TCP 53 connections at once. One address holds at most 25 of them \
+             (or half, under 50). When all are taken, a new connection takes the place \
+             of the one idle the longest from the address holding the most.",
             &mut f.max_concurrent_tcp_sessions,
             80.0,
         );

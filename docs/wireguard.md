@@ -12,15 +12,17 @@ Partes:
 - **PR 3 (G1.31b):** config do cliente com QR, `wg-import`/`wg-export`, saúde "sem handshake",
   endpoint por nome DNS, assistente de firewall, MTU pela rota até o endpoint, Safe Mode na `wg`
   de gerência e a caixa "Create Routes" no modal do par, abaixo em "Extras".
+- **G1.31c:** a VRF dos pacotes cifrados (`vrf`, RouterOS 7.21), abaixo em "VRF do socket
+  cifrado".
 
 ## Comandos
 
 | Comando | O que faz |
 |---|---|
-| `interface.wireguard.add {name?, listen_port?, mtu?, private_key?, disabled?, comment?}` | Cria a interface. Nome padrão `wireguard1`, porta 13231 (ou a primeira livre acima), MTU 1420, chave privada gerada no roteador e selada. Devolve a chave pública. |
+| `interface.wireguard.add {name?, listen_port?, mtu?, private_key?, vrf?, disabled?, comment?}` | Cria a interface. Nome padrão `wireguard1`, porta 13231 (ou a primeira livre acima), MTU 1420, chave privada gerada no roteador e selada. Devolve a chave pública. |
 | `interface.wireguard.set {name, listen_port?, mtu?, private_key?, …}` | `private_key=auto` faz um par novo: todos os pares precisam da pública nova (aviso). |
 | `interface.wireguard.remove/enable/disable {name}` | `remove` leva os pares junto. |
-| `interface.wireguard.list {show_sensitive?}` | Porta, MTU, chave pública, `running`, pares e pares `up`, erro do último push. A privada só com `show_sensitive` (grupo `full`). |
+| `interface.wireguard.list {show_sensitive?}` | Porta, MTU, `vrf` dos pacotes cifrados, chave pública, `running`, pares e pares `up`, erro do último push. A privada só com `show_sensitive` (grupo `full`). |
 | `interface.wireguard.peers.add {interface, name?, public_key? \| private_key?, preshared_key?, endpoint_address?, endpoint_port?, allowed_address, persistent_keepalive?, responder?, …}` | Nome padrão `peerN`, único no roteador. `private_key=auto` gera o par de chaves do cliente (para a config do cliente, PR 3). `preshared_key=auto` gera a PSK. |
 | `interface.wireguard.peers.set {name, new_name?, …}` | Mesmos campos; `endpoint_address=""` volta a esperar o par. |
 | `interface.wireguard.peers.remove/enable/disable {name}` | |
@@ -95,6 +97,63 @@ do G0.24:
 - **Segredos:** `preshared_key` entrou em `SECRET_KEYS` (um PSK colado ia para o journal em claro
   desde o PR 1), e as linhas `PrivateKey`/`PresharedKey` de um texto `wg-quick` são mascaradas no
   journal, no log e na barra de status da GUI.
+
+## VRF do socket cifrado (G1.31c)
+
+`vrf` (RouterOS 7.21, padrão `main`) é a VRF por onde saem e chegam os pacotes **cifrados**: o
+UDP do túnel e os handshakes. Não é a VRF da interface `wg` (essa é o `vrf` da própria interface,
+em `ip.vrf`). O caso de uso é o túnel que fala com o par por uma segunda operadora numa VRF, com o
+tráfego de dentro do túnel na tabela principal.
+
+```sh
+corerouter-cli run ip.vrf.add '{"name":"wan2","interfaces":"ether2"}'
+corerouter-cli run ip.route.add '{"dst_address":"0.0.0.0/0","gateway":"198.51.100.1","routing_table":"wan2"}'
+corerouter-cli run interface.wireguard.add '{"name":"wg0","vrf":"wan2"}'
+corerouter-cli run routing.rule.kernel   # a regra 1xx: fwmark da wan2, iif lo, lookup da wan2
+```
+
+**Como funciona.** O socket do WireGuard no kernel não se prende a interface nenhuma
+(`drivers/net/wireguard/socket.c` do linux-6.18.59: `send4`/`send6` fazem
+`ip_route_output_flow` com `flowi4_mark = wg->fwmark` e sem `oif`; `udp_sock_create` sem
+`bind_ifindex`). Então um `commit` faz três coisas juntas:
+
+1. o `fwmark` do link é a marca de roteamento da VRF (`mark_value(Routing, "wan2")`, a mesma
+   que um `mark-routing=wan2` do mangle daria), enviado em `WGDEVICE_A_FWMARK` pelo push;
+2. uma regra `fwmark <marca>/0xffff0000 iif lo lookup <tabela da VRF>` entra na faixa das
+   marcas (prioridades 100–999, antes do `l3mdev` 1000) pelo mesmo `apply` que escreve as outras
+   regras (`hal::policy::expected_rules`). `iif lo`: só os pacotes do próprio roteador. Sem ele,
+   um pacote recebido que manteve a marca casaria a regra antes do `l3mdev` e voltaria pela VRF de
+   onde veio. Isso aparece num veth no mesmo namespace, que não limpa o `skb->mark`: no teste, o
+   pacote ficava em laço até o TTL. Se o mangle também usa o nome da VRF como marca, a regra é a
+   do mangle, sem `iif`;
+3. `net.ipv4.udp_l3mdev_accept=1`, enquanto houver uma `wg` habilitada com `vrf`. Um datagrama
+   que chega numa porta da VRF só chega a um socket sem `bind` com esse sysctl
+   (`inet_bound_dev_eq`, `include/net/inet_sock.h`; o mesmo vale para IPv6,
+   `udp_sk_bound_dev_eq`, `include/net/udp.h`). Sem ele: `UdpNoPorts` e ICMP port unreachable
+   (**medido** no laboratório). Volta ao valor anterior quando nenhuma `wg` tem `vrf`.
+
+Tirar o `vrf` (ou `main`), desativar ou remover a interface desfaz os três no mesmo commit, e o
+`config.rollback` também.
+
+**Cuidados.**
+
+- Com o `udp_l3mdev_accept` ligado, os serviços UDP do roteador que escutam em todos os
+  endereços (DNS, NTP…) também ouvem nas portas das VRFs. O `add`/`set` avisa; filtre-os no
+  `input`.
+- `ip.vrf.remove` recusa uma VRF que uma `wg` usa.
+- A prévia do modal procura a rota até cada endpoint na tabela da VRF. Avisa quando não há rota
+  e mostra o firewall `input` e o MTU pela porta da VRF.
+- O Safe Mode trata a troca de `vrf` do túnel por onde a sessão chega como corte.
+- `routing.rule.kernel` descreve a regra como "the encrypted packets of WireGuard wg0".
+- Uma marca de VRF que colide com outra marca de roteamento de nome diferente é recusada.
+
+**Testado** num kernel real (`crates/hal-linux/tests/netns_wireguard_vrf.rs`, namespace sem root,
+2,1 s), com duas VRFs ligadas por um veth, onde a tabela principal não alcança o outro lado:
+
+- `wgva` (vrf=vblue) fecha o handshake com `wgvb` (vrf=vred);
+- `wgvc`, igual mas sem `vrf`, não fecha;
+- com `vrf=vblue`, `wgvc` fecha;
+- sem os `vrf`, as regras saem e o sysctl volta.
 
 ## Validações (mais fortes que os avisos do RouterOS)
 
@@ -242,8 +301,8 @@ Os scripts ficaram fora do repositório (pasta de notas da sessão): `wg-host.sh
 
 **O que fica para depois** (gaps no `docs/changes/G1.31-motor.md`):
 
-- VRF do socket cifrado;
-- clamp de MSS;
+- VRF do socket cifrado (feito na G1.31c);
+- clamp de MSS (feito na G1.31d, `action=change-mss` do mangle);
 - fila na `wg`;
 - medição em VM;
 - PSK rotativa pós-quântica (Rosenpass).

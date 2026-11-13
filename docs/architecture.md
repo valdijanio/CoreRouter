@@ -353,6 +353,17 @@ backend.**
   (`proto-ospf` → `proto-bgp`, lateral permitido) com listas renomeadas `CR-O2-`/`CR-O3-`, porque
   o `ospfd` recusa as linhas BGP dos route-maps do `bgpd`. Índice de templates por nome: 4 000
   interfaces × 1 000 templates em 10,9 ms (era 145,7 ms, **medido**).
+- **Proteção da LSDB: patch no `ospfd`, não controle nosso (G3.4r, `docs/ospf.md`).** O FRR
+  não limita as LSAs. Duas opções foram comparadas no laboratório, com 192 721 externas de um
+  vizinho (**medido**):
+  - **controle nosso** (ler o `show ip ospf json` a cada 2 s e desligar a instância): chega
+    depois da enxurrada inteira, porque 175 436 LSAs entram no primeiro segundo. O pico fica
+    em 293 MiB no `ospfd` e 120 MiB no `zebra`, e a memória não volta depois.
+  - **o `max-lsa` dentro do `ospfd`** (`os/patches/frr/0007`, enviado ao FRR): para em 50 008
+    LSAs com limite de 50 000, com pico de 84 + 42 MiB.
+
+  Ficamos com o patch. A leitura, a janela, a saúde e a prévia continuam nossas, no mesmo
+  `show ip ospf json` que o serviço `frr` já lê.
 - **holo** (suíte de roteamento em Rust, modelo YANG) é o candidato a backend Rust-nativo do
   mesmo trait (G3.8) — sem mudar UI, comandos ou MCP.
 - FSMs próprias só para o **simulador** (sessões BGP/OSPF entre roteadores virtuais no lab, G3.7)
@@ -1176,7 +1187,28 @@ mesmo pool. **Medido** contra o Unbound 1.19.2 no laboratório: 0 SERVFAIL a 500
 0,6 ms, 16 handshakes/s. Multiplexar várias consultas por conexão fica para quando fizer falta
 (hoje cada consulta em andamento tem a sua thread e a sua conexão).
 
-Detalhes, regras de RFC e pesquisa: `docs/dns.md`.
+**Log de consultas (G4.1zd): formato binário próprio em Rust, sem SQLite nem texto.** Uma etapa
+`querylog` (só `after`, a última da cadeia) entrega cada consulta ao daemon. O daemon a põe num
+buffer por faixa de thread, como as estatísticas do G4.1h: ~70 ns por consulta, sem lock
+disputado, fila limitada que descarta e conta. Um escritor (`service/dns_log.rs`) grava blocos
+deflate com tabelas de nomes e clientes por bloco em `/config/dns-log/`.
+
+Comparados com a mesma carga (Zipf, 4096 clientes CGNAT; **medido** em `docs/dns-query-log.md`):
+
+| Formato | Bytes por consulta | Custo |
+|---|---|---|
+| texto no estilo Unbound | 85 (29 com deflate) | |
+| JSON do AdGuard | 183 (33) | |
+| nosso binário | 17 (12,3 com deflate) | ~200 ns por consulta para codificar e comprimir |
+
+- **Por que não SQLite (Pi-hole):** é C, tem custo de B-tree e WAL por inserção e não tem teto em
+  bytes.
+- **Por que não texto:** custa 2,3× o binário no disco, e o desgaste do SSD e o teto é que limitam
+  a retenção num provedor (21 GB/dia a 20 mil consultas/s).
+- **Rever se** a busca por cliente num período longo ficar lenta. Hoje ela decodifica 12 milhões
+  de consultas/s por núcleo, e com CGNAT um índice por cliente não pula blocos.
+
+Detalhes, regras de RFC e pesquisa: `docs/dns.md` e `docs/dns-query-log.md`.
 
 ### Supervisor de serviços do daemon (G0.10)
 
