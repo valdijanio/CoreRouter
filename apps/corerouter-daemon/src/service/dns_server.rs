@@ -218,6 +218,15 @@ impl Server {
         self.fwd.statistics().answered_in(us);
     }
 
+    /// G4.1zd: the query to the log (`ip.dns.log`), answered or dropped,
+    /// with the time since it was read. Off, the chain built no entry.
+    fn log(&self, read_at: Instant, entry: Option<Box<corerouter_proto_dns::querylog::Entry>>) {
+        let Some(mut e) = entry else { return };
+        let us = u32::try_from(read_at.elapsed().as_micros()).unwrap_or(u32::MAX);
+        e.at_ms = super::dns_log::unix_ms();
+        super::dns_log::sink().push(&e, us);
+    }
+
     fn alive(&self, epoch: u64) -> bool {
         !self.shutdown.is_closed() && self.epoch.load(Ordering::Acquire) == epoch
     }
@@ -254,7 +263,7 @@ impl Server {
         let done: corerouter_proto_dns::resolver::Waiter = Box::new(move |got| {
             let mut d = srv.fwd.resume(p, got, srv.dns.now_ms());
             srv.effects(&mut d);
-            reply.send(&srv, d.reply);
+            reply.send(&srv, d);
         });
         match begin {
             Begin::Now(got) => done(got),
@@ -277,19 +286,21 @@ enum Reply {
 }
 
 impl Reply {
-    fn send(self, srv: &Server, reply: Option<Vec<u8>>) {
+    fn send(self, srv: &Server, d: Done) {
         match self {
             Self::Udp { sock, to, local, read_at } => {
-                if let Some(r) = &reply {
+                if let Some(r) = &d.reply {
                     sock.send(r, to, local);
                     srv.answered(read_at);
                 }
+                // G4.1zd: the query log, as for a cache hit.
+                srv.log(read_at, d.log);
             }
             Self::Then(then, read_at) => {
-                if reply.is_some() {
+                if d.reply.is_some() {
                     srv.answered(read_at);
                 }
-                then(reply);
+                then(d.reply);
             }
         }
     }
@@ -342,6 +353,7 @@ fn udp_loop(srv: Arc<Server>, sock: Arc<Udp>, epoch: u64) {
                     sock.send(r, from, local);
                     srv.answered(read_at);
                 }
+                srv.log(read_at, d.log.take());
                 srv.effects(&mut d);
             }
             // RouterOS `max-concurrent-queries`: past it the resolver says
@@ -490,6 +502,7 @@ fn tcp_session(srv: &Arc<Server>, mut s: TcpStream, epoch: u64) {
         srv.effects(&mut done);
         let Some(reply) = done.reply else {
             // Refused by the limit or junk: the connection ends.
+            srv.log(read_at, done.log);
             return;
         };
         // An answer over 64 KiB cannot be framed: SERVFAIL, not silence.
@@ -507,9 +520,11 @@ fn tcp_session(srv: &Arc<Server>, mut s: TcpStream, epoch: u64) {
         let mut framed = len.to_be_bytes().to_vec();
         framed.extend(reply);
         if s.write_all(&framed).is_err() {
+            srv.log(read_at, done.log);
             return;
         }
         srv.answered(read_at);
+        srv.log(read_at, done.log);
     }
 }
 
@@ -1428,6 +1443,7 @@ mod tests {
                 .collect(),
             answered_by: "test",
             explain: Vec::new(),
+            log: None,
         };
         srv.effects(&mut d);
         let dropped = srv.effects_dropped.load(Ordering::Relaxed);

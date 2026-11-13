@@ -201,9 +201,37 @@ fn kernel_rules_of(cfg: &Config, r: &RoutingRule, pos: usize, out: &mut BTreeSet
     }
 }
 
-/// The routing marks the mangle sets, by name, each with its table when one
-/// has that name (the mark sends packets there, as in RouterOS v7).
-pub fn mangle_marks(cfg: &Config) -> BTreeMap<&Name, Option<RoutingTable>> {
+/// The routing marks the router sets, by name, each with its table when one
+/// has that name (the mark sends packets there, as in RouterOS v7): the
+/// mangle's `mark-routing`, and the encrypted packets of a WireGuard
+/// interface with a `vrf` (G1.31c: the kernel marks them with the VRF's
+/// routing mark, `wg->fwmark`, and routes them by it, `socket.c`).
+pub fn routing_marks(cfg: &Config) -> BTreeMap<Name, Option<RoutingTable>> {
+    let mangle = cfg
+        .ip
+        .firewall
+        .mangle
+        .iter()
+        .filter(|r| !r.disabled)
+        .filter_map(|r| match &r.action {
+            Action::MarkRouting {
+                new_routing_mark, ..
+            } => Some(new_routing_mark.clone()),
+            _ => None,
+        });
+    let sockets = wireguard_vrfs(cfg).filter_map(|(_, vrf)| vrf.as_str().parse::<Name>().ok());
+    mangle
+        .chain(sockets)
+        .map(|name| {
+            let table = name.as_str().parse::<RoutingTable>().ok();
+            let table = table.filter(|t| route::table_id(cfg, t).is_some());
+            (name, table)
+        })
+        .collect()
+}
+
+/// The routing marks of the mangle's `mark-routing` rules, by name.
+fn mangle_marks(cfg: &Config) -> BTreeSet<&Name> {
     cfg.ip
         .firewall
         .mangle
@@ -215,22 +243,48 @@ pub fn mangle_marks(cfg: &Config) -> BTreeMap<&Name, Option<RoutingTable>> {
             } => Some(new_routing_mark),
             _ => None,
         })
-        .map(|name| {
-            let table = name.as_str().parse::<RoutingTable>().ok();
-            let table = table.filter(|t| route::table_id(cfg, t).is_some());
-            (name, table)
-        })
         .collect()
+}
+
+/// The enabled WireGuard interfaces whose encrypted packets go by a VRF
+/// (`vrf`, RouterOS 7.21), with it.
+pub fn wireguard_vrfs(cfg: &Config) -> impl Iterator<Item = (&IfName, &IfName)> {
+    cfg.interfaces
+        .values()
+        .filter(|i| !i.disabled)
+        .filter_map(|i| match &i.kind {
+            InterfaceKind::Wireguard(w) => w.vrf.as_ref().map(|v| (&i.name, v)),
+            _ => None,
+        })
+}
+
+/// The packet mark WireGuard interface `w`'s encrypted packets carry
+/// (`WGDEVICE_A_FWMARK`): its VRF's routing mark, 0 without one.
+pub fn wireguard_fwmark(w: &corerouter_model::wireguard::Wireguard) -> u32 {
+    w.vrf
+        .as_ref()
+        .and_then(|v| v.as_str().parse::<Name>().ok())
+        .map_or(0, |n| mark_value(MarkKind::Routing, &n))
 }
 
 /// The rule list `cfg` asks of the kernel (without the kernel's own).
 pub fn expected_rules(cfg: &Config) -> BTreeSet<KernelRule> {
     let mut out = BTreeSet::new();
-    let marks = mangle_marks(cfg);
-    let with_table = marks.iter().filter_map(|(n, t)| Some((*n, t.as_ref()?)));
+    let marks = routing_marks(cfg);
+    let mangle = mangle_marks(cfg);
+    let with_table = marks.iter().filter_map(|(n, t)| Some((n, t.as_ref()?)));
     for (pref, (name, table)) in (FIRST_MARK_PREF..=LAST_MARK_PREF).zip(with_table) {
         let Some(table) = route::table_id(cfg, table) else {
             continue;
+        };
+        // G1.31c: a mark only WireGuard sets is for the router's own
+        // packets (`iif lo`): a received packet that kept it (a veth in the
+        // same namespace does not clear `skb->mark`) must still go by its
+        // own VRF (`l3mdev`, after this rule), never back out.
+        let iif = if mangle.contains(name) {
+            None
+        } else {
+            "lo".parse::<IfName>().ok()
         };
         for v6 in [false, true] {
             out.insert(KernelRule {
@@ -238,7 +292,7 @@ pub fn expected_rules(cfg: &Config) -> BTreeSet<KernelRule> {
                 v6,
                 src: None,
                 dst: None,
-                iif: None,
+                iif: iif.clone(),
                 mark: Some(mark_value(MarkKind::Routing, name)),
                 action: KernelRuleAction::Table(table),
                 suppress: None,
@@ -541,7 +595,7 @@ mod tests {
         );
         assert_eq!(got[0].action, KernelRuleAction::Table(1000));
         assert_eq!(
-            mangle_marks(&c).values().filter(|t| t.is_none()).count(),
+            routing_marks(&c).values().filter(|t| t.is_none()).count(),
             1,
             "a mark without table is kept apart"
         );

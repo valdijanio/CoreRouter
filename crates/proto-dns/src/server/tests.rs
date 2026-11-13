@@ -155,7 +155,8 @@ fn stages_are_in_order() {
             "zones",
             "cache",
             "upstream",
-            "statistics"
+            "statistics",
+            "querylog"
         ]
     );
 }

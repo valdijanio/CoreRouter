@@ -110,6 +110,34 @@ fn import_checks_the_pem_and_the_key() {
     assert_eq!(rows[0]["origin"], "imported");
 }
 
+/// A long command (a PEM chain wraps into dozens of lines) scrolls inside
+/// the preview: OK stays above the status bar. The certificate's length
+/// varies by a byte or two with its random key, and the import test above
+/// used to fail when the wrap gave the modal one or two more lines.
+#[test]
+fn a_long_chain_keeps_ok_on_screen() {
+    let mut h = open(lab());
+    let (cert, key) = corerouter_engine::x509::generate(&corerouter_engine::x509::NewCert {
+        common_name: "dns.example.net".into(),
+        subject_alt_names: vec!["DNS:dns.example.net".into()],
+        key_type: "ecdsa-p256".into(),
+        days_valid: 90,
+        now: 1_794_441_600,
+    })
+    .unwrap();
+    h.app.with_panel_as::<CertificatesPanel, _>(|p, app| {
+        p.modal = Some((crate::certificates::Which::Import, crate::list_modal::Modal::open(app, None, Default::default())));
+    });
+    refresh(&mut h);
+    set(&mut h, "name", "chain");
+    set(&mut h, "certificate", &[cert.as_str(); 4].join("\n"));
+    set(&mut h, "private_key", &key);
+    assert!(h.has_text_containing("/certificate import"), "the preview came back");
+    let ok = h.text("OK");
+    let bar = h.text("ready");
+    assert!(ok.y + 12.0 < bar.y, "OK at {ok:?}, the status bar at {bar:?}");
+}
+
 #[test]
 fn www_ssl_offers_the_certificates_with_a_key() {
     let mut s = lab();

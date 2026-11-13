@@ -8,7 +8,7 @@ use std::net::IpAddr;
 use corerouter_firewall::nft::{MarkKind, mark_value};
 use corerouter_hal::policy::{
     self, FIRST_MARK_PREF, KernelRuleAction, L3MDEV_PREF, LAST_MARK_PREF, MAIN_PREF, RulePacket,
-    RuleVerdict, VRF_UNREACH_PREF, expected_rules, mangle_marks, pos_of_pref,
+    RuleVerdict, VRF_UNREACH_PREF, expected_rules, pos_of_pref, routing_marks, wireguard_vrfs,
 };
 use corerouter_model::firewall::Name;
 use corerouter_model::policy_rule::{MAX_RULES, RoutingRule};
@@ -105,7 +105,7 @@ pub(crate) fn checks(cfg: &Config) -> Vec<Issue> {
             out.push(Issue::new(format!("routing.rules[{}].{field}", r.id), why));
         }
     }
-    let marks = mangle_marks(cfg);
+    let marks = routing_marks(cfg);
     let tabled = marks.values().filter(|t| t.is_some()).count();
     let room = (LAST_MARK_PREF - FIRST_MARK_PREF + 1) as usize;
     if tabled > room {
@@ -116,10 +116,20 @@ pub(crate) fn checks(cfg: &Config) -> Vec<Issue> {
     }
     // Different names, one kernel mark: a rule would take the other's
     // packets. The firewall's validator compares its own marks only.
-    let mut seen: BTreeMap<u32, &Name> = marks
-        .keys()
-        .map(|n| (mark_value(MarkKind::Routing, n), *n))
-        .collect();
+    let mut seen: BTreeMap<u32, &Name> = BTreeMap::new();
+    let socket_vrfs: Vec<&str> = wireguard_vrfs(cfg).map(|(_, v)| v.as_str()).collect();
+    for n in marks.keys() {
+        // A VRF a WireGuard socket names against a mangle mark (G1.31c;
+        // two mangle marks are the firewall validator's).
+        if let Some(other) = seen.insert(mark_value(MarkKind::Routing, n), n)
+            && (socket_vrfs.contains(&other.as_str()) || socket_vrfs.contains(&n.as_str()))
+        {
+            out.push(Issue::new(
+                "ip.firewall.mangle",
+                format!("mark names '{other}' and '{n}' map to the same kernel mark; rename one"),
+            ));
+        }
+    }
     for r in rules {
         let Some(name) = &r.routing_mark else {
             continue;
@@ -154,11 +164,24 @@ pub(crate) fn describe_pref(cfg: &Config, pref: u32) -> (Option<ItemId>, String)
         return (None, "the table of its VRF".to_owned());
     }
     if (FIRST_MARK_PREF..=LAST_MARK_PREF).contains(&pref) {
-        let name = mangle_marks(cfg)
+        let name = routing_marks(cfg)
             .into_iter()
             .filter(|(_, t)| t.is_some())
             .nth((pref - FIRST_MARK_PREF) as usize)
             .map_or_else(String::new, |(n, _)| n.as_str().to_owned());
+        let tunnels: Vec<&str> = wireguard_vrfs(cfg)
+            .filter(|(_, v)| v.as_str() == name)
+            .map(|(i, _)| i.as_str())
+            .collect();
+        if !tunnels.is_empty() {
+            return (
+                None,
+                format!(
+                    "routing mark '{name}': the encrypted packets of WireGuard {} (vrf={name})",
+                    tunnels.join(", ")
+                ),
+            );
+        }
         return (None, format!("routing mark '{name}' of the mangle"));
     }
     (None, format!("kernel rule {pref}"))

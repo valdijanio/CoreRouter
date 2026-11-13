@@ -79,7 +79,7 @@ corerouter-cli --connect 127.0.0.1:7979 run ip.dns.cache.flush
 | RFC 5452 §9.2: id aleatório e porta de origem aleatória por consulta | `message::query`, `bind(0)` |
 | RFC 6761 §6.3/§6.4: `localhost` é o loopback; `invalid` nunca existe; nenhum vai à rede | `special_use` |
 | RFC 6891 §6.2.5: EDNS(0) anuncia `max_udp_packet_size` | `message::query` |
-| RFC 7766 §5: resposta UDP truncada é refeita por TCP no mesmo servidor | `resolver::fetch` |
+| RFC 7766 §5: resposta UDP truncada é refeita por TCP no mesmo servidor | `resolver::Lookup::reply` |
 
 **Testes.** `proto-dns`: codec (exemplo da RFC 1035, CNAME, negativos, TTL enorme, respostas
 alheias, truncamento, proptest com bytes hostis e respostas danificadas), cache (expiração, teto,
@@ -1252,7 +1252,7 @@ origem por resposta. E cada miss criava uma thread nova e a destruía no fim.
 | Regra | Onde |
 |---|---|
 | RFC 5452 §5: várias consultas iguais pendentes facilitam a falsificação (ataque do aniversário); juntá-las é a defesa prática (Unbound: mesh; dnsmasq ≥ 2.83, CVE-2020-25686) | `resolver/flight.rs` |
-| RFC 9520 §3.2: a falha do líder vale para os seguidores e entra no cache de falhas uma vez | `Resolver::ask` |
+| RFC 9520 §3.2: a falha do líder vale para os seguidores e entra no cache de falhas uma vez | `Resolver::complete` |
 
 **Medido** (host, 4 CPUs, origem a 20 ms; `docs/dns-stress.md` tem os números da VM): o mesmo nome
 com TTL 0 a 2000/s, 1,00 → 0,02 consulta à origem por resposta; misses com a origem a 0 ms, 46,7
@@ -1260,3 +1260,48 @@ mil → ~122 mil/s sem SERVFAIL. Custo da junção: +0,24 µs por miss no `dns_f
 
 **Fica de fora** (gaps G4.1t em diante): os seguidores ainda ocupam uma vaga e uma thread cada; um
 laço de eventos no upstream resolveria as duas coisas.
+
+## G4.1t — laço de eventos no upstream
+
+**Antes.** Cada consulta em andamento ocupava uma thread bloqueada até a resposta (G4.1r: um
+worker reaproveitado, mas um por consulta). Os misses paravam em `max_concurrent_queries` / RTT
+(100 / 20 ms = 5 mil/s); com 1000, mil threads disputavam as CPUs; os seguidores da G4.1o também
+ocupavam uma vaga e uma thread cada (**medido**, `docs/dns-stress.md`).
+
+**Agora.**
+
+- `proto-dns/src/resolver/lookup.rs`: a busca é uma máquina de estados sem E/S (`Lookup`). Ela diz
+  o que mandar (`Exchange`: servidor, UDP/TCP/cifrado, id, prazo) e ouve o que voltou (`reply`),
+  o que falhou (`failed`) e que o tempo passou (`tick`). As regras (servidores em ordem,
+  `query_server_timeout`, `query_total_timeout`, TCP no truncamento da RFC 7766 §5, resposta que
+  não é desta consulta ignorada pela RFC 5452 §9.1) existem uma vez só, para os dois caminhos:
+  - `Resolver::begin` resolve sem rede: cache, falha guardada (RFC 9520), a busca igual em
+    andamento (G4.1o) ou uma busca nova para liderar; `Resolver::complete` guarda o resultado
+    (cache, estatísticas, falhas) e o entrega a quem esperava;
+  - `Resolver::resolve` continua bloqueante para as ferramentas do roteador (ping, NTP, DNS
+    Lookup) e para o TCP 53, por um `Transport`, uma troca de cada vez.
+- `max_concurrent_queries` passa a contar **buscas em andamento** (o mapa da G4.1o): acima disso,
+  SERVFAIL na hora ("busy"). Um seguidor não ocupa vaga nem thread: deixa um callback
+  (`Follow::then`) ou, no caminho bloqueante, espera. Seguidores com callback: no máximo
+  `MAX_WAITING` (16 384).
+- `service/dns_server/upstream.rs`: os laços "dns-upstream-N" (`mio`, tantos quantos leitores UDP
+  por família) carregam as buscas. Socket UDP conectado a um servidor, porta efêmera do kernel
+  (aleatória no Linux); cada socket leva no máximo 16 consultas e vive no máximo 2 s, então um
+  novo (outra porta) assume. Com várias consultas pendentes há várias portas em uso ao mesmo
+  tempo (RFC 5452 §9.2, MUST). O ICMP de porta fechada do servidor encerra na hora as consultas
+  daquele socket.
+- O que ainda bloqueia vai para as threads "dns-query" (`pool.rs`) e volta pela caixa do laço: o
+  TCP depois do truncamento e as buscas com servidor cifrado (DoT/DoH são fluxos TLS bloqueantes
+  aqui). O pool de conexões DoT/DoH guarda toda conexão devolvida (até 256 por servidor):
+  tantas quantas consultas estiveram em voo, em vez de 4.
+
+| Regra | Onde |
+|---|---|
+| RFC 5452 §9.2: porta e id imprevisíveis, várias portas ao mesmo tempo com várias consultas pendentes | `upstream.rs` (`USES`, `AGE`), `message::query` |
+| RFC 5452 §9.1: endereço, porta, id e pergunta conferidos; o resto é descartado | socket conectado, `Lookup::reply` |
+| RFC 7766 §5: resposta UDP truncada repetida por TCP no mesmo servidor | `Lookup::reply` |
+| RFC 7858 §3.4: conexões DoT/DoH reaproveitadas | `dns_secure.rs` (`KEEP`) |
+
+**Fica de fora:** DoT com várias consultas por conexão (RFC 7858 §3.3) e HTTP/2 com vários
+fluxos no laço, sem thread por consulta cifrada; o TCP 53 de entrada (G4.1w) ainda responde o
+miss na thread da conexão.

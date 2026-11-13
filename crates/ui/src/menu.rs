@@ -86,6 +86,7 @@ pub(crate) const CATALOG: &[Entry] = &[
     e("dns-encrypted", DNS, Some("Encrypted Service"), icons::LOCK_SIMPLE, "", &["ip.dns.encrypted-service"], &["dot", "dns over tls", "rfc 7858", "853", "private dns", "dns privado", "android", "ddr", "resolver.arpa", "tls", "dns cifrado", "encrypted dns", "doh server", "servidor dot"]),
     e("dns-forwarders", DNS, Some("Forwarders"), icons::ARROW_BEND_UP_RIGHT, "/ip dns forwarders", &["ip.dns.forwarders"], &["forward", "encaminhar", "conditional forwarding", "doh"]),
     e("dns-lookup", None, None, icons::MAGNIFYING_GLASS, "/tool dns-lookup", &["tool.dns", "ip.dns.resolve"], &["nslookup", "dig", "resolve", "host", "resolver nome"]),
+    e("dns-query-log", DNS, Some("Query Log"), icons::SCROLL, "/ip dns log", &["ip.dns.log"], &["query log", "log de consultas", "querylog", "pi-hole", "adguard", "who asked", "quem consultou", "marco civil", "lgpd", "dnstap"]),
     e("dns-static", DNS, Some("Static"), icons::PUSH_PIN, "/ip dns static", &["ip.dns.static"], &["hosts", "a record", "registro", "fwd", "cname", "estático"]),
     e("dns-statistics", DNS, Some("Statistics"), icons::CHART_BAR, "/ip dns statistics", &["ip.dns.statistics"], &["queries", "consultas", "top clients", "estatísticas"]),
     e("dns-tsig", DNS, Some("TSIG Keys"), icons::KEY, "/ip dns tsig-key", &["ip.dns.tsig-key"], &["tsig", "key", "chave", "rfc 8945"]),

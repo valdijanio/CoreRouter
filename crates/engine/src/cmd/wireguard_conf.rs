@@ -82,7 +82,7 @@ fn client_config(s: &mut Session, p: &Value) -> Result<Value> {
         parse_endpoint(&c.endpoint)
             .or_else(|| corerouter_model::wireguard::WgHost::parse(&c.endpoint).map(|h| (h, w.listen_port)))
     } else {
-        match wan_of(&cfg, INTERNET) {
+        match wan_of(&cfg, INTERNET, &super::wireguard_preview::underlay(w)) {
             Some((wan, Some(ip))) => {
                 if private(ip) {
                     warnings.push(format!(
