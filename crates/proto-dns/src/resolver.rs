@@ -33,8 +33,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 mod flight;
 mod lookup;
@@ -365,24 +364,45 @@ pub const FAILURE_MAX_HOLD_MS: u64 = 300_000;
 pub const MAX_FAILURES: usize = 4096;
 /// A piece of a cache listing (G4.1y): slots looked at, and entries
 /// copied, per hold of the lock. On a million entries a piece holds it
-/// ~61 µs scanning and ~29 µs copying (`benches/resolver.rs`, release,
-/// host, 2026-11-13, **medido**); the whole scan under the lock took
-/// 190 ms.
-pub const PRINT_SLOTS: usize = 4096;
+/// ~30 µs scanning and ~29 µs copying on the host (`benches/resolver.rs`,
+/// release, 2026-11-13, **medido**), ~0,25 ms scanning in the lab VM
+/// (**estimado** from the whole listing); the whole scan under the lock
+/// took 190 ms on the host.
+pub const PRINT_SLOTS: usize = 2048;
 pub const PRINT_COPIES: usize = 256;
-/// At most this many yields between two pieces while lookups wait.
-const PRINT_YIELDS: u32 = 256;
+
+/// The lookups' share of the lock during a cache listing (G4.1y): after
+/// each piece the listing sleeps as long as the piece held the lock, so
+/// lookups have it at least half the time. Letting it go between pieces
+/// was not enough: a forwarder thread answers one query at a time, each
+/// waited for a piece, and the queue grew for the whole listing (p99,9 of
+/// the load beside 84 ms of a 130 ms listing in the lab VM, with yields
+/// or with a fair hand-off alike).
+struct Turn {
+    #[cfg(not(target_arch = "wasm32"))]
+    started: std::time::Instant,
+}
+
+impl Turn {
+    fn start() -> Self {
+        Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// No clock and no threads to share with in wasm builds.
+    fn pause(self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::sleep(self.started.elapsed());
+    }
+}
 
 /// Resolver shared by every thread of the router (tools, NTP, the LAN
 /// forwarder).
 #[derive(Debug, Default)]
 pub struct Resolver {
     state: Mutex<State>,
-    /// Threads waiting for `state` (G4.1y): a cache listing lets them in
-    /// between its pieces. The std mutex is not fair: the listing, taking
-    /// it again right after letting it go, kept the woken lookups out for
-    /// the whole listing (31 ms of 31 ms on a million entries, host).
-    waiting: AtomicUsize,
     /// G4.1o: lookups in flight.
     flights: Arc<Flights>,
 }
@@ -399,26 +419,13 @@ impl Resolver {
                 stats: BTreeMap::new(),
                 failures: HashMap::new(),
             }),
-            waiting: AtomicUsize::new(0),
             flights: Arc::default(),
         }
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
-        // Free: no counting (the common case pays nothing more).
-        match self.state.try_lock() {
-            Ok(st) => return st,
-            Err(std::sync::TryLockError::Poisoned(p)) => return p.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {}
-        }
-        self.waiting.fetch_add(1, Ordering::Relaxed);
         // A panic elsewhere never makes the resolver unusable.
-        let st = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.waiting.fetch_sub(1, Ordering::Relaxed);
-        st
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// New settings (config change or a DHCP lease). The cache stays,
@@ -466,18 +473,17 @@ impl Resolver {
                 break;
             }
             let room = limit.min(copies.len().saturating_add(PRINT_COPIES));
-            from = self
-                .state()
+            // Grown before the lock: doubling 100 000 copies moved ~8 MB
+            // under it (1,5 ms of p99,9 beside a `limit=100000`, host).
+            copies.reserve(room.saturating_sub(copies.len()));
+            let st = self.state();
+            // The time holding the lock, not the time waiting for it.
+            let turn = Turn::start();
+            from = st
                 .cache
                 .copy_matching(&filter, f, PRINT_SLOTS, room, &mut copies);
-            // The lookups waiting for the lock go first (a bounded wait:
-            // a waiter the scheduler does not run never stalls the
-            // listing for long).
-            let mut turns = 0;
-            while self.waiting.load(Ordering::Relaxed) > 0 && turns < PRINT_YIELDS {
-                std::thread::yield_now();
-                turns += 1;
-            }
+            drop(st);
+            turn.pause();
         }
         crate::cache::rows_of(&copies, now_ms)
     }
