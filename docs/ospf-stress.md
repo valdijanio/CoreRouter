@@ -242,6 +242,27 @@ faltaram / pps. Três cortes por modo.
   espera o `ospfd` (aviso do BFD, SPF, instalação), como a G3.4k já mediu; o ganho real é a G3.4k
   (reserva pré-programado no plano de dados).
 
+### 8. Proteção da LSDB (G3.4r)
+
+`--tests maxlsa` (fora do padrão, só DUT local). A instância recebe `max_lsa` (`--maxlsa-limit`,
+50 000), com ignore-time de 30 s e ignore-count de 1. O gerador inunda `--maxlsa-load` externas
+(200 000). A tabela diz:
+
+- em quanto tempo a instância cai e o pico de LSAs amostrado;
+- os picos de memória de `ospfd`, `zebra` e daemon;
+- o que `routing.ospf.instance.list` e a saúde `ospf.lsdb` dizem;
+- quando ela fica isolada (depois da volta do ignore);
+- em quanto tempo o `routing.ospf.instance.clear-lsdb-protection` traz o Full de volta, com o
+  gerador sem a enxurrada.
+
+Passa se cair, isolar e voltar, sem OOM e sem processo morto.
+
+Sem root, os mesmos passos no `ospfd` com o patch, direto pelo `vtysh`:
+`scripts/frr-ospf-max-lsa.sh`. Ele roda com
+`unshare --user --map-root-user --mount --net --pid --fork --mount-proc`; o cabeçalho do script
+diz como montar a raiz com o FRR compilado. Os números estão em
+`docs/ospf.md`, "Proteção da LSDB".
+
 ### Modo remoto (auto-teste contra um segundo namespace)
 
 `--selftest-remote`: o roteador em outro namespace, com TLS em 10.99.0.1 e o gerador do outro lado

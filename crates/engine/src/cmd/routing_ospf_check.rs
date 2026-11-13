@@ -16,7 +16,7 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "routing.ospf.instance.check", "Check OSPF Instance", [], None,
-        "{id?: string (the instance being edited), name?: string, version?: u8 | string, vrf?: string, router_id?: string | null, redistribute?: [string] | string, out_filter_chain?: string | null, originate_default?: string, subscriber_pools?: bool | yes | no, stub_router?: bool | yes | no, stub_router_on_startup?: u32 | string | null, disabled?: bool | yes | no, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk}",
+        "{id?: string (the instance being edited), name?: string, version?: u8 | string, vrf?: string, router_id?: string | null, redistribute?: [string] | string, out_filter_chain?: string | null, originate_default?: string, subscriber_pools?: bool | yes | no, stub_router?: bool | yes | no, stub_router_on_startup?: u32 | string | null, max_lsa?: u32 | string | null, max_lsa_threshold?: u8 | string | null, max_lsa_warning_only?: bool | yes | no, max_lsa_ignore_time?: u32 | string | null, max_lsa_ignore_count?: u32 | string | null, max_lsa_reset_time?: u32 | string | null, disabled?: bool | yes | no, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk}",
         always, instance_check),
     cmd!(query "routing.ospf.area.check", "Check OSPF Area", [], None,
         "{id?: string (the area being edited), name?: string, instance?: string, area_id?: string, type?: string, no_summaries?: bool | yes | no, default_cost?: u32 | string | null, nssa_translate?: string, disabled?: bool | yes | no, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk}",
@@ -59,7 +59,7 @@ fn normalize(raw: &Value, editing: bool) -> Value {
         }
         for (k, v) in o.iter_mut() {
             if let Value::String(t) = v
-                && matches!(k.as_str(), "disabled" | "no_summaries" | "subscriber_pools" | "stub_router" | "advertise")
+                && matches!(k.as_str(), "disabled" | "no_summaries" | "subscriber_pools" | "stub_router" | "advertise" | "max_lsa_warning_only")
             {
                 *v = Value::Bool(t == "yes" || t == "true");
             }
@@ -102,6 +102,7 @@ fn preview(s: &mut Session, raw: &Value, what: What) -> Result<Value> {
         }
     }
     let binds = corerouter_proto_ospf::bind::bindings(&cfg);
+    let mut lsdb_risk: Option<String> = None;
     match what {
         What::Instance => {
             let n = binds.iter().filter(|b| b.instance.name == name).count();
@@ -115,6 +116,7 @@ fn preview(s: &mut Session, raw: &Value, what: What) -> Result<Value> {
                     computed.push(json!({"label": "Pools announced", "value": if p.is_empty() { "none".to_owned() } else { p.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ") }}));
                 }
                 stub_router_checks(s, &cfg, i, &binds, &mut computed, &mut checks);
+                lsdb_checks(s, &cfg, i, &mut computed, &mut checks, &mut lsdb_risk);
             }
         }
         What::Area => {
@@ -131,14 +133,16 @@ fn preview(s: &mut Session, raw: &Value, what: What) -> Result<Value> {
     for c in changes.iter().filter(|c| !c.drops) {
         checks.push(check("info", c.what, c.message.clone(), ""));
     }
-    let risk = (!dropping.is_empty()).then(|| {
-        let msgs: Vec<&str> = changes.iter().filter(|c| c.drops).map(|c| c.message.as_str()).take(6).collect();
-        format!(
-            "the OSPF adjacencies on {} go down: {}. Use Safe Mode to roll back on its own if this cuts the session",
-            dropping.join(", "),
-            msgs.join("; ")
-        )
-    });
+    let risk = (!dropping.is_empty())
+        .then(|| {
+            let msgs: Vec<&str> = changes.iter().filter(|c| c.drops).map(|c| c.message.as_str()).take(6).collect();
+            format!(
+                "the OSPF adjacencies on {} go down: {}. Use Safe Mode to roll back on its own if this cuts the session",
+                dropping.join(", "),
+                msgs.join("; ")
+            )
+        })
+        .or(lsdb_risk);
     let ok = !checks.iter().any(|c| c.get("level").and_then(Value::as_str) == Some("error"));
     let (add, set) = what.commands();
     let mut params = p;
@@ -206,6 +210,94 @@ fn stub_router_checks(
         && !old.disabled
     {
         checks.push(check("info", "on-startup", format!("the instance already runs: the {t} s apply at its next start (reboot, FRR restart or disable/enable), not now; use stub_router to drain now"), "stub_router_on_startup"));
+    }
+}
+
+/// Routes past which a redistribution is worth a warning: Cisco IOS XE's
+/// `redistribute maximum-prefix` default (10 240, FN74009).
+const BIG_REDISTRIBUTION: u64 = 10_240;
+
+/// G3.4r: what the LSDB protection of instance `i` does with the database
+/// as it is now, and (extra) the redistributions that grow every
+/// database of the domain. A limit below the LSAs of other routers now
+/// takes the instance down as the commit applies: that is a `risk`.
+fn lsdb_checks(
+    s: &Session,
+    cfg: &Config,
+    i: &corerouter_model::ospf::OspfInstance,
+    computed: &mut Vec<Value>,
+    checks: &mut Vec<Value>,
+    risk: &mut Option<String>,
+) {
+    use corerouter_model::ospf::{Redistribute, Version};
+    use corerouter_model::ospf_state::lsdb_memory_bytes;
+    let mib = |n: u64| lsdb_memory_bytes(n).div_ceil(1 << 20);
+    let (live, _) = s.ospf_stub_live();
+    let now = live.iter().find(|st| st.instance == i.name);
+    let others = now.and_then(|st| st.lsas_other);
+    if let Some(m) = &i.max_lsa {
+        computed.push(json!({"label": "LSDB protection", "value": if m.warning_only {
+            format!("warns at {} and past {} LSAs; never goes down", m.warn_at(), m.limit)
+        } else {
+            format!("warns at {}; past {} down {} s, isolated after {}", m.warn_at(), m.limit, m.ignore_time, m.ignore_count)
+        }}));
+        computed.push(json!({"label": "Memory at the limit", "value": format!("~{} MiB in ospfd + zebra (estimated)", mib(u64::from(m.limit)))}));
+        let down = now.and_then(|st| st.max_lsa.as_ref()).filter(|p| p.down());
+        if let Some(p) = down {
+            let left = p.ignore_remaining_secs.map(|t| format!(", back in {t} s")).unwrap_or_default();
+            checks.push(check("warning", "max-lsa", format!("the instance is down by its LSDB protection ({}{left}): editing does not bring it back; Clear LSDB Protection does, once the flood is fixed", p.state), "max_lsa"));
+        }
+        if now.is_some_and(|st| st.lsas.is_some() && st.lsas_other.is_none()) {
+            checks.push(check("warning", "ospfd", "this ospfd has no max-lsa (FRR without the CoreRouter patch, os/patches/frr): the commit will be refused".into(), "max_lsa"));
+        }
+        // Down, the database is empty: its count says nothing.
+        if let Some(n) = others.filter(|_| down.is_none()) {
+            let limit = u64::from(m.limit);
+            if n > limit && !m.warning_only {
+                *risk = Some(format!("the limit {limit} is below the {n} LSAs of other routers now: the instance goes down (every adjacency) as soon as the commit applies, for {} s at a time. Use Safe Mode to roll back on its own if this cuts the session", m.ignore_time));
+            } else if n > limit {
+                checks.push(check("warning", "max-lsa", format!("the limit {limit} is below the {n} LSAs of other routers now: it warns at once (warning-only)"), "max_lsa"));
+            } else if n.saturating_mul(6) > limit.saturating_mul(5) {
+                checks.push(check("warning", "max-lsa", format!("the limit {limit} leaves little room over the {n} LSAs of other routers now (less than 20 %): normal growth takes the instance down; leave room, and the same limit on every router makes them all go down together"), "max_lsa"));
+            } else {
+                checks.push(check("ok", "max-lsa", format!("{n} LSAs of other routers now, {} % of the limit", n.saturating_mul(100) / limit.max(1)), "max_lsa"));
+            }
+        }
+    } else if let Some(n) = others.or(now.and_then(|st| st.lsas)) {
+        computed.push(json!({"label": "LSDB", "value": format!("{n} LSAs, ~{} MiB in ospfd + zebra (estimated); no limit", mib(n))}));
+    }
+    if i.version != Version::V2 || i.disabled {
+        return;
+    }
+    // Extra: the redistributions this edit turns on, and how many routes
+    // each would bring in as type-5 LSAs (a copy in every router).
+    let before = s.store().running().routing.ospf.instances.get(&i.name);
+    let vrf_main = i.vrf == corerouter_model::ospf::MAIN_VRF;
+    for kind in &i.redistribute {
+        if before.is_some_and(|b| b.redistribute.contains(kind) && b.out_filter_chain == i.out_filter_chain) {
+            continue;
+        }
+        let routes = match kind {
+            Redistribute::Bgp => s.routing_status().map(|st| {
+                st.bgp_sessions
+                    .iter()
+                    .filter(|b| b.established && (b.vrf == i.vrf || (vrf_main && b.vrf.is_empty())))
+                    .filter_map(|b| b.prefix_count)
+                    .fold(0u64, u64::saturating_add)
+            }),
+            // The linux backend's static routes reach zebra as kernel routes.
+            Redistribute::Static | Redistribute::Kernel => Some(cfg.ip.routes.iter().filter(|r| !r.disabled).count() as u64),
+            _ => None,
+        };
+        let Some(n) = routes.filter(|n| *n >= BIG_REDISTRIBUTION) else { continue };
+        let (level, tail) = match &i.out_filter_chain {
+            Some(c) => ("info", format!(" before the out_filter_chain {c}")),
+            None => ("warning", "; filter them with out_filter_chain, or summarize".to_owned()),
+        };
+        checks.push(check(level, "redistribute", format!(
+            "redistribute {} brings up to {n} routes into OSPF as type-5 LSAs{tail}: every router of the domain keeps a copy (~{} MiB in ospfd + zebra each, estimated)",
+            kind.name(), mib(n)
+        ), "redistribute"));
     }
 }
 
@@ -313,5 +405,95 @@ mod tests {
         assert!(c.to_string().contains("errata 4685"), "{c}");
         let c = s.execute("routing.ospf.instance.check", &json!({"id": "v2", "stub_router_on_startup": "2"})).unwrap();
         assert_eq!(c["checks"][0]["param"], "stub_router_on_startup", "{c}");
+    }
+
+    /// A routing daemon that takes every commit and counts the clears.
+    #[derive(Clone, Default)]
+    struct Daemon {
+        cleared: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl corerouter_hal::routing::RoutingDaemon for Daemon {
+        fn describe(&self) -> String {
+            "test".into()
+        }
+        fn apply(&mut self, _: &corerouter_model::Config, _: &corerouter_model::Config) -> Result<(), corerouter_hal::HalError> {
+            Ok(())
+        }
+        fn reader(&self) -> Box<dyn corerouter_hal::routing::RoutingReader> {
+            Box::new(self.clone())
+        }
+        fn ospf_max_lsa_clear(&mut self, instance: &str, vrf: &str) -> Result<(), corerouter_hal::HalError> {
+            self.cleared.lock().unwrap().push(format!("{instance}@{vrf}"));
+            Ok(())
+        }
+    }
+
+    impl corerouter_hal::routing::RoutingReader for Daemon {
+        fn bgp_sessions(&mut self, _: &corerouter_model::Config) -> Result<Vec<corerouter_model::routing_state::BgpSession>, corerouter_hal::HalError> {
+            Ok(Vec::new())
+        }
+        fn version(&mut self) -> Result<String, corerouter_hal::HalError> {
+            Ok("test".into())
+        }
+    }
+
+    /// G3.4r: the LSDB protection's preview against the database as the
+    /// daemon reads it (a limit under the count is a risk, one with little
+    /// room a warning), an ospfd without the patch, the big
+    /// redistribution (extra), and the clear through the daemon.
+    #[test]
+    fn lsdb_protection_preview_and_clear() {
+        use corerouter_model::ospf_state::{MaxLsaState, OspfStubState};
+        use corerouter_model::routing_state::{BgpSession, RoutingStatus};
+        let mut s = Session::new(Box::new(VirtualHal::default()));
+        let d = Daemon::default();
+        let _ = s.attach_routing(Box::new(d.clone()));
+        s.execute("routing.ospf.instance.add", &json!({"name": "v2", "router_id": "10.0.0.1"})).unwrap();
+        let status = |others: Option<u64>, max_lsa: Option<MaxLsaState>| RoutingStatus {
+            backend: "frr test".into(),
+            bgp_sessions: vec![BgpSession { instance: "default".into(), vrf: "main".into(), established: true, prefix_count: Some(900_000), ..Default::default() }],
+            ospf_stub: vec![OspfStubState { instance: "v2".into(), lsas: Some(41_300), lsas_other: others, max_lsa, ..Default::default() }],
+            ..Default::default()
+        };
+        s.set_routing_status(status(Some(41_200), None));
+        // No limit: the size, estimated.
+        let c = s.execute("routing.ospf.instance.check", &json!({"id": "v2", "comment": "x"})).unwrap();
+        assert!(c.to_string().contains("41200 LSAs, ~85 MiB"), "{c}");
+        // Below the count: the instance goes down as the commit applies.
+        let c = s.execute("routing.ospf.instance.check", &json!({"id": "v2", "max_lsa": "10000"})).unwrap();
+        assert!(c["risk"].as_str().unwrap().contains("below the 41200 LSAs"), "{c}");
+        assert!(c.to_string().contains("~21 MiB in ospfd + zebra"), "{c}");
+        // warning-only: a warning, no risk.
+        let c = s.execute("routing.ospf.instance.check", &json!({"id": "v2", "max_lsa": "10000", "max_lsa_warning_only": "yes"})).unwrap();
+        assert!(c["risk"].is_null() && c.to_string().contains("it warns at once"), "{c}");
+        // Little room, and enough room.
+        let c = s.execute("routing.ospf.instance.check", &json!({"id": "v2", "max_lsa": "45000"})).unwrap();
+        assert!(c["risk"].is_null() && c.to_string().contains("less than 20 %"), "{c}");
+        let c = s.execute("routing.ospf.instance.check", &json!({"id": "v2", "max_lsa": "100000"})).unwrap();
+        assert!(c.to_string().contains("41 % of the limit"), "{c}");
+        // An ospfd without the patch counts no LSAs of other routers.
+        s.set_routing_status(status(None, None));
+        let c = s.execute("routing.ospf.instance.check", &json!({"id": "v2", "max_lsa": "100000"})).unwrap();
+        assert!(c.to_string().contains("without the CoreRouter patch"), "{c}");
+        // Extra: redistributing BGP's 900 000 routes, unfiltered.
+        let c = s.execute("routing.ospf.instance.check", &json!({"id": "v2", "redistribute": "bgp"})).unwrap();
+        let text = c.to_string();
+        assert!(text.contains("redistribute bgp brings up to 900000 routes") && text.contains("\"level\":\"warning\""), "{c}");
+        s.execute("routing.ospf.instance.set", &json!({"id": "v2", "redistribute": "bgp"})).unwrap();
+        let c = s.execute("routing.ospf.instance.check", &json!({"id": "v2", "comment": "y"})).unwrap();
+        assert!(!c.to_string().contains("brings up to"), "already on: {c}");
+        // The clear goes to the daemon, named by the committed instance.
+        s.execute("routing.ospf.instance.clear-lsdb-protection", &json!({"id": "v2"})).unwrap();
+        assert_eq!(*d.cleared.lock().unwrap(), ["v2@main"]);
+        // The list shows what the daemon says.
+        s.set_routing_status(status(Some(0), Some(MaxLsaState { limit: 50_000, state: "ignore".into(), ignore_entries: 1, ignore_count: 5, ignore_remaining_secs: Some(280) })));
+        let l = s.execute("routing.ospf.instance.list", &json!({})).unwrap();
+        assert_eq!(l[0]["lsdb"]["protection"]["state"], "ignore", "{l}");
+        assert_eq!(l[0]["lsdb"]["protection"]["remaining_secs"], 280, "{l}");
+        assert_eq!(l[0]["lsdb"]["source"], "frr", "{l}");
+        // Editing it while it is down says what brings it back.
+        let c = s.execute("routing.ospf.instance.check", &json!({"id": "v2", "max_lsa": "60000"})).unwrap();
+        assert!(c.to_string().contains("(ignore, back in 280 s): editing does not bring it back"), "{c}");
     }
 }

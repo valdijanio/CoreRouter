@@ -12,17 +12,22 @@
 //!   `allow_remote_requests` says.
 //! - up to four UDP threads per family on one socket ([`udp_threads`]):
 //!   each reads a query and runs the chain up to the cache; a cache hit is
-//!   answered at once. A miss goes to a "dns-query" worker of its own
-//!   ([`pool`]: kept for the next miss, not created per query), at most
-//!   `max_concurrent_queries` of them (more: SERVFAIL), so one slow
-//!   upstream never holds the cache hits back.
+//!   answered at once. A miss goes to a "dns-upstream" event loop
+//!   ([`upstream`], G4.1t: no thread per query), at most
+//!   `max_concurrent_queries` lookups in flight (more: SERVFAIL), so one
+//!   slow upstream never holds the cache hits back. What still blocks (TCP
+//!   after truncation, DoT/DoH upstreams) runs on "dns-query" workers
+//!   ([`pool`]: kept for the next job).
 //! - one TCP thread per family; a thread per connection, at most
-//!   `max_concurrent_tcp_sessions` (a quarter of them per source), closed
-//!   after 10 s idle (RFC 7766 §6.2.3). A peer that may not ask anything
-//!   (not the router, not `allowed_from`, not a peer a zone names) is
-//!   closed at accept, before it takes a slot; a message must arrive whole
-//!   within 10 s of its first byte and a connection reads no new query
-//!   after 2 minutes (a slow drip never holds a slot).
+//!   `max_concurrent_tcp_sessions` (25 per address, RFC 9210 §4.5, and at
+//!   most half), closed after 10 s idle (RFC 7766 §6.2.3). When every place
+//!   is taken, a new connection takes the place of the longest idle one of
+//!   the address holding the most (G4.1w, [`slots`]): stalled connections
+//!   no longer lock the LAN out. A peer that may not ask anything (not the
+//!   router, not `allowed_from`, not a peer a zone names) is closed at
+//!   accept, before it takes a place; a message must arrive whole within
+//!   10 s of its first byte and a connection reads no new query after 2
+//!   minutes (a slow drip never holds a place for long).
 //! - "dns-update": RFC 2136 UPDATEs that came over UDP, applied off the
 //!   listener (they wait for the session lock and a disk write).
 //! - "dns-effects": applies what the chain asks of the rest of the router
@@ -35,18 +40,18 @@
 //! on the LAN would otherwise answer from another one, and the client drops
 //! the reply (dnsmasq and Unbound do the same).
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use corerouter_control::Shutdown;
 use corerouter_engine::{Shared, lock};
 use corerouter_model::Config;
+use corerouter_proto_dns::resolver::Begin;
 use corerouter_proto_dns::server::{Done, Effect, Forwarder, MAX_QUERY, Pending, Start, Statistics};
 use corerouter_proto_dns::zone;
 use super::dns::RouterDns;
@@ -55,6 +60,10 @@ use sock::{Udp, bind_tcp};
 
 #[path = "dns_server/pool.rs"]
 mod pool;
+#[path = "dns_server/upstream.rs"]
+mod upstream;
+#[path = "dns_server/slots.rs"]
+pub(crate) mod slots;
 
 /// RFC 1035 §4.2.1.
 const DEFAULT_PORT: u16 = 53;
@@ -86,70 +95,6 @@ const EFFECTS_QUEUE: usize = 4096;
 /// retries, RFC 2136 §7.6).
 const UPDATE_QUEUE: usize = 64;
 
-/// A bounded count (queries or TCP sessions in flight).
-#[derive(Default)]
-struct Gate(AtomicUsize);
-
-impl Gate {
-    fn try_enter(&self, max: u32) -> bool {
-        let max = usize::try_from(max).unwrap_or(usize::MAX);
-        let mut cur = self.0.load(Ordering::Relaxed);
-        loop {
-            if cur >= max {
-                return false;
-            }
-            match self
-                .0
-                .compare_exchange(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed)
-            {
-                Ok(_) => return true,
-                Err(now) => cur = now,
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Which {
-    Query,
-    Tcp,
-}
-
-/// A TCP session's place per source: one source holds at most a quarter
-/// of `max_concurrent_tcp_sessions` (at least one).
-struct SourcePass {
-    srv: Arc<Server>,
-    ip: IpAddr,
-}
-
-impl SourcePass {
-    fn enter(srv: &Arc<Server>, ip: IpAddr, max: u32) -> Option<Self> {
-        let cap = (max / 4).max(1);
-        let mut per = srv.tcp_sources.lock().unwrap_or_else(|e| e.into_inner());
-        let n = per.entry(ip).or_insert(0);
-        if *n >= cap {
-            return None;
-        }
-        *n += 1;
-        Some(Self {
-            srv: srv.clone(),
-            ip,
-        })
-    }
-}
-
-impl Drop for SourcePass {
-    fn drop(&mut self) {
-        let mut per = self.srv.tcp_sources.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(n) = per.get_mut(&self.ip) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                per.remove(&self.ip);
-            }
-        }
-    }
-}
-
 /// An RFC 2136 UPDATE that came over UDP, for the "dns-update" thread.
 struct UdpUpdate {
     packet: Vec<u8>,
@@ -158,44 +103,20 @@ struct UdpUpdate {
     sock: Arc<Udp>,
 }
 
-/// A place in a gate, given back when dropped (it can move to a thread).
-struct Pass {
-    srv: Arc<Server>,
-    which: Which,
-}
-
-impl Pass {
-    fn enter(srv: &Arc<Server>, which: Which, max: u32) -> Option<Self> {
-        let pass = srv.gate(which).try_enter(max).then(|| Self {
-            srv: srv.clone(),
-            which,
-        })?;
-        srv.in_flight(which);
-        Some(pass)
-    }
-}
-
-impl Drop for Pass {
-    fn drop(&mut self) {
-        self.srv.gate(self.which).0.fetch_sub(1, Ordering::AcqRel);
-        self.srv.in_flight(self.which);
-    }
-}
-
 /// What the socket threads share.
 pub(crate) struct Server {
     fwd: Forwarder,
     dns: Arc<RouterDns>,
-    queries: Gate,
-    tcp: Gate,
-    /// TCP sessions per source address.
-    tcp_sources: Mutex<HashMap<IpAddr, u32>>,
+    /// The places of TCP 53 (G4.1w).
+    tcp: Arc<slots::Slots>,
     effects: SyncSender<Effect>,
     /// Effects dropped because the queue was full.
     effects_dropped: AtomicU64,
     updates: SyncSender<UdpUpdate>,
-    /// The workers of the misses (G4.1r).
+    /// Threads for what blocks (G4.1r): TCP retries, DoT/DoH upstreams.
     misses: Arc<pool::Pool>,
+    /// The event loops of the misses (G4.1t).
+    loops: upstream::Loops,
     /// Socket threads of an older epoch stop (the config turned the
     /// forwarder off, or the daemon is closing).
     epoch: AtomicU64,
@@ -203,32 +124,23 @@ pub(crate) struct Server {
 }
 
 impl Server {
-    fn gate(&self, which: Which) -> &Gate {
-        match which {
-            Which::Query => &self.queries,
-            Which::Tcp => &self.tcp,
-        }
-    }
-
-    /// G4.1h: the queries waiting for an upstream, for the statistics.
-    fn in_flight(&self, which: Which) {
-        if let Which::Query = which {
-            self.fwd.statistics().set_in_flight(self.queries.0.load(Ordering::Relaxed));
-        }
-    }
-
     /// G4.1h: a reply went out; the time since its query was read.
     fn answered(&self, read_at: Instant) {
         let us = u64::try_from(read_at.elapsed().as_micros()).unwrap_or(u64::MAX);
         self.fwd.statistics().answered_in(us);
     }
 
-    fn alive(&self, epoch: u64) -> bool {
-        !self.shutdown.is_closed() && self.epoch.load(Ordering::Acquire) == epoch
+    /// G4.1zd: the query to the log (`ip.dns.log`), answered or dropped,
+    /// with the time since it was read. Off, the chain built no entry.
+    fn log(&self, read_at: Instant, entry: Option<Box<corerouter_proto_dns::querylog::Entry>>) {
+        let Some(mut e) = entry else { return };
+        let us = u32::try_from(read_at.elapsed().as_micros()).unwrap_or(u32::MAX);
+        e.at_ms = super::dns_log::unix_ms();
+        super::dns_log::sink().push(&e, us);
     }
 
-    fn max_queries(&self) -> u32 {
-        self.fwd.config().config.ip.dns.max_concurrent_queries
+    fn alive(&self, epoch: u64) -> bool {
+        !self.shutdown.is_closed() && self.epoch.load(Ordering::Acquire) == epoch
     }
 
     fn effects(&self, done: &mut Done) {
@@ -247,10 +159,62 @@ impl Server {
         &self.fwd
     }
 
-    /// The rest of the chain, on this (worker) thread.
+    /// The rest of the chain, on this thread (it may wait on the network).
     fn finish(&self, p: Pending) -> Done {
         let mut t = self.dns.transport();
         self.fwd.finish(p, &mut t)
+    }
+
+    /// G4.1t: the rest of the chain of a miss without waiting here: the
+    /// answer now, after the equal lookup in flight (G4.1o), or after a
+    /// lookup an event loop carries; `reply` gets it on whichever thread
+    /// has it.
+    fn upstream(self: &Arc<Self>, p: Pending, reply: Reply) {
+        let begin = self.fwd.upstream(&p, self.dns.now_ms());
+        let srv = self.clone();
+        let done: corerouter_proto_dns::resolver::Waiter = Box::new(move |got| {
+            let mut d = srv.fwd.resume(p, got, srv.dns.now_ms());
+            srv.effects(&mut d);
+            reply.send(&srv, d);
+        });
+        match begin {
+            Begin::Now(got) => done(got),
+            Begin::Follow(f) => f.then(done),
+            Begin::Lead(lookup) => self.loops.lead(self, lookup, done),
+        }
+    }
+}
+
+/// Where the reply of a miss goes.
+enum Reply {
+    Udp {
+        sock: Arc<Udp>,
+        to: SocketAddr,
+        local: Option<IpAddr>,
+        read_at: Instant,
+    },
+    /// DoT/DoH (G4.1zf): the connection's loop.
+    Then(Then, Instant),
+}
+
+impl Reply {
+    fn send(self, srv: &Server, d: Done) {
+        match self {
+            Self::Udp { sock, to, local, read_at } => {
+                if let Some(r) = &d.reply {
+                    sock.send(r, to, local);
+                    srv.answered(read_at);
+                }
+                // G4.1zd: the query log, as for a cache hit.
+                srv.log(read_at, d.log);
+            }
+            Self::Then(then, read_at) => {
+                if d.reply.is_some() {
+                    srv.answered(read_at);
+                }
+                then(d.reply);
+            }
+        }
     }
 }
 
@@ -301,36 +265,20 @@ fn udp_loop(srv: Arc<Server>, sock: Arc<Udp>, epoch: u64) {
                     sock.send(r, from, local);
                     srv.answered(read_at);
                 }
+                srv.log(read_at, d.log.take());
                 srv.effects(&mut d);
             }
-            Start::Pending(p) => {
-                // RouterOS `max-concurrent-queries`: past it, SERVFAIL now
-                // (the client tries its other server) instead of a queue.
-                let Some(pass) = Pass::enter(&srv, Which::Query, srv.max_queries()) else {
-                    let d = srv.fwd.fail(*p);
-                    if let Some(r) = &d.reply {
-                        sock.send(r, from, local);
-                        srv.answered(read_at);
-                    }
-                    continue;
-                };
-                let sock_w = sock.clone();
-                let worker = move || {
-                    let mut d = pass.srv.finish(*p);
-                    if let Some(r) = &d.reply {
-                        sock_w.send(r, from, local);
-                        pass.srv.answered(read_at);
-                    }
-                    pass.srv.effects(&mut d);
-                };
-                if srv.misses.submit(Box::new(worker)).is_err() {
-                    // No worker: SERVFAIL from its bytes, so the client
-                    // tries elsewhere at once.
-                    if let Some(r) = servfail(packet) {
-                        sock.send(&r, from, local);
-                    }
-                }
-            }
+            // RouterOS `max-concurrent-queries`: past it the resolver says
+            // busy, SERVFAIL now (the client tries its other server).
+            Start::Pending(p) => srv.upstream(
+                *p,
+                Reply::Udp {
+                    sock: sock.clone(),
+                    to: from,
+                    local,
+                    read_at,
+                },
+            ),
         }
     }
 }
@@ -369,17 +317,13 @@ fn tcp_loop(srv: Arc<Server>, listener: TcpListener, epoch: u64) {
             continue;
         }
         let max = srv.fwd.config().config.ip.dns.max_concurrent_tcp_sessions;
-        // Over the limits the connection just closes.
-        let Some(source) = SourcePass::enter(&srv, peer.ip().to_canonical(), max) else {
+        // A place, maybe a stalled connection's (G4.1w); none: the
+        // connection just closes.
+        let Ok(ticket) = srv.tcp.admit(peer.ip().to_canonical(), &stream, max) else {
             continue;
         };
-        let Some(pass) = Pass::enter(&srv, Which::Tcp, max) else {
-            continue;
-        };
-        let session = move || {
-            let _source = source;
-            tcp_session(&pass.srv, stream, epoch);
-        };
+        let srv2 = srv.clone();
+        let session = move || tcp_session(&srv2, stream, &ticket, epoch);
         if let Err(e) = thread::Builder::new().name("dns-tcp".into()).spawn(session) {
             log::warn!("DNS: no thread for a TCP session: {e}");
         }
@@ -430,7 +374,7 @@ fn read_message(s: &mut TcpStream, session_end: Instant) -> Option<Vec<u8>> {
 
 /// RFC 1035 §4.2.2 / RFC 7766: 2-byte length, then the message; several
 /// queries per connection, answered in order.
-fn tcp_session(srv: &Arc<Server>, mut s: TcpStream, epoch: u64) {
+fn tcp_session(srv: &Arc<Server>, mut s: TcpStream, ticket: &slots::Ticket, epoch: u64) {
     let Ok(peer) = s.peer_addr() else { return };
     let _ = s.set_nonblocking(false);
     let _ = s.set_write_timeout(Some(TCP_IDLE));
@@ -442,6 +386,11 @@ fn tcp_session(srv: &Arc<Server>, mut s: TcpStream, epoch: u64) {
         let Some(msg) = read_message(&mut s, session_end) else {
             return;
         };
+        // Closed for a newcomer while the query came in (RFC 7766 §6.2.4:
+        // it is never answered).
+        if !ticket.busy() {
+            return;
+        }
         let read_at = Instant::now();
         // AXFR/IXFR (several messages) and NOTIFY (G4.1c), before the chain.
         if let Some(replies) = zone::xfr::intercept(&srv.fwd, &msg, peer.ip(), true) {
@@ -455,18 +404,19 @@ fn tcp_session(srv: &Arc<Server>, mut s: TcpStream, epoch: u64) {
                     return;
                 }
             }
+            ticket.reading();
             continue;
         }
         let mut done = match srv.fwd.start(&msg, peer.ip(), true, srv.dns.now_ms()) {
             Start::Done(d) => d,
-            Start::Pending(p) => match Pass::enter(srv, Which::Query, srv.max_queries()) {
-                Some(_pass) => srv.finish(*p),
-                None => srv.fwd.fail(*p),
-            },
+            // The connection's own thread waits (the resolver bounds the
+            // lookups in flight, G4.1t).
+            Start::Pending(p) => srv.finish(*p),
         };
         srv.effects(&mut done);
         let Some(reply) = done.reply else {
             // Refused by the limit or junk: the connection ends.
+            srv.log(read_at, done.log);
             return;
         };
         // An answer over 64 KiB cannot be framed: SERVFAIL, not silence.
@@ -484,9 +434,12 @@ fn tcp_session(srv: &Arc<Server>, mut s: TcpStream, epoch: u64) {
         let mut framed = len.to_be_bytes().to_vec();
         framed.extend(reply);
         if s.write_all(&framed).is_err() {
+            srv.log(read_at, done.log);
             return;
         }
         srv.answered(read_at);
+        srv.log(read_at, done.log);
+        ticket.reading();
     }
 }
 
@@ -626,13 +579,12 @@ fn prepare(
     let srv = Arc::new(Server {
         fwd: Forwarder::new(dns.resolver.clone()),
         dns,
-        queries: Gate::default(),
-        tcp: Gate::default(),
-        tcp_sources: Mutex::new(HashMap::new()),
+        tcp: Arc::new(slots::Slots::default()),
         effects: tx,
         effects_dropped: AtomicU64::new(0),
         updates: utx,
         misses: Arc::new(pool::Pool::default()),
+        loops: upstream::Loops::default(),
         epoch: AtomicU64::new(0),
         shutdown,
     });
@@ -670,6 +622,9 @@ fn follow(session: &Shared, srv: &Arc<Server>, port: u16, any: bool, health: &su
     let mut bound: Vec<SocketAddr> = Vec::new();
     let mut retry_at = 0u64;
     let lab = !any && is_lab(session);
+    // G4.1w: what the TCP 53 places did, told once a minute at most.
+    let mut tcp_told = (0u64, 0u64);
+    let mut tcp_told_at = 0u64;
     loop {
         if health.stopping() {
             srv.epoch.fetch_add(1, Ordering::AcqRel);
@@ -725,6 +680,21 @@ fn follow(session: &Shared, srv: &Arc<Server>, port: u16, any: bool, health: &su
         health.disabled((!want).then_some("ip.dns allow_remote_requests=no"));
         if listening {
             srv.fwd.statistics().set_socket_drops(drops::udp_drops(&bound));
+        }
+        if now >= tcp_told_at.saturating_add(60_000) {
+            let (evicted, refused) = srv.tcp.counts();
+            if (evicted, refused) != tcp_told {
+                let max = last.as_ref().map_or(0, |c| c.ip.dns.max_concurrent_tcp_sessions);
+                log::warn!(
+                    "DNS: TCP 53 full: idle connections closed for new ones: {}, new ones refused: {} \
+                     (since the last report; {} of {max} places taken now)",
+                    evicted.saturating_sub(tcp_told.0),
+                    refused.saturating_sub(tcp_told.1),
+                    srv.tcp.open()
+                );
+                tcp_told = (evicted, refused);
+            }
+            tcp_told_at = now;
         }
         health.sleep(TICK);
     }
@@ -852,9 +822,9 @@ pub(crate) type Then = Box<dyn FnOnce(Option<Vec<u8>>) + Send>;
 impl Answer {
     /// One query that came over DNS over TLS (G4.1zf) from `client`: the
     /// chain as for TCP 53 (`tcp`: no truncation), up to the cache on the
-    /// caller's thread; a miss waits on a pooled worker, at most
-    /// `max_concurrent_queries` of them (more: SERVFAIL now, as UDP), and
-    /// `then` gets its reply. Zone transfers are not served over TLS here
+    /// caller's thread; a miss goes upstream as UDP's (G4.1t: an event
+    /// loop, at most `max_concurrent_queries` in flight, more: SERVFAIL),
+    /// and `then` gets its reply. Zone transfers are not served over TLS here
     /// (RFC 9103 XoT is another feature).
     pub(crate) fn ask(srv: &Arc<Server>, msg: &[u8], client: IpAddr, read_at: Instant, then: Then) -> Self {
         match srv.fwd.start(msg, client, true, srv.dns.now_ms()) {
@@ -866,22 +836,8 @@ impl Answer {
                 Self::Now(d.reply)
             }
             Start::Pending(p) => {
-                let Some(pass) = Pass::enter(srv, Which::Query, srv.max_queries()) else {
-                    return Self::Now(srv.fwd.fail(*p).reply);
-                };
-                let worker = move || {
-                    let mut d = pass.srv.finish(*p);
-                    pass.srv.effects(&mut d);
-                    if d.reply.is_some() {
-                        pass.srv.answered(read_at);
-                    }
-                    then(d.reply);
-                };
-                // The misses' workers (G4.1r), as UDP's.
-                match srv.misses.submit(Box::new(worker)) {
-                    Ok(()) => Self::Later,
-                    Err(()) => Self::Now(servfail(msg)),
-                }
+                srv.upstream(*p, Reply::Then(then, read_at));
+                Self::Later
             }
         }
     }
@@ -1350,21 +1306,44 @@ mod tests {
         s
     }
 
-    /// RFC 7766 slots: one source cannot take them all, and a message that
+    /// RFC 7766 places: stalled connections cannot lock the LAN out
+    /// (G4.1w), one address cannot take them all, and a message that
     /// trickles in is cut at its deadline.
     #[cfg(target_os = "linux")]
     #[test]
     fn tcp_slots_survive_slow_and_greedy_peers() {
         let (_session, srv, port, shutdown) = lab();
-        // 127.0.0.2 opens every slot there is and sends one byte each.
-        let greedy: Vec<TcpStream> = (0..4).map(|_| connect_from([127, 0, 0, 2], port)).collect();
-        thread::sleep(Duration::from_millis(300));
-        // The LAN client still gets an answer over TCP.
+        // Two addresses try three connections each that send one byte and
+        // stall: RFC 9210 §4.5 per address (here per_source(4) = 2), so
+        // they hold every place and the third of each is closed.
+        let mut greedy: Vec<TcpStream> = [[127, 0, 0, 2], [127, 0, 0, 3]]
+            .into_iter()
+            .flat_map(|a| (0..3).map(move |_| connect_from(a, port)))
+            .collect();
+        wait("the stalled connections to take every place", || srv.tcp.open() == 4);
+        // The LAN client still gets an answer over TCP: its connection
+        // takes the place of a stalled one (RFC 7766 §6.2.3: zero timeout
+        // under attack; RFC 9210 §4.2: the oldest idle first).
         let m = tcp(port, &query("nas.lan.", RecordType::A));
         assert_eq!(m.answers[0].data.to_string(), "192.168.88.2");
-        // A message trickling in one byte at a time is cut at its
-        // deadline (TCP_MESSAGE, 2 s in tests), not kept alive by each byte.
-        let mut slow = connect_from([127, 0, 0, 3], port);
+        let (evicted, refused) = srv.tcp.counts();
+        assert_eq!(evicted, 1, "one stalled connection gave its place");
+        assert_eq!(refused, 2, "the third connection of each address");
+        // Its client sees the end; so do the two refused (the others are
+        // only cut at TCP_MESSAGE, 2 s after their byte).
+        let closed = greedy
+            .iter_mut()
+            .map(|g| {
+                g.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+                match g.read(&mut [0u8; 1]) {
+                    Ok(n) => n == 0,
+                    Err(e) => e.kind() == std::io::ErrorKind::ConnectionReset,
+                }
+            })
+            .filter(|ended| *ended)
+            .count();
+        assert_eq!(closed, 3, "two refused at accept, one evicted");
+        let mut slow = connect_from([127, 0, 0, 4], port);
         let t = Instant::now();
         let mut closed = false;
         while t.elapsed() < Duration::from_secs(6) {
@@ -1419,6 +1398,7 @@ mod tests {
                 .collect(),
             answered_by: "test",
             explain: Vec::new(),
+            log: None,
         };
         srv.effects(&mut d);
         let dropped = srv.effects_dropped.load(Ordering::Relaxed);

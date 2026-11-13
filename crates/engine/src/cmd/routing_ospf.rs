@@ -11,7 +11,8 @@ use std::net::Ipv4Addr;
 
 use corerouter_model::Routing;
 use corerouter_model::ospf::{
-    AreaId, AreaType, MAX_AREAS, MAX_INSTANCES, MAX_NEIGHBORS, MAX_RANGES, NssaTranslate, OriginateDefault,
+    AreaId, AreaType, MAX_AREAS, MAX_INSTANCES, MAX_LSA_IGNORE_COUNT, MAX_LSA_IGNORE_TIME, MAX_LSA_LIMIT,
+    MAX_LSA_RESET_TIME, MAX_LSA_THRESHOLD, MAX_NEIGHBORS, MAX_RANGES, MaxLsa, NssaTranslate, OriginateDefault,
     OspfArea, OspfAreaRange, OspfInstance, OspfStaticNeighbor, Redistribute, STUB_ROUTER_STARTUP, Version,
 };
 use corerouter_model::types::ItemId;
@@ -25,17 +26,20 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("routing.ospf.instance.add", "Add OSPF Instance", ["Routing", "OSPF"], None,
-        "{name: string, version?: u8 (2: IPv4, RFC 2328; 3: IPv6, RFC 5340; default 2), vrf?: string (default main), router_id?: ipv4 | null (unique in the AS; default: picked by the daemon), redistribute?: [string] | string (connected, static, bgp, kernel), out_filter_chain?: string | null (the /routing filter chain of redistributed routes), originate_default?: string (never, if-installed, always), subscriber_pools?: bool (announce the PPPoE/IPoE pools, summarized; v2), stub_router?: bool (RFC 6987: transit links at cost 65535 until unset; drains the router), stub_router_on_startup?: u32 | null (seconds 5..=86400 as a stub router after the instance starts; v2), disabled?: bool, comment?: string} → {name}",
+        "{name: string, version?: u8 (2: IPv4, RFC 2328; 3: IPv6, RFC 5340; default 2), vrf?: string (default main), router_id?: ipv4 | null (unique in the AS; default: picked by the daemon), redistribute?: [string] | string (connected, static, bgp, kernel), out_filter_chain?: string | null (the /routing filter chain of redistributed routes), originate_default?: string (never, if-installed, always), subscriber_pools?: bool (announce the PPPoE/IPoE pools, summarized; v2), stub_router?: bool (RFC 6987: transit links at cost 65535 until unset; drains the router), stub_router_on_startup?: u32 | null (seconds 5..=86400 as a stub router after the instance starts; v2), max_lsa?: u32 | null (G3.4r LSDB protection: most LSAs of other routers in the database, 1..=4294967294; above it the instance goes down for max_lsa_ignore_time; null: no limit, the default; v2), max_lsa_threshold?: u8 (warn at this % of max_lsa, 1..=100; default 75), max_lsa_warning_only?: bool (only warn, never go down), max_lsa_ignore_time?: u32 (seconds down above the limit, 30..=3600; default 300), max_lsa_ignore_count?: u32 (ignore periods before staying down until routing.ospf.instance.clear-lsdb-protection, 1..=32; default 5), max_lsa_reset_time?: u32 (seconds up that forget the ignore periods, 60..=86400; default 600), disabled?: bool, comment?: string} → {name}",
         always, instance_add),
     cmd!("routing.ospf.instance.set", "Set OSPF Instance", [], None,
-        "{id: string (the name), name?: string, version?: u8, vrf?: string, router_id?: ipv4 | null, redistribute?: [string] | string, out_filter_chain?: string | null, originate_default?: string, subscriber_pools?: bool, stub_router?: bool, stub_router_on_startup?: u32 | null, disabled?: bool, comment?: string} → {name}",
+        "{id: string (the name), name?: string, version?: u8, vrf?: string, router_id?: ipv4 | null, redistribute?: [string] | string, out_filter_chain?: string | null, originate_default?: string, subscriber_pools?: bool, stub_router?: bool, stub_router_on_startup?: u32 | null, max_lsa?: u32 | null, max_lsa_threshold?: u8, max_lsa_warning_only?: bool, max_lsa_ignore_time?: u32, max_lsa_ignore_count?: u32, max_lsa_reset_time?: u32, disabled?: bool, comment?: string} → {name}",
         has_instances, instance_set),
     cmd!("routing.ospf.instance.remove", "Remove OSPF Instance", [], None,
         "{id: string (the name)} → {name}",
         has_instances, instance_remove),
     cmd!(query "routing.ospf.instance.list", "OSPF Instances", ["Routing", "OSPF"], None,
-        "{} → [{name, version, vrf, router_id, redistribute, out_filter_chain, originate_default, subscriber_pools, stub_router, stub_router_on_startup, stub_state: {state (administrative, startup, off), remaining_secs?, areas, source} | null (what the daemon does now), pools: [prefix] (announced), areas, interfaces (matched now), disabled, comment}]",
+        "{} → [{name, version, vrf, router_id, redistribute, out_filter_chain, originate_default, subscriber_pools, stub_router, stub_router_on_startup, stub_state: {state (administrative, startup, off), remaining_secs?, areas, source} | null (what the daemon does now), max_lsa, max_lsa_threshold, max_lsa_warning_only, max_lsa_ignore_time, max_lsa_ignore_count, max_lsa_reset_time (null without a limit), lsdb: {lsas (in the databases, this router's included), lsas_other (of other routers: what max_lsa counts; patched ospfd), memory_mib (estimated for ospfd + zebra), protection: {state (normal, warning, exceeded, ignore, isolated, off), limit, ignore_entries, ignore_count, remaining_secs?} | null, source} | null, pools: [prefix] (announced), areas, interfaces (matched now), disabled, comment}]",
         always, instance_list),
+    cmd!("routing.ospf.instance.clear-lsdb-protection", "Clear OSPF LSDB Protection", [], None,
+        "{id: string (the instance)} → {name} (G3.4r: out of the ignore or isolated state of max_lsa now, the ignore periods forgotten: the adjacencies come up again; fix what floods the LSAs first, or it goes down again)",
+        always, instance_clear_lsdb_protection),
     cmd!("routing.ospf.area.add", "Add OSPF Area", ["Routing", "OSPF"], None,
         "{name: string, instance: string, area_id: string (dotted 0.0.0.1 or a number; 0.0.0.0 is the backbone), type?: string (default, stub, nssa), no_summaries?: bool (stub/NSSA: only a default route from the ABR), default_cost?: u32 | null, nssa_translate?: string (candidate, yes, no), disabled?: bool, comment?: string} → {name}",
         always, area_add),
@@ -216,6 +220,7 @@ pub(super) fn apply_instance(routing: &mut Routing, p: &Value, id: Option<&str>)
             subscriber_pools: false,
             stub_router: false,
             stub_router_on_startup: None,
+            max_lsa: None,
             disabled: false,
             comment: String::new(),
         },
@@ -296,6 +301,7 @@ pub(super) fn apply_instance(routing: &mut Routing, p: &Value, id: Option<&str>)
             "OSPFv3 (ospf6d) has no on-startup stub router: use stub_router and unset it later",
         ));
     }
+    max_lsa(p, &mut inst)?;
     comment_and_disabled(p, &mut inst.comment, &mut inst.disabled)?;
     let name = inst.name.clone();
     if id != Some(name.as_str()) && ospf.instances.contains_key(&name) {
@@ -318,6 +324,66 @@ pub(super) fn apply_instance(routing: &mut Routing, p: &Value, id: Option<&str>)
     }
     ospf.instances.insert(name.clone(), inst);
     Ok(name)
+}
+
+/// G3.4r: the LSDB protection. `max_lsa` sets or removes the limit; the
+/// other keys tune it, and without a limit only their default (or unset)
+/// is taken, so a form that sends every field still saves.
+fn max_lsa(p: &Value, inst: &mut OspfInstance) -> Result<()> {
+    match given(p, "max_lsa") {
+        Given::Absent => {}
+        Given::Unset => inst.max_lsa = None,
+        Given::Value(v) => {
+            let n = number("max_lsa", v, u64::from(*MAX_LSA_LIMIT.start()), u64::from(*MAX_LSA_LIMIT.end()))?;
+            let n = u32::try_from(n).map_err(|_| EngineError::bad("max_lsa", "out of range"))?;
+            match inst.max_lsa.as_mut() {
+                Some(m) => m.limit = n,
+                None => inst.max_lsa = Some(MaxLsa::new(n)),
+            }
+        }
+    }
+    let mut tune = |key: &str, range: (u64, u64), default: u64, set: &dyn Fn(&mut MaxLsa, u64)| -> Result<()> {
+        let n = match given(p, key) {
+            Given::Absent => return Ok(()),
+            Given::Unset => default,
+            Given::Value(v) => number(key, v, range.0, range.1)?,
+        };
+        match inst.max_lsa.as_mut() {
+            Some(m) => set(m, n),
+            None if n == default => {}
+            None => return Err(EngineError::bad(key, "needs max_lsa (the limit) first")),
+        }
+        Ok(())
+    };
+    let r8 = |r: &std::ops::RangeInclusive<u8>| (u64::from(*r.start()), u64::from(*r.end()));
+    let r32 = |r: &std::ops::RangeInclusive<u32>| (u64::from(*r.start()), u64::from(*r.end()));
+    // The ranges bound the values, so the narrowing never truncates.
+    tune("max_lsa_threshold", r8(&MAX_LSA_THRESHOLD), u64::from(MaxLsa::THRESHOLD), &|m, n| {
+        m.threshold = u8::try_from(n).unwrap_or(MaxLsa::THRESHOLD);
+    })?;
+    tune("max_lsa_ignore_time", r32(&MAX_LSA_IGNORE_TIME), u64::from(MaxLsa::IGNORE_TIME), &|m, n| {
+        m.ignore_time = u32::try_from(n).unwrap_or(MaxLsa::IGNORE_TIME);
+    })?;
+    tune("max_lsa_ignore_count", r32(&MAX_LSA_IGNORE_COUNT), u64::from(MaxLsa::IGNORE_COUNT), &|m, n| {
+        m.ignore_count = u32::try_from(n).unwrap_or(MaxLsa::IGNORE_COUNT);
+    })?;
+    tune("max_lsa_reset_time", r32(&MAX_LSA_RESET_TIME), u64::from(MaxLsa::RESET_TIME), &|m, n| {
+        m.reset_time = u32::try_from(n).unwrap_or(MaxLsa::RESET_TIME);
+    })?;
+    if let Some(b) = opt_boolean(p, "max_lsa_warning_only")? {
+        match inst.max_lsa.as_mut() {
+            Some(m) => m.warning_only = b,
+            None if !b => {}
+            None => return Err(EngineError::bad("max_lsa_warning_only", "needs max_lsa (the limit) first")),
+        }
+    }
+    if inst.version == Version::V3 && inst.max_lsa.is_some() {
+        return Err(EngineError::bad(
+            "max_lsa",
+            "OSPFv3 (ospf6d) has no LSDB protection yet: only OSPFv2 instances take max_lsa",
+        ));
+    }
+    Ok(())
 }
 
 fn instance_add(s: &mut Session, p: &Value) -> Result<Value> {
@@ -353,6 +419,51 @@ fn instance_remove(s: &mut Session, p: &Value) -> Result<Value> {
     ospf.static_neighbors.retain(|n| n.instance != id);
     ospf.instances.remove(id);
     Ok(json!({ "name": id }))
+}
+
+/// G3.4r: out of the LSDB protection's ignore or isolated state (a
+/// running action: nothing to roll back; the running config names the
+/// instance, as a session action names a committed connection).
+fn instance_clear_lsdb_protection(s: &mut Session, p: &Value) -> Result<Value> {
+    let id = req_str(p, "id")?;
+    let inst = s
+        .store()
+        .running()
+        .routing
+        .ospf
+        .instances
+        .get(id)
+        .cloned()
+        .ok_or_else(|| EngineError::bad("id", format!("no committed OSPF instance {:?}", cut(id))))?;
+    if inst.version != Version::V2 {
+        return Err(EngineError::bad("id", format!("{:?} is OSPFv3: no LSDB protection", inst.name)));
+    }
+    if inst.disabled {
+        return Err(EngineError::bad("id", format!("{:?} is disabled", inst.name)));
+    }
+    s.routing_ospf_max_lsa_clear(&inst.name, &inst.vrf)?;
+    Ok(json!({ "name": inst.name }))
+}
+
+/// G3.4r: the database's size and the LSDB protection of one instance as
+/// the list shows them; `None` while the daemon has not answered.
+fn lsdb_state(st: Option<&corerouter_model::ospf_state::OspfStubState>, source: &str) -> Value {
+    let Some(st) = st else {
+        return Value::Null;
+    };
+    json!({
+        "lsas": st.lsas,
+        "lsas_other": st.lsas_other,
+        "memory_mib": st.lsas.map(|n| corerouter_model::ospf_state::lsdb_memory_bytes(n).div_ceil(1 << 20)),
+        "protection": st.max_lsa.as_ref().map(|m| json!({
+            "state": m.state,
+            "limit": m.limit,
+            "ignore_entries": m.ignore_entries,
+            "ignore_count": m.ignore_count,
+            "remaining_secs": m.ignore_remaining_secs,
+        })),
+        "source": source,
+    })
 }
 
 /// G3.9c: the stub router state of one instance as the list shows it:
@@ -394,6 +505,13 @@ fn instance_list(s: &mut Session, _: &Value) -> Result<Value> {
                 "stub_router": i.stub_router,
                 "stub_router_on_startup": i.stub_router_on_startup,
                 "stub_state": stub_state(stub.iter().find(|st| st.instance == i.name), stub_source),
+                "max_lsa": i.max_lsa.map(|m| m.limit),
+                "max_lsa_threshold": i.max_lsa.map(|m| m.threshold),
+                "max_lsa_warning_only": i.max_lsa.map(|m| m.warning_only),
+                "max_lsa_ignore_time": i.max_lsa.map(|m| m.ignore_time),
+                "max_lsa_ignore_count": i.max_lsa.map(|m| m.ignore_count),
+                "max_lsa_reset_time": i.max_lsa.map(|m| m.reset_time),
+                "lsdb": lsdb_state(stub.iter().find(|st| st.instance == i.name), stub_source),
                 "pools": if i.subscriber_pools && i.version == Version::V2 {
                     pools.iter().map(ToString::to_string).collect::<Vec<_>>()
                 } else {
@@ -824,5 +942,82 @@ mod tests {
         s.execute("config.rollback", &json!({"revision": rev})).unwrap();
         let i = &s.store().running().routing.ospf.instances["v2"];
         assert!(!i.stub_router && i.stub_router_on_startup.is_none(), "{i:?}");
+    }
+
+    /// G3.4r: the LSDB protection: set with the defaults, tuned, unset by a
+    /// form's empty field, validated (FRR's ranges, v2 only, the tuning
+    /// needs a limit) and rolled back.
+    #[test]
+    fn lsdb_protection_set_validate_and_roll_back() {
+        let mut s = lab();
+        let rev = s.store().current_revision();
+        s.execute("routing.ospf.instance.set", &json!({"id": "v2", "max_lsa": "50000"})).unwrap();
+        let m = s.store().running().routing.ospf.instances["v2"].max_lsa.unwrap();
+        assert_eq!((m.limit, m.threshold, m.warning_only, m.ignore_time, m.ignore_count, m.reset_time), (50_000, 75, false, 300, 5, 600));
+        s.execute(
+            "routing.ospf.instance.set",
+            &json!({"id": "v2", "max_lsa_threshold": 80, "max_lsa_warning_only": "yes", "max_lsa_ignore_time": "30", "max_lsa_ignore_count": 2, "max_lsa_reset_time": 60}),
+        )
+        .unwrap();
+        let l = s.execute("routing.ospf.instance.list", &json!({})).unwrap();
+        assert_eq!(
+            (&l[0]["max_lsa"], &l[0]["max_lsa_threshold"], &l[0]["max_lsa_warning_only"], &l[0]["max_lsa_ignore_time"], &l[0]["max_lsa_ignore_count"], &l[0]["max_lsa_reset_time"]),
+            (&json!(50_000), &json!(80), &json!(true), &json!(30), &json!(2), &json!(60)),
+            "{l}"
+        );
+        // The lab's sample: an empty database, the protection normal.
+        assert_eq!(l[0]["lsdb"]["lsas_other"], 0, "{l}");
+        assert_eq!(l[0]["lsdb"]["protection"]["state"], "normal", "{l}");
+        assert_eq!(l[0]["lsdb"]["protection"]["limit"], 50_000, "{l}");
+        // An emptied tuning field goes back to its default.
+        s.execute("routing.ospf.instance.set", &json!({"id": "v2", "max_lsa_threshold": ""})).unwrap();
+        assert_eq!(s.store().running().routing.ospf.instances["v2"].max_lsa.unwrap().threshold, 75);
+        // Out of ospfd's ranges.
+        for (k, bad, range) in [
+            ("max_lsa", json!(0), "1..=4294967294"),
+            ("max_lsa", json!(4_294_967_295u64), "1..=4294967294"),
+            ("max_lsa_threshold", json!(101), "1..=100"),
+            ("max_lsa_ignore_time", json!(29), "30..=3600"),
+            ("max_lsa_ignore_count", json!(33), "1..=32"),
+            ("max_lsa_reset_time", json!("soon"), "60..=86400"),
+        ] {
+            let e = s.execute("routing.ospf.instance.set", &json!({"id": "v2", k: bad})).unwrap_err();
+            assert!(e.to_string().contains(range), "{k}: {e}");
+        }
+        // A form sends every field: without a limit, the defaults (or
+        // empty) pass and anything else needs the limit.
+        s.execute(
+            "routing.ospf.instance.set",
+            &json!({"id": "v2", "max_lsa": "", "max_lsa_threshold": "75", "max_lsa_warning_only": "no", "max_lsa_ignore_time": "", "max_lsa_ignore_count": "5", "max_lsa_reset_time": ""}),
+        )
+        .unwrap();
+        assert!(s.store().running().routing.ospf.instances["v2"].max_lsa.is_none());
+        let e = s.execute("routing.ospf.instance.set", &json!({"id": "v2", "max_lsa_ignore_time": 60})).unwrap_err();
+        assert!(e.to_string().contains("needs max_lsa"), "{e}");
+        let e = s.execute("routing.ospf.instance.set", &json!({"id": "v2", "max_lsa_warning_only": true})).unwrap_err();
+        assert!(e.to_string().contains("needs max_lsa"), "{e}");
+        // ospf6d has none.
+        let e = s
+            .execute("routing.ospf.instance.add", &json!({"name": "v3", "version": 3, "max_lsa": 1000}))
+            .unwrap_err();
+        assert!(e.to_string().contains("OSPFv3"), "{e}");
+        // The rollback takes it back to no limit.
+        s.execute("routing.ospf.instance.set", &json!({"id": "v2", "max_lsa": 20_000})).unwrap();
+        s.execute("config.rollback", &json!({"revision": rev})).unwrap();
+        assert!(s.store().running().routing.ospf.instances["v2"].max_lsa.is_none());
+    }
+
+    /// G3.4r: the clear acts on a committed v2 instance, through the
+    /// routing daemon (none in the lab: an error that says so).
+    #[test]
+    fn clear_lsdb_protection_needs_the_instance_and_a_daemon() {
+        let mut s = lab();
+        let e = s.execute("routing.ospf.instance.clear-lsdb-protection", &json!({"id": "nope"})).unwrap_err();
+        assert!(e.to_string().contains("no committed OSPF instance"), "{e}");
+        let e = s.execute("routing.ospf.instance.clear-lsdb-protection", &json!({"id": "v2"})).unwrap_err();
+        assert!(e.to_string().contains("no routing daemon"), "{e}");
+        s.execute("routing.ospf.instance.add", &json!({"name": "v3", "version": 3})).unwrap();
+        let e = s.execute("routing.ospf.instance.clear-lsdb-protection", &json!({"id": "v3"})).unwrap_err();
+        assert!(e.to_string().contains("OSPFv3"), "{e}");
     }
 }

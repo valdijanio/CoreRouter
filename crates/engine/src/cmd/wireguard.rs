@@ -46,7 +46,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add WireGuard",
         ["Interfaces", "WireGuard"],
         None,
-        "{name?: string (default the first free wireguardN, as RouterOS), listen_port?: int 1..65535 (UDP port of the encrypted packets; default 13231, or the first free one above), mtu?: int 1280..9216 (default 1420: 1500 minus the 80 bytes of WireGuard over IPv6), private_key?: string (base64, as wg genkey prints it; default auto: generated on the router and sealed), disabled?: bool, comment?: string} → {name, public_key, warnings}",
+        "{name?: string (default the first free wireguardN, as RouterOS), listen_port?: int 1..65535 (UDP port of the encrypted packets; default 13231, or the first free one above), mtu?: int 1280..9216 (default 1420: 1500 minus the 80 bytes of WireGuard over IPv6), private_key?: string (base64, as wg genkey prints it; default auto: generated on the router and sealed), vrf?: string (VRF the encrypted packets go by, RouterOS 7.21: main or empty = the main table; not the VRF of the tunnel interface, which interface.vrf sets), disabled?: bool, comment?: string} → {name, public_key, warnings}",
         always,
         add
     ),
@@ -55,7 +55,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set WireGuard",
         [],
         None,
-        "{name: string, listen_port?: int 1..65535, mtu?: int 1280..9216, private_key?: string (base64, or auto: a new key pair; every peer must then get the new public key), disabled?: bool, comment?: string, force?: bool (apply even if it cuts this session, which comes through this tunnel)} → {name, public_key, warnings}",
+        "{name: string, listen_port?: int 1..65535, mtu?: int 1280..9216, private_key?: string (base64, or auto: a new key pair; every peer must then get the new public key), vrf?: string (VRF the encrypted packets go by, RouterOS 7.21: main or empty = the main table; not the VRF of the tunnel interface, which interface.vrf sets), disabled?: bool, comment?: string, force?: bool (apply even if it cuts this session, which comes through this tunnel)} → {name, public_key, warnings}",
         has_interfaces,
         set
     ),
@@ -87,7 +87,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         disable
     ),
     cmd!(query "interface.wireguard.list", "WireGuard", ["Interfaces", "WireGuard"], None,
-        "{show_sensitive?: bool (the private keys in base64; group full)} → [{name, listen_port, mtu, public_key, private_key, disabled, running, peers, peers_up, error, comment}]",
+        "{show_sensitive?: bool (the private keys in base64; group full)} → [{name, listen_port, mtu, vrf (of the encrypted packets; main), public_key, private_key, disabled, running, peers, peers_up, error, comment}]",
         always, list),
 ];
 
@@ -182,6 +182,36 @@ fn check_port(cfg: &Config, me: &IfName, port: u16, warnings: &mut Vec<String>) 
 
 /// The private key asked for: `Some((key, generated))`, or `None` when the
 /// parameter is absent.
+/// `vrf` (G1.31c): `None` not given, `Some(None)` main, `Some(Some(v))` a
+/// VRF of the config. A VRF also tells what it costs: the kernel's socket
+/// is bound to no device, so it hears on the VRF's ports only with
+/// `net.ipv4.udp_l3mdev_accept=1`, which every unbound UDP socket shares.
+fn vrf_of(cfg: &Config, p: &Value) -> Result<Option<Option<IfName>>> {
+    let Some(text) = opt_str(p, "vrf")? else {
+        return Ok(None);
+    };
+    let text = text.trim();
+    if text.is_empty() || text == "main" {
+        return Ok(Some(None));
+    }
+    let name: IfName = text
+        .parse()
+        .map_err(|e: corerouter_model::ParseError| EngineError::bad("vrf", e.to_string()))?;
+    if !matches!(cfg.interfaces.get(&name).map(|i| &i.kind), Some(InterfaceKind::Vrf { .. })) {
+        return Err(EngineError::bad("vrf", format!("no VRF '{name}' (see ip.vrf.list; main for the main table)")));
+    }
+    Ok(Some(Some(name)))
+}
+
+/// What sending by VRF `name` costs, said when it is chosen.
+fn vrf_warning(name: &IfName) -> String {
+    format!(
+        "the encrypted packets go by VRF {name}: marked with its routing mark and looked up in its table; \
+         to hear on its ports the router sets net.ipv4.udp_l3mdev_accept=1, so its UDP services that listen \
+         on every address (DNS, NTP...) also hear on {name}'s ports: filter them in /ip firewall filter input"
+    )
+}
+
 fn private_of(p: &Value) -> Result<Option<(wg::Key, bool)>> {
     match opt_str(p, "private_key")? {
         None => Ok(None),
@@ -254,6 +284,12 @@ pub(super) fn add_on(cfg: &mut Config, seal: &SealKey, p: &Value) -> Result<Valu
         None => (wg::generate_private().map_err(EngineError::Internal)?, true),
     };
     let mut w = Wireguard::new(port);
+    if let Some(v) = vrf_of(cfg, p)? {
+        if let Some(name) = &v {
+            warnings.push(vrf_warning(name));
+        }
+        w.vrf = v;
+    }
     store_key(seal, &mut w, &key)?;
     let public = w.public_key.to_string();
     warnings.push(format!(
@@ -289,9 +325,16 @@ pub(super) fn set_on(cfg: &mut Config, seal: &SealKey, p: &Value) -> Result<Valu
         check_port(cfg, &name, port, &mut warnings)?;
     }
     let key = private_of(p)?;
+    let vrf = vrf_of(cfg, p)?;
     let mut w = wireguard_of(cfg, "name", &name)?.clone();
     if let Some(port) = port {
         w.listen_port = port;
+    }
+    if let Some(v) = vrf {
+        if let Some(name) = v.as_ref().filter(|n| w.vrf.as_ref() != Some(*n)) {
+            warnings.push(vrf_warning(name));
+        }
+        w.vrf = v;
     }
     if let Some((k, _)) = &key {
         let before = w.public_key.clone();
@@ -394,6 +437,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
             "name": name,
             "listen_port": w.listen_port,
             "mtu": iface.mtu,
+            "vrf": w.vrf.as_ref().map_or("main", |v| v.as_str()),
             "public_key": w.public_key,
             "private_key": shown(key.as_deref(), &w.private_key),
             "disabled": iface.disabled,

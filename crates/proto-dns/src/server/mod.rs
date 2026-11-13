@@ -32,13 +32,16 @@ use hickory_proto::rr::{DNSClass, Record, RecordType};
 use ipnet::IpNet;
 
 use crate::message::{Answer, QName};
-use crate::resolver::{Resolver, Source, Transport};
+use crate::resolver::{Begin, ResolveError, Resolved, Resolver, Source, Transport};
 
 include!(concat!(env!("OUT_DIR"), "/stages.rs"));
 
 pub mod explain;
 
 use explain::{Decision, Note, Outcome};
+
+/// The stripe of the calling thread (statistics, states, adlists).
+pub(crate) use statistics::my_stripe;
 
 pub use statistics::{
     CATEGORIES, CLIENT_V6_PREFIX, ClientStats, Counters, DomainStats, MAX_CLIENTS, NameStats,
@@ -167,6 +170,10 @@ pub struct Query {
     /// knows one (counted by the statistics, and sent to a client that
     /// used EDNS, G4.1ze).
     pub ede: Option<u16>,
+    /// G4.1t: the upstream lookup's result, brought by [`Forwarder::resume`].
+    upstream: Option<Result<Resolved, ResolveError>>,
+    /// Refused for `max_concurrent_queries` (answered as "busy").
+    busy: bool,
     /// `explain` (G6.8): each stage's decision so far.
     explain: Option<Vec<Decision>>,
     /// What the running stage said about itself ([`Query::note`]).
@@ -183,6 +190,8 @@ pub struct Query {
     dropped: bool,
     /// The UDP reply went without records and with TC (too large).
     truncated: bool,
+    /// G4.1zd: set by the `querylog` stage's `after`.
+    pub log: Option<Box<crate::querylog::Entry>>,
 }
 
 /// A query waiting for a worker (it needs the network).
@@ -200,6 +209,12 @@ pub struct Done {
     pub answered_by: &'static str,
     /// Each stage's decision, when asked with [`How::explain`].
     pub explain: Vec<Decision>,
+    /// G4.1zd: the query for the log (`ip.dns.log` on, the client not
+    /// excluded); the daemon adds the time to answer and hands it to the
+    /// [`crate::querylog::Sink`]. Boxed: `Query` and `Done` move several
+    /// times per query, and an inline entry made every query ~2 % more
+    /// instructions with the log off (**medido**, `perf stat`).
+    pub log: Option<Box<crate::querylog::Entry>>,
 }
 
 /// How a query the router asks itself (DNS Lookup, G6.8) goes down the
@@ -213,7 +228,7 @@ pub struct How {
 }
 
 /// Stages that only count (they never decide): left out of `explain`.
-const NOT_EXPLAINED: [&str; 1] = ["statistics"];
+const NOT_EXPLAINED: [&str; 2] = ["statistics", "querylog"];
 
 pub enum Start {
     Done(Done),
@@ -230,8 +245,18 @@ pub struct Forwarder {
     /// the map (G4.1h).
     stats: Arc<statistics::Statistics>,
     states: Mutex<HashMap<TypeId, AnyArc>>,
+    /// Copies of `states`, one per stripe of threads (G4.1z): a stage
+    /// reaches its state through the stripe of its thread, a lock no other
+    /// thread takes while there are no more threads than stripes.
+    state_stripes: Box<[StateStripe]>,
     compiled: Mutex<HashMap<TypeId, (u64, AnyArc)>>,
 }
+
+/// The states a stripe of threads has reached, on cache lines of its own.
+/// A short list: a forwarder keeps a handful of states.
+#[derive(Default)]
+#[repr(align(128))]
+struct StateStripe(Mutex<Vec<(TypeId, AnyArc)>>);
 
 /// A static entry's `regexp`, compiled as the forwarder matches it.
 pub(crate) fn stage_statics_compile(pattern: &str) -> Result<regex::Regex, String> {
@@ -350,6 +375,7 @@ impl Forwarder {
                 allowed: Vec::new(),
             })),
             states: Mutex::new(states),
+            state_stripes: (0..STRIPES).map(|_| StateStripe::default()).collect(),
             compiled: Mutex::new(HashMap::new()),
         }
     }
@@ -375,18 +401,52 @@ impl Forwarder {
     /// The state of type `T` a stage keeps across queries (made on first
     /// use). Stages own their state: nothing to add here for a new one.
     pub fn state<T: Default + Send + Sync + 'static>(&self) -> Arc<T> {
-        let mut map = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = map
-            .entry(TypeId::of::<T>())
-            .or_insert_with(|| Arc::new(T::default()) as AnyArc)
-            .clone();
-        drop(map);
-        match entry.downcast::<T>() {
-            Ok(t) => t,
-            // Unreachable by construction (keyed by the type); a fresh one
-            // keeps the forwarder going.
-            Err(_) => Arc::new(T::default()),
+        self.stripe_state::<T, _>(|any| {
+            any.clone()
+                .downcast::<T>()
+                // Unreachable by construction (keyed by the type); a fresh
+                // one keeps the forwarder going.
+                .unwrap_or_else(|_| Arc::new(T::default()))
+        })
+    }
+
+    /// `f` on the state of type `T`, borrowed (G4.1z): no reference count
+    /// shared by every thread changes, so the stages that run for every
+    /// query use this rather than [`Forwarder::state`]. `f` runs under the
+    /// lock of the thread's stripe: it must not reach a state itself.
+    pub fn with_state<T: Default + Send + Sync + 'static, R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        self.stripe_state::<T, _>(|any| match any.downcast_ref::<T>() {
+            Some(t) => f(t),
+            // Unreachable, as in `state`.
+            None => f(&T::default()),
+        })
+    }
+
+    /// `look` on the state of type `T` as this thread's stripe holds it,
+    /// copied from `states` (made there if new) on first use.
+    fn stripe_state<T: Default + Send + Sync + 'static, R>(
+        &self,
+        look: impl FnOnce(&AnyArc) -> R,
+    ) -> R {
+        let id = TypeId::of::<T>();
+        let Some(stripe) = self.state_stripes.get(my_stripe()) else {
+            return look(&self.shared_state::<T>());
+        };
+        let mut list = stripe.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, any)) = list.iter().find(|(t, _)| *t == id) {
+            return look(any);
         }
+        let any = self.shared_state::<T>();
+        list.push((id, any.clone()));
+        look(&any)
+    }
+
+    /// The one state of type `T` all stripes copy.
+    fn shared_state<T: Default + Send + Sync + 'static>(&self) -> AnyArc {
+        let mut map = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(TypeId::of::<T>())
+            .or_insert_with(|| Arc::new(T::default()) as AnyArc)
+            .clone()
     }
 
     /// The statistics (the same as `state::<Statistics>()`, without its
@@ -440,6 +500,7 @@ impl Forwarder {
                     effects: Vec::new(),
                     answered_by: "parse",
                     explain: Vec::new(),
+                    log: None,
                 });
             }
         };
@@ -461,6 +522,7 @@ impl Forwarder {
                     effects: Vec::new(),
                     answered_by: "parse",
                     explain: Vec::new(),
+                    log: None,
                 });
             }
         };
@@ -481,13 +543,44 @@ impl Forwarder {
         self.done(query)
     }
 
-    /// No room for it (`max_concurrent_queries`): SERVFAIL, so the client
-    /// tries its other server instead of waiting.
+    /// No room for it (no worker): SERVFAIL, so the client tries its other
+    /// server instead of waiting.
     pub fn fail(&self, p: Pending) -> Done {
         let mut query = p.query;
         query.answered_by = "busy";
         query.reply = Some(Reply::code(ResponseCode::ServFail));
         self.done(query)
+    }
+
+    /// G4.1t: the upstream lookup of `p` without waiting: an answer now
+    /// (the cache filled meanwhile, a held failure, busy), the same lookup
+    /// in flight to follow, or a lookup to lead. Whatever it is, the result
+    /// goes back through [`Self::resume`].
+    pub fn upstream(&self, p: &Pending, now_ms: u64) -> Begin {
+        let q = &p.query;
+        let b = self
+            .resolver
+            .begin(&q.name, q.qtype, q.forward_to.as_ref(), now_ms);
+        self.count_in_flight();
+        b
+    }
+
+    /// The rest of the chain of `p` with its upstream result `got`.
+    pub fn resume(&self, p: Pending, got: Result<Resolved, ResolveError>, now_ms: u64) -> Done {
+        let Pending { mut query, next } = p;
+        query.now_ms = now_ms;
+        query.upstream = Some(got);
+        if self.run(&mut query, next, None).is_some() {
+            query.reply = Some(Reply::code(ResponseCode::ServFail));
+        }
+        self.done(query)
+    }
+
+    /// G4.1h: lookups in flight upstream and the equal ones waiting for
+    /// them, for `ip.dns.statistics.print`.
+    pub fn count_in_flight(&self) {
+        let (leading, following) = self.resolver.in_flight();
+        self.stats.set_in_flight(leading.saturating_add(following));
     }
 
     /// Stages from `from`; `Some(i)`: stage `i` must wait for a worker.
@@ -522,7 +615,7 @@ impl Forwarder {
                 }
                 Step::Reply(mut r) => {
                     q.decided(stage, Outcome::Answered);
-                    q.answered_by = stage.name;
+                    q.answered_by = if q.busy { "busy" } else { stage.name };
                     if !q.prefix.is_empty() {
                         let mut all = q.prefix.clone();
                         all.append(&mut r.answers);
@@ -568,6 +661,7 @@ impl Forwarder {
                 effects: q.effects,
                 answered_by: q.answered_by,
                 explain,
+                log: q.log,
             };
         }
         Done {
@@ -575,6 +669,7 @@ impl Forwarder {
             effects: std::mem::take(&mut q.effects),
             answered_by: q.answered_by,
             explain,
+            log: q.log.take(),
         }
     }
 }
@@ -626,6 +721,8 @@ impl Query {
             source: None,
             effects: Vec::new(),
             ede: None,
+            upstream: None,
+            busy: false,
             explain: None,
             pending: None,
             simulated: false,
@@ -634,6 +731,7 @@ impl Query {
             reply: None,
             dropped: false,
             truncated: false,
+            log: None,
         })
     }
 

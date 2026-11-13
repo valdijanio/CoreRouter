@@ -79,7 +79,7 @@ corerouter-cli --connect 127.0.0.1:7979 run ip.dns.cache.flush
 | RFC 5452 §9.2: id aleatório e porta de origem aleatória por consulta | `message::query`, `bind(0)` |
 | RFC 6761 §6.3/§6.4: `localhost` é o loopback; `invalid` nunca existe; nenhum vai à rede | `special_use` |
 | RFC 6891 §6.2.5: EDNS(0) anuncia `max_udp_packet_size` | `message::query` |
-| RFC 7766 §5: resposta UDP truncada é refeita por TCP no mesmo servidor | `resolver::fetch` |
+| RFC 7766 §5: resposta UDP truncada é refeita por TCP no mesmo servidor | `resolver::Lookup::reply` |
 
 **Testes.** `proto-dns`: codec (exemplo da RFC 1035, CNAME, negativos, TTL enorme, respostas
 alheias, truncamento, proptest com bytes hostis e respostas danificadas), cache (expiração, teto,
@@ -145,7 +145,7 @@ aparecem desabilitados com a parte que os traz), IP › DNS Static e IP › DNS 
 | 40 | `static` | `/ip dns static` (abaixo). |
 | 50 | `zones` | Vazia; a G4.1c entra aqui. |
 | 60 | `cache` | O cache compartilhado com o resolvedor do roteador; responde na thread do socket. |
-| 90 | `upstream` | O resolvedor da G4.1a (troca de servidor, TCP no truncamento, serve-stale); a única etapa que espera a rede: roda numa thread de trabalho. |
+| 90 | `upstream` | O resolvedor da G4.1a (troca de servidor, TCP no truncamento, serve-stale); a única etapa que espera a rede: a busca vai para um laço de eventos `dns-upstream` (G4.1t) e a resposta volta por `Forwarder::resume`. |
 
 **Uma etapa nova** (Statistics, Adlist, Zones…) é só um arquivo `stage/<nome>.rs`:
 
@@ -160,7 +160,8 @@ pub(crate) const STAGE: Stage = Stage {
 
 - `handle` olha a `Query` (cliente, nome, tipo, a config em execução inteira em
   `q.config.config`) e devolve `Step::Next`, `Step::Reply(..)`, `Step::Drop` ou, se precisa da
-  rede, `Step::Wait` (é chamada de novo numa thread de trabalho, com o transporte).
+  rede, `Step::Wait` (só a `upstream`: o daemon leva a busca ao laço de eventos e devolve o
+  resultado; quem chama `Forwarder::finish` com um transporte a roda bloqueando).
 - Estado entre consultas: `f.state::<MeuTipo>()` (criado no primeiro uso). Config compilada
   (regexps, tabelas): `f.compiled(&q.config, MeuTipo::build)`, refeita a cada mudança de config.
 - Efeitos fora do DNS (address list do firewall): `q.effects.push(Effect::…)`; o daemon aplica.
@@ -1251,7 +1252,7 @@ origem por resposta. E cada miss criava uma thread nova e a destruía no fim.
 | Regra | Onde |
 |---|---|
 | RFC 5452 §5: várias consultas iguais pendentes facilitam a falsificação (ataque do aniversário); juntá-las é a defesa prática (Unbound: mesh; dnsmasq ≥ 2.83, CVE-2020-25686) | `resolver/flight.rs` |
-| RFC 9520 §3.2: a falha do líder vale para os seguidores e entra no cache de falhas uma vez | `Resolver::ask` |
+| RFC 9520 §3.2: a falha do líder vale para os seguidores e entra no cache de falhas uma vez | `Resolver::complete` |
 
 **Medido** (host, 4 CPUs, origem a 20 ms; `docs/dns-stress.md` tem os números da VM): o mesmo nome
 com TTL 0 a 2000/s, 1,00 → 0,02 consulta à origem por resposta; misses com a origem a 0 ms, 46,7
@@ -1259,3 +1260,103 @@ mil → ~122 mil/s sem SERVFAIL. Custo da junção: +0,24 µs por miss no `dns_f
 
 **Fica de fora** (gaps G4.1t em diante): os seguidores ainda ocupam uma vaga e uma thread cada; um
 laço de eventos no upstream resolveria as duas coisas.
+
+## G4.1t — laço de eventos no upstream
+
+**Antes.** Cada consulta em andamento ocupava uma thread bloqueada até a resposta (G4.1r: um
+worker reaproveitado, mas um por consulta). Os misses paravam em `max_concurrent_queries` / RTT
+(100 / 20 ms = 5 mil/s); com 1000, mil threads disputavam as CPUs; os seguidores da G4.1o também
+ocupavam uma vaga e uma thread cada (**medido**, `docs/dns-stress.md`).
+
+**Agora.**
+
+- `proto-dns/src/resolver/lookup.rs`: a busca é uma máquina de estados sem E/S (`Lookup`). Ela diz
+  o que mandar (`Exchange`: servidor, UDP/TCP/cifrado, id, prazo) e ouve o que voltou (`reply`),
+  o que falhou (`failed`) e que o tempo passou (`tick`). As regras (servidores em ordem,
+  `query_server_timeout`, `query_total_timeout`, TCP no truncamento da RFC 7766 §5, resposta que
+  não é desta consulta ignorada pela RFC 5452 §9.1) existem uma vez só, para os dois caminhos:
+  - `Resolver::begin` resolve sem rede: cache, falha guardada (RFC 9520), a busca igual em
+    andamento (G4.1o) ou uma busca nova para liderar; `Resolver::complete` guarda o resultado
+    (cache, estatísticas, falhas) e o entrega a quem esperava;
+  - `Resolver::resolve` continua bloqueante para as ferramentas do roteador (ping, NTP, DNS
+    Lookup) e para o TCP 53, por um `Transport`, uma troca de cada vez.
+- `max_concurrent_queries` passa a contar **buscas em andamento** (o mapa da G4.1o): acima disso,
+  SERVFAIL na hora ("busy"). Um seguidor não ocupa vaga nem thread: deixa um callback
+  (`Follow::then`) ou, no caminho bloqueante, espera. Seguidores com callback: no máximo
+  `MAX_WAITING` (16 384).
+- `service/dns_server/upstream.rs`: os laços "dns-upstream-N" (`mio`, tantos quantos leitores UDP
+  por família) carregam as buscas. Socket UDP conectado a um servidor, porta efêmera do kernel
+  (aleatória no Linux); cada socket leva no máximo 16 consultas e vive no máximo 2 s, então um
+  novo (outra porta) assume. Com várias consultas pendentes há várias portas em uso ao mesmo
+  tempo (RFC 5452 §9.2, MUST). O ICMP de porta fechada do servidor encerra na hora as consultas
+  daquele socket.
+- O que ainda bloqueia vai para as threads "dns-query" (`pool.rs`) e volta pela caixa do laço: o
+  TCP depois do truncamento e as buscas com servidor cifrado (DoT/DoH são fluxos TLS bloqueantes
+  aqui). O pool de conexões DoT/DoH guarda toda conexão devolvida (até 256 por servidor):
+  tantas quantas consultas estiveram em voo, em vez de 4.
+
+| Regra | Onde |
+|---|---|
+| RFC 5452 §9.2: porta e id imprevisíveis, várias portas ao mesmo tempo com várias consultas pendentes | `upstream.rs` (`USES`, `AGE`), `message::query` |
+| RFC 5452 §9.1: endereço, porta, id e pergunta conferidos; o resto é descartado | socket conectado, `Lookup::reply` |
+| RFC 7766 §5: resposta UDP truncada repetida por TCP no mesmo servidor | `Lookup::reply` |
+| RFC 7858 §3.4: conexões DoT/DoH reaproveitadas | `dns_secure.rs` (`KEEP`) |
+
+**Fica de fora:** DoT com várias consultas por conexão (RFC 7858 §3.3) e HTTP/2 com vários
+fluxos no laço, sem thread por consulta cifrada; o TCP 53 de entrada (G4.1w) ainda responde o
+miss na thread da conexão.
+
+## G4.1u — prazo por servidor adaptativo e nova tentativa
+
+**Antes.** Cada servidor esperava o `query_server_timeout` inteiro (2 s) e era perguntado uma
+vez. Com 30 % de perda nas respostas só ~24 % das consultas eram respondidas (p99 4,1 s); na queda
+de um servidor, cada nome novo esperava 2 s até ele ir para o fim da fila (**medido**,
+`docs/dns-stress.md`).
+
+**Agora** (`proto-dns/src/resolver/lookup.rs`, `resolver.rs`):
+
+- Cada servidor tem um RTO (RFC 6298): `SRTT + 4·RTTVAR`, α = 1/8, β = 1/4 (§2.2, §2.3), entre 50 ms
+  e 120 s (`RTT_MIN_TIMEOUT`/`RTT_MAX_TIMEOUT` do Unbound; o mínimo de 1 s do §2.4 é para segmento
+  TCP). Nunca medido: 376 ms (o `UNKNOWN_SERVER_NICENESS` do Unbound; o Knot Resolver usa 400).
+  Um estouro dobra o RTO (§5.5), a partir do RTO usado naquela consulta, não do atual (como o
+  `rtt_lost` do Unbound: cem consultas que estouram juntas dobram uma vez só).
+- Uma busca pergunta os servidores em turno: cada consulta espera o RTO do servidor, e a última
+  espera o `query_server_timeout` inteiro. No máximo três envios por servidor (RFC 9520 §3.1:
+  "three queries in total") e três no total, ou um por servidor quando há mais de três. Um
+  servidor que deu falha definitiva (SERVFAIL, REFUSED, resposta malformada, ICMP de porta
+  fechada) não é perguntado de novo na mesma busca.
+- A consulta que estourou continua ouvindo: uma resposta atrasada dela vale (id próprio por
+  consulta, então a amostra de RTT não é ambígua, RFC 6298 §3).
+- Um estouro só não derruba o servidor: ele fica `down` depois de três seguidos (o Knot usa
+  quatro); uma falha definitiva conta na hora, como antes.
+- `ip.dns.statistics.print` mostra o `rto_ms` de cada servidor.
+
+| Regra | Onde |
+|---|---|
+| RFC 9520 §3.1: no máximo três consultas por servidor e transporte | `MAX_SENDS_PER_SERVER`, `Lookup::advance` |
+| RFC 6298 §2.2–2.3: SRTT, RTTVAR, RTO | `Resolver::record` |
+| RFC 6298 §5.5: dobrar o RTO no estouro | `Lookup::timed_out`, `Resolver::record` |
+| RFC 6298 §3 (Karn): amostra só de resposta sem ambiguidade | id novo por envio (`message::query`) |
+
+## G4.1v — serve-stale com o prazo do cliente
+
+**Antes.** A resposta vencida (RFC 8767, `serve_stale_secs`) só saía depois de todos os
+servidores falharem: 4,1 s com as duas origens fora (**medido**, `docs/dns-stress.md`). O cliente
+comum desiste antes (o Windows repete em 1 s, o glibc em 5 s).
+
+**Agora** (`service/dns_server/upstream.rs`, `Resolver::answer_stale`): o "client response
+timer" da RFC 8767 §5. Uma busca ainda fora 1,8 s depois de começar (`STALE_CLIENT_MS`; o
+`serve-expired-client-timeout` do Unbound desde o 1.23) responde com a entrada vencida, se o cache
+ainda a tem dentro do `serve_stale_secs`, com TTL 30 s (§4). A resposta vai para o cliente que
+começou a busca e para todas as iguais que esperam ou que chegarem depois (G4.1o): a busca
+continua no mapa, então nenhuma outra sai para a origem. Ela segue até o fim e, quando a origem
+responde, só renova o cache; se falha, a falha fica guardada (RFC 9520) e o vencido sai na hora
+até lá. Sem entrada vencida, o cliente continua esperando a busca.
+
+| Regra | Onde |
+|---|---|
+| RFC 8767 §5: client response timer de 1,8 s, a busca segue ao fundo | `STALE_CLIENT_MS`, `Run::timers_due` |
+| RFC 8767 §4: TTL do vencido > 0, recomendado 30 s | `cache::STALE_TTL` |
+
+**Fica de fora:** o caminho bloqueante (ferramentas do roteador, TCP 53 de entrada, buscas com
+servidor cifrado nas threads) ainda dá o vencido só quando todos falham.

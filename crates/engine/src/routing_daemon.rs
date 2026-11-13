@@ -66,6 +66,19 @@ impl Session {
         }
     }
 
+    /// G3.4r: out of the OSPF LSDB protection's ignore or isolated state
+    /// (a running action, one vty command).
+    pub fn routing_ospf_max_lsa_clear(&mut self, instance: &str, vrf: &str) -> Result<()> {
+        match self.ext_mut::<RoutingBackend>() {
+            Some(RoutingBackend(Some(d))) => d
+                .ospf_max_lsa_clear(instance, vrf)
+                .map_err(|e| EngineError::Hal(format!("routing: {e}"))),
+            _ => Err(EngineError::Hal(
+                "routing: no routing daemon is attached (virtual lab, or the daemon runs without --frr)".into(),
+            )),
+        }
+    }
+
     /// Whether a routing backend is attached.
     pub fn has_routing(&self) -> bool {
         matches!(self.ext::<RoutingBackend>(), Some(RoutingBackend(Some(_))))
