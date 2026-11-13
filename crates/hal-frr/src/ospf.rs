@@ -16,7 +16,7 @@ use std::io::Read;
 use std::net::Ipv4Addr;
 
 use corerouter_model::ospf_state::{
-    Link, Lsa, Lsdb, OspfIfState, OspfNeighbor, OspfRoute, OspfStubState,
+    Link, Lsa, Lsdb, MaxLsaState, OspfIfState, OspfNeighbor, OspfRoute, OspfStubState,
 };
 use serde::Deserialize;
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -292,12 +292,23 @@ pub fn interfaces_v2(json: impl AsRef<[u8]>, instance: &str) -> Result<Vec<OspfI
 }
 
 #[derive(Deserialize, Default)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 struct OspfTop<'a> {
     #[serde(borrow)]
     areas: Dict<'a, Obj<AreaStub<'a>>>,
-    #[serde(borrow, rename = "routerIsStubRouter")]
+    #[serde(borrow)]
     router_is_stub_router: Option<Loose<'a>>,
+    // G3.4r: the database's size (ospfd; ospf6d's AS scope).
+    #[serde(borrow)]
+    lsa_external_counter: Option<Loose<'a>>,
+    #[serde(borrow)]
+    lsa_asopaque_counter: Option<Loose<'a>>,
+    #[serde(borrow)]
+    lsa_other_routers_counter: Option<Loose<'a>>,
+    #[serde(borrow)]
+    number_of_as_scoped_lsa: Option<Loose<'a>>,
+    #[serde(borrow)]
+    max_lsa: Obj<MaxLsaJson<'a>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -309,6 +320,59 @@ struct AreaStub<'a> {
     indefinite_active_admin: Option<Loose<'a>>,
     #[serde(borrow)]
     active_startup_remainder_msecs: Option<Loose<'a>>,
+    #[serde(borrow)]
+    lsa_number: Option<Loose<'a>>,
+    #[serde(borrow)]
+    number_of_area_scoped_lsa: Option<Loose<'a>>,
+}
+
+/// G3.4r: the `maxLsa` object of the patched ospfd
+/// (`os/patches/frr/0002-…`, `show_ip_ospf_common`).
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct MaxLsaJson<'a> {
+    #[serde(borrow)]
+    limit: Option<Loose<'a>>,
+    #[serde(borrow)]
+    state: Option<Loose<'a>>,
+    #[serde(borrow)]
+    ignore_entries: Option<Loose<'a>>,
+    #[serde(borrow)]
+    ignore_count: Option<Loose<'a>>,
+    #[serde(borrow)]
+    ignore_remaining_msecs: Option<Loose<'a>>,
+}
+
+/// G3.4r: the size of the database and the LSDB protection, from the
+/// answer the stub router state is read from (the counters, not the
+/// LSAs: ~1 KiB and ≤ 0.5 ms of ospfd at any size, **medido**).
+fn lsdb_size(top: &OspfTop<'_>, out: &mut OspfStubState) {
+    let mut total: Option<u64> = None;
+    let mut add = |v: Option<u64>| {
+        if let Some(v) = v {
+            total = Some(total.unwrap_or(0).saturating_add(v));
+        }
+    };
+    for (_, a) in top.areas.0.iter().take(1_000) {
+        if let Some(a) = &a.0 {
+            add(u64_of(&a.lsa_number));
+            add(u64_of(&a.number_of_area_scoped_lsa));
+        }
+    }
+    add(u64_of(&top.lsa_external_counter));
+    add(u64_of(&top.lsa_asopaque_counter));
+    add(u64_of(&top.number_of_as_scoped_lsa));
+    out.lsas = total;
+    out.lsas_other = u64_of(&top.lsa_other_routers_counter);
+    out.max_lsa = top.max_lsa.0.as_ref().map(|m| MaxLsaState {
+        limit: u64_of(&m.limit).unwrap_or(0),
+        state: text(&m.state)
+            .map(|s| s.chars().take(16).collect())
+            .unwrap_or_default(),
+        ignore_entries: u64_of(&m.ignore_entries).unwrap_or(0),
+        ignore_count: u64_of(&m.ignore_count).unwrap_or(0),
+        ignore_remaining_secs: u64_of(&m.ignore_remaining_msecs).map(|ms| ms.div_ceil(1000)),
+    });
 }
 
 /// G3.9c: `show ip ospf json`: the areas that originate a stub router-LSA
@@ -322,6 +386,7 @@ pub fn stub_v2(json: impl AsRef<[u8]>, instance: &str) -> Result<OspfStubState, 
         ..OspfStubState::default()
     };
     let Some(top) = top.0 else { return Ok(out) };
+    lsdb_size(&top, &mut out);
     for (id, a) in top.areas.0.iter().take(1_000) {
         let Some(m) = &a.0 else { continue };
         if bool_of(&m.origin_stub_max_dist_router_lsa) != Some(true) {
@@ -343,13 +408,18 @@ pub fn stub_v2(json: impl AsRef<[u8]>, instance: &str) -> Result<OspfStubState, 
 /// `ospf6d/ospf6_top.c`); ospf6d has the administrative form only.
 pub fn stub_v3(json: impl AsRef<[u8]>, instance: &str) -> Result<OspfStubState, String> {
     let top: Obj<OspfTop<'_>> = loose::parse(json.as_ref(), "ospf6d")?;
-    Ok(OspfStubState {
+    let mut out = OspfStubState {
         instance: instance.to_owned(),
         admin: top
             .0
+            .as_ref()
             .is_some_and(|t| bool_of(&t.router_is_stub_router) == Some(true)),
         ..OspfStubState::default()
-    })
+    };
+    if let Some(t) = &top.0 {
+        lsdb_size(t, &mut out);
+    }
+    Ok(out)
 }
 
 /// Most routes kept from `show ip ospf route json`.
@@ -932,6 +1002,46 @@ mod tests {
                 .active()
         );
         assert!(stub_v2("garbage", "v2").is_err());
+    }
+
+    /// G3.4r: the database's size and the LSDB protection, in the form
+    /// the patched ospfd prints (taken from the host lab,
+    /// `scripts/ospf-stress-lab.sh`), and ospf6d's counters.
+    #[test]
+    fn lsdb_size_and_max_lsa_of_ospfd_and_ospf6d() {
+        let plain = r#"{"routerId":"10.255.0.1","lsaExternalCounter":194881,"lsaAsopaqueCounter":0,
+            "areas":{"0.0.0.0":{"lsaNumber":2}}}"#;
+        let st = stub_v2(plain, "v2").unwrap();
+        assert_eq!(
+            (st.lsas, st.lsas_other, st.max_lsa.clone()),
+            (Some(194_883), None, None),
+            "{st:?}"
+        );
+        let patched = r#"{"routerId":"10.255.0.1","lsaOtherRoutersCounter":0,
+            "maxLsa":{"limit":50000,"threshold":80,"warningOnly":false,"ignoreTimeSecs":30,"ignoreCount":2,
+                      "resetTimeSecs":60,"state":"ignore","ignoreEntries":1,"ignoreRemainingMsecs":29854},
+            "lsaExternalCounter":0,"lsaAsopaqueCounter":0,"areas":{"0.0.0.0":{"lsaNumber":0}}}"#;
+        let st = stub_v2(patched, "v2").unwrap();
+        let m = st.max_lsa.clone().unwrap();
+        assert_eq!((st.lsas, st.lsas_other), (Some(0), Some(0)));
+        assert_eq!(
+            (
+                m.limit,
+                m.state.as_str(),
+                m.ignore_entries,
+                m.ignore_count,
+                m.ignore_remaining_secs
+            ),
+            (50_000, "ignore", 1, 2, Some(30))
+        );
+        assert!(m.down());
+        let v3 = r#"{"routerId":"1.1.1.1","numberOfAsScopedLsa":7,"areas":{"0.0.0.0":{"numberOfAreaScopedLsa":5}}}"#;
+        assert_eq!(stub_v3(v3, "v3").unwrap().lsas, Some(12));
+        // Odd types are None, not an error.
+        let odd = r#"{"lsaOtherRoutersCounter":"x","maxLsa":{"limit":"y","state":7},"areas":{"0":{"lsaNumber":[]}}}"#;
+        let st = stub_v2(odd, "v2").unwrap();
+        assert_eq!((st.lsas, st.lsas_other), (None, None));
+        assert_eq!(st.max_lsa.unwrap().limit, 0);
     }
 
     #[test]

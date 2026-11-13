@@ -353,6 +353,17 @@ backend.**
   (`proto-ospf` → `proto-bgp`, lateral permitido) com listas renomeadas `CR-O2-`/`CR-O3-`, porque
   o `ospfd` recusa as linhas BGP dos route-maps do `bgpd`. Índice de templates por nome: 4 000
   interfaces × 1 000 templates em 10,9 ms (era 145,7 ms, **medido**).
+- **Proteção da LSDB: patch no `ospfd`, não controle nosso (G3.4r, `docs/ospf.md`).** O FRR
+  não limita as LSAs. Duas opções foram comparadas no laboratório, com 192 721 externas de um
+  vizinho (**medido**):
+  - **controle nosso** (ler o `show ip ospf json` a cada 2 s e desligar a instância): chega
+    depois da enxurrada inteira, porque 175 436 LSAs entram no primeiro segundo. O pico fica
+    em 293 MiB no `ospfd` e 120 MiB no `zebra`, e a memória não volta depois.
+  - **o `max-lsa` dentro do `ospfd`** (`os/patches/frr/0007`, enviado ao FRR): para em 50 008
+    LSAs com limite de 50 000, com pico de 84 + 42 MiB.
+
+  Ficamos com o patch. A leitura, a janela, a saúde e a prévia continuam nossas, no mesmo
+  `show ip ospf json` que o serviço `frr` já lê.
 - **holo** (suíte de roteamento em Rust, modelo YANG) é o candidato a backend Rust-nativo do
   mesmo trait (G3.8) — sem mudar UI, comandos ou MCP.
 - FSMs próprias só para o **simulador** (sessões BGP/OSPF entre roteadores virtuais no lab, G3.7)
