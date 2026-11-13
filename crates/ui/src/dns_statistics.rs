@@ -1,12 +1,18 @@
-//! IP › DNS › Statistics (G4.1e, G4.1h): what the LAN forwarder did, in
-//! three tabs.
+//! IP › DNS › Statistics (G4.1e, G4.1h, G4.1za, G4.1zb): what the LAN
+//! forwarder did, in five tabs.
 //!
 //! - **Overview**: cards (queries per second now and the period's peak,
 //!   cache hits and SERVFAIL over the period, the time to answer, the
 //!   queries in flight against `max_concurrent_queries`), the `dns` graph
 //!   series (queries per second, cache hits) over 1 h, 24 h or 7 d, who
-//!   answered, the response codes, the transport, the warnings the engine
-//!   raised and the clients that ask most.
+//!   answered, the response codes, the transport and the warnings the
+//!   engine raised.
+//! - **Names**: the names asked most (all clients together) and the
+//!   domains whose names fail (NXDOMAIN, SERVFAIL) with how many different
+//!   names failed; the random-subdomain warnings under them.
+//! - **Clients**: live, in memory only: queries per second, NXDOMAIN
+//!   share, queries over the per-client limit, refused, when last seen.
+//!   Never the names a client asked (LGPD).
 //! - **Upstreams**: one row per server (how it is asked, answers per
 //!   second, round trips, timeouts, SERVFAIL, truncated answers, up, slow
 //!   or down and for how long) and the round trips by range, the ends
@@ -39,6 +45,8 @@ use crate::{CoreRouterUi, Win};
 const NAME: &str = "dns-statistics";
 pub(crate) const WIN: &str = "dns-statistics";
 const CLIENTS_TABLE: &str = "dns-statistics-clients";
+const NAMES_TABLE: &str = "dns-statistics-names";
+const DOMAINS_TABLE: &str = "dns-statistics-domains";
 const UPSTREAMS_TABLE: &str = "dns-statistics-upstreams";
 const PRINT: &str = "ip.dns.statistics.print";
 const RESET: &str = "ip.dns.statistics.reset";
@@ -63,11 +71,28 @@ pub(crate) const PANEL: Panel = Panel {
     new: || Box::new(DnsStatsPanel::default()),
 };
 
-const CLIENT_COLUMNS: [table::Column; 4] = [
+const CLIENT_COLUMNS: [table::Column; 8] = [
     col("Client").help("dns_statistics.client"),
+    num("Queries/s").help("dns_statistics.client_rate"),
     num("Queries").help("dns_statistics.client_queries"),
     num("%").help("dns_statistics.client_share"),
+    num("NXDOMAIN %").help("dns_statistics.client_nxdomain"),
+    num("Limited").help("dns_statistics.client_limited"),
     num("Refused").help("dns_statistics.client_refused"),
+    num("Last seen").help("dns_statistics.client_seen"),
+];
+const NAME_COLUMNS: [table::Column; 4] = [
+    col("Name").help("dns_statistics.name"),
+    num("Queries").help("dns_statistics.name_queries"),
+    num("%").help("dns_statistics.name_share"),
+    num("Queries/s").help("dns_statistics.name_rate"),
+];
+const DOMAIN_COLUMNS: [table::Column; 5] = [
+    col("Domain").help("dns_statistics.domain"),
+    num("NXDOMAIN").help("dns_statistics.domain_nxdomain"),
+    num("SERVFAIL").help("dns_statistics.domain_servfail"),
+    num("Failures/s").help("dns_statistics.domain_rate"),
+    num("Names").help("dns_statistics.domain_names"),
 ];
 const UPSTREAM_COLUMNS: [table::Column; 9] = [
     col("Server").help("dns_statistics.server"),
@@ -86,16 +111,20 @@ const UPSTREAM_COLUMNS: [table::Column; 9] = [
 pub(crate) enum Tab {
     #[default]
     Overview,
+    Names,
+    Clients,
     Upstreams,
     Cache,
 }
 
 impl Tab {
-    const ALL: [Tab; 3] = [Tab::Overview, Tab::Upstreams, Tab::Cache];
+    const ALL: [Tab; 5] = [Tab::Overview, Tab::Names, Tab::Clients, Tab::Upstreams, Tab::Cache];
 
     fn label(self) -> &'static str {
         match self {
             Tab::Overview => "Overview",
+            Tab::Names => "Names",
+            Tab::Clients => "Clients",
             Tab::Upstreams => "Upstreams",
             Tab::Cache => "Cache",
         }
@@ -104,6 +133,8 @@ impl Tab {
     fn help(self) -> &'static str {
         match self {
             Tab::Overview => "dns_statistics.tab_overview",
+            Tab::Names => "dns_statistics.tab_names",
+            Tab::Clients => "dns_statistics.tab_clients",
             Tab::Upstreams => "dns_statistics.tab_upstreams",
             Tab::Cache => "dns_statistics.tab_cache",
         }
@@ -155,16 +186,31 @@ pub(crate) const HELP_KEYS: &[&str] = &[
     "dns_statistics.cache_hits",
     "dns_statistics.cache_used",
     "dns_statistics.client",
+    "dns_statistics.client_limited",
+    "dns_statistics.client_nxdomain",
     "dns_statistics.client_queries",
+    "dns_statistics.client_rate",
     "dns_statistics.client_refused",
+    "dns_statistics.client_seen",
     "dns_statistics.client_share",
     "dns_statistics.clients",
+    "dns_statistics.domain",
+    "dns_statistics.domain_names",
+    "dns_statistics.domain_nxdomain",
+    "dns_statistics.domain_rate",
+    "dns_statistics.domain_servfail",
+    "dns_statistics.failing_domains",
     "dns_statistics.encrypted_in",
     "dns_statistics.evicted",
     "dns_statistics.expired",
     "dns_statistics.in_flight",
     "dns_statistics.latency",
     "dns_statistics.malformed",
+    "dns_statistics.name",
+    "dns_statistics.name_queries",
+    "dns_statistics.name_rate",
+    "dns_statistics.name_share",
+    "dns_statistics.names",
     "dns_statistics.period",
     "dns_statistics.queries_per_sec",
     "dns_statistics.rcodes",
@@ -178,6 +224,8 @@ pub(crate) const HELP_KEYS: &[&str] = &[
     "dns_statistics.stale_served",
     "dns_statistics.state",
     "dns_statistics.tab_cache",
+    "dns_statistics.tab_clients",
+    "dns_statistics.tab_names",
     "dns_statistics.tab_overview",
     "dns_statistics.tab_upstreams",
     "dns_statistics.tc_tcp",
@@ -196,8 +244,18 @@ pub(crate) const HELP_KEYS: &[&str] = &[
 
 /// The warnings the engine raises, by key (their text has a template).
 #[cfg(test)]
-pub(crate) const WARNINGS: [&str; 6] =
-    ["upstream_down", "upstream_timeouts", "servfail_high", "limit_reached", "cache_evicting", "socket_drops"];
+pub(crate) const WARNINGS: [&str; 7] = [
+    "upstream_down",
+    "upstream_timeouts",
+    "servfail_high",
+    "limit_reached",
+    "cache_evicting",
+    "socket_drops",
+    "random_subdomain",
+];
+
+/// The warnings the Names tab shows under its tables.
+const NAME_WARNINGS: [&str; 1] = ["random_subdomain"];
 
 #[derive(Default)]
 pub(crate) struct DnsStatsPanel {
@@ -212,6 +270,8 @@ pub(crate) struct DnsStatsPanel {
     asked: Cell<Option<Range>>,
     tick: Cell<u32>,
     clients_table: TableState,
+    names_table: TableState,
+    domains_table: TableState,
     upstreams_table: TableState,
     help: Option<HelpView>,
 }
@@ -255,27 +315,71 @@ fn ms(v: Option<f64>) -> String {
     }
 }
 
-fn client_row(r: &Value, total: u64) -> Row {
-    let error = n(r, "error");
-    let queries = if error > 0 {
-        // Space-Saving: the count may hold up to `error` queries of
-        // clients this one replaced.
-        format!("≤{}", n(r, "queries"))
+/// A count Space-Saving may have inflated: `≤n` when up to `error` of it
+/// belongs to keys this one replaced.
+fn bounded(r: &Value, k: &str) -> String {
+    if n(r, "error") > 0 {
+        format!("≤{}", n(r, k))
     } else {
-        n(r, "queries").to_string()
-    };
+        n(r, k).to_string()
+    }
+}
+
+fn row(key: String, cells: Vec<String>) -> Row {
     Row {
-        key: text(r, "address"),
-        cells: vec![
-            text(r, "address"),
-            queries,
-            percent(n(r, "queries"), total),
-            n(r, "refused").to_string(),
-        ],
+        key,
+        cells,
         dimmed: false,
         section: false,
         tint: None,
     }
+}
+
+pub(crate) fn client_row(r: &Value, total: u64) -> Row {
+    let seen = r.get("seen_secs").and_then(Value::as_u64);
+    let mut out = row(
+        text(r, "address"),
+        vec![
+            text(r, "address"),
+            one(f(r, "queries_per_sec")),
+            bounded(r, "queries"),
+            percent(n(r, "queries"), total),
+            one(f(r, "nxdomain_percent")),
+            n(r, "limited").to_string(),
+            n(r, "refused").to_string(),
+            seen.map_or_else(|| "–".into(), duration),
+        ],
+    );
+    // Quiet for a minute: greyed out (still in the table until replaced).
+    out.dimmed = seen.is_some_and(|s| s >= 60);
+    out
+}
+
+pub(crate) fn name_row(r: &Value, total: u64) -> Row {
+    row(
+        text(r, "name"),
+        vec![text(r, "name"), bounded(r, "queries"), percent(n(r, "queries"), total), one(f(r, "queries_per_sec"))],
+    )
+}
+
+pub(crate) fn domain_row(r: &Value) -> Row {
+    let name = text(r, "domain");
+    let cell = if r.get("random").and_then(Value::as_bool) == Some(true) {
+        chip::cell(&name, &[("random names", Kind::Amber)])
+    } else {
+        name.clone()
+    };
+    let fails = if n(r, "error") > 0 { "≤" } else { "" };
+    row(
+        name,
+        vec![
+            cell,
+            format!("{fails}{}", n(r, "nxdomain")),
+            format!("{fails}{}", n(r, "servfail")),
+            one(f(r, "failures_per_sec")),
+            format!("≈{}", n(r, "names")),
+        ],
+    )
 }
 
 /// `up 5 min`, `down 30 s` as a chip in the State cell.
@@ -399,12 +503,17 @@ impl PanelState for DnsStatsPanel {
     }
 
     fn escape(&mut self, _: &'static str) -> bool {
-        self.clients_table.escape() || self.upstreams_table.escape()
+        self.clients_table.escape()
+            || self.names_table.escape()
+            || self.domains_table.escape()
+            || self.upstreams_table.escape()
     }
 
     fn tables(&self) -> Vec<(&'static str, &TableState)> {
         vec![
             (CLIENTS_TABLE, &self.clients_table),
+            (NAMES_TABLE, &self.names_table),
+            (DOMAINS_TABLE, &self.domains_table),
             (UPSTREAMS_TABLE, &self.upstreams_table),
         ]
     }
@@ -412,6 +521,8 @@ impl PanelState for DnsStatsPanel {
     fn tables_mut(&mut self) -> Vec<(&'static str, &mut TableState)> {
         vec![
             (CLIENTS_TABLE, &mut self.clients_table),
+            (NAMES_TABLE, &mut self.names_table),
+            (DOMAINS_TABLE, &mut self.domains_table),
             (UPSTREAMS_TABLE, &mut self.upstreams_table),
         ]
     }
@@ -461,6 +572,8 @@ impl DnsStatsPanel {
             .auto_shrink([false, false])
             .show(ui, |ui| match self.tab {
                 Tab::Overview => self.overview(app, ui, &s),
+                Tab::Names => self.names(app, ui, &s),
+                Tab::Clients => self.clients(app, ui, &s),
                 Tab::Upstreams => self.upstreams(app, ui, &s),
                 Tab::Cache => self.cache(app, ui, &s),
             });
@@ -587,24 +700,69 @@ impl DnsStatsPanel {
                 });
             });
         });
-        self.warnings(app, ui, s);
-        ui.add_space(4.0);
-        let clients: Vec<Row> = s
-            .get("clients")
+        self.warnings(app, ui, s, None);
+    }
+
+    /// A table of rows `key` of the reply, with its heading and "shown /
+    /// tracked"; the help of a clicked column opens.
+    #[allow(clippy::too_many_arguments)]
+    fn list(
+        &mut self,
+        app: &mut CoreRouterUi,
+        ui: &mut Ui,
+        s: &Value,
+        (key, tracked): (&str, &str),
+        (help, title): (&'static str, &'static str),
+        (id, height, columns): (&'static str, f32, &[table::Column]),
+        make: impl Fn(&Value) -> Row,
+    ) {
+        let l = app.lang.labels;
+        let rows: Vec<Row> = s
+            .get(key)
             .and_then(Value::as_array)
-            .map(|a| a.iter().map(|r| client_row(r, total)).collect())
+            .map(|a| a.iter().map(&make).collect())
             .unwrap_or_default();
         ui.horizontal(|ui| {
-            heading(ui, &mut self.help, l, "dns_statistics.clients", "Top clients");
-            ui.weak(format!("{} / {}", clients.len(), n(s, "clients_tracked")));
+            heading(ui, &mut self.help, l, help, title);
+            ui.weak(format!("{} / {}", rows.len(), n(s, tracked)));
         });
-        let out = table::show(ui, CLIENTS_TABLE, 0.0, &mut self.clients_table, &CLIENT_COLUMNS, &clients, |ui, menu| {
+        let state = match id {
+            NAMES_TABLE => &mut self.names_table,
+            DOMAINS_TABLE => &mut self.domains_table,
+            _ => &mut self.clients_table,
+        };
+        let out = table::show(ui, id, height, state, columns, &rows, |ui, menu| {
             refresh_menu(app, ui, &menu);
         });
         if let Some(key) = out.help {
-            let title = CLIENT_COLUMNS.iter().find(|c| c.help == key).map_or("", |c| c.title);
+            let title = columns.iter().find(|c| c.help == key).map_or("", |c| c.title);
             self.help = Some(HelpView::new(key, tr_in(SCOPE, l, title)));
         }
+    }
+
+    fn names(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, s: &Value) {
+        let l = app.lang.labels;
+        let total = n(s, "queries");
+        self.list(app, ui, s, ("names", "names_tracked"), ("dns_statistics.names", "Top names"),
+            (NAMES_TABLE, 230.0, &NAME_COLUMNS), |r| name_row(r, total));
+        ui.add_space(6.0);
+        self.list(app, ui, s, ("failing_domains", "domains_tracked"),
+            ("dns_statistics.failing_domains", "Failing domains (NXDOMAIN / SERVFAIL)"),
+            (DOMAINS_TABLE, 190.0, &DOMAIN_COLUMNS), domain_row);
+        ui.weak(tr_in(SCOPE, l, "Counted for all clients together: no name is kept with the client that asked it."));
+        ui.add_space(4.0);
+        self.warnings(app, ui, s, Some(&NAME_WARNINGS));
+    }
+
+    fn clients(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, s: &Value) {
+        let l = app.lang.labels;
+        let total = n(s, "queries");
+        ui.horizontal_wrapped(|ui| {
+            chip(ui, tr_in(SCOPE, l, "live"), chip::GREEN.tone(ui.visuals()));
+            ui.weak(tr_in(SCOPE, l, "In memory only, never written; the names a client asks are not kept (LGPD). IPv6 clients count per /56."));
+        });
+        self.list(app, ui, s, ("clients", "clients_tracked"), ("dns_statistics.clients", "Clients"),
+            (CLIENTS_TABLE, 0.0, &CLIENT_COLUMNS), |r| client_row(r, total));
     }
 
     /// Queries per second and cache hits over the period, side by side.
@@ -647,10 +805,14 @@ impl DnsStatsPanel {
         });
     }
 
-    /// The engine's warnings, one line each (none: a quiet line).
-    fn warnings(&mut self, app: &CoreRouterUi, ui: &mut Ui, s: &Value) {
+    /// The engine's warnings, one line each (none: a quiet line); only
+    /// the keys in `only` when given.
+    fn warnings(&mut self, app: &CoreRouterUi, ui: &mut Ui, s: &Value, only: Option<&[&str]>) {
         let l = app.lang.labels;
-        let list = s.get("warnings").and_then(Value::as_array).cloned().unwrap_or_default();
+        let mut list = s.get("warnings").and_then(Value::as_array).cloned().unwrap_or_default();
+        if let Some(keys) = only {
+            list.retain(|w| keys.contains(&text(w, "key").as_str()));
+        }
         ui.horizontal(|ui| {
             heading(ui, &mut self.help, l, "dns_statistics.warnings", "Warnings");
             if list.is_empty() {
@@ -850,10 +1012,20 @@ mod tests {
 
     #[test]
     fn rows() {
-        let c = json!({"address": "192.168.88.10", "queries": 30, "refused": 2, "error": 0});
-        assert_eq!(client_row(&c, 120).cells, ["192.168.88.10", "30", "25", "2"]);
-        let c = json!({"address": "10.0.0.9", "queries": 7, "refused": 0, "error": 6});
-        assert_eq!(client_row(&c, 0).cells[1..3], ["≤7", "–"]);
+        let c = json!({"address": "192.168.88.10", "queries": 30, "queries_per_sec": 2.5, "nxdomain_percent": 10.0,
+            "limited": 1, "refused": 2, "error": 0, "seen_secs": 5});
+        assert_eq!(client_row(&c, 120).cells, ["192.168.88.10", "2.5", "30", "25", "10", "1", "2", "5s"]);
+        let c = json!({"address": "2001:db8:1:ab00::/56", "queries": 7, "refused": 0, "error": 6, "seen_secs": 90});
+        let r = client_row(&c, 0);
+        assert_eq!(r.cells[2..4], ["≤7", "–"]);
+        assert!(r.dimmed, "quiet for a minute");
+        let d = json!({"domain": "victim.com.br", "nxdomain": 900, "servfail": 3, "failures_per_sec": 41.0,
+            "names": 880, "error": 0, "random": true});
+        let r = domain_row(&d);
+        assert_eq!(chip::split(&r.cells[0]), ("victim.com.br", vec![(Kind::Amber, "random names")]));
+        assert_eq!(r.cells[1..], ["900", "3", "41", "≈880"]);
+        let nm = json!({"name": "www.example.com", "queries": 50, "queries_per_sec": 0.4, "error": 2});
+        assert_eq!(name_row(&nm, 200).cells, ["www.example.com", "≤50", "25", "0.4"]);
         let u = json!({"server": "1.1.1.1", "via": "dot", "answers_per_sec": 12.5, "rtt_p50_ms": 0.04,
             "rtt_p95_ms": 23.4, "timeouts_percent": 0.0, "servfail_percent": null, "truncated": 2,
             "state": "down", "state_secs": 30});

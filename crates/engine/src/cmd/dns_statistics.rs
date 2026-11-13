@@ -12,12 +12,21 @@
 //! (RFC 8914), each upstream's timeouts, SERVFAIL, TC and round trips, the
 //! cache's evictions and types, the "now" values of the last minute and
 //! the warnings the engine draws from them (the window only shows them).
+//!
+//! G4.1za/zb: the names asked most and the domains whose names fail
+//! (NXDOMAIN, SERVFAIL) with how many different names failed, as PowerDNS
+//! (`top-queries`, `top-pub-servfail-queries`), dnsdist (`topQueries`,
+//! `topResponses` by labels) and Knot (`stats.frequent`) list them, and a
+//! warning when a domain looks like a random-subdomain attack (dnsdist's
+//! `setSuffixMatchRule` watches the same); the clients live, with their
+//! rate, NXDOMAIN share, limited queries and when last seen, and never the
+//! names they asked (LGPD).
 
 use std::net::IpAddr;
 
 use corerouter_proto_dns::histogram::{EDGES_US, Hist, RANGES};
 use corerouter_proto_dns::resolver::ServerStats;
-use corerouter_proto_dns::server::{Snapshot, ede_name, type_name};
+use corerouter_proto_dns::server::{CLIENT_V6_PREFIX, DomainStats, Snapshot, ede_name, type_name};
 use serde_json::{Map, Value, json};
 
 use super::args::opt_u32;
@@ -25,7 +34,7 @@ use super::{CommandSpec, always};
 use crate::dns_statistics::{Reading, Window, minus, percent, window};
 use crate::{EngineError, Result, Session};
 
-/// Clients listed by default, and at most.
+/// Clients, names and failing domains listed by default, and at most.
 const TOP: u32 = 10;
 const MAX_TOP: u32 = 100;
 /// Always shown, even at zero (the stages every forwarder has).
@@ -44,10 +53,17 @@ const MIN_EVENTS: u64 = 3;
 const EVICT_WARN: u64 = 10;
 /// An upstream is `slow` when its 95th percentile passes this (ms).
 const SLOW_MS: u64 = 500;
+/// A random-subdomain attack: a domain failing at this rate now (per
+/// second, over 10 s)…
+const RANDOM_RATE: f64 = 20.0;
+/// …with at least this many different names failed since the reset (a
+/// broken client repeats one name; an attack replaying a word list still
+/// passes it).
+const RANDOM_NAMES: u64 = 200;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "ip.dns.statistics.print", "DNS Statistics", [], None,
-        "{top?: int 1..100 (clients listed, default 10)} → {resolver: router|simulated, allow_remote_requests, since (unix time counting started), elapsed_secs, queries, udp, tcp, transport: {udp4, udp6, tcp4, tcp6, truncated, socket_drops}, malformed, answered: {cache, static, upstream, stale, refused, limit, busy, malformed, …}, cache_hit_percent, rcodes: {noerror, nxdomain, servfail, refused, formerr, notimp, dropped, …}, ede: [{code, name, replies}] (RFC 8914, most first), types: [{type, queries}], latency: {p50_ms, p90_ms, p99_ms, buckets: [{below_us (null: the last, open), replies}], ranges: [{range (ms), replies}]} (since the reset), in_flight, in_flight_peak, max_concurrent_queries, limit_hits, now: {window_secs, queries_per_sec, cache_hit_percent, servfail_percent, latency_p50_ms, latency_p99_ms, evictions}|null (the last minute; null before the first readings), cache: {entries, used_bytes, max_bytes, evicted, expired, stale_served, types: [{type, entries}]}|null, clients: [{address, queries, refused, error}], clients_tracked, clients_replaced, upstreams: [{server, via (udp|dot|doh), answers, answers_per_sec, srtt_ms, rtt_p50_ms, rtt_p95_ms, timeouts, timeouts_percent, servfails, servfail_percent, truncated, failures, down, state (up|slow|down), state_secs, rtt_ranges: [6 counts, ms ranges as latency.ranges]}], rtt_ranges: [{range, replies}] (all upstreams), warnings: [{key (upstream_down|upstream_timeouts|servfail_high|limit_reached|cache_evicting|socket_drops), severity (warning|error), text, args}]}",
+        "{top?: int 1..100 (clients, names and failing domains listed, default 10)} → {resolver: router|simulated, allow_remote_requests, since (unix time counting started), elapsed_secs, queries, udp, tcp, transport: {udp4, udp6, tcp4, tcp6, truncated, socket_drops}, malformed, answered: {cache, static, upstream, stale, refused, limit, busy, malformed, …}, cache_hit_percent, rcodes: {noerror, nxdomain, servfail, refused, formerr, notimp, dropped, …}, ede: [{code, name, replies}] (RFC 8914, most first), types: [{type, queries}], latency: {p50_ms, p90_ms, p99_ms, buckets: [{below_us (null: the last, open), replies}], ranges: [{range (ms), replies}]} (since the reset), in_flight, in_flight_peak, max_concurrent_queries, limit_hits, now: {window_secs, queries_per_sec, cache_hit_percent, servfail_percent, latency_p50_ms, latency_p99_ms, evictions}|null (the last minute; null before the first readings), cache: {entries, used_bytes, max_bytes, evicted, expired, stale_served, types: [{type, entries}]}|null, clients: [{address (IPv6: its /56), queries, queries_per_sec, nxdomain, nxdomain_percent, refused, limited, error, seen_secs}], clients_tracked, clients_replaced, names: [{name, queries, queries_per_sec, error}], names_tracked, names_replaced, failing_domains: [{domain, nxdomain, servfail, failures_per_sec, names (different names failed, ±6.5 %), error, random}], domains_tracked, domains_replaced, upstreams: [{server, via (udp|dot|doh), answers, answers_per_sec, srtt_ms, rtt_p50_ms, rtt_p95_ms, timeouts, timeouts_percent, servfails, servfail_percent, truncated, failures, down, state (up|slow|down), state_secs, rtt_ranges: [6 counts, ms ranges as latency.ranges]}], rtt_ranges: [{range, replies}] (all upstreams), warnings: [{key (upstream_down|upstream_timeouts|servfail_high|limit_reached|cache_evicting|socket_drops|random_subdomain), severity (warning|error), text, args}]}",
         always, print),
     cmd!(
         "ip.dns.statistics.reset",
@@ -65,19 +81,19 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
     if !(1..=MAX_TOP).contains(&top) {
         return Err(EngineError::bad("top", format!("must be 1..{MAX_TOP}")));
     }
+    let backend = s.dns_backend();
+    let clock = backend.as_ref().and_then(|b| b.clock_ms());
     let (snap, since, resolver) = match s.dns_statistics() {
         Some((st, since)) => (
-            st.snapshot(usize::try_from(top).unwrap_or(10)),
+            st.snapshot_at(usize::try_from(top).unwrap_or(10), clock),
             since,
             "router",
         ),
         None => (Snapshot::default(), None, "simulated"),
     };
     let mut out = render(&snap);
-    let backend = s.dns_backend();
     let servers = backend.as_ref().map(|b| b.server_stats()).unwrap_or_default();
     let cache = backend.as_ref().and_then(|b| b.cache_stats());
-    let clock = backend.as_ref().and_then(|b| b.clock_ms());
     let (bases, (evicted_base, expired_base)) = s.dns_bases();
     let readings = s.dns_readings();
     let minute = last(&readings, 60);
@@ -135,6 +151,16 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(w) = &minute {
         warnings.extend(minute_warnings(w, max_queries));
     }
+    warnings.extend(snap.failing_domains.iter().filter(|(_, d)| random(d)).map(|(name, d)| {
+        let names = d.names.to_string();
+        let rate = format!("{:.0}", d.per_sec);
+        warning(
+            "random_subdomain",
+            "warning",
+            format!("Domain {name}: about {names} different names failed ({rate}/s now): a random-subdomain attack or a broken client"),
+            json!({"domain": name, "names": names, "rate": rate}),
+        )
+    }));
     o.insert("warnings".into(), Value::Array(warnings));
     Ok(out)
 }
@@ -300,6 +326,25 @@ fn minute_warnings(w: &Window, max_queries: u32) -> Vec<Value> {
     out
 }
 
+/// A domain that fails like a random-subdomain attack: fast now, on many
+/// different names.
+fn random(d: &DomainStats) -> bool {
+    d.per_sec >= RANDOM_RATE && d.names >= RANDOM_NAMES
+}
+
+/// A client as listed: an address, or an IPv6 /56.
+fn client_name(ip: &IpAddr) -> String {
+    match ip {
+        IpAddr::V6(_) => format!("{ip}/{CLIENT_V6_PREFIX}"),
+        IpAddr::V4(_) => ip.to_string(),
+    }
+}
+
+/// The root zone's name (an empty key) as a DNS tool writes it.
+fn dotted(name: &str) -> &str {
+    if name.is_empty() { "." } else { name }
+}
+
 fn ranges(h: &Hist) -> Value {
     Value::Array(
         RANGES
@@ -351,10 +396,22 @@ fn render(snap: &Snapshot) -> Value {
         "in_flight": c.in_flight,
         "in_flight_peak": c.in_flight_peak,
         "limit_hits": got("busy"),
-        "clients": snap.top_clients.iter().map(|(ip, st)| json!({"address": ip,
-            "queries": st.queries, "refused": st.refused, "error": st.error})).collect::<Vec<_>>(),
+        "clients": snap.top_clients.iter().map(|(ip, st)| json!({"address": client_name(ip),
+            "queries": st.queries, "queries_per_sec": round1(st.per_sec), "nxdomain": st.nxdomain,
+            "nxdomain_percent": percent(st.nxdomain, st.queries).map(round1),
+            "refused": st.refused, "limited": st.limited, "error": st.error,
+            "seen_secs": snap.now_ms.saturating_sub(st.last_ms) / 1000})).collect::<Vec<_>>(),
         "clients_tracked": snap.clients_tracked,
         "clients_replaced": c.clients_replaced,
+        "names": snap.top_names.iter().map(|(name, st)| json!({"name": dotted(name),
+            "queries": st.queries, "queries_per_sec": round1(st.per_sec), "error": st.error})).collect::<Vec<_>>(),
+        "names_tracked": snap.names_tracked,
+        "names_replaced": c.names_replaced,
+        "failing_domains": snap.failing_domains.iter().map(|(name, d)| json!({"domain": dotted(name),
+            "nxdomain": d.nxdomain, "servfail": d.servfail, "failures_per_sec": round1(d.per_sec),
+            "names": d.names, "error": d.error, "random": random(d)})).collect::<Vec<_>>(),
+        "domains_tracked": snap.domains_tracked,
+        "domains_replaced": c.domains_replaced,
     })
 }
 
@@ -429,14 +486,57 @@ mod tests {
         assert_eq!(out["types"][0], json!({"type": "A", "queries": 4}));
         let clients = out["clients"].as_array().unwrap();
         assert_eq!(clients.len(), 2, "top 2 of 3");
-        assert_eq!(clients[0], json!({"address": "192.168.88.10", "queries": 3,
-            "refused": 0, "error": 0}));
+        assert_eq!(clients[0]["address"], "192.168.88.10");
+        assert_eq!((clients[0]["queries"].clone(), clients[0]["refused"].clone()), (json!(3), json!(0)));
+        assert_eq!(clients[0]["nxdomain_percent"], 0.0);
+        assert_eq!(clients[0]["seen_secs"], 0, "the forwarder's clock: no daemon, the latest query");
+        assert_eq!(out["names"][0], json!({"name": "nas.lan", "queries": 5, "queries_per_sec": 0.5, "error": 0}));
         assert_eq!(out["clients_tracked"], 3);
         assert_eq!(s.execute("ip.dns.statistics.reset", &json!({})).unwrap()["reset"], true);
         let out = s.execute("ip.dns.statistics.print", &json!({})).unwrap();
         assert_eq!(out["queries"], 0);
         assert_eq!(out["clients"], json!([]));
         assert_eq!(out["cache_hit_percent"], Value::Null);
+    }
+
+    #[test]
+    fn names_failing_domains_and_a_random_subdomain_attack() {
+        let mut s = Session::virtual_lab();
+        let f = wired(&mut s);
+        for i in 0..300 {
+            // No upstream: each one fails (SERVFAIL), each name new.
+            send(&f, [192, 168, 88, 30], &format!("r{i}.victim.example."), A);
+        }
+        send(&f, [192, 168, 88, 10], "nas.lan.", A);
+        // An IPv6 client is its /56 (refused: outside allowed_from).
+        let v6: IpAddr = "2001:db8:1:ab12::7".parse().unwrap();
+        drop(f.start(&ask("nas.lan.", A), v6, false, 1000));
+        let out = s.execute("ip.dns.statistics.print", &json!({"top": 3})).unwrap();
+        let d = &out["failing_domains"][0];
+        assert_eq!(d["domain"], "victim.example");
+        assert_eq!((d["servfail"].clone(), d["nxdomain"].clone()), (json!(300), json!(0)));
+        assert!(d["names"].as_u64().is_some_and(|n| (260..=300).contains(&n)), "{d}");
+        assert_eq!(d["random"], true);
+        assert_eq!(out["domains_tracked"], 1);
+        assert_eq!(out["names"].as_array().unwrap().len(), 3, "top 3");
+        let w = out["warnings"].as_array().unwrap().iter().find(|w| w["key"] == "random_subdomain").unwrap();
+        assert_eq!(w["args"]["domain"], "victim.example");
+        assert_eq!(w["args"]["rate"], "30", "300 in the 10 s window");
+        let clients = out["clients"].as_array().unwrap();
+        assert_eq!(clients[0]["address"], "192.168.88.30");
+        assert_eq!(clients[0]["queries_per_sec"], 30.0);
+        assert_eq!(clients[0]["nxdomain_percent"], 0.0, "SERVFAIL is not NXDOMAIN");
+        let all = s.execute("ip.dns.statistics.print", &json!({"top": 10})).unwrap();
+        assert!(all["clients"].as_array().unwrap().iter().any(|c| c["address"] == "2001:db8:1:ab00::/56"), "{}", all["clients"]);
+        // No name is ever listed with a client (LGPD).
+        for c in all["clients"].as_array().unwrap() {
+            let keys: Vec<&String> = c.as_object().unwrap().keys().collect();
+            assert!(!keys.iter().any(|k| ["name", "names", "domain", "qname"].contains(&k.as_str())), "{keys:?}");
+        }
+        // Reset clears names and domains too.
+        s.execute("ip.dns.statistics.reset", &json!({})).unwrap();
+        let out = s.execute("ip.dns.statistics.print", &json!({})).unwrap();
+        assert_eq!((out["names"].clone(), out["failing_domains"].clone()), (json!([]), json!([])));
     }
 
     #[test]
