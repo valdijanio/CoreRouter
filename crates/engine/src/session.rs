@@ -657,6 +657,8 @@ impl Session {
         self.ext.set(ValidRunning(self.store.running().clone()));
         // G2.3: the CGNAT mapping history ("who was") follows every commit.
         self.cgnat_note();
+        // G1.31: WireGuard keys and peers (sealed in the config) right away.
+        self.wireguard_after_commit();
         let line = match (&delta, self.store.history().last()) {
             (Some(d), Some(rev)) => persist::encode_journal_line(rev, base, d).ok(),
             _ => None,

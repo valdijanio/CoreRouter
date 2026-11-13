@@ -30,7 +30,7 @@ use rtnetlink::packet_route::route::{
 };
 use rtnetlink::{
     AddressMessageBuilder, Handle, LinkBond, LinkBridge, LinkDummy, LinkMessageBuilder, LinkUnspec,
-    LinkVeth, LinkVlan, LinkVrf, RouteMessageBuilder,
+    LinkVeth, LinkVlan, LinkVrf, LinkWireguard, RouteMessageBuilder,
 };
 
 use crate::link_dump::mac_text;
@@ -676,6 +676,7 @@ impl Link {
             LinkSpec::Vrf { .. } => InfoKind::Vrf,
             LinkSpec::Bond { .. } => InfoKind::Bond,
             LinkSpec::PppoeOut { .. } => InfoKind::Veth,
+            LinkSpec::Wireguard => InfoKind::Wireguard,
         };
         self.kind.as_ref() == Some(&want)
     }
@@ -691,7 +692,10 @@ impl Link {
                 } => self.vlan_id == Some(*vlan_id) && self.vlan_service_tag == *service_tag,
                 LinkSpec::Vrf { table } => self.vrf_table == Some(*table),
                 LinkSpec::Bond { mode, .. } => self.bond_mode == Some(kernel_bond_mode(*mode)),
-                LinkSpec::Bridge | LinkSpec::Dummy | LinkSpec::PppoeOut { .. } => true,
+                LinkSpec::Bridge
+                | LinkSpec::Dummy
+                | LinkSpec::PppoeOut { .. }
+                | LinkSpec::Wireguard => true,
             }
     }
 
@@ -908,7 +912,8 @@ impl Kernel {
             | LinkSpec::Dummy
             | LinkSpec::Vrf { .. }
             | LinkSpec::Bond { .. }
-            | LinkSpec::PppoeOut { .. } => None,
+            | LinkSpec::PppoeOut { .. }
+            | LinkSpec::Wireguard => None,
         };
         if let Some(l) = self.find(link).await? {
             // Same link already there (daemon restart): adopt it, nothing to undo.
@@ -949,6 +954,8 @@ impl Kernel {
             (LinkSpec::Vrf { table }, _) => LinkVrf::new(name, *table).build(),
             // No ARP on a point-to-point link: the relay owns the far end.
             (LinkSpec::PppoeOut { peer }, _) => LinkVeth::new(name, peer).arp(false).build(),
+            // G1.31: keys and peers come after, from `wireguard::set`.
+            (LinkSpec::Wireguard, _) => LinkWireguard::new(name).build(),
             (
                 LinkSpec::Bond {
                     mode,

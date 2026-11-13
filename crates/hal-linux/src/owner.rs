@@ -195,6 +195,8 @@ fn claim_fits(claim: &InterfaceKind, link: &KernelLink) -> bool {
         InterfaceKind::Bonding { .. } => link.is("bond"),
         // The session's netdev is one end of a veth pair (G3.9ga).
         InterfaceKind::PppoeClient(_) => link.is("veth"),
+        // G1.31: the kernel's own WireGuard link.
+        InterfaceKind::Wireguard(_) => link.is("wireguard"),
     }
 }
 
