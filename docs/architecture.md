@@ -1069,9 +1069,10 @@ que sobram são de arquitetura nossa (gaps com número), não da biblioteca.
 ping/MTR/MTU ─► Session::tool_prober ─► RouterResolver::resolve ─┐
 cliente NTP ─► service::dns::resolve ────────────────────────────┤ (sem lock do Session)
                                                                  ▼
-               proto-dns::Resolver: cache (lock curto) ─► fetch: servidores um a um
-                                                                 │ Transport
+               proto-dns::Resolver: cache (lock curto) ─► Lookup (máquina de estados)
+                                                                 │ Transport (bloqueante)
                service/dns.rs: UDP (+TCP no TC) ◄────────────────┘
+encaminhador da LAN: dns-udp ─► Resolver::begin ─► laço dns-upstream (mio) ─► Resolver::complete
 thread "dns" (1 s): Session::dns_settings (running ip.dns + DHCP use_peer_dns) ─► configure
 ```
 
