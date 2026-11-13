@@ -76,7 +76,9 @@ VM do laboratório: 8 vCPUs AMD EPYC-Genoa (KVM, `host-model`), 16 GiB, kernel 7
 roteador em 2 ou 4 vCPUs, gerador e origem nas outras 4. Números de VM servem para comparar antes
 e depois, não como número de produção (veja "Fase C"). **Antes** = o daemon da imagem G1.6zd (main
 `d2a454d2`, raiz da imagem num chroot); **depois** = esta branch (`--daemon build`). Release nos dois.
-As tabelas completas de cada rodada (`results.md`) ficam em `/srv/lab/dns-stress/` na VM.
+As tabelas completas de cada rodada (`results.md`) ficam em `/srv/lab/dns-stress/` na VM. Rodada de
+confirmação com a imagem e o roteiro final (`--host`, todos os testes menos `soak`, 2026-11-13):
+**OK**, com uma linha LIMITE (o DHCP com nome na zona, G4.1p).
 
 ### Consultas por segundo (`qps`)
 
