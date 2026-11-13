@@ -62,6 +62,15 @@ pub trait RoutingDaemon: Send {
         let _ = (instance, neighbor, how);
         Err(HalError::Unsupported("BGP session actions".into()))
     }
+
+    /// G3.4r: take OSPF instance `instance` (in VRF `vrf`) out of the
+    /// LSDB protection's ignore or isolated state now and forget its ignore
+    /// periods (a running-state action, as Junos `clear ospf
+    /// database-protection`).
+    fn ospf_max_lsa_clear(&mut self, instance: &str, vrf: &str) -> Result<(), HalError> {
+        let _ = (instance, vrf);
+        Err(HalError::Unsupported("OSPF LSDB protection".into()))
+    }
 }
 
 /// Reads the routing daemons' state; owned by a thread of its own.

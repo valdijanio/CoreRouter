@@ -97,6 +97,38 @@ const INST_FIELDS: &[Field] = &[
     field("stub_router_on_startup", "Stub Router On Startup", "ospf.instance.stub_router_on_startup", Input::Text("300 s (empty: off)")),
     field("disabled", "Disabled", "ospf.disabled", Input::Check),
     field("comment", "Comment", "", Input::Text("")),
+    // G3.4r: the LSDB Protection page.
+    field("max_lsa", "Max LSA", "ospf.instance.max_lsa", Input::Text("50000 (empty: no limit)")),
+    field("max_lsa_threshold", "Warning Threshold", "ospf.instance.max_lsa_threshold", Input::Text("75 %")),
+    field("max_lsa_warning_only", "Warning Only", "ospf.instance.max_lsa_warning_only", Input::Check),
+    field("max_lsa_ignore_time", "Ignore Time", "ospf.instance.max_lsa_ignore_time", Input::Text("300 s")),
+    field("max_lsa_ignore_count", "Ignore Count", "ospf.instance.max_lsa_ignore_count", Input::Text("5")),
+    field("max_lsa_reset_time", "Reset Time", "ospf.instance.max_lsa_reset_time", Input::Text("600 s")),
+];
+
+/// G3.4r: the pages of the instance modal.
+const INST_PAGES: [&str; 2] = ["General", "LSDB Protection"];
+const INST_GENERAL: &[&str] = &[
+    "name",
+    "version",
+    "vrf",
+    "router_id",
+    "redistribute",
+    "out_filter_chain",
+    "originate_default",
+    "subscriber_pools",
+    "stub_router",
+    "stub_router_on_startup",
+    "disabled",
+    "comment",
+];
+const INST_LSDB: &[&str] = &[
+    "max_lsa",
+    "max_lsa_threshold",
+    "max_lsa_warning_only",
+    "max_lsa_ignore_time",
+    "max_lsa_ignore_count",
+    "max_lsa_reset_time",
 ];
 
 const AREA_FIELDS: &[Field] = &[
@@ -183,13 +215,14 @@ const NBR_COLUMNS: [table::Column; 8] = [
     col("BFD").help("ospf.template.bfd"),
     col("Instance").help("ospf.area.instance"),
 ];
-const INST_COLUMNS: [table::Column; 9] = [
+const INST_COLUMNS: [table::Column; 10] = [
     col("Name").help("ospf.instance.name"),
     col("Version").help("ospf.instance.version"),
     col("Router ID").help("ospf.instance.router_id"),
     col("VRF").help("ospf.instance.vrf"),
     col("Redistribute").help("ospf.instance.redistribute"),
     col("Stub Router").help("ospf.instance.stub_router"),
+    col("LSDB").help("ospf.instance.lsdb"),
     num("Areas").help("ospf.tab.areas"),
     num("Interfaces").help("ospf.template.interfaces"),
     comment(),
@@ -306,6 +339,8 @@ pub(crate) struct OspfPanel {
     lsa_table: TableState,
     pub(crate) route_table: TableState,
     pub(crate) modal: Option<(What, Modal)>,
+    /// G3.4r: the page of the instance modal (General, LSDB Protection).
+    pub(crate) inst_page: usize,
     pub(crate) help: Option<HelpView>,
 }
 
@@ -441,6 +476,7 @@ fn inst_row(r: &Value) -> Row {
                 chips(&c)
             },
             stub_cell(r),
+            lsdb_cell(r),
             s(r, "areas"),
             s(r, "interfaces"),
             s(r, "comment"),
@@ -467,6 +503,98 @@ fn stub_cell(r: &Value) -> String {
         None if configured => cell("", &[("pending", Kind::Neutral)]),
         _ => "–".into(),
     }
+}
+
+/// G3.4r: the database's size and the LSDB protection: the count against
+/// the limit (amber past the warning threshold or the limit), red while
+/// the protection holds the instance down; the count alone with no limit.
+fn lsdb_cell(r: &Value) -> String {
+    let Some(st) = r.get("lsdb").filter(|v| !v.is_null()) else {
+        return "–".into();
+    };
+    let num = |k: &str| st.get(k).and_then(Value::as_u64);
+    let count = num("lsas_other").or_else(|| num("lsas"));
+    let n = |v: Option<u64>| v.map_or_else(|| "?".to_owned(), |v| crate::tuning::grouped(i64::try_from(v).unwrap_or(i64::MAX)));
+    let Some(p) = st.get("protection").filter(|v| !v.is_null()) else {
+        return count.map_or_else(|| "–".to_owned(), |c| n(Some(c)));
+    };
+    let limit = p.get("limit").and_then(Value::as_u64);
+    let of = format!("{} / {}", n(count), n(limit));
+    let pct = match (count, limit) {
+        (Some(c), Some(l)) if l > 0 => c.saturating_mul(100) / l,
+        _ => 0,
+    };
+    match s(p, "state").as_str() {
+        "ignore" => {
+            let left = p.get("remaining_secs").and_then(Value::as_u64);
+            let periods = format!("{}/{}", s(p, "ignore_entries"), s(p, "ignore_count"));
+            let text = match left {
+                Some(t) => format!("ignore {}m{:02}s · {periods}", t / 60, t % 60),
+                None => format!("ignore · {periods}"),
+            };
+            chips(&[(text, Kind::Red)])
+        }
+        "isolated" => cell("", &[("isolated", Kind::Red)]),
+        "exceeded" => chips(&[(format!("{of} · over"), Kind::Amber)]),
+        "warning" => chips(&[(format!("{of} · {pct} %"), Kind::Amber)]),
+        _ => chips(&[(of, Kind::Neutral)]),
+    }
+}
+
+/// G3.4r: Clear LSDB Protection of the selected instance, while its
+/// protection holds it down (ignore or isolated).
+fn clear_lsdb_button(ui: &mut Ui, picked: &[Item], data: &[Value], can: Result<(), String>, l: crate::i18n::Lang) -> Option<Value> {
+    let label = tr_in(SCOPE, l, "Clear LSDB Protection");
+    let row = match picked {
+        [one] => data.iter().find(|r| s(r, "name") == one.key),
+        _ => None,
+    };
+    let state = row
+        .and_then(|r| r.get("lsdb"))
+        .and_then(|v| v.get("protection"))
+        .map(|p| s(p, "state"))
+        .unwrap_or_default();
+    let why = match (row, can) {
+        (None, _) => Err("select one instance".to_owned()),
+        (Some(_), Err(e)) => Err(e),
+        (Some(_), Ok(())) if state != "ignore" && state != "isolated" => Err("the LSDB protection holds nothing down".to_owned()),
+        (Some(r), Ok(())) => Ok(r),
+    };
+    match why {
+        Ok(r) => ui
+            .button(label)
+            .on_hover_text("bring the adjacencies up now and forget the ignore periods; fix what floods the LSAs first, or it goes down again")
+            .clicked()
+            .then(|| json!({"command": "routing.ospf.instance.clear-lsdb-protection", "params": {"id": s(r, "name")}})),
+        Err(e) => {
+            ui.add_enabled(false, egui::Button::new(label)).on_disabled_hover_text(e);
+            None
+        }
+    }
+}
+
+/// G3.4r: what the LSDB Protection page says about the instance now.
+fn lsdb_summary(r: Option<&Value>) -> String {
+    let Some(r) = r else {
+        return "OSPFv2 only. Empty Max LSA: no limit (the default).".into();
+    };
+    if s(r, "version") == "3" {
+        return "OSPFv3 (ospf6d) has no LSDB protection yet: only OSPFv2.".into();
+    }
+    let st = r.get("lsdb").filter(|v| !v.is_null());
+    let num = |k: &str| st.and_then(|v| v.get(k)).and_then(Value::as_u64);
+    let now = match (num("lsas_other"), num("lsas")) {
+        (Some(o), _) => format!("Now: {} LSAs of other routers", crate::tuning::grouped(i64::try_from(o).unwrap_or(i64::MAX))),
+        (None, Some(t)) => format!("Now: {} LSAs", crate::tuning::grouped(i64::try_from(t).unwrap_or(i64::MAX))),
+        _ => "Now: the daemon has not answered".into(),
+    };
+    let mib = num("memory_mib").map(|m| format!(" (~{m} MiB in ospfd + zebra)")).unwrap_or_default();
+    let state = st
+        .and_then(|v| v.get("protection"))
+        .filter(|v| !v.is_null())
+        .map(|p| format!("; protection {}", s(p, "state")))
+        .unwrap_or_else(|| "; no limit".into());
+    format!("{now}{mib}{state}.")
 }
 
 /// G3.9c: Drain / Undrain of the selected instance: `stub_router` on or
@@ -691,7 +819,7 @@ fn values_of(r: &Value, what: What) -> BTreeMap<&'static str, String> {
     for f in fields {
         let v = match f.param {
             "auth_key" => String::new(),
-            "disabled" | "passive" | "mtu_ignore" | "no_summaries" | "subscriber_pools" | "stub_router" | "force" => {
+            "disabled" | "passive" | "mtu_ignore" | "no_summaries" | "subscriber_pools" | "stub_router" | "force" | "max_lsa_warning_only" => {
                 if flag(r, f.param) { "yes" } else { "no" }.to_owned()
             }
             "interfaces" | "networks" | "redistribute" => list_of(r, f.param).join(","),
@@ -906,12 +1034,19 @@ impl OspfPanel {
         }
         let mut act = None;
         let mut drain = None;
+        let can_clear = app.can().check("routing.ospf.instance.clear-lsdb-protection");
         ui.horizontal(|ui| {
             act = list::toolbar(ui, salt, &tools, &selection, l);
             if what == What::Instance {
                 drain = drain_button(ui, &picked, &data, &tools, l);
                 if help::info_button(ui, egui::Id::unique("ospf-drain-help"), tr_in(SCOPE, l, "Drain")).clicked() {
                     self.help = Some(HelpView::new("ospf.instance.drain", tr_in(SCOPE, l, "Drain")));
+                }
+                if let Some(step) = clear_lsdb_button(ui, &picked, &data, can_clear, l) {
+                    drain = Some(step);
+                }
+                if help::info_button(ui, egui::Id::unique("ospf-clear-lsdb-help"), tr_in(SCOPE, l, "Clear LSDB Protection")).clicked() {
+                    self.help = Some(HelpView::new("ospf.instance.clear_lsdb_protection", tr_in(SCOPE, l, "Clear LSDB Protection")));
                 }
             }
             table::find_field(ui, salt, table);
@@ -989,6 +1124,7 @@ impl OspfPanel {
         match act {
             Act::Add => {
                 if self.modal.is_none() {
+                    self.inst_page = 0;
                     let mut values = BTreeMap::new();
                     match what {
                         What::Instance => {
@@ -1052,6 +1188,7 @@ impl OspfPanel {
         if let Some((_, m)) = &mut self.modal {
             m.status.bring_to_front();
         } else if let Some(r) = row {
+            self.inst_page = 0;
             self.modal = Some((what, Modal::open(app, Some((key.to_owned(), title(&r))), values_of(&r, what))));
         }
     }
@@ -1367,11 +1504,42 @@ impl PanelState for OspfPanel {
                 What::PrefixSid => &crate::ospf_sr::SID_SPEC,
             };
             let w = *what;
-            let open = m.show(app, ctx, area, spec, &|p| match (w, p) {
-                (What::Template, "type") => options(p, &areas, &[], &chains),
-                (What::Area, "type") => options(p, &[], &instances, &chains),
-                _ => options(p, &areas, &instances, &chains),
-            });
+            let l = app.lang.labels;
+            // G3.4r: the instance modal has two pages; the second says
+            // what the database holds now.
+            let summary = lsdb_summary(m.item.as_ref().and_then(|id| self.instances.iter().find(|r| s(r, "name") == *id)));
+            let page = &mut self.inst_page;
+            let open = m.show_paged(
+                app,
+                ctx,
+                area,
+                spec,
+                &|p| match (w, p) {
+                    (What::Template, "type") => options(p, &areas, &[], &chains),
+                    (What::Area, "type") => options(p, &[], &instances, &chains),
+                    _ => options(p, &areas, &instances, &chains),
+                },
+                &mut |ui| {
+                    if w != What::Instance {
+                        return Some(&[]);
+                    }
+                    ui.horizontal(|ui| {
+                        for (i, label) in INST_PAGES.iter().enumerate() {
+                            if ui.selectable_label(*page == i, tr_in(SCOPE, l, label)).clicked() {
+                                *page = i;
+                            }
+                        }
+                    });
+                    ui.separator();
+                    if *page == 1 {
+                        ui.weak(summary.as_str());
+                        ui.add_space(4.0);
+                        Some(INST_LSDB)
+                    } else {
+                        Some(INST_GENERAL)
+                    }
+                },
+            );
             if !open {
                 self.modal = None;
             }
@@ -1458,7 +1626,7 @@ impl OspfPanel {
         for f in INST_FIELDS.iter().chain(AREA_FIELDS).chain(TPL_FIELDS).chain(KC_FIELDS) {
             out.push(f.help);
         }
-        out.extend([INST_SPEC.help, AREA_SPEC.help, TPL_SPEC.help, KC_SPEC.help, "ospf.diagnose", "ospf.path", "ospf.topology.legend"]);
+        out.extend([INST_SPEC.help, AREA_SPEC.help, TPL_SPEC.help, KC_SPEC.help, "ospf.diagnose", "ospf.path", "ospf.topology.legend", "ospf.instance.drain", "ospf.instance.clear_lsdb_protection"]);
         out.extend(crate::ospf_sr::help_keys());
         out.extend(crate::ospf_frr::help_keys());
         out.retain(|k| !k.is_empty());

@@ -24,6 +24,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Before"##, r##"Antes"##),
     (r##"Behavior"##, r##"Comportamento"##),
     (r##"Body"##, r##"Conteúdo"##),
+    (r##"Clear LSDB Protection"##, r##"Limpar proteção da LSDB"##),
     (r##"Comment"##, r##"Comentário"##),
     (r##"Cost"##, r##"Custo"##),
     (r##"Coverage"##, r##"Cobertura"##),
@@ -38,8 +39,11 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Fast Reroute"##, r##"Fast Reroute"##),
     (r##"Fit"##, r##"Ajustar"##),
     (r##"Force"##, r##"Forçar"##),
+    (r##"General"##, r##"Geral"##),
     (r##"Hello Interval"##, r##"Hello interval"##),
     (r##"ID"##, r##"ID"##),
+    (r##"Ignore Count"##, r##"Vezes em ignore"##),
+    (r##"Ignore Time"##, r##"Tempo em ignore"##),
     (r##"In"##, r##"Entra"##),
     (r##"Index"##, r##"Índice"##),
     (r##"Instance"##, r##"Instância"##),
@@ -55,12 +59,14 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Kind"##, r##"Tipo"##),
     (r##"LDP"##, r##"LDP"##),
     (r##"LSDB"##, r##"LSDB"##),
+    (r##"LSDB Protection"##, r##"Proteção da LSDB"##),
     (r##"Label"##, r##"Rótulo"##),
     (r##"Label Stack"##, r##"Pilha de rótulos"##),
     (r##"Loopback SIDs"##, r##"SIDs das loopbacks"##),
     (r##"MSD"##, r##"MSD"##),
     (r##"MTU Ignore"##, r##"Ignorar MTU"##),
     (r##"Match"##, r##"Casa com"##),
+    (r##"Max LSA"##, r##"Máx. de LSAs"##),
     (r##"NSSA"##, r##"NSSA"##),
     (r##"NSSA Translate"##, r##"Tradução NSSA"##),
     (r##"Name"##, r##"Nome"##),
@@ -98,6 +104,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Reading the database from the routing daemon…"##, r##"Lendo a base do daemon de roteamento…"##),
     (r##"Reason"##, r##"Motivo"##),
     (r##"Redistribute"##, r##"Redistribuir"##),
+    (r##"Reset Time"##, r##"Tempo para zerar"##),
     (r##"Rotation"##, r##"Rotação"##),
     (r##"Router"##, r##"Router"##),
     (r##"Router ID"##, r##"Router ID"##),
@@ -139,6 +146,8 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Used By"##, r##"Usada por"##),
     (r##"VRF"##, r##"VRF"##),
     (r##"Version"##, r##"Versão"##),
+    (r##"Warning Only"##, r##"Só avisar"##),
+    (r##"Warning Threshold"##, r##"Limiar de aviso"##),
     (r##"Warnings"##, r##"Avisos"##),
     (r##"Why this neighbor is not Full, with the RFC section that says so"##, r##"Por que este vizinho não chega a Full, com a seção da RFC que diz isso"##),
     (r##"Why this path?"##, r##"Por que esse caminho?"##),
@@ -211,11 +220,42 @@ Os segmentos do reparo calculados como o `ospfd` faz (nó PQ, ou nó P e adjacê
 **Rotas**: cada rota com o próximo salto principal e o de reserva e a pilha de rótulos (como o next-hop de reserva do Junos). **Sem proteção**: as rotas sem reserva e por quê (único caminho, conectada, externa, roteador sem SID). **Simular corte de link**: escolha um vizinho e veja o reserva de cada rota afetada e o caminho depois da convergência, sem tocar a rede."##),
     (r##"ospf.instance"##, r##"## O que é
 Uma instância OSPF (`/routing ospf instance`). A prévia mostra em quais interfaces ela roda e o que a mudança faz (inclusive adjacências que caem)."##),
+    (r##"ospf.instance.clear_lsdb_protection"##, r##"## O que é
+Tira a instância selecionada do estado `ignore` ou `isolated` da proteção da LSDB agora e zera os períodos: as adjacências sobem de novo (`routing.ospf.instance.clear-lsdb-protection`, como o `clear ospf database-protection` do Junos). Só ativo enquanto a proteção segura a instância.
+
+## Antes
+Ache quem injeta as LSAs (aba LSDB, agrupada por Adv. Router) e corrija a redistribuição dele; senão a instância cai de novo assim que a base passar do limite."##),
     (r##"ospf.instance.drain"##, r##"## O que é
 Liga (Drenar) ou desliga (Desfazer drenagem) o stub router da instância selecionada: `routing.ospf.instance.set {stub_router}`. Drenado, todo enlace de trânsito da router-LSA vai a custo 65535 e o tráfego contorna este roteador; as redes dele continuam alcançáveis (RFC 6987).
 
 ## Quando
 Antes de uma manutenção, ou para pôr um roteador novo no núcleo sem carregar tráfego. Em Safe Mode ou em modo transacional, a mudança volta junto com o resto."##),
+    (r##"ospf.instance.lsdb"##, r##"## O que é
+O tamanho da base de estados de enlace (LSDB) da instância: as LSAs de outros roteadores (o que o Max LSA conta) contra o limite, ou a contagem só, sem limite. Âmbar a partir do limiar de aviso; vermelho enquanto a proteção segura a instância fora (`ignore` com o tempo que falta e os períodos, ou `isolated`).
+
+## Por que importa
+Cada LSA custa ~1,5 KiB no `ospfd` e cada rota ~0,6 KiB no `zebra` (**medido**). Uma redistribuição errada em outro roteador (a tabela BGP inteira no OSPF) leva este roteador à falta de memória em segundos: 175 000 LSAs chegaram em 1 s no laboratório."##),
+    (r##"ospf.instance.max_lsa"##, r##"## O que é
+Proteção da LSDB: o máximo de LSAs **de outros roteadores** na base (as deste roteador não contam), como o `max-lsa` do Cisco e o `database-protection` do Junos. Passou do limite, a instância cai pelo Tempo em ignore: derruba **todas** as adjacências e apaga o que aprendeu (a base da área continua coerente, porque ninguém passa por este roteador), e depois volta. Depois de Vezes em ignore seguidas, fica isolada até o Limpar proteção da LSDB. Vazio: sem limite (o padrão, como no RouterOS e no FRR). Só OSPFv2.
+
+## Cuidados
+Um limite baixo derruba o roteador da rede no crescimento normal. Se a gerência passa pelo OSPF, há lockout: use Safe Mode. O mesmo limite em todos os roteadores faz todos caírem juntos. A memória de uma enxurrada não volta ao sistema depois; o limite só segura o pico.
+
+## Recomendado
+Um limite que caiba na RAM (2,1 KiB por LSA no `ospfd` + `zebra`) e com folga sobre o tamanho normal da base (2× ou mais). Comece com Só avisar para ver a base crescer antes de deixar cair."##),
+    (r##"ospf.instance.max_lsa_ignore_count"##, r##"## O que é
+Quantos períodos em ignore seguidos antes de a instância ficar isolada até alguém liberar (Limpar proteção da LSDB). 1–32; padrão 5."##),
+    (r##"ospf.instance.max_lsa_ignore_time"##, r##"## O que é
+Quanto tempo a instância fica fora (sem adjacência, sem LSA aprendida) depois de passar do Max LSA, antes de tentar de novo. 30–3600 s; padrão 300 s (Cisco e Junos).
+
+## Cuidados
+Na volta a base chega inteira de novo (Full em ~7 s, **medido**). Se a causa continua, cai de novo e conta mais um período."##),
+    (r##"ospf.instance.max_lsa_reset_time"##, r##"## O que é
+Quanto tempo de pé, sem passar do Max LSA de novo, zera a contagem de períodos em ignore. 60–86400 s; padrão 600 s."##),
+    (r##"ospf.instance.max_lsa_threshold"##, r##"## O que é
+A porcentagem do Max LSA em que o roteador avisa (log e saúde `ospf.lsdb`), antes de cair. 1–100; padrão 75 %."##),
+    (r##"ospf.instance.max_lsa_warning_only"##, r##"## O que é
+Só avisa ao passar do Max LSA (log e saúde), sem nunca derrubar a instância. Serve para medir a base antes de ligar a proteção de verdade; não protege a memória."##),
     (r##"ospf.instance.name"##, r##"## O que é
 O nome da instância (as áreas a citam por ele)."##),
     (r##"ospf.instance.originate_default"##, r##"## O que é

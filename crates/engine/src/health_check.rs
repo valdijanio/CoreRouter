@@ -271,9 +271,33 @@ pub struct Inputs {
     /// for `NO_HANDSHAKE_ALERT_SECS` or more: (peer, interface, seconds,
     /// had a handshake once). A peer that only waits or idles is not here.
     pub wireguard_stale: Vec<(String, String, u64, bool)>,
+    /// G3.4r: each running OSPF instance's database and LSDB protection, as
+    /// the routing daemon reads them. `None`: no routing daemon.
+    pub ospf_lsdb: Option<Vec<OspfLsdbInput>>,
+    /// The RAM, bytes (`None`: not read yet).
+    pub ram_bytes: Option<u64>,
     /// Whether any reading exists at all.
     pub readings: bool,
 }
+
+/// G3.4r: one OSPF instance for the `ospf.lsdb` check.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OspfLsdbInput {
+    pub instance: String,
+    /// LSAs in its databases (this router's included).
+    pub lsas: u64,
+    /// Of other routers (the patched ospfd).
+    pub others: Option<u64>,
+    /// The configured limit and its warning threshold (LSAs).
+    pub limit: Option<(u64, u64)>,
+    pub protection: Option<corerouter_model::ospf_state::MaxLsaState>,
+}
+
+/// G3.4r: the share of the RAM the OSPF databases may take (estimated for
+/// ospfd + zebra) before the check warns, and before it is an error: the
+/// memory of a flood does not come back after it (glibc, **medido**).
+pub const OSPF_LSDB_RAM_WARN: u64 = 25;
+pub const OSPF_LSDB_RAM_ERROR: u64 = 50;
 
 /// G1.6zy: what the memory check looks at.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -800,6 +824,8 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
         }
     }
 
+    ospf_lsdb(i, &mut out);
+
     // G3.9fj, RFC 8538: graceful restart with the N bit and no BFD.
     let (key, name) = ("bgp.gr-bfd", "BGP GR without BFD");
     match &i.bgp_gr_no_bfd {
@@ -1118,6 +1144,80 @@ impl HealthAlerts {
     }
 }
 
+/// G3.4r: the OSPF databases: an instance down by its LSDB protection
+/// (error), one past its limit with warning-only or its threshold, and
+/// the memory the databases take against the RAM even with no limit (the
+/// alert that would have caught the flood of the gap with nothing
+/// configured).
+fn ospf_lsdb(i: &Inputs, out: &mut Vec<Check>) {
+    use corerouter_model::ospf_state::lsdb_memory_bytes;
+    let (key, name) = ("ospf.lsdb", "OSPF LSDB");
+    let Some(insts) = &i.ospf_lsdb else {
+        out.push(Check { key, name, severity: Severity::Unknown, value: None, reason: "nenhum daemon de roteamento informou o OSPF".into(), action: None });
+        return;
+    };
+    if insts.is_empty() {
+        out.push(Check { key, name, severity: Severity::Ok, value: None, reason: "nenhuma instância OSPF rodando".into(), action: None });
+        return;
+    }
+    let find = "Ache quem injeta: Routing › OSPF › LSDB agrupada por Adv. Router (ou routing.ospf.lsdb.print), corrija a redistribuição dele";
+    // The worst instance speaks; the rest are counted.
+    let mut worst: Option<Check> = None;
+    let mut keep = |c: Check| {
+        if worst.as_ref().is_none_or(|w| c.severity > w.severity) {
+            worst = Some(c);
+        }
+    };
+    let mut total = 0u64;
+    for o in insts {
+        total = total.saturating_add(o.lsas);
+        let others = o.others.unwrap_or(o.lsas);
+        if let Some(p) = &o.protection {
+            match p.state.as_str() {
+                "ignore" => keep(Check { key, name, severity: Severity::Error,
+                    value: Some(format!("{}: ignore", o.instance)),
+                    reason: format!("{} em ignore (LSDB protection): acima de {} LSAs de outros roteadores, adjacências derrubadas; nova tentativa em {} ({} de {} períodos)",
+                        o.instance, p.limit, p.ignore_remaining_secs.map_or("instantes".into(), |t| format!("{}m{:02}s", t / 60, t % 60)), p.ignore_entries, p.ignore_count),
+                    action: Some(format!("{find}; depois do último período ela fica isolada até o Clear LSDB Protection (routing.ospf.instance.clear-lsdb-protection).")) }),
+                "isolated" => keep(Check { key, name, severity: Severity::Error,
+                    value: Some(format!("{}: isolated", o.instance)),
+                    reason: format!("{} isolada (LSDB protection): passou de {} LSAs de outros roteadores em {} períodos seguidos; sem adjacência até alguém liberar", o.instance, p.limit, p.ignore_count),
+                    action: Some(format!("{find}, e então Clear LSDB Protection (routing.ospf.instance.clear-lsdb-protection).")) }),
+                "exceeded" => keep(Check { key, name, severity: Severity::Warning,
+                    value: Some(format!("{others} / {}", p.limit)),
+                    reason: format!("{}: {others} LSAs de outros roteadores, acima do limite de {} (warning-only: a instância segue)", o.instance, p.limit),
+                    action: Some(format!("{find}, ou suba o limite (Max LSA) se o crescimento é legítimo.")) }),
+                "warning" => keep(Check { key, name, severity: Severity::Warning,
+                    value: Some(format!("{others} / {}", p.limit)),
+                    reason: format!("{}: {others} LSAs de outros roteadores, {} % do limite de {}; acima dele a instância cai", o.instance, others.saturating_mul(100) / p.limit.max(1), p.limit),
+                    action: Some(format!("{find}, ou suba o limite (Max LSA) com folga se o crescimento é legítimo.")) }),
+                _ => {}
+            }
+        }
+    }
+    let used = lsdb_memory_bytes(total);
+    let mib = used.div_ceil(1 << 20);
+    if let Some(ram) = i.ram_bytes.filter(|r| *r > 0) {
+        let share = used.saturating_mul(100) / ram;
+        let severity = if share >= OSPF_LSDB_RAM_ERROR { Severity::Error } else if share >= OSPF_LSDB_RAM_WARN { Severity::Warning } else { Severity::Ok };
+        let limited = insts.iter().all(|o| o.limit.is_some());
+        if severity != Severity::Ok {
+            keep(Check { key, name, severity,
+                value: Some(format!("{share} % da RAM")),
+                reason: format!("{total} LSAs nas bases do OSPF: ~{mib} MiB no ospfd + zebra (estimado, 2,1 KiB por LSA), {share} % da RAM; a memória de uma enxurrada não volta depois"),
+                action: Some(if limited {
+                    format!("{find}; e baixe o Max LSA para caber na RAM.")
+                } else {
+                    format!("{find}; e ponha um limite (Routing › OSPF › Instances › LSDB Protection, Max LSA) que caiba na RAM.")
+                }) });
+        }
+    }
+    out.push(worst.unwrap_or_else(|| Check { key, name, severity: Severity::Ok,
+        value: Some(format!("{total} LSAs")),
+        reason: format!("{} instância(s), {total} LSAs, ~{mib} MiB no ospfd + zebra (estimado)", insts.len()),
+        action: None }));
+}
+
 impl Session {
     /// The rules' inputs now.
     pub(crate) fn health_inputs(&mut self) -> Inputs {
@@ -1174,6 +1274,7 @@ impl Session {
                 }
             }
             i.conntrack = l.conntrack.zip(l.conntrack_max);
+            i.ram_bytes = Some(l.memory.total).filter(|t| *t > 0);
             let e = &l.memory_errors;
             let corrupted = e.hardware_corrupted_kib.unwrap_or(0);
             i.memory = (e.controllers > 0 || corrupted > 0).then(|| MemoryInput {
@@ -1259,6 +1360,17 @@ impl Session {
                 .map(|b| b.connection.clone().unwrap_or_else(|| b.remote_address.clone()))
                 .collect();
             (all.len(), bare)
+        });
+        // G3.4r: the routing daemon's last poll (the lab floods nothing).
+        i.ospf_lsdb = self.has_routing().then(|| {
+            let (live, _) = self.ospf_stub_live();
+            let insts = &self.store().running().routing.ospf.instances;
+            live.into_iter()
+                .filter_map(|st| {
+                    let limit = insts.get(&st.instance).and_then(|c| c.max_lsa).map(|m| (u64::from(m.limit), m.warn_at()));
+                    Some(OspfLsdbInput { lsas: st.lsas?, others: st.lsas_other, limit, protection: st.max_lsa, instance: st.instance })
+                })
+                .collect()
         });
         let pkg = self.ext::<crate::package::Packages>().and_then(|p| p.status.as_ref());
         i.root_verity = pkg.and_then(root_verity);
@@ -1371,7 +1483,55 @@ mod tests {
             boot_apply: Vec::new(),
             crash: None,
             memory: None,
+            ospf_lsdb: Some(Vec::new()),
+            ram_bytes: Some(8 << 30),
         }
+    }
+
+    /// G3.4r: the OSPF databases, case by case: the protection's states
+    /// and the memory against the RAM with no limit at all.
+    #[test]
+    fn ospf_lsdb_states_and_memory() {
+        use corerouter_model::ospf_state::MaxLsaState;
+        let by = |i: &Inputs| evaluate(i).into_iter().find(|c| c.key == "ospf.lsdb").unwrap();
+        let prot = |state: &str| MaxLsaState { limit: 50_000, state: state.into(), ignore_entries: 2, ignore_count: 5, ignore_remaining_secs: Some(108) };
+        let inst = |lsas: u64, protection: Option<MaxLsaState>| OspfLsdbInput {
+            instance: "v2".into(),
+            lsas,
+            others: Some(lsas.saturating_sub(10)),
+            limit: protection.as_ref().map(|p| (p.limit, 37_500)),
+            protection,
+        };
+        let mut i = healthy();
+        i.ospf_lsdb = None;
+        assert_eq!(by(&i).severity, Severity::Unknown);
+        i.ospf_lsdb = Some(vec![inst(12_350, None)]);
+        let c = by(&i);
+        assert_eq!(c.severity, Severity::Ok);
+        assert!(c.reason.contains("12350 LSAs, ~26 MiB"), "{c:?}");
+        let cases: [(u64, Option<&str>, Severity, &str); 6] = [
+            (12_350, Some("normal"), Severity::Ok, "1 instância"),
+            (41_210, Some("warning"), Severity::Warning, "82 % do limite"),
+            (60_010, Some("exceeded"), Severity::Warning, "warning-only"),
+            (10, Some("ignore"), Severity::Error, "nova tentativa em 1m48s (2 de 5"),
+            (10, Some("isolated"), Severity::Error, "isolada"),
+            // No limit: 1 000 000 LSAs take ~2 GiB, 25 % of 8 GiB.
+            (1_000_000, None, Severity::Warning, "25 % da RAM"),
+        ];
+        for (lsas, state, severity, text) in cases {
+            i.ospf_lsdb = Some(vec![inst(lsas, state.map(prot))]);
+            let c = by(&i);
+            assert_eq!(c.severity, severity, "{state:?}: {c:?}");
+            assert!(c.reason.contains(text), "{state:?}: {c:?}");
+        }
+        // Half the RAM is an error, and the advice is to set a limit.
+        i.ospf_lsdb = Some(vec![inst(2_000_000, None)]);
+        let c = by(&i);
+        assert_eq!(c.severity, Severity::Error, "{c:?}");
+        assert!(c.action.unwrap().contains("ponha um limite"));
+        // The worst instance speaks.
+        i.ospf_lsdb = Some(vec![inst(41_210, Some(prot("warning"))), OspfLsdbInput { instance: "b".into(), ..inst(10, Some(prot("isolated"))) }]);
+        assert!(by(&i).reason.starts_with("b isolada"), "{:?}", by(&i));
     }
 
     /// G1.6zy: no ECC, no check; a module that corrects errors; one that
@@ -1443,7 +1603,7 @@ mod tests {
     #[test]
     fn healthy_is_all_ok() {
         let checks = evaluate(&healthy());
-        assert_eq!(checks.len(), 19);
+        assert_eq!(checks.len(), 20);
         for c in &checks {
             assert_eq!(c.severity, Severity::Ok, "{c:?}");
             assert!(c.action.is_none());

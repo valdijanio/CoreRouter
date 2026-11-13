@@ -47,8 +47,9 @@ pub struct OspfNeighbor {
     pub summary: u64,
 }
 
-/// G3.9c: whether an instance is a stub router now (RFC 6987), as the
-/// daemon says (`show ip ospf json`, `show ipv6 ospf6 json`).
+/// What one small answer per instance says every poll (`show ip ospf
+/// json`, `show ipv6 ospf6 json`): G3.9c whether it is a stub router now
+/// (RFC 6987), G3.4r the size of its database and its LSDB protection.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct OspfStubState {
     pub instance: String,
@@ -61,6 +62,53 @@ pub struct OspfStubState {
     /// Seconds left of `on-startup` (the longest of the areas).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_remaining_secs: Option<u64>,
+    /// G3.4r: LSAs in the databases, this router's included (area and AS
+    /// scope; v3 without the link scope).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsas: Option<u64>,
+    /// G3.4r: LSAs of other routers, what `max-lsa` counts (the patched
+    /// ospfd only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsas_other: Option<u64>,
+    /// G3.4r: the LSDB protection as ospfd runs it (with a limit set, or
+    /// still in ignore/isolated after it was removed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lsa: Option<MaxLsaState>,
+}
+
+/// G3.4r: bytes per LSA in ospfd (1.5 KiB) and per route in zebra
+/// (0.6 KiB), **medido** with 192 721 type-5 LSAs (FRR 10.7.1, G3.4m and
+/// G3.4r host lab).
+pub const LSA_BYTES: u64 = 1_536;
+pub const ROUTE_BYTES: u64 = 614;
+
+/// G3.4r: the memory a database of `lsas` LSAs costs ospfd and zebra
+/// (every LSA a route: the worst case, a flood of externals).
+pub fn lsdb_memory_bytes(lsas: u64) -> u64 {
+    lsas.saturating_mul(LSA_BYTES + ROUTE_BYTES)
+}
+
+/// G3.4r: ospfd's `max-lsa` now.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct MaxLsaState {
+    pub limit: u64,
+    /// `normal`, `warning` (past the threshold), `exceeded` (past the
+    /// limit with warning-only), `ignore` (down for ignore-time),
+    /// `isolated` (down until cleared), `off`.
+    pub state: String,
+    /// Ignore periods since the last reset, of `ignore_count`.
+    pub ignore_entries: u64,
+    pub ignore_count: u64,
+    /// Seconds left of the ignore period.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_remaining_secs: Option<u64>,
+}
+
+impl MaxLsaState {
+    /// Down because of the limit: no adjacency, no LSA learned.
+    pub fn down(&self) -> bool {
+        matches!(self.state.as_str(), "ignore" | "isolated")
+    }
 }
 
 impl OspfStubState {

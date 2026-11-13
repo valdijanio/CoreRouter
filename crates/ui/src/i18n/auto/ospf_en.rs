@@ -45,11 +45,42 @@ The repair segments, computed as ospfd does."##),
 Routes: primary and backup next hop with the label stack. Unprotected: the routes without a backup and why. Simulate Link Cut: the backup each affected route takes and the path after convergence, nothing changed."##),
     (r##"ospf.instance"##, r##"## What it is
 An OSPF instance (RouterOS `/routing ospf instance`). The preview shows the interfaces it runs on and what the change does."##),
+    (r##"ospf.instance.clear_lsdb_protection"##, r##"## What it is
+Takes the selected instance out of the LSDB protection's `ignore` or `isolated` state now and resets the periods: the adjacencies come up again (`routing.ospf.instance.clear-lsdb-protection`, as Junos `clear ospf database-protection`). Active only while the protection holds the instance down.
+
+## Before
+Find who injects the LSAs (the LSDB tab, grouped by Adv. Router) and fix its redistribution; otherwise the instance goes down again as soon as the database passes the limit."##),
     (r##"ospf.instance.drain"##, r##"## What it is
 Turns the selected instance's stub router on (Drain) or off (Undrain): `routing.ospf.instance.set {stub_router}`. Drained, every transit link of the router-LSA goes to cost 65535 and traffic goes around this router; its own networks stay reachable (RFC 6987).
 
 ## When
 Before maintenance, or to bring a new router into the core without carrying traffic. In a Safe Mode or transactional session the change rolls back with the rest."##),
+    (r##"ospf.instance.lsdb"##, r##"## What it is
+The size of the instance's link-state database: the LSAs of other routers (what Max LSA counts) against the limit, or the count alone without a limit. Amber from the warning threshold on; red while the protection holds the instance down (`ignore` with the time left and the periods, or `isolated`).
+
+## Why it matters
+Each LSA costs ~1.5 KiB in `ospfd` and each route ~0.6 KiB in `zebra` (**measured**). A wrong redistribution elsewhere (the whole BGP table into OSPF) runs this router out of memory in seconds: 175 000 LSAs arrived in 1 s in the lab."##),
+    (r##"ospf.instance.max_lsa"##, r##"## What it is
+LSDB protection: the most LSAs **of other routers** in the database (this router's own do not count), as Cisco `max-lsa` and Junos `database-protection`. Past it the instance goes down for the Ignore Time: **every** adjacency drops and what it learned goes (the area's databases stay consistent, as nothing routes through this router), then it comes back. After Ignore Count periods in a row it stays down until Clear LSDB Protection. Empty: no limit (the default, as RouterOS and FRR). OSPFv2 only.
+
+## Caveats
+A low limit takes the router off the network on normal growth. With management over OSPF that is a lockout: use Safe Mode. The same limit on every router takes them all down together. A flood's memory does not go back to the system afterwards; the limit only holds the peak.
+
+## Recommended
+A limit that fits the RAM (2.1 KiB per LSA in `ospfd` + `zebra`) with room over the normal size (2× or more). Start with Warning Only to watch the database grow before letting it go down."##),
+    (r##"ospf.instance.max_lsa_ignore_count"##, r##"## What it is
+How many ignore periods in a row before the instance stays down until someone clears it (Clear LSDB Protection). 1–32; default 5."##),
+    (r##"ospf.instance.max_lsa_ignore_time"##, r##"## What it is
+How long the instance stays down (no adjacency, no learned LSA) after passing Max LSA, before trying again. 30–3600 s; default 300 s (Cisco and Junos).
+
+## Caveats
+On the way back the whole database arrives again (Full in ~7 s, **measured**). If the cause is still there it goes down again and counts another period."##),
+    (r##"ospf.instance.max_lsa_reset_time"##, r##"## What it is
+How long up without passing Max LSA again resets the count of ignore periods. 60–86400 s; default 600 s."##),
+    (r##"ospf.instance.max_lsa_threshold"##, r##"## What it is
+The percent of Max LSA at which the router warns (log and the `ospf.lsdb` health check) before going down. 1–100; default 75 %."##),
+    (r##"ospf.instance.max_lsa_warning_only"##, r##"## What it is
+Only warn past Max LSA (log and health), never take the instance down. To measure the database before turning the protection on for real; it does not protect the memory."##),
     (r##"ospf.instance.name"##, r##"## What it is
 The instance's name."##),
     (r##"ospf.instance.originate_default"##, r##"## What it is

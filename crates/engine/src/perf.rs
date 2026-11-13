@@ -120,6 +120,7 @@ pub fn ospf_scale(ifaces: u32, nbrs: u32, routers: u32, lsas: u32, routes: u32) 
             subscriber_pools: false,
             stub_router: false,
             stub_router_on_startup: None,
+            max_lsa: None,
             disabled: false,
             comment: String::new(),
         },
