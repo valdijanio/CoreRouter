@@ -338,7 +338,7 @@ o resync do daemon não desfaz o ignore. Só OSPFv2; o `ospf6d` é a G3.4x.
 
 **Medido**, laboratório no host (FRR 10.7.1 com os patches 0001–0007, dois `ospfd` em
 namespaces de usuário, Ryzen AI Max+ 395, 13/11/2026). A enxurrada é de ~190 000 externas de um
-vizinho; o limite, 50 000 (`/srv/build/G3.4r/hostlab/maxlsa-2`).
+vizinho; o limite, 50 000 (`scripts/frr-ospf-max-lsa.sh`).
 
 | | sem limite | `max-lsa 50000` |
 |---|---|---|
