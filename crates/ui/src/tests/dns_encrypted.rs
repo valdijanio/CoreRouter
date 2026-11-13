@@ -49,7 +49,7 @@ fn apply_turns_dot_on_with_a_certificate_and_shows_the_checks() {
 fn doh_shows_its_url_once_on() {
     let mut s = lab();
     s.execute("ip.dns.encrypted-service.set", &json!({"doh": true, "doh_port": 8443})).unwrap();
-    let mut h = open(s);
+    let h = open(s);
     assert!(h.has_text("DNS over HTTPS"));
     assert!(h.has_text_containing("/dns-query{?dns}"), "the URL to give clients");
     assert!(h.has_text("Copy"));
