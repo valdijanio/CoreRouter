@@ -25,10 +25,12 @@
 //! - DoH: ALPN `h2` gets HTTP/2 (`http2::server`: up to 100 streams,
 //!   answered in any order), anything else HTTP/1.1, one request at a time
 //!   (`dns_doh`). GET and POST on `doh_path` (RFC 8484 §4.1).
-//! - Over `max_sessions`, the connection of this loop idle the longest
-//!   gives its place (RFC 7766 §6.2.3 allows closing at once under load;
-//!   the stalled-connection lesson of G4.1w); one address holds at most a
-//!   quarter of the places (CGNAT and CPEs: loose, §6.2.2).
+//! - Over `max_sessions`, a connection of this loop with no query waiting
+//!   gives its place (RFC 7766 §6.2.3 allows closing at once under load):
+//!   the longest idle of the address holding the most, as TCP 53 chooses
+//!   (`dns_server::slots::victim`, G4.1w), so a peer that reopens what was
+//!   closed cannot push out the client with one connection. One address
+//!   holds at most a quarter of the places (CGNAT and CPEs: loose, §6.2.2).
 //! - TLS 1.2 and 1.3 (rustls: AEAD with forward secrecy only, RFC 9325),
 //!   no 0-RTT (§3.10; RFC 8470), ALPN `dot` on DoT and `h2`/`http/1.1` on
 //!   DoH (§3.8), stateless tickets rotated by rustls (RFC 8310 §9), the
@@ -52,7 +54,7 @@ use mio::{Events, Interest, Poll, Token, Waker};
 use rustls::{ServerConfig, ServerConnection};
 
 use super::dns_doh::{self, Doh};
-use super::dns_server::{self, Answer, Server};
+use super::dns_server::{self, Answer, Server, slots};
 use super::http2::server as h2;
 
 /// How often the follow thread looks at the config.
@@ -580,10 +582,21 @@ impl Loop {
         }
     }
 
-    /// The connection idle the longest, to make room (no query waiting).
-    fn evict_one(&mut self) -> bool {
-        let oldest = self.conns.iter().filter(|(_, c)| c.in_flight == 0).min_by_key(|(_, c)| c.last).map(|(id, _)| *id);
-        match oldest {
+    /// A place for a newcomer from `peer` (no query waiting on the one
+    /// closed): `slots::victim`'s choice, fair by address.
+    fn evict_one(&mut self, peer: IpAddr) -> bool {
+        let now = Instant::now();
+        let chosen = {
+            let per = self.sh.per_source.lock().unwrap_or_else(PoisonError::into_inner);
+            let held = |ip: IpAddr| per.get(&ip).map_or(0, |n| u32::try_from(*n).unwrap_or(u32::MAX));
+            let candidates = self.conns.iter().filter(|(_, c)| c.in_flight == 0).map(|(id, c)| slots::Candidate {
+                key: *id,
+                source: c.peer,
+                idle: now.saturating_duration_since(c.last),
+            });
+            slots::victim(candidates, held, held(peer))
+        };
+        match chosen {
             Some(id) => {
                 self.drop_conn(id);
                 true
@@ -702,7 +715,7 @@ impl Loop {
             }
             bump(&self.sh.stats.accepted);
             let max = self.sh.max_sessions.load(Ordering::Relaxed);
-            if self.sh.sessions.load(Ordering::Acquire) >= max && !self.evict_one() {
+            if self.sh.sessions.load(Ordering::Acquire) >= max && !self.evict_one(peer) {
                 bump(&self.sh.stats.over_limit);
                 continue;
             }
