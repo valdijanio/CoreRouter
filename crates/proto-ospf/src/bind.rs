@@ -26,14 +26,15 @@ pub struct Binding<'a> {
     pub template: &'a OspfTemplate,
     /// Why it matched: `interface`, `list <name>` or `network <prefix>`.
     pub why: String,
-    /// G3.4m: the interface's addresses OSPF runs on when only some of
-    /// them are in the template's networks (a network match on an
-    /// interface that also has, say, a management address): RouterOS v7
-    /// matches networks per address. Empty: all of them (a match by name,
-    /// or every address inside the networks). FRR's interface-wide
-    /// `ip ospf area` would run OSPF on the other addresses too
-    /// (advertised, and a second adjacency on the same link that flapped
-    /// with SeqNumberMismatch in the stress lab, docs/ospf-stress.md).
+    /// G3.4m: the addresses OSPFv2 runs on for a match by network: those
+    /// inside the template's networks (RouterOS v7 matches networks per
+    /// address). Empty: every address of the interface (a match by name,
+    /// or OSPFv3, which runs per link). FRR's interface-wide `ip ospf
+    /// area` ran OSPF on a management address next to the OSPF link too:
+    /// advertised, and a second adjacency on the same link that flapped
+    /// with SeqNumberMismatch (stress lab, docs/ospf-stress.md). Always
+    /// per address, so adding or removing an address outside the networks
+    /// changes no line of FRR's and drops no adjacency.
     pub addresses: Vec<IpNet>,
 }
 
@@ -161,14 +162,11 @@ pub fn bindings(cfg: &Config) -> Vec<Binding<'_>> {
                     };
                     // OSPFv3 runs per link, not per address.
                     if inst.version == Version::V2 {
-                        let inside: Vec<IpNet> = addrs
+                        some = addrs
                             .iter()
                             .filter(|a| t.networks.iter().any(|n| n.contains(&a.addr())))
                             .copied()
                             .collect();
-                        if inside.len() < addrs.len() {
-                            some = inside;
-                        }
                     }
                     format!("network {n}")
                 }
@@ -273,14 +271,14 @@ mod tests {
     }
 
     /// G3.4m: a network match runs OSPF only on the addresses inside the
-    /// networks; an interface whose addresses are all inside keeps the
-    /// interface-wide form.
+    /// networks, the same with or without other addresses on the
+    /// interface (adding one changes nothing for OSPF).
     #[test]
     fn a_network_match_takes_only_the_addresses_inside() {
         let mut cfg = sample();
         let b = bindings(&cfg);
         let e2 = b.iter().find(|b| b.interface.as_str() == "ether2").unwrap();
-        assert!(e2.addresses.is_empty(), "{:?}", e2.addresses);
+        assert_eq!(e2.addresses, vec!["10.0.2.1/30".parse::<IpNet>().unwrap()]);
         let mut mgmt = cfg.ip.addresses.iter().nth(1).unwrap().clone();
         mgmt.id = corerouter_model::ItemId(99);
         mgmt.address = "10.99.0.1/24".parse().unwrap();

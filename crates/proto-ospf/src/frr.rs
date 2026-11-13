@@ -370,8 +370,8 @@ fn iface_v2(s: &mut String, b: &Binding<'_>, open: Opener<'_>) -> Result<(), Str
     if b.addresses.is_empty() {
         let _ = writeln!(s, " ip ospf area {}", b.area.area_id);
     } else {
-        // G3.4m: only the addresses inside the template's networks
-        // (`bind::Binding::addresses`).
+        // G3.4m: a match by network: only the addresses inside the
+        // template's networks (`bind::Binding::addresses`).
         for a in &b.addresses {
             let _ = writeln!(s, " ip ospf area {} {}", b.area.area_id, a.addr());
         }
@@ -795,7 +795,10 @@ mod tests {
         mgmt.id = corerouter_model::ItemId(99);
         mgmt.address = "10.99.0.1/24".parse().unwrap();
         cfg.ip.addresses.push(mgmt);
+        let before = render(&sample(), &|s| Some(s.stored().to_owned())).unwrap();
         let text = render(&cfg, &|s| Some(s.stored().to_owned())).unwrap();
+        // The second address changes nothing in FRR's config.
+        assert_eq!(before, text);
         let e2 = text.split("interface ether2\n").nth(1).unwrap();
         let e2 = &e2[..e2.find("exit\n").unwrap()];
         assert!(e2.contains(" ip ospf area 0.0.0.0 10.0.2.1\n"), "{e2}");
