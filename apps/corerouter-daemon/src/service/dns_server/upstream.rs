@@ -619,12 +619,20 @@ mod tests {
         let quiet = silent.clone();
         let udp = StdUdp::bind("127.0.0.1:0").unwrap();
         let port = udp.local_addr().unwrap().port();
+        // A burst of 400 queries is ~380 KiB of kernel buffer (~960 bytes
+        // of truesize each), the default holds ~220 of them. The kernel
+        // gives at most twice `net.core.rmem_max` (208 KiB by default, so
+        // ~416 KiB, room for ~440): the whole burst fits even when the
+        // reader below gets no CPU during it. With the default buffer a
+        // reader stopped 200 ms lost 177 queries (`RcvbufErrors`), each
+        // asked again only after the forwarder's RTO (1.66 s instead of
+        // 0.76 s, measured; 2.5 s on a loaded CI runner).
+        socket2::SockRef::from(&udp).set_recv_buffer_size(8 << 20).unwrap();
         let count = Arc::new(AtomicUsize::new(0));
         let c = count.clone();
-        // A thread that only drains the socket: a burst of 400 queries is
-        // ~400 KiB of kernel buffer (truesize), twice the default 208 KiB,
-        // and parsing between reads (a debug build on a 4-CPU runner) lost
-        // up to 40 % of them before they were counted.
+        // A thread that only drains the socket: parsing between reads (a
+        // debug build on a 4-CPU runner) lost up to 40 % of a burst before
+        // they were counted.
         let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, SocketAddr)>();
         let reader = udp.try_clone().unwrap();
         thread::spawn(move || {
