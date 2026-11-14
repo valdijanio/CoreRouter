@@ -574,13 +574,43 @@ dns_set() { ok ip.dns.set "$(jq -cn --argjson b "$DNS_BASE" --argjson o "${1:-$N
 REVISION=""
 dut_config() {
 	if [ $DUT = remote ]; then
-		# Phase C: everything below leaves by rollback to this revision.
-		REVISION=$(cr config.history | jq -r '[.[].number] | max // empty')
-		say "remote DUT: config revision $REVISION before the lab (rolled back at the end)"
+		# Phase C: everything below leaves by rollback to this revision
+		# (the first one: dut_config runs again after a daemon restart).
+		if [ -z "$REVISION" ]; then
+			REVISION=$(cr config.history | jq -r '[.[].number] | max // empty')
+			say "remote DUT: config revision $REVISION before the lab (rolled back at the end)"
+		fi
+		# Servers learned by DHCP (`use_peer_dns`) join the lab's ones as
+		# `dynamic_servers`. On the notebook (2026-11-14) the home router
+		# behind ether1 got ~33 000 lab queries, answered NXDOMAIN for
+		# *.up.lab, and that negative answer in the cache was the "forwarder
+		# stopped answering" after the 200 ms origin. A change of
+		# `use_peer_dns` keeps the lease (engine dhcp_update); the rollback
+		# turns it back on.
+		local c dyn
+		# Ids like `*1` are read line by line: unquoted, they glob.
+		while read -r c; do
+			[ -n "$c" ] || continue
+			ok ip.dhcp-client.set "{\"id\":\"$c\",\"use_peer_dns\":false}" >/dev/null || return 1
+			say "remote DUT: DHCP client $c without use_peer_dns during the lab"
+		done < <(cr ip.dhcp-client.list | jq -r '.[] | select(.use_peer_dns == true) | .id')
+		# The resolver takes the new list on the engine's next pass (~2 s
+		# on the notebook, measured).
+		local end=$((SECONDS + 15))
+		until dyn=$(cr ip.dns.get | jq -c '.dynamic_servers') && [ "$dyn" = "[]" ]; do
+			[ $SECONDS -lt $end ] || {
+				fail "the DUT also asks learned DNS servers $dyn (a PPPoE client with use_peer_dns?): turn them off, the lab's load must not leave by them"
+				return 1
+			}
+			sleep 1
+		done
 	fi
 	cr ip.address.list | jq -e --arg a "$DUT_IP/24" 'any(.[]; .address == $a)' >/dev/null ||
 		ok ip.address.add "{\"address\":\"$DUT_IP/24\",\"interface\":\"$DUT_IFACE\"}" >/dev/null
 	dns_set
+	# An answer kept from the servers before the lab (a NXDOMAIN for *.up.lab
+	# from the home router) must not answer for the lab's origins.
+	flush
 	local end=$((SECONDS + 30))
 	until q_one h1.up.lab A | grep -q NOERROR; do
 		[ $SECONDS -lt $end ] || { fail "the DUT's forwarder does not answer on $DUT_IP:53"; return 1; }
@@ -2006,7 +2036,8 @@ main() {
 		# address is already there on a real remote router).
 		cr_local ip.address.add "{\"address\":\"$DUT_IP/24\",\"interface\":\"$DUT_IFACE\"}" >/dev/null
 	fi
-	dut_config
+	# Refused (learned servers, no answer): the load must not start.
+	dut_config || exit 1
 	{
 		echo "# DNS sob carga (G4.1r) — $(date -Is)"
 		echo ""
