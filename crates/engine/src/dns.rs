@@ -23,8 +23,9 @@ pub trait DnsBackend: Send + Sync {
     fn lookup(&self, name: &str) -> Result<Vec<IpAddr>, ResolveError>;
     fn cache_rows(&self) -> Vec<CacheRow>;
     /// At most `limit` entries whose name contains `name` and whose type
-    /// is `qtype` (upper case). Implementations filter before formatting,
-    /// under their lock: a large cache is never copied whole.
+    /// is `qtype` (upper case), sorted by name. Implementations filter
+    /// before formatting and never hold their lock for the whole scan
+    /// (the daemon's resolver copies in pieces, G4.1y).
     fn cache_rows_matching(&self, name: Option<&str>, qtype: Option<&str>, limit: usize) -> Vec<CacheRow> {
         self.cache_rows()
             .into_iter()

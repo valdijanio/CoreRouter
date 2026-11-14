@@ -670,9 +670,9 @@ impl Cache {
     }
 
     /// At most `limit` rows whose name contains `name` and whose type is
-    /// `qtype`, sorted by name: filtered on the key, so only the rows
-    /// returned are formatted. Which ones, when more match than `limit`,
-    /// is not said (the order the slots happen to be in).
+    /// `qtype`, sorted by name. Which ones, when more match than `limit`,
+    /// is not said (the order the slots happen to be in). In one go: the
+    /// resolver lists in pieces instead ([`Cache::copy_matching`]).
     pub fn rows_matching(
         &self,
         now_ms: u64,
@@ -680,27 +680,127 @@ impl Cache {
         qtype: Option<&str>,
         limit: usize,
     ) -> Vec<CacheRow> {
+        let mut out = Vec::new();
+        let filter = Filter::new(now_ms, name, qtype);
+        self.copy_matching(&filter, 0, usize::MAX, limit, &mut out);
+        rows_of(&out, now_ms)
+    }
+
+    /// One piece of a listing (G4.1y): copies of the entries that match
+    /// `filter` among the slots `from..from + scan`, until `out` holds
+    /// `room`; the slot to go on from, `None` at the end. Only copies under
+    /// the caller's lock (the formatting is done after it, [`rows_of`]):
+    /// the resolver lets the lock go between pieces, so listing a million
+    /// entries never stops the lookups for more than one piece.
+    pub fn copy_matching(
+        &self,
+        filter: &Filter<'_>,
+        from: usize,
+        scan: usize,
+        room: usize,
+        out: &mut Vec<Copied>,
+    ) -> Option<usize> {
+        let end = from.saturating_add(scan).min(self.slots.len());
+        let piece = self.slots.get(from..end)?;
         let stale_ms = self.stale_ms;
-        let mut rows: Vec<(u16, CacheRow)> = self
-            .slots
-            .iter()
-            .flatten()
-            .filter(|s| s.entry.expires_ms.saturating_add(stale_ms) > now_ms)
-            .filter(|s| name.is_none_or(|f| s.name.contains(f)))
-            .filter(|s| qtype.is_none_or(|q| RecordType::from(s.rtype).to_string() == q))
-            .take(limit)
-            .map(|s| (s.rtype, row(s, now_ms)))
-            .collect();
-        rows.sort_by(|a, b| a.1.name.cmp(&b.1.name).then(a.0.cmp(&b.0)));
-        rows.into_iter().map(|(_, r)| r).collect()
+        for (i, s) in piece.iter().enumerate() {
+            if out.len() >= room {
+                return Some(from + i);
+            }
+            let Some(s) = s else { continue };
+            if s.entry.expires_ms.saturating_add(stale_ms) <= filter.now_ms
+                || !filter.name.is_none_or(|f| s.name.contains(f))
+                || !filter.qtype.matches(s.rtype)
+            {
+                continue;
+            }
+            out.push(Copied {
+                name: s.name.clone(),
+                rtype: s.rtype,
+                entry: s.entry.clone(),
+            });
+        }
+        (end < self.slots.len()).then_some(end)
+    }
+
+    /// Slots in the table (live or free): where a listing ends.
+    pub fn slots(&self) -> usize {
+        self.slots.len()
     }
 }
 
-fn row(s: &Slot, now_ms: u64) -> CacheRow {
-    let e = &s.entry;
-    let rtype = RecordType::from(s.rtype);
+/// What a listing looks for: entries alive or stale-servable at `now_ms`,
+/// whose name contains `name` and whose type is `qtype` (its text, as
+/// `A`, `MX` or `TYPE65`).
+#[derive(Debug, Clone)]
+pub struct Filter<'a> {
+    now_ms: u64,
+    name: Option<&'a str>,
+    qtype: TypeFilter<'a>,
+}
+
+#[derive(Debug, Clone)]
+enum TypeFilter<'a> {
+    Any,
+    /// A known type: compared by number.
+    Code(u16),
+    /// Text hickory does not parse: compared as text (rare).
+    Text(&'a str),
+}
+
+impl TypeFilter<'_> {
+    fn matches(&self, rtype: u16) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Code(c) => *c == rtype,
+            Self::Text(t) => RecordType::from(rtype).to_string() == *t,
+        }
+    }
+}
+
+impl<'a> Filter<'a> {
+    pub fn new(now_ms: u64, name: Option<&'a str>, qtype: Option<&'a str>) -> Self {
+        let qtype = match qtype {
+            None => TypeFilter::Any,
+            // The text a row shows (`RecordType`'s `Display`) is what the
+            // filter is compared with: a parse that does not print back
+            // the same falls to the text.
+            Some(q) => match q.parse::<RecordType>() {
+                Ok(t) if t.to_string() == q => TypeFilter::Code(u16::from(t)),
+                _ => TypeFilter::Text(q),
+            },
+        };
+        Self {
+            now_ms,
+            name,
+            qtype,
+        }
+    }
+}
+
+/// An entry copied out of the cache under its lock, to be formatted after
+/// it (G4.1y).
+#[derive(Debug, Clone)]
+pub struct Copied {
+    name: String,
+    rtype: u16,
+    entry: Entry,
+}
+
+/// The rows of `copies`, sorted by name and type.
+pub fn rows_of(copies: &[Copied], now_ms: u64) -> Vec<CacheRow> {
+    let mut rows: Vec<(u16, CacheRow)> = copies
+        .iter()
+        .map(|c| (c.rtype, row(&c.name, c.rtype, &c.entry, now_ms)))
+        .collect();
+    rows.sort_by(|a, b| a.1.name.cmp(&b.1.name).then(a.0.cmp(&b.0)));
+    rows.into_iter().map(|(_, r)| r).collect()
+}
+
+fn row(name: &str, rtype: u16, e: &Entry, now_ms: u64) -> CacheRow {
+    let rtype = RecordType::from(rtype);
     CacheRow {
-        name: s.name.clone(),
+        name: name.to_owned(),
         qtype: rtype.to_string(),
         kind: e.answer.kind(rtype),
         data: e
@@ -803,6 +903,15 @@ mod tests {
             40,
         );
         assert!(c.get("bare", A, 0).is_none(), "no SOA, not cached");
+    }
+
+    impl Cache {
+        fn flush_one(&mut self, name: &str) {
+            let t = u16::from(A);
+            if let Some(i) = self.find(self.hash(name, t), name, t) {
+                self.remove(i);
+            }
+        }
     }
 
     /// Entry size of a 6-character name with one record (tests below).
@@ -1024,6 +1133,61 @@ mod tests {
         c.put("x", A, &addrs([192, 0, 2, 1], 60), None, 0, 86_400, 40);
         assert_eq!(c.stats().by_type, [(u16::from(A), 1)]);
         check(&c);
+    }
+
+    #[test]
+    fn a_listing_in_pieces_is_the_listing_in_one_go() {
+        // G4.1y: pieces of 7 slots or 3 copies, entries removed and added
+        // between them as lookups would; nothing listed twice, filters on
+        // name and type, the rows sorted.
+        let mut c = Cache::new(1 << 20);
+        for i in 0..100u32 {
+            ask(&mut c, &format!("h{i:05}"), 3600, 0);
+            c.put(
+                &format!("h{i:05}"),
+                RecordType::AAAA,
+                &negative(Rcode::NoError, Some(60)),
+                None,
+                0,
+                WEEK,
+                40,
+            );
+        }
+        let all = c.rows(0);
+        assert_eq!(all.len(), 200);
+        let f = Filter::new(0, Some("h0004"), Some("AAAA"));
+        let (mut out, mut from, mut pieces) = (Vec::new(), Some(0), 0);
+        while let Some(n) = from {
+            from = c.copy_matching(&f, n, 7, out.len() + 3, &mut out);
+            pieces += 1;
+        }
+        let rows = rows_of(&out, 0);
+        assert_eq!(rows.len(), 10, "h00040..h00049, AAAA only");
+        assert!(
+            rows.iter()
+                .all(|r| r.qtype == "AAAA" && r.name.starts_with("h0004"))
+        );
+        assert!(rows.windows(2).all(|w| w[0].name < w[1].name), "sorted");
+        assert!(pieces > 200 / 7, "{pieces} pieces");
+        // A type hickory does not know is compared as text.
+        assert!(c.rows_matching(0, None, Some("TYPE65"), 10).is_empty());
+        assert_eq!(c.rows_matching(0, None, Some("A"), 1000).len(), 100);
+        // Changes between pieces: what was there all along is listed once.
+        let f = Filter::new(0, None, Some("A"));
+        let mut out = Vec::new();
+        let next = c.copy_matching(&f, 0, 50, usize::MAX, &mut out).unwrap();
+        for i in 0..10 {
+            c.flush_one(&format!("h{i:05}"));
+            ask(&mut c, &format!("n{i:05}"), 3600, 0);
+        }
+        let mut from = Some(next);
+        while let Some(n) = from {
+            from = c.copy_matching(&f, n, 50, usize::MAX, &mut out);
+        }
+        let names: std::collections::BTreeSet<String> =
+            out.iter().map(|c| c.name.clone()).collect();
+        assert_eq!(names.len(), out.len(), "no entry twice");
+        assert!((10..100).all(|i| names.contains(&format!("h{i:05}"))));
     }
 
     #[derive(Debug, Clone)]

@@ -1,6 +1,7 @@
 //! G4.1a — the router's resolver: encode a query, check and read a reply
 //! (CNAME + two A records + SOA), a cache hit among 10 000 entries, and a
-//! full 64 MiB cache: a hit and a unique name's miss + store (G4.1x).
+//! full 64 MiB cache: a hit and a unique name's miss + store (G4.1x); a
+//! piece of `ip.dns.cache.print` on a million entries (G4.1y).
 //!
 //! `cargo xtask bench` runs it; alone: `cargo bench -p corerouter-proto-dns --bench resolver`.
 
@@ -15,8 +16,9 @@
 use std::hint::black_box;
 use std::net::Ipv4Addr;
 
-use corerouter_proto_dns::cache::Cache;
+use corerouter_proto_dns::cache::{Cache, Filter};
 use corerouter_proto_dns::message::{Answer, Rcode, parse_name, parse_reply, query};
+use corerouter_proto_dns::resolver::{PRINT_COPIES, PRINT_SLOTS};
 use criterion::{Criterion, criterion_group, criterion_main};
 use hickory_proto::op::{Message, OpCode};
 use hickory_proto::rr::rdata::{A, CNAME};
@@ -154,6 +156,40 @@ fn bench(c: &mut Criterion) {
                 big.put(name, RecordType::A, &answer, None, 2000, 604_800, 60);
             }
         })
+    });
+
+    // G4.1y: `ip.dns.cache.print` on a million entries (the lab's `cache`
+    // test): one piece of the listing, the time the lock is held, with a
+    // name filter that matches nothing (the whole scan) and with none
+    // (every entry copied); and the whole listing filtered by name.
+    let mut million = Cache::new(1 << 30);
+    for i in 0..1_000_000u64 {
+        let name = format!("{:016x}.wt.example", i.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        million.put(&name, RecordType::A, &answer, None, 0, 604_800, 60);
+    }
+    let none = Filter::new(0, Some("h1.up.lab"), None);
+    let mut from = 0usize;
+    c.bench_function("dns_cache_print_piece_scan_1m", |b| {
+        b.iter(|| {
+            let mut out = Vec::new();
+            from = million
+                .copy_matching(&none, from, PRINT_SLOTS, PRINT_COPIES, &mut out)
+                .unwrap_or(0);
+            out
+        })
+    });
+    let any = Filter::new(0, None, None);
+    c.bench_function("dns_cache_print_piece_copy_1m", |b| {
+        b.iter(|| {
+            let mut out = Vec::new();
+            from = million
+                .copy_matching(&any, from, PRINT_SLOTS, PRINT_COPIES, &mut out)
+                .unwrap_or(0);
+            out
+        })
+    });
+    c.bench_function("dns_cache_print_name_1m", |b| {
+        b.iter(|| million.rows_matching(0, Some("h1.up.lab"), None, 1000))
     });
 }
 

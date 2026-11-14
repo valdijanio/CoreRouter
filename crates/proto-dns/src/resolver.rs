@@ -33,7 +33,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 mod flight;
 mod lookup;
@@ -362,6 +362,41 @@ pub const FAILURE_HOLD_MS: u64 = 5_000;
 pub const FAILURE_MAX_HOLD_MS: u64 = 300_000;
 /// Failures remembered at most (§3.2: the cache SHOULD be bounded).
 pub const MAX_FAILURES: usize = 4096;
+/// A piece of a cache listing (G4.1y): slots looked at, and entries
+/// copied, per hold of the lock. On a million entries a piece holds it
+/// ~30 µs scanning and ~29 µs copying on the host (`benches/resolver.rs`,
+/// release, 2026-11-13, **medido**), ~0,25 ms scanning in the lab VM
+/// (**estimado** from the whole listing); the whole scan under the lock
+/// took 190 ms on the host.
+pub const PRINT_SLOTS: usize = 2048;
+pub const PRINT_COPIES: usize = 256;
+
+/// The lookups' share of the lock during a cache listing (G4.1y): after
+/// each piece the listing sleeps as long as the piece held the lock, so
+/// lookups have it at least half the time. Letting it go between pieces
+/// was not enough: a forwarder thread answers one query at a time, each
+/// waited for a piece, and the queue grew for the whole listing (p99,9 of
+/// the load beside 84 ms of a 130 ms listing in the lab VM, with yields
+/// or with a fair hand-off alike).
+struct Turn {
+    #[cfg(not(target_arch = "wasm32"))]
+    started: std::time::Instant,
+}
+
+impl Turn {
+    fn start() -> Self {
+        Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// No clock and no threads to share with in wasm builds.
+    fn pause(self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::sleep(self.started.elapsed());
+    }
+}
 
 /// Resolver shared by every thread of the router (tools, NTP, the LAN
 /// forwarder).
@@ -390,9 +425,7 @@ impl Resolver {
 
     fn state(&self) -> MutexGuard<'_, State> {
         // A panic elsewhere never makes the resolver unusable.
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// New settings (config change or a DHCP lease). The cache stays,
@@ -416,10 +449,15 @@ impl Resolver {
     }
 
     pub fn cache_rows(&self, now_ms: u64) -> Vec<CacheRow> {
-        self.state().cache.rows(now_ms)
+        self.cache_rows_matching(now_ms, None, None, usize::MAX)
     }
 
-    /// See [`Cache::rows_matching`].
+    /// At most `limit` cache entries whose name contains `name` and whose
+    /// type is `qtype`, sorted by name (`ip.dns.cache.print`). Copied in
+    /// pieces of [`PRINT_SLOTS`] slots or [`PRINT_COPIES`] entries, the
+    /// lock let go between them, and formatted after (G4.1y): with a
+    /// million entries the whole scan under the lock stopped every lookup
+    /// for up to 160 ms (`docs/dns-stress.md`).
     pub fn cache_rows_matching(
         &self,
         now_ms: u64,
@@ -427,7 +465,27 @@ impl Resolver {
         qtype: Option<&str>,
         limit: usize,
     ) -> Vec<CacheRow> {
-        self.state().cache.rows_matching(now_ms, name, qtype, limit)
+        let filter = crate::cache::Filter::new(now_ms, name, qtype);
+        let mut copies = Vec::new();
+        let mut from = Some(0);
+        while let Some(f) = from {
+            if copies.len() >= limit {
+                break;
+            }
+            let room = limit.min(copies.len().saturating_add(PRINT_COPIES));
+            // Grown before the lock: doubling 100 000 copies moved ~8 MB
+            // under it (1,5 ms of p99,9 beside a `limit=100000`, host).
+            copies.reserve(room.saturating_sub(copies.len()));
+            let st = self.state();
+            // The time holding the lock, not the time waiting for it.
+            let turn = Turn::start();
+            from = st
+                .cache
+                .copy_matching(&filter, f, PRINT_SLOTS, room, &mut copies);
+            drop(st);
+            turn.pause();
+        }
+        crate::cache::rows_of(&copies, now_ms)
     }
 
     pub fn cache_len(&self) -> usize {
@@ -1082,6 +1140,36 @@ mod tests {
     use crate::message::tests::{a, reply};
     use hickory_proto::op::{Message, ResponseCode};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn the_cache_listing_goes_in_pieces() {
+        // G4.1y: more entries than a piece holds; the filtered listing
+        // still finds its rows, sorted, and stops at the limit.
+        let r = Resolver::new(Settings {
+            cache_bytes: 64 << 20,
+            ..Settings::default()
+        });
+        {
+            let mut st = r.state();
+            for i in 0..3 * PRINT_SLOTS {
+                let name = format!("host{i}.example");
+                let ans = Answer::local(
+                    crate::message::Rcode::NoError,
+                    vec![a(&name, 600, [192, 0, 2, 1])],
+                );
+                st.cache
+                    .put(&name, RecordType::A, &ans, None, 0, 604_800, 40);
+            }
+        }
+        let rows = r.cache_rows_matching(0, Some("host1"), Some("A"), usize::MAX);
+        let want = (0..3 * PRINT_SLOTS)
+            .filter(|i| i.to_string().starts_with('1'))
+            .count();
+        assert_eq!(rows.len(), want);
+        assert!(rows.windows(2).all(|w| w[0].name <= w[1].name), "sorted");
+        assert_eq!(r.cache_rows_matching(0, None, None, 1000).len(), 1000);
+        assert_eq!(r.cache_rows(0).len(), 3 * PRINT_SLOTS);
+    }
 
     #[derive(Clone, Copy)]
     enum Behave {
