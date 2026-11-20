@@ -79,7 +79,7 @@ mod tests {
 
     use hickory_proto::rr::RecordType;
 
-    use crate::querylog::{BY, format};
+    use crate::querylog::BY;
     use crate::server::tests::{LAN, Up, ask, forwarder};
     use crate::server::{Forwarder, Start};
 
@@ -113,13 +113,24 @@ mod tests {
         assert_eq!(e.client, IpAddr::from(LAN));
         assert_eq!(BY.get(usize::from(e.by)), Some(&"upstream"));
         assert_eq!(e.at_ms, 7);
-        // Burst of 2, then dropped over UDP: still logged, flagged.
+        // Burst of 2, then dropped over UDP before the parse (G4.1zo): no
+        // name to log (a flood would write a line per packet); the
+        // statistics count it for the client.
         let _ = done(&f, &mut up, LAN, "www.example.com.");
         let d = done(&f, &mut up, LAN, "www.example.com.");
         assert!(d.reply.is_none());
-        let e = d.log.expect("a drop is logged");
-        assert_eq!(e.flags & format::DROPPED, format::DROPPED);
-        assert_eq!(BY.get(usize::from(e.by)), Some(&"limit"));
+        assert_eq!(d.answered_by, "limit");
+        assert!(d.log.is_none(), "not in the query log");
+        // Over TCP the chain still decides, and the REFUSED is logged.
+        let tcp = ask("www.example.com.", RecordType::AAAA);
+        let mut seen = None;
+        for _ in 0..3 {
+            if let Start::Done(d) = f.start(&tcp, IpAddr::from(LAN), true, 7) {
+                seen = d.log.filter(|e| BY.get(usize::from(e.by)) == Some(&"limit"));
+            }
+        }
+        let e = seen.expect("a TCP refusal over the limit is logged");
+        assert_eq!(e.rcode, 5);
         // Outside allowed_from: refused, logged with the EDE.
         let d = done(&f, &mut up, [203, 0, 113, 9], "x.example.");
         let e = d.log.expect("refused is logged");

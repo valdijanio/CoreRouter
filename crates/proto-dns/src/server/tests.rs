@@ -241,6 +241,46 @@ fn per_client_limit_drops_udp() {
     assert!(run(&f, &mut up, LAN, &q).is_some(), "refilled");
 }
 
+/// G4.1zo: junk from a client counts against its limit before it is
+/// parsed. Under the limit it gets its FORMERR (RFC 1035 §4.1.1); over it,
+/// nothing goes back and nothing is decoded: a flood of junk from one
+/// address no longer passes the limit that a flood of queries meets.
+#[test]
+fn junk_counts_against_the_limit_before_the_parse() {
+    use crate::server::statistics::Statistics;
+    let f = forwarder(|c| c.ip.dns.max_queries_per_client = 5);
+    let mut up = Up::new();
+    let t = up.now;
+    let from = IpAddr::from(LAN);
+    let cut = [
+        0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 3, b'w', b'w',
+    ];
+    let replies: Vec<bool> = (0..20)
+        .map(|_| matches!(f.start(&cut, from, false, t), Start::Done(d) if d.reply.is_some()))
+        .collect();
+    assert_eq!(
+        replies.iter().filter(|r| **r).count(),
+        10,
+        "the burst, then silence"
+    );
+    assert!(replies.iter().skip(10).all(|r| !r), "{replies:?}");
+    let s = f.state::<Statistics>().snapshot(10);
+    let got = |k| s.counters.answered.get(k).copied().unwrap_or(0);
+    assert_eq!((got("malformed"), got("limit")), (10, 10));
+    // A query from the same address meets the same empty bucket.
+    assert!(run(&f, &mut up, LAN, &ask("example.com.", RecordType::A)).is_none());
+    // TCP is not limited before the parse (no spoofing; REFUSED needs the
+    // question), the router itself never is, and other clients have theirs.
+    assert!(matches!(f.start(&cut, from, true, t), Start::Done(d) if d.reply.is_some()));
+    let lo = IpAddr::from([127, 0, 0, 1]);
+    assert!(
+        (0..20).all(|_| matches!(f.start(&cut, lo, false, t), Start::Done(d) if d.reply.is_some()))
+    );
+    assert!(
+        matches!(f.start(&cut, IpAddr::from([192, 168, 88, 11]), false, t), Start::Done(d) if d.reply.is_some())
+    );
+}
+
 #[test]
 fn stale_answer_when_upstream_is_down() {
     let f = forwarder(|_| {});

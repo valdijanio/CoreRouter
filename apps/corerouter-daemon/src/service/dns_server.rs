@@ -10,8 +10,11 @@
 //! - "dns-server": every second, copies the running config into the
 //!   forwarder when it changed, and opens or closes the sockets as
 //!   `allow_remote_requests` says.
-//! - up to four UDP threads per family on one socket ([`udp_threads`]):
-//!   each reads a query and runs the chain up to the cache; a cache hit is
+//! - four UDP sockets per family on port 53 in a `SO_REUSEPORT` group that
+//!   steers each client to one socket by its source address ([`steer`],
+//!   G4.1zo: a flood from one address fills one queue, not everyone's),
+//!   each with up to four "dns-udp" readers ([`udp_threads`]). A reader
+//!   reads a query and runs the chain up to the cache; a cache hit is
 //!   answered at once. A miss goes to a "dns-upstream" event loop
 //!   ([`upstream`], G4.1t: no thread per query), at most
 //!   `max_concurrent_queries` lookups in flight (more: SERVFAIL), so one
@@ -56,10 +59,12 @@ use corerouter_proto_dns::server::{Done, Effect, Forwarder, MAX_QUERY, Pending, 
 use corerouter_proto_dns::zone;
 use super::dns::RouterDns;
 use corerouter_model::service::Listen;
-use sock::{Udp, bind_tcp};
+use sock::{Udp, bind_group, bind_tcp};
 
 #[path = "dns_server/pool.rs"]
 mod pool;
+#[path = "dns_server/steer.rs"]
+mod steer;
 #[path = "dns_server/upstream.rs"]
 mod upstream;
 #[path = "dns_server/slots.rs"]
@@ -490,8 +495,8 @@ fn open(
     let mut opened = Vec::new();
     for ip in listen_ips(lab) {
         let addr = SocketAddr::new(ip, port);
-        let udp = match Udp::bind(addr) {
-            Ok(u) => Arc::new(u),
+        let udp = match bind_group(addr, steer::SOCKETS) {
+            Ok(g) => g.into_iter().map(Arc::new).collect::<Vec<_>>(),
             // A host without IPv6 still serves IPv4.
             Err(e) if ip.is_ipv6() => {
                 log::info!("DNS: no IPv6 listener on {addr}: {e}");
@@ -503,13 +508,22 @@ fn open(
         opened.push((udp, tcp, addr));
     }
     let at = opened.iter().map(|(_, _, a)| *a).collect();
-    for (udp, tcp, _) in opened {
-        for _ in 0..udp_threads() {
-            let s = srv.clone();
-            let udp = udp.clone();
-            health
-                .spawn("dns-udp", move || udp_loop(s, udp, epoch))
-                .map_err(|e| e.to_string())?;
+    for (group, tcp, _) in opened {
+        // G4.1zo: each socket of the group gets the clients that hash to it
+        // ([`steer`]) and as many readers as the one socket had before, so
+        // one busy client still has every reader (one source at saturation,
+        // VM, 4 CPUs: 78 000 cache hits/s with one reader per socket,
+        // 136 000/s with two, 155 000/s with the one socket before,
+        // **medido**), and a flood keeps to its own queue. Idle readers wait
+        // in `recv`.
+        for udp in group {
+            for _ in 0..udp_threads() {
+                let s = srv.clone();
+                let udp = udp.clone();
+                health
+                    .spawn("dns-udp", move || udp_loop(s, udp, epoch))
+                    .map_err(|e| e.to_string())?;
+            }
         }
         let s = srv.clone();
         health
@@ -896,8 +910,32 @@ mod sock {
         std::io::Error::from_raw_os_error(e as i32)
     }
 
+    /// G4.1zo: `n` sockets on `addr` in one `SO_REUSEPORT` group, the
+    /// datagrams of each client steered to one of them by its source
+    /// address ([`super::steer`]). Without the steering (a kernel without
+    /// it) the kernel still spreads by the four-tuple: logged, not fatal.
+    pub(super) fn bind_group(addr: SocketAddr, n: u32) -> std::io::Result<Vec<Udp>> {
+        let group = (0..n.max(1))
+            .map(|_| Udp::bind_as(addr, true))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        if let Some(first) = group.first() {
+            let mut prog: Vec<libc::sock_filter> = super::steer::program(addr.is_ipv6(), n.max(1))
+                .into_iter()
+                .map(|(code, jt, jf, k)| libc::sock_filter { code, jt, jf, k })
+                .collect();
+            let fprog = libc::sock_fprog {
+                len: u16::try_from(prog.len()).unwrap_or(u16::MAX),
+                filter: prog.as_mut_ptr(),
+            };
+            if let Err(e) = setsockopt(&first.sock, sockopt::AttachReusePortCbpf, &fprog) {
+                log::warn!("DNS: UDP {addr}: no steering by client ({e}): the kernel's own spread");
+            }
+        }
+        Ok(group)
+    }
+
     impl Udp {
-        pub(super) fn bind(addr: SocketAddr) -> std::io::Result<Self> {
+        fn bind_as(addr: SocketAddr, reuse_port: bool) -> std::io::Result<Self> {
             let v6 = addr.is_ipv6();
             let family = if v6 {
                 AddressFamily::Inet6
@@ -907,6 +945,9 @@ mod sock {
             let fd: OwnedFd = socket(family, SockType::Datagram, SockFlag::SOCK_CLOEXEC, None)
                 .map_err(nix_io)?;
             setsockopt(&fd, sockopt::ReuseAddr, &true).map_err(nix_io)?;
+            if reuse_port {
+                setsockopt(&fd, sockopt::ReusePort, &true).map_err(nix_io)?;
+            }
             if setsockopt(&fd, sockopt::RcvBufForce, &RCVBUF).is_err() {
                 let _ = setsockopt(&fd, sockopt::RcvBuf, &RCVBUF);
             }
@@ -1044,6 +1085,11 @@ mod sock {
         sock: UdpSocket,
     }
 
+    /// One socket: no steering by client here.
+    pub(super) fn bind_group(addr: SocketAddr, _n: u32) -> std::io::Result<Vec<Udp>> {
+        Ok(vec![Udp::bind(addr)?])
+    }
+
     impl Udp {
         pub(super) fn bind(addr: SocketAddr) -> std::io::Result<Self> {
             let sock = UdpSocket::bind(addr)?;
@@ -1142,6 +1188,37 @@ mod tests {
         assert!(is_lab(&shared(Session::virtual_lab())));
         assert!(listen_ips(true).iter().all(IpAddr::is_loopback));
         assert!(listen_ips(false).iter().all(IpAddr::is_unspecified));
+    }
+
+    /// G4.1zo, the real kernel: every datagram of one source address
+    /// reaches the same socket of the group whatever its source port, and
+    /// different sources spread over the group (127/8 is all local).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_client_lands_in_one_socket_of_the_group() {
+        let port = free_port();
+        let group = bind_group(SocketAddr::from(([127, 0, 0, 1], port)), steer::SOCKETS).unwrap();
+        assert_eq!(group.len(), steer::SOCKETS as usize);
+        let sources: Vec<Ipv4Addr> = (2..42).map(|i| Ipv4Addr::new(127, 0, 0, i)).collect();
+        for src in &sources {
+            for _ in 0..3 {
+                let c = UdpSocket::bind((*src, 0)).unwrap();
+                c.send_to(b"steer", ("127.0.0.1", port)).unwrap();
+            }
+        }
+        let mut seen: std::collections::BTreeMap<IpAddr, std::collections::BTreeSet<usize>> =
+            Default::default();
+        let mut buf = [0u8; 64];
+        for (i, sock) in group.iter().enumerate() {
+            // Each read waits at most POLL (250 ms) once its queue is empty.
+            while let Ok((_, from, _)) = sock.recv(&mut buf) {
+                seen.entry(from.ip()).or_default().insert(i);
+            }
+        }
+        assert_eq!(seen.len(), sources.len(), "every source arrived: {seen:?}");
+        assert!(seen.values().all(|s| s.len() == 1), "one socket per source: {seen:?}");
+        let used: std::collections::BTreeSet<usize> = seen.values().flatten().copied().collect();
+        assert!(used.len() >= 3, "40 sources over the group: {used:?}");
     }
 
     #[test]
