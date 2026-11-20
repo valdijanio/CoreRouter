@@ -11,9 +11,13 @@
 //!
 //! - **The open sessions.** Every request of a logged-in connection passes
 //!   through [`Session::as_caller`](crate::Session), which calls [`seen`]:
-//!   one map insert by connection id. [`gone`] drops it when the
-//!   connection closes. Loopback sessions are left out (the `local` table
-//!   answers them before any route).
+//!   one map insert by connection id. [`gone`] marks it closed when the
+//!   connection closes, and it is still watched for [`RECENT_SECS`]: a
+//!   learned route usually kills the session it covers, and the operator
+//!   who comes back by another way (the console, another network) must see
+//!   what did it; `corerouter-cli run` also opens one connection per
+//!   command. Loopback sessions are left out (the `local` table answers
+//!   them before any route).
 //! - **The check.** The daemon's `mgmt-guard` service asks the kernel,
 //!   once a second and outside the session lock, which FIB entry a reply
 //!   to each distinct (peer, local address) takes ([`Session::mgmt_guard_probes`],
@@ -47,6 +51,10 @@ use crate::Session;
 
 /// Most sessions tracked (the control channel takes fewer at once).
 pub const MAX_SESSIONS: usize = 1024;
+/// A closed session is still watched this long.
+pub const RECENT_SECS: u64 = 600;
+/// Most closed sessions kept (the newest).
+pub const MAX_CLOSED: usize = 256;
 /// Distinct (peer, local) pairs looked up per tick.
 pub const MAX_PROBES: usize = 1024;
 /// Answers older than this are not trusted (the service stopped).
@@ -63,6 +71,8 @@ struct Open {
     link: Link,
     via: Option<&'static str>,
     user: String,
+    /// When the connection closed (`Some(None)`: closed, no clock).
+    closed: Option<Option<u64>>,
 }
 
 /// What a RIB read gave.
@@ -94,6 +104,8 @@ pub struct Who {
     pub via: String,
     pub user: String,
     pub peer: IpAddr,
+    /// Still connected (a closed one is watched for [`RECENT_SECS`]).
+    pub open: bool,
 }
 
 /// A learned route that covers the peer of open sessions.
@@ -141,7 +153,7 @@ pub(crate) fn seen(s: &mut Session, caller: &Caller) {
         }
         return;
     }
-    if g.open.len() >= MAX_SESSIONS {
+    if g.open.values().filter(|o| o.closed.is_none()).count() >= MAX_SESSIONS {
         return;
     }
     g.open.insert(
@@ -150,19 +162,53 @@ pub(crate) fn seen(s: &mut Session, caller: &Caller) {
             link,
             via: caller.via,
             user: caller.principal.label().chars().take(64).collect(),
+            closed: None,
         },
     );
 }
 
-/// The connection `id` closed.
+/// The connection `id` closed: watched for [`RECENT_SECS`] more, as the
+/// newest closed session of its peer, user and client.
 pub(crate) fn gone(s: &mut Session, id: u64) {
-    if let Some(g) = s.ext_mut::<Guard>() {
-        g.open.remove(&id);
-        g.findings.retain_mut(|f| {
-            f.sessions.retain(|w| w.id != id);
-            !f.sessions.is_empty()
+    let now = s.now();
+    let Some(g) = s.ext_mut::<Guard>() else {
+        return;
+    };
+    let Some(o) = g.open.get_mut(&id) else {
+        return;
+    };
+    o.closed = Some(now);
+    let key = (o.link.peer.ip(), o.link.local.ip(), o.via, o.user.clone());
+    g.open.retain(|k, o| *k == id || o.closed.is_none() || (o.link.peer.ip(), o.link.local.ip(), o.via, o.user.clone()) != key);
+    for f in &mut g.findings {
+        for w in f.sessions.iter_mut().filter(|w| w.id == id) {
+            w.open = false;
+        }
+    }
+    prune(g, now);
+}
+
+/// Drop the closed sessions older than [`RECENT_SECS`], and the oldest
+/// beyond [`MAX_CLOSED`].
+fn prune(g: &mut Guard, now: Option<u64>) {
+    if let Some(now) = now {
+        g.open.retain(|_, o| match o.closed {
+            Some(Some(at)) => now.saturating_sub(at) <= RECENT_SECS,
+            _ => true,
         });
     }
+    let mut closed: Vec<u64> = g.open.iter().filter(|(_, o)| o.closed.is_some()).map(|(k, _)| *k).collect();
+    if closed.len() > MAX_CLOSED {
+        closed.sort_unstable();
+        for k in closed.iter().take(closed.len() - MAX_CLOSED) {
+            g.open.remove(k);
+        }
+    }
+    let alive: HashSet<u64> = g.open.keys().copied().collect();
+    g.findings.retain_mut(|f| {
+        f.sessions.retain(|w| alive.contains(&w.id));
+        !f.sessions.is_empty()
+    });
 }
 
 /// The connected networks of the main table that are up, by network: the
@@ -198,6 +244,7 @@ fn who(id: u64, o: &Open) -> Who {
         via: o.via.unwrap_or("tcp").to_owned(),
         user: o.user.clone(),
         peer: plain(o.link.peer.ip()),
+        open: o.closed.is_none(),
     }
 }
 
@@ -263,7 +310,7 @@ pub fn describe(f: &Finding) -> String {
         .sessions
         .iter()
         .take(4)
-        .map(|w| format!("{} {} de {}", w.via, w.user, w.peer))
+        .map(|w| format!("{} {} de {}{}", w.via, w.user, w.peer, if w.open { "" } else { ", já fechada" }))
         .collect();
     let more = f.sessions.len().saturating_sub(4);
     let more = if more > 0 { format!(" e mais {more}") } else { String::new() };
@@ -284,9 +331,11 @@ impl Session {
     /// The distinct (peer, local address) pairs of the open management
     /// sessions, for the `mgmt-guard` service to look up.
     pub fn mgmt_guard_probes(&mut self) -> Vec<(IpAddr, IpAddr)> {
-        let Some(g) = self.ext::<Guard>() else {
+        let now = self.now();
+        let Some(g) = self.ext_mut::<Guard>() else {
             return Vec::new();
         };
+        prune(g, now);
         let mut seen = HashSet::new();
         g.open
             .values()
@@ -356,7 +405,8 @@ impl Session {
         self.ext::<Guard>().is_some_and(|g| g.fed)
     }
 
-    /// The open management sessions (not loopback).
+    /// The management sessions (not loopback): the open ones and those
+    /// closed in the last [`RECENT_SECS`] (`open: false`).
     pub fn mgmt_guard_sessions(&self) -> Vec<Who> {
         let mut v: Vec<Who> = self
             .ext::<Guard>()
@@ -383,7 +433,7 @@ impl Session {
     /// none or it is old. Without a routing daemon: unavailable.
     pub fn mgmt_guard_rib(&mut self, net: IpNet) -> RibView {
         if self.routing_status().is_none_or(|st| st.backend.is_empty()) {
-            return RibView::Unavailable("no routing daemon attached (the virtual lab runs none)".into());
+            return RibView::Unavailable("no routing daemon attached (FRR is not running here)".into());
         }
         let now = self.now();
         let Some(g) = self.ext_mut::<Guard>() else {
@@ -570,11 +620,32 @@ pub(crate) mod tests {
         // Said in the log at once.
         let log = s.execute("log.print", &json!({})).unwrap().to_string();
         assert!(log.contains("Gerência: a rota 192.168.0.2/32"), "{log}");
-        // The connection closes: nothing to warn about.
+        // The route usually kills the session: still named, as closed, for
+        // the operator who comes back by another way.
         s.hang_up(7);
         s.hang_up(8);
+        let f = s.mgmt_guard_findings();
+        assert!(f[0].sessions.iter().all(|w| !w.open));
+        assert!(describe(&f[0]).contains("GUI admin de 192.168.0.2, já fechada"), "{}", describe(&f[0]));
+        assert!(!summary(&s).is_null());
+    }
+
+    #[test]
+    fn a_closed_session_is_watched_for_ten_minutes() {
+        let mut s = lab();
+        s.tick(1_000);
+        // `corerouter-cli run`: one connection per command.
+        s.execute_as(&operator(7, "192.168.0.2", "CLI"), "system.identity.get", &json!({})).unwrap();
+        s.hang_up(7);
+        s.execute_as(&operator(8, "192.168.0.2", "CLI"), "system.identity.get", &json!({})).unwrap();
+        s.hang_up(8);
+        assert_eq!(s.mgmt_guard_sessions().len(), 1, "the newest closed one per peer, user and client");
+        s.tick(1_000 + RECENT_SECS);
+        feed(&mut s, |_| learned("192.168.0.2/32", 188));
+        assert_eq!(s.mgmt_guard_findings().len(), 1);
+        s.tick(1_001 + RECENT_SECS);
+        assert!(s.mgmt_guard_probes().is_empty(), "forgotten after RECENT_SECS");
         assert!(s.mgmt_guard_findings().is_empty());
-        assert!(summary(&s).is_null());
     }
 
     #[test]
@@ -643,3 +714,4 @@ pub(crate) mod tests {
         assert_eq!(installed, 1);
     }
 }
+

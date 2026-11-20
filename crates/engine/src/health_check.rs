@@ -1371,7 +1371,7 @@ impl Session {
         i.absent_ports = self.invalid_interfaces(&live).into_keys().map(|n| n.to_string()).collect();
         i.wireguard_stale = self.wireguard_stale();
         if self.mgmt_guard_watching() {
-            i.mgmt_route = Some((self.mgmt_guard_sessions().len(), self.mgmt_guard_findings()));
+            i.mgmt_route = Some((self.mgmt_guard_sessions().iter().filter(|w| w.open).count(), self.mgmt_guard_findings()));
         }
         i.nic_hardware = self.nic_health();
         i.boot_apply = self.boot_failures().into_iter().map(|f| (f.label(), f.error)).collect();

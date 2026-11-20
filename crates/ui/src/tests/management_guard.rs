@@ -85,6 +85,8 @@ fn protect_guards_the_network_and_the_list_shows_it() {
     h.app.open(Win::Panel(WIN));
     refresh(&mut h);
     assert!(h.has_text("Protect 192.168.0.0/24"), "{:?}", texts(&h));
+    let buttons = texts(&h).iter().filter(|t| *t == "Protect 192.168.0.0/24").count();
+    assert_eq!(buttons, 1, "one button per network");
     h.click(h.text("Protect 192.168.0.0/24"));
     refresh(&mut h);
     let p = h.app.panel_mut::<GuardPanel>().unwrap();

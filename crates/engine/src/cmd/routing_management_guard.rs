@@ -30,7 +30,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{} → {watching: bool (the daemon looks up the open sessions' routes), rows: [{id, network, family (ipv4 | ipv6), interface? (the connected network's port), connected: bool, sessions (open management sessions whose peer is inside), covered (of them, whose replies a learned route takes now), refused?: u32 (learned routes inside and longer the daemon holds and keeps out of the kernel), refused_text?, installed?: u32 (of them, in the kernel: the guard is not in force), rib: ready | pending | unavailable, rib_error?, state (active | disabled | not-applied), disabled, comment}], findings: [{peer, route, protocol, interface?, gateway?, connected, connected_interface, sessions: [{via, user, peer}], guarded, text, fix?}]}",
         always, list),
     cmd!(query "routing.management-guard.suggest", "Management Networks", [], None,
-        "{} → [{network, interface, sessions: [{via, user, peer}], covered: bool (a learned route takes the replies now), guarded: bool, command (what protects it)}]",
+        "{} → [{network, interface, sessions: [{via, user, peer, open (false: closed in the last 10 min)}], covered: bool (a learned route takes the replies now), guarded: bool, command (what protects it)}]",
         always, suggest),
     cmd!(query "routing.management-guard.check", "Check Management Guard Network", [], None,
         "{id?: string (the network being edited), network?: string, disabled?: string, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param?}], commands: [{command, params}]} (form texts accepted; never an error: bad input is a check)",
@@ -156,7 +156,7 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
             .find(|(c, _, _)| *c == n.network)
             .map(|(_, i, _)| i.to_string())
             .or_else(|| connected_port(s.store().running(), &n.network));
-        let sessions: usize = inside.iter().map(|(_, _, w)| w.len()).sum();
+        let sessions: usize = inside.iter().map(|(_, _, w)| w.iter().filter(|w| w.open).count()).sum();
         let covered: usize = findings
             .iter()
             .filter(|f| n.network.contains(&f.peer))
@@ -285,9 +285,13 @@ fn check(s: &mut Session, raw: &Value) -> Result<Value> {
         )),
     }
     let mgmt = s.mgmt_guard_networks();
-    let here: usize = mgmt.iter().filter(|(c, _, _)| net.contains(c)).map(|(_, _, w)| w.len()).sum();
-    if here > 0 {
-        checks.push(item("ok", "sessions", format!("{here} open management session(s) come from inside {net}"), None));
+    let inside: Vec<_> = mgmt.iter().filter(|(c, _, _)| net.contains(c)).flat_map(|(_, _, w)| w.iter()).collect();
+    let open = inside.iter().filter(|w| w.open).count();
+    if open > 0 {
+        checks.push(item("ok", "sessions", format!("{open} open management session(s) come from inside {net}"), None));
+    }
+    if inside.len() > open {
+        checks.push(item("ok", "sessions", format!("{} management session(s) from inside {net} closed in the last 10 min", inside.len() - open), None));
     }
     if s.mgmt_guard_findings().iter().any(|f| net.contains(&f.peer)) {
         checks.push(item("warning", "covered", format!("a learned route takes the replies to a session inside {net} now: this guard takes it out"), None));

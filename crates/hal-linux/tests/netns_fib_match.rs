@@ -110,6 +110,36 @@ fn a_learned_host_route_over_the_management_network_is_seen() {
         "another peer of the /24 is not covered"
     );
 
+    // What zebra really installs (FRR 10): a nexthop object and `nhid`; the
+    // FIB entry then carries RTA_NH_ID and no RTA_OIF/RTA_GATEWAY (the lab
+    // VM, 2026-11-20: the guard missed it until this was read).
+    ip(&[
+        "nexthop", "add", "id", "10", "via", "10.0.1.2", "dev", "lab0", "proto", "ospf",
+    ]);
+    ip(&[
+        "route",
+        "add",
+        "192.168.0.77/32",
+        "nhid",
+        "10",
+        "proto",
+        "ospf",
+        "metric",
+        "20",
+    ]);
+    let nh = lookup(&[(a("192.168.0.77"), Some(a("192.168.0.1")))])
+        .unwrap()
+        .remove(0);
+    let nh = nh.unwrap_or_else(|e| panic!("nhid route: {e}"));
+    assert_eq!(nh.prefix.unwrap().to_string(), "192.168.0.77/32");
+    assert_eq!(protocol_name(nh.protocol), "ospf");
+    assert_eq!(
+        nh.interface.as_ref().map(|i| i.as_str()),
+        Some("lab0"),
+        "{nh:?}"
+    );
+    assert_eq!(nh.gateway, Some(a("10.0.1.2")), "{nh:?}");
+
     // A static route of CoreRouter is the operator's own.
     ip(&[
         "route",

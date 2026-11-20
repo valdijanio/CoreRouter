@@ -158,7 +158,10 @@ pub(crate) fn sessions_text(who: &Value) -> String {
         .into_iter()
         .flatten()
         .take(4)
-        .map(|w| format!("{} {} {}", s(w, "via"), s(w, "user"), s(w, "peer")))
+        .map(|w| {
+            let closed = if w.get("open").and_then(Value::as_bool) == Some(false) { " (closed)" } else { "" };
+            format!("{} {} {}{closed}", s(w, "via"), s(w, "user"), s(w, "peer"))
+        })
         .collect::<Vec<_>>()
         .join("; ")
 }
@@ -201,10 +204,13 @@ impl GuardPanel {
                 }
             });
         }
+        // A network a finding above already offers is not repeated.
+        let offered: Vec<String> = findings.iter().map(|f| s(f, "connected")).collect();
         let open: Vec<Value> = self
             .suggest
             .iter()
             .filter(|n| n.get("guarded").and_then(Value::as_bool) != Some(true))
+            .filter(|n| !offered.contains(&s(n, "network")))
             .cloned()
             .collect();
         if !open.is_empty() {
