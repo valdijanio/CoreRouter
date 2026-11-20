@@ -255,6 +255,11 @@ Carga das zonas por `ip.dns.zone.file.load`: 311 ms para 9 980 registros e 1,07 
   endereço: nenhuma queda nem panic; o cliente legítimo ao lado: p99 151 µs com o limite padrão,
   20 ms sem ele (o lixo que parece consulta vira miss). As mensagens acima do limite são descartadas
   e contadas (`limit` no `ip.dns.statistics.print`).
+- **G4.1zo** (`--junk-procs 4`: o lixo de quatro processos no mesmo endereço, ~1 M mensagens/s):
+  antes, com um socket por família, o legítimo perdia 65 % (limite 200) e 80 % (sem limite) com
+  1 leitor, e 37 % e 61 % com 2. Depois (limite antes da decodificação, quatro sockets
+  `SO_REUSEPORT` repartidos pela origem), 0 % em todas, p99 abaixo de 1 ms. No notebook, pelo cabo:
+  1,7 % → 0 % com o limite padrão (`docs/changes/G4.1zo.md`).
 - ANY é respondido com um registro (RFC 8482: resposta mínima), 50–61 bytes; TXT de 3,8 KB vem
   truncado (TC) em 28–39 bytes, também com EDNS de 4096 (o `max_udp_packet_size` padrão é 1232); um A
   com 60 registros cabe em 1000 bytes (fator 25 sobre a pergunta, só para quem está no
