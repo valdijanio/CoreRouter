@@ -341,16 +341,23 @@ fn revisions_are_files_of_their_own() {
     let history: Vec<u32> = s.store().history().iter().map(|r| r.number).collect();
     assert_eq!(history, [0, 1, 2]);
     add(&mut s, "10.0.2.1/24");
+    add(&mut s, "10.0.3.1/24");
     assert_eq!(fs::read(dir.0.join(revision_file(1))).unwrap(), first);
+    // G4.1zn: journaled commits leave their revision files to the
+    // checkpoint, which writes them together (one syncfs on Linux).
+    assert!(!dir.0.join(revision_file(2)).exists());
+    assert_eq!(s.checkpoint(), Ok(true));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        assert!(!dir.0.join(revision_file(3)).exists());
-        let mode = fs::metadata(dir.0.join(revision_file(2)))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600);
+        assert!(!dir.0.join(revision_file(4)).exists());
+        for n in [2, 3] {
+            let mode = fs::metadata(dir.0.join(revision_file(n)))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "revision {n}");
+        }
     }
     s.execute("config.rollback", &json!({"revision": 1}))
         .unwrap();

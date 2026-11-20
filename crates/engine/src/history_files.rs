@@ -51,6 +51,15 @@
 //! saved. The boot replays the lines that build on the slot it loaded
 //! ([`replay_journal`]); a torn last line (a crash in an append) is left
 //! out, and the next save checkpoints instead of appending after it.
+//!
+//! G4.1zn: a journaled commit writes its line and nothing else. The
+//! revision files of the slot's revision and the newer ones (the boot
+//! rebuilds them from the journal, from either slot, and ignores their
+//! files) wait for the save that next writes the slot, which writes them
+//! first, together (`ConfigStorage::save_revisions`: one `syncfs` on
+//! Linux). A commit was a revision file plus a line, two flushes; on the
+//! phase C notebook's USB SSD that was ~29 ms of each command's ~40
+//! (**medido**: `ip.dns.set` p50 41 ms, `ip.dns.get` 12 ms).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -315,6 +324,67 @@ pub(crate) fn save(
     if history.is_empty() {
         return Err("empty history".into());
     }
+    // G4.1zn: when the journal takes this commit, the revisions it rebuilds
+    // at boot (the current slot's and every newer one: their lines stay in
+    // the journal for either slot) need no file yet. Their files are written
+    // by the save that next writes the slot, before it: a commit is one
+    // flush (the journal line), not two (a revision file and the line).
+    let defer_from = if !slot && storage.config_journal() && journal_takes(files, store, users) {
+        files.journal.current
+    } else {
+        None
+    };
+    let mut keep = write_files(storage, files, store, budget, defer_from)?;
+    let mut journaled = false;
+    if defer_from.is_some() {
+        journaled = matches!(journal_append(storage, files, store, users), Ok(true));
+        if !journaled {
+            // The journal failed after all: the slot is written below, and
+            // every file it needs goes first.
+            keep = write_files(storage, files, store, budget, None)?;
+        }
+    }
+    // The newest revision is in the slot (or, journaled, in the journal).
+    let skipped = history.len().saturating_sub(keep.len()).saturating_sub(1);
+    let mut saved = if journaled {
+        Ok(())
+    } else {
+        save_newest(storage, files, store, users, slot)
+    };
+    if saved.is_err() {
+        saved = save_newest(storage, files, store, users, slot);
+    }
+    if let Err(e) = &saved
+        && crate::storage::no_space(e)
+    {
+        // G1.6w: the same with the slot or the journal line: every revision
+        // but the last good one gives way to the running config. Only for a
+        // full disk, and only after a retry: anything else costs no history.
+        log::warn!("the running config does not fit, freeing the old revisions: {e}");
+        let last_good = keep.last().copied();
+        keep.retain(|k| Some(*k) == last_good);
+        remove_stale(storage, files, &keep);
+        saved = save_newest(storage, files, store, users, slot);
+    }
+    saved?;
+    let skipped = skipped.max(history.len().saturating_sub(keep.len()).saturating_sub(1));
+    // Past the history now, or the newest (whole in the slot or built by
+    // the journal).
+    remove_stale(storage, files, &keep);
+    Ok(skipped)
+}
+
+/// The revision files [`save`] needs that are missing, newest first; the
+/// revisions kept (files written, already there, or `defer_from` and newer:
+/// left to the journal). `Err` only for a failure that is not a full disk.
+fn write_files(
+    storage: &mut dyn ConfigStorage,
+    files: &mut RevisionFiles,
+    store: &ConfigStore,
+    budget: usize,
+    defer_from: Option<u32>,
+) -> Result<BTreeSet<u32>, String> {
+    let history = store.history();
     // Newest first: each revision is a difference against the next newer
     // one, so the chain stops at the first that does not fit (an older
     // file without its base would be useless).
@@ -325,6 +395,10 @@ pub(crate) fn save(
         let [rev, base] = pair else { continue };
         let size = match files.saved.get(&rev.number) {
             Some(f) if f.base == Some(base.number) => f.size,
+            _ if defer_from.is_some_and(|c| rev.number >= c) => {
+                keep.insert(rev.number);
+                continue;
+            }
             _ => {
                 // Only the sections the two do not share are serialized.
                 let delta = persist::revision_delta(&base.config, &rev.config)
@@ -343,12 +417,18 @@ pub(crate) fn save(
         used = used.saturating_add(size);
         keep.insert(rev.number);
     }
+    // G4.1zn: all at once (one flush for the batch a checkpoint writes);
+    // what failed gets the single-file path below.
+    let batch: Vec<(u32, &str)> = write.iter().map(|(n, t, _)| (*n, t.as_str())).collect();
+    let mut first = storage.save_revisions(&batch).into_iter();
     for (number, text, base) in &write {
         // Whatever was there is replaced: until it is written, no file counts.
         files.saved.remove(number);
         files.present.insert(*number);
         // One retry for a passing error: it must not cost any history.
-        let mut wrote = storage.save_revision(*number, text);
+        let mut wrote = first
+            .next()
+            .unwrap_or_else(|| Err(crate::StorageError("revision not written".into())));
         if wrote.is_err() {
             wrote = storage.save_revision(*number, text);
         }
@@ -390,30 +470,7 @@ pub(crate) fn save(
             break;
         }
     }
-    // The newest revision is in the slot.
-    let skipped = history.len().saturating_sub(keep.len()).saturating_sub(1);
-    let mut saved = save_newest(storage, files, store, users, slot);
-    if saved.is_err() {
-        saved = save_newest(storage, files, store, users, slot);
-    }
-    if let Err(e) = &saved
-        && crate::storage::no_space(e)
-    {
-        // G1.6w: the same with the slot or the journal line: every revision
-        // but the last good one gives way to the running config. Only for a
-        // full disk, and only after a retry: anything else costs no history.
-        log::warn!("the running config does not fit, freeing the old revisions: {e}");
-        let last_good = keep.last().copied();
-        keep.retain(|k| Some(*k) == last_good);
-        remove_stale(storage, files, &keep);
-        saved = save_newest(storage, files, store, users, slot);
-    }
-    saved?;
-    let skipped = skipped.max(history.len().saturating_sub(keep.len()).saturating_sub(1));
-    // Past the history now, or the newest (whole in the slot or built by
-    // the journal).
-    remove_stale(storage, files, &keep);
-    Ok(skipped)
+    Ok(keep)
 }
 
 /// The newest revision to the journal or, when that cannot take it, the slot.
@@ -455,6 +512,34 @@ pub(crate) fn slot_is_newest(storage: &dyn ConfigStorage, files: &RevisionFiles,
     !storage.config_journal() || (newest.is_some() && files.journal.current == newest)
 }
 
+/// Whether [`journal_append`] takes the newest revision of `store` (appends
+/// its line, or finds it already there), without writing anything:
+/// [`save`] defers the revision files only then (G4.1zn).
+fn journal_takes(files: &RevisionFiles, store: &ConfigStore, users: &Users) -> bool {
+    let history = store.history();
+    let (Some(newest), Some((logged, cfg))) = (history.last(), files.journal.logged.as_ref()) else {
+        return false;
+    };
+    let j = &files.journal;
+    if j.users.as_ref() != Some(users) || j.current.is_none() || j.previous.is_none() {
+        return false;
+    }
+    let holds = |n: u32| {
+        history
+            .iter()
+            .find(|r| r.number == n)
+            .is_some_and(|r| corerouter_model::sections::changed(&r.config, cfg).is_empty())
+    };
+    if newest.number == *logged {
+        return holds(*logged);
+    }
+    let Some((number, base, line)) = files.line.as_ref() else {
+        return false;
+    };
+    let fits = j.lines < MAX_JOURNAL_LINES && j.bytes.saturating_add(line.len()) <= journal_budget(j.slot);
+    *number == newest.number && *base == *logged && holds(*base) && fits
+}
+
 /// The newest revision as one more journal line, when the storage holds
 /// the one before it: `Ok(true)` when nothing else is needed (appended, or
 /// already there). `Ok(false)`: the slot must be written instead (the
@@ -465,32 +550,20 @@ fn journal_append(
     store: &ConfigStore,
     users: &Users,
 ) -> Result<bool, String> {
-    let history = store.history();
-    let (Some(newest), Some((logged, cfg))) = (history.last(), files.journal.logged.as_ref()) else {
-        return Ok(false);
-    };
-    let j = &files.journal;
-    if j.users.as_ref() != Some(users) || j.current.is_none() || j.previous.is_none() {
+    if !journal_takes(files, store, users) {
+        // The checkpoint still journals the line (the previous slot needs it).
         return Ok(false);
     }
-    let holds = |n: u32| {
-        history
-            .iter()
-            .find(|r| r.number == n)
-            .is_some_and(|r| corerouter_model::sections::changed(&r.config, cfg).is_empty())
-    };
-    if newest.number == *logged {
-        return Ok(holds(*logged));
-    }
-    let Some((number, base, line)) = files.line.take() else {
+    let Some(newest) = store.history().last() else {
         return Ok(false);
     };
-    let fits = j.lines < MAX_JOURNAL_LINES && j.bytes.saturating_add(line.len()) <= journal_budget(j.slot);
-    if number != newest.number || base != *logged || !holds(base) || !fits {
-        // The checkpoint still journals it (the previous slot needs it).
-        files.line = Some((number, base, line));
-        return Ok(false);
+    if files.journal.logged.as_ref().is_some_and(|(n, _)| *n == newest.number) {
+        // Already there.
+        return Ok(true);
     }
+    let Some((_, _, line)) = files.line.take() else {
+        return Ok(false);
+    };
     storage
         .append_journal(crate::storage::CONFIG_JOURNAL, &line)
         .map_err(|e| e.to_string())?;

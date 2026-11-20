@@ -32,9 +32,11 @@
 //! hard-links these files instead of copying them. Only journals are
 //! appended to.
 
+use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use corerouter_engine::storage::{MAX_JOURNAL_BYTES, MAX_STATE_BYTES, state_name_ok};
 use corerouter_engine::{ConfigStorage, Slot, StorageError};
@@ -93,6 +95,25 @@ pub struct FileStorage {
     dir: PathBuf,
     /// G1.6zn: while this file exists the disk is gone, and its text says so.
     gone: Option<PathBuf>,
+    /// G4.1zn: flushes past [`SLOW_FLUSH`], told in the log at most once
+    /// every [`SLOW_LOG_EVERY`].
+    slow: RefCell<SlowFlushes>,
+}
+
+/// A flush (fsync, fdatasync, a directory's fsync) that took longer than
+/// this is logged: a commit waits for one or two of them, so slow flash (a
+/// USB stick, a worn SD card) shows up here first (G4.1zn: ~15 ms each on
+/// the phase C notebook's USB SSD, **estimado** from its command times).
+pub const SLOW_FLUSH: Duration = Duration::from_millis(100);
+const SLOW_LOG_EVERY: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Default)]
+struct SlowFlushes {
+    told: Option<Instant>,
+    /// Since the last line: how many, the worst and what it was.
+    count: u32,
+    worst: Duration,
+    worst_what: String,
 }
 
 impl FileStorage {
@@ -107,7 +128,11 @@ impl FileStorage {
                 dir.display()
             )));
         }
-        let me = Self { dir, gone: None };
+        let me = Self {
+            dir,
+            gone: None,
+            slow: RefCell::default(),
+        };
         match fs::remove_file(me.path(TEMP)) {
             Ok(()) => log::warn!("removed {TEMP} left by an interrupted save"),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -220,7 +245,9 @@ impl FileStorage {
         }
         let path = self.path(file);
         let mut f = opts.open(&path)?;
-        let written = f.write_all(data.as_bytes()).and_then(|()| f.sync_all());
+        let written = f
+            .write_all(data.as_bytes())
+            .and_then(|()| self.flush(file, || f.sync_all()));
         if written.is_err() {
             // A full disk must not also collect half-written temporaries,
             // one per failed commit (G1.6w).
@@ -230,12 +257,93 @@ impl FileStorage {
         written
     }
 
+    /// [`Self::write_file`] without the flush: the caller makes it durable
+    /// ([`Self::sync_files`]). A failed write removes the file.
+    fn write_unsynced(&self, file: &str, data: &str) -> io::Result<()> {
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let path = self.path(file);
+        let written = opts
+            .open(&path)
+            .and_then(|mut f| f.write_all(data.as_bytes()));
+        if written.is_err() {
+            let _ = fs::remove_file(&path);
+        }
+        written
+    }
+
     /// Make the renames durable (POSIX: a rename is only on disk once the
     /// directory is synced). Windows has no directory handle to sync.
     fn sync_dir(&self) -> io::Result<()> {
         #[cfg(unix)]
-        File::open(&self.dir)?.sync_all()?;
+        {
+            let d = File::open(&self.dir)?;
+            self.flush("the directory", || d.sync_all())?;
+        }
         Ok(())
+    }
+
+    /// `sync`, timed: a slow one goes to the log (G4.1zn).
+    fn flush(&self, what: &str, sync: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        let started = Instant::now();
+        let done = sync();
+        let took = started.elapsed();
+        if took >= SLOW_FLUSH {
+            self.slow_flush(what, took);
+        }
+        done
+    }
+
+    fn slow_flush(&self, what: &str, took: Duration) {
+        let Ok(mut s) = self.slow.try_borrow_mut() else {
+            return;
+        };
+        s.count = s.count.saturating_add(1);
+        if took > s.worst {
+            s.worst = took;
+            s.worst_what = what.to_owned();
+        }
+        if s.told.is_some_and(|t| t.elapsed() < SLOW_LOG_EVERY) {
+            return;
+        }
+        log::warn!(
+            "config disk slow: {} flush(es) over {} ms in {}, the worst {} ms ({}); every commit waits for one",
+            s.count,
+            SLOW_FLUSH.as_millis(),
+            self.dir.display(),
+            s.worst.as_millis(),
+            s.worst_what
+        );
+        *s = SlowFlushes {
+            told: Some(Instant::now()),
+            ..SlowFlushes::default()
+        };
+    }
+
+    /// G4.1zn: the files of `revs` durable together. Linux: one `syncfs`
+    /// of the config's filesystem (64 revision files on a disk with 15 ms
+    /// flushes: 1.8 s one fsync each, 37–69 ms with one syncfs, **medido**
+    /// in the VM over dm-delay). Elsewhere, one fsync each.
+    fn sync_files(&self, files: &[String]) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = files;
+            let d = File::open(&self.dir)?;
+            self.flush("syncfs", || rustix::fs::syncfs(&d).map_err(io::Error::from))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            for f in files {
+                let file = File::open(self.path(f))?;
+                self.flush(f, || file.sync_all())?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -362,7 +470,7 @@ impl ConfigStorage for FileStorage {
         f.write_all(lines.as_bytes())
             .map_err(|e| self.err(&format!("append {file}"), &e))?;
         // fdatasync: the lines (and the size) are on disk, not the times.
-        f.sync_data()
+        self.flush(&file, || f.sync_data())
             .map_err(|e| self.err(&format!("sync {file}"), &e))?;
         if fresh {
             // A new file's directory entry must reach the disk too.
@@ -430,6 +538,47 @@ impl ConfigStorage for FileStorage {
         // Durable with the slot's directory fsync, which comes next.
         fs::rename(self.path(&temp), self.path(&file))
             .map_err(|e| self.err(&format!("rename {temp} → {file}"), &e))
+    }
+
+    /// Every file written and renamed without its own flush, then all made
+    /// durable at once ([`Self::sync_files`]), before the slot that needs
+    /// them is written. A crash before that leaves files the slot on disk
+    /// does not need (the revisions its journal still holds, which the boot
+    /// ignores); the next checkpoint writes them again. One file: the
+    /// single path (a `syncfs` would also flush everything else on the
+    /// disk).
+    fn save_revisions(&mut self, files: &[(u32, &str)]) -> Vec<Result<(), StorageError>> {
+        if files.len() < 2 {
+            return files
+                .iter()
+                .map(|(number, data)| self.save_revision(*number, data))
+                .collect();
+        }
+        if let Err(e) = self.guard() {
+            return files.iter().map(|_| Err(e.clone())).collect();
+        }
+        let mut done: Vec<Result<(), StorageError>> = Vec::with_capacity(files.len());
+        let mut written: Vec<String> = Vec::new();
+        for (number, data) in files {
+            let file = revision_file(*number);
+            let temp = format!("{file}.tmp");
+            let wrote = self
+                .write_unsynced(&temp, data)
+                .map_err(|e| self.err(&format!("write {temp}"), &e))
+                .and_then(|()| {
+                    fs::rename(self.path(&temp), self.path(&file))
+                        .map_err(|e| self.err(&format!("rename {temp} → {file}"), &e))
+                });
+            if wrote.is_ok() {
+                written.push(file);
+            }
+            done.push(wrote);
+        }
+        if let Err(e) = self.sync_files(&written) {
+            let e = self.err("sync the revision files", &e);
+            return files.iter().map(|_| Err(e.clone())).collect();
+        }
+        done
     }
 
     fn remove_revision(&mut self, number: u32) -> Result<(), StorageError> {

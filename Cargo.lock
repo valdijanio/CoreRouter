@@ -1652,6 +1652,7 @@ dependencies = [
  "corerouter-model",
  "criterion",
  "log",
+ "rustix 1.1.5",
  "serde_json",
 ]
 
