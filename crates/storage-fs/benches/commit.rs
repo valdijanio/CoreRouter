@@ -386,16 +386,22 @@ fn checkpoint(c: &mut Criterion) {
             let mut spent = Duration::ZERO;
             for _ in 0..iters {
                 let t = Instant::now();
-                s.execute("config.checkpoint.add", &json!({"name": "b"})).unwrap();
+                s.execute("config.checkpoint.add", &json!({"name": "b"}))
+                    .unwrap();
                 spent += t.elapsed();
-                s.execute("config.checkpoint.remove", &json!({"name": "b"})).unwrap();
+                s.execute("config.checkpoint.remove", &json!({"name": "b"}))
+                    .unwrap();
             }
             spent
         });
     });
-    s.execute("config.checkpoint.add", &json!({"name": "r"})).unwrap();
+    s.execute("config.checkpoint.add", &json!({"name": "r"}))
+        .unwrap();
     let text = std::fs::read_to_string(dir.join("checkpoint-r.json")).unwrap();
-    println!("checkpoint file: {:.2} MiB", text.len() as f64 / 1_048_576.0);
+    println!(
+        "checkpoint file: {:.2} MiB",
+        text.len() as f64 / 1_048_576.0
+    );
     let mut flip = false;
     g.bench_function(BenchmarkId::new("restore", "5mib"), |b| {
         b.iter_custom(|iters| {
@@ -403,10 +409,14 @@ fn checkpoint(c: &mut Criterion) {
             for _ in 0..iters {
                 flip = !flip;
                 let comment = if flip { "a" } else { "b" };
-                s.execute("interface.set", &json!({"name": "ether2", "comment": comment}))
-                    .unwrap();
+                s.execute(
+                    "interface.set",
+                    &json!({"name": "ether2", "comment": comment}),
+                )
+                .unwrap();
                 let t = Instant::now();
-                s.execute("config.checkpoint.restore", &json!({"name": "r"})).unwrap();
+                s.execute("config.checkpoint.restore", &json!({"name": "r"}))
+                    .unwrap();
                 spent += t.elapsed();
             }
             spent
