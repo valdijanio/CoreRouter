@@ -362,6 +362,13 @@ pub fn journal_message(
         "config.rollback" => p
             .get("revision")
             .map(|r| format!("Configuração revertida para a revisão {r}")),
+        // G0.33: the `revision` of these results is the one the checkpoint holds.
+        "config.checkpoint.add" => {
+            text(p, "name").map(|n| format!("Checkpoint «{n}» salvo com a revisão em uso{revision}"))
+        }
+        "config.checkpoint.restore" => text(p, "name")
+            .map(|n| format!("Configuração restaurada do checkpoint «{n}», que guarda{revision}")),
+        "config.checkpoint.remove" => text(p, "name").map(|n| format!("Checkpoint «{n}» apagado")),
         "config.safe-mode.cancel" => Some(match text(p, "automatic") {
             Some(why) => format!(
                 "Safe Mode desfeito automaticamente: {}{revision}",

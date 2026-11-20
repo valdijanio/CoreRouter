@@ -12,6 +12,7 @@
 //! | `*.corrupt`, `*.corrupt.<n>` | quarantined unreadable slot (each one kept) |
 //! | `state-<name>.json` | operational state outside the revisions (DHCP client leases) |
 //! | `journal-<name>.log` | append-only journal (the DHCP server's leases, G4.2a) |
+//! | `checkpoint-<name>.json` | a named checkpoint: a whole config kept apart from the history (G0.33) |
 //!
 //! A save is: write `running.json.tmp`, fsync it, rename `running.json` →
 //! `running.json.prev`, rename the temp file → `running.json`, fsync the
@@ -25,7 +26,7 @@
 //! directory fsync makes both renames durable). See the engine's
 //! `history_files` for the order and what a crash leaves.
 //!
-//! Slots, revisions and `state-*` files are never written in place: a new
+//! Slots, revisions, checkpoints and `state-*` files are never written in place: a new
 //! content is a new file renamed over the old one. The A/B update's
 //! configuration snapshot relies on it (G1.6u, `sysupdate::state`): it
 //! hard-links these files instead of copying them. Only journals are
@@ -37,7 +38,7 @@ use std::path::{Path, PathBuf};
 
 use corerouter_engine::storage::{MAX_JOURNAL_BYTES, MAX_STATE_BYTES, state_name_ok};
 use corerouter_engine::{ConfigStorage, Slot, StorageError};
-use corerouter_model::persist::MAX_FILE_BYTES;
+use corerouter_model::persist::{MAX_FILE_BYTES, checkpoint_name_ok};
 
 pub const CURRENT: &str = "running.json";
 pub const PREVIOUS: &str = "running.json.prev";
@@ -54,6 +55,26 @@ pub fn revision_file(number: u32) -> String {
 
 /// The revision a file name holds (`rev-12.json` gives 12), strictly: no
 /// sign, no leading zero, nothing after.
+/// Checkpoint files: `checkpoint-<name>.json`.
+pub const CHECKPOINT_PREFIX: &str = "checkpoint-";
+
+/// File name of checkpoint `name`, for a name the engine accepts only.
+fn checkpoint_file(name: &str) -> Result<String, StorageError> {
+    if checkpoint_name_ok(name) {
+        Ok(format!("{CHECKPOINT_PREFIX}{name}.json"))
+    } else {
+        Err(StorageError(format!("bad checkpoint name '{name}'")))
+    }
+}
+
+/// The checkpoint a file name holds (`checkpoint-x.json` gives `x`).
+fn checkpoint_name(file: &str) -> Option<&str> {
+    let name = file
+        .strip_prefix(CHECKPOINT_PREFIX)?
+        .strip_suffix(".json")?;
+    checkpoint_name_ok(name).then_some(name)
+}
+
 fn revision_number(name: &str) -> Option<u32> {
     let digits = name
         .strip_prefix(REVISION_PREFIX)?
@@ -100,7 +121,8 @@ impl FileStorage {
             let Some(name) = name.to_str() else { continue };
             let stale = (name.starts_with("state-")
                 || name.starts_with("journal-")
-                || name.starts_with(REVISION_PREFIX))
+                || name.starts_with(REVISION_PREFIX)
+                || name.starts_with(CHECKPOINT_PREFIX))
                 && name.ends_with(".tmp");
             if stale {
                 match fs::remove_file(entry.path()) {
@@ -419,6 +441,58 @@ impl ConfigStorage for FileStorage {
             Err(e) => Err(self.err(&format!("remove {file}"), &e)),
         }
     }
+
+    fn list_checkpoints(&mut self) -> Result<Vec<String>, StorageError> {
+        let entries = fs::read_dir(&self.dir).map_err(|e| self.err("list", &e))?;
+        let mut found = Vec::new();
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            if let Some(name) = entry.file_name().to_str().and_then(checkpoint_name) {
+                found.push(name.to_owned());
+            }
+        }
+        Ok(found)
+    }
+
+    fn load_checkpoint(&mut self, name: &str) -> Result<Option<String>, StorageError> {
+        let file = checkpoint_file(name)?;
+        let f = match File::open(self.path(&file)) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(self.err(&format!("open {file}"), &e)),
+        };
+        // Like a slot: past the limit it comes back as text the decoder
+        // refuses.
+        let limit = u64::try_from(MAX_FILE_BYTES)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let mut bytes = Vec::new();
+        f.take(limit)
+            .read_to_end(&mut bytes)
+            .map_err(|e| self.err(&format!("read {file}"), &e))?;
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    }
+
+    fn save_checkpoint(&mut self, name: &str, data: &str) -> Result<(), StorageError> {
+        self.guard()?;
+        let file = checkpoint_file(name)?;
+        let temp = format!("{file}.tmp");
+        self.write_file(&temp, data)
+            .map_err(|e| self.err(&format!("write {temp}"), &e))?;
+        fs::rename(self.path(&temp), self.path(&file))
+            .map_err(|e| self.err(&format!("rename {temp} → {file}"), &e))?;
+        self.sync_dir().map_err(|e| self.err("sync", &e))
+    }
+
+    fn remove_checkpoint(&mut self, name: &str) -> Result<(), StorageError> {
+        self.guard()?;
+        let file = checkpoint_file(name)?;
+        match fs::remove_file(self.path(&file)) {
+            Ok(()) => self.sync_dir().map_err(|e| self.err("sync", &e)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(self.err(&format!("remove {file}"), &e)),
+        }
+    }
 }
 
 /// The last `limit` bytes of `f`, from the first line that starts inside
@@ -447,6 +521,36 @@ pub fn read_tail(mut f: File, limit: u64) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G0.33: checkpoints are files of their own, listed by name, and a
+    /// temp file of an interrupted write is gone at the next open.
+    #[test]
+    fn checkpoints_on_disk() {
+        let d = std::env::temp_dir().join(format!("storage-fs-ckpt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let mut st = FileStorage::open(&d).unwrap();
+        assert_eq!(st.list_checkpoints().unwrap(), Vec::<String>::new());
+        st.save_checkpoint("before-lab", "{}\n").unwrap();
+        st.save_checkpoint("b_2", "x").unwrap();
+        assert!(st.save_checkpoint("../x", "x").is_err());
+        let mut names = st.list_checkpoints().unwrap();
+        names.sort();
+        assert_eq!(names, ["b_2", "before-lab"]);
+        assert_eq!(
+            st.load_checkpoint("before-lab").unwrap().as_deref(),
+            Some("{}\n")
+        );
+        assert_eq!(st.load_checkpoint("none").unwrap(), None);
+        st.remove_checkpoint("b_2").unwrap();
+        st.remove_checkpoint("b_2").unwrap();
+        assert_eq!(st.list_checkpoints().unwrap(), ["before-lab"]);
+        fs::write(d.join("checkpoint-c.json.tmp"), "partial").unwrap();
+        fs::write(d.join("checkpoint-bad name.json"), "x").unwrap();
+        let mut st = FileStorage::open(&d).unwrap();
+        assert!(!d.join("checkpoint-c.json.tmp").exists());
+        assert_eq!(st.list_checkpoints().unwrap(), ["before-lab"]);
+        fs::remove_dir_all(&d).unwrap();
+    }
 
     #[test]
     fn revision_names_are_strict() {

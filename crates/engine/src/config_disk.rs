@@ -23,6 +23,9 @@ use crate::history_files::RevisionFiles;
 
 /// Revision files, at most this much of `/config`.
 pub const HISTORY_PERCENT: u64 = 10;
+/// Named checkpoints (G0.33: whole configs kept apart from the history),
+/// at most this much of `/config`, besides the history's share.
+pub const CHECKPOINT_PERCENT: u64 = 10;
 /// Graph files (`graphs/*.rrd`), at most this much of `/config`.
 pub const GRAPHS_PERCENT: u64 = 25;
 
