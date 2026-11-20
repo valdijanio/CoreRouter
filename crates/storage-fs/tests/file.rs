@@ -386,3 +386,33 @@ fn commits_go_to_the_config_journal_file() {
     assert_eq!(s.storage_status().loaded_from, Some("previous"));
     assert_eq!(addresses(&s), want);
 }
+
+/// G0.33: a checkpoint on disk outlives more commits than the history keeps
+/// and a restart, and brings the config from before them back.
+#[test]
+fn a_checkpoint_on_disk_outlives_the_history_and_a_restart() {
+    let dir = TempDir::new();
+    let mut s = boot(&dir);
+    add(&mut s, "10.0.0.1/24");
+    s.execute("config.checkpoint.add", &json!({"name": "before-lab"}))
+        .unwrap();
+    assert!(dir.0.join("checkpoint-before-lab.json").exists());
+    for i in 0..80 {
+        add(&mut s, &format!("10.1.{i}.1/24"));
+    }
+    drop(s);
+    let mut s = boot(&dir);
+    assert_eq!(addresses(&s).len(), 81);
+    let oldest = s.store().history().first().unwrap().number;
+    assert!(oldest > 1, "the history moved past the checkpoint ({oldest})");
+    s.execute(
+        "config.checkpoint.restore",
+        &json!({"name": "before-lab", "remove": true}),
+    )
+    .unwrap();
+    assert_eq!(addresses(&s), ["10.0.0.1/24"]);
+    assert!(!dir.0.join("checkpoint-before-lab.json").exists());
+    drop(s);
+    let s = boot(&dir);
+    assert_eq!(addresses(&s), ["10.0.0.1/24"], "the restore was saved");
+}

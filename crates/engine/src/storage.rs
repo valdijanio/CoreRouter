@@ -148,6 +148,32 @@ pub trait ConfigStorage: Send {
         let _ = number;
         Ok(())
     }
+
+    /// Names of the checkpoints present (G0.33; any order). A checkpoint
+    /// is a whole config kept apart from the revisions, under a name that
+    /// [`corerouter_model::persist::checkpoint_name_ok`] accepts.
+    fn list_checkpoints(&mut self) -> Result<Vec<String>, StorageError> {
+        Ok(Vec::new())
+    }
+
+    /// Contents of checkpoint `name`, or `None` if there is none.
+    fn load_checkpoint(&mut self, name: &str) -> Result<Option<String>, StorageError> {
+        let _ = name;
+        Ok(None)
+    }
+
+    /// Write checkpoint `name`, atomically like [`Self::save`] and synced
+    /// before it returns (the command answers after it).
+    fn save_checkpoint(&mut self, name: &str, data: &str) -> Result<(), StorageError> {
+        let _ = (name, data);
+        Err(StorageError("checkpoints are not supported by this storage".into()))
+    }
+
+    /// Delete checkpoint `name` (none there: `Ok`).
+    fn remove_checkpoint(&mut self, name: &str) -> Result<(), StorageError> {
+        let _ = name;
+        Ok(())
+    }
 }
 
 /// The journal of commits since the slot was last written (G0.22).
@@ -181,6 +207,7 @@ struct Slots {
     state: std::collections::BTreeMap<String, String>,
     journals: std::collections::BTreeMap<String, String>,
     revisions: std::collections::BTreeMap<u32, String>,
+    checkpoints: std::collections::BTreeMap<String, String>,
     /// [`MemoryStorage::set_unavailable`].
     unavailable: Option<String>,
 }
@@ -260,6 +287,23 @@ impl MemoryStorage {
     /// disk went away).
     pub fn set_unavailable(&self, why: Option<String>) {
         self.with(|s| s.unavailable = why);
+    }
+
+    /// Checkpoint `name` (tests: inspect or corrupt it).
+    pub fn checkpoint(&self, name: &str) -> Option<String> {
+        self.with(|s| s.checkpoints.get(name).cloned())
+    }
+
+    /// Overwrite or delete checkpoint `name` (tests).
+    pub fn put_checkpoint(&self, name: &str, data: Option<String>) {
+        self.with(|s| match data {
+            Some(d) => {
+                s.checkpoints.insert(name.to_owned(), d);
+            }
+            None => {
+                s.checkpoints.remove(name);
+            }
+        });
     }
 
     /// Bytes stored in revision files (tests: what the history costs).
@@ -364,6 +408,27 @@ impl ConfigStorage for MemoryStorage {
 
     fn remove_revision(&mut self, number: u32) -> Result<(), StorageError> {
         self.put_revision(number, None);
+        Ok(())
+    }
+
+    fn list_checkpoints(&mut self) -> Result<Vec<String>, StorageError> {
+        Ok(self.with(|s| s.checkpoints.keys().cloned().collect()))
+    }
+
+    fn load_checkpoint(&mut self, name: &str) -> Result<Option<String>, StorageError> {
+        Ok(self.checkpoint(name))
+    }
+
+    fn save_checkpoint(&mut self, name: &str, data: &str) -> Result<(), StorageError> {
+        if !corerouter_model::persist::checkpoint_name_ok(name) {
+            return Err(StorageError(format!("checkpoint name '{name}' refused")));
+        }
+        self.put_checkpoint(name, Some(data.to_owned()));
+        Ok(())
+    }
+
+    fn remove_checkpoint(&mut self, name: &str) -> Result<(), StorageError> {
+        self.put_checkpoint(name, None);
         Ok(())
     }
 }

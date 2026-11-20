@@ -15,7 +15,9 @@ Find ids and their params signature with list_commands (use `prefix`), run them 
 run_command, or several at once with command_batch (atomic by default). Check the result \
 with inspect_state (pass `path` to read one subtree). Commit mode: `immediate` applies each \
 change at once; switch to `transactional` (config.mode.set) for multi-step changes, review \
-config.diff, then config.commit; config.rollback {revision} restores history. Errors are \
+config.diff, then config.commit; config.rollback {revision} restores one of the newest 64 \
+revisions; before long work save config.checkpoint.add {name} and go back with \
+config.checkpoint.restore {name}. Errors are \
 plain text that says what to fix. Resources: corerouter://state, corerouter://diff, \
 corerouter://command/{id}, corerouter://state/{path}; prompts: configure_address, \
 review_and_commit, diagnose_connectivity. With the GUI attached, ui_screenshot shows the screen.";
