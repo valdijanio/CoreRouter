@@ -966,8 +966,13 @@ mod tests {
         // G4.1x, the lab's torture in small: 50 hot names in a cache for
         // 100, then 20 000 unique names with a legit client asking a hot
         // name every second unique one (each hot name once per 100 unique
-        // names: once per turn of the whole cache). Every legit query is
-        // a hit. Evicting by arrival, as before, this missed most of them.
+        // names: once per turn of the whole cache). Evicting by arrival, as
+        // before, this missed most of them; now nearly all are hits. Not
+        // all: the sketch is keyed by a random hash (`RandomState`, so a
+        // client cannot aim at the hot names' counters), and in a sketch
+        // this small (128 words) a unique name now and then ties with a
+        // hot one right after a halving. 200 runs, **medido**: 162 with no
+        // miss, the worst 24 of the 10 000 legit queries (0,24 %).
         let mut c = Cache::new(100 * ONE);
         for i in 0..50 {
             ask(&mut c, &format!("h{i:05}"), 3600, 0);
@@ -983,10 +988,14 @@ mod tests {
             }
         }
         check(&c);
-        assert_eq!(missed, 0);
+        assert!(
+            missed <= 100,
+            "{missed} of 10 000 legit queries missed (1 % at most)"
+        );
         let s = c.stats();
         assert_eq!(s.entries, 100);
-        assert_eq!(s.evicted + s.rejected, 20_000 - 50, "{s:?}");
+        // Each miss put its hot name back: one more answer came in.
+        assert_eq!(s.evicted + s.rejected, 20_000 - 50 + missed, "{s:?}");
         assert!(s.rejected > 10_000, "{s:?}");
     }
 
