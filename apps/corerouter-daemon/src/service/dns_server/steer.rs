@@ -36,7 +36,7 @@ pub(crate) const SOCKETS: u32 = 4;
 pub(crate) type Insn = (u16, u8, u8, u32);
 
 // linux/filter.h (classic BPF), the codes this program uses.
-const LD_W_ABS: u16 = 0x00 | 0x00 | 0x20; // BPF_LD | BPF_W | BPF_ABS
+const LD_W_ABS: u16 = 0x20; // BPF_LD (0) | BPF_W (0) | BPF_ABS
 const TAX: u16 = 0x07; // BPF_MISC | BPF_TAX
 const XOR_X: u16 = 0x04 | 0xa0 | 0x08; // BPF_ALU | BPF_XOR | BPF_X
 const MUL_K: u16 = 0x04 | 0x20; // BPF_ALU | BPF_MUL | BPF_K
