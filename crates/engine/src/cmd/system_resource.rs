@@ -25,7 +25,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{} → [{cpu, load, user, system, irq, softirq, iowait, steal, frequency_mhz, irq_rate, softirq_rate, net_rx_rate, net_tx_rate}]",
         always, cpu_print),
     cmd!(query "system.resource.process.print", "Resources Processes", [], None,
-        "{sort?: cpu|memory|name|pid|threads, limit?: int, threads?: bool (only the router's own processes — daemon, init, FRR — each with its threads)} → [{pid, ppid, name, state, threads, cpu, memory, fds (open descriptors; null: unreadable), tasks? (with threads: [{tid, name, state, cpu (% of one CPU)}], busiest first)}]",
+        "{sort?: cpu|memory|name|pid|threads, limit?: int, threads?: bool (only the router's own processes — daemon, init, FRR — each with its threads)} → [{pid, ppid, name, state, threads, cpu, cpu_secs (CPU time since it started, user + system, its ended threads included), memory, fds (open descriptors; null: unreadable), tasks? (with threads: [{tid, name, state, cpu (% of one CPU), cpu_secs}], busiest first)}]",
         always, process_print),
     cmd!(query "system.resource.network.print", "Resources Network", [], None,
         "{} → [{name, running, speed_mbps, rx_bits_per_second, tx_bits_per_second, rx_packets_per_second, tx_packets_per_second, rx_errors, tx_errors, rx_drops, tx_drops, errors_per_second, drops_per_second}]",
@@ -232,6 +232,7 @@ fn process_print(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let m = monitor(s, true)?;
     let cpu = m.process_cpu();
+    let hz = ticks_per_sec(m);
     let Some((_, list)) = &m.procs_last else {
         return Ok(json!([]));
     };
@@ -254,11 +255,24 @@ fn process_print(s: &mut Session, p: &Value) -> Result<Value> {
                 json!({
                     "pid": x.pid, "ppid": x.ppid, "name": x.name,
                     "state": x.state.to_string(), "threads": x.threads,
-                    "cpu": c.map(r1f), "memory": x.rss_bytes, "fds": x.fds,
+                    "cpu": c.map(r1f), "cpu_secs": secs(x.cpu_ticks, hz),
+                    "memory": x.rss_bytes, "fds": x.fds,
                 })
             })
             .collect(),
     ))
+}
+
+/// Clock ticks per second of the last reading's CPU times.
+fn ticks_per_sec(m: &ResourceMonitor) -> u32 {
+    m.last.as_ref().map_or(100, |l| l.hz.max(1))
+}
+
+/// G4.1zp: CPU time in seconds (two decimals), from clock ticks. A remote
+/// script takes two readings and divides by the time between them, as it
+/// does with `/proc` on a local router.
+fn secs(ticks: u64, hz: u32) -> f64 {
+    (ticks as f64 / f64::from(hz.max(1)) * 100.0).round() / 100.0
 }
 
 /// G1.6qe, `threads: true`: the router's own processes from every
@@ -268,6 +282,7 @@ fn process_print(s: &mut Session, p: &Value) -> Result<Value> {
 fn router_threads(s: &mut Session, sort: &str, limit: u32) -> Result<Value> {
     let m = monitor(s, false)?;
     let l = last(m)?;
+    let hz = l.hz;
     let (cpu, task_cpu) = m.router_cpu();
     let mut rows: Vec<_> = l.router.iter().map(|x| (x, cpu.get(&x.pid).copied())).collect();
     match sort {
@@ -292,13 +307,17 @@ fn router_threads(s: &mut Session, sort: &str, limit: u32) -> Result<Value> {
                 let tasks: Vec<Value> = tasks
                     .into_iter()
                     .map(|(t, c)| {
-                        json!({"tid": t.tid, "name": t.name, "state": t.state.to_string(), "cpu": c.map(r1f)})
+                        json!({
+                            "tid": t.tid, "name": t.name, "state": t.state.to_string(),
+                            "cpu": c.map(r1f), "cpu_secs": secs(t.cpu_ticks, hz),
+                        })
                     })
                     .collect();
                 json!({
                     "pid": x.pid, "ppid": x.ppid, "name": x.name,
                     "state": x.state.to_string(), "threads": x.threads,
-                    "cpu": c.map(r1f), "memory": x.rss_bytes, "fds": x.fds,
+                    "cpu": c.map(r1f), "cpu_secs": secs(x.cpu_ticks, hz),
+                    "memory": x.rss_bytes, "fds": x.fds,
                     "tasks": tasks,
                 })
             })
@@ -413,6 +432,14 @@ mod tests {
         assert!(cpu.windows(2).all(|w| w[0] >= w[1]), "busiest first: {cpu:?}");
         assert_eq!(cpu.last(), Some(&0.0));
         assert!(rows[1]["tasks"].as_array().unwrap().is_empty());
+        // G4.1zp: CPU time so far, for a remote script's own averages; the
+        // process's covers its threads (ended ones too).
+        let secs = |v: &Value| v["cpu_secs"].as_f64().unwrap();
+        let busiest = secs(&tasks[0]);
+        assert!(busiest > 0.0, "{}", tasks[0]);
+        assert!(secs(&rows[0]) >= busiest, "{}", rows[0]["cpu_secs"]);
+        let later = s.execute("system.resource.process.print", &json!({"threads": true})).unwrap();
+        assert!(secs(&later[0]) >= secs(&rows[0]), "it only grows");
         let v = s
             .execute("system.resource.process.print", &json!({"threads": true, "sort": "memory", "limit": 1}))
             .unwrap();
@@ -429,6 +456,7 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0]["name"], "corerouter-daemon");
         assert!(rows[0]["cpu"].as_f64().unwrap() >= rows[1]["cpu"].as_f64().unwrap());
+        assert!(rows[0]["cpu_secs"].as_f64().unwrap() > 0.0, "{}", rows[0]);
         let v = s.execute("system.resource.process.print", &json!({"sort": "memory"})).unwrap();
         assert_eq!(v[0]["name"], "bgpd");
         let v = s.execute("system.resource.process.print", &json!({"sort": "name", "limit": 1})).unwrap();

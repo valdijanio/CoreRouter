@@ -331,6 +331,17 @@ fn the_router_processes_are_found_and_kept() {
         "the daemon first, by its own name"
     );
     assert_eq!(s.router[0].pid, 2_889_393);
+    // G4.1zp: the whole list names it the same way (not the kernel's
+    // `corerouter-daem`), so a script finds it in either.
+    let all = c
+        .sample(Want {
+            processes: true,
+            ..Want::default()
+        })
+        .processes
+        .unwrap();
+    let own = all.iter().find(|p| p.pid == 2_889_393).unwrap();
+    assert_eq!(own.name, "corerouter-daemon");
     assert_eq!(
         c.router_pids.as_ref().map(|(_, p)| p.clone()),
         Some(vec![412])
