@@ -206,7 +206,7 @@ v=json.load(open(sys.argv[1]))
 for r in v["rows"]: print(f"    lista: {r['network']} {r.get('interface')} sessões={r['sessions']} recusadas={r.get('refused_text', r.get('rib'))} estado={r['state']}")
 print(f"    descobertas abertas: {len(v['findings'])}")
 EOF
-grep -q '"refused_text": "2 (ospf 2)"' "$OUT/list.json" && ok "a lista mostra 2 recusadas (ospf)" || bad "a lista não contou 2 recusadas"
+grep -q '"refused_text": "3 (ospf 3)"' "$OUT/list.json" && ok "a lista mostra 3 recusadas (os /32 do gerador: .2, .77, .78)" || bad "a lista não contou 3 recusadas"
 local_cli run system.health.check >"$OUT/health2.json" 2>>"$OUT/cli-stderr.log"
 grep -A3 '"key": "management.route"' "$OUT/health2.json" | grep -q '"ok"' && ok "saúde voltou a ok" || say "    (saúde: $(grep -A3 '"key": "management.route"' "$OUT/health2.json" | tr -d '\n' | head -c 200))"
 
