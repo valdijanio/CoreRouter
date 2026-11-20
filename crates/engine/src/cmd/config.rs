@@ -103,7 +103,22 @@ fn discard(s: &mut Session, _: &Value) -> Result<Value> {
 fn rollback(s: &mut Session, p: &Value) -> Result<Value> {
     crate::lockout::take_force(s, p)?;
     let rev = req_u32(p, "revision")?;
-    s.store_mut().rollback(rev)?;
+    if let Err(e) = s.store_mut().rollback(rev) {
+        // G0.33: say what is left and how not to lose it next time.
+        let oldest = s.store().history().first().map_or(0, |r| r.number);
+        return Err(match e {
+            corerouter_model::StoreError::UnknownRevision(n) if n < oldest => EngineError::bad(
+                "revision",
+                format!(
+                    "revision {n} not found: the history keeps the newest {} and starts at \
+                     revision {oldest}; before long work save a point that stays, \
+                     config.checkpoint.add {{name}}, and go back with config.checkpoint.restore",
+                    corerouter_model::ConfigStore::DEFAULT_MAX_HISTORY
+                ),
+            ),
+            e => e.into(),
+        });
+    }
     // In immediate mode `execute` commits right after this returns.
     Ok(json!({ "loaded": rev, "pending": s.mode() == CommitMode::Transactional }))
 }
@@ -113,9 +128,15 @@ fn history(s: &mut Session, _: &Value) -> Result<Value> {
 }
 
 fn diff(s: &mut Session, _: &Value) -> Result<Value> {
+    let lines = s.store().diff();
+    masked(s, &lines)
+}
+
+/// Diff lines as the caller may see them: below group full a changed
+/// secret shows as changed, not its value (also `config.checkpoint.diff`).
+pub(super) fn masked(s: &Session, lines: &[corerouter_model::DiffLine]) -> Result<Value> {
     let mut lines =
-        serde_json::to_value(s.store().diff()).map_err(|e| EngineError::Internal(e.to_string()))?;
-    // Below group full a changed secret shows as changed, not its value.
+        serde_json::to_value(lines).map_err(|e| EngineError::Internal(e.to_string()))?;
     if s.permit(crate::auth::Group::Full).is_err()
         && let Some(lines) = lines.as_array_mut()
     {

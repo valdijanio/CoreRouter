@@ -729,6 +729,27 @@ G0.16):
 
 Os 63 deltas somam 0,01 MiB; o resto do disco são os dois slots.
 
+**Checkpoints com nome (G0.33).** O histórico guarda as 64 revisões mais novas; um laboratório
+que faz centenas de commits (o teste de comandos do `dns-stress-lab.sh`, ~270 no notebook)
+empurra para fora a revisão de antes dele, e o `config.rollback` para ela falhava. Um checkpoint
+(`config.checkpoint.add {name}`, `.list`, `.diff`, `.restore {name, remove?}`, `.remove`) é
+uma cópia **inteira** da running com nome, num arquivo próprio (`checkpoint-<nome>.json`,
+`ConfigStorage::save_checkpoint`), fora do histórico: nenhum commit, limite ou cota do histórico
+o tira, só o `remove` (ou `restore` com `remove: true`). É o que fazem o rescue do Junos, os
+checkpoints do Arista EOS (20) e do SR Linux (10). Comparado com marcar uma revisão como fixa
+dentro do histórico: lá o arquivo dela é delta contra a revisão seguinte e mudaria de base a cada
+commit (custo por commit, e um formato novo no slot que uma versão anterior recusaria); a cópia
+inteira não custa nada ao commit e não depende de outro arquivo. Limites: 16 checkpoints e 10 %
+do `/config` (`config_disk::CHECKPOINT_PERCENT`), fora dos 10 % do histórico; o `add` acima disso é
+recusado e a running nunca perde espaço. O `restore` leva a cópia ao candidate como o rollback
+(imediato: commit na hora, com a checagem de lockout, e um commit recusado não apaga nada;
+transacional: espera o `config.commit`). Recusado em Safe Mode o `add` (a running ainda não foi
+confirmada); o `restore` em Safe Mode é um commit como os outros e o cancelamento o desfaz. Em
+memória fica só a lista: o primeiro `config.checkpoint.*` lê o cabeçalho de cada arquivo (6,2 ms
+num de 5 MiB contra 54,5 ms para montar a config, **medido**), e só o `restore`/`diff` monta a
+config. Contas não voltam (estão fora da config). "Checkpoint" aqui é a palavra do operador; o
+`Session::checkpoint` do G0.27 é outra coisa (a regravação do slot do journal no desligamento).
+
 | Backend | Onde | Uso |
 |---|---|---|
 | `MemoryStorage` | engine | GUI, wasm, testes, daemon em lab sem `--config-dir` |

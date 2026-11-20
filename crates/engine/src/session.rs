@@ -145,6 +145,10 @@ const NOT_IN_ATOMIC_BATCH: &[&str] = &[
     "config.safe-mode.enter",
     "config.safe-mode.exit",
     "config.safe-mode.cancel",
+    // A checkpoint file is written or deleted at once (G0.33): a later
+    // failed step cannot take it back.
+    "config.checkpoint.add",
+    "config.checkpoint.remove",
     // A reboot cannot be taken back if a later step fails (G1.6qa).
     "system.reboot",
     "system.shutdown",

@@ -30,7 +30,9 @@
 #                  $COREROUTER_PASSWORD). --mgmt adds that address to <if>
 #                  to reach <addr>. --dut-iface: the router's port on the
 #                  cable (never the one on the home network). The test
-#                  config goes in by transaction and leaves by rollback.
+#                  config goes in by transaction and leaves by restoring
+#                  the checkpoint `dns-stress-lab` saved before it (G0.33:
+#                  the lab makes more commits than the history keeps).
 #   --selftest-remote  a local DUT driven as a remote one (TLS on 10.53.0.1).
 #
 # Tests (--tests, comma-separated; default all but soak):
@@ -574,21 +576,32 @@ mcp_batch() {
 # not hold the 10 000 hot names; test qps measures it apart).
 DNS_BASE='{"servers":["'$UP1'","'$UP2'"],"allow_remote_requests":true,"allowed_from":["10.53.0.0/25"],"max_queries_per_client":0,"max_concurrent_queries":100,"max_concurrent_tcp_sessions":20,"cache_size":65536,"query_server_timeout_ms":2000,"query_total_timeout_ms":10000,"use_doh_server":"","serve_stale_secs":86400,"server_selection":"fastest"}'
 dns_set() { ok ip.dns.set "$(jq -cn --argjson b "$DNS_BASE" --argjson o "${1:-$NOPARAMS}" '$b + $o')" >/dev/null; }
-REVISION=""
+# G0.33: the config from before the lab, kept by name. A revision number
+# was not enough: the command tests make ~270 commits, the history keeps
+# 64, and the rollback to it failed on the notebook ("revision not found").
+CHECKPOINT=dns-stress-lab
+CHECKPOINT_SET=""
 dut_config() {
 	if [ $DUT = remote ]; then
-		# Phase C: everything below leaves by rollback to this revision
-		# (the first one: dut_config runs again after a daemon restart).
-		if [ -z "$REVISION" ]; then
-			REVISION=$(cr config.history | jq -r '[.[].number] | max // empty')
-			say "remote DUT: config revision $REVISION before the lab (rolled back at the end)"
+		# Phase C: everything below leaves by restoring the checkpoint
+		# (saved once: dut_config runs again after a daemon restart).
+		if [ -z "$CHECKPOINT_SET" ]; then
+			if cr config.checkpoint.list | jq -e --arg n "$CHECKPOINT" 'any(.[]; .name == $n)' >/dev/null; then
+				# Left by a run that did not reach its end: that one holds
+				# the config from before it, so it stays.
+				say "remote DUT: checkpoint $CHECKPOINT from an earlier run kept (restored at the end)"
+			else
+				ok config.checkpoint.add "{\"name\":\"$CHECKPOINT\",\"comment\":\"dns-stress-lab.sh: config before the lab\"}" >/dev/null || return 1
+				say "remote DUT: config saved as checkpoint $CHECKPOINT (restored at the end)"
+			fi
+			CHECKPOINT_SET=1
 		fi
 		# Servers learned by DHCP (`use_peer_dns`) join the lab's ones as
 		# `dynamic_servers`. On the notebook (2026-11-14) the home router
 		# behind ether1 got ~33 000 lab queries, answered NXDOMAIN for
 		# *.up.lab, and that negative answer in the cache was the "forwarder
 		# stopped answering" after the 200 ms origin. A change of
-		# `use_peer_dns` keeps the lease (engine dhcp_update); the rollback
+		# `use_peer_dns` keeps the lease (engine dhcp_update); the restore
 		# turns it back on.
 		local c dyn
 		# Ids like `*1` are read line by line: unquoted, they glob.
@@ -621,10 +634,10 @@ dut_config() {
 	done
 }
 dut_unconfig() {
-	if [ $DUT = remote ] && [ -n "$REVISION" ]; then
-		cr config.rollback "{\"revision\":$REVISION}" >/dev/null 2>&1 &&
-			say "remote DUT: rolled back to revision $REVISION" ||
-			say "remote DUT: rollback to $REVISION FAILED: undo by hand"
+	if [ $DUT = remote ] && [ -n "$CHECKPOINT_SET" ]; then
+		cr config.checkpoint.restore "{\"name\":\"$CHECKPOINT\",\"remove\":true}" >/dev/null 2>&1 &&
+			say "remote DUT: config from before the lab restored (checkpoint $CHECKPOINT, removed)" ||
+			say "remote DUT: restoring checkpoint $CHECKPOINT FAILED: config.checkpoint.restore {\"name\":\"$CHECKPOINT\"} by hand"
 	fi
 }
 

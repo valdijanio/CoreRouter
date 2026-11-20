@@ -718,12 +718,12 @@ fn run_until_signal(
     let started = Instant::now();
     match s.checkpoint() {
         Ok(true) => log::info!(
-            "shutting down: config checkpoint written in {} ms",
+            "shutting down: journaled commits written to the config slot in {} ms",
             started.elapsed().as_millis()
         ),
         Ok(false) => {}
         Err(e) => log::error!(
-            "shutting down: config checkpoint failed ({e}); the next start replays the journal"
+            "shutting down: writing the journaled commits to the config slot failed ({e}); the next start replays the journal"
         ),
     }
     if s.in_safe_mode() {
