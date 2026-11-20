@@ -361,6 +361,22 @@ pub(crate) fn route_get(
     with_kernel(|k| async move { k.route_get(q).await.map_err(HalError::Io) })
 }
 
+/// G3.4z: the FIB entry the reply to each `(peer, our address)` takes, with
+/// the route's protocol; one netlink connection for all of them (a lookup
+/// is one request, the kernel's trie does the longest match).
+pub(crate) fn fib_entries(
+    pairs: &[(IpAddr, Option<IpAddr>)],
+) -> Result<Vec<Result<corerouter_hal::route_get::FibEntry, String>>, HalError> {
+    with_kernel(|k| async move {
+        let mut names = std::collections::HashMap::new();
+        let mut out = Vec::with_capacity(pairs.len());
+        for (dst, src) in pairs {
+            out.push(k.fib_entry(*dst, *src, &mut names).await);
+        }
+        Ok(out)
+    })
+}
+
 /// A configured (permanent) address of `m`, as a prefix.
 fn configured_address(m: &AddressMessage) -> Option<IpNet> {
     let mut permanent = m.header.flags.contains(AddressHeaderFlags::Permanent);
@@ -1355,6 +1371,102 @@ impl Kernel {
                 None
             }),
             table,
+        })
+    }
+
+    /// G3.4z: `ip route get <dst> [from <src>] fibmatch`, and who put the
+    /// entry there. `names` caches interface names for one batch.
+    async fn fib_entry(
+        &self,
+        dst: IpAddr,
+        src: Option<IpAddr>,
+        names: &mut std::collections::HashMap<u32, Option<IfName>>,
+    ) -> Result<corerouter_hal::route_get::FibEntry, String> {
+        use corerouter_hal::route_get::{FibEntry, RouteKind};
+        use rtnetlink::packet_route::route::RouteFlags;
+        const ENETUNREACH: i32 = 101;
+        const EHOSTUNREACH: i32 = 113;
+        const EINVAL: i32 = 22;
+        const EACCES: i32 = 13;
+        let full = if dst.is_ipv4() { 32 } else { 128 };
+        let b = RouteMessageBuilder::<IpAddr>::new()
+            .destination_prefix(dst, full)
+            .map_err(|e| e.to_string())?;
+        let b = match src {
+            Some(s) if s.is_ipv4() == dst.is_ipv4() => {
+                b.source_prefix(s, full).map_err(|e| e.to_string())?
+            }
+            _ => b,
+        };
+        let mut m = b.build();
+        m.header.flags |= RouteFlags::FibMatch;
+        let none = |kind| FibEntry {
+            kind,
+            prefix: None,
+            protocol: 0,
+            interface: None,
+            gateway: None,
+        };
+        let mut st = self.handle.route().get(m).execute();
+        let m = match st.try_next().await {
+            Ok(Some(m)) => m,
+            Ok(None) => return Ok(none(RouteKind::Unreachable)),
+            Err(e) if matches!(errno(&e), Some(ENETUNREACH | EHOSTUNREACH)) => {
+                return Ok(none(RouteKind::Unreachable));
+            }
+            Err(e) if errno(&e) == Some(EINVAL) => return Ok(none(RouteKind::Blackhole)),
+            Err(e) if errno(&e) == Some(EACCES) => return Ok(none(RouteKind::Prohibit)),
+            Err(e) => return Err(format!("route get {dst}: {}", readable(&e))),
+        };
+        let kind = match m.header.kind {
+            RouteType::Local => RouteKind::Local,
+            RouteType::Unicast => RouteKind::Unicast,
+            RouteType::BlackHole => RouteKind::Blackhole,
+            RouteType::Prohibit => RouteKind::Prohibit,
+            _ => RouteKind::Unreachable,
+        };
+        let (mut at, mut oif, mut gateway) = (None, None, None);
+        for a in &m.attributes {
+            match a {
+                RouteAttribute::Destination(d) => at = ip_of(d),
+                RouteAttribute::Oif(i) => oif = Some(*i),
+                RouteAttribute::Gateway(g) => gateway = ip_of(g),
+                RouteAttribute::MultiPath(hops) => {
+                    if let Some(nh) = hops.first() {
+                        oif = oif.or(Some(nh.interface_index));
+                        gateway = gateway.or_else(|| {
+                            nh.attributes.iter().find_map(|a| match a {
+                                RouteAttribute::Gateway(g) => ip_of(g),
+                                _ => None,
+                            })
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        let base = at.unwrap_or(if dst.is_ipv4() {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        });
+        let interface = match oif {
+            Some(i) => match names.get(&i) {
+                Some(n) => n.clone(),
+                None => {
+                    let n = self.name_of(i).await?;
+                    names.insert(i, n.clone());
+                    n
+                }
+            },
+            None => None,
+        };
+        Ok(FibEntry {
+            kind,
+            prefix: IpNet::new(base, m.header.destination_prefix_length).ok(),
+            protocol: u8::from(m.header.protocol),
+            interface,
+            gateway,
         })
     }
 

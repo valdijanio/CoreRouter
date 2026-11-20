@@ -274,6 +274,9 @@ pub struct Inputs {
     /// G3.4r: each running OSPF instance's database and LSDB protection, as
     /// the routing daemon reads them. `None`: no routing daemon.
     pub ospf_lsdb: Option<Vec<OspfLsdbInput>>,
+    /// G3.4z: the open management sessions (not loopback) and the learned
+    /// routes that cover their peers. `None`: nothing watches (the lab).
+    pub mgmt_route: Option<(usize, Vec<crate::mgmt_guard::Finding>)>,
     /// The RAM, bytes (`None`: not read yet).
     pub ram_bytes: Option<u64>,
     /// Whether any reading exists at all.
@@ -865,6 +868,38 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
             reason: format!("interface(s) da configuração sem a placa nesta máquina (flag I): {list}; o resto da configuração está aplicado e a delas volta sozinha quando a placa voltar"),
             action: Some("Confira o cabo/adaptador USB ou a placa; se ela saiu de vez, tire a configuração dela (ou troque a interface dos itens que a usam).".into()) });
     }
+    // G3.4z: a learned route more specific than the connected network an
+    // operator manages from: the replies leave by another port.
+    match &i.mgmt_route {
+        Some((_, f)) if !f.is_empty() => {
+            let sessions: usize = f.iter().map(|f| f.sessions.len()).sum();
+            let list: Vec<String> = f.iter().take(3).map(crate::mgmt_guard::describe).collect();
+            let unguarded: Vec<String> = f
+                .iter()
+                .filter(|f| !f.guarded)
+                .map(|f| crate::mgmt_guard::protect_command(&f.connected))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let action = if unguarded.is_empty() {
+                "A guarda já cobre a rede e a rota continua no kernel: confira o FRR (routing.backend.get) e se outro programa instalou a rota.".to_owned()
+            } else {
+                format!(
+                    "Proteja a rede de gerência ({}; Routing › Management Guard) ou filtre o prefixo no vizinho que o anuncia. Sessão que já caiu: entre por outra rede ou pelo console.",
+                    unguarded.join(", ")
+                )
+            };
+            out.push(Check { key: "management.route", name: "Management route", severity: Severity::Warning,
+                value: Some(sessions.to_string()),
+                reason: list.join("; "),
+                action: Some(action) });
+        }
+        Some((n, _)) if *n > 0 => out.push(Check { key: "management.route", name: "Management route", severity: Severity::Ok,
+            value: Some(n.to_string()),
+            reason: format!("{n} sessão(ões) de gerência pela rede; nenhuma rota aprendida cobre o par delas"),
+            action: None }),
+        _ => {}
+    }
     // G1.31b: a WireGuard peer the router keeps calling without an answer.
     if !i.wireguard_stale.is_empty() {
         let list = i
@@ -1335,6 +1370,9 @@ impl Session {
         i.usb_watchdog = self.usb_watchdog_health();
         i.absent_ports = self.invalid_interfaces(&live).into_keys().map(|n| n.to_string()).collect();
         i.wireguard_stale = self.wireguard_stale();
+        if self.mgmt_guard_watching() {
+            i.mgmt_route = Some((self.mgmt_guard_sessions().len(), self.mgmt_guard_findings()));
+        }
         i.nic_hardware = self.nic_health();
         i.boot_apply = self.boot_failures().into_iter().map(|f| (f.label(), f.error)).collect();
         i.bgp_no_eor = self.routing_status().map(|st| {
@@ -1480,6 +1518,7 @@ mod tests {
             usb_watchdog: Vec::new(),
             absent_ports: Vec::new(),
             wireguard_stale: Vec::new(),
+            mgmt_route: None,
             boot_apply: Vec::new(),
             crash: None,
             memory: None,

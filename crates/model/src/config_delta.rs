@@ -353,8 +353,10 @@ fn light_routing(r: &Routing) -> Routing {
         tables,
         rules,
         next_rule_id,
+        management_guard,
     } = r;
     Routing {
+        management_guard: management_guard.clone(),
         tables: tables.clone(),
         rules: rules.clone(),
         next_rule_id: *next_rule_id,
