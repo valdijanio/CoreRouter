@@ -69,7 +69,9 @@ fn checkpoint_file(name: &str) -> Result<String, StorageError> {
 
 /// The checkpoint a file name holds (`checkpoint-x.json` gives `x`).
 fn checkpoint_name(file: &str) -> Option<&str> {
-    let name = file.strip_prefix(CHECKPOINT_PREFIX)?.strip_suffix(".json")?;
+    let name = file
+        .strip_prefix(CHECKPOINT_PREFIX)?
+        .strip_suffix(".json")?;
     checkpoint_name_ok(name).then_some(name)
 }
 
@@ -534,7 +536,10 @@ mod tests {
         let mut names = st.list_checkpoints().unwrap();
         names.sort();
         assert_eq!(names, ["b_2", "before-lab"]);
-        assert_eq!(st.load_checkpoint("before-lab").unwrap().as_deref(), Some("{}\n"));
+        assert_eq!(
+            st.load_checkpoint("before-lab").unwrap().as_deref(),
+            Some("{}\n")
+        );
         assert_eq!(st.load_checkpoint("none").unwrap(), None);
         st.remove_checkpoint("b_2").unwrap();
         st.remove_checkpoint("b_2").unwrap();

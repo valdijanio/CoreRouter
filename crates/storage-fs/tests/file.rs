@@ -404,7 +404,10 @@ fn a_checkpoint_on_disk_outlives_the_history_and_a_restart() {
     let mut s = boot(&dir);
     assert_eq!(addresses(&s).len(), 81);
     let oldest = s.store().history().first().unwrap().number;
-    assert!(oldest > 1, "the history moved past the checkpoint ({oldest})");
+    assert!(
+        oldest > 1,
+        "the history moved past the checkpoint ({oldest})"
+    );
     s.execute(
         "config.checkpoint.restore",
         &json!({"name": "before-lab", "remove": true}),
