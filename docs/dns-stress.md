@@ -49,8 +49,13 @@ cabo (`--iface`, levada para o `crgen` durante a rodada e devolvida no fim); os 
 TLS como `admin` (`$COREROUTER_PASSWORD`). A config de teste entra com o roteador anotando a
 revisão (`config.history`) e sai com `config.rollback` para ela no fim. A porta do cabo é
 `--dut-iface`: **nunca** a porta da rede de casa (o `ether1` do notebook é só cliente). No modo
-remoto não há CPU por thread nem `perf` (só o `system.resource.process.print threads=yes`), nem a
-comparação com Unbound/dnsmasq. `--selftest-remote` roda o modo remoto contra um DUT local.
+remoto, CPU por grupo de threads, threads, RSS e descritores vêm da leitura que o próprio roteador
+faz de si (`system.resource.process.print threads=yes`: a linha `corerouter-daemon`, com o
+`cpu_secs` acumulado de cada thread, G4.1zp); a leitura tem até 1 s de idade, então a CPU de uma
+medição de 15 s fica a ~±7 %. Não há `perf` nem a comparação com Unbound/dnsmasq. A tabela de
+serve-stale conta também os outros rcodes (um NXDOMAIN não some) e confere com o `kdig` um nome
+vencido (NOERROR, TTL 30, EDE 3) e um nunca visto (SERVFAIL, EDE 13 da falha guardada); `--selftest-remote` roda o modo
+remoto contra um DUT local.
 
 ## O que cada teste mede
 
