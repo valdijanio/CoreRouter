@@ -1032,6 +1032,11 @@ impl Collector {
             .filter_map(|e| {
                 let mut p = parse_pid_stat(&read(&e.path().join("stat"))?, self.page_size)?;
                 p.fds = count_fds(&e.path().join("fd"));
+                // G4.1zp: the daemon by the same name as in `router` (the
+                // kernel's `comm` is `corerouter-daem`, cut at 15 bytes).
+                if p.pid == self.own_pid {
+                    p.name = DAEMON_PROCESS.to_owned();
+                }
                 Some(p)
             })
             .collect()

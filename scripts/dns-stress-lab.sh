@@ -733,7 +733,15 @@ DP_HEAD='qps | respostas | perdidas | NOERROR/SERVFAIL/outros | p50 | p99 | p99,
 DP_SEP='---|---|---|---|---|---|---|---'
 
 # --- The DUT's cost: CPU per thread group, threads, RSS, descriptors.
-# Local: /proc; remote: system.resource.process.print threads=yes.
+# Local: /proc. Remote: the router's own reading of itself,
+# system.resource.process.print threads=yes (G4.1zp): the daemon's row,
+# with its threads and their CPU time so far (cpu_secs). The router reads
+# itself every second while someone looks, so a remote number can be up to
+# a second older than the call: CPU over a run of 15 s is within ~±7 %.
+dut_proc() { # → the daemon's row (JSON), or nothing
+	cr system.resource.process.print '{"threads":true,"sort":"pid","limit":64}' 2>/dev/null |
+		jq -c '[.[]? | select(.name == "corerouter-daemon")][0] // empty' 2>/dev/null
+}
 thr_snap() { # → file of "group ticks" (and "_total ticks")
 	local f=$1 t c
 	if local_dut; then
@@ -745,7 +753,15 @@ thr_snap() { # → file of "group ticks" (and "_total ticks")
 			echo "_total $(awk '{print $14 + $15}' "/proc/$DPID/stat")"
 		} >"$f"
 	else
+		local row name ticks
+		row=$(dut_proc)
 		: >"$f"
+		[ -n "$row" ] || return 0
+		{
+			printf '%s' "$row" | jq -r --argjson clk "$CLK" '.tasks[]? | "\(.name) \((.cpu_secs // 0) * $clk | floor)"' |
+				while read -r name ticks; do echo "$(thr_group "$name") $ticks"; done
+			printf '%s' "$row" | jq -r --argjson clk "$CLK" '"_total \((.cpu_secs // 0) * $clk | floor)"'
+		} >"$f"
 	fi
 }
 thr_group() {
@@ -757,16 +773,11 @@ thr_group() {
 }
 # thr_cpu <before> <after> <secs> → "dns-udp 312 %, …, exited 40 %" (one
 # core = 100 %); "exited": threads that ended in between (the dns-query
-# workers of the misses, mostly).
+# workers of the misses, mostly). "-" when a reading is missing.
 CLK=$(getconf CLK_TCK)
 thr_cpu() {
-	if ! local_dut; then
-		# The router's own view, now (not the run's average): the DNS
-		# threads by name, the rest together.
-		cr system.resource.process.print '{"threads":true,"sort":"cpu","limit":5}' 2>/dev/null |
-			jq -r '[.[] | select(.name == "corerouter-daemon") | .tasks[]? |
-				.name |= (if startswith("dns-") then . else "other" end)] | group_by(.name) |
-				map("\(.[0].name) \(map(.cpu) | add | floor) %") | join(", ")' 2>/dev/null || echo "-"
+	if [ ! -s "$1" ] || [ ! -s "$2" ]; then
+		echo "-"
 		return
 	fi
 	awk -v clk="$CLK" -v secs="$3" '
@@ -780,24 +791,32 @@ thr_cpu() {
 			n = asorti(out, keys)
 			for (i = 1; i <= n; i++) s = s sprintf("%s%s %d %%", (s == "" ? "" : ", "), keys[i], out[keys[i]] * 100 / clk / secs)
 			if (ex > 0) s = s sprintf(", exited %d %%", ex * 100 / clk / secs)
-			print s
+			print (s == "" ? "-" : s)
 		}' "$1" "$2"
 }
-# A background sampler of the DUT (threads, RSS MiB, fds) every 200 ms;
-# samp_stop prints "peak_threads peak_rss_mib peak_fds".
+# "threads rss_mib fds" of the DUT now; nothing when it cannot be read.
+dut_now() {
+	if local_dut; then
+		awk '/^Threads/ {t = $2} /^VmRSS/ {r = int($2 / 1024)} END {printf "%d %d ", t, r}' "/proc/$DPID/status"
+		ls "/proc/$DPID/fd" | wc -l
+	else
+		dut_proc | jq -r '"\(.threads // 0) \((.memory // 0) / 1048576 | floor) \(.fds // 0)"'
+	fi
+}
+# A background sampler of the DUT (threads, RSS MiB, fds) every 200 ms
+# (remote: every second, the router's own pace); samp_stop prints
+# "peak_threads peak_rss_mib peak_fds", "- - -" if no reading came.
 SAMP_PID=""
 samp_start() {
 	: >"$W/samp"
 	if local_dut; then
 		(while kill -0 "$DPID" 2>/dev/null; do
-			awk '/^Threads/ {t = $2} /^VmRSS/ {r = int($2 / 1024)} END {printf "%d %d ", t, r}' "/proc/$DPID/status"
-			ls "/proc/$DPID/fd" 2>/dev/null | wc -l
+			dut_now
 			sleep 0.2
 		done) >"$W/samp" 2>/dev/null &
 	else
 		(while :; do
-			cr system.resource.process.print '{"sort":"memory","limit":100}' 2>/dev/null |
-				jq -r '[.[] | select(.name == "corerouter-daemon")][0] // {} | "\(.threads // 0) \((.memory // 0) / 1048576 | floor) \(.fds // 0)"'
+			dut_now
 			sleep 1
 		done) >"$W/samp" 2>/dev/null &
 	fi
@@ -806,24 +825,17 @@ samp_start() {
 samp_stop() {
 	[ -n "$SAMP_PID" ] && { kill "$SAMP_PID" 2>/dev/null || true; wait "$SAMP_PID" 2>/dev/null || true; }
 	SAMP_PID=""
-	awk 'BEGIN {t = r = f = 0} {if ($1 > t) t = $1; if ($2 > r) r = $2; if ($3 > f) f = $3} END {print t, r, f}' "$W/samp"
+	awk 'BEGIN {t = r = f = 0} NF == 3 {n++; if ($1 > t) t = $1; if ($2 > r) r = $2; if ($3 > f) f = $3}
+		END {if (n) print t, r, f; else print "- - -"}' "$W/samp"
 }
-dut_now() { # → "threads rss_mib fds"
-	if local_dut; then
-		awk '/^Threads/ {t = $2} /^VmRSS/ {r = int($2 / 1024)} END {printf "%d %d ", t, r}' "/proc/$DPID/status"
-		ls "/proc/$DPID/fd" | wc -l
-	else
-		cr system.resource.process.print '{"sort":"memory","limit":100}' |
-			jq -r '[.[] | select(.name == "corerouter-daemon")][0] // {} | "\(.threads // 0) \((.memory // 0) / 1048576 | floor) \(.fds // 0)"'
+daemon_cpu() { # CPU seconds of the DUT so far (exited threads included)
+	if local_dut; then awk -v clk="$CLK" '{printf "%.2f", ($14 + $15) / clk}' "/proc/$DPID/stat"; else
+		dut_proc | jq -r '.cpu_secs // 0'
 	fi
 }
-daemon_cpu() { # CPU seconds of the DUT so far (exited threads included); remote: 0
-	if local_dut; then awk -v clk="$CLK" '{printf "%.2f", ($14 + $15) / clk}' "/proc/$DPID/stat"; else echo 0; fi
-}
-rss_kib() { # exact RSS of the DUT (local) in KiB; remote: process.print
+rss_kib() { # RSS of the DUT in KiB (remote: the router's reading)
 	if local_dut; then awk '/^VmRSS/ {print $2}' "/proc/$DPID/status"; else
-		cr system.resource.process.print '{"sort":"memory","limit":100}' |
-			jq -r '[.[] | select(.name == "corerouter-daemon")][0].memory // 0 | . / 1024 | floor'
+		dut_proc | jq -r '(.memory // 0) / 1024 | floor'
 	fi
 }
 alive_check() { # <what>: the daemon is still the same process and answers
@@ -929,8 +941,7 @@ test_qps() {
 		if local_dut; then
 			readers=$(ls /proc/"$DPID"/task | while read -r t; do cat "/proc/$DPID/task/$t/comm"; done | grep -c '^dns-udp' || true)
 		else
-			readers=$(cr system.resource.process.print '{"threads":true,"limit":100}' |
-				jq '[.[] | select(.name == "corerouter-daemon") | .tasks[]? | select(.name == "dns-udp")] | length')
+			readers=$(dut_proc | jq '[.tasks[]? | select(.name == "dns-udp")] | length')
 		fi
 		say ""
 		say "### DUT em CPUs $cpus: $readers threads dns-udp"
@@ -1107,9 +1118,29 @@ PY
 probe() { # <secs> <out> <prefix> [every_s] [names,…]
 	in_gen python3 -I "$W/probe.py" "$DUT_IP" "${CLIENTS[6]}" "$1" "$2" "$3" "${4:-0.05}" "${5:-}"
 }
-probe_summary() { # <file> [from_ms] [to_ms] → "n ok servfail timeout p50 p99 max" (ms)
-	awk -v a="${2:-0}" -v b="${3:-1e18}" '$1 >= a && $1 < b {n++; r[n] = $2; if ($3 == "NOERROR") ok++; else if ($3 == "SERVFAIL") sf++; else if ($3 == "timeout") to++}
-		END {asort(r); printf "%d %d %d %d %.0f %.0f %.0f\n", n, ok, sf, to, r[int(n * 0.5) + (n > 0)], r[int(n * 0.99) + (n > 0)], r[n]}' "$1"
+# probe_summary <file> [from_ms] [to_ms] → "n ok servfail other timeout p50
+# p99 max" (ms); "other": any other rcode (NXDOMAIN, REFUSED…), counted so
+# a wrong answer is not mistaken for none (G4.1zp).
+probe_summary() {
+	awk -v a="${2:-0}" -v b="${3:-1e18}" '$1 >= a && $1 < b {n++; r[n] = $2; if ($3 == "NOERROR") ok++; else if ($3 == "SERVFAIL") sf++; else if ($3 == "timeout") to++; else ot++}
+		END {asort(r); printf "%d %d %d %d %d %.0f %.0f %.0f\n", n, ok, sf, ot, to, r[int(n * 0.5) + (n > 0)], r[int(n * 0.99) + (n > 0)], r[n]}' "$1"
+}
+probe_rcodes() { # <file> → "NXDOMAIN 20, REFUSED 1" (the rcodes besides NOERROR/SERVFAIL/timeout)
+	awk '$3 != "NOERROR" && $3 != "SERVFAIL" && $3 != "timeout" {c[$3]++}
+		END {s = ""; for (k in c) s = s sprintf("%s%s %d", (s == "" ? "" : ", "), k, c[k]); print s}' "$1"
+}
+# kdig_view <name> → "RCODE TTL EDE" as another client sees it (kdig, from
+# the probe's address): the first answer's TTL and the RFC 8914 extended
+# error code ("-" when absent). The raw reply goes to $OUT/raw/kdig-<name>.
+kdig_view() {
+	local raw="$OUT/raw/kdig-$1.txt"
+	in_gen "${TENV[@]}" kdig @"$DUT_IP" -b "${CLIENTS[6]}" "$1" A +timeout=8 +retry=0 +notcp +edns >"$raw" 2>&1 || true
+	awk '/->>HEADER<<-/ {for (i = 1; i <= NF; i++) if ($i == "status:") {r = $(i + 1); sub(/[,;]$/, "", r)}}
+		/EDE: [0-9]+/ {if (match($0, /EDE: [0-9]+/)) e = substr($0, RSTART + 5, RLENGTH - 5)}
+		/^;; ANSWER SECTION/ {ans = 1; next}
+		ans && NF >= 5 && t == "" {t = $2}
+		ans && NF == 0 {ans = 0}
+		END {printf "%s %s %s\n", (r == "" ? "timeout" : r), (t == "" ? "-" : t), (e == "" ? "-" : e)}' "$raw"
 }
 test_origin() {
 	say ""
@@ -1133,8 +1164,8 @@ test_origin() {
 	s1=$(probe_summary "$W/failover" 5000 8000)
 	s2=$(probe_summary "$W/failover" 8000)
 	rec=$(awk '$1 >= 5000 && $2 > 100 {last = $1} END {print (last ? last - 5000 : 0)}' "$W/failover")
-	say "| janela | consultas | NOERROR | SERVFAIL | sem resposta | p50 ms | p99 ms | máx. ms |"
-	say "|---|---|---|---|---|---|---|---|"
+	say "| janela | consultas | NOERROR | SERVFAIL | outros | sem resposta | p50 ms | p99 ms | máx. ms |"
+	say "|---|---|---|---|---|---|---|---|---|"
 	say "| antes (0–5 s) | ${s0// / | } |"
 	say "| a queda (5–8 s) | ${s1// / | } |"
 	say "| depois (8–20 s) | ${s2// / | } |"
@@ -1158,14 +1189,37 @@ test_origin() {
 	probe 1 "$W/stale-2" st 0.05 "$names"
 	probe 2 "$W/dead-1" dead 0.1 "gone1.wt.up.lab,gone2.wt.up.lab"
 	probe 2 "$W/dead-2" dead 0.1 "gone1.wt.up.lab,gone2.wt.up.lab"
+	# The same answers seen by kdig (G4.1zp): a name of each kind, now
+	# stale / failed and guarded (RFC 8767 §4: TTL 30; RFC 8914: EDE 3
+	# Stale Answer, 13 Cached Error).
+	local kst kdead
+	kst=$(kdig_view st0.short.up.lab)
+	kdead=$(kdig_view gone1.wt.up.lab)
 	o1=$(origin_count)
-	say "| caso | consultas | NOERROR | SERVFAIL | sem resposta | p50 ms | p99 ms | máx. ms |"
-	say "|---|---|---|---|---|---|---|---|"
-	say "| expirado, origens fora (1ª vez) | $(probe_summary "$W/stale-1" | tr ' ' '|' | sed 's/|/ | /g') |"
-	say "| expirado, origens fora (de novo) | $(probe_summary "$W/stale-2" | tr ' ' '|' | sed 's/|/ | /g') |"
-	say "| nunca visto, origens fora (1ª vez) | $(probe_summary "$W/dead-1" | tr ' ' '|' | sed 's/|/ | /g') |"
-	say "| nunca visto, de novo (falha guardada) | $(probe_summary "$W/dead-2" | tr ' ' '|' | sed 's/|/ | /g') |"
+	say "| caso | consultas | NOERROR | SERVFAIL | outros | sem resposta | p50 ms | p99 ms | máx. ms |"
+	say "|---|---|---|---|---|---|---|---|---|"
+	local f what sum other n okc sfc rc ttl ede
+	for f in "stale-1:expirado, origens fora (1ª vez)" "stale-2:expirado, origens fora (de novo)" \
+		"dead-1:nunca visto, origens fora (1ª vez)" "dead-2:nunca visto, de novo (falha guardada)"; do
+		what=${f#*:}
+		f=${f%%:*}
+		sum=$(probe_summary "$W/$f")
+		say "| $what | ${sum// / | } |"
+		other=$(probe_rcodes "$W/$f")
+		[ -n "$other" ] && other=" ($other)"
+		# n == NOERROR (stale) / n == SERVFAIL (never seen): anything
+		# else is another answer than the one the RFCs ask for.
+		read -r n okc sfc _ <<<"$sum"
+		case $f in
+		stale-*) [ "$n" -gt 0 ] && [ "$okc" = "$n" ] || fail "serve-stale ($f): $okc of $n NOERROR$other" ;;
+		dead-*) [ "$n" -gt 0 ] && [ "$sfc" = "$n" ] || fail "never-seen name with the origins down ($f): $sfc of $n SERVFAIL$other" ;;
+		esac
+	done
 	say ""
+	read -r rc ttl ede <<<"$kst"
+	say "kdig (outro cliente): \`st0.short.up.lab\` expirado → $rc, TTL $ttl, EDE $ede; \`gone1.wt.up.lab\` → $(echo "$kdead" | awk '{print $1 ", EDE " $3}')."
+	[ "$rc" = NOERROR ] || fail "serve-stale: kdig got $rc for st0.short.up.lab (see raw/kdig-st0.short.up.lab.txt)"
+	[ "$(echo "$kdead" | cut -d' ' -f1)" = SERVFAIL ] || fail "failure cache: kdig got $(echo "$kdead" | cut -d' ' -f1) for gone1.wt.up.lab"
 	say "Pacotes que chegaram às origens (descartados) nessas rodadas: $((o1 - o0))."
 
 	say ""
