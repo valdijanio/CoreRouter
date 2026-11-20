@@ -3428,3 +3428,162 @@ AMD Ryzen AI MAX+ 395 (32 threads), load 13–25, daemon release no laboratório
 
 O DoH em HTTP/2 rende o mesmo que o DoT: o custo é o encaminhador e o TLS, não o HTTP/2 (HPACK
 literal na resposta, um quadro HEADERS e um DATA).
+
+- 2026-11-20 — G0.33, checkpoints (**medido**, AMD Ryzen AI MAX+ 395, build release do criterion,
+  disco NVMe com fsync, `cargo bench -p corerouter-storage-fs --bench commit -- storage_fs/checkpoint`,
+  config de 5 MiB: 4000 regras, 20 000 entradas de address-list, 10 000 rotas e 10 000 leases):
+  `checkpoint/add` 12,7 ms (uma serialização + arquivo 5,09 MiB com fsync); `checkpoint/restore`
+  117 ms (ler, montar a config e o commit dela); `checkpoint/decode` 54,5 ms a config inteira
+  contra `decode_info` 6,2 ms só o cabeçalho, o que a primeira listagem paga por checkpoint
+  (16 × 54,5 ms = 0,9 s sob o lock da sessão antes, ~100 ms agora, **estimado** pela soma).
+  Commit: nenhum custo novo (o caminho do commit não mudou; os checkpoints não estão no
+  histórico).
+
+### G3.4z: guarda da gerência (2026-11-20, host AMD Ryzen AI Max+ 395, 32 threads; a última linha na VM do laboratório, 8 vCPUs; **medido**)
+
+| O quê | Build | Número |
+|---|---|---|
+| `RTM_GETROUTE` + `RTM_F_FIB_MATCH`, 256 pares numa conexão netlink (`netns_fib_match`) | debug | 2,9 ms (11,5 µs por par) |
+| probes + feed do engine sob o lock, 1 000 sessões (250 pares), 10 001 endereços | release | 1,33 ms por tique (1/s) |
+| resumo `management_route` (a cada refresh da GUI), mesmo cenário | release | 104 µs |
+| registro por pedido (`Session::as_caller`), conexão conhecida | release | ~19 ns |
+| `/32` fora do kernel depois do `routing.management-guard.add` (VM, FRR 10.7.1, com o CLI) | debug | 24–31 ms |
+
+O custo por tique cresce com os pares (peer, local) distintos, nunca com as rotas: a busca é a do
+trie do kernel (`fib_table_lookup`). No zebra a recusa é um `prefix-list` (trie do FRR) por rota
+processada, sem passar pela lista das redes.
+
+Na VM do laboratório (4 vCPUs para o roteador, `scripts/dns-stress-lab.sh --tests torture`,
+2026-11-13, **medido**), a `main` em `6e5218d3` contra a branch empilhada da G4.1y, que contém esta
+(a G4.1y só muda o `cache.print`). Cache de 64 MiB, origem a 20 ms, cliente legítimo pedindo nomes
+quentes ao lado do ataque. Branch: a última de três rodadas; entre parênteses, a faixa das três.
+
+| `max_concurrent_queries` | Ataque | Cliente legítimo: p99 / SERVFAIL em 15 s, `main` → branch | Respostas/s, `main` → branch | Despejadas / não admitidas (branch) |
+|---|---|---|---|---|
+| 100 | 5000/s | 179 µs / 0 → 191 µs / 0 | 4,9 mil → 4,9 mil | 0 / 0 |
+| 100 | 20 000/s | 20 ms / **14 544 → 99 µs / 0** | 20 mil → 20 mil | 2 393 / 71 274 |
+| 100 | sem limite | 45 ms / **17 768 → 35 ms / 0** | 198 mil → 215 mil (199–233 mil) | 58 490 / 16 392 |
+| 1000 | 20 000/s | 21 ms / 0 → 115 µs / 0 | 20 mil → 20 mil | 100 364 / 200 112 |
+| 1000 | sem limite | 50 ms / **22 239 → 27 ms / 0** | 190 mil → 227 mil (197–227 mil) | 631 559 / 96 816 |
+
+O p99 de ~30 ms do cliente legítimo sem limite é a fila das 4 vCPUs saturadas; nenhuma resposta é
+SERVFAIL. Com 1000 e 20 000/s, na `main` o cliente legítimo não falha, mas espera a origem (p99
+21 ms): os nomes quentes dele saíram do cache.
+
+Descarte (cache de 64 MiB, nomes únicos sem limite de taxa, cada um despeja outro): cache vazio
+103 mil → 206–248 mil respostas/s; cheio 145 mil → 205–247 mil/s.
+
+Criterion no host (32 núcleos, release, perfil do workspace; carga de outras sessões ao lado):
+
+| Bench | `main` | G4.1x |
+|---|---|---|
+| `dns_cache_hit_10k` | 89 ns | 75 ns |
+| `dns_cache_hit_64mib` (cache cheio, ~95 mil entradas) | 369 ns | **85 ns** |
+| `dns_cache_put_full` | 731 ns | 390 ns |
+| `dns_cache_flood_64mib` (nome único: get + put num cache cheio) | 319 ns | 419 ns |
+
+Instruções por operação (`perf stat -e instructions:u`, laço fixo): acerto 1676 → 1132; nome
+único 4440 → 3202. No nome único o relógio sobe ~100 ns (faltas de cache de CPU no `HashMap` e no
+sketch), ~0,15 % dos ~67 µs de CPU de um miss no daemon.
+
+G4.1y, `ip.dns.cache.print` com 1 M de entradas e nomes quentes a 20 000/s ao lado, na VM do
+laboratório (4 vCPUs para o roteador, `scripts/dns-stress-lab.sh --tests cache`, 2026-11-13,
+**medido**): a `main` em `6e5218d3` contra esta branch (`name=` três vezes seguidas).
+
+| Comando | Duração, `main` → G4.1y | Carga ao lado, p99,9, `main` → G4.1y | Máximo, `main` → G4.1y |
+|---|---|---|---|
+| `print name=h1.up.lab` | 219 ms → 271–287 ms | **201 ms → 279–295 µs** | 211 ms → 0,36–0,81 ms |
+| `print limit=100000` | 1129 ms → 726 ms | **80 ms → 135 µs** | 92 ms → 0,51 ms |
+| `print` (padrão, 1000 linhas) | 12 ms → 10 ms | 2,6 ms → 75 µs | 7,7 ms → 0,45 ms |
+| nenhum (a carga sozinha) | — | 2,7 ms → 287 µs | 6,8 ms → 3,5 ms |
+
+No notebook da fase C (i5-12450H, `main` em `443646f1`, **medido** pela sessão principal), o
+"antes" em hardware: `limit=100000` levou 17,9 s, com a carga ao lado em 4 828 consultas/s, p99 de
+2,4 s e máximo de 3 s; `name=h1.up.lab` levou 108 ms, com p99,9 de 76 ms ao lado. A sessão
+principal mede de novo no notebook depois do merge.
+
+Host (32 núcleos, 4 CPUs pela `taskset`, release): o `Resolver` real com 1 M de respostas e duas
+threads em laço aberto a 50 000 consultas/s cada, com a latência contada da chegada marcada, como
+a fila de uma thread do encaminhador (`G4.1y-print-contention.rs` nas notas da sessão, **medido**,
+três a cinco rodadas):
+
+| Comando | p99,9 ao lado, `yield` entre pedaços → pausa igual ao tempo segurado |
+|---|---|
+| `name=h1.up.lab` | 2,8–8,3 ms → 70–114 µs |
+| `limit=100000` | 1,2–4,1 ms → 78–88 µs (com a reserva fora do lock) |
+
+Criterion (`benches/resolver.rs`, 1 M de entradas, uma CPU):
+
+| Medida | Tempo |
+|---|---|
+| Um pedaço varrendo 2048 slots, com o lock seguro | 31,5 µs |
+| Um pedaço copiando 256 entradas | 28,8 µs |
+| A listagem inteira com filtro por nome, sem pausas | 15,6 ms (`main`: 190 ms, toda sob o lock) |
+
+VM do laboratório (8 vCPUs EPYC-Genoa, roteador nas CPUs 0-1 ou 0-3, gerador e origem nas 4-7),
+`scripts/dns-stress-lab.sh`, 10 s por medição, release, 2026-11-20, **medido**. Antes: `main` em
+`fdde3956` (o DNS desta parte é o mesmo). Depois: esta branch.
+
+`--tests hostile`: lixo de 10.53.0.5, com o cliente legítimo a 150/s de outro endereço.
+
+| CPUs (leitores por família) | Remetentes de lixo | Limite | Lixo/s antes / depois | Legítimo perdido, antes → depois | Legítimo p99, antes → depois |
+|---|---|---|---|---|---|
+| 0-1 (1) | 1 | 200 | 225 mil / 63 mil | 0,8 % → 0 % | 23 ms → 415 µs |
+| 0-1 (1) | 1 | 0 | 388 mil / 264 mil | 17 % → 0 % | 27 ms → 831 µs |
+| 0-1 (1) | 4 | 200 | 1,03 M / 813 mil | **65 %** → 0 % | 41 ms → 1,0 ms |
+| 0-1 (1) | 4 | 0 | 1,26 M / 1,03 M | **80 %** → 0 % | 80 ms → 990 µs |
+| 0-3 (2) | 4 | 200 | 857 mil / 799 mil | 37 % → 0 % | 30 ms → 303 µs |
+| 0-3 (2) | 4 | 0 | 991 mil / 1,35 M | 61 % → 0 % | 35 ms → 219 µs |
+
+"Lixo/s" é o que o gerador conseguiu mandar (Python, sem bloquear, um processo por remetente). A
+taxa varia entre rodadas e não é comparável entre as colunas. O que se compara é o cliente
+legítimo com o roteador sob lixo.
+
+`--tests qps`, saturação de **uma** origem (o `dnsperf` manda tudo de um endereço, o pior caso da
+repartição por origem), mil/s:
+
+| Cenário | 2 CPUs antes → depois | 4 CPUs antes → depois |
+|---|---|---|
+| Acerto de cache (64 MiB) | 50,8 → 45,1 | 154,7 → 136,1 |
+| Estático | 46,9 → 52,0 | 148,6 → 136,1 |
+| Zona | 48,0 → 41,2 | 137,0 → 144,5 |
+| Miss, origem a 0 ms | 39,3 → 55,1 | 100,9 → 118,4 |
+| Mistura | 43,0 → 43,0 | 118,4 → 115,6 |
+
+Tudo dentro do ruído de ±30 % entre rodadas na VM. Com **um** leitor por socket (a primeira
+versão), a mesma origem caía para 78 mil/s no acerto de cache e 49 mil/s no estático, com 4 CPUs.
+Por isso cada socket ficou com os leitores de antes.
+
+Notebook (i5-12450H, 12 CPUs: 4 leitores por família; lixo pelo cabo de 1 Gb a partir da VM;
+`--dut remote`), `hostile` com 4 remetentes:
+
+| Limite | Antes (`dev.659`): lixo/s, legítimo perdido, p99 | Depois (`dev.663`, esta branch): lixo/s, legítimo perdido, p99, CPU `dns-udp` |
+|---|---|---|
+| 200 | 803 mil/s, 1,7 %, 6,0 ms | 979 mil/s, **0 %**, 3,8 ms, 147 % |
+| 0 | 720 mil/s, 0,9 %, 5,6 ms | 776 mil/s, 0,3 %, 4,7 ms, 333 % |
+
+O notebook sofria menos que a VM antes: 4 leitores por família e o cabo de 1 Gb segura o lixo em
+~0,8–1 M pacotes/s. Com o limite padrão, o legítimo deixa de perder. Sem limite, sobram 0,3 %. O
+atacante (10.53.0.5) e o legítimo (10.53.0.9) caem em sockets diferentes, os mesmos da VM, então
+esse resto vem de antes do socket: a fila da placa e o softirq de um núcleo a ~800 mil pps
+(**estimado**, não medido por dentro). Com 1 remetente (~63 mil/s), 0 % antes e depois.
+
+A atualização foi `corerouter-cli upload --wait` pelo cabo: 62 s no total, 28,6 s do reboot à
+confirmação do boot de teste (**medido**).
+
+Rodada do roteiro, não do roteador. VM do laboratório (8 vCPUs EPYC-Genoa), `--selftest-remote`
+com o DUT nas CPUs 0-3, `--duration 5`, 2026-11-20, **medido**. Antes: `main` em `fdde3956`;
+depois: esta branch.
+
+| Medida (modo remoto) | Antes | Depois |
+|---|---|---|
+| threads (pico), tempestade de nomes únicos | 0 | 73 |
+| RSS pico, tempestade a 1000 em voo sem limite | 0 MiB | 116 MiB |
+| fds (pico), 16 clientes TCP com 100 vagas | 0 | 58 |
+| CPU do daemon em 30 s de slowloris (20 vagas, 10 por endereço) | 0,0 s | 0,8 s |
+| CPU por grupo, origem a 200 ms na saturação | o último segundo, depois da carga | `dns-udp` 197 % (média dos 5 s) |
+| RSS por entrada no cache (50 000 nomes) | 0 bytes | 443 bytes |
+| Serve-stale: vencido, origens fora | 20 NOERROR (o NXDOMAIN do notebook não aparecia) | 20 NOERROR, 0 outros; `kdig`: NOERROR, TTL 30, EDE 3 |
+
+O custo no roteador: uma leitura `threads=yes` por segundo durante a amostragem (só os processos
+do roteador, sem varrer o `/proc` inteiro como a lista completa varria).
