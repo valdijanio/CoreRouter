@@ -52,7 +52,8 @@
 #   hostile   junk (--junk-procs senders, one address), ANY, big TXT, a
 #             client outside allowed_from
 #   ops       commands under load (ip.dns.set, statics, flush, statistics,
-#             an atomic batch): their p99 and the load's
+#             an atomic batch): their p99 and the load's; --config-flush-ms N
+#             puts the local DUT's /config on a disk with N ms flushes
 #   compare   the same runs against Unbound and dnsmasq (local only)
 #   soak      moderate load for --soak-secs: RSS, threads, fds, cache, p99
 #
@@ -62,7 +63,7 @@ set -euo pipefail
 # Decimal points, not commas ($EPOCHREALTIME, awk, printf).
 export LC_ALL=C
 
-usage() { sed -n '2,53p' "$0"; exit 2; }
+usage() { sed -n '2,54p' "$0"; exit 2; }
 
 if [ "${1:-}" = "--host" ]; then
 	IMAGES=${2:?usage: $0 --host <images dir> [options]}
@@ -126,6 +127,7 @@ while [ $# -gt 0 ]; do
 	--hot) HOT=$2; shift 2 ;;
 	--fill) FILL=$2; shift 2 ;;
 	--junk-procs) JUNK_PROCS=$2; shift 2 ;;
+	--config-flush-ms) CONFIG_FLUSH_MS=$2; shift 2 ;;
 	--adlist) ADLIST_N=$2; shift 2 ;;
 	--zone-records) ZONE_RECORDS=$2; shift 2 ;;
 	--dhcp-clients) DHCP_N=$2; shift 2 ;;
@@ -448,10 +450,40 @@ build_tools() {
 	fi
 }
 
+# G4.1zn, --config-flush-ms N: the local DUT's /config on an ext4 over
+# dm-delay, every flush N ms late (the phase C notebook's USB SSD took
+# ~15 ms), reads and writes on time. Built once, kept across restarts.
+SLOWDISK=""
+slowdisk_up() {
+	[ "${CONFIG_FLUSH_MS:-0}" -gt 0 ] || return 0
+	[ -n "$SLOWDISK" ] && return 0
+	mkdir -p "$W/dut/tmp/cfg"
+	# Left by a run that was killed.
+	umount /dev/mapper/crslowcfg 2>/dev/null || true
+	dmsetup remove crslowcfg 2>/dev/null || true
+	truncate -s 1G "$W/slowdisk.img"
+	local loop sectors
+	loop=$(losetup -f --show "$W/slowdisk.img")
+	sectors=$(blockdev --getsz "$loop")
+	dmsetup create crslowcfg --table "0 $sectors delay $loop 0 0 $loop 0 0 $loop 0 $CONFIG_FLUSH_MS"
+	mkfs.ext4 -q /dev/mapper/crslowcfg
+	mount /dev/mapper/crslowcfg "$W/dut/tmp/cfg"
+	SLOWDISK=$loop
+	log "DUT /config on dm-delay: flushes $CONFIG_FLUSH_MS ms late"
+}
+slowdisk_down() {
+	[ -n "$SLOWDISK" ] || return 0
+	umount "$W/dut/tmp/cfg" 2>/dev/null
+	dmsetup remove crslowcfg 2>/dev/null
+	losetup -d "$SLOWDISK" 2>/dev/null
+	rm -f "$W/slowdisk.img"
+	SLOWDISK=""
+}
 daemon_start() { # [cpus]
 	local cpus=${1:-$DUT_CPUS} extra=()
 	[ $SELFTEST = 1 ] && extra=(--listen "0.0.0.0:$TLS_PORT")
 	mkdir -p "$W/dut/run/corerouter" "$W/dut/tmp/cfg"
+	slowdisk_up
 	if [ -n "$DAEMON_BIN" ]; then
 		taskset -c "$cpus" ip netns exec crdut env COREROUTER_RUNTIME_DIR="$W/dut/run/corerouter" RUST_LOG=info \
 			"$DAEMON_BIN" --backend linux --config-dir "$W/dut/tmp/cfg" --control 7979 \
@@ -2095,6 +2127,7 @@ cleanup() {
 	mcp_close 2>/dev/null
 	dut_unconfig 2>/dev/null
 	{ [ $DUT = local ] || [ $SELFTEST = 1 ]; } && daemon_stop
+	slowdisk_down
 	net_down
 	[ "$DAEMON" = image ] && umount_image
 	[ -d "$W/dut" ] && cp "$W/dut/daemon.log" "$OUT/daemon.log" 2>/dev/null
