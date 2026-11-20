@@ -413,3 +413,10 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-11-13 — G4.1zd parte 1 feita (log persistente); dnstap fica na parte 2
 - 2026-11-13 — G4.1zf parte 1 (DoT) feita; G4.1zh e G4.1zi criados
 - 2026-11-13 — G4.1zf feito (DoT e DoH para a LAN)
+- 2026-11-20 — G0.33 feito (checkpoint com nome para voltar antes de um trabalho longo)
+- 2026-11-20 — G3.4z feito (gerência protegida contra rota aprendida)
+- 2026-11-20 — G4.1x feito (cache do DNS protegido contra nomes únicos, W-TinyLFU)
+- 2026-11-20 — G4.1y feito (`ip.dns.cache.print` sem parar as consultas)
+- 2026-11-20 — G4.1zo feito (um cliente não ocupa a recepção UDP do DNS)
+- 2026-11-20 — G4.1zp feito (`dns-stress-lab.sh` remoto: memória, threads, descritores, CPU e serve-stale)
+- 2026-11-20 — G0.30k criada (regressão noturna dos laboratórios, pedido do usuário)

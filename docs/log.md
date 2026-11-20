@@ -12705,3 +12705,338 @@ continuação indentadas).
   run -p corerouter-daemon -E 'test(dns_doh) | test(http2::server) | test(dns_tls)'` (daemon real:
   HTTP/1.1 GET e POST, HTTP/2 com dois streams, 404 e 415, DDR; HTTP/2 em memória: ordem, janelas,
   rapid reset, CONTINUATION, limite de streams, proptest).
+
+- 2026-11-20 — G0.33: Checkpoints de configuração com nome. `config.checkpoint.add {name, comment?}` grava a running
+  inteira em `checkpoint-<nome>.json`, fora do histórico de 64 revisões: nenhum commit nem a cota do
+  histórico o apagam, só `config.checkpoint.remove` (ou `config.checkpoint.restore {name, remove:
+  true}`). `config.checkpoint.restore` leva a cópia ao candidate como o `config.rollback` (modo
+  imediato: commit na hora com a checagem de lockout; transacional: espera o `config.commit`),
+  `config.checkpoint.diff` mostra o que mudou desde ele (segredos mascarados abaixo do grupo full),
+  `config.checkpoint.list` lista nome, comentário, revisão, hora, bytes e o erro de um arquivo
+  estragado. Limites: 16 checkpoints e 10 % do `/config`; `add` recusado em Safe Mode e dentro de
+  lote atômico. O `config.rollback` para uma revisão que já saiu agora diz onde o histórico começa e
+  sugere o checkpoint. O `dns-stress-lab.sh` no modo remoto salva o checkpoint `dns-stress-lab` antes
+  do laboratório (reaproveita o de uma rodada que caiu) e o restaura e apaga no fim. Nenhum arquivo
+  existente mudou de formato: a config gravada carrega igual, e uma versão anterior ignora os
+  `checkpoint-*.json`. O snapshot do A/B (`sysupdate`) os liga por hard link.
+
+  Como testar: `cargo run -p corerouter-daemon -- --config-dir /tmp/cr --control 7979`; pela CLI
+  `config.checkpoint.add '{"name":"antes"}'`, 70 × `system.identity.set`, reiniciar o daemon,
+  `config.rollback` para a revisão de antes falha com a dica, `config.checkpoint.diff
+  '{"name":"antes"}'` e `config.checkpoint.restore '{"name":"antes","remove":true}'` voltam.
+
+- 2026-11-20 — G3.4z: Gerência protegida contra rota aprendida (fase C: os `/32` OSPF do gerador em 192.168.0.0 cobriram
+  a `ether1` 192.168.0.0/24 do notebook e cortaram a gerência até o fim do teste).
+
+  - **Aviso.** O engine guarda as sessões de gerência abertas (todo pedido de uma conexão logada
+    passa por `Session::as_caller`; sai no `hang_up`; loopback fica de fora). O serviço novo
+    `mgmt-guard` do daemon (só `--backend linux`) pergunta ao kernel, uma vez por segundo e fora
+    do lock, qual entrada do FIB as respostas a cada par (peer, endereço local) tomam
+    (`RTM_GETROUTE` + `RTM_F_FIB_MATCH`, com o `rtm_protocol`, `hal-linux::fib_match`). Par numa
+    rede conectada cuja resposta é uma rota de daemon de roteamento (ospf, bgp, isis…) mais longa
+    que a rede: aviso `management.route` na saúde (com a rota, o protocolo, a porta e o comando
+    que resolve), linha no log na hora, selo âmbar `mgmt route: <par>` na barra da GUI (clique abre
+    a janela) e `management_route` no resumo do `state.inspect` (CLI, MCP). Rota estática do
+    CoreRouter, conectada, mais curta ou do mesmo tamanho, e par atrás de gateway (NOC por OSPF)
+    não avisam.
+  - **Filtro.** `routing.management-guard.{add,set,remove,list,suggest,check}` (Routing ›
+    Management Guard): redes de gerência; o FRR recusa, de todos os protocolos, prefixo dentro
+    delas e mais longo (`ip prefix-list CR-MG-4 … ge N`, `route-map CR-MG-4 deny`,
+    `ip protocol any route-map CR-MG-4`, no mgmtd numa transação só; IPv6 com `CR-MG-6`). A rota
+    fica na RIB do protocolo como inativa e o LSDB não muda (RFC 2328 §2). Recusa `/32`, `/128` e
+    `/0`.
+  - **Extras escolhidos.** Proteger em um clique: a janela lista as redes conectadas de onde vêm as
+    sessões abertas sem guarda, e o aviso tem o botão Protect (o mesmo `add`). Prévia no modal: a
+    rede, a faixa, a porta conectada, as sessões dentro dela e quantas rotas aprendidas ela recusaria
+    agora por protocolo, lidas da RIB do zebra (`show ip route <rede> longer-prefixes json`, pelo
+    laço do serviço `frr`, fora do lock); a coluna Refused mostra o mesmo.
+  - **Lockout (G2.1b).** Tirar ou desativar a guarda da rede da própria sessão quando a RIB lida
+    mostra uma rota aprendida que cobriria o par é recusado como os outros lockouts (Safe Mode ou
+    `force: true`).
+  - **Sessões fechadas há pouco.** Uma rota aprendida costuma derrubar a sessão que cobre, e o
+    `corerouter-cli run` abre uma conexão por comando: a sessão fechada continua vigiada por 10 min
+    (`já fechada` no aviso), para o operador que volta pelo console ou por outra rede ver o que
+    aconteceu.
+
+  Como testar: `cargo test -p corerouter-engine -- mgmt_guard management_guard`,
+  `cargo test -p corerouter-ui -- management_guard`, `cargo xtask netns` (`netns_fib_match`, com a
+  rota `nhid` como o zebra instala) e `cargo xtask vm-lab run -- scripts/mgmt-guard-lab.sh`
+  (FRR 10.7.1 de verdade: operador, roteador e gerador OSPF em três netns da VM).
+
+  Conferido no laboratório da VM (2026-11-20, **medido**), 14 de 14 checagens:
+  - corte reproduzido: o OSPF do gerador instala `192.168.0.2/32` (e `.77`, `.78`) sobre a
+    `ether1` 192.168.0.0/24, e o login novo do operador fica sem resposta;
+  - o aviso aparece na saúde, no resumo e no log, com a sessão aberta e a já fechada;
+  - a prévia conta `3 (ospf 3)` e diz que os três estão no kernel;
+  - o `/32` sai do kernel 24–31 ms depois do `add` (duas rodadas, com o CLI), e `198.18.7.0/24`,
+    fora da guarda, não sai em nenhuma das ~600 leituras a cada 10 ms;
+  - o operador entra de novo, e o terminal que travou volta a responder;
+  - o zebra mostra o `/32` sem `Selected`/`Installed`;
+  - tirar a guarda pela sessão do operador é recusado como lockout;
+  - o commit seguinte não digita nada no mgmtd (o render bate com o que o FRR imprime).
+
+  Na GUI (laboratório netns no host com `--backend linux`, sem FRR, prints em
+  `docs/changes/G3.4z-screenshots/`): selo âmbar na barra com a dica, janela com o aviso e Protect,
+  modal com a prévia, rede protegida nos temas claro e escuro.
+
+- 2026-11-20 — G4.1x: Cache do DNS protegido contra nomes únicos: o cache do resolvedor (`crates/proto-dns/src/cache.rs`)
+  passa a decidir quem fica pelo W-TinyLFU (Einziger, Friedman, Manes, ACM ToS 2017; a política do
+  Caffeine), em bytes. Cada consulta conta num sketch de frequência de tamanho fixo
+  (`cache/frequency.rs`: count-min de contadores de 4 bits, um bloco de 64 bytes por chave,
+  atualização conservadora, metade de tudo a cada 10× o tamanho, hash com chave aleatória); a
+  resposta nova entra numa janela LRU de 1 % do orçamento e, ao sair dela, só empurra para fora a
+  menos usada da área principal se foi pedida mais vezes; quem tem acerto passa de "probation" a
+  "protected" (80 %). Respostas além da janela de serve-stale continuam saindo primeiro (o índice
+  por expiração). Antes o despejo seguia a expiração, que com TTLs iguais é a ordem de chegada: a
+  20 000 nomes únicos por segundo, um cache de 64 MiB virava em ~5 s e os nomes quentes iam junto.
+
+  O mapa do cache virou `HashMap` (hash SipHash com chave, uma vez por consulta, que também acha os
+  contadores) com as entradas numa tabela de slots ligados em listas, no lugar do `BTreeMap` por
+  nome: o acerto ficou O(1). O `ip.dns.cache.print` sai ordenado por nome entre as linhas
+  devolvidas; quando casam mais que o `limit`, quais saem não é definido (como no RouterOS).
+
+  Novo contador `rejected` ("Not admitted", respostas novas que o cache cheio não guardou) no
+  `ip.dns.statistics.print` (com reset), na janela DNS › Statistics (com ⓘ) e no `/metrics`
+  (`corerouter_dns_cache_rejected_total`); o `torture` do `scripts/dns-stress-lab.sh` mostra
+  despejadas e não admitidas por rodada.
+
+  Como testar: `cargo test -p corerouter-proto-dns cache` (o torture em miniatura:
+  `a_flood_of_unique_names_leaves_the_hot_ones`; proptest das invariantes da estrutura);
+  `cargo xtask vm-lab run -- scripts/dns-stress-lab.sh --daemon build --tests torture`.
+
+  O código da G4.1x entrou na `main` junto com a G4.1y (#695, empilhada). O PR dela (#694) ficou só
+  com uma correção de teste: `many_misses_in_flight_without_a_thread_each` falhou num lote da fila
+  (2,5 s contra o teto de 1,5 s). O upstream falso do teste lê de um socket com o buffer padrão
+  (~220 consultas), e a rajada é de 400; com a thread leitora sem CPU no runner carregado, o kernel
+  descartou consultas, que o encaminhador só repetiu depois do RTO. Travando a leitora por 200 ms,
+  177 consultas perdidas (`RcvbufErrors`) e 1,66 s contra 0,76 s (**medido**). O socket agora pede um
+  buffer grande (o kernel dá até 2 × `rmem_max`, lugar para ~440 consultas mesmo no padrão): com a
+  leitora travada por 500 ms e esse buffer, nenhuma perda (**medido**). O cache não entra nesse caminho.
+
+- 2026-11-20 — G4.1y: `ip.dns.cache.print` sem parar as consultas. O filtro por nome varria o cache inteiro sob o lock do
+  resolvedor. Com 1 M de entradas, na VM, eram 219 ms de comando com as consultas ao lado paradas até
+  201 ms (p99,9). O `limit=100000` ainda formatava as linhas sob o lock: 1,1 s na VM e, no notebook
+  da fase C, 17,9 s, com a carga ao lado caindo de 20 000 para 4 828 consultas/s.
+
+  Agora o resolvedor (`Resolver::cache_rows_matching`):
+  - copia em pedaços (`Cache::copy_matching`): até 2048 slots olhados ou 256 entradas copiadas por
+    vez com o lock;
+  - depois de cada pedaço, solta o lock e **dorme o tempo em que o segurou**, então as consultas têm
+    o lock pelo menos metade do tempo da listagem;
+  - reserva o espaço das cópias antes de pegar o lock (dobrar 100 mil cópias movia ~8 MB sob ele);
+  - formata e ordena por nome depois (`cache::rows_of`).
+
+  Só soltar o lock entre os pedaços não bastou. A thread do encaminhador responde uma consulta por
+  vez; com a listagem segurando o lock quase o tempo todo, cada consulta esperava um pedaço, e a fila
+  crescia durante a listagem inteira. Na VM, a carga ao lado de um `name=` ficou em p99,9 de 84 ms,
+  tanto cedendo a vez com `yield` quanto com a passagem justa do `parking_lot` (`unlock_fair`); as
+  duas versões ficaram de fora. O filtro por tipo compara o número do tipo; antes formatava o tipo de
+  cada entrada.
+
+  O comando fica mais lento com carga (cede metade do tempo): `name=` em 1 M leva ~280 ms na VM, contra
+  219 ms na `main`. A listagem não é um instantâneo atômico (nem era preciso): uma entrada que entra
+  ou sai entre dois pedaços aparece no máximo uma vez.
+
+  Esta gap está empilhada na G4.1x, que trocou o `BTreeMap` por slots contíguos; com isso a varredura
+  de 1 M ficou mais barata (criterion, abaixo).
+
+  Como testar:
+  - `cargo test -p corerouter-proto-dns listing`: pedaços com entradas saindo e entrando entre eles,
+    e ninguém aparece duas vezes;
+  - `cargo test -p corerouter-proto-dns the_cache_listing`;
+  - `cargo xtask vm-lab run -- scripts/dns-stress-lab.sh --daemon build --tests cache`.
+
+- 2026-11-20 — G4.1zo: Um cliente não ocupa mais a recepção UDP do encaminhador DNS.
+
+  **O defeito (reproduzido na VM, 2026-11-20, **medido**):**
+  - Era um socket UDP por família, com até quatro leitores. A fila de recepção do kernel era uma só
+    para todos os clientes. Lixo de um endereço enchia essa fila, e o kernel descartava as consultas
+    legítimas junto com o lixo.
+  - O limite por cliente (`max_queries_per_client`) era uma etapa da cadeia, depois da decodificação.
+    Uma mensagem que não decodificava nem chegava ao limite: era decodificada, ganhava FORMERR e uma
+    resposta enviada. No notebook (2026-11-14) eram 1,67 M "malformed" contra 132 mil "limit". Por isso
+    o limite padrão de 200 quase não ajudava contra lixo.
+  - Os "98 % numa thread `dns-udp`" do notebook eram a soma das oito threads (o roteiro remoto
+    agrupava por nome, G4.1zp).
+
+  **A correção:**
+  - `proto-dns`: em UDP, a ficha do limite sai antes da decodificação, só pelo endereço de origem
+    (`Forwarder::start_as`). Acima do limite, a mensagem é descartada sem decodificar e sem resposta.
+    A estatística conta como `limit`, sem nome nem tipo. O TCP segue decidindo na cadeia, com
+    REFUSED: precisa da pergunta, e um cliente TCP não falsifica o endereço.
+    - Muda o comportamento: a consulta UDP barrada pelo limite não entra mais no log de consultas,
+      porque não há nome a registrar e uma enxurrada escreveria uma linha por pacote. O cliente
+      continua aparecendo em `statistics.print` (`limited`).
+  - `daemon`: quatro sockets por família na porta 53, num grupo `SO_REUSEPORT` com um programa BPF
+    clássico (`SO_ATTACH_REUSEPORT_CBPF`, `service/dns_server/steer.rs`, API segura do `nix`, sem
+    `unsafe`).
+    - O programa escolhe o socket por um hash do endereço de origem (IPv4 inteiro, IPv6 pelo /64,
+      como o limite). Todo datagrama de um cliente cai no mesmo socket, qualquer que seja a porta de
+      origem.
+    - Cada socket tem os leitores que o socket único tinha (`udp_threads`, de 1 a 4). Assim, um cliente
+      sozinho (um resolvedor, um CGNAT) continua com todos os leitores.
+    - Sem o BPF (kernel antigo), o kernel espalha pelo hash da quádrupla, e o log avisa.
+  - `scripts/dns-stress-lab.sh`: `--junk-procs N` manda o lixo do teste `hostile` de N processos no
+    mesmo endereço, cada um com a sua porta.
+
+  Como testar:
+  - Na VM: `cargo xtask vm-lab run -- env REBUILD=1 scripts/dns-stress-lab.sh --daemon build --tests hostile --dut-cpus 0-1 --junk-procs 4 --duration 10`.
+    O cliente legítimo deve ter 0 % de perdidas.
+  - Sem root: `cargo test -p corerouter-daemon --bin corerouter-daemon -- one_client_lands steer::`.
+    O teste prova, no kernel de verdade (loopback), que as 3 portas de cada uma de 40 origens caem
+    num socket só. Sem o BPF, ele falha.
+
+- 2026-11-20 — G4.1zp: `scripts/dns-stress-lab.sh` no modo remoto (fase C) volta a medir o roteador.
+
+  **O defeito (reproduzido na VM com `--selftest-remote`, 2026-11-20, **medido**):**
+  - As colunas threads, RSS e fds saíam 0 em todas as tabelas (`torture`, `origin`, `tcp`, `cache`),
+    e "CPU do daemon" saía 0,0 s. O roteiro procurava `corerouter-daemon` na lista completa de
+    processos, mas lá o nome é o `comm` do kernel, cortado em 15 bytes: `corerouter-daem`. Só a
+    lista `threads=yes` dava o nome inteiro.
+  - A CPU por grupo de threads era a do último segundo (o campo `cpu`), lida depois de a carga
+    acabar, e não a média da medição.
+  - A tabela de serve-stale do notebook (2026-11-14) mostrou 20 consultas com 0 NOERROR, 0 SERVFAIL
+    e 0 sem resposta: eram NXDOMAIN do roteador de casa (`fix-dns-lab-peer-dns`), que a tabela não
+    contava em coluna nenhuma.
+
+  **A correção:**
+  - `system.resource.process.print` traz `cpu_secs`: o CPU acumulado do processo (com as threads que
+    já terminaram) e de cada thread. É uma chave nova, e a doc do `params` mudou junto.
+  - Na lista completa (`threads` ausente), o processo do próprio daemon também se chama
+    `corerouter-daemon` (`hal-linux`), igual à lista `threads=yes` e à saúde.
+  - O roteiro lê a linha do daemon uma vez (`dut_proc`). A CPU por grupo, o "CPU do daemon", o RSS,
+    as threads e os fds são calculados como no modo local, pela diferença entre duas leituras. A
+    leitura do roteador pode ter até 1 s de idade, então a CPU de 15 s fica a ~±7 % (**estimado**).
+    Quando a leitura falha, a célula mostra "-", não 0.
+  - As tabelas de troca de servidor e de serve-stale ganham a coluna "outros" (NXDOMAIN, REFUSED…).
+    O serve-stale reprova se uma resposta vencida não vier NOERROR, e o nome nunca visto reprova se
+    não vier SERVFAIL. O `kdig`, de outro processo, confere um nome de cada: vencido → NOERROR,
+    TTL 30 (RFC 8767 §4), EDE 3 Stale Answer; nunca visto e guardado → SERVFAIL, EDE 13 Cached Error
+    (RFC 8914). A resposta crua fica em `raw/kdig-<nome>.txt`.
+
+  Como testar:
+  `cargo xtask vm-lab run -- env REBUILD=1 scripts/dns-stress-lab.sh --selftest-remote --daemon build --tests torture,origin,tcp,cache --duration 5 --fill 50000`.
+  O `results.md` deve ter threads, RSS e fds diferentes de 0, a CPU por grupo nas tabelas da
+  origem e do DoT/DoH, e a linha `kdig (outro cliente)`. No notebook, rode o mesmo com
+  `--dut remote …`.
+
+- 2026-11-20 — fase-c: Gaps achadas na fase C no hardware real (notebook i5-12450H, `dev.650` = `443646f1`, carga pelo
+  cabo de 1 Gb a partir da VM do laboratório, 2026-11-13, **medido**). Cada linha traz o número
+  medido que a motivou.
+
+- 2026-11-20 — fix-dns-cache-flaky: O teste `cache::tests::a_flood_of_unique_names_leaves_the_hot_ones` (G4.1x) deixa de falhar ao
+  acaso. Ele reprovou o `cargo xtask ci --affected` da G4.1zo duas vezes seguidas (TRY 2 FAIL), sem
+  nada do cache mudado.
+
+  **A causa, medida:**
+  - O esboço de frequência do W-TinyLFU usa um hash com chave aleatória (`RandomState`). É de
+    propósito: assim um cliente não escolhe nomes que caiam nos contadores dos nomes quentes.
+  - No cache do teste (100 entradas, 128 palavras de contador), um nome único às vezes empata com um
+    nome quente logo depois da redução à metade e o tira do cache. O nome quente falta uma vez, volta
+    ao cache, e às vezes puxa outras faltas em seguida.
+  - Em 200 rodadas (**medido**, 2026-11-20): 162 sem falta nenhuma; nas outras 38, de 1 a 24 faltas
+    em 10 000 consultas quentes (no máximo 0,24 %).
+  - O teste exigia 0 faltas, uma garantia que um esboço probabilístico não dá. Quando havia falta, a
+    conta `evicted + rejected == 20 000 − 50` também não fechava: cada falta põe o nome de volta e
+    conta mais uma entrada.
+
+  **A correção (só o teste):**
+  - No máximo 1 % de faltas, contra a "maioria" que a política antiga (descarte por chegada)
+    perdia.
+  - A conta passa a somar as faltas.
+  - Não houve mudança de comportamento no cache. Com a correção, as 200 de 200 rodadas passam.
+
+- 2026-11-20 — fix-dns-lab-peer-dns: `scripts/dns-stress-lab.sh` no modo remoto (fase C) não manda mais carga do laboratório para os
+  servidores DNS que o roteador aprendeu por DHCP.
+
+  **O defeito, achado no notebook (2026-11-14, `dev.659`, **medido**):**
+  - O cliente DHCP da `ether1` (rede de casa) tem `use_peer_dns`, e o roteador de casa
+    (192.168.0.1) entrava em `dynamic_servers` junto com as origens do laboratório.
+  - Numa bateria de 24 min ele recebeu ~33 000 consultas do laboratório pela `ether1` (27 455
+    respondidas, 5 771 sem resposta) e respondeu NXDOMAIN para nomes `*.up.lab`.
+  - Essa resposta negativa ficava no cache. Era ela que fazia o roteiro acusar "the forwarder
+    stopped answering" depois da origem de 200 ms, nas duas rodadas do notebook. O coletor de
+    estatísticas mostrou o encaminhador respondendo 13 000 a 23 000 consultas/s, todas NOERROR,
+    justo no momento da falha.
+  - Pelo mesmo motivo, a checagem inicial falhou ("does not answer on 10.53.0.1:53"). Com
+    `server_selection fastest`, o roteador de casa já tinha RTT medido e as origens novas ainda
+    não. O NXDOMAIN de `big.up.lab` e de `many.up.lab` na tabela de entrada hostil também vinha
+    dele.
+
+  **A correção:**
+  - No modo remoto, o roteiro desliga o `use_peer_dns` dos clientes DHCP durante o laboratório. O
+    `dhcp_update` do engine mantém o lease, e o rollback do fim religa a opção.
+  - Ele espera o resolvedor tirar os servidores aprendidos (~2 s no notebook, **medido**) e se
+    recusa a rodar se sobrar algum, por exemplo de um cliente PPPoE.
+  - Ele esvazia o cache depois de configurar.
+  - A recusa agora interrompe a rodada antes da carga.
+  - O `REVISION` do rollback fica sendo o primeiro, mesmo quando `dut_config` roda de novo.
+
+  Conferido no notebook: com a correção, a rodada `origin,ops` passou ("Resultado: OK") e não
+  houve mais "stopped answering" depois da origem de 200 ms (38 312 NOERROR, máx. 823 ms).
+
+  Como testar:
+  `cargo xtask vm-lab run -- env COREROUTER_PASSWORD= scripts/dns-stress-lab.sh --dut remote --iface enp9s0 --target 100.64.0.1 --mgmt 100.64.0.253/24 --dut-iface ether2 --tests origin,ops`
+  contra um roteador com cliente DHCP. O log mostra "DHCP client *1 without use_peer_dns during the
+  lab", e o `ip.dns.get` volta com o `dynamic_servers` de antes.
+
+  **O rollback ainda falha depois do teste `ops`.** Ele faz mais de 64 revisões, e a revisão de
+  antes sai do histórico. A G0.33 (ponto de volta com nome) resolve isso. Até lá, a limpeza é à mão:
+  - `use_peer_dns` de volta;
+  - `ip.dns.set` com os valores de antes;
+  - remover o endereço 10.53.0.1/24.
+
+  **Números do notebook na mesma rodada, para as gaps da fase C (**medido**):**
+  - **G4.1zo:** com `max_queries_per_client=0` e 65 000 mensagens de lixo por segundo, a thread
+    `dns-udp` ficou em 49 % e o cliente legítimo teve p99 de 719 µs. Antes eram 98 % e 1,5 s, com
+    27 000 mensagens/s.
+  - **G4.1zn:** com 20 000 consultas/s ao lado, o p99 de `ip.dns.set` caiu para 43 ms. Ainda ficam
+    acima do alvo de 50 ms o `static.add` + `remove` (p99 de 479 ms) e o lote atômico (452 ms).
+
+- 2026-11-20 — fix-ospf-lab-glob: `scripts/ospf-stress-lab.sh`, dois defeitos achados na fase C contra o notebook (2026-11-13):
+
+  - **Teardown com coringa:** os interface templates da área do laboratório eram removidos com
+    `for id in $(…)` sem aspas, e os ids do roteador (`*E`) viravam coringa de arquivo (`*E` virou
+    `LICENSE`, da pasta do código na VM). A remoção falhava calada, o template ficava, a área e a
+    instância `stress` não saíam e o roteiro parava ao montar o degrau de 10 000 LSAs. Agora os ids
+    são lidos linha a linha (`while read -r`).
+  - **Faixas do gerador sobre redes reais:** os `/32` dos nós saíam de `192.168.0.0` e as externas
+    de `100.64.0.0/28`. No notebook, eles cobriram a rede de casa (`ether1`, 192.168.0.0/24) e a LAN
+    de teste (`ether2`, 100.64.0.0/24). Um `/32` vence o `/24` conectado, então o notebook respondia
+    à gerência pelo cabo do laboratório e ficou inacessível até o fim do teste. Agora os nós saem de
+    `198.19.0.0` e as externas de `10.128.0.0/28` (198.18.0.0/15 é a faixa de benchmarking da
+    RFC 2544). No modo remoto, `remote_overlap_check` recusa o teste antes de configurar qualquer
+    coisa quando um endereço do roteador cai nessas faixas. Conferido com as faixas antigas: a
+    checagem acusa `192.168.0.182/24` e `100.64.0.1/24`.
+
+- 2026-11-20 — regress-noturno: Registra a G0.30k: regressão de desempenho e de carga no CI noturno, em vez de uma bateria em
+  cada gap. Decisão do usuário (2026-11-20), depois de comparar três caminhos:
+
+  - bateria por gap (`xtask regress --affected`) mais um subagente revisor: 15–40 min a mais por
+    gap típica, mais a disputa pela VM do laboratório (**estimado**);
+  - só o noturno: zero minutos por gap, ~1 h de runner por noite (**estimado**);
+  - deixar como está: o CI pega teste quebrado, mas não pega desempenho pior nem defeito que só
+    aparece com carga (os da fase C: o p99 de 404 ms do DNS e a rota que cortou a gerência só
+    apareceram no notebook).
+
+  Ficou o noturno. O custo é achar a regressão até 24 h depois, apontando o dia (a lista de PRs
+  que entraram) e não o PR.
+
+- 2026-11-20 — vm-lab-reset-busy: `cargo xtask vm-lab run` não reinicia mais a VM do laboratório por cima de uma rodada viva. Em
+  2026-11-13 às 15:16 o health-check de um `run` achou o disco da VM abaixo de 2 GiB (outra rodada
+  compilava em release) e fez `virsh destroy` + `snapshot-revert` no meio da fase C de DNS contra o
+  notebook e de uma rodada da G4.1w (as duas com status 255). Agora a decisão é a função pura
+  `verdict` (`xtask/src/vm_lab.rs`): saúde boa segue; disco curto primeiro apaga os
+  `/srv/lab/<worktree>/target` das worktrees sem rodada viva, do menos recente para o mais, até 6 GiB
+  livres (os `src` ficam); sem rodada viva, o que ainda estiver ruim vira `reset` como antes; com
+  rodada viva (um `ssh … COREROUTER_LAB_ROUND=…` de um `vm-lab run` vivo no `/proc` do host, ou o
+  `vm/root.lock` do usuário), o `run` espera e confere de novo a cada 30 s dentro do
+  `--lock-timeout`, com SSH mais paciente (30 s de conexão, 180 s de resposta), e no fim sai com
+  erro dizendo quem está na VM, sem reiniciar. A conferência, a limpeza e o `reset` rodam sob
+  `vm/health.lock` no host até o `ssh` da rodada começar: dois `run` não reiniciam juntos.
+  `snapshot`/`reset` à mão também recusam com rodada viva (antes só olhavam a trava da VM). O
+  `create` passou a 40 GiB de disco (o `tools` ocupa 7,1 GiB dos 19 GiB, **medido**), e o
+  `docs/vm-lab.md` ganhou a seção "Saúde da VM: reiniciar ou esperar" e a receita para crescer a VM
+  existente (`qemu-img resize` + retirar o snapshot `tools`, porque voltar a um snapshot devolve o
+  tamanho dele, **medido**). Testar: `cargo test -p xtask vm_lab` (tabela da decisão, `classify`,
+  `round_of_ssh`, a limpeza num `/srv/lab` falso, `live_rounds` com um `ssh` falso).
