@@ -16,6 +16,12 @@
 //! (G0.27): the boot after the checkpoint of a clean shutdown, with nothing
 //! left to replay.
 //!
+//! `checkpoint/*` (G0.33): with the 5 MiB config, saving a named checkpoint
+//! (`add`), restoring it (`restore`: read, parse and the commit), and
+//! parsing one file whole (`decode`, what a restore or diff pays) and only
+//! its head (`decode_info`, what the first `config.checkpoint.*` of a
+//! process pays per checkpoint to list them).
+//!
 //! `cargo xtask bench commit_fs`; alone: `cargo bench -p corerouter-storage-fs --bench commit`.
 //! The directory is under the build's tmp dir (a real disk, not tmpfs).
 
@@ -24,7 +30,7 @@
 
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use corerouter_engine::{ConfigStorage, Session};
 use corerouter_hal::VirtualHal;
@@ -363,7 +369,69 @@ fn boot_rss(dir: &str) {
     );
 }
 
-criterion_group!(benches, commit, history64);
+fn checkpoint(c: &mut Criterion) {
+    let mut g = c.benchmark_group("storage_fs/checkpoint");
+    g.sample_size(10);
+    g.measurement_time(Duration::from_secs(10));
+    let cfg = isp(4000, 20_000, 10_000, 10_000);
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("bench-checkpoint-5mib");
+    let _ = std::fs::remove_dir_all(&dir);
+    FileStorage::open(&dir)
+        .unwrap()
+        .save(&persist::encode(&ConfigStore::new(cfg)).unwrap())
+        .unwrap();
+    let mut s = boot(&dir);
+    g.bench_function(BenchmarkId::new("add", "5mib"), |b| {
+        b.iter_custom(|iters| {
+            let mut spent = Duration::ZERO;
+            for _ in 0..iters {
+                let t = Instant::now();
+                s.execute("config.checkpoint.add", &json!({"name": "b"}))
+                    .unwrap();
+                spent += t.elapsed();
+                s.execute("config.checkpoint.remove", &json!({"name": "b"}))
+                    .unwrap();
+            }
+            spent
+        });
+    });
+    s.execute("config.checkpoint.add", &json!({"name": "r"}))
+        .unwrap();
+    let text = std::fs::read_to_string(dir.join("checkpoint-r.json")).unwrap();
+    println!(
+        "checkpoint file: {:.2} MiB",
+        text.len() as f64 / 1_048_576.0
+    );
+    let mut flip = false;
+    g.bench_function(BenchmarkId::new("restore", "5mib"), |b| {
+        b.iter_custom(|iters| {
+            let mut spent = Duration::ZERO;
+            for _ in 0..iters {
+                flip = !flip;
+                let comment = if flip { "a" } else { "b" };
+                s.execute(
+                    "interface.set",
+                    &json!({"name": "ether2", "comment": comment}),
+                )
+                .unwrap();
+                let t = Instant::now();
+                s.execute("config.checkpoint.restore", &json!({"name": "r"}))
+                    .unwrap();
+                spent += t.elapsed();
+            }
+            spent
+        });
+    });
+    g.bench_function(BenchmarkId::new("decode", "5mib"), |b| {
+        b.iter(|| persist::decode_checkpoint(&text, "r").unwrap());
+    });
+    g.bench_function(BenchmarkId::new("decode_info", "5mib"), |b| {
+        b.iter(|| persist::decode_checkpoint_info(&text, "r").unwrap());
+    });
+    g.finish();
+}
+
+criterion_group!(benches, commit, history64, checkpoint);
 
 fn main() {
     if let Ok(dir) = std::env::var(BOOT_RSS) {

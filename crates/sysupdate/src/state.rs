@@ -178,7 +178,10 @@ fn skip(name: &str) -> bool {
 /// is copied.
 fn linkable(name: &str) -> bool {
     matches!(name, "running.json" | "running.json.prev")
-        || (name.ends_with(".json") && (name.starts_with("rev-") || name.starts_with("state-")))
+        || (name.ends_with(".json")
+            && (name.starts_with("rev-")
+                || name.starts_with("state-")
+                || name.starts_with("checkpoint-")))
 }
 
 fn round_up(n: u64) -> u64 {
