@@ -405,6 +405,8 @@ impl Session {
     }
 
     fn as_caller<T>(&mut self, caller: &Caller, f: impl FnOnce(&mut Self) -> T) -> T {
+        // G3.4z: the open management sessions, for the management guard.
+        crate::mgmt_guard::seen(self, caller);
         let outer = std::mem::replace(&mut self.caller, caller.clone());
         let out = f(self);
         self.caller = outer;
@@ -871,6 +873,7 @@ impl Session {
                 "pending_changes": self.store.diff().len(),
                 "storage": self.storage_status,
                 "safe_mode": self.safe_mode_summary(),
+                "management_route": crate::mgmt_guard::summary(self),
                 "counts": {
                     "interfaces": cand.interfaces.len(),
                     "ip_addresses": cand.ip.addresses.len(),

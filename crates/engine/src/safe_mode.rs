@@ -197,6 +197,7 @@ impl Session {
     /// The connection `caller_id` closed. If it owned Safe Mode, its changes
     /// are undone (that is the whole point: the operator lost the router).
     pub fn hang_up(&mut self, caller_id: u64) {
+        crate::mgmt_guard::gone(self, caller_id);
         let owned = self
             .safe_mode()
             .active

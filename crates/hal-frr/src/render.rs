@@ -70,6 +70,14 @@ pub const OWNED: Owned = &[
     ("ipv6 prefix-list CR-O3-", &[Daemon::Ospf6d]),
     ("route-map CR-O2-", &[Daemon::Ospfd]),
     ("route-map CR-O3-", &[Daemon::Ospf6d]),
+    // G3.4z: the management guard, a zebra filter typed in mgmtd (FRR 10:
+    // `ip protocol` is one of its YANG commands); before the `CR-` BGP
+    // filters, whose prefix it shares.
+    ("ip prefix-list CR-MG-", &[Daemon::Mgmtd]),
+    ("ipv6 prefix-list CR-MG-", &[Daemon::Mgmtd]),
+    ("route-map CR-MG-", &[Daemon::Mgmtd]),
+    ("ip protocol any route-map CR-MG-", &[Daemon::Mgmtd]),
+    ("ipv6 protocol any route-map CR-MG-", &[Daemon::Mgmtd]),
     // G3.2b: the `/routing filter` render, all named `CR-` (the operator's
     // own lists and maps are left alone). Only bgpd filters with them.
     ("ip prefix-list CR-", &[Daemon::Bgpd]),
@@ -162,6 +170,7 @@ pub fn render(cfg: &Config, open: corerouter_proto_bgp::Opener<'_>) -> Result<Co
     // G3.4: the same key opener (both seal with the engine's key).
     text.push_str(&corerouter_proto_ospf::frr::render(cfg, open).map_err(RenderError::Proto)?);
     text.push_str(&corerouter_proto_bfd::frr::render(cfg));
+    text.push_str(&crate::mgmt_guard::render(cfg));
     text.push_str(
         &corerouter_proto_mpls::render_frr(&cfg.routing.mpls, open).map_err(RenderError::Proto)?,
     );

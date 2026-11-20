@@ -246,6 +246,11 @@ fn commands() -> Vec<(&'static str, Value)> {
             "routing.rule.add",
             json!({"dst_address": "198.18.0.0/15", "action": "unreachable"}),
         ),
+        // G3.4z: the management guard.
+        (
+            "routing.management-guard.add",
+            json!({"network": "192.0.2.0/24", "comment": "mgmt"}),
+        ),
         ("routing.bfd.profile.add", json!({"name": "bp"})),
         ("routing.bfd.peer.add", json!({"address": "192.0.2.4"})),
         (

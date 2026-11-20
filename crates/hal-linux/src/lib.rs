@@ -199,6 +199,9 @@ pub mod nic_scan;
 #[cfg(target_os = "linux")]
 pub mod oslog;
 
+/// G3.4z: the FIB entry of a management session's replies, and its protocol.
+#[cfg(target_os = "linux")]
+pub mod fib_match;
 /// The link list read lean, for the poll (G1.3f).
 pub mod link_dump;
 /// Link events (G1.3d): ports replugged between two polls.

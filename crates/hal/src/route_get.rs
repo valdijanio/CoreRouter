@@ -94,6 +94,58 @@ pub struct KernelLookup {
     pub table: u32,
 }
 
+/// G3.4z: the FIB entry a reply to `peer` takes (`RTM_GETROUTE` with
+/// `RTM_F_FIB_MATCH`), and who put it there: the management guard asks it
+/// for every open management session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FibEntry {
+    pub kind: RouteKind,
+    /// The entry's own prefix (`None`: no entry, or a discard route).
+    pub prefix: Option<IpNet>,
+    /// `rtm_protocol` (`RTPROT_*`: 2 kernel, 4 static, 186 bgp, 188 ospf…).
+    pub protocol: u8,
+    pub interface: Option<IfName>,
+    pub gateway: Option<IpAddr>,
+}
+
+/// The name of a route's `rtm_protocol` (`/etc/iproute2/rt_protos` and
+/// FRR's `lib/route_types.txt`, which zebra installs with).
+pub fn protocol_name(p: u8) -> &'static str {
+    match p {
+        0 => "unspec",
+        1 => "redirect",
+        2 => "kernel",
+        3 => "boot",
+        4 => "static",
+        9 => "ra",
+        11 => "zebra",
+        16 => "dhcp",
+        42 => "babel",
+        186 => "bgp",
+        187 => "isis",
+        188 => "ospf",
+        189 => "rip",
+        190 => "ripng",
+        191 => "nhrp",
+        192 => "eigrp",
+        193 => "ldp",
+        194 => "sharp",
+        195 => "pbr",
+        196 => "static",
+        197 => "openfabric",
+        198 => "srte",
+        _ => "other",
+    }
+}
+
+/// Whether a routing daemon put the route there (FRR's protocols): what
+/// the management guard watches. CoreRouter's own routes are `static`
+/// (4), the kernel's `kernel` (2) and DHCP's `dhcp` (16); FRR's staticd
+/// (196) is learned too, since the engine never drives it.
+pub fn is_learned_protocol(p: u8) -> bool {
+    matches!(p, 11 | 42 | 186..=198)
+}
+
 /// Kernel table the link `name` routes in (its VRF's, or main).
 fn table_of_link(cfg: &Config, snap: &Snapshot, name: &IfName) -> u32 {
     if let Some(InterfaceKind::Vrf { table }) = cfg.interfaces.get(name).map(|i| &i.kind) {

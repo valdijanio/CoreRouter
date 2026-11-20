@@ -1728,6 +1728,28 @@ cripto. As chaves vêm seladas do engine, que as abre e entrega ao `Hal::wiregua
 - um CoreRouter em VM (como o CHR) precisar de vazão TCP alta num túnel: medir a imagem em
   QEMU/Proxmox e reavaliar o wireguard-go nesse caso.
 
+### Guarda da gerência: aviso pelo FIB, filtro no zebra (G3.4z)
+
+Uma rota aprendida mais específica que a rede conectada de gerência vence pelo prefixo (RFC 1812
+§5.2.4.3) e leva as respostas ao operador para outra porta; nenhum commit muda, então o lockout da
+G2.1b não vê. Duas peças, comparadas assim:
+
+- **Aviso: perguntar ao kernel por sessão, não varrer rotas.** O serviço `mgmt-guard` faz um
+  `RTM_GETROUTE` + `RTM_F_FIB_MATCH` por par (peer, local) distinto, 1×/s, fora do lock
+  (`hal-linux::fib_match`), e o engine (`engine::mgmt_guard`) julga com as redes conectadas da
+  config. A alternativa (ler as rotas OSPF/BGP do FRR e cruzar com as sessões) custa O(rotas) e
+  só vê o que o FRR imprime; a do kernel custa O(sessões), 11,5 µs por par (**medido**), e vê
+  também rota de outro programa. Assinar `RTM_NEWROUTE` daria o aviso antes de 1 s, mas paga um
+  evento por rota no churn de 200 000 LSAs; fica como está enquanto 1 s bastar.
+- **Filtro: no zebra (`ip protocol any route-map`), não em cadeias por protocolo.** O
+  `routing.filter` + um `in_filter_chain` no OSPF e o `input_filter` de cada conexão BGP
+  (o modelo do RouterOS) protegem só onde o operador lembrou de ligar a cadeia; o filtro de
+  instalação do zebra vale para todo protocolo, deixa a rota inativa na RIB (diagnóstico) e não
+  toca o LSDB (RFC 2328 §2). No FRR 10 o `ip protocol` é comando YANG do mgmtd: tudo vai lá numa
+  transação, para o zebra nunca ver o `ip protocol` sem o seu route-map (um route-map com nome e
+  sem definição recusa tudo, `zebra_route_map_check`). Medido na VM: o `/32` sai do kernel em
+  24–31 ms e as outras rotas OSPF não saem.
+
 ## Histórico de revisão
 
 - 2026-10-21 — versão inicial (esqueleto v0.1.0).
