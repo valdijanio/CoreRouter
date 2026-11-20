@@ -681,6 +681,24 @@ impl Statistics {
         });
     }
 
+    /// G4.1zo: a UDP message dropped by `max_queries_per_client` before it
+    /// was parsed (no name, no type: only who sent it).
+    pub(crate) fn limited(&self, client: IpAddr, now_ms: u64) {
+        self.count(&Event {
+            category: LIMIT,
+            rcode: DROPPED,
+            qtype: None,
+            name: None,
+            client: client.to_canonical(),
+            tcp: false,
+            refused: true,
+            truncated: false,
+            ede: None,
+            upstream: None,
+            now_ms,
+        });
+    }
+
     fn record(&self, q: &Query, r: &Reply) {
         let what = category(q.answered_by, q.source.as_ref());
         let refused = q.dropped() || r.rcode == ResponseCode::Refused;
@@ -951,7 +969,8 @@ mod tests {
         assert_eq!(c.rcodes.get("dropped"), Some(&1));
         assert_eq!(c.rcodes.get("refused"), Some(&1));
         assert_eq!(c.ede.get(&EDE_PROHIBITED), Some(&1), "RFC 8914 §4.19");
-        assert_eq!(s.types(), [("A".to_owned(), 3), ("TXT".to_owned(), 1)]);
+        // G4.1zo: the drop over the limit was never parsed: no type.
+        assert_eq!(s.types(), [("A".to_owned(), 2), ("TXT".to_owned(), 1)]);
         assert_eq!(c.upstreams.get(&IpAddr::from([198, 51, 100, 53])), Some(&1));
         let lan = s.top_clients.first().copied().unwrap();
         assert_eq!(lan.0, IpAddr::from(LAN));

@@ -47,7 +47,8 @@
 #   adlist    a list of --adlist names: load time, memory, cost, reload
 #   ddns      a zone of --zone-records records, RFC 2136 UPDATEs and a DHCP
 #             storm with names, zone queries beside them (G4.1p, G4.1q)
-#   hostile   junk, ANY, big TXT, a client outside allowed_from
+#   hostile   junk (--junk-procs senders, one address), ANY, big TXT, a
+#             client outside allowed_from
 #   ops       commands under load (ip.dns.set, statics, flush, statistics,
 #             an atomic batch): their p99 and the load's
 #   compare   the same runs against Unbound and dnsmasq (local only)
@@ -59,7 +60,7 @@ set -euo pipefail
 # Decimal points, not commas ($EPOCHREALTIME, awk, printf).
 export LC_ALL=C
 
-usage() { sed -n '2,52p' "$0"; exit 2; }
+usage() { sed -n '2,53p' "$0"; exit 2; }
 
 if [ "${1:-}" = "--host" ]; then
 	IMAGES=${2:?usage: $0 --host <images dir> [options]}
@@ -101,6 +102,7 @@ HOT=10000 STATICS=1000 ZONE_N=10000
 # zone that changes with --zone-records and a second one with the rest
 # (G4.1p: every change rebuilds every primary zone).
 FILL=1000000 ADLIST_N=1000000 ZONE_RECORDS=40000 DHCP_N=20000
+JUNK_PROCS=1 # --junk-procs: senders of junk in the hostile test (one address)
 SOAK_SECS=7200
 OUT=""
 while [ $# -gt 0 ]; do
@@ -121,6 +123,7 @@ while [ $# -gt 0 ]; do
 	--dut-cpus-list) DUT_CPUS_LIST=$2; shift 2 ;;
 	--hot) HOT=$2; shift 2 ;;
 	--fill) FILL=$2; shift 2 ;;
+	--junk-procs) JUNK_PROCS=$2; shift 2 ;;
 	--adlist) ADLIST_N=$2; shift 2 ;;
 	--zone-records) ZONE_RECORDS=$2; shift 2 ;;
 	--dhcp-clients) DHCP_N=$2; shift 2 ;;
@@ -1762,6 +1765,19 @@ while time.monotonic() - t0 < secs:
 print(n, "%.0f" % (n / secs))
 PY
 }
+# junk_run <src> → "sent per_s": --junk-procs senders of junk.py from the
+# same address (each its own source port, as a flood from one host that
+# opens several sockets), for $DUR seconds.
+junk_run() {
+	local i pids=()
+	for ((i = 0; i < JUNK_PROCS; i++)); do
+		in_gen python3 -I "$W/junk.py" "$DUT_IP" "$1" "$DUR" >"$W/junkout.$i" &
+		pids+=($!)
+	done
+	wait "${pids[@]}" 2>/dev/null || true
+	cat "$W/junkout".* | awk '{n += $1; r += $2} END {printf "%d %.0f\n", n, r}'
+	rm -f "$W/junkout".*
+}
 test_hostile() {
 	say ""
 	say "## 8. Entrada hostil"
@@ -1770,7 +1786,7 @@ test_hostile() {
 	junk_py
 	warm hot
 	local res lim
-	say "Lixo a toda velocidade de ${CLIENTS[3]} (bytes ao acaso, cabeçalho só, contagens falsas, laço de"
+	say "Lixo a toda velocidade de ${CLIENTS[3]} ($JUNK_PROCS processo(s), cada um com a sua porta; bytes ao acaso, cabeçalho só, contagens falsas, laço de"
 	say "compressão, resposta no lugar de pergunta, 127 rótulos, OPT com versão errada); ao lado, um cliente"
 	say "legítimo (cache, 150/s, abaixo do limite por cliente) de outro endereço."
 	say ""
@@ -1782,7 +1798,7 @@ test_hostile() {
 		# Under the default per-client limit (200/s), so only the attacker
 		# meets it.
 		legit_bg "hostile-legit-$lim" 150
-		res=$(in_gen python3 -I "$W/junk.py" "$DUT_IP" "${CLIENTS[3]}" "$DUR")
+		res=$(junk_run "${CLIENTS[3]}")
 		legit_wait "hostile-legit-$lim"
 		thr_snap "$W/t1"
 		say "| $lim$([ "$lim" = 200 ] && echo " (padrão)" || echo " (desligado)") | $(echo "$res" | cut -d' ' -f1) | $(echo "$res" | cut -d' ' -f2) | $(dp_row) | $(thr_cpu "$W/t0" "$W/t1" "$DUR") |"

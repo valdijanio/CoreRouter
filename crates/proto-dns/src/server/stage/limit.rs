@@ -121,6 +121,12 @@ fn handle(f: &Forwarder, q: &mut Query, _: Option<&mut dyn Transport>) -> Step {
         q.note(|| Note::new("limit.router"));
         return Step::Next;
     }
+    if !q.tcp && !q.simulated() {
+        // G4.1zo: a UDP message took its token before the parse
+        // (`Forwarder::start_as`); one over the limit never got here.
+        q.note(|| Note::new("limit.within").arg("client", client).arg("rate", rate));
+        return Step::Next;
+    }
     let buckets = f.state::<Buckets>();
     let within = if q.simulated() {
         buckets.peek(client, rate, q.now_ms)

@@ -139,7 +139,7 @@ aparecem desabilitados com a parte que os traz), IP › DNS Static e IP › DNS 
 | Ordem | Etapa | O que faz |
 |---|---|---|
 | 10 | `acl` | Fora de `allowed_from` (e do loopback): REFUSED. Nunca um resolvedor aberto. |
-| 20 | `limit` | Balde de fichas por cliente (IPv6 por /64), rajada de 2× a taxa. Passou: UDP descartado (nada a refletir), TCP com REFUSED. |
+| 20 | `limit` | Balde de fichas por cliente (IPv6 por /64), rajada de 2× a taxa. Passou: UDP descartado (nada a refletir), TCP com REFUSED. Em UDP a ficha sai antes da decodificação (G4.1zo): o lixo que não decodifica também conta, e o descarte custa uma consulta à tabela. |
 | 25 | `special` | `localhost` e `.invalid` (RFC 6761) e ANY (RFC 8482: um HINFO só). |
 | 30 | `adlist` | Vazia; a G4.1d entra aqui. |
 | 40 | `static` | `/ip dns static` (abaixo). |
@@ -1284,6 +1284,21 @@ ocupavam uma vaga e uma thread cada (**medido**, `docs/dns-stress.md`).
   SERVFAIL na hora ("busy"). Um seguidor não ocupa vaga nem thread: deixa um callback
   (`Follow::then`) ou, no caminho bloqueante, espera. Seguidores com callback: no máximo
   `MAX_WAITING` (16 384).
+- **Recepção UDP repartida por cliente (G4.1zo).** São quatro sockets por família na porta 53, cada
+  um com os mesmos leitores "dns-udp" que o socket único tinha (metade dos núcleos, de 1 a 4), num grupo `SO_REUSEPORT` com um programa BPF clássico
+  (`SO_ATTACH_REUSEPORT_CBPF`, `service/dns_server/steer.rs`) que escolhe o socket por um hash do
+  endereço de origem (IPv4 inteiro, IPv6 pelo /64). Todo datagrama de um cliente cai no mesmo
+  socket, qualquer que seja a porta de origem. Uma enxurrada de um endereço enche só a fila e os
+  leitores dela; os outros três sockets não a veem. Antes, com um socket só, a fila era de todos: na
+  VM, com 1 M de mensagens de lixo por segundo de um endereço, um cliente legítimo perdia 65 % das
+  consultas com o limite padrão e 80 % sem ele; agora perde 0 %, p99 abaixo de 1 ms (**medido**,
+  `scripts/dns-stress-lab.sh --tests hostile --junk-procs 4`). Um cliente sozinho (um resolvedor ou um
+  CGNAT que manda tudo de um endereço) continua com todos os leitores: com um leitor por socket ele
+  ficava com um só (na VM, 155 mil → 78 mil acertos/s de uma origem; com os leitores mantidos, 136 mil, dentro do
+  ruído de ±30 % entre rodadas, **medido**). Os clientes que
+  caem no socket da enxurrada dividem a fila com ela; o limite por cliente, antes da
+  decodificação, é o que os protege. Sem o BPF (kernel antigo), o kernel espalha pelo hash da
+  quádrupla e o roteador avisa no log.
 - `service/dns_server/upstream.rs`: os laços "dns-upstream-N" (`mio`, tantos quantos leitores UDP
   por família) carregam as buscas. Socket UDP conectado a um servidor, porta efêmera do kernel
   (aleatória no Linux); cada socket leva no máximo 16 consultas e vive no máximo 2 s, então um

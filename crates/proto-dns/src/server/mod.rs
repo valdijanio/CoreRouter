@@ -489,6 +489,22 @@ impl Forwarder {
         now_ms: u64,
         how: How,
     ) -> Start {
+        let config = self.config();
+        // G4.1zo: the per-client limit first, on the source address alone
+        // (UDP): a flood that never parses (junk) is limited too, and a
+        // message over the limit costs a table lookup, not a decoding and a
+        // FORMERR sent back. TCP keeps it in the chain (REFUSED needs the
+        // question; a TCP client cannot spoof its address).
+        if !tcp && !how.simulated && !self.within_limit(&config, client, now_ms) {
+            self.stats.limited(client, now_ms);
+            return Start::Done(Done {
+                reply: None,
+                effects: Vec::new(),
+                answered_by: "limit",
+                explain: Vec::new(),
+                log: None,
+            });
+        }
         let request = match parse_request(packet) {
             Ok(m) => m,
             Err(reply) => {
@@ -504,7 +520,6 @@ impl Forwarder {
                 });
             }
         };
-        let config = self.config();
         let mut query = match Query::new(request, client, tcp, now_ms, config) {
             Ok(mut q) => {
                 q.simulated = how.simulated;
@@ -530,6 +545,15 @@ impl Forwarder {
             Some(i) => Start::Pending(Box::new(Pending { query, next: i })),
             None => Start::Done(self.done(query)),
         }
+    }
+
+    /// `client` may send one more UDP message now (`max_queries_per_client`;
+    /// the router itself always may).
+    fn within_limit(&self, config: &ServerConfig, client: IpAddr, now_ms: u64) -> bool {
+        let rate = config.config.ip.dns.max_queries_per_client;
+        rate == 0
+            || client.is_loopback()
+            || self.state::<limit::Buckets>().take(client, rate, now_ms)
     }
 
     /// The rest of the chain, on a worker, with the network.
