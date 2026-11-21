@@ -54,6 +54,9 @@ use corerouter_model::firewall::DynamicAddress;
 use corerouter_model::{Config, IfName};
 use serde::Serialize;
 
+/// [`Hal::unmanaged`]'s answer: link name → why CoreRouter leaves it alone.
+pub type Unmanaged = std::sync::Arc<std::collections::BTreeMap<IfName, String>>;
+
 pub use dhcp::{
     Dhcp6Port, Dhcp6Responder, DhcpPort, DhcpResponder, SharedResponder, SharedResponder6,
 };
@@ -272,9 +275,13 @@ pub trait Hal: Send {
 
     /// Links present on the platform that CoreRouter must not change, with
     /// the reason (see [`LinkState::unmanaged`]). Commands check it before
-    /// touching a name; the default (virtual lab) has none.
-    fn unmanaged(&mut self) -> Vec<(IfName, String)> {
-        Vec::new()
+    /// touching a name; the default (virtual lab) has none. Shared, not
+    /// copied: a backend that keeps the answer hands out the same map to
+    /// every command of a batch, so a check costs a lookup and not a copy
+    /// of every link (G0.30m: 1 000 checks with 3 011 links copied 3 M
+    /// entries, 270 ms in a debug build, **medido**).
+    fn unmanaged(&mut self) -> Unmanaged {
+        Unmanaged::default()
     }
 
     /// Wall clock in seconds since the Unix epoch, if the platform has one.

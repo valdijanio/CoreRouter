@@ -337,7 +337,7 @@ mod linux {
     }
 
     /// `Hal::unmanaged`'s answer with the `epoch` and the moment it was read.
-    type UnmanagedMemo = (u64, std::time::Instant, Vec<(IfName, String)>);
+    type UnmanagedMemo = (u64, std::time::Instant, corerouter_hal::Unmanaged);
 
     /// How long an `Hal::unmanaged` answer is reused. The commands'
     /// check is an early refusal: `apply` classifies the links again and
@@ -1530,26 +1530,34 @@ mod linux {
             self.sync_rules(cfg)
         }
 
-        fn unmanaged(&mut self) -> Vec<(IfName, String)> {
-            if let Some((epoch, at, list)) = &self.unmanaged_memo
+        fn unmanaged(&mut self) -> corerouter_hal::Unmanaged {
+            if let Some((epoch, at, map)) = &self.unmanaged_memo
                 && *epoch == self.epoch
                 && at.elapsed() < UNMANAGED_TTL
             {
-                return list.clone();
+                // The same map for every check of a batch: a pointer, not
+                // a copy of every link (G0.30m).
+                return std::sync::Arc::clone(map);
             }
             match self.view(&self.claims) {
                 Ok(v) => {
-                    let list: Vec<(IfName, String)> = v
-                        .into_iter()
-                        .filter_map(|(l, o)| Some((l.name.parse().ok()?, o.reason()?.to_owned())))
-                        .collect();
-                    self.unmanaged_memo =
-                        Some((self.epoch, std::time::Instant::now(), list.clone()));
-                    list
+                    let map: corerouter_hal::Unmanaged = std::sync::Arc::new(
+                        v.into_iter()
+                            .filter_map(|(l, o)| {
+                                Some((l.name.parse().ok()?, o.reason()?.to_owned()))
+                            })
+                            .collect(),
+                    );
+                    self.unmanaged_memo = Some((
+                        self.epoch,
+                        std::time::Instant::now(),
+                        std::sync::Arc::clone(&map),
+                    ));
+                    map
                 }
                 Err(e) => {
                     log::warn!("link dump failed: {e}");
-                    Vec::new()
+                    corerouter_hal::Unmanaged::default()
                 }
             }
         }
