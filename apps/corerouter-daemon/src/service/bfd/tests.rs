@@ -440,3 +440,39 @@ fn data_plane_for_a_fake_bfdd() {
     health.stop();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// G3.6n: a new engine takes a session over with the same discriminator
+/// (the daemon restarted and bfdd handed it back) and resumes it Up: the
+/// peer never leaves Up. Without the resume the new engine sends Down and
+/// the peer goes Down (RFC 5880 §6.8.6: Up and a Down received).
+#[test]
+fn a_restarted_engine_resumes_the_session_without_a_down_on_the_peer() {
+    let (pa, pb) = ports();
+    let (pa, pb) = (pa + 8000, pb + 8000);
+    let fast = BfdProfile::new("fast", 50, 3);
+    let mut b = engine("127.0.0.2".parse().unwrap(), pb, pa, 1);
+    let mut sb = spec("127.0.0.1".parse().unwrap(), None, &fast);
+    sb.damp = None;
+    b.add(sb, None);
+    let mut sa = spec("127.0.0.2".parse().unwrap(), None, &fast);
+    sa.damp = None;
+    sa.resume_us = super::resume_us(&sa.cfg);
+    assert_eq!(sa.resume_us, 75_000);
+    let lid = 0x0002_2002;
+    let mut a = engine("127.0.0.1".parse().unwrap(), pa, pb, 1);
+    assert!(a.add_with(lid, sa.clone()));
+    // Up, and past the slow detection of a new session (G3.9b).
+    assert!(wait_for(&b, Duration::from_secs(5), |s| s[0].state == "up" && s[0].detect_time_us == 150_000));
+    while b.events.try_recv().is_ok() {}
+    // The daemon dies; the new one gets the session back from bfdd.
+    drop(a);
+    let mut a2 = engine("127.0.0.1".parse().unwrap(), pa, pb, 1);
+    assert!(a2.add_with(lid, sa));
+    assert!(wait_for(&a2, Duration::from_secs(2), |s| s[0].state == "up"));
+    thread::sleep(Duration::from_millis(600));
+    let downs: Vec<_> = std::iter::from_fn(|| b.events.try_recv().ok()).map(|e| (e.from, e.to)).collect();
+    assert!(downs.is_empty(), "the peer saw {downs:?}");
+    let (s, _) = b.snapshot();
+    assert_eq!(s[0].state, "up");
+    assert_eq!(s[0].remote_discr, lid);
+}
