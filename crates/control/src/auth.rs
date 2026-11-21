@@ -44,12 +44,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use corerouter_engine::auth::{MAX_PASSWORD, burn_verification, verify_password};
+use corerouter_engine::login_lockout::{LoginLockouts, UserLockout};
 use corerouter_engine::{Caller, Principal};
 use ring::digest::{SHA256, digest};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{Value, json};
 
 use crate::dispatch::Host;
+use crate::lockout::{Locked, Lockouts, exempt};
 
 /// Prefix of every authentication error, so clients can tell "log in
 /// again" apart from a refused command.
@@ -90,6 +92,20 @@ pub struct Limits {
     pub block_after: u32,
     /// How long failures are remembered.
     pub window: Duration,
+    /// Failures of one user name (from [`Limits::lock_sources`] distinct
+    /// sources, within [`Limits::window`]) that lock it for network logins
+    /// (G0.12, [`crate::lockout`]); 0 = never.
+    pub lock_after: u32,
+    /// Distinct sources (IPv4 addresses or IPv6 /64s) those failures must
+    /// come from: one source alone is the per-source block's job.
+    pub lock_sources: u32,
+    /// The first lock; each one after it within [`Limits::lock_memory`]
+    /// lasts twice as long, at most [`Limits::lock_max`].
+    pub lock_base: Duration,
+    pub lock_max: Duration,
+    /// How long a lock counts for the doubling, and how long a source a
+    /// user logged in from stays known (never locked out).
+    pub lock_memory: Duration,
 }
 
 impl Default for Limits {
@@ -102,6 +118,11 @@ impl Default for Limits {
             max_delay: Duration::from_secs(8),
             block_after: 20,
             window: Duration::from_secs(15 * 60),
+            lock_after: 10,
+            lock_sources: 3,
+            lock_base: Duration::from_secs(60),
+            lock_max: Duration::from_secs(30 * 60),
+            lock_memory: Duration::from_secs(24 * 3600),
         }
     }
 }
@@ -124,6 +145,9 @@ struct Failures {
 struct Inner {
     tokens: Mutex<Vec<Token>>,
     failures: Mutex<HashMap<String, Failures>>,
+    /// Per user name, against many sources (G0.12). Taken inside
+    /// `failures`, never the other way round.
+    users: Mutex<Lockouts>,
     limits: Limits,
     /// Argon2 verifications running now, and its wake-up.
     verifying: Mutex<usize>,
@@ -203,6 +227,7 @@ impl Gate {
         Self(Arc::new(Inner {
             tokens: Mutex::new(Vec::new()),
             failures: Mutex::new(HashMap::new()),
+            users: Mutex::new(Lockouts::default()),
             limits,
             verifying: Mutex::new(0),
             verified: Condvar::new(),
@@ -258,16 +283,23 @@ impl Gate {
         params: &Value,
     ) -> Result<Value, String> {
         let (user, password) = login_params(params)?;
-        let keys = [
-            format!(
-                "ip {}",
-                peer.map(|p| crate::conn::source_of(p).to_string())
-                    .unwrap_or_default()
-            ),
-            format!("user {}", user.chars().take(64).collect::<String>()),
-        ];
+        let source = peer
+            .map(|p| crate::conn::source_of(p).to_string())
+            .unwrap_or_default();
+        let name: String = user.chars().take(64).collect();
+        let keys = [format!("ip {source}"), format!("user {name}")];
+        let exempt = exempt(peer);
         // Counted now, forgiven on success: N parallel attempts are N.
-        let delay = self.attempt(&keys)?;
+        let delay = match self.attempt(&keys, &name, &source, exempt) {
+            Ok(d) => d,
+            Err(Refused::Limit(e)) => return Err(e),
+            Err(Refused::Locked(l)) => {
+                if let Some(st) = &l.started {
+                    log_lock(host, caller, st);
+                }
+                return Err(l.message());
+            }
+        };
         if !delay.is_zero() {
             thread::sleep(delay);
         }
@@ -307,6 +339,7 @@ impl Gate {
             return Err(INVALID_LOGIN.into());
         }
         self.succeeded(&keys);
+        lock(&self.0.users).succeeded(&name, &source, exempt, Instant::now());
         let token = new_token()?;
         let name = user.to_owned();
         let via = caller.name.clone();
@@ -498,7 +531,13 @@ impl Gate {
     /// and say how long it waits first, or why it is refused. Checking and
     /// counting under one lock: parallel attempts cannot all pass the
     /// check before any of them counts.
-    fn attempt(&self, keys: &[String]) -> Result<Duration, String> {
+    fn attempt(
+        &self,
+        keys: &[String],
+        user: &str,
+        source: &str,
+        exempt: bool,
+    ) -> Result<Duration, Refused> {
         let l = &self.0.limits;
         let now = Instant::now();
         let mut map = lock(&self.0.failures);
@@ -509,13 +548,17 @@ impl Gate {
                 *f = Failures::default();
             }
             if i == 0 && f.count >= l.block_after {
-                return Err(format!(
+                return Err(Refused::Limit(format!(
                     "too many failed logins from this address; try again in {} minutes",
                     l.window.as_secs().div_ceil(60)
-                ));
+                )));
             }
             worst = worst.max(f.count);
         }
+        // G0.12: the name, against many sources; before any Argon2 work.
+        lock(&self.0.users)
+            .attempt(user, source, exempt, now, l)
+            .map_err(Refused::Locked)?;
         for key in keys {
             if !map.contains_key(key) {
                 self.make_room(&mut map, now);
@@ -562,8 +605,102 @@ impl Gate {
         }
     }
 
+    /// [`Gate::attempt`] for the per-source and per-name counters only
+    /// (an exempt source: no lockout).
+    #[cfg(test)]
+    fn try_keys(&self, keys: &[String]) -> Result<Duration, String> {
+        self.attempt(keys, "", "", true).map_err(|e| match e {
+            Refused::Limit(m) => m,
+            Refused::Locked(l) => l.message(),
+        })
+    }
+
     pub fn limits(&self) -> &Limits {
         &self.0.limits
+    }
+}
+
+#[derive(Debug)]
+/// Why [`Gate::attempt`] refused a login before looking at the password.
+enum Refused {
+    /// The per-source block (the message says so).
+    Limit(String),
+    /// The user name is locked for network logins (G0.12).
+    Locked(Locked),
+}
+
+/// A user name was just locked: a warning in the router's log (one line per
+/// name, the repeats counted: `Session::log_event_grouped`) and the
+/// process log.
+fn log_lock(host: &mut dyn Host, caller: &Caller, st: &crate::lockout::LockStarted) {
+    log::warn!(
+        "control: user {:?} locked for network logins for {} s: {} failed logins from {} \
+         addresses ({}, lock {} in a row)",
+        st.user,
+        st.secs,
+        st.failures,
+        st.sources.len(),
+        caller.name,
+        st.blocks
+    );
+    let shown: Vec<&str> = st.sources.iter().take(8).map(String::as_str).collect();
+    let more = st.sources.len().saturating_sub(shown.len());
+    let list = if more > 0 {
+        format!("{} e mais {more}", shown.join(", "))
+    } else {
+        shown.join(", ")
+    };
+    let key = format!("auth.lockout {}", st.user);
+    let msg = format!(
+        "Usuário {} bloqueado para login pela rede por {} s: {} falhas de {} origens ({list}); \
+         loopback e origens já usadas por ele continuam entrando; user.lockout.clear libera",
+        st.user,
+        st.secs,
+        st.failures,
+        st.sources.len()
+    );
+    let detail = json!({
+        "user": st.user,
+        "locked_secs": st.secs,
+        "failures": st.failures,
+        "sources": shown,
+        "blocks": st.blocks,
+    });
+    let _ = host.with_session(&mut |s| {
+        Ok(Value::Bool(s.log_event_grouped(
+            &key,
+            &["system", "account", "warning"],
+            "auth",
+            msg.clone(),
+            detail.clone(),
+        )))
+    });
+}
+
+impl LoginLockouts for Gate {
+    fn lockouts(&self) -> Vec<UserLockout> {
+        lock(&self.0.users).rows(Instant::now(), &self.0.limits)
+    }
+
+    fn lockout_clear(&self, user: Option<&str>) -> usize {
+        let n = lock(&self.0.users).clear(user);
+        // The per-name delay goes too: the operator said this name is fine.
+        let mut map = lock(&self.0.failures);
+        match user {
+            Some(u) => {
+                map.remove(&format!("user {u}"));
+            }
+            None => map.retain(|k, _| !k.starts_with("user ")),
+        }
+        n
+    }
+}
+
+impl Gate {
+    /// Show this gate's lockouts in `user.lockout.list` (and let
+    /// `user.lockout.clear` reach them).
+    pub fn attach(&self, s: &mut corerouter_engine::Session) {
+        s.add_login_lockouts(Arc::new(self.clone()));
     }
 }
 
@@ -650,6 +787,95 @@ mod tests {
         assert!(!bad.unwrap_err().contains("right-password"));
     }
 
+    fn login_from(gate: &Gate, s: &mut Session, ip: &str, pw: &str) -> Result<Value, String> {
+        let caller = Caller::new(7, format!("tls {ip}:40000"));
+        gate.login(
+            s,
+            &caller,
+            Some(ip.parse().unwrap()),
+            &json!({"user": "admin", "password": pw}),
+        )
+    }
+
+    /// G0.12: many sources against one name lock it for the network, never
+    /// for loopback nor for a source it logged in from before.
+    #[test]
+    fn distributed_brute_force_locks_the_name() {
+        let gate = Gate::new(Limits {
+            lock_after: 6,
+            lock_sources: 3,
+            ..quick()
+        });
+        let mut s = lab();
+        gate.attach(&mut s);
+        // The operator's workstation, before the attack.
+        login_from(&gate, &mut s, "192.0.2.50", "right-password").unwrap();
+        // Five failures from three addresses (one of them an IPv6 /64
+        // seen through two addresses): not yet.
+        for ip in [
+            "198.51.100.1",
+            "198.51.100.2",
+            "2001:db8::1",
+            "2001:db8::2",
+            "198.51.100.1",
+        ] {
+            assert_eq!(
+                login_from(&gate, &mut s, ip, "guess").unwrap_err(),
+                INVALID_LOGIN
+            );
+        }
+        let before = gate.verifications();
+        // The sixth locks: refused, as are the next, even with the right
+        // password, from any new address, without any Argon2 work.
+        let e = login_from(&gate, &mut s, "198.51.100.3", "guess").unwrap_err();
+        assert!(e.contains("held for 60 more seconds"), "{e}");
+        let e = login_from(&gate, &mut s, "203.0.113.9", "right-password").unwrap_err();
+        assert!(e.contains("several addresses"), "{e}");
+        assert_eq!(gate.verifications(), before);
+        // Loopback and the known workstation still get in.
+        login_from(&gate, &mut s, "127.0.0.1", "right-password").unwrap();
+        login_from(&gate, &mut s, "::1", "right-password").unwrap();
+        login_from(&gate, &mut s, "192.0.2.50", "right-password").unwrap();
+        // Shown by the command and in the router's log.
+        let r = s.execute("user.lockout.list", &json!({})).unwrap();
+        assert_eq!(r["locked"], 1, "{r}");
+        assert_eq!(r["rows"][0]["user"], "admin");
+        assert_eq!(r["rows"][0]["blocks"], 1);
+        assert_eq!(r["rows"][0]["known_sources"], 1);
+        let log = s.execute("log.print", &json!({})).unwrap().to_string();
+        assert!(log.contains("bloqueado para login pela rede"), "{log}");
+        // Cleared by a full user: the attacker's next guess is back to a
+        // plain wrong password.
+        let r = s
+            .execute("user.lockout.clear", &json!({"user": "admin"}))
+            .unwrap();
+        assert_eq!(r["cleared"], 1);
+        assert_eq!(
+            login_from(&gate, &mut s, "203.0.113.9", "guess").unwrap_err(),
+            INVALID_LOGIN
+        );
+        login_from(&gate, &mut s, "203.0.113.9", "right-password").unwrap();
+    }
+
+    #[test]
+    fn loopback_alone_never_locks_the_name() {
+        let gate = Gate::new(Limits {
+            lock_after: 2,
+            lock_sources: 1,
+            block_after: 1000,
+            ..quick()
+        });
+        let mut s = lab();
+        for ip in ["127.0.0.1", "127.0.0.2", "::1", "127.0.0.3", "127.0.0.4"] {
+            assert_eq!(
+                login_from(&gate, &mut s, ip, "guess").unwrap_err(),
+                INVALID_LOGIN
+            );
+        }
+        login_from(&gate, &mut s, "127.0.0.1", "right-password").unwrap();
+        assert!(gate.lockouts().is_empty());
+    }
+
     #[test]
     fn brute_force_is_slowed_then_blocked() {
         let gate = Gate::new(quick());
@@ -673,14 +899,14 @@ mod tests {
         assert!(other.is_ok());
         let d = Gate::new(Limits::default());
         assert_eq!(
-            d.attempt(&["ip a".into(), "user b".into()]).unwrap(),
+            d.try_keys(&["ip a".into(), "user b".into()]).unwrap(),
             Duration::ZERO
         );
         for _ in 0..4 {
-            d.attempt(&["ip a".into()]).unwrap();
+            d.try_keys(&["ip a".into()]).unwrap();
         }
         assert_eq!(
-            d.attempt(&["ip a".into()]).unwrap(),
+            d.try_keys(&["ip a".into()]).unwrap(),
             Duration::from_secs(1),
             "5 failures: 2 past the free ones, 250 ms doubled twice"
         );
@@ -692,15 +918,15 @@ mod tests {
     fn a_full_failure_map_keeps_the_user_keys() {
         let d = Gate::new(Limits::default());
         for _ in 0..5 {
-            d.attempt(&["ip 192.0.2.1".into(), "user admin".into()])
+            d.try_keys(&["ip 192.0.2.1".into(), "user admin".into()])
                 .unwrap();
         }
         for n in 0..5000u32 {
-            d.attempt(&[format!("ip 2001:db8:{n:x}::")]).unwrap();
+            d.try_keys(&[format!("ip 2001:db8:{n:x}::")]).unwrap();
         }
         assert!(lock(&d.0.failures).len() <= MAX_TRACKED);
         let wait = d
-            .attempt(&["ip 2001:db8:ffff::".into(), "user admin".into()])
+            .try_keys(&["ip 2001:db8:ffff::".into(), "user admin".into()])
             .unwrap();
         assert!(!wait.is_zero(), "the per-user count was forgotten");
     }
