@@ -20,7 +20,11 @@ history: G4.7c feito (resiliência do cliente DHCP)
 Cliente DHCP, parte 3: o que entrou, como testar (comandos ou cliques) e os números, marcados
 como **medido** ou **estimado**. Pode ter várias linhas e parágrafos.
 
-| G4.7d | Gap nova que este PR descobriu | proto-dhcp | Critério de aceite | 4 h | aberto |
+| G4.7d | Gap nova que este PR descobriu | proto-dhcp | Critério de aceite | 4 h | aberto (depende: CPE real) |
+
+## ideias
+
+- **Título curto**: melhoria que ninguém pediu, de onde veio (fonte) e por que ajudaria.
 ```
 
 - **Cabeçalho** (até a primeira linha em branco):
@@ -33,10 +37,16 @@ como **medido** ou **estimado**. Pode ter várias linhas e parágrafos.
 - **Corpo:** o texto da entrada de `docs/log.md`. O fold prefixa `- AAAA-MM-DD — <id>: ` com a
   data do merge.
 - **Linhas de tabela** no corpo (`| G… |`) são gaps novas: entram em `docs/gaps.md` logo depois
-  da linha anterior da mesma fase. O id tem de ser novo; confira na `origin/main`.
-- **`## perf`** (opcional, no fim): tudo depois dessa linha vai para o fim de `docs/perf.md`
+  da linha anterior da mesma fase. O id tem de ser novo; confira na `origin/main`. Gap nova só
+  nos casos de "Gap nova ou feita na hora" do `CLAUDE.md` (G0.34): uma `aberto` com estimativa
+  de até 4 h precisa do motivo na Status (`aberto (depende: …)`), senão o passo `docs` reprova;
+  o pequeno se faz no próprio PR.
+- **`## ideias`** (opcional): itens `- ` (continuação recuada) que vão para o fim de
+  `docs/ideias.md`, sob `### <data> — <id>`. Melhoria que ninguém pediu fica aqui, não vira gap.
+- **`## perf`** (opcional, no fim, antes ou depois de `## ideias`): o texto dessa seção vai para o fim de `docs/perf.md`
   (medições **medidas**, com máquina, build e data). Não edite o `perf.md` à mão: todo PR de
   desempenho acrescentava no fim dele, e PRs paralelos conflitavam.
 
-`cargo xtask docs` confere todos os arquivos (sem gravar). `cargo xtask docs fold [--date
+`cargo xtask docs` confere todos os arquivos (sem gravar). `cargo xtask docs pending` lista o que
+falta consolidar e o saldo (gaps fechadas, criadas e abertas depois). `cargo xtask docs fold [--date
 AAAA-MM-DD]` aplica e apaga.

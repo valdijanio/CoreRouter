@@ -149,10 +149,10 @@ checks_or_stop() {
 }
 
 # Documentos que só o fold escreve. Um conflito neles não é de verdade: vem de uma branch que
-# guardou um fold de uma rodada anterior da fila (que parou no meio). Log, histórico e perf só
-# recebem acréscimos: ficam as entradas dos dois lados. No gaps.md, uma linha de gap que mudou
-# dos dois lados fica uma só (a do PR, a mais nova).
-FOLD_DOCS="docs/log.md docs/gaps-history.md docs/perf.md docs/gaps.md"
+# guardou um fold de uma rodada anterior da fila (que parou no meio). Log, histórico, perf e
+# ideias só recebem acréscimos: ficam as entradas dos dois lados. No gaps.md, uma linha de gap
+# que mudou dos dois lados fica uma só (a do PR, a mais nova).
+FOLD_DOCS="docs/log.md docs/gaps-history.md docs/perf.md docs/ideias.md docs/gaps.md"
 
 # `git merge` de $1 (mensagem $2) que resolve sozinho os conflitos só em FOLD_DOCS. 0: limpo ou
 # resolvido; 1: conflito de verdade (merge abortado; arquivos em $conflicts).
@@ -500,14 +500,15 @@ maybe_fold() {
   git -C "$root" worktree remove --force "$wt" 2>/dev/null || true
   git -C "$root" worktree add --quiet --detach "$wt" "origin/$base"
   cd "$wt"
-  cargo xtask docs fold >/dev/null || stop fold "fold falhou na main"
+  # A linha "saldo: …" (G0.34) vai no corpo do PR do fold: gaps fechadas × criadas no período.
+  saldo=$(cargo xtask docs fold 2>&1 >/dev/null | grep '^saldo:') || stop fold "fold falhou na main"
   fb="queue/fold-$(date +%s)"
   git add -A docs
   git commit --quiet -m "docs: consolida docs/changes ($pending arquivos)"
   git push --quiet origin "HEAD:refs/heads/$fb"
   fpr=$(gh pr create --base "$base" --head "$fb" \
     --title "docs: consolida docs/changes ($pending arquivos)" \
-    --body "Fold da fila de entrada (scripts/land.sh)." | grep -o '[0-9]*$')
+    --body "Fold da fila de entrada (scripts/land.sh). $saldo" | grep -o '[0-9]*$')
   checks_or_stop "$fpr" "$(git rev-parse HEAD)"
   # Sem --delete-branch: o GitHub já apaga a branch no merge, e o 404 de apagar de novo fazia o
   # gh sair com erro depois de um merge que deu certo (a fila parou assim em #120).
@@ -516,7 +517,7 @@ maybe_fold() {
     stop "$fpr" "o merge do fold foi recusado"
   fi
   git push --quiet origin --delete "$fb" 2>/dev/null || true
-  say "  fold #$fpr entrou ($pending arquivos)"
+  say "  fold #$fpr entrou ($pending arquivos; $saldo)"
   cd "$root"
   git worktree remove --force "$wt"
 }

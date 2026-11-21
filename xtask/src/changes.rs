@@ -9,6 +9,12 @@
 //!
 //! `docs` (a `cargo xtask ci` step) only checks the files; `docs fold` applies
 //! and deletes them.
+//!
+//! G0.34: a new gap that is still open and small (at most
+//! [`SMALL_GAP_HOURS`]) is refused unless its Status says what it waits for
+//! (`aberto (depende: …)`): work that small is done in the PR that found it.
+//! Ideas nobody asked for go under `## ideias`, folded into `docs/ideias.md`,
+//! outside the gap list.
 
 use std::path::Path;
 
@@ -19,10 +25,13 @@ const GAPS: &str = "docs/gaps.md";
 const LOG: &str = "docs/log.md";
 const HISTORY: &str = "docs/gaps-history.md";
 const PERF: &str = "docs/perf.md";
+const IDEAS: &str = "docs/ideias.md";
+/// A new open gap estimated at this or less needs `depende:` in its Status.
+pub const SMALL_GAP_HOURS: f64 = 4.0;
 /// Upper bound for one change file: a log entry, not a document.
 const MAX_BYTES: usize = 64 * 1024;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Change {
     pub id: String,
     /// New text of the Status column of the `id` row in `docs/gaps.md`.
@@ -33,8 +42,10 @@ pub struct Change {
     pub log: Vec<String>,
     /// New `docs/gaps.md` rows (`| G4.7d | … |`).
     pub rows: Vec<String>,
-    /// Text after a `## perf` line, for the end of `docs/perf.md`.
+    /// Text under a `## perf` line, for the end of `docs/perf.md`.
     pub perf: Vec<String>,
+    /// Text under a `## ideias` line, for the end of `docs/ideias.md`.
+    pub ideas: Vec<String>,
 }
 
 /// `G4.7c` → (4, 7, "c"); `G2` → (2, 0, ""). `None` for anything else.
@@ -61,6 +72,52 @@ fn valid_id(id: &str) -> bool {
             && id
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'))
+}
+
+/// Hours of an estimate cell: `4 h`, `1 d` (8 h), `2–4 h` (the upper
+/// bound), `12 h (**estimado**)`. `None` when it is not a number of hours or
+/// days (`—`, `?`).
+fn estimate_hours(cell: &str) -> Option<f64> {
+    let number = |s: &str| -> Option<(f64, usize)> {
+        let len = s
+            .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == ','))
+            .unwrap_or(s.len());
+        let n = s.get(..len)?.replace(',', ".").parse().ok()?;
+        Some((n, len))
+    };
+    let cell = cell.trim();
+    let (mut n, len) = number(cell)?;
+    let mut rest = cell.get(len..)?.trim_start();
+    if let Some(upper) = rest.strip_prefix(['–', '-']) {
+        let (m, len) = number(upper.trim_start())?;
+        n = m;
+        rest = upper.trim_start().get(len..)?.trim_start();
+    }
+    match rest.chars().next()? {
+        'h' => Some(n),
+        'd' => Some(n * 8.0),
+        _ => None,
+    }
+}
+
+/// G0.34: a new row that is open, estimated at [`SMALL_GAP_HOURS`] or less
+/// and does not say what it waits for. Rows without the Est. and Status
+/// columns (`| G… | … |` in short form) are not judged.
+fn small_open_gap(row: &str) -> Option<String> {
+    let body = row.trim_end().trim_end_matches('|').trim_end();
+    let mut cells = body.rsplitn(3, " | ");
+    let status = cells.next()?.trim();
+    let estimate = cells.next()?.trim();
+    let id = row_id(row)?;
+    if !status.to_lowercase().starts_with("aberto") || status.contains("depende:") {
+        return None;
+    }
+    let hours = estimate_hours(estimate)?;
+    (hours <= SMALL_GAP_HOURS).then(|| {
+        format!(
+            "new gap {id} is open and estimated at {estimate}: a gap of {SMALL_GAP_HOURS} h or less is done in the PR that found it (CLAUDE.md, \"Gap nova ou feita na hora\"); if it cannot be, its Status says why: 'aberto (depende: hardware | root | G… | decisão do usuário | …)'"
+        )
+    })
 }
 
 /// Id of a `docs/gaps.md` table row (`| G1.2 | …`).
@@ -115,18 +172,36 @@ pub fn parse(file: &str, text: &str) -> Result<Change, String> {
     if status.is_some() && gap_key(&id).is_none() {
         return Err(format!("{file}: 'status:' needs a gap id, not '{id}'"));
     }
-    let (mut log, mut rows, mut perf) = (Vec::new(), Vec::new(), Vec::new());
-    let mut in_perf = false;
+    let (mut log, mut rows, mut perf, mut ideas) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    // Where the lines go: the log, then the `## perf` / `## ideias` sections
+    // (each at most once, in any order, up to the end of the file).
+    let (mut section, mut seen_perf, mut seen_ideas) = (None::<bool>, false, false);
     for line in lines {
-        if line.trim() == "## perf" {
-            in_perf = true;
-        } else if in_perf {
-            perf.push(line.trim_end().to_owned());
-        } else if line.starts_with("| G") {
-            row_id(line).ok_or_else(|| format!("{file}: bad gap row: {line:.60}"))?;
-            rows.push(line.to_owned());
-        } else {
-            log.push(line.trim_end().to_owned());
+        match line.trim() {
+            heading @ ("## perf" | "## ideias") => {
+                let is_perf = heading == "## perf";
+                let seen = if is_perf {
+                    &mut seen_perf
+                } else {
+                    &mut seen_ideas
+                };
+                if std::mem::replace(seen, true) {
+                    return Err(format!("{file}: '{heading}' repeated"));
+                }
+                section = Some(is_perf);
+            }
+            _ => match section {
+                Some(true) => perf.push(line.trim_end().to_owned()),
+                Some(false) => ideas.push(line.trim_end().to_owned()),
+                None if line.starts_with("| G") => {
+                    row_id(line).ok_or_else(|| format!("{file}: bad gap row: {line:.60}"))?;
+                    if let Some(e) = small_open_gap(line) {
+                        return Err(format!("{file}: {e}"));
+                    }
+                    rows.push(line.to_owned());
+                }
+                None => log.push(line.trim_end().to_owned()),
+            },
         }
     }
     while log.last().is_some_and(String::is_empty) {
@@ -139,8 +214,20 @@ pub fn parse(file: &str, text: &str) -> Result<Change, String> {
         return Err(format!("{file}: no log text after the header"));
     }
     trim_blank(&mut perf);
-    if in_perf && perf.is_empty() {
+    if seen_perf && perf.is_empty() {
         return Err(format!("{file}: '## perf' without text"));
+    }
+    trim_blank(&mut ideas);
+    if seen_ideas && ideas.is_empty() {
+        return Err(format!("{file}: '## ideias' without text"));
+    }
+    if let Some(bad) = ideas
+        .iter()
+        .find(|l| !(l.is_empty() || l.starts_with("- ") || l.starts_with("  ")))
+    {
+        return Err(format!(
+            "{file}: '## ideias' takes '- ' items (continuation indented): {bad:.60}"
+        ));
     }
     Ok(Change {
         id,
@@ -149,6 +236,7 @@ pub fn parse(file: &str, text: &str) -> Result<Change, String> {
         log,
         rows,
         perf,
+        ideas,
     })
 }
 
@@ -263,6 +351,7 @@ pub struct Docs {
     pub log: String,
     pub history: String,
     pub perf: String,
+    pub ideas: String,
 }
 
 /// Fold the changes, in file name order, into the documents.
@@ -272,6 +361,7 @@ pub fn fold(date: &str, changes: &[Change], docs: &Docs) -> Result<Docs, String>
         mut log,
         mut history,
         mut perf,
+        mut ideas,
     } = docs.clone();
     // Already folded: a branch made from another PR's branch still
     // carries that PR's change file after its squash reached the main
@@ -293,13 +383,55 @@ pub fn fold(date: &str, changes: &[Change], docs: &Docs) -> Result<Docs, String>
         if !c.perf.is_empty() {
             perf = append(&perf, &(c.perf.join("\n") + "\n"), true);
         }
+        if !c.ideas.is_empty() {
+            let block = format!("### {date} — {}\n\n{}\n", c.id, c.ideas.join("\n"));
+            ideas = append(&ideas, &block, true);
+        }
     }
     Ok(Docs {
         gaps,
         log,
         history,
         perf,
+        ideas,
     })
+}
+
+/// Status cell (last column) of a gap row.
+fn status_of(row: &str) -> &str {
+    let body = row.trim_end().trim_end_matches('|').trim_end();
+    body.rsplit_once(" | ").map_or("", |(_, s)| s.trim())
+}
+
+fn is_open(status: &str) -> bool {
+    status.to_lowercase().starts_with("aberto")
+}
+
+/// G0.34: how the gap list moves with these changes: gaps closed (a
+/// `status:` that starts with `feito`), new rows and, of them, the open
+/// ones; `open_now` is the open rows of `gaps` before the fold.
+pub fn balance(changes: &[Change], gaps: &str) -> String {
+    let closed = changes
+        .iter()
+        .filter(|c| {
+            c.status
+                .as_deref()
+                .is_some_and(|s| s.to_lowercase().starts_with("feito"))
+        })
+        .count();
+    let rows: Vec<&String> = changes.iter().flat_map(|c| &c.rows).collect();
+    let opened = rows.iter().filter(|r| is_open(status_of(r))).count();
+    let open_now = gaps
+        .lines()
+        .filter(|l| row_id(l).is_some() && is_open(status_of(l)))
+        .count();
+    let after = (open_now + opened).saturating_sub(closed);
+    let delta = after as i64 - open_now as i64;
+    format!(
+        "saldo: {closed} gap(s) fechada(s), {} nova(s) ({opened} aberta(s), {} já feita(s)); abertas {open_now} → {after} ({delta:+})",
+        rows.len(),
+        rows.len() - opened
+    )
 }
 
 fn read(root: &Path, rel: &str) -> Result<String, String> {
@@ -351,7 +483,9 @@ pub fn check(root: &Path) -> Outcome {
     }
 }
 
-fn dry_fold(root: &Path, date: &str) -> Result<(Vec<String>, Docs), String> {
+/// The change file names, the documents after the fold and the
+/// [`balance`] line.
+fn dry_fold(root: &Path, date: &str) -> Result<(Vec<String>, Docs, String), String> {
     let loaded = load(root)?;
     let (names, changes): (Vec<String>, Vec<Change>) = loaded.into_iter().unzip();
     let docs = Docs {
@@ -359,8 +493,10 @@ fn dry_fold(root: &Path, date: &str) -> Result<(Vec<String>, Docs), String> {
         log: read(root, LOG)?,
         history: read(root, HISTORY)?,
         perf: read(root, PERF)?,
+        ideas: read(root, IDEAS)?,
     };
-    Ok((names, fold(date, &changes, &docs)?))
+    let line = balance(&changes, &docs.gaps);
+    Ok((names, fold(date, &changes, &docs)?, line))
 }
 
 /// `cargo xtask docs pending`: what the change files not folded yet say. The
@@ -376,6 +512,11 @@ fn pending(root: &Path) -> Outcome {
         return Outcome::Ok;
     }
     println!("{} change file(s) not folded yet ({DIR}):", loaded.len());
+    let changes: Vec<Change> = loaded.iter().map(|(_, c)| c.clone()).collect();
+    match read(root, GAPS) {
+        Ok(gaps) => println!("{}", balance(&changes, &gaps)),
+        Err(e) => return Outcome::Fail(e),
+    }
     for (name, c) in &loaded {
         let first = c.log.first().map_or("", String::as_str);
         println!("- {name}: {}", first.chars().take(100).collect::<String>());
@@ -402,7 +543,7 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
             );
         }
     };
-    let (names, docs) = match dry_fold(root, &date) {
+    let (names, docs, line) = match dry_fold(root, &date) {
         Ok(v) => v,
         Err(e) => return Outcome::Fail(e),
     };
@@ -417,6 +558,7 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
         .and_then(|()| write(LOG, &docs.log))
         .and_then(|()| write(HISTORY, &docs.history))
         .and_then(|()| write(PERF, &docs.perf))
+        .and_then(|()| write(IDEAS, &docs.ideas))
         .and_then(|()| {
             names.iter().try_for_each(|n| {
                 std::fs::remove_file(root.join(DIR).join(n)).map_err(|e| format!("{DIR}/{n}: {e}"))
@@ -425,6 +567,7 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
     match result {
         Ok(()) => {
             eprintln!("folded {}: {}", names.len(), names.join(", "));
+            eprintln!("{line}");
             Outcome::Ok
         }
         Err(e) => Outcome::Fail(e),
@@ -509,6 +652,7 @@ mod tests {
             log: log.into(),
             history: history.into(),
             perf: "# perf\n".into(),
+            ideas: "# ideias\n".into(),
         }
     }
 
@@ -543,5 +687,72 @@ mod tests {
     #[test]
     fn empty_perf_section_is_an_error() {
         assert!(parse("G4.7b.md", "id: G4.7b\n\nx\n## perf\n\n").is_err());
+    }
+
+    #[test]
+    fn estimates_read_hours_and_days() {
+        assert_eq!(estimate_hours("4 h"), Some(4.0));
+        assert_eq!(estimate_hours("12 h (**estimado**)"), Some(12.0));
+        assert_eq!(estimate_hours("1 d"), Some(8.0));
+        assert_eq!(estimate_hours("2–4 h"), Some(4.0));
+        assert_eq!(estimate_hours("1,5 h"), Some(1.5));
+        assert_eq!(estimate_hours("—"), None);
+        assert_eq!(estimate_hours("Resiliência"), None);
+    }
+
+    /// G0.34: a small open gap is done in the PR that found it, or says
+    /// what it waits for.
+    #[test]
+    fn a_small_open_gap_needs_a_reason() {
+        let file = |row: &str| format!("id: G4.7b\n\nEntrou.\n\n{row}\n");
+        let small = "| G4.7c | Resto | engine | Critério | 3 h | aberto |";
+        let err = parse("G4.7b.md", &file(small)).unwrap_err();
+        assert!(err.contains("G4.7c") && err.contains("depende:"), "{err}");
+        for ok in [
+            "| G4.7c | Resto | engine | Critério | 3 h | aberto (depende: root na VM) |",
+            "| G4.7c | Resto | engine | Critério | 3 h | feito: entrou neste PR |",
+            "| G4.7c | Maior | engine | Critério | 6 h | aberto |",
+            "| G4.7c | Maior | engine | Critério | 1 d | aberto |",
+            "| G4.7c | Sem estimativa | engine | Critério | — | aberto |",
+            "| G4.7c | Resiliência | aberto |",
+        ] {
+            assert!(parse("G4.7b.md", &file(ok)).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn ideas_fold_into_their_own_document() {
+        let c = change(
+            "id: G4.7b\n\nEntrou.\n\n## ideias\n\n- **Uma ideia**: como o Junos faz.\n  Mais texto.\n\n## perf\n\n| codec | 1 µs |\n",
+        );
+        assert_eq!(c.log, ["Entrou."]);
+        assert_eq!(
+            c.ideas,
+            ["- **Uma ideia**: como o Junos faz.", "  Mais texto."]
+        );
+        assert_eq!(c.perf, ["| codec | 1 µs |"]);
+        let out = fold("2026-11-21", &[c], &docs("# log\n", "# h\n")).unwrap();
+        assert_eq!(
+            out.ideas,
+            "# ideias\n\n### 2026-11-21 — G4.7b\n\n- **Uma ideia**: como o Junos faz.\n  Mais texto.\n"
+        );
+        for bad in [
+            "id: G4.7b\n\nx\n## ideias\n\n",
+            "id: G4.7b\n\nx\n## ideias\n- a\n## ideias\n- b\n",
+            "id: G4.7b\n\nx\n## ideias\nsolta\n",
+        ] {
+            assert!(parse("G4.7b.md", bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn balance_counts_closed_and_new_gaps() {
+        let a = change(
+            "id: G4.7b\nstatus: feito (`x`)\n\nEntrou.\n\n| G4.7c | Resto | e | c | 6 h | aberto |\n| G4.7d | Feita | e | c | 1 h | feito |\n",
+        );
+        assert_eq!(
+            balance(&[a], GAPS_MD),
+            "saldo: 1 gap(s) fechada(s), 2 nova(s) (1 aberta(s), 1 já feita(s)); abertas 2 → 2 (+0)"
+        );
     }
 }
