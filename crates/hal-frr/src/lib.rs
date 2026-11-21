@@ -22,6 +22,7 @@ pub mod conf;
 pub mod fast_reroute;
 pub mod ldp;
 pub mod loose;
+pub mod mgmt_guard;
 pub mod on_demand;
 pub mod ospf;
 pub mod render;
@@ -549,6 +550,25 @@ impl Frr {
 
     /// G3.9c: the stub router state of `cfg`'s instances (main VRF), one
     /// `show … json` each.
+    /// G3.4z: zebra's routes inside `net` (`show ip route <net>
+    /// longer-prefixes json`).
+    pub fn rib_inside(
+        &self,
+        net: ipnet::IpNet,
+    ) -> Result<Vec<corerouter_model::mgmt_guard::RibRoute>, HalError> {
+        let cmd = mgmt_guard::rib_command(&net);
+        let r = self.with_vty(Daemon::Zebra, |vty| {
+            vty.run(&cmd).map_err(|e| io_err(Daemon::Zebra, e))
+        })?;
+        if !r.ok() {
+            return Err(HalError::Rejected(format!(
+                "FRR zebra: {}",
+                r.text(MAX_ERROR)
+            )));
+        }
+        mgmt_guard::parse_rib(&r.output).map_err(HalError::Rejected)
+    }
+
     pub fn ospf_stub_state(
         &self,
         cfg: &Config,
@@ -1151,6 +1171,13 @@ impl RoutingReader for FrrReader {
         HalError,
     > {
         self.0.ospf_state(cfg)
+    }
+
+    fn rib_inside(
+        &mut self,
+        net: ipnet::IpNet,
+    ) -> Result<Vec<corerouter_model::mgmt_guard::RibRoute>, HalError> {
+        self.0.rib_inside(net)
     }
 
     fn ospf_stub_state(

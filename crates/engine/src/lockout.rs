@@ -388,6 +388,10 @@ impl Session {
         if let Some(why) = service_cut(&before.system.web.www_ssl, &after.system.web.www_ssl, &link) {
             return Some(why);
         }
+        // G3.4z: the guard that keeps a learned route off this session.
+        if let Some(why) = crate::mgmt_guard::unguard_cut(self, before, after, &link) {
+            return Some(format!("{why}. {HOW_TO_PROCEED}"));
+        }
         let local = plain(link.local.ip());
         let (iface_before, iface_after) =
             (local_interface(before, local), local_interface(after, local));

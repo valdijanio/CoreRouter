@@ -1135,6 +1135,7 @@ impl CoreRouterUi {
             self.live_warning(ui);
             self.no_password_warning(ui);
             self.boot_apply_warning(ui);
+            self.mgmt_route_warning(ui);
             // Nothing heard from the router yet: no empty fields.
             if !known {
                 return;

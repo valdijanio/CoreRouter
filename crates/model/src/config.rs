@@ -472,6 +472,9 @@ pub struct Routing {
     /// Next id handed out to a rule (never reused, like RouterOS).
     #[serde(skip_serializing_if = "is_zero")]
     pub next_rule_id: u32,
+    /// `/routing management-guard` (G3.4z, `crate::mgmt_guard`).
+    #[serde(skip_serializing_if = "crate::mgmt_guard::ManagementGuard::is_empty")]
+    pub management_guard: crate::mgmt_guard::ManagementGuard,
 }
 
 fn is_zero(v: &u32) -> bool {

@@ -184,6 +184,13 @@ fn run(session: &Shared, mut reader: Box<dyn RoutingReader>, synced: bool, healt
             let old = s.set_routing_status(sample);
             (s.bgp_routes_wanted(), s.ospf_db_wanted(), old)
         };
+        // G3.4z: the RIB inside the guarded networks a window asked for
+        // (a handful of routes each), read here and handed back.
+        let rib_wanted = lock(session).mgmt_guard_rib_wanted();
+        for net in rib_wanted {
+            let got = reader.rib_inside(net).map_err(|e| e.to_string());
+            lock(session).mgmt_guard_set_rib(net, got);
+        }
         // Freed out of the lock (G3.4n).
         drop(old);
         // G3.4b: the OSPF databases a window asked for, streamed here
