@@ -13664,3 +13664,251 @@ continuação indentadas).
   segurava a VM havia 919 s (**medido**).
 
   Registra a G0.26c: uma segunda VM de laboratório para testes de funcionamento.
+
+- 2026-11-21 — G0.15c: Glifos que a fonte padrão da GUI não tem (aparecem como um quadrado) saíram dos textos da
+  `crates/ui`. O teste `tests/glyphs.rs` (`catalogs_use_only_glyphs_the_font_has`) deixou de usar uma
+  lista fixa: pergunta às próprias fontes do egui 0.37 (`Fonts::has_glyph`, família proporcional;
+  ícones do Phosphor na família deles) por cada literal de texto e de caractere da `crates/ui/src`
+  fora dos testes (os catálogos `i18n` inclusive, os `auto/` que o teste antigo não via) e pelas
+  tabelas de texto do engine que a GUI traduz. Um lexer pequeno ignora comentários e itens
+  `#[cfg(test)]` e lê strings cruas e escapes `\u{…}`.
+
+  Sonda da fonte (**medido**, egui 0.37, `Ubuntu-Light` + fallbacks): faltam →, ⇒, ←, ↑, ↓, ↳ (só
+  o Hack, monoespaçado, tem), ⚠, ✓, ✔, ✗, ▸, ▾, ▶, ◀, ⏯, ⏭, ⏮, ⓘ, ℹ, ●, ★; existem › » ‹ • · … – —
+  × ± ≥ ≤ ° µ. O teste confere que os cinco do G0.15c continuam faltando (se a fonte mudar, o
+  comentário é atualizado).
+
+  Trocas (19 arquivos):
+  - sequência e caminho de menu: "›" (PADI › PADR › LCP, Graphs › Settings, Queues › Queue Types,
+    o histórico de MAC do ARP);
+  - resultado e mapeamento: "->" (System › Log: `comando {params} -> resultado`, a linha CGNAT da
+    Identity) ou ":" na prosa (8 s: 6 s a 2M; o nosso: ibgp);
+  - ⚠: o selo âmbar "warning" com o texto ao lado, como os modais de Certificates e IP Calculator
+    (Analytics › Settings, alertas do SFP na aba Ethernet, que ganha "alarm" vermelho); a aba
+    "SFP ⚠" virou "SFP !" na mesma cor;
+  - ◀/▶ da paginação do ARP: ‹ e ›; o ✓ e ⏯ ⏭ ⏮ das explicações: o nome do botão (**Enable**,
+    **Play/Pause**, **Step**, **Restart**);
+  - o ⓘ já era desenhado (`help::info_button`), sem glifo.
+
+  Como testar: `cargo test -p corerouter-ui glyphs`; na GUI, System › Log depois de um comando e o ⓘ
+  de PPP › Why.
+
+- 2026-11-21 — G0.30l: `netns_ha_bfd::bfd_takes_over_in_a_fraction_of_the_dead_interval` falhava e passava ao repetir na
+  fila (2026-11-13 duas vezes, 2026-11-20): B assumia, mas por `detected_by: "dead-interval"`
+  (`detected_ms` 1 208) em vez de BFD. Causa reproduzida: quando a máquina deixa um daemon sem CPU
+  por mais que os 150 ms de detecção, o BFD de B expira nos dois caminhos e logo chega um hello de
+  A (alarme falso). Cada perda e cada alarme falso somam 1 000 de penalidade; com duas, a penalidade
+  passa do `suppress` 2 500 e os dois caminhos de B ficam amortecidos por ~26 s (RFC 5882 §3.2,
+  meia-vida 15 s até o `reuse` 800). Nesse tempo o BFD está `up`, mas a máquina de papéis ignora
+  as perdas dele, e quem decide é o intervalo morto: o produto faz o certo. O teste esperava só
+  `up` e `detect_ms` 150 antes da tomada, e o checklist da tomada em A olha o amortecimento de A,
+  não o de B (gap G3.6p abaixo).
+
+  - O `steady_bfd` do teste espera os caminhos dos dois nós saírem do amortecimento (no máximo o
+    `max_suppress` de 120 s, o teto da RFC 2439) e um segundo inteiro de BFD `up`, rápido e não
+    amortecido. Nenhum prazo ficou maior: a espera nova é por uma condição real e só acontece
+    quando houve amortecimento (~26 s, **medido**).
+
+  Reprodução forçada, sem root, no namespace do teste: duas vezes, o nftables de B descarta por
+  250 ms o BFD que chega e o ping da testemunha (perda + alarme falso, sem tomada). Antes: 5 de 5
+  falham com `dead-interval`, como no CI. Depois: 4 de 4 passam, esperando ~26 s pelo `reuse`
+  (**medido**, 2026-11-21); numa 5ª rodada a sonda provocou uma tomada real (a testemunha
+  respondeu antes do descarte) e a rodada não conta. Sem sonda, 10 de 10 passam em 2 CPUs com
+  carga antes (a taxa natural é baixa: 3 vezes em ~80 lotes da fila); depois, 8 de 8 passam e em
+  2 delas a espera nova pegou um caminho de verdade amortecido (0,13 s e 1,35 s até o `reuse`),
+  justamente o caso que antes saía pelo intervalo morto.
+
+- 2026-11-21 — G0.30q: `netns_v6_sample::the_sample_answers_the_ipv6_reads_like_the_kernel` (do G1.3i, #718) falhava na
+  fila: "failed, then passed alone" no run 44876629761 e duas vezes seguidas no run 44877846410,
+  que tirou o #713 de um lote. Reproduzido neste host: 23/30 falhas com o teste preso em 2 CPUs
+  (**medido**). Eram duas corridas entre o retrato do relógio, lido na hora, e a leitura direta do
+  kernel, feita logo depois. As duas estavam no teste, não no produto:
+
+  - **DAD:** os endereços do teste ainda estavam em DAD (RFC 4862 §5.4, ~1 s). O retrato os via
+    `tentative` e o kernel, um instante depois, já não (a saída do CI mostra `tentative=true`
+    contra `false`). Os endereços agora entram com `nodad`; o teste compara as duas leituras, não
+    o DAD.
+  - **Prazos:** o teste descontava o mesmo segundo de todos os prazos de uma vez, mas o kernel vira
+    cada um no seu momento (o do endereço conta do `tstamp` dele; o da rota, dos jiffies). Assim a
+    rota lia 1800 contra 1799, e os endereços 3600 contra 3600, e nenhum desconto único servia.
+    A comparação agora é item a item, e cada prazo pode estar igual ou até 1 s menor.
+
+  Depois: 0/60 rodadas com 2 CPUs e 0/60 sem limite (**medido**, `unshare --user --map-root-user
+  --net`, build de dev). Como testar: `cargo xtask netns`.
+
+- 2026-11-21 — G0.31g: Linhas de rota reconstruídas fora do lock do `Session`. Antes, qualquer commit (até o da
+  identidade) invalidava o cache das linhas, porque a chave era a geração da config inteira. A
+  `ip.route.list` ou `ip.route.page` seguinte reconstruía as 60 000 linhas sob o lock: 27,5 ms
+  (**medido**, `lock_hold/held/ip.route.list/after_change`).
+
+  - **Chave por seção:** o cache guarda a config de que as linhas saíram e compara com a nova por
+    `sections::changed` (por ponteiro, O(seções pequenas)). As linhas ficam se nada de
+    `route_table::ROUTE_READS` mudou: interfaces, endereços, rotas, e o resto de `ip` e o `ipv6`
+    (os clientes DHCP/DHCPv6 da config efetiva). O teste
+    `the_route_lines_read_only_what_they_declare` (o mesmo corpus e o mesmo `restrict` dos
+    validadores da G0.22) reprova uma seção lida e não declarada.
+  - **Montagem fora do lock:** com o cache velho, `Session::routes` pega só as entradas (a config
+    compartilhada, o estado vivo, um instantâneo do watch) e devolve um `RouteJob`.
+    - `RouteJob::run` monta as linhas, conta o resumo e faz o olhar do watch de rotas (estados e
+      transições) sem a sessão, depois publica tudo num slot.
+    - A leitura seguinte adota a montagem: troca os ponteiros e grava as transições, em
+      O(transições).
+    - Se outro olhar mudou os estados no meio, o watch olha de novo sob o lock, com o instante em
+      que as linhas foram pedidas. A coluna Changed não muda de sentido.
+  - **Quem monta:**
+    - a resposta deferida da `ip.route.list` (stream) e da `ip.route.page`, que passa a montar a
+      página inteira depois do lock;
+    - o relógio (`control::clock`), antes do tick, quando o olhar de rotas dele vai rodar
+      (`Session::route_job`).
+  - **Liberação fora do lock:** a tabela substituída (linhas e mapa de estados: ~4 ms de `free`
+    com 60 000 rotas, **medido** com `perf`) vai para uma lixeira que a resposta e o relógio
+    esvaziam depois de soltar o lock (`Session::route_garbage`). No máximo 8 itens para quem
+    nunca esvazia (a GUI no navegador).
+  - **Lista grande (G0.31h):** com linhas prontas, o "busy" continua vindo na hora do pedido. Com
+    linhas a montar, a conta é feita depois de montar, antes do primeiro byte (`Streamed::prepare`,
+    novo): o "busy" vira o erro da resposta, e uma lista filtrada pequena não é recusada por
+    engano.
+
+  Como testar:
+  - `cargo test -p corerouter-engine --test it route_lines_offlock`;
+  - `cargo test -p corerouter-engine --test it the_route_lines_read_only_what_they_declare`;
+  - `cargo test -p corerouter-engine --test it off_lock`;
+  - `cargo test -p corerouter-engine a_look_made_off_the_lock`;
+  - `LOCK_HOLD_SWEEP=0 cargo bench -p corerouter-engine --bench lock_hold -- after_`.
+
+- 2026-11-21 — G1.24: As listagens do engine passam a dizer, em cada linha, o que o operador pode fazer com ela:
+  `removable`, `editable` e `fixed_reason`, o motivo em texto quando um dos dois é falso
+  (`crates/engine/src/row_rules.rs`). A GUI só mostra esse motivo, sem deduzir nada:
+  - **interface.list:** porta física e rádio Wi-Fi não se removem (`kept`); um link que o CoreRouter
+    não gerencia não se muda. A regra é a mesma função que o `interface.remove` usa para recusar.
+    A GUI decidia por `type == "ether"` e errava: deixava tentar remover um rádio Wi-Fi e bloqueava
+    uma porta não gerenciada que o engine aceita remover;
+  - **ip.address.list:** endereço dinâmico fica `fixed`, com o motivo pela origem: cliente DHCP,
+    DHCPv6 ou RA, com a interface;
+  - **ip.firewall.\<tabela\>.list:** regra da matriz de zonas fica `fixed` (o mesmo texto que o
+    `set`/`remove` devolvem);
+  - **ip.firewall.address-list.list:** entrada dinâmica pode ser removida, mas não mudada.
+
+  Na GUI, saíram `can_remove` por tipo (Interfaces), `not_zone` e a regra de entrada dinâmica do
+  `can_toggle` (Firewall) e o texto fixo de endereço dinâmico (Addresses). O `list::Item` ganhou
+  `no_edit`/`no_remove`, lidos por `list::RowRules::of`. O `can_enable` do DHCP client e do DHCPv6
+  virou o `list::toggle_rule` comum. O `print` do terminal esconde os três campos.
+
+  Achado e corrigido no caminho: o atalho Delete do Firewall ignorava a regra (precedência de
+  `&&`/`||`) e mandava ao engine o remove de uma regra de zona.
+
+  Testes de contrato:
+  - `crates/engine/tests/it/row_rules.rs`: em cada linha das quatro listas, `remove` e `set`
+    aceitam exatamente quando a linha diz;
+  - `crates/ui/src/tests/row_rules.rs`: as linhas reais do engine passam pelas funções da GUI, e o
+    cinza traz o motivo do engine;
+  - `dhcp_client.rs`: o endereço dinâmico de um lease do laboratório.
+
+  Como testar: `cargo test -p corerouter-engine --test it row_rules`, `cargo test -p corerouter-ui
+  row_rules`. Na GUI, Interfaces › ether1 › passe o mouse no "−"; Firewall com a matriz de zonas ›
+  selecione uma regra Z › "−".
+
+- 2026-11-21 — G1.5d: A janela da rota mostra os `warnings` que `ip.route.add`/`set` devolvem (G1.5b: rota
+  blackhole/unreachable/prohibit sobre uma rede conectada, ou que derruba a própria conexão), em vez
+  de descartá-los. Eles ficam no rodapé do modal, acima da linha de erro, cada um com o selo âmbar
+  `warning`, como Certificates e IP Calculator. O mockup do G1.5a previa um ⚠, mas a fonte da GUI não
+  tem esse glifo (G0.15c).
+
+  - O `dialog::Status` comum ganhou `warnings`, `replied_warned` e `warn`, e qualquer modal que use
+    `dialog::show` pode adotá-los. O padrão está no `docs/ui-style.md` ("Aviso da resposta").
+  - **Route <dst>:** OK, Apply e Enable que avisam mantêm a janela aberta com o aviso. OK de novo, sem
+    mudança, fecha. Disable limpa o aviso, porque uma rota de descarte desativada não descarta nada.
+  - **New Route:** um OK que avisa fecha o "New Route" e abre a janela da rota criada já com o aviso
+    (o mesmo caminho do Apply). Assim, um segundo OK não cria outra rota.
+  - **Comment:** não mostra aviso, porque o comentário não muda o que o aviso diz.
+
+  Como testar: `cargo test -p corerouter-ui route_warnings`. Na GUI (virtual lab), ponha
+  10.9.0.1/24 no ether2 e crie em IP › Routes, com "+", a rota 10.9.0.0/25 do tipo blackhole: a janela
+  "Route <10.9.0.0/25>" abre com o aviso, e OK fecha.
+
+- 2026-11-21 — G1.6qj: Mortes por OOM datadas pelo kmsg (G1.6qj). `corerouter_hal::oslog::oom_kill` lê a linha que o
+  kernel escreve em `__oom_kill_process` (`mm/oom_kill.c`): `Out of memory`, `Memory cgroup out of
+  memory` ou `Out of memory (oom_kill_allocating_task)`, pid, nome (até a última `) total-vm:`, que
+  pode ter espaços e parênteses), `anon-rss` e `oom_score_adj` (os dois e o `UID`/`pgtables`
+  opcionais: antes do Linux 5.4 não vinham). O OS Log guarda as 64 mais novas (`OsLogBook::oom_kills`,
+  antes de juntar as repetidas, sem contar duas vezes a cópia do journal). A checagem "OOM kills"
+  conta as da última hora pela hora da linha (a do boot mais o carimbo do kmsg) e usa o maior entre
+  isso e o que o `/proc/vmstat` já contava. Assim o daemon reiniciado depois de morto numa máquina
+  ligada há dias não diz mais "ok", e o motivo diz quem morreu: "corerouter-daemon, o próprio daemon
+  (o init o reiniciou) (pid 812, há 12 min, 410 MiB)", "bgpd, do FRR (…)". Sem relógio, só o
+  `/proc/vmstat`, como antes. Parser com proptest. O `frr-test` confere, depois do OOM provocado
+  da G1.6zz, que a saúde cita o `tail`.
+
+- 2026-11-21 — G1.6qm: A chave de desenvolvimento que assina os `.crpkg` saiu de `<out>/keys/` e foi para
+  `~/.config/corerouter/dev-image-key/` (`$XDG_CONFIG_HOME` se definido; `$COREROUTER_DEV_KEY_DIR`
+  muda a pasta). Agora é **uma chave por usuário**, a mesma para todo checkout e toda pasta de build.
+
+  O motivo foi uma perda real. Na limpeza de disco de 2026-11-21, os `os-out` antigos e a
+  `os/out.old` foram apagados com OK do usuário, e a chave `df0376340ceee539` foi junto. O notebook
+  de teste só confia nela, e passou a recusar todo pacote novo ("signed by key f6f0068927b70faa,
+  which this image does not trust", **medido**). Ele só volta a atualizar pela rede depois que o
+  disco for regravado com uma imagem da chave nova. Além disso, cada worktree gerava a própria
+  chave: o pacote de uma sessão não atualizava o roteador que outra tinha instalado.
+
+  - `out::dev_keys` decide a pasta. Se a pasta compartilhada ainda não tem chave, o primeiro build
+    copia para lá a do `<out>/keys/` dele (ou do `os/out/keys/` antigo do checkout), por uma pasta
+    temporária renomeada no lugar: dois builds ao mesmo tempo terminam com uma cópia inteira. O
+    original fica onde estava.
+  - Uma pasta de build com outra chave ganha um aviso a cada build, porque os roteadores
+    atualizados por ela recusam a chave compartilhada.
+  - Saiu a guarda do `out.rs` que parava o build com `$COREROUTER_OS_OUT` sem chave enquanto o
+    `os/out` tinha uma: com a chave fora da pasta de build, o caso não existe mais.
+  - `--key <pkcs8>` e `$COREROUTER_IMAGE_KEY` continuam passando por cima.
+  - Docs: `os-image.md` ("A chave", que agora pede backup da pasta), `release.md` e
+    `producao-core.md`.
+
+  Como testar: `cargo test -p xtask os::out`. De ponta a ponta,
+  `COREROUTER_OS_OUT=<out com chave> cargo xtask os package --out /tmp/t.crpkg` imprime
+  "development signing key … moved to ~/.config/corerouter/dev-image-key" na primeira vez e nada
+  na segunda; o pacote sai assinado pela chave migrada (conferido com a `f6f0068927b70faa`).
+
+- 2026-11-21 — G1.6zz: `oom_score_adj` do plano de controle (G1.6zz). O `corerouter-init` grava o valor de cada processo
+  logo depois de lançá-lo (`/proc/<pid>/oom_score_adj`): `corerouter-daemon` −900, `zebra` e `mgmtd`
+  −700, `bfdd` −600, `staticd`, `ospfd`, `ospf6d` e `ldpd` −300, `bgpd` 0
+  (`plan::DAEMON_OOM_SCORE_ADJ`, `plan::frr_oom_score_adj`). O kernel soma `adj × memória / 1000`
+  aos pontos (`oom_badness`, `mm/oom_kill.c`): −900 tira 90 % da memória da conta do daemon. Nada
+  em −1000 (um daemon que vaza ainda pode ser morto e o init o reinicia; sem ninguém matável o
+  kernel entra em pânico). O valor passa aos filhos no `fork` (`kernel/fork.c`): o hal-linux devolve
+  a 0 o `wpa_supplicant` e o `hostapd` que o daemon lança e que ficam rodando; os auxiliares curtos
+  (`nft`, `journalctl`, `iperf3`) herdam −900 e terminam logo. O `frr-test` confere os valores no r2
+  e provoca um OOM (`tail /dev/zero`, que guarda a "linha" inteira): morre o `tail`, os PIDs do
+  daemon e do FRR não mudam e a adjacência OSPF volta sozinha. **Medido** no QEMU (1 GiB, sem
+  swap), duas rodadas: numa o `tail` morreu em 1,0 s; na outra o kernel se arrastou tirando o cache
+  das páginas, o OSPF (dead 4 s) caiu e o serviço BFD ficou 54 s sem heartbeat antes do OOM killer
+  agir; daí a gap nova abaixo. FRR, VyOS e SONiC não ajustam nada (o SONiC
+  reinicia a máquina num OOM, `vm.panic_on_oom=2`).
+
+- 2026-11-21 — G3.6n: BFD sobrevive ao `corerouter-daemon` (G3.6n). Três defeitos do `bfdd` 10.7.1 achados no fonte e
+  no log (`BFD_DEBUG=1`):
+  1. quando o plano de dados (o motor do daemon) cai, o software para onde o `bfdd` devolve as
+     sessões não ouve (`bfd_vrf_start_sockets` não abre os sockets com `--dplaneaddr`);
+  2. esse software usa os tempos lentos (1 s) e transmite tarde demais para o vizinho;
+  3. na volta, ele avisa os clientes de um Down (`bfd_session_disable` → `path-down`) e entrega a
+     sessão sem estado.
+
+  `os/patches/frr/0008-bfdd-dplane-software-fallback.patch` corrige os três (texto pronto para o
+  FRR). Na volta, a sessão Up vai com a flag nova `SESSION_RESUME`. O motor espera ouvir o vizinho
+  (`Session::resume`, metade da detecção dele); se o pacote diz Up com o nosso discriminador, a
+  sessão continua Up (RFC 5880 §6.8.1/§6.8.6). Senão, informa Up → Down e começa do jeito normal.
+  As sessões que o `bfdd` entrega enquanto ainda segura a porta 3784 esperam e são tentadas de
+  novo a cada 20 ms.
+
+  **Medido** no laboratório do host (`scripts/bgp-crcr-userns.sh cbit`, BFD 100 ms × 3, eBGP com
+  GR, ping a cada 20 ms), `kill -9` só do daemon:
+  - antes, a rota do CR1 saía do CR2 em 476 ms e se perdiam 162 de 389 pings;
+  - depois, com o `bfdd` da imagem (`BFDD_BIN`), a rota fica, o BGP e o BFD continuam no ar e se
+    perdem 0 de 557 pings;
+  - com só o primeiro e o segundo defeito corrigidos, eram 53 de 556.
+
+  Testes:
+  - `a_resumed_session_takes_over_without_a_down_on_the_peer` e
+    `a_resume_without_proof_starts_the_normal_way` (proto-bfd);
+  - `a_restarted_engine_resumes_the_session_without_a_down_on_the_peer` (daemon; sem a retomada,
+    o vizinho vê Up → Down → Up);
+  - o `cbit` exige a rota mantida quando roda com `BFDD_BIN`;
+  - o `frr-test` mata o daemon do r1 e confere que a sessão do r2 não muda.
