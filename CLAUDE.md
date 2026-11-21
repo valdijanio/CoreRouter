@@ -425,6 +425,19 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
   rodada pelo usuário (abaixo) e o runner do CI ficam como alternativas. Sessões usam só
   `vm-lab run`, sem embrulhar em `flock vm/root.lock`. VM travada (espera > 15 min):
   `cargo xtask vm-lab unlock`; regras em `docs/vm-lab.md`.
+- **A VM é uma só: ocupe-a pouco** (pedido do usuário, 2026-11-20). Uma rodada segura a VM
+  inteira e as outras sessões esperam (na rodada da fase C, a G3.4z esperou a do DNS, que já
+  segurava a VM havia 919 s, **medido**). Por isso:
+  - conferir se funciona: primeiro no host, sem root (`unshare --user --map-root-user --net`,
+    os `netns_*`, `dns-stress-lab.sh --userns`); a VM só para o que precisa de root de verdade,
+    de placa ou do número de desempenho;
+  - ajustar e repetir na VM: bateria curta, só os testes da área e duração curta (ex.:
+    `dns-stress-lab.sh --tests ops --duration 5`);
+  - a bateria inteira, com a duração padrão, uma vez só, no fim, para o antes e depois do PR;
+  - compilar dentro da VM com `vm-lab run --shared -- cargo build …` (não pega a vez
+    exclusiva) e só depois a rodada exclusiva; `--no-sync` quando nada mudou.
+
+  A segunda VM, para testes de funcionamento, é a G0.26c.
 - **Sem a VM: rodada local pelo usuário.** É o caminho
   rápido (segundos, contra ~15 min de um `workflow_dispatch` no runner do CI, **medido** em
   2026-10-24). A sessão entrega ao usuário, pela sessão principal, o comando completo na pasta
