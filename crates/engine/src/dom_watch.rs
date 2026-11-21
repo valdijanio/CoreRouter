@@ -4,14 +4,21 @@
 //! going in and out of a cage are logged too.
 //!
 //! The readings come from every `interface.ethernet.monitor` and from a
-//! scan of the Ethernet ports every [`SCAN_SECS`] on [`Session::tick`], so
-//! an alert is logged even with no window open. Operational state: never
-//! saved.
+//! scan of the Ethernet ports every [`SCAN_SECS`], so an alert is logged
+//! even with no window open. Operational state: never saved.
+//!
+//! The scan (G1.22): a module read is up to four kernel requests, and a
+//! driver stuck on its I²C bus answers after seconds. When the hal has a
+//! [`ModuleReader`] (Linux), a thread of the app takes a [`ModuleScan`]
+//! under the lock ([`Session::module_scan`]: the ports and the reader),
+//! reads with the lock released and hands the readings back
+//! ([`Session::module_scan_feed`]); the tick then reads nothing. A hal
+//! without one (the virtual lab, cheap) is read by [`Session::tick`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use corerouter_hal::HalError;
-use corerouter_hal::sff::{Level, SfpModule};
+use corerouter_hal::sff::{Level, ModuleReader, SfpModule};
 use corerouter_model::{IfName, InterfaceKind};
 
 use crate::Session;
@@ -20,6 +27,10 @@ use crate::Session;
 pub const SCAN_SECS: u64 = 30;
 /// Ports scanned at most per tick (bounded work under the session lock).
 const MAX_SCAN: usize = 64;
+/// Ports one [`ModuleScan`] reads at most: off the lock there is no reason
+/// to leave the ports of a big chassis out, but a config with thousands of
+/// "Ethernet" ports must not make a scan endless.
+const MAX_SCAN_OFF_LOCK: usize = 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct PortState {
@@ -133,27 +144,111 @@ impl DomWatch {
     }
 }
 
+/// The ports to read and a reader, taken under the session lock, read
+/// with it released (see the module docs).
+pub struct ModuleScan {
+    reader: Box<dyn ModuleReader>,
+    ports: Vec<IfName>,
+}
+
+impl std::fmt::Debug for ModuleScan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModuleScan")
+            .field("ports", &self.ports)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ModuleScan {
+    pub fn ports(&self) -> &[IfName] {
+        &self.ports
+    }
+
+    /// Read every port, one after the other; `before` runs before each
+    /// (a heartbeat: one read may take seconds).
+    pub fn read(mut self, mut before: impl FnMut(&IfName)) -> ModuleReadings {
+        let mut read = Vec::with_capacity(self.ports.len());
+        for p in self.ports {
+            before(&p);
+            let r = self.reader.read(&p);
+            read.push((p, r));
+        }
+        ModuleReadings { read }
+    }
+}
+
+/// What a [`ModuleScan`] read, for [`Session::module_scan_feed`].
+#[derive(Debug)]
+pub struct ModuleReadings {
+    read: Vec<(IfName, Result<SfpModule, HalError>)>,
+}
+
+impl ModuleReadings {
+    pub fn len(&self) -> usize {
+        self.read.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.read.is_empty()
+    }
+
+    /// Reads that failed (a port without a cage is not a failure).
+    pub fn failed(&self) -> usize {
+        self.read
+            .iter()
+            .filter(|(_, r)| matches!(r, Err(e) if !matches!(e, HalError::Unsupported(_))))
+            .count()
+    }
+}
+
 impl Session {
     /// Read `name`'s module and note it; `Unsupported` means no cage.
     pub(crate) fn read_module(&mut self, name: &IfName) -> Result<SfpModule, HalError> {
         let r = self.hal_mut().sfp_module(name);
+        self.note_module(name, &r);
+        r
+    }
+
+    /// Note a reading of `name`'s module.
+    fn note_module(&mut self, name: &IfName, r: &Result<SfpModule, HalError>) {
         let disabled = self
             .store()
             .running()
             .interfaces
             .get(name)
             .is_some_and(|i| i.disabled);
-        match &r {
+        match r {
             Ok(m) => {
                 self.dom.observe(name, m, disabled);
             }
             Err(HalError::Unsupported(_)) => self.dom.forget(name),
             Err(_) => {}
         }
-        r
     }
 
-    /// Every [`SCAN_SECS`]: read the module of each Ethernet port.
+    /// The Ethernet ports of the running config worth reading (not known
+    /// to have no cage), at most `max`.
+    fn module_ports(&mut self, max: usize) -> Vec<IfName> {
+        let ethernet: BTreeSet<IfName> = self
+            .store()
+            .running()
+            .interfaces
+            .values()
+            .filter(|i| i.kind == InterfaceKind::Ethernet)
+            .map(|i| i.name.clone())
+            .collect();
+        // A port gone from the config is asked again if it comes back.
+        self.dom.no_cage.retain(|n| ethernet.contains(n));
+        ethernet
+            .difference(&self.dom.no_cage)
+            .take(max)
+            .cloned()
+            .collect()
+    }
+
+    /// Every [`SCAN_SECS`]: read the module of each Ethernet port, here
+    /// only when the hal has no [`ModuleReader`] (an app thread reads with
+    /// one, off the lock).
     pub(crate) fn scan_modules(&mut self) {
         let Some(now) = self.now() else {
             return;
@@ -166,23 +261,43 @@ impl Session {
             return;
         }
         self.dom.last_scan = Some(now);
-        let ethernet: BTreeSet<IfName> = self
-            .store()
-            .running()
-            .interfaces
-            .values()
-            .filter(|i| i.kind == InterfaceKind::Ethernet)
-            .map(|i| i.name.clone())
-            .collect();
-        // A port gone from the config is asked again if it comes back.
-        self.dom.no_cage.retain(|n| ethernet.contains(n));
-        let ports: Vec<IfName> = ethernet
-            .difference(&self.dom.no_cage)
-            .take(MAX_SCAN)
-            .cloned()
-            .collect();
-        for p in ports {
+        if self.hal().module_reader().is_some() {
+            return;
+        }
+        for p in self.module_ports(MAX_SCAN) {
             if let Err(HalError::Unsupported(_)) = self.read_module(&p) {
+                self.dom.no_cage.insert(p);
+            }
+        }
+    }
+
+    /// A scan for the caller to read with the session unlocked, then hand
+    /// to [`Session::module_scan_feed`]; `None`: the hal has no module
+    /// reader, the tick reads by itself. The caller paces the scans
+    /// (every [`SCAN_SECS`]).
+    pub fn module_scan(&mut self) -> Option<ModuleScan> {
+        let reader = self.hal().module_reader()?;
+        Some(ModuleScan {
+            reader,
+            ports: self.module_ports(MAX_SCAN_OFF_LOCK),
+        })
+    }
+
+    /// Note what a [`ModuleScan`] read. A port that stopped being an
+    /// Ethernet port of the running config while it was read is skipped.
+    pub fn module_scan_feed(&mut self, readings: ModuleReadings) {
+        for (p, r) in readings.read {
+            let still = self
+                .store()
+                .running()
+                .interfaces
+                .get(&p)
+                .is_some_and(|i| i.kind == InterfaceKind::Ethernet);
+            if !still {
+                continue;
+            }
+            self.note_module(&p, &r);
+            if let Err(HalError::Unsupported(_)) = r {
                 self.dom.no_cage.insert(p);
             }
         }

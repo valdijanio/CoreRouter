@@ -877,7 +877,7 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
             let unguarded: Vec<String> = f
                 .iter()
                 .filter(|f| !f.guarded)
-                .map(|f| crate::mgmt_guard::protect_command(&f.connected))
+                .map(|f| crate::mgmt_guard::protect_command(&f.vrf, &f.connected))
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect();

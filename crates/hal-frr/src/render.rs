@@ -78,6 +78,10 @@ pub const OWNED: Owned = &[
     ("route-map CR-MG-", &[Daemon::Mgmtd]),
     ("ip protocol any route-map CR-MG-", &[Daemon::Mgmtd]),
     ("ipv6 protocol any route-map CR-MG-", &[Daemon::Mgmtd]),
+    // G3.4za: the guard of a VRF's networks, inside zebra's `vrf <name>`
+    // (only its `ip protocol` lines are ours: [`CHILDREN`]; the context
+    // itself is never deleted, `conf::kept_context`).
+    ("vrf ", &[Daemon::Mgmtd]),
     // G3.2b: the `/routing filter` render, all named `CR-` (the operator's
     // own lists and maps are left alone). Only bgpd filters with them.
     ("ip prefix-list CR-", &[Daemon::Bgpd]),
@@ -111,6 +115,14 @@ pub type Owned = &'static [(&'static str, &'static [Daemon])];
 pub const CHILDREN: &[(&str, Daemon, &[&str])] = &[
     ("interface ", Daemon::Ospfd, &["ip ospf ", "no ip ospf "]),
     ("interface ", Daemon::Ospf6d, &["ipv6 ospf6 "]),
+    (
+        "vrf ",
+        Daemon::Mgmtd,
+        &[
+            "ip protocol any route-map CR-MG-",
+            "ipv6 protocol any route-map CR-MG-",
+        ],
+    ),
 ];
 
 /// `n` as daemon `d` owns it: the children [`CHILDREN`] gives `d` (all of

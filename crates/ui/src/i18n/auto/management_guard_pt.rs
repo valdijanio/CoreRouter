@@ -20,6 +20,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Refused"##, r##"Recusadas"##),
     (r##"Sessions"##, r##"Sessões"##),
     (r##"State"##, r##"Estado"##),
+    (r##"VRF"##, r##"VRF"##),
     (r##"covered"##, r##"coberta"##),
     (r##"mgmt route"##, r##"rota na gerência"##),
 ];
@@ -60,6 +61,11 @@ Sessões de gerência abertas (GUI, terminal, MCP, CLI pela rede) cujo par está
 - `in kernel`: rotas aprendidas dentro dela estão instaladas."##),
     (r##"management_guard.suggest"##, r##"## O que é
 As redes conectadas de onde vêm as suas sessões de gerência abertas, ainda sem guarda. Protect acrescenta a rede num passo (`routing.management-guard.add`)."##),
+    (r##"management_guard.vrf"##, r##"## O que é
+A tabela de roteamento em que a rede está: `main`, ou a VRF da porta de gerência. O filtro de uma rede de VRF vai dentro do contexto `vrf <nome>` do zebra e só recusa rotas aprendidas dessa VRF (OSPF ou BGP dela); o mesmo prefixo em outra VRF é outra rede e fica como está.
+
+## Padrão
+Vazio, o roteador escolhe a tabela onde a rede é conectada (main quando ela também está na main). Uma guarda na tabela errada não protege nada: a prévia avisa quando a rede é conectada em outra."##),
     (r##"menu.management-guard"##, r##"## O que faz
 Impede que rotas aprendidas (OSPF, BGP) tomem a rede de gerência: o roteador recusa um prefixo dentro dela mais longo que ela e avisa quando uma rota aprendida cobre uma sessão aberta."##),
 ];

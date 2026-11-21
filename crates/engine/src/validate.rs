@@ -109,6 +109,12 @@ pub const UNITS: &[Unit] = &[
         run: routing_table_checks,
     },
     Unit {
+        name: "management-guard",
+        // G3.4za: a guard network's VRF is an interface.
+        reads: small_and(Sections::INTERFACES),
+        run: management_guard_checks,
+    },
+    Unit {
         name: "routing-rules",
         // A rule names interfaces and tables, and the mangle's marks.
         reads: small_and(Sections::INTERFACES.union(Sections::MANGLE)),
@@ -198,6 +204,23 @@ const FIREWALL_UNIT: &str = "firewall";
 
 /// What `routing.table.add` enforces, for a config that did not come
 /// through it (G1.27e).
+/// G3.4za: the VRF of a guard network exists (the zebra `vrf` context of a
+/// missing one would guard nothing, silently).
+fn management_guard_checks(cfg: &Config) -> Vec<Issue> {
+    cfg.routing
+        .management_guard
+        .networks
+        .iter()
+        .filter(|n| !n.vrf.is_main() && !route::is_vrf_table(cfg, &n.vrf))
+        .map(|n| {
+            Issue::new(
+                format!("routing.management_guard.{}.vrf", n.id),
+                format!("no VRF '{}' for the guard of {} (interface.vrf.add, or vrf main)", n.vrf, n.network),
+            )
+        })
+        .collect()
+}
+
 fn routing_table_checks(cfg: &Config) -> Vec<Issue> {
     use corerouter_model::routing_table::{MAX_TABLES, RESERVED};
     let mut out = Vec::new();
