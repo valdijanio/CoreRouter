@@ -297,13 +297,11 @@ impl Svc {
         if t.confirm != Confirm::Auto || self.started.elapsed() < GRACE {
             return;
         }
-        let rows = lock(session).execute("interface.list", &json!({})).unwrap_or(Value::Null);
-        let up = |name: &str| {
-            rows.as_array().is_some_and(|r| {
-                r.iter().any(|i| i.get("name").and_then(Value::as_str) == Some(name) && i.get("running") == Some(&json!(true)))
-            })
-        };
-        let down: Vec<&String> = t.mgmt.iter().filter(|m| !up(m)).collect();
+        // G1.6ba: running *and* with an address again, the lease of a DHCP
+        // or PPPoE client included (a port that runs without its lease does
+        // not reach the operator).
+        let reachable = package::reachable_ports(&mut lock(session));
+        let down: Vec<&String> = t.mgmt.iter().filter(|m| !reachable.contains(m)).collect();
         if !down.is_empty() {
             self.healthy_since = None;
             return;
@@ -315,7 +313,7 @@ impl Svc {
         let detail = if t.mgmt.is_empty() {
             "daemon up".to_owned()
         } else {
-            format!("daemon up; management interfaces running: {}", t.mgmt.join(", "))
+            format!("daemon up; management interfaces running with an address: {}", t.mgmt.join(", "))
         };
         match p.confirm(now_unix(), &detail) {
             Ok(o) => {

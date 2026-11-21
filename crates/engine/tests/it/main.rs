@@ -83,6 +83,7 @@ mod subscriber_notice;
 mod system_clock;
 mod tool_params;
 mod unmanaged;
+mod update_mgmt;
 mod users;
 mod wifi;
 mod wifi_ap;
