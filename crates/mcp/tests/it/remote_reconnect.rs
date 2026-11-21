@@ -116,6 +116,21 @@ fn remote(addr: &str) -> Remote {
     .unwrap()
 }
 
+/// Waits until `r` itself has seen the router close the connection. The
+/// router's side closing is not enough: on a loaded machine the FIN reached
+/// the client's socket later, the next request went out on the old
+/// connection and got a reset (G0.30p, 2 of 4 runs alone, **medido**).
+fn wait_redial(r: &Remote) {
+    let start = std::time::Instant::now();
+    while !r.will_redial() {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the close never reached the client"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn run(r: &mut Remote) -> Result<Value, String> {
     r.call("engine.execute", json!({"command": "interface.list"}))
 }
@@ -127,6 +142,7 @@ fn a_restarted_router_is_redialled_on_the_next_call() {
     assert_eq!(run(&mut r).unwrap()["conn"], 1);
     // The router went away between two calls (restart, upgrade).
     fake.wait_closed(1);
+    wait_redial(&r);
     assert_eq!(run(&mut r).unwrap()["conn"], 2);
     assert_eq!(run(&mut r).unwrap()["conn"], 2);
     // Each request reached a router exactly once.
@@ -150,6 +166,7 @@ fn an_unreachable_router_is_a_clear_error_and_the_next_call_retries() {
     let mut r = remote(&fake.addr);
     run(&mut r).unwrap();
     fake.wait_closed(0);
+    wait_redial(&r);
     // Nothing listens any more (the fake router served its one connection
     // and the listener is gone with its thread).
     let e = run(&mut r).unwrap_err();
