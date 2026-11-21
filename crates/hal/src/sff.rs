@@ -24,6 +24,17 @@
 
 use serde::Serialize;
 
+use crate::HalError;
+use corerouter_model::IfName;
+
+/// Reads the ports' modules with no access to the hal (G1.22); [`Send`],
+/// so a thread of the app runs it with the session unlocked: a read is up
+/// to four kernel requests, and a driver stuck on its I²C bus answers after
+/// seconds. Same answers as [`Hal::sfp_module`](crate::Hal::sfp_module).
+pub trait ModuleReader: Send {
+    fn read(&mut self, name: &IfName) -> Result<SfpModule, HalError>;
+}
+
 /// Half a page: what one `MODULE_EEPROM_GET` may return.
 pub const HALF_PAGE: usize = 128;
 

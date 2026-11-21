@@ -387,6 +387,17 @@ mod linux {
         }
     }
 
+    /// Reads the ports' modules with the session unlocked (G1.22): the
+    /// same ethtool netlink requests as `Hal::sfp_module`, which keeps no
+    /// state between reads.
+    struct Modules;
+
+    impl corerouter_hal::sff::ModuleReader for Modules {
+        fn read(&mut self, name: &IfName) -> Result<SfpModule, HalError> {
+            crate::nic::sfp_module(name.as_str())
+        }
+    }
+
     /// Reads the links with the session unlocked (G1.3f).
     struct Reader {
         epoch: u64,
@@ -1785,6 +1796,10 @@ mod linux {
 
         fn sfp_module(&mut self, name: &IfName) -> Result<SfpModule, HalError> {
             crate::nic::sfp_module(name.as_str())
+        }
+
+        fn module_reader(&self) -> Option<Box<dyn corerouter_hal::sff::ModuleReader>> {
+            Some(Box::new(Modules))
         }
 
         fn packet_capture(&self) -> Result<corerouter_hal::capture::SharedCapture, String> {

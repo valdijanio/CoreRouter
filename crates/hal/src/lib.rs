@@ -365,6 +365,14 @@ pub trait Hal: Send {
         )))
     }
 
+    /// A reader of the modules for a thread of the app to run with the
+    /// session unlocked (G1.22, [`sff::ModuleReader`]); `None` (the
+    /// default): this backend reads them cheaply, the tick asks
+    /// [`Hal::sfp_module`].
+    fn module_reader(&self) -> Option<Box<dyn sff::ModuleReader>> {
+        None
+    }
+
     /// A cable test of `name`, to run on a task thread (G1.20): building it
     /// is cheap and checks what can be checked up front.
     fn cable_tester(&mut self, name: &IfName) -> Result<Box<dyn CableTest>, HalError> {
