@@ -198,6 +198,10 @@ direito: copiar, copiar como comando (CoreRouter e RouterOS), ativar/desativar, 
 - **Prévia dos comandos** que serão aplicados.
 - Botões **Cancel**, **Apply** (aplica e mantém aberto) e **OK** (aplica e fecha); Enter = OK,
   Esc = Cancel. Erro do engine aparece no modal, junto do campo, sem fechar.
+- **Aviso da resposta** (`warnings: [string]` de um `add`/`set` que aplicou): no rodapé do
+  modal, acima da linha de erro, um por linha com o selo âmbar `warning` (`dialog::Status::
+  replied_warned`, G1.5d). O modal não fecha no OK enquanto houver aviso para ler; OK de novo,
+  sem mudança, fecha. Num "New …" que avisou, abre a janela do item criado com o aviso.
 
 ### Como adotar (API dos componentes)
 
