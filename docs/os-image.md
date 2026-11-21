@@ -1859,7 +1859,7 @@ minutos sem resposta, manda olhar o console.
   o cache das páginas (o código dos programas) e a máquina pode se arrastar: numa VM de 1 GiB o
   `tail` morreu em 1,0 s numa rodada e, noutra, o OSPF (dead 4 s) caiu e o serviço BFD ficou 54 s
   sem heartbeat (**medido**). Matar mais cedo, pela pressão de
-  memória (PSI), é a gap G1.6zza.
+  memória (PSI), é a gap G1.32.
 - **Fora da imagem** (`post-build.sh`): `vtysh` (o único que liga readline), bash, readline,
   ncurses, o runtime C++ que a toolchain copia, scripts Python e os daemons que o CoreRouter não
   configura (rip, isis, pim, babel, eigrp, …). O `nft` deixa de ter CLI interativa (ela puxava
