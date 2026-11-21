@@ -269,6 +269,10 @@ Carga das zonas por `ip.dns.zone.file.load`: 311 ms para 9 980 registros e 1,07 
 
 ### Operação com carga (`ops`)
 
+**G4.1zn:** um commit passou a ser uma descarga em disco. No notebook (SSD USB), `ip.dns.set` foi
+de p99 489 ms para 32–49 ms e o lote atômico de 505 ms para 42–50 ms. `--config-flush-ms 15` faz um
+disco assim na VM (`docs/changes/G4.1zn.md`).
+
 50 vezes cada comando por uma conexão MCP aberta, com 20 000/s de nomes quentes ao lado (depois):
 
 | Comando | p50 | p99 (= máx.) |
