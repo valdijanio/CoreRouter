@@ -421,13 +421,7 @@ fn some(picked: &[&Value]) -> Result<(), String> {
 
 fn can_enable(picked: &[&Value], enable: bool) -> Result<(), String> {
     some(picked)?;
-    if picked.iter().any(|r| flag(r, "disabled") == enable) {
-        Ok(())
-    } else if enable {
-        Err("Already enabled".into())
-    } else {
-        Err("Already disabled".into())
-    }
+    crate::list::toggle_rule(picked.iter().map(|r| flag(r, "disabled")), enable)
 }
 
 fn running(picked: &[&Value]) -> Result<(), String> {

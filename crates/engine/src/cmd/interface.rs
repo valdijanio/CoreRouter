@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 use super::args::{opt_bool, opt_parse, opt_str, opt_text, opt_u32, req_parse, req_u32};
 use super::{CommandSpec, always};
+use crate::row_rules::RowRules;
 use crate::validate::vlan_lowers;
 use crate::{EngineError, Result, Session};
 
@@ -17,7 +18,7 @@ pub const MAX_INTERFACES: usize = 4096;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "interface.list", "Interfaces", ["Interfaces"], None,
-        "{type?: string (ether | vlan | bridge | bonding | loopback | vrf | veth | …)} → [{name, type, kind, managed, unmanaged_reason, mtu, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, comment, parent, vlan_id, use_service_tag, bridge, bond, vrf, table, usb: null | {port, speed, driver, slow_port, alert} (a USB adapter, G1.29b), invalid: bool (G1.3b: a port not on this machine, or a VLAN on one; flag I), invalid_reason: string | null, hardware_problem: null | firmware | safe-mode (G1.6ja: see interface.hardware-problem.print), hardware_problem_reason: string | null}]",
+        "{type?: string (ether | vlan | bridge | bonding | loopback | vrf | veth | …)} → [{name, type, kind, managed, unmanaged_reason, mtu, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, comment, parent, vlan_id, use_service_tag, bridge, bond, vrf, table, usb: null | {port, speed, driver, slow_port, alert} (a USB adapter, G1.29b), invalid: bool (G1.3b: a port not on this machine, or a VLAN on one; flag I), invalid_reason: string | null, hardware_problem: null | firmware | safe-mode (G1.6ja: see interface.hardware-problem.print), hardware_problem_reason: string | null, removable: bool, editable: bool, fixed_reason: string | null (G1.24: a physical port is not removed; a link CoreRouter does not manage is not changed)}]",
         always, list),
     cmd!(
         "interface.set",
@@ -143,7 +144,8 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                 _ => None,
             };
             let unmanaged = st.and_then(|l| l.unmanaged.as_deref());
-            json!({
+            let rules = row_rules(&i.kind, unmanaged);
+            let mut row = json!({
                 "name": i.name,
                 "type": i.kind.label(),
                 "kind": st.map_or(i.kind.label(), |l| l.kind.as_str()),
@@ -169,7 +171,9 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                 "invalid_reason": invalid.get(&i.name),
                 "hardware_problem": hardware.get(i.name.as_str()).map(|p| p.0),
                 "hardware_problem_reason": hardware.get(i.name.as_str()).map(|p| p.1.as_str()),
-            })
+            });
+            rules.put(&mut row);
+            row
         })
         .collect();
     rows.extend(
@@ -181,7 +185,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                     .unmanaged
                     .as_deref()
                     .unwrap_or("not in the configuration (appeared after boot)");
-                json!({
+                let mut row = json!({
                     "name": l.name,
                     "type": l.kind,
                     "kind": l.kind,
@@ -204,7 +208,9 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                     "table": null,
                     "invalid": false,
                     "invalid_reason": null,
-                })
+                });
+                RowRules::fixed(format!("not managed by CoreRouter: {why}")).put(&mut row);
+                row
             }),
     );
     Ok(Value::Array(rows))
@@ -692,18 +698,10 @@ pub(super) fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     let external = unmanaged(s);
     let cfg = s.store().candidate();
     let (name, iface) = existing(cfg, p, "name")?;
-    if matches!(iface.kind, InterfaceKind::Ethernet | InterfaceKind::Wifi(_))
-        && !external.contains_key(&name)
-    {
-        let what = if matches!(iface.kind, InterfaceKind::Wifi(_)) {
-            "Wi-Fi radio"
-        } else {
-            "physical port"
-        };
-        return Err(EngineError::bad(
-            "name",
-            format!("'{name}' is a {what} and cannot be removed (disable it with interface.set)"),
-        ));
+    let rules = row_rules(&iface.kind, external.get(&name).map(String::as_str));
+    if !rules.removable {
+        let why = rules.reason.unwrap_or_default();
+        return Err(EngineError::bad("name", format!("'{name}': {why}")));
     }
     let blockers = dependents(cfg, &name, iface);
     if !blockers.is_empty() {
@@ -724,6 +722,26 @@ pub(super) fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     // Discovery stops on it with it, instead of blocking the removal.
     cfg.ip.neighbor_discovery.interfaces.remove(&name);
     Ok(json!({ "name": name }))
+}
+
+/// G1.24: what the Interfaces list lets do with a config interface of
+/// `kind` (`unmanaged`: why the platform keeps the link, if it does).
+/// `interface.remove` refuses with the same reason. A link CoreRouter does
+/// not manage may lose its stale config entry (apply never touches it), but
+/// is not changed.
+fn row_rules(kind: &InterfaceKind, unmanaged: Option<&str>) -> RowRules {
+    if let Some(why) = unmanaged {
+        return RowRules::read_only(format!("not managed by CoreRouter: {why}"));
+    }
+    match kind {
+        InterfaceKind::Ethernet => {
+            RowRules::kept("a physical port cannot be removed: disable it instead (interface.set)")
+        }
+        InterfaceKind::Wifi(_) => {
+            RowRules::kept("a Wi-Fi radio cannot be removed: disable it instead (interface.set)")
+        }
+        _ => RowRules::free(),
+    }
 }
 
 /// What must be removed before `name` can go, each with the command to use.

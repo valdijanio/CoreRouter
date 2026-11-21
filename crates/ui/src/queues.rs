@@ -632,7 +632,7 @@ impl QueuesPanel {
             .map(|r| {
                 let mut it = Item::of(r, "name", BUILTIN);
                 if r.get("builtin").and_then(Value::as_bool).unwrap_or(false) {
-                    it.fixed = Some(BUILTIN.to_owned());
+                    it.fix(BUILTIN);
                 }
                 it
             })

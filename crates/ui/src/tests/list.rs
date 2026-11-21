@@ -32,11 +32,15 @@ fn avail(set_enabled: bool) -> Avail {
 }
 
 fn item(key: &str, disabled: bool, fixed: Option<&str>) -> Item {
-    Item {
+    let mut i = Item {
         key: key.into(),
         disabled,
-        fixed: fixed.map(str::to_owned),
+        ..Item::default()
+    };
+    if let Some(why) = fixed {
+        i.fix(why);
     }
+    i
 }
 
 #[test]

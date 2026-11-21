@@ -76,6 +76,7 @@ mod route_discard_lockout;
 mod route_lines_offlock;
 mod route_page;
 mod route_view;
+mod row_rules;
 mod safe_mode;
 mod session;
 mod subscriber_notice;

@@ -41,9 +41,9 @@ const CMDS: Cmds = Cmds {
     what: "addresses",
 };
 
-const DYNAMIC: &str = "Dynamic addresses come from a DHCP client or a Router Advertisement: \
-     release or disable the client (IP › DHCP Client, IPv6 › DHCPv6 Client) or stop accepting \
-     RA (IPv6 › IPv6 Settings)";
+/// What a dynamic row says on a router older than G1.24, whose rows carry
+/// no `fixed_reason` (the engine names the client or the RA now).
+const DYNAMIC: &str = "a dynamic address: change it where it comes from (DHCP client or Router Advertisement)";
 
 const FIELDS: &[Field] = &[
     Field {

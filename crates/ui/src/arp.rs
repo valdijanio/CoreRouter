@@ -511,10 +511,16 @@ impl ArpPanel {
             .collect();
         let picked: Vec<Item> = chosen
             .iter()
-            .map(|r| Item {
-                key: key_of(r),
-                disabled: s(r, "disabled") == "true",
-                fixed: (s(r, "source") != "static").then(|| LEARNED.to_owned()),
+            .map(|r| {
+                let mut i = Item {
+                    key: key_of(r),
+                    disabled: s(r, "disabled") == "true",
+                    ..Item::default()
+                };
+                if s(r, "source") != "static" {
+                    i.fix(LEARNED);
+                }
+                i
             })
             .collect();
         let can = app.can();

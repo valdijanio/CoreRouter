@@ -573,7 +573,7 @@ fn remove_refuses_what_is_in_use_and_says_what_to_remove() {
         &mut s,
         "interface.remove",
         rm("ether1"),
-        "physical port and cannot be removed",
+        "a physical port cannot be removed",
     );
     fails(
         &mut s,

@@ -339,15 +339,19 @@ fn prefix_row(r: &Value) -> Row {
 
 /// A prefix row as `Item`: only the static ones are configuration.
 fn prefix_item(r: &Value) -> Item {
-    Item {
+    let mut i = Item {
         key: prefix_key(r),
         disabled: flag(r, "disabled"),
-        fixed: s(r, "id").is_empty().then(|| match s(r, "origin").as_str() {
-            "deprecated" => "a prefix that left the RA: it goes out with lifetimes 0 a few more times".to_owned(),
-            "dhcp-pd" => "from the prefix DHCPv6-PD delegated (ip.address from_pool): its lifetimes follow the delegation".to_owned(),
-            _ => "from a /64 address of the interface: add a static prefix to change or hide it".to_owned(),
-        }),
+        ..Item::default()
+    };
+    if s(r, "id").is_empty() {
+        i.fix(match s(r, "origin").as_str() {
+            "deprecated" => "a prefix that left the RA: it goes out with lifetimes 0 a few more times",
+            "dhcp-pd" => "from the prefix DHCPv6-PD delegated (ip.address from_pool): its lifetimes follow the delegation",
+            _ => "from a /64 address of the interface: add a static prefix to change or hide it",
+        });
     }
+    i
 }
 
 fn yes(b: bool) -> String {
