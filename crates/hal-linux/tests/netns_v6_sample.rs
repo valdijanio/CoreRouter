@@ -89,38 +89,38 @@ fn sorted<T: std::fmt::Debug>(v: Vec<T>) -> Vec<String> {
     out
 }
 
-/// `l` with its lifetimes as they would read `by` seconds later, so two
-/// reads a second apart compare equal.
-fn later(l: &Learned, by: u32) -> Learned {
-    let f = |s: Option<u32>| s.map(|s| s.saturating_sub(by));
-    match l.clone() {
+/// `l` without its lifetimes, and the lifetimes apart.
+fn split(l: &Learned) -> (String, Vec<Option<u32>>) {
+    let mut bare = l.clone();
+    let lifetimes = match &mut bare {
         Learned::Address {
-            interface,
-            address,
             valid_secs,
             preferred_secs,
-        } => Learned::Address {
-            interface,
-            address,
-            valid_secs: f(valid_secs),
-            preferred_secs: f(preferred_secs),
-        },
-        Learned::Route {
-            interface,
-            dst,
-            gateway,
-            metric,
-            table,
-            expires_secs,
-        } => Learned::Route {
-            interface,
-            dst,
-            gateway,
-            metric,
-            table,
-            expires_secs: f(expires_secs),
-        },
-    }
+            ..
+        } => vec![valid_secs.take(), preferred_secs.take()],
+        Learned::Route { expires_secs, .. } => vec![expires_secs.take()],
+    };
+    (format!("{bare:?}"), lifetimes)
+}
+
+/// The same items, each lifetime equal or up to a second lower in `later`:
+/// the sample counts down from when it was read, and the kernel ticks each
+/// lifetime over on its own (an address's from its `tstamp`, a route's from
+/// jiffies), so one shared offset does not fit them all (G0.30q).
+fn same_but_for_a_tick(earlier: &[Learned], later: &[Learned]) -> bool {
+    let mut a: Vec<_> = earlier.iter().map(split).collect();
+    let mut b: Vec<_> = later.iter().map(split).collect();
+    a.sort();
+    b.sort();
+    a.len() == b.len()
+        && a.iter().zip(&b).all(|((ka, la), (kb, lb))| {
+            ka == kb
+                && la.len() == lb.len()
+                && la.iter().zip(lb).all(|(x, y)| match (x, y) {
+                    (Some(x), Some(y)) => x >= y && x - y <= 1,
+                    (x, y) => x == y,
+                })
+        })
 }
 
 #[test]
@@ -138,9 +138,12 @@ fn the_sample_answers_the_ipv6_reads_like_the_kernel() {
     hal.apply(&Config::default(), &cfg).unwrap();
     // What RA would have left: an address with a lifetime, a deprecated
     // one (preferred lifetime over), an `ra` route; and a BGP route.
+    // `nodad`: the sample is read at once and the kernel a moment later, so
+    // an address still in DAD (RFC 4862 §5.4, ~1 s) would read tentative in
+    // one and settled in the other (G0.30q: 23/30 failures with 2 CPUs).
     ip_batch(&[
-        "addr add 2001:db8:1::1/64 dev v6p valid_lft 3600 preferred_lft 1800",
-        "addr add 2001:db8:2::1/64 dev v6p valid_lft 3600 preferred_lft 0",
+        "addr add 2001:db8:1::1/64 dev v6p valid_lft 3600 preferred_lft 1800 nodad",
+        "addr add 2001:db8:2::1/64 dev v6p valid_lft 3600 preferred_lft 0 nodad",
         "route add 2001:db8:a::/64 dev v6p proto ra expires 1800",
         "route add 2001:db8:b::/64 dev v6p proto bgp",
     ]);
@@ -155,13 +158,11 @@ fn the_sample_answers_the_ipv6_reads_like_the_kernel() {
     let kernel_learned = fresh.ipv6_learned().unwrap();
     fresh.poll();
     let kernel_states = fresh.address_states().unwrap();
-    // Equal, but for a lifetime that ticked over between the two reads (the
-    // sample's count down from when it was read).
-    let same = (0..=1).any(|by| {
-        let ours: Vec<Learned> = learned.iter().map(|l| later(l, by)).collect();
-        sorted(ours) == sorted(kernel_learned.clone())
-    });
-    assert!(same, "{learned:?}\n{kernel_learned:?}");
+    // Equal, but for a lifetime that ticked over between the two reads.
+    assert!(
+        same_but_for_a_tick(&learned, &kernel_learned),
+        "{learned:?}\n{kernel_learned:?}"
+    );
     let strip = |v: &[corerouter_hal::address_state::AddressState]| {
         sorted(
             v.iter()
