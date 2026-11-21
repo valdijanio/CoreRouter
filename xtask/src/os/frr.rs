@@ -551,9 +551,14 @@ fn oom(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(), S
     // OSPF's 4 s dead interval may expire meanwhile. What must hold is that the control plane survives and
     // the adjacency comes back by itself.
     let full = until(vm, log, 60, "routing.ospf.neighbor.list", "{}", |v| {
-        v["result"]["rows"].as_array().is_some_and(|r| r.iter().any(|n| n["state"] == "Full"))
+        v["result"]["rows"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|n| n["state"] == "Full"))
     });
-    check(full.is_ok(), format!("r2: OSPF did not come back after the OOM: {full:?}"))?;
+    check(
+        full.is_ok(),
+        format!("r2: OSPF did not come back after the OOM: {full:?}"),
+    )?;
     let ping = sh(vm, log, "ping -c 3 -W 2 10.255.0.1 | tail -n 2")?;
     check(
         ping.contains(" 0% packet loss"),
