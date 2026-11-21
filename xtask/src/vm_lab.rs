@@ -572,7 +572,9 @@ fn parse_pin(rest: &[String]) -> Result<(bool, Option<PinTarget>), String> {
                 force = true;
                 continue;
             }
-            "--vm" => it.next().ok_or_else(|| "--vm needs a value (1, 2, ci)".to_owned())?,
+            "--vm" => it
+                .next()
+                .ok_or_else(|| "--vm needs a value (1, 2, ci)".to_owned())?,
             f if f.starts_with("--vm=") => f.trim_start_matches("--vm="),
             other => return Err(format!("pin: unknown option {other}\n{HELP}")),
         };
