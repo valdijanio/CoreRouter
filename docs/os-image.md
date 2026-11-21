@@ -227,8 +227,9 @@ precisar de streaming delta, o RAUC volta a ser a opção (o formato de bundle v
 Tudo o que o `cargo xtask os` constrói fica numa pasta por checkout, `<out>`
 (`xtask/src/os/out.rs`): a árvore do Buildroot extraída, o `O=` dele (`build/`, com as
 imagens em `build/images/`), o `ccache`, os targets do cargo (`cargo-target` do daemon e do init,
-`web-target` da GUI web, `cli-target` da CLI do `push`), a GUI web, as pastas dos testes no QEMU e a **chave
-de assinatura** de desenvolvimento (`keys/`). Os downloads continuam em `os/dl/`.
+`web-target` da GUI web, `cli-target` da CLI do `push`), a GUI web e as pastas dos testes no QEMU.
+Os downloads continuam em `os/dl/`. A **chave de assinatura** de desenvolvimento não fica mais aqui
+(G1.6qm, "A chave" abaixo).
 
 A pasta, na primeira regra que valer:
 
@@ -248,12 +249,19 @@ juntos: o segundo para na hora com "another `cargo xtask os build` is using …"
 espaço levou junto o ccache e os targets do cargo: o build seguinte foi completo e frio. No
 disco de builds (929 GB livres) nada disso precisa ser apagado por falta de espaço.
 
-**A chave.** Os pacotes `.crpkg` são assinados pela chave privada de `<out>/keys/`
-(`dev-image-key.pk8`), e o roteador só aceita pacotes da chave pública que a imagem instalada
-dele traz. Pasta nova sem a chave = chave nova = o roteador **recusa** o pacote (assinatura
-desconhecida); por isso a regra 2 existe, e com `$COREROUTER_OS_OUT` apontando para uma pasta
-sem chave enquanto o `os/out` tem uma o build para e diz o que copiar. Para usar a mesma chave
-em mais de um checkout, copie `keys/` ou passe `--key <pkcs8>` (`$COREROUTER_IMAGE_KEY`).
+**A chave.** Os pacotes `.crpkg` são assinados pela chave privada de
+`~/.config/corerouter/dev-image-key/` (`dev-image-key.pk8`, `0600`; `$XDG_CONFIG_HOME` se
+definido, `$COREROUTER_DEV_KEY_DIR` para mudar), e o roteador só aceita pacotes da chave pública
+que a imagem instalada dele traz. É **uma chave por usuário**, a mesma para todo checkout e toda
+pasta de build (G1.6qm): o pacote de qualquer worktree atualiza o notebook de teste e as VMs, e
+apagar um `os-out` para abrir espaço não leva a chave junto. Até 2026-11-21 ela ficava em
+`<out>/keys/`. Uma limpeza de disco apagou a pasta que tinha a chave do notebook, e ele passou a
+recusar todo pacote novo ("signed by key …, which this image does not trust"); só regravar o
+disco dele resolveu. Migração: o primeiro build depois da mudança copia para lá a chave do
+`<out>/keys/` dele (ou do `os/out/keys/` antigo do checkout), e o original fica. Uma pasta de
+build com outra chave ganha um aviso a cada build, porque os roteadores atualizados por ela
+recusam a chave compartilhada. `--key <pkcs8>` (`$COREROUTER_IMAGE_KEY`) continua passando por
+cima. **Faça backup** dessa pasta junto com a da chave de release.
 
 Essa é a chave de **desenvolvimento**. A de **release**, que assina as versões publicadas, é
 outra: cifrada com senha, fora do repositório e do `/srv/build`
@@ -513,7 +521,7 @@ Scrub) e **System › Tuning › Boot** (o que cada slot carrega, "Apply on slot
   recalculada. A imagem só leva a **chave pública** (`/etc/corerouter/image-keys/<id>.pub`); a
   privada fica fora do repositório (`cargo xtask os build --key <pkcs8>` ou
   `$COREROUTER_IMAGE_KEY`; sem elas, uma chave de desenvolvimento gerada uma vez em
-  `<out>/keys/`, fora do repositório; seção "Onde fica o build"). Imagem de desenvolvimento:
+  `~/.config/corerouter/dev-image-key/`, fora do repositório; seção "Onde fica o build"). Imagem de desenvolvimento:
   essa chave e as de release de `os/keys/release/`; imagem de release: só as de release
   ([release.md](release.md)). Atualizar para um build mais antigo é recusado
   ("use system.package.downgrade").
