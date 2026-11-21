@@ -35,43 +35,82 @@ pub const MAX_COMMENT: usize = 256;
 /// screen can show (**estimado**).
 pub const MAX_ZONE_CELLS: usize = 1024;
 
+/// The actions `table` takes, in RouterOS menu order (G1.24: the engine
+/// shows them to the GUI with `ip.firewall.actions`; nothing else keeps a
+/// copy).
+pub fn table_actions(table: Table) -> &'static [&'static str] {
+    match table {
+        Table::Filter => &[
+            "accept",
+            "drop",
+            "reject",
+            "jump",
+            "return",
+            "log",
+            "passthrough",
+            "add-src-to-address-list",
+            "add-dst-to-address-list",
+        ],
+        Table::Nat => &[
+            "accept",
+            "masquerade",
+            "src-nat",
+            "dst-nat",
+            "jump",
+            "return",
+            "log",
+            "passthrough",
+            "add-src-to-address-list",
+            "add-dst-to-address-list",
+        ],
+        Table::Mangle => &[
+            "accept",
+            "mark-connection",
+            "mark-packet",
+            "mark-routing",
+            "change-mss",
+            "jump",
+            "return",
+            "log",
+            "passthrough",
+            "add-src-to-address-list",
+            "add-dst-to-address-list",
+        ],
+        Table::Raw => &[
+            "accept",
+            "drop",
+            "notrack",
+            "jump",
+            "return",
+            "log",
+            "passthrough",
+            "add-src-to-address-list",
+            "add-dst-to-address-list",
+        ],
+    }
+}
+
 /// Actions allowed in `table` (before looking at the chain).
 fn table_allows(table: Table, action: &Action) -> bool {
-    let common = matches!(
-        action,
-        Action::Accept
-            | Action::Jump { .. }
-            | Action::Return
-            | Action::Log { .. }
-            | Action::Passthrough
-            | Action::AddSrcToAddressList { .. }
-            | Action::AddDstToAddressList { .. }
-    );
-    common
-        || match table {
-            Table::Filter => matches!(action, Action::Drop | Action::Reject { .. }),
-            Table::Nat => matches!(
-                action,
-                Action::Masquerade { .. } | Action::SrcNat { .. } | Action::DstNat { .. }
-            ),
-            Table::Mangle => matches!(
-                action,
-                Action::MarkConnection { .. }
-                    | Action::MarkPacket { .. }
-                    | Action::MarkRouting { .. }
-                    | Action::ChangeMss { .. }
-            ),
-            Table::Raw => matches!(action, Action::Drop | Action::Notrack),
-        }
+    table_actions(table).contains(&action.name())
+}
+
+/// The built-in chains action `name` runs from, if it is restricted
+/// whatever its parameters (`change-mss` is restricted only with
+/// `clamp-to-pmtu`, see [`chain_limit`]).
+pub fn action_chains(name: &str) -> Option<&'static [&'static str]> {
+    match name {
+        "masquerade" | "src-nat" => Some(&["srcnat"]),
+        "dst-nat" => Some(&["dstnat"]),
+        // The kernel routes again after a mark only there.
+        "mark-routing" => Some(&["prerouting", "output"]),
+        _ => None,
+    }
 }
 
 /// The built-in chains an action may run from, if it is restricted.
 fn chain_limit(action: &Action) -> Option<&'static [&'static str]> {
     match action {
-        Action::Masquerade { .. } | Action::SrcNat { .. } => Some(&["srcnat"]),
-        Action::DstNat { .. } => Some(&["dstnat"]),
-        // The kernel routes again after a mark only there.
-        Action::MarkRouting { .. } => Some(&["prerouting", "output"]),
         // `rt mtu` needs the route: the kernel refuses it before routing
         // (`nft_rt_validate`: forward, output, postrouting), as iptables'
         // `TCPMSS --clamp-mss-to-pmtu`.
@@ -79,7 +118,7 @@ fn chain_limit(action: &Action) -> Option<&'static [&'static str]> {
             new_mss: NewMss::ClampToPmtu,
             ..
         } => Some(&["forward", "output", "postrouting"]),
-        _ => None,
+        _ => action_chains(action.name()),
     }
 }
 
@@ -721,6 +760,22 @@ fn mark_collisions(cfg: &Config) -> Vec<Issue> {
 mod tests {
     use super::*;
     use crate::sample::{act, m, rule};
+
+    #[test]
+    fn every_action_belongs_to_a_table_and_names_are_real() {
+        for name in Action::NAMES {
+            assert!(
+                Table::ALL.iter().any(|t| table_actions(*t).contains(&name)),
+                "{name} in no table"
+            );
+        }
+        for t in Table::ALL {
+            for name in table_actions(t) {
+                assert!(Action::NAMES.contains(name), "{t}: {name}");
+            }
+        }
+        assert_eq!(action_chains("dst-nat"), Some(&["dstnat"][..]));
+    }
 
     fn table(n: u32) -> Config {
         let mut cfg = Config::default();

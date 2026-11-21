@@ -37,7 +37,7 @@ pub(crate) enum FwTable {
 }
 
 impl FwTable {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             FwTable::Filter => "filter",
             FwTable::Nat => "nat",
@@ -68,66 +68,6 @@ impl FwTable {
         }
     }
 
-    fn chains(self) -> &'static [&'static str] {
-        match self {
-            FwTable::Filter => &["input", "forward", "output"],
-            FwTable::Nat => &["dstnat", "srcnat"],
-            FwTable::Mangle => &["prerouting", "input", "forward", "output", "postrouting"],
-            FwTable::Raw => &["prerouting", "output"],
-        }
-    }
-
-    fn actions(self) -> &'static [&'static str] {
-        match self {
-            FwTable::Filter => &[
-                "accept",
-                "drop",
-                "reject",
-                "jump",
-                "return",
-                "log",
-                "passthrough",
-                "add-src-to-address-list",
-                "add-dst-to-address-list",
-            ],
-            FwTable::Nat => &[
-                "accept",
-                "masquerade",
-                "src-nat",
-                "dst-nat",
-                "jump",
-                "return",
-                "log",
-                "passthrough",
-                "add-src-to-address-list",
-                "add-dst-to-address-list",
-            ],
-            FwTable::Mangle => &[
-                "accept",
-                "mark-connection",
-                "mark-packet",
-                "mark-routing",
-                "change-mss",
-                "jump",
-                "return",
-                "log",
-                "passthrough",
-                "add-src-to-address-list",
-                "add-dst-to-address-list",
-            ],
-            FwTable::Raw => &[
-                "accept",
-                "drop",
-                "notrack",
-                "jump",
-                "return",
-                "log",
-                "passthrough",
-                "add-src-to-address-list",
-                "add-dst-to-address-list",
-            ],
-        }
-    }
 
     fn feed(self) -> Feed {
         match self {
@@ -151,10 +91,12 @@ pub(crate) enum Feed {
     Members,
     /// `ip.firewall.zone.list`: one object (zones, cells, rules).
     Zones,
+    /// G1.24: `ip.firewall.actions`, what each table and action take.
+    Actions,
 }
 
 impl Feed {
-    pub(crate) const ALL: [Feed; 8] = [
+    pub(crate) const ALL: [Feed; 9] = [
         Feed::Filter,
         Feed::Nat,
         Feed::Mangle,
@@ -163,6 +105,7 @@ impl Feed {
         Feed::Lists,
         Feed::Members,
         Feed::Zones,
+        Feed::Actions,
     ];
 
     /// The query that fills it.
@@ -176,6 +119,7 @@ impl Feed {
             Feed::Lists => "interface.list.list",
             Feed::Members => "interface.list.member.list",
             Feed::Zones => "ip.firewall.zone.list",
+            Feed::Actions => "ip.firewall.actions",
         }
     }
 
@@ -219,6 +163,7 @@ impl Feed {
             Feed::Lists => "if-lists",
             Feed::Members => "if-members",
             Feed::Zones => "fw-zones",
+            Feed::Actions => "fw-actions",
             t => t.table().map(FwTable::salt).unwrap_or(""),
         }
     }
@@ -237,6 +182,7 @@ impl Feed {
             Feed::Lists => "Interface List",
             Feed::Members => "Interface List Member",
             Feed::Zones => "Zone",
+            Feed::Actions => "Firewall Actions",
             t => t.table().map(FwTable::label).unwrap_or(""),
         }
     }
@@ -299,7 +245,7 @@ pub(crate) struct State {
     /// Chain filter of each rule table ("" = all).
     chain: [String; 8],
     /// Shared, so a frame borrows a list instead of copying every rule.
-    rows: [Arc<Vec<Value>>; 8],
+    rows: [Arc<Vec<Value>>; 9],
     pub dialogs: Vec<FwDialogWin>,
     /// Items to open once a list sent after this request arrives.
     open_after: Vec<(RequestId, Feed, String)>,
@@ -317,6 +263,7 @@ fn feed_index(f: Feed) -> usize {
         Feed::Members => 5,
         Feed::Zones => 6,
         Feed::Raw => 7,
+        Feed::Actions => 8,
     }
 }
 
@@ -423,30 +370,70 @@ const RULE_FIELDS_TAIL: [&str; 6] = [
     "new_mss",
 ];
 
-/// Fields only sent with these actions (so switching action does not send
-/// stale parameters the engine would refuse).
-fn action_field_owner(field: &str) -> Option<&'static [&'static str]> {
-    Some(match field {
-        "reject_with" => &["reject"],
-        "jump_target" => &["jump"],
-        "log_prefix" => &["log"],
-        "to_addresses" => &["src-nat", "dst-nat"],
-        "to_ports" => &["masquerade", "src-nat", "dst-nat"],
-        "new_connection_mark" => &["mark-connection"],
-        "new_packet_mark" => &["mark-packet"],
-        "new_routing_mark" => &["mark-routing"],
-        "new_mss" => &["change-mss"],
-        "address_list" | "address_list_timeout" => {
-            &["add-src-to-address-list", "add-dst-to-address-list"]
-        }
-        _ => return None,
-    })
+/// G1.24: what the engine says each table and action take
+/// (`ip.firewall.actions`): the built-in chains, the actions, and the
+/// action parameters of each action. The rule window keeps no copy of its
+/// own; before the answer arrives (or from a router without the command)
+/// the lists are empty and every filled field is sent, for the engine to
+/// judge.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Schema<'a>(pub &'a [Value]);
+
+impl<'a> Schema<'a> {
+    fn table(self, t: FwTable) -> Option<&'a Value> {
+        self.0.iter().find(|x| x.get("table").and_then(Value::as_str) == Some(t.name()))
+    }
+
+    fn texts(v: Option<&Value>) -> Vec<String> {
+        v.and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The built-in chains of `t`, in packet order.
+    pub(crate) fn chains(self, t: FwTable) -> Vec<String> {
+        Self::texts(self.table(t).and_then(|x| x.get("chains")))
+    }
+
+    fn entries(self, t: FwTable) -> impl Iterator<Item = &'a Value> {
+        self.table(t)
+            .and_then(|x| x.get("actions"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+    }
+
+    /// The actions `t` takes, in menu order.
+    pub(crate) fn actions(self, t: FwTable) -> Vec<String> {
+        self.entries(t).map(|a| text(a, "action")).collect()
+    }
+
+    /// The action parameters `action` takes in `t`; `None`: not known.
+    pub(crate) fn params(self, t: FwTable, action: &str) -> Option<Vec<String>> {
+        self.entries(t)
+            .find(|a| text(a, "action") == action)
+            .map(|a| Self::texts(a.get("params")))
+    }
+
+    /// Whether `field` is an action parameter (of some action of any
+    /// table: `reject_with` is one in a NAT rule too, where no action
+    /// takes it).
+    fn is_action_param(self, field: &str) -> bool {
+        self.0
+            .iter()
+            .filter_map(|x| x.get("actions").and_then(Value::as_array))
+            .flatten()
+            .any(|a| Self::texts(a.get("params")).iter().any(|p| p == field))
+    }
 }
 
 impl RuleForm {
-    fn new(table: FwTable) -> Self {
+    pub(crate) fn new(table: FwTable, schema: Schema<'_>) -> Self {
         let mut f = Self::of(&Value::Null);
-        f.set("chain", table.chains().first().copied().unwrap_or(""));
+        f.set("chain", schema.chains(table).first().map_or("", String::as_str));
         f.set("action", "accept");
         f.set("family", "both");
         f
@@ -476,6 +463,12 @@ impl RuleForm {
             .map_or("", |(_, v)| v.as_str())
     }
 
+    /// Whether the window has a field for parameter `k`.
+    #[cfg(test)]
+    pub(crate) fn has_field(k: &str) -> bool {
+        RULE_FIELDS.contains(&k) || RULE_FIELDS_TAIL.contains(&k)
+    }
+
     pub(crate) fn set(&mut self, k: &str, v: &str) {
         if let Some((_, slot)) = self.fields.iter_mut().find(|(f, _)| *f == k) {
             *slot = v.to_owned();
@@ -489,25 +482,28 @@ impl RuleForm {
             .map(|(_, v)| v)
     }
 
-    fn applies(&self, k: &str) -> bool {
-        action_field_owner(k).is_none_or(|owners| owners.contains(&self.get("action").trim()))
+    /// Whether field `k` goes with this rule's action: a matcher always,
+    /// an action parameter when the engine says the action takes it (so
+    /// switching action does not send stale parameters it would refuse).
+    fn applies(&self, s: Schema<'_>, t: FwTable, k: &str) -> bool {
+        !s.is_action_param(k)
+            || s.params(t, self.get("action").trim()).is_some_and(|p| p.iter().any(|x| x == k))
     }
 
-    fn has_passthrough(&self) -> bool {
-        let a = self.get("action");
-        a.starts_with("mark-") || a == "change-mss"
+    fn has_passthrough(&self, s: Schema<'_>, t: FwTable) -> bool {
+        s.params(t, self.get("action").trim()).is_some_and(|p| p.iter().any(|x| x == "passthrough"))
     }
 
     /// `add` params: every filled field that applies.
-    fn add_params(&self) -> Value {
+    pub(crate) fn add_params(&self, s: Schema<'_>, t: FwTable) -> Value {
         let mut p = Map::new();
         for (k, v) in &self.fields {
             let v = v.trim();
-            if !v.is_empty() && self.applies(k) {
+            if !v.is_empty() && self.applies(s, t, k) {
                 p.insert((*k).into(), json!(v));
             }
         }
-        if self.has_passthrough() && !self.passthrough {
+        if self.has_passthrough(s, t) && !self.passthrough {
             p.insert("passthrough".into(), json!(false));
         }
         if self.disabled {
@@ -521,22 +517,20 @@ impl RuleForm {
 
     /// `set` params for what differs from `base` (`""` clears); `None` if
     /// nothing changed.
-    fn set_params(&self, id: &str, base: &RuleForm) -> Option<Value> {
+    pub(crate) fn set_params(&self, id: &str, base: &RuleForm, s: Schema<'_>, t: FwTable) -> Option<Value> {
         let mut p = Map::new();
         let action_changed = self.get("action").trim() != base.get("action");
         for (k, v) in &self.fields {
             let v = v.trim();
-            if !self.applies(k) {
+            if !self.applies(s, t, k) {
                 continue;
             }
             // A new action takes its fields again (the old ones are gone).
-            if v != base.get(k)
-                || (action_changed && action_field_owner(k).is_some() && !v.is_empty())
-            {
+            if v != base.get(k) || (action_changed && s.is_action_param(k) && !v.is_empty()) {
                 p.insert((*k).into(), json!(v));
             }
         }
-        if self.has_passthrough() && (self.passthrough != base.passthrough || action_changed) {
+        if self.has_passthrough(s, t) && (self.passthrough != base.passthrough || action_changed) {
             p.insert("passthrough".into(), json!(self.passthrough));
         }
         if self.disabled != base.disabled {
@@ -653,12 +647,14 @@ impl Edit {
     }
 
     /// What OK/Apply send: (command, params), or `None` when nothing changed.
-    fn send(&self, item: Option<&str>) -> Option<(String, Value)> {
+    fn send(&self, item: Option<&str>, schema: Schema<'_>) -> Option<(String, Value)> {
         let feed = self.feed();
         match (self, item) {
-            (Edit::Rule { table, form, .. }, None) => Some((table.cmd("add"), form.add_params())),
-            (Edit::Rule { form, base, .. }, Some(id)) => {
-                form.set_params(id, base).map(|p| (feed.set_cmd(), p))
+            (Edit::Rule { table, form, .. }, None) => {
+                Some((table.cmd("add"), form.add_params(schema, *table)))
+            }
+            (Edit::Rule { table, form, base, .. }, Some(id)) => {
+                form.set_params(id, base, schema, *table).map(|p| (feed.set_cmd(), p))
             }
             (Edit::Section { table, title, .. }, None) => {
                 Some((table.cmd("add"), json!({ "section": title.trim() })))
@@ -1206,8 +1202,9 @@ impl CoreRouterUi {
             Feed::Addr => &mut self.tables.fw_addr,
             Feed::Lists => &mut self.tables.if_lists,
             Feed::Members => &mut self.tables.if_members,
-            // The matrix is not a table; its rules are the filter table's.
-            Feed::Zones => &mut self.tables.fw_filter,
+            // The matrix is not a table; its rules are the filter table's;
+            // the actions are no table at all.
+            Feed::Zones | Feed::Actions => &mut self.tables.fw_filter,
         }
     }
 
@@ -1403,7 +1400,7 @@ impl CoreRouterUi {
             }
             let mut picked = chain.clone();
             let mut chains: Vec<String> = vec![String::new()];
-            chains.extend(t.chains().iter().map(|c| (*c).to_owned()));
+            chains.extend(Schema(&self.fw.shared(Feed::Actions)).chains(t));
             for r in all.iter() {
                 let c = text(r, "chain");
                 if !c.is_empty() && !chains.contains(&c) {
@@ -1775,7 +1772,8 @@ impl CoreRouterUi {
                     },
                     t => {
                         let Some(t) = t.table() else { return };
-                        let form = RuleForm::new(t);
+                        let actions = self.fw.shared(Feed::Actions);
+                        let form = RuleForm::new(t, Schema(&actions));
                         Edit::Rule {
                             table: t,
                             base: form.clone(),
@@ -1973,6 +1971,7 @@ impl CoreRouterUi {
         let mut dialogs = std::mem::take(&mut self.fw.dialogs);
         let lists = self.list_names();
         let addr_lists = self.address_list_names();
+        let actions = self.fw.shared(Feed::Actions);
         let mut ifaces = self.interface_names(None);
         // G4.3y: every PPPoE subscriber (RouterOS `all-ppp`); their device
         // itself is the service's, not an interface of the rules.
@@ -2002,6 +2001,7 @@ impl CoreRouterUi {
                 lists: &lists,
                 addr_lists: &addr_lists,
                 ifaces: &ifaces,
+                schema: Schema(&actions),
             };
             let item = d.item.clone();
             let mut help = None;
@@ -2037,6 +2037,8 @@ impl CoreRouterUi {
         }
         let feed = d.edit.feed();
         let key = feed.key();
+        let actions = self.fw.shared(Feed::Actions);
+        let schema = Schema(&actions);
         let (sends, close): (Vec<(String, Value, Effect)>, bool) = match (&d.edit, &d.item, &b) {
             (
                 Edit::Comment {
@@ -2075,7 +2077,7 @@ impl CoreRouterUi {
                 vec![(feed.remove_cmd(), json!({ key: item }), Effect::None)],
                 true,
             ),
-            (edit, item, Press::Ok | Press::Apply) => match edit.send(item.as_deref()) {
+            (edit, item, Press::Ok | Press::Apply) => match edit.send(item.as_deref(), schema) {
                 Some((cmd, p)) => {
                     let effect = match (item, &b) {
                         (None, Press::Apply) => Effect::OpenCreated,
@@ -2168,6 +2170,8 @@ struct Picks<'a> {
     lists: &'a [String],
     addr_lists: &'a [String],
     ifaces: &'a [String],
+    /// What the engine says the tables and actions take (G1.24).
+    schema: Schema<'a>,
 }
 
 fn title(e: &Edit, item: Option<&str>, row: Option<&Value>) -> String {
@@ -2339,7 +2343,7 @@ fn body(
                 .spacing([12.0, 6.0])
                 .show(ui, |ui| match tab {
                     RuleTab::General => {
-                        rule_combo(ui, f, form, "Chain", "chain", &strings(t.chains()), "input");
+                        rule_combo(ui, f, form, "Chain", "chain", &pick.schema.chains(t), "input");
                         rule_combo(
                             ui,
                             f,
@@ -2487,7 +2491,7 @@ fn body(
                         rule_field(ui, f, form, "Limit", "limit", "5/1s,10 (count/time,burst)");
                     }
                     RuleTab::Action => {
-                        let actions = strings(t.actions());
+                        let actions = pick.schema.actions(t);
                         if form.get("action") == "change-mss" {
                             help_label(ui, f, "Action", "firewall.action.change-mss", help);
                         } else {
@@ -2519,7 +2523,7 @@ fn body(
                             ),
                         ];
                         for (param, label, hint) in fields {
-                            if !form.applies(param) {
+                            if !form.applies(pick.schema, t, param) {
                                 continue;
                             }
                             if *param == "reject_with" {
@@ -2556,7 +2560,7 @@ fn body(
                                 rule_field(ui, f, form, label, param, hint);
                             }
                         }
-                        if form.has_passthrough() {
+                        if form.has_passthrough(pick.schema, t) {
                             ui.label("Passthrough");
                             ui.checkbox(&mut form.passthrough, "");
                             ui.end_row();
