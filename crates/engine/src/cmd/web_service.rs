@@ -8,10 +8,11 @@
 use corerouter_model::web::{WebListener, WebListenerStatus, WebService, WebStatus};
 use serde_json::{Value, json};
 
+use corerouter_model::RoutingTable;
 use corerouter_model::certificate::Certificates;
 
 use super::args::{opt_bool, opt_parse, opt_str, opt_u32};
-use super::metrics_service::available_from;
+use super::metrics_service::{available_from, vrf_param};
 use super::{CommandSpec, always};
 use crate::{EngineError, Result, Session};
 
@@ -21,24 +22,24 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Web Access (HTTPS)",
         [],
         None,
-        "{enabled?: bool, address?: ip, port?: int 1..65535, available_from?: [prefix], certificate?: string (a /certificate with its key; none: the router's own), force?: bool (even if the next login of this session could not come back through it)} → {enabled, address, port, available_from, certificate, warning?}",
+        "{enabled?: bool, address?: ip, port?: int 1..65535, available_from?: [prefix], certificate?: string (a /certificate with its key; none: the router's own), vrf?: string (main or a VRF: the listener answers only there, out of the table OSPF and BGP feed), force?: bool (even if the next login of this session could not come back through it)} → {enabled, address, port, available_from, certificate, vrf, warning?}",
         always,
         set_ssl
     ),
     cmd!(query "ip.service.www-ssl.get", "Web Access (HTTPS)", [], None,
-        "{} → {enabled, address, port, available_from, certificate, status: stopped|listening|error, listening, last_error, refused, gui_files}",
+        "{} → {enabled, address, port, available_from, certificate, vrf, status: stopped|listening|error, listening, last_error, refused, gui_files}",
         always, get_ssl),
     cmd!(
         "ip.service.www.set",
         "Web Access (HTTP redirect)",
         [],
         None,
-        "{enabled?: bool, address?: ip, port?: int 1..65535, available_from?: [prefix]} → {enabled, address, port, available_from, warning?}",
+        "{enabled?: bool, address?: ip, port?: int 1..65535, available_from?: [prefix], vrf?: string (main or a VRF)} → {enabled, address, port, available_from, vrf, warning?}",
         always,
         set_plain
     ),
     cmd!(query "ip.service.www.get", "Web Access (HTTP redirect)", [], None,
-        "{} → {enabled, address, port, available_from, status: stopped|listening|error, listening, last_error, refused}",
+        "{} → {enabled, address, port, available_from, vrf, status: stopped|listening|error, listening, last_error, refused}",
         always, get_plain),
 ];
 
@@ -61,6 +62,7 @@ fn settings_json(c: &WebListener, r: Row) -> Value {
         "address": c.address,
         "port": c.port,
         "available_from": c.available_from,
+        "vrf": c.vrf,
     });
     // G1.6zs: only HTTPS has a certificate (`none` is the router's own).
     if let (Row::Ssl, Some(o)) = (r, v.as_object_mut()) {
@@ -73,7 +75,13 @@ fn settings_json(c: &WebListener, r: Row) -> Value {
 /// Applies `p` to row `r` of `web`: the rules of `set`, also for the preview
 /// (`ip.service.check`, on a copy). `certs` is `/certificate`, for
 /// `certificate`.
-pub(super) fn apply(web: &mut WebService, certs: &Certificates, p: &Value, r: Row) -> Result<Value> {
+pub(super) fn apply(
+    web: &mut WebService,
+    certs: &Certificates,
+    p: &Value,
+    r: Row,
+    vrf: Option<RoutingTable>,
+) -> Result<Value> {
     let enabled = opt_bool(p, "enabled")?;
     let address = opt_parse::<std::net::IpAddr>(p, "address")?;
     let port = opt_u32(p, "port")?
@@ -119,14 +127,19 @@ pub(super) fn apply(web: &mut WebService, certs: &Certificates, p: &Value, r: Ro
     if let Some(list) = from {
         c.available_from = list;
     }
+    if let Some(v) = vrf {
+        c.vrf = v;
+    }
     let mut out = settings_json(c, r);
     let other = match r {
         Row::Ssl => &web.www,
         Row::Plain => &web.www_ssl,
     };
     let (ssl, plain) = (&web.www_ssl, &web.www);
+    // Two VRFs are two places: the same port in each is no clash (G3.4zb).
     let clash = ssl.enabled
         && plain.enabled
+        && ssl.vrf == plain.vrf
         && ssl.port == plain.port
         && (ssl.address == plain.address
             || ssl.address.is_unspecified()
@@ -150,8 +163,9 @@ fn set(s: &mut Session, p: &Value, r: Row) -> Result<Value> {
     if r == Row::Ssl {
         crate::lockout::take_force(s, p)?;
     }
+    let vrf = vrf_param(s.store().candidate(), p)?;
     let mut web = s.store().candidate().system.web.clone();
-    let out = apply(&mut web, &s.store().candidate().system.certificates, p, r)?;
+    let out = apply(&mut web, &s.store().candidate().system.certificates, p, r, vrf)?;
     s.store_mut().candidate_mut().system.web = web;
     Ok(out)
 }

@@ -227,23 +227,44 @@ pub fn access_addresses(cfg: &Config, link: &Link) -> Vec<(corerouter_model::Ite
         .collect()
 }
 
-/// Whether this connection came in through listener `w`: the port and an
-/// address that covers ours. The listeners are the only sockets on their port.
-pub(crate) fn comes_through(w: &WebListener, link: &Link) -> bool {
+/// Whether this connection, which came in through `table` (its local
+/// address's VRF, or main), came in through listener `w`: the port, an
+/// address that covers ours, and the VRF (G3.4zb: a listener bound to a
+/// VRF only takes that VRF's connections; an unbound one in main may take a
+/// VRF's too, with `tcp_l3mdev_accept`). The listeners are the only sockets
+/// on their port.
+pub(crate) fn comes_through(w: &WebListener, link: &Link, table: &RoutingTable) -> bool {
     w.enabled
         && w.port == link.local.port()
         && (w.address.is_unspecified() || plain(w.address) == plain(link.local.ip()))
+        && (w.vrf.is_main() || w.vrf == *table)
 }
 
 /// What changing `www-ssl` from `before` to `after` does to the caller's next
 /// login, when this session comes through it (G1.6p); `None`: nothing.
-pub(crate) fn service_cut(before: &WebListener, after: &WebListener, link: &Link) -> Option<String> {
-    if !comes_through(before, link) {
+pub(crate) fn service_cut(
+    before: &WebListener,
+    after: &WebListener,
+    link: &Link,
+    table: &RoutingTable,
+) -> Option<String> {
+    if !comes_through(before, link, table) {
         return None;
     }
+    // A session of a VRF reached an unbound main listener only because the
+    // kernel lets it (`tcp_l3mdev_accept`); moved to another VRF it cannot.
+    let vrf_ok = after.vrf == *table || (after.vrf.is_main() && (table.is_main() || before.vrf.is_main()));
+    let moved;
     let what = if !after.enabled {
         "would turn off www-ssl"
-    } else if !comes_through(after, link) {
+    } else if !vrf_ok {
+        moved = format!(
+            "would move www-ssl to {}, and this session comes in through {}",
+            if after.vrf.is_main() { "main".to_owned() } else { format!("VRF {}", after.vrf) },
+            if table.is_main() { "main".to_owned() } else { format!("VRF {table}") }
+        );
+        moved.as_str()
+    } else if !comes_through(after, link, table) {
         "would move www-ssl away from the address and port"
     } else if !after.allows(link.peer.ip()) {
         "would leave your address out of the available_from of www-ssl"
@@ -385,7 +406,8 @@ impl Session {
         dyn_after: &[DynamicAddress],
     ) -> Option<String> {
         let link = self.caller().link?;
-        if let Some(why) = service_cut(&before.system.web.www_ssl, &after.system.web.www_ssl, &link) {
+        let table = crate::mgmt_guard::table_of_local(before, link.local.ip());
+        if let Some(why) = service_cut(&before.system.web.www_ssl, &after.system.web.www_ssl, &link, &table) {
             return Some(why);
         }
         // G3.4z: the guard that keeps a learned route off this session.
@@ -538,13 +560,14 @@ mod tests {
             f(&mut w);
             w
         };
-        assert!(comes_through(&on, &link), "every address, port 443");
+        let main = RoutingTable::Main;
+        assert!(comes_through(&on, &link, &main), "every address, port 443");
         // Unchanged, or a change that still lets this client back in.
-        assert_eq!(service_cut(&on, &on, &link), None);
+        assert_eq!(service_cut(&on, &on, &link, &main), None);
         let ok = with(&|w| w.available_from = vec!["192.0.2.0/24".parse().unwrap()]);
-        assert_eq!(service_cut(&on, &ok, &link), None);
+        assert_eq!(service_cut(&on, &ok, &link, &main), None);
         let ok = with(&|w| w.address = "192.0.2.1".parse().unwrap());
-        assert_eq!(service_cut(&on, &ok, &link), None);
+        assert_eq!(service_cut(&on, &ok, &link, &main), None);
         // Each way of losing the next login.
         for (after, says) in [
             (with(&|w| w.enabled = false), "turn off"),
@@ -552,14 +575,37 @@ mod tests {
             (with(&|w| w.address = "192.0.2.9".parse().unwrap()), "move"),
             (with(&|w| w.available_from = vec!["198.51.100.0/24".parse().unwrap()]), "leave your address out"),
         ] {
-            let why = service_cut(&on, &after, &link).unwrap();
+            let why = service_cut(&on, &after, &link, &main).unwrap();
             assert!(why.contains(says) && why.contains("Safe Mode"), "{why}");
         }
         // Another session (the TLS control port): the service is not its way in.
         let other = Link { local: "192.0.2.1:8729".parse().unwrap(), ..link };
-        assert_eq!(service_cut(&on, &with(&|w| w.enabled = false), &other), None);
+        assert_eq!(service_cut(&on, &with(&|w| w.enabled = false), &other, &main), None);
         // Off before: nothing to lose.
-        assert_eq!(service_cut(&with(&|w| w.enabled = false), &on, &link), None);
+        assert_eq!(service_cut(&with(&|w| w.enabled = false), &on, &link, &main), None);
+    }
+
+    /// G3.4zb: the VRF of www-ssl and the VRF a session comes in through.
+    #[test]
+    fn moving_www_ssl_to_another_vrf_cuts_the_session_of_this_one() {
+        let link = Link { peer: "10.99.0.2:50000".parse().unwrap(), local: "10.99.0.1:443".parse().unwrap() };
+        let mgmt: RoutingTable = "mgmt".parse().unwrap();
+        let main = RoutingTable::Main;
+        let on = WebListener { enabled: true, ..corerouter_model::web::WebService::factory().www_ssl };
+        let in_vrf = |v: &RoutingTable| WebListener { vrf: v.clone(), ..on.clone() };
+        // A main session: moving the service into a VRF cuts it.
+        let why = service_cut(&on, &in_vrf(&mgmt), &link, &main).unwrap();
+        assert!(why.contains("to VRF mgmt") && why.contains("through main"), "{why}");
+        // A session of the VRF: into its own VRF is fine, into another is not.
+        assert_eq!(service_cut(&on, &in_vrf(&mgmt), &link, &mgmt), None);
+        let blue: RoutingTable = "blue".parse().unwrap();
+        assert!(service_cut(&in_vrf(&mgmt), &in_vrf(&blue), &link, &mgmt).unwrap().contains("to VRF blue"));
+        // Back to main from the VRF: an unbound listener does not take the
+        // VRF's connections by default (tcp_l3mdev_accept=0).
+        assert!(service_cut(&in_vrf(&mgmt), &on, &link, &mgmt).unwrap().contains("to main"));
+        // A listener of another VRF never carried this session.
+        assert!(!comes_through(&in_vrf(&blue), &link, &mgmt));
+        assert_eq!(service_cut(&in_vrf(&blue), &on, &link, &mgmt), None);
     }
 
     #[test]

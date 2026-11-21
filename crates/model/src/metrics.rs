@@ -11,6 +11,8 @@ use std::net::{IpAddr, Ipv4Addr};
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
+use crate::types::RoutingTable;
+
 /// node_exporter's port (and VyOS `service monitoring prometheus
 /// node-exporter`): a Prometheus job written for one finds us.
 pub const DEFAULT_PORT: u16 = 9100;
@@ -31,6 +33,9 @@ pub struct MetricsService {
     /// (RouterOS `address` of `/ip service`). Others are disconnected
     /// without an answer.
     pub available_from: Vec<IpNet>,
+    /// G3.4zb: the VRF it listens in (RouterOS `/ip service … vrf=`).
+    #[serde(skip_serializing_if = "RoutingTable::is_main")]
+    pub vrf: RoutingTable,
 }
 
 impl Default for MetricsService {
@@ -40,6 +45,7 @@ impl Default for MetricsService {
             address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: DEFAULT_PORT,
             available_from: Vec::new(),
+            vrf: RoutingTable::Main,
         }
     }
 }
