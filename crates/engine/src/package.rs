@@ -136,8 +136,8 @@ pub struct Job {
     pub confirm: String,
     pub timeout_s: u64,
     pub reboot: bool,
-    /// Interfaces running with an address now ("management reachable"
-    /// after the reboot means these run again).
+    /// [`reachable_ports`] when the job was queued ("management reachable"
+    /// after the reboot means each of these runs with an address again).
     pub mgmt: Vec<String>,
     /// `system.tuning.boot` of the running configuration.
     pub tuning: Vec<(String, String)>,
@@ -279,4 +279,37 @@ pub fn status(s: &Session) -> Value {
         .unwrap_or_else(|| {
             json!({"supported": false, "reason": "the package service has not reported (daemon without it, or still starting)"})
         })
+}
+
+/// Interfaces running now with an address the operator can reach the router
+/// at: a static one, a DHCP lease, a DHCPv6 address or a PPPoE client
+/// session (the addresses of [`Session::effective`]).
+///
+/// The update records them before the reboot and the trial is confirmed
+/// automatically only when all of them carry an address again. G1.6ba: it
+/// counted only the static addresses, so a router managed over a DHCP lease
+/// (the notebook's ether2, dev.701) recorded no port, and a new image that
+/// broke the DHCP client was confirmed anyway, the slot kept with the router
+/// unreachable. The fallback address of a DHCP client (G4.7c) does not
+/// count: it says the lease was not obtained.
+pub fn reachable_ports(s: &mut Session) -> Vec<String> {
+    let live = s.hal_mut().poll();
+    let fallback: Vec<_> = s
+        .dhcp
+        .runners
+        .values()
+        .filter_map(|r| r.fallback.as_ref())
+        .collect();
+    let with_addr: std::collections::BTreeSet<String> = s
+        .effective(s.store().running())
+        .ip
+        .addresses
+        .iter()
+        .filter(|a| !a.disabled && !fallback.contains(a))
+        .map(|a| a.interface.to_string())
+        .collect();
+    live.iter()
+        .filter(|l| l.running && with_addr.contains(&l.name.to_string()))
+        .map(|l| l.name.to_string())
+        .collect()
 }

@@ -301,3 +301,33 @@ fn download_over_http() {
         p["running"] == "b" && p["trial"]["slot"] == "b" && p["trial"]["version"] == "9.2"
     });
 }
+
+/// Slow layer (G0.30): the daemon's 10 s grace after the (simulated)
+/// reboot before it confirms on its own, ~15 s in a dev build.
+///
+/// G1.6ba: a router managed over a DHCP lease (the notebook's ether2,
+/// dev.701) recorded no management port, so `confirm=auto` confirmed the
+/// trial without waiting for anything. Now the lease's port is recorded and
+/// named in the confirmation.
+#[test]
+fn slow_auto_confirm_waits_for_the_dhcp_port() {
+    let d = lab("dhcp");
+    exec(&d, "ip.dhcp-client.add", json!({"interface": "ether2"})).unwrap();
+    wait_for("the lease on ether2", Duration::from_secs(10), || {
+        exec(&d, "ip.dhcp-client.list", json!({})).is_ok_and(|l| l[0]["status"] == "bound")
+    });
+    let pkg = package(&d.dir.join("config"), "9.2");
+    let r = upload(&d, &pkg, json!({}), None);
+    assert_eq!(r["ok"], true, "{r}");
+    let mut last = Value::Null;
+    wait_for("B confirmed by the daemon", Duration::from_secs(30), || {
+        let p = exec(&d, "system.package.print", json!({})).unwrap();
+        last = p["last"].clone();
+        p["trial"].is_null() && p["primary"] == "b"
+    });
+    let detail = last.to_string();
+    assert!(
+        detail.contains("running with an address: ether2"),
+        "{detail}"
+    );
+}

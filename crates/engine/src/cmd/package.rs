@@ -16,14 +16,14 @@
 //! verity tree before the slot is activated). `abort` stops it; a client
 //! that disappears is dropped after 60 s without a chunk.
 
-use std::collections::BTreeSet;
-
 use base64::Engine as _;
 use serde_json::{Value, json};
 
 use super::args::{opt_bool, opt_str, opt_u32, req_str};
 use super::{CommandSpec, always};
-use crate::package::{Job, JobKind, Packages, Pushed, UPLOAD_CHUNK, Upload, push_chunk, status};
+use crate::package::{
+    Job, JobKind, Packages, Pushed, UPLOAD_CHUNK, Upload, push_chunk, reachable_ports, status,
+};
 use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
@@ -197,24 +197,6 @@ fn timeout(p: &Value) -> Result<u64> {
     }
 }
 
-/// Interfaces running now and carrying an enabled address.
-fn mgmt(s: &mut Session) -> Vec<String> {
-    let live = s.hal_mut().poll();
-    let with_addr: BTreeSet<String> = s
-        .store()
-        .running()
-        .ip
-        .addresses
-        .iter()
-        .filter(|a| !a.disabled)
-        .map(|a| a.interface.to_string())
-        .collect();
-    live.iter()
-        .filter(|l| l.running && with_addr.contains(&l.name.to_string()))
-        .map(|l| l.name.to_string())
-        .collect()
-}
-
 /// Not now: another job, a pending trial (the command is fine, the moment
 /// is not).
 fn conflict(reason: impl Into<String>) -> EngineError {
@@ -266,7 +248,7 @@ pub(crate) fn queue(s: &mut Session, kind: JobKind, p: &Value) -> Result<Value> 
         let force = opt_bool(p, "force")?.unwrap_or(false);
         super::system_power::restart_guard(s, "reboot of the update", force)?;
     }
-    let mgmt = if kind.arms_trial() { mgmt(s) } else { Vec::new() };
+    let mgmt = if kind.arms_trial() { reachable_ports(s) } else { Vec::new() };
     let tuning: Vec<(String, String)> = s
         .store()
         .running()
