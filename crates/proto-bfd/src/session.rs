@@ -118,6 +118,9 @@ pub struct Session {
     next_tx: Option<u64>,
     detect_at: Option<u64>,
     forget_auth_at: Option<u64>,
+    /// G3.6n: until when a session handed over Up only listens (see
+    /// [`Session::resume`]).
+    resume_until: Option<u64>,
     rng: u64,
     pub tx_packets: u64,
     pub rx_packets: u64,
@@ -152,6 +155,7 @@ impl Session {
             next_tx: None,
             detect_at: None,
             forget_auth_at: None,
+            resume_until: None,
             rng: seed | 1,
             tx_packets: 0,
             rx_packets: 0,
@@ -281,9 +285,33 @@ impl Session {
         }
     }
 
+    /// G3.6n: this session may be one another implementation kept Up
+    /// until now (FRR's `bfdd` runs the sessions in software while its data
+    /// plane, this engine, restarts, and hands them back Down: its
+    /// `DP_ADD_SESSION` carries no state, bfdd/dplane.c). Until `until` it
+    /// sends nothing and listens: a first packet that says Up and carries
+    /// our discriminator as Your Discriminator proves the peer's session is
+    /// this one, Up (RFC 5880 §6.8.1: bfd.LocalDiscr is unique to the
+    /// session, and §6.8.6 accepts no packet whose Your Discriminator is
+    /// not ours), so the session goes on Up, without the Down → Init → Up
+    /// that would take it, and its clients, down on the peer. Any other
+    /// packet, or the end of the wait, starts it the normal way (§6.8.7: a
+    /// Down session sends at once). Only a Down session waits.
+    pub fn resume(&mut self, until: u64) {
+        if self.state == State::Down {
+            self.resume_until = Some(until);
+            self.next_tx = None;
+        }
+    }
+
+    /// Whether the session is still waiting to hear whether it is resumed.
+    pub fn resuming(&self) -> bool {
+        self.resume_until.is_some()
+    }
+
     /// The earliest time [`Session::on_timer`] has work.
     pub fn next_deadline(&self) -> Option<u64> {
-        [self.next_tx, self.detect_at, self.forget_auth_at]
+        [self.next_tx, self.detect_at, self.forget_auth_at, self.resume_until]
             .into_iter()
             .flatten()
             .min()
@@ -383,7 +411,12 @@ impl Session {
         self.detect_at = (detect > 0).then_some(now + detect);
         // §6.8.1 bfd.AuthSeqKnown: forgotten after two Detection Times of silence.
         self.forget_auth_at = (self.cfg.auth.is_some() && detect > 0).then_some(now + 2 * detect);
-        if self.state != State::AdminDown {
+        let resumed = self.resume_until.take().is_some_and(|until| {
+            now < until && self.state == State::Down && p.state == State::Up && p.your_discr == self.local_discr
+        });
+        if resumed {
+            out.change = self.set_state(State::Up, Diag::None);
+        } else if self.state != State::AdminDown {
             out.change = if p.state == State::AdminDown {
                 if self.state != State::Down {
                     self.set_state(State::Down, Diag::NeighborSignaledDown)
@@ -447,6 +480,16 @@ impl Session {
         {
             self.forget_auth_at = None;
             self.rcv_seq.known = false;
+        }
+        // G3.6n: nobody spoke while it waited: a Down session as any other.
+        if let Some(at) = self.resume_until
+            && at <= now
+        {
+            self.resume_until = None;
+            if self.periodic_allowed() && !out.send {
+                out.send = true;
+                self.schedule_tx(now);
+            }
         }
         if let Some(at) = self.next_tx
             && at <= now
@@ -616,6 +659,67 @@ mod tests {
         let p = Packet::decode(&raw[..m]).unwrap();
         a.receive(&raw[..m], &p, MS).unwrap();
         assert!(a.remote_cpi());
+    }
+
+    /// G3.6n: `a` restarts (a new Session with the same discriminator, as
+    /// bfdd hands its sessions back to a reconnected data plane, Down):
+    /// waiting to hear the peer, it takes the session back Up and the peer
+    /// never leaves Up.
+    #[test]
+    fn a_resumed_session_takes_over_without_a_down_on_the_peer() {
+        let mut w = Wire::new(fast(), fast());
+        w.run(300 * MS);
+        assert_eq!((w.a.state(), w.b.state()), (State::Up, State::Up));
+        w.changes.clear();
+        // 40 ms of silence (the handover), then the new `a`.
+        w.cut = true;
+        w.run(340 * MS);
+        w.cut = false;
+        w.a = Session::new(0x1111, fast(), w.now, 9);
+        w.a.resume(w.now + 75 * MS);
+        assert!(w.a.resuming());
+        w.run(400 * MS);
+        assert_eq!((w.a.state(), w.b.state()), (State::Up, State::Up));
+        assert!(!w.a.resuming());
+        assert!(w.changes.iter().all(|(who, _)| *who == 'a'), "the peer never changed: {:?}", w.changes);
+        assert_eq!(w.changes.len(), 1, "{:?}", w.changes);
+        assert_eq!(w.a.remote_discr(), 0x2222);
+        // And it stays up (the Poll Sequence of the fast timers ends).
+        w.run(900 * MS);
+        assert_eq!((w.a.state(), w.b.state()), (State::Up, State::Up));
+    }
+
+    /// G3.6n: a packet that does not prove the session (another Your
+    /// Discriminator, or a peer that is not Up) ends the wait: the normal
+    /// handshake; so does silence for the whole wait.
+    #[test]
+    fn a_resume_without_proof_starts_the_normal_way() {
+        let mut a = Session::new(0x1111, fast(), 0, 1);
+        a.resume(75 * MS);
+        assert_eq!(a.next_deadline(), Some(75 * MS));
+        assert!(!a.on_timer(10 * MS).send, "it listens first");
+        let mut b = Session::new(0x2222, fast(), 0, 2);
+        let mut buf = [0u8; MAX_LEN];
+        let n = b.build(false, &mut buf);
+        let mut p = Packet::decode(&buf[..n]).unwrap();
+        p.state = State::Up;
+        p.your_discr = 0x9999;
+        let mut raw = [0u8; MAX_LEN];
+        let m = p.encode(&mut raw);
+        let p = Packet::decode(&raw[..m]).unwrap();
+        let r = a.receive(&raw[..m], &p, 20 * MS).unwrap();
+        assert!(r.change.is_none() && a.state() == State::Down && !a.resuming());
+        assert!(a.next_deadline().is_some_and(|t| t <= 20 * MS + 1_000 * MS), "sending again");
+        // Silence for the whole wait: it starts sending at its end.
+        let mut c = Session::new(0x3333, fast(), 0, 3);
+        c.resume(75 * MS);
+        assert!(!c.on_timer(74 * MS).send);
+        assert!(c.on_timer(75 * MS).send);
+        assert!(!c.resuming() && c.state() == State::Down);
+        // Only a Down session waits.
+        let mut d = Session::new(0x4444, Config { admin_down: true, ..fast() }, 0, 4);
+        d.resume(75 * MS);
+        assert!(!d.resuming());
     }
 
     #[test]

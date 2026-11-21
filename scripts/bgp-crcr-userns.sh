@@ -141,6 +141,8 @@ frr_start() {
   local ns=$1 p; shift
   mkdir -p "/etc/frr/$ns" "/var/lib/frr/$ns" "/var/run/frr/$ns"
   for p in zebra bgpd ospfd staticd bfdd; do : > "/etc/frr/$ns/$p.conf"; done
+  # BFD_DEBUG=1: bfdd's view of its data plane and sessions in frr-<ns>.log.
+  [ -z "${BFD_DEBUG:-}" ] || printf 'log stdout debugging\ndebug bfd peer\ndebug bfd network\ndebug bfd distributed\n' > "/etc/frr/$ns/bfdd.conf"
   [ -f "$W/$ns.bgpd" ] && cp "$W/$ns.bgpd" "/etc/frr/$ns/bgpd.conf"
   for p in "$@"; do
     case $p in
