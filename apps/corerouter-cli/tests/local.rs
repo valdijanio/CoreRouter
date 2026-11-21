@@ -22,12 +22,10 @@ fn router(dir: &Path) -> u16 {
     gate.add_local_token(&token);
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join(format!("control-{port}.token")), &token).unwrap();
-    spawn(
-        Endpoint::loopback(listener),
-        SharedHost(shared(Session::virtual_lab())),
-        gate,
-    )
-    .unwrap();
+    // A clock, as the daemon's tick gives it (a Safe Mode timeout needs one).
+    let mut lab = Session::virtual_lab();
+    lab.tick(1_792_591_389);
+    spawn(Endpoint::loopback(listener), SharedHost(shared(lab)), gate).unwrap();
     port
 }
 
@@ -219,5 +217,65 @@ fn run_refuses_safe_mode_which_would_end_with_its_connection() {
         ],
     );
     assert!(ok, "{err}");
+    let _ = std::fs::remove_dir_all(base);
+}
+
+/// G1.6qg: `run config.safe-mode.enter {detach: true}` is allowed: the
+/// Safe Mode outlives the connection of that `run`, every later login is
+/// warned with the time left, and another `run` by the same user confirms.
+#[test]
+fn run_enters_a_detached_safe_mode_and_another_run_confirms_it() {
+    let base = std::env::temp_dir().join(format!("cr-cli-detach-{}", std::process::id()));
+    let runtime = base.join("run");
+    let port = router(&runtime);
+    let addr = format!("127.0.0.1:{port}");
+    let run = |args: &[&str]| {
+        let mut all = vec!["--connect", addr.as_str(), "run"];
+        all.extend_from_slice(args);
+        cli(&runtime, &all)
+    };
+
+    let (ok, out, err) = run(&[
+        "config.safe-mode.enter",
+        r#"{"timeout_secs":300,"detach":true}"#,
+    ]);
+    assert!(ok, "{err}");
+    let entered: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        (
+            entered["detached"].as_bool(),
+            entered["expires_in"].as_u64()
+        ),
+        (Some(true), Some(300)),
+        "{out}"
+    );
+    // Its connection closed with the command: still on, and the next login
+    // says so.
+    let (ok, _, err) = run(&["system.identity.set", r#"{"name":"pending"}"#]);
+    assert!(ok, "{err}");
+    assert!(
+        err.contains("WARNING: Safe Mode (detached) entered by local"),
+        "{err}"
+    );
+    let (ok, out, err) = cli(&runtime, &["--connect", &addr, "inspect"]);
+    assert!(ok, "{err}");
+    assert!(
+        err.contains("1 change(s) are undone in"),
+        "the login after the change: {err}"
+    );
+    let state: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(state["safe_mode"]["active"], true, "{out}");
+    assert_eq!(state["safe_mode"]["owner_connected"], false, "{out}");
+    // Confirmed by another `run` (the same user: the local token).
+    let (ok, out, err) = run(&["config.safe-mode.exit"]);
+    assert!(ok, "{err}");
+    assert!(out.contains("confirmed"), "{out}");
+    let (ok, out, err) = run(&["system.identity.get"]);
+    assert!(ok, "{err}");
+    assert!(out.contains("pending"), "{out}");
+    assert!(
+        !err.contains("Safe Mode"),
+        "no warning once confirmed: {err}"
+    );
     let _ = std::fs::remove_dir_all(base);
 }
