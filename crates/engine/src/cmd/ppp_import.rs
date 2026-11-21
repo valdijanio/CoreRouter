@@ -32,7 +32,7 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[cmd!(
     "ppp.secret.import", "Import PPP Secrets", [], None,
-    "{text: string (a RouterOS export: /ppp secret export show-sensitive, or a whole /export show-sensitive; at most 32 MiB, 16 MiB over the control channel; masked in the journal), profile_map?: {<routeros profile>: string} (a RouterOS profile and the one of ours its secrets get), on_conflict?: skip|replace|rename (a name that exists here; default skip; rename adds -2, -3…), create_profiles?: bool (create the profiles the file defines and we lack; default true), dry_run?: bool (only the report)} → {dry_run, total (secrets in the file), profiles: [{name (as in the file), count (secrets that use it), here (we have it), in_file (the file defines it), target (where its secrets go, empty: missing)}], with_password, without_password: {count, names}, profiles_in_file, profiles_created, missing_profiles, conflicts: {count, names}, added, replaced, renamed: [{from, to}], skipped, duplicates, set_unknown, unsupported: {<field>: count}, errors: [{line, name?, param?, message}], warnings, ignored_lines, reminder}",
+    "{text: string (a RouterOS export: /ppp secret export show-sensitive, or a whole /export show-sensitive; at most 32 MiB, 16 MiB over the control channel; masked in the journal), profile_map?: {<routeros profile>: string} (a RouterOS profile and the one of ours its secrets get), on_conflict?: skip|replace|rename (a name that exists here; default skip; rename adds -2, -3…), create_profiles?: bool (create the profiles the file defines and we lack; default true), dry_run?: bool (only the report)} → {dry_run, total (secrets in the file), profiles: [{name (as in the file), count (secrets that use it), here (we have it), in_file (the file defines it), target (where its secrets go, empty: missing)}], with_password, without_password: {count, names}, profiles_in_file, profiles_created, missing_profiles, conflicts: {count, names}, added, replaced, renamed: [{from, to}], skipped, duplicates, set_unknown, unsupported: {<field>: count}, errors: [{line, name?, param?, message}], warnings, ignored_lines, reminder, checkpoint?: {name, revision, rotated} | {error} (G0.33b: from 100 secrets added or replaced, the automatic checkpoint saved first)}",
     always, import
 )];
 
@@ -576,6 +576,16 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
                 report.errors_total
             ),
         ));
+    }
+    // G0.33b: a large import replaces much at once: the config before it
+    // as an automatic checkpoint (the newest 4 kept).
+    let mut out = out;
+    let changes = added.saturating_add(replaced);
+    if changes >= super::config_checkpoint::LARGE_IMPORT
+        && let Some(o) = out.as_object_mut()
+    {
+        let what = format!("ppp.secret.import of {changes} secrets");
+        o.insert("checkpoint".into(), super::config_checkpoint::before_change(s, &what));
     }
     let ppp = &mut s.store_mut().candidate_mut().ppp;
     // In place, keeping the indexes (G4.3gb): only the touched blocks of
