@@ -115,26 +115,46 @@ fn query_helper() {
     common::query_helper();
 }
 
-/// The BFD of both paths up with the fast timers, as the monitor of
-/// `netns` shows it. `up` alone is not enough: a session comes up with the
-/// slow timers (3 s detection) and only gets the fast ones after the Poll
-/// Sequence, so a peer killed in between is caught by the dead interval.
+/// The BFD of both paths up with the fast timers and not damped, as the
+/// monitor of `netns` shows it. `up` alone is not enough: a session comes
+/// up with the slow timers (3 s detection) and only gets the fast ones
+/// after the Poll Sequence, so a peer killed in between is caught by the
+/// dead interval. A damped path is up too, but the role machine ignores
+/// its losses (RFC 5882 §3.2) and the dead interval decides.
 fn bfd_up(netns: Option<u32>) -> bool {
     let m = monitor(netns);
     let p = m["bfd"].as_array().cloned().unwrap_or_default();
     p.len() == 2
         && p.iter()
-            .all(|x| x["state"] == "up" && x["detect_ms"] == 150)
+            .all(|x| x["state"] == "up" && x["detect_ms"] == 150 && x["suppressed"] == false)
 }
 
-/// BFD up on both paths of both nodes for a whole second. A 150 ms
-/// detection time is also lost for real when the machine starves a daemon
-/// that long: the pair then falls back on its hellos (`dead-interval`),
-/// rightly, and a takeover started in that moment cannot show BFD's
-/// (flaked in the queue's batches). A bug that keeps BFD down never gets
-/// a steady second.
+/// A path of `netns` is damped.
+fn damped(netns: Option<u32>) -> bool {
+    monitor(netns)["bfd"]
+        .as_array()
+        .is_some_and(|p| p.iter().any(|x| x["suppressed"] == true))
+}
+
+/// BFD up and not damped on both paths of both nodes for a whole second.
+/// A 150 ms detection time is also lost for real when the machine starves
+/// a daemon that long: the peer's BFD expires, its hellos then arrive (a
+/// false alarm) and two such losses damp the path for ~26 s (penalty
+/// 1 000 per loss and per false alarm, `suppress` 2 500, `reuse` 800,
+/// half-life 15 s: G0.30l, forced by dropping B's BFD and witness
+/// answers twice for 250 ms, **medido**). A takeover started then is
+/// found by the hellos' dead interval, rightly, and cannot show BFD's. So the test waits for
+/// the penalty to decay below `reuse` (at most `max_suppress`, 120 s: the
+/// RFC 2439 ceiling) and for a steady second. A bug that keeps BFD down
+/// or damped never gets one.
 fn steady_bfd(b: u32) {
     for attempt in 1..=10 {
+        let t = until("BFD undamped on both nodes", 130, || {
+            !damped(None) && !damped(Some(b))
+        });
+        if t > Duration::from_millis(100) {
+            eprintln!("BFD window {attempt}: waited {t:?} for a damped path to be reused");
+        }
         until("BFD up on both paths of both nodes", 20, || {
             bfd_up(None) && bfd_up(Some(b))
         });
@@ -150,7 +170,9 @@ fn steady_bfd(b: u32) {
         if steady {
             return;
         }
-        eprintln!("BFD window {attempt}: a path went down (the machine starved a daemon?)");
+        eprintln!(
+            "BFD window {attempt}: a path went down or was damped (the machine starved a daemon?)"
+        );
     }
     panic!("no steady second of BFD in 10 tries");
 }
