@@ -360,7 +360,7 @@ fn source_label(source: &str) -> &'static str {
 pub(crate) fn tooltip_ui(ui: &mut Ui, l: Lang, r: &Value) {
     if let Some(c) = r.get("cgnat") {
         ui.label(format!(
-            "CGNAT: {}:{} → {} ({})",
+            "CGNAT: {}:{} -> {} ({})",
             text(c, "public"),
             c.get("port").and_then(Value::as_u64).unwrap_or(0),
             text(c, "subscriber"),

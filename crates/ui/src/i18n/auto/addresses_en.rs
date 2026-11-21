@@ -36,7 +36,7 @@ Uncheck it to skip the probe (one packet, up to 2 s)."##,
     (
         "ip.address.disabled",
         r##"## What it is
-A disabled address stays in the configuration and leaves the data plane (the kernel): no traffic, no connected route. Enable it again with ✓.
+A disabled address stays in the configuration and leaves the data plane (the kernel): no traffic, no connected route. Enable it again with **Enable**.
 
 Useful to keep a spare or an address you will move back."##,
     ),
@@ -67,7 +67,7 @@ The network the address belongs to (the address with the host bits cleared). It 
         "ip.address.state",
         r##"## What it says
 - **active**: in the kernel and in use.
-- **disabled**: kept in the configuration, out of the kernel (✓ brings it back).
+- **disabled**: kept in the configuration, out of the kernel (**Enable** brings it back).
 - **invalid**: cannot be used: its interface is missing or disabled, or its pool has no prefix yet.
 - **tentative**: IPv6 duplicate address detection is running (RFC 4862 §5.4), about a second.
 - **dad-failed**: another host on the link has this IPv6 address; the kernel will not use it.

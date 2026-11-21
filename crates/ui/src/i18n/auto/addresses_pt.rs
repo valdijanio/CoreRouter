@@ -95,7 +95,7 @@ Desmarque para pular a sonda. Ela é um pacote e leva até 2 s."##,
     (
         "ip.address.disabled",
         r##"## O que é
-Um endereço desativado fica na configuração e sai do plano de dados (o kernel): sem tráfego e sem rota conectada. Para voltar, ative com ✓.
+Um endereço desativado fica na configuração e sai do plano de dados (o kernel): sem tráfego e sem rota conectada. Para voltar, use **Enable**.
 
 Serve para guardar um endereço reserva ou um que vai voltar depois."##,
     ),
@@ -126,7 +126,7 @@ A rede a que o endereço pertence: o endereço com os bits de host zerados. É t
         "ip.address.state",
         r##"## O que diz
 - **active**: está no kernel, em uso.
-- **disabled**: fica na configuração e sai do kernel. Para voltar, use ✓.
+- **disabled**: fica na configuração e sai do kernel. Para voltar, use **Enable**.
 - **invalid**: não pode ser usado. A interface não existe ou está desativada, ou o pool ainda não tem prefixo.
 - **tentative**: a detecção de endereço duplicado do IPv6 está rodando (RFC 4862 §5.4). Leva cerca de um segundo.
 - **dad-failed**: outro host do enlace tem este endereço IPv6, e o kernel não o usa.
