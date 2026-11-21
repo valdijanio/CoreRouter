@@ -542,3 +542,19 @@ pub fn shift_secs(t: u64, delta: i64) -> u64 {
         t.saturating_sub(delta.unsigned_abs()).max(1)
     }
 }
+
+#[cfg(test)]
+mod shift_tests {
+    use super::shift_secs;
+
+    #[test]
+    fn shifts_keep_never_and_saturate() {
+        assert_eq!(shift_secs(0, 1_000), 0, "never stays never");
+        assert_eq!(shift_secs(1_000, 500), 1_500);
+        assert_eq!(shift_secs(1_000, -400), 600);
+        // Back past 1970: the earliest time, not "never".
+        assert_eq!(shift_secs(1_000, -5_000), 1);
+        assert_eq!(shift_secs(u64::MAX - 1, 10), u64::MAX);
+        assert_eq!(shift_secs(10, i64::MIN), 1);
+    }
+}

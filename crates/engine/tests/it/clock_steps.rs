@@ -96,15 +96,24 @@ fn dynamic_address_list_entries_follow_the_monotonic_clock() {
 
 fn lan(s: &mut Session) {
     for (id, p) in [
-        ("ip.address.add", json!({"address": "10.0.0.1/16", "interface": "ether2"})),
-        ("ip.pool.add", json!({"name": "subs", "ranges": "10.0.1.0-10.0.255.254"})),
+        (
+            "ip.address.add",
+            json!({"address": "10.0.0.1/16", "interface": "ether2"}),
+        ),
+        (
+            "ip.pool.add",
+            json!({"name": "subs", "ranges": "10.0.1.0-10.0.255.254"}),
+        ),
         (
             "ip.dhcp-server.add",
             json!({"interface": "ether2", "address_pool": "subs", "lease_time": "2m",
                    "conflict_detection": false, "client_rate_limit": 0,
                    "address_lists": "subscribers"}),
         ),
-        ("ip.dhcp-server.network.add", json!({"address": "10.0.0.0/16", "gateway": "10.0.0.1"})),
+        (
+            "ip.dhcp-server.network.add",
+            json!({"address": "10.0.0.0/16", "gateway": "10.0.0.1"}),
+        ),
     ] {
         ok(s, id, p);
     }
@@ -156,12 +165,22 @@ fn dhcp_leases_keep_their_time_across_a_step() {
             left - 1,
             "step {step}"
         );
-        assert_eq!(in_list(&mut s, "subscribers").len(), before.len(), "step {step}");
+        assert_eq!(
+            in_list(&mut s, "subscribers").len(),
+            before.len(),
+            "step {step}"
+        );
         if step.abs() >= 1000 {
-            assert!(counting.take().rewrites >= 1, "step {step}: journal not rewritten");
+            assert!(
+                counting.take().rewrites >= 1,
+                "step {step}: journal not rewritten"
+            );
         }
         let log = ok(&mut s, "log.print", json!({})).to_string();
-        assert!(log.contains("deu um passo de"), "step {step}: not in the log");
+        assert!(
+            log.contains("deu um passo de"),
+            "step {step}: not in the log"
+        );
         // And they end on time.
         let w = clocks.pass(left - 2);
         s.tick(w);
