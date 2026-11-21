@@ -456,7 +456,7 @@ fn pin(lab: &dyn Fn(Vm) -> Lab, chosen: Option<Vm>, rest: &[String]) -> Result<(
         Some(PinTarget::Lab(v)) => (Some(v), false),
         None => (chosen, false),
     };
-    let mut plan: Vec<(&str, u32, &[u32], &str, Option<Lab>)> = Vec::new();
+    let mut plan: Vec<PinJob> = Vec::new();
     if !ci_only {
         for vm in VMS {
             if chosen.is_some_and(|c| c != vm) {
@@ -472,16 +472,34 @@ fn pin(lab: &dyn Fn(Vm) -> Lab, chosen: Option<Vm>, rest: &[String]) -> Result<(
                 vcpu_count(&virsh(&["vcpucount", vm.name, "--config"])?)
             }
             .unwrap_or(vm.cpus);
-            plan.push((vm.name, cpus, vm.vcpu_cpus, vm.emulator_cpus, Some(l)));
+            plan.push(PinJob {
+                name: vm.name,
+                cpus,
+                vcpu_cpus: vm.vcpu_cpus,
+                emulator: vm.emulator_cpus,
+                lab: Some(l),
+            });
         }
     }
-    if chosen.is_none() || ci_only {
-        if let Ok(out) = virsh(&["vcpucount", CI_NAME, "--config"]) {
-            let cpus = vcpu_count(&out).unwrap_or(16);
-            plan.push((CI_NAME, cpus, CI_VCPU_CPUS, CI_EMULATOR_CPUS, None));
-        }
+    if (chosen.is_none() || ci_only)
+        && let Ok(out) = virsh(&["vcpucount", CI_NAME, "--config"])
+    {
+        plan.push(PinJob {
+            name: CI_NAME,
+            cpus: vcpu_count(&out).unwrap_or(16),
+            vcpu_cpus: CI_VCPU_CPUS,
+            emulator: CI_EMULATOR_CPUS,
+            lab: None,
+        });
     }
-    for (name, cpus, vcpu_cpus, emulator, l) in plan {
+    for PinJob {
+        name,
+        cpus,
+        vcpu_cpus,
+        emulator,
+        lab: l,
+    } in plan
+    {
         if let Some(l) = &l
             && !force
             && let Err(why) = l.idle()
@@ -552,6 +570,16 @@ fn pin_summary(vcpupin: &str, emulatorpin: &str, want: &[u32], want_emu: &str) -
         "not the map of docs/vm-lab.md: `cargo xtask vm-lab pin`"
     };
     format!("vCPU→CPU {pairs}; emulator {emu} ({verdict})")
+}
+
+/// One VM for `pin`: its map, and the lab (for the round check) unless it
+/// is the CI runner.
+struct PinJob {
+    name: &'static str,
+    cpus: u32,
+    vcpu_cpus: &'static [u32],
+    emulator: &'static str,
+    lab: Option<Lab>,
 }
 
 /// What `pin --vm <x>` names: a lab VM or the CI runner.
