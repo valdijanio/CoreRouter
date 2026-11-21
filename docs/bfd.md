@@ -160,54 +160,71 @@ própria thread, sem o lock do `Session`; veja `docs/bng-ha.md` §2.13).
 
 O motor roda no `corerouter-daemon`, como plano de dados do `bfdd`. Um `kill -9` ou uma
 atualização só do daemon derrubavam o BGP do vizinho, embora o `bgpd`, o `zebra` e o
-encaminhamento do kernel continuassem vivos. **Medido** no laboratório do host
-(`scripts/bgp-crcr-userns.sh cbit`, BFD 100 ms × 3, FRR 10.7.1, 2026-11-21): o CR2 perdeu a rota
-do CR1 476 ms depois do `kill -9` e 162 de 389 pings se perderam (416–423 ms na G3.9fj).
+encaminhamento do kernel continuassem vivos.
+
+**Medido** no laboratório do host (`scripts/bgp-crcr-userns.sh cbit`, BFD 100 ms × 3, eBGP com GR,
+FRR 10.7.1, ping a cada 20 ms, 2026-11-21):
+
+| `kill -9` no CR1 | antes | depois (`bfdd` da imagem, `BFDD_BIN`) |
+|---|---|---|
+| só o `corerouter-daemon` | rota do CR1 some do CR2 em 476 ms; 162 de 389 pings perdidos | rota fica, BGP e BFD no ar; **0 de 557** |
+| `bgpd` + `bfdd` | rota fica; 2 de 521 | rota fica; 2 de 549 |
+| a pilha inteira | rota fica; 2 de 390 | rota fica; 2 de 557 |
 
 **Causa, no fonte do FRR 10.7.1** (`BFD_DEBUG=1` no laboratório):
-- quando o plano de dados desconecta, o `bfdd` devolve as sessões ao BFD em software
-  (`_bfd_session_unregister_dplane`, `bfdd/dplane.c`) com o estado que o plano de dados informou,
-  Up;
-- só que o `bfd_vrf_start_sockets` (`bfdd/bfd.c`) não abre os sockets de recepção quando há
-  `--dplaneaddr`: o software transmite e não ouve;
-- e os tempos dele continuam os lentos de uma sessão nova (`xmt_TO` e `cur_timers` em 1 s): o
-  primeiro pacote sai depois de 0,75–1 s, depois da detecção do vizinho (300 ms);
-- no log: o daemon some às 00:13:45, o `bfdd` declara Down às 00:13:48 (`path-down`, a detecção
-  lenta de 3 s), o vizinho já tinha caído.
+1. quando o plano de dados desconecta, o `bfdd` devolve as sessões ao BFD em software
+   (`_bfd_session_unregister_dplane`, `bfdd/dplane.c`) com o estado que o plano de dados
+   informou, Up; mas `bfd_vrf_start_sockets` (`bfdd/bfd.c`) não abre os sockets de recepção com
+   `--dplaneaddr`, e os tempos continuam os lentos de uma sessão nova (`xmt_TO` e `cur_timers` em
+   1 s): o software manda devagar demais e não ouve. No log, o daemon some às 00:13:45, o vizinho
+   cai em 476 ms e o `bfdd` só declara Down às 00:13:48 (a detecção lenta de 3 s);
+2. na volta do plano de dados, `_bfd_session_register_dplane` chama `bfd_session_disable`, que
+   avisa os clientes de um Down (`path-down`): o `bgpd` local derruba a sessão por um instante
+   (53 de 556 pings perdidos com só o item 1 corrigido, **medido**); e o `DP_ADD_SESSION` não
+   leva estado (`bfddp_packet.h`), então o plano de dados começaria a sessão Down e o vizinho
+   cairia.
 
-**Decisão: corrigir o `bfdd` e retomar a sessão do nosso lado** (não um processo de BFD à parte,
-nem AdminDown):
-- `os/patches/frr/0008-bfdd-dplane-software-fallback.patch`: o software ouve enquanto não há plano
-  de dados (os sockets abrem e fecham com a contagem de sessões em software, que já existia), e
-  uma sessão Up devolvida a ele usa os tempos negociados que o plano de dados informou e manda um
-  pacote na hora (RFC 5880 §6.8.3, §6.8.4, §6.8.7). O texto do patch serve para o envio ao FRR
-  (`docs/upstream.md`).
-- Na volta, o `bfdd` entrega a sessão Down: o `DP_ADD_SESSION` não leva estado nem o
-  discriminador remoto (`bfddp_packet.h`). O motor então espera ouvir antes de mandar
-  (`Session::resume`, `corerouter_proto_bfd::session`): metade da detecção provável do vizinho
-  (o nosso intervalo × o multiplicador / 2, de 20 ms a 1,5 s). Se o primeiro pacote diz Up e traz o
-  nosso discriminador como Your Discriminator, a sessão é esta, e continua Up (RFC 5880 §6.8.1:
-  o discriminador é único da sessão; §6.8.6: só um pacote com o nosso discriminador é aceito). Com
-  qualquer outro pacote, ou no fim da espera, ela começa do jeito normal. Sem a espera, o motor
-  novo mandaria Down e o vizinho cairia (o teste `a_restarted_engine_resumes_the_session_without_a_down_on_the_peer`
-  mostra Up → Down → Up no vizinho sem ela).
-- Enquanto o `bfdd` ainda segura a porta 3784 (de outro usuário, `frr`, então fora do grupo
+**Decisão: corrigir o `bfdd` onde está o defeito e retomar a sessão do nosso lado** —
+`os/patches/frr/0008-bfdd-dplane-software-fallback.patch` (texto pronto para o FRR,
+`docs/upstream.md`):
+- sem plano de dados, o software ouve (os sockets abrem e fecham com a contagem de sessões em
+  software, que já existia) e uma sessão Up usa os tempos negociados que o plano de dados
+  informou, mandando um pacote na hora (RFC 5880 §6.8.3, §6.8.4, §6.8.7);
+- na volta, uma sessão Up passa ao plano de dados sem o aviso de Down aos clientes e com a flag
+  nova `SESSION_RESUME` no `DP_ADD_SESSION`;
+- o motor, ao ver a flag, espera ouvir antes de mandar (`Session::resume`,
+  `corerouter_proto_bfd::session`): metade da detecção provável do vizinho (o nosso intervalo ×
+  o multiplicador / 2, de 20 ms a 1,5 s). Se o primeiro pacote diz Up e traz o nosso
+  discriminador como Your Discriminator, a sessão é esta e continua Up (RFC 5880 §6.8.1: o
+  discriminador é único da sessão; §6.8.6: só um pacote com o nosso discriminador é aceito).
+  Qualquer outro pacote, ou o fim da espera, informa Up → Down (os clientes a conheciam Up) e
+  começa a sessão do jeito normal. Sem a flag (o `bfdd` sem o patch, ou uma sessão nova), nada
+  muda: começa na hora;
+- enquanto o `bfdd` ainda segura a porta 3784 (de outro usuário, `frr`, fora do grupo
   `SO_REUSEPORT`), as sessões que ele entrega esperam e são tentadas de novo a cada 20 ms
   (`dp_waiting`), em vez de se perderem.
 
+Testes: `a_resumed_session_takes_over_without_a_down_on_the_peer` e
+`a_resume_without_proof_starts_the_normal_way` (proto-bfd);
+`a_restarted_engine_resumes_the_session_without_a_down_on_the_peer` (daemon; sem a retomada o
+vizinho vê Up → Down → Up); `cbit` do laboratório do host (com `BFDD_BIN`, exige a rota mantida);
+`frr-test` da imagem (mata o daemon do r1 e confere a sessão do r2).
+
 **Por que não as outras:**
 - **AdminDown antes de um reinício planejado** (RFC 5882 §3.2: o cliente não age): não cobre o
-  `kill -9` nem uma queda do daemon, e o `bfdd` do lado de cá ainda cairia pela detecção lenta.
-  Fica para o reboot planejado da máquina inteira (gap G3.6o).
+  `kill -9` nem uma queda do daemon, e o `bfdd` de cá cairia mesmo assim. Fica para o reboot
+  planejado da máquina inteira (gap G3.6o).
 - **Um processo próprio de BFD** que sobrevive ao daemon (o caminho do Junos, `ppmd` na PFE):
-  resolve sem depender do FRR, mas leva o motor, as sessões BNG (G3.6h) e o estado para outro
-  processo, com um canal novo até o daemon. Ficou como alternativa se o FRR não aceitar o patch.
+  resolve sem depender do FRR, mas leva o motor, as sessões do par BNG (G3.6h) e o estado para
+  outro processo, com um canal novo até o daemon. Fica como alternativa se o FRR recusar o patch.
 
 **Limites:**
 - Durante a ausência do daemon o BFD é o do `bfdd`: sem autenticação (o `bfddp` não a leva; uma
   sessão com chave cai como antes) e sem dampening.
-- A porta de origem muda duas vezes (RFC 5881 §4 pede a mesma porta por sessão); o FRR, o nosso
-  motor e o RouterOS (**estimado**: não demultiplexam por porta) não conferem.
+- A porta de origem muda duas vezes (RFC 5881 §4 pede a mesma porta por sessão); o FRR e o nosso
+  motor não conferem, o RouterOS (**estimado**) também não.
+- Os peers que o motor roda sozinho (`--bfd-dplane off`, sem FRR) e as sessões do par BNG não
+  passam pelo `bfdd`: caem com o daemon, como antes.
 
 ## Desempenho e paralelismo
 
