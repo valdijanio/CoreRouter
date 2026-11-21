@@ -324,6 +324,20 @@ fn apply_wanted(frr: &mut [Svc], now: Instant) {
     }
 }
 
+/// G1.6zz: the OOM killer's weight of a process just started (written by
+/// PID 1, which has `CAP_SYS_RESOURCE`; the process ran at most a few
+/// instructions with 0, and an `exec` keeps the value). Not fatal: a
+/// kernel without `/proc` leaves the default, and says so once a start.
+fn set_oom_score_adj(pid: u32, name: &str, adj: i32) {
+    if adj == 0 {
+        return;
+    }
+    let path = format!("/proc/{pid}/oom_score_adj");
+    if let Err(e) = fs::write(&path, adj.to_string()) {
+        log!("{name}: oom_score_adj {adj} not set ({path}: {e})");
+    }
+}
+
 fn spawn_frr(s: &Svc) -> Option<Pid> {
     let path = format!("{}/{}", plan::FRR_SBIN, s.name);
     let log_file = OpenOptions::new()
@@ -343,7 +357,10 @@ fn spawn_frr(s: &Svc) -> Option<Pid> {
         .stderr(err)
         .spawn()
     {
-        Ok(c) => i32::try_from(c.id()).ok().and_then(Pid::from_raw),
+        Ok(c) => {
+            set_oom_score_adj(c.id(), s.name, plan::frr_oom_score_adj(s.name));
+            i32::try_from(c.id()).ok().and_then(Pid::from_raw)
+        }
         Err(e) => {
             log!("{path}: {e}");
             None
@@ -1107,6 +1124,7 @@ fn spawn_daemon(opts: &BootOptions, frr: bool) -> Option<Pid> {
     match spawned {
         Ok(child) => {
             log!("started corerouter-daemon (pid {})", child.id());
+            set_oom_score_adj(child.id(), "corerouter-daemon", plan::DAEMON_OOM_SCORE_ADJ);
             // The loop reaps it with waitpid(-1); the Child is not waited on.
             i32::try_from(child.id()).ok().and_then(Pid::from_raw)
         }

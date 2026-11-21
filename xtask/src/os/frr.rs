@@ -21,7 +21,10 @@
 //! - G1.6i: before the configuration only mgmtd, zebra and staticd run;
 //!   on r1 a BGP instance starts bgpd, and removing LDP and the BFD peer
 //!   stops ldpd and bfdd while zebra and ospfd keep their PIDs and the
-//!   other loopback still answers over OSPF.
+//!   other loopback still answers over OSPF;
+//! - G1.6zz: every control-plane process has the `oom_score_adj` init
+//!   gives it, and an OOM provoked on r2 kills the hog, never the daemon
+//!   nor FRR.
 
 #![allow(clippy::indexing_slicing)]
 
@@ -449,7 +452,8 @@ pub fn frr_test(root: &Path, images: &Path, args: &[String]) -> Result<(), Strin
     );
     let res = verify(&mut r1, &mut log, &mut nums, 1, frr.as_deref(), t0)
         .and_then(|()| verify(&mut r2, &mut log, &mut nums, 2, frr.as_deref(), t0))
-        .and_then(|()| on_demand(&mut r1, &mut log, &mut nums));
+        .and_then(|()| on_demand(&mut r1, &mut log, &mut nums))
+        .and_then(|()| oom(&mut r2, &mut log, &mut nums));
     if let Err(e) = res {
         for (vm, n) in [(&mut r1, 1), (&mut r2, 2)] {
             let diag = sh(
@@ -487,6 +491,86 @@ pub fn frr_test(root: &Path, images: &Path, args: &[String]) -> Result<(), Strin
     for n in [1, 2] {
         let _ = std::fs::remove_file(work.join(format!("r{n}.qcow2")));
     }
+    Ok(())
+}
+
+/// G1.6zz: each control-plane process carries the `oom_score_adj` init
+/// gives it, and an OOM provoked on r2 (a `tail` of `/dev/zero`, which
+/// keeps its whole "line") kills the hog, not the daemon nor FRR: their
+/// PIDs stay, the kernel's line names the hog, and the other loopback
+/// still answers over OSPF.
+fn oom(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(), String> {
+    const PROCS: &str = "corerouter-daemon mgmtd zebra staticd ospfd ldpd bfdd";
+    let adj = sh(
+        vm,
+        log,
+        &format!(
+            "{{ for p in {PROCS}; do printf '%s=%s ' $p $(cat /proc/$(pidof -s $p)/oom_score_adj); done; echo .; }}"
+        ),
+    )?;
+    let want = [
+        ("corerouter-daemon", "-900"),
+        ("mgmtd", "-700"),
+        ("zebra", "-700"),
+        ("staticd", "-300"),
+        ("ospfd", "-300"),
+        ("ldpd", "-300"),
+        ("bfdd", "-600"),
+    ];
+    for (p, v) in want {
+        check(
+            adj.split_whitespace().any(|w| w == format!("{p}={v}")),
+            format!("r2: oom_score_adj of {p} is not {v}: {adj}"),
+        )?;
+    }
+    nums.put(
+        "r2: oom_score_adj",
+        adj.trim_end_matches('.').trim().to_owned(),
+    );
+    let before = sh(vm, log, &format!("pidof {PROCS}"))?;
+    let t0 = Instant::now();
+    let hog = sh(vm, log, "tail /dev/zero > /dev/null; echo rc=$?")?;
+    let took = t0.elapsed();
+    let after = sh(vm, log, &format!("pidof {PROCS}"))?;
+    let killed = sh(
+        vm,
+        log,
+        "dmesg | grep -E 'Out of memory|oom-kill:' | tail -n 2",
+    )?;
+    check(
+        hog.contains("rc=137") && killed.contains("(tail)"),
+        format!("r2: the OOM did not kill the hog: {hog} / {killed}"),
+    )?;
+    check(
+        before == after,
+        format!("r2: a control-plane process died in the OOM: {before} → {after}"),
+    )?;
+    // Without swap the kernel first evicts the page cache (the programs'
+    // own code) and the machine may crawl until the OOM killer acts (1 s
+    // in one run of a 1 GiB guest, tens of seconds in another, **medido**):
+    // OSPF's 4 s dead interval may expire meanwhile. What must hold is that the control plane survives and
+    // the adjacency comes back by itself.
+    let full = until(vm, log, 60, "routing.ospf.neighbor.list", "{}", |v| {
+        v["result"]["rows"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|n| n["state"] == "Full"))
+    });
+    check(
+        full.is_ok(),
+        format!("r2: OSPF did not come back after the OOM: {full:?}"),
+    )?;
+    let ping = sh(vm, log, "ping -c 3 -W 2 10.255.0.1 | tail -n 2")?;
+    check(
+        ping.contains(" 0% packet loss"),
+        format!("r2: ping 10.255.0.1 after the OOM: {ping}"),
+    )?;
+    nums.put(
+        "r2: OOM provoked (tail /dev/zero): killed",
+        format!(
+            "the hog after {:.1} s; daemon and FRR PIDs unchanged, OSPF back by itself",
+            took.as_secs_f64()
+        ),
+    );
     Ok(())
 }
 

@@ -489,6 +489,7 @@ mod io {
             if let Ok(c) = Ctrl::connect_as(WHO, dir, &sock)
                 && ping(&c)
             {
+                crate::wifi::oom_score_default(&dir.join("hostapd.pid"), "hostapd");
                 return Ok(c);
             }
             if Instant::now() >= deadline {

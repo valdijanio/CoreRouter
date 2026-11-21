@@ -1838,6 +1838,22 @@ minutos sem resposta, manda olhar o console.
   Memória ociosa sem protocolo de roteamento (`os boot-test`, KVM, 1 GiB, três boots cada,
   2026-10-29, **medido**): **98,9 → 70,9 MiB** (101,9/95,2/99,6 → 72,0/69,0/71,8; −28 MiB), e o
   FRR fica pronto 0,82 s depois do kernel (antes 1,0–1,9 s).
+- **Quem morre primeiro num OOM (G1.6zz).** O init grava o `oom_score_adj` de cada processo
+  logo depois de lançá-lo (`/proc/<pid>/oom_score_adj`, como root): `corerouter-daemon` −900,
+  `zebra` e `mgmtd` −700, `bfdd` −600, `staticd`, `ospfd`, `ospf6d` e `ldpd` −300, `bgpd` 0
+  (`apps/corerouter-init/src/plan.rs`). O kernel soma `adj × memória / 1000` aos pontos de cada
+  processo (`oom_badness`, `mm/oom_kill.c`): −900 tira 90 % da memória da conta do daemon, então
+  um `bgpd` que cresce com a tabela cheia, ou uma ferramenta descontrolada, sai antes da gerência.
+  Nada fica em −1000: um daemon que vaza ainda pode ser morto (o init o reinicia), e sem ninguém
+  para matar o kernel entra em pânico. O valor passa para os filhos no `fork`; o daemon devolve a
+  0 os auxiliares que ficam rodando (`wpa_supplicant`, `hostapd`). O FRR, o VyOS e o SONiC não
+  ajustam nada (o SONiC reinicia a máquina num OOM, `vm.panic_on_oom=2`). O `frr-test` confere
+  os valores e provoca um OOM no r2 (`tail /dev/zero`): morre o `tail`, os PIDs do daemon e do
+  FRR ficam e a adjacência OSPF volta sozinha. Sem swap, antes do OOM killer agir o kernel tira
+  o cache das páginas (o código dos programas) e a máquina pode se arrastar: numa VM de 1 GiB o
+  `tail` morreu em 1,0 s numa rodada e, noutra, o OSPF (dead 4 s) caiu e o serviço BFD ficou 54 s
+  sem heartbeat (**medido**). Matar mais cedo, pela pressão de
+  memória (PSI), é a gap G1.32.
 - **Fora da imagem** (`post-build.sh`): `vtysh` (o único que liga readline), bash, readline,
   ncurses, o runtime C++ que a toolchain copia, scripts Python e os daemons que o CoreRouter não
   configura (rip, isis, pim, babel, eigrp, …). O `nft` deixa de ter CLI interativa (ela puxava
