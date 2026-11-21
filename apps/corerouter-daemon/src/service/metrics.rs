@@ -892,7 +892,7 @@ fn run_service(session: &Shared, health: &super::Health, flag: Option<SocketAddr
             }
             if now.enabled {
                 let addr = SocketAddr::new(now.address, now.port);
-                match open(addr) {
+                match open(addr, &now.vrf) {
                     Ok(l) => {
                         let at = l.local_addr().unwrap_or(addr);
                         log_open(at, !now.available_from.is_empty());
@@ -929,8 +929,9 @@ fn run_service(session: &Shared, health: &super::Health, flag: Option<SocketAddr
     publish(session, &MetricsStatus::default());
 }
 
-fn open(addr: SocketAddr) -> std::io::Result<TcpListener> {
-    let l = TcpListener::bind(addr)?;
+fn open(addr: SocketAddr, vrf: &corerouter_model::RoutingTable) -> std::io::Result<TcpListener> {
+    // G3.4zb: in its VRF, if it has one.
+    let l = super::listen_vrf::bind(addr, vrf)?;
     // Non-blocking accept, so the thread sees a config change within a tick.
     l.set_nonblocking(true)?;
     Ok(l)

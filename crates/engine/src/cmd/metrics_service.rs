@@ -4,6 +4,7 @@
 //! opens, moves or closes the listener without a restart.
 
 use corerouter_model::metrics::{MAX_AVAILABLE_FROM, MetricsService, MetricsStatus};
+use corerouter_model::{Config, RoutingTable, route};
 use ipnet::IpNet;
 use serde_json::{Value, json};
 
@@ -17,12 +18,12 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Metrics Service",
         [],
         None,
-        "{enabled?: bool, address?: ip, port?: int 1..65535, available_from?: [prefix]} → {enabled, address, port, available_from, warning?}",
+        "{enabled?: bool, address?: ip, port?: int 1..65535, available_from?: [prefix], vrf?: string (main or a VRF: the listener answers only there)} → {enabled, address, port, available_from, vrf, warning?}",
         always,
         set
     ),
     cmd!(query "ip.service.metrics.get", "Metrics Service", [], None,
-        "{} → {enabled, address, port, available_from, status: stopped|listening|error, listening, last_error, requests, refused}",
+        "{} → {enabled, address, port, available_from, vrf, status: stopped|listening|error, listening, last_error, requests, refused}",
         always, get),
 ];
 
@@ -32,7 +33,39 @@ fn settings_json(c: &MetricsService) -> Value {
         "address": c.address,
         "port": c.port,
         "available_from": c.available_from,
+        "vrf": c.vrf,
     })
+}
+
+/// G3.4zb: `vrf` of a service (`/ip service … vrf=`): `main` or an existing
+/// VRF; `None` when not given (an empty form field is not given).
+pub(super) fn vrf_param(cfg: &Config, p: &Value) -> Result<Option<RoutingTable>> {
+    let Some(raw) = p.get("vrf").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let Some(text) = raw.as_str().map(str::trim) else {
+        return Err(EngineError::bad("vrf", "must be main or the name of a VRF"));
+    };
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let t: RoutingTable = text.parse().map_err(|e: corerouter_model::ParseError| EngineError::bad("vrf", e.to_string()))?;
+    if !t.is_main() && !route::is_vrf_table(cfg, &t) {
+        let known: Vec<String> = cfg
+            .interfaces
+            .values()
+            .filter(|i| matches!(i.kind, corerouter_model::InterfaceKind::Vrf { .. }))
+            .map(|i| i.name.to_string())
+            .collect();
+        return Err(EngineError::bad(
+            "vrf",
+            format!(
+                "no VRF '{t}' (ip.vrf.add){}",
+                if known.is_empty() { "; this router has none: main".to_owned() } else { format!("; VRFs: main, {}", known.join(", ")) }
+            ),
+        ));
+    }
+    Ok(Some(t))
 }
 
 /// A JSON array of prefixes or, for the CLI, one comma-separated string.
@@ -87,7 +120,7 @@ pub(super) fn available_from(p: &Value) -> Result<Option<Vec<IpNet>>> {
 
 /// Applies `p` to `c`: the rules of `set`, also for the preview
 /// (`ip.service.check`, on a copy).
-pub(super) fn apply(c: &mut MetricsService, p: &Value) -> Result<Value> {
+pub(super) fn apply(c: &mut MetricsService, p: &Value, vrf: Option<RoutingTable>) -> Result<Value> {
     let enabled = opt_bool(p, "enabled")?;
     let address = opt_parse::<std::net::IpAddr>(p, "address")?;
     let port = opt_u32(p, "port")?
@@ -114,6 +147,9 @@ pub(super) fn apply(c: &mut MetricsService, p: &Value) -> Result<Value> {
     if let Some(list) = from {
         c.available_from = list;
     }
+    if let Some(v) = vrf {
+        c.vrf = v;
+    }
     let mut out = settings_json(c);
     // The endpoint has no login: say so when anyone on the network can read it.
     if c.enabled && !c.address.is_loopback() && c.available_from.is_empty()
@@ -129,8 +165,9 @@ pub(super) fn apply(c: &mut MetricsService, p: &Value) -> Result<Value> {
 }
 
 fn set(s: &mut Session, p: &Value) -> Result<Value> {
+    let vrf = vrf_param(s.store().candidate(), p)?;
     let mut c = s.store().candidate().system.metrics.clone();
-    let out = apply(&mut c, p)?;
+    let out = apply(&mut c, p, vrf)?;
     s.store_mut().candidate_mut().system.metrics = c;
     Ok(out)
 }
