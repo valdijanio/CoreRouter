@@ -340,7 +340,7 @@ fn what_the_commands_refuse() {
         "{e}"
     );
     let e = fails(&mut s, "interface.remove", json!({"name": "wifi1"}));
-    assert!(e.contains("Wi-Fi radio and cannot be removed"), "{e}");
+    assert!(e.contains("Wi-Fi radio cannot be removed"), "{e}");
     let e = fails(&mut s, "interface.wifi.adopt", json!({"name": "wifi1"}));
     assert!(e.contains("already"), "{e}");
     let e = fails(&mut s, "interface.wifi.adopt", json!({"name": "ether9"}));

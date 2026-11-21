@@ -410,11 +410,14 @@ impl BfdPanel {
             .iter()
             .map(|k| match self.peer_of(k) {
                 Some(p) => Item::of(p, "name", ""),
-                None => Item {
-                    key: k.clone(),
-                    disabled: false,
-                    fixed: Some("asked for by BGP or OSPF: turn it off in the protocol (bfd profile)".into()),
-                },
+                None => {
+                    let mut i = Item {
+                        key: k.clone(),
+                        ..Item::default()
+                    };
+                    i.fix("asked for by BGP or OSPF: turn it off in the protocol (bfd profile)");
+                    i
+                }
             })
             .collect();
         let tools = Tools::new(&app.can(), &PEER_CMDS, &picked);

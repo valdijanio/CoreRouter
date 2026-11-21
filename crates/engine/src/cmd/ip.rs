@@ -10,6 +10,7 @@ use corerouter_hal::Learned;
 
 use crate::dhcp_client::{duration_text, is_dynamic};
 use crate::dhcp6_client::{is_dynamic6, ra_id};
+use crate::row_rules::RowRules;
 use crate::validate::{MAX_ADDRESSES, v6_twice};
 use crate::{EngineError, Result, Session};
 
@@ -33,7 +34,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         remove
     ),
     cmd!(query "ip.address.list", "Addresses", ["IP", "Addresses"], None,
-        "{interface?: string} → [{id, flags (X disabled, I invalid, D dynamic), address, network, interface, disabled, dynamic, comment, from_pool, origin (static | dhcp | dhcpv6 | ra | pool), valid_after, preferred_after, reason, state (active | disabled | invalid | tentative | dad-failed | deprecated), family (ipv4 | ipv6), vrf, access (why this session depends on it, or null)}]",
+        "{interface?: string} → [{id, flags (X disabled, I invalid, D dynamic), address, network, interface, disabled, dynamic, comment, from_pool, origin (static | dhcp | dhcpv6 | ra | pool), valid_after, preferred_after, reason, state (active | disabled | invalid | tentative | dad-failed | deprecated), family (ipv4 | ipv6), vrf, access (why this session depends on it, or null), removable: bool, editable: bool, fixed_reason: string | null (G1.24: a dynamic address changes at its source)}]",
         always, list),
 ];
 
@@ -236,7 +237,31 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     decorate(s, &mut rows);
+    for row in &mut rows {
+        let rules = row_rules(row);
+        rules.put(row);
+    }
     Ok(Value::Array(rows))
+}
+
+/// G1.24: what the Addresses list lets do with `row`: a dynamic address is
+/// changed where it comes from (`ip.address.remove`/`set` do not know it).
+fn row_rules(row: &Value) -> RowRules {
+    if row.get("dynamic").and_then(Value::as_bool) != Some(true) {
+        return RowRules::free();
+    }
+    let on = row.get("interface").and_then(Value::as_str).unwrap_or("");
+    RowRules::fixed(match row.get("origin").and_then(Value::as_str) {
+        Some("dhcpv6") => format!(
+            "obtained by the DHCPv6 client on {on}: release or disable the client (IPv6 › DHCPv6 Client)"
+        ),
+        Some("ra") => format!(
+            "from a Router Advertisement on {on} (SLAAC): stop accepting RA there (IPv6 › Settings)"
+        ),
+        _ => format!(
+            "obtained by the DHCP client on {on}: release or disable the client (IP › DHCP Client)"
+        ),
+    })
 }
 
 /// What G1.28 adds to every row: `state`, `family`, `vrf` and `access`

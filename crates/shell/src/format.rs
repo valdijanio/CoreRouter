@@ -84,12 +84,21 @@ fn disabled(row: &Value) -> bool {
 }
 
 /// Field order: the doc's, then any extra field the rows carry.
+/// Row fields for windows, not for people reading a `print` (G1.24: what
+/// the row lets a GUI do). `print proplist=…` still shows them.
+const FOR_WINDOWS: [&str; 3] = ["removable", "editable", "fixed_reason"];
+
 fn field_order(shape: &Shape, rows: &[Value]) -> Vec<String> {
-    let mut out = shape.fields.clone();
+    let mut out: Vec<String> = shape
+        .fields
+        .iter()
+        .filter(|f| !FOR_WINDOWS.contains(&f.as_str()))
+        .cloned()
+        .collect();
     for r in rows {
         if let Some(o) = r.as_object() {
             for k in o.keys() {
-                if !out.contains(k) {
+                if !out.contains(k) && !FOR_WINDOWS.contains(&k.as_str()) {
                     out.push(k.clone());
                 }
             }
@@ -545,6 +554,26 @@ mod tests {
             .map(Line::text)
             .collect();
         assert!(pl.iter().any(|l| l.contains("GATEWAY")), "{pl:?}");
+    }
+
+    #[test]
+    fn print_leaves_out_what_the_row_lets_windows_do() {
+        let s = shape(
+            "{} → [{name, mtu, removable: bool, editable: bool, fixed_reason: string | null}]",
+        );
+        let rows = vec![
+            json!({"name": "ether1", "mtu": 1500, "removable": false, "editable": true, "fixed_reason": "a physical port"}),
+        ];
+        let text: String = table(&rows, &s, &PrintOpts::default(), true, None)
+            .iter()
+            .map(Line::text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("ether1") && !text.to_lowercase().contains("removable"),
+            "{text}"
+        );
+        assert!(!text.contains("physical"), "{text}");
     }
 
     #[test]

@@ -169,7 +169,7 @@ copie o código de uma janela para outra).
 | Botão | Ação | Cinza quando |
 |---|---|---|
 | **+** | abre o modal de adicionar | o roteador não tem o comando `…add` |
-| **−** | remove a seleção (com confirmação se for mais de um) | nada selecionado; item dinâmico (DHCP, RA) que não se remove |
+| **−** | remove a seleção (com confirmação se for mais de um) | nada selecionado; linha com `removable: false` (porta física, item dinâmico do DHCP/RA) |
 | **✓** | ativa a seleção | nada desativado selecionado |
 | **✗** | desativa a seleção (fica na config, sai do kernel) | nada ativo selecionado; item sem `disabled` |
 | **💬** | comenta a seleção | nada selecionado |
@@ -205,10 +205,20 @@ Código: `crates/ui/src/list.rs` (barra, filtros, rodapé, menu de clique direit
 e `crates/ui/src/list_modal.rs` (o modal). Nada ali decide o que um item pode: a linha que o engine
 manda diz (`disabled`, `dynamic`, motivo), e o `engine.list` diz se o comando existe e está liberado.
 
+**O que a linha permite (G1.24):** a listagem do engine põe em cada linha `removable`, `editable`
+e `fixed_reason` (`crates/engine/src/row_rules.rs`, `RowRules::kept/fixed/read_only`). A UI lê
+com `list::RowRules::of(linha)` (o `Item::of` já lê): **−** fica cinza com o motivo quando
+`removable` é falso; **✓ ✗ 💬** e o modal, quando `editable` é falso. A UI não deduz nada pelo tipo
+ou pela origem. Lista nova com linha que o roteador mantém sozinho põe os três campos e entra nos
+testes de contrato (`crates/engine/tests/it/row_rules.rs`: o `remove`/`set` concordam com a linha;
+`crates/ui/src/tests/row_rules.rs`: a UI mostra o motivo do engine). O `print` do terminal os
+esconde.
+
 - **Barra:** `Tools::new(&app.can(), &Cmds{add, remove, set, what}, &picked)` calcula cada botão
   (`Ok` ou o motivo do cinza: primeiro o do roteador, depois o da seleção); `list::toolbar(ui, salt,
   &tools, &sel, lang)` desenha **+ − ✓ ✗ 💬** e devolve um `Act`. `Item::of(linha, "id", motivo)`
-  monta o que cada linha diz de si (item dinâmico fica preso, com o motivo).
+  monta o que cada linha diz de si: as regras do engine e, numa lista que ainda não as manda, o
+  item dinâmico preso com o `motivo`.
 - **Filtros:** `Filters` guarda os selos ligados por campo da linha; `filters.chips(ui, "family",
   &[("ipv4", "IPv4"), …], lang)` desenha, `filters.shows(&linha)` filtra (E entre campos, OU dentro
   de um). O Find (`table::find_field`) vem por último, à direita.

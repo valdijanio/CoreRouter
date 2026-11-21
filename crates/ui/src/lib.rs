@@ -2069,13 +2069,15 @@ mod tests {
 
         h.click(h.text("Disable"));
         assert_eq!(h.iface("ether2").unwrap()["disabled"], true);
-        // Remove on a physical port is refused and explained in place.
+        // Remove on a physical port is greyed with the engine's reason
+        // (G1.24): the click sends nothing, the window stays.
         h.click(h.text("Remove"));
+        assert!(h.iface("ether2").is_some());
         assert!(
             h.app
                 .dialogs
                 .first()
-                .is_some_and(|d| d.status.error.is_some())
+                .is_some_and(|d| d.status.error.is_none() && d.status.waiting == 0)
         );
         h.click(h.text("OK"));
         assert!(h.app.dialogs.is_empty());

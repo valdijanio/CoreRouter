@@ -694,7 +694,7 @@ impl PppPanel {
             .map(|t| {
                 let mut i = Item::of(t, "id", "");
                 if flag(t, "special") {
-                    i.fixed = Some(tr_in(SCOPE, l, "the empty and other-names rows always exist: change their action").to_owned());
+                    i.fix(tr_in(SCOPE, l, "the empty and other-names rows always exist: change their action"));
                 }
                 i
             })
@@ -992,7 +992,7 @@ impl PppPanel {
             .map(|t| {
                 let mut i = Item::of(t, "id", "");
                 if flag(t, "builtin") {
-                    i.fixed = Some(fixed.to_owned());
+                    i.fix(fixed);
                 }
                 i
             })

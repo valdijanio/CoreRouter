@@ -70,10 +70,13 @@ pub(crate) struct Iface {
     /// G1.6ja: (`firmware` | `safe-mode`, why): the kernel could not bring
     /// the card behind this port up in full.
     pub hardware: Option<(String, String)>,
+    /// G1.24: why the router does not remove it (a physical port, a Wi-Fi
+    /// radio), from the row's `removable` / `fixed_reason`.
+    pub no_remove: Option<String>,
 }
 
 impl Iface {
-    fn from_row(row: &Value) -> Self {
+    pub(crate) fn from_row(row: &Value) -> Self {
         let text = |k: &str| row.get(k).map(value_text).unwrap_or_default();
         let opt = |k: &str| row.get(k).filter(|v| !v.is_null()).map(value_text);
         let flag = |k: &str| row.get(k).and_then(Value::as_bool).unwrap_or(false);
@@ -96,11 +99,8 @@ impl Iface {
                 .then(|| opt("unmanaged_reason").unwrap_or_else(|| "not managed".into())),
             invalid: flag("invalid").then(|| opt("invalid_reason").unwrap_or_else(|| "not on this machine".into())),
             hardware: opt("hardware_problem").map(|k| (k, opt("hardware_problem_reason").unwrap_or_default())),
+            no_remove: crate::list::RowRules::of(row).and_then(|r| r.removable.err()),
         }
-    }
-
-    fn physical(&self) -> bool {
-        self.kind == "ether"
     }
 }
 
@@ -1120,10 +1120,13 @@ fn some(picked: &[&Iface]) -> Result<(), String> {
     }
 }
 
-fn can_remove(picked: &[&Iface]) -> Result<(), String> {
-    some(picked)?;
-    match picked.iter().find(|i| i.physical()) {
-        Some(i) => Err(format!("{} is a physical port: disable it instead", i.name)),
+/// The engine says which rows it does not remove (G1.24).
+pub(crate) fn can_remove(picked: &[&Iface]) -> Result<(), String> {
+    if picked.is_empty() {
+        return Err("Select one or more interfaces first".into());
+    }
+    match picked.iter().find_map(|i| Some((&i.name, i.no_remove.as_ref()?))) {
+        Some((name, why)) => Err(format!("{name}: {why}")),
         None => Ok(()),
     }
 }
@@ -1382,7 +1385,11 @@ fn dialog_body(
     });
     let mut footer = Footer::edit(!matches!(d, Dialog::Comment { .. }), ok);
     if let Some(t) = toggle {
-        footer.extra = vec![t, ("Remove", Button::Remove, can.check("interface.remove"))];
+        let remove = match &d {
+            Dialog::Props(p) => can.and("interface.remove", can_remove(&ifaces.iter().filter(|i| i.name == p.name).collect::<Vec<_>>())),
+            _ => can.check("interface.remove"),
+        };
+        footer.extra = vec![t, ("Remove", Button::Remove, remove)];
     }
     footer.pressed = go.or(port_op.map(|(add, bridge, port)| Button::Port { add, bridge, port }));
     footer

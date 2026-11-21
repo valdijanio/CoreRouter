@@ -33,22 +33,69 @@ use crate::{CoreRouterUi, Pending, Then};
 pub(crate) struct Item {
     pub key: String,
     pub disabled: bool,
-    /// Why it cannot be removed, enabled or disabled here (a dynamic item:
-    /// "comes from the DHCP client …"); `None`: it can.
-    pub fixed: Option<String>,
+    /// Why it cannot be changed here (edit, enable, disable, comment);
+    /// `None`: it can.
+    pub no_edit: Option<String>,
+    /// Why it cannot be removed here; `None`: it can.
+    pub no_remove: Option<String>,
 }
 
 impl Item {
-    /// From a list row: `key` names its id field; `disabled` and
-    /// `dynamic` are the usual booleans; a dynamic row is fixed with
-    /// `dynamic_why`.
+    /// From a list row: `key` names its id field, `disabled` is the usual
+    /// boolean. What the row allows is the engine's word (G1.24:
+    /// `removable`, `editable`, `fixed_reason`, see [`RowRules`]); a list
+    /// that does not say it yet fixes a `dynamic` row with `dynamic_why`.
     pub(crate) fn of(row: &Value, key: &str, dynamic_why: &str) -> Self {
         let flag = |k: &str| row.get(k).and_then(Value::as_bool).unwrap_or(false);
-        Self {
+        let mut item = Self {
             key: row.get(key).map(crate::value_text).unwrap_or_default(),
             disabled: flag("disabled"),
-            fixed: flag("dynamic").then(|| dynamic_why.to_owned()),
+            no_edit: None,
+            no_remove: None,
+        };
+        match RowRules::of(row) {
+            Some(r) => {
+                item.no_edit = r.editable.err();
+                item.no_remove = r.removable.err();
+            }
+            None if flag("dynamic") => item.fix(dynamic_why),
+            None => {}
         }
+        item
+    }
+
+    /// Neither changed nor removed here, because `why`.
+    pub(crate) fn fix(&mut self, why: &str) {
+        self.no_edit = Some(why.to_owned());
+        self.no_remove = Some(why.to_owned());
+    }
+}
+
+/// G1.24: what a list row lets the operator do, as the engine says it
+/// (`crates/engine/src/row_rules.rs`): `Err` holds the engine's reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RowRules {
+    pub removable: Result<(), String>,
+    pub editable: Result<(), String>,
+}
+
+impl RowRules {
+    /// `None` when the row does not carry them (a list that does not say it
+    /// yet, or an older router).
+    pub(crate) fn of(row: &Value) -> Option<Self> {
+        let removable = row.get("removable")?.as_bool()?;
+        let editable = row.get("editable")?.as_bool()?;
+        let why = || {
+            row.get("fixed_reason")
+                .and_then(Value::as_str)
+                .unwrap_or("the router keeps this row")
+                .to_owned()
+        };
+        let rule = |ok: bool| if ok { Ok(()) } else { Err(why()) };
+        Some(Self {
+            removable: rule(removable),
+            editable: rule(editable),
+        })
     }
 }
 
@@ -83,7 +130,11 @@ impl Tools {
                 Ok(())
             }
         };
-        let fixed = || match picked.iter().find_map(|i| i.fixed.clone()) {
+        let fixed = || match picked.iter().find_map(|i| i.no_edit.clone()) {
+            Some(why) => Err(why),
+            None => Ok(()),
+        };
+        let kept = || match picked.iter().find_map(|i| i.no_remove.clone()) {
             Some(why) => Err(why),
             None => Ok(()),
         };
@@ -94,21 +145,27 @@ impl Tools {
         let toggle = |to_disabled: bool| {
             none()?;
             fixed()?;
-            if picked.iter().any(|i| i.disabled != to_disabled) {
-                Ok(())
-            } else if to_disabled {
-                Err("Already disabled".to_owned())
-            } else {
-                Err("Already enabled".to_owned())
-            }
+            toggle_rule(picked.iter().map(|i| i.disabled), !to_disabled)
         };
         Self {
             add: can.check(cmds.add),
-            remove: can.and(cmds.remove, none().and_then(|()| fixed())),
+            remove: can.and(cmds.remove, none().and_then(|()| kept())),
             enable: set(toggle(false)),
             disable: set(toggle(true)),
             comment: set(none().and_then(|()| fixed())),
         }
+    }
+}
+
+/// Enable (`enable`) or Disable greyed when no picked row would change:
+/// `disabled` is each picked row's state.
+pub(crate) fn toggle_rule(disabled: impl IntoIterator<Item = bool>, enable: bool) -> Result<(), String> {
+    if disabled.into_iter().any(|d| d == enable) {
+        Ok(())
+    } else if enable {
+        Err("Already enabled".to_owned())
+    } else {
+        Err("Already disabled".to_owned())
     }
 }
 

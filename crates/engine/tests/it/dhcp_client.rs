@@ -208,6 +208,25 @@ fn a_lab_client_gets_a_lease_and_the_data_plane_runs_it() {
     assert_eq!(dynamic.len(), 1);
     assert_eq!(dynamic[0]["flags"], "D");
     assert_eq!(dynamic[0]["interface"], "ether1");
+    // G1.24: the row says it changes at its source, and the commands agree.
+    assert_eq!(
+        (
+            dynamic[0]["removable"].as_bool(),
+            dynamic[0]["editable"].as_bool()
+        ),
+        (Some(false), Some(false))
+    );
+    let why = dynamic[0]["fixed_reason"].as_str().unwrap();
+    assert!(why.contains("DHCP client on ether1"), "{why}");
+    let dyn_id = dynamic[0]["id"].clone();
+    assert!(
+        l.s.execute("ip.address.remove", &json!({"id": dyn_id}))
+            .is_err()
+    );
+    assert!(
+        l.s.execute("ip.address.set", &json!({"id": dyn_id, "comment": "x"}))
+            .is_err()
+    );
     // Option 121 came, so it decides the routes (option 3 is ignored).
     let routes = l.routes();
     let default = routes
