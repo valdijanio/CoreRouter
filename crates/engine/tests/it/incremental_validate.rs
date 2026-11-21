@@ -597,3 +597,35 @@ proptest! {
         prop_assert_eq!(validate_commit(&base, &c, diff), validate_all(&c), "changed {:?}", diff);
     }
 }
+
+/// G0.31g: the route lines (`ip.route.list`) read only
+/// `route_table::ROUTE_READS`: blanking any other section leaves them as
+/// they were, so the route cache keeps its lines across a change there
+/// (the identity, a firewall rule, a DNS record…).
+#[test]
+fn the_route_lines_read_only_what_they_declare() {
+    use corerouter_engine::route_table::ROUTE_READS;
+    let lines = |cfg: &Config| {
+        corerouter_engine::perf::with_running(cfg.clone())
+            .execute("ip.route.list", &json!({}))
+            .unwrap()
+    };
+    let mut missing = Vec::new();
+    for cfg in corpus().iter().take(40) {
+        let full = lines(cfg);
+        for s in Sections::ALL.each() {
+            if ROUTE_READS.contains(s) {
+                continue;
+            }
+            if lines(&restrict(cfg, Sections::ALL.without(s))) != full {
+                missing.push(format!("route lines read {s:?}"));
+            }
+        }
+        if lines(&restrict(cfg, ROUTE_READS)) != full {
+            missing.push(format!("route lines restricted to {ROUTE_READS:?} differ"));
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    assert!(missing.is_empty(), "undeclared reads: {missing:#?}");
+}

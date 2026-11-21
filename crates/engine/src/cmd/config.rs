@@ -48,7 +48,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Safe Mode",
         ["System", "Configuration"],
         None,
-        "{timeout_secs?: u32} → {active, owner, since, entry_revision, timeout_secs, expires_in}",
+        "{timeout_secs?: u32 (10..=86400; undone when it expires without confirmation), detach?: bool (G1.6qg: outlives this connection, ended only by the timeout, default 600 s, or by the same user from any connection) } → {active, owner, owner_user, detached, since, entry_revision, timeout_secs, expires_in}",
         always,
         safe_mode_enter
     ),
@@ -186,7 +186,7 @@ fn mode_set(s: &mut Session, p: &Value) -> Result<Value> {
 // entered and left is in `state.inspect {path: journal}`; none of them edits
 // the candidate, so `execute` never auto-commits after them.
 fn safe_mode_enter(s: &mut Session, p: &Value) -> Result<Value> {
-    s.safe_mode_enter(opt_u32(p, "timeout_secs")?)
+    s.safe_mode_enter(opt_u32(p, "timeout_secs")?, opt_bool(p, "detach")?.unwrap_or(false))
 }
 
 fn safe_mode_exit(s: &mut Session, p: &Value) -> Result<Value> {

@@ -215,6 +215,11 @@ wait_for() { # wait_for <timeout s> <command…>: poll every 100 ms; prints the 
 }
 cr_sess() { cr "$1" routing.bgp.session.list | jq -c --arg c "$2" '[.[] | select(.connection == $c)][0] // {}'; }
 cr_up() { [ "$(cr_sess "$1" "$2" | jq -r '.established // false')" = true ]; }
+# cr_uptime <n> <connection>: the session's uptime in s, once that side
+# shows it (empty before: CR1 can see Established before CR2's daemon has
+# read its own session from bgpd).
+cr_uptime() { cr_sess "$1" "$2" | jq -r '.uptime_secs // empty'; }
+cr_uptime_known() { [ -n "$(cr_uptime "$1" "$2")" ]; }
 cr_state() { cr_sess "$1" "$2" | jq -c '{state, reason, last_error}'; }
 k_route() { ip -n "$1" route show "$2" 2>/dev/null | grep -o 'via [0-9.]*' | head -1 || true; }
 k_route6() { ip -n "$1" -6 route show "$2" 2>/dev/null | grep -o 'via [0-9a-f:]*' | head -1 || true; }
@@ -796,13 +801,16 @@ case_restart() {
   local ms
   ms=$(wait_for 60 cr_up 1 cr2) || { result restart FAIL "no session"; pair_down; return; }
   wait_for 30 k_has c2 100.64.39.0/24 >/dev/null || true
-  local up0; up0=$(cr_sess 2 cr1 | jq -r .uptime_secs)
+  # G3.9fk: CR2's own view of the session, before the restart. Read at
+  # once it was `null` in 2 of 4 runs (CR1 saw Established first).
+  wait_for 30 cr_uptime_known 2 cr1 >/dev/null || { result restart FAIL "CR2 never showed the session: $(cr_state 2 cr1)"; pair_down; return; }
+  local up0; up0=$(cr_uptime 2 cr1)
   kill "$(cat "$W/daemon1.pid")"; sleep 1
   local t0; t0=$(now_ms)
   start_daemon 1
   local tr=$(( $(now_ms) - t0 ))
   sleep 5
-  local up1; up1=$(cr_sess 2 cr1 | jq -r .uptime_secs)
+  local up1; up1=$(cr_uptime 2 cr1)
   cr_up 2 cr1 && k_has c2 100.64.39.0/24 && [ "${up1:-0}" -ge "${up0:-0}" ] \
     && result restart OK "corerouter-daemon restarted (answering in ${tr} ms): the peer's session untouched (uptime $up0 → $up1 s)" \
     || result restart FAIL "daemon restart: CR2 $(cr_state 2 cr1) uptime $up0 → $up1, route '$(k_route c2 100.64.39.0/24)'"

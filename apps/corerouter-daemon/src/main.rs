@@ -107,7 +107,7 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 const USAGE: &str = "\
 usage: corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-dir <dir>]
                          [--listen <addr:port>] [--ws <port> [--ws-origin <origin>]...
-                         [--web-root <dir>]] [--ws-listen <addr:port>]
+                         [--web-root <dir>]] [--ws-listen <addr:port>] [--listen-vrf <vrf>]
                          [--token-file <path>] [--reset-admin-password]
                          [--discovery-port <port> | --no-discovery]
                          [--discovery-transport interfaces|loopback]
@@ -117,6 +117,8 @@ usage: corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-
   --control <port>      plain control channel on 127.0.0.1:<port> (default 7979)
   --listen <addr:port>  control channel over TLS on any address, e.g. 0.0.0.0:8729 or
                         [::]:8729; login required (the local token is not accepted there)
+  --listen-vrf <vrf>    --listen and --ws-listen answer only in this VRF (bound to its
+                        device, out of the main table OSPF and BGP feed; G3.4zb)
   --token-file <path>   where to write the local token (default: see docs/control-protocol.md)
   --reset-admin-password  leave `admin` (group full, enabled) without a password, as on
                         the first start, and go on running; set a new one from this
@@ -163,6 +165,8 @@ struct Args {
     port: u16,
     listen: Option<std::net::SocketAddr>,
     ws_listen: Option<std::net::SocketAddr>,
+    /// G3.4zb: the VRF of `--listen` and `--ws-listen` (main: unbound).
+    listen_vrf: corerouter_model::RoutingTable,
     token_file: Option<PathBuf>,
     reset_admin: bool,
     backend: String,
@@ -187,6 +191,7 @@ fn parse_args() -> Result<Args, String> {
         port: DEFAULT_PORT,
         listen: None,
         ws_listen: None,
+        listen_vrf: corerouter_model::RoutingTable::Main,
         token_file: None,
         reset_admin: false,
         backend: "virtual".into(),
@@ -218,6 +223,10 @@ fn parse_args() -> Result<Args, String> {
                 } else {
                     out.ws_listen = Some(addr);
                 }
+            }
+            "--listen-vrf" => {
+                let v = args.next().ok_or("--listen-vrf needs a VRF name")?;
+                out.listen_vrf = v.parse().map_err(|e| format!("--listen-vrf: {e}"))?;
             }
             "--token-file" => {
                 let v = args.next().ok_or("--token-file needs a path")?;
@@ -360,34 +369,47 @@ fn websocket(
         .map_err(|e| format!("cannot start the WebSocket thread: {e}"))?;
     }
     if let (Some(addr), Some(id)) = (args.ws_listen, tls) {
-        let listener = std::net::TcpListener::bind(addr)
-            .map_err(|e| format!("cannot open --ws-listen {addr}: {e}"))?;
-        log::info!(
-            "WebSocket over TLS on wss://{addr}/ws (login required){}",
-            if args.web_root.is_some() {
-                format!("; web GUI at https://{addr}/")
-            } else {
-                String::new()
-            }
-        );
         let policy = WsPolicy {
             origins: args.ws_origins.clone(),
             web_root: args.web_root.clone(),
             same_host: true,
         };
-        spawn_ws_until(
-            Endpoint::tls(listener, id.config.clone()),
+        let gui = if args.web_root.is_some() {
+            format!("; web GUI at https://{addr}/")
+        } else {
+            String::new()
+        };
+        let (host, gate, stop, config) = (
             host.clone(),
-            policy,
             remote_gate.clone(),
             shutdown.clone(),
-        )
-        .map_err(|e| format!("cannot start the WebSocket TLS thread: {e}"))?;
+            id.config.clone(),
+        );
+        // G3.4zb: in --listen-vrf, waiting for the VRF if it is not there yet.
+        service::listen_vrf::bind_or_wait(
+            addr,
+            &args.listen_vrf,
+            "--ws-listen",
+            shutdown.clone(),
+            move |listener| {
+                log::info!("WebSocket over TLS on wss://{addr}/ws (login required){gui}");
+                spawn_ws_until(Endpoint::tls(listener, config), host, policy, gate, stop)
+                    .map(|_| ())
+                    .map_err(|e| format!("cannot start the WebSocket TLS thread: {e}"))
+            },
+        )?;
     }
     Ok(())
 }
 
 /// The lab's diagnostic tools: this host's ICMP or the simulated network.
+/// Seconds on `CLOCK_MONOTONIC` since the first call: the lab's deadlines
+/// ignore steps of the wall clock, as a real router's do (G0.13).
+fn monotonic_secs() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs()
+}
+
 fn lab_tools(lab: VirtualHal, how: &str) -> Result<VirtualHal, String> {
     #[cfg(target_os = "linux")]
     let host = corerouter_hal_linux::icmp::HostProber::detect();
@@ -529,7 +551,9 @@ fn backend(
         // G1.30: the lab has a Wi-Fi radio too (`wifi1`, off until told to
         // join one of the lab's networks).
         "virtual" => Ok(Box::new(lab_tools(
-            VirtualHal::default().with_wifi(1),
+            VirtualHal::default()
+                .with_wifi(1)
+                .with_monotonic(monotonic_secs),
             lab_ping,
         )?)),
         #[cfg(target_os = "linux")]
@@ -661,7 +685,7 @@ fn run_until_signal(
     session: &corerouter_engine::Shared,
     shutdown: &Shutdown,
     discovery: Discovery,
-    token_file: Option<PathBuf>,
+    (token_file, remove_socket): (Option<PathBuf>, Box<dyn FnOnce()>),
 ) -> ! {
     let sig = signals.wait();
     log::info!(
@@ -682,6 +706,7 @@ fn run_until_signal(
     if let Some(f) = token_file {
         let _ = std::fs::remove_file(f);
     }
+    remove_socket();
     let deadline = Instant::now() + GOODBYE_WAIT;
     let left = || deadline.saturating_duration_since(Instant::now());
     #[cfg(target_os = "linux")]
@@ -903,25 +928,53 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     if let (Some(addr), Some(id)) = (args.listen, &tls) {
-        let started = std::net::TcpListener::bind(addr)
-            .map_err(|e| format!("cannot open --listen {addr}: {e}"))
-            .and_then(|l| {
-                spawn_until(
-                    Endpoint::tls(l, id.config.clone()),
-                    host.clone(),
-                    remote_gate.clone(),
-                    shutdown.clone(),
-                )
-                .map_err(|e| format!("cannot start the TLS control thread: {e}"))
-            });
-        match started {
-            Ok(_) => log::info!("control channel over TLS on {addr} (login required)"),
-            Err(e) => {
-                eprintln!("{e}");
-                return ExitCode::FAILURE;
-            }
+        let (h, gate, stop, config) = (
+            host.clone(),
+            remote_gate.clone(),
+            shutdown.clone(),
+            id.config.clone(),
+        );
+        let vrf = if args.listen_vrf.is_main() {
+            String::new()
+        } else {
+            format!(" in VRF {}", args.listen_vrf)
+        };
+        // G3.4zb: in --listen-vrf, waiting for the VRF if it is not there yet.
+        let started = service::listen_vrf::bind_or_wait(
+            addr,
+            &args.listen_vrf,
+            "--listen",
+            shutdown.clone(),
+            move |l| {
+                spawn_until(Endpoint::tls(l, config), h, gate, stop)
+                    .map_err(|e| format!("cannot start the TLS control thread: {e}"))?;
+                log::info!("control channel over TLS on {addr}{vrf} (login required)");
+                Ok(())
+            },
+        );
+        if let Err(e) = started {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
         }
     }
+    // G0.11: the local socket beside 127.0.0.1:<port>; the CLI, MCP and
+    // GUI of this OS user (and root) prefer it, no token file needed.
+    #[cfg(target_os = "linux")]
+    let socket_file = match corerouter_control::unix::bind(args.port).and_then(|l| {
+        let file = l.file();
+        let shown = l.path().display().to_string();
+        corerouter_control::unix::spawn_until(l, host.clone(), gate.clone(), shutdown.clone())
+            .map(|_| (file, shown))
+    }) {
+        Ok((file, path)) => {
+            log::info!("control socket for this OS user and root: {path}");
+            Some(file)
+        }
+        Err(e) => {
+            log::warn!("control socket not served ({e}): local clients use 127.0.0.1");
+            None
+        }
+    };
     let stop = shutdown.clone();
     let control = thread::Builder::new()
         .name("control".into())
@@ -930,5 +983,21 @@ fn main() -> ExitCode {
         eprintln!("cannot start the control thread: {e}");
         return ExitCode::FAILURE;
     }
-    run_until_signal(signals, &session, &shutdown, discovery, token_file)
+    // G0.11: the socket goes with the token (the process may exit before
+    // its accept loop wakes up to remove it).
+    #[cfg(target_os = "linux")]
+    let remove_socket: Box<dyn FnOnce()> = Box::new(move || {
+        if let Some(f) = socket_file {
+            f.remove();
+        }
+    });
+    #[cfg(not(target_os = "linux"))]
+    let remove_socket: Box<dyn FnOnce()> = Box::new(|| {});
+    run_until_signal(
+        signals,
+        &session,
+        &shutdown,
+        discovery,
+        (token_file, remove_socket),
+    )
 }

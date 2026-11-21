@@ -182,6 +182,40 @@ pub fn local_token_hint(port: u16) -> String {
     }
 }
 
+/// The router's local socket for a loopback `target` (G0.11), when there
+/// is one this user may use; `None` falls back to TCP and the local token.
+/// `COREROUTER_NO_UNIX_SOCKET=1` skips it (tests of the TCP path).
+fn local_socket(target: &Target) -> Option<Client> {
+    #[cfg(target_os = "linux")]
+    {
+        if target.tls || !target.is_loopback() {
+            return None;
+        }
+        if std::env::var_os("COREROUTER_NO_UNIX_SOCKET").is_some_and(|v| v == "1") {
+            return None;
+        }
+        let path = crate::unix::path(target.port)?;
+        if !path.exists() {
+            return None;
+        }
+        match Client::connect_unix(&path) {
+            Ok(c) => {
+                log::debug!("{target}: over {}", path.display());
+                Some(c)
+            }
+            Err(e) => {
+                log::warn!("{target}: local socket not used ({e}); TCP instead");
+                None
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = target;
+        None
+    }
+}
+
 /// Connect, check the certificate (TLS), and log in.
 pub fn dial(
     target: &Target,
@@ -238,6 +272,18 @@ pub fn dial(
             }
         }
         c
+    } else if let Some(mut c) = local_socket(target) {
+        // G0.11: the router's own socket; the OS user is the credential
+        // (a login or a token given still acts as that user).
+        match login {
+            Login::Token(t) => c.set_token(Some(t.clone())),
+            Login::Password { user, password } => {
+                c.login(user, password)
+                    .map_err(|e| format!("{target}: {e}"))?;
+            }
+            Login::Auto | Login::Nothing => {}
+        }
+        return Ok(c);
     } else if target.host.eq_ignore_ascii_case("localhost") {
         // `localhost` usually resolves to `::1` first, where the router does
         // not listen ([`crate::bind_loopback`]) and any local user could.

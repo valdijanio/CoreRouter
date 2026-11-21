@@ -231,6 +231,52 @@ fn lock_hold(c: &mut Criterion) {
             held
         })
     });
+    // G0.31g: a route changed. The first list and page take only the
+    // inputs under the lock and build the 60 000 lines after it (before:
+    // the whole build, ~26 ms, under it).
+    let mut d = 1u8;
+    let mut change_route = |s: &mut Session| {
+        d = if d == 1 { 2 } else { 1 };
+        s.execute("ip.route.set", &json!({"id": "*1", "distance": d}))
+            .unwrap();
+    };
+    for id in ["ip.route.list", "ip.route.page"] {
+        g.bench_function(format!("held/{id}/after_route_change"), |b| {
+            b.iter_custom(|iters| {
+                let mut held = Duration::ZERO;
+                for _ in 0..iters {
+                    change_route(&mut s);
+                    let t = Instant::now();
+                    let reply = s.execute_reply_as(&Caller::local(), id, &Value::Null);
+                    held += t.elapsed();
+                    // The page's build is published for the next read; the
+                    // list's is dropped unwritten.
+                    if id == "ip.route.page" {
+                        black_box(reply.ok().map(Reply::finish));
+                    }
+                }
+                held
+            })
+        });
+    }
+    // The read after that: it takes the published build into the cache and
+    // shows it to the route watch (60 000 lines compared with their last
+    // states) under the lock.
+    g.bench_function("held/ip.route.page/after_built", |b| {
+        b.iter_custom(|iters| {
+            let mut held = Duration::ZERO;
+            for _ in 0..iters {
+                change_route(&mut s);
+                let built = s.execute_reply_as(&Caller::local(), "ip.route.page", &Value::Null);
+                black_box(built.ok().map(Reply::finish));
+                let t = Instant::now();
+                let reply = s.execute_reply_as(&Caller::local(), "ip.route.page", &Value::Null);
+                held += t.elapsed();
+                black_box(reply.ok());
+            }
+            held
+        })
+    });
     g.finish();
 }
 

@@ -283,6 +283,12 @@ impl Session {
     fn dhcp_round_begin(&mut self, now_ms: u64, clock_us: &dyn Fn() -> u64) -> DhcpRound {
         let start = clock_us();
         let now = self.dhcp_now(now_ms);
+        // G0.13: an NTP step between two rounds moves the stored times.
+        if let Some(step) = self.wall_step(now.unix) {
+            self.dhcp_server_clock_step(now, step);
+            self.dhcp6_clock_step(step);
+            self.dhcp_history_clock_step(step);
+        }
         self.dhcp_server_sync(now);
         self.dhcp_history_load(now);
         self.dhcp_server_restore(now);
@@ -454,7 +460,7 @@ impl Session {
                 );
             }
         }
-        self.dhcp_lists_flush(now);
+        self.dhcp_lists_flush();
     }
 
     /// Follow the running config: the plan, the journal (first time), the
@@ -662,7 +668,7 @@ impl Session {
                 _ => {}
             }
         }
-        self.dhcp_lists_flush(now);
+        self.dhcp_lists_flush();
         self.dhcp_history_flush();
         wire
     }
@@ -770,7 +776,7 @@ impl Session {
     /// ones (against the running config, borrowed), then each is added;
     /// when the check fails, each is checked alone (and the refused ones
     /// leave the lease's lists).
-    fn dhcp_lists_flush(&mut self, now: Now) {
+    fn dhcp_lists_flush(&mut self) {
         let pending = self
             .ext_mut::<DhcpServerRuntime>()
             .map(|r| std::mem::take(&mut r.pending_lists))
@@ -778,7 +784,7 @@ impl Session {
         if pending.is_empty() {
             return;
         }
-        let at = self.now();
+        let at = self.steady_now();
         let mut before: Option<Vec<_>> = None;
         let mut after = Vec::new();
         for (list, ip, timeout) in &pending {
@@ -794,7 +800,7 @@ impl Session {
                 list: name,
                 address: addr,
                 timeout_secs: (*timeout).max(1),
-                added: Some(now.unix),
+                added: at,
                 comment: "dhcp".into(),
             };
             let b = before.get_or_insert_with(|| self.dynamic_now());
@@ -811,11 +817,11 @@ impl Session {
             }
         };
         if all_ok {
-            self.dhcp_lists_add(pending, now);
+            self.dhcp_lists_add(pending);
             return;
         }
         for (list, ip, timeout) in pending {
-            if !self.dhcp_list_put(&list, ip, timeout, now, true) {
+            if !self.dhcp_list_put(&list, ip, timeout, true) {
                 self.dhcp_list_refused(&list, ip);
             }
         }
@@ -824,8 +830,8 @@ impl Session {
     /// The round's entries, checked already: the new ones reach the kernel
     /// in one batch (one per binding was a netlink transaction each, under
     /// the session lock, G4.2h); one to refresh goes alone.
-    fn dhcp_lists_add(&mut self, pending: Vec<(String, Ipv4Addr, u64)>, now: Now) {
-        let at = self.now();
+    fn dhcp_lists_add(&mut self, pending: Vec<(String, Ipv4Addr, u64)>) {
+        let at = self.steady_now();
         let mut fresh = Vec::new();
         let mut room = MAX_DYNAMIC.saturating_sub(self.dynamic_addresses.entries().len());
         for (list, ip, timeout) in pending {
@@ -835,7 +841,7 @@ impl Session {
             };
             let addr = AddrMatch::Net(ipnet::IpNet::from(IpAddr::V4(ip)));
             if self.dynamic_addresses.find(&name, &addr).is_some() {
-                if !self.dhcp_list_put(&list, ip, timeout, now, false) {
+                if !self.dhcp_list_put(&list, ip, timeout, false) {
                     self.dhcp_list_refused(&list, ip);
                 }
                 continue;
@@ -850,7 +856,7 @@ impl Session {
                 list: name,
                 address: addr,
                 timeout_secs: timeout.max(1),
-                added: Some(now.unix),
+                added: at,
                 comment: "dhcp".into(),
             };
             // Each takes its id now: the next `next_id` must see it.
@@ -885,12 +891,12 @@ impl Session {
     /// refreshed when it has less than half left). False if refused.
     /// `check`: the lockout check for this entry alone (else the caller
     /// checked the round's entries together).
-    fn dhcp_list_put(&mut self, list: &str, ip: Ipv4Addr, timeout: u64, now: Now, check: bool) -> bool {
+    fn dhcp_list_put(&mut self, list: &str, ip: Ipv4Addr, timeout: u64, check: bool) -> bool {
         let Ok(name) = list.parse::<Name>() else {
             return false;
         };
         let addr = AddrMatch::Net(ipnet::IpNet::from(IpAddr::V4(ip)));
-        let at = self.now();
+        let at = self.steady_now();
         if let Some(e) = self.dynamic_addresses.find(&name, &addr) {
             if e.left(at) >= timeout / 2 {
                 return true;
@@ -910,7 +916,7 @@ impl Session {
             list: name,
             address: addr,
             timeout_secs: timeout.max(1),
-            added: Some(now.unix),
+            added: at,
             comment: "dhcp".into(),
         };
         // Operational state, not a commit: the lockout check is here (a
@@ -946,7 +952,7 @@ impl Session {
             return;
         };
         let addr = AddrMatch::Net(ipnet::IpNet::from(IpAddr::V4(ip)));
-        let at = self.now();
+        let at = self.steady_now();
         let Some(id) = self.dynamic_addresses.find(&name, &addr).map(|e| e.id) else {
             return;
         };
@@ -955,6 +961,25 @@ impl Session {
                 .hal_mut()
                 .address_list_dynamic(DynamicChange::Remove(&old.data_plane(at)));
         }
+    }
+
+    /// The wall clock stepped by `step` seconds (G0.13,
+    /// [`crate::clock_step`]): the server's times move with it and the
+    /// journal is rewritten with them.
+    pub(crate) fn dhcp_server_clock_step(&mut self, now: Now, step: i64) {
+        use corerouter_proto_dhcp::shift_secs;
+        let Some(rt) = self.ext_mut::<DhcpServerRuntime>() else {
+            return;
+        };
+        {
+            let mut g = hold(&rt.core);
+            if g.started {
+                g.server.clock_step(step);
+            }
+        }
+        rt.compacted_at = shift_secs(rt.compacted_at, step);
+        rt.compact_retry_at = shift_secs(rt.compact_retry_at, step);
+        self.dhcp_server_compact(now, true);
     }
 
     /// Rewrite the journal with the live records when it is due (`force`:

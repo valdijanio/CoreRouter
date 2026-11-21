@@ -585,6 +585,40 @@ fn leases_expire_and_leave_the_dns() {
     assert_eq!(lab.srv.leases().get(a).unwrap().state, State::Expired);
 }
 
+/// G0.13: NTP steps the wall clock ahead (a router without a battery
+/// boots in 1970) or back. Without `clock_step` a step ahead ends every
+/// lease at once; with it each keeps the time it had left, and still ends
+/// on time.
+#[test]
+fn a_clock_step_keeps_the_time_left() {
+    let gone = |fx: &[Effect], a: Ipv4Addr| {
+        fx.iter()
+            .any(|e| matches!(e, Effect::Gone(l) if l.address == a))
+    };
+    // The bug this fixes: no compensation, a step ahead expires it.
+    let mut lab = Lab::new(&cfg());
+    let a = lab.dora(mac(1));
+    lab.now.unix += 1_700_000_000;
+    assert!(gone(&lab.later(1000), a));
+
+    for step in [1_700_000_000i64, -900_000, 30, -30] {
+        let mut lab = Lab::new(&cfg());
+        let a = lab.dora(mac(1));
+        let left = lab.srv.leases().get(a).unwrap().left(lab.now.unix);
+        assert!(left > 100, "{left}");
+        lab.now.unix = crate::shift_secs(lab.now.unix, step);
+        lab.srv.clock_step(step);
+        let fx = lab.later(1000);
+        assert!(!gone(&fx, a), "step {step}: {fx:?}");
+        let l = lab.srv.leases().get(a).unwrap();
+        assert_eq!(l.state, State::Bound, "step {step}");
+        assert_eq!(l.left(lab.now.unix), left - 1, "step {step}");
+        // Ends when its time runs out, not a step later or earlier.
+        assert!(!gone(&lab.later((left - 2) * 1000), a), "step {step}");
+        assert!(gone(&lab.later(1000), a), "step {step}");
+    }
+}
+
 #[test]
 fn options_matchers_and_relay_echo() {
     let mut c = cfg();

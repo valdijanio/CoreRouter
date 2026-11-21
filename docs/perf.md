@@ -3587,3 +3587,97 @@ depois: esta branch.
 
 O custo no roteador: uma leitura `threads=yes` por segundo durante a amostragem (só os processos
 do roteador, sem varrer o `/proc` inteiro como a lista completa varria).
+
+### VMs do laboratório: ruído na VM 1 (G0.26c, 2026-11-20, **medido**)
+
+Host Ryzen AI MAX+ 395 (16 núcleos, SMT, 2 CCDs), carga média do host entre 5 e 15 (outras
+sessões compilando). Carga fixa na VM 1 (`corerouter-lab`): 8 processos em paralelo, cada um
+com `sha256sum` de um arquivo de 512 MiB em `/dev/shm`, três vezes; 15 repetições por bloco,
+tempo de parede. Carga na VM 2: builds release do `corerouter-hal-linux` em laço. Blocos
+intercalados.
+
+| VM 1 | VM 2 | blocos de 15 | mediana de cada bloco | CV dentro do bloco | pior |
+|---|---|---|---|---|---|
+| com mapa de CPUs | compilando | 4 | 940, 951, 951, 952 ms | 0,5–1,1 % | 984 ms |
+| sem mapa | compilando | 3 | 936, 917, 965 ms | 0,7–2,4 % | 1014 ms |
+| com mapa | parada | 3 | 943, 954, 983 ms | 0,7–1,2 % | 1007 ms |
+| com mapa | parada, host com carga 13 | 1 | 1004 ms | 24 % | 1865 ms |
+| sem mapa | parada | 2 | 936, 965 ms | 1,9 %, 21 % | 1544 ms |
+
+A VM 2 não deixa marca visível (940–952 ms com ela compilando, 943–983 ms com ela parada). O
+mapa reduz a variação sob carga (CV 0,5–1,1 % contra 0,7–2,4 %). O ruído grande vem dos
+processos do host (G0.26d).
+
+### Medição silenciosa na VM 1 (G0.26d, 2026-11-20, **medido**)
+
+Host Ryzen AI MAX+ 395. Na VM 1: 8 × `sha256sum` de 512 MiB em `/dev/shm`, três vezes;
+15 repetições por bloco. Carga do host: 32 laços `while :; do :; done` do usuário, mais as
+outras sessões; a carga média foi de 19 a 64.
+
+| host | `--perf` | blocos | mediana de cada bloco | CV no bloco | pior |
+|---|---|---|---|---|---|
+| sem os laços (carga 4–19) | silencioso | 2 | 826, 864 ms | 1,5–2,6 % | 950 ms |
+| sem os laços (carga 4–19) | `--no-quiet` | 2 | 838, 902 ms | 0,9–7,5 % | 1056 ms |
+| com os laços (carga 19 → 64) | silencioso | 3 | 881, 901, 951 ms | 3,5–8,6 % | 1167 ms |
+| com os laços (carga 19 → 64) | `--no-quiet` | 3 | 2155, 2622, 2695 ms | 7,0–16,3 % | 3094 ms |
+
+- Com uma carga que cabe no L3 (16 MiB, 96 vezes), sob carga 65–83: silenciosa 1078 e 1126 ms
+  (CV 4,3–4,9 %), sem ela 2994 e 3236 ms.
+- `/proc/stat` durante uma rodada silenciosa sob carga: CPUs 8–15 com 99 % de convidado, irmãs
+  24–31 com 93 % ociosas.
+- Custo no host: a primeira varredura leva 0,2–1,2 s, quase tudo nos `taskset`. As seguintes
+  leem ~600 `/proc/<pid>/status` a cada 2 s, uns 10 ms (**estimado**), e só rodam `taskset` para
+  processos novos de fora da árvore já movida.
+
+- 2026-11-20, G1.22, **medido** (Ryzen do desenvolvimento, build de teste, laboratório com 8
+  portas Ethernet): o tick lendo 8 módulos de 20 ms sob o lock segurou-o 172–193 ms (o
+  comportamento antigo; com 200 ms por módulo seriam ~1,6 s, **estimado**). Com o serviço
+  `module-scan`, durante uma varredura de módulos de 200 ms: espera pelo lock 6–11 µs,
+  comando mais lento 3–12 ms (o próprio commit em build de debug), 4 rodadas.
+
+- 2026-11-21, G1.3i, **medido** na VM 1 (`vm-lab run --perf`, medição silenciosa, build
+  release, bench `netns_tick_io`, 8 portas gerenciadas, 256 rotas e 256 endereços aprendidos
+  quando RA está ligado). Valores em ms; a coluna "leitura" é a leitura fora do lock.
+
+  | rotas v6 (BGP) | RA | tick sob o lock, antes → depois (mediana / máx.) | espera de comando, máx., antes → depois | leitura, depois |
+  |---|---|---|---|---|
+  | 1 000 | ligado | 2,48 / 3,18 → 0,40 / 0,46 | 1,34 → 0,13 | 1,46 |
+  | 10 000 | ligado | 9,33 / 11,2 → 0,42 / 0,47 | 27,1 → 0,017 | 3,54 |
+  | 100 000 | ligado | 74,5 / 103 → 0,42 / 0,56 | 106 → 0,011 | 22,5 |
+  | 1 000 | desligado | 1,52 / 1,62 → 0,22 / 0,29 | 1,15 → 0,020 | 0,34 |
+  | 10 000 | desligado | 8,42 / 8,75 → 0,22 / 0,29 | 8,31 → 0,20 | 0,34 |
+  | 100 000 | desligado | 72,6 / 83,1 → 0,22 / 0,28 | 71,3 → 0,13 | 0,35 |
+
+  O `ipv6_learned` sozinho, com o dump filtrado, levou 19 ms com 100 000 rotas (antes, 73 ms):
+  o kernel ainda percorre a tabela inteira, só não serializa. No host (Ryzen, sem medição
+  silenciosa) os números foram parecidos: 282 → 0,66 ms com RA e 102 → 0,22 ms sem RA.
+
+`--tests ops`: 50 vezes cada comando por uma conexão MCP aberta, com 20 000 consultas/s de nomes
+quentes ao lado. Alvo: p99 < 50 ms por comando (G4.2h). `static.add` + `remove` são dois
+comandos. **Medido**, 2026-11-20.
+
+Notebook (i5-12450H, SSD USB; `dev.659` → `dev.672` desta branch), p50 / p99 em ms:
+
+| Comando | Antes | Depois (1ª rodada) | Depois (2ª rodada) |
+|---|---|---|---|
+| `ip.dns.set` | 41 / **489** | 35 / 49 | 26 / 32 |
+| `ip.dns.static.add` + `remove` (2 commits) | 81 / **537** | 66 / 85 | 52 / 62 |
+| lote atômico (`static.add` + `ip.dns.set`, 1 commit) | 41 / **505** | 33 / 42 | 30 / 50 |
+| `ip.dns.get` (sem gravação) | 12 / 15 | 18 / 24 | 14 / 21 |
+
+Na 2ª rodada, as 50 vezes do `ip.dns.set` ficaram entre 22 e 32 ms, e as do lote entre 26 e 50 ms.
+
+VM (8 vCPUs EPYC; roteador nas CPUs 0-3, `/config` em dm-delay com 15 ms por descarga), antes =
+o daemon da G4.1zo, depois = esta branch:
+
+| Comando | Antes | Depois |
+|---|---|---|
+| `ip.dns.set` | 63 / 82 | 32 / 41 |
+| `ip.dns.static.add` + `remove` | 120 / 231 | 65 / 70 |
+| lote atômico | 65 / 75 | 33 / 41 |
+| `ip.dns.get` | 21 / 31 | 10 / 15 |
+
+Com o disco da VM sem atraso: `ip.dns.set` 14 / 74 → 12 / 15, lote 15 / 121 → 13 / 25.
+
+O desligamento limpo, que agora também grava os arquivos adiados, levou 72–111 ms na VM (antes,
+12–84 ms).
