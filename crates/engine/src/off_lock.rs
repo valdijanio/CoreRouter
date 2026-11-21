@@ -40,6 +40,12 @@ pub type Build = Box<dyn FnOnce() -> Result<Value> + Send>;
 /// row at a time, or as a [`Value`] for a caller in this process (with
 /// no bytes in between).
 pub trait Streamed: Send {
+    /// What must happen before the first byte and may still fail the
+    /// answer (G0.31g: build the route lines, then take a big list's
+    /// slot): its error goes back as the command's.
+    fn prepare(&mut self) -> Result<()> {
+        Ok(())
+    }
     /// Its JSON into `w`.
     fn write(self: Box<Self>, w: &mut dyn Write) -> std::io::Result<()>;
     /// It as a value.
@@ -66,7 +72,10 @@ impl Reply {
         match self {
             Self::Ready(v) => Ok(v),
             Self::Later(build) => build(),
-            Self::Stream(st) => crate::guard::run("streamed answer", || st.value()),
+            Self::Stream(mut st) => crate::guard::run("streamed answer", || {
+                st.prepare()?;
+                st.value()
+            }),
         }
     }
 
@@ -77,11 +86,14 @@ impl Reply {
         match self {
             // A panic while writing breaks the connection (part of the
             // answer is out already), not the daemon.
-            Self::Stream(st) => crate::guard::run("streamed answer", || {
-                st.write(w)
-                    .map_err(|e| EngineError::Internal(format!("answer: {e}")))
-            })
-            .map_err(|e| WriteError::Io(std::io::Error::other(e.to_string()))),
+            Self::Stream(mut st) => {
+                crate::guard::run("streamed answer", || st.prepare()).map_err(WriteError::Answer)?;
+                crate::guard::run("streamed answer", || {
+                    st.write(w)
+                        .map_err(|e| EngineError::Internal(format!("answer: {e}")))
+                })
+                .map_err(|e| WriteError::Io(std::io::Error::other(e.to_string())))
+            }
             other => {
                 let v = other.finish().map_err(WriteError::Answer)?;
                 serde_json::to_writer(w, &v).map_err(|e| WriteError::Io(e.into()))
@@ -177,7 +189,11 @@ impl Session {
                 o.pending = Some(Pending::Stream(Box::new(answer)));
                 Ok(Value::Null)
             }
-            _ => Box::new(answer).value(),
+            _ => {
+                let mut answer = Box::new(answer);
+                answer.prepare()?;
+                answer.value()
+            }
         }
     }
 
