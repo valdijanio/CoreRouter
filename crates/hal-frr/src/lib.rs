@@ -550,13 +550,14 @@ impl Frr {
 
     /// G3.9c: the stub router state of `cfg`'s instances (main VRF), one
     /// `show … json` each.
-    /// G3.4z: zebra's routes inside `net` (`show ip route <net>
+    /// G3.4z: zebra's routes inside `net` (`show ip route [vrf V] <net>
     /// longer-prefixes json`).
     pub fn rib_inside(
         &self,
+        table: &corerouter_model::RoutingTable,
         net: ipnet::IpNet,
     ) -> Result<Vec<corerouter_model::mgmt_guard::RibRoute>, HalError> {
-        let cmd = mgmt_guard::rib_command(&net);
+        let cmd = mgmt_guard::rib_command(table, &net);
         let r = self.with_vty(Daemon::Zebra, |vty| {
             vty.run(&cmd).map_err(|e| io_err(Daemon::Zebra, e))
         })?;
@@ -1175,9 +1176,10 @@ impl RoutingReader for FrrReader {
 
     fn rib_inside(
         &mut self,
+        table: &corerouter_model::RoutingTable,
         net: ipnet::IpNet,
     ) -> Result<Vec<corerouter_model::mgmt_guard::RibRoute>, HalError> {
-        self.0.rib_inside(net)
+        self.0.rib_inside(table, net)
     }
 
     fn ospf_stub_state(
