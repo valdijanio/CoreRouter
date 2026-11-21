@@ -1849,7 +1849,10 @@ minutos sem resposta, manda olhar o console.
   0 os auxiliares que ficam rodando (`wpa_supplicant`, `hostapd`). O FRR, o VyOS e o SONiC não
   ajustam nada (o SONiC reinicia a máquina num OOM, `vm.panic_on_oom=2`). O `frr-test` confere
   os valores e provoca um OOM no r2 (`tail /dev/zero`): morre o `tail`, os PIDs do daemon e do
-  FRR ficam e a rota OSPF continua.
+  FRR ficam e a adjacência OSPF volta sozinha. Sem swap, antes do OOM killer agir o kernel tira
+  o cache das páginas (o código dos programas) e a máquina se arrasta: ~50 s numa VM de 1 GiB
+  (**medido**), tempo em que o OSPF (dead 4 s) chega a cair. Matar mais cedo, pela pressão de
+  memória (PSI), é a gap G1.6zza.
 - **Fora da imagem** (`post-build.sh`): `vtysh` (o único que liga readline), bash, readline,
   ncurses, o runtime C++ que a toolchain copia, scripts Python e os daemons que o CoreRouter não
   configura (rip, isis, pim, babel, eigrp, …). O `nft` deixa de ter CLI interativa (ela puxava
