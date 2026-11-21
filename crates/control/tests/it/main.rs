@@ -7,3 +7,4 @@
 mod fuzz;
 mod limits;
 mod tcp;
+mod unix_socket;

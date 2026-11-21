@@ -77,6 +77,9 @@ struct ShutdownInner {
     closed: AtomicBool,
     /// Where the loops listen, to wake their blocking accept.
     listening: Mutex<Vec<SocketAddr>>,
+    /// The Unix sockets of the loops (G0.11), woken the same way.
+    #[cfg(target_os = "linux")]
+    listening_unix: Mutex<Vec<std::path::PathBuf>>,
 }
 
 impl Shutdown {
@@ -98,6 +101,27 @@ impl Shutdown {
         for addr in addrs {
             let _ = TcpStream::connect_timeout(&addr, WAKE_TIMEOUT);
         }
+        #[cfg(target_os = "linux")]
+        {
+            let paths = self
+                .0
+                .listening_unix
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            for path in paths {
+                let _ = std::os::unix::net::UnixStream::connect(path);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn watch_unix(&self, path: &std::path::Path) {
+        self.0
+            .listening_unix
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(path.to_owned());
     }
 
     pub(crate) fn watch(&self, listener: &TcpListener) {
@@ -451,6 +475,21 @@ pub(crate) fn answer_with(
     text: &str,
     on_token: &mut dyn FnMut(),
 ) -> Option<Answer> {
+    answer_as(host, gate, caller, peer, None, text, on_token)
+}
+
+/// [`answer_with`] for a connection whose operating-system user is known
+/// (the Unix socket, G0.11): a request without a token acts as `local`;
+/// one with a token (a login over the socket) acts as that token says.
+pub(crate) fn answer_as(
+    host: &mut dyn Host,
+    gate: &Gate,
+    caller: &Caller,
+    peer: Option<IpAddr>,
+    local: Option<&corerouter_engine::Principal>,
+    text: &str,
+    on_token: &mut dyn FnMut(),
+) -> Option<Answer> {
     let req = serde_json::from_str::<Request>(text).ok()?;
     let id = req
         .id
@@ -464,7 +503,8 @@ pub(crate) fn answer_with(
             // The exact build tells which known bugs a router has: strangers
             // on the network get it only after logging in. (`ping` checks no
             // token: it is the hot path of health checks.)
-            let stranger = m == "server.info" && !peer.is_some_and(|p| p.is_loopback()) && {
+            let on_box = peer.is_some_and(|p| p.is_loopback()) || local.is_some();
+            let stranger = m == "server.info" && !on_box && {
                 let logged_in = token.is_some() && gate.principal(host, token).is_ok();
                 authenticated = logged_in;
                 !logged_in
@@ -494,7 +534,11 @@ pub(crate) fn answer_with(
         }
         .map(Reply::Ready),
         "auth.logout" => gate.logout(host, token).map(Reply::Ready),
-        method => gate.principal(host, token).and_then(|p| {
+        method => match (token, local) {
+            (None, Some(p)) => Ok(p.clone()),
+            _ => gate.principal(host, token),
+        }
+        .and_then(|p| {
             authenticated = true;
             on_token();
             let caller = caller.clone().with_principal(p);

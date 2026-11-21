@@ -15,6 +15,9 @@ use crate::wire::{Line, MAX_RESPONSE_LINE, read_line_bounded, write_line};
 enum Stream {
     Plain(TcpStream),
     Tls(Box<ClientStream>),
+    /// The router's local socket (G0.11).
+    #[cfg(target_os = "linux")]
+    Unix(std::os::unix::net::UnixStream),
 }
 
 impl Read for Stream {
@@ -22,6 +25,8 @@ impl Read for Stream {
         match self {
             Self::Plain(s) => s.read(buf),
             Self::Tls(s) => s.read(buf),
+            #[cfg(target_os = "linux")]
+            Self::Unix(s) => s.read(buf),
         }
     }
 }
@@ -31,6 +36,8 @@ impl Write for Stream {
         match self {
             Self::Plain(s) => s.write(buf),
             Self::Tls(s) => s.write(buf),
+            #[cfg(target_os = "linux")]
+            Self::Unix(s) => s.write(buf),
         }
     }
 
@@ -38,6 +45,8 @@ impl Write for Stream {
         match self {
             Self::Plain(s) => s.flush(),
             Self::Tls(s) => s.flush(),
+            #[cfg(target_os = "linux")]
+            Self::Unix(s) => s.flush(),
         }
     }
 }
@@ -101,6 +110,41 @@ impl Client {
         Ok(Self::over(Stream::Tls(Box::new(s)), addr, Some(fp)))
     }
 
+    /// The router's local socket (G0.11), only if the process serving it
+    /// is this user or root (`SO_PEERCRED`): a socket someone else left at
+    /// that path is never talked to.
+    #[cfg(target_os = "linux")]
+    pub fn connect_unix(path: &std::path::Path) -> Result<Self, String> {
+        let shown = path.display();
+        let stream =
+            std::os::unix::net::UnixStream::connect(path).map_err(|e| format!("{shown}: {e}"))?;
+        let (uid, _) = crate::unix::peer(&stream).map_err(|e| format!("{shown}: {e}"))?;
+        let mine = crate::unix::my_uid();
+        if !crate::unix::trusted_uid(uid, mine) {
+            return Err(format!(
+                "{shown} is served by uid {uid}, neither this user (uid {mine}) nor root; \
+                 not used"
+            ));
+        }
+        stream
+            .set_read_timeout(Some(Duration::from_secs(120)))
+            .map_err(|e| e.to_string())?;
+        Ok(Self::over(Stream::Unix(stream), &shown.to_string(), None))
+    }
+
+    /// Over the router's local socket: the operating-system user is the
+    /// credential, no token needed.
+    pub fn is_unix(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            matches!(self.reader.get_ref(), Stream::Unix(_))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
     fn over(stream: Stream, addr: &str, fingerprint: Option<String>) -> Self {
         Self {
             reader: BufReader::new(stream),
@@ -120,6 +164,8 @@ impl Client {
         match self.reader.get_ref() {
             Stream::Plain(s) => s.peer_addr().ok(),
             Stream::Tls(s) => s.sock.peer_addr().ok(),
+            #[cfg(target_os = "linux")]
+            Stream::Unix(_) => None,
         }
     }
 
@@ -144,6 +190,16 @@ impl Client {
         let (sock, tls) = match self.reader.get_ref() {
             Stream::Plain(s) => (s, false),
             Stream::Tls(s) => (&s.sock, true),
+            #[cfg(target_os = "linux")]
+            Stream::Unix(s) => {
+                use rustix::net::{RecvFlags, recv};
+                let mut b = [0u8; 1];
+                return match recv(s, &mut b[..], RecvFlags::PEEK | RecvFlags::DONTWAIT) {
+                    Err(e) => e != rustix::io::Errno::AGAIN,
+                    // Closed, or bytes nobody asked for.
+                    Ok(_) => true,
+                };
+            }
         };
         if sock.set_nonblocking(true).is_err() {
             return true;
@@ -199,7 +255,19 @@ impl Client {
         if let (Some(t), Some(o)) = (&self.token, req.as_object_mut()) {
             o.insert("token".into(), json!(t));
         }
-        write_line(self.reader.get_mut(), &req).map_err(|e| format!("send: {e}"))?;
+        if let Err(e) = write_line(self.reader.get_mut(), &req) {
+            // A router that refused the connection (no slot) wrote why and
+            // closed: that line is still there to read.
+            return match read_line_bounded(&mut self.reader, MAX_RESPONSE_LINE) {
+                Ok(Line::Text(t)) => match serde_json::from_str::<Value>(&t) {
+                    Ok(reply) => Err(reply_result(&reply)
+                        .err()
+                        .unwrap_or_else(|| format!("send: {e}"))),
+                    Err(_) => Err(format!("send: {e}")),
+                },
+                _ => Err(format!("send: {e}")),
+            };
+        }
         let line = match read_line_bounded(&mut self.reader, MAX_RESPONSE_LINE) {
             Ok(Line::Text(t)) => t,
             Ok(Line::TooLong) => return Err("response exceeds 256 MiB".into()),
